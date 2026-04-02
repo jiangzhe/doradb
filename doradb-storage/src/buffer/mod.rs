@@ -13,6 +13,8 @@ mod util;
 
 #[cfg(test)]
 pub(crate) use self::readonly::tests::{global_readonly_pool_scope, table_readonly_pool};
+#[cfg(test)]
+pub(crate) use self::tests::test_page_id;
 pub use evict::EvictableBufferPool;
 pub(crate) use evict::{IndexPoolWorkers, MemPoolWorkers};
 pub use evictor::{EvictionArbiter, EvictionArbiterBuilder};
@@ -22,27 +24,243 @@ pub(crate) use identity::{PoolIdentity, RowPoolRole};
 pub use pool_guard::{PoolGuard, PoolGuards, PoolGuardsBuilder};
 pub(crate) use readonly::DiskPoolWorkers;
 pub(crate) use readonly::ReadSubmission;
-pub use readonly::{
-    GlobalReadonlyBufferPool, PersistedBlockKey, ReadonlyBlockGuard, ReadonlyBufferPool,
-};
+pub use readonly::{BlockKey, GlobalReadonlyBufferPool, ReadonlyBlockGuard, ReadonlyBufferPool};
 
 /// Physical file identity used by persisted-block mappings and cache invalidation.
 pub type PersistedFileID = u64;
 
 use crate::buffer::guard::{FacadePageGuard, PageExclusiveGuard};
-use crate::buffer::page::{BufferPage, PageID, VersionedPageID};
+use crate::buffer::page::{BufferPage, VersionedPageID};
 use crate::component::{
     Component, ComponentRegistry, DiskPoolConfig, IndexPool, IndexPoolConfig, MemPool, MetaPool,
     MetaPoolConfig, ShelfScope,
 };
+use crate::compression::BitPackable;
 use crate::conf::EvictableBufferPoolConfig;
 use crate::error::Validation;
-use crate::error::{PersistedFileKind, Result};
+use crate::error::{FileKind, Result};
+use crate::file::BlockID;
 use crate::io::Completion;
 use crate::latch::LatchFallbackMode;
+use crate::serde::{Deser, Ser, Serde};
+use bytemuck::{Pod, Zeroable};
+use std::fmt;
 use std::future::Future;
+use std::mem;
+use std::ops::{Add, AddAssign, Sub, SubAssign};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+
+/// Runtime buffer-managed page identity.
+///
+/// This id is reserved for mutable or cached pages owned by the buffer layer.
+/// Persisted fixed-size file units use `crate::file::BlockID` instead.
+#[repr(transparent)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Zeroable, Pod)]
+pub struct PageID(u64);
+
+impl PageID {
+    #[inline]
+    pub const fn new(raw: u64) -> Self {
+        Self(raw)
+    }
+
+    #[inline]
+    pub const fn as_u64(self) -> u64 {
+        self.0
+    }
+
+    #[inline]
+    pub const fn as_usize(self) -> usize {
+        self.0 as usize
+    }
+
+    #[inline]
+    pub const fn to_le_bytes(self) -> [u8; mem::size_of::<u64>()] {
+        self.0.to_le_bytes()
+    }
+
+    #[inline]
+    pub const fn from_le_bytes(bytes: [u8; mem::size_of::<u64>()]) -> Self {
+        Self(u64::from_le_bytes(bytes))
+    }
+}
+
+impl From<u64> for PageID {
+    #[inline]
+    fn from(value: u64) -> Self {
+        Self(value)
+    }
+}
+
+impl From<u32> for PageID {
+    #[inline]
+    fn from(value: u32) -> Self {
+        Self(value as u64)
+    }
+}
+
+impl From<usize> for PageID {
+    #[inline]
+    fn from(value: usize) -> Self {
+        Self(value as u64)
+    }
+}
+
+impl From<PageID> for u64 {
+    #[inline]
+    fn from(value: PageID) -> Self {
+        value.0
+    }
+}
+
+impl From<PageID> for usize {
+    #[inline]
+    fn from(value: PageID) -> Self {
+        value.as_usize()
+    }
+}
+
+impl Add<u64> for PageID {
+    type Output = Self;
+
+    #[inline]
+    fn add(self, rhs: u64) -> Self::Output {
+        Self(self.0 + rhs)
+    }
+}
+
+impl AddAssign<u64> for PageID {
+    #[inline]
+    fn add_assign(&mut self, rhs: u64) {
+        self.0 += rhs;
+    }
+}
+
+impl Sub<u64> for PageID {
+    type Output = Self;
+
+    #[inline]
+    fn sub(self, rhs: u64) -> Self::Output {
+        Self(self.0 - rhs)
+    }
+}
+
+impl SubAssign<u64> for PageID {
+    #[inline]
+    fn sub_assign(&mut self, rhs: u64) {
+        self.0 -= rhs;
+    }
+}
+
+impl Sub<PageID> for u64 {
+    type Output = PageID;
+
+    #[inline]
+    fn sub(self, rhs: PageID) -> Self::Output {
+        PageID(self - rhs.0)
+    }
+}
+
+impl PartialEq<u64> for PageID {
+    #[inline]
+    fn eq(&self, other: &u64) -> bool {
+        self.0 == *other
+    }
+}
+
+impl PartialEq<i32> for PageID {
+    #[inline]
+    fn eq(&self, other: &i32) -> bool {
+        *other >= 0 && self.0 == *other as u64
+    }
+}
+
+impl PartialEq<PageID> for u64 {
+    #[inline]
+    fn eq(&self, other: &PageID) -> bool {
+        *self == other.0
+    }
+}
+
+impl PartialEq<PageID> for i32 {
+    #[inline]
+    fn eq(&self, other: &PageID) -> bool {
+        *self >= 0 && *self as u64 == other.0
+    }
+}
+
+impl fmt::Display for PageID {
+    #[inline]
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl Ser<'_> for PageID {
+    #[inline]
+    fn ser_len(&self) -> usize {
+        mem::size_of::<u64>()
+    }
+
+    #[inline]
+    fn ser<S: Serde + ?Sized>(&self, out: &mut S, start_idx: usize) -> usize {
+        out.ser_u64(start_idx, self.0)
+    }
+}
+
+impl Deser for PageID {
+    #[inline]
+    fn deser<S: Serde + ?Sized>(
+        input: &S,
+        start_idx: usize,
+    ) -> crate::error::Result<(usize, Self)> {
+        input
+            .deser_u64(start_idx)
+            .map(|(idx, raw)| (idx, Self(raw)))
+    }
+}
+
+impl BitPackable for PageID {
+    const ZERO: Self = Self(0);
+
+    #[inline]
+    fn sub_to_u64(self, min: Self) -> u64 {
+        self.0.wrapping_sub(min.0)
+    }
+
+    #[inline]
+    fn sub_to_u32(self, min: Self) -> u32 {
+        self.0.wrapping_sub(min.0) as u32
+    }
+
+    #[inline]
+    fn add_from_u32(self, delta: u32) -> Self {
+        Self(self.0.wrapping_add(delta as u64))
+    }
+
+    #[inline]
+    fn sub_to_u16(self, min: Self) -> u16 {
+        self.0.wrapping_sub(min.0) as u16
+    }
+
+    #[inline]
+    fn add_from_u16(self, delta: u16) -> Self {
+        Self(self.0.wrapping_add(delta as u64))
+    }
+
+    #[inline]
+    fn sub_to_u8(self, min: Self) -> u8 {
+        self.0.wrapping_sub(min.0) as u8
+    }
+
+    #[inline]
+    fn add_from_u8(self, delta: u8) -> Self {
+        Self(self.0.wrapping_add(delta as u64))
+    }
+}
+
+pub const INVALID_PAGE_ID: PageID = PageID::new(u64::MAX);
 
 /// Shared terminal-status cell for one page-sized buffer-pool IO operation.
 ///
@@ -51,8 +269,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 /// waiting behind writeback of the same page.
 pub(crate) type PageIOCompletion = Completion<Result<PageID>>;
 
-/// Validation callback for one persisted readonly-cache page image.
-pub(crate) type ReadonlyPageValidator = fn(&[u8], PersistedFileKind, PageID) -> Result<()>;
+/// Validation callback for one persisted readonly-cache block image.
+pub(crate) type ReadonlyBlockValidator = fn(&[u8], FileKind, BlockID) -> Result<()>;
 
 /// Snapshot of buffer-pool access and IO lifecycle counters.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -387,4 +605,112 @@ impl Component for crate::DiskPool {
 
     #[inline]
     fn shutdown(_component: &Self::Owned) {}
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use super::PageID;
+    use crate::compression::BitPackable;
+    use crate::serde::{Deser, Ser};
+    use std::mem;
+
+    #[inline]
+    pub(crate) fn test_page_id(value: i32) -> PageID {
+        PageID::new(u64::try_from(value).expect("test PageID must be non-negative"))
+    }
+
+    #[test]
+    fn test_page_id_accessors_and_conversions() {
+        let page_id = PageID::new(42);
+        assert_eq!(page_id.as_u64(), 42);
+        assert_eq!(page_id.as_usize(), 42);
+        assert_eq!(PageID::from(42u64), page_id);
+        assert_eq!(PageID::from(42u32), page_id);
+        assert_eq!(PageID::from(42usize), page_id);
+        assert_eq!(u64::from(page_id), 42);
+        assert_eq!(usize::from(page_id), 42);
+    }
+
+    #[test]
+    fn test_page_id_bytes_roundtrip() {
+        let page_id = PageID::new(0x0123_4567_89ab_cdef);
+        let bytes = page_id.to_le_bytes();
+        assert_eq!(bytes, 0x0123_4567_89ab_cdefu64.to_le_bytes());
+        assert_eq!(PageID::from_le_bytes(bytes), page_id);
+    }
+
+    #[test]
+    fn test_page_id_arithmetic() {
+        let page_id = PageID::new(10);
+        assert_eq!(page_id + 5, PageID::new(15));
+        assert_eq!(page_id - 3, PageID::new(7));
+        assert_eq!(20u64 - page_id, PageID::new(10));
+
+        let mut next = page_id;
+        next += 7;
+        assert_eq!(next, PageID::new(17));
+        next -= 5;
+        assert_eq!(next, PageID::new(12));
+    }
+
+    #[test]
+    fn test_page_id_partial_eq_signed_and_unsigned() {
+        let page_id = PageID::new(7);
+        assert_eq!(page_id, 7u64);
+        assert_eq!(7u64, page_id);
+        assert_eq!(page_id, 7i32);
+        assert_eq!(7i32, page_id);
+        assert_ne!(page_id, -1i32);
+        assert_ne!(-1i32, page_id);
+    }
+
+    #[test]
+    fn test_page_id_display() {
+        assert_eq!(format!("{}", PageID::new(99)), "99");
+    }
+
+    #[test]
+    fn test_page_id_serde_roundtrip() {
+        let page_id = PageID::new(1234);
+        assert_eq!(page_id.ser_len(), mem::size_of::<u64>());
+
+        let mut out = vec![0; page_id.ser_len()];
+        let end = page_id.ser(&mut out[..], 0);
+        assert_eq!(end, out.len());
+
+        let (end, deser) = PageID::deser(&out[..], 0).unwrap();
+        assert_eq!(end, out.len());
+        assert_eq!(deser, page_id);
+    }
+
+    #[test]
+    fn test_page_id_bit_packable_contract() {
+        let min = PageID::new(10);
+        let value = PageID::new(42);
+        assert_eq!(PageID::ZERO, PageID::new(0));
+        assert_eq!(value.sub_to_u64(min), 32);
+        assert_eq!(value.sub_to_u32(min), 32);
+        assert_eq!(value.sub_to_u16(min), 32);
+        assert_eq!(value.sub_to_u8(min), 32);
+        assert_eq!(min.add_from_u32(5), PageID::new(15));
+        assert_eq!(min.add_from_u16(6), PageID::new(16));
+        assert_eq!(min.add_from_u8(7), PageID::new(17));
+
+        let wrap_min = PageID::new(u64::MAX - 2);
+        let wrap_value = PageID::new(1);
+        assert_eq!(wrap_value.sub_to_u64(wrap_min), 4);
+        assert_eq!(wrap_min.add_from_u32(5), PageID::new(2));
+    }
+
+    #[test]
+    fn test_test_page_id_accepts_non_negative_values() {
+        assert_eq!(test_page_id(0), PageID::new(0));
+        assert_eq!(test_page_id(17), PageID::new(17));
+    }
+
+    #[test]
+    #[should_panic(expected = "test PageID must be non-negative")]
+    fn test_test_page_id_panics_on_negative_values() {
+        let _ = test_page_id(-1);
+    }
 }

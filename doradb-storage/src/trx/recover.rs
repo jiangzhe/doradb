@@ -12,8 +12,8 @@
 //! We separate all transactions into two kinds:
 //! 1. DDL involved transactions
 //! 2. DML-only transactions
+use crate::buffer::PageID;
 use crate::buffer::guard::PageGuard;
-use crate::buffer::page::PageID;
 use crate::buffer::{
     BufferPool, EvictableBufferPool, FixedBufferPool, GlobalReadonlyBufferPool, PoolGuards,
     PoolRole,
@@ -624,10 +624,10 @@ mod tests {
         TableMetadata, TableSpec,
     };
     use crate::conf::{EngineConfig, EvictableBufferPoolConfig, TrxSysConfig};
-    use crate::error::{Error, PersistedFileKind, PersistedPageCorruptionCause, PersistedPageKind};
+    use crate::error::{BlockCorruptionCause, BlockKind, Error, FileKind};
+    use crate::file::block_integrity::{BLOCK_INTEGRITY_HEADER_SIZE, write_block_checksum};
     use crate::file::build_test_fs_in;
     use crate::file::cow_file::COW_FILE_PAGE_SIZE;
-    use crate::file::page_integrity::{PAGE_INTEGRITY_HEADER_SIZE, write_page_checksum};
     use crate::index::{COLUMN_DELETION_BLOB_PAGE_HEADER_SIZE, ColumnBlockIndex};
     use crate::row::RowRead;
     use crate::row::ops::{DeleteMvcc, InsertMvcc, SelectKey, UpdateCol, UpdateMvcc};
@@ -639,7 +639,8 @@ mod tests {
     use std::io::{Read, Seek, SeekFrom, Write};
     use tempfile::TempDir;
 
-    fn corrupt_page_checksum(path: impl AsRef<std::path::Path>, page_id: u64) {
+    fn corrupt_page_checksum(path: impl AsRef<std::path::Path>, page_id: impl Into<u64>) {
+        let page_id = page_id.into();
         let mut file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -657,9 +658,10 @@ mod tests {
 
     fn rewrite_page_with_checksum(
         path: impl AsRef<std::path::Path>,
-        page_id: u64,
+        page_id: impl Into<u64>,
         rewrite: impl FnOnce(&mut [u8]),
     ) {
+        let page_id = page_id.into();
         let mut file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -670,7 +672,7 @@ mod tests {
         file.seek(SeekFrom::Start(offset)).unwrap();
         file.read_exact(&mut page).unwrap();
         rewrite(&mut page);
-        write_page_checksum(&mut page);
+        write_block_checksum(&mut page);
         file.seek(SeekFrom::Start(offset)).unwrap();
         file.write_all(&page).unwrap();
         file.flush().unwrap();
@@ -678,10 +680,10 @@ mod tests {
 
     fn corrupt_blob_header_kind(
         path: impl AsRef<std::path::Path>,
-        page_id: u64,
+        page_id: impl Into<u64>,
         start_offset: u16,
     ) {
-        let byte_offset = PAGE_INTEGRITY_HEADER_SIZE
+        let byte_offset = BLOCK_INTEGRITY_HEADER_SIZE
             + COLUMN_DELETION_BLOB_PAGE_HEADER_SIZE
             + start_offset as usize;
         rewrite_page_with_checksum(path, page_id, |page| {
@@ -1442,7 +1444,7 @@ mod tests {
     }
 
     #[test]
-    fn test_log_recover_fails_on_corrupted_persisted_lwc_page() {
+    fn test_log_recover_fails_on_corrupted_persisted_lwc_block() {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
             let main_dir = temp_dir.path().to_path_buf();
@@ -1517,7 +1519,7 @@ mod tests {
                     .unwrap()
                     .into_iter()
                     .next()
-                    .expect("checkpointed table should publish a persisted LWC page");
+                    .expect("checkpointed table should publish a persisted LWC block");
                 entry.block_id()
             };
 
@@ -1550,11 +1552,11 @@ mod tests {
             };
             assert!(matches!(
                 err,
-                Error::PersistedPageCorrupted {
-                    file_kind: PersistedFileKind::TableFile,
-                    page_kind: PersistedPageKind::LwcPage,
-                    page_id,
-                    cause: PersistedPageCorruptionCause::ChecksumMismatch,
+                Error::BlockCorrupted {
+                    file_kind: FileKind::TableFile,
+                    block_kind: BlockKind::LwcBlock,
+                    block_id: page_id,
+                    cause: BlockCorruptionCause::ChecksumMismatch,
                 } if page_id == block_id
             ));
         })
@@ -1718,11 +1720,11 @@ mod tests {
             };
             assert!(matches!(
                 err,
-                Error::PersistedPageCorrupted {
-                    file_kind: PersistedFileKind::TableFile,
-                    page_kind: PersistedPageKind::ColumnDeletionBlob,
-                    page_id,
-                    cause: PersistedPageCorruptionCause::InvalidPayload,
+                Error::BlockCorrupted {
+                    file_kind: FileKind::TableFile,
+                    block_kind: BlockKind::ColumnDeletionBlob,
+                    block_id: page_id,
+                    cause: BlockCorruptionCause::InvalidPayload,
                 } if page_id == blob_ref.start_page_id
             ));
         })

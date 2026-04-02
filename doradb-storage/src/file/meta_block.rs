@@ -1,45 +1,46 @@
 use crate::bitmap::AllocMap;
-use crate::buffer::page::PageID;
 use crate::catalog::table::{TableBriefMetadata, TableBriefMetadataSerView, TableMetadata};
 use crate::catalog::{ObjID, USER_OBJ_ID_START};
 use crate::error::Result;
-use crate::file::cow_file::SUPER_BLOCK_ID;
+use crate::file::cow_file::{BlockID, SUPER_BLOCK_ID};
 use crate::file::multi_table_file::{
-    CATALOG_TABLE_ROOT_DESC_COUNT, CatalogTableRootDesc, MultiTableMetaPage,
+    CATALOG_TABLE_ROOT_DESC_COUNT, CatalogTableRootDesc, MultiTableMetaBlock,
 };
 use crate::lwc::{LwcPrimitiveDeser, LwcPrimitiveSer};
 use crate::row::RowID;
 use crate::serde::{Deser, Ser, Serde};
 use crate::trx::TrxID;
+use bytemuck::cast_slice;
 use std::mem;
 use std::num::NonZeroU64;
 
-/// Magic bytes stored at the beginning of every table meta page envelope.
-pub(crate) const TABLE_META_MAGIC_WORD: [u8; 8] = [b'T', b'B', b'L', b'M', b'E', b'T', b'A', 0];
-/// Table meta-page envelope version.
-pub(crate) const TABLE_META_VERSION: u64 = 1;
+/// Magic bytes stored at the beginning of every table meta block envelope.
+pub(crate) const TABLE_META_BLOCK_MAGIC_WORD: [u8; 8] =
+    [b'T', b'B', b'L', b'M', b'E', b'T', b'A', 0];
+/// Table meta-block envelope version.
+pub(crate) const TABLE_META_BLOCK_VERSION: u64 = 1;
 
-/// Parsed payload of one checksummed table meta page.
+/// Parsed payload of one checksummed table meta block.
 ///
 /// The surrounding magic/version/checksum envelope is validated by the file
 /// layer before this payload is deserialized during startup or recovery.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MetaPage {
+pub struct MetaBlock {
     /// Row-store/column-store boundary row id.
     pub pivot_row_id: RowID,
     /// Earliest redo timestamp required to recover in-memory heap.
     pub heap_redo_start_ts: TrxID,
     /// Table schema metadata.
     pub schema: TableMetadata,
-    /// Root page id of column block index.
-    pub column_block_index_root: PageID,
+    /// Root block id of column block index.
+    pub column_block_index_root: BlockID,
     /// Page allocation bitmap.
     pub alloc_map: AllocMap,
     /// Obsolete page ids pending reclamation.
-    pub gc_page_list: Vec<PageID>,
+    pub gc_block_list: Vec<BlockID>,
 }
 
-impl Deser for MetaPage {
+impl Deser for MetaBlock {
     #[inline]
     fn deser<S: Serde + ?Sized>(input: &S, start_idx: usize) -> Result<(usize, Self)> {
         let (idx, pivot_row_id) = input.deser_u64(start_idx)?;
@@ -49,65 +50,65 @@ impl Deser for MetaPage {
         let (idx, column_block_index_root) = input.deser_u64(idx)?;
         Ok((
             idx,
-            MetaPage {
+            MetaBlock {
                 pivot_row_id,
                 heap_redo_start_ts,
                 schema: TableMetadata::from(meta),
-                column_block_index_root,
+                column_block_index_root: BlockID::from(column_block_index_root),
                 alloc_map: space.alloc_map,
-                gc_page_list: space.gc_page_list,
+                gc_block_list: space.gc_block_list,
             },
         ))
     }
 }
 
-/// Borrowed serialization view of [`MetaPage`].
+/// Borrowed serialization view of [`MetaBlock`].
 ///
-/// This avoids building an owned [`MetaPage`] when only page encoding is
+/// This avoids building an owned [`MetaBlock`] when only page encoding is
 /// needed for checkpoint writes.
-pub struct MetaPageSerView<'a> {
+pub struct MetaBlockSerView<'a> {
     /// Row-store/column-store boundary row id.
     pub pivot_row_id: RowID,
     /// Earliest redo timestamp required to recover in-memory heap.
     pub heap_redo_start_ts: TrxID,
     /// Compact schema serialization view.
     pub schema: TableBriefMetadataSerView<'a>,
-    /// Root page id of column block index.
-    pub column_block_index_root: PageID,
+    /// Root block id of column block index.
+    pub column_block_index_root: BlockID,
     /// Shared allocation-map + GC-list serialization view.
     pub space: AllocMapGcListSerView<'a>,
 }
 
-impl<'a> MetaPageSerView<'a> {
-    /// Constructs a table meta-page serialization view from active in-memory
+impl<'a> MetaBlockSerView<'a> {
+    /// Constructs a table meta-block serialization view from active in-memory
     /// table state.
     #[inline]
     pub fn new(
         schema: TableBriefMetadataSerView<'a>,
-        column_block_index_root: PageID,
+        column_block_index_root: BlockID,
         alloc_map: &'a AllocMap,
-        gc_page_list: &'a [PageID],
+        gc_block_list: &'a [BlockID],
         pivot_row_id: RowID,
         heap_redo_start_ts: TrxID,
     ) -> Self {
-        MetaPageSerView {
+        MetaBlockSerView {
             pivot_row_id,
             heap_redo_start_ts,
             schema,
             column_block_index_root,
-            space: AllocMapGcListSerView::new(alloc_map, gc_page_list),
+            space: AllocMapGcListSerView::new(alloc_map, gc_block_list),
         }
     }
 }
 
-impl<'a> Ser<'a> for MetaPageSerView<'a> {
+impl<'a> Ser<'a> for MetaBlockSerView<'a> {
     #[inline]
     fn ser_len(&self) -> usize {
         mem::size_of::<RowID>()
             + mem::size_of::<TrxID>()
             + self.space.ser_len()
             + self.schema.ser_len()
-            + mem::size_of::<PageID>()
+            + mem::size_of::<BlockID>()
     }
 
     #[inline]
@@ -116,7 +117,7 @@ impl<'a> Ser<'a> for MetaPageSerView<'a> {
         let idx = out.ser_u64(idx, self.heap_redo_start_ts);
         let idx = self.space.ser(out, idx);
         let idx = self.schema.ser(out, idx);
-        out.ser_u64(idx, self.column_block_index_root)
+        out.ser_u64(idx, self.column_block_index_root.into())
     }
 }
 
@@ -129,20 +130,21 @@ pub struct AllocMapGcList {
     /// Page allocation bitmap.
     pub alloc_map: AllocMap,
     /// Obsolete page ids pending reclamation.
-    pub gc_page_list: Vec<PageID>,
+    pub gc_block_list: Vec<BlockID>,
 }
 
 impl Deser for AllocMapGcList {
     #[inline]
     fn deser<S: Serde + ?Sized>(input: &S, start_idx: usize) -> Result<(usize, Self)> {
         let (idx, alloc_map) = AllocMap::deser(input, start_idx)?;
-        if alloc_map.len() == 0 || !alloc_map.is_allocated(SUPER_BLOCK_ID as usize) {
+        if alloc_map.len() == 0 || !alloc_map.is_allocated(usize::from(SUPER_BLOCK_ID)) {
             return Err(crate::error::Error::InvalidFormat);
         }
 
-        let (idx, gc_page_list) = LwcPrimitiveDeser::<PageID>::deser(input, idx)?;
-        for page_id in &gc_page_list.0 {
-            if *page_id as usize >= alloc_map.len() {
+        let (idx, gc_block_list) = LwcPrimitiveDeser::<BlockID>::deser(input, idx)?;
+        for page_id in &gc_block_list.0 {
+            let raw_block_id = usize::from(*page_id);
+            if raw_block_id == usize::from(SUPER_BLOCK_ID) || raw_block_id >= alloc_map.len() {
                 return Err(crate::error::Error::InvalidFormat);
             }
         }
@@ -151,7 +153,7 @@ impl Deser for AllocMapGcList {
             idx,
             AllocMapGcList {
                 alloc_map,
-                gc_page_list: gc_page_list.0,
+                gc_block_list: gc_block_list.0,
             },
         ))
     }
@@ -162,16 +164,16 @@ pub struct AllocMapGcListSerView<'a> {
     /// Page allocation bitmap.
     pub alloc_map: &'a AllocMap,
     /// LWC serialization view of obsolete page ids pending reclamation.
-    pub gc_page_list: LwcPrimitiveSer<'a>,
+    pub gc_block_list: LwcPrimitiveSer<'a>,
 }
 
 impl<'a> AllocMapGcListSerView<'a> {
     /// Constructs a serialization view of allocation bitmap and GC list.
     #[inline]
-    pub fn new(alloc_map: &'a AllocMap, gc_page_list: &'a [PageID]) -> Self {
+    pub fn new(alloc_map: &'a AllocMap, gc_block_list: &'a [BlockID]) -> Self {
         AllocMapGcListSerView {
             alloc_map,
-            gc_page_list: LwcPrimitiveSer::new_u64(gc_page_list),
+            gc_block_list: LwcPrimitiveSer::new_u64(cast_slice(gc_block_list)),
         }
     }
 }
@@ -179,26 +181,31 @@ impl<'a> AllocMapGcListSerView<'a> {
 impl<'a> Ser<'a> for AllocMapGcListSerView<'a> {
     #[inline]
     fn ser_len(&self) -> usize {
-        self.alloc_map.ser_len() + self.gc_page_list.ser_len()
+        self.alloc_map.ser_len() + self.gc_block_list.ser_len()
     }
 
     #[inline]
     fn ser<S: Serde + ?Sized>(&self, out: &mut S, start_idx: usize) -> usize {
         let idx = self.alloc_map.ser(out, start_idx);
-        self.gc_page_list.ser(out, idx)
+        self.gc_block_list.ser(out, idx)
     }
 }
 
-/// Magic bytes stored at the beginning of every `catalog.mtb` meta page envelope.
-pub(crate) const MULTI_TABLE_META_MAGIC_WORD: [u8; 8] =
+/// Magic bytes stored at the beginning of every `catalog.mtb` meta block envelope.
+pub(crate) const MULTI_TABLE_META_BLOCK_MAGIC_WORD: [u8; 8] =
     [b'M', b'T', b'B', b'M', b'E', b'T', b'A', 0];
-
-/// Parsed payload of one checksummed `catalog.mtb` meta page.
+/// Raw on-disk sentinel for one catalog table without a checkpointed root block.
 ///
-/// The shared page-integrity envelope is validated before this payload is
+/// This stays `0` because block `0` is reserved for the `catalog.mtb` super
+/// block and therefore cannot be a logical catalog-table root.
+const NO_ROOT_BLOCK_ID: u64 = 0;
+
+/// Parsed payload of one checksummed `catalog.mtb` meta block.
+///
+/// The shared block-integrity envelope is validated before this payload is
 /// deserialized into catalog root state.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MultiTableMetaPageData {
+pub struct MultiTableMetaBlockData {
     /// Global next user object-id allocator watermark.
     pub next_user_obj_id: ObjID,
     /// Reserved root descriptors of catalog logical tables.
@@ -206,10 +213,10 @@ pub struct MultiTableMetaPageData {
     /// Page allocation bitmap.
     pub alloc_map: AllocMap,
     /// Obsolete page ids pending reclamation.
-    pub gc_page_list: Vec<PageID>,
+    pub gc_block_list: Vec<BlockID>,
 }
 
-impl Deser for MultiTableMetaPageData {
+impl Deser for MultiTableMetaBlockData {
     #[inline]
     fn deser<S: Serde + ?Sized>(input: &S, start_idx: usize) -> Result<(usize, Self)> {
         let (idx, next_user_obj_id) = input.deser_u64(start_idx)?;
@@ -225,15 +232,17 @@ impl Deser for MultiTableMetaPageData {
         let mut table_roots = [CatalogTableRootDesc::default(); CATALOG_TABLE_ROOT_DESC_COUNT];
         for root in &mut table_roots {
             let (next_idx, table_id) = input.deser_u64(idx)?;
-            let (next_idx, root_page_id_raw) = input.deser_u64(next_idx)?;
+            let (next_idx, root_block_id_raw) = input.deser_u64(next_idx)?;
             let (next_idx, pivot_row_id) = input.deser_u64(next_idx)?;
-            let root_page_id = NonZeroU64::new(root_page_id_raw);
-            if root_page_id.is_none() && pivot_row_id != 0 {
+            // `NO_ROOT_BLOCK_ID` decodes back to `None`; any nonzero raw value
+            // is a checkpointed persisted root block id.
+            let root_block_id = NonZeroU64::new(root_block_id_raw);
+            if root_block_id.is_none() && pivot_row_id != 0 {
                 return Err(crate::error::Error::InvalidFormat);
             }
             *root = CatalogTableRootDesc {
                 table_id,
-                root_page_id,
+                root_block_id,
                 pivot_row_id,
             };
             idx = next_idx;
@@ -243,21 +252,21 @@ impl Deser for MultiTableMetaPageData {
 
         Ok((
             idx,
-            MultiTableMetaPageData {
+            MultiTableMetaBlockData {
                 next_user_obj_id,
                 table_roots,
                 alloc_map: space.alloc_map,
-                gc_page_list: space.gc_page_list,
+                gc_block_list: space.gc_block_list,
             },
         ))
     }
 }
 
-/// Borrowed payload serialization view for `catalog.mtb` meta pages.
+/// Borrowed payload serialization view for `catalog.mtb` meta blocks.
 ///
 /// The file layer wraps this payload with the shared integrity envelope when a
 /// new catalog root is published.
-pub struct MultiTableMetaPageSerView<'a> {
+pub struct MultiTableMetaBlockSerView<'a> {
     /// Global next user object-id allocator watermark.
     pub next_user_obj_id: ObjID,
     /// Reserved root descriptors of catalog logical tables.
@@ -266,24 +275,24 @@ pub struct MultiTableMetaPageSerView<'a> {
     pub space: AllocMapGcListSerView<'a>,
 }
 
-impl<'a> MultiTableMetaPageSerView<'a> {
-    /// Constructs a `catalog.mtb` meta-page serialization view from active
+impl<'a> MultiTableMetaBlockSerView<'a> {
+    /// Constructs a `catalog.mtb` meta-block serialization view from active
     /// multi-table root state and space-management data.
     #[inline]
     pub fn new(
-        meta: &'a MultiTableMetaPage,
+        meta: &'a MultiTableMetaBlock,
         alloc_map: &'a AllocMap,
-        gc_page_list: &'a [PageID],
+        gc_block_list: &'a [BlockID],
     ) -> Self {
-        MultiTableMetaPageSerView {
+        MultiTableMetaBlockSerView {
             next_user_obj_id: meta.next_user_obj_id,
             table_roots: &meta.table_roots,
-            space: AllocMapGcListSerView::new(alloc_map, gc_page_list),
+            space: AllocMapGcListSerView::new(alloc_map, gc_block_list),
         }
     }
 }
 
-impl<'a> Ser<'a> for MultiTableMetaPageSerView<'a> {
+impl<'a> Ser<'a> for MultiTableMetaBlockSerView<'a> {
     #[inline]
     fn ser_len(&self) -> usize {
         mem::size_of::<u64>() // next_user_obj_id
@@ -304,7 +313,7 @@ impl<'a> Ser<'a> for MultiTableMetaPageSerView<'a> {
             idx = out.ser_u64(idx, root.table_id);
             idx = out.ser_u64(
                 idx,
-                root.root_page_id.map_or(SUPER_BLOCK_ID, NonZeroU64::get),
+                root.root_block_id.map_or(NO_ROOT_BLOCK_ID, NonZeroU64::get),
             );
             idx = out.ser_u64(idx, root.pivot_row_id);
         }
@@ -316,12 +325,13 @@ impl<'a> Ser<'a> for MultiTableMetaPageSerView<'a> {
 mod tests {
     use super::*;
     use crate::catalog::{ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexSpec};
+    use crate::file::multi_table_file::CATALOG_TABLE_ROOT_DESC_COUNT;
     use crate::file::table_file::ActiveRoot;
     use crate::value::ValKind;
     use std::sync::Arc;
 
     #[test]
-    fn test_meta_page_serde() {
+    fn test_meta_block_serde() {
         let metadata = Arc::new(TableMetadata::new(
             vec![
                 ColumnSpec::new("c0", ValKind::U32, ColumnAttributes::empty()),
@@ -334,21 +344,66 @@ mod tests {
             )],
         ));
         let active_root = ActiveRoot::new(7, 1024, Arc::clone(&metadata));
-        let ser_view = active_root.meta_page_ser_view();
+        let ser_view = active_root.meta_block_ser_view();
         let ser_len = ser_view.ser_len();
         let mut data = vec![0u8; ser_len];
         let res_idx = ser_view.ser(&mut data[..], 0);
         assert_eq!(res_idx, ser_len);
 
-        let (_, meta_page) = MetaPage::deser(&data[..], 0).unwrap();
-        assert_eq!(meta_page.schema, *active_root.metadata);
+        let (_, meta_block) = MetaBlock::deser(&data[..], 0).unwrap();
+        assert_eq!(meta_block.schema, *active_root.metadata);
         assert_eq!(
-            meta_page.column_block_index_root,
+            meta_block.column_block_index_root,
             active_root.column_block_index_root
         );
-        assert_eq!(meta_page.alloc_map, active_root.alloc_map);
-        assert_eq!(meta_page.gc_page_list, active_root.gc_page_list);
-        assert_eq!(meta_page.pivot_row_id, active_root.pivot_row_id);
-        assert_eq!(meta_page.heap_redo_start_ts, active_root.heap_redo_start_ts);
+        assert_eq!(meta_block.alloc_map, active_root.alloc_map);
+        assert_eq!(meta_block.gc_block_list, active_root.gc_block_list);
+        assert_eq!(meta_block.pivot_row_id, active_root.pivot_row_id);
+        assert_eq!(
+            meta_block.heap_redo_start_ts,
+            active_root.heap_redo_start_ts
+        );
+    }
+
+    #[test]
+    fn test_multi_table_meta_block_serde_none_root_block_id() {
+        let mut meta = MultiTableMetaBlock::new(USER_OBJ_ID_START + 9);
+        meta.table_roots[0].root_block_id = None;
+        meta.table_roots[0].pivot_row_id = 0;
+        meta.table_roots[1].root_block_id = NonZeroU64::new(42);
+        meta.table_roots[1].pivot_row_id = 128;
+
+        let alloc_map = AllocMap::new(128);
+        assert!(alloc_map.allocate_at(usize::from(SUPER_BLOCK_ID)));
+        let gc_block_list = vec![];
+        let ser_view = MultiTableMetaBlockSerView::new(&meta, &alloc_map, &gc_block_list);
+        let ser_len = ser_view.ser_len();
+        let mut data = vec![0u8; ser_len];
+        let res_idx = ser_view.ser(&mut data[..], 0);
+        assert_eq!(res_idx, ser_len);
+
+        let (_, decoded) = MultiTableMetaBlockData::deser(&data[..], 0).unwrap();
+        assert_eq!(decoded.next_user_obj_id, meta.next_user_obj_id);
+        assert_eq!(decoded.table_roots[0].table_id, 0);
+        assert_eq!(decoded.table_roots[0].root_block_id, None);
+        assert_eq!(decoded.table_roots[0].pivot_row_id, 0);
+        assert_eq!(decoded.table_roots[1].root_block_id, NonZeroU64::new(42));
+        assert_eq!(decoded.table_roots[1].pivot_row_id, 128);
+        assert_eq!(decoded.table_roots.len(), CATALOG_TABLE_ROOT_DESC_COUNT);
+    }
+
+    #[test]
+    fn test_alloc_map_gc_list_deser_rejects_super_block_gc_entry() {
+        let alloc_map = AllocMap::new(128);
+        assert!(alloc_map.allocate_at(usize::from(SUPER_BLOCK_ID)));
+        let gc_block_list = vec![SUPER_BLOCK_ID];
+        let ser_view = AllocMapGcListSerView::new(&alloc_map, &gc_block_list);
+        let ser_len = ser_view.ser_len();
+        let mut data = vec![0u8; ser_len];
+        let res_idx = ser_view.ser(&mut data[..], 0);
+        assert_eq!(res_idx, ser_len);
+
+        let err = AllocMapGcList::deser(&data[..], 0).unwrap_err();
+        assert!(matches!(err, crate::error::Error::InvalidFormat));
     }
 }

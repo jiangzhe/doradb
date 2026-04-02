@@ -143,9 +143,9 @@ The process is coordinated by a system transaction that defines the persistence 
     *   Merge the new deletions: `New_Bitmap = Old_Bitmap | New_Deletes`.
     *   Persist the new bitmap using Copy-on-Write (CoW), updating the Block Index and/or a dedicated Bitmap B+Tree.
 4.  **Commit & Watermark Advancement**:
-    *   A new `MetaPage` is created.
+    *   A new `MetaBlock` is created.
     *   **Crucially**, the watermark is advanced to the system timestamp acquired in Step 1: `Table.watermarks.deletion_rec_cts = Checkpoint_STS`. This happens even if no data was written (the "Heartbeat" path), ensuring the recovery watermark always moves forward.
-    *   The SuperPage is atomically updated to point to the new `MetaPage`.
+    *   The SuperBlock is atomically updated to point to the new `MetaBlock`.
 
 ### Memory Garbage Collection (Cleanup)
 Persistence of a delete is decoupled from its cleanup in memory. Entries are retained after a checkpoint to provide MVCC visibility (Undo) for long-running transactions.

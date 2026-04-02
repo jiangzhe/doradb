@@ -1,4 +1,4 @@
-use crate::buffer::page::PageID;
+use crate::buffer::PageID;
 use crate::buffer::{BufferPool, EvictableBufferPool, PoolGuards};
 use crate::catalog::{Catalog, TableCache, TableHandle};
 use crate::error::{Result, StoragePoisonSource};
@@ -971,7 +971,7 @@ mod tests {
             };
             let page_id = match table.find_row(&pool_guards, row_id).await {
                 RowLocation::RowPage(page_id) => page_id,
-                RowLocation::LwcPage { .. } | RowLocation::NotFound => unreachable!(),
+                RowLocation::LwcBlock { .. } | RowLocation::NotFound => unreachable!(),
             };
             let page_guard = table
                 .mem_pool()
@@ -1079,7 +1079,7 @@ mod tests {
             };
             let page_id = match table.find_row(&pool_guards, row_id).await {
                 RowLocation::RowPage(page_id) => page_id,
-                RowLocation::LwcPage { .. } | RowLocation::NotFound => unreachable!(),
+                RowLocation::LwcBlock { .. } | RowLocation::NotFound => unreachable!(),
             };
             let page_guard = table
                 .mem_pool()

@@ -139,6 +139,7 @@ impl CommitGroup {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::buffer::test_page_id;
     use crate::io::Completion;
     use crate::trx::log_replay::TrxLog;
     use crate::trx::redo::{RedoHeader, RedoLogs, RedoTrxKind, RowRedo, RowRedoKind, TableDML};
@@ -162,7 +163,7 @@ mod tests {
         rows.insert(
             1u64,
             RowRedo {
-                page_id: 5,
+                page_id: test_page_id(5),
                 row_id: 100,
                 kind: RowRedoKind::Insert(vec![Val::from(1u32), Val::from(&s[..])]),
             },

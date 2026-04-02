@@ -1,12 +1,12 @@
 use crate::buffer::guard::{PageExclusiveGuard, PageGuard};
-use crate::buffer::page::{BufferPage, PageID};
+use crate::buffer::page::BufferPage;
 use crate::buffer::{BufferPool, FixedBufferPool, PoolGuard, PoolGuards};
 use crate::catalog::storage::CatalogStorage;
 use crate::catalog::table::TableMetadata;
 use crate::catalog::{CatalogCheckpointBatch, CatalogRedoEntry};
 use crate::catalog::{ObjID, TableID, USER_OBJ_ID_START};
-use crate::error::{Error, PersistedPageCorruptionCause, PersistedPageKind, Result};
-use crate::file::cow_file::SUPER_BLOCK_ID;
+use crate::error::{BlockCorruptionCause, BlockKind, Error, Result};
+use crate::file::cow_file::{BlockID, SUPER_BLOCK_ID};
 use crate::file::multi_table_file::{
     CATALOG_TABLE_ROOT_DESC_COUNT, CatalogTableRootDesc, MultiTableFileSnapshot,
     MutableMultiTableFile,
@@ -16,7 +16,7 @@ use crate::index::{
     ColumnDeleteDomain, ColumnLeafEntry, load_entry_deletion_deltas,
 };
 use crate::io::DirectBuf;
-use crate::lwc::{LwcBuilder, PersistedLwcPage};
+use crate::lwc::{LwcBuilder, PersistedLwcBlock};
 use crate::row::ops::SelectKey;
 use crate::row::{InsertRow, RowID, RowPage};
 use crate::trx::redo::RowRedoKind;
@@ -24,7 +24,7 @@ use crate::value::Val;
 use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroU64;
 
-struct PendingLwcPage {
+struct PendingLwcBlock {
     shape: ColumnBlockEntryShape,
     buf: DirectBuf,
 }
@@ -59,7 +59,7 @@ impl CatalogStorage {
             if idx >= self.tables.len() {
                 break;
             }
-            if root.root_page_id.is_none() {
+            if root.root_block_id.is_none() {
                 if root.pivot_row_id != 0 {
                     return Err(Error::InvalidState);
                 }
@@ -168,18 +168,18 @@ impl CatalogStorage {
     ) -> Result<CatalogTableRootDesc> {
         let disk_pool_guard = self.disk_pool.pool_guard();
         // Step 1: Validate root invariants and construct a base index snapshot for reads.
-        if root.root_page_id.is_none() && root.pivot_row_id != 0 {
+        if root.root_block_id.is_none() && root.pivot_row_id != 0 {
             return Err(Error::InvalidState);
         }
-        let root_block_id = root.root_page_id.map_or(SUPER_BLOCK_ID, NonZeroU64::get);
-        let entries = if root_block_id == SUPER_BLOCK_ID {
-            Vec::new()
-        } else {
+        let root_block_id = root.checkpoint_root_block_id();
+        let entries = if let Some(root_block_id) = root_block_id {
             self.collect_index_entries(&disk_pool_guard, root_block_id)
                 .await?
+        } else {
+            Vec::new()
         };
         let base_index = ColumnBlockIndex::new(
-            root_block_id,
+            root_block_id.unwrap_or(SUPER_BLOCK_ID),
             root.pivot_row_id,
             &self.disk_pool,
             &disk_pool_guard,
@@ -252,7 +252,7 @@ impl CatalogStorage {
         }
 
         // Step 4: Build the live-insert batch after canceling same-batch insert+delete rows.
-        let mut current_root_block_id = root_block_id;
+        let mut current_root_block_id = root_block_id.unwrap_or(SUPER_BLOCK_ID);
         let mut current_end_row_id = root.pivot_row_id;
         let mut entries_changed = false;
         let mut live_inserts = Vec::new();
@@ -265,7 +265,7 @@ impl CatalogStorage {
             }
         }
 
-        // Step 5: Try CoW-merging inserts into the right-most existing LWC page first.
+        // Step 5: Try CoW-merging inserts into the right-most existing LWC block first.
         if !live_inserts.is_empty()
             && let Some(last_entry) = entries.last().copied()
         {
@@ -274,7 +274,7 @@ impl CatalogStorage {
                 .await?;
             if !existing_tail_rows.is_empty()
                 && let Some((merged_tail_buf, merged_row_ids, consumed)) = self
-                    .build_merged_tail_lwc_page(
+                    .build_merged_tail_lwc_block(
                         metadata,
                         last_entry.start_row_id,
                         &existing_tail_rows,
@@ -282,11 +282,11 @@ impl CatalogStorage {
                     )
                     .await?
             {
-                let new_tail_page_id = mutable.allocate_page_id()?;
+                let new_tail_page_id = mutable.allocate_block_id()?;
                 mutable
-                    .write_page(new_tail_page_id, merged_tail_buf)
+                    .write_block(new_tail_page_id, merged_tail_buf)
                     .await?;
-                mutable.record_gc_page(last_entry.block_id());
+                mutable.record_gc_block(last_entry.block_id());
                 let merged_end_row_id = live_inserts
                     .get(consumed.saturating_sub(1))
                     .map(|row| row.row_id.saturating_add(1))
@@ -321,15 +321,15 @@ impl CatalogStorage {
             }
         }
 
-        // Step 6: Persist any remaining inserts as new LWC pages and append index entries.
+        // Step 6: Persist any remaining inserts as new LWC blocks and append index entries.
         if !live_inserts.is_empty() {
             let new_pages = self
-                .build_lwc_pages_from_row_records(&self.meta_pool, metadata, &live_inserts)
+                .build_lwc_blocks_from_row_records(&self.meta_pool, metadata, &live_inserts)
                 .await?;
             let mut new_entries = Vec::with_capacity(new_pages.len());
             for page in new_pages {
-                let page_id = mutable.allocate_page_id()?;
-                mutable.write_page(page_id, page.buf).await?;
+                let page_id = mutable.allocate_block_id()?;
+                mutable.write_block(page_id, page.buf).await?;
                 new_entries.push(page.shape.with_block_id(page_id));
             }
             if !new_entries.is_empty() {
@@ -386,22 +386,31 @@ impl CatalogStorage {
         }
 
         // Step 9: Publish final per-table root descriptor for this checkpoint batch.
-        let root_page_id = if entries_changed {
-            Some(NonZeroU64::new(current_root_block_id).ok_or(Error::InvalidState)?)
+        let next_pivot_row_id = next_row_id.max(root.pivot_row_id);
+        let (root_block_id, pivot_row_id) = if current_root_block_id == SUPER_BLOCK_ID {
+            // Same-batch insert/delete on an empty root can advance `next_row_id`
+            // without materializing any persisted blocks. Keep the published
+            // descriptor empty instead of emitting `None` with a nonzero pivot.
+            (root.root_block_id, root.pivot_row_id)
         } else {
-            root.root_page_id
+            let root_block_id = if entries_changed || next_pivot_row_id > root.pivot_row_id {
+                Some(NonZeroU64::new(current_root_block_id.into()).ok_or(Error::InvalidState)?)
+            } else {
+                root.root_block_id
+            };
+            (root_block_id, next_pivot_row_id)
         };
         Ok(CatalogTableRootDesc {
             table_id,
-            root_page_id,
-            pivot_row_id: next_row_id.max(root.pivot_row_id),
+            root_block_id,
+            pivot_row_id,
         })
     }
 
     async fn collect_index_entries(
         &self,
         disk_pool_guard: &PoolGuard,
-        root_block_id: PageID,
+        root_block_id: BlockID,
     ) -> Result<Vec<CatalogIndexEntry>> {
         assert_ne!(
             root_block_id, SUPER_BLOCK_ID,
@@ -418,16 +427,15 @@ impl CatalogStorage {
         disk_pool_guard: &PoolGuard,
         root: CatalogTableRootDesc,
     ) -> Result<Vec<RowRecord>> {
-        if root.root_page_id.is_none() {
+        if root.root_block_id.is_none() {
             if root.pivot_row_id != 0 {
                 return Err(Error::InvalidState);
             }
             return Ok(Vec::new());
         }
         let root_block_id = root
-            .root_page_id
-            .map(NonZeroU64::get)
-            .unwrap_or(SUPER_BLOCK_ID);
+            .checkpoint_root_block_id()
+            .expect("root_block_id checked above");
         let entries = self
             .collect_index_entries(disk_pool_guard, root_block_id)
             .await?;
@@ -502,32 +510,32 @@ impl CatalogStorage {
         column_index: &ColumnBlockIndex<'_>,
         entry: &CatalogIndexEntry,
     ) -> Result<Vec<RowRecord>> {
-        let lwc_page =
-            PersistedLwcPage::load(&self.disk_pool, disk_pool_guard, entry.block_id()).await?;
-        let row_count = lwc_page.row_count();
+        let lwc_block =
+            PersistedLwcBlock::load(&self.disk_pool, disk_pool_guard, entry.block_id()).await?;
+        let row_count = lwc_block.row_count();
         let row_ids = column_index.load_entry_row_ids(entry).await?;
         if row_count != row_ids.len() {
-            return Err(Error::persisted_page_corrupted(
-                self.disk_pool.persisted_file_kind(),
-                PersistedPageKind::LwcPage,
+            return Err(Error::block_corrupted(
+                self.disk_pool.file_kind(),
+                BlockKind::LwcBlock,
                 entry.block_id(),
-                PersistedPageCorruptionCause::InvalidPayload,
+                BlockCorruptionCause::InvalidPayload,
             ));
         }
         let mut rows = Vec::with_capacity(row_count);
         for (row_idx, row_id) in row_ids.into_iter().enumerate() {
-            let vals = lwc_page.decode_full_row_values(metadata, row_idx)?;
+            let vals = lwc_block.decode_full_row_values(metadata, row_idx)?;
             rows.push(RowRecord { row_id, vals });
         }
         Ok(rows)
     }
 
-    async fn build_lwc_pages_from_row_records(
+    async fn build_lwc_blocks_from_row_records(
         &self,
         meta_pool: &FixedBufferPool,
         metadata: &TableMetadata,
         rows: &[RowRecord],
-    ) -> Result<Vec<PendingLwcPage>> {
+    ) -> Result<Vec<PendingLwcBlock>> {
         for row in rows {
             if row.vals.len() != metadata.col_count() {
                 return Err(Error::InvalidFormat);
@@ -537,7 +545,7 @@ impl CatalogStorage {
             return Ok(Vec::new());
         }
 
-        let mut lwc_pages = Vec::new();
+        let mut lwc_blocks = Vec::new();
         let mut builder = LwcBuilder::new(metadata);
         let mut builder_start = None;
         let mut builder_end = 0u64;
@@ -560,7 +568,7 @@ impl CatalogStorage {
                     Vec::new(),
                 )?;
                 let buf = builder.build(shape.row_shape_fingerprint())?;
-                lwc_pages.push(PendingLwcPage { shape, buf });
+                lwc_blocks.push(PendingLwcBlock { shape, buf });
 
                 builder = LwcBuilder::new(metadata);
                 builder_start = Some(row.row_id);
@@ -585,12 +593,12 @@ impl CatalogStorage {
                 Vec::new(),
             )?;
             let buf = builder.build(shape.row_shape_fingerprint())?;
-            lwc_pages.push(PendingLwcPage { shape, buf });
+            lwc_blocks.push(PendingLwcBlock { shape, buf });
         }
-        Ok(lwc_pages)
+        Ok(lwc_blocks)
     }
 
-    async fn build_merged_tail_lwc_page(
+    async fn build_merged_tail_lwc_block(
         &self,
         metadata: &TableMetadata,
         start_row_id: RowID,
@@ -685,12 +693,103 @@ fn row_matches_key(metadata: &TableMetadata, row: &[Val], key: &SelectKey) -> bo
 
 #[cfg(test)]
 mod tests {
-    use crate::buffer::PersistedBlockKey;
+    use super::*;
+    use crate::buffer::BlockKey;
+    use crate::catalog::USER_OBJ_ID_START;
     use crate::catalog::tests::{table1, table2};
     use crate::conf::{EngineConfig, TrxSysConfig};
-    use crate::file::multi_table_file::CATALOG_MTB_PERSISTED_FILE_ID;
+    use crate::file::BlockID;
+    use crate::file::multi_table_file::{CATALOG_MTB_PERSISTED_FILE_ID, MutableMultiTableFile};
     use crate::index::{ColumnBlockIndex, ColumnDeleteDomain, load_entry_deletion_deltas};
+    use crate::row::ops::SelectKey;
+    use crate::trx::redo::RowRedoKind;
+    use crate::value::Val;
     use tempfile::TempDir;
+
+    #[test]
+    fn test_catalog_checkpoint_apply_table_ops_keeps_empty_root_for_canceled_insert_batch() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let main_dir = temp_dir.path().to_path_buf();
+            let engine = EngineConfig::default()
+                .storage_root(main_dir)
+                .trx(
+                    TrxSysConfig::default()
+                        .log_file_stem("catalog-checkpoint-canceled-empty-root")
+                        .skip_recovery(false),
+                )
+                .build()
+                .await
+                .unwrap();
+
+            let storage = &engine.catalog().storage;
+            let table = storage.get_catalog_table(0).unwrap();
+            let root = CatalogTableRootDesc {
+                table_id: 0,
+                root_block_id: None,
+                pivot_row_id: 0,
+            };
+            let table_id = USER_OBJ_ID_START + 42;
+            let table_ops = vec![
+                RowRedoKind::Insert(vec![Val::from(table_id)]),
+                RowRedoKind::DeleteByUniqueKey(SelectKey::new(0, vec![Val::from(table_id)])),
+            ];
+            let mut mutable = MutableMultiTableFile::fork(&storage.mtb);
+
+            let next_root = storage
+                .apply_table_ops(&mut mutable, 0, table.metadata(), root, &table_ops, 7)
+                .await
+                .unwrap();
+
+            assert_eq!(next_root.root_block_id, None);
+            assert_eq!(next_root.pivot_row_id, 0);
+        });
+    }
+
+    #[test]
+    fn test_catalog_checkpoint_apply_table_ops_advances_existing_root_for_canceled_insert_batch() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let main_dir = temp_dir.path().to_path_buf();
+            let engine = EngineConfig::default()
+                .storage_root(main_dir)
+                .trx(
+                    TrxSysConfig::default()
+                        .log_file_stem("catalog-checkpoint-canceled-existing-root")
+                        .skip_recovery(false),
+                )
+                .build()
+                .await
+                .unwrap();
+
+            let _ = table1(&engine).await;
+            engine
+                .catalog()
+                .checkpoint_now(&engine.trx_sys)
+                .await
+                .unwrap();
+
+            let storage = &engine.catalog().storage;
+            let table = storage.get_catalog_table(0).unwrap();
+            let root = storage.checkpoint_snapshot().unwrap().meta.table_roots[0];
+            assert!(root.root_block_id.is_some());
+
+            let table_id = USER_OBJ_ID_START + 4242;
+            let table_ops = vec![
+                RowRedoKind::Insert(vec![Val::from(table_id)]),
+                RowRedoKind::DeleteByUniqueKey(SelectKey::new(0, vec![Val::from(table_id)])),
+            ];
+            let mut mutable = MutableMultiTableFile::fork(&storage.mtb);
+
+            let next_root = storage
+                .apply_table_ops(&mut mutable, 0, table.metadata(), root, &table_ops, 8)
+                .await
+                .unwrap();
+
+            assert_eq!(next_root.root_block_id, root.root_block_id);
+            assert_eq!(next_root.pivot_row_id, root.pivot_row_id + 1);
+        });
+    }
 
     #[test]
     fn test_catalog_checkpoint_collect_index_entries_uses_readonly_cache() {
@@ -717,7 +816,7 @@ mod tests {
 
             let snap = engine.catalog().storage.checkpoint_snapshot().unwrap();
             let tables_root = snap.meta.table_roots[0];
-            let root_page_id = tables_root.root_page_id.unwrap().get();
+            let root_block_id = BlockID::from(tables_root.root_block_id.unwrap().get());
             let disk_pool_guard = engine.catalog().storage.disk_pool.pool_guard();
 
             assert_eq!(engine.disk_pool.allocated(), 0);
@@ -725,20 +824,20 @@ mod tests {
             let entries1 = engine
                 .catalog()
                 .storage
-                .collect_index_entries(&disk_pool_guard, root_page_id)
+                .collect_index_entries(&disk_pool_guard, root_block_id)
                 .await
                 .unwrap();
             assert!(!entries1.is_empty());
 
             let cached_after_first = engine.disk_pool.allocated();
             assert!(cached_after_first >= 1);
-            let root_key = PersistedBlockKey::new(CATALOG_MTB_PERSISTED_FILE_ID, root_page_id);
+            let root_key = BlockKey::new(CATALOG_MTB_PERSISTED_FILE_ID, root_block_id);
             assert!(engine.disk_pool.try_get_frame_id(&root_key).is_some());
 
             let entries2 = engine
                 .catalog()
                 .storage
-                .collect_index_entries(&disk_pool_guard, root_page_id)
+                .collect_index_entries(&disk_pool_guard, root_block_id)
                 .await
                 .unwrap();
             assert_eq!(entries2.len(), entries1.len());
@@ -771,12 +870,15 @@ mod tests {
 
             let snap1 = engine.catalog().storage.checkpoint_snapshot().unwrap();
             let tables_root1 = snap1.meta.table_roots[0];
-            assert!(tables_root1.root_page_id.is_some());
+            assert!(tables_root1.root_block_id.is_some());
             let disk_pool_guard = engine.catalog().storage.disk_pool.pool_guard();
             let entries1 = engine
                 .catalog()
                 .storage
-                .collect_index_entries(&disk_pool_guard, tables_root1.root_page_id.unwrap().get())
+                .collect_index_entries(
+                    &disk_pool_guard,
+                    BlockID::from(tables_root1.root_block_id.unwrap().get()),
+                )
                 .await
                 .unwrap();
             assert!(!entries1.is_empty());
@@ -793,12 +895,15 @@ mod tests {
             let entries2 = engine
                 .catalog()
                 .storage
-                .collect_index_entries(&disk_pool_guard, tables_root2.root_page_id.unwrap().get())
+                .collect_index_entries(
+                    &disk_pool_guard,
+                    BlockID::from(tables_root2.root_block_id.unwrap().get()),
+                )
                 .await
                 .unwrap();
 
             assert!(tables_root2.pivot_row_id > tables_root1.pivot_row_id);
-            assert!(tables_root2.root_page_id != tables_root1.root_page_id);
+            assert!(tables_root2.root_block_id != tables_root1.root_block_id);
             assert_eq!(
                 entries2.len(),
                 entries1.len(),
@@ -808,13 +913,13 @@ mod tests {
             let last1 = entries1.last().copied().unwrap();
             let last2 = entries2.last().copied().unwrap();
             let index1 = ColumnBlockIndex::new(
-                tables_root1.root_page_id.unwrap().get(),
+                BlockID::from(tables_root1.root_block_id.unwrap().get()),
                 tables_root1.pivot_row_id,
                 &engine.catalog().storage.disk_pool,
                 &disk_pool_guard,
             );
             let index2 = ColumnBlockIndex::new(
-                tables_root2.root_page_id.unwrap().get(),
+                BlockID::from(tables_root2.root_block_id.unwrap().get()),
                 tables_root2.pivot_row_id,
                 &engine.catalog().storage.disk_pool,
                 &disk_pool_guard,

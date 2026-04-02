@@ -1,11 +1,11 @@
+use crate::buffer::PageID;
 use crate::buffer::PoolGuards;
-use crate::buffer::page::PageID;
-use crate::error::{Error, PersistedPageCorruptionCause, PersistedPageKind, Result};
+use crate::error::{BlockCorruptionCause, BlockKind, Error, Result};
 use crate::file::cow_file::SUPER_BLOCK_ID;
 use crate::index::{
     ColumnBlockIndex, IndexInsert, NonUniqueIndex, UniqueIndex, load_entry_deletion_deltas,
 };
-use crate::lwc::PersistedLwcPage;
+use crate::lwc::PersistedLwcBlock;
 use crate::row::ops::{ReadRow, SelectKey, UpdateCol};
 use crate::row::{RowID, RowRead};
 use crate::table::{
@@ -59,7 +59,7 @@ pub trait TableRecover {
         page_id: PageID,
     ) -> impl Future<Output = Result<()>>;
 
-    /// Populate indexes using persisted LWC pages below the current pivot boundary.
+    /// Populate indexes using persisted LWC blocks below the current pivot boundary.
     fn populate_index_via_persisted_data(
         &self,
         guards: &PoolGuards,
@@ -273,15 +273,15 @@ impl TableRecover for Table {
         );
         for entry in index.collect_leaf_entries().await? {
             let deleted = load_entry_deletion_deltas(&index, &entry).await?;
-            let page =
-                PersistedLwcPage::load(self.disk_pool(), disk_pool_guard, entry.block_id()).await?;
+            let page = PersistedLwcBlock::load(self.disk_pool(), disk_pool_guard, entry.block_id())
+                .await?;
             let row_ids = index.load_entry_row_ids(&entry).await?;
             if page.row_count() != row_ids.len() {
-                return Err(Error::persisted_page_corrupted(
-                    self.disk_pool().persisted_file_kind(),
-                    PersistedPageKind::LwcPage,
+                return Err(Error::block_corrupted(
+                    self.disk_pool().file_kind(),
+                    BlockKind::LwcBlock,
                     entry.block_id(),
-                    PersistedPageCorruptionCause::InvalidPayload,
+                    BlockCorruptionCause::InvalidPayload,
                 ));
             }
 

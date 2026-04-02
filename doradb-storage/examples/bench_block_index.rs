@@ -4,7 +4,7 @@ use doradb_storage::catalog::{
     ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexSpec, TableMetadata,
 };
 use doradb_storage::conf::{EngineConfig, EvictableBufferPoolConfig, TrxSysConfig};
-use doradb_storage::index::{RowBlockIndex, RowLocation};
+use doradb_storage::index::{RowLocation, RowPageIndex};
 use doradb_storage::value::ValKind;
 use parking_lot::RwLock;
 
@@ -46,7 +46,7 @@ fn main() {
             ));
             let meta_guard = engine.meta_pool.pool_guard();
             let blk_idx =
-                Arc::new(RowBlockIndex::new(engine.meta_pool.clone_inner(), &meta_guard, 0).await);
+                Arc::new(RowPageIndex::new(engine.meta_pool.clone_inner(), &meta_guard, 0).await);
             let mem_guard = engine.mem_pool.pool_guard();
 
             for _ in 0..args.pages {
@@ -160,7 +160,7 @@ fn bench_btreemap(args: Args) {
 
 async fn worker(
     args: Args,
-    blk_idx: Arc<RowBlockIndex>,
+    blk_idx: Arc<RowPageIndex>,
     meta_guard: doradb_storage::buffer::PoolGuard,
     stop: Arc<AtomicBool>,
 ) -> (usize, u64) {
@@ -175,7 +175,7 @@ async fn worker(
         match res {
             RowLocation::RowPage(page_id) => {
                 count += 1;
-                sum_page_id += page_id;
+                sum_page_id += u64::from(page_id);
             }
             _ => panic!("invalid search result"),
         }

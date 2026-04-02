@@ -1,12 +1,13 @@
 use clap::Parser;
 use doradb_storage::buffer::frame::BufferFrame;
-use doradb_storage::buffer::page::{PAGE_SIZE, Page, PageID};
+use doradb_storage::buffer::page::{PAGE_SIZE, Page};
 use doradb_storage::buffer::{BufferPoolStats, PoolRole, ReadonlyBufferPool};
 use doradb_storage::catalog::{ColumnAttributes, ColumnSpec, TableMetadata};
 use doradb_storage::conf::{
     EngineConfig, EvictableBufferPoolConfig, TableFileSystemConfig, TrxSysConfig,
 };
-use doradb_storage::error::PersistedFileKind;
+use doradb_storage::error::FileKind;
+use doradb_storage::file::BlockID;
 use doradb_storage::io::{AIOBuf, DirectBuf, IOBackendStats};
 use doradb_storage::quiescent::QuiescentBox;
 use doradb_storage::value::ValKind;
@@ -27,7 +28,7 @@ const MIN_READONLY_POOL_PAGES: usize = 256;
     about = "Readonly buffer-pool serialized single-miss latency benchmark"
 )]
 struct Args {
-    /// Number of persisted pages written to the table file.
+    /// Number of persisted blocks written to the table file.
     #[arg(long, default_value_t = DEFAULT_PAGES)]
     pages: usize,
     /// Number of random warm-hit control reads after the full resident set is loaded.
@@ -60,7 +61,10 @@ async fn write_pages(table_file: &Arc<doradb_storage::file::table_file::TableFil
         let bytes = buf.as_bytes_mut();
         bytes.fill(0);
         bytes[0..8].copy_from_slice(&(page_id as u64).to_le_bytes());
-        table_file.write_page(page_id as PageID, buf).await.unwrap();
+        table_file
+            .write_block(BlockID::from(page_id), buf)
+            .await
+            .unwrap();
     }
 }
 
@@ -197,7 +201,7 @@ fn main() {
 
         let pool = QuiescentBox::new(ReadonlyBufferPool::from_table_file(
             901,
-            PersistedFileKind::TableFile,
+            FileKind::TableFile,
             Arc::clone(&table_file),
             engine.disk_pool.clone_inner(),
         ));
@@ -218,9 +222,9 @@ fn main() {
         let cold_backend_start = engine.table_fs.io_backend_stats();
         let cold_start = std::time::Instant::now();
         let mut cold_checksum = 0u64;
-        for page_id in 0..args.pages as PageID {
+        for page_id in 0..args.pages {
             let g = pool
-                .read_block(&pool_guard, page_id)
+                .read_block(&pool_guard, BlockID::from(page_id))
                 .await
                 .expect("buffer-pool read failed in benchmark");
             let mut arr = [0u8; 8];
@@ -247,9 +251,9 @@ fn main() {
         let mut warm_checksum = 0u64;
         let mut rng = rand::rng();
         for _ in 0..args.warm_reads {
-            let page_id = (rng.next_u64() % args.pages as u64) as PageID;
+            let page_id = rng.next_u64() % args.pages as u64;
             let g = pool
-                .read_block(&pool_guard, page_id)
+                .read_block(&pool_guard, BlockID::from(page_id))
                 .await
                 .expect("buffer-pool read failed in benchmark");
             warm_checksum ^= g.page()[0] as u64;

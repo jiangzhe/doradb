@@ -1,6 +1,7 @@
 use crate::buffer::PersistedFileID;
-use crate::buffer::page::{INVALID_PAGE_ID, Page, PageID, VersionedPageID};
+use crate::buffer::page::{Page, PageID, VersionedPageID};
 use crate::catalog::TableMetadata;
+use crate::file::cow_file::{BlockID, INVALID_BLOCK_ID};
 use crate::latch::HybridLatch;
 use crate::trx::TrxID;
 use crate::trx::recover::RecoverMap;
@@ -101,20 +102,21 @@ impl BufferFrame {
 
     /// Returns the persisted-block identity stored in this frame, if present.
     #[inline]
-    pub fn persisted_block_key(&self) -> Option<(PersistedFileID, PageID)> {
+    pub fn persisted_block_key(&self) -> Option<(PersistedFileID, BlockID)> {
         if !self.has_persisted_block_key.load(Ordering::Acquire) {
             return None;
         }
         let file_id = self.persisted_file_id.load(Ordering::Acquire);
         let block_id = self.persisted_block_id.load(Ordering::Acquire);
-        Some((file_id, block_id))
+        Some((file_id, BlockID::from(block_id)))
     }
 
     /// Updates persisted-block metadata for this frame.
     #[inline]
-    pub fn set_persisted_block_key(&self, file_id: PersistedFileID, block_id: PageID) {
+    pub fn set_persisted_block_key(&self, file_id: PersistedFileID, block_id: BlockID) {
         self.persisted_file_id.store(file_id, Ordering::Release);
-        self.persisted_block_id.store(block_id, Ordering::Release);
+        self.persisted_block_id
+            .store(block_id.into(), Ordering::Release);
         self.has_persisted_block_key.store(true, Ordering::Release);
     }
 
@@ -124,7 +126,7 @@ impl BufferFrame {
         self.has_persisted_block_key.store(false, Ordering::Release);
         self.persisted_file_id.store(0, Ordering::Release);
         self.persisted_block_id
-            .store(INVALID_PAGE_ID, Ordering::Release);
+            .store(INVALID_BLOCK_ID.into(), Ordering::Release);
     }
 
     #[inline]
@@ -147,13 +149,13 @@ impl Default for BufferFrame {
     fn default() -> Self {
         BufferFrame {
             latch: HybridLatch::new(),
-            page_id: 0,
+            page_id: PageID::new(0),
             frame_kind: AtomicU8::new(FrameKind::Uninitialized as u8),
             generation: AtomicU64::new(0),
             // by default the page is dirty because no copy on disk.
             dirty: AtomicBool::new(true),
             persisted_file_id: AtomicU64::new(0),
-            persisted_block_id: AtomicU64::new(INVALID_PAGE_ID),
+            persisted_block_id: AtomicU64::new(INVALID_BLOCK_ID.into()),
             has_persisted_block_key: AtomicBool::new(false),
             ctx: None,
             page: std::ptr::null_mut(),

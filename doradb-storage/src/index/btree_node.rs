@@ -538,17 +538,17 @@ impl BTreeNode {
     pub fn lookup_child(&self, key: &[u8]) -> LookupChild {
         debug_assert!(!self.is_leaf());
         match self.search_key(key) {
-            Ok(idx) => LookupChild::Slot(idx, self.value::<BTreeU64>(idx).to_u64()),
+            Ok(idx) => LookupChild::Slot(idx, self.value::<BTreeU64>(idx).into()),
             Err(idx) => {
                 if idx == 0 {
                     // key less than first key.
                     return if self.header.lower_fence_value.is_deleted() {
                         LookupChild::NotFound
                     } else {
-                        LookupChild::LowerFence(self.header.lower_fence_value.to_u64())
+                        LookupChild::LowerFence(self.header.lower_fence_value.into())
                     };
                 }
-                LookupChild::Slot(idx - 1, self.value::<BTreeU64>(idx - 1).to_u64())
+                LookupChild::Slot(idx - 1, self.value::<BTreeU64>(idx - 1).into())
             }
         }
     }
@@ -1010,7 +1010,7 @@ impl BTreeNode {
     /// Convenient method to get value as page id.
     #[inline]
     pub(super) fn value_as_page_id(&self, idx: usize) -> PageID {
-        self.value::<BTreeU64>(idx).to_u64()
+        self.value::<BTreeU64>(idx).into()
     }
 
     #[inline]

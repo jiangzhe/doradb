@@ -334,15 +334,17 @@ impl BufferPool for EvictableBufferPool {
             // Now we have memory budget to allocate new page.
             match self.alloc_map.try_allocate() {
                 Some(page_id) => {
-                    self.in_mem.pin(page_id as PageID);
-                    return self.arena.init_page(guard, page_id as PageID);
+                    let page_id = PageID::from(page_id);
+                    self.in_mem.pin(page_id);
+                    return self.arena.init_page(guard, page_id);
                 }
                 None => {
                     listener!(self.alloc_ev => listener);
                     // re-check
                     if let Some(page_id) = self.alloc_map.try_allocate() {
-                        self.in_mem.pin(page_id as PageID);
-                        return self.arena.init_page(guard, page_id as PageID);
+                        let page_id = PageID::from(page_id);
+                        self.in_mem.pin(page_id);
+                        return self.arena.init_page(guard, page_id);
                     }
 
                     // Here we cannot find a free page to load, we should cancel reservation of a page
@@ -362,7 +364,7 @@ impl BufferPool for EvictableBufferPool {
     ) -> Result<PageExclusiveGuard<T>> {
         self.reserve_page().await;
 
-        if self.alloc_map.allocate_at(page_id as usize) {
+        if self.alloc_map.allocate_at(usize::from(page_id)) {
             self.in_mem.pin(page_id);
             Ok(self.arena.init_page(guard, page_id))
         } else {
@@ -495,7 +497,7 @@ impl BufferPool for EvictableBufferPool {
         g.bf_mut().bump_generation();
         self.in_mem.unpin(page_id);
         self.in_mem.mark_page_dontneed(g);
-        self.alloc_map.deallocate(page_id as usize);
+        self.alloc_map.deallocate(usize::from(page_id));
         self.alloc_ev.notify(usize::MAX);
     }
 
@@ -1161,7 +1163,7 @@ impl EvictReadSubmission {
         // SAFETY: the reservation keeps the page slot alive and exclusively
         // owned until the read completes or rolls back.
         let operation = unsafe {
-            Operation::pread_borrowed(raw_fd, page_id as usize * PAGE_SIZE, ptr, PAGE_SIZE)
+            Operation::pread_borrowed(raw_fd, usize::from(page_id) * PAGE_SIZE, ptr, PAGE_SIZE)
         };
         stats.add_queued_reads(1);
         EvictReadSubmission {
@@ -1289,7 +1291,7 @@ impl SingleFileIO {
         unsafe {
             Operation::pwrite_borrowed(
                 self.file.as_raw_fd(),
-                page_id as usize * PAGE_SIZE,
+                usize::from(page_id) * PAGE_SIZE,
                 ptr as *mut u8,
                 PAGE_SIZE,
             )
@@ -1496,6 +1498,7 @@ mod tests {
     use super::*;
     use crate::buffer::EvictionArbiterBuilder;
     use crate::buffer::guard::PageGuard;
+    use crate::buffer::test_page_id;
     use crate::quiescent::{QuiescentBox, QuiescentGuard};
     use crate::row::RowPage;
     use crate::thread::join_worker;
@@ -1663,7 +1666,7 @@ mod tests {
             }
             {
                 let g = pool
-                    .get_page::<RowPage>(&pool_guard, 0, LatchFallbackMode::Spin)
+                    .get_page::<RowPage>(&pool_guard, test_page_id(0), LatchFallbackMode::Spin)
                     .await
                     .expect("buffer-pool read failed in test")
                     .downgrade();
@@ -1671,14 +1674,19 @@ mod tests {
                 let p = g.facade();
                 // test coupling.
                 let c = pool
-                    .get_child_page::<RowPage>(&pool_guard, &p, 1, LatchFallbackMode::Exclusive)
+                    .get_child_page::<RowPage>(
+                        &pool_guard,
+                        &p,
+                        test_page_id(1),
+                        LatchFallbackMode::Exclusive,
+                    )
                     .await;
                 let c = c.unwrap();
                 drop(c);
             }
             {
                 let g = pool
-                    .get_page::<RowPage>(&pool_guard, 0, LatchFallbackMode::Spin)
+                    .get_page::<RowPage>(&pool_guard, test_page_id(0), LatchFallbackMode::Spin)
                     .await
                     .expect("buffer-pool read failed in test")
                     .downgrade();
@@ -1687,7 +1695,7 @@ mod tests {
 
                 // modify page 0.
                 let g = pool
-                    .get_page::<RowPage>(&pool_guard, 0, LatchFallbackMode::Exclusive)
+                    .get_page::<RowPage>(&pool_guard, test_page_id(0), LatchFallbackMode::Exclusive)
                     .await
                     .expect("buffer-pool read failed in test")
                     .verify_exclusive_async::<false>()
@@ -1696,7 +1704,12 @@ mod tests {
 
                 // test coupling fail.
                 let c = pool
-                    .get_child_page::<RowPage>(&pool_guard, &p, 1, LatchFallbackMode::Exclusive)
+                    .get_child_page::<RowPage>(
+                        &pool_guard,
+                        &p,
+                        test_page_id(1),
+                        LatchFallbackMode::Exclusive,
+                    )
                     .await;
                 assert!(c.unwrap().is_invalid());
             }
@@ -1982,10 +1995,10 @@ mod tests {
                 drop(g);
             }
 
-            wait_for(|| pool.arena.frame(0).kind() == FrameKind::Evicted);
+            wait_for(|| pool.arena.frame(test_page_id(0)).kind() == FrameKind::Evicted);
 
             let g = pool
-                .get_page::<Page>(&pool_guard, 0, LatchFallbackMode::Shared)
+                .get_page::<Page>(&pool_guard, test_page_id(0), LatchFallbackMode::Shared)
                 .await
                 .expect("buffer-pool read failed in test");
             let g = g.lock_shared_async().await.unwrap();

@@ -26,7 +26,7 @@ pub(super) enum ClockHand {
 impl Default for ClockHand {
     #[inline]
     fn default() -> Self {
-        ClockHand::From(0..)
+        ClockHand::From(PageID::new(0)..)
     }
 }
 
@@ -35,7 +35,7 @@ impl ClockHand {
     #[inline]
     pub(super) fn reset(&mut self) {
         let start = self.start();
-        if start == 0 {
+        if start == PageID::new(0) {
             *self = ClockHand::default()
         } else {
             *self = ClockHand::FromTo(start.., ..start)
@@ -47,7 +47,7 @@ impl ClockHand {
         match self {
             ClockHand::Between(between) => between.start,
             ClockHand::From(from) => from.start,
-            ClockHand::To(_) => 0,
+            ClockHand::To(_) => PageID::new(0),
             ClockHand::FromTo(from, _) => from.start,
         }
     }

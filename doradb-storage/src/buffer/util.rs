@@ -45,7 +45,7 @@ pub(super) unsafe fn initialize_frame_and_page_arrays(
         for i in 0..capacity {
             let frame_ptr = frames.add(i);
             std::ptr::write(frame_ptr, BufferFrame::default());
-            (*frame_ptr).page_id = i as PageID;
+            (*frame_ptr).page_id = PageID::from(i);
             (*frame_ptr).page = pages.add(i);
         }
         Ok((frames, pages))

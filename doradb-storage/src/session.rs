@@ -3,7 +3,7 @@ use crate::buffer::{BufferPool, PoolGuards, PoolRole, ReadonlyBufferPool};
 use crate::catalog::{ColumnObject, IndexColumnObject, IndexObject, TableMetadata, TableObject};
 use crate::catalog::{IndexSpec, TableID, TableSpec};
 use crate::engine::EngineRef;
-use crate::error::{Error, PersistedFileKind, Result};
+use crate::error::{Error, FileKind, Result};
 use crate::index::BlockIndex;
 use crate::row::RowID;
 use crate::table::Table;
@@ -226,7 +226,7 @@ impl Session {
         .await;
         let disk_pool = ReadonlyBufferPool::new(
             table_id,
-            PersistedFileKind::TableFile,
+            FileKind::TableFile,
             Arc::clone(&table_file),
             engine.disk_pool.clone_inner(),
         );

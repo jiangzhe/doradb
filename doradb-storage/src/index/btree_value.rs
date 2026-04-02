@@ -1,4 +1,4 @@
-use crate::buffer::page::INVALID_PAGE_ID;
+use crate::buffer::page::{INVALID_PAGE_ID, PageID};
 use crate::index::util::Maskable;
 use crate::row::INVALID_ROW_ID;
 use std::mem;
@@ -62,6 +62,20 @@ impl From<u64> for BTreeU64 {
     }
 }
 
+impl From<PageID> for BTreeU64 {
+    #[inline]
+    fn from(value: PageID) -> Self {
+        BTreeU64(value.into())
+    }
+}
+
+impl From<BTreeU64> for PageID {
+    #[inline]
+    fn from(value: BTreeU64) -> Self {
+        PageID::from(value.0)
+    }
+}
+
 impl BTreeU64 {
     #[inline]
     pub fn to_u64(self) -> u64 {
@@ -72,7 +86,7 @@ impl BTreeU64 {
 const BTREE_VALUE_U64_DELETE_BIT: u64 = 1u64 << 63;
 
 const _: () = assert!(BTreeU64::INVALID_VALUE.0 == INVALID_ROW_ID);
-const _: () = assert!(BTreeU64::INVALID_VALUE.0 == INVALID_PAGE_ID);
+const _: () = assert!(BTreeU64::INVALID_VALUE.0 == INVALID_PAGE_ID.as_u64());
 
 impl Maskable for BTreeU64 {
     const INVALID_VALUE: Self = BTreeU64(!0);
