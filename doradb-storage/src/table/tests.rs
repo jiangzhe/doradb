@@ -1124,7 +1124,7 @@ fn test_row_page_transition_retries_update_delete() {
         let page_id = match sys.table.find_row(session.pool_guards(), row_id).await {
             RowLocation::RowPage(page_id) => page_id,
             RowLocation::NotFound => panic!("row should exist"),
-            RowLocation::LwcBlock { .. } => unreachable!("lwc page"),
+            RowLocation::LwcBlock { .. } => unreachable!("lwc block"),
         };
         let page_guard = sys
             .engine

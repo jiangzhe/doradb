@@ -323,7 +323,7 @@ pub enum TableHandle {
 }
 
 impl TableHandle {
-    /// Returns the row block index for this table handle.
+    /// Returns the row page index for this table handle.
     #[inline]
     pub fn blk_idx(&self) -> &BlockIndex {
         match self {
@@ -869,7 +869,7 @@ pub mod tests {
     }
 
     #[test]
-    fn test_catalog_bootstrap_fails_on_corrupted_checkpoint_lwc_page() {
+    fn test_catalog_bootstrap_fails_on_corrupted_checkpoint_lwc_block() {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
             let main_dir = temp_dir.path().to_path_buf();
@@ -915,7 +915,7 @@ pub mod tests {
                     .unwrap()
                     .into_iter()
                     .next()
-                    .expect("catalog checkpoint should publish at least one LWC page");
+                    .expect("catalog checkpoint should publish at least one LWC block");
                 entry.block_id()
             };
             drop(engine);

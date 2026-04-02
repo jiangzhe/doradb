@@ -20,30 +20,37 @@ use std::mem;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-pub const BLOCK_PAGE_SIZE: usize = PAGE_SIZE;
-pub const BLOCK_HEADER_SIZE: usize = mem::size_of::<BlockNodeHeader>();
+pub const ROW_PAGE_INDEX_NODE_SIZE: usize = PAGE_SIZE;
+pub const ROW_PAGE_INDEX_NODE_HEADER_SIZE: usize = mem::size_of::<RowPageIndexNodeHeader>();
 pub const NBR_ENTRIES_IN_BRANCH: usize = 4093;
 pub const ENTRY_SIZE: usize = mem::size_of::<PageEntry>();
-pub const NBR_PAGE_ENTRIES_IN_LEAF: usize = (BLOCK_PAGE_SIZE - BLOCK_HEADER_SIZE) / ENTRY_SIZE;
+pub const NBR_ROW_PAGE_ENTRIES_IN_LEAF: usize =
+    (ROW_PAGE_INDEX_NODE_SIZE - ROW_PAGE_INDEX_NODE_HEADER_SIZE) / ENTRY_SIZE;
 
 const _: () = assert!(
-    { mem::size_of::<BlockNode>() == BLOCK_PAGE_SIZE },
+    { mem::size_of::<RowPageIndexNode>() == ROW_PAGE_INDEX_NODE_SIZE },
     "Size of node of BlockIndex should equal to 64KB"
 );
 
 const _: () = assert!(
-    { BLOCK_HEADER_SIZE + NBR_ENTRIES_IN_BRANCH * ENTRY_SIZE <= BLOCK_PAGE_SIZE },
+    {
+        ROW_PAGE_INDEX_NODE_HEADER_SIZE + NBR_ENTRIES_IN_BRANCH * ENTRY_SIZE
+            <= ROW_PAGE_INDEX_NODE_SIZE
+    },
     "Size of branch node of BlockIndex can be at most 64KB"
 );
 
 const _: () = assert!(
-    { BLOCK_HEADER_SIZE + NBR_PAGE_ENTRIES_IN_LEAF * ENTRY_SIZE <= BLOCK_PAGE_SIZE },
+    {
+        ROW_PAGE_INDEX_NODE_HEADER_SIZE + NBR_ROW_PAGE_ENTRIES_IN_LEAF * ENTRY_SIZE
+            <= ROW_PAGE_INDEX_NODE_SIZE
+    },
     "Size of leaf node of BlockIndex can be at most 64KB"
 );
 
 const _: () = assert!(
-    { BLOCK_HEADER_SIZE.is_multiple_of(mem::align_of::<PageEntry>()) },
-    "BlockNode data area must align with PageEntry alignment"
+    { ROW_PAGE_INDEX_NODE_HEADER_SIZE.is_multiple_of(mem::align_of::<PageEntry>()) },
+    "RowPageIndexNode data area must align with PageEntry alignment"
 );
 
 const _: () = assert!(
@@ -51,19 +58,19 @@ const _: () = assert!(
     "ENTRY_SIZE must match PageEntry size"
 );
 
-/// BlockNode is B-Tree node of block index.
+/// RowPageIndexNode is one B-tree node of the row-page index.
 /// It can be either branch or leaf.
 /// Branch contains at most 4093 child node pointers.
-/// Leaf contains at most NBR_PAGE_ENTRIES_IN_LEAF page entries.
+/// Leaf contains at most NBR_ROW_PAGE_ENTRIES_IN_LEAF page entries.
 #[repr(C)]
 #[derive(Clone)]
-pub struct BlockNode {
-    pub header: BlockNodeHeader,
-    data: [u8; BLOCK_PAGE_SIZE - BLOCK_HEADER_SIZE],
+pub struct RowPageIndexNode {
+    pub header: RowPageIndexNodeHeader,
+    data: [u8; ROW_PAGE_INDEX_NODE_SIZE - ROW_PAGE_INDEX_NODE_HEADER_SIZE],
 }
 
-impl BlockNode {
-    /// Initilaize block node with given height, start row id.
+impl RowPageIndexNode {
+    /// Initializes one node with the given height and starting row id.
     /// End row id is set to MAX_ROW_ID.
     #[inline]
     pub fn init(&mut self, height: u32, start_row_id: RowID, count: u64, insert_page_id: PageID) {
@@ -83,13 +90,13 @@ impl BlockNode {
         self.header.count = 0;
     }
 
-    /// Returns whether the block node is leaf.
+    /// Returns whether the node is leaf.
     #[inline]
     pub fn is_leaf(&self) -> bool {
         self.header.height == 0
     }
 
-    /// Returns whether the block node is branch.
+    /// Returns whether the node is branch.
     #[inline]
     pub fn is_branch(&self) -> bool {
         !self.is_leaf()
@@ -162,7 +169,7 @@ impl BlockNode {
     #[inline]
     pub fn leaf_is_full(&self) -> bool {
         debug_assert!(self.is_leaf());
-        self.header.count as usize == NBR_PAGE_ENTRIES_IN_LEAF
+        self.header.count as usize == NBR_ROW_PAGE_ENTRIES_IN_LEAF
     }
 
     /// Returns whether the leaf node is empty.
@@ -232,12 +239,12 @@ impl BlockNode {
     }
 }
 
-impl BufferPage for BlockNode {}
+impl BufferPage for RowPageIndexNode {}
 
 #[repr(C)]
-/// Header metadata for one in-memory block-index node.
+/// Header metadata for one in-memory row-page-index node.
 #[derive(Clone)]
-pub struct BlockNodeHeader {
+pub struct RowPageIndexNodeHeader {
     // height of the node
     pub height: u32,
     // count of entry.
@@ -265,34 +272,31 @@ impl PageEntry {
     }
 }
 
-/// The base index of blocks.
-///
-/// It controls block/page level storage information
-/// of column-store and row-store.
+/// In-memory index for runtime row pages.
 ///
 /// The index is sorted by RowID, which is global unique identifier
 /// of each row.
 /// When inserting a new row, a row page must be located, either by
 /// allocating a new page from buffer pool, or by reusing a non-full
 /// page.
-/// The row page determines its RowID range by increasing max row id
-/// of the block index with estimated row count.
+/// The row page determines its RowID range by increasing the max row id
+/// of the row-page index with estimated row count.
 ///
 /// Old rows have smaller RowID, new rows have bigger RowID.
 /// Once all data in one row page can be seen by all active transactions,
 /// it is qualified to be persisted to disk in column format.
 ///
 /// Multiple row pages are merged to be a column file.
-/// Block index will also be updated to reflect the change.
+/// The row-page index will also be updated to reflect the change.
 ///
-/// The block index supports two operations.
+/// The row-page index supports two operations.
 ///
 /// 1. index search with row id: determine which column file or row page
 ///    one RowID belongs to.
 /// 2. table scan: traverse all column files and row pages to perform
 ///    full table scan.
 ///
-pub struct GenericRowBlockIndex<P: 'static> {
+pub struct GenericRowPageIndex<P: 'static> {
     root_page_id: PageID,
     height: AtomicUsize,
     insert_free_list: Mutex<Vec<PageID>>,
@@ -300,18 +304,18 @@ pub struct GenericRowBlockIndex<P: 'static> {
     pool: QuiescentGuard<P>,
 }
 
-/// Compatibility alias for runtime row-block index backed by `FixedBufferPool`.
-pub type RowBlockIndex = GenericRowBlockIndex<FixedBufferPool>;
+/// Compatibility alias for the runtime row-page index backed by `FixedBufferPool`.
+pub type RowPageIndex = GenericRowPageIndex<FixedBufferPool>;
 
-impl<P: BufferPool> GenericRowBlockIndex<P> {
-    /// Create a new block index backed by buffer pool.
+impl<P: BufferPool> GenericRowPageIndex<P> {
+    /// Creates a new row-page index backed by the buffer pool.
     #[inline]
     pub async fn new(pool: QuiescentGuard<P>, pool_guard: &PoolGuard, start_row_id: RowID) -> Self {
-        let mut g = pool.allocate_page::<BlockNode>(pool_guard).await;
+        let mut g = pool.allocate_page::<RowPageIndexNode>(pool_guard).await;
         let page_id = g.page_id();
         let page = g.page_mut();
         page.init_empty(0, start_row_id);
-        GenericRowBlockIndex {
+        GenericRowPageIndex {
             root_page_id: page_id,
             height: AtomicUsize::new(0),
             pool,
@@ -320,11 +324,16 @@ impl<P: BufferPool> GenericRowBlockIndex<P> {
     }
 
     #[inline]
-    async fn allocate_block_page(&self, pool_guard: &PoolGuard) -> PageExclusiveGuard<BlockNode> {
-        self.pool.allocate_page::<BlockNode>(pool_guard).await
+    async fn allocate_node_page(
+        &self,
+        pool_guard: &PoolGuard,
+    ) -> PageExclusiveGuard<RowPageIndexNode> {
+        self.pool
+            .allocate_page::<RowPageIndexNode>(pool_guard)
+            .await
     }
 
-    /// Returns height of block index.
+    /// Returns the height of the row-page index.
     #[inline]
     pub fn height(&self) -> usize {
         self.height.load(Ordering::Relaxed)
@@ -337,7 +346,7 @@ impl<P: BufferPool> GenericRowBlockIndex<P> {
     }
 
     /// Get row page for insertion.
-    /// Caller should cache insert page id to avoid invoking this method frequently.
+    /// Caller should cache insert page ids to avoid invoking this method frequently.
     #[inline]
     pub async fn get_insert_page<B: BufferPool>(
         &self,
@@ -356,7 +365,7 @@ impl<P: BufferPool> GenericRowBlockIndex<P> {
             None,
         )
         .await
-        .expect("row-block-index get_insert_page should not ignore row-page I/O failures")
+        .expect("row-page-index get_insert_page should not ignore row-page I/O failures")
     }
 
     #[cfg(test)]
@@ -379,7 +388,7 @@ impl<P: BufferPool> GenericRowBlockIndex<P> {
             redo_ctx,
         )
         .await
-        .expect("row-block-index get_insert_page_with_redo should not ignore row-page I/O failures")
+        .expect("row-page-index get_insert_page_with_redo should not ignore row-page I/O failures")
     }
 
     #[inline]
@@ -535,8 +544,8 @@ impl<P: BufferPool> GenericRowBlockIndex<P> {
     pub fn mem_cursor<'a>(
         &'a self,
         pool_guard: &'a PoolGuard,
-    ) -> GenericRowBlockIndexMemCursor<'a, P> {
-        GenericRowBlockIndexMemCursor {
+    ) -> GenericRowPageIndexMemCursor<'a, P> {
+        GenericRowPageIndexMemCursor {
             blk_idx: self,
             pool_guard,
             parent: None,
@@ -581,7 +590,7 @@ impl<P: BufferPool> GenericRowBlockIndex<P> {
         let page_guard = mem_pool
             .get_page::<RowPage>(mem_pool_guard, page_id, LatchFallbackMode::Exclusive)
             .await
-            .expect("row-block-index free-list exclusive read should not ignore buffer-pool errors")
+            .expect("row-page-index free-list exclusive read should not ignore buffer-pool errors")
             .lock_exclusive_async()
             .await
             .unwrap();
@@ -593,7 +602,7 @@ impl<P: BufferPool> GenericRowBlockIndex<P> {
     async fn insert_row_page_split_root(
         &self,
         pool_guard: &PoolGuard,
-        mut p_guard: PageExclusiveGuard<BlockNode>,
+        mut p_guard: PageExclusiveGuard<RowPageIndexNode>,
         row_id: RowID,
         count: u64,
         insert_page_id: PageID,
@@ -610,7 +619,7 @@ impl<P: BufferPool> GenericRowBlockIndex<P> {
         let max_row_id = r_row_id + count;
 
         // create left child and copy all contents to it.
-        let mut l_guard = self.allocate_block_page(pool_guard).await;
+        let mut l_guard = self.allocate_node_page(pool_guard).await;
         let l_page_id = l_guard.page_id();
         l_guard.page_mut().clone_from(p_guard.page());
         l_guard.page_mut().header.end_row_id = row_id; // update original page's end row id
@@ -620,7 +629,7 @@ impl<P: BufferPool> GenericRowBlockIndex<P> {
         // Because we disable branch split. We have to always construct right tree
         // as same height as left.
         let r_page_id = if root.header.height == 0 {
-            let mut r_guard = self.allocate_block_page(pool_guard).await;
+            let mut r_guard = self.allocate_node_page(pool_guard).await;
             r_guard.page_mut().init(0, r_row_id, count, insert_page_id);
             r_guard.page_id()
         } else {
@@ -666,12 +675,12 @@ impl<P: BufferPool> GenericRowBlockIndex<P> {
         insert_page_id: PageID,
     ) -> PageID {
         debug_assert!(height > 0);
-        let mut p_g = self.allocate_block_page(pool_guard).await;
+        let mut p_g = self.allocate_node_page(pool_guard).await;
         let page_id = p_g.page_id();
         p_g.page_mut().init_empty(height, start_row_id);
         loop {
             height -= 1;
-            let mut c_g = self.allocate_block_page(pool_guard).await;
+            let mut c_g = self.allocate_node_page(pool_guard).await;
             let c_page_id = c_g.page_id();
             p_g.page_mut().branch_add_entry(PageEntry {
                 row_id: start_row_id,
@@ -694,8 +703,8 @@ impl<P: BufferPool> GenericRowBlockIndex<P> {
     async fn insert_row_page_to_new_leaf(
         &self,
         pool_guard: &PoolGuard,
-        stack: &mut Vec<PageOptimisticGuard<BlockNode>>,
-        c_guard: PageExclusiveGuard<BlockNode>,
+        stack: &mut Vec<PageOptimisticGuard<RowPageIndexNode>>,
+        c_guard: PageExclusiveGuard<RowPageIndexNode>,
         row_id: RowID,
         count: u64,
         insert_page_id: PageID,
@@ -704,11 +713,11 @@ impl<P: BufferPool> GenericRowBlockIndex<P> {
         let mut p_guard;
         // Block index is a special type of B+ tree, which does not implement
         // branch node split.
-        // Split is only applied to root node. This is because block index is
+        // Split is only applied to root node. This is because the row-page index is
         // an append-only index, no random access is allowed (except the merge
         // of multiple leaf nodes, but not implemented yet). So we prefer to
         // always hold full branch node.
-        // That means we may have a block index of depth a little larger than a
+        // That means we may have a row-page index of depth a little larger than a
         // normal B+ tree.
         loop {
             // try to lock parent.
@@ -730,7 +739,7 @@ impl<P: BufferPool> GenericRowBlockIndex<P> {
         let p_height = p_guard.page().header.height;
         debug_assert!(p_height >= 1);
         let c_page_id = if p_height == 1 {
-            let mut leaf = self.allocate_block_page(pool_guard).await;
+            let mut leaf = self.allocate_node_page(pool_guard).await;
             leaf.page_mut().init(0, row_id, count, insert_page_id);
             debug_assert!(leaf.page_mut().header.end_row_id == row_id + count);
             leaf.page_id()
@@ -745,7 +754,7 @@ impl<P: BufferPool> GenericRowBlockIndex<P> {
         Valid((row_id, row_id + count))
     }
 
-    /// Insert row page id into block index.
+    /// Inserts a row page id into the row-page index.
     #[inline]
     async fn insert_row_page(
         &self,
@@ -773,7 +782,7 @@ impl<P: BufferPool> GenericRowBlockIndex<P> {
         }
         let end_row_id = p_guard.page().header.end_row_id;
         if p_guard.page().leaf_is_full() {
-            // leaf is full, we must add new leaf to block index
+            // Leaf is full, so we must add a new leaf to the row-page index.
             if stack.is_empty() {
                 // root is full and already exclusive locked
                 let res = self
@@ -808,14 +817,14 @@ impl<P: BufferPool> GenericRowBlockIndex<P> {
     async fn find_right_most_leaf(
         &self,
         pool_guard: &PoolGuard,
-        stack: &mut Vec<PageOptimisticGuard<BlockNode>>,
+        stack: &mut Vec<PageOptimisticGuard<RowPageIndexNode>>,
         mode: LatchFallbackMode,
-    ) -> Validation<FacadePageGuard<BlockNode>> {
+    ) -> Validation<FacadePageGuard<RowPageIndexNode>> {
         let mut p_guard = self
             .pool
-            .get_page::<BlockNode>(pool_guard, self.root_page_id, LatchFallbackMode::Spin)
+            .get_page::<RowPageIndexNode>(pool_guard, self.root_page_id, LatchFallbackMode::Spin)
             .await
-            .expect("row-block-index traversal should not ignore buffer-pool errors");
+            .expect("row-page-index traversal should not ignore buffer-pool errors");
         loop {
             let step = verify!(p_guard.with_page_ref_validated(|page| {
                 if page.is_leaf() {
@@ -831,19 +840,19 @@ impl<P: BufferPool> GenericRowBlockIndex<P> {
             debug_assert!(height >= 1);
             let c_guard = if height == 1 {
                 self.pool
-                    .get_child_page::<BlockNode>(pool_guard, &p_guard, page_id, mode)
+                    .get_child_page::<RowPageIndexNode>(pool_guard, &p_guard, page_id, mode)
                     .await
-                    .expect("row-block-index traversal should not ignore buffer-pool errors")
+                    .expect("row-page-index traversal should not ignore buffer-pool errors")
             } else {
                 self.pool
-                    .get_child_page::<BlockNode>(
+                    .get_child_page::<RowPageIndexNode>(
                         pool_guard,
                         &p_guard,
                         page_id,
                         LatchFallbackMode::Spin,
                     )
                     .await
-                    .expect("row-block-index traversal should not ignore buffer-pool errors")
+                    .expect("row-page-index traversal should not ignore buffer-pool errors")
             };
             stack.push(p_guard.downgrade());
             p_guard = verify!(c_guard);
@@ -859,9 +868,9 @@ impl<P: BufferPool> GenericRowBlockIndex<P> {
 
         let mut g = self
             .pool
-            .get_page::<BlockNode>(pool_guard, self.root_page_id, LatchFallbackMode::Spin)
+            .get_page::<RowPageIndexNode>(pool_guard, self.root_page_id, LatchFallbackMode::Spin)
             .await
-            .expect("row-block-index lookup should not ignore buffer-pool errors");
+            .expect("row-page-index lookup should not ignore buffer-pool errors");
         loop {
             let step = verify!(g.with_page_ref_validated(|page| {
                 if page.is_leaf() {
@@ -916,7 +925,7 @@ impl<P: BufferPool> GenericRowBlockIndex<P> {
                         self.pool
                             .get_child_page(pool_guard, &g, page_id, LatchFallbackMode::Spin)
                             .await
-                            .expect("row-block-index lookup should not ignore buffer-pool errors")
+                            .expect("row-page-index lookup should not ignore buffer-pool errors")
                     );
                 }
             }
@@ -942,18 +951,18 @@ pub enum RowLocation {
 }
 
 /// A cursor to read all in-mem leaf values.
-pub struct GenericRowBlockIndexMemCursor<'a, P: 'static> {
-    blk_idx: &'a GenericRowBlockIndex<P>,
+pub struct GenericRowPageIndexMemCursor<'a, P: 'static> {
+    blk_idx: &'a GenericRowPageIndex<P>,
     pool_guard: &'a PoolGuard,
     // The parent node of current located
-    parent: Option<ParentPosition<PageSharedGuard<BlockNode>>>,
-    child: Option<PageSharedGuard<BlockNode>>,
+    parent: Option<ParentPosition<PageSharedGuard<RowPageIndexNode>>>,
+    child: Option<PageSharedGuard<RowPageIndexNode>>,
 }
 
-/// Compatibility alias for runtime row-block in-memory cursor.
-pub type RowBlockIndexMemCursor<'a> = GenericRowBlockIndexMemCursor<'a, FixedBufferPool>;
+/// Compatibility alias for the runtime row-page-index in-memory cursor.
+pub type RowPageIndexMemCursor<'a> = GenericRowPageIndexMemCursor<'a, FixedBufferPool>;
 
-impl<P: BufferPool> GenericRowBlockIndexMemCursor<'_, P> {
+impl<P: BufferPool> GenericRowPageIndexMemCursor<'_, P> {
     /// Seeks to the in-memory leaf that can serve `row_id`.
     #[inline]
     pub async fn seek(&mut self, row_id: RowID) {
@@ -967,7 +976,7 @@ impl<P: BufferPool> GenericRowBlockIndexMemCursor<'_, P> {
 
     /// Returns current in-memory leaf and advances to the next leaf.
     #[inline]
-    pub async fn next(&mut self) -> Option<FacadePageGuard<BlockNode>> {
+    pub async fn next(&mut self) -> Option<FacadePageGuard<RowPageIndexNode>> {
         if let Some(child) = self.child.take() {
             return Some(child.facade(false));
         }
@@ -996,9 +1005,9 @@ impl<P: BufferPool> GenericRowBlockIndexMemCursor<'_, P> {
             let child = self
                 .blk_idx
                 .pool
-                .get_page::<BlockNode>(self.pool_guard, page_id, LatchFallbackMode::Shared)
+                .get_page::<RowPageIndexNode>(self.pool_guard, page_id, LatchFallbackMode::Shared)
                 .await
-                .expect("row-block-index cursor should not ignore buffer-pool errors")
+                .expect("row-page-index cursor should not ignore buffer-pool errors")
                 .lock_shared_async()
                 .await
                 .unwrap();
@@ -1024,13 +1033,13 @@ impl<P: BufferPool> GenericRowBlockIndexMemCursor<'_, P> {
         let mut g = self
             .blk_idx
             .pool
-            .get_page::<BlockNode>(
+            .get_page::<RowPageIndexNode>(
                 self.pool_guard,
                 self.blk_idx.root_page_id,
                 LatchFallbackMode::Shared,
             )
             .await
-            .expect("row-block-index cursor should not ignore buffer-pool errors");
+            .expect("row-page-index cursor should not ignore buffer-pool errors");
         'SEARCH: loop {
             let step = verify!(g.with_page_ref_validated(|page| {
                 if page.is_leaf() {
@@ -1075,9 +1084,14 @@ impl<P: BufferPool> GenericRowBlockIndexMemCursor<'_, P> {
             let c = self
                 .blk_idx
                 .pool
-                .get_child_page::<BlockNode>(self.pool_guard, &g, page_id, LatchFallbackMode::Spin)
+                .get_child_page::<RowPageIndexNode>(
+                    self.pool_guard,
+                    &g,
+                    page_id,
+                    LatchFallbackMode::Spin,
+                )
                 .await
-                .expect("row-block-index cursor should not ignore buffer-pool errors");
+                .expect("row-page-index cursor should not ignore buffer-pool errors");
             let c = verify!(c);
             let Some(parent_g) = g.lock_shared_async().await else {
                 return Invalid;
@@ -1207,7 +1221,7 @@ mod tests {
     }
 
     #[test]
-    fn test_row_block_index_free_list_shared() {
+    fn test_row_page_index_free_list_shared() {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
             let main_dir = temp_dir.path().to_path_buf();
@@ -1221,7 +1235,7 @@ mod tests {
                 )
                 .trx(
                     TrxSysConfig::default()
-                        .log_file_stem("redo_row_blk_idx")
+                        .log_file_stem("redo_row_page_idx")
                         .skip_recovery(true),
                 )
                 .build()
@@ -1231,7 +1245,7 @@ mod tests {
                 let metadata = make_test_metadata();
                 let meta_guard = engine.meta_pool.pool_guard();
                 let blk_idx =
-                    RowBlockIndex::new(engine.meta_pool.clone_inner(), &meta_guard, 0).await;
+                    RowPageIndex::new(engine.meta_pool.clone_inner(), &meta_guard, 0).await;
                 let mem_guard = engine.mem_pool.pool_guard();
                 let p1 = blk_idx
                     .get_insert_page(&meta_guard, &*engine.mem_pool, &mem_guard, &metadata, 100)
@@ -1251,7 +1265,7 @@ mod tests {
     }
 
     #[test]
-    fn test_row_block_index_free_list_exclusive() {
+    fn test_row_page_index_free_list_exclusive() {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
             let main_dir = temp_dir.path().to_path_buf();
@@ -1265,7 +1279,7 @@ mod tests {
                 )
                 .trx(
                     TrxSysConfig::default()
-                        .log_file_stem("redo_row_blk_idx")
+                        .log_file_stem("redo_row_page_idx")
                         .skip_recovery(true),
                 )
                 .build()
@@ -1275,7 +1289,7 @@ mod tests {
                 let metadata = make_test_metadata();
                 let meta_guard = engine.meta_pool.pool_guard();
                 let blk_idx =
-                    RowBlockIndex::new(engine.meta_pool.clone_inner(), &meta_guard, 0).await;
+                    RowPageIndex::new(engine.meta_pool.clone_inner(), &meta_guard, 0).await;
                 let mem_guard = engine.mem_pool.pool_guard();
                 let p1 = blk_idx
                     .get_insert_page_exclusive(
@@ -1316,7 +1330,7 @@ mod tests {
             let meta_guard = (*meta_pool).pool_guard();
             let mem_guard = (*mem_pool).pool_guard();
             let metadata = make_test_metadata();
-            let blk_idx = RowBlockIndex::new(meta_pool.guard(), &meta_guard, 0).await;
+            let blk_idx = RowPageIndex::new(meta_pool.guard(), &meta_guard, 0).await;
 
             let page_guard = blk_idx
                 .get_insert_page_exclusive(&meta_guard, &*mem_pool, &mem_guard, &metadata, 100)
@@ -1344,7 +1358,7 @@ mod tests {
     }
 
     #[test]
-    fn test_row_block_index_cursor_shared() {
+    fn test_row_page_index_cursor_shared() {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
             let main_dir = temp_dir.path().to_path_buf();
@@ -1360,7 +1374,7 @@ mod tests {
                 )
                 .trx(
                     TrxSysConfig::default()
-                        .log_file_stem("redo_row_blk_idx")
+                        .log_file_stem("redo_row_page_idx")
                         .skip_recovery(true),
                 )
                 .build()
@@ -1370,7 +1384,7 @@ mod tests {
                 let metadata = make_test_metadata();
                 let meta_guard = engine.meta_pool.pool_guard();
                 let blk_idx =
-                    RowBlockIndex::new(engine.meta_pool.clone_inner(), &meta_guard, 0).await;
+                    RowPageIndex::new(engine.meta_pool.clone_inner(), &meta_guard, 0).await;
                 let mem_guard = engine.mem_pool.pool_guard();
                 for _ in 0..row_pages {
                     let _ = blk_idx
@@ -1385,7 +1399,7 @@ mod tests {
                     let g = res.try_into_shared().unwrap();
                     assert!(g.page().is_leaf());
                 }
-                let row_pages_per_leaf = NBR_PAGE_ENTRIES_IN_LEAF;
+                let row_pages_per_leaf = NBR_ROW_PAGE_ENTRIES_IN_LEAF;
                 assert_eq!(count, row_pages.div_ceil(row_pages_per_leaf));
             }
             drop(engine);
@@ -1393,14 +1407,14 @@ mod tests {
     }
 
     #[test]
-    fn test_row_block_index_cursor_two_level_tree() {
+    fn test_row_page_index_cursor_two_level_tree() {
         smol::block_on(async {
             let pool = owned_index_pool(1024usize * 1024 * 1024);
             let pool_guard = (*pool).pool_guard();
-            let blk_idx = RowBlockIndex::new(pool.guard(), &pool_guard, 0).await;
+            let blk_idx = RowPageIndex::new(pool.guard(), &pool_guard, 0).await;
 
             let overflow_entries = 3usize;
-            let row_pages = NBR_PAGE_ENTRIES_IN_LEAF + overflow_entries;
+            let row_pages = NBR_ROW_PAGE_ENTRIES_IN_LEAF + overflow_entries;
             for row_page_id in 0..row_pages {
                 loop {
                     if let Valid(_) = blk_idx
@@ -1416,7 +1430,7 @@ mod tests {
             let mut root_leaf_page_ids = vec![];
             {
                 let root = pool
-                    .get_page_spin::<BlockNode>(&pool_guard, blk_idx.root_page_id())
+                    .get_page_spin::<RowPageIndexNode>(&pool_guard, blk_idx.root_page_id())
                     .lock_shared_async()
                     .await
                     .unwrap();
@@ -1444,7 +1458,7 @@ mod tests {
 
             assert_eq!(leaf_headers.len(), 2);
             assert_eq!(leaf_headers[0].0, 0);
-            assert_eq!(leaf_headers[0].2, NBR_PAGE_ENTRIES_IN_LEAF);
+            assert_eq!(leaf_headers[0].2, NBR_ROW_PAGE_ENTRIES_IN_LEAF);
             assert_eq!(leaf_headers[1].0, leaf_headers[0].1);
             assert_eq!(leaf_headers[1].1, row_pages as RowID);
             assert_eq!(leaf_headers[1].2, overflow_entries);
@@ -1454,11 +1468,11 @@ mod tests {
     }
 
     #[test]
-    fn test_row_block_index_search() {
+    fn test_row_page_index_search() {
         smol::block_on(async {
             let pool = owned_index_pool(512usize * 1024 * 1024);
             let pool_guard = (*pool).pool_guard();
-            let blk_idx = RowBlockIndex::new(pool.guard(), &pool_guard, 0).await;
+            let blk_idx = RowPageIndex::new(pool.guard(), &pool_guard, 0).await;
             let row_pages = 5000usize;
             let rows_per_page = 100usize;
             for i in 0..row_pages {
@@ -1488,11 +1502,11 @@ mod tests {
     }
 
     #[test]
-    fn test_row_block_index_split() {
+    fn test_row_page_index_split() {
         smol::block_on(async {
             let pool = owned_index_pool(1024usize * 1024 * 1024);
             let pool_guard = (*pool).pool_guard();
-            let blk_idx = RowBlockIndex::new(pool.guard(), &pool_guard, 0).await;
+            let blk_idx = RowPageIndex::new(pool.guard(), &pool_guard, 0).await;
             assert_eq!(blk_idx.height(), 0);
 
             for row_page_id in 0..10000 {
@@ -1508,7 +1522,7 @@ mod tests {
             assert_eq!(blk_idx.height(), 1);
 
             let mut root = pool
-                .get_page::<BlockNode>(
+                .get_page::<RowPageIndexNode>(
                     &pool_guard,
                     blk_idx.root_page_id(),
                     LatchFallbackMode::Exclusive,
@@ -1522,9 +1536,9 @@ mod tests {
             root.page_mut().header.count = NBR_ENTRIES_IN_BRANCH as u32;
 
             // Assign right-most leaf node.
-            let mut r_g = pool.allocate_page::<BlockNode>(&pool_guard).await;
+            let mut r_g = pool.allocate_page::<RowPageIndexNode>(&pool_guard).await;
             r_g.page_mut().init(0, 50000, 10000, test_page_id(10001));
-            r_g.page_mut().header.count = NBR_PAGE_ENTRIES_IN_LEAF as u32;
+            r_g.page_mut().header.count = NBR_ROW_PAGE_ENTRIES_IN_LEAF as u32;
             let r_page_id = r_g.page_id();
             drop(r_g);
             root.page_mut().branch_last_entry_mut().row_id = 50000;
@@ -1544,7 +1558,7 @@ mod tests {
     }
 
     #[test]
-    fn test_row_block_index_inline_redo_ctx_commits_create_row_page_once() {
+    fn test_row_page_index_inline_redo_ctx_commits_create_row_page_once() {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
             let main_dir = temp_dir.path().to_path_buf();
@@ -1558,7 +1572,7 @@ mod tests {
                 )
                 .trx(
                     TrxSysConfig::default()
-                        .log_file_stem("redo_row_blk_idx")
+                        .log_file_stem("redo_row_page_idx")
                         .skip_recovery(true),
                 )
                 .build()
@@ -1568,7 +1582,7 @@ mod tests {
                 let metadata = make_test_metadata();
                 let meta_guard = engine.meta_pool.pool_guard();
                 let blk_idx =
-                    RowBlockIndex::new(engine.meta_pool.clone_inner(), &meta_guard, 0).await;
+                    RowPageIndex::new(engine.meta_pool.clone_inner(), &meta_guard, 0).await;
                 let mem_guard = engine.mem_pool.pool_guard();
                 let redo_ctx = RowPageCreateRedoCtx::new(&engine.trx_sys, 104);
                 let page_guard = blk_idx
@@ -1609,7 +1623,7 @@ mod tests {
             engine.shutdown().unwrap();
 
             let mut create_row_page_logs = 0usize;
-            let file_prefix = temp_dir.path().join("redo_row_blk_idx");
+            let file_prefix = temp_dir.path().join("redo_row_page_idx");
             let file_prefix = file_prefix.to_str().unwrap();
             let logs = list_log_files(file_prefix, 0, false).unwrap();
             for log in logs {

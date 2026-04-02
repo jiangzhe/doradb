@@ -6,8 +6,8 @@ use crate::error::{Error, Result};
 use crate::file::cow_file::{BlockID, SUPER_BLOCK_ID};
 use crate::index::block_index_root::{BlockIndexRoot, BlockIndexRoute};
 use crate::index::column_block_index::ColumnBlockIndex;
-use crate::index::row_block_index::{
-    GenericRowBlockIndex, GenericRowBlockIndexMemCursor, RowLocation,
+use crate::index::row_page_index::{
+    GenericRowPageIndex, GenericRowPageIndexMemCursor, RowLocation,
 };
 use crate::index::util::{Maskable, RowPageCreateRedoCtx};
 use crate::quiescent::QuiescentGuard;
@@ -18,13 +18,13 @@ use std::sync::Arc;
 /// Facade of the hybrid block index.
 ///
 /// This type routes lookups between:
-/// - the in-memory row-store index (`RowBlockIndex`)
+/// - the in-memory row-store index (`RowPageIndex`)
 /// - the on-disk column-store index (`ColumnBlockIndex`)
 ///
 /// Routing decisions are made by `BlockIndexRoot`.
 pub struct GenericBlockIndex<P: 'static> {
     root: BlockIndexRoot,
-    row: GenericRowBlockIndex<P>,
+    row: GenericRowPageIndex<P>,
 }
 
 /// Compatibility alias for runtime block index backed by `FixedBufferPool`.
@@ -33,7 +33,7 @@ pub type BlockIndex = GenericBlockIndex<FixedBufferPool>;
 impl<P: BufferPool> GenericBlockIndex<P> {
     /// Creates a block-index facade for one table.
     ///
-    /// `pivot_row_id` and `column_root_page_id` define the boundary and root of
+    /// `pivot_row_id` and `column_root_block_id` define the boundary and root of
     /// persisted columnar data at startup.
     #[inline]
     pub async fn new(
@@ -42,7 +42,7 @@ impl<P: BufferPool> GenericBlockIndex<P> {
         pivot_row_id: RowID,
         column_root_block_id: BlockID,
     ) -> Self {
-        let row = GenericRowBlockIndex::new(pool, meta_pool_guard, pivot_row_id).await;
+        let row = GenericRowPageIndex::new(pool, meta_pool_guard, pivot_row_id).await;
         let root = BlockIndexRoot::new(pivot_row_id, column_root_block_id);
         GenericBlockIndex { root, row }
     }
@@ -59,7 +59,7 @@ impl<P: BufferPool> GenericBlockIndex<P> {
         self.row.height()
     }
 
-    /// Atomically updates the persisted column index boundary and root page.
+    /// Atomically updates the persisted column index boundary and root block.
     ///
     /// Called after checkpoint/persist updates the column block index.
     #[inline]
@@ -81,7 +81,7 @@ impl<P: BufferPool> GenericBlockIndex<P> {
         self.root.pivot_row_id()
     }
 
-    /// Returns current column-root page id.
+    /// Returns current column-root block id.
     #[inline]
     pub fn column_root_block_id(&self) -> BlockID {
         self.root.column_root_block_id()
@@ -205,12 +205,12 @@ impl<P: BufferPool> GenericBlockIndex<P> {
         self.row.cache_exclusive_insert_page(guard)
     }
 
-    /// Creates a cursor to scan in-memory block-index leaves.
+    /// Creates a cursor to scan in-memory row-page-index leaves.
     #[inline]
     pub fn mem_cursor<'a>(
         &'a self,
         meta_pool_guard: &'a PoolGuard,
-    ) -> GenericRowBlockIndexMemCursor<'a, P> {
+    ) -> GenericRowPageIndexMemCursor<'a, P> {
         self.row.mem_cursor(meta_pool_guard)
     }
 

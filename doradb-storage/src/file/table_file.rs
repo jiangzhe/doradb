@@ -33,9 +33,9 @@ const TABLE_META_BLOCK_SPEC: BlockIntegritySpec =
 
 /// Initial size of new table file.
 pub const TABLE_FILE_INITIAL_SIZE: usize = 16 * 1024 * 1024;
-/// Super page size of table file is 32KB.
+/// Super block size of the table file is 32KB.
 pub const TABLE_FILE_SUPER_BLOCK_SIZE: usize = SUPER_BLOCK_SIZE;
-/// Super page header size.
+/// Super block header size.
 pub const TABLE_FILE_SUPER_BLOCK_HEADER_SIZE: usize = mem::size_of::<[u8; 8]>()
     + mem::size_of::<u64>()
     + mem::size_of::<BlockID>()
@@ -64,7 +64,7 @@ pub type ActiveRoot = GenericActiveRoot<TableMeta>;
 
 impl ActiveRoot {
     /// Create a new active root.
-    /// Page number is set to zero (the first super-block slot of this file).
+    /// Slot number is set to zero (the first super-block slot of this file).
     #[inline]
     pub fn new(trx_id: TrxID, max_pages: usize, metadata: Arc<TableMetadata>) -> Self {
         let alloc_map = AllocMap::new(max_pages);
@@ -279,11 +279,11 @@ pub struct MutableTableFile {
     mutable_writer_claimed: bool,
 }
 
-/// One LWC page payload that should be persisted into table file pages.
-pub struct LwcPagePersist {
-    /// Phase-1 logical index-entry shape for this page before page-id assignment.
+/// One LWC block payload that should be persisted into table-file blocks.
+pub struct LwcBlockPersist {
+    /// Phase-1 logical index-entry shape for this block before block-id assignment.
     pub shape: ColumnBlockEntryShape,
-    /// Serialized LWC page bytes.
+    /// Serialized LWC block bytes.
     pub buf: DirectBuf,
 }
 
@@ -374,7 +374,7 @@ impl MutableTableFile {
         Ok(())
     }
 
-    /// Allocate a new page id for copy-on-write updates.
+    /// Allocate a new block id for copy-on-write updates.
     #[inline]
     pub fn allocate_block_id(&mut self) -> Result<BlockID> {
         self.new_root_mut()
@@ -382,7 +382,7 @@ impl MutableTableFile {
             .ok_or(Error::InvalidState)
     }
 
-    /// Record an obsolete page id to be reclaimed on commit.
+    /// Record an obsolete block id to be reclaimed on commit.
     #[inline]
     pub fn record_gc_block(&mut self, block_id: BlockID) {
         self.new_root_mut().gc_block_list.push(block_id);
@@ -427,10 +427,10 @@ impl MutableTableFile {
         }
     }
 
-    /// Persist provided LWC pages and update mutable root/index metadata.
-    pub async fn apply_lwc_pages(
+    /// Persist provided LWC blocks and update mutable root/index metadata.
+    pub async fn apply_lwc_blocks(
         &mut self,
-        lwc_pages: Vec<LwcPagePersist>,
+        lwc_blocks: Vec<LwcBlockPersist>,
         heap_redo_start_ts: TrxID,
         ts: TrxID,
         disk_pool: &ReadonlyBufferPool,
@@ -438,14 +438,14 @@ impl MutableTableFile {
         let table_file = Arc::clone(self.file_ref());
         let disk_pool_guard = disk_pool.pool_guard();
         let mut max_row_id = self.root().pivot_row_id;
-        let mut writes = Vec::with_capacity(lwc_pages.len());
-        let mut new_entries = Vec::with_capacity(lwc_pages.len());
+        let mut writes = Vec::with_capacity(lwc_blocks.len());
+        let mut new_entries = Vec::with_capacity(lwc_blocks.len());
         let mut last_end = self.root().pivot_row_id;
 
-        for page in lwc_pages {
-            let start_row_id = page.shape.start_row_id();
-            let end_row_id = page.shape.end_row_id();
-            let page_id = self
+        for block in lwc_blocks {
+            let start_row_id = block.shape.start_row_id();
+            let end_row_id = block.shape.end_row_id();
+            let block_id = self
                 .new_root_mut()
                 .try_allocate_block_id()
                 .ok_or(Error::InvalidState)?;
@@ -454,8 +454,8 @@ impl MutableTableFile {
                 return Err(Error::InvalidArgument);
             }
             last_end = end_row_id;
-            new_entries.push(page.shape.with_block_id(page_id));
-            writes.push(table_file.write_block(page_id, page.buf));
+            new_entries.push(block.shape.with_block_id(block_id));
+            writes.push(table_file.write_block(block_id, block.buf));
         }
 
         try_join_all(writes).await?;
@@ -477,15 +477,15 @@ impl MutableTableFile {
         Ok(())
     }
 
-    /// Persist LWC pages and commit the resulting root as one CoW publish.
-    pub async fn persist_lwc_pages(
+    /// Persist LWC blocks and commit the resulting root as one CoW publish.
+    pub async fn persist_lwc_blocks(
         mut self,
-        lwc_pages: Vec<LwcPagePersist>,
+        lwc_blocks: Vec<LwcBlockPersist>,
         heap_redo_start_ts: TrxID,
         ts: TrxID,
         disk_pool: &ReadonlyBufferPool,
     ) -> Result<(Arc<TableFile>, Option<OldRoot>)> {
-        self.apply_lwc_pages(lwc_pages, heap_redo_start_ts, ts, disk_pool)
+        self.apply_lwc_blocks(lwc_blocks, heap_redo_start_ts, ts, disk_pool)
             .await?;
         self.commit(ts, false).await
     }
@@ -809,7 +809,7 @@ mod tests {
     }
 
     #[test]
-    fn test_persist_lwc_pages_appends_entries() {
+    fn test_persist_lwc_blocks_appends_entries() {
         smol::block_on(async {
             let (_temp_dir, fs) = build_test_fs();
             let metadata = build_test_metadata();
@@ -817,13 +817,13 @@ mod tests {
             let (table_file, old_root) = table_file.commit(1, false).await.unwrap();
             drop(old_root);
 
-            let lwc_pages = vec![
-                LwcPagePersist {
+            let lwc_blocks = vec![
+                LwcBlockPersist {
                     shape: ColumnBlockEntryShape::new(0, 10, (0..10).collect(), Vec::new())
                         .unwrap(),
                     buf: page_buf(b"lwc-page-1"),
                 },
-                LwcPagePersist {
+                LwcBlockPersist {
                     shape: ColumnBlockEntryShape::new(10, 20, (10..20).collect(), Vec::new())
                         .unwrap(),
                     buf: page_buf(b"lwc-page-2"),
@@ -833,7 +833,7 @@ mod tests {
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
             let disk_pool = table_readonly_pool(&global, 43, &table_file);
             let (table_file, old_root) = MutableTableFile::fork(&table_file)
-                .persist_lwc_pages(lwc_pages, 7, 2, &disk_pool)
+                .persist_lwc_blocks(lwc_blocks, 7, 2, &disk_pool)
                 .await
                 .unwrap();
             drop(old_root);
@@ -869,7 +869,7 @@ mod tests {
     }
 
     #[test]
-    fn test_persist_lwc_pages_rejects_overlapping_ranges() {
+    fn test_persist_lwc_blocks_rejects_overlapping_ranges() {
         smol::block_on(async {
             let (_temp_dir, fs) = build_test_fs();
             let metadata = build_test_metadata();
@@ -877,13 +877,13 @@ mod tests {
             let (table_file, old_root) = table_file.commit(1, false).await.unwrap();
             drop(old_root);
 
-            let lwc_pages = vec![
-                LwcPagePersist {
+            let lwc_blocks = vec![
+                LwcBlockPersist {
                     shape: ColumnBlockEntryShape::new(0, 10, (0..10).collect(), Vec::new())
                         .unwrap(),
                     buf: page_buf(b"lwc-overlap-1"),
                 },
-                LwcPagePersist {
+                LwcBlockPersist {
                     shape: ColumnBlockEntryShape::new(5, 15, (5..15).collect(), Vec::new())
                         .unwrap(),
                     buf: page_buf(b"lwc-overlap-2"),
@@ -893,7 +893,7 @@ mod tests {
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
             let disk_pool = table_readonly_pool(&global, 44, &table_file);
             let result = MutableTableFile::fork(&table_file)
-                .persist_lwc_pages(lwc_pages, 7, 2, &disk_pool)
+                .persist_lwc_blocks(lwc_blocks, 7, 2, &disk_pool)
                 .await;
 
             assert!(matches!(result, Err(Error::InvalidArgument)));

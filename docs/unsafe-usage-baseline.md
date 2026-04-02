@@ -42,7 +42,7 @@
 | `doradb-storage/src/buffer/fixed.rs` | buffer | 2 | 2 |
 | `doradb-storage/src/buffer/frame.rs` | buffer | 2 | 2 |
 | `doradb-storage/src/io/libaio_abi.rs` | io | 2 | 1 |
-| `doradb-storage/src/lwc/page.rs` | lwc | 2 | 2 |
+| `doradb-storage/src/lwc/block.rs` | lwc | 2 | 2 |
 | `doradb-storage/src/buffer/page.rs` | buffer | 1 | 1 |
 | `doradb-storage/src/index/btree_node.rs` | index | 1 | 1 |
 | `doradb-storage/src/index/column_block_index.rs` | index | 1 | 1 |

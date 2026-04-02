@@ -1,8 +1,8 @@
 //! This module contains definition and functions of LWC(Lightweight Compression) Block.
 
-pub mod page;
+pub mod block;
 
-pub use page::*;
+pub use block::*;
 
 use crate::bitmap::Bitmap;
 use crate::catalog::TableMetadata;
@@ -654,7 +654,7 @@ impl<'a> Ser<'a> for LwcPrimitiveSer<'a> {
     }
 }
 
-const LWC_PAGE_HEADER_SIZE: usize = 24;
+const LWC_BLOCK_HEADER_SIZE: usize = 24;
 
 struct LwcColumnStats {
     min_i64: i64,
@@ -786,7 +786,7 @@ impl<'a> LwcBuilder<'a> {
         self.scan_page_stats(&view, &new_row_ids)?;
         self.buffer.scan(view)?;
         self.row_ids.extend(new_row_ids);
-        if self.estimate_size()? > LWC_PAGE_PAYLOAD_SIZE {
+        if self.estimate_size()? > LWC_BLOCK_PAYLOAD_SIZE {
             self.rollback(snapshot);
             return Ok(false);
         }
@@ -881,7 +881,7 @@ impl<'a> LwcBuilder<'a> {
             column_payloads.push(data);
         }
 
-        let header = LwcPageHeader::new(
+        let header = LwcBlockHeader::new(
             row_shape_fingerprint,
             row_count as u16,
             self.metadata.col_count() as u16,
@@ -890,8 +890,8 @@ impl<'a> LwcBuilder<'a> {
 
         let mut buf = DirectBuf::zeroed(COW_FILE_PAGE_SIZE);
         let payload_start = write_block_header(buf.data_mut(), LWC_BLOCK_SPEC);
-        let payload_end = payload_start + LWC_PAGE_PAYLOAD_SIZE;
-        let page = LwcPage::try_from_bytes_mut(&mut buf.data_mut()[payload_start..payload_end])?;
+        let payload_end = payload_start + LWC_BLOCK_PAYLOAD_SIZE;
+        let page = LwcBlock::try_from_bytes_mut(&mut buf.data_mut()[payload_start..payload_end])?;
         page.header = header;
         let mut body_idx = 0;
         for offset in col_offsets {
@@ -1005,7 +1005,7 @@ impl<'a> LwcBuilder<'a> {
 
     fn estimate_size(&self) -> Result<usize> {
         let row_count = self.buffer.len();
-        let mut total = LWC_PAGE_HEADER_SIZE;
+        let mut total = LWC_BLOCK_HEADER_SIZE;
         total += mem::size_of::<u16>() * self.metadata.col_count();
         total += estimate_columns_size(self.metadata, &self.buffer, &self.stats, row_count)?;
         Ok(total)
@@ -1940,20 +1940,20 @@ mod tests {
         let expected_fingerprint = row_shape_fingerprint_for(builder.row_ids(), 100, 110);
         let buf = builder.build(expected_fingerprint).unwrap();
 
-        let lwc_page = LwcPage::try_from_persisted_bytes(
+        let lwc_block = LwcBlock::try_from_persisted_bytes(
             buf.as_bytes(),
             FileKind::TableFile,
             test_block_id(1),
         )
         .unwrap();
-        assert_eq!(lwc_page.header.row_count() as usize, expected_rows.len());
+        assert_eq!(lwc_block.header.row_count() as usize, expected_rows.len());
         assert_eq!(
-            lwc_page.header.row_shape_fingerprint(),
+            lwc_block.header.row_shape_fingerprint(),
             expected_fingerprint
         );
 
-        let column0 = lwc_page.column(&metadata, 0).unwrap();
-        let column1 = lwc_page.column(&metadata, 1).unwrap();
+        let column0 = lwc_block.column(&metadata, 0).unwrap();
+        let column1 = lwc_block.column(&metadata, 1).unwrap();
         let data0 = column0.data().unwrap();
         let data1 = column1.data().unwrap();
         for (idx, (_row_id, c0, c1)) in expected_rows.iter().enumerate() {
@@ -2113,13 +2113,13 @@ mod tests {
             .build(row_shape_fingerprint_for(builder.row_ids(), 10, 13))
             .unwrap();
 
-        let lwc_page = LwcPage::try_from_persisted_bytes(
+        let lwc_block = LwcBlock::try_from_persisted_bytes(
             buf.as_bytes(),
             FileKind::TableFile,
             test_block_id(1),
         )
         .unwrap();
-        assert_eq!(lwc_page.header.row_count() as usize, rows.len());
+        assert_eq!(lwc_block.header.row_count() as usize, rows.len());
 
         for (col_idx, expected_kind) in [
             ValKind::I8,
@@ -2137,7 +2137,7 @@ mod tests {
         .iter()
         .enumerate()
         {
-            let column = lwc_page.column(&metadata, col_idx).unwrap();
+            let column = lwc_block.column(&metadata, col_idx).unwrap();
             let data = column.data().unwrap();
             assert_eq!(data.len(), rows.len());
             for (row_idx, expected_row) in rows.iter().enumerate() {

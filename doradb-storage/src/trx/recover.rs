@@ -1444,7 +1444,7 @@ mod tests {
     }
 
     #[test]
-    fn test_log_recover_fails_on_corrupted_persisted_lwc_page() {
+    fn test_log_recover_fails_on_corrupted_persisted_lwc_block() {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
             let main_dir = temp_dir.path().to_path_buf();
@@ -1519,7 +1519,7 @@ mod tests {
                     .unwrap()
                     .into_iter()
                     .next()
-                    .expect("checkpointed table should publish a persisted LWC page");
+                    .expect("checkpointed table should publish a persisted LWC block");
                 entry.block_id()
             };
 

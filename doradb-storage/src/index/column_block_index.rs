@@ -334,7 +334,7 @@ impl ColumnBlockNode {
 }
 
 /// Validated row-shape metadata for one logical leaf entry before the backing
-/// LWC page id is assigned in the table file.
+/// LWC block id is assigned in the table file.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ColumnBlockEntryShape {
     start_row_id: RowID,
@@ -415,7 +415,7 @@ impl ColumnBlockEntryShape {
 }
 
 /// Fully materialized logical leaf entry used by v2 builders and rewrite flows
-/// after the backing LWC page id is known.
+/// after the backing LWC block id is known.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ColumnBlockEntryInput {
     start_row_id: RowID,
@@ -541,14 +541,14 @@ impl ResolvedColumnRow {
         self.block_id
     }
 
-    /// Returns the resolved ordinal inside the persisted LWC page.
+    /// Returns the resolved ordinal inside the persisted LWC block.
     #[inline]
     pub fn row_idx(&self) -> usize {
         self.row_idx
     }
 
     /// Returns the expected canonical row-shape fingerprint for the resolved
-    /// persisted LWC page.
+    /// persisted LWC block.
     #[inline]
     pub fn row_shape_fingerprint(&self) -> u128 {
         self.row_shape_fingerprint

@@ -19,7 +19,7 @@ use crate::buffer::{
 use crate::catalog::TableMetadata;
 use crate::catalog::{IndexSpec, TableID};
 use crate::error::{Error, Result};
-use crate::file::table_file::{LwcPagePersist, TableFile};
+use crate::file::table_file::{LwcBlockPersist, TableFile};
 use crate::index::util::{Maskable, RowPageCreateRedoCtx};
 use crate::index::{
     BlockIndex, ColumnBlockEntryShape, GenericSecondaryIndex, IndexCompareExchange, IndexInsert,
@@ -185,7 +185,7 @@ impl<D: BufferPool, I: BufferPool> GenericMemTable<D, I> {
         &self.mem_pool
     }
 
-    /// Returns the row block index used by this table.
+    /// Returns the row page index used by this table.
     #[inline]
     pub fn blk_idx(&self) -> &BlockIndex {
         &self.blk_idx
@@ -592,19 +592,19 @@ impl Table {
         Ok(())
     }
 
-    async fn build_lwc_pages(
+    async fn build_lwc_blocks(
         &self,
         guards: &PoolGuards,
         cutoff_ts: TrxID,
         frozen_pages: &[FrozenPage],
-    ) -> Result<Vec<LwcPagePersist>> {
+    ) -> Result<Vec<LwcBlockPersist>> {
         #[cfg(test)]
         {
             if TEST_FORCE_LWC_BUILD_ERROR.with(|flag| flag.get()) {
                 return Err(Error::InvalidState);
             }
         }
-        let mut lwc_pages = Vec::new();
+        let mut lwc_blocks = Vec::new();
         if !frozen_pages.is_empty() {
             let metadata = self.metadata();
             let mut builder = LwcBuilder::new(metadata);
@@ -631,7 +631,7 @@ impl Table {
                         Vec::new(),
                     )?;
                     let buf = builder.build(shape.row_shape_fingerprint())?;
-                    lwc_pages.push(LwcPagePersist { shape, buf });
+                    lwc_blocks.push(LwcBlockPersist { shape, buf });
                     builder = LwcBuilder::new(metadata);
                     current_start = page_info.start_row_id;
                     current_end = page_info.end_row_id;
@@ -651,10 +651,10 @@ impl Table {
                     Vec::new(),
                 )?;
                 let buf = builder.build(shape.row_shape_fingerprint())?;
-                lwc_pages.push(LwcPagePersist { shape, buf });
+                lwc_blocks.push(LwcBlockPersist { shape, buf });
             }
         }
-        Ok(lwc_pages)
+        Ok(lwc_blocks)
     }
 
     fn capture_delete_markers_for_transition(
@@ -1066,7 +1066,7 @@ impl Table {
     ) -> Result<Option<TrxID>> {
         Ok(match self.find_row(guards, row_id).await {
             RowLocation::NotFound => None,
-            RowLocation::LwcBlock { .. } => todo!("lwc page"),
+            RowLocation::LwcBlock { .. } => todo!("lwc block"),
             RowLocation::RowPage(page_id) => {
                 let page_guard = self.must_get_row_page_shared(guards, page_id).await?;
                 debug_assert!(validate_page_row_range(&page_guard, page_id, row_id));

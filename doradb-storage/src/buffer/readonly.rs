@@ -1398,7 +1398,9 @@ pub(crate) mod tests {
         AIOBuf, AIOKind, DirectBuf, StorageBackendOp, StorageBackendTestHook,
         set_storage_backend_test_hook,
     };
-    use crate::lwc::{LWC_PAGE_PAYLOAD_SIZE, LwcPage, LwcPageHeader, validate_persisted_lwc_block};
+    use crate::lwc::{
+        LWC_BLOCK_PAYLOAD_SIZE, LwcBlock, LwcBlockHeader, validate_persisted_lwc_block,
+    };
     use crate::quiescent::QuiescentBox;
     use crate::thread::join_worker;
     use crate::value::ValKind;
@@ -1698,12 +1700,12 @@ pub(crate) mod tests {
         });
     }
 
-    fn build_valid_persisted_lwc_page() -> Vec<u8> {
+    fn build_valid_persisted_lwc_block() -> Vec<u8> {
         let mut buf = vec![0u8; COW_FILE_PAGE_SIZE];
         let payload_start = write_block_header(&mut buf, LWC_BLOCK_SPEC);
-        let payload_end = payload_start + LWC_PAGE_PAYLOAD_SIZE;
-        let page = LwcPage::try_from_bytes_mut(&mut buf[payload_start..payload_end]).unwrap();
-        page.header = LwcPageHeader::new(1, 0, 0, 0);
+        let payload_end = payload_start + LWC_BLOCK_PAYLOAD_SIZE;
+        let page = LwcBlock::try_from_bytes_mut(&mut buf[payload_start..payload_end]).unwrap();
+        page.header = LwcBlockHeader::new(1, 0, 0, 0);
         write_block_checksum(&mut buf);
         buf
     }
@@ -2134,7 +2136,7 @@ pub(crate) mod tests {
             let (table_file, old_root) = table_file.commit(1, false).await.unwrap();
             drop(old_root);
 
-            let persisted_page = build_valid_persisted_lwc_page();
+            let persisted_page = build_valid_persisted_lwc_block();
             write_page_bytes(&table_file, test_block_id(12), &persisted_page).await;
 
             let global = owned_global_pool(frame_page_bytes(2));
@@ -2534,7 +2536,7 @@ pub(crate) mod tests {
             let table_file = fs.create_table_file(115, make_metadata(), false).unwrap();
             let (table_file, old_root) = table_file.commit(1, false).await.unwrap();
             drop(old_root);
-            let mut page = build_valid_persisted_lwc_page();
+            let mut page = build_valid_persisted_lwc_block();
             let last_idx = page.len() - 1;
             page[last_idx] ^= 0xFF;
             write_page_bytes(&table_file, test_block_id(8), &page).await;
@@ -2620,7 +2622,7 @@ pub(crate) mod tests {
             let (table_file, old_root) = table_file.commit(1, false).await.unwrap();
             drop(old_root);
 
-            let mut page = build_valid_persisted_lwc_page();
+            let mut page = build_valid_persisted_lwc_block();
             let last_idx = page.len() - 1;
             page[last_idx] ^= 0xFF;
             write_page_bytes(&table_file, test_block_id(9), &page).await;
@@ -2660,14 +2662,14 @@ pub(crate) mod tests {
             let (table_file, old_root) = table_file.commit(1, false).await.unwrap();
             drop(old_root);
 
-            let mut page = build_valid_persisted_lwc_page();
+            let mut page = build_valid_persisted_lwc_block();
             {
                 let payload_start = BLOCK_INTEGRITY_HEADER_SIZE;
-                let payload_end = payload_start + LWC_PAGE_PAYLOAD_SIZE;
+                let payload_end = payload_start + LWC_BLOCK_PAYLOAD_SIZE;
                 let page_view =
-                    LwcPage::try_from_bytes_mut(&mut page[payload_start..payload_end]).unwrap();
+                    LwcBlock::try_from_bytes_mut(&mut page[payload_start..payload_end]).unwrap();
                 let invalid_end = (page_view.body.len() as u16).saturating_add(1);
-                page_view.header = LwcPageHeader::new(1, 1, 1, 0);
+                page_view.header = LwcBlockHeader::new(1, 1, 1, 0);
                 page_view.body[..2].copy_from_slice(&invalid_end.to_le_bytes());
             }
             write_block_checksum(&mut page);

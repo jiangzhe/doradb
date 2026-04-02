@@ -16,7 +16,7 @@ pub trait TablePersistence {
     /// Freeze row pages and return approximate non-deleted rows visited.
     fn freeze(&self, session: &Session, max_rows: usize) -> impl Future<Output = usize>;
 
-    /// Convert frozen row pages to LWC pages and persist to table file.
+    /// Convert frozen row pages to LWC blocks and persist to table file.
     fn checkpoint_for_new_data(&self, session: &mut Session) -> impl Future<Output = Result<()>>;
 
     /// Persist committed cold-row deletions from memory to column block index.
@@ -51,7 +51,7 @@ impl Table {
             .ok_or(Error::NotSupported("checkpoint requires idle session"))?;
         let checkpoint_ts = trx.sts;
         let mut new_pivot_row_id = pivot_row_id;
-        let mut lwc_pages = Vec::new();
+        let mut lwc_blocks = Vec::new();
         let mut heap_redo_start_ts = active_root.heap_redo_start_ts;
 
         // Step 2: for new-data checkpoint, collect frozen pages and move them into
@@ -69,18 +69,18 @@ impl Table {
                     .await?;
             }
 
-            // Step 4: build LWC pages from transition pages using the cutoff snapshot.
+            // Step 4: build LWC blocks from transition pages using the cutoff snapshot.
             new_pivot_row_id = frozen_pages
                 .last()
                 .map(|page| page.end_row_id)
                 .unwrap_or(pivot_row_id);
 
             match self
-                .build_lwc_pages(session.pool_guards(), cutoff_ts, &frozen_pages)
+                .build_lwc_blocks(session.pool_guards(), cutoff_ts, &frozen_pages)
                 .await
             {
                 Ok(pages) => {
-                    lwc_pages = pages;
+                    lwc_blocks = pages;
                     heap_redo_start_ts = next_heap_redo_start_ts.unwrap_or(checkpoint_ts);
                 }
                 Err(err) => {
@@ -89,7 +89,7 @@ impl Table {
                 }
             }
 
-            if let Some(last) = lwc_pages.last_mut()
+            if let Some(last) = lwc_blocks.last_mut()
                 && last.shape.end_row_id() < new_pivot_row_id
             {
                 last.shape.set_end_row_id(new_pivot_row_id)?;
@@ -110,9 +110,9 @@ impl Table {
         let mut table_file_changed = false;
         if include_new_data {
             table_file_changed = true;
-            if !lwc_pages.is_empty() {
+            if !lwc_blocks.is_empty() {
                 mutable_file
-                    .apply_lwc_pages(lwc_pages, heap_redo_start_ts, checkpoint_ts, disk_pool)
+                    .apply_lwc_blocks(lwc_blocks, heap_redo_start_ts, checkpoint_ts, disk_pool)
                     .await?;
             } else {
                 mutable_file.apply_checkpoint_metadata(new_pivot_row_id, heap_redo_start_ts)?;
@@ -197,7 +197,7 @@ impl Table {
         // Step 3: resolve each row-id to its persisted block payload.
         // Future improvement:
         // 1) resolve disjoint row-id ranges in parallel for higher throughput;
-        // 2) when roaring bitmap encoding is introduced, also fetch the target LWC page
+        // 2) when roaring bitmap encoding is introduced, also fetch the target LWC block
         //    row-id array to map each input row-id to the correct offset-based bit index.
         let column_index = ColumnBlockIndex::new(
             mutable_root.column_block_index_root,

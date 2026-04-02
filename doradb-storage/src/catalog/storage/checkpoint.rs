@@ -24,7 +24,7 @@ use crate::value::Val;
 use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroU64;
 
-struct PendingLwcPage {
+struct PendingLwcBlock {
     shape: ColumnBlockEntryShape,
     buf: DirectBuf,
 }
@@ -265,7 +265,7 @@ impl CatalogStorage {
             }
         }
 
-        // Step 5: Try CoW-merging inserts into the right-most existing LWC page first.
+        // Step 5: Try CoW-merging inserts into the right-most existing LWC block first.
         if !live_inserts.is_empty()
             && let Some(last_entry) = entries.last().copied()
         {
@@ -274,7 +274,7 @@ impl CatalogStorage {
                 .await?;
             if !existing_tail_rows.is_empty()
                 && let Some((merged_tail_buf, merged_row_ids, consumed)) = self
-                    .build_merged_tail_lwc_page(
+                    .build_merged_tail_lwc_block(
                         metadata,
                         last_entry.start_row_id,
                         &existing_tail_rows,
@@ -321,10 +321,10 @@ impl CatalogStorage {
             }
         }
 
-        // Step 6: Persist any remaining inserts as new LWC pages and append index entries.
+        // Step 6: Persist any remaining inserts as new LWC blocks and append index entries.
         if !live_inserts.is_empty() {
             let new_pages = self
-                .build_lwc_pages_from_row_records(&self.meta_pool, metadata, &live_inserts)
+                .build_lwc_blocks_from_row_records(&self.meta_pool, metadata, &live_inserts)
                 .await?;
             let mut new_entries = Vec::with_capacity(new_pages.len());
             for page in new_pages {
@@ -510,9 +510,9 @@ impl CatalogStorage {
         column_index: &ColumnBlockIndex<'_>,
         entry: &CatalogIndexEntry,
     ) -> Result<Vec<RowRecord>> {
-        let lwc_page =
+        let lwc_block =
             PersistedLwcBlock::load(&self.disk_pool, disk_pool_guard, entry.block_id()).await?;
-        let row_count = lwc_page.row_count();
+        let row_count = lwc_block.row_count();
         let row_ids = column_index.load_entry_row_ids(entry).await?;
         if row_count != row_ids.len() {
             return Err(Error::block_corrupted(
@@ -524,18 +524,18 @@ impl CatalogStorage {
         }
         let mut rows = Vec::with_capacity(row_count);
         for (row_idx, row_id) in row_ids.into_iter().enumerate() {
-            let vals = lwc_page.decode_full_row_values(metadata, row_idx)?;
+            let vals = lwc_block.decode_full_row_values(metadata, row_idx)?;
             rows.push(RowRecord { row_id, vals });
         }
         Ok(rows)
     }
 
-    async fn build_lwc_pages_from_row_records(
+    async fn build_lwc_blocks_from_row_records(
         &self,
         meta_pool: &FixedBufferPool,
         metadata: &TableMetadata,
         rows: &[RowRecord],
-    ) -> Result<Vec<PendingLwcPage>> {
+    ) -> Result<Vec<PendingLwcBlock>> {
         for row in rows {
             if row.vals.len() != metadata.col_count() {
                 return Err(Error::InvalidFormat);
@@ -545,7 +545,7 @@ impl CatalogStorage {
             return Ok(Vec::new());
         }
 
-        let mut lwc_pages = Vec::new();
+        let mut lwc_blocks = Vec::new();
         let mut builder = LwcBuilder::new(metadata);
         let mut builder_start = None;
         let mut builder_end = 0u64;
@@ -568,7 +568,7 @@ impl CatalogStorage {
                     Vec::new(),
                 )?;
                 let buf = builder.build(shape.row_shape_fingerprint())?;
-                lwc_pages.push(PendingLwcPage { shape, buf });
+                lwc_blocks.push(PendingLwcBlock { shape, buf });
 
                 builder = LwcBuilder::new(metadata);
                 builder_start = Some(row.row_id);
@@ -593,12 +593,12 @@ impl CatalogStorage {
                 Vec::new(),
             )?;
             let buf = builder.build(shape.row_shape_fingerprint())?;
-            lwc_pages.push(PendingLwcPage { shape, buf });
+            lwc_blocks.push(PendingLwcBlock { shape, buf });
         }
-        Ok(lwc_pages)
+        Ok(lwc_blocks)
     }
 
-    async fn build_merged_tail_lwc_page(
+    async fn build_merged_tail_lwc_block(
         &self,
         metadata: &TableMetadata,
         start_row_id: RowID,

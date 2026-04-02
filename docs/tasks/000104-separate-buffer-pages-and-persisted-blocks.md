@@ -191,6 +191,51 @@ Reference:
 
 ## Implementation Notes
 
+Implemented the runtime page / persisted block split in `doradb-storage`
+without changing persisted byte layout.
+
+1. Identity and low-level API split:
+   - moved nominal runtime `PageID` ownership into `doradb-storage/src/buffer/mod.rs`
+     and nominal persisted `BlockID` ownership into
+     `doradb-storage/src/file/mod.rs`;
+   - renamed `PersistedBlockKey` to `BlockKey`;
+   - replaced fully qualified type spellings with imports and short names at
+     call sites;
+   - removed `From<i32>` from `PageID` and `BlockID`, and replaced test-only
+     signed construction with `test_page_id(i32)` / `test_block_id(i32)`.
+2. File-layer block terminology cleanup:
+   - renamed `meta_page` / `super_page` modules, types, constants, tests, and
+     helpers to `meta_block` / `super_block`;
+   - renamed `page_integrity` filename and API surface to `block_integrity`,
+     including persisted corruption reporting names in `error.rs`;
+   - renamed `CatalogTableRootDesc.root_page_id` to `root_block_id`;
+   - made the multi-table meta-block codec use an explicit `NO_ROOT_BLOCK_ID = 0`
+     sentinel for `None` and documented the matching deserialize behavior.
+3. Correctness hardening completed during implementation:
+   - added meta-block regression coverage for `root_block_id = None`
+     round-trip;
+   - rejected `SUPER_BLOCK_ID` in meta-block GC lists during deserialize;
+   - fixed catalog checkpoint root publication so `root_block_id = None`
+     cannot be paired with a nonzero pivot row id;
+   - added focused direct unit coverage for `PageID` and `BlockID`.
+4. Remaining terminology cleanup originally deferred during implementation was
+   completed before resolve:
+   - renamed `doradb-storage/src/lwc/page.rs` to `doradb-storage/src/lwc/block.rs`
+     and `LwcPage*` surfaces to `LwcBlock*`;
+   - renamed `doradb-storage/src/index/row_block_index.rs` to
+     `doradb-storage/src/index/row_page_index.rs` and corresponding
+     `RowBlockIndex*` / `BlockNode*` surfaces to row-page index names;
+   - updated direct consumers, tests, and examples accordingly.
+5. Validation and review outcomes:
+   - refreshed unsafe inventory with
+     `tools/unsafe_inventory.rs --write docs/unsafe-usage-baseline.md`;
+   - `cargo fmt --all`;
+   - `cargo clippy -p doradb-storage --all-targets -- -D warnings`;
+   - `cargo check -p doradb-storage --all-targets`;
+   - `cargo nextest run -p doradb-storage` passed with 474 tests;
+   - `cargo nextest run -p doradb-storage --no-default-features --features libaio`
+     passed with 473 tests.
+
 ## Impacts
 
 Primary code paths:

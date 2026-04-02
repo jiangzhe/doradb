@@ -59,7 +59,7 @@ pub trait TableRecover {
         page_id: PageID,
     ) -> impl Future<Output = Result<()>>;
 
-    /// Populate indexes using persisted LWC pages below the current pivot boundary.
+    /// Populate indexes using persisted LWC blocks below the current pivot boundary.
     fn populate_index_via_persisted_data(
         &self,
         guards: &PoolGuards,
