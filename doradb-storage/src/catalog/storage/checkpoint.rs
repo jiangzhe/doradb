@@ -386,15 +386,24 @@ impl CatalogStorage {
         }
 
         // Step 9: Publish final per-table root descriptor for this checkpoint batch.
-        let root_block_id = if entries_changed {
-            Some(NonZeroU64::new(current_root_block_id.into()).ok_or(Error::InvalidState)?)
+        let next_pivot_row_id = next_row_id.max(root.pivot_row_id);
+        let (root_block_id, pivot_row_id) = if current_root_block_id == SUPER_BLOCK_ID {
+            // Same-batch insert/delete on an empty root can advance `next_row_id`
+            // without materializing any persisted blocks. Keep the published
+            // descriptor empty instead of emitting `None` with a nonzero pivot.
+            (root.root_block_id, root.pivot_row_id)
         } else {
-            root.root_block_id
+            let root_block_id = if entries_changed || next_pivot_row_id > root.pivot_row_id {
+                Some(NonZeroU64::new(current_root_block_id.into()).ok_or(Error::InvalidState)?)
+            } else {
+                root.root_block_id
+            };
+            (root_block_id, next_pivot_row_id)
         };
         Ok(CatalogTableRootDesc {
             table_id,
             root_block_id,
-            pivot_row_id: next_row_id.max(root.pivot_row_id),
+            pivot_row_id,
         })
     }
 
@@ -684,13 +693,103 @@ fn row_matches_key(metadata: &TableMetadata, row: &[Val], key: &SelectKey) -> bo
 
 #[cfg(test)]
 mod tests {
+    use super::*;
     use crate::buffer::BlockKey;
+    use crate::catalog::USER_OBJ_ID_START;
     use crate::catalog::tests::{table1, table2};
     use crate::conf::{EngineConfig, TrxSysConfig};
     use crate::file::BlockID;
-    use crate::file::multi_table_file::CATALOG_MTB_PERSISTED_FILE_ID;
+    use crate::file::multi_table_file::{CATALOG_MTB_PERSISTED_FILE_ID, MutableMultiTableFile};
     use crate::index::{ColumnBlockIndex, ColumnDeleteDomain, load_entry_deletion_deltas};
+    use crate::row::ops::SelectKey;
+    use crate::trx::redo::RowRedoKind;
+    use crate::value::Val;
     use tempfile::TempDir;
+
+    #[test]
+    fn test_catalog_checkpoint_apply_table_ops_keeps_empty_root_for_canceled_insert_batch() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let main_dir = temp_dir.path().to_path_buf();
+            let engine = EngineConfig::default()
+                .storage_root(main_dir)
+                .trx(
+                    TrxSysConfig::default()
+                        .log_file_stem("catalog-checkpoint-canceled-empty-root")
+                        .skip_recovery(false),
+                )
+                .build()
+                .await
+                .unwrap();
+
+            let storage = &engine.catalog().storage;
+            let table = storage.get_catalog_table(0).unwrap();
+            let root = CatalogTableRootDesc {
+                table_id: 0,
+                root_block_id: None,
+                pivot_row_id: 0,
+            };
+            let table_id = USER_OBJ_ID_START + 42;
+            let table_ops = vec![
+                RowRedoKind::Insert(vec![Val::from(table_id)]),
+                RowRedoKind::DeleteByUniqueKey(SelectKey::new(0, vec![Val::from(table_id)])),
+            ];
+            let mut mutable = MutableMultiTableFile::fork(&storage.mtb);
+
+            let next_root = storage
+                .apply_table_ops(&mut mutable, 0, table.metadata(), root, &table_ops, 7)
+                .await
+                .unwrap();
+
+            assert_eq!(next_root.root_block_id, None);
+            assert_eq!(next_root.pivot_row_id, 0);
+        });
+    }
+
+    #[test]
+    fn test_catalog_checkpoint_apply_table_ops_advances_existing_root_for_canceled_insert_batch() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let main_dir = temp_dir.path().to_path_buf();
+            let engine = EngineConfig::default()
+                .storage_root(main_dir)
+                .trx(
+                    TrxSysConfig::default()
+                        .log_file_stem("catalog-checkpoint-canceled-existing-root")
+                        .skip_recovery(false),
+                )
+                .build()
+                .await
+                .unwrap();
+
+            let _ = table1(&engine).await;
+            engine
+                .catalog()
+                .checkpoint_now(&engine.trx_sys)
+                .await
+                .unwrap();
+
+            let storage = &engine.catalog().storage;
+            let table = storage.get_catalog_table(0).unwrap();
+            let root = storage.checkpoint_snapshot().unwrap().meta.table_roots[0];
+            assert!(root.root_block_id.is_some());
+
+            let table_id = USER_OBJ_ID_START + 4242;
+            let table_ops = vec![
+                RowRedoKind::Insert(vec![Val::from(table_id)]),
+                RowRedoKind::DeleteByUniqueKey(SelectKey::new(0, vec![Val::from(table_id)])),
+            ];
+            let mut mutable = MutableMultiTableFile::fork(&storage.mtb);
+
+            let next_root = storage
+                .apply_table_ops(&mut mutable, 0, table.metadata(), root, &table_ops, 8)
+                .await
+                .unwrap();
+
+            assert_eq!(next_root.root_block_id, root.root_block_id);
+            assert_eq!(next_root.pivot_row_id, root.pivot_row_id + 1);
+        });
+    }
 
     #[test]
     fn test_catalog_checkpoint_collect_index_entries_uses_readonly_cache() {

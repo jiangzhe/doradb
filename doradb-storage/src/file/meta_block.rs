@@ -143,7 +143,8 @@ impl Deser for AllocMapGcList {
 
         let (idx, gc_block_list) = LwcPrimitiveDeser::<BlockID>::deser(input, idx)?;
         for page_id in &gc_block_list.0 {
-            if usize::from(*page_id) >= alloc_map.len() {
+            let raw_block_id = usize::from(*page_id);
+            if raw_block_id == usize::from(SUPER_BLOCK_ID) || raw_block_id >= alloc_map.len() {
                 return Err(crate::error::Error::InvalidFormat);
             }
         }
@@ -389,5 +390,20 @@ mod tests {
         assert_eq!(decoded.table_roots[1].root_block_id, NonZeroU64::new(42));
         assert_eq!(decoded.table_roots[1].pivot_row_id, 128);
         assert_eq!(decoded.table_roots.len(), CATALOG_TABLE_ROOT_DESC_COUNT);
+    }
+
+    #[test]
+    fn test_alloc_map_gc_list_deser_rejects_super_block_gc_entry() {
+        let alloc_map = AllocMap::new(128);
+        assert!(alloc_map.allocate_at(usize::from(SUPER_BLOCK_ID)));
+        let gc_block_list = vec![SUPER_BLOCK_ID];
+        let ser_view = AllocMapGcListSerView::new(&alloc_map, &gc_block_list);
+        let ser_len = ser_view.ser_len();
+        let mut data = vec![0u8; ser_len];
+        let res_idx = ser_view.ser(&mut data[..], 0);
+        assert_eq!(res_idx, ser_len);
+
+        let err = AllocMapGcList::deser(&data[..], 0).unwrap_err();
+        assert!(matches!(err, crate::error::Error::InvalidFormat));
     }
 }
