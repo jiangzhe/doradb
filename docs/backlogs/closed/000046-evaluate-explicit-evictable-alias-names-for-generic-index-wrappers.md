@@ -33,3 +33,12 @@ When a backlog item is moved to `docs/backlogs/closed/`, append:
 - Reference: <task/issue/pr reference>
 - Closed At: <YYYY-MM-DD>
 ```
+
+## Close Reason
+
+- Type: wontfix
+- Detail: The codebase naming has settled on `RowPageIndex`, and the buffer-pool property is not the concern that should drive this index name. Additional explicit `Evictable*` compatibility aliases are therefore not the chosen naming direction.
+- Closed By: backlog close
+- Reference: docs/index-design.md; doradb-storage/src/index/row_page_index.rs
+
+- Closed At: 2026-04-03
