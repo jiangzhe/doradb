@@ -674,6 +674,9 @@ impl Deref for FixedSizeBufferFreeList {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::compression::BitPackable;
+    use crate::serde::{Deser, Ser};
+    use std::mem;
     use std::sync::{Arc, Mutex};
     use tempfile::TempDir;
 
@@ -722,6 +725,98 @@ mod tests {
     pub(crate) fn set_file_sync_test_hook(hook: Option<FileSyncHook>) -> Option<FileSyncHook> {
         let mut guard = FILE_SYNC_TEST_HOOK.lock().unwrap();
         std::mem::replace(&mut *guard, hook)
+    }
+
+    #[test]
+    fn test_block_id_accessors_and_conversions() {
+        let block_id = BlockID::new(42);
+        assert_eq!(block_id.as_u64(), 42);
+        assert_eq!(block_id.as_usize(), 42);
+        assert_eq!(BlockID::from(42u64), block_id);
+        assert_eq!(BlockID::from(42u32), block_id);
+        assert_eq!(BlockID::from(42usize), block_id);
+        assert_eq!(u64::from(block_id), 42);
+        assert_eq!(usize::from(block_id), 42);
+    }
+
+    #[test]
+    fn test_block_id_bytes_roundtrip() {
+        let block_id = BlockID::new(0xfedc_ba98_7654_3210);
+        let bytes = block_id.to_le_bytes();
+        assert_eq!(bytes, 0xfedc_ba98_7654_3210u64.to_le_bytes());
+        assert_eq!(BlockID::from_le_bytes(bytes), block_id);
+    }
+
+    #[test]
+    fn test_block_id_arithmetic() {
+        let block_id = BlockID::new(10);
+        assert_eq!(block_id + 5, BlockID::new(15));
+        assert_eq!(block_id - 3, BlockID::new(7));
+
+        let mut next = block_id;
+        next += 7;
+        assert_eq!(next, BlockID::new(17));
+        next -= 5;
+        assert_eq!(next, BlockID::new(12));
+    }
+
+    #[test]
+    fn test_block_id_partial_eq_signed() {
+        let block_id = BlockID::new(7);
+        assert_eq!(block_id, 7i32);
+        assert_eq!(7i32, block_id);
+        assert_ne!(block_id, -1i32);
+        assert_ne!(-1i32, block_id);
+    }
+
+    #[test]
+    fn test_block_id_display() {
+        assert_eq!(format!("{}", BlockID::new(99)), "99");
+    }
+
+    #[test]
+    fn test_block_id_serde_roundtrip() {
+        let block_id = BlockID::new(1234);
+        assert_eq!(block_id.ser_len(), mem::size_of::<u64>());
+
+        let mut out = vec![0; block_id.ser_len()];
+        let end = block_id.ser(&mut out[..], 0);
+        assert_eq!(end, out.len());
+
+        let (end, deser) = BlockID::deser(&out[..], 0).unwrap();
+        assert_eq!(end, out.len());
+        assert_eq!(deser, block_id);
+    }
+
+    #[test]
+    fn test_block_id_bit_packable_contract() {
+        let min = BlockID::new(10);
+        let value = BlockID::new(42);
+        assert_eq!(BlockID::ZERO, BlockID::new(0));
+        assert_eq!(value.sub_to_u64(min), 32);
+        assert_eq!(value.sub_to_u32(min), 32);
+        assert_eq!(value.sub_to_u16(min), 32);
+        assert_eq!(value.sub_to_u8(min), 32);
+        assert_eq!(min.add_from_u32(5), BlockID::new(15));
+        assert_eq!(min.add_from_u16(6), BlockID::new(16));
+        assert_eq!(min.add_from_u8(7), BlockID::new(17));
+
+        let wrap_min = BlockID::new(u64::MAX - 2);
+        let wrap_value = BlockID::new(1);
+        assert_eq!(wrap_value.sub_to_u64(wrap_min), 4);
+        assert_eq!(wrap_min.add_from_u32(5), BlockID::new(2));
+    }
+
+    #[test]
+    fn test_test_block_id_accepts_non_negative_values() {
+        assert_eq!(test_block_id(0), BlockID::new(0));
+        assert_eq!(test_block_id(17), BlockID::new(17));
+    }
+
+    #[test]
+    #[should_panic(expected = "test BlockID must be non-negative")]
+    fn test_test_block_id_panics_on_negative_values() {
+        let _ = test_block_id(-1);
     }
 
     #[test]

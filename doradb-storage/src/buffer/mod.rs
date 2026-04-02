@@ -610,9 +610,107 @@ impl Component for crate::DiskPool {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::PageID;
+    use crate::compression::BitPackable;
+    use crate::serde::{Deser, Ser};
+    use std::mem;
 
     #[inline]
     pub(crate) fn test_page_id(value: i32) -> PageID {
         PageID::new(u64::try_from(value).expect("test PageID must be non-negative"))
+    }
+
+    #[test]
+    fn test_page_id_accessors_and_conversions() {
+        let page_id = PageID::new(42);
+        assert_eq!(page_id.as_u64(), 42);
+        assert_eq!(page_id.as_usize(), 42);
+        assert_eq!(PageID::from(42u64), page_id);
+        assert_eq!(PageID::from(42u32), page_id);
+        assert_eq!(PageID::from(42usize), page_id);
+        assert_eq!(u64::from(page_id), 42);
+        assert_eq!(usize::from(page_id), 42);
+    }
+
+    #[test]
+    fn test_page_id_bytes_roundtrip() {
+        let page_id = PageID::new(0x0123_4567_89ab_cdef);
+        let bytes = page_id.to_le_bytes();
+        assert_eq!(bytes, 0x0123_4567_89ab_cdefu64.to_le_bytes());
+        assert_eq!(PageID::from_le_bytes(bytes), page_id);
+    }
+
+    #[test]
+    fn test_page_id_arithmetic() {
+        let page_id = PageID::new(10);
+        assert_eq!(page_id + 5, PageID::new(15));
+        assert_eq!(page_id - 3, PageID::new(7));
+        assert_eq!(20u64 - page_id, PageID::new(10));
+
+        let mut next = page_id;
+        next += 7;
+        assert_eq!(next, PageID::new(17));
+        next -= 5;
+        assert_eq!(next, PageID::new(12));
+    }
+
+    #[test]
+    fn test_page_id_partial_eq_signed_and_unsigned() {
+        let page_id = PageID::new(7);
+        assert_eq!(page_id, 7u64);
+        assert_eq!(7u64, page_id);
+        assert_eq!(page_id, 7i32);
+        assert_eq!(7i32, page_id);
+        assert_ne!(page_id, -1i32);
+        assert_ne!(-1i32, page_id);
+    }
+
+    #[test]
+    fn test_page_id_display() {
+        assert_eq!(format!("{}", PageID::new(99)), "99");
+    }
+
+    #[test]
+    fn test_page_id_serde_roundtrip() {
+        let page_id = PageID::new(1234);
+        assert_eq!(page_id.ser_len(), mem::size_of::<u64>());
+
+        let mut out = vec![0; page_id.ser_len()];
+        let end = page_id.ser(&mut out[..], 0);
+        assert_eq!(end, out.len());
+
+        let (end, deser) = PageID::deser(&out[..], 0).unwrap();
+        assert_eq!(end, out.len());
+        assert_eq!(deser, page_id);
+    }
+
+    #[test]
+    fn test_page_id_bit_packable_contract() {
+        let min = PageID::new(10);
+        let value = PageID::new(42);
+        assert_eq!(PageID::ZERO, PageID::new(0));
+        assert_eq!(value.sub_to_u64(min), 32);
+        assert_eq!(value.sub_to_u32(min), 32);
+        assert_eq!(value.sub_to_u16(min), 32);
+        assert_eq!(value.sub_to_u8(min), 32);
+        assert_eq!(min.add_from_u32(5), PageID::new(15));
+        assert_eq!(min.add_from_u16(6), PageID::new(16));
+        assert_eq!(min.add_from_u8(7), PageID::new(17));
+
+        let wrap_min = PageID::new(u64::MAX - 2);
+        let wrap_value = PageID::new(1);
+        assert_eq!(wrap_value.sub_to_u64(wrap_min), 4);
+        assert_eq!(wrap_min.add_from_u32(5), PageID::new(2));
+    }
+
+    #[test]
+    fn test_test_page_id_accepts_non_negative_values() {
+        assert_eq!(test_page_id(0), PageID::new(0));
+        assert_eq!(test_page_id(17), PageID::new(17));
+    }
+
+    #[test]
+    #[should_panic(expected = "test PageID must be non-negative")]
+    fn test_test_page_id_panics_on_negative_values() {
+        let _ = test_page_id(-1);
     }
 }
