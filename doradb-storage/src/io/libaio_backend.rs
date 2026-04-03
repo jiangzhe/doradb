@@ -1,9 +1,9 @@
 use super::{
     AIOBuf, AIOClient, AIOError, AIOKey, AIOKind, AIOResult, BackendToken, IOBackend,
-    IOBackendStats, IOBackendStatsHandle, IOWorkerBuilder, Operation, io_context_t, io_destroy,
-    io_event, io_getevents, io_iocb_cmd, io_setup, io_submit, iocb,
+    IOBackendStats, IOBackendStatsHandle, IOLaneConfig, IOWorkerBuilder, Operation,
+    build_io_worker, build_io_worker_lanes, io_context_t, io_destroy, io_event, io_getevents,
+    io_iocb_cmd, io_setup, io_submit, iocb,
 };
-use flume::bounded;
 use libc::{EAGAIN, EINTR, c_long};
 use std::collections::VecDeque;
 use std::os::unix::io::RawFd;
@@ -276,10 +276,17 @@ impl LibaioBackend {
     /// Build an IO worker builder.
     #[inline]
     pub fn io_worker<T>(self) -> (IOWorkerBuilder<T>, AIOClient<T>) {
-        const DEFAULT_AIO_EVENT_LOOP_BACKLOG: usize = 10;
-        let (tx, rx) = bounded(DEFAULT_AIO_EVENT_LOOP_BACKLOG);
-        let worker = IOWorkerBuilder { backend: self, rx };
-        (worker, AIOClient(tx))
+        build_io_worker(self)
+    }
+
+    /// Builds a multi-lane IO worker builder plus one client per ingress lane.
+    #[allow(dead_code)]
+    #[inline]
+    pub(crate) fn io_worker_lanes<T>(
+        self,
+        lane_configs: &[IOLaneConfig],
+    ) -> AIOResult<(IOWorkerBuilder<T>, Vec<AIOClient<T>>)> {
+        build_io_worker_lanes(self, lane_configs)
     }
 }
 

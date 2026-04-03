@@ -1,8 +1,8 @@
 use super::{
     AIOClient, AIOError, AIOKind, AIOResult, BackendToken, IOBackend, IOBackendStats,
-    IOBackendStatsHandle, IOWorkerBuilder, Operation,
+    IOBackendStatsHandle, IOLaneConfig, IOWorkerBuilder, Operation, build_io_worker,
+    build_io_worker_lanes,
 };
-use flume::bounded;
 use io_uring::{IoUring, opcode, squeue, types};
 use libc::{EAGAIN, EBUSY, EINTR};
 use std::collections::VecDeque;
@@ -62,10 +62,17 @@ impl IouringBackend {
     /// Builds an IO worker builder.
     #[inline]
     pub fn io_worker<T>(self) -> (IOWorkerBuilder<T>, AIOClient<T>) {
-        const DEFAULT_AIO_EVENT_LOOP_BACKLOG: usize = 10;
-        let (tx, rx) = bounded(DEFAULT_AIO_EVENT_LOOP_BACKLOG);
-        let worker = IOWorkerBuilder { backend: self, rx };
-        (worker, AIOClient(tx))
+        build_io_worker(self)
+    }
+
+    /// Builds a multi-lane IO worker builder plus one client per ingress lane.
+    #[allow(dead_code)]
+    #[inline]
+    pub(crate) fn io_worker_lanes<T>(
+        self,
+        lane_configs: &[IOLaneConfig],
+    ) -> AIOResult<(IOWorkerBuilder<T>, Vec<AIOClient<T>>)> {
+        build_io_worker_lanes(self, lane_configs)
     }
 }
 
