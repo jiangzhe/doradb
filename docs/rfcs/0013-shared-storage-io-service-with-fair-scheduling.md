@@ -4,6 +4,7 @@ title: Introduce Shared Storage Runtime With Shared IO And Multi-Pool Eviction
 status: proposal
 tags: [io, scheduling, eviction, table-file, buffer-pool]
 created: 2026-04-03
+github_issue: 518
 ---
 
 # RFC-0013: Introduce Shared Storage Runtime With Shared IO And Multi-Pool Eviction
