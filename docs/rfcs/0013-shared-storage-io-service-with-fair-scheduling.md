@@ -434,10 +434,10 @@ Backend-touching phases must also run the supported alternate backend pass:
     redo and simple clients.
   - Non-goals: No client migration yet; no redo-path changes; no shared-evictor
     work yet; no new user-facing scheduling knobs.
-  - Task Doc: `docs/tasks/TBD.md`
-  - Task Issue: `#0`
-  - Phase Status: `pending`
-  - Implementation Summary: `pending`
+  - Task Doc: `docs/tasks/000105-multi-lane-completion-scheduling.md`
+  - Task Issue: `#520`
+  - Phase Status: done
+  - Implementation Summary: Implemented the generic multi-lane IO scheduler seam, lane-local deferred remainders, backend multi-lane builders, and fairness-sensitive tests while preserving single-lane caller compatibility. [Task Resolve Sync: docs/tasks/000105-multi-lane-completion-scheduling.md @ 2026-04-03]
 
 - **Phase 2: Shared Storage IO Runtime And Config Centralization**
   - Scope: Introduce `StorageRuntime` and `StorageService`,

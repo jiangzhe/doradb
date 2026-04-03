@@ -153,6 +153,32 @@ Reference:
 
 ## Implementation Notes
 
+1. `doradb-storage/src/io/mod.rs` now routes request intake through an
+   internal `RequestScheduler<T>` with one receiver, one deferred remainder
+   slot, one shutdown bit, and one burst cap per lane. `IOWorker` still owns
+   staged batching, inflight-slot accounting, backend submission, completion
+   dispatch, and shutdown drain; only request admission moved behind the
+   scheduler seam. The existing single-lane builder path now wraps one lane
+   with effectively unbounded burst capacity so current production callers
+   remain source-compatible.
+2. Added `IOLaneConfig`, `build_io_worker_lanes()`, and backend-specific
+   `io_worker_lanes()` helpers in `doradb-storage/src/io/iouring_backend.rs`
+   and `doradb-storage/src/io/libaio_backend.rs`. The new construction path
+   returns one `Vec<AIOClient<T>>` plus the existing worker builder shape for
+   later RFC-0013 phases, while `TableFileSystem`, evictable buffer pools, and
+   redo-log I/O continue to use the single-lane constructor unchanged in this
+   phase.
+3. Extended `io`-module tests to cover round-robin fairness after deferred
+   remainders, lane-local backlog isolation, idle wakeup on any lane, and
+   shutdown draining across lanes, while preserving existing single-lane fetch
+   coverage. Validation completed with:
+   - `cargo clippy -p doradb-storage --all-targets -- -D warnings`
+   - `cargo nextest run -p doradb-storage`
+   - `cargo nextest run -p doradb-storage --no-default-features --features libaio`
+4. Unsafe boundaries did not expand in this phase. Backend-specific unsafe
+   preparation remains below the generic scheduler seam, `doradb-storage/src/io/libaio_abi.rs`
+   was unchanged, and no unsafe inventory refresh was required.
+
 ## Impacts
 
 1. Generic I/O core:
@@ -190,6 +216,6 @@ Reference:
 
 ## Open Questions
 
-None in this task scope. Later RFC-0013 phases will decide storage-specific
-lane mapping, caller migration onto shared clients, storage-runtime ownership,
-and any future public tuning surface for scheduler policy.
+Later RFC-0013 phases still need to decide storage-specific lane mapping,
+caller migration onto shared clients, shared runtime ownership, and whether
+any scheduler policy should become visible outside `crate::io`.
