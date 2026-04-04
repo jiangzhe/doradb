@@ -1,20 +1,21 @@
 use crate::bitmap::AllocMap;
-use crate::buffer::{PersistedFileID, ReadonlyBufferPool};
+use crate::buffer::{PersistedFileID, ReadSubmission, ReadonlyBufferPool};
 use crate::catalog::{ObjID, TableID, USER_OBJ_ID_START};
 use crate::error::{BlockCorruptionCause, BlockKind, Error, FileKind, Result};
-use crate::file::TableFsRequest;
 use crate::file::block_integrity::{
-    BlockIntegritySpec, max_payload_len, validate_block, write_block_checksum, write_block_header,
+    BLOCK_INTEGRITY_HEADER_SIZE, BlockIntegritySpec, max_payload_len, validate_block,
+    write_block_checksum, write_block_header,
 };
 use crate::file::cow_file::{
     ActiveRoot as GenericActiveRoot, BlockID, COW_FILE_PAGE_SIZE, CowCodec, CowFile,
     MutableCowFile, OldCowRoot, ParsedMeta, SUPER_BLOCK_ID, validate_active_meta_block_id,
 };
+use crate::file::fs::BackgroundWriteRequest;
 use crate::file::meta_block::{
     MULTI_TABLE_META_BLOCK_MAGIC_WORD, MultiTableMetaBlockData, MultiTableMetaBlockSerView,
 };
 use crate::file::super_block::{
-    SUPER_BLOCK_FOOTER_OFFSET, SUPER_BLOCK_SIZE, SUPER_BLOCK_VERSION, SuperBlockBody,
+    SUPER_BLOCK_FOOTER_OFFSET, SUPER_BLOCK_SIZE, SUPER_BLOCK_VERSION, SuperBlock, SuperBlockBody,
     SuperBlockFooter, SuperBlockHeader, SuperBlockSerView, parse_super_block,
 };
 use crate::file::table_file::TABLE_FILE_INITIAL_SIZE;
@@ -139,7 +140,7 @@ pub struct MultiTableFileSnapshot {
 }
 
 #[inline]
-fn parse_multi_table_super_block(buf: &[u8]) -> Result<crate::file::super_block::SuperBlock> {
+fn parse_multi_table_super_block(buf: &[u8]) -> Result<SuperBlock> {
     parse_super_block(buf, MULTI_TABLE_FILE_MAGIC_WORD, SUPER_BLOCK_VERSION)
 }
 
@@ -210,10 +211,7 @@ fn build_multi_table_meta_block(root: &MultiTableActiveRoot) -> Result<DirectBuf
     let mut buf = DirectBuf::zeroed(COW_FILE_PAGE_SIZE);
     let idx = write_block_header(buf.as_bytes_mut(), MULTI_TABLE_META_BLOCK_SPEC);
     let idx = meta_block.ser(buf.as_bytes_mut(), idx);
-    debug_assert_eq!(
-        idx,
-        crate::file::block_integrity::BLOCK_INTEGRITY_HEADER_SIZE + meta_len
-    );
+    debug_assert_eq!(idx, BLOCK_INTEGRITY_HEADER_SIZE + meta_len);
     write_block_checksum(buf.as_bytes_mut());
     Ok(buf)
 }
@@ -242,7 +240,8 @@ impl MultiTableFile {
     #[inline]
     pub(super) async fn open_or_create(
         file_path: impl AsRef<str>,
-        io_client: AIOClient<TableFsRequest>,
+        table_reads: AIOClient<ReadSubmission>,
+        background_writes: AIOClient<BackgroundWriteRequest>,
     ) -> Result<Arc<Self>> {
         let file_path = file_path.as_ref();
         let file_exists = Path::new(file_path).exists();
@@ -250,7 +249,8 @@ impl MultiTableFile {
             CowFile::open(
                 file_path,
                 CATALOG_MTB_PERSISTED_FILE_ID,
-                io_client,
+                table_reads,
+                background_writes,
                 multi_table_codec(),
             )?
         } else {
@@ -258,7 +258,8 @@ impl MultiTableFile {
                 file_path,
                 MULTI_TABLE_FILE_INITIAL_SIZE,
                 CATALOG_MTB_PERSISTED_FILE_ID,
-                io_client,
+                table_reads,
+                background_writes,
                 multi_table_codec(),
                 false,
             )?
@@ -695,8 +696,7 @@ mod tests {
             // overwrite meta-block version to simulate format mismatch.
             let meta_offset = u64::from(active_meta_block_id) * COW_FILE_PAGE_SIZE as u64;
             file.seek(SeekFrom::Start(
-                meta_offset
-                    + crate::file::meta_block::MULTI_TABLE_META_BLOCK_MAGIC_WORD.len() as u64,
+                meta_offset + MULTI_TABLE_META_BLOCK_MAGIC_WORD.len() as u64,
             ))
             .unwrap();
             file.write_all(&(CATALOG_MTB_VERSION + 1).to_le_bytes())

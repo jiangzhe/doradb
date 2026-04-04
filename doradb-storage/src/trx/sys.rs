@@ -1,9 +1,10 @@
+use crate::DiskPool;
 use crate::catalog::{Catalog, CatalogCheckpointScanConfig, TableCache};
 use crate::component::{Component, ComponentRegistry, IndexPool, MemPool, MetaPool, ShelfScope};
 use crate::conf::TrxSysConfig;
 use crate::error::{Error, Result, StoragePoisonSource};
-use crate::file::table_fs::TableFileSystem;
-use crate::quiescent::{QuiescentGuard, SyncQuiescentGuard};
+use crate::file::fs::FileSystem;
+use crate::quiescent::{QuiescentBox, QuiescentGuard, SyncQuiescentGuard};
 use crate::session::SessionState;
 use crate::thread;
 use crate::trx::group::Commit;
@@ -482,11 +483,11 @@ impl Component for TransactionSystem {
         let meta_pool = registry.dependency::<MetaPool>()?;
         let index_pool = registry.dependency::<IndexPool>()?;
         let mem_pool = registry.dependency::<MemPool>()?;
-        let table_fs = registry.dependency::<TableFileSystem>()?;
-        let disk_pool = registry.dependency::<crate::DiskPool>()?;
+        let table_fs = registry.dependency::<FileSystem>()?;
+        let disk_pool = registry.dependency::<DiskPool>()?;
         let catalog = registry.dependency::<Catalog>()?;
 
-        let pending = config
+        let (trx_sys, startup) = config
             .prepare(
                 meta_pool.clone_inner(),
                 index_pool.clone_inner(),
@@ -496,7 +497,6 @@ impl Component for TransactionSystem {
                 catalog,
             )
             .await?;
-        let (trx_sys, startup) = pending.into_parts();
         registry.register::<Self>(trx_sys)?;
         shelf.put::<TransactionSystemWorkers>(startup)?;
         TransactionSystemWorkers::build((), registry, shelf.scope::<TransactionSystemWorkers>())
@@ -504,7 +504,7 @@ impl Component for TransactionSystem {
     }
 
     #[inline]
-    fn access(owner: &crate::quiescent::QuiescentBox<Self::Owned>) -> Self::Access {
+    fn access(owner: &QuiescentBox<Self::Owned>) -> Self::Access {
         owner.guard()
     }
 
@@ -528,12 +528,12 @@ impl Component for TransactionSystemWorkers {
         let trx_sys = registry.dependency::<TransactionSystem>()?;
         let startup = shelf
             .take::<TransactionSystem>()
-            .ok_or(crate::error::Error::InvalidState)?;
+            .ok_or(Error::InvalidState)?;
         registry.register::<Self>(startup.start(trx_sys))
     }
 
     #[inline]
-    fn access(_owner: &crate::quiescent::QuiescentBox<Self::Owned>) -> Self::Access {}
+    fn access(_owner: &QuiescentBox<Self::Owned>) -> Self::Access {}
 
     #[inline]
     fn shutdown(component: &Self::Owned) {
@@ -581,6 +581,7 @@ impl Component for TransactionSystemWorkers {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::buffer::PoolRole;
     use crate::catalog::tests::table2;
     use crate::conf::{EngineConfig, EvictableBufferPoolConfig};
     use crate::value::Val;
@@ -600,7 +601,7 @@ mod tests {
                 .storage_root(main_dir)
                 .data_buffer(
                     EvictableBufferPoolConfig::default()
-                        .role(crate::buffer::PoolRole::Mem)
+                        .role(PoolRole::Mem)
                         .max_mem_size(128usize * 1024 * 1024)
                         .max_file_size(256usize * 1024 * 1024),
                 )
@@ -642,7 +643,7 @@ mod tests {
                 .storage_root(main_dir)
                 .data_buffer(
                     EvictableBufferPoolConfig::default()
-                        .role(crate::buffer::PoolRole::Mem)
+                        .role(PoolRole::Mem)
                         .max_mem_size(128usize * 1024 * 1024)
                         .max_file_size(256usize * 1024 * 1024),
                 )
@@ -721,7 +722,7 @@ mod tests {
                 .storage_root(main_dir)
                 .data_buffer(
                     EvictableBufferPoolConfig::default()
-                        .role(crate::buffer::PoolRole::Mem)
+                        .role(PoolRole::Mem)
                         .max_mem_size(128usize * 1024 * 1024)
                         .max_file_size(256usize * 1024 * 1024),
                 )
@@ -924,7 +925,7 @@ mod tests {
                 .storage_root(main_dir)
                 .data_buffer(
                     EvictableBufferPoolConfig::default()
-                        .role(crate::buffer::PoolRole::Mem)
+                        .role(PoolRole::Mem)
                         .max_mem_size(128usize * 1024 * 1024)
                         .max_file_size(256usize * 1024 * 1024),
                 )
@@ -969,7 +970,7 @@ mod tests {
                 .storage_root(main_dir)
                 .data_buffer(
                     EvictableBufferPoolConfig::default()
-                        .role(crate::buffer::PoolRole::Mem)
+                        .role(PoolRole::Mem)
                         .max_mem_size(128usize * 1024 * 1024)
                         .max_file_size(256usize * 1024 * 1024),
                 )

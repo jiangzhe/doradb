@@ -1,13 +1,14 @@
 pub mod block_integrity;
 pub mod cow_file;
+pub mod fs;
 pub mod meta_block;
 pub mod multi_table_file;
 pub mod super_block;
 pub mod table_file;
-pub mod table_fs;
 
+use self::fs::BackgroundWriteRequest;
 #[cfg(test)]
-pub(crate) use self::table_fs::tests::{build_test_fs, build_test_fs_in};
+pub(crate) use self::fs::tests::{build_test_fs, build_test_fs_in};
 #[cfg(test)]
 pub(crate) use self::tests::{
     FileSyncOp, FileSyncTestHook, set_file_sync_test_hook, test_block_id,
@@ -18,8 +19,8 @@ use crate::compression::BitPackable;
 use crate::free_list::FreeList;
 use crate::io::DirectBuf;
 use crate::io::{
-    AIOClient, AIOError, AIOKind, AIOResult, Completion, IOQueue, IOStateMachine, IOSubmission,
-    Operation, STORAGE_SECTOR_SIZE, align_to_sector_size,
+    AIOClient, AIOError, AIOKind, AIOResult, Completion, IOQueue, IOSubmission, Operation,
+    STORAGE_SECTOR_SIZE, align_to_sector_size,
 };
 use crate::serde::{Deser, Ser, Serde};
 use crate::{error::Error, error::Result};
@@ -456,11 +457,6 @@ impl IOSubmission for WriteSubmission {
     }
 }
 
-pub(crate) enum TableFsRequest {
-    Write(WriteSubmission),
-    Read(ReadSubmission),
-}
-
 pub(crate) enum TableFsSubmission {
     Write(WriteSubmission),
     Read(ReadSubmission),
@@ -497,15 +493,15 @@ pub(crate) async fn write_direct(
     fd: RawFd,
     offset: usize,
     buf: DirectBuf,
-    io_client: &AIOClient<TableFsRequest>,
+    background_writes: &AIOClient<BackgroundWriteRequest>,
 ) -> Result<()> {
     let (submission, result) = WriteSubmission::prepare(key, fd, offset, buf);
-    if let Err(err) = io_client
-        .send_async(TableFsRequest::Write(submission))
+    if let Err(err) = background_writes
+        .send_async(BackgroundWriteRequest::Table(submission))
         .await
     {
-        let TableFsRequest::Write(_submission) = err.into_inner() else {
-            unreachable!("write_direct received unexpected readonly-load send error");
+        let BackgroundWriteRequest::Table(_submission) = err.into_inner() else {
+            unreachable!("write_direct received unexpected background-write send error");
         };
         return Err(Error::SendError);
     }
@@ -520,50 +516,65 @@ impl TableFsStateMachine {
     pub fn new() -> TableFsStateMachine {
         TableFsStateMachine
     }
-}
-
-impl IOStateMachine for TableFsStateMachine {
-    type Request = TableFsRequest;
-    type Key = BlockKey;
-    type Submission = TableFsSubmission;
 
     #[inline]
-    fn prepare_request(
+    pub(crate) fn prepare_read_request(
         &mut self,
-        req: TableFsRequest,
+        req: ReadSubmission,
         max_new: usize,
         queue: &mut IOQueue<TableFsSubmission>,
-    ) -> Option<TableFsRequest> {
+    ) -> Option<ReadSubmission> {
         if max_new == 0 {
             return Some(req);
         }
-        match req {
-            TableFsRequest::Write(req) => queue.push(TableFsSubmission::Write(req)),
-            TableFsRequest::Read(req) => queue.push(TableFsSubmission::Read(req)),
-        }
+        queue.push(TableFsSubmission::Read(req));
         None
     }
 
     #[inline]
-    fn on_submit(&mut self, sub: &TableFsSubmission) {
+    pub(crate) fn prepare_write_request(
+        &mut self,
+        req: WriteSubmission,
+        max_new: usize,
+        queue: &mut IOQueue<TableFsSubmission>,
+    ) -> Option<WriteSubmission> {
+        if max_new == 0 {
+            return Some(req);
+        }
+        queue.push(TableFsSubmission::Write(req));
+        None
+    }
+
+    #[inline]
+    pub(crate) fn on_submit(&mut self, sub: &TableFsSubmission) {
         if let TableFsSubmission::Read(sub) = sub {
             sub.record_running();
         }
     }
 
     #[inline]
-    fn on_complete(&mut self, sub: TableFsSubmission, res: std::io::Result<usize>) -> AIOKind {
+    pub(crate) fn on_complete(
+        &mut self,
+        sub: TableFsSubmission,
+        res: std::io::Result<usize>,
+    ) -> AIOKind {
         match sub {
             TableFsSubmission::Write(mut sub) => {
+                let expected_len = sub.operation.len();
                 let buf = sub
                     .operation
                     .take_buf()
                     .expect("write operation must still own its direct buffer");
+                debug_assert_eq!(expected_len, buf.capacity());
                 match res {
                     Ok(len) => {
-                        debug_assert!(len == buf.capacity());
                         drop(buf);
-                        sub.completion.complete(Ok(()));
+                        let result = if len == expected_len {
+                            Ok(())
+                        } else {
+                            Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof).into())
+                        };
+                        sub.completion.complete(result);
                     }
                     Err(err) => {
                         drop(buf);
@@ -574,11 +585,6 @@ impl IOStateMachine for TableFsStateMachine {
             }
             TableFsSubmission::Read(sub) => sub.complete(res),
         }
-    }
-
-    #[inline]
-    fn end_loop(self) {
-        // do nothing
     }
 }
 
@@ -830,5 +836,42 @@ mod tests {
         drop(file);
         let file = SparseFile::open(&file_path).unwrap();
         drop(file);
+    }
+
+    #[test]
+    fn test_table_fs_write_completion_succeeds_on_full_write() {
+        let mut state_machine = TableFsStateMachine::new();
+        let (submission, waiter) = WriteSubmission::prepare(
+            BlockKey::new(0, BlockID::new(1)),
+            0,
+            0,
+            DirectBuf::zeroed(STORAGE_SECTOR_SIZE),
+        );
+        let expected_len = submission.operation.len();
+
+        let kind =
+            state_machine.on_complete(TableFsSubmission::Write(submission), Ok(expected_len));
+
+        assert_eq!(kind, AIOKind::Write);
+        assert!(smol::block_on(waiter).is_ok());
+    }
+
+    #[test]
+    fn test_table_fs_write_completion_rejects_short_write() {
+        let mut state_machine = TableFsStateMachine::new();
+        let (submission, waiter) = WriteSubmission::prepare(
+            BlockKey::new(0, BlockID::new(1)),
+            0,
+            0,
+            DirectBuf::zeroed(STORAGE_SECTOR_SIZE),
+        );
+        let expected_len = submission.operation.len();
+        assert!(expected_len > 0);
+
+        let kind =
+            state_machine.on_complete(TableFsSubmission::Write(submission), Ok(expected_len - 1));
+
+        assert_eq!(kind, AIOKind::Write);
+        assert!(matches!(smol::block_on(waiter), Err(Error::IOError)));
     }
 }

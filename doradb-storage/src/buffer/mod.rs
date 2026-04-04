@@ -12,11 +12,20 @@ mod readonly;
 mod util;
 
 #[cfg(test)]
+pub(crate) use self::evict::tests::{
+    frame_kind as test_frame_kind,
+    io_backend_stats_handle_identity as test_io_backend_stats_handle_identity,
+    raw_fd as test_raw_fd,
+};
+#[cfg(test)]
 pub(crate) use self::readonly::tests::{global_readonly_pool_scope, table_readonly_pool};
 #[cfg(test)]
 pub(crate) use self::tests::test_page_id;
 pub use evict::EvictableBufferPool;
-pub(crate) use evict::{IndexPoolWorkers, MemPoolWorkers};
+pub(crate) use evict::{
+    EvictReadSubmission, EvictSubmission, EvictablePoolStateMachine, IndexPoolWorkers,
+    MemPoolWorkers, PoolRequest, build_pool_with_swap_file_field,
+};
 pub use evictor::{EvictionArbiter, EvictionArbiterBuilder};
 pub use fixed::FixedBufferPool;
 pub use identity::PoolRole;
@@ -29,6 +38,7 @@ pub use readonly::{BlockKey, GlobalReadonlyBufferPool, ReadonlyBlockGuard, Reado
 /// Physical file identity used by persisted-block mappings and cache invalidation.
 pub type PersistedFileID = u64;
 
+use crate::DiskPool;
 use crate::buffer::guard::{FacadePageGuard, PageExclusiveGuard};
 use crate::buffer::page::{BufferPage, VersionedPageID};
 use crate::component::{
@@ -40,8 +50,10 @@ use crate::conf::EvictableBufferPoolConfig;
 use crate::error::Validation;
 use crate::error::{FileKind, Result};
 use crate::file::BlockID;
+use crate::file::fs::{FileSystem, FileSystemWorkers};
 use crate::io::Completion;
 use crate::latch::LatchFallbackMode;
+use crate::quiescent::QuiescentBox;
 use crate::serde::{Deser, Ser, Serde};
 use bytemuck::{Pod, Zeroable};
 use std::fmt;
@@ -54,7 +66,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 /// Runtime buffer-managed page identity.
 ///
 /// This id is reserved for mutable or cached pages owned by the buffer layer.
-/// Persisted fixed-size file units use `crate::file::BlockID` instead.
+/// Persisted fixed-size file units use [`BlockID`] instead.
 #[repr(transparent)]
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Zeroable, Pod)]
 pub struct PageID(u64);
@@ -211,10 +223,7 @@ impl Ser<'_> for PageID {
 
 impl Deser for PageID {
     #[inline]
-    fn deser<S: Serde + ?Sized>(
-        input: &S,
-        start_idx: usize,
-    ) -> crate::error::Result<(usize, Self)> {
+    fn deser<S: Serde + ?Sized>(input: &S, start_idx: usize) -> Result<(usize, Self)> {
         input
             .deser_u64(start_idx)
             .map(|(idx, raw)| (idx, Self(raw)))
@@ -509,7 +518,7 @@ impl Component for MetaPool {
     }
 
     #[inline]
-    fn access(owner: &crate::quiescent::QuiescentBox<Self::Owned>) -> Self::Access {
+    fn access(owner: &QuiescentBox<Self::Owned>) -> Self::Access {
         Self::from(owner.guard())
     }
 
@@ -530,19 +539,19 @@ impl Component for IndexPool {
         registry: &mut ComponentRegistry,
         mut shelf: ShelfScope<'_, Self>,
     ) -> Result<()> {
-        let (pool, pending) = EvictableBufferPoolConfig::default()
+        let fs = registry.dependency::<FileSystem>()?;
+        let (pool, storage) = EvictableBufferPoolConfig::default()
             .role(PoolRole::Index)
             .max_mem_size(config.bytes)
             .max_file_size(config.max_file_size)
             .data_swap_file(config.swap_file)
-            .build_index()?;
+            .build_index_for_engine(fs)?;
         registry.register::<Self>(pool)?;
-        shelf.put::<IndexPoolWorkers>(pending)?;
-        IndexPoolWorkers::build((), registry, shelf.scope::<IndexPoolWorkers>()).await
+        shelf.put::<FileSystemWorkers>(storage)
     }
 
     #[inline]
-    fn access(owner: &crate::quiescent::QuiescentBox<Self::Owned>) -> Self::Access {
+    fn access(owner: &QuiescentBox<Self::Owned>) -> Self::Access {
         Self::from(owner.guard())
     }
 
@@ -563,14 +572,14 @@ impl Component for MemPool {
         registry: &mut ComponentRegistry,
         mut shelf: ShelfScope<'_, Self>,
     ) -> Result<()> {
-        let (pool, pending) = config.role(PoolRole::Mem).build()?;
+        let fs = registry.dependency::<FileSystem>()?;
+        let (pool, storage) = config.role(PoolRole::Mem).build_for_engine(fs)?;
         registry.register::<Self>(pool)?;
-        shelf.put::<MemPoolWorkers>(pending)?;
-        MemPoolWorkers::build((), registry, shelf.scope::<MemPoolWorkers>()).await
+        shelf.put::<FileSystemWorkers>(storage)
     }
 
     #[inline]
-    fn access(owner: &crate::quiescent::QuiescentBox<Self::Owned>) -> Self::Access {
+    fn access(owner: &QuiescentBox<Self::Owned>) -> Self::Access {
         Self::from(owner.guard())
     }
 
@@ -578,7 +587,7 @@ impl Component for MemPool {
     fn shutdown(_component: &Self::Owned) {}
 }
 
-impl Component for crate::DiskPool {
+impl Component for DiskPool {
     type Config = DiskPoolConfig;
     type Owned = GlobalReadonlyBufferPool;
     type Access = Self;
@@ -599,7 +608,7 @@ impl Component for crate::DiskPool {
     }
 
     #[inline]
-    fn access(owner: &crate::quiescent::QuiescentBox<Self::Owned>) -> Self::Access {
+    fn access(owner: &QuiescentBox<Self::Owned>) -> Self::Access {
         Self::from(owner.guard())
     }
 

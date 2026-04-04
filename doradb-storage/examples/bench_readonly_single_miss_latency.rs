@@ -4,7 +4,7 @@ use doradb_storage::buffer::page::{PAGE_SIZE, Page};
 use doradb_storage::buffer::{BufferPoolStats, PoolRole, ReadonlyBufferPool};
 use doradb_storage::catalog::{ColumnAttributes, ColumnSpec, TableMetadata};
 use doradb_storage::conf::{
-    EngineConfig, EvictableBufferPoolConfig, TableFileSystemConfig, TrxSysConfig,
+    EngineConfig, EvictableBufferPoolConfig, FileSystemConfig, TrxSysConfig,
 };
 use doradb_storage::error::FileKind;
 use doradb_storage::file::BlockID;
@@ -174,7 +174,7 @@ fn main() {
         let engine = EngineConfig::default()
             .storage_root(temp_dir.path())
             .file(
-                TableFileSystemConfig::default()
+                FileSystemConfig::default()
                     .data_dir(".")
                     .readonly_buffer_size(args.cache_bytes),
             )

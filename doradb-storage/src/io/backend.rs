@@ -135,6 +135,12 @@ impl IOBackendStatsHandle {
                 .fetch_add(wait_completions, Ordering::Relaxed);
         }
     }
+
+    #[cfg(test)]
+    #[inline]
+    pub(crate) fn identity(&self) -> usize {
+        Arc::as_ptr(&self.0) as usize
+    }
 }
 
 /// Backend-specific submit/wait contract used by [`super::IOWorker`].

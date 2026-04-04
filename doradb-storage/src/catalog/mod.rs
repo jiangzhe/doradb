@@ -11,6 +11,7 @@ pub use spec::*;
 pub use storage::*;
 pub use table::*;
 
+use crate::DiskPool;
 use crate::buffer::guard::PageSharedGuard;
 use crate::buffer::page::{PageID, VersionedPageID};
 use crate::buffer::{
@@ -19,8 +20,8 @@ use crate::buffer::{
 };
 use crate::component::{Component, ComponentRegistry, MetaPool, ShelfScope};
 use crate::error::{Error, Result};
-use crate::file::table_fs::TableFileSystem;
-use crate::index::BlockIndex;
+use crate::file::fs::FileSystem;
+use crate::index::{BlockIndex, RowLocation};
 use crate::quiescent::{QuiescentBox, QuiescentGuard};
 use crate::row::ops::SelectKey;
 use crate::row::{RowID, RowPage};
@@ -72,8 +73,8 @@ impl Component for Catalog {
         _shelf: ShelfScope<'_, Self>,
     ) -> Result<()> {
         let meta_pool = registry.dependency::<MetaPool>()?;
-        let table_fs = registry.dependency::<TableFileSystem>()?;
-        let disk_pool = registry.dependency::<crate::DiskPool>()?;
+        let table_fs = registry.dependency::<FileSystem>()?;
+        let disk_pool = registry.dependency::<DiskPool>()?;
         let storage =
             CatalogStorage::new(meta_pool.clone_inner(), &table_fs, disk_pool.clone_inner())
                 .await?;
@@ -154,7 +155,7 @@ impl Catalog {
         &self,
         mem_pool: QuiescentGuard<EvictableBufferPool>,
         index_pool: QuiescentGuard<EvictableBufferPool>,
-        table_fs: &TableFileSystem,
+        table_fs: &FileSystem,
         global_disk_pool: QuiescentGuard<GlobalReadonlyBufferPool>,
         guards: &PoolGuards,
         table_id: TableID,
@@ -349,7 +350,7 @@ impl TableHandle {
 
     /// Resolve a row id to its current storage location.
     #[inline]
-    pub async fn find_row(&self, guards: &PoolGuards, row_id: RowID) -> crate::index::RowLocation {
+    pub async fn find_row(&self, guards: &PoolGuards, row_id: RowID) -> RowLocation {
         match self {
             TableHandle::User(table) => table.find_row(guards, row_id).await,
             TableHandle::Catalog(table) => table.find_row(guards, row_id).await,
