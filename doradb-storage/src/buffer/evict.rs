@@ -682,7 +682,7 @@ impl IOSubmission for EvictSubmission {
 }
 
 impl IOStateMachine for EvictablePoolStateMachine {
-    type Request = Box<PoolRequest>;
+    type Request = PoolRequest;
     type Key = PageID;
     type Submission = EvictSubmission;
 
@@ -690,14 +690,14 @@ impl IOStateMachine for EvictablePoolStateMachine {
     #[inline]
     fn prepare_request(
         &mut self,
-        req: Box<PoolRequest>,
+        req: PoolRequest,
         max_new: usize,
         queue: &mut IOQueue<EvictSubmission>,
-    ) -> Option<Box<PoolRequest>> {
+    ) -> Option<PoolRequest> {
         if max_new == 0 {
             return Some(req);
         }
-        match *req {
+        match req {
             PoolRequest::Read(req) => {
                 let page_id = *req.key();
                 debug_assert!(self.pool.inflight_io.contains(page_id));
@@ -732,7 +732,7 @@ impl IOStateMachine for EvictablePoolStateMachine {
                     };
                     queue.push(EvictSubmission::Write(req));
                 }
-                remainder.map(|page_guards| Box::new(PoolRequest::BatchWrite(page_guards, done_ev)))
+                remainder.map(|page_guards| PoolRequest::BatchWrite(page_guards, done_ev))
             }
         }
     }
@@ -758,46 +758,44 @@ impl IOStateMachine for EvictablePoolStateMachine {
         match sub {
             EvictSubmission::Read(sub) => sub.complete(res),
             EvictSubmission::Write(sub) => {
-                let page_id = sub.page_id();
-                let mut g = self.pool.inflight_io.map.lock();
-                let mut status = g.remove(&page_id).unwrap();
-                match status.kind {
-                    IOKind::Write => {
-                        let completion = status.completion.take();
-                        self.pool.inflight_io.writes.fetch_sub(1, Ordering::Relaxed);
-                        let mut page_guard = sub.page_guard;
-                        let bf = page_guard.bf();
-                        debug_assert!(bf.kind() == FrameKind::Evicting);
-                        // Writeback either finishes eviction or leaves the
-                        // frame marked for retry on the next access.
-                        let result = match res {
-                            Ok(len) if len == PAGE_SIZE => {
-                                self.pool.in_mem.evict_page(page_guard);
-                                Ok(page_id)
-                            }
-                            Ok(_) | Err(_) => {
-                                page_guard.bf_mut().set_kind(FrameKind::EvictionFailed);
-                                drop(page_guard);
-                                Err(Error::IOError)
-                            }
-                        };
-                        self.pool.stats.add_completed_writes(1);
-                        if result.is_err() {
-                            self.pool.stats.add_write_errors(1);
-                        }
-                        drop(g);
-                        if let Some(completion) = completion {
-                            completion.complete(result);
-                        }
-                        drop(sub.batch_done);
-                        AIOKind::Write
-                    }
-                    IOKind::ReadWaitForWrite => {
-                        // Write request will overwrite it to IOKind::Write.
-                        unreachable!()
-                    }
-                    IOKind::Read => unreachable!(),
+                let PageIO {
+                    key: _,
+                    operation: _,
+                    page_guard,
+                    batch_done,
+                } = sub;
+                if !matches!(res, Ok(len) if len == PAGE_SIZE) {
+                    self.pool
+                        .inflight_io
+                        .fail_writeback(&self.pool.stats, page_guard);
+                    drop(batch_done);
+                    return AIOKind::Write;
                 }
+
+                let page_id = page_guard.page_id();
+                let completion = {
+                    let mut g = self.pool.inflight_io.map.lock();
+                    let mut status = g.remove(&page_id).unwrap();
+                    match status.kind {
+                        IOKind::Write => {
+                            self.pool.inflight_io.writes.fetch_sub(1, Ordering::Relaxed);
+                            debug_assert!(page_guard.bf().kind() == FrameKind::Evicting);
+                            self.pool.in_mem.evict_page(page_guard);
+                            self.pool.stats.add_completed_writes(1);
+                            status.completion.take()
+                        }
+                        IOKind::ReadWaitForWrite => {
+                            // Write request will overwrite it to IOKind::Write.
+                            unreachable!()
+                        }
+                        IOKind::Read => unreachable!(),
+                    }
+                };
+                if let Some(completion) = completion {
+                    completion.complete(Ok(page_id));
+                }
+                drop(batch_done);
+                AIOKind::Write
             }
         }
     }
@@ -827,9 +825,15 @@ impl EvictableRuntime {
         self.inflight_io.batch_writes(&page_guards);
         let done_ev = Arc::new(EventNotifyOnDrop::new());
         let listener = done_ev.listen();
-        let _ = self
-            .fs
-            .send_pool_batch_write(self.role, page_guards, done_ev);
+        if let Err((page_guards, done_ev)) =
+            self.fs
+                .send_pool_batch_write(self.role, page_guards, done_ev)
+        {
+            for page_guard in page_guards {
+                self.inflight_io.fail_writeback(&self.stats, page_guard);
+            }
+            drop(done_ev);
+        }
         listener
     }
 }
@@ -1129,7 +1133,7 @@ pub(crate) struct EvictReadSubmission {
     operation: Operation,
     inflight_io: Arc<InflightIO>,
     stats: BufferPoolStatsHandle,
-    reservation: Option<PageReservationGuard<EvictPageReservation>>,
+    reservation: Option<Box<PageReservationGuard<EvictPageReservation>>>,
     completed: bool,
 }
 
@@ -1155,7 +1159,7 @@ impl EvictReadSubmission {
             operation,
             inflight_io,
             stats,
-            reservation: Some(reservation),
+            reservation: Some(Box::new(reservation)),
             completed: false,
         }
     }
@@ -1210,7 +1214,7 @@ impl EvictReadSubmission {
                 let reservation = self.reservation.take().expect(
                     "evict read submission must still own its page reservation before publish",
                 );
-                reservation.publish()
+                (*reservation).publish()
             }
             Ok(_) => {
                 drop(self.reservation.take());
@@ -1407,6 +1411,43 @@ impl InflightIO {
             }
         }
         self.writes.fetch_add(count, Ordering::AcqRel);
+    }
+
+    #[inline]
+    fn fail_writeback(
+        &self,
+        stats: &BufferPoolStatsHandle,
+        mut page_guard: PageExclusiveGuard<Page>,
+    ) {
+        let page_id = page_guard.page_id();
+        let completion = {
+            let mut g = self.map.lock();
+            let mut status = g.remove(&page_id).unwrap_or_else(|| {
+                panic!(
+                    "inflight write entry missing during failure cleanup: page_id={}",
+                    page_id
+                )
+            });
+            match status.kind {
+                IOKind::Write => {
+                    self.writes.fetch_sub(1, Ordering::Relaxed);
+                    debug_assert!(page_guard.bf().kind() == FrameKind::Evicting);
+                    page_guard.bf_mut().set_kind(FrameKind::EvictionFailed);
+                    stats.add_completed_writes(1);
+                    stats.add_write_errors(1);
+                    status.completion.take()
+                }
+                IOKind::ReadWaitForWrite => {
+                    // Write request will overwrite it to IOKind::Write.
+                    unreachable!()
+                }
+                IOKind::Read => unreachable!(),
+            }
+        };
+        drop(page_guard);
+        if let Some(completion) = completion {
+            completion.complete(Err(Error::IOError));
+        }
     }
 
     #[inline]
@@ -1814,6 +1855,62 @@ pub(crate) mod tests {
             assert!(!owner.inflight_io.map.lock().contains_key(&page_id));
 
             drop(state_machine);
+            drop(pool_guard);
+            drop(owner);
+        });
+    }
+
+    #[test]
+    fn test_writeback_send_failure_unwinds_failed_batch_and_wakes_waiters() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let (_fs_owner, pool, _storage) = build_raw_pool_for_test(
+                EvictableBufferPoolConfig::default()
+                    .role(PoolRole::Mem)
+                    .data_swap_file(temp_dir.path().join("data.swp"))
+                    .max_mem_size(64u64 * 1024 * 1024)
+                    .max_file_size(128u64 * 1024 * 1024),
+            )
+            .unwrap();
+            let owner = QuiescentBox::new(pool);
+            let pool_guard = owner.pool_guard();
+
+            let mut page_guard = owner.allocate_page::<Page>(&pool_guard).await;
+            let page_id = page_guard.page_id();
+            page_guard.page_mut()[0] = 0xAB;
+            page_guard.bf_mut().set_kind(FrameKind::Evicting);
+
+            let runtime = EvictableRuntime {
+                arena: owner.arena.arena_guard(owner.pool_guard()),
+                in_mem: Arc::clone(&owner.in_mem),
+                inflight_io: Arc::clone(&owner.inflight_io),
+                fs: owner.fs.clone(),
+                role: owner.role,
+                stats: owner.stats.clone(),
+                _pool: Some(owner.guard().into_sync()),
+            };
+
+            let listener = runtime.dispatch_io_writes(vec![page_guard]);
+            listener.await;
+
+            assert_eq!(owner.arena.frame(page_id).kind(), FrameKind::EvictionFailed);
+            assert!(matches!(
+                owner
+                    .inflight_io
+                    .wait_for_write(page_id, owner.arena.frame(page_id))
+                    .await,
+                Err(Error::IOError)
+            ));
+            assert_eq!(owner.inflight_io.writes.load(Ordering::Relaxed), 0);
+            assert!(!owner.inflight_io.map.lock().contains_key(&page_id));
+
+            let stats = owner.stats();
+            assert_eq!(stats.queued_writes, 1);
+            assert_eq!(stats.running_writes, 0);
+            assert_eq!(stats.completed_writes, 1);
+            assert_eq!(stats.write_errors, 1);
+
+            drop(runtime);
             drop(pool_guard);
             drop(owner);
         });

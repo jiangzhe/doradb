@@ -191,8 +191,8 @@ impl StorageStateMachine {
     ) -> Option<PoolReadRequest> {
         let mut pool_queue = IOQueue::with_capacity(max_new);
         let (role, req) = match req {
-            PoolReadRequest::Mem(req) => (PoolRole::Mem, Box::new(PoolRequest::Read(req))),
-            PoolReadRequest::Index(req) => (PoolRole::Index, Box::new(PoolRequest::Read(req))),
+            PoolReadRequest::Mem(req) => (PoolRole::Mem, PoolRequest::Read(req)),
+            PoolReadRequest::Index(req) => (PoolRole::Index, PoolRequest::Read(req)),
         };
         let remainder = match role {
             PoolRole::Mem => self.mem_pool.prepare_request(req, max_new, &mut pool_queue),
@@ -201,7 +201,7 @@ impl StorageStateMachine {
                 .prepare_request(req, max_new, &mut pool_queue),
             other => panic!("unsupported shared storage pool role: {other:?}"),
         }
-        .map(|req| match *req {
+        .map(|req| match req {
             PoolRequest::Read(req) => match role {
                 PoolRole::Mem => PoolReadRequest::Mem(req),
                 PoolRole::Index => PoolReadRequest::Index(req),
@@ -261,19 +261,17 @@ impl StorageStateMachine {
     ) -> Option<BackgroundWriteRequest> {
         let mut pool_queue = IOQueue::with_capacity(max_new);
         let remainder = match role {
-            PoolRole::Mem => self.mem_pool.prepare_request(
-                Box::new(req.into_pool_request()),
-                max_new,
-                &mut pool_queue,
-            ),
-            PoolRole::Index => self.index_pool.prepare_request(
-                Box::new(req.into_pool_request()),
-                max_new,
-                &mut pool_queue,
-            ),
+            PoolRole::Mem => {
+                self.mem_pool
+                    .prepare_request(req.into_pool_request(), max_new, &mut pool_queue)
+            }
+            PoolRole::Index => {
+                self.index_pool
+                    .prepare_request(req.into_pool_request(), max_new, &mut pool_queue)
+            }
             other => panic!("unsupported shared storage pool role: {other:?}"),
         }
-        .map(|req| match *req {
+        .map(|req| match req {
             PoolRequest::BatchWrite(page_guards, done_ev) => match role {
                 PoolRole::Mem => BackgroundWriteRequest::MemPool(Box::new(
                     PoolBatchWriteRequest::new(page_guards, done_ev),
@@ -1317,7 +1315,7 @@ impl FileSystem {
         role: PoolRole,
         page_guards: Vec<PageExclusiveGuard<Page>>,
         done_ev: Arc<EventNotifyOnDrop>,
-    ) -> StdResult<(), SendError<Box<PoolBatchWriteRequest>>> {
+    ) -> StdResult<(), (Vec<PageExclusiveGuard<Page>>, Arc<EventNotifyOnDrop>)> {
         Self::assert_pool_role(role, "shared pool write dispatch");
         self.background_writes
             .send(match role {
@@ -1337,7 +1335,8 @@ impl FileSystem {
                         unreachable!("shared pool write lane returned a table write request");
                     }
                 };
-                SendError(req)
+                let req = *req;
+                (req.page_guards, req.done_ev)
             })
     }
 
