@@ -891,7 +891,7 @@ mod tests {
                 .await
                 .unwrap();
 
-            let pending = TrxSysConfig::default()
+            let (trx_sys, startup) = TrxSysConfig::default()
                 .log_dir(&log_dir)
                 .log_file_stem("pending-startup-cleanup")
                 .skip_recovery(true)
@@ -905,8 +905,6 @@ mod tests {
                 )
                 .await
                 .unwrap();
-
-            let (trx_sys, startup) = pending.into_parts();
             drop(startup);
             drop(trx_sys);
         });

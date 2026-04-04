@@ -24,8 +24,7 @@ pub(crate) use self::tests::test_page_id;
 pub use evict::EvictableBufferPool;
 pub(crate) use evict::{
     EvictReadSubmission, EvictSubmission, EvictablePoolStateMachine, IndexPoolWorkers,
-    MemPoolWorkers, PendingEvictorThread, PoolRequest, PoolStorageProvision, SingleFileIO,
-    build_pool_with_swap_file_field,
+    MemPoolWorkers, PoolRequest, build_pool_with_swap_file_field,
 };
 pub use evictor::{EvictionArbiter, EvictionArbiterBuilder};
 pub use fixed::FixedBufferPool;
@@ -541,15 +540,14 @@ impl Component for IndexPool {
         mut shelf: ShelfScope<'_, Self>,
     ) -> Result<()> {
         let fs = registry.dependency::<FileSystem>()?;
-        let (pool, storage, evictor) = EvictableBufferPoolConfig::default()
+        let (pool, storage) = EvictableBufferPoolConfig::default()
             .role(PoolRole::Index)
             .max_mem_size(config.bytes)
             .max_file_size(config.max_file_size)
             .data_swap_file(config.swap_file)
             .build_index_for_engine(fs)?;
         registry.register::<Self>(pool)?;
-        shelf.put::<FileSystemWorkers>(storage)?;
-        shelf.put::<IndexPoolWorkers>(evictor)
+        shelf.put::<FileSystemWorkers>(storage)
     }
 
     #[inline]
@@ -575,10 +573,9 @@ impl Component for MemPool {
         mut shelf: ShelfScope<'_, Self>,
     ) -> Result<()> {
         let fs = registry.dependency::<FileSystem>()?;
-        let (pool, storage, evictor) = config.role(PoolRole::Mem).build_for_engine(fs)?;
+        let (pool, storage) = config.role(PoolRole::Mem).build_for_engine(fs)?;
         registry.register::<Self>(pool)?;
-        shelf.put::<FileSystemWorkers>(storage)?;
-        shelf.put::<MemPoolWorkers>(evictor)
+        shelf.put::<FileSystemWorkers>(storage)
     }
 
     #[inline]

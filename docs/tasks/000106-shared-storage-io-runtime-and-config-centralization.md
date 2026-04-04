@@ -186,14 +186,20 @@ Reference:
    the returned length with `operation.len()` and surfaces a short write as
    `Error::IOError`, with focused regression tests in
    `doradb-storage/src/file/mod.rs`.
-8. Validation completed with:
+8. Subsequent cleanup in the same task removed several zero- or single-field
+   indirection types that no longer carried meaningful lifecycle state:
+   `PendingEvictorThread`, `SingleFileIO`, `PoolStorageProvision`,
+   `FileSystemWorkersProvision`, and `PendingTransactionSystem`. The remaining
+   startup boundary is `PendingTransactionSystemStartup`, which still owns the
+   real worker-start payload for `TransactionSystemWorkers`.
+9. Validation completed with:
    - `cargo fmt --all`
    - `cargo check -p doradb-storage`
    - `cargo clippy -p doradb-storage --all-targets -- -D warnings`
    - `cargo nextest run -p doradb-storage`
    - `cargo nextest run -p doradb-storage --no-default-features --features libaio`
    - `cargo nextest run -p doradb-storage table_fs_write_completion`
-9. Unsafe boundaries did not expand in this phase. No unsafe inventory refresh
+10. Unsafe boundaries did not expand in this phase. No unsafe inventory refresh
    was required.
 
 ## Impacts
@@ -210,6 +216,7 @@ Reference:
    - `doradb-storage/src/conf/buffer.rs`
 3. Engine and component wiring:
    - `doradb-storage/src/conf/fs.rs`
+   - `doradb-storage/src/conf/trx.rs`
    - `doradb-storage/src/conf/mod.rs`
    - `doradb-storage/src/conf/engine.rs`
    - `doradb-storage/src/component.rs`
@@ -248,3 +255,9 @@ Reference:
 1. The broader repo-wide `AIO*` to `IO*` rename was intentionally kept out of
    scope. Follow-up is tracked in
    `docs/backlogs/000078-rename-io-module-aio-surface-to-io-naming.md`.
+2. Raw-fd IO operations still need a stronger ownership story at the
+   submission/request layer. Follow-up is tracked in
+   `docs/backlogs/000079-retain-file-ownership-across-raw-fd-storage-operations.md`.
+3. File sync remains a simple blocking raw-fd wrapper even though the storage
+   stack now supports `io_uring`. Follow-up is tracked in
+   `docs/backlogs/000080-evaluate-safe-async-file-sync-abstraction-beyond-file-syncer.md`.

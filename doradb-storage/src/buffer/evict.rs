@@ -81,9 +81,6 @@ pub(crate) struct IndexPoolWorkersOwned {
     evict_thread: Mutex<Option<JoinHandle<()>>>,
 }
 
-/// Shelf marker proving that a pool still needs its evictor thread started.
-pub(crate) struct PendingEvictorThread;
-
 impl EvictableBufferPool {
     #[inline]
     pub(crate) fn identity(&self) -> PoolIdentity {
@@ -573,10 +570,9 @@ impl Component for MemPoolWorkers {
     async fn build(
         _config: Self::Config,
         registry: &mut ComponentRegistry,
-        mut shelf: ShelfScope<'_, Self>,
+        _shelf: ShelfScope<'_, Self>,
     ) -> Result<()> {
         let pool = registry.dependency::<MemPool>()?;
-        let _pending = shelf.take::<MemPool>().ok_or(Error::InvalidState)?;
         let sync_pool = pool.clone_inner().into_sync();
         let evict_thread = EvictableBufferPool::spawn_evict_thread_guarded(sync_pool.clone());
         registry.register::<Self>(MemPoolWorkersOwned {
@@ -598,12 +594,8 @@ impl Component for MemPoolWorkers {
     }
 }
 
-impl Supplier<MemPoolWorkers> for MemPool {
-    type Provision = PendingEvictorThread;
-}
-
 impl Supplier<FileSystemWorkers> for MemPool {
-    type Provision = PoolStorageProvision;
+    type Provision = SparseFile;
 }
 
 impl Component for IndexPoolWorkers {
@@ -618,10 +610,9 @@ impl Component for IndexPoolWorkers {
     async fn build(
         _config: Self::Config,
         registry: &mut ComponentRegistry,
-        mut shelf: ShelfScope<'_, Self>,
+        _shelf: ShelfScope<'_, Self>,
     ) -> Result<()> {
         let pool = registry.dependency::<IndexPool>()?;
-        let _pending = shelf.take::<IndexPool>().ok_or(Error::InvalidState)?;
         let sync_pool = pool.clone_inner().into_sync();
         let evict_thread = EvictableBufferPool::spawn_evict_thread_guarded(sync_pool.clone());
         registry.register::<Self>(IndexPoolWorkersOwned {
@@ -643,12 +634,8 @@ impl Component for IndexPoolWorkers {
     }
 }
 
-impl Supplier<IndexPoolWorkers> for IndexPool {
-    type Provision = PendingEvictorThread;
-}
-
 impl Supplier<FileSystemWorkers> for IndexPool {
-    type Provision = PoolStorageProvision;
+    type Provision = SparseFile;
 }
 
 /// IO worker state machine for [`EvictableBufferPool`].
@@ -657,17 +644,14 @@ impl Supplier<FileSystemWorkers> for IndexPool {
 /// reconciles frame/inflight state on completion.
 pub(crate) struct EvictablePoolStateMachine {
     pool: SyncQuiescentGuard<EvictableBufferPool>,
-    file_io: SingleFileIO,
+    file: SparseFile,
 }
 
 impl EvictablePoolStateMachine {
     /// Bind one pool runtime plus its worker-owned sparse-file handle.
     #[inline]
-    pub(crate) fn new(
-        pool: SyncQuiescentGuard<EvictableBufferPool>,
-        file_io: SingleFileIO,
-    ) -> Self {
-        Self { pool, file_io }
+    pub(crate) fn new(pool: SyncQuiescentGuard<EvictableBufferPool>, file: SparseFile) -> Self {
+        Self { pool, file }
     }
 }
 
@@ -730,7 +714,16 @@ impl IOStateMachine for EvictablePoolStateMachine {
                     let page_id = page_guard.page_id();
                     debug_assert!(self.pool.inflight_io.contains(page_id));
                     debug_assert!(page_guard.bf().kind() == FrameKind::Evicting);
-                    let operation = self.file_io.prepare_write(page_id, page_guard.page_mut());
+                    // SAFETY: the borrowed page pointer refers to one live page-sized arena
+                    // allocation, and the resulting `PageIO` owns `page_guard` until completion.
+                    let operation = unsafe {
+                        Operation::pwrite_borrowed(
+                            self.file.as_raw_fd(),
+                            usize::from(page_id) * PAGE_SIZE,
+                            page_guard.page_mut() as *mut Page as *mut u8,
+                            PAGE_SIZE,
+                        )
+                    };
                     let req = PageIO {
                         key: page_id,
                         operation,
@@ -1264,44 +1257,12 @@ impl Drop for EvictReadSubmission {
     }
 }
 
-/// Thin wrapper for sparse-file page IO used by the evictable pool.
-pub(crate) struct SingleFileIO {
-    file: SparseFile,
-}
-
-impl SingleFileIO {
-    #[inline]
-    fn new(file: SparseFile) -> Self {
-        SingleFileIO { file }
-    }
-
-    /// Prepare one borrowed page write against the pool swap file.
-    #[inline]
-    pub(crate) fn prepare_write(&self, page_id: PageID, ptr: *mut Page) -> Operation {
-        // SAFETY: evict writes borrow one live page-sized arena allocation that
-        // stays owned by the page guard until IO completion.
-        unsafe {
-            Operation::pwrite_borrowed(
-                self.file.as_raw_fd(),
-                usize::from(page_id) * PAGE_SIZE,
-                ptr as *mut u8,
-                PAGE_SIZE,
-            )
-        }
-    }
-}
-
-/// Shelf provision that hands the shared worker a pool-owned swap-file handle.
-pub(crate) struct PoolStorageProvision {
-    pub(crate) file_io: SingleFileIO,
-}
-
 /// Build one evictable pool together with the storage-worker provision it needs.
 pub(crate) fn build_pool_with_swap_file_field(
     config: EvictableBufferPoolConfig,
     swap_file_field_name: &'static str,
     fs: QuiescentGuard<FileSystem>,
-) -> Result<(EvictableBufferPool, PoolStorageProvision)> {
+) -> Result<(EvictableBufferPool, SparseFile)> {
     config.role.assert_valid("evictable buffer pool");
     validate_swap_file_path_candidate(swap_file_field_name, &config.data_swap_file)?;
     // 1. Calculate memory usage.
@@ -1332,7 +1293,6 @@ pub(crate) fn build_pool_with_swap_file_field(
     let swap_file_path = path_to_utf8(&config.data_swap_file, swap_file_field_name)?;
     let file = SparseFile::create_or_trunc(swap_file_path, max_file_size)?;
     let raw_fd = file.as_raw_fd();
-    let file_io = SingleFileIO::new(file);
 
     let pool = EvictableBufferPool {
         alloc_map: AllocMap::new(max_nbr),
@@ -1346,7 +1306,7 @@ pub(crate) fn build_pool_with_swap_file_field(
         role: config.role,
         arena,
     };
-    Ok((pool, PoolStorageProvision { file_io }))
+    Ok((pool, file))
 }
 
 struct IOStatus {
@@ -1521,11 +1481,7 @@ pub(crate) mod tests {
 
     fn build_raw_pool_for_test(
         config: EvictableBufferPoolConfig,
-    ) -> Result<(
-        QuiescentBox<FileSystem>,
-        EvictableBufferPool,
-        PoolStorageProvision,
-    )> {
+    ) -> Result<(QuiescentBox<FileSystem>, EvictableBufferPool, SparseFile)> {
         let swap_file = config.data_swap_file_ref();
         let storage_root = if swap_file.is_absolute() {
             swap_file
@@ -1807,7 +1763,7 @@ pub(crate) mod tests {
             let sync_pool = owner.guard().into_sync();
             let mut state_machine = EvictablePoolStateMachine {
                 pool: sync_pool,
-                file_io: storage.file_io,
+                file: storage,
             };
 
             let mut page_guard = owner.allocate_page::<Page>(&pool_guard).await;
@@ -1828,9 +1784,16 @@ pub(crate) mod tests {
             }
             owner.inflight_io.writes.store(1, Ordering::Relaxed);
 
-            let operation = state_machine
-                .file_io
-                .prepare_write(page_id, page_guard.page_mut());
+            // SAFETY: the borrowed page pointer refers to one live page-sized arena
+            // allocation, and this test keeps `page_guard` alive in `PageIO` until completion.
+            let operation = unsafe {
+                Operation::pwrite_borrowed(
+                    state_machine.file.as_raw_fd(),
+                    usize::from(page_id) * PAGE_SIZE,
+                    page_guard.page_mut() as *mut Page as *mut u8,
+                    PAGE_SIZE,
+                )
+            };
             let kind = state_machine.on_complete(
                 EvictSubmission::Write(PageIO {
                     key: page_id,

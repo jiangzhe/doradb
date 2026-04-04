@@ -487,7 +487,7 @@ impl Component for TransactionSystem {
         let disk_pool = registry.dependency::<DiskPool>()?;
         let catalog = registry.dependency::<Catalog>()?;
 
-        let pending = config
+        let (trx_sys, startup) = config
             .prepare(
                 meta_pool.clone_inner(),
                 index_pool.clone_inner(),
@@ -497,7 +497,6 @@ impl Component for TransactionSystem {
                 catalog,
             )
             .await?;
-        let (trx_sys, startup) = pending.into_parts();
         registry.register::<Self>(trx_sys)?;
         shelf.put::<TransactionSystemWorkers>(startup)?;
         TransactionSystemWorkers::build((), registry, shelf.scope::<TransactionSystemWorkers>())

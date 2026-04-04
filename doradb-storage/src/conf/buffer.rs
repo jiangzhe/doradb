@@ -1,8 +1,9 @@
 use crate::buffer::{
-    EvictableBufferPool, EvictionArbiter, EvictionArbiterBuilder, PendingEvictorThread, PoolRole,
-    PoolStorageProvision, build_pool_with_swap_file_field,
+    EvictableBufferPool, EvictionArbiter, EvictionArbiterBuilder, PoolRole,
+    build_pool_with_swap_file_field,
 };
 use crate::error::Result;
+use crate::file::SparseFile;
 use crate::file::fs::FileSystem;
 use crate::quiescent::QuiescentGuard;
 use byte_unit::Byte;
@@ -132,25 +133,15 @@ impl EvictableBufferPoolConfig {
     pub(crate) fn build_for_engine(
         self,
         fs: QuiescentGuard<FileSystem>,
-    ) -> Result<(
-        EvictableBufferPool,
-        PoolStorageProvision,
-        PendingEvictorThread,
-    )> {
-        let (pool, storage) = build_pool_with_swap_file_field(self, "data_swap_file", fs)?;
-        Ok((pool, storage, PendingEvictorThread))
+    ) -> Result<(EvictableBufferPool, SparseFile)> {
+        build_pool_with_swap_file_field(self, "data_swap_file", fs)
     }
 
     #[inline]
     pub(crate) fn build_index_for_engine(
         self,
         fs: QuiescentGuard<FileSystem>,
-    ) -> Result<(
-        EvictableBufferPool,
-        PoolStorageProvision,
-        PendingEvictorThread,
-    )> {
-        let (pool, storage) = build_pool_with_swap_file_field(self, "index_swap_file", fs)?;
-        Ok((pool, storage, PendingEvictorThread))
+    ) -> Result<(EvictableBufferPool, SparseFile)> {
+        build_pool_with_swap_file_field(self, "index_swap_file", fs)
     }
 }

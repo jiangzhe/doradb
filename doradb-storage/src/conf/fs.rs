@@ -1,6 +1,6 @@
 use crate::conf::path::{path_to_utf8, validate_catalog_file_name};
 use crate::error::{Error, Result};
-use crate::file::fs::{FileSystem, FileSystemWorkersProvision, build_file_system};
+use crate::file::fs::{FileSystem, StorageIOWorkerBuilder, build_file_system};
 use serde::{Deserialize, Serialize};
 use std::path::{Component as PathComponent, Path, PathBuf};
 
@@ -63,7 +63,7 @@ impl FileSystemConfig {
     }
 
     #[inline]
-    pub(crate) fn build_engine_parts(self) -> Result<(FileSystem, FileSystemWorkersProvision)> {
+    pub(crate) fn build_engine_parts(self) -> Result<(FileSystem, StorageIOWorkerBuilder)> {
         let (data_dir, catalog_file_name, io_depth) = self.validate_parts()?;
         build_file_system(io_depth, data_dir, catalog_file_name)
     }

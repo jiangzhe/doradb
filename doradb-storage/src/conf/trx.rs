@@ -59,24 +59,12 @@ pub struct TrxSysConfig {
     pub skip_recovery: bool,
 }
 
-pub(crate) struct PendingTransactionSystem {
-    pub(crate) trx_sys: TransactionSystem,
-    startup: PendingTransactionSystemStartup,
-}
-
 pub(crate) struct PendingTransactionSystemStartup {
     gc_rxs: Vec<Receiver<GC>>,
     purge_tx: Sender<Purge>,
     purge_rx: Receiver<Purge>,
     mem_pool: QuiescentGuard<EvictableBufferPool>,
     pool_guards: PoolGuards,
-}
-
-impl PendingTransactionSystem {
-    #[inline]
-    pub(crate) fn into_parts(self) -> (TransactionSystem, PendingTransactionSystemStartup) {
-        (self.trx_sys, self.startup)
-    }
 }
 
 impl PendingTransactionSystemStartup {
@@ -237,7 +225,7 @@ impl TrxSysConfig {
         table_fs: QuiescentGuard<FileSystem>,
         global_disk_pool: QuiescentGuard<GlobalReadonlyBufferPool>,
         catalog: QuiescentGuard<Catalog>,
-    ) -> Result<PendingTransactionSystem> {
+    ) -> Result<(TransactionSystem, PendingTransactionSystemStartup)> {
         let mut log_partition_initializers = Vec::with_capacity(self.log_partitions);
         for idx in 0..self.log_partitions {
             let initializer = self.log_partition_initializer(idx)?;
@@ -267,16 +255,16 @@ impl TrxSysConfig {
 
         let (purge_tx, purge_rx) = flume::unbounded();
         let trx_sys = TransactionSystem::new(self, catalog, log_partitions);
-        Ok(PendingTransactionSystem {
+        Ok((
             trx_sys,
-            startup: PendingTransactionSystemStartup {
+            PendingTransactionSystemStartup {
                 gc_rxs,
                 purge_tx,
                 purge_rx,
                 mem_pool,
                 pool_guards,
             },
-        })
+        ))
     }
 }
 

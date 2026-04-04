@@ -2,8 +2,7 @@ use crate::buffer::guard::PageExclusiveGuard;
 use crate::buffer::page::Page;
 use crate::buffer::{
     BlockKey, EvictReadSubmission, EvictSubmission, EvictableBufferPool, EvictablePoolStateMachine,
-    GlobalReadonlyBufferPool, PageID, PoolRequest, PoolRole, PoolStorageProvision, ReadSubmission,
-    ReadonlyBufferPool, SingleFileIO,
+    GlobalReadonlyBufferPool, PageID, PoolRequest, PoolRole, ReadSubmission, ReadonlyBufferPool,
 };
 use crate::catalog::table::TableMetadata;
 use crate::catalog::{TableID, USER_OBJ_ID_START};
@@ -15,7 +14,7 @@ use crate::file::cow_file::COW_FILE_PAGE_SIZE;
 use crate::file::multi_table_file::{CATALOG_MTB_PERSISTED_FILE_ID, MultiTableFile};
 use crate::file::table_file::{ActiveRoot, TABLE_FILE_INITIAL_SIZE};
 use crate::file::table_file::{MutableTableFile, TableFile};
-use crate::file::{TableFsStateMachine, TableFsSubmission, WriteSubmission};
+use crate::file::{SparseFile, TableFsStateMachine, TableFsSubmission, WriteSubmission};
 use crate::io::{
     AIOClient, AIOKind, AIOMessage, BackendToken, IOBackend, IOBackendStats, IOBackendStatsHandle,
     IOQueue, IOStateMachine, IOSubmission, Operation, StorageBackend,
@@ -35,14 +34,6 @@ use std::thread::JoinHandle;
 const STORAGE_SERVICE_BACKLOG: usize = 10;
 const STORAGE_BACKGROUND_WRITE_BURST_LIMIT: usize = 1;
 const INVALID_SLOT: u32 = u32::MAX;
-
-/// Deferred worker startup state for the shared storage service.
-///
-/// `FileSystem` creates ingress clients early, but the worker cannot be bound
-/// until both evictable pools have registered their runtime state.
-pub(crate) struct FileSystemWorkersProvision {
-    builder: StorageIOWorkerBuilder,
-}
 
 /// Pool-read lane payload for one evictable-pool page-in request.
 pub(crate) enum PoolReadRequest {
@@ -161,14 +152,14 @@ impl StorageStateMachine {
     #[inline]
     fn new(
         mem_pool: SyncQuiescentGuard<EvictableBufferPool>,
-        mem_pool_file_io: SingleFileIO,
+        mem_pool_file: SparseFile,
         index_pool: SyncQuiescentGuard<EvictableBufferPool>,
-        index_pool_file_io: SingleFileIO,
+        index_pool_file: SparseFile,
     ) -> Self {
         Self {
             table_fs: TableFsStateMachine::new(),
-            mem_pool: EvictablePoolStateMachine::new(mem_pool, mem_pool_file_io),
-            index_pool: EvictablePoolStateMachine::new(index_pool, index_pool_file_io),
+            mem_pool: EvictablePoolStateMachine::new(mem_pool, mem_pool_file),
+            index_pool: EvictablePoolStateMachine::new(index_pool, index_pool_file),
         }
     }
 
@@ -1170,7 +1161,7 @@ pub(crate) fn build_file_system(
     io_depth: usize,
     data_dir: PathBuf,
     catalog_file_name: String,
-) -> Result<(FileSystem, FileSystemWorkersProvision)> {
+) -> Result<(FileSystem, StorageIOWorkerBuilder)> {
     let backend = StorageBackend::new(io_depth)?;
     let stats = backend.stats_handle();
     let (builder, table_reads, pool_reads, background_writes) =
@@ -1184,7 +1175,7 @@ pub(crate) fn build_file_system(
             data_dir,
             catalog_file_name,
         ),
-        FileSystemWorkersProvision { builder },
+        builder,
     ))
 }
 
@@ -1211,14 +1202,9 @@ impl Component for FileSystemWorkers {
         registry: &mut ComponentRegistry,
         mut shelf: ShelfScope<'_, Self>,
     ) -> Result<()> {
-        let FileSystemWorkersProvision { builder } =
-            shelf.take::<FileSystem>().ok_or(Error::InvalidState)?;
-        let PoolStorageProvision {
-            file_io: mem_pool_file_io,
-        } = shelf.take::<MemPool>().ok_or(Error::InvalidState)?;
-        let PoolStorageProvision {
-            file_io: index_pool_file_io,
-        } = shelf.take::<IndexPool>().ok_or(Error::InvalidState)?;
+        let builder = shelf.take::<FileSystem>().ok_or(Error::InvalidState)?;
+        let mem_pool_file = shelf.take::<MemPool>().ok_or(Error::InvalidState)?;
+        let index_pool_file = shelf.take::<IndexPool>().ok_or(Error::InvalidState)?;
 
         let fs = registry.dependency::<FileSystem>()?;
         let mem_pool = registry.dependency::<MemPool>()?;
@@ -1226,9 +1212,9 @@ impl Component for FileSystemWorkers {
         let handle = builder
             .bind(StorageStateMachine::new(
                 mem_pool.clone_inner().into_sync(),
-                mem_pool_file_io,
+                mem_pool_file,
                 index_pool.clone_inner().into_sync(),
-                index_pool_file_io,
+                index_pool_file,
             ))
             .start_thread();
         registry.register::<Self>(FileSystemWorkersOwned {
@@ -1476,7 +1462,7 @@ impl FileSystem {
 }
 
 impl Supplier<FileSystemWorkers> for FileSystem {
-    type Provision = FileSystemWorkersProvision;
+    type Provision = StorageIOWorkerBuilder;
 }
 
 impl Component for FileSystem {
@@ -1492,9 +1478,9 @@ impl Component for FileSystem {
         registry: &mut ComponentRegistry,
         mut shelf: ShelfScope<'_, Self>,
     ) -> Result<()> {
-        let (fs, workers) = config.build_engine_parts()?;
+        let (fs, builder) = config.build_engine_parts()?;
         registry.register::<Self>(fs)?;
-        shelf.put::<FileSystemWorkers>(workers)
+        shelf.put::<FileSystemWorkers>(builder)
     }
 
     #[inline]
