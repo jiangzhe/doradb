@@ -440,20 +440,22 @@ Backend-touching phases must also run the supported alternate backend pass:
   - Implementation Summary: Implemented the generic multi-lane IO scheduler seam, lane-local deferred remainders, backend multi-lane builders, and fairness-sensitive tests while preserving single-lane caller compatibility. [Task Resolve Sync: docs/tasks/000105-multi-lane-completion-scheduling.md @ 2026-04-03]
 
 - **Phase 2: Shared Storage IO Runtime And Config Centralization**
-  - Scope: Introduce `StorageRuntime` and `StorageService`,
-    migrate `TableFileSystem`, `mem_pool`, and `index_pool` to typed shared-I/O
-    clients, replace their dedicated I/O-worker ownership, and move
-    authoritative shared-I/O depth to `TableFileSystemConfig`.
-  - Goals: Replace three private storage-I/O worker owners with one shared
-    owner; preserve readonly miss-load correctness; deprecate
-    `EvictableBufferPoolConfig.max_io_depth` immediately and remove it from the
-    RFC target state.
-  - Non-goals: No evictor-thread merge yet; no redo migration; no public tuning
-    API for fairness policy.
-  - Task Doc: `docs/tasks/TBD.md`
-  - Task Issue: `#0`
-  - Phase Status: `pending`
-  - Implementation Summary: `pending`
+  - Scope: Consolidate table-file and evictable-pool storage I/O under
+    `FileSystem` and `FileSystemWorkers`, replace dedicated table/pool
+    storage-worker ownership with one shared three-lane storage worker in
+    `doradb-storage/src/file/fs.rs`, make `MemPool` and `IndexPool` depend
+    directly on `FileSystem`, and move authoritative shared-I/O depth to
+    `FileSystemConfig`.
+  - Goals: Replace dedicated table/pool storage workers with one shared owner,
+    preserve readonly miss-load correctness and shared backend stats, and keep
+    `MemPoolWorkers` and `IndexPoolWorkers` evictor-only until the later
+    shared-evictor phase.
+  - Non-goals: No shared-evictor merge yet; no redo migration; no public
+    fairness-tuning API; no broader repo-wide `AIO*` rename in this phase.
+  - Task Doc: `docs/tasks/000106-shared-storage-io-runtime-and-config-centralization.md`
+  - Task Issue: `#522`
+  - Phase Status: done
+  - Implementation Summary: Implemented phase 2 by centralizing shared storage IO under FileSystem and FileSystemWorkers, replacing dedicated table and pool storage workers with one concrete three-lane storage worker in doradb-storage/src/file/fs.rs, making MemPool and IndexPool depend directly on FileSystem, renaming TableFileSystem and TableFileSystemConfig to FileSystem and FileSystemConfig, and leaving shared evictor work plus the broader AIO rename as follow-up scope. [Task Resolve Sync: docs/tasks/000106-shared-storage-io-runtime-and-config-centralization.md @ 2026-04-04]
 
 - **Phase 3: Shared Multi-Pool Evictor**
   - Scope: Introduce `SharedPoolEvictor`, migrate global readonly, `mem_pool`,

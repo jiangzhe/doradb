@@ -1,7 +1,7 @@
 ---
 id: 000106
 title: Add Shared Storage IO Runtime And Config Centralization
-status: proposal  # proposal | implemented | superseded
+status: implemented  # proposal | implemented | superseded
 created: 2026-04-03
 github_issue: 522
 ---
@@ -10,42 +10,38 @@ github_issue: 522
 
 ## Summary
 
-Implement Phase 2 of RFC-0013 by introducing one engine-owned
-`StorageRuntime` that owns one shared `StorageService` worker for table-file
-I/O, readonly miss loads, `mem_pool`, and `index_pool`. Migrate those
-subsystems from private storage-I/O workers onto typed shared clients, remove
-`TableFileSystemWorkers`, keep `MemPoolWorkers` and `IndexPoolWorkers` as
-evictor-only transitional components, and make
-`FileSystemConfig.io_depth` the only authoritative shared storage-I/O
-depth for engine builds.
+Implement Phase 2 of RFC-0013 by consolidating table-file I/O and evictable
+pool I/O under one engine-owned shared storage service built around
+`FileSystem` and `FileSystemWorkers`. The final implementation centralizes
+shared storage-I/O depth under `FileSystemConfig`, removes dedicated table/pool
+storage workers and late-bound install slots, makes `MemPool` and `IndexPool`
+depend directly on `FileSystem`, and uses a storage-specific three-lane worker
+in `doradb-storage/src/file/fs.rs` rather than the originally proposed
+`StorageRuntime` component.
 
 ## Context
 
-Task 000105 already landed the generic scheduler seam in `crate::io`:
-multi-lane ingress, lane-local deferred remainders, and backend
-multi-lane worker construction. Production storage owners do not use that
-shared-worker capability yet. `TableFileSystem` still creates its own backend
-and worker, and both evictable pools still create their own backends and I/O
-workers.
+Task 000105 initially added a generic multi-lane scheduler seam in `crate::io`,
+and the original Phase 2 plan built on that with `StorageRuntime`,
+typed bridge clients, and install slots. Implementation work showed that those
+layers made startup, shutdown, and test ownership harder to reason about than
+the storage topology required:
 
-RFC-0013 isolates this phase specifically so shared storage-I/O ownership can
-move from subsystem-private worker components to one explicit engine-owned
-runtime without also merging evictor execution yet. That separation remains
-important here. `MemPoolWorkers` and `IndexPoolWorkers` currently own both I/O
-threads and evictor threads. Removing those components entirely in this phase
-would implicitly pull shared-evictor work into Phase 2. This task therefore
-removes dedicated storage-I/O ownership only:
+- backend ownership still needed one explicit worker owner for reverse-order
+  shutdown;
+- pools naturally depend on the filesystem for shared clients and backend
+  stats;
+- a generic heterogeneous worker abstraction was unnecessary for one fixed
+  storage topology; and
+- standalone filesystem startup diverged from the production shared path.
 
-- `TableFileSystemWorkers` is removed because it is I/O-only.
-- `MemPoolWorkers` and `IndexPoolWorkers` stay, but shrink to evictor-only
-  owners until Phase 3.
-- `DiskPoolWorkers` remains unchanged until Phase 3.
+The resolved implementation therefore simplified the design:
 
-The codebase also has a second constraint beyond engine startup:
-engine-owned shared storage I/O must not leave tests and examples with
-half-initialized file or pool owners. Internal helper paths therefore need to
-either go through `Engine::build()` directly or use explicit raw no-I/O test
-builders that never pretend to be live runtime startup.
+- `FileSystem` is the shared API surface for file and pool callers;
+- `FileSystemWorkers` owns the shared storage worker/backend lifecycle;
+- `MemPoolWorkers` and `IndexPoolWorkers` remain evictor-only components; and
+- shared storage scheduling is a concrete three-lane service in
+  `doradb-storage/src/file/fs.rs`.
 
 Optional issue metadata for `tools/issue.rs create-issue-from-doc`:
 `Issue Labels:`
@@ -58,69 +54,58 @@ Optional issue metadata for `tools/issue.rs create-issue-from-doc`:
 
 ## Goals
 
-1. Introduce `StorageRuntime` as the single owner of shared storage-I/O worker
-   lifecycle inside engine startup and shutdown.
-2. Introduce `StorageService` as one shared worker serving:
-   - table-file reads and writes;
+1. Provide one shared storage-I/O service for:
+   - table-file reads;
+   - table-file background writes;
    - readonly miss loads;
    - `mem_pool` page-in reads and writeback; and
    - `index_pool` page-in reads and writeback.
-3. Migrate `TableFileSystem`, `MemPool`, and `IndexPool` onto typed shared-I/O
-   clients without changing their higher-level request semantics.
-4. Remove `TableFileSystemWorkers` and dedicated storage-I/O ownership from
-   `MemPoolWorkers` and `IndexPoolWorkers`.
-5. Keep `MemPoolWorkers` and `IndexPoolWorkers` as evictor-only components
-   until the Phase 3 shared-evictor task lands.
-6. Make `FileSystemConfig.io_depth` the only authoritative shared
+2. Make `FileSystemConfig.io_depth` the single authoritative shared
    storage-I/O depth for engine builds.
-7. Preserve source-compatible backend stats accessors for table-file and both
-   evictable pools by wiring them to the same shared backend stats handle.
-8. Preserve clear standalone startup semantics for tests/examples rather than
-   making engine-only shared-runtime installation implicit in generic builder
-   helpers.
+3. Remove dedicated table/pool storage worker ownership while keeping
+   `MemPoolWorkers` and `IndexPoolWorkers` as evictor-only components.
+4. Remove late-bound installation indirection so file and pool owners are
+   constructed with concrete shared-storage dependencies.
+5. Preserve source-compatible backend stats accessors by wiring filesystem and
+   both evictable pools to the same shared backend stats handle.
+6. Keep live-I/O test startup on the production shared-storage path rather than
+   supporting a separate standalone filesystem worker topology.
 
 ## Non-Goals
 
 1. Implementing the shared evictor or removing `MemPoolWorkers`,
    `IndexPoolWorkers`, or `DiskPoolWorkers` entirely.
 2. Changing readonly eviction behavior or merging readonly eviction into the
-   shared storage-I/O worker loop.
-3. Migrating redo-log I/O onto the shared runtime.
-4. Adding new public fairness, lane, or storage-I/O tuning knobs.
-5. Redesigning per-origin backend stats attribution beyond reusing one shared
-   backend stats handle.
-6. Removing `EvictableBufferPoolConfig.max_io_depth` from the public config
-   surface in this phase; field removal is deferred even though the field stops
-   being authoritative for engine builds.
-7. Redesigning standalone test/example constructors into a shared-runtime-only
-   model.
+   shared storage worker loop.
+3. Migrating redo-log I/O onto the shared filesystem storage worker.
+4. Removing `EvictableBufferPoolConfig.max_io_depth` from the config surface in
+   this phase; it remains compatibility-only for engine startup.
+5. Performing the broader repo-wide `AIO*` to `IO*` rename in `crate::io`.
+6. Adding new user-facing fairness or lane-tuning knobs.
 
 ## Unsafe Considerations (If Applicable)
 
-This task changes ownership and request-routing around direct-I/O code paths
-that already rely on unsafe-backed borrowed-page operations and backend-local
-submission preparation.
+This task reshapes ownership and routing around direct-I/O paths that already
+depend on unsafe-backed page access and backend-local submission preparation.
 
 1. Expected affected unsafe-bearing paths:
-   - `doradb-storage/src/file/cow_file.rs`
+   - `doradb-storage/src/file/fs.rs`
    - `doradb-storage/src/file/mod.rs`
+   - `doradb-storage/src/file/cow_file.rs`
    - `doradb-storage/src/buffer/evict.rs`
-   - `doradb-storage/src/buffer/readonly.rs`
    - `doradb-storage/src/io/iouring_backend.rs`
    - `doradb-storage/src/io/libaio_backend.rs`
 2. Required invariants:
-   - routing a request through `StorageService` must not change the lifetime
-     guarantees of borrowed page memory or owned direct buffers before
-     completion is observed exactly once;
-   - typed shared-client adapters must preserve correct lane routing by request
-     kind so latency-sensitive reads cannot be accidentally downgraded into the
-     background-write lane;
-   - shutdown ownership must stay explicit: only `StorageRuntime` may terminate
-     shared storage-I/O admission, and transitional pool/file owners must not
-     shut shared clients down out from under other subsystems;
-   - backend-specific raw-pointer preparation and completion-token handling must
-     remain below the generic completion boundary with localized `// SAFETY:`
-     commentary when touched.
+   - shared-lane routing must not change completion ownership or buffer/page
+     lifetimes before completion is observed exactly once;
+   - table reads, pool reads, and background writes must stay on their intended
+     lanes so foreground reads are not silently routed through background
+     writeback admission;
+   - only `FileSystemWorkers` may shut down the shared lane clients, and pool
+     or file owners must not terminate shared I/O out from under other
+     subsystems;
+   - short reads or writes must surface as failures rather than being accepted
+     by release builds.
 3. Validation and inventory refresh if unsafe comments or boundaries change:
    - `tools/unsafe_inventory.rs --write docs/unsafe-usage-baseline.md`
    - `cargo clippy -p doradb-storage --all-targets -- -D warnings`
@@ -133,184 +118,133 @@ Reference:
 
 ## Plan
 
-1. Add one new storage-runtime module and component.
-   - Introduce `StorageRuntime` as a new engine component registered after
-     `MemPool` and before `Catalog`.
-   - `StorageRuntime` owns:
-     - one shared storage-I/O worker thread handle;
-     - one shared backend stats handle; and
-     - any build-time state needed to install typed clients into already-built
-       owners.
-   - `StorageRuntime` shutdown is the only path that stops shared storage I/O.
-
-2. Introduce one storage-specific shared request layer above `crate::io`.
-   - Add `StorageRequest` and `StorageSubmission` enums that cover:
-     - table-file requests;
-     - mem-pool requests; and
-     - index-pool requests.
-   - Add one `StorageStateMachine` that delegates to:
-     - `TableFsStateMachine`;
-     - one mem-pool state machine instance; and
-     - one index-pool state machine instance.
-   - Use the Phase 1 multi-lane scheduler underneath with the RFC lane split:
-     - `table_reads`
-     - `pool_reads`
-     - `background_writes`
-
-3. Introduce typed shared-client adapters instead of reusing raw
-   `AIOClient<TableFsRequest>` and `AIOClient<PoolRequest>` directly.
-   - Table-file adapter:
-     - accepts `TableFsRequest`;
-     - routes reads to `table_reads`;
-     - routes writes to `background_writes`.
-   - Pool adapter:
-     - accepts `PoolRequest`;
-     - routes reads to `pool_reads`;
-     - routes writeback batches to `background_writes`.
-   - Adapters should preserve the caller-facing `send` / `send_async` shape
-     needed by current subsystem code but should not expose subsystem-owned
-     worker shutdown.
-
-4. Refactor `TableFileSystem` engine build path around installable shared-I/O
-   state.
-   - Stop constructing its own `StorageBackend` and worker thread during engine
+1. Reify shared storage ownership around `FileSystem` and `FileSystemWorkers`.
+   - Rename `TableFileSystem` to `FileSystem`.
+   - Rename `TableFileSystemConfig` to `FileSystemConfig`.
+   - Move config-owned validation and engine-build orchestration into
+     `doradb-storage/src/conf/fs.rs`.
+   - Keep `FileSystem` as the shared API surface for table files and pools.
+2. Merge the storage-runtime layer into `doradb-storage/src/file/fs.rs`.
+   - Remove the separate `storage_runtime.rs` module.
+   - Remove the planned `StorageRuntime` component entirely.
+   - Keep `FileSystemWorkers` as the explicit owner of the running worker
+     thread, backend, and shutdown path.
+3. Reify storage scheduling instead of extending `crate::io` with a generic
+   heterogeneous worker.
+   - Remove the generic multi-lane builder path added in Task 000105.
+   - Implement one concrete three-lane storage worker in
+     `doradb-storage/src/file/fs.rs`.
+   - Use typed lane requests:
+     - `ReadSubmission` for `table_reads`;
+     - `PoolReadRequest` for `pool_reads`; and
+     - `BackgroundWriteRequest` for `background_writes`.
+4. Make evictable pools depend directly on `FileSystem`.
+   - `MemPool` and `IndexPool` acquire `QuiescentGuard<FileSystem>` during
      build.
-   - Register a raw `TableFileSystem` owner with install slots for:
-     - the typed shared table client; and
-     - the shared backend stats handle.
-   - Put one build-only `TableFileSystem -> StorageRuntime` provision on the
-     shelf containing the shared-I/O participation data, including the
-     authoritative shared depth from `FileSystemConfig.io_depth`.
-   - Remove `TableFileSystemWorkers` from the engine lifecycle.
-
-5. Refactor `MemPool` and `IndexPool` engine build paths around installable
-   shared-I/O state plus separate evictor provisions.
-   - Stop constructing dedicated storage backends and I/O workers during engine
-     build.
-   - Keep pool-local state unchanged where possible:
-     - swap-file ownership;
-     - inflight page-I/O tracking;
-     - pool stats;
-     - eviction policy/state;
-     - shutdown flag;
-     - arena and allocation state.
-   - Add install slots for:
-     - the typed shared pool client; and
-     - the shared backend stats handle.
-   - Put one build-only storage participation provision on the shelf for
-     `StorageRuntime`.
-   - Keep separate build-only evictor provisions for `MemPoolWorkers` and
-     `IndexPoolWorkers`.
-   - Remove dedicated I/O thread state from those worker components.
-
-6. Keep live startup explicit and engine-owned.
-   - Do not silently repurpose helper constructors into engine-only
-     shared-runtime participants.
-   - For live I/O, use explicit engine-backed startup paths.
-   - For state-machine-only coverage, use raw no-I/O test builders.
-   - The shared-runtime design must not leave tests/examples with partially
-     initialized file or pool owners.
-
-7. Update worker components and engine registration order.
-   - Remove `TableFileSystemWorkers`.
-   - Keep `MemPoolWorkers` and `IndexPoolWorkers` but shrink them to:
-     - one evictor thread handle each; and
-     - evictor-only shutdown/join logic.
-   - Build order should become:
-     1. `DiskPool`
-     2. `DiskPoolWorkers`
-     3. `TableFileSystem`
-     4. `MetaPool`
-     5. `IndexPool`
-     6. `MemPool`
-     7. `StorageRuntime`
-     8. `IndexPoolWorkers`
-     9. `MemPoolWorkers`
-     10. `Catalog`
-     11. `TransactionSystem`
-     12. `TransactionSystemWorkers`
-   - Reverse shutdown order should therefore stop catalog/runtime users first,
-     then pool evictors, then shared storage I/O, then pool/file owners.
-
-8. Centralize engine configuration.
-   - `FileSystemConfig.io_depth` becomes the only authoritative shared
-     storage-I/O depth in engine builds.
-   - `EvictableBufferPoolConfig.max_io_depth` becomes compatibility-only and
-     must not affect engine shared-worker construction anymore.
-   - Preserve the field and builder for configuration compatibility in this
-     phase, but document and test that it is non-authoritative under engine
-     startup.
-
-9. Preserve stats compatibility.
-   - Keep `io_backend_stats()` accessors on `TableFileSystem` and both
-     evictable pools source-compatible.
-   - Wire all three to snapshots from the same shared backend stats handle in
-     this phase.
-   - Do not attempt per-origin split accounting yet.
+   - `EvictableBufferPool` routes page-in reads and batch writeback through
+     shared filesystem helpers instead of pool-local clients or install slots.
+   - Shared backend stats flow through `FileSystem`.
+5. Remove standalone filesystem runtime startup.
+   - Delete `StartedFileSystem`.
+   - Delete `FileSystemConfig::build()`.
+   - Keep test-only helpers inside `file::fs::tests` and use production-path
+     shared storage for live-I/O coverage.
+6. Keep transitional worker and config compatibility where it still matters.
+   - `MemPoolWorkers` and `IndexPoolWorkers` remain evictor-only.
+   - `EvictableBufferPoolConfig.max_io_depth` remains on the config surface but
+     is not authoritative for engine shared-storage construction.
 
 ## Implementation Notes
 
+1. The final implementation intentionally diverged from the original proposal
+   to remove `StorageRuntime`, `InstallSlot`, `PoolIOClient`,
+   `TableFsIOClient`, and the separate `storage_runtime.rs` module.
+   `doradb-storage/src/file/fs.rs` now contains the shared storage worker,
+   typed lane requests, scheduler, `FileSystem`, and `FileSystemWorkers`.
+2. `TableFileSystem` and `TableFileSystemConfig` were renamed to `FileSystem`
+   and `FileSystemConfig`. Their source modules moved from
+   `doradb-storage/src/file/table_fs.rs` and
+   `doradb-storage/src/conf/table_fs.rs` to
+   `doradb-storage/src/file/fs.rs` and `doradb-storage/src/conf/fs.rs`.
+3. `MemPool` and `IndexPool` now build with a `QuiescentGuard<FileSystem>` and
+   route page-in reads and writeback through shared filesystem lane helpers.
+   `MemPoolWorkers` and `IndexPoolWorkers` now only own evictor threads.
+4. The generic multi-lane scheduler introduced in Task 000105 was retired from
+   `crate::io`. Shared storage now uses a concrete three-lane worker local to
+   `doradb-storage/src/file/fs.rs`, while `doradb-storage/src/io/mod.rs`
+   remains the generic single-lane completion core used by redo-log I/O and
+   other simple clients.
+5. Standalone filesystem startup was removed. `StartedFileSystem` and
+   `FileSystemConfig::build()` no longer exist. Test-only helpers and imports
+   were pushed inside `tests` modules so live-I/O coverage exercises the
+   production shared-storage path instead of a private standalone worker.
+6. Config-owned pool build helpers were moved into `doradb-storage/src/conf/buffer.rs`,
+   matching the `FileSystemConfig` pattern and reducing cross-module
+   initialization indirection.
+7. Follow-up verification found that `TableFsStateMachine::on_complete` still
+   accepted short writes in release builds. That completion path now compares
+   the returned length with `operation.len()` and surfaces a short write as
+   `Error::IOError`, with focused regression tests in
+   `doradb-storage/src/file/mod.rs`.
+8. Validation completed with:
+   - `cargo fmt --all`
+   - `cargo check -p doradb-storage`
+   - `cargo clippy -p doradb-storage --all-targets -- -D warnings`
+   - `cargo nextest run -p doradb-storage`
+   - `cargo nextest run -p doradb-storage --no-default-features --features libaio`
+   - `cargo nextest run -p doradb-storage table_fs_write_completion`
+9. Unsafe boundaries did not expand in this phase. No unsafe inventory refresh
+   was required.
+
 ## Impacts
 
-1. New storage-runtime layer:
-   - `doradb-storage/src/storage_runtime.rs` or equivalent new internal module
-     for `StorageRuntime`, `StorageService`, shared request enums, and typed
-     adapters
-2. Engine/component wiring:
-   - `doradb-storage/src/component.rs`
-   - `doradb-storage/src/engine.rs`
-3. Table-file shared-I/O migration:
-   - `doradb-storage/src/file/table_fs.rs`
+1. Shared filesystem and storage-worker ownership:
+   - `doradb-storage/src/file/fs.rs`
    - `doradb-storage/src/file/mod.rs`
    - `doradb-storage/src/file/cow_file.rs`
-4. Evictable-pool shared-I/O migration:
+   - `doradb-storage/src/file/table_file.rs`
+   - `doradb-storage/src/file/multi_table_file.rs`
+2. Pool integration and runtime ownership:
    - `doradb-storage/src/buffer/mod.rs`
    - `doradb-storage/src/buffer/evict.rs`
-5. Transitionally unchanged shared-evictor inputs:
-   - `doradb-storage/src/buffer/readonly.rs`
-   - `doradb-storage/src/buffer/evictor.rs`
-6. Config and compatibility behavior:
-   - `doradb-storage/src/conf/fs.rs`
    - `doradb-storage/src/conf/buffer.rs`
-7. Shared-core validation touchpoints:
+3. Engine and component wiring:
+   - `doradb-storage/src/conf/fs.rs`
+   - `doradb-storage/src/conf/mod.rs`
+   - `doradb-storage/src/conf/engine.rs`
+   - `doradb-storage/src/component.rs`
+   - `doradb-storage/src/engine.rs`
+4. IO-core simplification and backend constructors:
    - `doradb-storage/src/io/mod.rs`
    - `doradb-storage/src/io/iouring_backend.rs`
    - `doradb-storage/src/io/libaio_backend.rs`
+5. Production-path test and recovery call sites:
+   - `doradb-storage/src/table/tests.rs`
+   - `doradb-storage/src/trx/recover.rs`
+   - `doradb-storage/src/trx/sys.rs`
 
 ## Test Cases
 
-1. Engine startup creates one shared storage-I/O thread instead of three
-   dedicated storage-I/O threads.
-2. Default engine background-thread count drops from `12` to `10`; evictor
-   count is unchanged in this phase.
-3. `TableFileSystemWorkers` is removed from engine lifecycle.
-4. `MemPoolWorkers` and `IndexPoolWorkers` remain but own only evictor threads.
-5. Readonly miss loads still complete correctly through the shared
-   `table_reads` lane under sustained pool writeback.
-6. `mem_pool` and `index_pool` page-in reads still complete correctly through
-   the shared `pool_reads` lane.
-7. Table-file writes, mem-pool writeback, and index-pool writeback all route
-   through the shared `background_writes` lane without breaking completion
-   ownership or waiter semantics.
-8. Pool shutdown no longer shuts down shared storage I/O out from under other
-   storage clients.
-9. Reverse-order engine shutdown cleanly stops:
-   - catalog/runtime users;
-   - mem/index evictor workers;
-   - shared `StorageRuntime`;
-   - underlying pool and file owners.
-10. Changing `FileSystemConfig.io_depth` changes shared-worker capacity in
-    engine startup.
-11. Changing only `EvictableBufferPoolConfig.max_io_depth` does not change
-    engine shared-worker construction.
-12. Standalone started test/example helpers remain explicit and functional
-    without requiring full engine `StorageRuntime` startup.
-13. Validation commands:
-    - `cargo nextest run -p doradb-storage`
-    - `cargo nextest run -p doradb-storage --no-default-features --features libaio`
+1. Engine startup builds one shared storage worker under `FileSystemWorkers`
+   instead of separate table/pool storage workers.
+2. `table_reads`, `pool_reads`, and `background_writes` route requests through
+   the intended lane-specific request types and drain cleanly during shutdown.
+3. `MemPoolWorkers` and `IndexPoolWorkers` remain evictor-only components.
+4. `FileSystemConfig.io_depth` is authoritative for engine shared-storage
+   depth, while changing only `EvictableBufferPoolConfig.max_io_depth` does not
+   change engine shared-worker construction.
+5. `FileSystem`, `mem_pool`, and `index_pool` expose the same shared backend
+   stats handle identity/snapshots.
+6. File, catalog, and recovery tests use the production shared-storage path
+   instead of a standalone filesystem runtime.
+7. Short table-file writes fail completion instead of being accepted as
+   success.
+8. Validation commands:
+   - `cargo nextest run -p doradb-storage`
+   - `cargo nextest run -p doradb-storage --no-default-features --features libaio`
 
 ## Open Questions
 
-None in this task scope. Phase 3 remains responsible for shared-evictor
-implementation and the eventual removal of transitional evictor-only worker
-components.
+1. The broader repo-wide `AIO*` to `IO*` rename was intentionally kept out of
+   scope. Follow-up is tracked in
+   `docs/backlogs/000078-rename-io-module-aio-surface-to-io-naming.md`.
