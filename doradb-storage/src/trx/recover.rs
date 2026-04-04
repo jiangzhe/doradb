@@ -22,7 +22,7 @@ use crate::catalog::{
     Catalog, CatalogTable, TableID, TableMetadata, is_catalog_obj_id, is_user_obj_id,
 };
 use crate::error::{Error, Result};
-use crate::file::table_fs::TableFileSystem;
+use crate::file::fs::FileSystem;
 use crate::latch::LatchFallbackMode;
 use crate::quiescent::QuiescentGuard;
 use crate::row::{RowID, RowPage};
@@ -170,7 +170,7 @@ pub(crate) async fn log_recover(
 pub(crate) struct RecoveryDeps {
     pub(crate) index_pool: QuiescentGuard<EvictableBufferPool>,
     pub(crate) mem_pool: QuiescentGuard<EvictableBufferPool>,
-    pub(crate) table_fs: QuiescentGuard<TableFileSystem>,
+    pub(crate) table_fs: QuiescentGuard<FileSystem>,
     pub(crate) global_disk_pool: QuiescentGuard<GlobalReadonlyBufferPool>,
 }
 
@@ -178,7 +178,7 @@ pub(crate) struct RecoveryDeps {
 pub struct LogRecovery<'a> {
     index_pool: QuiescentGuard<EvictableBufferPool>,
     mem_pool: QuiescentGuard<EvictableBufferPool>,
-    table_fs: QuiescentGuard<TableFileSystem>,
+    table_fs: QuiescentGuard<FileSystem>,
     global_disk_pool: QuiescentGuard<GlobalReadonlyBufferPool>,
     catalog: &'a Catalog,
     log_merger: LogMerger,
@@ -201,7 +201,7 @@ impl<'a> LogRecovery<'a> {
         meta_pool: &FixedBufferPool,
         index_pool: QuiescentGuard<EvictableBufferPool>,
         mem_pool: QuiescentGuard<EvictableBufferPool>,
-        table_fs: QuiescentGuard<TableFileSystem>,
+        table_fs: QuiescentGuard<FileSystem>,
         global_disk_pool: QuiescentGuard<GlobalReadonlyBufferPool>,
         catalog: &'a Catalog,
         log_merger: LogMerger,
@@ -545,7 +545,7 @@ impl<'a> LogRecovery<'a> {
         &mut self,
         table: &CatalogTable,
         rows: &BTreeMap<RowID, RowRedo>,
-    ) -> crate::error::Result<()> {
+    ) -> Result<()> {
         for row in rows.values() {
             match &row.kind {
                 RowRedoKind::Insert(vals) => {
@@ -619,6 +619,7 @@ impl<'a> LogRecovery<'a> {
 
 #[cfg(test)]
 mod tests {
+    use crate::buffer::PoolRole;
     use crate::catalog::{
         ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexOrder, IndexSpec,
         TableMetadata, TableSpec,
@@ -626,12 +627,11 @@ mod tests {
     use crate::conf::{EngineConfig, EvictableBufferPoolConfig, TrxSysConfig};
     use crate::error::{BlockCorruptionCause, BlockKind, Error, FileKind};
     use crate::file::block_integrity::{BLOCK_INTEGRITY_HEADER_SIZE, write_block_checksum};
-    use crate::file::build_test_fs_in;
     use crate::file::cow_file::COW_FILE_PAGE_SIZE;
     use crate::index::{COLUMN_DELETION_BLOB_PAGE_HEADER_SIZE, ColumnBlockIndex};
     use crate::row::RowRead;
     use crate::row::ops::{DeleteMvcc, InsertMvcc, SelectKey, UpdateCol, UpdateMvcc};
-    use crate::table::{TableAccess, TablePersistence};
+    use crate::table::{DeleteMarker, TableAccess, TablePersistence};
     use crate::trx::MIN_SNAPSHOT_TS;
     use crate::value::Val;
     use crate::value::ValKind;
@@ -700,7 +700,7 @@ mod tests {
                 .storage_root(main_dir)
                 .data_buffer(
                     EvictableBufferPoolConfig::default()
-                        .role(crate::buffer::PoolRole::Mem)
+                        .role(PoolRole::Mem)
                         .max_mem_size(64usize * 1024 * 1024)
                         .max_file_size(128usize * 1024 * 1024),
                 )
@@ -726,7 +726,7 @@ mod tests {
                 .storage_root(main_dir.clone())
                 .data_buffer(
                     EvictableBufferPoolConfig::default()
-                        .role(crate::buffer::PoolRole::Mem)
+                        .role(PoolRole::Mem)
                         .max_mem_size(64usize * 1024 * 1024)
                         .max_file_size(128usize * 1024 * 1024),
                 )
@@ -772,7 +772,7 @@ mod tests {
                 .storage_root(main_dir)
                 .data_buffer(
                     EvictableBufferPoolConfig::default()
-                        .role(crate::buffer::PoolRole::Mem)
+                        .role(PoolRole::Mem)
                         .max_mem_size(64usize * 1024 * 1024)
                         .max_file_size(128usize * 1024 * 1024),
                 )
@@ -808,7 +808,7 @@ mod tests {
                 .storage_root(main_dir.clone())
                 .data_buffer(
                     EvictableBufferPoolConfig::default()
-                        .role(crate::buffer::PoolRole::Mem)
+                        .role(PoolRole::Mem)
                         .max_mem_size(64usize * 1024 * 1024)
                         .max_file_size(128usize * 1024 * 1024),
                 )
@@ -893,7 +893,7 @@ mod tests {
                 .storage_root(main_dir)
                 .data_buffer(
                     EvictableBufferPoolConfig::default()
-                        .role(crate::buffer::PoolRole::Mem)
+                        .role(PoolRole::Mem)
                         .max_mem_size(64usize * 1024 * 1024)
                         .max_file_size(128usize * 1024 * 1024),
                 )
@@ -934,7 +934,7 @@ mod tests {
                 .storage_root(main_dir.clone())
                 .data_buffer(
                     EvictableBufferPoolConfig::default()
-                        .role(crate::buffer::PoolRole::Mem)
+                        .role(PoolRole::Mem)
                         .max_mem_size(64usize * 1024 * 1024)
                         .max_file_size(128usize * 1024 * 1024),
                 )
@@ -978,7 +978,7 @@ mod tests {
                 .storage_root(main_dir)
                 .data_buffer(
                     EvictableBufferPoolConfig::default()
-                        .role(crate::buffer::PoolRole::Mem)
+                        .role(PoolRole::Mem)
                         .max_mem_size(64usize * 1024 * 1024)
                         .max_file_size(128usize * 1024 * 1024),
                 )
@@ -1005,7 +1005,7 @@ mod tests {
                 .storage_root(main_dir.clone())
                 .data_buffer(
                     EvictableBufferPoolConfig::default()
-                        .role(crate::buffer::PoolRole::Mem)
+                        .role(PoolRole::Mem)
                         .max_mem_size(64usize * 1024 * 1024)
                         .max_file_size(128usize * 1024 * 1024),
                 )
@@ -1074,7 +1074,7 @@ mod tests {
                 .storage_root(main_dir)
                 .data_buffer(
                     EvictableBufferPoolConfig::default()
-                        .role(crate::buffer::PoolRole::Mem)
+                        .role(PoolRole::Mem)
                         .max_mem_size(64usize * 1024 * 1024)
                         .max_file_size(128usize * 1024 * 1024),
                 )
@@ -1116,7 +1116,7 @@ mod tests {
                 .storage_root(main_dir.clone())
                 .data_buffer(
                     EvictableBufferPoolConfig::default()
-                        .role(crate::buffer::PoolRole::Mem)
+                        .role(PoolRole::Mem)
                         .max_mem_size(64usize * 1024 * 1024)
                         .max_file_size(128usize * 1024 * 1024),
                 )
@@ -1196,7 +1196,7 @@ mod tests {
                 .storage_root(main_dir)
                 .data_buffer(
                     EvictableBufferPoolConfig::default()
-                        .role(crate::buffer::PoolRole::Mem)
+                        .role(PoolRole::Mem)
                         .max_mem_size(64usize * 1024 * 1024)
                         .max_file_size(128usize * 1024 * 1024),
                 )
@@ -1247,7 +1247,7 @@ mod tests {
                 .storage_root(main_dir.clone())
                 .data_buffer(
                     EvictableBufferPoolConfig::default()
-                        .role(crate::buffer::PoolRole::Mem)
+                        .role(PoolRole::Mem)
                         .max_mem_size(64usize * 1024 * 1024)
                         .max_file_size(128usize * 1024 * 1024),
                 )
@@ -1375,7 +1375,7 @@ mod tests {
                 .storage_root(main_dir)
                 .data_buffer(
                     EvictableBufferPoolConfig::default()
-                        .role(crate::buffer::PoolRole::Mem)
+                        .role(PoolRole::Mem)
                         .max_mem_size(64usize * 1024 * 1024)
                         .max_file_size(128usize * 1024 * 1024),
                 )
@@ -1452,7 +1452,7 @@ mod tests {
                 .storage_root(main_dir.clone())
                 .data_buffer(
                     EvictableBufferPoolConfig::default()
-                        .role(crate::buffer::PoolRole::Mem)
+                        .role(PoolRole::Mem)
                         .max_mem_size(64usize * 1024 * 1024)
                         .max_file_size(128usize * 1024 * 1024),
                 )
@@ -1523,19 +1523,19 @@ mod tests {
                 entry.block_id()
             };
 
+            let table_file_path = engine.table_fs.table_file_path(table_id);
             drop(checkpoint_session);
             drop(table);
             drop(session);
             drop(engine);
 
-            let fs = build_test_fs_in(temp_dir.path());
-            corrupt_page_checksum(fs.table_file_path(table_id), block_id);
+            corrupt_page_checksum(table_file_path, block_id);
 
             let err = match EngineConfig::default()
                 .storage_root(main_dir)
                 .data_buffer(
                     EvictableBufferPoolConfig::default()
-                        .role(crate::buffer::PoolRole::Mem)
+                        .role(PoolRole::Mem)
                         .max_mem_size(64usize * 1024 * 1024)
                         .max_file_size(128usize * 1024 * 1024),
                 )
@@ -1571,7 +1571,7 @@ mod tests {
                 .storage_root(main_dir.clone())
                 .data_buffer(
                     EvictableBufferPoolConfig::default()
-                        .role(crate::buffer::PoolRole::Mem)
+                        .role(PoolRole::Mem)
                         .max_mem_size(64usize * 1024 * 1024)
                         .max_file_size(128usize * 1024 * 1024),
                 )
@@ -1636,8 +1636,8 @@ mod tests {
 
             let marker = table.deletion_buffer().get(0).unwrap();
             let marker_ts = match marker {
-                crate::table::DeleteMarker::Committed(ts) => ts,
-                crate::table::DeleteMarker::Ref(status) => status.ts(),
+                DeleteMarker::Committed(ts) => ts,
+                DeleteMarker::Ref(status) => status.ts(),
             };
             let trx_sys = session.engine().trx_sys.clone();
             let mut ready = false;
@@ -1686,15 +1686,15 @@ mod tests {
                     .expect("delete checkpoint should offload large delete sets")
             };
 
+            let table_file_path = engine.table_fs.table_file_path(table_id);
             drop(trx_sys);
             drop(checkpoint_session);
             drop(table);
             drop(session);
             drop(engine);
 
-            let fs = build_test_fs_in(temp_dir.path());
             corrupt_blob_header_kind(
-                fs.table_file_path(table_id),
+                table_file_path,
                 blob_ref.start_page_id,
                 blob_ref.start_offset,
             );
@@ -1703,7 +1703,7 @@ mod tests {
                 .storage_root(main_dir)
                 .data_buffer(
                     EvictableBufferPoolConfig::default()
-                        .role(crate::buffer::PoolRole::Mem)
+                        .role(PoolRole::Mem)
                         .max_mem_size(64usize * 1024 * 1024)
                         .max_file_size(128usize * 1024 * 1024),
                 )

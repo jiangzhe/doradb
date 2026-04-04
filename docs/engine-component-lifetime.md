@@ -41,15 +41,16 @@ components in one fixed dependency order:
 
 1. `DiskPool`
 2. `DiskPoolWorkers`
-3. `TableFileSystem`
-4. `TableFileSystemWorkers`
-5. `MetaPool`
-6. `IndexPool`
-7. `MemPool`
-8. `MemPoolWorkers`
-9. `Catalog`
-10. `TransactionSystem`
-11. `TransactionSystemWorkers`
+3. `FileSystem`
+4. `MetaPool`
+5. `IndexPool`
+6. `MemPool`
+7. `FileSystemWorkers`
+8. `IndexPoolWorkers`
+9. `MemPoolWorkers`
+10. `Catalog`
+11. `TransactionSystem`
+12. `TransactionSystemWorkers`
 
 Registration order is the dependency order. Reverse registration order is both:
 

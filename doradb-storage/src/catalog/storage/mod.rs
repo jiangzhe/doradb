@@ -13,10 +13,10 @@ use crate::catalog::storage::tables::*;
 use crate::catalog::table::TableMetadata;
 use crate::catalog::{ObjID, TableID};
 use crate::error::Result;
+use crate::file::fs::FileSystem;
 use crate::file::multi_table_file::{
     CATALOG_TABLE_ROOT_DESC_COUNT, CatalogTableRootDesc, MultiTableFile, MultiTableFileSnapshot,
 };
-use crate::file::table_fs::TableFileSystem;
 use crate::index::BlockIndex;
 use crate::quiescent::QuiescentGuard;
 use crate::trx::TrxID;
@@ -37,7 +37,7 @@ impl CatalogStorage {
     #[inline]
     pub(crate) async fn new(
         meta_pool: QuiescentGuard<FixedBufferPool>,
-        table_fs: &TableFileSystem,
+        table_fs: &FileSystem,
         global_disk_pool: QuiescentGuard<GlobalReadonlyBufferPool>,
     ) -> Result<Self> {
         let meta_pool_guard = meta_pool.pool_guard();

@@ -14,7 +14,7 @@ use super::path::{
     path_to_utf8, validate_catalog_file_name, validate_log_file_stem,
     validate_swap_file_path_candidate,
 };
-use super::{EvictableBufferPoolConfig, TableFileSystemConfig, TrxSysConfig};
+use super::{EvictableBufferPoolConfig, FileSystemConfig, TrxSysConfig};
 use crate::conf::consts::MAX_LOG_PARTITIONS;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -284,7 +284,7 @@ pub struct EngineConfig {
     pub(crate) index_swap_file: PathBuf,
     pub(crate) index_max_file_size: Byte,
     pub(crate) data_buffer: EvictableBufferPoolConfig,
-    pub(crate) file: TableFileSystemConfig,
+    pub(crate) file: FileSystemConfig,
 }
 
 impl Default for EngineConfig {
@@ -298,7 +298,7 @@ impl Default for EngineConfig {
             index_swap_file: PathBuf::from(DEFAULT_ENGINE_INDEX_SWAP_FILE),
             index_max_file_size: Byte::from_u64(DEFAULT_ENGINE_INDEX_MAX_FILE_SIZE as u64),
             data_buffer: EvictableBufferPoolConfig::default(),
-            file: TableFileSystemConfig::default(),
+            file: FileSystemConfig::default(),
         }
     }
 }
@@ -347,7 +347,7 @@ impl EngineConfig {
     }
 
     #[inline]
-    pub fn file(mut self, file: TableFileSystemConfig) -> Self {
+    pub fn file(mut self, file: FileSystemConfig) -> Self {
         self.file = file;
         self
     }
@@ -481,7 +481,7 @@ mod tests {
 
         let changed = EngineConfig::default()
             .storage_root(root.path())
-            .file(TableFileSystemConfig::default().data_dir("data"))
+            .file(FileSystemConfig::default().data_dir("data"))
             .resolve_storage_paths()
             .unwrap();
         changed.ensure_directories().unwrap();
@@ -502,14 +502,14 @@ mod tests {
     #[test]
     fn test_swap_files_reject_data_dir_aliases() {
         let err = EngineConfig::default()
-            .file(TableFileSystemConfig::default().data_dir("data.swp"))
+            .file(FileSystemConfig::default().data_dir("data.swp"))
             .data_buffer(EvictableBufferPoolConfig::default().data_swap_file("data.swp"))
             .resolve_storage_paths()
             .unwrap_err();
         assert!(matches!(err, Error::InvalidStoragePath(_)));
 
         let err = EngineConfig::default()
-            .file(TableFileSystemConfig::default().data_dir("data.swp"))
+            .file(FileSystemConfig::default().data_dir("data.swp"))
             .data_buffer(EvictableBufferPoolConfig::default().data_swap_file("data.swp/heap.swp"))
             .resolve_storage_paths()
             .unwrap_err();

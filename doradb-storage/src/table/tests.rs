@@ -2,11 +2,11 @@ use super::{DeleteInternal, FrozenPage, InsertRowIntoPage, UpdateRowInplace};
 use crate::buffer::BufferPool;
 use crate::buffer::frame::FrameKind;
 use crate::buffer::page::{PAGE_SIZE, PageID};
-use crate::conf::{EngineConfig, EvictableBufferPoolConfig, TableFileSystemConfig, TrxSysConfig};
+use crate::buffer::{PoolGuards, PoolRole, test_frame_kind, test_raw_fd};
+use crate::conf::{EngineConfig, EvictableBufferPoolConfig, FileSystemConfig, TrxSysConfig};
 use crate::engine::Engine;
 use crate::error::{BlockCorruptionCause, BlockKind, Error, FileKind, Result, StoragePoisonSource};
 use crate::file::block_integrity::{BLOCK_INTEGRITY_HEADER_SIZE, write_block_checksum};
-use crate::file::build_test_fs_in;
 use crate::file::cow_file::{COW_FILE_PAGE_SIZE, SUPER_BLOCK_ID};
 use crate::index::{
     COLUMN_BLOCK_HEADER_SIZE, COLUMN_BLOCK_LEAF_HEADER_SIZE, ColumnBlockIndex, RowLocation,
@@ -435,8 +435,8 @@ fn test_lwc_select_surfaces_persisted_corruption() {
         let entry = index.locate_block(row_id).await.unwrap().unwrap();
         let block_id = entry.block_id();
 
-        let fs = build_test_fs_in(sys._temp_dir.path());
-        corrupt_page_checksum(fs.table_file_path(sys.table.table_id()), block_id);
+        let table_file_path = sys.engine.table_fs.table_file_path(sys.table.table_id());
+        corrupt_page_checksum(table_file_path, block_id);
 
         let mut trx = session.try_begin_trx().unwrap().unwrap();
         let stmt = trx.start_stmt();
@@ -481,12 +481,8 @@ fn test_lwc_select_surfaces_column_block_index_row_metadata_corruption() {
         );
         let entry = index.locate_block(row_id).await.unwrap().unwrap();
 
-        let fs = build_test_fs_in(sys._temp_dir.path());
-        corrupt_leaf_row_codec(
-            fs.table_file_path(sys.table.table_id()),
-            entry.leaf_page_id,
-            0,
-        );
+        let table_file_path = sys.engine.table_fs.table_file_path(sys.table.table_id());
+        corrupt_leaf_row_codec(table_file_path, entry.leaf_page_id, 0);
         let _ = sys
             .table
             .disk_pool()
@@ -535,12 +531,8 @@ fn test_lwc_select_surfaces_column_block_index_zero_block_id_corruption() {
         );
         let entry = index.locate_block(row_id).await.unwrap().unwrap();
 
-        let fs = build_test_fs_in(sys._temp_dir.path());
-        corrupt_leaf_block_id(
-            fs.table_file_path(sys.table.table_id()),
-            entry.leaf_page_id,
-            0,
-        );
+        let table_file_path = sys.engine.table_fs.table_file_path(sys.table.table_id());
+        corrupt_leaf_block_id(table_file_path, entry.leaf_page_id, 0);
         let _ = sys
             .table
             .disk_pool()
@@ -589,11 +581,8 @@ fn test_lwc_select_surfaces_row_shape_fingerprint_mismatch_corruption() {
         );
         let entry = index.locate_block(row_id).await.unwrap().unwrap();
 
-        let fs = build_test_fs_in(sys._temp_dir.path());
-        corrupt_lwc_row_shape_fingerprint(
-            fs.table_file_path(sys.table.table_id()),
-            entry.block_id(),
-        );
+        let table_file_path = sys.engine.table_fs.table_file_path(sys.table.table_id());
+        corrupt_lwc_row_shape_fingerprint(table_file_path, entry.block_id());
         let _ = sys.table.disk_pool().invalidate_block_id(entry.block_id());
 
         let mut trx = session.try_begin_trx().unwrap().unwrap();
@@ -982,12 +971,8 @@ fn test_checkpoint_for_deletion_fails_on_invalid_v2_delete_metadata() {
             .unwrap()
             .expect("persisted entry should exist");
 
-        let fs = build_test_fs_in(sys._temp_dir.path());
-        corrupt_leaf_delete_codec(
-            fs.table_file_path(sys.table.table_id()),
-            entry.leaf_page_id,
-            0,
-        );
+        let table_file_path = sys.engine.table_fs.table_file_path(sys.table.table_id());
+        corrupt_leaf_delete_codec(table_file_path, entry.leaf_page_id, 0);
         let _ = sys
             .table
             .disk_pool()
@@ -1069,12 +1054,8 @@ fn test_checkpoint_for_deletion_fails_on_short_v2_delete_section_header() {
             .unwrap()
             .expect("persisted entry should exist");
 
-        let fs = build_test_fs_in(sys._temp_dir.path());
-        corrupt_leaf_short_delete_section_header(
-            fs.table_file_path(sys.table.table_id()),
-            entry.leaf_page_id,
-            0,
-        );
+        let table_file_path = sys.engine.table_fs.table_file_path(sys.table.table_id());
+        corrupt_leaf_short_delete_section_header(table_file_path, entry.leaf_page_id, 0);
         let _ = sys
             .table
             .disk_pool()
@@ -2349,13 +2330,13 @@ fn test_mvcc_insert_surfaces_cached_insert_page_reload_error() {
         for i in 2..258 {
             sys.new_trx_insert(&mut writer, vec![Val::from(i), Val::from(&large[..])])
                 .await;
-            if sys.table.mem.mem_pool.test_frame_kind(cached_page.page_id) == FrameKind::Evicted {
+            if test_frame_kind(&sys.table.mem.mem_pool, cached_page.page_id) == FrameKind::Evicted {
                 break;
             }
         }
         let mut evicted = false;
         for _ in 0..20 {
-            if sys.table.mem.mem_pool.test_frame_kind(cached_page.page_id) == FrameKind::Evicted {
+            if test_frame_kind(&sys.table.mem.mem_pool, cached_page.page_id) == FrameKind::Evicted {
                 evicted = true;
                 break;
             }
@@ -2367,7 +2348,7 @@ fn test_mvcc_insert_surfaces_cached_insert_page_reload_error() {
         );
 
         let read_hook = Arc::new(FailingPageReadHook::for_page(
-            sys.table.mem.mem_pool.test_raw_fd(),
+            test_raw_fd(&sys.table.mem.mem_pool),
             cached_page.page_id,
             libc::EIO,
         ));
@@ -2422,13 +2403,13 @@ fn test_mvcc_rollback_poisons_runtime_on_row_page_reload_error() {
         for i in 2..258 {
             sys.new_trx_insert(&mut writer, vec![Val::from(i), Val::from(&large[..])])
                 .await;
-            if sys.table.mem.mem_pool.test_frame_kind(cached_page.page_id) == FrameKind::Evicted {
+            if test_frame_kind(&sys.table.mem.mem_pool, cached_page.page_id) == FrameKind::Evicted {
                 break;
             }
         }
         let mut evicted = false;
         for _ in 0..20 {
-            if sys.table.mem.mem_pool.test_frame_kind(cached_page.page_id) == FrameKind::Evicted {
+            if test_frame_kind(&sys.table.mem.mem_pool, cached_page.page_id) == FrameKind::Evicted {
                 evicted = true;
                 break;
             }
@@ -2437,7 +2418,7 @@ fn test_mvcc_rollback_poisons_runtime_on_row_page_reload_error() {
         assert!(evicted, "rollback row page should be evicted before repro");
 
         let read_hook = Arc::new(FailingPageReadHook::for_page(
-            sys.table.mem.mem_pool.test_raw_fd(),
+            test_raw_fd(&sys.table.mem.mem_pool),
             cached_page.page_id,
             libc::EIO,
         ));
@@ -2515,7 +2496,7 @@ fn test_user_secondary_indexes_evict_and_continue_serving_lookups() {
             .index_max_file_size(32u64 * 1024 * 1024)
             .data_buffer(
                 EvictableBufferPoolConfig::default()
-                    .role(crate::buffer::PoolRole::Mem)
+                    .role(PoolRole::Mem)
                     .max_mem_size(64u64 * 1024 * 1024)
                     .max_file_size(128u64 * 1024 * 1024),
             )
@@ -2653,7 +2634,7 @@ impl TestSys {
             .storage_root(main_dir)
             .data_buffer(
                 EvictableBufferPoolConfig::default()
-                    .role(crate::buffer::PoolRole::Mem)
+                    .role(PoolRole::Mem)
                     .max_mem_size(max_mem_size)
                     .max_file_size(128u64 * 1024 * 1024),
             )
@@ -2663,7 +2644,7 @@ impl TestSys {
                     .skip_recovery(true),
             )
             .file(
-                TableFileSystemConfig::default()
+                FileSystemConfig::default()
                     .io_depth(16)
                     .readonly_buffer_size(128 * 1024 * 1024)
                     .data_dir("."),
@@ -2812,7 +2793,7 @@ fn unwrap_insert_result(res: Result<InsertMvcc>) -> RowID {
 
 async fn assert_row_in_lwc(
     table: &Table,
-    guards: &crate::buffer::PoolGuards,
+    guards: &PoolGuards,
     key: &SelectKey,
     sts: TrxID,
 ) -> RowID {

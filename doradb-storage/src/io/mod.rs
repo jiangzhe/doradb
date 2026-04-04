@@ -14,7 +14,7 @@ mod libaio_abi;
 mod libaio_backend;
 
 use crate::thread;
-use flume::{Receiver, RecvError, Selector, SendError, Sender, TryRecvError, TrySendError};
+use flume::{Receiver, SendError, Sender, TryRecvError, TrySendError};
 use std::collections::VecDeque;
 use std::os::unix::io::RawFd;
 use std::result::Result as StdResult;
@@ -67,7 +67,8 @@ pub enum AIOError {
 pub type AIOResult<T> = StdResult<T, AIOError>;
 #[cfg(test)]
 pub(crate) use self::tests::{
-    StorageBackendOp, StorageBackendTestHook, set_storage_backend_test_hook,
+    StorageBackendOp, StorageBackendTestHook, current_storage_backend_test_hook,
+    set_storage_backend_test_hook,
 };
 
 /// Buffer ownership model for one backend-agnostic IO operation.
@@ -281,6 +282,11 @@ impl<T> IOQueue<T> {
     pub fn push(&mut self, req: T) {
         self.reqs.push_back(req);
     }
+
+    #[inline]
+    pub(crate) fn pop_front(&mut self) -> Option<T> {
+        self.reqs.pop_front()
+    }
 }
 
 /// One worker-owned submission staged for backend preparation and completion.
@@ -302,7 +308,6 @@ pub type AIOKey = u64;
 
 const INVALID_SLOT: u32 = u32::MAX;
 const DEFAULT_AIO_EVENT_LOOP_BACKLOG: usize = 10;
-const UNBOUNDED_LANE_BURST_LIMIT: usize = usize::MAX;
 
 enum Entry<T> {
     Occupied(T),
@@ -447,317 +452,6 @@ pub trait IOStateMachine {
     fn end_loop(self);
 }
 
-/// Worker construction parameters for one logical ingress lane.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct IOLaneConfig {
-    backlog: usize,
-    burst_limit_ops: usize,
-}
-
-impl IOLaneConfig {
-    /// Creates one ingress-lane config with bounded queue capacity and a per-turn burst cap.
-    #[allow(dead_code)]
-    #[inline]
-    pub(crate) const fn new(backlog: usize, burst_limit_ops: usize) -> Self {
-        IOLaneConfig {
-            backlog,
-            burst_limit_ops,
-        }
-    }
-
-    #[inline]
-    const fn single_lane(backlog: usize) -> Self {
-        IOLaneConfig {
-            backlog,
-            burst_limit_ops: UNBOUNDED_LANE_BURST_LIMIT,
-        }
-    }
-}
-
-struct SchedulerLaneBuilder<T> {
-    rx: Receiver<AIOMessage<T>>,
-    burst_limit_ops: usize,
-}
-
-struct RequestSchedulerBuilder<T> {
-    lanes: Box<[SchedulerLaneBuilder<T>]>,
-}
-
-impl<T> RequestSchedulerBuilder<T> {
-    #[inline]
-    fn single_lane(backlog: usize) -> (Self, AIOClient<T>) {
-        let lane_config = IOLaneConfig::single_lane(backlog);
-        let (tx, rx) = flume::bounded(backlog);
-        let builder = RequestSchedulerBuilder {
-            lanes: vec![SchedulerLaneBuilder {
-                rx,
-                burst_limit_ops: lane_config.burst_limit_ops,
-            }]
-            .into_boxed_slice(),
-        };
-        (builder, AIOClient(tx))
-    }
-
-    #[inline]
-    fn try_new(lane_configs: &[IOLaneConfig]) -> AIOResult<(Self, Vec<AIOClient<T>>)> {
-        if lane_configs.is_empty() {
-            return Err(AIOError::SetupError);
-        }
-        let mut lanes = Vec::with_capacity(lane_configs.len());
-        let mut clients = Vec::with_capacity(lane_configs.len());
-        for lane_config in lane_configs {
-            if lane_config.burst_limit_ops == 0 {
-                return Err(AIOError::SetupError);
-            }
-            let (tx, rx) = flume::bounded(lane_config.backlog);
-            lanes.push(SchedulerLaneBuilder {
-                rx,
-                burst_limit_ops: lane_config.burst_limit_ops,
-            });
-            clients.push(AIOClient(tx));
-        }
-        Ok((
-            RequestSchedulerBuilder {
-                lanes: lanes.into_boxed_slice(),
-            },
-            clients,
-        ))
-    }
-
-    #[inline]
-    fn build(self) -> RequestScheduler<T> {
-        let lanes = self
-            .lanes
-            .into_vec()
-            .into_iter()
-            .map(|lane| SchedulerLane {
-                rx: lane.rx,
-                deferred_req: None,
-                burst_limit_ops: lane.burst_limit_ops,
-                shutdown: false,
-            })
-            .collect();
-        RequestScheduler { lanes, cursor: 0 }
-    }
-}
-
-struct SchedulerLane<T> {
-    rx: Receiver<AIOMessage<T>>,
-    deferred_req: Option<T>,
-    burst_limit_ops: usize,
-    shutdown: bool,
-}
-
-enum LaneTurnStart<T> {
-    Deferred(usize),
-    Message(usize, AIOMessage<T>),
-    Disconnected(usize),
-}
-
-struct RequestScheduler<T> {
-    lanes: Box<[SchedulerLane<T>]>,
-    cursor: usize,
-}
-
-impl<T> RequestScheduler<T> {
-    #[inline]
-    fn all_shutdown(&self) -> bool {
-        self.lanes.iter().all(|lane| lane.shutdown)
-    }
-
-    #[inline]
-    fn has_deferred(&self) -> bool {
-        self.lanes.iter().any(|lane| lane.deferred_req.is_some())
-    }
-
-    #[inline]
-    fn next_lane_idx(&self, lane_idx: usize) -> usize {
-        if self.lanes.len() == 1 {
-            0
-        } else {
-            (lane_idx + 1) % self.lanes.len()
-        }
-    }
-
-    #[inline]
-    fn local_depth<S>(
-        &self,
-        queue: &IOQueue<S>,
-        staged_slots_len: usize,
-        submitted: usize,
-    ) -> usize {
-        queue.len() + staged_slots_len + submitted
-    }
-
-    fn next_ready_turn_start(&mut self) -> Option<LaneTurnStart<T>> {
-        for offset in 0..self.lanes.len() {
-            let lane_idx = (self.cursor + offset) % self.lanes.len();
-            let lane = &mut self.lanes[lane_idx];
-            if lane.deferred_req.is_some() {
-                return Some(LaneTurnStart::Deferred(lane_idx));
-            }
-            if lane.shutdown {
-                continue;
-            }
-            match lane.rx.try_recv() {
-                Ok(msg) => return Some(LaneTurnStart::Message(lane_idx, msg)),
-                Err(TryRecvError::Empty) => {}
-                Err(TryRecvError::Disconnected) => {
-                    return Some(LaneTurnStart::Disconnected(lane_idx));
-                }
-            }
-        }
-        None
-    }
-
-    fn wait_turn_start(&mut self) -> Option<LaneTurnStart<T>> {
-        if self.all_shutdown() {
-            return None;
-        }
-        let mut selector = Selector::new();
-        let mut active_lanes = 0usize;
-        for offset in 0..self.lanes.len() {
-            let lane_idx = (self.cursor + offset) % self.lanes.len();
-            let lane = &self.lanes[lane_idx];
-            if lane.shutdown {
-                continue;
-            }
-            active_lanes += 1;
-            selector = selector.recv(&lane.rx, move |res| match res {
-                Ok(msg) => LaneTurnStart::Message(lane_idx, msg),
-                Err(RecvError::Disconnected) => LaneTurnStart::Disconnected(lane_idx),
-            });
-        }
-        if active_lanes == 0 {
-            None
-        } else {
-            Some(selector.wait())
-        }
-    }
-
-    fn fetch_reqs<S>(
-        &mut self,
-        state_machine: &mut S,
-        queue: &mut IOQueue<S::Submission>,
-        staged_slots_len: usize,
-        submitted: usize,
-        io_depth: usize,
-        mut min_turns: usize,
-    ) where
-        S: IOStateMachine<Request = T>,
-    {
-        loop {
-            if self.local_depth(queue, staged_slots_len, submitted) >= io_depth {
-                return;
-            }
-
-            let Some(turn_start) = self.next_ready_turn_start().or_else(|| {
-                if min_turns == 0 {
-                    None
-                } else {
-                    self.wait_turn_start()
-                }
-            }) else {
-                return;
-            };
-            min_turns = min_turns.saturating_sub(1);
-            self.process_turn(
-                turn_start,
-                state_machine,
-                queue,
-                staged_slots_len,
-                submitted,
-                io_depth,
-            );
-        }
-    }
-
-    fn process_turn<S>(
-        &mut self,
-        turn_start: LaneTurnStart<T>,
-        state_machine: &mut S,
-        queue: &mut IOQueue<S::Submission>,
-        staged_slots_len: usize,
-        submitted: usize,
-        io_depth: usize,
-    ) where
-        S: IOStateMachine<Request = T>,
-    {
-        let lane_idx = match turn_start {
-            LaneTurnStart::Deferred(lane_idx)
-            | LaneTurnStart::Message(lane_idx, _)
-            | LaneTurnStart::Disconnected(lane_idx) => lane_idx,
-        };
-        let headroom = io_depth - self.local_depth(queue, staged_slots_len, submitted);
-        debug_assert!(headroom != 0);
-
-        let lane = &mut self.lanes[lane_idx];
-        let mut budget = headroom.min(lane.burst_limit_ops);
-        let mut first_msg = match turn_start {
-            LaneTurnStart::Deferred(_) => None,
-            LaneTurnStart::Message(_, msg) => Some(msg),
-            LaneTurnStart::Disconnected(_) => {
-                lane.shutdown = true;
-                None
-            }
-        };
-
-        while budget != 0 {
-            if let Some(req) = lane.deferred_req.take() {
-                let queue_len = queue.len();
-                lane.deferred_req = state_machine.prepare_request(req, budget, queue);
-                let admitted = queue.len() - queue_len;
-                debug_assert!(
-                    admitted <= budget,
-                    "state machine admitted more operations than burst budget"
-                );
-                budget -= admitted;
-                if lane.deferred_req.is_some() {
-                    break;
-                }
-                continue;
-            }
-
-            let next_msg = match first_msg.take() {
-                Some(msg) => Some(msg),
-                None if lane.shutdown => None,
-                None => match lane.rx.try_recv() {
-                    Ok(msg) => Some(msg),
-                    Err(TryRecvError::Empty) => None,
-                    Err(TryRecvError::Disconnected) => {
-                        lane.shutdown = true;
-                        None
-                    }
-                },
-            };
-            let Some(msg) = next_msg else {
-                break;
-            };
-            match msg {
-                AIOMessage::Shutdown => {
-                    lane.shutdown = true;
-                    break;
-                }
-                AIOMessage::Req(req) => {
-                    let queue_len = queue.len();
-                    lane.deferred_req = state_machine.prepare_request(req, budget, queue);
-                    let admitted = queue.len() - queue_len;
-                    debug_assert!(
-                        admitted <= budget,
-                        "state machine admitted more operations than burst budget"
-                    );
-                    budget -= admitted;
-                    if lane.deferred_req.is_some() {
-                        break;
-                    }
-                }
-            }
-        }
-
-        self.cursor = self.next_lane_idx(lane_idx);
-    }
-}
-
 /// Cloneable sender used to enqueue requests into one [`IOWorker`].
 ///
 /// The client only transports state-machine requests. It does not own any
@@ -765,6 +459,12 @@ impl<T> RequestScheduler<T> {
 pub struct AIOClient<T>(Sender<AIOMessage<T>>);
 
 impl<T> AIOClient<T> {
+    #[inline]
+    pub(crate) fn bounded(backlog: usize) -> (Receiver<AIOMessage<T>>, Self) {
+        let (tx, rx) = flume::bounded(backlog);
+        (rx, AIOClient(tx))
+    }
+
     /// Signals that this ingress lane is finished and contributes to worker shutdown.
     ///
     /// A single-lane worker stops after receiving this message. Multi-lane
@@ -817,7 +517,7 @@ impl<T> Clone for AIOClient<T> {
 /// concrete [`IOStateMachine`] later.
 pub struct IOWorkerBuilder<T, B = StorageBackend> {
     backend: B,
-    scheduler: RequestSchedulerBuilder<T>,
+    rx: Receiver<AIOMessage<T>>,
 }
 
 impl<T, B> IOWorkerBuilder<T, B>
@@ -834,7 +534,9 @@ where
         let submit_batch = self.backend.new_submit_batch();
         IOWorker {
             backend: self.backend,
-            scheduler: self.scheduler.build(),
+            rx: self.rx,
+            deferred_req: None,
+            shutdown: false,
             submitted: 0,
             staged_slots: VecDeque::new(),
             submit_batch,
@@ -856,7 +558,9 @@ where
 /// machine and its owning subsystem.
 pub struct IOWorker<T, S: IOStateMachine<Request = T>, B: IOBackend = StorageBackend> {
     backend: B,
-    scheduler: RequestScheduler<T>,
+    rx: Receiver<AIOMessage<T>>,
+    deferred_req: Option<T>,
+    shutdown: bool,
     submitted: usize,
     staged_slots: VecDeque<u32>,
     submit_batch: B::SubmitBatch,
@@ -893,18 +597,74 @@ where
     }
 
     #[inline]
+    fn has_deferred(&self) -> bool {
+        self.deferred_req.is_some()
+    }
+
+    #[inline]
     fn fetch_reqs(&mut self, queue: &mut IOQueue<S::Submission>, min_reqs: usize) {
-        let staged_slots_len = self.staged_slots.len();
-        let submitted = self.submitted;
-        let io_depth = self.io_depth();
-        self.scheduler.fetch_reqs(
-            &mut self.state_machine,
-            queue,
-            staged_slots_len,
-            submitted,
-            io_depth,
-            min_reqs,
-        );
+        let mut require_block = min_reqs != 0;
+        loop {
+            let headroom = self.io_depth() - self.local_depth(queue);
+            if headroom == 0 {
+                return;
+            }
+
+            if let Some(req) = self.deferred_req.take() {
+                let queue_len = queue.len();
+                self.deferred_req = self.state_machine.prepare_request(req, headroom, queue);
+                let admitted = queue.len() - queue_len;
+                debug_assert!(
+                    admitted <= headroom,
+                    "state machine admitted more operations than submission headroom"
+                );
+                require_block = false;
+                continue;
+            }
+
+            if self.shutdown {
+                return;
+            }
+
+            let next_msg = if require_block {
+                match self.rx.recv() {
+                    Ok(msg) => Some(msg),
+                    Err(_) => {
+                        self.shutdown = true;
+                        None
+                    }
+                }
+            } else {
+                match self.rx.try_recv() {
+                    Ok(msg) => Some(msg),
+                    Err(TryRecvError::Empty) => None,
+                    Err(TryRecvError::Disconnected) => {
+                        self.shutdown = true;
+                        None
+                    }
+                }
+            };
+            require_block = false;
+
+            let Some(msg) = next_msg else {
+                return;
+            };
+            match msg {
+                AIOMessage::Shutdown => {
+                    self.shutdown = true;
+                    return;
+                }
+                AIOMessage::Req(req) => {
+                    let queue_len = queue.len();
+                    self.deferred_req = self.state_machine.prepare_request(req, headroom, queue);
+                    let admitted = queue.len() - queue_len;
+                    debug_assert!(
+                        admitted <= headroom,
+                        "state machine admitted more operations than submission headroom"
+                    );
+                }
+            }
+        }
     }
 
     #[inline]
@@ -945,9 +705,9 @@ where
             // We only accept new channel requests if shutdown flag is false.
             // Deferred request remainders are already worker-owned, so they
             // must still be expanded and drained after shutdown.
-            if self.scheduler.has_deferred() {
+            if self.has_deferred() {
                 self.fetch_reqs(&mut queue, 0);
-            } else if !self.scheduler.all_shutdown() {
+            } else if !self.shutdown {
                 if self.local_depth(&queue) == 0 {
                     // there is no IO operation running.
                     self.fetch_reqs(&mut queue, 1);
@@ -1012,9 +772,9 @@ where
             }
             // Drain local queues before quitting so backend-staged submissions
             // and worker-owned request state are not dropped silently.
-            if self.scheduler.all_shutdown()
+            if self.shutdown
                 && self.submitted == 0
-                && !self.scheduler.has_deferred()
+                && !self.has_deferred()
                 && self.staged_slots.is_empty()
                 && queue.is_empty()
             {
@@ -1027,19 +787,8 @@ where
 
 #[inline]
 fn build_io_worker<T, B>(backend: B) -> (IOWorkerBuilder<T, B>, AIOClient<T>) {
-    let (scheduler, client) = RequestSchedulerBuilder::single_lane(DEFAULT_AIO_EVENT_LOOP_BACKLOG);
-    (IOWorkerBuilder { backend, scheduler }, client)
-}
-
-type MultiLaneWorkerBuild<T, B> = (IOWorkerBuilder<T, B>, Vec<AIOClient<T>>);
-
-#[inline]
-pub(crate) fn build_io_worker_lanes<T, B>(
-    backend: B,
-    lane_configs: &[IOLaneConfig],
-) -> AIOResult<MultiLaneWorkerBuild<T, B>> {
-    let (scheduler, clients) = RequestSchedulerBuilder::try_new(lane_configs)?;
-    Ok((IOWorkerBuilder { backend, scheduler }, clients))
+    let (rx, client) = AIOClient::bounded(DEFAULT_AIO_EVENT_LOOP_BACKLOG);
+    (IOWorkerBuilder { backend, rx }, client)
 }
 
 #[cfg(test)]
@@ -1047,7 +796,6 @@ mod tests {
     use super::*;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::time::Duration;
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub(crate) struct StorageBackendOp {
@@ -1058,7 +806,7 @@ mod tests {
 
     impl StorageBackendOp {
         #[inline]
-        pub(super) fn new(kind: AIOKind, fd: RawFd, offset: usize) -> Self {
+        pub(crate) fn new(kind: AIOKind, fd: RawFd, offset: usize) -> Self {
             Self { kind, fd, offset }
         }
 
@@ -1090,7 +838,7 @@ mod tests {
         std::sync::Mutex::new(None);
 
     #[inline]
-    pub(super) fn current_storage_backend_test_hook() -> Option<StorageBackendHook> {
+    pub(crate) fn current_storage_backend_test_hook() -> Option<StorageBackendHook> {
         STORAGE_BACKEND_TEST_HOOK.lock().unwrap().clone()
     }
 
@@ -1158,13 +906,11 @@ mod tests {
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     struct ExpandRequest {
-        lane: usize,
         remaining: usize,
     }
 
     struct ExpandSubmission {
         key: u64,
-        lane: usize,
         operation: Operation,
     }
 
@@ -1202,7 +948,6 @@ mod tests {
                 self.next_key += 1;
                 queue.push(ExpandSubmission {
                     key,
-                    lane: req.lane,
                     operation: Operation::pwrite_owned(
                         -1,
                         0,
@@ -1223,14 +968,6 @@ mod tests {
         fn end_loop(self) {}
     }
 
-    fn test_scheduler<T>(
-        lane_configs: &[IOLaneConfig],
-    ) -> (RequestScheduler<T>, Vec<AIOClient<T>>) {
-        let (builder, clients) =
-            build_io_worker_lanes(TestBackend { max_events: 4 }, lane_configs).unwrap();
-        (builder.scheduler.build(), clients)
-    }
-
     fn test_single_lane_worker(
         max_events: usize,
         submitted: usize,
@@ -1242,21 +979,6 @@ mod tests {
         let mut worker = builder.bind(ExpandingStateMachine::default());
         worker.submitted = submitted;
         (worker, client)
-    }
-
-    fn test_multi_lane_worker(
-        max_events: usize,
-        submitted: usize,
-        lane_configs: &[IOLaneConfig],
-    ) -> (
-        IOWorker<ExpandRequest, ExpandingStateMachine, TestBackend>,
-        Vec<AIOClient<ExpandRequest>>,
-    ) {
-        let (builder, clients) = build_io_worker_lanes(TestBackend { max_events }, lane_configs)
-            .expect("lane configs should be valid");
-        let mut worker = builder.bind(ExpandingStateMachine::default());
-        worker.submitted = submitted;
-        (worker, clients)
     }
 
     struct ImmediateBackend {
@@ -1327,7 +1049,6 @@ mod tests {
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     struct RecordedRequest {
-        lane: usize,
         tag: &'static str,
         next_op: usize,
         remaining: usize,
@@ -1335,9 +1056,8 @@ mod tests {
 
     impl RecordedRequest {
         #[inline]
-        fn new(lane: usize, tag: &'static str, remaining: usize) -> Self {
+        fn new(tag: &'static str, remaining: usize) -> Self {
             RecordedRequest {
-                lane,
                 tag,
                 next_op: 0,
                 remaining,
@@ -1347,7 +1067,6 @@ mod tests {
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     struct RecordedOp {
-        lane: usize,
         tag: &'static str,
         op_idx: usize,
     }
@@ -1380,23 +1099,18 @@ mod tests {
     struct RecordingStateMachine {
         next_key: u64,
         log: Arc<RecordingLog>,
-        submit_tx: Option<flume::Sender<RecordedOp>>,
     }
 
     type RecordingWorkerParts = (
         IOWorker<RecordedRequest, RecordingStateMachine, ImmediateBackend>,
-        Vec<AIOClient<RecordedRequest>>,
+        AIOClient<RecordedRequest>,
         Arc<RecordingLog>,
     );
 
     impl RecordingStateMachine {
         #[inline]
-        fn new(log: Arc<RecordingLog>, submit_tx: Option<flume::Sender<RecordedOp>>) -> Self {
-            RecordingStateMachine {
-                next_key: 0,
-                log,
-                submit_tx,
-            }
+        fn new(log: Arc<RecordingLog>) -> Self {
+            RecordingStateMachine { next_key: 0, log }
         }
     }
 
@@ -1418,7 +1132,6 @@ mod tests {
                 queue.push(RecordedSubmission {
                     key,
                     op: RecordedOp {
-                        lane: req.lane,
                         tag: req.tag,
                         op_idx,
                     },
@@ -1436,9 +1149,6 @@ mod tests {
 
         fn on_submit(&mut self, sub: &RecordedSubmission) {
             self.log.submits.lock().unwrap().push(sub.op);
-            if let Some(submit_tx) = &self.submit_tx {
-                let _ = submit_tx.send(sub.op);
-            }
         }
 
         fn on_complete(
@@ -1455,17 +1165,11 @@ mod tests {
         }
     }
 
-    fn recording_worker(
-        max_events: usize,
-        lane_configs: &[IOLaneConfig],
-        submit_tx: Option<flume::Sender<RecordedOp>>,
-    ) -> RecordingWorkerParts {
+    fn recording_worker(max_events: usize) -> RecordingWorkerParts {
         let log = Arc::new(RecordingLog::default());
-        let (builder, clients) =
-            build_io_worker_lanes(ImmediateBackend::new(max_events), lane_configs)
-                .expect("lane configs should be valid");
-        let worker = builder.bind(RecordingStateMachine::new(Arc::clone(&log), submit_tx));
-        (worker, clients, log)
+        let (builder, client) = build_io_worker(ImmediateBackend::new(max_events));
+        let worker = builder.bind(RecordingStateMachine::new(Arc::clone(&log)));
+        (worker, client, log)
     }
 
     #[test]
@@ -1473,23 +1177,12 @@ mod tests {
         let (mut worker, client) = test_single_lane_worker(2, 0);
         let mut queue = IOQueue::with_capacity(2);
 
-        client
-            .send(ExpandRequest {
-                lane: 0,
-                remaining: 5,
-            })
-            .unwrap();
+        client.send(ExpandRequest { remaining: 5 }).unwrap();
         worker.fetch_reqs(&mut queue, 1);
 
         assert_eq!(queue.len(), 2);
         assert_eq!(worker.local_depth(&queue), 2);
-        assert_eq!(
-            worker.scheduler.lanes[0].deferred_req,
-            Some(ExpandRequest {
-                lane: 0,
-                remaining: 3,
-            })
-        );
+        assert_eq!(worker.deferred_req, Some(ExpandRequest { remaining: 3 }));
     }
 
     #[test]
@@ -1497,23 +1190,13 @@ mod tests {
         let (mut worker, client) = test_single_lane_worker(2, 1);
         let mut queue = IOQueue::with_capacity(2);
 
-        client
-            .send(ExpandRequest {
-                lane: 0,
-                remaining: 1,
-            })
-            .unwrap();
-        client
-            .send(ExpandRequest {
-                lane: 0,
-                remaining: 1,
-            })
-            .unwrap();
+        client.send(ExpandRequest { remaining: 1 }).unwrap();
+        client.send(ExpandRequest { remaining: 1 }).unwrap();
 
         worker.fetch_reqs(&mut queue, 0);
         assert_eq!(queue.len(), 1);
         assert_eq!(worker.local_depth(&queue), 2);
-        assert!(!worker.scheduler.has_deferred());
+        assert!(!worker.has_deferred());
 
         worker.submitted = 0;
         worker.fetch_reqs(&mut queue, 0);
@@ -1522,81 +1205,12 @@ mod tests {
     }
 
     #[test]
-    fn test_multi_lane_fetch_reqs_rotates_after_burst_limited_remainder() {
-        let lane_configs = [IOLaneConfig::new(4, 1), IOLaneConfig::new(4, 1)];
-        let (mut worker, clients) = test_multi_lane_worker(2, 0, &lane_configs);
-        let mut queue = IOQueue::with_capacity(2);
+    fn test_single_lane_worker_drains_deferred_and_queued_work_once_on_shutdown() {
+        let (worker, client, log) = recording_worker(1);
 
-        clients[0]
-            .send(ExpandRequest {
-                lane: 0,
-                remaining: 3,
-            })
-            .unwrap();
-        clients[1]
-            .send(ExpandRequest {
-                lane: 1,
-                remaining: 1,
-            })
-            .unwrap();
-
-        worker.fetch_reqs(&mut queue, 0);
-
-        let queued_lanes: Vec<_> = queue.reqs.iter().map(|sub| sub.lane).collect();
-        assert_eq!(queued_lanes, vec![0, 1]);
-        assert_eq!(
-            worker.scheduler.lanes[0].deferred_req,
-            Some(ExpandRequest {
-                lane: 0,
-                remaining: 2,
-            })
-        );
-        assert!(worker.scheduler.lanes[1].deferred_req.is_none());
-    }
-
-    #[test]
-    fn test_multi_lane_backpressure_is_lane_local() {
-        let lane_configs = [IOLaneConfig::new(1, 1), IOLaneConfig::new(1, 1)];
-        let (_scheduler, clients) = test_scheduler::<ExpandRequest>(&lane_configs);
-
-        clients[0]
-            .try_send(ExpandRequest {
-                lane: 0,
-                remaining: 1,
-            })
-            .unwrap();
-        let full = clients[0]
-            .try_send(ExpandRequest {
-                lane: 0,
-                remaining: 1,
-            })
-            .expect_err("lane 0 backlog should be full");
-        assert!(matches!(
-            full,
-            TrySendError::Full(ExpandRequest { lane: 0, .. })
-        ));
-
-        clients[1]
-            .try_send(ExpandRequest {
-                lane: 1,
-                remaining: 1,
-            })
-            .expect("lane 1 should retain independent enqueue capacity");
-    }
-
-    #[test]
-    fn test_multi_lane_worker_drains_deferred_and_queued_work_once_on_shutdown() {
-        let lane_configs = [IOLaneConfig::new(8, 1), IOLaneConfig::new(8, 1)];
-        let (worker, clients, log) = recording_worker(1, &lane_configs, None);
-
-        clients[0]
-            .send(RecordedRequest::new(0, "lane0", 3))
-            .unwrap();
-        clients[1]
-            .send(RecordedRequest::new(1, "lane1", 1))
-            .unwrap();
-        clients[0].shutdown();
-        clients[1].shutdown();
+        client.send(RecordedRequest::new("main", 3)).unwrap();
+        client.send(RecordedRequest::new("tail", 1)).unwrap();
+        client.shutdown();
 
         worker.run();
 
@@ -1606,74 +1220,24 @@ mod tests {
             submits,
             vec![
                 RecordedOp {
-                    lane: 0,
-                    tag: "lane0",
+                    tag: "main",
                     op_idx: 0,
                 },
                 RecordedOp {
-                    lane: 1,
-                    tag: "lane1",
-                    op_idx: 0,
-                },
-                RecordedOp {
-                    lane: 0,
-                    tag: "lane0",
+                    tag: "main",
                     op_idx: 1,
                 },
                 RecordedOp {
-                    lane: 0,
-                    tag: "lane0",
+                    tag: "main",
                     op_idx: 2,
+                },
+                RecordedOp {
+                    tag: "tail",
+                    op_idx: 0,
                 },
             ]
         );
         assert_eq!(completes, submits);
         assert_eq!(log.end_count.load(Ordering::Relaxed), 1);
-    }
-
-    #[test]
-    fn test_idle_multi_lane_worker_wakes_on_any_lane_and_resumes_rotation() {
-        let lane_configs = [IOLaneConfig::new(8, 1), IOLaneConfig::new(8, 1)];
-        let (submit_tx, submit_rx) = flume::unbounded();
-        let (worker, clients, log) = recording_worker(1, &lane_configs, Some(submit_tx));
-
-        let handle = std::thread::spawn(move || worker.run());
-        std::thread::sleep(Duration::from_millis(20));
-
-        clients[1].send(RecordedRequest::new(1, "wake", 1)).unwrap();
-        let first = submit_rx
-            .recv_timeout(Duration::from_secs(1))
-            .expect("lane 1 work should wake an idle worker");
-        assert_eq!(
-            first,
-            RecordedOp {
-                lane: 1,
-                tag: "wake",
-                op_idx: 0,
-            }
-        );
-
-        clients[0].send(RecordedRequest::new(0, "next", 1)).unwrap();
-        clients[0].shutdown();
-        clients[1].shutdown();
-
-        handle.join().unwrap();
-
-        let submits = log.submits.lock().unwrap().clone();
-        assert_eq!(
-            submits,
-            vec![
-                RecordedOp {
-                    lane: 1,
-                    tag: "wake",
-                    op_idx: 0,
-                },
-                RecordedOp {
-                    lane: 0,
-                    tag: "next",
-                    op_idx: 0,
-                },
-            ]
-        );
     }
 }

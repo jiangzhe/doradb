@@ -5,13 +5,14 @@
 //! `docs/engine-component-lifetime.md` for the runtime-versus-owner lifetime
 //! model that this module and [`crate::component::ComponentRegistry`] enforce.
 use crate::buffer::PoolRole;
+use crate::buffer::{IndexPoolWorkers, MemPoolWorkers};
 use crate::catalog::Catalog;
 use crate::component::{
     ComponentRegistry, DiskPoolConfig, IndexPoolConfig, MetaPoolConfig, RegistryBuilder,
 };
 use crate::conf::EngineConfig;
 use crate::error::{Error, Result};
-use crate::file::table_fs::TableFileSystem;
+use crate::file::fs::{FileSystem, FileSystemWorkers};
 use crate::quiescent::QuiescentGuard;
 use crate::session::Session;
 use crate::trx::sys::TransactionSystem;
@@ -251,7 +252,7 @@ pub struct EngineInner {
     /// In-memory row-page pool for table data.
     pub mem_pool: MemPool,
     /// Table-file subsystem that runs persistent page IO.
-    pub table_fs: QuiescentGuard<TableFileSystem>,
+    pub table_fs: QuiescentGuard<FileSystem>,
     /// Global readonly pool for persisted table-file reads.
     pub disk_pool: DiskPool,
     lifecycle: EngineLifecycle,
@@ -291,7 +292,7 @@ impl EngineConfig {
         builder
             .build::<DiskPool>(DiskPoolConfig::new(readonly_buffer_size))
             .await?;
-        builder.build::<TableFileSystem>(file).await?;
+        builder.build::<FileSystem>(file).await?;
         builder
             .build::<MetaPool>(MetaPoolConfig::new(self.meta_buffer.as_u64() as usize))
             .await?;
@@ -309,6 +310,9 @@ impl EngineConfig {
                     .data_swap_file(resolved.data_swap_file_path()),
             )
             .await?;
+        builder.build::<FileSystemWorkers>(()).await?;
+        builder.build::<IndexPoolWorkers>(()).await?;
+        builder.build::<MemPoolWorkers>(()).await?;
         // Catalog owns user-table runtimes, and those runtimes retain buffer-pool
         // guards for row/index/readonly access. Register catalog after the pools it
         // can pin so reverse shutdown/drop order releases table guards before pool
@@ -323,7 +327,7 @@ impl EngineConfig {
         let meta_pool = registry.dependency::<MetaPool>()?;
         let index_pool = registry.dependency::<IndexPool>()?;
         let mem_pool = registry.dependency::<MemPool>()?;
-        let table_fs = registry.dependency::<TableFileSystem>()?;
+        let table_fs = registry.dependency::<FileSystem>()?;
         let disk_pool = registry.dependency::<DiskPool>()?;
         let engine_inner = EngineInner {
             catalog,
@@ -345,15 +349,12 @@ impl EngineConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::buffer::{FixedBufferPool, GlobalReadonlyBufferPool};
-    use crate::catalog::storage::CatalogStorage;
+    use crate::buffer::test_io_backend_stats_handle_identity as pool_stats_handle_identity;
     use crate::catalog::tests::table1;
     use crate::conf::consts::STORAGE_LAYOUT_FILE_NAME;
-    use crate::conf::{
-        EngineConfig, EvictableBufferPoolConfig, TableFileSystemConfig, TrxSysConfig,
-    };
+    use crate::conf::{EngineConfig, EvictableBufferPoolConfig, FileSystemConfig, TrxSysConfig};
     use crate::error::Error;
-    use crate::file::build_test_fs_in;
+    use crate::file::fs::tests::io_backend_stats_handle_identity as fs_stats_handle_identity;
     use std::fs;
     use std::panic::{AssertUnwindSafe, catch_unwind};
     use std::sync::{Arc as StdArc, Barrier};
@@ -373,7 +374,7 @@ mod tests {
                     .max_mem_size(TEST_POOL_BYTES)
                     .max_file_size(128usize * 1024 * 1024),
             )
-            .file(TableFileSystemConfig::default().readonly_buffer_size(TEST_POOL_BYTES))
+            .file(FileSystemConfig::default().readonly_buffer_size(TEST_POOL_BYTES))
             .trx(TrxSysConfig::default().skip_recovery(false))
     }
 
@@ -386,6 +387,62 @@ mod tests {
         assert!(config_str.contains("data_swap_file"));
         assert!(config_str.contains("log_dir"));
         assert!(config_str.contains("log_file_stem"));
+    }
+
+    #[test]
+    fn test_engine_component_order_uses_shared_storage_workers() {
+        smol::block_on(async {
+            let root = TempDir::new().unwrap();
+            let engine = test_engine_config_for(root.path()).build().await.unwrap();
+
+            assert_eq!(
+                engine.components().component_names(),
+                vec![
+                    "disk_pool",
+                    "disk_pool_workers",
+                    "fs",
+                    "meta_pool",
+                    "index_pool",
+                    "mem_pool",
+                    "fs_workers",
+                    "index_pool_workers",
+                    "mem_pool_workers",
+                    "catalog",
+                    "trx_sys",
+                    "trx_sys_workers",
+                ]
+            );
+        });
+    }
+
+    #[test]
+    fn test_engine_shared_storage_runtime_reuses_one_backend_stats_handle() {
+        smol::block_on(async {
+            let root = TempDir::new().unwrap();
+            let engine = test_engine_config_for(root.path())
+                .file(
+                    FileSystemConfig::default()
+                        .io_depth(7)
+                        .readonly_buffer_size(TEST_POOL_BYTES),
+                )
+                .data_buffer(
+                    EvictableBufferPoolConfig::default()
+                        .role(PoolRole::Mem)
+                        .max_mem_size(TEST_POOL_BYTES)
+                        .max_file_size(128usize * 1024 * 1024)
+                        .max_io_depth(1),
+                )
+                .build()
+                .await
+                .unwrap();
+
+            let table_stats = fs_stats_handle_identity(&engine.table_fs);
+            let mem_stats = pool_stats_handle_identity(&engine.mem_pool);
+            let index_stats = pool_stats_handle_identity(&engine.index_pool);
+
+            assert_eq!(table_stats, mem_stats);
+            assert_eq!(table_stats, index_stats);
+        });
     }
 
     #[test]
@@ -446,7 +503,7 @@ mod tests {
             drop(engine);
 
             let err = match test_engine_config_for(root.path())
-                .file(TableFileSystemConfig::default().data_dir("data"))
+                .file(FileSystemConfig::default().data_dir("data"))
                 .build()
                 .await
             {
@@ -468,7 +525,7 @@ mod tests {
             assert!(!new_data_dir.exists());
 
             let err = match test_engine_config_for(root.path())
-                .file(TableFileSystemConfig::default().data_dir("other-data"))
+                .file(FileSystemConfig::default().data_dir("other-data"))
                 .build()
                 .await
             {
@@ -507,7 +564,7 @@ mod tests {
                 .storage_root(root.path())
                 .meta_buffer(TEST_POOL_BYTES)
                 .index_buffer(TEST_POOL_BYTES)
-                .file(TableFileSystemConfig::default().readonly_buffer_size(TEST_POOL_BYTES))
+                .file(FileSystemConfig::default().readonly_buffer_size(TEST_POOL_BYTES))
                 .data_buffer(
                     EvictableBufferPoolConfig::default()
                         .role(PoolRole::Mem)
@@ -526,7 +583,7 @@ mod tests {
 
             let engine = test_engine_config_for(root.path())
                 .file(
-                    TableFileSystemConfig::default()
+                    FileSystemConfig::default()
                         .data_dir("data")
                         .readonly_buffer_size(TEST_POOL_BYTES),
                 )
@@ -821,59 +878,30 @@ mod tests {
     fn test_unstarted_transaction_system_shutdown_is_safe() {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
-            let data_dir = temp_dir.path().join("data");
             let log_dir = temp_dir.path().join("log");
-            let swap_file = temp_dir.path().join("data.swp");
-            fs::create_dir_all(&data_dir).unwrap();
             fs::create_dir_all(&log_dir).unwrap();
-            let table_fs = build_test_fs_in(&data_dir);
-            let meta_pool = crate::quiescent::QuiescentBox::new(
-                FixedBufferPool::with_capacity(PoolRole::Meta, TEST_POOL_BYTES).unwrap(),
-            );
-            let index_pool = crate::quiescent::QuiescentBox::new(
-                EvictableBufferPoolConfig::default()
-                    .role(PoolRole::Index)
-                    .data_swap_file(temp_dir.path().join("index.swp"))
-                    .max_mem_size(TEST_POOL_BYTES)
-                    .max_file_size(128usize * 1024 * 1024)
-                    .build_index()
-                    .unwrap()
-                    .0,
-            );
-            let mem_pool = crate::quiescent::QuiescentBox::new(
-                EvictableBufferPoolConfig::default()
-                    .role(PoolRole::Mem)
-                    .data_swap_file(&swap_file)
-                    .max_mem_size(TEST_POOL_BYTES)
-                    .max_file_size(128usize * 1024 * 1024)
-                    .build()
-                    .unwrap()
-                    .0,
-            );
-            let disk_pool = crate::quiescent::QuiescentBox::new(
-                GlobalReadonlyBufferPool::with_capacity(PoolRole::Disk, TEST_POOL_BYTES).unwrap(),
-            );
-            let catalog = crate::quiescent::QuiescentBox::new(
-                Catalog::new(
-                    CatalogStorage::new(meta_pool.guard(), &table_fs, disk_pool.guard())
-                        .await
-                        .unwrap(),
+            let engine = test_engine_config_for(temp_dir.path())
+                .file(
+                    FileSystemConfig::default()
+                        .data_dir("data")
+                        .readonly_buffer_size(TEST_POOL_BYTES),
                 )
+                .trx(TrxSysConfig::default().skip_recovery(true))
+                .build()
                 .await
-                .unwrap(),
-            );
+                .unwrap();
 
             let pending = TrxSysConfig::default()
                 .log_dir(&log_dir)
                 .log_file_stem("pending-startup-cleanup")
                 .skip_recovery(true)
                 .prepare(
-                    meta_pool.guard(),
-                    index_pool.guard(),
-                    mem_pool.guard(),
-                    table_fs.guard(),
-                    disk_pool.guard(),
-                    catalog.guard(),
+                    engine.meta_pool.clone_inner(),
+                    engine.index_pool.clone_inner(),
+                    engine.mem_pool.clone_inner(),
+                    engine.table_fs.clone(),
+                    engine.disk_pool.clone_inner(),
+                    engine.catalog.clone(),
                 )
                 .await
                 .unwrap();

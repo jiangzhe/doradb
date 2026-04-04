@@ -2,8 +2,9 @@ use crate::bitmap::AllocMap;
 use crate::buffer::page::PAGE_SIZE;
 use crate::buffer::{BlockKey, PersistedFileID, ReadSubmission, ReadonlyBufferPool};
 use crate::error::{BlockCorruptionCause, BlockKind, Error, FileKind, Result};
+use crate::file::fs::BackgroundWriteRequest;
 use crate::file::super_block::{SUPER_BLOCK_SIZE, SuperBlock};
-use crate::file::{SparseFile, TableFsRequest, write_direct};
+use crate::file::{SparseFile, write_direct};
 use crate::io::{AIOClient, DirectBuf};
 use crate::trx::TrxID;
 use std::fs;
@@ -163,7 +164,8 @@ pub struct CowFile<M> {
     file_id: PersistedFileID,
     active_root: AtomicPtr<ActiveRoot<M>>,
     mutable_inflight: AtomicBool,
-    io_client: AIOClient<TableFsRequest>,
+    table_reads: AIOClient<ReadSubmission>,
+    background_writes: AIOClient<BackgroundWriteRequest>,
     codec: CowCodec<M>,
 }
 
@@ -177,7 +179,8 @@ impl<M> CowFile<M> {
         file_path: impl AsRef<str>,
         initial_size: usize,
         file_id: PersistedFileID,
-        io_client: AIOClient<TableFsRequest>,
+        table_reads: AIOClient<ReadSubmission>,
+        background_writes: AIOClient<BackgroundWriteRequest>,
         codec: CowCodec<M>,
         trunc: bool,
     ) -> Result<Self> {
@@ -191,7 +194,8 @@ impl<M> CowFile<M> {
             file_id,
             active_root: AtomicPtr::new(std::ptr::null_mut()),
             mutable_inflight: AtomicBool::new(false),
-            io_client,
+            table_reads,
+            background_writes,
             codec,
         })
     }
@@ -204,7 +208,8 @@ impl<M> CowFile<M> {
     pub(crate) fn open(
         file_path: impl AsRef<str>,
         file_id: PersistedFileID,
-        io_client: AIOClient<TableFsRequest>,
+        table_reads: AIOClient<ReadSubmission>,
+        background_writes: AIOClient<BackgroundWriteRequest>,
         codec: CowCodec<M>,
     ) -> Result<Self> {
         let file = SparseFile::open(file_path)?;
@@ -213,7 +218,8 @@ impl<M> CowFile<M> {
             file_id,
             active_root: AtomicPtr::new(std::ptr::null_mut()),
             mutable_inflight: AtomicBool::new(false),
-            io_client,
+            table_reads,
+            background_writes,
             codec,
         })
     }
@@ -286,7 +292,7 @@ impl<M> CowFile<M> {
             self.file.as_raw_fd(),
             offset,
             buf,
-            &self.io_client,
+            &self.background_writes,
         )
         .await
     }
@@ -298,12 +304,10 @@ impl<M> CowFile<M> {
 
     #[inline]
     pub(crate) async fn queue_read(&self, req: ReadSubmission) -> Result<()> {
-        match self.io_client.send_async(TableFsRequest::Read(req)).await {
+        match self.table_reads.send_async(req).await {
             Ok(()) => Ok(()),
             Err(err) => {
-                let TableFsRequest::Read(req) = err.into_inner() else {
-                    unreachable!("table worker returned unexpected readonly load request");
-                };
+                let req = err.into_inner();
                 req.fail(Error::SendError);
                 Err(Error::SendError)
             }

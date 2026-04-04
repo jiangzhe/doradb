@@ -1,7 +1,6 @@
 use super::{
     AIOClient, AIOError, AIOKind, AIOResult, BackendToken, IOBackend, IOBackendStats,
-    IOBackendStatsHandle, IOLaneConfig, IOWorkerBuilder, Operation, build_io_worker,
-    build_io_worker_lanes,
+    IOBackendStatsHandle, IOWorkerBuilder, Operation, build_io_worker,
 };
 use io_uring::{IoUring, opcode, squeue, types};
 use libc::{EAGAIN, EBUSY, EINTR};
@@ -63,16 +62,6 @@ impl IouringBackend {
     #[inline]
     pub fn io_worker<T>(self) -> (IOWorkerBuilder<T>, AIOClient<T>) {
         build_io_worker(self)
-    }
-
-    /// Builds a multi-lane IO worker builder plus one client per ingress lane.
-    #[allow(dead_code)]
-    #[inline]
-    pub(crate) fn io_worker_lanes<T>(
-        self,
-        lane_configs: &[IOLaneConfig],
-    ) -> AIOResult<(IOWorkerBuilder<T>, Vec<AIOClient<T>>)> {
-        build_io_worker_lanes(self, lane_configs)
     }
 }
 

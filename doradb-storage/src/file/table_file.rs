@@ -1,15 +1,16 @@
 use crate::bitmap::AllocMap;
-use crate::buffer::ReadonlyBufferPool;
+use crate::buffer::{ReadSubmission, ReadonlyBufferPool};
 use crate::catalog::{TableID, table::TableMetadata};
 use crate::error::{BlockCorruptionCause, BlockKind, Error, FileKind, Result};
-use crate::file::TableFsRequest;
 use crate::file::block_integrity::{
-    BlockIntegritySpec, max_payload_len, validate_block, write_block_checksum, write_block_header,
+    BLOCK_INTEGRITY_HEADER_SIZE, BlockIntegritySpec, max_payload_len, validate_block,
+    write_block_checksum, write_block_header,
 };
 use crate::file::cow_file::{
     ActiveRoot as GenericActiveRoot, BlockID, COW_FILE_PAGE_SIZE, CowCodec, CowFile,
     MutableCowFile, OldCowRoot, ParsedMeta, SUPER_BLOCK_ID, validate_active_meta_block_id,
 };
+use crate::file::fs::BackgroundWriteRequest;
 use crate::file::meta_block::{
     MetaBlock, MetaBlockSerView, TABLE_META_BLOCK_MAGIC_WORD, TABLE_META_BLOCK_VERSION,
 };
@@ -167,10 +168,7 @@ fn build_table_meta_block(root: &ActiveRoot) -> Result<DirectBuf> {
     }
     let meta_idx = write_block_header(meta_buf.as_bytes_mut(), TABLE_META_BLOCK_SPEC);
     let meta_idx = meta_block.ser(meta_buf.as_bytes_mut(), meta_idx);
-    debug_assert_eq!(
-        meta_idx,
-        crate::file::block_integrity::BLOCK_INTEGRITY_HEADER_SIZE + meta_len
-    );
+    debug_assert_eq!(meta_idx, BLOCK_INTEGRITY_HEADER_SIZE + meta_len);
     write_block_checksum(meta_buf.as_bytes_mut());
     Ok(meta_buf)
 }
@@ -218,7 +216,8 @@ impl TableFile {
         file_path: impl AsRef<str>,
         initial_size: usize,
         table_id: TableID,
-        io_client: AIOClient<TableFsRequest>,
+        table_reads: AIOClient<ReadSubmission>,
+        background_writes: AIOClient<BackgroundWriteRequest>,
         trunc: bool,
     ) -> Result<Self> {
         debug_assert!(initial_size.is_multiple_of(COW_FILE_PAGE_SIZE));
@@ -226,7 +225,8 @@ impl TableFile {
             file_path,
             initial_size,
             table_id,
-            io_client,
+            table_reads,
+            background_writes,
             table_codec(),
             trunc,
         )?;
@@ -237,9 +237,16 @@ impl TableFile {
     pub(super) fn open(
         file_path: impl AsRef<str>,
         table_id: TableID,
-        io_client: AIOClient<TableFsRequest>,
+        table_reads: AIOClient<ReadSubmission>,
+        background_writes: AIOClient<BackgroundWriteRequest>,
     ) -> Result<Self> {
-        let cow_file = CowFile::open(file_path, table_id, io_client, table_codec())?;
+        let cow_file = CowFile::open(
+            file_path,
+            table_id,
+            table_reads,
+            background_writes,
+            table_codec(),
+        )?;
         Ok(TableFile(cow_file))
     }
 

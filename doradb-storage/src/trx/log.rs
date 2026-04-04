@@ -4,7 +4,7 @@ use crate::file::{FileSyncer, SparseFile};
 use crate::free_list::FreeList;
 use crate::io::{
     AIOClient, AIOError, AIOKind, Completion, DirectBuf, IOBackendStats, IOBackendStatsHandle,
-    IOQueue, IOSubmission, IOWorkerBuilder, Operation, StorageBackend,
+    IOQueue, IOStateMachine, IOSubmission, IOWorkerBuilder, Operation, StorageBackend,
 };
 use crate::serde::Ser;
 use crate::session::SessionState;
@@ -210,7 +210,7 @@ impl LogIOStateMachine {
     }
 }
 
-impl crate::io::IOStateMachine for LogIOStateMachine {
+impl IOStateMachine for LogIOStateMachine {
     type Request = LogIORequest;
     type Key = TrxID;
     type Submission = LogWriteSubmission;
@@ -1080,10 +1080,10 @@ pub fn parse_file_seq(file_path: &Path) -> Result<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::buffer::{PageID, test_page_id};
+    use crate::buffer::{PageID, PoolRole, test_page_id};
     use crate::catalog::tests::table2;
     use crate::conf::{EngineConfig, EvictableBufferPoolConfig, TrxSysConfig};
-    use crate::engine::EngineRef;
+    use crate::engine::{Engine, EngineRef};
     use crate::file::{FileSyncKind, FileSyncOp, FileSyncTestHook, set_file_sync_test_hook};
     use crate::io::{
         AIOKind, StorageBackendOp, StorageBackendTestHook, set_storage_backend_test_hook,
@@ -1292,7 +1292,7 @@ mod tests {
     }
 
     impl FileSyncTestHook for ControlledFileSyncHook {
-        fn on_sync(&self, op: FileSyncOp, override_res: &mut Option<crate::error::Result<()>>) {
+        fn on_sync(&self, op: FileSyncOp, override_res: &mut Option<Result<()>>) {
             if !self.matches(op) {
                 return;
             }
@@ -1327,10 +1327,7 @@ mod tests {
         })
     }
 
-    async fn build_redo_test_engine(
-        log_file_stem: &str,
-        log_sync: LogSync,
-    ) -> (TempDir, crate::engine::Engine) {
+    async fn build_redo_test_engine(log_file_stem: &str, log_sync: LogSync) -> (TempDir, Engine) {
         let temp_dir = TempDir::new().unwrap();
         let engine = EngineConfig::default()
             .storage_root(temp_dir.path().to_path_buf())
@@ -1344,7 +1341,7 @@ mod tests {
             )
             .data_buffer(
                 EvictableBufferPoolConfig::default()
-                    .role(crate::buffer::PoolRole::Mem)
+                    .role(PoolRole::Mem)
                     .max_mem_size(64u64 * 1024 * 1024)
                     .max_file_size(128u64 * 1024 * 1024),
             )
@@ -1396,7 +1393,7 @@ mod tests {
                 )
                 .data_buffer(
                     EvictableBufferPoolConfig::default()
-                        .role(crate::buffer::PoolRole::Mem)
+                        .role(PoolRole::Mem)
                         .max_mem_size(64u64 * 1024 * 1024)
                         .max_file_size(128u64 * 1024 * 1024),
                 )
@@ -1469,7 +1466,7 @@ mod tests {
                 )
                 .data_buffer(
                     EvictableBufferPoolConfig::default()
-                        .role(crate::buffer::PoolRole::Mem)
+                        .role(PoolRole::Mem)
                         .max_mem_size(64u64 * 1024 * 1024)
                         .max_file_size(128u64 * 1024 * 1024),
                 )

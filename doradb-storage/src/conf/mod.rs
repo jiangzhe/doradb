@@ -1,8 +1,8 @@
 mod buffer;
 pub(crate) mod consts;
 mod engine;
+mod fs;
 pub(crate) mod path;
-mod table_fs;
 mod trx;
 
 pub use self::buffer::EvictableBufferPoolConfig;
@@ -12,5 +12,5 @@ pub use self::consts::{
     DEFAULT_SKIP_RECOVERY, MAX_LOG_PARTITIONS,
 };
 pub use self::engine::EngineConfig;
-pub use self::table_fs::TableFileSystemConfig;
+pub use self::fs::FileSystemConfig;
 pub use self::trx::TrxSysConfig;

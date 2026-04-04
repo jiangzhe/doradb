@@ -5,12 +5,12 @@ use crate::buffer::{
 use crate::catalog::Catalog;
 use crate::component::Supplier;
 use crate::error::Result;
-use crate::file::table_fs::TableFileSystem;
+use crate::file::fs::FileSystem;
 use crate::io::{StorageBackend, align_to_sector_size};
 use crate::quiescent::QuiescentGuard;
 use crate::trx::log::{LOG_HEADER_PAGES, LogPartitionInitializer, LogPartitionMode, LogSync};
 use crate::trx::purge::{GC, Purge};
-use crate::trx::recover::log_recover;
+use crate::trx::recover::{RecoveryDeps, log_recover};
 use crate::trx::sys::{TransactionSystem, TransactionSystemWorkers, TransactionSystemWorkersOwned};
 use byte_unit::Byte;
 use flume::{Receiver, Sender};
@@ -234,7 +234,7 @@ impl TrxSysConfig {
         meta_pool: QuiescentGuard<FixedBufferPool>,
         index_pool: QuiescentGuard<EvictableBufferPool>,
         mem_pool: QuiescentGuard<EvictableBufferPool>,
-        table_fs: QuiescentGuard<TableFileSystem>,
+        table_fs: QuiescentGuard<FileSystem>,
         global_disk_pool: QuiescentGuard<GlobalReadonlyBufferPool>,
         catalog: QuiescentGuard<Catalog>,
     ) -> Result<PendingTransactionSystem> {
@@ -253,7 +253,7 @@ impl TrxSysConfig {
 
         let (log_partitions, gc_rxs) = log_recover(
             &meta_pool,
-            crate::trx::recover::RecoveryDeps {
+            RecoveryDeps {
                 index_pool,
                 mem_pool: mem_pool.clone(),
                 table_fs,

@@ -54,6 +54,9 @@ pub(crate) trait Supplier<Down: Component>: Component {
 
 trait ErasedComponentBox: Send + Sync {
     fn shutdown(&self);
+
+    #[cfg(test)]
+    fn name(&self) -> &'static str;
 }
 
 struct TypedComponentBox<C: Component> {
@@ -64,6 +67,12 @@ impl<C: Component> ErasedComponentBox for TypedComponentBox<C> {
     #[inline]
     fn shutdown(&self) {
         C::shutdown(&self.owner);
+    }
+
+    #[cfg(test)]
+    #[inline]
+    fn name(&self) -> &'static str {
+        C::NAME
     }
 }
 
@@ -78,20 +87,20 @@ impl<C: Component> ErasedComponentBox for TypedComponentBox<C> {
 /// Current engine registration order:
 /// 1. `DiskPool`
 /// 2. `DiskPoolWorkers` -> `DiskPool`
-/// 3. `TableFileSystem`
-/// 4. `TableFileSystemWorkers` -> `TableFileSystem`
-/// 5. `MetaPool`
-/// 6. `IndexPool`
-/// 7. `IndexPoolWorkers` -> `IndexPool`
-/// 8. `MemPool`
+/// 3. `FileSystem`
+/// 4. `MetaPool`
+/// 5. `IndexPool`
+/// 6. `MemPool`
+/// 7. `FileSystemWorkers` -> `FileSystem`, `IndexPool`, `MemPool`
+/// 8. `IndexPoolWorkers` -> `IndexPool`
 /// 9. `MemPoolWorkers` -> `MemPool`
-/// 10. `Catalog` -> `MetaPool`, `TableFileSystem`, `DiskPool`
+/// 10. `Catalog` -> `MetaPool`, `FileSystem`, `DiskPool`
 /// 11. `TransactionSystem` -> `MetaPool`, `IndexPool`, `MemPool`,
-///     `TableFileSystem`, `DiskPool`, `Catalog`
+///     `FileSystem`, `DiskPool`, `Catalog`
 /// 12. `TransactionSystemWorkers` -> `TransactionSystem`
 ///
 /// In addition to the direct component edges above, `Catalog` owns user-table
-/// runtimes that retain guards into `MemPool`, `IndexPool`, `TableFileSystem`,
+/// runtimes that retain guards into `MemPool`, `IndexPool`, `FileSystem`,
 /// and `DiskPool`. That is why `Catalog` must be registered after those pool
 /// and file components: reverse shutdown and drop must release table-owned
 /// guards before the underlying pool owners are torn down.
@@ -328,6 +337,15 @@ impl ComponentRegistry {
         for component in self.boxed_vec.iter().rev() {
             component.shutdown();
         }
+    }
+
+    #[cfg(test)]
+    #[inline]
+    pub(crate) fn component_names(&self) -> Vec<&'static str> {
+        self.boxed_vec
+            .iter()
+            .map(|component| component.name())
+            .collect()
     }
 }
 

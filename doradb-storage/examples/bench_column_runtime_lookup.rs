@@ -4,7 +4,7 @@ use doradb_storage::catalog::{
     ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexSpec, TableSpec,
 };
 use doradb_storage::conf::{
-    EngineConfig, EvictableBufferPoolConfig, TableFileSystemConfig, TrxSysConfig,
+    EngineConfig, EvictableBufferPoolConfig, FileSystemConfig, TrxSysConfig,
 };
 use doradb_storage::engine::Engine;
 use doradb_storage::error::FileKind;
@@ -89,7 +89,7 @@ async fn build_case(
                 .skip_recovery(true),
         )
         .file(
-            TableFileSystemConfig::default()
+            FileSystemConfig::default()
                 .io_depth(16)
                 .readonly_buffer_size(128 * 1024 * 1024)
                 .data_dir("."),
