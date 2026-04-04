@@ -560,15 +560,21 @@ impl TableFsStateMachine {
     ) -> AIOKind {
         match sub {
             TableFsSubmission::Write(mut sub) => {
+                let expected_len = sub.operation.len();
                 let buf = sub
                     .operation
                     .take_buf()
                     .expect("write operation must still own its direct buffer");
+                debug_assert_eq!(expected_len, buf.capacity());
                 match res {
                     Ok(len) => {
-                        debug_assert!(len == buf.capacity());
                         drop(buf);
-                        sub.completion.complete(Ok(()));
+                        let result = if len == expected_len {
+                            Ok(())
+                        } else {
+                            Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof).into())
+                        };
+                        sub.completion.complete(result);
                     }
                     Err(err) => {
                         drop(buf);
@@ -830,5 +836,42 @@ mod tests {
         drop(file);
         let file = SparseFile::open(&file_path).unwrap();
         drop(file);
+    }
+
+    #[test]
+    fn test_table_fs_write_completion_succeeds_on_full_write() {
+        let mut state_machine = TableFsStateMachine::new();
+        let (submission, waiter) = WriteSubmission::prepare(
+            BlockKey::new(0, BlockID::new(1)),
+            0,
+            0,
+            DirectBuf::zeroed(STORAGE_SECTOR_SIZE),
+        );
+        let expected_len = submission.operation.len();
+
+        let kind =
+            state_machine.on_complete(TableFsSubmission::Write(submission), Ok(expected_len));
+
+        assert_eq!(kind, AIOKind::Write);
+        assert!(smol::block_on(waiter).is_ok());
+    }
+
+    #[test]
+    fn test_table_fs_write_completion_rejects_short_write() {
+        let mut state_machine = TableFsStateMachine::new();
+        let (submission, waiter) = WriteSubmission::prepare(
+            BlockKey::new(0, BlockID::new(1)),
+            0,
+            0,
+            DirectBuf::zeroed(STORAGE_SECTOR_SIZE),
+        );
+        let expected_len = submission.operation.len();
+        assert!(expected_len > 0);
+
+        let kind =
+            state_machine.on_complete(TableFsSubmission::Write(submission), Ok(expected_len - 1));
+
+        assert_eq!(kind, AIOKind::Write);
+        assert!(matches!(smol::block_on(waiter), Err(Error::IOError)));
     }
 }
