@@ -32,8 +32,8 @@ and `FileSystemWorkers`, but eviction ownership is still fragmented:
 3. `IndexPoolWorkers` starts one mutable evictor thread.
 
 This remaining fragmentation is mostly lifecycle and scheduling overhead rather
-than algorithm duplication. `buffer/evictor.rs` already provides a generic
-`EvictionRuntime`, `PressureDeltaClockPolicy`, and `Evictor<T>` used by both
+than algorithm duplication. `buffer/evictor.rs` already provides the shared
+`EvictionRuntime` contract and `PressureDeltaClockPolicy` used by both
 readonly and mutable pools. What remains pool-local today is wakeup ownership,
 shutdown plumbing, and `execute()` semantics.
 
@@ -80,8 +80,8 @@ Optional issue metadata for `tools/issue.rs create-issue-from-doc`:
 4. Folding backlog `000071` wrapper cleanup into this task.
 5. Broad telemetry, starvation benchmarks, or service-level observability work
    reserved for RFC-0013 Phase 4.
-6. Removing isolated test-only helpers that start local evictor threads for
-   standalone readonly or evictable pool tests.
+6. Reworking unrelated readonly or evictable pool tests beyond what is needed
+   to remove the dead single-pool evictor path.
 
 ## Unsafe Considerations (If Applicable)
 
@@ -117,8 +117,6 @@ Reference:
 
 1. Extend `doradb-storage/src/buffer/evictor.rs` with a shared multi-domain
    runner.
-   - Keep the existing single-runtime `Evictor<T>` path for local tests and
-     other simple callers.
    - Add a shared runner that owns one policy per pool and rotates domains in
      round-robin order when multiple pools currently report pending pressure.
    - The scheduler should only select pools whose own policy currently decides
@@ -158,12 +156,11 @@ Reference:
    8. `Catalog`
    9. `TransactionSystem`
    10. `TransactionSystemWorkers`
-6. Preserve local standalone test helpers where they remain useful.
-   - `StartedGlobalReadonlyBufferPool` and similar isolated pool test owners
-     may continue to spawn local evictor threads in test-only code.
-   - Registry-backed engine/filesystem test helpers should migrate to the new
-     production shared component instead of reassembling the old three-worker
-     topology.
+6. Remove the legacy single-pool evictor path once the shared runner lands.
+   - Local standalone test helpers should use plain owned pools unless they
+     need production worker behavior.
+   - Production-path eviction coverage should migrate to engine/filesystem
+     setup instead of reassembling private worker topology in tests.
 7. Encode the cache-performance constraint directly in tests and review.
    - The shared thread must only reconsider which pressured pool runs next.
    - It must not force eviction in a pool that would be idle under its own
@@ -181,8 +178,13 @@ Reference:
    `doradb-storage/src/buffer/readonly.rs` now expose shared-domain builders
    plus one optional shared wake handle in residency state. Production-path
    pressure notifications now wake both the existing local event and the
-   shared event when installed, while standalone started-pool helpers keep
-   using the local single-pool `Evictor<T>` path in tests.
+   shared event when installed. The legacy single-pool `Evictor<T>` loop and
+   its local spawn helpers were then removed, and readonly eviction coverage
+   now uses the production engine path instead of a private test worker. The
+   mutable `EvictableRuntime` wrapper was then collapsed to the same
+   `ArenaGuard + SyncQuiescentGuard<Pool>` shape already used by
+   `ReadonlyRuntime`, removing duplicated cached sub-handles without changing
+   behavior.
 3. Production registry wiring now registers exactly one
    `shared_pool_evictor_workers` component. `DiskPool` no longer auto-builds
    a readonly worker component, and engine/filesystem test builders now use
@@ -235,6 +237,3 @@ Reference:
 1. RFC-0013 Phase 4 should add broader fairness telemetry and observability so
    shared-evictor scheduling can be reviewed against real workloads without
    turning this task into a tuning program.
-2. Backlog `000071-collapse-evictor-runtime-wrappers-to-arena-plus-pool-guards`
-   remains the intended follow-up for internal runtime-wrapper cleanup after
-   the shared topology lands.

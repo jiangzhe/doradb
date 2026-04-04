@@ -32,3 +32,11 @@ When a backlog item is moved to `docs/backlogs/closed/`, append:
 - Reference: <task/issue/pr reference>
 - Closed At: <YYYY-MM-DD>
 ```
+
+## Close Reason
+
+- Type: implemented
+- Detail: EvictableRuntime now matches ReadonlyRuntime's arena-plus-pool wrapper shape, so backlog 000071 is fully satisfied by the shared-evictor follow-up in PR #525.
+- Closed By: backlog close
+- Reference: docs/tasks/000107-shared-multi-pool-evictor.md; PR #525
+- Closed At: 2026-04-04

@@ -335,6 +335,6 @@ Reference:
 
 1. Private evictor runtime wrappers in `evict.rs` and `readonly.rs` still cache
    selected pool sub-handles even though the worker can retain `ArenaGuard +
-   SyncQuiescentGuard<Pool>` and derive the rest on demand. This cleanup is
-   deferred to backlog `000071`:
-   `docs/backlogs/000071-collapse-evictor-runtime-wrappers-to-arena-plus-pool-guards.md`.
+   SyncQuiescentGuard<Pool>` and derive the rest on demand. This cleanup was
+   later tracked and closed as backlog `000071`:
+   `docs/backlogs/closed/000071-collapse-evictor-runtime-wrappers-to-arena-plus-pool-guards.md`.

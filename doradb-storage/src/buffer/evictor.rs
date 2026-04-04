@@ -544,10 +544,6 @@ pub(super) trait EvictionRuntime {
     /// Returns recent allocation-failure ratio used as eviction pressure signal.
     fn allocation_failure_rate(&self) -> f64;
 
-    /// Returns a listener notified when eviction work may become available.
-    #[allow(dead_code)]
-    fn work_listener(&self) -> EventListener;
-
     /// Emits post-eviction progress notifications to blocked alloc/load waiters.
     fn notify_progress(&self);
 
@@ -684,88 +680,6 @@ impl SharedEvictionDomain {
         }
         self.runtime.notify_progress();
         true
-    }
-}
-
-/// Generic eviction runner shared by mutable and readonly pools.
-#[allow(dead_code)]
-pub(super) struct Evictor<T> {
-    runtime: T,
-    policy: PressureDeltaClockPolicy,
-    shutdown_flag: Arc<AtomicBool>,
-}
-
-#[allow(dead_code)]
-impl<T> Evictor<T>
-where
-    T: EvictionRuntime + Send + 'static,
-{
-    #[inline]
-    pub(super) fn new(
-        runtime: T,
-        policy: PressureDeltaClockPolicy,
-        shutdown_flag: Arc<AtomicBool>,
-    ) -> Self {
-        Evictor {
-            runtime,
-            policy,
-            shutdown_flag,
-        }
-    }
-
-    #[inline]
-    pub(super) fn start_thread(self, thread_name: &'static str) -> JoinHandle<()> {
-        thread::spawn_named(thread_name, move || self.run())
-    }
-
-    #[inline]
-    fn wait_for_work(&self) -> bool {
-        // Register listener before re-checking pressure to avoid missed wakeups.
-        let listener = self.runtime.work_listener();
-        if self.shutdown_flag.load(Ordering::Acquire) {
-            return false;
-        }
-        if self.policy.decide_batch(&self.runtime).is_some() {
-            return true;
-        }
-        listener.wait();
-        !self.shutdown_flag.load(Ordering::Acquire)
-    }
-
-    #[inline]
-    pub(super) fn run(mut self) {
-        loop {
-            if self.shutdown_flag.load(Ordering::Acquire) {
-                return;
-            }
-
-            let target = match self.policy.decide_batch(&self.runtime) {
-                Some(target) if target > 0 => target,
-                _ => {
-                    if !self.wait_for_work() {
-                        return;
-                    }
-                    continue;
-                }
-            };
-
-            let candidates = self.policy.select_candidates(&self.runtime, target);
-            if candidates.is_empty() {
-                if !self.wait_for_work() {
-                    return;
-                }
-                continue;
-            }
-
-            let waiter = self.runtime.execute(candidates);
-            if self.shutdown_flag.load(Ordering::Acquire) {
-                return;
-            }
-            if let Some(waiter) = waiter {
-                waiter.wait();
-            }
-            self.runtime.notify_progress();
-        }
     }
 }
 
@@ -1037,7 +951,6 @@ mod tests {
         capacity: usize,
         inflight: usize,
         failure_rate: f64,
-        wake: Arc<Event>,
     }
 
     impl MockRuntime {
@@ -1047,7 +960,6 @@ mod tests {
                 capacity,
                 inflight: 0,
                 failure_rate: 0.0,
-                wake: Arc::new(Event::new()),
             }
         }
     }
@@ -1067,10 +979,6 @@ mod tests {
 
         fn allocation_failure_rate(&self) -> f64 {
             self.failure_rate
-        }
-
-        fn work_listener(&self) -> EventListener {
-            self.wake.listen()
         }
 
         fn notify_progress(&self) {}

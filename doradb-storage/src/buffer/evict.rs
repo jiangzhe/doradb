@@ -1,8 +1,8 @@
 use crate::bitmap::AllocMap;
 use crate::buffer::arena::{ArenaGuard, QuiescentArena};
 use crate::buffer::evictor::{
-    ClockHand, EvictionArbiter, EvictionRuntime, Evictor, FailureRateTracker,
-    PressureDeltaClockPolicy, SharedEvictionDomain, clock_collect_batch, clock_sweep_candidate,
+    ClockHand, EvictionArbiter, EvictionRuntime, FailureRateTracker, PressureDeltaClockPolicy,
+    SharedEvictionDomain, clock_collect_batch, clock_sweep_candidate,
 };
 use crate::buffer::frame::{BufferFrame, FrameKind};
 use crate::buffer::guard::{FacadePageGuard, PageExclusiveGuard, PageGuard, PageLatchGuard};
@@ -33,15 +33,15 @@ use std::mem;
 use std::os::fd::{AsRawFd, RawFd};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::thread::JoinHandle;
 // min buffer pool size is 64KB * 128 = 8MB.
 const MIN_IN_MEM_PAGES: usize = 128;
 
 /// EvictableBufferPool is a buffer pool which can evict
 /// pages to disk.
 ///
-/// The pool owns page/frame state and its eviction thread, while all actual file
-/// IO is routed through the shared storage worker exposed by [`FileSystem`].
+/// The pool owns page/frame state, while all actual file IO is routed through
+/// the shared storage worker exposed by [`FileSystem`] and eviction scheduling
+/// runs under the shared pool evictor.
 pub struct EvictableBufferPool {
     // Takes care of page allocation and deallocation.
     alloc_map: AllocMap,
@@ -221,31 +221,17 @@ impl EvictableBufferPool {
     #[inline]
     fn evictor_parts(
         pool: SyncQuiescentGuard<Self>,
-    ) -> (EvictableRuntime, PressureDeltaClockPolicy, Arc<AtomicBool>) {
-        let shutdown_flag = Arc::clone(&pool.shutdown_flag);
+    ) -> (EvictableRuntime, PressureDeltaClockPolicy) {
         let policy =
             PressureDeltaClockPolicy::new(pool.in_mem.eviction_arbiter, MIN_IN_MEM_PAGES / 2);
         let runtime = EvictableRuntime {
             arena: pool.arena.arena_guard(pool.pool_guard()),
-            in_mem: Arc::clone(&pool.in_mem),
-            fs: pool.fs.clone(),
-            inflight_io: Arc::clone(&pool.inflight_io),
-            role: pool.role,
-            stats: pool.stats.clone(),
-            _pool: Some(pool),
+            pool,
         };
-        (runtime, policy, shutdown_flag)
+        (runtime, policy)
     }
 
-    /// Start the dedicated eviction thread for one registered pool.
-    #[inline]
-    #[allow(dead_code)]
-    fn spawn_evict_thread_guarded(pool: SyncQuiescentGuard<Self>) -> JoinHandle<()> {
-        let (runtime, policy, shutdown_flag) = Self::evictor_parts(pool);
-        Evictor::new(runtime, policy, shutdown_flag).start_thread("EvictableBufferPoolEvictor")
-    }
-
-    /// Signal the pool-local eviction thread to stop.
+    /// Signal this pool's participation in eviction work to stop.
     #[inline]
     pub(super) fn signal_shutdown(&self) {
         self.shutdown_flag.store(true, Ordering::SeqCst);
@@ -259,7 +245,7 @@ impl EvictableBufferPool {
 
     #[inline]
     pub(super) fn shared_evictor_domain(pool: SyncQuiescentGuard<Self>) -> SharedEvictionDomain {
-        let (runtime, policy, _) = Self::evictor_parts(pool);
+        let (runtime, policy) = Self::evictor_parts(pool);
         SharedEvictionDomain::new(runtime, policy)
     }
 
@@ -739,28 +725,26 @@ impl IOStateMachine for EvictablePoolStateMachine {
 /// Evictor-facing runtime that routes selected writeback through `FileSystem`.
 struct EvictableRuntime {
     arena: ArenaGuard,
-    in_mem: Arc<InMemPageSet>,
-    inflight_io: Arc<InflightIO>,
-    fs: QuiescentGuard<FileSystem>,
-    role: PoolRole,
-    stats: BufferPoolStatsHandle,
-    _pool: Option<SyncQuiescentGuard<EvictableBufferPool>>,
+    pool: SyncQuiescentGuard<EvictableBufferPool>,
 }
 
 impl EvictableRuntime {
     /// Send one eviction writeback batch to the shared storage worker.
     #[inline]
     fn dispatch_io_writes(&self, page_guards: Vec<PageExclusiveGuard<Page>>) -> EventListener {
-        self.stats.add_queued_writes(page_guards.len());
-        self.inflight_io.batch_writes(&page_guards);
+        self.pool.stats.add_queued_writes(page_guards.len());
+        self.pool.inflight_io.batch_writes(&page_guards);
         let done_ev = Arc::new(EventNotifyOnDrop::new());
         let listener = done_ev.listen();
         if let Err((page_guards, done_ev)) =
-            self.fs
-                .send_pool_batch_write(self.role, page_guards, done_ev)
+            self.pool
+                .fs
+                .send_pool_batch_write(self.pool.role, page_guards, done_ev)
         {
             for page_guard in page_guards {
-                self.inflight_io.fail_writeback(&self.stats, page_guard);
+                self.pool
+                    .inflight_io
+                    .fail_writeback(&self.pool.stats, page_guard);
             }
             drop(done_ev);
         }
@@ -771,34 +755,29 @@ impl EvictableRuntime {
 impl EvictionRuntime for EvictableRuntime {
     #[inline]
     fn resident_count(&self) -> usize {
-        self.in_mem.count.load(Ordering::Acquire)
+        self.pool.in_mem.count.load(Ordering::Acquire)
     }
 
     #[inline]
     fn capacity(&self) -> usize {
-        self.in_mem.max_count
+        self.pool.in_mem.max_count
     }
 
     #[inline]
     fn inflight_evicts(&self) -> usize {
-        self.inflight_io.writes.load(Ordering::Relaxed)
+        self.pool.inflight_io.writes.load(Ordering::Relaxed)
     }
 
     #[inline]
     fn allocation_failure_rate(&self) -> f64 {
-        self.in_mem.alloc_failure_rate()
-    }
-
-    #[inline]
-    fn work_listener(&self) -> EventListener {
-        self.in_mem.evict_ev.listen()
+        self.pool.in_mem.alloc_failure_rate()
     }
 
     #[inline]
     fn notify_progress(&self) {
-        let in_mem_count = self.in_mem.count.load(Ordering::Acquire);
-        if in_mem_count < self.in_mem.max_count {
-            self.in_mem.load_ev.notify(1);
+        let in_mem_count = self.pool.in_mem.count.load(Ordering::Acquire);
+        if in_mem_count < self.pool.in_mem.max_count {
+            self.pool.in_mem.load_ev.notify(1);
         }
     }
 
@@ -809,7 +788,7 @@ impl EvictionRuntime for EvictableRuntime {
         limit: usize,
         out: &mut Vec<PageID>,
     ) -> Option<ClockHand> {
-        self.in_mem.collect_batch_ids(hand, limit, out)
+        self.pool.in_mem.collect_batch_ids(hand, limit, out)
     }
 
     #[inline]
@@ -828,7 +807,7 @@ impl EvictionRuntime for EvictableRuntime {
                 // Keep inflight map ordering consistent with write path.
                 let page_id = page_guard.page_id();
                 let waiter_completion = {
-                    let mut g = self.inflight_io.map.lock();
+                    let mut g = self.pool.inflight_io.map.lock();
                     let waiter_completion = if matches!(
                         g.get(&page_id).map(|status| status.kind),
                         Some(IOKind::ReadWaitForWrite)
@@ -842,7 +821,7 @@ impl EvictionRuntime for EvictableRuntime {
                         None
                     };
                     debug_assert!(page_guard.bf().kind() == FrameKind::Evicting);
-                    self.in_mem.evict_page(page_guard);
+                    self.pool.in_mem.evict_page(page_guard);
                     waiter_completion
                 };
                 if let Some(completion) = waiter_completion {
@@ -1829,12 +1808,7 @@ pub(crate) mod tests {
 
             let runtime = EvictableRuntime {
                 arena: owner.arena.arena_guard(owner.pool_guard()),
-                in_mem: Arc::clone(&owner.in_mem),
-                inflight_io: Arc::clone(&owner.inflight_io),
-                fs: owner.fs.clone(),
-                role: owner.role,
-                stats: owner.stats.clone(),
-                _pool: Some(owner.guard().into_sync()),
+                pool: owner.guard().into_sync(),
             };
 
             let listener = runtime.dispatch_io_writes(vec![page_guard]);
