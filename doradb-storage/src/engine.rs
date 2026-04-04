@@ -5,7 +5,7 @@
 //! `docs/engine-component-lifetime.md` for the runtime-versus-owner lifetime
 //! model that this module and [`crate::component::ComponentRegistry`] enforce.
 use crate::buffer::PoolRole;
-use crate::buffer::{IndexPoolWorkers, MemPoolWorkers};
+use crate::buffer::SharedPoolEvictorWorkers;
 use crate::catalog::Catalog;
 use crate::component::{
     ComponentRegistry, DiskPoolConfig, IndexPoolConfig, MetaPoolConfig, RegistryBuilder,
@@ -311,8 +311,7 @@ impl EngineConfig {
             )
             .await?;
         builder.build::<FileSystemWorkers>(()).await?;
-        builder.build::<IndexPoolWorkers>(()).await?;
-        builder.build::<MemPoolWorkers>(()).await?;
+        builder.build::<SharedPoolEvictorWorkers>(()).await?;
         // Catalog owns user-table runtimes, and those runtimes retain buffer-pool
         // guards for row/index/readonly access. Register catalog after the pools it
         // can pin so reverse shutdown/drop order releases table guards before pool
@@ -390,7 +389,7 @@ mod tests {
     }
 
     #[test]
-    fn test_engine_component_order_uses_shared_storage_workers() {
+    fn test_engine_component_order_uses_shared_storage_and_evictor_workers() {
         smol::block_on(async {
             let root = TempDir::new().unwrap();
             let engine = test_engine_config_for(root.path()).build().await.unwrap();
@@ -399,14 +398,12 @@ mod tests {
                 engine.components().component_names(),
                 vec![
                     "disk_pool",
-                    "disk_pool_workers",
                     "fs",
                     "meta_pool",
                     "index_pool",
                     "mem_pool",
                     "fs_workers",
-                    "index_pool_workers",
-                    "mem_pool_workers",
+                    "shared_pool_evictor_workers",
                     "catalog",
                     "trx_sys",
                     "trx_sys_workers",

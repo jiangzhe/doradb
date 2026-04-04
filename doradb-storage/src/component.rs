@@ -86,18 +86,16 @@ impl<C: Component> ErasedComponentBox for TypedComponentBox<C> {
 ///
 /// Current engine registration order:
 /// 1. `DiskPool`
-/// 2. `DiskPoolWorkers` -> `DiskPool`
-/// 3. `FileSystem`
-/// 4. `MetaPool`
-/// 5. `IndexPool`
-/// 6. `MemPool`
-/// 7. `FileSystemWorkers` -> `FileSystem`, `IndexPool`, `MemPool`
-/// 8. `IndexPoolWorkers` -> `IndexPool`
-/// 9. `MemPoolWorkers` -> `MemPool`
-/// 10. `Catalog` -> `MetaPool`, `FileSystem`, `DiskPool`
-/// 11. `TransactionSystem` -> `MetaPool`, `IndexPool`, `MemPool`,
-///     `FileSystem`, `DiskPool`, `Catalog`
-/// 12. `TransactionSystemWorkers` -> `TransactionSystem`
+/// 2. `FileSystem`
+/// 3. `MetaPool`
+/// 4. `IndexPool`
+/// 5. `MemPool`
+/// 6. `FileSystemWorkers` -> `FileSystem`, `IndexPool`, `MemPool`
+/// 7. `SharedPoolEvictorWorkers` -> `DiskPool`, `IndexPool`, `MemPool`
+/// 8. `Catalog` -> `MetaPool`, `FileSystem`, `DiskPool`
+/// 9. `TransactionSystem` -> `MetaPool`, `IndexPool`, `MemPool`, `FileSystem`,
+///    `DiskPool`, `Catalog`
+/// 10. `TransactionSystemWorkers` -> `TransactionSystem`
 ///
 /// In addition to the direct component edges above, `Catalog` owns user-table
 /// runtimes that retain guards into `MemPool`, `IndexPool`, `FileSystem`,

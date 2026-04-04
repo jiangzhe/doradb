@@ -466,10 +466,10 @@ Backend-touching phases must also run the supported alternate backend pass:
     unchanged.
   - Non-goals: No merger of pool eviction algorithms; no fusion with the shared
     I/O worker; no change to readonly drop-only eviction semantics.
-  - Task Doc: `docs/tasks/TBD.md`
-  - Task Issue: `#0`
-  - Phase Status: `pending`
-  - Implementation Summary: `pending`
+  - Task Doc: `docs/tasks/000107-shared-multi-pool-evictor.md`
+  - Task Issue: `#524`
+  - Phase Status: done
+  - Implementation Summary: Implemented the shared multi-pool evictor by adding one `SharedPoolEvictorWorkers` component after `FileSystemWorkers`, preserving one pool-local policy/clock-hand per pool, routing readonly/mem/index pressure through one shared wake event, removing the old per-pool production evictor-owner components, and validating both the default and `libaio` backends. [Task Resolve Sync: docs/tasks/000107-shared-multi-pool-evictor.md @ 2026-04-04]
 
 - **Phase 4: Validation, Stats, And Documentation Hardening**
   - Scope: Add starvation-focused shared-I/O tests, multi-pool wakeup and

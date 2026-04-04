@@ -2,7 +2,7 @@ use crate::bitmap::AllocMap;
 use crate::buffer::arena::{ArenaGuard, QuiescentArena};
 use crate::buffer::evictor::{
     ClockHand, EvictionArbiter, EvictionRuntime, Evictor, FailureRateTracker,
-    PressureDeltaClockPolicy, clock_collect_batch, clock_sweep_candidate,
+    PressureDeltaClockPolicy, SharedEvictionDomain, clock_collect_batch, clock_sweep_candidate,
 };
 use crate::buffer::frame::{BufferFrame, FrameKind};
 use crate::buffer::guard::{FacadePageGuard, PageExclusiveGuard, PageGuard, PageLatchGuard};
@@ -13,7 +13,7 @@ use crate::buffer::{
     BufferPool, BufferPoolStats, BufferPoolStatsHandle, PageIOCompletion, PoolGuard, PoolIdentity,
     PoolRole, RowPoolRole,
 };
-use crate::component::{Component, ComponentRegistry, ShelfScope, Supplier};
+use crate::component::Supplier;
 use crate::conf::EvictableBufferPoolConfig;
 use crate::conf::path::{path_to_utf8, validate_swap_file_path_candidate};
 use crate::error::Validation::Valid;
@@ -23,7 +23,7 @@ use crate::file::fs::{FileSystem, FileSystemWorkers};
 use crate::io::{AIOKind, IOBackendStats, IOQueue, IOStateMachine, IOSubmission, Operation};
 use crate::latch::{GuardState, LatchFallbackMode};
 use crate::notify::EventNotifyOnDrop;
-use crate::quiescent::{QuiescentBox, QuiescentGuard, SyncQuiescentGuard};
+use crate::quiescent::{QuiescentGuard, SyncQuiescentGuard};
 use crate::{IndexPool, MemPool};
 use event_listener::{Event, EventListener, listener};
 use parking_lot::Mutex;
@@ -61,24 +61,6 @@ pub struct EvictableBufferPool {
     stats: BufferPoolStatsHandle,
     role: PoolRole,
     arena: QuiescentArena,
-}
-
-/// Lifecycle component that owns the mem-pool evictor thread.
-pub(crate) struct MemPoolWorkers;
-
-/// Registered shutdown state for the mem-pool evictor thread.
-pub(crate) struct MemPoolWorkersOwned {
-    pool: SyncQuiescentGuard<EvictableBufferPool>,
-    evict_thread: Mutex<Option<JoinHandle<()>>>,
-}
-
-/// Lifecycle component that owns the index-pool evictor thread.
-pub(crate) struct IndexPoolWorkers;
-
-/// Registered shutdown state for the index-pool evictor thread.
-pub(crate) struct IndexPoolWorkersOwned {
-    pool: SyncQuiescentGuard<EvictableBufferPool>,
-    evict_thread: Mutex<Option<JoinHandle<()>>>,
 }
 
 impl EvictableBufferPool {
@@ -152,7 +134,7 @@ impl EvictableBufferPool {
                                 if !self.in_mem.try_inc() {
                                     self.in_mem.record_alloc_failure();
                                     // Still no budget. Ask evictor to work and wait for progress.
-                                    self.in_mem.evict_ev.notify(1);
+                                    self.in_mem.notify_evictor();
                                     drop(page_guard);
                                     DispatchAction::WaitForLoad(listener)
                                 } else {
@@ -236,9 +218,13 @@ impl EvictableBufferPool {
         Ok(())
     }
 
-    /// Start the dedicated eviction thread for one registered pool.
     #[inline]
-    fn spawn_evict_thread_guarded(pool: SyncQuiescentGuard<Self>) -> JoinHandle<()> {
+    fn evictor_parts(
+        pool: SyncQuiescentGuard<Self>,
+    ) -> (EvictableRuntime, PressureDeltaClockPolicy, Arc<AtomicBool>) {
+        let shutdown_flag = Arc::clone(&pool.shutdown_flag);
+        let policy =
+            PressureDeltaClockPolicy::new(pool.in_mem.eviction_arbiter, MIN_IN_MEM_PAGES / 2);
         let runtime = EvictableRuntime {
             arena: pool.arena.arena_guard(pool.pool_guard()),
             in_mem: Arc::clone(&pool.in_mem),
@@ -246,19 +232,35 @@ impl EvictableBufferPool {
             inflight_io: Arc::clone(&pool.inflight_io),
             role: pool.role,
             stats: pool.stats.clone(),
-            _pool: Some(pool.clone()),
+            _pool: Some(pool),
         };
-        let policy =
-            PressureDeltaClockPolicy::new(pool.in_mem.eviction_arbiter, MIN_IN_MEM_PAGES / 2);
-        Evictor::new(runtime, policy, Arc::clone(&pool.shutdown_flag))
-            .start_thread("EvictableBufferPoolEvictor")
+        (runtime, policy, shutdown_flag)
+    }
+
+    /// Start the dedicated eviction thread for one registered pool.
+    #[inline]
+    #[allow(dead_code)]
+    fn spawn_evict_thread_guarded(pool: SyncQuiescentGuard<Self>) -> JoinHandle<()> {
+        let (runtime, policy, shutdown_flag) = Self::evictor_parts(pool);
+        Evictor::new(runtime, policy, shutdown_flag).start_thread("EvictableBufferPoolEvictor")
     }
 
     /// Signal the pool-local eviction thread to stop.
     #[inline]
-    fn signal_shutdown(&self) {
+    pub(super) fn signal_shutdown(&self) {
         self.shutdown_flag.store(true, Ordering::SeqCst);
-        self.in_mem.evict_ev.notify(1);
+        self.in_mem.notify_evictor();
+    }
+
+    #[inline]
+    pub(super) fn install_shared_evictor_wake(&self, wake_event: Arc<Event>) {
+        self.in_mem.install_shared_wake(wake_event);
+    }
+
+    #[inline]
+    pub(super) fn shared_evictor_domain(pool: SyncQuiescentGuard<Self>) -> SharedEvictionDomain {
+        let (runtime, policy, _) = Self::evictor_parts(pool);
+        SharedEvictionDomain::new(runtime, policy)
     }
 
     /// Reserve a page in memory.
@@ -280,7 +282,7 @@ impl EvictableBufferPool {
             }
             self.in_mem.record_alloc_failure();
             // Notify evictor thread to work.
-            self.in_mem.evict_ev.notify(1);
+            self.in_mem.notify_evictor();
             listener.await;
         }
     }
@@ -558,80 +560,8 @@ unsafe impl Send for EvictableBufferPool {}
 // thread-safe primitives and stable arena-owned frame/page memory.
 unsafe impl Sync for EvictableBufferPool {}
 
-impl Component for MemPoolWorkers {
-    type Config = ();
-    type Owned = MemPoolWorkersOwned;
-    type Access = ();
-
-    const NAME: &'static str = "mem_pool_workers";
-
-    /// Start the mem-pool evictor after the pool component has registered.
-    #[inline]
-    async fn build(
-        _config: Self::Config,
-        registry: &mut ComponentRegistry,
-        _shelf: ShelfScope<'_, Self>,
-    ) -> Result<()> {
-        let pool = registry.dependency::<MemPool>()?;
-        let sync_pool = pool.clone_inner().into_sync();
-        let evict_thread = EvictableBufferPool::spawn_evict_thread_guarded(sync_pool.clone());
-        registry.register::<Self>(MemPoolWorkersOwned {
-            pool: sync_pool,
-            evict_thread: Mutex::new(Some(evict_thread)),
-        })
-    }
-
-    #[inline]
-    fn access(_owner: &QuiescentBox<Self::Owned>) -> Self::Access {}
-
-    /// Stop the mem-pool evictor thread after signaling shutdown.
-    #[inline]
-    fn shutdown(component: &Self::Owned) {
-        component.pool.signal_shutdown();
-        if let Some(handle) = component.evict_thread.lock().take() {
-            handle.join().unwrap();
-        }
-    }
-}
-
 impl Supplier<FileSystemWorkers> for MemPool {
     type Provision = SparseFile;
-}
-
-impl Component for IndexPoolWorkers {
-    type Config = ();
-    type Owned = IndexPoolWorkersOwned;
-    type Access = ();
-
-    const NAME: &'static str = "index_pool_workers";
-
-    /// Start the index-pool evictor after the pool component has registered.
-    #[inline]
-    async fn build(
-        _config: Self::Config,
-        registry: &mut ComponentRegistry,
-        _shelf: ShelfScope<'_, Self>,
-    ) -> Result<()> {
-        let pool = registry.dependency::<IndexPool>()?;
-        let sync_pool = pool.clone_inner().into_sync();
-        let evict_thread = EvictableBufferPool::spawn_evict_thread_guarded(sync_pool.clone());
-        registry.register::<Self>(IndexPoolWorkersOwned {
-            pool: sync_pool,
-            evict_thread: Mutex::new(Some(evict_thread)),
-        })
-    }
-
-    #[inline]
-    fn access(_owner: &QuiescentBox<Self::Owned>) -> Self::Access {}
-
-    /// Stop the index-pool evictor thread after signaling shutdown.
-    #[inline]
-    fn shutdown(component: &Self::Owned) {
-        component.pool.signal_shutdown();
-        if let Some(handle) = component.evict_thread.lock().take() {
-            handle.join().unwrap();
-        }
-    }
 }
 
 impl Supplier<FileSystemWorkers> for IndexPool {
@@ -945,6 +875,8 @@ struct InMemPageSet {
     // Event to notify evictor thread to choose page candidates,
     // write to disk and release memory.
     evict_ev: Event,
+    // Optional shared wake event used by the production shared evictor.
+    shared_evict_wake: Mutex<Option<Arc<Event>>>,
 }
 
 impl InMemPageSet {
@@ -958,6 +890,7 @@ impl InMemPageSet {
             set: Mutex::new(BTreeSet::new()),
             load_ev: Event::new(),
             evict_ev: Event::new(),
+            shared_evict_wake: Mutex::new(None),
         }
     }
 
@@ -1005,6 +938,20 @@ impl InMemPageSet {
     #[inline]
     fn record_alloc_failure(&self) {
         self.alloc_failures.record_failure();
+    }
+
+    #[inline]
+    fn install_shared_wake(&self, wake_event: Arc<Event>) {
+        *self.shared_evict_wake.lock() = Some(wake_event);
+    }
+
+    #[inline]
+    fn notify_evictor(&self) {
+        let shared_wake = self.shared_evict_wake.lock().clone();
+        self.evict_ev.notify(1);
+        if let Some(shared_wake) = shared_wake {
+            shared_wake.notify(1);
+        }
     }
 
     /// Pin given page in memory.

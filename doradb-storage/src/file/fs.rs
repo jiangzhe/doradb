@@ -1501,7 +1501,7 @@ fn path_to_string(path: &Path, field: &str) -> String {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use crate::buffer::{IndexPoolWorkers, MemPoolWorkers, PoolRole};
+    use crate::buffer::{PoolRole, SharedPoolEvictorWorkers};
     use crate::catalog::{
         ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexSpec, USER_OBJ_ID_START,
     };
@@ -1617,8 +1617,7 @@ pub(crate) mod tests {
                 )
                 .await?;
             builder.build::<FileSystemWorkers>(()).await?;
-            builder.build::<IndexPoolWorkers>(()).await?;
-            builder.build::<MemPoolWorkers>(()).await?;
+            builder.build::<SharedPoolEvictorWorkers>(()).await?;
             let registry = builder.finish()?;
             let fs = registry.dependency::<FileSystem>()?;
             Ok(TestFileSystem {

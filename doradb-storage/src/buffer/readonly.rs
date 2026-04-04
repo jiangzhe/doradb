@@ -2,7 +2,8 @@ use crate::buffer::PersistedFileID;
 use crate::buffer::arena::{ArenaGuard, QuiescentArena};
 use crate::buffer::evictor::{
     ClockHand, EvictionArbiter, EvictionArbiterBuilder, EvictionRuntime, Evictor,
-    FailureRateTracker, PressureDeltaClockPolicy, clock_collect_batch, clock_sweep_candidate,
+    FailureRateTracker, PressureDeltaClockPolicy, SharedEvictionDomain, clock_collect_batch,
+    clock_sweep_candidate,
 };
 use crate::buffer::frame::{BufferFrame, FrameKind};
 use crate::buffer::guard::{
@@ -15,14 +16,13 @@ use crate::buffer::{
     BufferPoolStats, BufferPoolStatsHandle, PageIOCompletion, PoolGuard, PoolIdentity, PoolRole,
     ReadonlyBlockValidator,
 };
-use crate::component::{Component, ComponentRegistry, ShelfScope};
 use crate::error::{Error, FileKind, Result};
 use crate::file::BlockID;
 use crate::file::multi_table_file::MultiTableFile;
 use crate::file::table_file::TableFile;
 use crate::io::{AIOKind, IOSubmission, Operation};
 use crate::latch::LatchFallbackMode;
-use crate::quiescent::{QuiescentBox, QuiescentGuard, SyncQuiescentGuard};
+use crate::quiescent::{QuiescentGuard, SyncQuiescentGuard};
 use dashmap::DashMap;
 use dashmap::mapref::entry::Entry;
 use event_listener::{Event, EventListener, listener};
@@ -126,13 +126,6 @@ pub struct GlobalReadonlyBufferPool {
     role: PoolRole,
     stats: BufferPoolStatsHandle,
     arena: QuiescentArena,
-}
-
-pub(crate) struct DiskPoolWorkers;
-
-pub(crate) struct DiskPoolWorkersOwned {
-    pool: SyncQuiescentGuard<GlobalReadonlyBufferPool>,
-    evict_thread: Mutex<Option<JoinHandle<()>>>,
 }
 
 impl GlobalReadonlyBufferPool {
@@ -248,7 +241,7 @@ impl GlobalReadonlyBufferPool {
                 return Ok(frame_id);
             }
             self.residency.record_alloc_failure();
-            self.residency.evict_ev.notify(1);
+            self.residency.notify_evictor();
             listener.await;
             if self.shutdown_flag.load(Ordering::Acquire) {
                 return Err(Error::InvalidState);
@@ -442,26 +435,46 @@ impl GlobalReadonlyBufferPool {
     }
 
     #[inline]
+    fn evictor_parts(
+        pool: SyncQuiescentGuard<Self>,
+    ) -> (ReadonlyRuntime, PressureDeltaClockPolicy, Arc<AtomicBool>) {
+        let shutdown_flag = Arc::clone(&pool.shutdown_flag);
+        let policy = PressureDeltaClockPolicy::new(pool.eviction_arbiter, 1);
+        let runtime = ReadonlyRuntime {
+            arena: pool.arena.arena_guard(pool.pool_guard()),
+            pool,
+        };
+        (runtime, policy, shutdown_flag)
+    }
+
+    #[inline]
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn spawn_evictor_thread_guarded(pool: QuiescentGuard<Self>) -> JoinHandle<()> {
         // Acquire one direct guard from the stable owner, convert it once to
         // `SyncQuiescentGuard`, then clone that wrapper into the spawned
         // thread/runtime. This keeps worker startup on the guard side without
         // rebuilding a static-ownership compatibility layer.
-        let pool = pool.into_sync();
-        let runtime = ReadonlyRuntime {
-            arena: pool.arena.arena_guard(pool.pool_guard()),
-            pool: pool.clone(),
-        };
-        let policy = PressureDeltaClockPolicy::new(pool.eviction_arbiter, 1);
-        let evictor = Evictor::new(runtime, policy, Arc::clone(&pool.shutdown_flag));
+        let (runtime, policy, shutdown_flag) = Self::evictor_parts(pool.into_sync());
+        let evictor = Evictor::new(runtime, policy, shutdown_flag);
         evictor.start_thread("ReadonlyBufferPoolEvictor")
     }
 
     #[inline]
-    fn signal_shutdown(&self) {
+    pub(super) fn signal_shutdown(&self) {
         self.shutdown_flag.store(true, Ordering::SeqCst);
         self.residency.free_ev.notify(usize::MAX);
-        self.residency.evict_ev.notify(1);
+        self.residency.notify_evictor();
+    }
+
+    #[inline]
+    pub(super) fn install_shared_evictor_wake(&self, wake_event: Arc<Event>) {
+        self.residency.install_shared_wake(wake_event);
+    }
+
+    #[inline]
+    pub(super) fn shared_evictor_domain(pool: SyncQuiescentGuard<Self>) -> SharedEvictionDomain {
+        let (runtime, policy, _) = Self::evictor_parts(pool);
+        SharedEvictionDomain::new(runtime, policy)
     }
 
     #[inline]
@@ -577,41 +590,6 @@ unsafe impl Send for GlobalReadonlyBufferPool {}
 // latch-protected frames.
 unsafe impl Sync for GlobalReadonlyBufferPool {}
 
-impl Component for DiskPoolWorkers {
-    type Config = ();
-    type Owned = DiskPoolWorkersOwned;
-    type Access = ();
-
-    const NAME: &'static str = "disk_pool_workers";
-
-    #[inline]
-    async fn build(
-        _config: Self::Config,
-        registry: &mut ComponentRegistry,
-        _shelf: ShelfScope<'_, Self>,
-    ) -> Result<()> {
-        let pool = registry.dependency::<crate::DiskPool>()?;
-        let sync_pool = pool.clone_inner().into_sync();
-        let evict_thread =
-            GlobalReadonlyBufferPool::spawn_evictor_thread_guarded(pool.into_inner());
-        registry.register::<Self>(DiskPoolWorkersOwned {
-            pool: sync_pool,
-            evict_thread: Mutex::new(Some(evict_thread)),
-        })
-    }
-
-    #[inline]
-    fn access(_owner: &QuiescentBox<Self::Owned>) -> Self::Access {}
-
-    #[inline]
-    fn shutdown(component: &Self::Owned) {
-        component.pool.signal_shutdown();
-        if let Some(handle) = component.evict_thread.lock().take() {
-            handle.join().unwrap();
-        }
-    }
-}
-
 #[derive(Clone, Copy)]
 struct InflightLoadValidation {
     file_kind: FileKind,
@@ -711,7 +689,7 @@ impl PageReservation for ReadonlyPageReservation {
         drop(page_guard);
         pool.residency.mark_resident(frame_id);
         if pool.residency.no_free_frame() {
-            pool.residency.evict_ev.notify(1);
+            pool.residency.notify_evictor();
         }
         Ok(frame_id)
     }
@@ -888,6 +866,7 @@ struct ReadonlyResidency {
     alloc_failures: FailureRateTracker,
     free_ev: Event,
     evict_ev: Event,
+    shared_evict_wake: Mutex<Option<Arc<Event>>>,
 }
 
 impl ReadonlyResidency {
@@ -904,6 +883,7 @@ impl ReadonlyResidency {
             alloc_failures: FailureRateTracker::new(eviction_arbiter.failure_window()),
             free_ev: Event::new(),
             evict_ev: Event::new(),
+            shared_evict_wake: Mutex::new(None),
         }
     }
 
@@ -979,6 +959,20 @@ impl ReadonlyResidency {
     #[inline]
     fn alloc_failure_rate(&self) -> f64 {
         self.alloc_failures.failure_rate()
+    }
+
+    #[inline]
+    fn install_shared_wake(&self, wake_event: Arc<Event>) {
+        *self.shared_evict_wake.lock() = Some(wake_event);
+    }
+
+    #[inline]
+    fn notify_evictor(&self) {
+        let shared_wake = self.shared_evict_wake.lock().clone();
+        self.evict_ev.notify(1);
+        if let Some(shared_wake) = shared_wake {
+            shared_wake.notify(1);
+        }
     }
 
     #[inline]
