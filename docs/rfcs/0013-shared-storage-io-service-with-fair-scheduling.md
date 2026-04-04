@@ -52,11 +52,11 @@ therefore keep reclaiming headroom and starve unrelated reads. [D2], [C1],
 Thread count is also fragmented on the eviction side. `mem_pool`,
 `index_pool`, and the global readonly pool each start a dedicated evictor
 thread. At the same time, the repository already has one generic
-`EvictionRuntime` abstraction and one generic `Evictor<T>` runner shared by
+`EvictionRuntime` abstraction and shared pressure-delta clock policy across
 mutable and readonly pools. That means the existing design already separates
-pool-local eviction logic from the thread that runs it; what remains
-per-thread today is mainly wakeup, loop ownership, and one `ClockHand` plus
-policy instance per pool. [D1], [D6], [C5], [C7], [C8], [U5], [U6], [U7]
+pool-local eviction logic from thread ownership; what remains per-thread today
+is mainly wakeup, loop ownership, and one `ClockHand` plus policy instance per
+pool. [D1], [D6], [C5], [C7], [C8], [U5], [U6], [U7]
 
 Lifecycle ownership is another blocker for a drop-in merge. Today
 `DiskPoolWorkers`, `TableFileSystemWorkers`, `IndexPoolWorkers`, and
@@ -126,8 +126,8 @@ Optional issue metadata for `tools/issue.rs create-issue-from-doc`:
 - [C6] `doradb-storage/src/component.rs` and `doradb-storage/src/engine.rs` -
   current component registration order and reverse-order shutdown/drop.
 - [C7] `doradb-storage/src/buffer/evictor.rs` - generic `EvictionRuntime`,
-  `PressureDeltaClockPolicy`, and `Evictor<T>` loop already shared across pool
-  types.
+  `PressureDeltaClockPolicy`, and shared scheduler implementation points across
+  pool types.
 - [C8] `doradb-storage/src/buffer/readonly.rs` - global readonly pool has its
   own dedicated evictor thread, no dedicated I/O worker, and different
   drop-only eviction behavior.
@@ -296,9 +296,9 @@ ownership, scheduling, and wakeup. [D2], [D3], [D4], [C2], [C5], [C7], [C8],
 - Analysis: This captures the most obvious I/O-layer consolidation and is lower
   risk than changing both I/O and eviction topology at once. It still leaves
   three mostly lightweight dedicated evictor threads in place, even though the
-  repository already has a generic `Evictor<T>` abstraction and the user
-  explicitly wants thread-count reduction on the eviction side as well. [C5],
-  [C7], [C8], [U5], [U6], [U7]
+  repository already shares the eviction runtime contract across pool types and
+  the user explicitly wants thread-count reduction on the eviction side as
+  well. [C5], [C7], [C8], [U5], [U6], [U7]
 - Why Not Chosen: The selected runtime boundary now explicitly includes shared
   eviction execution, and leaving evictors separate would preserve avoidable
   thread overhead after the harder part of shared ownership has already landed.
@@ -309,8 +309,8 @@ ownership, scheduling, and wakeup. [D2], [D3], [D4], [C2], [C5], [C7], [C8],
 - Summary: Share one evictor thread for the two mutable pools and keep the
   global readonly pool on its own evictor thread.
 - Analysis: This minimizes behavioral differences because readonly eviction is
-  drop-only and uses a different residency model. However, `EvictionRuntime`
-  and `Evictor<T>` are already generic across mutable and readonly pools, so
+  drop-only and uses a different residency model. However, the eviction
+  runtime contract is already shared across mutable and readonly pools, so
   keeping readonly separate would preserve one dedicated thread mainly because
   of historical ownership rather than because of a strong abstraction barrier.
   [C7], [C8], [U6], [U7]
@@ -466,10 +466,10 @@ Backend-touching phases must also run the supported alternate backend pass:
     unchanged.
   - Non-goals: No merger of pool eviction algorithms; no fusion with the shared
     I/O worker; no change to readonly drop-only eviction semantics.
-  - Task Doc: `docs/tasks/TBD.md`
-  - Task Issue: `#0`
-  - Phase Status: `pending`
-  - Implementation Summary: `pending`
+  - Task Doc: `docs/tasks/000107-shared-multi-pool-evictor.md`
+  - Task Issue: `#524`
+  - Phase Status: done
+  - Implementation Summary: Implemented the shared multi-pool evictor by adding one `SharedPoolEvictorWorkers` component after `FileSystemWorkers`, preserving one pool-local policy/clock-hand per pool, routing readonly/mem/index pressure through one shared wake event, removing the old per-pool production evictor-owner components, and validating both the default and `libaio` backends. [Task Resolve Sync: docs/tasks/000107-shared-multi-pool-evictor.md @ 2026-04-04]
 
 - **Phase 4: Validation, Stats, And Documentation Hardening**
   - Scope: Add starvation-focused shared-I/O tests, multi-pool wakeup and

@@ -40,17 +40,15 @@ Engine startup resolves storage paths, validates layout markers, then registers
 components in one fixed dependency order:
 
 1. `DiskPool`
-2. `DiskPoolWorkers`
-3. `FileSystem`
-4. `MetaPool`
-5. `IndexPool`
-6. `MemPool`
-7. `FileSystemWorkers`
-8. `IndexPoolWorkers`
-9. `MemPoolWorkers`
-10. `Catalog`
-11. `TransactionSystem`
-12. `TransactionSystemWorkers`
+2. `FileSystem`
+3. `MetaPool`
+4. `IndexPool`
+5. `MemPool`
+6. `FileSystemWorkers`
+7. `SharedPoolEvictorWorkers`
+8. `Catalog`
+9. `TransactionSystem`
+10. `TransactionSystemWorkers`
 
 Registration order is the dependency order. Reverse registration order is both:
 

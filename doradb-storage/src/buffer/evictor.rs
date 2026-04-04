@@ -2,8 +2,12 @@ use crate::buffer::arena::ArenaGuard;
 use crate::buffer::frame::FrameKind;
 use crate::buffer::guard::PageExclusiveGuard;
 use crate::buffer::page::{Page, PageID};
+use crate::component::{Component, ComponentRegistry, ShelfScope};
+use crate::error::Result;
+use crate::quiescent::{QuiescentBox, SyncQuiescentGuard};
 use crate::thread;
-use event_listener::{EventListener, Listener};
+use crate::{DiskPool, IndexPool, MemPool};
+use event_listener::{Event, EventListener, Listener};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
@@ -540,9 +544,6 @@ pub(super) trait EvictionRuntime {
     /// Returns recent allocation-failure ratio used as eviction pressure signal.
     fn allocation_failure_rate(&self) -> f64;
 
-    /// Returns a listener notified when eviction work may become available.
-    fn work_listener(&self) -> EventListener;
-
     /// Emits post-eviction progress notifications to blocked alloc/load waiters.
     fn notify_progress(&self);
 
@@ -586,7 +587,7 @@ impl PressureDeltaClockPolicy {
     }
 
     #[inline]
-    fn decide_batch<T: EvictionRuntime>(&self, runtime: &T) -> Option<usize> {
+    fn decide_batch(&self, runtime: &dyn EvictionRuntime) -> Option<usize> {
         self.arbiter
             .decide(
                 runtime.resident_count(),
@@ -599,9 +600,9 @@ impl PressureDeltaClockPolicy {
     }
 
     #[inline]
-    fn select_candidates<T: EvictionRuntime>(
+    fn select_candidates(
         &mut self,
-        runtime: &T,
+        runtime: &dyn EvictionRuntime,
         target: usize,
     ) -> Vec<PageExclusiveGuard<Page>> {
         let mut batch_size = target;
@@ -639,43 +640,115 @@ impl PressureDeltaClockPolicy {
     }
 }
 
-/// Generic eviction runner shared by mutable and readonly pools.
-pub(super) struct Evictor<T> {
-    runtime: T,
+pub(super) struct SharedEvictionDomain {
+    runtime: Box<dyn EvictionRuntime + Send>,
     policy: PressureDeltaClockPolicy,
-    shutdown_flag: Arc<AtomicBool>,
 }
 
-impl<T> Evictor<T>
-where
-    T: EvictionRuntime + Send + 'static,
-{
+impl SharedEvictionDomain {
     #[inline]
-    pub(super) fn new(
-        runtime: T,
-        policy: PressureDeltaClockPolicy,
-        shutdown_flag: Arc<AtomicBool>,
-    ) -> Self {
-        Evictor {
-            runtime,
+    pub(super) fn new<T>(runtime: T, policy: PressureDeltaClockPolicy) -> Self
+    where
+        T: EvictionRuntime + Send + 'static,
+    {
+        SharedEvictionDomain {
+            runtime: Box::new(runtime),
             policy,
-            shutdown_flag,
         }
     }
 
     #[inline]
-    pub(super) fn start_thread(self, thread_name: &'static str) -> JoinHandle<()> {
-        thread::spawn_named(thread_name, move || self.run())
+    fn is_ready(&self) -> bool {
+        self.policy.decide_batch(self.runtime.as_ref()).is_some()
+    }
+
+    #[inline]
+    fn try_run_once(&mut self) -> bool {
+        let target = match self.policy.decide_batch(self.runtime.as_ref()) {
+            Some(target) if target > 0 => target,
+            _ => return false,
+        };
+
+        let candidates = self.policy.select_candidates(self.runtime.as_ref(), target);
+        if candidates.is_empty() {
+            return false;
+        }
+
+        let waiter = self.runtime.execute(candidates);
+        if let Some(waiter) = waiter {
+            waiter.wait();
+        }
+        self.runtime.notify_progress();
+        true
+    }
+}
+
+struct SharedEvictor {
+    domains: Vec<SharedEvictionDomain>,
+    shutdown_flag: Arc<AtomicBool>,
+    wake_event: Arc<Event>,
+    next_domain: usize,
+}
+
+impl SharedEvictor {
+    #[inline]
+    fn new(
+        domains: Vec<SharedEvictionDomain>,
+        shutdown_flag: Arc<AtomicBool>,
+        wake_event: Arc<Event>,
+    ) -> Self {
+        SharedEvictor {
+            domains,
+            shutdown_flag,
+            wake_event,
+            next_domain: 0,
+        }
+    }
+
+    #[inline]
+    fn start_thread(self) -> JoinHandle<()> {
+        thread::spawn_named("SharedPoolEvictor", move || self.run())
+    }
+
+    #[inline]
+    fn any_domain_ready(&self) -> bool {
+        self.domains.iter().any(SharedEvictionDomain::is_ready)
+    }
+
+    #[inline]
+    fn next_ready_domain_index(&mut self) -> Option<usize> {
+        let len = self.domains.len();
+        for _ in 0..len {
+            let idx = self.next_domain;
+            self.next_domain = (self.next_domain + 1) % len;
+            if self.domains[idx].is_ready() {
+                return Some(idx);
+            }
+        }
+        None
+    }
+
+    #[inline]
+    fn run_one_ready_domain(&mut self) -> bool {
+        let len = self.domains.len();
+        for _ in 0..len {
+            let Some(idx) = self.next_ready_domain_index() else {
+                return false;
+            };
+            if self.domains[idx].try_run_once() {
+                return true;
+            }
+        }
+        false
     }
 
     #[inline]
     fn wait_for_work(&self) -> bool {
-        // Register listener before re-checking pressure to avoid missed wakeups.
-        let listener = self.runtime.work_listener();
+        let listener = self.wake_event.listen();
         if self.shutdown_flag.load(Ordering::Acquire) {
             return false;
         }
-        if self.policy.decide_batch(&self.runtime).is_some() {
+        if self.any_domain_ready() {
             return true;
         }
         listener.wait();
@@ -683,38 +756,92 @@ where
     }
 
     #[inline]
-    pub(super) fn run(mut self) {
+    fn run(mut self) {
         loop {
             if self.shutdown_flag.load(Ordering::Acquire) {
                 return;
             }
-
-            let target = match self.policy.decide_batch(&self.runtime) {
-                Some(target) if target > 0 => target,
-                _ => {
-                    if !self.wait_for_work() {
-                        return;
-                    }
-                    continue;
-                }
-            };
-
-            let candidates = self.policy.select_candidates(&self.runtime, target);
-            if candidates.is_empty() {
-                if !self.wait_for_work() {
-                    return;
-                }
+            if self.run_one_ready_domain() {
                 continue;
             }
-
-            let waiter = self.runtime.execute(candidates);
-            if self.shutdown_flag.load(Ordering::Acquire) {
+            if !self.wait_for_work() {
                 return;
             }
-            if let Some(waiter) = waiter {
-                waiter.wait();
-            }
-            self.runtime.notify_progress();
+        }
+    }
+}
+
+pub(crate) struct SharedPoolEvictorWorkers;
+
+pub(crate) struct SharedPoolEvictorWorkersOwned {
+    disk_pool: SyncQuiescentGuard<crate::buffer::GlobalReadonlyBufferPool>,
+    index_pool: SyncQuiescentGuard<crate::buffer::EvictableBufferPool>,
+    mem_pool: SyncQuiescentGuard<crate::buffer::EvictableBufferPool>,
+    shutdown_flag: Arc<AtomicBool>,
+    wake_event: Arc<Event>,
+    evict_thread: Mutex<Option<JoinHandle<()>>>,
+}
+
+impl Component for SharedPoolEvictorWorkers {
+    type Config = ();
+    type Owned = SharedPoolEvictorWorkersOwned;
+    type Access = ();
+
+    const NAME: &'static str = "shared_pool_evictor_workers";
+
+    #[inline]
+    async fn build(
+        _config: Self::Config,
+        registry: &mut ComponentRegistry,
+        _shelf: ShelfScope<'_, Self>,
+    ) -> Result<()> {
+        let disk_pool = registry.dependency::<DiskPool>()?;
+        let index_pool = registry.dependency::<IndexPool>()?;
+        let mem_pool = registry.dependency::<MemPool>()?;
+
+        let disk_pool = disk_pool.clone_inner().into_sync();
+        let index_pool = index_pool.clone_inner().into_sync();
+        let mem_pool = mem_pool.clone_inner().into_sync();
+        let shutdown_flag = Arc::new(AtomicBool::new(false));
+        let wake_event = Arc::new(Event::new());
+
+        disk_pool.install_shared_evictor_wake(Arc::clone(&wake_event));
+        index_pool.install_shared_evictor_wake(Arc::clone(&wake_event));
+        mem_pool.install_shared_evictor_wake(Arc::clone(&wake_event));
+
+        let handle = SharedEvictor::new(
+            vec![
+                crate::buffer::GlobalReadonlyBufferPool::shared_evictor_domain(disk_pool.clone()),
+                crate::buffer::EvictableBufferPool::shared_evictor_domain(mem_pool.clone()),
+                crate::buffer::EvictableBufferPool::shared_evictor_domain(index_pool.clone()),
+            ],
+            Arc::clone(&shutdown_flag),
+            Arc::clone(&wake_event),
+        )
+        .start_thread();
+
+        registry.register::<Self>(SharedPoolEvictorWorkersOwned {
+            disk_pool,
+            index_pool,
+            mem_pool,
+            shutdown_flag,
+            wake_event,
+            evict_thread: Mutex::new(Some(handle)),
+        })
+    }
+
+    #[inline]
+    fn access(_owner: &QuiescentBox<Self::Owned>) -> Self::Access {}
+
+    #[inline]
+    fn shutdown(component: &Self::Owned) {
+        component.shutdown_flag.store(true, Ordering::SeqCst);
+        component.disk_pool.signal_shutdown();
+        component.index_pool.signal_shutdown();
+        component.mem_pool.signal_shutdown();
+        component.wake_event.notify(usize::MAX);
+        if let Some(handle) = component.evict_thread.lock().take() {
+            handle.join().unwrap();
         }
     }
 }
@@ -722,6 +849,8 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use event_listener::Event;
+    use std::sync::Arc;
 
     #[test]
     fn test_failure_rate_tracker_window() {
@@ -815,5 +944,104 @@ mod tests {
         // max_batch is normalized to be at least min_batch.
         assert_eq!(arbiter.min_batch, 9);
         assert_eq!(arbiter.max_batch, 9);
+    }
+
+    struct MockRuntime {
+        resident: usize,
+        capacity: usize,
+        inflight: usize,
+        failure_rate: f64,
+    }
+
+    impl MockRuntime {
+        fn new(resident: usize, capacity: usize) -> Self {
+            Self {
+                resident,
+                capacity,
+                inflight: 0,
+                failure_rate: 0.0,
+            }
+        }
+    }
+
+    impl EvictionRuntime for MockRuntime {
+        fn resident_count(&self) -> usize {
+            self.resident
+        }
+
+        fn capacity(&self) -> usize {
+            self.capacity
+        }
+
+        fn inflight_evicts(&self) -> usize {
+            self.inflight
+        }
+
+        fn allocation_failure_rate(&self) -> f64 {
+            self.failure_rate
+        }
+
+        fn notify_progress(&self) {}
+
+        fn collect_batch_ids(
+            &self,
+            _hand: ClockHand,
+            _limit: usize,
+            _out: &mut Vec<PageID>,
+        ) -> Option<ClockHand> {
+            panic!("selection is not exercised by this scheduler test")
+        }
+
+        fn try_mark_evicting(&self, _page_id: PageID) -> Option<PageExclusiveGuard<Page>> {
+            panic!("selection is not exercised by this scheduler test")
+        }
+
+        fn execute(&self, _pages: Vec<PageExclusiveGuard<Page>>) -> Option<EventListener> {
+            panic!("selection is not exercised by this scheduler test")
+        }
+    }
+
+    fn test_policy() -> PressureDeltaClockPolicy {
+        PressureDeltaClockPolicy::new(
+            EvictionArbiterBuilder::new()
+                .target_free(2)
+                .hysteresis(1)
+                .dynamic_batch_bounds(1, 4)
+                .build(8),
+            1,
+        )
+    }
+
+    #[test]
+    fn test_shared_evictor_skips_idle_domains() {
+        let mut evictor = SharedEvictor::new(
+            vec![
+                SharedEvictionDomain::new(MockRuntime::new(4, 8), test_policy()),
+                SharedEvictionDomain::new(MockRuntime::new(7, 8), test_policy()),
+                SharedEvictionDomain::new(MockRuntime::new(3, 8), test_policy()),
+            ],
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(Event::new()),
+        );
+
+        assert_eq!(evictor.next_ready_domain_index(), Some(1));
+        assert_eq!(evictor.next_domain, 2);
+    }
+
+    #[test]
+    fn test_shared_evictor_rotates_across_ready_domains() {
+        let mut evictor = SharedEvictor::new(
+            vec![
+                SharedEvictionDomain::new(MockRuntime::new(7, 8), test_policy()),
+                SharedEvictionDomain::new(MockRuntime::new(7, 8), test_policy()),
+                SharedEvictionDomain::new(MockRuntime::new(4, 8), test_policy()),
+            ],
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(Event::new()),
+        );
+
+        assert_eq!(evictor.next_ready_domain_index(), Some(0));
+        assert_eq!(evictor.next_ready_domain_index(), Some(1));
+        assert_eq!(evictor.next_ready_domain_index(), Some(0));
     }
 }

@@ -23,15 +23,15 @@ pub(crate) use self::readonly::tests::{global_readonly_pool_scope, table_readonl
 pub(crate) use self::tests::test_page_id;
 pub use evict::EvictableBufferPool;
 pub(crate) use evict::{
-    EvictReadSubmission, EvictSubmission, EvictablePoolStateMachine, IndexPoolWorkers,
-    MemPoolWorkers, PoolRequest, build_pool_with_swap_file_field,
+    EvictReadSubmission, EvictSubmission, EvictablePoolStateMachine, PoolRequest,
+    build_pool_with_swap_file_field,
 };
+pub(crate) use evictor::SharedPoolEvictorWorkers;
 pub use evictor::{EvictionArbiter, EvictionArbiterBuilder};
 pub use fixed::FixedBufferPool;
 pub use identity::PoolRole;
 pub(crate) use identity::{PoolIdentity, RowPoolRole};
 pub use pool_guard::{PoolGuard, PoolGuards, PoolGuardsBuilder};
-pub(crate) use readonly::DiskPoolWorkers;
 pub(crate) use readonly::ReadSubmission;
 pub use readonly::{BlockKey, GlobalReadonlyBufferPool, ReadonlyBlockGuard, ReadonlyBufferPool};
 
@@ -598,13 +598,12 @@ impl Component for DiskPool {
     async fn build(
         config: Self::Config,
         registry: &mut ComponentRegistry,
-        mut shelf: ShelfScope<'_, Self>,
+        _shelf: ShelfScope<'_, Self>,
     ) -> Result<()> {
         registry.register::<Self>(GlobalReadonlyBufferPool::with_capacity(
             PoolRole::Disk,
             config.bytes,
-        )?)?;
-        DiskPoolWorkers::build((), registry, shelf.scope::<DiskPoolWorkers>()).await
+        )?)
     }
 
     #[inline]
