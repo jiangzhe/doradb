@@ -29,11 +29,115 @@ use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::result::Result as StdResult;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread::JoinHandle;
 
 const STORAGE_SERVICE_BACKLOG: usize = 10;
 const STORAGE_BACKGROUND_WRITE_BURST_LIMIT: usize = 1;
 const INVALID_SLOT: u32 = u32::MAX;
+
+/// Snapshot of shared-storage service ingress and scheduler activity.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct StorageServiceStats {
+    /// Number of admitted table-file or readonly-cache read requests.
+    pub table_read_requests: usize,
+    /// Number of admitted evictable-pool page-in read requests.
+    pub pool_read_requests: usize,
+    /// Number of admitted shared background-write requests.
+    pub background_write_requests: usize,
+    /// Number of scheduler turns consumed by the table-read lane.
+    pub table_read_turns: usize,
+    /// Number of scheduler turns consumed by the pool-read lane.
+    pub pool_read_turns: usize,
+    /// Number of scheduler turns consumed by the background-write lane.
+    pub background_write_turns: usize,
+}
+
+impl StorageServiceStats {
+    /// Returns the saturating delta from one earlier snapshot.
+    #[inline]
+    pub fn delta_since(self, earlier: StorageServiceStats) -> StorageServiceStats {
+        StorageServiceStats {
+            table_read_requests: self
+                .table_read_requests
+                .saturating_sub(earlier.table_read_requests),
+            pool_read_requests: self
+                .pool_read_requests
+                .saturating_sub(earlier.pool_read_requests),
+            background_write_requests: self
+                .background_write_requests
+                .saturating_sub(earlier.background_write_requests),
+            table_read_turns: self
+                .table_read_turns
+                .saturating_sub(earlier.table_read_turns),
+            pool_read_turns: self.pool_read_turns.saturating_sub(earlier.pool_read_turns),
+            background_write_turns: self
+                .background_write_turns
+                .saturating_sub(earlier.background_write_turns),
+        }
+    }
+}
+
+#[derive(Default)]
+struct StorageServiceStatsCounters {
+    table_read_requests: AtomicUsize,
+    pool_read_requests: AtomicUsize,
+    background_write_requests: AtomicUsize,
+    table_read_turns: AtomicUsize,
+    pool_read_turns: AtomicUsize,
+    background_write_turns: AtomicUsize,
+}
+
+#[derive(Clone, Default)]
+struct StorageServiceStatsHandle(Arc<StorageServiceStatsCounters>);
+
+impl StorageServiceStatsHandle {
+    #[inline]
+    fn snapshot(&self) -> StorageServiceStats {
+        StorageServiceStats {
+            table_read_requests: self.0.table_read_requests.load(Ordering::Relaxed),
+            pool_read_requests: self.0.pool_read_requests.load(Ordering::Relaxed),
+            background_write_requests: self.0.background_write_requests.load(Ordering::Relaxed),
+            table_read_turns: self.0.table_read_turns.load(Ordering::Relaxed),
+            pool_read_turns: self.0.pool_read_turns.load(Ordering::Relaxed),
+            background_write_turns: self.0.background_write_turns.load(Ordering::Relaxed),
+        }
+    }
+
+    #[inline]
+    fn record_request(&self, lane_id: StorageLaneId) {
+        match lane_id {
+            StorageLaneId::TableReads => {
+                self.0.table_read_requests.fetch_add(1, Ordering::Relaxed);
+            }
+            StorageLaneId::PoolReads => {
+                self.0.pool_read_requests.fetch_add(1, Ordering::Relaxed);
+            }
+            StorageLaneId::BackgroundWrites => {
+                self.0
+                    .background_write_requests
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    #[inline]
+    fn record_turn(&self, lane_id: StorageLaneId) {
+        match lane_id {
+            StorageLaneId::TableReads => {
+                self.0.table_read_turns.fetch_add(1, Ordering::Relaxed);
+            }
+            StorageLaneId::PoolReads => {
+                self.0.pool_read_turns.fetch_add(1, Ordering::Relaxed);
+            }
+            StorageLaneId::BackgroundWrites => {
+                self.0
+                    .background_write_turns
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+}
 
 /// Pool-read lane payload for one evictable-pool page-in request.
 pub(crate) enum PoolReadRequest {
@@ -419,6 +523,7 @@ struct StorageRequestScheduler {
     pool_reads: PoolReadLane,
     background_writes: BackgroundWriteLane,
     cursor: StorageLaneId,
+    stats: StorageServiceStatsHandle,
 }
 
 impl StorageRequestScheduler {
@@ -589,6 +694,7 @@ impl StorageRequestScheduler {
         io_depth: usize,
     ) {
         let lane_id = turn_start.lane_id();
+        self.stats.record_turn(lane_id);
         let headroom = io_depth - self.local_depth(queue, staged_slots_len, submitted);
         debug_assert!(headroom != 0);
         let mut budget = match lane_id {
@@ -673,6 +779,7 @@ impl StorageRequestScheduler {
                     break;
                 }
                 AIOMessage::Req(req) => {
+                    self.stats.record_request(StorageLaneId::TableReads);
                     let queue_len = queue.len();
                     self.table_reads.deferred_req =
                         state_machine.prepare_table_read_request(req, *budget, queue);
@@ -731,6 +838,7 @@ impl StorageRequestScheduler {
                     break;
                 }
                 AIOMessage::Req(req) => {
+                    self.stats.record_request(StorageLaneId::PoolReads);
                     let queue_len = queue.len();
                     self.pool_reads.deferred_req =
                         state_machine.prepare_pool_read_request(req, *budget, queue);
@@ -789,6 +897,7 @@ impl StorageRequestScheduler {
                     break;
                 }
                 AIOMessage::Req(req) => {
+                    self.stats.record_request(StorageLaneId::BackgroundWrites);
                     let queue_len = queue.len();
                     self.background_writes.deferred_req =
                         state_machine.prepare_background_write_request(req, *budget, queue);
@@ -928,6 +1037,7 @@ pub(crate) struct StorageIOWorkerBuilder<B = StorageBackend> {
     table_reads_rx: Receiver<AIOMessage<ReadSubmission>>,
     pool_reads_rx: Receiver<AIOMessage<PoolReadRequest>>,
     background_writes_rx: Receiver<AIOMessage<BackgroundWriteRequest>>,
+    stats: StorageServiceStatsHandle,
 }
 
 impl<B> StorageIOWorkerBuilder<B>
@@ -947,12 +1057,14 @@ where
         let (table_reads_rx, table_reads) = AIOClient::bounded(STORAGE_SERVICE_BACKLOG);
         let (pool_reads_rx, pool_reads) = AIOClient::bounded(STORAGE_SERVICE_BACKLOG);
         let (background_writes_rx, background_writes) = AIOClient::bounded(STORAGE_SERVICE_BACKLOG);
+        let stats = StorageServiceStatsHandle::default();
         (
             Self {
                 backend,
                 table_reads_rx,
                 pool_reads_rx,
                 background_writes_rx,
+                stats,
             },
             table_reads,
             pool_reads,
@@ -984,6 +1096,7 @@ where
                     shutdown: false,
                 },
                 cursor: StorageLaneId::TableReads,
+                stats: self.stats,
             },
             submitted: 0,
             staged_slots: VecDeque::new(),
@@ -1166,10 +1279,14 @@ pub(crate) fn build_file_system(
         StorageIOWorkerBuilder::new(backend);
     Ok((
         FileSystem::new(
-            table_reads,
-            pool_reads,
-            background_writes,
-            stats,
+            FileSystemSharedIo {
+                table_reads,
+                pool_reads,
+                background_writes,
+                io_backend_stats: stats,
+                storage_service_stats: builder.stats.clone(),
+                configured_io_depth: io_depth,
+            },
             data_dir,
             catalog_file_name,
         ),
@@ -1239,31 +1356,27 @@ impl Component for FileSystemWorkers {
 /// `FileSystem` owns the three ingress lane clients plus the shared backend
 /// stats handle. The backend itself remains owned by `fs_workers`.
 pub struct FileSystem {
-    table_reads: AIOClient<ReadSubmission>,
-    pool_reads: AIOClient<PoolReadRequest>,
-    background_writes: AIOClient<BackgroundWriteRequest>,
-    io_backend_stats: IOBackendStatsHandle,
+    shared_io: FileSystemSharedIo,
     data_dir: PathBuf,
     // Catalog multi-table file name.
     catalog_file_name: String,
 }
 
+struct FileSystemSharedIo {
+    table_reads: AIOClient<ReadSubmission>,
+    pool_reads: AIOClient<PoolReadRequest>,
+    background_writes: AIOClient<BackgroundWriteRequest>,
+    io_backend_stats: IOBackendStatsHandle,
+    storage_service_stats: StorageServiceStatsHandle,
+    configured_io_depth: usize,
+}
+
 impl FileSystem {
     /// Create the filesystem facade from prebuilt shared ingress clients.
     #[inline]
-    pub(crate) fn new(
-        table_reads: AIOClient<ReadSubmission>,
-        pool_reads: AIOClient<PoolReadRequest>,
-        background_writes: AIOClient<BackgroundWriteRequest>,
-        io_backend_stats: IOBackendStatsHandle,
-        data_dir: PathBuf,
-        catalog_file_name: String,
-    ) -> Self {
+    fn new(shared_io: FileSystemSharedIo, data_dir: PathBuf, catalog_file_name: String) -> Self {
         FileSystem {
-            table_reads,
-            pool_reads,
-            background_writes,
-            io_backend_stats,
+            shared_io,
             data_dir,
             catalog_file_name,
         }
@@ -1274,7 +1387,10 @@ impl FileSystem {
     pub(crate) fn table_io_clients(
         &self,
     ) -> (AIOClient<ReadSubmission>, AIOClient<BackgroundWriteRequest>) {
-        (self.table_reads.clone(), self.background_writes.clone())
+        (
+            self.shared_io.table_reads.clone(),
+            self.shared_io.background_writes.clone(),
+        )
     }
 
     #[inline]
@@ -1293,7 +1409,8 @@ impl FileSystem {
         req: EvictReadSubmission,
     ) -> StdResult<(), SendError<EvictReadSubmission>> {
         Self::assert_pool_role(role, "shared pool read dispatch");
-        self.pool_reads
+        self.shared_io
+            .pool_reads
             .send_async(match role {
                 PoolRole::Mem => PoolReadRequest::Mem(req),
                 PoolRole::Index => PoolReadRequest::Index(req),
@@ -1317,7 +1434,8 @@ impl FileSystem {
         done_ev: Arc<EventNotifyOnDrop>,
     ) -> StdResult<(), (Vec<PageExclusiveGuard<Page>>, Arc<EventNotifyOnDrop>)> {
         Self::assert_pool_role(role, "shared pool write dispatch");
-        self.background_writes
+        self.shared_io
+            .background_writes
             .send(match role {
                 PoolRole::Mem => BackgroundWriteRequest::MemPool(Box::new(
                     PoolBatchWriteRequest::new(page_guards, done_ev),
@@ -1343,9 +1461,9 @@ impl FileSystem {
     /// Signal shutdown to all shared ingress lanes.
     #[inline]
     fn shutdown_io_clients(&self) {
-        self.table_reads.shutdown();
-        self.pool_reads.shutdown();
-        self.background_writes.shutdown();
+        self.shared_io.table_reads.shutdown();
+        self.shared_io.pool_reads.shutdown();
+        self.shared_io.background_writes.shutdown();
     }
 
     /// Create a new table file.
@@ -1363,8 +1481,8 @@ impl FileSystem {
             &file_path,
             TABLE_FILE_INITIAL_SIZE,
             table_id,
-            self.table_reads.clone(),
-            self.background_writes.clone(),
+            self.shared_io.table_reads.clone(),
+            self.shared_io.background_writes.clone(),
             trunc,
         )?;
         let initial_pages = TABLE_FILE_INITIAL_SIZE / COW_FILE_PAGE_SIZE;
@@ -1425,7 +1543,19 @@ impl FileSystem {
     /// Returns one snapshot of backend-owned submit/wait activity.
     #[inline]
     pub fn io_backend_stats(&self) -> IOBackendStats {
-        self.io_backend_stats.snapshot()
+        self.shared_io.io_backend_stats.snapshot()
+    }
+
+    /// Returns one snapshot of shared-storage ingress and scheduler activity.
+    #[inline]
+    pub fn storage_service_stats(&self) -> StorageServiceStats {
+        self.shared_io.storage_service_stats.snapshot()
+    }
+
+    /// Returns the configured shared-storage worker IO depth.
+    #[inline]
+    pub fn configured_io_depth(&self) -> usize {
+        self.shared_io.configured_io_depth
     }
 
     /// Open existing catalog multi-table file or create a new one.
@@ -1501,7 +1631,12 @@ fn path_to_string(path: &Path, field: &str) -> String {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use crate::buffer::{PoolRole, SharedPoolEvictorWorkers};
+    use crate::buffer::guard::PageGuard;
+    use crate::buffer::page::Page;
+    use crate::buffer::{
+        BufferPool, PoolRole, SharedPoolEvictorWorkers, test_dispatch_dirty_pages,
+        test_persist_and_evict_page, test_raw_fd,
+    };
     use crate::catalog::{
         ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexSpec, USER_OBJ_ID_START,
     };
@@ -1509,9 +1644,22 @@ pub(crate) mod tests {
     use crate::conf::{EngineConfig, EvictableBufferPoolConfig, TrxSysConfig};
     use crate::engine::Engine;
     use crate::error::Error;
+    use crate::file::BlockID;
+    use crate::file::cow_file::COW_FILE_PAGE_SIZE;
+    use crate::file::table_file::TableFile;
+    use crate::io::{
+        AIOBuf, AIOKind, DirectBuf, StorageBackendOp, StorageBackendTestHook,
+        set_storage_backend_test_hook,
+    };
+    use crate::latch::LatchFallbackMode;
     use crate::value::ValKind;
     use crate::{DiskPool, IndexPool, MemPool, MetaPool};
     use std::ops::Deref;
+    use std::os::fd::RawFd;
+    use std::sync::Arc;
+    use std::sync::LazyLock;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::time::Duration;
     use tempfile::TempDir;
 
     const TEST_META_POOL_BYTES: usize = 32 * 1024 * 1024;
@@ -1520,6 +1668,8 @@ pub(crate) mod tests {
     const TEST_DATA_POOL_BYTES: usize = 64 * 1024 * 1024;
     const TEST_DATA_MAX_FILE_BYTES: usize = 128 * 1024 * 1024;
     const TEST_READONLY_BUFFER_BYTES: usize = 32 * 1024 * 1024;
+    const TEST_WAIT_RETRIES: usize = 2000;
+    const TEST_WAIT_INTERVAL: Duration = Duration::from_millis(1);
 
     pub(crate) struct TestFileSystem {
         fs: Option<QuiescentGuard<FileSystem>>,
@@ -1530,6 +1680,24 @@ pub(crate) mod tests {
         #[inline]
         pub(crate) fn shutdown(&self) {
             self.registry.shutdown_all();
+        }
+
+        #[inline]
+        pub(crate) fn disk_pool(&self) -> DiskPool {
+            self.registry.dependency::<DiskPool>().unwrap()
+        }
+
+        #[inline]
+        pub(crate) fn mem_pool(&self) -> QuiescentGuard<crate::buffer::EvictableBufferPool> {
+            self.registry.dependency::<MemPool>().unwrap().clone_inner()
+        }
+
+        #[inline]
+        pub(crate) fn index_pool(&self) -> QuiescentGuard<crate::buffer::EvictableBufferPool> {
+            self.registry
+                .dependency::<IndexPool>()
+                .unwrap()
+                .clone_inner()
         }
     }
 
@@ -1552,7 +1720,7 @@ pub(crate) mod tests {
 
     #[inline]
     pub(crate) fn io_backend_stats_handle_identity(fs: &FileSystem) -> usize {
-        fs.io_backend_stats.identity()
+        fs.shared_io.io_backend_stats.identity()
     }
 
     #[inline]
@@ -1643,12 +1811,303 @@ pub(crate) mod tests {
         .unwrap()
     }
 
+    fn make_metadata() -> Arc<TableMetadata> {
+        Arc::new(TableMetadata::new(
+            vec![ColumnSpec::new(
+                "c0",
+                ValKind::U32,
+                ColumnAttributes::empty(),
+            )],
+            vec![IndexSpec::new(
+                "idx_pk",
+                vec![IndexKey::new(0)],
+                IndexAttributes::PK,
+            )],
+        ))
+    }
+
+    async fn write_payload(table_file: &Arc<TableFile>, block_id: BlockID, payload: &[u8]) {
+        let mut buf = DirectBuf::zeroed(COW_FILE_PAGE_SIZE);
+        buf.as_bytes_mut()[..payload.len()].copy_from_slice(payload);
+        table_file.write_block(block_id, buf).await.unwrap();
+    }
+
+    static STORAGE_BACKEND_TEST_HOOK_LOCK: LazyLock<parking_lot::Mutex<()>> =
+        LazyLock::new(|| parking_lot::Mutex::new(()));
+
+    struct InstalledStorageBackendTestHook {
+        previous: Option<Arc<dyn StorageBackendTestHook>>,
+        guard: Option<parking_lot::MutexGuard<'static, ()>>,
+    }
+
+    impl Drop for InstalledStorageBackendTestHook {
+        #[inline]
+        fn drop(&mut self) {
+            let _ = set_storage_backend_test_hook(self.previous.take());
+            drop(self.guard.take());
+        }
+    }
+
+    fn install_storage_backend_test_hook(
+        hook: Arc<dyn StorageBackendTestHook>,
+    ) -> InstalledStorageBackendTestHook {
+        let guard = STORAGE_BACKEND_TEST_HOOK_LOCK.lock();
+        InstalledStorageBackendTestHook {
+            previous: set_storage_backend_test_hook(Some(hook)),
+            guard: Some(guard),
+        }
+    }
+
+    #[derive(Clone)]
+    struct ControlledStorageOpHook {
+        inner: Arc<ControlledStorageOpHookInner>,
+    }
+
+    struct ControlledStorageOpHookInner {
+        blocked_kind: AIOKind,
+        blocked_fd: RawFd,
+        submits: parking_lot::Mutex<Vec<StorageBackendOp>>,
+        submit_count: AtomicUsize,
+        submit_ev: event_listener::Event,
+        blocked_submits: AtomicUsize,
+        blocked_submit_ev: event_listener::Event,
+        released: AtomicBool,
+        release_ev: event_listener::Event,
+    }
+
+    impl ControlledStorageOpHook {
+        fn new(blocked_kind: AIOKind, blocked_fd: RawFd) -> Self {
+            Self {
+                inner: Arc::new(ControlledStorageOpHookInner {
+                    blocked_kind,
+                    blocked_fd,
+                    submits: parking_lot::Mutex::new(Vec::new()),
+                    submit_count: AtomicUsize::new(0),
+                    submit_ev: event_listener::Event::new(),
+                    blocked_submits: AtomicUsize::new(0),
+                    blocked_submit_ev: event_listener::Event::new(),
+                    released: AtomicBool::new(false),
+                    release_ev: event_listener::Event::new(),
+                }),
+            }
+        }
+
+        fn matches_blocked(&self, op: StorageBackendOp) -> bool {
+            op.kind() == self.inner.blocked_kind && op.fd() == self.inner.blocked_fd
+        }
+
+        fn submits(&self) -> Vec<StorageBackendOp> {
+            self.inner.submits.lock().clone()
+        }
+
+        async fn wait_for_submit_count(&self, expected: usize) {
+            loop {
+                if self.inner.submit_count.load(Ordering::SeqCst) >= expected {
+                    return;
+                }
+                event_listener::listener!(self.inner.submit_ev => listener);
+                if self.inner.submit_count.load(Ordering::SeqCst) >= expected {
+                    return;
+                }
+                listener.await;
+            }
+        }
+
+        async fn wait_for_blocked_submits(&self, expected: usize) {
+            loop {
+                if self.inner.blocked_submits.load(Ordering::SeqCst) >= expected {
+                    return;
+                }
+                event_listener::listener!(self.inner.blocked_submit_ev => listener);
+                if self.inner.blocked_submits.load(Ordering::SeqCst) >= expected {
+                    return;
+                }
+                listener.await;
+            }
+        }
+
+        fn release(&self) {
+            self.inner.released.store(true, Ordering::SeqCst);
+            self.inner.release_ev.notify(usize::MAX);
+        }
+    }
+
+    impl StorageBackendTestHook for ControlledStorageOpHook {
+        fn on_submit(&self, op: StorageBackendOp) {
+            self.inner.submits.lock().push(op);
+            self.inner.submit_count.fetch_add(1, Ordering::SeqCst);
+            self.inner.submit_ev.notify(usize::MAX);
+            if self.matches_blocked(op) {
+                self.inner.blocked_submits.fetch_add(1, Ordering::SeqCst);
+                self.inner.blocked_submit_ev.notify(usize::MAX);
+            }
+        }
+
+        fn on_complete(&self, op: StorageBackendOp, _res: &mut std::io::Result<usize>) {
+            if !self.matches_blocked(op) {
+                return;
+            }
+            loop {
+                if self.inner.released.load(Ordering::SeqCst) {
+                    break;
+                }
+                event_listener::listener!(self.inner.release_ev => listener);
+                if self.inner.released.load(Ordering::SeqCst) {
+                    break;
+                }
+                smol::block_on(listener);
+            }
+        }
+    }
+
+    async fn wait_until(mut predicate: impl FnMut() -> bool) {
+        for _ in 0..TEST_WAIT_RETRIES {
+            if predicate() {
+                return;
+            }
+            smol::Timer::after(TEST_WAIT_INTERVAL).await;
+        }
+        panic!("condition was not satisfied before timeout");
+    }
+
     #[test]
     fn test_table_file_system_shutdown_is_idempotent() {
         let (_temp_dir, fs) = build_test_fs();
 
         fs.shutdown();
         fs.shutdown();
+    }
+
+    #[test]
+    fn test_storage_service_reconsiders_table_reads_before_deferred_background_writes() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let fs = build_test_fs_with_config_in(
+                temp_dir.path(),
+                FileSystemConfig::default().io_depth(1),
+            )
+            .unwrap();
+
+            let table_file = fs.create_table_file(130, make_metadata(), false).unwrap();
+            let (table_file, old_root) = table_file.commit(1, false).await.unwrap();
+            drop(old_root);
+            write_payload(&table_file, BlockID::from(7usize), b"table-read").await;
+
+            let (reopened, readonly_pool) = fs
+                .open_table_file(130, fs.disk_pool().clone_inner())
+                .await
+                .unwrap();
+            let readonly_guard = readonly_pool.pool_guard();
+            let index_pool = fs.index_pool();
+            let background_fd = test_raw_fd(&index_pool);
+            let read_fd = reopened.raw_fd();
+            let stats_start = fs.storage_service_stats();
+            let hook = Arc::new(ControlledStorageOpHook::new(AIOKind::Write, background_fd));
+            let _hook = install_storage_backend_test_hook(hook.clone());
+
+            let writes_done = test_dispatch_dirty_pages(index_pool, 2).await;
+            hook.wait_for_blocked_submits(1).await;
+
+            let read_stats_start = readonly_pool.global_stats();
+            let readonly_probe = readonly_pool.clone();
+            let readonly_task = smol::spawn(async move {
+                let g = readonly_pool
+                    .read_block(&readonly_guard, BlockID::from(7usize))
+                    .await
+                    .unwrap();
+                g.page()[..10].to_vec()
+            });
+            wait_until(|| {
+                readonly_probe
+                    .global_stats()
+                    .delta_since(read_stats_start)
+                    .queued_reads
+                    == 1
+            })
+            .await;
+
+            hook.release();
+            hook.wait_for_submit_count(2).await;
+            let submits = hook.submits();
+            assert_eq!(submits[0].kind(), AIOKind::Write);
+            assert_eq!(submits[0].fd(), background_fd);
+            assert_eq!(submits[1].kind(), AIOKind::Read);
+            assert_eq!(submits[1].fd(), read_fd);
+
+            assert_eq!(readonly_task.await, b"table-read");
+            writes_done.await;
+
+            let delta = fs.storage_service_stats().delta_since(stats_start);
+            assert_eq!(delta.table_read_requests, 1);
+            assert_eq!(delta.pool_read_requests, 0);
+            assert_eq!(delta.background_write_requests, 1);
+            assert_eq!(delta.table_read_turns, 1);
+            assert_eq!(delta.pool_read_turns, 0);
+            assert_eq!(delta.background_write_turns, 2);
+        });
+    }
+
+    #[test]
+    fn test_storage_service_reconsiders_pool_reads_before_deferred_background_writes() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let fs = build_test_fs_with_config_in(
+                temp_dir.path(),
+                FileSystemConfig::default().io_depth(1),
+            )
+            .unwrap();
+
+            let mem_pool = fs.mem_pool();
+            let index_pool = fs.index_pool();
+            let reload_page_id = test_persist_and_evict_page(mem_pool.clone(), b"pool-read").await;
+            let background_fd = test_raw_fd(&index_pool);
+            let read_fd = test_raw_fd(&mem_pool);
+            let stats_start = fs.storage_service_stats();
+            let hook = Arc::new(ControlledStorageOpHook::new(AIOKind::Write, background_fd));
+            let _hook = install_storage_backend_test_hook(hook.clone());
+
+            let writes_done = test_dispatch_dirty_pages(index_pool, 2).await;
+            hook.wait_for_blocked_submits(1).await;
+
+            let read_stats_start = mem_pool.stats();
+            let mem_pool_probe = mem_pool.clone();
+            let pool_guard = mem_pool.pool_guard();
+            let reload_task = smol::spawn(async move {
+                let g = mem_pool
+                    .get_page::<Page>(&pool_guard, reload_page_id, LatchFallbackMode::Shared)
+                    .await
+                    .unwrap();
+                let g = g.lock_shared_async().await.unwrap();
+                g.page()[..9].to_vec()
+            });
+            wait_until(|| {
+                mem_pool_probe
+                    .stats()
+                    .delta_since(read_stats_start)
+                    .queued_reads
+                    == 1
+            })
+            .await;
+
+            hook.release();
+            hook.wait_for_submit_count(2).await;
+            let submits = hook.submits();
+            assert_eq!(submits[0].kind(), AIOKind::Write);
+            assert_eq!(submits[0].fd(), background_fd);
+            assert_eq!(submits[1].kind(), AIOKind::Read);
+            assert_eq!(submits[1].fd(), read_fd);
+
+            assert_eq!(reload_task.await, b"pool-read");
+            writes_done.await;
+
+            let delta = fs.storage_service_stats().delta_since(stats_start);
+            assert_eq!(delta.table_read_requests, 0);
+            assert_eq!(delta.pool_read_requests, 1);
+            assert_eq!(delta.background_write_requests, 1);
+            assert_eq!(delta.table_read_turns, 0);
+            assert_eq!(delta.pool_read_turns, 1);
+            assert_eq!(delta.background_write_turns, 2);
+        });
     }
 
     #[test]

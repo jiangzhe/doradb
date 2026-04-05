@@ -19,6 +19,19 @@ Backend-specific code only prepares kernel submission objects, stages them into
 the backend's submission format, submits batches, and decodes completions back
 into worker tokens.
 
+In the current runtime topology, the storage engine uses two storage-adjacent
+workers:
+
+- one shared `StorageIOWorker` for table-file reads/writes, readonly-cache miss
+  loads, and `mem_pool` / `index_pool` page IO; and
+- one dedicated redo-log worker for transaction-log writes.
+
+The shared storage worker exposes three logical lanes:
+
+- `table_reads`
+- `pool_reads`
+- `background_writes`
+
 ## Ownership Model
 
 One `crate::io::Operation` describes a single read or write:
@@ -71,13 +84,13 @@ Exactly one backend feature must be enabled at compile time.
 
 The current storage-engine integration points are:
 
-- table-file and catalog-file reads/writes in `src/file/` and
-  `src/file/table_fs.rs`;
-- buffer-pool page reads and writes in `src/buffer/`; and
+- table-file and catalog-file reads/writes in `src/file/`;
+- readonly-cache miss loads in `src/buffer/readonly.rs`;
+- evictable-pool page reads and writeback in `src/buffer/evict.rs`; and
 - redo-log writes in `src/trx/log.rs`.
 
-Each subsystem keeps its own request semantics and waiter model, but all of
-them submit work through the same completion core and backend contract.
+Table-file and buffer-pool traffic now share one storage service, while redo
+retains its own dedicated worker and durability policy.
 
 ## Redo Path
 
@@ -91,6 +104,18 @@ Redo-log writes use a dedicated backend-neutral worker:
 
 Fatal redo submit, write, or sync failures poison runtime admission through
 `StoragePoisonSource::{RedoSubmit, RedoWrite, RedoSync}`.
+
+## Telemetry
+
+Two layers of runtime-local storage telemetry are available:
+
+- `FileSystem::io_backend_stats()` reports backend-owned submit/wait activity.
+- `FileSystem::storage_service_stats()` reports shared-service ingress counts
+  and scheduler turns per lane.
+
+The shared pool evictor keeps separate wake/wait and per-domain execution
+counters through its component access handle, so diagnostics can distinguish
+shared-worker fairness from raw backend saturation.
 
 ## Operational Notes
 

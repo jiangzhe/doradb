@@ -13,10 +13,92 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::ops::{Range, RangeFrom, RangeTo};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread::JoinHandle;
 const DEFAULT_TARGET_FREE_RATIO: f64 = 0.10;
 const DEFAULT_HYSTERESIS_RATIO: f64 = 0.30;
+
+/// Snapshot of shared-evictor wake and domain-execution activity.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) struct SharedPoolEvictorStats {
+    /// Number of wakeups observed after the evictor blocked for work.
+    pub wake_count: usize,
+    /// Number of times the evictor blocked waiting for work.
+    pub wait_count: usize,
+    /// Number of readonly-domain runs completed by the shared evictor.
+    pub readonly_runs: usize,
+    /// Number of mem-pool-domain runs completed by the shared evictor.
+    pub mem_runs: usize,
+    /// Number of index-pool-domain runs completed by the shared evictor.
+    pub index_runs: usize,
+}
+
+impl SharedPoolEvictorStats {
+    /// Returns the saturating delta from one earlier snapshot.
+    #[inline]
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn delta_since(self, earlier: SharedPoolEvictorStats) -> SharedPoolEvictorStats {
+        SharedPoolEvictorStats {
+            wake_count: self.wake_count.saturating_sub(earlier.wake_count),
+            wait_count: self.wait_count.saturating_sub(earlier.wait_count),
+            readonly_runs: self.readonly_runs.saturating_sub(earlier.readonly_runs),
+            mem_runs: self.mem_runs.saturating_sub(earlier.mem_runs),
+            index_runs: self.index_runs.saturating_sub(earlier.index_runs),
+        }
+    }
+}
+
+#[derive(Default)]
+struct SharedPoolEvictorStatsCounters {
+    wake_count: AtomicUsize,
+    wait_count: AtomicUsize,
+    readonly_runs: AtomicUsize,
+    mem_runs: AtomicUsize,
+    index_runs: AtomicUsize,
+}
+
+#[derive(Clone, Default)]
+pub(crate) struct SharedPoolEvictorStatsHandle(Arc<SharedPoolEvictorStatsCounters>);
+
+impl SharedPoolEvictorStatsHandle {
+    #[inline]
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn snapshot(&self) -> SharedPoolEvictorStats {
+        SharedPoolEvictorStats {
+            wake_count: self.0.wake_count.load(Ordering::Relaxed),
+            wait_count: self.0.wait_count.load(Ordering::Relaxed),
+            readonly_runs: self.0.readonly_runs.load(Ordering::Relaxed),
+            mem_runs: self.0.mem_runs.load(Ordering::Relaxed),
+            index_runs: self.0.index_runs.load(Ordering::Relaxed),
+        }
+    }
+
+    #[inline]
+    fn record_wait(&self) {
+        self.0.wait_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[inline]
+    fn record_wake(&self) {
+        self.0.wake_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[inline]
+    fn record_domain_run(&self, id: SharedEvictionDomainId) {
+        match id {
+            SharedEvictionDomainId::Readonly => {
+                self.0.readonly_runs.fetch_add(1, Ordering::Relaxed);
+            }
+            SharedEvictionDomainId::Mem => {
+                self.0.mem_runs.fetch_add(1, Ordering::Relaxed);
+            }
+            SharedEvictionDomainId::Index => {
+                self.0.index_runs.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+}
 
 /// Shared clock hand state for clock-sweep eviction.
 #[derive(Debug, Clone)]
@@ -641,20 +723,38 @@ impl PressureDeltaClockPolicy {
 }
 
 pub(super) struct SharedEvictionDomain {
+    id: SharedEvictionDomainId,
     runtime: Box<dyn EvictionRuntime + Send>,
     policy: PressureDeltaClockPolicy,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum SharedEvictionDomainId {
+    Readonly,
+    Mem,
+    Index,
+}
+
 impl SharedEvictionDomain {
     #[inline]
-    pub(super) fn new<T>(runtime: T, policy: PressureDeltaClockPolicy) -> Self
+    pub(super) fn new<T>(
+        id: SharedEvictionDomainId,
+        runtime: T,
+        policy: PressureDeltaClockPolicy,
+    ) -> Self
     where
         T: EvictionRuntime + Send + 'static,
     {
         SharedEvictionDomain {
+            id,
             runtime: Box::new(runtime),
             policy,
         }
+    }
+
+    #[inline]
+    fn id(&self) -> SharedEvictionDomainId {
+        self.id
     }
 
     #[inline]
@@ -688,6 +788,7 @@ struct SharedEvictor {
     shutdown_flag: Arc<AtomicBool>,
     wake_event: Arc<Event>,
     next_domain: usize,
+    stats: SharedPoolEvictorStatsHandle,
 }
 
 impl SharedEvictor {
@@ -696,12 +797,14 @@ impl SharedEvictor {
         domains: Vec<SharedEvictionDomain>,
         shutdown_flag: Arc<AtomicBool>,
         wake_event: Arc<Event>,
+        stats: SharedPoolEvictorStatsHandle,
     ) -> Self {
         SharedEvictor {
             domains,
             shutdown_flag,
             wake_event,
             next_domain: 0,
+            stats,
         }
     }
 
@@ -736,6 +839,7 @@ impl SharedEvictor {
                 return false;
             };
             if self.domains[idx].try_run_once() {
+                self.stats.record_domain_run(self.domains[idx].id());
                 return true;
             }
         }
@@ -751,8 +855,13 @@ impl SharedEvictor {
         if self.any_domain_ready() {
             return true;
         }
+        self.stats.record_wait();
         listener.wait();
-        !self.shutdown_flag.load(Ordering::Acquire)
+        if self.shutdown_flag.load(Ordering::Acquire) {
+            return false;
+        }
+        self.stats.record_wake();
+        true
     }
 
     #[inline]
@@ -779,13 +888,14 @@ pub(crate) struct SharedPoolEvictorWorkersOwned {
     mem_pool: SyncQuiescentGuard<crate::buffer::EvictableBufferPool>,
     shutdown_flag: Arc<AtomicBool>,
     wake_event: Arc<Event>,
+    stats: SharedPoolEvictorStatsHandle,
     evict_thread: Mutex<Option<JoinHandle<()>>>,
 }
 
 impl Component for SharedPoolEvictorWorkers {
     type Config = ();
     type Owned = SharedPoolEvictorWorkersOwned;
-    type Access = ();
+    type Access = SharedPoolEvictorStatsHandle;
 
     const NAME: &'static str = "shared_pool_evictor_workers";
 
@@ -804,6 +914,7 @@ impl Component for SharedPoolEvictorWorkers {
         let mem_pool = mem_pool.clone_inner().into_sync();
         let shutdown_flag = Arc::new(AtomicBool::new(false));
         let wake_event = Arc::new(Event::new());
+        let stats = SharedPoolEvictorStatsHandle::default();
 
         disk_pool.install_shared_evictor_wake(Arc::clone(&wake_event));
         index_pool.install_shared_evictor_wake(Arc::clone(&wake_event));
@@ -817,6 +928,7 @@ impl Component for SharedPoolEvictorWorkers {
             ],
             Arc::clone(&shutdown_flag),
             Arc::clone(&wake_event),
+            stats.clone(),
         )
         .start_thread();
 
@@ -826,12 +938,15 @@ impl Component for SharedPoolEvictorWorkers {
             mem_pool,
             shutdown_flag,
             wake_event,
+            stats,
             evict_thread: Mutex::new(Some(handle)),
         })
     }
 
     #[inline]
-    fn access(_owner: &QuiescentBox<Self::Owned>) -> Self::Access {}
+    fn access(owner: &QuiescentBox<Self::Owned>) -> Self::Access {
+        owner.stats.clone()
+    }
 
     #[inline]
     fn shutdown(component: &Self::Owned) {
@@ -849,8 +964,28 @@ impl Component for SharedPoolEvictorWorkers {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::buffer::BufferPool;
+    use crate::buffer::frame::BufferFrame;
+    use crate::buffer::page::Page;
+    use crate::buffer::{PoolRole, ReadonlyBufferPool};
+    use crate::catalog::{
+        ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexSpec, TableMetadata,
+    };
+    use crate::component::{ComponentRegistry, DiskPoolConfig, IndexPoolConfig, RegistryBuilder};
+    use crate::conf::{EvictableBufferPoolConfig, FileSystemConfig};
+    use crate::file::BlockID;
+    use crate::file::cow_file::COW_FILE_PAGE_SIZE;
+    use crate::file::fs::{FileSystem, FileSystemWorkers};
+    use crate::file::table_file::TableFile;
+    use crate::io::{AIOBuf, DirectBuf};
+    use crate::{DiskPool, IndexPool, MemPool};
     use event_listener::Event;
+    use std::mem;
+    use std::path::Path;
     use std::sync::Arc;
+    use std::thread;
+    use std::time::Duration;
+    use tempfile::TempDir;
 
     #[test]
     fn test_failure_rate_tracker_window() {
@@ -1012,16 +1147,185 @@ mod tests {
         )
     }
 
+    const TEST_POOL_BYTES: usize = 64 * 1024 * 130;
+    const TEST_POOL_MAX_FILE_BYTES: usize = 128 * 1024 * 260;
+    const TEST_WAIT_RETRIES: usize = 100;
+    const TEST_WAIT_INTERVAL: Duration = Duration::from_millis(10);
+
+    fn frame_page_bytes(capacity: usize) -> usize {
+        capacity * (mem::size_of::<BufferFrame>() + mem::size_of::<Page>())
+    }
+
+    fn wait_for(mut predicate: impl FnMut() -> bool) {
+        for _ in 0..TEST_WAIT_RETRIES {
+            if predicate() {
+                return;
+            }
+            thread::sleep(TEST_WAIT_INTERVAL);
+        }
+        panic!("condition was not satisfied before timeout");
+    }
+
+    fn make_metadata() -> Arc<TableMetadata> {
+        Arc::new(TableMetadata::new(
+            vec![ColumnSpec::new(
+                "c0",
+                crate::value::ValKind::U32,
+                ColumnAttributes::empty(),
+            )],
+            vec![IndexSpec::new(
+                "idx_pk",
+                vec![IndexKey::new(0)],
+                IndexAttributes::PK,
+            )],
+        ))
+    }
+
+    async fn write_payload(table_file: &Arc<TableFile>, block_id: BlockID, payload: &[u8]) {
+        let mut buf = DirectBuf::zeroed(COW_FILE_PAGE_SIZE);
+        buf.as_bytes_mut()[..payload.len()].copy_from_slice(payload);
+        table_file.write_block(block_id, buf).await.unwrap();
+    }
+
+    struct StartedSharedEvictorRuntime {
+        fs: crate::quiescent::QuiescentGuard<FileSystem>,
+        disk_pool: DiskPool,
+        mem_pool: MemPool,
+        index_pool: IndexPool,
+        stats: SharedPoolEvictorStatsHandle,
+        registry: ComponentRegistry,
+    }
+
+    impl StartedSharedEvictorRuntime {
+        fn new(root: &Path) -> Self {
+            smol::block_on(async {
+                let mut builder = RegistryBuilder::new();
+                let file = FileSystemConfig::default()
+                    .data_dir(root)
+                    .readonly_buffer_size(frame_page_bytes(256));
+                builder
+                    .build::<DiskPool>(DiskPoolConfig::new(file.readonly_buffer_size))
+                    .await
+                    .unwrap();
+                builder.build::<FileSystem>(file).await.unwrap();
+                builder
+                    .build::<IndexPool>(IndexPoolConfig::new(
+                        TEST_POOL_BYTES,
+                        root.join("index.swp"),
+                        TEST_POOL_MAX_FILE_BYTES,
+                    ))
+                    .await
+                    .unwrap();
+                builder
+                    .build::<MemPool>(
+                        EvictableBufferPoolConfig::default()
+                            .role(PoolRole::Mem)
+                            .max_mem_size(TEST_POOL_BYTES)
+                            .max_file_size(TEST_POOL_MAX_FILE_BYTES)
+                            .data_swap_file(root.join("data.swp")),
+                    )
+                    .await
+                    .unwrap();
+                builder.build::<FileSystemWorkers>(()).await.unwrap();
+                builder.build::<SharedPoolEvictorWorkers>(()).await.unwrap();
+                let registry = builder.finish().unwrap();
+                let fs = registry.dependency::<FileSystem>().unwrap();
+                let disk_pool = registry.dependency::<DiskPool>().unwrap();
+                let mem_pool = registry.dependency::<MemPool>().unwrap();
+                let index_pool = registry.dependency::<IndexPool>().unwrap();
+                let stats = registry.dependency::<SharedPoolEvictorWorkers>().unwrap();
+                Self {
+                    fs,
+                    disk_pool,
+                    mem_pool,
+                    index_pool,
+                    stats,
+                    registry,
+                }
+            })
+        }
+
+        fn stats(&self) -> SharedPoolEvictorStats {
+            self.stats.snapshot()
+        }
+
+        fn wait_until_idle(&self) -> SharedPoolEvictorStats {
+            let start = self.stats();
+            wait_for(|| self.stats().wait_count > start.wait_count);
+            self.stats()
+        }
+    }
+
+    impl Drop for StartedSharedEvictorRuntime {
+        fn drop(&mut self) {
+            self.registry.shutdown_all();
+        }
+    }
+
+    async fn allocate_with_pressure(pool: &crate::buffer::EvictableBufferPool, total_pages: usize) {
+        let pool_guard = pool.pool_guard();
+        for _ in 0..total_pages {
+            let page = pool.allocate_page::<Page>(&pool_guard).await;
+            drop(page);
+        }
+    }
+
+    async fn read_with_pressure(
+        fs: &FileSystem,
+        disk_pool: &DiskPool,
+        table_id: u64,
+    ) -> ReadonlyBufferPool {
+        let table_file = fs
+            .create_table_file(table_id, make_metadata(), false)
+            .unwrap();
+        let (table_file, old_root) = table_file.commit(1, false).await.unwrap();
+        drop(old_root);
+
+        let capacity = disk_pool.capacity();
+        let base = 32u64;
+        for i in 0..=capacity {
+            let block_id = BlockID::from(base + i as u64);
+            let payload = format!("page-{i}");
+            write_payload(&table_file, block_id, payload.as_bytes()).await;
+        }
+
+        let (_opened, pool) = fs
+            .open_table_file(table_id, disk_pool.clone_inner())
+            .await
+            .unwrap();
+        let pool_guard = pool.pool_guard();
+        for i in 0..=capacity {
+            let block_id = BlockID::from(base + i as u64);
+            let g = pool.read_block(&pool_guard, block_id).await.unwrap();
+            drop(g);
+        }
+        drop(pool_guard);
+        pool
+    }
+
     #[test]
     fn test_shared_evictor_skips_idle_domains() {
         let mut evictor = SharedEvictor::new(
             vec![
-                SharedEvictionDomain::new(MockRuntime::new(4, 8), test_policy()),
-                SharedEvictionDomain::new(MockRuntime::new(7, 8), test_policy()),
-                SharedEvictionDomain::new(MockRuntime::new(3, 8), test_policy()),
+                SharedEvictionDomain::new(
+                    SharedEvictionDomainId::Readonly,
+                    MockRuntime::new(4, 8),
+                    test_policy(),
+                ),
+                SharedEvictionDomain::new(
+                    SharedEvictionDomainId::Mem,
+                    MockRuntime::new(7, 8),
+                    test_policy(),
+                ),
+                SharedEvictionDomain::new(
+                    SharedEvictionDomainId::Index,
+                    MockRuntime::new(3, 8),
+                    test_policy(),
+                ),
             ],
             Arc::new(AtomicBool::new(false)),
             Arc::new(Event::new()),
+            SharedPoolEvictorStatsHandle::default(),
         );
 
         assert_eq!(evictor.next_ready_domain_index(), Some(1));
@@ -1032,16 +1336,126 @@ mod tests {
     fn test_shared_evictor_rotates_across_ready_domains() {
         let mut evictor = SharedEvictor::new(
             vec![
-                SharedEvictionDomain::new(MockRuntime::new(7, 8), test_policy()),
-                SharedEvictionDomain::new(MockRuntime::new(7, 8), test_policy()),
-                SharedEvictionDomain::new(MockRuntime::new(4, 8), test_policy()),
+                SharedEvictionDomain::new(
+                    SharedEvictionDomainId::Readonly,
+                    MockRuntime::new(7, 8),
+                    test_policy(),
+                ),
+                SharedEvictionDomain::new(
+                    SharedEvictionDomainId::Mem,
+                    MockRuntime::new(7, 8),
+                    test_policy(),
+                ),
+                SharedEvictionDomain::new(
+                    SharedEvictionDomainId::Index,
+                    MockRuntime::new(4, 8),
+                    test_policy(),
+                ),
             ],
             Arc::new(AtomicBool::new(false)),
             Arc::new(Event::new()),
+            SharedPoolEvictorStatsHandle::default(),
         );
 
         assert_eq!(evictor.next_ready_domain_index(), Some(0));
         assert_eq!(evictor.next_ready_domain_index(), Some(1));
         assert_eq!(evictor.next_ready_domain_index(), Some(0));
+    }
+
+    #[test]
+    fn test_shared_evictor_stats_track_isolated_domain_pressure() {
+        smol::block_on(async {
+            {
+                let root = TempDir::new().unwrap();
+                let runtime = StartedSharedEvictorRuntime::new(root.path());
+                let parked = runtime.wait_until_idle();
+                assert!(parked.wait_count > 0);
+
+                let start = runtime.stats();
+                let readonly_pool = read_with_pressure(&runtime.fs, &runtime.disk_pool, 201).await;
+                wait_for(|| runtime.stats().delta_since(start).readonly_runs > 0);
+                let delta = runtime.stats().delta_since(start);
+                assert!(delta.wake_count > 0);
+                assert!(delta.readonly_runs > 0);
+                assert_eq!(delta.mem_runs, 0);
+                assert_eq!(delta.index_runs, 0);
+                drop(readonly_pool);
+            }
+
+            {
+                let root = TempDir::new().unwrap();
+                let runtime = StartedSharedEvictorRuntime::new(root.path());
+                runtime.wait_until_idle();
+
+                let start = runtime.stats();
+                allocate_with_pressure(&runtime.mem_pool, 192).await;
+                wait_for(|| runtime.stats().delta_since(start).mem_runs > 0);
+                let delta = runtime.stats().delta_since(start);
+                assert!(delta.wake_count > 0);
+                assert_eq!(delta.readonly_runs, 0);
+                assert!(delta.mem_runs > 0);
+                assert_eq!(delta.index_runs, 0);
+            }
+
+            {
+                let root = TempDir::new().unwrap();
+                let runtime = StartedSharedEvictorRuntime::new(root.path());
+                runtime.wait_until_idle();
+
+                let start = runtime.stats();
+                allocate_with_pressure(&runtime.index_pool, 192).await;
+                wait_for(|| runtime.stats().delta_since(start).index_runs > 0);
+                let delta = runtime.stats().delta_since(start);
+                assert!(delta.wake_count > 0);
+                assert_eq!(delta.readonly_runs, 0);
+                assert_eq!(delta.mem_runs, 0);
+                assert!(delta.index_runs > 0);
+            }
+        });
+    }
+
+    #[test]
+    fn test_shared_evictor_makes_progress_across_concurrent_domains() {
+        smol::block_on(async {
+            let root = TempDir::new().unwrap();
+            let runtime = StartedSharedEvictorRuntime::new(root.path());
+            runtime.wait_until_idle();
+            let start = runtime.stats();
+
+            let table_id = 202u64;
+            let readonly_task = {
+                let fs = runtime.fs.clone();
+                let disk_pool = runtime.disk_pool.clone();
+                smol::spawn(async move {
+                    let _ = read_with_pressure(&fs, &disk_pool, table_id).await;
+                })
+            };
+            let mem_task = {
+                let mem_pool = runtime.mem_pool.clone();
+                smol::spawn(async move {
+                    allocate_with_pressure(&mem_pool, 192).await;
+                })
+            };
+            let index_task = {
+                let index_pool = runtime.index_pool.clone();
+                smol::spawn(async move {
+                    allocate_with_pressure(&index_pool, 192).await;
+                })
+            };
+
+            wait_for(|| {
+                let delta = runtime.stats().delta_since(start);
+                delta.readonly_runs > 0 && delta.mem_runs > 0 && delta.index_runs > 0
+            });
+            let delta = runtime.stats().delta_since(start);
+            assert!(delta.wake_count > 0);
+            assert!(delta.readonly_runs > 0);
+            assert!(delta.mem_runs > 0);
+            assert!(delta.index_runs > 0);
+
+            readonly_task.await;
+            mem_task.await;
+            index_task.await;
+        });
     }
 }

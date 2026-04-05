@@ -1,7 +1,7 @@
 ---
 id: 0013
 title: Introduce Shared Storage Runtime With Shared IO And Multi-Pool Eviction
-status: proposal
+status: implemented
 tags: [io, scheduling, eviction, table-file, buffer-pool]
 created: 2026-04-03
 github_issue: 518
@@ -480,10 +480,10 @@ Backend-touching phases must also run the supported alternate backend pass:
     `io_uring` and `libaio` backend behavior.
   - Non-goals: No autotuner; no external scheduling knobs; no broader engine
     scheduling framework beyond this storage runtime.
-  - Task Doc: `docs/tasks/TBD.md`
-  - Task Issue: `#0`
-  - Phase Status: `pending`
-  - Implementation Summary: `pending`
+  - Task Doc: `docs/tasks/000108-validate-and-harden-shared-storage-runtime.md`
+  - Task Issue: `#527`
+  - Phase Status: done
+  - Implementation Summary: Implemented phase 4 by adding shared-storage fairness telemetry and starvation-focused production tests, shared-evictor wake/domain telemetry plus engine-backed fairness coverage, authoritative shared-IO-depth compatibility validation, and runtime-topology doc sync for the shared storage worker and shared evictor. [Task Resolve Sync: docs/tasks/000108-validate-and-harden-shared-storage-runtime.md @ 2026-04-05]
 
 ## Consequences
 

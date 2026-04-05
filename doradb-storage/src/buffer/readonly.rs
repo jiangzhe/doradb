@@ -2,7 +2,8 @@ use crate::buffer::PersistedFileID;
 use crate::buffer::arena::{ArenaGuard, QuiescentArena};
 use crate::buffer::evictor::{
     ClockHand, EvictionArbiter, EvictionArbiterBuilder, EvictionRuntime, FailureRateTracker,
-    PressureDeltaClockPolicy, SharedEvictionDomain, clock_collect_batch, clock_sweep_candidate,
+    PressureDeltaClockPolicy, SharedEvictionDomain, SharedEvictionDomainId, clock_collect_batch,
+    clock_sweep_candidate,
 };
 use crate::buffer::frame::{BufferFrame, FrameKind};
 use crate::buffer::guard::{
@@ -459,7 +460,7 @@ impl GlobalReadonlyBufferPool {
     #[inline]
     pub(super) fn shared_evictor_domain(pool: SyncQuiescentGuard<Self>) -> SharedEvictionDomain {
         let (runtime, policy) = Self::evictor_parts(pool);
-        SharedEvictionDomain::new(runtime, policy)
+        SharedEvictionDomain::new(SharedEvictionDomainId::Readonly, runtime, policy)
     }
 
     #[inline]

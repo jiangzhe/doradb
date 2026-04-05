@@ -13,9 +13,9 @@ mod util;
 
 #[cfg(test)]
 pub(crate) use self::evict::tests::{
-    frame_kind as test_frame_kind,
+    dispatch_dirty_pages_for_test as test_dispatch_dirty_pages, frame_kind as test_frame_kind,
     io_backend_stats_handle_identity as test_io_backend_stats_handle_identity,
-    raw_fd as test_raw_fd,
+    persist_and_evict_page_for_test as test_persist_and_evict_page, raw_fd as test_raw_fd,
 };
 #[cfg(test)]
 pub(crate) use self::readonly::tests::{global_readonly_pool_scope, table_readonly_pool};
