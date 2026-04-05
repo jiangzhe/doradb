@@ -20,7 +20,7 @@ use crate::error::{Error, FileKind, Result};
 use crate::file::BlockID;
 use crate::file::multi_table_file::MultiTableFile;
 use crate::file::table_file::TableFile;
-use crate::io::{IOKind, IOSubmission, Operation};
+use crate::io::{DirectBuf, IOKind, IOSubmission, Operation};
 use crate::latch::LatchFallbackMode;
 use crate::quiescent::{QuiescentGuard, SyncQuiescentGuard};
 use dashmap::DashMap;
@@ -79,7 +79,7 @@ impl ReadonlyBackingFile {
     }
 
     #[inline]
-    fn raw_fd(&self) -> RawFd {
+    pub(crate) fn raw_fd(&self) -> RawFd {
         match self {
             ReadonlyBackingFile::Table(file) => file.raw_fd(),
             ReadonlyBackingFile::Multi(file) => file.raw_fd(),
@@ -92,6 +92,11 @@ impl ReadonlyBackingFile {
         // SAFETY: readonly loads borrow frame-owned page memory that remains
         // live until IO completion, and offsets are page-aligned by construction.
         unsafe { Operation::pread_borrowed(self.raw_fd(), offset, ptr, len) }
+    }
+
+    #[inline]
+    pub(crate) fn write_operation(&self, offset: usize, buf: DirectBuf) -> Operation {
+        Operation::pwrite_owned(self.raw_fd(), offset, buf)
     }
 }
 
@@ -709,6 +714,7 @@ impl PageReservation for ReadonlyPageReservation {
 /// completed the miss.
 pub(crate) struct ReadSubmission {
     key: BlockKey,
+    _backing: ReadonlyBackingFile,
     operation: Operation,
     pool: QuiescentGuard<GlobalReadonlyBufferPool>,
     inflight: Arc<PageIOCompletion>,
@@ -729,10 +735,12 @@ impl ReadSubmission {
         mut reservation: ReadonlyReservedPage,
     ) -> Self {
         let ptr = reservation.page_mut() as *mut Page as *mut u8;
+        let operation = backing.read_operation(key, ptr, PAGE_SIZE);
         pool.stats.add_queued_reads(1);
         ReadSubmission {
             key,
-            operation: backing.read_operation(key, ptr, PAGE_SIZE),
+            _backing: backing,
+            operation,
             pool,
             inflight,
             reservation: Some(reservation),

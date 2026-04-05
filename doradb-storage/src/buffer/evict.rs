@@ -55,8 +55,6 @@ pub struct EvictableBufferPool {
     shutdown_flag: Arc<AtomicBool>,
     // In-memory page set.
     in_mem: Arc<InMemPageSet>,
-    // Borrowed file descriptor used to describe worker-owned read completions.
-    raw_fd: RawFd,
     // Inflight IO map.
     inflight_io: Arc<InflightIO>,
     // Pool-owned access and IO lifecycle counters.
@@ -154,7 +152,6 @@ impl EvictableBufferPool {
                                         ));
                                     let req = EvictReadSubmission::new(
                                         page_id,
-                                        self.raw_fd,
                                         Arc::clone(&self.inflight_io),
                                         self.stats.clone(),
                                         reservation,
@@ -174,7 +171,6 @@ impl EvictableBufferPool {
                                 );
                                 let req = EvictReadSubmission::new(
                                     page_id,
-                                    self.raw_fd,
                                     Arc::clone(&self.inflight_io),
                                     self.stats.clone(),
                                     reservation,
@@ -577,7 +573,7 @@ impl EvictablePoolStateMachine {
 
 /// Backend-facing pool submission emitted by `EvictablePoolStateMachine`.
 pub(crate) enum EvictSubmission {
-    Read(EvictReadSubmission),
+    Read(PreparedEvictReadSubmission),
     Write(PageIO),
 }
 
@@ -621,7 +617,9 @@ impl IOStateMachine for EvictablePoolStateMachine {
             PoolRequest::Read(req) => {
                 let page_id = *req.key();
                 debug_assert!(self.pool.inflight_io.contains(page_id));
-                queue.push(EvictSubmission::Read(req));
+                queue.push(EvictSubmission::Read(
+                    req.into_prepared(self.file.as_raw_fd()),
+                ));
                 None
             }
             PoolRequest::BatchWrite(mut page_guards, done_ev) => {
@@ -1070,7 +1068,6 @@ impl PageReservation for EvictPageReservation {
 /// an error.
 pub(crate) struct EvictReadSubmission {
     key: PageID,
-    operation: Operation,
     inflight_io: Arc<InflightIO>,
     stats: BufferPoolStatsHandle,
     reservation: Option<Box<PageReservationGuard<EvictPageReservation>>>,
@@ -1082,25 +1079,40 @@ impl EvictReadSubmission {
     /// Builds one evictable reload submission from an already reserved page.
     fn new(
         page_id: PageID,
-        raw_fd: RawFd,
         inflight_io: Arc<InflightIO>,
         stats: BufferPoolStatsHandle,
-        mut reservation: PageReservationGuard<EvictPageReservation>,
+        reservation: PageReservationGuard<EvictPageReservation>,
     ) -> Self {
-        let ptr = reservation.page_mut() as *mut Page as *mut u8;
-        // SAFETY: the reservation keeps the page slot alive and exclusively
-        // owned until the read completes or rolls back.
-        let operation = unsafe {
-            Operation::pread_borrowed(raw_fd, usize::from(page_id) * PAGE_SIZE, ptr, PAGE_SIZE)
-        };
         stats.add_queued_reads(1);
         EvictReadSubmission {
             key: page_id,
-            operation,
             inflight_io,
             stats,
             reservation: Some(Box::new(reservation)),
             completed: false,
+        }
+    }
+
+    #[inline]
+    pub(crate) fn key(&self) -> &PageID {
+        &self.key
+    }
+
+    #[inline]
+    fn into_prepared(mut self, raw_fd: RawFd) -> PreparedEvictReadSubmission {
+        let ptr = self
+            .reservation
+            .as_mut()
+            .expect("evict read submission must retain its page reservation before prepare")
+            .page_mut() as *mut Page as *mut u8;
+        // SAFETY: the reservation keeps the page slot alive and exclusively
+        // owned until the read completes or rolls back.
+        let operation = unsafe {
+            Operation::pread_borrowed(raw_fd, usize::from(self.key) * PAGE_SIZE, ptr, PAGE_SIZE)
+        };
+        PreparedEvictReadSubmission {
+            inner: self,
+            operation,
         }
     }
 
@@ -1174,12 +1186,29 @@ impl EvictReadSubmission {
     }
 }
 
-impl IOSubmission for EvictReadSubmission {
+pub(crate) struct PreparedEvictReadSubmission {
+    inner: EvictReadSubmission,
+    operation: Operation,
+}
+
+impl PreparedEvictReadSubmission {
+    #[inline]
+    fn record_running(&self) {
+        self.inner.record_running();
+    }
+
+    #[inline]
+    fn complete(self, res: std::io::Result<usize>) -> IOKind {
+        self.inner.complete(res)
+    }
+}
+
+impl IOSubmission for PreparedEvictReadSubmission {
     type Key = PageID;
 
     #[inline]
     fn key(&self) -> &Self::Key {
-        &self.key
+        self.inner.key()
     }
 
     #[inline]
@@ -1236,15 +1265,12 @@ pub(crate) fn build_pool_with_swap_file_field(
     // 3. Create the swap file and retain the opened descriptor for worker-owned IO.
     let swap_file_path = path_to_utf8(&config.data_swap_file, swap_file_field_name)?;
     let file = SparseFile::create_or_trunc(swap_file_path, max_file_size)?;
-    let raw_fd = file.as_raw_fd();
-
     let pool = EvictableBufferPool {
         alloc_map: AllocMap::new(max_nbr),
         alloc_ev: Event::new(),
         fs,
         shutdown_flag: Arc::new(AtomicBool::new(false)),
         in_mem: Arc::new(InMemPageSet::new(max_nbr_in_mem, eviction_arbiter)),
-        raw_fd,
         inflight_io: Arc::new(InflightIO::default()),
         stats: BufferPoolStatsHandle::default(),
         role: config.role,
@@ -1440,11 +1466,6 @@ pub(crate) mod tests {
     #[inline]
     pub(crate) fn frame_kind(pool: &EvictableBufferPool, page_id: PageID) -> FrameKind {
         pool.arena.frame(page_id).kind()
-    }
-
-    #[inline]
-    pub(crate) fn raw_fd(pool: &EvictableBufferPool) -> RawFd {
-        pool.raw_fd
     }
 
     pub(crate) async fn dispatch_dirty_pages_for_test(

@@ -172,8 +172,8 @@ impl PoolBatchWriteRequest {
 /// write-heavy traffic throttled independently from read traffic.
 pub(crate) enum BackgroundWriteRequest {
     Table(WriteSubmission),
-    MemPool(Box<PoolBatchWriteRequest>),
-    IndexPool(Box<PoolBatchWriteRequest>),
+    MemPool(PoolBatchWriteRequest),
+    IndexPool(PoolBatchWriteRequest),
 }
 
 /// Unified completion key space for the shared storage backend.
@@ -346,10 +346,10 @@ impl StorageStateMachine {
                 remainder
             }
             BackgroundWriteRequest::MemPool(req) => {
-                self.prepare_pool_batch_write_request(PoolRole::Mem, *req, max_new, queue)
+                self.prepare_pool_batch_write_request(PoolRole::Mem, req, max_new, queue)
             }
             BackgroundWriteRequest::IndexPool(req) => {
-                self.prepare_pool_batch_write_request(PoolRole::Index, *req, max_new, queue)
+                self.prepare_pool_batch_write_request(PoolRole::Index, req, max_new, queue)
             }
         }
     }
@@ -377,11 +377,13 @@ impl StorageStateMachine {
         }
         .map(|req| match req {
             PoolRequest::BatchWrite(page_guards, done_ev) => match role {
-                PoolRole::Mem => BackgroundWriteRequest::MemPool(Box::new(
-                    PoolBatchWriteRequest::new(page_guards, done_ev),
+                PoolRole::Mem => BackgroundWriteRequest::MemPool(PoolBatchWriteRequest::new(
+                    page_guards,
+                    done_ev,
                 )),
-                PoolRole::Index => BackgroundWriteRequest::IndexPool(Box::new(
-                    PoolBatchWriteRequest::new(page_guards, done_ev),
+                PoolRole::Index => BackgroundWriteRequest::IndexPool(PoolBatchWriteRequest::new(
+                    page_guards,
+                    done_ev,
                 )),
                 other => panic!("unsupported shared storage pool role: {other:?}"),
             },
@@ -1416,11 +1418,13 @@ impl FileSystem {
         Self::assert_pool_role(role, "shared pool write dispatch");
         self.background_writes
             .send(match role {
-                PoolRole::Mem => BackgroundWriteRequest::MemPool(Box::new(
-                    PoolBatchWriteRequest::new(page_guards, done_ev),
+                PoolRole::Mem => BackgroundWriteRequest::MemPool(PoolBatchWriteRequest::new(
+                    page_guards,
+                    done_ev,
                 )),
-                PoolRole::Index => BackgroundWriteRequest::IndexPool(Box::new(
-                    PoolBatchWriteRequest::new(page_guards, done_ev),
+                PoolRole::Index => BackgroundWriteRequest::IndexPool(PoolBatchWriteRequest::new(
+                    page_guards,
+                    done_ev,
                 )),
                 other => panic!("unsupported pool role {other:?} in shared pool write dispatch"),
             })
@@ -1432,7 +1436,6 @@ impl FileSystem {
                         unreachable!("shared pool write lane returned a table write request");
                     }
                 };
-                let req = *req;
                 (req.page_guards, req.done_ev)
             })
     }
@@ -1614,7 +1617,7 @@ pub(crate) mod tests {
     use crate::buffer::page::Page;
     use crate::buffer::{
         BufferPool, PoolRole, SharedPoolEvictorWorkers, test_dispatch_dirty_pages,
-        test_persist_and_evict_page, test_raw_fd,
+        test_persist_and_evict_page,
     };
     use crate::catalog::{
         ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexSpec, USER_OBJ_ID_START,
@@ -1627,14 +1630,13 @@ pub(crate) mod tests {
     use crate::file::cow_file::COW_FILE_PAGE_SIZE;
     use crate::file::table_file::TableFile;
     use crate::io::{
-        DirectBuf, IOBuf, IOKind, StorageBackendOp, StorageBackendTestHook,
-        install_storage_backend_test_hook,
+        DirectBuf, IOBuf, IOKind, StorageBackendFileIdentity, StorageBackendOp,
+        StorageBackendTestHook, install_storage_backend_test_hook,
     };
     use crate::latch::LatchFallbackMode;
     use crate::value::ValKind;
     use crate::{DiskPool, IndexPool, MemPool, MetaPool};
     use std::ops::Deref;
-    use std::os::fd::RawFd;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::time::Duration;
@@ -1817,7 +1819,7 @@ pub(crate) mod tests {
 
     struct ControlledStorageOpHookInner {
         blocked_kind: IOKind,
-        blocked_fd: RawFd,
+        blocked_file: StorageBackendFileIdentity,
         submits: parking_lot::Mutex<Vec<StorageBackendOp>>,
         submit_count: AtomicUsize,
         submit_ev: event_listener::Event,
@@ -1828,11 +1830,11 @@ pub(crate) mod tests {
     }
 
     impl ControlledStorageOpHook {
-        fn new(blocked_kind: IOKind, blocked_fd: RawFd) -> Self {
+        fn new(blocked_kind: IOKind, blocked_file: StorageBackendFileIdentity) -> Self {
             Self {
                 inner: Arc::new(ControlledStorageOpHookInner {
                     blocked_kind,
-                    blocked_fd,
+                    blocked_file,
                     submits: parking_lot::Mutex::new(Vec::new()),
                     submit_count: AtomicUsize::new(0),
                     submit_ev: event_listener::Event::new(),
@@ -1845,7 +1847,8 @@ pub(crate) mod tests {
         }
 
         fn matches_blocked(&self, op: StorageBackendOp) -> bool {
-            op.kind() == self.inner.blocked_kind && op.fd() == self.inner.blocked_fd
+            op.kind() == self.inner.blocked_kind
+                && op.matches_file_identity(self.inner.blocked_file)
         }
 
         fn submits(&self) -> Vec<StorageBackendOp> {
@@ -1951,10 +1954,11 @@ pub(crate) mod tests {
                 .unwrap();
             let readonly_guard = readonly_pool.pool_guard();
             let index_pool = fs.index_pool();
-            let background_fd = test_raw_fd(&index_pool);
+            let background_file =
+                StorageBackendFileIdentity::from_path(temp_dir.path().join("index.swp")).unwrap();
             let read_fd = reopened.raw_fd();
             let stats_start = fs.storage_service_stats();
-            let hook = Arc::new(ControlledStorageOpHook::new(IOKind::Write, background_fd));
+            let hook = Arc::new(ControlledStorageOpHook::new(IOKind::Write, background_file));
             let _hook = install_storage_backend_test_hook(hook.clone());
 
             let writes_done = test_dispatch_dirty_pages(index_pool, 2).await;
@@ -1982,7 +1986,7 @@ pub(crate) mod tests {
             hook.wait_for_submit_count(2).await;
             let submits = hook.submits();
             assert_eq!(submits[0].kind(), IOKind::Write);
-            assert_eq!(submits[0].fd(), background_fd);
+            assert!(submits[0].matches_file_identity(background_file));
             assert_eq!(submits[1].kind(), IOKind::Read);
             assert_eq!(submits[1].fd(), read_fd);
 
@@ -2012,10 +2016,12 @@ pub(crate) mod tests {
             let mem_pool = fs.mem_pool();
             let index_pool = fs.index_pool();
             let reload_page_id = test_persist_and_evict_page(mem_pool.clone(), b"pool-read").await;
-            let background_fd = test_raw_fd(&index_pool);
-            let read_fd = test_raw_fd(&mem_pool);
+            let background_file =
+                StorageBackendFileIdentity::from_path(temp_dir.path().join("index.swp")).unwrap();
+            let mem_pool_file =
+                StorageBackendFileIdentity::from_path(temp_dir.path().join("data.swp")).unwrap();
             let stats_start = fs.storage_service_stats();
-            let hook = Arc::new(ControlledStorageOpHook::new(IOKind::Write, background_fd));
+            let hook = Arc::new(ControlledStorageOpHook::new(IOKind::Write, background_file));
             let _hook = install_storage_backend_test_hook(hook.clone());
 
             let writes_done = test_dispatch_dirty_pages(index_pool, 2).await;
@@ -2045,9 +2051,9 @@ pub(crate) mod tests {
             hook.wait_for_submit_count(2).await;
             let submits = hook.submits();
             assert_eq!(submits[0].kind(), IOKind::Write);
-            assert_eq!(submits[0].fd(), background_fd);
+            assert!(submits[0].matches_file_identity(background_file));
             assert_eq!(submits[1].kind(), IOKind::Read);
-            assert_eq!(submits[1].fd(), read_fd);
+            assert!(submits[1].matches_file_identity(mem_pool_file));
 
             assert_eq!(reload_task.await, b"pool-read");
             writes_done.await;
