@@ -19,7 +19,7 @@ use crate::file::super_block::{
     SuperBlockFooter, SuperBlockHeader, SuperBlockSerView, parse_super_block,
 };
 use crate::index::{ColumnBlockEntryShape, ColumnBlockIndex};
-use crate::io::{AIOBuf, AIOClient, DirectBuf};
+use crate::io::{DirectBuf, IOBuf, IOClient};
 use crate::row::RowID;
 use crate::serde::{Deser, Ser};
 use crate::trx::TrxID;
@@ -216,8 +216,8 @@ impl TableFile {
         file_path: impl AsRef<str>,
         initial_size: usize,
         table_id: TableID,
-        table_reads: AIOClient<ReadSubmission>,
-        background_writes: AIOClient<BackgroundWriteRequest>,
+        table_reads: IOClient<ReadSubmission>,
+        background_writes: IOClient<BackgroundWriteRequest>,
         trunc: bool,
     ) -> Result<Self> {
         debug_assert!(initial_size.is_multiple_of(COW_FILE_PAGE_SIZE));
@@ -237,8 +237,8 @@ impl TableFile {
     pub(super) fn open(
         file_path: impl AsRef<str>,
         table_id: TableID,
-        table_reads: AIOClient<ReadSubmission>,
-        background_writes: AIOClient<BackgroundWriteRequest>,
+        table_reads: IOClient<ReadSubmission>,
+        background_writes: IOClient<BackgroundWriteRequest>,
     ) -> Result<Self> {
         let cow_file = CowFile::open(
             file_path,
@@ -567,7 +567,7 @@ mod tests {
     use crate::error::{BlockCorruptionCause, BlockKind, Error, FileKind};
     use crate::file::block_integrity::BLOCK_INTEGRITY_TRAILER_SIZE;
     use crate::file::{build_test_fs, build_test_fs_in, test_block_id};
-    use crate::io::AIOBuf;
+    use crate::io::IOBuf;
     use crate::value::ValKind;
     use std::fs::OpenOptions;
     use std::io::{Seek, SeekFrom, Write};

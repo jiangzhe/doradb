@@ -1,5 +1,4 @@
 use crate::file::BlockID;
-use crate::io::AIOError;
 use crate::row::RowID;
 use std::array::TryFromSliceError;
 use std::fmt;
@@ -98,7 +97,30 @@ impl fmt::Display for StoragePoisonSource {
     }
 }
 
-#[derive(Debug, Clone, Error)]
+/// Classifies which storage setup/file operation surfaced one OS-backed IO failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StorageOp {
+    BackendSetup,
+    FileCreate,
+    FileOpen,
+    FileResize,
+    FileStat,
+}
+
+impl fmt::Display for StorageOp {
+    #[inline]
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            StorageOp::BackendSetup => "backend setup",
+            StorageOp::FileCreate => "file create",
+            StorageOp::FileOpen => "file open",
+            StorageOp::FileResize => "file resize",
+            StorageOp::FileStat => "file stat",
+        })
+    }
+}
+
+#[derive(Debug, Error, Clone)]
 pub enum Error {
     #[error("invalid argument")]
     InvalidArgument,
@@ -114,8 +136,21 @@ pub enum Error {
     InvalidFormat,
     #[error("Checksum mismatch")]
     ChecksumMismatch,
-    #[error("IO Error")]
-    IOError,
+    #[error("IO error(kind={kind:?}, raw_os_error={raw_os_error:?})")]
+    IOError {
+        kind: std::io::ErrorKind,
+        raw_os_error: Option<i32>,
+    },
+    #[error("storage {op} IO error(kind={kind:?}, raw_os_error={raw_os_error:?})")]
+    StorageIOError {
+        op: StorageOp,
+        kind: std::io::ErrorKind,
+        raw_os_error: Option<i32>,
+    },
+    #[error("short IO")]
+    ShortIO,
+    #[error("storage file capacity exceeded")]
+    StorageFileCapacityExceeded,
     #[error("Data type not supported")]
     DataTypeNotSupported,
     #[error("Index out of bound")]
@@ -146,8 +181,6 @@ pub enum Error {
     StorageEngineShutdownBusy(usize),
     #[error("storage engine runtime is poisoned by fatal {0} failure")]
     StorageEnginePoisoned(StoragePoisonSource),
-    #[error("{0}")]
-    AIOError(#[from] AIOError),
     #[error("table not found")]
     TableNotFound,
     #[error("table not deleted")]
@@ -204,8 +237,11 @@ impl From<TryFromSliceError> for Error {
 
 impl From<std::io::Error> for Error {
     #[inline]
-    fn from(_src: std::io::Error) -> Self {
-        Error::IOError
+    fn from(src: std::io::Error) -> Self {
+        match (src.kind(), src.raw_os_error()) {
+            (std::io::ErrorKind::UnexpectedEof, None) => Error::ShortIO,
+            (kind, raw_os_error) => Error::IOError { kind, raw_os_error },
+        }
     }
 }
 
@@ -238,6 +274,23 @@ impl Error {
             block_id,
             cause,
         }
+    }
+
+    #[inline]
+    pub(crate) fn storage_io_error(op: StorageOp, err: std::io::Error) -> Self {
+        Error::StorageIOError {
+            op,
+            kind: err.kind(),
+            raw_os_error: err.raw_os_error(),
+        }
+    }
+
+    #[inline]
+    pub(crate) fn is_storage_io_failure(&self) -> bool {
+        matches!(
+            self,
+            Error::IOError { .. } | Error::StorageIOError { .. } | Error::ShortIO
+        )
     }
 }
 

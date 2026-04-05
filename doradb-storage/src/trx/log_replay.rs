@@ -1,5 +1,5 @@
 use crate::error::{Error, Result};
-use crate::io::{AIOBuf, DirectBuf};
+use crate::io::{DirectBuf, IOBuf};
 use crate::io::{STORAGE_SECTOR_SIZE, align_to_sector_size};
 use crate::serde::{Deser, LenPrefixPod, Ser, Serde};
 use crate::trx::log::LogPartitionInitializer;
@@ -370,7 +370,7 @@ impl MmapLogReader {
 mod tests {
     use super::*;
     use crate::buffer::test_page_id;
-    use crate::io::AIOBuf;
+    use crate::io::IOBuf;
     use crate::trx::redo::{
         DDLRedo, RedoHeader, RedoLogs, RedoTrxKind, RowRedo, RowRedoKind, TableDML,
     };

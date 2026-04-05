@@ -1590,7 +1590,7 @@ mod tests {
     use crate::error::FileKind;
     use crate::file::test_block_id;
     use crate::index::ColumnBlockEntryShape;
-    use crate::io::AIOBuf;
+    use crate::io::IOBuf;
     use crate::row::{Delete, InsertRow, RowPage};
     use crate::value::{MemVar, Val};
     use ordered_float::OrderedFloat;

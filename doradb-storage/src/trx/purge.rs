@@ -723,7 +723,7 @@ mod tests {
 
             assert!(!handle_gc_row_page_deallocation_result(
                 &engine.trx_sys,
-                Err(Error::IOError)
+                Err(std::io::Error::from_raw_os_error(libc::EIO).into())
             ));
             assert!(matches!(
                 engine.trx_sys.storage_poison_error(),

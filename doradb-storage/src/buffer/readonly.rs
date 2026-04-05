@@ -20,7 +20,7 @@ use crate::error::{Error, FileKind, Result};
 use crate::file::BlockID;
 use crate::file::multi_table_file::MultiTableFile;
 use crate::file::table_file::TableFile;
-use crate::io::{AIOKind, IOSubmission, Operation};
+use crate::io::{IOKind, IOSubmission, Operation};
 use crate::latch::LatchFallbackMode;
 use crate::quiescent::{QuiescentGuard, SyncQuiescentGuard};
 use dashmap::DashMap;
@@ -775,7 +775,7 @@ impl ReadSubmission {
     ///
     /// Exact-page reads publish the reserved frame; short reads and IO errors
     /// drop the reservation so rollback returns the frame to the free list.
-    pub(crate) fn complete(mut self, res: std::io::Result<usize>) -> AIOKind {
+    pub(crate) fn complete(mut self, res: std::io::Result<usize>) -> IOKind {
         let result = match res {
             Ok(len) if len == PAGE_SIZE => {
                 if let Some(validation) = self.validation {
@@ -789,7 +789,7 @@ impl ReadSubmission {
                     ) {
                         drop(self.reservation.take());
                         self.complete_inflight_once(Err(err));
-                        return AIOKind::Read;
+                        return IOKind::Read;
                     }
                 }
                 let reservation = self.reservation.take().expect(
@@ -802,7 +802,7 @@ impl ReadSubmission {
             }
             Ok(_) => {
                 drop(self.reservation.take());
-                Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof).into())
+                Err(Error::ShortIO)
             }
             Err(err) => {
                 drop(self.reservation.take());
@@ -814,7 +814,7 @@ impl ReadSubmission {
             self.pool.stats.add_read_errors(1);
         }
         self.complete_inflight_once(result);
-        AIOKind::Read
+        IOKind::Read
     }
 }
 
@@ -1371,7 +1371,7 @@ pub(crate) mod tests {
         validate_persisted_column_block_index_page,
     };
     use crate::io::{
-        AIOBuf, AIOKind, DirectBuf, StorageBackendOp, StorageBackendTestHook,
+        DirectBuf, IOBuf, IOKind, StorageBackendOp, StorageBackendTestHook,
         install_storage_backend_test_hook,
     };
     use crate::lwc::{
@@ -1716,7 +1716,7 @@ pub(crate) mod tests {
         }
 
         fn matches(&self, op: StorageBackendOp) -> bool {
-            op.kind() == AIOKind::Read
+            op.kind() == IOKind::Read
                 && op.fd() == self.inner.fd
                 && op.offset() == self.inner.offset
         }
@@ -2382,8 +2382,8 @@ pub(crate) mod tests {
             smol::Timer::after(Duration::from_millis(10)).await;
             read_hook.release();
 
-            assert!(matches!(waiter1.await, Err(Error::IOError)));
-            assert!(matches!(waiter2.await, Err(Error::IOError)));
+            assert!(matches!(waiter1.await, Err(Error::IOError { .. })));
+            assert!(matches!(waiter2.await, Err(Error::IOError { .. })));
             assert_eq!(read_hook.call_count(), 1);
             assert_eq!(global.allocated(), 0);
             assert_eq!(global.try_get_frame_id(&key), None);

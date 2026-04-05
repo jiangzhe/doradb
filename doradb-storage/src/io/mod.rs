@@ -19,7 +19,6 @@ use std::collections::VecDeque;
 use std::os::unix::io::RawFd;
 use std::result::Result as StdResult;
 use std::thread::JoinHandle;
-use thiserror::Error;
 
 pub(crate) use backend::IOBackendStatsHandle;
 pub use backend::*;
@@ -30,7 +29,7 @@ pub use iouring_backend::IouringBackend;
 #[cfg(feature = "libaio")]
 pub use libaio_abi::*;
 #[cfg(feature = "libaio")]
-pub use libaio_backend::{AIO, IocbRawPtr, LibaioBackend, UnsafeAIO, pread, pwrite};
+pub use libaio_backend::{IORequest, IocbRawPtr, LibaioBackend, UnsafeIORequest, pread, pwrite};
 
 #[cfg(feature = "iouring")]
 /// Canonical storage backend selected by cargo features.
@@ -48,23 +47,6 @@ pub fn align_to_sector_size(len: usize) -> usize {
     len.max(STORAGE_SECTOR_SIZE).div_ceil(STORAGE_SECTOR_SIZE) * STORAGE_SECTOR_SIZE
 }
 
-#[derive(Debug, Clone, Error)]
-pub enum AIOError {
-    #[error("AIO setup error")]
-    SetupError,
-    #[error("create file error")]
-    CreateFileError,
-    #[error("open file error")]
-    OpenFileError,
-    #[error("truncate file error")]
-    TruncFileError,
-    #[error("AIO out of range")]
-    OutOfRange,
-    #[error("AIO file stat error")]
-    StatError,
-}
-
-pub type AIOResult<T> = StdResult<T, AIOError>;
 #[cfg(test)]
 pub(crate) use self::tests::{
     StorageBackendOp, StorageBackendTestHook, current_storage_backend_test_hook,
@@ -83,7 +65,7 @@ pub enum IOMemory {
 
 // SAFETY: borrowed pointers are only used for buffer/page memory that higher
 // layers guarantee remains valid until completion, matching the old
-// `UnsafeAIO` contract.
+// `UnsafeIORequest` contract.
 unsafe impl Send for IOMemory {}
 
 /// Backend-agnostic description of one submitted kernel IO operation.
@@ -92,7 +74,7 @@ unsafe impl Send for IOMemory {}
 /// owns or borrows the memory that the backend will bind into its prepared
 /// submission shape.
 pub struct Operation {
-    kind: AIOKind,
+    kind: IOKind,
     fd: RawFd,
     offset: usize,
     memory: IOMemory,
@@ -103,7 +85,7 @@ impl Operation {
     #[inline]
     pub fn pread_owned(fd: RawFd, offset: usize, buf: DirectBuf) -> Self {
         Operation {
-            kind: AIOKind::Read,
+            kind: IOKind::Read,
             fd,
             offset,
             memory: IOMemory::Owned(buf),
@@ -114,7 +96,7 @@ impl Operation {
     #[inline]
     pub fn pwrite_owned(fd: RawFd, offset: usize, buf: DirectBuf) -> Self {
         Operation {
-            kind: AIOKind::Write,
+            kind: IOKind::Write,
             fd,
             offset,
             memory: IOMemory::Owned(buf),
@@ -129,7 +111,7 @@ impl Operation {
     #[inline]
     pub unsafe fn pread_borrowed(fd: RawFd, offset: usize, ptr: *mut u8, len: usize) -> Self {
         Operation {
-            kind: AIOKind::Read,
+            kind: IOKind::Read,
             fd,
             offset,
             memory: IOMemory::Borrowed { ptr, len },
@@ -144,7 +126,7 @@ impl Operation {
     #[inline]
     pub unsafe fn pwrite_borrowed(fd: RawFd, offset: usize, ptr: *mut u8, len: usize) -> Self {
         Operation {
-            kind: AIOKind::Write,
+            kind: IOKind::Write,
             fd,
             offset,
             memory: IOMemory::Borrowed { ptr, len },
@@ -153,7 +135,7 @@ impl Operation {
 
     /// Returns whether this operation is a read or a write.
     #[inline]
-    pub fn kind(&self) -> AIOKind {
+    pub fn kind(&self) -> IOKind {
         self.kind
     }
 
@@ -221,22 +203,22 @@ impl Operation {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AIOKind {
+pub enum IOKind {
     Read,
     Write,
 }
 
-pub enum AIOMessage<T> {
+pub enum IOMessage<T> {
     Shutdown,
     Req(T),
 }
 
-impl<T> AIOMessage<T> {
+impl<T> IOMessage<T> {
     #[inline]
     pub fn req(self) -> Option<T> {
         match self {
-            AIOMessage::Req(r) => Some(r),
-            AIOMessage::Shutdown => None,
+            IOMessage::Req(r) => Some(r),
+            IOMessage::Shutdown => None,
         }
     }
 }
@@ -303,11 +285,11 @@ pub trait IOSubmission {
     fn operation(&mut self) -> &mut Operation;
 }
 
-/// AIOKey represents the unique key of any AIO request.
-pub type AIOKey = u64;
+/// IOKey represents the unique key of any worker-owned IO request.
+pub type IOKey = u64;
 
 const INVALID_SLOT: u32 = u32::MAX;
-const DEFAULT_AIO_EVENT_LOOP_BACKLOG: usize = 10;
+const DEFAULT_IO_EVENT_LOOP_BACKLOG: usize = 10;
 
 enum Entry<T> {
     Occupied(T),
@@ -444,9 +426,9 @@ pub trait IOStateMachine {
     /// Called after one submission is accepted by the kernel.
     fn on_submit(&mut self, sub: &Self::Submission);
 
-    /// Called when AIO is completed.
+    /// Called when IO is completed.
     /// The result contains number of bytes read/write, or the IO error.
-    fn on_complete(&mut self, sub: Self::Submission, res: std::io::Result<usize>) -> AIOKind;
+    fn on_complete(&mut self, sub: Self::Submission, res: std::io::Result<usize>) -> IOKind;
 
     /// Called when event loop is ended.
     fn end_loop(self);
@@ -456,13 +438,13 @@ pub trait IOStateMachine {
 ///
 /// The client only transports state-machine requests. It does not own any
 /// backend-specific submission state.
-pub struct AIOClient<T>(Sender<AIOMessage<T>>);
+pub struct IOClient<T>(Sender<IOMessage<T>>);
 
-impl<T> AIOClient<T> {
+impl<T> IOClient<T> {
     #[inline]
-    pub(crate) fn bounded(backlog: usize) -> (Receiver<AIOMessage<T>>, Self) {
+    pub(crate) fn bounded(backlog: usize) -> (Receiver<IOMessage<T>>, Self) {
         let (tx, rx) = flume::bounded(backlog);
-        (rx, AIOClient(tx))
+        (rx, IOClient(tx))
     }
 
     /// Signals that this ingress lane is finished and contributes to worker shutdown.
@@ -474,40 +456,40 @@ impl<T> AIOClient<T> {
     pub fn shutdown(&self) {
         // Someone might already sent shutdown message via the channel,
         // so we ignore send error.
-        let _ = self.0.send(AIOMessage::Shutdown);
+        let _ = self.0.send(IOMessage::Shutdown);
     }
 
-    /// Send IO request to AIO executor.
+    /// Send IO request to the IO worker.
     #[inline]
     pub fn send(&self, req: T) -> StdResult<(), SendError<T>> {
         self.0
-            .send(AIOMessage::Req(req))
+            .send(IOMessage::Req(req))
             .map_err(|e| SendError(e.0.req().unwrap()))
     }
 
-    /// Try send IO request to AIO executor.
+    /// Try send IO request to the IO worker.
     #[inline]
     pub fn try_send(&self, req: T) -> StdResult<(), TrySendError<T>> {
-        self.0.try_send(AIOMessage::Req(req)).map_err(|e| match e {
+        self.0.try_send(IOMessage::Req(req)).map_err(|e| match e {
             TrySendError::Full(v) => TrySendError::Full(v.req().unwrap()),
             TrySendError::Disconnected(v) => TrySendError::Disconnected(v.req().unwrap()),
         })
     }
 
-    /// Send IO request to AIO executor in async way.
+    /// Send IO request to the IO worker in async way.
     #[inline]
     pub async fn send_async(&self, req: T) -> StdResult<(), SendError<T>> {
         self.0
-            .send_async(AIOMessage::Req(req))
+            .send_async(IOMessage::Req(req))
             .await
             .map_err(|e| SendError(e.0.req().unwrap()))
     }
 }
 
-impl<T> Clone for AIOClient<T> {
+impl<T> Clone for IOClient<T> {
     #[inline]
     fn clone(&self) -> Self {
-        AIOClient(self.0.clone())
+        IOClient(self.0.clone())
     }
 }
 
@@ -517,7 +499,7 @@ impl<T> Clone for AIOClient<T> {
 /// concrete [`IOStateMachine`] later.
 pub struct IOWorkerBuilder<T, B = StorageBackend> {
     backend: B,
-    rx: Receiver<AIOMessage<T>>,
+    rx: Receiver<IOMessage<T>>,
 }
 
 impl<T, B> IOWorkerBuilder<T, B>
@@ -558,7 +540,7 @@ where
 /// machine and its owning subsystem.
 pub struct IOWorker<T, S: IOStateMachine<Request = T>, B: IOBackend = StorageBackend> {
     backend: B,
-    rx: Receiver<AIOMessage<T>>,
+    rx: Receiver<IOMessage<T>>,
     deferred_req: Option<T>,
     shutdown: bool,
     submitted: usize,
@@ -650,11 +632,11 @@ where
                 return;
             };
             match msg {
-                AIOMessage::Shutdown => {
+                IOMessage::Shutdown => {
                     self.shutdown = true;
                     return;
                 }
-                AIOMessage::Req(req) => {
+                IOMessage::Req(req) => {
                     let queue_len = queue.len();
                     self.deferred_req = self.state_machine.prepare_request(req, headroom, queue);
                     let admitted = queue.len() - queue_len;
@@ -786,8 +768,8 @@ where
 }
 
 #[inline]
-fn build_io_worker<T, B>(backend: B) -> (IOWorkerBuilder<T, B>, AIOClient<T>) {
-    let (rx, client) = AIOClient::bounded(DEFAULT_AIO_EVENT_LOOP_BACKLOG);
+fn build_io_worker<T, B>(backend: B) -> (IOWorkerBuilder<T, B>, IOClient<T>) {
+    let (rx, client) = IOClient::bounded(DEFAULT_IO_EVENT_LOOP_BACKLOG);
     (IOWorkerBuilder { backend, rx }, client)
 }
 
@@ -799,19 +781,19 @@ mod tests {
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub(crate) struct StorageBackendOp {
-        kind: AIOKind,
+        kind: IOKind,
         fd: RawFd,
         offset: usize,
     }
 
     impl StorageBackendOp {
         #[inline]
-        pub(crate) fn new(kind: AIOKind, fd: RawFd, offset: usize) -> Self {
+        pub(crate) fn new(kind: IOKind, fd: RawFd, offset: usize) -> Self {
             Self { kind, fd, offset }
         }
 
         #[inline]
-        pub(crate) fn kind(&self) -> AIOKind {
+        pub(crate) fn kind(&self) -> IOKind {
             self.kind
         }
 
@@ -1028,7 +1010,7 @@ mod tests {
 
         fn on_submit(&mut self, _sub: &ExpandSubmission) {}
 
-        fn on_complete(&mut self, _sub: ExpandSubmission, _res: std::io::Result<usize>) -> AIOKind {
+        fn on_complete(&mut self, _sub: ExpandSubmission, _res: std::io::Result<usize>) -> IOKind {
             unreachable!("fetch-only tests never complete IO")
         }
 
@@ -1040,7 +1022,7 @@ mod tests {
         submitted: usize,
     ) -> (
         IOWorker<ExpandRequest, ExpandingStateMachine, TestBackend>,
-        AIOClient<ExpandRequest>,
+        IOClient<ExpandRequest>,
     ) {
         let (builder, client) = build_io_worker(TestBackend { max_events });
         let mut worker = builder.bind(ExpandingStateMachine::default());
@@ -1170,7 +1152,7 @@ mod tests {
 
     type RecordingWorkerParts = (
         IOWorker<RecordedRequest, RecordingStateMachine, ImmediateBackend>,
-        AIOClient<RecordedRequest>,
+        IOClient<RecordedRequest>,
         Arc<RecordingLog>,
     );
 
@@ -1218,13 +1200,9 @@ mod tests {
             self.log.submits.lock().unwrap().push(sub.op);
         }
 
-        fn on_complete(
-            &mut self,
-            sub: RecordedSubmission,
-            _res: std::io::Result<usize>,
-        ) -> AIOKind {
+        fn on_complete(&mut self, sub: RecordedSubmission, _res: std::io::Result<usize>) -> IOKind {
             self.log.completes.lock().unwrap().push(sub.op);
-            AIOKind::Write
+            IOKind::Write
         }
 
         fn end_loop(self) {

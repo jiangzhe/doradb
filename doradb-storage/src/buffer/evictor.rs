@@ -254,19 +254,6 @@ pub(super) fn clock_sweep_candidate(
             }
             None
         }
-        FrameKind::EvictionFailed => {
-            if let Some(page_guard) = arena.try_lock_page_exclusive(page_id) {
-                if page_guard
-                    .bf()
-                    .compare_exchange_kind(FrameKind::EvictionFailed, FrameKind::Evicting)
-                    != FrameKind::EvictionFailed
-                {
-                    return None;
-                }
-                return Some(page_guard);
-            }
-            None
-        }
         FrameKind::Hot => {
             let _ = arena.compare_exchange_frame_kind(page_id, FrameKind::Hot, FrameKind::Cool);
             None
@@ -977,14 +964,14 @@ mod tests {
     use crate::file::cow_file::COW_FILE_PAGE_SIZE;
     use crate::file::fs::{FileSystem, FileSystemWorkers};
     use crate::file::table_file::TableFile;
-    use crate::io::{AIOBuf, DirectBuf};
+    use crate::io::{DirectBuf, IOBuf};
     use crate::{DiskPool, IndexPool, MemPool};
     use event_listener::Event;
     use std::mem;
     use std::path::Path;
     use std::sync::Arc;
     use std::thread;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
     use tempfile::TempDir;
 
     #[test]
@@ -1149,7 +1136,7 @@ mod tests {
 
     const TEST_POOL_BYTES: usize = 64 * 1024 * 130;
     const TEST_POOL_MAX_FILE_BYTES: usize = 128 * 1024 * 260;
-    const TEST_WAIT_RETRIES: usize = 100;
+    const TEST_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
     const TEST_WAIT_INTERVAL: Duration = Duration::from_millis(10);
 
     fn frame_page_bytes(capacity: usize) -> usize {
@@ -1157,9 +1144,13 @@ mod tests {
     }
 
     fn wait_for(mut predicate: impl FnMut() -> bool) {
-        for _ in 0..TEST_WAIT_RETRIES {
+        let deadline = Instant::now() + TEST_WAIT_TIMEOUT;
+        loop {
             if predicate() {
                 return;
+            }
+            if Instant::now() >= deadline {
+                break;
             }
             thread::sleep(TEST_WAIT_INTERVAL);
         }
@@ -1252,6 +1243,14 @@ mod tests {
         fn wait_until_idle(&self) -> SharedPoolEvictorStats {
             let start = self.stats();
             wait_for(|| self.stats().wait_count > start.wait_count);
+            self.stats()
+        }
+
+        fn wait_until_idle_since(&self, start: SharedPoolEvictorStats) -> SharedPoolEvictorStats {
+            wait_for(|| {
+                let stats = self.stats();
+                stats.wait_count > start.wait_count && stats.wake_count > start.wake_count
+            });
             self.stats()
         }
     }
@@ -1373,8 +1372,7 @@ mod tests {
 
                 let start = runtime.stats();
                 let readonly_pool = read_with_pressure(&runtime.fs, &runtime.disk_pool, 201).await;
-                wait_for(|| runtime.stats().delta_since(start).readonly_runs > 0);
-                let delta = runtime.stats().delta_since(start);
+                let delta = runtime.wait_until_idle_since(start).delta_since(start);
                 assert!(delta.wake_count > 0);
                 assert!(delta.readonly_runs > 0);
                 assert_eq!(delta.mem_runs, 0);
@@ -1389,8 +1387,7 @@ mod tests {
 
                 let start = runtime.stats();
                 allocate_with_pressure(&runtime.mem_pool, 192).await;
-                wait_for(|| runtime.stats().delta_since(start).mem_runs > 0);
-                let delta = runtime.stats().delta_since(start);
+                let delta = runtime.wait_until_idle_since(start).delta_since(start);
                 assert!(delta.wake_count > 0);
                 assert_eq!(delta.readonly_runs, 0);
                 assert!(delta.mem_runs > 0);
@@ -1404,8 +1401,7 @@ mod tests {
 
                 let start = runtime.stats();
                 allocate_with_pressure(&runtime.index_pool, 192).await;
-                wait_for(|| runtime.stats().delta_since(start).index_runs > 0);
-                let delta = runtime.stats().delta_since(start);
+                let delta = runtime.wait_until_idle_since(start).delta_since(start);
                 assert!(delta.wake_count > 0);
                 assert_eq!(delta.readonly_runs, 0);
                 assert_eq!(delta.mem_runs, 0);

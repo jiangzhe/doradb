@@ -2,9 +2,9 @@ use crate::io::{STORAGE_SECTOR_SIZE, align_to_sector_size};
 use crate::serde::Ser;
 use std::alloc::{Layout, alloc, alloc_zeroed};
 
-/// AIOBuf represents one aligned direct-I/O buffer shared by the supported
+/// IOBuf represents one aligned direct-I/O buffer shared by the supported
 /// storage backends.
-pub trait AIOBuf: Send + 'static {
+pub trait IOBuf: Send + 'static {
     /// Returns reference to underlying byte slice.
     fn as_bytes(&self) -> &[u8];
 
@@ -152,7 +152,7 @@ impl From<&[u8]> for DirectBuf {
     }
 }
 
-impl AIOBuf for DirectBuf {
+impl IOBuf for DirectBuf {
     #[inline]
     fn as_bytes(&self) -> &[u8] {
         &self.data

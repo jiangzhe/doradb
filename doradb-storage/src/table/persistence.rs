@@ -143,7 +143,7 @@ impl Table {
         // Step 9: publish new table-file root and then commit checkpoint transaction.
         let (table_file, old_root) = match mutable_file.commit(checkpoint_ts, false).await {
             Ok(res) => res,
-            Err(Error::IOError | Error::AIOError(_) | Error::SendError) => {
+            Err(err) if err.is_storage_io_failure() || matches!(err, Error::SendError) => {
                 let _ = trx_sys.rollback(trx).await;
                 let poison = trx_sys.poison_storage(StoragePoisonSource::CheckpointWrite);
                 return Err(poison);
