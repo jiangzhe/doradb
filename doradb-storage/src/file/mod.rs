@@ -266,11 +266,9 @@ impl SparseFile {
             }
             let ret = ftruncate(fd, max_size as i64);
             if ret < 0 {
+                let err = std::io::Error::last_os_error();
                 let _ = close(fd); // close file descriptor if truncate fail.
-                return Err(Error::storage_io_error(
-                    StorageOp::FileResize,
-                    std::io::Error::last_os_error(),
-                ));
+                return Err(Error::storage_io_error(StorageOp::FileResize, err));
             }
             Ok(SparseFile::new(fd, 0, max_size))
         }
@@ -298,11 +296,9 @@ impl SparseFile {
             }
             let ret = ftruncate(fd, max_size as i64);
             if ret < 0 {
+                let err = std::io::Error::last_os_error();
                 let _ = close(fd); // close file descriptor if truncate fail.
-                return Err(Error::storage_io_error(
-                    StorageOp::FileResize,
-                    std::io::Error::last_os_error(),
-                ));
+                return Err(Error::storage_io_error(StorageOp::FileResize, err));
             }
             Ok(SparseFile::new(fd, 0, max_size))
         }
