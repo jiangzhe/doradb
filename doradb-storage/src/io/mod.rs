@@ -68,7 +68,7 @@ pub type AIOResult<T> = StdResult<T, AIOError>;
 #[cfg(test)]
 pub(crate) use self::tests::{
     StorageBackendOp, StorageBackendTestHook, current_storage_backend_test_hook,
-    set_storage_backend_test_hook,
+    install_storage_backend_test_hook,
 };
 
 /// Buffer ownership model for one backend-agnostic IO operation.
@@ -794,8 +794,8 @@ fn build_io_worker<T, B>(backend: B) -> (IOWorkerBuilder<T, B>, AIOClient<T>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub(crate) struct StorageBackendOp {
@@ -834,8 +834,22 @@ mod tests {
 
     type StorageBackendHook = Arc<dyn StorageBackendTestHook>;
 
+    static STORAGE_BACKEND_TEST_HOOK_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
     static STORAGE_BACKEND_TEST_HOOK: std::sync::Mutex<Option<StorageBackendHook>> =
         std::sync::Mutex::new(None);
+
+    pub(crate) struct InstalledStorageBackendTestHook {
+        previous: Option<StorageBackendHook>,
+        guard: Option<MutexGuard<'static, ()>>,
+    }
+
+    impl Drop for InstalledStorageBackendTestHook {
+        #[inline]
+        fn drop(&mut self) {
+            let _ = set_storage_backend_test_hook(self.previous.take());
+            drop(self.guard.take());
+        }
+    }
 
     #[inline]
     pub(crate) fn current_storage_backend_test_hook() -> Option<StorageBackendHook> {
@@ -848,6 +862,59 @@ mod tests {
     ) -> Option<StorageBackendHook> {
         let mut guard = STORAGE_BACKEND_TEST_HOOK.lock().unwrap();
         std::mem::replace(&mut *guard, hook)
+    }
+
+    #[inline]
+    fn install_storage_backend_test_hook_locked(
+        hook: StorageBackendHook,
+        guard: MutexGuard<'static, ()>,
+    ) -> InstalledStorageBackendTestHook {
+        InstalledStorageBackendTestHook {
+            previous: set_storage_backend_test_hook(Some(hook)),
+            guard: Some(guard),
+        }
+    }
+
+    #[inline]
+    pub(crate) fn install_storage_backend_test_hook(
+        hook: StorageBackendHook,
+    ) -> InstalledStorageBackendTestHook {
+        let guard = STORAGE_BACKEND_TEST_HOOK_LOCK.lock().unwrap();
+        install_storage_backend_test_hook_locked(hook, guard)
+    }
+
+    struct NoopStorageBackendTestHook;
+
+    impl StorageBackendTestHook for NoopStorageBackendTestHook {}
+
+    #[test]
+    fn test_install_storage_backend_test_hook_clears_hook_on_drop() {
+        let hook: StorageBackendHook = Arc::new(NoopStorageBackendTestHook);
+        {
+            let _install = install_storage_backend_test_hook(hook.clone());
+            let current = current_storage_backend_test_hook().unwrap();
+            assert!(Arc::ptr_eq(&current, &hook));
+        }
+        assert!(current_storage_backend_test_hook().is_none());
+    }
+
+    #[test]
+    fn test_installed_storage_backend_test_hook_restores_previous_on_drop() {
+        let previous: StorageBackendHook = Arc::new(NoopStorageBackendTestHook);
+        let next: StorageBackendHook = Arc::new(NoopStorageBackendTestHook);
+        let guard = STORAGE_BACKEND_TEST_HOOK_LOCK.lock().unwrap();
+        let replaced = set_storage_backend_test_hook(Some(previous.clone()));
+        assert!(replaced.is_none());
+
+        let install = install_storage_backend_test_hook_locked(next.clone(), guard);
+        let current = current_storage_backend_test_hook().unwrap();
+        assert!(Arc::ptr_eq(&current, &next));
+        drop(install);
+
+        let restored = current_storage_backend_test_hook().unwrap();
+        assert!(Arc::ptr_eq(&restored, &previous));
+        let cleared = set_storage_backend_test_hook(None).unwrap();
+        assert!(Arc::ptr_eq(&cleared, &previous));
     }
 
     #[test]

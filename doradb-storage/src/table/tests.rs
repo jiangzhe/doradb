@@ -12,7 +12,9 @@ use crate::index::{
     COLUMN_BLOCK_HEADER_SIZE, COLUMN_BLOCK_LEAF_HEADER_SIZE, ColumnBlockIndex, RowLocation,
     UniqueIndex, load_entry_deletion_deltas,
 };
-use crate::io::{AIOKind, StorageBackendOp, StorageBackendTestHook, set_storage_backend_test_hook};
+use crate::io::{
+    AIOKind, StorageBackendOp, StorageBackendTestHook, install_storage_backend_test_hook,
+};
 use crate::latch::LatchFallbackMode;
 use crate::row::ops::{DeleteMvcc, InsertMvcc, SelectKey, SelectMvcc, UpdateCol, UpdateMvcc};
 use crate::row::{RowID, RowPage, RowRead};
@@ -25,35 +27,10 @@ use crate::value::Val;
 use std::fs::OpenOptions;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::fd::RawFd;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
 use std::time::Duration;
 use tempfile::TempDir;
-
-static STORAGE_BACKEND_TEST_HOOK_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
-
-struct InstalledStorageBackendTestHook {
-    previous: Option<Arc<dyn StorageBackendTestHook>>,
-    guard: Option<MutexGuard<'static, ()>>,
-}
-
-impl Drop for InstalledStorageBackendTestHook {
-    #[inline]
-    fn drop(&mut self) {
-        let _ = set_storage_backend_test_hook(self.previous.take());
-        drop(self.guard.take());
-    }
-}
-
-fn install_storage_backend_test_hook(
-    hook: Arc<dyn StorageBackendTestHook>,
-) -> InstalledStorageBackendTestHook {
-    let guard = STORAGE_BACKEND_TEST_HOOK_LOCK.lock().unwrap();
-    InstalledStorageBackendTestHook {
-        previous: set_storage_backend_test_hook(Some(hook)),
-        guard: Some(guard),
-    }
-}
 
 struct FailingPageReadHook {
     fd: RawFd,

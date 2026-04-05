@@ -1372,7 +1372,7 @@ pub(crate) mod tests {
     };
     use crate::io::{
         AIOBuf, AIOKind, DirectBuf, StorageBackendOp, StorageBackendTestHook,
-        set_storage_backend_test_hook,
+        install_storage_backend_test_hook,
     };
     use crate::lwc::{
         LWC_BLOCK_PAYLOAD_SIZE, LwcBlock, LwcBlockHeader, validate_persisted_lwc_block,
@@ -1381,8 +1381,8 @@ pub(crate) mod tests {
     use crate::value::ValKind;
     use std::ops::Deref;
     use std::os::fd::RawFd;
+    use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-    use std::sync::{Arc, LazyLock};
     use std::thread;
     use std::time::Duration;
     use tempfile::TempDir;
@@ -1632,37 +1632,6 @@ pub(crate) mod tests {
         payload[COLUMN_DELETION_BLOB_PAGE_HEADER_SIZE] = 7;
         write_block_checksum(&mut buf);
         buf
-    }
-
-    /// Serializes ownership of the process-global storage-backend test hook.
-    ///
-    /// The hook itself is stored in `io` as one process-global
-    /// slot, so readonly tests must not interleave install/restore across
-    /// different test cases.
-    static STORAGE_BACKEND_TEST_HOOK_LOCK: LazyLock<parking_lot::Mutex<()>> =
-        LazyLock::new(|| parking_lot::Mutex::new(()));
-
-    struct InstalledStorageBackendTestHook {
-        previous: Option<Arc<dyn StorageBackendTestHook>>,
-        guard: Option<parking_lot::MutexGuard<'static, ()>>,
-    }
-
-    impl Drop for InstalledStorageBackendTestHook {
-        #[inline]
-        fn drop(&mut self) {
-            let _ = set_storage_backend_test_hook(self.previous.take());
-            drop(self.guard.take());
-        }
-    }
-
-    fn install_storage_backend_test_hook(
-        hook: Arc<dyn StorageBackendTestHook>,
-    ) -> InstalledStorageBackendTestHook {
-        let guard = STORAGE_BACKEND_TEST_HOOK_LOCK.lock();
-        InstalledStorageBackendTestHook {
-            previous: set_storage_backend_test_hook(Some(hook)),
-            guard: Some(guard),
-        }
     }
 
     #[derive(Clone)]

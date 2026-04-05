@@ -1649,7 +1649,7 @@ pub(crate) mod tests {
     use crate::file::table_file::TableFile;
     use crate::io::{
         AIOBuf, AIOKind, DirectBuf, StorageBackendOp, StorageBackendTestHook,
-        set_storage_backend_test_hook,
+        install_storage_backend_test_hook,
     };
     use crate::latch::LatchFallbackMode;
     use crate::value::ValKind;
@@ -1657,7 +1657,6 @@ pub(crate) mod tests {
     use std::ops::Deref;
     use std::os::fd::RawFd;
     use std::sync::Arc;
-    use std::sync::LazyLock;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::time::Duration;
     use tempfile::TempDir;
@@ -1830,32 +1829,6 @@ pub(crate) mod tests {
         let mut buf = DirectBuf::zeroed(COW_FILE_PAGE_SIZE);
         buf.as_bytes_mut()[..payload.len()].copy_from_slice(payload);
         table_file.write_block(block_id, buf).await.unwrap();
-    }
-
-    static STORAGE_BACKEND_TEST_HOOK_LOCK: LazyLock<parking_lot::Mutex<()>> =
-        LazyLock::new(|| parking_lot::Mutex::new(()));
-
-    struct InstalledStorageBackendTestHook {
-        previous: Option<Arc<dyn StorageBackendTestHook>>,
-        guard: Option<parking_lot::MutexGuard<'static, ()>>,
-    }
-
-    impl Drop for InstalledStorageBackendTestHook {
-        #[inline]
-        fn drop(&mut self) {
-            let _ = set_storage_backend_test_hook(self.previous.take());
-            drop(self.guard.take());
-        }
-    }
-
-    fn install_storage_backend_test_hook(
-        hook: Arc<dyn StorageBackendTestHook>,
-    ) -> InstalledStorageBackendTestHook {
-        let guard = STORAGE_BACKEND_TEST_HOOK_LOCK.lock();
-        InstalledStorageBackendTestHook {
-            previous: set_storage_backend_test_hook(Some(hook)),
-            guard: Some(guard),
-        }
     }
 
     #[derive(Clone)]
