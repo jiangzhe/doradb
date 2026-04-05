@@ -2,7 +2,7 @@ use crate::bitmap::AllocMap;
 use crate::buffer::arena::{ArenaGuard, QuiescentArena};
 use crate::buffer::evictor::{
     ClockHand, EvictionArbiter, EvictionRuntime, FailureRateTracker, PressureDeltaClockPolicy,
-    SharedEvictionDomain, clock_collect_batch, clock_sweep_candidate,
+    SharedEvictionDomain, SharedEvictionDomainId, clock_collect_batch, clock_sweep_candidate,
 };
 use crate::buffer::frame::{BufferFrame, FrameKind};
 use crate::buffer::guard::{FacadePageGuard, PageExclusiveGuard, PageGuard, PageLatchGuard};
@@ -245,8 +245,13 @@ impl EvictableBufferPool {
 
     #[inline]
     pub(super) fn shared_evictor_domain(pool: SyncQuiescentGuard<Self>) -> SharedEvictionDomain {
+        let domain_id = match pool.role {
+            PoolRole::Mem => SharedEvictionDomainId::Mem,
+            PoolRole::Index => SharedEvictionDomainId::Index,
+            other => panic!("unsupported shared-evictor role: {other:?}"),
+        };
         let (runtime, policy) = Self::evictor_parts(pool);
-        SharedEvictionDomain::new(runtime, policy)
+        SharedEvictionDomain::new(domain_id, runtime, policy)
     }
 
     /// Reserve a page in memory.
@@ -1434,6 +1439,45 @@ pub(crate) mod tests {
     #[inline]
     pub(crate) fn raw_fd(pool: &EvictableBufferPool) -> RawFd {
         pool.raw_fd
+    }
+
+    pub(crate) async fn dispatch_dirty_pages_for_test(
+        pool: QuiescentGuard<EvictableBufferPool>,
+        page_count: usize,
+    ) -> event_listener::EventListener {
+        let pool_guard = pool.pool_guard();
+        let mut page_guards = Vec::with_capacity(page_count);
+        for idx in 0..page_count {
+            let mut page_guard = pool.allocate_page::<Page>(&pool_guard).await;
+            page_guard.page_mut()[0] = idx as u8;
+            page_guard.bf_mut().set_dirty(true);
+            page_guard.bf_mut().set_kind(FrameKind::Evicting);
+            page_guards.push(page_guard);
+        }
+        let runtime = EvictableRuntime {
+            arena: pool.arena.arena_guard(pool.pool_guard()),
+            pool: pool.into_sync(),
+        };
+        runtime.dispatch_io_writes(page_guards)
+    }
+
+    pub(crate) async fn persist_and_evict_page_for_test(
+        pool: QuiescentGuard<EvictableBufferPool>,
+        payload: &[u8],
+    ) -> PageID {
+        let pool_guard = pool.pool_guard();
+        let mut page_guard = pool.allocate_page::<Page>(&pool_guard).await;
+        let page_id = page_guard.page_id();
+        page_guard.page_mut()[..payload.len()].copy_from_slice(payload);
+        page_guard.bf_mut().set_dirty(true);
+        page_guard.bf_mut().set_kind(FrameKind::Evicting);
+        let runtime = EvictableRuntime {
+            arena: pool.arena.arena_guard(pool.pool_guard()),
+            pool: pool.clone().into_sync(),
+        };
+        runtime.dispatch_io_writes(vec![page_guard]).await;
+        wait_for(|| pool.arena.frame(page_id).kind() == FrameKind::Evicted);
+        page_id
     }
 
     fn wait_for(mut predicate: impl FnMut() -> bool) {

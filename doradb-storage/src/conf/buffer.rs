@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 
 use super::consts::{
     DEFAULT_EVICTABLE_BUFFER_POOL_DATA_SWAP_FILE, DEFAULT_EVICTABLE_BUFFER_POOL_MAX_FILE_SIZE,
-    DEFAULT_EVICTABLE_BUFFER_POOL_MAX_IO_DEPTH, DEFAULT_EVICTABLE_BUFFER_POOL_MAX_MEM_SIZE,
+    DEFAULT_EVICTABLE_BUFFER_POOL_MAX_MEM_SIZE,
 };
 
 /// Builder-style configuration for [`crate::buffer::EvictableBufferPool`].
@@ -26,7 +26,6 @@ pub struct EvictableBufferPoolConfig {
     pub(crate) data_swap_file: PathBuf,
     pub(crate) max_file_size: Byte,
     pub(crate) max_mem_size: Byte,
-    pub(crate) max_io_depth: usize,
     pub(crate) eviction_arbiter_builder: EvictionArbiterBuilder,
 }
 
@@ -38,7 +37,6 @@ impl Default for EvictableBufferPoolConfig {
             data_swap_file: PathBuf::from(DEFAULT_EVICTABLE_BUFFER_POOL_DATA_SWAP_FILE),
             max_file_size: DEFAULT_EVICTABLE_BUFFER_POOL_MAX_FILE_SIZE,
             max_mem_size: DEFAULT_EVICTABLE_BUFFER_POOL_MAX_MEM_SIZE,
-            max_io_depth: DEFAULT_EVICTABLE_BUFFER_POOL_MAX_IO_DEPTH,
             eviction_arbiter_builder: EvictionArbiter::builder(),
         }
     }
@@ -77,12 +75,6 @@ impl EvictableBufferPoolConfig {
         Byte: From<T>,
     {
         self.max_mem_size = Byte::from(max_mem_size);
-        self
-    }
-
-    #[inline]
-    pub fn max_io_depth(mut self, max_io_depth: usize) -> Self {
-        self.max_io_depth = max_io_depth;
         self
     }
 

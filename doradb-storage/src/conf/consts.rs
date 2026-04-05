@@ -34,8 +34,6 @@ pub(crate) const DEFAULT_EVICTABLE_BUFFER_POOL_MAX_FILE_SIZE: Byte =
 /// Default in-memory budget for a generic evictable buffer pool.
 pub(crate) const DEFAULT_EVICTABLE_BUFFER_POOL_MAX_MEM_SIZE: Byte =
     Byte::from_u64(1024 * 1024 * 1024);
-/// Default async IO depth for an evictable buffer pool worker.
-pub(crate) const DEFAULT_EVICTABLE_BUFFER_POOL_MAX_IO_DEPTH: usize = 64;
 
 /// Default async IO depth allocated to each redo-log partition.
 pub const DEFAULT_LOG_IO_DEPTH: usize = 32;

@@ -64,6 +64,19 @@ Worker components are separate registry entries because they need explicit
 shutdown before their owner objects are dropped, but their long-lived
 dependencies are still encoded by the same topological order.
 
+The two storage-runtime worker components currently own:
+
+- `FileSystemWorkers`
+  - the shared storage-I/O thread;
+  - shutdown sequencing for the three ingress lanes owned by `FileSystem`; and
+  - the backend-owned completion lifecycle for table-file and evictable-pool
+    IO.
+- `SharedPoolEvictorWorkers`
+  - one shared eviction thread for the global readonly pool, `mem_pool`, and
+    `index_pool`;
+  - wakeup/shutdown orchestration for those three domains; and
+  - the shared-evictor stats handle published through the component registry.
+
 ## Admission, Shutdown, And Drop
 
 The engine lifecycle has three states:
@@ -168,3 +181,8 @@ Use this split when adding or reviewing engine fields:
 
 That distinction keeps runtime access small and cloneable while preserving one
 clear owner for shutdown ordering.
+
+For the current storage runtime, `FileSystem` is the runtime-facing access path
+for shared-storage IO clients and stats snapshots, while the shared evictor's
+stats live on the `SharedPoolEvictorWorkers` component access handle rather
+than on the individual pool APIs.

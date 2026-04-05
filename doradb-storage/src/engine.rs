@@ -386,6 +386,7 @@ mod tests {
         assert!(config_str.contains("data_swap_file"));
         assert!(config_str.contains("log_dir"));
         assert!(config_str.contains("log_file_stem"));
+        assert!(!config_str.contains("max_io_depth"));
     }
 
     #[test]
@@ -426,8 +427,7 @@ mod tests {
                     EvictableBufferPoolConfig::default()
                         .role(PoolRole::Mem)
                         .max_mem_size(TEST_POOL_BYTES)
-                        .max_file_size(128usize * 1024 * 1024)
-                        .max_io_depth(1),
+                        .max_file_size(128usize * 1024 * 1024),
                 )
                 .build()
                 .await
@@ -439,6 +439,38 @@ mod tests {
 
             assert_eq!(table_stats, mem_stats);
             assert_eq!(table_stats, index_stats);
+        });
+    }
+
+    #[test]
+    fn test_engine_shared_storage_io_depth_comes_from_file_system_config() {
+        smol::block_on(async {
+            let root = TempDir::new().unwrap();
+            let engine = test_engine_config_for(root.path())
+                .file(
+                    FileSystemConfig::default()
+                        .io_depth(7)
+                        .readonly_buffer_size(TEST_POOL_BYTES),
+                )
+                .data_buffer(
+                    EvictableBufferPoolConfig::default()
+                        .role(PoolRole::Mem)
+                        .max_mem_size(TEST_POOL_BYTES)
+                        .max_file_size(128usize * 1024 * 1024),
+                )
+                .build()
+                .await
+                .unwrap();
+
+            assert_eq!(engine.table_fs.configured_io_depth(), 7);
+            assert_eq!(
+                engine.mem_pool.io_backend_stats(),
+                engine.table_fs.io_backend_stats()
+            );
+            assert_eq!(
+                engine.index_pool.io_backend_stats(),
+                engine.table_fs.io_backend_stats()
+            );
         });
     }
 

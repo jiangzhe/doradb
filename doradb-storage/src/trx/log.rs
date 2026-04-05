@@ -1086,7 +1086,7 @@ mod tests {
     use crate::engine::{Engine, EngineRef};
     use crate::file::{FileSyncKind, FileSyncOp, FileSyncTestHook, set_file_sync_test_hook};
     use crate::io::{
-        AIOKind, StorageBackendOp, StorageBackendTestHook, set_storage_backend_test_hook,
+        AIOKind, StorageBackendOp, StorageBackendTestHook, install_storage_backend_test_hook,
     };
     use crate::trx::log_replay::{LogMerger, ReadLog};
     use crate::value::Val;
@@ -1114,31 +1114,7 @@ mod tests {
         panic!("condition was not satisfied before timeout");
     }
 
-    static STORAGE_BACKEND_TEST_HOOK_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
     static FILE_SYNC_TEST_HOOK_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
-
-    struct InstalledStorageBackendTestHook {
-        previous: Option<Arc<dyn StorageBackendTestHook>>,
-        guard: Option<MutexGuard<'static, ()>>,
-    }
-
-    impl Drop for InstalledStorageBackendTestHook {
-        #[inline]
-        fn drop(&mut self) {
-            let _ = set_storage_backend_test_hook(self.previous.take());
-            drop(self.guard.take());
-        }
-    }
-
-    fn install_storage_backend_test_hook(
-        hook: Arc<dyn StorageBackendTestHook>,
-    ) -> InstalledStorageBackendTestHook {
-        let guard = STORAGE_BACKEND_TEST_HOOK_LOCK.lock().unwrap();
-        InstalledStorageBackendTestHook {
-            previous: set_storage_backend_test_hook(Some(hook)),
-            guard: Some(guard),
-        }
-    }
 
     struct InstalledFileSyncTestHook {
         previous: Option<Arc<dyn FileSyncTestHook>>,
