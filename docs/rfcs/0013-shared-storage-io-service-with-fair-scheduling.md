@@ -483,7 +483,7 @@ Backend-touching phases must also run the supported alternate backend pass:
   - Task Doc: `docs/tasks/000108-validate-and-harden-shared-storage-runtime.md`
   - Task Issue: `#527`
   - Phase Status: done
-  - Implementation Summary: Implemented phase 4 by adding shared-storage fairness telemetry and starvation-focused production tests, shared-evictor wake/domain telemetry plus engine-backed fairness coverage, authoritative shared-IO-depth compatibility validation, and runtime-topology doc sync for the shared storage worker and shared evictor. [Task Resolve Sync: docs/tasks/000108-validate-and-harden-shared-storage-runtime.md @ 2026-04-05]
+  - Implementation Summary: Implemented phase 4 by adding shared-storage fairness telemetry and starvation-focused production tests, shared-evictor wake/domain telemetry plus engine-backed fairness coverage, authoritative shared-IO-depth compatibility validation, runtime-topology doc sync, and shared storage-backend test-hook serialization hardening for hook-driven tests. [Task Resolve Sync: docs/tasks/000108-validate-and-harden-shared-storage-runtime.md @ 2026-04-05]
 
 ## Consequences
 

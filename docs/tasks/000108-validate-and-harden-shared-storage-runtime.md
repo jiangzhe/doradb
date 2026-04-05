@@ -215,6 +215,11 @@ runtime without changing the selected runtime topology.
    - `cargo clippy -p doradb-storage --all-targets -- -D warnings`
    - `cargo nextest run -p doradb-storage`
    - `cargo nextest run -p doradb-storage --no-default-features --features libaio`
+8. Post-implementation review hardening consolidated storage-backend test-hook
+   installation onto one shared test-only lock in `doradb-storage/src/io/mod.rs`
+   so hook-driven tests in shared-storage, readonly, table, and redo-log
+   modules cannot race by installing different hooks against the same
+   process-global hook slot.
 
 ## Impacts
 
