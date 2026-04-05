@@ -455,7 +455,7 @@ Backend-touching phases must also run the supported alternate backend pass:
   - Task Doc: `docs/tasks/000106-shared-storage-io-runtime-and-config-centralization.md`
   - Task Issue: `#522`
   - Phase Status: done
-  - Implementation Summary: Implemented phase 2 by centralizing shared storage IO under FileSystem and FileSystemWorkers, replacing dedicated table and pool storage workers with one concrete three-lane storage worker in doradb-storage/src/file/fs.rs, making MemPool and IndexPool depend directly on FileSystem, renaming TableFileSystem and TableFileSystemConfig to FileSystem and FileSystemConfig, and leaving shared evictor work plus the broader AIO rename as follow-up scope. [Task Resolve Sync: docs/tasks/000106-shared-storage-io-runtime-and-config-centralization.md @ 2026-04-04]
+  - Implementation Summary: Implemented phase 2 by centralizing shared storage IO under FileSystem and FileSystemWorkers, replacing dedicated table and pool storage workers with one concrete three-lane storage worker in doradb-storage/src/file/fs.rs, making MemPool and IndexPool depend directly on FileSystem, renaming TableFileSystem and TableFileSystemConfig to FileSystem and FileSystemConfig, and deferring the shared evictor, broader AIO rename, raw-fd file-ownership hardening, and file-sync abstraction work to follow-up phases and backlog docs. [Task Resolve Sync: docs/tasks/000106-shared-storage-io-runtime-and-config-centralization.md @ 2026-04-04]
 
 - **Phase 3: Shared Multi-Pool Evictor**
   - Scope: Introduce `SharedPoolEvictor`, migrate global readonly, `mem_pool`,
@@ -469,7 +469,7 @@ Backend-touching phases must also run the supported alternate backend pass:
   - Task Doc: `docs/tasks/000107-shared-multi-pool-evictor.md`
   - Task Issue: `#524`
   - Phase Status: done
-  - Implementation Summary: Implemented the shared multi-pool evictor by adding one `SharedPoolEvictorWorkers` component after `FileSystemWorkers`, preserving one pool-local policy/clock-hand per pool, routing readonly/mem/index pressure through one shared wake event, removing the old per-pool production evictor-owner components, and validating both the default and `libaio` backends. [Task Resolve Sync: docs/tasks/000107-shared-multi-pool-evictor.md @ 2026-04-04]
+  - Implementation Summary: Implemented the shared multi-pool evictor by adding one `SharedPoolEvictorWorkers` component after `FileSystemWorkers`, preserving one pool-local policy/clock-hand per pool, routing readonly/mem/index pressure through one shared wake event, removing the old per-pool production evictor-owner components, and validating both the default and `libaio` backends, while leaving mutable-pool shutdown waiter propagation to a separate fallible-allocation follow-up. [Task Resolve Sync: docs/tasks/000107-shared-multi-pool-evictor.md @ 2026-04-04]
 
 - **Phase 4: Validation, Stats, And Documentation Hardening**
   - Scope: Add starvation-focused shared-I/O tests, multi-pool wakeup and
@@ -483,7 +483,7 @@ Backend-touching phases must also run the supported alternate backend pass:
   - Task Doc: `docs/tasks/000108-validate-and-harden-shared-storage-runtime.md`
   - Task Issue: `#527`
   - Phase Status: done
-  - Implementation Summary: Implemented phase 4 by adding shared-storage fairness telemetry and starvation-focused production tests, shared-evictor wake/domain telemetry plus engine-backed fairness coverage, authoritative shared-IO-depth compatibility validation, runtime-topology doc sync, and shared storage-backend test-hook serialization hardening for hook-driven tests. [Task Resolve Sync: docs/tasks/000108-validate-and-harden-shared-storage-runtime.md @ 2026-04-05]
+  - Implementation Summary: Implemented phase 4 by adding shared-storage fairness telemetry and starvation-focused production tests, shared-evictor wake/domain telemetry plus engine-backed fairness coverage, completing the shared-depth cleanup by removing the last pool-local `max_io_depth` config surface, syncing runtime-topology docs, and hardening shared storage-backend test-hook serialization for hook-driven tests. [Task Resolve Sync: docs/tasks/000108-validate-and-harden-shared-storage-runtime.md @ 2026-04-05]
 
 ## Consequences
 
