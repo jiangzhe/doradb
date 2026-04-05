@@ -42,3 +42,11 @@ When a backlog item is moved to `docs/backlogs/closed/`, append:
 - Reference: <task/issue/pr reference>
 - Closed At: <YYYY-MM-DD>
 ```
+
+## Close Reason
+
+- Type: implemented
+- Detail: Task 000109 renamed the io surface, so this deferred rename backlog is now implemented.
+- Closed By: backlog close
+- Reference: docs/tasks/000109-rename-aio-surface-to-io-and-refine-storage-io-errors.md
+- Closed At: 2026-04-05
