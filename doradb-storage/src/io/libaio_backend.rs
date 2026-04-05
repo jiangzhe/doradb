@@ -1,15 +1,16 @@
 use super::{
-    AIOBuf, AIOClient, AIOError, AIOKey, AIOKind, AIOResult, BackendToken, IOBackend,
-    IOBackendStats, IOBackendStatsHandle, IOWorkerBuilder, Operation, build_io_worker,
-    io_context_t, io_destroy, io_event, io_getevents, io_iocb_cmd, io_setup, io_submit, iocb,
+    BackendToken, IOBackend, IOBackendStats, IOBackendStatsHandle, IOBuf, IOClient, IOKey, IOKind,
+    IOWorkerBuilder, Operation, build_io_worker, io_context_t, io_destroy, io_event, io_getevents,
+    io_iocb_cmd, io_setup, io_submit, iocb,
 };
+use crate::error::{Error, Result, StorageOp};
 use libc::{EAGAIN, EINTR, c_long};
 use std::collections::VecDeque;
 use std::os::unix::io::RawFd;
 use std::result::Result as StdResult;
 use std::time::Instant;
 
-const DEFAULT_AIO_MAX_EVENTS: usize = 32;
+const DEFAULT_IO_MAX_EVENTS: usize = 32;
 
 /// Concrete libaio context used by the current storage-engine backend.
 ///
@@ -34,19 +35,19 @@ unsafe impl Send for LibaioBackend {}
 pub type IocbRawPtr = *mut iocb;
 
 /// Raw libaio request backed by an owned aligned buffer.
-pub struct AIO<T> {
+pub struct IORequest<T> {
     iocb: Box<iocb>,
     // libaio keeps the raw buffer pointer until completion, so the owned
     // buffer must stay attached to the request object for the full inflight
     // lifetime.
     buf: Option<T>,
-    pub key: AIOKey,
+    pub key: IOKey,
 }
 
-impl<T: AIOBuf> AIO<T> {
+impl<T: IOBuf> IORequest<T> {
     #[inline]
     pub fn new(
-        key: AIOKey,
+        key: IOKey,
         fd: RawFd,
         offset: usize,
         mut buf: T,
@@ -63,7 +64,7 @@ impl<T: AIOBuf> AIO<T> {
         iocb.offset = offset as u64;
         iocb.flags = flags;
         iocb.data = key;
-        AIO {
+        IORequest {
             key,
             buf: Some(buf),
             iocb,
@@ -91,12 +92,12 @@ impl<T: AIOBuf> AIO<T> {
 /// The pointer must outlive the kernel request. This compatibility wrapper is
 /// still used for buffer-pool page memory that remains allocated for the whole
 /// async submission lifetime.
-pub struct UnsafeAIO {
+pub struct UnsafeIORequest {
     iocb: Box<iocb>,
-    pub key: AIOKey,
+    pub key: IOKey,
 }
 
-impl UnsafeAIO {
+impl UnsafeIORequest {
     /// Creates one libaio request from a borrowed aligned pointer.
     ///
     /// # Safety
@@ -107,7 +108,7 @@ impl UnsafeAIO {
     #[allow(clippy::too_many_arguments)]
     #[inline]
     pub unsafe fn new(
-        key: AIOKey,
+        key: IOKey,
         fd: RawFd,
         offset: usize,
         ptr: *mut u8,
@@ -125,7 +126,7 @@ impl UnsafeAIO {
         iocb.offset = offset as u64;
         iocb.flags = flags;
         iocb.data = key;
-        UnsafeAIO { iocb, key }
+        UnsafeIORequest { iocb, key }
     }
 
     #[inline]
@@ -135,11 +136,14 @@ impl UnsafeAIO {
 }
 
 impl LibaioBackend {
-    /// Create a new AIO context with max events(io depth).
+    /// Create a new libaio context with max events(io depth).
     #[inline]
-    pub fn new(max_events: usize) -> AIOResult<Self> {
+    pub fn new(max_events: usize) -> Result<Self> {
         debug_assert!(max_events < isize::MAX as usize);
         let mut ctx = std::ptr::null_mut();
+        // SAFETY: `ctx` points to writable storage for the kernel-owned libaio
+        // context handle, and the return code is checked before constructing
+        // the Rust backend wrapper.
         unsafe {
             match io_setup(max_events as i32, &mut ctx) {
                 0 => Ok(LibaioBackend {
@@ -147,15 +151,18 @@ impl LibaioBackend {
                     max_events,
                     stats: IOBackendStatsHandle::default(),
                 }),
-                _ => Err(AIOError::SetupError),
+                ret => Err(Error::storage_io_error(
+                    StorageOp::BackendSetup,
+                    std::io::Error::from_raw_os_error(-ret),
+                )),
             }
         }
     }
 
-    /// Create a default AIO context.
+    /// Create a default libaio context.
     #[inline]
-    pub fn try_default() -> AIOResult<Self> {
-        LibaioBackend::new(DEFAULT_AIO_MAX_EVENTS)
+    pub fn try_default() -> Result<Self> {
+        LibaioBackend::new(DEFAULT_IO_MAX_EVENTS)
     }
 
     /// Returns maximum events.
@@ -211,13 +218,13 @@ impl LibaioBackend {
         &self,
         events: &mut [io_event],
         min_nr: usize,
-        mut callback: F,
+        callback: F,
     ) -> (usize, usize)
     where
-        F: FnMut(AIOKey, StdResult<usize, std::io::Error>) -> AIOKind,
+        F: FnMut(IOKey, StdResult<usize, std::io::Error>) -> IOKind,
     {
         let (_, read_count, write_count) =
-            self.wait_at_least_with_attempts(events, min_nr, |key, res| callback(key, res));
+            self.wait_at_least_with_attempts(events, min_nr, callback);
         (read_count, write_count)
     }
 
@@ -229,7 +236,7 @@ impl LibaioBackend {
         mut callback: F,
     ) -> (usize, usize, usize)
     where
-        F: FnMut(AIOKey, StdResult<usize, std::io::Error>) -> AIOKind,
+        F: FnMut(IOKey, StdResult<usize, std::io::Error>) -> IOKind,
     {
         let max_nwait = events.len();
         let mut wait_calls = 0;
@@ -265,8 +272,8 @@ impl LibaioBackend {
                 Err(err)
             };
             match callback(key, res) {
-                AIOKind::Read => read_count += 1,
-                AIOKind::Write => write_count += 1,
+                IOKind::Read => read_count += 1,
+                IOKind::Write => write_count += 1,
             }
         }
         (wait_calls, read_count, write_count)
@@ -274,16 +281,16 @@ impl LibaioBackend {
 
     /// Build an IO worker builder.
     #[inline]
-    pub fn io_worker<T>(self) -> (IOWorkerBuilder<T>, AIOClient<T>) {
+    pub fn io_worker<T>(self) -> (IOWorkerBuilder<T>, IOClient<T>) {
         build_io_worker(self)
     }
 }
 
 #[inline]
-pub fn pread<T: AIOBuf>(key: AIOKey, fd: RawFd, offset: usize, buf: T) -> AIO<T> {
+pub fn pread<T: IOBuf>(key: IOKey, fd: RawFd, offset: usize, buf: T) -> IORequest<T> {
     const PRIORITY: u16 = 0;
     const FLAGS: u32 = 0;
-    AIO::new(
+    IORequest::new(
         key,
         fd,
         offset,
@@ -295,10 +302,10 @@ pub fn pread<T: AIOBuf>(key: AIOKey, fd: RawFd, offset: usize, buf: T) -> AIO<T>
 }
 
 #[inline]
-pub fn pwrite<T: AIOBuf>(key: AIOKey, fd: RawFd, offset: usize, buf: T) -> AIO<T> {
+pub fn pwrite<T: IOBuf>(key: IOKey, fd: RawFd, offset: usize, buf: T) -> IORequest<T> {
     const PRIORITY: u16 = 0;
     const FLAGS: u32 = 0;
-    AIO::new(
+    IORequest::new(
         key,
         fd,
         offset,
@@ -317,6 +324,8 @@ fn io_submit_impl(ctx: io_context_t, nr: c_long, ios: *mut *mut iocb) -> i32 {
             return hook(ctx, nr, ios);
         }
     }
+    // SAFETY: the caller forwards the live libaio context, request count, and
+    // pointer array exactly as required by `io_submit`.
     unsafe { io_submit(ctx, nr, ios) }
 }
 
@@ -328,12 +337,16 @@ fn io_getevents_impl(ctx: io_context_t, min_nr: c_long, nr: c_long, events: *mut
             return hook(ctx, min_nr, nr, events);
         }
     }
+    // SAFETY: the caller provides a live libaio context plus an output buffer
+    // large enough for `nr` events, and uses the null timeout for blocking wait.
     unsafe { io_getevents(ctx, min_nr, nr, events, std::ptr::null_mut()) }
 }
 
 impl Drop for LibaioBackend {
     #[inline]
     fn drop(&mut self) {
+        // SAFETY: `self.ctx` is the live libaio context originally created by
+        // `io_setup`, and drop is the unique point that destroys it.
         unsafe {
             assert_eq!(io_destroy(self.ctx), 0);
         }
@@ -382,8 +395,8 @@ impl IOBackend for LibaioBackend {
         let mut iocb = iocb::boxed();
         iocb.aio_fildes = operation.fd() as u32;
         iocb.aio_lio_opcode = match operation.kind() {
-            AIOKind::Read => io_iocb_cmd::IO_CMD_PREAD as u16,
-            AIOKind::Write => io_iocb_cmd::IO_CMD_PWRITE as u16,
+            IOKind::Read => io_iocb_cmd::IO_CMD_PREAD as u16,
+            IOKind::Write => io_iocb_cmd::IO_CMD_PWRITE as u16,
         };
         iocb.aio_reqprio = 0;
         iocb.buf = operation.as_mut_ptr();
@@ -430,7 +443,7 @@ impl IOBackend for LibaioBackend {
         let (wait_calls, _read_count, _write_count) =
             self.wait_at_least_with_attempts(events, min_nr, |token, res| {
                 completed.push((BackendToken::from_raw(token), res));
-                AIOKind::Read
+                IOKind::Read
             });
         self.stats
             .record_submit_and_wait(wait_calls, start.elapsed().as_nanos() as usize);
@@ -516,7 +529,7 @@ pub(crate) mod tests {
 
         client
             .send(Request {
-                kind: AIOKind::Write,
+                kind: IOKind::Write,
                 offset: 0,
                 buf,
             })
@@ -525,7 +538,7 @@ pub(crate) mod tests {
         let mut elem2 = buf_free_list.pop(false);
         elem2.reset();
         let _ = client.send(Request {
-            kind: AIOKind::Read,
+            kind: IOKind::Read,
             offset: 0,
             buf: elem2,
         });
@@ -544,6 +557,17 @@ pub(crate) mod tests {
         let submit_count = ctx.submit_limit(&reqs, 1);
         set_io_submit_hook(previous);
         assert_eq!(submit_count, 0);
+    }
+
+    #[test]
+    fn test_libaio_backend_maps_io_setup_failure_to_storage_backend_setup_failed() {
+        assert!(matches!(
+            LibaioBackend::new(0),
+            Err(Error::StorageIOError {
+                op: StorageOp::BackendSetup,
+                ..
+            })
+        ));
     }
 
     #[test]
@@ -596,14 +620,14 @@ pub(crate) mod tests {
     }
 
     struct Request {
-        kind: AIOKind,
+        kind: IOKind,
         offset: usize,
         buf: DirectBuf,
     }
 
     struct Submission {
         key: u64,
-        kind: AIOKind,
+        kind: IOKind,
         operation: Operation,
     }
 
@@ -641,8 +665,8 @@ pub(crate) mod tests {
             let key = self.next_key;
             self.next_key += 1;
             let operation = match req.kind {
-                AIOKind::Read => Operation::pread_owned(self.file.as_raw_fd(), req.offset, req.buf),
-                AIOKind::Write => {
+                IOKind::Read => Operation::pread_owned(self.file.as_raw_fd(), req.offset, req.buf),
+                IOKind::Write => {
                     Operation::pwrite_owned(self.file.as_raw_fd(), req.offset, req.buf)
                 }
             };
@@ -658,14 +682,14 @@ pub(crate) mod tests {
             debug_assert!(*sub.key() < u64::MAX);
         }
 
-        fn on_complete(&mut self, sub: Submission, res: std::io::Result<usize>) -> AIOKind {
+        fn on_complete(&mut self, sub: Submission, res: std::io::Result<usize>) -> IOKind {
             match res {
                 Ok(len) => {
                     match sub.kind {
-                        AIOKind::Read => {
+                        IOKind::Read => {
                             println!("read {} bytes", len);
                         }
-                        AIOKind::Write => {
+                        IOKind::Write => {
                             println!("write {} bytes", len);
                         }
                     }

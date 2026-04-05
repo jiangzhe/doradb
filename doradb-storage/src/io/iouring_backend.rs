@@ -1,14 +1,15 @@
 use super::{
-    AIOClient, AIOError, AIOKind, AIOResult, BackendToken, IOBackend, IOBackendStats,
-    IOBackendStatsHandle, IOWorkerBuilder, Operation, build_io_worker,
+    BackendToken, IOBackend, IOBackendStats, IOBackendStatsHandle, IOClient, IOKind,
+    IOWorkerBuilder, Operation, build_io_worker,
 };
+use crate::error::{Error, Result, StorageOp};
 use io_uring::{IoUring, opcode, squeue, types};
 use libc::{EAGAIN, EBUSY, EINTR};
 use std::collections::VecDeque;
 use std::result::Result as StdResult;
 use std::time::Instant;
 
-const DEFAULT_AIO_MAX_EVENTS: usize = 32;
+const DEFAULT_IO_MAX_EVENTS: usize = 32;
 
 /// Concrete io_uring context used by the storage-engine backend.
 pub struct IouringBackend {
@@ -20,14 +21,16 @@ pub struct IouringBackend {
 impl IouringBackend {
     /// Creates a new io_uring backend with the requested maximum concurrent IO depth.
     #[inline]
-    pub fn new(max_events: usize) -> AIOResult<Self> {
+    pub fn new(max_events: usize) -> Result<Self> {
         if max_events == 0 {
-            return Err(AIOError::SetupError);
+            return Err(Error::InvalidArgument);
         }
         let ring_entries = max_events
             .checked_next_power_of_two()
-            .ok_or(AIOError::SetupError)?;
-        let ring = IoUring::new(ring_entries as u32).map_err(|_| AIOError::SetupError)?;
+            .ok_or(Error::InvalidArgument)?;
+        let ring_entries = u32::try_from(ring_entries).map_err(|_| Error::InvalidArgument)?;
+        let ring = IoUring::new(ring_entries)
+            .map_err(|err| Error::storage_io_error(StorageOp::BackendSetup, err))?;
         Ok(IouringBackend {
             ring,
             max_events,
@@ -37,8 +40,8 @@ impl IouringBackend {
 
     /// Creates a default io_uring backend.
     #[inline]
-    pub fn try_default() -> AIOResult<Self> {
-        Self::new(DEFAULT_AIO_MAX_EVENTS)
+    pub fn try_default() -> Result<Self> {
+        Self::new(DEFAULT_IO_MAX_EVENTS)
     }
 
     /// Returns maximum concurrent events exposed to the generic worker.
@@ -60,7 +63,7 @@ impl IouringBackend {
 
     /// Builds an IO worker builder.
     #[inline]
-    pub fn io_worker<T>(self) -> (IOWorkerBuilder<T>, AIOClient<T>) {
+    pub fn io_worker<T>(self) -> (IOWorkerBuilder<T>, IOClient<T>) {
         build_io_worker(self)
     }
 }
@@ -259,8 +262,8 @@ impl IOBackend for IouringBackend {
         let len = operation.len() as _;
         let offset = operation.offset() as u64;
         let entry = match operation.kind() {
-            AIOKind::Read => opcode::Read::new(fd, ptr, len).offset(offset).build(),
-            AIOKind::Write => opcode::Write::new(fd, ptr, len).offset(offset).build(),
+            IOKind::Read => opcode::Read::new(fd, ptr, len).offset(offset).build(),
+            IOKind::Write => opcode::Write::new(fd, ptr, len).offset(offset).build(),
         };
         entry.user_data(token.raw())
     }
@@ -439,5 +442,21 @@ mod tests {
         assert_eq!(snapshot.submitted_ops, 5);
         assert_eq!(snapshot.submit_and_wait_nanos, 17);
         assert_eq!(snapshot.wait_completions, 3);
+    }
+
+    #[test]
+    fn test_iouring_backend_rejects_zero_depth_as_invalid_argument() {
+        assert!(matches!(
+            IouringBackend::new(0),
+            Err(Error::InvalidArgument)
+        ));
+    }
+
+    #[test]
+    fn test_iouring_backend_rejects_ring_entry_overflow_as_invalid_argument() {
+        assert!(matches!(
+            IouringBackend::new((u32::MAX as usize) + 1),
+            Err(Error::InvalidArgument)
+        ));
     }
 }

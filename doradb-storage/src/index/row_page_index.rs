@@ -1188,7 +1188,7 @@ mod tests {
             mode: LatchFallbackMode,
         ) -> Result<FacadePageGuard<T>> {
             if page_id == self.fail_page_id.load(Ordering::Acquire) {
-                return Err(Error::IOError);
+                return Err(std::io::Error::from_raw_os_error(libc::EIO).into());
             }
             self.inner.get_page(guard, page_id, mode).await
         }
@@ -1353,7 +1353,7 @@ mod tests {
                 Ok(_) => panic!("expected free-list page reload failure"),
                 Err(err) => err,
             };
-            assert!(matches!(err, Error::IOError));
+            assert!(matches!(err, Error::IOError { .. }));
         });
     }
 

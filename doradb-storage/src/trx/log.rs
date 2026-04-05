@@ -3,8 +3,8 @@ use crate::error::{Error, Result, StoragePoisonSource};
 use crate::file::{FileSyncer, SparseFile};
 use crate::free_list::FreeList;
 use crate::io::{
-    AIOClient, AIOError, AIOKind, Completion, DirectBuf, IOBackendStats, IOBackendStatsHandle,
-    IOQueue, IOStateMachine, IOSubmission, IOWorkerBuilder, Operation, StorageBackend,
+    Completion, DirectBuf, IOBackendStats, IOBackendStatsHandle, IOClient, IOKind, IOQueue,
+    IOStateMachine, IOSubmission, IOWorkerBuilder, Operation, StorageBackend,
 };
 use crate::serde::Ser;
 use crate::session::SessionState;
@@ -235,7 +235,7 @@ impl IOStateMachine for LogIOStateMachine {
     fn on_submit(&mut self, _sub: &LogWriteSubmission) {}
 
     #[inline]
-    fn on_complete(&mut self, mut sub: LogWriteSubmission, res: std::io::Result<usize>) -> AIOKind {
+    fn on_complete(&mut self, mut sub: LogWriteSubmission, res: std::io::Result<usize>) -> IOKind {
         let expected_len = sub.operation.len();
         let buf = sub
             .operation
@@ -251,7 +251,7 @@ impl IOStateMachine for LogIOStateMachine {
             buf,
             poison: result,
         });
-        AIOKind::Write
+        IOKind::Write
     }
 
     #[inline]
@@ -276,7 +276,7 @@ pub(crate) struct LogPartition {
     /// Backend-neutral redo IO worker builder, taken exactly once during startup.
     io_worker: CachePadded<Mutex<Option<IOWorkerBuilder<LogIORequest>>>>,
     /// Sender to enqueue redo write requests into the dedicated worker.
-    io_client: AIOClient<LogIORequest>,
+    io_client: IOClient<LogIORequest>,
     /// Backend-owned submit/wait statistics for the redo worker.
     io_backend_stats: IOBackendStatsHandle,
     /// Completion channel used by the scheduler thread to observe redo write results.
@@ -382,7 +382,7 @@ impl LogPartition {
         // Allocate space of log file.
         let (fd, offset) = match log_file.alloc(log_buf.capacity()) {
             Ok((offset, _)) => (log_file.as_raw_fd(), offset),
-            Err(AIOError::OutOfRange) => {
+            Err(Error::StorageFileCapacityExceeded) => {
                 // rotate log file and try again.
                 self.rotate_log_file(group_commit_g)
                     .expect("rotate log file");
@@ -817,7 +817,7 @@ impl<'a> FileProcessor<'a> {
     #[inline]
     fn fetch_io_reqs(&mut self) -> Option<SparseFile> {
         if self.in_progress == 0 {
-            // there is no processing AIO, so we can block on waiting for next request.
+            // there is no processing IO, so we can block on waiting for next request.
             self.fetch_io_reqs_internal()
         } else {
             // only try non-blocking way to fetch incoming requests, because we also
@@ -1086,7 +1086,7 @@ mod tests {
     use crate::engine::{Engine, EngineRef};
     use crate::file::{FileSyncKind, FileSyncOp, FileSyncTestHook, set_file_sync_test_hook};
     use crate::io::{
-        AIOKind, StorageBackendOp, StorageBackendTestHook, install_storage_backend_test_hook,
+        IOKind, StorageBackendOp, StorageBackendTestHook, install_storage_backend_test_hook,
     };
     use crate::trx::log_replay::{LogMerger, ReadLog};
     use crate::value::Val;
@@ -1166,7 +1166,7 @@ mod tests {
         }
 
         fn matches(&self, op: StorageBackendOp) -> bool {
-            op.kind() == AIOKind::Write && op.fd() == self.inner.fd
+            op.kind() == IOKind::Write && op.fd() == self.inner.fd
         }
 
         async fn wait_started(&self, expected_calls: usize) {

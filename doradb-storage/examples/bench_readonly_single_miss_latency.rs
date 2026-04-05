@@ -8,7 +8,7 @@ use doradb_storage::conf::{
 };
 use doradb_storage::error::FileKind;
 use doradb_storage::file::BlockID;
-use doradb_storage::io::{AIOBuf, DirectBuf, IOBackendStats};
+use doradb_storage::io::{DirectBuf, IOBackendStats, IOBuf};
 use doradb_storage::quiescent::QuiescentBox;
 use doradb_storage::value::ValKind;
 use rand::RngCore;

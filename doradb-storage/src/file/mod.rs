@@ -16,14 +16,14 @@ pub(crate) use self::tests::{
 
 use crate::buffer::{BlockKey, ReadSubmission};
 use crate::compression::BitPackable;
+use crate::error::{Error, Result, StorageOp};
 use crate::free_list::FreeList;
 use crate::io::DirectBuf;
 use crate::io::{
-    AIOClient, AIOError, AIOKind, AIOResult, Completion, IOQueue, IOSubmission, Operation,
-    STORAGE_SECTOR_SIZE, align_to_sector_size,
+    Completion, IOClient, IOKind, IOQueue, IOSubmission, Operation, STORAGE_SECTOR_SIZE,
+    align_to_sector_size,
 };
 use crate::serde::{Deser, Ser, Serde};
-use crate::{error::Error, error::Result};
 use bytemuck::{Pod, Zeroable};
 use libc::{
     O_CREAT, O_DIRECT, O_EXCL, O_RDWR, O_TRUNC, close, fdatasync, fstat, fsync, ftruncate, open,
@@ -38,7 +38,6 @@ use std::mem::MaybeUninit;
 use std::ops::Deref;
 use std::ops::{Add, AddAssign, Sub, SubAssign};
 use std::os::unix::io::{AsRawFd, RawFd};
-use std::result::Result as StdResult;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -249,24 +248,29 @@ impl SparseFile {
     /// Create a sparse file and truncate if file already exists.
     /// Note that space is allocated only when data is written to this file.
     #[inline]
-    pub fn create_or_trunc(file_path: impl AsRef<str>, max_size: usize) -> AIOResult<SparseFile> {
+    pub fn create_or_trunc(file_path: impl AsRef<str>, max_size: usize) -> Result<SparseFile> {
         // SAFETY: libc calls (`open`, `ftruncate`, `close`) are used with validated C string
         // arguments and checked return codes before constructing `SparseFile`.
         unsafe {
-            let c_string =
-                CString::new(file_path.as_ref()).map_err(|_| AIOError::CreateFileError)?;
+            let c_string = c_string_from_path(file_path.as_ref())?;
             let fd = open(
                 c_string.as_ptr(),
                 O_CREAT | O_RDWR | O_TRUNC | O_DIRECT,
                 0o644,
             );
             if fd < 0 {
-                return Err(AIOError::CreateFileError);
+                return Err(Error::storage_io_error(
+                    StorageOp::FileCreate,
+                    std::io::Error::last_os_error(),
+                ));
             }
             let ret = ftruncate(fd, max_size as i64);
             if ret < 0 {
                 let _ = close(fd); // close file descriptor if truncate fail.
-                return Err(AIOError::TruncFileError);
+                return Err(Error::storage_io_error(
+                    StorageOp::FileResize,
+                    std::io::Error::last_os_error(),
+                ));
             }
             Ok(SparseFile::new(fd, 0, max_size))
         }
@@ -275,25 +279,30 @@ impl SparseFile {
     /// Create a sparse file and fail if file already exists.
     /// Note that space is allocated only when data is written to this file.
     #[inline]
-    pub fn create_or_fail(file_path: impl AsRef<str>, max_size: usize) -> AIOResult<SparseFile> {
+    pub fn create_or_fail(file_path: impl AsRef<str>, max_size: usize) -> Result<SparseFile> {
         // SAFETY: libc calls (`open`, `ftruncate`, `close`) are issued with a
         // validated C string and checked return codes before constructing
         // `SparseFile`.
         unsafe {
-            let c_string =
-                CString::new(file_path.as_ref()).map_err(|_| AIOError::CreateFileError)?;
+            let c_string = c_string_from_path(file_path.as_ref())?;
             let fd = open(
                 c_string.as_ptr(),
                 O_CREAT | O_RDWR | O_EXCL | O_DIRECT,
                 0o644,
             );
             if fd < 0 {
-                return Err(AIOError::CreateFileError);
+                return Err(Error::storage_io_error(
+                    StorageOp::FileCreate,
+                    std::io::Error::last_os_error(),
+                ));
             }
             let ret = ftruncate(fd, max_size as i64);
             if ret < 0 {
                 let _ = close(fd); // close file descriptor if truncate fail.
-                return Err(AIOError::TruncFileError);
+                return Err(Error::storage_io_error(
+                    StorageOp::FileResize,
+                    std::io::Error::last_os_error(),
+                ));
             }
             Ok(SparseFile::new(fd, 0, max_size))
         }
@@ -301,18 +310,24 @@ impl SparseFile {
 
     /// Open an existing sparse file with given maximum length.
     #[inline]
-    pub fn open(file_path: impl AsRef<str>) -> AIOResult<SparseFile> {
+    pub fn open(file_path: impl AsRef<str>) -> Result<SparseFile> {
         // SAFETY: `open` is called with a validated C string, and the returned
         // fd is checked before it is used or wrapped.
         unsafe {
-            let c_string = CString::new(file_path.as_ref()).map_err(|_| AIOError::OpenFileError)?;
+            let c_string = c_string_from_path(file_path.as_ref())?;
             let fd = open(c_string.as_ptr(), O_RDWR | O_DIRECT, 0o644);
             if fd < 0 {
-                return Err(AIOError::OpenFileError);
+                return Err(Error::storage_io_error(
+                    StorageOp::FileOpen,
+                    std::io::Error::last_os_error(),
+                ));
             }
             let (logical_size, _) = match sparse_file_size(fd) {
                 Ok((l, a)) => (l, a),
-                Err(_) => return Err(AIOError::StatError),
+                Err(err) => {
+                    let _ = close(fd);
+                    return Err(Error::storage_io_error(StorageOp::FileStat, err));
+                }
             };
             Ok(SparseFile::new(fd, 0, logical_size))
         }
@@ -332,13 +347,13 @@ impl SparseFile {
     /// Allocate enough space for data of given length to persist
     /// at end of the file.
     #[inline]
-    pub fn alloc(&self, len: usize) -> StdResult<(usize, usize), AIOError> {
+    pub fn alloc(&self, len: usize) -> Result<(usize, usize)> {
         let size = align_to_sector_size(len);
         loop {
             let offset = self.offset.load(Ordering::Relaxed);
             let new_offset = offset + size;
             if new_offset > self.max_len.load(Ordering::Relaxed) {
-                return Err(AIOError::OutOfRange);
+                return Err(Error::StorageFileCapacityExceeded);
             }
             if self
                 .offset
@@ -412,6 +427,11 @@ pub fn sparse_file_size(fd: RawFd) -> std::io::Result<(usize, usize)> {
         debug_assert!(retcode == -1);
         Err(std::io::Error::last_os_error())
     }
+}
+
+#[inline]
+fn c_string_from_path(file_path: &str) -> Result<CString> {
+    CString::new(file_path).map_err(|_| Error::InvalidStoragePath(file_path.to_owned()))
 }
 
 /// Worker-owned write submission for the table-filesystem IO worker.
@@ -493,7 +513,7 @@ pub(crate) async fn write_direct(
     fd: RawFd,
     offset: usize,
     buf: DirectBuf,
-    background_writes: &AIOClient<BackgroundWriteRequest>,
+    background_writes: &IOClient<BackgroundWriteRequest>,
 ) -> Result<()> {
     let (submission, result) = WriteSubmission::prepare(key, fd, offset, buf);
     if let Err(err) = background_writes
@@ -557,7 +577,7 @@ impl TableFsStateMachine {
         &mut self,
         sub: TableFsSubmission,
         res: std::io::Result<usize>,
-    ) -> AIOKind {
+    ) -> IOKind {
         match sub {
             TableFsSubmission::Write(mut sub) => {
                 let expected_len = sub.operation.len();
@@ -572,7 +592,7 @@ impl TableFsStateMachine {
                         let result = if len == expected_len {
                             Ok(())
                         } else {
-                            Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof).into())
+                            Err(Error::ShortIO)
                         };
                         sub.completion.complete(result);
                     }
@@ -581,7 +601,7 @@ impl TableFsStateMachine {
                         sub.completion.complete(Err(err.into()));
                     }
                 }
-                AIOKind::Write
+                IOKind::Write
             }
             TableFsSubmission::Read(sub) => sub.complete(res),
         }
@@ -830,12 +850,64 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let file_path = temp_dir.path().join("sparsefile1.bin");
         let file_path = file_path.to_string_lossy().into_owned();
-        let res = SparseFile::open(&file_path);
-        assert!(res.is_err());
+        assert!(matches!(
+            SparseFile::open(&file_path),
+            Err(Error::StorageIOError {
+                op: StorageOp::FileOpen,
+                ..
+            })
+        ));
         let file = SparseFile::create_or_trunc(&file_path, 1024 * 1024).unwrap();
         drop(file);
         let file = SparseFile::open(&file_path).unwrap();
         drop(file);
+    }
+
+    #[test]
+    fn test_sparse_file_create_missing_parent_maps_create_failed() {
+        let temp_dir = TempDir::new().unwrap();
+        let file_path = temp_dir
+            .path()
+            .join("missing")
+            .join("nested")
+            .join("create.bin");
+        let file_path = file_path.to_string_lossy().into_owned();
+        assert!(matches!(
+            SparseFile::create_or_trunc(&file_path, 4096),
+            Err(Error::StorageIOError {
+                op: StorageOp::FileCreate,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn test_sparse_file_invalid_path_maps_invalid_storage_path() {
+        let invalid_path = "bad\0path";
+        assert!(matches!(
+            SparseFile::open(invalid_path),
+            Err(Error::InvalidStoragePath(path)) if path == invalid_path
+        ));
+        assert!(matches!(
+            SparseFile::create_or_trunc(invalid_path, 4096),
+            Err(Error::InvalidStoragePath(path)) if path == invalid_path
+        ));
+    }
+
+    #[test]
+    fn test_sparse_file_alloc_exhaustion_maps_capacity_exceeded() {
+        let temp_dir = TempDir::new().unwrap();
+        let file_path = temp_dir.path().join("capacity.bin");
+        let file_path = file_path.to_string_lossy().into_owned();
+        let file = SparseFile::create_or_trunc(&file_path, STORAGE_SECTOR_SIZE).unwrap();
+        assert_eq!(
+            file.alloc(STORAGE_SECTOR_SIZE).unwrap(),
+            (0, STORAGE_SECTOR_SIZE)
+        );
+        assert!(matches!(
+            file.alloc(STORAGE_SECTOR_SIZE),
+            Err(Error::StorageFileCapacityExceeded)
+        ));
     }
 
     #[test]
@@ -852,7 +924,7 @@ mod tests {
         let kind =
             state_machine.on_complete(TableFsSubmission::Write(submission), Ok(expected_len));
 
-        assert_eq!(kind, AIOKind::Write);
+        assert_eq!(kind, IOKind::Write);
         assert!(smol::block_on(waiter).is_ok());
     }
 
@@ -871,7 +943,7 @@ mod tests {
         let kind =
             state_machine.on_complete(TableFsSubmission::Write(submission), Ok(expected_len - 1));
 
-        assert_eq!(kind, AIOKind::Write);
-        assert!(matches!(smol::block_on(waiter), Err(Error::IOError)));
+        assert_eq!(kind, IOKind::Write);
+        assert!(matches!(smol::block_on(waiter), Err(Error::ShortIO)));
     }
 }

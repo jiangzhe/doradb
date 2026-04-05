@@ -20,7 +20,9 @@ use crate::error::Validation::Valid;
 use crate::error::{Error, Result, Validation};
 use crate::file::SparseFile;
 use crate::file::fs::{FileSystem, FileSystemWorkers};
-use crate::io::{AIOKind, IOBackendStats, IOQueue, IOStateMachine, IOSubmission, Operation};
+use crate::io::{
+    IOBackendStats, IOKind as StorageIOKind, IOQueue, IOStateMachine, IOSubmission, Operation,
+};
 use crate::latch::{GuardState, LatchFallbackMode};
 use crate::notify::EventNotifyOnDrop;
 use crate::quiescent::{QuiescentGuard, SyncQuiescentGuard};
@@ -365,7 +367,6 @@ impl BufferPool for EvictableBufferPool {
                         bf,
                     ));
                 }
-                FrameKind::EvictionFailed => return Err(Error::IOError),
                 FrameKind::Cool => {
                     // Try to mark this page as HOT.
                     if frame.compare_exchange_kind(FrameKind::Cool, FrameKind::Hot)
@@ -428,7 +429,6 @@ impl BufferPool for EvictableBufferPool {
                     self.stats.record_cache_hit();
                     return Ok(Some(g));
                 }
-                FrameKind::EvictionFailed => return Err(Error::IOError),
                 FrameKind::Cool => {
                     let g = frame.latch.optimistic_fallback_raw(mode).await;
                     if frame.compare_exchange_kind(FrameKind::Cool, FrameKind::Hot)
@@ -503,7 +503,6 @@ impl BufferPool for EvictableBufferPool {
                     }
                     return Ok(Validation::Invalid);
                 }
-                FrameKind::EvictionFailed => return Err(Error::IOError),
                 FrameKind::Cool => {
                     let g = frame.latch.optimistic_fallback_raw(mode).await;
                     // Try to mark this page as HOT.
@@ -675,9 +674,12 @@ impl IOStateMachine for EvictablePoolStateMachine {
 
     /// Reconcile inflight/page state after one backend completion.
     #[inline]
-    fn on_complete(&mut self, sub: EvictSubmission, res: std::io::Result<usize>) -> AIOKind {
+    fn on_complete(&mut self, sub: EvictSubmission, res: std::io::Result<usize>) -> StorageIOKind {
         match sub {
-            EvictSubmission::Read(sub) => sub.complete(res),
+            EvictSubmission::Read(sub) => {
+                sub.complete(res);
+                StorageIOKind::Read
+            }
             EvictSubmission::Write(sub) => {
                 let PageIO {
                     key: _,
@@ -685,12 +687,17 @@ impl IOStateMachine for EvictablePoolStateMachine {
                     page_guard,
                     batch_done,
                 } = sub;
-                if !matches!(res, Ok(len) if len == PAGE_SIZE) {
+                let err = match res {
+                    Ok(len) if len == PAGE_SIZE => None,
+                    Ok(_) => Some(Error::ShortIO),
+                    Err(err) => Some(err.into()),
+                };
+                if let Some(err) = err {
                     self.pool
                         .inflight_io
-                        .fail_writeback(&self.pool.stats, page_guard);
+                        .fail_writeback(&self.pool.stats, page_guard, err);
                     drop(batch_done);
-                    return AIOKind::Write;
+                    return StorageIOKind::Write;
                 }
 
                 let page_id = page_guard.page_id();
@@ -716,7 +723,7 @@ impl IOStateMachine for EvictablePoolStateMachine {
                     completion.complete(Ok(page_id));
                 }
                 drop(batch_done);
-                AIOKind::Write
+                StorageIOKind::Write
             }
         }
     }
@@ -747,9 +754,11 @@ impl EvictableRuntime {
                 .send_pool_batch_write(self.pool.role, page_guards, done_ev)
         {
             for page_guard in page_guards {
-                self.pool
-                    .inflight_io
-                    .fail_writeback(&self.pool.stats, page_guard);
+                self.pool.inflight_io.fail_writeback(
+                    &self.pool.stats,
+                    page_guard,
+                    Error::SendError,
+                );
             }
             drop(done_ev);
         }
@@ -1139,7 +1148,7 @@ impl EvictReadSubmission {
     /// Successful full-page reads publish the reserved page back to `Hot`.
     /// Short reads and IO errors drop the reservation so memory accounting is
     /// rolled back before waiters are released.
-    pub(crate) fn complete(mut self, res: std::io::Result<usize>) -> AIOKind {
+    pub(crate) fn complete(mut self, res: std::io::Result<usize>) -> IOKind {
         let result = match res {
             Ok(len) if len == PAGE_SIZE => {
                 let reservation = self.reservation.take().expect(
@@ -1149,7 +1158,7 @@ impl EvictReadSubmission {
             }
             Ok(_) => {
                 drop(self.reservation.take());
-                Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof).into())
+                Err(Error::ShortIO)
             }
             Err(err) => {
                 drop(self.reservation.take());
@@ -1161,7 +1170,7 @@ impl EvictReadSubmission {
             self.stats.add_read_errors(1);
         }
         self.complete_waiters(result);
-        AIOKind::Read
+        IOKind::Read
     }
 }
 
@@ -1289,10 +1298,6 @@ impl InflightIO {
                         drop(g); // explicit drop guard before await.
                         completion.wait_result().await.map(|_| ())?;
                     }
-                    FrameKind::EvictionFailed => {
-                        drop(g);
-                        return Err(Error::IOError);
-                    }
                     // In any other kind, we let caller retry.
                     FrameKind::Cool
                     | FrameKind::Hot
@@ -1349,6 +1354,7 @@ impl InflightIO {
         &self,
         stats: &BufferPoolStatsHandle,
         mut page_guard: PageExclusiveGuard<Page>,
+        err: Error,
     ) {
         let page_id = page_guard.page_id();
         let completion = {
@@ -1363,7 +1369,7 @@ impl InflightIO {
                 IOKind::Write => {
                     self.writes.fetch_sub(1, Ordering::Relaxed);
                     debug_assert!(page_guard.bf().kind() == FrameKind::Evicting);
-                    page_guard.bf_mut().set_kind(FrameKind::EvictionFailed);
+                    page_guard.bf_mut().set_kind(FrameKind::Hot);
                     stats.add_completed_writes(1);
                     stats.add_write_errors(1);
                     status.completion.take()
@@ -1377,7 +1383,7 @@ impl InflightIO {
         };
         drop(page_guard);
         if let Some(completion) = completion {
-            completion.complete(Err(Error::IOError));
+            completion.complete(Err(err));
         }
     }
 
@@ -1758,7 +1764,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn test_writeback_failure_preserves_failed_frame_kind_and_surfaces_error() {
+    fn test_writeback_failure_keeps_page_hot_and_surfaces_error_to_current_waiters() {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
             let (_fs_owner, pool, storage) = build_raw_pool_for_test(
@@ -1812,14 +1818,14 @@ pub(crate) mod tests {
                     page_guard,
                     batch_done: None,
                 }),
-                Err(std::io::Error::other("writeback failed")),
+                Err(std::io::Error::from_raw_os_error(libc::EIO)),
             );
 
-            assert_eq!(kind, AIOKind::Write);
-            assert_eq!(owner.arena.frame(page_id).kind(), FrameKind::EvictionFailed);
+            assert_eq!(kind, StorageIOKind::Write);
+            assert_eq!(owner.arena.frame(page_id).kind(), FrameKind::Hot);
             assert!(matches!(
                 completion.wait_result().await,
-                Err(Error::IOError)
+                Err(Error::IOError { .. })
             ));
             assert_eq!(owner.inflight_io.writes.load(Ordering::Relaxed), 0);
             assert!(!owner.inflight_io.map.lock().contains_key(&page_id));
@@ -1831,7 +1837,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn test_writeback_send_failure_unwinds_failed_batch_and_wakes_waiters() {
+    fn test_writeback_send_failure_keeps_page_hot_and_wakes_current_waiters() {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
             let (_fs_owner, pool, _storage) = build_raw_pool_for_test(
@@ -1858,14 +1864,14 @@ pub(crate) mod tests {
             let listener = runtime.dispatch_io_writes(vec![page_guard]);
             listener.await;
 
-            assert_eq!(owner.arena.frame(page_id).kind(), FrameKind::EvictionFailed);
-            assert!(matches!(
+            assert_eq!(owner.arena.frame(page_id).kind(), FrameKind::Hot);
+            assert!(
                 owner
                     .inflight_io
                     .wait_for_write(page_id, owner.arena.frame(page_id))
-                    .await,
-                Err(Error::IOError)
-            ));
+                    .await
+                    .is_ok()
+            );
             assert_eq!(owner.inflight_io.writes.load(Ordering::Relaxed), 0);
             assert!(!owner.inflight_io.map.lock().contains_key(&page_id));
 
@@ -1882,10 +1888,10 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn test_failed_eviction_frame_returns_error_to_readers() {
+    fn test_failed_writeback_leaves_page_accessible_to_future_readers() {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
-            let (_fs_owner, pool, _storage) = build_raw_pool_for_test(
+            let (_fs_owner, pool, storage) = build_raw_pool_for_test(
                 EvictableBufferPoolConfig::default()
                     .role(PoolRole::Mem)
                     .data_swap_file(temp_dir.path().join("data.swp"))
@@ -1893,34 +1899,76 @@ pub(crate) mod tests {
                     .max_file_size(128u64 * 1024 * 1024),
             )
             .unwrap();
-            let pool_guard = pool.pool_guard();
-            let mut page_guard = pool.allocate_page::<Page>(&pool_guard).await;
+            let owner = QuiescentBox::new(pool);
+            let pool_guard = owner.pool_guard();
+            let mut page_guard = owner.allocate_page::<Page>(&pool_guard).await;
             let page_id = page_guard.page_id();
             let versioned = page_guard.versioned_page_id();
-            page_guard.bf_mut().set_kind(FrameKind::EvictionFailed);
-            drop(page_guard);
+            page_guard.page_mut()[0] = 0xAB;
+            page_guard.bf_mut().set_dirty(true);
+            page_guard.bf_mut().set_kind(FrameKind::Evicting);
 
+            let completion = Arc::new(PageIOCompletion::new());
+            {
+                let mut g = owner.inflight_io.map.lock();
+                g.insert(
+                    page_id,
+                    IOStatus {
+                        kind: IOKind::Write,
+                        completion: Some(Arc::clone(&completion)),
+                    },
+                );
+            }
+            owner.inflight_io.writes.store(1, Ordering::Relaxed);
+
+            let mut state_machine = EvictablePoolStateMachine {
+                pool: owner.guard().into_sync(),
+                file: storage,
+            };
+            // SAFETY: the borrowed page pointer refers to one live page-sized arena
+            // allocation, and this test keeps `page_guard` alive in `PageIO` until completion.
+            let operation = unsafe {
+                Operation::pwrite_borrowed(
+                    state_machine.file.as_raw_fd(),
+                    usize::from(page_id) * PAGE_SIZE,
+                    page_guard.page_mut() as *mut Page as *mut u8,
+                    PAGE_SIZE,
+                )
+            };
+            let kind = state_machine.on_complete(
+                EvictSubmission::Write(PageIO {
+                    key: page_id,
+                    operation,
+                    page_guard,
+                    batch_done: None,
+                }),
+                Err(std::io::Error::from_raw_os_error(libc::EIO)),
+            );
+            assert_eq!(kind, StorageIOKind::Write);
             assert!(matches!(
-                pool.inflight_io
-                    .wait_for_write(page_id, pool.arena.frame(page_id))
-                    .await,
-                Err(Error::IOError)
+                completion.wait_result().await,
+                Err(Error::IOError { .. })
             ));
-            assert!(matches!(
-                pool.get_page::<Page>(&pool_guard, page_id, LatchFallbackMode::Shared)
-                    .await,
-                Err(Error::IOError)
-            ));
-            assert!(matches!(
-                pool.get_page_versioned::<Page>(&pool_guard, versioned, LatchFallbackMode::Shared,)
-                    .await,
-                Err(Error::IOError)
-            ));
+
+            assert_eq!(owner.arena.frame(page_id).kind(), FrameKind::Hot);
+            assert!(
+                owner
+                    .get_page::<Page>(&pool_guard, page_id, LatchFallbackMode::Shared)
+                    .await
+                    .is_ok()
+            );
+            assert!(
+                owner
+                    .get_page_versioned::<Page>(&pool_guard, versioned, LatchFallbackMode::Shared,)
+                    .await
+                    .unwrap()
+                    .is_some()
+            );
         });
     }
 
     #[test]
-    fn test_failed_eviction_frame_can_retry_and_clear_on_success() {
+    fn test_failed_writeback_page_can_retry_eviction_naturally() {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
             let (_fs_owner, pool, _storage) = build_raw_pool_for_test(
@@ -1934,12 +1982,15 @@ pub(crate) mod tests {
             let pool_guard = pool.pool_guard();
             let mut page_guard = pool.allocate_page::<Page>(&pool_guard).await;
             let page_id = page_guard.page_id();
-            page_guard.bf_mut().set_kind(FrameKind::EvictionFailed);
+            page_guard.bf_mut().set_kind(FrameKind::Hot);
             drop(page_guard);
 
             let arena_guard = pool.arena.arena_guard(pool_guard.clone());
+            assert!(clock_sweep_candidate(&arena_guard, page_id).is_none());
+            assert_eq!(pool.arena.frame(page_id).kind(), FrameKind::Cool);
+
             let page_guard = clock_sweep_candidate(&arena_guard, page_id)
-                .expect("failed eviction should remain retryable");
+                .expect("hot page should remain retryable after one cool-down step");
             assert_eq!(page_guard.bf().kind(), FrameKind::Evicting);
 
             pool.in_mem.evict_page(page_guard);

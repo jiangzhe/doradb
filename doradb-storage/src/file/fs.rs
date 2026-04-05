@@ -16,7 +16,7 @@ use crate::file::table_file::{ActiveRoot, TABLE_FILE_INITIAL_SIZE};
 use crate::file::table_file::{MutableTableFile, TableFile};
 use crate::file::{SparseFile, TableFsStateMachine, TableFsSubmission, WriteSubmission};
 use crate::io::{
-    AIOClient, AIOKind, AIOMessage, BackendToken, IOBackend, IOBackendStats, IOBackendStatsHandle,
+    BackendToken, IOBackend, IOBackendStats, IOBackendStatsHandle, IOClient, IOKind, IOMessage,
     IOQueue, IOStateMachine, IOSubmission, Operation, StorageBackend,
 };
 use crate::notify::EventNotifyOnDrop;
@@ -411,7 +411,7 @@ impl StorageStateMachine {
 
     /// Route one backend completion back to the owning domain state machine.
     #[inline]
-    fn on_complete(&mut self, sub: StorageSubmission, res: std::io::Result<usize>) -> AIOKind {
+    fn on_complete(&mut self, sub: StorageSubmission, res: std::io::Result<usize>) -> IOKind {
         match sub.inner {
             StorageSubmissionKind::Table(sub) => self.table_fs.on_complete(sub, res),
             StorageSubmissionKind::MemPool(sub) => self.mem_pool.on_complete(sub, res),
@@ -422,21 +422,21 @@ impl StorageStateMachine {
 
 /// Scheduler state for the table-read ingress lane.
 struct TableReadLane {
-    rx: Receiver<AIOMessage<ReadSubmission>>,
+    rx: Receiver<IOMessage<ReadSubmission>>,
     deferred_req: Option<ReadSubmission>,
     shutdown: bool,
 }
 
 /// Scheduler state for the pool-read ingress lane.
 struct PoolReadLane {
-    rx: Receiver<AIOMessage<PoolReadRequest>>,
+    rx: Receiver<IOMessage<PoolReadRequest>>,
     deferred_req: Option<PoolReadRequest>,
     shutdown: bool,
 }
 
 /// Scheduler state for the shared background-write ingress lane.
 struct BackgroundWriteLane {
-    rx: Receiver<AIOMessage<BackgroundWriteRequest>>,
+    rx: Receiver<IOMessage<BackgroundWriteRequest>>,
     deferred_req: Option<BackgroundWriteRequest>,
     shutdown: bool,
 }
@@ -486,13 +486,13 @@ impl StorageLaneId {
 /// First ready item for one scheduler turn.
 enum StorageLaneTurnStart {
     TableReadDeferred,
-    TableReadMessage(AIOMessage<ReadSubmission>),
+    TableReadMessage(IOMessage<ReadSubmission>),
     TableReadDisconnected,
     PoolReadDeferred,
-    PoolReadMessage(AIOMessage<PoolReadRequest>),
+    PoolReadMessage(IOMessage<PoolReadRequest>),
     PoolReadDisconnected,
     BackgroundWriteDeferred,
-    BackgroundWriteMessage(AIOMessage<BackgroundWriteRequest>),
+    BackgroundWriteMessage(IOMessage<BackgroundWriteRequest>),
     BackgroundWriteDisconnected,
 }
 
@@ -737,7 +737,7 @@ impl StorageRequestScheduler {
 
     fn process_table_read_turn(
         &mut self,
-        mut first_msg: Option<AIOMessage<ReadSubmission>>,
+        mut first_msg: Option<IOMessage<ReadSubmission>>,
         state_machine: &mut StorageStateMachine,
         queue: &mut IOQueue<StorageSubmission>,
         budget: &mut usize,
@@ -774,11 +774,11 @@ impl StorageRequestScheduler {
                 break;
             };
             match msg {
-                AIOMessage::Shutdown => {
+                IOMessage::Shutdown => {
                     self.table_reads.shutdown = true;
                     break;
                 }
-                AIOMessage::Req(req) => {
+                IOMessage::Req(req) => {
                     self.stats.record_request(StorageLaneId::TableReads);
                     let queue_len = queue.len();
                     self.table_reads.deferred_req =
@@ -796,7 +796,7 @@ impl StorageRequestScheduler {
 
     fn process_pool_read_turn(
         &mut self,
-        mut first_msg: Option<AIOMessage<PoolReadRequest>>,
+        mut first_msg: Option<IOMessage<PoolReadRequest>>,
         state_machine: &mut StorageStateMachine,
         queue: &mut IOQueue<StorageSubmission>,
         budget: &mut usize,
@@ -833,11 +833,11 @@ impl StorageRequestScheduler {
                 break;
             };
             match msg {
-                AIOMessage::Shutdown => {
+                IOMessage::Shutdown => {
                     self.pool_reads.shutdown = true;
                     break;
                 }
-                AIOMessage::Req(req) => {
+                IOMessage::Req(req) => {
                     self.stats.record_request(StorageLaneId::PoolReads);
                     let queue_len = queue.len();
                     self.pool_reads.deferred_req =
@@ -855,7 +855,7 @@ impl StorageRequestScheduler {
 
     fn process_background_write_turn(
         &mut self,
-        mut first_msg: Option<AIOMessage<BackgroundWriteRequest>>,
+        mut first_msg: Option<IOMessage<BackgroundWriteRequest>>,
         state_machine: &mut StorageStateMachine,
         queue: &mut IOQueue<StorageSubmission>,
         budget: &mut usize,
@@ -892,11 +892,11 @@ impl StorageRequestScheduler {
                 break;
             };
             match msg {
-                AIOMessage::Shutdown => {
+                IOMessage::Shutdown => {
                     self.background_writes.shutdown = true;
                     break;
                 }
-                AIOMessage::Req(req) => {
+                IOMessage::Req(req) => {
                     self.stats.record_request(StorageLaneId::BackgroundWrites);
                     let queue_len = queue.len();
                     self.background_writes.deferred_req =
@@ -1034,9 +1034,9 @@ struct StorageInflightEntry<S, P> {
 /// after `fs_workers` can see the registered mem/index pools.
 pub(crate) struct StorageIOWorkerBuilder<B = StorageBackend> {
     backend: B,
-    table_reads_rx: Receiver<AIOMessage<ReadSubmission>>,
-    pool_reads_rx: Receiver<AIOMessage<PoolReadRequest>>,
-    background_writes_rx: Receiver<AIOMessage<BackgroundWriteRequest>>,
+    table_reads_rx: Receiver<IOMessage<ReadSubmission>>,
+    pool_reads_rx: Receiver<IOMessage<PoolReadRequest>>,
+    background_writes_rx: Receiver<IOMessage<BackgroundWriteRequest>>,
     stats: StorageServiceStatsHandle,
 }
 
@@ -1050,13 +1050,13 @@ where
         backend: B,
     ) -> (
         Self,
-        AIOClient<ReadSubmission>,
-        AIOClient<PoolReadRequest>,
-        AIOClient<BackgroundWriteRequest>,
+        IOClient<ReadSubmission>,
+        IOClient<PoolReadRequest>,
+        IOClient<BackgroundWriteRequest>,
     ) {
-        let (table_reads_rx, table_reads) = AIOClient::bounded(STORAGE_SERVICE_BACKLOG);
-        let (pool_reads_rx, pool_reads) = AIOClient::bounded(STORAGE_SERVICE_BACKLOG);
-        let (background_writes_rx, background_writes) = AIOClient::bounded(STORAGE_SERVICE_BACKLOG);
+        let (table_reads_rx, table_reads) = IOClient::bounded(STORAGE_SERVICE_BACKLOG);
+        let (pool_reads_rx, pool_reads) = IOClient::bounded(STORAGE_SERVICE_BACKLOG);
+        let (background_writes_rx, background_writes) = IOClient::bounded(STORAGE_SERVICE_BACKLOG);
         let stats = StorageServiceStatsHandle::default();
         (
             Self {
@@ -1354,9 +1354,9 @@ impl Component for FileSystemWorkers {
 /// `FileSystem` owns the three ingress lane clients plus the shared backend
 /// stats handle. The backend itself remains owned by `fs_workers`.
 pub struct FileSystem {
-    table_reads: AIOClient<ReadSubmission>,
-    pool_reads: AIOClient<PoolReadRequest>,
-    background_writes: AIOClient<BackgroundWriteRequest>,
+    table_reads: IOClient<ReadSubmission>,
+    pool_reads: IOClient<PoolReadRequest>,
+    background_writes: IOClient<BackgroundWriteRequest>,
     io_backend_stats: IOBackendStatsHandle,
     storage_service_stats: StorageServiceStatsHandle,
     configured_io_depth: usize,
@@ -1370,7 +1370,7 @@ impl FileSystem {
     #[inline]
     pub(crate) fn table_io_clients(
         &self,
-    ) -> (AIOClient<ReadSubmission>, AIOClient<BackgroundWriteRequest>) {
+    ) -> (IOClient<ReadSubmission>, IOClient<BackgroundWriteRequest>) {
         (self.table_reads.clone(), self.background_writes.clone())
     }
 
@@ -1627,7 +1627,7 @@ pub(crate) mod tests {
     use crate::file::cow_file::COW_FILE_PAGE_SIZE;
     use crate::file::table_file::TableFile;
     use crate::io::{
-        AIOBuf, AIOKind, DirectBuf, StorageBackendOp, StorageBackendTestHook,
+        DirectBuf, IOBuf, IOKind, StorageBackendOp, StorageBackendTestHook,
         install_storage_backend_test_hook,
     };
     use crate::latch::LatchFallbackMode;
@@ -1816,7 +1816,7 @@ pub(crate) mod tests {
     }
 
     struct ControlledStorageOpHookInner {
-        blocked_kind: AIOKind,
+        blocked_kind: IOKind,
         blocked_fd: RawFd,
         submits: parking_lot::Mutex<Vec<StorageBackendOp>>,
         submit_count: AtomicUsize,
@@ -1828,7 +1828,7 @@ pub(crate) mod tests {
     }
 
     impl ControlledStorageOpHook {
-        fn new(blocked_kind: AIOKind, blocked_fd: RawFd) -> Self {
+        fn new(blocked_kind: IOKind, blocked_fd: RawFd) -> Self {
             Self {
                 inner: Arc::new(ControlledStorageOpHookInner {
                     blocked_kind,
@@ -1954,7 +1954,7 @@ pub(crate) mod tests {
             let background_fd = test_raw_fd(&index_pool);
             let read_fd = reopened.raw_fd();
             let stats_start = fs.storage_service_stats();
-            let hook = Arc::new(ControlledStorageOpHook::new(AIOKind::Write, background_fd));
+            let hook = Arc::new(ControlledStorageOpHook::new(IOKind::Write, background_fd));
             let _hook = install_storage_backend_test_hook(hook.clone());
 
             let writes_done = test_dispatch_dirty_pages(index_pool, 2).await;
@@ -1981,9 +1981,9 @@ pub(crate) mod tests {
             hook.release();
             hook.wait_for_submit_count(2).await;
             let submits = hook.submits();
-            assert_eq!(submits[0].kind(), AIOKind::Write);
+            assert_eq!(submits[0].kind(), IOKind::Write);
             assert_eq!(submits[0].fd(), background_fd);
-            assert_eq!(submits[1].kind(), AIOKind::Read);
+            assert_eq!(submits[1].kind(), IOKind::Read);
             assert_eq!(submits[1].fd(), read_fd);
 
             assert_eq!(readonly_task.await, b"table-read");
@@ -2015,7 +2015,7 @@ pub(crate) mod tests {
             let background_fd = test_raw_fd(&index_pool);
             let read_fd = test_raw_fd(&mem_pool);
             let stats_start = fs.storage_service_stats();
-            let hook = Arc::new(ControlledStorageOpHook::new(AIOKind::Write, background_fd));
+            let hook = Arc::new(ControlledStorageOpHook::new(IOKind::Write, background_fd));
             let _hook = install_storage_backend_test_hook(hook.clone());
 
             let writes_done = test_dispatch_dirty_pages(index_pool, 2).await;
@@ -2044,9 +2044,9 @@ pub(crate) mod tests {
             hook.release();
             hook.wait_for_submit_count(2).await;
             let submits = hook.submits();
-            assert_eq!(submits[0].kind(), AIOKind::Write);
+            assert_eq!(submits[0].kind(), IOKind::Write);
             assert_eq!(submits[0].fd(), background_fd);
-            assert_eq!(submits[1].kind(), AIOKind::Read);
+            assert_eq!(submits[1].kind(), IOKind::Read);
             assert_eq!(submits[1].fd(), read_fd);
 
             assert_eq!(reload_task.await, b"pool-read");

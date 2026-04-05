@@ -5,7 +5,7 @@ use parking_lot::Mutex;
 ///
 /// Producers call [`Self::complete`] exactly once to publish the final result.
 /// Waiters can either poll [`Self::completed_result`] or await
-/// [`Self::wait_result`]. The stored value is clone-returned so multiple
+/// [`Self::wait_result`]. The stored value is cloned so multiple
 /// waiters can observe the same terminal state.
 pub struct Completion<T> {
     state: Mutex<CompletionState<T>>,

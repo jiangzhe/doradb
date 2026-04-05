@@ -13,7 +13,7 @@ use crate::index::{
     UniqueIndex, load_entry_deletion_deltas,
 };
 use crate::io::{
-    AIOKind, StorageBackendOp, StorageBackendTestHook, install_storage_backend_test_hook,
+    IOKind, StorageBackendOp, StorageBackendTestHook, install_storage_backend_test_hook,
 };
 use crate::latch::LatchFallbackMode;
 use crate::row::ops::{DeleteMvcc, InsertMvcc, SelectKey, SelectMvcc, UpdateCol, UpdateMvcc};
@@ -57,7 +57,7 @@ impl FailingPageReadHook {
 
     #[inline]
     fn matches(&self, op: StorageBackendOp) -> bool {
-        op.kind() == AIOKind::Read && op.fd() == self.fd && op.offset() == self.offset
+        op.kind() == IOKind::Read && op.fd() == self.fd && op.offset() == self.offset
     }
 }
 
@@ -2339,7 +2339,7 @@ fn test_mvcc_insert_surfaces_cached_insert_page_reload_error() {
         let trx = stmt.fail().await.unwrap();
         trx.rollback().await.unwrap();
         assert!(
-            matches!(res, Err(Error::IOError)),
+            matches!(res, Err(Error::IOError { .. })),
             "expected insert-page reload failure, got {res:?}"
         );
         assert!(

@@ -19,7 +19,7 @@ use crate::file::super_block::{
     SuperBlockFooter, SuperBlockHeader, SuperBlockSerView, parse_super_block,
 };
 use crate::file::table_file::TABLE_FILE_INITIAL_SIZE;
-use crate::io::{AIOBuf, AIOClient, DirectBuf};
+use crate::io::{DirectBuf, IOBuf, IOClient};
 use crate::row::RowID;
 use crate::serde::{Deser, Ser};
 use crate::trx::{MIN_SNAPSHOT_TS, TrxID};
@@ -240,8 +240,8 @@ impl MultiTableFile {
     #[inline]
     pub(super) async fn open_or_create(
         file_path: impl AsRef<str>,
-        table_reads: AIOClient<ReadSubmission>,
-        background_writes: AIOClient<BackgroundWriteRequest>,
+        table_reads: IOClient<ReadSubmission>,
+        background_writes: IOClient<BackgroundWriteRequest>,
     ) -> Result<Arc<Self>> {
         let file_path = file_path.as_ref();
         let file_exists = Path::new(file_path).exists();
@@ -530,7 +530,7 @@ mod tests {
     use crate::file::block_integrity::BLOCK_INTEGRITY_TRAILER_SIZE;
     use crate::file::test_block_id;
     use crate::file::{build_test_fs, build_test_fs_in};
-    use crate::io::AIOBuf;
+    use crate::io::IOBuf;
     use std::fs::OpenOptions;
     use std::io::{Seek, SeekFrom, Write};
     use std::num::NonZeroU64;

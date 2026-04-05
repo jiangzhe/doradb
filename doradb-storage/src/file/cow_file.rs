@@ -5,7 +5,7 @@ use crate::error::{BlockCorruptionCause, BlockKind, Error, FileKind, Result};
 use crate::file::fs::BackgroundWriteRequest;
 use crate::file::super_block::{SUPER_BLOCK_SIZE, SuperBlock};
 use crate::file::{SparseFile, write_direct};
-use crate::io::{AIOClient, DirectBuf};
+use crate::io::{DirectBuf, IOClient};
 use crate::trx::TrxID;
 use std::fs;
 use std::ops::{Deref, DerefMut};
@@ -164,8 +164,8 @@ pub struct CowFile<M> {
     file_id: PersistedFileID,
     active_root: AtomicPtr<ActiveRoot<M>>,
     mutable_inflight: AtomicBool,
-    table_reads: AIOClient<ReadSubmission>,
-    background_writes: AIOClient<BackgroundWriteRequest>,
+    table_reads: IOClient<ReadSubmission>,
+    background_writes: IOClient<BackgroundWriteRequest>,
     codec: CowCodec<M>,
 }
 
@@ -179,8 +179,8 @@ impl<M> CowFile<M> {
         file_path: impl AsRef<str>,
         initial_size: usize,
         file_id: PersistedFileID,
-        table_reads: AIOClient<ReadSubmission>,
-        background_writes: AIOClient<BackgroundWriteRequest>,
+        table_reads: IOClient<ReadSubmission>,
+        background_writes: IOClient<BackgroundWriteRequest>,
         codec: CowCodec<M>,
         trunc: bool,
     ) -> Result<Self> {
@@ -208,8 +208,8 @@ impl<M> CowFile<M> {
     pub(crate) fn open(
         file_path: impl AsRef<str>,
         file_id: PersistedFileID,
-        table_reads: AIOClient<ReadSubmission>,
-        background_writes: AIOClient<BackgroundWriteRequest>,
+        table_reads: IOClient<ReadSubmission>,
+        background_writes: IOClient<BackgroundWriteRequest>,
         codec: CowCodec<M>,
     ) -> Result<Self> {
         let file = SparseFile::open(file_path)?;

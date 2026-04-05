@@ -134,7 +134,7 @@ impl TransactionSystem {
             guard.is_some(),
             "storage poison flag published before poison error was recorded"
         );
-        guard.clone()
+        guard.as_ref().cloned()
     }
 
     /// Returns `Err` once a fatal storage failure poisoned runtime admission.

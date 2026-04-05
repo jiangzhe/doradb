@@ -62,7 +62,7 @@ impl Catalog {
         let batch = self.scan_checkpoint_batch(trx_sys)?;
         match self.apply_checkpoint_batch(batch).await {
             Ok(()) => Ok(()),
-            Err(Error::IOError | Error::AIOError(_) | Error::SendError) => {
+            Err(err) if err.is_storage_io_failure() || matches!(err, Error::SendError) => {
                 Err(trx_sys.poison_storage(StoragePoisonSource::CheckpointWrite))
             }
             Err(err) => Err(err),
