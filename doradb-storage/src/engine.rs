@@ -386,6 +386,7 @@ mod tests {
         assert!(config_str.contains("data_swap_file"));
         assert!(config_str.contains("log_dir"));
         assert!(config_str.contains("log_file_stem"));
+        assert!(!config_str.contains("max_io_depth"));
     }
 
     #[test]
@@ -426,8 +427,7 @@ mod tests {
                     EvictableBufferPoolConfig::default()
                         .role(PoolRole::Mem)
                         .max_mem_size(TEST_POOL_BYTES)
-                        .max_file_size(128usize * 1024 * 1024)
-                        .max_io_depth(1),
+                        .max_file_size(128usize * 1024 * 1024),
                 )
                 .build()
                 .await
@@ -456,8 +456,7 @@ mod tests {
                     EvictableBufferPoolConfig::default()
                         .role(PoolRole::Mem)
                         .max_mem_size(TEST_POOL_BYTES)
-                        .max_file_size(128usize * 1024 * 1024)
-                        .max_io_depth(1),
+                        .max_file_size(128usize * 1024 * 1024),
                 )
                 .build()
                 .await

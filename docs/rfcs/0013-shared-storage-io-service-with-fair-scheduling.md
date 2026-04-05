@@ -19,8 +19,8 @@ fair-scheduled storage-I/O worker for table-file I/O, readonly miss loads,
 backend-neutral completion core from RFC-0010, keeps redo-log I/O dedicated,
 and keeps pool-local eviction policy/state local even though evictor execution
 is shared. It also centralizes storage-I/O capacity under
-`TableFileSystemConfig.io_depth`, deprecates
-`EvictableBufferPoolConfig.max_io_depth`, and reduces the default engine
+`TableFileSystemConfig.io_depth`, removes per-pool storage I/O depth
+configuration from `EvictableBufferPoolConfig`, and reduces the default engine
 background-thread count from `12` to `8`. [D2], [D6], [D9], [C1], [C3], [C5],
 [C6], [C8], [C9], [C10], [U1], [U2], [U5], [U6], [U7], [U8]
 
@@ -121,8 +121,9 @@ Optional issue metadata for `tools/issue.rs create-issue-from-doc`:
   through `TableFsRequest::Read`, so table-file worker latency directly affects
   readonly reads.
 - [C5] `doradb-storage/src/buffer/evict.rs` - evictable pools own separate I/O
-  and evictor threads, maintain pool-local inflight/writeback state, and use
-  `max_io_depth` today.
+  and evictor threads, maintain pool-local inflight/writeback state, and
+  historically owned their own I/O-depth settings before the shared-runtime
+  consolidation.
 - [C6] `doradb-storage/src/component.rs` and `doradb-storage/src/engine.rs` -
   current component registration order and reverse-order shutdown/drop.
 - [C7] `doradb-storage/src/buffer/evictor.rs` - generic `EvictionRuntime`,
@@ -133,8 +134,8 @@ Optional issue metadata for `tools/issue.rs create-issue-from-doc`:
   drop-only eviction behavior.
 - [C9] `doradb-storage/src/conf/table_fs.rs` - current table-file config owns
   `io_depth` and readonly-buffer sizing.
-- [C10] `doradb-storage/src/conf/buffer.rs` - evictable-pool config currently
-  exposes `max_io_depth` and pool-local eviction-arbiter tuning.
+- [C10] `doradb-storage/src/conf/buffer.rs` - evictable-pool config owns
+  pool-local eviction-arbiter tuning and previously exposed `max_io_depth`.
 - [C11] `doradb-storage/src/conf/engine.rs` - engine config and storage-path
   resolution already treat table files and swap files as one storage layout.
 
@@ -156,8 +157,8 @@ Optional issue metadata for `tools/issue.rs create-issue-from-doc`:
 - [U7] User selected one shared evictor thread across `mem_pool`,
   `index_pool`, and the global readonly pool.
 - [U8] User decided that shared storage-I/O depth should be owned by
-  `TableFileSystemConfig`, and that pool `max_io_depth` should be deprecated
-  and removed from the target state.
+  `TableFileSystemConfig`, and that pool `max_io_depth` should be removed from
+  the config surface.
 
 ## Decision
 
@@ -205,10 +206,9 @@ reads and background buffer-pool writeback. [D2], [D5], [C1], [U4]
 
 `TableFileSystemConfig.io_depth` becomes the single authoritative shared
 storage-I/O depth. Pool swap files are treated as part of the same storage
-runtime and no longer own separate I/O-capacity settings. `EvictableBufferPool`
-will stop treating `max_io_depth` as authoritative during migration, and the
-RFC target state removes that field from the public config surface after the
-shared runtime lands. [C5], [C9], [C10], [C11], [U8]
+runtime and no longer own separate I/O-capacity settings. The pool config no
+longer exposes `max_io_depth`; shared storage depth is owned solely by
+`TableFileSystemConfig.io_depth`. [C5], [C9], [C10], [C11], [U8]
 
 The first implementation does not add new user-facing fairness knobs. Lane
 weights, burst budgets, and shared-evictor scan order remain internal policy
@@ -515,8 +515,8 @@ Backend-touching phases must also run the supported alternate backend pass:
 - Changes the current observability shape because backend stats become
   runtime-owned instead of trivially per-worker, and evictor activity becomes
   one shared loop rather than one thread per pool. [C3], [C5], [C8]
-- Requires config migration because `EvictableBufferPoolConfig.max_io_depth`
-  becomes deprecated and eventually removed. [C9], [C10], [U8]
+- Requires config migration because stale pool-local `max_io_depth` settings
+  are no longer part of the supported config surface. [C9], [C10], [U8]
 
 ## Open Questions
 
@@ -532,8 +532,6 @@ Backend-touching phases must also run the supported alternate backend pass:
    scheduler boundary after the initial storage runtime proves stable.
 2. Consider adaptive scheduling or workload-sensitive lane tuning only after
    the fixed-policy runtime is validated.
-3. Remove the deprecated pool-local I/O depth field once the migration phase is
-   complete and downstream config users are updated.
 
 ## References
 

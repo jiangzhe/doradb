@@ -1278,18 +1278,16 @@ pub(crate) fn build_file_system(
     let (builder, table_reads, pool_reads, background_writes) =
         StorageIOWorkerBuilder::new(backend);
     Ok((
-        FileSystem::new(
-            FileSystemSharedIo {
-                table_reads,
-                pool_reads,
-                background_writes,
-                io_backend_stats: stats,
-                storage_service_stats: builder.stats.clone(),
-                configured_io_depth: io_depth,
-            },
+        FileSystem {
+            table_reads,
+            pool_reads,
+            background_writes,
+            io_backend_stats: stats,
+            storage_service_stats: builder.stats.clone(),
+            configured_io_depth: io_depth,
             data_dir,
             catalog_file_name,
-        ),
+        },
         builder,
     ))
 }
@@ -1356,41 +1354,24 @@ impl Component for FileSystemWorkers {
 /// `FileSystem` owns the three ingress lane clients plus the shared backend
 /// stats handle. The backend itself remains owned by `fs_workers`.
 pub struct FileSystem {
-    shared_io: FileSystemSharedIo,
-    data_dir: PathBuf,
-    // Catalog multi-table file name.
-    catalog_file_name: String,
-}
-
-struct FileSystemSharedIo {
     table_reads: AIOClient<ReadSubmission>,
     pool_reads: AIOClient<PoolReadRequest>,
     background_writes: AIOClient<BackgroundWriteRequest>,
     io_backend_stats: IOBackendStatsHandle,
     storage_service_stats: StorageServiceStatsHandle,
     configured_io_depth: usize,
+    data_dir: PathBuf,
+    // Catalog multi-table file name.
+    catalog_file_name: String,
 }
 
 impl FileSystem {
-    /// Create the filesystem facade from prebuilt shared ingress clients.
-    #[inline]
-    fn new(shared_io: FileSystemSharedIo, data_dir: PathBuf, catalog_file_name: String) -> Self {
-        FileSystem {
-            shared_io,
-            data_dir,
-            catalog_file_name,
-        }
-    }
-
     /// Clone the file-facing read and write clients for a table-file handle.
     #[inline]
     pub(crate) fn table_io_clients(
         &self,
     ) -> (AIOClient<ReadSubmission>, AIOClient<BackgroundWriteRequest>) {
-        (
-            self.shared_io.table_reads.clone(),
-            self.shared_io.background_writes.clone(),
-        )
+        (self.table_reads.clone(), self.background_writes.clone())
     }
 
     #[inline]
@@ -1409,8 +1390,7 @@ impl FileSystem {
         req: EvictReadSubmission,
     ) -> StdResult<(), SendError<EvictReadSubmission>> {
         Self::assert_pool_role(role, "shared pool read dispatch");
-        self.shared_io
-            .pool_reads
+        self.pool_reads
             .send_async(match role {
                 PoolRole::Mem => PoolReadRequest::Mem(req),
                 PoolRole::Index => PoolReadRequest::Index(req),
@@ -1434,8 +1414,7 @@ impl FileSystem {
         done_ev: Arc<EventNotifyOnDrop>,
     ) -> StdResult<(), (Vec<PageExclusiveGuard<Page>>, Arc<EventNotifyOnDrop>)> {
         Self::assert_pool_role(role, "shared pool write dispatch");
-        self.shared_io
-            .background_writes
+        self.background_writes
             .send(match role {
                 PoolRole::Mem => BackgroundWriteRequest::MemPool(Box::new(
                     PoolBatchWriteRequest::new(page_guards, done_ev),
@@ -1461,9 +1440,9 @@ impl FileSystem {
     /// Signal shutdown to all shared ingress lanes.
     #[inline]
     fn shutdown_io_clients(&self) {
-        self.shared_io.table_reads.shutdown();
-        self.shared_io.pool_reads.shutdown();
-        self.shared_io.background_writes.shutdown();
+        self.table_reads.shutdown();
+        self.pool_reads.shutdown();
+        self.background_writes.shutdown();
     }
 
     /// Create a new table file.
@@ -1481,8 +1460,8 @@ impl FileSystem {
             &file_path,
             TABLE_FILE_INITIAL_SIZE,
             table_id,
-            self.shared_io.table_reads.clone(),
-            self.shared_io.background_writes.clone(),
+            self.table_reads.clone(),
+            self.background_writes.clone(),
             trunc,
         )?;
         let initial_pages = TABLE_FILE_INITIAL_SIZE / COW_FILE_PAGE_SIZE;
@@ -1543,19 +1522,19 @@ impl FileSystem {
     /// Returns one snapshot of backend-owned submit/wait activity.
     #[inline]
     pub fn io_backend_stats(&self) -> IOBackendStats {
-        self.shared_io.io_backend_stats.snapshot()
+        self.io_backend_stats.snapshot()
     }
 
     /// Returns one snapshot of shared-storage ingress and scheduler activity.
     #[inline]
     pub fn storage_service_stats(&self) -> StorageServiceStats {
-        self.shared_io.storage_service_stats.snapshot()
+        self.storage_service_stats.snapshot()
     }
 
     /// Returns the configured shared-storage worker IO depth.
     #[inline]
     pub fn configured_io_depth(&self) -> usize {
-        self.shared_io.configured_io_depth
+        self.configured_io_depth
     }
 
     /// Open existing catalog multi-table file or create a new one.
@@ -1719,7 +1698,7 @@ pub(crate) mod tests {
 
     #[inline]
     pub(crate) fn io_backend_stats_handle_identity(fs: &FileSystem) -> usize {
-        fs.shared_io.io_backend_stats.identity()
+        fs.io_backend_stats.identity()
     }
 
     #[inline]

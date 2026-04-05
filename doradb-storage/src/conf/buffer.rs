@@ -12,18 +12,13 @@ use std::path::{Path, PathBuf};
 
 use super::consts::{
     DEFAULT_EVICTABLE_BUFFER_POOL_DATA_SWAP_FILE, DEFAULT_EVICTABLE_BUFFER_POOL_MAX_FILE_SIZE,
-    DEFAULT_EVICTABLE_BUFFER_POOL_MAX_IO_DEPTH, DEFAULT_EVICTABLE_BUFFER_POOL_MAX_MEM_SIZE,
+    DEFAULT_EVICTABLE_BUFFER_POOL_MAX_MEM_SIZE,
 };
 
 /// Builder-style configuration for [`crate::buffer::EvictableBufferPool`].
 ///
 /// Besides file and memory sizing, this type carries eviction-arbiter tuning
 /// used to build the background evictor policy.
-///
-/// `max_io_depth` remains a compatibility-only field. Engine builds route pool
-/// reads and writeback through the shared storage worker, so
-/// [`crate::conf::FileSystemConfig::io_depth`] is the authoritative runtime IO
-/// depth.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EvictableBufferPoolConfig {
     #[serde(default)]
@@ -31,9 +26,6 @@ pub struct EvictableBufferPoolConfig {
     pub(crate) data_swap_file: PathBuf,
     pub(crate) max_file_size: Byte,
     pub(crate) max_mem_size: Byte,
-    // Compatibility-only legacy field. Shared storage runtime capacity is
-    // owned by `FileSystemConfig::io_depth`.
-    pub(crate) max_io_depth: usize,
     pub(crate) eviction_arbiter_builder: EvictionArbiterBuilder,
 }
 
@@ -45,7 +37,6 @@ impl Default for EvictableBufferPoolConfig {
             data_swap_file: PathBuf::from(DEFAULT_EVICTABLE_BUFFER_POOL_DATA_SWAP_FILE),
             max_file_size: DEFAULT_EVICTABLE_BUFFER_POOL_MAX_FILE_SIZE,
             max_mem_size: DEFAULT_EVICTABLE_BUFFER_POOL_MAX_MEM_SIZE,
-            max_io_depth: DEFAULT_EVICTABLE_BUFFER_POOL_MAX_IO_DEPTH,
             eviction_arbiter_builder: EvictionArbiter::builder(),
         }
     }
@@ -84,16 +75,6 @@ impl EvictableBufferPoolConfig {
         Byte: From<T>,
     {
         self.max_mem_size = Byte::from(max_mem_size);
-        self
-    }
-
-    #[inline]
-    /// Sets the compatibility-only legacy pool IO-depth field.
-    ///
-    /// Engine builds ignore this value for shared-worker capacity and instead
-    /// use [`crate::conf::FileSystemConfig::io_depth`].
-    pub fn max_io_depth(mut self, max_io_depth: usize) -> Self {
-        self.max_io_depth = max_io_depth;
         self
     }
 

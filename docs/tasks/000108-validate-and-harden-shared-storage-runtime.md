@@ -201,11 +201,11 @@ runtime without changing the selected runtime topology.
 4. Added production-path shared-evictor tests proving isolated domain pressure,
    concurrent multi-domain pressure, and idle-domain non-participation for the
    single shared evictor thread.
-5. Added authoritative-depth compatibility coverage in
-   `doradb-storage/src/engine.rs` and clarified in
-   `doradb-storage/src/conf/buffer.rs` that
-   `EvictableBufferPoolConfig.max_io_depth` is compatibility-only while
-   `FileSystemConfig.io_depth` remains authoritative for shared storage IO.
+5. Added authoritative shared-depth coverage in `doradb-storage/src/engine.rs`
+   and then completed the config cleanup by removing
+   `EvictableBufferPoolConfig.max_io_depth` from
+   `doradb-storage/src/conf/buffer.rs`, deleting its dead default constant, and
+   keeping `FileSystemConfig.io_depth` as the only storage IO-depth knob.
 6. Updated `docs/async-io.md` and `docs/engine-component-lifetime.md` so the
    living docs match the shipped shared storage worker, dedicated redo worker,
    shared evictor ownership, and telemetry surfaces.
@@ -220,6 +220,13 @@ runtime without changing the selected runtime topology.
    so hook-driven tests in shared-storage, readonly, table, and redo-log
    modules cannot race by installing different hooks against the same
    process-global hook slot.
+9. Follow-on cleanup synchronized `docs/rfcs/0013-shared-storage-io-service-with-fair-scheduling.md`
+   with the shipped config surface so the RFC now describes pool-local IO depth
+   as removed rather than compatibility-only.
+10. Follow-on cleanup in `doradb-storage/src/file/fs.rs` removed the private
+    `FileSystemSharedIo` wrapper and flattened those shared-client and stats
+    fields directly onto `FileSystem` without changing runtime behavior or the
+    public `FileSystem` API.
 
 ## Impacts
 
@@ -229,13 +236,15 @@ runtime without changing the selected runtime topology.
    - `doradb-storage/src/buffer/evictor.rs`
 3. Engine/runtime access for compatibility and telemetry assertions:
    - `doradb-storage/src/engine.rs`
-4. Compatibility-only config documentation:
+4. Shared-storage config cleanup and constants:
    - `doradb-storage/src/conf/buffer.rs`
+   - `doradb-storage/src/conf/consts.rs`
 5. Test-only backend-control support used by production-path validation:
    - `doradb-storage/src/io/mod.rs`
 6. Living documentation:
    - `docs/async-io.md`
    - `docs/engine-component-lifetime.md`
+   - `docs/rfcs/0013-shared-storage-io-service-with-fair-scheduling.md`
 
 ## Test Cases
 
@@ -251,19 +260,16 @@ runtime without changing the selected runtime topology.
    progress across the active domains rather than repeatedly running only one.
 6. A pool that is not under local pressure does not accumulate shared-evictor
    run counts merely because another pool is pressured.
-7. `FileSystemConfig.io_depth` is reflected by the shared storage worker and
-   changing only `EvictableBufferPoolConfig.max_io_depth` does not change that
-   depth.
+7. `FileSystemConfig.io_depth` is reflected by the shared storage worker, no
+   per-pool storage IO-depth setting remains on `EvictableBufferPoolConfig`,
+   and the shared backend stats surface remains wired through `FileSystem`.
 8. Validation commands:
    - `cargo nextest run -p doradb-storage`
    - `cargo nextest run -p doradb-storage --no-default-features --features libaio`
 
 ## Open Questions
 
-1. `EvictableBufferPoolConfig.max_io_depth` remains compatibility-only after
-   this task. A later cleanup task can remove the field entirely once the
-   repository no longer needs the compatibility surface.
-2. Mutable-pool shutdown propagation remains intentionally separate in
+1. Mutable-pool shutdown propagation remains intentionally separate in
    `docs/backlogs/000081-make-bufferpool-allocate-page-fallible-on-shutdown.md`
    because the preferred fix requires a broader fallible-allocation API change
    than Phase 4 should absorb.
