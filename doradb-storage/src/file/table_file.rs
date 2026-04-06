@@ -26,7 +26,7 @@ use crate::serde::{Deser, Ser};
 use crate::trx::TrxID;
 use futures::future::try_join_all;
 use std::mem;
-use std::ops::Deref;
+use std::os::fd::RawFd;
 use std::sync::Arc;
 
 pub const TABLE_FILE_MAGIC_WORD: [u8; 8] = [b'D', b'O', b'R', b'A', 0, 0, 0, 0];
@@ -247,50 +247,33 @@ impl TableFile {
         self.file.load_active_root_from_pool(disk_pool).await
     }
 
+    /// Returns the in-memory active root snapshot.
     #[inline]
-    pub(crate) async fn write_block(
-        self: &Arc<Self>,
-        block_id: BlockID,
-        buf: DirectBuf,
-        background_writes: &IOClient<BackgroundWriteRequest>,
-    ) -> Result<()> {
-        self.file
-            .write_block_with_owner(
-                background_writes,
-                ReadonlyBackingFile::from(Arc::clone(self)),
-                block_id,
-                buf,
-            )
-            .await
+    pub fn active_root(&self) -> &ActiveRoot {
+        self.file.active_root()
+    }
+
+    /// Returns the physical file identifier used by readonly caching and IO routing.
+    #[inline]
+    pub(crate) fn file_id(&self) -> FileID {
+        self.file.file_id()
+    }
+
+    /// Returns the owned raw file descriptor for direct IO operations.
+    #[inline]
+    pub(crate) fn raw_fd(&self) -> RawFd {
+        self.file.raw_fd()
     }
 
     #[inline]
-    pub(crate) async fn publish_root(
-        self: &Arc<Self>,
-        new_root: ActiveRoot,
-        background_writes: &IOClient<BackgroundWriteRequest>,
-    ) -> Result<Option<OldRoot>> {
-        self.file
-            .publish_root_with_owner(
-                background_writes,
-                ReadonlyBackingFile::from(Arc::clone(self)),
-                new_root,
-            )
-            .await
-    }
-
-    #[inline]
-    /// Remove this table file from disk.
-    pub fn delete(self) {
-        self.file.delete();
+    pub(super) fn install_loaded_root(&self, active_root: ActiveRoot) -> Option<OldRoot> {
+        self.file.swap_active_root(active_root)
     }
 }
 
-impl Deref for TableFile {
-    type Target = CowFile<TableMeta>;
-
+impl TableFile {
     #[inline]
-    fn deref(&self) -> &Self::Target {
+    fn file(&self) -> &CowFile<TableMeta> {
         &self.file
     }
 }
@@ -338,7 +321,7 @@ impl MutableTableFile {
     #[inline]
     fn release_mutable_claim_with_file(&mut self, file: &Arc<TableFile>) {
         if self.mutable_writer_claimed {
-            file.release_mutable_writer();
+            file.file().release_mutable_writer();
             self.mutable_writer_claimed = false;
         }
     }
@@ -350,7 +333,7 @@ impl MutableTableFile {
                 .file
                 .as_ref()
                 .expect("mutable table file has been consumed");
-            file.release_mutable_writer();
+            file.file().release_mutable_writer();
             self.mutable_writer_claimed = false;
         }
     }
@@ -362,7 +345,7 @@ impl MutableTableFile {
         new_root: ActiveRoot,
         background_writes: &IOClient<BackgroundWriteRequest>,
     ) -> Self {
-        table_file.claim_mutable_writer();
+        table_file.file().claim_mutable_writer();
         MutableTableFile {
             file: Some(table_file),
             new_root: Some(new_root),
@@ -377,7 +360,7 @@ impl MutableTableFile {
         table_file: &Arc<TableFile>,
         background_writes: &IOClient<BackgroundWriteRequest>,
     ) -> Self {
-        table_file.claim_mutable_writer();
+        table_file.file().claim_mutable_writer();
         MutableTableFile {
             file: Some(Arc::clone(table_file)),
             new_root: Some(table_file.active_root().flip()),
@@ -433,8 +416,19 @@ impl MutableTableFile {
     /// Write one page into the underlying table file.
     #[inline]
     pub async fn write_block(&self, block_id: BlockID, buf: DirectBuf) -> Result<()> {
+        let owner = ReadonlyBackingFile::from(Arc::clone(self.file_ref()));
         self.file_ref()
-            .write_block(block_id, buf, self.background_writes())
+            .file()
+            .write_block_with_owner(self.background_writes(), owner, block_id, buf)
+            .await
+    }
+
+    #[inline]
+    async fn publish_root(&self, new_root: ActiveRoot) -> Result<Option<OldRoot>> {
+        let owner = ReadonlyBackingFile::from(Arc::clone(self.file_ref()));
+        self.file_ref()
+            .file()
+            .publish_root_with_owner(self.background_writes(), owner, new_root)
             .await
     }
 
@@ -453,10 +447,7 @@ impl MutableTableFile {
             .expect("mutable table file has been consumed");
         debug_assert!(new_root.trx_id == 0 || new_root.trx_id < trx_id);
         new_root.trx_id = trx_id;
-        let publish_res = self
-            .file_ref()
-            .publish_root(new_root, self.background_writes())
-            .await;
+        let publish_res = self.publish_root(new_root).await;
         let table_file = self
             .file
             .take()
@@ -467,7 +458,7 @@ impl MutableTableFile {
             Ok(old_root) => Ok((table_file, old_root)),
             Err(err) => {
                 if try_delete_if_fail && let Some(file) = Arc::into_inner(table_file) {
-                    file.delete();
+                    file.file.delete();
                 }
                 Err(err)
             }
@@ -503,7 +494,18 @@ impl MutableTableFile {
             }
             last_end = end_row_id;
             new_entries.push(block.shape.with_block_id(block_id));
-            writes.push(table_file.write_block(block_id, block.buf, &background_writes));
+            let background_writes = background_writes.clone();
+            let file = Arc::clone(&table_file);
+            writes.push(async move {
+                file.file()
+                    .write_block_with_owner(
+                        &background_writes,
+                        ReadonlyBackingFile::from(Arc::clone(&file)),
+                        block_id,
+                        block.buf,
+                    )
+                    .await
+            });
         }
 
         try_join_all(writes).await?;
@@ -547,7 +549,7 @@ impl MutableTableFile {
             .expect("mutable table file has been consumed");
         self.release_mutable_claim_with_file(&table_file);
         if let Some(table_file) = Arc::into_inner(table_file) {
-            table_file.delete();
+            table_file.file.delete();
             return true;
         }
         false
@@ -649,10 +651,10 @@ mod tests {
             let mut buf = DirectBuf::zeroed(COW_FILE_PAGE_SIZE);
             buf.reset();
             buf.extend_from_slice(b"hello, world");
-            let res = table_file
-                .write_block(test_block_id(3), buf, background_writes)
-                .await;
+            let mutable = MutableTableFile::fork(&table_file, background_writes);
+            let res = mutable.write_block(test_block_id(3), buf).await;
             assert!(res.is_ok());
+            drop(mutable);
 
             let res = read_page_for_test(&table_file, test_block_id(3)).await;
             assert!(res.is_ok());

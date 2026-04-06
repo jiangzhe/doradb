@@ -1475,7 +1475,7 @@ impl FileSystem {
             global_disk_pool,
         );
         let active_root = table_file.load_active_root_from_pool(&disk_pool).await?;
-        let old_root = table_file.swap_active_root(active_root);
+        let old_root = table_file.install_loaded_root(active_root);
         debug_assert!(old_root.is_none());
         Ok((table_file, disk_pool))
     }
@@ -1536,7 +1536,7 @@ impl FileSystem {
                     global_disk_pool,
                 );
                 let active_root = mtb.load_active_root_from_pool(&disk_pool).await?;
-                let old_root = mtb.swap_active_root(active_root);
+                let old_root = mtb.install_loaded_root(active_root);
                 debug_assert!(old_root.is_none());
                 Ok((mtb, disk_pool))
             }
@@ -1812,10 +1812,9 @@ pub(crate) mod tests {
     ) {
         let mut buf = DirectBuf::zeroed(COW_FILE_PAGE_SIZE);
         buf.as_bytes_mut()[..payload.len()].copy_from_slice(payload);
-        table_file
-            .write_block(block_id, buf, fs.background_writes())
-            .await
-            .unwrap();
+        let mutable = MutableTableFile::fork(table_file, fs.background_writes());
+        mutable.write_block(block_id, buf).await.unwrap();
+        drop(mutable);
     }
 
     #[derive(Clone)]

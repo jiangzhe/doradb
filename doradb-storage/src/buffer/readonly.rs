@@ -1505,10 +1505,9 @@ pub(crate) mod tests {
         let mut buf = DirectBuf::zeroed(COW_FILE_PAGE_SIZE);
         let bytes = buf.as_bytes_mut();
         bytes[..payload.len()].copy_from_slice(payload);
-        table_file
-            .write_block(page_id, buf, fs.background_writes())
-            .await
-            .unwrap();
+        let mutable = MutableTableFile::fork(table_file, fs.background_writes());
+        mutable.write_block(page_id, buf).await.unwrap();
+        drop(mutable);
     }
 
     async fn write_page_bytes(
@@ -1519,10 +1518,9 @@ pub(crate) mod tests {
     ) {
         let mut buf = DirectBuf::zeroed(COW_FILE_PAGE_SIZE);
         buf.as_bytes_mut().copy_from_slice(bytes);
-        table_file
-            .write_block(page_id, buf, fs.background_writes())
-            .await
-            .unwrap();
+        let mutable = MutableTableFile::fork(table_file, fs.background_writes());
+        mutable.write_block(page_id, buf).await.unwrap();
+        drop(mutable);
     }
 
     #[test]

@@ -964,7 +964,7 @@ mod tests {
     use crate::file::BlockID;
     use crate::file::cow_file::COW_FILE_PAGE_SIZE;
     use crate::file::fs::{FileSystem, FileSystemWorkers};
-    use crate::file::table_file::TableFile;
+    use crate::file::table_file::{MutableTableFile, TableFile};
     use crate::io::{DirectBuf, IOBuf};
     use crate::quiescent::QuiescentGuard;
     use crate::value::ValKind;
@@ -1183,10 +1183,9 @@ mod tests {
     ) {
         let mut buf = DirectBuf::zeroed(COW_FILE_PAGE_SIZE);
         buf.as_bytes_mut()[..payload.len()].copy_from_slice(payload);
-        table_file
-            .write_block(block_id, buf, fs.background_writes())
-            .await
-            .unwrap();
+        let mutable = MutableTableFile::fork(table_file, fs.background_writes());
+        mutable.write_block(block_id, buf).await.unwrap();
+        drop(mutable);
     }
 
     #[derive(Clone)]

@@ -16,6 +16,7 @@ use crate::error::Result;
 use crate::file::fs::FileSystem;
 use crate::file::multi_table_file::{
     CATALOG_TABLE_ROOT_DESC_COUNT, CatalogTableRootDesc, MultiTableFile, MultiTableFileSnapshot,
+    MutableMultiTableFile,
 };
 use crate::index::BlockIndex;
 use crate::quiescent::QuiescentGuard;
@@ -150,14 +151,15 @@ impl CatalogStorage {
         next_user_obj_id: ObjID,
     ) -> Result<()> {
         let background_writes = self.table_fs.background_writes();
-        self.mtb
-            .publish_checkpoint(
-                catalog_replay_start_ts,
-                next_user_obj_id,
-                self.catalog_table_roots(),
-                background_writes,
-            )
-            .await
+        let mut mutable = MutableMultiTableFile::fork(&self.mtb, background_writes);
+        mutable.apply_checkpoint_metadata(
+            catalog_replay_start_ts,
+            next_user_obj_id,
+            self.catalog_table_roots(),
+        )?;
+        let (_, old_root) = mutable.commit().await?;
+        drop(old_root);
+        Ok(())
     }
 
     #[inline]

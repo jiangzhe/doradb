@@ -25,7 +25,7 @@ use crate::serde::{Deser, Ser};
 use crate::trx::{MIN_SNAPSHOT_TS, TrxID};
 use std::io::ErrorKind;
 use std::num::NonZeroU64;
-use std::ops::Deref;
+use std::os::fd::RawFd;
 use std::sync::Arc;
 
 pub use crate::file::CATALOG_MTB_FILE_ID;
@@ -286,6 +286,12 @@ impl MultiTableFile {
         self.file.load_active_root_from_pool(disk_pool).await
     }
 
+    /// Returns the in-memory active root snapshot.
+    #[inline]
+    pub fn active_root(&self) -> &MultiTableActiveRoot {
+        self.file.active_root()
+    }
+
     /// Returns active-root snapshot from in-memory pointer without additional IO.
     #[inline]
     pub fn load_snapshot(&self) -> Result<MultiTableFileSnapshot> {
@@ -296,64 +302,30 @@ impl MultiTableFile {
         })
     }
 
+    /// Returns the physical file identifier used by readonly caching and IO routing.
     #[inline]
-    pub(crate) async fn write_block(
-        self: &Arc<Self>,
-        block_id: BlockID,
-        buf: DirectBuf,
-        background_writes: &IOClient<BackgroundWriteRequest>,
-    ) -> Result<()> {
-        self.file
-            .write_block_with_owner(
-                background_writes,
-                ReadonlyBackingFile::from(Arc::clone(self)),
-                block_id,
-                buf,
-            )
-            .await
+    pub(crate) fn file_id(&self) -> crate::file::FileID {
+        self.file.file_id()
+    }
+
+    /// Returns the owned raw file descriptor for direct IO operations.
+    #[inline]
+    pub(crate) fn raw_fd(&self) -> RawFd {
+        self.file.raw_fd()
     }
 
     #[inline]
-    pub(crate) async fn publish_root(
-        self: &Arc<Self>,
-        new_root: MultiTableActiveRoot,
-        background_writes: &IOClient<BackgroundWriteRequest>,
-    ) -> Result<Option<OldMultiTableRoot>> {
-        self.file
-            .publish_root_with_owner(
-                background_writes,
-                ReadonlyBackingFile::from(Arc::clone(self)),
-                new_root,
-            )
-            .await
-    }
-
-    /// Publish new checkpoint metadata atomically.
-    #[inline]
-    pub(crate) async fn publish_checkpoint(
-        self: &Arc<Self>,
-        catalog_replay_start_ts: TrxID,
-        next_user_obj_id: ObjID,
-        table_roots: [CatalogTableRootDesc; CATALOG_TABLE_ROOT_DESC_COUNT],
-        background_writes: &IOClient<BackgroundWriteRequest>,
-    ) -> Result<()> {
-        let mut mutable = MutableMultiTableFile::fork(self, background_writes);
-        mutable.apply_checkpoint_metadata(
-            catalog_replay_start_ts,
-            next_user_obj_id,
-            table_roots,
-        )?;
-        let (_, old_root) = mutable.commit().await?;
-        drop(old_root);
-        Ok(())
+    pub(super) fn install_loaded_root(
+        &self,
+        active_root: MultiTableActiveRoot,
+    ) -> Option<OldMultiTableRoot> {
+        self.file.swap_active_root(active_root)
     }
 }
 
-impl Deref for MultiTableFile {
-    type Target = CowFile<MultiTableMetaBlock>;
-
+impl MultiTableFile {
     #[inline]
-    fn deref(&self) -> &Self::Target {
+    fn file(&self) -> &CowFile<MultiTableMetaBlock> {
         &self.file
     }
 }
@@ -391,7 +363,7 @@ impl MutableMultiTableFile {
     #[inline]
     fn release_mutable_claim_with_file(&mut self, file: &Arc<MultiTableFile>) {
         if self.mutable_writer_claimed {
-            file.release_mutable_writer();
+            file.file().release_mutable_writer();
             self.mutable_writer_claimed = false;
         }
     }
@@ -403,7 +375,7 @@ impl MutableMultiTableFile {
                 .file
                 .as_ref()
                 .expect("mutable multi-table file has been consumed");
-            file.release_mutable_writer();
+            file.file().release_mutable_writer();
             self.mutable_writer_claimed = false;
         }
     }
@@ -415,7 +387,7 @@ impl MutableMultiTableFile {
         new_root: MultiTableActiveRoot,
         background_writes: &IOClient<BackgroundWriteRequest>,
     ) -> Self {
-        table_file.claim_mutable_writer();
+        table_file.file().claim_mutable_writer();
         MutableMultiTableFile {
             file: Some(table_file),
             new_root: Some(new_root),
@@ -430,7 +402,7 @@ impl MutableMultiTableFile {
         table_file: &Arc<MultiTableFile>,
         background_writes: &IOClient<BackgroundWriteRequest>,
     ) -> Self {
-        table_file.claim_mutable_writer();
+        table_file.file().claim_mutable_writer();
         MutableMultiTableFile {
             file: Some(Arc::clone(table_file)),
             new_root: Some(table_file.active_root().flip()),
@@ -464,8 +436,22 @@ impl MutableMultiTableFile {
     /// Write one page into the underlying multi-table file.
     #[inline]
     pub(crate) async fn write_block(&self, block_id: BlockID, buf: DirectBuf) -> Result<()> {
+        let owner = ReadonlyBackingFile::from(Arc::clone(self.file_ref()));
         self.file_ref()
-            .write_block(block_id, buf, self.background_writes())
+            .file()
+            .write_block_with_owner(self.background_writes(), owner, block_id, buf)
+            .await
+    }
+
+    #[inline]
+    async fn publish_root(
+        &self,
+        new_root: MultiTableActiveRoot,
+    ) -> Result<Option<OldMultiTableRoot>> {
+        let owner = ReadonlyBackingFile::from(Arc::clone(self.file_ref()));
+        self.file_ref()
+            .file()
+            .publish_root_with_owner(self.background_writes(), owner, new_root)
             .await
     }
 
@@ -505,10 +491,7 @@ impl MutableMultiTableFile {
             .new_root
             .take()
             .expect("mutable multi-table file has been consumed");
-        let publish_res = self
-            .file_ref()
-            .publish_root(new_root, self.background_writes())
-            .await;
+        let publish_res = self.publish_root(new_root).await;
         let file = self
             .file
             .take()
@@ -617,6 +600,21 @@ mod tests {
         ));
     }
 
+    async fn publish_checkpoint_for_test(
+        mtb: &Arc<MultiTableFile>,
+        background_writes: &IOClient<BackgroundWriteRequest>,
+        catalog_replay_start_ts: TrxID,
+        next_user_obj_id: ObjID,
+        table_roots: [CatalogTableRootDesc; CATALOG_TABLE_ROOT_DESC_COUNT],
+    ) {
+        let mut mutable = MutableMultiTableFile::fork(mtb, background_writes);
+        mutable
+            .apply_checkpoint_metadata(catalog_replay_start_ts, next_user_obj_id, table_roots)
+            .unwrap();
+        let (_, old_root) = mutable.commit().await.unwrap();
+        drop(old_root);
+    }
+
     #[test]
     fn test_multi_table_file_open_publish_and_reload() {
         smol::block_on(async {
@@ -641,9 +639,8 @@ mod tests {
                 root.root_block_id = NonZeroU64::new((idx + 10) as u64);
                 root.pivot_row_id = (idx * 100) as u64;
             }
-            mtb.publish_checkpoint(7, USER_OBJ_ID_START + 16, roots, background_writes)
-                .await
-                .unwrap();
+            publish_checkpoint_for_test(&mtb, background_writes, 7, USER_OBJ_ID_START + 16, roots)
+                .await;
             let meta_block_id_1 = mtb.active_root().meta_block_id;
             assert_ne!(meta_block_id_0, meta_block_id_1);
             drop(mtb);
@@ -680,13 +677,11 @@ mod tests {
             }
 
             let meta_block_id_0 = mtb.active_root().meta_block_id;
-            mtb.publish_checkpoint(3, USER_OBJ_ID_START + 1, roots, background_writes)
-                .await
-                .unwrap();
+            publish_checkpoint_for_test(&mtb, background_writes, 3, USER_OBJ_ID_START + 1, roots)
+                .await;
             let meta_block_id_1 = mtb.active_root().meta_block_id;
-            mtb.publish_checkpoint(4, USER_OBJ_ID_START + 2, roots, background_writes)
-                .await
-                .unwrap();
+            publish_checkpoint_for_test(&mtb, background_writes, 4, USER_OBJ_ID_START + 2, roots)
+                .await;
             let meta_block_id_2 = mtb.active_root().meta_block_id;
 
             assert_ne!(meta_block_id_0, meta_block_id_1);
@@ -822,17 +817,27 @@ mod tests {
                 root.root_block_id = NonZeroU64::new((idx + 10) as u64);
                 root.pivot_row_id = (idx as u64) + 1;
             }
-            mtb.publish_checkpoint(3, USER_OBJ_ID_START + 1, roots_v1, background_writes)
-                .await
-                .unwrap();
+            publish_checkpoint_for_test(
+                &mtb,
+                background_writes,
+                3,
+                USER_OBJ_ID_START + 1,
+                roots_v1,
+            )
+            .await;
             let older_snapshot = mtb.load_snapshot().unwrap();
 
             let mut roots_v2 = roots_v1;
             roots_v2[0].root_block_id = NonZeroU64::new(99);
             roots_v2[0].pivot_row_id = 100;
-            mtb.publish_checkpoint(4, USER_OBJ_ID_START + 2, roots_v2, background_writes)
-                .await
-                .unwrap();
+            publish_checkpoint_for_test(
+                &mtb,
+                background_writes,
+                4,
+                USER_OBJ_ID_START + 2,
+                roots_v2,
+            )
+            .await;
             let active_super_slot = mtb.active_root().slot_no;
             drop(mtb);
             drop(fs);
@@ -873,16 +878,26 @@ mod tests {
                 root.root_block_id = NonZeroU64::new((idx + 20) as u64);
                 root.pivot_row_id = (idx as u64) + 10;
             }
-            mtb.publish_checkpoint(5, USER_OBJ_ID_START + 10, roots_v1, background_writes)
-                .await
-                .unwrap();
+            publish_checkpoint_for_test(
+                &mtb,
+                background_writes,
+                5,
+                USER_OBJ_ID_START + 10,
+                roots_v1,
+            )
+            .await;
 
             let mut roots_v2 = roots_v1;
             roots_v2[1].root_block_id = NonZeroU64::new(123);
             roots_v2[1].pivot_row_id = 222;
-            mtb.publish_checkpoint(6, USER_OBJ_ID_START + 11, roots_v2, background_writes)
-                .await
-                .unwrap();
+            publish_checkpoint_for_test(
+                &mtb,
+                background_writes,
+                6,
+                USER_OBJ_ID_START + 11,
+                roots_v2,
+            )
+            .await;
             let active_meta_block_id = mtb.active_root().meta_block_id;
             drop(mtb);
             drop(fs);
