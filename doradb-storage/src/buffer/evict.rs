@@ -278,8 +278,9 @@ impl EvictableBufferPool {
             return Err(Error::StorageEngineShutdown);
         }
         if self.in_mem.try_inc() {
-            // Once reservation succeeds, shutdown does not try to roll it back.
-            // The only hard requirement is that blocked waiters can exit.
+            // `reserve_page()` only acquires in-memory budget. Callers that later
+            // fail before publishing a page decide whether that reservation
+            // should be released again.
             self.in_mem.record_alloc_success();
             return Ok(());
         }
@@ -343,6 +344,10 @@ impl BufferPool for EvictableBufferPool {
                     // Check after listener registration so shutdown terminates the wait path
                     // directly instead of waiting for a page id to become available.
                     if self.shutdown_flag.load(Ordering::Acquire) {
+                        // `reserve_page()` already claimed in-memory budget for this attempt,
+                        // but we have not acquired a page id yet, so release the reservation
+                        // before surfacing shutdown to the caller.
+                        self.in_mem.dec();
                         return Err(Error::StorageEngineShutdown);
                     }
                     // re-check

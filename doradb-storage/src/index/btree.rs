@@ -754,13 +754,18 @@ impl<P: BufferPool> GenericBTree<P> {
         let lower_fence_value = root.lower_fence_value();
         // Only truncate separator key if it's leaf.
         let sep_key = root.create_sep_key(sep_idx, is_leaf);
-        // Allocate left node.
+        // Allocate both child nodes before mutating any page state.
         let mut left_page = self.allocate_node(pool_guard).await?;
+        let mut right_page = match self.allocate_node(pool_guard).await {
+            Ok(page) => page,
+            Err(err) => {
+                self.pool.deallocate_page(left_page);
+                return Err(err);
+            }
+        };
         let left_page_id = left_page.page_id();
-        let left_node = left_page.page_mut();
-        // Allocate right node.
-        let mut right_page = self.allocate_node(pool_guard).await?;
         let right_page_id = right_page.page_id();
+        let left_node = left_page.page_mut();
         let right_node = right_page.page_mut();
         // Initialize and copy key values to left node.
         left_node.init(
@@ -1978,6 +1983,69 @@ mod tests {
             first_right_leaf_page_id,
             second_right_leaf_page_id,
         }
+    }
+
+    #[test]
+    fn test_btree_split_root_releases_left_page_when_right_allocation_fails() {
+        smol::block_on(async {
+            let pool = QuiescentBox::new(
+                FixedBufferPool::with_capacity(
+                    crate::buffer::PoolRole::Index,
+                    2 * (std::mem::size_of::<crate::buffer::frame::BufferFrame>()
+                        + std::mem::size_of::<crate::buffer::page::Page>()),
+                )
+                .unwrap(),
+            );
+            let pool_guard = (*pool).pool_guard();
+            let tree = BTree::new(pool.guard(), &pool_guard, false, 200)
+                .await
+                .expect("test btree construction should succeed");
+            assert_eq!(pool.allocated(), 1);
+
+            {
+                let mut root_guard = tree
+                    .get_node(&pool_guard, tree.root, LatchFallbackMode::Exclusive)
+                    .await
+                    .unwrap()
+                    .lock_exclusive_async()
+                    .await
+                    .unwrap();
+                let root = root_guard.page_mut();
+                root.init(0, 200, &[], BTreeU64::INVALID_VALUE, &[], false);
+                root.insert(b"a", BTreeU64::from(1));
+                root.insert(b"b", BTreeU64::from(2));
+                root.insert(b"c", BTreeU64::from(3));
+
+                let err = tree
+                    .split_root::<BTreeU64>(&pool_guard, root, true, 210)
+                    .await
+                    .expect_err("second split-root allocation should fail");
+                assert!(matches!(err, Error::BufferPoolFull));
+            }
+
+            assert_eq!(pool.allocated(), 1);
+
+            let extra = tree
+                .allocate_node(&pool_guard)
+                .await
+                .expect("left split page should be returned to the pool on failure");
+            pool.deallocate_page(extra);
+
+            let root_guard = tree
+                .get_node(&pool_guard, tree.root, LatchFallbackMode::Shared)
+                .await
+                .unwrap()
+                .lock_shared_async()
+                .await
+                .unwrap();
+            let root = root_guard.page();
+            assert!(root.is_leaf());
+            assert_eq!(root.height(), 0);
+            assert_eq!(root.count(), 3);
+            assert_eq!(root.search_key(b"a"), Ok(0));
+            assert_eq!(root.search_key(b"b"), Ok(1));
+            assert_eq!(root.search_key(b"c"), Ok(2));
+        })
     }
 
     #[test]
