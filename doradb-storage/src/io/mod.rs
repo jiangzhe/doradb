@@ -273,14 +273,10 @@ impl<T> IOQueue<T> {
 
 /// One worker-owned submission staged for backend preparation and completion.
 ///
-/// The state-machine key is opaque to the generic worker. Domain-specific
-/// inflight dedupe and ordering live above the worker in the state machine and
-/// its owning subsystem.
+/// The generic worker only prepares and submits the backend operation. Any
+/// domain identity or higher-level bookkeeping lives in the concrete
+/// submission and its owning state machine.
 pub trait IOSubmission {
-    type Key;
-
-    /// Returns the domain key associated with this submission.
-    fn key(&self) -> &Self::Key;
     /// Returns the backend-agnostic IO operation to prepare and submit.
     fn operation(&mut self) -> &mut Operation;
 }
@@ -402,12 +398,7 @@ struct InflightEntry<S, P> {
 /// applies completion-side state transitions.
 pub trait IOStateMachine {
     type Request;
-    /// Opaque domain identity attached to each submission.
-    ///
-    /// The generic worker does not interpret this key. Subsystems use it for
-    /// their own inflight maps, dedupe, and debugging.
-    type Key;
-    type Submission: IOSubmission<Key = Self::Key>;
+    type Submission: IOSubmission;
 
     /// Called when receiving a new request from the worker channel.
     ///
@@ -1002,30 +993,20 @@ mod tests {
     }
 
     struct ExpandSubmission {
-        key: u64,
         operation: Operation,
     }
 
     impl IOSubmission for ExpandSubmission {
-        type Key = u64;
-
-        fn key(&self) -> &Self::Key {
-            &self.key
-        }
-
         fn operation(&mut self) -> &mut Operation {
             &mut self.operation
         }
     }
 
     #[derive(Default)]
-    struct ExpandingStateMachine {
-        next_key: u64,
-    }
+    struct ExpandingStateMachine;
 
     impl IOStateMachine for ExpandingStateMachine {
         type Request = ExpandRequest;
-        type Key = u64;
         type Submission = ExpandSubmission;
 
         fn prepare_request(
@@ -1036,10 +1017,7 @@ mod tests {
         ) -> Option<ExpandRequest> {
             let emit = req.remaining.min(max_new);
             for _ in 0..emit {
-                let key = self.next_key;
-                self.next_key += 1;
                 queue.push(ExpandSubmission {
-                    key,
                     operation: Operation::pwrite_owned(
                         -1,
                         0,
@@ -1068,7 +1046,7 @@ mod tests {
         IOClient<ExpandRequest>,
     ) {
         let (builder, client) = build_io_worker(TestBackend { max_events });
-        let mut worker = builder.bind(ExpandingStateMachine::default());
+        let mut worker = builder.bind(ExpandingStateMachine);
         worker.submitted = submitted;
         (worker, client)
     }
@@ -1164,18 +1142,11 @@ mod tests {
     }
 
     struct RecordedSubmission {
-        key: u64,
         op: RecordedOp,
         operation: Operation,
     }
 
     impl IOSubmission for RecordedSubmission {
-        type Key = u64;
-
-        fn key(&self) -> &Self::Key {
-            &self.key
-        }
-
         fn operation(&mut self) -> &mut Operation {
             &mut self.operation
         }
@@ -1189,7 +1160,6 @@ mod tests {
     }
 
     struct RecordingStateMachine {
-        next_key: u64,
         log: Arc<RecordingLog>,
     }
 
@@ -1202,13 +1172,12 @@ mod tests {
     impl RecordingStateMachine {
         #[inline]
         fn new(log: Arc<RecordingLog>) -> Self {
-            RecordingStateMachine { next_key: 0, log }
+            RecordingStateMachine { log }
         }
     }
 
     impl IOStateMachine for RecordingStateMachine {
         type Request = RecordedRequest;
-        type Key = u64;
         type Submission = RecordedSubmission;
 
         fn prepare_request(
@@ -1219,10 +1188,7 @@ mod tests {
         ) -> Option<RecordedRequest> {
             let emit = req.remaining.min(max_new);
             for op_idx in req.next_op..req.next_op + emit {
-                let key = self.next_key;
-                self.next_key += 1;
                 queue.push(RecordedSubmission {
-                    key,
                     op: RecordedOp {
                         tag: req.tag,
                         op_idx,

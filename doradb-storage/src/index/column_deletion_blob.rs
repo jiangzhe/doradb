@@ -257,7 +257,7 @@ struct SealedBlobPage {
 }
 
 /// Append-only writer for immutable shared delete payload blobs.
-pub struct ColumnDeletionBlobWriter<'a, M: MutableCowFile> {
+pub(crate) struct ColumnDeletionBlobWriter<'a, M: MutableCowFile> {
     mutable_file: &'a mut M,
     current_page: Option<PendingBlobPage>,
     sealed_pages: Vec<SealedBlobPage>,
@@ -265,7 +265,7 @@ pub struct ColumnDeletionBlobWriter<'a, M: MutableCowFile> {
 
 impl<'a, M: MutableCowFile> ColumnDeletionBlobWriter<'a, M> {
     #[inline]
-    pub fn new(mutable_file: &'a mut M) -> Self {
+    pub(crate) fn new(mutable_file: &'a mut M) -> Self {
         ColumnDeletionBlobWriter {
             mutable_file,
             current_page: None,
@@ -577,7 +577,7 @@ mod tests {
             let disk_pool = table_readonly_pool(&global, 1, &table);
             let disk_pool_guard = disk_pool.pool_guard();
 
-            let mut mutable = MutableTableFile::fork(&table);
+            let mut mutable = MutableTableFile::fork(&table, fs.background_writes());
             let blob = vec![9u8; 513];
             let blob_ref = {
                 let mut writer = ColumnDeletionBlobWriter::new(&mut mutable);
@@ -615,7 +615,7 @@ mod tests {
             let disk_pool = table_readonly_pool(&global, 1, &table);
             let disk_pool_guard = disk_pool.pool_guard();
 
-            let mut mutable = MutableTableFile::fork(&table);
+            let mut mutable = MutableTableFile::fork(&table, fs.background_writes());
             let blob = vec![7u8; COLUMN_DELETION_BLOB_PAGE_BODY_SIZE * 2 + 113];
             let blob_ref = {
                 let mut writer = ColumnDeletionBlobWriter::new(&mut mutable);
@@ -650,7 +650,7 @@ mod tests {
             let disk_pool = table_readonly_pool(&global, 1, &table);
             let disk_pool_guard = disk_pool.pool_guard();
 
-            let mut mutable = MutableTableFile::fork(&table);
+            let mut mutable = MutableTableFile::fork(&table, fs.background_writes());
             let first_blob =
                 vec![3u8; COLUMN_DELETION_BLOB_PAGE_BODY_SIZE - COLUMN_AUX_BLOB_HEADER_SIZE];
             let second_blob = vec![5u8; 17];

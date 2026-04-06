@@ -1,7 +1,8 @@
 use crate::bitmap::AllocMap;
-use crate::buffer::{ReadSubmission, ReadonlyBackingFile, ReadonlyBufferPool};
+use crate::buffer::{ReadonlyBackingFile, ReadonlyBufferPool};
 use crate::catalog::{TableID, table::TableMetadata};
 use crate::error::{BlockCorruptionCause, BlockKind, Error, FileKind, Result};
+use crate::file::FileID;
 use crate::file::block_integrity::{
     BLOCK_INTEGRITY_HEADER_SIZE, BlockIntegritySpec, max_payload_len, validate_block,
     write_block_checksum, write_block_header,
@@ -25,7 +26,7 @@ use crate::serde::{Deser, Ser};
 use crate::trx::TrxID;
 use futures::future::try_join_all;
 use std::mem;
-use std::ops::Deref;
+use std::os::fd::RawFd;
 use std::sync::Arc;
 
 pub const TABLE_FILE_MAGIC_WORD: [u8; 8] = [b'D', b'O', b'R', b'A', 0, 0, 0, 0];
@@ -207,7 +208,9 @@ fn table_codec() -> CowCodec<TableMeta> {
 }
 
 /// Table-file facade over generic copy-on-write file mechanics.
-pub struct TableFile(CowFile<TableMeta>);
+pub struct TableFile {
+    file: CowFile<TableMeta>,
+}
 
 impl TableFile {
     /// Create a table file.
@@ -216,38 +219,23 @@ impl TableFile {
         file_path: impl AsRef<str>,
         initial_size: usize,
         table_id: TableID,
-        table_reads: IOClient<ReadSubmission>,
-        background_writes: IOClient<BackgroundWriteRequest>,
         trunc: bool,
     ) -> Result<Self> {
         debug_assert!(initial_size.is_multiple_of(COW_FILE_PAGE_SIZE));
-        let cow_file = CowFile::create(
+        let file = CowFile::create(
             file_path,
             initial_size,
-            table_id,
-            table_reads,
-            background_writes,
+            FileID::from(table_id),
             table_codec(),
             trunc,
         )?;
-        Ok(TableFile(cow_file))
+        Ok(TableFile { file })
     }
 
     #[inline]
-    pub(super) fn open(
-        file_path: impl AsRef<str>,
-        table_id: TableID,
-        table_reads: IOClient<ReadSubmission>,
-        background_writes: IOClient<BackgroundWriteRequest>,
-    ) -> Result<Self> {
-        let cow_file = CowFile::open(
-            file_path,
-            table_id,
-            table_reads,
-            background_writes,
-            table_codec(),
-        )?;
-        Ok(TableFile(cow_file))
+    pub(super) fn open(file_path: impl AsRef<str>, table_id: TableID) -> Result<Self> {
+        let file = CowFile::open(file_path, FileID::from(table_id), table_codec())?;
+        Ok(TableFile { file })
     }
 
     /// Load the active root after validating the selected table meta block through readonly cache.
@@ -256,39 +244,37 @@ impl TableFile {
         &self,
         disk_pool: &ReadonlyBufferPool,
     ) -> Result<ActiveRoot> {
-        self.0.load_active_root_from_pool(disk_pool).await
+        self.file.load_active_root_from_pool(disk_pool).await
+    }
+
+    /// Returns the in-memory active root snapshot.
+    #[inline]
+    pub fn active_root(&self) -> &ActiveRoot {
+        self.file.active_root()
+    }
+
+    /// Returns the physical file identifier used by readonly caching and IO routing.
+    #[inline]
+    pub(crate) fn file_id(&self) -> FileID {
+        self.file.file_id()
+    }
+
+    /// Returns the owned raw file descriptor for direct IO operations.
+    #[inline]
+    pub(crate) fn raw_fd(&self) -> RawFd {
+        self.file.raw_fd()
     }
 
     #[inline]
-    pub async fn write_block(self: &Arc<Self>, block_id: BlockID, buf: DirectBuf) -> Result<()> {
-        self.0
-            .write_block_with_owner(ReadonlyBackingFile::from(Arc::clone(self)), block_id, buf)
-            .await
-    }
-
-    #[inline]
-    pub(crate) async fn publish_root(
-        self: &Arc<Self>,
-        new_root: ActiveRoot,
-    ) -> Result<Option<OldRoot>> {
-        self.0
-            .publish_root_with_owner(ReadonlyBackingFile::from(Arc::clone(self)), new_root)
-            .await
-    }
-
-    #[inline]
-    /// Remove this table file from disk.
-    pub fn delete(self) {
-        self.0.delete();
+    pub(super) fn install_loaded_root(&self, active_root: ActiveRoot) -> Option<OldRoot> {
+        self.file.swap_active_root(active_root)
     }
 }
 
-impl Deref for TableFile {
-    type Target = CowFile<TableMeta>;
-
+impl TableFile {
     #[inline]
-    fn deref(&self) -> &Self::Target {
-        &self.0
+    fn file(&self) -> &CowFile<TableMeta> {
+        &self.file
     }
 }
 
@@ -300,6 +286,7 @@ impl Deref for TableFile {
 pub struct MutableTableFile {
     file: Option<Arc<TableFile>>,
     new_root: Option<ActiveRoot>,
+    background_writes: IOClient<BackgroundWriteRequest>,
     mutable_writer_claimed: bool,
 }
 
@@ -327,9 +314,14 @@ impl MutableTableFile {
     }
 
     #[inline]
+    fn background_writes(&self) -> &IOClient<BackgroundWriteRequest> {
+        &self.background_writes
+    }
+
+    #[inline]
     fn release_mutable_claim_with_file(&mut self, file: &Arc<TableFile>) {
         if self.mutable_writer_claimed {
-            file.release_mutable_writer();
+            file.file().release_mutable_writer();
             self.mutable_writer_claimed = false;
         }
     }
@@ -341,29 +333,38 @@ impl MutableTableFile {
                 .file
                 .as_ref()
                 .expect("mutable table file has been consumed");
-            file.release_mutable_writer();
+            file.file().release_mutable_writer();
             self.mutable_writer_claimed = false;
         }
     }
 
     /// Create new mutable table file.
     #[inline]
-    pub fn new(table_file: Arc<TableFile>, new_root: ActiveRoot) -> Self {
-        table_file.claim_mutable_writer();
+    pub(crate) fn new(
+        table_file: Arc<TableFile>,
+        new_root: ActiveRoot,
+        background_writes: &IOClient<BackgroundWriteRequest>,
+    ) -> Self {
+        table_file.file().claim_mutable_writer();
         MutableTableFile {
             file: Some(table_file),
             new_root: Some(new_root),
+            background_writes: background_writes.clone(),
             mutable_writer_claimed: true,
         }
     }
 
     /// Fork the whole table file with a new root.
     #[inline]
-    pub fn fork(table_file: &Arc<TableFile>) -> Self {
-        table_file.claim_mutable_writer();
+    pub(crate) fn fork(
+        table_file: &Arc<TableFile>,
+        background_writes: &IOClient<BackgroundWriteRequest>,
+    ) -> Self {
+        table_file.file().claim_mutable_writer();
         MutableTableFile {
             file: Some(Arc::clone(table_file)),
             new_root: Some(table_file.active_root().flip()),
+            background_writes: background_writes.clone(),
             mutable_writer_claimed: true,
         }
     }
@@ -415,7 +416,20 @@ impl MutableTableFile {
     /// Write one page into the underlying table file.
     #[inline]
     pub async fn write_block(&self, block_id: BlockID, buf: DirectBuf) -> Result<()> {
-        self.file_ref().write_block(block_id, buf).await
+        let owner = ReadonlyBackingFile::from(Arc::clone(self.file_ref()));
+        self.file_ref()
+            .file()
+            .write_block_with_owner(self.background_writes(), owner, block_id, buf)
+            .await
+    }
+
+    #[inline]
+    async fn publish_root(&self, new_root: ActiveRoot) -> Result<Option<OldRoot>> {
+        let owner = ReadonlyBackingFile::from(Arc::clone(self.file_ref()));
+        self.file_ref()
+            .file()
+            .publish_root_with_owner(self.background_writes(), owner, new_root)
+            .await
     }
 
     /// Commit the modification of table file.
@@ -433,7 +447,7 @@ impl MutableTableFile {
             .expect("mutable table file has been consumed");
         debug_assert!(new_root.trx_id == 0 || new_root.trx_id < trx_id);
         new_root.trx_id = trx_id;
-        let publish_res = self.file_ref().publish_root(new_root).await;
+        let publish_res = self.publish_root(new_root).await;
         let table_file = self
             .file
             .take()
@@ -444,7 +458,7 @@ impl MutableTableFile {
             Ok(old_root) => Ok((table_file, old_root)),
             Err(err) => {
                 if try_delete_if_fail && let Some(file) = Arc::into_inner(table_file) {
-                    file.delete();
+                    file.file.delete();
                 }
                 Err(err)
             }
@@ -452,7 +466,7 @@ impl MutableTableFile {
     }
 
     /// Persist provided LWC blocks and update mutable root/index metadata.
-    pub async fn apply_lwc_blocks(
+    pub(crate) async fn apply_lwc_blocks(
         &mut self,
         lwc_blocks: Vec<LwcBlockPersist>,
         heap_redo_start_ts: TrxID,
@@ -460,6 +474,7 @@ impl MutableTableFile {
         disk_pool: &ReadonlyBufferPool,
     ) -> Result<()> {
         let table_file = Arc::clone(self.file_ref());
+        let background_writes = self.background_writes.clone();
         let disk_pool_guard = disk_pool.pool_guard();
         let mut max_row_id = self.root().pivot_row_id;
         let mut writes = Vec::with_capacity(lwc_blocks.len());
@@ -479,7 +494,18 @@ impl MutableTableFile {
             }
             last_end = end_row_id;
             new_entries.push(block.shape.with_block_id(block_id));
-            writes.push(table_file.write_block(block_id, block.buf));
+            let background_writes = background_writes.clone();
+            let file = Arc::clone(&table_file);
+            writes.push(async move {
+                file.file()
+                    .write_block_with_owner(
+                        &background_writes,
+                        ReadonlyBackingFile::from(Arc::clone(&file)),
+                        block_id,
+                        block.buf,
+                    )
+                    .await
+            });
         }
 
         try_join_all(writes).await?;
@@ -502,7 +528,8 @@ impl MutableTableFile {
     }
 
     /// Persist LWC blocks and commit the resulting root as one CoW publish.
-    pub async fn persist_lwc_blocks(
+    #[cfg(test)]
+    pub(crate) async fn persist_lwc_blocks(
         mut self,
         lwc_blocks: Vec<LwcBlockPersist>,
         heap_redo_start_ts: TrxID,
@@ -514,20 +541,6 @@ impl MutableTableFile {
         self.commit(ts, false).await
     }
 
-    /// Updates checkpoint metadata in the mutable root and commits it as a new table-file root.
-    ///
-    /// This method consumes `self`; on `Err`, the caller must treat the failed mutable instance
-    /// as discarded and start from `MutableTableFile::fork` again.
-    pub async fn update_checkpoint(
-        mut self,
-        pivot_row_id: RowID,
-        heap_redo_start_ts: TrxID,
-        ts: TrxID,
-    ) -> Result<(Arc<TableFile>, Option<OldRoot>)> {
-        self.apply_checkpoint_metadata(pivot_row_id, heap_redo_start_ts)?;
-        self.commit(ts, false).await
-    }
-
     #[inline]
     pub fn try_delete(mut self) -> bool {
         let table_file = self
@@ -536,7 +549,7 @@ impl MutableTableFile {
             .expect("mutable table file has been consumed");
         self.release_mutable_claim_with_file(&table_file);
         if let Some(table_file) = Arc::into_inner(table_file) {
-            table_file.delete();
+            table_file.file.delete();
             return true;
         }
         false
@@ -579,12 +592,16 @@ pub type OldRoot = OldCowRoot<TableMeta>;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::buffer::{global_readonly_pool_scope, table_readonly_pool};
+    use crate::buffer::{
+        GlobalReadonlyBufferPool, PoolRole, ReadonlyBufferPool, global_readonly_pool_scope,
+        table_readonly_pool,
+    };
     use crate::catalog::{ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexSpec};
     use crate::error::{BlockCorruptionCause, BlockKind, Error, FileKind};
     use crate::file::block_integrity::BLOCK_INTEGRITY_TRAILER_SIZE;
     use crate::file::{build_test_fs, build_test_fs_in, test_block_id};
     use crate::io::IOBuf;
+    use crate::quiescent::QuiescentBox;
     use crate::value::ValKind;
     use std::fs::OpenOptions;
     use std::io::{Seek, SeekFrom, Write};
@@ -612,6 +629,7 @@ mod tests {
     fn test_table_file() {
         smol::block_on(async {
             let (_temp_dir, fs) = build_test_fs();
+            let background_writes = fs.background_writes();
             let metadata = Arc::new(TableMetadata::new(
                 vec![
                     ColumnSpec::new("c0", ValKind::U32, ColumnAttributes::empty()),
@@ -633,8 +651,10 @@ mod tests {
             let mut buf = DirectBuf::zeroed(COW_FILE_PAGE_SIZE);
             buf.reset();
             buf.extend_from_slice(b"hello, world");
-            let res = table_file.write_block(test_block_id(3), buf).await;
+            let mutable = MutableTableFile::fork(&table_file, background_writes);
+            let res = mutable.write_block(test_block_id(3), buf).await;
             assert!(res.is_ok());
+            drop(mutable);
 
             let res = read_page_for_test(&table_file, test_block_id(3)).await;
             assert!(res.is_ok());
@@ -647,7 +667,7 @@ mod tests {
             let (table_file2, disk_pool) = fs.open_table_file(41, global.guard()).await.unwrap();
             assert_eq!(table_file2.active_root().trx_id, 1);
 
-            let mutable = MutableTableFile::fork(&table_file2);
+            let mutable = MutableTableFile::fork(&table_file2, background_writes);
             let (table_file3, old_root) = mutable.commit(2, false).await.unwrap();
             drop(old_root);
             let active_root = table_file3
@@ -708,13 +728,34 @@ mod tests {
             assert_eq!(table_file.active_root().slot_no, 0);
             assert_eq!(table_file.active_root().trx_id, 1);
 
-            // We first drop file system, then send the IO request,
-            // it should fail.
-            drop(fs);
+            let global = QuiescentBox::new(
+                GlobalReadonlyBufferPool::with_capacity(
+                    PoolRole::Disk,
+                    64 * 1024 * 1024,
+                    fs.guard(),
+                )
+                .unwrap(),
+            );
+            let disk_pool = ReadonlyBufferPool::from_table_file(
+                FileKind::TableFile,
+                Arc::clone(&table_file),
+                global.guard(),
+            );
+            let disk_pool_guard = disk_pool.pool_guard();
 
-            let res = read_page_for_test(&table_file, test_block_id(1)).await;
+            // We first shut down the file system, then send the IO request,
+            // it should fail.
+            fs.shutdown();
+
+            let res = disk_pool
+                .read_validated_block(&disk_pool_guard, test_block_id(1), accept_any_page)
+                .await;
             assert!(res.is_err());
 
+            drop(disk_pool_guard);
+            drop(disk_pool);
+            drop(global);
+            drop(fs);
             drop(table_file);
         });
     }
@@ -836,6 +877,7 @@ mod tests {
     fn test_persist_lwc_blocks_appends_entries() {
         smol::block_on(async {
             let (_temp_dir, fs) = build_test_fs();
+            let background_writes = fs.background_writes();
             let metadata = build_test_metadata();
             let table_file = fs.create_table_file(43, metadata, false).unwrap();
             let (table_file, old_root) = table_file.commit(1, false).await.unwrap();
@@ -856,7 +898,7 @@ mod tests {
 
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
             let disk_pool = table_readonly_pool(&global, 43, &table_file);
-            let (table_file, old_root) = MutableTableFile::fork(&table_file)
+            let (table_file, old_root) = MutableTableFile::fork(&table_file, background_writes)
                 .persist_lwc_blocks(lwc_blocks, 7, 2, &disk_pool)
                 .await
                 .unwrap();
@@ -896,6 +938,7 @@ mod tests {
     fn test_persist_lwc_blocks_rejects_overlapping_ranges() {
         smol::block_on(async {
             let (_temp_dir, fs) = build_test_fs();
+            let background_writes = fs.background_writes();
             let metadata = build_test_metadata();
             let table_file = fs.create_table_file(44, metadata, false).unwrap();
             let (table_file, old_root) = table_file.commit(1, false).await.unwrap();
@@ -916,7 +959,7 @@ mod tests {
 
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
             let disk_pool = table_readonly_pool(&global, 44, &table_file);
-            let result = MutableTableFile::fork(&table_file)
+            let result = MutableTableFile::fork(&table_file, background_writes)
                 .persist_lwc_blocks(lwc_blocks, 7, 2, &disk_pool)
                 .await;
 
@@ -935,13 +978,14 @@ mod tests {
     fn test_mutable_table_file_rejects_concurrent_fork() {
         smol::block_on(async {
             let (_temp_dir, fs) = build_test_fs();
+            let background_writes = fs.background_writes();
             let metadata = build_test_metadata();
             let table_file = fs.create_table_file(45, metadata, false).unwrap();
             let (table_file, old_root) = table_file.commit(1, false).await.unwrap();
             drop(old_root);
 
-            let _first = MutableTableFile::fork(&table_file);
-            let _second = MutableTableFile::fork(&table_file);
+            let _first = MutableTableFile::fork(&table_file, background_writes);
+            let _second = MutableTableFile::fork(&table_file, background_writes);
         });
     }
 
@@ -949,15 +993,16 @@ mod tests {
     fn test_mutable_table_file_allows_fork_after_drop() {
         smol::block_on(async {
             let (_temp_dir, fs) = build_test_fs();
+            let background_writes = fs.background_writes();
             let metadata = build_test_metadata();
             let table_file = fs.create_table_file(46, metadata, false).unwrap();
             let (table_file, old_root) = table_file.commit(1, false).await.unwrap();
             drop(old_root);
 
-            let first = MutableTableFile::fork(&table_file);
+            let first = MutableTableFile::fork(&table_file, background_writes);
             drop(first);
 
-            let _second = MutableTableFile::fork(&table_file);
+            let _second = MutableTableFile::fork(&table_file, background_writes);
         });
     }
 }

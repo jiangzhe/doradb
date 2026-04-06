@@ -1,7 +1,7 @@
 use crate::bitmap::AllocMap;
-use crate::buffer::{PersistedFileID, ReadSubmission, ReadonlyBackingFile, ReadonlyBufferPool};
+use crate::buffer::{ReadonlyBackingFile, ReadonlyBufferPool};
 use crate::catalog::{ObjID, TableID, USER_OBJ_ID_START};
-use crate::error::{BlockCorruptionCause, BlockKind, Error, FileKind, Result};
+use crate::error::{BlockCorruptionCause, BlockKind, Error, FileKind, Result, StorageOp};
 use crate::file::block_integrity::{
     BLOCK_INTEGRITY_HEADER_SIZE, BlockIntegritySpec, max_payload_len, validate_block,
     write_block_checksum, write_block_header,
@@ -23,17 +23,17 @@ use crate::io::{DirectBuf, IOBuf, IOClient};
 use crate::row::RowID;
 use crate::serde::{Deser, Ser};
 use crate::trx::{MIN_SNAPSHOT_TS, TrxID};
+use std::io::ErrorKind;
 use std::num::NonZeroU64;
-use std::ops::Deref;
-use std::path::Path;
+use std::os::fd::RawFd;
 use std::sync::Arc;
+
+pub use crate::file::CATALOG_MTB_FILE_ID;
 
 /// On-disk format version of `catalog.mtb`.
 pub const CATALOG_MTB_VERSION: u64 = 2;
 /// Reserved number of catalog logical-table root descriptors.
 pub const CATALOG_TABLE_ROOT_DESC_COUNT: usize = 4;
-/// Reserved persisted-file identity of `catalog.mtb`.
-pub const CATALOG_MTB_PERSISTED_FILE_ID: PersistedFileID = USER_OBJ_ID_START - 1;
 /// Initial sparse-file size for `catalog.mtb`.
 pub const MULTI_TABLE_FILE_INITIAL_SIZE: usize = TABLE_FILE_INITIAL_SIZE;
 
@@ -233,48 +233,48 @@ fn multi_table_codec() -> CowCodec<MultiTableMetaBlock> {
 /// - page 0 contains two ping-pong super blocks,
 /// - meta blocks are CoW-allocated and super blocks point to active meta block,
 /// - updates are published by writing new meta block then swapping active super block.
-pub struct MultiTableFile(CowFile<MultiTableMetaBlock>);
+pub struct MultiTableFile {
+    file: CowFile<MultiTableMetaBlock>,
+}
+
+pub(super) enum MultiTableFileOpenOutcome {
+    Created(Arc<MultiTableFile>),
+    Opened(Arc<MultiTableFile>),
+}
 
 impl MultiTableFile {
-    /// Open existing file or create a new one, then load/publish initial active root.
+    /// Open existing file or create a new one, returning which case occurred.
+    ///
+    /// Initial root loading or first-root publish is handled by
+    /// `FileSystem::open_or_create_multi_table_file()`.
     #[inline]
     pub(super) async fn open_or_create(
         file_path: impl AsRef<str>,
-        table_reads: IOClient<ReadSubmission>,
-        background_writes: IOClient<BackgroundWriteRequest>,
-    ) -> Result<Arc<Self>> {
+    ) -> Result<MultiTableFileOpenOutcome> {
         let file_path = file_path.as_ref();
-        let file_exists = Path::new(file_path).exists();
-        let cow_file = if file_exists {
-            CowFile::open(
-                file_path,
-                CATALOG_MTB_PERSISTED_FILE_ID,
-                table_reads,
-                background_writes,
-                multi_table_codec(),
-            )?
-        } else {
-            CowFile::create(
-                file_path,
-                MULTI_TABLE_FILE_INITIAL_SIZE,
-                CATALOG_MTB_PERSISTED_FILE_ID,
-                table_reads,
-                background_writes,
-                multi_table_codec(),
-                false,
-            )?
+        let file = match CowFile::create(
+            file_path,
+            MULTI_TABLE_FILE_INITIAL_SIZE,
+            CATALOG_MTB_FILE_ID,
+            multi_table_codec(),
+            false,
+        ) {
+            Ok(file) => {
+                return Ok(MultiTableFileOpenOutcome::Created(Arc::new(
+                    MultiTableFile { file },
+                )));
+            }
+            Err(Error::StorageIOError {
+                op: StorageOp::FileCreate,
+                kind: ErrorKind::AlreadyExists,
+                ..
+            }) => CowFile::open(file_path, CATALOG_MTB_FILE_ID, multi_table_codec())?,
+            Err(err) => return Err(err),
         };
 
-        let file = Arc::new(MultiTableFile(cow_file));
-
-        if !file_exists {
-            let mutable =
-                MutableMultiTableFile::new(Arc::clone(&file), MultiTableActiveRoot::new());
-            let (_, old_root) = mutable.commit().await?;
-            debug_assert!(old_root.is_none());
-        }
-
-        Ok(file)
+        Ok(MultiTableFileOpenOutcome::Opened(Arc::new(
+            MultiTableFile { file },
+        )))
     }
 
     /// Load the active root after validating the selected `catalog.mtb` meta block.
@@ -283,7 +283,13 @@ impl MultiTableFile {
         &self,
         disk_pool: &ReadonlyBufferPool,
     ) -> Result<MultiTableActiveRoot> {
-        self.0.load_active_root_from_pool(disk_pool).await
+        self.file.load_active_root_from_pool(disk_pool).await
+    }
+
+    /// Returns the in-memory active root snapshot.
+    #[inline]
+    pub fn active_root(&self) -> &MultiTableActiveRoot {
+        self.file.active_root()
     }
 
     /// Returns active-root snapshot from in-memory pointer without additional IO.
@@ -296,49 +302,31 @@ impl MultiTableFile {
         })
     }
 
+    /// Returns the physical file identifier used by readonly caching and IO routing.
     #[inline]
-    pub async fn write_block(self: &Arc<Self>, block_id: BlockID, buf: DirectBuf) -> Result<()> {
-        self.0
-            .write_block_with_owner(ReadonlyBackingFile::from(Arc::clone(self)), block_id, buf)
-            .await
+    pub(crate) fn file_id(&self) -> crate::file::FileID {
+        self.file.file_id()
+    }
+
+    /// Returns the owned raw file descriptor for direct IO operations.
+    #[inline]
+    pub(crate) fn raw_fd(&self) -> RawFd {
+        self.file.raw_fd()
     }
 
     #[inline]
-    pub(crate) async fn publish_root(
-        self: &Arc<Self>,
-        new_root: MultiTableActiveRoot,
-    ) -> Result<Option<OldMultiTableRoot>> {
-        self.0
-            .publish_root_with_owner(ReadonlyBackingFile::from(Arc::clone(self)), new_root)
-            .await
-    }
-
-    /// Publish new checkpoint metadata atomically.
-    #[inline]
-    pub async fn publish_checkpoint(
-        self: &Arc<Self>,
-        catalog_replay_start_ts: TrxID,
-        next_user_obj_id: ObjID,
-        table_roots: [CatalogTableRootDesc; CATALOG_TABLE_ROOT_DESC_COUNT],
-    ) -> Result<()> {
-        let mut mutable = MutableMultiTableFile::fork(self);
-        mutable.apply_checkpoint_metadata(
-            catalog_replay_start_ts,
-            next_user_obj_id,
-            table_roots,
-        )?;
-        let (_, old_root) = mutable.commit().await?;
-        drop(old_root);
-        Ok(())
+    pub(super) fn install_loaded_root(
+        &self,
+        active_root: MultiTableActiveRoot,
+    ) -> Option<OldMultiTableRoot> {
+        self.file.swap_active_root(active_root)
     }
 }
 
-impl Deref for MultiTableFile {
-    type Target = CowFile<MultiTableMetaBlock>;
-
+impl MultiTableFile {
     #[inline]
-    fn deref(&self) -> &Self::Target {
-        &self.0
+    fn file(&self) -> &CowFile<MultiTableMetaBlock> {
+        &self.file
     }
 }
 
@@ -348,6 +336,7 @@ impl Deref for MultiTableFile {
 pub struct MutableMultiTableFile {
     file: Option<Arc<MultiTableFile>>,
     new_root: Option<MultiTableActiveRoot>,
+    background_writes: IOClient<BackgroundWriteRequest>,
     mutable_writer_claimed: bool,
 }
 
@@ -367,9 +356,14 @@ impl MutableMultiTableFile {
     }
 
     #[inline]
+    fn background_writes(&self) -> &IOClient<BackgroundWriteRequest> {
+        &self.background_writes
+    }
+
+    #[inline]
     fn release_mutable_claim_with_file(&mut self, file: &Arc<MultiTableFile>) {
         if self.mutable_writer_claimed {
-            file.release_mutable_writer();
+            file.file().release_mutable_writer();
             self.mutable_writer_claimed = false;
         }
     }
@@ -381,29 +375,38 @@ impl MutableMultiTableFile {
                 .file
                 .as_ref()
                 .expect("mutable multi-table file has been consumed");
-            file.release_mutable_writer();
+            file.file().release_mutable_writer();
             self.mutable_writer_claimed = false;
         }
     }
 
     /// Create mutable handle with caller-provided root.
     #[inline]
-    pub fn new(table_file: Arc<MultiTableFile>, new_root: MultiTableActiveRoot) -> Self {
-        table_file.claim_mutable_writer();
+    pub(crate) fn new(
+        table_file: Arc<MultiTableFile>,
+        new_root: MultiTableActiveRoot,
+        background_writes: &IOClient<BackgroundWriteRequest>,
+    ) -> Self {
+        table_file.file().claim_mutable_writer();
         MutableMultiTableFile {
             file: Some(table_file),
             new_root: Some(new_root),
+            background_writes: background_writes.clone(),
             mutable_writer_claimed: true,
         }
     }
 
     /// Fork mutable handle from current active root.
     #[inline]
-    pub fn fork(table_file: &Arc<MultiTableFile>) -> Self {
-        table_file.claim_mutable_writer();
+    pub(crate) fn fork(
+        table_file: &Arc<MultiTableFile>,
+        background_writes: &IOClient<BackgroundWriteRequest>,
+    ) -> Self {
+        table_file.file().claim_mutable_writer();
         MutableMultiTableFile {
             file: Some(Arc::clone(table_file)),
             new_root: Some(table_file.active_root().flip()),
+            background_writes: background_writes.clone(),
             mutable_writer_claimed: true,
         }
     }
@@ -432,8 +435,24 @@ impl MutableMultiTableFile {
 
     /// Write one page into the underlying multi-table file.
     #[inline]
-    pub async fn write_block(&self, block_id: BlockID, buf: DirectBuf) -> Result<()> {
-        self.file_ref().write_block(block_id, buf).await
+    pub(crate) async fn write_block(&self, block_id: BlockID, buf: DirectBuf) -> Result<()> {
+        let owner = ReadonlyBackingFile::from(Arc::clone(self.file_ref()));
+        self.file_ref()
+            .file()
+            .write_block_with_owner(self.background_writes(), owner, block_id, buf)
+            .await
+    }
+
+    #[inline]
+    async fn publish_root(
+        &self,
+        new_root: MultiTableActiveRoot,
+    ) -> Result<Option<OldMultiTableRoot>> {
+        let owner = ReadonlyBackingFile::from(Arc::clone(self.file_ref()));
+        self.file_ref()
+            .file()
+            .publish_root_with_owner(self.background_writes(), owner, new_root)
+            .await
     }
 
     /// Apply checkpoint metadata to mutable root.
@@ -465,12 +484,14 @@ impl MutableMultiTableFile {
 
     /// Commit mutable root by writing meta block then ping-pong super block.
     #[inline]
-    pub async fn commit(mut self) -> Result<(Arc<MultiTableFile>, Option<OldMultiTableRoot>)> {
+    pub(crate) async fn commit(
+        mut self,
+    ) -> Result<(Arc<MultiTableFile>, Option<OldMultiTableRoot>)> {
         let new_root = self
             .new_root
             .take()
             .expect("mutable multi-table file has been consumed");
-        let publish_res = self.file_ref().publish_root(new_root).await;
+        let publish_res = self.publish_root(new_root).await;
         let file = self
             .file
             .take()
@@ -579,10 +600,26 @@ mod tests {
         ));
     }
 
+    async fn publish_checkpoint_for_test(
+        mtb: &Arc<MultiTableFile>,
+        background_writes: &IOClient<BackgroundWriteRequest>,
+        catalog_replay_start_ts: TrxID,
+        next_user_obj_id: ObjID,
+        table_roots: [CatalogTableRootDesc; CATALOG_TABLE_ROOT_DESC_COUNT],
+    ) {
+        let mut mutable = MutableMultiTableFile::fork(mtb, background_writes);
+        mutable
+            .apply_checkpoint_metadata(catalog_replay_start_ts, next_user_obj_id, table_roots)
+            .unwrap();
+        let (_, old_root) = mutable.commit().await.unwrap();
+        drop(old_root);
+    }
+
     #[test]
     fn test_multi_table_file_open_publish_and_reload() {
         smol::block_on(async {
             let (_dir, fs) = build_test_fs();
+            let background_writes = fs.background_writes();
             let path = fs.catalog_mtb_file_path();
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
 
@@ -602,9 +639,8 @@ mod tests {
                 root.root_block_id = NonZeroU64::new((idx + 10) as u64);
                 root.pivot_row_id = (idx * 100) as u64;
             }
-            mtb.publish_checkpoint(7, USER_OBJ_ID_START + 16, roots)
-                .await
-                .unwrap();
+            publish_checkpoint_for_test(&mtb, background_writes, 7, USER_OBJ_ID_START + 16, roots)
+                .await;
             let meta_block_id_1 = mtb.active_root().meta_block_id;
             assert_ne!(meta_block_id_0, meta_block_id_1);
             drop(mtb);
@@ -628,6 +664,7 @@ mod tests {
     fn test_multi_table_file_meta_block_copy_on_write() {
         smol::block_on(async {
             let (_dir, fs) = build_test_fs();
+            let background_writes = fs.background_writes();
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
             let (mtb, _) = fs
                 .open_or_create_multi_table_file(global.guard())
@@ -640,13 +677,11 @@ mod tests {
             }
 
             let meta_block_id_0 = mtb.active_root().meta_block_id;
-            mtb.publish_checkpoint(3, USER_OBJ_ID_START + 1, roots)
-                .await
-                .unwrap();
+            publish_checkpoint_for_test(&mtb, background_writes, 3, USER_OBJ_ID_START + 1, roots)
+                .await;
             let meta_block_id_1 = mtb.active_root().meta_block_id;
-            mtb.publish_checkpoint(4, USER_OBJ_ID_START + 2, roots)
-                .await
-                .unwrap();
+            publish_checkpoint_for_test(&mtb, background_writes, 4, USER_OBJ_ID_START + 2, roots)
+                .await;
             let meta_block_id_2 = mtb.active_root().meta_block_id;
 
             assert_ne!(meta_block_id_0, meta_block_id_1);
@@ -768,6 +803,7 @@ mod tests {
     fn test_multi_table_file_falls_back_to_older_valid_super_slot() {
         smol::block_on(async {
             let (dir, fs) = build_test_fs();
+            let background_writes = fs.background_writes();
             let path = fs.catalog_mtb_file_path();
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
             let (mtb, _) = fs
@@ -781,17 +817,27 @@ mod tests {
                 root.root_block_id = NonZeroU64::new((idx + 10) as u64);
                 root.pivot_row_id = (idx as u64) + 1;
             }
-            mtb.publish_checkpoint(3, USER_OBJ_ID_START + 1, roots_v1)
-                .await
-                .unwrap();
+            publish_checkpoint_for_test(
+                &mtb,
+                background_writes,
+                3,
+                USER_OBJ_ID_START + 1,
+                roots_v1,
+            )
+            .await;
             let older_snapshot = mtb.load_snapshot().unwrap();
 
             let mut roots_v2 = roots_v1;
             roots_v2[0].root_block_id = NonZeroU64::new(99);
             roots_v2[0].pivot_row_id = 100;
-            mtb.publish_checkpoint(4, USER_OBJ_ID_START + 2, roots_v2)
-                .await
-                .unwrap();
+            publish_checkpoint_for_test(
+                &mtb,
+                background_writes,
+                4,
+                USER_OBJ_ID_START + 2,
+                roots_v2,
+            )
+            .await;
             let active_super_slot = mtb.active_root().slot_no;
             drop(mtb);
             drop(fs);
@@ -818,6 +864,7 @@ mod tests {
     fn test_multi_table_file_does_not_fall_back_when_newest_meta_root_is_invalid() {
         smol::block_on(async {
             let (dir, fs) = build_test_fs();
+            let background_writes = fs.background_writes();
             let path = fs.catalog_mtb_file_path();
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
             let (mtb, _) = fs
@@ -831,16 +878,26 @@ mod tests {
                 root.root_block_id = NonZeroU64::new((idx + 20) as u64);
                 root.pivot_row_id = (idx as u64) + 10;
             }
-            mtb.publish_checkpoint(5, USER_OBJ_ID_START + 10, roots_v1)
-                .await
-                .unwrap();
+            publish_checkpoint_for_test(
+                &mtb,
+                background_writes,
+                5,
+                USER_OBJ_ID_START + 10,
+                roots_v1,
+            )
+            .await;
 
             let mut roots_v2 = roots_v1;
             roots_v2[1].root_block_id = NonZeroU64::new(123);
             roots_v2[1].pivot_row_id = 222;
-            mtb.publish_checkpoint(6, USER_OBJ_ID_START + 11, roots_v2)
-                .await
-                .unwrap();
+            publish_checkpoint_for_test(
+                &mtb,
+                background_writes,
+                6,
+                USER_OBJ_ID_START + 11,
+                roots_v2,
+            )
+            .await;
             let active_meta_block_id = mtb.active_root().meta_block_id;
             drop(mtb);
             drop(fs);
@@ -897,8 +954,8 @@ mod tests {
                 .await
                 .unwrap();
 
-            let _first = MutableMultiTableFile::fork(&mtb);
-            let _second = MutableMultiTableFile::fork(&mtb);
+            let _first = MutableMultiTableFile::fork(&mtb, fs.background_writes());
+            let _second = MutableMultiTableFile::fork(&mtb, fs.background_writes());
         });
     }
 
@@ -912,10 +969,10 @@ mod tests {
                 .await
                 .unwrap();
 
-            let first = MutableMultiTableFile::fork(&mtb);
+            let first = MutableMultiTableFile::fork(&mtb, fs.background_writes());
             drop(first);
 
-            let _second = MutableMultiTableFile::fork(&mtb);
+            let _second = MutableMultiTableFile::fork(&mtb, fs.background_writes());
         });
     }
 }

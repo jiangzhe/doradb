@@ -101,9 +101,10 @@ impl CatalogStorage {
         if safe_cts < replay_start_ts {
             return Ok(());
         }
+        let background_writes = self.table_fs.background_writes();
 
         if catalog_ops.is_empty() {
-            let mut mutable = MutableMultiTableFile::fork(&self.mtb);
+            let mut mutable = MutableMultiTableFile::fork(&self.mtb, background_writes);
             mutable.apply_checkpoint_metadata(
                 next_catalog_replay_start_ts,
                 next_user_obj_id.max(USER_OBJ_ID_START),
@@ -124,7 +125,7 @@ impl CatalogStorage {
             ops_by_table[table_idx].push(kind);
         }
 
-        let mut mutable = MutableMultiTableFile::fork(&self.mtb);
+        let mut mutable = MutableMultiTableFile::fork(&self.mtb, background_writes);
         let mut new_roots = snapshot.meta.table_roots;
         for (idx, table) in self.tables.iter().enumerate() {
             if idx >= CATALOG_TABLE_ROOT_DESC_COUNT {
@@ -694,12 +695,11 @@ fn row_matches_key(metadata: &TableMetadata, row: &[Val], key: &SelectKey) -> bo
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::buffer::BlockKey;
     use crate::catalog::USER_OBJ_ID_START;
     use crate::catalog::tests::{table1, table2};
     use crate::conf::{EngineConfig, TrxSysConfig};
-    use crate::file::BlockID;
-    use crate::file::multi_table_file::{CATALOG_MTB_PERSISTED_FILE_ID, MutableMultiTableFile};
+    use crate::file::multi_table_file::{CATALOG_MTB_FILE_ID, MutableMultiTableFile};
+    use crate::file::{BlockID, BlockKey};
     use crate::index::{ColumnBlockIndex, ColumnDeleteDomain, load_entry_deletion_deltas};
     use crate::row::ops::SelectKey;
     use crate::trx::redo::RowRedoKind;
@@ -734,7 +734,8 @@ mod tests {
                 RowRedoKind::Insert(vec![Val::from(table_id)]),
                 RowRedoKind::DeleteByUniqueKey(SelectKey::new(0, vec![Val::from(table_id)])),
             ];
-            let mut mutable = MutableMultiTableFile::fork(&storage.mtb);
+            let mut mutable =
+                MutableMultiTableFile::fork(&storage.mtb, storage.table_fs.background_writes());
 
             let next_root = storage
                 .apply_table_ops(&mut mutable, 0, table.metadata(), root, &table_ops, 7)
@@ -779,7 +780,8 @@ mod tests {
                 RowRedoKind::Insert(vec![Val::from(table_id)]),
                 RowRedoKind::DeleteByUniqueKey(SelectKey::new(0, vec![Val::from(table_id)])),
             ];
-            let mut mutable = MutableMultiTableFile::fork(&storage.mtb);
+            let mut mutable =
+                MutableMultiTableFile::fork(&storage.mtb, storage.table_fs.background_writes());
 
             let next_root = storage
                 .apply_table_ops(&mut mutable, 0, table.metadata(), root, &table_ops, 8)
@@ -831,7 +833,7 @@ mod tests {
 
             let cached_after_first = engine.disk_pool.allocated();
             assert!(cached_after_first >= 1);
-            let root_key = BlockKey::new(CATALOG_MTB_PERSISTED_FILE_ID, root_block_id);
+            let root_key = BlockKey::new(CATALOG_MTB_FILE_ID, root_block_id);
             assert!(engine.disk_pool.try_get_frame_id(&root_key).is_some());
 
             let entries2 = engine

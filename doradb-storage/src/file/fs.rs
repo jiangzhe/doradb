@@ -1,8 +1,8 @@
 use crate::buffer::guard::PageExclusiveGuard;
 use crate::buffer::page::Page;
 use crate::buffer::{
-    BlockKey, EvictReadSubmission, EvictSubmission, EvictableBufferPool, EvictablePoolStateMachine,
-    GlobalReadonlyBufferPool, PageID, PoolRequest, PoolRole, ReadSubmission, ReadonlyBufferPool,
+    EvictReadSubmission, EvictSubmission, EvictableBufferPool, EvictablePoolStateMachine,
+    GlobalReadonlyBufferPool, PoolRequest, PoolRole, ReadSubmission, ReadonlyBufferPool,
 };
 use crate::catalog::table::TableMetadata;
 use crate::catalog::{TableID, USER_OBJ_ID_START};
@@ -11,7 +11,9 @@ use crate::conf::FileSystemConfig;
 use crate::conf::path::path_to_utf8;
 use crate::error::{Error, FileKind, Result};
 use crate::file::cow_file::COW_FILE_PAGE_SIZE;
-use crate::file::multi_table_file::{CATALOG_MTB_PERSISTED_FILE_ID, MultiTableFile};
+use crate::file::multi_table_file::{
+    MultiTableActiveRoot, MultiTableFile, MultiTableFileOpenOutcome, MutableMultiTableFile,
+};
 use crate::file::table_file::{ActiveRoot, TABLE_FILE_INITIAL_SIZE};
 use crate::file::table_file::{MutableTableFile, TableFile};
 use crate::file::{SparseFile, TableFsStateMachine, TableFsSubmission, WriteSubmission};
@@ -176,13 +178,6 @@ pub(crate) enum BackgroundWriteRequest {
     IndexPool(PoolBatchWriteRequest),
 }
 
-/// Unified completion key space for the shared storage backend.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum StorageKey {
-    Table(BlockKey),
-    Pool(PageID),
-}
-
 /// Domain-specific submission owner for one inflight backend operation.
 enum StorageSubmissionKind {
     Table(TableFsSubmission),
@@ -192,7 +187,6 @@ enum StorageSubmissionKind {
 
 /// Backend-facing submission stored in the shared storage inflight table.
 struct StorageSubmission {
-    key: StorageKey,
     inner: StorageSubmissionKind,
 }
 
@@ -200,7 +194,6 @@ impl StorageSubmission {
     #[inline]
     fn table(sub: TableFsSubmission) -> Self {
         Self {
-            key: StorageKey::Table(*sub.key()),
             inner: StorageSubmissionKind::Table(sub),
         }
     }
@@ -208,7 +201,6 @@ impl StorageSubmission {
     #[inline]
     fn mem_pool(sub: EvictSubmission) -> Self {
         Self {
-            key: StorageKey::Pool(*sub.key()),
             inner: StorageSubmissionKind::MemPool(sub),
         }
     }
@@ -216,20 +208,12 @@ impl StorageSubmission {
     #[inline]
     fn index_pool(sub: EvictSubmission) -> Self {
         Self {
-            key: StorageKey::Pool(*sub.key()),
             inner: StorageSubmissionKind::IndexPool(sub),
         }
     }
 }
 
 impl IOSubmission for StorageSubmission {
-    type Key = StorageKey;
-
-    #[inline]
-    fn key(&self) -> &Self::Key {
-        &self.key
-    }
-
     #[inline]
     fn operation(&mut self) -> &mut Operation {
         match &mut self.inner {
@@ -1368,20 +1352,27 @@ pub struct FileSystem {
 }
 
 impl FileSystem {
-    /// Clone the file-facing read and write clients for a table-file handle.
-    #[inline]
-    pub(crate) fn table_io_clients(
-        &self,
-    ) -> (IOClient<ReadSubmission>, IOClient<BackgroundWriteRequest>) {
-        (self.table_reads.clone(), self.background_writes.clone())
-    }
-
     #[inline]
     fn assert_pool_role(role: PoolRole, context: &'static str) {
         match role {
             PoolRole::Mem | PoolRole::Index => {}
             other => panic!("unsupported pool role {other:?} in {context}"),
         }
+    }
+
+    /// Send one readonly/table-file read onto the shared table-read lane.
+    #[inline]
+    pub(crate) async fn send_table_read_async(
+        &self,
+        req: ReadSubmission,
+    ) -> StdResult<(), SendError<ReadSubmission>> {
+        self.table_reads.send_async(req).await
+    }
+
+    /// Returns a shared reference to the background-write ingress client.
+    #[inline]
+    pub(crate) fn background_writes(&self) -> &IOClient<BackgroundWriteRequest> {
+        &self.background_writes
     }
 
     /// Send one pool page-in read onto the shared pool-read lane.
@@ -1459,17 +1450,14 @@ impl FileSystem {
         trunc: bool,
     ) -> Result<MutableTableFile> {
         let file_path = self.table_file_path(table_id);
-        let table_file = TableFile::create(
-            &file_path,
-            TABLE_FILE_INITIAL_SIZE,
-            table_id,
-            self.table_reads.clone(),
-            self.background_writes.clone(),
-            trunc,
-        )?;
+        let table_file = TableFile::create(&file_path, TABLE_FILE_INITIAL_SIZE, table_id, trunc)?;
         let initial_pages = TABLE_FILE_INITIAL_SIZE / COW_FILE_PAGE_SIZE;
         let active_root = ActiveRoot::new(0, initial_pages, metadata);
-        Ok(MutableTableFile::new(Arc::new(table_file), active_root))
+        Ok(MutableTableFile::new(
+            Arc::new(table_file),
+            active_root,
+            self.background_writes(),
+        ))
     }
 
     /// Open an existing table file.
@@ -1480,21 +1468,14 @@ impl FileSystem {
         global_disk_pool: QuiescentGuard<GlobalReadonlyBufferPool>,
     ) -> Result<(Arc<TableFile>, ReadonlyBufferPool)> {
         let file_path = self.table_file_path(table_id);
-        let (table_reads, background_writes) = self.table_io_clients();
-        let table_file = Arc::new(TableFile::open(
-            &file_path,
-            table_id,
-            table_reads,
-            background_writes,
-        )?);
+        let table_file = Arc::new(TableFile::open(&file_path, table_id)?);
         let disk_pool = ReadonlyBufferPool::new(
-            table_id,
             FileKind::TableFile,
             Arc::clone(&table_file),
             global_disk_pool,
         );
         let active_root = table_file.load_active_root_from_pool(&disk_pool).await?;
-        let old_root = table_file.swap_active_root(active_root);
+        let old_root = table_file.install_loaded_root(active_root);
         debug_assert!(old_root.is_none());
         Ok((table_file, disk_pool))
     }
@@ -1546,29 +1527,38 @@ impl FileSystem {
         &self,
         global_disk_pool: QuiescentGuard<GlobalReadonlyBufferPool>,
     ) -> Result<(Arc<MultiTableFile>, ReadonlyBufferPool)> {
-        let (table_reads, background_writes) = self.table_io_clients();
-        let mtb = MultiTableFile::open_or_create(
-            self.catalog_mtb_file_path(),
-            table_reads,
-            background_writes,
-        )
-        .await?;
-        let disk_pool = ReadonlyBufferPool::new(
-            CATALOG_MTB_PERSISTED_FILE_ID,
-            FileKind::CatalogMultiTableFile,
-            Arc::clone(&mtb),
-            global_disk_pool,
-        );
-        if mtb
-            .active_root_ptr()
-            .load(std::sync::atomic::Ordering::Acquire)
-            .is_null()
-        {
-            let active_root = mtb.load_active_root_from_pool(&disk_pool).await?;
-            let old_root = mtb.swap_active_root(active_root);
-            debug_assert!(old_root.is_none());
+        let file_path = self.catalog_mtb_file_path();
+        match MultiTableFile::open_or_create(&file_path).await? {
+            MultiTableFileOpenOutcome::Opened(mtb) => {
+                let disk_pool = ReadonlyBufferPool::new(
+                    FileKind::CatalogMultiTableFile,
+                    Arc::clone(&mtb),
+                    global_disk_pool,
+                );
+                let active_root = mtb.load_active_root_from_pool(&disk_pool).await?;
+                let old_root = mtb.install_loaded_root(active_root);
+                debug_assert!(old_root.is_none());
+                Ok((mtb, disk_pool))
+            }
+            MultiTableFileOpenOutcome::Created(mtb) => {
+                let mutable = MutableMultiTableFile::new(
+                    Arc::clone(&mtb),
+                    MultiTableActiveRoot::new(),
+                    self.background_writes(),
+                );
+                if let Err(err) = mutable.commit().await {
+                    drop(mtb);
+                    let _ = std::fs::remove_file(&file_path);
+                    return Err(err);
+                }
+                let disk_pool = ReadonlyBufferPool::new(
+                    FileKind::CatalogMultiTableFile,
+                    Arc::clone(&mtb),
+                    global_disk_pool,
+                );
+                Ok((mtb, disk_pool))
+            }
         }
-        Ok((mtb, disk_pool))
     }
 }
 
@@ -1663,6 +1653,14 @@ pub(crate) mod tests {
         }
 
         #[inline]
+        pub(crate) fn guard(&self) -> QuiescentGuard<FileSystem> {
+            self.fs
+                .as_ref()
+                .expect("test filesystem guard is live")
+                .clone()
+        }
+
+        #[inline]
         pub(crate) fn disk_pool(&self) -> DiskPool {
             self.registry.dependency::<DiskPool>().unwrap()
         }
@@ -1741,10 +1739,10 @@ pub(crate) mod tests {
                 .data_dir(data_dir)
                 .readonly_buffer_size(TEST_READONLY_BUFFER_BYTES);
             let mut builder = RegistryBuilder::new();
+            builder.build::<FileSystem>(file.clone()).await?;
             builder
                 .build::<DiskPool>(DiskPoolConfig::new(file.readonly_buffer_size))
                 .await?;
-            builder.build::<FileSystem>(file).await?;
             builder
                 .build::<MetaPool>(MetaPoolConfig::new(TEST_META_POOL_BYTES))
                 .await?;
@@ -1806,10 +1804,17 @@ pub(crate) mod tests {
         ))
     }
 
-    async fn write_payload(table_file: &Arc<TableFile>, block_id: BlockID, payload: &[u8]) {
+    async fn write_payload(
+        fs: &FileSystem,
+        table_file: &Arc<TableFile>,
+        block_id: BlockID,
+        payload: &[u8],
+    ) {
         let mut buf = DirectBuf::zeroed(COW_FILE_PAGE_SIZE);
         buf.as_bytes_mut()[..payload.len()].copy_from_slice(payload);
-        table_file.write_block(block_id, buf).await.unwrap();
+        let mutable = MutableTableFile::fork(table_file, fs.background_writes());
+        mutable.write_block(block_id, buf).await.unwrap();
+        drop(mutable);
     }
 
     #[derive(Clone)]
@@ -1915,6 +1920,26 @@ pub(crate) mod tests {
         }
     }
 
+    struct FailingFirstWriteHook {
+        failed: AtomicBool,
+    }
+
+    impl FailingFirstWriteHook {
+        fn new() -> Self {
+            Self {
+                failed: AtomicBool::new(false),
+            }
+        }
+    }
+
+    impl StorageBackendTestHook for FailingFirstWriteHook {
+        fn on_complete(&self, op: StorageBackendOp, res: &mut std::io::Result<usize>) {
+            if op.kind() == IOKind::Write && !self.failed.swap(true, Ordering::SeqCst) {
+                *res = Err(std::io::Error::from_raw_os_error(libc::EIO));
+            }
+        }
+    }
+
     async fn wait_until(mut predicate: impl FnMut() -> bool) {
         for _ in 0..TEST_WAIT_RETRIES {
             if predicate() {
@@ -1934,6 +1959,42 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn test_open_or_create_multi_table_file_removes_new_file_after_initial_commit_failure() {
+        smol::block_on(async {
+            let (_temp_dir, fs) = build_test_fs();
+            let path = fs.catalog_mtb_file_path();
+            let global = crate::buffer::global_readonly_pool_scope(64 * 1024 * 1024);
+
+            {
+                let _hook =
+                    install_storage_backend_test_hook(Arc::new(FailingFirstWriteHook::new()));
+                let err = match fs.open_or_create_multi_table_file(global.guard()).await {
+                    Ok(_) => panic!("expected initial catalog.mtb publish failure"),
+                    Err(err) => err,
+                };
+                assert!(err.is_storage_io_failure(), "unexpected error: {err:?}");
+            }
+
+            assert!(
+                !std::path::Path::new(&path).exists(),
+                "freshly created catalog.mtb should be removed after failed initial publish"
+            );
+
+            let (mtb, _pool) = fs
+                .open_or_create_multi_table_file(global.guard())
+                .await
+                .unwrap();
+            let snapshot = mtb.load_snapshot().unwrap();
+            assert_eq!(
+                snapshot.catalog_replay_start_ts,
+                crate::trx::MIN_SNAPSHOT_TS
+            );
+            assert_eq!(snapshot.meta.next_user_obj_id, USER_OBJ_ID_START);
+            assert!(mtb.active_root().meta_block_id > BlockID::new(0));
+        });
+    }
+
+    #[test]
     fn test_storage_service_reconsiders_table_reads_before_deferred_background_writes() {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
@@ -1946,7 +2007,7 @@ pub(crate) mod tests {
             let table_file = fs.create_table_file(130, make_metadata(), false).unwrap();
             let (table_file, old_root) = table_file.commit(1, false).await.unwrap();
             drop(old_root);
-            write_payload(&table_file, BlockID::from(7usize), b"table-read").await;
+            write_payload(&fs, &table_file, BlockID::from(7usize), b"table-read").await;
 
             let (reopened, readonly_pool) = fs
                 .open_table_file(130, fs.disk_pool().clone_inner())

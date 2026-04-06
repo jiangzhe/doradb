@@ -75,9 +75,12 @@ impl Component for Catalog {
         let meta_pool = registry.dependency::<MetaPool>()?;
         let table_fs = registry.dependency::<FileSystem>()?;
         let disk_pool = registry.dependency::<DiskPool>()?;
-        let storage =
-            CatalogStorage::new(meta_pool.clone_inner(), &table_fs, disk_pool.clone_inner())
-                .await?;
+        let storage = CatalogStorage::new(
+            meta_pool.clone_inner(),
+            table_fs.clone(),
+            disk_pool.clone_inner(),
+        )
+        .await?;
         registry.register::<Self>(Catalog::new(storage).await?)
     }
 

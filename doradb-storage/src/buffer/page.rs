@@ -1,5 +1,6 @@
 use crate::buffer::frame::{BufferFrame, FrameKind};
 use crate::buffer::guard::PageExclusiveGuard;
+use crate::file::BlockKey;
 use crate::io::{IOSubmission, Operation};
 use crate::notify::EventNotifyOnDrop;
 use std::mem;
@@ -66,7 +67,7 @@ pub enum IOKind {
 ///
 /// Read-miss loads now use the shared generic read-load core in `buffer/load.rs`.
 pub struct PageIO {
-    pub(crate) key: PageID,
+    pub(crate) block_key: BlockKey,
     pub(crate) operation: Operation,
     pub(crate) page_guard: PageExclusiveGuard<Page>,
     // Batch-level completion token cloned into each write submission.
@@ -83,13 +84,6 @@ impl PageIO {
 }
 
 impl IOSubmission for PageIO {
-    type Key = PageID;
-
-    #[inline]
-    fn key(&self) -> &Self::Key {
-        &self.key
-    }
-
     #[inline]
     fn operation(&mut self) -> &mut Operation {
         &mut self.operation

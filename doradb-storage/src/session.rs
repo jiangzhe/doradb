@@ -225,7 +225,6 @@ impl Session {
         )
         .await?;
         let disk_pool = ReadonlyBufferPool::new(
-            table_id,
             FileKind::TableFile,
             Arc::clone(&table_file),
             engine.disk_pool.clone_inner(),

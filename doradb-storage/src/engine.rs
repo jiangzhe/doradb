@@ -289,10 +289,10 @@ impl EngineConfig {
         // Components are registered in one fixed dependency order. Reverse
         // registration order then defines both explicit shutdown order and the
         // final owner drop order.
+        builder.build::<FileSystem>(file).await?;
         builder
             .build::<DiskPool>(DiskPoolConfig::new(readonly_buffer_size))
             .await?;
-        builder.build::<FileSystem>(file).await?;
         builder
             .build::<MetaPool>(MetaPoolConfig::new(self.meta_buffer.as_u64() as usize))
             .await?;
@@ -398,8 +398,8 @@ mod tests {
             assert_eq!(
                 engine.components().component_names(),
                 vec![
-                    "disk_pool",
                     "fs",
+                    "disk_pool",
                     "meta_pool",
                     "index_pool",
                     "mem_pool",

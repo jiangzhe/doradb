@@ -85,8 +85,8 @@ impl<C: Component> ErasedComponentBox for TypedComponentBox<C> {
 /// - reverse-order final owner drop in [`Drop`]
 ///
 /// Current engine registration order:
-/// 1. `DiskPool`
-/// 2. `FileSystem`
+/// 1. `FileSystem`
+/// 2. `DiskPool`
 /// 3. `MetaPool`
 /// 4. `IndexPool`
 /// 5. `MemPool`

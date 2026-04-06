@@ -16,6 +16,7 @@ use crate::error::Result;
 use crate::file::fs::FileSystem;
 use crate::file::multi_table_file::{
     CATALOG_TABLE_ROOT_DESC_COUNT, CatalogTableRootDesc, MultiTableFile, MultiTableFileSnapshot,
+    MutableMultiTableFile,
 };
 use crate::index::BlockIndex;
 use crate::quiescent::QuiescentGuard;
@@ -26,6 +27,7 @@ use std::sync::Arc;
 /// Runtime storage container for all catalog logical tables.
 pub struct CatalogStorage {
     pub(super) meta_pool: QuiescentGuard<FixedBufferPool>,
+    pub(super) table_fs: QuiescentGuard<FileSystem>,
     tables: Box<[Arc<CatalogTable>]>,
     next_user_obj_id: ObjID,
     mtb: Arc<MultiTableFile>,
@@ -37,7 +39,7 @@ impl CatalogStorage {
     #[inline]
     pub(crate) async fn new(
         meta_pool: QuiescentGuard<FixedBufferPool>,
-        table_fs: &FileSystem,
+        table_fs: QuiescentGuard<FileSystem>,
         global_disk_pool: QuiescentGuard<GlobalReadonlyBufferPool>,
     ) -> Result<Self> {
         let meta_pool_guard = meta_pool.pool_guard();
@@ -71,6 +73,7 @@ impl CatalogStorage {
         }
         let storage = CatalogStorage {
             meta_pool,
+            table_fs,
             tables: cat.into_boxed_slice(),
             next_user_obj_id: mtb_snapshot.meta.next_user_obj_id,
             mtb,
@@ -147,13 +150,16 @@ impl CatalogStorage {
         catalog_replay_start_ts: TrxID,
         next_user_obj_id: ObjID,
     ) -> Result<()> {
-        self.mtb
-            .publish_checkpoint(
-                catalog_replay_start_ts,
-                next_user_obj_id,
-                self.catalog_table_roots(),
-            )
-            .await
+        let background_writes = self.table_fs.background_writes();
+        let mut mutable = MutableMultiTableFile::fork(&self.mtb, background_writes);
+        mutable.apply_checkpoint_metadata(
+            catalog_replay_start_ts,
+            next_user_obj_id,
+            self.catalog_table_roots(),
+        )?;
+        let (_, old_root) = mutable.commit().await?;
+        drop(old_root);
+        Ok(())
     }
 
     #[inline]

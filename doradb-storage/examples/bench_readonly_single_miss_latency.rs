@@ -8,6 +8,7 @@ use doradb_storage::conf::{
 };
 use doradb_storage::error::FileKind;
 use doradb_storage::file::BlockID;
+use doradb_storage::file::table_file::MutableTableFile;
 use doradb_storage::io::{DirectBuf, IOBackendStats, IOBuf};
 use doradb_storage::quiescent::QuiescentBox;
 use doradb_storage::value::ValKind;
@@ -55,7 +56,7 @@ fn make_metadata() -> Arc<TableMetadata> {
     ))
 }
 
-async fn write_pages(table_file: &Arc<doradb_storage::file::table_file::TableFile>, pages: usize) {
+async fn write_pages(table_file: &MutableTableFile, pages: usize) {
     for page_id in 0..pages {
         let mut buf = DirectBuf::zeroed(PAGE_SIZE);
         let bytes = buf.as_bytes_mut();
@@ -194,13 +195,12 @@ fn main() {
             .table_fs
             .create_table_file(901, make_metadata(), false)
             .unwrap();
+        write_pages(&table_file, args.pages).await;
+
         let (table_file, old_root) = table_file.commit(1, false).await.unwrap();
         drop(old_root);
 
-        write_pages(&table_file, args.pages).await;
-
         let pool = QuiescentBox::new(ReadonlyBufferPool::from_table_file(
-            901,
             FileKind::TableFile,
             Arc::clone(&table_file),
             engine.disk_pool.clone_inner(),
