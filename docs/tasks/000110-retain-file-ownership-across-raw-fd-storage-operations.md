@@ -1,7 +1,7 @@
 ---
 id: 000110
 title: Retain File Ownership Across Raw-Fd Storage Operations
-status: proposal  # proposal | implemented | superseded
+status: implemented  # proposal | implemented | superseded
 created: 2026-04-05
 github_issue: 533
 ---
@@ -165,18 +165,50 @@ Reference:
 
 ## Implementation Notes
 
+- Pool reload submissions no longer snapshot or cache a pool-side borrowed fd.
+  `EvictableBufferPool` dropped the test-only `worker_raw_fd` cache, reload
+  requests now keep only reservation/inflight bookkeeping, and
+  `EvictablePoolStateMachine::prepare_request` constructs pool read operations
+  from the worker-owned `SparseFile`.
+- Readonly miss loads and detached table writes now both retain
+  `ReadonlyBackingFile` until terminal completion. `WriteSubmission` carries
+  keepalive plus write metadata, and
+  `TableFsStateMachine::prepare_write_request` builds
+  `Operation::pwrite_owned(...)` when the request is admitted to the backend
+  queue.
+- The shared background-write lane now stores pool batch-write payloads inline
+  instead of boxing `PoolBatchWriteRequest`, while preserving the existing
+  send-failure, deferred-split, and completion ownership rules.
+- Test hooks that previously matched swap-file work by cached worker fd now use
+  stable file identity (`st_dev`, `st_ino`) derived from the actual backing
+  path. This removed the last remaining reason for `EvictableBufferPool` to
+  expose worker-fd state in tests.
+- Shared-evictor progress tests were stabilized for CI by pre-seeding readonly
+  pressure outside the measured window and waiting on per-domain run counters
+  instead of requiring a fresh post-start sleep/wake cycle.
+- Validation completed with:
+  - `cargo fmt -p doradb-storage`
+  - `cargo clippy -p doradb-storage --all-targets -- -D warnings`
+  - `cargo nextest run -p doradb-storage`
+  - `cargo nextest run -p doradb-storage --no-default-features --features libaio`
+  - `tools/unsafe_inventory.rs --write docs/unsafe-usage-baseline.md`
+  - repeated targeted reruns of the shared-evictor tests under both `cargo test`
+    and `cargo nextest`
+
 ## Impacts
 
 - `doradb-storage/src/buffer/evict.rs`
-- `doradb-storage/src/buffer/page.rs`
+- `doradb-storage/src/buffer/evictor.rs`
+- `doradb-storage/src/buffer/mod.rs`
 - `doradb-storage/src/buffer/readonly.rs`
 - `doradb-storage/src/file/fs.rs`
 - `doradb-storage/src/file/mod.rs`
 - `doradb-storage/src/file/cow_file.rs`
 - `doradb-storage/src/file/table_file.rs`
 - `doradb-storage/src/file/multi_table_file.rs`
-- test helpers in `doradb-storage/src/file/fs.rs` and
-  `doradb-storage/src/table/tests.rs`
+- `doradb-storage/src/io/mod.rs`
+- `doradb-storage/src/table/tests.rs`
+- `docs/unsafe-usage-baseline.md`
 
 ## Test Cases
 

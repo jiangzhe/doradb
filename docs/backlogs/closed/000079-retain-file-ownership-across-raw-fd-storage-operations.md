@@ -42,3 +42,11 @@ When a backlog item is moved to `docs/backlogs/closed/`, append:
 - Reference: <task/issue/pr reference>
 - Closed At: <YYYY-MM-DD>
 ```
+
+## Close Reason
+
+- Type: implemented
+- Detail: Implemented by task 000110 after landing the raw-fd ownership fixes and test follow-ups.
+- Closed By: backlog close
+- Reference: docs/tasks/000110-retain-file-ownership-across-raw-fd-storage-operations.md; PR #534
+- Closed At: 2026-04-06
