@@ -1,7 +1,7 @@
 ---
 id: 000109
 title: Rename AIO Surface To IO And Refine Storage IO Errors
-status: proposal  # proposal | implemented | superseded
+status: implemented  # proposal | implemented | superseded
 created: 2026-04-05
 github_issue: 530
 ---
@@ -167,6 +167,70 @@ Reference:
 
 ## Implementation Notes
 
+Implemented the coordinated `AIO*` removal and storage-I/O error refinement
+without adding compatibility aliases or changing backend-selection policy.
+
+1. Renamed the live backend-neutral `crate::io` surface across worker core,
+   filesystem, redo, buffer-pool, tests, and examples.
+   - `AIOBuf`, `AIOClient`, `AIOMessage`, `AIOKind`, and `AIOKey` became
+     `IOBuf`, `IOClient`, `IOMessage`, `IOKind`, and `IOKey`.
+   - The libaio-only wrappers moved to the corresponding `IORequest` and
+     `UnsafeIORequest` names.
+   - Resolve verification with
+     `rg -n "\bAIO[A-Za-z0-9_]*\b" doradb-storage/src doradb-storage/examples docs/async-io.md`
+     found no remaining live `AIO*` symbols in current source/example/docs.
+2. Replaced the removed `io::AIOError` / `AIOResult` flow with structured
+   crate-level storage-I/O errors in `doradb-storage/src/error.rs`.
+   - `Error::IOError` now preserves `ErrorKind` plus `raw_os_error`.
+   - `Error::StorageIOError` records the failing storage operation through
+     `StorageOp`.
+   - `Error::ShortIO` now represents short-read/short-write completion paths.
+   - `Error::StorageFileCapacityExceeded` now covers logical sparse-file
+     allocation exhaustion.
+3. Preserved syscall detail and path validation at the actual backend/file
+   boundaries.
+   - `LibaioBackend::new(...)` now maps `io_setup` failures via
+     `std::io::Error::from_raw_os_error(-ret)`.
+   - `IouringBackend::new(...)` keeps zero/overflow depth as
+     `Error::InvalidArgument` and maps ring-construction failure to
+     `StorageOp::BackendSetup`.
+   - `SparseFile::{create_or_trunc, create_or_fail, open}` now preserve
+     create/open/resize/stat failure detail, reject interior-NUL paths as
+     `Error::InvalidStoragePath`, and map allocation exhaustion to
+     `Error::StorageFileCapacityExceeded`.
+4. Propagated the refined error semantics through storage-runtime poison and
+   completion paths.
+   - Redo rotation now matches `Error::StorageFileCapacityExceeded`.
+   - Checkpoint/persistence poison classification now uses
+     `err.is_storage_io_failure()` plus `Error::SendError` instead of the
+     removed `Error::AIOError(_)` matching.
+   - Backend-neutral short completion paths in file/buffer code now surface
+     `Error::ShortIO` instead of collapsing into the old opaque I/O bucket.
+5. Added and updated focused coverage around the new behavior.
+   - Added backend-constructor coverage for invalid `io_uring` depth/overflow
+     and libaio `io_setup` failure mapping.
+   - Added sparse-file coverage for missing-parent create failure,
+     invalid-path rejection, and capacity exhaustion.
+   - Updated redo, readonly, row-page-index, purge, and table tests to assert
+     the new structured error variants rather than the removed coarse
+     `Error::IOError` shape.
+6. Post-implementation review hardening adjusted the evictable-buffer-pool
+   writeback failure path and supporting tests.
+   - Failed writeback now leaves the page `Hot`, wakes current waiters with the
+     concrete error, and allows later readers/retry attempts to proceed instead
+     of leaving a persistent `FrameKind::EvictionFailed` state behind.
+   - Shared-evictor tests now wait for idle progress with a deadline-based
+     helper instead of a fixed retry count.
+   - `docs/unsafe-usage-baseline.md` was refreshed after adding/expanding
+     `// SAFETY:` comments in the touched buffer and libaio paths.
+7. Validation completed with:
+   - `cargo clippy -p doradb-storage --all-targets -- -D warnings`
+   - `cargo clippy -p doradb-storage --no-default-features --features libaio --all-targets -- -D warnings`
+   - `cargo nextest run -p doradb-storage`
+   - `cargo nextest run -p doradb-storage --no-default-features --features libaio`
+8. Resolve-time backlog sync archived the source backlog as implemented:
+   - `docs/backlogs/closed/000078-rename-io-module-aio-surface-to-io-naming.md`
+
 ## Impacts
 
 1. Error model and conversions:
@@ -222,6 +286,7 @@ Reference:
 
 ## Open Questions
 
-1. After this task lands, should historical design documents that describe
-   superseded `AIO*` APIs get a separate documentation cleanup pass, or should
-   historical terminology remain untouched for archival accuracy?
+1. Historical RFC/task/backlog documents still retain superseded `AIO*`
+   terminology intentionally for archival accuracy. If the repository later
+   wants terminology cleanup there, it should be scoped as a separate
+   documentation-only follow-up rather than folded into storage/runtime work.
