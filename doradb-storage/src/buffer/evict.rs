@@ -10,8 +10,8 @@ use crate::buffer::load::{PageReservation, PageReservationGuard};
 use crate::buffer::page::{BufferPage, IOKind, PAGE_SIZE, Page, PageID, PageIO, VersionedPageID};
 use crate::buffer::util::{frame_total_bytes, madvise_dontneed};
 use crate::buffer::{
-    BlockKey, BufferPool, BufferPoolStats, BufferPoolStatsHandle, PageIOCompletion, PoolGuard,
-    PoolIdentity, PoolRole, RowPoolRole,
+    BufferPool, BufferPoolStats, BufferPoolStatsHandle, PageIOCompletion, PoolGuard, PoolIdentity,
+    PoolRole, RowPoolRole,
 };
 use crate::component::Supplier;
 use crate::conf::EvictableBufferPoolConfig;
@@ -19,9 +19,7 @@ use crate::conf::path::{path_to_utf8, validate_swap_file_path_candidate};
 use crate::error::Validation::Valid;
 use crate::error::{Error, Result, Validation};
 use crate::file::fs::{FileSystem, FileSystemWorkers};
-use crate::file::{
-    BlockID, INDEX_POOL_SWAP_PERSISTED_FILE_ID, MEM_POOL_SWAP_PERSISTED_FILE_ID, SparseFile,
-};
+use crate::file::{BlockID, BlockKey, INDEX_POOL_SWAP_FILE_ID, MEM_POOL_SWAP_FILE_ID, SparseFile};
 use crate::io::{
     IOBackendStats, IOKind as StorageIOKind, IOQueue, IOStateMachine, IOSubmission, Operation,
 };
@@ -632,16 +630,6 @@ pub(crate) enum EvictSubmission {
 }
 
 impl IOSubmission for EvictSubmission {
-    type Key = BlockKey;
-
-    #[inline]
-    fn key(&self) -> Self::Key {
-        match self {
-            EvictSubmission::Read(sub) => sub.key(),
-            EvictSubmission::Write(sub) => sub.key(),
-        }
-    }
-
     #[inline]
     fn operation(&mut self) -> &mut Operation {
         match self {
@@ -653,7 +641,6 @@ impl IOSubmission for EvictSubmission {
 
 impl IOStateMachine for EvictablePoolStateMachine {
     type Request = PoolRequest;
-    type Key = BlockKey;
     type Submission = EvictSubmission;
 
     /// Expand one pool request into backend-facing read or write submissions.
@@ -714,10 +701,12 @@ impl IOStateMachine for EvictablePoolStateMachine {
     fn on_submit(&mut self, sub: &EvictSubmission) {
         match sub {
             EvictSubmission::Read(sub) => {
+                let _ = sub.block_key;
                 debug_assert!(self.pool.inflight_io.contains(sub.page_id()));
                 sub.record_running();
             }
             EvictSubmission::Write(sub) => {
+                let _ = sub.block_key;
                 debug_assert!(self.pool.inflight_io.contains(sub.page_id()));
                 self.pool.stats.add_running_writes(1);
             }
@@ -729,16 +718,18 @@ impl IOStateMachine for EvictablePoolStateMachine {
     fn on_complete(&mut self, sub: EvictSubmission, res: std::io::Result<usize>) -> StorageIOKind {
         match sub {
             EvictSubmission::Read(sub) => {
+                let _ = sub.block_key;
                 sub.complete(res);
                 StorageIOKind::Read
             }
             EvictSubmission::Write(sub) => {
                 let PageIO {
-                    block_key: _,
+                    block_key,
                     operation: _,
                     page_guard,
                     batch_done,
                 } = sub;
+                let _ = block_key;
                 let err = match res {
                     Ok(len) if len == PAGE_SIZE => None,
                     Ok(_) => Some(Error::ShortIO),
@@ -1265,13 +1256,6 @@ impl PreparedEvictReadSubmission {
 }
 
 impl IOSubmission for PreparedEvictReadSubmission {
-    type Key = BlockKey;
-
-    #[inline]
-    fn key(&self) -> Self::Key {
-        self.block_key
-    }
-
     #[inline]
     fn operation(&mut self) -> &mut Operation {
         &mut self.operation
@@ -1329,8 +1313,8 @@ pub(crate) fn build_pool_with_swap_file_field(
         swap_file_path,
         max_file_size,
         match config.role {
-            PoolRole::Mem => MEM_POOL_SWAP_PERSISTED_FILE_ID,
-            PoolRole::Index => INDEX_POOL_SWAP_PERSISTED_FILE_ID,
+            PoolRole::Mem => MEM_POOL_SWAP_FILE_ID,
+            PoolRole::Index => INDEX_POOL_SWAP_FILE_ID,
             other => panic!("unsupported pool role {other:?} in swap-file persisted id"),
         },
     )?;

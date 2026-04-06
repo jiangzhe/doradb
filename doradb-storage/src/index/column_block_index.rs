@@ -1638,7 +1638,7 @@ impl<'a> ColumnBlockIndex<'a> {
     }
 
     /// Replaces sorted delete-delta sets keyed by `start_row_id`.
-    pub async fn batch_replace_delete_deltas<M: MutableCowFile>(
+    pub(crate) async fn batch_replace_delete_deltas<M: MutableCowFile>(
         &self,
         mutable_file: &mut M,
         patches: &[ColumnDeleteDeltaPatch<'_>],
@@ -1685,7 +1685,7 @@ impl<'a> ColumnBlockIndex<'a> {
     }
 
     /// Replaces sorted logical entries keyed by existing `start_row_id`.
-    pub async fn batch_replace_entries<M: MutableCowFile>(
+    pub(crate) async fn batch_replace_entries<M: MutableCowFile>(
         &self,
         mutable_file: &mut M,
         patches: &[ColumnBlockEntryPatch],
@@ -1725,7 +1725,7 @@ impl<'a> ColumnBlockIndex<'a> {
     }
 
     /// Appends sorted logical entries and returns the new root page id.
-    pub async fn batch_insert<M: MutableCowFile>(
+    pub(crate) async fn batch_insert<M: MutableCowFile>(
         &self,
         mutable_file: &mut M,
         entries: &[ColumnBlockEntryInput],
@@ -2068,7 +2068,7 @@ impl<'a> ColumnBlockIndex<'a> {
 
     /// Allocate a new node page for copy-on-write updates.
     #[inline]
-    pub fn allocate_node<M: MutableCowFile>(
+    pub(crate) fn allocate_node<M: MutableCowFile>(
         &self,
         table_file: &mut M,
         height: u32,
@@ -2082,7 +2082,7 @@ impl<'a> ColumnBlockIndex<'a> {
 
     /// Record an obsolete node page to be reclaimed after commit.
     #[inline]
-    pub fn record_obsolete_node<M: MutableCowFile>(
+    pub(crate) fn record_obsolete_node<M: MutableCowFile>(
         &self,
         table_file: &mut M,
         page_id: BlockID,
@@ -3229,6 +3229,7 @@ mod tests {
     fn test_batch_insert_and_locate_sparse_membership() {
         smol::block_on(async {
             let (_temp_dir, fs) = build_test_fs();
+            let background_writes = fs.background_writes();
             let metadata = metadata();
             let table = fs.create_table_file(1, metadata, false).unwrap();
             let (table, old_root) = table.commit(1, false).await.unwrap();
@@ -3236,7 +3237,7 @@ mod tests {
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
             let disk_pool = table_readonly_pool(&global, 1, &table);
             let disk_pool_guard = disk_pool.pool_guard();
-            let mut mutable = MutableTableFile::fork(&table);
+            let mut mutable = MutableTableFile::fork(&table, background_writes);
             let index = ColumnBlockIndex::new(SUPER_BLOCK_ID, 0, &disk_pool, &disk_pool_guard);
             let entries = vec![
                 sparse_entry(10, 20, vec![12, 15, 18], test_block_id(1001)),
@@ -3270,6 +3271,7 @@ mod tests {
         expected_block_id: impl Into<BlockID>,
     ) {
         let (_temp_dir, fs) = build_test_fs();
+        let background_writes = fs.background_writes();
         let metadata = metadata();
         let table = fs.create_table_file(1, metadata, false).unwrap();
         let (table, old_root) = table.commit(1, false).await.unwrap();
@@ -3277,7 +3279,7 @@ mod tests {
         let global = global_readonly_pool_scope(64 * 1024 * 1024);
         let disk_pool = table_readonly_pool(&global, 1, &table);
         let disk_pool_guard = disk_pool.pool_guard();
-        let mut mutable = MutableTableFile::fork(&table);
+        let mut mutable = MutableTableFile::fork(&table, background_writes);
         let root_block_id = ColumnBlockIndex::new(SUPER_BLOCK_ID, 0, &disk_pool, &disk_pool_guard)
             .batch_insert(&mut mutable, &entries, end_row_id, 2)
             .await
@@ -3349,6 +3351,7 @@ mod tests {
     fn test_load_entry_row_ids_roundtrip_dense_and_sparse() {
         smol::block_on(async {
             let (_temp_dir, fs) = build_test_fs();
+            let background_writes = fs.background_writes();
             let metadata = metadata();
             let table = fs.create_table_file(1, metadata, false).unwrap();
             let (table, old_root) = table.commit(1, false).await.unwrap();
@@ -3356,7 +3359,7 @@ mod tests {
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
             let disk_pool = table_readonly_pool(&global, 1, &table);
             let disk_pool_guard = disk_pool.pool_guard();
-            let mut mutable = MutableTableFile::fork(&table);
+            let mut mutable = MutableTableFile::fork(&table, background_writes);
             let root_block_id =
                 ColumnBlockIndex::new(SUPER_BLOCK_ID, 0, &disk_pool, &disk_pool_guard)
                     .batch_insert(
@@ -3399,6 +3402,7 @@ mod tests {
     fn test_resolve_row_dense_and_sparse() {
         smol::block_on(async {
             let (_temp_dir, fs) = build_test_fs();
+            let background_writes = fs.background_writes();
             let metadata = metadata();
             let table = fs.create_table_file(1, metadata, false).unwrap();
             let (table, old_root) = table.commit(1, false).await.unwrap();
@@ -3406,7 +3410,7 @@ mod tests {
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
             let disk_pool = table_readonly_pool(&global, 1, &table);
             let disk_pool_guard = disk_pool.pool_guard();
-            let mut mutable = MutableTableFile::fork(&table);
+            let mut mutable = MutableTableFile::fork(&table, background_writes);
             let entries = vec![
                 dense_entry(0, 4, test_block_id(1001)),
                 sparse_entry(10, 20, vec![12, 15, 18], test_block_id(1002)),
@@ -3460,6 +3464,7 @@ mod tests {
     fn test_collect_leaf_entries_and_replace_entry() {
         smol::block_on(async {
             let (_temp_dir, fs) = build_test_fs();
+            let background_writes = fs.background_writes();
             let metadata = metadata();
             let table = fs.create_table_file(1, metadata, false).unwrap();
             let (table, old_root) = table.commit(1, false).await.unwrap();
@@ -3467,7 +3472,7 @@ mod tests {
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
             let disk_pool = table_readonly_pool(&global, 1, &table);
             let disk_pool_guard = disk_pool.pool_guard();
-            let mut mutable = MutableTableFile::fork(&table);
+            let mut mutable = MutableTableFile::fork(&table, background_writes);
             let root_v1 = ColumnBlockIndex::new(SUPER_BLOCK_ID, 0, &disk_pool, &disk_pool_guard)
                 .batch_insert(
                     &mut mutable,
@@ -3482,7 +3487,7 @@ mod tests {
                 .unwrap();
             let (_table, _old_root) = mutable.commit(2, false).await.unwrap();
 
-            let mut mutable = MutableTableFile::fork(&table);
+            let mut mutable = MutableTableFile::fork(&table, background_writes);
             let replacement = sparse_entry(4, 10, vec![4, 5, 8, 9], test_block_id(2002));
             let root_v2 = ColumnBlockIndex::new(root_v1, 8, &disk_pool, &disk_pool_guard)
                 .batch_replace_entries(
@@ -3516,6 +3521,7 @@ mod tests {
     fn test_batch_replace_delete_deltas_roundtrip_inline() {
         smol::block_on(async {
             let (_temp_dir, fs) = build_test_fs();
+            let background_writes = fs.background_writes();
             let metadata = metadata();
             let table = fs.create_table_file(1, metadata, false).unwrap();
             let (table, old_root) = table.commit(1, false).await.unwrap();
@@ -3523,7 +3529,7 @@ mod tests {
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
             let disk_pool = table_readonly_pool(&global, 1, &table);
             let disk_pool_guard = disk_pool.pool_guard();
-            let mut mutable = MutableTableFile::fork(&table);
+            let mut mutable = MutableTableFile::fork(&table, background_writes);
             let root_v1 = ColumnBlockIndex::new(SUPER_BLOCK_ID, 0, &disk_pool, &disk_pool_guard)
                 .batch_insert(
                     &mut mutable,
@@ -3535,7 +3541,7 @@ mod tests {
                 .unwrap();
             let (_table, _old_root) = mutable.commit(2, false).await.unwrap();
 
-            let mut mutable = MutableTableFile::fork(&table);
+            let mut mutable = MutableTableFile::fork(&table, background_writes);
             let root_v2 = ColumnBlockIndex::new(root_v1, 8, &disk_pool, &disk_pool_guard)
                 .batch_replace_delete_deltas(
                     &mut mutable,
@@ -3564,6 +3570,7 @@ mod tests {
     fn test_batch_replace_entries_roundtrip_ordinal_delete_domain() {
         smol::block_on(async {
             let (_temp_dir, fs) = build_test_fs();
+            let background_writes = fs.background_writes();
             let metadata = metadata();
             let table = fs.create_table_file(1, metadata, false).unwrap();
             let (table, old_root) = table.commit(1, false).await.unwrap();
@@ -3571,7 +3578,7 @@ mod tests {
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
             let disk_pool = table_readonly_pool(&global, 1, &table);
             let disk_pool_guard = disk_pool.pool_guard();
-            let mut mutable = MutableTableFile::fork(&table);
+            let mut mutable = MutableTableFile::fork(&table, background_writes);
             let root_v1 = ColumnBlockIndex::new(SUPER_BLOCK_ID, 0, &disk_pool, &disk_pool_guard)
                 .batch_insert(
                     &mut mutable,
@@ -3587,7 +3594,7 @@ mod tests {
                 .unwrap()
                 .with_delete_domain(ColumnDeleteDomain::Ordinal)
                 .with_block_id(test_block_id(1001));
-            let mut mutable = MutableTableFile::fork(&table);
+            let mut mutable = MutableTableFile::fork(&table, background_writes);
             let root_v2 = ColumnBlockIndex::new(root_v1, 8, &disk_pool, &disk_pool_guard)
                 .batch_replace_entries(
                     &mut mutable,
@@ -3615,6 +3622,7 @@ mod tests {
     fn test_batch_replace_delete_deltas_preserves_ordinal_domain() {
         smol::block_on(async {
             let (_temp_dir, fs) = build_test_fs();
+            let background_writes = fs.background_writes();
             let metadata = metadata();
             let table = fs.create_table_file(1, metadata, false).unwrap();
             let (table, old_root) = table.commit(1, false).await.unwrap();
@@ -3627,14 +3635,14 @@ mod tests {
                 .unwrap()
                 .with_delete_domain(ColumnDeleteDomain::Ordinal)
                 .with_block_id(test_block_id(1001));
-            let mut mutable = MutableTableFile::fork(&table);
+            let mut mutable = MutableTableFile::fork(&table, background_writes);
             let root_v1 = ColumnBlockIndex::new(SUPER_BLOCK_ID, 0, &disk_pool, &disk_pool_guard)
                 .batch_insert(&mut mutable, &[seed], 8, 2)
                 .await
                 .unwrap();
             let (_table, _old_root) = mutable.commit(2, false).await.unwrap();
 
-            let mut mutable = MutableTableFile::fork(&table);
+            let mut mutable = MutableTableFile::fork(&table, background_writes);
             let root_v2 = ColumnBlockIndex::new(root_v1, 8, &disk_pool, &disk_pool_guard)
                 .batch_replace_delete_deltas(
                     &mut mutable,
@@ -3662,6 +3670,7 @@ mod tests {
     fn test_batch_insert_splits_leaf_pages() {
         smol::block_on(async {
             let (_temp_dir, fs) = build_test_fs();
+            let background_writes = fs.background_writes();
             let metadata = metadata();
             let table = fs.create_table_file(1, metadata, false).unwrap();
             let (table, old_root) = table.commit(1, false).await.unwrap();
@@ -3669,7 +3678,7 @@ mod tests {
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
             let disk_pool = table_readonly_pool(&global, 1, &table);
             let disk_pool_guard = disk_pool.pool_guard();
-            let mut mutable = MutableTableFile::fork(&table);
+            let mut mutable = MutableTableFile::fork(&table, background_writes);
             let mut entries = Vec::new();
             for idx in 0..(COLUMN_BLOCK_MAX_ENTRIES + 32) as u64 {
                 entries.push(dense_entry(idx * 2, idx * 2 + 2, 10_000 + idx));

@@ -1,6 +1,6 @@
-use crate::buffer::BlockKey;
 use crate::buffer::frame::{BufferFrame, FrameKind};
 use crate::buffer::guard::PageExclusiveGuard;
+use crate::file::BlockKey;
 use crate::io::{IOSubmission, Operation};
 use crate::notify::EventNotifyOnDrop;
 use std::mem;
@@ -84,13 +84,6 @@ impl PageIO {
 }
 
 impl IOSubmission for PageIO {
-    type Key = BlockKey;
-
-    #[inline]
-    fn key(&self) -> Self::Key {
-        self.block_key
-    }
-
     #[inline]
     fn operation(&mut self) -> &mut Operation {
         &mut self.operation

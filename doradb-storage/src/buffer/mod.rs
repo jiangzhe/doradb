@@ -32,11 +32,8 @@ pub use fixed::FixedBufferPool;
 pub use identity::PoolRole;
 pub(crate) use identity::{PoolIdentity, RowPoolRole};
 pub use pool_guard::{PoolGuard, PoolGuards, PoolGuardsBuilder};
-pub use readonly::{BlockKey, GlobalReadonlyBufferPool, ReadonlyBlockGuard, ReadonlyBufferPool};
+pub use readonly::{GlobalReadonlyBufferPool, ReadonlyBlockGuard, ReadonlyBufferPool};
 pub(crate) use readonly::{ReadSubmission, ReadonlyBackingFile};
-
-/// Physical file identity used by persisted-block mappings and cache invalidation.
-pub type PersistedFileID = u64;
 
 use crate::DiskPool;
 use crate::buffer::guard::{FacadePageGuard, PageExclusiveGuard};

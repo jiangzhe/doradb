@@ -1,7 +1,7 @@
 use crate::buffer::guard::PageExclusiveGuard;
 use crate::buffer::page::Page;
 use crate::buffer::{
-    BlockKey, EvictReadSubmission, EvictSubmission, EvictableBufferPool, EvictablePoolStateMachine,
+    EvictReadSubmission, EvictSubmission, EvictableBufferPool, EvictablePoolStateMachine,
     GlobalReadonlyBufferPool, PoolRequest, PoolRole, ReadSubmission, ReadonlyBufferPool,
 };
 use crate::catalog::table::TableMetadata;
@@ -11,7 +11,7 @@ use crate::conf::FileSystemConfig;
 use crate::conf::path::path_to_utf8;
 use crate::error::{Error, FileKind, Result};
 use crate::file::cow_file::COW_FILE_PAGE_SIZE;
-use crate::file::multi_table_file::MultiTableFile;
+use crate::file::multi_table_file::{MultiTableActiveRoot, MultiTableFile, MutableMultiTableFile};
 use crate::file::table_file::{ActiveRoot, TABLE_FILE_INITIAL_SIZE};
 use crate::file::table_file::{MutableTableFile, TableFile};
 use crate::file::{SparseFile, TableFsStateMachine, TableFsSubmission, WriteSubmission};
@@ -212,17 +212,6 @@ impl StorageSubmission {
 }
 
 impl IOSubmission for StorageSubmission {
-    type Key = BlockKey;
-
-    #[inline]
-    fn key(&self) -> Self::Key {
-        match &self.inner {
-            StorageSubmissionKind::Table(sub) => sub.key(),
-            StorageSubmissionKind::MemPool(sub) => sub.key(),
-            StorageSubmissionKind::IndexPool(sub) => sub.key(),
-        }
-    }
-
     #[inline]
     fn operation(&mut self) -> &mut Operation {
         match &mut self.inner {
@@ -1378,6 +1367,12 @@ impl FileSystem {
         self.table_reads.send_async(req).await
     }
 
+    /// Returns a clone of the shared background-write ingress client.
+    #[inline]
+    pub(crate) fn background_writes(&self) -> &IOClient<BackgroundWriteRequest> {
+        &self.background_writes
+    }
+
     /// Send one pool page-in read onto the shared pool-read lane.
     #[inline]
     pub(crate) async fn send_pool_read_async(
@@ -1453,16 +1448,14 @@ impl FileSystem {
         trunc: bool,
     ) -> Result<MutableTableFile> {
         let file_path = self.table_file_path(table_id);
-        let table_file = TableFile::create(
-            &file_path,
-            TABLE_FILE_INITIAL_SIZE,
-            table_id,
-            self.background_writes.clone(),
-            trunc,
-        )?;
+        let table_file = TableFile::create(&file_path, TABLE_FILE_INITIAL_SIZE, table_id, trunc)?;
         let initial_pages = TABLE_FILE_INITIAL_SIZE / COW_FILE_PAGE_SIZE;
         let active_root = ActiveRoot::new(0, initial_pages, metadata);
-        Ok(MutableTableFile::new(Arc::new(table_file), active_root))
+        Ok(MutableTableFile::new(
+            Arc::new(table_file),
+            active_root,
+            self.background_writes(),
+        ))
     }
 
     /// Open an existing table file.
@@ -1473,11 +1466,7 @@ impl FileSystem {
         global_disk_pool: QuiescentGuard<GlobalReadonlyBufferPool>,
     ) -> Result<(Arc<TableFile>, ReadonlyBufferPool)> {
         let file_path = self.table_file_path(table_id);
-        let table_file = Arc::new(TableFile::open(
-            &file_path,
-            table_id,
-            self.background_writes.clone(),
-        )?);
+        let table_file = Arc::new(TableFile::open(&file_path, table_id)?);
         let disk_pool = ReadonlyBufferPool::new(
             FileKind::TableFile,
             Arc::clone(&table_file),
@@ -1536,23 +1525,25 @@ impl FileSystem {
         &self,
         global_disk_pool: QuiescentGuard<GlobalReadonlyBufferPool>,
     ) -> Result<(Arc<MultiTableFile>, ReadonlyBufferPool)> {
-        let mtb = MultiTableFile::open_or_create(
-            self.catalog_mtb_file_path(),
-            self.background_writes.clone(),
-        )
-        .await?;
+        let file_path = self.catalog_mtb_file_path();
+        let file_exists = Path::new(&file_path).exists();
+        let mtb = MultiTableFile::open_or_create(&file_path).await?;
         let disk_pool = ReadonlyBufferPool::new(
             FileKind::CatalogMultiTableFile,
             Arc::clone(&mtb),
             global_disk_pool,
         );
-        if mtb
-            .active_root_ptr()
-            .load(std::sync::atomic::Ordering::Acquire)
-            .is_null()
-        {
+        if file_exists {
             let active_root = mtb.load_active_root_from_pool(&disk_pool).await?;
             let old_root = mtb.swap_active_root(active_root);
+            debug_assert!(old_root.is_none());
+        } else {
+            let mutable = MutableMultiTableFile::new(
+                Arc::clone(&mtb),
+                MultiTableActiveRoot::new(),
+                self.background_writes(),
+            );
+            let (_, old_root) = mutable.commit().await?;
             debug_assert!(old_root.is_none());
         }
         Ok((mtb, disk_pool))
@@ -1801,10 +1792,18 @@ pub(crate) mod tests {
         ))
     }
 
-    async fn write_payload(table_file: &Arc<TableFile>, block_id: BlockID, payload: &[u8]) {
+    async fn write_payload(
+        fs: &FileSystem,
+        table_file: &Arc<TableFile>,
+        block_id: BlockID,
+        payload: &[u8],
+    ) {
         let mut buf = DirectBuf::zeroed(COW_FILE_PAGE_SIZE);
         buf.as_bytes_mut()[..payload.len()].copy_from_slice(payload);
-        table_file.write_block(block_id, buf).await.unwrap();
+        table_file
+            .write_block(block_id, buf, fs.background_writes())
+            .await
+            .unwrap();
     }
 
     #[derive(Clone)]
@@ -1941,7 +1940,7 @@ pub(crate) mod tests {
             let table_file = fs.create_table_file(130, make_metadata(), false).unwrap();
             let (table_file, old_root) = table_file.commit(1, false).await.unwrap();
             drop(old_root);
-            write_payload(&table_file, BlockID::from(7usize), b"table-read").await;
+            write_payload(&fs, &table_file, BlockID::from(7usize), b"table-read").await;
 
             let (reopened, readonly_pool) = fs
                 .open_table_file(130, fs.disk_pool().clone_inner())

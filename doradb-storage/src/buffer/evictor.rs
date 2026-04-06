@@ -2,6 +2,7 @@ use crate::buffer::arena::ArenaGuard;
 use crate::buffer::frame::FrameKind;
 use crate::buffer::guard::PageExclusiveGuard;
 use crate::buffer::page::{Page, PageID};
+use crate::buffer::{EvictableBufferPool, GlobalReadonlyBufferPool};
 use crate::component::{Component, ComponentRegistry, ShelfScope};
 use crate::error::Result;
 use crate::quiescent::{QuiescentBox, SyncQuiescentGuard};
@@ -870,9 +871,9 @@ impl SharedEvictor {
 pub(crate) struct SharedPoolEvictorWorkers;
 
 pub(crate) struct SharedPoolEvictorWorkersOwned {
-    disk_pool: SyncQuiescentGuard<crate::buffer::GlobalReadonlyBufferPool>,
-    index_pool: SyncQuiescentGuard<crate::buffer::EvictableBufferPool>,
-    mem_pool: SyncQuiescentGuard<crate::buffer::EvictableBufferPool>,
+    disk_pool: SyncQuiescentGuard<GlobalReadonlyBufferPool>,
+    index_pool: SyncQuiescentGuard<EvictableBufferPool>,
+    mem_pool: SyncQuiescentGuard<EvictableBufferPool>,
     shutdown_flag: Arc<AtomicBool>,
     wake_event: Arc<Event>,
     stats: SharedPoolEvictorStatsHandle,
@@ -909,9 +910,9 @@ impl Component for SharedPoolEvictorWorkers {
 
         let handle = SharedEvictor::new(
             vec![
-                crate::buffer::GlobalReadonlyBufferPool::shared_evictor_domain(disk_pool.clone()),
-                crate::buffer::EvictableBufferPool::shared_evictor_domain(mem_pool.clone()),
-                crate::buffer::EvictableBufferPool::shared_evictor_domain(index_pool.clone()),
+                GlobalReadonlyBufferPool::shared_evictor_domain(disk_pool.clone()),
+                EvictableBufferPool::shared_evictor_domain(mem_pool.clone()),
+                EvictableBufferPool::shared_evictor_domain(index_pool.clone()),
             ],
             Arc::clone(&shutdown_flag),
             Arc::clone(&wake_event),
@@ -954,7 +955,7 @@ mod tests {
     use crate::buffer::BufferPool;
     use crate::buffer::frame::BufferFrame;
     use crate::buffer::page::Page;
-    use crate::buffer::{PoolRole, ReadonlyBufferPool};
+    use crate::buffer::{EvictableBufferPool, PoolRole, ReadonlyBufferPool};
     use crate::catalog::{
         ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexSpec, TableMetadata,
     };
@@ -965,6 +966,8 @@ mod tests {
     use crate::file::fs::{FileSystem, FileSystemWorkers};
     use crate::file::table_file::TableFile;
     use crate::io::{DirectBuf, IOBuf};
+    use crate::quiescent::QuiescentGuard;
+    use crate::value::ValKind;
     use crate::{DiskPool, IndexPool, MemPool};
     use event_listener::Event;
     use std::mem;
@@ -1161,7 +1164,7 @@ mod tests {
         Arc::new(TableMetadata::new(
             vec![ColumnSpec::new(
                 "c0",
-                crate::value::ValKind::U32,
+                ValKind::U32,
                 ColumnAttributes::empty(),
             )],
             vec![IndexSpec::new(
@@ -1172,10 +1175,18 @@ mod tests {
         ))
     }
 
-    async fn write_payload(table_file: &Arc<TableFile>, block_id: BlockID, payload: &[u8]) {
+    async fn write_payload(
+        fs: &FileSystem,
+        table_file: &Arc<TableFile>,
+        block_id: BlockID,
+        payload: &[u8],
+    ) {
         let mut buf = DirectBuf::zeroed(COW_FILE_PAGE_SIZE);
         buf.as_bytes_mut()[..payload.len()].copy_from_slice(payload);
-        table_file.write_block(block_id, buf).await.unwrap();
+        table_file
+            .write_block(block_id, buf, fs.background_writes())
+            .await
+            .unwrap();
     }
 
     #[derive(Clone)]
@@ -1186,7 +1197,7 @@ mod tests {
     }
 
     struct StartedSharedEvictorRuntime {
-        fs: crate::quiescent::QuiescentGuard<FileSystem>,
+        fs: QuiescentGuard<FileSystem>,
         disk_pool: DiskPool,
         mem_pool: MemPool,
         index_pool: IndexPool,
@@ -1263,7 +1274,7 @@ mod tests {
         }
     }
 
-    async fn allocate_with_pressure(pool: &crate::buffer::EvictableBufferPool, total_pages: usize) {
+    async fn allocate_with_pressure(pool: &EvictableBufferPool, total_pages: usize) {
         let pool_guard = pool.pool_guard();
         for _ in 0..total_pages {
             let page = pool
@@ -1290,7 +1301,7 @@ mod tests {
         for i in 0..=capacity {
             let block_id = BlockID::from(base + i as u64);
             let payload = format!("page-{i}");
-            write_payload(&table_file, block_id, payload.as_bytes()).await;
+            write_payload(fs, &table_file, block_id, payload.as_bytes()).await;
         }
 
         let (_opened, pool) = fs

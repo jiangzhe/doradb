@@ -1,4 +1,3 @@
-use crate::buffer::PersistedFileID;
 use crate::buffer::arena::{ArenaGuard, QuiescentArena};
 use crate::buffer::evictor::{
     ClockHand, EvictionArbiter, EvictionArbiterBuilder, EvictionRuntime, FailureRateTracker,
@@ -17,10 +16,10 @@ use crate::buffer::{
     ReadonlyBlockValidator,
 };
 use crate::error::{Error, FileKind, Result};
-use crate::file::BlockID;
 use crate::file::fs::FileSystem;
 use crate::file::multi_table_file::MultiTableFile;
 use crate::file::table_file::TableFile;
+use crate::file::{BlockID, BlockKey, FileID};
 use crate::io::{DirectBuf, IOKind, IOSubmission, Operation};
 use crate::latch::LatchFallbackMode;
 use crate::quiescent::{QuiescentGuard, SyncQuiescentGuard};
@@ -39,26 +38,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 /// Very small pools provide little practical value and can stall eviction/load flow.
 const MIN_READONLY_POOL_PAGES: usize = 256;
 
-/// Physical persisted-block identity for cache lookup and invalidation.
-///
-/// This intentionally excludes root version to preserve cache hits across
-/// root swaps when physical blocks are unchanged.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct BlockKey {
-    /// Persisted file identity owning the block.
-    pub file_id: PersistedFileID,
-    /// Physical page/block id in the backing file.
-    pub block_id: BlockID,
-}
-
-impl BlockKey {
-    /// Builds a key from file id and physical block id.
-    #[inline]
-    pub fn new(file_id: PersistedFileID, block_id: BlockID) -> Self {
-        BlockKey { file_id, block_id }
-    }
-}
-
 /// Keepalive handle for one real readonly backing file.
 ///
 /// This stays on the production path only: readonly-cache misses are always
@@ -72,7 +51,7 @@ pub(crate) enum ReadonlyBackingFile {
 
 impl ReadonlyBackingFile {
     #[inline]
-    pub(crate) fn file_id(&self) -> PersistedFileID {
+    pub(crate) fn file_id(&self) -> FileID {
         match self {
             ReadonlyBackingFile::Table(file) => file.file_id(),
             ReadonlyBackingFile::Multi(file) => file.file_id(),
@@ -382,11 +361,7 @@ impl GlobalReadonlyBufferPool {
 
     /// Invalidates one physical block from one file.
     #[inline]
-    pub fn invalidate_file_block(
-        &self,
-        file_id: PersistedFileID,
-        block_id: BlockID,
-    ) -> Option<PageID> {
+    pub fn invalidate_file_block(&self, file_id: FileID, block_id: BlockID) -> Option<PageID> {
         self.invalidate_key(&BlockKey::new(file_id, block_id))
     }
 
@@ -394,7 +369,7 @@ impl GlobalReadonlyBufferPool {
     #[inline]
     pub fn invalidate_file_block_strict(
         &self,
-        file_id: PersistedFileID,
+        file_id: FileID,
         block_id: BlockID,
     ) -> Option<PageID> {
         self.invalidate_key_strict(&BlockKey::new(file_id, block_id))
@@ -404,7 +379,7 @@ impl GlobalReadonlyBufferPool {
     ///
     /// Returns the number of invalidated mappings.
     #[inline]
-    pub fn invalidate_file(&self, file_id: PersistedFileID) -> usize {
+    pub fn invalidate_file(&self, file_id: FileID) -> usize {
         let keys = self
             .mappings
             .iter()
@@ -429,7 +404,7 @@ impl GlobalReadonlyBufferPool {
     ///
     /// This method panics if any target frame is still latch-held.
     #[inline]
-    pub fn invalidate_file_strict(&self, file_id: PersistedFileID) -> usize {
+    pub fn invalidate_file_strict(&self, file_id: FileID) -> usize {
         let keys = self
             .mappings
             .iter()
@@ -839,13 +814,6 @@ impl ReadSubmission {
 }
 
 impl IOSubmission for ReadSubmission {
-    type Key = BlockKey;
-
-    #[inline]
-    fn key(&self) -> Self::Key {
-        self.key
-    }
-
     #[inline]
     fn operation(&mut self) -> &mut Operation {
         &mut self.operation
@@ -1380,9 +1348,12 @@ pub(crate) mod tests {
         write_block_header,
     };
     use crate::file::build_test_fs;
+    use crate::file::build_test_fs_in;
     use crate::file::cow_file::{COW_FILE_PAGE_SIZE, SUPER_BLOCK_ID};
-    use crate::file::table_file::TableFile;
-    use crate::file::test_block_id;
+    use crate::file::fs::FileSystem;
+    use crate::file::fs::tests::{TestFileSystem, build_test_fs_owner_in};
+    use crate::file::table_file::{MutableTableFile, TableFile};
+    use crate::file::{CATALOG_MTB_FILE_ID, test_block_id, test_file_id};
     use crate::index::{
         COLUMN_BLOCK_HEADER_SIZE, COLUMN_BLOCK_NODE_PAYLOAD_SIZE,
         COLUMN_DELETION_BLOB_PAGE_HEADER_SIZE, ColumnBlockNodeHeader, validate_persisted_blob_page,
@@ -1395,7 +1366,7 @@ pub(crate) mod tests {
     use crate::lwc::{
         LWC_BLOCK_PAYLOAD_SIZE, LwcBlock, LwcBlockHeader, validate_persisted_lwc_block,
     };
-    use crate::quiescent::QuiescentBox;
+    use crate::quiescent::{QuiescentBox, QuiescentGuard};
     use crate::value::ValKind;
     use std::ops::Deref;
     use std::os::fd::RawFd;
@@ -1428,13 +1399,13 @@ pub(crate) mod tests {
     /// Test-only owner wrapper for one shared readonly pool.
     pub(crate) struct GlobalReadOnlyPoolScope {
         _temp_dir: TempDir,
-        fs: Option<crate::file::fs::tests::TestFileSystem>,
+        fs: Option<TestFileSystem>,
         owner: Option<QuiescentBox<GlobalReadonlyBufferPool>>,
     }
 
     fn owned_global_pool(pool_size: usize) -> GlobalReadOnlyPoolScope {
         let temp_dir = TempDir::new().unwrap();
-        let fs = crate::file::build_test_fs_in(temp_dir.path());
+        let fs = build_test_fs_in(temp_dir.path());
         let owner = QuiescentBox::new(
             GlobalReadonlyBufferPool::with_capacity(PoolRole::Disk, pool_size, fs.guard()).unwrap(),
         );
@@ -1458,7 +1429,7 @@ pub(crate) mod tests {
 
     impl GlobalReadOnlyPoolScope {
         #[inline]
-        pub(crate) fn guard(&self) -> crate::quiescent::QuiescentGuard<GlobalReadonlyBufferPool> {
+        pub(crate) fn guard(&self) -> QuiescentGuard<GlobalReadonlyBufferPool> {
             self.owner
                 .as_ref()
                 .expect("test readonly pool owner is live")
@@ -1489,7 +1460,7 @@ pub(crate) mod tests {
     }
 
     fn owned_readonly_pool<O>(
-        _file_id: PersistedFileID,
+        _file_id: FileID,
         file_kind: FileKind,
         backing: O,
         global: &GlobalReadOnlyPoolScope,
@@ -1519,17 +1490,39 @@ pub(crate) mod tests {
         ))
     }
 
-    async fn write_payload(table_file: &Arc<TableFile>, page_id: BlockID, payload: &[u8]) {
+    async fn commit_table_file(_fs: &FileSystem, table_file: MutableTableFile) -> Arc<TableFile> {
+        let (table_file, old_root) = table_file.commit(1, false).await.unwrap();
+        drop(old_root);
+        table_file
+    }
+
+    async fn write_payload(
+        fs: &FileSystem,
+        table_file: &Arc<TableFile>,
+        page_id: BlockID,
+        payload: &[u8],
+    ) {
         let mut buf = DirectBuf::zeroed(COW_FILE_PAGE_SIZE);
         let bytes = buf.as_bytes_mut();
         bytes[..payload.len()].copy_from_slice(payload);
-        table_file.write_block(page_id, buf).await.unwrap();
+        table_file
+            .write_block(page_id, buf, fs.background_writes())
+            .await
+            .unwrap();
     }
 
-    async fn write_page_bytes(table_file: &Arc<TableFile>, page_id: BlockID, bytes: &[u8]) {
+    async fn write_page_bytes(
+        fs: &FileSystem,
+        table_file: &Arc<TableFile>,
+        page_id: BlockID,
+        bytes: &[u8],
+    ) {
         let mut buf = DirectBuf::zeroed(COW_FILE_PAGE_SIZE);
         buf.as_bytes_mut().copy_from_slice(bytes);
-        table_file.write_block(page_id, buf).await.unwrap();
+        table_file
+            .write_block(page_id, buf, fs.background_writes())
+            .await
+            .unwrap();
     }
 
     #[test]
@@ -1537,9 +1530,8 @@ pub(crate) mod tests {
         smol::block_on(async {
             let (_temp_dir, fs) = build_test_fs();
             let table_file = fs.create_table_file(120, make_metadata(), false).unwrap();
-            let (table_file, old_root) = table_file.commit(1, false).await.unwrap();
-            drop(old_root);
-            write_payload(&table_file, test_block_id(0), b"readonly-stats").await;
+            let table_file = commit_table_file(&fs, table_file).await;
+            write_payload(&fs, &table_file, test_block_id(0), b"readonly-stats").await;
 
             let scope = global_readonly_pool_scope(frame_page_bytes(4));
             let pool = table_readonly_pool(&scope, 120, &table_file);
@@ -1584,14 +1576,12 @@ pub(crate) mod tests {
         smol::block_on(async {
             let (_temp_dir, fs) = build_test_fs();
             let table_file_a = fs.create_table_file(121, make_metadata(), false).unwrap();
-            let (table_file_a, old_root_a) = table_file_a.commit(1, false).await.unwrap();
-            drop(old_root_a);
-            write_payload(&table_file_a, test_block_id(0), b"readonly-shared-a").await;
+            let table_file_a = commit_table_file(&fs, table_file_a).await;
+            write_payload(&fs, &table_file_a, test_block_id(0), b"readonly-shared-a").await;
 
             let table_file_b = fs.create_table_file(122, make_metadata(), false).unwrap();
-            let (table_file_b, old_root_b) = table_file_b.commit(1, false).await.unwrap();
-            drop(old_root_b);
-            write_payload(&table_file_b, test_block_id(0), b"readonly-shared-b").await;
+            let table_file_b = commit_table_file(&fs, table_file_b).await;
+            write_payload(&fs, &table_file_b, test_block_id(0), b"readonly-shared-b").await;
 
             let scope = global_readonly_pool_scope(frame_page_bytes(4));
             let pool_a = table_readonly_pool(&scope, 121, &table_file_a);
@@ -1781,7 +1771,7 @@ pub(crate) mod tests {
     fn test_global_readonly_mapping_and_invalidation() {
         let global = owned_global_pool(64 * 1024 * 1024);
         let global_guard = (*global).pool_guard();
-        let key = BlockKey::new(7, test_block_id(11));
+        let key = BlockKey::new(test_file_id(7), test_block_id(11));
 
         assert_eq!(global.allocated(), 0);
         let mut g3 = global
@@ -1795,7 +1785,7 @@ pub(crate) mod tests {
         assert!(global.bind_frame(key, &mut g3).is_ok());
 
         let err = global
-            .bind_frame(BlockKey::new(7, test_block_id(12)), &mut g3)
+            .bind_frame(BlockKey::new(test_file_id(7), test_block_id(12)), &mut g3)
             .unwrap_err();
         assert!(matches!(err, Error::InvalidState));
 
@@ -1809,13 +1799,16 @@ pub(crate) mod tests {
         smol::block_on(async {
             let (_temp_dir, fs) = build_test_fs();
             let table_file = fs.create_table_file(118, make_metadata(), false).unwrap();
-            let (table_file, old_root) = table_file.commit(1, false).await.unwrap();
-            drop(old_root);
+            let table_file = commit_table_file(&fs, table_file).await;
 
             let global = owned_global_pool(frame_page_bytes(2));
-            let pool =
-                owned_readonly_pool(118, FileKind::TableFile, Arc::clone(&table_file), &global);
-            let key = BlockKey::new(118, test_block_id(14));
+            let pool = owned_readonly_pool(
+                test_file_id(118),
+                FileKind::TableFile,
+                Arc::clone(&table_file),
+                &global,
+            );
+            let key = BlockKey::new(test_file_id(118), test_block_id(14));
             let inflight = Arc::new(PageIOCompletion::new());
             let task_arena = global.arena.arena_guard(global.pool_guard());
             let (frame_id, page_guard) =
@@ -1861,7 +1854,7 @@ pub(crate) mod tests {
         let bytes = (MIN_READONLY_POOL_PAGES - 1)
             * (mem::size_of::<BufferFrame>() + mem::size_of::<Page>());
         let temp_dir = TempDir::new().unwrap();
-        let fs_owner = crate::file::fs::tests::build_test_fs_owner_in(temp_dir.path()).unwrap();
+        let fs_owner = build_test_fs_owner_in(temp_dir.path()).unwrap();
         let res = GlobalReadonlyBufferPool::with_capacity(PoolRole::Disk, bytes, fs_owner.guard());
         assert!(matches!(res, Err(Error::BufferPoolSizeTooSmall)));
     }
@@ -1870,9 +1863,9 @@ pub(crate) mod tests {
     fn test_global_invalidate_file() {
         let global = owned_global_pool(64 * 1024 * 1024);
         let global_guard = (*global).pool_guard();
-        let k1 = BlockKey::new(1, test_block_id(10));
-        let k2 = BlockKey::new(1, test_block_id(11));
-        let k3 = BlockKey::new(2, test_block_id(20));
+        let k1 = BlockKey::new(test_file_id(1), test_block_id(10));
+        let k2 = BlockKey::new(test_file_id(1), test_block_id(11));
+        let k3 = BlockKey::new(test_file_id(2), test_block_id(20));
 
         let mut g1 = global
             .try_lock_page_exclusive(&global_guard, test_page_id(1))
@@ -1890,7 +1883,7 @@ pub(crate) mod tests {
         drop(g2);
         drop(g3);
 
-        assert_eq!(global.invalidate_file(1), 2);
+        assert_eq!(global.invalidate_file(test_file_id(1)), 2);
         assert_eq!(global.try_get_frame_id(&k1), None);
         assert_eq!(global.try_get_frame_id(&k2), None);
         assert_eq!(global.try_get_frame_id(&k3), Some(test_page_id(3)));
@@ -1900,8 +1893,8 @@ pub(crate) mod tests {
     fn test_readonly_cache_file_ids_keep_catalog_and_user_pages_isolated() {
         let global = owned_global_pool(64 * 1024 * 1024);
         let global_guard = (*global).pool_guard();
-        let catalog_key = BlockKey::new(USER_OBJ_ID_START - 1, test_block_id(42));
-        let user_key = BlockKey::new(USER_OBJ_ID_START, test_block_id(42));
+        let catalog_key = BlockKey::new(CATALOG_MTB_FILE_ID, test_block_id(42));
+        let user_key = BlockKey::new(FileID::new(USER_OBJ_ID_START), test_block_id(42));
 
         let mut catalog_frame = global
             .try_lock_page_exclusive(&global_guard, test_page_id(1))
@@ -1922,7 +1915,7 @@ pub(crate) mod tests {
     fn test_global_invalidate_key_strict() {
         let global = owned_global_pool(64 * 1024 * 1024);
         let global_guard = (*global).pool_guard();
-        let key = BlockKey::new(9, test_block_id(77));
+        let key = BlockKey::new(test_file_id(9), test_block_id(77));
 
         let mut g = global
             .try_lock_page_exclusive(&global_guard, test_page_id(5))
@@ -1940,7 +1933,7 @@ pub(crate) mod tests {
         smol::block_on(async {
             let global = owned_global_pool(64 * 1024 * 1024);
             let global_guard = (*global).pool_guard();
-            let key = BlockKey::new(10, test_block_id(99));
+            let key = BlockKey::new(test_file_id(10), test_block_id(99));
 
             let mut g = global
                 .try_lock_page_exclusive(&global_guard, test_page_id(6))
@@ -1975,13 +1968,12 @@ pub(crate) mod tests {
         smol::block_on(async {
             let (_temp_dir, fs) = build_test_fs();
             let table_file = fs.create_table_file(111, make_metadata(), false).unwrap();
-            let (table_file, old_root) = table_file.commit(1, false).await.unwrap();
-            drop(old_root);
-            write_payload(&table_file, test_block_id(9), b"reload").await;
+            let table_file = commit_table_file(&fs, table_file).await;
+            write_payload(&fs, &table_file, test_block_id(9), b"reload").await;
 
             let global = owned_global_pool(frame_page_bytes(2));
             let global_guard = (*global).pool_guard();
-            let key = BlockKey::new(111, test_block_id(9));
+            let key = BlockKey::new(test_file_id(111), test_block_id(9));
 
             let mut g0 = global
                 .try_lock_page_exclusive(&global_guard, test_page_id(0))
@@ -1994,8 +1986,12 @@ pub(crate) mod tests {
             frame.set_kind(FrameKind::Uninitialized);
             drop(g0);
 
-            let pool =
-                owned_readonly_pool(111, FileKind::TableFile, Arc::clone(&table_file), &global);
+            let pool = owned_readonly_pool(
+                test_file_id(111),
+                FileKind::TableFile,
+                Arc::clone(&table_file),
+                &global,
+            );
             let pool_guard = pool.pool_guard();
             let reload_start = pool.global_stats();
             let page = pool
@@ -2026,15 +2022,14 @@ pub(crate) mod tests {
         smol::block_on(async {
             let (_temp_dir, fs) = build_test_fs();
             let table_file = fs.create_table_file(123, make_metadata(), false).unwrap();
-            let (table_file, old_root) = table_file.commit(1, false).await.unwrap();
-            drop(old_root);
+            let table_file = commit_table_file(&fs, table_file).await;
 
             let persisted_page = build_valid_persisted_lwc_block();
-            write_page_bytes(&table_file, test_block_id(12), &persisted_page).await;
+            write_page_bytes(&fs, &table_file, test_block_id(12), &persisted_page).await;
 
             let global = owned_global_pool(frame_page_bytes(2));
             let global_guard = (*global).pool_guard();
-            let key = BlockKey::new(123, test_block_id(12));
+            let key = BlockKey::new(test_file_id(123), test_block_id(12));
 
             let mut g0 = global
                 .try_lock_page_exclusive(&global_guard, test_page_id(0))
@@ -2047,8 +2042,12 @@ pub(crate) mod tests {
             frame.set_kind(FrameKind::Uninitialized);
             drop(g0);
 
-            let pool =
-                owned_readonly_pool(123, FileKind::TableFile, Arc::clone(&table_file), &global);
+            let pool = owned_readonly_pool(
+                test_file_id(123),
+                FileKind::TableFile,
+                Arc::clone(&table_file),
+                &global,
+            );
             let pool_guard = pool.pool_guard();
 
             let reload_start = pool.global_stats();
@@ -2090,13 +2089,16 @@ pub(crate) mod tests {
         smol::block_on(async {
             let (_temp_dir, fs) = build_test_fs();
             let table_file = fs.create_table_file(101, make_metadata(), false).unwrap();
-            let (table_file, old_root) = table_file.commit(1, false).await.unwrap();
-            drop(old_root);
-            write_payload(&table_file, test_block_id(3), b"hello").await;
+            let table_file = commit_table_file(&fs, table_file).await;
+            write_payload(&fs, &table_file, test_block_id(3), b"hello").await;
 
             let global = owned_global_pool(frame_page_bytes(4));
-            let pool =
-                owned_readonly_pool(101, FileKind::TableFile, Arc::clone(&table_file), &global);
+            let pool = owned_readonly_pool(
+                test_file_id(101),
+                FileKind::TableFile,
+                Arc::clone(&table_file),
+                &global,
+            );
             let pool_guard = pool.pool_guard();
             let page = pool
                 .read_block(&pool_guard, test_block_id(3))
@@ -2122,13 +2124,16 @@ pub(crate) mod tests {
         smol::block_on(async {
             let (_temp_dir, fs) = build_test_fs();
             let table_file = fs.create_table_file(102, make_metadata(), false).unwrap();
-            let (table_file, old_root) = table_file.commit(1, false).await.unwrap();
-            drop(old_root);
-            write_payload(&table_file, test_block_id(5), b"world").await;
+            let table_file = commit_table_file(&fs, table_file).await;
+            write_payload(&fs, &table_file, test_block_id(5), b"world").await;
 
             let global = owned_global_pool(frame_page_bytes(8));
-            let pool =
-                owned_readonly_pool(102, FileKind::TableFile, Arc::clone(&table_file), &global);
+            let pool = owned_readonly_pool(
+                test_file_id(102),
+                FileKind::TableFile,
+                Arc::clone(&table_file),
+                &global,
+            );
             let pool_guard = pool.pool_guard();
 
             let mut tasks = vec![];
@@ -2157,9 +2162,8 @@ pub(crate) mod tests {
         smol::block_on(async {
             let (_temp_dir, fs) = build_test_fs();
             let table_file = fs.create_table_file(112, make_metadata(), false).unwrap();
-            let (table_file, old_root) = table_file.commit(1, false).await.unwrap();
-            drop(old_root);
-            write_payload(&table_file, test_block_id(5), b"hello").await;
+            let table_file = commit_table_file(&fs, table_file).await;
+            write_payload(&fs, &table_file, test_block_id(5), b"hello").await;
             let read_hook = Arc::new(ControlledReadHook::for_page(
                 table_file.raw_fd(),
                 test_block_id(5),
@@ -2167,10 +2171,14 @@ pub(crate) mod tests {
             let _hook = install_storage_backend_test_hook(read_hook.clone());
 
             let global = owned_global_pool(frame_page_bytes(2));
-            let pool =
-                owned_readonly_pool(112, FileKind::TableFile, Arc::clone(&table_file), &global);
+            let pool = owned_readonly_pool(
+                test_file_id(112),
+                FileKind::TableFile,
+                Arc::clone(&table_file),
+                &global,
+            );
             let pool_guard = pool.pool_guard();
-            let key = BlockKey::new(112, test_block_id(5));
+            let key = BlockKey::new(test_file_id(112), test_block_id(5));
 
             let pool_for_loader = (*pool).clone();
             let loader_guard = pool_guard.clone();
@@ -2213,9 +2221,8 @@ pub(crate) mod tests {
         smol::block_on(async {
             let (_temp_dir, fs) = build_test_fs();
             let table_file = fs.create_table_file(113, make_metadata(), false).unwrap();
-            let (table_file, old_root) = table_file.commit(1, false).await.unwrap();
-            drop(old_root);
-            write_payload(&table_file, test_block_id(9), b"solo").await;
+            let table_file = commit_table_file(&fs, table_file).await;
+            write_payload(&fs, &table_file, test_block_id(9), b"solo").await;
             let read_hook = Arc::new(ControlledReadHook::for_page(
                 table_file.raw_fd(),
                 test_block_id(9),
@@ -2223,10 +2230,14 @@ pub(crate) mod tests {
             let _hook = install_storage_backend_test_hook(read_hook.clone());
 
             let global = owned_global_pool(frame_page_bytes(2));
-            let pool =
-                owned_readonly_pool(113, FileKind::TableFile, Arc::clone(&table_file), &global);
+            let pool = owned_readonly_pool(
+                test_file_id(113),
+                FileKind::TableFile,
+                Arc::clone(&table_file),
+                &global,
+            );
             let pool_guard = pool.pool_guard();
-            let key = BlockKey::new(113, test_block_id(9));
+            let key = BlockKey::new(test_file_id(113), test_block_id(9));
 
             let pool_for_loader = (*pool).clone();
             let loader_guard = pool_guard.clone();
@@ -2264,19 +2275,22 @@ pub(crate) mod tests {
         smol::block_on(async {
             let (_temp_dir, fs) = build_test_fs();
             let table_file = fs.create_table_file(116, make_metadata(), false).unwrap();
-            let (table_file, old_root) = table_file.commit(1, false).await.unwrap();
-            drop(old_root);
-            write_payload(&table_file, test_block_id(12), b"drop").await;
+            let table_file = commit_table_file(&fs, table_file).await;
+            write_payload(&fs, &table_file, test_block_id(12), b"drop").await;
             let read_hook = Arc::new(ControlledReadHook::for_page(
                 table_file.raw_fd(),
                 test_block_id(12),
             ));
             let _hook = install_storage_backend_test_hook(read_hook.clone());
-            let key = BlockKey::new(116, test_block_id(12));
+            let key = BlockKey::new(test_file_id(116), test_block_id(12));
 
             let global = owned_global_pool(frame_page_bytes(2));
-            let pool =
-                owned_readonly_pool(116, FileKind::TableFile, Arc::clone(&table_file), &global);
+            let pool = owned_readonly_pool(
+                test_file_id(116),
+                FileKind::TableFile,
+                Arc::clone(&table_file),
+                &global,
+            );
             let pool_guard = pool.pool_guard();
             let observe = global.guard();
 
@@ -2322,7 +2336,7 @@ pub(crate) mod tests {
     #[test]
     fn test_readonly_pool_drop_unblocks_detached_reserve_waiter() {
         smol::block_on(async {
-            let key = BlockKey::new(117, test_block_id(13));
+            let key = BlockKey::new(test_file_id(117), test_block_id(13));
             let global = owned_global_pool(frame_page_bytes(1));
 
             {
@@ -2379,8 +2393,7 @@ pub(crate) mod tests {
         smol::block_on(async {
             let (_temp_dir, fs) = build_test_fs();
             let table_file = fs.create_table_file(114, make_metadata(), false).unwrap();
-            let (table_file, old_root) = table_file.commit(1, false).await.unwrap();
-            drop(old_root);
+            let table_file = commit_table_file(&fs, table_file).await;
             let read_hook = Arc::new(ControlledReadHook::with_errno(
                 table_file.raw_fd(),
                 test_block_id(7),
@@ -2389,10 +2402,14 @@ pub(crate) mod tests {
             let _hook = install_storage_backend_test_hook(read_hook.clone());
 
             let global = owned_global_pool(frame_page_bytes(2));
-            let pool =
-                owned_readonly_pool(114, FileKind::TableFile, Arc::clone(&table_file), &global);
+            let pool = owned_readonly_pool(
+                test_file_id(114),
+                FileKind::TableFile,
+                Arc::clone(&table_file),
+                &global,
+            );
             let pool_guard = pool.pool_guard();
-            let key = BlockKey::new(114, test_block_id(7));
+            let key = BlockKey::new(test_file_id(114), test_block_id(7));
 
             let pool_1 = (*pool).clone();
             let waiter1_guard = pool_guard.clone();
@@ -2427,12 +2444,11 @@ pub(crate) mod tests {
         smol::block_on(async {
             let (_temp_dir, fs) = build_test_fs();
             let table_file = fs.create_table_file(115, make_metadata(), false).unwrap();
-            let (table_file, old_root) = table_file.commit(1, false).await.unwrap();
-            drop(old_root);
+            let table_file = commit_table_file(&fs, table_file).await;
             let mut page = build_valid_persisted_lwc_block();
             let last_idx = page.len() - 1;
             page[last_idx] ^= 0xFF;
-            write_page_bytes(&table_file, test_block_id(8), &page).await;
+            write_page_bytes(&fs, &table_file, test_block_id(8), &page).await;
             let read_hook = Arc::new(ControlledReadHook::for_page(
                 table_file.raw_fd(),
                 test_block_id(8),
@@ -2440,10 +2456,14 @@ pub(crate) mod tests {
             let _hook = install_storage_backend_test_hook(read_hook.clone());
 
             let global = owned_global_pool(frame_page_bytes(2));
-            let pool =
-                owned_readonly_pool(115, FileKind::TableFile, Arc::clone(&table_file), &global);
+            let pool = owned_readonly_pool(
+                test_file_id(115),
+                FileKind::TableFile,
+                Arc::clone(&table_file),
+                &global,
+            );
             let pool_guard = pool.pool_guard();
-            let key = BlockKey::new(115, test_block_id(8));
+            let key = BlockKey::new(test_file_id(115), test_block_id(8));
 
             let pool_1 = (*pool).clone();
             let waiter1_guard = pool_guard.clone();
@@ -2512,19 +2532,22 @@ pub(crate) mod tests {
         smol::block_on(async {
             let (_temp_dir, fs) = build_test_fs();
             let table_file = fs.create_table_file(107, make_metadata(), false).unwrap();
-            let (table_file, old_root) = table_file.commit(1, false).await.unwrap();
-            drop(old_root);
+            let table_file = commit_table_file(&fs, table_file).await;
 
             let mut page = build_valid_persisted_lwc_block();
             let last_idx = page.len() - 1;
             page[last_idx] ^= 0xFF;
-            write_page_bytes(&table_file, test_block_id(9), &page).await;
+            write_page_bytes(&fs, &table_file, test_block_id(9), &page).await;
 
             let global = owned_global_pool(frame_page_bytes(4));
-            let pool =
-                owned_readonly_pool(107, FileKind::TableFile, Arc::clone(&table_file), &global);
+            let pool = owned_readonly_pool(
+                test_file_id(107),
+                FileKind::TableFile,
+                Arc::clone(&table_file),
+                &global,
+            );
             let pool_guard = pool.pool_guard();
-            let key = BlockKey::new(107, test_block_id(9));
+            let key = BlockKey::new(test_file_id(107), test_block_id(9));
 
             let err = match pool
                 .read_validated_block(&pool_guard, test_block_id(9), validate_persisted_lwc_block)
@@ -2552,8 +2575,7 @@ pub(crate) mod tests {
         smol::block_on(async {
             let (_temp_dir, fs) = build_test_fs();
             let table_file = fs.create_table_file(116, make_metadata(), false).unwrap();
-            let (table_file, old_root) = table_file.commit(1, false).await.unwrap();
-            drop(old_root);
+            let table_file = commit_table_file(&fs, table_file).await;
 
             let mut page = build_valid_persisted_lwc_block();
             {
@@ -2566,13 +2588,17 @@ pub(crate) mod tests {
                 page_view.body[..2].copy_from_slice(&invalid_end.to_le_bytes());
             }
             write_block_checksum(&mut page);
-            write_page_bytes(&table_file, test_block_id(10), &page).await;
+            write_page_bytes(&fs, &table_file, test_block_id(10), &page).await;
 
             let global = owned_global_pool(frame_page_bytes(4));
-            let pool =
-                owned_readonly_pool(116, FileKind::TableFile, Arc::clone(&table_file), &global);
+            let pool = owned_readonly_pool(
+                test_file_id(116),
+                FileKind::TableFile,
+                Arc::clone(&table_file),
+                &global,
+            );
             let pool_guard = pool.pool_guard();
-            let key = BlockKey::new(116, test_block_id(10));
+            let key = BlockKey::new(test_file_id(116), test_block_id(10));
 
             let err = match pool
                 .read_validated_block(&pool_guard, test_block_id(10), validate_persisted_lwc_block)
@@ -2600,19 +2626,22 @@ pub(crate) mod tests {
         smol::block_on(async {
             let (_temp_dir, fs) = build_test_fs();
             let table_file = fs.create_table_file(108, make_metadata(), false).unwrap();
-            let (table_file, old_root) = table_file.commit(1, false).await.unwrap();
-            drop(old_root);
+            let table_file = commit_table_file(&fs, table_file).await;
 
             let mut page = build_valid_persisted_column_block_page();
             let last_idx = page.len() - 1;
             page[last_idx] ^= 0xFF;
-            write_page_bytes(&table_file, test_block_id(10), &page).await;
+            write_page_bytes(&fs, &table_file, test_block_id(10), &page).await;
 
             let global = owned_global_pool(frame_page_bytes(4));
-            let pool =
-                owned_readonly_pool(108, FileKind::TableFile, Arc::clone(&table_file), &global);
+            let pool = owned_readonly_pool(
+                test_file_id(108),
+                FileKind::TableFile,
+                Arc::clone(&table_file),
+                &global,
+            );
             let pool_guard = pool.pool_guard();
-            let key = BlockKey::new(108, test_block_id(10));
+            let key = BlockKey::new(test_file_id(108), test_block_id(10));
 
             let err = match pool
                 .read_validated_block(
@@ -2644,19 +2673,22 @@ pub(crate) mod tests {
         smol::block_on(async {
             let (_temp_dir, fs) = build_test_fs();
             let table_file = fs.create_table_file(109, make_metadata(), false).unwrap();
-            let (table_file, old_root) = table_file.commit(1, false).await.unwrap();
-            drop(old_root);
+            let table_file = commit_table_file(&fs, table_file).await;
 
             let mut page = build_valid_persisted_blob_page();
             let last_idx = page.len() - 1;
             page[last_idx] ^= 0xFF;
-            write_page_bytes(&table_file, test_block_id(11), &page).await;
+            write_page_bytes(&fs, &table_file, test_block_id(11), &page).await;
 
             let global = owned_global_pool(frame_page_bytes(4));
-            let pool =
-                owned_readonly_pool(109, FileKind::TableFile, Arc::clone(&table_file), &global);
+            let pool = owned_readonly_pool(
+                test_file_id(109),
+                FileKind::TableFile,
+                Arc::clone(&table_file),
+                &global,
+            );
             let pool_guard = pool.pool_guard();
-            let key = BlockKey::new(109, test_block_id(11));
+            let key = BlockKey::new(test_file_id(109), test_block_id(11));
 
             let err = match pool
                 .read_validated_block(&pool_guard, test_block_id(11), validate_persisted_blob_page)
@@ -2706,8 +2738,7 @@ pub(crate) mod tests {
                 .table_fs
                 .create_table_file(103, make_metadata(), false)
                 .unwrap();
-            let (table_file, old_root) = table_file.commit(1, false).await.unwrap();
-            drop(old_root);
+            let table_file = commit_table_file(&engine.table_fs, table_file).await;
 
             let capacity = engine.disk_pool.capacity();
             let base_page_id = 7u64;
@@ -2716,7 +2747,7 @@ pub(crate) mod tests {
             for i in 0..=capacity {
                 let block_id = BlockID::from(base_page_id + i as u64);
                 let payload = format!("page-{i}");
-                write_payload(&table_file, block_id, payload.as_bytes()).await;
+                write_payload(&engine.table_fs, &table_file, block_id, payload.as_bytes()).await;
             }
             drop(table_file);
 
@@ -2741,7 +2772,8 @@ pub(crate) mod tests {
             let loaded_count = capacity + 1;
             let mapped_count = (0..=capacity)
                 .filter(|i| {
-                    let key = BlockKey::new(103, BlockID::from(base_page_id + *i as u64));
+                    let key =
+                        BlockKey::new(test_file_id(103), BlockID::from(base_page_id + *i as u64));
                     engine.disk_pool.try_get_frame_id(&key).is_some()
                 })
                 .count();
@@ -2767,12 +2799,15 @@ pub(crate) mod tests {
             let global = owned_global_pool(frame_page_bytes(2));
             let (_temp_dir, fs) = build_test_fs();
             let table_file = fs.create_table_file(105, make_metadata(), false).unwrap();
-            let (table_file, old_root) = table_file.commit(1, false).await.unwrap();
-            drop(old_root);
-            write_payload(&table_file, test_block_id(9), b"drop-order").await;
+            let table_file = commit_table_file(&fs, table_file).await;
+            write_payload(&fs, &table_file, test_block_id(9), b"drop-order").await;
 
-            let pool =
-                owned_readonly_pool(105, FileKind::TableFile, Arc::clone(&table_file), &global);
+            let pool = owned_readonly_pool(
+                test_file_id(105),
+                FileKind::TableFile,
+                Arc::clone(&table_file),
+                &global,
+            );
             let pool_guard = pool.pool_guard();
 
             let g = pool
@@ -2790,12 +2825,12 @@ pub(crate) mod tests {
         smol::block_on(async {
             let (_temp_dir, fs) = build_test_fs();
             let table_file = fs.create_table_file(104, make_metadata(), false).unwrap();
-            let (table_file, old_root) = table_file.commit(1, false).await.unwrap();
-            drop(old_root);
-            write_payload(&table_file, test_block_id(4), b"guard").await;
+            let table_file = commit_table_file(&fs, table_file).await;
+            write_payload(&fs, &table_file, test_block_id(4), b"guard").await;
 
             let global = owned_global_pool(64 * 1024 * 1024);
-            let pool = owned_readonly_pool(104, FileKind::TableFile, table_file, &global);
+            let pool =
+                owned_readonly_pool(test_file_id(104), FileKind::TableFile, table_file, &global);
             let pool_guard = pool.pool_guard();
             let guard: ReadonlyBlockGuard = pool
                 .read_block(&pool_guard, test_block_id(4))
@@ -2809,7 +2844,7 @@ pub(crate) mod tests {
     #[test]
     fn test_global_readonly_pool_uses_custom_arbiter_builder() {
         let temp_dir = TempDir::new().unwrap();
-        let fs_owner = crate::file::fs::tests::build_test_fs_owner_in(temp_dir.path()).unwrap();
+        let fs_owner = build_test_fs_owner_in(temp_dir.path()).unwrap();
         let global = QuiescentBox::new(
             GlobalReadonlyBufferPool::with_capacity_and_arbiter_builder(
                 PoolRole::Disk,

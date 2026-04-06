@@ -1,13 +1,14 @@
 use crate::bitmap::AllocMap;
 use crate::buffer::page::PAGE_SIZE;
-use crate::buffer::{BlockKey, ReadonlyBackingFile, ReadonlyBufferPool};
+use crate::buffer::{ReadonlyBackingFile, ReadonlyBufferPool};
 use crate::error::{BlockCorruptionCause, BlockKind, Error, FileKind, Result};
 use crate::file::fs::BackgroundWriteRequest;
 use crate::file::super_block::{SUPER_BLOCK_SIZE, SuperBlock};
-use crate::file::{SparseFile, write_direct};
+use crate::file::{BlockKey, FileID, SparseFile, write_direct};
 use crate::io::{DirectBuf, IOClient};
 use crate::trx::TrxID;
 use std::fs;
+use std::future::Future;
 use std::ops::{Deref, DerefMut};
 use std::os::fd::{AsRawFd, RawFd};
 use std::ptr::NonNull;
@@ -27,14 +28,14 @@ pub const SUPER_BLOCK_ID: BlockID = BlockID::new(0);
 pub const INVALID_BLOCK_ID: BlockID = BlockID::new(u64::MAX);
 
 /// Minimal mutable operations required by CoW index/checkpoint writers.
-pub trait MutableCowFile {
+pub(crate) trait MutableCowFile {
     fn allocate_block_id(&mut self) -> Result<BlockID>;
     fn record_gc_block(&mut self, block_id: BlockID);
     fn write_block(
         &self,
         block_id: BlockID,
         buf: DirectBuf,
-    ) -> impl std::future::Future<Output = Result<()>> + Send;
+    ) -> impl Future<Output = Result<()>> + Send;
 }
 
 /// Shared in-memory active root for copy-on-write files.
@@ -175,7 +176,7 @@ impl<M> CowFile<M> {
     pub(crate) fn create(
         file_path: impl AsRef<str>,
         initial_size: usize,
-        file_id: crate::buffer::PersistedFileID,
+        file_id: FileID,
         codec: CowCodec<M>,
         trunc: bool,
     ) -> Result<Self> {
@@ -199,7 +200,7 @@ impl<M> CowFile<M> {
     #[inline]
     pub(crate) fn open(
         file_path: impl AsRef<str>,
-        file_id: crate::buffer::PersistedFileID,
+        file_id: FileID,
         codec: CowCodec<M>,
     ) -> Result<Self> {
         let file = SparseFile::open(file_path, file_id)?;
@@ -301,7 +302,7 @@ impl<M> CowFile<M> {
     }
 
     #[inline]
-    pub(crate) fn file_id(&self) -> crate::buffer::PersistedFileID {
+    pub(crate) fn file_id(&self) -> FileID {
         self.file.file_id()
     }
 

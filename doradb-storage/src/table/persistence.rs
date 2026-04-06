@@ -106,7 +106,8 @@ impl Table {
         }));
 
         // Step 6: fork mutable table-file state and apply selected phases.
-        let mut mutable_file = MutableTableFile::fork(table_file);
+        let mut mutable_file =
+            MutableTableFile::fork(table_file, session.engine().table_fs.background_writes());
         let mut table_file_changed = false;
         if include_new_data {
             table_file_changed = true;

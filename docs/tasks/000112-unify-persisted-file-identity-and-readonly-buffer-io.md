@@ -130,7 +130,7 @@ Reference:
 ## Plan
 
 1. Add persisted-file identity to `SparseFile`.
-   - extend `SparseFile` to store one immutable `PersistedFileID`;
+   - extend `SparseFile` to store one immutable `FileID`;
    - update tracked-file constructors and open helpers to take explicit file id;
    - provide one explicit invalid or untracked file-id path for redo-log and
      other non-persisted users;

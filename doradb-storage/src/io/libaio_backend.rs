@@ -455,7 +455,7 @@ impl IOBackend for LibaioBackend {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use crate::file::{FixedSizeBufferFreeList, SparseFile, UNTRACKED_PERSISTED_FILE_ID};
+    use crate::file::{FixedSizeBufferFreeList, SparseFile, UNTRACKED_FILE_ID};
     use crate::io::{DirectBuf, IOQueue, IOStateMachine, IOSubmission};
     use libc::EAGAIN;
     use std::os::fd::AsRawFd;
@@ -497,9 +497,7 @@ pub(crate) mod tests {
         let temp_dir = TempDir::new().unwrap();
         let file_path = temp_dir.path().join("aio_file2.txt");
         let file_path = file_path.to_string_lossy().into_owned();
-        let file =
-            SparseFile::create_or_trunc(&file_path, 1024 * 1024, UNTRACKED_PERSISTED_FILE_ID)
-                .unwrap();
+        let file = SparseFile::create_or_trunc(&file_path, 1024 * 1024, UNTRACKED_FILE_ID).unwrap();
         let (logical_size, allocated_size) = file.size().unwrap();
         println!("file created, logical size={logical_size}, allocated size={allocated_size}");
         assert_eq!(logical_size, 1024 * 1024);
@@ -518,12 +516,10 @@ pub(crate) mod tests {
         let temp_dir = TempDir::new().unwrap();
         let file_path = temp_dir.path().join("aio_file3.txt");
         let file_path = file_path.to_string_lossy().into_owned();
-        let file =
-            SparseFile::create_or_trunc(&file_path, 1024 * 1024, UNTRACKED_PERSISTED_FILE_ID)
-                .unwrap();
+        let file = SparseFile::create_or_trunc(&file_path, 1024 * 1024, UNTRACKED_FILE_ID).unwrap();
 
         let buf_free_list = FixedSizeBufferFreeList::new(4096, 4, 4);
-        let listener = SimpleListener { file, next_key: 0 };
+        let listener = SimpleListener { file };
         let (worker, client) = ctx.io_worker();
         let handle = worker.bind(listener).start_thread();
 
@@ -630,18 +626,11 @@ pub(crate) mod tests {
     }
 
     struct Submission {
-        key: u64,
         kind: IOKind,
         operation: Operation,
     }
 
     impl IOSubmission for Submission {
-        type Key = u64;
-
-        fn key(&self) -> Self::Key {
-            self.key
-        }
-
         fn operation(&mut self) -> &mut Operation {
             &mut self.operation
         }
@@ -649,12 +638,10 @@ pub(crate) mod tests {
 
     struct SimpleListener {
         file: SparseFile,
-        next_key: u64,
     }
 
     impl IOStateMachine for SimpleListener {
         type Request = Request;
-        type Key = u64;
         type Submission = Submission;
 
         fn prepare_request(
@@ -666,8 +653,6 @@ pub(crate) mod tests {
             if max_new == 0 {
                 return Some(req);
             }
-            let key = self.next_key;
-            self.next_key += 1;
             let operation = match req.kind {
                 IOKind::Read => Operation::pread_owned(self.file.as_raw_fd(), req.offset, req.buf),
                 IOKind::Write => {
@@ -675,16 +660,13 @@ pub(crate) mod tests {
                 }
             };
             queue.push(Submission {
-                key,
                 kind: req.kind,
                 operation,
             });
             None
         }
 
-        fn on_submit(&mut self, sub: &Submission) {
-            debug_assert!(sub.key() < u64::MAX);
-        }
+        fn on_submit(&mut self, _sub: &Submission) {}
 
         fn on_complete(&mut self, sub: Submission, res: std::io::Result<usize>) -> IOKind {
             match res {

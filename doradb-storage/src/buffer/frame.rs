@@ -1,6 +1,6 @@
-use crate::buffer::PersistedFileID;
 use crate::buffer::page::{Page, PageID, VersionedPageID};
 use crate::catalog::TableMetadata;
+use crate::file::FileID;
 use crate::file::cow_file::{BlockID, INVALID_BLOCK_ID};
 use crate::latch::HybridLatch;
 use crate::trx::TrxID;
@@ -102,19 +102,20 @@ impl BufferFrame {
 
     /// Returns the persisted-block identity stored in this frame, if present.
     #[inline]
-    pub fn persisted_block_key(&self) -> Option<(PersistedFileID, BlockID)> {
+    pub fn persisted_block_key(&self) -> Option<(FileID, BlockID)> {
         if !self.has_persisted_block_key.load(Ordering::Acquire) {
             return None;
         }
-        let file_id = self.persisted_file_id.load(Ordering::Acquire);
+        let file_id = FileID::from(self.persisted_file_id.load(Ordering::Acquire));
         let block_id = self.persisted_block_id.load(Ordering::Acquire);
         Some((file_id, BlockID::from(block_id)))
     }
 
     /// Updates persisted-block metadata for this frame.
     #[inline]
-    pub fn set_persisted_block_key(&self, file_id: PersistedFileID, block_id: BlockID) {
-        self.persisted_file_id.store(file_id, Ordering::Release);
+    pub fn set_persisted_block_key(&self, file_id: FileID, block_id: BlockID) {
+        self.persisted_file_id
+            .store(file_id.into(), Ordering::Release);
         self.persisted_block_id
             .store(block_id.into(), Ordering::Release);
         self.has_persisted_block_key.store(true, Ordering::Release);

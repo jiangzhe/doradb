@@ -1,6 +1,6 @@
 use crate::conf::TrxSysConfig;
 use crate::error::{Error, Result, StoragePoisonSource};
-use crate::file::{FileSyncer, SparseFile, UNTRACKED_PERSISTED_FILE_ID};
+use crate::file::{FileSyncer, SparseFile, UNTRACKED_FILE_ID};
 use crate::free_list::FreeList;
 use crate::io::{
     Completion, DirectBuf, IOBackendStats, IOBackendStatsHandle, IOClient, IOKind, IOQueue,
@@ -176,13 +176,6 @@ impl LogWriteSubmission {
 }
 
 impl IOSubmission for LogWriteSubmission {
-    type Key = TrxID;
-
-    #[inline]
-    fn key(&self) -> Self::Key {
-        self.cts
-    }
-
     #[inline]
     fn operation(&mut self) -> &mut Operation {
         &mut self.operation
@@ -212,7 +205,6 @@ impl LogIOStateMachine {
 
 impl IOStateMachine for LogIOStateMachine {
     type Request = LogIORequest;
-    type Key = TrxID;
     type Submission = LogWriteSubmission;
 
     #[inline]
@@ -1039,8 +1031,7 @@ pub(super) fn create_log_file(
     file_header_size: usize,
 ) -> Result<SparseFile> {
     let file_name = log_file_name(file_prefix, log_no, file_seq);
-    let log_file =
-        SparseFile::create_or_fail(&file_name, file_max_size, UNTRACKED_PERSISTED_FILE_ID)?;
+    let log_file = SparseFile::create_or_fail(&file_name, file_max_size, UNTRACKED_FILE_ID)?;
     // todo: Add two pages as file header.
     let _ = log_file.alloc(file_header_size)?;
     Ok(log_file)
