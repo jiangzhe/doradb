@@ -1369,7 +1369,7 @@ impl FileSystem {
         self.table_reads.send_async(req).await
     }
 
-    /// Returns a clone of the shared background-write ingress client.
+    /// Returns a shared reference to the background-write ingress client.
     #[inline]
     pub(crate) fn background_writes(&self) -> &IOClient<BackgroundWriteRequest> {
         &self.background_writes

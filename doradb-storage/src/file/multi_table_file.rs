@@ -243,7 +243,10 @@ pub(super) enum MultiTableFileOpenOutcome {
 }
 
 impl MultiTableFile {
-    /// Open existing file or create a new one, then load/publish initial active root.
+    /// Open existing file or create a new one, returning which case occurred.
+    ///
+    /// Initial root loading or first-root publish is handled by
+    /// `FileSystem::open_or_create_multi_table_file()`.
     #[inline]
     pub(super) async fn open_or_create(
         file_path: impl AsRef<str>,

@@ -1,7 +1,7 @@
 ---
 id: 000112
 title: Unify Persisted File Identity And Readonly Buffer IO
-status: proposal  # proposal | implemented | superseded
+status: implemented  # proposal | implemented | superseded
 created: 2026-04-06
 github_issue: 537
 ---
@@ -13,10 +13,11 @@ github_issue: 537
 Refactor persisted-file identity and shared-storage ownership so `SparseFile`
 owns persisted file id, table-file and swap-file submissions use the same
 `BlockKey(file_id, block_id)` shape, `CowFile` stops owning storage-lane
-clients, and `GlobalReadonlyBufferPool` dispatches readonly miss loads through
-`FileSystem` just like `mem_pool` and `index_pool` already dispatch their own
-I/O. Keep `ReadonlyBufferPool` as a thin file-scoped facade in this task; full
-retirement is intentionally deferred.
+clients, mutable CoW wrappers own cloned background-write clients sourced from
+`FileSystem::background_writes()`, and `GlobalReadonlyBufferPool` dispatches
+readonly miss loads through `FileSystem` just like `mem_pool` and `index_pool`
+already dispatch their own I/O. Keep `ReadonlyBufferPool` as a thin
+file-scoped facade in this task; full retirement is intentionally deferred.
 
 ## Context
 
@@ -68,9 +69,10 @@ Optional issue metadata for `tools/issue.rs create-issue-from-doc`:
    non-persisted users such as redo logs.
 3. Unify shared-storage worker submission keys on
    `BlockKey(file_id, block_id)` for both table-file and swap-file I/O.
-4. Remove `CowFile.table_reads` and `CowFile.background_writes`, and make
-   `CowFile` read and write entrypoints take the needed `IOClient` as an input
-   parameter.
+4. Remove `CowFile.table_reads` and `CowFile.background_writes`, keep
+   `FileSystem::background_writes()` as a shared ingress accessor, and let
+   mutable CoW wrappers own cloned background-write clients while low-level
+   `CowFile` write and publish helpers still take explicit `IOClient` inputs.
 5. Add `QuiescentGuard<FileSystem>` to `GlobalReadonlyBufferPool` so readonly
    miss dispatch follows the same ownership model as the other two pools.
 6. Keep `ReadonlyBufferPool` as a thin file-scoped facade carrying
@@ -143,7 +145,9 @@ Reference:
      `write_at_offset_with_owner`, and publish or load helpers to accept the
      needed `IOClient` argument instead of reading an owned field;
    - adapt `TableFile`, `MultiTableFile`, and `FileSystem` call paths to pass
-     those clients through.
+     those clients through, while `MutableTableFile` and
+     `MutableMultiTableFile` each retain one cloned background-write client to
+     simplify mutable write and commit flows.
 3. Unify submission-key plumbing.
    - change `IOSubmission::key()` to return `Self::Key` by value;
    - update all implementations, worker wrappers, and tests to derive keys
@@ -174,11 +178,50 @@ Reference:
      rather than the full global pool directly.
 7. Make the new dependency explicit in engine startup and docs.
    - register `FileSystem` before `DiskPool`;
+   - make `MultiTableFile::open_or_create()` return an explicit
+     created/opened outcome, and have
+     `FileSystem::open_or_create_multi_table_file()` branch on that result to
+     choose active-root load vs first publish;
+   - remove a freshly created `catalog.mtb` if the first mutable commit fails,
+     so restart does not misclassify a half-initialized file as an existing
+     catalog file;
    - update component and engine lifetime documentation to reflect the new
      order and dependency edge;
    - adjust affected startup and test helpers accordingly.
 
 ## Implementation Notes
+
+1. Persisted file identity is now owned by `SparseFile` as concrete `FileID`
+   values. `BlockKey` moved into the file module, shared-storage routing uses
+   `BlockKey` directly for table and swap-file work, and the old generic
+   `IOSubmission::Key` / `IOStateMachine::Key` plumbing was removed.
+2. `CowFile` no longer owns background-write clients. Mutable CoW wrappers now
+   retain one cloned `IOClient<BackgroundWriteRequest>` each, so
+   `MutableTableFile` and `MutableMultiTableFile` can write and commit without
+   re-threading the client through every mutable helper.
+3. Readonly miss dispatch now originates in `GlobalReadonlyBufferPool` through
+   `FileSystem`, while `ReadonlyBufferPool` remains as the thin file-scoped
+   facade used by table, catalog, and index readers.
+4. `FileSystem` now registers before `DiskPool`, and `catalog.mtb` bootstrap
+   uses the explicit `MultiTableFile::open_or_create()` created/opened outcome
+   instead of `Path::exists()`. If the first publish of a newly created
+   `catalog.mtb` fails, the file is removed so restart cannot misclassify a
+   half-initialized file as an existing catalog file.
+5. Follow-up cleanup in the same task scope renamed `PersistedFileID` to
+   concrete `FileID`, moved `BlockKey` into the file module, simplified
+   mutable CoW write APIs around wrapper-owned background-write clients, and
+   updated task/rustdoc text so `background_writes()` and `open_or_create()`
+   describe the current behavior.
+6. Validation completed in this worktree:
+   - `cargo fmt --all`
+   - `cargo check -p doradb-storage --all-targets`
+   - `cargo clippy -p doradb-storage --all-targets -- -D warnings`
+   - `cargo nextest run -p doradb-storage`
+   - `cargo nextest run -p doradb-storage --no-default-features --features libaio`
+7. `tools/unsafe_inventory.rs --write docs/unsafe-usage-baseline.md` was not
+   rerun in this task resolve because the implementation did not add or modify
+   any `unsafe` blocks; the work stayed within existing unsafe-adjacent IO and
+   ownership surfaces.
 
 ## Impacts
 
