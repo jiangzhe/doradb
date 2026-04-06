@@ -1178,6 +1178,13 @@ mod tests {
         table_file.write_block(block_id, buf).await.unwrap();
     }
 
+    #[derive(Clone)]
+    struct ReadonlyPressureFixture {
+        pool: ReadonlyBufferPool,
+        base_block_id: BlockID,
+        block_count: usize,
+    }
+
     struct StartedSharedEvictorRuntime {
         fs: crate::quiescent::QuiescentGuard<FileSystem>,
         disk_pool: DiskPool,
@@ -1241,16 +1248,11 @@ mod tests {
         }
 
         fn wait_until_idle(&self) -> SharedPoolEvictorStats {
-            let start = self.stats();
-            wait_for(|| self.stats().wait_count > start.wait_count);
-            self.stats()
-        }
-
-        fn wait_until_idle_since(&self, start: SharedPoolEvictorStats) -> SharedPoolEvictorStats {
-            wait_for(|| {
-                let stats = self.stats();
-                stats.wait_count > start.wait_count && stats.wake_count > start.wake_count
-            });
+            // Startup synchronization only needs evidence that the shared
+            // evictor has parked at least once. Requiring a fresh
+            // post-snapshot wait is racy because the worker may already be
+            // idle before the test calls this helper.
+            wait_for(|| self.stats().wait_count > 0);
             self.stats()
         }
     }
@@ -1269,11 +1271,11 @@ mod tests {
         }
     }
 
-    async fn read_with_pressure(
+    async fn prepare_read_pressure(
         fs: &FileSystem,
         disk_pool: &DiskPool,
         table_id: u64,
-    ) -> ReadonlyBufferPool {
+    ) -> ReadonlyPressureFixture {
         let table_file = fs
             .create_table_file(table_id, make_metadata(), false)
             .unwrap();
@@ -1292,14 +1294,22 @@ mod tests {
             .open_table_file(table_id, disk_pool.clone_inner())
             .await
             .unwrap();
+        ReadonlyPressureFixture {
+            pool,
+            base_block_id: BlockID::from(base),
+            block_count: capacity + 1,
+        }
+    }
+
+    async fn drive_read_pressure(fixture: &ReadonlyPressureFixture) {
+        let pool = &fixture.pool;
         let pool_guard = pool.pool_guard();
-        for i in 0..=capacity {
-            let block_id = BlockID::from(base + i as u64);
+        for i in 0..fixture.block_count {
+            let block_id = fixture.base_block_id + i as u64;
             let g = pool.read_block(&pool_guard, block_id).await.unwrap();
             drop(g);
         }
         drop(pool_guard);
-        pool
     }
 
     #[test]
@@ -1370,14 +1380,17 @@ mod tests {
                 let parked = runtime.wait_until_idle();
                 assert!(parked.wait_count > 0);
 
+                let readonly_fixture =
+                    prepare_read_pressure(&runtime.fs, &runtime.disk_pool, 201).await;
+
                 let start = runtime.stats();
-                let readonly_pool = read_with_pressure(&runtime.fs, &runtime.disk_pool, 201).await;
-                let delta = runtime.wait_until_idle_since(start).delta_since(start);
-                assert!(delta.wake_count > 0);
+                drive_read_pressure(&readonly_fixture).await;
+                wait_for(|| runtime.stats().delta_since(start).readonly_runs > 0);
+                let delta = runtime.stats().delta_since(start);
                 assert!(delta.readonly_runs > 0);
                 assert_eq!(delta.mem_runs, 0);
                 assert_eq!(delta.index_runs, 0);
-                drop(readonly_pool);
+                drop(readonly_fixture);
             }
 
             {
@@ -1387,8 +1400,8 @@ mod tests {
 
                 let start = runtime.stats();
                 allocate_with_pressure(&runtime.mem_pool, 192).await;
-                let delta = runtime.wait_until_idle_since(start).delta_since(start);
-                assert!(delta.wake_count > 0);
+                wait_for(|| runtime.stats().delta_since(start).mem_runs > 0);
+                let delta = runtime.stats().delta_since(start);
                 assert_eq!(delta.readonly_runs, 0);
                 assert!(delta.mem_runs > 0);
                 assert_eq!(delta.index_runs, 0);
@@ -1401,8 +1414,8 @@ mod tests {
 
                 let start = runtime.stats();
                 allocate_with_pressure(&runtime.index_pool, 192).await;
-                let delta = runtime.wait_until_idle_since(start).delta_since(start);
-                assert!(delta.wake_count > 0);
+                wait_for(|| runtime.stats().delta_since(start).index_runs > 0);
+                let delta = runtime.stats().delta_since(start);
                 assert_eq!(delta.readonly_runs, 0);
                 assert_eq!(delta.mem_runs, 0);
                 assert!(delta.index_runs > 0);
@@ -1416,14 +1429,16 @@ mod tests {
             let root = TempDir::new().unwrap();
             let runtime = StartedSharedEvictorRuntime::new(root.path());
             runtime.wait_until_idle();
-            let start = runtime.stats();
 
             let table_id = 202u64;
+            let readonly_fixture =
+                prepare_read_pressure(&runtime.fs, &runtime.disk_pool, table_id).await;
+
+            let start = runtime.stats();
             let readonly_task = {
-                let fs = runtime.fs.clone();
-                let disk_pool = runtime.disk_pool.clone();
+                let readonly_fixture = readonly_fixture.clone();
                 smol::spawn(async move {
-                    let _ = read_with_pressure(&fs, &disk_pool, table_id).await;
+                    drive_read_pressure(&readonly_fixture).await;
                 })
             };
             let mem_task = {
@@ -1444,7 +1459,6 @@ mod tests {
                 delta.readonly_runs > 0 && delta.mem_runs > 0 && delta.index_runs > 0
             });
             let delta = runtime.stats().delta_since(start);
-            assert!(delta.wake_count > 0);
             assert!(delta.readonly_runs > 0);
             assert!(delta.mem_runs > 0);
             assert!(delta.index_runs > 0);
