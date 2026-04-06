@@ -15,7 +15,7 @@ mod util;
 pub(crate) use self::evict::tests::{
     dispatch_dirty_pages_for_test as test_dispatch_dirty_pages, frame_kind as test_frame_kind,
     io_backend_stats_handle_identity as test_io_backend_stats_handle_identity,
-    persist_and_evict_page_for_test as test_persist_and_evict_page, raw_fd as test_raw_fd,
+    persist_and_evict_page_for_test as test_persist_and_evict_page,
 };
 #[cfg(test)]
 pub(crate) use self::readonly::tests::{global_readonly_pool_scope, table_readonly_pool};
@@ -32,8 +32,8 @@ pub use fixed::FixedBufferPool;
 pub use identity::PoolRole;
 pub(crate) use identity::{PoolIdentity, RowPoolRole};
 pub use pool_guard::{PoolGuard, PoolGuards, PoolGuardsBuilder};
-pub(crate) use readonly::ReadSubmission;
 pub use readonly::{BlockKey, GlobalReadonlyBufferPool, ReadonlyBlockGuard, ReadonlyBufferPool};
+pub(crate) use readonly::{ReadSubmission, ReadonlyBackingFile};
 
 /// Physical file identity used by persisted-block mappings and cache invalidation.
 pub type PersistedFileID = u64;

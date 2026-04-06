@@ -1,5 +1,5 @@
 use crate::bitmap::AllocMap;
-use crate::buffer::{ReadSubmission, ReadonlyBufferPool};
+use crate::buffer::{ReadSubmission, ReadonlyBackingFile, ReadonlyBufferPool};
 use crate::catalog::{TableID, table::TableMetadata};
 use crate::error::{BlockCorruptionCause, BlockKind, Error, FileKind, Result};
 use crate::file::block_integrity::{
@@ -257,6 +257,23 @@ impl TableFile {
         disk_pool: &ReadonlyBufferPool,
     ) -> Result<ActiveRoot> {
         self.0.load_active_root_from_pool(disk_pool).await
+    }
+
+    #[inline]
+    pub async fn write_block(self: &Arc<Self>, block_id: BlockID, buf: DirectBuf) -> Result<()> {
+        self.0
+            .write_block_with_owner(ReadonlyBackingFile::from(Arc::clone(self)), block_id, buf)
+            .await
+    }
+
+    #[inline]
+    pub(crate) async fn publish_root(
+        self: &Arc<Self>,
+        new_root: ActiveRoot,
+    ) -> Result<Option<OldRoot>> {
+        self.0
+            .publish_root_with_owner(ReadonlyBackingFile::from(Arc::clone(self)), new_root)
+            .await
     }
 
     #[inline]

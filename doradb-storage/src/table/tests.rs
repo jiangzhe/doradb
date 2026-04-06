@@ -2,7 +2,7 @@ use super::{DeleteInternal, FrozenPage, InsertRowIntoPage, UpdateRowInplace};
 use crate::buffer::BufferPool;
 use crate::buffer::frame::FrameKind;
 use crate::buffer::page::{PAGE_SIZE, PageID};
-use crate::buffer::{PoolGuards, PoolRole, test_frame_kind, test_raw_fd};
+use crate::buffer::{PoolGuards, PoolRole, test_frame_kind};
 use crate::conf::{EngineConfig, EvictableBufferPoolConfig, FileSystemConfig, TrxSysConfig};
 use crate::engine::Engine;
 use crate::error::{BlockCorruptionCause, BlockKind, Error, FileKind, Result, StoragePoisonSource};
@@ -13,7 +13,8 @@ use crate::index::{
     UniqueIndex, load_entry_deletion_deltas,
 };
 use crate::io::{
-    IOKind, StorageBackendOp, StorageBackendTestHook, install_storage_backend_test_hook,
+    IOKind, StorageBackendFileIdentity, StorageBackendOp, StorageBackendTestHook,
+    install_storage_backend_test_hook,
 };
 use crate::latch::LatchFallbackMode;
 use crate::row::ops::{DeleteMvcc, InsertMvcc, SelectKey, SelectMvcc, UpdateCol, UpdateMvcc};
@@ -26,14 +27,13 @@ use crate::trx::{ActiveTrx, TrxID};
 use crate::value::Val;
 use std::fs::OpenOptions;
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::os::fd::RawFd;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 use tempfile::TempDir;
 
 struct FailingPageReadHook {
-    fd: RawFd,
+    file: StorageBackendFileIdentity,
     offset: usize,
     errno: i32,
     calls: AtomicUsize,
@@ -41,9 +41,9 @@ struct FailingPageReadHook {
 
 impl FailingPageReadHook {
     #[inline]
-    fn for_page(fd: RawFd, page_id: PageID, errno: i32) -> Self {
+    fn for_page(file: StorageBackendFileIdentity, page_id: PageID, errno: i32) -> Self {
         Self {
-            fd,
+            file,
             offset: usize::from(page_id) * PAGE_SIZE,
             errno,
             calls: AtomicUsize::new(0),
@@ -57,7 +57,9 @@ impl FailingPageReadHook {
 
     #[inline]
     fn matches(&self, op: StorageBackendOp) -> bool {
-        op.kind() == IOKind::Read && op.fd() == self.fd && op.offset() == self.offset
+        op.kind() == IOKind::Read
+            && op.matches_file_identity(self.file)
+            && op.offset() == self.offset
     }
 }
 
@@ -2324,8 +2326,10 @@ fn test_mvcc_insert_surfaces_cached_insert_page_reload_error() {
             "cached insert page should be evicted before repro insert"
         );
 
+        let mem_pool_file =
+            StorageBackendFileIdentity::from_path(sys._temp_dir.path().join("data.swp")).unwrap();
         let read_hook = Arc::new(FailingPageReadHook::for_page(
-            test_raw_fd(&sys.table.mem.mem_pool),
+            mem_pool_file,
             cached_page.page_id,
             libc::EIO,
         ));
@@ -2394,8 +2398,10 @@ fn test_mvcc_rollback_poisons_runtime_on_row_page_reload_error() {
         }
         assert!(evicted, "rollback row page should be evicted before repro");
 
+        let mem_pool_file =
+            StorageBackendFileIdentity::from_path(sys._temp_dir.path().join("data.swp")).unwrap();
         let read_hook = Arc::new(FailingPageReadHook::for_page(
-            test_raw_fd(&sys.table.mem.mem_pool),
+            mem_pool_file,
             cached_page.page_id,
             libc::EIO,
         ));

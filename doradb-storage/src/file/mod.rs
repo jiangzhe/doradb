@@ -14,7 +14,7 @@ pub(crate) use self::tests::{
     FileSyncOp, FileSyncTestHook, set_file_sync_test_hook, test_block_id,
 };
 
-use crate::buffer::{BlockKey, ReadSubmission};
+use crate::buffer::{BlockKey, ReadSubmission, ReadonlyBackingFile};
 use crate::compression::BitPackable;
 use crate::error::{Error, Result, StorageOp};
 use crate::free_list::FreeList;
@@ -430,13 +430,16 @@ fn c_string_from_path(file_path: &str) -> Result<CString> {
     CString::new(file_path).map_err(|_| Error::InvalidStoragePath(file_path.to_owned()))
 }
 
-/// Worker-owned write submission for the table-filesystem IO worker.
+/// Worker-owned table-write request before the backend queue admits it.
 ///
-/// The submission keeps the persisted-block identity, the backend-agnostic IO
-/// operation, and the waiter notification state together until completion.
+/// The request keeps the file owner alive while it is deferred or queued on the
+/// shared background-write lane. `TableFsStateMachine` materializes the backend
+/// `Operation` only when this request is admitted to the IO queue.
 pub struct WriteSubmission {
     key: BlockKey,
-    operation: Operation,
+    backing: ReadonlyBackingFile,
+    offset: usize,
+    buf: DirectBuf,
     completion: Arc<Completion<Result<()>>>,
 }
 
@@ -444,7 +447,7 @@ impl WriteSubmission {
     #[inline]
     fn prepare(
         key: BlockKey,
-        fd: RawFd,
+        backing: ReadonlyBackingFile,
         offset: usize,
         buf: DirectBuf,
     ) -> (Self, impl std::future::Future<Output = Result<()>> + Send) {
@@ -452,14 +455,41 @@ impl WriteSubmission {
         let waiter = Arc::clone(&completion);
         let fio = WriteSubmission {
             key,
-            operation: Operation::pwrite_owned(fd, offset, buf),
+            backing,
+            offset,
+            buf,
             completion,
         };
         (fio, async move { waiter.wait_result().await })
     }
+
+    #[inline]
+    fn into_prepared(self) -> PreparedWriteSubmission {
+        let WriteSubmission {
+            key,
+            backing,
+            offset,
+            buf,
+            completion,
+        } = self;
+        let operation = backing.write_operation(offset, buf);
+        PreparedWriteSubmission {
+            key,
+            _backing: backing,
+            operation,
+            completion,
+        }
+    }
 }
 
-impl IOSubmission for WriteSubmission {
+pub(crate) struct PreparedWriteSubmission {
+    key: BlockKey,
+    _backing: ReadonlyBackingFile,
+    operation: Operation,
+    completion: Arc<Completion<Result<()>>>,
+}
+
+impl IOSubmission for PreparedWriteSubmission {
     type Key = BlockKey;
 
     #[inline]
@@ -474,7 +504,7 @@ impl IOSubmission for WriteSubmission {
 }
 
 pub(crate) enum TableFsSubmission {
-    Write(WriteSubmission),
+    Write(PreparedWriteSubmission),
     Read(ReadSubmission),
 }
 
@@ -506,12 +536,12 @@ impl IOSubmission for TableFsSubmission {
 #[inline]
 pub(crate) async fn write_direct(
     key: BlockKey,
-    fd: RawFd,
+    backing: ReadonlyBackingFile,
     offset: usize,
     buf: DirectBuf,
     background_writes: &IOClient<BackgroundWriteRequest>,
 ) -> Result<()> {
-    let (submission, result) = WriteSubmission::prepare(key, fd, offset, buf);
+    let (submission, result) = WriteSubmission::prepare(key, backing, offset, buf);
     if let Err(err) = background_writes
         .send_async(BackgroundWriteRequest::Table(submission))
         .await
@@ -557,7 +587,7 @@ impl TableFsStateMachine {
         if max_new == 0 {
             return Some(req);
         }
-        queue.push(TableFsSubmission::Write(req));
+        queue.push(TableFsSubmission::Write(req.into_prepared()));
         None
     }
 
@@ -696,15 +726,60 @@ impl Deref for FixedSizeBufferFreeList {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::catalog::table::TableMetadata;
+    use crate::catalog::{ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexSpec};
     use crate::compression::BitPackable;
+    use crate::file::fs::tests::{TestFileSystem, build_test_fs};
+    use crate::file::table_file::TableFile;
     use crate::serde::{Deser, Ser};
+    use crate::value::ValKind;
     use std::mem;
-    use std::sync::{Arc, Mutex};
+    use std::sync::{Arc, Mutex, Weak};
     use tempfile::TempDir;
 
     #[inline]
     pub(crate) fn test_block_id(value: i32) -> BlockID {
         BlockID::new(u64::try_from(value).expect("test BlockID must be non-negative"))
+    }
+
+    fn build_test_metadata() -> Arc<TableMetadata> {
+        Arc::new(TableMetadata::new(
+            vec![ColumnSpec::new(
+                "c0",
+                ValKind::U32,
+                ColumnAttributes::empty(),
+            )],
+            vec![IndexSpec::new(
+                "idx_pk",
+                vec![IndexKey::new(0)],
+                IndexAttributes::PK,
+            )],
+        ))
+    }
+
+    async fn committed_test_table_file() -> (TempDir, TestFileSystem, Arc<TableFile>) {
+        let (temp_dir, fs) = build_test_fs();
+        let mutable = fs
+            .create_table_file(801, build_test_metadata(), false)
+            .unwrap();
+        let (table_file, old_root) = mutable.commit(1, false).await.unwrap();
+        drop(old_root);
+        (temp_dir, fs, table_file)
+    }
+
+    fn prepare_table_write_submission(
+        table_file: Arc<TableFile>,
+        block_id: BlockID,
+    ) -> (
+        WriteSubmission,
+        impl std::future::Future<Output = Result<()>> + Send,
+    ) {
+        WriteSubmission::prepare(
+            BlockKey::new(801, block_id),
+            ReadonlyBackingFile::from(table_file),
+            usize::from(block_id) * STORAGE_SECTOR_SIZE,
+            DirectBuf::zeroed(STORAGE_SECTOR_SIZE),
+        )
     }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -908,38 +983,94 @@ mod tests {
 
     #[test]
     fn test_table_fs_write_completion_succeeds_on_full_write() {
-        let mut state_machine = TableFsStateMachine::new();
-        let (submission, waiter) = WriteSubmission::prepare(
-            BlockKey::new(0, BlockID::new(1)),
-            0,
-            0,
-            DirectBuf::zeroed(STORAGE_SECTOR_SIZE),
-        );
-        let expected_len = submission.operation.len();
+        smol::block_on(async {
+            let (_temp_dir, fs, table_file) = committed_test_table_file().await;
+            let mut state_machine = TableFsStateMachine::new();
+            let (submission, waiter) =
+                prepare_table_write_submission(Arc::clone(&table_file), BlockID::new(1));
+            let mut queue = IOQueue::with_capacity(1);
+            assert!(
+                state_machine
+                    .prepare_write_request(submission, 1, &mut queue)
+                    .is_none()
+            );
 
-        let kind =
-            state_machine.on_complete(TableFsSubmission::Write(submission), Ok(expected_len));
+            let Some(TableFsSubmission::Write(submission)) = queue.pop_front() else {
+                panic!("expected one prepared table write submission");
+            };
+            let expected_len = submission.operation.len();
+            let kind =
+                state_machine.on_complete(TableFsSubmission::Write(submission), Ok(expected_len));
 
-        assert_eq!(kind, IOKind::Write);
-        assert!(smol::block_on(waiter).is_ok());
+            assert_eq!(kind, IOKind::Write);
+            assert!(waiter.await.is_ok());
+            drop(table_file);
+            drop(fs);
+        });
     }
 
     #[test]
     fn test_table_fs_write_completion_rejects_short_write() {
-        let mut state_machine = TableFsStateMachine::new();
-        let (submission, waiter) = WriteSubmission::prepare(
-            BlockKey::new(0, BlockID::new(1)),
-            0,
-            0,
-            DirectBuf::zeroed(STORAGE_SECTOR_SIZE),
-        );
-        let expected_len = submission.operation.len();
-        assert!(expected_len > 0);
+        smol::block_on(async {
+            let (_temp_dir, fs, table_file) = committed_test_table_file().await;
+            let mut state_machine = TableFsStateMachine::new();
+            let (submission, waiter) =
+                prepare_table_write_submission(Arc::clone(&table_file), BlockID::new(1));
+            let mut queue = IOQueue::with_capacity(1);
+            assert!(
+                state_machine
+                    .prepare_write_request(submission, 1, &mut queue)
+                    .is_none()
+            );
 
-        let kind =
-            state_machine.on_complete(TableFsSubmission::Write(submission), Ok(expected_len - 1));
+            let Some(TableFsSubmission::Write(submission)) = queue.pop_front() else {
+                panic!("expected one prepared table write submission");
+            };
+            let expected_len = submission.operation.len();
+            assert!(expected_len > 0);
 
-        assert_eq!(kind, IOKind::Write);
-        assert!(matches!(smol::block_on(waiter), Err(Error::ShortIO)));
+            let kind = state_machine
+                .on_complete(TableFsSubmission::Write(submission), Ok(expected_len - 1));
+
+            assert_eq!(kind, IOKind::Write);
+            assert!(matches!(waiter.await, Err(Error::ShortIO)));
+            drop(table_file);
+            drop(fs);
+        });
+    }
+
+    #[test]
+    fn test_table_fs_write_submission_keeps_backing_alive_until_completion() {
+        smol::block_on(async {
+            let (_temp_dir, fs, table_file) = committed_test_table_file().await;
+            let weak: Weak<TableFile> = Arc::downgrade(&table_file);
+            let mut state_machine = TableFsStateMachine::new();
+            let (submission, waiter) =
+                prepare_table_write_submission(Arc::clone(&table_file), BlockID::new(2));
+            let mut queue = IOQueue::with_capacity(1);
+
+            drop(table_file);
+            assert!(weak.upgrade().is_some());
+
+            assert!(
+                state_machine
+                    .prepare_write_request(submission, 1, &mut queue)
+                    .is_none()
+            );
+            assert!(weak.upgrade().is_some());
+
+            let Some(TableFsSubmission::Write(submission)) = queue.pop_front() else {
+                panic!("expected one prepared table write submission");
+            };
+            let expected_len = submission.operation.len();
+
+            let kind =
+                state_machine.on_complete(TableFsSubmission::Write(submission), Ok(expected_len));
+
+            assert_eq!(kind, IOKind::Write);
+            assert!(waiter.await.is_ok());
+            assert!(weak.upgrade().is_none());
+            drop(fs);
+        });
     }
 }

@@ -1,5 +1,5 @@
 use crate::bitmap::AllocMap;
-use crate::buffer::{PersistedFileID, ReadSubmission, ReadonlyBufferPool};
+use crate::buffer::{PersistedFileID, ReadSubmission, ReadonlyBackingFile, ReadonlyBufferPool};
 use crate::catalog::{ObjID, TableID, USER_OBJ_ID_START};
 use crate::error::{BlockCorruptionCause, BlockKind, Error, FileKind, Result};
 use crate::file::block_integrity::{
@@ -294,6 +294,23 @@ impl MultiTableFile {
             catalog_replay_start_ts: active_root.trx_id,
             meta: active_root.meta.clone(),
         })
+    }
+
+    #[inline]
+    pub async fn write_block(self: &Arc<Self>, block_id: BlockID, buf: DirectBuf) -> Result<()> {
+        self.0
+            .write_block_with_owner(ReadonlyBackingFile::from(Arc::clone(self)), block_id, buf)
+            .await
+    }
+
+    #[inline]
+    pub(crate) async fn publish_root(
+        self: &Arc<Self>,
+        new_root: MultiTableActiveRoot,
+    ) -> Result<Option<OldMultiTableRoot>> {
+        self.0
+            .publish_root_with_owner(ReadonlyBackingFile::from(Arc::clone(self)), new_root)
+            .await
     }
 
     /// Publish new checkpoint metadata atomically.

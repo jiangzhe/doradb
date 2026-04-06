@@ -49,8 +49,8 @@ pub fn align_to_sector_size(len: usize) -> usize {
 
 #[cfg(test)]
 pub(crate) use self::tests::{
-    StorageBackendOp, StorageBackendTestHook, current_storage_backend_test_hook,
-    install_storage_backend_test_hook,
+    StorageBackendFileIdentity, StorageBackendOp, StorageBackendTestHook,
+    current_storage_backend_test_hook, install_storage_backend_test_hook,
 };
 
 /// Buffer ownership model for one backend-agnostic IO operation.
@@ -776,8 +776,46 @@ fn build_io_worker<T, B>(backend: B) -> (IOWorkerBuilder<T, B>, IOClient<T>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::mem::MaybeUninit;
+    use std::os::unix::fs::MetadataExt;
+    use std::path::Path;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) struct StorageBackendFileIdentity {
+        dev: u64,
+        ino: u64,
+    }
+
+    impl StorageBackendFileIdentity {
+        #[inline]
+        pub(crate) fn from_path(path: impl AsRef<Path>) -> std::io::Result<Self> {
+            let md = std::fs::metadata(path)?;
+            Ok(Self {
+                dev: md.dev(),
+                ino: md.ino(),
+            })
+        }
+
+        #[inline]
+        fn from_fd(fd: RawFd) -> std::io::Result<Self> {
+            // SAFETY: `fstat` initializes the output struct on success and does
+            // not take ownership of the borrowed raw fd.
+            unsafe {
+                let mut stat = MaybeUninit::<libc::stat>::uninit();
+                if libc::fstat(fd, stat.as_mut_ptr()) == 0 {
+                    let stat = stat.assume_init();
+                    Ok(Self {
+                        dev: stat.st_dev,
+                        ino: stat.st_ino,
+                    })
+                } else {
+                    Err(std::io::Error::last_os_error())
+                }
+            }
+        }
+    }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub(crate) struct StorageBackendOp {
@@ -805,6 +843,11 @@ mod tests {
         #[inline]
         pub(crate) fn offset(&self) -> usize {
             self.offset
+        }
+
+        #[inline]
+        pub(crate) fn matches_file_identity(&self, expected: StorageBackendFileIdentity) -> bool {
+            StorageBackendFileIdentity::from_fd(self.fd).is_ok_and(|actual| actual == expected)
         }
     }
 
