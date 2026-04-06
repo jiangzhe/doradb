@@ -50,7 +50,7 @@ Optional issue metadata for `tools/issue.rs create-issue-from-doc`:
 `- codex`
 
 `Source Backlogs:`
-`- docs/backlogs/000081-make-bufferpool-allocate-page-fallible-on-shutdown.md`
+`- docs/backlogs/closed/000081-make-bufferpool-allocate-page-fallible-on-shutdown.md`
 
 ## Goals
 
@@ -196,10 +196,20 @@ Reference:
    wake blocked waiters and exit cleanly. Successful reservations are not
    rolled back once shutdown starts, and the code comments describe that
    terminal-shutdown policy explicitly.
-4. Validation completed in this worktree:
+4. Review-driven follow-up fixes in this task scope reclaimed partially
+   allocated pages in B-tree root split, row-page insert-page publication,
+   staged secondary-index construction, and block-index shared insert-page
+   acquisition instead of panicking or leaking unreachable pages.
+5. Deferred follow-up backlog:
+   - `docs/backlogs/000082-handle-post-commit-create-table-runtime-load-failure-compensation.md`
+     tracks the remaining `Session::create_table()` post-commit runtime-load
+     failure window. Durable DDL succeeds before runtime bootstrap finishes, so
+     compensating cleanup or committed-but-unloaded recovery semantics need a
+     dedicated follow-up design rather than an opportunistic patch here.
+6. Validation completed in this worktree:
    - `cargo test -p doradb-storage --no-run --message-format short`
    - `cargo nextest run -p doradb-storage`
-5. Additional validation listed in this task doc (`cargo clippy` and the
+7. Additional validation listed in this task doc (`cargo clippy` and the
    `--no-default-features --features libaio` nextest run) was not executed in
    this turn.
 
@@ -254,3 +264,7 @@ Reference:
    listener/wakeup control-flow template and does not rename readonly shutdown
    errors unless implementation naturally touches that code for shared helper
    cleanup.
+2. `Session::create_table()` still has a post-commit runtime-load failure
+   window after durable catalog/file commit. Follow-up backlog
+   `000082-handle-post-commit-create-table-runtime-load-failure-compensation`
+   tracks the required compensation or recovery-state design.
