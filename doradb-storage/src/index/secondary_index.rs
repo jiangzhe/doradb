@@ -34,7 +34,7 @@ impl<P: BufferPool> GenericSecondaryIndex<P> {
         index_spec: &IndexSpec,
         ty_infer: F,
         ts: TrxID,
-    ) -> Self {
+    ) -> crate::error::Result<Self> {
         debug_assert!(!index_spec.index_cols.is_empty());
         let mut types: Vec<_> = index_spec
             .index_cols
@@ -43,17 +43,26 @@ impl<P: BufferPool> GenericSecondaryIndex<P> {
             .collect();
         if index_spec.unique() {
             let encoder = BTreeKeyEncoder::new(types);
-            let tree = GenericBTree::new(index_pool, index_pool_guard, true, ts).await;
+            let tree = GenericBTree::new(index_pool, index_pool_guard, true, ts).await?;
             let kind = GenericIndexKind::Unique(GenericUniqueBTreeIndex::new(tree, encoder));
-            GenericSecondaryIndex { index_no, kind }
+            Ok(GenericSecondaryIndex { index_no, kind })
         } else {
             // non-unique index always encodes RowID as last key to
             // ensure uniqueness(which is required by BTree implementation).
             types.push(ValType::new(ValKind::U64, false));
             let encoder = BTreeKeyEncoder::new(types);
-            let tree = GenericBTree::new(index_pool, index_pool_guard, true, ts).await;
+            let tree = GenericBTree::new(index_pool, index_pool_guard, true, ts).await?;
             let kind = GenericIndexKind::NonUnique(GenericNonUniqueBTreeIndex::new(tree, encoder));
-            GenericSecondaryIndex { index_no, kind }
+            Ok(GenericSecondaryIndex { index_no, kind })
+        }
+    }
+
+    /// Destroy this secondary index and reclaim all pages it owns.
+    #[inline]
+    pub(crate) async fn destroy(self, pool_guard: &PoolGuard) -> crate::error::Result<()> {
+        match self.kind {
+            GenericIndexKind::Unique(idx) => idx.destroy(pool_guard).await,
+            GenericIndexKind::NonUnique(idx) => idx.destroy(pool_guard).await,
         }
     }
 

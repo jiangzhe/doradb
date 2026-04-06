@@ -24,7 +24,7 @@ impl CatalogTable {
         table_id: TableID,
         blk_idx: BlockIndex,
         metadata: Arc<TableMetadata>,
-    ) -> Self {
+    ) -> Result<Self> {
         let mem = GenericMemTable::new(
             mem_pool.clone(),
             mem_pool.row_pool_role(),
@@ -36,8 +36,8 @@ impl CatalogTable {
             blk_idx,
             MIN_SNAPSHOT_TS,
         )
-        .await;
-        CatalogTable { mem }
+        .await?;
+        Ok(CatalogTable { mem })
     }
 
     /// Build a lightweight operation accessor over this catalog table runtime.

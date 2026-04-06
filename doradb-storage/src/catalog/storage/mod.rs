@@ -56,7 +56,7 @@ impl CatalogStorage {
             // make sure table id matches.
             assert_eq!(cat.len(), *table_id as usize);
             let metadata = Arc::new(metadata.clone());
-            let blk_idx = BlockIndex::new_catalog(meta_pool.clone(), &meta_pool_guard).await;
+            let blk_idx = BlockIndex::new_catalog(meta_pool.clone(), &meta_pool_guard).await?;
             let table = Arc::new(
                 CatalogTable::new(
                     meta_pool.clone(),
@@ -65,7 +65,7 @@ impl CatalogStorage {
                     blk_idx,
                     metadata,
                 )
-                .await,
+                .await?,
             );
             cat.push(table);
         }

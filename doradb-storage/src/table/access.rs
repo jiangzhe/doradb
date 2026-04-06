@@ -376,7 +376,7 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
         loop {
             // acquire insert page from block index.
             let mut page_guard =
-                GenericMemTable::get_insert_page_exclusive(self, guards, row_count, None).await;
+                GenericMemTable::get_insert_page_exclusive(self, guards, row_count, None).await?;
             let page = page_guard.page_mut();
             debug_assert!(metadata.col_count() == page.header.col_count as usize);
             debug_assert!(cols.len() == page.header.col_count as usize);

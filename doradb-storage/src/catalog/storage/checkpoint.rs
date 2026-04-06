@@ -550,7 +550,7 @@ impl CatalogStorage {
         let mut builder_start = None;
         let mut builder_end = 0u64;
         let meta_guard = meta_pool.pool_guard();
-        let mut temp_page = meta_pool.allocate_page::<RowPage>(&meta_guard).await;
+        let mut temp_page = meta_pool.allocate_page::<RowPage>(&meta_guard).await?;
 
         for row in rows {
             if builder.is_empty() {
@@ -621,7 +621,7 @@ impl CatalogStorage {
 
         let mut builder = LwcBuilder::new(metadata);
         let meta_guard = self.meta_pool.pool_guard();
-        let mut temp_page = self.meta_pool.allocate_page::<RowPage>(&meta_guard).await;
+        let mut temp_page = self.meta_pool.allocate_page::<RowPage>(&meta_guard).await?;
 
         for row in existing_tail_rows {
             if !append_single_row_to_builder(metadata, &mut temp_page, &mut builder, row)? {

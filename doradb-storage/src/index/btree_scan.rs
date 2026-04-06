@@ -161,7 +161,9 @@ mod tests {
             );
             {
                 let pool_guard = (*pool).pool_guard();
-                let tree = BTree::new(pool.guard(), &pool_guard, true, 200).await;
+                let tree = BTree::new(pool.guard(), &pool_guard, true, 200)
+                    .await
+                    .expect("test btree construction should succeed");
                 let keys = vec![
                     "a", "b", "c", "d", "aa", "bb", "cc", "dd", "aaa", "bbb", "ccc", "ddd",
                 ];
@@ -221,7 +223,9 @@ mod tests {
             {
                 // generate random data
                 let pool_guard = (*pool).pool_guard();
-                let tree = BTree::new(pool.guard(), &pool_guard, true, 200).await;
+                let tree = BTree::new(pool.guard(), &pool_guard, true, 200)
+                    .await
+                    .expect("test btree construction should succeed");
                 let mut data = Vec::with_capacity(COUNT);
                 let mut rng = rand::rng();
                 for i in 0..COUNT {

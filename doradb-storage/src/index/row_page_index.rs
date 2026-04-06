@@ -310,24 +310,28 @@ pub type RowPageIndex = GenericRowPageIndex<FixedBufferPool>;
 impl<P: BufferPool> GenericRowPageIndex<P> {
     /// Creates a new row-page index backed by the buffer pool.
     #[inline]
-    pub async fn new(pool: QuiescentGuard<P>, pool_guard: &PoolGuard, start_row_id: RowID) -> Self {
-        let mut g = pool.allocate_page::<RowPageIndexNode>(pool_guard).await;
+    pub async fn new(
+        pool: QuiescentGuard<P>,
+        pool_guard: &PoolGuard,
+        start_row_id: RowID,
+    ) -> Result<Self> {
+        let mut g = pool.allocate_page::<RowPageIndexNode>(pool_guard).await?;
         let page_id = g.page_id();
         let page = g.page_mut();
         page.init_empty(0, start_row_id);
-        GenericRowPageIndex {
+        Ok(GenericRowPageIndex {
             root_page_id: page_id,
             height: AtomicUsize::new(0),
             pool,
             insert_free_list: Mutex::new(Vec::with_capacity(64)),
-        }
+        })
     }
 
     #[inline]
     async fn allocate_node_page(
         &self,
         pool_guard: &PoolGuard,
-    ) -> PageExclusiveGuard<RowPageIndexNode> {
+    ) -> Result<PageExclusiveGuard<RowPageIndexNode>> {
         self.pool
             .allocate_page::<RowPageIndexNode>(pool_guard)
             .await
@@ -408,9 +412,16 @@ impl<P: BufferPool> GenericRowPageIndex<P> {
             return Ok(free_page);
         }
         // Empty or stale free-list entries fall back to allocating a fresh row page.
-        let mut new_page = mem_pool.allocate_page::<RowPage>(mem_pool_guard).await;
-        self.insert_page_guard(meta_pool_guard, metadata, count, redo_ctx, &mut new_page)
-            .await;
+        let mut new_page = mem_pool.allocate_page::<RowPage>(mem_pool_guard).await?;
+        if let Err(err) = self
+            .insert_page_guard(meta_pool_guard, metadata, count, redo_ctx, &mut new_page)
+            .await
+        {
+            // The row page was allocated locally and never published, so reclaim it
+            // before surfacing the metadata-side insertion failure.
+            mem_pool.deallocate_page(new_page);
+            return Err(err);
+        }
         Ok(new_page.downgrade_shared())
     }
 
@@ -423,7 +434,7 @@ impl<P: BufferPool> GenericRowPageIndex<P> {
         mem_pool_guard: &PoolGuard,
         metadata: &Arc<TableMetadata>,
         count: usize,
-    ) -> PageExclusiveGuard<RowPage> {
+    ) -> Result<PageExclusiveGuard<RowPage>> {
         self.get_insert_page_exclusive_with_redo(
             meta_pool_guard,
             mem_pool,
@@ -444,18 +455,24 @@ impl<P: BufferPool> GenericRowPageIndex<P> {
         metadata: &Arc<TableMetadata>,
         count: usize,
         redo_ctx: Option<RowPageCreateRedoCtx<'_>>,
-    ) -> PageExclusiveGuard<RowPage> {
+    ) -> Result<PageExclusiveGuard<RowPage>> {
         if let Ok(free_page) = self
             .get_insert_page_exclusive_from_free_list(mem_pool, mem_pool_guard)
             .await
         {
-            return free_page;
+            return Ok(free_page);
         }
-        // we just ignore the free list error and latch error, and continue to get new page.
-        let mut new_page = mem_pool.allocate_page::<RowPage>(mem_pool_guard).await;
-        self.insert_page_guard(meta_pool_guard, metadata, count, redo_ctx, &mut new_page)
-            .await;
-        new_page
+        // Free-list reload failures and stale exclusive-lock attempts are best-effort only here.
+        // Fall back to a fresh page instead of aborting the insert-page acquisition path.
+        let mut new_page = mem_pool.allocate_page::<RowPage>(mem_pool_guard).await?;
+        if let Err(err) = self
+            .insert_page_guard(meta_pool_guard, metadata, count, redo_ctx, &mut new_page)
+            .await
+        {
+            mem_pool.deallocate_page(new_page);
+            return Err(err);
+        }
+        Ok(new_page)
     }
 
     /// Allocate a row page with given page id.
@@ -469,14 +486,18 @@ impl<P: BufferPool> GenericRowPageIndex<P> {
         metadata: &Arc<TableMetadata>,
         count: usize,
         page_id: PageID,
-    ) -> PageExclusiveGuard<RowPage> {
+    ) -> Result<PageExclusiveGuard<RowPage>> {
         let mut new_page = mem_pool
             .allocate_page_at::<RowPage>(mem_pool_guard, page_id)
+            .await?;
+        if let Err(err) = self
+            .insert_page_guard(meta_pool_guard, metadata, count, None, &mut new_page)
             .await
-            .expect("allocate page with specific page id failed");
-        self.insert_page_guard(meta_pool_guard, metadata, count, None, &mut new_page)
-            .await;
-        new_page
+        {
+            mem_pool.deallocate_page(new_page);
+            return Err(err);
+        }
+        Ok(new_page)
     }
 
     #[inline]
@@ -487,13 +508,13 @@ impl<P: BufferPool> GenericRowPageIndex<P> {
         count: usize,
         redo_ctx: Option<RowPageCreateRedoCtx<'_>>,
         new_page: &mut PageExclusiveGuard<RowPage>,
-    ) {
+    ) -> Result<()> {
         let new_page_id = new_page.page_id();
         let metadata = Arc::clone(metadata);
         loop {
             match self
                 .insert_row_page(meta_pool_guard, count as u64, new_page_id)
-                .await
+                .await?
             {
                 Invalid => (),
                 Valid((start_row_id, end_row_id)) => {
@@ -513,7 +534,7 @@ impl<P: BufferPool> GenericRowPageIndex<P> {
                         }
                     }
                     // finally, we downgrade the page lock for shared mode.
-                    return;
+                    return Ok(());
                 }
             }
         }
@@ -589,11 +610,11 @@ impl<P: BufferPool> GenericRowPageIndex<P> {
         };
         let page_guard = mem_pool
             .get_page::<RowPage>(mem_pool_guard, page_id, LatchFallbackMode::Exclusive)
-            .await
-            .expect("row-page-index free-list exclusive read should not ignore buffer-pool errors")
+            .await?;
+        let page_guard = page_guard
             .lock_exclusive_async()
             .await
-            .unwrap();
+            .ok_or(Error::InvalidState)?;
         Ok(page_guard)
     }
 
@@ -606,7 +627,7 @@ impl<P: BufferPool> GenericRowPageIndex<P> {
         row_id: RowID,
         count: u64,
         insert_page_id: PageID,
-    ) -> (RowID, RowID) {
+    ) -> Result<(RowID, RowID)> {
         debug_assert!(p_guard.page_id() == self.root_page_id);
         debug_assert!({
             let p = p_guard.page();
@@ -619,7 +640,7 @@ impl<P: BufferPool> GenericRowPageIndex<P> {
         let max_row_id = r_row_id + count;
 
         // create left child and copy all contents to it.
-        let mut l_guard = self.allocate_node_page(pool_guard).await;
+        let mut l_guard = self.allocate_node_page(pool_guard).await?;
         let l_page_id = l_guard.page_id();
         l_guard.page_mut().clone_from(p_guard.page());
         l_guard.page_mut().header.end_row_id = row_id; // update original page's end row id
@@ -629,7 +650,7 @@ impl<P: BufferPool> GenericRowPageIndex<P> {
         // Because we disable branch split. We have to always construct right tree
         // as same height as left.
         let r_page_id = if root.header.height == 0 {
-            let mut r_guard = self.allocate_node_page(pool_guard).await;
+            let mut r_guard = self.allocate_node_page(pool_guard).await?;
             r_guard.page_mut().init(0, r_row_id, count, insert_page_id);
             r_guard.page_id()
         } else {
@@ -640,7 +661,7 @@ impl<P: BufferPool> GenericRowPageIndex<P> {
                 count,
                 insert_page_id,
             )
-            .await
+            .await?
         };
 
         // initialize parent again.
@@ -662,7 +683,7 @@ impl<P: BufferPool> GenericRowPageIndex<P> {
             });
             self.height.store(new_height as usize, Ordering::Relaxed);
         }
-        (r_row_id, max_row_id)
+        Ok((r_row_id, max_row_id))
     }
 
     #[inline]
@@ -673,14 +694,14 @@ impl<P: BufferPool> GenericRowPageIndex<P> {
         start_row_id: RowID,
         count: u64,
         insert_page_id: PageID,
-    ) -> PageID {
+    ) -> Result<PageID> {
         debug_assert!(height > 0);
-        let mut p_g = self.allocate_node_page(pool_guard).await;
+        let mut p_g = self.allocate_node_page(pool_guard).await?;
         let page_id = p_g.page_id();
         p_g.page_mut().init_empty(height, start_row_id);
         loop {
             height -= 1;
-            let mut c_g = self.allocate_node_page(pool_guard).await;
+            let mut c_g = self.allocate_node_page(pool_guard).await?;
             let c_page_id = c_g.page_id();
             p_g.page_mut().branch_add_entry(PageEntry {
                 row_id: start_row_id,
@@ -696,7 +717,7 @@ impl<P: BufferPool> GenericRowPageIndex<P> {
             c_g.page_mut().init_empty(height, start_row_id);
             p_g = c_g;
         }
-        page_id
+        Ok(page_id)
     }
 
     #[inline]
@@ -708,7 +729,7 @@ impl<P: BufferPool> GenericRowPageIndex<P> {
         row_id: RowID,
         count: u64,
         insert_page_id: PageID,
-    ) -> Validation<(RowID, RowID)> {
+    ) -> Result<Validation<(RowID, RowID)>> {
         debug_assert!(!stack.is_empty());
         let mut p_guard;
         // Block index is a special type of B+ tree, which does not implement
@@ -723,15 +744,18 @@ impl<P: BufferPool> GenericRowPageIndex<P> {
             // try to lock parent.
             let g = stack.pop().unwrap();
             // if lock failed, just retry the whole process.
-            p_guard = verify!(g.try_exclusive());
+            p_guard = match g.try_exclusive() {
+                Valid(v) => v,
+                Invalid => return Ok(Invalid),
+            };
             if !p_guard.page().branch_is_full() {
                 break;
             } else if stack.is_empty() {
                 // root is full, should split.
                 let res = self
                     .insert_row_page_split_root(pool_guard, p_guard, row_id, count, insert_page_id)
-                    .await;
-                return Valid(res);
+                    .await?;
+                return Ok(Valid(res));
             } // do not split branch node.
         }
         // create new leaf node with one insert page id
@@ -739,19 +763,19 @@ impl<P: BufferPool> GenericRowPageIndex<P> {
         let p_height = p_guard.page().header.height;
         debug_assert!(p_height >= 1);
         let c_page_id = if p_height == 1 {
-            let mut leaf = self.allocate_node_page(pool_guard).await;
+            let mut leaf = self.allocate_node_page(pool_guard).await?;
             leaf.page_mut().init(0, row_id, count, insert_page_id);
             debug_assert!(leaf.page_mut().header.end_row_id == row_id + count);
             leaf.page_id()
         } else {
             self.create_sub_tree(pool_guard, p_height - 1, row_id, count, insert_page_id)
-                .await
+                .await?
         };
         p_guard
             .page_mut()
             .branch_add_entry(PageEntry::new(row_id, c_page_id));
         drop(c_guard);
-        Valid((row_id, row_id + count))
+        Ok(Valid((row_id, row_id + count)))
     }
 
     /// Inserts a row page id into the row-page index.
@@ -761,15 +785,20 @@ impl<P: BufferPool> GenericRowPageIndex<P> {
         pool_guard: &PoolGuard,
         count: u64,
         insert_page_id: PageID,
-    ) -> Validation<(RowID, RowID)> {
+    ) -> Result<Validation<(RowID, RowID)>> {
         // Stack holds the path from root to leaf.
         let mut stack = vec![];
         let mut p_guard = {
             let g = self
                 .find_right_most_leaf(pool_guard, &mut stack, LatchFallbackMode::Exclusive)
                 .await;
-            let mut guard = verify!(g);
-            verify!(guard.try_exclusive());
+            let mut guard = match g {
+                Valid(v) => v,
+                Invalid => return Ok(Invalid),
+            };
+            if guard.try_exclusive().is_invalid() {
+                return Ok(Invalid);
+            }
             guard.must_exclusive()
         };
         debug_assert!(p_guard.page().is_leaf());
@@ -778,7 +807,7 @@ impl<P: BufferPool> GenericRowPageIndex<P> {
             p_guard
                 .page_mut()
                 .leaf_add_entry(start_row_id, count, insert_page_id);
-            return Valid((start_row_id, start_row_id + count));
+            return Ok(Valid((start_row_id, start_row_id + count)));
         }
         let end_row_id = p_guard.page().header.end_row_id;
         if p_guard.page().leaf_is_full() {
@@ -793,8 +822,8 @@ impl<P: BufferPool> GenericRowPageIndex<P> {
                         count,
                         insert_page_id,
                     )
-                    .await;
-                return Valid(res);
+                    .await?;
+                return Ok(Valid(res));
             }
             return self
                 .insert_row_page_to_new_leaf(
@@ -810,7 +839,7 @@ impl<P: BufferPool> GenericRowPageIndex<P> {
         p_guard
             .page_mut()
             .leaf_add_entry(end_row_id, count, insert_page_id);
-        Valid((end_row_id, end_row_id + count))
+        Ok(Valid((end_row_id, end_row_id + count)))
     }
 
     #[inline]
@@ -1132,6 +1161,41 @@ mod tests {
         )
     }
 
+    fn owned_mem_pool(pool_size: usize) -> QuiescentBox<FixedBufferPool> {
+        QuiescentBox::new(
+            FixedBufferPool::with_capacity(crate::buffer::PoolRole::Mem, pool_size).unwrap(),
+        )
+    }
+
+    fn fixed_pool_bytes(page_count: usize) -> usize {
+        page_count
+            * (std::mem::size_of::<crate::buffer::frame::BufferFrame>()
+                + std::mem::size_of::<crate::buffer::page::Page>())
+    }
+
+    async fn fill_root_leaf_full<P: BufferPool>(
+        blk_idx: &GenericRowPageIndex<P>,
+        pool_guard: &PoolGuard,
+    ) {
+        let mut root = blk_idx
+            .pool
+            .get_page::<RowPageIndexNode>(
+                pool_guard,
+                blk_idx.root_page_id(),
+                LatchFallbackMode::Exclusive,
+            )
+            .await
+            .expect("test row-page-index root read should succeed")
+            .lock_exclusive_async()
+            .await
+            .unwrap();
+        let root = root.page_mut();
+        root.init_empty(0, 0);
+        for i in 0..NBR_ROW_PAGE_ENTRIES_IN_LEAF {
+            root.leaf_add_entry(i as RowID, 1, test_page_id(i as i32));
+        }
+    }
+
     struct FailingInsertPagePool {
         inner: QuiescentGuard<FixedBufferPool>,
         fail_page_id: AtomicU64,
@@ -1167,7 +1231,7 @@ mod tests {
         fn allocate_page<T: BufferPage>(
             &self,
             guard: &PoolGuard,
-        ) -> impl Future<Output = PageExclusiveGuard<T>> + Send {
+        ) -> impl Future<Output = Result<PageExclusiveGuard<T>>> + Send {
             self.inner.allocate_page(guard)
         }
 
@@ -1244,8 +1308,9 @@ mod tests {
             {
                 let metadata = make_test_metadata();
                 let meta_guard = engine.meta_pool.pool_guard();
-                let blk_idx =
-                    RowPageIndex::new(engine.meta_pool.clone_inner(), &meta_guard, 0).await;
+                let blk_idx = RowPageIndex::new(engine.meta_pool.clone_inner(), &meta_guard, 0)
+                    .await
+                    .expect("test row-page-index construction should succeed");
                 let mem_guard = engine.mem_pool.pool_guard();
                 let p1 = blk_idx
                     .get_insert_page(&meta_guard, &*engine.mem_pool, &mem_guard, &metadata, 100)
@@ -1288,8 +1353,9 @@ mod tests {
             {
                 let metadata = make_test_metadata();
                 let meta_guard = engine.meta_pool.pool_guard();
-                let blk_idx =
-                    RowPageIndex::new(engine.meta_pool.clone_inner(), &meta_guard, 0).await;
+                let blk_idx = RowPageIndex::new(engine.meta_pool.clone_inner(), &meta_guard, 0)
+                    .await
+                    .expect("test row-page-index construction should succeed");
                 let mem_guard = engine.mem_pool.pool_guard();
                 let p1 = blk_idx
                     .get_insert_page_exclusive(
@@ -1299,7 +1365,8 @@ mod tests {
                         &metadata,
                         100,
                     )
-                    .await;
+                    .await
+                    .expect("test insert-page allocation should succeed");
                 let pid1 = p1.page_id();
                 blk_idx.cache_exclusive_insert_page(p1);
                 assert_eq!(blk_idx.insert_free_list.lock().len(), 1);
@@ -1311,7 +1378,8 @@ mod tests {
                         &metadata,
                         100,
                     )
-                    .await;
+                    .await
+                    .expect("test insert-page allocation should succeed");
                 assert_eq!(pid1, p2.page_id());
                 assert!(blk_idx.insert_free_list.lock().is_empty());
             }
@@ -1323,18 +1391,18 @@ mod tests {
     fn test_try_get_insert_page_with_redo_returns_error_on_free_list_io_failure() {
         smol::block_on(async {
             let meta_pool = owned_index_pool(64 * 1024 * 1024);
-            let mem_pool = QuiescentBox::new(
-                FixedBufferPool::with_capacity(crate::buffer::PoolRole::Mem, 64 * 1024 * 1024)
-                    .unwrap(),
-            );
+            let mem_pool = owned_mem_pool(64 * 1024 * 1024);
             let meta_guard = (*meta_pool).pool_guard();
             let mem_guard = (*mem_pool).pool_guard();
             let metadata = make_test_metadata();
-            let blk_idx = RowPageIndex::new(meta_pool.guard(), &meta_guard, 0).await;
+            let blk_idx = RowPageIndex::new(meta_pool.guard(), &meta_guard, 0)
+                .await
+                .expect("test row-page-index construction should succeed");
 
             let page_guard = blk_idx
                 .get_insert_page_exclusive(&meta_guard, &*mem_pool, &mem_guard, &metadata, 100)
-                .await;
+                .await
+                .expect("test insert-page allocation should succeed");
             let page_id = page_guard.page_id();
             blk_idx.cache_exclusive_insert_page(page_guard);
 
@@ -1354,6 +1422,138 @@ mod tests {
                 Err(err) => err,
             };
             assert!(matches!(err, Error::IOError { .. }));
+        });
+    }
+
+    #[test]
+    fn test_get_insert_page_exclusive_with_redo_falls_back_on_free_list_io_failure() {
+        smol::block_on(async {
+            let meta_pool = owned_index_pool(64 * 1024 * 1024);
+            let mem_pool = owned_mem_pool(64 * 1024 * 1024);
+            let meta_guard = (*meta_pool).pool_guard();
+            let mem_guard = (*mem_pool).pool_guard();
+            let metadata = make_test_metadata();
+            let blk_idx = RowPageIndex::new(meta_pool.guard(), &meta_guard, 0)
+                .await
+                .expect("test row-page-index construction should succeed");
+
+            let page_guard = blk_idx
+                .get_insert_page_exclusive(&meta_guard, &*mem_pool, &mem_guard, &metadata, 100)
+                .await
+                .expect("test insert-page allocation should succeed");
+            let failed_page_id = page_guard.page_id();
+            blk_idx.cache_exclusive_insert_page(page_guard);
+
+            let failing_pool = FailingInsertPagePool::new(mem_pool.guard(), failed_page_id);
+            let page_guard = blk_idx
+                .get_insert_page_exclusive_with_redo(
+                    &meta_guard,
+                    &failing_pool,
+                    &mem_guard,
+                    &metadata,
+                    100,
+                    None,
+                )
+                .await
+                .expect("exclusive free-list reload failure should fall back to fresh allocation");
+            assert_ne!(failed_page_id, page_guard.page_id());
+            assert!(blk_idx.insert_free_list.lock().is_empty());
+        });
+    }
+
+    #[test]
+    fn test_try_get_insert_page_with_redo_reclaims_allocated_row_page_on_insert_error() {
+        smol::block_on(async {
+            let meta_pool = owned_index_pool(fixed_pool_bytes(1));
+            let mem_pool = owned_mem_pool(fixed_pool_bytes(1));
+            let meta_guard = (*meta_pool).pool_guard();
+            let mem_guard = (*mem_pool).pool_guard();
+            let metadata = make_test_metadata();
+            let blk_idx = RowPageIndex::new(meta_pool.guard(), &meta_guard, 0)
+                .await
+                .expect("test row-page-index construction should succeed");
+            fill_root_leaf_full(&blk_idx, &meta_guard).await;
+
+            let err = match blk_idx
+                .try_get_insert_page_with_redo(
+                    &meta_guard,
+                    &*mem_pool,
+                    &mem_guard,
+                    &metadata,
+                    100,
+                    None,
+                )
+                .await
+            {
+                Ok(_) => panic!("metadata split should fail in one-page meta pool"),
+                Err(err) => err,
+            };
+            assert!(matches!(err, Error::BufferPoolFull));
+            assert_eq!(mem_pool.allocated(), 0);
+        });
+    }
+
+    #[test]
+    fn test_get_insert_page_exclusive_with_redo_reclaims_allocated_row_page_on_insert_error() {
+        smol::block_on(async {
+            let meta_pool = owned_index_pool(fixed_pool_bytes(1));
+            let mem_pool = owned_mem_pool(fixed_pool_bytes(1));
+            let meta_guard = (*meta_pool).pool_guard();
+            let mem_guard = (*mem_pool).pool_guard();
+            let metadata = make_test_metadata();
+            let blk_idx = RowPageIndex::new(meta_pool.guard(), &meta_guard, 0)
+                .await
+                .expect("test row-page-index construction should succeed");
+            fill_root_leaf_full(&blk_idx, &meta_guard).await;
+
+            let err = match blk_idx
+                .get_insert_page_exclusive_with_redo(
+                    &meta_guard,
+                    &*mem_pool,
+                    &mem_guard,
+                    &metadata,
+                    100,
+                    None,
+                )
+                .await
+            {
+                Ok(_) => panic!("metadata split should fail in one-page meta pool"),
+                Err(err) => err,
+            };
+            assert!(matches!(err, Error::BufferPoolFull));
+            assert_eq!(mem_pool.allocated(), 0);
+        });
+    }
+
+    #[test]
+    fn test_allocate_row_page_at_reclaims_reserved_page_id_on_insert_error() {
+        smol::block_on(async {
+            let meta_pool = owned_index_pool(fixed_pool_bytes(1));
+            let mem_pool = owned_mem_pool(fixed_pool_bytes(1));
+            let meta_guard = (*meta_pool).pool_guard();
+            let mem_guard = (*mem_pool).pool_guard();
+            let metadata = make_test_metadata();
+            let blk_idx = RowPageIndex::new(meta_pool.guard(), &meta_guard, 0)
+                .await
+                .expect("test row-page-index construction should succeed");
+            fill_root_leaf_full(&blk_idx, &meta_guard).await;
+
+            let page_id = test_page_id(0);
+            let err = match blk_idx
+                .allocate_row_page_at(&meta_guard, &*mem_pool, &mem_guard, &metadata, 100, page_id)
+                .await
+            {
+                Ok(_) => panic!("metadata split should fail in one-page meta pool"),
+                Err(err) => err,
+            };
+            assert!(matches!(err, Error::BufferPoolFull));
+            assert_eq!(mem_pool.allocated(), 0);
+
+            let page = mem_pool
+                .allocate_page_at::<RowPage>(&mem_guard, page_id)
+                .await
+                .expect("fixed page id should be released on rollback");
+            mem_pool.deallocate_page(page);
         });
     }
 
@@ -1383,8 +1583,9 @@ mod tests {
             {
                 let metadata = make_test_metadata();
                 let meta_guard = engine.meta_pool.pool_guard();
-                let blk_idx =
-                    RowPageIndex::new(engine.meta_pool.clone_inner(), &meta_guard, 0).await;
+                let blk_idx = RowPageIndex::new(engine.meta_pool.clone_inner(), &meta_guard, 0)
+                    .await
+                    .expect("test row-page-index construction should succeed");
                 let mem_guard = engine.mem_pool.pool_guard();
                 for _ in 0..row_pages {
                     let _ = blk_idx
@@ -1411,7 +1612,9 @@ mod tests {
         smol::block_on(async {
             let pool = owned_index_pool(1024usize * 1024 * 1024);
             let pool_guard = (*pool).pool_guard();
-            let blk_idx = RowPageIndex::new(pool.guard(), &pool_guard, 0).await;
+            let blk_idx = RowPageIndex::new(pool.guard(), &pool_guard, 0)
+                .await
+                .expect("test row-page-index construction should succeed");
 
             let overflow_entries = 3usize;
             let row_pages = NBR_ROW_PAGE_ENTRIES_IN_LEAF + overflow_entries;
@@ -1420,6 +1623,7 @@ mod tests {
                     if let Valid(_) = blk_idx
                         .insert_row_page(&pool_guard, 1, PageID::from(row_page_id))
                         .await
+                        .expect("test row-page insertion should succeed")
                     {
                         break;
                     }
@@ -1472,7 +1676,9 @@ mod tests {
         smol::block_on(async {
             let pool = owned_index_pool(512usize * 1024 * 1024);
             let pool_guard = (*pool).pool_guard();
-            let blk_idx = RowPageIndex::new(pool.guard(), &pool_guard, 0).await;
+            let blk_idx = RowPageIndex::new(pool.guard(), &pool_guard, 0)
+                .await
+                .expect("test row-page-index construction should succeed");
             let row_pages = 5000usize;
             let rows_per_page = 100usize;
             for i in 0..row_pages {
@@ -1480,6 +1686,7 @@ mod tests {
                     if let Valid(_) = blk_idx
                         .insert_row_page(&pool_guard, rows_per_page as u64, PageID::from(i))
                         .await
+                        .expect("test row-page insertion should succeed")
                     {
                         break;
                     }
@@ -1506,7 +1713,9 @@ mod tests {
         smol::block_on(async {
             let pool = owned_index_pool(1024usize * 1024 * 1024);
             let pool_guard = (*pool).pool_guard();
-            let blk_idx = RowPageIndex::new(pool.guard(), &pool_guard, 0).await;
+            let blk_idx = RowPageIndex::new(pool.guard(), &pool_guard, 0)
+                .await
+                .expect("test row-page-index construction should succeed");
             assert_eq!(blk_idx.height(), 0);
 
             for row_page_id in 0..10000 {
@@ -1514,6 +1723,7 @@ mod tests {
                     if let Valid(_) = blk_idx
                         .insert_row_page(&pool_guard, 100, test_page_id(row_page_id))
                         .await
+                        .expect("test row-page insertion should succeed")
                     {
                         break;
                     }
@@ -1536,7 +1746,10 @@ mod tests {
             root.page_mut().header.count = NBR_ENTRIES_IN_BRANCH as u32;
 
             // Assign right-most leaf node.
-            let mut r_g = pool.allocate_page::<RowPageIndexNode>(&pool_guard).await;
+            let mut r_g = pool
+                .allocate_page::<RowPageIndexNode>(&pool_guard)
+                .await
+                .expect("test page allocation should succeed");
             r_g.page_mut().init(0, 50000, 10000, test_page_id(10001));
             r_g.page_mut().header.count = NBR_ROW_PAGE_ENTRIES_IN_LEAF as u32;
             let r_page_id = r_g.page_id();
@@ -1549,6 +1762,7 @@ mod tests {
                 if let Valid(_) = blk_idx
                     .insert_row_page(&pool_guard, 100, test_page_id(20000))
                     .await
+                    .expect("test row-page insertion should succeed")
                 {
                     break;
                 }
@@ -1581,8 +1795,9 @@ mod tests {
             {
                 let metadata = make_test_metadata();
                 let meta_guard = engine.meta_pool.pool_guard();
-                let blk_idx =
-                    RowPageIndex::new(engine.meta_pool.clone_inner(), &meta_guard, 0).await;
+                let blk_idx = RowPageIndex::new(engine.meta_pool.clone_inner(), &meta_guard, 0)
+                    .await
+                    .expect("test row-page-index construction should succeed");
                 let mem_guard = engine.mem_pool.pool_guard();
                 let redo_ctx = RowPageCreateRedoCtx::new(&engine.trx_sys, 104);
                 let page_guard = blk_idx

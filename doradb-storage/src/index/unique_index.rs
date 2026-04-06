@@ -113,6 +113,12 @@ impl<P: BufferPool> GenericUniqueBTreeIndex<P> {
     pub fn new(tree: GenericBTree<P>, encoder: BTreeKeyEncoder) -> Self {
         GenericUniqueBTreeIndex { tree, encoder }
     }
+
+    /// Destroy this unique index and reclaim all backing tree pages.
+    #[inline]
+    pub(crate) async fn destroy(self, pool_guard: &PoolGuard) -> Result<()> {
+        self.tree.destory(pool_guard).await
+    }
 }
 
 impl<P: BufferPool> UniqueIndex for GenericUniqueBTreeIndex<P> {
@@ -488,7 +494,9 @@ mod tests {
             {
                 let pool_guard = (*pool).pool_guard();
                 let index = UniqueBTreeIndex {
-                    tree: BTree::new(pool.guard(), &pool_guard, false, 100).await,
+                    tree: BTree::new(pool.guard(), &pool_guard, false, 100)
+                        .await
+                        .expect("test btree construction should succeed"),
                     encoder: BTreeKeyEncoder::new(vec![ValType {
                         kind: ValKind::I32,
                         nullable: false,
@@ -512,7 +520,9 @@ mod tests {
             {
                 let pool_guard = (*pool).pool_guard();
                 let index = UniqueBTreeIndex {
-                    tree: BTree::new(pool.guard(), &pool_guard, false, 100).await,
+                    tree: BTree::new(pool.guard(), &pool_guard, false, 100)
+                        .await
+                        .expect("test btree construction should succeed"),
                     encoder: BTreeKeyEncoder::new(vec![
                         ValType {
                             kind: ValKind::VarByte,

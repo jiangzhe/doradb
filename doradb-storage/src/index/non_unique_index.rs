@@ -100,6 +100,12 @@ impl<P: BufferPool> GenericNonUniqueBTreeIndex<P> {
     pub fn new(tree: GenericBTree<P>, encoder: BTreeKeyEncoder) -> Self {
         GenericNonUniqueBTreeIndex { tree, encoder }
     }
+
+    /// Destroy this non-unique index and reclaim all backing tree pages.
+    #[inline]
+    pub(crate) async fn destroy(self, pool_guard: &PoolGuard) -> Result<()> {
+        self.tree.destory(pool_guard).await
+    }
 }
 
 impl<P: BufferPool> NonUniqueIndex for GenericNonUniqueBTreeIndex<P> {
@@ -303,7 +309,9 @@ mod tests {
                 let pool_guard = (*pool).pool_guard();
                 // i32 column and row id
                 let index = NonUniqueBTreeIndex {
-                    tree: BTree::new(pool.guard(), &pool_guard, true, 100).await,
+                    tree: BTree::new(pool.guard(), &pool_guard, true, 100)
+                        .await
+                        .expect("test btree construction should succeed"),
                     encoder: BTreeKeyEncoder::new(vec![
                         ValType {
                             kind: ValKind::I32,

@@ -166,6 +166,8 @@ pub enum Error {
     InsufficientMemory(usize),
     #[error("buffer page already allocated")]
     BufferPageAlreadyAllocated,
+    #[error("buffer pool full")]
+    BufferPoolFull,
     #[error("empty free list of buffer pool")]
     EmptyFreeListOfBufferPool,
     #[error("buffer pool size is too small")]

@@ -100,20 +100,20 @@ impl<P: BufferPool> GenericBTree<P> {
         pool_guard: &PoolGuard,
         hints_enabled: bool,
         ts: TrxID,
-    ) -> Self {
-        let mut g = pool.allocate_page::<BTreeNode>(pool_guard).await;
+    ) -> Result<Self> {
+        let mut g = pool.allocate_page::<BTreeNode>(pool_guard).await?;
         let page_id = g.page_id();
         let page = g.page_mut();
         page.init(0, ts, &[], BTreeU64::INVALID_VALUE, &[], hints_enabled);
-        GenericBTree {
+        Ok(GenericBTree {
             root: page_id,
             height: AtomicUsize::new(0),
             pool,
-        }
+        })
     }
 
     #[inline]
-    async fn allocate_node(&self, pool_guard: &PoolGuard) -> PageExclusiveGuard<BTreeNode> {
+    async fn allocate_node(&self, pool_guard: &PoolGuard) -> Result<PageExclusiveGuard<BTreeNode>> {
         self.pool.allocate_page::<BTreeNode>(pool_guard).await
     }
 
@@ -250,7 +250,7 @@ impl<P: BufferPool> GenericBTree<P> {
                 debug_assert!(node.count() > 1);
                 if p_guard.is_none() {
                     // Root is leaf and full, should split.
-                    self.split_root::<V>(pool_guard, node, true, ts).await;
+                    self.split_root::<V>(pool_guard, node, true, ts).await?;
                     continue;
                 }
                 match self
@@ -560,7 +560,7 @@ impl<P: BufferPool> GenericBTree<P> {
                     }
                     // Parent is root and full, just split.
                     self.split_root::<BTreeU64>(pool_guard, p_guard.page_mut(), false, ts)
-                        .await;
+                        .await?;
                     return Ok(BTreeSplit::Ok);
                 }
                 p_guard
@@ -586,7 +586,7 @@ impl<P: BufferPool> GenericBTree<P> {
         };
         // Now parent and child locks are acquired exclusively, and parent has enough
         // space to insert separator key, so to actual split.
-        let r_guard = self.allocate_node(pool_guard).await;
+        let r_guard = self.allocate_node(pool_guard).await?;
         self.split_node::<V>(
             p_guard.page_mut(),
             c_guard.page_mut(),
@@ -636,7 +636,7 @@ impl<P: BufferPool> GenericBTree<P> {
                         }
                         // Parent is root and full, just split.
                         self.split_root::<BTreeU64>(pool_guard, p_guard.page_mut(), false, ts)
-                            .await;
+                            .await?;
                         return Ok(Either::Right(BTreeSplit::Ok));
                     }
                     // Re-lock child in exclusive mode.
@@ -719,14 +719,14 @@ impl<P: BufferPool> GenericBTree<P> {
                             }
                             // split root.
                             self.split_root::<BTreeU64>(pool_guard, p_node, false, ts)
-                                .await;
+                                .await?;
                             if !p_node.can_insert(&sep_key) {
                                 return Ok(BTreeSplit::Inconsistent);
                             }
                         }
                         // now parent and child nodes are exclusively locked and parent has enough
                         // space to insert separator key, so do actual split.
-                        let r_guard = self.allocate_node(pool_guard).await;
+                        let r_guard = self.allocate_node(pool_guard).await?;
                         self.split_node::<BTreeU64>(p_node, c_node, r_guard, sep_idx, &sep_key, ts)
                             .await;
                         Ok(BTreeSplit::Ok)
@@ -744,7 +744,7 @@ impl<P: BufferPool> GenericBTree<P> {
         root: &mut BTreeNode,
         is_leaf: bool,
         ts: TrxID,
-    ) {
+    ) -> Result<()> {
         debug_assert!(root.is_leaf() == is_leaf);
         let ts = root.ts().max(ts);
         let height = root.height() as u16;
@@ -754,13 +754,18 @@ impl<P: BufferPool> GenericBTree<P> {
         let lower_fence_value = root.lower_fence_value();
         // Only truncate separator key if it's leaf.
         let sep_key = root.create_sep_key(sep_idx, is_leaf);
-        // Allocate left node.
-        let mut left_page = self.allocate_node(pool_guard).await;
+        // Allocate both child nodes before mutating any page state.
+        let mut left_page = self.allocate_node(pool_guard).await?;
+        let mut right_page = match self.allocate_node(pool_guard).await {
+            Ok(page) => page,
+            Err(err) => {
+                self.pool.deallocate_page(left_page);
+                return Err(err);
+            }
+        };
         let left_page_id = left_page.page_id();
-        let left_node = left_page.page_mut();
-        // Allocate right node.
-        let mut right_page = self.allocate_node(pool_guard).await;
         let right_page_id = right_page.page_id();
+        let left_node = left_page.page_mut();
         let right_node = right_page.page_mut();
         // Initialize and copy key values to left node.
         left_node.init(
@@ -796,6 +801,7 @@ impl<P: BufferPool> GenericBTree<P> {
         let slot_idx = root.insert(&sep_key, BTreeU64::from(right_page_id));
         debug_assert!(slot_idx == 0);
         self.height.store(root.height(), Ordering::SeqCst);
+        Ok(())
     }
 
     /// Split node.
@@ -1901,36 +1907,53 @@ mod tests {
         pool: QuiescentGuard<FixedBufferPool>,
         pool_guard: &PoolGuard,
     ) -> ExactBoundaryResumeFixture {
-        let tree = BTree::new(pool, pool_guard, false, 200).await;
+        let tree = BTree::new(pool, pool_guard, false, 200)
+            .await
+            .expect("test btree construction should succeed");
 
-        let mut left_leaf_guard = tree.allocate_node(pool_guard).await;
+        let mut left_leaf_guard = tree
+            .allocate_node(pool_guard)
+            .await
+            .expect("test node allocation should succeed");
         let left_leaf_page_id = left_leaf_guard.page_id();
         let left_leaf = left_leaf_guard.page_mut();
         left_leaf.init(0, 200, &[], BTreeU64::INVALID_VALUE, b"ab", false);
         left_leaf.insert(b"aa", BTreeU64::from(1));
         drop(left_leaf_guard);
 
-        let mut first_right_leaf_guard = tree.allocate_node(pool_guard).await;
+        let mut first_right_leaf_guard = tree
+            .allocate_node(pool_guard)
+            .await
+            .expect("test node allocation should succeed");
         let first_right_leaf_page_id = first_right_leaf_guard.page_id();
         let first_right_leaf = first_right_leaf_guard.page_mut();
         first_right_leaf.init(0, 200, b"ab", BTreeU64::INVALID_VALUE, b"ab\0", false);
         first_right_leaf.insert(b"ab", BTreeU64::from(2));
         drop(first_right_leaf_guard);
 
-        let mut second_right_leaf_guard = tree.allocate_node(pool_guard).await;
+        let mut second_right_leaf_guard = tree
+            .allocate_node(pool_guard)
+            .await
+            .expect("test node allocation should succeed");
         let second_right_leaf_page_id = second_right_leaf_guard.page_id();
         let second_right_leaf = second_right_leaf_guard.page_mut();
         second_right_leaf.init(0, 200, b"ab\0", BTreeU64::INVALID_VALUE, &[], false);
         second_right_leaf.insert(b"ab\0", BTreeU64::from(3));
         drop(second_right_leaf_guard);
 
-        let mut left_branch_guard = tree.allocate_node(pool_guard).await;
+        let mut left_branch_guard = tree
+            .allocate_node(pool_guard)
+            .await
+            .expect("test node allocation should succeed");
         let left_branch_page_id = left_branch_guard.page_id();
         let left_branch = left_branch_guard.page_mut();
         left_branch.init(1, 200, &[], BTreeU64::from(left_leaf_page_id), b"ab", false);
         drop(left_branch_guard);
 
-        let mut right_branch_guard = tree.allocate_node(pool_guard).await;
+        let mut right_branch_guard = tree
+            .allocate_node(pool_guard)
+            .await
+            .expect("test node allocation should succeed");
         let right_branch_page_id = right_branch_guard.page_id();
         let right_branch = right_branch_guard.page_mut();
         right_branch.init(1, 200, b"ab", BTreeU64::INVALID_VALUE, &[], false);
@@ -1960,6 +1983,69 @@ mod tests {
             first_right_leaf_page_id,
             second_right_leaf_page_id,
         }
+    }
+
+    #[test]
+    fn test_btree_split_root_releases_left_page_when_right_allocation_fails() {
+        smol::block_on(async {
+            let pool = QuiescentBox::new(
+                FixedBufferPool::with_capacity(
+                    crate::buffer::PoolRole::Index,
+                    2 * (std::mem::size_of::<crate::buffer::frame::BufferFrame>()
+                        + std::mem::size_of::<crate::buffer::page::Page>()),
+                )
+                .unwrap(),
+            );
+            let pool_guard = (*pool).pool_guard();
+            let tree = BTree::new(pool.guard(), &pool_guard, false, 200)
+                .await
+                .expect("test btree construction should succeed");
+            assert_eq!(pool.allocated(), 1);
+
+            {
+                let mut root_guard = tree
+                    .get_node(&pool_guard, tree.root, LatchFallbackMode::Exclusive)
+                    .await
+                    .unwrap()
+                    .lock_exclusive_async()
+                    .await
+                    .unwrap();
+                let root = root_guard.page_mut();
+                root.init(0, 200, &[], BTreeU64::INVALID_VALUE, &[], false);
+                root.insert(b"a", BTreeU64::from(1));
+                root.insert(b"b", BTreeU64::from(2));
+                root.insert(b"c", BTreeU64::from(3));
+
+                let err = tree
+                    .split_root::<BTreeU64>(&pool_guard, root, true, 210)
+                    .await
+                    .expect_err("second split-root allocation should fail");
+                assert!(matches!(err, Error::BufferPoolFull));
+            }
+
+            assert_eq!(pool.allocated(), 1);
+
+            let extra = tree
+                .allocate_node(&pool_guard)
+                .await
+                .expect("left split page should be returned to the pool on failure");
+            pool.deallocate_page(extra);
+
+            let root_guard = tree
+                .get_node(&pool_guard, tree.root, LatchFallbackMode::Shared)
+                .await
+                .unwrap()
+                .lock_shared_async()
+                .await
+                .unwrap();
+            let root = root_guard.page();
+            assert!(root.is_leaf());
+            assert_eq!(root.height(), 0);
+            assert_eq!(root.count(), 3);
+            assert_eq!(root.search_key(b"a"), Ok(0));
+            assert_eq!(root.search_key(b"b"), Ok(1));
+            assert_eq!(root.search_key(b"c"), Ok(2));
+        })
     }
 
     #[test]
@@ -2068,7 +2154,9 @@ mod tests {
             let pool = owned_index_pool(64 * 1024 * 1024);
             let pool_guard = (*pool).pool_guard();
             {
-                let tree = BTree::new(pool.guard(), &pool_guard, false, 200).await;
+                let tree = BTree::new(pool.guard(), &pool_guard, false, 200)
+                    .await
+                    .expect("test btree construction should succeed");
                 // insert 1, 2, 3.
                 let one = BTreeU64::from(1);
                 let three = BTreeU64::from(3);
@@ -2163,7 +2251,9 @@ mod tests {
             let pool = owned_index_pool(3 * 1024 * 1024 * 1024);
             let pool_guard = (*pool).pool_guard();
             {
-                let tree = BTree::new(pool.guard(), &pool_guard, false, 200).await;
+                let tree = BTree::new(pool.guard(), &pool_guard, false, 200)
+                    .await
+                    .expect("test btree construction should succeed");
 
                 // Key length in leaf node is about 1000 bytes.
                 // Key length in branch node is about 8 bytes(with suffix truncation).
@@ -2235,7 +2325,9 @@ mod tests {
             let pool = owned_index_pool(3 * 1024 * 1024 * 1024);
             let pool_guard = (*pool).pool_guard();
             {
-                let tree = BTree::new(pool.guard(), &pool_guard, false, 200).await;
+                let tree = BTree::new(pool.guard(), &pool_guard, false, 200)
+                    .await
+                    .expect("test btree construction should succeed");
 
                 // Key length in leaf node is about 1000 bytes.
                 // Key length in branch node is about 8 bytes(with suffix truncation).
@@ -2307,7 +2399,9 @@ mod tests {
             let pool = owned_index_pool(3 * 1024 * 1024 * 1024);
             let pool_guard = (*pool).pool_guard();
             {
-                let tree = BTree::new(pool.guard(), &pool_guard, false, 200).await;
+                let tree = BTree::new(pool.guard(), &pool_guard, false, 200)
+                    .await
+                    .expect("test btree construction should succeed");
 
                 // Key length in leaf node is about 1000 bytes.
                 // Key length in branch node is about 8 bytes(with suffix truncation).
@@ -2393,7 +2487,9 @@ mod tests {
             let pool = owned_index_pool(100 * 1024 * 1024);
             let pool_guard = (*pool).pool_guard();
             {
-                let tree = BTree::new(pool.guard(), &pool_guard, false, 200).await;
+                let tree = BTree::new(pool.guard(), &pool_guard, false, 200)
+                    .await
+                    .expect("test btree construction should succeed");
                 let mut map = BTreeMap::new();
 
                 // number less than 10 million
@@ -2446,7 +2542,9 @@ mod tests {
             let pool = owned_index_pool(100 * 1024 * 1024);
             let pool_guard = (*pool).pool_guard();
             {
-                let tree = BTree::new(pool.guard(), &pool_guard, true, 200).await;
+                let tree = BTree::new(pool.guard(), &pool_guard, true, 200)
+                    .await
+                    .expect("test btree construction should succeed");
                 let mut map = BTreeMap::new();
 
                 // number less than 10 million
@@ -2499,7 +2597,9 @@ mod tests {
             let pool = owned_index_pool(20 * 1024 * 1024);
             let pool_guard = (*pool).pool_guard();
             {
-                let tree = BTree::new(pool.guard(), &pool_guard, false, 1).await;
+                let tree = BTree::new(pool.guard(), &pool_guard, false, 1)
+                    .await
+                    .expect("test btree construction should succeed");
 
                 let start = Instant::now();
                 // insert with random distribution.
@@ -2563,7 +2663,11 @@ mod tests {
             let pool = owned_index_pool(3 * 1024 * 1024 * 1024);
             let pool_guard = (*pool).pool_guard();
             {
-                let tree = Arc::new(BTree::new(pool.guard(), &pool_guard, false, 200).await);
+                let tree = Arc::new(
+                    BTree::new(pool.guard(), &pool_guard, false, 200)
+                        .await
+                        .expect("test btree construction should succeed"),
+                );
 
                 // Key length in leaf node is about 1000 bytes.
                 // Key length in branch node is about 8 bytes(with suffix truncation).
@@ -2647,7 +2751,11 @@ mod tests {
             let pool = owned_index_pool(3 * 1024 * 1024 * 1024);
             let pool_guard = (*pool).pool_guard();
             {
-                let tree = Arc::new(BTree::new(pool.guard(), &pool_guard, false, 200).await);
+                let tree = Arc::new(
+                    BTree::new(pool.guard(), &pool_guard, false, 200)
+                        .await
+                        .expect("test btree construction should succeed"),
+                );
 
                 // Key length in leaf node is about 1000 bytes.
                 // Key length in branch node is about 8 bytes(with suffix truncation).
@@ -2697,7 +2805,9 @@ mod tests {
             let pool = owned_index_pool(100 * 1024 * 1024);
             let pool_guard = (*pool).pool_guard();
             {
-                let tree = BTree::new(pool.guard(), &pool_guard, false, 200).await;
+                let tree = BTree::new(pool.guard(), &pool_guard, false, 200)
+                    .await
+                    .expect("test btree construction should succeed");
                 // number less than 10 million
                 let between = Uniform::new(0u64, 10_000_000).unwrap();
                 let mut rng = rand::rng();
@@ -2747,7 +2857,9 @@ mod tests {
             assert!(pool.allocated() == 0);
             // height=0
             {
-                let tree = BTree::new(pool.guard(), &pool_guard, false, 200).await;
+                let tree = BTree::new(pool.guard(), &pool_guard, false, 200)
+                    .await
+                    .expect("test btree construction should succeed");
                 let mut key = vec![0u8; 1000];
                 for i in 0..H0_ROWS {
                     key[..8].copy_from_slice(&i.to_be_bytes());
@@ -2765,7 +2877,9 @@ mod tests {
             }
             // height=1
             {
-                let tree = BTree::new(pool.guard(), &pool_guard, false, 200).await;
+                let tree = BTree::new(pool.guard(), &pool_guard, false, 200)
+                    .await
+                    .expect("test btree construction should succeed");
                 let mut key = vec![0u8; 1000];
                 for i in 0..H1_ROWS {
                     key[..8].copy_from_slice(&i.to_be_bytes());
@@ -2783,7 +2897,9 @@ mod tests {
             }
             // height=2
             {
-                let tree = BTree::new(pool.guard(), &pool_guard, false, 200).await;
+                let tree = BTree::new(pool.guard(), &pool_guard, false, 200)
+                    .await
+                    .expect("test btree construction should succeed");
                 let mut key = vec![0u8; 1000];
                 for i in 0..H2_ROWS {
                     key[..8].copy_from_slice(&i.to_be_bytes());
