@@ -11,7 +11,9 @@ use crate::conf::FileSystemConfig;
 use crate::conf::path::path_to_utf8;
 use crate::error::{Error, FileKind, Result};
 use crate::file::cow_file::COW_FILE_PAGE_SIZE;
-use crate::file::multi_table_file::{MultiTableActiveRoot, MultiTableFile, MutableMultiTableFile};
+use crate::file::multi_table_file::{
+    MultiTableActiveRoot, MultiTableFile, MultiTableFileOpenOutcome, MutableMultiTableFile,
+};
 use crate::file::table_file::{ActiveRoot, TABLE_FILE_INITIAL_SIZE};
 use crate::file::table_file::{MutableTableFile, TableFile};
 use crate::file::{SparseFile, TableFsStateMachine, TableFsSubmission, WriteSubmission};
@@ -1526,27 +1528,37 @@ impl FileSystem {
         global_disk_pool: QuiescentGuard<GlobalReadonlyBufferPool>,
     ) -> Result<(Arc<MultiTableFile>, ReadonlyBufferPool)> {
         let file_path = self.catalog_mtb_file_path();
-        let file_exists = Path::new(&file_path).exists();
-        let mtb = MultiTableFile::open_or_create(&file_path).await?;
-        let disk_pool = ReadonlyBufferPool::new(
-            FileKind::CatalogMultiTableFile,
-            Arc::clone(&mtb),
-            global_disk_pool,
-        );
-        if file_exists {
-            let active_root = mtb.load_active_root_from_pool(&disk_pool).await?;
-            let old_root = mtb.swap_active_root(active_root);
-            debug_assert!(old_root.is_none());
-        } else {
-            let mutable = MutableMultiTableFile::new(
-                Arc::clone(&mtb),
-                MultiTableActiveRoot::new(),
-                self.background_writes(),
-            );
-            let (_, old_root) = mutable.commit().await?;
-            debug_assert!(old_root.is_none());
+        match MultiTableFile::open_or_create(&file_path).await? {
+            MultiTableFileOpenOutcome::Opened(mtb) => {
+                let disk_pool = ReadonlyBufferPool::new(
+                    FileKind::CatalogMultiTableFile,
+                    Arc::clone(&mtb),
+                    global_disk_pool,
+                );
+                let active_root = mtb.load_active_root_from_pool(&disk_pool).await?;
+                let old_root = mtb.swap_active_root(active_root);
+                debug_assert!(old_root.is_none());
+                Ok((mtb, disk_pool))
+            }
+            MultiTableFileOpenOutcome::Created(mtb) => {
+                let mutable = MutableMultiTableFile::new(
+                    Arc::clone(&mtb),
+                    MultiTableActiveRoot::new(),
+                    self.background_writes(),
+                );
+                if let Err(err) = mutable.commit().await {
+                    drop(mtb);
+                    let _ = std::fs::remove_file(&file_path);
+                    return Err(err);
+                }
+                let disk_pool = ReadonlyBufferPool::new(
+                    FileKind::CatalogMultiTableFile,
+                    Arc::clone(&mtb),
+                    global_disk_pool,
+                );
+                Ok((mtb, disk_pool))
+            }
         }
-        Ok((mtb, disk_pool))
     }
 }
 
@@ -1909,6 +1921,26 @@ pub(crate) mod tests {
         }
     }
 
+    struct FailingFirstWriteHook {
+        failed: AtomicBool,
+    }
+
+    impl FailingFirstWriteHook {
+        fn new() -> Self {
+            Self {
+                failed: AtomicBool::new(false),
+            }
+        }
+    }
+
+    impl StorageBackendTestHook for FailingFirstWriteHook {
+        fn on_complete(&self, op: StorageBackendOp, res: &mut std::io::Result<usize>) {
+            if op.kind() == IOKind::Write && !self.failed.swap(true, Ordering::SeqCst) {
+                *res = Err(std::io::Error::from_raw_os_error(libc::EIO));
+            }
+        }
+    }
+
     async fn wait_until(mut predicate: impl FnMut() -> bool) {
         for _ in 0..TEST_WAIT_RETRIES {
             if predicate() {
@@ -1925,6 +1957,42 @@ pub(crate) mod tests {
 
         fs.shutdown();
         fs.shutdown();
+    }
+
+    #[test]
+    fn test_open_or_create_multi_table_file_removes_new_file_after_initial_commit_failure() {
+        smol::block_on(async {
+            let (_temp_dir, fs) = build_test_fs();
+            let path = fs.catalog_mtb_file_path();
+            let global = crate::buffer::global_readonly_pool_scope(64 * 1024 * 1024);
+
+            {
+                let _hook =
+                    install_storage_backend_test_hook(Arc::new(FailingFirstWriteHook::new()));
+                let err = match fs.open_or_create_multi_table_file(global.guard()).await {
+                    Ok(_) => panic!("expected initial catalog.mtb publish failure"),
+                    Err(err) => err,
+                };
+                assert!(err.is_storage_io_failure(), "unexpected error: {err:?}");
+            }
+
+            assert!(
+                !std::path::Path::new(&path).exists(),
+                "freshly created catalog.mtb should be removed after failed initial publish"
+            );
+
+            let (mtb, _pool) = fs
+                .open_or_create_multi_table_file(global.guard())
+                .await
+                .unwrap();
+            let snapshot = mtb.load_snapshot().unwrap();
+            assert_eq!(
+                snapshot.catalog_replay_start_ts,
+                crate::trx::MIN_SNAPSHOT_TS
+            );
+            assert_eq!(snapshot.meta.next_user_obj_id, USER_OBJ_ID_START);
+            assert!(mtb.active_root().meta_block_id > BlockID::new(0));
+        });
     }
 
     #[test]

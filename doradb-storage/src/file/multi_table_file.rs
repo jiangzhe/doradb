@@ -1,7 +1,7 @@
 use crate::bitmap::AllocMap;
 use crate::buffer::{ReadonlyBackingFile, ReadonlyBufferPool};
 use crate::catalog::{ObjID, TableID, USER_OBJ_ID_START};
-use crate::error::{BlockCorruptionCause, BlockKind, Error, FileKind, Result};
+use crate::error::{BlockCorruptionCause, BlockKind, Error, FileKind, Result, StorageOp};
 use crate::file::block_integrity::{
     BLOCK_INTEGRITY_HEADER_SIZE, BlockIntegritySpec, max_payload_len, validate_block,
     write_block_checksum, write_block_header,
@@ -23,9 +23,9 @@ use crate::io::{DirectBuf, IOBuf, IOClient};
 use crate::row::RowID;
 use crate::serde::{Deser, Ser};
 use crate::trx::{MIN_SNAPSHOT_TS, TrxID};
+use std::io::ErrorKind;
 use std::num::NonZeroU64;
 use std::ops::Deref;
-use std::path::Path;
 use std::sync::Arc;
 
 pub use crate::file::CATALOG_MTB_FILE_ID;
@@ -237,25 +237,41 @@ pub struct MultiTableFile {
     file: CowFile<MultiTableMetaBlock>,
 }
 
+pub(super) enum MultiTableFileOpenOutcome {
+    Created(Arc<MultiTableFile>),
+    Opened(Arc<MultiTableFile>),
+}
+
 impl MultiTableFile {
     /// Open existing file or create a new one, then load/publish initial active root.
     #[inline]
-    pub(super) async fn open_or_create(file_path: impl AsRef<str>) -> Result<Arc<Self>> {
+    pub(super) async fn open_or_create(
+        file_path: impl AsRef<str>,
+    ) -> Result<MultiTableFileOpenOutcome> {
         let file_path = file_path.as_ref();
-        let file_exists = Path::new(file_path).exists();
-        let file = if file_exists {
-            CowFile::open(file_path, CATALOG_MTB_FILE_ID, multi_table_codec())?
-        } else {
-            CowFile::create(
-                file_path,
-                MULTI_TABLE_FILE_INITIAL_SIZE,
-                CATALOG_MTB_FILE_ID,
-                multi_table_codec(),
-                false,
-            )?
+        let file = match CowFile::create(
+            file_path,
+            MULTI_TABLE_FILE_INITIAL_SIZE,
+            CATALOG_MTB_FILE_ID,
+            multi_table_codec(),
+            false,
+        ) {
+            Ok(file) => {
+                return Ok(MultiTableFileOpenOutcome::Created(Arc::new(
+                    MultiTableFile { file },
+                )));
+            }
+            Err(Error::StorageIOError {
+                op: StorageOp::FileCreate,
+                kind: ErrorKind::AlreadyExists,
+                ..
+            }) => CowFile::open(file_path, CATALOG_MTB_FILE_ID, multi_table_codec())?,
+            Err(err) => return Err(err),
         };
 
-        Ok(Arc::new(MultiTableFile { file }))
+        Ok(MultiTableFileOpenOutcome::Opened(Arc::new(
+            MultiTableFile { file },
+        )))
     }
 
     /// Load the active root after validating the selected `catalog.mtb` meta block.
