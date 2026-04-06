@@ -134,12 +134,13 @@ impl BufferPool for FixedBufferPool {
 
     // allocate a new page with exclusive lock.
     #[inline]
-    async fn allocate_page<T: BufferPage>(&self, guard: &PoolGuard) -> PageExclusiveGuard<T> {
+    async fn allocate_page<T: BufferPage>(
+        &self,
+        guard: &PoolGuard,
+    ) -> Result<PageExclusiveGuard<T>> {
         match self.alloc_map.try_allocate() {
-            Some(page_id) => self.arena.init_page(guard, PageID::from(page_id)),
-            None => {
-                panic!("buffer pool full");
-            }
+            Some(page_id) => Ok(self.arena.init_page(guard, PageID::from(page_id))),
+            None => Err(Error::BufferPoolFull),
         }
     }
 
@@ -268,14 +269,23 @@ mod tests {
             let pool = test_pool();
             let pool_guard = FixedBufferPool::pool_guard(&pool);
             {
-                let g = pool.allocate_page::<RowPageIndexNode>(&pool_guard).await;
+                let g = pool
+                    .allocate_page::<RowPageIndexNode>(&pool_guard)
+                    .await
+                    .expect("test page allocation should succeed");
                 assert_eq!(g.page_id(), 0);
             }
             {
-                let g = pool.allocate_page::<RowPageIndexNode>(&pool_guard).await;
+                let g = pool
+                    .allocate_page::<RowPageIndexNode>(&pool_guard)
+                    .await
+                    .expect("test page allocation should succeed");
                 assert_eq!(g.page_id(), 1);
                 pool.deallocate_page(g);
-                let g = pool.allocate_page::<RowPageIndexNode>(&pool_guard).await;
+                let g = pool
+                    .allocate_page::<RowPageIndexNode>(&pool_guard)
+                    .await
+                    .expect("test page allocation should succeed");
                 assert_eq!(g.page_id(), 1);
             }
             {
@@ -291,14 +301,20 @@ mod tests {
                 assert_eq!(g.page_id(), 0);
             }
             {
-                let g = pool.allocate_page::<RowPageIndexNode>(&pool_guard).await;
+                let g = pool
+                    .allocate_page::<RowPageIndexNode>(&pool_guard)
+                    .await
+                    .expect("test page allocation should succeed");
                 let page_id = g.page_id();
                 drop(g);
                 let g = pool.get_page_spin::<RowPageIndexNode>(&pool_guard, page_id);
                 assert!(g.page_id() == page_id);
                 drop(g);
 
-                let p = pool.allocate_page::<RowPageIndexNode>(&pool_guard).await;
+                let p = pool
+                    .allocate_page::<RowPageIndexNode>(&pool_guard)
+                    .await
+                    .expect("test page allocation should succeed");
                 let p = p.downgrade().facade();
                 let c = pool
                     .get_child_page::<RowPageIndexNode>(
@@ -312,13 +328,19 @@ mod tests {
                 drop(c);
             }
             {
-                let g = pool.allocate_page::<RowPageIndexNode>(&pool_guard).await;
+                let g = pool
+                    .allocate_page::<RowPageIndexNode>(&pool_guard)
+                    .await
+                    .expect("test page allocation should succeed");
                 let page_id = g.page_id();
                 let stale_versioned = g.versioned_page_id();
                 let first_generation = stale_versioned.generation;
                 pool.deallocate_page(g);
 
-                let g = pool.allocate_page::<RowPageIndexNode>(&pool_guard).await;
+                let g = pool
+                    .allocate_page::<RowPageIndexNode>(&pool_guard)
+                    .await
+                    .expect("test page allocation should succeed");
                 assert_eq!(g.page_id(), page_id);
                 assert_eq!(g.bf().generation(), first_generation + 2);
                 let current_versioned = g.versioned_page_id();
@@ -345,7 +367,10 @@ mod tests {
                 assert!(g.is_none());
             }
             {
-                let g = pool.allocate_page::<RowPageIndexNode>(&pool_guard).await;
+                let g = pool
+                    .allocate_page::<RowPageIndexNode>(&pool_guard)
+                    .await
+                    .expect("test page allocation should succeed");
                 let page_id = g.page_id();
                 let versioned = g.versioned_page_id();
                 drop(g);
@@ -372,7 +397,10 @@ mod tests {
                     .await
                     .unwrap();
                 pool.deallocate_page(g);
-                let g = pool.allocate_page::<RowPageIndexNode>(&pool_guard).await;
+                let g = pool
+                    .allocate_page::<RowPageIndexNode>(&pool_guard)
+                    .await
+                    .expect("test page allocation should succeed");
                 assert_eq!(g.page_id(), page_id);
                 drop(g);
 
@@ -386,7 +414,10 @@ mod tests {
         smol::block_on(async {
             let pool = test_pool();
             let pool_guard = FixedBufferPool::pool_guard(&pool);
-            let page = pool.allocate_page::<RowPageIndexNode>(&pool_guard).await;
+            let page = pool
+                .allocate_page::<RowPageIndexNode>(&pool_guard)
+                .await
+                .expect("test page allocation should succeed");
             let page_id = page.page_id();
             drop(page);
 
@@ -411,7 +442,10 @@ mod tests {
         smol::block_on(async {
             let pool = test_pool();
             let pool_guard = FixedBufferPool::pool_guard(&pool);
-            let g = pool.allocate_page::<RowPageIndexNode>(&pool_guard).await;
+            let g = pool
+                .allocate_page::<RowPageIndexNode>(&pool_guard)
+                .await
+                .expect("test page allocation should succeed");
             let page_id = g.page_id();
             drop(g);
 
@@ -465,7 +499,10 @@ mod tests {
                 .await
                 .unwrap();
             pool.deallocate_page(g);
-            let g = pool.allocate_page::<RowPageIndexNode>(&pool_guard).await;
+            let g = pool
+                .allocate_page::<RowPageIndexNode>(&pool_guard)
+                .await
+                .expect("test page allocation should succeed");
             assert_eq!(g.page_id(), page_id);
             drop(g);
 
@@ -478,7 +515,10 @@ mod tests {
         smol::block_on(async {
             let pool = test_pool();
             let pool_guard = FixedBufferPool::pool_guard(&pool);
-            let g = pool.allocate_page::<RowPageIndexNode>(&pool_guard).await;
+            let g = pool
+                .allocate_page::<RowPageIndexNode>(&pool_guard)
+                .await
+                .expect("test page allocation should succeed");
             let page_id = g.page_id();
             drop(g);
 
@@ -536,7 +576,10 @@ mod tests {
                 .await
                 .unwrap();
             pool.deallocate_page(g);
-            let g = pool.allocate_page::<RowPageIndexNode>(&pool_guard).await;
+            let g = pool
+                .allocate_page::<RowPageIndexNode>(&pool_guard)
+                .await
+                .expect("test page allocation should succeed");
             assert_eq!(g.page_id(), page_id);
             drop(g);
 
@@ -550,7 +593,10 @@ mod tests {
         smol::block_on(async {
             let pool = test_pool();
             let pool_guard = FixedBufferPool::pool_guard(&pool);
-            let g = pool.allocate_page::<RowPageIndexNode>(&pool_guard).await;
+            let g = pool
+                .allocate_page::<RowPageIndexNode>(&pool_guard)
+                .await
+                .expect("test page allocation should succeed");
             let page_id = g.page_id();
             drop(g);
 
@@ -573,7 +619,10 @@ mod tests {
         smol::block_on(async {
             let pool = test_pool();
             let pool_guard = FixedBufferPool::pool_guard(&pool);
-            let g = pool.allocate_page::<RowPageIndexNode>(&pool_guard).await;
+            let g = pool
+                .allocate_page::<RowPageIndexNode>(&pool_guard)
+                .await
+                .expect("test page allocation should succeed");
             let page_id = g.page_id();
             drop(g);
 
@@ -598,7 +647,9 @@ mod tests {
             );
             let guard = {
                 let pool_guard = FixedBufferPool::pool_guard(&pool);
-                pool.allocate_page::<RowPageIndexNode>(&pool_guard).await
+                pool.allocate_page::<RowPageIndexNode>(&pool_guard)
+                    .await
+                    .expect("test page allocation should succeed")
             };
             let dropped = Arc::new(AtomicBool::new(false));
             let dropped_flag = Arc::clone(&dropped);
@@ -627,7 +678,10 @@ mod tests {
             let pool1_guard = FixedBufferPool::pool_guard(&pool1);
             let pool2_guard = FixedBufferPool::pool_guard(&pool2);
 
-            let page = pool1.allocate_page::<RowPageIndexNode>(&pool1_guard).await;
+            let page = pool1
+                .allocate_page::<RowPageIndexNode>(&pool1_guard)
+                .await
+                .expect("test page allocation should succeed");
             let page_id = page.page_id();
             drop(page);
 

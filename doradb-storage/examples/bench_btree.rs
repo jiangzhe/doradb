@@ -36,7 +36,9 @@ async fn single_thread_bench_btree(args: &Args) {
         QuiescentBox::new(FixedBufferPool::with_capacity(PoolRole::Index, args.mem_size).unwrap());
     {
         let pool_guard = (*pool).pool_guard();
-        let tree = BTree::new(pool.guard(), &pool_guard, args.hints_enabled, 1).await;
+        let tree = BTree::new(pool.guard(), &pool_guard, args.hints_enabled, 1)
+            .await
+            .unwrap();
 
         let start = Instant::now();
         match &args.mode[..] {

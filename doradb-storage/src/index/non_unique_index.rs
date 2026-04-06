@@ -303,7 +303,9 @@ mod tests {
                 let pool_guard = (*pool).pool_guard();
                 // i32 column and row id
                 let index = NonUniqueBTreeIndex {
-                    tree: BTree::new(pool.guard(), &pool_guard, true, 100).await,
+                    tree: BTree::new(pool.guard(), &pool_guard, true, 100)
+                        .await
+                        .expect("test btree construction should succeed"),
                     encoder: BTreeKeyEncoder::new(vec![
                         ValType {
                             kind: ValKind::I32,

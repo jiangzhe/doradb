@@ -41,15 +41,15 @@ impl<P: BufferPool> GenericBlockIndex<P> {
         meta_pool_guard: &PoolGuard,
         pivot_row_id: RowID,
         column_root_block_id: BlockID,
-    ) -> Self {
-        let row = GenericRowPageIndex::new(pool, meta_pool_guard, pivot_row_id).await;
+    ) -> Result<Self> {
+        let row = GenericRowPageIndex::new(pool, meta_pool_guard, pivot_row_id).await?;
         let root = BlockIndexRoot::new(pivot_row_id, column_root_block_id);
-        GenericBlockIndex { root, row }
+        Ok(GenericBlockIndex { root, row })
     }
 
     /// Creates block index for catalog-table runtime without table-file backing.
     #[inline]
-    pub async fn new_catalog(pool: QuiescentGuard<P>, meta_pool_guard: &PoolGuard) -> Self {
+    pub async fn new_catalog(pool: QuiescentGuard<P>, meta_pool_guard: &PoolGuard) -> Result<Self> {
         Self::new(pool, meta_pool_guard, 0, SUPER_BLOCK_ID).await
     }
 
@@ -140,7 +140,7 @@ impl<P: BufferPool> GenericBlockIndex<P> {
         mem_pool_guard: &PoolGuard,
         metadata: &Arc<TableMetadata>,
         count: usize,
-    ) -> PageExclusiveGuard<RowPage> {
+    ) -> Result<PageExclusiveGuard<RowPage>> {
         self.get_insert_page_exclusive_with_redo(
             meta_pool_guard,
             mem_pool,
@@ -161,7 +161,7 @@ impl<P: BufferPool> GenericBlockIndex<P> {
         metadata: &Arc<TableMetadata>,
         count: usize,
         redo_ctx: Option<RowPageCreateRedoCtx<'_>>,
-    ) -> PageExclusiveGuard<RowPage> {
+    ) -> Result<PageExclusiveGuard<RowPage>> {
         self.row
             .get_insert_page_exclusive_with_redo(
                 meta_pool_guard,
@@ -186,7 +186,7 @@ impl<P: BufferPool> GenericBlockIndex<P> {
         metadata: &Arc<TableMetadata>,
         count: usize,
         page_id: PageID,
-    ) -> PageExclusiveGuard<RowPage> {
+    ) -> Result<PageExclusiveGuard<RowPage>> {
         self.row
             .allocate_row_page_at(
                 meta_pool_guard,
@@ -378,7 +378,7 @@ mod tests {
         fn allocate_page<T: BufferPage>(
             &self,
             guard: &PoolGuard,
-        ) -> impl Future<Output = PageExclusiveGuard<T>> + Send {
+        ) -> impl Future<Output = Result<PageExclusiveGuard<T>>> + Send {
             self.inner.allocate_page(guard)
         }
 
@@ -448,7 +448,8 @@ mod tests {
             &meta_guard,
             10,
             test_block_id(77),
-        ));
+        ))
+        .expect("test block-index construction should succeed");
 
         // Row id 9 is below the pivot, so lookup goes straight to the column path.
         // Without column storage this must surface as an error, not as "not found".
@@ -478,7 +479,8 @@ mod tests {
             &meta_guard,
             10,
             test_block_id(77),
-        ));
+        ))
+        .expect("test block-index construction should succeed");
         pool.set_stall_page_id(blk_idx.row.root_page_id());
 
         std::thread::scope(|s| {

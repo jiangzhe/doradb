@@ -122,7 +122,7 @@ pub(crate) async fn build_secondary_indexes<I: BufferPool + 'static>(
     index_pool_guard: &PoolGuard,
     metadata: &TableMetadata,
     index_ts: TrxID,
-) -> Box<[GenericSecondaryIndex<I>]> {
+) -> Result<Box<[GenericSecondaryIndex<I>]>> {
     let mut sec_idx = Vec::with_capacity(metadata.index_specs.len());
     for (index_no, index_spec) in metadata.index_specs.iter().enumerate() {
         let ty_infer = |col_no: usize| metadata.col_type(col_no);
@@ -134,10 +134,10 @@ pub(crate) async fn build_secondary_indexes<I: BufferPool + 'static>(
             ty_infer,
             index_ts,
         )
-        .await;
+        .await?;
         sec_idx.push(si);
     }
-    sec_idx.into_boxed_slice()
+    Ok(sec_idx.into_boxed_slice())
 }
 
 impl<D: BufferPool, I: BufferPool> GenericMemTable<D, I> {
@@ -153,10 +153,10 @@ impl<D: BufferPool, I: BufferPool> GenericMemTable<D, I> {
         metadata: Arc<TableMetadata>,
         blk_idx: BlockIndex,
         index_ts: TrxID,
-    ) -> Self {
+    ) -> Result<Self> {
         let sec_idx =
-            build_secondary_indexes(index_pool, index_pool_guard, &metadata, index_ts).await;
-        GenericMemTable {
+            build_secondary_indexes(index_pool, index_pool_guard, &metadata, index_ts).await?;
+        Ok(GenericMemTable {
             table_id,
             metadata,
             mem_pool,
@@ -164,7 +164,7 @@ impl<D: BufferPool, I: BufferPool> GenericMemTable<D, I> {
             index_pool_role,
             blk_idx,
             sec_idx,
-        }
+        })
     }
 
     /// Returns the logical table id of this runtime.
@@ -322,7 +322,7 @@ impl<D: BufferPool, I: BufferPool> GenericMemTable<D, I> {
         guards: &PoolGuards,
         count: usize,
         redo_ctx: Option<RowPageCreateRedoCtx<'_>>,
-    ) -> PageExclusiveGuard<RowPage> {
+    ) -> Result<PageExclusiveGuard<RowPage>> {
         let meta_pool_guard = guards.meta_guard();
         let row_pool_guard = self.row_pool_guard(guards);
         self.blk_idx
@@ -343,7 +343,7 @@ impl<D: BufferPool, I: BufferPool> GenericMemTable<D, I> {
         guards: &PoolGuards,
         count: usize,
         page_id: PageID,
-    ) -> PageExclusiveGuard<RowPage> {
+    ) -> Result<PageExclusiveGuard<RowPage>> {
         let meta_pool_guard = guards.meta_guard();
         let row_pool_guard = self.row_pool_guard(guards);
         self.blk_idx
@@ -455,7 +455,7 @@ impl Table {
         blk_idx: BlockIndex,
         file: Arc<TableFile>,
         disk_pool: ReadonlyBufferPool,
-    ) -> Self {
+    ) -> Result<Self> {
         let active_root = file.active_root();
         let metadata = Arc::clone(&active_root.metadata);
         let mem = GenericMemTable::new(
@@ -469,9 +469,9 @@ impl Table {
             blk_idx,
             active_root.trx_id,
         )
-        .await;
+        .await?;
         let storage = ColumnStorage::new(file, disk_pool);
-        Table { mem, storage }
+        Ok(Table { mem, storage })
     }
 
     /// Build a lightweight operation accessor over this table runtime.

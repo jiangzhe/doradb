@@ -110,6 +110,7 @@ impl EvictableBufferPool {
         self.stats.record_cache_miss();
         enum DispatchAction {
             RetryYield,
+            Shutdown,
             Wait(Arc<PageIOCompletion>),
             WaitForLoad(EventListener),
             SendRead {
@@ -131,7 +132,12 @@ impl EvictableBufferPool {
                             // Reserve one in-memory slot for this load.
                             if !self.in_mem.try_inc() {
                                 let listener = self.in_mem.load_ev.listen();
-                                if !self.in_mem.try_inc() {
+                                if self.shutdown_flag.load(Ordering::Acquire) {
+                                    // There is no useful reload cleanup once shutdown starts.
+                                    // Just stop the wait path and surface the terminal error.
+                                    drop(page_guard);
+                                    DispatchAction::Shutdown
+                                } else if !self.in_mem.try_inc() {
                                     self.in_mem.record_alloc_failure();
                                     // Still no budget. Ask evictor to work and wait for progress.
                                     self.in_mem.notify_evictor();
@@ -196,11 +202,18 @@ impl EvictableBufferPool {
             DispatchAction::RetryYield => {
                 smol::future::yield_now().await;
             }
+            DispatchAction::Shutdown => {
+                return Err(Error::StorageEngineShutdown);
+            }
             DispatchAction::Wait(completion) => {
                 completion.wait_result().await?;
             }
             DispatchAction::WaitForLoad(listener) => {
                 listener.await;
+                // Wakeups can come from shutdown as well as real load progress.
+                if self.shutdown_flag.load(Ordering::Acquire) {
+                    return Err(Error::StorageEngineShutdown);
+                }
                 self.in_mem.load_ev.notify(1);
             }
             DispatchAction::SendRead { req, completion } => {
@@ -233,6 +246,10 @@ impl EvictableBufferPool {
     #[inline]
     pub(super) fn signal_shutdown(&self) {
         self.shutdown_flag.store(true, Ordering::SeqCst);
+        // Shutdown is terminal, so wake all waiters instead of relying on further
+        // eviction or deallocation progress to unblock them.
+        self.alloc_ev.notify(usize::MAX);
+        self.in_mem.load_ev.notify(usize::MAX);
         self.in_mem.notify_evictor();
     }
 
@@ -256,23 +273,36 @@ impl EvictableBufferPool {
     /// If this function returns true, in-mem page counter is incremented.
     /// Caller should handle the failure of add a page into memory and decrease this number.
     #[inline]
-    async fn reserve_page(&self) {
+    async fn reserve_page(&self) -> Result<()> {
+        if self.shutdown_flag.load(Ordering::Acquire) {
+            return Err(Error::StorageEngineShutdown);
+        }
         if self.in_mem.try_inc() {
+            // Once reservation succeeds, shutdown does not try to roll it back.
+            // The only hard requirement is that blocked waiters can exit.
             self.in_mem.record_alloc_success();
-            return;
+            return Ok(());
         }
         // Slow path. Wait for other to release memory.
         loop {
             listener!(self.in_mem.load_ev => listener);
+            // Check after listener registration so shutdown cannot strand this waiter.
+            if self.shutdown_flag.load(Ordering::Acquire) {
+                return Err(Error::StorageEngineShutdown);
+            }
             if self.in_mem.try_inc() {
                 self.in_mem.record_alloc_success();
                 self.in_mem.load_ev.notify(1);
-                return;
+                return Ok(());
             }
             self.in_mem.record_alloc_failure();
             // Notify evictor thread to work.
             self.in_mem.notify_evictor();
             listener.await;
+            // Wakeups can come from shutdown as well as real memory progress.
+            if self.shutdown_flag.load(Ordering::Acquire) {
+                return Err(Error::StorageEngineShutdown);
+            }
         }
     }
 }
@@ -294,30 +324,42 @@ impl BufferPool for EvictableBufferPool {
     }
 
     #[inline]
-    async fn allocate_page<T: BufferPage>(&self, guard: &PoolGuard) -> PageExclusiveGuard<T> {
+    async fn allocate_page<T: BufferPage>(
+        &self,
+        guard: &PoolGuard,
+    ) -> Result<PageExclusiveGuard<T>> {
         loop {
-            self.reserve_page().await;
+            self.reserve_page().await?;
 
             // Now we have memory budget to allocate new page.
             match self.alloc_map.try_allocate() {
                 Some(page_id) => {
                     let page_id = PageID::from(page_id);
                     self.in_mem.pin(page_id);
-                    return self.arena.init_page(guard, page_id);
+                    return Ok(self.arena.init_page(guard, page_id));
                 }
                 None => {
                     listener!(self.alloc_ev => listener);
+                    // Check after listener registration so shutdown terminates the wait path
+                    // directly instead of waiting for a page id to become available.
+                    if self.shutdown_flag.load(Ordering::Acquire) {
+                        return Err(Error::StorageEngineShutdown);
+                    }
                     // re-check
                     if let Some(page_id) = self.alloc_map.try_allocate() {
                         let page_id = PageID::from(page_id);
                         self.in_mem.pin(page_id);
-                        return self.arena.init_page(guard, page_id);
+                        return Ok(self.arena.init_page(guard, page_id));
                     }
 
                     // Here we cannot find a free page to load, we should cancel reservation of a page
                     // and retry.
                     self.in_mem.dec();
                     listener.await;
+                    // Wakeups can come from shutdown as well as page deallocation.
+                    if self.shutdown_flag.load(Ordering::Acquire) {
+                        return Err(Error::StorageEngineShutdown);
+                    }
                 }
             }
         }
@@ -329,7 +371,7 @@ impl BufferPool for EvictableBufferPool {
         guard: &PoolGuard,
         page_id: PageID,
     ) -> Result<PageExclusiveGuard<T>> {
-        self.reserve_page().await;
+        self.reserve_page().await?;
 
         if self.alloc_map.allocate_at(usize::from(page_id)) {
             self.in_mem.pin(page_id);
@@ -1475,7 +1517,10 @@ pub(crate) mod tests {
         let pool_guard = pool.pool_guard();
         let mut page_guards = Vec::with_capacity(page_count);
         for idx in 0..page_count {
-            let mut page_guard = pool.allocate_page::<Page>(&pool_guard).await;
+            let mut page_guard = pool
+                .allocate_page::<Page>(&pool_guard)
+                .await
+                .expect("test page allocation should succeed");
             page_guard.page_mut()[0] = idx as u8;
             page_guard.bf_mut().set_dirty(true);
             page_guard.bf_mut().set_kind(FrameKind::Evicting);
@@ -1493,7 +1538,10 @@ pub(crate) mod tests {
         payload: &[u8],
     ) -> PageID {
         let pool_guard = pool.pool_guard();
-        let mut page_guard = pool.allocate_page::<Page>(&pool_guard).await;
+        let mut page_guard = pool
+            .allocate_page::<Page>(&pool_guard)
+            .await
+            .expect("test page allocation should succeed");
         let page_id = page_guard.page_id();
         page_guard.page_mut()[..payload.len()].copy_from_slice(payload);
         page_guard.bf_mut().set_dirty(true);
@@ -1630,15 +1678,24 @@ pub(crate) mod tests {
             );
             let pool_guard = pool.pool_guard();
             {
-                let g = pool.allocate_page::<RowPage>(&pool_guard).await;
+                let g = pool
+                    .allocate_page::<RowPage>(&pool_guard)
+                    .await
+                    .expect("test page allocation should succeed");
                 assert_eq!(g.page_id(), 0);
             }
             {
-                let g = pool.allocate_page::<RowPage>(&pool_guard).await;
+                let g = pool
+                    .allocate_page::<RowPage>(&pool_guard)
+                    .await
+                    .expect("test page allocation should succeed");
                 assert_eq!(g.page_id(), 1);
                 let stale_versioned = g.versioned_page_id();
                 pool.deallocate_page(g);
-                let g = pool.allocate_page::<RowPage>(&pool_guard).await;
+                let g = pool
+                    .allocate_page::<RowPage>(&pool_guard)
+                    .await
+                    .expect("test page allocation should succeed");
                 assert_eq!(g.page_id(), 1);
                 assert_eq!(g.bf().generation(), stale_versioned.generation + 2);
                 let current_versioned = g.versioned_page_id();
@@ -1665,7 +1722,10 @@ pub(crate) mod tests {
                 assert!(g.is_none());
             }
             {
-                let g = pool.allocate_page::<RowPage>(&pool_guard).await;
+                let g = pool
+                    .allocate_page::<RowPage>(&pool_guard)
+                    .await
+                    .expect("test page allocation should succeed");
                 let page_id = g.page_id();
                 let versioned = g.versioned_page_id();
                 drop(g);
@@ -1688,7 +1748,10 @@ pub(crate) mod tests {
                     .await
                     .unwrap();
                 pool.deallocate_page(g);
-                let g = pool.allocate_page::<RowPage>(&pool_guard).await;
+                let g = pool
+                    .allocate_page::<RowPage>(&pool_guard)
+                    .await
+                    .expect("test page allocation should succeed");
                 assert_eq!(g.page_id(), page_id);
                 drop(g);
 
@@ -1760,7 +1823,10 @@ pub(crate) mod tests {
             .unwrap();
             let pool_guard = pool.pool_guard();
 
-            let mut page_guard = pool.allocate_page::<Page>(&pool_guard).await;
+            let mut page_guard = pool
+                .allocate_page::<Page>(&pool_guard)
+                .await
+                .expect("test page allocation should succeed");
             let page_id = page_guard.page_id();
             page_guard.bf_mut().set_kind(FrameKind::Evicting);
             pool.in_mem.evict_page(page_guard);
@@ -1804,7 +1870,10 @@ pub(crate) mod tests {
                 file: storage,
             };
 
-            let mut page_guard = owner.allocate_page::<Page>(&pool_guard).await;
+            let mut page_guard = owner
+                .allocate_page::<Page>(&pool_guard)
+                .await
+                .expect("test page allocation should succeed");
             let page_id = page_guard.page_id();
             page_guard.page_mut()[0] = 0xAB;
             page_guard.bf_mut().set_kind(FrameKind::Evicting);
@@ -1872,7 +1941,10 @@ pub(crate) mod tests {
             let owner = QuiescentBox::new(pool);
             let pool_guard = owner.pool_guard();
 
-            let mut page_guard = owner.allocate_page::<Page>(&pool_guard).await;
+            let mut page_guard = owner
+                .allocate_page::<Page>(&pool_guard)
+                .await
+                .expect("test page allocation should succeed");
             let page_id = page_guard.page_id();
             page_guard.page_mut()[0] = 0xAB;
             page_guard.bf_mut().set_kind(FrameKind::Evicting);
@@ -1922,7 +1994,10 @@ pub(crate) mod tests {
             .unwrap();
             let owner = QuiescentBox::new(pool);
             let pool_guard = owner.pool_guard();
-            let mut page_guard = owner.allocate_page::<Page>(&pool_guard).await;
+            let mut page_guard = owner
+                .allocate_page::<Page>(&pool_guard)
+                .await
+                .expect("test page allocation should succeed");
             let page_id = page_guard.page_id();
             let versioned = page_guard.versioned_page_id();
             page_guard.page_mut()[0] = 0xAB;
@@ -2001,7 +2076,10 @@ pub(crate) mod tests {
             )
             .unwrap();
             let pool_guard = pool.pool_guard();
-            let mut page_guard = pool.allocate_page::<Page>(&pool_guard).await;
+            let mut page_guard = pool
+                .allocate_page::<Page>(&pool_guard)
+                .await
+                .expect("test page allocation should succeed");
             let page_id = page_guard.page_id();
             page_guard.bf_mut().set_kind(FrameKind::Hot);
             drop(page_guard);
@@ -2052,7 +2130,10 @@ pub(crate) mod tests {
                 smol::block_on(async move {
                     // allocate more pages than memory limit.
                     for i in 0..160 {
-                        let g = pool_ref.allocate_page::<RowPage>(&pool_guard).await;
+                        let g = pool_ref
+                            .allocate_page::<RowPage>(&pool_guard)
+                            .await
+                            .expect("test page allocation should succeed");
                         let _ = tx.send(g.page_id());
                         println!("allocated page {}", i);
                     }
@@ -2101,7 +2182,10 @@ pub(crate) mod tests {
         smol::block_on(async {
             let mut pages = vec![];
             for _ in 0..2048 {
-                let g = pool.allocate_page::<RowPage>(&pool_guard).await;
+                let g = pool
+                    .allocate_page::<RowPage>(&pool_guard)
+                    .await
+                    .expect("test page allocation should succeed");
                 pages.push(g.page_id());
             }
             debug_assert!(pages.len() == 2048);
@@ -2123,7 +2207,10 @@ pub(crate) mod tests {
             let total_pages = pool.in_mem.max_count + 64;
 
             for i in 0..total_pages {
-                let mut g = pool.allocate_page::<Page>(&pool_guard).await;
+                let mut g = pool
+                    .allocate_page::<Page>(&pool_guard)
+                    .await
+                    .expect("test page allocation should succeed");
                 let payload = format!("page-{i}");
                 g.page_mut()[..payload.len()].copy_from_slice(payload.as_bytes());
                 drop(g);
@@ -2160,7 +2247,9 @@ pub(crate) mod tests {
             let pool = QuiescentBox::new(pool);
             let guard = {
                 let pool_guard = EvictableBufferPool::pool_guard(&pool);
-                pool.allocate_page::<RowPage>(&pool_guard).await
+                pool.allocate_page::<RowPage>(&pool_guard)
+                    .await
+                    .expect("test page allocation should succeed")
             };
             let dropped = Arc::new(AtomicBool::new(false));
             let dropped_flag = Arc::clone(&dropped);
@@ -2211,7 +2300,10 @@ pub(crate) mod tests {
                     for _ in 0..200 {
                         // allocate a new page.
                         println!("thread {} alloc page start", thread_id);
-                        let g = pool_ref.allocate_page::<RowPage>(&pool_guard).await;
+                        let g = pool_ref
+                            .allocate_page::<RowPage>(&pool_guard)
+                            .await
+                            .expect("test page allocation should succeed");
                         pages.push(g.page_id());
                         println!(
                             "thread {} alloc page end page_id {}, allocated {}, in-mem {}, target_free {}, reads {}, writes {}",
@@ -2324,7 +2416,10 @@ pub(crate) mod tests {
             let pool1_guard = pool1.pool_guard();
             let pool2_guard = pool2.pool_guard();
 
-            let page = pool1.allocate_page::<RowPage>(&pool1_guard).await;
+            let page = pool1
+                .allocate_page::<RowPage>(&pool1_guard)
+                .await
+                .expect("test page allocation should succeed");
             let page_id = page.page_id();
             drop(page);
 

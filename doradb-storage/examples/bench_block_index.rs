@@ -45,8 +45,11 @@ fn main() {
                 )],
             ));
             let meta_guard = engine.meta_pool.pool_guard();
-            let blk_idx =
-                Arc::new(RowPageIndex::new(engine.meta_pool.clone_inner(), &meta_guard, 0).await);
+            let blk_idx = Arc::new(
+                RowPageIndex::new(engine.meta_pool.clone_inner(), &meta_guard, 0)
+                    .await
+                    .unwrap(),
+            );
             let mem_guard = engine.mem_pool.pool_guard();
 
             for _ in 0..args.pages {

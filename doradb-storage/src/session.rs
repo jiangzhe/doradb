@@ -223,7 +223,7 @@ impl Session {
             table_file.active_root().pivot_row_id,
             table_file.active_root().column_block_index_root,
         )
-        .await;
+        .await?;
         let disk_pool = ReadonlyBufferPool::new(
             table_id,
             FileKind::TableFile,
@@ -240,7 +240,7 @@ impl Session {
                 table_file,
                 disk_pool,
             )
-            .await,
+            .await?,
         );
 
         engine.catalog().insert_user_table(table);

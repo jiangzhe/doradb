@@ -456,7 +456,7 @@ pub trait BufferPool: Send + Sync {
     fn allocate_page<T: BufferPage>(
         &self,
         guard: &PoolGuard,
-    ) -> impl Future<Output = PageExclusiveGuard<T>> + Send;
+    ) -> impl Future<Output = Result<PageExclusiveGuard<T>>> + Send;
 
     /// Allocate a new page at given id(offset);
     fn allocate_page_at<T: BufferPage>(

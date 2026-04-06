@@ -249,7 +249,7 @@ impl Catalog {
                     row_id_bound,
                     active_root.column_block_index_root,
                 )
-                .await;
+                .await?;
                 let table = Arc::new(
                     Table::new(
                         mem_pool.clone(),
@@ -260,7 +260,7 @@ impl Catalog {
                         table_file,
                         disk_pool,
                     )
-                    .await,
+                    .await?,
                 );
                 let old = self.user_tables.insert(table_id, table);
                 if old.is_some() {

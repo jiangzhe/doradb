@@ -1266,7 +1266,10 @@ mod tests {
     async fn allocate_with_pressure(pool: &crate::buffer::EvictableBufferPool, total_pages: usize) {
         let pool_guard = pool.pool_guard();
         for _ in 0..total_pages {
-            let page = pool.allocate_page::<Page>(&pool_guard).await;
+            let page = pool
+                .allocate_page::<Page>(&pool_guard)
+                .await
+                .expect("test page allocation should succeed");
             drop(page);
         }
     }

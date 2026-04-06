@@ -444,7 +444,7 @@ impl<'a> LogRecovery<'a> {
                 let count = end_row_id - start_row_id;
                 let mut page_guard = table
                     .allocate_row_page_at(&self.pool_guards, count as usize, *page_id)
-                    .await;
+                    .await?;
                 // Here we switch row page to recover mode.
                 page_guard.bf_mut().init_recover_map(cts);
 

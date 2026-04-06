@@ -224,29 +224,25 @@ impl GlobalReadonlyBufferPool {
                 return Err(Error::InvalidState);
             }
             if let Some(frame_id) = self.residency.try_reserve_frame() {
-                if self.shutdown_flag.load(Ordering::Acquire) {
-                    self.residency.release_free(frame_id);
-                    return Err(Error::InvalidState);
-                }
+                // Like the mutable pool, terminal shutdown does not try to reclaim
+                // successful reservations. Only blocking wait paths must exit.
                 self.residency.record_alloc_success();
                 return Ok(frame_id);
             }
             self.residency.record_alloc_failure();
             listener!(self.residency.free_ev => listener);
+            // Check after listener registration so shutdown cannot strand this waiter.
             if self.shutdown_flag.load(Ordering::Acquire) {
                 return Err(Error::InvalidState);
             }
             if let Some(frame_id) = self.residency.try_reserve_frame() {
-                if self.shutdown_flag.load(Ordering::Acquire) {
-                    self.residency.release_free(frame_id);
-                    return Err(Error::InvalidState);
-                }
                 self.residency.record_alloc_success();
                 return Ok(frame_id);
             }
             self.residency.record_alloc_failure();
             self.residency.notify_evictor();
             listener.await;
+            // Wakeups can come from shutdown as well as real frame reclamation.
             if self.shutdown_flag.load(Ordering::Acquire) {
                 return Err(Error::InvalidState);
             }
