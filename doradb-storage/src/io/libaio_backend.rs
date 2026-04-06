@@ -455,7 +455,7 @@ impl IOBackend for LibaioBackend {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use crate::file::{FixedSizeBufferFreeList, SparseFile};
+    use crate::file::{FixedSizeBufferFreeList, SparseFile, UNTRACKED_PERSISTED_FILE_ID};
     use crate::io::{DirectBuf, IOQueue, IOStateMachine, IOSubmission};
     use libc::EAGAIN;
     use std::os::fd::AsRawFd;
@@ -497,7 +497,9 @@ pub(crate) mod tests {
         let temp_dir = TempDir::new().unwrap();
         let file_path = temp_dir.path().join("aio_file2.txt");
         let file_path = file_path.to_string_lossy().into_owned();
-        let file = SparseFile::create_or_trunc(&file_path, 1024 * 1024).unwrap();
+        let file =
+            SparseFile::create_or_trunc(&file_path, 1024 * 1024, UNTRACKED_PERSISTED_FILE_ID)
+                .unwrap();
         let (logical_size, allocated_size) = file.size().unwrap();
         println!("file created, logical size={logical_size}, allocated size={allocated_size}");
         assert_eq!(logical_size, 1024 * 1024);
@@ -516,7 +518,9 @@ pub(crate) mod tests {
         let temp_dir = TempDir::new().unwrap();
         let file_path = temp_dir.path().join("aio_file3.txt");
         let file_path = file_path.to_string_lossy().into_owned();
-        let file = SparseFile::create_or_trunc(&file_path, 1024 * 1024).unwrap();
+        let file =
+            SparseFile::create_or_trunc(&file_path, 1024 * 1024, UNTRACKED_PERSISTED_FILE_ID)
+                .unwrap();
 
         let buf_free_list = FixedSizeBufferFreeList::new(4096, 4, 4);
         let listener = SimpleListener { file, next_key: 0 };
@@ -634,8 +638,8 @@ pub(crate) mod tests {
     impl IOSubmission for Submission {
         type Key = u64;
 
-        fn key(&self) -> &Self::Key {
-            &self.key
+        fn key(&self) -> Self::Key {
+            self.key
         }
 
         fn operation(&mut self) -> &mut Operation {
@@ -679,7 +683,7 @@ pub(crate) mod tests {
         }
 
         fn on_submit(&mut self, sub: &Submission) {
-            debug_assert!(*sub.key() < u64::MAX);
+            debug_assert!(sub.key() < u64::MAX);
         }
 
         fn on_complete(&mut self, sub: Submission, res: std::io::Result<usize>) -> IOKind {

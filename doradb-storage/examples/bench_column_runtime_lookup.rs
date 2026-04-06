@@ -1,5 +1,5 @@
 use clap::Parser;
-use doradb_storage::buffer::{GlobalReadonlyBufferPool, PoolGuard, PoolRole, ReadonlyBufferPool};
+use doradb_storage::buffer::{PoolGuard, PoolRole, ReadonlyBufferPool};
 use doradb_storage::catalog::{
     ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexSpec, TableSpec,
 };
@@ -10,7 +10,6 @@ use doradb_storage::engine::Engine;
 use doradb_storage::error::FileKind;
 use doradb_storage::file::BlockID;
 use doradb_storage::index::ColumnBlockIndex;
-use doradb_storage::quiescent::QuiescentBox;
 use doradb_storage::row::RowID;
 use doradb_storage::row::ops::{DeleteMvcc, InsertMvcc, SelectKey};
 use doradb_storage::session::Session;
@@ -41,7 +40,6 @@ struct BenchmarkCase {
     _table: Arc<Table>,
     disk_pool: ReadonlyBufferPool,
     disk_pool_guard: PoolGuard,
-    _global_pool: QuiescentBox<GlobalReadonlyBufferPool>,
     root_page_id: BlockID,
     end_row_id: RowID,
     row_ids: Vec<RowID>,
@@ -124,14 +122,10 @@ async fn build_case(
     table.freeze(&session, usize::MAX).await;
     table.data_checkpoint(&mut session).await.unwrap();
 
-    let global_pool = QuiescentBox::new(
-        GlobalReadonlyBufferPool::with_capacity(PoolRole::Disk, 64 * 1024 * 1024).unwrap(),
-    );
     let disk_pool = ReadonlyBufferPool::from_table_file(
-        table.table_id(),
         FileKind::TableFile,
         Arc::clone(table.file()),
-        global_pool.guard(),
+        engine.disk_pool.clone_inner(),
     );
 
     let active_root = table.file().active_root();
@@ -156,7 +150,6 @@ async fn build_case(
         _temp_dir: temp_dir,
         _engine: engine,
         _table: table,
-        _global_pool: global_pool,
         disk_pool,
         disk_pool_guard,
         root_page_id,
@@ -200,14 +193,12 @@ impl BenchmarkCase {
             _table,
             disk_pool,
             disk_pool_guard,
-            _global_pool,
             root_page_id: _,
             end_row_id: _,
             row_ids: _,
         } = self;
         drop(disk_pool);
         drop(disk_pool_guard);
-        drop(_global_pool);
         drop(_table);
         drop(_engine);
         drop(_temp_dir);

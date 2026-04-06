@@ -39,8 +39,8 @@ to teardown-only owner state.
 Engine startup resolves storage paths, validates layout markers, then registers
 components in one fixed dependency order:
 
-1. `DiskPool`
-2. `FileSystem`
+1. `FileSystem`
+2. `DiskPool`
 3. `MetaPool`
 4. `IndexPool`
 5. `MemPool`
@@ -49,6 +49,10 @@ components in one fixed dependency order:
 8. `Catalog`
 9. `TransactionSystem`
 10. `TransactionSystemWorkers`
+
+`DiskPool` now depends on `FileSystem` directly because readonly-cache miss
+loads are dispatched through the shared storage worker rather than file-scoped
+wrappers.
 
 Registration order is the dependency order. Reverse registration order is both:
 

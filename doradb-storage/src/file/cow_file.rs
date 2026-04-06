@@ -1,8 +1,6 @@
 use crate::bitmap::AllocMap;
 use crate::buffer::page::PAGE_SIZE;
-use crate::buffer::{
-    BlockKey, PersistedFileID, ReadSubmission, ReadonlyBackingFile, ReadonlyBufferPool,
-};
+use crate::buffer::{BlockKey, ReadonlyBackingFile, ReadonlyBufferPool};
 use crate::error::{BlockCorruptionCause, BlockKind, Error, FileKind, Result};
 use crate::file::fs::BackgroundWriteRequest;
 use crate::file::super_block::{SUPER_BLOCK_SIZE, SuperBlock};
@@ -163,11 +161,8 @@ pub struct CowCodec<M> {
 /// [`CowCodec`].
 pub struct CowFile<M> {
     file: SparseFile,
-    file_id: PersistedFileID,
     active_root: AtomicPtr<ActiveRoot<M>>,
     mutable_inflight: AtomicBool,
-    table_reads: IOClient<ReadSubmission>,
-    background_writes: IOClient<BackgroundWriteRequest>,
     codec: CowCodec<M>,
 }
 
@@ -180,24 +175,19 @@ impl<M> CowFile<M> {
     pub(crate) fn create(
         file_path: impl AsRef<str>,
         initial_size: usize,
-        file_id: PersistedFileID,
-        table_reads: IOClient<ReadSubmission>,
-        background_writes: IOClient<BackgroundWriteRequest>,
+        file_id: crate::buffer::PersistedFileID,
         codec: CowCodec<M>,
         trunc: bool,
     ) -> Result<Self> {
         let file = if trunc {
-            SparseFile::create_or_trunc(file_path, initial_size)
+            SparseFile::create_or_trunc(file_path, initial_size, file_id)
         } else {
-            SparseFile::create_or_fail(file_path, initial_size)
+            SparseFile::create_or_fail(file_path, initial_size, file_id)
         }?;
         Ok(CowFile {
             file,
-            file_id,
             active_root: AtomicPtr::new(std::ptr::null_mut()),
             mutable_inflight: AtomicBool::new(false),
-            table_reads,
-            background_writes,
             codec,
         })
     }
@@ -209,19 +199,14 @@ impl<M> CowFile<M> {
     #[inline]
     pub(crate) fn open(
         file_path: impl AsRef<str>,
-        file_id: PersistedFileID,
-        table_reads: IOClient<ReadSubmission>,
-        background_writes: IOClient<BackgroundWriteRequest>,
+        file_id: crate::buffer::PersistedFileID,
         codec: CowCodec<M>,
     ) -> Result<Self> {
-        let file = SparseFile::open(file_path)?;
+        let file = SparseFile::open(file_path, file_id)?;
         Ok(CowFile {
             file,
-            file_id,
             active_root: AtomicPtr::new(std::ptr::null_mut()),
             mutable_inflight: AtomicBool::new(false),
-            table_reads,
-            background_writes,
             codec,
         })
     }
@@ -277,24 +262,30 @@ impl<M> CowFile<M> {
     #[inline]
     pub(crate) async fn write_block_with_owner(
         &self,
+        background_writes: &IOClient<BackgroundWriteRequest>,
         owner: ReadonlyBackingFile,
         block_id: BlockID,
         buf: DirectBuf,
     ) -> Result<()> {
         debug_assert!(buf.capacity() == COW_FILE_PAGE_SIZE);
         let offset = usize::from(block_id) * COW_FILE_PAGE_SIZE;
-        self.write_at_offset_with_owner(owner, offset, buf).await
+        self.write_at_offset_with_owner(background_writes, owner, offset, buf)
+            .await
     }
 
     #[inline]
     fn block_key(&self, offset: usize) -> BlockKey {
-        BlockKey::new(self.file_id, BlockID::from(offset / COW_FILE_PAGE_SIZE))
+        BlockKey::new(
+            self.file.file_id(),
+            BlockID::from(offset / COW_FILE_PAGE_SIZE),
+        )
     }
 
     /// Write one buffer at given byte offset.
     #[inline]
     pub(crate) async fn write_at_offset_with_owner(
         &self,
+        background_writes: &IOClient<BackgroundWriteRequest>,
         owner: ReadonlyBackingFile,
         offset: usize,
         buf: DirectBuf,
@@ -304,26 +295,19 @@ impl<M> CowFile<M> {
             owner,
             offset,
             buf,
-            &self.background_writes,
+            background_writes,
         )
         .await
     }
 
     #[inline]
-    pub(crate) fn raw_fd(&self) -> RawFd {
-        self.file.as_raw_fd()
+    pub(crate) fn file_id(&self) -> crate::buffer::PersistedFileID {
+        self.file.file_id()
     }
 
     #[inline]
-    pub(crate) async fn queue_read(&self, req: ReadSubmission) -> Result<()> {
-        match self.table_reads.send_async(req).await {
-            Ok(()) => Ok(()),
-            Err(err) => {
-                let req = err.into_inner();
-                req.fail(Error::SendError);
-                Err(Error::SendError)
-            }
-        }
+    pub(crate) fn raw_fd(&self) -> RawFd {
+        self.file.as_raw_fd()
     }
 
     /// Replace active root with new root, returning previous-root guard if present.
@@ -388,6 +372,7 @@ impl<M> CowFile<M> {
     #[inline]
     pub(crate) async fn publish_root_with_owner(
         &self,
+        background_writes: &IOClient<BackgroundWriteRequest>,
         owner: ReadonlyBackingFile,
         mut new_root: ActiveRoot<M>,
     ) -> Result<Option<OldCowRoot<M>>> {
@@ -403,12 +388,17 @@ impl<M> CowFile<M> {
         new_root.meta_block_id = new_meta_block_id;
 
         let meta_buf = (self.codec.build_meta_block)(&new_root)?;
-        self.write_block_with_owner(owner.clone(), new_meta_block_id, meta_buf)
-            .await?;
+        self.write_block_with_owner(
+            background_writes,
+            owner.clone(),
+            new_meta_block_id,
+            meta_buf,
+        )
+        .await?;
 
         let super_buf = (self.codec.build_super_block)(&new_root)?;
         let offset = new_root.slot_no as usize * super_buf.capacity();
-        self.write_at_offset_with_owner(owner, offset, super_buf)
+        self.write_at_offset_with_owner(background_writes, owner, offset, super_buf)
             .await?;
 
         self.fsync()?;

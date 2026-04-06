@@ -10,16 +10,18 @@ use crate::buffer::load::{PageReservation, PageReservationGuard};
 use crate::buffer::page::{BufferPage, IOKind, PAGE_SIZE, Page, PageID, PageIO, VersionedPageID};
 use crate::buffer::util::{frame_total_bytes, madvise_dontneed};
 use crate::buffer::{
-    BufferPool, BufferPoolStats, BufferPoolStatsHandle, PageIOCompletion, PoolGuard, PoolIdentity,
-    PoolRole, RowPoolRole,
+    BlockKey, BufferPool, BufferPoolStats, BufferPoolStatsHandle, PageIOCompletion, PoolGuard,
+    PoolIdentity, PoolRole, RowPoolRole,
 };
 use crate::component::Supplier;
 use crate::conf::EvictableBufferPoolConfig;
 use crate::conf::path::{path_to_utf8, validate_swap_file_path_candidate};
 use crate::error::Validation::Valid;
 use crate::error::{Error, Result, Validation};
-use crate::file::SparseFile;
 use crate::file::fs::{FileSystem, FileSystemWorkers};
+use crate::file::{
+    BlockID, INDEX_POOL_SWAP_PERSISTED_FILE_ID, MEM_POOL_SWAP_PERSISTED_FILE_ID, SparseFile,
+};
 use crate::io::{
     IOBackendStats, IOKind as StorageIOKind, IOQueue, IOStateMachine, IOSubmission, Operation,
 };
@@ -616,6 +618,11 @@ impl EvictablePoolStateMachine {
     pub(crate) fn new(pool: SyncQuiescentGuard<EvictableBufferPool>, file: SparseFile) -> Self {
         Self { pool, file }
     }
+
+    #[inline]
+    fn block_key(&self, page_id: PageID) -> BlockKey {
+        BlockKey::new(self.file.file_id(), BlockID::from(u64::from(page_id)))
+    }
 }
 
 /// Backend-facing pool submission emitted by `EvictablePoolStateMachine`.
@@ -625,10 +632,10 @@ pub(crate) enum EvictSubmission {
 }
 
 impl IOSubmission for EvictSubmission {
-    type Key = PageID;
+    type Key = BlockKey;
 
     #[inline]
-    fn key(&self) -> &Self::Key {
+    fn key(&self) -> Self::Key {
         match self {
             EvictSubmission::Read(sub) => sub.key(),
             EvictSubmission::Write(sub) => sub.key(),
@@ -646,7 +653,7 @@ impl IOSubmission for EvictSubmission {
 
 impl IOStateMachine for EvictablePoolStateMachine {
     type Request = PoolRequest;
-    type Key = PageID;
+    type Key = BlockKey;
     type Submission = EvictSubmission;
 
     /// Expand one pool request into backend-facing read or write submissions.
@@ -662,10 +669,10 @@ impl IOStateMachine for EvictablePoolStateMachine {
         }
         match req {
             PoolRequest::Read(req) => {
-                let page_id = *req.key();
+                let page_id = req.page_id();
                 debug_assert!(self.pool.inflight_io.contains(page_id));
                 queue.push(EvictSubmission::Read(
-                    req.into_prepared(self.file.as_raw_fd()),
+                    req.into_prepared(self.file.as_raw_fd(), self.block_key(page_id)),
                 ));
                 None
             }
@@ -690,7 +697,7 @@ impl IOStateMachine for EvictablePoolStateMachine {
                         )
                     };
                     let req = PageIO {
-                        key: page_id,
+                        block_key: self.block_key(page_id),
                         operation,
                         page_guard,
                         batch_done: Some(Arc::clone(&done_ev)),
@@ -707,7 +714,7 @@ impl IOStateMachine for EvictablePoolStateMachine {
     fn on_submit(&mut self, sub: &EvictSubmission) {
         match sub {
             EvictSubmission::Read(sub) => {
-                debug_assert!(self.pool.inflight_io.contains(*sub.key()));
+                debug_assert!(self.pool.inflight_io.contains(sub.page_id()));
                 sub.record_running();
             }
             EvictSubmission::Write(sub) => {
@@ -727,7 +734,7 @@ impl IOStateMachine for EvictablePoolStateMachine {
             }
             EvictSubmission::Write(sub) => {
                 let PageIO {
-                    key: _,
+                    block_key: _,
                     operation: _,
                     page_guard,
                     batch_done,
@@ -1141,12 +1148,12 @@ impl EvictReadSubmission {
     }
 
     #[inline]
-    pub(crate) fn key(&self) -> &PageID {
-        &self.key
+    pub(crate) fn page_id(&self) -> PageID {
+        self.key
     }
 
     #[inline]
-    fn into_prepared(mut self, raw_fd: RawFd) -> PreparedEvictReadSubmission {
+    fn into_prepared(mut self, raw_fd: RawFd, block_key: BlockKey) -> PreparedEvictReadSubmission {
         let ptr = self
             .reservation
             .as_mut()
@@ -1159,6 +1166,7 @@ impl EvictReadSubmission {
         };
         PreparedEvictReadSubmission {
             inner: self,
+            block_key,
             operation,
         }
     }
@@ -1235,6 +1243,7 @@ impl EvictReadSubmission {
 
 pub(crate) struct PreparedEvictReadSubmission {
     inner: EvictReadSubmission,
+    block_key: BlockKey,
     operation: Operation,
 }
 
@@ -1245,17 +1254,22 @@ impl PreparedEvictReadSubmission {
     }
 
     #[inline]
+    fn page_id(&self) -> PageID {
+        self.inner.page_id()
+    }
+
+    #[inline]
     fn complete(self, res: std::io::Result<usize>) -> IOKind {
         self.inner.complete(res)
     }
 }
 
 impl IOSubmission for PreparedEvictReadSubmission {
-    type Key = PageID;
+    type Key = BlockKey;
 
     #[inline]
-    fn key(&self) -> &Self::Key {
-        self.inner.key()
+    fn key(&self) -> Self::Key {
+        self.block_key
     }
 
     #[inline]
@@ -1311,7 +1325,15 @@ pub(crate) fn build_pool_with_swap_file_field(
 
     // 3. Create the swap file and retain the opened descriptor for worker-owned IO.
     let swap_file_path = path_to_utf8(&config.data_swap_file, swap_file_field_name)?;
-    let file = SparseFile::create_or_trunc(swap_file_path, max_file_size)?;
+    let file = SparseFile::create_or_trunc(
+        swap_file_path,
+        max_file_size,
+        match config.role {
+            PoolRole::Mem => MEM_POOL_SWAP_PERSISTED_FILE_ID,
+            PoolRole::Index => INDEX_POOL_SWAP_PERSISTED_FILE_ID,
+            other => panic!("unsupported pool role {other:?} in swap-file persisted id"),
+        },
+    )?;
     let pool = EvictableBufferPool {
         alloc_map: AllocMap::new(max_nbr),
         alloc_ev: Event::new(),
@@ -1908,7 +1930,7 @@ pub(crate) mod tests {
             };
             let kind = state_machine.on_complete(
                 EvictSubmission::Write(PageIO {
-                    key: page_id,
+                    block_key: state_machine.block_key(page_id),
                     operation,
                     page_guard,
                     batch_done: None,
@@ -2038,7 +2060,7 @@ pub(crate) mod tests {
             };
             let kind = state_machine.on_complete(
                 EvictSubmission::Write(PageIO {
-                    key: page_id,
+                    block_key: state_machine.block_key(page_id),
                     operation,
                     page_guard,
                     batch_done: None,

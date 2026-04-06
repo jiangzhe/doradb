@@ -600,9 +600,11 @@ impl Component for DiskPool {
         registry: &mut ComponentRegistry,
         _shelf: ShelfScope<'_, Self>,
     ) -> Result<()> {
+        let fs = registry.dependency::<FileSystem>()?;
         registry.register::<Self>(GlobalReadonlyBufferPool::with_capacity(
             PoolRole::Disk,
             config.bytes,
+            fs,
         )?)
     }
 

@@ -18,6 +18,7 @@ use crate::buffer::{
 };
 use crate::error::{Error, FileKind, Result};
 use crate::file::BlockID;
+use crate::file::fs::FileSystem;
 use crate::file::multi_table_file::MultiTableFile;
 use crate::file::table_file::TableFile;
 use crate::io::{DirectBuf, IOKind, IOSubmission, Operation};
@@ -71,10 +72,10 @@ pub(crate) enum ReadonlyBackingFile {
 
 impl ReadonlyBackingFile {
     #[inline]
-    async fn queue_read(&self, req: ReadSubmission) -> Result<()> {
+    pub(crate) fn file_id(&self) -> PersistedFileID {
         match self {
-            ReadonlyBackingFile::Table(file) => file.queue_read(req).await,
-            ReadonlyBackingFile::Multi(file) => file.queue_read(req).await,
+            ReadonlyBackingFile::Table(file) => file.file_id(),
+            ReadonlyBackingFile::Multi(file) => file.file_id(),
         }
     }
 
@@ -126,6 +127,7 @@ pub struct GlobalReadonlyBufferPool {
     inflight_loads: DashMap<BlockKey, Arc<PageIOCompletion>>,
     residency: ReadonlyResidency,
     eviction_arbiter: EvictionArbiter,
+    fs: QuiescentGuard<FileSystem>,
     shutdown_flag: Arc<AtomicBool>,
     role: PoolRole,
     stats: BufferPoolStatsHandle,
@@ -139,8 +141,12 @@ impl GlobalReadonlyBufferPool {
     /// Callers must first place the pool into a stable owner such as
     /// [`QuiescentBox`] before starting guarded worker threads.
     #[inline]
-    pub fn with_capacity(role: PoolRole, pool_size: usize) -> Result<Self> {
-        Self::with_capacity_and_arbiter_builder(role, pool_size, EvictionArbiter::builder())
+    pub fn with_capacity(
+        role: PoolRole,
+        pool_size: usize,
+        fs: QuiescentGuard<FileSystem>,
+    ) -> Result<Self> {
+        Self::with_capacity_and_arbiter_builder(role, pool_size, fs, EvictionArbiter::builder())
     }
 
     /// Creates a raw global readonly pool with explicit eviction arbiter builder.
@@ -150,6 +156,7 @@ impl GlobalReadonlyBufferPool {
     pub fn with_capacity_and_arbiter_builder(
         role: PoolRole,
         pool_size: usize,
+        fs: QuiescentGuard<FileSystem>,
         eviction_arbiter_builder: EvictionArbiterBuilder,
     ) -> Result<Self> {
         role.assert_valid("global readonly buffer pool");
@@ -166,12 +173,21 @@ impl GlobalReadonlyBufferPool {
             inflight_loads: DashMap::new(),
             residency: ReadonlyResidency::new(size, eviction_arbiter),
             eviction_arbiter,
+            fs,
             shutdown_flag: Arc::new(AtomicBool::new(false)),
             role,
             stats: BufferPoolStatsHandle::default(),
             arena,
         };
         Ok(pool)
+    }
+
+    #[inline]
+    async fn send_read_async(
+        &self,
+        req: ReadSubmission,
+    ) -> std::result::Result<(), flume::SendError<ReadSubmission>> {
+        self.fs.send_table_read_async(req).await
     }
 
     /// Returns total number of frame slots in this pool.
@@ -826,8 +842,8 @@ impl IOSubmission for ReadSubmission {
     type Key = BlockKey;
 
     #[inline]
-    fn key(&self) -> &Self::Key {
-        &self.key
+    fn key(&self) -> Self::Key {
+        self.key
     }
 
     #[inline]
@@ -1097,7 +1113,6 @@ impl ReadonlyBlockGuard {
 /// and delegates to [`GlobalReadonlyBufferPool`].
 #[derive(Clone)]
 pub struct ReadonlyBufferPool {
-    file_id: PersistedFileID,
     file_kind: FileKind,
     backing: ReadonlyBackingFile,
     global: QuiescentGuard<GlobalReadonlyBufferPool>,
@@ -1107,7 +1122,6 @@ impl ReadonlyBufferPool {
     /// Creates a per-file readonly pool wrapper.
     #[inline]
     pub(crate) fn new<O>(
-        file_id: PersistedFileID,
         file_kind: FileKind,
         backing: O,
         global: QuiescentGuard<GlobalReadonlyBufferPool>,
@@ -1116,7 +1130,6 @@ impl ReadonlyBufferPool {
         O: Into<ReadonlyBackingFile>,
     {
         ReadonlyBufferPool {
-            file_id,
             file_kind,
             backing: backing.into(),
             global,
@@ -1126,23 +1139,21 @@ impl ReadonlyBufferPool {
     /// Creates a readonly pool backed by one table file.
     #[inline]
     pub fn from_table_file(
-        file_id: PersistedFileID,
         file_kind: FileKind,
         table_file: Arc<TableFile>,
         global: QuiescentGuard<GlobalReadonlyBufferPool>,
     ) -> Self {
-        Self::new(file_id, file_kind, table_file, global)
+        Self::new(file_kind, table_file, global)
     }
 
     /// Creates a readonly pool backed by one multi-table file.
     #[inline]
     pub fn from_multi_table_file(
-        file_id: PersistedFileID,
         file_kind: FileKind,
         mtb: Arc<MultiTableFile>,
         global: QuiescentGuard<GlobalReadonlyBufferPool>,
     ) -> Self {
-        Self::new(file_id, file_kind, mtb, global)
+        Self::new(file_kind, mtb, global)
     }
 
     /// Returns which persisted file format this pool reads from.
@@ -1164,7 +1175,7 @@ impl ReadonlyBufferPool {
 
     #[inline]
     fn block_key(&self, block_id: BlockID) -> BlockKey {
-        BlockKey::new(self.file_id, block_id)
+        BlockKey::new(self.backing.file_id(), block_id)
     }
 
     #[inline]
@@ -1196,7 +1207,9 @@ impl ReadonlyBufferPool {
                             validation,
                             reservation,
                         );
-                        let _ = self.backing.queue_read(req).await;
+                        if let Err(err) = self.global.send_read_async(req).await {
+                            err.into_inner().fail(Error::SendError);
+                        }
                     }
                     Err(err) => {
                         global.complete_inflight_load(key, &inflight, Err(err));
@@ -1340,14 +1353,15 @@ impl ReadonlyBufferPool {
     #[inline]
     /// Invalidates one block for this file from the global readonly cache.
     pub fn invalidate_block_id(&self, block_id: BlockID) -> Option<PageID> {
-        self.global.invalidate_file_block(self.file_id, block_id)
+        self.global
+            .invalidate_file_block(self.backing.file_id(), block_id)
     }
 
     #[inline]
     /// Invalidates one block for this file with strict GC ordering preconditions.
     pub fn invalidate_block_id_strict(&self, block_id: BlockID) -> Option<PageID> {
         self.global
-            .invalidate_file_block_strict(self.file_id, block_id)
+            .invalidate_file_block_strict(self.backing.file_id(), block_id)
     }
 }
 
@@ -1411,15 +1425,24 @@ pub(crate) mod tests {
         cap.max(MIN_READONLY_POOL_PAGES) * (mem::size_of::<BufferFrame>() + mem::size_of::<Page>())
     }
 
-    fn owned_global_pool(pool_size: usize) -> QuiescentBox<GlobalReadonlyBufferPool> {
-        QuiescentBox::new(
-            GlobalReadonlyBufferPool::with_capacity(PoolRole::Disk, pool_size).unwrap(),
-        )
-    }
-
     /// Test-only owner wrapper for one shared readonly pool.
     pub(crate) struct GlobalReadOnlyPoolScope {
-        owner: QuiescentBox<GlobalReadonlyBufferPool>,
+        _temp_dir: TempDir,
+        fs: Option<crate::file::fs::tests::TestFileSystem>,
+        owner: Option<QuiescentBox<GlobalReadonlyBufferPool>>,
+    }
+
+    fn owned_global_pool(pool_size: usize) -> GlobalReadOnlyPoolScope {
+        let temp_dir = TempDir::new().unwrap();
+        let fs = crate::file::build_test_fs_in(temp_dir.path());
+        let owner = QuiescentBox::new(
+            GlobalReadonlyBufferPool::with_capacity(PoolRole::Disk, pool_size, fs.guard()).unwrap(),
+        );
+        GlobalReadOnlyPoolScope {
+            _temp_dir: temp_dir,
+            fs: Some(fs),
+            owner: Some(owner),
+        }
     }
 
     impl Deref for GlobalReadOnlyPoolScope {
@@ -1427,59 +1450,59 @@ pub(crate) mod tests {
 
         #[inline]
         fn deref(&self) -> &Self::Target {
-            &self.owner
+            self.owner
+                .as_ref()
+                .expect("test readonly pool owner is live")
         }
     }
 
     impl GlobalReadOnlyPoolScope {
         #[inline]
         pub(crate) fn guard(&self) -> crate::quiescent::QuiescentGuard<GlobalReadonlyBufferPool> {
-            self.owner.guard()
+            self.owner
+                .as_ref()
+                .expect("test readonly pool owner is live")
+                .guard()
+        }
+    }
+
+    impl Drop for GlobalReadOnlyPoolScope {
+        #[inline]
+        fn drop(&mut self) {
+            drop(self.owner.take());
+            drop(self.fs.take());
         }
     }
 
     #[inline]
     pub(crate) fn global_readonly_pool_scope(pool_size: usize) -> GlobalReadOnlyPoolScope {
-        GlobalReadOnlyPoolScope {
-            owner: owned_global_pool(pool_size),
-        }
+        owned_global_pool(pool_size)
     }
 
     #[inline]
     pub(crate) fn table_readonly_pool(
         scope: &GlobalReadOnlyPoolScope,
-        table_id: TableID,
+        _table_id: TableID,
         table_file: &Arc<TableFile>,
     ) -> ReadonlyBufferPool {
-        ReadonlyBufferPool::new(
-            table_id,
-            FileKind::TableFile,
-            Arc::clone(table_file),
-            scope.guard(),
-        )
+        ReadonlyBufferPool::new(FileKind::TableFile, Arc::clone(table_file), scope.guard())
     }
 
     fn owned_readonly_pool<O>(
-        file_id: PersistedFileID,
+        _file_id: PersistedFileID,
         file_kind: FileKind,
         backing: O,
-        global: &QuiescentBox<GlobalReadonlyBufferPool>,
+        global: &GlobalReadOnlyPoolScope,
     ) -> QuiescentBox<ReadonlyBufferPool>
     where
         O: Into<ReadonlyBackingFile>,
     {
-        QuiescentBox::new(ReadonlyBufferPool::new(
-            file_id,
-            file_kind,
-            backing,
-            global.guard(),
-        ))
+        QuiescentBox::new(ReadonlyBufferPool::new(file_kind, backing, global.guard()))
     }
 
     #[test]
     fn test_global_readonly_pool_shutdown_is_idempotent_before_worker_start() {
-        let pool =
-            GlobalReadonlyBufferPool::with_capacity(PoolRole::Disk, frame_page_bytes(2)).unwrap();
+        let pool = owned_global_pool(frame_page_bytes(2));
 
         pool.signal_shutdown();
         pool.signal_shutdown();
@@ -1837,7 +1860,9 @@ pub(crate) mod tests {
     fn test_global_readonly_pool_rejects_too_small_capacity() {
         let bytes = (MIN_READONLY_POOL_PAGES - 1)
             * (mem::size_of::<BufferFrame>() + mem::size_of::<Page>());
-        let res = GlobalReadonlyBufferPool::with_capacity(PoolRole::Disk, bytes);
+        let temp_dir = TempDir::new().unwrap();
+        let fs_owner = crate::file::fs::tests::build_test_fs_owner_in(temp_dir.path()).unwrap();
+        let res = GlobalReadonlyBufferPool::with_capacity(PoolRole::Disk, bytes, fs_owner.guard());
         assert!(matches!(res, Err(Error::BufferPoolSizeTooSmall)));
     }
 
@@ -2783,10 +2808,13 @@ pub(crate) mod tests {
 
     #[test]
     fn test_global_readonly_pool_uses_custom_arbiter_builder() {
+        let temp_dir = TempDir::new().unwrap();
+        let fs_owner = crate::file::fs::tests::build_test_fs_owner_in(temp_dir.path()).unwrap();
         let global = QuiescentBox::new(
             GlobalReadonlyBufferPool::with_capacity_and_arbiter_builder(
                 PoolRole::Disk,
                 frame_page_bytes(16),
+                fs_owner.guard(),
                 EvictionArbiterBuilder::new()
                     .target_free(4)
                     .hysteresis(2)

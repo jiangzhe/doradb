@@ -15,6 +15,7 @@ pub(crate) use self::tests::{
 };
 
 use crate::buffer::{BlockKey, ReadSubmission, ReadonlyBackingFile};
+use crate::catalog::USER_OBJ_ID_START;
 use crate::compression::BitPackable;
 use crate::error::{Error, Result, StorageOp};
 use crate::free_list::FreeList;
@@ -40,6 +41,20 @@ use std::ops::{Add, AddAssign, Sub, SubAssign};
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+
+/// Sentinel persisted-file identity used by files that never participate in
+/// persisted-block cache identity or shared-storage worker routing.
+pub const UNTRACKED_PERSISTED_FILE_ID: crate::buffer::PersistedFileID =
+    crate::buffer::PersistedFileID::MAX;
+
+/// Reserved persisted-file identity of the shared index-pool swap file.
+pub const INDEX_POOL_SWAP_PERSISTED_FILE_ID: crate::buffer::PersistedFileID = USER_OBJ_ID_START - 3;
+
+/// Reserved persisted-file identity of the shared mem-pool swap file.
+pub const MEM_POOL_SWAP_PERSISTED_FILE_ID: crate::buffer::PersistedFileID = USER_OBJ_ID_START - 2;
+
+/// Reserved persisted-file identity of `catalog.mtb`.
+pub const CATALOG_MTB_PERSISTED_FILE_ID: crate::buffer::PersistedFileID = USER_OBJ_ID_START - 1;
 
 /// Persisted fixed-size file block identity.
 ///
@@ -230,6 +245,7 @@ impl BitPackable for BlockID {
 /// The logical size of sparse file can be very large, but the
 /// real allocated blocks can be only a few.
 pub struct SparseFile {
+    file_id: crate::buffer::PersistedFileID,
     fd: RawFd,
     offset: AtomicUsize,
     max_len: AtomicUsize,
@@ -248,7 +264,11 @@ impl SparseFile {
     /// Create a sparse file and truncate if file already exists.
     /// Note that space is allocated only when data is written to this file.
     #[inline]
-    pub fn create_or_trunc(file_path: impl AsRef<str>, max_size: usize) -> Result<SparseFile> {
+    pub fn create_or_trunc(
+        file_path: impl AsRef<str>,
+        max_size: usize,
+        file_id: crate::buffer::PersistedFileID,
+    ) -> Result<SparseFile> {
         // SAFETY: libc calls (`open`, `ftruncate`, `close`) are used with validated C string
         // arguments and checked return codes before constructing `SparseFile`.
         unsafe {
@@ -270,14 +290,18 @@ impl SparseFile {
                 let _ = close(fd); // close file descriptor if truncate fail.
                 return Err(Error::storage_io_error(StorageOp::FileResize, err));
             }
-            Ok(SparseFile::new(fd, 0, max_size))
+            Ok(SparseFile::new(fd, 0, max_size, file_id))
         }
     }
 
     /// Create a sparse file and fail if file already exists.
     /// Note that space is allocated only when data is written to this file.
     #[inline]
-    pub fn create_or_fail(file_path: impl AsRef<str>, max_size: usize) -> Result<SparseFile> {
+    pub fn create_or_fail(
+        file_path: impl AsRef<str>,
+        max_size: usize,
+        file_id: crate::buffer::PersistedFileID,
+    ) -> Result<SparseFile> {
         // SAFETY: libc calls (`open`, `ftruncate`, `close`) are issued with a
         // validated C string and checked return codes before constructing
         // `SparseFile`.
@@ -300,13 +324,16 @@ impl SparseFile {
                 let _ = close(fd); // close file descriptor if truncate fail.
                 return Err(Error::storage_io_error(StorageOp::FileResize, err));
             }
-            Ok(SparseFile::new(fd, 0, max_size))
+            Ok(SparseFile::new(fd, 0, max_size, file_id))
         }
     }
 
     /// Open an existing sparse file with given maximum length.
     #[inline]
-    pub fn open(file_path: impl AsRef<str>) -> Result<SparseFile> {
+    pub fn open(
+        file_path: impl AsRef<str>,
+        file_id: crate::buffer::PersistedFileID,
+    ) -> Result<SparseFile> {
         // SAFETY: `open` is called with a validated C string, and the returned
         // fd is checked before it is used or wrapped.
         unsafe {
@@ -325,19 +352,31 @@ impl SparseFile {
                     return Err(Error::storage_io_error(StorageOp::FileStat, err));
                 }
             };
-            Ok(SparseFile::new(fd, 0, logical_size))
+            Ok(SparseFile::new(fd, 0, logical_size, file_id))
         }
     }
 
     /// Create a new sparse file.
     #[inline]
-    fn new(fd: RawFd, offset: usize, max_len: usize) -> Self {
+    fn new(
+        fd: RawFd,
+        offset: usize,
+        max_len: usize,
+        file_id: crate::buffer::PersistedFileID,
+    ) -> Self {
         SparseFile {
+            file_id,
             fd,
             offset: AtomicUsize::new(offset),
             max_len: AtomicUsize::new(max_len),
             size_lock: RawMutex::INIT,
         }
+    }
+
+    /// Returns the immutable persisted-file identity attached to this file handle.
+    #[inline]
+    pub fn file_id(&self) -> crate::buffer::PersistedFileID {
+        self.file_id
     }
 
     /// Allocate enough space for data of given length to persist
@@ -493,8 +532,8 @@ impl IOSubmission for PreparedWriteSubmission {
     type Key = BlockKey;
 
     #[inline]
-    fn key(&self) -> &Self::Key {
-        &self.key
+    fn key(&self) -> Self::Key {
+        self.key
     }
 
     #[inline]
@@ -512,7 +551,7 @@ impl IOSubmission for TableFsSubmission {
     type Key = BlockKey;
 
     #[inline]
-    fn key(&self) -> &Self::Key {
+    fn key(&self) -> Self::Key {
         match self {
             TableFsSubmission::Write(sub) => sub.key(),
             TableFsSubmission::Read(sub) => sub.key(),
@@ -775,7 +814,7 @@ mod tests {
         impl std::future::Future<Output = Result<()>> + Send,
     ) {
         WriteSubmission::prepare(
-            BlockKey::new(801, block_id),
+            BlockKey::new(table_file.file_id(), block_id),
             ReadonlyBackingFile::from(table_file),
             usize::from(block_id) * STORAGE_SECTOR_SIZE,
             DirectBuf::zeroed(STORAGE_SECTOR_SIZE),
@@ -922,15 +961,17 @@ mod tests {
         let file_path = temp_dir.path().join("sparsefile1.bin");
         let file_path = file_path.to_string_lossy().into_owned();
         assert!(matches!(
-            SparseFile::open(&file_path),
+            SparseFile::open(&file_path, UNTRACKED_PERSISTED_FILE_ID),
             Err(Error::StorageIOError {
                 op: StorageOp::FileOpen,
                 ..
             })
         ));
-        let file = SparseFile::create_or_trunc(&file_path, 1024 * 1024).unwrap();
+        let file =
+            SparseFile::create_or_trunc(&file_path, 1024 * 1024, UNTRACKED_PERSISTED_FILE_ID)
+                .unwrap();
         drop(file);
-        let file = SparseFile::open(&file_path).unwrap();
+        let file = SparseFile::open(&file_path, UNTRACKED_PERSISTED_FILE_ID).unwrap();
         drop(file);
     }
 
@@ -944,7 +985,7 @@ mod tests {
             .join("create.bin");
         let file_path = file_path.to_string_lossy().into_owned();
         assert!(matches!(
-            SparseFile::create_or_trunc(&file_path, 4096),
+            SparseFile::create_or_trunc(&file_path, 4096, UNTRACKED_PERSISTED_FILE_ID),
             Err(Error::StorageIOError {
                 op: StorageOp::FileCreate,
                 ..
@@ -956,11 +997,11 @@ mod tests {
     fn test_sparse_file_invalid_path_maps_invalid_storage_path() {
         let invalid_path = "bad\0path";
         assert!(matches!(
-            SparseFile::open(invalid_path),
+            SparseFile::open(invalid_path, UNTRACKED_PERSISTED_FILE_ID),
             Err(Error::InvalidStoragePath(path)) if path == invalid_path
         ));
         assert!(matches!(
-            SparseFile::create_or_trunc(invalid_path, 4096),
+            SparseFile::create_or_trunc(invalid_path, 4096, UNTRACKED_PERSISTED_FILE_ID),
             Err(Error::InvalidStoragePath(path)) if path == invalid_path
         ));
     }
@@ -970,7 +1011,12 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let file_path = temp_dir.path().join("capacity.bin");
         let file_path = file_path.to_string_lossy().into_owned();
-        let file = SparseFile::create_or_trunc(&file_path, STORAGE_SECTOR_SIZE).unwrap();
+        let file = SparseFile::create_or_trunc(
+            &file_path,
+            STORAGE_SECTOR_SIZE,
+            UNTRACKED_PERSISTED_FILE_ID,
+        )
+        .unwrap();
         assert_eq!(
             file.alloc(STORAGE_SECTOR_SIZE).unwrap(),
             (0, STORAGE_SECTOR_SIZE)

@@ -277,10 +277,10 @@ impl<T> IOQueue<T> {
 /// inflight dedupe and ordering live above the worker in the state machine and
 /// its owning subsystem.
 pub trait IOSubmission {
-    type Key;
+    type Key: Copy;
 
     /// Returns the domain key associated with this submission.
-    fn key(&self) -> &Self::Key;
+    fn key(&self) -> Self::Key;
     /// Returns the backend-agnostic IO operation to prepare and submit.
     fn operation(&mut self) -> &mut Operation;
 }
@@ -1009,8 +1009,8 @@ mod tests {
     impl IOSubmission for ExpandSubmission {
         type Key = u64;
 
-        fn key(&self) -> &Self::Key {
-            &self.key
+        fn key(&self) -> Self::Key {
+            self.key
         }
 
         fn operation(&mut self) -> &mut Operation {
@@ -1172,8 +1172,8 @@ mod tests {
     impl IOSubmission for RecordedSubmission {
         type Key = u64;
 
-        fn key(&self) -> &Self::Key {
-            &self.key
+        fn key(&self) -> Self::Key {
+            self.key
         }
 
         fn operation(&mut self) -> &mut Operation {

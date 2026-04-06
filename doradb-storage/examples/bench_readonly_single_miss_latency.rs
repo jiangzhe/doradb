@@ -200,7 +200,6 @@ fn main() {
         write_pages(&table_file, args.pages).await;
 
         let pool = QuiescentBox::new(ReadonlyBufferPool::from_table_file(
-            901,
             FileKind::TableFile,
             Arc::clone(&table_file),
             engine.disk_pool.clone_inner(),

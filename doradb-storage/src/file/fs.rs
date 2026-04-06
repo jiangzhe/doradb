@@ -2,7 +2,7 @@ use crate::buffer::guard::PageExclusiveGuard;
 use crate::buffer::page::Page;
 use crate::buffer::{
     BlockKey, EvictReadSubmission, EvictSubmission, EvictableBufferPool, EvictablePoolStateMachine,
-    GlobalReadonlyBufferPool, PageID, PoolRequest, PoolRole, ReadSubmission, ReadonlyBufferPool,
+    GlobalReadonlyBufferPool, PoolRequest, PoolRole, ReadSubmission, ReadonlyBufferPool,
 };
 use crate::catalog::table::TableMetadata;
 use crate::catalog::{TableID, USER_OBJ_ID_START};
@@ -11,7 +11,7 @@ use crate::conf::FileSystemConfig;
 use crate::conf::path::path_to_utf8;
 use crate::error::{Error, FileKind, Result};
 use crate::file::cow_file::COW_FILE_PAGE_SIZE;
-use crate::file::multi_table_file::{CATALOG_MTB_PERSISTED_FILE_ID, MultiTableFile};
+use crate::file::multi_table_file::MultiTableFile;
 use crate::file::table_file::{ActiveRoot, TABLE_FILE_INITIAL_SIZE};
 use crate::file::table_file::{MutableTableFile, TableFile};
 use crate::file::{SparseFile, TableFsStateMachine, TableFsSubmission, WriteSubmission};
@@ -176,13 +176,6 @@ pub(crate) enum BackgroundWriteRequest {
     IndexPool(PoolBatchWriteRequest),
 }
 
-/// Unified completion key space for the shared storage backend.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum StorageKey {
-    Table(BlockKey),
-    Pool(PageID),
-}
-
 /// Domain-specific submission owner for one inflight backend operation.
 enum StorageSubmissionKind {
     Table(TableFsSubmission),
@@ -192,7 +185,6 @@ enum StorageSubmissionKind {
 
 /// Backend-facing submission stored in the shared storage inflight table.
 struct StorageSubmission {
-    key: StorageKey,
     inner: StorageSubmissionKind,
 }
 
@@ -200,7 +192,6 @@ impl StorageSubmission {
     #[inline]
     fn table(sub: TableFsSubmission) -> Self {
         Self {
-            key: StorageKey::Table(*sub.key()),
             inner: StorageSubmissionKind::Table(sub),
         }
     }
@@ -208,7 +199,6 @@ impl StorageSubmission {
     #[inline]
     fn mem_pool(sub: EvictSubmission) -> Self {
         Self {
-            key: StorageKey::Pool(*sub.key()),
             inner: StorageSubmissionKind::MemPool(sub),
         }
     }
@@ -216,18 +206,21 @@ impl StorageSubmission {
     #[inline]
     fn index_pool(sub: EvictSubmission) -> Self {
         Self {
-            key: StorageKey::Pool(*sub.key()),
             inner: StorageSubmissionKind::IndexPool(sub),
         }
     }
 }
 
 impl IOSubmission for StorageSubmission {
-    type Key = StorageKey;
+    type Key = BlockKey;
 
     #[inline]
-    fn key(&self) -> &Self::Key {
-        &self.key
+    fn key(&self) -> Self::Key {
+        match &self.inner {
+            StorageSubmissionKind::Table(sub) => sub.key(),
+            StorageSubmissionKind::MemPool(sub) => sub.key(),
+            StorageSubmissionKind::IndexPool(sub) => sub.key(),
+        }
     }
 
     #[inline]
@@ -1368,20 +1361,21 @@ pub struct FileSystem {
 }
 
 impl FileSystem {
-    /// Clone the file-facing read and write clients for a table-file handle.
-    #[inline]
-    pub(crate) fn table_io_clients(
-        &self,
-    ) -> (IOClient<ReadSubmission>, IOClient<BackgroundWriteRequest>) {
-        (self.table_reads.clone(), self.background_writes.clone())
-    }
-
     #[inline]
     fn assert_pool_role(role: PoolRole, context: &'static str) {
         match role {
             PoolRole::Mem | PoolRole::Index => {}
             other => panic!("unsupported pool role {other:?} in {context}"),
         }
+    }
+
+    /// Send one readonly/table-file read onto the shared table-read lane.
+    #[inline]
+    pub(crate) async fn send_table_read_async(
+        &self,
+        req: ReadSubmission,
+    ) -> StdResult<(), SendError<ReadSubmission>> {
+        self.table_reads.send_async(req).await
     }
 
     /// Send one pool page-in read onto the shared pool-read lane.
@@ -1463,7 +1457,6 @@ impl FileSystem {
             &file_path,
             TABLE_FILE_INITIAL_SIZE,
             table_id,
-            self.table_reads.clone(),
             self.background_writes.clone(),
             trunc,
         )?;
@@ -1480,15 +1473,12 @@ impl FileSystem {
         global_disk_pool: QuiescentGuard<GlobalReadonlyBufferPool>,
     ) -> Result<(Arc<TableFile>, ReadonlyBufferPool)> {
         let file_path = self.table_file_path(table_id);
-        let (table_reads, background_writes) = self.table_io_clients();
         let table_file = Arc::new(TableFile::open(
             &file_path,
             table_id,
-            table_reads,
-            background_writes,
+            self.background_writes.clone(),
         )?);
         let disk_pool = ReadonlyBufferPool::new(
-            table_id,
             FileKind::TableFile,
             Arc::clone(&table_file),
             global_disk_pool,
@@ -1546,15 +1536,12 @@ impl FileSystem {
         &self,
         global_disk_pool: QuiescentGuard<GlobalReadonlyBufferPool>,
     ) -> Result<(Arc<MultiTableFile>, ReadonlyBufferPool)> {
-        let (table_reads, background_writes) = self.table_io_clients();
         let mtb = MultiTableFile::open_or_create(
             self.catalog_mtb_file_path(),
-            table_reads,
-            background_writes,
+            self.background_writes.clone(),
         )
         .await?;
         let disk_pool = ReadonlyBufferPool::new(
-            CATALOG_MTB_PERSISTED_FILE_ID,
             FileKind::CatalogMultiTableFile,
             Arc::clone(&mtb),
             global_disk_pool,
@@ -1663,6 +1650,14 @@ pub(crate) mod tests {
         }
 
         #[inline]
+        pub(crate) fn guard(&self) -> QuiescentGuard<FileSystem> {
+            self.fs
+                .as_ref()
+                .expect("test filesystem guard is live")
+                .clone()
+        }
+
+        #[inline]
         pub(crate) fn disk_pool(&self) -> DiskPool {
             self.registry.dependency::<DiskPool>().unwrap()
         }
@@ -1741,10 +1736,10 @@ pub(crate) mod tests {
                 .data_dir(data_dir)
                 .readonly_buffer_size(TEST_READONLY_BUFFER_BYTES);
             let mut builder = RegistryBuilder::new();
+            builder.build::<FileSystem>(file.clone()).await?;
             builder
                 .build::<DiskPool>(DiskPoolConfig::new(file.readonly_buffer_size))
                 .await?;
-            builder.build::<FileSystem>(file).await?;
             builder
                 .build::<MetaPool>(MetaPoolConfig::new(TEST_META_POOL_BYTES))
                 .await?;

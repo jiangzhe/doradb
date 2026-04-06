@@ -1,5 +1,5 @@
 use crate::bitmap::AllocMap;
-use crate::buffer::{PersistedFileID, ReadSubmission, ReadonlyBackingFile, ReadonlyBufferPool};
+use crate::buffer::{ReadonlyBackingFile, ReadonlyBufferPool};
 use crate::catalog::{ObjID, TableID, USER_OBJ_ID_START};
 use crate::error::{BlockCorruptionCause, BlockKind, Error, FileKind, Result};
 use crate::file::block_integrity::{
@@ -28,12 +28,12 @@ use std::ops::Deref;
 use std::path::Path;
 use std::sync::Arc;
 
+pub use crate::file::CATALOG_MTB_PERSISTED_FILE_ID;
+
 /// On-disk format version of `catalog.mtb`.
 pub const CATALOG_MTB_VERSION: u64 = 2;
 /// Reserved number of catalog logical-table root descriptors.
 pub const CATALOG_TABLE_ROOT_DESC_COUNT: usize = 4;
-/// Reserved persisted-file identity of `catalog.mtb`.
-pub const CATALOG_MTB_PERSISTED_FILE_ID: PersistedFileID = USER_OBJ_ID_START - 1;
 /// Initial sparse-file size for `catalog.mtb`.
 pub const MULTI_TABLE_FILE_INITIAL_SIZE: usize = TABLE_FILE_INITIAL_SIZE;
 
@@ -233,24 +233,24 @@ fn multi_table_codec() -> CowCodec<MultiTableMetaBlock> {
 /// - page 0 contains two ping-pong super blocks,
 /// - meta blocks are CoW-allocated and super blocks point to active meta block,
 /// - updates are published by writing new meta block then swapping active super block.
-pub struct MultiTableFile(CowFile<MultiTableMetaBlock>);
+pub struct MultiTableFile {
+    file: CowFile<MultiTableMetaBlock>,
+    background_writes: IOClient<BackgroundWriteRequest>,
+}
 
 impl MultiTableFile {
     /// Open existing file or create a new one, then load/publish initial active root.
     #[inline]
     pub(super) async fn open_or_create(
         file_path: impl AsRef<str>,
-        table_reads: IOClient<ReadSubmission>,
         background_writes: IOClient<BackgroundWriteRequest>,
     ) -> Result<Arc<Self>> {
         let file_path = file_path.as_ref();
         let file_exists = Path::new(file_path).exists();
-        let cow_file = if file_exists {
+        let file = if file_exists {
             CowFile::open(
                 file_path,
                 CATALOG_MTB_PERSISTED_FILE_ID,
-                table_reads,
-                background_writes,
                 multi_table_codec(),
             )?
         } else {
@@ -258,14 +258,15 @@ impl MultiTableFile {
                 file_path,
                 MULTI_TABLE_FILE_INITIAL_SIZE,
                 CATALOG_MTB_PERSISTED_FILE_ID,
-                table_reads,
-                background_writes,
                 multi_table_codec(),
                 false,
             )?
         };
 
-        let file = Arc::new(MultiTableFile(cow_file));
+        let file = Arc::new(MultiTableFile {
+            file,
+            background_writes,
+        });
 
         if !file_exists {
             let mutable =
@@ -283,7 +284,7 @@ impl MultiTableFile {
         &self,
         disk_pool: &ReadonlyBufferPool,
     ) -> Result<MultiTableActiveRoot> {
-        self.0.load_active_root_from_pool(disk_pool).await
+        self.file.load_active_root_from_pool(disk_pool).await
     }
 
     /// Returns active-root snapshot from in-memory pointer without additional IO.
@@ -298,8 +299,13 @@ impl MultiTableFile {
 
     #[inline]
     pub async fn write_block(self: &Arc<Self>, block_id: BlockID, buf: DirectBuf) -> Result<()> {
-        self.0
-            .write_block_with_owner(ReadonlyBackingFile::from(Arc::clone(self)), block_id, buf)
+        self.file
+            .write_block_with_owner(
+                &self.background_writes,
+                ReadonlyBackingFile::from(Arc::clone(self)),
+                block_id,
+                buf,
+            )
             .await
     }
 
@@ -308,8 +314,12 @@ impl MultiTableFile {
         self: &Arc<Self>,
         new_root: MultiTableActiveRoot,
     ) -> Result<Option<OldMultiTableRoot>> {
-        self.0
-            .publish_root_with_owner(ReadonlyBackingFile::from(Arc::clone(self)), new_root)
+        self.file
+            .publish_root_with_owner(
+                &self.background_writes,
+                ReadonlyBackingFile::from(Arc::clone(self)),
+                new_root,
+            )
             .await
     }
 
@@ -338,7 +348,7 @@ impl Deref for MultiTableFile {
 
     #[inline]
     fn deref(&self) -> &Self::Target {
-        &self.0
+        &self.file
     }
 }
 

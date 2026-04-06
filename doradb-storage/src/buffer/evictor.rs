@@ -1201,11 +1201,11 @@ mod tests {
                 let file = FileSystemConfig::default()
                     .data_dir(root)
                     .readonly_buffer_size(frame_page_bytes(256));
+                builder.build::<FileSystem>(file.clone()).await.unwrap();
                 builder
                     .build::<DiskPool>(DiskPoolConfig::new(file.readonly_buffer_size))
                     .await
                     .unwrap();
-                builder.build::<FileSystem>(file).await.unwrap();
                 builder
                     .build::<IndexPool>(IndexPoolConfig::new(
                         TEST_POOL_BYTES,

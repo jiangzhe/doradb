@@ -1,5 +1,5 @@
 use crate::bitmap::AllocMap;
-use crate::buffer::{ReadSubmission, ReadonlyBackingFile, ReadonlyBufferPool};
+use crate::buffer::{ReadonlyBackingFile, ReadonlyBufferPool};
 use crate::catalog::{TableID, table::TableMetadata};
 use crate::error::{BlockCorruptionCause, BlockKind, Error, FileKind, Result};
 use crate::file::block_integrity::{
@@ -207,7 +207,10 @@ fn table_codec() -> CowCodec<TableMeta> {
 }
 
 /// Table-file facade over generic copy-on-write file mechanics.
-pub struct TableFile(CowFile<TableMeta>);
+pub struct TableFile {
+    file: CowFile<TableMeta>,
+    background_writes: IOClient<BackgroundWriteRequest>,
+}
 
 impl TableFile {
     /// Create a table file.
@@ -216,38 +219,28 @@ impl TableFile {
         file_path: impl AsRef<str>,
         initial_size: usize,
         table_id: TableID,
-        table_reads: IOClient<ReadSubmission>,
         background_writes: IOClient<BackgroundWriteRequest>,
         trunc: bool,
     ) -> Result<Self> {
         debug_assert!(initial_size.is_multiple_of(COW_FILE_PAGE_SIZE));
-        let cow_file = CowFile::create(
-            file_path,
-            initial_size,
-            table_id,
-            table_reads,
+        let file = CowFile::create(file_path, initial_size, table_id, table_codec(), trunc)?;
+        Ok(TableFile {
+            file,
             background_writes,
-            table_codec(),
-            trunc,
-        )?;
-        Ok(TableFile(cow_file))
+        })
     }
 
     #[inline]
     pub(super) fn open(
         file_path: impl AsRef<str>,
         table_id: TableID,
-        table_reads: IOClient<ReadSubmission>,
         background_writes: IOClient<BackgroundWriteRequest>,
     ) -> Result<Self> {
-        let cow_file = CowFile::open(
-            file_path,
-            table_id,
-            table_reads,
+        let file = CowFile::open(file_path, table_id, table_codec())?;
+        Ok(TableFile {
+            file,
             background_writes,
-            table_codec(),
-        )?;
-        Ok(TableFile(cow_file))
+        })
     }
 
     /// Load the active root after validating the selected table meta block through readonly cache.
@@ -256,13 +249,18 @@ impl TableFile {
         &self,
         disk_pool: &ReadonlyBufferPool,
     ) -> Result<ActiveRoot> {
-        self.0.load_active_root_from_pool(disk_pool).await
+        self.file.load_active_root_from_pool(disk_pool).await
     }
 
     #[inline]
     pub async fn write_block(self: &Arc<Self>, block_id: BlockID, buf: DirectBuf) -> Result<()> {
-        self.0
-            .write_block_with_owner(ReadonlyBackingFile::from(Arc::clone(self)), block_id, buf)
+        self.file
+            .write_block_with_owner(
+                &self.background_writes,
+                ReadonlyBackingFile::from(Arc::clone(self)),
+                block_id,
+                buf,
+            )
             .await
     }
 
@@ -271,15 +269,19 @@ impl TableFile {
         self: &Arc<Self>,
         new_root: ActiveRoot,
     ) -> Result<Option<OldRoot>> {
-        self.0
-            .publish_root_with_owner(ReadonlyBackingFile::from(Arc::clone(self)), new_root)
+        self.file
+            .publish_root_with_owner(
+                &self.background_writes,
+                ReadonlyBackingFile::from(Arc::clone(self)),
+                new_root,
+            )
             .await
     }
 
     #[inline]
     /// Remove this table file from disk.
     pub fn delete(self) {
-        self.0.delete();
+        self.file.delete();
     }
 }
 
@@ -288,7 +290,7 @@ impl Deref for TableFile {
 
     #[inline]
     fn deref(&self) -> &Self::Target {
-        &self.0
+        &self.file
     }
 }
 
@@ -579,12 +581,16 @@ pub type OldRoot = OldCowRoot<TableMeta>;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::buffer::{global_readonly_pool_scope, table_readonly_pool};
+    use crate::buffer::{
+        GlobalReadonlyBufferPool, PoolRole, ReadonlyBufferPool, global_readonly_pool_scope,
+        table_readonly_pool,
+    };
     use crate::catalog::{ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexSpec};
     use crate::error::{BlockCorruptionCause, BlockKind, Error, FileKind};
     use crate::file::block_integrity::BLOCK_INTEGRITY_TRAILER_SIZE;
     use crate::file::{build_test_fs, build_test_fs_in, test_block_id};
     use crate::io::IOBuf;
+    use crate::quiescent::QuiescentBox;
     use crate::value::ValKind;
     use std::fs::OpenOptions;
     use std::io::{Seek, SeekFrom, Write};
@@ -708,13 +714,34 @@ mod tests {
             assert_eq!(table_file.active_root().slot_no, 0);
             assert_eq!(table_file.active_root().trx_id, 1);
 
-            // We first drop file system, then send the IO request,
-            // it should fail.
-            drop(fs);
+            let global = QuiescentBox::new(
+                GlobalReadonlyBufferPool::with_capacity(
+                    PoolRole::Disk,
+                    64 * 1024 * 1024,
+                    fs.guard(),
+                )
+                .unwrap(),
+            );
+            let disk_pool = ReadonlyBufferPool::from_table_file(
+                FileKind::TableFile,
+                Arc::clone(&table_file),
+                global.guard(),
+            );
+            let disk_pool_guard = disk_pool.pool_guard();
 
-            let res = read_page_for_test(&table_file, test_block_id(1)).await;
+            // We first shut down the file system, then send the IO request,
+            // it should fail.
+            fs.shutdown();
+
+            let res = disk_pool
+                .read_validated_block(&disk_pool_guard, test_block_id(1), accept_any_page)
+                .await;
             assert!(res.is_err());
 
+            drop(disk_pool_guard);
+            drop(disk_pool);
+            drop(global);
+            drop(fs);
             drop(table_file);
         });
     }
