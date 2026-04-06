@@ -96,7 +96,7 @@ impl<P: BufferPool> GenericBlockIndex<P> {
         mem_pool_guard: &PoolGuard,
         metadata: &Arc<TableMetadata>,
         count: usize,
-    ) -> PageSharedGuard<RowPage> {
+    ) -> Result<PageSharedGuard<RowPage>> {
         self.try_get_insert_page_with_redo(
             meta_pool_guard,
             mem_pool,
@@ -106,7 +106,6 @@ impl<P: BufferPool> GenericBlockIndex<P> {
             None,
         )
         .await
-        .expect("block-index get_insert_page should not ignore row-page I/O failures")
     }
 
     #[inline]
@@ -316,10 +315,13 @@ mod tests {
     use crate::buffer::guard::{FacadePageGuard, PageExclusiveGuard};
     use crate::buffer::page::{BufferPage, INVALID_PAGE_ID, VersionedPageID};
     use crate::buffer::{BufferPool, FixedBufferPool, PoolGuard};
+    use crate::catalog::{ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexSpec};
     use crate::error::Validation;
     use crate::file::test_block_id;
     use crate::latch::LatchFallbackMode;
     use crate::quiescent::{QuiescentBox, QuiescentGuard};
+    use crate::value::ValKind;
+    use semistr::SemiStr;
     use std::future::Future;
     use std::sync::Arc;
     use std::sync::Barrier;
@@ -436,6 +438,121 @@ mod tests {
         }
     }
 
+    struct FailingInsertPagePool {
+        inner: QuiescentGuard<FixedBufferPool>,
+        fail_page_id: AtomicU64,
+    }
+
+    impl FailingInsertPagePool {
+        #[inline]
+        fn new(inner: QuiescentGuard<FixedBufferPool>, fail_page_id: PageID) -> Self {
+            Self {
+                inner,
+                fail_page_id: AtomicU64::new(u64::from(fail_page_id)),
+            }
+        }
+    }
+
+    impl BufferPool for FailingInsertPagePool {
+        #[inline]
+        fn capacity(&self) -> usize {
+            self.inner.capacity()
+        }
+
+        #[inline]
+        fn allocated(&self) -> usize {
+            self.inner.allocated()
+        }
+
+        #[inline]
+        fn pool_guard(&self) -> PoolGuard {
+            self.inner.pool_guard()
+        }
+
+        #[inline]
+        fn allocate_page<T: BufferPage>(
+            &self,
+            guard: &PoolGuard,
+        ) -> impl Future<Output = Result<PageExclusiveGuard<T>>> + Send {
+            self.inner.allocate_page(guard)
+        }
+
+        #[inline]
+        fn allocate_page_at<T: BufferPage>(
+            &self,
+            guard: &PoolGuard,
+            page_id: PageID,
+        ) -> impl Future<Output = Result<PageExclusiveGuard<T>>> + Send {
+            self.inner.allocate_page_at(guard, page_id)
+        }
+
+        #[inline]
+        async fn get_page<T: BufferPage>(
+            &self,
+            guard: &PoolGuard,
+            page_id: PageID,
+            mode: LatchFallbackMode,
+        ) -> Result<FacadePageGuard<T>> {
+            if page_id == self.fail_page_id.load(Ordering::Acquire) {
+                return Err(std::io::Error::from_raw_os_error(libc::EIO).into());
+            }
+            self.inner.get_page(guard, page_id, mode).await
+        }
+
+        #[inline]
+        fn get_page_versioned<T: BufferPage>(
+            &self,
+            guard: &PoolGuard,
+            id: VersionedPageID,
+            mode: LatchFallbackMode,
+        ) -> impl Future<Output = Result<Option<FacadePageGuard<T>>>> + Send {
+            self.inner.get_page_versioned(guard, id, mode)
+        }
+
+        #[inline]
+        fn deallocate_page<T: BufferPage>(&self, g: PageExclusiveGuard<T>) {
+            self.inner.deallocate_page(g)
+        }
+
+        #[inline]
+        fn get_child_page<T: BufferPage>(
+            &self,
+            guard: &PoolGuard,
+            p_guard: &FacadePageGuard<T>,
+            page_id: PageID,
+            mode: LatchFallbackMode,
+        ) -> impl Future<Output = Result<Validation<FacadePageGuard<T>>>> + Send {
+            self.inner.get_child_page(guard, p_guard, page_id, mode)
+        }
+    }
+
+    fn owned_index_pool(pool_size: usize) -> QuiescentBox<FixedBufferPool> {
+        QuiescentBox::new(
+            FixedBufferPool::with_capacity(crate::buffer::PoolRole::Index, pool_size).unwrap(),
+        )
+    }
+
+    fn owned_mem_pool(pool_size: usize) -> QuiescentBox<FixedBufferPool> {
+        QuiescentBox::new(
+            FixedBufferPool::with_capacity(crate::buffer::PoolRole::Mem, pool_size).unwrap(),
+        )
+    }
+
+    fn make_test_metadata() -> Arc<TableMetadata> {
+        Arc::new(TableMetadata::new(
+            vec![ColumnSpec {
+                column_name: SemiStr::new("id"),
+                column_type: ValKind::I32,
+                column_attributes: ColumnAttributes::empty(),
+            }],
+            vec![IndexSpec::new(
+                "idx_id",
+                vec![IndexKey::new(0)],
+                IndexAttributes::UK,
+            )],
+        ))
+    }
+
     #[test]
     fn test_try_find_row_returns_error_when_column_route_has_no_storage() {
         let pool = QuiescentBox::new(
@@ -500,6 +617,37 @@ mod tests {
 
             let res = handle.join().unwrap();
             assert!(matches!(res, Err(Error::ColumnStorageMissing)));
+        });
+    }
+
+    #[test]
+    fn test_get_insert_page_returns_error_on_free_list_io_failure() {
+        smol::block_on(async {
+            let meta_pool = owned_index_pool(64 * 1024 * 1024);
+            let mem_pool = owned_mem_pool(64 * 1024 * 1024);
+            let meta_guard = (*meta_pool).pool_guard();
+            let mem_guard = (*mem_pool).pool_guard();
+            let metadata = make_test_metadata();
+            let blk_idx = BlockIndex::new(meta_pool.guard(), &meta_guard, 0, test_block_id(77))
+                .await
+                .expect("test block-index construction should succeed");
+
+            let page_guard = blk_idx
+                .get_insert_page_exclusive(&meta_guard, &*mem_pool, &mem_guard, &metadata, 100)
+                .await
+                .expect("test insert-page allocation should succeed");
+            let page_id = page_guard.page_id();
+            blk_idx.cache_exclusive_insert_page(page_guard);
+
+            let failing_pool = FailingInsertPagePool::new(mem_pool.guard(), page_id);
+            let res = blk_idx
+                .get_insert_page(&meta_guard, &failing_pool, &mem_guard, &metadata, 100)
+                .await;
+            let err = match res {
+                Ok(_) => panic!("expected cached insert-page reload failure"),
+                Err(err) => err,
+            };
+            assert!(matches!(err, Error::IOError { .. }));
         });
     }
 }

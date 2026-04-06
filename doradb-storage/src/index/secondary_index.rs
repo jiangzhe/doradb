@@ -57,6 +57,15 @@ impl<P: BufferPool> GenericSecondaryIndex<P> {
         }
     }
 
+    /// Destroy this secondary index and reclaim all pages it owns.
+    #[inline]
+    pub(crate) async fn destroy(self, pool_guard: &PoolGuard) -> crate::error::Result<()> {
+        match self.kind {
+            GenericIndexKind::Unique(idx) => idx.destroy(pool_guard).await,
+            GenericIndexKind::NonUnique(idx) => idx.destroy(pool_guard).await,
+        }
+    }
+
     /// Returns whether this index is unique.
     #[inline]
     pub fn is_unique(&self) -> bool {

@@ -2465,6 +2465,45 @@ fn test_data_checkpoint_error_rollback() {
 }
 
 #[test]
+fn test_build_secondary_indexes_reclaims_staged_indexes_on_error() {
+    smol::block_on(async {
+        use super::build_secondary_indexes;
+        use crate::buffer::FixedBufferPool;
+        use crate::catalog::{
+            ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexSpec, TableMetadata,
+        };
+        use crate::quiescent::QuiescentBox;
+        use crate::value::ValKind;
+
+        let pool_bytes = std::mem::size_of::<crate::buffer::frame::BufferFrame>()
+            + std::mem::size_of::<crate::buffer::page::Page>();
+        let pool = QuiescentBox::new(
+            FixedBufferPool::with_capacity(PoolRole::Index, pool_bytes)
+                .expect("one-page fixed index pool should be constructible"),
+        );
+        let pool_guard = (*pool).pool_guard();
+        let metadata = TableMetadata::new(
+            vec![ColumnSpec::new(
+                "id",
+                ValKind::I32,
+                ColumnAttributes::empty(),
+            )],
+            vec![
+                IndexSpec::new("idx_a", vec![IndexKey::new(0)], IndexAttributes::PK),
+                IndexSpec::new("idx_b", vec![IndexKey::new(0)], IndexAttributes::empty()),
+            ],
+        );
+
+        let err = match build_secondary_indexes(pool.guard(), &pool_guard, &metadata, 100).await {
+            Ok(_) => panic!("second secondary-index construction should fail in one-page pool"),
+            Err(err) => err,
+        };
+        assert!(matches!(err, Error::BufferPoolFull));
+        assert_eq!(pool.allocated(), 0);
+    });
+}
+
+#[test]
 fn test_user_secondary_indexes_evict_and_continue_serving_lookups() {
     smol::block_on(async {
         use crate::catalog::{

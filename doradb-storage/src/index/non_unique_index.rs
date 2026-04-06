@@ -100,6 +100,12 @@ impl<P: BufferPool> GenericNonUniqueBTreeIndex<P> {
     pub fn new(tree: GenericBTree<P>, encoder: BTreeKeyEncoder) -> Self {
         GenericNonUniqueBTreeIndex { tree, encoder }
     }
+
+    /// Destroy this non-unique index and reclaim all backing tree pages.
+    #[inline]
+    pub(crate) async fn destroy(self, pool_guard: &PoolGuard) -> Result<()> {
+        self.tree.destory(pool_guard).await
+    }
 }
 
 impl<P: BufferPool> NonUniqueIndex for GenericNonUniqueBTreeIndex<P> {

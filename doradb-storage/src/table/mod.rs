@@ -116,6 +116,55 @@ struct FrozenPage {
     end_row_id: RowID,
 }
 
+/// Stages newly built secondary indexes until the caller publishes them.
+///
+/// This keeps the build flow linear: construct each index, then either publish
+/// the whole batch on success or explicitly destroy already-built trees before
+/// returning the original build error.
+struct SecondaryIndexScopedBuilder<P: 'static> {
+    staged: Vec<GenericSecondaryIndex<P>>,
+}
+
+impl<P: BufferPool> SecondaryIndexScopedBuilder<P> {
+    #[inline]
+    fn new(capacity: usize) -> Self {
+        Self {
+            staged: Vec::with_capacity(capacity),
+        }
+    }
+
+    #[inline]
+    async fn push_or_rollback(
+        &mut self,
+        built: Result<GenericSecondaryIndex<P>>,
+        pool_guard: &PoolGuard,
+    ) -> Result<()> {
+        match built {
+            Ok(index) => {
+                self.staged.push(index);
+                Ok(())
+            }
+            Err(err) => {
+                self.rollback(pool_guard).await;
+                Err(err)
+            }
+        }
+    }
+
+    #[inline]
+    async fn rollback(&mut self, pool_guard: &PoolGuard) {
+        for index in std::mem::take(&mut self.staged).into_iter().rev() {
+            // Keep the original construction error as the function result.
+            let _ = index.destroy(pool_guard).await;
+        }
+    }
+
+    #[inline]
+    fn publish(self) -> Box<[GenericSecondaryIndex<P>]> {
+        self.staged.into_boxed_slice()
+    }
+}
+
 #[inline]
 pub(crate) async fn build_secondary_indexes<I: BufferPool + 'static>(
     index_pool: QuiescentGuard<I>,
@@ -123,21 +172,25 @@ pub(crate) async fn build_secondary_indexes<I: BufferPool + 'static>(
     metadata: &TableMetadata,
     index_ts: TrxID,
 ) -> Result<Box<[GenericSecondaryIndex<I>]>> {
-    let mut sec_idx = Vec::with_capacity(metadata.index_specs.len());
+    let mut builder = SecondaryIndexScopedBuilder::new(metadata.index_specs.len());
     for (index_no, index_spec) in metadata.index_specs.iter().enumerate() {
         let ty_infer = |col_no: usize| metadata.col_type(col_no);
-        let si = GenericSecondaryIndex::new(
-            index_pool.clone(),
-            index_pool_guard,
-            index_no,
-            index_spec,
-            ty_infer,
-            index_ts,
-        )
-        .await?;
-        sec_idx.push(si);
+        builder
+            .push_or_rollback(
+                GenericSecondaryIndex::new(
+                    index_pool.clone(),
+                    index_pool_guard,
+                    index_no,
+                    index_spec,
+                    ty_infer,
+                    index_ts,
+                )
+                .await,
+                index_pool_guard,
+            )
+            .await?;
     }
-    Ok(sec_idx.into_boxed_slice())
+    Ok(builder.publish())
 }
 
 impl<D: BufferPool, I: BufferPool> GenericMemTable<D, I> {
