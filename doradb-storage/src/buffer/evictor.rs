@@ -2,7 +2,7 @@ use crate::buffer::arena::ArenaGuard;
 use crate::buffer::frame::FrameKind;
 use crate::buffer::guard::PageExclusiveGuard;
 use crate::buffer::page::{Page, PageID};
-use crate::buffer::{EvictableBufferPool, GlobalReadonlyBufferPool};
+use crate::buffer::{EvictableBufferPool, ReadonlyBufferPool};
 use crate::component::{Component, ComponentRegistry, ShelfScope};
 use crate::error::Result;
 use crate::quiescent::{QuiescentBox, SyncQuiescentGuard};
@@ -871,7 +871,7 @@ impl SharedEvictor {
 pub(crate) struct SharedPoolEvictorWorkers;
 
 pub(crate) struct SharedPoolEvictorWorkersOwned {
-    disk_pool: SyncQuiescentGuard<GlobalReadonlyBufferPool>,
+    disk_pool: SyncQuiescentGuard<ReadonlyBufferPool>,
     index_pool: SyncQuiescentGuard<EvictableBufferPool>,
     mem_pool: SyncQuiescentGuard<EvictableBufferPool>,
     shutdown_flag: Arc<AtomicBool>,
@@ -910,7 +910,7 @@ impl Component for SharedPoolEvictorWorkers {
 
         let handle = SharedEvictor::new(
             vec![
-                GlobalReadonlyBufferPool::shared_evictor_domain(disk_pool.clone()),
+                ReadonlyBufferPool::shared_evictor_domain(disk_pool.clone()),
                 EvictableBufferPool::shared_evictor_domain(mem_pool.clone()),
                 EvictableBufferPool::shared_evictor_domain(index_pool.clone()),
             ],
@@ -961,6 +961,7 @@ mod tests {
     };
     use crate::component::{ComponentRegistry, DiskPoolConfig, IndexPoolConfig, RegistryBuilder};
     use crate::conf::{EvictableBufferPoolConfig, FileSystemConfig};
+    use crate::error::FileKind;
     use crate::file::BlockID;
     use crate::file::cow_file::COW_FILE_PAGE_SIZE;
     use crate::file::fs::{FileSystem, FileSystemWorkers};
@@ -1190,7 +1191,8 @@ mod tests {
 
     #[derive(Clone)]
     struct ReadonlyPressureFixture {
-        pool: ReadonlyBufferPool,
+        file: Arc<TableFile>,
+        pool: QuiescentGuard<ReadonlyBufferPool>,
         base_block_id: BlockID,
         block_count: usize,
     }
@@ -1303,11 +1305,13 @@ mod tests {
             write_payload(fs, &table_file, block_id, payload.as_bytes()).await;
         }
 
-        let (_opened, pool) = fs
+        let file = fs
             .open_table_file(table_id, disk_pool.clone_inner())
             .await
             .unwrap();
+        let pool = disk_pool.clone_inner();
         ReadonlyPressureFixture {
+            file,
             pool,
             base_block_id: BlockID::from(base),
             block_count: capacity + 1,
@@ -1319,7 +1323,15 @@ mod tests {
         let pool_guard = pool.pool_guard();
         for i in 0..fixture.block_count {
             let block_id = fixture.base_block_id + i as u64;
-            let g = pool.read_block(&pool_guard, block_id).await.unwrap();
+            let g = pool
+                .read_block(
+                    FileKind::TableFile,
+                    fixture.file.sparse_file(),
+                    &pool_guard,
+                    block_id,
+                )
+                .await
+                .unwrap();
             drop(g);
         }
         drop(pool_guard);

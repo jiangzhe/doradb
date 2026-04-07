@@ -2,6 +2,7 @@ use crate::bitmap::AllocMap;
 use crate::buffer::{ReadonlyBackingFile, ReadonlyBufferPool};
 use crate::catalog::{ObjID, TableID, USER_OBJ_ID_START};
 use crate::error::{BlockCorruptionCause, BlockKind, Error, FileKind, Result, StorageOp};
+use crate::file::SparseFile;
 use crate::file::block_integrity::{
     BLOCK_INTEGRITY_HEADER_SIZE, BlockIntegritySpec, max_payload_len, validate_block,
     write_block_checksum, write_block_header,
@@ -20,12 +21,12 @@ use crate::file::super_block::{
 };
 use crate::file::table_file::TABLE_FILE_INITIAL_SIZE;
 use crate::io::{DirectBuf, IOBuf, IOClient};
+use crate::quiescent::QuiescentGuard;
 use crate::row::RowID;
 use crate::serde::{Deser, Ser};
 use crate::trx::{MIN_SNAPSHOT_TS, TrxID};
 use std::io::ErrorKind;
 use std::num::NonZeroU64;
-use std::os::fd::RawFd;
 use std::sync::Arc;
 
 pub use crate::file::CATALOG_MTB_FILE_ID;
@@ -281,9 +282,11 @@ impl MultiTableFile {
     #[inline]
     pub async fn load_active_root_from_pool(
         &self,
-        disk_pool: &ReadonlyBufferPool,
+        disk_pool: &QuiescentGuard<ReadonlyBufferPool>,
     ) -> Result<MultiTableActiveRoot> {
-        self.file.load_active_root_from_pool(disk_pool).await
+        self.file
+            .load_active_root_from_pool(FileKind::CatalogMultiTableFile, disk_pool)
+            .await
     }
 
     /// Returns the in-memory active root snapshot.
@@ -302,16 +305,19 @@ impl MultiTableFile {
         })
     }
 
-    /// Returns the physical file identifier used by readonly caching and IO routing.
     #[inline]
-    pub(crate) fn file_id(&self) -> crate::file::FileID {
-        self.file.file_id()
+    pub(crate) fn file_kind(&self) -> FileKind {
+        FileKind::CatalogMultiTableFile
     }
 
-    /// Returns the owned raw file descriptor for direct IO operations.
     #[inline]
-    pub(crate) fn raw_fd(&self) -> RawFd {
-        self.file.raw_fd()
+    pub(crate) fn sparse_file(&self) -> &Arc<SparseFile> {
+        self.file.sparse_file()
+    }
+
+    #[inline]
+    pub(crate) fn readonly_backing(&self) -> ReadonlyBackingFile {
+        self.file.readonly_backing()
     }
 
     #[inline]
@@ -436,7 +442,7 @@ impl MutableMultiTableFile {
     /// Write one page into the underlying multi-table file.
     #[inline]
     pub(crate) async fn write_block(&self, block_id: BlockID, buf: DirectBuf) -> Result<()> {
-        let owner = ReadonlyBackingFile::from(Arc::clone(self.file_ref()));
+        let owner = self.file_ref().readonly_backing();
         self.file_ref()
             .file()
             .write_block_with_owner(self.background_writes(), owner, block_id, buf)
@@ -448,7 +454,7 @@ impl MutableMultiTableFile {
         &self,
         new_root: MultiTableActiveRoot,
     ) -> Result<Option<OldMultiTableRoot>> {
-        let owner = ReadonlyBackingFile::from(Arc::clone(self.file_ref()));
+        let owner = self.file_ref().readonly_backing();
         self.file_ref()
             .file()
             .publish_root_with_owner(self.background_writes(), owner, new_root)
@@ -623,7 +629,7 @@ mod tests {
             let path = fs.catalog_mtb_file_path();
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
 
-            let (mtb, _) = fs
+            let mtb = fs
                 .open_or_create_multi_table_file(global.guard())
                 .await
                 .unwrap();
@@ -645,7 +651,7 @@ mod tests {
             assert_ne!(meta_block_id_0, meta_block_id_1);
             drop(mtb);
 
-            let (mtb2, _) = fs
+            let mtb2 = fs
                 .open_or_create_multi_table_file(global.guard())
                 .await
                 .unwrap();
@@ -666,7 +672,7 @@ mod tests {
             let (_dir, fs) = build_test_fs();
             let background_writes = fs.background_writes();
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
-            let (mtb, _) = fs
+            let mtb = fs
                 .open_or_create_multi_table_file(global.guard())
                 .await
                 .unwrap();
@@ -697,7 +703,7 @@ mod tests {
             let (dir, fs) = build_test_fs();
             let path = fs.catalog_mtb_file_path();
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
-            let (mtb, _) = fs
+            let mtb = fs
                 .open_or_create_multi_table_file(global.guard())
                 .await
                 .unwrap();
@@ -732,7 +738,7 @@ mod tests {
             let (dir, fs) = build_test_fs();
             let path = fs.catalog_mtb_file_path();
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
-            let (mtb, _) = fs
+            let mtb = fs
                 .open_or_create_multi_table_file(global.guard())
                 .await
                 .unwrap();
@@ -774,7 +780,7 @@ mod tests {
             let (dir, fs) = build_test_fs();
             let path = fs.catalog_mtb_file_path();
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
-            let (mtb, _) = fs
+            let mtb = fs
                 .open_or_create_multi_table_file(global.guard())
                 .await
                 .unwrap();
@@ -806,7 +812,7 @@ mod tests {
             let background_writes = fs.background_writes();
             let path = fs.catalog_mtb_file_path();
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
-            let (mtb, _) = fs
+            let mtb = fs
                 .open_or_create_multi_table_file(global.guard())
                 .await
                 .unwrap();
@@ -847,7 +853,7 @@ mod tests {
             overwrite_file_bytes(&path, version_offset, &2u64.to_le_bytes());
 
             let fs = build_test_fs_in(dir.path());
-            let (mtb, _) = fs
+            let mtb = fs
                 .open_or_create_multi_table_file(global.guard())
                 .await
                 .unwrap();
@@ -867,7 +873,7 @@ mod tests {
             let background_writes = fs.background_writes();
             let path = fs.catalog_mtb_file_path();
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
-            let (mtb, _) = fs
+            let mtb = fs
                 .open_or_create_multi_table_file(global.guard())
                 .await
                 .unwrap();
@@ -949,7 +955,7 @@ mod tests {
         smol::block_on(async {
             let (_dir, fs) = build_test_fs();
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
-            let (mtb, _) = fs
+            let mtb = fs
                 .open_or_create_multi_table_file(global.guard())
                 .await
                 .unwrap();
@@ -964,7 +970,7 @@ mod tests {
         smol::block_on(async {
             let (_dir, fs) = build_test_fs();
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
-            let (mtb, _) = fs
+            let mtb = fs
                 .open_or_create_multi_table_file(global.guard())
                 .await
                 .unwrap();

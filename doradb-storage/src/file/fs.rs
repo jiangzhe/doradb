@@ -2,14 +2,14 @@ use crate::buffer::guard::PageExclusiveGuard;
 use crate::buffer::page::Page;
 use crate::buffer::{
     EvictReadSubmission, EvictSubmission, EvictableBufferPool, EvictablePoolStateMachine,
-    GlobalReadonlyBufferPool, PoolRequest, PoolRole, ReadSubmission, ReadonlyBufferPool,
+    PoolRequest, PoolRole, ReadSubmission, ReadonlyBufferPool,
 };
 use crate::catalog::table::TableMetadata;
 use crate::catalog::{TableID, USER_OBJ_ID_START};
 use crate::component::{Component, ComponentRegistry, ShelfScope, Supplier};
 use crate::conf::FileSystemConfig;
 use crate::conf::path::path_to_utf8;
-use crate::error::{Error, FileKind, Result};
+use crate::error::{Error, Result};
 use crate::file::cow_file::COW_FILE_PAGE_SIZE;
 use crate::file::multi_table_file::{
     MultiTableActiveRoot, MultiTableFile, MultiTableFileOpenOutcome, MutableMultiTableFile,
@@ -1465,19 +1465,14 @@ impl FileSystem {
     pub async fn open_table_file(
         &self,
         table_id: TableID,
-        global_disk_pool: QuiescentGuard<GlobalReadonlyBufferPool>,
-    ) -> Result<(Arc<TableFile>, ReadonlyBufferPool)> {
+        disk_pool: QuiescentGuard<ReadonlyBufferPool>,
+    ) -> Result<Arc<TableFile>> {
         let file_path = self.table_file_path(table_id);
         let table_file = Arc::new(TableFile::open(&file_path, table_id)?);
-        let disk_pool = ReadonlyBufferPool::new(
-            FileKind::TableFile,
-            Arc::clone(&table_file),
-            global_disk_pool,
-        );
         let active_root = table_file.load_active_root_from_pool(&disk_pool).await?;
         let old_root = table_file.install_loaded_root(active_root);
         debug_assert!(old_root.is_none());
-        Ok((table_file, disk_pool))
+        Ok(table_file)
     }
 
     /// Build file path for a logical table id.
@@ -1525,20 +1520,15 @@ impl FileSystem {
     #[inline]
     pub async fn open_or_create_multi_table_file(
         &self,
-        global_disk_pool: QuiescentGuard<GlobalReadonlyBufferPool>,
-    ) -> Result<(Arc<MultiTableFile>, ReadonlyBufferPool)> {
+        disk_pool: QuiescentGuard<ReadonlyBufferPool>,
+    ) -> Result<Arc<MultiTableFile>> {
         let file_path = self.catalog_mtb_file_path();
         match MultiTableFile::open_or_create(&file_path).await? {
             MultiTableFileOpenOutcome::Opened(mtb) => {
-                let disk_pool = ReadonlyBufferPool::new(
-                    FileKind::CatalogMultiTableFile,
-                    Arc::clone(&mtb),
-                    global_disk_pool,
-                );
                 let active_root = mtb.load_active_root_from_pool(&disk_pool).await?;
                 let old_root = mtb.install_loaded_root(active_root);
                 debug_assert!(old_root.is_none());
-                Ok((mtb, disk_pool))
+                Ok(mtb)
             }
             MultiTableFileOpenOutcome::Created(mtb) => {
                 let mutable = MutableMultiTableFile::new(
@@ -1551,12 +1541,8 @@ impl FileSystem {
                     let _ = std::fs::remove_file(&file_path);
                     return Err(err);
                 }
-                let disk_pool = ReadonlyBufferPool::new(
-                    FileKind::CatalogMultiTableFile,
-                    Arc::clone(&mtb),
-                    global_disk_pool,
-                );
-                Ok((mtb, disk_pool))
+                let _ = disk_pool;
+                Ok(mtb)
             }
         }
     }
@@ -1627,6 +1613,7 @@ pub(crate) mod tests {
     use crate::value::ValKind;
     use crate::{DiskPool, IndexPool, MemPool, MetaPool};
     use std::ops::Deref;
+    use std::os::fd::AsRawFd;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::time::Duration;
@@ -1980,7 +1967,7 @@ pub(crate) mod tests {
                 "freshly created catalog.mtb should be removed after failed initial publish"
             );
 
-            let (mtb, _pool) = fs
+            let mtb = fs
                 .open_or_create_multi_table_file(global.guard())
                 .await
                 .unwrap();
@@ -2009,15 +1996,16 @@ pub(crate) mod tests {
             drop(old_root);
             write_payload(&fs, &table_file, BlockID::from(7usize), b"table-read").await;
 
-            let (reopened, readonly_pool) = fs
+            let reopened = fs
                 .open_table_file(130, fs.disk_pool().clone_inner())
                 .await
                 .unwrap();
+            let readonly_pool = fs.disk_pool().clone_inner();
             let readonly_guard = readonly_pool.pool_guard();
             let index_pool = fs.index_pool();
             let background_file =
                 StorageBackendFileIdentity::from_path(temp_dir.path().join("index.swp")).unwrap();
-            let read_fd = reopened.raw_fd();
+            let read_fd = reopened.sparse_file().as_raw_fd();
             let stats_start = fs.storage_service_stats();
             let hook = Arc::new(ControlledStorageOpHook::new(IOKind::Write, background_file));
             let _hook = install_storage_backend_test_hook(hook.clone());
@@ -2025,18 +2013,23 @@ pub(crate) mod tests {
             let writes_done = test_dispatch_dirty_pages(index_pool, 2).await;
             hook.wait_for_blocked_submits(1).await;
 
-            let read_stats_start = readonly_pool.global_stats();
+            let read_stats_start = readonly_pool.stats();
             let readonly_probe = readonly_pool.clone();
             let readonly_task = smol::spawn(async move {
                 let g = readonly_pool
-                    .read_block(&readonly_guard, BlockID::from(7usize))
+                    .read_block(
+                        reopened.file_kind(),
+                        reopened.sparse_file(),
+                        &readonly_guard,
+                        BlockID::from(7usize),
+                    )
                     .await
                     .unwrap();
                 g.page()[..10].to_vec()
             });
             wait_until(|| {
                 readonly_probe
-                    .global_stats()
+                    .stats()
                     .delta_since(read_stats_start)
                     .queued_reads
                     == 1

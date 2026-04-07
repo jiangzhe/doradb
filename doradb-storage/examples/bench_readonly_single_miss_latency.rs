@@ -1,38 +1,40 @@
 use clap::Parser;
 use doradb_storage::buffer::frame::BufferFrame;
-use doradb_storage::buffer::page::{PAGE_SIZE, Page};
-use doradb_storage::buffer::{BufferPoolStats, PoolRole, ReadonlyBufferPool};
-use doradb_storage::catalog::{ColumnAttributes, ColumnSpec, TableMetadata};
+use doradb_storage::buffer::page::Page;
+use doradb_storage::buffer::{BufferPoolStats, PoolRole};
+use doradb_storage::catalog::{
+    ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexSpec, TableSpec,
+};
 use doradb_storage::conf::{
     EngineConfig, EvictableBufferPoolConfig, FileSystemConfig, TrxSysConfig,
 };
-use doradb_storage::error::FileKind;
-use doradb_storage::file::BlockID;
-use doradb_storage::file::table_file::MutableTableFile;
-use doradb_storage::io::{DirectBuf, IOBackendStats, IOBuf};
-use doradb_storage::quiescent::QuiescentBox;
-use doradb_storage::value::ValKind;
+use doradb_storage::io::IOBackendStats;
+use doradb_storage::row::ops::{InsertMvcc, SelectKey, SelectMvcc};
+use doradb_storage::session::Session;
+use doradb_storage::table::{Table, TablePersistence};
+use doradb_storage::value::{Val, ValKind};
 use rand::RngCore;
+use std::hint::black_box;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use tempfile::{Builder, TempDir};
 
-const DEFAULT_PAGES: usize = 8192;
+const DEFAULT_ROWS: usize = 8192;
 const DEFAULT_WARM_READS: usize = 1_000_000;
 const DEFAULT_CACHE_BYTES: usize = 640usize * 1024 * 1024;
-const MIN_READONLY_POOL_PAGES: usize = 256;
+const READ_SET: [usize; 1] = [0];
 
 #[derive(Debug, Parser)]
 #[command(
     version,
-    about = "Readonly buffer-pool serialized single-miss latency benchmark"
+    about = "Public persisted-row lookup cold/warm latency benchmark"
 )]
 struct Args {
-    /// Number of persisted blocks written to the table file.
-    #[arg(long, default_value_t = DEFAULT_PAGES)]
-    pages: usize,
-    /// Number of random warm-hit control reads after the full resident set is loaded.
+    /// Number of persisted rows written to the benchmark table.
+    #[arg(long, default_value_t = DEFAULT_ROWS)]
+    rows: usize,
+    /// Number of random warm lookup reads after the persisted row set is loaded.
     #[arg(long, default_value_t = DEFAULT_WARM_READS)]
     warm_reads: usize,
     /// Capacity of the global readonly pool in bytes.
@@ -45,38 +47,8 @@ struct Args {
     temp_dir: Option<PathBuf>,
 }
 
-fn make_metadata() -> Arc<TableMetadata> {
-    Arc::new(TableMetadata::new(
-        vec![ColumnSpec::new(
-            "c0",
-            ValKind::U32,
-            ColumnAttributes::empty(),
-        )],
-        vec![],
-    ))
-}
-
-async fn write_pages(table_file: &MutableTableFile, pages: usize) {
-    for page_id in 0..pages {
-        let mut buf = DirectBuf::zeroed(PAGE_SIZE);
-        let bytes = buf.as_bytes_mut();
-        bytes.fill(0);
-        bytes[0..8].copy_from_slice(&(page_id as u64).to_le_bytes());
-        table_file
-            .write_block(BlockID::from(page_id), buf)
-            .await
-            .unwrap();
-    }
-}
-
 const fn readonly_frame_bytes() -> usize {
     std::mem::size_of::<BufferFrame>() + std::mem::size_of::<Page>()
-}
-
-fn required_cache_bytes(pages: usize) -> Option<usize> {
-    pages
-        .max(MIN_READONLY_POOL_PAGES)
-        .checked_mul(readonly_frame_bytes())
 }
 
 fn format_pool_stats(stats: BufferPoolStats) -> String {
@@ -131,27 +103,8 @@ fn print_phase(
 
 fn main() {
     let args = Args::parse();
-    if args.pages == 0 {
-        eprintln!("pages must be greater than zero");
-        std::process::exit(2);
-    }
-
-    let required_cache_bytes = required_cache_bytes(args.pages).unwrap_or_else(|| {
-        eprintln!(
-            "required cache size overflow: pages={} frame_bytes={}",
-            args.pages,
-            readonly_frame_bytes(),
-        );
-        std::process::exit(2);
-    });
-    if args.cache_bytes < required_cache_bytes {
-        eprintln!(
-            "cache_bytes={} is too small for a true warm-hit control; required_cache_bytes={} pages={} frame_bytes={}",
-            args.cache_bytes,
-            required_cache_bytes,
-            args.pages,
-            readonly_frame_bytes(),
-        );
+    if args.rows == 0 {
+        eprintln!("rows must be greater than zero");
         std::process::exit(2);
     }
     if let Some(temp_dir) = &args.temp_dir
@@ -191,53 +144,70 @@ fn main() {
             .build()
             .await
             .unwrap();
-        let table_file = engine
-            .table_fs
-            .create_table_file(901, make_metadata(), false)
+
+        let mut ddl_session = engine.try_new_session().unwrap();
+        let table_id = ddl_session
+            .create_table(
+                TableSpec::new(vec![ColumnSpec::new(
+                    "id",
+                    ValKind::I32,
+                    ColumnAttributes::empty(),
+                )]),
+                vec![IndexSpec::new(
+                    "idx_pk",
+                    vec![IndexKey::new(0)],
+                    IndexAttributes::PK,
+                )],
+            )
+            .await
             .unwrap();
-        write_pages(&table_file, args.pages).await;
+        drop(ddl_session);
 
-        let (table_file, old_root) = table_file.commit(1, false).await.unwrap();
-        drop(old_root);
+        let table = engine.catalog().get_table(table_id).await.unwrap();
+        let mut write_session = engine.try_new_session().unwrap();
+        insert_rows(&table, &mut write_session, args.rows).await;
+        table.freeze(&write_session, usize::MAX).await;
+        table.data_checkpoint(&mut write_session).await.unwrap();
+        drop(write_session);
 
-        let pool = QuiescentBox::new(ReadonlyBufferPool::from_table_file(
-            FileKind::TableFile,
-            Arc::clone(&table_file),
-            engine.disk_pool.clone_inner(),
-        ));
+        let keys = build_keys(args.rows);
 
         println!(
-            "readonly-single-miss-latency storage_root={} pages={} page_size={} dataset_bytes={} cache_bytes={} required_cache_bytes={} frame_bytes={}",
+            "persisted-row-lookup-latency storage_root={} rows={} cache_bytes={} frame_bytes={}",
             temp_dir.path().display(),
-            args.pages,
-            PAGE_SIZE,
-            args.pages * PAGE_SIZE,
+            args.rows,
             args.cache_bytes,
-            required_cache_bytes,
             readonly_frame_bytes(),
         );
 
-        let pool_guard = pool.pool_guard();
-        let cold_pool_start = pool.global_stats();
+        let mut session = engine.try_new_session().unwrap();
+
+        let cold_pool_start = engine.disk_pool.stats();
         let cold_backend_start = engine.table_fs.io_backend_stats();
         let cold_start = std::time::Instant::now();
         let mut cold_checksum = 0u64;
-        for page_id in 0..args.pages {
-            let g = pool
-                .read_block(&pool_guard, BlockID::from(page_id))
+        let mut trx = session.try_begin_trx().unwrap().unwrap();
+        for (idx, key) in keys.iter().enumerate() {
+            let stmt = trx.start_stmt();
+            let res = stmt
+                .select_row_mvcc(table.as_ref(), key, &READ_SET)
                 .await
-                .expect("buffer-pool read failed in benchmark");
-            let mut arr = [0u8; 8];
-            arr.copy_from_slice(&g.page()[0..8]);
-            cold_checksum ^= u64::from_le_bytes(arr);
-            drop(g);
+                .unwrap();
+            let vals = match res {
+                SelectMvcc::Found(vals) => vals,
+                SelectMvcc::NotFound => panic!("cold benchmark key unexpectedly missing"),
+            };
+            black_box(vals);
+            cold_checksum ^= idx as u64;
+            trx = stmt.succeed();
         }
+        trx.commit().await.unwrap();
         let cold_elapsed = cold_start.elapsed();
-        let cold_pool_end = pool.global_stats();
+        let cold_pool_end = engine.disk_pool.stats();
         let cold_backend_end = engine.table_fs.io_backend_stats();
         print_phase(
-            "cold_miss",
-            args.pages,
+            "cold_select",
+            args.rows,
             cold_elapsed,
             engine.disk_pool.allocated(),
             cold_checksum,
@@ -250,20 +220,29 @@ fn main() {
         let warm_start = std::time::Instant::now();
         let mut warm_checksum = 0u64;
         let mut rng = rand::rng();
+        let mut trx = session.try_begin_trx().unwrap().unwrap();
         for _ in 0..args.warm_reads {
-            let page_id = rng.next_u64() % args.pages as u64;
-            let g = pool
-                .read_block(&pool_guard, BlockID::from(page_id))
+            let idx = (rng.next_u64() % args.rows as u64) as usize;
+            let key = &keys[idx];
+            let stmt = trx.start_stmt();
+            let res = stmt
+                .select_row_mvcc(table.as_ref(), key, &READ_SET)
                 .await
-                .expect("buffer-pool read failed in benchmark");
-            warm_checksum ^= g.page()[0] as u64;
-            drop(g);
+                .unwrap();
+            let vals = match res {
+                SelectMvcc::Found(vals) => vals,
+                SelectMvcc::NotFound => panic!("warm benchmark key unexpectedly missing"),
+            };
+            black_box(vals);
+            warm_checksum ^= idx as u64;
+            trx = stmt.succeed();
         }
+        trx.commit().await.unwrap();
         let warm_elapsed = warm_start.elapsed();
-        let warm_pool_end = pool.global_stats();
+        let warm_pool_end = engine.disk_pool.stats();
         let warm_backend_end = engine.table_fs.io_backend_stats();
         print_phase(
-            "warm_hit",
+            "warm_select",
             args.warm_reads,
             warm_elapsed,
             engine.disk_pool.allocated(),
@@ -272,8 +251,25 @@ fn main() {
             warm_backend_end.delta_since(warm_backend_start),
         );
 
-        drop(pool);
-        drop(table_file);
+        drop(session);
+        drop(table);
         drop(engine);
     });
+}
+
+fn build_keys(rows: usize) -> Vec<SelectKey> {
+    (0..rows)
+        .map(|idx| SelectKey::new(0, vec![Val::from(idx as i32)]))
+        .collect()
+}
+
+async fn insert_rows(table: &Arc<Table>, session: &mut Session, rows: usize) {
+    let mut trx = session.try_begin_trx().unwrap().unwrap();
+    for idx in 0..rows {
+        let mut stmt = trx.start_stmt();
+        let res = stmt.insert_row(table, vec![Val::from(idx as i32)]).await;
+        assert!(matches!(res, Ok(InsertMvcc::Inserted(_))));
+        trx = stmt.succeed();
+    }
+    trx.commit().await.unwrap();
 }

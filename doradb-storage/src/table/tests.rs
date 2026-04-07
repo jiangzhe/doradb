@@ -361,6 +361,8 @@ fn test_find_row_returns_resolved_lwc_page_location() {
         let column_index = ColumnBlockIndex::new(
             active_root.column_block_index_root,
             active_root.pivot_row_id,
+            sys.table.file().file_kind(),
+            sys.table.file().sparse_file(),
             sys.table.disk_pool(),
             session.pool_guards().disk_guard(),
         );
@@ -408,6 +410,8 @@ fn test_lwc_select_surfaces_persisted_corruption() {
         let index = ColumnBlockIndex::new(
             active_root.column_block_index_root,
             active_root.pivot_row_id,
+            sys.table.file().file_kind(),
+            sys.table.file().sparse_file(),
             sys.table.disk_pool(),
             session.pool_guards().disk_guard(),
         );
@@ -455,6 +459,8 @@ fn test_lwc_select_surfaces_column_block_index_row_metadata_corruption() {
         let index = ColumnBlockIndex::new(
             active_root.column_block_index_root,
             active_root.pivot_row_id,
+            sys.table.file().file_kind(),
+            sys.table.file().sparse_file(),
             sys.table.disk_pool(),
             session.pool_guards().disk_guard(),
         );
@@ -465,7 +471,7 @@ fn test_lwc_select_surfaces_column_block_index_row_metadata_corruption() {
         let _ = sys
             .table
             .disk_pool()
-            .invalidate_block_id(entry.leaf_page_id);
+            .invalidate_block_id(sys.table.file().sparse_file().file_id(), entry.leaf_page_id);
 
         let mut trx = session.try_begin_trx().unwrap().unwrap();
         let stmt = trx.start_stmt();
@@ -505,6 +511,8 @@ fn test_lwc_select_surfaces_column_block_index_zero_block_id_corruption() {
         let index = ColumnBlockIndex::new(
             active_root.column_block_index_root,
             active_root.pivot_row_id,
+            sys.table.file().file_kind(),
+            sys.table.file().sparse_file(),
             sys.table.disk_pool(),
             session.pool_guards().disk_guard(),
         );
@@ -515,7 +523,7 @@ fn test_lwc_select_surfaces_column_block_index_zero_block_id_corruption() {
         let _ = sys
             .table
             .disk_pool()
-            .invalidate_block_id(entry.leaf_page_id);
+            .invalidate_block_id(sys.table.file().sparse_file().file_id(), entry.leaf_page_id);
 
         let mut trx = session.try_begin_trx().unwrap().unwrap();
         let stmt = trx.start_stmt();
@@ -555,6 +563,8 @@ fn test_lwc_select_surfaces_row_shape_fingerprint_mismatch_corruption() {
         let index = ColumnBlockIndex::new(
             active_root.column_block_index_root,
             active_root.pivot_row_id,
+            sys.table.file().file_kind(),
+            sys.table.file().sparse_file(),
             sys.table.disk_pool(),
             session.pool_guards().disk_guard(),
         );
@@ -562,7 +572,10 @@ fn test_lwc_select_surfaces_row_shape_fingerprint_mismatch_corruption() {
 
         let table_file_path = sys.engine.table_fs.table_file_path(sys.table.table_id());
         corrupt_lwc_row_shape_fingerprint(table_file_path, entry.block_id());
-        let _ = sys.table.disk_pool().invalidate_block_id(entry.block_id());
+        let _ = sys
+            .table
+            .disk_pool()
+            .invalidate_block_id(sys.table.file().sparse_file().file_id(), entry.block_id());
 
         let mut trx = session.try_begin_trx().unwrap().unwrap();
         let stmt = trx.start_stmt();
@@ -790,6 +803,8 @@ fn test_checkpoint_for_deletion_persists_committed_markers() {
         let index_before = ColumnBlockIndex::new(
             active_root.column_block_index_root,
             active_root.pivot_row_id,
+            sys.table.file().file_kind(),
+            sys.table.file().sparse_file(),
             sys.table.disk_pool(),
             session.pool_guards().disk_guard(),
         );
@@ -808,6 +823,8 @@ fn test_checkpoint_for_deletion_persists_committed_markers() {
         let index = ColumnBlockIndex::new(
             active_root.column_block_index_root,
             active_root.pivot_row_id,
+            sys.table.file().file_kind(),
+            sys.table.file().sparse_file(),
             sys.table.disk_pool(),
             session.pool_guards().disk_guard(),
         );
@@ -871,6 +888,8 @@ fn test_checkpoint_for_deletion_skips_markers_at_or_after_cutoff() {
         let index = ColumnBlockIndex::new(
             active_root.column_block_index_root,
             active_root.pivot_row_id,
+            sys.table.file().file_kind(),
+            sys.table.file().sparse_file(),
             sys.table.disk_pool(),
             session.pool_guards().disk_guard(),
         );
@@ -941,6 +960,8 @@ fn test_checkpoint_for_deletion_fails_on_invalid_v2_delete_metadata() {
         let index = ColumnBlockIndex::new(
             active_root.column_block_index_root,
             active_root.pivot_row_id,
+            sys.table.file().file_kind(),
+            sys.table.file().sparse_file(),
             sys.table.disk_pool(),
             session.pool_guards().disk_guard(),
         );
@@ -955,7 +976,7 @@ fn test_checkpoint_for_deletion_fails_on_invalid_v2_delete_metadata() {
         let _ = sys
             .table
             .disk_pool()
-            .invalidate_block_id(entry.leaf_page_id);
+            .invalidate_block_id(sys.table.file().sparse_file().file_id(), entry.leaf_page_id);
 
         let err = sys
             .table
@@ -1024,6 +1045,8 @@ fn test_checkpoint_for_deletion_fails_on_short_v2_delete_section_header() {
         let index = ColumnBlockIndex::new(
             active_root.column_block_index_root,
             active_root.pivot_row_id,
+            sys.table.file().file_kind(),
+            sys.table.file().sparse_file(),
             sys.table.disk_pool(),
             session.pool_guards().disk_guard(),
         );
@@ -1038,7 +1061,7 @@ fn test_checkpoint_for_deletion_fails_on_short_v2_delete_section_header() {
         let _ = sys
             .table
             .disk_pool()
-            .invalidate_block_id(entry.leaf_page_id);
+            .invalidate_block_id(sys.table.file().sparse_file().file_id(), entry.leaf_page_id);
 
         let err = sys
             .table
@@ -1974,7 +1997,7 @@ fn test_data_checkpoint_persistence_recovery() {
         let root_before = table.file().active_root().clone();
         drop(table);
 
-        let (table_file, _) = engine
+        let table_file = engine
             .table_fs
             .open_table_file(table_id, engine.disk_pool.clone_inner())
             .await

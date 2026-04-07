@@ -294,6 +294,8 @@ impl<P: BufferPool> GenericBlockIndex<P> {
         let index = ColumnBlockIndex::new(
             root_block_id,
             pivot_row_id,
+            storage.file().file_kind(),
+            storage.file().sparse_file(),
             storage.disk_pool(),
             disk_pool_guard,
         );

@@ -100,7 +100,7 @@ pub struct GenericMemTable<D: 'static, I: 'static> {
 /// Persisted column-store attachments associated with a user table runtime.
 pub struct ColumnStorage {
     pub(crate) file: Arc<TableFile>,
-    pub(crate) disk_pool: ReadonlyBufferPool,
+    pub(crate) disk_pool: QuiescentGuard<ReadonlyBufferPool>,
     pub(crate) deletion_buffer: ColumnDeletionBuffer,
 }
 
@@ -470,7 +470,7 @@ impl<D: BufferPool, I: BufferPool> GenericMemTable<D, I> {
 
 impl ColumnStorage {
     #[inline]
-    pub(crate) fn new(file: Arc<TableFile>, disk_pool: ReadonlyBufferPool) -> Self {
+    pub(crate) fn new(file: Arc<TableFile>, disk_pool: QuiescentGuard<ReadonlyBufferPool>) -> Self {
         ColumnStorage {
             file,
             disk_pool,
@@ -486,7 +486,7 @@ impl ColumnStorage {
 
     /// Returns the read-only buffer pool used for persisted blocks.
     #[inline]
-    pub fn disk_pool(&self) -> &ReadonlyBufferPool {
+    pub fn disk_pool(&self) -> &QuiescentGuard<ReadonlyBufferPool> {
         &self.disk_pool
     }
 
@@ -507,7 +507,7 @@ impl Table {
         table_id: TableID,
         blk_idx: BlockIndex,
         file: Arc<TableFile>,
-        disk_pool: ReadonlyBufferPool,
+        disk_pool: QuiescentGuard<ReadonlyBufferPool>,
     ) -> Result<Self> {
         let active_root = file.active_root();
         let metadata = Arc::clone(&active_root.metadata);
@@ -540,7 +540,7 @@ impl Table {
     }
 
     #[inline]
-    pub(crate) fn disk_pool(&self) -> &ReadonlyBufferPool {
+    pub(crate) fn disk_pool(&self) -> &QuiescentGuard<ReadonlyBufferPool> {
         self.storage.disk_pool()
     }
 
