@@ -166,6 +166,48 @@ Reference:
 
 ## Implementation Notes
 
+1. The per-file `ReadonlyBufferPool` wrapper is fully removed. Shared readonly
+   access now uses concrete `FileKind` plus `&Arc<SparseFile>` against the
+   renamed global `ReadonlyBufferPool`, and table/catalog runtime wiring now
+   threads concrete files directly instead of storing another wrapper layer.
+2. Persisted readers were reified around those explicit file inputs:
+   `ColumnBlockIndex`, `ColumnDeletionBlobReader`, and `PersistedLwcBlock`
+   no longer depend on a persisted-file trait abstraction, and `CowFile`
+   root/meta loads now read through the shared pool directly.
+3. The shared readonly miss path was tightened further during implementation by
+   moving `read_block()` and `read_validated_block()` onto
+   `QuiescentGuard<ReadonlyBufferPool>`. That removed the redundant extra pool
+   argument at call sites while preserving the owned-guard keepalive needed by
+   inflight miss reservations and queued read submissions.
+4. Example-driven production API widening was rolled back. The benchmark
+   examples now use public persisted-row lookup paths, while internal surfaces
+   such as raw readonly helpers and `ColumnBlockIndex` visibility returned to
+   crate-internal scope.
+5. Follow-up cleanup in the same task scope removed temporary or test-only
+   helper surfaces that no longer matched the final design, including the
+   persisted-file trait, `invalidate_block_id_strict`,
+   `ColumnBlockIndex::resolve_row`, delete-payload header helpers,
+   test-only file-id/raw-fd accessors, and the `CatalogStorage::mtb()`
+   accessor. Naming was also normalized (`GlobalReadonlyBufferPool` ->
+   `ReadonlyBufferPool`, `global_disk_pool` -> `disk_pool`,
+   sealed `persisted_file` module -> `private`).
+6. The detached keepalive model now stays centered on `Arc<SparseFile>` plus
+   internal `ReadonlyBackingFile`. The old keepalive observability hook and its
+   dependent unit test were removed instead of widening production APIs for
+   tests.
+7. Review hand-off for this implementation is tracked in PR `#541`
+   (`chore: Remove Per-File Readonly Buffer Pool Wrapper`), linked to issue
+   `#540`.
+8. Validation completed in this worktree:
+   - `cargo fmt --all --check`
+   - `cargo check -p doradb-storage`
+   - `cargo nextest run -p doradb-storage`
+   - `cargo nextest run -p doradb-storage --no-default-features --features libaio`
+9. `cargo clippy -p doradb-storage --all-targets -- -D warnings` and
+   `tools/unsafe_inventory.rs --write docs/unsafe-usage-baseline.md` were not
+   rerun during resolve. The implementation changed unsafe-adjacent ownership
+   and IO plumbing, but did not add new `unsafe` blocks.
+
 ## Impacts
 
 1. `doradb-storage/src/buffer/readonly.rs`
@@ -218,7 +260,8 @@ Reference:
 
 No blocking questions for task scope.
 
-Possible future cleanup, if the explicit `(file, readonly_pool)` threading
-proves noisy after wrapper removal: add small inherent helper methods on
-`TableFile` and `MultiTableFile` instead of reintroducing another stored
-wrapper type.
+Possible future cleanup, if the remaining explicit
+`(file_kind, sparse_file, readonly_pool)` threading still proves noisy after
+wrapper removal and the guard-receiver cleanup: add small inherent helper
+methods on `TableFile` and `MultiTableFile` instead of reintroducing another
+stored wrapper type.
