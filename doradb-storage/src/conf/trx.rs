@@ -1,6 +1,5 @@
 use crate::buffer::{
-    BufferPool, EvictableBufferPool, FixedBufferPool, GlobalReadonlyBufferPool, PoolGuards,
-    PoolRole,
+    BufferPool, EvictableBufferPool, FixedBufferPool, PoolGuards, PoolRole, ReadonlyBufferPool,
 };
 use crate::catalog::Catalog;
 use crate::component::Supplier;
@@ -223,7 +222,7 @@ impl TrxSysConfig {
         index_pool: QuiescentGuard<EvictableBufferPool>,
         mem_pool: QuiescentGuard<EvictableBufferPool>,
         table_fs: QuiescentGuard<FileSystem>,
-        global_disk_pool: QuiescentGuard<GlobalReadonlyBufferPool>,
+        disk_pool: QuiescentGuard<ReadonlyBufferPool>,
         catalog: QuiescentGuard<Catalog>,
     ) -> Result<(TransactionSystem, PendingTransactionSystemStartup)> {
         let mut log_partition_initializers = Vec::with_capacity(self.log_partitions);
@@ -236,7 +235,7 @@ impl TrxSysConfig {
             .push(PoolRole::Meta, meta_pool.pool_guard())
             .push(PoolRole::Index, index_pool.pool_guard())
             .push(PoolRole::Mem, mem_pool.pool_guard())
-            .push(PoolRole::Disk, global_disk_pool.pool_guard())
+            .push(PoolRole::Disk, disk_pool.pool_guard())
             .build();
 
         let (log_partitions, gc_rxs) = log_recover(
@@ -245,7 +244,7 @@ impl TrxSysConfig {
                 index_pool,
                 mem_pool: mem_pool.clone(),
                 table_fs,
-                global_disk_pool,
+                disk_pool,
             },
             &catalog,
             log_partition_initializers,

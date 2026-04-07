@@ -27,7 +27,7 @@ pub fn decode_deletion_deltas_from_bytes(bytes: &[u8]) -> Result<Vec<u32>> {
 }
 
 /// Loads authoritative persisted deletion deltas for one v2 leaf entry.
-pub async fn load_entry_deletion_deltas(
+pub(crate) async fn load_entry_deletion_deltas(
     column_index: &ColumnBlockIndex<'_>,
     entry: &ColumnLeafEntry,
 ) -> Result<BTreeSet<u32>> {

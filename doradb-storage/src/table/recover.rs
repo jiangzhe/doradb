@@ -268,17 +268,25 @@ impl TableRecover for Table {
         let index = ColumnBlockIndex::new(
             active_root.column_block_index_root,
             active_root.pivot_row_id,
+            self.file().file_kind(),
+            self.file().sparse_file(),
             self.disk_pool(),
             disk_pool_guard,
         );
         for entry in index.collect_leaf_entries().await? {
             let deleted = load_entry_deletion_deltas(&index, &entry).await?;
-            let page = PersistedLwcBlock::load(self.disk_pool(), disk_pool_guard, entry.block_id())
-                .await?;
+            let page = PersistedLwcBlock::load(
+                self.file().file_kind(),
+                self.file().sparse_file(),
+                self.disk_pool(),
+                disk_pool_guard,
+                entry.block_id(),
+            )
+            .await?;
             let row_ids = index.load_entry_row_ids(&entry).await?;
             if page.row_count() != row_ids.len() {
                 return Err(Error::block_corrupted(
-                    self.disk_pool().file_kind(),
+                    self.file().file_kind(),
                     BlockKind::LwcBlock,
                     entry.block_id(),
                     BlockCorruptionCause::InvalidPayload,

@@ -15,8 +15,7 @@ use crate::DiskPool;
 use crate::buffer::guard::PageSharedGuard;
 use crate::buffer::page::{PageID, VersionedPageID};
 use crate::buffer::{
-    BufferPool, EvictableBufferPool, FixedBufferPool, GlobalReadonlyBufferPool, PoolGuards,
-    PoolRole,
+    BufferPool, EvictableBufferPool, FixedBufferPool, PoolGuards, PoolRole, ReadonlyBufferPool,
 };
 use crate::component::{Component, ComponentRegistry, MetaPool, ShelfScope};
 use crate::error::{Error, Result};
@@ -159,7 +158,7 @@ impl Catalog {
         mem_pool: QuiescentGuard<EvictableBufferPool>,
         index_pool: QuiescentGuard<EvictableBufferPool>,
         table_fs: &FileSystem,
-        global_disk_pool: QuiescentGuard<GlobalReadonlyBufferPool>,
+        disk_pool: QuiescentGuard<ReadonlyBufferPool>,
         guards: &PoolGuards,
         table_id: TableID,
     ) -> Result<()> {
@@ -233,8 +232,8 @@ impl Catalog {
                         index.index_attributes,
                     ));
                 }
-                let (table_file, disk_pool) = table_fs
-                    .open_table_file(table.table_id, global_disk_pool.clone())
+                let table_file = table_fs
+                    .open_table_file(table.table_id, disk_pool.clone())
                     .await?;
                 let active_root = table_file.active_root();
                 let metadata_in_catalog = TableMetadata::new(column_specs, index_specs);
@@ -261,7 +260,7 @@ impl Catalog {
                         table.table_id,
                         blk_idx,
                         table_file,
-                        disk_pool,
+                        disk_pool.clone(),
                     )
                     .await?,
                 );
@@ -910,6 +909,8 @@ pub mod tests {
                 let index = ColumnBlockIndex::new(
                     root_block_id,
                     root.pivot_row_id,
+                    engine.catalog().storage.mtb.file_kind(),
+                    engine.catalog().storage.mtb.sparse_file(),
                     &engine.catalog().storage.disk_pool,
                     &disk_pool_guard,
                 );
@@ -989,6 +990,8 @@ pub mod tests {
                 let index = ColumnBlockIndex::new(
                     root_block_id,
                     root.pivot_row_id,
+                    engine.catalog().storage.mtb.file_kind(),
+                    engine.catalog().storage.mtb.sparse_file(),
                     &engine.catalog().storage.disk_pool,
                     &disk_pool_guard,
                 );

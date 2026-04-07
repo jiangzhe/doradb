@@ -4,7 +4,7 @@ mod indexes;
 mod object;
 mod tables;
 
-use crate::buffer::{BufferPool, FixedBufferPool, GlobalReadonlyBufferPool, ReadonlyBufferPool};
+use crate::buffer::{BufferPool, FixedBufferPool, ReadonlyBufferPool};
 use crate::catalog::runtime::CatalogTable;
 use crate::catalog::storage::columns::*;
 use crate::catalog::storage::indexes::*;
@@ -30,8 +30,8 @@ pub struct CatalogStorage {
     pub(super) table_fs: QuiescentGuard<FileSystem>,
     tables: Box<[Arc<CatalogTable>]>,
     next_user_obj_id: ObjID,
-    mtb: Arc<MultiTableFile>,
-    pub(super) disk_pool: ReadonlyBufferPool,
+    pub(super) mtb: Arc<MultiTableFile>,
+    pub(super) disk_pool: QuiescentGuard<ReadonlyBufferPool>,
 }
 
 impl CatalogStorage {
@@ -40,11 +40,11 @@ impl CatalogStorage {
     pub(crate) async fn new(
         meta_pool: QuiescentGuard<FixedBufferPool>,
         table_fs: QuiescentGuard<FileSystem>,
-        global_disk_pool: QuiescentGuard<GlobalReadonlyBufferPool>,
+        disk_pool: QuiescentGuard<ReadonlyBufferPool>,
     ) -> Result<Self> {
         let meta_pool_guard = meta_pool.pool_guard();
-        let (mtb, disk_pool) = table_fs
-            .open_or_create_multi_table_file(global_disk_pool)
+        let mtb = table_fs
+            .open_or_create_multi_table_file(disk_pool.clone())
             .await?;
         let mtb_snapshot = mtb.load_snapshot()?;
 

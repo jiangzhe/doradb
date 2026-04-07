@@ -15,8 +15,7 @@
 use crate::buffer::PageID;
 use crate::buffer::guard::PageGuard;
 use crate::buffer::{
-    BufferPool, EvictableBufferPool, FixedBufferPool, GlobalReadonlyBufferPool, PoolGuards,
-    PoolRole,
+    BufferPool, EvictableBufferPool, FixedBufferPool, PoolGuards, PoolRole, ReadonlyBufferPool,
 };
 use crate::catalog::{
     Catalog, CatalogTable, TableID, TableMetadata, is_catalog_obj_id, is_user_obj_id,
@@ -128,7 +127,7 @@ pub(crate) async fn log_recover(
         index_pool,
         mem_pool,
         table_fs,
-        global_disk_pool,
+        disk_pool,
     } = deps;
     // In recovery, we disable GC and redo logging.
     // All data are purely processed in memory and if
@@ -141,13 +140,7 @@ pub(crate) async fn log_recover(
             log_merger.add_stream(stream)?;
         }
         let log_recovery = LogRecovery::new(
-            meta_pool,
-            index_pool,
-            mem_pool,
-            table_fs,
-            global_disk_pool,
-            catalog,
-            log_merger,
+            meta_pool, index_pool, mem_pool, table_fs, disk_pool, catalog, log_merger,
         );
         let log_streams = log_recovery.recover_all().await?;
         log_partition_initializers = log_streams
@@ -171,7 +164,7 @@ pub(crate) struct RecoveryDeps {
     pub(crate) index_pool: QuiescentGuard<EvictableBufferPool>,
     pub(crate) mem_pool: QuiescentGuard<EvictableBufferPool>,
     pub(crate) table_fs: QuiescentGuard<FileSystem>,
-    pub(crate) global_disk_pool: QuiescentGuard<GlobalReadonlyBufferPool>,
+    pub(crate) disk_pool: QuiescentGuard<ReadonlyBufferPool>,
 }
 
 /// Redo-log recovery coordinator for catalog metadata and user tables.
@@ -179,7 +172,7 @@ pub struct LogRecovery<'a> {
     index_pool: QuiescentGuard<EvictableBufferPool>,
     mem_pool: QuiescentGuard<EvictableBufferPool>,
     table_fs: QuiescentGuard<FileSystem>,
-    global_disk_pool: QuiescentGuard<GlobalReadonlyBufferPool>,
+    disk_pool: QuiescentGuard<ReadonlyBufferPool>,
     catalog: &'a Catalog,
     log_merger: LogMerger,
     catalog_replay_start_ts: TrxID,
@@ -202,7 +195,7 @@ impl<'a> LogRecovery<'a> {
         index_pool: QuiescentGuard<EvictableBufferPool>,
         mem_pool: QuiescentGuard<EvictableBufferPool>,
         table_fs: QuiescentGuard<FileSystem>,
-        global_disk_pool: QuiescentGuard<GlobalReadonlyBufferPool>,
+        disk_pool: QuiescentGuard<ReadonlyBufferPool>,
         catalog: &'a Catalog,
         log_merger: LogMerger,
     ) -> Self {
@@ -210,13 +203,13 @@ impl<'a> LogRecovery<'a> {
             .push(PoolRole::Meta, meta_pool.pool_guard())
             .push(PoolRole::Index, index_pool.pool_guard())
             .push(PoolRole::Mem, mem_pool.pool_guard())
-            .push(PoolRole::Disk, global_disk_pool.pool_guard())
+            .push(PoolRole::Disk, disk_pool.pool_guard())
             .build();
         LogRecovery {
             index_pool,
             mem_pool,
             table_fs,
-            global_disk_pool,
+            disk_pool,
             catalog,
             log_merger,
             catalog_replay_start_ts: MIN_SNAPSHOT_TS,
@@ -261,7 +254,7 @@ impl<'a> LogRecovery<'a> {
                     self.mem_pool.clone(),
                     self.index_pool.clone(),
                     &self.table_fs,
-                    self.global_disk_pool.clone(),
+                    self.disk_pool.clone(),
                     &self.pool_guards,
                     table.table_id,
                 )
@@ -406,7 +399,7 @@ impl<'a> LogRecovery<'a> {
                         self.mem_pool.clone(),
                         self.index_pool.clone(),
                         &self.table_fs,
-                        self.global_disk_pool.clone(),
+                        self.disk_pool.clone(),
                         &self.pool_guards,
                         *table_id,
                     )
@@ -1510,6 +1503,8 @@ mod tests {
                 let index = ColumnBlockIndex::new(
                     active_root.column_block_index_root,
                     active_root.pivot_row_id,
+                    table.file().file_kind(),
+                    table.file().sparse_file(),
                     table.disk_pool(),
                     &disk_pool_guard,
                 );
@@ -1673,6 +1668,8 @@ mod tests {
                 let index = ColumnBlockIndex::new(
                     active_root.column_block_index_root,
                     active_root.pivot_row_id,
+                    table.file().file_kind(),
+                    table.file().sparse_file(),
                     table.disk_pool(),
                     &disk_pool_guard,
                 );

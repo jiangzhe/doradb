@@ -936,7 +936,7 @@ mod tests {
     use crate::serde::{Deser, Ser};
     use crate::value::ValKind;
     use std::mem;
-    use std::sync::{Arc, Mutex, Weak};
+    use std::sync::{Arc, Mutex};
     use tempfile::TempDir;
 
     #[inline]
@@ -979,7 +979,7 @@ mod tests {
         block_id: BlockID,
     ) -> (WriteSubmission, impl Future<Output = Result<()>> + Send) {
         WriteSubmission::prepare(
-            BlockKey::new(table_file.file_id(), block_id),
+            BlockKey::new(table_file.sparse_file().file_id(), block_id),
             ReadonlyBackingFile::from(table_file),
             usize::from(block_id) * STORAGE_SECTOR_SIZE,
             DirectBuf::zeroed(STORAGE_SECTOR_SIZE),
@@ -1321,41 +1321,6 @@ mod tests {
             assert_eq!(kind, IOKind::Write);
             assert!(matches!(waiter.await, Err(Error::ShortIO)));
             drop(table_file);
-            drop(fs);
-        });
-    }
-
-    #[test]
-    fn test_table_fs_write_submission_keeps_backing_alive_until_completion() {
-        smol::block_on(async {
-            let (_temp_dir, fs, table_file) = committed_test_table_file().await;
-            let weak: Weak<TableFile> = Arc::downgrade(&table_file);
-            let mut state_machine = TableFsStateMachine::new();
-            let (submission, waiter) =
-                prepare_table_write_submission(Arc::clone(&table_file), BlockID::new(2));
-            let mut queue = IOQueue::with_capacity(1);
-
-            drop(table_file);
-            assert!(weak.upgrade().is_some());
-
-            assert!(
-                state_machine
-                    .prepare_write_request(submission, 1, &mut queue)
-                    .is_none()
-            );
-            assert!(weak.upgrade().is_some());
-
-            let Some(TableFsSubmission::Write(submission)) = queue.pop_front() else {
-                panic!("expected one prepared table write submission");
-            };
-            let expected_len = submission.operation.len();
-
-            let kind =
-                state_machine.on_complete(TableFsSubmission::Write(submission), Ok(expected_len));
-
-            assert_eq!(kind, IOKind::Write);
-            assert!(waiter.await.is_ok());
-            assert!(weak.upgrade().is_none());
             drop(fs);
         });
     }

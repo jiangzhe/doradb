@@ -2,7 +2,6 @@ use crate::bitmap::AllocMap;
 use crate::buffer::{ReadonlyBackingFile, ReadonlyBufferPool};
 use crate::catalog::{TableID, table::TableMetadata};
 use crate::error::{BlockCorruptionCause, BlockKind, Error, FileKind, Result};
-use crate::file::FileID;
 use crate::file::block_integrity::{
     BLOCK_INTEGRITY_HEADER_SIZE, BlockIntegritySpec, max_payload_len, validate_block,
     write_block_checksum, write_block_header,
@@ -19,14 +18,15 @@ use crate::file::super_block::{
     SUPER_BLOCK_FOOTER_OFFSET, SUPER_BLOCK_SIZE, SUPER_BLOCK_VERSION, SuperBlock, SuperBlockBody,
     SuperBlockFooter, SuperBlockHeader, SuperBlockSerView, parse_super_block,
 };
+use crate::file::{FileID, SparseFile};
 use crate::index::{ColumnBlockEntryShape, ColumnBlockIndex};
 use crate::io::{DirectBuf, IOBuf, IOClient};
+use crate::quiescent::QuiescentGuard;
 use crate::row::RowID;
 use crate::serde::{Deser, Ser};
 use crate::trx::TrxID;
 use futures::future::try_join_all;
 use std::mem;
-use std::os::fd::RawFd;
 use std::sync::Arc;
 
 pub const TABLE_FILE_MAGIC_WORD: [u8; 8] = [b'D', b'O', b'R', b'A', 0, 0, 0, 0];
@@ -242,9 +242,11 @@ impl TableFile {
     #[inline]
     pub async fn load_active_root_from_pool(
         &self,
-        disk_pool: &ReadonlyBufferPool,
+        disk_pool: &QuiescentGuard<ReadonlyBufferPool>,
     ) -> Result<ActiveRoot> {
-        self.file.load_active_root_from_pool(disk_pool).await
+        self.file
+            .load_active_root_from_pool(FileKind::TableFile, disk_pool)
+            .await
     }
 
     /// Returns the in-memory active root snapshot.
@@ -253,16 +255,19 @@ impl TableFile {
         self.file.active_root()
     }
 
-    /// Returns the physical file identifier used by readonly caching and IO routing.
     #[inline]
-    pub(crate) fn file_id(&self) -> FileID {
-        self.file.file_id()
+    pub(crate) fn file_kind(&self) -> FileKind {
+        FileKind::TableFile
     }
 
-    /// Returns the owned raw file descriptor for direct IO operations.
     #[inline]
-    pub(crate) fn raw_fd(&self) -> RawFd {
-        self.file.raw_fd()
+    pub(crate) fn sparse_file(&self) -> &Arc<SparseFile> {
+        self.file.sparse_file()
+    }
+
+    #[inline]
+    pub(crate) fn readonly_backing(&self) -> ReadonlyBackingFile {
+        self.file.readonly_backing()
     }
 
     #[inline]
@@ -416,7 +421,7 @@ impl MutableTableFile {
     /// Write one page into the underlying table file.
     #[inline]
     pub async fn write_block(&self, block_id: BlockID, buf: DirectBuf) -> Result<()> {
-        let owner = ReadonlyBackingFile::from(Arc::clone(self.file_ref()));
+        let owner = self.file_ref().readonly_backing();
         self.file_ref()
             .file()
             .write_block_with_owner(self.background_writes(), owner, block_id, buf)
@@ -425,7 +430,7 @@ impl MutableTableFile {
 
     #[inline]
     async fn publish_root(&self, new_root: ActiveRoot) -> Result<Option<OldRoot>> {
-        let owner = ReadonlyBackingFile::from(Arc::clone(self.file_ref()));
+        let owner = self.file_ref().readonly_backing();
         self.file_ref()
             .file()
             .publish_root_with_owner(self.background_writes(), owner, new_root)
@@ -471,7 +476,7 @@ impl MutableTableFile {
         lwc_blocks: Vec<LwcBlockPersist>,
         heap_redo_start_ts: TrxID,
         ts: TrxID,
-        disk_pool: &ReadonlyBufferPool,
+        disk_pool: &QuiescentGuard<ReadonlyBufferPool>,
     ) -> Result<()> {
         let table_file = Arc::clone(self.file_ref());
         let background_writes = self.background_writes.clone();
@@ -500,7 +505,7 @@ impl MutableTableFile {
                 file.file()
                     .write_block_with_owner(
                         &background_writes,
-                        ReadonlyBackingFile::from(Arc::clone(&file)),
+                        file.readonly_backing(),
                         block_id,
                         block.buf,
                     )
@@ -514,6 +519,8 @@ impl MutableTableFile {
         let column_index = ColumnBlockIndex::new(
             root.column_block_index_root,
             root.pivot_row_id,
+            table_file.file_kind(),
+            table_file.sparse_file(),
             disk_pool,
             &disk_pool_guard,
         );
@@ -534,7 +541,7 @@ impl MutableTableFile {
         lwc_blocks: Vec<LwcBlockPersist>,
         heap_redo_start_ts: TrxID,
         ts: TrxID,
-        disk_pool: &ReadonlyBufferPool,
+        disk_pool: &QuiescentGuard<ReadonlyBufferPool>,
     ) -> Result<(Arc<TableFile>, Option<OldRoot>)> {
         self.apply_lwc_blocks(lwc_blocks, heap_redo_start_ts, ts, disk_pool)
             .await?;
@@ -593,8 +600,7 @@ pub type OldRoot = OldCowRoot<TableMeta>;
 mod tests {
     use super::*;
     use crate::buffer::{
-        GlobalReadonlyBufferPool, PoolRole, ReadonlyBufferPool, global_readonly_pool_scope,
-        table_readonly_pool,
+        PoolRole, ReadonlyBufferPool, global_readonly_pool_scope, table_readonly_pool,
     };
     use crate::catalog::{ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexSpec};
     use crate::error::{BlockCorruptionCause, BlockKind, Error, FileKind};
@@ -664,7 +670,8 @@ mod tests {
             drop(table_file);
 
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
-            let (table_file2, disk_pool) = fs.open_table_file(41, global.guard()).await.unwrap();
+            let table_file2 = fs.open_table_file(41, global.guard()).await.unwrap();
+            let disk_pool = global.guard();
             assert_eq!(table_file2.active_root().trx_id, 1);
 
             let mutable = MutableTableFile::fork(&table_file2, background_writes);
@@ -729,18 +736,10 @@ mod tests {
             assert_eq!(table_file.active_root().trx_id, 1);
 
             let global = QuiescentBox::new(
-                GlobalReadonlyBufferPool::with_capacity(
-                    PoolRole::Disk,
-                    64 * 1024 * 1024,
-                    fs.guard(),
-                )
-                .unwrap(),
+                ReadonlyBufferPool::with_capacity(PoolRole::Disk, 64 * 1024 * 1024, fs.guard())
+                    .unwrap(),
             );
-            let disk_pool = ReadonlyBufferPool::from_table_file(
-                FileKind::TableFile,
-                Arc::clone(&table_file),
-                global.guard(),
-            );
+            let disk_pool = global.guard();
             let disk_pool_guard = disk_pool.pool_guard();
 
             // We first shut down the file system, then send the IO request,
@@ -748,7 +747,13 @@ mod tests {
             fs.shutdown();
 
             let res = disk_pool
-                .read_validated_block(&disk_pool_guard, test_block_id(1), accept_any_page)
+                .read_validated_block(
+                    table_file.file_kind(),
+                    table_file.sparse_file(),
+                    &disk_pool_guard,
+                    test_block_id(1),
+                    accept_any_page,
+                )
                 .await;
             assert!(res.is_err());
 
@@ -899,7 +904,7 @@ mod tests {
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
             let disk_pool = table_readonly_pool(&global, 43, &table_file);
             let (table_file, old_root) = MutableTableFile::fork(&table_file, background_writes)
-                .persist_lwc_blocks(lwc_blocks, 7, 2, &disk_pool)
+                .persist_lwc_blocks(lwc_blocks, 7, 2, disk_pool.global_pool())
                 .await
                 .unwrap();
             drop(old_root);
@@ -915,7 +920,9 @@ mod tests {
             let column_index = ColumnBlockIndex::new(
                 active_root.column_block_index_root,
                 active_root.pivot_row_id,
-                &disk_pool,
+                disk_pool.file_kind(),
+                disk_pool.sparse_file(),
+                disk_pool.global_pool(),
                 &disk_pool_guard,
             );
             let entry1 = column_index.locate_block(0).await.unwrap().unwrap();
@@ -960,7 +967,7 @@ mod tests {
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
             let disk_pool = table_readonly_pool(&global, 44, &table_file);
             let result = MutableTableFile::fork(&table_file, background_writes)
-                .persist_lwc_blocks(lwc_blocks, 7, 2, &disk_pool)
+                .persist_lwc_blocks(lwc_blocks, 7, 2, disk_pool.global_pool())
                 .await;
 
             assert!(matches!(result, Err(Error::InvalidArgument)));

@@ -32,8 +32,8 @@ pub use fixed::FixedBufferPool;
 pub use identity::PoolRole;
 pub(crate) use identity::{PoolIdentity, RowPoolRole};
 pub use pool_guard::{PoolGuard, PoolGuards, PoolGuardsBuilder};
-pub use readonly::{GlobalReadonlyBufferPool, ReadonlyBlockGuard, ReadonlyBufferPool};
 pub(crate) use readonly::{ReadSubmission, ReadonlyBackingFile};
+pub use readonly::{ReadonlyBlockGuard, ReadonlyBufferPool};
 
 use crate::DiskPool;
 use crate::buffer::guard::{FacadePageGuard, PageExclusiveGuard};
@@ -586,7 +586,7 @@ impl Component for MemPool {
 
 impl Component for DiskPool {
     type Config = DiskPoolConfig;
-    type Owned = GlobalReadonlyBufferPool;
+    type Owned = ReadonlyBufferPool;
     type Access = Self;
 
     const NAME: &'static str = "disk_pool";
@@ -598,7 +598,7 @@ impl Component for DiskPool {
         _shelf: ShelfScope<'_, Self>,
     ) -> Result<()> {
         let fs = registry.dependency::<FileSystem>()?;
-        registry.register::<Self>(GlobalReadonlyBufferPool::with_capacity(
+        registry.register::<Self>(ReadonlyBufferPool::with_capacity(
             PoolRole::Disk,
             config.bytes,
             fs,

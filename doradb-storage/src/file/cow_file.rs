@@ -6,12 +6,14 @@ use crate::file::fs::BackgroundWriteRequest;
 use crate::file::super_block::{SUPER_BLOCK_SIZE, SuperBlock};
 use crate::file::{BlockKey, FileID, SparseFile, write_direct};
 use crate::io::{DirectBuf, IOClient};
+use crate::quiescent::QuiescentGuard;
 use crate::trx::TrxID;
 use std::fs;
 use std::future::Future;
 use std::ops::{Deref, DerefMut};
 use std::os::fd::{AsRawFd, RawFd};
 use std::ptr::NonNull;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 
 pub use crate::file::BlockID;
@@ -161,7 +163,7 @@ pub struct CowCodec<M> {
 /// publish/load flow. Concrete file types provide format-specific behavior via
 /// [`CowCodec`].
 pub struct CowFile<M> {
-    file: SparseFile,
+    file: Arc<SparseFile>,
     active_root: AtomicPtr<ActiveRoot<M>>,
     mutable_inflight: AtomicBool,
     codec: CowCodec<M>,
@@ -186,7 +188,7 @@ impl<M> CowFile<M> {
             SparseFile::create_or_fail(file_path, initial_size, file_id)
         }?;
         Ok(CowFile {
-            file,
+            file: Arc::new(file),
             active_root: AtomicPtr::new(std::ptr::null_mut()),
             mutable_inflight: AtomicBool::new(false),
             codec,
@@ -205,7 +207,7 @@ impl<M> CowFile<M> {
     ) -> Result<Self> {
         let file = SparseFile::open(file_path, file_id)?;
         Ok(CowFile {
-            file,
+            file: Arc::new(file),
             active_root: AtomicPtr::new(std::ptr::null_mut()),
             mutable_inflight: AtomicBool::new(false),
             codec,
@@ -302,13 +304,13 @@ impl<M> CowFile<M> {
     }
 
     #[inline]
-    pub(crate) fn file_id(&self) -> FileID {
-        self.file.file_id()
+    pub(crate) fn sparse_file(&self) -> &Arc<SparseFile> {
+        &self.file
     }
 
     #[inline]
-    pub(crate) fn raw_fd(&self) -> RawFd {
-        self.file.as_raw_fd()
+    pub(crate) fn readonly_backing(&self) -> ReadonlyBackingFile {
+        ReadonlyBackingFile::new(Arc::clone(&self.file))
     }
 
     /// Replace active root with new root, returning previous-root guard if present.
@@ -326,27 +328,36 @@ impl<M> CowFile<M> {
     /// codec, and rejects invalid root invariants before returning an
     /// in-memory [`ActiveRoot`].
     ///
-    /// This is the intended runtime use of `ReadonlyBufferPool::read_block()`.
+    /// This is the intended runtime use of
+    /// `QuiescentGuard<ReadonlyBufferPool>::read_block()`.
     /// The raw block reads here are acceptable because super/meta-block
     /// validation happens immediately through `pick_super_block`,
     /// `parse_meta_block`, and `validate_root`. New callers should prefer
     /// `read_validated_block()` unless they have an equivalent caller-owned
     /// validation path and have reviewed the raw-read inflight semantics.
     #[inline]
-    pub async fn load_active_root_from_pool(
+    pub(crate) async fn load_active_root_from_pool(
         &self,
-        disk_pool: &ReadonlyBufferPool,
+        file_kind: FileKind,
+        disk_pool: &QuiescentGuard<ReadonlyBufferPool>,
     ) -> Result<ActiveRoot<M>> {
-        let _ = disk_pool.invalidate_block_id(SUPER_BLOCK_ID);
+        let _ = disk_pool.invalidate_block_id(self.file.file_id(), SUPER_BLOCK_ID);
         let pool_guard = disk_pool.pool_guard();
-        let super_block_guard = disk_pool.read_block(&pool_guard, SUPER_BLOCK_ID).await?;
+        let super_block_guard = disk_pool
+            .read_block(file_kind, &self.file, &pool_guard, SUPER_BLOCK_ID)
+            .await?;
         let super_block =
             Self::pick_super_block(super_block_guard.page(), self.codec.parse_super_block)?;
         drop(super_block_guard);
 
-        let _ = disk_pool.invalidate_block_id(super_block.body.meta_block_id);
+        let _ = disk_pool.invalidate_block_id(self.file.file_id(), super_block.body.meta_block_id);
         let meta_block_guard = disk_pool
-            .read_block(&pool_guard, super_block.body.meta_block_id)
+            .read_block(
+                file_kind,
+                &self.file,
+                &pool_guard,
+                super_block.body.meta_block_id,
+            )
             .await?;
         let parsed_meta =
             (self.codec.parse_meta_block)(super_block.body.meta_block_id, meta_block_guard.page())?;

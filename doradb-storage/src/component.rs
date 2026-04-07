@@ -1,4 +1,4 @@
-use crate::buffer::{EvictableBufferPool, FixedBufferPool, GlobalReadonlyBufferPool};
+use crate::buffer::{EvictableBufferPool, FixedBufferPool, ReadonlyBufferPool};
 use crate::error::{Error, Result};
 use crate::quiescent::{QuiescentBox, QuiescentGuard};
 use std::any::{Any, TypeId};
@@ -395,7 +395,7 @@ macro_rules! pool_access_newtype {
 pool_access_newtype!(MetaPool, FixedBufferPool);
 pool_access_newtype!(IndexPool, EvictableBufferPool);
 pool_access_newtype!(MemPool, EvictableBufferPool);
-pool_access_newtype!(DiskPool, GlobalReadonlyBufferPool);
+pool_access_newtype!(DiskPool, ReadonlyBufferPool);
 
 #[derive(Clone, Copy)]
 pub(crate) struct MetaPoolConfig {

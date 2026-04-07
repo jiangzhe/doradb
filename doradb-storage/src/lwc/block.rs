@@ -3,15 +3,18 @@
 use crate::buffer::{PoolGuard, ReadonlyBlockGuard, ReadonlyBufferPool};
 use crate::catalog::TableMetadata;
 use crate::error::{BlockCorruptionCause, BlockKind, Error, FileKind, Result};
+use crate::file::SparseFile;
 use crate::file::block_integrity::{
     BLOCK_INTEGRITY_HEADER_SIZE, LWC_BLOCK_SPEC, max_payload_len, validate_block,
 };
 use crate::file::cow_file::{BlockID, COW_FILE_PAGE_SIZE};
 use crate::lwc::{LwcData, LwcNullBitmap};
+use crate::quiescent::QuiescentGuard;
 use crate::serde::{Ser, Serde};
 use crate::value::{Val, ValKind};
 use bytemuck::{Pod, Zeroable};
 use std::mem;
+use std::sync::Arc;
 
 /// Size in bytes of one validated persisted LWC payload, excluding the shared block envelope.
 pub const LWC_BLOCK_PAYLOAD_SIZE: usize = max_payload_len(COW_FILE_PAGE_SIZE);
@@ -280,13 +283,20 @@ impl PersistedLwcBlock {
     /// Loads one persisted LWC block through the validated readonly-cache path.
     #[inline]
     pub async fn load(
-        disk_pool: &ReadonlyBufferPool,
+        file_kind: FileKind,
+        file: &Arc<SparseFile>,
+        disk_pool: &QuiescentGuard<ReadonlyBufferPool>,
         disk_pool_guard: &PoolGuard,
         block_id: BlockID,
     ) -> Result<Self> {
-        let file_kind = disk_pool.file_kind();
         let guard = disk_pool
-            .read_validated_block(disk_pool_guard, block_id, validate_persisted_lwc_block)
+            .read_validated_block(
+                file_kind,
+                file,
+                disk_pool_guard,
+                block_id,
+                validate_persisted_lwc_block,
+            )
             .await?;
         Ok(PersistedLwcBlock {
             guard,

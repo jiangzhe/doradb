@@ -182,6 +182,8 @@ impl CatalogStorage {
         let base_index = ColumnBlockIndex::new(
             root_block_id.unwrap_or(SUPER_BLOCK_ID),
             root.pivot_row_id,
+            self.mtb.file_kind(),
+            self.mtb.sparse_file(),
             &self.disk_pool,
             &disk_pool_guard,
         );
@@ -308,6 +310,8 @@ impl CatalogStorage {
                 let column_index = ColumnBlockIndex::new(
                     current_root_block_id,
                     current_end_row_id,
+                    self.mtb.file_kind(),
+                    self.mtb.sparse_file(),
                     &self.disk_pool,
                     &disk_pool_guard,
                 );
@@ -338,6 +342,8 @@ impl CatalogStorage {
                 let column_index = ColumnBlockIndex::new(
                     current_root_block_id,
                     current_end_row_id,
+                    self.mtb.file_kind(),
+                    self.mtb.sparse_file(),
                     &self.disk_pool,
                     &disk_pool_guard,
                 );
@@ -377,6 +383,8 @@ impl CatalogStorage {
             let column_index = ColumnBlockIndex::new(
                 current_root_block_id,
                 current_end_row_id,
+                self.mtb.file_kind(),
+                self.mtb.sparse_file(),
                 &self.disk_pool,
                 &disk_pool_guard,
             );
@@ -417,8 +425,14 @@ impl CatalogStorage {
             root_block_id, SUPER_BLOCK_ID,
             "root_block_id must not reference the reserved super block",
         );
-        let index =
-            ColumnBlockIndex::new(root_block_id, RowID::MAX, &self.disk_pool, disk_pool_guard);
+        let index = ColumnBlockIndex::new(
+            root_block_id,
+            RowID::MAX,
+            self.mtb.file_kind(),
+            self.mtb.sparse_file(),
+            &self.disk_pool,
+            disk_pool_guard,
+        );
         index.collect_leaf_entries().await
     }
 
@@ -443,6 +457,8 @@ impl CatalogStorage {
         let column_index = ColumnBlockIndex::new(
             root_block_id,
             root.pivot_row_id,
+            self.mtb.file_kind(),
+            self.mtb.sparse_file(),
             &self.disk_pool,
             disk_pool_guard,
         );
@@ -511,13 +527,19 @@ impl CatalogStorage {
         column_index: &ColumnBlockIndex<'_>,
         entry: &CatalogIndexEntry,
     ) -> Result<Vec<RowRecord>> {
-        let lwc_block =
-            PersistedLwcBlock::load(&self.disk_pool, disk_pool_guard, entry.block_id()).await?;
+        let lwc_block = PersistedLwcBlock::load(
+            self.mtb.file_kind(),
+            self.mtb.sparse_file(),
+            &self.disk_pool,
+            disk_pool_guard,
+            entry.block_id(),
+        )
+        .await?;
         let row_count = lwc_block.row_count();
         let row_ids = column_index.load_entry_row_ids(entry).await?;
         if row_count != row_ids.len() {
             return Err(Error::block_corrupted(
-                self.disk_pool.file_kind(),
+                self.mtb.file_kind(),
                 BlockKind::LwcBlock,
                 entry.block_id(),
                 BlockCorruptionCause::InvalidPayload,
@@ -917,12 +939,16 @@ mod tests {
             let index1 = ColumnBlockIndex::new(
                 BlockID::from(tables_root1.root_block_id.unwrap().get()),
                 tables_root1.pivot_row_id,
+                engine.catalog().storage.mtb.file_kind(),
+                engine.catalog().storage.mtb.sparse_file(),
                 &engine.catalog().storage.disk_pool,
                 &disk_pool_guard,
             );
             let index2 = ColumnBlockIndex::new(
                 BlockID::from(tables_root2.root_block_id.unwrap().get()),
                 tables_root2.pivot_row_id,
+                engine.catalog().storage.mtb.file_kind(),
+                engine.catalog().storage.mtb.sparse_file(),
                 &engine.catalog().storage.disk_pool,
                 &disk_pool_guard,
             );

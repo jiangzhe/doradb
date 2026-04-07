@@ -203,6 +203,8 @@ impl Table {
         let column_index = ColumnBlockIndex::new(
             mutable_root.column_block_index_root,
             mutable_root.pivot_row_id,
+            self.file().file_kind(),
+            self.file().sparse_file(),
             disk_pool,
             &disk_pool_guard,
         );

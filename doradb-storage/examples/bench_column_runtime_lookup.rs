@@ -1,17 +1,12 @@
 use clap::Parser;
-use doradb_storage::buffer::{PoolGuard, PoolRole, ReadonlyBufferPool};
 use doradb_storage::catalog::{
     ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexSpec, TableSpec,
 };
 use doradb_storage::conf::{
     EngineConfig, EvictableBufferPoolConfig, FileSystemConfig, TrxSysConfig,
 };
-use doradb_storage::engine::Engine;
-use doradb_storage::error::FileKind;
-use doradb_storage::file::BlockID;
-use doradb_storage::index::ColumnBlockIndex;
-use doradb_storage::row::RowID;
-use doradb_storage::row::ops::{DeleteMvcc, InsertMvcc, SelectKey};
+use doradb_storage::engine::{Engine, EngineRef};
+use doradb_storage::row::ops::{DeleteMvcc, InsertMvcc, SelectKey, SelectMvcc};
 use doradb_storage::session::Session;
 use doradb_storage::table::{Table, TablePersistence};
 use doradb_storage::value::{Val, ValKind};
@@ -21,7 +16,10 @@ use std::thread;
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
 
+const READ_SET: [usize; 2] = [0, 1];
+
 #[derive(Clone, Parser)]
+#[command(about = "Persisted row lookup benchmark via public table/session APIs")]
 struct Args {
     #[arg(long, default_value_t = 4096)]
     rows: usize,
@@ -37,12 +35,9 @@ struct BenchmarkCase {
     label: &'static str,
     _temp_dir: TempDir,
     _engine: Engine,
-    _table: Arc<Table>,
-    disk_pool: ReadonlyBufferPool,
-    disk_pool_guard: PoolGuard,
-    root_page_id: BlockID,
-    end_row_id: RowID,
-    row_ids: Vec<RowID>,
+    engine_ref: EngineRef,
+    table: Arc<Table>,
+    keys: Vec<SelectKey>,
 }
 
 fn main() {
@@ -77,7 +72,7 @@ async fn build_case(
         .storage_root(temp_dir.path())
         .data_buffer(
             EvictableBufferPoolConfig::default()
-                .role(PoolRole::Mem)
+                .role(doradb_storage::buffer::PoolRole::Mem)
                 .max_mem_size(64u64 * 1024 * 1024)
                 .max_file_size(128u64 * 1024 * 1024),
         )
@@ -121,41 +116,30 @@ async fn build_case(
     }
     table.freeze(&session, usize::MAX).await;
     table.data_checkpoint(&mut session).await.unwrap();
+    drop(session);
 
-    let disk_pool = ReadonlyBufferPool::from_table_file(
-        FileKind::TableFile,
-        Arc::clone(table.file()),
-        engine.disk_pool.clone_inner(),
-    );
-
-    let active_root = table.file().active_root();
-    let root_page_id = active_root.column_block_index_root;
-    let end_row_id = active_root.pivot_row_id;
-    let disk_pool_guard = disk_pool.pool_guard();
-    let index = ColumnBlockIndex::new(root_page_id, end_row_id, &disk_pool, &disk_pool_guard);
-
-    let mut row_ids = Vec::new();
-    for row_id in 0..rows as RowID {
-        if sparse && (row_id as usize).is_multiple_of(sparse_stride) {
-            continue;
-        }
-        if index.locate_block(row_id).await.unwrap().is_some() {
-            row_ids.push(row_id);
-        }
-    }
-    assert!(!row_ids.is_empty());
+    let keys = live_keys(rows, sparse, sparse_stride);
+    assert!(!keys.is_empty());
 
     BenchmarkCase {
         label,
+        engine_ref: engine.new_ref().unwrap(),
         _temp_dir: temp_dir,
         _engine: engine,
-        _table: table,
-        disk_pool,
-        disk_pool_guard,
-        root_page_id,
-        end_row_id,
-        row_ids,
+        table,
+        keys,
     }
+}
+
+fn live_keys(rows: usize, sparse: bool, sparse_stride: usize) -> Vec<SelectKey> {
+    let mut keys = Vec::with_capacity(rows);
+    for idx in 0..rows {
+        if sparse && idx.is_multiple_of(sparse_stride) {
+            continue;
+        }
+        keys.push(SelectKey::new(0, vec![Val::from(idx as i32)]));
+    }
+    keys
 }
 
 async fn insert_rows(table: &Arc<Table>, session: &mut Session, rows: usize) {
@@ -190,85 +174,56 @@ impl BenchmarkCase {
             label: _,
             _temp_dir,
             _engine,
-            _table,
-            disk_pool,
-            disk_pool_guard,
-            root_page_id: _,
-            end_row_id: _,
-            row_ids: _,
+            engine_ref,
+            table,
+            keys: _,
         } = self;
-        drop(disk_pool);
-        drop(disk_pool_guard);
-        drop(_table);
+        drop(table);
+        drop(engine_ref);
         drop(_engine);
         drop(_temp_dir);
     }
 }
 
-#[derive(Clone, Copy)]
-enum BenchPath {
-    Locate,
-    Resolved,
-}
-
 fn bench_case(case: &BenchmarkCase, threads: usize, iterations_per_thread: usize) {
-    let locate = bench_parallel(case, threads, iterations_per_thread, BenchPath::Locate);
-    let resolved = bench_parallel(case, threads, iterations_per_thread, BenchPath::Resolved);
+    let elapsed = bench_parallel(case, threads, iterations_per_thread);
     print_result(
         case.label,
-        "locate",
-        case.row_ids.len(),
+        case.keys.len(),
         threads,
         iterations_per_thread,
-        locate,
-    );
-    print_result(
-        case.label,
-        "resolved",
-        case.row_ids.len(),
-        threads,
-        iterations_per_thread,
-        resolved,
+        elapsed,
     );
 }
 
-fn bench_parallel(
-    case: &BenchmarkCase,
-    threads: usize,
-    iterations_per_thread: usize,
-    path: BenchPath,
-) -> Duration {
+fn bench_parallel(case: &BenchmarkCase, threads: usize, iterations_per_thread: usize) -> Duration {
     assert!(threads > 0);
     let start = Instant::now();
     thread::scope(|scope| {
         for worker_idx in 0..threads {
-            let disk_pool = case.disk_pool.clone();
-            let disk_pool_guard = case.disk_pool_guard.clone();
-            let row_ids = &case.row_ids;
-            let root_page_id = case.root_page_id;
-            let end_row_id = case.end_row_id;
+            let engine_ref = case.engine_ref.clone();
+            let table = Arc::clone(&case.table);
+            let keys = &case.keys;
             scope.spawn(move || {
                 smol::block_on(async move {
-                    let index = ColumnBlockIndex::new(
-                        root_page_id,
-                        end_row_id,
-                        &disk_pool,
-                        &disk_pool_guard,
-                    );
+                    let mut session = engine_ref.try_new_session().unwrap();
+                    let mut trx = session.try_begin_trx().unwrap().unwrap();
                     for step in 0..iterations_per_thread {
-                        let row_id = row_ids[(worker_idx + step * threads) % row_ids.len()];
-                        match path {
-                            BenchPath::Locate => {
-                                let entry = index.locate_block(row_id).await.unwrap().unwrap();
-                                black_box(entry.block_id());
-                            }
-                            BenchPath::Resolved => {
-                                let resolved =
-                                    index.locate_and_resolve_row(row_id).await.unwrap().unwrap();
-                                black_box((resolved.block_id(), resolved.row_idx()));
-                            }
-                        }
+                        let key = &keys[(worker_idx + step * threads) % keys.len()];
+                        let stmt = trx.start_stmt();
+                        let res = stmt
+                            .select_row_mvcc(table.as_ref(), key, &READ_SET)
+                            .await
+                            .unwrap();
+                        let vals = match res {
+                            SelectMvcc::Found(vals) => vals,
+                            SelectMvcc::NotFound => panic!("benchmark key unexpectedly missing"),
+                        };
+                        black_box(vals);
+                        trx = stmt.succeed();
                     }
+                    trx.commit().await.unwrap();
+                    drop(session);
                 });
             });
         }
@@ -278,7 +233,6 @@ fn bench_parallel(
 
 fn print_result(
     label: &str,
-    path: &str,
     live_rows: usize,
     threads: usize,
     iterations_per_thread: usize,
@@ -288,7 +242,7 @@ fn print_result(
     let nanos = elapsed.as_nanos() as f64 / total_ops as f64;
     let qps = total_ops as f64 * 1_000_000_000f64 / elapsed.as_nanos() as f64;
     println!(
-        "{label:>6} {path:>8}: live_rows={live_rows}, threads={threads}, iterations/thread={iterations_per_thread}, total_ops={total_ops}, elapsed={}ms, op={nanos:.1}ns, qps={qps:.2}",
+        "{label:>6} select_mvcc: live_rows={live_rows}, threads={threads}, iterations/thread={iterations_per_thread}, total_ops={total_ops}, elapsed={}ms, op={nanos:.1}ns, qps={qps:.2}",
         elapsed.as_millis(),
     );
 }

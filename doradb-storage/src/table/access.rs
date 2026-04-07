@@ -271,8 +271,14 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
         let Some(storage) = self.storage else {
             return Err(Error::InvalidState);
         };
-        let block =
-            PersistedLwcBlock::load(storage.disk_pool(), guards.disk_guard(), block_id).await?;
+        let block = PersistedLwcBlock::load(
+            storage.file().file_kind(),
+            storage.file().sparse_file(),
+            storage.disk_pool(),
+            guards.disk_guard(),
+            block_id,
+        )
+        .await?;
         if block.row_shape_fingerprint() != row_shape_fingerprint {
             return Err(Error::block_corrupted(
                 FileKind::TableFile,
