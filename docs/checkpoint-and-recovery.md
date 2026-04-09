@@ -2,263 +2,266 @@
 
 ## 1. Overview
 
-The Doradb persistence layer operates on a **No-Steal / No-Force** policy. This design decouples high-concurrency foreground transaction processing from background persistence tasks, eliminating global write locks and random I/O storms associated with traditional buffer pool flushing.
+Doradb uses a **No-Steal / No-Force** persistence model:
 
-### Core Philosophy
-1.  **CTS as Watermark**: The system uses **Commit Timestamps (CTS)** rather than physical LSNs to track persistence progress, enabling logical consistency across multi-stream logs.
-2.  **Table-Centric Management**: Persistence coordination is grouped by **Table**. Each table acts as an autonomous unit managing the commit status of its data heap and all associated indexes.
-3.  **Decoupled Components**: Within a table, the Heap (Tuple Mover) and each Secondary Index (Checkpoint Thread) persist independently but share a common commit history for coordination.
+- foreground transactions write memory state plus redo
+- background checkpoint publishes committed persistent state through CoW roots
+- restart restores the latest committed state by loading checkpointed files and
+  replaying redo
 
-## 2. Architecture Components
+Checkpoint and recovery are table-centric. Each user table publishes one CoW
+root that includes:
 
-### 2.1 Table Structure for Persistence
-Each Table object maintains the following structures to coordinate checkpoints:
+- persistent LWC/block-index state
+- persistent cold-row delete state
+- persistent secondary-index `DiskTree` roots
 
-1. **Commit Queue**: Buffers newly committed transactions that modified this table. Pushed by foreground worker threads on Commit.
-2. **Unflushed Transaction Map**: Stores committed transactions not yet fully persisted by all table components. Key: STS (Start Timestamp), Value: CTS (Commit Timestamp).
-3. **Component Watermarks**: Records recovery watermark of heap table, checkpoint watermark of each index.
+The important boundary is that secondary-index persistence is a companion of
+table data/deletion checkpoint. There is no independent index checkpoint thread
+and no index-specific replay watermark.
 
-Catalog metadata uses a related but distinct persistence path. Runtime catalog
-reads remain cache-first in memory, while checkpointed catalog state is
-published into a single CoW file, `catalog.mtb`. Its active root stores table
-roots for the logical catalog tables, `next_user_obj_id`, and
-`catalog_replay_start_ts`. `catalog_replay_start_ts` is the inclusive lower
-bound of catalog redo that still must be replayed after restart; heartbeat/noop
-catalog checkpoints may advance this watermark even when the table roots do not
-change.
+## 2. Persistent Boundaries
 
-### 2.2 Watermark Definitions
+### 2.1 Heap Boundary
 
-Each table maintains three types of watermarks, corresponding to its three persistence components. The minimum of these defines the table's retention requirement.
+Heap recovery is controlled by `Heap_Redo_Start_TS`.
 
-1. Heap Watermark: `Heap_Redo_Start_TS`
-    *   **Definition**: The creation timestamp (CTS) of the **oldest active RowPage** currently resident in the in-memory RowStore.
-    *   **Purpose**: To rebuild the volatile RowStore, the system must replay all heap operations (Insert/Update) that occurred since the creation of the oldest surviving page.
-    *   **Maintenance**:
-        *   When a new RowPage is allocated, its `Creation_CTS` is set to the current system clock.
-        *   When the **Tuple Mover** successfully converts a batch of frozen RowPages into LWC blocks and persists them:
-            1.  It identifies the *next* oldest active RowPage remaining in memory.
-            2.  It updates `Heap_Redo_Start_TS` in the Table Metadata to that page's `Creation_CTS`.
-        *   *Edge Case*: If the RowStore becomes empty (all data flushed to LWC), `Heap_Redo_Start_TS` is advanced to the current system CTS.
+Definition:
 
-2. Deletion Watermark: `Deletion_Rec_CTS`
-    *   **Definition**: The maximum CTS such that all deletions with `CTS <= Deletion_Rec_CTS` targeting cold data (`RowID < Pivot`) have been persisted into on-disk Delete Bitmaps.
-    *   **Purpose**: To rebuild the in-memory **ColumnDeletionBuffer**, the system must replay delete operations that occurred after this point.
-    *   **Maintenance**: Updated atomically in the Table Metadata after a successful **Deletion Checkpoint**.
+- the creation timestamp of the oldest surviving in-memory RowStore page
 
-3. Index Watermark: `Index_Rec_CTS` (Per Index)
-    *   **Definition**: The maximum CTS such that all key changes with `CTS <= Index_Rec_CTS` have been merged into the on-disk DiskTree.
-    *   **Purpose**: To rebuild the in-memory **MemTree**, the system must replay index operations that occurred after this point.
-    *   **Maintenance**: Updated atomically in the Index Meta Page after a successful **Index Checkpoint**.
+Purpose:
 
-## 3. The Commit Flow
+- restart replays heap redo from this point to reconstruct hot RowStore pages
 
-When a transaction $T$ (`My_STS`, `My_CTS`) commits, it performs the following steps for each table it modified:
+Why it is separate:
 
-1.  **Commit Log**: Write the transaction record to the global transaction log.
-2.  **Memory Update**: Update the in-memory CTS in Undo Chains or Deletion Buffers for visibility.
-3.  **Queue Push**: Push a `(sts, cts)` pair into the Table's `commit_queue`.
+- RowStore checkpoint is incremental
+- rows older than a checkpoint barrier may still exist only in memory if their
+  page was not yet converted to LWC
+- therefore heap cannot share one universal recovery watermark with deletion and
+  secondary-index persistence
 
-## 4. Checkpoint Processes
+### 2.2 Deletion Boundary
 
-Checkpointing is executed by background threads. While the Heap and Index checkpoint processes are asynchronous, they coordinate via the Table's shared state.
+Cold-row deletion recovery is controlled by `Deletion_Rec_CTS`.
 
-### 4.1 State Ingestion (Common Step)
-Before any component starts a checkpoint, it drains the table's `commit_queue` and inserts all items into the `unflushed_map`. This ensures the map contains the latest commit history.
+Definition:
 
-### 4.3 Data Checkpoint (Heap / Tuple Mover)
+- the maximum commit timestamp such that all cold-row deletions with
+  `CTS <= Deletion_Rec_CTS` have been persisted into delete bitmaps
 
-The Data Checkpoint is driven by the **Tuple Mover**, a background task responsible for transforming in-memory **RowPages** into on-disk **LWC (LightWeight Columnar) Blocks**.
+Purpose:
 
-This process follows a strict **Three-Stage Lifecycle** to ensure non-blocking writes and data consistency.
+- restart only replays newer cold-row deletions into the in-memory deletion
+  buffer
 
-#### 4.3.1 RowPage Lifecycle States
+### 2.3 Secondary Index Boundary
 
-Each RowPage maintains an atomic `state` word (`[RefCount: 62bit | State: 2bit]`):
+Secondary indexes do not keep an independent recovery watermark.
 
-1.  **ACTIVE**:
-    *   **Allowed**: Insert, In-place Update, Delete.
-    *   **Behavior**: Transaction threads perform standard MVCC operations. The page tracks `Max_Ins_STS` (the STS of the latest transaction to perform an Insert or Update).
-2.  **FROZEN** (Draining):
-    *   **Allowed**: Delete **only**.
-    *   **Redirect**: Insert/Update attempts are rejected and redirected to the "Cold Update" path (Delete + Re-Insert into a new Active page).
-    *   **Purpose**: Allows existing uncommitted transactions to settle without blocking new writers.
-3.  **TRANSITION** (Converting):
-    *   **Allowed**: Read (Snapshot Read).
-    *   **Behavior**: Data is immutable. Source for LWC generation. Writers backoff & retry.
+Instead:
 
-#### 4.3.2. The Tuple Mover Workflow
+- checkpointed cold secondary-index state is loaded from the `DiskTree` roots in
+  the table checkpoint
+- hot secondary-index state is rebuilt through normal redo replay of hot row
+  operations
+- stale cold entries are shadowed at runtime by `MemTree` and deletion-buffer
+  state until the next table checkpoint publishes updated `DiskTree` roots
 
-The Tuple Mover processes a batch of RowPages through these stages:
+This removes the old `Index_Rec_CTS` problem entirely.
 
-**Step 1: Freeze (Active -> Frozen)**
+## 3. Commit Flow
 
-The goal is to stop new mutations (Inserts/Updates) instantly without waiting.
-1.  **Atomic Switch**: The Tuple Mover performs a `CAS(state, ACTIVE, FROZEN)` on the target RowPages.
-2.  **Effect**: Subsequent Insert/Update requests immediately fail the state check and divert to the "Cold Update" path (logical deletion + insertion into a fresh Active page). Delete operations continue to be allowed to minimize aborts.
+When a transaction commits on a table:
 
-**Step 2: Stabilize (Wait for Visibility)**
+1. its redo record is appended to the commit log
+2. heap undo state and deletion-buffer state become visible through commit CTS
+3. secondary-index changes remain in `MemTree`
 
-The Tuple Mover must ensure that all data in the Frozen pages is fully committed (or aborted) before conversion.
-1.  **Check Condition**: Instead of scanning Undo Chains, the Tuple Mover compares timestamps:
-    $$ \text{Global\_Min\_Active\_STS} > \text{Page.Max\_Insert\_STS} $$
-    *   `Global_Min_Active_STS`: The start timestamp of the oldest active transaction in the system.
-    *   `Page.Max_Insert_STS`: Updated by every writer during the Active phase.
-2.  **Wait**: If the condition is not met, the Tuple Mover yields/sleeps and retries later. This ensures no uncommitted Inserts/Updates exist on the page.
+Foreground commit never updates persistent `DiskTree` pages directly.
 
-**Step 3: Convert (Frozen -> Transition)**
+## 4. Checkpoint
 
-Once stabilized, the page is ready for conversion.
-1.  **Atomic Transition**: Perform `CAS(state, FROZEN, TRANSITION)`.
-2.  **Drain Reference Count**: Spin-wait until `RefCount == 0`. This ensures any concurrent Delete operations (which were allowed in Frozen state) have finished.
-3.  **Read & Transform**:
-    *   Read the now-immutable RowPage data.
-    *   Apply any committed Deletes from the delete bitmap.
-    *   Encode data into an **LWC Block**.
-    *   If uncommitted Deletes exist (rare, but possible), they are carried over to the LWC Block's separate "Deletion Bitmap" or Deletion Buffer.
-4.  **Persist**:
-    *   Write the LWC Block and its Block Index entry to disk. This step is fast because both blocks and its index are append-only.
-5.  **Switch Metadata**:
-    *   Update in-memory Block Index to point to the new LWC Block.
-    *   Update `Table.watermarks.heap_rec_cts` based on the maximum CTS found in the converted data.
-    *   Mark `TRANSITION` pages as **Retired** (hand over to Transaction-based GC).
+Table checkpoint has two persistence responsibilities:
 
-## 4.3 Deletion Checkpoint (Delete Bitmap)
+1. move committed hot rows into persistent LWC blocks
+2. persist committed cold-row deletes into delete bitmaps
 
-While the Tuple Mover handles the append-only growth of data (Heap), deletions on existing persistent data (`RowID < Pivot`) are handled via the Deletion Checkpoint.
+Secondary-index persistence happens as companion work of those same checkpoint
+operations.
 
-### Triggering
-Deletion Checkpoint can be triggered in three ways:
-1.  **Piggyback**: Runs automatically alongside the Tuple Mover tasks to amortize metadata I/O overhead.
-2.  **Threshold**: Runs independently if the in-memory **ColumnDeletionBuffer** exceeds a size threshold (e.g., 64MB).
-3.  **Heartbeat**: Runs on a periodic timer (e.g., every minute) if no data-driven checkpoint has occurred for a table, or is triggered by the Log Manager when log usage is high. This is critical for log truncation.
+### 4.1 Data Checkpoint
 
-### Process
-The process is coordinated by a system transaction that defines the persistence boundary.
+Data checkpoint is driven by the Tuple Mover.
 
-1.  **Snapshot & Barrier**: The Checkpoint Coordinator acquires a global system timestamp: **`Checkpoint_STS`**. This timestamp acts as a **Read View**, guaranteeing that all deletions committed at or before this time will be persisted.
-2.  **Select**: The coordinator scans the `ColumnDeletionBuffer` and collects `RowID`s where the entry is committed and its `CTS <= Checkpoint_STS`.
-3.  **Merge & Encode (Data Path)**: If deletions were selected:
-    *   For each affected LWC Block, load the old on-disk bitmap.
-    *   Merge the new deletions: `New_Bitmap = Old_Bitmap | New_Deletes`.
-    *   Persist the new bitmap using Copy-on-Write (CoW), updating the Block Index and/or a dedicated Bitmap B+Tree.
-4.  **Commit & Watermark Advancement**:
-    *   A new `MetaBlock` is created.
-    *   **Crucially**, the watermark is advanced to the system timestamp acquired in Step 1: `Table.watermarks.deletion_rec_cts = Checkpoint_STS`. This happens even if no data was written (the "Heartbeat" path), ensuring the recovery watermark always moves forward.
-    *   The SuperBlock is atomically updated to point to the new `MetaBlock`.
+#### RowPage Lifecycle
 
-### Memory Garbage Collection (Cleanup)
-Persistence of a delete is decoupled from its cleanup in memory. Entries are retained after a checkpoint to provide MVCC visibility (Undo) for long-running transactions.
+Each RowPage moves through:
 
-*   **Trigger**: A separate, periodic background task.
-*   **Condition**: An entry can be removed from the `ColumnDeletionBuffer` **only if** its commit timestamp is older than the start timestamp of the oldest active transaction in the system:
-    $$ \text{Entry.CTS} < \text{Global\_Min\_Active\_STS} $$
-*   **Logic**: Once this condition is met, no active transaction can possibly need to see the "pre-delete" version of the row, so the Undo information in memory is obsolete and can be safely reclaimed.
+1. `ACTIVE`
+   - accepts insert, in-place update, delete
+2. `FROZEN`
+   - rejects new insert/update
+   - still allows delete while in-flight writers drain
+3. `TRANSITION`
+   - immutable source for LWC generation
 
-### 4.4 Index Checkpoint (Per Index)
+#### Data Checkpoint Workflow
 
-The Index Checkpoint thread persists dirty data from the in-memory **MemTree** to the on-disk **DiskTree**.
+1. Freeze selected RowStore pages.
+2. Wait until all relevant inserts/updates are committed or aborted.
+3. Move pages to `TRANSITION`.
+4. Build LWC blocks from the committed visible rows.
+5. Insert matching `ColumnBlockIndex` entries.
+6. Build companion secondary-index entries from the same committed visible rows
+   and merge them into each affected `DiskTree`.
+7. Publish one new table checkpoint root that contains:
+   - new LWC blocks
+   - new block-index state
+   - updated `DiskTree` roots
+   - updated `Heap_Redo_Start_TS`
 
-1.  **Scan & Correlate**:
-    *   Scan all **Dirty Entries** (`{Key, RowID, STS}`) in the MemTree.
-    *   For each entry, look up its `STS` in the **Table `unflushed_map`**.
-    *   **If Found**: The transaction is committed. Retrieve its `CTS`. Include this entry in the current batch. Update `Batch_Max_CTS = max(Batch_Max_CTS, CTS)`.
-    *   **If Not Found**: The transaction is either active (skip) or already fully persisted/GC'ed (skip).
-2.  **CoW Merge**:
-    *   Apply the batch of entries to the DiskTree using Copy-on-Write.
-    *   Generate a new Root Page.
-3.  **Persistence**:
-    *   Flush new pages to disk.
-    *   Atomically update the DiskTree Meta Page: `Index_Rec_CTS = Batch_Max_CTS`.
-4.  **In-Memory Cleanup**:
-    *   Perform `CAS(&Entry.sts, STS, 0)` on the processed MemTree entries to mark them as **Clean**.
-5.  **Watermark Update**:
-    *   Update `Table.watermarks.index_rec_cts[IndexID]` in memory.
+This guarantees that newly checkpointed cold rows and their cold secondary
+index entries become durable together.
 
-## 5. Garbage Collection (Map Cleanup)
+### 4.2 Deletion Checkpoint
 
-To prevent the `unflushed_map` from growing indefinitely, a cleanup task runs periodically (e.g., after every checkpoint cycle).
+Deletion checkpoint persists committed cold-row deletes.
 
-1.  **Calculate Safe Watermark**:
-    For each transaction $T$ in the `unflushed_map`:
-    *   Identify the components (Heap + Indexes) modified by $T$ (using `affected_indexes_bitmap`).
-    *   Check if **all** relevant components have `Rec_CTS >= T.CTS`.
-2.  **Prune**:
-    *   If the condition is met, $T$ is fully persisted everywhere. Remove $T$ from `unflushed_map`.
+#### Selection Rule
 
-## 6. Recovery System
+1. acquire a checkpoint cutoff timestamp
+2. select deletion-buffer entries for cold rows with `CTS < cutoff`
 
-The recovery process restores the in-memory state by replaying the WAL, filtering operations based on the persisted watermarks.
+#### Persistence Workflow
 
-### 6.1 Logical Replay Floor
+1. load the affected persistent delete bitmaps
+2. merge the selected deletions
+3. locate the deleted rows in persistent storage
+4. decode their old secondary-index keys
+5. apply the corresponding companion deletes to each affected `DiskTree`
+6. publish one new table checkpoint root that contains:
+   - updated delete bitmaps
+   - updated `DiskTree` roots
+   - updated `Deletion_Rec_CTS`
 
-Current implementation persists a logical recovery floor but does not yet
-physically truncate redo logs. On startup the engine computes a coarse replay
-start watermark `W` from the persisted catalog checkpoint boundary and the
-loaded user-table heap boundaries:
+This guarantees that persisted cold-row deletes and persisted cold secondary
+index removals become durable together.
+
+### 4.3 No Independent Index Checkpoint
+
+The design explicitly does **not** do the following:
+
+- scan dirty `MemTree` entries looking for committed work
+- merge arbitrary committed batches into `DiskTree`
+- advance an index-only replay watermark from a batch max CTS
+
+That older model is more complex and cannot safely prove a contiguous persisted
+index prefix without extra machinery.
+
+## 5. Recovery
+
+### 5.1 Coarse Replay Floor
+
+Current recovery still computes a coarse replay floor from:
 
 $$ W = \min \left( \text{catalog\_replay\_start\_ts}, \min_{\forall T \in \text{Loaded User Tables}}(T.\text{Heap\_Redo\_Start\_TS}) \right) $$
 
-This watermark is only a coarse filter. Recovery still applies finer
-per-component replay predicates after `W`. Future physical truncation work can
-reuse the same persisted watermarks, but segment deletion is intentionally
-deferred.
+This only skips redo that is definitely older than every loaded hot heap
+boundary. Finer replay rules are still applied afterward.
 
-### 6.2 Recovery Procedure
+### 5.2 Metadata Load
 
-Upon system restart, the recovery process uses these persistent watermarks to determine where to begin reading the log and how to filter operations.
+On restart:
 
-#### 6.2.1 Metadata Load & Start Point Determination
-1.  Load the active root from `catalog.mtb` and construct the in-memory
-    catalog tables from the checkpointed catalog rows.
-2.  Restore catalog metadata persisted in `catalog.mtb`, especially
-    `next_user_obj_id` and `catalog_replay_start_ts`.
-3.  Reload each checkpointed user table listed in the catalog and read its
-    table-file metadata, including `Heap_Redo_Start_TS`.
-4.  Calculate the coarse replay floor:
-    $$ \text{Replay\_Start\_CTS} = \min(\text{catalog\_replay\_start\_ts}, \text{all loaded } \text{Heap\_Redo\_Start\_TS}) $$
-5.  The log reader still scans merged redo streams linearly, but skips any log
-    record with `CTS < Replay_Start_CTS`.
+1. load checkpointed catalog state from `catalog.mtb`
+2. reload checkpointed user tables
+3. load each table's persistent LWC/block-index state
+4. load each table's persistent secondary-index `DiskTree` roots from the same
+   table checkpoint root
 
-#### 6.2.2 Log Replay
-The recovery thread reads logs sequentially from the `Replay_Start_CTS`. This timestamp acts as a coarse-grained filter to skip log records that are guaranteed to be persisted across all tables and all components.
+At this point the engine has all checkpointed cold data, cold delete state, and
+checkpointed cold secondary-index state.
 
-For each log entry read from the log, a second, finer-grained check is performed against the specific component's watermark to decide whether to replay the operation. This ensures that each part of the system (Heap, Deletion, Index) is restored to its correct state without re-applying changes that are already persisted.
+### 5.3 Log Replay
 
-*   **Catalog Operations**:
-    *   **Rule**: Replay if `Entry.CTS >= catalog_replay_start_ts`.
-    *   **Action**: Apply catalog row redo to the in-memory catalog tables. New
-        user tables created after the checkpoint are loaded from their table
-        files before subsequent user-table DML replay touches them.
+For each redo record after the coarse replay floor:
 
-*   **Heap Operations (Affecting the In-Memory RowStore)**:
-    *   **Filter**: An operation on a table `T` is a candidate if its `RowID >= T.Pivot_RowID`.
-    *   **Rule**: Replay if `Entry.CTS >= T.Heap_Redo_Start_TS`.
-    *   **Action**: Re-apply the Insert or Update to reconstruct the in-memory RowPage.
-    *   **Clarification**: The `Heap_Redo_Start_TS` specifically marks the point from which the *volatile* part of the heap needs to be reconstructed. There is an additional filter for *cold* data (see `data-checkpoint.md` for `Last_Checkpoint_STS` logic).
+- Catalog:
+  - replay if `CTS >= catalog_replay_start_ts`
+- Heap / hot RowStore:
+  - replay if the row belongs to hot RowStore and
+    `CTS >= Heap_Redo_Start_TS`
+  - row replay also rebuilds hot secondary-index `MemTree` state through the
+    normal row/index update logic
+- Cold-row deletions:
+  - replay if the row belongs to persistent storage and
+    `CTS > Deletion_Rec_CTS`
+  - insert those deletes into the in-memory deletion buffer
 
-*   **Deletion Operations (Affecting the On-Disk ColumnStore)**:
-    *   **Filter**: An operation on a table `T` is a candidate if its `RowID < T.Pivot_RowID`.
-    *   **Rule**: Replay if `Entry.CTS > T.Deletion_rec_CTS`.
-    *   **Action**: Insert the deletion record into the in-memory `ColumnDeletionBuffer`.
+There is no extra per-index replay predicate.
 
-*   **Index Operations**:
-    *   **Filter**: All operations that modify an index.
-    *   **Rule**: Replay if `Entry.CTS > Index.Rec_CTS` for the specific index being modified.
-    *   **Action**: Insert the key change into the corresponding in-memory `MemTree` and mark it as dirty.
+### 5.4 Why Index Recovery Works Without `Index_Rec_CTS`
 
-#### 6.2.3 Completion
-Once the log end is reached, the in-memory state (catalog tables, RowStore,
-DeletionBuffer, MemTree) is consistent with the state at the moment of the
-crash. For user tables preloaded from checkpoint, persisted data below
-`Pivot_RowID` is already available from the table file and in-memory secondary
-indexes are rebuilt from that persisted data before the engine opens for new
-transactions.
+Recovery does not need an index-specific watermark because:
+
+1. checkpointed cold secondary-index state is already loaded from `DiskTree`
+2. hot post-checkpoint secondary-index state is reconstructed from hot row redo
+3. post-checkpoint cold deletes are reconstructed from deletion redo and shadow
+   stale cold `DiskTree` entries until a later checkpoint updates them
+4. no active transaction survives restart, so recovery only needs the latest
+   committed mapping, not historical pre-crash snapshot visibility
+
+### 5.5 Completion
+
+After redo reaches log end:
+
+- RowStore is reconstructed for hot rows
+- deletion buffer is reconstructed for post-checkpoint cold deletes
+- `MemTree` is reconstructed for post-checkpoint hot secondary-index state
+- `DiskTree` remains the checkpointed source of truth for cold secondary-index
+  state
+
+The engine can then serve traffic.
+
+## 6. Garbage Collection
+
+### 6.1 MemTree Cleanup
+
+`MemTree` entries may be cleaned or evicted only after the corresponding table
+checkpoint makes their state durable:
+
+- hot rows checkpointed into persistent LWC plus companion `DiskTree` entries
+- cold deletes checkpointed into delete bitmaps plus companion `DiskTree`
+  deletes
+
+### 6.2 Deletion Buffer Cleanup
+
+Persisted cold-row delete markers are retained in memory until they are no
+longer needed for live snapshots:
+
+$$ \text{Entry.CTS} < \text{Global\_Min\_Active\_STS} $$
+
+### 6.3 DiskTree Page GC
+
+`DiskTree` uses normal CoW garbage collection:
+
+- each checkpoint publishes new roots
+- unreachable old pages are reclaimed later
 
 ## 7. Summary
 
-This design achieves a robust, decentralized persistence model:
+The checkpoint/recovery design is built around three ideas:
 
-1.  **Performance**: Commits are lightweight (Queue Push) and avoid Index lock contention.
-2.  **Scalability**: Checkpointing and GC are handled per-table, preventing a single slow index from blocking the entire system global GC.
-3.  **Correctness**: The shared `unflushed_map` combined with component-specific watermarks ensures strict consistency between memory and disk states, even in the presence of partial failures.
+1. `Heap_Redo_Start_TS` remains the hot-heap recovery boundary.
+2. `Deletion_Rec_CTS` remains the cold-delete recovery boundary.
+3. Secondary-index `DiskTree` state is published only as a companion of table
+   data/deletion checkpoint, so there is no `Index_Rec_CTS`.
+
+This keeps restart simple and aligned with Doradb's current runtime contract:
+
+- cold persistent state comes from checkpointed CoW roots
+- hot mutable state comes from redo replay
+- historical runtime MVCC remains a heap/undo concern, not a persistent index
+  recovery concern

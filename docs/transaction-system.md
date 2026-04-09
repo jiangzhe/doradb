@@ -15,7 +15,7 @@ The system employs a unique persistence and recovery model that fundamentally di
 |----|----|----|
 | **Dirty Page Policy** | **Strict No-Steal**: Disk data structures (DiskTree/ColumnStore) are immutable or CoW, containing only committed data. No dirty pages are flushed. | **Steal**: Dirty pages from uncommitted transactions can be flushed to disk, requiring Undo Logs for rollback. |
 | **Persistence** | **No-Force**: Only commit log is forced to disk at commit. Data pages remain in memory until checkpoint. | **No-Force**: Only WAL is forced. |
-| **Checkpoint** | **Commit-Only**: Background threads scan committed data/index to update disk structures via Copy-on-Write (CoW). | **Fuzzy Checkpoint**: Flushes dirty pages from the buffer pool, dealing with complex LSN ordering. |
+| **Checkpoint** | **Commit-Only**: Background checkpoints publish committed cold data plus companion index/delete state via Copy-on-Write (CoW). | **Fuzzy Checkpoint**: Flushes dirty pages from the buffer pool, dealing with complex LSN ordering. |
 | **Recovery** | **Redo-Only**: Crash recovery involves replaying the Commit Log to rebuild memory state. **No Undo phase** is required for disk structures. | **Redo + Undo**: Requires replaying history and then undoing uncommitted changes using Undo Logs. |
 
 **Design Advantages**:
@@ -59,37 +59,46 @@ The Heap Table uses a **Tiered Architecture**, combining an in-memory RowStore (
 
 ## Index Structure
 
-The index stores only the Key -> RowID mapping. It reflects latest(uncommitted) changes.
+Secondary indexes use a hot/cold split:
+
+- `MemTree` stores hot mutable state
+- `DiskTree` stores checkpointed cold state
+- `DiskTree` is maintained only as companion work of table data/deletion
+  checkpoint
+
+Unique and non-unique indexes do not share the same physical model:
+
+- unique indexes keep the latest logical-key mapping
+- non-unique indexes keep exact entries keyed by `(logical_key, row_id)`
+
+For the detailed index design, see [`secondary-index.md`](./secondary-index.md).
 
 ### In-Memory MemTree
 
 - **Role**: Write Cache.
-- **Entry Structure**:
-
-```rust
-struct MemTreeEntry {
-    key: Key,
-    val: RowID,
-    sts: AtomicU64,
-    deleted: bool,
-    dirty: bool,
-}
-```
-
-Checkpoint task merges committed and dirty entries to DiskTree and reset them to *clean*.
+- **Behavior**:
+  - absorbs foreground inserts, updates, and deletes
+  - shadows stale cold `DiskTree` entries until checkpoint publishes updated
+    persistent state
+  - stays memory-first on the write path
 
 ### On-Disk CoW B+Tree (DiskTree)
 
 - **Structure**: A Copy-on-Write B+Tree similar to LMDB.
+- **Role**:
+  - stores checkpointed cold secondary-index state
+  - is loaded directly from the latest table checkpoint during restart
 - **Double Root Mechanism**:
   - The file header contains two root page pointers (Root A and Root B).
   - Only one root is valid/active at any time.
   - A monotonic transaction ID or timestamp in the header indicates which root is newer.
-- **Background Merge Process**:
-  1. The Checkpoint thread reads the active root.
-  2. It applies a batch of updates (from commit log replay).
-  3. Modified nodes are copied to new disk pages (CoW), propagating path updates up to a **new root**.
-  4. The new root pointer is written to the inactive slot in the header, and an atomic meta-block update switches the active root.
+- **Publication**:
+  1. A table checkpoint reads the active root.
+  2. It applies companion updates generated from checkpointed rows or
+     checkpointed cold-row deletions.
+  3. Modified nodes are copied to new disk pages (CoW), propagating path updates
+     up to a **new root**.
+  4. The new root is published together with the table checkpoint metadata.
   - This ensures the DiskTree is always in a consistent state, even if the system crashes during a write.
 
 ## Transaction System
@@ -104,7 +113,7 @@ Checkpoint task merges committed and dirty entries to DiskTree and reset them to
 #### Execution Phase
 
 1. **Read**: 
-   - Search MemTree -> DiskTree to get `RowID`.
+   - Probe `MemTree` first and then `DiskTree` as required by the index type.
    - Route to RowStore or ColumnStore based on `RowID` vs `Pivot`.
    - **Visibility Check**: Compare Reader.STS against the timestamp in the Undo Chain (for RowStore) or Deletion Buffer (for ColumnStore).
 
@@ -130,12 +139,19 @@ Checkpoint task merges committed and dirty entries to DiskTree and reset them to
 
 ####  Index Checkpoint
 
-The system uses a **MemTree Scan** mechanism to decouple foreground latency from background persistence.
+There is no independent MemTree-scan index checkpoint.
 
-1. **Dispatch**: A background dispatcher scans dirty entries in MemTree and dispatch them to worker threads.
-2. **Apply**: Worker threads apply batches of updates to the DiskTree using the CoW mechanism.
+Instead:
+
+1. **Data Checkpoint Companion Work**:
+   - when frozen RowStore pages are converted into persistent LWC blocks, the
+     same committed rows are encoded into companion `DiskTree` updates
+2. **Deletion Checkpoint Companion Work**:
+   - when committed cold-row deletes are persisted into delete bitmaps, the same
+     deleted rows drive companion `DiskTree` removals
 3. **State Transition**:
-   - After the DiskTree is updated and flushed, the worker update page-level `flush_epoch = Current_Epoch`(used for index scan to skip MemTree) and entry-level `dirty = false`.
+   - after the related table checkpoint publishes its new roots, the
+     corresponding `MemTree` entries can become clean or evictable
 
 ### Heap Persistence
 
@@ -145,23 +161,28 @@ Heap persistence relies on the **Tuple Mover** and the durability of the commit 
    - Periodically selects frozen (immutable) RowStore pages.
    - Converts them into **LWC** (lightweight compressed) ColumnStore blocks.
    - Updates the `Pivot_RowID` and persists metadata.
-   - This is the primary mechanism for long-term heap storage and commit log truncation (Log can be truncated only after data moves to ColumnStore and Index Checkpoint advances).
+   - Publishes companion `DiskTree` updates for those checkpointed rows.
+   - This is the primary mechanism for long-term heap storage and commit log
+     truncation.
 2. **Commit Log Reliance**:
    - Data in the active RowStore (not yet converted) is protected solely by the commit log.
    - To prevent infinite commit log growth, the Tuple Mover must run frequently enough to keep the "Active RowStore" size manageable.
 
-### Crach Recovery
+### Crash Recovery
 
 **Recovery** is simplified due to the **No-Steal** policy (no dirty data on disk) and Append-Only heap design.
 
-1. **Load Metadata**: Read `Pivot_RowID`, `Index_Rec_CTS`, and `Heap_Redo_Start_TS` (derived from the oldest active RowPage).
+1. **Load Metadata**: Read `Pivot_RowID`, `Heap_Redo_Start_TS`, persistent
+   delete-checkpoint state, and the checkpointed `DiskTree` roots.
 2. **Load ColumnStore**: Initialize access to persisted columnar data (`RowID < Pivot`).
 3. **Load DiskTree**: Open the B+Tree at the last valid root.
 4. **Replay Commit Log**:
    - **Heap Redo**: Start scanning from `Heap_Redo_Start_TS`. Reconstruct the in-memory RowStore pages by replaying insert/update logs.
-   - **Index Redo**: Start scanning from `Index_Rec_CTS`. Re-insert missing keys into the MemTree, restoring their `sts` to the value found in the log (marking them as Dirty/Clean relative to the DiskTree).
-   - **Deletion Buffer Redo**: Rebuild the **ColumnDeletionBuffer** from logs to restore deletion states for columnar data.
-5. **Completion**: The system is open for service once memory structures are rebuilt. The background Checkpoint thread resumes to flush the restored MemTree data to DiskTree.
+   - **Deletion Buffer Redo**: Rebuild the **ColumnDeletionBuffer** from logs to restore post-checkpoint deletion states for columnar data.
+   - **Secondary Index Redo**: Hot row redo rebuilds the corresponding `MemTree`
+     entries through the normal row/index update logic. No index-specific replay
+     watermark is needed.
+5. **Completion**: The system is open for service once memory structures are rebuilt. `DiskTree` already contains checkpointed cold index state and `MemTree` contains post-checkpoint hot state.
 
 ### Garbage Collection (GC)
 
@@ -187,8 +208,10 @@ Heap persistence relies on the **Tuple Mover** and the durability of the commit 
 
 #### MemTree Eviction
 
-- **Condition**: `Entry.sts == 0`.
-- **Action**: Entries marked as Clean can be safely evicted from memory to free up space, as they are guaranteed to exist in the DiskTree.
+- **Condition**: the related table checkpoint has made the same state durable.
+- **Action**: clean entries can be evicted from memory because the authoritative
+  cold state is already available from checkpointed `DiskTree` roots or delete
+  checkpoint state.
 
 ### Summary
 
@@ -196,5 +219,8 @@ The transaction system tries to achieve high throughput for HTAP workloads by ad
 
 - **Write Optimization**: Foreground writes are completely in-memory (MemTree + RowStore) with sequential commit logging. The overhead of transaction commit is reduced to *O(1)* by eliminating index traversal and global state contention.
 - **Read Optimization**: The hybrid layout serves OLTP queries from the RowStore/MemTree and OLAP scans from the high-density ColumnStore. The Index structure avoids the read amplification typical of LSM-trees by maintaining a compact B+Tree structure on disk.
-- **Reliability**: Recovery is simplified to a Redo-only process. The separation of the immutable DiskTree and the active MemTree ensures that the on-disk state is always consistent, eliminating the need for complex Undo recovery logic.
+- **Reliability**: Recovery is simplified to a Redo-only process. Checkpointed
+  `DiskTree` roots provide cold secondary-index state directly, while redo
+  reconstructs hot `MemTree` state without needing an independent index replay
+  watermark.
 - **Scalability**: Table-level checkpoints and independent Tuple Movers allow the system to scale across many tables without "convoy effects", ensuring stable performance even under mixed workloads.
