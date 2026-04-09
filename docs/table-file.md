@@ -2,173 +2,180 @@
 
 ## 1. Overview
 
-The **Table File** is the fundamental physical persistence unit for a single table. It is designed to support **HTAP** workloads by combining efficient columnar scanning with fast random access for point lookups.
+The **Table File** is the physical persistence unit for one user table.
 
-To ensure data consistency and recovery speed, the design strictly follows **Copy-on-Write (CoW)** and **Append-Only** principles. It integrates with the **No-Steal / No-Force** transactional model.
+It stores:
 
-**Key Design Specifications:**
-*   **Page Size:** Fixed at **64KB**.
-*   **Indirection Architecture:** Separation of the **SuperBlock** (Physical Anchor) and the **MetaBlock** (Logical Snapshot) to allow non-blocking checkpoints.
-*   **Atomicity:** Guaranteed via double-buffered SuperBlocks with Header-Footer validation.
-*   **Decoupling:** Data Checkpoints (Tuple Mover) and Index Checkpoints operate independently.
+- checkpointed LWC data blocks
+- block-index metadata
+- persistent delete state for cold rows
+- persistent secondary-index `DiskTree` roots
+
+The file follows a Copy-on-Write design:
+
+- new checkpoints write new blocks and a new metadata root
+- the super block atomically switches to that new root
+- old pages are reclaimed later
 
 ## 2. Physical Layout
 
-The file is divided into fixed-size 64KB pages. Page 0 is the fixed anchor; all other pages are dynamically allocated.
+The file is divided into fixed-size 64KB pages.
 
 ```text
 +-------------------------------------------------------+
-| Page 0: SuperBlock (Double-Buffered Anchors A/B)       |
+| Page 0: SuperBlock (double-buffered root anchors)     |
 +-------------------------------------------------------+
-| Page 1: MetaBlock (Snapshot V100)                      | <--- Dynamic, CoW
+| Page 1: MetaBlock (snapshot V100)                     |
 +-------------------------------------------------------+
-| Page 2: SpaceMap Page (Allocated/Free Bitmaps)        |
+| Page 2: SpaceMap Page                                 |
 +-------------------------------------------------------+
-| Page 3: LWC Data Block (RowID 0~N)                    |
+| Page 3: LWC Data Block                                |
 +-------------------------------------------------------+
-| Page 4: DiskTree Node (Index Internal/Leaf)           |
+| Page 4: DiskTree Node / delete payload / misc CoW     |
 +-------------------------------------------------------+
 | ...                                                   |
 +-------------------------------------------------------+
-| Page N: MetaBlock (Snapshot V101)                      | <--- New version
+| Page N: MetaBlock (snapshot V101)                     |
 +-------------------------------------------------------+
 ```
 
-## 3. SuperBlock Design (The Anchor)
+## 3. SuperBlock
 
-The **SuperBlock** (Page 0) acts as the static entry point to the file. It is lightweight and contains two slots for double-buffering. Each slot points to the latest valid **MetaBlock**.
+The super block is the fixed entry point of the table file.
 
-### 3.1. Structure of a Slot
-| Section | Field | Description |
-| :--- | :--- | :--- |
-| **Header** | `magic_number` | File signature. |
-| | `version` | File format version. |
-| | `trx_id` | **Transaction ID** of the coordinator that wrote this slot. Used to identify the freshest anchor. |
-| **Body** | **`meta_block_id`** | Pointer to the latest **MetaBlock**. |
-| **Footer** | `checksum` | CRC32C checksum of Header + Body. |
-| | `trx_id_redundant` | Must match `Header.trx_id`. |
+Each slot stores:
 
-### 3.2. Atomic Update Protocol
-To update the file state (commit a checkpoint):
-1.  **Write**: Write Header (new `trx_id`), Body (new `meta_block_id`), and Footer to the inactive slot (A or B) within Page 0.
-2.  **Fsync**: Persist Page 0 to disk.
-3.  **Completion**: Once fsync returns successfully, the new state is valid. There is **no need** to check for active transactions during this step.
+- magic/version
+- checkpoint transaction id
+- pointer to the active `MetaBlock`
+- checksum/footer redundancy
 
-## 4. MetaBlock Design (The Snapshot)
+Commit protocol:
 
-The **MetaBlock** holds the complete state of the table at a specific point in time. It is a dynamic page managed via CoW. Every checkpoint creates a completely new MetaBlock.
+1. write the inactive slot with the new `MetaBlock` pointer
+2. fsync the page
+3. once durable, that slot is the active root
 
-### 4.1. Structure
-| Field | Description |
-| :--- | :--- |
-| `schema_info` | Column definitions, types, and compression metadata. |
-| `block_index_root` | Root PageID of the **Block Index** (RowID -> LWC Block). |
-| **`bitmap_tree_root`** | Root PageID of the **Bitmap B+Tree** for offloaded delete bitmaps. |
-| `disktree_roots` | Map `<IndexID, PageID>` storing roots for all Secondary Indexes. |
-| `space_map_root` | PageID of the **SpaceMap**. |
-| `pivot_rowid` | The watermark separating Disk Store (<) and Memory Store (>=). |
-| **`watermarks`** | A structure containing all component watermarks for recovery log truncation. |
-| | &nbsp;&nbsp;**`heap_redo_start_ts`** | Redo log start point for the in-memory RowStore. |
-| | &nbsp;&nbsp;**`deletion_rec_cts`** | Persistence watermark for the on-disk delete bitmaps. |
-| | &nbsp;&nbsp;**`index_rec_cts`** | Map `<IndexID, CTS>` of persistence watermarks for each index. |
-| **`last_checkpoint_sts`** | The logical watermark (Start Timestamp) of the transaction that created this snapshot. Crucial for recovery filtering. |
-| **`gc_page_list`** | A list of PageIDs that became obsolete in this version (including the *previous* MetaBlock ID). |
+## 4. MetaBlock
 
-### 4.2. Lifecycle
-*   **Creation**: Generated by the Coordinator at the end of a Data, Deletion, or Index Checkpoint.
-*   **Obsolescence**: When a newer MetaBlock is committed, the old MetaBlock ID is added to the new MetaBlock's `gc_page_list`.
-*   **Reclamation**: When `MetaBlock.last_checkpoint_sts` < `Global_Min_Active_STS`, the MetaBlock **and** all pages in its `gc_page_list` can be reclaimed, as no active transaction can be viewing them.
+`MetaBlock` is the logical snapshot for one table checkpoint publication.
 
-## 5. Space Management & Garbage Collection
+### 4.1 Structure
 
-Space is managed via **SpaceMap Pages** (referenced by `MetaBlock.space_map_root`).
+The active `MetaBlock` stores:
 
-### 5.1. Page States
-1.  **Allocated**: In use by the current MetaBlock or its children (Data, Index, Bitmaps).
-2.  **GC_Wait**: Physically exists but logically obsolete. Referenced only by the `gc_page_list` of a MetaBlock. Visible to long-running transactions holding that MetaBlock.
-3.  **Free**: Marked as free in the SpaceMap.
+- schema metadata
+- root of the persistent RowID/block index
+- root or payload references for persistent cold-row delete metadata
+- root page id of each secondary-index `DiskTree`
+- page allocation state
+- `pivot_row_id`
+- `heap_redo_start_ts`
+- `deletion_rec_cts`
+- checkpoint transaction id / publication timestamp
+- GC list of obsolete pages
 
-### 5.2. Non-Blocking GC Strategy
-The Indirection Architecture solves the long transaction problem:
+Notably, the table file does **not** need `index_rec_cts`.
 
-1.  **Scenario**: Transaction $T_{long}$ starts at logical time 100. It grabs the SuperBlock, which points to `MetaBlock_V1`.
-2.  **Checkpoint**: A checkpoint runs at time 200. It creates `MetaBlock_V2`.
-    *   `MetaBlock_V2.gc_page_list` includes `MetaBlock_V1` and other old pages.
-    *   SuperBlock is updated to point to `MetaBlock_V2`.
-3.  **Result**:
-    *   New transactions see `MetaBlock_V2`.
-    *   $T_{long}$ continues reading from `MetaBlock_V1`.
-    *   The background GC thread scans `MetaBlock_V2`. It sees `MetaBlock_V1` in the GC list. Since $T_{long}$ (Start Time 100) is still active, it **skips** recycling `MetaBlock_V1`.
-    *   Once $T_{long}$ commits, the next GC run will safely recycle `MetaBlock_V1` and its children.
+Persistent secondary-index state is recovered by loading the checkpointed
+`DiskTree` roots directly. Hot post-checkpoint index state is rebuilt from redo.
 
-## 6. LWC Block Design (Data Storage)
+### 4.2 Lifecycle
 
-LWC (LightWeight Columnar) blocks are stored in **PAX (Partition Attributes Across)** format within a 64KB page. They are optimized for both TP point lookups and AP scans.
+- a new `MetaBlock` is created for each successful table checkpoint publication
+- the new `MetaBlock` copies unchanged roots from the previous one
+- changed roots are overwritten with new CoW page ids
+- the previous `MetaBlock` id and other obsolete pages are appended to the new
+  GC list
 
-### 6.1. Internal Structure
+## 5. Space Management And GC
 
-```text
-[Block Header]
-  - row_count
-  - null_bitmap_offset
-  - data_offsets[] (Start offset for each column)
+Pages move through three states:
 
-[Null Bitmaps Area]
-  - Column 1 NullBitmap (if nullable)
-  - Column 2 NullBitmap ...
-  - (Non-null columns occupy 0 bytes here)
+1. `Allocated`
+   - reachable from the active `MetaBlock`
+2. `GC_Wait`
+   - obsolete but still protected by snapshot/root retention
+3. `Free`
+   - reusable by future CoW writes
 
-[Data Area - Column 1]
-  - Compression Metadata (Min/Max, Dict Base)
-  - Payload (Compressed Data)
+Long-running readers are protected by root indirection:
 
-[Data Area - Column 2]
-  ...
-```
+- old `MetaBlock` snapshots remain valid until no active reader needs them
+- page reclamation only happens after that retention condition is satisfied
 
-### 6.2. Compression Strategy
+## 6. LWC Blocks
 
-Algorithms are selected to ensure **O(1) random access** (or near O(1)) to support HTAP point queries without full block decompression.
+Persistent rows are stored in LWC blocks using a PAX-style layout optimized for:
 
-1.  **Integers / Dates / Timestamps**:
-    *   **Bitpacking (Frame of Reference)**: Store the `Min` value in metadata. Store deltas using the minimal number of bits required.
-2.  **Strings (Low Cardinality)**:
-    *   **Dictionary Encoding**: Store a local or global dictionary. Data payload consists of bitpacked integer IDs.
-3.  **Strings (High Cardinality)**:
-    *   **FSST (Fast Static Symbol Table)**: Allows random access to compressed strings and partial matching without full decompression.
-4.  **Others (Default)**:
-    *   **Flat**: Uncompressed storage to guarantee write/read performance.
+- point lookup
+- range scan
+- lightweight compression
 
-## 7. Decoupled Checkpoint Workflows
+LWC blocks are immutable once published. Updates and deletes against persistent
+rows are represented through:
 
-Data persistence (Data Checkpoint), deletion persistence (Deletion Checkpoint), and Index persistence (Index Checkpoint) are independent processes. They coordinate only at the final commit phase to update the SuperBlock atomically.
+- deletion metadata
+- reinsertion of updated rows into hot RowStore
+- companion secondary-index maintenance
 
-### 7.1. Coordination Mechanism
-*   **SuperBlock Lock**: A lightweight mutex used only during the final, brief phase of swapping the `meta_block_id` in the SuperBlock.
-*   **Space Allocation**: All workflows pre-allocate pages from the SpaceMap to minimize contention.
+## 7. Checkpoint Publication
 
-### 7.2. Checkpoint Commit Phase (Generic)
-All checkpoint workflows follow a similar commit protocol:
+There is one atomic publication mechanism, but two kinds of table checkpoint
+work can trigger it:
 
-1.  **Acquire SuperBlock Lock**.
-2.  **Read current active MetaBlock** (`ActiveMeta`).
-3.  **Allocate a New MetaBlock** (`NewMeta`).
-4.  **Populate New MetaBlock**:
-    *   **Copy**: Copy all root pointers and watermarks from `ActiveMeta` to `NewMeta`.
-    *   **Update**: Overwrite the specific fields managed by this checkpoint. For example:
-        *   A **Data Checkpoint** updates `block_index_root`, `pivot_rowid`, and `watermarks.heap_redo_start_ts`.
-        *   An **Index Checkpoint** updates `disktree_roots` and `watermarks.index_rec_cts`.
-        *   A **Deletion Checkpoint** updates `bitmap_tree_root` and `watermarks.deletion_rec_cts`.
-    *   **Set Timestamp**: Set `last_checkpoint_sts` to the `STS` of the system transaction coordinating the checkpoint.
-    *   **GC Handling**: Add `ActiveMeta`'s Page ID and the checkpoint's locally accumulated garbage list (`local_gc_list`) to `NewMeta.gc_page_list`.
-5.  **Persist New MetaBlock**.
-6.  **Atomic Anchor Update**: Update the **SuperBlock** to point to `NewMeta`.
-7.  **Release Lock**.
+1. data checkpoint
+2. deletion checkpoint
 
-## 8. Summary
+Secondary-index `DiskTree` updates are companion work of those checkpoints, not
+an independent third checkpoint stream.
 
-This design achieves:
-1.  **Robustness**: The SuperBlock protocol guarantees file integrity even during power failures.
-2.  **Scalability**: Parallel checkpointing removes the single-threaded write bottleneck.
-3.  **Non-Blocking Persistence**: Long transactions never block checkpoints.
-5.  **HTAP Performance**: The LWC format with nullable support and random-access-friendly compression ensures the storage engine performs well for both transactional lookups and analytical scans.
+### 7.1 Data Checkpoint Publication
+
+Data checkpoint publishes:
+
+- new LWC blocks
+- new block-index roots
+- updated secondary-index `DiskTree` roots for the newly checkpointed rows
+- updated `pivot_row_id`
+- updated `heap_redo_start_ts`
+
+### 7.2 Deletion Checkpoint Publication
+
+Deletion checkpoint publishes:
+
+- new persistent delete metadata
+- updated secondary-index `DiskTree` roots for the deleted cold rows
+- updated `deletion_rec_cts`
+
+### 7.3 Generic Publish Flow
+
+1. read the active `MetaBlock`
+2. allocate new CoW pages for changed structures
+3. build a new `MetaBlock` that copies unchanged roots and overwrites changed
+   roots
+4. persist the new `MetaBlock`
+5. atomically switch the super block to it
+
+## 8. Recovery Role
+
+On restart, the table file supplies:
+
+- checkpointed cold data
+- checkpointed block-index state
+- checkpointed persistent delete state
+- checkpointed secondary-index `DiskTree` roots
+
+Redo recovery then rebuilds only the missing hot state:
+
+- hot RowStore pages from `heap_redo_start_ts`
+- post-checkpoint cold deletes from `deletion_rec_cts`
+- hot secondary-index `MemTree` state from normal row redo
+
+## 9. Summary
+
+The table file is the durable snapshot container for one table.
+
+It publishes cold data, cold delete state, and cold secondary-index `DiskTree`
+state together through one CoW root. This keeps persistent state self-consistent
+without requiring an independent secondary-index recovery watermark.

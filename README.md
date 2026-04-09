@@ -2,7 +2,6 @@
 
 ![build](https://github.com/jiangzhe/doradb/actions/workflows/build.yml/badge.svg)
 ![codecov](https://codecov.io/gh/jiangzhe/doradb/branch/main/graph/badge.svg?token=T3RMZE2998)
-![pr-review](https://img.shields.io/coderabbit/prs/github/jiangzhe/doradb?utm_source=oss&utm_medium=github&utm_campaign=jiangzhe%2Fdoradb&labelColor=171717&color=FF570A&link=https%3A%2F%2Fcoderabbit.ai&label=CodeRabbit+Reviews)
 
 DoraDB is an attempt to build a fast storage engine in Rust from scratch.
 It is work in progress.
@@ -13,7 +12,7 @@ The original goal is to build a complete relational database, compatible with My
 
 After coding about 70k lines of Rust, I have to admit it's really too ambitious to achieve as a single-person project.
 
-Now I limit its scope to be a fast storage engine, which is probably achievable. I also want it to be useful (not just a toy) after major features are done.
+Current goal is to build a modern and fast storage engine, which is probably achievable. I also want it to be useful (not just a toy) after major features are done.
 
 The storage engine is designed as a hybrid engine with both in-memory row store and on-disk column store, and have full transactional support across all data.
 
@@ -22,12 +21,15 @@ The storage engine is designed as a hybrid engine with both in-memory row store 
 - [Storage Architecture](./docs/architecture.md)
 - [Transaction System](./docs/transaction-system.md)
 - [Index Design](./docs/index-design.md)
+- [Block Index](./docs/block-index.md)
+- [Secondary Index](./docs/secondary-index.md)
 - [Checkpoint and Recovery](./docs/checkpoint-and-recovery.md)
 - [Table File](./docs/table-file.md)
 - [Data Checkpoint](./docs/data-checkpoint.md)
 - [Deletion Checkpoint](./docs/deletion-checkpoint.md)
 - [Buffer Pool](./docs/buffer-pool.md)
 
+Above documents describe the core design of this engine. Most parts are update-to-date.
 Some ideas are different from traditional database system.
 I'm glad to have discussions if someone is interested in details.
 
@@ -55,6 +57,8 @@ Code structure of storage engine:
 
 Current devlopment is driven by document, and implemneted by code agent.
 Every task assigned to agent has one associated task document located in `docs/tasks`.
+Larger features/refactors require RFC document inside `docs/rfcs`.
+Deferred tasks are put in `docs/backlogs`.
 
 ## License
 

@@ -41,13 +41,21 @@ If update target row on disk, either in LWC page or column page, the old data wi
 
 ### Block Index
 
-**Block Index** is introduced to manage data among the three layouts, with the help of **RowID**.
+**Block Index** is the indirection layer between stable **RowID** identity and
+physical storage location.
 
-**Block Index** is basically a specialized B+Tree stores mapping from **RowID** range to page id or block id.
+It allows higher layers to keep using **RowID** even when data moves between
+hot in-memory RowStore and cold persisted LWC blocks.
 
-For data in in-memory row store, it only stores page id.
+The design is split into:
 
-For data on disk, it stores block id with some statistics, which can be used for data skipping.
+- hot in-memory routing for RowStore pages
+- cold persistent CoW routing for LWC blocks
+
+The persistent side also carries cold-row delete payload and the binding needed
+to resolve a cold row inside a persisted block.
+
+For more details, see [Block Index Design](./block-index.md).
 
 ### Table File
 
@@ -80,15 +88,22 @@ It does not contains "undo", therefore it does not support ARIES-style fuzzy che
 
 ### Secondary Index
 
-**Secondary Index** is a B+Tree index. It stores mapping between key and row id.
-The secondary index is composite of two trees: **MemTree** and **DiskTree**.
-**MemTree** is similar to a MemTable in LSM architecture, it holds new data inserted and hot data which are frequently updated. A background task will transfer **MemTree** to **DiskTree** as part of the checkpoint process.
+**Secondary Index** is split into a hot in-memory `MemTree` and a persistent
+CoW `DiskTree`.
 
-**DiskTree** is a CoW B+Tree which supports fast lookup, scan and batch inserts. Small transactions will be combined as large batch and modify the **DiskTree** in a CoW way. New root will be created and updated in metadata. In such way, no logging is required for recovery.
+- `MemTree` serves foreground writes and hot lookups.
+- `DiskTree` stores checkpointed cold secondary-index state.
+- `DiskTree` is updated only as companion work of table data/deletion
+  checkpoint, not by an independent MemTree flush thread.
 
-Query on index will execute on both tree and aggregate their results.
+Unique and non-unique indexes use different physical models:
 
-For more details, see [Index Design](./index-design.md).
+- unique indexes keep the latest logical-key mapping
+- non-unique indexes keep exact entries keyed by logical key plus row id
+
+For more details, see [Secondary Index Design](./secondary-index.md). The
+overall index split is summarized in [Index Design](./index-design.md), and the
+RowID-based routing layer is documented in [Block Index Design](./block-index.md).
 
 ## Transactional System
 
@@ -126,8 +141,8 @@ title: Point Select
 flowchart TD
     A[Begin]
     A --> B[Lookup secondary index to get row id]
-    B --> C[Lookup block index to get page id]
-    C --> D[Read page]
+    B --> C[Lookup block index to get row location]
+    C --> D[Read row page or LWC block]
     D --> E[Visibility check]
     E --> F[Return]
 ```
@@ -176,7 +191,7 @@ title: Update Hot
 flowchart TD
     A[Begin]
     A --> B[Lookup secondary index]
-    B --> C[Lookup block index]
+    B --> C[Lookup block index to get row location]
     C --> D[Modify row page and append version chain]
     D --> E[Update secondary index if needed]
     E --> F[Return]
@@ -191,7 +206,7 @@ title: Update Cold
 flowchart TD
     A[Begin]
     A --> B[Lookup secondary index]
-    B --> C[Lookup block index]
+    B --> C[Lookup block index to get row location]
     C --> D[Read bitmap page, LWC/column page]
     D --> E[Apply mark and version to bitmap page]
     E --> F[Copy old row and modify]
