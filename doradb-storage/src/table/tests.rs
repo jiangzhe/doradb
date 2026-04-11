@@ -9,8 +9,8 @@ use crate::error::{BlockCorruptionCause, BlockKind, Error, FileKind, Result, Sto
 use crate::file::block_integrity::{BLOCK_INTEGRITY_HEADER_SIZE, write_block_checksum};
 use crate::file::cow_file::{COW_FILE_PAGE_SIZE, SUPER_BLOCK_ID};
 use crate::index::{
-    COLUMN_BLOCK_HEADER_SIZE, COLUMN_BLOCK_LEAF_HEADER_SIZE, ColumnBlockIndex, RowLocation,
-    UniqueIndex, load_entry_deletion_deltas,
+    COLUMN_BLOCK_HEADER_SIZE, COLUMN_BLOCK_LEAF_HEADER_SIZE, ColumnBlockIndex, NonUniqueIndex,
+    RowLocation, UniqueIndex, load_entry_deletion_deltas,
 };
 use crate::io::{
     IOKind, StorageBackendFileIdentity, StorageBackendOp, StorageBackendTestHook,
@@ -23,7 +23,7 @@ use crate::session::Session;
 use crate::table::{DeleteMarker, Table, TableAccess, TablePersistence, TableRecover};
 use crate::trx::row::LockRowForWrite;
 use crate::trx::undo::RowUndoKind;
-use crate::trx::{ActiveTrx, TrxID};
+use crate::trx::{ActiveTrx, MAX_SNAPSHOT_TS, TrxID};
 use crate::value::Val;
 use std::fs::OpenOptions;
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -846,7 +846,6 @@ fn test_checkpoint_all_deleted_row_page_advances_without_column_index() {
 }
 
 #[test]
-#[ignore = "blocked by docs/backlogs/000049-purge-crashes-on-checkpointed-rows-in-index-delete-lwc-path.md"]
 fn test_checkpoint_transition_delete_marker_waits_for_next_cutoff_range() {
     smol::block_on(async {
         let sys = TestSys::new_evictable().await;
@@ -933,6 +932,323 @@ fn test_checkpoint_transition_delete_marker_waits_for_next_cutoff_range() {
         drop(checkpoint_session);
         drop(writer_session);
         drop(hold_session);
+        drop(session);
+        sys.clean_all();
+    });
+}
+
+#[test]
+fn test_lwc_unique_index_purge_uses_purgeable_delete_marker_fast_path() {
+    smol::block_on(async {
+        let sys = TestSys::new_evictable().await;
+        let mut session = sys.try_new_session().unwrap();
+        insert_rows(&sys, &mut session, 0, 1, "name").await;
+        sys.table.freeze(&session, usize::MAX).await;
+        sys.table.checkpoint(&mut session).await.unwrap();
+
+        let key = single_key(0i32);
+        let reader = session.try_begin_trx().unwrap().unwrap();
+        let row_id = assert_row_in_lwc(&sys.table, session.pool_guards(), &key, reader.sts).await;
+        reader.commit().await.unwrap();
+
+        let index = sys.table.sec_idx()[key.index_no].unique().unwrap();
+        assert!(
+            index
+                .mask_as_deleted(
+                    session.pool_guards().index_guard(),
+                    &key.vals,
+                    row_id,
+                    MAX_SNAPSHOT_TS,
+                )
+                .await
+                .unwrap()
+        );
+        sys.table
+            .deletion_buffer()
+            .put_committed(row_id, 10)
+            .unwrap();
+
+        let deleted = sys
+            .table
+            .accessor()
+            .delete_index(session.pool_guards(), &key, row_id, true, 11)
+            .await
+            .unwrap();
+        assert!(deleted);
+        assert!(
+            index
+                .lookup(
+                    session.pool_guards().index_guard(),
+                    &key.vals,
+                    MAX_SNAPSHOT_TS,
+                )
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        drop(session);
+        sys.clean_all();
+    });
+}
+
+#[test]
+fn test_lwc_unique_index_purge_compares_persisted_key_when_marker_is_not_purgeable() {
+    smol::block_on(async {
+        let sys = TestSys::new_evictable().await;
+        let mut session = sys.try_new_session().unwrap();
+        insert_rows(&sys, &mut session, 0, 1, "name").await;
+        sys.table.freeze(&session, usize::MAX).await;
+        sys.table.checkpoint(&mut session).await.unwrap();
+
+        let current_key = single_key(0i32);
+        let stale_key = single_key(-1i32);
+        let reader = session.try_begin_trx().unwrap().unwrap();
+        let row_id =
+            assert_row_in_lwc(&sys.table, session.pool_guards(), &current_key, reader.sts).await;
+        reader.commit().await.unwrap();
+
+        let index = sys.table.sec_idx()[current_key.index_no].unique().unwrap();
+        let _ = index
+            .insert_if_not_exists(
+                session.pool_guards().index_guard(),
+                &stale_key.vals,
+                row_id,
+                false,
+                MAX_SNAPSHOT_TS,
+            )
+            .await
+            .unwrap();
+        assert!(
+            index
+                .mask_as_deleted(
+                    session.pool_guards().index_guard(),
+                    &stale_key.vals,
+                    row_id,
+                    MAX_SNAPSHOT_TS,
+                )
+                .await
+                .unwrap()
+        );
+        let deleted = sys
+            .table
+            .accessor()
+            .delete_index(
+                session.pool_guards(),
+                &stale_key,
+                row_id,
+                true,
+                MAX_SNAPSHOT_TS,
+            )
+            .await
+            .unwrap();
+        assert!(deleted);
+        assert!(
+            index
+                .lookup(
+                    session.pool_guards().index_guard(),
+                    &stale_key.vals,
+                    MAX_SNAPSHOT_TS,
+                )
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        assert!(
+            index
+                .mask_as_deleted(
+                    session.pool_guards().index_guard(),
+                    &current_key.vals,
+                    row_id,
+                    MAX_SNAPSHOT_TS,
+                )
+                .await
+                .unwrap()
+        );
+        sys.table
+            .deletion_buffer()
+            .put_committed(row_id, 100)
+            .unwrap();
+        let deleted = sys
+            .table
+            .accessor()
+            .delete_index(session.pool_guards(), &current_key, row_id, true, 100)
+            .await
+            .unwrap();
+        assert!(!deleted);
+        assert!(matches!(
+            index
+                .lookup(
+                    session.pool_guards().index_guard(),
+                    &current_key.vals,
+                    MAX_SNAPSHOT_TS,
+                )
+                .await
+                .unwrap(),
+            Some((actual_row_id, true)) if actual_row_id == row_id
+        ));
+
+        drop(session);
+        sys.clean_all();
+    });
+}
+
+#[test]
+fn test_lwc_non_unique_index_purge_compares_persisted_key_when_marker_is_not_purgeable() {
+    smol::block_on(async {
+        let sys = TestSys::new_evictable_with_non_unique_name_index().await;
+        let mut session = sys.try_new_session().unwrap();
+        insert_rows(&sys, &mut session, 0, 1, "current").await;
+        sys.table.freeze(&session, usize::MAX).await;
+        sys.table.checkpoint(&mut session).await.unwrap();
+
+        let pk = single_key(0i32);
+        let current_key = name_key("current");
+        let stale_key = name_key("stale");
+        let reader = session.try_begin_trx().unwrap().unwrap();
+        let row_id = assert_row_in_lwc(&sys.table, session.pool_guards(), &pk, reader.sts).await;
+        reader.commit().await.unwrap();
+
+        let index = sys.table.sec_idx()[current_key.index_no]
+            .non_unique()
+            .unwrap();
+        let _ = index
+            .insert_if_not_exists(
+                session.pool_guards().index_guard(),
+                &stale_key.vals,
+                row_id,
+                false,
+                MAX_SNAPSHOT_TS,
+            )
+            .await
+            .unwrap();
+        assert!(
+            index
+                .mask_as_deleted(
+                    session.pool_guards().index_guard(),
+                    &stale_key.vals,
+                    row_id,
+                    MAX_SNAPSHOT_TS,
+                )
+                .await
+                .unwrap()
+        );
+        let deleted = sys
+            .table
+            .accessor()
+            .delete_index(
+                session.pool_guards(),
+                &stale_key,
+                row_id,
+                false,
+                MAX_SNAPSHOT_TS,
+            )
+            .await
+            .unwrap();
+        assert!(deleted);
+        assert!(
+            index
+                .lookup_unique(
+                    session.pool_guards().index_guard(),
+                    &stale_key.vals,
+                    row_id,
+                    MAX_SNAPSHOT_TS,
+                )
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        assert!(
+            index
+                .mask_as_deleted(
+                    session.pool_guards().index_guard(),
+                    &current_key.vals,
+                    row_id,
+                    MAX_SNAPSHOT_TS,
+                )
+                .await
+                .unwrap()
+        );
+        sys.table
+            .deletion_buffer()
+            .put_committed(row_id, 200)
+            .unwrap();
+        let deleted = sys
+            .table
+            .accessor()
+            .delete_index(session.pool_guards(), &current_key, row_id, false, 200)
+            .await
+            .unwrap();
+        assert!(!deleted);
+        assert!(matches!(
+            index
+                .lookup_unique(
+                    session.pool_guards().index_guard(),
+                    &current_key.vals,
+                    row_id,
+                    MAX_SNAPSHOT_TS,
+                )
+                .await
+                .unwrap(),
+            Some(false)
+        ));
+
+        drop(session);
+        sys.clean_all();
+    });
+}
+
+#[test]
+fn test_index_purge_removes_delete_marked_unique_entry_when_row_is_not_found() {
+    smol::block_on(async {
+        let sys = TestSys::new_evictable().await;
+        let session = sys.try_new_session().unwrap();
+        let key = single_key(9999i32);
+        let row_id = 9999;
+        let index = sys.table.sec_idx()[key.index_no].unique().unwrap();
+        let _ = index
+            .insert_if_not_exists(
+                session.pool_guards().index_guard(),
+                &key.vals,
+                row_id,
+                false,
+                MAX_SNAPSHOT_TS,
+            )
+            .await
+            .unwrap();
+        assert!(
+            index
+                .mask_as_deleted(
+                    session.pool_guards().index_guard(),
+                    &key.vals,
+                    row_id,
+                    MAX_SNAPSHOT_TS,
+                )
+                .await
+                .unwrap()
+        );
+
+        let deleted = sys
+            .table
+            .accessor()
+            .delete_index(session.pool_guards(), &key, row_id, true, MAX_SNAPSHOT_TS)
+            .await
+            .unwrap();
+        assert!(deleted);
+        assert!(
+            index
+                .lookup(
+                    session.pool_guards().index_guard(),
+                    &key.vals,
+                    MAX_SNAPSHOT_TS,
+                )
+                .await
+                .unwrap()
+                .is_none()
+        );
+
         drop(session);
         sys.clean_all();
     });
@@ -2937,6 +3253,60 @@ impl TestSys {
             _temp_dir: temp_dir,
         }
     }
+
+    #[inline]
+    async fn new_evictable_with_non_unique_name_index() -> Self {
+        use crate::catalog::{
+            ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexSpec, TableSpec,
+        };
+        use crate::value::ValKind;
+
+        let temp_dir = TempDir::new().unwrap();
+        let main_dir = temp_dir.path().to_path_buf();
+        let engine = EngineConfig::default()
+            .storage_root(main_dir)
+            .data_buffer(
+                EvictableBufferPoolConfig::default()
+                    .role(PoolRole::Mem)
+                    .max_mem_size(64u64 * 1024 * 1024)
+                    .max_file_size(128u64 * 1024 * 1024),
+            )
+            .trx(
+                TrxSysConfig::default()
+                    .log_file_stem("redo_testsys_non_unique")
+                    .skip_recovery(true),
+            )
+            .file(
+                FileSystemConfig::default()
+                    .io_depth(16)
+                    .readonly_buffer_size(128 * 1024 * 1024)
+                    .data_dir("."),
+            )
+            .build()
+            .await
+            .unwrap();
+        let mut ddl_session = engine.try_new_session().unwrap();
+        let table_id = ddl_session
+            .create_table(
+                TableSpec::new(vec![
+                    ColumnSpec::new("id", ValKind::I32, ColumnAttributes::empty()),
+                    ColumnSpec::new("name", ValKind::VarByte, ColumnAttributes::empty()),
+                ]),
+                vec![
+                    IndexSpec::new("idx_id", vec![IndexKey::new(0)], IndexAttributes::PK),
+                    IndexSpec::new("idx_name", vec![IndexKey::new(1)], IndexAttributes::empty()),
+                ],
+            )
+            .await
+            .unwrap();
+        drop(ddl_session);
+        let table = engine.catalog().get_table(table_id).await.unwrap();
+        TestSys {
+            engine,
+            table,
+            _temp_dir: temp_dir,
+        }
+    }
 }
 
 impl TestSys {
@@ -3058,6 +3428,13 @@ fn single_key<V: Into<Val>>(value: V) -> SelectKey {
     SelectKey {
         index_no: 0,
         vals: vec![value.into()],
+    }
+}
+
+fn name_key(value: &str) -> SelectKey {
+    SelectKey {
+        index_no: 1,
+        vals: vec![Val::from(value)],
     }
 }
 

@@ -24,7 +24,7 @@ use crate::trx::row::{
 };
 use crate::trx::undo::{IndexBranch, OwnedRowUndo, RowUndoKind};
 use crate::trx::ver_map::RowPageState;
-use crate::trx::{MIN_SNAPSHOT_TS, trx_is_committed};
+use crate::trx::{MIN_SNAPSHOT_TS, TrxID, trx_is_committed};
 use crate::value::Val;
 use std::collections::HashMap;
 use std::future::Future;
@@ -141,6 +141,7 @@ pub trait TableAccess {
         key: &SelectKey,
         row_id: RowID,
         unique: bool,
+        min_active_sts: TrxID,
     ) -> impl Future<Output = Result<bool>>;
 }
 
@@ -152,6 +153,12 @@ pub trait TableAccess {
 pub struct TableAccessor<'a, D: 'static, I: 'static> {
     mem: &'a GenericMemTable<D, I>,
     storage: Option<&'a ColumnStorage>,
+}
+
+enum IndexPurgeDecision {
+    Delete,
+    Keep,
+    RowPage(PageID),
 }
 
 impl<'a> From<&'a Table> for TableAccessor<'a, EvictableBufferPool, EvictableBufferPool> {
@@ -288,6 +295,97 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
             ));
         }
         block.decode_row_values(self.metadata(), row_idx, read_set)
+    }
+
+    #[inline]
+    fn cold_delete_marker_is_globally_purgeable(
+        &self,
+        row_id: RowID,
+        min_active_sts: TrxID,
+    ) -> bool {
+        let Some(deletion_buffer) = self.deletion_buffer() else {
+            return false;
+        };
+        let Some(marker) = deletion_buffer.get(row_id) else {
+            return false;
+        };
+        let delete_cts = match marker {
+            DeleteMarker::Committed(ts) => ts,
+            DeleteMarker::Ref(status) => {
+                let ts = status.ts();
+                if !trx_is_committed(ts) {
+                    return false;
+                }
+                ts
+            }
+        };
+        delete_cts < min_active_sts
+    }
+
+    #[inline]
+    async fn persisted_lwc_key_differs(
+        &self,
+        guards: &PoolGuards,
+        key: &SelectKey,
+        block_id: BlockID,
+        row_idx: usize,
+        row_shape_fingerprint: u128,
+    ) -> Result<bool> {
+        let read_set = self.metadata().index_specs[key.index_no]
+            .index_cols
+            .iter()
+            .map(|key| key.col_no as usize)
+            .collect::<Vec<_>>();
+        let vals = self
+            .read_lwc_row(guards, block_id, row_idx, row_shape_fingerprint, &read_set)
+            .await?;
+        Ok(vals.as_slice() != key.vals.as_slice())
+    }
+
+    #[inline]
+    async fn index_purge_decision(
+        &self,
+        guards: &PoolGuards,
+        key: &SelectKey,
+        row_id: RowID,
+        min_active_sts: TrxID,
+    ) -> Result<IndexPurgeDecision> {
+        // This path is physical GC cleanup for a previously delete-marked
+        // secondary-index entry. A cold delete marker proves that every key for
+        // the row is unreachable only after its transaction is committed and
+        // older than the current purge horizon.
+        if self.cold_delete_marker_is_globally_purgeable(row_id, min_active_sts) {
+            return Ok(IndexPurgeDecision::Delete);
+        }
+
+        match self.try_find_row(guards, row_id, self.storage).await? {
+            RowLocation::NotFound => Ok(IndexPurgeDecision::Delete),
+            RowLocation::LwcBlock {
+                block_id,
+                row_idx,
+                row_shape_fingerprint,
+            } => {
+                // LWC rows are immutable persisted images. If no globally
+                // purgeable marker proves the whole row invisible, decode only
+                // the indexed columns and delete the purge key only when it no
+                // longer matches the persisted current key.
+                if self
+                    .persisted_lwc_key_differs(
+                        guards,
+                        key,
+                        block_id,
+                        row_idx,
+                        row_shape_fingerprint,
+                    )
+                    .await?
+                {
+                    Ok(IndexPurgeDecision::Delete)
+                } else {
+                    Ok(IndexPurgeDecision::Keep)
+                }
+            }
+            RowLocation::RowPage(page_id) => Ok(IndexPurgeDecision::RowPage(page_id)),
+        }
     }
 
     #[inline]
@@ -1015,6 +1113,7 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
         index: &impl UniqueIndex,
         key: &SelectKey,
         row_id: RowID,
+        min_active_sts: TrxID,
     ) -> Result<bool> {
         let index_pool_guard = self.index_pool_guard(guards);
         let (page_guard, row_id) = loop {
@@ -1032,8 +1131,11 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
                         // So we skip to delete it.
                         return Ok(false);
                     }
-                    match self.try_find_row(guards, row_id, self.storage).await? {
-                        RowLocation::NotFound => {
+                    match self
+                        .index_purge_decision(guards, key, row_id, min_active_sts)
+                        .await?
+                    {
+                        IndexPurgeDecision::Delete => {
                             return index
                                 .compare_delete(
                                     index_pool_guard,
@@ -1044,8 +1146,8 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
                                 )
                                 .await;
                         }
-                        RowLocation::LwcBlock { .. } => todo!("lwc block"),
-                        RowLocation::RowPage(page_id) => {
+                        IndexPurgeDecision::Keep => return Ok(false),
+                        IndexPurgeDecision::RowPage(page_id) => {
                             let Some(page_guard) = self
                                 .try_get_validated_row_page_shared_result(guards, page_id, row_id)
                                 .await?
@@ -1062,7 +1164,8 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
         let access = RowReadAccess::new(page, ctx, page.row_idx(row_id));
         // To safely delete an index entry, we need to make sure
         // no version with matched keys can be found in either page
-        // data or version chain.
+        // data or version chain. Hot row pages still have undo chains, unlike
+        // LWC rows whose persisted image is the only current key material.
         if !access.any_version_matches_key(self.metadata(), key) {
             return index
                 .compare_delete(index_pool_guard, &key.vals, row_id, false, MIN_SNAPSHOT_TS)
@@ -1078,6 +1181,7 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
         index: &impl NonUniqueIndex,
         key: &SelectKey,
         row_id: RowID,
+        min_active_sts: TrxID,
     ) -> Result<bool> {
         let index_pool_guard = self.index_pool_guard(guards);
         let (page_guard, row_id) = loop {
@@ -1086,8 +1190,8 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
                 .await?
             {
                 None => return Ok(false), // Another thread deleted this entry.
-                Some(deleted) => {
-                    if !deleted {
+                Some(active) => {
+                    if active {
                         // 1. Delete flag is unset by other transaction,
                         // so we skip to delete it.
                         // 2. Row id changed, means another transaction inserted
@@ -1095,8 +1199,11 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
                         // So we skip to delete it.
                         return Ok(false);
                     }
-                    match self.try_find_row(guards, row_id, self.storage).await? {
-                        RowLocation::NotFound => {
+                    match self
+                        .index_purge_decision(guards, key, row_id, min_active_sts)
+                        .await?
+                    {
+                        IndexPurgeDecision::Delete => {
                             return index
                                 .compare_delete(
                                     index_pool_guard,
@@ -1107,8 +1214,8 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
                                 )
                                 .await;
                         }
-                        RowLocation::LwcBlock { .. } => todo!("lwc block"),
-                        RowLocation::RowPage(page_id) => {
+                        IndexPurgeDecision::Keep => return Ok(false),
+                        IndexPurgeDecision::RowPage(page_id) => {
                             let Some(page_guard) = self
                                 .try_get_validated_row_page_shared_result(guards, page_id, row_id)
                                 .await?
@@ -1125,7 +1232,8 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
         let access = RowReadAccess::new(page, ctx, page.row_idx(row_id));
         // To safely delete an index entry, we need to make sure
         // no version with matched keys can be found in either page
-        // data or version chain.
+        // data or version chain. Hot row pages still have undo chains, unlike
+        // LWC rows whose persisted image is the only current key material.
         if !access.any_version_matches_key(self.metadata(), key) {
             return index
                 .compare_delete(index_pool_guard, &key.vals, row_id, false, MIN_SNAPSHOT_TS)
@@ -2385,16 +2493,18 @@ impl<D: BufferPool, I: BufferPool> TableAccess for TableAccessor<'_, D, I> {
         key: &SelectKey,
         row_id: RowID,
         unique: bool,
+        min_active_sts: TrxID,
     ) -> Result<bool> {
         // todo: consider index drop.
         let index_schema = &self.metadata().index_specs[key.index_no];
         debug_assert_eq!(unique, index_schema.unique());
         if unique {
             let index = self.sec_idx()[key.index_no].unique().unwrap();
-            self.delete_unique_index(guards, index, key, row_id).await
+            self.delete_unique_index(guards, index, key, row_id, min_active_sts)
+                .await
         } else {
             let index = self.sec_idx()[key.index_no].non_unique().unwrap();
-            self.delete_non_unique_index(guards, index, key, row_id)
+            self.delete_non_unique_index(guards, index, key, row_id, min_active_sts)
                 .await
         }
     }
