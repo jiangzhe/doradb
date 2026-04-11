@@ -193,23 +193,26 @@ impl Table {
             )
         };
         let cutoff_advanced = cutoff_ts > deletion_cutoff_ts;
-        // Step 1: ensure there is a persisted column index to patch.
-        if column_block_index_root == SUPER_BLOCK_ID || pivot_row_id == 0 {
-            if cutoff_advanced {
-                mutable_file.advance_deletion_cutoff_ts(cutoff_ts);
-                return Ok(DeletionCheckpointOutcome::MetadataOnly);
-            }
-            return Ok(DeletionCheckpointOutcome::NoOp);
-        }
 
-        // Step 2: pick committed deletion markers that are visible at cutoff.
+        // Step 1: pick committed deletion markers in this checkpoint's durable
+        // replay range: [previous_cutoff, current_cutoff). Markers below
+        // deletion_cutoff_ts were already covered by an earlier checkpoint,
+        // even if the in-memory deletion buffer has not been GC'ed yet. Markers
+        // at or above cutoff_ts are intentionally left for a later checkpoint
+        // because they may have just been moved from transition row pages.
         // This is currently a simple scan + in-place filter + sort/dedup path.
         // For very large deletion buffers, we can optimize this step later by
         // introducing parallel marker selection and parallel sort/merge while
         // preserving deterministic ordering before patch application.
-        let mut selected_row_ids = self.deletion_buffer().collect_committed_before(cutoff_ts);
+        let mut selected_row_ids = self
+            .deletion_buffer()
+            .collect_committed_in_range(deletion_cutoff_ts, cutoff_ts);
         selected_row_ids.retain(|row_id| *row_id < pivot_row_id);
         if selected_row_ids.is_empty() {
+            // No eligible cold delete marker remains for this checkpoint range,
+            // so advancing only metadata is safe even when there is no persisted
+            // column_block_index_root yet, e.g. all frozen rows were already
+            // deleted and no LWC block was produced.
             if cutoff_advanced {
                 mutable_file.advance_deletion_cutoff_ts(cutoff_ts);
                 return Ok(DeletionCheckpointOutcome::MetadataOnly);
@@ -218,6 +221,14 @@ impl Table {
         }
         selected_row_ids.sort_unstable();
         selected_row_ids.dedup();
+
+        // Step 2: fail closed when eligible cold delete markers exist but the
+        // persisted column index needed to resolve them is absent. Returning
+        // MetadataOnly/NoOp here would advance deletion_cutoff_ts and make
+        // recovery skip delete redo that was never reflected in column payloads.
+        if column_block_index_root == SUPER_BLOCK_ID || pivot_row_id == 0 {
+            return Err(Error::InvalidState);
+        }
 
         // Step 3: resolve each row-id to its persisted block payload.
         // Future improvement:
@@ -236,7 +247,10 @@ impl Table {
         let mut grouped: BTreeMap<u64, (BlockPatchSeed, BTreeSet<u32>)> = BTreeMap::new();
         for row_id in selected_row_ids {
             let Some(entry) = column_index.locate_block(row_id).await? else {
-                continue;
+                // The marker is in [previous_cutoff, current_cutoff), so it is
+                // eligible now. A missing locate_block result means we cannot
+                // prove the delete is already durable; do not advance the cutoff.
+                return Err(Error::InvalidState);
             };
             let delta_u64 = row_id
                 .checked_sub(entry.start_row_id)
@@ -251,11 +265,9 @@ impl Table {
             entry.1.insert(delta);
         }
         if grouped.is_empty() {
-            if cutoff_advanced {
-                mutable_file.advance_deletion_cutoff_ts(cutoff_ts);
-                return Ok(DeletionCheckpointOutcome::MetadataOnly);
-            }
-            return Ok(DeletionCheckpointOutcome::NoOp);
+            // Defensive guard: selected markers should either resolve into at
+            // least one patch group or fail above.
+            return Err(Error::InvalidState);
         }
 
         // Step 4: load authoritative persisted deltas and merge pending row-id deltas.

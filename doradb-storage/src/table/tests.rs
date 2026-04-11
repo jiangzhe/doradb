@@ -772,27 +772,8 @@ fn test_checkpoint_persists_committed_cold_delete_markers() {
 
         sys.new_trx_delete(&mut session, &key).await;
         let marker = sys.table.deletion_buffer().get(row_id).unwrap();
-        let marker_ts = match marker {
-            DeleteMarker::Committed(ts) => ts,
-            DeleteMarker::Ref(status) => status.ts(),
-        };
-        let trx_sys = session.engine().trx_sys.clone();
-        // `checkpoint()` selects cold-delete markers with `cts < cutoff_ts`.
-        // `cutoff_ts` comes from GC-visible min-active STS and can lag right after delete commit,
-        // so we wait until this marker becomes eligible to avoid timing flakes.
-        let mut ready = false;
-        for _ in 0..50 {
-            if trx_sys.calc_min_active_sts_for_gc() > marker_ts {
-                ready = true;
-                break;
-            }
-            smol::Timer::after(Duration::from_millis(20)).await;
-        }
-        assert!(
-            ready,
-            "deletion marker ts {} not yet below checkpoint cutoff",
-            marker_ts
-        );
+        let marker_ts = delete_marker_ts(marker);
+        wait_gc_cutoff_after(&session, marker_ts).await;
         let active_root = sys.table.file().active_root();
         let index_before = ColumnBlockIndex::new(
             active_root.column_block_index_root,
@@ -833,7 +814,246 @@ fn test_checkpoint_persists_committed_cold_delete_markers() {
         let expected_delta = (row_id - entry.start_row_id) as u32;
         assert!(deltas.contains(&expected_delta));
 
-        drop(trx_sys);
+        drop(session);
+        sys.clean_all();
+    });
+}
+
+#[test]
+fn test_checkpoint_all_deleted_row_page_advances_without_column_index() {
+    smol::block_on(async {
+        let sys = TestSys::new_evictable().await;
+        let mut session = sys.try_new_session().unwrap();
+        insert_rows(&sys, &mut session, 0, 10, "name").await;
+        for i in 0..10 {
+            sys.new_trx_delete(&mut session, &single_key(i)).await;
+        }
+
+        let root_before = sys.table.file().active_root().clone();
+        sys.table.freeze(&session, usize::MAX).await;
+        sys.table.checkpoint(&mut session).await.unwrap();
+
+        let root_after = sys.table.file().active_root();
+        assert!(root_after.pivot_row_id > root_before.pivot_row_id);
+        assert_eq!(root_after.column_block_index_root, SUPER_BLOCK_ID);
+        assert!(root_after.deletion_cutoff_ts > root_before.deletion_cutoff_ts);
+        for i in 0..10 {
+            sys.new_trx_select_not_found(&mut session, &single_key(i))
+                .await;
+        }
+
+        drop(session);
+        sys.clean_all();
+    });
+}
+
+#[test]
+#[ignore = "blocked by docs/backlogs/000049-purge-crashes-on-checkpointed-rows-in-index-delete-lwc-path.md"]
+fn test_checkpoint_transition_delete_marker_waits_for_next_cutoff_range() {
+    smol::block_on(async {
+        let sys = TestSys::new_evictable().await;
+        let mut session = sys.try_new_session().unwrap();
+        insert_rows(&sys, &mut session, 0, 1, "name").await;
+
+        let key = single_key(0i32);
+        let reader = session.try_begin_trx().unwrap().unwrap();
+        let index = sys.table.sec_idx()[key.index_no].unique().unwrap();
+        let (row_id, _) = index
+            .lookup(session.pool_guards().index_guard(), &key.vals, reader.sts)
+            .await
+            .unwrap()
+            .expect("row should exist before delete");
+        assert!(matches!(
+            sys.table.find_row(session.pool_guards(), row_id).await,
+            RowLocation::RowPage(_)
+        ));
+        reader.commit().await.unwrap();
+
+        let mut hold_session = sys.try_new_session().unwrap();
+        let hold_trx = hold_session.try_begin_trx().unwrap().unwrap();
+        let hold_sts = hold_trx.sts;
+
+        let mut writer_session = sys.try_new_session().unwrap();
+        sys.new_trx_delete(&mut writer_session, &key).await;
+        assert!(sys.table.deletion_buffer().get(row_id).is_none());
+
+        sys.table.freeze(&session, usize::MAX).await;
+        let mut checkpoint_session = sys.try_new_session().unwrap();
+        sys.table.checkpoint(&mut checkpoint_session).await.unwrap();
+
+        let marker = sys.table.deletion_buffer().get(row_id).unwrap();
+        let delete_cts = delete_marker_ts(marker);
+        assert!(delete_cts >= hold_sts);
+
+        let root_after_first = sys.table.file().active_root().clone();
+        let index_after_first = ColumnBlockIndex::new(
+            root_after_first.column_block_index_root,
+            root_after_first.pivot_row_id,
+            sys.table.file().file_kind(),
+            sys.table.file().sparse_file(),
+            sys.table.disk_pool(),
+            session.pool_guards().disk_guard(),
+        );
+        let entry_after_first = index_after_first
+            .locate_block(row_id)
+            .await
+            .unwrap()
+            .expect("transition snapshot should persist the row into LWC");
+        assert!(root_after_first.deletion_cutoff_ts <= delete_cts);
+        assert!(
+            load_entry_deletion_deltas(&index_after_first, &entry_after_first)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        hold_trx.rollback().await.unwrap();
+        wait_gc_cutoff_after(&checkpoint_session, delete_cts).await;
+        sys.table.checkpoint(&mut checkpoint_session).await.unwrap();
+
+        let root_after_second = sys.table.file().active_root();
+        let index_after_second = ColumnBlockIndex::new(
+            root_after_second.column_block_index_root,
+            root_after_second.pivot_row_id,
+            sys.table.file().file_kind(),
+            sys.table.file().sparse_file(),
+            sys.table.disk_pool(),
+            session.pool_guards().disk_guard(),
+        );
+        let entry_after_second = index_after_second
+            .locate_block(row_id)
+            .await
+            .unwrap()
+            .expect("persisted entry should still exist");
+        let deltas = load_entry_deletion_deltas(&index_after_second, &entry_after_second)
+            .await
+            .unwrap();
+        let expected_delta = (row_id - entry_after_second.start_row_id) as u32;
+        assert!(root_after_second.deletion_cutoff_ts > delete_cts);
+        assert!(deltas.contains(&expected_delta));
+
+        drop(checkpoint_session);
+        drop(writer_session);
+        drop(hold_session);
+        drop(session);
+        sys.clean_all();
+    });
+}
+
+#[test]
+fn test_checkpoint_fails_when_eligible_delete_marker_has_no_column_index() {
+    smol::block_on(async {
+        let sys = TestSys::new_evictable().await;
+        let mut session = sys.try_new_session().unwrap();
+        insert_rows(&sys, &mut session, 0, 4, "name").await;
+        for i in 0..4 {
+            sys.new_trx_delete(&mut session, &single_key(i)).await;
+        }
+        sys.table.freeze(&session, usize::MAX).await;
+        sys.table.checkpoint(&mut session).await.unwrap();
+
+        let root_before = sys.table.file().active_root().clone();
+        assert!(root_before.pivot_row_id > 0);
+        assert_eq!(root_before.column_block_index_root, SUPER_BLOCK_ID);
+        let marker_ts = root_before.deletion_cutoff_ts;
+        sys.table
+            .deletion_buffer()
+            .put_committed(0, marker_ts)
+            .unwrap();
+        wait_gc_cutoff_after(&session, marker_ts).await;
+
+        let err = sys.table.checkpoint(&mut session).await.unwrap_err();
+        assert!(matches!(err, Error::InvalidState));
+        let root_after = sys.table.file().active_root();
+        assert_eq!(
+            root_after.deletion_cutoff_ts,
+            root_before.deletion_cutoff_ts
+        );
+        assert_eq!(
+            root_after.column_block_index_root,
+            root_before.column_block_index_root
+        );
+
+        drop(session);
+        sys.clean_all();
+    });
+}
+
+#[test]
+fn test_checkpoint_fails_when_eligible_delete_marker_cannot_be_located() {
+    smol::block_on(async {
+        let sys = TestSys::new_evictable().await;
+        let mut session = sys.try_new_session().unwrap();
+        insert_rows(&sys, &mut session, 0, 1, "name").await;
+        sys.table.freeze(&session, usize::MAX).await;
+        sys.table.checkpoint(&mut session).await.unwrap();
+
+        let key = single_key(0i32);
+        let reader = session.try_begin_trx().unwrap().unwrap();
+        let row_id = assert_row_in_lwc(&sys.table, session.pool_guards(), &key, reader.sts).await;
+        reader.commit().await.unwrap();
+
+        let root_before = sys.table.file().active_root().clone();
+        assert_ne!(root_before.column_block_index_root, SUPER_BLOCK_ID);
+        let missing_row_id = row_id + 1;
+        assert!(missing_row_id < root_before.pivot_row_id);
+        let index = ColumnBlockIndex::new(
+            root_before.column_block_index_root,
+            root_before.pivot_row_id,
+            sys.table.file().file_kind(),
+            sys.table.file().sparse_file(),
+            sys.table.disk_pool(),
+            session.pool_guards().disk_guard(),
+        );
+        assert!(index.locate_block(missing_row_id).await.unwrap().is_none());
+
+        let marker_ts = root_before.deletion_cutoff_ts;
+        sys.table
+            .deletion_buffer()
+            .put_committed(missing_row_id, marker_ts)
+            .unwrap();
+        wait_gc_cutoff_after(&session, marker_ts).await;
+
+        let err = sys.table.checkpoint(&mut session).await.unwrap_err();
+        assert!(matches!(err, Error::InvalidState));
+        assert_eq!(
+            sys.table.file().active_root().deletion_cutoff_ts,
+            root_before.deletion_cutoff_ts
+        );
+
+        drop(session);
+        sys.clean_all();
+    });
+}
+
+#[test]
+fn test_checkpoint_ignores_missing_old_delete_marker_below_previous_cutoff() {
+    smol::block_on(async {
+        let sys = TestSys::new_evictable().await;
+        let mut session = sys.try_new_session().unwrap();
+        insert_rows(&sys, &mut session, 0, 1, "name").await;
+        sys.table.freeze(&session, usize::MAX).await;
+        sys.table.checkpoint(&mut session).await.unwrap();
+
+        let key = single_key(0i32);
+        let reader = session.try_begin_trx().unwrap().unwrap();
+        let row_id = assert_row_in_lwc(&sys.table, session.pool_guards(), &key, reader.sts).await;
+        reader.commit().await.unwrap();
+
+        let root_before = sys.table.file().active_root().clone();
+        assert!(root_before.deletion_cutoff_ts > 0);
+        let missing_row_id = row_id + 1;
+        assert!(missing_row_id < root_before.pivot_row_id);
+        let old_marker_ts = root_before.deletion_cutoff_ts - 1;
+        sys.table
+            .deletion_buffer()
+            .put_committed(missing_row_id, old_marker_ts)
+            .unwrap();
+        wait_gc_cutoff_after(&session, root_before.deletion_cutoff_ts).await;
+
+        sys.table.checkpoint(&mut session).await.unwrap();
+        assert!(sys.table.file().active_root().deletion_cutoff_ts > root_before.deletion_cutoff_ts);
+
         drop(session);
         sys.clean_all();
     });
@@ -961,24 +1181,8 @@ fn test_checkpoint_fails_on_invalid_v2_delete_metadata() {
 
         sys.new_trx_delete(&mut session, &key1).await;
         let marker1 = sys.table.deletion_buffer().get(row_id1).unwrap();
-        let marker1_ts = match marker1 {
-            DeleteMarker::Committed(ts) => ts,
-            DeleteMarker::Ref(status) => status.ts(),
-        };
-        let trx_sys = session.engine().trx_sys.clone();
-        let mut ready = false;
-        for _ in 0..50 {
-            if trx_sys.calc_min_active_sts_for_gc() > marker1_ts {
-                ready = true;
-                break;
-            }
-            smol::Timer::after(Duration::from_millis(20)).await;
-        }
-        assert!(
-            ready,
-            "deletion marker ts {} not yet below checkpoint cutoff",
-            marker1_ts
-        );
+        let marker1_ts = delete_marker_ts(marker1);
+        wait_gc_cutoff_after(&session, marker1_ts).await;
         sys.table.checkpoint(&mut session).await.unwrap();
 
         let active_root = sys.table.file().active_root();
@@ -995,6 +1199,25 @@ fn test_checkpoint_fails_on_invalid_v2_delete_metadata() {
             .await
             .unwrap()
             .expect("persisted entry should exist");
+
+        let key2 = single_key(7i32);
+        let mut reader_session = sys.try_new_session().unwrap();
+        let reader = reader_session.try_begin_trx().unwrap().unwrap();
+        let row_id2 =
+            assert_row_in_lwc(&sys.table, reader_session.pool_guards(), &key2, reader.sts).await;
+        reader.commit().await.unwrap();
+        let entry2 = index
+            .locate_block(row_id2)
+            .await
+            .unwrap()
+            .expect("second persisted entry should exist");
+        assert_eq!(entry2.leaf_page_id, entry.leaf_page_id);
+        drop(reader_session);
+
+        sys.new_trx_delete(&mut session, &key2).await;
+        let marker2 = sys.table.deletion_buffer().get(row_id2).unwrap();
+        let marker2_ts = delete_marker_ts(marker2);
+        wait_gc_cutoff_after(&session, marker2_ts).await;
 
         let table_file_path = sys.engine.table_fs.table_file_path(sys.table.table_id());
         corrupt_leaf_delete_codec(table_file_path, entry.leaf_page_id, 0);
@@ -1014,7 +1237,6 @@ fn test_checkpoint_fails_on_invalid_v2_delete_metadata() {
             } if page_id == entry.leaf_page_id
         ));
 
-        drop(trx_sys);
         drop(session);
         sys.clean_all();
     });
@@ -1036,24 +1258,8 @@ fn test_checkpoint_fails_on_short_v2_delete_section_header() {
 
         sys.new_trx_delete(&mut session, &key1).await;
         let marker1 = sys.table.deletion_buffer().get(row_id1).unwrap();
-        let marker1_ts = match marker1 {
-            DeleteMarker::Committed(ts) => ts,
-            DeleteMarker::Ref(status) => status.ts(),
-        };
-        let trx_sys = session.engine().trx_sys.clone();
-        let mut ready = false;
-        for _ in 0..50 {
-            if trx_sys.calc_min_active_sts_for_gc() > marker1_ts {
-                ready = true;
-                break;
-            }
-            smol::Timer::after(Duration::from_millis(20)).await;
-        }
-        assert!(
-            ready,
-            "deletion marker ts {} not yet below checkpoint cutoff",
-            marker1_ts
-        );
+        let marker1_ts = delete_marker_ts(marker1);
+        wait_gc_cutoff_after(&session, marker1_ts).await;
         sys.table.checkpoint(&mut session).await.unwrap();
 
         let active_root = sys.table.file().active_root();
@@ -1070,6 +1276,25 @@ fn test_checkpoint_fails_on_short_v2_delete_section_header() {
             .await
             .unwrap()
             .expect("persisted entry should exist");
+
+        let key2 = single_key(7i32);
+        let mut reader_session = sys.try_new_session().unwrap();
+        let reader = reader_session.try_begin_trx().unwrap().unwrap();
+        let row_id2 =
+            assert_row_in_lwc(&sys.table, reader_session.pool_guards(), &key2, reader.sts).await;
+        reader.commit().await.unwrap();
+        let entry2 = index
+            .locate_block(row_id2)
+            .await
+            .unwrap()
+            .expect("second persisted entry should exist");
+        assert_eq!(entry2.leaf_page_id, entry.leaf_page_id);
+        drop(reader_session);
+
+        sys.new_trx_delete(&mut session, &key2).await;
+        let marker2 = sys.table.deletion_buffer().get(row_id2).unwrap();
+        let marker2_ts = delete_marker_ts(marker2);
+        wait_gc_cutoff_after(&session, marker2_ts).await;
 
         let table_file_path = sys.engine.table_fs.table_file_path(sys.table.table_id());
         corrupt_leaf_short_delete_section_header(table_file_path, entry.leaf_page_id, 0);
@@ -1089,7 +1314,6 @@ fn test_checkpoint_fails_on_short_v2_delete_section_header() {
             } if page_id == entry.leaf_page_id
         ));
 
-        drop(trx_sys);
         drop(session);
         sys.clean_all();
     });
@@ -2867,6 +3091,24 @@ async fn assert_row_in_lwc(
         RowLocation::RowPage(..) => panic!("row should be in lwc"),
         RowLocation::NotFound => panic!("row should exist"),
     }
+}
+
+fn delete_marker_ts(marker: DeleteMarker) -> TrxID {
+    match marker {
+        DeleteMarker::Committed(ts) => ts,
+        DeleteMarker::Ref(status) => status.ts(),
+    }
+}
+
+async fn wait_gc_cutoff_after(session: &Session, ts: TrxID) {
+    let trx_sys = session.engine().trx_sys.clone();
+    for _ in 0..50 {
+        if trx_sys.calc_min_active_sts_for_gc() > ts {
+            return;
+        }
+        smol::Timer::after(Duration::from_millis(20)).await;
+    }
+    panic!("GC cutoff did not advance past {ts}");
 }
 
 fn corrupt_page_checksum(path: impl AsRef<std::path::Path>, page_id: impl Into<u64>) {
