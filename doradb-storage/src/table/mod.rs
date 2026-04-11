@@ -34,7 +34,7 @@ use crate::trx::row::RowReadAccess;
 use crate::trx::sys::TransactionSystem;
 use crate::trx::undo::{IndexBranch, RowUndoKind, UndoStatus};
 use crate::trx::ver_map::RowPageState;
-use crate::trx::{MIN_SNAPSHOT_TS, TrxID, trx_is_committed};
+use crate::trx::{MAX_SNAPSHOT_TS, MIN_SNAPSHOT_TS, TrxID, trx_is_committed};
 use crate::value::{PAGE_VAR_LEN_INLINE, Val};
 #[cfg(test)]
 use std::cell::Cell;
@@ -738,7 +738,11 @@ impl Table {
                         if let Some(trx_status) = status.as_ref()
                             && !trx_is_committed(trx_status.ts())
                         {
-                            let _ = self.deletion_buffer().put_ref(row_id, trx_status.clone());
+                            let _ = self.deletion_buffer().put_ref(
+                                row_id,
+                                trx_status.clone(),
+                                MAX_SNAPSHOT_TS,
+                            );
                         }
                     }
                     RowUndoKind::Delete => {
@@ -751,8 +755,11 @@ impl Table {
                                             self.deletion_buffer().put_committed(row_id, status_ts);
                                     }
                                 } else {
-                                    let _ =
-                                        self.deletion_buffer().put_ref(row_id, trx_status.clone());
+                                    let _ = self.deletion_buffer().put_ref(
+                                        row_id,
+                                        trx_status.clone(),
+                                        MAX_SNAPSHOT_TS,
+                                    );
                                 }
                             }
                             None => {

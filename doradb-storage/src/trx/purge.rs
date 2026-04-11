@@ -788,7 +788,7 @@ mod tests {
             let status = Arc::new(SharedTrxStatus::global_visible());
             table
                 .deletion_buffer()
-                .put_ref(row_id, status.clone())
+                .put_ref(row_id, status.clone(), MAX_SNAPSHOT_TS)
                 .unwrap();
 
             let mut row_undo = RowUndoLogs::empty();
@@ -878,7 +878,7 @@ mod tests {
             let status = Arc::new(SharedTrxStatus::new(MIN_ACTIVE_TRX_ID + 1));
             table
                 .deletion_buffer()
-                .put_ref(row_id, status.clone())
+                .put_ref(row_id, status.clone(), MAX_SNAPSHOT_TS)
                 .unwrap();
 
             let mut row_undo = RowUndoLogs::empty();
@@ -990,7 +990,7 @@ mod tests {
             let status = Arc::new(SharedTrxStatus::global_visible());
             table
                 .deletion_buffer()
-                .put_ref(row_id, status.clone())
+                .put_ref(row_id, status.clone(), MAX_SNAPSHOT_TS)
                 .unwrap();
 
             let mut row_undo = RowUndoLogs::empty();
@@ -1098,7 +1098,7 @@ mod tests {
             let status = Arc::new(SharedTrxStatus::new(MIN_ACTIVE_TRX_ID + 1));
             table
                 .deletion_buffer()
-                .put_ref(row_id, status.clone())
+                .put_ref(row_id, status.clone(), MAX_SNAPSHOT_TS)
                 .unwrap();
 
             let mut row_undo = RowUndoLogs::empty();

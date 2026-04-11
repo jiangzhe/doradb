@@ -34,20 +34,30 @@ impl ColumnDeletionBuffer {
         &self,
         row_id: RowID,
         status: Arc<SharedTrxStatus>,
+        snapshot_sts: TrxID,
     ) -> Result<(), DeletionError> {
         match self.entries.entry(row_id) {
             Entry::Occupied(entry) => match entry.get() {
                 DeleteMarker::Ref(existing) => {
                     let ts = existing.ts();
                     if trx_is_committed(ts) {
-                        return Err(DeletionError::AlreadyDeleted);
+                        if ts <= snapshot_sts {
+                            return Err(DeletionError::AlreadyDeleted);
+                        }
+                        return Err(DeletionError::WriteConflict);
                     }
                     if Arc::ptr_eq(existing, &status) {
                         return Ok(());
                     }
                     Err(DeletionError::WriteConflict)
                 }
-                DeleteMarker::Committed(_) => Err(DeletionError::AlreadyDeleted),
+                DeleteMarker::Committed(ts) => {
+                    if *ts <= snapshot_sts {
+                        Err(DeletionError::AlreadyDeleted)
+                    } else {
+                        Err(DeletionError::WriteConflict)
+                    }
+                }
             },
             Entry::Vacant(entry) => {
                 entry.insert(DeleteMarker::Ref(status));
@@ -179,7 +189,7 @@ impl ColumnDeletionBuffer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::trx::MIN_ACTIVE_TRX_ID;
+    use crate::trx::{MAX_SNAPSHOT_TS, MIN_ACTIVE_TRX_ID};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -195,7 +205,11 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 0);
 
         buffer
-            .put_ref(1, Arc::new(SharedTrxStatus::new(MIN_ACTIVE_TRX_ID + 1)))
+            .put_ref(
+                1,
+                Arc::new(SharedTrxStatus::new(MIN_ACTIVE_TRX_ID + 1)),
+                MAX_SNAPSHOT_TS,
+            )
             .unwrap();
         assert!(!buffer.delete_marker_is_globally_purgeable_with(1, || {
             calls.fetch_add(1, Ordering::SeqCst);
@@ -216,5 +230,32 @@ mod tests {
             11
         }));
         assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn test_put_ref_respects_snapshot_for_committed_markers() {
+        let buffer = ColumnDeletionBuffer::new();
+        let status = Arc::new(SharedTrxStatus::new(MIN_ACTIVE_TRX_ID + 1));
+
+        buffer.put_committed(1, 20).unwrap();
+        assert_eq!(
+            buffer.put_ref(1, status.clone(), 20),
+            Err(DeletionError::AlreadyDeleted)
+        );
+        assert_eq!(
+            buffer.put_ref(1, status.clone(), 19),
+            Err(DeletionError::WriteConflict)
+        );
+
+        let committed_ref = Arc::new(SharedTrxStatus::new(30));
+        buffer.put_ref(2, committed_ref, MAX_SNAPSHOT_TS).unwrap();
+        assert_eq!(
+            buffer.put_ref(2, status.clone(), 30),
+            Err(DeletionError::AlreadyDeleted)
+        );
+        assert_eq!(
+            buffer.put_ref(2, status, 29),
+            Err(DeletionError::WriteConflict)
+        );
     }
 }

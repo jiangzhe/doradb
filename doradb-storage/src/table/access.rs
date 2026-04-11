@@ -2647,7 +2647,7 @@ impl<D: BufferPool, I: BufferPool> TableAccess for TableAccessor<'_, D, I> {
                             }
                         };
                         let deletion_buffer = self.lwc_deletion_buffer()?;
-                        match deletion_buffer.put_ref(row_id, stmt.trx.status()) {
+                        match deletion_buffer.put_ref(row_id, stmt.trx.status(), stmt.trx.sts) {
                             Ok(()) => (),
                             Err(DeletionError::WriteConflict) => {
                                 return Ok(UpdateMvcc::WriteConflict);
@@ -2832,7 +2832,7 @@ impl<D: BufferPool, I: BufferPool> TableAccess for TableAccessor<'_, D, I> {
                             return Ok(DeleteMvcc::NotFound);
                         }
                         let deletion_buffer = self.lwc_deletion_buffer()?;
-                        match deletion_buffer.put_ref(row_id, stmt.trx.status()) {
+                        match deletion_buffer.put_ref(row_id, stmt.trx.status(), stmt.trx.sts) {
                             Ok(()) => {
                                 let undo = OwnedRowUndo::new(
                                     self.table_id(),

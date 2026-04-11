@@ -776,6 +776,46 @@ fn test_column_delete_mvcc_visibility() {
 }
 
 #[test]
+fn test_lwc_delete_unique_conflicts_when_delete_committed_after_snapshot() {
+    smol::block_on(async {
+        let sys = TestSys::new_evictable().await;
+        let mut session = sys.try_new_session().unwrap();
+        insert_rows(&sys, &mut session, 0, 10, "name").await;
+        sys.table.freeze(&session, usize::MAX).await;
+        sys.table.checkpoint(&mut session).await.unwrap();
+
+        let key = single_key(5i32);
+        let mut writer_session = sys.try_new_session().unwrap();
+        let mut writer = writer_session.try_begin_trx().unwrap().unwrap();
+        let writer_sts = writer.sts;
+        let row_id =
+            assert_row_in_lwc(&sys.table, writer_session.pool_guards(), &key, writer_sts).await;
+
+        sys.new_trx_delete(&mut session, &key).await;
+        let delete_cts = delete_marker_ts(sys.table.deletion_buffer().get(row_id).unwrap());
+        assert!(delete_cts > writer_sts);
+
+        writer = sys
+            .trx_select(writer, &key, |row| {
+                assert_eq!(row, vec![Val::from(5i32), Val::from("name")]);
+            })
+            .await;
+
+        let mut stmt = writer.start_stmt();
+        let res = stmt.delete_row(&sys.table, &key).await;
+        assert!(matches!(res, Ok(DeleteMvcc::WriteConflict)));
+        let writer = stmt.fail().await.unwrap();
+        writer.rollback().await.unwrap();
+
+        sys.new_trx_select_not_found(&mut session, &key).await;
+
+        drop(writer_session);
+        drop(session);
+        sys.clean_all();
+    });
+}
+
+#[test]
 fn test_lwc_update_unique_same_key_reinserts_hot_and_preserves_old_snapshot() {
     smol::block_on(async {
         let sys = TestSys::new_evictable().await;
@@ -859,6 +899,55 @@ fn test_lwc_update_unique_same_key_reinserts_hot_and_preserves_old_snapshot() {
         old_reader.commit().await.unwrap();
 
         drop(old_reader_session);
+        drop(session);
+        sys.clean_all();
+    });
+}
+
+#[test]
+fn test_lwc_update_unique_conflicts_when_delete_committed_after_snapshot() {
+    smol::block_on(async {
+        let sys = TestSys::new_evictable().await;
+        let mut session = sys.try_new_session().unwrap();
+        insert_rows(&sys, &mut session, 0, 10, "name").await;
+        sys.table.freeze(&session, usize::MAX).await;
+        sys.table.checkpoint(&mut session).await.unwrap();
+
+        let key = single_key(5i32);
+        let mut writer_session = sys.try_new_session().unwrap();
+        let mut writer = writer_session.try_begin_trx().unwrap().unwrap();
+        let writer_sts = writer.sts;
+        let row_id =
+            assert_row_in_lwc(&sys.table, writer_session.pool_guards(), &key, writer_sts).await;
+
+        sys.new_trx_delete(&mut session, &key).await;
+        let delete_cts = delete_marker_ts(sys.table.deletion_buffer().get(row_id).unwrap());
+        assert!(delete_cts > writer_sts);
+
+        writer = sys
+            .trx_select(writer, &key, |row| {
+                assert_eq!(row, vec![Val::from(5i32), Val::from("name")]);
+            })
+            .await;
+
+        let mut stmt = writer.start_stmt();
+        let res = stmt
+            .update_row(
+                &sys.table,
+                &key,
+                vec![UpdateCol {
+                    idx: 1,
+                    val: Val::from("updated"),
+                }],
+            )
+            .await;
+        assert!(matches!(res, Ok(UpdateMvcc::WriteConflict)));
+        let writer = stmt.fail().await.unwrap();
+        writer.rollback().await.unwrap();
+
+        sys.new_trx_select_not_found(&mut session, &key).await;
+
+        drop(writer_session);
         drop(session);
         sys.clean_all();
     });
