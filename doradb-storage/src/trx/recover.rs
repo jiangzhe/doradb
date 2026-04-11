@@ -94,45 +94,6 @@ impl RecoverMap {
     }
 }
 
-#[cfg(test)]
-mod basic_tests {
-    use super::{RecoverMap, RecoveryTableState};
-
-    #[test]
-    fn test_recover_map_tracks_create_cts_and_entries() {
-        let mut map = RecoverMap::new(7);
-        assert_eq!(map.create_cts(), 7);
-        assert!(map.is_vacant(0));
-
-        map.insert_at(2, 11);
-        assert!(map.is_vacant(0));
-        assert!(map.is_vacant(1));
-        assert!(!map.is_vacant(2));
-        assert_eq!(map.at(2), Some(11));
-        assert_eq!(map.at(3), None);
-
-        map.update_at(2, 13);
-        assert_eq!(map.at(2), Some(13));
-    }
-
-    #[test]
-    fn test_recovery_table_state_replay_start_uses_heap_and_deletion_floor() {
-        let heap_first = RecoveryTableState {
-            heap_redo_start_ts: 7,
-            deletion_cutoff_ts: 11,
-            preloaded_from_checkpoint: true,
-        };
-        assert_eq!(heap_first.replay_start_ts(), 7);
-
-        let deletion_first = RecoveryTableState {
-            heap_redo_start_ts: 19,
-            deletion_cutoff_ts: 13,
-            preloaded_from_checkpoint: true,
-        };
-        assert_eq!(deletion_first.replay_start_ts(), 13);
-    }
-}
-
 pub(crate) async fn log_recover(
     meta_pool: &FixedBufferPool,
     deps: RecoveryDeps,
@@ -671,6 +632,7 @@ impl<'a> LogRecovery<'a> {
 
 #[cfg(test)]
 mod tests {
+    use super::{RecoverMap, RecoveryTableState};
     use crate::buffer::PoolRole;
     use crate::catalog::{
         ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexOrder, IndexSpec,
@@ -690,6 +652,40 @@ mod tests {
     use std::fs::OpenOptions;
     use std::io::{Read, Seek, SeekFrom, Write};
     use tempfile::TempDir;
+
+    #[test]
+    fn test_recover_map_tracks_create_cts_and_entries() {
+        let mut map = RecoverMap::new(7);
+        assert_eq!(map.create_cts(), 7);
+        assert!(map.is_vacant(0));
+
+        map.insert_at(2, 11);
+        assert!(map.is_vacant(0));
+        assert!(map.is_vacant(1));
+        assert!(!map.is_vacant(2));
+        assert_eq!(map.at(2), Some(11));
+        assert_eq!(map.at(3), None);
+
+        map.update_at(2, 13);
+        assert_eq!(map.at(2), Some(13));
+    }
+
+    #[test]
+    fn test_recovery_table_state_replay_start_uses_heap_and_deletion_floor() {
+        let heap_first = RecoveryTableState {
+            heap_redo_start_ts: 7,
+            deletion_cutoff_ts: 11,
+            preloaded_from_checkpoint: true,
+        };
+        assert_eq!(heap_first.replay_start_ts(), 7);
+
+        let deletion_first = RecoveryTableState {
+            heap_redo_start_ts: 19,
+            deletion_cutoff_ts: 13,
+            preloaded_from_checkpoint: true,
+        };
+        assert_eq!(deletion_first.replay_start_ts(), 13);
+    }
 
     fn corrupt_page_checksum(path: impl AsRef<std::path::Path>, page_id: impl Into<u64>) {
         let page_id = page_id.into();
