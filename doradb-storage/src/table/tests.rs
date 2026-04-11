@@ -825,9 +825,7 @@ fn test_checkpoint_all_deleted_row_page_advances_without_column_index() {
         let sys = TestSys::new_evictable().await;
         let mut session = sys.try_new_session().unwrap();
         insert_rows(&sys, &mut session, 0, 10, "name").await;
-        for i in 0..10 {
-            sys.new_trx_delete(&mut session, &single_key(i)).await;
-        }
+        delete_key_range_and_wait_gc_cutoff(&sys, &mut session, 0, 10).await;
 
         let root_before = sys.table.file().active_root().clone();
         sys.table.freeze(&session, usize::MAX).await;
@@ -946,9 +944,7 @@ fn test_checkpoint_fails_when_eligible_delete_marker_has_no_column_index() {
         let sys = TestSys::new_evictable().await;
         let mut session = sys.try_new_session().unwrap();
         insert_rows(&sys, &mut session, 0, 4, "name").await;
-        for i in 0..4 {
-            sys.new_trx_delete(&mut session, &single_key(i)).await;
-        }
+        delete_key_range_and_wait_gc_cutoff(&sys, &mut session, 0, 4).await;
         sys.table.freeze(&session, usize::MAX).await;
         sys.table.checkpoint(&mut session).await.unwrap();
 
@@ -3263,4 +3259,20 @@ async fn insert_rows_direct(
         trx = stmt.succeed();
     }
     trx.commit().await.unwrap();
+}
+
+async fn delete_key_range_and_wait_gc_cutoff(
+    sys: &TestSys,
+    session: &mut Session,
+    start: i32,
+    count: i32,
+) {
+    let mut max_delete_cts = 0;
+    for i in 0..count {
+        let mut trx = session.try_begin_trx().unwrap().unwrap();
+        trx = sys.trx_delete(trx, &single_key(start + i)).await;
+        let cts = trx.commit().await.unwrap();
+        max_delete_cts = max_delete_cts.max(cts);
+    }
+    wait_gc_cutoff_after(session, max_delete_cts).await;
 }
