@@ -141,7 +141,19 @@ impl IndexUndoLogs {
                     // To solve this, we need to re-check original row with row latch and delete
                     // index entry if it is deleted and does not have any old version (already GCed).
                     match table.find_row(guards, old_row_id, storage).await {
-                        RowLocation::NotFound => unreachable!(),
+                        RowLocation::NotFound => {
+                            // The delete-masked owner may already have been
+                            // purged while its stale unique-index entry was
+                            // still present. There is no old owner to restore,
+                            // so rollback only removes the new claim.
+                            let new_row_id = entry.row_id;
+                            let index = table.sec_idx()[key.index_no].unique().unwrap();
+                            let res = index
+                                .compare_delete(index_pool_guard, &key.vals, new_row_id, true, ts)
+                                .await?;
+                            assert!(res);
+                            return Ok(());
+                        }
                         RowLocation::LwcBlock {
                             block_id,
                             row_idx,

@@ -1556,6 +1556,94 @@ fn test_index_purge_removes_delete_marked_unique_entry_when_row_is_not_found() {
 }
 
 #[test]
+fn test_unique_insert_rollback_removes_claim_when_deleted_owner_not_found() {
+    smol::block_on(async {
+        let sys = TestSys::new_evictable().await;
+        let mut session = sys.try_new_session().unwrap();
+        let key = single_key(10_001i32);
+        let stale_row_id = 10_001;
+
+        assert!(matches!(
+            sys.table
+                .find_row(session.pool_guards(), stale_row_id)
+                .await,
+            RowLocation::NotFound
+        ));
+
+        let index = sys.table.sec_idx()[key.index_no].unique().unwrap();
+        assert!(
+            index
+                .insert_if_not_exists(
+                    session.pool_guards().index_guard(),
+                    &key.vals,
+                    stale_row_id,
+                    false,
+                    MAX_SNAPSHOT_TS,
+                )
+                .await
+                .unwrap()
+                .is_ok()
+        );
+        assert!(
+            index
+                .mask_as_deleted(
+                    session.pool_guards().index_guard(),
+                    &key.vals,
+                    stale_row_id,
+                    MAX_SNAPSHOT_TS,
+                )
+                .await
+                .unwrap()
+        );
+        assert_unique_index_entry(
+            &sys.table,
+            session.pool_guards(),
+            &key,
+            MAX_SNAPSHOT_TS,
+            stale_row_id,
+            true,
+        )
+        .await;
+
+        let trx = session.try_begin_trx().unwrap().unwrap();
+        let mut stmt = trx.start_stmt();
+        let new_row_id = unwrap_insert_result(
+            stmt.insert_row(&sys.table, vec![Val::from(10_001i32), Val::from("reborn")])
+                .await,
+        );
+        assert_ne!(new_row_id, stale_row_id);
+        assert_unique_index_entry(
+            &sys.table,
+            session.pool_guards(),
+            &key,
+            stmt.trx.sts,
+            new_row_id,
+            false,
+        )
+        .await;
+
+        let trx = stmt.fail().await.unwrap();
+        trx.rollback().await.unwrap();
+
+        assert!(
+            index
+                .lookup(
+                    session.pool_guards().index_guard(),
+                    &key.vals,
+                    MAX_SNAPSHOT_TS,
+                )
+                .await
+                .unwrap()
+                .is_none()
+        );
+        sys.new_trx_select_not_found(&mut session, &key).await;
+
+        drop(session);
+        sys.clean_all();
+    });
+}
+
+#[test]
 fn test_checkpoint_fails_when_eligible_delete_marker_has_no_column_index() {
     smol::block_on(async {
         let sys = TestSys::new_evictable().await;
