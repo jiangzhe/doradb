@@ -1058,6 +1058,111 @@ fn test_lwc_update_unique_claims_committed_deleted_cold_owner_with_visibility_br
 }
 
 #[test]
+fn test_lwc_update_unique_claim_rollback_restores_deleted_cold_owner() {
+    smol::block_on(async {
+        let sys = TestSys::new_evictable().await;
+        let mut session = sys.try_new_session().unwrap();
+        insert_rows(&sys, &mut session, 1, 2, "name").await;
+        sys.table.freeze(&session, usize::MAX).await;
+        sys.table.checkpoint(&mut session).await.unwrap();
+
+        let old_key = single_key(1i32);
+        let claimed_key = single_key(2i32);
+        let mut old_reader_session = sys.try_new_session().unwrap();
+        let mut old_reader = old_reader_session.try_begin_trx().unwrap().unwrap();
+        let claimed_row_id = assert_row_in_lwc(
+            &sys.table,
+            old_reader_session.pool_guards(),
+            &claimed_key,
+            old_reader.sts,
+        )
+        .await;
+
+        sys.new_trx_delete(&mut session, &claimed_key).await;
+        assert_unique_index_entry(
+            &sys.table,
+            session.pool_guards(),
+            &claimed_key,
+            MAX_SNAPSHOT_TS,
+            claimed_row_id,
+            true,
+        )
+        .await;
+
+        let writer = session.try_begin_trx().unwrap().unwrap();
+        let mut stmt = writer.start_stmt();
+        let res = stmt
+            .update_row(
+                &sys.table,
+                &old_key,
+                vec![
+                    UpdateCol {
+                        idx: 0,
+                        val: Val::from(2i32),
+                    },
+                    UpdateCol {
+                        idx: 1,
+                        val: Val::from("claimed"),
+                    },
+                ],
+            )
+            .await;
+        let new_row_id = match res {
+            Ok(UpdateMvcc::Updated(row_id)) => row_id,
+            other => panic!("expected update success, got {other:?}"),
+        };
+        assert_ne!(claimed_row_id, new_row_id);
+        assert_unique_index_entry(
+            &sys.table,
+            session.pool_guards(),
+            &claimed_key,
+            stmt.trx.sts,
+            new_row_id,
+            false,
+        )
+        .await;
+        assert!(matches!(
+            sys.table
+                .find_row(session.pool_guards(), claimed_row_id)
+                .await,
+            RowLocation::LwcBlock { .. }
+        ));
+
+        // Keep the statement changes in the transaction so transaction rollback
+        // exercises index undo before row undo. That is the path where the
+        // claimed deleted owner must still resolve as RowLocation::LwcBlock.
+        let writer = stmt.succeed();
+        writer.rollback().await.unwrap();
+
+        assert_unique_index_entry(
+            &sys.table,
+            session.pool_guards(),
+            &claimed_key,
+            MAX_SNAPSHOT_TS,
+            claimed_row_id,
+            true,
+        )
+        .await;
+        sys.new_trx_select(&mut session, &old_key, |vals| {
+            assert_eq!(vals, vec![Val::from(1i32), Val::from("name")]);
+        })
+        .await;
+        sys.new_trx_select_not_found(&mut session, &claimed_key)
+            .await;
+        old_reader = sys
+            .trx_select(old_reader, &claimed_key, |vals| {
+                assert_eq!(vals, vec![Val::from(2i32), Val::from("name")]);
+            })
+            .await;
+        old_reader.commit().await.unwrap();
+
+        drop(old_reader_session);
+        drop(session);
+        sys.clean_all();
+    });
+}
+
+#[test]
 fn test_checkpoint_persists_committed_cold_delete_markers() {
     smol::block_on(async {
         let sys = TestSys::new_evictable().await;
