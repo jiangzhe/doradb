@@ -96,7 +96,7 @@ impl RecoverMap {
 
 #[cfg(test)]
 mod basic_tests {
-    use super::RecoverMap;
+    use super::{RecoverMap, RecoveryTableState};
 
     #[test]
     fn test_recover_map_tracks_create_cts_and_entries() {
@@ -113,6 +113,23 @@ mod basic_tests {
 
         map.update_at(2, 13);
         assert_eq!(map.at(2), Some(13));
+    }
+
+    #[test]
+    fn test_recovery_table_state_replay_start_uses_heap_and_deletion_floor() {
+        let heap_first = RecoveryTableState {
+            heap_redo_start_ts: 7,
+            deletion_cutoff_ts: 11,
+            preloaded_from_checkpoint: true,
+        };
+        assert_eq!(heap_first.replay_start_ts(), 7);
+
+        let deletion_first = RecoveryTableState {
+            heap_redo_start_ts: 19,
+            deletion_cutoff_ts: 13,
+            preloaded_from_checkpoint: true,
+        };
+        assert_eq!(deletion_first.replay_start_ts(), 13);
     }
 }
 
@@ -185,7 +202,15 @@ pub struct LogRecovery<'a> {
 #[derive(Clone, Copy, Debug)]
 struct RecoveryTableState {
     heap_redo_start_ts: TrxID,
+    deletion_cutoff_ts: TrxID,
     preloaded_from_checkpoint: bool,
+}
+
+impl RecoveryTableState {
+    #[inline]
+    fn replay_start_ts(self) -> TrxID {
+        self.heap_redo_start_ts.min(self.deletion_cutoff_ts)
+    }
 }
 
 impl<'a> LogRecovery<'a> {
@@ -264,7 +289,7 @@ impl<'a> LogRecovery<'a> {
                 .table_states
                 .get(&table.table_id)
                 .ok_or(Error::TableNotFound)?;
-            self.replay_floor = self.replay_floor.min(state.heap_redo_start_ts);
+            self.replay_floor = self.replay_floor.min(state.replay_start_ts());
         }
         Ok(())
     }
@@ -288,6 +313,7 @@ impl<'a> LogRecovery<'a> {
             table_id,
             RecoveryTableState {
                 heap_redo_start_ts: table.file().active_root().heap_redo_start_ts,
+                deletion_cutoff_ts: table.file().active_root().deletion_cutoff_ts,
                 preloaded_from_checkpoint,
             },
         );
@@ -302,6 +328,22 @@ impl<'a> LogRecovery<'a> {
         self.table_states
             .get(&table_id)
             .map(|state| state.heap_redo_start_ts)
+            .ok_or(Error::TableNotFound)
+    }
+
+    #[inline]
+    fn table_deletion_cutoff_ts(&self, table_id: TableID) -> Result<TrxID> {
+        self.table_states
+            .get(&table_id)
+            .map(|state| state.deletion_cutoff_ts)
+            .ok_or(Error::TableNotFound)
+    }
+
+    #[inline]
+    fn table_replay_start_ts(&self, table_id: TableID) -> Result<TrxID> {
+        self.table_states
+            .get(&table_id)
+            .map(|state| state.replay_start_ts())
             .ok_or(Error::TableNotFound)
     }
 
@@ -503,7 +545,7 @@ impl<'a> LogRecovery<'a> {
                     .await?;
                 continue;
             }
-            if cts < self.table_heap_redo_start_ts(table_id)? {
+            if cts < self.table_replay_start_ts(table_id)? {
                 continue;
             }
             let table = self
@@ -511,7 +553,7 @@ impl<'a> LogRecovery<'a> {
                 .get_table(table_id)
                 .await
                 .ok_or(Error::TableNotFound)?;
-            self.replay_table_dml(&table, &table_dml.rows, cts, disable_index)
+            self.replay_table_dml(table_id, &table, &table_dml.rows, cts, disable_index)
                 .await?;
         }
         Ok(())
@@ -558,14 +600,21 @@ impl<'a> LogRecovery<'a> {
 
     async fn replay_table_dml(
         &mut self,
+        table_id: TableID,
         table: &Table,
         rows: &BTreeMap<RowID, RowRedo>,
         cts: TrxID,
         disable_index: bool,
     ) -> Result<()> {
+        let heap_redo_start_ts = self.table_heap_redo_start_ts(table_id)?;
+        let deletion_cutoff_ts = self.table_deletion_cutoff_ts(table_id)?;
+        let pivot_row_id = table.file().active_root().pivot_row_id;
         for row in rows.values() {
             match &row.kind {
                 RowRedoKind::Insert(vals) => {
+                    if cts < heap_redo_start_ts {
+                        continue;
+                    }
                     table
                         .recover_row_insert(
                             &self.pool_guards,
@@ -578,6 +627,9 @@ impl<'a> LogRecovery<'a> {
                         .await?;
                 }
                 RowRedoKind::Update(vals) => {
+                    if cts < heap_redo_start_ts {
+                        continue;
+                    }
                     table
                         .recover_row_update(
                             &self.pool_guards,
@@ -590,6 +642,13 @@ impl<'a> LogRecovery<'a> {
                         .await?;
                 }
                 RowRedoKind::Delete => {
+                    if row.row_id < pivot_row_id {
+                        if cts < deletion_cutoff_ts {
+                            continue;
+                        }
+                    } else if cts < heap_redo_start_ts {
+                        continue;
+                    }
                     table
                         .recover_row_delete(
                             &self.pool_guards,
@@ -623,7 +682,7 @@ mod tests {
     use crate::file::cow_file::COW_FILE_PAGE_SIZE;
     use crate::index::{COLUMN_DELETION_BLOB_PAGE_HEADER_SIZE, ColumnBlockIndex};
     use crate::row::RowRead;
-    use crate::row::ops::{DeleteMvcc, InsertMvcc, SelectKey, UpdateCol, UpdateMvcc};
+    use crate::row::ops::{DeleteMvcc, InsertMvcc, SelectKey, SelectMvcc, UpdateCol, UpdateMvcc};
     use crate::table::{DeleteMarker, TableAccess, TablePersistence};
     use crate::trx::MIN_SNAPSHOT_TS;
     use crate::value::Val;
@@ -1051,10 +1110,7 @@ mod tests {
 
             table.freeze(&session, usize::MAX).await;
             let mut checkpoint_session = engine.try_new_session().unwrap();
-            table
-                .data_checkpoint(&mut checkpoint_session)
-                .await
-                .unwrap();
+            table.checkpoint(&mut checkpoint_session).await.unwrap();
             let root_after_checkpoint = table.file().active_root();
             assert!(root_after_checkpoint.heap_redo_start_ts > catalog_replay_start_ts);
 
@@ -1164,10 +1220,7 @@ mod tests {
 
             table.freeze(&session, usize::MAX).await;
             let mut checkpoint_session = engine.try_new_session().unwrap();
-            table
-                .data_checkpoint(&mut checkpoint_session)
-                .await
-                .unwrap();
+            table.checkpoint(&mut checkpoint_session).await.unwrap();
             let root_after_checkpoint = table.file().active_root();
             assert!(root_after_checkpoint.heap_redo_start_ts > catalog_replay_start_ts);
 
@@ -1225,6 +1278,175 @@ mod tests {
 
             stmt.succeed().commit().await.unwrap();
 
+            drop(table);
+            drop(session);
+            drop(engine);
+        })
+    }
+
+    #[test]
+    fn test_log_recover_skips_checkpointed_and_replays_newer_cold_deletes() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let main_dir = temp_dir.path().to_path_buf();
+            let engine = EngineConfig::default()
+                .storage_root(main_dir.clone())
+                .data_buffer(
+                    EvictableBufferPoolConfig::default()
+                        .role(PoolRole::Mem)
+                        .max_mem_size(64usize * 1024 * 1024)
+                        .max_file_size(128usize * 1024 * 1024),
+                )
+                .trx(
+                    TrxSysConfig::default()
+                        .log_file_stem("recover10")
+                        .skip_recovery(false),
+                )
+                .build()
+                .await
+                .unwrap();
+
+            let mut session = engine.try_new_session().unwrap();
+            let table_id = session
+                .create_table(
+                    TableSpec::new(vec![ColumnSpec::new(
+                        "id",
+                        ValKind::U32,
+                        ColumnAttributes::empty(),
+                    )]),
+                    vec![IndexSpec::new(
+                        "idx_t10_pk",
+                        vec![IndexKey::new(0)],
+                        IndexAttributes::PK,
+                    )],
+                )
+                .await
+                .unwrap();
+
+            engine
+                .catalog()
+                .checkpoint_now(&engine.trx_sys)
+                .await
+                .unwrap();
+
+            let table = engine.catalog().get_table(table_id).await.unwrap();
+            let mut trx = session.try_begin_trx().unwrap().unwrap();
+            for i in 0..10u32 {
+                let mut stmt = trx.start_stmt();
+                let insert = stmt.insert_row(&table, vec![Val::from(i)]).await;
+                assert!(matches!(insert, Ok(InsertMvcc::Inserted(_))));
+                trx = stmt.succeed();
+            }
+            trx.commit().await.unwrap();
+
+            table.freeze(&session, usize::MAX).await;
+            let mut checkpoint_session = engine.try_new_session().unwrap();
+            table.checkpoint(&mut checkpoint_session).await.unwrap();
+
+            let mut trx = session.try_begin_trx().unwrap().unwrap();
+            let key0 = SelectKey::new(0, vec![Val::from(0u32)]);
+            let mut stmt = trx.start_stmt();
+            let delete = stmt.delete_row(&table, &key0).await;
+            assert!(matches!(delete, Ok(DeleteMvcc::Deleted)));
+            trx = stmt.succeed();
+            trx.commit().await.unwrap();
+
+            let marker0_ts = match table.deletion_buffer().get(0).unwrap() {
+                DeleteMarker::Committed(ts) => ts,
+                DeleteMarker::Ref(status) => status.ts(),
+            };
+            let trx_sys = session.engine().trx_sys.clone();
+            let mut ready = false;
+            for _ in 0..50 {
+                if trx_sys.calc_min_active_sts_for_gc() > marker0_ts {
+                    ready = true;
+                    break;
+                }
+                smol::Timer::after(std::time::Duration::from_millis(20)).await;
+            }
+            assert!(
+                ready,
+                "deletion marker ts {} not yet below checkpoint cutoff",
+                marker0_ts
+            );
+            table.checkpoint(&mut checkpoint_session).await.unwrap();
+            let checkpointed_cutoff = table.file().active_root().deletion_cutoff_ts;
+            assert!(checkpointed_cutoff > marker0_ts);
+
+            let mut trx = session.try_begin_trx().unwrap().unwrap();
+            let key1 = SelectKey::new(0, vec![Val::from(1u32)]);
+            let mut stmt = trx.start_stmt();
+            let delete = stmt.delete_row(&table, &key1).await;
+            assert!(matches!(delete, Ok(DeleteMvcc::Deleted)));
+            trx = stmt.succeed();
+            trx.commit().await.unwrap();
+            let marker1_ts = match table.deletion_buffer().get(1).unwrap() {
+                DeleteMarker::Committed(ts) => ts,
+                DeleteMarker::Ref(status) => status.ts(),
+            };
+            assert!(marker1_ts >= checkpointed_cutoff);
+
+            let mut trx = session.try_begin_trx().unwrap().unwrap();
+            let mut stmt = trx.start_stmt();
+            let insert = stmt.insert_row(&table, vec![Val::from(100u32)]).await;
+            assert!(matches!(insert, Ok(InsertMvcc::Inserted(_))));
+            trx = stmt.succeed();
+            trx.commit().await.unwrap();
+
+            drop(trx_sys);
+            drop(table);
+            drop(checkpoint_session);
+            drop(session);
+            drop(engine);
+
+            let engine = EngineConfig::default()
+                .storage_root(main_dir)
+                .data_buffer(
+                    EvictableBufferPoolConfig::default()
+                        .role(PoolRole::Mem)
+                        .max_mem_size(64usize * 1024 * 1024)
+                        .max_file_size(128usize * 1024 * 1024),
+                )
+                .trx(
+                    TrxSysConfig::default()
+                        .log_file_stem("recover10")
+                        .skip_recovery(false),
+                )
+                .build()
+                .await
+                .unwrap();
+
+            let table = engine.catalog().get_table(table_id).await.unwrap();
+            assert_eq!(
+                table.file().active_root().deletion_cutoff_ts,
+                checkpointed_cutoff
+            );
+            assert!(table.deletion_buffer().get(0).is_none());
+            match table.deletion_buffer().get(1).unwrap() {
+                DeleteMarker::Committed(ts) => assert_eq!(ts, marker1_ts),
+                DeleteMarker::Ref(_) => panic!("recovered cold delete should be committed"),
+            }
+
+            let mut session = engine.try_new_session().unwrap();
+            let trx = session.try_begin_trx().unwrap().unwrap();
+            let stmt = trx.start_stmt();
+
+            let row0 = stmt
+                .select_row_mvcc(&table, &SelectKey::new(0, vec![Val::from(0u32)]), &[0])
+                .await;
+            assert!(matches!(row0, Ok(SelectMvcc::NotFound)));
+
+            let row1 = stmt
+                .select_row_mvcc(&table, &SelectKey::new(0, vec![Val::from(1u32)]), &[0])
+                .await;
+            assert!(matches!(row1, Ok(SelectMvcc::NotFound)));
+
+            let row100 = stmt
+                .select_row_mvcc(&table, &SelectKey::new(0, vec![Val::from(100u32)]), &[0])
+                .await;
+            assert_eq!(row100.unwrap().unwrap_found(), vec![Val::from(100u32)]);
+
+            stmt.succeed().commit().await.unwrap();
             drop(table);
             drop(session);
             drop(engine);
@@ -1322,7 +1544,7 @@ mod tests {
             checkpointed_table.freeze(&session, usize::MAX).await;
             let mut checkpoint_session = engine.try_new_session().unwrap();
             checkpointed_table
-                .data_checkpoint(&mut checkpoint_session)
+                .checkpoint(&mut checkpoint_session)
                 .await
                 .unwrap();
 
@@ -1492,10 +1714,7 @@ mod tests {
 
             table.freeze(&session, usize::MAX).await;
             let mut checkpoint_session = engine.try_new_session().unwrap();
-            table
-                .data_checkpoint(&mut checkpoint_session)
-                .await
-                .unwrap();
+            table.checkpoint(&mut checkpoint_session).await.unwrap();
 
             let active_root = table.file().active_root();
             let block_id = {
@@ -1614,10 +1833,7 @@ mod tests {
 
             table.freeze(&session, usize::MAX).await;
             let mut checkpoint_session = engine.try_new_session().unwrap();
-            table
-                .checkpoint_for_new_data(&mut checkpoint_session)
-                .await
-                .unwrap();
+            table.checkpoint(&mut checkpoint_session).await.unwrap();
 
             let mut trx = session.try_begin_trx().unwrap().unwrap();
             for i in 0..64u32 {
@@ -1657,10 +1873,7 @@ mod tests {
             trx.commit().await.unwrap();
 
             table.freeze(&session, usize::MAX).await;
-            table
-                .data_checkpoint(&mut checkpoint_session)
-                .await
-                .unwrap();
+            table.checkpoint(&mut checkpoint_session).await.unwrap();
 
             let active_root = table.file().active_root();
             let blob_ref = {

@@ -71,7 +71,7 @@ The active `MetaBlock` stores:
 - page allocation state
 - `pivot_row_id`
 - `heap_redo_start_ts`
-- `deletion_rec_cts`
+- `deletion_cutoff_ts`
 - checkpoint transaction id / publication timestamp
 - GC list of obsolete pages
 
@@ -121,11 +121,12 @@ rows are represented through:
 
 ## 7. Checkpoint Publication
 
-There is one atomic publication mechanism, but two kinds of table checkpoint
-work can trigger it:
+There is one atomic publication mechanism. A `checkpoint()` run may publish
+new data, cold-delete state, metadata-only replay-boundary advancement, or a
+combination of those changes:
 
-1. data checkpoint
-2. deletion checkpoint
+1. data checkpoint work
+2. deletion checkpoint work
 
 Secondary-index `DiskTree` updates are companion work of those checkpoints, not
 an independent third checkpoint stream.
@@ -146,7 +147,11 @@ Deletion checkpoint publishes:
 
 - new persistent delete metadata
 - updated secondary-index `DiskTree` roots for the deleted cold rows
-- updated `deletion_rec_cts`
+- updated `deletion_cutoff_ts`
+
+If no cold-delete payload changes are selected, checkpoint can still publish a
+metadata-only root that advances `deletion_cutoff_ts` to the checkpoint
+`cutoff_ts`.
 
 ### 7.3 Generic Publish Flow
 
@@ -169,7 +174,7 @@ On restart, the table file supplies:
 Redo recovery then rebuilds only the missing hot state:
 
 - hot RowStore pages from `heap_redo_start_ts`
-- post-checkpoint cold deletes from `deletion_rec_cts`
+- post-checkpoint cold deletes from `deletion_cutoff_ts`
 - hot secondary-index `MemTree` state from normal row redo
 
 ## 9. Summary

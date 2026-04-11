@@ -120,7 +120,7 @@ The process moves committed deletions from memory to disk. Crucially, the **Syst
 *   **Lock**: Acquire `SuperBlock Lock`.
 *   **New MetaBlock**: Create a new `MetaBlock`.
     *   Update `BlockIndexRoot` (if changed).
-    *   **Crucial Update**: Set `Table.watermarks.deletion_rec_ts = Checkpoint_STS`.
+    *   **Crucial Update**: Set `Table.watermarks.deletion_cutoff_ts = Checkpoint_STS`.
     *   *Note*: This is set to the system timestamp acquired in Phase 1, regardless of the actual data timestamps.
 *   **Persist**: Write MetaBlock to disk.
 *   **Switch**: Update `SuperBlock` to point to the new MetaBlock.
@@ -129,7 +129,7 @@ The process moves committed deletions from memory to disk. Crucially, the **Syst
 
 To prevent "cold" tables (tables with no recent deletions) from blocking the global truncation of the Redo Log, the system implements a Heartbeat mechanism.
 
-*   **Problem**: If we relied on data timestamps (`Batch_Max_CTS`) for the watermark, a table with no writes would keep its `deletion_rec_ts` stuck in the past. The Log Manager cannot truncate logs older than `min(All_Tables.rec_cts)`, leading to disk exhaustion.
+*   **Problem**: If we relied on data timestamps (`Batch_Max_CTS`) for the watermark, a table with no writes would keep its `deletion_cutoff_ts` stuck in the past. The Log Manager cannot truncate logs older than the minimum table replay boundary, leading to disk exhaustion.
 *   **Trigger**:
     *   Periodic timer (e.g., every minute) IF no regular Deletion Checkpoint has occurred.
     *   Or triggered explicitly by the Log Manager when log usage is high.
@@ -137,7 +137,7 @@ To prevent "cold" tables (tables with no recent deletions) from blocking the glo
     1.  Acquire `Checkpoint_STS`.
     2.  Verify `ColumnDeletionBuffer` has no pending commits with `CTS <= Checkpoint_STS`.
     3.  **Fast Path**: Skip Phases 2 and 3 (No Data I/O).
-    4.  **Meta Update**: Directly generate a new MetaBlock with `deletion_rec_ts = Checkpoint_STS` and perform the SuperBlock switch.
+    4.  **Meta Update**: Directly generate a new MetaBlock with `deletion_cutoff_ts = Checkpoint_STS` and perform the SuperBlock switch.
 *   **Result**: The watermark advances, allowing the Log Manager to safely discard old logs.
 
 ## 5. Garbage Collection (Memory Cleanup)
@@ -157,15 +157,15 @@ Memory entries are retained after the checkpoint to provide MVCC visibility (Und
 
 ## 6. Crash Recovery
 
-Recovery relies on the `deletion_rec_ts` as a strict **Persistence Barrier**.
+Recovery relies on `deletion_cutoff_ts` as an exclusive **Persistence Barrier**.
 
 1.  **Load State**: Read the latest valid MetaBlock from SuperBlock.
 2.  **Determine Replay Start**:
-    *   Retrieve `Replay_Start_CTS = MetaBlock.deletion_rec_ts`.
-    *   This timestamp guarantees that **any** transaction with `CTS <= Replay_Start_CTS` has already been processed (either persisted to the Bitmap or confirmed non-existent).
+    *   Retrieve `Deletion_Cutoff_TS = MetaBlock.deletion_cutoff_ts`.
+    *   This timestamp guarantees that cold-row deletes with `cts < Deletion_Cutoff_TS` and `row_id < pivot_row_id` have already been processed (either persisted to the Bitmap or confirmed non-existent).
 3.  **Log Replay**:
-    *   The Log Reader scans entries starting from `Replay_Start_CTS`.
-    *   **Filter**: Only replay delete operations where `Entry.CTS > Replay_Start_CTS`.
+    *   The Log Reader scans entries starting from the coarse global replay floor.
+    *   **Filter**: Only replay cold-row delete operations where `row_id < pivot_row_id` and `Entry.CTS >= Deletion_Cutoff_TS`.
     *   **Action**: Insert these replayed entries into the `ColumnDeletionBuffer`.
 4.  **Consistency**:
     *   The system is now consistent. The on-disk Bitmap acts as the base state, and the `ColumnDeletionBuffer` contains the "tail" of deletions that occurred after the last checkpoint (Heartbeat or Data) but before the crash.

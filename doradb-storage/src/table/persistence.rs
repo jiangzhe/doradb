@@ -16,19 +16,27 @@ pub trait TablePersistence {
     /// Freeze row pages and return approximate non-deleted rows visited.
     fn freeze(&self, session: &Session, max_rows: usize) -> impl Future<Output = usize>;
 
-    /// Convert frozen row pages to LWC blocks and persist to table file.
-    fn checkpoint_for_new_data(&self, session: &mut Session) -> impl Future<Output = Result<()>>;
-
-    /// Persist committed cold-row deletions from memory to column block index.
-    fn checkpoint_for_deletion(&self, session: &mut Session) -> impl Future<Output = Result<()>>;
-
-    /// Combined checkpoint that persists both new data and deletions in one run.
-    fn data_checkpoint(&self, session: &mut Session) -> impl Future<Output = Result<()>>;
+    /// Persist eligible row-store and cold-delete state in one checkpoint run.
+    fn checkpoint(&self, session: &mut Session) -> impl Future<Output = Result<()>>;
 }
 
 #[derive(Clone, Copy)]
 struct BlockPatchSeed {
     entry: ColumnLeafEntry,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DeletionCheckpointOutcome {
+    NoOp,
+    MetadataOnly,
+    PayloadChanged,
+}
+
+impl DeletionCheckpointOutcome {
+    #[inline]
+    fn changed(self) -> bool {
+        !matches!(self, Self::NoOp)
+    }
 }
 
 impl Table {
@@ -120,19 +128,20 @@ impl Table {
             }
         }
 
-        // Step 7: merge committed cold-row deletions into column index payloads.
+        // Step 7: merge committed cold-row deletions into column index payloads
+        // and publish the durable cold-delete replay watermark.
         if include_deletion {
-            let changed = match self
+            let outcome = match self
                 .apply_deletion_checkpoint(&mut mutable_file, cutoff_ts, checkpoint_ts)
                 .await
             {
-                Ok(changed) => changed,
+                Ok(outcome) => outcome,
                 Err(err) => {
                     trx_sys.rollback(trx).await?;
                     return Err(err);
                 }
             };
-            table_file_changed |= changed;
+            table_file_changed |= outcome.changed();
         }
 
         // Step 8: rollback no-op checkpoint transactions to avoid empty commits.
@@ -172,14 +181,25 @@ impl Table {
         mutable_file: &mut MutableTableFile,
         cutoff_ts: TrxID,
         checkpoint_ts: TrxID,
-    ) -> Result<bool> {
+    ) -> Result<DeletionCheckpointOutcome> {
         let disk_pool = self.disk_pool();
         let disk_pool_guard = disk_pool.pool_guard();
+        let (column_block_index_root, pivot_row_id, deletion_cutoff_ts) = {
+            let root = mutable_file.root();
+            (
+                root.column_block_index_root,
+                root.pivot_row_id,
+                root.deletion_cutoff_ts,
+            )
+        };
+        let cutoff_advanced = cutoff_ts > deletion_cutoff_ts;
         // Step 1: ensure there is a persisted column index to patch.
-        let mutable_root = mutable_file.root();
-        if mutable_root.column_block_index_root == SUPER_BLOCK_ID || mutable_root.pivot_row_id == 0
-        {
-            return Ok(false);
+        if column_block_index_root == SUPER_BLOCK_ID || pivot_row_id == 0 {
+            if cutoff_advanced {
+                mutable_file.advance_deletion_cutoff_ts(cutoff_ts);
+                return Ok(DeletionCheckpointOutcome::MetadataOnly);
+            }
+            return Ok(DeletionCheckpointOutcome::NoOp);
         }
 
         // Step 2: pick committed deletion markers that are visible at cutoff.
@@ -188,9 +208,13 @@ impl Table {
         // introducing parallel marker selection and parallel sort/merge while
         // preserving deterministic ordering before patch application.
         let mut selected_row_ids = self.deletion_buffer().collect_committed_before(cutoff_ts);
-        selected_row_ids.retain(|row_id| *row_id < mutable_root.pivot_row_id);
+        selected_row_ids.retain(|row_id| *row_id < pivot_row_id);
         if selected_row_ids.is_empty() {
-            return Ok(false);
+            if cutoff_advanced {
+                mutable_file.advance_deletion_cutoff_ts(cutoff_ts);
+                return Ok(DeletionCheckpointOutcome::MetadataOnly);
+            }
+            return Ok(DeletionCheckpointOutcome::NoOp);
         }
         selected_row_ids.sort_unstable();
         selected_row_ids.dedup();
@@ -201,8 +225,8 @@ impl Table {
         // 2) when roaring bitmap encoding is introduced, also fetch the target LWC block
         //    row-id array to map each input row-id to the correct offset-based bit index.
         let column_index = ColumnBlockIndex::new(
-            mutable_root.column_block_index_root,
-            mutable_root.pivot_row_id,
+            column_block_index_root,
+            pivot_row_id,
             self.file().file_kind(),
             self.file().sparse_file(),
             disk_pool,
@@ -227,7 +251,11 @@ impl Table {
             entry.1.insert(delta);
         }
         if grouped.is_empty() {
-            return Ok(false);
+            if cutoff_advanced {
+                mutable_file.advance_deletion_cutoff_ts(cutoff_ts);
+                return Ok(DeletionCheckpointOutcome::MetadataOnly);
+            }
+            return Ok(DeletionCheckpointOutcome::NoOp);
         }
 
         // Step 4: load authoritative persisted deltas and merge pending row-id deltas.
@@ -242,7 +270,11 @@ impl Table {
             patch_storage.push((start_row_id, base.into_iter().collect()));
         }
         if patch_storage.is_empty() {
-            return Ok(false);
+            if cutoff_advanced {
+                mutable_file.advance_deletion_cutoff_ts(cutoff_ts);
+                return Ok(DeletionCheckpointOutcome::MetadataOnly);
+            }
+            return Ok(DeletionCheckpointOutcome::NoOp);
         }
 
         // Step 5: apply typed delete rewrites and advance the index root in the mutable file.
@@ -257,7 +289,8 @@ impl Table {
             .batch_replace_delete_deltas(mutable_file, &patches, checkpoint_ts)
             .await?;
         mutable_file.set_column_block_index_root(new_root);
-        Ok(true)
+        mutable_file.advance_deletion_cutoff_ts(cutoff_ts);
+        Ok(DeletionCheckpointOutcome::PayloadChanged)
     }
 }
 
@@ -278,17 +311,7 @@ impl TablePersistence for Table {
         rows
     }
 
-    async fn checkpoint_for_new_data(&self, session: &mut Session) -> Result<()> {
-        // Run only the new-data phase.
-        self.run_checkpoint(session, true, false).await
-    }
-
-    async fn checkpoint_for_deletion(&self, session: &mut Session) -> Result<()> {
-        // Run only the deletion phase.
-        self.run_checkpoint(session, false, true).await
-    }
-
-    async fn data_checkpoint(&self, session: &mut Session) -> Result<()> {
+    async fn checkpoint(&self, session: &mut Session) -> Result<()> {
         // Run both new-data and deletion phases in one combined checkpoint.
         self.run_checkpoint(session, true, true).await
     }

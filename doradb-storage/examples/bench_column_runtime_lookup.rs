@@ -115,7 +115,7 @@ async fn build_case(
         delete_rows(&table, &mut session, rows, sparse_stride).await;
     }
     table.freeze(&session, usize::MAX).await;
-    table.data_checkpoint(&mut session).await.unwrap();
+    table.checkpoint(&mut session).await.unwrap();
     drop(session);
 
     let keys = live_keys(rows, sparse, sparse_stride);

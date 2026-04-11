@@ -44,12 +44,12 @@ Why it is separate:
 
 ### 2.2 Deletion Boundary
 
-Cold-row deletion recovery is controlled by `Deletion_Rec_CTS`.
+Cold-row deletion recovery is controlled by `deletion_cutoff_ts`.
 
 Definition:
 
-- the maximum commit timestamp such that all cold-row deletions with
-  `CTS <= Deletion_Rec_CTS` have been persisted into delete bitmaps
+- the exclusive commit-timestamp cutoff such that cold-row deletions with
+  `cts < deletion_cutoff_ts` are already covered by durable delete state
 
 Purpose:
 
@@ -89,7 +89,8 @@ Table checkpoint has two persistence responsibilities:
 2. persist committed cold-row deletes into delete bitmaps
 
 Secondary-index persistence happens as companion work of those same checkpoint
-operations.
+operations. The public table checkpoint API is a single `checkpoint()` call
+that runs eligible data and deletion work in one publication flow.
 
 ### 4.1 Data Checkpoint
 
@@ -132,7 +133,8 @@ Deletion checkpoint persists committed cold-row deletes.
 #### Selection Rule
 
 1. acquire a checkpoint cutoff timestamp
-2. select deletion-buffer entries for cold rows with `CTS < cutoff`
+2. select deletion-buffer entries where `row_id < pivot_row_id` and
+   `cts < cutoff`
 
 #### Persistence Workflow
 
@@ -144,10 +146,13 @@ Deletion checkpoint persists committed cold-row deletes.
 6. publish one new table checkpoint root that contains:
    - updated delete bitmaps
    - updated `DiskTree` roots
-   - updated `Deletion_Rec_CTS`
+   - updated `deletion_cutoff_ts = cutoff`
 
 This guarantees that persisted cold-row deletes and persisted cold secondary
 index removals become durable together.
+
+If no delete bitmap changes are selected, checkpoint can still publish a
+metadata-only root to advance `deletion_cutoff_ts` to the checkpoint cutoff.
 
 ### 4.3 No Independent Index Checkpoint
 
@@ -164,11 +169,11 @@ index prefix without extra machinery.
 
 ### 5.1 Coarse Replay Floor
 
-Current recovery still computes a coarse replay floor from:
+Recovery computes a coarse replay floor from:
 
-$$ W = \min \left( \text{catalog\_replay\_start\_ts}, \min_{\forall T \in \text{Loaded User Tables}}(T.\text{Heap\_Redo\_Start\_TS}) \right) $$
+$$ W = \min \left( \text{catalog\_replay\_start\_ts}, \min_{\forall T \in \text{Loaded User Tables}}(T.\text{heap\_redo\_start\_ts}), \min_{\forall T \in \text{Loaded User Tables}}(T.\text{deletion\_cutoff\_ts}) \right) $$
 
-This only skips redo that is definitely older than every loaded hot heap
+This only skips redo that is definitely older than every loaded replay
 boundary. Finer replay rules are still applied afterward.
 
 ### 5.2 Metadata Load
@@ -196,8 +201,8 @@ For each redo record after the coarse replay floor:
   - row replay also rebuilds hot secondary-index `MemTree` state through the
     normal row/index update logic
 - Cold-row deletions:
-  - replay if the row belongs to persistent storage and
-    `CTS > Deletion_Rec_CTS`
+  - replay if `row_id < pivot_row_id` and
+    `cts >= deletion_cutoff_ts`
   - insert those deletes into the in-memory deletion buffer
 
 There is no extra per-index replay predicate.
@@ -254,10 +259,10 @@ $$ \text{Entry.CTS} < \text{Global\_Min\_Active\_STS} $$
 
 The checkpoint/recovery design is built around three ideas:
 
-1. `Heap_Redo_Start_TS` remains the hot-heap recovery boundary.
-2. `Deletion_Rec_CTS` remains the cold-delete recovery boundary.
+1. `heap_redo_start_ts` remains the hot-heap recovery boundary.
+2. `deletion_cutoff_ts` remains the cold-delete recovery boundary.
 3. Secondary-index `DiskTree` state is published only as a companion of table
-   data/deletion checkpoint, so there is no `Index_Rec_CTS`.
+   data/deletion checkpoint, so there is no `index_rec_cts`.
 
 This keeps restart simple and aligned with Doradb's current runtime contract:
 

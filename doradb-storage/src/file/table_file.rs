@@ -24,7 +24,7 @@ use crate::io::{DirectBuf, IOBuf, IOClient};
 use crate::quiescent::QuiescentGuard;
 use crate::row::RowID;
 use crate::serde::{Deser, Ser};
-use crate::trx::TrxID;
+use crate::trx::{MIN_SNAPSHOT_TS, TrxID};
 use futures::future::try_join_all;
 use std::mem;
 use std::sync::Arc;
@@ -57,6 +57,8 @@ pub struct TableMeta {
     pub pivot_row_id: RowID,
     /// Redo log start point for in-memory heap.
     pub heap_redo_start_ts: TrxID,
+    /// Redo log start point for cold-row deletions.
+    pub deletion_cutoff_ts: TrxID,
 }
 
 /// Active root type of table files.
@@ -84,6 +86,7 @@ impl ActiveRoot {
                 column_block_index_root: SUPER_BLOCK_ID,
                 pivot_row_id: 0,
                 heap_redo_start_ts: trx_id,
+                deletion_cutoff_ts: trx_id.max(MIN_SNAPSHOT_TS),
             },
         )
     }
@@ -114,6 +117,7 @@ impl ActiveRoot {
             &self.gc_block_list,
             self.pivot_row_id,
             self.heap_redo_start_ts,
+            self.deletion_cutoff_ts,
         )
     }
 }
@@ -143,6 +147,7 @@ fn parse_table_meta_block(page_id: BlockID, buf: &[u8]) -> Result<ParsedMeta<Tab
             column_block_index_root: meta_block.column_block_index_root,
             pivot_row_id: meta_block.pivot_row_id,
             heap_redo_start_ts: meta_block.heap_redo_start_ts,
+            deletion_cutoff_ts: meta_block.deletion_cutoff_ts,
         },
         alloc_map: meta_block.alloc_map,
         gc_block_list: meta_block.gc_block_list,
@@ -402,6 +407,15 @@ impl MutableTableFile {
         root.pivot_row_id = pivot_row_id;
         root.heap_redo_start_ts = heap_redo_start_ts;
         Ok(())
+    }
+
+    /// Advances mutable root cold-delete replay watermark without regressing it.
+    #[inline]
+    pub fn advance_deletion_cutoff_ts(&mut self, deletion_cutoff_ts: TrxID) {
+        let root = self.new_root_mut();
+        if deletion_cutoff_ts > root.deletion_cutoff_ts {
+            root.deletion_cutoff_ts = deletion_cutoff_ts;
+        }
     }
 
     /// Allocate a new block id for copy-on-write updates.
@@ -913,6 +927,7 @@ mod tests {
             assert_eq!(active_root.trx_id, 2);
             assert_eq!(active_root.pivot_row_id, 20);
             assert_eq!(active_root.heap_redo_start_ts, 7);
+            assert_eq!(active_root.deletion_cutoff_ts, 1);
             assert_ne!(active_root.column_block_index_root, SUPER_BLOCK_ID);
             let disk_pool = table_readonly_pool(&global, 43, &table_file);
             let disk_pool_guard = disk_pool.pool_guard();
@@ -974,6 +989,7 @@ mod tests {
             let active_root = table_file.active_root();
             assert_eq!(active_root.pivot_row_id, 0);
             assert_eq!(active_root.column_block_index_root, SUPER_BLOCK_ID);
+            assert_eq!(active_root.deletion_cutoff_ts, 1);
 
             drop(table_file);
             drop(fs);
