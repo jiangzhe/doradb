@@ -446,31 +446,6 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
     }
 
     #[inline]
-    fn cold_delete_marker_is_globally_purgeable(
-        &self,
-        row_id: RowID,
-        min_active_sts: TrxID,
-    ) -> bool {
-        let Some(deletion_buffer) = self.deletion_buffer() else {
-            return false;
-        };
-        let Some(marker) = deletion_buffer.get(row_id) else {
-            return false;
-        };
-        let delete_cts = match marker {
-            DeleteMarker::Committed(ts) => ts,
-            DeleteMarker::Ref(status) => {
-                let ts = status.ts();
-                if !trx_is_committed(ts) {
-                    return false;
-                }
-                ts
-            }
-        };
-        delete_cts < min_active_sts
-    }
-
-    #[inline]
     async fn persisted_lwc_key_differs(
         &self,
         guards: &PoolGuards,
@@ -502,7 +477,9 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
         // secondary-index entry. A cold delete marker proves that every key for
         // the row is unreachable only after its transaction is committed and
         // older than the current purge horizon.
-        if self.cold_delete_marker_is_globally_purgeable(row_id, min_active_sts) {
+        if self.deletion_buffer().is_some_and(|deletion_buffer| {
+            deletion_buffer.delete_marker_is_globally_purgeable(row_id, min_active_sts)
+        }) {
             return Ok(IndexPurgeDecision::Delete);
         }
 

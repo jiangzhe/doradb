@@ -272,7 +272,9 @@ impl TransactionSystem {
         let mut table_cache = TableCache::new(&self.catalog);
         if trx
             .index_undo
-            .rollback(&mut table_cache, &pool_guards, trx.sts)
+            .rollback(&mut table_cache, &pool_guards, trx.sts, || {
+                self.calc_min_active_sts_for_gc()
+            })
             .await
             .is_err()
         {
@@ -324,7 +326,9 @@ impl TransactionSystem {
         }
         if payload
             .index_undo
-            .rollback(&mut table_cache, &pool_guards, payload.sts)
+            .rollback(&mut table_cache, &pool_guards, payload.sts, || {
+                self.calc_min_active_sts_for_gc()
+            })
             .await
             .is_err()
         {

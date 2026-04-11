@@ -1163,6 +1163,130 @@ fn test_lwc_update_unique_claim_rollback_restores_deleted_cold_owner() {
 }
 
 #[test]
+fn test_lwc_update_unique_claim_rollback_drops_purgeable_deleted_cold_owner() {
+    smol::block_on(async {
+        let sys = TestSys::new_evictable().await;
+        let mut session = sys.try_new_session().unwrap();
+        insert_rows(&sys, &mut session, 1, 2, "name").await;
+        sys.table.freeze(&session, usize::MAX).await;
+        sys.table.checkpoint(&mut session).await.unwrap();
+
+        let old_key = single_key(1i32);
+        let claimed_key = single_key(2i32);
+        let reader = session.try_begin_trx().unwrap().unwrap();
+        let claimed_row_id =
+            assert_row_in_lwc(&sys.table, session.pool_guards(), &claimed_key, reader.sts).await;
+        reader.commit().await.unwrap();
+
+        let index = sys.table.sec_idx()[claimed_key.index_no].unique().unwrap();
+        assert!(
+            index
+                .mask_as_deleted(
+                    session.pool_guards().index_guard(),
+                    &claimed_key.vals,
+                    claimed_row_id,
+                    MAX_SNAPSHOT_TS,
+                )
+                .await
+                .unwrap()
+        );
+        let delete_cts = 1;
+        sys.table
+            .deletion_buffer()
+            .put_committed(claimed_row_id, delete_cts)
+            .unwrap();
+        sys.new_trx_select_not_found(&mut session, &claimed_key)
+            .await;
+
+        let writer = session.try_begin_trx().unwrap().unwrap();
+        assert!(delete_cts < writer.sts);
+        assert!(
+            sys.table
+                .deletion_buffer()
+                .delete_marker_is_globally_purgeable(claimed_row_id, writer.sts)
+        );
+        let mut stmt = writer.start_stmt();
+        let res = stmt
+            .update_row(
+                &sys.table,
+                &old_key,
+                vec![
+                    UpdateCol {
+                        idx: 0,
+                        val: Val::from(2i32),
+                    },
+                    UpdateCol {
+                        idx: 1,
+                        val: Val::from("claimed"),
+                    },
+                ],
+            )
+            .await;
+        let new_row_id = match res {
+            Ok(UpdateMvcc::Updated(row_id)) => row_id,
+            other => panic!("expected update success, got {other:?}"),
+        };
+        assert_unique_index_entry(
+            &sys.table,
+            session.pool_guards(),
+            &claimed_key,
+            stmt.trx.sts,
+            new_row_id,
+            false,
+        )
+        .await;
+        assert!(matches!(
+            sys.table
+                .find_row(session.pool_guards(), claimed_row_id)
+                .await,
+            RowLocation::LwcBlock { .. }
+        ));
+
+        // This is the stale GC attempt from the original delete. While the
+        // replacement claim owns the unique key, GC observes a row-id mismatch
+        // and skips the entry, so rollback must not recreate that skipped
+        // delete-masked owner.
+        let deleted = sys
+            .table
+            .accessor()
+            .delete_index(
+                session.pool_guards(),
+                &claimed_key,
+                claimed_row_id,
+                true,
+                MAX_SNAPSHOT_TS,
+            )
+            .await
+            .unwrap();
+        assert!(!deleted);
+
+        let writer = stmt.succeed();
+        writer.rollback().await.unwrap();
+
+        assert!(
+            index
+                .lookup(
+                    session.pool_guards().index_guard(),
+                    &claimed_key.vals,
+                    MAX_SNAPSHOT_TS,
+                )
+                .await
+                .unwrap()
+                .is_none()
+        );
+        sys.new_trx_select(&mut session, &old_key, |vals| {
+            assert_eq!(vals, vec![Val::from(1i32), Val::from("name")]);
+        })
+        .await;
+        sys.new_trx_select_not_found(&mut session, &claimed_key)
+            .await;
+
+        drop(session);
+        sys.clean_all();
+    });
+}
+
+#[test]
 fn test_checkpoint_persists_committed_cold_delete_markers() {
     smol::block_on(async {
         let sys = TestSys::new_evictable().await;

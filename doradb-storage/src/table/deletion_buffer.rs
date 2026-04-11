@@ -110,6 +110,40 @@ impl ColumnDeletionBuffer {
         self.entries.get(&row_id).map(|entry| entry.value().clone())
     }
 
+    #[inline]
+    pub fn delete_marker_is_globally_purgeable(
+        &self,
+        row_id: RowID,
+        min_active_sts: TrxID,
+    ) -> bool {
+        self.delete_marker_is_globally_purgeable_with(row_id, || min_active_sts)
+    }
+
+    #[inline]
+    pub fn delete_marker_is_globally_purgeable_with<F>(
+        &self,
+        row_id: RowID,
+        min_active_sts: F,
+    ) -> bool
+    where
+        F: FnOnce() -> TrxID,
+    {
+        let Some(marker) = self.get(row_id) else {
+            return false;
+        };
+        let delete_cts = match marker {
+            DeleteMarker::Committed(ts) => ts,
+            DeleteMarker::Ref(status) => {
+                let ts = status.ts();
+                if !trx_is_committed(ts) {
+                    return false;
+                }
+                ts
+            }
+        };
+        delete_cts < min_active_sts()
+    }
+
     /// Snapshot row ids whose delete marker is committed and
     /// `previous_cutoff <= cts < current_cutoff`.
     pub fn collect_committed_in_range(
@@ -139,5 +173,48 @@ impl ColumnDeletionBuffer {
     #[inline]
     pub fn remove(&self, row_id: RowID) {
         self.entries.remove(&row_id);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::trx::MIN_ACTIVE_TRX_ID;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn test_delete_marker_is_globally_purgeable_with_is_lazy() {
+        let buffer = ColumnDeletionBuffer::new();
+        let calls = AtomicUsize::new(0);
+
+        assert!(!buffer.delete_marker_is_globally_purgeable_with(1, || {
+            calls.fetch_add(1, Ordering::SeqCst);
+            100
+        }));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+        buffer
+            .put_ref(1, Arc::new(SharedTrxStatus::new(MIN_ACTIVE_TRX_ID + 1)))
+            .unwrap();
+        assert!(!buffer.delete_marker_is_globally_purgeable_with(1, || {
+            calls.fetch_add(1, Ordering::SeqCst);
+            100
+        }));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+        buffer.remove(1);
+        buffer.put_committed(1, 10).unwrap();
+        assert!(!buffer.delete_marker_is_globally_purgeable_with(1, || {
+            calls.fetch_add(1, Ordering::SeqCst);
+            10
+        }));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        assert!(buffer.delete_marker_is_globally_purgeable_with(1, || {
+            calls.fetch_add(1, Ordering::SeqCst);
+            11
+        }));
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 }
