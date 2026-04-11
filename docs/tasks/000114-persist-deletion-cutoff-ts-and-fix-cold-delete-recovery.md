@@ -1,7 +1,7 @@
 ---
 id: 000114
 title: Persist Deletion_Cutoff_TS And Fix Cold-Delete Recovery
-status: proposal
+status: implemented
 created: 2026-04-10
 github_issue: 543
 ---
@@ -180,6 +180,70 @@ Not applicable. This task should not introduce or modify `unsafe` code.
 
 ## Implementation Notes
 
+- Implemented in PR #544 on branch `delete-cutoff`.
+- Persisted `deletion_cutoff_ts` through table-file metadata, active roots, and
+  mutable root publication:
+  - `MetaBlock` / `MetaBlockSerView` now encode and decode the field.
+  - `TableMeta` and new table roots initialize it to
+    `trx_id.max(MIN_SNAPSHOT_TS)`.
+  - `MutableTableFile::advance_deletion_cutoff_ts` publishes monotonic
+    metadata-only cutoff advancement without regressing earlier roots.
+- Simplified the public table checkpoint API to `checkpoint()` and kept
+  data/deletion phases private inside `run_checkpoint`.
+- Updated deletion checkpoint behavior:
+  - Successful deletion checkpoints advance `deletion_cutoff_ts` to the
+    checkpoint `cutoff_ts`, including metadata-only runs.
+  - Marker selection now uses `[previous_cutoff, current_cutoff)` so stale
+    in-memory markers already covered by the durable cutoff are not reselected
+    when deletion-buffer GC has not yet run.
+  - Eligible markers fail closed with `Error::InvalidState` if
+    `column_block_index_root == SUPER_BLOCK_ID` or `locate_block(row_id)`
+    cannot resolve the persisted row.
+  - Valid empty-column-store checkpoints remain allowed when no eligible marker
+    exists, including the all-inserted-then-all-deleted-before-checkpoint case
+    where `pivot_row_id > 0` and `column_block_index_root == SUPER_BLOCK_ID`.
+- Updated recovery:
+  - `RecoveryTableState` carries both `heap_redo_start_ts` and
+    `deletion_cutoff_ts`.
+  - The coarse recovery replay floor includes catalog replay start, loaded table
+    heap replay starts, and loaded table deletion cutoffs.
+  - Cold-row delete redo is skipped only when
+    `row_id < pivot_row_id && cts < deletion_cutoff_ts`.
+  - Newer cold-row delete redo rebuilds `ColumnDeletionBuffer` state instead of
+    using the hot row-page delete path.
+  - Cold-delete recovery now treats conflicting `AlreadyDeleted` state as
+    `Error::InvalidState` rather than silently ignoring it.
+- Updated living documentation in `docs/checkpoint-and-recovery.md`,
+  `docs/table-file.md`, and `docs/architecture.md` to use
+  `deletion_cutoff_ts` and the unified `checkpoint()` wording.
+- Added and updated regression tests for:
+  - table-file/meta-block round-trip of `deletion_cutoff_ts`;
+  - metadata-only deletion-cutoff checkpoint advancement;
+  - persisted cold-delete checkpoint payloads;
+  - recovery replay floor and mixed table checkpoint states;
+  - skipping checkpointed cold deletes and replaying newer cold deletes;
+  - rejecting invalid cold-delete recovery state;
+  - preserving valid empty-column-store checkpoints;
+  - failing closed for eligible delete markers without a column index;
+  - failing closed when eligible markers cannot be resolved by `locate_block`;
+  - ignoring old markers below `previous_cutoff`;
+  - corrupt persisted delete metadata with a fresh eligible marker after the
+    previous cutoff.
+- Verification completed:
+  - `cargo nextest run -p doradb-storage test_checkpoint_` passed with 14 tests
+    run.
+  - `cargo nextest run -p doradb-storage` passed with 512 tests run and 1
+    ignored test.
+  - Commit hook ran `cargo fmt` and
+    `cargo clippy -p doradb-storage --all-targets -- -D warnings`.
+- Deferred transition-boundary repro:
+  - `test_checkpoint_transition_delete_marker_waits_for_next_cutoff_range` is
+    present but ignored because releasing the old reader currently reaches the
+    existing LWC purge TODO in index cleanup.
+  - The finding was added to
+    `docs/backlogs/000049-purge-crashes-on-checkpointed-rows-in-index-delete-lwc-path.md`
+    instead of creating a duplicate backlog item.
+
 ## Impacts
 
 - `doradb-storage/src/file/meta_block.rs`
@@ -249,9 +313,12 @@ Affected concepts and interfaces:
 
 ## Open Questions
 
-- Initial value choice for a brand-new table root should be fixed explicitly
-  during implementation. The default should be monotonic and should not cause
-  recovery to skip any real cold-row delete that predates the table itself.
-- Later tasks may decide whether deletion-buffer purge, index-delete GC, or log
-  truncation policy need to consume `deletion_cutoff_ts` beyond the recovery and
-  metadata-publication scope defined here.
+- Deletion-buffer GC and persisted marker cleanup remain out of scope for this
+  task. Existing follow-up:
+  `docs/backlogs/000010-column-deletion-buffer-gc-and-persisted-marker-cleanup-policy.md`.
+- LWC index-delete purge remains out of scope. Existing follow-up:
+  `docs/backlogs/000049-purge-crashes-on-checkpointed-rows-in-index-delete-lwc-path.md`.
+  Re-enable `test_checkpoint_transition_delete_marker_waits_for_next_cutoff_range`
+  when that purge gap is implemented.
+- Future log-truncation policy may consume `deletion_cutoff_ts` beyond the
+  recovery and metadata-publication scope implemented here.
