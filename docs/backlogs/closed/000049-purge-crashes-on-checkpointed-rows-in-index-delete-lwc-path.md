@@ -34,3 +34,11 @@ When a backlog item is moved to `docs/backlogs/closed/`, append:
 - Reference: <task/issue/pr reference>
 - Closed At: <YYYY-MM-DD>
 ```
+
+## Close Reason
+
+- Type: implemented
+- Detail: Implemented via docs/tasks/000115-harden-lwc-index-purge-cleanup.md and PR #546.
+- Closed By: backlog close
+- Reference: User decision
+- Closed At: 2026-04-11

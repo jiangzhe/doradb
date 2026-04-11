@@ -237,6 +237,47 @@ Reference:
 
 ## Implementation Notes
 
+- Implemented the GC-only LWC index-purge decision in
+  `doradb-storage/src/table/access.rs`.
+  - `TransactionSystem::purge_trx_list(...)` now passes `min_active_sts` into
+    table-level index cleanup through `TableHandle::delete_index(...)` and
+    `TableAccess::delete_index(...)`.
+  - `TableAccessor` now uses a shared purge decision helper for both unique
+    and non-unique indexes.
+  - The helper uses the cold deletion-buffer fast path only when a marker is
+    committed and `delete_cts < min_active_sts`.
+  - When no globally purgeable marker proves full-row invisibility, the helper
+    resolves storage location: `NotFound` removes the stale entry, `RowPage`
+    keeps the existing undo-chain `any_version_matches_key(...)` protection,
+    and `LwcBlock` decodes only indexed persisted values and removes the purge
+    entry only when the persisted key differs from the purge key.
+- Preserved the unique-index precheck that the delete-marked entry still points
+  at the target `row_id`.
+- Corrected the non-unique purge precheck so the exact `(key, row_id)` entry is
+  removed only when it exists and is delete-marked.
+- Re-enabled
+  `test_checkpoint_transition_delete_marker_waits_for_next_cutoff_range`.
+- Added focused table tests for:
+  - unique LWC marker fast-path cleanup;
+  - unique LWC persisted-key mismatch cleanup and matching-key retention when a
+    later marker is not yet purgeable;
+  - non-unique LWC persisted-key mismatch cleanup and matching-key retention;
+  - stale delete-marked unique cleanup when row lookup returns `NotFound`.
+- Review follow-up checked the LWC projection ordering concern. No code change
+  was required because `PersistedLwcBlock::decode_persisted_row_values(...)`
+  returns values in the requested `read_set` order, and the existing LWC block
+  test covers an unsorted `[1, 0]` projection.
+- Validation completed:
+  - `cargo fmt`
+  - focused `cargo nextest run -p doradb-storage` for the new/re-enabled purge
+    tests
+  - `cargo nextest run -p doradb-storage` (`517` tests passed)
+  - `cargo clippy -p doradb-storage --all-targets -- -D warnings`
+  - `cargo nextest run -p doradb-storage test_lwc_block_decode_persisted_row_values`
+- GitHub issue and PR:
+  - Issue: `#545`
+  - PR: `#546`
+
 ## Impacts
 
 - `doradb-storage/src/trx/purge.rs`
