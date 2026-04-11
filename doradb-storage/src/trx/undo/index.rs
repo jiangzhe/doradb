@@ -1,8 +1,9 @@
 use crate::buffer::{BufferPool, PoolGuards};
 use crate::catalog::{TableCache, TableHandle, TableID};
-use crate::error::Result;
+use crate::error::{BlockCorruptionCause, BlockKind, Error, FileKind, Result};
 use crate::index::util::Maskable;
 use crate::index::{NonUniqueIndex, RowLocation, UniqueIndex};
+use crate::lwc::PersistedLwcBlock;
 use crate::row::ops::SelectKey;
 use crate::row::{RowID, RowRead};
 use crate::table::{ColumnStorage, GenericMemTable};
@@ -141,7 +142,54 @@ impl IndexUndoLogs {
                     // index entry if it is deleted and does not have any old version (already GCed).
                     match table.find_row(guards, old_row_id, storage).await {
                         RowLocation::NotFound => unreachable!(),
-                        RowLocation::LwcBlock { .. } => todo!("lwc block"),
+                        RowLocation::LwcBlock {
+                            block_id,
+                            row_idx,
+                            row_shape_fingerprint,
+                        } => {
+                            // Rollback of a claimed cold unique owner cannot
+                            // latch a row page. Re-read the persisted key and
+                            // restore the index according to the CDB marker.
+                            let new_row_id = entry.row_id;
+                            let index = table.sec_idx()[key.index_no].unique().unwrap();
+                            if !Self::lwc_row_matches_key(
+                                table,
+                                storage,
+                                guards,
+                                &key,
+                                block_id,
+                                row_idx,
+                                row_shape_fingerprint,
+                            )
+                            .await?
+                            {
+                                let res = index
+                                    .compare_delete(
+                                        index_pool_guard,
+                                        &key.vals,
+                                        new_row_id,
+                                        true,
+                                        ts,
+                                    )
+                                    .await?;
+                                assert!(res);
+                                return Ok(());
+                            }
+                            // Restore the masked old owner first. If this
+                            // transaction also recorded a deferred delete,
+                            // that undo entry will unmask it next.
+                            let old_row_id = old_row_id.deleted();
+                            let res = index
+                                .compare_exchange(
+                                    index_pool_guard,
+                                    &key.vals,
+                                    new_row_id,
+                                    old_row_id,
+                                    ts,
+                                )
+                                .await?;
+                            assert!(res.is_ok());
+                        }
                         RowLocation::RowPage(page_id) => {
                             let Some(page_guard) =
                                 table.get_row_page_shared(guards, page_id).await?
@@ -211,6 +259,44 @@ impl IndexUndoLogs {
             }
         }
         Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn lwc_row_matches_key<D: BufferPool, I: BufferPool>(
+        table: &GenericMemTable<D, I>,
+        storage: Option<&ColumnStorage>,
+        guards: &PoolGuards,
+        key: &SelectKey,
+        block_id: crate::file::BlockID,
+        row_idx: usize,
+        row_shape_fingerprint: u128,
+    ) -> Result<bool> {
+        let Some(storage) = storage else {
+            return Ok(false);
+        };
+        let block = PersistedLwcBlock::load(
+            storage.file().file_kind(),
+            storage.file().sparse_file(),
+            storage.disk_pool(),
+            guards.disk_guard(),
+            block_id,
+        )
+        .await?;
+        if block.row_shape_fingerprint() != row_shape_fingerprint {
+            return Err(Error::block_corrupted(
+                FileKind::TableFile,
+                BlockKind::LwcBlock,
+                block_id,
+                BlockCorruptionCause::InvalidPayload,
+            ));
+        }
+        let read_set = table.metadata().index_specs[key.index_no]
+            .index_cols
+            .iter()
+            .map(|key| key.col_no as usize)
+            .collect::<Vec<_>>();
+        let vals = block.decode_row_values(table.metadata(), row_idx, &read_set)?;
+        Ok(vals.as_slice() == key.vals.as_slice())
     }
 
     /// Merge another undo log buffer.

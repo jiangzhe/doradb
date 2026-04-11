@@ -422,9 +422,28 @@ impl UndoStatus {
 /// ```
 pub struct IndexBranch {
     pub key: SelectKey,
-    pub cts: TrxID,
-    pub entry: RowUndoRef,
+    pub target: IndexBranchTarget,
     pub undo_vals: Vec<UpdateCol>,
+}
+
+/// Target of a runtime unique-index branch.
+pub enum IndexBranchTarget {
+    /// Branch to another hot row's undo chain.
+    Hot { cts: TrxID, entry: RowUndoRef },
+    /// Branch to a persisted cold row reconstructed from `undo_vals`.
+    /// `delete_cts` is the CDB delete timestamp when the cold row was already
+    /// committed deleted; `None` means the current transaction owns the delete.
+    ColdTerminal { delete_cts: Option<TrxID> },
+}
+
+impl IndexBranchTarget {
+    #[inline]
+    pub(crate) fn purge_cts(&self) -> Option<TrxID> {
+        match self {
+            IndexBranchTarget::Hot { cts, .. } => Some(*cts),
+            IndexBranchTarget::ColdTerminal { delete_cts } => *delete_cts,
+        }
+    }
 }
 
 pub struct RowUndoHead {
