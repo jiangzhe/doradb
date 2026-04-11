@@ -125,8 +125,9 @@ durable upper watermark, merges the catalog-row changes into `catalog.mtb`, and
 publishes a new root with `catalog_replay_start_ts = safe_cts + 1`. On restart,
 the engine first loads checkpointed catalog rows from `catalog.mtb`, then
 preloads user tables from their table files, and finally replays only redo at
-or after the coarse replay floor derived from `catalog_replay_start_ts` and the
-loaded tables' `heap_redo_start_ts` values.
+or after the coarse replay floor derived from `catalog_replay_start_ts`, loaded
+tables' `heap_redo_start_ts` values, and loaded tables' `deletion_cutoff_ts`
+values.
 
 For more details, see [Checkpoint and Recovery](./checkpoint-and-recovery.md).
 

@@ -481,7 +481,7 @@ only summarizes the index-relevant parts:
 - deletion checkpoint persists only committed cold-row delete markers with
   `cts < cutoff_ts`
 - recovery still uses `heap_redo_start_ts` for hot heap replay and
-  `Deletion_Rec_CTS` for cold-row deletion replay
+  `deletion_cutoff_ts` for cold-row deletion replay
 
 ### 9.1 Data Checkpoint Companion Work
 
@@ -572,8 +572,8 @@ index state.
 Recovery then replays redo as usual:
 
 - hot heap redo is replayed from `heap_redo_start_ts`
-- cold-row deletions newer than the last persisted deletion checkpoint are
-  replayed into the in-memory deletion buffer
+- cold-row deletions with `row_id < pivot_row_id` and
+  `cts >= deletion_cutoff_ts` are replayed into the in-memory deletion buffer
 - row replay rebuilds hot `MemTree` state through the normal index update logic
 
 There is no separate index replay start timestamp.

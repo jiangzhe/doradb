@@ -110,8 +110,13 @@ impl ColumnDeletionBuffer {
         self.entries.get(&row_id).map(|entry| entry.value().clone())
     }
 
-    /// Snapshot row ids whose delete marker is committed and `cts < cutoff_ts`.
-    pub fn collect_committed_before(&self, cutoff_ts: TrxID) -> Vec<RowID> {
+    /// Snapshot row ids whose delete marker is committed and
+    /// `previous_cutoff <= cts < current_cutoff`.
+    pub fn collect_committed_in_range(
+        &self,
+        previous_cutoff: TrxID,
+        current_cutoff: TrxID,
+    ) -> Vec<RowID> {
         let mut row_ids = Vec::new();
         for entry in &self.entries {
             let cts = match entry.value() {
@@ -124,7 +129,7 @@ impl ColumnDeletionBuffer {
                     ts
                 }
             };
-            if cts < cutoff_ts {
+            if cts >= previous_cutoff && cts < current_cutoff {
                 row_ids.push(*entry.key());
             }
         }

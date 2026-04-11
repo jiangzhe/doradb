@@ -18,6 +18,8 @@ Purge no longer panics on checkpointed rows in LWC pages, and stale index entrie
 
 ## Notes (Optional)
 
+- Deferred again from `docs/tasks/000114-persist-deletion-cutoff-ts-and-fix-cold-delete-recovery.md`: the deletion-checkpoint range test `test_checkpoint_transition_delete_marker_waits_for_next_cutoff_range` can reproduce the purge gap after a row-page delete is captured into LWC under an old reader, but is ignored in the current phase because releasing the old reader reaches the existing `RowLocation::LwcBlock { .. } => todo!("lwc block")` branch in purge index cleanup.
+- Current finding: deletion-marker movement itself is intended to use `delete_cts >= cutoff_ts` during row-page transition, which is disjoint from deletion-checkpoint selection over `[previous_cutoff, current_cutoff)`. Once LWC purge support exists, re-enable the ignored test to validate that the moved marker is not selected in the same checkpoint and is persisted by a later checkpoint after the cutoff advances.
 
 ## Close Reason (Added When Closed)
 

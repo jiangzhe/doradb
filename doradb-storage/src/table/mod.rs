@@ -789,13 +789,19 @@ impl Table {
     #[inline]
     pub async fn total_row_pages(&self, guards: &PoolGuards) -> usize {
         let mut res = 0usize;
+        let pivot_row_id = self.pivot_row_id();
         let meta_pool_guard = guards.meta_guard();
         let mut cursor = self.blk_idx().mem_cursor(meta_pool_guard);
-        cursor.seek(0).await;
+        cursor.seek(pivot_row_id).await;
         while let Some(leaf) = cursor.next().await {
             let g = leaf.lock_shared_async().await.unwrap();
             debug_assert!(g.page().is_leaf());
-            res += g.page().leaf_entries().len();
+            res += g
+                .page()
+                .leaf_entries()
+                .iter()
+                .filter(|entry| entry.row_id >= pivot_row_id)
+                .count();
         }
         res
     }
@@ -807,13 +813,17 @@ impl Table {
         // With cursor, we lock two pages in block index and one row page
         // when scanning rows.
         let meta_pool_guard = guards.meta_guard();
+        let pivot_row_id = self.pivot_row_id();
         let mut cursor = self.blk_idx().mem_cursor(meta_pool_guard);
-        cursor.seek(0).await;
+        cursor.seek(pivot_row_id).await;
         while let Some(leaf) = cursor.next().await {
             let g = leaf.lock_shared_async().await.unwrap();
             debug_assert!(g.page().is_leaf());
             let entries = g.page().leaf_entries();
             for page_entry in entries {
+                if page_entry.row_id < pivot_row_id {
+                    continue;
+                }
                 let page_guard = self
                     .must_get_row_page_shared(guards, page_entry.page_id)
                     .await

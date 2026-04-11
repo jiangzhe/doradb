@@ -167,7 +167,7 @@ fn main() {
         let mut write_session = engine.try_new_session().unwrap();
         insert_rows(&table, &mut write_session, args.rows).await;
         table.freeze(&write_session, usize::MAX).await;
-        table.data_checkpoint(&mut write_session).await.unwrap();
+        table.checkpoint(&mut write_session).await.unwrap();
         drop(write_session);
 
         let keys = build_keys(args.rows);

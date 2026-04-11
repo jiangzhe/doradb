@@ -312,10 +312,11 @@ impl Catalog {
     }
 
     #[inline]
-    fn loaded_table_heap_redo_start_ts(&self, table_id: TableID) -> Option<u64> {
-        self.user_tables
-            .get(&table_id)
-            .map(|table| table.file().active_root().heap_redo_start_ts)
+    fn loaded_table_replay_start_ts(&self, table_id: TableID) -> Option<u64> {
+        self.user_tables.get(&table_id).map(|table| {
+            let root = table.file().active_root();
+            root.heap_redo_start_ts.min(root.deletion_cutoff_ts)
+        })
     }
 }
 
@@ -1198,7 +1199,7 @@ pub mod tests {
             checkpointed_table.freeze(&session, usize::MAX).await;
             let mut checkpoint_session = engine.try_new_session().unwrap();
             checkpointed_table
-                .data_checkpoint(&mut checkpoint_session)
+                .checkpoint(&mut checkpoint_session)
                 .await
                 .unwrap();
 

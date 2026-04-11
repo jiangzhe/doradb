@@ -18,7 +18,7 @@ use std::num::NonZeroU64;
 pub(crate) const TABLE_META_BLOCK_MAGIC_WORD: [u8; 8] =
     [b'T', b'B', b'L', b'M', b'E', b'T', b'A', 0];
 /// Table meta-block envelope version.
-pub(crate) const TABLE_META_BLOCK_VERSION: u64 = 1;
+pub(crate) const TABLE_META_BLOCK_VERSION: u64 = 2;
 
 /// Parsed payload of one checksummed table meta block.
 ///
@@ -30,6 +30,8 @@ pub struct MetaBlock {
     pub pivot_row_id: RowID,
     /// Earliest redo timestamp required to recover in-memory heap.
     pub heap_redo_start_ts: TrxID,
+    /// Earliest redo timestamp required to recover cold-row deletions.
+    pub deletion_cutoff_ts: TrxID,
     /// Table schema metadata.
     pub schema: TableMetadata,
     /// Root block id of column block index.
@@ -45,6 +47,7 @@ impl Deser for MetaBlock {
     fn deser<S: Serde + ?Sized>(input: &S, start_idx: usize) -> Result<(usize, Self)> {
         let (idx, pivot_row_id) = input.deser_u64(start_idx)?;
         let (idx, heap_redo_start_ts) = input.deser_u64(idx)?;
+        let (idx, deletion_cutoff_ts) = input.deser_u64(idx)?;
         let (idx, space) = AllocMapGcList::deser(input, idx)?;
         let (idx, meta) = TableBriefMetadata::deser(input, idx)?;
         let (idx, column_block_index_root) = input.deser_u64(idx)?;
@@ -53,6 +56,7 @@ impl Deser for MetaBlock {
             MetaBlock {
                 pivot_row_id,
                 heap_redo_start_ts,
+                deletion_cutoff_ts,
                 schema: TableMetadata::from(meta),
                 column_block_index_root: BlockID::from(column_block_index_root),
                 alloc_map: space.alloc_map,
@@ -71,6 +75,8 @@ pub struct MetaBlockSerView<'a> {
     pub pivot_row_id: RowID,
     /// Earliest redo timestamp required to recover in-memory heap.
     pub heap_redo_start_ts: TrxID,
+    /// Earliest redo timestamp required to recover cold-row deletions.
+    pub deletion_cutoff_ts: TrxID,
     /// Compact schema serialization view.
     pub schema: TableBriefMetadataSerView<'a>,
     /// Root block id of column block index.
@@ -90,10 +96,12 @@ impl<'a> MetaBlockSerView<'a> {
         gc_block_list: &'a [BlockID],
         pivot_row_id: RowID,
         heap_redo_start_ts: TrxID,
+        deletion_cutoff_ts: TrxID,
     ) -> Self {
         MetaBlockSerView {
             pivot_row_id,
             heap_redo_start_ts,
+            deletion_cutoff_ts,
             schema,
             column_block_index_root,
             space: AllocMapGcListSerView::new(alloc_map, gc_block_list),
@@ -106,6 +114,7 @@ impl<'a> Ser<'a> for MetaBlockSerView<'a> {
     fn ser_len(&self) -> usize {
         mem::size_of::<RowID>()
             + mem::size_of::<TrxID>()
+            + mem::size_of::<TrxID>()
             + self.space.ser_len()
             + self.schema.ser_len()
             + mem::size_of::<BlockID>()
@@ -115,6 +124,7 @@ impl<'a> Ser<'a> for MetaBlockSerView<'a> {
     fn ser<S: Serde + ?Sized>(&self, out: &mut S, start_idx: usize) -> usize {
         let idx = out.ser_u64(start_idx, self.pivot_row_id);
         let idx = out.ser_u64(idx, self.heap_redo_start_ts);
+        let idx = out.ser_u64(idx, self.deletion_cutoff_ts);
         let idx = self.space.ser(out, idx);
         let idx = self.schema.ser(out, idx);
         out.ser_u64(idx, self.column_block_index_root.into())
@@ -362,6 +372,10 @@ mod tests {
         assert_eq!(
             meta_block.heap_redo_start_ts,
             active_root.heap_redo_start_ts
+        );
+        assert_eq!(
+            meta_block.deletion_cutoff_ts,
+            active_root.deletion_cutoff_ts
         );
     }
 

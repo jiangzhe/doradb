@@ -9,7 +9,8 @@ use crate::lwc::PersistedLwcBlock;
 use crate::row::ops::{ReadRow, SelectKey, UpdateCol};
 use crate::row::{RowID, RowRead};
 use crate::table::{
-    RecoverIndex, Table, index_key_is_changed, index_key_replace, read_latest_index_key,
+    DeletionError, RecoverIndex, Table, index_key_is_changed, index_key_replace,
+    read_latest_index_key,
 };
 use crate::trx::MIN_SNAPSHOT_TS;
 use crate::trx::TrxID;
@@ -168,6 +169,24 @@ impl TableRecover for Table {
         cts: TrxID,
         disable_index: bool,
     ) -> Result<()> {
+        let active_root = self.file().active_root();
+        if row_id < active_root.pivot_row_id {
+            if cts < active_root.deletion_cutoff_ts {
+                return Ok(());
+            }
+            if !disable_index {
+                return Err(Error::NotSupported(
+                    "cold-row delete recovery requires deferred index rebuild",
+                ));
+            }
+            match self.deletion_buffer().put_committed(row_id, cts) {
+                Ok(()) => return Ok(()),
+                Err(DeletionError::AlreadyDeleted | DeletionError::WriteConflict) => {
+                    return Err(Error::InvalidState);
+                }
+            }
+        }
+
         let mut page_guard = self.must_get_row_page_exclusive(guards, page_id).await?;
 
         if disable_index {
@@ -301,6 +320,9 @@ impl TableRecover for Table {
                     return Err(Error::InvalidState);
                 }
                 if deleted.contains(&(delta as u32)) {
+                    continue;
+                }
+                if self.deletion_buffer().get(row_id).is_some() {
                     continue;
                 }
 

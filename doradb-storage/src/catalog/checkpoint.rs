@@ -139,7 +139,7 @@ impl Catalog {
                 && let Some((table_id, ddl_kind)) = blocking_table_ddl(ddl)
                 && is_user_obj_id(table_id)
             {
-                let Some(table_replay_start_ts) = self.loaded_table_heap_redo_start_ts(table_id)
+                let Some(table_replay_start_ts) = self.loaded_table_replay_start_ts(table_id)
                 else {
                     batch.stop_reason = CatalogCheckpointScanStopReason::BlockedByTableDDL {
                         table_id,
