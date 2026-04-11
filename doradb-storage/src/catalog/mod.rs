@@ -396,18 +396,19 @@ impl TableHandle {
         key: &SelectKey,
         row_id: RowID,
         unique: bool,
+        min_active_sts: crate::trx::TrxID,
     ) -> Result<bool> {
         match self {
             TableHandle::User(table) => {
                 table
                     .accessor()
-                    .delete_index(guards, key, row_id, unique)
+                    .delete_index(guards, key, row_id, unique, min_active_sts)
                     .await
             }
             TableHandle::Catalog(table) => {
                 table
                     .accessor()
-                    .delete_index(guards, key, row_id, unique)
+                    .delete_index(guards, key, row_id, unique, min_active_sts)
                     .await
             }
         }
