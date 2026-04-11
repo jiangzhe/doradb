@@ -1058,6 +1058,90 @@ fn test_lwc_update_unique_claims_committed_deleted_cold_owner_with_visibility_br
 }
 
 #[test]
+fn test_lwc_update_unique_rejects_cold_owner_deleted_after_snapshot() {
+    smol::block_on(async {
+        let sys = TestSys::new_evictable().await;
+        let mut session = sys.try_new_session().unwrap();
+        insert_rows(&sys, &mut session, 1, 2, "name").await;
+        sys.table.freeze(&session, usize::MAX).await;
+        sys.table.checkpoint(&mut session).await.unwrap();
+
+        let old_key = single_key(1i32);
+        let claimed_key = single_key(2i32);
+        let mut writer_session = sys.try_new_session().unwrap();
+        let mut writer = writer_session.try_begin_trx().unwrap().unwrap();
+        let writer_sts = writer.sts;
+        let claimed_row_id = assert_row_in_lwc(
+            &sys.table,
+            writer_session.pool_guards(),
+            &claimed_key,
+            writer_sts,
+        )
+        .await;
+
+        sys.new_trx_delete(&mut session, &claimed_key).await;
+        let delete_cts = delete_marker_ts(sys.table.deletion_buffer().get(claimed_row_id).unwrap());
+        assert!(delete_cts > writer_sts);
+        assert_unique_index_entry(
+            &sys.table,
+            writer_session.pool_guards(),
+            &claimed_key,
+            MAX_SNAPSHOT_TS,
+            claimed_row_id,
+            true,
+        )
+        .await;
+
+        writer = sys
+            .trx_select(writer, &claimed_key, |vals| {
+                assert_eq!(vals, vec![Val::from(2i32), Val::from("name")]);
+            })
+            .await;
+
+        let mut stmt = writer.start_stmt();
+        let res = stmt
+            .update_row(
+                &sys.table,
+                &old_key,
+                vec![
+                    UpdateCol {
+                        idx: 0,
+                        val: Val::from(2i32),
+                    },
+                    UpdateCol {
+                        idx: 1,
+                        val: Val::from("claimed"),
+                    },
+                ],
+            )
+            .await;
+        assert!(matches!(res, Ok(UpdateMvcc::DuplicateKey)));
+        let writer = stmt.fail().await.unwrap();
+        writer.rollback().await.unwrap();
+
+        assert_unique_index_entry(
+            &sys.table,
+            session.pool_guards(),
+            &claimed_key,
+            MAX_SNAPSHOT_TS,
+            claimed_row_id,
+            true,
+        )
+        .await;
+        sys.new_trx_select(&mut session, &old_key, |vals| {
+            assert_eq!(vals, vec![Val::from(1i32), Val::from("name")]);
+        })
+        .await;
+        sys.new_trx_select_not_found(&mut session, &claimed_key)
+            .await;
+
+        drop(writer_session);
+        drop(session);
+        sys.clean_all();
+    });
+}
+
+#[test]
 fn test_lwc_update_unique_claim_rollback_restores_deleted_cold_owner() {
     smol::block_on(async {
         let sys = TestSys::new_evictable().await;

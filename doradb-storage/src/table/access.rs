@@ -1562,16 +1562,31 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
     ) -> Result<LinkForUniqueIndex> {
         let deletion_buffer = self.lwc_deletion_buffer()?;
         // Convert the CDB marker into the delete timestamp carried by a
-        // terminal cold branch. `None` below means the cold row is still active;
-        // `Some(None)` means it was deleted by this transaction; `Some(Some(_))`
-        // means it was deleted by a committed transaction.
+        // terminal cold branch. `None` below means the cold row is visible to
+        // this statement, either because there is no marker or the committed
+        // delete is newer than the transaction snapshot; a matching persisted
+        // key must still reject the duplicate claim in that case. `Some(None)`
+        // means this transaction deleted the cold row itself; `Some(Some(_))`
+        // means a committed delete is visible to this transaction, so the new
+        // hot owner may keep the old image as a terminal branch for older
+        // snapshots.
         let delete_cts = match deletion_buffer.get(old_id) {
             None => None,
-            Some(DeleteMarker::Committed(ts)) => Some(Some(ts)),
+            Some(DeleteMarker::Committed(ts)) => {
+                if ts <= stmt.trx.sts {
+                    Some(Some(ts))
+                } else {
+                    None
+                }
+            }
             Some(DeleteMarker::Ref(status)) => {
                 let ts = status.ts();
                 if trx_is_committed(ts) {
-                    Some(Some(ts))
+                    if ts <= stmt.trx.sts {
+                        Some(Some(ts))
+                    } else {
+                        None
+                    }
                 } else if Arc::ptr_eq(&status, &stmt.trx.status()) {
                     Some(None)
                 } else {
