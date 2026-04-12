@@ -119,9 +119,23 @@ The process moves committed deletions from memory to disk. Crucially, the **Syst
 *   **Action**: For each affected LWC Block:
     1.  **Load Old Bitmap**: Fetch from Block Index (Inline) or blob pages (Offload).
     2.  **Merge**: `New_Bitmap = Old_Bitmap | New_Deletes`.
-    3.  **Optimize**: Serialize `New_Bitmap`.
+    3.  **Decode Rows Once**: Decode the affected LWC block once and
+        reconstruct old row values for every selected RowID in this block.
+    4.  **Build Secondary Deletes**: Decode old secondary-index keys from those
+        reconstructed row values and append per-index companion `DiskTree`
+        delete/update work:
+        *   Unique indexes conditionally delete/update only when the stored
+            owner still matches the deleted old RowID.
+        *   Non-unique indexes remove the exact `(logical_key, old_row_id)`
+            entry.
+    5.  **Optimize**: Serialize `New_Bitmap`.
         *   If `Size < Threshold`: Mark as `Inline`.
         *   If `Size >= Threshold`: Mark as `Offload`.
+
+This block-grouped reconstruction is the baseline algorithm. Row values for
+deleted cold rows must remain reconstructible until the checkpoint publication
+durably includes both the persistent delete metadata and the companion
+secondary-index `DiskTree` delete/update work.
 
 ### Phase 3: CoW Persistence (I/O)
 *   **Write Blob Pages** (Only for Offload blocks):
@@ -131,15 +145,23 @@ The process moves committed deletions from memory to disk. Crucially, the **Syst
     *   Perform a **Batch Put** on the Block Index.
     *   Update values to inline deletion list or offloaded `BlobRef`.
     *   Generate new Block Index Root via CoW.
+*   **Update Secondary DiskTrees**:
+    *   Apply the per-index companion delete/update batches generated in Phase
+        2.
+    *   Generate new secondary-index `DiskTree` roots via CoW.
 
 ### Phase 4: Commit & Watermark Advancement
 *   **Lock**: Acquire `SuperBlock Lock`.
 *   **New MetaBlock**: Create a new `MetaBlock`.
     *   Update `BlockIndexRoot` (if changed).
+    *   Update secondary-index `DiskTree` roots (if changed).
     *   **Crucial Update**: Set `Table.watermarks.deletion_cutoff_ts = Checkpoint_STS`.
     *   *Note*: This is set to the system timestamp acquired in Phase 1, regardless of the actual data timestamps.
 *   **Persist**: Write MetaBlock to disk.
 *   **Switch**: Update `SuperBlock` to point to the new MetaBlock.
+*   **Atomic Outcome**: Persistent delete metadata and companion
+    secondary-index `DiskTree` roots become visible together through the same
+    MetaBlock.
 
 ## Heartbeat Checkpoint (Log Truncation)
 

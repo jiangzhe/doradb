@@ -119,6 +119,14 @@ rows are represented through:
 - reinsertion of updated rows into hot RowStore
 - companion secondary-index maintenance
 
+For cold-row deletes, the table file owns a retention contract needed by
+deletion checkpoint and secondary-index maintenance: deleted cold row values
+remain reconstructible from their persisted LWC blocks until a checkpoint root
+durably publishes both the persistent delete metadata and the companion
+secondary-index `DiskTree` delete/update. Storage compaction, vacuum, or page
+reclamation must not make those row values undecodable before that joint
+publication.
+
 ## 7. Checkpoint Publication
 
 There is one atomic publication mechanism. A `checkpoint()` run may publish
@@ -148,6 +156,12 @@ Deletion checkpoint publishes:
 - new persistent delete metadata
 - updated secondary-index `DiskTree` roots for the deleted cold rows
 - updated `deletion_cutoff_ts`
+
+The deleted row values used to reconstruct secondary-index keys remain
+available until this publication succeeds. The delete metadata and companion
+`DiskTree` root changes are one table-checkpoint outcome, so recovery never
+observes a checkpoint root where the durable delete bitmap has advanced without
+the matching secondary-index delete publication.
 
 If no cold-delete payload changes are selected, checkpoint can still publish a
 metadata-only root that advances `deletion_cutoff_ts` to the checkpoint
