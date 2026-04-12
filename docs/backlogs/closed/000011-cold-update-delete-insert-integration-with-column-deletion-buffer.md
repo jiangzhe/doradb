@@ -19,3 +19,10 @@ Implement and validate how cold-data updates (delete+insert path) integrate with
 
 Cold updates against persisted data are fully specified and tested with no MVCC/regression gaps.
 
+## Close Reason
+
+- Type: implemented
+- Detail: Implemented via docs/tasks/000116-implement-lwc-unique-update-transaction.md
+- Closed By: backlog close
+- Reference: User decision
+- Closed At: 2026-04-12

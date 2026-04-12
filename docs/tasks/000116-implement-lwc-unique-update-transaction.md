@@ -1,7 +1,7 @@
 ---
 id: 000116
 title: Implement LWC Unique Update Transaction
-status: proposal
+status: implemented
 created: 2026-04-11
 github_issue: 547
 ---
@@ -210,6 +210,57 @@ Reference:
 
 ## Implementation Notes
 
+1. Implemented LWC unique update as cold delete plus hot insert:
+   - `update_unique_mvcc(...)` now handles `RowLocation::LwcBlock` by checking
+     `ColumnDeletionBuffer` visibility, decoding the persisted row, validating
+     the lookup key, installing a delete marker, recording cold delete
+     undo/redo, inserting the modified hot row, and maintaining secondary
+     indexes through existing index helpers.
+   - LWC delete/update paths now mask old index entries through the deferred
+     delete-index helpers so rollback and GC see the same logical shape as hot
+     row delete/update.
+   - LWC delete reads only index-related columns for delete-index maintenance
+     instead of decoding the full cold row.
+
+2. Added explicit hot and cold unique-branch targets:
+   - `IndexBranchTarget::Hot` preserves the existing row-page undo-chain
+     continuation semantics.
+   - `IndexBranchTarget::ColdTerminal { delete_cts }` reconstructs a terminal
+     cold owner from stored undo values and applies the optional delete-CTS
+     visibility rule without needing the old cold `row_id` in the branch
+     target.
+   - Unique-link creation now handles old LWC owners, including same-row
+     cold-to-hot updates and claims over committed deleted cold owners; non-
+     unique indexes remain exact-entry insert/delete-shadow maintenance only.
+
+3. Hardened rollback and stale-owner handling for cold unique owners:
+   - unique-index undo handles stale/purged cold owners by deleting the masked
+     replacement claim instead of treating missing cold rows as unreachable;
+   - rollback for `RowLocation::LwcBlock` uses the same purgeability decision
+     as the LWC purge path, restoring a masked owner only when snapshots still
+     need the deleted marker and removing the replacement claim when it is safe
+     to drop;
+   - `min_active_sts` calculation is lazy and only evaluated on the rollback
+     path when a deleted cold owner actually needs a purgeability decision.
+
+4. Fixed snapshot visibility edge cases found during review:
+   - `link_for_unique_index_lwc(...)` treats a committed CDB marker as linkable
+     only when `delete_cts <= stmt.trx.sts`; a later committed delete remains
+     visible to the writer and rejects the duplicate claim.
+   - `ColumnDeletionBuffer::put_ref(...)` now accepts the caller snapshot and
+     returns `AlreadyDeleted` only for deletes visible to that snapshot; later
+     committed deletes surface as `WriteConflict`.
+
+5. Added focused regression coverage for the implemented behavior:
+   - same-key LWC update preserving old snapshots;
+   - key-changing LWC update preserving old/new key visibility;
+   - duplicate-key rollback for cold marker plus hot insert;
+   - claiming committed deleted cold owners with a cold terminal bridge;
+   - rollback restore/drop behavior for deleted cold owners;
+   - stale unique-index purge for missing/purged cold owners;
+   - snapshot-aware CDB marker handling for update/delete paths.
+   Validation passed with `cargo nextest run -p doradb-storage` (`529` tests).
+
 ## Impacts
 
 - `doradb-storage/src/table/access.rs`
@@ -288,6 +339,3 @@ Reference:
 - Future work may add an explicit lock-only state to `ColumnDeletionBuffer` if
   LWC rows need lock operations independent from delete/update. This task
   intentionally keeps delete markers as the LWC write ownership record.
-- During implementation, decide whether cold terminal unique branch targets
-  require the old cold `row_id` for diagnostics or cleanup, or whether
-  `delete_cts: Option<TrxID>` plus reconstructed values is sufficient.
