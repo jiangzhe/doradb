@@ -1,8 +1,9 @@
 use crate::buffer::{BufferPool, PoolGuards};
 use crate::catalog::{TableCache, TableHandle, TableID};
-use crate::error::Result;
+use crate::error::{BlockCorruptionCause, BlockKind, Error, FileKind, Result};
 use crate::index::util::Maskable;
 use crate::index::{NonUniqueIndex, RowLocation, UniqueIndex};
+use crate::lwc::PersistedLwcBlock;
 use crate::row::ops::SelectKey;
 use crate::row::{RowID, RowRead};
 use crate::table::{ColumnStorage, GenericMemTable};
@@ -44,44 +45,87 @@ impl IndexUndoLogs {
     /// because other transaction can not update the same index entry
     /// concurrently.
     #[inline]
-    pub async fn rollback(
+    pub async fn rollback<F>(
         &mut self,
         table_cache: &mut TableCache<'_>,
         guards: &PoolGuards,
         ts: TrxID,
-    ) -> Result<()> {
+        mut calc_min_active_sts: F,
+    ) -> Result<()>
+    where
+        F: FnMut() -> TrxID,
+    {
+        // Calculating the GC horizon scans transaction buckets. Most rollback
+        // entries do not need it, so compute it only on the LWC purgeability
+        // path and reuse the value for the rest of this rollback.
+        let mut min_active_sts = None;
         while let Some(entry) = self.0.pop() {
             let table = table_cache.must_get_table(entry.table_id).await;
-            Self::rollback_entry_in_table(entry, table, guards, ts).await?;
+            Self::rollback_entry_in_table(
+                entry,
+                table,
+                guards,
+                ts,
+                &mut min_active_sts,
+                &mut calc_min_active_sts,
+            )
+            .await?;
         }
         Ok(())
     }
 
     #[inline]
-    async fn rollback_entry_in_table(
+    async fn rollback_entry_in_table<F>(
         entry: IndexUndo,
         table: &TableHandle,
         guards: &PoolGuards,
         ts: TrxID,
-    ) -> Result<()> {
+        min_active_sts: &mut Option<TrxID>,
+        calc_min_active_sts: &mut F,
+    ) -> Result<()>
+    where
+        F: FnMut() -> TrxID,
+    {
         match table {
             TableHandle::User(table) => {
-                Self::rollback_entry_in_mem_table(entry, table, Some(&table.storage), guards, ts)
-                    .await
+                Self::rollback_entry_in_mem_table(
+                    entry,
+                    table,
+                    Some(&table.storage),
+                    guards,
+                    ts,
+                    min_active_sts,
+                    calc_min_active_sts,
+                )
+                .await
             }
             TableHandle::Catalog(table) => {
-                Self::rollback_entry_in_mem_table(entry, table, None, guards, ts).await
+                Self::rollback_entry_in_mem_table(
+                    entry,
+                    table,
+                    None,
+                    guards,
+                    ts,
+                    min_active_sts,
+                    calc_min_active_sts,
+                )
+                .await
             }
         }
     }
 
-    async fn rollback_entry_in_mem_table<D: BufferPool, I: BufferPool>(
+    async fn rollback_entry_in_mem_table<D: BufferPool, I: BufferPool, F>(
         entry: IndexUndo,
         table: &GenericMemTable<D, I>,
         storage: Option<&ColumnStorage>,
         guards: &PoolGuards,
         ts: TrxID,
-    ) -> Result<()> {
+        min_active_sts: &mut Option<TrxID>,
+        calc_min_active_sts: &mut F,
+    ) -> Result<()>
+    where
+        F: FnMut() -> TrxID,
+    {
         let index_pool_guard = table.index_pool_guard(guards);
         match entry.kind {
             IndexUndoKind::InsertUnique(key, merge_old_deleted) => {
@@ -140,8 +184,96 @@ impl IndexUndoLogs {
                     // To solve this, we need to re-check original row with row latch and delete
                     // index entry if it is deleted and does not have any old version (already GCed).
                     match table.find_row(guards, old_row_id, storage).await {
-                        RowLocation::NotFound => unreachable!(),
-                        RowLocation::LwcBlock { .. } => todo!("lwc block"),
+                        RowLocation::NotFound => {
+                            // The delete-masked owner may already have been
+                            // purged while its stale unique-index entry was
+                            // still present. There is no old owner to restore,
+                            // so rollback only removes the new claim.
+                            let new_row_id = entry.row_id;
+                            let index = table.sec_idx()[key.index_no].unique().unwrap();
+                            let res = index
+                                .compare_delete(index_pool_guard, &key.vals, new_row_id, true, ts)
+                                .await?;
+                            assert!(res);
+                            return Ok(());
+                        }
+                        RowLocation::LwcBlock {
+                            block_id,
+                            row_idx,
+                            row_shape_fingerprint,
+                        } => {
+                            // Rollback of a claimed cold unique owner cannot
+                            // latch a row page. Use the same cold-delete
+                            // purgeability rule as index GC: when no live
+                            // snapshot can need the deleted owner, remove only
+                            // the replacement claim instead of recreating a
+                            // masked owner that GC may already have skipped.
+                            let new_row_id = entry.row_id;
+                            let index = table.sec_idx()[key.index_no].unique().unwrap();
+                            if storage.is_some_and(|storage| {
+                                storage
+                                    .deletion_buffer()
+                                    .delete_marker_is_globally_purgeable_with(old_row_id, || {
+                                        match *min_active_sts {
+                                            Some(min_active_sts) => min_active_sts,
+                                            None => {
+                                                let calculated = calc_min_active_sts();
+                                                *min_active_sts = Some(calculated);
+                                                calculated
+                                            }
+                                        }
+                                    })
+                            }) {
+                                let res = index
+                                    .compare_delete(
+                                        index_pool_guard,
+                                        &key.vals,
+                                        new_row_id,
+                                        true,
+                                        ts,
+                                    )
+                                    .await?;
+                                assert!(res);
+                                return Ok(());
+                            }
+                            if !Self::lwc_row_matches_key(
+                                table,
+                                storage,
+                                guards,
+                                &key,
+                                block_id,
+                                row_idx,
+                                row_shape_fingerprint,
+                            )
+                            .await?
+                            {
+                                let res = index
+                                    .compare_delete(
+                                        index_pool_guard,
+                                        &key.vals,
+                                        new_row_id,
+                                        true,
+                                        ts,
+                                    )
+                                    .await?;
+                                assert!(res);
+                                return Ok(());
+                            }
+                            // Restore the masked old owner first. If this
+                            // transaction also recorded a deferred delete,
+                            // that undo entry will unmask it next.
+                            let old_row_id = old_row_id.deleted();
+                            let res = index
+                                .compare_exchange(
+                                    index_pool_guard,
+                                    &key.vals,
+                                    new_row_id,
+                                    old_row_id,
+                                    ts,
+                                )
+                                .await?;
+                            assert!(res.is_ok());
+                        }
                         RowLocation::RowPage(page_id) => {
                             let Some(page_guard) =
                                 table.get_row_page_shared(guards, page_id).await?
@@ -211,6 +343,44 @@ impl IndexUndoLogs {
             }
         }
         Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn lwc_row_matches_key<D: BufferPool, I: BufferPool>(
+        table: &GenericMemTable<D, I>,
+        storage: Option<&ColumnStorage>,
+        guards: &PoolGuards,
+        key: &SelectKey,
+        block_id: crate::file::BlockID,
+        row_idx: usize,
+        row_shape_fingerprint: u128,
+    ) -> Result<bool> {
+        let Some(storage) = storage else {
+            return Ok(false);
+        };
+        let block = PersistedLwcBlock::load(
+            storage.file().file_kind(),
+            storage.file().sparse_file(),
+            storage.disk_pool(),
+            guards.disk_guard(),
+            block_id,
+        )
+        .await?;
+        if block.row_shape_fingerprint() != row_shape_fingerprint {
+            return Err(Error::block_corrupted(
+                FileKind::TableFile,
+                BlockKind::LwcBlock,
+                block_id,
+                BlockCorruptionCause::InvalidPayload,
+            ));
+        }
+        let read_set = table.metadata().index_specs[key.index_no]
+            .index_cols
+            .iter()
+            .map(|key| key.col_no as usize)
+            .collect::<Vec<_>>();
+        let vals = block.decode_row_values(table.metadata(), row_idx, &read_set)?;
+        Ok(vals.as_slice() == key.vals.as_slice())
     }
 
     /// Merge another undo log buffer.

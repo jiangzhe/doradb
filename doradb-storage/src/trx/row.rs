@@ -6,8 +6,8 @@ use crate::row::{Row, RowID, RowMut, RowPage, RowRead};
 use crate::stmt::Statement;
 use crate::trx::recover::RecoverMap;
 use crate::trx::undo::{
-    IndexBranch, MainBranch, NextRowUndo, OwnedRowUndo, RowUndoHead, RowUndoKind, RowUndoRef,
-    UndoStatus,
+    IndexBranch, IndexBranchTarget, MainBranch, NextRowUndo, OwnedRowUndo, RowUndoHead,
+    RowUndoKind, RowUndoRef, UndoStatus,
 };
 use crate::trx::ver_map::{RowPageState, RowVersionReadGuard, RowVersionWriteGuard};
 use crate::trx::{ActiveTrx, SharedTrxStatus, TrxID, trx_is_committed};
@@ -172,11 +172,29 @@ impl<'a> RowReadAccess<'a> {
                             // Index branch only contains non-deleted version.
                             // So delete flag is not used.
                             debug_assert!(!ver.deleted);
-                            if trx.sts > ib.cts {
-                                // current version is visible
-                                return ver.get_visible_vals(metadata, self.row(), key);
+                            match &ib.target {
+                                IndexBranchTarget::Hot {
+                                    cts,
+                                    entry: hot_entry,
+                                } => {
+                                    if trx.sts > *cts {
+                                        // current version is visible
+                                        return ver.get_visible_vals(metadata, self.row(), key);
+                                    }
+                                    entry = hot_entry.as_ref();
+                                }
+                                IndexBranchTarget::ColdTerminal { delete_cts } => {
+                                    // A cold terminal branch has no older undo
+                                    // chain. It remains visible to snapshots
+                                    // before its CDB delete timestamp.
+                                    if let Some(delete_cts) = delete_cts
+                                        && trx.sts > *delete_cts
+                                    {
+                                        return ReadRow::NotFound;
+                                    }
+                                    return ver.get_visible_vals(metadata, self.row(), key);
+                                }
                             }
-                            entry = ib.entry.as_ref();
                         } else {
                             // Key not match, go to main branch
                             entry = next.main.entry.as_ref();
@@ -809,8 +827,24 @@ impl<'a> RowWriteAccess<'a> {
         let undo_head = self.guard.as_mut().expect("undo head");
         undo_head.next.indexes.push(IndexBranch {
             key,
-            cts,
-            entry,
+            target: IndexBranchTarget::Hot { cts, entry },
+            undo_vals,
+        })
+    }
+
+    #[inline]
+    pub fn link_for_unique_index_cold_terminal(
+        &mut self,
+        key: SelectKey,
+        delete_cts: Option<TrxID>,
+        undo_vals: Vec<UpdateCol>,
+    ) {
+        // The old owner is a persisted LWC row, so the branch records only the
+        // reconstructed image and optional committed delete timestamp.
+        let undo_head = self.guard.as_mut().expect("undo head");
+        undo_head.next.indexes.push(IndexBranch {
+            key,
+            target: IndexBranchTarget::ColdTerminal { delete_cts },
             undo_vals,
         })
     }
@@ -856,7 +890,11 @@ impl<'a> RowWriteAccess<'a> {
                     // remove old links.
                     while idx > 0 {
                         idx -= 1;
-                        if next.indexes[idx].cts < min_active_sts {
+                        if next.indexes[idx]
+                            .target
+                            .purge_cts()
+                            .is_some_and(|cts| cts < min_active_sts)
+                        {
                             next.indexes.swap_remove(idx);
                         }
                     }

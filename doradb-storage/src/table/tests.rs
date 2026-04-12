@@ -609,15 +609,34 @@ fn test_column_delete_rollback() {
         let key = single_key(2i32);
         let mut reader_session = sys.try_new_session().unwrap();
         let trx = reader_session.try_begin_trx().unwrap().unwrap();
-        let _ = assert_row_in_lwc(&sys.table, reader_session.pool_guards(), &key, trx.sts).await;
+        let old_row_id =
+            assert_row_in_lwc(&sys.table, reader_session.pool_guards(), &key, trx.sts).await;
         trx.commit().await.unwrap();
 
         let mut trx = session.try_begin_trx().unwrap().unwrap();
         let mut stmt = trx.start_stmt();
         let res = stmt.delete_row(&sys.table, &key).await;
         assert!(matches!(res, Ok(DeleteMvcc::Deleted)));
+        assert_unique_index_entry(
+            &sys.table,
+            session.pool_guards(),
+            &key,
+            stmt.trx.sts,
+            old_row_id,
+            true,
+        )
+        .await;
         trx = stmt.succeed();
         trx.rollback().await.unwrap();
+        assert_unique_index_entry(
+            &sys.table,
+            session.pool_guards(),
+            &key,
+            MAX_SNAPSHOT_TS,
+            old_row_id,
+            false,
+        )
+        .await;
 
         let mut trx = session.try_begin_trx().unwrap().unwrap();
         trx = sys
@@ -751,6 +770,690 @@ fn test_column_delete_mvcc_visibility() {
 
         drop(delete_session);
         drop(reader_session);
+        drop(session);
+        sys.clean_all();
+    });
+}
+
+#[test]
+fn test_lwc_delete_unique_conflicts_when_delete_committed_after_snapshot() {
+    smol::block_on(async {
+        let sys = TestSys::new_evictable().await;
+        let mut session = sys.try_new_session().unwrap();
+        insert_rows(&sys, &mut session, 0, 10, "name").await;
+        sys.table.freeze(&session, usize::MAX).await;
+        sys.table.checkpoint(&mut session).await.unwrap();
+
+        let key = single_key(5i32);
+        let mut writer_session = sys.try_new_session().unwrap();
+        let mut writer = writer_session.try_begin_trx().unwrap().unwrap();
+        let writer_sts = writer.sts;
+        let row_id =
+            assert_row_in_lwc(&sys.table, writer_session.pool_guards(), &key, writer_sts).await;
+
+        sys.new_trx_delete(&mut session, &key).await;
+        let delete_cts = delete_marker_ts(sys.table.deletion_buffer().get(row_id).unwrap());
+        assert!(delete_cts > writer_sts);
+
+        writer = sys
+            .trx_select(writer, &key, |row| {
+                assert_eq!(row, vec![Val::from(5i32), Val::from("name")]);
+            })
+            .await;
+
+        let mut stmt = writer.start_stmt();
+        let res = stmt.delete_row(&sys.table, &key).await;
+        assert!(matches!(res, Ok(DeleteMvcc::WriteConflict)));
+        let writer = stmt.fail().await.unwrap();
+        writer.rollback().await.unwrap();
+
+        sys.new_trx_select_not_found(&mut session, &key).await;
+
+        drop(writer_session);
+        drop(session);
+        sys.clean_all();
+    });
+}
+
+#[test]
+fn test_lwc_update_unique_same_key_reinserts_hot_and_preserves_old_snapshot() {
+    smol::block_on(async {
+        let sys = TestSys::new_evictable().await;
+        let mut session = sys.try_new_session().unwrap();
+        insert_rows(&sys, &mut session, 0, 4, "name").await;
+        sys.table.freeze(&session, usize::MAX).await;
+        sys.table.checkpoint(&mut session).await.unwrap();
+
+        let key = single_key(1i32);
+        let mut old_reader_session = sys.try_new_session().unwrap();
+        let mut old_reader = old_reader_session.try_begin_trx().unwrap().unwrap();
+        let old_row_id = assert_row_in_lwc(
+            &sys.table,
+            old_reader_session.pool_guards(),
+            &key,
+            old_reader.sts,
+        )
+        .await;
+
+        let mut writer = session.try_begin_trx().unwrap().unwrap();
+        let mut stmt = writer.start_stmt();
+        let res = stmt
+            .update_row(
+                &sys.table,
+                &key,
+                vec![UpdateCol {
+                    idx: 1,
+                    val: Val::from("updated"),
+                }],
+            )
+            .await;
+        let new_row_id = match res {
+            Ok(UpdateMvcc::Updated(row_id)) => row_id,
+            other => panic!("expected update success, got {other:?}"),
+        };
+        assert_ne!(old_row_id, new_row_id);
+        assert_unique_index_entry(
+            &sys.table,
+            session.pool_guards(),
+            &key,
+            stmt.trx.sts,
+            new_row_id,
+            false,
+        )
+        .await;
+        assert!(matches!(
+            sys.table.find_row(session.pool_guards(), new_row_id).await,
+            RowLocation::RowPage(_)
+        ));
+        match sys.table.deletion_buffer().get(old_row_id).unwrap() {
+            DeleteMarker::Ref(status) => {
+                assert!(Arc::ptr_eq(&status, &stmt.trx.status()));
+            }
+            DeleteMarker::Committed(_) => panic!("update should hold an in-flight delete marker"),
+        }
+
+        let res = stmt.select_row_mvcc(&sys.table, &key, &[0, 1]).await;
+        assert!(matches!(
+            res,
+            Ok(SelectMvcc::Found(vals))
+                if vals == vec![Val::from(1i32), Val::from("updated")]
+        ));
+        old_reader = sys
+            .trx_select(old_reader, &key, |vals| {
+                assert_eq!(vals, vec![Val::from(1i32), Val::from("name")]);
+            })
+            .await;
+
+        writer = stmt.succeed();
+        writer.commit().await.unwrap();
+
+        sys.new_trx_select(&mut session, &key, |vals| {
+            assert_eq!(vals, vec![Val::from(1i32), Val::from("updated")]);
+        })
+        .await;
+        old_reader = sys
+            .trx_select(old_reader, &key, |vals| {
+                assert_eq!(vals, vec![Val::from(1i32), Val::from("name")]);
+            })
+            .await;
+        old_reader.commit().await.unwrap();
+
+        drop(old_reader_session);
+        drop(session);
+        sys.clean_all();
+    });
+}
+
+#[test]
+fn test_lwc_update_unique_conflicts_when_delete_committed_after_snapshot() {
+    smol::block_on(async {
+        let sys = TestSys::new_evictable().await;
+        let mut session = sys.try_new_session().unwrap();
+        insert_rows(&sys, &mut session, 0, 10, "name").await;
+        sys.table.freeze(&session, usize::MAX).await;
+        sys.table.checkpoint(&mut session).await.unwrap();
+
+        let key = single_key(5i32);
+        let mut writer_session = sys.try_new_session().unwrap();
+        let mut writer = writer_session.try_begin_trx().unwrap().unwrap();
+        let writer_sts = writer.sts;
+        let row_id =
+            assert_row_in_lwc(&sys.table, writer_session.pool_guards(), &key, writer_sts).await;
+
+        sys.new_trx_delete(&mut session, &key).await;
+        let delete_cts = delete_marker_ts(sys.table.deletion_buffer().get(row_id).unwrap());
+        assert!(delete_cts > writer_sts);
+
+        writer = sys
+            .trx_select(writer, &key, |row| {
+                assert_eq!(row, vec![Val::from(5i32), Val::from("name")]);
+            })
+            .await;
+
+        let mut stmt = writer.start_stmt();
+        let res = stmt
+            .update_row(
+                &sys.table,
+                &key,
+                vec![UpdateCol {
+                    idx: 1,
+                    val: Val::from("updated"),
+                }],
+            )
+            .await;
+        assert!(matches!(res, Ok(UpdateMvcc::WriteConflict)));
+        let writer = stmt.fail().await.unwrap();
+        writer.rollback().await.unwrap();
+
+        sys.new_trx_select_not_found(&mut session, &key).await;
+
+        drop(writer_session);
+        drop(session);
+        sys.clean_all();
+    });
+}
+
+#[test]
+fn test_lwc_update_unique_key_change_preserves_old_and_new_key_visibility() {
+    smol::block_on(async {
+        let sys = TestSys::new_evictable().await;
+        let mut session = sys.try_new_session().unwrap();
+        insert_rows(&sys, &mut session, 0, 4, "name").await;
+        sys.table.freeze(&session, usize::MAX).await;
+        sys.table.checkpoint(&mut session).await.unwrap();
+
+        let old_key = single_key(2i32);
+        let new_key = single_key(20i32);
+        let mut old_reader_session = sys.try_new_session().unwrap();
+        let mut old_reader = old_reader_session.try_begin_trx().unwrap().unwrap();
+        let old_row_id = assert_row_in_lwc(
+            &sys.table,
+            old_reader_session.pool_guards(),
+            &old_key,
+            old_reader.sts,
+        )
+        .await;
+
+        let mut writer = session.try_begin_trx().unwrap().unwrap();
+        let mut stmt = writer.start_stmt();
+        let res = stmt
+            .update_row(
+                &sys.table,
+                &old_key,
+                vec![
+                    UpdateCol {
+                        idx: 0,
+                        val: Val::from(20i32),
+                    },
+                    UpdateCol {
+                        idx: 1,
+                        val: Val::from("moved"),
+                    },
+                ],
+            )
+            .await;
+        let new_row_id = match res {
+            Ok(UpdateMvcc::Updated(row_id)) => row_id,
+            other => panic!("expected update success, got {other:?}"),
+        };
+        assert_unique_index_entry(
+            &sys.table,
+            session.pool_guards(),
+            &old_key,
+            stmt.trx.sts,
+            old_row_id,
+            true,
+        )
+        .await;
+        assert_unique_index_entry(
+            &sys.table,
+            session.pool_guards(),
+            &new_key,
+            stmt.trx.sts,
+            new_row_id,
+            false,
+        )
+        .await;
+        writer = stmt.succeed();
+        writer.commit().await.unwrap();
+
+        sys.new_trx_select_not_found(&mut session, &old_key).await;
+        sys.new_trx_select(&mut session, &new_key, |vals| {
+            assert_eq!(vals, vec![Val::from(20i32), Val::from("moved")]);
+        })
+        .await;
+
+        old_reader = sys
+            .trx_select(old_reader, &old_key, |vals| {
+                assert_eq!(vals, vec![Val::from(2i32), Val::from("name")]);
+            })
+            .await;
+        old_reader = sys.trx_select_not_found(old_reader, &new_key).await;
+        old_reader.commit().await.unwrap();
+
+        drop(old_reader_session);
+        drop(session);
+        sys.clean_all();
+    });
+}
+
+#[test]
+fn test_lwc_update_unique_duplicate_rolls_back_cold_marker_and_hot_insert() {
+    smol::block_on(async {
+        let sys = TestSys::new_evictable().await;
+        let mut session = sys.try_new_session().unwrap();
+        insert_rows(&sys, &mut session, 0, 4, "name").await;
+        sys.table.freeze(&session, usize::MAX).await;
+        sys.table.checkpoint(&mut session).await.unwrap();
+
+        let key = single_key(1i32);
+        let duplicate_key = single_key(2i32);
+        let trx = session.try_begin_trx().unwrap().unwrap();
+        let old_row_id = assert_row_in_lwc(&sys.table, session.pool_guards(), &key, trx.sts).await;
+        trx.commit().await.unwrap();
+
+        let trx = session.try_begin_trx().unwrap().unwrap();
+        let mut stmt = trx.start_stmt();
+        let res = stmt
+            .update_row(
+                &sys.table,
+                &key,
+                vec![UpdateCol {
+                    idx: 0,
+                    val: Val::from(2i32),
+                }],
+            )
+            .await;
+        assert!(matches!(res, Ok(UpdateMvcc::DuplicateKey)));
+        let trx = stmt.fail().await.unwrap();
+        trx.rollback().await.unwrap();
+
+        assert!(sys.table.deletion_buffer().get(old_row_id).is_none());
+        sys.new_trx_select(&mut session, &key, |vals| {
+            assert_eq!(vals, vec![Val::from(1i32), Val::from("name")]);
+        })
+        .await;
+        sys.new_trx_select(&mut session, &duplicate_key, |vals| {
+            assert_eq!(vals, vec![Val::from(2i32), Val::from("name")]);
+        })
+        .await;
+
+        drop(session);
+        sys.clean_all();
+    });
+}
+
+#[test]
+fn test_lwc_update_unique_claims_committed_deleted_cold_owner_with_visibility_bridge() {
+    smol::block_on(async {
+        let sys = TestSys::new_evictable().await;
+        let mut session = sys.try_new_session().unwrap();
+        insert_rows(&sys, &mut session, 1, 2, "name").await;
+        sys.table.freeze(&session, usize::MAX).await;
+        sys.table.checkpoint(&mut session).await.unwrap();
+
+        let old_key = single_key(1i32);
+        let claimed_key = single_key(2i32);
+        let mut old_reader_session = sys.try_new_session().unwrap();
+        let mut old_reader = old_reader_session.try_begin_trx().unwrap().unwrap();
+        let _ = assert_row_in_lwc(
+            &sys.table,
+            old_reader_session.pool_guards(),
+            &claimed_key,
+            old_reader.sts,
+        )
+        .await;
+
+        sys.new_trx_delete(&mut session, &claimed_key).await;
+
+        let mut gap_reader_session = sys.try_new_session().unwrap();
+        let mut gap_reader = gap_reader_session.try_begin_trx().unwrap().unwrap();
+
+        sys.new_trx_update(
+            &mut session,
+            &old_key,
+            vec![
+                UpdateCol {
+                    idx: 0,
+                    val: Val::from(2i32),
+                },
+                UpdateCol {
+                    idx: 1,
+                    val: Val::from("claimed"),
+                },
+            ],
+        )
+        .await;
+
+        sys.new_trx_select(&mut session, &claimed_key, |vals| {
+            assert_eq!(vals, vec![Val::from(2i32), Val::from("claimed")]);
+        })
+        .await;
+        old_reader = sys
+            .trx_select(old_reader, &claimed_key, |vals| {
+                assert_eq!(vals, vec![Val::from(2i32), Val::from("name")]);
+            })
+            .await;
+        gap_reader = sys.trx_select_not_found(gap_reader, &claimed_key).await;
+
+        old_reader.commit().await.unwrap();
+        gap_reader.commit().await.unwrap();
+
+        drop(gap_reader_session);
+        drop(old_reader_session);
+        drop(session);
+        sys.clean_all();
+    });
+}
+
+#[test]
+fn test_lwc_update_unique_rejects_cold_owner_deleted_after_snapshot() {
+    smol::block_on(async {
+        let sys = TestSys::new_evictable().await;
+        let mut session = sys.try_new_session().unwrap();
+        insert_rows(&sys, &mut session, 1, 2, "name").await;
+        sys.table.freeze(&session, usize::MAX).await;
+        sys.table.checkpoint(&mut session).await.unwrap();
+
+        let old_key = single_key(1i32);
+        let claimed_key = single_key(2i32);
+        let mut writer_session = sys.try_new_session().unwrap();
+        let mut writer = writer_session.try_begin_trx().unwrap().unwrap();
+        let writer_sts = writer.sts;
+        let claimed_row_id = assert_row_in_lwc(
+            &sys.table,
+            writer_session.pool_guards(),
+            &claimed_key,
+            writer_sts,
+        )
+        .await;
+
+        sys.new_trx_delete(&mut session, &claimed_key).await;
+        let delete_cts = delete_marker_ts(sys.table.deletion_buffer().get(claimed_row_id).unwrap());
+        assert!(delete_cts > writer_sts);
+        assert_unique_index_entry(
+            &sys.table,
+            writer_session.pool_guards(),
+            &claimed_key,
+            MAX_SNAPSHOT_TS,
+            claimed_row_id,
+            true,
+        )
+        .await;
+
+        writer = sys
+            .trx_select(writer, &claimed_key, |vals| {
+                assert_eq!(vals, vec![Val::from(2i32), Val::from("name")]);
+            })
+            .await;
+
+        let mut stmt = writer.start_stmt();
+        let res = stmt
+            .update_row(
+                &sys.table,
+                &old_key,
+                vec![
+                    UpdateCol {
+                        idx: 0,
+                        val: Val::from(2i32),
+                    },
+                    UpdateCol {
+                        idx: 1,
+                        val: Val::from("claimed"),
+                    },
+                ],
+            )
+            .await;
+        assert!(matches!(res, Ok(UpdateMvcc::DuplicateKey)));
+        let writer = stmt.fail().await.unwrap();
+        writer.rollback().await.unwrap();
+
+        assert_unique_index_entry(
+            &sys.table,
+            session.pool_guards(),
+            &claimed_key,
+            MAX_SNAPSHOT_TS,
+            claimed_row_id,
+            true,
+        )
+        .await;
+        sys.new_trx_select(&mut session, &old_key, |vals| {
+            assert_eq!(vals, vec![Val::from(1i32), Val::from("name")]);
+        })
+        .await;
+        sys.new_trx_select_not_found(&mut session, &claimed_key)
+            .await;
+
+        drop(writer_session);
+        drop(session);
+        sys.clean_all();
+    });
+}
+
+#[test]
+fn test_lwc_update_unique_claim_rollback_restores_deleted_cold_owner() {
+    smol::block_on(async {
+        let sys = TestSys::new_evictable().await;
+        let mut session = sys.try_new_session().unwrap();
+        insert_rows(&sys, &mut session, 1, 2, "name").await;
+        sys.table.freeze(&session, usize::MAX).await;
+        sys.table.checkpoint(&mut session).await.unwrap();
+
+        let old_key = single_key(1i32);
+        let claimed_key = single_key(2i32);
+        let mut old_reader_session = sys.try_new_session().unwrap();
+        let mut old_reader = old_reader_session.try_begin_trx().unwrap().unwrap();
+        let claimed_row_id = assert_row_in_lwc(
+            &sys.table,
+            old_reader_session.pool_guards(),
+            &claimed_key,
+            old_reader.sts,
+        )
+        .await;
+
+        sys.new_trx_delete(&mut session, &claimed_key).await;
+        assert_unique_index_entry(
+            &sys.table,
+            session.pool_guards(),
+            &claimed_key,
+            MAX_SNAPSHOT_TS,
+            claimed_row_id,
+            true,
+        )
+        .await;
+
+        let writer = session.try_begin_trx().unwrap().unwrap();
+        let mut stmt = writer.start_stmt();
+        let res = stmt
+            .update_row(
+                &sys.table,
+                &old_key,
+                vec![
+                    UpdateCol {
+                        idx: 0,
+                        val: Val::from(2i32),
+                    },
+                    UpdateCol {
+                        idx: 1,
+                        val: Val::from("claimed"),
+                    },
+                ],
+            )
+            .await;
+        let new_row_id = match res {
+            Ok(UpdateMvcc::Updated(row_id)) => row_id,
+            other => panic!("expected update success, got {other:?}"),
+        };
+        assert_ne!(claimed_row_id, new_row_id);
+        assert_unique_index_entry(
+            &sys.table,
+            session.pool_guards(),
+            &claimed_key,
+            stmt.trx.sts,
+            new_row_id,
+            false,
+        )
+        .await;
+        assert!(matches!(
+            sys.table
+                .find_row(session.pool_guards(), claimed_row_id)
+                .await,
+            RowLocation::LwcBlock { .. }
+        ));
+
+        // Keep the statement changes in the transaction so transaction rollback
+        // exercises index undo before row undo. That is the path where the
+        // claimed deleted owner must still resolve as RowLocation::LwcBlock.
+        let writer = stmt.succeed();
+        writer.rollback().await.unwrap();
+
+        assert_unique_index_entry(
+            &sys.table,
+            session.pool_guards(),
+            &claimed_key,
+            MAX_SNAPSHOT_TS,
+            claimed_row_id,
+            true,
+        )
+        .await;
+        sys.new_trx_select(&mut session, &old_key, |vals| {
+            assert_eq!(vals, vec![Val::from(1i32), Val::from("name")]);
+        })
+        .await;
+        sys.new_trx_select_not_found(&mut session, &claimed_key)
+            .await;
+        old_reader = sys
+            .trx_select(old_reader, &claimed_key, |vals| {
+                assert_eq!(vals, vec![Val::from(2i32), Val::from("name")]);
+            })
+            .await;
+        old_reader.commit().await.unwrap();
+
+        drop(old_reader_session);
+        drop(session);
+        sys.clean_all();
+    });
+}
+
+#[test]
+fn test_lwc_update_unique_claim_rollback_drops_purgeable_deleted_cold_owner() {
+    smol::block_on(async {
+        let sys = TestSys::new_evictable().await;
+        let mut session = sys.try_new_session().unwrap();
+        insert_rows(&sys, &mut session, 1, 2, "name").await;
+        sys.table.freeze(&session, usize::MAX).await;
+        sys.table.checkpoint(&mut session).await.unwrap();
+
+        let old_key = single_key(1i32);
+        let claimed_key = single_key(2i32);
+        let reader = session.try_begin_trx().unwrap().unwrap();
+        let claimed_row_id =
+            assert_row_in_lwc(&sys.table, session.pool_guards(), &claimed_key, reader.sts).await;
+        reader.commit().await.unwrap();
+
+        let index = sys.table.sec_idx()[claimed_key.index_no].unique().unwrap();
+        assert!(
+            index
+                .mask_as_deleted(
+                    session.pool_guards().index_guard(),
+                    &claimed_key.vals,
+                    claimed_row_id,
+                    MAX_SNAPSHOT_TS,
+                )
+                .await
+                .unwrap()
+        );
+        let delete_cts = 1;
+        sys.table
+            .deletion_buffer()
+            .put_committed(claimed_row_id, delete_cts)
+            .unwrap();
+        sys.new_trx_select_not_found(&mut session, &claimed_key)
+            .await;
+
+        let writer = session.try_begin_trx().unwrap().unwrap();
+        assert!(delete_cts < writer.sts);
+        assert!(
+            sys.table
+                .deletion_buffer()
+                .delete_marker_is_globally_purgeable(claimed_row_id, writer.sts)
+        );
+        let mut stmt = writer.start_stmt();
+        let res = stmt
+            .update_row(
+                &sys.table,
+                &old_key,
+                vec![
+                    UpdateCol {
+                        idx: 0,
+                        val: Val::from(2i32),
+                    },
+                    UpdateCol {
+                        idx: 1,
+                        val: Val::from("claimed"),
+                    },
+                ],
+            )
+            .await;
+        let new_row_id = match res {
+            Ok(UpdateMvcc::Updated(row_id)) => row_id,
+            other => panic!("expected update success, got {other:?}"),
+        };
+        assert_unique_index_entry(
+            &sys.table,
+            session.pool_guards(),
+            &claimed_key,
+            stmt.trx.sts,
+            new_row_id,
+            false,
+        )
+        .await;
+        assert!(matches!(
+            sys.table
+                .find_row(session.pool_guards(), claimed_row_id)
+                .await,
+            RowLocation::LwcBlock { .. }
+        ));
+
+        // This is the stale GC attempt from the original delete. While the
+        // replacement claim owns the unique key, GC observes a row-id mismatch
+        // and skips the entry, so rollback must not recreate that skipped
+        // delete-masked owner.
+        let deleted = sys
+            .table
+            .accessor()
+            .delete_index(
+                session.pool_guards(),
+                &claimed_key,
+                claimed_row_id,
+                true,
+                MAX_SNAPSHOT_TS,
+            )
+            .await
+            .unwrap();
+        assert!(!deleted);
+
+        let writer = stmt.succeed();
+        writer.rollback().await.unwrap();
+
+        assert!(
+            index
+                .lookup(
+                    session.pool_guards().index_guard(),
+                    &claimed_key.vals,
+                    MAX_SNAPSHOT_TS,
+                )
+                .await
+                .unwrap()
+                .is_none()
+        );
+        sys.new_trx_select(&mut session, &old_key, |vals| {
+            assert_eq!(vals, vec![Val::from(1i32), Val::from("name")]);
+        })
+        .await;
+        sys.new_trx_select_not_found(&mut session, &claimed_key)
+            .await;
+
         drop(session);
         sys.clean_all();
     });
@@ -1248,6 +1951,94 @@ fn test_index_purge_removes_delete_marked_unique_entry_when_row_is_not_found() {
                 .unwrap()
                 .is_none()
         );
+
+        drop(session);
+        sys.clean_all();
+    });
+}
+
+#[test]
+fn test_unique_insert_rollback_removes_claim_when_deleted_owner_not_found() {
+    smol::block_on(async {
+        let sys = TestSys::new_evictable().await;
+        let mut session = sys.try_new_session().unwrap();
+        let key = single_key(10_001i32);
+        let stale_row_id = 10_001;
+
+        assert!(matches!(
+            sys.table
+                .find_row(session.pool_guards(), stale_row_id)
+                .await,
+            RowLocation::NotFound
+        ));
+
+        let index = sys.table.sec_idx()[key.index_no].unique().unwrap();
+        assert!(
+            index
+                .insert_if_not_exists(
+                    session.pool_guards().index_guard(),
+                    &key.vals,
+                    stale_row_id,
+                    false,
+                    MAX_SNAPSHOT_TS,
+                )
+                .await
+                .unwrap()
+                .is_ok()
+        );
+        assert!(
+            index
+                .mask_as_deleted(
+                    session.pool_guards().index_guard(),
+                    &key.vals,
+                    stale_row_id,
+                    MAX_SNAPSHOT_TS,
+                )
+                .await
+                .unwrap()
+        );
+        assert_unique_index_entry(
+            &sys.table,
+            session.pool_guards(),
+            &key,
+            MAX_SNAPSHOT_TS,
+            stale_row_id,
+            true,
+        )
+        .await;
+
+        let trx = session.try_begin_trx().unwrap().unwrap();
+        let mut stmt = trx.start_stmt();
+        let new_row_id = unwrap_insert_result(
+            stmt.insert_row(&sys.table, vec![Val::from(10_001i32), Val::from("reborn")])
+                .await,
+        );
+        assert_ne!(new_row_id, stale_row_id);
+        assert_unique_index_entry(
+            &sys.table,
+            session.pool_guards(),
+            &key,
+            stmt.trx.sts,
+            new_row_id,
+            false,
+        )
+        .await;
+
+        let trx = stmt.fail().await.unwrap();
+        trx.rollback().await.unwrap();
+
+        assert!(
+            index
+                .lookup(
+                    session.pool_guards().index_guard(),
+                    &key.vals,
+                    MAX_SNAPSHOT_TS,
+                )
+                .await
+                .unwrap()
+                .is_none()
+        );
+        sys.new_trx_select_not_found(&mut session, &key).await;
 
         drop(session);
         sys.clean_all();
@@ -3464,6 +4255,26 @@ async fn assert_row_in_lwc(
         RowLocation::RowPage(..) => panic!("row should be in lwc"),
         RowLocation::NotFound => panic!("row should exist"),
     }
+}
+
+async fn assert_unique_index_entry(
+    table: &Table,
+    guards: &PoolGuards,
+    key: &SelectKey,
+    sts: TrxID,
+    expected_row_id: RowID,
+    expected_deleted: bool,
+) {
+    let index = table.sec_idx()[key.index_no].unique().unwrap();
+    let Some((row_id, deleted)) = index
+        .lookup(guards.index_guard(), &key.vals, sts)
+        .await
+        .expect("index lookup should succeed")
+    else {
+        panic!("index entry should exist");
+    };
+    assert_eq!(row_id, expected_row_id);
+    assert_eq!(deleted, expected_deleted);
 }
 
 fn delete_marker_ts(marker: DeleteMarker) -> TrxID {

@@ -22,7 +22,7 @@ use crate::trx::redo::{RowRedo, RowRedoKind};
 use crate::trx::row::{
     FindOldVersion, LockRowForWrite, LockUndo, ReadAllRows, RowReadAccess, RowWriteAccess,
 };
-use crate::trx::undo::{IndexBranch, OwnedRowUndo, RowUndoKind};
+use crate::trx::undo::{IndexBranch, IndexBranchTarget, OwnedRowUndo, RowUndoKind};
 use crate::trx::ver_map::RowPageState;
 use crate::trx::{MIN_SNAPSHOT_TS, TrxID, trx_is_committed};
 use crate::value::Val;
@@ -161,6 +161,12 @@ enum IndexPurgeDecision {
     RowPage(PageID),
 }
 
+enum ColdRowUpdateRead {
+    Ok(Vec<Val>),
+    NotFound,
+    WriteConflict,
+}
+
 impl<'a> From<&'a Table> for TableAccessor<'a, EvictableBufferPool, EvictableBufferPool> {
     #[inline]
     fn from(table: &'a Table) -> Self {
@@ -187,6 +193,14 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
         self.storage.map(ColumnStorage::deletion_buffer)
     }
 
+    /// Returns the deletion buffer for paths that already resolved a row as LWC.
+    /// Catalog accessors have no column storage, but they also must not resolve
+    /// row ids to persisted LWC blocks.
+    #[inline]
+    fn lwc_deletion_buffer(&self) -> Result<&ColumnDeletionBuffer> {
+        self.deletion_buffer().ok_or(Error::InvalidState)
+    }
+
     #[inline]
     async fn index_lookup_unique_row_mvcc(
         &self,
@@ -206,9 +220,7 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
                     row_idx,
                     row_shape_fingerprint,
                 } => {
-                    let Some(deletion_buffer) = self.deletion_buffer() else {
-                        return Ok(SelectMvcc::NotFound);
-                    };
+                    let deletion_buffer = self.lwc_deletion_buffer()?;
                     if let Some(marker) = deletion_buffer.get(row_id) {
                         match marker {
                             DeleteMarker::Committed(ts) => {
@@ -298,28 +310,139 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
     }
 
     #[inline]
-    fn cold_delete_marker_is_globally_purgeable(
+    async fn read_lwc_full_row(
         &self,
+        guards: &PoolGuards,
+        block_id: BlockID,
+        row_idx: usize,
+        row_shape_fingerprint: u128,
+    ) -> Result<Vec<Val>> {
+        let Some(storage) = self.storage else {
+            return Err(Error::InvalidState);
+        };
+        let block = PersistedLwcBlock::load(
+            storage.file().file_kind(),
+            storage.file().sparse_file(),
+            storage.disk_pool(),
+            guards.disk_guard(),
+            block_id,
+        )
+        .await?;
+        if block.row_shape_fingerprint() != row_shape_fingerprint {
+            return Err(Error::block_corrupted(
+                FileKind::TableFile,
+                BlockKind::LwcBlock,
+                block_id,
+                BlockCorruptionCause::InvalidPayload,
+            ));
+        }
+        block.decode_full_row_values(self.metadata(), row_idx)
+    }
+
+    #[inline]
+    fn index_keys_from_indexed_values(
+        &self,
+        read_set: &[usize],
+        vals: Vec<Val>,
+    ) -> Result<Vec<SelectKey>> {
+        if read_set.len() != vals.len() {
+            return Err(Error::InvalidState);
+        }
+        let indexed_vals = read_set
+            .iter()
+            .copied()
+            .zip(vals)
+            .collect::<HashMap<_, _>>();
+        self.metadata()
+            .index_specs
+            .iter()
+            .enumerate()
+            .map(|(index_no, index)| {
+                let vals = index
+                    .index_cols
+                    .iter()
+                    .map(|key| {
+                        indexed_vals
+                            .get(&(key.col_no as usize))
+                            .cloned()
+                            .ok_or(Error::InvalidState)
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                Ok(SelectKey::new(index_no, vals))
+            })
+            .collect()
+    }
+
+    #[inline]
+    async fn read_lwc_index_keys(
+        &self,
+        guards: &PoolGuards,
+        block_id: BlockID,
+        row_idx: usize,
+        row_shape_fingerprint: u128,
+    ) -> Result<Vec<SelectKey>> {
+        let mut read_set = self
+            .metadata()
+            .index_cols
+            .iter()
+            .copied()
+            .collect::<Vec<_>>();
+        read_set.sort_unstable();
+        let vals = self
+            .read_lwc_row(guards, block_id, row_idx, row_shape_fingerprint, &read_set)
+            .await?;
+        self.index_keys_from_indexed_values(&read_set, vals)
+    }
+
+    #[inline]
+    fn index_key_matches(keys: &[SelectKey], key: &SelectKey) -> Result<bool> {
+        let old_key = keys.get(key.index_no).ok_or(Error::InvalidState)?;
+        Ok(old_key.vals == key.vals)
+    }
+
+    #[inline]
+    async fn read_lwc_row_for_update(
+        &self,
+        stmt: &Statement,
+        key: &SelectKey,
         row_id: RowID,
-        min_active_sts: TrxID,
-    ) -> bool {
-        let Some(deletion_buffer) = self.deletion_buffer() else {
-            return false;
-        };
-        let Some(marker) = deletion_buffer.get(row_id) else {
-            return false;
-        };
-        let delete_cts = match marker {
-            DeleteMarker::Committed(ts) => ts,
-            DeleteMarker::Ref(status) => {
-                let ts = status.ts();
-                if !trx_is_committed(ts) {
-                    return false;
+        block_id: BlockID,
+        row_idx: usize,
+        row_shape_fingerprint: u128,
+    ) -> Result<ColdRowUpdateRead> {
+        let deletion_buffer = self.lwc_deletion_buffer()?;
+        // Cold rows are immutable, so their write visibility is tracked only
+        // by the column deletion buffer. Check the marker before decoding the
+        // persisted row image.
+        if let Some(marker) = deletion_buffer.get(row_id) {
+            match marker {
+                DeleteMarker::Committed(ts) => {
+                    if ts <= stmt.trx.sts {
+                        return Ok(ColdRowUpdateRead::NotFound);
+                    }
                 }
-                ts
+                DeleteMarker::Ref(status) => {
+                    let ts = status.ts();
+                    if trx_is_committed(ts) {
+                        if ts <= stmt.trx.sts {
+                            return Ok(ColdRowUpdateRead::NotFound);
+                        }
+                    } else if Arc::ptr_eq(&status, &stmt.trx.status()) {
+                        // This transaction already consumed the cold row.
+                        return Ok(ColdRowUpdateRead::NotFound);
+                    } else {
+                        return Ok(ColdRowUpdateRead::WriteConflict);
+                    }
+                }
             }
-        };
-        delete_cts < min_active_sts
+        }
+        let vals = self
+            .read_lwc_full_row(stmt.pool_guards(), block_id, row_idx, row_shape_fingerprint)
+            .await?;
+        if !self.metadata().match_key(key, &vals) {
+            return Ok(ColdRowUpdateRead::NotFound);
+        }
+        Ok(ColdRowUpdateRead::Ok(vals))
     }
 
     #[inline]
@@ -354,7 +477,9 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
         // secondary-index entry. A cold delete marker proves that every key for
         // the row is unreachable only after its transaction is committed and
         // older than the current purge horizon.
-        if self.cold_delete_marker_is_globally_purgeable(row_id, min_active_sts) {
+        if self.deletion_buffer().is_some_and(|deletion_buffer| {
+            deletion_buffer.delete_marker_is_globally_purgeable(row_id, min_active_sts)
+        }) {
             return Ok(IndexPurgeDecision::Delete);
         }
 
@@ -609,7 +734,18 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
         debug_assert!(new_row_id == row_id);
         stmt.update_last_row_undo(undo_kind);
         for branch in index_branches {
-            access.link_for_unique_index(branch.key, branch.cts, branch.entry, branch.undo_vals);
+            match branch.target {
+                IndexBranchTarget::Hot { cts, entry } => {
+                    access.link_for_unique_index(branch.key, cts, entry, branch.undo_vals);
+                }
+                IndexBranchTarget::ColdTerminal { delete_cts } => {
+                    access.link_for_unique_index_cold_terminal(
+                        branch.key,
+                        delete_cts,
+                        branch.undo_vals,
+                    );
+                }
+            }
         }
         drop(access);
 
@@ -826,8 +962,10 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
                         .collect();
                     IndexBranch {
                         key: SelectKey::new(index_no, vals),
-                        cts: undo_head.ts(),
-                        entry: old_entry.clone(),
+                        target: IndexBranchTarget::Hot {
+                            cts: undo_head.ts(),
+                            entry: old_entry.clone(),
+                        },
                         undo_vals: undo_vals.clone(),
                     }
                 })
@@ -839,6 +977,17 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
             .await?;
         // do not unlock the page because we may need to update index
         Ok((new_row_id, index_change_cols, new_guard))
+    }
+
+    #[inline]
+    fn build_cold_update_row(&self, mut vals: Vec<Val>, update: Vec<UpdateCol>) -> Vec<Val> {
+        for uc in update {
+            let val = &mut vals[uc.idx];
+            if val != &uc.val {
+                *val = uc.val;
+            }
+        }
+        vals
     }
 
     #[inline]
@@ -1068,16 +1217,31 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
         page_guard: &PageSharedGuard<RowPage>,
     ) -> Result<()> {
         let metadata = self.metadata();
-        for (index, index_schema) in self.sec_idx().iter().zip(&metadata.index_specs) {
+        let keys = self
+            .sec_idx()
+            .iter()
+            .map(|index| read_latest_index_key(metadata, index.index_no, page_guard, row_id))
+            .collect();
+        self.defer_delete_index_keys(stmt, row_id, keys).await
+    }
+
+    #[inline]
+    async fn defer_delete_index_keys(
+        &self,
+        stmt: &mut Statement,
+        row_id: RowID,
+        keys: Vec<SelectKey>,
+    ) -> Result<()> {
+        debug_assert_eq!(keys.len(), self.sec_idx().len());
+        for key in keys {
+            let index = &self.sec_idx()[key.index_no];
+            let index_schema = &self.metadata().index_specs[key.index_no];
             debug_assert!(index.is_unique() == index_schema.unique());
-            let key = read_latest_index_key(metadata, index.index_no, page_guard, row_id);
             if index_schema.unique() {
-                let index = index.unique().unwrap();
-                self.defer_delete_unique_index(stmt, index, row_id, key)
+                self.defer_delete_unique_index(stmt, index.unique().unwrap(), row_id, key)
                     .await?;
             } else {
-                let index = index.non_unique().unwrap();
-                self.defer_delete_non_unique_index(stmt, index, row_id, key)
+                self.defer_delete_non_unique_index(stmt, index.non_unique().unwrap(), row_id, key)
                     .await?;
             }
         }
@@ -1361,6 +1525,97 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
         }
     }
 
+    #[inline]
+    async fn unmasked_duplicate_has_lwc_delete_marker(
+        &self,
+        stmt: &Statement,
+        row_id: RowID,
+    ) -> Result<bool> {
+        // The normal LWC delete/update path masks index entries after writing
+        // the CDB marker, but another transaction may observe the small window
+        // before masking completes. Treat that as a link/write-conflict case
+        // instead of a plain duplicate.
+        match self
+            .try_find_row(stmt.pool_guards(), row_id, self.storage)
+            .await?
+        {
+            RowLocation::LwcBlock { .. } => {
+                let deletion_buffer = self.lwc_deletion_buffer()?;
+                Ok(deletion_buffer.get(row_id).is_some())
+            }
+            RowLocation::RowPage(_) | RowLocation::NotFound => Ok(false),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    #[inline]
+    async fn link_for_unique_index_lwc(
+        &self,
+        stmt: &Statement,
+        old_id: RowID,
+        key: &SelectKey,
+        new_id: RowID,
+        new_guard: &PageSharedGuard<RowPage>,
+        block_id: BlockID,
+        row_idx: usize,
+        row_shape_fingerprint: u128,
+    ) -> Result<LinkForUniqueIndex> {
+        let deletion_buffer = self.lwc_deletion_buffer()?;
+        // Convert the CDB marker into the delete timestamp carried by a
+        // terminal cold branch. `None` below means the cold row is visible to
+        // this statement, either because there is no marker or the committed
+        // delete is newer than the transaction snapshot; a matching persisted
+        // key must still reject the duplicate claim in that case. `Some(None)`
+        // means this transaction deleted the cold row itself; `Some(Some(_))`
+        // means a committed delete is visible to this transaction, so the new
+        // hot owner may keep the old image as a terminal branch for older
+        // snapshots.
+        let delete_cts = match deletion_buffer.get(old_id) {
+            None => None,
+            Some(DeleteMarker::Committed(ts)) => {
+                if ts <= stmt.trx.sts {
+                    Some(Some(ts))
+                } else {
+                    None
+                }
+            }
+            Some(DeleteMarker::Ref(status)) => {
+                let ts = status.ts();
+                if trx_is_committed(ts) {
+                    if ts <= stmt.trx.sts {
+                        Some(Some(ts))
+                    } else {
+                        None
+                    }
+                } else if Arc::ptr_eq(&status, &stmt.trx.status()) {
+                    Some(None)
+                } else {
+                    return Ok(LinkForUniqueIndex::WriteConflict);
+                }
+            }
+        };
+        let old_row = self
+            .read_lwc_full_row(stmt.pool_guards(), block_id, row_idx, row_shape_fingerprint)
+            .await?;
+        // The unique index entry may be stale while purge is catching up, so
+        // verify the persisted row still owns the key before linking it.
+        if !self.metadata().match_key(key, &old_row) {
+            return Ok(LinkForUniqueIndex::NotNeeded);
+        }
+        let Some(delete_cts) = delete_cts else {
+            return Ok(LinkForUniqueIndex::DuplicateKey);
+        };
+        let metadata = self.metadata();
+        let (ctx, page) = new_guard.ctx_and_page();
+        let mut new_access =
+            RowWriteAccess::new(page, ctx, page.row_idx(new_id), Some(stmt.trx.sts), false);
+        let undo_vals = new_access.row().calc_delta(metadata, &old_row);
+        // The new hot row owns the key now. The terminal branch preserves the
+        // old cold image for snapshots that still need to see it.
+        new_access.link_for_unique_index_cold_terminal(key.clone(), delete_cts, undo_vals);
+        Ok(LinkForUniqueIndex::Linked)
+    }
+
     /// Link old version for index.
     /// This is a special operation for unique index maintainance.
     /// It's triggered by duplicate key finding when updating index.
@@ -1389,7 +1644,24 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
                 .await
             {
                 Ok(RowLocation::NotFound) => return Ok(LinkForUniqueIndex::NotNeeded),
-                Ok(RowLocation::LwcBlock { .. }) => todo!("lwc block"),
+                Ok(RowLocation::LwcBlock {
+                    block_id,
+                    row_idx,
+                    row_shape_fingerprint,
+                }) => {
+                    return self
+                        .link_for_unique_index_lwc(
+                            stmt,
+                            old_id,
+                            key,
+                            new_id,
+                            new_guard,
+                            block_id,
+                            row_idx,
+                            row_shape_fingerprint,
+                        )
+                        .await;
+                }
                 Ok(RowLocation::RowPage(page_id)) => {
                     let Some(old_guard) = self
                         .try_get_validated_row_page_shared_result(
@@ -1451,9 +1723,11 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
                     // we found there is already one existing row with same key.
                     // so perform move+link.
                     debug_assert!(old_row_id != row_id);
-                    if !deleted {
-                        // As the key is not deleted, there must be an active row with same key.
-                        // todo: change logic if switch to lock-based protocol.
+                    if !deleted
+                        && !self
+                            .unmasked_duplicate_has_lwc_delete_marker(stmt, old_row_id)
+                            .await?
+                    {
                         return Ok(InsertIndex::DuplicateKey);
                     }
                     match self
@@ -1470,11 +1744,16 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
                             // but leave index not purged.
                             // The purge thread may delete the key before we apply the update.
                             // so our update can fail.
+                            let index_old_row_id = if deleted {
+                                old_row_id.deleted()
+                            } else {
+                                old_row_id
+                            };
                             match index
                                 .compare_exchange(
                                     index_pool_guard,
                                     &key.vals,
-                                    old_row_id.deleted(),
+                                    index_old_row_id,
                                     row_id,
                                     stmt.trx.sts,
                                 )
@@ -1506,11 +1785,16 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
                             // key. Because we only search the matched version of old row but not add
                             // logical lock on it, it's possible that both transactions are trying to
                             // update the index. Only one should succeed and the other will fail.
+                            let index_old_row_id = if deleted {
+                                old_row_id.deleted()
+                            } else {
+                                old_row_id
+                            };
                             match index
                                 .compare_exchange(
                                     index_pool_guard,
                                     &key.vals,
-                                    old_row_id.deleted(),
+                                    index_old_row_id,
                                     row_id,
                                     stmt.trx.sts,
                                 )
@@ -1637,14 +1921,18 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
                 IndexInsert::DuplicateKey(index_row_id, deleted) => {
                     // new row id is the insert id so index value must not be the same.
                     debug_assert!(index_row_id != new_row_id);
-                    if !deleted {
+                    if !deleted
+                        && !self
+                            .unmasked_duplicate_has_lwc_delete_marker(stmt, index_row_id)
+                            .await?
+                    {
                         return Ok(UpdateIndex::DuplicateKey);
                     }
                     // todo: change the logic.
                     // If we treat move-update just as delete and insert,
                     // with an extra linking step. then, we don't need to
                     // care about if index_row_id equal to old_row_id.
-                    if index_row_id == old_row_id {
+                    if deleted && index_row_id == old_row_id {
                         // This is possible.
                         // For example, transaction update row(RowID=100) key=1 to key=2.
                         //
@@ -1710,11 +1998,16 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
                         LinkForUniqueIndex::NotNeeded => {
                             // No old version found.
                             // so we can update index to point to self
+                            let index_old_row_id = if deleted {
+                                index_row_id.deleted()
+                            } else {
+                                index_row_id
+                            };
                             match index
                                 .compare_exchange(
                                     index_pool_guard,
                                     &new_key.vals,
-                                    index_row_id,
+                                    index_old_row_id,
                                     new_row_id,
                                     stmt.trx.sts,
                                 )
@@ -1753,11 +2046,16 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
                             // modified by self transaction. That means no other transaction
                             // can modify the new index key concurrently.
                             // So below operation must succeed.
+                            let index_old_row_id = if deleted {
+                                index_row_id.deleted()
+                            } else {
+                                index_row_id
+                            };
                             match index
                                 .compare_exchange(
                                     index_pool_guard,
                                     &new_key.vals,
-                                    index_row_id,
+                                    index_old_row_id,
                                     new_row_id,
                                     stmt.trx.sts,
                                 )
@@ -1928,8 +2226,11 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
                 IndexInsert::DuplicateKey(index_row_id, deleted) => {
                     // There is already a row with same new key.
                     // We have to check its status.
-                    if !deleted {
-                        // duplicate key.
+                    if !deleted
+                        && !self
+                            .unmasked_duplicate_has_lwc_delete_marker(stmt, index_row_id)
+                            .await?
+                    {
                         return Ok(UpdateIndex::DuplicateKey);
                     }
                     match self
@@ -1942,11 +2243,16 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
                         }
                         LinkForUniqueIndex::NotNeeded => {
                             // no old row found.
+                            let index_old_row_id = if deleted {
+                                index_row_id.deleted()
+                            } else {
+                                index_row_id
+                            };
                             match index
                                 .compare_exchange(
                                     index_pool_guard,
                                     &new_key.vals,
-                                    index_row_id.deleted(),
+                                    index_old_row_id,
                                     row_id,
                                     stmt.trx.sts,
                                 )
@@ -1977,11 +2283,16 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
                         LinkForUniqueIndex::Linked => {
                             // Both old row(index points to) and new row are locked.
                             // we must succeed on updating index.
+                            let index_old_row_id = if deleted {
+                                index_row_id.deleted()
+                            } else {
+                                index_row_id
+                            };
                             match index
                                 .compare_exchange(
                                     index_pool_guard,
                                     &new_key.vals,
-                                    index_row_id.deleted(),
+                                    index_old_row_id,
                                     row_id,
                                     stmt.trx.sts,
                                 )
@@ -2284,6 +2595,16 @@ impl<D: BufferPool, I: BufferPool> TableAccess for TableAccessor<'_, D, I> {
         debug_assert!(key.index_no < self.sec_idx().len());
         debug_assert!(self.metadata().index_specs[key.index_no].unique());
         debug_assert!(self.metadata().index_type_match(key.index_no, &key.vals));
+        debug_assert!(update.iter().all(|uc| {
+            uc.idx < self.metadata().col_count() && self.metadata().col_type_match(uc.idx, &uc.val)
+        }));
+        debug_assert!(
+            update.is_empty()
+                || update
+                    .iter()
+                    .zip(update.iter().skip(1))
+                    .all(|(l, r)| l.idx < r.idx)
+        );
         let index = self.sec_idx()[key.index_no].unique().unwrap();
         loop {
             let (page_guard, row_id) = match index
@@ -2300,7 +2621,82 @@ impl<D: BufferPool, I: BufferPool> TableAccess for TableAccessor<'_, D, I> {
                     .await
                 {
                     Ok(RowLocation::NotFound) => return Ok(UpdateMvcc::NotFound),
-                    Ok(RowLocation::LwcBlock { .. }) => todo!("lwc block"),
+                    Ok(RowLocation::LwcBlock {
+                        block_id,
+                        row_idx,
+                        row_shape_fingerprint,
+                    }) => {
+                        // LWC rows are immutable: update is modeled as a CDB
+                        // delete marker on the cold row plus a new hot row
+                        // containing the updated values.
+                        let old_vals = match self
+                            .read_lwc_row_for_update(
+                                stmt,
+                                key,
+                                row_id,
+                                block_id,
+                                row_idx,
+                                row_shape_fingerprint,
+                            )
+                            .await?
+                        {
+                            ColdRowUpdateRead::Ok(vals) => vals,
+                            ColdRowUpdateRead::NotFound => return Ok(UpdateMvcc::NotFound),
+                            ColdRowUpdateRead::WriteConflict => {
+                                return Ok(UpdateMvcc::WriteConflict);
+                            }
+                        };
+                        let deletion_buffer = self.lwc_deletion_buffer()?;
+                        match deletion_buffer.put_ref(row_id, stmt.trx.status(), stmt.trx.sts) {
+                            Ok(()) => (),
+                            Err(DeletionError::WriteConflict) => {
+                                return Ok(UpdateMvcc::WriteConflict);
+                            }
+                            Err(DeletionError::AlreadyDeleted) => {
+                                return Ok(UpdateMvcc::NotFound);
+                            }
+                        }
+                        stmt.row_undo.push(OwnedRowUndo::new(
+                            self.table_id(),
+                            None,
+                            row_id,
+                            RowUndoKind::Delete,
+                        ));
+                        stmt.redo.insert_dml(
+                            self.table_id(),
+                            RowRedo {
+                                page_id: INVALID_PAGE_ID,
+                                row_id,
+                                kind: RowRedoKind::Delete,
+                            },
+                        );
+
+                        // Match row-page update/delete behavior: mask the old
+                        // cold index entries now and let index undo restore
+                        // them on rollback or GC remove them after commit.
+                        let old_index_keys = self.metadata().keys_for_insert(&old_vals);
+                        self.defer_delete_index_keys(stmt, row_id, old_index_keys)
+                            .await?;
+
+                        let new_row = self.build_cold_update_row(old_vals, update.clone());
+                        let new_index_keys = self.metadata().keys_for_insert(&new_row);
+                        let (new_row_id, new_guard) = self
+                            .insert_row_internal(stmt, new_row, RowUndoKind::Insert, Vec::new())
+                            .await?;
+                        for key in new_index_keys {
+                            match self.insert_index(stmt, key, new_row_id, &new_guard).await? {
+                                InsertIndex::Inserted => (),
+                                InsertIndex::DuplicateKey => {
+                                    return Ok(UpdateMvcc::DuplicateKey);
+                                }
+                                InsertIndex::WriteConflict => {
+                                    return Ok(UpdateMvcc::WriteConflict);
+                                }
+                            }
+                        }
+                        new_guard.set_dirty();
+                        return Ok(UpdateMvcc::Updated(new_row_id));
+                    }
                     Ok(RowLocation::RowPage(page_id)) => {
                         let Some(page_guard) = self
                             .try_get_validated_row_page_shared_result(
@@ -2417,11 +2813,26 @@ impl<D: BufferPool, I: BufferPool> TableAccess for TableAccessor<'_, D, I> {
                     .await
                 {
                     Ok(RowLocation::NotFound) => return Ok(DeleteMvcc::NotFound),
-                    Ok(RowLocation::LwcBlock { .. }) => {
-                        let deletion_buffer = self
-                            .deletion_buffer()
-                            .expect("catalog table should never have lwc block rows");
-                        match deletion_buffer.put_ref(row_id, stmt.trx.status()) {
+                    Ok(RowLocation::LwcBlock {
+                        block_id,
+                        row_idx,
+                        row_shape_fingerprint,
+                    }) => {
+                        // Delete only needs old secondary-index keys, so read
+                        // indexed columns instead of decoding the whole row.
+                        let index_keys = self
+                            .read_lwc_index_keys(
+                                stmt.pool_guards(),
+                                block_id,
+                                row_idx,
+                                row_shape_fingerprint,
+                            )
+                            .await?;
+                        if !Self::index_key_matches(&index_keys, key)? {
+                            return Ok(DeleteMvcc::NotFound);
+                        }
+                        let deletion_buffer = self.lwc_deletion_buffer()?;
+                        match deletion_buffer.put_ref(row_id, stmt.trx.status(), stmt.trx.sts) {
                             Ok(()) => {
                                 let undo = OwnedRowUndo::new(
                                     self.table_id(),
@@ -2441,6 +2852,10 @@ impl<D: BufferPool, I: BufferPool> TableAccess for TableAccessor<'_, D, I> {
                                     kind: redo_kind,
                                 };
                                 stmt.redo.insert_dml(self.table_id(), redo);
+                                // Mask old index entries immediately; physical
+                                // deletion remains deferred to index GC.
+                                self.defer_delete_index_keys(stmt, row_id, index_keys)
+                                    .await?;
                                 return Ok(DeleteMvcc::Deleted);
                             }
                             Err(DeletionError::WriteConflict) => {
