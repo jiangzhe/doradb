@@ -411,9 +411,12 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
         row_shape_fingerprint: u128,
     ) -> Result<ColdRowUpdateRead> {
         let deletion_buffer = self.lwc_deletion_buffer()?;
-        // Cold rows are immutable, so their write visibility is tracked only
-        // by the column deletion buffer. Check the marker before decoding the
-        // persisted row image.
+        // Cold rows are immutable, so their write visibility is tracked by the
+        // column deletion buffer rather than by a row-page undo chain. A marker
+        // committed at or before this writer's snapshot means the row is gone
+        // for this statement. An uncommitted marker owned by this transaction
+        // means this statement already consumed the cold row. A marker owned by
+        // another active transaction is a write conflict.
         if let Some(marker) = deletion_buffer.get(row_id) {
             match marker {
                 DeleteMarker::Committed(ts) => {
@@ -436,6 +439,9 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
                 }
             }
         }
+        // Decode after the deletion-buffer visibility check, then revalidate
+        // the unique key. The index candidate can be stale while delete/index
+        // cleanup catches up with a cold-row delete.
         let vals = self
             .read_lwc_full_row(stmt.pool_guards(), block_id, row_idx, row_shape_fingerprint)
             .await?;
@@ -803,6 +809,9 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
         {
             return UpdateRowInplace::RowNotFound;
         }
+        // The row-page image must not change until the undo-head lock is
+        // installed. The lock path also rejects stale index candidates whose
+        // latest hot-row key no longer matches the lookup key.
         let mut lock_row = self
             .lock_row_for_write(stmt, &page_guard, row_id, Some(key))
             .await;
@@ -819,10 +828,13 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
                 }
                 match access.update_row(metadata, &update, frozen) {
                     UpdateRow::NoFreeSpaceOrFrozen(old_row) => {
-                        // Page does not have enough space or has been frozen for update,
-                        // we need to switch to out-of-place update mode, which will add
-                        // a DELETE undo entry to end original row and perform an INSERT into
-                        // new page, and link the two versions with index branches.
+                        // The hot row cannot be updated in place because the
+                        // page has no reusable space or has been frozen for
+                        // tuple movement. Convert this statement into a move
+                        // update: delete the old RowID with undo, insert the
+                        // replacement as a new hot RowID, and connect unique
+                        // owners with runtime branches when older snapshots
+                        // may still need the old version.
                         //
                         // Mark page data as deleted.
                         access.delete_row();
@@ -843,7 +855,10 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
                         UpdateRowInplace::NoFreeSpace(row_id, old_row, update, page_guard)
                     }
                     UpdateRow::Ok(mut row) => {
-                        // Index change columns contains the col_no and old value.
+                        // In-place update keeps the RowID stable. Only changed
+                        // columns are copied into undo/redo; indexed old values
+                        // are retained so MemTree can shadow or remap keys
+                        // after the row latch is released.
                         let mut index_change_cols = HashMap::new();
                         // perform in-place update.
                         let (mut undo_cols, mut redo_cols) = (vec![], vec![]);
@@ -872,7 +887,8 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
                                 });
                             }
                         }
-                        // Update LOCK entry to UPDATE entry.
+                        // The provisional row lock now becomes the operation
+                        // kind that MVCC reads and rollback will interpret.
                         stmt.update_last_row_undo(RowUndoKind::Update(undo_cols));
                         // Mark this access as update, so page-level max_ins_sts will be updated.
                         access.enable_ins_or_update();
@@ -880,8 +896,8 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
                         drop(lock_row);
                         // we may still need this page if we'd like to update index.
                         if !redo_cols.is_empty() {
-                            // there might be nothing to update, so we do not need to add redo log.
-                            // but undo is required because we need to properly lock the row.
+                            // A no-op update still used a row lock, but only a
+                            // real value change needs redo.
                             let redo_entry = RowRedo {
                                 page_id,
                                 row_id,
@@ -905,7 +921,9 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
         old_id: RowID,
         old_guard: PageSharedGuard<RowPage>,
     ) -> Result<(RowID, HashMap<usize, Val>, PageSharedGuard<RowPage>)> {
-        // calculate new row and index changes.
+        // Build the replacement hot row and remember indexed old values. The
+        // caller already turned the old hot row's first undo entry into
+        // `Delete`, so this path is logically delete-old plus insert-new.
         let (new_row, old_vals, index_change_cols) = {
             let mut index_change_cols = HashMap::new();
             let mut row = Vec::with_capacity(old_row.len());
@@ -943,6 +961,10 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
             })
             .collect();
         let index_branches = {
+            // Unique indexes keep only the latest owner in MemTree. When a
+            // move update changes RowID, the new hot row's insert undo carries
+            // runtime branches back to the deleted old hot row so older
+            // snapshots can still resolve the previous unique-key owner.
             let (ctx, page) = old_guard.ctx_and_page();
             let old_access = RowReadAccess::new(page, ctx, page.row_idx(old_id));
             let undo_head = old_access.undo_head().expect("undo head");
@@ -1175,6 +1197,9 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
         if !page.row_id_in_valid_range(row_id) {
             return DeleteInternal::NotFound;
         }
+        // The undo-head lock is the conflict check for hot delete. Once the
+        // lock is owned, the row-page delete bit becomes the latest image and
+        // the same undo entry is rewritten to `Delete`.
         let mut lock_row = self
             .lock_row_for_write(stmt, &page_guard, row_id, Some(key))
             .await;
@@ -1460,8 +1485,10 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
         Some(RowPageCreateRedoCtx::new(&engine.trx_sys, self.table_id()))
     }
 
-    // lock row will check write conflict on given row and lock it.
-    // clippy can not find the guard is actually dropped before await point.
+    // Hot-row writes acquire ownership by installing a `Lock` undo entry at
+    // the row's undo head. That entry is the row-level write lock and the
+    // rollback anchor that is later rewritten to Insert/Update/Delete.
+    // clippy cannot find the guard is actually dropped before await point.
     #[allow(clippy::await_holding_lock)]
     #[inline]
     pub(super) async fn lock_row_for_write<'b>(
@@ -1531,10 +1558,11 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
         stmt: &Statement,
         row_id: RowID,
     ) -> Result<bool> {
-        // The normal LWC delete/update path masks index entries after writing
-        // the CDB marker, but another transaction may observe the small window
-        // before masking completes. Treat that as a link/write-conflict case
-        // instead of a plain duplicate.
+        // The normal LWC delete/update path first writes the CDB marker and
+        // then masks index entries. Another transaction can observe the small
+        // window before masking completes. Any LWC marker therefore forces the
+        // duplicate path through link_for_unique_index_lwc(), where snapshot
+        // visibility decides between duplicate, link, and write conflict.
         match self
             .try_find_row(stmt.pool_guards(), row_id, self.storage)
             .await?
@@ -1561,15 +1589,16 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
         row_shape_fingerprint: u128,
     ) -> Result<LinkForUniqueIndex> {
         let deletion_buffer = self.lwc_deletion_buffer()?;
-        // Convert the CDB marker into the delete timestamp carried by a
-        // terminal cold branch. `None` below means the cold row is visible to
-        // this statement, either because there is no marker or the committed
-        // delete is newer than the transaction snapshot; a matching persisted
-        // key must still reject the duplicate claim in that case. `Some(None)`
-        // means this transaction deleted the cold row itself; `Some(Some(_))`
-        // means a committed delete is visible to this transaction, so the new
-        // hot owner may keep the old image as a terminal branch for older
-        // snapshots.
+        // Convert the CDB marker into the delete timestamp carried by a cold
+        // terminal unique branch. `None` below means the old cold owner is
+        // still visible to this statement, either because there is no marker or
+        // because the committed delete is newer than the statement snapshot. If
+        // the persisted row still matches the key, that remains a duplicate.
+        // `Some(None)` means this transaction itself installed the cold delete
+        // marker, so the old cold image must be reachable only through the new
+        // hot row's runtime unique branch. `Some(Some(ts))` means an earlier
+        // committed delete is visible to this statement, and older snapshots
+        // before `ts` may still need the old cold image.
         let delete_cts = match deletion_buffer.get(old_id) {
             None => None,
             Some(DeleteMarker::Committed(ts)) => {
@@ -1611,13 +1640,14 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
             RowWriteAccess::new(page, ctx, page.row_idx(new_id), Some(stmt.trx.sts), false);
         let undo_vals = new_access.row().calc_delta(metadata, &old_row);
         // The new hot row owns the key now. The terminal branch preserves the
-        // old cold image for snapshots that still need to see it.
+        // old cold image for snapshots that still need to see it. The branch is
+        // runtime-only; recovery restores only the latest committed mapping.
         new_access.link_for_unique_index_cold_terminal(key.clone(), delete_cts, undo_vals);
         Ok(LinkForUniqueIndex::Linked)
     }
 
     /// Link old version for index.
-    /// This is a special operation for unique index maintainance.
+    /// This is a special operation for unique index maintenance.
     /// It's triggered by duplicate key finding when updating index.
     ///
     /// There are scenarios as below:
@@ -1663,6 +1693,10 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
                         .await;
                 }
                 Ok(RowLocation::RowPage(page_id)) => {
+                    // A hot duplicate candidate must be inspected through its
+                    // row-page undo chain. It may be a stale latest mapping, a
+                    // deleted owner that older snapshots still need, or a true
+                    // duplicate visible to this transaction.
                     let Some(old_guard) = self
                         .try_get_validated_row_page_shared_result(
                             stmt.pool_guards(),
@@ -1678,8 +1712,11 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
                 Err(err) => return Err(err),
             }
         };
-        // The link process is to find one version of the old row that matches
-        // given key and then link new row to it.
+        // Find a non-deleted old hot version that matches the unique key. If
+        // this transaction cannot see that version, a runtime branch from the
+        // new owner to the old owner's undo chain preserves it for older
+        // snapshots. If this transaction can see it, the new claim is a real
+        // duplicate.
         let metadata = self.metadata();
         let (ctx, page) = old_guard.ctx_and_page();
         let old_access = RowReadAccess::new(page, ctx, page.row_idx(old_id));
@@ -1720,8 +1757,10 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
                     return Ok(InsertIndex::Inserted);
                 }
                 IndexInsert::DuplicateKey(old_row_id, deleted) => {
-                    // we found there is already one existing row with same key.
-                    // so perform move+link.
+                    // A unique key already has a latest mapping. A live
+                    // non-deleted owner is a duplicate. A delete-masked or
+                    // cold-marked owner may instead be a stale/old owner that
+                    // should be linked for snapshots before this new claim.
                     debug_assert!(old_row_id != row_id);
                     if !deleted
                         && !self
@@ -1739,11 +1778,10 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
                             return Ok(InsertIndex::WriteConflict);
                         }
                         LinkForUniqueIndex::NotNeeded => {
-                            // No old row found, so we can update index to point to self.
-                            // This may happen because purge thread can remove row data,
-                            // but leave index not purged.
-                            // The purge thread may delete the key before we apply the update.
-                            // so our update can fail.
+                            // No old version matched the key. The index entry
+                            // was stale or has already been purged, so claim
+                            // the latest mapping if it still points to the
+                            // same old row id.
                             let index_old_row_id = if deleted {
                                 old_row_id.deleted()
                             } else {
@@ -1781,10 +1819,10 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
                             }
                         }
                         LinkForUniqueIndex::Linked => {
-                            // There is scenario that two transactions update different rows to the same
-                            // key. Because we only search the matched version of old row but not add
-                            // logical lock on it, it's possible that both transactions are trying to
-                            // update the index. Only one should succeed and the other will fail.
+                            // Linking preserved the older visible owner but
+                            // does not lock the logical key globally. Competing
+                            // transactions can race here; compare_exchange is
+                            // the serialization point for the new latest owner.
                             let index_old_row_id = if deleted {
                                 old_row_id.deleted()
                             } else {
@@ -1858,6 +1896,9 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
         key: SelectKey,
     ) -> Result<()> {
         let index_pool_guard = self.index_pool_guard(stmt.pool_guards());
+        // Foreground hot delete/update masks the latest unique mapping instead
+        // of physically removing it. The row id is retained so older snapshots
+        // and rollback can still recover the previous owner.
         let res = index
             .mask_as_deleted(index_pool_guard, &key.vals, row_id, stmt.trx.sts)
             .await?;
@@ -1875,6 +1916,8 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
         key: SelectKey,
     ) -> Result<()> {
         let index_pool_guard = self.index_pool_guard(stmt.pool_guards());
+        // Non-unique entries are exact `(key, row_id)` claims, so masking this
+        // pair shadows the old hot version while preserving rollback state.
         let res = index
             .mask_as_deleted(index_pool_guard, &key.vals, row_id, stmt.trx.sts)
             .await?;
@@ -1898,7 +1941,10 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
         debug_assert!(old_row_id != new_row_id);
         let index_pool_guard = self.index_pool_guard(stmt.pool_guards());
         loop {
-            // new_row_id is guaranteed to be not in the index.
+            // Move update with a unique-key change. The new RowID cannot
+            // already be in the index; duplicate handling below decides
+            // whether an existing logical-key owner is visible, stale, or
+            // should be linked for older snapshots.
             match index
                 .insert_if_not_exists(
                     index_pool_guard,
@@ -1919,7 +1965,8 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
                     return Ok(UpdateIndex::Updated);
                 }
                 IndexInsert::DuplicateKey(index_row_id, deleted) => {
-                    // new row id is the insert id so index value must not be the same.
+                    // The new row id is the insert id, so a duplicate points
+                    // to another latest or delete-masked owner.
                     debug_assert!(index_row_id != new_row_id);
                     if !deleted
                         && !self
@@ -1984,9 +2031,9 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
                             }
                         }
                     }
-                    // There is a conflict key pointing to another row.
-                    // We have to check the status of the old row.
-                    // See comments of method link_for_unique_index().
+                    // A conflicting key points to another row. Inspect that
+                    // hot/cold owner before deciding whether this is a true
+                    // duplicate, a write conflict, or a linkable old owner.
                     match self
                         .link_for_unique_index(stmt, index_row_id, &new_key, new_row_id, new_guard)
                         .await?
@@ -1996,8 +2043,9 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
                             return Ok(UpdateIndex::WriteConflict);
                         }
                         LinkForUniqueIndex::NotNeeded => {
-                            // No old version found.
-                            // so we can update index to point to self
+                            // No visible old version matched the key, so the
+                            // existing index entry is stale and can be claimed
+                            // if it has not changed concurrently.
                             let index_old_row_id = if deleted {
                                 index_row_id.deleted()
                             } else {
@@ -2040,12 +2088,10 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
                             }
                         }
                         LinkForUniqueIndex::Linked => {
-                            // Old version found and linked.
-                            // Because in linking process, we checked the old row status.
-                            // The on-page version of old row must be deleted or being
-                            // modified by self transaction. That means no other transaction
-                            // can modify the new index key concurrently.
-                            // So below operation must succeed.
+                            // The older owner was preserved through a runtime
+                            // branch. The compare_exchange publishes the new
+                            // latest owner while ensuring the entry still
+                            // points at the owner we inspected.
                             let index_old_row_id = if deleted {
                                 index_row_id.deleted()
                             } else {
@@ -2101,7 +2147,8 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
     ) -> Result<UpdateIndex> {
         debug_assert!(old_row_id != new_row_id);
         let index_pool_guard = self.index_pool_guard(stmt.pool_guards());
-        // new_row_id is guaranteed to be not in the index.
+        // Non-unique indexes store exact `(key, row_id)` entries, so a move
+        // update inserts the new exact entry and masks the old one.
         match index
             .insert_if_not_exists(
                 index_pool_guard,
@@ -2136,6 +2183,9 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
     ) -> Result<UpdateIndex> {
         debug_assert!(old_row_id != new_row_id);
         let index_pool_guard = self.index_pool_guard(stmt.pool_guards());
+        // Move update where the unique key is unchanged. The logical key keeps
+        // one latest mapping, so atomically replace the old RowID with the new
+        // hot RowID and record undo to restore it on rollback.
         match index
             .compare_exchange(
                 index_pool_guard,
@@ -2173,7 +2223,8 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
     ) -> Result<UpdateIndex> {
         debug_assert!(old_row_id != new_row_id);
         let index_pool_guard = self.index_pool_guard(stmt.pool_guards());
-        // insert new entry.
+        // Non-unique key unchanged but RowID changed: publish the replacement
+        // exact entry, then mask the old exact entry for rollback/GC.
         let res = index
             .insert_if_not_exists(index_pool_guard, &key.vals, new_row_id, false, stmt.trx.sts)
             .await?;
@@ -2201,6 +2252,11 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
     ) -> Result<UpdateIndex> {
         let index_pool_guard = self.index_pool_guard(stmt.pool_guards());
         loop {
+            // In-place unique-key change keeps the same RowID. Repeated key
+            // changes in the same transaction can encounter this RowID already
+            // delete-masked under the new key, so insert may merge by flipping
+            // the delete flag back to active.
+            //
             // This is case for one transaction or multiple transactions to update
             // key of the same row back and forth.
             // e.g. update k=1 to k=2, then update k=2 to k=1, ...
@@ -2224,8 +2280,10 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
                     return Ok(UpdateIndex::Updated);
                 }
                 IndexInsert::DuplicateKey(index_row_id, deleted) => {
-                    // There is already a row with same new key.
-                    // We have to check its status.
+                    // Another owner is mapped to the new key. Inspect it
+                    // before deciding whether this is a duplicate, a stale
+                    // mapping, or an old owner to preserve through a runtime
+                    // unique branch.
                     if !deleted
                         && !self
                             .unmasked_duplicate_has_lwc_delete_marker(stmt, index_row_id)
@@ -2566,11 +2624,15 @@ impl<D: BufferPool, I: BufferPool> TableAccess for TableAccessor<'_, D, I> {
                 .all(|(idx, val)| self.metadata().col_type_match(idx, val))
         });
         let keys = self.metadata().keys_for_insert(&cols);
-        // insert row into page with undo log linked.
+        // Insert always creates a hot RowStore row. The insert undo head makes
+        // the new row invisible to older snapshots and is also the rollback
+        // handle if any following index insert fails.
         let (row_id, page_guard) = self
             .insert_row_internal(stmt, cols, RowUndoKind::Insert, Vec::new())
             .await?;
-        // insert index
+        // Secondary-index claims are made after the row exists so unique
+        // duplicate handling can link this new hot row to older owners if
+        // needed for MVCC visibility.
         for key in keys {
             match self.insert_index(stmt, key, row_id, &page_guard).await? {
                 InsertIndex::Inserted => (),
@@ -2626,9 +2688,11 @@ impl<D: BufferPool, I: BufferPool> TableAccess for TableAccessor<'_, D, I> {
                         row_idx,
                         row_shape_fingerprint,
                     }) => {
-                        // LWC rows are immutable: update is modeled as a CDB
-                        // delete marker on the cold row plus a new hot row
-                        // containing the updated values.
+                        // LWC rows are immutable. A cold update is represented
+                        // as an owned CDB delete marker for the old row plus a
+                        // new hot RowStore row containing the updated values.
+                        // read_lwc_row_for_update() checks snapshot visibility
+                        // before decoding and key revalidation.
                         let old_vals = match self
                             .read_lwc_row_for_update(
                                 stmt,
@@ -2647,6 +2711,10 @@ impl<D: BufferPool, I: BufferPool> TableAccess for TableAccessor<'_, D, I> {
                             }
                         };
                         let deletion_buffer = self.lwc_deletion_buffer()?;
+                        // The read above is only validation. This put_ref() is
+                        // the definitive ownership claim and rechecks the CDB
+                        // state under the map entry to catch races with other
+                        // cold delete/update transactions.
                         match deletion_buffer.put_ref(row_id, stmt.trx.status(), stmt.trx.sts) {
                             Ok(()) => (),
                             Err(DeletionError::WriteConflict) => {
@@ -2656,6 +2724,11 @@ impl<D: BufferPool, I: BufferPool> TableAccess for TableAccessor<'_, D, I> {
                                 return Ok(UpdateMvcc::NotFound);
                             }
                         }
+                        // Cold delete undo has no row page. Rollback routes
+                        // page_id=None to CDB marker removal; redo uses
+                        // INVALID_PAGE_ID so recovery replays the delete into
+                        // the deletion buffer when it is newer than the
+                        // deletion checkpoint cutoff.
                         stmt.row_undo.push(OwnedRowUndo::new(
                             self.table_id(),
                             None,
@@ -2674,6 +2747,9 @@ impl<D: BufferPool, I: BufferPool> TableAccess for TableAccessor<'_, D, I> {
                         // Match row-page update/delete behavior: mask the old
                         // cold index entries now and let index undo restore
                         // them on rollback or GC remove them after commit.
+                        // Unique indexes may also install runtime branches from
+                        // the hot replacement to the old cold owner while the
+                        // new row's index entries are inserted below.
                         let old_index_keys = self.metadata().keys_for_insert(&old_vals);
                         self.defer_delete_index_keys(stmt, row_id, old_index_keys)
                             .await?;
@@ -2698,6 +2774,9 @@ impl<D: BufferPool, I: BufferPool> TableAccess for TableAccessor<'_, D, I> {
                         return Ok(UpdateMvcc::Updated(new_row_id));
                     }
                     Ok(RowLocation::RowPage(page_id)) => {
+                        // Hot-row update proceeds through row-page locking and
+                        // undo-chain visibility. A stale index location is
+                        // retried or rejected before any row mutation.
                         let Some(page_guard) = self
                             .try_get_validated_row_page_shared_result(
                                 stmt.pool_guards(),
@@ -2720,7 +2799,9 @@ impl<D: BufferPool, I: BufferPool> TableAccess for TableAccessor<'_, D, I> {
                 UpdateRowInplace::Ok(new_row_id, index_change_cols, page_guard) => {
                     debug_assert!(row_id == new_row_id);
                     if !index_change_cols.is_empty() {
-                        // Index may change, we should check whether each index key change and update correspondingly.
+                        // RowID is unchanged, but logical keys may have moved.
+                        // Update MemTree after the page mutation so rollback
+                        // can restore both row data and index visibility.
                         let res = self
                             .update_indexes_only_key_change(
                                 stmt,
@@ -2748,8 +2829,10 @@ impl<D: BufferPool, I: BufferPool> TableAccess for TableAccessor<'_, D, I> {
                     continue;
                 }
                 UpdateRowInplace::NoFreeSpace(old_row_id, old_row, update, old_guard) => {
-                    // in-place update failed, we transfer update into
-                    // move+update.
+                    // In-place update failed after the old row was locked and
+                    // marked deleted. Finish the move update by inserting the
+                    // replacement row and then update indexes for any RowID or
+                    // key movement.
                     let (new_row_id, index_change_cols, new_guard) = self
                         .move_update_for_space(stmt, old_row, update, old_row_id, old_guard)
                         .await?;
@@ -2820,6 +2903,9 @@ impl<D: BufferPool, I: BufferPool> TableAccess for TableAccessor<'_, D, I> {
                     }) => {
                         // Delete only needs old secondary-index keys, so read
                         // indexed columns instead of decoding the whole row.
+                        // The key recheck prevents acting on stale DiskTree or
+                        // MemTree state after another path already moved the
+                        // logical key away from this cold row.
                         let index_keys = self
                             .read_lwc_index_keys(
                                 stmt.pool_guards(),
@@ -2834,6 +2920,9 @@ impl<D: BufferPool, I: BufferPool> TableAccess for TableAccessor<'_, D, I> {
                         let deletion_buffer = self.lwc_deletion_buffer()?;
                         match deletion_buffer.put_ref(row_id, stmt.trx.status(), stmt.trx.sts) {
                             Ok(()) => {
+                                // The marker is the transaction-owned delete
+                                // state. Row undo removes it on rollback; redo
+                                // rebuilds it as a cold delete during recovery.
                                 let undo = OwnedRowUndo::new(
                                     self.table_id(),
                                     None,
@@ -2867,6 +2956,9 @@ impl<D: BufferPool, I: BufferPool> TableAccess for TableAccessor<'_, D, I> {
                         }
                     }
                     Ok(RowLocation::RowPage(page_id)) => {
+                        // Hot delete is an in-page delete bit guarded by row
+                        // undo. Index entries are masked after the row mutation
+                        // and restored by index undo on rollback.
                         let Some(page_guard) = self
                             .try_get_validated_row_page_shared_result(
                                 stmt.pool_guards(),
@@ -2893,7 +2985,9 @@ impl<D: BufferPool, I: BufferPool> TableAccess for TableAccessor<'_, D, I> {
                     continue;
                 }
                 DeleteInternal::Ok(page_guard) => {
-                    // defer index deletion with index undo log.
+                    // Mask every secondary-index entry for this hot row. The
+                    // physical index entry remains until rollback unmasks it
+                    // or index GC removes it after it is no longer visible.
                     self.defer_delete_indexes(stmt, row_id, &page_guard).await?;
                     page_guard.set_dirty(); // mark as dirty.
                     return Ok(DeleteMvcc::Deleted);

@@ -131,13 +131,18 @@ impl IndexUndoLogs {
             IndexUndoKind::InsertUnique(key, merge_old_deleted) => {
                 let index = table.sec_idx()[key.index_no].unique().unwrap();
                 if merge_old_deleted {
-                    // this is actually a update from deleted to non-deleted.
-                    // so we just mask it back to deleted.
+                    // This insert reused a delete-masked unique entry for the
+                    // same RowID, usually from repeated hot key changes in one
+                    // transaction. Rollback restores the masked old owner
+                    // instead of removing the entry.
                     let res = index
                         .mask_as_deleted(index_pool_guard, &key.vals, entry.row_id, ts)
                         .await?;
                     assert!(res);
                 } else {
+                    // The transaction created a new latest unique owner. If it
+                    // aborts, remove only that claim; older owners are restored
+                    // by separate update/defer-delete undo entries.
                     let res = index
                         .compare_delete(index_pool_guard, &key.vals, entry.row_id, true, ts)
                         .await?;
@@ -147,11 +152,15 @@ impl IndexUndoLogs {
             IndexUndoKind::InsertNonUnique(key, merge_old_deleted) => {
                 let index = table.sec_idx()[key.index_no].non_unique().unwrap();
                 if merge_old_deleted {
+                    // Same exact `(key, row_id)` was unmasked during a hot
+                    // key-change cycle. Rollback masks it back to deleted.
                     let res = index
                         .mask_as_deleted(index_pool_guard, &key.vals, entry.row_id, ts)
                         .await?;
                     assert!(res);
                 } else {
+                    // Remove the exact non-unique claim inserted by the
+                    // aborted transaction.
                     let res = index
                         .compare_delete(index_pool_guard, &key.vals, entry.row_id, true, ts)
                         .await?;
@@ -170,19 +179,14 @@ impl IndexUndoLogs {
                         .await?;
                     debug_assert!(res.is_ok());
                 } else {
-                    // There is a race condition:
-                    // Transaction A deleted a row{row_id=100, k=1} and committed.
-                    // GC thread is trying to delete index entry.
-                    // Meanwhile, transaction B is inserting a row{row_id=200, k=1}, and updates
-                    // index entry {k=1,row_id=100} to {k=1, row_id=200}.
-                    // After the index change, GC thread finds index value of transaction A
-                    // does not match orignal value(row_id != 100), then skips the index deletion.
-                    // After that, transaction B starts to rollback.
-                    // If transaction B does not care about the status of original row, it will leave
-                    // a leaked index entry {k=1, row_id=100}, and no GC will touch it again.
-                    //
-                    // To solve this, we need to re-check original row with row latch and delete
-                    // index entry if it is deleted and does not have any old version (already GCed).
+                    // Roll back a claim over a delete-masked unique owner.
+                    // The replacement row may have taken over an index entry
+                    // that previously pointed at a deleted hot or cold owner.
+                    // If rollback blindly restores that owner after GC has
+                    // already proven it obsolete, the index can leak a stale
+                    // entry that no later GC pass owns. Re-check the old owner
+                    // location and decide whether to restore the masked owner
+                    // or delete only the failed replacement claim.
                     match table.find_row(guards, old_row_id, storage).await {
                         RowLocation::NotFound => {
                             // The delete-masked owner may already have been
@@ -203,11 +207,12 @@ impl IndexUndoLogs {
                             row_shape_fingerprint,
                         } => {
                             // Rollback of a claimed cold unique owner cannot
-                            // latch a row page. Use the same cold-delete
-                            // purgeability rule as index GC: when no live
-                            // snapshot can need the deleted owner, remove only
-                            // the replacement claim instead of recreating a
-                            // masked owner that GC may already have skipped.
+                            // latch a row page or inspect a row undo chain.
+                            // Use the same cold-delete purgeability rule as
+                            // index GC: when no live snapshot can need the
+                            // deleted owner, remove only the replacement claim
+                            // instead of recreating a masked owner that GC may
+                            // already have skipped.
                             let new_row_id = entry.row_id;
                             let index = table.sec_idx()[key.index_no].unique().unwrap();
                             if storage.is_some_and(|storage| {
@@ -236,6 +241,10 @@ impl IndexUndoLogs {
                                 assert!(res);
                                 return Ok(());
                             }
+                            // If the persisted LWC row no longer matches the
+                            // key, the unique entry we claimed was stale.
+                            // Removing the replacement claim is enough; there
+                            // is no matching old owner to restore for this key.
                             if !Self::lwc_row_matches_key(
                                 table,
                                 storage,
@@ -284,7 +293,11 @@ impl IndexUndoLogs {
                             let (ctx, page) = page_guard.ctx_and_page();
                             let access = RowReadAccess::new(page, ctx, page.row_idx(old_row_id));
                             if access.row().is_deleted() && !access.any_old_version_exists() {
-                                // old row is invisible to all transactions.
+                                // The old hot owner is now globally invisible:
+                                // its page image is deleted and no undo chain
+                                // can reconstruct an older visible version.
+                                // Rollback removes the failed replacement
+                                // claim instead of resurrecting a stale owner.
                                 let new_row_id = entry.row_id;
                                 let index = table.sec_idx()[key.index_no].unique().unwrap();
                                 let res = index
@@ -298,9 +311,10 @@ impl IndexUndoLogs {
                                     .await?;
                                 assert!(res);
                             } else {
-                                // old row must be seen for one transaction.
-                                // rollback the index change and let other take care of
-                                // following GC.
+                                // Some active or future snapshot may still
+                                // need the delete-masked hot owner. Restore
+                                // that masked owner and let normal defer-delete
+                                // undo or GC finish cleanup.
                                 let new_row_id = entry.row_id;
                                 let index = table.sec_idx()[key.index_no].unique().unwrap();
                                 let res = index
@@ -319,8 +333,10 @@ impl IndexUndoLogs {
                 }
             }
             IndexUndoKind::DeferDelete(key, unique) => {
-                // Because we always mask index entry as deleted for each defer delete undo log.
-                // We need to unmask it.
+                // Foreground hot/cold delete and update paths mask index
+                // entries but leave them physically present for rollback and
+                // old snapshots. Aborting the transaction unmasks the exact
+                // owner that was deferred for deletion.
                 if unique {
                     let index = table.sec_idx()[key.index_no].unique().unwrap();
                     let res = index

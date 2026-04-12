@@ -109,26 +109,37 @@ impl<'a> RowReadAccess<'a> {
             RowReadState::RowVer(undo) => match &**undo {
                 None => self.read_row_latest(metadata, read_set, key),
                 Some(undo_head) => {
-                    // At this point, we already wait for preparation of commit is done.
-                    // So we only have two cases: uncommitted, and committed.
+                    // A hot row page stores the newest physical image, while
+                    // the undo head stores the transaction status that decides
+                    // whether this reader can use that image directly. Commit
+                    // preparation has already been waited out before this
+                    // read, so the head is either committed or still owned by
+                    // an active transaction.
                     let ts = undo_head.ts();
                     if trx_is_committed(ts) {
                         if trx.sts > ts {
-                            // This version is visible
+                            // The latest row-page image committed before this
+                            // snapshot, so no undo traversal is needed.
                             return self.read_row_latest(metadata, read_set, key);
                         } // Otherwise, go to next version
                     } else {
                         let trx_id = trx.trx_id();
                         if trx_id == ts {
-                            // Self update, see the latest version
+                            // Read-your-own-write: the uncommitted page image
+                            // belongs to this transaction.
                             return self.read_row_latest(metadata, read_set, key);
                         } // Otherwise, go to next version
                     }
-                    // Page data is invisible, we have to backtrace version chain
-                    // Prepare visitor of version chain.
+                    // The page image is too new for this snapshot. Walk the
+                    // hot undo chain and apply inverse operations until the
+                    // visible version is reconstructed.
                     let mut next = &undo_head.next;
                     let read_set: BTreeSet<usize> = read_set.iter().cloned().collect();
                     let key_tracker = if let Some(key) = key {
+                        // Index lookups may route through a latest row whose
+                        // current key no longer matches the lookup key. Track
+                        // enough key columns to validate older reconstructed
+                        // versions, even when the user read set omitted them.
                         let index_spec = &metadata.index_specs[key.index_no];
                         let user_key_idx_map: HashMap<usize, usize> = index_spec
                             .index_cols
@@ -165,9 +176,10 @@ impl<'a> RowReadAccess<'a> {
                         let entry;
                         // First we check index branch with matched key.
                         if let Some(ib) = next.index_branch(key) {
-                            // Because index branch jump to version of another row,
-                            // we should first apply the differences between current
-                            // row and that row.
+                            // A unique-index branch jumps from the latest key
+                            // owner to an older owner that may have a different
+                            // RowID. Apply the delta from the current row image
+                            // to that older owner before checking its target.
                             ver.undo_update(&ib.undo_vals);
                             // Index branch only contains non-deleted version.
                             // So delete flag is not used.
@@ -178,15 +190,25 @@ impl<'a> RowReadAccess<'a> {
                                     entry: hot_entry,
                                 } => {
                                     if trx.sts > *cts {
-                                        // current version is visible
+                                        // The old same-key hot owner stopped
+                                        // being visible before this snapshot,
+                                        // so the current reconstructed owner is
+                                        // the visible one.
                                         return ver.get_visible_vals(metadata, self.row(), key);
                                     }
+                                    // Older snapshots continue from the old
+                                    // hot owner's undo chain.
                                     entry = hot_entry.as_ref();
                                 }
                                 IndexBranchTarget::ColdTerminal { delete_cts } => {
                                     // A cold terminal branch has no older undo
-                                    // chain. It remains visible to snapshots
-                                    // before its CDB delete timestamp.
+                                    // chain. `ver` already holds the cold image
+                                    // reconstructed from undo_vals. It remains
+                                    // visible only to snapshots at or before
+                                    // its committed CDB delete timestamp; a
+                                    // missing timestamp means the current
+                                    // uncommitted transaction owns the cold
+                                    // delete marker.
                                     if let Some(delete_cts) = delete_cts
                                         && trx.sts > *delete_cts
                                     {
@@ -199,7 +221,8 @@ impl<'a> RowReadAccess<'a> {
                             // Key not match, go to main branch
                             entry = next.main.entry.as_ref();
                         }
-                        // visit undo log
+                        // Apply the inverse of the foreground operation that
+                        // produced this undo entry.
                         match &entry.kind {
                             RowUndoKind::Lock => (), // do nothing.
                             RowUndoKind::Insert => {
@@ -725,6 +748,10 @@ impl<'a> RowWriteAccess<'a> {
         let row = self.page.row(self.row_idx);
         match &mut *self.guard {
             None => {
+                // No undo head exists yet, so this transaction becomes the
+                // first writer for the hot row. The `Lock` entry is pushed to
+                // transaction-owned row undo before the actual row-page change
+                // is made.
                 let entry = OwnedRowUndo::new(table_id, Some(page_id), row_id, RowUndoKind::Lock);
                 self.add_undo_head(stmt.trx.status(), entry.leak());
                 stmt.row_undo.push(entry);
@@ -732,6 +759,9 @@ impl<'a> RowWriteAccess<'a> {
             }
             Some(undo_head) => {
                 if stmt.trx.is_same_trx(undo_head) {
+                    // Re-entrant write by the same transaction. Chain another
+                    // provisional lock entry so each statement-level operation
+                    // can roll back independently in reverse order.
                     let mut entry =
                         OwnedRowUndo::new(table_id, Some(page_id), row_id, RowUndoKind::Lock);
                     let new_next = NextRowUndo::new(MainBranch {
@@ -745,7 +775,10 @@ impl<'a> RowWriteAccess<'a> {
                 }
                 let old_cts = undo_head.ts();
                 if trx_is_committed(old_cts) {
-                    // This row is committed, no lock conflict.
+                    // The previous writer has committed, so this transaction
+                    // can own a new undo head. Key validation filters stale
+                    // index candidates before the row is locked.
+                    //
                     // Check whether the row is valid through index lookup.
                     // There might be case an out-of-date index entry pointing to the
                     // latest version of the row which has different key other than index.
@@ -805,9 +838,9 @@ impl<'a> RowWriteAccess<'a> {
                     stmt.row_undo.push(entry);
                     return LockUndo::Ok;
                 }
-                // Transaction is not committed, we need to check if it's prepared for commit.
-                // If yes, wait for it to finish commit.
-                // Otherwise, throw error.
+                // Another active transaction owns the hot-row lock. If it is
+                // preparing commit, wait and retry because the status will
+                // shortly become committed; otherwise report a write conflict.
                 if !undo_head.preparing() {
                     return LockUndo::WriteConflict;
                 }
@@ -824,6 +857,10 @@ impl<'a> RowWriteAccess<'a> {
         entry: RowUndoRef,
         undo_vals: Vec<UpdateCol>,
     ) {
+        // Runtime unique-key link to an older hot owner. The branch is stored
+        // on the new owner's undo head so readers following the latest unique
+        // mapping can still reach snapshots where `entry` was the visible
+        // same-key owner.
         let undo_head = self.guard.as_mut().expect("undo head");
         undo_head.next.indexes.push(IndexBranch {
             key,
@@ -840,7 +877,9 @@ impl<'a> RowWriteAccess<'a> {
         undo_vals: Vec<UpdateCol>,
     ) {
         // The old owner is a persisted LWC row, so the branch records only the
-        // reconstructed image and optional committed delete timestamp.
+        // reconstructed image and optional committed delete timestamp. There is
+        // no RowUndoRef continuation because cold rows do not have row-page
+        // undo chains after checkpoint.
         let undo_head = self.guard.as_mut().expect("undo head");
         undo_head.next.indexes.push(IndexBranch {
             key,
@@ -850,8 +889,8 @@ impl<'a> RowWriteAccess<'a> {
     }
 
     /// Purge undo chain according to minimum active STS.
-    /// This method only remove out-of-date versions from next list.
-    /// The real deletion of undo log is performed later.
+    /// This method removes out-of-date versions from the next list.
+    /// The real deletion of undo logs is performed later.
     #[inline]
     pub fn purge_undo_chain(&mut self, min_active_sts: TrxID) {
         match &mut *self.guard {
@@ -866,8 +905,9 @@ impl<'a> RowWriteAccess<'a> {
                 // Check whether the head can be purged.
                 let ts = undo_head.ts();
                 if trx_is_committed(ts) && ts < min_active_sts {
-                    // First entry is too old. That means page data is globally visible.
-                    // So we can remove the entire undo head.
+                    // The newest hot row-page image is older than every active
+                    // snapshot. No reader can need older main or unique-index
+                    // branches, so the whole undo head can be detached.
                     self.guard.take();
                     return;
                 }
@@ -878,7 +918,7 @@ impl<'a> RowWriteAccess<'a> {
                         return;
                     }
                     let next = entry_next.as_mut().unwrap();
-                    // pruge main branch
+                    // purge main branch
                     if next.main.status.can_purge(min_active_sts) {
                         // main branch can be purged means index branches can also
                         // be purged, because index branches have smaller timestamps.
@@ -895,6 +935,10 @@ impl<'a> RowWriteAccess<'a> {
                             .purge_cts()
                             .is_some_and(|cts| cts < min_active_sts)
                         {
+                            // This runtime unique branch only preserves an
+                            // older owner for snapshots at or before its CTS.
+                            // Once that CTS is below the oldest active
+                            // snapshot, the latest mapping alone is enough.
                             next.indexes.swap_remove(idx);
                         }
                     }
@@ -916,22 +960,26 @@ impl<'a> RowWriteAccess<'a> {
             let input_ref = &*owned_entry;
             std::ptr::addr_eq(entry.as_ref(), input_ref)
         });
-        // rollback row data
+        // Roll back the hot row page by applying the inverse of the first undo
+        // entry. Index undo is handled separately by transaction rollback.
         match &owned_entry.kind {
             RowUndoKind::Lock => (), // do nothing.
             RowUndoKind::Insert => {
+                // The inserted image never existed before this transaction.
                 let res = self.page.set_deleted(self.row_idx, true);
                 debug_assert!(res);
                 self.page.inc_approx_deleted();
             }
             RowUndoKind::Delete => {
+                // The row-page image still carries the deleted row values.
+                // Clearing the bit restores the pre-delete latest image.
                 let res = self.page.set_deleted(self.row_idx, false);
                 debug_assert!(res);
                 self.page.dec_approx_deleted();
             }
             RowUndoKind::Update(undo_cols) => {
-                // Here we try to rollback changes on this page
-                // and prefer to reuse the space occupied by old value.
+                // Restore changed columns from before-images and prefer to
+                // reuse the variable-length space captured by the undo entry.
                 for uc in undo_cols {
                     self.page.update_col(
                         metadata,

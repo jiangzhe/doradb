@@ -9,7 +9,9 @@ In Doradb's HTAP architecture, data blocks (LWC Blocks) are immutable. Modificat
 ### Core Design Principles
 
 1.  **No-Steal / No-Force**: Only committed data is persisted.
-2.  **Pessimistic Disk Persistence**: The on-disk Bitmap represents a **superset** of all committed deletions.
+2.  **Commit-Only Disk Persistence**: The on-disk Bitmap represents committed
+    deletes that have crossed the deletion checkpoint cutoff. Newer committed
+    deletes remain in `ColumnDeletionBuffer` until a later checkpoint.
     *   **Disk State**: "Physically Deleted".
     *   **Memory State**: "Logically Visible" (Undo information).
 3.  **Hybrid Storage Layout**: Small bitmaps are inlined in the Block Index; large bitmaps are offloaded to immutable shared slotted blob pages.
@@ -19,25 +21,28 @@ In Doradb's HTAP architecture, data blocks (LWC Blocks) are immutable. Modificat
 
 ### 2.1 In-Memory: `ColumnDeletionBuffer`
 
-A concurrent, sharded hash map serving as both the write buffer and the MVCC Undo cache.
+A concurrent table-level map serving as both the cold-row write ownership
+record and the MVCC undo cache above persisted delete bitmaps.
 
 ```rust
 struct ColumnDeletionBuffer {
-    // Sharded for high concurrency (e.g., 64 shards)
-    shards: Vec<RwLock<HashMap<RowID, DeletionEntry>>>,
+    entries: DashMap<RowID, DeleteMarker>,
 }
 
-struct DeletionEntry {
-    sts: u64, // Start Timestamp of the modifier (Lock owner)
-    
-    // Atomic Transaction State Hook
-    // Shared via Arc across all rows modified by the same transaction
-    commit_state: Arc<AtomicU64>,
+enum DeleteMarker {
+    Ref(Arc<SharedTrxStatus>),
+    Committed(TrxID),
 }
 ```
 
-*   **Concurrency**: Uses sharded `RwLock` to minimize contention.
-*   **Atomic Commit**: Transaction commit is $O(1)$. The transaction manager updates the `AtomicU64` inside the `Arc`, instantly making all associated rows "Committed" in the map.
+*   **Concurrency**: Uses `DashMap` for concurrent foreground delete/update,
+    rollback, purge, checkpoint selection, and recovery replay.
+*   **Write Ownership**: An uncommitted `Ref` is the row-level ownership record
+    for a cold delete/update. It also acts as the conflict point for other
+    writers.
+*   **Atomic Commit**: Transaction commit updates the shared transaction status
+    observed by every `Ref` owned by that transaction. Maintenance paths may
+    later compact a committed `Ref` into `Committed(cts)`.
 
 ### 2.2 On-Disk: Hybrid Bitmap Storage
 
@@ -63,26 +68,36 @@ struct BlobRef {
 
 ## 3. Transaction & Visibility Model
 
-The visibility check logic determines whether a row is "alive" for a reader transaction $T_{reader}$.
+The visibility check logic determines whether a cold row is "alive" for a
+reader transaction $T_{reader}$.
 
-**Logic**: `Visible = (Disk_Bitmap[Row] == 0) OR (Memory_Map[Row].CTS > T.STS)`
+**Logic**: the in-memory marker is the newest authority when present; the
+persisted bitmap is the base state when the marker is absent. A memory marker
+can hide an uncheckpointed delete even when the disk bitmap is still clear, or
+can make a disk-deleted row visible to an older snapshot when the marker's CTS
+is newer than the reader snapshot.
 
 ### The Read Path
-1.  **Check Disk (Fast Path)**:
-    *   Query Block Index. Get Bitmap (Inline or fetch via `BlobRef` from blob pages).
-    *   If `Bitmap.contains(RowID) == false`: **Row is Visible**. (Return data).
-2.  **Check Memory (Slow Path / Undo Path)**:
-    *   *Condition*: Triggered only if `Bitmap.contains(RowID) == true`.
-    *   Query `ColumnDeletionBuffer`.
-    *   **Case A: Entry Not Found**:
-        *   The delete was committed long ago and GC'd.
-        *   **Result**: **Row is Deleted**.
-    *   **Case B: Entry Found** (`Entry.CTS > T.STS`):
-        *   The delete happened *after* $T_{reader}$ started.
-        *   **Result**: **Row is Visible** (Undo).
-    *   **Case C: Entry Found** (`Entry.CTS <= T.STS`):
-        *   The delete happened *before* $T_{reader}$ started.
-        *   **Result**: **Row is Deleted**.
+1.  **Check Memory Tail**:
+    *   Query `ColumnDeletionBuffer` for the RowID.
+    *   **Committed marker with `CTS <= T.STS`**: the delete is visible to the
+        reader, so the row is deleted.
+    *   **Committed marker with `CTS > T.STS`**: the delete happened after the
+        reader started, so the old cold row remains visible as undo.
+    *   **Uncommitted marker owned by the reader transaction**: the transaction
+        already consumed the cold row, so the row is deleted for that
+        transaction.
+    *   **Uncommitted marker owned by another transaction**: readers keep
+        snapshot visibility, while writers treat the marker as a write
+        conflict.
+2.  **Check Persisted Bitmap When No Marker Exists**:
+    *   Query Block Index. Get Bitmap (Inline or fetch via `BlobRef` from blob
+        pages).
+    *   If `Bitmap.contains(RowID) == true`: the delete was committed,
+        checkpointed, and no in-memory undo marker remains, so the row is
+        deleted.
+    *   If `Bitmap.contains(RowID) == false`: no memory or disk delete applies,
+        so the row is visible.
 
 ## 4. Deletion Checkpoint Workflow
 
@@ -90,12 +105,13 @@ The process moves committed deletions from memory to disk. Crucially, the **Syst
 
 ### Phase 1: Snapshot & Barrier
 *   **Action**: The Checkpoint Coordinator starts a system transaction and acquires the current global timestamp: **`Checkpoint_STS`**.
-*   **Semantic**: This timestamp acts as a **Read View**. The system guarantees that upon successful completion of this checkpoint, *all* deletions committed at or before `Checkpoint_STS` are persisted.
+*   **Semantic**: This timestamp acts as a **Read View**. The system guarantees that upon successful completion of this checkpoint, selected cold deletes below this exclusive cutoff are persisted.
 *   **Scan & Filter**:
-    *   Iterate through `ColumnDeletionBuffer` shards.
+    *   Iterate through `ColumnDeletionBuffer`.
     *   Collect `RowID`s where:
-        1.  `commit_state` is **Committed** (CTS > 0).
-        2.  `CTS <= Checkpoint_STS`.
+        1.  the marker is committed, either `Committed(cts)` or committed `Ref`.
+        2.  `previous_deletion_cutoff_ts <= CTS < Checkpoint_STS`.
+        3.  `row_id < pivot_row_id`.
 *   **Output**: A list of RowIDs grouped by `LWC Block ID`.
 
 ### Phase 2: Merge & Encode (Pure Computation)
@@ -135,7 +151,8 @@ To prevent "cold" tables (tables with no recent deletions) from blocking the glo
     *   Or triggered explicitly by the Log Manager when log usage is high.
 *   **Process**:
     1.  Acquire `Checkpoint_STS`.
-    2.  Verify `ColumnDeletionBuffer` has no pending commits with `CTS <= Checkpoint_STS`.
+    2.  Verify the current scan has no eligible committed markers in
+        `[deletion_cutoff_ts, Checkpoint_STS)`.
     3.  **Fast Path**: Skip Phases 2 and 3 (No Data I/O).
     4.  **Meta Update**: Directly generate a new MetaBlock with `deletion_cutoff_ts = Checkpoint_STS` and perform the SuperBlock switch.
 *   **Result**: The watermark advances, allowing the Log Manager to safely discard old logs.
@@ -148,11 +165,12 @@ Memory entries are retained after the checkpoint to provide MVCC visibility (Und
 *   **Trigger**: Periodic background task or Memory Pressure.
 *   **Condition**: An entry can be removed **only if**:
     $$ \text{Entry.CTS} < \text{Global\_Min\_Active\_STS} $$
+    and the delete is already covered by durable delete-bitmap state.
 *   **Logic**:
     1.  Acquire `Global_Min_Active_STS` from the Transaction Manager.
     2.  Scan `ColumnDeletionBuffer`.
     3.  Remove entries satisfying the condition.
-    *   *Reasoning*: If the delete commit time is older than the oldest active transaction, then strictly **everyone** sees the row as deleted. The Disk Bitmap (which is a superset) is now the absolute truth, and the "Undo" info in memory is obsolete.
+    *   *Reasoning*: If the delete commit time is older than the oldest active transaction and the delete has been checkpointed, then strictly **everyone** sees the row as deleted. The Disk Bitmap is now the absolute truth, and the "Undo" info in memory is obsolete.
 
 
 ## 6. Crash Recovery
@@ -182,7 +200,7 @@ sequenceDiagram
     participant IDX as BlockIndex
 
     %% Phase 1
-    CP->>Mem: 1. Snapshot (Scan CTS <= Checkpoint_STS)
+    CP->>Mem: 1. Snapshot (Scan previous cutoff <= CTS < Checkpoint_STS)
     Note right of CP: Group RowIDs by Block
 
     %% Phase 2 & 3

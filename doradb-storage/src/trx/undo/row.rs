@@ -12,34 +12,48 @@ use std::ops::{Deref, DerefMut};
 use std::ptr::NonNull;
 use std::sync::Arc;
 
-/// RowUndoKind represents the kind of original operation.
-/// So the actual undo action should be opposite of the kind.
+/// RowUndoKind records the foreground operation that produced an undo entry.
+///
+/// Hot-row MVCC and rollback both interpret the entry in reverse: an `Insert`
+/// becomes invisible to older readers, a `Delete` restores the previous
+/// visible row image, and an `Update` carries the before-images needed to
+/// reconstruct the older version.
 pub enum RowUndoKind {
-    /// Lock a row.
-    /// Before insert/delete/update, we add a lock record to version chain
-    /// to indicate other transactions that the row is locked by someone.
-    /// After done the change, update the LOCK kind to specific kind.
-    Lock,
-    /// Insert a new row.
-    /// Before-image is empty for insert, so we do not need to copy values.
+    /// Provisional row-page write lock.
     ///
-    /// # Possbile chains:
+    /// Hot updates and deletes first install a `Lock` entry at the undo head.
+    /// That entry is the write-conflict point for other transactions. After
+    /// the row-page mutation succeeds, the same transaction rewrites the entry
+    /// into the actual operation kind.
+    Lock,
+    /// Insert a new hot row.
+    ///
+    /// The row page holds the newly inserted image. No before-image values are
+    /// stored because older snapshots must treat the row as non-existent once
+    /// this entry is reached.
+    ///
+    /// For move updates, the inserted row may also carry unique-index runtime
+    /// branches to the previous hot or cold owner.
+    ///
+    /// # Possible chains
     ///
     /// 1. Insert -> null.
     ///
-    /// This is common scenario. The insert is first version of a row. And it
-    /// does not have older(next) version.
+    /// This is the common scenario: the insert is the first version of a row
+    /// and does not have an older next version.
     Insert,
-    /// Delete an existing row.
-    /// We optimize to not have row values in delete log entry, because we always can
-    /// find the version in row page.
+    /// Delete an existing hot row.
+    ///
+    /// The row-page delete bit is the newest image. The undo entry does not
+    /// copy row values because older snapshots can still read the row image
+    /// from the page and flip the delete state while traversing the chain.
     ///
     /// Possible chains:
     ///
     /// 1. Delete -> null.
     ///
     /// It can happen when GC is executed and the insert transaction is cleaned.
-    /// This means if we can not see the delete version, we should unmark latest
+    /// This means if we cannot see the delete version, we should unmark latest
     /// version in data page.
     ///
     /// 2. Delete -> Insert.
@@ -47,7 +61,11 @@ pub enum RowUndoKind {
     /// 3. Delete -> Update.
     ///
     Delete,
-    /// Copy old versions of updated columns.
+    /// Update a hot row in place.
+    ///
+    /// Only changed columns are copied as before-images. Readers that cannot
+    /// see the latest page image apply these values while walking the main
+    /// branch. Rollback applies the same values to the row page.
     ///
     /// Possible chains:
     ///
@@ -59,7 +77,7 @@ pub enum RowUndoKind {
     ///
     /// 4. Update -> Delete.
     ///
-    /// Dervied from an insert operation.
+    /// Derived from an insert operation.
     /// We'd like to reuse the deleted row(RowID and data) and link
     /// update(instead of insert) entry to it.
     /// In this way, we may not need to change secondary index.
@@ -266,10 +284,16 @@ impl Clone for RowUndoRef {
 }
 
 pub struct RowUndo {
+    /// Table containing the hot row or cold deletion marker.
     pub table_id: TableID,
+    /// Row page for hot-row undo. `None` is reserved for cold-row deletion
+    /// buffer undo, which has no row page to latch during rollback.
     pub page_id: Option<VersionedPageID>,
+    /// Physical row version affected by this undo entry.
     pub row_id: RowID,
+    /// Operation whose inverse reconstructs the previous MVCC state.
     pub kind: RowUndoKind,
+    /// Older version state reachable from this entry.
     pub next: Option<NextRowUndo>,
 }
 
@@ -281,6 +305,12 @@ pub struct RowUndo {
 /// Timestamp of Main branch is always larger than those of indexes,
 /// because the link is generated when main is uncommitted but
 /// index is committed.
+///
+/// Unique-index branches are runtime MVCC bridges. They are needed when the
+/// latest unique-key mapping points to a row whose ordinary undo chain cannot
+/// reach an older visible owner of the same logical key. The branch target may
+/// be a hot row undo chain or a terminal cold row image reconstructed from the
+/// branch's undo values.
 pub struct NextRowUndo {
     pub main: MainBranch,
     pub indexes: Vec<IndexBranch>,
@@ -303,7 +333,11 @@ impl NextRowUndo {
     }
 }
 
-/// Main branch starts from insertion and ends at deletion.
+/// Main branch stores older versions of the same hot RowID.
+///
+/// It is the normal path for table scans and point reads that already routed
+/// to the row. Unique-index branches are separate because a latest unique-key
+/// mapping may need to reach an older owner with a different RowID.
 pub struct MainBranch {
     pub entry: RowUndoRef,
     pub status: UndoStatus,
@@ -312,7 +346,11 @@ pub struct MainBranch {
 /// UndoStatus represents status of any undo log,
 /// including uncommitted transactions.
 pub enum UndoStatus {
+    /// Shared transaction status while the owning transaction is active or has
+    /// not yet been compacted to a plain commit timestamp.
     Ref(Arc<SharedTrxStatus>),
+    /// Stable committed timestamp kept after the shared status is no longer
+    /// needed for visibility.
     CTS(TrxID),
 }
 
@@ -354,14 +392,20 @@ impl UndoStatus {
 /// The disadvantage is making version chain complicated.
 /// But in our assumption, most transactions are short and in-memory
 /// version chain can be easily purged than out-of-memory index
-/// maintainance.
+/// maintenance.
 ///
 /// MVCC read can skip this branch if the index key provided for
 /// search is not same as the reborn key.
 /// Because only such key should be searched in the Index branch.
 /// Table scan should skip such branch.
 ///
-/// Below is a sample data flow of the undo branch maintainance.
+/// A branch can target either a hot owner with a row-page undo continuation, or
+/// a cold terminal owner. Cold terminal branches are used by LWC unique update
+/// and unique-key claim paths: the persisted old row has no row-page undo
+/// chain, so `undo_vals` reconstructs that old image and the optional delete
+/// timestamp decides whether the reconstructed image is visible to a reader.
+///
+/// Below is a sample data flow of the undo branch maintenance.
 ///
 /// ```text
 ///  ┌──────────────────────────────────────────────────────────┐                     
@@ -429,10 +473,19 @@ pub struct IndexBranch {
 /// Target of a runtime unique-index branch.
 pub enum IndexBranchTarget {
     /// Branch to another hot row's undo chain.
+    ///
+    /// `cts` is the delete/update timestamp at which the old hot owner stopped
+    /// being visible. Readers at or before that timestamp continue through
+    /// `entry` to find the older same-key version.
     Hot { cts: TrxID, entry: RowUndoRef },
     /// Branch to a persisted cold row reconstructed from `undo_vals`.
-    /// `delete_cts` is the CDB delete timestamp when the cold row was already
-    /// committed deleted; `None` means the current transaction owns the delete.
+    ///
+    /// Cold rows are immutable and have no row-page undo chain. `delete_cts`
+    /// is the committed CDB delete timestamp when the cold row was already
+    /// deleted by an earlier transaction; readers after that timestamp must not
+    /// see the reconstructed image. `None` means the transaction containing the
+    /// new hot row owns the cold delete marker, which covers the same-row
+    /// cold-to-hot update case before that transaction commits.
     ColdTerminal { delete_cts: Option<TrxID> },
 }
 
