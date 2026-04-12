@@ -33,11 +33,28 @@ So let's see what it can be in future.
 
 ### Row ID
 
-When new data is coming, a unique identifier is assigned to each row, called **RowID**. wherever the data is located, **RowID** will not change.
+When new data is coming, a unique identifier is assigned to each physical row
+version, called **RowID**. A row version keeps its RowID wherever it is stored.
 
-If update happens in in-mem row store, modification will be applied directly on row page and the undo information will be stored in a version chain associated to that row.
+If an update happens in the in-memory RowStore and the row page can still hold
+the new image, the modification is applied in place. The RowID is reused and
+the previous values are stored in the version chain associated with that RowID.
+If the page is frozen or cannot fit the update, the engine performs a hot move
+update: the old hot RowID is marked deleted with row undo, the replacement
+values are inserted into the RowStore with a new RowID, and runtime unique-key
+branches preserve any older hot owner needed by active snapshots.
 
-If update target row on disk, either in LWC page or column page, the old data will be extracted and modified and re-inserted into row store in memory with a new **RowID**. Meanwhile a delete bit will be applied to bitmap page cache associated to that data page on disk. And also in such scenario, the secondary index will be updated to point to new **RowID**.
+If an update targets a persisted row on disk, either in an LWC page or future
+column page, the persisted row version is immutable. The engine installs a
+cold-row delete marker for the old RowID, extracts and modifies the old values,
+and inserts the replacement values into the RowStore with a new RowID. The old
+cold RowID remains meaningful for MVCC visibility, rollback, recovery, and
+secondary-index cleanup until no active snapshot can require it.
+
+Secondary indexes are updated to make the latest logical key point to the new
+RowID. For unique indexes, runtime unique-key links may also connect the new
+hot version back to an older hot or cold owner so older snapshots can still
+resolve the correct visible row.
 
 ### Block Index
 

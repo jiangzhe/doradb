@@ -394,25 +394,41 @@ matches the key can block the new claim.
 
 If the target row remains in RowStore:
 
-- heap data and undo chain are updated as today
-- secondary index updates only touch `MemTree`
+- every write first owns the row undo head with a `Lock` entry
+- in-place update reuses the RowID and records before-image columns in the hot
+  undo chain
+- move update marks the old hot RowID deleted, inserts the replacement as a new
+  hot RowID, and links unique-key owners when older snapshots may need the old
+  owner
+- secondary index updates only touch `MemTree`; `DiskTree` is updated later by
+  table checkpoint companion work
 
 Cases:
 
 - unique, key unchanged:
-  - no logical-key remap is needed if row id is unchanged
+  - no logical-key remap is needed when RowID is unchanged
+  - if RowID changes due to move update, atomically replace the latest mapping
+    from old RowID to new RowID and record index undo for rollback
 - unique, key changed:
   - first apply the unique-key enforcement rule for the new key
   - install a row-id-carrying delete-shadow for the old key in `MemTree`
   - insert new key -> row id in `MemTree`
-  - if an older snapshot may still need the previous owner/version of either
-    key and that owner is not reachable through ordinary undo from the latest
-    row id, install the required runtime unique-key link
+  - same-RowID key changes may merge with this transaction's own delete-shadow
+    by flipping the delete flag back to active
+  - if the conflicting owner is delete-masked or otherwise stale, revalidate the
+    old owner through row undo before claiming the latest mapping
+  - if an older snapshot may still need the previous owner/version and that
+    owner is not reachable through ordinary undo from the latest row id, install
+    the required runtime unique-key link to the older hot owner
 - non-unique, key unchanged:
-  - no index change if row id stays the same
+  - no index change if RowID stays the same
+  - if RowID changes due to move update, insert the new exact `(key, row_id)`
+    entry and mask the old exact entry
 - non-unique, key changed:
-  - delete exact old `(key, row_id)` entry in `MemTree`
+  - mask exact old `(key, row_id)` entry in `MemTree`
   - insert exact new `(key, row_id)` entry in `MemTree`
+  - rollback unmasks the old exact entry and removes or remasks the new exact
+    entry according to its index undo kind
 
 ### 8.4 Update of a Cold Row
 
@@ -649,11 +665,11 @@ checkpoint model:
    - cleanup should be derived from published checkpoint metadata and
      deletion-buffer state without requiring a post-publish rewrite of all
      touched `MemTree` entries
-6. Cold-owner runtime link implementation:
-   - the design now requires runtime unique-key links to be able to target old
-     cold owners during cold-row update of unique keys
-   - the remaining work is implementation of that cold-owner branch, not
-     reconsideration of the unique latest-mapping physical model
+6. Cold-owner runtime link refinement:
+   - runtime unique-key links can now target old cold owners during cold-row
+     update of unique keys
+   - future work should focus on cleanup and cost refinements for those runtime
+     links, not on changing the unique latest-mapping physical model
 
 ## 13. Summary
 

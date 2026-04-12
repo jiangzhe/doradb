@@ -43,18 +43,42 @@ The Heap Table uses a **Tiered Architecture**, combining an in-memory RowStore (
 - Write Pattern
   - New inserts append to the tail page.
   - Page creation is serialized and logged in commit log.
+  - Hot updates first install a row undo `Lock`, then either mutate the row
+    page in place or fall back to a move update when the page is frozen or has
+    no reusable space.
+  - Hot deletes set the row-page delete bit after the row undo lock is owned.
 - Split-Level MVCC
   - MVCC metadata is not stored in Data Pages but in a separate **Undo Mapping Table** (`RowID -> UndoChain*`).
   - **Undo Log**: Stored in transaction-private memory, linking old versions and visibility timestamps.
+  - The latest row-page image is visible only if the undo-head timestamp is
+    visible to the reader. Otherwise the reader walks the undo main branch and
+    applies inverse `Insert`/`Update`/`Delete` operations to reconstruct an
+    older version.
+  - Unique-index runtime branches can connect the latest owner to an older hot
+    owner with a different RowID when the ordinary main branch cannot reach the
+    older same-key version.
 
 ### On-Disk ColumnStore with Deletion Buffer
 
 - **Physical Structure**: Immutable PAX (Partition Attributes Across) format blocks.
 - **Index**: Sparse Block Index + Delete Bitmap.
 - **Handling Deletes/Updates**:
-  - Since ColumnStore blocks are immutable, modifications are handled via an in-memory **ColumnDeletionBuffer**.
-  - **ColumnDeletionBuffer**: A hash map or skip list storing {`RowID -> Delete_Flag & Version`}.
-  - **Read Path**: Queries first check the **ColumnDeletionBuffer**. If a delete marker is found, the row from disk is ignored.
+  - Since ColumnStore blocks are immutable, foreground modifications are
+    represented by an in-memory **ColumnDeletionBuffer** plus hot RowStore
+    replacement rows when needed.
+  - **ColumnDeletionBuffer**: a concurrent table-level map storing
+    `RowID -> DeleteMarker`, where a marker is either a shared transaction
+    status (`Ref`) or a compact committed delete timestamp (`Committed`).
+  - **Read Path**: queries combine persisted delete bitmap state with
+    snapshot-aware deletion-buffer visibility. A committed marker hides the row
+    only when `delete_cts <= reader_sts`; a committed marker newer than the
+    reader snapshot preserves the old cold row for that reader. An uncommitted
+    marker hides the row from its owning transaction and acts as a write
+    conflict for other writers.
+  - **Cold Update Path**: update of an LWC row is modeled as claiming the old
+    cold RowID in the deletion buffer, recording cold-delete undo/redo,
+    masking old secondary-index entries, and inserting the modified values as a
+    new hot RowStore row.
 - **Tuple Mover**: A background thread responsible for converting frozen RowStore pages into ColumnStore blocks and advancing the `Pivot_RowID`.
 
 ## Index Structure
@@ -116,15 +140,37 @@ For the detailed index design, see [`secondary-index.md`](./secondary-index.md).
    - Probe `MemTree` first and then `DiskTree` as required by the index type.
    - Route to RowStore or ColumnStore based on `RowID` vs `Pivot`.
    - **Visibility Check**: Compare Reader.STS against the timestamp in the Undo Chain (for RowStore) or Deletion Buffer (for ColumnStore).
+   - For unique indexes, runtime unique-key links may be followed when the
+     latest logical-key owner is not enough to reach an older visible owner.
+     Such links can target either hot undo history or a terminal cold owner
+     reconstructed from stored undo values.
 
 2. **Insert**:
    - Append tuple to RowStore -> Get new `RowID`.
+   - Create an insert undo head so older snapshots and rollback treat the row
+     as absent until the transaction commits.
    - Insert into MemTree with `sts = My_STS`.
 
 3. **Delete**:
-   - **If RowStore**: Append a "Delete" record to the Undo Chain.
+   - **If RowStore**: install a row undo `Lock`, set the row-page delete bit,
+     rewrite the lock entry to `Delete`, and mask secondary-index entries in
+     MemTree with index undo.
    - **If ColumnStore**: Insert a "Delete Mark" into the **ColumnDeletionBuffer**.
-   - Update MemTree: Mark the key as deleted and set `sts = My_STS`.
+   - Update MemTree: mask the old secondary-index entries so runtime lookups do
+     not blindly fall through to stale cold `DiskTree` state.
+
+4. **Update**:
+   - **If RowStore**: install a row undo `Lock` before mutating the page. If
+     the update fits, mutate the row page in place, rewrite the lock entry to
+     `Update`, and update MemTree only for changed index keys. If the update
+     cannot fit or the page is frozen, rewrite the lock to `Delete`, insert the
+     replacement as a new hot RowID, and update MemTree for RowID/key movement.
+   - **If ColumnStore**: install a deletion-buffer marker for the old cold
+     RowID, insert the replacement row into hot RowStore with a new RowID, mask
+     old index entries, and insert the replacement index entries.
+   - Unique hot and cold updates may install runtime-only branches from the new
+     hot owner to an older hot or cold owner so older snapshots can still see
+     the correct logical key owner.
 
 #### Commit Phase
 
@@ -132,8 +178,22 @@ For the detailed index design, see [`secondary-index.md`](./secondary-index.md).
 2. **State Update**
    - Instead of updating a global transaction table or traversing the MemTree, the transaction simply backfills the **Commit Timestamp (CTS)** into its Undo Log records.
    - For the **ColumnDeletionBuffer**, the CTS is attached to the delete/update markers.
-   - The **CTS** of all undo and deletion buffer in one transaction is backed by `Arc<AtomicU64>>`. This makes the commit operation extremely lightweight and fast. The visibility of the data is now naturally handled by the presence of a valid CTS in the Undo chain or Deletion buffer.
+   - The **CTS** of all undo and deletion-buffer refs in one transaction is
+     backed by shared transaction status. This makes the commit operation
+     lightweight: setting the shared status makes all related undo records and
+     deletion-buffer markers observe the commit timestamp.
 3. **Cleanup**: Discard local write buffers.
+
+#### Rollback Phase
+
+- Row undo is rolled back in reverse order. `Insert` marks the hot row deleted,
+  `Delete` clears the delete bit, `Update` restores before-image columns, and
+  a pure `Lock` leaves row data unchanged.
+- Index undo removes inserted claims, restores merged delete-masked claims, and
+  unmasks deferred deletes so MemTree returns to the pre-transaction state.
+- Runtime unique-key branches are transaction-local MVCC aids. They are kept
+  only while live snapshots may need the older owner and can be purged once
+  their CTS is older than the minimum active snapshot.
 
 ### Checkpoint and Persistence
 
