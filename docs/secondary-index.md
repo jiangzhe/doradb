@@ -19,9 +19,15 @@ is documented in [`block-index.md`](./block-index.md). The higher-level split
 between block index and secondary index is summarized in
 [`index-design.md`](./index-design.md).
 
+Scope note: the `MemTree`/`DiskTree` split in this document applies to
+user-table secondary indexes. Catalog-table secondary indexes remain purely
+in-memory and continue to use the existing single-tree runtime implementation.
+Catalog tables do not receive `DiskTree` roots, checkpoint companion
+secondary-index publication, or composite runtime integration.
+
 ## 2. Design Goals
 
-The secondary index must satisfy the following constraints:
+User-table secondary indexes must satisfy the following constraints:
 
 1. Foreground writes stay memory-first and do not perform random persistent
    index writes.
@@ -35,7 +41,7 @@ The secondary index must satisfy the following constraints:
 
 ## 3. High-Level Architecture
 
-Each secondary index is split into two layers:
+Each user-table secondary index is split into two layers:
 
 1. `MemTree`
    - in-memory
@@ -127,8 +133,17 @@ For v1, `DiskTree` stores only live checkpointed secondary-index state:
 - unique `DiskTree`:
   - logical key -> latest checkpointed owner row id
 - non-unique `DiskTree`:
-  - live exact entries keyed by `(logical_key, row_id)`
+  - a key-only exact-entry set keyed by `(logical_key, row_id)`
+  - key presence is the whole durable fact; there is no logical value payload
+    for a non-unique `DiskTree` entry
+  - exact delete physically removes the `(logical_key, row_id)` key from the
+    set
 - no durable secondary-index tombstones are stored in `DiskTree`
+
+Non-unique `DiskTree` must not expose delete-mask operations. The delete bit
+used by the current in-memory non-unique B+Tree value is a `MemTree` overlay
+concern only. Reusing B+Tree search, split, merge, or cursor code must not turn
+that runtime byte into a persisted `DiskTree` API or format contract.
 
 Delete representation is split across runtime overlay state and cold delete
 state:
@@ -206,15 +221,28 @@ overlay state, not from an eagerly rewritten per-entry `dirty` bit.
 Common cases:
 
 - live row mapping:
-  - once the referenced row id is below the published `pivot_row_id`, the same
-    row is already represented by published cold state
+  - once the referenced row id is below the published `pivot_row_id`, the
+    committed cold representation of the same row is published
+  - pivot-based eviction applies only when the entry's transactional state is
+    settled and no rollback/index-undo obligation can still require the
+    `MemTree` entry
   - the `MemTree` entry can then be evicted or retained only as a cache
-- cold delete-shadow:
+- cold-origin delete overlay:
+  - this covers unique delete-shadows and non-unique delete-marked exact
+    entries that shadow rows already represented in `DiskTree`
   - if the deletion buffer no longer contains a marker for the shadow's
     referenced row id, the shadow can be removed
   - a deletion-buffer miss is safe here because deletion-buffer GC is allowed
     only after the delete is durably published and no active snapshot still
     needs the pre-delete view
+- hot-origin delete overlay:
+  - this covers unique delete-shadows and non-unique delete-marked exact
+    entries created by hot-row update/delete paths
+  - these overlays cannot be collected by deletion-buffer miss alone because a
+    cold delete marker may never exist for the hot row
+  - retain them until rollback/index-undo obligations are gone and the runtime
+    MVCC horizon, represented by the minimum active snapshot timestamp, can no
+    longer require the old owner/version
 
 There is no separate MemTree-to-DiskTree flush pass and no need for a
 post-publish sweep that flips touched entries from dirty to clean.
@@ -278,10 +306,12 @@ Runtime lookup for a unique secondary index proceeds as follows:
    matches the logical lookup key. If the visible version no longer matches,
    treat the candidate as a stale index result and skip it.
 
-For unique lookup, a `MemTree` hit is terminal only for tree selection: once
-hot logical-key state is present, lookup must not fall through to older
-`DiskTree` state for the same logical key, but final visibility still comes
-from the normal row/deletion MVCC path plus the final key recheck.
+Contract: for unique lookup, a `MemTree` hit is terminal for tree selection.
+This includes both live entries and delete-shadow entries. Once hot
+logical-key state is present, lookup must not fall through to older `DiskTree`
+state for the same logical key. A delete-shadow's retained row id is still only
+a candidate entry point: final visibility comes from the normal row/deletion
+MVCC path plus the final key recheck.
 
 ### 7.2 Non-Unique Lookup and Scan
 
@@ -291,16 +321,20 @@ key:
 1. Probe or range-scan `MemTree`.
 2. Probe or range-scan `DiskTree`.
 3. Merge exact entries from both sources.
-4. Use delete-marked exact entries only to suppress stale older tree state for
-   the same exact `(logical_key, row_id)` entry.
+4. Use delete-marked `MemTree` exact entries only to suppress matching
+   `DiskTree` exact `(logical_key, row_id)` entries.
 5. Route the remaining candidate row ids through the normal row/deletion
    visibility check.
 6. After visibility resolution, recheck that each visible row version still
    satisfies the lookup key or scan predicate. Return only rows that still
    satisfy that predicate.
 
-For non-unique indexes, a `MemTree` hit is not terminal because the cold tree
-may still contain additional duplicates for the same logical key.
+Contract: for non-unique lookup and scan, exact entries from both trees are
+merged. A `MemTree` hit is not terminal because the cold tree may still contain
+additional duplicates for the same logical key. A delete-marked `MemTree` exact
+entry suppresses only the matching cold exact `(logical_key, row_id)` entry.
+Remaining entries are deduplicated by exact identity and returned in
+deterministic exact-entry order, which is `(logical_key, row_id)` order.
 
 ### 7.3 Visibility Authority
 
@@ -341,7 +375,13 @@ Runtime unique-key links are a separate MVCC mechanism from `DiskTree`:
     MVCC path and before the final key recheck, when the visible older owner of
     the same logical key must still be consulted
 - discard:
-  - once no active snapshot can still require that older owner/version
+  - governed by the same `Global_Min_STS` / oldest-active-snapshot horizon used
+    for undo visibility
+  - a link remains required until rollback/index-undo obligations are gone and
+    the older owner/version's visibility can no longer be needed by any active
+    snapshot
+  - a link is not collectible merely because the source or target row became
+    cold, crossed `pivot_row_id`, or no longer appears in the deletion buffer
 - persistence:
   - runtime-only, not stored in `DiskTree`, not checkpointed, and not restored
     as historical MVCC state during recovery
@@ -350,6 +390,36 @@ The target of a runtime unique-key link may be another hot row/version or an
 older cold owner/version. This link lifecycle is what makes the unique
 latest-mapping `DiskTree` model compatible with snapshot visibility across
 ownership transfer.
+
+### 7.5 Composite Trait Method Parity
+
+The composite user-table implementation keeps method parity with the current
+runtime traits, but routes each method through `MemTree` and `DiskTree` under
+the contracts above. Foreground and rollback methods mutate only `MemTree`;
+`DiskTree` changes are checkpoint companion work.
+
+Unique index method parity:
+
+| Current method | Composite semantics | Rollback expectation |
+| --- | --- | --- |
+| `lookup` | Probe `MemTree` first. A live hit or delete-shadow hit is terminal for tree selection and returns the retained row id plus delete flag to the normal MVCC/key-recheck path. On `MemTree` miss, probe `DiskTree` and return the cold owner as a live candidate. | Read-only. Rollback state is visible only through `MemTree` overlays and runtime unique-key links. |
+| `insert_if_not_exists` | Insert into `MemTree` only after duplicate checks. A `MemTree` duplicate is terminal; `merge_if_match_deleted` may unmask a matching `MemTree` delete-shadow. On `MemTree` miss, a `DiskTree` owner is reported as a duplicate candidate but is not modified. | Insert rollback removes the new `MemTree` claim, or remasks a delete-shadow that was merged by `merge_if_match_deleted`. |
+| `compare_exchange` | Update a matching `MemTree` entry when present. If `MemTree` misses and `DiskTree` still maps the key to `old_row_id`, claim the cold owner by installing the `new_row_id` mapping in `MemTree`; `DiskTree` is not updated. | Update rollback uses the same operation to restore the old owner as a `MemTree` overlay when the durable cold owner cannot be changed directly. |
+| `mask_as_deleted` | Mark a matching `MemTree` live entry as a delete-shadow, or install a row-id-carrying `MemTree` delete-shadow when the matching owner exists only in `DiskTree`. | Delete rollback unmasks or removes the `MemTree` delete-shadow; no rollback path writes `DiskTree`. |
+| `compare_delete` | Remove or adjust matching `MemTree` overlay state according to `ignore_del_mask`. If only `DiskTree` has the matching owner, the operation is an idempotent runtime no-op; durable removal is deletion-checkpoint work. | Purge/recovery rollback cleanup removes only `MemTree` state. Durable cold cleanup waits for companion checkpoint publication. |
+| `scan_values` | Scan both layers, with `MemTree` state terminal per logical key. `MemTree` overlays suppress same-key `DiskTree` candidates before MVCC/key recheck. | Read-only. Rollback-visible candidates come from `MemTree` overlays and runtime unique-key links. |
+
+Non-unique index method parity:
+
+| Current method | Composite semantics | Rollback expectation |
+| --- | --- | --- |
+| `lookup` | Prefix-scan exact entries from both layers. Active `MemTree` exact entries are returned; delete-marked `MemTree` exact entries suppress only matching `DiskTree` exact entries. Remaining candidates are deduplicated and ordered by `(logical_key, row_id)`. | Read-only. Rollback state is represented by exact `MemTree` overlays. |
+| `lookup_unique` | Check the exact `(logical_key, row_id)` pair in `MemTree` first. A live or delete-marked exact hit is terminal and returns that state. On `MemTree` miss, `DiskTree` exact-key presence returns active. | Read-only. Rollback observes only `MemTree` exact overlay state. |
+| `insert_if_not_exists` | Insert the exact entry into `MemTree` only. An active `MemTree` exact duplicate is terminal; `merge_if_match_deleted` may unmask a matching delete-marked `MemTree` exact entry. On `MemTree` miss, matching `DiskTree` key presence is a duplicate candidate but is not modified. | Insert rollback removes the new `MemTree` exact entry, or remasks the exact entry if it was merged from delete-marked state. |
+| `mask_as_deleted` | Mark a matching `MemTree` exact entry deleted, or install a delete-marked `MemTree` exact entry when the exact key exists only in `DiskTree`. `DiskTree` has no delete-mask API. | Delete rollback must be able to unmask this `MemTree` exact entry until rollback/index-undo obligations are gone. |
+| `mask_as_active` | Rollback-only unmask of a delete-marked `MemTree` exact entry. It never updates `DiskTree`, because `DiskTree` exact-key presence has no delete flag. | Required for delete/update rollback and must not fail because cleanup removed a hot-origin overlay too early. |
+| `compare_delete` | Remove the matching `MemTree` exact overlay according to `ignore_del_mask`. If only `DiskTree` has the exact key, the operation is an idempotent runtime no-op; durable exact removal is deletion-checkpoint work. | Purge/recovery rollback cleanup removes only `MemTree` overlays. Durable cold cleanup waits for companion checkpoint publication. |
+| `scan_values` | Scan both exact-entry sets and merge deterministically by `(logical_key, row_id)`. `MemTree` exact entries deduplicate or suppress matching `DiskTree` exact keys. | Read-only. Rollback-visible state comes from exact `MemTree` overlays. |
 
 ## 8. Write Path
 
@@ -430,6 +500,11 @@ Cases:
   - rollback unmasks the old exact entry and removes or remasks the new exact
     entry according to its index undo kind
 
+Delete-shadows and delete-marked exact entries created by hot-row update are
+hot-origin overlays. Their cleanup follows the hot-origin rule in
+[`5.5 MemTree Cleanup`](#55-memtree-cleanup); deletion-buffer absence is not a
+cleanup proof for them.
+
 ### 8.4 Update of a Cold Row
 
 If the target row is already persistent:
@@ -470,6 +545,8 @@ Hot-row delete:
   index or a delete-marked exact entry for a non-unique index
 - these overlay entries block stale fallback but final visibility still comes
   from the normal row/deletion path
+- these are hot-origin overlays and follow the hot-origin cleanup rule in
+  [`5.5 MemTree Cleanup`](#55-memtree-cleanup)
 
 Cold-row delete:
 
@@ -521,9 +598,13 @@ become durable together.
 When committed cold-row delete markers with `cts < cutoff_ts` are selected at
 deletion-checkpoint cutoff:
 
-1. locate the persisted cold row by row id
-2. decode the old index key from persisted row values
-3. apply the corresponding `DiskTree` delete/update according to index kind:
+1. sort and group selected delete markers by persisted LWC block
+2. for each affected LWC block, load and decode the block once
+3. reconstruct all affected secondary keys for that block from the persisted
+   row values
+4. emit per-index `DiskTree` delete/update batches from those reconstructed
+   keys
+5. apply the corresponding `DiskTree` delete/update according to index kind:
    - unique:
      - apply the companion delete/update only if the currently stored owner for
        that logical key still matches the deleted old row id
@@ -531,17 +612,18 @@ deletion-checkpoint cutoff:
        key because a newer owner has already been published
    - non-unique:
      - remove the exact `(logical_key, old_row_id)` entry from `DiskTree`
-4. publish those `DiskTree` changes together with the new persistent delete
+6. publish those `DiskTree` changes together with the new persistent delete
    bitmap state
 
 This guarantees that persisted cold-row deletes and persistent secondary-index
 removals become durable together.
 
-This companion delete flow relies on one retention rule: deleted cold row
-values remain reconstructible until the companion secondary-index delete has
-been durably published. Under the current storage model, persisted LWC blocks
-are immutable and there is no earlier vacuum/compaction path that may reclaim
-those bytes before this companion delete work is complete.
+This companion delete flow relies on a table/checkpoint retention contract:
+deleted cold row values remain reconstructible until persistent delete metadata
+and the companion secondary-index delete have been durably published together.
+Under the current storage model, persisted LWC blocks are immutable and there
+is no earlier vacuum/compaction path that may reclaim those bytes before this
+companion delete work is complete.
 
 This conditional unique-key rule is required because data checkpoint for a
 newer owner of key `K` may publish before deletion checkpoint later processes
@@ -613,9 +695,14 @@ This works because:
 state:
 
 - live entries for rows below the published `pivot_row_id` are no longer needed
-  for correctness
-- delete-shadow entries for old cold rows can be removed once the deletion
-  buffer no longer contains the corresponding row id
+  for correctness only after their committed cold representation is published
+  and their transactional state is settled
+- cold-origin delete overlays for rows already represented in `DiskTree` can be
+  removed once the deletion buffer no longer contains the corresponding row id
+- hot-origin delete overlays created by hot-row update/delete cannot use
+  deletion-buffer absence as a cleanup proof; retain them until rollback/index
+  undo obligations are gone and the minimum active snapshot can no longer need
+  the old owner/version
 - clean entries may still be kept as cache, but they do not need to remain for
   correctness
 
@@ -636,8 +723,14 @@ contract:
   when ownership moved across different row chains, including from a new hot row
   version to an older cold owner/version when needed for snapshot visibility
 - both are runtime-only and only need to satisfy live snapshots
-- runtime unique-key links may be discarded once no active snapshot can still
-  require that older owner/version
+- runtime unique-key links are governed by the same `Global_Min_STS` /
+  oldest-active-snapshot horizon as undo GC
+- runtime unique-key links may be discarded only after rollback/index-undo
+  obligations are gone and no active snapshot can still require that older
+  owner/version
+- runtime unique-key links are not collectible merely because a source or
+  target row became cold, crossed `pivot_row_id`, or disappeared from the
+  deletion buffer
 - neither needs to survive restart because restart only restores the latest
   committed mapping
 
@@ -646,37 +739,34 @@ contract:
 The following areas need careful implementation detail even under the companion
 checkpoint model:
 
-1. Unique-key shadow semantics:
-   - a unique delete-shadow in `MemTree` must reliably block blind fallback to
-     a stale cold mapping in `DiskTree` while still deferring final visibility
-     to the row/deletion MVCC path
-2. Non-unique merge behavior:
-   - range scans need deterministic duplicate suppression and ordering when the
-     same logical key exists in both trees
-3. Deletion-checkpoint key reconstruction:
-   - locating deleted cold rows and decoding old keys can become expensive if it
-     causes excessive random block reads
-   - correctness depends on the stated retention rule that deleted cold row
-     values remain reconstructible until companion secondary-index delete
-     publication
-4. Checkpoint write amplification:
+1. Block-grouped deletion-checkpoint cost:
+   - the baseline algorithm groups selected deletes by persisted LWC block and
+     decodes each affected block once, but very large delete batches can still
+     create memory pressure and many per-index `DiskTree` updates
+   - future work may parallelize block groups after the grouped algorithm is in
+     place
+2. Checkpoint write amplification:
    - scattered CoW updates across many logical keys can enlarge checkpoint cost
-5. MemTree cleanup rules:
+3. MemTree cleanup rules:
    - cleanup should be derived from published checkpoint metadata and
      deletion-buffer state without requiring a post-publish rewrite of all
      touched `MemTree` entries
-6. Cold-owner runtime link refinement:
+4. Cold-owner runtime link refinement:
    - runtime unique-key links can now target old cold owners during cold-row
      update of unique keys
-   - future work should focus on cleanup and cost refinements for those runtime
-     links, not on changing the unique latest-mapping physical model
+   - future work should focus on cost refinements under the fixed
+     `Global_Min_STS` lifecycle, not on changing the unique latest-mapping
+     physical model
 
 ## 13. Summary
 
-Doradb secondary indexes use a two-layer design:
+User-table secondary indexes use a two-layer design:
 
 - `MemTree` serves hot mutable state
 - `DiskTree` stores checkpointed cold state
+
+Catalog-table secondary indexes stay on the existing in-memory single-tree
+runtime path.
 
 The persistent index is maintained as a companion of data and deletion
 checkpoint, not as an independently flushed committed overlay. This keeps the

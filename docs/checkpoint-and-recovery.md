@@ -140,8 +140,9 @@ Deletion checkpoint persists committed cold-row deletes.
 
 1. load the affected persistent delete bitmaps
 2. merge the selected deletions
-3. locate the deleted rows in persistent storage
-4. decode their old secondary-index keys
+3. sort/group selected row ids by persisted LWC block
+4. for each affected LWC block, decode the block once and reconstruct old
+   secondary-index keys for every selected row in that block
 5. apply the corresponding companion deletes to each affected `DiskTree`
 6. publish one new table checkpoint root that contains:
    - updated delete bitmaps
@@ -150,6 +151,13 @@ Deletion checkpoint persists committed cold-row deletes.
 
 This guarantees that persisted cold-row deletes and persisted cold secondary
 index removals become durable together.
+
+Deletion checkpoint owns the cold-row value retention boundary required by this
+workflow. Deleted cold row values must remain reconstructible from their
+persisted LWC blocks until one checkpoint publication durably contains both the
+persistent delete metadata and the companion secondary-index `DiskTree`
+deletes. Storage compaction, vacuum, or page reclamation must not make those
+row values undecodable before that publication.
 
 If no delete bitmap changes are selected, checkpoint can still publish a
 metadata-only root to advance `deletion_cutoff_ts` to the checkpoint cutoff.

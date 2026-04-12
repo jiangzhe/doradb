@@ -192,8 +192,12 @@ For the detailed index design, see [`secondary-index.md`](./secondary-index.md).
 - Index undo removes inserted claims, restores merged delete-masked claims, and
   unmasks deferred deletes so MemTree returns to the pre-transaction state.
 - Runtime unique-key branches are transaction-local MVCC aids. They are kept
-  only while live snapshots may need the older owner and can be purged once
-  their CTS is older than the minimum active snapshot.
+  only while live snapshots may need the older owner. Their GC anchor is the
+  same `Global_Min_STS` / oldest-active-snapshot horizon used by undo GC: they
+  can be purged only after rollback/index-undo obligations are gone and
+  `Global_Min_STS` proves no active snapshot can require the older owner. They
+  are not purged merely because a row became cold, crossed `pivot_row_id`, or no
+  longer appears in the deletion buffer.
 
 ### Checkpoint and Persistence
 
