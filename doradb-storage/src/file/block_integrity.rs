@@ -1,5 +1,6 @@
 use crate::error::{BlockCorruptionCause, Result};
 use crate::serde::{Deser, Ser, Serde};
+use bytemuck::{Pod, Zeroable};
 use std::mem;
 
 /// Size in bytes of the fixed block-integrity header.
@@ -15,7 +16,6 @@ pub(crate) const COLUMN_BLOCK_INDEX_BLOCK_SPEC: BlockIntegritySpec =
 /// Block-integrity markers for persisted column auxiliary-blob blocks.
 pub(crate) const COLUMN_DELETION_BLOB_BLOCK_SPEC: BlockIntegritySpec =
     BlockIntegritySpec::new(*b"CDBLOB\0\0", 2);
-
 /// Expected block-envelope markers for one persisted CoW block kind.
 ///
 /// The shared integrity helpers use this to validate that a block belongs to
@@ -73,8 +73,9 @@ impl Deser for BlockIntegrityHeader {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct BlockIntegrityTrailer {
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Pod, Zeroable)]
+#[repr(C)]
+pub(crate) struct BlockIntegrityTrailer {
     b3sum: [u8; 32],
 }
 
@@ -133,6 +134,25 @@ pub(crate) fn write_block_checksum(buf: &mut [u8]) {
     debug_assert_eq!(idx, buf.len());
 }
 
+/// Validates only the trailing BLAKE3 checksum for one full block image.
+///
+/// This is used by block formats, such as DiskTree nodes, that reuse the
+/// shared checksum trailer without the shared magic/version header.
+#[inline]
+pub(crate) fn validate_block_checksum(buf: &[u8]) -> std::result::Result<(), BlockCorruptionCause> {
+    if buf.len() < BLOCK_INTEGRITY_TRAILER_SIZE {
+        return Err(BlockCorruptionCause::InvalidPayload);
+    }
+    let checksum_offset = checksum_offset(buf.len());
+    let (_, trailer) = BlockIntegrityTrailer::deser(buf, checksum_offset)
+        .map_err(|_| BlockCorruptionCause::ChecksumMismatch)?;
+    let b3sum = blake3::hash(&buf[..checksum_offset]);
+    if b3sum.as_bytes() != &trailer.b3sum {
+        return Err(BlockCorruptionCause::ChecksumMismatch);
+    }
+    Ok(())
+}
+
 /// Validates one persisted block envelope and returns the payload slice on success.
 ///
 /// This helper expects a full fixed-size persisted block image. The checksum
@@ -154,13 +174,8 @@ pub(crate) fn validate_block(
     if header.version != expected.version {
         return Err(BlockCorruptionCause::InvalidVersion);
     }
+    validate_block_checksum(buf)?;
     let checksum_offset = checksum_offset(buf.len());
-    let (_, trailer) = BlockIntegrityTrailer::deser(buf, checksum_offset)
-        .map_err(|_| BlockCorruptionCause::ChecksumMismatch)?;
-    let b3sum = blake3::hash(&buf[..checksum_offset]);
-    if b3sum.as_bytes() != &trailer.b3sum {
-        return Err(BlockCorruptionCause::ChecksumMismatch);
-    }
     Ok(&buf[payload_start..checksum_offset])
 }
 
@@ -191,6 +206,18 @@ mod tests {
         buf[checksum_idx] ^= 0xff;
 
         let err = validate_block(&buf, spec).unwrap_err();
+        assert_eq!(err, BlockCorruptionCause::ChecksumMismatch);
+    }
+
+    #[test]
+    fn test_block_integrity_checksum_only_trailer() {
+        let mut buf = vec![0u8; 4096];
+        buf[10] = 3;
+        write_block_checksum(&mut buf);
+        validate_block_checksum(&buf).unwrap();
+
+        buf[10] ^= 0xff;
+        let err = validate_block_checksum(&buf).unwrap_err();
         assert_eq!(err, BlockCorruptionCause::ChecksumMismatch);
     }
 }

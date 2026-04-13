@@ -7,7 +7,9 @@ use crate::buffer::{BufferPool, FixedBufferPool, PoolGuard};
 use crate::error::Validation;
 use crate::error::Validation::{Invalid, Valid};
 use crate::error::{Error, Result};
-use crate::index::btree_node::{BTreeNode, BTreeNodeBox, LookupChild, SpaceEstimation};
+use crate::index::btree_node::{
+    BTREE_NODE_USABLE_SIZE, BTreeNode, BTreeNodeBox, LookupChild, SpaceEstimation,
+};
 use crate::index::btree_scan::{BTreePrefixScan, BTreeSlotCallback};
 use crate::index::btree_value::{BTreeU64, BTreeValue};
 use crate::index::util::{Maskable, ParentPosition, SpaceStatistics};
@@ -16,7 +18,6 @@ use crate::quiescent::QuiescentGuard;
 use crate::trx::TrxID;
 use either::Either;
 use std::marker::PhantomData;
-use std::mem;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 pub type SharedStrategy = SharedLockStrategy<BTreeNode>;
@@ -246,7 +247,7 @@ impl<P: BufferPool> GenericBTree<P> {
                     return Ok(BTreeInsert::DuplicateKey(old_v));
                 }
             };
-            if !node.can_insert(key) {
+            if !node.can_insert::<V>(key) {
                 debug_assert!(node.count() > 1);
                 if p_guard.is_none() {
                     // Root is leaf and full, should split.
@@ -390,8 +391,8 @@ impl<P: BufferPool> GenericBTree<P> {
         while let Some(g) = cursor.next().await? {
             let node = g.page();
             preview.nodes += 1;
-            preview.total_space += mem::size_of::<BTreeNode>();
-            preview.used_space += mem::size_of::<BTreeNode>() - node.free_space();
+            preview.total_space += BTREE_NODE_USABLE_SIZE;
+            preview.used_space += BTREE_NODE_USABLE_SIZE - node.free_space();
             preview.effective_space += node.effective_space();
         }
         Ok(preview)
@@ -552,7 +553,7 @@ impl<P: BufferPool> GenericBTree<P> {
             Valid(()) => {
                 let mut p_guard = p_guard.must_exclusive();
                 // Check if parent is full, trigger top-down split of parent node.
-                if !p_guard.page().can_insert(&sep_key) {
+                if !p_guard.page().can_insert::<BTreeU64>(&sep_key) {
                     let page_id = p_guard.page_id();
                     if page_id != self.root {
                         let lower_fence_key = p_guard.page().lower_fence_key();
@@ -623,7 +624,7 @@ impl<P: BufferPool> GenericBTree<P> {
                 if page_id == c_page_id {
                     // Tree structure remains the same.
                     // Check if parent is full.
-                    if !p_node.can_insert(sep_key) {
+                    if !p_node.can_insert::<BTreeU64>(sep_key) {
                         let p_page_id = p_guard.page_id();
                         if p_page_id != self.root {
                             // Parent is full, trigger top-down split of parent node.
@@ -696,7 +697,7 @@ impl<P: BufferPool> GenericBTree<P> {
                             .await
                             .unwrap();
                         let c_node = c_guard.page_mut();
-                        if c_node.can_insert(sep_key) {
+                        if c_node.can_insert::<BTreeU64>(sep_key) {
                             // The node to split can insert original separator key,
                             // maybe other thread restructure this tree.
                             return Ok(BTreeSplit::Inconsistent);
@@ -706,7 +707,7 @@ impl<P: BufferPool> GenericBTree<P> {
                         let sep_idx = c_node.find_separator();
                         // Separator key can not be truncated because it's branch node.
                         let sep_key = c_node.create_sep_key(sep_idx, false);
-                        if !p_node.can_insert(&sep_key) {
+                        if !p_node.can_insert::<BTreeU64>(&sep_key) {
                             // parent node is full
                             if p_page_id != self.root {
                                 // not root, split it in a single run.
@@ -720,7 +721,7 @@ impl<P: BufferPool> GenericBTree<P> {
                             // split root.
                             self.split_root::<BTreeU64>(pool_guard, p_node, false, ts)
                                 .await?;
-                            if !p_node.can_insert(&sep_key) {
+                            if !p_node.can_insert::<BTreeU64>(&sep_key) {
                                 return Ok(BTreeSplit::Inconsistent);
                             }
                         }
@@ -886,7 +887,7 @@ impl<P: BufferPool> GenericBTree<P> {
         upper_fence_key: &[u8], // upper fence key of right node.
         ts: TrxID,
     ) {
-        let value_size = mem::size_of::<V>();
+        let value_size = V::ENCODED_LEN;
         debug_assert!(l_node.height() == r_node.height());
         debug_assert!(p_r_idx < p_node.count());
         debug_assert!(p_node.lookup_child_idx(lower_fence_key) == Some(p_r_idx as isize - 1));
@@ -895,7 +896,7 @@ impl<P: BufferPool> GenericBTree<P> {
                 SpaceEstimation::with_fences(lower_fence_key, upper_fence_key, value_size);
             estimation.add_key_range(l_node, 0, l_node.count());
             estimation.add_key_range(r_node, 0, r_node.count());
-            estimation.total_space() <= mem::size_of::<BTreeNode>()
+            estimation.total_space() <= BTREE_NODE_USABLE_SIZE
         });
         let ts = ts.max(l_node.ts()).max(r_node.ts()).max(p_node.ts());
         let mut tmp_l = BTreeNodeBox::alloc(
@@ -933,7 +934,7 @@ impl<P: BufferPool> GenericBTree<P> {
         count: usize,
         ts: TrxID,
     ) {
-        let value_size = mem::size_of::<V>();
+        let value_size = V::ENCODED_LEN;
         debug_assert!(l_node.height() == r_node.height());
         debug_assert!(p_r_idx < p_node.count());
         debug_assert!(p_node.lookup_child_idx(lower_fence_key) == Some(p_r_idx as isize - 1));
@@ -943,7 +944,7 @@ impl<P: BufferPool> GenericBTree<P> {
             let mut estimation = SpaceEstimation::with_fences(lower_fence_key, sep_key, value_size);
             estimation.add_key_range(l_node, 0, l_node.count());
             estimation.add_key_range(r_node, 0, count);
-            estimation.total_space() <= mem::size_of::<BTreeNode>()
+            estimation.total_space() <= BTREE_NODE_USABLE_SIZE
         });
         let ts = ts.max(l_node.ts()).max(r_node.ts()).max(p_node.ts());
         let mut tmp_l = BTreeNodeBox::alloc(
@@ -1566,10 +1567,10 @@ impl<'a, V: BTreeValue, P: BufferPool> BTreeCompactor<'a, V, P> {
         height: usize,
         config: BTreeCompactConfig,
     ) -> Self {
-        let low_space = ((mem::size_of::<BTreeNode>() as f64 * config.low_ratio) as usize)
-            .min(mem::size_of::<BTreeNode>());
-        let high_space = ((mem::size_of::<BTreeNode>() as f64 * config.high_ratio) as usize)
-            .min(mem::size_of::<BTreeNode>());
+        let low_space = ((BTREE_NODE_USABLE_SIZE as f64 * config.low_ratio) as usize)
+            .min(BTREE_NODE_USABLE_SIZE);
+        let high_space = ((BTREE_NODE_USABLE_SIZE as f64 * config.high_ratio) as usize)
+            .min(BTREE_NODE_USABLE_SIZE);
         BTreeCompactor {
             tree,
             pool_guard,
@@ -1680,10 +1681,10 @@ impl<'a, V: BTreeValue, P: BufferPool> BTreeCompactor<'a, V, P> {
                     let mut estimation = SpaceEstimation::with_fences(
                         lower_fence_key_buffer,
                         upper_fence_key_buffer,
-                        mem::size_of::<V>(),
+                        V::ENCODED_LEN,
                     );
                     estimation.add_key_range(l_node, 0, l_node.count());
-                    if estimation.total_space() > mem::size_of::<BTreeNode>() {
+                    if estimation.total_space() > BTREE_NODE_USABLE_SIZE {
                         // fence key change results in a node out of space.
                         self.coupling.node.replace(r_guard);
                         self.coupling.parent.as_mut().unwrap().idx = p_r_idx as isize;

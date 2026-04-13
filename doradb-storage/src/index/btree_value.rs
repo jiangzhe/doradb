@@ -1,6 +1,7 @@
 use crate::buffer::page::{INVALID_PAGE_ID, PageID};
 use crate::index::util::Maskable;
 use crate::row::INVALID_ROW_ID;
+use bytemuck::{Pod, Zeroable};
 use std::mem;
 use std::ops::Deref;
 
@@ -43,7 +44,7 @@ pub trait BTreeValuePackable: BTreeValue {
 
 /// U64 value type to support both page id in branch node
 /// and row id in leaf node.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Pod, Zeroable)]
 #[repr(transparent)]
 pub struct BTreeU64(u64);
 
@@ -134,7 +135,7 @@ impl BTreeValuePackable for BTreeU64 {
 
 /// U8 value type to support non-unique-index.
 /// Only one bit is used for delete flag.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Pod, Zeroable)]
 #[repr(transparent)]
 pub struct BTreeByte(u8);
 
@@ -173,5 +174,47 @@ impl BTreeValue for BTreeByte {
     fn decode_le(src: &[u8]) -> Self {
         debug_assert!(src.len() == Self::ENCODED_LEN);
         BTreeByte(src[0])
+    }
+}
+
+/// Zero-width value type for persisted key-only sets.
+///
+/// Non-unique DiskTree stores exact `(logical_key, row_id)` keys and has no
+/// durable delete mask or value payload, so the value width is intentionally
+/// zero.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct BTreeNil;
+
+impl Maskable for BTreeNil {
+    const INVALID_VALUE: Self = BTreeNil;
+
+    #[inline]
+    fn deleted(self) -> Self {
+        self
+    }
+
+    #[inline]
+    fn value(self) -> Self {
+        self
+    }
+
+    #[inline]
+    fn is_deleted(self) -> bool {
+        false
+    }
+}
+
+impl BTreeValue for BTreeNil {
+    const ENCODED_LEN: usize = 0;
+
+    #[inline]
+    fn encode_le(self, dst: &mut [u8]) {
+        debug_assert!(dst.is_empty());
+    }
+
+    #[inline]
+    fn decode_le(src: &[u8]) -> Self {
+        debug_assert!(src.is_empty());
+        BTreeNil
     }
 }
