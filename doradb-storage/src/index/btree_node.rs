@@ -1343,6 +1343,13 @@ impl BTreeNode {
         self.read_value_le(offset)
     }
 
+    /// Returns the value for a known-valid slot.
+    #[inline]
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(super) fn value_for_slot<V: BTreeValue>(&self, slot: &BTreeSlot) -> V {
+        self.slot_value(slot)
+    }
+
     /// Returns all values in this node.
     #[inline]
     pub(super) fn values<V: BTreeValue, T, F: Fn(V) -> T>(&self, res: &mut Vec<T>, f: F) {

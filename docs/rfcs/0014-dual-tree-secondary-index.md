@@ -15,10 +15,10 @@ User-table secondary indexes will move from one mutable runtime tree to a
 two-layer design: an in-memory `MemTree` for foreground writes and hot overlay
 state, plus a persistent copy-on-write `DiskTree` for checkpointed cold state.
 The migration is staged to keep behavior unchanged while DiskTree is introduced:
-first implement and publish DiskTree roots as checkpoint sidecar state, then use
-DiskTree as a temporary recovery source for rebuilding the current runtime tree,
-and only then compose `MemTree` and `DiskTree` behind the user-table
-secondary-index runtime and remove that temporary rebuild path.
+first implement and publish DiskTree roots as checkpoint sidecar state, then
+build and test the composite `MemTree`/`DiskTree` secondary-index core without
+runtime wiring, and only then wire that composite behind the user-table
+secondary-index runtime and recovery path.
 
 Catalog tables remain on the existing single-tree in-memory runtime path.
 
@@ -128,15 +128,14 @@ Issue Labels:
 - [U2] Follow-up constraint: catalog tables must remain purely in-memory at
   runtime and continue reusing the current data/index codebase.
 - [U3] Follow-up migration direction: implement `DiskTree` first, wire it into
-  checkpoint and recovery while keeping the current single-tree runtime index,
-  then wrap the single-tree as `MemTree` and integrate both trees behind adapted
-  unique and non-unique interfaces.
+  checkpoint while keeping the current single-tree runtime index, then wrap the
+  single-tree as `MemTree` and integrate both trees behind adapted unique and
+  non-unique interfaces.
 - [U4] Draft revision constraint: storage version compatibility is not required;
-  do not add version-aware table-meta parsing, and make Phase 3 root handling
-  explicit so `SUPER_BLOCK_ID` means an empty root rather than a missing root.
-- [U5] Draft revision constraint: Phase 4 must remove the temporary recovery
-  logic that rebuilds the runtime tree from DiskTree; composite recovery should
-  load DiskTree roots directly and rebuild only hot/redone state into MemTree.
+  do not add version-aware table-meta parsing, and make root handling explicit
+  so `SUPER_BLOCK_ID` means an empty root rather than a missing root.
+- [U5] Draft revision constraint: composite recovery should load DiskTree roots
+  directly and rebuild only hot/redone state into MemTree.
 - [U6] Draft revision constraint: unique-key shadow semantics and non-unique
   merge behavior are normative contracts, not open questions or phase-note
   implications.
@@ -161,6 +160,10 @@ Issue Labels:
   exact-entry set with no reserved value byte and no durable delete-mask API;
   the RFC should also define method-by-method composite parity with current
   unique and non-unique traits, including rollback expectations.
+- [U12] Phase revision constraint: do not implement a temporary Phase 3
+  DiskTree-to-single-runtime-tree recovery rebuild because Phase 4 would remove
+  it; instead move a self-contained, testable composite-index-core slice from
+  Phase 4 into Phase 3.
 
 ### Source Backlogs
 
@@ -234,26 +237,31 @@ reconstructible until the checkpoint root durably publishes both persistent
 delete metadata and companion DiskTree root updates. [D1], [D5], [D6], [D11],
 [C7], [C11], [C13], [U8]
 
-The recovery-source migration keeps the single-tree runtime index as the only
-runtime access path until the composite runtime exists. Root handling is
-phase-gated, not root-value-gated: before the Phase 3 cutover, recovery
-continues to rebuild checkpointed cold entries through the existing
-persisted-LWC scan even if Phase 2 has already written DiskTree roots as
-sidecar state; after the Phase 3 cutover, the secondary-root vector is
-authoritative for checkpointed cold secondary-index state. At that point,
-recovery must rebuild the current single runtime tree from DiskTree entries and
-must not fall back to the persisted-LWC scan because a root equals
-`SUPER_BLOCK_ID`. Inside the authoritative vector, `SUPER_BLOCK_ID` means the
-index has no checkpointed cold entries. Hot row redo continues to rebuild the
-runtime tree through normal index update logic. [D5], [C12], [C16], [U3], [U4]
+After checkpoint sidecar publication, recovery remains phase-gated. Until the
+composite user-table runtime is wired, recovery continues to rebuild
+checkpointed cold entries through the existing persisted-LWC scan even when
+DiskTree sidecar roots are present. The migration deliberately skips a
+temporary DiskTree-to-single-runtime-tree rebuild because that code would be
+removed by the composite runtime phase. [D5], [C12], [C16], [U12]
 
-The Phase 3 DiskTree-to-single-runtime-tree rebuild is temporary migration
-logic. Phase 4 removes that user-table recovery path when the composite runtime
-is introduced: recovery loads DiskTree roots into the composite index, rebuilds
-only hot/redone state into MemTree, and does not copy checkpointed cold
-DiskTree entries into MemTree. DiskTree remains the recovered persistent cold
-layer rather than an input used to repopulate the hot layer. [D1], [D5], [C12],
-[C13], [C16], [U5]
+Instead, the next stage introduces a self-contained composite secondary-index
+core. That core wraps the current single-tree implementation as the `MemTree`
+backend, reads checkpointed cold state through the existing unique and
+non-unique `DiskTree` readers, and implements method-by-method composite
+semantics behind internal user-table helper APIs that accept the explicit
+DiskTree file and disk-buffer context needed for cold reads. This stage is
+tested in isolation and does not wire the composite into table runtime,
+foreground DML, rollback, or recovery. [D1], [C1], [C2], [C3], [C12], [C13],
+[U11], [U12]
+
+The later runtime-integration stage makes the secondary-root vector
+authoritative for checkpointed cold secondary-index state in user-table
+runtime and recovery. At that point recovery loads DiskTree roots into the
+composite index, treats `SUPER_BLOCK_ID` inside the validated root vector as an
+empty index, rebuilds only hot/redone state into MemTree, and does not copy
+checkpointed cold DiskTree entries into MemTree. DiskTree remains the recovered
+persistent cold layer rather than an input used to repopulate the hot layer.
+[D1], [D5], [C12], [C13], [C16], [U4], [U5], [U12]
 
 The final user-table runtime will use a composite index:
 
@@ -262,8 +270,8 @@ The final user-table runtime will use a composite index:
 - `DiskTree` is the table-file CoW persisted cold layer.
 - foreground insert/update/delete mutate only `MemTree`.
 - DiskTree mutations occur only through checkpoint companion work.
-- recovery opens DiskTree roots directly and does not backfill MemTree from
-  checkpointed DiskTree cold entries.
+- composite recovery opens DiskTree roots directly and does not backfill
+  MemTree from checkpointed DiskTree cold entries.
 - catalog tables keep the single-tree runtime implementation directly. [D1],
   [D3], [C1], [C13], [C14], [U2], [U3], [U5]
 
@@ -372,25 +380,41 @@ persisted delete bitmaps. [D1], [D2], [D3], [C13]
   catalog runtime changes in one large behavioral change.
 - Why Not Chosen: catalog tables intentionally remain in-memory at runtime, and
   the current single-tree user-table behavior should stay unchanged while
-  DiskTree checkpoint and recovery are proven.
+  DiskTree checkpoint publication and the composite core are proven.
 - References: [C13], [C14], [C15], [U2], [U3]
 
-### Alternative D: Staged User-Table DiskTree, Then Composite Runtime
+### Alternative D: Staged User-Table DiskTree, Composite Core, Then Runtime
 
 - Summary: implement DiskTree and table metadata first, publish DiskTree roots
-  through checkpoint while keeping the single-tree runtime, migrate recovery to
-  DiskTree as a temporary source for rebuilding the single runtime tree, then
-  wrap the current single tree as MemTree, add the composite user-table
-  runtime, and remove the temporary DiskTree-to-runtime-tree recovery rebuild.
+  through checkpoint while keeping the single-tree runtime, move the
+  self-contained composite-index core and method-parity tests ahead of runtime
+  wiring, then integrate the composite user-table runtime and recovery path.
 - Analysis: this creates useful validation boundaries. DiskTree can be tested
   as a persisted structure before it influences foreground reads and writes.
-  Recovery can prove root correctness while runtime behavior stays the same.
-  The final composite work then focuses on interface semantics instead of file
-  format and checkpoint concerns.
+  The composite method contract can be proven against MemTree and DiskTree
+  fixtures before the table access path depends on it. The final runtime work
+  then focuses on table wiring and recovery cutover instead of also designing
+  the core merge and shadow semantics.
 - Why Chosen: it best matches the user request while reducing migration risk
-  and preserving catalog behavior.
+  and preserving catalog behavior. It also avoids temporary
+  DiskTree-to-single-runtime-tree recovery code that the next runtime phase
+  would remove.
 - References: [D1], [D5], [D6], [C7], [C12], [C13], [C14], [U1], [U2], [U3],
-  [U5]
+  [U5], [U12]
+
+### Alternative E: Temporary DiskTree Recovery Rebuild
+
+- Summary: after checkpoint sidecar publication, rebuild the existing
+  single-tree runtime index from DiskTree entries during recovery, then delete
+  that rebuild path when the composite runtime lands.
+- Analysis: this would validate DiskTree roots through restart without changing
+  foreground behavior, but it introduces throwaway migration code and still
+  requires extra handling for stale cold entries that the final composite
+  runtime is designed to shadow rather than copy into MemTree.
+- Why Not Chosen: the composite core is a better Phase 3 boundary because it is
+  independently testable and directly reused by the final runtime and recovery
+  cutover.
+- References: [D1], [D5], [C12], [C13], [C16], [U5], [U12]
 
 ## Unsafe Considerations
 
@@ -442,39 +466,42 @@ SAFETY:` comments, and run the repository lint gate. [D10], [C4], [C7]
   - Phase Status: done
   - Implementation Summary: Implemented checkpoint sidecar publication for user-table secondary DiskTree roots. [Task Resolve Sync: docs/tasks/000118-disk-tree-checkpoint-sidecar-publication.md @ 2026-04-14]
 
-- **Phase 3: Recovery Source Migration**
-  - Scope: use checkpointed DiskTree roots as a validated recovery source
-    before introducing runtime composition.
-  - Goals: switch recovery-source selection from persisted-LWC scan to DiskTree
-    as an explicit phase cutover; before the cutover, keep using persisted-LWC
-    scan even when DiskTree sidecar roots exist; after the cutover, load the
-    secondary-root vector from table metadata and treat it as authoritative for
-    checkpointed cold state; treat `SUPER_BLOCK_ID` roots as empty indexes; keep
-    hot redo replay rebuilding runtime entries.
-  - Non-goals: changing runtime lookup semantics, adding storage-version
-    compatibility, and retaining persisted-LWC scan as an automatic fallback
-    after the DiskTree recovery cutover.
-  - Task Doc: `docs/tasks/TBD.md`
+- **Phase 3: Composite Secondary Index Core**
+  - Scope: implement the self-contained user-table composite secondary-index
+    core before table runtime wiring.
+  - Goals: wrap the current single-tree unique and non-unique implementations
+    as the MemTree backend; compose them with existing unique and non-unique
+    DiskTree root views behind internal helper APIs that accept explicit
+    DiskTree file and disk-buffer context; implement method parity with current
+    unique and non-unique trait surfaces; enforce unique terminal MemTree
+    lookup, DiskTree fallback, DiskTree-owner claiming through MemTree overlay,
+    unique delete-shadows for cold owners, non-unique exact merge,
+    delete-marked exact suppression, deterministic ordering, and rollback
+    expectations for each composite method.
+  - Non-goals: wiring the composite into table foreground DML, changing
+    catalog tables, changing recovery source selection, rebuilding the current
+    single runtime tree from DiskTree, foreground persistent DiskTree writes,
+    storage-version compatibility, MemTree cleanup/eviction, and generic
+    B+Tree backend unification.
+  - Task Doc: `docs/tasks/000119-composite-secondary-index-core.md`
   - Task Issue: `#0`
   - Phase Status: `pending`
   - Implementation Summary: `pending`
 
-- **Phase 4: MemTree Wrapper And User Composite**
-  - Scope: wrap the existing single-tree implementation as `MemTree` and add
-    the concrete user-table composite secondary-index implementation.
+- **Phase 4: User Composite Runtime And Recovery**
+  - Scope: wire the Phase 3 composite core into user-table runtime access and
+    recovery.
   - Goals: preserve catalog tables on the single-tree runtime; introduce a
-    user-table index type that combines MemTree and DiskTree; implement unique
-    terminal MemTree lookup, DiskTree fallback, DiskTree-owner claiming through
-    MemTree overlay, unique delete-shadows for cold owners, non-unique exact
-    merge and suppression as runtime contracts, method-by-method parity with
-    current `UniqueIndex` and `NonUniqueIndex` trait methods, and rollback
-    expectations for each composite method; replace the Phase 3 recovery
-    rebuild with composite recovery that loads DiskTree roots directly and
-    rebuilds only hot/redone state into MemTree.
+    user-table runtime index type that carries MemTree plus DiskTree root
+    context; adapt foreground lookup, uniqueness enforcement, insert, update,
+    delete, rollback, purge-facing cleanup, and scans to call the composite
+    core; make recovery load DiskTree roots directly as the cold layer and
+    rebuild only hot/redone state into MemTree; remove the existing
+    persisted-LWC cold secondary-index rebuild path for user tables.
   - Non-goals: foreground persistent DiskTree writes, changing heap MVCC
-    visibility authority, retaining the Phase 3 DiskTree-to-runtime-tree
-    rebuild for user tables, and removing the single-tree catalog
-    implementation.
+    visibility authority, rebuilding checkpointed cold DiskTree entries into
+    MemTree, removing the single-tree catalog implementation, and generic
+    B+Tree backend unification.
   - Task Doc: `docs/tasks/TBD.md`
   - Task Issue: `#0`
   - Phase Status: `pending`
@@ -511,21 +538,19 @@ SAFETY:` comments, and run the repository lint gate. [D10], [C4], [C7]
 - Phase 1 API coverage must keep non-unique DiskTree write methods limited to
   exact insert and exact delete; there must be no durable `mask_as_deleted`,
   `mask_as_active`, value compare/update, or deleted-value acceptance path.
-- Phase 4 unique method-parity tests must cover each current `UniqueIndex`
+- Phase 3 unique method-parity tests must cover each current `UniqueIndex`
   method with MemTree hit, MemTree delete-shadow hit where applicable,
   MemTree miss plus DiskTree hit, and complete miss cases.
-- Phase 4 non-unique method-parity tests must cover each current
+- Phase 3 non-unique method-parity tests must cover each current
   `NonUniqueIndex` method with exact MemTree hit, exact MemTree delete-marked
   hit where applicable, exact DiskTree hit, and complete miss cases.
-- Rollback tests must prove composite unique and non-unique rollback paths
+- Phase 3 rollback tests must prove composite unique and non-unique rollback paths
   mutate only `MemTree` and preserve DiskTree roots.
-- Phase 3 tests must prove recovery rebuilds the current single runtime tree
-  from DiskTree entries while runtime lookup semantics remain unchanged.
 - Phase 4 tests must prove composite recovery does not populate MemTree from
   checkpointed DiskTree cold entries.
 - Phase 4 tests must prove composite recovery loads DiskTree roots, replays hot
-  redo into MemTree, and returns the same visible rows as the Phase 3
-  single-tree rebuild path.
+  redo into MemTree, removes the user-table persisted-LWC cold index rebuild
+  path, and returns the same visible rows as the pre-composite recovery path.
 - Phase 5 tests must keep the no-cold-backfill invariant while exercising
   MemTree cleanup, unique ownership transfer, non-unique merge/suppression,
   checkpoint/recovery, and cold-delete companion behavior.

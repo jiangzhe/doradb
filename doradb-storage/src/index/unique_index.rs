@@ -1,6 +1,6 @@
 use crate::buffer::guard::PageGuard;
 use crate::buffer::{BufferPool, FixedBufferPool, PoolGuard};
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::index::IndexCompareExchange;
 use crate::index::btree::{BTreeDelete, BTreeInsert, BTreeUpdate, GenericBTree};
 use crate::index::btree_key::BTreeKeyEncoder;
@@ -104,6 +104,31 @@ pub struct GenericUniqueBTreeIndex<P: 'static> {
     encoder: BTreeKeyEncoder,
 }
 
+/// Encoded MemTree state for one unique secondary-index entry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) struct UniqueMemTreeEntry {
+    /// Encoded logical secondary key in BTree order.
+    pub(crate) encoded_key: Vec<u8>,
+    /// Row id stored in the MemTree entry with the delete bit stripped.
+    pub(crate) row_id: RowID,
+    /// Whether the MemTree entry is a delete-shadow.
+    pub(crate) deleted: bool,
+}
+
+impl UniqueMemTreeEntry {
+    /// Return the row id in the same shape as current MemTree scan results.
+    #[inline]
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn scan_row_id(&self) -> RowID {
+        if self.deleted {
+            self.row_id.deleted()
+        } else {
+            self.row_id
+        }
+    }
+}
+
 /// Compatibility alias for runtime unique index backed by `FixedBufferPool`.
 pub type UniqueBTreeIndex = GenericUniqueBTreeIndex<FixedBufferPool>;
 
@@ -118,6 +143,86 @@ impl<P: BufferPool> GenericUniqueBTreeIndex<P> {
     #[inline]
     pub(crate) async fn destroy(self, pool_guard: &PoolGuard) -> Result<()> {
         self.tree.destory(pool_guard).await
+    }
+
+    /// Insert a live or delete-shadow overlay when the logical key is absent.
+    ///
+    /// This helper is intentionally concrete to the BTree-backed MemTree so the
+    /// dual-tree composite can claim or shadow cold DiskTree owners without
+    /// widening the public `UniqueIndex` trait.
+    #[inline]
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) async fn insert_overlay_if_absent(
+        &self,
+        pool_guard: &PoolGuard,
+        key: &[Val],
+        row_id: RowID,
+        ts: TrxID,
+    ) -> Result<bool> {
+        let key = self.encoder.encode(key);
+        Ok(
+            match self
+                .tree
+                .insert::<BTreeU64>(
+                    pool_guard,
+                    key.as_bytes(),
+                    BTreeU64::from(row_id),
+                    false,
+                    ts,
+                )
+                .await?
+            {
+                BTreeInsert::Ok(_) => true,
+                BTreeInsert::DuplicateKey(_) => false,
+            },
+        )
+    }
+
+    /// Insert a cold-owner delete-shadow when the logical key is absent.
+    ///
+    /// The retained row id remains available for MVCC/key-recheck routing while
+    /// preventing a later composite lookup from falling through to stale
+    /// DiskTree state.
+    #[inline]
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) async fn insert_delete_shadow_if_absent(
+        &self,
+        pool_guard: &PoolGuard,
+        key: &[Val],
+        row_id: RowID,
+        ts: TrxID,
+    ) -> Result<bool> {
+        debug_assert!(!row_id.is_deleted());
+        self.insert_overlay_if_absent(pool_guard, key, row_id.deleted(), ts)
+            .await
+    }
+
+    /// Scan MemTree entries with encoded logical keys and delete state.
+    ///
+    /// The returned entries are ordered by encoded key because they are produced
+    /// by the underlying BTree leaf cursor.
+    #[inline]
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) async fn scan_encoded_entries(
+        &self,
+        pool_guard: &PoolGuard,
+    ) -> Result<Vec<UniqueMemTreeEntry>> {
+        let mut entries = Vec::new();
+        let mut cursor = self.tree.cursor(pool_guard, 0);
+        cursor.seek(&[]).await?;
+        while let Some(guard) = cursor.next().await? {
+            let node = guard.page();
+            for idx in 0..node.count() {
+                let encoded_key = node.key_checked(idx).ok_or(Error::InvalidState)?;
+                let value = node.value::<BTreeU64>(idx);
+                entries.push(UniqueMemTreeEntry {
+                    encoded_key,
+                    row_id: value.value().to_u64(),
+                    deleted: value.is_deleted(),
+                });
+            }
+        }
+        Ok(entries)
     }
 }
 

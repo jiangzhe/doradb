@@ -1518,14 +1518,30 @@ impl<'a> NonUniqueDiskTree<'a> {
     /// prefix; later range-scan support can route directly through leaf ranges.
     #[inline]
     pub(crate) async fn prefix_scan(&self, key: &[Val]) -> Result<Vec<RowID>> {
+        Ok(self
+            .prefix_scan_entries(key)
+            .await?
+            .into_iter()
+            .map(|(_, row_id)| row_id)
+            .collect())
+    }
+
+    /// Prefix-scan one logical key and return encoded exact keys with row ids.
+    ///
+    /// Composite secondary-index reads use the encoded exact key to merge
+    /// MemTree and DiskTree entries without duplicating key encoders outside the
+    /// concrete DiskTree reader.
+    #[inline]
+    pub(crate) async fn prefix_scan_entries(&self, key: &[Val]) -> Result<Vec<(Vec<u8>, RowID)>> {
         let prefix = self.tree.encoder.encode_prefix(key, Some(ROW_ID_SIZE));
-        let mut row_ids = Vec::new();
+        let mut entries = Vec::new();
         for entry in self.tree.collect_entries().await? {
             if entry.key.starts_with(prefix.as_bytes()) {
-                row_ids.push(unpack_row_id_from_exact_key(&entry.key)?);
+                let row_id = unpack_row_id_from_exact_key(&entry.key)?;
+                entries.push((entry.key, row_id));
             }
         }
-        Ok(row_ids)
+        Ok(entries)
     }
 
     /// Scan encoded exact keys and row ids in durable exact-key order.

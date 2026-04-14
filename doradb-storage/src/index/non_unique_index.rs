@@ -1,6 +1,6 @@
 use crate::buffer::guard::PageGuard;
 use crate::buffer::{BufferPool, FixedBufferPool, PoolGuard};
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::index::btree::{BTreeDelete, BTreeInsert, BTreeUpdate, GenericBTree};
 use crate::index::btree_key::BTreeKeyEncoder;
 use crate::index::btree_node::{BTreeNode, BTreeSlot};
@@ -91,6 +91,18 @@ pub struct GenericNonUniqueBTreeIndex<P: 'static> {
     encoder: BTreeKeyEncoder,
 }
 
+/// Encoded MemTree state for one non-unique exact secondary-index entry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) struct NonUniqueMemTreeEntry {
+    /// Encoded exact key in BTree order, including the row-id suffix.
+    pub(crate) encoded_key: Vec<u8>,
+    /// Row id decoded from the exact key suffix.
+    pub(crate) row_id: RowID,
+    /// Whether the exact entry is delete-marked in MemTree.
+    pub(crate) deleted: bool,
+}
+
 /// Compatibility alias for runtime non-unique index backed by `FixedBufferPool`.
 pub type NonUniqueBTreeIndex = GenericNonUniqueBTreeIndex<FixedBufferPool>;
 
@@ -105,6 +117,86 @@ impl<P: BufferPool> GenericNonUniqueBTreeIndex<P> {
     #[inline]
     pub(crate) async fn destroy(self, pool_guard: &PoolGuard) -> Result<()> {
         self.tree.destory(pool_guard).await
+    }
+
+    /// Insert a delete-marked exact overlay when the exact key is absent.
+    ///
+    /// This helper is intentionally concrete to the BTree-backed MemTree so the
+    /// dual-tree composite can shadow cold DiskTree exact entries without
+    /// widening the public `NonUniqueIndex` trait.
+    #[inline]
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) async fn insert_delete_overlay_if_absent(
+        &self,
+        pool_guard: &PoolGuard,
+        key: &[Val],
+        row_id: RowID,
+        ts: TrxID,
+    ) -> Result<bool> {
+        debug_assert!(!row_id.is_deleted());
+        let key = self.encoder.encode_pair(key, Val::from(row_id));
+        Ok(
+            match self
+                .tree
+                .insert::<BTreeByte>(
+                    pool_guard,
+                    key.as_bytes(),
+                    BTREE_BYTE_ZERO.deleted(),
+                    false,
+                    ts,
+                )
+                .await?
+            {
+                BTreeInsert::Ok(_) => true,
+                BTreeInsert::DuplicateKey(_) => false,
+            },
+        )
+    }
+
+    /// Scan exact MemTree entries for one logical key with encoded keys.
+    ///
+    /// The returned entries are ordered by encoded exact key and include
+    /// delete-marked overlays so the composite can suppress matching DiskTree
+    /// exact entries.
+    #[inline]
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) async fn lookup_encoded_entries(
+        &self,
+        pool_guard: &PoolGuard,
+        key: &[Val],
+    ) -> Result<Vec<NonUniqueMemTreeEntry>> {
+        let key = self
+            .encoder
+            .encode_prefix(key, Some(mem::size_of::<RowID>()));
+        let mut entries = Vec::new();
+        let mut scanner = self
+            .tree
+            .prefix_scanner(pool_guard, CollectEncodedExactEntries(&mut entries));
+        scanner.scan_prefix(key.as_bytes()).await?;
+        Ok(entries)
+    }
+
+    /// Scan all exact MemTree entries with encoded keys and delete state.
+    ///
+    /// The returned entries are ordered by encoded exact key because they are
+    /// produced by the underlying BTree leaf cursor.
+    #[inline]
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) async fn scan_encoded_entries(
+        &self,
+        pool_guard: &PoolGuard,
+    ) -> Result<Vec<NonUniqueMemTreeEntry>> {
+        let mut entries = Vec::new();
+        let mut cursor = self.tree.cursor(pool_guard, 0);
+        cursor.seek(&[]).await?;
+        while let Some(guard) = cursor.next().await? {
+            let node = guard.page();
+            for idx in 0..node.count() {
+                let slot = node.slot(idx);
+                push_encoded_exact_entry(node, slot, &mut entries)?;
+            }
+        }
+        Ok(entries)
     }
 }
 
@@ -285,6 +377,39 @@ impl BTreeSlotCallback for CollectRowID<'_> {
         self.0.push(value.to_u64());
         true
     }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+struct CollectEncodedExactEntries<'a>(&'a mut Vec<NonUniqueMemTreeEntry>);
+
+impl BTreeSlotCallback for CollectEncodedExactEntries<'_> {
+    #[inline]
+    fn apply(&mut self, node: &BTreeNode, slot: &BTreeSlot) -> bool {
+        // In-memory BTree slot data has already been validated by the scanner.
+        push_encoded_exact_entry(node, slot, self.0).is_ok()
+    }
+}
+
+#[inline]
+#[cfg_attr(not(test), allow(dead_code))]
+fn push_encoded_exact_entry(
+    node: &BTreeNode,
+    slot: &BTreeSlot,
+    entries: &mut Vec<NonUniqueMemTreeEntry>,
+) -> Result<()> {
+    let mut encoded_key = Vec::new();
+    node.extend_slot_key(slot, &mut encoded_key);
+    if encoded_key.len() < mem::size_of::<RowID>() {
+        return Err(Error::InvalidState);
+    }
+    let row_id = node.unpack_value::<BTreeU64>(slot).to_u64();
+    let value = node.value_for_slot::<BTreeByte>(slot);
+    entries.push(NonUniqueMemTreeEntry {
+        encoded_key,
+        row_id,
+        deleted: value.is_deleted(),
+    });
+    Ok(())
 }
 
 #[cfg(test)]
