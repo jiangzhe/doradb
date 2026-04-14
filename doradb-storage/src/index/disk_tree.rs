@@ -582,6 +582,24 @@ fn unpack_row_id_from_exact_key(key: &[u8]) -> Result<RowID> {
     Ok(BTreeU64::unpack(&key[key.len() - ROW_ID_SIZE..]).to_u64())
 }
 
+/// Validate already-encoded non-unique exact keys before staging them.
+///
+/// The trailing row-id suffix is part of the durable exact key contract; reject
+/// malformed keys here so readers never discover them through prefix scans.
+fn validate_sorted_non_unique_exact_keys(
+    entries: &[NonUniqueDiskTreeEncodedExact<'_>],
+) -> Result<()> {
+    let mut prev = None;
+    for entry in entries {
+        unpack_row_id_from_exact_key(entry.key)?;
+        if prev.is_some_and(|prev_key: &[u8]| prev_key >= entry.key) {
+            return Err(Error::InvalidArgument);
+        }
+        prev = Some(entry.key);
+    }
+    Ok(())
+}
+
 /// Shared root-snapshot view over one persisted DiskTree.
 ///
 /// The view is immutable: reads use the readonly buffer pool, while writes build
@@ -1685,7 +1703,7 @@ impl<M: MutableCowFile> NonUniqueDiskTreeBatchWriter<'_, '_, M> {
         &mut self,
         entries: &[NonUniqueDiskTreeEncodedExact<'_>],
     ) -> Result<()> {
-        validate_sorted_unique_keys(entries.iter().map(|entry| entry.key))?;
+        validate_sorted_non_unique_exact_keys(entries)?;
         for entry in entries {
             self.operations.insert(entry.key.to_vec(), true);
         }
@@ -1710,7 +1728,7 @@ impl<M: MutableCowFile> NonUniqueDiskTreeBatchWriter<'_, '_, M> {
         &mut self,
         entries: &[NonUniqueDiskTreeEncodedExact<'_>],
     ) -> Result<()> {
-        validate_sorted_unique_keys(entries.iter().map(|entry| entry.key))?;
+        validate_sorted_non_unique_exact_keys(entries)?;
         for entry in entries {
             self.operations.insert(entry.key.to_vec(), false);
         }
@@ -2164,6 +2182,25 @@ mod tests {
                 .encode_pair(&key1, Val::from(11u64))
                 .as_bytes()
                 .to_vec();
+            let malformed_exact = [0u8; ROW_ID_SIZE - 1];
+            {
+                let mut writer = non_unique_tree.batch_writer(&mut mutable, 4);
+                assert!(matches!(
+                    writer.batch_insert_encoded(&[NonUniqueDiskTreeEncodedExact {
+                        key: &malformed_exact
+                    }]),
+                    Err(Error::InvalidFormat)
+                ));
+            }
+            {
+                let mut writer = non_unique_tree.batch_writer(&mut mutable, 4);
+                assert!(matches!(
+                    writer.batch_exact_delete_encoded(&[NonUniqueDiskTreeEncodedExact {
+                        key: &malformed_exact
+                    }]),
+                    Err(Error::InvalidFormat)
+                ));
+            }
             {
                 let mut writer = non_unique_tree.batch_writer(&mut mutable, 4);
                 assert!(matches!(
