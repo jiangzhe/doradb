@@ -114,7 +114,7 @@ impl ActiveRoot {
 
     /// Build meta-block serialization view for the current active root.
     #[inline]
-    pub fn meta_block_ser_view(&self) -> MetaBlockSerView<'_> {
+    pub fn meta_block_ser_view(&self) -> Result<MetaBlockSerView<'_>> {
         MetaBlockSerView::new(
             self.metadata.ser_view(),
             self.column_block_index_root,
@@ -172,7 +172,7 @@ fn validate_table_root(meta_block_id: BlockID, parsed_meta: &ParsedMeta<TableMet
 
 #[inline]
 fn build_table_meta_block(root: &ActiveRoot) -> Result<DirectBuf> {
-    let meta_block = root.meta_block_ser_view();
+    let meta_block = root.meta_block_ser_view()?;
     let mut meta_buf = DirectBuf::zeroed(COW_FILE_PAGE_SIZE);
     let meta_len = meta_block.ser_len();
     if meta_len > max_payload_len(COW_FILE_PAGE_SIZE) {
@@ -768,6 +768,46 @@ mod tests {
             drop(table_file2);
             drop(table_file3);
 
+            drop(fs);
+        });
+    }
+
+    #[test]
+    fn test_mutable_table_file_rolls_back_only_current_fork_allocations() {
+        smol::block_on(async {
+            let (_temp_dir, fs) = build_test_fs();
+            let background_writes = fs.background_writes();
+            let metadata = build_test_metadata();
+            let table_file = fs.create_table_file(143, metadata, false).unwrap();
+            let (table_file, old_root) = table_file.commit(1, false).await.unwrap();
+            drop(old_root);
+
+            let mut mutable = MutableTableFile::fork(&table_file, background_writes);
+            let inherited_root = mutable.allocate_block_id().unwrap();
+            mutable.set_secondary_index_root(0, inherited_root).unwrap();
+            let (table_file, old_root) = mutable.commit(2, false).await.unwrap();
+            drop(old_root);
+
+            let mut mutable = MutableTableFile::fork(&table_file, background_writes);
+            let allocated_before = mutable.root().alloc_map.allocated();
+            let err = mutable
+                .rollback_allocated_block_id(inherited_root)
+                .unwrap_err();
+            assert!(matches!(err, Error::InvalidState));
+            assert_eq!(mutable.root().alloc_map.allocated(), allocated_before);
+
+            let fresh_block = mutable.allocate_block_id().unwrap();
+            assert_eq!(mutable.root().alloc_map.allocated(), allocated_before + 1);
+            mutable.rollback_allocated_block_id(fresh_block).unwrap();
+            assert_eq!(mutable.root().alloc_map.allocated(), allocated_before);
+
+            let err = mutable
+                .rollback_allocated_block_id(fresh_block)
+                .unwrap_err();
+            assert!(matches!(err, Error::InvalidState));
+
+            drop(mutable);
+            drop(table_file);
             drop(fs);
         });
     }

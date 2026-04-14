@@ -106,8 +106,11 @@ impl<'a> MetaBlockSerView<'a> {
         pivot_row_id: RowID,
         heap_redo_start_ts: TrxID,
         deletion_cutoff_ts: TrxID,
-    ) -> Self {
-        MetaBlockSerView {
+    ) -> Result<Self> {
+        if secondary_index_roots.len() != schema.index_specs.len() {
+            return Err(crate::error::Error::InvalidFormat);
+        }
+        Ok(MetaBlockSerView {
             pivot_row_id,
             heap_redo_start_ts,
             deletion_cutoff_ts,
@@ -115,7 +118,7 @@ impl<'a> MetaBlockSerView<'a> {
             column_block_index_root,
             secondary_index_roots,
             space,
-        }
+        })
     }
 }
 
@@ -367,7 +370,7 @@ mod tests {
         ));
         let mut active_root = ActiveRoot::new(7, 1024, Arc::clone(&metadata));
         active_root.secondary_index_roots = vec![BlockID::new(11)];
-        let ser_view = active_root.meta_block_ser_view();
+        let ser_view = active_root.meta_block_ser_view().unwrap();
         let ser_len = ser_view.ser_len();
         let mut data = vec![0u8; ser_len];
         let res_idx = ser_view.ser(&mut data[..], 0);
@@ -407,7 +410,7 @@ mod tests {
             vec![],
         ));
         let active_root = ActiveRoot::new(7, 1024, Arc::clone(&metadata));
-        let ser_view = active_root.meta_block_ser_view();
+        let ser_view = active_root.meta_block_ser_view().unwrap();
         let ser_len = ser_view.ser_len();
         let mut data = vec![0u8; ser_len];
         let res_idx = ser_view.ser(&mut data[..], 0);
@@ -432,7 +435,7 @@ mod tests {
         ));
         let mut active_root = ActiveRoot::new(7, 1024, Arc::clone(&metadata));
         active_root.secondary_index_roots = vec![BlockID::new(11), BlockID::new(12)];
-        let ser_view = active_root.meta_block_ser_view();
+        let ser_view = active_root.meta_block_ser_view().unwrap();
         let ser_len = ser_view.ser_len();
         let mut data = vec![0u8; ser_len];
         let res_idx = ser_view.ser(&mut data[..], 0);
@@ -481,6 +484,35 @@ mod tests {
         assert_eq!(idx, ser_len);
 
         let err = MetaBlock::deser(&data[..], 0).unwrap_err();
+        assert!(matches!(err, crate::error::Error::InvalidFormat));
+    }
+
+    #[test]
+    fn test_meta_block_ser_view_rejects_secondary_root_count_mismatch() {
+        let metadata = Arc::new(TableMetadata::new(
+            vec![ColumnSpec::new(
+                "c0",
+                ValKind::U32,
+                ColumnAttributes::empty(),
+            )],
+            vec![IndexSpec::new(
+                "idx1",
+                vec![IndexKey::new(0)],
+                IndexAttributes::PK,
+            )],
+        ));
+        let active_root = ActiveRoot::new(7, 1024, Arc::clone(&metadata));
+        let err = MetaBlockSerView::new(
+            active_root.metadata.ser_view(),
+            active_root.column_block_index_root,
+            &[],
+            AllocMapGcListSerView::new(&active_root.alloc_map, &active_root.gc_block_list),
+            active_root.pivot_row_id,
+            active_root.heap_redo_start_ts,
+            active_root.deletion_cutoff_ts,
+        )
+        .err()
+        .unwrap();
         assert!(matches!(err, crate::error::Error::InvalidFormat));
     }
 
