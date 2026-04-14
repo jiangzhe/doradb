@@ -19,7 +19,7 @@ use crate::file::SparseFile;
 use crate::file::block_integrity::{validate_block_checksum, write_block_checksum};
 use crate::file::cow_file::{BlockID, COW_FILE_PAGE_SIZE, MutableCowFile, SUPER_BLOCK_ID};
 use crate::index::btree_key::BTreeKeyEncoder;
-use crate::index::btree_node::{BTreeNode, LookupChild};
+use crate::index::btree_node::{BTREE_NODE_USABLE_SIZE, BTreeNode, LookupChild};
 use crate::index::btree_value::{BTreeNil, BTreeU64, BTreeValue, BTreeValuePackable};
 use crate::index::util::Maskable;
 use crate::io::DirectBuf;
@@ -36,6 +36,7 @@ use std::sync::Arc;
 /// Physical size of one persisted secondary DiskTree block.
 pub(crate) const DISK_TREE_BLOCK_SIZE: usize = COW_FILE_PAGE_SIZE;
 const ROW_ID_SIZE: usize = mem::size_of::<RowID>();
+const DISK_TREE_REWRITE_COMPACT_UNDERFILLED_PERCENT: usize = 40;
 
 const _: () = assert!(DISK_TREE_BLOCK_SIZE == mem::size_of::<BTreeNode>());
 
@@ -88,15 +89,87 @@ impl LogicalEntry {
     }
 }
 
-/// Lower-fence key and block id for one child subtree.
+/// In-memory payload for one child block while a rewrite is in progress.
+///
+/// Newly written blocks cannot be reached through a published root yet, so the
+/// rewrite carries their logical payload beside the block id. This lets parent
+/// compaction merge or collapse those blocks without reading them through the
+/// readonly pool.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum BranchEntryPayload {
+    /// Leaf entries stored by the child block.
+    Leaf(Vec<LogicalEntry>),
+    /// Flattened child entries stored by the branch block.
+    Branch(Vec<BranchEntry>),
+}
+
+/// Lower-fence key, block id, and rewrite metadata for one child subtree.
 ///
 /// Branch blocks encode the first child in the lower fence and subsequent
-/// children as slot key/value pairs. This flattened form lets rewrites split and
-/// rebuild branch levels without exposing that layout to callers.
+/// children as slot key/value pairs. This flattened form lets rewrites split,
+/// rebuild, compact, and collapse branch levels without exposing that layout to
+/// callers. `rewrite_allocated` is true only for blocks allocated by the current
+/// mutable root, which makes it safe to roll back abandoned intermediate blocks.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct BranchEntry {
     key: Vec<u8>,
     block_id: BlockID,
+    height: u16,
+    effective_space: Option<usize>,
+    rewrite_allocated: bool,
+    payload: Option<BranchEntryPayload>,
+}
+
+impl BranchEntry {
+    /// Reference an existing persisted block from the published root snapshot.
+    #[inline]
+    fn persisted(key: Vec<u8>, block_id: BlockID, height: u16) -> Self {
+        Self {
+            key,
+            block_id,
+            height,
+            effective_space: None,
+            rewrite_allocated: false,
+            payload: None,
+        }
+    }
+
+    /// Describe a leaf block allocated and written by the current rewrite.
+    #[inline]
+    fn rewritten_leaf(
+        key: Vec<u8>,
+        block_id: BlockID,
+        effective_space: usize,
+        entries: Vec<LogicalEntry>,
+    ) -> Self {
+        Self {
+            key,
+            block_id,
+            height: 0,
+            effective_space: Some(effective_space),
+            rewrite_allocated: true,
+            payload: Some(BranchEntryPayload::Leaf(entries)),
+        }
+    }
+
+    /// Describe a branch block allocated and written by the current rewrite.
+    #[inline]
+    fn rewritten_branch(
+        key: Vec<u8>,
+        block_id: BlockID,
+        height: u16,
+        effective_space: usize,
+        children: Vec<BranchEntry>,
+    ) -> Self {
+        Self {
+            key,
+            block_id,
+            height,
+            effective_space: Some(effective_space),
+            rewrite_allocated: true,
+            payload: Some(BranchEntryPayload::Branch(children)),
+        }
+    }
 }
 
 /// Result of rewriting one subtree.
@@ -605,21 +678,24 @@ impl<'a, F: DiskTreeSpec> DiskTree<'a, F> {
     ) -> Pin<Box<dyn Future<Output = Result<BlockID>> + 'b>> {
         Box::pin(async move {
             if operations.is_empty() {
+                // An empty companion batch should preserve the exact root block.
+                // This avoids producing a new tree image for checkpoint no-ops.
                 return Ok(self.root_block_id);
             }
             if self.root_block_id == SUPER_BLOCK_ID {
+                // Empty roots have no block to rewrite. Apply the batch against
+                // an empty logical set and build the resulting tree from scratch.
                 let entries = F::apply_operations(&[], operations)?;
                 return self
                     .build_tree_from_entries(mutable_file, &entries, create_ts)
                     .await;
             }
-            let root = self.read_node(self.root_block_id).await?;
-            let root_height = root.node().height() as u16;
-            drop(root);
             let res = self
                 .rewrite_subtree(mutable_file, self.root_block_id, operations, create_ts)
                 .await?;
-            self.finalize_root_rewrite(mutable_file, root_height, res.entries, create_ts)
+            // Finalization decides whether the rewritten result is empty, can
+            // promote a single child, or needs new branch levels above it.
+            self.finalize_root_rewrite(mutable_file, res.entries, create_ts)
                 .await
         })
     }
@@ -640,11 +716,15 @@ impl<'a, F: DiskTreeSpec> DiskTree<'a, F> {
             let guard = self.read_node(block_id).await?;
             let node = guard.node();
             if node.is_leaf() {
+                // Leaves are already validated, so each slot can be decoded into
+                // the spec's logical entry form before applying batch semantics.
                 let mut entries = Vec::with_capacity(node.count());
                 for idx in 0..node.count() {
                     entries.push(F::leaf_entry(node, idx, self.file_kind, block_id)?);
                 }
                 let entries = F::apply_operations(&entries, operations)?;
+                // The rewrite result is a fresh run of one or more leaves. The
+                // parent only needs the lower-fence key and block id for each.
                 let new_entries = self
                     .write_leaf_blocks_from_entries(mutable_file, &entries, create_ts)
                     .await?;
@@ -653,6 +733,8 @@ impl<'a, F: DiskTreeSpec> DiskTree<'a, F> {
                 });
             }
             let entries = branch_entries_from_node(node, self.file_kind, block_id)?;
+            // Flatten the branch while the guard is alive, then release it before
+            // recursive children perform mutable writes through the CoW fork.
             drop(guard);
             self.rewrite_branch(entries, mutable_file, operations, create_ts)
                 .await
@@ -677,15 +759,21 @@ impl<'a, F: DiskTreeSpec> DiskTree<'a, F> {
             let upper = old_entries
                 .get(child_idx + 1)
                 .map(|next| next.key.as_slice());
+            // Child ranges are half-open: this child's lower fence through the
+            // next child's lower fence. The last child owns the remaining suffix.
             while op_idx < operations.len()
                 && upper.is_none_or(|upper| operations[op_idx].key.as_slice() < upper)
             {
                 op_idx += 1;
             }
             if start_idx == op_idx {
+                // No operation falls in this child range, so reuse the existing
+                // child block and preserve copy-on-write locality.
                 combined.push(entry.clone());
                 continue;
             }
+            // Only touched children are recursively rewritten. A child rewrite
+            // may shrink, preserve, or split into multiple replacement children.
             let child = self
                 .rewrite_subtree(
                     mutable_file,
@@ -697,13 +785,27 @@ impl<'a, F: DiskTreeSpec> DiskTree<'a, F> {
             combined.extend(child.entries);
         }
         if op_idx != operations.len() {
+            // Sorted operations should all be consumed by the existing branch
+            // ranges. Leftovers indicate invalid caller ordering or routing.
             return Err(Error::InvalidArgument);
         }
-        let height = if combined.is_empty() {
-            1
-        } else {
-            self.read_node(combined[0].block_id).await?.node().height() as u16 + 1
-        };
+        if combined.is_empty() {
+            return Ok(NodeRewriteResult {
+                entries: Vec::new(),
+            });
+        }
+        // Before writing this parent level, opportunistically repack adjacent
+        // underfilled siblings. The predicate is intentionally local and cheap:
+        // it only accepts a merge when repacking reduces the block count.
+        let combined = self
+            .compact_underfilled_siblings(mutable_file, combined, create_ts)
+            .await?;
+        if combined.is_empty() {
+            return Ok(NodeRewriteResult {
+                entries: Vec::new(),
+            });
+        }
+        let height = parent_height_from_children(&combined)?;
         let entries = self
             .write_branch_blocks(mutable_file, &combined, height, create_ts)
             .await?;
@@ -723,7 +825,7 @@ impl<'a, F: DiskTreeSpec> DiskTree<'a, F> {
         let leaf_entries = self
             .write_leaf_blocks_from_entries(mutable_file, entries, create_ts)
             .await?;
-        self.finalize_root_rewrite(mutable_file, 0, leaf_entries, create_ts)
+        self.finalize_root_rewrite(mutable_file, leaf_entries, create_ts)
             .await
     }
 
@@ -734,18 +836,21 @@ impl<'a, F: DiskTreeSpec> DiskTree<'a, F> {
     async fn finalize_root_rewrite<M: MutableCowFile>(
         &self,
         mutable_file: &mut M,
-        old_root_height: u16,
         entries: Vec<BranchEntry>,
         create_ts: u64,
     ) -> Result<BlockID> {
         if entries.is_empty() {
+            // A rewrite that removes every logical entry returns the empty-root
+            // sentinel instead of writing an empty node block.
             return Ok(SUPER_BLOCK_ID);
         }
-        if entries.len() == 1 {
-            return Ok(entries[0].block_id);
-        }
-        self.build_branch_levels(mutable_file, entries, old_root_height + 1, create_ts)
-            .await
+        // Multiple children need branch levels above them; a single child is
+        // already a root candidate. In both cases, root-only single-child branch
+        // chains are collapsed before returning the final block id.
+        let root_entry = self
+            .build_branch_levels(mutable_file, entries, create_ts)
+            .await?;
+        self.collapse_root_chain(mutable_file, root_entry).await
     }
 
     /// Build branch levels until the tree has a single root block.
@@ -753,21 +858,226 @@ impl<'a, F: DiskTreeSpec> DiskTree<'a, F> {
         &self,
         mutable_file: &mut M,
         mut entries: Vec<BranchEntry>,
-        mut height: u16,
         create_ts: u64,
-    ) -> Result<BlockID> {
+    ) -> Result<BranchEntry> {
         loop {
             if entries.is_empty() {
-                return Ok(SUPER_BLOCK_ID);
+                // This is defensive: callers normally handle empty rewrites
+                // before entering the branch-level builder.
+                return Err(Error::InvalidArgument);
             }
             if entries.len() == 1 {
-                return Ok(entries[0].block_id);
+                // Stop as soon as the current level has a single root candidate.
+                return Ok(entries.remove(0));
             }
+            // Pack the current level into parent branch blocks, then repeat with
+            // the returned lower-fence entries until one root block remains.
+            let height = parent_height_from_children(&entries)?;
             entries = self
                 .write_branch_blocks(mutable_file, &entries, height, create_ts)
                 .await?;
-            height += 1;
         }
+    }
+
+    /// Collapse root-only branch wrappers that have exactly one child.
+    ///
+    /// This keeps delete-heavy rewrites from returning a tall chain of branch
+    /// nodes above a single leaf. Only blocks allocated by this rewrite are
+    /// rolled back; old published blocks remain allocated for the normal CoW/GC
+    /// lifecycle.
+    async fn collapse_root_chain<M: MutableCowFile>(
+        &self,
+        mutable_file: &mut M,
+        mut entry: BranchEntry,
+    ) -> Result<BlockID> {
+        loop {
+            if entry.height == 0 {
+                return Ok(entry.block_id);
+            }
+            let payload = self.branch_entry_payload(&entry).await?;
+            match payload {
+                BranchEntryPayload::Branch(mut children) if children.len() == 1 => {
+                    // Promote the only child as the next root candidate and
+                    // roll back the now-abandoned wrapper if this rewrite wrote it.
+                    let wrapper = entry;
+                    entry = children.remove(0);
+                    self.rollback_rewritten_entry_block(mutable_file, &wrapper)?;
+                }
+                BranchEntryPayload::Branch(_) => return Ok(entry.block_id),
+                BranchEntryPayload::Leaf(_) => return Err(Error::InvalidFormat),
+            }
+        }
+    }
+
+    /// Repack adjacent underfilled siblings when doing so reduces block count.
+    ///
+    /// The heuristic is local by design. It groups same-height siblings that are
+    /// below the fill threshold, rewrites that run from its logical payload, and
+    /// accepts the candidate only if fewer blocks are needed. Rejected candidate
+    /// blocks are immediately rolled back from the mutable allocation map.
+    async fn compact_underfilled_siblings<M: MutableCowFile>(
+        &self,
+        mutable_file: &mut M,
+        entries: Vec<BranchEntry>,
+        create_ts: u64,
+    ) -> Result<Vec<BranchEntry>> {
+        if entries.len() < 2 {
+            return Ok(entries);
+        }
+
+        let mut compacted_entries = Vec::with_capacity(entries.len());
+        let mut idx = 0usize;
+        while idx < entries.len() {
+            if idx + 1 >= entries.len() {
+                compacted_entries.push(entries[idx].clone());
+                break;
+            }
+
+            let height = entries[idx].height;
+            let current_underfilled = self.branch_entry_underfilled(&entries[idx]).await?;
+            let next_underfilled = entries[idx + 1].height == height
+                && self.branch_entry_underfilled(&entries[idx + 1]).await?;
+            if !(current_underfilled && next_underfilled) {
+                compacted_entries.push(entries[idx].clone());
+                idx += 1;
+                continue;
+            }
+
+            // Extend the run while adjacent siblings have the same height and
+            // remain underfilled. There is deliberately no fixed group cap: the
+            // acceptance check below decides whether the rewrite was worthwhile.
+            let run_start = idx;
+            idx += 2;
+            while idx < entries.len()
+                && entries[idx].height == height
+                && self.branch_entry_underfilled(&entries[idx]).await?
+            {
+                idx += 1;
+            }
+            let run = &entries[run_start..idx];
+            let candidate = self
+                .compact_sibling_run(mutable_file, run, height, create_ts)
+                .await?;
+
+            if candidate.len() < run.len() {
+                // The candidate is structurally better, so abandon only the
+                // direct blocks from the old run that this rewrite allocated.
+                for entry in run {
+                    self.rollback_rewritten_entry_block(mutable_file, entry)?;
+                }
+                compacted_entries.extend(candidate);
+            } else {
+                // Repacking did not reduce fanout. Keep the original run and
+                // roll back every direct candidate block just allocated.
+                for entry in &candidate {
+                    self.rollback_rewritten_entry_block(mutable_file, entry)?;
+                }
+                compacted_entries.extend_from_slice(run);
+            }
+        }
+        Ok(compacted_entries)
+    }
+
+    /// Build replacement blocks for one same-height sibling run.
+    ///
+    /// Leaf runs are repacked from logical leaf entries. Branch runs are repacked
+    /// from flattened child entries, preserving the child subtrees they point at.
+    async fn compact_sibling_run<M: MutableCowFile>(
+        &self,
+        mutable_file: &mut M,
+        run: &[BranchEntry],
+        height: u16,
+        create_ts: u64,
+    ) -> Result<Vec<BranchEntry>> {
+        if run.is_empty() {
+            return Err(Error::InvalidArgument);
+        }
+        if height == 0 {
+            let mut entries = Vec::new();
+            for entry in run {
+                match self.branch_entry_payload(entry).await? {
+                    BranchEntryPayload::Leaf(mut leaf_entries) => {
+                        entries.append(&mut leaf_entries);
+                    }
+                    BranchEntryPayload::Branch(_) => return Err(Error::InvalidFormat),
+                }
+            }
+            validate_logical_entries_sorted(&entries)?;
+            return self
+                .write_leaf_blocks_from_entries(mutable_file, &entries, create_ts)
+                .await;
+        }
+
+        let mut children = Vec::new();
+        for entry in run {
+            match self.branch_entry_payload(entry).await? {
+                BranchEntryPayload::Branch(mut child_entries) => {
+                    children.append(&mut child_entries);
+                }
+                BranchEntryPayload::Leaf(_) => return Err(Error::InvalidFormat),
+            }
+        }
+        validate_branch_entries_for_height(&children, height - 1)?;
+        self.write_branch_blocks(mutable_file, &children, height, create_ts)
+            .await
+    }
+
+    /// Determine whether one sibling is sparse enough for local compaction.
+    async fn branch_entry_underfilled(&self, entry: &BranchEntry) -> Result<bool> {
+        let effective_space = self.branch_entry_effective_space(entry).await?;
+        Ok(is_rewrite_compaction_underfilled(effective_space))
+    }
+
+    /// Read exact fill metadata for an existing block or reuse carried metadata.
+    async fn branch_entry_effective_space(&self, entry: &BranchEntry) -> Result<usize> {
+        if let Some(effective_space) = entry.effective_space {
+            return Ok(effective_space);
+        }
+        let guard = self.read_node(entry.block_id).await?;
+        let node = guard.node();
+        if node.height() != usize::from(entry.height) {
+            return Err(invalid_node_payload(self.file_kind, entry.block_id));
+        }
+        Ok(node.effective_space())
+    }
+
+    /// Materialize one branch entry's payload without reading newly written blocks.
+    async fn branch_entry_payload(&self, entry: &BranchEntry) -> Result<BranchEntryPayload> {
+        if let Some(payload) = &entry.payload {
+            return Ok(payload.clone());
+        }
+
+        let guard = self.read_node(entry.block_id).await?;
+        let node = guard.node();
+        if node.height() != usize::from(entry.height) {
+            return Err(invalid_node_payload(self.file_kind, entry.block_id));
+        }
+        if node.is_leaf() {
+            let mut entries = Vec::with_capacity(node.count());
+            for idx in 0..node.count() {
+                entries.push(F::leaf_entry(node, idx, self.file_kind, entry.block_id)?);
+            }
+            Ok(BranchEntryPayload::Leaf(entries))
+        } else {
+            Ok(BranchEntryPayload::Branch(branch_entries_from_node(
+                node,
+                self.file_kind,
+                entry.block_id,
+            )?))
+        }
+    }
+
+    /// Roll back a direct block allocated by this rewrite if it was abandoned.
+    #[inline]
+    fn rollback_rewritten_entry_block<M: MutableCowFile>(
+        &self,
+        mutable_file: &mut M,
+        entry: &BranchEntry,
+    ) -> Result<()> {
+        if entry.rewrite_allocated {
+            mutable_file.rollback_allocated_block_id(entry.block_id)?;
+        }
+        Ok(())
     }
 
     /// Write sorted logical entries into one or more leaf blocks.
@@ -784,8 +1094,10 @@ impl<'a, F: DiskTreeSpec> DiskTree<'a, F> {
         let mut start = 0usize;
         while start < entries.len() {
             let mut buf = DirectBuf::zeroed(DISK_TREE_BLOCK_SIZE);
-            let end = {
+            let (end, effective_space) = {
                 let node = btree_node_from_block_mut(buf.data_mut())?;
+                // The first logical key becomes the leaf lower fence. Leaf
+                // values follow the tree spec: row-id owners or zero-width nils.
                 node.init(
                     0,
                     create_ts,
@@ -796,6 +1108,8 @@ impl<'a, F: DiskTreeSpec> DiskTree<'a, F> {
                 );
                 let mut end = start;
                 while end < entries.len() {
+                    // Stop before exceeding the shared BTreeNode slot/KV area;
+                    // the outer loop starts a new leaf at the same entry.
                     if !node.can_insert::<F::LeafValue>(&entries[end].key) {
                         break;
                     }
@@ -807,18 +1121,23 @@ impl<'a, F: DiskTreeSpec> DiskTree<'a, F> {
                     );
                     end += 1;
                 }
+                // Hints must match the final slot set before checksum/write.
                 node.update_hints();
-                end
+                (end, node.effective_space())
             };
             if end == start {
+                // The lower fence itself should always fit in an empty node.
+                // Failing to make progress means the entry is too large.
                 return Err(Error::InvalidArgument);
             }
             let block_id = mutable_file.allocate_block_id()?;
             self.write_node_block(mutable_file, block_id, buf).await?;
-            branch_entries.push(BranchEntry {
-                key: entries[start].key.clone(),
+            branch_entries.push(BranchEntry::rewritten_leaf(
+                entries[start].key.clone(),
                 block_id,
-            });
+                effective_space,
+                entries[start..end].to_vec(),
+            ));
             start = end;
         }
         Ok(branch_entries)
@@ -846,11 +1165,15 @@ impl<'a, F: DiskTreeSpec> DiskTree<'a, F> {
         while start < entries.len() {
             let first = &entries[start];
             if first.block_id == SUPER_BLOCK_ID {
+                // Branch children must point at real blocks; SUPER_BLOCK_ID is
+                // only valid as the whole-tree empty root sentinel.
                 return Err(Error::InvalidArgument);
             }
             let mut buf = DirectBuf::zeroed(DISK_TREE_BLOCK_SIZE);
-            let end = {
+            let (end, effective_space) = {
                 let node = btree_node_from_block_mut(buf.data_mut())?;
+                // Store the first child in the lower fence and subsequent
+                // children as branch slots keyed by their lower fences.
                 node.init(
                     height,
                     create_ts,
@@ -862,8 +1185,12 @@ impl<'a, F: DiskTreeSpec> DiskTree<'a, F> {
                 let mut end = start + 1;
                 while end < entries.len() {
                     if entries[end].block_id == SUPER_BLOCK_ID {
+                        // The empty-root sentinel cannot appear inside a branch
+                        // fanout list either.
                         return Err(Error::InvalidArgument);
                     }
+                    // Start another branch block once this node cannot accept
+                    // the next child fence and block-id value.
                     if !node.can_insert::<BTreeU64>(&entries[end].key) {
                         break;
                     }
@@ -875,18 +1202,24 @@ impl<'a, F: DiskTreeSpec> DiskTree<'a, F> {
                     );
                     end += 1;
                 }
+                // Branch search hints are persisted as part of the node image.
                 node.update_hints();
-                end
+                (end, node.effective_space())
             };
             if end == start + 1 && end < entries.len() {
+                // If a branch cannot fit even one slot after the lower fence, a
+                // higher level cannot make progress with this layout.
                 return Err(Error::InvalidArgument);
             }
             let block_id = mutable_file.allocate_block_id()?;
             self.write_node_block(mutable_file, block_id, buf).await?;
-            parent_entries.push(BranchEntry {
-                key: first.key.clone(),
+            parent_entries.push(BranchEntry::rewritten_branch(
+                first.key.clone(),
                 block_id,
-            });
+                height,
+                effective_space,
+                entries[start..end].to_vec(),
+            ));
             start = end;
         }
         Ok(parent_entries)
@@ -899,9 +1232,55 @@ impl<'a, F: DiskTreeSpec> DiskTree<'a, F> {
         block_id: BlockID,
         mut buf: DirectBuf,
     ) -> Result<()> {
+        // Compute integrity after all node bytes, fences, values, and hints have
+        // reached their final persisted representation.
         write_block_checksum(buf.data_mut());
         mutable_file.write_block(block_id, buf).await
     }
+}
+
+/// Return true when a node is below the rewrite-time sibling-merge threshold.
+#[inline]
+fn is_rewrite_compaction_underfilled(effective_space: usize) -> bool {
+    effective_space.saturating_mul(100)
+        < BTREE_NODE_USABLE_SIZE.saturating_mul(DISK_TREE_REWRITE_COMPACT_UNDERFILLED_PERCENT)
+}
+
+/// Calculate a branch height from a homogeneous child-entry run.
+fn parent_height_from_children(entries: &[BranchEntry]) -> Result<u16> {
+    let first = entries.first().ok_or(Error::InvalidArgument)?;
+    validate_branch_entries_for_height(entries, first.height)?;
+    first.height.checked_add(1).ok_or(Error::InvalidArgument)
+}
+
+/// Validate that logical leaf entries are strictly sorted by encoded key.
+fn validate_logical_entries_sorted(entries: &[LogicalEntry]) -> Result<()> {
+    let mut prev = None;
+    for entry in entries {
+        if prev.is_some_and(|prev_key: &[u8]| prev_key >= entry.key.as_slice()) {
+            return Err(Error::InvalidFormat);
+        }
+        prev = Some(entry.key.as_slice());
+    }
+    Ok(())
+}
+
+/// Validate a flattened branch-entry run before writing it into branch blocks.
+fn validate_branch_entries_for_height(entries: &[BranchEntry], height: u16) -> Result<()> {
+    if entries.is_empty() {
+        return Err(Error::InvalidArgument);
+    }
+    let mut prev = None;
+    for entry in entries {
+        if entry.height != height || entry.block_id == SUPER_BLOCK_ID {
+            return Err(Error::InvalidArgument);
+        }
+        if prev.is_some_and(|prev_key: &[u8]| prev_key >= entry.key.as_slice()) {
+            return Err(Error::InvalidArgument);
+        }
+        prev = Some(entry.key.as_slice());
+    }
+    Ok(())
 }
 
 /// Resolve the child block selected by a branch-node key lookup.
@@ -925,19 +1304,27 @@ fn branch_entries_from_node(
     file_kind: FileKind,
     block_id: BlockID,
 ) -> Result<Vec<BranchEntry>> {
+    let child_height = node
+        .height()
+        .checked_sub(1)
+        .ok_or_else(|| invalid_node_payload(file_kind, block_id))?;
+    let child_height =
+        u16::try_from(child_height).map_err(|_| invalid_node_payload(file_kind, block_id))?;
     let mut entries = Vec::with_capacity(node.count() + 1);
-    entries.push(BranchEntry {
-        key: node.lower_fence_key().as_bytes().to_vec(),
-        block_id: BlockID::from(node.lower_fence_value().to_u64()),
-    });
+    entries.push(BranchEntry::persisted(
+        node.lower_fence_key().as_bytes().to_vec(),
+        BlockID::from(node.lower_fence_value().to_u64()),
+        child_height,
+    ));
     for idx in 0..node.count() {
         let key = node
             .key_checked(idx)
             .ok_or_else(|| invalid_node_payload(file_kind, block_id))?;
-        entries.push(BranchEntry {
+        entries.push(BranchEntry::persisted(
             key,
-            block_id: BlockID::from(node.value::<BTreeU64>(idx).to_u64()),
-        });
+            BlockID::from(node.value::<BTreeU64>(idx).to_u64()),
+            child_height,
+        ));
     }
     Ok(entries)
 }
@@ -1560,6 +1947,337 @@ mod tests {
             assert_eq!(new_tree.prefix_scan(&key1).await.unwrap(), vec![11, 12]);
             assert!(!new_tree.contains_exact(&key1, 10).await.unwrap());
             assert_eq!(tree.prefix_scan(&key1).await.unwrap(), vec![10, 11]);
+            assert!(mutable.root().gc_block_list.is_empty());
+        });
+    }
+
+    #[test]
+    fn test_unique_delete_all_entries_returns_empty_root() {
+        smol::block_on(async {
+            let (_temp_dir, fs) = build_test_fs();
+            let metadata = metadata_with_indexes();
+            let table = fs
+                .create_table_file(306, Arc::clone(&metadata), false)
+                .unwrap();
+            let (table, old_root) = table.commit(1, false).await.unwrap();
+            drop(old_root);
+            let global = global_readonly_pool_scope(64 * 1024 * 1024);
+            let disk_pool = table_readonly_pool(&global, 306, &table);
+            let guard = disk_pool.pool_guard();
+            let mut mutable =
+                crate::file::table_file::MutableTableFile::fork(&table, fs.background_writes());
+            let tree = UniqueDiskTree::new(
+                SUPER_BLOCK_ID,
+                &metadata.index_specs[0],
+                &metadata,
+                disk_pool.file_kind(),
+                disk_pool.sparse_file(),
+                disk_pool.global_pool(),
+                &guard,
+            )
+            .unwrap();
+            let key1 = [Val::from(1u32)];
+            let key2 = [Val::from(2u32)];
+            let key3 = [Val::from(3u32)];
+            let mut writer = tree.batch_writer(&mut mutable, 2);
+            writer
+                .batch_put(&[
+                    UniqueDiskTreePut {
+                        key: &key1,
+                        row_id: 10,
+                    },
+                    UniqueDiskTreePut {
+                        key: &key2,
+                        row_id: 20,
+                    },
+                    UniqueDiskTreePut {
+                        key: &key3,
+                        row_id: 30,
+                    },
+                ])
+                .unwrap();
+            let root = writer.finish().await.unwrap();
+            assert_ne!(root, SUPER_BLOCK_ID);
+
+            let tree = UniqueDiskTree::new(
+                root,
+                &metadata.index_specs[0],
+                &metadata,
+                disk_pool.file_kind(),
+                disk_pool.sparse_file(),
+                disk_pool.global_pool(),
+                &guard,
+            )
+            .unwrap();
+            let rows = tree
+                .scan_entries()
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|(_, row_id)| row_id)
+                .collect::<Vec<_>>();
+            assert_eq!(rows, vec![10, 20, 30]);
+
+            let mut writer = tree.batch_writer(&mut mutable, 3);
+            writer
+                .batch_conditional_delete(&[
+                    UniqueDiskTreeDelete {
+                        key: &key1,
+                        expected_old_row_id: 10,
+                    },
+                    UniqueDiskTreeDelete {
+                        key: &key2,
+                        expected_old_row_id: 20,
+                    },
+                    UniqueDiskTreeDelete {
+                        key: &key3,
+                        expected_old_row_id: 30,
+                    },
+                ])
+                .unwrap();
+            let empty_root = writer.finish().await.unwrap();
+            assert_eq!(empty_root, SUPER_BLOCK_ID);
+
+            let empty_tree = UniqueDiskTree::new(
+                empty_root,
+                &metadata.index_specs[0],
+                &metadata,
+                disk_pool.file_kind(),
+                disk_pool.sparse_file(),
+                disk_pool.global_pool(),
+                &guard,
+            )
+            .unwrap();
+            assert_eq!(empty_tree.lookup(&key1).await.unwrap(), None);
+            assert_eq!(empty_tree.lookup(&key2).await.unwrap(), None);
+            assert_eq!(empty_tree.lookup(&key3).await.unwrap(), None);
+            assert!(empty_tree.scan_entries().await.unwrap().is_empty());
+
+            let rows = tree
+                .scan_entries()
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|(_, row_id)| row_id)
+                .collect::<Vec<_>>();
+            assert_eq!(rows, vec![10, 20, 30]);
+            assert!(mutable.root().gc_block_list.is_empty());
+        });
+    }
+
+    #[test]
+    fn test_non_unique_delete_all_exact_entries_returns_empty_root() {
+        smol::block_on(async {
+            let (_temp_dir, fs) = build_test_fs();
+            let metadata = metadata_with_indexes();
+            let table = fs
+                .create_table_file(307, Arc::clone(&metadata), false)
+                .unwrap();
+            let (table, old_root) = table.commit(1, false).await.unwrap();
+            drop(old_root);
+            let global = global_readonly_pool_scope(64 * 1024 * 1024);
+            let disk_pool = table_readonly_pool(&global, 307, &table);
+            let guard = disk_pool.pool_guard();
+            let mut mutable =
+                crate::file::table_file::MutableTableFile::fork(&table, fs.background_writes());
+            let tree = NonUniqueDiskTree::new(
+                SUPER_BLOCK_ID,
+                &metadata.index_specs[1],
+                &metadata,
+                disk_pool.file_kind(),
+                disk_pool.sparse_file(),
+                disk_pool.global_pool(),
+                &guard,
+            )
+            .unwrap();
+            let key1 = [Val::from(1u32)];
+            let key2 = [Val::from(2u32)];
+            let mut writer = tree.batch_writer(&mut mutable, 2);
+            writer
+                .batch_insert(&[
+                    NonUniqueDiskTreeExact {
+                        key: &key1,
+                        row_id: 10,
+                    },
+                    NonUniqueDiskTreeExact {
+                        key: &key1,
+                        row_id: 11,
+                    },
+                    NonUniqueDiskTreeExact {
+                        key: &key2,
+                        row_id: 20,
+                    },
+                ])
+                .unwrap();
+            let root = writer.finish().await.unwrap();
+            assert_ne!(root, SUPER_BLOCK_ID);
+
+            let tree = NonUniqueDiskTree::new(
+                root,
+                &metadata.index_specs[1],
+                &metadata,
+                disk_pool.file_kind(),
+                disk_pool.sparse_file(),
+                disk_pool.global_pool(),
+                &guard,
+            )
+            .unwrap();
+            assert_eq!(tree.prefix_scan(&key1).await.unwrap(), vec![10, 11]);
+            assert_eq!(tree.prefix_scan(&key2).await.unwrap(), vec![20]);
+
+            let mut writer = tree.batch_writer(&mut mutable, 3);
+            writer
+                .batch_exact_delete(&[
+                    NonUniqueDiskTreeExact {
+                        key: &key1,
+                        row_id: 10,
+                    },
+                    NonUniqueDiskTreeExact {
+                        key: &key1,
+                        row_id: 11,
+                    },
+                    NonUniqueDiskTreeExact {
+                        key: &key2,
+                        row_id: 20,
+                    },
+                ])
+                .unwrap();
+            let empty_root = writer.finish().await.unwrap();
+            assert_eq!(empty_root, SUPER_BLOCK_ID);
+
+            let empty_tree = NonUniqueDiskTree::new(
+                empty_root,
+                &metadata.index_specs[1],
+                &metadata,
+                disk_pool.file_kind(),
+                disk_pool.sparse_file(),
+                disk_pool.global_pool(),
+                &guard,
+            )
+            .unwrap();
+            assert!(!empty_tree.contains_exact(&key1, 10).await.unwrap());
+            assert!(!empty_tree.contains_exact(&key1, 11).await.unwrap());
+            assert!(!empty_tree.contains_exact(&key2, 20).await.unwrap());
+            assert!(empty_tree.prefix_scan(&key1).await.unwrap().is_empty());
+            assert!(empty_tree.prefix_scan(&key2).await.unwrap().is_empty());
+            assert!(empty_tree.scan_entries().await.unwrap().is_empty());
+
+            assert_eq!(tree.prefix_scan(&key1).await.unwrap(), vec![10, 11]);
+            assert_eq!(tree.prefix_scan(&key2).await.unwrap(), vec![20]);
+            assert!(mutable.root().gc_block_list.is_empty());
+        });
+    }
+
+    #[test]
+    fn test_unique_delete_sparse_remaining_entries_compacts_to_one_leaf() {
+        smol::block_on(async {
+            let (_temp_dir, fs) = build_test_fs();
+            let metadata = metadata_with_indexes();
+            let table = fs
+                .create_table_file(308, Arc::clone(&metadata), false)
+                .unwrap();
+            let (table, old_root) = table.commit(1, false).await.unwrap();
+            drop(old_root);
+            let global = global_readonly_pool_scope(64 * 1024 * 1024);
+            let disk_pool = table_readonly_pool(&global, 308, &table);
+            let guard = disk_pool.pool_guard();
+            let mut mutable =
+                crate::file::table_file::MutableTableFile::fork(&table, fs.background_writes());
+            let tree = UniqueDiskTree::new(
+                SUPER_BLOCK_ID,
+                &metadata.index_specs[0],
+                &metadata,
+                disk_pool.file_kind(),
+                disk_pool.sparse_file(),
+                disk_pool.global_pool(),
+                &guard,
+            )
+            .unwrap();
+
+            const ENTRY_COUNT: u32 = 8192;
+            const KEEP_EVERY: usize = 100;
+            let keys = (0..ENTRY_COUNT)
+                .map(|idx| [Val::from(idx)])
+                .collect::<Vec<_>>();
+            let puts = keys
+                .iter()
+                .enumerate()
+                .map(|(idx, key)| UniqueDiskTreePut {
+                    key,
+                    row_id: idx as RowID + 100,
+                })
+                .collect::<Vec<_>>();
+            let mut writer = tree.batch_writer(&mut mutable, 2);
+            writer.batch_put(&puts).unwrap();
+            let root = writer.finish().await.unwrap();
+            assert_ne!(root, SUPER_BLOCK_ID);
+
+            let tree = UniqueDiskTree::new(
+                root,
+                &metadata.index_specs[0],
+                &metadata,
+                disk_pool.file_kind(),
+                disk_pool.sparse_file(),
+                disk_pool.global_pool(),
+                &guard,
+            )
+            .unwrap();
+            let root_guard = tree.tree.read_node(root).await.unwrap();
+            assert!(!root_guard.node().is_leaf());
+            drop(root_guard);
+
+            let allocated_before_delete = mutable.root().alloc_map.allocated();
+            let deletes = keys
+                .iter()
+                .enumerate()
+                .filter(|(idx, _)| idx % KEEP_EVERY != 0)
+                .map(|(idx, key)| UniqueDiskTreeDelete {
+                    key,
+                    expected_old_row_id: idx as RowID + 100,
+                })
+                .collect::<Vec<_>>();
+            let expected_rows = (0..ENTRY_COUNT as usize)
+                .filter(|idx| idx % KEEP_EVERY == 0)
+                .map(|idx| idx as RowID + 100)
+                .collect::<Vec<_>>();
+
+            let mut writer = tree.batch_writer(&mut mutable, 3);
+            writer.batch_conditional_delete(&deletes).unwrap();
+            let compacted_root = writer.finish().await.unwrap();
+            assert_ne!(compacted_root, SUPER_BLOCK_ID);
+            assert_eq!(
+                mutable.root().alloc_map.allocated(),
+                allocated_before_delete + 1
+            );
+
+            let compacted_tree = UniqueDiskTree::new(
+                compacted_root,
+                &metadata.index_specs[0],
+                &metadata,
+                disk_pool.file_kind(),
+                disk_pool.sparse_file(),
+                disk_pool.global_pool(),
+                &guard,
+            )
+            .unwrap();
+            let compacted_guard = compacted_tree.tree.read_node(compacted_root).await.unwrap();
+            assert!(compacted_guard.node().is_leaf());
+            assert_eq!(compacted_guard.node().count(), expected_rows.len());
+            drop(compacted_guard);
+
+            let rows = compacted_tree
+                .scan_entries()
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|(_, row_id)| row_id)
+                .collect::<Vec<_>>();
+            assert_eq!(rows, expected_rows);
+            assert_eq!(compacted_tree.lookup(&keys[1]).await.unwrap(), None);
+            assert_eq!(
+                tree.scan_entries().await.unwrap().len(),
+                ENTRY_COUNT as usize
+            );
             assert!(mutable.root().gc_block_list.is_empty());
         });
     }

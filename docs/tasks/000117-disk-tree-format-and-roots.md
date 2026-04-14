@@ -237,13 +237,30 @@ cargo nextest run -p doradb-storage --no-default-features --features libaio
      replaced DiskTree blocks out of the table-file GC list for future
      root-reachability reclamation.
 
-4. Added focused validation:
+4. Refined the DiskTree rewrite shape policy:
+   - `BranchEntry` carries child height, effective-space metadata, and
+     in-memory payload for newly written blocks so parent rewrites do not read
+     unpublished blocks through the readonly buffer pool.
+   - rewrite finalization collapses root-only single-child branch chains so
+     delete-heavy rewrites do not publish avoidable branch wrappers above one
+     child.
+   - adjacent same-height siblings are repacked when both are below the
+     rewrite-time fill threshold and the repack reduces block count.
+   - abandoned blocks allocated by the current mutable root are rolled back from
+     the allocation map, so the next published file root does not mark them
+     live.
+   - full DiskTree compaction and rebuild policy remains deferred to
+     `docs/backlogs/000083-full-disk-tree-compaction-policy.md`.
+
+5. Added focused validation:
    - metadata serde tests cover zero, one, and multiple secondary roots plus
      root-count mismatch rejection.
    - DiskTree tests cover empty roots, unique lookup/scan/conditional delete,
      non-unique exact lookup/prefix scan/delete, mixed writer sessions,
-     duplicate/unsorted batch rejection, old-root readability, and no
-     per-rewrite GC recording.
+     duplicate/unsorted batch rejection, all-entry deletes returning the empty
+     root sentinel, sparse delete-heavy rewrites compacting back to one leaf,
+     allocation rollback for abandoned rewrite blocks, old-root readability, and
+     no per-rewrite GC recording.
    - Validation run: `cargo fmt --all`, `cargo clippy -p doradb-storage
      --all-targets -- -D warnings`, and `cargo nextest run -p doradb-storage`.
 
@@ -255,6 +272,12 @@ cargo nextest run -p doradb-storage --no-default-features --features libaio
   - `ActiveRoot::meta_block_ser_view`
   - `MutableTableFile` root setters/accessors
   - `MutableCowFile` usage by the new DiskTree writer
+- `doradb-storage/src/file/cow_file.rs`
+  - `MutableCowFile::rollback_allocated_block_id`
+  - `ActiveRoot::rollback_allocated_block_id`
+- `doradb-storage/src/file/multi_table_file.rs`
+  - `MutableMultiTableFile` rollback implementation for shared
+    `MutableCowFile` behavior
 - `doradb-storage/src/file/meta_block.rs`
   - `TABLE_META_BLOCK_VERSION`
   - `MetaBlock`
@@ -294,12 +317,20 @@ cargo nextest run -p doradb-storage --no-default-features --features libaio
   matches the expected old row id.
 - Unique conditional delete skips missing or mismatched owners without corrupting
   the resulting root.
+- Unique conditional delete of every entry returns `SUPER_BLOCK_ID` and leaves
+  the previous root readable.
+- Delete-heavy unique rewrites with sparse remaining keys compact adjacent
+  underfilled siblings back to a single leaf when the remaining entries fit.
+- DiskTree rewrite rolls back newly allocated but abandoned intermediate blocks
+  so allocation-map growth reflects only blocks reachable from the new root.
 - Non-unique batch insert stores exact `(logical_key, row_id)` entries and
   exact lookup reports presence.
 - Non-unique prefix scan returns row ids ordered by exact `(logical_key, row_id)`
   key order.
 - Non-unique exact delete physically removes matching exact keys.
 - Non-unique missing exact delete is idempotent.
+- Non-unique exact delete of every entry returns `SUPER_BLOCK_ID` and leaves the
+  previous root readable.
 - Non-unique APIs and tests expose no durable byte value and no delete-mask
   state.
 - A mixed writer test applies a delete batch and an insert batch to the same
@@ -316,3 +347,8 @@ cargo nextest run -p doradb-storage --no-default-features --features libaio
 ## Open Questions
 
 None.
+
+Deferred follow-up:
+- `docs/backlogs/000083-full-disk-tree-compaction-policy.md` tracks the future
+  full DiskTree compaction/rebuild policy beyond the lightweight rewrite-time
+  heuristic implemented here.

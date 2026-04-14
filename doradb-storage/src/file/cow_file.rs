@@ -32,6 +32,7 @@ pub const INVALID_BLOCK_ID: BlockID = BlockID::new(u64::MAX);
 /// Minimal mutable operations required by CoW index/checkpoint writers.
 pub(crate) trait MutableCowFile {
     fn allocate_block_id(&mut self) -> Result<BlockID>;
+    fn rollback_allocated_block_id(&mut self, block_id: BlockID) -> Result<()>;
     fn record_gc_block(&mut self, block_id: BlockID);
     fn write_block(
         &self,
@@ -107,6 +108,27 @@ impl<M> ActiveRoot<M> {
     #[inline]
     pub fn try_allocate_block_id(&mut self) -> Option<BlockID> {
         self.alloc_map.try_allocate().map(BlockID::from)
+    }
+
+    /// Roll back one block id allocated from this mutable root.
+    ///
+    /// This is only valid for blocks allocated by the current unpublished CoW
+    /// fork. The bytes may already exist in the sparse file, but clearing the
+    /// allocation bit keeps the future published root from marking an abandoned
+    /// block as live.
+    #[inline]
+    pub fn rollback_allocated_block_id(&mut self, block_id: BlockID) -> Result<()> {
+        if block_id == SUPER_BLOCK_ID {
+            return Err(Error::InvalidState);
+        }
+        let idx = usize::try_from(block_id.as_u64()).map_err(|_| Error::InvalidState)?;
+        if idx >= self.alloc_map.len() {
+            return Err(Error::InvalidState);
+        }
+        if !self.alloc_map.deallocate(idx) {
+            return Err(Error::InvalidState);
+        }
+        Ok(())
     }
 }
 

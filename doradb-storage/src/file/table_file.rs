@@ -471,6 +471,12 @@ impl MutableTableFile {
             .ok_or(Error::InvalidState)
     }
 
+    /// Roll back a block id allocated by this unpublished mutable root.
+    #[inline]
+    pub fn rollback_allocated_block_id(&mut self, block_id: BlockID) -> Result<()> {
+        self.new_root_mut().rollback_allocated_block_id(block_id)
+    }
+
     /// Record an obsolete block id to be reclaimed on commit.
     #[inline]
     pub fn record_gc_block(&mut self, block_id: BlockID) {
@@ -633,6 +639,11 @@ impl MutableCowFile for MutableTableFile {
     #[inline]
     fn allocate_block_id(&mut self) -> Result<BlockID> {
         MutableTableFile::allocate_block_id(self)
+    }
+
+    #[inline]
+    fn rollback_allocated_block_id(&mut self, block_id: BlockID) -> Result<()> {
+        MutableTableFile::rollback_allocated_block_id(self, block_id)
     }
 
     #[inline]
