@@ -64,9 +64,6 @@ We rely on tooling to enforce style.
 *   **Inventory**: Update the unsafe baseline if usage changes.
 
 ## 6. Development Checklist
-- [ ] **Reliability**: Have you handled all error cases?
-- [ ] **Performance**: Are there unnecessary allocations or locks?
-- [ ] **Visibility**: Is this new method actually needed to be `pub`?
-- [ ] **Documentation**: Do all public entities have `///` comments?
-- [ ] **Locking**: Did you use `parking_lot` for small, fast blocking sections?
-- [ ] **I/O**: Does it preserve the default `io_uring` path and the supported alternate `libaio` backend contract?
+
+Use the standalone [Development Checklist](dev-checklist.md) before submitting or
+reviewing an implementation.

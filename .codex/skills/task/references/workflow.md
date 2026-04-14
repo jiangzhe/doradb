@@ -2,10 +2,12 @@
 
 ## Command Model
 
-`task` has three prompt workflows:
+`task` has five prompt workflows:
 1. `task create`: design-phase analysis and task doc creation.
-2. `task resolve`: post-implementation sync and follow-up tracking.
-3. `task purge worktree`: dry-run and optional removal flow for completed task worktrees.
+2. `task implement`: pre-edit implementation planning from a task worktree.
+3. `task checklist`: post-implementation review against `docs/process/dev-checklist.md`.
+4. `task resolve`: post-implementation sync and follow-up tracking.
+5. `task purge worktree`: dry-run and optional removal flow for completed task worktrees.
 
 ## `task create` Formal Round Definition
 
@@ -128,20 +130,134 @@ tools/task.rs create-task-doc \
 
 Stop if `.worktrees/<task-id>` already exists or if `git worktree add` fails. Do not fall back to writing task docs in the dispatch root.
 
+## `task implement` Checklist
+
+Use `task implement` only from the task-specific worktree root after task
+creation and before making implementation edits. The workflow produces a
+detailed implementation plan and must stop for explicit developer approval
+before editing code.
+
+Reject immediately unless all entry checks pass:
+
+1. Current directory is the git worktree root:
+```bash
+test "$(pwd -P)" = "$(git rev-parse --show-toplevel)"
+```
+2. Current directory basename is exactly the 6-digit task id:
+```bash
+basename "$(pwd -P)"
+```
+3. The worktree root is under `.worktrees/<task-id>`.
+4. Current git branch is named, not detached, and is not `main`.
+5. Exactly one task doc exists at `docs/tasks/<task-id>-*.md`.
+6. The task doc frontmatter `id:` matches `<task-id>`.
+
+Complete all planning items:
+
+1. Read the task doc first, especially Goals, Non-Goals, Plan, Impacts, Test
+   Cases, Open Questions, and Unsafe Considerations.
+2. If the task doc has `Parent RFC:`, read the parent RFC before inspecting
+   code.
+3. If the parent RFC has an `Implementation Phases` section:
+   - locate the current phase by the current task doc path or task id;
+   - read previous phase task docs whose phase blocks precede the current
+     phase and are already implemented, identified by `status: implemented`,
+     `Status: Implemented`, or an `Implementation Summary`;
+   - if the current phase cannot be located, ask the developer instead of
+     guessing which previous phase docs are required.
+4. Read relevant source files and conceptual docs referenced by the task doc,
+   parent RFC, and implemented previous phase task docs.
+5. Produce a detailed implementation plan that includes:
+   - files and modules to change;
+   - core logic and control flow;
+   - data structures, structs, traits, methods, and APIs to add or modify;
+   - error handling, unsafe handling, transaction/recovery implications, and
+     performance-sensitive paths when relevant;
+   - tests mapped back to task-doc requirements;
+   - documentation updates required by `docs/process/dev-checklist.md`.
+6. If a hard implementation decision remains, present the decision, viable
+   options, recommendation, and tradeoff, then ask the developer to decide.
+   Do not silently choose.
+7. Ask for explicit developer approval before editing code.
+   - Do not infer approval from silence or vague agreement.
+   - Do not edit code, run formatters that rewrite files, update task docs, or
+     create backlog docs before approval.
+   - After approval, implementation edits may proceed in the same task
+     worktree.
+
+## `task checklist` Checklist
+
+Use `task checklist` after implementation is believed complete and before
+`task resolve`.
+
+This workflow is chat-report-only. Do not edit task docs, create backlog docs,
+commit, or push while running it. If the developer asks to fix issues after the
+report, handle that as normal implementation work. If actionable follow-ups are
+deferred, use the `$backlog` workflow separately.
+
+Complete all items:
+
+1. Resolve the task doc path.
+   - Prefer an explicit user-provided path.
+   - Otherwise use the current worktree basename when it is a 6-digit task id
+     and exactly one matching `docs/tasks/<task-id>-*.md` exists.
+   - Otherwise use the only changed task doc if exactly one is discoverable.
+   - Ask for the task doc path if the task remains ambiguous.
+2. Read `docs/process/dev-checklist.md`.
+3. Read the task doc's Goals, Non-Goals, Plan, Test Cases, and Open Questions.
+4. Inspect implementation scope with:
+```bash
+git status --short
+git diff --stat
+git diff
+```
+5. Review every development-checklist category:
+   - Reliability: compare tests to task requirements, run or verify
+     `cargo nextest run -p doradb-storage`, run
+     `tools/coverage_focus.rs --path <changed file/or/dir>` for relevant
+     changed Rust files or directories, and target at least 80% focused
+     coverage.
+   - Security: when unsafe changed, apply
+     `docs/process/unsafe-review-checklist.md`; otherwise mark unsafe-specific
+     checks `n/a` with evidence.
+   - Performance: review synchronization, IO, batching/parallelism,
+     algorithmic complexity, allocations/copies, recomputation, and data
+     reduction opportunities.
+   - Feature completeness: compare implementation to task goals, non-goals,
+     acceptance criteria, and protected unchanged behavior.
+   - Documentation: verify public and crate-public docs, trait docs, core logic
+     comments, and related concept-level documentation updates.
+   - Test-only code: confirm helpers stay inside `#[cfg(test)] mod tests`
+     unless narrowly justified, and prefer production execution paths.
+   - Complexity: review changed functions over roughly 60 lines and require
+     splitting or inline comments for major steps and invariants.
+6. Mark each item as `pass`, `issue`, `blocked`, or `n/a`.
+   - Use `blocked` when a command cannot run or required evidence is missing.
+   - Use `n/a` only with a brief reason.
+7. End with one report containing:
+   - task doc path and changed scope,
+   - commands run and results,
+   - checklist status by category,
+   - required fixes before `task resolve`,
+   - optional improvements and backlog candidates,
+   - a direct question asking which fixes or improvements the developer wants
+     handled now or deferred.
+
 ## `task resolve` Checklist
 
 Complete all items:
 
-1. Ensure implementation and tests are complete before running resolve updates.
-2. Edit the task doc directly and keep section structure consistent with `docs/tasks/000000-template.md`.
-3. Fill `Implementation Notes` with concrete implementation/test/review results.
-4. Append unresolved future improvements to `Open Questions` if they remain out of scope.
-5. Convert actionable follow-ups into backlog todos under `docs/backlogs/`.
-6. When a follow-up backlog item is intentionally deferred from current task/RFC execution, require backlog creation to include:
+1. Ensure implementation, tests, and `task checklist` review are complete before running resolve updates.
+2. Confirm checklist issues are fixed or explicitly accepted/deferred.
+3. Edit the task doc directly and keep section structure consistent with `docs/tasks/000000-template.md`.
+4. Fill `Implementation Notes` with concrete implementation/test/review results.
+5. Append unresolved future improvements to `Open Questions` if they remain out of scope.
+6. Convert actionable follow-ups into backlog todos under `docs/backlogs/`.
+7. When a follow-up backlog item is intentionally deferred from current task/RFC execution, require backlog creation to include:
    - `Deferred From`: current task doc plus parent RFC when applicable.
    - `Deferral Context`: defer reason, findings, and direction hint.
-7. Link related backlog todos from task doc resolve updates.
-8. If task doc has `Source Backlogs:` entries in `docs/backlogs/`, close/archive those backlog files during resolve.
+8. Link related backlog todos from task doc resolve updates.
+9. If task doc has `Source Backlogs:` entries in `docs/backlogs/`, close/archive those backlog files during resolve.
    - Resolve backlog by id/path first when needed:
 ```bash
 tools/doc-id.rs search-by-id --kind backlog --id 000123 --scope open
@@ -151,19 +267,19 @@ tools/doc-id.rs search-by-id --kind backlog --id 000123 --scope open
 tools/backlog.rs close-doc --path docs/backlogs/000123-example.md --type implemented --detail "Implemented via docs/tasks/000042-example.md"
 ```
    - If close `detail`/`reference` text is multiline or contains markdown/backticks, use `tools/backlog.rs close-doc --detail-file ... [--reference-file ...]`.
-9. Refresh `docs/tasks/next-id` in the task worktree before other resolve sync steps:
+10. Refresh `docs/tasks/next-id` in the task worktree before other resolve sync steps:
 ```bash
 tools/task.rs resolve-task-next-id --task docs/tasks/000042-example.md
 ```
-10. Always check whether resolved task is an RFC sub-task.
-11. If parent RFC exists, update matched phase in RFC `Implementation Phases` with task resolve outcome.
+11. Always check whether resolved task is an RFC sub-task.
+12. If parent RFC exists, update matched phase in RFC `Implementation Phases` with task resolve outcome.
    - Use:
 ```bash
 tools/task.rs resolve-task-rfc --task docs/tasks/000042-example.md
 ```
    - Use `--summary-file` when the sync summary is longer than a short phrase or includes markdown/backticks.
-12. Do not run `git commit` or `git push` during `task resolve`.
-13. Limit resolve actions to task-doc synchronization plus required backlog/RFC updates; leave version-control publication to an explicit separate request.
+13. Do not run `git commit` or `git push` during `task resolve`.
+14. Limit resolve actions to task-doc synchronization plus required backlog/RFC updates; leave version-control publication to an explicit separate request.
 
 ## `task purge worktree` Checklist
 
