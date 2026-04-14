@@ -92,7 +92,8 @@ Issue Labels:
   `BTreeU64` for row ids and `BTreeByte` for non-unique delete flags.
 - [C7] `doradb-storage/src/index/column_block_index.rs` - existing persisted
   CoW index model for root snapshots, validated reads, batch insert, subtree
-  rewrite, obsolete-page recording, and root replacement.
+  rewrite, and root replacement; DiskTree deliberately differs by not using
+  per-rewrite obsolete-page recording.
 - [C8] `doradb-storage/src/file/table_file.rs` - current table root persists one
   `column_block_index_root`, checkpoint metadata, allocation state, and GC list;
   it does not persist per-secondary-index roots.
@@ -188,11 +189,13 @@ practical:
   `(logical_key, row_id)`; key presence is the whole durable fact and no
   logical value byte is reserved
 
-The DiskTree writer will follow the `ColumnBlockIndex` style: read a root
-snapshot, build or rewrite CoW pages into a mutable table file, record obsolete
-pages for GC, and publish the new roots only through table-file checkpoint
-metadata. It must not perform foreground random persistent writes. [D1], [D3],
-[D5], [D6], [C5], [C6], [C7], [C8], [U1], [U11]
+The DiskTree writer will follow the `ColumnBlockIndex` style for root-snapshot
+reads, CoW block writes, and table-checkpoint root publication, with one
+intentional difference: replaced DiskTree blocks are not recorded into the
+table-file GC list. DiskTree block reclamation will be handled later by
+root-reachability GC, so Phase 1 writers leave replaced blocks outside block
+reuse until that GC exists. It must not perform foreground random persistent
+writes. [D1], [D3], [D5], [D6], [C5], [C6], [C7], [C8], [U1], [U11]
 
 Non-unique `DiskTree` must expose set-style APIs: exact-key lookup,
 prefix/range scan, exact insert, and exact delete. It must not expose
@@ -415,10 +418,10 @@ SAFETY:` comments, and run the repository lint gate. [D10], [C4], [C7]
   - Non-goals: runtime lookup integration, foreground writes to DiskTree,
     catalog-table changes, storage version compatibility with older table-meta
     payloads, and removal of the existing single-tree index.
-  - Task Doc: `docs/tasks/TBD.md`
+  - Task Doc: `docs/tasks/000117-disk-tree-format-and-roots.md`
   - Task Issue: `#0`
-  - Phase Status: `pending`
-  - Implementation Summary: `pending`
+  - Phase Status: done
+  - Implementation Summary: Implemented Phase 1 DiskTree root metadata and persisted unique/non-unique DiskTree primitives [Task Resolve Sync: docs/tasks/000117-disk-tree-format-and-roots.md @ 2026-04-12]
 
 - **Phase 2: Checkpoint Sidecar Publication**
   - Scope: publish DiskTree roots as table checkpoint companion work while the

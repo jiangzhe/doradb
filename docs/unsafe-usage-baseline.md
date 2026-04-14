@@ -1,6 +1,6 @@
 # Unsafe Usage Baseline
 
-- Generated on: `2026-04-12`
+- Generated on: `2026-04-14`
 - Command: `tools/unsafe_inventory.rs`
 - Scope: `doradb-storage/src/{buffer,latch,row,index,io,trx,lwc,file}`
 
@@ -11,12 +11,12 @@
 | buffer | 13 | 52 | 0 | 0 | 0 | 46 |
 | latch | 4 | 40 | 0 | 0 | 0 | 36 |
 | row | 3 | 5 | 0 | 0 | 0 | 5 |
-| index | 17 | 11 | 0 | 0 | 3 | 5 |
+| index | 18 | 11 | 0 | 0 | 3 | 5 |
 | io | 7 | 20 | 0 | 0 | 1 | 15 |
 | trx | 14 | 5 | 0 | 0 | 0 | 5 |
 | lwc | 2 | 2 | 0 | 0 | 0 | 2 |
 | file | 8 | 12 | 0 | 0 | 2 | 12 |
-| **total** | **68** | **147** | **0** | **0** | **6** | **126** |
+| **total** | **69** | **147** | **0** | **0** | **6** | **126** |
 
 ## File Hotspots (top 40)
 

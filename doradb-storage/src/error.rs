@@ -32,6 +32,7 @@ pub enum BlockKind {
     LwcBlock,
     ColumnBlockIndex,
     ColumnDeletionBlob,
+    SecondaryDiskTree,
 }
 
 impl fmt::Display for BlockKind {
@@ -43,6 +44,7 @@ impl fmt::Display for BlockKind {
             BlockKind::LwcBlock => "lwc-block",
             BlockKind::ColumnBlockIndex => "column-block-index",
             BlockKind::ColumnDeletionBlob => "column-deletion-blob",
+            BlockKind::SecondaryDiskTree => "secondary-disk-tree",
         })
     }
 }

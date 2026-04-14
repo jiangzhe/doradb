@@ -9,6 +9,7 @@ mod btree_value;
 mod column_block_index;
 mod column_checkpoint;
 mod column_deletion_blob;
+pub(crate) mod disk_tree;
 mod non_unique_index;
 mod row_page_index;
 mod secondary_index;

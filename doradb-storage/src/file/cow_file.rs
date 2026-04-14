@@ -8,6 +8,7 @@ use crate::file::{BlockKey, FileID, SparseFile, write_direct};
 use crate::io::{DirectBuf, IOClient};
 use crate::quiescent::QuiescentGuard;
 use crate::trx::TrxID;
+use std::collections::BTreeSet;
 use std::fs;
 use std::future::Future;
 use std::ops::{Deref, DerefMut};
@@ -32,6 +33,7 @@ pub const INVALID_BLOCK_ID: BlockID = BlockID::new(u64::MAX);
 /// Minimal mutable operations required by CoW index/checkpoint writers.
 pub(crate) trait MutableCowFile {
     fn allocate_block_id(&mut self) -> Result<BlockID>;
+    fn rollback_allocated_block_id(&mut self, block_id: BlockID) -> Result<()>;
     fn record_gc_block(&mut self, block_id: BlockID);
     fn write_block(
         &self,
@@ -58,6 +60,11 @@ pub struct ActiveRoot<M> {
     pub gc_block_list: Vec<BlockID>,
     /// File-specific in-memory metadata payload.
     pub meta: M,
+    /// Blocks allocated by this unpublished mutable root.
+    ///
+    /// This set is intentionally not persisted. It prevents rollback from
+    /// clearing allocation bits inherited from the published root snapshot.
+    newly_allocated_ids: BTreeSet<BlockID>,
 }
 
 impl<M> ActiveRoot<M> {
@@ -78,6 +85,7 @@ impl<M> ActiveRoot<M> {
             alloc_map,
             gc_block_list,
             meta,
+            newly_allocated_ids: BTreeSet::new(),
         }
     }
 
@@ -89,6 +97,7 @@ impl<M> ActiveRoot<M> {
     {
         let mut new = self.clone();
         new.slot_no = 1 - self.slot_no;
+        new.newly_allocated_ids.clear();
         new
     }
 
@@ -106,7 +115,40 @@ impl<M> ActiveRoot<M> {
     /// Returns `None` when the allocation bitmap cannot provide a new page.
     #[inline]
     pub fn try_allocate_block_id(&mut self) -> Option<BlockID> {
-        self.alloc_map.try_allocate().map(BlockID::from)
+        let block_id = self.alloc_map.try_allocate().map(BlockID::from)?;
+        self.newly_allocated_ids.insert(block_id);
+        Some(block_id)
+    }
+
+    /// Roll back one block id allocated from this mutable root.
+    ///
+    /// This is only valid for blocks allocated by the current unpublished CoW
+    /// fork. The bytes may already exist in the sparse file, but clearing the
+    /// allocation bit keeps the future published root from marking an abandoned
+    /// block as live.
+    #[inline]
+    pub fn rollback_allocated_block_id(&mut self, block_id: BlockID) -> Result<()> {
+        if block_id == SUPER_BLOCK_ID {
+            return Err(Error::InvalidState);
+        }
+        let idx = usize::try_from(block_id.as_u64()).map_err(|_| Error::InvalidState)?;
+        if idx >= self.alloc_map.len() {
+            return Err(Error::InvalidState);
+        }
+        if !self.newly_allocated_ids.contains(&block_id) {
+            return Err(Error::InvalidState);
+        }
+        if !self.alloc_map.deallocate(idx) {
+            return Err(Error::InvalidState);
+        }
+        self.newly_allocated_ids.remove(&block_id);
+        Ok(())
+    }
+
+    /// Drop unpublished allocation ownership markers before publishing a root.
+    #[inline]
+    fn clear_newly_allocated_ids(&mut self) {
+        self.newly_allocated_ids.clear();
     }
 }
 
@@ -414,6 +456,7 @@ impl<M> CowFile<M> {
             .await?;
 
         self.fsync()?;
+        new_root.clear_newly_allocated_ids();
         Ok(self.swap_active_root(new_root))
     }
 

@@ -1,4 +1,5 @@
 use crate::index::btree_node::KeyHeadInt;
+use bytemuck::{Pod, Zeroable};
 
 pub const BTREE_HINTS_LEN: usize = 8;
 
@@ -17,9 +18,9 @@ pub const BTREE_HINTS_LEN: usize = 8;
 /// Find the position i where for all j <= i, hint[j] < head(key).
 /// If key is 1410, hint[0] is picked.
 /// If key is 1800, hint[1] is picked.
-#[derive(Debug, Clone, Copy)]
-#[repr(align(32))]
-pub struct BTreeHints([KeyHeadInt; BTREE_HINTS_LEN]);
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+#[repr(C, align(32))]
+pub struct BTreeHints([[u8; 4]; BTREE_HINTS_LEN]);
 
 impl BTreeHints {
     /// Search interface of hints.
@@ -28,19 +29,25 @@ impl BTreeHints {
     /// Maybe avx512f is better. Leave for future improvement.
     #[inline]
     pub fn search(&self, key: KeyHeadInt) -> (usize, usize) {
+        let hints = self.heads();
         #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
         {
-            unsafe { search_hints_avx2(&self.0, key) }
+            unsafe { search_hints_avx2(&hints, key) }
         }
         #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
         {
-            search_hints_scalar(&self.0, key)
+            search_hints_scalar(&hints, key)
         }
     }
 
     #[inline]
     pub fn update(&mut self, idx: usize, key: KeyHeadInt) {
-        self.0[idx] = key;
+        self.0[idx] = key.to_le_bytes();
+    }
+
+    #[inline]
+    fn heads(&self) -> [KeyHeadInt; BTREE_HINTS_LEN] {
+        self.0.map(KeyHeadInt::from_le_bytes)
     }
 }
 
@@ -90,6 +97,15 @@ fn search_hints_scalar(hints: &[u32; 8], key_head: u32) -> (usize, usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_btree_hints_store_little_endian_heads() {
+        let mut hints = BTreeHints::zeroed();
+        hints.update(3, 0x0102_0304);
+
+        assert_eq!(hints.0[3], 0x0102_0304u32.to_le_bytes());
+        assert_eq!(hints.heads()[3], 0x0102_0304);
+    }
 
     #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
     #[test]

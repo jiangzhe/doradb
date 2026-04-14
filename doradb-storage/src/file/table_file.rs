@@ -12,7 +12,8 @@ use crate::file::cow_file::{
 };
 use crate::file::fs::BackgroundWriteRequest;
 use crate::file::meta_block::{
-    MetaBlock, MetaBlockSerView, TABLE_META_BLOCK_MAGIC_WORD, TABLE_META_BLOCK_VERSION,
+    AllocMapGcListSerView, MetaBlock, MetaBlockSerView, TABLE_META_BLOCK_MAGIC_WORD,
+    TABLE_META_BLOCK_VERSION,
 };
 use crate::file::super_block::{
     SUPER_BLOCK_FOOTER_OFFSET, SUPER_BLOCK_SIZE, SUPER_BLOCK_VERSION, SuperBlock, SuperBlockBody,
@@ -53,6 +54,8 @@ pub struct TableMeta {
     pub metadata: Arc<TableMetadata>,
     /// Root block id of column block index.
     pub column_block_index_root: BlockID,
+    /// Root block ids of secondary DiskTrees, ordered by index number.
+    pub secondary_index_roots: Vec<BlockID>,
     /// Upper bound of row id in this file.
     pub pivot_row_id: RowID,
     /// Redo log start point for in-memory heap.
@@ -74,6 +77,7 @@ impl ActiveRoot {
         let alloc_map = AllocMap::new(max_pages);
         let super_block_allocated = alloc_map.allocate_at(usize::from(SUPER_BLOCK_ID));
         assert!(super_block_allocated);
+        let secondary_index_roots = vec![SUPER_BLOCK_ID; metadata.index_specs.len()];
 
         ActiveRoot::from_parts(
             0,
@@ -84,6 +88,7 @@ impl ActiveRoot {
             TableMeta {
                 metadata,
                 column_block_index_root: SUPER_BLOCK_ID,
+                secondary_index_roots,
                 pivot_row_id: 0,
                 heap_redo_start_ts: trx_id,
                 deletion_cutoff_ts: trx_id.max(MIN_SNAPSHOT_TS),
@@ -109,12 +114,12 @@ impl ActiveRoot {
 
     /// Build meta-block serialization view for the current active root.
     #[inline]
-    pub fn meta_block_ser_view(&self) -> MetaBlockSerView<'_> {
+    pub fn meta_block_ser_view(&self) -> Result<MetaBlockSerView<'_>> {
         MetaBlockSerView::new(
             self.metadata.ser_view(),
             self.column_block_index_root,
-            &self.alloc_map,
-            &self.gc_block_list,
+            &self.secondary_index_roots,
+            AllocMapGcListSerView::new(&self.alloc_map, &self.gc_block_list),
             self.pivot_row_id,
             self.heap_redo_start_ts,
             self.deletion_cutoff_ts,
@@ -145,6 +150,7 @@ fn parse_table_meta_block(page_id: BlockID, buf: &[u8]) -> Result<ParsedMeta<Tab
         meta: TableMeta {
             metadata: Arc::new(meta_block.schema),
             column_block_index_root: meta_block.column_block_index_root,
+            secondary_index_roots: meta_block.secondary_index_roots,
             pivot_row_id: meta_block.pivot_row_id,
             heap_redo_start_ts: meta_block.heap_redo_start_ts,
             deletion_cutoff_ts: meta_block.deletion_cutoff_ts,
@@ -166,7 +172,7 @@ fn validate_table_root(meta_block_id: BlockID, parsed_meta: &ParsedMeta<TableMet
 
 #[inline]
 fn build_table_meta_block(root: &ActiveRoot) -> Result<DirectBuf> {
-    let meta_block = root.meta_block_ser_view();
+    let meta_block = root.meta_block_ser_view()?;
     let mut meta_buf = DirectBuf::zeroed(COW_FILE_PAGE_SIZE);
     let meta_len = meta_block.ser_len();
     if meta_len > max_payload_len(COW_FILE_PAGE_SIZE) {
@@ -393,6 +399,45 @@ impl MutableTableFile {
         self.new_root_mut().column_block_index_root = root_block_id;
     }
 
+    /// Returns mutable-root secondary DiskTree roots ordered by index number.
+    #[inline]
+    pub fn secondary_index_roots(&self) -> &[BlockID] {
+        &self.root().secondary_index_roots
+    }
+
+    /// Returns one mutable-root secondary DiskTree root by index number.
+    #[inline]
+    pub fn secondary_index_root(&self, index_no: usize) -> Result<BlockID> {
+        self.root()
+            .secondary_index_roots
+            .get(index_no)
+            .copied()
+            .ok_or(Error::InvalidArgument)
+    }
+
+    /// Updates one mutable-root secondary DiskTree root by index number.
+    #[inline]
+    pub fn set_secondary_index_root(
+        &mut self,
+        index_no: usize,
+        root_block_id: BlockID,
+    ) -> Result<()> {
+        let roots = &mut self.new_root_mut().secondary_index_roots;
+        let root = roots.get_mut(index_no).ok_or(Error::InvalidArgument)?;
+        *root = root_block_id;
+        Ok(())
+    }
+
+    /// Replaces all mutable-root secondary DiskTree roots.
+    #[inline]
+    pub fn set_secondary_index_roots(&mut self, roots: Vec<BlockID>) -> Result<()> {
+        if roots.len() != self.root().metadata.index_specs.len() {
+            return Err(Error::InvalidArgument);
+        }
+        self.new_root_mut().secondary_index_roots = roots;
+        Ok(())
+    }
+
     /// Updates mutable root checkpoint metadata.
     #[inline]
     pub fn apply_checkpoint_metadata(
@@ -424,6 +469,12 @@ impl MutableTableFile {
         self.new_root_mut()
             .try_allocate_block_id()
             .ok_or(Error::InvalidState)
+    }
+
+    /// Roll back a block id allocated by this unpublished mutable root.
+    #[inline]
+    pub fn rollback_allocated_block_id(&mut self, block_id: BlockID) -> Result<()> {
+        self.new_root_mut().rollback_allocated_block_id(block_id)
     }
 
     /// Record an obsolete block id to be reclaimed on commit.
@@ -591,6 +642,11 @@ impl MutableCowFile for MutableTableFile {
     }
 
     #[inline]
+    fn rollback_allocated_block_id(&mut self, block_id: BlockID) -> Result<()> {
+        MutableTableFile::rollback_allocated_block_id(self, block_id)
+    }
+
+    #[inline]
     fn record_gc_block(&mut self, block_id: BlockID) {
         MutableTableFile::record_gc_block(self, block_id)
     }
@@ -666,6 +722,10 @@ mod tests {
             assert!(old_root.is_none());
             assert_eq!(table_file.active_root().slot_no, 0);
             assert_eq!(table_file.active_root().trx_id, 1);
+            assert_eq!(
+                table_file.active_root().secondary_index_roots,
+                vec![SUPER_BLOCK_ID]
+            );
 
             // write
             let mut buf = DirectBuf::zeroed(COW_FILE_PAGE_SIZE);
@@ -688,7 +748,14 @@ mod tests {
             let disk_pool = global.guard();
             assert_eq!(table_file2.active_root().trx_id, 1);
 
-            let mutable = MutableTableFile::fork(&table_file2, background_writes);
+            let mut mutable = MutableTableFile::fork(&table_file2, background_writes);
+            let secondary_root = mutable.allocate_block_id().unwrap();
+            mutable.set_secondary_index_root(0, secondary_root).unwrap();
+            assert_eq!(mutable.secondary_index_root(0).unwrap(), secondary_root);
+            let err = mutable
+                .set_secondary_index_roots(vec![SUPER_BLOCK_ID, secondary_root])
+                .unwrap_err();
+            assert!(matches!(err, Error::InvalidArgument));
             let (table_file3, old_root) = mutable.commit(2, false).await.unwrap();
             drop(old_root);
             let active_root = table_file3
@@ -697,9 +764,50 @@ mod tests {
                 .unwrap();
             assert_eq!(active_root.slot_no, 1);
             assert_eq!(active_root.trx_id, 2);
+            assert_eq!(active_root.secondary_index_roots, vec![secondary_root]);
             drop(table_file2);
             drop(table_file3);
 
+            drop(fs);
+        });
+    }
+
+    #[test]
+    fn test_mutable_table_file_rolls_back_only_current_fork_allocations() {
+        smol::block_on(async {
+            let (_temp_dir, fs) = build_test_fs();
+            let background_writes = fs.background_writes();
+            let metadata = build_test_metadata();
+            let table_file = fs.create_table_file(143, metadata, false).unwrap();
+            let (table_file, old_root) = table_file.commit(1, false).await.unwrap();
+            drop(old_root);
+
+            let mut mutable = MutableTableFile::fork(&table_file, background_writes);
+            let inherited_root = mutable.allocate_block_id().unwrap();
+            mutable.set_secondary_index_root(0, inherited_root).unwrap();
+            let (table_file, old_root) = mutable.commit(2, false).await.unwrap();
+            drop(old_root);
+
+            let mut mutable = MutableTableFile::fork(&table_file, background_writes);
+            let allocated_before = mutable.root().alloc_map.allocated();
+            let err = mutable
+                .rollback_allocated_block_id(inherited_root)
+                .unwrap_err();
+            assert!(matches!(err, Error::InvalidState));
+            assert_eq!(mutable.root().alloc_map.allocated(), allocated_before);
+
+            let fresh_block = mutable.allocate_block_id().unwrap();
+            assert_eq!(mutable.root().alloc_map.allocated(), allocated_before + 1);
+            mutable.rollback_allocated_block_id(fresh_block).unwrap();
+            assert_eq!(mutable.root().alloc_map.allocated(), allocated_before);
+
+            let err = mutable
+                .rollback_allocated_block_id(fresh_block)
+                .unwrap_err();
+            assert!(matches!(err, Error::InvalidState));
+
+            drop(mutable);
+            drop(table_file);
             drop(fs);
         });
     }
