@@ -1,4 +1,37 @@
 interface:
-  display_name: "Task Design"
-  short_description: "Deep-research, multi-round task design with proposal quality gates"
-  default_prompt: "Use $task create for deep-research design rounds that require explicit `First-Principles`, `Long-Term Evolution`, and `Original-Requirement-Fit` proposals, a best-overall recommendation rather than defaulting to the original request, explicit approval gating, root-side task id allocation, concise unprefixed branch creation under 20 characters via `git worktree add -b <branch-name> .worktrees/<task-id> origin/main`, and task-doc creation in `.worktrees/<task-id>/docs/tasks/`; keep the branch name separate from the full task-doc slug. Use $task resolve from the task worktree, including `tools/task.rs resolve-task-next-id --task docs/tasks/<id>-<slug>.md` before RFC sync, handle source backlog closure explicitly through $backlog, and when deferring work into backlog include the current task/RFC source plus defer reason, findings, and direction hint. Use $task purge worktree from the `main` dispatch worktree with `tools/task.rs purge-worktrees`, and only remove worktrees in `--apply` mode when the task is implemented, the worktree is clean, and the same-name remote branch already contains the local tip."
+  display_name: "Task"
+  short_description: "Task design, implementation planning, checklist, resolve, and worktree workflows"
+  default_prompt: >
+    Use $task create for deep-research design rounds that require explicit
+    `First-Principles`, `Long-Term Evolution`, and `Original-Requirement-Fit`
+    proposals, a best-overall recommendation rather than defaulting to the
+    original request, explicit approval gating, root-side task id allocation,
+    concise unprefixed branch creation under 20 characters via
+    `git worktree add -b <branch-name> .worktrees/<task-id> origin/main`, and
+    task-doc creation in `.worktrees/<task-id>/docs/tasks/`; keep the branch
+    name separate from the full task-doc slug. Use $task implement only from a
+    task-specific git worktree root whose current directory basename is exactly
+    the six-digit task id, whose root is under `.worktrees/<task-id>`, whose
+    branch is named and not `main`, and whose `docs/tasks/<task-id>-*.md` task
+    doc is unique and matches that id; otherwise reject the command. For $task
+    implement, read the task doc first, then the parent RFC when present, then
+    already implemented previous phase task docs from the RFC implementation
+    phases, then relevant code/docs; produce a detailed implementation plan
+    covering core logic, data structures, structs, traits, methods, APIs, tests,
+    docs, and hard decisions, and ask for explicit developer approval before
+    editing code. Use $task checklist after
+    implementation and before $task resolve: read `docs/process/dev-checklist.md`,
+    compare the implementation with the task doc, inspect changed files, run or
+    verify required validation and focused coverage, review security,
+    performance, feature completeness, documentation, test-only code, and
+    complexity, then report pass/issue/blocked/n/a items in chat and ask which
+    fixes or improvements to handle now or defer. Use $task resolve from the
+    task worktree after checklist issues are fixed or explicitly
+    accepted/deferred, including `tools/task.rs resolve-task-next-id --task
+    docs/tasks/<id>-<slug>.md` before RFC sync, handle source backlog closure
+    explicitly through $backlog, and when deferring work into backlog include
+    the current task/RFC source plus defer reason, findings, and direction hint.
+    Use $task purge worktree from the `main` dispatch worktree with
+    `tools/task.rs purge-worktrees`, and only remove worktrees in `--apply` mode
+    when the task is implemented, the worktree is clean, and the same-name
+    remote branch already contains the local tip.
