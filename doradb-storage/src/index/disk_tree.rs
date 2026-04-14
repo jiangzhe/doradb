@@ -56,12 +56,34 @@ pub(crate) struct UniqueDiskTreeDelete<'a> {
     pub expected_old_row_id: RowID,
 }
 
+/// One unique DiskTree batch insertion item with an already-encoded key.
+pub(crate) struct UniqueDiskTreeEncodedPut<'a> {
+    /// Encoded logical secondary key in durable DiskTree order.
+    pub key: &'a [u8],
+    /// Latest checkpointed owner row id.
+    pub row_id: RowID,
+}
+
+/// One unique DiskTree conditional delete item with an already-encoded key.
+pub(crate) struct UniqueDiskTreeEncodedDelete<'a> {
+    /// Encoded logical secondary key in durable DiskTree order.
+    pub key: &'a [u8],
+    /// Owner row id that must still match before the mapping is removed.
+    pub expected_old_row_id: RowID,
+}
+
 /// One non-unique DiskTree exact-entry item.
 pub(crate) struct NonUniqueDiskTreeExact<'a> {
     /// Logical secondary key values.
     pub key: &'a [Val],
     /// Exact entry row id suffix.
     pub row_id: RowID,
+}
+
+/// One non-unique DiskTree exact-entry item with an already-encoded exact key.
+pub(crate) struct NonUniqueDiskTreeEncodedExact<'a> {
+    /// Encoded exact key, including the row-id suffix.
+    pub key: &'a [u8],
 }
 
 /// Normalized logical entry used by the shared rewrite engine.
@@ -538,6 +560,19 @@ fn validate_sorted_unique_keys<'a>(keys: impl IntoIterator<Item = &'a [u8]>) -> 
     Ok(())
 }
 
+/// Ensure caller-provided batches are in durable key order, allowing equal
+/// adjacent keys for multi-operation unique conditional deletes.
+fn validate_sorted_keys<'a>(keys: impl IntoIterator<Item = &'a [u8]>) -> Result<()> {
+    let mut prev = None;
+    for key in keys {
+        if prev.is_some_and(|prev_key: &[u8]| prev_key > key) {
+            return Err(Error::InvalidArgument);
+        }
+        prev = Some(key);
+    }
+    Ok(())
+}
+
 /// Extract the row-id suffix from a non-unique exact key.
 #[inline]
 fn unpack_row_id_from_exact_key(key: &[u8]) -> Result<RowID> {
@@ -545,6 +580,24 @@ fn unpack_row_id_from_exact_key(key: &[u8]) -> Result<RowID> {
         return Err(Error::InvalidFormat);
     }
     Ok(BTreeU64::unpack(&key[key.len() - ROW_ID_SIZE..]).to_u64())
+}
+
+/// Validate already-encoded non-unique exact keys before staging them.
+///
+/// The trailing row-id suffix is part of the durable exact key contract; reject
+/// malformed keys here so readers never discover them through prefix scans.
+fn validate_sorted_non_unique_exact_keys(
+    entries: &[NonUniqueDiskTreeEncodedExact<'_>],
+) -> Result<()> {
+    let mut prev = None;
+    for entry in entries {
+        unpack_row_id_from_exact_key(entry.key)?;
+        if prev.is_some_and(|prev_key: &[u8]| prev_key >= entry.key) {
+            return Err(Error::InvalidArgument);
+        }
+        prev = Some(entry.key);
+    }
+    Ok(())
 }
 
 /// Shared root-snapshot view over one persisted DiskTree.
@@ -1529,12 +1582,27 @@ impl<M: MutableCowFile> UniqueDiskTreeBatchWriter<'_, '_, M> {
                 entry.row_id,
             ));
         }
-        validate_sorted_unique_keys(encoded.iter().map(|(key, _)| key.as_slice()))?;
-        for (key, row_id) in encoded {
+        let encoded_entries = encoded
+            .iter()
+            .map(|(key, row_id)| UniqueDiskTreeEncodedPut {
+                key,
+                row_id: *row_id,
+            })
+            .collect::<Vec<_>>();
+        self.batch_put_encoded(&encoded_entries)
+    }
+
+    /// Add already-encoded, strictly sorted logical-key put work to this writer.
+    pub(crate) fn batch_put_encoded(
+        &mut self,
+        entries: &[UniqueDiskTreeEncodedPut<'_>],
+    ) -> Result<()> {
+        validate_sorted_unique_keys(entries.iter().map(|entry| entry.key))?;
+        for entry in entries {
             self.operations
-                .entry(key)
+                .entry(entry.key.to_vec())
                 .or_default()
-                .push(UniqueDiskTreeOp::Put(row_id));
+                .push(UniqueDiskTreeOp::Put(entry.row_id));
         }
         Ok(())
     }
@@ -1554,12 +1622,29 @@ impl<M: MutableCowFile> UniqueDiskTreeBatchWriter<'_, '_, M> {
                 entry.expected_old_row_id,
             ));
         }
-        validate_sorted_unique_keys(encoded.iter().map(|(key, _)| key.as_slice()))?;
-        for (key, row_id) in encoded {
-            self.operations
-                .entry(key)
-                .or_default()
-                .push(UniqueDiskTreeOp::ConditionalDelete(row_id));
+        let encoded_entries = encoded
+            .iter()
+            .map(|(key, row_id)| UniqueDiskTreeEncodedDelete {
+                key,
+                expected_old_row_id: *row_id,
+            })
+            .collect::<Vec<_>>();
+        self.batch_conditional_delete_encoded(&encoded_entries)
+    }
+
+    /// Add already-encoded logical-key conditional delete work to this writer.
+    ///
+    /// Equal adjacent keys are accepted so a checkpoint can try multiple
+    /// expected old owners for the same key without re-encoding.
+    pub(crate) fn batch_conditional_delete_encoded(
+        &mut self,
+        entries: &[UniqueDiskTreeEncodedDelete<'_>],
+    ) -> Result<()> {
+        validate_sorted_keys(entries.iter().map(|entry| entry.key))?;
+        for entry in entries {
+            self.operations.entry(entry.key.to_vec()).or_default().push(
+                UniqueDiskTreeOp::ConditionalDelete(entry.expected_old_row_id),
+            );
         }
         Ok(())
     }
@@ -1606,8 +1691,21 @@ impl<M: MutableCowFile> NonUniqueDiskTreeBatchWriter<'_, '_, M> {
     /// Add sorted exact-entry insert work to this writer.
     pub(crate) fn batch_insert(&mut self, entries: &[NonUniqueDiskTreeExact<'_>]) -> Result<()> {
         let encoded = self.encode_exact_batch(entries)?;
-        for key in encoded {
-            self.operations.insert(key, true);
+        let encoded_entries = encoded
+            .iter()
+            .map(|key| NonUniqueDiskTreeEncodedExact { key })
+            .collect::<Vec<_>>();
+        self.batch_insert_encoded(&encoded_entries)
+    }
+
+    /// Add already-encoded, strictly sorted exact-entry insert work.
+    pub(crate) fn batch_insert_encoded(
+        &mut self,
+        entries: &[NonUniqueDiskTreeEncodedExact<'_>],
+    ) -> Result<()> {
+        validate_sorted_non_unique_exact_keys(entries)?;
+        for entry in entries {
+            self.operations.insert(entry.key.to_vec(), true);
         }
         Ok(())
     }
@@ -1618,8 +1716,21 @@ impl<M: MutableCowFile> NonUniqueDiskTreeBatchWriter<'_, '_, M> {
         entries: &[NonUniqueDiskTreeExact<'_>],
     ) -> Result<()> {
         let encoded = self.encode_exact_batch(entries)?;
-        for key in encoded {
-            self.operations.insert(key, false);
+        let encoded_entries = encoded
+            .iter()
+            .map(|key| NonUniqueDiskTreeEncodedExact { key })
+            .collect::<Vec<_>>();
+        self.batch_exact_delete_encoded(&encoded_entries)
+    }
+
+    /// Add already-encoded, strictly sorted exact-entry delete work.
+    pub(crate) fn batch_exact_delete_encoded(
+        &mut self,
+        entries: &[NonUniqueDiskTreeEncodedExact<'_>],
+    ) -> Result<()> {
+        validate_sorted_non_unique_exact_keys(entries)?;
+        for entry in entries {
+            self.operations.insert(entry.key.to_vec(), false);
         }
         Ok(())
     }
@@ -1948,6 +2059,202 @@ mod tests {
             assert!(!new_tree.contains_exact(&key1, 10).await.unwrap());
             assert_eq!(tree.prefix_scan(&key1).await.unwrap(), vec![10, 11]);
             assert!(mutable.root().gc_block_list.is_empty());
+        });
+    }
+
+    #[test]
+    fn test_encoded_batch_writer_apis() {
+        smol::block_on(async {
+            let (_temp_dir, fs) = build_test_fs();
+            let metadata = metadata_with_indexes();
+            let table = fs
+                .create_table_file(305, Arc::clone(&metadata), false)
+                .unwrap();
+            let (table, old_root) = table.commit(1, false).await.unwrap();
+            drop(old_root);
+            let global = global_readonly_pool_scope(64 * 1024 * 1024);
+            let disk_pool = table_readonly_pool(&global, 305, &table);
+            let guard = disk_pool.pool_guard();
+            let mut mutable =
+                crate::file::table_file::MutableTableFile::fork(&table, fs.background_writes());
+
+            let unique_tree = UniqueDiskTree::new(
+                SUPER_BLOCK_ID,
+                &metadata.index_specs[0],
+                &metadata,
+                disk_pool.file_kind(),
+                disk_pool.sparse_file(),
+                disk_pool.global_pool(),
+                &guard,
+            )
+            .unwrap();
+            let key1 = [Val::from(1u32)];
+            let key2 = [Val::from(2u32)];
+            let encoded_unique1 = unique_tree.tree.encoder.encode(&key1).as_bytes().to_vec();
+            let encoded_unique2 = unique_tree.tree.encoder.encode(&key2).as_bytes().to_vec();
+
+            {
+                let mut writer = unique_tree.batch_writer(&mut mutable, 2);
+                assert!(matches!(
+                    writer.batch_put_encoded(&[
+                        UniqueDiskTreeEncodedPut {
+                            key: &encoded_unique2,
+                            row_id: 20,
+                        },
+                        UniqueDiskTreeEncodedPut {
+                            key: &encoded_unique1,
+                            row_id: 10,
+                        },
+                    ]),
+                    Err(Error::InvalidArgument)
+                ));
+            }
+            let mut writer = unique_tree.batch_writer(&mut mutable, 2);
+            writer
+                .batch_put_encoded(&[
+                    UniqueDiskTreeEncodedPut {
+                        key: &encoded_unique1,
+                        row_id: 10,
+                    },
+                    UniqueDiskTreeEncodedPut {
+                        key: &encoded_unique2,
+                        row_id: 20,
+                    },
+                ])
+                .unwrap();
+            let unique_root = writer.finish().await.unwrap();
+            let unique_tree = UniqueDiskTree::new(
+                unique_root,
+                &metadata.index_specs[0],
+                &metadata,
+                disk_pool.file_kind(),
+                disk_pool.sparse_file(),
+                disk_pool.global_pool(),
+                &guard,
+            )
+            .unwrap();
+            let mut writer = unique_tree.batch_writer(&mut mutable, 3);
+            writer
+                .batch_conditional_delete_encoded(&[
+                    UniqueDiskTreeEncodedDelete {
+                        key: &encoded_unique1,
+                        expected_old_row_id: 999,
+                    },
+                    UniqueDiskTreeEncodedDelete {
+                        key: &encoded_unique1,
+                        expected_old_row_id: 10,
+                    },
+                ])
+                .unwrap();
+            let unique_root = writer.finish().await.unwrap();
+            let unique_tree = UniqueDiskTree::new(
+                unique_root,
+                &metadata.index_specs[0],
+                &metadata,
+                disk_pool.file_kind(),
+                disk_pool.sparse_file(),
+                disk_pool.global_pool(),
+                &guard,
+            )
+            .unwrap();
+            assert_eq!(unique_tree.lookup(&key1).await.unwrap(), None);
+            assert_eq!(unique_tree.lookup(&key2).await.unwrap(), Some(20));
+
+            let non_unique_tree = NonUniqueDiskTree::new(
+                SUPER_BLOCK_ID,
+                &metadata.index_specs[1],
+                &metadata,
+                disk_pool.file_kind(),
+                disk_pool.sparse_file(),
+                disk_pool.global_pool(),
+                &guard,
+            )
+            .unwrap();
+            let encoded_exact10 = non_unique_tree
+                .tree
+                .encoder
+                .encode_pair(&key1, Val::from(10u64))
+                .as_bytes()
+                .to_vec();
+            let encoded_exact11 = non_unique_tree
+                .tree
+                .encoder
+                .encode_pair(&key1, Val::from(11u64))
+                .as_bytes()
+                .to_vec();
+            let malformed_exact = [0u8; ROW_ID_SIZE - 1];
+            {
+                let mut writer = non_unique_tree.batch_writer(&mut mutable, 4);
+                assert!(matches!(
+                    writer.batch_insert_encoded(&[NonUniqueDiskTreeEncodedExact {
+                        key: &malformed_exact
+                    }]),
+                    Err(Error::InvalidFormat)
+                ));
+            }
+            {
+                let mut writer = non_unique_tree.batch_writer(&mut mutable, 4);
+                assert!(matches!(
+                    writer.batch_exact_delete_encoded(&[NonUniqueDiskTreeEncodedExact {
+                        key: &malformed_exact
+                    }]),
+                    Err(Error::InvalidFormat)
+                ));
+            }
+            {
+                let mut writer = non_unique_tree.batch_writer(&mut mutable, 4);
+                assert!(matches!(
+                    writer.batch_insert_encoded(&[
+                        NonUniqueDiskTreeEncodedExact {
+                            key: &encoded_exact11
+                        },
+                        NonUniqueDiskTreeEncodedExact {
+                            key: &encoded_exact10
+                        },
+                    ]),
+                    Err(Error::InvalidArgument)
+                ));
+            }
+            let mut writer = non_unique_tree.batch_writer(&mut mutable, 4);
+            writer
+                .batch_insert_encoded(&[
+                    NonUniqueDiskTreeEncodedExact {
+                        key: &encoded_exact10,
+                    },
+                    NonUniqueDiskTreeEncodedExact {
+                        key: &encoded_exact11,
+                    },
+                ])
+                .unwrap();
+            let non_unique_root = writer.finish().await.unwrap();
+            let non_unique_tree = NonUniqueDiskTree::new(
+                non_unique_root,
+                &metadata.index_specs[1],
+                &metadata,
+                disk_pool.file_kind(),
+                disk_pool.sparse_file(),
+                disk_pool.global_pool(),
+                &guard,
+            )
+            .unwrap();
+            let mut writer = non_unique_tree.batch_writer(&mut mutable, 5);
+            writer
+                .batch_exact_delete_encoded(&[NonUniqueDiskTreeEncodedExact {
+                    key: &encoded_exact10,
+                }])
+                .unwrap();
+            let non_unique_root = writer.finish().await.unwrap();
+            let non_unique_tree = NonUniqueDiskTree::new(
+                non_unique_root,
+                &metadata.index_specs[1],
+                &metadata,
+                disk_pool.file_kind(),
+                disk_pool.sparse_file(),
+                disk_pool.global_pool(),
+                &guard,
+            )
+            .unwrap();
+            assert_eq!(non_unique_tree.prefix_scan(&key1).await.unwrap(), vec![11]);
         });
     }
 

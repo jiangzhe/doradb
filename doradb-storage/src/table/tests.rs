@@ -8,6 +8,7 @@ use crate::engine::Engine;
 use crate::error::{BlockCorruptionCause, BlockKind, Error, FileKind, Result, StoragePoisonSource};
 use crate::file::block_integrity::{BLOCK_INTEGRITY_HEADER_SIZE, write_block_checksum};
 use crate::file::cow_file::{COW_FILE_PAGE_SIZE, SUPER_BLOCK_ID};
+use crate::index::disk_tree::{NonUniqueDiskTree, UniqueDiskTree};
 use crate::index::{
     COLUMN_BLOCK_HEADER_SIZE, COLUMN_BLOCK_LEAF_HEADER_SIZE, ColumnBlockIndex, NonUniqueIndex,
     RowLocation, UniqueIndex, load_entry_deletion_deltas,
@@ -25,12 +26,34 @@ use crate::trx::row::LockRowForWrite;
 use crate::trx::undo::RowUndoKind;
 use crate::trx::{ActiveTrx, MAX_SNAPSHOT_TS, TrxID};
 use crate::value::Val;
+use std::cell::Cell;
 use std::fs::OpenOptions;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 use tempfile::TempDir;
+
+thread_local! {
+    static TEST_FORCE_LWC_BUILD_ERROR: Cell<bool> = const { Cell::new(false) };
+    static TEST_FORCE_SECONDARY_SIDECAR_ERROR: Cell<bool> = const { Cell::new(false) };
+}
+
+pub(super) fn set_test_force_lwc_build_error(enabled: bool) {
+    TEST_FORCE_LWC_BUILD_ERROR.with(|flag| flag.set(enabled));
+}
+
+pub(super) fn test_force_lwc_build_error_enabled() -> bool {
+    TEST_FORCE_LWC_BUILD_ERROR.with(|flag| flag.get())
+}
+
+pub(super) fn set_test_force_secondary_sidecar_error(enabled: bool) {
+    TEST_FORCE_SECONDARY_SIDECAR_ERROR.with(|flag| flag.set(enabled));
+}
+
+pub(super) fn test_force_secondary_sidecar_error_enabled() -> bool {
+    TEST_FORCE_SECONDARY_SIDECAR_ERROR.with(|flag| flag.get())
+}
 
 struct FailingPageReadHook {
     file: StorageBackendFileIdentity,
@@ -1516,6 +1539,225 @@ fn test_checkpoint_persists_committed_cold_delete_markers() {
         let deltas = load_entry_deletion_deltas(&index, &entry).await.unwrap();
         let expected_delta = (row_id - entry.start_row_id) as u32;
         assert!(deltas.contains(&expected_delta));
+
+        drop(session);
+        sys.clean_all();
+    });
+}
+
+#[test]
+fn test_checkpoint_publishes_unique_secondary_disk_tree_root() {
+    smol::block_on(async {
+        let sys = TestSys::new_evictable().await;
+        let mut session = sys.try_new_session().unwrap();
+        insert_rows(&sys, &mut session, 0, 3, "name").await;
+
+        sys.table.freeze(&session, usize::MAX).await;
+        sys.table.checkpoint(&mut session).await.unwrap();
+
+        let active_root = sys.table.file().active_root();
+        assert_ne!(active_root.secondary_index_roots[0], SUPER_BLOCK_ID);
+        let reader = session.try_begin_trx().unwrap().unwrap();
+        for key_value in 0..3 {
+            let key = single_key(key_value);
+            let row_id =
+                assert_row_in_lwc(&sys.table, session.pool_guards(), &key, reader.sts).await;
+            assert_eq!(
+                unique_disk_tree_lookup(&sys.table, session.pool_guards(), &key).await,
+                Some(row_id)
+            );
+        }
+        reader.commit().await.unwrap();
+
+        drop(session);
+        sys.clean_all();
+    });
+}
+
+#[test]
+fn test_checkpoint_publishes_non_unique_secondary_disk_tree_entries_across_lwc_splits() {
+    smol::block_on(async {
+        let sys = TestSys::new_evictable_with_non_unique_name_index().await;
+        let mut session = sys.try_new_session().unwrap();
+        let name = "split-name-".repeat(120);
+        let row_count = 80;
+        insert_rows(&sys, &mut session, 0, row_count, &name).await;
+
+        sys.table.freeze(&session, usize::MAX).await;
+        sys.table.checkpoint(&mut session).await.unwrap();
+
+        let name_key = name_key(&name);
+        let row_ids =
+            non_unique_disk_tree_prefix_scan(&sys.table, session.pool_guards(), &name_key).await;
+        assert_eq!(row_ids.len(), row_count as usize);
+
+        let first_key = single_key(0i32);
+        let last_key = single_key(row_count - 1);
+        let first_row_id = unique_disk_tree_lookup(&sys.table, session.pool_guards(), &first_key)
+            .await
+            .unwrap();
+        let last_row_id = unique_disk_tree_lookup(&sys.table, session.pool_guards(), &last_key)
+            .await
+            .unwrap();
+        let active_root = sys.table.file().active_root();
+        let column_index = ColumnBlockIndex::new(
+            active_root.column_block_index_root,
+            active_root.pivot_row_id,
+            sys.table.file().file_kind(),
+            sys.table.file().sparse_file(),
+            sys.table.disk_pool(),
+            session.pool_guards().disk_guard(),
+        );
+        let first_entry = column_index
+            .locate_block(first_row_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let last_entry = column_index
+            .locate_block(last_row_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_ne!(first_entry.block_id(), last_entry.block_id());
+
+        drop(session);
+        sys.clean_all();
+    });
+}
+
+#[test]
+fn test_deletion_checkpoint_updates_secondary_disk_tree_roots() {
+    smol::block_on(async {
+        let sys = TestSys::new_evictable_with_non_unique_name_index().await;
+        let mut session = sys.try_new_session().unwrap();
+        insert_rows(&sys, &mut session, 0, 2, "same-name").await;
+        sys.table.freeze(&session, usize::MAX).await;
+        sys.table.checkpoint(&mut session).await.unwrap();
+
+        let delete_key = single_key(0i32);
+        let keep_key = single_key(1i32);
+        let deleted_row_id =
+            unique_disk_tree_lookup(&sys.table, session.pool_guards(), &delete_key)
+                .await
+                .unwrap();
+        let kept_row_id = unique_disk_tree_lookup(&sys.table, session.pool_guards(), &keep_key)
+            .await
+            .unwrap();
+
+        sys.new_trx_delete(&mut session, &delete_key).await;
+        let marker_ts = delete_marker_ts(sys.table.deletion_buffer().get(deleted_row_id).unwrap());
+        wait_gc_cutoff_after(&session, marker_ts).await;
+        sys.table.checkpoint(&mut session).await.unwrap();
+
+        assert_eq!(
+            unique_disk_tree_lookup(&sys.table, session.pool_guards(), &delete_key).await,
+            None
+        );
+        assert_eq!(
+            unique_disk_tree_lookup(&sys.table, session.pool_guards(), &keep_key).await,
+            Some(kept_row_id)
+        );
+        let exact_rows = non_unique_disk_tree_prefix_scan(
+            &sys.table,
+            session.pool_guards(),
+            &name_key("same-name"),
+        )
+        .await;
+        assert_eq!(exact_rows, vec![kept_row_id]);
+
+        drop(session);
+        sys.clean_all();
+    });
+}
+
+#[test]
+fn test_unique_checkpoint_overlap_keeps_new_disk_tree_owner() {
+    smol::block_on(async {
+        let sys = TestSys::new_evictable().await;
+        let mut session = sys.try_new_session().unwrap();
+        sys.new_trx_insert(&mut session, vec![Val::from(1i32), Val::from("old")])
+            .await;
+        sys.table.freeze(&session, usize::MAX).await;
+        sys.table.checkpoint(&mut session).await.unwrap();
+
+        let key = single_key(1i32);
+        let old_row_id = unique_disk_tree_lookup(&sys.table, session.pool_guards(), &key)
+            .await
+            .unwrap();
+        sys.new_trx_delete(&mut session, &key).await;
+        let delete_ts = delete_marker_ts(sys.table.deletion_buffer().get(old_row_id).unwrap());
+        sys.new_trx_insert(&mut session, vec![Val::from(1i32), Val::from("new")])
+            .await;
+
+        let reader = session.try_begin_trx().unwrap().unwrap();
+        let new_row_id = sys.table.sec_idx()[0]
+            .unique()
+            .unwrap()
+            .lookup(session.pool_guards().index_guard(), &key.vals, reader.sts)
+            .await
+            .unwrap()
+            .unwrap()
+            .0;
+        reader.commit().await.unwrap();
+
+        sys.table.freeze(&session, usize::MAX).await;
+        wait_gc_cutoff_after(&session, delete_ts).await;
+        sys.table.checkpoint(&mut session).await.unwrap();
+
+        assert_eq!(
+            unique_disk_tree_lookup(&sys.table, session.pool_guards(), &key).await,
+            Some(new_row_id)
+        );
+
+        drop(session);
+        sys.clean_all();
+    });
+}
+
+#[test]
+fn test_secondary_sidecar_failure_keeps_checkpoint_root_atomic() {
+    struct ResetSidecarHook;
+
+    impl Drop for ResetSidecarHook {
+        fn drop(&mut self) {
+            set_test_force_secondary_sidecar_error(false);
+        }
+    }
+
+    smol::block_on(async {
+        let sys = TestSys::new_evictable().await;
+        let mut session = sys.try_new_session().unwrap();
+        insert_rows(&sys, &mut session, 0, 2, "name").await;
+        sys.table.freeze(&session, usize::MAX).await;
+        sys.table.checkpoint(&mut session).await.unwrap();
+
+        let key = single_key(0i32);
+        let row_id = unique_disk_tree_lookup(&sys.table, session.pool_guards(), &key)
+            .await
+            .unwrap();
+        sys.new_trx_delete(&mut session, &key).await;
+        let marker_ts = delete_marker_ts(sys.table.deletion_buffer().get(row_id).unwrap());
+        wait_gc_cutoff_after(&session, marker_ts).await;
+        let root_before = sys.table.file().active_root().clone();
+
+        set_test_force_secondary_sidecar_error(true);
+        let _reset = ResetSidecarHook;
+        let err = sys.table.checkpoint(&mut session).await.unwrap_err();
+        assert!(matches!(err, Error::InvalidState));
+
+        let root_after = sys.table.file().active_root();
+        assert_eq!(
+            root_after.deletion_cutoff_ts,
+            root_before.deletion_cutoff_ts
+        );
+        assert_eq!(
+            root_after.column_block_index_root,
+            root_before.column_block_index_root
+        );
+        assert_eq!(
+            root_after.secondary_index_roots,
+            root_before.secondary_index_roots
+        );
 
         drop(session);
         sys.clean_all();
@@ -3801,9 +4043,9 @@ fn test_checkpoint_error_rollback() {
         sys.table.freeze(&session, usize::MAX).await;
         let root_before = sys.table.file().active_root().clone();
 
-        super::set_test_force_lwc_build_error(true);
+        set_test_force_lwc_build_error(true);
         let res = sys.table.checkpoint(&mut session).await;
-        super::set_test_force_lwc_build_error(false);
+        set_test_force_lwc_build_error(false);
         assert!(res.is_err());
 
         let root_after = sys.table.file().active_root();
@@ -4255,6 +4497,44 @@ async fn assert_row_in_lwc(
         RowLocation::RowPage(..) => panic!("row should be in lwc"),
         RowLocation::NotFound => panic!("row should exist"),
     }
+}
+
+async fn unique_disk_tree_lookup(
+    table: &Table,
+    guards: &PoolGuards,
+    key: &SelectKey,
+) -> Option<RowID> {
+    let root = table.file().active_root().secondary_index_roots[key.index_no];
+    let tree = UniqueDiskTree::new(
+        root,
+        &table.metadata().index_specs[key.index_no],
+        table.metadata(),
+        table.file().file_kind(),
+        table.file().sparse_file(),
+        table.disk_pool(),
+        guards.disk_guard(),
+    )
+    .unwrap();
+    tree.lookup(&key.vals).await.unwrap()
+}
+
+async fn non_unique_disk_tree_prefix_scan(
+    table: &Table,
+    guards: &PoolGuards,
+    key: &SelectKey,
+) -> Vec<RowID> {
+    let root = table.file().active_root().secondary_index_roots[key.index_no];
+    let tree = NonUniqueDiskTree::new(
+        root,
+        &table.metadata().index_specs[key.index_no],
+        table.metadata(),
+        table.file().file_kind(),
+        table.file().sparse_file(),
+        table.disk_pool(),
+        guards.disk_guard(),
+    )
+    .unwrap();
+    tree.prefix_scan(&key.vals).await.unwrap()
 }
 
 async fn assert_unique_index_entry(

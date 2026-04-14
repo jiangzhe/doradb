@@ -1483,6 +1483,34 @@ impl<'a> ColumnBlockIndex<'a> {
         )
     }
 
+    /// Loads validated delete deltas and authoritative row ids for one
+    /// persisted entry from one leaf-node read.
+    pub(crate) async fn load_delete_deltas_and_row_ids(
+        &self,
+        entry: &ColumnLeafEntry,
+    ) -> Result<(Vec<u32>, Vec<RowID>)> {
+        let node = self.read_node(entry.leaf_page_id).await?;
+        let view = self.read_entry_view(&node, entry)?;
+        let row_set = decode_logical_row_set(&view, self.file_kind(), entry.leaf_page_id)?;
+        let delete_set = self
+            .decode_logical_delete_set(&view, &row_set, entry.leaf_page_id)
+            .await?;
+        let delete_deltas = match delete_set {
+            LogicalDeleteSet::None { .. } => Vec::new(),
+            LogicalDeleteSet::Inline { row_id_deltas, .. } => row_id_deltas,
+            LogicalDeleteSet::External { row_id_deltas, .. } => {
+                row_id_deltas.ok_or(Error::InvalidState)?
+            }
+        };
+        let row_ids = decode_row_ids_from_row_set(
+            view.start_row_id,
+            &row_set,
+            self.file_kind(),
+            entry.leaf_page_id,
+        )?;
+        Ok((delete_deltas, row_ids))
+    }
+
     async fn decode_logical_delete_set(
         &self,
         view: &LeafEntryView<'_>,

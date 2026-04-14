@@ -36,22 +36,10 @@ use crate::trx::undo::{IndexBranch, RowUndoKind, UndoStatus};
 use crate::trx::ver_map::RowPageState;
 use crate::trx::{MAX_SNAPSHOT_TS, MIN_SNAPSHOT_TS, TrxID, trx_is_committed};
 use crate::value::{PAGE_VAR_LEN_INLINE, Val};
-#[cfg(test)]
-use std::cell::Cell;
 use std::collections::HashMap;
 use std::ops::Deref;
 use std::sync::Arc;
 use std::time::Duration;
-
-#[cfg(test)]
-thread_local! {
-    static TEST_FORCE_LWC_BUILD_ERROR: Cell<bool> = const { Cell::new(false) };
-}
-
-#[cfg(test)]
-pub(super) fn set_test_force_lwc_build_error(enabled: bool) {
-    TEST_FORCE_LWC_BUILD_ERROR.with(|flag| flag.set(enabled));
-}
 
 /// Table is a logical data set of rows.
 /// It combines components such as row page, undo map, block index, secondary
@@ -115,6 +103,8 @@ struct FrozenPage {
     start_row_id: RowID,
     end_row_id: RowID,
 }
+
+type VisibleRowCollector<'a> = &'a mut dyn FnMut(&RowPage, usize, RowID) -> Result<()>;
 
 /// Stages newly built secondary indexes until the caller publishes them.
 ///
@@ -650,10 +640,11 @@ impl Table {
         guards: &PoolGuards,
         cutoff_ts: TrxID,
         frozen_pages: &[FrozenPage],
+        mut collect_visible_row: Option<VisibleRowCollector<'_>>,
     ) -> Result<Vec<LwcBlockPersist>> {
         #[cfg(test)]
         {
-            if TEST_FORCE_LWC_BUILD_ERROR.with(|flag| flag.get()) {
+            if tests::test_force_lwc_build_error_enabled() {
                 return Err(Error::InvalidState);
             }
         }
@@ -671,6 +662,13 @@ impl Table {
                 let view = page.vector_view_in_transition(metadata, ctx, cutoff_ts, cutoff_ts);
                 if view.rows_non_deleted() == 0 {
                     continue;
+                }
+                if let Some(collect_visible_row) = collect_visible_row.as_mut() {
+                    for (start_idx, end_idx) in view.range_non_deleted() {
+                        for row_idx in start_idx..end_idx {
+                            collect_visible_row(page, row_idx, page.row_id(row_idx))?;
+                        }
+                    }
                 }
                 if builder.is_empty() {
                     current_start = page_info.start_row_id;
