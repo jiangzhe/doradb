@@ -1,7 +1,7 @@
 ---
 id: 000118
 title: DiskTree Checkpoint Sidecar Publication
-status: proposal
+status: implemented
 created: 2026-04-14
 github_issue: 554
 ---
@@ -212,6 +212,51 @@ cargo nextest run -p doradb-storage --no-default-features --features libaio
 
 ## Implementation Notes
 
+1. Published user-table secondary `DiskTree` roots from `Table::checkpoint()`:
+   - checkpoint now collects secondary sidecar entries from the same
+     committed-visible transition rows used to build LWC blocks.
+   - deletion checkpoint reconstructs cold-row secondary keys from persisted
+     LWC blocks and applies companion deletes before advancing the durable
+     deletion cutoff.
+   - secondary roots are staged through the same `MutableTableFile` fork as
+     LWC, column-index, metadata, and heartbeat changes, so partial secondary
+     publication is abandoned on checkpoint failure.
+
+2. Added checkpoint-local sidecar batching and normalization:
+   - unique sidecars coalesce encoded puts by key, retain the latest same-run
+     owner, and suppress conditional deletes when the same checkpoint publishes
+     a new owner for that key.
+   - non-unique sidecars store encoded exact `(logical_key, row_id)` entries,
+     dedup inserts/deletes, and make exact deletes win for the same encoded
+     entry.
+   - tables without secondary indexes skip sidecar row callback work.
+
+3. Hardened and optimized persisted `DiskTree` companion application:
+   - added encoded writer entrypoints for unique puts, unique conditional
+     deletes, non-unique exact inserts, and non-unique exact deletes.
+   - encoded non-unique exact keys are validated for the trailing `RowID`
+     suffix before staging, preventing malformed exact keys from reaching
+     `prefix_scan` or `scan_entries`.
+   - deletion checkpoint now caches block lookup while scanning sorted row ids,
+     loads delete deltas and row ids from one column-index leaf read, maps dense
+     row ids directly, uses linear sparse mapping, and decodes only indexed
+     columns from affected LWC blocks.
+
+4. Added checkpoint and writer coverage:
+   - unique data checkpoint publishes a readable unique `DiskTree` root.
+   - non-unique data checkpoint publishes exact entries across LWC splits.
+   - deletion checkpoint updates unique and non-unique secondary roots.
+   - same-run unique overlap keeps the new checkpointed owner.
+   - sidecar write failure leaves checkpoint root publication atomic.
+   - checkpoint heartbeat remains explicit and covered.
+   - encoded writer tests cover malformed non-unique exact keys.
+
+5. Validation completed:
+   - `cargo fmt --all --check`
+   - `cargo clippy -p doradb-storage --all-targets -- -D warnings`
+   - `cargo nextest run -p doradb-storage` (556 passed, 0 skipped)
+   - `git diff --check`
+
 ## Impacts
 
 - `doradb-storage/src/table/persistence.rs`
@@ -279,9 +324,6 @@ cargo nextest run -p doradb-storage --no-default-features --features libaio
 
 ## Open Questions
 
-1. Should the sidecar accumulator stay in `table/persistence.rs` for locality,
-   or move to a small `table/checkpoint_index.rs` module once implementation
-   size is clear?
-2. Should the "decode each affected LWC block once" requirement be proven with
-   a test-only counter hook, or is structural grouping coverage sufficient for
-   this phase?
+1. Parallel secondary `DiskTree` checkpoint application remains deferred:
+   `docs/backlogs/000084-parallel-secondary-disk-tree-checkpoint-application.md`
+   tracks both index-level and subtree-level parallel rewrite work.

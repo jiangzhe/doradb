@@ -437,10 +437,10 @@ SAFETY:` comments, and run the repository lint gate. [D10], [C4], [C7]
     metadata.
   - Non-goals: changing foreground lookup or uniqueness behavior, changing
     catalog checkpointing, and independent MemTree flush.
-  - Task Doc: `docs/tasks/TBD.md`
-  - Task Issue: `#0`
-  - Phase Status: `pending`
-  - Implementation Summary: `pending`
+  - Task Doc: `docs/tasks/000118-disk-tree-checkpoint-sidecar-publication.md`
+  - Task Issue: `#554`
+  - Phase Status: done
+  - Implementation Summary: Implemented checkpoint sidecar publication for user-table secondary DiskTree roots. [Task Resolve Sync: docs/tasks/000118-disk-tree-checkpoint-sidecar-publication.md @ 2026-04-14]
 
 - **Phase 3: Recovery Source Migration**
   - Scope: use checkpointed DiskTree roots as a validated recovery source
