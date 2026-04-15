@@ -1,7 +1,7 @@
 ---
 id: 000119
 title: Composite Secondary Index Core
-status: proposal
+status: implemented
 created: 2026-04-15
 github_issue: 557
 ---
@@ -271,11 +271,70 @@ cargo nextest run -p doradb-storage --no-default-features --features libaio
 
 ## Implementation Notes
 
+1. Implemented the self-contained composite secondary-index core:
+   - added `DualTreeUniqueIndex`, `DualTreeNonUniqueIndex`, and
+     `DualTreeSecondaryIndex` over the existing BTree-backed MemTree indexes.
+   - implemented the current `UniqueIndex` and `NonUniqueIndex` trait
+     contracts with terminal MemTree semantics, DiskTree fallback, unique cold
+     owner claiming, unique delete-shadow overlays, non-unique exact-entry
+     merge/suppression, and deterministic encoded-key ordering.
+   - added focused MemTree helper APIs for encoded state scans, unique
+     delete-shadow insertion, and non-unique delete-marked exact overlays
+     without widening the public trait surfaces.
+
+2. Reshaped the cold DiskTree runtime after implementation review:
+   - replaced the original root-owning `SecondaryDiskTreeContext` shape with
+     `SecondaryDiskTreeRuntime`, which stores the fixed secondary-index shape
+     and opens root snapshots against the currently published table root or an
+     explicit historical root.
+   - split `DiskTreeRuntime<F>` from borrowed `DiskTree<'_, F>` root snapshots,
+     keeping `UniqueDiskTree` and `NonUniqueDiskTree` as type aliases.
+   - moved reusable secondary DiskTree runtimes into `ColumnStorage`, while
+     `TableMeta.secondary_index_roots` remains the slim persisted root vector.
+   - checkpoint sidecar application now reuses the stored secondary runtime and
+     opens explicit old-root snapshots when rewriting roots.
+
+3. Completed related correctness and ownership cleanup:
+   - fixed non-unique encoded-entry collection so malformed exact-key decode
+     failures propagate as errors instead of ending scans with partial results.
+   - removed `ReadonlyBackingFile`; queued read and write IO now keep plain
+     `Arc<SparseFile>` references, and readonly miss-load dedupe clones the file
+     only when creating a new miss-load submission.
+   - removed CoW file `*_with_owner` plumbing and kept file ownership at the
+     async submission boundary.
+   - refreshed the unsafe usage baseline for the added BTree-node test helper
+     unsafe block.
+
+4. Added coverage for the Phase 3 behavior:
+   - unique composite tests cover MemTree hits, DiskTree fallback, duplicate
+     detection, cold-owner claiming, delete-shadow behavior, scan merge, and
+     unchanged DiskTree roots.
+   - non-unique composite tests cover exact lookup/lookup_unique, duplicate
+     detection, delete-marked suppression, scan merge, and unchanged DiskTree
+     roots.
+   - runtime-root tests cover resolving the published secondary root per open.
+   - regression coverage verifies malformed non-unique exact keys surface
+     `Error::InvalidState`.
+
+5. Validation completed after checklist review:
+   - `cargo check -p doradb-storage`
+   - `cargo nextest run -p doradb-storage disk_tree` (14 passed, 548 skipped)
+   - `cargo nextest run -p doradb-storage composite_secondary_index` (4 passed,
+     558 skipped)
+   - `cargo nextest run -p doradb-storage readonly` (33 passed, 529 skipped)
+   - `cargo fmt --all --check`
+   - `git diff --check`
+   - `cargo clippy -p doradb-storage --all-targets -- -D warnings`
+   - `cargo nextest run -p doradb-storage` (562 passed, 0 skipped)
+
+No unresolved checklist fixes or intentionally deferred backlog items remain
+for this task. The Phase 4 runtime/recovery wiring remains tracked by RFC 0014.
+
 ## Impacts
 
 - `doradb-storage/src/index/composite_secondary_index.rs`
-  - new dual-tree grouping types, cold-root context, trait implementations,
-    and composite merge helpers
+  - new dual-tree grouping types, `SecondaryDiskTreeRuntime`, trait
+    implementations, and composite merge helpers
 - `doradb-storage/src/index/mod.rs`
   - internal module export for the composite index core
 - `doradb-storage/src/index/unique_index.rs`
@@ -283,13 +342,26 @@ cargo nextest run -p doradb-storage --no-default-features --features libaio
     and encoded-state scans
 - `doradb-storage/src/index/non_unique_index.rs`
   - narrow non-unique MemTree helper APIs for delete-marked exact overlay
-    insertion and encoded-state scans
+    insertion and encoded-state scans; encoded scan callbacks now propagate
+    decode failures
 - `doradb-storage/src/index/disk_tree.rs`
-  - existing user-table DiskTree readers are reused; optional table-only open
-    helpers may be added if they keep `FileKind` out of the composite API
-- `doradb-storage/src/index/secondary_index.rs`
-  - optional construction helpers or enum alignment for future Phase 4 wiring;
-    no table runtime replacement in this task
+  - `DiskTreeRuntime<F>` owns fixed shape and `DiskTree<'_, F>` borrows it as a
+    root snapshot
+- `doradb-storage/src/table/mod.rs`
+  - `ColumnStorage` owns reusable secondary DiskTree runtimes for table-scoped
+    secondary indexes
+- `doradb-storage/src/table/persistence.rs`
+  - checkpoint secondary-root rewrites reuse the stored runtimes with explicit
+    old-root snapshots
+- `doradb-storage/src/buffer/readonly.rs` and `doradb-storage/src/file/*.rs`
+  - queued readonly reads and table writes use `Arc<SparseFile>` directly
+    instead of `ReadonlyBackingFile`
+- `doradb-storage/src/index/btree_scan.rs` and
+  `doradb-storage/src/index/btree_node.rs`
+  - scan callbacks can propagate errors, and a test helper exposes controlled
+    raw-key mutation
+- `doradb-storage/src/table/tests.rs`
+  - table checkpoint tests use the stored runtime helpers for DiskTree lookups
 
 ## Test Cases
 

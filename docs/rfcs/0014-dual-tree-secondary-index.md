@@ -484,9 +484,9 @@ SAFETY:` comments, and run the repository lint gate. [D10], [C4], [C7]
     storage-version compatibility, MemTree cleanup/eviction, and generic
     B+Tree backend unification.
   - Task Doc: `docs/tasks/000119-composite-secondary-index-core.md`
-  - Task Issue: `#0`
-  - Phase Status: `pending`
-  - Implementation Summary: `pending`
+  - Task Issue: `#557`
+  - Phase Status: done
+  - Implementation Summary: Implemented Phase 3 composite secondary-index core with dual-tree unique/non-unique wrappers, reusable secondary DiskTree runtimes, and root-snapshot DiskTree views. [Task Resolve Sync: docs/tasks/000119-composite-secondary-index-core.md @ 2026-04-15]
 
 - **Phase 4: User Composite Runtime And Recovery**
   - Scope: wire the Phase 3 composite core into user-table runtime access and
