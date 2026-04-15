@@ -370,12 +370,12 @@ struct CollectRowID<'a>(&'a mut Vec<RowID>);
 
 impl BTreeSlotCallback for CollectRowID<'_> {
     #[inline]
-    fn apply(&mut self, node: &BTreeNode, slot: &BTreeSlot) -> bool {
+    fn apply(&mut self, node: &BTreeNode, slot: &BTreeSlot) -> Result<bool> {
         // todo: with covering index support, we may further skip deleted row ids.
         let value = node.unpack_value::<BTreeU64>(slot);
         // The result collection may contains deleted row id.
         self.0.push(value.to_u64());
-        true
+        Ok(true)
     }
 }
 
@@ -384,9 +384,10 @@ struct CollectEncodedExactEntries<'a>(&'a mut Vec<NonUniqueMemTreeEntry>);
 
 impl BTreeSlotCallback for CollectEncodedExactEntries<'_> {
     #[inline]
-    fn apply(&mut self, node: &BTreeNode, slot: &BTreeSlot) -> bool {
+    fn apply(&mut self, node: &BTreeNode, slot: &BTreeSlot) -> Result<bool> {
         // In-memory BTree slot data has already been validated by the scanner.
-        push_encoded_exact_entry(node, slot, self.0).is_ok()
+        push_encoded_exact_entry(node, slot, self.0)?;
+        Ok(true)
     }
 }
 
@@ -450,6 +451,58 @@ mod tests {
                 };
                 run_test_suit_for_non_unique_index(&index, &pool_guard).await;
             }
+        })
+    }
+
+    #[test]
+    fn test_lookup_encoded_entries_propagates_malformed_exact_key() {
+        smol::block_on(async {
+            let pool = QuiescentBox::new(
+                FixedBufferPool::with_capacity(
+                    crate::buffer::PoolRole::Index,
+                    1024usize * 1024 * 1024,
+                )
+                .unwrap(),
+            );
+            let pool_guard = (*pool).pool_guard();
+            let index = NonUniqueBTreeIndex {
+                tree: BTree::new(pool.guard(), &pool_guard, true, 100)
+                    .await
+                    .expect("test btree construction should succeed"),
+                encoder: BTreeKeyEncoder::new(vec![
+                    ValType {
+                        kind: ValKind::I32,
+                        nullable: false,
+                    },
+                    ValType {
+                        kind: ValKind::U64,
+                        nullable: false,
+                    },
+                ]),
+            };
+
+            let key = vec![Val::from(42i32)];
+            let malformed_exact_key = index
+                .encoder
+                .encode_prefix(&key, Some(mem::size_of::<RowID>()));
+            assert!(malformed_exact_key.as_bytes().len() < mem::size_of::<RowID>());
+            index
+                .tree
+                .insert::<BTreeByte>(
+                    &pool_guard,
+                    malformed_exact_key.as_bytes(),
+                    BTREE_BYTE_ZERO,
+                    false,
+                    100,
+                )
+                .await
+                .expect("test btree insert should succeed");
+
+            let err = index
+                .lookup_encoded_entries(&pool_guard, &key)
+                .await
+                .expect_err("malformed exact key should fail encoded-entry lookup");
+            assert!(matches!(err, Error::InvalidState));
         })
     }
 
