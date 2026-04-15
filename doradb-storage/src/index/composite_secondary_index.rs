@@ -256,12 +256,7 @@ impl<P: BufferPool + 'static> UniqueIndex for DualTreeUniqueIndex<P> {
                 .compare_delete(pool_guard, key, old_row_id, ignore_del_mask, ts)
                 .await;
         }
-        let disk_pool_guard = self.disk.disk_pool_guard();
-        let disk = self.disk.open_unique(&disk_pool_guard)?;
-        match disk.lookup(key).await? {
-            Some(cold_row_id) => Ok(cold_row_id == old_row_id),
-            None => Ok(true),
-        }
+        Ok(true)
     }
 
     #[inline]
@@ -854,7 +849,7 @@ mod tests {
                     .unwrap()
             );
             assert!(
-                !index
+                index
                     .compare_delete(&index_guard, &key4, 41, false, 7)
                     .await
                     .unwrap()

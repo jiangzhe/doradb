@@ -297,6 +297,9 @@ cargo nextest run -p doradb-storage --no-default-features --features libaio
 3. Completed related correctness and ownership cleanup:
    - fixed non-unique encoded-entry collection so malformed exact-key decode
      failures propagate as errors instead of ending scans with partial results.
+   - tightened `DualTreeUniqueIndex::compare_delete` to stay MemTree-only on
+     MemTree miss, treating DiskTree-only matches as idempotent no-ops for
+     cleanup/purge-shaped callers and avoiding unnecessary cold-layer opens.
    - removed `ReadonlyBackingFile`; queued read and write IO now keep plain
      `Arc<SparseFile>` references, and readonly miss-load dedupe clones the file
      only when creating a new miss-load submission.
@@ -318,17 +321,22 @@ cargo nextest run -p doradb-storage --no-default-features --features libaio
 
 5. Validation completed after checklist review:
    - `cargo check -p doradb-storage`
-   - `cargo nextest run -p doradb-storage disk_tree` (14 passed, 548 skipped)
    - `cargo nextest run -p doradb-storage composite_secondary_index` (4 passed,
-     558 skipped)
+     561 skipped)
+   - `cargo nextest run -p doradb-storage disk_tree` (15 passed, 550 skipped)
    - `cargo nextest run -p doradb-storage readonly` (33 passed, 529 skipped)
    - `cargo fmt --all --check`
    - `git diff --check`
    - `cargo clippy -p doradb-storage --all-targets -- -D warnings`
-   - `cargo nextest run -p doradb-storage` (562 passed, 0 skipped)
+   - `cargo nextest run -p doradb-storage` (565 passed, 0 skipped)
+   - `tools/coverage_focus.rs --path doradb-storage/src/index/composite_secondary_index.rs`
+     (803/845 lines, 95.03%)
 
-No unresolved checklist fixes or intentionally deferred backlog items remain
-for this task. The Phase 4 runtime/recovery wiring remains tracked by RFC 0014.
+The checklist found no code correctness issues in the final implementation.
+The secondary-index dual-tree access path and caller-provided pool guard
+follow-up is deferred to
+`docs/backlogs/000086-secondary-index-dual-tree-access-path.md`. The Phase 4
+runtime/recovery wiring remains tracked by RFC 0014.
 
 ## Impacts
 
