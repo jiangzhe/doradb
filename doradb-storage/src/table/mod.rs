@@ -20,6 +20,7 @@ use crate::catalog::TableMetadata;
 use crate::catalog::{IndexSpec, TableID};
 use crate::error::{Error, Result};
 use crate::file::table_file::{LwcBlockPersist, TableFile};
+use crate::index::composite_secondary_index::SecondaryDiskTreeRuntime;
 use crate::index::util::{Maskable, RowPageCreateRedoCtx};
 use crate::index::{
     BlockIndex, ColumnBlockEntryShape, GenericSecondaryIndex, IndexCompareExchange, IndexInsert,
@@ -90,6 +91,7 @@ pub struct ColumnStorage {
     pub(crate) file: Arc<TableFile>,
     pub(crate) disk_pool: QuiescentGuard<ReadonlyBufferPool>,
     pub(crate) deletion_buffer: ColumnDeletionBuffer,
+    secondary_indexes: Box<[SecondaryDiskTreeRuntime]>,
 }
 
 /// Runtime handle for a user table, combining in-memory and persisted storage.
@@ -460,12 +462,31 @@ impl<D: BufferPool, I: BufferPool> GenericMemTable<D, I> {
 
 impl ColumnStorage {
     #[inline]
-    pub(crate) fn new(file: Arc<TableFile>, disk_pool: QuiescentGuard<ReadonlyBufferPool>) -> Self {
-        ColumnStorage {
+    pub(crate) fn new(
+        file: Arc<TableFile>,
+        disk_pool: QuiescentGuard<ReadonlyBufferPool>,
+    ) -> Result<Self> {
+        let metadata = Arc::clone(&file.active_root().metadata);
+        if file.active_root().secondary_index_roots.len() != metadata.index_specs.len() {
+            return Err(Error::InvalidState);
+        }
+        let secondary_indexes = (0..metadata.index_specs.len())
+            .map(|index_no| {
+                SecondaryDiskTreeRuntime::new(
+                    index_no,
+                    Arc::clone(&metadata),
+                    Arc::clone(&file),
+                    disk_pool.clone(),
+                )
+            })
+            .collect::<Result<Vec<_>>>()?
+            .into_boxed_slice();
+        Ok(ColumnStorage {
             file,
             disk_pool,
             deletion_buffer: ColumnDeletionBuffer::new(),
-        }
+            secondary_indexes,
+        })
     }
 
     /// Returns the underlying table file for persisted column data.
@@ -485,6 +506,23 @@ impl ColumnStorage {
     pub fn deletion_buffer(&self) -> &ColumnDeletionBuffer {
         &self.deletion_buffer
     }
+
+    /// Returns one reusable secondary DiskTree runtime by index number.
+    #[inline]
+    pub(crate) fn secondary_index_runtime(
+        &self,
+        index_no: usize,
+    ) -> Result<&SecondaryDiskTreeRuntime> {
+        self.secondary_indexes
+            .get(index_no)
+            .ok_or(Error::InvalidArgument)
+    }
+
+    /// Returns the reusable secondary DiskTree runtimes owned by this table.
+    #[inline]
+    pub(crate) fn secondary_index_runtimes(&self) -> &[SecondaryDiskTreeRuntime] {
+        &self.secondary_indexes
+    }
 }
 
 impl Table {
@@ -501,6 +539,7 @@ impl Table {
     ) -> Result<Self> {
         let active_root = file.active_root();
         let metadata = Arc::clone(&active_root.metadata);
+        let secondary_index_count = metadata.index_specs.len();
         let mem = GenericMemTable::new(
             mem_pool.clone(),
             mem_pool.row_pool_role(),
@@ -513,7 +552,11 @@ impl Table {
             active_root.trx_id,
         )
         .await?;
-        let storage = ColumnStorage::new(file, disk_pool);
+        let storage = ColumnStorage::new(file, disk_pool)?;
+        debug_assert_eq!(
+            storage.secondary_index_runtimes().len(),
+            secondary_index_count
+        );
         Ok(Table { mem, storage })
     }
 

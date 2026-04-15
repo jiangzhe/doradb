@@ -1,5 +1,5 @@
 use crate::bitmap::AllocMap;
-use crate::buffer::{ReadonlyBackingFile, ReadonlyBufferPool};
+use crate::buffer::ReadonlyBufferPool;
 use crate::catalog::{TableID, table::TableMetadata};
 use crate::error::{BlockCorruptionCause, BlockKind, Error, FileKind, Result};
 use crate::file::block_integrity::{
@@ -277,11 +277,6 @@ impl TableFile {
     }
 
     #[inline]
-    pub(crate) fn readonly_backing(&self) -> ReadonlyBackingFile {
-        self.file.readonly_backing()
-    }
-
-    #[inline]
     pub(super) fn install_loaded_root(&self, active_root: ActiveRoot) -> Option<OldRoot> {
         self.file.swap_active_root(active_root)
     }
@@ -486,19 +481,17 @@ impl MutableTableFile {
     /// Write one page into the underlying table file.
     #[inline]
     pub async fn write_block(&self, block_id: BlockID, buf: DirectBuf) -> Result<()> {
-        let owner = self.file_ref().readonly_backing();
         self.file_ref()
             .file()
-            .write_block_with_owner(self.background_writes(), owner, block_id, buf)
+            .write_block(self.background_writes(), block_id, buf)
             .await
     }
 
     #[inline]
     async fn publish_root(&self, new_root: ActiveRoot) -> Result<Option<OldRoot>> {
-        let owner = self.file_ref().readonly_backing();
         self.file_ref()
             .file()
-            .publish_root_with_owner(self.background_writes(), owner, new_root)
+            .publish_root(self.background_writes(), new_root)
             .await
     }
 
@@ -568,12 +561,7 @@ impl MutableTableFile {
             let file = Arc::clone(&table_file);
             writes.push(async move {
                 file.file()
-                    .write_block_with_owner(
-                        &background_writes,
-                        file.readonly_backing(),
-                        block_id,
-                        block.buf,
-                    )
+                    .write_block(&background_writes, block_id, block.buf)
                     .await
             });
         }

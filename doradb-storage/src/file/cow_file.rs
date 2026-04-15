@@ -1,6 +1,6 @@
 use crate::bitmap::AllocMap;
+use crate::buffer::ReadonlyBufferPool;
 use crate::buffer::page::PAGE_SIZE;
-use crate::buffer::{ReadonlyBackingFile, ReadonlyBufferPool};
 use crate::error::{BlockCorruptionCause, BlockKind, Error, FileKind, Result};
 use crate::file::fs::BackgroundWriteRequest;
 use crate::file::super_block::{SUPER_BLOCK_SIZE, SuperBlock};
@@ -305,17 +305,15 @@ impl<M> CowFile<M> {
 
     /// Write one block using async direct IO.
     #[inline]
-    pub(crate) async fn write_block_with_owner(
+    pub(crate) async fn write_block(
         &self,
         background_writes: &IOClient<BackgroundWriteRequest>,
-        owner: ReadonlyBackingFile,
         block_id: BlockID,
         buf: DirectBuf,
     ) -> Result<()> {
         debug_assert!(buf.capacity() == COW_FILE_PAGE_SIZE);
         let offset = usize::from(block_id) * COW_FILE_PAGE_SIZE;
-        self.write_at_offset_with_owner(background_writes, owner, offset, buf)
-            .await
+        self.write_at_offset(background_writes, offset, buf).await
     }
 
     #[inline]
@@ -328,16 +326,15 @@ impl<M> CowFile<M> {
 
     /// Write one buffer at given byte offset.
     #[inline]
-    pub(crate) async fn write_at_offset_with_owner(
+    pub(crate) async fn write_at_offset(
         &self,
         background_writes: &IOClient<BackgroundWriteRequest>,
-        owner: ReadonlyBackingFile,
         offset: usize,
         buf: DirectBuf,
     ) -> Result<()> {
         write_direct(
             self.block_key(offset),
-            owner,
+            Arc::clone(&self.file),
             offset,
             buf,
             background_writes,
@@ -348,11 +345,6 @@ impl<M> CowFile<M> {
     #[inline]
     pub(crate) fn sparse_file(&self) -> &Arc<SparseFile> {
         &self.file
-    }
-
-    #[inline]
-    pub(crate) fn readonly_backing(&self) -> ReadonlyBackingFile {
-        ReadonlyBackingFile::new(Arc::clone(&self.file))
     }
 
     /// Replace active root with new root, returning previous-root guard if present.
@@ -424,10 +416,9 @@ impl<M> CowFile<M> {
     /// 3. write next super block slot,
     /// 4. fsync and atomically swap active root pointer.
     #[inline]
-    pub(crate) async fn publish_root_with_owner(
+    pub(crate) async fn publish_root(
         &self,
         background_writes: &IOClient<BackgroundWriteRequest>,
-        owner: ReadonlyBackingFile,
         mut new_root: ActiveRoot<M>,
     ) -> Result<Option<OldCowRoot<M>>> {
         let old_meta_block_id = new_root.meta_block_id;
@@ -442,17 +433,12 @@ impl<M> CowFile<M> {
         new_root.meta_block_id = new_meta_block_id;
 
         let meta_buf = (self.codec.build_meta_block)(&new_root)?;
-        self.write_block_with_owner(
-            background_writes,
-            owner.clone(),
-            new_meta_block_id,
-            meta_buf,
-        )
-        .await?;
+        self.write_block(background_writes, new_meta_block_id, meta_buf)
+            .await?;
 
         let super_buf = (self.codec.build_super_block)(&new_root)?;
         let offset = new_root.slot_no as usize * super_buf.capacity();
-        self.write_at_offset_with_owner(background_writes, owner, offset, super_buf)
+        self.write_at_offset(background_writes, offset, super_buf)
             .await?;
 
         self.fsync()?;

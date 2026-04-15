@@ -1,21 +1,24 @@
 //! Composite MemTree/DiskTree secondary-index core.
 //!
 //! The types in this module are the RFC 0014 phase-3 user-table core only.
-//! They group the current in-memory BTree-backed secondary index with one
-//! checkpointed secondary DiskTree root and preserve the existing unique and
-//! non-unique trait contracts without wiring the composite into table runtime.
+//! They group the current in-memory BTree-backed secondary index with the
+//! current published secondary DiskTree root and preserve the existing unique
+//! and non-unique trait contracts without wiring the composite into table
+//! runtime.
 
 #![cfg_attr(not(test), allow(dead_code))]
 
-use super::disk_tree::{NonUniqueDiskTree, UniqueDiskTree};
+use super::disk_tree::{
+    NonUniqueDiskTree, NonUniqueDiskTreeRuntime, UniqueDiskTree, UniqueDiskTreeRuntime,
+};
 use super::non_unique_index::{GenericNonUniqueBTreeIndex, NonUniqueIndex, NonUniqueMemTreeEntry};
 use super::secondary_index::{IndexCompareExchange, IndexInsert};
 use super::unique_index::{GenericUniqueBTreeIndex, UniqueIndex, UniqueMemTreeEntry};
 use crate::buffer::{BufferPool, PoolGuard, ReadonlyBufferPool};
-use crate::catalog::{IndexSpec, TableMetadata};
-use crate::error::{Error, FileKind, Result};
-use crate::file::SparseFile;
+use crate::catalog::TableMetadata;
+use crate::error::{Error, Result};
 use crate::file::cow_file::BlockID;
+use crate::file::table_file::TableFile;
 use crate::index::util::Maskable;
 use crate::quiescent::QuiescentGuard;
 use crate::row::RowID;
@@ -24,46 +27,76 @@ use crate::value::Val;
 use std::cmp::Ordering;
 use std::sync::Arc;
 
-/// Immutable cold-root context for one user-table secondary DiskTree.
+/// Runtime cold-layer opener for one user-table secondary DiskTree.
 ///
-/// The context is table-specific by construction. DiskTree readers opened from
-/// it always use `FileKind::TableFile`, and key encoders remain owned by the
-/// concrete DiskTree readers derived from table metadata.
-#[derive(Clone)]
-pub(crate) struct SecondaryDiskTreeContext {
-    root: BlockID,
+/// The runtime is table-specific by construction. Each open reads the currently
+/// published secondary root from the table file, then hands that copied root to
+/// a typed DiskTree reader. Already opened readers keep their root snapshot.
+pub(crate) struct SecondaryDiskTreeRuntime {
     index_no: usize,
-    metadata: Arc<TableMetadata>,
-    file: Arc<SparseFile>,
-    disk_pool: QuiescentGuard<ReadonlyBufferPool>,
+    table_file: Arc<TableFile>,
+    kind: SecondaryDiskTreeRuntimeKind,
 }
 
-impl SecondaryDiskTreeContext {
-    /// Create a cold-root context for one table secondary-index root.
+enum SecondaryDiskTreeRuntimeKind {
+    Unique(UniqueDiskTreeRuntime),
+    NonUnique(NonUniqueDiskTreeRuntime),
+}
+
+impl SecondaryDiskTreeRuntime {
+    /// Create a cold-layer runtime for one table secondary index.
     #[inline]
     pub(crate) fn new(
-        root: BlockID,
         index_no: usize,
         metadata: Arc<TableMetadata>,
-        file: Arc<SparseFile>,
+        table_file: Arc<TableFile>,
         disk_pool: QuiescentGuard<ReadonlyBufferPool>,
     ) -> Result<Self> {
-        if metadata.index_specs.get(index_no).is_none() {
-            return Err(Error::InvalidArgument);
-        }
-        Ok(Self {
-            root,
+        let index_spec = metadata
+            .index_specs
+            .get(index_no)
+            .ok_or(Error::InvalidArgument)?;
+        table_file
+            .active_root()
+            .secondary_index_roots
+            .get(index_no)
+            .ok_or(Error::InvalidArgument)?;
+        let file_kind = table_file.file_kind();
+        let file = Arc::clone(table_file.sparse_file());
+        let kind = if index_spec.unique() {
+            SecondaryDiskTreeRuntimeKind::Unique(UniqueDiskTreeRuntime::new(
+                index_spec,
+                metadata.as_ref(),
+                file_kind,
+                file,
+                disk_pool,
+            )?)
+        } else {
+            SecondaryDiskTreeRuntimeKind::NonUnique(NonUniqueDiskTreeRuntime::new(
+                index_spec,
+                metadata.as_ref(),
+                file_kind,
+                file,
+                disk_pool,
+            )?)
+        };
+        let runtime = Self {
             index_no,
-            metadata,
-            file,
-            disk_pool,
-        })
+            table_file,
+            kind,
+        };
+        Ok(runtime)
     }
 
-    /// Return the immutable DiskTree root snapshot held by this context.
+    /// Return the current published DiskTree root for this secondary index.
     #[inline]
-    pub(crate) fn root(&self) -> BlockID {
-        self.root
+    pub(crate) fn published_root(&self) -> Result<BlockID> {
+        self.table_file
+            .active_root()
+            .secondary_index_roots
+            .get(self.index_no)
+            .copied()
+            .ok_or(Error::InvalidArgument)
     }
 
     /// Return the table index number represented by this context.
@@ -73,100 +106,85 @@ impl SecondaryDiskTreeContext {
     }
 
     #[inline]
-    fn index_spec(&self) -> Result<&IndexSpec> {
-        self.metadata
-            .index_specs
-            .get(self.index_no)
-            .ok_or(Error::InvalidArgument)
+    pub(crate) fn is_unique(&self) -> bool {
+        matches!(self.kind, SecondaryDiskTreeRuntimeKind::Unique(_))
     }
 
     #[inline]
-    fn open_unique<'a>(&'a self, disk_pool_guard: &'a PoolGuard) -> Result<UniqueDiskTree<'a>> {
-        UniqueDiskTree::new(
-            self.root,
-            self.index_spec()?,
-            self.metadata.as_ref(),
-            FileKind::TableFile,
-            &self.file,
-            &self.disk_pool,
-            disk_pool_guard,
-        )
+    pub(crate) fn disk_pool_guard(&self) -> PoolGuard {
+        match &self.kind {
+            SecondaryDiskTreeRuntimeKind::Unique(runtime) => runtime.disk_pool_guard(),
+            SecondaryDiskTreeRuntimeKind::NonUnique(runtime) => runtime.disk_pool_guard(),
+        }
     }
 
     #[inline]
-    fn open_non_unique<'a>(
+    pub(crate) fn open_unique<'a>(
+        &'a self,
+        disk_pool_guard: &'a PoolGuard,
+    ) -> Result<UniqueDiskTree<'a>> {
+        self.open_unique_at(self.published_root()?, disk_pool_guard)
+    }
+
+    #[inline]
+    pub(crate) fn open_unique_at<'a>(
+        &'a self,
+        root_block_id: BlockID,
+        disk_pool_guard: &'a PoolGuard,
+    ) -> Result<UniqueDiskTree<'a>> {
+        match &self.kind {
+            SecondaryDiskTreeRuntimeKind::Unique(runtime) => {
+                Ok(runtime.open(root_block_id, disk_pool_guard))
+            }
+            SecondaryDiskTreeRuntimeKind::NonUnique(_) => Err(Error::InvalidArgument),
+        }
+    }
+
+    #[inline]
+    pub(crate) fn open_non_unique<'a>(
         &'a self,
         disk_pool_guard: &'a PoolGuard,
     ) -> Result<NonUniqueDiskTree<'a>> {
-        NonUniqueDiskTree::new(
-            self.root,
-            self.index_spec()?,
-            self.metadata.as_ref(),
-            FileKind::TableFile,
-            &self.file,
-            &self.disk_pool,
-            disk_pool_guard,
-        )
+        self.open_non_unique_at(self.published_root()?, disk_pool_guard)
     }
 
     #[inline]
-    async fn unique_lookup(&self, key: &[Val]) -> Result<Option<RowID>> {
-        let disk_pool_guard = self.disk_pool.pool_guard();
-        let tree = self.open_unique(&disk_pool_guard)?;
-        tree.lookup(key).await
-    }
-
-    #[inline]
-    async fn unique_scan_entries(&self) -> Result<Vec<(Vec<u8>, RowID)>> {
-        let disk_pool_guard = self.disk_pool.pool_guard();
-        let tree = self.open_unique(&disk_pool_guard)?;
-        tree.scan_entries().await
-    }
-
-    #[inline]
-    async fn non_unique_contains_exact(&self, key: &[Val], row_id: RowID) -> Result<bool> {
-        let disk_pool_guard = self.disk_pool.pool_guard();
-        let tree = self.open_non_unique(&disk_pool_guard)?;
-        tree.contains_exact(key, row_id).await
-    }
-
-    #[inline]
-    async fn non_unique_prefix_entries(&self, key: &[Val]) -> Result<Vec<(Vec<u8>, RowID)>> {
-        let disk_pool_guard = self.disk_pool.pool_guard();
-        let tree = self.open_non_unique(&disk_pool_guard)?;
-        tree.prefix_scan_entries(key).await
-    }
-
-    #[inline]
-    async fn non_unique_scan_entries(&self) -> Result<Vec<(Vec<u8>, RowID)>> {
-        let disk_pool_guard = self.disk_pool.pool_guard();
-        let tree = self.open_non_unique(&disk_pool_guard)?;
-        tree.scan_entries().await
+    pub(crate) fn open_non_unique_at<'a>(
+        &'a self,
+        root_block_id: BlockID,
+        disk_pool_guard: &'a PoolGuard,
+    ) -> Result<NonUniqueDiskTree<'a>> {
+        match &self.kind {
+            SecondaryDiskTreeRuntimeKind::Unique(_) => Err(Error::InvalidArgument),
+            SecondaryDiskTreeRuntimeKind::NonUnique(runtime) => {
+                Ok(runtime.open(root_block_id, disk_pool_guard))
+            }
+        }
     }
 }
 
 /// Composite unique secondary index over a mutable MemTree and cold DiskTree.
 pub(crate) struct DualTreeUniqueIndex<P: 'static> {
     mem: GenericUniqueBTreeIndex<P>,
-    disk: SecondaryDiskTreeContext,
+    disk: SecondaryDiskTreeRuntime,
 }
 
 impl<P: BufferPool> DualTreeUniqueIndex<P> {
-    /// Create a composite unique index from an existing MemTree and cold root.
+    /// Create a composite unique index from an existing MemTree and DiskTree runtime.
     #[inline]
     pub(crate) fn new(
         mem: GenericUniqueBTreeIndex<P>,
-        disk: SecondaryDiskTreeContext,
+        disk: SecondaryDiskTreeRuntime,
     ) -> Result<Self> {
-        if !disk.index_spec()?.unique() {
+        if !disk.is_unique() {
             return Err(Error::InvalidArgument);
         }
         Ok(Self { mem, disk })
     }
 
-    /// Return the immutable cold-root context used by this composite.
+    /// Return the cold DiskTree runtime used by this composite.
     #[inline]
-    pub(crate) fn disk(&self) -> &SecondaryDiskTreeContext {
+    pub(crate) fn disk(&self) -> &SecondaryDiskTreeRuntime {
         &self.disk
     }
 
@@ -188,11 +206,9 @@ impl<P: BufferPool + 'static> UniqueIndex for DualTreeUniqueIndex<P> {
         if let Some(hit) = self.mem.lookup(pool_guard, key, ts).await? {
             return Ok(Some(hit));
         }
-        Ok(self
-            .disk
-            .unique_lookup(key)
-            .await?
-            .map(|row_id| (row_id, false)))
+        let disk_pool_guard = self.disk.disk_pool_guard();
+        let disk = self.disk.open_unique(&disk_pool_guard)?;
+        Ok(disk.lookup(key).await?.map(|row_id| (row_id, false)))
     }
 
     #[inline]
@@ -214,7 +230,9 @@ impl<P: BufferPool + 'static> UniqueIndex for DualTreeUniqueIndex<P> {
             }
             return Ok(IndexInsert::DuplicateKey(old_row_id, deleted));
         }
-        if let Some(cold_row_id) = self.disk.unique_lookup(key).await? {
+        let disk_pool_guard = self.disk.disk_pool_guard();
+        let disk = self.disk.open_unique(&disk_pool_guard)?;
+        if let Some(cold_row_id) = disk.lookup(key).await? {
             return Ok(IndexInsert::DuplicateKey(cold_row_id, false));
         }
         self.mem
@@ -238,7 +256,9 @@ impl<P: BufferPool + 'static> UniqueIndex for DualTreeUniqueIndex<P> {
                 .compare_delete(pool_guard, key, old_row_id, ignore_del_mask, ts)
                 .await;
         }
-        match self.disk.unique_lookup(key).await? {
+        let disk_pool_guard = self.disk.disk_pool_guard();
+        let disk = self.disk.open_unique(&disk_pool_guard)?;
+        match disk.lookup(key).await? {
             Some(cold_row_id) => Ok(cold_row_id == old_row_id),
             None => Ok(true),
         }
@@ -259,7 +279,9 @@ impl<P: BufferPool + 'static> UniqueIndex for DualTreeUniqueIndex<P> {
                 .compare_exchange(pool_guard, key, old_row_id, new_row_id, ts)
                 .await;
         }
-        match self.disk.unique_lookup(key).await? {
+        let disk_pool_guard = self.disk.disk_pool_guard();
+        let disk = self.disk.open_unique(&disk_pool_guard)?;
+        match disk.lookup(key).await? {
             Some(cold_row_id) if cold_row_id == old_row_id => {
                 if self
                     .mem
@@ -284,7 +306,9 @@ impl<P: BufferPool + 'static> UniqueIndex for DualTreeUniqueIndex<P> {
         _ts: TrxID,
     ) -> Result<()> {
         let mem_entries = self.mem.scan_encoded_entries(pool_guard).await?;
-        let disk_entries = self.disk.unique_scan_entries().await?;
+        let disk_pool_guard = self.disk.disk_pool_guard();
+        let disk = self.disk.open_unique(&disk_pool_guard)?;
+        let disk_entries = disk.scan_entries().await?;
         merge_unique_entries(&mem_entries, &disk_entries, values);
         Ok(())
     }
@@ -293,25 +317,25 @@ impl<P: BufferPool + 'static> UniqueIndex for DualTreeUniqueIndex<P> {
 /// Composite non-unique secondary index over a mutable MemTree and cold DiskTree.
 pub(crate) struct DualTreeNonUniqueIndex<P: 'static> {
     mem: GenericNonUniqueBTreeIndex<P>,
-    disk: SecondaryDiskTreeContext,
+    disk: SecondaryDiskTreeRuntime,
 }
 
 impl<P: BufferPool> DualTreeNonUniqueIndex<P> {
-    /// Create a composite non-unique index from an existing MemTree and cold root.
+    /// Create a composite non-unique index from an existing MemTree and DiskTree runtime.
     #[inline]
     pub(crate) fn new(
         mem: GenericNonUniqueBTreeIndex<P>,
-        disk: SecondaryDiskTreeContext,
+        disk: SecondaryDiskTreeRuntime,
     ) -> Result<Self> {
-        if disk.index_spec()?.unique() {
+        if disk.is_unique() {
             return Err(Error::InvalidArgument);
         }
         Ok(Self { mem, disk })
     }
 
-    /// Return the immutable cold-root context used by this composite.
+    /// Return the cold DiskTree runtime used by this composite.
     #[inline]
-    pub(crate) fn disk(&self) -> &SecondaryDiskTreeContext {
+    pub(crate) fn disk(&self) -> &SecondaryDiskTreeRuntime {
         &self.disk
     }
 
@@ -332,7 +356,9 @@ impl<P: BufferPool + 'static> NonUniqueIndex for DualTreeNonUniqueIndex<P> {
         _ts: TrxID,
     ) -> Result<()> {
         let mem_entries = self.mem.lookup_encoded_entries(pool_guard, key).await?;
-        let disk_entries = self.disk.non_unique_prefix_entries(key).await?;
+        let disk_pool_guard = self.disk.disk_pool_guard();
+        let disk = self.disk.open_non_unique(&disk_pool_guard)?;
+        let disk_entries = disk.prefix_scan_entries(key).await?;
         merge_non_unique_entries(&mem_entries, &disk_entries, res);
         Ok(())
     }
@@ -348,7 +374,9 @@ impl<P: BufferPool + 'static> NonUniqueIndex for DualTreeNonUniqueIndex<P> {
         if let Some(mem_hit) = self.mem.lookup_unique(pool_guard, key, row_id, ts).await? {
             return Ok(Some(mem_hit));
         }
-        if self.disk.non_unique_contains_exact(key, row_id).await? {
+        let disk_pool_guard = self.disk.disk_pool_guard();
+        let disk = self.disk.open_non_unique(&disk_pool_guard)?;
+        if disk.contains_exact(key, row_id).await? {
             Ok(Some(true))
         } else {
             Ok(None)
@@ -374,7 +402,9 @@ impl<P: BufferPool + 'static> NonUniqueIndex for DualTreeNonUniqueIndex<P> {
             }
             return Ok(IndexInsert::DuplicateKey(row_id, !active));
         }
-        if self.disk.non_unique_contains_exact(key, row_id).await? {
+        let disk_pool_guard = self.disk.disk_pool_guard();
+        let disk = self.disk.open_non_unique(&disk_pool_guard)?;
+        if disk.contains_exact(key, row_id).await? {
             return Ok(IndexInsert::DuplicateKey(row_id, false));
         }
         self.mem
@@ -395,7 +425,9 @@ impl<P: BufferPool + 'static> NonUniqueIndex for DualTreeNonUniqueIndex<P> {
             Some(true) => self.mem.mask_as_deleted(pool_guard, key, row_id, ts).await,
             Some(false) => Ok(false),
             None => {
-                if self.disk.non_unique_contains_exact(key, row_id).await? {
+                let disk_pool_guard = self.disk.disk_pool_guard();
+                let disk = self.disk.open_non_unique(&disk_pool_guard)?;
+                if disk.contains_exact(key, row_id).await? {
                     self.mem
                         .insert_delete_overlay_if_absent(pool_guard, key, row_id, ts)
                         .await
@@ -449,7 +481,9 @@ impl<P: BufferPool + 'static> NonUniqueIndex for DualTreeNonUniqueIndex<P> {
         _ts: TrxID,
     ) -> Result<()> {
         let mem_entries = self.mem.scan_encoded_entries(pool_guard).await?;
-        let disk_entries = self.disk.non_unique_scan_entries().await?;
+        let disk_pool_guard = self.disk.disk_pool_guard();
+        let disk = self.disk.open_non_unique(&disk_pool_guard)?;
+        let disk_entries = disk.scan_entries().await?;
         merge_non_unique_entries(&mem_entries, &disk_entries, values);
         Ok(())
     }
@@ -583,10 +617,10 @@ mod tests {
     use crate::buffer::{
         FixedBufferPool, PoolGuard, PoolRole, global_readonly_pool_scope, table_readonly_pool,
     };
-    use crate::catalog::{ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey};
+    use crate::catalog::{ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexSpec};
     use crate::file::build_test_fs;
     use crate::file::cow_file::SUPER_BLOCK_ID;
-    use crate::file::table_file::MutableTableFile;
+    use crate::file::table_file::{MutableTableFile, TableFile};
     use crate::index::btree::BTree;
     use crate::index::btree_key::BTreeKeyEncoder;
     use crate::index::disk_tree::{NonUniqueDiskTreeExact, UniqueDiskTreePut};
@@ -640,6 +674,49 @@ mod tests {
         )
     }
 
+    async fn publish_secondary_root(
+        mut mutable: MutableTableFile,
+        index_no: usize,
+        root: BlockID,
+        ts: TrxID,
+    ) -> Arc<TableFile> {
+        mutable
+            .set_secondary_index_root(index_no, root)
+            .expect("test secondary root publication should accept index number");
+        let (table, old_root) = mutable
+            .commit(ts, false)
+            .await
+            .expect("test secondary root publication should commit");
+        drop(old_root);
+        table
+    }
+
+    macro_rules! unique_runtime {
+        ($metadata:ident, $disk_pool:ident) => {
+            UniqueDiskTreeRuntime::new(
+                &$metadata.index_specs[0],
+                $metadata.as_ref(),
+                $disk_pool.file_kind(),
+                Arc::clone($disk_pool.sparse_file()),
+                $disk_pool.global_pool().clone(),
+            )
+            .unwrap()
+        };
+    }
+
+    macro_rules! non_unique_runtime {
+        ($metadata:ident, $disk_pool:ident) => {
+            NonUniqueDiskTreeRuntime::new(
+                &$metadata.index_specs[1],
+                $metadata.as_ref(),
+                $disk_pool.file_kind(),
+                Arc::clone($disk_pool.sparse_file()),
+                $disk_pool.global_pool().clone(),
+            )
+            .unwrap()
+        };
+    }
+
     #[test]
     fn test_unique_dual_tree_method_semantics() {
         smol::block_on(async {
@@ -654,16 +731,8 @@ mod tests {
             let disk_pool = table_readonly_pool(&global, 611, &table);
             let disk_guard = disk_pool.pool_guard();
             let mut mutable = MutableTableFile::fork(&table, fs.background_writes());
-            let disk = UniqueDiskTree::new(
-                SUPER_BLOCK_ID,
-                &metadata.index_specs[0],
-                &metadata,
-                FileKind::TableFile,
-                disk_pool.sparse_file(),
-                disk_pool.global_pool(),
-                &disk_guard,
-            )
-            .unwrap();
+            let disk_runtime = unique_runtime!(metadata, disk_pool);
+            let disk = disk_runtime.open(SUPER_BLOCK_ID, &disk_guard);
             let key1 = [Val::from(1u32)];
             let key2 = [Val::from(2u32)];
             let key3 = [Val::from(3u32)];
@@ -692,6 +761,7 @@ mod tests {
                 ])
                 .unwrap();
             let root = writer.finish().await.unwrap();
+            let table = publish_secondary_root(mutable, 0, root, 2).await;
 
             let index_pool = QuiescentBox::new(
                 FixedBufferPool::with_capacity(PoolRole::Index, 64 * 1024 * 1024).unwrap(),
@@ -704,17 +774,16 @@ mod tests {
                     .unwrap()
                     .is_ok()
             );
-            let context = SecondaryDiskTreeContext::new(
-                root,
+            let runtime = SecondaryDiskTreeRuntime::new(
                 0,
                 Arc::clone(&metadata),
-                Arc::clone(disk_pool.sparse_file()),
+                Arc::clone(&table),
                 disk_pool.global_pool().clone(),
             )
             .unwrap();
-            let index = DualTreeUniqueIndex::new(mem, context).unwrap();
+            let index = DualTreeUniqueIndex::new(mem, runtime).unwrap();
 
-            assert_eq!(index.disk().root(), root);
+            assert_eq!(index.disk().published_root().unwrap(), root);
             assert_eq!(index.disk().index_no(), 0);
             assert!(
                 index
@@ -798,19 +867,81 @@ mod tests {
                 .unwrap();
             assert_eq!(values, vec![100, 200, 30u64.deleted(), 40, 50]);
 
-            let unchanged_disk = UniqueDiskTree::new(
-                root,
-                &metadata.index_specs[0],
-                &metadata,
-                FileKind::TableFile,
-                disk_pool.sparse_file(),
-                disk_pool.global_pool(),
-                &disk_guard,
-            )
-            .unwrap();
+            let unchanged_disk = disk_runtime.open(root, &disk_guard);
             assert_eq!(unchanged_disk.lookup(&key2).await.unwrap(), Some(20));
             assert_eq!(unchanged_disk.lookup(&key3).await.unwrap(), Some(30));
             assert_eq!(unchanged_disk.lookup(&key4).await.unwrap(), Some(40));
+        });
+    }
+
+    #[test]
+    fn test_disk_runtime_resolves_published_root_per_open() {
+        smol::block_on(async {
+            let (_temp_dir, fs) = build_test_fs();
+            let metadata = metadata_with_indexes();
+            let table = fs
+                .create_table_file(614, Arc::clone(&metadata), false)
+                .unwrap();
+            let (table, old_root) = table.commit(1, false).await.unwrap();
+            drop(old_root);
+            let global = global_readonly_pool_scope(64 * 1024 * 1024);
+            let disk_pool = table_readonly_pool(&global, 614, &table);
+            let disk_guard = disk_pool.pool_guard();
+            let key1 = [Val::from(1u32)];
+            let key2 = [Val::from(2u32)];
+
+            let mut mutable = MutableTableFile::fork(&table, fs.background_writes());
+            let disk_runtime = unique_runtime!(metadata, disk_pool);
+            let disk = disk_runtime.open(SUPER_BLOCK_ID, &disk_guard);
+            let root_a = {
+                let mut writer = disk.batch_writer(&mut mutable, 2);
+                writer
+                    .batch_put(&[UniqueDiskTreePut {
+                        key: &key1,
+                        row_id: 10,
+                    }])
+                    .unwrap();
+                writer.finish().await.unwrap()
+            };
+            let table = publish_secondary_root(mutable, 0, root_a, 2).await;
+            let runtime = SecondaryDiskTreeRuntime::new(
+                0,
+                Arc::clone(&metadata),
+                Arc::clone(&table),
+                disk_pool.global_pool().clone(),
+            )
+            .unwrap();
+            assert_eq!(runtime.published_root().unwrap(), root_a);
+
+            let opened_a_guard = runtime.disk_pool_guard();
+            let opened_a = runtime.open_unique(&opened_a_guard).unwrap();
+            assert_eq!(opened_a.lookup(&key1).await.unwrap(), Some(10));
+            assert_eq!(opened_a.lookup(&key2).await.unwrap(), None);
+
+            let mut mutable = MutableTableFile::fork(&table, fs.background_writes());
+            let disk = disk_runtime.open(root_a, &disk_guard);
+            let root_b = {
+                let mut writer = disk.batch_writer(&mut mutable, 3);
+                writer
+                    .batch_put(&[UniqueDiskTreePut {
+                        key: &key2,
+                        row_id: 20,
+                    }])
+                    .unwrap();
+                writer.finish().await.unwrap()
+            };
+            assert_ne!(root_a, root_b);
+            let table_after_b = publish_secondary_root(mutable, 0, root_b, 3).await;
+            assert_eq!(table_after_b.active_root().secondary_index_roots[0], root_b);
+            assert_eq!(runtime.published_root().unwrap(), root_b);
+
+            assert_eq!(opened_a.lookup(&key1).await.unwrap(), Some(10));
+            assert_eq!(opened_a.lookup(&key2).await.unwrap(), None);
+
+            let opened_b_guard = runtime.disk_pool_guard();
+            let opened_b = runtime.open_unique(&opened_b_guard).unwrap();
+            assert_eq!(opened_b.lookup(&key1).await.unwrap(), Some(10));
+            assert_eq!(opened_b.lookup(&key2).await.unwrap(), Some(20));
         });
     }
 
@@ -828,16 +959,8 @@ mod tests {
             let disk_pool = table_readonly_pool(&global, 612, &table);
             let disk_guard = disk_pool.pool_guard();
             let mut mutable = MutableTableFile::fork(&table, fs.background_writes());
-            let disk = NonUniqueDiskTree::new(
-                SUPER_BLOCK_ID,
-                &metadata.index_specs[1],
-                &metadata,
-                FileKind::TableFile,
-                disk_pool.sparse_file(),
-                disk_pool.global_pool(),
-                &disk_guard,
-            )
-            .unwrap();
+            let disk_runtime = non_unique_runtime!(metadata, disk_pool);
+            let disk = disk_runtime.open(SUPER_BLOCK_ID, &disk_guard);
             let key1 = [Val::from(1u32)];
             let key2 = [Val::from(2u32)];
             let key3 = [Val::from(3u32)];
@@ -863,6 +986,7 @@ mod tests {
                 ])
                 .unwrap();
             let root = writer.finish().await.unwrap();
+            let table = publish_secondary_root(mutable, 1, root, 2).await;
 
             let index_pool = QuiescentBox::new(
                 FixedBufferPool::with_capacity(PoolRole::Index, 64 * 1024 * 1024).unwrap(),
@@ -875,17 +999,16 @@ mod tests {
                     .unwrap()
                     .is_ok()
             );
-            let context = SecondaryDiskTreeContext::new(
-                root,
+            let runtime = SecondaryDiskTreeRuntime::new(
                 1,
                 Arc::clone(&metadata),
-                Arc::clone(disk_pool.sparse_file()),
+                Arc::clone(&table),
                 disk_pool.global_pool().clone(),
             )
             .unwrap();
-            let index = DualTreeNonUniqueIndex::new(mem, context).unwrap();
+            let index = DualTreeNonUniqueIndex::new(mem, runtime).unwrap();
 
-            assert_eq!(index.disk().root(), root);
+            assert_eq!(index.disk().published_root().unwrap(), root);
             assert_eq!(index.disk().index_no(), 1);
             assert!(
                 index
@@ -974,16 +1097,7 @@ mod tests {
                 .unwrap();
             assert_eq!(values, vec![10, 11, 12, 13, 30]);
 
-            let unchanged_disk = NonUniqueDiskTree::new(
-                root,
-                &metadata.index_specs[1],
-                &metadata,
-                FileKind::TableFile,
-                disk_pool.sparse_file(),
-                disk_pool.global_pool(),
-                &disk_guard,
-            )
-            .unwrap();
+            let unchanged_disk = disk_runtime.open(root, &disk_guard);
             assert_eq!(
                 unchanged_disk.prefix_scan(&key1).await.unwrap(),
                 vec![10, 11]
@@ -1015,30 +1129,28 @@ mod tests {
                     .await
                     .unwrap()
             );
-            let context = SecondaryDiskTreeContext::new(
-                SUPER_BLOCK_ID,
+            let runtime = SecondaryDiskTreeRuntime::new(
                 0,
                 Arc::clone(&metadata),
-                Arc::clone(disk_pool.sparse_file()),
+                Arc::clone(&table),
                 disk_pool.global_pool().clone(),
             )
             .unwrap();
             let composite =
-                DualTreeSecondaryIndex::Unique(DualTreeUniqueIndex::new(mem, context).unwrap());
+                DualTreeSecondaryIndex::Unique(DualTreeUniqueIndex::new(mem, runtime).unwrap());
             assert!(composite.is_unique());
             assert_eq!(composite.index_no(), 0);
 
             let mem = non_unique_mem_index(&index_pool, &index_guard).await;
-            let context = SecondaryDiskTreeContext::new(
-                SUPER_BLOCK_ID,
+            let runtime = SecondaryDiskTreeRuntime::new(
                 1,
                 Arc::clone(&metadata),
-                Arc::clone(disk_pool.sparse_file()),
+                Arc::clone(&table),
                 disk_pool.global_pool().clone(),
             )
             .unwrap();
             let composite = DualTreeSecondaryIndex::NonUnique(
-                DualTreeNonUniqueIndex::new(mem, context).unwrap(),
+                DualTreeNonUniqueIndex::new(mem, runtime).unwrap(),
             );
             assert!(!composite.is_unique());
             assert_eq!(composite.index_no(), 1);
