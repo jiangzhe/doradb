@@ -16,17 +16,18 @@ pub trait BTreeSlotCallback {
     /// so it's not suitable to perform blocking operations here and
     /// caller should prevent dead-lock(recursively searching on the
     /// same tree should be avoided).
-    /// Returns true if the scan should continue. Otherwise, stop.
-    fn apply(&mut self, node: &BTreeNode, slot: &BTreeSlot) -> bool;
+    /// Returns `Ok(true)` if the scan should continue, `Ok(false)` if it
+    /// should stop cleanly, or `Err` if slot processing fails.
+    fn apply(&mut self, node: &BTreeNode, slot: &BTreeSlot) -> Result<bool>;
 }
 
 /// Convenient blank implemtation of support scan callback.
 impl<F> BTreeSlotCallback for F
 where
-    F: FnMut(&BTreeNode, &BTreeSlot) -> bool,
+    F: FnMut(&BTreeNode, &BTreeSlot) -> Result<bool>,
 {
     #[inline]
-    fn apply(&mut self, node: &BTreeNode, slot: &BTreeSlot) -> bool {
+    fn apply(&mut self, node: &BTreeNode, slot: &BTreeSlot) -> Result<bool> {
         self(node, slot)
     }
 }
@@ -80,7 +81,7 @@ impl<'a, C: BTreeSlotCallback, P: BufferPool> BTreePrefixScan<'a, C, P> {
         let start_idx = match first_node.search_key(key) {
             Ok(idx) => {
                 let slot = first_node.slot(idx);
-                let res = self.callback.apply(first_node, slot);
+                let res = self.callback.apply(first_node, slot)?;
                 if !res {
                     return Ok(());
                 }
@@ -92,7 +93,7 @@ impl<'a, C: BTreeSlotCallback, P: BufferPool> BTreePrefixScan<'a, C, P> {
         for idx in start_idx..first_node.count() {
             let slot = first_node.slot(idx);
             if first_node.slot_matches_k(slot, k) {
-                let res = self.callback.apply(first_node, slot);
+                let res = self.callback.apply(first_node, slot)?;
                 if !res {
                     return Ok(());
                 }
@@ -122,7 +123,7 @@ impl<'a, C: BTreeSlotCallback, P: BufferPool> BTreePrefixScan<'a, C, P> {
             let k = &key[node.prefix_len()..];
             for slot in node.slots() {
                 if node.slot_matches_k(slot, k) {
-                    let res = self.callback.apply(node, slot);
+                    let res = self.callback.apply(node, slot)?;
                     if !res {
                         return Ok(());
                     }
@@ -146,6 +147,7 @@ impl<'a, C: BTreeSlotCallback, P: BufferPool> BTreePrefixScan<'a, C, P> {
 mod tests {
     use super::*;
     use crate::buffer::FixedBufferPool;
+    use crate::error::Error;
     use crate::index::btree::BTree;
     use crate::index::btree_value::BTreeU64;
     use crate::quiescent::QuiescentBox;
@@ -275,9 +277,42 @@ mod tests {
 
     impl BTreeSlotCallback for Count {
         #[inline]
-        fn apply(&mut self, _: &BTreeNode, _: &BTreeSlot) -> bool {
+        fn apply(&mut self, _: &BTreeNode, _: &BTreeSlot) -> Result<bool> {
             self.0 += 1;
-            true
+            Ok(true)
         }
+    }
+
+    struct FailOnFirstSlot;
+
+    impl BTreeSlotCallback for FailOnFirstSlot {
+        #[inline]
+        fn apply(&mut self, _: &BTreeNode, _: &BTreeSlot) -> Result<bool> {
+            Err(Error::InvalidState)
+        }
+    }
+
+    #[test]
+    fn test_btree_scan_propagates_callback_error() {
+        smol::block_on(async {
+            let pool = QuiescentBox::new(
+                FixedBufferPool::with_capacity(crate::buffer::PoolRole::Index, 64 * 1024 * 1024)
+                    .unwrap(),
+            );
+            let pool_guard = (*pool).pool_guard();
+            let tree = BTree::new(pool.guard(), &pool_guard, true, 200)
+                .await
+                .expect("test btree construction should succeed");
+            tree.insert(&pool_guard, b"a", BTreeU64::from(1), false, 100)
+                .await
+                .expect("test btree insert should succeed");
+
+            let mut scanner = tree.prefix_scanner(&pool_guard, FailOnFirstSlot);
+            let err = scanner
+                .scan_prefix(b"a")
+                .await
+                .expect_err("callback error should abort the scan");
+            assert!(matches!(err, Error::InvalidState));
+        });
     }
 }

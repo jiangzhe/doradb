@@ -91,7 +91,7 @@ pub(crate) struct NonUniqueDiskTreeEncodedExact<'a> {
 /// Unique entries carry a row-id owner. Non-unique entries store only the
 /// encoded exact key, including the row-id suffix.
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct LogicalEntry {
+pub(crate) struct LogicalEntry {
     key: Vec<u8>,
     row_id: Option<RowID>,
 }
@@ -226,7 +226,7 @@ enum DiskTreeOperationKind {
 /// The key is already encoded in durable B-tree order. Batch writers normalize
 /// logical inputs before constructing this representation.
 #[derive(Clone, Debug)]
-struct DiskTreeOperation {
+pub(crate) struct DiskTreeOperation {
     key: Vec<u8>,
     kind: DiskTreeOperationKind,
 }
@@ -237,7 +237,7 @@ struct DiskTreeOperation {
 /// branches contain child block ids, and blocks are validated as `BTreeNode`
 /// images. This trait defines the leaf value type and how logical entries are
 /// interpreted for each durable secondary-index contract.
-trait DiskTreeSpec: Copy + 'static {
+pub(crate) trait DiskTreeSpec: Copy + 'static {
     /// Value encoded in leaf slots.
     ///
     /// Unique trees use `BTreeU64` row-id owners. Non-unique trees use
@@ -268,7 +268,7 @@ trait DiskTreeSpec: Copy + 'static {
 
 /// Unique DiskTree specialization: encoded logical key -> latest owner `RowID`.
 #[derive(Clone, Copy)]
-struct UniqueDiskTreeSpec;
+pub(crate) struct UniqueDiskTreeSpec;
 
 impl DiskTreeSpec for UniqueDiskTreeSpec {
     type LeafValue = BTreeU64;
@@ -344,7 +344,7 @@ impl DiskTreeSpec for UniqueDiskTreeSpec {
 /// The row id is appended to the encoded logical key, so no leaf value bytes are
 /// needed and no durable delete mask exists.
 #[derive(Clone, Copy)]
-struct NonUniqueDiskTreeSpec;
+pub(crate) struct NonUniqueDiskTreeSpec;
 
 impl DiskTreeSpec for NonUniqueDiskTreeSpec {
     type LeafValue = BTreeNil;
@@ -600,44 +600,130 @@ fn validate_sorted_non_unique_exact_keys(
     Ok(())
 }
 
+/// Fixed runtime shape shared by root snapshots of one persisted DiskTree.
+///
+/// The runtime owns the shape and IO context that do not change when a
+/// checkpoint publishes a new root. Individual [`DiskTree`] snapshots borrow it
+/// and supply the root block id that was current when they were opened.
+pub(crate) struct DiskTreeRuntime<F: DiskTreeSpec> {
+    file_kind: FileKind,
+    file: Arc<SparseFile>,
+    disk_pool: QuiescentGuard<ReadonlyBufferPool>,
+    encoder: BTreeKeyEncoder,
+    _marker: PhantomData<F>,
+}
+
+impl<F: DiskTreeSpec> DiskTreeRuntime<F> {
+    #[inline]
+    fn from_shape(
+        encoder: BTreeKeyEncoder,
+        file_kind: FileKind,
+        file: Arc<SparseFile>,
+        disk_pool: QuiescentGuard<ReadonlyBufferPool>,
+    ) -> Self {
+        Self {
+            file_kind,
+            file,
+            disk_pool,
+            encoder,
+            _marker: PhantomData,
+        }
+    }
+
+    /// Open a typed view over one root snapshot.
+    ///
+    /// `SUPER_BLOCK_ID` is accepted here and interpreted by read/write paths as
+    /// the empty tree sentinel.
+    #[inline]
+    pub(crate) fn open<'a>(
+        &'a self,
+        root_block_id: BlockID,
+        disk_pool_guard: &'a PoolGuard,
+    ) -> DiskTree<'a, F> {
+        DiskTree::from_root_snapshot(root_block_id, self, disk_pool_guard)
+    }
+
+    #[inline]
+    pub(crate) fn disk_pool_guard(&self) -> PoolGuard {
+        self.disk_pool.pool_guard()
+    }
+}
+
+/// Fixed runtime shape for persisted unique secondary DiskTrees.
+pub(crate) type UniqueDiskTreeRuntime = DiskTreeRuntime<UniqueDiskTreeSpec>;
+
+impl UniqueDiskTreeRuntime {
+    /// Create a reusable unique DiskTree runtime for one index shape.
+    #[inline]
+    pub(crate) fn new(
+        index_spec: &IndexSpec,
+        metadata: &TableMetadata,
+        file_kind: FileKind,
+        file: Arc<SparseFile>,
+        disk_pool: QuiescentGuard<ReadonlyBufferPool>,
+    ) -> Result<Self> {
+        if !index_spec.unique() {
+            return Err(Error::InvalidArgument);
+        }
+        let encoder = BTreeKeyEncoder::new(index_key_types(metadata, index_spec, false)?);
+        Ok(Self::from_shape(encoder, file_kind, file, disk_pool))
+    }
+}
+
+/// Fixed runtime shape for persisted non-unique secondary DiskTrees.
+pub(crate) type NonUniqueDiskTreeRuntime = DiskTreeRuntime<NonUniqueDiskTreeSpec>;
+
+impl NonUniqueDiskTreeRuntime {
+    /// Create a reusable non-unique DiskTree runtime for one index shape.
+    #[inline]
+    pub(crate) fn new(
+        index_spec: &IndexSpec,
+        metadata: &TableMetadata,
+        file_kind: FileKind,
+        file: Arc<SparseFile>,
+        disk_pool: QuiescentGuard<ReadonlyBufferPool>,
+    ) -> Result<Self> {
+        if index_spec.unique() {
+            return Err(Error::InvalidArgument);
+        }
+        let encoder = BTreeKeyEncoder::new(index_key_types(metadata, index_spec, true)?);
+        Ok(Self::from_shape(encoder, file_kind, file, disk_pool))
+    }
+}
+
 /// Shared root-snapshot view over one persisted DiskTree.
 ///
 /// The view is immutable: reads use the readonly buffer pool, while writes build
 /// replacement CoW blocks through a mutable table-file fork and return a new root
 /// block id for the caller to publish later.
-struct DiskTree<'a, F: DiskTreeSpec> {
+pub(crate) struct DiskTree<'a, F: DiskTreeSpec> {
     root_block_id: BlockID,
-    file_kind: FileKind,
-    file: &'a Arc<SparseFile>,
-    disk_pool: &'a QuiescentGuard<ReadonlyBufferPool>,
+    runtime: &'a DiskTreeRuntime<F>,
     disk_pool_guard: &'a PoolGuard,
-    encoder: BTreeKeyEncoder,
-    _marker: PhantomData<F>,
 }
 
 impl<'a, F: DiskTreeSpec> DiskTree<'a, F> {
-    /// Create a typed view over one root snapshot.
-    ///
-    /// `SUPER_BLOCK_ID` is accepted here and interpreted by read/write paths as
-    /// the empty tree sentinel.
     #[inline]
-    fn new(
+    fn from_root_snapshot(
         root_block_id: BlockID,
-        encoder: BTreeKeyEncoder,
-        file_kind: FileKind,
-        file: &'a Arc<SparseFile>,
-        disk_pool: &'a QuiescentGuard<ReadonlyBufferPool>,
+        runtime: &'a DiskTreeRuntime<F>,
         disk_pool_guard: &'a PoolGuard,
     ) -> Self {
         Self {
             root_block_id,
-            file_kind,
-            file,
-            disk_pool,
+            runtime,
             disk_pool_guard,
-            encoder,
-            _marker: PhantomData,
         }
+    }
+
+    #[inline]
+    fn encoder(&self) -> &BTreeKeyEncoder {
+        &self.runtime.encoder
+    }
+
+    #[inline]
+    fn file_kind(&self) -> FileKind {
+        self.runtime.file_kind
     }
 
     /// Read and validate one persisted block as a DiskTree node.
@@ -647,10 +733,11 @@ impl<'a, F: DiskTreeSpec> DiskTree<'a, F> {
     #[inline]
     async fn read_node(&self, block_id: BlockID) -> Result<ValidatedDiskTreeNode<F>> {
         let guard = self
+            .runtime
             .disk_pool
             .read_validated_block(
-                self.file_kind,
-                self.file,
+                self.runtime.file_kind,
+                &self.runtime.file,
                 self.disk_pool_guard,
                 block_id,
                 F::validate_persisted_block,
@@ -676,7 +763,7 @@ impl<'a, F: DiskTreeSpec> DiskTree<'a, F> {
             let node = guard.node();
             if node.is_leaf() {
                 return match node.search_key(key) {
-                    Ok(idx) => Ok(Some(F::leaf_entry(node, idx, self.file_kind, block_id)?)),
+                    Ok(idx) => Ok(Some(F::leaf_entry(node, idx, self.file_kind(), block_id)?)),
                     Err(_) => Ok(None),
                 };
             }
@@ -703,20 +790,64 @@ impl<'a, F: DiskTreeSpec> DiskTree<'a, F> {
             let node = guard.node();
             if node.is_leaf() {
                 for idx in 0..node.count() {
-                    let entry = F::leaf_entry(node, idx, self.file_kind, block_id)?;
+                    let entry = F::leaf_entry(node, idx, self.file_kind(), block_id)?;
                     if entries.last().is_some_and(|prev| prev.key >= entry.key) {
-                        return Err(invalid_node_payload(self.file_kind, block_id));
+                        return Err(invalid_node_payload(self.file_kind(), block_id));
                     }
                     entries.push(entry);
                 }
             } else {
-                let branch_entries = branch_entries_from_node(node, self.file_kind, block_id)?;
+                let branch_entries = branch_entries_from_node(node, self.file_kind(), block_id)?;
                 for entry in branch_entries.into_iter().rev() {
                     stack.push(entry.block_id);
                 }
             }
         }
         Ok(entries)
+    }
+
+    /// Visit logical entries from the first key greater than or equal to
+    /// `start_key`, stopping when the visitor returns `false`.
+    async fn scan_entries_from<V>(&self, start_key: &[u8], mut visitor: V) -> Result<()>
+    where
+        V: FnMut(LogicalEntry) -> Result<bool>,
+    {
+        if self.root_block_id == SUPER_BLOCK_ID {
+            return Ok(());
+        }
+        let mut stack = vec![self.root_block_id];
+        let mut last_key: Option<Vec<u8>> = None;
+        while let Some(block_id) = stack.pop() {
+            let guard = self.read_node(block_id).await?;
+            let node = guard.node();
+            if node.is_leaf() {
+                for idx in node.lower_bound_slot_idx(start_key)..node.count() {
+                    let entry = F::leaf_entry(node, idx, self.file_kind(), block_id)?;
+                    if last_key
+                        .as_ref()
+                        .is_some_and(|prev| prev.as_slice() >= entry.key.as_slice())
+                    {
+                        return Err(invalid_node_payload(self.file_kind(), block_id));
+                    }
+                    last_key = Some(entry.key.clone());
+                    if !visitor(entry)? {
+                        return Ok(());
+                    }
+                }
+            } else {
+                let start_idx = node
+                    .lower_bound_child_entry_idx(start_key)
+                    .ok_or_else(|| invalid_node_payload(self.file_kind(), block_id))?;
+                let branch_entries = branch_entries_from_node(node, self.file_kind(), block_id)?;
+                if start_idx >= branch_entries.len() {
+                    return Err(invalid_node_payload(self.file_kind(), block_id));
+                }
+                for entry in branch_entries.into_iter().skip(start_idx).rev() {
+                    stack.push(entry.block_id);
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Rewrite the touched CoW paths and return the replacement root block id.
@@ -773,7 +904,7 @@ impl<'a, F: DiskTreeSpec> DiskTree<'a, F> {
                 // the spec's logical entry form before applying batch semantics.
                 let mut entries = Vec::with_capacity(node.count());
                 for idx in 0..node.count() {
-                    entries.push(F::leaf_entry(node, idx, self.file_kind, block_id)?);
+                    entries.push(F::leaf_entry(node, idx, self.file_kind(), block_id)?);
                 }
                 let entries = F::apply_operations(&entries, operations)?;
                 // The rewrite result is a fresh run of one or more leaves. The
@@ -785,7 +916,7 @@ impl<'a, F: DiskTreeSpec> DiskTree<'a, F> {
                     entries: new_entries,
                 });
             }
-            let entries = branch_entries_from_node(node, self.file_kind, block_id)?;
+            let entries = branch_entries_from_node(node, self.file_kind(), block_id)?;
             // Flatten the branch while the guard is alive, then release it before
             // recursive children perform mutable writes through the CoW fork.
             drop(guard);
@@ -1089,7 +1220,7 @@ impl<'a, F: DiskTreeSpec> DiskTree<'a, F> {
         let guard = self.read_node(entry.block_id).await?;
         let node = guard.node();
         if node.height() != usize::from(entry.height) {
-            return Err(invalid_node_payload(self.file_kind, entry.block_id));
+            return Err(invalid_node_payload(self.file_kind(), entry.block_id));
         }
         Ok(node.effective_space())
     }
@@ -1103,18 +1234,18 @@ impl<'a, F: DiskTreeSpec> DiskTree<'a, F> {
         let guard = self.read_node(entry.block_id).await?;
         let node = guard.node();
         if node.height() != usize::from(entry.height) {
-            return Err(invalid_node_payload(self.file_kind, entry.block_id));
+            return Err(invalid_node_payload(self.file_kind(), entry.block_id));
         }
         if node.is_leaf() {
             let mut entries = Vec::with_capacity(node.count());
             for idx in 0..node.count() {
-                entries.push(F::leaf_entry(node, idx, self.file_kind, entry.block_id)?);
+                entries.push(F::leaf_entry(node, idx, self.file_kind(), entry.block_id)?);
             }
             Ok(BranchEntryPayload::Leaf(entries))
         } else {
             Ok(BranchEntryPayload::Branch(branch_entries_from_node(
                 node,
-                self.file_kind,
+                self.file_kind(),
                 entry.block_id,
             )?))
         }
@@ -1387,41 +1518,9 @@ fn branch_entries_from_node(
 /// Lookups read the immutable checkpoint root supplied at construction time.
 /// Mutations are staged through `UniqueDiskTreeBatchWriter` and return a
 /// replacement root block id for the caller to publish.
-pub(crate) struct UniqueDiskTree<'a> {
-    tree: DiskTree<'a, UniqueDiskTreeSpec>,
-}
+pub(crate) type UniqueDiskTree<'a> = DiskTree<'a, UniqueDiskTreeSpec>;
 
 impl<'a> UniqueDiskTree<'a> {
-    /// Create a unique DiskTree view for one checkpoint root.
-    ///
-    /// The index spec must be unique. `SUPER_BLOCK_ID` is accepted as the empty
-    /// root sentinel and does not trigger any block read during construction.
-    #[inline]
-    pub(crate) fn new(
-        root_block_id: BlockID,
-        index_spec: &IndexSpec,
-        metadata: &TableMetadata,
-        file_kind: FileKind,
-        file: &'a Arc<SparseFile>,
-        disk_pool: &'a QuiescentGuard<ReadonlyBufferPool>,
-        disk_pool_guard: &'a PoolGuard,
-    ) -> Result<Self> {
-        if !index_spec.unique() {
-            return Err(Error::InvalidArgument);
-        }
-        let encoder = BTreeKeyEncoder::new(index_key_types(metadata, index_spec, false)?);
-        Ok(Self {
-            tree: DiskTree::new(
-                root_block_id,
-                encoder,
-                file_kind,
-                file,
-                disk_pool,
-                disk_pool_guard,
-            ),
-        })
-    }
-
     /// Look up one logical key and return its checkpointed owner row id.
     ///
     /// The lookup is exact and does not consult mutable in-memory index state or
@@ -1429,8 +1528,8 @@ impl<'a> UniqueDiskTree<'a> {
     /// with newer index layers when serving user transactions.
     #[inline]
     pub(crate) async fn lookup(&self, key: &[Val]) -> Result<Option<RowID>> {
-        let key = self.tree.encoder.encode(key);
-        match self.tree.lookup_encoded(key.as_bytes()).await? {
+        let key = self.encoder().encode(key);
+        match self.lookup_encoded(key.as_bytes()).await? {
             Some(entry) => Ok(Some(entry.row_id.ok_or(Error::InvalidFormat)?)),
             None => Ok(None),
         }
@@ -1439,8 +1538,7 @@ impl<'a> UniqueDiskTree<'a> {
     /// Scan encoded logical keys and row ids in durable key order.
     #[inline]
     pub(crate) async fn scan_entries(&self) -> Result<Vec<(Vec<u8>, RowID)>> {
-        self.tree
-            .collect_entries()
+        self.collect_entries()
             .await?
             .into_iter()
             .map(|entry| Ok((entry.key, entry.row_id.ok_or(Error::InvalidFormat)?)))
@@ -1470,46 +1568,14 @@ impl<'a> UniqueDiskTree<'a> {
 ///
 /// Exact entries are encoded as `(logical_key, row_id)` keys with no leaf value
 /// bytes. Prefix APIs decode the row-id suffix from matching exact keys.
-pub(crate) struct NonUniqueDiskTree<'a> {
-    tree: DiskTree<'a, NonUniqueDiskTreeSpec>,
-}
+pub(crate) type NonUniqueDiskTree<'a> = DiskTree<'a, NonUniqueDiskTreeSpec>;
 
 impl<'a> NonUniqueDiskTree<'a> {
-    /// Create a non-unique DiskTree view for one checkpoint root.
-    ///
-    /// The index spec must be non-unique. The encoder appends `RowID` to the
-    /// physical key type list so exact entries sort by logical key, then row id.
-    #[inline]
-    pub(crate) fn new(
-        root_block_id: BlockID,
-        index_spec: &IndexSpec,
-        metadata: &TableMetadata,
-        file_kind: FileKind,
-        file: &'a Arc<SparseFile>,
-        disk_pool: &'a QuiescentGuard<ReadonlyBufferPool>,
-        disk_pool_guard: &'a PoolGuard,
-    ) -> Result<Self> {
-        if index_spec.unique() {
-            return Err(Error::InvalidArgument);
-        }
-        let encoder = BTreeKeyEncoder::new(index_key_types(metadata, index_spec, true)?);
-        Ok(Self {
-            tree: DiskTree::new(
-                root_block_id,
-                encoder,
-                file_kind,
-                file,
-                disk_pool,
-                disk_pool_guard,
-            ),
-        })
-    }
-
     /// Return whether one exact `(logical_key, row_id)` entry exists.
     #[inline]
     pub(crate) async fn contains_exact(&self, key: &[Val], row_id: RowID) -> Result<bool> {
-        let key = self.tree.encoder.encode_pair(key, Val::from(row_id));
-        Ok(self.tree.lookup_encoded(key.as_bytes()).await?.is_some())
+        let key = self.encoder().encode_pair(key, Val::from(row_id));
+        Ok(self.lookup_encoded(key.as_bytes()).await?.is_some())
     }
 
     /// Prefix-scan one logical key and return row ids in exact-key order.
@@ -1518,21 +1584,40 @@ impl<'a> NonUniqueDiskTree<'a> {
     /// prefix; later range-scan support can route directly through leaf ranges.
     #[inline]
     pub(crate) async fn prefix_scan(&self, key: &[Val]) -> Result<Vec<RowID>> {
-        let prefix = self.tree.encoder.encode_prefix(key, Some(ROW_ID_SIZE));
-        let mut row_ids = Vec::new();
-        for entry in self.tree.collect_entries().await? {
-            if entry.key.starts_with(prefix.as_bytes()) {
-                row_ids.push(unpack_row_id_from_exact_key(&entry.key)?);
+        Ok(self
+            .prefix_scan_entries(key)
+            .await?
+            .into_iter()
+            .map(|(_, row_id)| row_id)
+            .collect())
+    }
+
+    /// Prefix-scan one logical key and return encoded exact keys with row ids.
+    ///
+    /// Composite secondary-index reads use the encoded exact key to merge
+    /// MemTree and DiskTree entries without duplicating key encoders outside the
+    /// concrete DiskTree reader.
+    #[inline]
+    pub(crate) async fn prefix_scan_entries(&self, key: &[Val]) -> Result<Vec<(Vec<u8>, RowID)>> {
+        let prefix = self.encoder().encode_prefix(key, Some(ROW_ID_SIZE));
+        let prefix_bytes = prefix.as_bytes();
+        let mut entries = Vec::new();
+        self.scan_entries_from(prefix_bytes, |entry| {
+            if !entry.key.starts_with(prefix_bytes) {
+                return Ok(false);
             }
-        }
-        Ok(row_ids)
+            let row_id = unpack_row_id_from_exact_key(&entry.key)?;
+            entries.push((entry.key, row_id));
+            Ok(true)
+        })
+        .await?;
+        Ok(entries)
     }
 
     /// Scan encoded exact keys and row ids in durable exact-key order.
     #[inline]
     pub(crate) async fn scan_entries(&self) -> Result<Vec<(Vec<u8>, RowID)>> {
-        self.tree
-            .collect_entries()
+        self.collect_entries()
             .await?
             .into_iter()
             .map(|entry| {
@@ -1578,7 +1663,7 @@ impl<M: MutableCowFile> UniqueDiskTreeBatchWriter<'_, '_, M> {
         let mut encoded = Vec::with_capacity(entries.len());
         for entry in entries {
             encoded.push((
-                self.tree.tree.encoder.encode(entry.key).as_bytes().to_vec(),
+                self.tree.encoder().encode(entry.key).as_bytes().to_vec(),
                 entry.row_id,
             ));
         }
@@ -1618,7 +1703,7 @@ impl<M: MutableCowFile> UniqueDiskTreeBatchWriter<'_, '_, M> {
         let mut encoded = Vec::with_capacity(entries.len());
         for entry in entries {
             encoded.push((
-                self.tree.tree.encoder.encode(entry.key).as_bytes().to_vec(),
+                self.tree.encoder().encode(entry.key).as_bytes().to_vec(),
                 entry.expected_old_row_id,
             ));
         }
@@ -1669,9 +1754,7 @@ impl<M: MutableCowFile> UniqueDiskTreeBatchWriter<'_, '_, M> {
                 });
             }
         }
-        tree.tree
-            .rewrite_root(mutable_file, &flattened, create_ts)
-            .await
+        tree.rewrite_root(mutable_file, &flattened, create_ts).await
     }
 }
 
@@ -1742,8 +1825,7 @@ impl<M: MutableCowFile> NonUniqueDiskTreeBatchWriter<'_, '_, M> {
         for entry in entries {
             encoded.push(
                 self.tree
-                    .tree
-                    .encoder
+                    .encoder()
                     .encode_pair(entry.key, Val::from(entry.row_id))
                     .as_bytes()
                     .to_vec(),
@@ -1771,9 +1853,7 @@ impl<M: MutableCowFile> NonUniqueDiskTreeBatchWriter<'_, '_, M> {
                 kind: DiskTreeOperationKind::NonUniqueSetPresent(present),
             })
             .collect::<Vec<_>>();
-        tree.tree
-            .rewrite_root(mutable_file, &flattened, create_ts)
-            .await
+        tree.rewrite_root(mutable_file, &flattened, create_ts).await
     }
 }
 
@@ -1784,6 +1864,7 @@ mod tests {
     use crate::catalog::{ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey};
     use crate::file::build_test_fs;
     use crate::value::ValKind;
+    use std::sync::Arc;
 
     fn metadata_with_indexes() -> Arc<TableMetadata> {
         Arc::new(TableMetadata::new(
@@ -1802,6 +1883,32 @@ mod tests {
         ))
     }
 
+    macro_rules! unique_runtime {
+        ($metadata:ident, $disk_pool:ident) => {
+            UniqueDiskTreeRuntime::new(
+                &$metadata.index_specs[0],
+                $metadata.as_ref(),
+                $disk_pool.file_kind(),
+                Arc::clone($disk_pool.sparse_file()),
+                $disk_pool.global_pool().clone(),
+            )
+            .unwrap()
+        };
+    }
+
+    macro_rules! non_unique_runtime {
+        ($metadata:ident, $disk_pool:ident) => {
+            NonUniqueDiskTreeRuntime::new(
+                &$metadata.index_specs[1],
+                $metadata.as_ref(),
+                $disk_pool.file_kind(),
+                Arc::clone($disk_pool.sparse_file()),
+                $disk_pool.global_pool().clone(),
+            )
+            .unwrap()
+        };
+    }
+
     #[test]
     fn test_empty_unique_root_reads_empty() {
         smol::block_on(async {
@@ -1815,16 +1922,8 @@ mod tests {
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
             let disk_pool = table_readonly_pool(&global, 301, &table);
             let guard = disk_pool.pool_guard();
-            let tree = UniqueDiskTree::new(
-                SUPER_BLOCK_ID,
-                &metadata.index_specs[0],
-                &metadata,
-                disk_pool.file_kind(),
-                disk_pool.sparse_file(),
-                disk_pool.global_pool(),
-                &guard,
-            )
-            .unwrap();
+            let runtime = unique_runtime!(metadata, disk_pool);
+            let tree = runtime.open(SUPER_BLOCK_ID, &guard);
             assert_eq!(tree.lookup(&[Val::from(1u32)]).await.unwrap(), None);
             assert!(tree.scan_entries().await.unwrap().is_empty());
             drop(table);
@@ -1845,16 +1944,8 @@ mod tests {
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
             let disk_pool = table_readonly_pool(&global, 302, &table);
             let guard = disk_pool.pool_guard();
-            let tree = NonUniqueDiskTree::new(
-                SUPER_BLOCK_ID,
-                &metadata.index_specs[1],
-                &metadata,
-                disk_pool.file_kind(),
-                disk_pool.sparse_file(),
-                disk_pool.global_pool(),
-                &guard,
-            )
-            .unwrap();
+            let runtime = non_unique_runtime!(metadata, disk_pool);
+            let tree = runtime.open(SUPER_BLOCK_ID, &guard);
             assert!(!tree.contains_exact(&[Val::from(1u32)], 10).await.unwrap());
             assert!(
                 tree.prefix_scan(&[Val::from(1u32)])
@@ -1883,16 +1974,8 @@ mod tests {
             let guard = disk_pool.pool_guard();
             let mut mutable =
                 crate::file::table_file::MutableTableFile::fork(&table, fs.background_writes());
-            let tree = UniqueDiskTree::new(
-                SUPER_BLOCK_ID,
-                &metadata.index_specs[0],
-                &metadata,
-                disk_pool.file_kind(),
-                disk_pool.sparse_file(),
-                disk_pool.global_pool(),
-                &guard,
-            )
-            .unwrap();
+            let runtime = unique_runtime!(metadata, disk_pool);
+            let tree = runtime.open(SUPER_BLOCK_ID, &guard);
             let key1 = [Val::from(1u32)];
             let key2 = [Val::from(2u32)];
             let key3 = [Val::from(3u32)];
@@ -1916,16 +1999,7 @@ mod tests {
             let root = writer.finish().await.unwrap();
             assert_ne!(root, SUPER_BLOCK_ID);
 
-            let tree = UniqueDiskTree::new(
-                root,
-                &metadata.index_specs[0],
-                &metadata,
-                disk_pool.file_kind(),
-                disk_pool.sparse_file(),
-                disk_pool.global_pool(),
-                &guard,
-            )
-            .unwrap();
+            let tree = runtime.open(root, &guard);
             assert_eq!(tree.lookup(&key2).await.unwrap(), Some(20));
             let rows = tree
                 .scan_entries()
@@ -1950,16 +2024,7 @@ mod tests {
                 ])
                 .unwrap();
             let new_root = writer.finish().await.unwrap();
-            let new_tree = UniqueDiskTree::new(
-                new_root,
-                &metadata.index_specs[0],
-                &metadata,
-                disk_pool.file_kind(),
-                disk_pool.sparse_file(),
-                disk_pool.global_pool(),
-                &guard,
-            )
-            .unwrap();
+            let new_tree = runtime.open(new_root, &guard);
             assert_eq!(new_tree.lookup(&key1).await.unwrap(), Some(10));
             assert_eq!(new_tree.lookup(&key2).await.unwrap(), None);
             assert_eq!(tree.lookup(&key2).await.unwrap(), Some(20));
@@ -1982,16 +2047,8 @@ mod tests {
             let guard = disk_pool.pool_guard();
             let mut mutable =
                 crate::file::table_file::MutableTableFile::fork(&table, fs.background_writes());
-            let tree = NonUniqueDiskTree::new(
-                SUPER_BLOCK_ID,
-                &metadata.index_specs[1],
-                &metadata,
-                disk_pool.file_kind(),
-                disk_pool.sparse_file(),
-                disk_pool.global_pool(),
-                &guard,
-            )
-            .unwrap();
+            let runtime = non_unique_runtime!(metadata, disk_pool);
+            let tree = runtime.open(SUPER_BLOCK_ID, &guard);
             let key1 = [Val::from(1u32)];
             let key2 = [Val::from(2u32)];
             let mut writer = tree.batch_writer(&mut mutable, 2);
@@ -2012,16 +2069,7 @@ mod tests {
                 ])
                 .unwrap();
             let root = writer.finish().await.unwrap();
-            let tree = NonUniqueDiskTree::new(
-                root,
-                &metadata.index_specs[1],
-                &metadata,
-                disk_pool.file_kind(),
-                disk_pool.sparse_file(),
-                disk_pool.global_pool(),
-                &guard,
-            )
-            .unwrap();
+            let tree = runtime.open(root, &guard);
             assert!(tree.contains_exact(&key1, 10).await.unwrap());
             assert_eq!(tree.prefix_scan(&key1).await.unwrap(), vec![10, 11]);
 
@@ -2045,20 +2093,63 @@ mod tests {
                 }])
                 .unwrap();
             let new_root = writer.finish().await.unwrap();
-            let new_tree = NonUniqueDiskTree::new(
-                new_root,
-                &metadata.index_specs[1],
-                &metadata,
-                disk_pool.file_kind(),
-                disk_pool.sparse_file(),
-                disk_pool.global_pool(),
-                &guard,
-            )
-            .unwrap();
+            let new_tree = runtime.open(new_root, &guard);
             assert_eq!(new_tree.prefix_scan(&key1).await.unwrap(), vec![11, 12]);
             assert!(!new_tree.contains_exact(&key1, 10).await.unwrap());
             assert_eq!(tree.prefix_scan(&key1).await.unwrap(), vec![10, 11]);
             assert!(mutable.root().gc_block_list.is_empty());
+        });
+    }
+
+    #[test]
+    fn test_non_unique_prefix_scan_streams_from_lower_bound() {
+        smol::block_on(async {
+            let (_temp_dir, fs) = build_test_fs();
+            let metadata = metadata_with_indexes();
+            let table = fs
+                .create_table_file(309, Arc::clone(&metadata), false)
+                .unwrap();
+            let (table, old_root) = table.commit(1, false).await.unwrap();
+            drop(old_root);
+            let global = global_readonly_pool_scope(64 * 1024 * 1024);
+            let disk_pool = table_readonly_pool(&global, 309, &table);
+            let guard = disk_pool.pool_guard();
+            let mut mutable =
+                crate::file::table_file::MutableTableFile::fork(&table, fs.background_writes());
+            let runtime = non_unique_runtime!(metadata, disk_pool);
+            let tree = runtime.open(SUPER_BLOCK_ID, &guard);
+
+            const ENTRY_COUNT: u32 = 65_536;
+            let keys = (0..ENTRY_COUNT)
+                .map(|idx| [Val::from(idx)])
+                .collect::<Vec<_>>();
+            let entries = keys
+                .iter()
+                .enumerate()
+                .map(|(idx, key)| NonUniqueDiskTreeExact {
+                    key,
+                    row_id: idx as RowID + 1000,
+                })
+                .collect::<Vec<_>>();
+            let allocated_before = mutable.root().alloc_map.allocated();
+            let mut writer = tree.batch_writer(&mut mutable, 2);
+            writer.batch_insert(&entries).unwrap();
+            let root = writer.finish().await.unwrap();
+            assert_ne!(root, SUPER_BLOCK_ID);
+            let tree_blocks = mutable.root().alloc_map.allocated() - allocated_before;
+            assert!(tree_blocks > 8);
+
+            let tree = runtime.open(root, &guard);
+            let key = [Val::from(7u32)];
+            let stats_before = disk_pool.global_stats();
+            assert_eq!(tree.prefix_scan(&key).await.unwrap(), vec![1007]);
+            let delta = disk_pool.global_stats().delta_since(stats_before);
+            assert!(
+                delta.cache_misses < tree_blocks / 2,
+                "prefix scan loaded {} readonly blocks out of {} DiskTree blocks",
+                delta.cache_misses,
+                tree_blocks
+            );
         });
     }
 
@@ -2078,20 +2169,12 @@ mod tests {
             let mut mutable =
                 crate::file::table_file::MutableTableFile::fork(&table, fs.background_writes());
 
-            let unique_tree = UniqueDiskTree::new(
-                SUPER_BLOCK_ID,
-                &metadata.index_specs[0],
-                &metadata,
-                disk_pool.file_kind(),
-                disk_pool.sparse_file(),
-                disk_pool.global_pool(),
-                &guard,
-            )
-            .unwrap();
+            let unique_runtime = unique_runtime!(metadata, disk_pool);
+            let unique_tree = unique_runtime.open(SUPER_BLOCK_ID, &guard);
             let key1 = [Val::from(1u32)];
             let key2 = [Val::from(2u32)];
-            let encoded_unique1 = unique_tree.tree.encoder.encode(&key1).as_bytes().to_vec();
-            let encoded_unique2 = unique_tree.tree.encoder.encode(&key2).as_bytes().to_vec();
+            let encoded_unique1 = unique_tree.encoder().encode(&key1).as_bytes().to_vec();
+            let encoded_unique2 = unique_tree.encoder().encode(&key2).as_bytes().to_vec();
 
             {
                 let mut writer = unique_tree.batch_writer(&mut mutable, 2);
@@ -2123,16 +2206,7 @@ mod tests {
                 ])
                 .unwrap();
             let unique_root = writer.finish().await.unwrap();
-            let unique_tree = UniqueDiskTree::new(
-                unique_root,
-                &metadata.index_specs[0],
-                &metadata,
-                disk_pool.file_kind(),
-                disk_pool.sparse_file(),
-                disk_pool.global_pool(),
-                &guard,
-            )
-            .unwrap();
+            let unique_tree = unique_runtime.open(unique_root, &guard);
             let mut writer = unique_tree.batch_writer(&mut mutable, 3);
             writer
                 .batch_conditional_delete_encoded(&[
@@ -2147,38 +2221,19 @@ mod tests {
                 ])
                 .unwrap();
             let unique_root = writer.finish().await.unwrap();
-            let unique_tree = UniqueDiskTree::new(
-                unique_root,
-                &metadata.index_specs[0],
-                &metadata,
-                disk_pool.file_kind(),
-                disk_pool.sparse_file(),
-                disk_pool.global_pool(),
-                &guard,
-            )
-            .unwrap();
+            let unique_tree = unique_runtime.open(unique_root, &guard);
             assert_eq!(unique_tree.lookup(&key1).await.unwrap(), None);
             assert_eq!(unique_tree.lookup(&key2).await.unwrap(), Some(20));
 
-            let non_unique_tree = NonUniqueDiskTree::new(
-                SUPER_BLOCK_ID,
-                &metadata.index_specs[1],
-                &metadata,
-                disk_pool.file_kind(),
-                disk_pool.sparse_file(),
-                disk_pool.global_pool(),
-                &guard,
-            )
-            .unwrap();
+            let non_unique_runtime = non_unique_runtime!(metadata, disk_pool);
+            let non_unique_tree = non_unique_runtime.open(SUPER_BLOCK_ID, &guard);
             let encoded_exact10 = non_unique_tree
-                .tree
-                .encoder
+                .encoder()
                 .encode_pair(&key1, Val::from(10u64))
                 .as_bytes()
                 .to_vec();
             let encoded_exact11 = non_unique_tree
-                .tree
-                .encoder
+                .encoder()
                 .encode_pair(&key1, Val::from(11u64))
                 .as_bytes()
                 .to_vec();
@@ -2227,16 +2282,7 @@ mod tests {
                 ])
                 .unwrap();
             let non_unique_root = writer.finish().await.unwrap();
-            let non_unique_tree = NonUniqueDiskTree::new(
-                non_unique_root,
-                &metadata.index_specs[1],
-                &metadata,
-                disk_pool.file_kind(),
-                disk_pool.sparse_file(),
-                disk_pool.global_pool(),
-                &guard,
-            )
-            .unwrap();
+            let non_unique_tree = non_unique_runtime.open(non_unique_root, &guard);
             let mut writer = non_unique_tree.batch_writer(&mut mutable, 5);
             writer
                 .batch_exact_delete_encoded(&[NonUniqueDiskTreeEncodedExact {
@@ -2244,16 +2290,7 @@ mod tests {
                 }])
                 .unwrap();
             let non_unique_root = writer.finish().await.unwrap();
-            let non_unique_tree = NonUniqueDiskTree::new(
-                non_unique_root,
-                &metadata.index_specs[1],
-                &metadata,
-                disk_pool.file_kind(),
-                disk_pool.sparse_file(),
-                disk_pool.global_pool(),
-                &guard,
-            )
-            .unwrap();
+            let non_unique_tree = non_unique_runtime.open(non_unique_root, &guard);
             assert_eq!(non_unique_tree.prefix_scan(&key1).await.unwrap(), vec![11]);
         });
     }
@@ -2273,16 +2310,8 @@ mod tests {
             let guard = disk_pool.pool_guard();
             let mut mutable =
                 crate::file::table_file::MutableTableFile::fork(&table, fs.background_writes());
-            let tree = UniqueDiskTree::new(
-                SUPER_BLOCK_ID,
-                &metadata.index_specs[0],
-                &metadata,
-                disk_pool.file_kind(),
-                disk_pool.sparse_file(),
-                disk_pool.global_pool(),
-                &guard,
-            )
-            .unwrap();
+            let runtime = unique_runtime!(metadata, disk_pool);
+            let tree = runtime.open(SUPER_BLOCK_ID, &guard);
             let key1 = [Val::from(1u32)];
             let key2 = [Val::from(2u32)];
             let key3 = [Val::from(3u32)];
@@ -2306,16 +2335,7 @@ mod tests {
             let root = writer.finish().await.unwrap();
             assert_ne!(root, SUPER_BLOCK_ID);
 
-            let tree = UniqueDiskTree::new(
-                root,
-                &metadata.index_specs[0],
-                &metadata,
-                disk_pool.file_kind(),
-                disk_pool.sparse_file(),
-                disk_pool.global_pool(),
-                &guard,
-            )
-            .unwrap();
+            let tree = runtime.open(root, &guard);
             let rows = tree
                 .scan_entries()
                 .await
@@ -2345,16 +2365,7 @@ mod tests {
             let empty_root = writer.finish().await.unwrap();
             assert_eq!(empty_root, SUPER_BLOCK_ID);
 
-            let empty_tree = UniqueDiskTree::new(
-                empty_root,
-                &metadata.index_specs[0],
-                &metadata,
-                disk_pool.file_kind(),
-                disk_pool.sparse_file(),
-                disk_pool.global_pool(),
-                &guard,
-            )
-            .unwrap();
+            let empty_tree = runtime.open(empty_root, &guard);
             assert_eq!(empty_tree.lookup(&key1).await.unwrap(), None);
             assert_eq!(empty_tree.lookup(&key2).await.unwrap(), None);
             assert_eq!(empty_tree.lookup(&key3).await.unwrap(), None);
@@ -2387,16 +2398,8 @@ mod tests {
             let guard = disk_pool.pool_guard();
             let mut mutable =
                 crate::file::table_file::MutableTableFile::fork(&table, fs.background_writes());
-            let tree = NonUniqueDiskTree::new(
-                SUPER_BLOCK_ID,
-                &metadata.index_specs[1],
-                &metadata,
-                disk_pool.file_kind(),
-                disk_pool.sparse_file(),
-                disk_pool.global_pool(),
-                &guard,
-            )
-            .unwrap();
+            let runtime = non_unique_runtime!(metadata, disk_pool);
+            let tree = runtime.open(SUPER_BLOCK_ID, &guard);
             let key1 = [Val::from(1u32)];
             let key2 = [Val::from(2u32)];
             let mut writer = tree.batch_writer(&mut mutable, 2);
@@ -2419,16 +2422,7 @@ mod tests {
             let root = writer.finish().await.unwrap();
             assert_ne!(root, SUPER_BLOCK_ID);
 
-            let tree = NonUniqueDiskTree::new(
-                root,
-                &metadata.index_specs[1],
-                &metadata,
-                disk_pool.file_kind(),
-                disk_pool.sparse_file(),
-                disk_pool.global_pool(),
-                &guard,
-            )
-            .unwrap();
+            let tree = runtime.open(root, &guard);
             assert_eq!(tree.prefix_scan(&key1).await.unwrap(), vec![10, 11]);
             assert_eq!(tree.prefix_scan(&key2).await.unwrap(), vec![20]);
 
@@ -2452,16 +2446,7 @@ mod tests {
             let empty_root = writer.finish().await.unwrap();
             assert_eq!(empty_root, SUPER_BLOCK_ID);
 
-            let empty_tree = NonUniqueDiskTree::new(
-                empty_root,
-                &metadata.index_specs[1],
-                &metadata,
-                disk_pool.file_kind(),
-                disk_pool.sparse_file(),
-                disk_pool.global_pool(),
-                &guard,
-            )
-            .unwrap();
+            let empty_tree = runtime.open(empty_root, &guard);
             assert!(!empty_tree.contains_exact(&key1, 10).await.unwrap());
             assert!(!empty_tree.contains_exact(&key1, 11).await.unwrap());
             assert!(!empty_tree.contains_exact(&key2, 20).await.unwrap());
@@ -2490,16 +2475,8 @@ mod tests {
             let guard = disk_pool.pool_guard();
             let mut mutable =
                 crate::file::table_file::MutableTableFile::fork(&table, fs.background_writes());
-            let tree = UniqueDiskTree::new(
-                SUPER_BLOCK_ID,
-                &metadata.index_specs[0],
-                &metadata,
-                disk_pool.file_kind(),
-                disk_pool.sparse_file(),
-                disk_pool.global_pool(),
-                &guard,
-            )
-            .unwrap();
+            let runtime = unique_runtime!(metadata, disk_pool);
+            let tree = runtime.open(SUPER_BLOCK_ID, &guard);
 
             const ENTRY_COUNT: u32 = 8192;
             const KEEP_EVERY: usize = 100;
@@ -2519,17 +2496,8 @@ mod tests {
             let root = writer.finish().await.unwrap();
             assert_ne!(root, SUPER_BLOCK_ID);
 
-            let tree = UniqueDiskTree::new(
-                root,
-                &metadata.index_specs[0],
-                &metadata,
-                disk_pool.file_kind(),
-                disk_pool.sparse_file(),
-                disk_pool.global_pool(),
-                &guard,
-            )
-            .unwrap();
-            let root_guard = tree.tree.read_node(root).await.unwrap();
+            let tree = runtime.open(root, &guard);
+            let root_guard = tree.read_node(root).await.unwrap();
             assert!(!root_guard.node().is_leaf());
             drop(root_guard);
 
@@ -2557,17 +2525,8 @@ mod tests {
                 allocated_before_delete + 1
             );
 
-            let compacted_tree = UniqueDiskTree::new(
-                compacted_root,
-                &metadata.index_specs[0],
-                &metadata,
-                disk_pool.file_kind(),
-                disk_pool.sparse_file(),
-                disk_pool.global_pool(),
-                &guard,
-            )
-            .unwrap();
-            let compacted_guard = compacted_tree.tree.read_node(compacted_root).await.unwrap();
+            let compacted_tree = runtime.open(compacted_root, &guard);
+            let compacted_guard = compacted_tree.read_node(compacted_root).await.unwrap();
             assert!(compacted_guard.node().is_leaf());
             assert_eq!(compacted_guard.node().count(), expected_rows.len());
             drop(compacted_guard);
@@ -2604,16 +2563,8 @@ mod tests {
             let guard = disk_pool.pool_guard();
             let mut mutable =
                 crate::file::table_file::MutableTableFile::fork(&table, fs.background_writes());
-            let tree = UniqueDiskTree::new(
-                SUPER_BLOCK_ID,
-                &metadata.index_specs[0],
-                &metadata,
-                disk_pool.file_kind(),
-                disk_pool.sparse_file(),
-                disk_pool.global_pool(),
-                &guard,
-            )
-            .unwrap();
+            let runtime = unique_runtime!(metadata, disk_pool);
+            let tree = runtime.open(SUPER_BLOCK_ID, &guard);
             let key1 = [Val::from(1u32)];
             let key2 = [Val::from(2u32)];
             let mut writer = tree.batch_writer(&mut mutable, 2);

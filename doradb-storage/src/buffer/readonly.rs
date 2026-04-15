@@ -17,10 +17,8 @@ use crate::buffer::{
 };
 use crate::error::{Error, FileKind, Result};
 use crate::file::fs::FileSystem;
-use crate::file::multi_table_file::MultiTableFile;
-use crate::file::table_file::TableFile;
 use crate::file::{BlockID, BlockKey, FileID, SparseFile};
-use crate::io::{DirectBuf, IOKind, IOSubmission, Operation};
+use crate::io::{IOKind, IOSubmission, Operation};
 use crate::latch::LatchFallbackMode;
 use crate::quiescent::{QuiescentGuard, SyncQuiescentGuard};
 use dashmap::DashMap;
@@ -29,7 +27,7 @@ use event_listener::{Event, EventListener, listener};
 use parking_lot::Mutex;
 use std::collections::BTreeSet;
 use std::mem;
-use std::os::fd::{AsRawFd, RawFd};
+use std::os::fd::AsRawFd;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -37,54 +35,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 ///
 /// Very small pools provide little practical value and can stall eviction/load flow.
 const MIN_READONLY_POOL_PAGES: usize = 256;
-
-/// Detached keepalive for one persisted file participating in readonly-cache IO.
-///
-/// This keeps the real file descriptor alive while a queued read or write is
-/// still owned by the shared storage worker.
-#[derive(Clone)]
-pub(crate) struct ReadonlyBackingFile {
-    file: Arc<SparseFile>,
-}
-
-impl ReadonlyBackingFile {
-    #[inline]
-    pub(crate) fn new(file: Arc<SparseFile>) -> Self {
-        Self { file }
-    }
-
-    #[inline]
-    pub(crate) fn raw_fd(&self) -> RawFd {
-        self.file.as_raw_fd()
-    }
-
-    #[inline]
-    fn read_operation(&self, key: BlockKey, ptr: *mut u8, len: usize) -> Operation {
-        let offset = usize::from(key.block_id) * PAGE_SIZE;
-        // SAFETY: readonly loads borrow frame-owned page memory that remains
-        // live until IO completion, and offsets are page-aligned by construction.
-        unsafe { Operation::pread_borrowed(self.raw_fd(), offset, ptr, len) }
-    }
-
-    #[inline]
-    pub(crate) fn write_operation(&self, offset: usize, buf: DirectBuf) -> Operation {
-        Operation::pwrite_owned(self.raw_fd(), offset, buf)
-    }
-}
-
-impl From<Arc<TableFile>> for ReadonlyBackingFile {
-    #[inline]
-    fn from(value: Arc<TableFile>) -> Self {
-        value.readonly_backing()
-    }
-}
-
-impl From<Arc<MultiTableFile>> for ReadonlyBackingFile {
-    #[inline]
-    fn from(value: Arc<MultiTableFile>) -> Self {
-        value.readonly_backing()
-    }
-}
 
 /// Global readonly cache owner shared across files.
 ///
@@ -693,7 +643,7 @@ impl PageReservation for ReadonlyPageReservation {
 /// completed the miss.
 pub(crate) struct ReadSubmission {
     key: BlockKey,
-    _backing: ReadonlyBackingFile,
+    _file: Arc<SparseFile>,
     operation: Operation,
     pool: QuiescentGuard<ReadonlyBufferPool>,
     inflight: Arc<PageIOCompletion>,
@@ -706,7 +656,7 @@ impl ReadSubmission {
     #[inline]
     /// Builds one readonly miss-load submission from an already reserved frame.
     fn new(
-        backing: ReadonlyBackingFile,
+        file: Arc<SparseFile>,
         pool: QuiescentGuard<ReadonlyBufferPool>,
         key: BlockKey,
         inflight: Arc<PageIOCompletion>,
@@ -714,11 +664,15 @@ impl ReadSubmission {
         mut reservation: ReadonlyReservedPage,
     ) -> Self {
         let ptr = reservation.page_mut() as *mut Page as *mut u8;
-        let operation = backing.read_operation(key, ptr, PAGE_SIZE);
+        let offset = usize::from(key.block_id) * PAGE_SIZE;
+        // SAFETY: readonly loads borrow frame-owned page memory that remains
+        // live until IO completion, and offsets are page-aligned by construction.
+        let operation =
+            unsafe { Operation::pread_borrowed(file.as_raw_fd(), offset, ptr, PAGE_SIZE) };
         pool.stats.add_queued_reads(1);
         ReadSubmission {
             key,
-            _backing: backing,
+            _file: file,
             operation,
             pool,
             inflight,
@@ -1141,7 +1095,7 @@ impl QuiescentGuard<ReadonlyBufferPool> {
                             page_guard,
                         );
                         let req = ReadSubmission::new(
-                            ReadonlyBackingFile::new(Arc::clone(file)),
+                            Arc::clone(file),
                             self.clone(),
                             key,
                             Arc::clone(&inflight),
@@ -1453,19 +1407,15 @@ pub(crate) mod tests {
         }
     }
 
-    fn owned_readonly_pool<O>(
+    fn owned_readonly_pool(
         _file_id: FileID,
         file_kind: FileKind,
-        backing: O,
+        file: Arc<SparseFile>,
         global: &GlobalReadOnlyPoolScope,
-    ) -> QuiescentBox<TestReadonlyPool>
-    where
-        O: Into<ReadonlyBackingFile>,
-    {
-        let backing = backing.into();
+    ) -> QuiescentBox<TestReadonlyPool> {
         QuiescentBox::new(TestReadonlyPool {
             file_kind,
-            file: Arc::clone(&backing.file),
+            file,
             global: global.guard(),
         })
     }
@@ -1802,7 +1752,7 @@ pub(crate) mod tests {
             let pool = owned_readonly_pool(
                 test_file_id(118),
                 FileKind::TableFile,
-                Arc::clone(&table_file),
+                Arc::clone(table_file.sparse_file()),
                 &global,
             );
             let key = BlockKey::new(test_file_id(118), test_block_id(14));
@@ -1819,7 +1769,7 @@ pub(crate) mod tests {
                 page_guard,
             );
             let mut submission = ReadSubmission::new(
-                ReadonlyBackingFile::new(Arc::clone(pool.sparse_file())),
+                Arc::clone(pool.sparse_file()),
                 pool.global.clone(),
                 key,
                 Arc::clone(&inflight),
@@ -1986,7 +1936,7 @@ pub(crate) mod tests {
             let pool = owned_readonly_pool(
                 test_file_id(111),
                 FileKind::TableFile,
-                Arc::clone(&table_file),
+                Arc::clone(table_file.sparse_file()),
                 &global,
             );
             let pool_guard = pool.pool_guard();
@@ -2042,7 +1992,7 @@ pub(crate) mod tests {
             let pool = owned_readonly_pool(
                 test_file_id(123),
                 FileKind::TableFile,
-                Arc::clone(&table_file),
+                Arc::clone(table_file.sparse_file()),
                 &global,
             );
             let pool_guard = pool.pool_guard();
@@ -2093,7 +2043,7 @@ pub(crate) mod tests {
             let pool = owned_readonly_pool(
                 test_file_id(101),
                 FileKind::TableFile,
-                Arc::clone(&table_file),
+                Arc::clone(table_file.sparse_file()),
                 &global,
             );
             let pool_guard = pool.pool_guard();
@@ -2128,7 +2078,7 @@ pub(crate) mod tests {
             let pool = owned_readonly_pool(
                 test_file_id(102),
                 FileKind::TableFile,
-                Arc::clone(&table_file),
+                Arc::clone(table_file.sparse_file()),
                 &global,
             );
             let pool_guard = pool.pool_guard();
@@ -2171,7 +2121,7 @@ pub(crate) mod tests {
             let pool = owned_readonly_pool(
                 test_file_id(112),
                 FileKind::TableFile,
-                Arc::clone(&table_file),
+                Arc::clone(table_file.sparse_file()),
                 &global,
             );
             let pool_guard = pool.pool_guard();
@@ -2230,7 +2180,7 @@ pub(crate) mod tests {
             let pool = owned_readonly_pool(
                 test_file_id(113),
                 FileKind::TableFile,
-                Arc::clone(&table_file),
+                Arc::clone(table_file.sparse_file()),
                 &global,
             );
             let pool_guard = pool.pool_guard();
@@ -2285,7 +2235,7 @@ pub(crate) mod tests {
             let pool = owned_readonly_pool(
                 test_file_id(116),
                 FileKind::TableFile,
-                Arc::clone(&table_file),
+                Arc::clone(table_file.sparse_file()),
                 &global,
             );
             let pool_guard = pool.pool_guard();
@@ -2402,7 +2352,7 @@ pub(crate) mod tests {
             let pool = owned_readonly_pool(
                 test_file_id(114),
                 FileKind::TableFile,
-                Arc::clone(&table_file),
+                Arc::clone(table_file.sparse_file()),
                 &global,
             );
             let pool_guard = pool.pool_guard();
@@ -2456,7 +2406,7 @@ pub(crate) mod tests {
             let pool = owned_readonly_pool(
                 test_file_id(115),
                 FileKind::TableFile,
-                Arc::clone(&table_file),
+                Arc::clone(table_file.sparse_file()),
                 &global,
             );
             let pool_guard = pool.pool_guard();
@@ -2540,7 +2490,7 @@ pub(crate) mod tests {
             let pool = owned_readonly_pool(
                 test_file_id(107),
                 FileKind::TableFile,
-                Arc::clone(&table_file),
+                Arc::clone(table_file.sparse_file()),
                 &global,
             );
             let pool_guard = pool.pool_guard();
@@ -2591,7 +2541,7 @@ pub(crate) mod tests {
             let pool = owned_readonly_pool(
                 test_file_id(116),
                 FileKind::TableFile,
-                Arc::clone(&table_file),
+                Arc::clone(table_file.sparse_file()),
                 &global,
             );
             let pool_guard = pool.pool_guard();
@@ -2634,7 +2584,7 @@ pub(crate) mod tests {
             let pool = owned_readonly_pool(
                 test_file_id(108),
                 FileKind::TableFile,
-                Arc::clone(&table_file),
+                Arc::clone(table_file.sparse_file()),
                 &global,
             );
             let pool_guard = pool.pool_guard();
@@ -2681,7 +2631,7 @@ pub(crate) mod tests {
             let pool = owned_readonly_pool(
                 test_file_id(109),
                 FileKind::TableFile,
-                Arc::clone(&table_file),
+                Arc::clone(table_file.sparse_file()),
                 &global,
             );
             let pool_guard = pool.pool_guard();
@@ -2813,7 +2763,7 @@ pub(crate) mod tests {
             let pool = owned_readonly_pool(
                 test_file_id(105),
                 FileKind::TableFile,
-                Arc::clone(&table_file),
+                Arc::clone(table_file.sparse_file()),
                 &global,
             );
             let pool_guard = pool.pool_guard();
@@ -2837,8 +2787,12 @@ pub(crate) mod tests {
             write_payload(&fs, &table_file, test_block_id(4), b"guard").await;
 
             let global = owned_global_pool(64 * 1024 * 1024);
-            let pool =
-                owned_readonly_pool(test_file_id(104), FileKind::TableFile, table_file, &global);
+            let pool = owned_readonly_pool(
+                test_file_id(104),
+                FileKind::TableFile,
+                Arc::clone(table_file.sparse_file()),
+                &global,
+            );
             let pool_guard = pool.pool_guard();
             let guard: ReadonlyBlockGuard = pool
                 .read_block(&pool_guard, test_block_id(4))

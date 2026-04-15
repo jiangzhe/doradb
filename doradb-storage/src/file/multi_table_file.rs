@@ -1,5 +1,5 @@
 use crate::bitmap::AllocMap;
-use crate::buffer::{ReadonlyBackingFile, ReadonlyBufferPool};
+use crate::buffer::ReadonlyBufferPool;
 use crate::catalog::{ObjID, TableID, USER_OBJ_ID_START};
 use crate::error::{BlockCorruptionCause, BlockKind, Error, FileKind, Result, StorageOp};
 use crate::file::SparseFile;
@@ -316,11 +316,6 @@ impl MultiTableFile {
     }
 
     #[inline]
-    pub(crate) fn readonly_backing(&self) -> ReadonlyBackingFile {
-        self.file.readonly_backing()
-    }
-
-    #[inline]
     pub(super) fn install_loaded_root(
         &self,
         active_root: MultiTableActiveRoot,
@@ -448,10 +443,9 @@ impl MutableMultiTableFile {
     /// Write one page into the underlying multi-table file.
     #[inline]
     pub(crate) async fn write_block(&self, block_id: BlockID, buf: DirectBuf) -> Result<()> {
-        let owner = self.file_ref().readonly_backing();
         self.file_ref()
             .file()
-            .write_block_with_owner(self.background_writes(), owner, block_id, buf)
+            .write_block(self.background_writes(), block_id, buf)
             .await
     }
 
@@ -460,10 +454,9 @@ impl MutableMultiTableFile {
         &self,
         new_root: MultiTableActiveRoot,
     ) -> Result<Option<OldMultiTableRoot>> {
-        let owner = self.file_ref().readonly_backing();
         self.file_ref()
             .file()
-            .publish_root_with_owner(self.background_writes(), owner, new_root)
+            .publish_root(self.background_writes(), new_root)
             .await
     }
 

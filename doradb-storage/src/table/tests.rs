@@ -8,7 +8,6 @@ use crate::engine::Engine;
 use crate::error::{BlockCorruptionCause, BlockKind, Error, FileKind, Result, StoragePoisonSource};
 use crate::file::block_integrity::{BLOCK_INTEGRITY_HEADER_SIZE, write_block_checksum};
 use crate::file::cow_file::{COW_FILE_PAGE_SIZE, SUPER_BLOCK_ID};
-use crate::index::disk_tree::{NonUniqueDiskTree, UniqueDiskTree};
 use crate::index::{
     COLUMN_BLOCK_HEADER_SIZE, COLUMN_BLOCK_LEAF_HEADER_SIZE, ColumnBlockIndex, NonUniqueIndex,
     RowLocation, UniqueIndex, load_entry_deletion_deltas,
@@ -4505,16 +4504,12 @@ async fn unique_disk_tree_lookup(
     key: &SelectKey,
 ) -> Option<RowID> {
     let root = table.file().active_root().secondary_index_roots[key.index_no];
-    let tree = UniqueDiskTree::new(
-        root,
-        &table.metadata().index_specs[key.index_no],
-        table.metadata(),
-        table.file().file_kind(),
-        table.file().sparse_file(),
-        table.disk_pool(),
-        guards.disk_guard(),
-    )
-    .unwrap();
+    let tree = table
+        .storage
+        .secondary_index_runtime(key.index_no)
+        .unwrap()
+        .open_unique_at(root, guards.disk_guard())
+        .unwrap();
     tree.lookup(&key.vals).await.unwrap()
 }
 
@@ -4524,16 +4519,12 @@ async fn non_unique_disk_tree_prefix_scan(
     key: &SelectKey,
 ) -> Vec<RowID> {
     let root = table.file().active_root().secondary_index_roots[key.index_no];
-    let tree = NonUniqueDiskTree::new(
-        root,
-        &table.metadata().index_specs[key.index_no],
-        table.metadata(),
-        table.file().file_kind(),
-        table.file().sparse_file(),
-        table.disk_pool(),
-        guards.disk_guard(),
-    )
-    .unwrap();
+    let tree = table
+        .storage
+        .secondary_index_runtime(key.index_no)
+        .unwrap()
+        .open_non_unique_at(root, guards.disk_guard())
+        .unwrap();
     tree.prefix_scan(&key.vals).await.unwrap()
 }
 

@@ -14,7 +14,7 @@ pub(crate) use self::tests::{
     FileSyncOp, FileSyncTestHook, set_file_sync_test_hook, test_block_id, test_file_id,
 };
 
-use crate::buffer::{ReadSubmission, ReadonlyBackingFile};
+use crate::buffer::ReadSubmission;
 use crate::catalog::USER_OBJ_ID_START;
 use crate::compression::BitPackable;
 use crate::error::{Error, Result, StorageOp};
@@ -652,7 +652,7 @@ fn c_string_from_path(file_path: &str) -> Result<CString> {
 /// `Operation` only when this request is admitted to the IO queue.
 pub struct WriteSubmission {
     key: BlockKey,
-    backing: ReadonlyBackingFile,
+    file: Arc<SparseFile>,
     offset: usize,
     buf: DirectBuf,
     completion: Arc<Completion<Result<()>>>,
@@ -662,7 +662,7 @@ impl WriteSubmission {
     #[inline]
     fn prepare(
         key: BlockKey,
-        backing: ReadonlyBackingFile,
+        file: Arc<SparseFile>,
         offset: usize,
         buf: DirectBuf,
     ) -> (Self, impl Future<Output = Result<()>> + Send) {
@@ -670,7 +670,7 @@ impl WriteSubmission {
         let waiter = Arc::clone(&completion);
         let fio = WriteSubmission {
             key,
-            backing,
+            file,
             offset,
             buf,
             completion,
@@ -682,15 +682,15 @@ impl WriteSubmission {
     fn into_prepared(self) -> PreparedWriteSubmission {
         let WriteSubmission {
             key,
-            backing,
+            file,
             offset,
             buf,
             completion,
         } = self;
-        let operation = backing.write_operation(offset, buf);
+        let operation = Operation::pwrite_owned(file.as_raw_fd(), offset, buf);
         PreparedWriteSubmission {
             key,
-            _backing: backing,
+            _file: file,
             operation,
             completion,
         }
@@ -699,7 +699,7 @@ impl WriteSubmission {
 
 pub(crate) struct PreparedWriteSubmission {
     key: BlockKey,
-    _backing: ReadonlyBackingFile,
+    _file: Arc<SparseFile>,
     operation: Operation,
     completion: Arc<Completion<Result<()>>>,
 }
@@ -734,12 +734,12 @@ impl IOSubmission for TableFsSubmission {
 #[inline]
 pub(crate) async fn write_direct(
     key: BlockKey,
-    backing: ReadonlyBackingFile,
+    file: Arc<SparseFile>,
     offset: usize,
     buf: DirectBuf,
     background_writes: &IOClient<BackgroundWriteRequest>,
 ) -> Result<()> {
-    let (submission, result) = WriteSubmission::prepare(key, backing, offset, buf);
+    let (submission, result) = WriteSubmission::prepare(key, file, offset, buf);
     if let Err(err) = background_writes
         .send_async(BackgroundWriteRequest::Table(submission))
         .await
@@ -980,7 +980,7 @@ mod tests {
     ) -> (WriteSubmission, impl Future<Output = Result<()>> + Send) {
         WriteSubmission::prepare(
             BlockKey::new(table_file.sparse_file().file_id(), block_id),
-            ReadonlyBackingFile::from(table_file),
+            Arc::clone(table_file.sparse_file()),
             usize::from(block_id) * STORAGE_SECTOR_SIZE,
             DirectBuf::zeroed(STORAGE_SECTOR_SIZE),
         )

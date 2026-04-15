@@ -5,8 +5,7 @@ use crate::file::cow_file::SUPER_BLOCK_ID;
 use crate::file::table_file::MutableTableFile;
 use crate::index::BTreeKeyEncoder;
 use crate::index::disk_tree::{
-    NonUniqueDiskTree, NonUniqueDiskTreeEncodedExact, UniqueDiskTree, UniqueDiskTreeEncodedDelete,
-    UniqueDiskTreeEncodedPut,
+    NonUniqueDiskTreeEncodedExact, UniqueDiskTreeEncodedDelete, UniqueDiskTreeEncodedPut,
 };
 use crate::index::{ColumnBlockIndex, ColumnDeleteDeltaPatch, ColumnLeafEntry};
 use crate::lwc::PersistedLwcBlock;
@@ -456,31 +455,18 @@ impl Table {
 
         let disk_pool = self.disk_pool();
         let disk_pool_guard = disk_pool.pool_guard();
-        let table_file = self.file();
-        for (index_no, (index_spec, index_sidecar)) in metadata
-            .index_specs
-            .iter()
-            .zip(sidecar.indexes.iter_mut())
-            .enumerate()
-        {
+        for (index_no, index_sidecar) in sidecar.indexes.iter_mut().enumerate() {
             index_sidecar.normalize();
             if !index_sidecar.has_work() {
                 continue;
             }
             let old_root = mutable_file.secondary_index_root(index_no)?;
+            let runtime = self.storage.secondary_index_runtime(index_no)?;
             let new_root = match index_sidecar {
                 SecondaryIndexSidecar::Unique { puts, deletes, .. } => {
                     // Use one writer per affected index so same-run puts and
                     // conditional deletes produce a single new DiskTree root.
-                    let tree = UniqueDiskTree::new(
-                        old_root,
-                        index_spec,
-                        metadata,
-                        table_file.file_kind(),
-                        table_file.sparse_file(),
-                        disk_pool,
-                        &disk_pool_guard,
-                    )?;
+                    let tree = runtime.open_unique_at(old_root, &disk_pool_guard)?;
                     let mut writer = tree.batch_writer(mutable_file, checkpoint_ts);
                     let put_entries = puts
                         .iter()
@@ -508,15 +494,7 @@ impl Table {
                 } => {
                     // Non-unique roots are exact-entry sets. Inserts and
                     // deletes are independent facts keyed by (key, row_id).
-                    let tree = NonUniqueDiskTree::new(
-                        old_root,
-                        index_spec,
-                        metadata,
-                        table_file.file_kind(),
-                        table_file.sparse_file(),
-                        disk_pool,
-                        &disk_pool_guard,
-                    )?;
+                    let tree = runtime.open_non_unique_at(old_root, &disk_pool_guard)?;
                     let mut writer = tree.batch_writer(mutable_file, checkpoint_ts);
                     let insert_entries = inserts
                         .iter()
