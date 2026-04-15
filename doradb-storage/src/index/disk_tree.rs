@@ -806,6 +806,50 @@ impl<'a, F: DiskTreeSpec> DiskTree<'a, F> {
         Ok(entries)
     }
 
+    /// Visit logical entries from the first key greater than or equal to
+    /// `start_key`, stopping when the visitor returns `false`.
+    async fn scan_entries_from<V>(&self, start_key: &[u8], mut visitor: V) -> Result<()>
+    where
+        V: FnMut(LogicalEntry) -> Result<bool>,
+    {
+        if self.root_block_id == SUPER_BLOCK_ID {
+            return Ok(());
+        }
+        let mut stack = vec![self.root_block_id];
+        let mut last_key: Option<Vec<u8>> = None;
+        while let Some(block_id) = stack.pop() {
+            let guard = self.read_node(block_id).await?;
+            let node = guard.node();
+            if node.is_leaf() {
+                for idx in node.lower_bound_slot_idx(start_key)..node.count() {
+                    let entry = F::leaf_entry(node, idx, self.file_kind(), block_id)?;
+                    if last_key
+                        .as_ref()
+                        .is_some_and(|prev| prev.as_slice() >= entry.key.as_slice())
+                    {
+                        return Err(invalid_node_payload(self.file_kind(), block_id));
+                    }
+                    last_key = Some(entry.key.clone());
+                    if !visitor(entry)? {
+                        return Ok(());
+                    }
+                }
+            } else {
+                let start_idx = node
+                    .lower_bound_child_entry_idx(start_key)
+                    .ok_or_else(|| invalid_node_payload(self.file_kind(), block_id))?;
+                let branch_entries = branch_entries_from_node(node, self.file_kind(), block_id)?;
+                if start_idx >= branch_entries.len() {
+                    return Err(invalid_node_payload(self.file_kind(), block_id));
+                }
+                for entry in branch_entries.into_iter().skip(start_idx).rev() {
+                    stack.push(entry.block_id);
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Rewrite the touched CoW paths and return the replacement root block id.
     ///
     /// The method does not publish the new root or record replaced blocks for GC;
@@ -1556,13 +1600,17 @@ impl<'a> NonUniqueDiskTree<'a> {
     #[inline]
     pub(crate) async fn prefix_scan_entries(&self, key: &[Val]) -> Result<Vec<(Vec<u8>, RowID)>> {
         let prefix = self.encoder().encode_prefix(key, Some(ROW_ID_SIZE));
+        let prefix_bytes = prefix.as_bytes();
         let mut entries = Vec::new();
-        for entry in self.collect_entries().await? {
-            if entry.key.starts_with(prefix.as_bytes()) {
-                let row_id = unpack_row_id_from_exact_key(&entry.key)?;
-                entries.push((entry.key, row_id));
+        self.scan_entries_from(prefix_bytes, |entry| {
+            if !entry.key.starts_with(prefix_bytes) {
+                return Ok(false);
             }
-        }
+            let row_id = unpack_row_id_from_exact_key(&entry.key)?;
+            entries.push((entry.key, row_id));
+            Ok(true)
+        })
+        .await?;
         Ok(entries)
     }
 
@@ -2050,6 +2098,58 @@ mod tests {
             assert!(!new_tree.contains_exact(&key1, 10).await.unwrap());
             assert_eq!(tree.prefix_scan(&key1).await.unwrap(), vec![10, 11]);
             assert!(mutable.root().gc_block_list.is_empty());
+        });
+    }
+
+    #[test]
+    fn test_non_unique_prefix_scan_streams_from_lower_bound() {
+        smol::block_on(async {
+            let (_temp_dir, fs) = build_test_fs();
+            let metadata = metadata_with_indexes();
+            let table = fs
+                .create_table_file(309, Arc::clone(&metadata), false)
+                .unwrap();
+            let (table, old_root) = table.commit(1, false).await.unwrap();
+            drop(old_root);
+            let global = global_readonly_pool_scope(64 * 1024 * 1024);
+            let disk_pool = table_readonly_pool(&global, 309, &table);
+            let guard = disk_pool.pool_guard();
+            let mut mutable =
+                crate::file::table_file::MutableTableFile::fork(&table, fs.background_writes());
+            let runtime = non_unique_runtime!(metadata, disk_pool);
+            let tree = runtime.open(SUPER_BLOCK_ID, &guard);
+
+            const ENTRY_COUNT: u32 = 65_536;
+            let keys = (0..ENTRY_COUNT)
+                .map(|idx| [Val::from(idx)])
+                .collect::<Vec<_>>();
+            let entries = keys
+                .iter()
+                .enumerate()
+                .map(|(idx, key)| NonUniqueDiskTreeExact {
+                    key,
+                    row_id: idx as RowID + 1000,
+                })
+                .collect::<Vec<_>>();
+            let allocated_before = mutable.root().alloc_map.allocated();
+            let mut writer = tree.batch_writer(&mut mutable, 2);
+            writer.batch_insert(&entries).unwrap();
+            let root = writer.finish().await.unwrap();
+            assert_ne!(root, SUPER_BLOCK_ID);
+            let tree_blocks = mutable.root().alloc_map.allocated() - allocated_before;
+            assert!(tree_blocks > 8);
+
+            let tree = runtime.open(root, &guard);
+            let key = [Val::from(7u32)];
+            let stats_before = disk_pool.global_stats();
+            assert_eq!(tree.prefix_scan(&key).await.unwrap(), vec![1007]);
+            let delta = disk_pool.global_stats().delta_since(stats_before);
+            assert!(
+                delta.cache_misses < tree_blocks / 2,
+                "prefix scan loaded {} readonly blocks out of {} DiskTree blocks",
+                delta.cache_misses,
+                tree_blocks
+            );
         });
     }
 

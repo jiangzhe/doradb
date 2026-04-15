@@ -923,6 +923,61 @@ impl BTreeNode {
                 && &key[..self.header.prefix_len() as usize] == self.common_prefix()
         );
         let k = &key[self.header.prefix_len() as usize..];
+        self.search_key_suffix(k)
+    }
+
+    /// Return the first slot whose full key is greater than or equal to `key`.
+    ///
+    /// Unlike [`Self::search_key`], this accepts probes outside or shorter than
+    /// the node common prefix, which range scans need when the lower bound is a
+    /// logical-key prefix rather than a full stored key.
+    #[inline]
+    pub(super) fn lower_bound_slot_idx(&self, key: &[u8]) -> usize {
+        match self.key_suffix_for_probe(key) {
+            NodeProbe::Before => 0,
+            NodeProbe::Within(k) => match self.search_key_suffix(k) {
+                Ok(idx) | Err(idx) => idx,
+            },
+            NodeProbe::After => self.count(),
+        }
+    }
+
+    /// Return the child-entry index that may contain `key` in a branch node.
+    ///
+    /// Child entry `0` is the lower-fence child, and later child entries map to
+    /// slot index `child_idx - 1`.
+    #[inline]
+    pub(super) fn lower_bound_child_entry_idx(&self, key: &[u8]) -> Option<usize> {
+        debug_assert!(!self.is_leaf());
+        if self.header.lower_fence_value().is_deleted() {
+            return None;
+        }
+        let idx = match self.key_suffix_for_probe(key) {
+            NodeProbe::Before => 0,
+            NodeProbe::Within(k) => match self.search_key_suffix(k) {
+                Ok(idx) => idx + 1,
+                Err(idx) => idx,
+            },
+            NodeProbe::After => self.count(),
+        };
+        Some(idx)
+    }
+
+    #[inline]
+    fn key_suffix_for_probe<'a>(&self, key: &'a [u8]) -> NodeProbe<'a> {
+        let prefix = self.common_prefix();
+        let common = common_prefix_len(key, prefix);
+        if common == prefix.len() {
+            return NodeProbe::Within(&key[prefix.len()..]);
+        }
+        if common == key.len() || key[common] < prefix[common] {
+            return NodeProbe::Before;
+        }
+        NodeProbe::After
+    }
+
+    #[inline]
+    fn search_key_suffix(&self, k: &[u8]) -> SearchKey {
         let head = head_int(k);
         if self.hints_enabled() {
             return self.search_key_with_hints(k, head);
@@ -1769,6 +1824,13 @@ impl BTreeNodeBox {
 
 pub type SearchKey = std::result::Result<usize, usize>;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NodeProbe<'a> {
+    Before,
+    Within(&'a [u8]),
+    After,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LookupChild {
     Slot(usize, PageID),
@@ -1970,6 +2032,40 @@ mod tests {
             Err(node.count())
         );
         assert!(node.validate_persisted_layout::<BTreeNil>());
+    }
+
+    #[test]
+    fn test_btree_node_lower_bound_slot_uses_common_prefix() {
+        let mut node = BTreeNodeBox::alloc(0, 7, b"abc0", BTreeU64::INVALID_VALUE, b"abcz", false);
+        for key in [b"abc1".as_slice(), b"abc3".as_slice(), b"abc5".as_slice()] {
+            let idx = node.count();
+            node.insert_at::<BTreeNil>(idx, key, BTreeNil);
+        }
+
+        assert_eq!(node.common_prefix(), b"abc");
+        assert_eq!(node.lower_bound_slot_idx(b"abc3"), 1);
+        assert_eq!(node.lower_bound_slot_idx(b"abc4"), 2);
+        assert_eq!(node.lower_bound_slot_idx(b"ab"), 0);
+        assert_eq!(node.lower_bound_slot_idx(b"abbz"), 0);
+        assert_eq!(node.lower_bound_slot_idx(b"abd"), node.count());
+    }
+
+    #[test]
+    fn test_btree_node_lower_bound_child_uses_common_prefix() {
+        let mut node = BTreeNodeBox::alloc(1, 7, b"abc0", BTreeU64::from(10), b"abcz", false);
+        for (key, block_id) in [(b"abc3".as_slice(), 20), (b"abc5".as_slice(), 30)] {
+            let idx = node.count();
+            node.insert_at::<BTreeU64>(idx, key, BTreeU64::from(block_id));
+        }
+
+        assert_eq!(node.common_prefix(), b"abc");
+        assert_eq!(node.lower_bound_child_entry_idx(b"abc1"), Some(0));
+        assert_eq!(node.lower_bound_child_entry_idx(b"abc3"), Some(1));
+        assert_eq!(node.lower_bound_child_entry_idx(b"abc4"), Some(1));
+        assert_eq!(node.lower_bound_child_entry_idx(b"abc5"), Some(2));
+        assert_eq!(node.lower_bound_child_entry_idx(b"ab"), Some(0));
+        assert_eq!(node.lower_bound_child_entry_idx(b"abbz"), Some(0));
+        assert_eq!(node.lower_bound_child_entry_idx(b"abd"), Some(node.count()));
     }
 
     #[test]
