@@ -82,3 +82,12 @@ document is the source of truth for intended behavior when one exists.
       without obscuring data flow or creating excessive argument lists.
 - [ ] If a large function should remain intact, add inline comments that mark
       the major steps and explain the relevant invariants.
+- [ ] Define a trait only when it has at least two concrete implementations.
+      Otherwise, prefer a plain struct with methods.
+- [ ] Add a single-field wrapper only with a specific intent. Document that
+      intent in a comment, even when the wrapper is internal-only, so the code
+      stays concise.
+- [ ] After implementation, compare the changed code with existing snippets
+      that do the same or a similar thing. Extract and call a shared method or
+      function when suitable; if sharing is not suitable, leave a comment that
+      explains why.
