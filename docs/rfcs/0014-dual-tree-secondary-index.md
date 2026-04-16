@@ -503,9 +503,9 @@ SAFETY:` comments, and run the repository lint gate. [D10], [C4], [C7]
     MemTree, removing the single-tree catalog implementation, and generic
     B+Tree backend unification.
   - Task Doc: `docs/tasks/000120-secondary-index-runtime-access-and-recovery.md`
-  - Task Issue: `#0`
-  - Phase Status: `pending`
-  - Implementation Summary: `pending`
+  - Task Issue: `#559`
+  - Phase Status: done
+  - Implementation Summary: Implemented Phase 4 user-table dual-tree runtime and recovery cutover, preserving catalog single-tree indexes, routing foreground/rollback access through composite indexes, and using checkpointed DiskTree roots as cold recovery state. [Task Resolve Sync: docs/tasks/000120-secondary-index-runtime-access-and-recovery.md @ 2026-04-16]
 
 - **Phase 5: Cleanup, Eviction, And Parity Hardening**
   - Scope: remove migration scaffolding only after composite behavior is

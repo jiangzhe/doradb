@@ -1,7 +1,7 @@
 ---
 id: 000120
 title: Secondary Index Runtime Access And Recovery
-status: proposal
+status: implemented
 created: 2026-04-16
 github_issue: 559
 ---
@@ -220,6 +220,44 @@ cargo nextest run -p doradb-storage --no-default-features --features libaio
 
 ## Implementation Notes
 
+- User-table secondary indexes now use the Phase 3 dual-tree runtime directly:
+  `Table` owns `DualTreeSecondaryIndex<EvictableBufferPool>` values built from
+  existing MemTree indexes plus `ColumnStorage` secondary `DiskTree` runtimes.
+  Catalog tables stay on the existing `GenericSecondaryIndex<FixedBufferPool>`
+  path.
+- Foreground user-table lookup, uniqueness enforcement, insert, update, delete,
+  scan, rollback, and purge-facing cleanup now route through the dual-tree
+  unique/non-unique implementations. Rollback behavior was moved behind the
+  crate-level `IndexRollback` trait so user tables and catalog tables can use
+  their own index storage without table-specific delegate methods.
+- Recovery no longer backfills checkpointed cold user-table secondary-index
+  entries into MemTree. Checkpointed secondary `DiskTree` roots remain the cold
+  layer, while redo recovery rebuilds only hot row-page state into MemTree
+  through recovery-only insertion paths and replays newer cold-delete metadata
+  into `ColumnDeletionBuffer`.
+- Review fixes removed test-only production accessors, simplified
+  `build_dual_tree_secondary_indexes` into one construction loop, renamed the
+  generic MemTree conversion helper to `DualTreeSecondaryIndex::new`, added
+  descriptive `LogRecovery` field comments, and kept unique rollback stale
+  delete-marker cleanup conservative instead of traversing GC-owned undo chains.
+- Follow-up work was intentionally deferred to backlog docs:
+  `docs/backlogs/000087-refactor-recovery-process-parallel-log-replay.md` for
+  broader recovery cleanup/parallel replay and
+  `docs/backlogs/000088-remove-recovery-skip-option.md` for removing the
+  dangerous production-facing recovery skip option.
+- Validation completed:
+
+```bash
+cargo fmt --all --check
+cargo clippy -p doradb-storage --all-targets -- -D warnings
+cargo nextest run -p doradb-storage
+tools/coverage_focus.rs --path doradb-storage/src/trx/recover.rs --top-uncovered 20
+git diff --check
+```
+
+  The focused recovery coverage report was 97.19%, and the full
+  `doradb-storage` nextest run passed with 568 tests.
+
 ## Impacts
 
 - `doradb-storage/src/index/composite_secondary_index.rs`
@@ -282,10 +320,12 @@ cargo nextest run -p doradb-storage --no-default-features --features libaio
 
 ## Open Questions
 
-None blocking for this task.
+None blocking for the implemented task.
 
 Deferred follow-up:
-- Catalog table index-access cleanup is intentionally out of scope. During task
-  resolve, create a dedicated backlog if the implementation leaves concrete
-  follow-up work beyond the existing dual-tree access-path backlog
+- The access-context/caller-provided disk-guard redesign remains tracked by
   `docs/backlogs/000086-secondary-index-dual-tree-access-path.md`.
+- Recovery code cleanup and possible log replay parallelization are tracked by
+  `docs/backlogs/000087-refactor-recovery-process-parallel-log-replay.md`.
+- Removing the production-facing recovery skip option is tracked by
+  `docs/backlogs/000088-remove-recovery-skip-option.md`.
