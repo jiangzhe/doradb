@@ -3,7 +3,7 @@ id: 000120
 title: Secondary Index Runtime Access And Recovery
 status: proposal
 created: 2026-04-16
-github_issue: 0
+github_issue: 559
 ---
 
 # Task: Secondary Index Runtime Access And Recovery

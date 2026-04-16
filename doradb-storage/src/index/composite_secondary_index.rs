@@ -294,6 +294,12 @@ impl<P: BufferPool + 'static> UniqueIndex for DualTreeUniqueIndex<P> {
                 .compare_exchange(pool_guard, key, old_row_id, new_row_id, ts)
                 .await;
         }
+        // Delete-shadows are MemTree overlays. If purge removed the shadow
+        // between the caller's lookup and this compare-exchange, retry instead
+        // of comparing the masked RowID against the unmasked DiskTree owner.
+        if old_row_id.is_deleted() {
+            return Ok(IndexCompareExchange::NotExists);
+        }
         let disk_pool_guard = self.disk.disk_pool_guard();
         let disk = self.disk.open_unique(&disk_pool_guard)?;
         match disk.lookup(key).await? {
@@ -909,6 +915,13 @@ mod tests {
                     .await
                     .unwrap(),
                 IndexCompareExchange::Mismatch
+            );
+            assert_eq!(
+                index
+                    .compare_exchange(&index_guard, &key4, 40.deleted(), 400, 6)
+                    .await
+                    .unwrap(),
+                IndexCompareExchange::NotExists
             );
             assert_eq!(
                 index
