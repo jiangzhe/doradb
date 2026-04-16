@@ -6,13 +6,11 @@
 //! and non-unique trait contracts without wiring the composite into table
 //! runtime.
 
-#![cfg_attr(not(test), allow(dead_code))]
-
 use super::disk_tree::{
     NonUniqueDiskTree, NonUniqueDiskTreeRuntime, UniqueDiskTree, UniqueDiskTreeRuntime,
 };
 use super::non_unique_index::{GenericNonUniqueBTreeIndex, NonUniqueIndex, NonUniqueMemTreeEntry};
-use super::secondary_index::{IndexCompareExchange, IndexInsert};
+use super::secondary_index::{GenericSecondaryIndex, IndexCompareExchange, IndexInsert};
 use super::unique_index::{GenericUniqueBTreeIndex, UniqueIndex, UniqueMemTreeEntry};
 use crate::buffer::{BufferPool, PoolGuard, ReadonlyBufferPool};
 use crate::catalog::TableMetadata;
@@ -170,28 +168,50 @@ pub(crate) struct DualTreeUniqueIndex<P: 'static> {
 }
 
 impl<P: BufferPool> DualTreeUniqueIndex<P> {
-    /// Create a composite unique index from an existing MemTree and DiskTree runtime.
-    #[inline]
-    pub(crate) fn new(
-        mem: GenericUniqueBTreeIndex<P>,
-        disk: SecondaryDiskTreeRuntime,
-    ) -> Result<Self> {
-        if !disk.is_unique() {
-            return Err(Error::InvalidArgument);
-        }
-        Ok(Self { mem, disk })
-    }
-
     /// Return the cold DiskTree runtime used by this composite.
     #[inline]
     pub(crate) fn disk(&self) -> &SecondaryDiskTreeRuntime {
         &self.disk
     }
 
-    /// Return the MemTree backend used by this composite.
+    /// Destroy the mutable MemTree owned by this composite index.
     #[inline]
-    pub(crate) fn mem(&self) -> &GenericUniqueBTreeIndex<P> {
-        &self.mem
+    pub(crate) async fn destroy(self, pool_guard: &PoolGuard) -> Result<()> {
+        self.mem.destroy(pool_guard).await
+    }
+
+    /// Insert into the MemTree backend during recovery without probing DiskTree.
+    ///
+    /// Recovery uses this for hot/post-checkpoint row-page state. Checkpointed
+    /// cold state is already represented by the DiskTree root and must not be
+    /// treated as a duplicate while rebuilding MemTree.
+    #[inline]
+    pub(crate) async fn insert_recovery_mem_only(
+        &self,
+        pool_guard: &PoolGuard,
+        key: &[Val],
+        row_id: RowID,
+        merge_if_match_deleted: bool,
+        ts: TrxID,
+    ) -> Result<IndexInsert> {
+        self.mem
+            .insert_if_not_exists(pool_guard, key, row_id, merge_if_match_deleted, ts)
+            .await
+    }
+
+    /// Compare-exchange the MemTree backend during recovery without DiskTree access.
+    #[inline]
+    pub(crate) async fn compare_exchange_recovery_mem_only(
+        &self,
+        pool_guard: &PoolGuard,
+        key: &[Val],
+        old_row_id: RowID,
+        new_row_id: RowID,
+        ts: TrxID,
+    ) -> Result<IndexCompareExchange> {
+        self.mem
+            .compare_exchange(pool_guard, key, old_row_id, new_row_id, ts)
+            .await
     }
 }
 
@@ -316,28 +336,35 @@ pub(crate) struct DualTreeNonUniqueIndex<P: 'static> {
 }
 
 impl<P: BufferPool> DualTreeNonUniqueIndex<P> {
-    /// Create a composite non-unique index from an existing MemTree and DiskTree runtime.
-    #[inline]
-    pub(crate) fn new(
-        mem: GenericNonUniqueBTreeIndex<P>,
-        disk: SecondaryDiskTreeRuntime,
-    ) -> Result<Self> {
-        if disk.is_unique() {
-            return Err(Error::InvalidArgument);
-        }
-        Ok(Self { mem, disk })
-    }
-
     /// Return the cold DiskTree runtime used by this composite.
     #[inline]
     pub(crate) fn disk(&self) -> &SecondaryDiskTreeRuntime {
         &self.disk
     }
 
-    /// Return the MemTree backend used by this composite.
+    /// Destroy the mutable MemTree owned by this composite index.
     #[inline]
-    pub(crate) fn mem(&self) -> &GenericNonUniqueBTreeIndex<P> {
-        &self.mem
+    pub(crate) async fn destroy(self, pool_guard: &PoolGuard) -> Result<()> {
+        self.mem.destroy(pool_guard).await
+    }
+
+    /// Insert into the MemTree backend during recovery without probing DiskTree.
+    ///
+    /// Non-unique DiskTree exact entries are checkpointed cold state. Hot redo
+    /// rebuilds only exact MemTree entries and must not reject a row because a
+    /// checkpointed cold exact entry exists.
+    #[inline]
+    pub(crate) async fn insert_recovery_mem_only(
+        &self,
+        pool_guard: &PoolGuard,
+        key: &[Val],
+        row_id: RowID,
+        merge_if_match_deleted: bool,
+        ts: TrxID,
+    ) -> Result<IndexInsert> {
+        self.mem
+            .insert_if_not_exists(pool_guard, key, row_id, merge_if_match_deleted, ts)
+            .await
     }
 }
 
@@ -493,6 +520,36 @@ pub(crate) enum DualTreeSecondaryIndex<P: 'static> {
 }
 
 impl<P: BufferPool> DualTreeSecondaryIndex<P> {
+    /// Pair a freshly built generic MemTree with its cold DiskTree runtime.
+    #[inline]
+    pub(crate) async fn new(
+        mem_index: GenericSecondaryIndex<P>,
+        disk: SecondaryDiskTreeRuntime,
+        pool_guard: &PoolGuard,
+    ) -> Result<Self> {
+        let unique = mem_index.is_unique();
+        if disk.index_no() != mem_index.index_no || disk.is_unique() != unique {
+            let _ = mem_index.destroy(pool_guard).await;
+            return Err(Error::InvalidState);
+        }
+        if unique {
+            let (_, mem) = mem_index.into_unique().ok_or(Error::InvalidState)?;
+            Ok(Self::Unique(DualTreeUniqueIndex { mem, disk }))
+        } else {
+            let (_, mem) = mem_index.into_non_unique().ok_or(Error::InvalidState)?;
+            Ok(Self::NonUnique(DualTreeNonUniqueIndex { mem, disk }))
+        }
+    }
+
+    /// Destroy the mutable MemTree owned by this composite index.
+    #[inline]
+    pub(crate) async fn destroy(self, pool_guard: &PoolGuard) -> Result<()> {
+        match self {
+            Self::Unique(index) => index.destroy(pool_guard).await,
+            Self::NonUnique(index) => index.destroy(pool_guard).await,
+        }
+    }
+
     /// Return whether this composite index enforces uniqueness.
     #[inline]
     pub(crate) fn is_unique(&self) -> bool {
@@ -505,6 +562,24 @@ impl<P: BufferPool> DualTreeSecondaryIndex<P> {
         match self {
             Self::Unique(index) => index.disk().index_no(),
             Self::NonUnique(index) => index.disk().index_no(),
+        }
+    }
+
+    /// Returns the unique-index view when this slot is unique.
+    #[inline]
+    pub(crate) fn unique(&self) -> Option<&DualTreeUniqueIndex<P>> {
+        match self {
+            Self::Unique(index) => Some(index),
+            Self::NonUnique(_) => None,
+        }
+    }
+
+    /// Returns the non-unique-index view when this slot is non-unique.
+    #[inline]
+    pub(crate) fn non_unique(&self) -> Option<&DualTreeNonUniqueIndex<P>> {
+        match self {
+            Self::Unique(_) => None,
+            Self::NonUnique(index) => Some(index),
         }
     }
 }
@@ -776,13 +851,13 @@ mod tests {
                 disk_pool.global_pool().clone(),
             )
             .unwrap();
-            let index = DualTreeUniqueIndex::new(mem, runtime).unwrap();
+            let index = DualTreeUniqueIndex { mem, disk: runtime };
 
             assert_eq!(index.disk().published_root().unwrap(), root);
             assert_eq!(index.disk().index_no(), 0);
             assert!(
                 index
-                    .mem()
+                    .mem
                     .lookup(&index_guard, &key1, 3)
                     .await
                     .unwrap()
@@ -1001,13 +1076,13 @@ mod tests {
                 disk_pool.global_pool().clone(),
             )
             .unwrap();
-            let index = DualTreeNonUniqueIndex::new(mem, runtime).unwrap();
+            let index = DualTreeNonUniqueIndex { mem, disk: runtime };
 
             assert_eq!(index.disk().published_root().unwrap(), root);
             assert_eq!(index.disk().index_no(), 1);
             assert!(
                 index
-                    .mem()
+                    .mem
                     .lookup_unique(&index_guard, &key1, 12, 3)
                     .await
                     .unwrap()
@@ -1132,7 +1207,7 @@ mod tests {
             )
             .unwrap();
             let composite =
-                DualTreeSecondaryIndex::Unique(DualTreeUniqueIndex::new(mem, runtime).unwrap());
+                DualTreeSecondaryIndex::Unique(DualTreeUniqueIndex { mem, disk: runtime });
             assert!(composite.is_unique());
             assert_eq!(composite.index_no(), 0);
 
@@ -1144,9 +1219,8 @@ mod tests {
                 disk_pool.global_pool().clone(),
             )
             .unwrap();
-            let composite = DualTreeSecondaryIndex::NonUnique(
-                DualTreeNonUniqueIndex::new(mem, runtime).unwrap(),
-            );
+            let composite =
+                DualTreeSecondaryIndex::NonUnique(DualTreeNonUniqueIndex { mem, disk: runtime });
             assert!(!composite.is_unique());
             assert_eq!(composite.index_no(), 1);
         });

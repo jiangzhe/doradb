@@ -94,7 +94,7 @@ impl SharedTrxStatus {
     /// Returns the timestamp of current transaction.
     #[inline]
     pub fn ts(&self) -> TrxID {
-        self.ts.load(Ordering::Relaxed)
+        self.ts.load(Ordering::Acquire)
     }
 
     /// Returns whether this transaction is preparing.

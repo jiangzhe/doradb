@@ -30,7 +30,7 @@ use crate::trx::log::{LogPartition, LogPartitionInitializer};
 use crate::trx::log_replay::{LogMerger, LogPartitionStream, TrxLog};
 use crate::trx::purge::GC;
 use crate::trx::redo::{DDLRedo, RedoLogs, RowRedo, RowRedoKind, TableDML};
-use crate::trx::{MIN_SNAPSHOT_TS, TrxID};
+use crate::trx::{MAX_SNAPSHOT_TS, MIN_SNAPSHOT_TS, TrxID};
 use crossbeam_utils::CachePadded;
 use flume::Receiver;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -100,7 +100,7 @@ pub(crate) async fn log_recover(
     catalog: &Catalog,
     mut log_partition_initializers: Vec<LogPartitionInitializer>,
     skip: bool,
-) -> Result<(Vec<CachePadded<LogPartition>>, Vec<Receiver<GC>>)> {
+) -> Result<(Vec<CachePadded<LogPartition>>, Vec<Receiver<GC>>, TrxID)> {
     let RecoveryDeps {
         index_pool,
         mem_pool,
@@ -110,6 +110,7 @@ pub(crate) async fn log_recover(
     // In recovery, we disable GC and redo logging.
     // All data are purely processed in memory and if
     // any failure occurs, we abort the whole process.
+    let mut next_trx_ts = MIN_SNAPSHOT_TS;
     if !skip {
         let log_partitions = log_partition_initializers.len();
         let mut log_merger = LogMerger::default();
@@ -120,7 +121,11 @@ pub(crate) async fn log_recover(
         let log_recovery = LogRecovery::new(
             meta_pool, index_pool, mem_pool, table_fs, disk_pool, catalog, log_merger,
         );
-        let log_streams = log_recovery.recover_all().await?;
+        let (log_streams, max_recovered_cts) = log_recovery.recover_all().await?;
+        next_trx_ts = max_recovered_cts
+            .checked_add(1)
+            .filter(|ts| *ts < MAX_SNAPSHOT_TS)
+            .ok_or(Error::InvalidState)?;
         log_partition_initializers = log_streams
             .into_iter()
             .map(|s| s.into_initializer())
@@ -135,7 +140,7 @@ pub(crate) async fn log_recover(
         partitions.push(CachePadded::new(partition));
         gc_rxs.push(gc_rx);
     }
-    Ok((partitions, gc_rxs))
+    Ok((partitions, gc_rxs, next_trx_ts))
 }
 
 pub(crate) struct RecoveryDeps {
@@ -147,24 +152,50 @@ pub(crate) struct RecoveryDeps {
 
 /// Redo-log recovery coordinator for catalog metadata and user tables.
 pub struct LogRecovery<'a> {
+    /// Mutable secondary-index buffer pool used while rebuilding hot MemTree state.
     index_pool: QuiescentGuard<EvictableBufferPool>,
+    /// Mutable row-page buffer pool used for recovered heap pages.
     mem_pool: QuiescentGuard<EvictableBufferPool>,
+    /// Table file system used to reload checkpointed user-table files.
     table_fs: QuiescentGuard<FileSystem>,
+    /// Readonly disk buffer pool used by checkpointed column and DiskTree state.
     disk_pool: QuiescentGuard<ReadonlyBufferPool>,
+    /// Catalog runtime being rebuilt from checkpointed metadata and redo logs.
     catalog: &'a Catalog,
+    /// Ordered view over all redo-log partitions.
     log_merger: LogMerger,
+    /// Catalog checkpoint boundary. Catalog redo before this timestamp is
+    /// already reflected in checkpointed catalog state.
     catalog_replay_start_ts: TrxID,
+    /// Earliest redo timestamp that may still affect any loaded runtime state.
+    ///
+    /// This starts at the catalog replay boundary and is lowered by loaded
+    /// user-table heap/delete replay starts so old irrelevant log records can be
+    /// skipped before per-table filtering.
     replay_floor: TrxID,
+    /// Highest timestamp observed in checkpoint metadata, table roots, or redo
+    /// log headers during recovery.
+    ///
+    /// This is a timestamp-generator watermark, not a replay filter. It is
+    /// updated even for redo records skipped by replay boundaries so runtime
+    /// transaction timestamps restart at `max_recovered_cts + 1` and never reuse
+    /// a historical CTS.
+    max_recovered_cts: TrxID,
+    /// Per loaded user table, the persisted replay boundaries from its active root.
     table_states: HashMap<TableID, RecoveryTableState>,
+    /// Hot row pages touched by redo replay, grouped by table for post-replay
+    /// index rebuild and undo-map refresh.
     recovered_tables: HashMap<TableID, BTreeSet<PageID>>,
+    /// Stable pool guards shared by recovery operations.
     pool_guards: PoolGuards,
 }
 
 #[derive(Clone, Copy, Debug)]
 struct RecoveryTableState {
+    /// Lower bound for replaying heap row-page redo for this table.
     heap_redo_start_ts: TrxID,
+    /// Lower bound for replaying persisted cold-delete metadata for this table.
     deletion_cutoff_ts: TrxID,
-    preloaded_from_checkpoint: bool,
 }
 
 impl RecoveryTableState {
@@ -200,6 +231,7 @@ impl<'a> LogRecovery<'a> {
             log_merger,
             catalog_replay_start_ts: MIN_SNAPSHOT_TS,
             replay_floor: MIN_SNAPSHOT_TS,
+            max_recovered_cts: MIN_SNAPSHOT_TS,
             table_states: HashMap::new(),
             recovered_tables: HashMap::new(),
             pool_guards,
@@ -208,7 +240,7 @@ impl<'a> LogRecovery<'a> {
 
     /// Replay all redo streams, rebuild indexes, and return reopened partition streams.
     #[inline]
-    pub async fn recover_all(mut self) -> Result<Vec<LogPartitionStream>> {
+    pub async fn recover_all(mut self) -> Result<(Vec<LogPartitionStream>, TrxID)> {
         self.bootstrap_checkpointed_user_tables().await?;
         // 1. replay all DDLs and DMLs.
         while let Some(log) = self.log_merger.try_next()? {
@@ -217,13 +249,14 @@ impl<'a> LogRecovery<'a> {
         // 2. Rebuild all indexes and refresh pages to enable undo map.
         self.recover_indexes_and_refresh_pages().await?;
 
-        Ok(self.log_merger.finished_streams())
+        Ok((self.log_merger.finished_streams(), self.max_recovered_cts))
     }
 
     async fn bootstrap_checkpointed_user_tables(&mut self) -> Result<()> {
         let snapshot = self.catalog.storage.checkpoint_snapshot()?;
         self.catalog_replay_start_ts = snapshot.catalog_replay_start_ts;
         self.replay_floor = snapshot.catalog_replay_start_ts;
+        self.max_recovered_cts = self.max_recovered_cts.max(snapshot.catalog_replay_start_ts);
 
         for table in self
             .catalog
@@ -245,7 +278,7 @@ impl<'a> LogRecovery<'a> {
                     table.table_id,
                 )
                 .await?;
-            self.track_loaded_table(table.table_id, true).await?;
+            self.track_loaded_table(table.table_id).await?;
             let state = self
                 .table_states
                 .get(&table.table_id)
@@ -260,24 +293,21 @@ impl<'a> LogRecovery<'a> {
         cts >= self.catalog_replay_start_ts
     }
 
-    async fn track_loaded_table(
-        &mut self,
-        table_id: TableID,
-        preloaded_from_checkpoint: bool,
-    ) -> Result<()> {
+    async fn track_loaded_table(&mut self, table_id: TableID) -> Result<()> {
         let table = self
             .catalog
             .get_table(table_id)
             .await
             .ok_or(Error::TableNotFound)?;
-        let old = self.table_states.insert(
-            table_id,
-            RecoveryTableState {
-                heap_redo_start_ts: table.file().active_root().heap_redo_start_ts,
-                deletion_cutoff_ts: table.file().active_root().deletion_cutoff_ts,
-                preloaded_from_checkpoint,
-            },
-        );
+        let state = RecoveryTableState {
+            heap_redo_start_ts: table.file().active_root().heap_redo_start_ts,
+            deletion_cutoff_ts: table.file().active_root().deletion_cutoff_ts,
+        };
+        self.max_recovered_cts = self
+            .max_recovered_cts
+            .max(state.heap_redo_start_ts)
+            .max(state.deletion_cutoff_ts);
+        let old = self.table_states.insert(table_id, state);
         if old.is_some() {
             return Err(Error::TableAlreadyExists);
         }
@@ -311,6 +341,7 @@ impl<'a> LogRecovery<'a> {
     async fn replay_log(&mut self, log: TrxLog) -> Result<()> {
         // sequentially replay redo log.
         let (header, RedoLogs { ddl, dml }) = log.into_inner();
+        self.max_recovered_cts = self.max_recovered_cts.max(header.cts);
         if header.cts < self.replay_floor {
             return Ok(());
         }
@@ -329,20 +360,8 @@ impl<'a> LogRecovery<'a> {
     }
 
     async fn recover_indexes_and_refresh_pages(&mut self) -> Result<()> {
-        for (&table_id, state) in &self.table_states {
-            if !state.preloaded_from_checkpoint {
-                continue;
-            }
-            let table = self
-                .catalog
-                .get_table(table_id)
-                .await
-                .ok_or(Error::TableNotFound)?;
-            table
-                .populate_index_via_persisted_data(&self.pool_guards)
-                .await?;
-        }
-        // recover index with all data.
+        // Checkpointed cold secondary-index state is already available through
+        // the table's DiskTree roots. Rebuild only hot row-page MemTree state.
         for (table_id, pages) in &self.recovered_tables {
             if let Some(table) = self.catalog.get_table(*table_id).await {
                 let metadata = Arc::new(table.metadata().clone());
@@ -407,7 +426,7 @@ impl<'a> LogRecovery<'a> {
                         *table_id,
                     )
                     .await?;
-                self.track_loaded_table(*table_id, false).await?;
+                self.track_loaded_table(*table_id).await?;
             }
             DDLRedo::DropTable(table_id) => {
                 if !self.should_replay_catalog(cts) {
@@ -642,7 +661,10 @@ mod tests {
     use crate::error::{BlockCorruptionCause, BlockKind, Error, FileKind};
     use crate::file::block_integrity::{BLOCK_INTEGRITY_HEADER_SIZE, write_block_checksum};
     use crate::file::cow_file::COW_FILE_PAGE_SIZE;
-    use crate::index::{COLUMN_DELETION_BLOB_PAGE_HEADER_SIZE, ColumnBlockIndex};
+    use crate::index::{
+        COLUMN_DELETION_BLOB_PAGE_HEADER_SIZE, ColumnBlockIndex, UniqueIndex,
+        load_entry_deletion_deltas,
+    };
     use crate::row::RowRead;
     use crate::row::ops::{DeleteMvcc, InsertMvcc, SelectKey, SelectMvcc, UpdateCol, UpdateMvcc};
     use crate::table::{DeleteMarker, TableAccess, TablePersistence};
@@ -675,14 +697,12 @@ mod tests {
         let heap_first = RecoveryTableState {
             heap_redo_start_ts: 7,
             deletion_cutoff_ts: 11,
-            preloaded_from_checkpoint: true,
         };
         assert_eq!(heap_first.replay_start_ts(), 7);
 
         let deletion_first = RecoveryTableState {
             heap_redo_start_ts: 19,
             deletion_cutoff_ts: 13,
-            preloaded_from_checkpoint: true,
         };
         assert_eq!(deletion_first.replay_start_ts(), 13);
     }
@@ -1045,7 +1065,7 @@ mod tests {
     }
 
     #[test]
-    fn test_log_recover_skips_pre_checkpoint_table_redo_and_rebuilds_persisted_index() {
+    fn test_log_recover_reads_checkpointed_secondary_from_disk_tree_without_mem_backfill() {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
             let main_dir = temp_dir.path().to_path_buf();
@@ -1100,7 +1120,10 @@ mod tests {
             let insert = stmt
                 .insert_row(&table, vec![Val::from(7u32), Val::from("cold-row")])
                 .await;
-            assert!(matches!(insert, Ok(InsertMvcc::Inserted(_))));
+            let cold_row_id = match insert {
+                Ok(InsertMvcc::Inserted(row_id)) => row_id,
+                other => panic!("expected cold insert success, got {other:?}"),
+            };
             trx = stmt.succeed();
             trx.commit().await.unwrap();
 
@@ -1139,10 +1162,167 @@ mod tests {
             let trx = session.try_begin_trx().unwrap().unwrap();
             let stmt = trx.start_stmt();
             let key = SelectKey::new(0, vec![Val::from(7u32)]);
+            let index = table.sec_idx()[key.index_no].unique().unwrap();
+            let disk = index
+                .disk()
+                .open_unique(session.pool_guards().disk_guard())
+                .unwrap();
+            assert_eq!(disk.lookup(&key.vals).await.unwrap(), Some(cold_row_id));
+            assert_eq!(
+                index
+                    .lookup(
+                        session.pool_guards().index_guard(),
+                        &key.vals,
+                        MIN_SNAPSHOT_TS
+                    )
+                    .await
+                    .unwrap(),
+                Some((cold_row_id, false))
+            );
             let row = stmt.select_row_mvcc(&table, &key, &[0, 1]).await;
             assert_eq!(
                 row.unwrap().unwrap_found(),
                 vec![Val::from(7u32), Val::from("cold-row")]
+            );
+            stmt.succeed().commit().await.unwrap();
+
+            drop(table);
+            drop(session);
+            drop(engine);
+        })
+    }
+
+    #[test]
+    fn test_log_recover_rebuilds_hot_unique_memtree_over_checkpointed_cold_duplicate() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let main_dir = temp_dir.path().to_path_buf();
+            let engine = EngineConfig::default()
+                .storage_root(main_dir.clone())
+                .data_buffer(
+                    EvictableBufferPoolConfig::default()
+                        .role(PoolRole::Mem)
+                        .max_mem_size(64usize * 1024 * 1024)
+                        .max_file_size(128usize * 1024 * 1024),
+                )
+                .trx(
+                    TrxSysConfig::default()
+                        .log_file_stem("recover11")
+                        .skip_recovery(false),
+                )
+                .build()
+                .await
+                .unwrap();
+
+            let mut session = engine.try_new_session().unwrap();
+            let table_id = session
+                .create_table(
+                    TableSpec::new(vec![
+                        ColumnSpec::new("id", ValKind::U32, ColumnAttributes::empty()),
+                        ColumnSpec::new("name", ValKind::VarByte, ColumnAttributes::empty()),
+                    ]),
+                    vec![IndexSpec::new(
+                        "idx_t11_pk",
+                        vec![IndexKey::new(0)],
+                        IndexAttributes::PK,
+                    )],
+                )
+                .await
+                .unwrap();
+
+            engine
+                .catalog()
+                .checkpoint_now(&engine.trx_sys)
+                .await
+                .unwrap();
+
+            let table = engine.catalog().get_table(table_id).await.unwrap();
+            let mut trx = session.try_begin_trx().unwrap().unwrap();
+            let mut stmt = trx.start_stmt();
+            let insert = stmt
+                .insert_row(&table, vec![Val::from(7u32), Val::from("cold-row")])
+                .await;
+            let Ok(InsertMvcc::Inserted(cold_row_id)) = insert else {
+                panic!("cold insert should succeed");
+            };
+            trx = stmt.succeed();
+            trx.commit().await.unwrap();
+
+            table.freeze(&session, usize::MAX).await;
+            let mut checkpoint_session = engine.try_new_session().unwrap();
+            table.checkpoint(&mut checkpoint_session).await.unwrap();
+            assert!(table.file().active_root().pivot_row_id > cold_row_id);
+
+            let key = SelectKey::new(0, vec![Val::from(7u32)]);
+            let mut trx = session.try_begin_trx().unwrap().unwrap();
+            let mut stmt = trx.start_stmt();
+            let delete = stmt.delete_row(&table, &key).await;
+            assert!(matches!(delete, Ok(DeleteMvcc::Deleted)));
+            trx = stmt.succeed();
+            trx.commit().await.unwrap();
+
+            let mut trx = session.try_begin_trx().unwrap().unwrap();
+            let mut stmt = trx.start_stmt();
+            let insert = stmt
+                .insert_row(&table, vec![Val::from(7u32), Val::from("hot-row")])
+                .await;
+            let Ok(InsertMvcc::Inserted(hot_row_id)) = insert else {
+                panic!("hot insert should reclaim deleted cold key");
+            };
+            assert_ne!(cold_row_id, hot_row_id);
+            trx = stmt.succeed();
+            trx.commit().await.unwrap();
+
+            drop(table);
+            drop(checkpoint_session);
+            drop(session);
+            drop(engine);
+
+            let engine = EngineConfig::default()
+                .storage_root(main_dir)
+                .data_buffer(
+                    EvictableBufferPoolConfig::default()
+                        .role(PoolRole::Mem)
+                        .max_mem_size(64usize * 1024 * 1024)
+                        .max_file_size(128usize * 1024 * 1024),
+                )
+                .trx(
+                    TrxSysConfig::default()
+                        .log_file_stem("recover11")
+                        .skip_recovery(false),
+                )
+                .build()
+                .await
+                .unwrap();
+
+            let table = engine.catalog().get_table(table_id).await.unwrap();
+            let mut session = engine.try_new_session().unwrap();
+            assert!(table.total_row_pages(session.pool_guards()).await > 0);
+
+            let index = table.sec_idx()[key.index_no].unique().unwrap();
+            let disk = index
+                .disk()
+                .open_unique(session.pool_guards().disk_guard())
+                .unwrap();
+            assert_eq!(disk.lookup(&key.vals).await.unwrap(), Some(cold_row_id));
+            assert_eq!(
+                index
+                    .lookup(
+                        session.pool_guards().index_guard(),
+                        &key.vals,
+                        MIN_SNAPSHOT_TS
+                    )
+                    .await
+                    .unwrap(),
+                Some((hot_row_id, false))
+            );
+
+            let trx = session.try_begin_trx().unwrap().unwrap();
+            let stmt = trx.start_stmt();
+            let row = stmt.select_row_mvcc(&table, &key, &[0, 1]).await;
+            assert_eq!(
+                row.unwrap().unwrap_found(),
+                vec![Val::from(7u32), Val::from("hot-row")]
             );
             stmt.succeed().commit().await.unwrap();
 
@@ -1655,7 +1835,7 @@ mod tests {
     }
 
     #[test]
-    fn test_log_recover_fails_on_corrupted_persisted_lwc_block() {
+    fn test_log_recover_defers_corrupted_persisted_lwc_block_until_read() {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
             let main_dir = temp_dir.path().to_path_buf();
@@ -1741,7 +1921,7 @@ mod tests {
 
             corrupt_page_checksum(table_file_path, block_id);
 
-            let err = match EngineConfig::default()
+            let engine = EngineConfig::default()
                 .storage_root(main_dir)
                 .data_buffer(
                     EvictableBufferPoolConfig::default()
@@ -1756,24 +1936,34 @@ mod tests {
                 )
                 .build()
                 .await
-            {
-                Ok(_) => panic!("expected recovery corruption failure"),
-                Err(err) => err,
-            };
-            assert!(matches!(
-                err,
-                Error::BlockCorrupted {
+                .unwrap();
+
+            let table = engine.catalog().get_table(table_id).await.unwrap();
+            let mut session = engine.try_new_session().unwrap();
+            let mut trx = session.try_begin_trx().unwrap().unwrap();
+            let stmt = trx.start_stmt();
+            let key = SelectKey::new(0, vec![Val::from(7u32)]);
+            let res = stmt.select_row_mvcc(&table, &key, &[0, 1]).await;
+            match res {
+                Err(Error::BlockCorrupted {
                     file_kind: FileKind::TableFile,
                     block_kind: BlockKind::LwcBlock,
                     block_id: page_id,
                     cause: BlockCorruptionCause::ChecksumMismatch,
-                } if page_id == block_id
-            ));
+                }) => assert_eq!(page_id, block_id),
+                other => panic!("expected persisted LWC corruption on read, got {other:?}"),
+            }
+            trx = stmt.fail().await.unwrap();
+            trx.rollback().await.unwrap();
+
+            drop(table);
+            drop(session);
+            drop(engine);
         })
     }
 
     #[test]
-    fn test_log_recover_fails_on_invalid_delete_blob_framing() {
+    fn test_log_recover_defers_invalid_delete_blob_framing_until_delta_load() {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
             let main_dir = temp_dir.path().to_path_buf();
@@ -1905,7 +2095,7 @@ mod tests {
                 blob_ref.start_offset,
             );
 
-            let err = match EngineConfig::default()
+            let engine = EngineConfig::default()
                 .storage_root(main_dir)
                 .data_buffer(
                     EvictableBufferPoolConfig::default()
@@ -1920,19 +2110,41 @@ mod tests {
                 )
                 .build()
                 .await
-            {
-                Ok(_) => panic!("expected recovery invalid-delete-blob failure"),
+                .unwrap();
+
+            let table = engine.catalog().get_table(table_id).await.unwrap();
+            let session = engine.try_new_session().unwrap();
+            let active_root = table.file().active_root();
+            let index = ColumnBlockIndex::new(
+                active_root.column_block_index_root,
+                active_root.pivot_row_id,
+                table.file().file_kind(),
+                table.file().sparse_file(),
+                table.disk_pool(),
+                session.pool_guards().disk_guard(),
+            );
+            let entry = index
+                .locate_block(0)
+                .await
+                .unwrap()
+                .expect("deleted row should still have a checkpoint entry");
+            let err = match load_entry_deletion_deltas(&index, &entry).await {
+                Ok(_) => panic!("expected invalid delete blob on delta load"),
                 Err(err) => err,
             };
-            assert!(matches!(
-                err,
+            match err {
                 Error::BlockCorrupted {
                     file_kind: FileKind::TableFile,
                     block_kind: BlockKind::ColumnDeletionBlob,
                     block_id: page_id,
                     cause: BlockCorruptionCause::InvalidPayload,
-                } if page_id == blob_ref.start_page_id
-            ));
+                } => assert_eq!(page_id, blob_ref.start_page_id),
+                other => panic!("expected invalid delete blob on delta load, got {other:?}"),
+            }
+
+            drop(table);
+            drop(session);
+            drop(engine);
         })
     }
 }

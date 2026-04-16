@@ -110,10 +110,12 @@ impl TransactionSystem {
         config: TrxSysConfig,
         catalog: QuiescentGuard<Catalog>,
         log_partitions: Vec<CachePadded<LogPartition>>,
+        initial_ts: TrxID,
     ) -> Self {
+        debug_assert!((MIN_SNAPSHOT_TS..MAX_SNAPSHOT_TS).contains(&initial_ts));
         TransactionSystem {
-            ts: CachePadded::new(AtomicU64::new(MIN_SNAPSHOT_TS)),
-            global_visible_sts: CachePadded::new(AtomicU64::new(MIN_SNAPSHOT_TS)),
+            ts: CachePadded::new(AtomicU64::new(initial_ts)),
+            global_visible_sts: CachePadded::new(AtomicU64::new(initial_ts)),
             rr_partition_id: CachePadded::new(AtomicUsize::new(0)),
             log_partitions: CachePadded::new(log_partitions.into_boxed_slice()),
             config: CachePadded::new(config),

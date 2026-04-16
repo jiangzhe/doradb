@@ -502,7 +502,7 @@ SAFETY:` comments, and run the repository lint gate. [D10], [C4], [C7]
     visibility authority, rebuilding checkpointed cold DiskTree entries into
     MemTree, removing the single-tree catalog implementation, and generic
     B+Tree backend unification.
-  - Task Doc: `docs/tasks/TBD.md`
+  - Task Doc: `docs/tasks/000120-secondary-index-runtime-access-and-recovery.md`
   - Task Issue: `#0`
   - Phase Status: `pending`
   - Implementation Summary: `pending`
