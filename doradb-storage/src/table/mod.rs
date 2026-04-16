@@ -220,6 +220,8 @@ pub(crate) async fn build_secondary_indexes<I: BufferPool + 'static>(
     Ok(builder.publish())
 }
 
+/// Build user-table dual-tree secondary indexes from fresh MemTree backends
+/// paired with the table file's checkpointed DiskTree runtimes.
 #[inline]
 pub(crate) async fn build_dual_tree_secondary_indexes(
     index_pool: QuiescentGuard<EvictableBufferPool>,

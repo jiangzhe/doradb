@@ -9,12 +9,23 @@ use crate::row::ops::SelectKey;
 use crate::trx::TrxID;
 use crate::trx::undo::{IndexUndo, IndexUndoKind};
 
+/// Rollback adapter for table-specific secondary-index runtimes.
+///
+/// User tables route rollback through dual-tree secondary indexes, while
+/// catalog tables keep using their in-memory generic indexes. Implementors
+/// provide the primitive index operations; the shared rollback body applies
+/// undo entries in reverse order and preserves the exact old index value
+/// recorded in the undo log.
 pub(crate) trait IndexRollback {
+    /// Row buffer pool type owned by the table runtime.
     type RowPool: BufferPool + 'static;
+    /// Secondary-index buffer pool type owned by the table runtime.
     type IndexPool: BufferPool + 'static;
 
+    /// Returns the shared MemTable metadata and index-pool binding.
     fn mem_table(&self) -> &GenericMemTable<Self::RowPool, Self::IndexPool>;
 
+    /// Marks an existing unique entry as deleted.
     async fn unique_mask_as_deleted(
         &self,
         index_pool_guard: &PoolGuard,
@@ -23,6 +34,7 @@ pub(crate) trait IndexRollback {
         ts: TrxID,
     ) -> Result<bool>;
 
+    /// Removes a unique entry when the current value matches `row_id`.
     async fn unique_compare_delete(
         &self,
         index_pool_guard: &PoolGuard,
@@ -32,6 +44,7 @@ pub(crate) trait IndexRollback {
         ts: TrxID,
     ) -> Result<bool>;
 
+    /// Atomically replaces a unique entry when the current value matches.
     async fn unique_compare_exchange(
         &self,
         index_pool_guard: &PoolGuard,
@@ -41,6 +54,7 @@ pub(crate) trait IndexRollback {
         ts: TrxID,
     ) -> Result<IndexCompareExchange>;
 
+    /// Marks an existing non-unique exact entry as deleted.
     async fn non_unique_mask_as_deleted(
         &self,
         index_pool_guard: &PoolGuard,
@@ -49,6 +63,7 @@ pub(crate) trait IndexRollback {
         ts: TrxID,
     ) -> Result<bool>;
 
+    /// Marks an existing non-unique exact entry as active.
     async fn non_unique_mask_as_active(
         &self,
         index_pool_guard: &PoolGuard,
@@ -57,6 +72,7 @@ pub(crate) trait IndexRollback {
         ts: TrxID,
     ) -> Result<bool>;
 
+    /// Removes a non-unique exact entry when the current value matches.
     async fn non_unique_compare_delete(
         &self,
         index_pool_guard: &PoolGuard,
@@ -66,6 +82,7 @@ pub(crate) trait IndexRollback {
         ts: TrxID,
     ) -> Result<bool>;
 
+    /// Rolls back one secondary-index undo entry against this table runtime.
     async fn rollback_index_entry(
         &self,
         entry: IndexUndo,

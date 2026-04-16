@@ -1333,6 +1333,152 @@ mod tests {
     }
 
     #[test]
+    fn test_log_recover_non_unique_disk_tree_scan_suppresses_exact_cold_delete() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let main_dir = temp_dir.path().to_path_buf();
+            let engine = EngineConfig::default()
+                .storage_root(main_dir.clone())
+                .data_buffer(
+                    EvictableBufferPoolConfig::default()
+                        .role(PoolRole::Mem)
+                        .max_mem_size(64usize * 1024 * 1024)
+                        .max_file_size(128usize * 1024 * 1024),
+                )
+                .trx(
+                    TrxSysConfig::default()
+                        .log_file_stem("recover12")
+                        .skip_recovery(false),
+                )
+                .build()
+                .await
+                .unwrap();
+
+            let mut session = engine.try_new_session().unwrap();
+            let table_id = session
+                .create_table(
+                    TableSpec::new(vec![
+                        ColumnSpec::new("id", ValKind::U32, ColumnAttributes::empty()),
+                        ColumnSpec::new("name", ValKind::VarByte, ColumnAttributes::empty()),
+                    ]),
+                    vec![
+                        IndexSpec::new("idx_t12_pk", vec![IndexKey::new(0)], IndexAttributes::PK),
+                        IndexSpec::new(
+                            "idx_t12_name",
+                            vec![IndexKey::new(1)],
+                            IndexAttributes::empty(),
+                        ),
+                    ],
+                )
+                .await
+                .unwrap();
+
+            engine
+                .catalog()
+                .checkpoint_now(&engine.trx_sys)
+                .await
+                .unwrap();
+
+            let table = engine.catalog().get_table(table_id).await.unwrap();
+            let mut same_row_ids = Vec::new();
+            let mut trx = session.try_begin_trx().unwrap().unwrap();
+            for id in [1u32, 2, 3] {
+                let mut stmt = trx.start_stmt();
+                let insert = stmt
+                    .insert_row(&table, vec![Val::from(id), Val::from("same-name")])
+                    .await;
+                let Ok(InsertMvcc::Inserted(row_id)) = insert else {
+                    panic!("same-name insert should succeed");
+                };
+                same_row_ids.push(row_id);
+                trx = stmt.succeed();
+            }
+            trx.commit().await.unwrap();
+
+            table.freeze(&session, usize::MAX).await;
+            let mut checkpoint_session = engine.try_new_session().unwrap();
+            table.checkpoint(&mut checkpoint_session).await.unwrap();
+            assert!(
+                same_row_ids
+                    .iter()
+                    .all(|row_id| *row_id < table.file().active_root().pivot_row_id)
+            );
+
+            let delete_key = SelectKey::new(0, vec![Val::from(2u32)]);
+            let mut trx = session.try_begin_trx().unwrap().unwrap();
+            let mut stmt = trx.start_stmt();
+            let delete = stmt.delete_row(&table, &delete_key).await;
+            assert!(matches!(delete, Ok(DeleteMvcc::Deleted)));
+            trx = stmt.succeed();
+            trx.commit().await.unwrap();
+
+            drop(table);
+            drop(checkpoint_session);
+            drop(session);
+            drop(engine);
+
+            let engine = EngineConfig::default()
+                .storage_root(main_dir)
+                .data_buffer(
+                    EvictableBufferPoolConfig::default()
+                        .role(PoolRole::Mem)
+                        .max_mem_size(64usize * 1024 * 1024)
+                        .max_file_size(128usize * 1024 * 1024),
+                )
+                .trx(
+                    TrxSysConfig::default()
+                        .log_file_stem("recover12")
+                        .skip_recovery(false),
+                )
+                .build()
+                .await
+                .unwrap();
+
+            let table = engine.catalog().get_table(table_id).await.unwrap();
+            let mut session = engine.try_new_session().unwrap();
+            assert_eq!(table.total_row_pages(session.pool_guards()).await, 0);
+
+            let name_key = SelectKey::new(1, vec![Val::from("same-name")]);
+            let non_unique = table.sec_idx()[name_key.index_no].non_unique().unwrap();
+            let disk = non_unique
+                .disk()
+                .open_non_unique(session.pool_guards().disk_guard())
+                .unwrap();
+            assert_eq!(
+                disk.prefix_scan(&name_key.vals).await.unwrap(),
+                same_row_ids
+            );
+            match table.deletion_buffer().get(same_row_ids[1]).unwrap() {
+                DeleteMarker::Committed(_) => (),
+                DeleteMarker::Ref(_) => panic!("recovered cold delete should be committed"),
+            }
+
+            let trx = session.try_begin_trx().unwrap().unwrap();
+            let stmt = trx.start_stmt();
+            let rows = table
+                .accessor()
+                .index_scan_mvcc(&stmt, &name_key, &[0, 1])
+                .await
+                .unwrap()
+                .unwrap_rows();
+            assert_eq!(
+                rows,
+                vec![
+                    vec![Val::from(1u32), Val::from("same-name")],
+                    vec![Val::from(3u32), Val::from("same-name")],
+                ]
+            );
+            let deleted = stmt.select_row_mvcc(&table, &delete_key, &[0, 1]).await;
+            assert!(matches!(deleted, Ok(SelectMvcc::NotFound)));
+            stmt.succeed().commit().await.unwrap();
+
+            drop(table);
+            drop(session);
+            drop(engine);
+        })
+    }
+
+    #[test]
     fn test_log_recover_replays_post_checkpoint_heap_redo_after_bootstrap() {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
