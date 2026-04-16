@@ -89,6 +89,24 @@ impl<P: BufferPool> GenericSecondaryIndex<P> {
             _ => None,
         }
     }
+
+    /// Consume this container into its concrete unique MemTree backend.
+    #[inline]
+    pub(crate) fn into_unique(self) -> Option<(usize, GenericUniqueBTreeIndex<P>)> {
+        match self.kind {
+            GenericIndexKind::Unique(idx) => Some((self.index_no, idx)),
+            GenericIndexKind::NonUnique(_) => None,
+        }
+    }
+
+    /// Consume this container into its concrete non-unique MemTree backend.
+    #[inline]
+    pub(crate) fn into_non_unique(self) -> Option<(usize, GenericNonUniqueBTreeIndex<P>)> {
+        match self.kind {
+            GenericIndexKind::Unique(_) => None,
+            GenericIndexKind::NonUnique(idx) => Some((self.index_no, idx)),
+        }
+    }
 }
 
 /// Generic variants of secondary-index backends.

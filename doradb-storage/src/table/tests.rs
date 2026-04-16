@@ -9,8 +9,8 @@ use crate::error::{BlockCorruptionCause, BlockKind, Error, FileKind, Result, Sto
 use crate::file::block_integrity::{BLOCK_INTEGRITY_HEADER_SIZE, write_block_checksum};
 use crate::file::cow_file::{COW_FILE_PAGE_SIZE, SUPER_BLOCK_ID};
 use crate::index::{
-    COLUMN_BLOCK_HEADER_SIZE, COLUMN_BLOCK_LEAF_HEADER_SIZE, ColumnBlockIndex, NonUniqueIndex,
-    RowLocation, UniqueIndex, load_entry_deletion_deltas,
+    COLUMN_BLOCK_HEADER_SIZE, COLUMN_BLOCK_LEAF_HEADER_SIZE, ColumnBlockIndex, IndexInsert,
+    NonUniqueIndex, RowLocation, UniqueIndex, load_entry_deletion_deltas,
 };
 use crate::io::{
     IOKind, StorageBackendFileIdentity, StorageBackendOp, StorageBackendTestHook,
@@ -1458,17 +1458,9 @@ fn test_lwc_update_unique_claim_rollback_drops_purgeable_deleted_cold_owner() {
         let writer = stmt.succeed();
         writer.rollback().await.unwrap();
 
-        assert!(
-            index
-                .lookup(
-                    session.pool_guards().index_guard(),
-                    &claimed_key.vals,
-                    MAX_SNAPSHOT_TS,
-                )
-                .await
-                .unwrap()
-                .is_none()
-        );
+        // The composite index may still fall through to the checkpointed cold
+        // root; MVCC reads filter that stale cold owner through the committed
+        // deletion marker.
         sys.new_trx_select(&mut session, &old_key, |vals| {
             assert_eq!(vals, vec![Val::from(1i32), Val::from("name")]);
         })
@@ -1919,16 +1911,20 @@ fn test_lwc_unique_index_purge_uses_purgeable_delete_marker_fast_path() {
             .await
             .unwrap();
         assert!(deleted);
-        assert!(
+        // A reinsertion attempt must not merge a stale MemTree delete overlay;
+        // after purge it falls through to the immutable cold root instead.
+        assert_eq!(
             index
-                .lookup(
+                .insert_if_not_exists(
                     session.pool_guards().index_guard(),
                     &key.vals,
-                    MAX_SNAPSHOT_TS,
+                    row_id,
+                    true,
+                    11,
                 )
                 .await
-                .unwrap()
-                .is_none()
+                .unwrap(),
+            IndexInsert::DuplicateKey(row_id, false)
         );
 
         drop(session);
@@ -2199,7 +2195,7 @@ fn test_index_purge_removes_delete_marked_unique_entry_when_row_is_not_found() {
 }
 
 #[test]
-fn test_unique_insert_rollback_removes_claim_when_deleted_owner_not_found() {
+fn test_unique_insert_rollback_restores_deleted_owner_even_when_row_missing() {
     smol::block_on(async {
         let sys = TestSys::new_evictable().await;
         let mut session = sys.try_new_session().unwrap();
@@ -2268,18 +2264,126 @@ fn test_unique_insert_rollback_removes_claim_when_deleted_owner_not_found() {
         let trx = stmt.fail().await.unwrap();
         trx.rollback().await.unwrap();
 
+        assert_unique_index_entry(
+            &sys.table,
+            session.pool_guards(),
+            &key,
+            MAX_SNAPSHOT_TS,
+            stale_row_id,
+            true,
+        )
+        .await;
+        sys.new_trx_select_not_found(&mut session, &key).await;
+        sys.new_trx_insert(
+            &mut session,
+            vec![Val::from(10_001i32), Val::from("reclaimed")],
+        )
+        .await;
+        sys.new_trx_select(&mut session, &key, |vals| {
+            assert_eq!(vals, vec![Val::from(10_001i32), Val::from("reclaimed")]);
+        })
+        .await;
+
+        drop(session);
+        sys.clean_all();
+    });
+}
+
+#[test]
+fn test_unique_insert_rollback_restores_delete_marked_stale_hot_owner() {
+    smol::block_on(async {
+        let sys = TestSys::new_evictable().await;
+        let mut session = sys.try_new_session().unwrap();
+        let live_key = single_key(1i32);
+        let stale_key = single_key(2i32);
+        sys.new_trx_insert(&mut session, vec![Val::from(1i32), Val::from("one")])
+            .await;
+
+        let reader = session.try_begin_trx().unwrap().unwrap();
+        let old_row_id = sys.table.sec_idx()[live_key.index_no]
+            .unique()
+            .unwrap()
+            .lookup(
+                session.pool_guards().index_guard(),
+                &live_key.vals,
+                reader.sts,
+            )
+            .await
+            .unwrap()
+            .unwrap()
+            .0;
+        reader.commit().await.unwrap();
+        assert!(matches!(
+            sys.table.find_row(session.pool_guards(), old_row_id).await,
+            RowLocation::RowPage(_)
+        ));
+
+        let index = sys.table.sec_idx()[stale_key.index_no].unique().unwrap();
         assert!(
             index
-                .lookup(
+                .insert_if_not_exists(
                     session.pool_guards().index_guard(),
-                    &key.vals,
+                    &stale_key.vals,
+                    old_row_id,
+                    false,
                     MAX_SNAPSHOT_TS,
                 )
                 .await
                 .unwrap()
-                .is_none()
+                .is_ok()
         );
-        sys.new_trx_select_not_found(&mut session, &key).await;
+        assert!(
+            index
+                .mask_as_deleted(
+                    session.pool_guards().index_guard(),
+                    &stale_key.vals,
+                    old_row_id,
+                    MAX_SNAPSHOT_TS,
+                )
+                .await
+                .unwrap()
+        );
+
+        let trx = session.try_begin_trx().unwrap().unwrap();
+        let mut stmt = trx.start_stmt();
+        let new_row_id = unwrap_insert_result(
+            stmt.insert_row(&sys.table, vec![Val::from(2i32), Val::from("two")])
+                .await,
+        );
+        assert_ne!(new_row_id, old_row_id);
+        assert_unique_index_entry(
+            &sys.table,
+            session.pool_guards(),
+            &stale_key,
+            stmt.trx.sts,
+            new_row_id,
+            false,
+        )
+        .await;
+
+        let trx = stmt.fail().await.unwrap();
+        trx.rollback().await.unwrap();
+
+        assert_unique_index_entry(
+            &sys.table,
+            session.pool_guards(),
+            &stale_key,
+            MAX_SNAPSHOT_TS,
+            old_row_id,
+            true,
+        )
+        .await;
+        sys.new_trx_select(&mut session, &live_key, |vals| {
+            assert_eq!(vals, vec![Val::from(1i32), Val::from("one")]);
+        })
+        .await;
+        sys.new_trx_select_not_found(&mut session, &stale_key).await;
+        sys.new_trx_insert(&mut session, vec![Val::from(2i32), Val::from("two-final")])
+            .await;
+        sys.new_trx_select(&mut session, &stale_key, |vals| {
+            assert_eq!(vals, vec![Val::from(2i32), Val::from("two-final")]);
+        })
+        .await;
 
         drop(session);
         sys.clean_all();

@@ -24,7 +24,9 @@ use crate::index::{BlockIndex, RowLocation};
 use crate::quiescent::{QuiescentBox, QuiescentGuard};
 use crate::row::ops::SelectKey;
 use crate::row::{RowID, RowPage};
-use crate::table::{ColumnDeletionBuffer, Table, TableAccess};
+use crate::table::{ColumnDeletionBuffer, IndexRollback, Table, TableAccess};
+use crate::trx::TrxID;
+use crate::trx::undo::IndexUndo;
 use dashmap::DashMap;
 use std::collections::hash_map::Entry;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -396,7 +398,7 @@ impl TableHandle {
         key: &SelectKey,
         row_id: RowID,
         unique: bool,
-        min_active_sts: crate::trx::TrxID,
+        min_active_sts: TrxID,
     ) -> Result<bool> {
         match self {
             TableHandle::User(table) => {
@@ -411,6 +413,20 @@ impl TableHandle {
                     .delete_index(guards, key, row_id, unique, min_active_sts)
                     .await
             }
+        }
+    }
+
+    /// Roll back one secondary-index undo entry through the concrete table runtime.
+    #[inline]
+    pub(crate) async fn rollback_index_entry(
+        &self,
+        entry: IndexUndo,
+        guards: &PoolGuards,
+        ts: TrxID,
+    ) -> Result<()> {
+        match self {
+            TableHandle::User(table) => table.rollback_index_entry(entry, guards, ts).await,
+            TableHandle::Catalog(table) => table.rollback_index_entry(entry, guards, ts).await,
         }
     }
 }

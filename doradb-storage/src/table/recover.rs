@@ -1,11 +1,7 @@
 use crate::buffer::PageID;
 use crate::buffer::PoolGuards;
-use crate::error::{BlockCorruptionCause, BlockKind, Error, Result};
-use crate::file::cow_file::SUPER_BLOCK_ID;
-use crate::index::{
-    ColumnBlockIndex, IndexInsert, NonUniqueIndex, UniqueIndex, load_entry_deletion_deltas,
-};
-use crate::lwc::PersistedLwcBlock;
+use crate::error::{Error, Result};
+use crate::index::IndexInsert;
 use crate::row::ops::{ReadRow, SelectKey, UpdateCol};
 use crate::row::{RowID, RowRead};
 use crate::table::{
@@ -58,12 +54,6 @@ pub trait TableRecover {
         &self,
         guards: &PoolGuards,
         page_id: PageID,
-    ) -> impl Future<Output = Result<()>>;
-
-    /// Populate indexes using persisted LWC blocks below the current pivot boundary.
-    fn populate_index_via_persisted_data(
-        &self,
-        guards: &PoolGuards,
     ) -> impl Future<Output = Result<()>>;
 }
 
@@ -135,11 +125,11 @@ impl TableRecover for Table {
                 let page_guard = self.must_get_row_page_shared(guards, page_id).await?;
 
                 let metadata = self.metadata();
-                for (index, index_schema) in self.sec_idx().iter().zip(&metadata.index_specs) {
-                    debug_assert!(index.is_unique() == index_schema.unique());
+                for (index_no, index_schema) in metadata.index_specs.iter().enumerate() {
+                    debug_assert_eq!(self.sec_idx()[index_no].is_unique(), index_schema.unique());
                     if index_key_is_changed(index_schema, &index_change_cols) {
                         let new_key =
-                            read_latest_index_key(metadata, index.index_no, &page_guard, row_id);
+                            read_latest_index_key(metadata, index_no, &page_guard, row_id);
                         let old_key = index_key_replace(index_schema, &new_key, &index_change_cols);
                         // insert new index entry.
                         match self
@@ -203,14 +193,14 @@ impl TableRecover for Table {
             );
             assert!(res.is_ok());
             page_guard.set_dirty(); // mark as dirty page.
-            for (index, index_schema) in self.sec_idx().iter().zip(&self.metadata().index_specs) {
-                debug_assert!(index.is_unique() == index_schema.unique());
+            for (index_no, index_schema) in self.metadata().index_specs.iter().enumerate() {
+                debug_assert_eq!(self.sec_idx()[index_no].is_unique(), index_schema.unique());
                 let vals: Vec<Val> = index_schema
                     .index_cols
                     .iter()
                     .map(|ik| index_cols[&(ik.col_no as usize)].clone())
                     .collect();
-                let key = SelectKey::new(index.index_no, vals);
+                let key = SelectKey::new(index_no, vals);
                 match self.recover_index_delete(guards, key, row_id).await? {
                     RecoverIndex::Ok | RecoverIndex::DeleteOutdated => (),
                     RecoverIndex::InsertOutdated => unreachable!(),
@@ -229,7 +219,8 @@ impl TableRecover for Table {
         let metadata = self.metadata();
         let index_pool_guard = self.index_pool_guard(guards);
         let (ctx, page) = page_guard.ctx_and_page();
-        for (index_spec, sec_idx) in metadata.index_specs.iter().zip(self.sec_idx()) {
+        for (index_no, index_spec) in metadata.index_specs.iter().enumerate() {
+            let sec_idx = &self.sec_idx()[index_no];
             let read_set: Vec<_> = index_spec
                 .index_cols
                 .iter()
@@ -242,7 +233,7 @@ impl TableRecover for Table {
                         if index_spec.unique() {
                             let index = sec_idx.unique().unwrap();
                             let res = index
-                                .insert_if_not_exists(
+                                .insert_recovery_mem_only(
                                     index_pool_guard,
                                     &vals,
                                     row_id,
@@ -250,11 +241,11 @@ impl TableRecover for Table {
                                     MIN_SNAPSHOT_TS,
                                 )
                                 .await?;
-                            ensure_recovery_index_insert(sec_idx.index_no, res)?;
+                            ensure_recovery_index_insert(sec_idx.index_no(), res)?;
                         } else {
                             let index = sec_idx.non_unique().unwrap();
                             let res = index
-                                .insert_if_not_exists(
+                                .insert_recovery_mem_only(
                                     index_pool_guard,
                                     &vals,
                                     row_id,
@@ -262,100 +253,11 @@ impl TableRecover for Table {
                                     MIN_SNAPSHOT_TS,
                                 )
                                 .await?;
-                            ensure_recovery_index_insert(sec_idx.index_no, res)?;
+                            ensure_recovery_index_insert(sec_idx.index_no(), res)?;
                         }
                     }
                     ReadRow::NotFound => (),
                     ReadRow::InvalidIndex => unreachable!(),
-                }
-            }
-        }
-        Ok(())
-    }
-
-    async fn populate_index_via_persisted_data(&self, _guards: &PoolGuards) -> Result<()> {
-        let index_pool_guard = self.index_pool_guard(_guards);
-        let disk_pool_guard = _guards.disk_guard();
-        if self.sec_idx().is_empty() {
-            return Ok(());
-        }
-        let active_root = self.file().active_root();
-        if active_root.column_block_index_root == SUPER_BLOCK_ID || active_root.pivot_row_id == 0 {
-            return Ok(());
-        }
-
-        let index = ColumnBlockIndex::new(
-            active_root.column_block_index_root,
-            active_root.pivot_row_id,
-            self.file().file_kind(),
-            self.file().sparse_file(),
-            self.disk_pool(),
-            disk_pool_guard,
-        );
-        for entry in index.collect_leaf_entries().await? {
-            let deleted = load_entry_deletion_deltas(&index, &entry).await?;
-            let page = PersistedLwcBlock::load(
-                self.file().file_kind(),
-                self.file().sparse_file(),
-                self.disk_pool(),
-                disk_pool_guard,
-                entry.block_id(),
-            )
-            .await?;
-            let row_ids = index.load_entry_row_ids(&entry).await?;
-            if page.row_count() != row_ids.len() {
-                return Err(Error::block_corrupted(
-                    self.file().file_kind(),
-                    BlockKind::LwcBlock,
-                    entry.block_id(),
-                    BlockCorruptionCause::InvalidPayload,
-                ));
-            }
-
-            for (row_idx, row_id) in row_ids.into_iter().enumerate() {
-                let delta = row_id
-                    .checked_sub(entry.start_row_id)
-                    .ok_or(Error::InvalidState)?;
-                if delta > u32::MAX as u64 {
-                    return Err(Error::InvalidState);
-                }
-                if deleted.contains(&(delta as u32)) {
-                    continue;
-                }
-                if self.deletion_buffer().get(row_id).is_some() {
-                    continue;
-                }
-
-                let vals = page.decode_full_row_values(self.metadata(), row_idx)?;
-
-                for key in self.metadata().keys_for_insert(&vals) {
-                    if self.metadata().index_specs[key.index_no].unique() {
-                        let res = self.sec_idx()[key.index_no]
-                            .unique()
-                            .unwrap()
-                            .insert_if_not_exists(
-                                index_pool_guard,
-                                &key.vals,
-                                row_id,
-                                false,
-                                MIN_SNAPSHOT_TS,
-                            )
-                            .await?;
-                        ensure_recovery_index_insert(key.index_no, res)?;
-                    } else {
-                        let res = self.sec_idx()[key.index_no]
-                            .non_unique()
-                            .unwrap()
-                            .insert_if_not_exists(
-                                index_pool_guard,
-                                &key.vals,
-                                row_id,
-                                false,
-                                MIN_SNAPSHOT_TS,
-                            )
-                            .await?;
-                        ensure_recovery_index_insert(key.index_no, res)?;
-                    }
                 }
             }
         }
