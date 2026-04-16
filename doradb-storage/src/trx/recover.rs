@@ -152,7 +152,7 @@ pub(crate) struct RecoveryDeps {
 
 /// Redo-log recovery coordinator for catalog metadata and user tables.
 pub struct LogRecovery<'a> {
-    /// Mutable secondary-index buffer pool used while rebuilding hot MemTree state.
+    /// Mutable secondary-index buffer pool used while rebuilding hot MemIndex state.
     index_pool: QuiescentGuard<EvictableBufferPool>,
     /// Mutable row-page buffer pool used for recovered heap pages.
     mem_pool: QuiescentGuard<EvictableBufferPool>,
@@ -361,7 +361,7 @@ impl<'a> LogRecovery<'a> {
 
     async fn recover_indexes_and_refresh_pages(&mut self) -> Result<()> {
         // Checkpointed cold secondary-index state is already available through
-        // the table's DiskTree roots. Rebuild only hot row-page MemTree state.
+        // the table's DiskTree roots. Rebuild only hot row-page MemIndex state.
         for (table_id, pages) in &self.recovered_tables {
             if let Some(table) = self.catalog.get_table(*table_id).await {
                 let metadata = Arc::new(table.metadata().clone());
@@ -1193,7 +1193,7 @@ mod tests {
     }
 
     #[test]
-    fn test_log_recover_rebuilds_hot_unique_memtree_over_checkpointed_cold_duplicate() {
+    fn test_log_recover_rebuilds_hot_unique_memindex_over_checkpointed_cold_duplicate() {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
             let main_dir = temp_dir.path().to_path_buf();

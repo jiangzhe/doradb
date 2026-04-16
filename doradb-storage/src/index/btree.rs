@@ -337,6 +337,32 @@ impl<P: BufferPool> GenericBTree<P> {
         Ok(res)
     }
 
+    /// Delete an existing key/value pair only if the current delete-bit state
+    /// still matches the caller's snapshot.
+    ///
+    /// Cleanup paths use this after scanning entries so a concurrent unmask,
+    /// remask, or owner change cannot be removed by a stale scan result.
+    #[inline]
+    pub(crate) async fn delete_exact<V: BTreeValue>(
+        &self,
+        pool_guard: &PoolGuard,
+        key: &[u8],
+        value: V,
+        expected_deleted: bool,
+        ts: TrxID,
+    ) -> Result<BTreeDelete> {
+        debug_assert!(!value.is_deleted());
+        let mut g = self.find_leaf::<ExclusiveStrategy>(pool_guard, key).await?;
+        debug_assert!(g.page().is_leaf());
+        let node = g.page_mut();
+        let res = node.delete_exact(key, value, expected_deleted);
+        if res.is_ok() {
+            node.update_hints();
+            node.update_ts(ts);
+        }
+        Ok(res)
+    }
+
     /// Update an existing key value pair with new value.
     #[inline]
     pub async fn update<V: BTreeValue>(
@@ -1984,6 +2010,61 @@ mod tests {
             first_right_leaf_page_id,
             second_right_leaf_page_id,
         }
+    }
+
+    #[test]
+    fn test_btree_delete_exact_checks_value_and_delete_state() {
+        smol::block_on(async {
+            let pool = owned_index_pool(64 * 1024 * 1024);
+            let pool_guard = (*pool).pool_guard();
+            let tree = BTree::new(pool.guard(), &pool_guard, false, 100)
+                .await
+                .expect("test btree construction should succeed");
+            tree.insert::<BTreeU64>(&pool_guard, b"k", BTreeU64::from(7), false, 100)
+                .await
+                .expect("test insert should succeed");
+
+            assert_eq!(
+                tree.delete_exact(&pool_guard, b"k", BTreeU64::from(8), false, 101)
+                    .await
+                    .expect("delete_exact should read the leaf"),
+                BTreeDelete::ValueMismatch
+            );
+            assert_eq!(
+                tree.delete_exact(&pool_guard, b"k", BTreeU64::from(7), true, 101)
+                    .await
+                    .expect("delete_exact should read the leaf"),
+                BTreeDelete::ValueMismatch
+            );
+            assert_eq!(
+                tree.lookup_optimistic::<BTreeU64>(&pool_guard, b"k")
+                    .await
+                    .expect("lookup should succeed"),
+                Some(BTreeU64::from(7))
+            );
+
+            tree.mark_as_deleted::<BTreeU64>(&pool_guard, b"k", BTreeU64::from(7), 102)
+                .await
+                .expect("mark_as_deleted should read the leaf");
+            assert_eq!(
+                tree.delete_exact(&pool_guard, b"k", BTreeU64::from(7), false, 103)
+                    .await
+                    .expect("delete_exact should read the leaf"),
+                BTreeDelete::ValueMismatch
+            );
+            assert_eq!(
+                tree.delete_exact(&pool_guard, b"k", BTreeU64::from(7), true, 104)
+                    .await
+                    .expect("delete_exact should read the leaf"),
+                BTreeDelete::Ok
+            );
+            assert_eq!(
+                tree.lookup_optimistic::<BTreeU64>(&pool_guard, b"k")
+                    .await
+                    .expect("lookup should succeed"),
+                None
+            );
+        })
     }
 
     #[test]

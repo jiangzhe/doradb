@@ -32,7 +32,7 @@ This pattern appears in both indexing layers:
   - hot routing in memory
   - cold routing in persisted CoW state
 - secondary index:
-  - hot `MemTree`
+  - hot `MemIndex`
   - cold `DiskTree`
 
 This design keeps foreground writes memory-first while letting checkpoint
@@ -51,10 +51,16 @@ Use the following documents as the living source of truth:
 
 2. [`secondary-index.md`](./secondary-index.md)
    - unique and non-unique secondary-index models
-   - `MemTree` and `DiskTree`
+   - `MemIndex` and `DiskTree`
    - read/write behavior
    - companion checkpoint maintenance
    - recovery behavior
+
+3. [`garbage-collect.md`](./garbage-collect.md)
+   - transaction and row undo purge
+   - runtime unique-key link lifecycle
+   - `MemIndex` cleanup proofs
+   - `DiskTree` and table-file CoW root reclamation
 
 ## 4. Summary
 

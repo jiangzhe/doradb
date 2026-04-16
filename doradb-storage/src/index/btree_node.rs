@@ -573,6 +573,29 @@ impl BTreeNode {
         BTreeDelete::Ok
     }
 
+    /// Delete an existing key/value pair only when the delete-bit state also
+    /// matches the caller's snapshot.
+    #[inline]
+    pub fn delete_exact<V: BTreeValue>(
+        &mut self,
+        key: &[u8],
+        value: V,
+        expected_deleted: bool,
+    ) -> BTreeDelete {
+        let idx = match self.search_key(key) {
+            Ok(idx) => {
+                let old_v = self.value::<V>(idx);
+                if old_v.value() != value || old_v.is_deleted() != expected_deleted {
+                    return BTreeDelete::ValueMismatch;
+                }
+                idx
+            }
+            Err(_) => return BTreeDelete::NotFound,
+        };
+        self.delete_at(idx, V::ENCODED_LEN);
+        BTreeDelete::Ok
+    }
+
     /// Mark an existing key value pair in current node as deleted.
     /// If key or value does not match, returns false.
     #[inline]
@@ -2198,6 +2221,41 @@ mod tests {
                     BTreeDelete::ValueMismatch
                 );
             }
+        })
+    }
+
+    #[test]
+    fn test_btree_node_delete_exact_checks_delete_state() {
+        smol::block_on(async {
+            let buf_pool = test_buf_pool();
+            let buf_pool_guard = FixedBufferPool::pool_guard(&buf_pool);
+
+            let mut page_guard = buf_pool
+                .allocate_page::<BTreeNode>(&buf_pool_guard)
+                .await
+                .expect("test page allocation should succeed");
+            let node = page_guard.page_mut();
+            node.init(0, 0, &[], BTreeU64::INVALID_VALUE, &[], false);
+            node.insert(b"a", BTreeU64::from(1));
+            assert_eq!(
+                node.delete_exact(b"a", BTreeU64::from(1), true),
+                BTreeDelete::ValueMismatch
+            );
+            assert_eq!(node.search_key(b"a"), Ok(0));
+
+            assert_eq!(
+                node.mark_as_deleted(b"a", BTreeU64::from(1)),
+                BTreeUpdate::Ok(BTreeU64::from(1))
+            );
+            assert_eq!(
+                node.delete_exact(b"a", BTreeU64::from(1), false),
+                BTreeDelete::ValueMismatch
+            );
+            assert_eq!(
+                node.delete_exact(b"a", BTreeU64::from(1), true),
+                BTreeDelete::Ok
+            );
+            assert_eq!(node.search_key(b"a"), Err(0));
         })
     }
 

@@ -85,7 +85,7 @@ The Heap Table uses a **Tiered Architecture**, combining an in-memory RowStore (
 
 Secondary indexes use a hot/cold split:
 
-- `MemTree` stores hot mutable state
+- `MemIndex` stores hot mutable state
 - `DiskTree` stores checkpointed cold state
 - `DiskTree` is maintained only as companion work of table data/deletion
   checkpoint
@@ -97,7 +97,7 @@ Unique and non-unique indexes do not share the same physical model:
 
 For the detailed index design, see [`secondary-index.md`](./secondary-index.md).
 
-### In-Memory MemTree
+### In-Memory MemIndex
 
 - **Role**: Write Cache.
 - **Behavior**:
@@ -137,7 +137,7 @@ For the detailed index design, see [`secondary-index.md`](./secondary-index.md).
 #### Execution Phase
 
 1. **Read**: 
-   - Probe `MemTree` first and then `DiskTree` as required by the index type.
+   - Probe `MemIndex` first and then `DiskTree` as required by the index type.
    - Route to RowStore or ColumnStore based on `RowID` vs `Pivot`.
    - **Visibility Check**: Compare Reader.STS against the timestamp in the Undo Chain (for RowStore) or Deletion Buffer (for ColumnStore).
    - For unique indexes, runtime unique-key links may be followed when the
@@ -149,22 +149,22 @@ For the detailed index design, see [`secondary-index.md`](./secondary-index.md).
    - Append tuple to RowStore -> Get new `RowID`.
    - Create an insert undo head so older snapshots and rollback treat the row
      as absent until the transaction commits.
-   - Insert into MemTree with `sts = My_STS`.
+   - Insert into MemIndex with `sts = My_STS`.
 
 3. **Delete**:
    - **If RowStore**: install a row undo `Lock`, set the row-page delete bit,
      rewrite the lock entry to `Delete`, and mask secondary-index entries in
-     MemTree with index undo.
+     MemIndex with index undo.
    - **If ColumnStore**: Insert a "Delete Mark" into the **ColumnDeletionBuffer**.
-   - Update MemTree: mask the old secondary-index entries so runtime lookups do
+   - Update MemIndex: mask the old secondary-index entries so runtime lookups do
      not blindly fall through to stale cold `DiskTree` state.
 
 4. **Update**:
    - **If RowStore**: install a row undo `Lock` before mutating the page. If
      the update fits, mutate the row page in place, rewrite the lock entry to
-     `Update`, and update MemTree only for changed index keys. If the update
+     `Update`, and update MemIndex only for changed index keys. If the update
      cannot fit or the page is frozen, rewrite the lock to `Delete`, insert the
-     replacement as a new hot RowID, and update MemTree for RowID/key movement.
+     replacement as a new hot RowID, and update MemIndex for RowID/key movement.
    - **If ColumnStore**: install a deletion-buffer marker for the old cold
      RowID, insert the replacement row into hot RowStore with a new RowID, mask
      old index entries, and insert the replacement index entries.
@@ -176,7 +176,7 @@ For the detailed index design, see [`secondary-index.md`](./secondary-index.md).
 
 1. **Log**: Serialize all modifications (Heap appends, Index changes, DeletionBuffer updates) and append to the global Commit Log.
 2. **State Update**
-   - Instead of updating a global transaction table or traversing the MemTree, the transaction simply backfills the **Commit Timestamp (CTS)** into its Undo Log records.
+   - Instead of updating a global transaction table or traversing the MemIndex, the transaction simply backfills the **Commit Timestamp (CTS)** into its Undo Log records.
    - For the **ColumnDeletionBuffer**, the CTS is attached to the delete/update markers.
    - The **CTS** of all undo and deletion-buffer refs in one transaction is
      backed by shared transaction status. This makes the commit operation
@@ -190,7 +190,7 @@ For the detailed index design, see [`secondary-index.md`](./secondary-index.md).
   `Delete` clears the delete bit, `Update` restores before-image columns, and
   a pure `Lock` leaves row data unchanged.
 - Index undo removes inserted claims, restores merged delete-masked claims, and
-  unmasks deferred deletes so MemTree returns to the pre-transaction state.
+  unmasks deferred deletes so MemIndex returns to the pre-transaction state.
 - Runtime unique-key branches are transaction-local MVCC aids. They are kept
   only while live snapshots may need the older owner. Their GC anchor is the
   same `Global_Min_STS` / oldest-active-snapshot horizon used by undo GC: they
@@ -203,7 +203,7 @@ For the detailed index design, see [`secondary-index.md`](./secondary-index.md).
 
 ####  Index Checkpoint
 
-There is no independent MemTree-scan index checkpoint.
+There is no independent MemIndex-scan index checkpoint.
 
 Instead:
 
@@ -215,7 +215,7 @@ Instead:
      deleted rows drive companion `DiskTree` removals
 3. **State Transition**:
    - after the related table checkpoint publishes its new roots, the
-     corresponding `MemTree` entries can become clean or evictable
+     corresponding `MemIndex` entries can become clean or evictable
 
 ### Heap Persistence
 
@@ -243,10 +243,10 @@ Heap persistence relies on the **Tuple Mover** and the durability of the commit 
 4. **Replay Commit Log**:
    - **Heap Redo**: Start scanning from `Heap_Redo_Start_TS`. Reconstruct the in-memory RowStore pages by replaying insert/update logs.
    - **Deletion Buffer Redo**: Rebuild the **ColumnDeletionBuffer** from logs to restore post-checkpoint deletion states for columnar data.
-   - **Secondary Index Redo**: Hot row redo rebuilds the corresponding `MemTree`
+   - **Secondary Index Redo**: Hot row redo rebuilds the corresponding `MemIndex`
      entries through the normal row/index update logic. No index-specific replay
      watermark is needed.
-5. **Completion**: The system is open for service once memory structures are rebuilt. `DiskTree` already contains checkpointed cold index state and `MemTree` contains post-checkpoint hot state.
+5. **Completion**: The system is open for service once memory structures are rebuilt. `DiskTree` already contains checkpointed cold index state and `MemIndex` contains post-checkpoint hot state.
 
 ### Garbage Collection (GC)
 
@@ -270,7 +270,7 @@ Heap persistence relies on the **Tuple Mover** and the durability of the commit 
   - Any Undo versions in the transaction with `Commit_STS < Global_Min_STS` are obsolete (no active transaction can see them).
   - These records are unlinked and memory is reclaimed.
 
-#### MemTree Eviction
+#### MemIndex Eviction
 
 - **Condition**: the related table checkpoint has made the same state durable.
 - **Action**: clean entries can be evicted from memory because the authoritative
@@ -281,10 +281,10 @@ Heap persistence relies on the **Tuple Mover** and the durability of the commit 
 
 The transaction system tries to achieve high throughput for HTAP workloads by adhering to a **Strict No-Steal / No-Force** policy combined with **Log-Structured** principles.
 
-- **Write Optimization**: Foreground writes are completely in-memory (MemTree + RowStore) with sequential commit logging. The overhead of transaction commit is reduced to *O(1)* by eliminating index traversal and global state contention.
-- **Read Optimization**: The hybrid layout serves OLTP queries from the RowStore/MemTree and OLAP scans from the high-density ColumnStore. The Index structure avoids the read amplification typical of LSM-trees by maintaining a compact B+Tree structure on disk.
+- **Write Optimization**: Foreground writes are completely in-memory (MemIndex + RowStore) with sequential commit logging. The overhead of transaction commit is reduced to *O(1)* by eliminating index traversal and global state contention.
+- **Read Optimization**: The hybrid layout serves OLTP queries from the RowStore/MemIndex and OLAP scans from the high-density ColumnStore. The Index structure avoids the read amplification typical of LSM-trees by maintaining a compact B+Tree structure on disk.
 - **Reliability**: Recovery is simplified to a Redo-only process. Checkpointed
   `DiskTree` roots provide cold secondary-index state directly, while redo
-  reconstructs hot `MemTree` state without needing an independent index replay
+  reconstructs hot `MemIndex` state without needing an independent index replay
   watermark.
 - **Scalability**: Table-level checkpoints and independent Tuple Movers allow the system to scale across many tables without "convoy effects", ensuring stable performance even under mixed workloads.

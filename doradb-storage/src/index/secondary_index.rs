@@ -1,119 +1,29 @@
-use crate::buffer::{BufferPool, FixedBufferPool, PoolGuard};
-use crate::catalog::IndexSpec;
-use crate::index::btree::GenericBTree;
-use crate::index::btree_key::{BTreeKey, BTreeKeyEncoder};
-use crate::index::non_unique_index::GenericNonUniqueBTreeIndex;
-use crate::index::unique_index::GenericUniqueBTreeIndex;
+//! Composite MemIndex/DiskTree secondary-index core.
+//!
+//! The types in this module are the RFC 0014 phase-3 user-table core only.
+//! They group the current in-memory BTree-backed secondary index with the
+//! current published secondary DiskTree root and preserve the existing unique
+//! and non-unique trait contracts without wiring the composite into table
+//! runtime.
+
+use super::disk_tree::{
+    NonUniqueDiskTree, NonUniqueDiskTreeRuntime, UniqueDiskTree, UniqueDiskTreeRuntime,
+};
+use super::mem_index::MemIndex;
+use super::non_unique_index::{NonUniqueIndex, NonUniqueMemIndex, NonUniqueMemIndexEntry};
+use super::unique_index::{UniqueIndex, UniqueMemIndex, UniqueMemIndexEntry};
+use crate::buffer::{BufferPool, PoolGuard, ReadonlyBufferPool};
+use crate::catalog::TableMetadata;
+use crate::error::{Error, Result};
+use crate::file::cow_file::BlockID;
+use crate::file::table_file::TableFile;
+use crate::index::util::Maskable;
 use crate::quiescent::QuiescentGuard;
 use crate::row::RowID;
 use crate::trx::TrxID;
-use crate::value::{Val, ValKind, ValType};
-use either::Either;
-use parking_lot::RwLock;
-use std::collections::BTreeMap;
-use std::hash::{DefaultHasher, Hash, Hasher};
-
-/// Generic secondary-index container for one table index definition.
-pub struct GenericSecondaryIndex<P: 'static> {
-    pub index_no: usize,
-    pub kind: GenericIndexKind<P>,
-}
-
-/// Compatibility alias for runtime secondary index backed by `FixedBufferPool`.
-pub type SecondaryIndex = GenericSecondaryIndex<FixedBufferPool>;
-/// Compatibility alias for runtime secondary-index kind.
-pub type IndexKind = GenericIndexKind<FixedBufferPool>;
-
-impl<P: BufferPool> GenericSecondaryIndex<P> {
-    /// Build a secondary index from catalog `IndexSpec`.
-    #[inline]
-    pub async fn new<F: Fn(usize) -> ValType>(
-        index_pool: QuiescentGuard<P>,
-        index_pool_guard: &PoolGuard,
-        index_no: usize,
-        index_spec: &IndexSpec,
-        ty_infer: F,
-        ts: TrxID,
-    ) -> crate::error::Result<Self> {
-        debug_assert!(!index_spec.index_cols.is_empty());
-        let mut types: Vec<_> = index_spec
-            .index_cols
-            .iter()
-            .map(|key| ty_infer(key.col_no as usize))
-            .collect();
-        if index_spec.unique() {
-            let encoder = BTreeKeyEncoder::new(types);
-            let tree = GenericBTree::new(index_pool, index_pool_guard, true, ts).await?;
-            let kind = GenericIndexKind::Unique(GenericUniqueBTreeIndex::new(tree, encoder));
-            Ok(GenericSecondaryIndex { index_no, kind })
-        } else {
-            // non-unique index always encodes RowID as last key to
-            // ensure uniqueness(which is required by BTree implementation).
-            types.push(ValType::new(ValKind::U64, false));
-            let encoder = BTreeKeyEncoder::new(types);
-            let tree = GenericBTree::new(index_pool, index_pool_guard, true, ts).await?;
-            let kind = GenericIndexKind::NonUnique(GenericNonUniqueBTreeIndex::new(tree, encoder));
-            Ok(GenericSecondaryIndex { index_no, kind })
-        }
-    }
-
-    /// Destroy this secondary index and reclaim all pages it owns.
-    #[inline]
-    pub(crate) async fn destroy(self, pool_guard: &PoolGuard) -> crate::error::Result<()> {
-        match self.kind {
-            GenericIndexKind::Unique(idx) => idx.destroy(pool_guard).await,
-            GenericIndexKind::NonUnique(idx) => idx.destroy(pool_guard).await,
-        }
-    }
-
-    /// Returns whether this index is unique.
-    #[inline]
-    pub fn is_unique(&self) -> bool {
-        matches!(self.kind, GenericIndexKind::Unique(_))
-    }
-
-    /// Returns the unique-index view when the index is unique.
-    #[inline]
-    pub fn unique(&self) -> Option<&GenericUniqueBTreeIndex<P>> {
-        match &self.kind {
-            GenericIndexKind::Unique(idx) => Some(idx),
-            _ => None,
-        }
-    }
-
-    /// Returns the non-unique-index view when the index is non-unique.
-    #[inline]
-    pub fn non_unique(&self) -> Option<&GenericNonUniqueBTreeIndex<P>> {
-        match &self.kind {
-            GenericIndexKind::NonUnique(idx) => Some(idx),
-            _ => None,
-        }
-    }
-
-    /// Consume this container into its concrete unique MemTree backend.
-    #[inline]
-    pub(crate) fn into_unique(self) -> Option<(usize, GenericUniqueBTreeIndex<P>)> {
-        match self.kind {
-            GenericIndexKind::Unique(idx) => Some((self.index_no, idx)),
-            GenericIndexKind::NonUnique(_) => None,
-        }
-    }
-
-    /// Consume this container into its concrete non-unique MemTree backend.
-    #[inline]
-    pub(crate) fn into_non_unique(self) -> Option<(usize, GenericNonUniqueBTreeIndex<P>)> {
-        match self.kind {
-            GenericIndexKind::Unique(_) => None,
-            GenericIndexKind::NonUnique(idx) => Some((self.index_no, idx)),
-        }
-    }
-}
-
-/// Generic variants of secondary-index backends.
-pub enum GenericIndexKind<P: 'static> {
-    Unique(GenericUniqueBTreeIndex<P>),
-    NonUnique(GenericNonUniqueBTreeIndex<P>),
-}
+use crate::value::Val;
+use std::cmp::Ordering;
+use std::sync::Arc;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -152,450 +62,1269 @@ impl IndexCompareExchange {
     }
 }
 
-pub trait EncodeKeySelf {
-    fn encode(key: &[Val]) -> Self;
+/// Runtime cold-layer opener for one user-table secondary DiskTree.
+///
+/// The runtime is table-specific by construction. Each open reads the currently
+/// published secondary root from the table file, then hands that copied root to
+/// a typed DiskTree reader. Already opened readers keep their root snapshot.
+pub(crate) struct SecondaryDiskTreeRuntime {
+    index_no: usize,
+    table_file: Arc<TableFile>,
+    kind: SecondaryDiskTreeRuntimeKind,
 }
 
-macro_rules! impl_self_encode_number {
-    ($ty:ty, $func:ident) => {
-        impl EncodeKeySelf for $ty {
-            #[inline]
-            fn encode(key: &[Val]) -> Self {
-                key[0].$func().unwrap()
+enum SecondaryDiskTreeRuntimeKind {
+    Unique(UniqueDiskTreeRuntime),
+    NonUnique(NonUniqueDiskTreeRuntime),
+}
+
+impl SecondaryDiskTreeRuntime {
+    /// Create a cold-layer runtime for one table secondary index.
+    #[inline]
+    pub(crate) fn new(
+        index_no: usize,
+        metadata: Arc<TableMetadata>,
+        table_file: Arc<TableFile>,
+        disk_pool: QuiescentGuard<ReadonlyBufferPool>,
+    ) -> Result<Self> {
+        let index_spec = metadata
+            .index_specs
+            .get(index_no)
+            .ok_or(Error::InvalidArgument)?;
+        table_file
+            .active_root()
+            .secondary_index_roots
+            .get(index_no)
+            .ok_or(Error::InvalidArgument)?;
+        let file_kind = table_file.file_kind();
+        let file = Arc::clone(table_file.sparse_file());
+        let kind = if index_spec.unique() {
+            SecondaryDiskTreeRuntimeKind::Unique(UniqueDiskTreeRuntime::new(
+                index_spec,
+                metadata.as_ref(),
+                file_kind,
+                file,
+                disk_pool,
+            )?)
+        } else {
+            SecondaryDiskTreeRuntimeKind::NonUnique(NonUniqueDiskTreeRuntime::new(
+                index_spec,
+                metadata.as_ref(),
+                file_kind,
+                file,
+                disk_pool,
+            )?)
+        };
+        let runtime = Self {
+            index_no,
+            table_file,
+            kind,
+        };
+        Ok(runtime)
+    }
+
+    /// Return the current published DiskTree root for this secondary index.
+    #[inline]
+    pub(crate) fn published_root(&self) -> Result<BlockID> {
+        self.table_file
+            .active_root()
+            .secondary_index_roots
+            .get(self.index_no)
+            .copied()
+            .ok_or(Error::InvalidArgument)
+    }
+
+    /// Return the table index number represented by this context.
+    #[inline]
+    pub(crate) fn index_no(&self) -> usize {
+        self.index_no
+    }
+
+    #[inline]
+    pub(crate) fn is_unique(&self) -> bool {
+        matches!(self.kind, SecondaryDiskTreeRuntimeKind::Unique(_))
+    }
+
+    #[inline]
+    pub(crate) fn disk_pool_guard(&self) -> PoolGuard {
+        match &self.kind {
+            SecondaryDiskTreeRuntimeKind::Unique(runtime) => runtime.disk_pool_guard(),
+            SecondaryDiskTreeRuntimeKind::NonUnique(runtime) => runtime.disk_pool_guard(),
+        }
+    }
+
+    #[inline]
+    pub(crate) fn open_unique<'a>(
+        &'a self,
+        disk_pool_guard: &'a PoolGuard,
+    ) -> Result<UniqueDiskTree<'a>> {
+        self.open_unique_at(self.published_root()?, disk_pool_guard)
+    }
+
+    #[inline]
+    pub(crate) fn open_unique_at<'a>(
+        &'a self,
+        root_block_id: BlockID,
+        disk_pool_guard: &'a PoolGuard,
+    ) -> Result<UniqueDiskTree<'a>> {
+        match &self.kind {
+            SecondaryDiskTreeRuntimeKind::Unique(runtime) => {
+                Ok(runtime.open(root_block_id, disk_pool_guard))
+            }
+            SecondaryDiskTreeRuntimeKind::NonUnique(_) => Err(Error::InvalidArgument),
+        }
+    }
+
+    #[inline]
+    pub(crate) fn open_non_unique<'a>(
+        &'a self,
+        disk_pool_guard: &'a PoolGuard,
+    ) -> Result<NonUniqueDiskTree<'a>> {
+        self.open_non_unique_at(self.published_root()?, disk_pool_guard)
+    }
+
+    #[inline]
+    pub(crate) fn open_non_unique_at<'a>(
+        &'a self,
+        root_block_id: BlockID,
+        disk_pool_guard: &'a PoolGuard,
+    ) -> Result<NonUniqueDiskTree<'a>> {
+        match &self.kind {
+            SecondaryDiskTreeRuntimeKind::Unique(_) => Err(Error::InvalidArgument),
+            SecondaryDiskTreeRuntimeKind::NonUnique(runtime) => {
+                Ok(runtime.open(root_block_id, disk_pool_guard))
             }
         }
-    };
-}
-
-impl_self_encode_number!(i8, as_i8);
-impl_self_encode_number!(u8, as_u8);
-impl_self_encode_number!(i16, as_i16);
-impl_self_encode_number!(u16, as_u16);
-impl_self_encode_number!(i32, as_i32);
-impl_self_encode_number!(u32, as_u32);
-impl_self_encode_number!(i64, as_i64);
-impl_self_encode_number!(u64, as_u64);
-impl_self_encode_number!(f32, as_f32);
-impl_self_encode_number!(f64, as_f64);
-
-impl EncodeKeySelf for BTreeKey {
-    #[inline]
-    fn encode(key: &[Val]) -> Self {
-        debug_assert!(key.len() == 1);
-        let bs = key[0].as_bytes().unwrap();
-        BTreeKey::from(bs)
     }
 }
 
-pub trait EncodeMultiKeys {
-    fn encode(&self, key: &[Val]) -> Val;
+/// Composite unique secondary index over a mutable MemIndex and cold DiskTree.
+pub(crate) struct UniqueSecondaryIndex<P: 'static> {
+    mem: UniqueMemIndex<P>,
+    disk: SecondaryDiskTreeRuntime,
+}
 
-    fn encode_pair(&self, prefix_key: &[Val], end_key: &Val) -> Val;
+impl<P: BufferPool> UniqueSecondaryIndex<P> {
+    /// Return the cold DiskTree runtime used by this composite.
+    #[inline]
+    pub(crate) fn disk(&self) -> &SecondaryDiskTreeRuntime {
+        &self.disk
+    }
+
+    /// Destroy the mutable MemIndex owned by this composite index.
+    #[inline]
+    pub(crate) async fn destroy(self, pool_guard: &PoolGuard) -> Result<()> {
+        self.mem.destroy(pool_guard).await
+    }
+
+    /// Scan the mutable MemIndex entries without reading DiskTree.
+    #[inline]
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) async fn scan_mem_entries(
+        &self,
+        pool_guard: &PoolGuard,
+    ) -> Result<Vec<UniqueMemIndexEntry>> {
+        self.mem.scan_encoded_entries(pool_guard).await
+    }
+
+    /// Remove one scanned MemIndex entry only if its current state still
+    /// matches the scan result.
+    #[inline]
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) async fn compare_delete_mem_encoded_entry(
+        &self,
+        pool_guard: &PoolGuard,
+        encoded_key: &[u8],
+        row_id: RowID,
+        deleted: bool,
+        ts: TrxID,
+    ) -> Result<bool> {
+        self.mem
+            .compare_delete_encoded_entry(pool_guard, encoded_key, row_id, deleted, ts)
+            .await
+    }
+
+    /// Insert into the MemIndex backend during recovery without probing DiskTree.
+    ///
+    /// Recovery uses this for hot/post-checkpoint row-page state. Checkpointed
+    /// cold state is already represented by the DiskTree root and must not be
+    /// treated as a duplicate while rebuilding MemIndex.
+    #[inline]
+    pub(crate) async fn insert_recovery_mem_only(
+        &self,
+        pool_guard: &PoolGuard,
+        key: &[Val],
+        row_id: RowID,
+        merge_if_match_deleted: bool,
+        ts: TrxID,
+    ) -> Result<IndexInsert> {
+        self.mem
+            .insert_if_not_exists(pool_guard, key, row_id, merge_if_match_deleted, ts)
+            .await
+    }
+
+    /// Compare-exchange the MemIndex backend during recovery without DiskTree access.
+    #[inline]
+    pub(crate) async fn compare_exchange_recovery_mem_only(
+        &self,
+        pool_guard: &PoolGuard,
+        key: &[Val],
+        old_row_id: RowID,
+        new_row_id: RowID,
+        ts: TrxID,
+    ) -> Result<IndexCompareExchange> {
+        self.mem
+            .compare_exchange(pool_guard, key, old_row_id, new_row_id, ts)
+            .await
+    }
+}
+
+impl<P: BufferPool + 'static> UniqueIndex for UniqueSecondaryIndex<P> {
+    #[inline]
+    async fn lookup(
+        &self,
+        pool_guard: &PoolGuard,
+        key: &[Val],
+        ts: TrxID,
+    ) -> Result<Option<(RowID, bool)>> {
+        if let Some(hit) = self.mem.lookup(pool_guard, key, ts).await? {
+            return Ok(Some(hit));
+        }
+        let disk_pool_guard = self.disk.disk_pool_guard();
+        let disk = self.disk.open_unique(&disk_pool_guard)?;
+        Ok(disk.lookup(key).await?.map(|row_id| (row_id, false)))
+    }
+
+    #[inline]
+    async fn insert_if_not_exists(
+        &self,
+        pool_guard: &PoolGuard,
+        key: &[Val],
+        row_id: RowID,
+        merge_if_match_deleted: bool,
+        ts: TrxID,
+    ) -> Result<IndexInsert> {
+        debug_assert!(!row_id.is_deleted());
+        if let Some((old_row_id, deleted)) = self.mem.lookup(pool_guard, key, ts).await? {
+            if merge_if_match_deleted && deleted && old_row_id == row_id {
+                return self
+                    .mem
+                    .insert_if_not_exists(pool_guard, key, row_id, true, ts)
+                    .await;
+            }
+            return Ok(IndexInsert::DuplicateKey(old_row_id, deleted));
+        }
+        let disk_pool_guard = self.disk.disk_pool_guard();
+        let disk = self.disk.open_unique(&disk_pool_guard)?;
+        if let Some(cold_row_id) = disk.lookup(key).await? {
+            return Ok(IndexInsert::DuplicateKey(cold_row_id, false));
+        }
+        self.mem
+            .insert_if_not_exists(pool_guard, key, row_id, false, ts)
+            .await
+    }
+
+    #[inline]
+    async fn compare_delete(
+        &self,
+        pool_guard: &PoolGuard,
+        key: &[Val],
+        old_row_id: RowID,
+        ignore_del_mask: bool,
+        ts: TrxID,
+    ) -> Result<bool> {
+        debug_assert!(!old_row_id.is_deleted());
+        if self.mem.lookup(pool_guard, key, ts).await?.is_some() {
+            return self
+                .mem
+                .compare_delete(pool_guard, key, old_row_id, ignore_del_mask, ts)
+                .await;
+        }
+        Ok(true)
+    }
+
+    #[inline]
+    async fn compare_exchange(
+        &self,
+        pool_guard: &PoolGuard,
+        key: &[Val],
+        old_row_id: RowID,
+        new_row_id: RowID,
+        ts: TrxID,
+    ) -> Result<IndexCompareExchange> {
+        if self.mem.lookup(pool_guard, key, ts).await?.is_some() {
+            return self
+                .mem
+                .compare_exchange(pool_guard, key, old_row_id, new_row_id, ts)
+                .await;
+        }
+        // Delete-shadows are MemIndex overlays. If purge removed the shadow
+        // between the caller's lookup and this compare-exchange, retry instead
+        // of comparing the masked RowID against the unmasked DiskTree owner.
+        if old_row_id.is_deleted() {
+            return Ok(IndexCompareExchange::NotExists);
+        }
+        let disk_pool_guard = self.disk.disk_pool_guard();
+        let disk = self.disk.open_unique(&disk_pool_guard)?;
+        match disk.lookup(key).await? {
+            Some(cold_row_id) if cold_row_id == old_row_id => {
+                if self
+                    .mem
+                    .insert_overlay_if_absent(pool_guard, key, new_row_id, ts)
+                    .await?
+                {
+                    Ok(IndexCompareExchange::Ok)
+                } else {
+                    Ok(IndexCompareExchange::Mismatch)
+                }
+            }
+            Some(_) => Ok(IndexCompareExchange::Mismatch),
+            None => Ok(IndexCompareExchange::NotExists),
+        }
+    }
+
+    #[inline]
+    async fn scan_values(
+        &self,
+        pool_guard: &PoolGuard,
+        values: &mut Vec<RowID>,
+        _ts: TrxID,
+    ) -> Result<()> {
+        let mem_entries = self.mem.scan_encoded_entries(pool_guard).await?;
+        let disk_pool_guard = self.disk.disk_pool_guard();
+        let disk = self.disk.open_unique(&disk_pool_guard)?;
+        let disk_entries = disk.scan_entries().await?;
+        merge_unique_entries(&mem_entries, &disk_entries, values);
+        Ok(())
+    }
+}
+
+/// Composite non-unique secondary index over a mutable MemIndex and cold DiskTree.
+pub(crate) struct NonUniqueSecondaryIndex<P: 'static> {
+    mem: NonUniqueMemIndex<P>,
+    disk: SecondaryDiskTreeRuntime,
+}
+
+impl<P: BufferPool> NonUniqueSecondaryIndex<P> {
+    /// Return the cold DiskTree runtime used by this composite.
+    #[inline]
+    pub(crate) fn disk(&self) -> &SecondaryDiskTreeRuntime {
+        &self.disk
+    }
+
+    /// Destroy the mutable MemIndex owned by this composite index.
+    #[inline]
+    pub(crate) async fn destroy(self, pool_guard: &PoolGuard) -> Result<()> {
+        self.mem.destroy(pool_guard).await
+    }
+
+    /// Scan the mutable MemIndex entries without reading DiskTree.
+    #[inline]
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) async fn scan_mem_entries(
+        &self,
+        pool_guard: &PoolGuard,
+    ) -> Result<Vec<NonUniqueMemIndexEntry>> {
+        self.mem.scan_encoded_entries(pool_guard).await
+    }
+
+    /// Remove one scanned MemIndex exact entry only if its current state still
+    /// matches the scan result.
+    #[inline]
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) async fn compare_delete_mem_encoded_entry(
+        &self,
+        pool_guard: &PoolGuard,
+        encoded_key: &[u8],
+        deleted: bool,
+        ts: TrxID,
+    ) -> Result<bool> {
+        self.mem
+            .compare_delete_encoded_entry(pool_guard, encoded_key, deleted, ts)
+            .await
+    }
+
+    /// Insert into the MemIndex backend during recovery without probing DiskTree.
+    ///
+    /// Non-unique DiskTree exact entries are checkpointed cold state. Hot redo
+    /// rebuilds only exact MemIndex entries and must not reject a row because a
+    /// checkpointed cold exact entry exists.
+    #[inline]
+    pub(crate) async fn insert_recovery_mem_only(
+        &self,
+        pool_guard: &PoolGuard,
+        key: &[Val],
+        row_id: RowID,
+        merge_if_match_deleted: bool,
+        ts: TrxID,
+    ) -> Result<IndexInsert> {
+        self.mem
+            .insert_if_not_exists(pool_guard, key, row_id, merge_if_match_deleted, ts)
+            .await
+    }
+}
+
+impl<P: BufferPool + 'static> NonUniqueIndex for NonUniqueSecondaryIndex<P> {
+    #[inline]
+    async fn lookup(
+        &self,
+        pool_guard: &PoolGuard,
+        key: &[Val],
+        res: &mut Vec<RowID>,
+        _ts: TrxID,
+    ) -> Result<()> {
+        let mem_entries = self.mem.lookup_encoded_entries(pool_guard, key).await?;
+        let disk_pool_guard = self.disk.disk_pool_guard();
+        let disk = self.disk.open_non_unique(&disk_pool_guard)?;
+        let disk_entries = disk.prefix_scan_entries(key).await?;
+        merge_non_unique_entries(&mem_entries, &disk_entries, res);
+        Ok(())
+    }
+
+    #[inline]
+    async fn lookup_unique(
+        &self,
+        pool_guard: &PoolGuard,
+        key: &[Val],
+        row_id: RowID,
+        ts: TrxID,
+    ) -> Result<Option<bool>> {
+        if let Some(mem_hit) = self.mem.lookup_unique(pool_guard, key, row_id, ts).await? {
+            return Ok(Some(mem_hit));
+        }
+        let disk_pool_guard = self.disk.disk_pool_guard();
+        let disk = self.disk.open_non_unique(&disk_pool_guard)?;
+        if disk.contains_exact(key, row_id).await? {
+            Ok(Some(true))
+        } else {
+            Ok(None)
+        }
+    }
+
+    #[inline]
+    async fn insert_if_not_exists(
+        &self,
+        pool_guard: &PoolGuard,
+        key: &[Val],
+        row_id: RowID,
+        merge_if_match_deleted: bool,
+        ts: TrxID,
+    ) -> Result<IndexInsert> {
+        debug_assert!(!row_id.is_deleted());
+        if let Some(active) = self.mem.lookup_unique(pool_guard, key, row_id, ts).await? {
+            if merge_if_match_deleted && !active {
+                return self
+                    .mem
+                    .insert_if_not_exists(pool_guard, key, row_id, true, ts)
+                    .await;
+            }
+            return Ok(IndexInsert::DuplicateKey(row_id, !active));
+        }
+        let disk_pool_guard = self.disk.disk_pool_guard();
+        let disk = self.disk.open_non_unique(&disk_pool_guard)?;
+        if disk.contains_exact(key, row_id).await? {
+            return Ok(IndexInsert::DuplicateKey(row_id, false));
+        }
+        self.mem
+            .insert_if_not_exists(pool_guard, key, row_id, false, ts)
+            .await
+    }
+
+    #[inline]
+    async fn mask_as_deleted(
+        &self,
+        pool_guard: &PoolGuard,
+        key: &[Val],
+        row_id: RowID,
+        ts: TrxID,
+    ) -> Result<bool> {
+        debug_assert!(!row_id.is_deleted());
+        match self.mem.lookup_unique(pool_guard, key, row_id, ts).await? {
+            Some(true) => self.mem.mask_as_deleted(pool_guard, key, row_id, ts).await,
+            Some(false) => Ok(false),
+            None => {
+                let disk_pool_guard = self.disk.disk_pool_guard();
+                let disk = self.disk.open_non_unique(&disk_pool_guard)?;
+                if disk.contains_exact(key, row_id).await? {
+                    self.mem
+                        .insert_delete_overlay_if_absent(pool_guard, key, row_id, ts)
+                        .await
+                } else {
+                    Ok(false)
+                }
+            }
+        }
+    }
+
+    #[inline]
+    async fn mask_as_active(
+        &self,
+        pool_guard: &PoolGuard,
+        key: &[Val],
+        row_id: RowID,
+        ts: TrxID,
+    ) -> Result<bool> {
+        self.mem.mask_as_active(pool_guard, key, row_id, ts).await
+    }
+
+    #[inline]
+    async fn compare_delete(
+        &self,
+        pool_guard: &PoolGuard,
+        key: &[Val],
+        row_id: RowID,
+        ignore_del_mask: bool,
+        ts: TrxID,
+    ) -> Result<bool> {
+        debug_assert!(!row_id.is_deleted());
+        if self
+            .mem
+            .lookup_unique(pool_guard, key, row_id, ts)
+            .await?
+            .is_some()
+        {
+            return self
+                .mem
+                .compare_delete(pool_guard, key, row_id, ignore_del_mask, ts)
+                .await;
+        }
+        Ok(true)
+    }
+
+    #[inline]
+    async fn scan_values(
+        &self,
+        pool_guard: &PoolGuard,
+        values: &mut Vec<RowID>,
+        _ts: TrxID,
+    ) -> Result<()> {
+        let mem_entries = self.mem.scan_encoded_entries(pool_guard).await?;
+        let disk_pool_guard = self.disk.disk_pool_guard();
+        let disk = self.disk.open_non_unique(&disk_pool_guard)?;
+        let disk_entries = disk.scan_entries().await?;
+        merge_non_unique_entries(&mem_entries, &disk_entries, values);
+        Ok(())
+    }
+}
+
+/// Composite secondary-index variant for one table secondary index.
+pub(crate) enum SecondaryIndex<P: 'static> {
+    /// Composite unique secondary index.
+    Unique(UniqueSecondaryIndex<P>),
+    /// Composite non-unique secondary index.
+    NonUnique(NonUniqueSecondaryIndex<P>),
+}
+
+impl<P: BufferPool> SecondaryIndex<P> {
+    /// Pair a freshly built generic MemIndex with its cold DiskTree runtime.
+    #[inline]
+    pub(crate) async fn new(
+        mem_index: MemIndex<P>,
+        disk: SecondaryDiskTreeRuntime,
+        pool_guard: &PoolGuard,
+    ) -> Result<Self> {
+        let unique = mem_index.is_unique();
+        if disk.index_no() != mem_index.index_no || disk.is_unique() != unique {
+            let _ = mem_index.destroy(pool_guard).await;
+            return Err(Error::InvalidState);
+        }
+        if unique {
+            let (_, mem) = mem_index.into_unique().ok_or(Error::InvalidState)?;
+            Ok(Self::Unique(UniqueSecondaryIndex { mem, disk }))
+        } else {
+            let (_, mem) = mem_index.into_non_unique().ok_or(Error::InvalidState)?;
+            Ok(Self::NonUnique(NonUniqueSecondaryIndex { mem, disk }))
+        }
+    }
+
+    /// Destroy the mutable MemIndex owned by this composite index.
+    #[inline]
+    pub(crate) async fn destroy(self, pool_guard: &PoolGuard) -> Result<()> {
+        match self {
+            Self::Unique(index) => index.destroy(pool_guard).await,
+            Self::NonUnique(index) => index.destroy(pool_guard).await,
+        }
+    }
+
+    /// Return whether this composite index enforces uniqueness.
+    #[inline]
+    pub(crate) fn is_unique(&self) -> bool {
+        matches!(self, Self::Unique(_))
+    }
+
+    /// Return the index number from the cold context.
+    #[inline]
+    pub(crate) fn index_no(&self) -> usize {
+        match self {
+            Self::Unique(index) => index.disk().index_no(),
+            Self::NonUnique(index) => index.disk().index_no(),
+        }
+    }
+
+    /// Returns the unique-index view when this slot is unique.
+    #[inline]
+    pub(crate) fn unique(&self) -> Option<&UniqueSecondaryIndex<P>> {
+        match self {
+            Self::Unique(index) => Some(index),
+            Self::NonUnique(_) => None,
+        }
+    }
+
+    /// Returns the non-unique-index view when this slot is non-unique.
+    #[inline]
+    pub(crate) fn non_unique(&self) -> Option<&NonUniqueSecondaryIndex<P>> {
+        match self {
+            Self::Unique(_) => None,
+            Self::NonUnique(index) => Some(index),
+        }
+    }
 }
 
 #[inline]
-pub fn multi_key_encoder(types: Vec<ValType>) -> Either<FixLenEncoder, VarLenEncoder> {
-    debug_assert!(types.len() > 1);
-    if types.iter().all(|ty| ty.kind.is_fixed()) {
-        let len = types
-            .iter()
-            .map(|ty| ty.memcmp_encoded_len().unwrap())
-            .sum::<usize>();
-        let encoder = FixLenEncoder::new(types, len);
-        return Either::Left(encoder);
-    }
-    let min_len = types
-        .iter()
-        .map(|ty| ty.memcmp_encoded_len_maybe_var())
-        .sum::<usize>();
-    let encoder = VarLenEncoder::new(types, min_len);
-    Either::Right(encoder)
-}
-
-pub struct FixLenEncoder {
-    types: Box<[ValType]>,
-    len: usize,
-}
-
-impl FixLenEncoder {
-    #[inline]
-    pub fn new(types: Vec<ValType>, len: usize) -> Self {
-        debug_assert!(types.len() > 1);
-        debug_assert!(types.iter().all(|ty| ty.kind.is_fixed()));
-        debug_assert!(
-            types
-                .iter()
-                .map(|ty| ty.memcmp_encoded_len().unwrap())
-                .sum::<usize>()
-                == len
-        );
-        FixLenEncoder {
-            types: types.into_boxed_slice(),
-            len,
+fn merge_unique_entries(
+    mem_entries: &[UniqueMemIndexEntry],
+    disk_entries: &[(Vec<u8>, RowID)],
+    values: &mut Vec<RowID>,
+) {
+    let mut mem_idx = 0;
+    let mut disk_idx = 0;
+    while mem_idx < mem_entries.len() && disk_idx < disk_entries.len() {
+        let mem = &mem_entries[mem_idx];
+        let (disk_key, disk_row_id) = &disk_entries[disk_idx];
+        match mem.encoded_key.as_slice().cmp(disk_key.as_slice()) {
+            Ordering::Less => {
+                values.push(mem.scan_row_id());
+                mem_idx += 1;
+            }
+            Ordering::Equal => {
+                values.push(mem.scan_row_id());
+                mem_idx += 1;
+                disk_idx += 1;
+            }
+            Ordering::Greater => {
+                values.push(*disk_row_id);
+                disk_idx += 1;
+            }
         }
     }
-}
-
-impl EncodeMultiKeys for FixLenEncoder {
-    #[inline]
-    fn encode(&self, key: &[Val]) -> Val {
-        debug_assert!(key.len() == self.types.len());
-        let mut buf = Vec::with_capacity(self.len);
-        for (ty, val) in self.types.iter().zip(key) {
-            val.encode_memcmp(*ty, &mut buf);
-        }
-        Val::from(buf)
+    for mem in &mem_entries[mem_idx..] {
+        values.push(mem.scan_row_id());
     }
-
-    #[inline]
-    fn encode_pair(&self, prefix_key: &[Val], end_key: &Val) -> Val {
-        debug_assert!(prefix_key.len() + 1 == self.types.len());
-        let mut buf = Vec::with_capacity(self.len);
-        for (ty, val) in self.types.iter().zip(prefix_key) {
-            val.encode_memcmp(*ty, &mut buf);
-        }
-        end_key.encode_memcmp(self.types.last().cloned().unwrap(), &mut buf);
-        Val::from(buf)
+    for (_, row_id) in &disk_entries[disk_idx..] {
+        values.push(*row_id);
     }
 }
 
-pub struct VarLenEncoder {
-    types: Box<[ValType]>,
-    min_len: usize,
-}
-
-impl VarLenEncoder {
-    #[inline]
-    pub fn new(types: Vec<ValType>, min_len: usize) -> Self {
-        debug_assert!(types.len() > 1);
-        debug_assert!(types.iter().any(|ty| !ty.kind.is_fixed()));
-        VarLenEncoder {
-            types: types.into_boxed_slice(),
-            min_len,
+#[inline]
+fn merge_non_unique_entries(
+    mem_entries: &[NonUniqueMemIndexEntry],
+    disk_entries: &[(Vec<u8>, RowID)],
+    values: &mut Vec<RowID>,
+) {
+    let mut mem_idx = 0;
+    let mut disk_idx = 0;
+    let mut last_emitted_key: Option<Vec<u8>> = None;
+    while mem_idx < mem_entries.len() && disk_idx < disk_entries.len() {
+        let mem = &mem_entries[mem_idx];
+        let (disk_key, disk_row_id) = &disk_entries[disk_idx];
+        match mem.encoded_key.as_slice().cmp(disk_key.as_slice()) {
+            Ordering::Less => {
+                push_active_mem_entry(mem, values, &mut last_emitted_key);
+                mem_idx += 1;
+            }
+            Ordering::Equal => {
+                if !mem.deleted {
+                    push_row_once(&mem.encoded_key, mem.row_id, values, &mut last_emitted_key);
+                }
+                mem_idx += 1;
+                disk_idx += 1;
+            }
+            Ordering::Greater => {
+                push_row_once(disk_key, *disk_row_id, values, &mut last_emitted_key);
+                disk_idx += 1;
+            }
         }
     }
-}
-
-impl EncodeMultiKeys for VarLenEncoder {
-    #[inline]
-    fn encode(&self, key: &[Val]) -> Val {
-        debug_assert!(key.len() == self.types.len());
-        let mut buf = Vec::with_capacity(self.min_len);
-        for (ty, val) in self.types.iter().zip(key) {
-            val.encode_memcmp(*ty, &mut buf);
-        }
-        Val::from(buf)
+    for mem in &mem_entries[mem_idx..] {
+        push_active_mem_entry(mem, values, &mut last_emitted_key);
     }
-
-    #[inline]
-    fn encode_pair(&self, prefix_key: &[Val], end_key: &Val) -> Val {
-        debug_assert!(prefix_key.len() + 1 == self.types.len());
-        let mut buf = Vec::with_capacity(self.min_len);
-        for (ty, val) in self.types.iter().zip(prefix_key) {
-            val.encode_memcmp(*ty, &mut buf);
-        }
-        end_key.encode_memcmp(self.types.last().cloned().unwrap(), &mut buf);
-        Val::from(buf)
+    for (disk_key, row_id) in &disk_entries[disk_idx..] {
+        push_row_once(disk_key, *row_id, values, &mut last_emitted_key);
     }
 }
 
-pub const INDEX_PARTITIONS: usize = 64;
-
-// Simple partitioned index implementation backed by BTreeMap in standard library.
-pub struct PartitionSingleKeyIndex<T, const NULLABLE: bool>(
-    pub(super) Box<[RwLock<BTreeMap<T, RowID>>]>,
-);
-
-impl<T: Hash> PartitionSingleKeyIndex<T, false> {
-    #[inline]
-    pub(super) fn empty() -> Self {
-        let partitions: Vec<_> = (0..INDEX_PARTITIONS)
-            .map(|_| RwLock::new(BTreeMap::new()))
-            .collect();
-        PartitionSingleKeyIndex(partitions.into_boxed_slice())
-    }
-
-    #[inline]
-    pub(super) fn select(&self, key: &T) -> &RwLock<BTreeMap<T, RowID>> {
-        let mut hasher = DefaultHasher::new();
-        key.hash(&mut hasher);
-        let hash = hasher.finish();
-        &self.0[hash as usize % INDEX_PARTITIONS]
+#[inline]
+fn push_active_mem_entry(
+    entry: &NonUniqueMemIndexEntry,
+    values: &mut Vec<RowID>,
+    last_emitted_key: &mut Option<Vec<u8>>,
+) {
+    if !entry.deleted {
+        push_row_once(&entry.encoded_key, entry.row_id, values, last_emitted_key);
     }
 }
 
-pub struct PartitionMultiKeyIndex {
-    pub(super) encoder: Either<FixLenEncoder, VarLenEncoder>,
-    pub(super) index: PartitionSingleKeyIndex<BTreeKey, false>,
-}
-
-impl PartitionMultiKeyIndex {
-    #[inline]
-    pub fn empty(encoder: Either<FixLenEncoder, VarLenEncoder>) -> Self {
-        let index = PartitionSingleKeyIndex::empty();
-        PartitionMultiKeyIndex { encoder, index }
-    }
-
-    #[inline]
-    pub fn encode(&self, key: &[Val]) -> Val {
-        match &self.encoder {
-            Either::Left(fe) => fe.encode(key),
-            Either::Right(ve) => ve.encode(key),
-        }
+#[inline]
+fn push_row_once(
+    encoded_key: &[u8],
+    row_id: RowID,
+    values: &mut Vec<RowID>,
+    last_emitted_key: &mut Option<Vec<u8>>,
+) {
+    if last_emitted_key.as_deref() != Some(encoded_key) {
+        values.push(row_id);
+        *last_emitted_key = Some(encoded_key.to_vec());
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::catalog::tests::table4;
-    use crate::conf::{EngineConfig, EvictableBufferPoolConfig, TrxSysConfig};
-    use crate::row::ops::{DeleteMvcc, InsertMvcc, SelectKey, SelectMvcc, UpdateCol, UpdateMvcc};
-    use crate::table::TableAccess;
-    use tempfile::TempDir;
+    use crate::buffer::{
+        FixedBufferPool, PoolGuard, PoolRole, global_readonly_pool_scope, table_readonly_pool,
+    };
+    use crate::catalog::{ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexSpec};
+    use crate::file::build_test_fs;
+    use crate::file::cow_file::SUPER_BLOCK_ID;
+    use crate::file::table_file::{MutableTableFile, TableFile};
+    use crate::index::btree::BTree;
+    use crate::index::btree_key::BTreeKeyEncoder;
+    use crate::index::disk_tree::{NonUniqueDiskTreeExact, UniqueDiskTreePut};
+    use crate::quiescent::QuiescentBox;
+    use crate::value::{ValKind, ValType};
 
-    #[test]
-    fn test_secondary_index_common() {
-        smol::block_on(async {
-            let temp_dir = TempDir::new().unwrap();
-            let main_dir = temp_dir.path().to_path_buf();
-            let engine = EngineConfig::default()
-                .storage_root(main_dir)
-                .data_buffer(
-                    EvictableBufferPoolConfig::default().role(crate::buffer::PoolRole::Mem),
-                )
-                .trx(
-                    TrxSysConfig::default()
-                        .log_file_stem("redo_secidx1")
-                        .skip_recovery(true),
-                )
-                .build()
-                .await
-                .unwrap();
-            let table_id = table4(&engine).await;
-            {
-                let table = engine.catalog().get_table(table_id).await.unwrap();
+    fn metadata_with_indexes() -> Arc<TableMetadata> {
+        Arc::new(TableMetadata::new(
+            vec![ColumnSpec::new(
+                "c0",
+                ValKind::U32,
+                ColumnAttributes::empty(),
+            )],
+            vec![
+                IndexSpec::new("idx_unique", vec![IndexKey::new(0)], IndexAttributes::UK),
+                IndexSpec::new(
+                    "idx_non_unique",
+                    vec![IndexKey::new(0)],
+                    IndexAttributes::empty(),
+                ),
+            ],
+        ))
+    }
 
-                let mut session = engine.try_new_session().unwrap();
-                let user_read_set = &[0usize, 1];
-                // insert row.
-                // 0,0; 1,1; 2,2; 3,3; 4,4
-                let trx = session.try_begin_trx().unwrap().unwrap();
-                let mut stmt = trx.start_stmt();
-                for i in 0i32..5i32 {
-                    let res = table
-                        .accessor()
-                        .insert_mvcc(&mut stmt, vec![Val::from(i), Val::from(i)])
-                        .await;
-                    assert!(matches!(res, Ok(InsertMvcc::Inserted(_))));
-                }
-                stmt.succeed().commit().await.unwrap();
-                // select ... where id = 1
-                let trx = session.try_begin_trx().unwrap().unwrap();
-                let stmt = trx.start_stmt();
-                let key = SelectKey::new(0, vec![Val::from(1i32)]);
-                let res = table
-                    .accessor()
-                    .index_lookup_unique_mvcc(&stmt, &key, user_read_set)
-                    .await;
-                stmt.succeed().commit().await.unwrap();
-                assert!(matches!(res, Ok(SelectMvcc::Found(_))));
-                // select ... where val = 1
-                let trx = session.try_begin_trx().unwrap().unwrap();
-                let stmt = trx.start_stmt();
-                let key = SelectKey::new(1, vec![Val::from(1i32)]);
-                let res = table
-                    .accessor()
-                    .index_scan_mvcc(&stmt, &key, user_read_set)
-                    .await;
-                stmt.succeed().commit().await.unwrap();
-                assert!(res.unwrap().unwrap_rows().len() == 1);
-                // update val = 0 where id = 1
-                let trx = session.try_begin_trx().unwrap().unwrap();
-                let mut stmt = trx.start_stmt();
-                let key = SelectKey::new(0, vec![Val::from(1i32)]);
-                let update = vec![UpdateCol {
-                    idx: 1,
-                    val: Val::from(0i32),
-                }];
-                let res = table
-                    .accessor()
-                    .update_unique_mvcc(&mut stmt, &key, update)
-                    .await;
-                stmt.succeed().commit().await.unwrap();
-                assert!(matches!(res, Ok(UpdateMvcc::Updated(_))));
-                // select ... where val = 0
-                let trx = session.try_begin_trx().unwrap().unwrap();
-                let stmt = trx.start_stmt();
-                let key = SelectKey::new(1, vec![Val::from(0i32)]);
-                let res = table
-                    .accessor()
-                    .index_scan_mvcc(&stmt, &key, user_read_set)
-                    .await;
-                stmt.succeed().commit().await.unwrap();
-                assert!(res.unwrap().unwrap_rows().len() == 2);
-                // delete where id = 0
-                let trx = session.try_begin_trx().unwrap().unwrap();
-                let mut stmt = trx.start_stmt();
-                let key = SelectKey::new(0, vec![Val::from(0i32)]);
-                let res = table
-                    .accessor()
-                    .delete_unique_mvcc(&mut stmt, &key, false)
-                    .await;
-                stmt.succeed().commit().await.unwrap();
-                assert!(matches!(res, Ok(DeleteMvcc::Deleted)));
-                // select ... where val = 0
-                let trx = session.try_begin_trx().unwrap().unwrap();
-                let stmt = trx.start_stmt();
-                let key = SelectKey::new(1, vec![Val::from(0i32)]);
-                let res = table
-                    .accessor()
-                    .index_scan_mvcc(&stmt, &key, user_read_set)
-                    .await;
-                _ = stmt.succeed().commit().await.unwrap();
-                assert!(res.unwrap().unwrap_rows().len() == 1);
-            }
-            drop(engine);
-        })
+    async fn unique_mem_index(
+        pool: &QuiescentBox<FixedBufferPool>,
+        pool_guard: &PoolGuard,
+    ) -> UniqueMemIndex<FixedBufferPool> {
+        let tree = BTree::new(pool.guard(), pool_guard, true, 100)
+            .await
+            .expect("unique MemIndex should be created");
+        UniqueMemIndex::new(
+            tree,
+            BTreeKeyEncoder::new(vec![ValType::new(ValKind::U32, false)]),
+        )
+    }
+
+    async fn non_unique_mem_index(
+        pool: &QuiescentBox<FixedBufferPool>,
+        pool_guard: &PoolGuard,
+    ) -> NonUniqueMemIndex<FixedBufferPool> {
+        let tree = BTree::new(pool.guard(), pool_guard, true, 100)
+            .await
+            .expect("non-unique MemIndex should be created");
+        NonUniqueMemIndex::new(
+            tree,
+            BTreeKeyEncoder::new(vec![
+                ValType::new(ValKind::U32, false),
+                ValType::new(ValKind::U64, false),
+            ]),
+        )
+    }
+
+    async fn publish_secondary_root(
+        mut mutable: MutableTableFile,
+        index_no: usize,
+        root: BlockID,
+        ts: TrxID,
+    ) -> Arc<TableFile> {
+        mutable
+            .set_secondary_index_root(index_no, root)
+            .expect("test secondary root publication should accept index number");
+        let (table, old_root) = mutable
+            .commit(ts, false)
+            .await
+            .expect("test secondary root publication should commit");
+        drop(old_root);
+        table
+    }
+
+    macro_rules! unique_runtime {
+        ($metadata:ident, $disk_pool:ident) => {
+            UniqueDiskTreeRuntime::new(
+                &$metadata.index_specs[0],
+                $metadata.as_ref(),
+                $disk_pool.file_kind(),
+                Arc::clone($disk_pool.sparse_file()),
+                $disk_pool.global_pool().clone(),
+            )
+            .unwrap()
+        };
+    }
+
+    macro_rules! non_unique_runtime {
+        ($metadata:ident, $disk_pool:ident) => {
+            NonUniqueDiskTreeRuntime::new(
+                &$metadata.index_specs[1],
+                $metadata.as_ref(),
+                $disk_pool.file_kind(),
+                Arc::clone($disk_pool.sparse_file()),
+                $disk_pool.global_pool().clone(),
+            )
+            .unwrap()
+        };
     }
 
     #[test]
-    fn test_secondary_index_rollback() {
+    fn test_unique_dual_tree_method_semantics() {
         smol::block_on(async {
-            let temp_dir = TempDir::new().unwrap();
-            let main_dir = temp_dir.path().to_path_buf();
-            let engine = EngineConfig::default()
-                .storage_root(main_dir)
-                .data_buffer(
-                    EvictableBufferPoolConfig::default().role(crate::buffer::PoolRole::Mem),
-                )
-                .trx(
-                    TrxSysConfig::default()
-                        .log_file_stem("redo_secidx2")
-                        .skip_recovery(true),
-                )
-                .build()
+            let (_temp_dir, fs) = build_test_fs();
+            let metadata = metadata_with_indexes();
+            let table = fs
+                .create_table_file(611, Arc::clone(&metadata), false)
+                .unwrap();
+            let (table, old_root) = table.commit(1, false).await.unwrap();
+            drop(old_root);
+            let global = global_readonly_pool_scope(64 * 1024 * 1024);
+            let disk_pool = table_readonly_pool(&global, 611, &table);
+            let disk_guard = disk_pool.pool_guard();
+            let mut mutable = MutableTableFile::fork(&table, fs.background_writes());
+            let disk_runtime = unique_runtime!(metadata, disk_pool);
+            let disk = disk_runtime.open(SUPER_BLOCK_ID, &disk_guard);
+            let key1 = [Val::from(1u32)];
+            let key2 = [Val::from(2u32)];
+            let key3 = [Val::from(3u32)];
+            let key4 = [Val::from(4u32)];
+            let key5 = [Val::from(5u32)];
+            let key6 = [Val::from(6u32)];
+            let mut writer = disk.batch_writer(&mut mutable, 2);
+            writer
+                .batch_put(&[
+                    UniqueDiskTreePut {
+                        key: &key1,
+                        row_id: 10,
+                    },
+                    UniqueDiskTreePut {
+                        key: &key2,
+                        row_id: 20,
+                    },
+                    UniqueDiskTreePut {
+                        key: &key3,
+                        row_id: 30,
+                    },
+                    UniqueDiskTreePut {
+                        key: &key4,
+                        row_id: 40,
+                    },
+                ])
+                .unwrap();
+            let root = writer.finish().await.unwrap();
+            let table = publish_secondary_root(mutable, 0, root, 2).await;
+
+            let index_pool = QuiescentBox::new(
+                FixedBufferPool::with_capacity(PoolRole::Index, 64 * 1024 * 1024).unwrap(),
+            );
+            let index_guard = (*index_pool).pool_guard();
+            let mem = unique_mem_index(&index_pool, &index_guard).await;
+            assert!(
+                mem.insert_if_not_exists(&index_guard, &key1, 100, false, 3)
+                    .await
+                    .unwrap()
+                    .is_ok()
+            );
+            let runtime = SecondaryDiskTreeRuntime::new(
+                0,
+                Arc::clone(&metadata),
+                Arc::clone(&table),
+                disk_pool.global_pool().clone(),
+            )
+            .unwrap();
+            let index = UniqueSecondaryIndex { mem, disk: runtime };
+
+            assert_eq!(index.disk().published_root().unwrap(), root);
+            assert_eq!(index.disk().index_no(), 0);
+            assert!(
+                index
+                    .mem
+                    .lookup(&index_guard, &key1, 3)
+                    .await
+                    .unwrap()
+                    .is_some()
+            );
+            assert_eq!(
+                index.lookup(&index_guard, &key1, 3).await.unwrap(),
+                Some((100, false))
+            );
+            assert_eq!(
+                index.lookup(&index_guard, &key2, 3).await.unwrap(),
+                Some((20, false))
+            );
+
+            assert!(
+                index
+                    .mask_as_deleted(&index_guard, &key3, 30, 4)
+                    .await
+                    .unwrap()
+            );
+            assert_eq!(
+                index.lookup(&index_guard, &key3, 4).await.unwrap(),
+                Some((30, true))
+            );
+            assert_eq!(
+                index
+                    .insert_if_not_exists(&index_guard, &key4, 400, false, 5)
+                    .await
+                    .unwrap(),
+                IndexInsert::DuplicateKey(40, false)
+            );
+            assert!(
+                index
+                    .insert_if_not_exists(&index_guard, &key5, 50, false, 5)
+                    .await
+                    .unwrap()
+                    .is_ok()
+            );
+            assert_eq!(
+                index
+                    .compare_exchange(&index_guard, &key2, 20, 200, 6)
+                    .await
+                    .unwrap(),
+                IndexCompareExchange::Ok
+            );
+            assert_eq!(
+                index
+                    .compare_exchange(&index_guard, &key4, 999, 9999, 6)
+                    .await
+                    .unwrap(),
+                IndexCompareExchange::Mismatch
+            );
+            assert_eq!(
+                index
+                    .compare_exchange(&index_guard, &key4, 40.deleted(), 400, 6)
+                    .await
+                    .unwrap(),
+                IndexCompareExchange::NotExists
+            );
+            assert_eq!(
+                index
+                    .compare_exchange(&index_guard, &key6, 60, 600, 6)
+                    .await
+                    .unwrap(),
+                IndexCompareExchange::NotExists
+            );
+            assert!(
+                index
+                    .compare_delete(&index_guard, &key4, 40, false, 7)
+                    .await
+                    .unwrap()
+            );
+            assert!(
+                index
+                    .compare_delete(&index_guard, &key4, 41, false, 7)
+                    .await
+                    .unwrap()
+            );
+
+            let mut values = Vec::new();
+            index
+                .scan_values(&index_guard, &mut values, 8)
                 .await
                 .unwrap();
-            let table_id = table4(&engine).await;
-            {
-                let table = engine.catalog().get_table(table_id).await.unwrap();
+            assert_eq!(values, vec![100, 200, 30u64.deleted(), 40, 50]);
 
-                let mut session = engine.try_new_session().unwrap();
-                let user_read_set = &[0usize, 1];
-                // insert row.
-                // 0,0; 1,1; 2,2; 3,3; 4,4
-                let trx = session.try_begin_trx().unwrap().unwrap();
-                let mut stmt = trx.start_stmt();
-                for i in 0i32..5i32 {
-                    let res = table
-                        .accessor()
-                        .insert_mvcc(&mut stmt, vec![Val::from(i), Val::from(i)])
-                        .await;
-                    assert!(matches!(res, Ok(InsertMvcc::Inserted(_))));
-                }
-                stmt.succeed().commit().await.unwrap();
-                // insert 5,5 and rollback
-                let trx = session.try_begin_trx().unwrap().unwrap();
-                let mut stmt = trx.start_stmt();
-                let res = table
-                    .accessor()
-                    .insert_mvcc(&mut stmt, vec![Val::from(5i32), Val::from(5i32)])
-                    .await;
-                assert!(matches!(res, Ok(InsertMvcc::Inserted(_))));
-                stmt.succeed().rollback().await.unwrap();
-                // select ... where id = 5
-                let trx = session.try_begin_trx().unwrap().unwrap();
-                let stmt = trx.start_stmt();
-                let key = SelectKey::new(0, vec![Val::from(5i32)]);
-                let res = table
-                    .accessor()
-                    .index_lookup_unique_mvcc(&stmt, &key, user_read_set)
-                    .await;
-                stmt.succeed().commit().await.unwrap();
-                assert!(matches!(res, Ok(SelectMvcc::NotFound)));
-                // update val = 0 where id = 1
-                let trx = session.try_begin_trx().unwrap().unwrap();
-                let mut stmt = trx.start_stmt();
-                let key = SelectKey::new(0, vec![Val::from(1i32)]);
-                let update = vec![UpdateCol {
-                    idx: 1,
-                    val: Val::from(0i32),
-                }];
-                let res = table
-                    .accessor()
-                    .update_unique_mvcc(&mut stmt, &key, update)
-                    .await;
-                assert!(matches!(res, Ok(UpdateMvcc::Updated(_))));
-                stmt.succeed().rollback().await.unwrap();
-                // select ... where id = 1
-                let trx = session.try_begin_trx().unwrap().unwrap();
-                let stmt = trx.start_stmt();
-                let key = SelectKey::new(0, vec![Val::from(1i32)]);
-                let res = table
-                    .accessor()
-                    .index_lookup_unique_mvcc(&stmt, &key, user_read_set)
-                    .await;
-                stmt.succeed().commit().await.unwrap();
-                assert!(matches!(res, Ok(SelectMvcc::Found(_))));
-                let vals = res.unwrap().unwrap_found();
-                assert!(vals[0] == Val::from(1i32) && vals[1] == Val::from(1i32));
-                // delete where id = 0
-                let trx = session.try_begin_trx().unwrap().unwrap();
-                let mut stmt = trx.start_stmt();
-                let key = SelectKey::new(0, vec![Val::from(0i32)]);
-                let res = table
-                    .accessor()
-                    .delete_unique_mvcc(&mut stmt, &key, false)
-                    .await;
-                assert!(matches!(res, Ok(DeleteMvcc::Deleted)));
-                stmt.succeed().rollback().await.unwrap();
-                // select ... where val = 0
-                let trx = session.try_begin_trx().unwrap().unwrap();
-                let stmt = trx.start_stmt();
-                let key = SelectKey::new(0, vec![Val::from(0i32)]);
-                let res = table
-                    .accessor()
-                    .index_lookup_unique_mvcc(&stmt, &key, user_read_set)
-                    .await;
-                stmt.succeed().commit().await.unwrap();
-                assert!(matches!(res, Ok(SelectMvcc::Found(_))));
-                let vals = res.unwrap().unwrap_found();
-                assert!(vals[0] == Val::from(0i32) && vals[1] == Val::from(0i32));
+            let unchanged_disk = disk_runtime.open(root, &disk_guard);
+            assert_eq!(unchanged_disk.lookup(&key2).await.unwrap(), Some(20));
+            assert_eq!(unchanged_disk.lookup(&key3).await.unwrap(), Some(30));
+            assert_eq!(unchanged_disk.lookup(&key4).await.unwrap(), Some(40));
+        });
+    }
 
-                // delete where id = 3, then insert 3,3, then rollback
-                let mut trx = session.try_begin_trx().unwrap().unwrap();
-                let key = SelectKey::new(0, vec![Val::from(3i32)]);
-                let mut stmt = trx.start_stmt();
-                let res = table
-                    .accessor()
-                    .delete_unique_mvcc(&mut stmt, &key, false)
-                    .await;
-                assert!(matches!(res, Ok(DeleteMvcc::Deleted)));
-                trx = stmt.succeed();
-                stmt = trx.start_stmt();
-                let res = table
-                    .accessor()
-                    .insert_mvcc(&mut stmt, vec![Val::from(3), Val::from(3)])
-                    .await;
-                assert!(matches!(res, Ok(InsertMvcc::Inserted(_))));
-                trx = stmt.succeed();
-                // manual rollback.
-                trx.rollback().await.unwrap();
-                // select ... where id = 3
-                let trx = session.try_begin_trx().unwrap().unwrap();
-                let stmt = trx.start_stmt();
-                let key = SelectKey::new(0, vec![Val::from(3i32)]);
-                let res = table
-                    .accessor()
-                    .index_lookup_unique_mvcc(&stmt, &key, user_read_set)
-                    .await;
-                _ = stmt.succeed().commit().await.unwrap();
-                assert!(matches!(res, Ok(SelectMvcc::Found(_))));
-                let vals = res.unwrap().unwrap_found();
-                assert!(vals[0] == Val::from(3i32) && vals[1] == Val::from(3i32));
-            }
-            drop(engine);
-        })
+    #[test]
+    fn test_disk_runtime_resolves_published_root_per_open() {
+        smol::block_on(async {
+            let (_temp_dir, fs) = build_test_fs();
+            let metadata = metadata_with_indexes();
+            let table = fs
+                .create_table_file(614, Arc::clone(&metadata), false)
+                .unwrap();
+            let (table, old_root) = table.commit(1, false).await.unwrap();
+            drop(old_root);
+            let global = global_readonly_pool_scope(64 * 1024 * 1024);
+            let disk_pool = table_readonly_pool(&global, 614, &table);
+            let disk_guard = disk_pool.pool_guard();
+            let key1 = [Val::from(1u32)];
+            let key2 = [Val::from(2u32)];
+
+            let mut mutable = MutableTableFile::fork(&table, fs.background_writes());
+            let disk_runtime = unique_runtime!(metadata, disk_pool);
+            let disk = disk_runtime.open(SUPER_BLOCK_ID, &disk_guard);
+            let root_a = {
+                let mut writer = disk.batch_writer(&mut mutable, 2);
+                writer
+                    .batch_put(&[UniqueDiskTreePut {
+                        key: &key1,
+                        row_id: 10,
+                    }])
+                    .unwrap();
+                writer.finish().await.unwrap()
+            };
+            let table = publish_secondary_root(mutable, 0, root_a, 2).await;
+            let runtime = SecondaryDiskTreeRuntime::new(
+                0,
+                Arc::clone(&metadata),
+                Arc::clone(&table),
+                disk_pool.global_pool().clone(),
+            )
+            .unwrap();
+            assert_eq!(runtime.published_root().unwrap(), root_a);
+
+            let opened_a_guard = runtime.disk_pool_guard();
+            let opened_a = runtime.open_unique(&opened_a_guard).unwrap();
+            assert_eq!(opened_a.lookup(&key1).await.unwrap(), Some(10));
+            assert_eq!(opened_a.lookup(&key2).await.unwrap(), None);
+
+            let mut mutable = MutableTableFile::fork(&table, fs.background_writes());
+            let disk = disk_runtime.open(root_a, &disk_guard);
+            let root_b = {
+                let mut writer = disk.batch_writer(&mut mutable, 3);
+                writer
+                    .batch_put(&[UniqueDiskTreePut {
+                        key: &key2,
+                        row_id: 20,
+                    }])
+                    .unwrap();
+                writer.finish().await.unwrap()
+            };
+            assert_ne!(root_a, root_b);
+            let table_after_b = publish_secondary_root(mutable, 0, root_b, 3).await;
+            assert_eq!(table_after_b.active_root().secondary_index_roots[0], root_b);
+            assert_eq!(runtime.published_root().unwrap(), root_b);
+
+            assert_eq!(opened_a.lookup(&key1).await.unwrap(), Some(10));
+            assert_eq!(opened_a.lookup(&key2).await.unwrap(), None);
+
+            let opened_b_guard = runtime.disk_pool_guard();
+            let opened_b = runtime.open_unique(&opened_b_guard).unwrap();
+            assert_eq!(opened_b.lookup(&key1).await.unwrap(), Some(10));
+            assert_eq!(opened_b.lookup(&key2).await.unwrap(), Some(20));
+        });
+    }
+
+    #[test]
+    fn test_non_unique_dual_tree_merge_and_overlay_semantics() {
+        smol::block_on(async {
+            let (_temp_dir, fs) = build_test_fs();
+            let metadata = metadata_with_indexes();
+            let table = fs
+                .create_table_file(612, Arc::clone(&metadata), false)
+                .unwrap();
+            let (table, old_root) = table.commit(1, false).await.unwrap();
+            drop(old_root);
+            let global = global_readonly_pool_scope(64 * 1024 * 1024);
+            let disk_pool = table_readonly_pool(&global, 612, &table);
+            let disk_guard = disk_pool.pool_guard();
+            let mut mutable = MutableTableFile::fork(&table, fs.background_writes());
+            let disk_runtime = non_unique_runtime!(metadata, disk_pool);
+            let disk = disk_runtime.open(SUPER_BLOCK_ID, &disk_guard);
+            let key1 = [Val::from(1u32)];
+            let key2 = [Val::from(2u32)];
+            let key3 = [Val::from(3u32)];
+            let mut writer = disk.batch_writer(&mut mutable, 2);
+            writer
+                .batch_insert(&[
+                    NonUniqueDiskTreeExact {
+                        key: &key1,
+                        row_id: 10,
+                    },
+                    NonUniqueDiskTreeExact {
+                        key: &key1,
+                        row_id: 11,
+                    },
+                    NonUniqueDiskTreeExact {
+                        key: &key2,
+                        row_id: 20,
+                    },
+                    NonUniqueDiskTreeExact {
+                        key: &key3,
+                        row_id: 30,
+                    },
+                ])
+                .unwrap();
+            let root = writer.finish().await.unwrap();
+            let table = publish_secondary_root(mutable, 1, root, 2).await;
+
+            let index_pool = QuiescentBox::new(
+                FixedBufferPool::with_capacity(PoolRole::Index, 64 * 1024 * 1024).unwrap(),
+            );
+            let index_guard = (*index_pool).pool_guard();
+            let mem = non_unique_mem_index(&index_pool, &index_guard).await;
+            assert!(
+                mem.insert_if_not_exists(&index_guard, &key1, 12, false, 3)
+                    .await
+                    .unwrap()
+                    .is_ok()
+            );
+            let runtime = SecondaryDiskTreeRuntime::new(
+                1,
+                Arc::clone(&metadata),
+                Arc::clone(&table),
+                disk_pool.global_pool().clone(),
+            )
+            .unwrap();
+            let index = NonUniqueSecondaryIndex { mem, disk: runtime };
+
+            assert_eq!(index.disk().published_root().unwrap(), root);
+            assert_eq!(index.disk().index_no(), 1);
+            assert!(
+                index
+                    .mem
+                    .lookup_unique(&index_guard, &key1, 12, 3)
+                    .await
+                    .unwrap()
+                    .is_some()
+            );
+            assert!(
+                index
+                    .mask_as_deleted(&index_guard, &key1, 10, 4)
+                    .await
+                    .unwrap()
+            );
+            let mut rows = Vec::new();
+            index
+                .lookup(&index_guard, &key1, &mut rows, 4)
+                .await
+                .unwrap();
+            assert_eq!(rows, vec![11, 12]);
+            assert_eq!(
+                index
+                    .lookup_unique(&index_guard, &key1, 10, 4)
+                    .await
+                    .unwrap(),
+                Some(false)
+            );
+            assert_eq!(
+                index
+                    .lookup_unique(&index_guard, &key1, 11, 4)
+                    .await
+                    .unwrap(),
+                Some(true)
+            );
+            assert_eq!(
+                index
+                    .lookup_unique(&index_guard, &key1, 99, 4)
+                    .await
+                    .unwrap(),
+                None
+            );
+            assert_eq!(
+                index
+                    .insert_if_not_exists(&index_guard, &key1, 11, false, 5)
+                    .await
+                    .unwrap(),
+                IndexInsert::DuplicateKey(11, false)
+            );
+            assert!(
+                index
+                    .mask_as_active(&index_guard, &key1, 10, 5)
+                    .await
+                    .unwrap()
+            );
+            rows.clear();
+            index
+                .lookup(&index_guard, &key1, &mut rows, 5)
+                .await
+                .unwrap();
+            assert_eq!(rows, vec![10, 11, 12]);
+            assert!(
+                index
+                    .insert_if_not_exists(&index_guard, &key1, 13, false, 6)
+                    .await
+                    .unwrap()
+                    .is_ok()
+            );
+            assert!(
+                index
+                    .mask_as_deleted(&index_guard, &key2, 20, 7)
+                    .await
+                    .unwrap()
+            );
+            assert!(
+                index
+                    .compare_delete(&index_guard, &key3, 30, false, 7)
+                    .await
+                    .unwrap()
+            );
+
+            let mut values = Vec::new();
+            index
+                .scan_values(&index_guard, &mut values, 8)
+                .await
+                .unwrap();
+            assert_eq!(values, vec![10, 11, 12, 13, 30]);
+
+            let unchanged_disk = disk_runtime.open(root, &disk_guard);
+            assert_eq!(
+                unchanged_disk.prefix_scan(&key1).await.unwrap(),
+                vec![10, 11]
+            );
+            assert_eq!(unchanged_disk.prefix_scan(&key2).await.unwrap(), vec![20]);
+        });
+    }
+
+    #[test]
+    fn test_dual_tree_secondary_index_wrapper() {
+        smol::block_on(async {
+            let (_temp_dir, fs) = build_test_fs();
+            let metadata = metadata_with_indexes();
+            let table = fs
+                .create_table_file(613, Arc::clone(&metadata), false)
+                .unwrap();
+            let (table, old_root) = table.commit(1, false).await.unwrap();
+            drop(old_root);
+            let global = global_readonly_pool_scope(64 * 1024 * 1024);
+            let disk_pool = table_readonly_pool(&global, 613, &table);
+            let index_pool = QuiescentBox::new(
+                FixedBufferPool::with_capacity(PoolRole::Index, 64 * 1024 * 1024).unwrap(),
+            );
+            let index_guard = (*index_pool).pool_guard();
+            let mem = unique_mem_index(&index_pool, &index_guard).await;
+            let shadow_key = [Val::from(9u32)];
+            assert!(
+                mem.insert_delete_shadow_if_absent(&index_guard, &shadow_key, 90, 2)
+                    .await
+                    .unwrap()
+            );
+            let runtime = SecondaryDiskTreeRuntime::new(
+                0,
+                Arc::clone(&metadata),
+                Arc::clone(&table),
+                disk_pool.global_pool().clone(),
+            )
+            .unwrap();
+            let composite = SecondaryIndex::Unique(UniqueSecondaryIndex { mem, disk: runtime });
+            assert!(composite.is_unique());
+            assert_eq!(composite.index_no(), 0);
+
+            let mem = non_unique_mem_index(&index_pool, &index_guard).await;
+            let runtime = SecondaryDiskTreeRuntime::new(
+                1,
+                Arc::clone(&metadata),
+                Arc::clone(&table),
+                disk_pool.global_pool().clone(),
+            )
+            .unwrap();
+            let composite =
+                SecondaryIndex::NonUnique(NonUniqueSecondaryIndex { mem, disk: runtime });
+            assert!(!composite.is_unique());
+            assert_eq!(composite.index_no(), 1);
+        });
     }
 }
