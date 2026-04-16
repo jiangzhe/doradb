@@ -40,31 +40,15 @@ impl IndexUndoLogs {
     /// because other transaction can not update the same index entry
     /// concurrently.
     #[inline]
-    pub async fn rollback<F>(
+    pub async fn rollback(
         &mut self,
         table_cache: &mut TableCache<'_>,
         guards: &PoolGuards,
         ts: TrxID,
-        mut calc_min_active_sts: F,
-    ) -> Result<()>
-    where
-        F: FnMut() -> TrxID,
-    {
-        // Calculating the GC horizon scans transaction buckets. Most rollback
-        // entries do not need it, so compute it only on the LWC purgeability
-        // path and reuse the value for the rest of this rollback.
-        let mut min_active_sts = None;
+    ) -> Result<()> {
         while let Some(entry) = self.0.pop() {
             let table = table_cache.must_get_table(entry.table_id).await;
-            table
-                .rollback_index_entry(
-                    entry,
-                    guards,
-                    ts,
-                    &mut min_active_sts,
-                    &mut calc_min_active_sts,
-                )
-                .await?;
+            table.rollback_index_entry(entry, guards, ts).await?;
         }
         Ok(())
     }

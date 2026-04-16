@@ -418,28 +418,15 @@ impl TableHandle {
 
     /// Roll back one secondary-index undo entry through the concrete table runtime.
     #[inline]
-    pub(crate) async fn rollback_index_entry<F>(
+    pub(crate) async fn rollback_index_entry(
         &self,
         entry: IndexUndo,
         guards: &PoolGuards,
         ts: TrxID,
-        min_active_sts: &mut Option<TrxID>,
-        calc_min_active_sts: &mut F,
-    ) -> Result<()>
-    where
-        F: FnMut() -> TrxID,
-    {
+    ) -> Result<()> {
         match self {
-            TableHandle::User(table) => {
-                table
-                    .rollback_index_entry(entry, guards, ts, min_active_sts, calc_min_active_sts)
-                    .await
-            }
-            TableHandle::Catalog(table) => {
-                table
-                    .rollback_index_entry(entry, guards, ts, min_active_sts, calc_min_active_sts)
-                    .await
-            }
+            TableHandle::User(table) => table.rollback_index_entry(entry, guards, ts).await,
+            TableHandle::Catalog(table) => table.rollback_index_entry(entry, guards, ts).await,
         }
     }
 }

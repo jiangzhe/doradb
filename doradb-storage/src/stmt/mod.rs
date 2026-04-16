@@ -83,12 +83,9 @@ impl Statement {
                 .poison_storage(StoragePoisonSource::RollbackAccess));
         }
         // rollback index data.
-        let trx_sys = engine.trx_sys.clone();
         if self
             .index_undo
-            .rollback(&mut table_cache, &pool_guards, self.trx.sts, || {
-                trx_sys.calc_min_active_sts_for_gc()
-            })
+            .rollback(&mut table_cache, &pool_guards, self.trx.sts)
             .await
             .is_err()
         {
