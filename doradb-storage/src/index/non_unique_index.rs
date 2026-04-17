@@ -217,6 +217,18 @@ impl<P: BufferPool> NonUniqueMemIndex<P> {
         Ok(entries)
     }
 
+    /// Return whether `key` plus `row_id` encodes to the exact MemIndex key
+    /// bytes captured by a cleanup scan.
+    #[inline]
+    pub(crate) fn encoded_exact_key_matches(
+        &self,
+        key: &[Val],
+        row_id: RowID,
+        encoded_key: &[u8],
+    ) -> bool {
+        self.encoder.encode_pair(key, Val::from(row_id)).as_bytes() == encoded_key
+    }
+
     /// Remove an encoded exact MemIndex entry only when its delete state still
     /// matches the previously scanned entry.
     ///

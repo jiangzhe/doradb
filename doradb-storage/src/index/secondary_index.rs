@@ -295,6 +295,13 @@ impl<P: BufferPool> UniqueSecondaryIndex<P> {
         self.mem.scan_encoded_entries(pool_guard).await
     }
 
+    /// Return whether `key` encodes to the same MemIndex key bytes captured by
+    /// a cleanup scan.
+    #[inline]
+    pub(crate) fn mem_encoded_key_matches(&self, key: &[Val], encoded_key: &[u8]) -> bool {
+        self.mem.encoded_key_matches(key, encoded_key)
+    }
+
     /// Remove one scanned MemIndex entry only if its current state still
     /// matches the scan result.
     #[inline]
@@ -492,6 +499,18 @@ impl<P: BufferPool> NonUniqueSecondaryIndex<P> {
         pool_guard: &PoolGuard,
     ) -> Result<Vec<NonUniqueMemIndexEntry>> {
         self.mem.scan_encoded_entries(pool_guard).await
+    }
+
+    /// Return whether `key` plus `row_id` encodes to the same exact MemIndex key
+    /// bytes captured by a cleanup scan.
+    #[inline]
+    pub(crate) fn mem_encoded_exact_key_matches(
+        &self,
+        key: &[Val],
+        row_id: RowID,
+        encoded_key: &[u8],
+    ) -> bool {
+        self.mem.encoded_exact_key_matches(key, row_id, encoded_key)
     }
 
     /// Remove one scanned MemIndex exact entry only if its current state still

@@ -229,20 +229,25 @@ Valid cleanup decisions:
 - live non-unique exact entries can be removed only when the row id is below the
   captured `pivot_row_id` and the captured non-unique `DiskTree` contains the
   same encoded exact `(logical_key, row_id)` key
-- unique delete-shadows must be retained while the captured `DiskTree` still
-  maps the same encoded logical key to the same row id
-- non-unique delete-marked exact entries must be retained while the captured
-  `DiskTree` still contains the same encoded exact key
-- delete overlays whose matching cold entry is gone can be removed only with
-  row-deletion proof: either a deletion-buffer marker committed before
-  `Global_Min_STS`, or a captured checkpoint root older than `Global_Min_STS`
-  whose `ColumnBlockIndex` proves the row id is absent below the captured pivot
+- delete overlays can be removed with overlay-obsolescence proof even when the
+  captured `DiskTree` still contains a stale cold entry; valid proofs are a
+  deletion-buffer marker committed before `Global_Min_STS`, a captured
+  checkpoint root older than `Global_Min_STS` whose `ColumnBlockIndex` proves
+  the row id is absent below the captured pivot, or a captured cold LWC row
+  whose current indexed values encode to a different scanned MemIndex key
+- removing a proven row-deletion overlay does not mutate `DiskTree`; any stale
+  cold entry exposed by the overlay removal is filtered by normal row/deletion
+  visibility checks
+- cold-row key mismatch covers committed key changes where the row still
+  exists but no longer owns the scanned delete overlay's key; hot row-page key
+  mismatch remains transaction index GC's responsibility
 
 Invalid shortcuts:
 
 - deletion-buffer absence is not a cleanup proof
 - `row_id < pivot_row_id` alone is not a cleanup proof for delete overlays
 - `RowLocation::NotFound` from a moving current root is not a cleanup proof
+- hot row-page key mismatch is not proven by the full-scan cleanup pass
 - cleanup must not collect runtime unique-key links; those follow undo-chain GC
   and `Global_Min_STS`
 
@@ -698,9 +703,9 @@ This works because:
 
 - live entries are removable only when the captured `DiskTree` already contains
   the same durable mapping
-- delete overlays are removable only when the captured `DiskTree` no longer
-  needs the overlay for suppression and row deletion is globally or durably
-  proven
+- delete overlays are removable once overlay obsolescence is globally or
+  durably proven, including captured cold-row absence or captured cold-row key
+  mismatch, without first proving absence from the captured `DiskTree`
 - cleanup deletes by encoded key and expected delete-bit state so a stale scan
   cannot remove an entry that changed concurrently
 - cleanup may retain clean entries as cache; retained entries must preserve the

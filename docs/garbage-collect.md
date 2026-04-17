@@ -51,15 +51,28 @@ pivot and the captured `DiskTree` already has the same durable entry:
 - unique: same encoded logical key maps to the same row id
 - non-unique: same encoded exact `(logical_key, row_id)` key exists
 
-Delete overlays require stronger proof. A unique delete-shadow or non-unique
-delete-marked exact entry can be removed only when the captured `DiskTree` no
-longer needs the overlay for suppression and the row deletion is proven by one
-of these facts:
+Delete overlays require overlay-obsolescence proof, not `DiskTree` absence. A
+unique delete-shadow or non-unique delete-marked exact entry can be removed
+when one of these facts is true:
 
 - a deletion-buffer marker is committed and older than `Global_Min_STS`
 - the captured table root is older than `Global_Min_STS`, the row id is below
   the captured pivot, and the captured `ColumnBlockIndex` proves the row id is
   absent
+- the captured table root is older than `Global_Min_STS`, the row id is below
+  the captured pivot, and the captured cold LWC row still exists but its current
+  indexed values encode to a different scanned MemIndex key
+
+The last case covers committed key changes for cold rows: the row still exists,
+but the scanned delete overlay no longer protects the row's current secondary
+key. If the captured cold row still owns the same encoded key, cleanup retains
+the overlay unless whole-row deletion is proven. Hot row-page key-obsolescence
+proof remains transaction index GC's job because it needs row-page undo-chain
+visibility.
+
+A matching stale cold entry may still exist in the captured `DiskTree` after a
+row-deletion overlay is removed. That is safe because normal row/deletion
+visibility checks filter the row; `DiskTree` mutation remains checkpoint-owned.
 
 Invalid cleanup proofs:
 
@@ -67,6 +80,7 @@ Invalid cleanup proofs:
 - `row_id < pivot_row_id` by itself
 - a `RowLocation::NotFound` result from a moving current root
 - the existence of a newer `DiskTree` root not captured with the table snapshot
+- hot row-page key mismatch without transaction index GC's row-page proof
 
 Cleanup removes scanned entries with encoded compare-delete operations that
 also check the expected row id or delete-bit state. If an entry changed after

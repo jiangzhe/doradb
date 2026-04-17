@@ -2,15 +2,18 @@
 
 use super::Table;
 use crate::buffer::{EvictableBufferPool, PoolGuard, PoolGuards};
-use crate::error::{Error, Result};
+use crate::error::{BlockCorruptionCause, BlockKind, Error, FileKind, Result};
 use crate::file::BlockID;
 use crate::file::cow_file::SUPER_BLOCK_ID;
 use crate::index::{
-    ColumnBlockIndex, NonUniqueSecondaryIndex, SecondaryIndex, UniqueSecondaryIndex,
+    ColumnBlockIndex, NonUniqueMemIndexEntry, NonUniqueSecondaryIndex, ResolvedColumnRow,
+    SecondaryIndex, UniqueMemIndexEntry, UniqueSecondaryIndex,
 };
+use crate::lwc::PersistedLwcBlock;
 use crate::row::RowID;
 use crate::session::Session;
 use crate::trx::TrxID;
+use crate::value::Val;
 
 /// Aggregate result for a full-scan user-table secondary MemIndex cleanup pass.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -63,6 +66,12 @@ enum CleanupDecision {
     Remove,
     Retain,
     Error,
+}
+
+enum DeleteOverlayProof {
+    NotProven,
+    Obsolete,
+    ColdRowValues(Vec<Val>),
 }
 
 impl SecondaryMemIndexCleanupIndexStats {
@@ -178,6 +187,7 @@ impl Table {
                 SecondaryIndex::Unique(unique) => {
                     self.cleanup_unique_secondary_mem_index(
                         &cleanup_context,
+                        index_no,
                         unique,
                         secondary_root,
                         &mut index_stats,
@@ -187,6 +197,7 @@ impl Table {
                 SecondaryIndex::NonUnique(non_unique) => {
                     self.cleanup_non_unique_secondary_mem_index(
                         &cleanup_context,
+                        index_no,
                         non_unique,
                         secondary_root,
                         &mut index_stats,
@@ -204,6 +215,7 @@ impl Table {
     async fn cleanup_unique_secondary_mem_index(
         &self,
         cleanup_context: &MemIndexCleanupContext<'_>,
+        index_no: usize,
         index: &UniqueSecondaryIndex<EvictableBufferPool>,
         secondary_root: BlockID,
         stats: &mut SecondaryMemIndexCleanupIndexStats,
@@ -216,33 +228,36 @@ impl Table {
             .await?
         {
             let decision = if entry.deleted {
-                match disk.lookup_encoded(&entry.encoded_key).await {
-                    Ok(Some(row_id)) if row_id == entry.row_id => CleanupDecision::Retain,
-                    Ok(_) => {
-                        if self
-                            .cleanup_delete_overlay_is_proven(
-                                cleanup_context.snapshot,
-                                cleanup_context.column_index,
-                                entry.row_id,
-                            )
-                            .await?
-                        {
-                            compare_delete_unique_cleanup_entry(
-                                index,
-                                cleanup_context.index_pool_guard,
-                                &entry,
-                                cleanup_context.snapshot.min_active_sts,
-                            )
-                            .await?
-                        } else {
-                            CleanupDecision::Retain
-                        }
-                    }
-                    Err(_) => CleanupDecision::Error,
+                // Delete-shadows are removable only after we prove the overlay
+                // is obsolete. Whole-row deletion is one proof; for cold rows,
+                // an immutable LWC row whose current unique key encodes
+                // differently proves this scanned shadow no longer protects a
+                // visible owner. Hot row-page version checks stay in
+                // transaction index GC, where undo visibility is available.
+                if self
+                    .cleanup_unique_delete_overlay_is_obsolete(
+                        cleanup_context,
+                        index_no,
+                        index,
+                        &entry,
+                    )
+                    .await?
+                {
+                    compare_delete_unique_cleanup_entry(
+                        index,
+                        cleanup_context.index_pool_guard,
+                        &entry,
+                        cleanup_context.snapshot.min_active_sts,
+                    )
+                    .await?
+                } else {
+                    CleanupDecision::Retain
                 }
             } else if entry.row_id >= cleanup_context.snapshot.pivot_row_id {
                 CleanupDecision::Retain
             } else {
+                // Live entries need a matching cold mapping before cleanup can
+                // treat the MemIndex copy as redundant.
                 match disk.lookup_encoded(&entry.encoded_key).await {
                     Ok(Some(row_id)) if row_id == entry.row_id => {
                         compare_delete_unique_cleanup_entry(
@@ -266,6 +281,7 @@ impl Table {
     async fn cleanup_non_unique_secondary_mem_index(
         &self,
         cleanup_context: &MemIndexCleanupContext<'_>,
+        index_no: usize,
         index: &NonUniqueSecondaryIndex<EvictableBufferPool>,
         secondary_root: BlockID,
         stats: &mut SecondaryMemIndexCleanupIndexStats,
@@ -278,33 +294,35 @@ impl Table {
             .await?
         {
             let decision = if entry.deleted {
-                match disk.contains_exact_encoded(&entry.encoded_key).await {
-                    Ok(true) => CleanupDecision::Retain,
-                    Ok(false) => {
-                        if self
-                            .cleanup_delete_overlay_is_proven(
-                                cleanup_context.snapshot,
-                                cleanup_context.column_index,
-                                entry.row_id,
-                            )
-                            .await?
-                        {
-                            compare_delete_non_unique_cleanup_entry(
-                                index,
-                                cleanup_context.index_pool_guard,
-                                &entry,
-                                cleanup_context.snapshot.min_active_sts,
-                            )
-                            .await?
-                        } else {
-                            CleanupDecision::Retain
-                        }
-                    }
-                    Err(_) => CleanupDecision::Error,
+                // Non-unique delete marks use the same cold-row-only proof as
+                // unique shadows. If the persisted row exists but its current
+                // exact key no longer matches this encoded key+row-id pair,
+                // the old delete mark is obsolete. We deliberately avoid hot
+                // row-page key proof here; transaction index GC owns that path.
+                if self
+                    .cleanup_non_unique_delete_overlay_is_obsolete(
+                        cleanup_context,
+                        index_no,
+                        index,
+                        &entry,
+                    )
+                    .await?
+                {
+                    compare_delete_non_unique_cleanup_entry(
+                        index,
+                        cleanup_context.index_pool_guard,
+                        &entry,
+                        cleanup_context.snapshot.min_active_sts,
+                    )
+                    .await?
+                } else {
+                    CleanupDecision::Retain
                 }
             } else if entry.row_id >= cleanup_context.snapshot.pivot_row_id {
                 CleanupDecision::Retain
             } else {
+                // Live exact entries are redundant only when the same exact
+                // key is already present in the captured cold root.
                 match disk.contains_exact_encoded(&entry.encoded_key).await {
                     Ok(true) => {
                         compare_delete_non_unique_cleanup_entry(
@@ -346,36 +364,121 @@ impl Table {
     }
 
     #[inline]
-    async fn cleanup_delete_overlay_is_proven(
+    async fn cleanup_unique_delete_overlay_is_obsolete(
         &self,
-        snapshot: &MemIndexCleanupSnapshot,
-        column_index: Option<&ColumnBlockIndex<'_>>,
-        row_id: RowID,
+        cleanup_context: &MemIndexCleanupContext<'_>,
+        index_no: usize,
+        index: &UniqueSecondaryIndex<EvictableBufferPool>,
+        entry: &UniqueMemIndexEntry,
     ) -> Result<bool> {
+        match self
+            .cleanup_delete_overlay_proof(cleanup_context, index_no, entry.row_id)
+            .await?
+        {
+            DeleteOverlayProof::NotProven => Ok(false),
+            DeleteOverlayProof::Obsolete => Ok(true),
+            DeleteOverlayProof::ColdRowValues(values) => {
+                Ok(!index.mem_encoded_key_matches(&values, &entry.encoded_key))
+            }
+        }
+    }
+
+    #[inline]
+    async fn cleanup_non_unique_delete_overlay_is_obsolete(
+        &self,
+        cleanup_context: &MemIndexCleanupContext<'_>,
+        index_no: usize,
+        index: &NonUniqueSecondaryIndex<EvictableBufferPool>,
+        entry: &NonUniqueMemIndexEntry,
+    ) -> Result<bool> {
+        match self
+            .cleanup_delete_overlay_proof(cleanup_context, index_no, entry.row_id)
+            .await?
+        {
+            DeleteOverlayProof::NotProven => Ok(false),
+            DeleteOverlayProof::Obsolete => Ok(true),
+            DeleteOverlayProof::ColdRowValues(values) => {
+                Ok(!index.mem_encoded_exact_key_matches(&values, entry.row_id, &entry.encoded_key))
+            }
+        }
+    }
+
+    #[inline]
+    async fn cleanup_delete_overlay_proof(
+        &self,
+        cleanup_context: &MemIndexCleanupContext<'_>,
+        index_no: usize,
+        row_id: RowID,
+    ) -> Result<DeleteOverlayProof> {
+        let snapshot = cleanup_context.snapshot;
+        // A globally purgeable row tombstone proves the delete overlay is no
+        // longer protecting any transaction-visible row, independent of where
+        // the row currently falls relative to the cold/hot pivot.
         if self
             .deletion_buffer()
             .delete_marker_is_globally_purgeable(row_id, snapshot.min_active_sts)
         {
-            return Ok(true);
+            return Ok(DeleteOverlayProof::Obsolete);
         }
-        self.cleanup_durable_row_absence_is_proven(snapshot, column_index, row_id)
-            .await
+        // Full-scan cleanup only proves key obsolescence for persisted LWC
+        // rows. Hot row pages require undo-chain checks, which transaction
+        // index GC already performs while holding the row-page context.
+        if row_id >= snapshot.pivot_row_id {
+            return Ok(DeleteOverlayProof::NotProven);
+        }
+        // The captured column root can prove durable row absence or a cold key
+        // mismatch only after it is older than every active snapshot. Otherwise
+        // removing the overlay could expose this newer cold-root fact to a
+        // transaction that still depends on the MemIndex delete marker.
+        if snapshot.table_root_ts >= snapshot.min_active_sts {
+            return Ok(DeleteOverlayProof::NotProven);
+        }
+        let Some(column_index) = cleanup_context.column_index else {
+            return Ok(DeleteOverlayProof::NotProven);
+        };
+        let Some(row) = column_index.locate_and_resolve_row(row_id).await? else {
+            return Ok(DeleteOverlayProof::Obsolete);
+        };
+        let values = self
+            .cleanup_read_cold_index_values(cleanup_context, index_no, row)
+            .await?;
+        Ok(DeleteOverlayProof::ColdRowValues(values))
     }
 
     #[inline]
-    async fn cleanup_durable_row_absence_is_proven(
+    async fn cleanup_read_cold_index_values(
         &self,
-        snapshot: &MemIndexCleanupSnapshot,
-        column_index: Option<&ColumnBlockIndex<'_>>,
-        row_id: RowID,
-    ) -> Result<bool> {
-        if row_id >= snapshot.pivot_row_id || snapshot.table_root_ts >= snapshot.min_active_sts {
-            return Ok(false);
+        cleanup_context: &MemIndexCleanupContext<'_>,
+        index_no: usize,
+        row: ResolvedColumnRow,
+    ) -> Result<Vec<Val>> {
+        let index_spec = self
+            .metadata()
+            .index_specs
+            .get(index_no)
+            .ok_or(Error::InvalidState)?;
+        let read_set = index_spec
+            .index_cols
+            .iter()
+            .map(|key| key.col_no as usize)
+            .collect::<Vec<_>>();
+        let block = PersistedLwcBlock::load(
+            self.file().file_kind(),
+            self.file().sparse_file(),
+            self.disk_pool(),
+            cleanup_context.disk_pool_guard,
+            row.block_id(),
+        )
+        .await?;
+        if block.row_shape_fingerprint() != row.row_shape_fingerprint() {
+            return Err(Error::block_corrupted(
+                FileKind::TableFile,
+                BlockKind::LwcBlock,
+                row.block_id(),
+                BlockCorruptionCause::InvalidPayload,
+            ));
         }
-        let Some(column_index) = column_index else {
-            return Ok(false);
-        };
-        Ok(column_index.locate_and_resolve_row(row_id).await?.is_none())
+        block.decode_row_values(self.metadata(), row.row_idx(), &read_set)
     }
 }
 

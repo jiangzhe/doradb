@@ -217,6 +217,13 @@ impl<P: BufferPool> UniqueMemIndex<P> {
         Ok(entries)
     }
 
+    /// Return whether `key` encodes to the same MemIndex key bytes captured by
+    /// a cleanup scan.
+    #[inline]
+    pub(crate) fn encoded_key_matches(&self, key: &[Val], encoded_key: &[u8]) -> bool {
+        self.encoder.encode(key).as_bytes() == encoded_key
+    }
+
     /// Remove an encoded MemIndex entry only when row id and delete state still
     /// match the previously scanned entry.
     ///

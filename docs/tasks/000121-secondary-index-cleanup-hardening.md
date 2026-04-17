@@ -88,15 +88,16 @@ Related Backlogs:
 7. Harden unique cleanup:
    - live MemIndex entries below the pivot are removable only when the same
      committed latest-owner mapping is already published in DiskTree;
-   - unique delete-shadows are removable only when falling through to DiskTree
-     cannot expose a stale owner to any active snapshot;
+   - unique delete-shadows are removable by delete-overlay obsolescence proof
+     without requiring DiskTree absence; valid proof is whole-row deletion,
+     captured cold-row absence, or captured cold-row key mismatch;
    - runtime unique-key links remain governed by the same `Global_Min_STS` /
      oldest-active-snapshot horizon as undo visibility.
 8. Harden non-unique cleanup:
    - live exact MemIndex entries below the pivot are removable only when the
      same exact entry is already published in DiskTree;
-   - delete-marked exact entries are removable only when the exact cold entry
-     no longer needs suppression and row deletion is globally or durably proven.
+   - delete-marked exact entries are removable by delete-overlay obsolescence
+     proof without requiring exact DiskTree absence.
 9. Keep deletion-buffer absence, pivot movement, and `RowLocation::NotFound`
    insufficient as standalone cleanup proofs.
 10. Add focused tests for MemIndex cleanup, unique ownership transfer,
@@ -215,12 +216,17 @@ Table::cleanup_secondary_mem_indexes(
      not expose a stale DiskTree owner to any active snapshot.
    - Keep the delete-shadow when the row is still hot by the purge-time
      snapshot.
-   - For cold-by-snapshot rows, remove only with proof that the old owner cannot
-     be visible to any active snapshot and that DiskTree no longer requires the
-     shadow to suppress that owner.
+   - For cold-by-snapshot rows, remove with proof that the overlay is obsolete:
+     whole-row deletion, durable row absence, or a captured cold row whose
+     current encoded unique key differs from the scanned shadow key.
+   - Do not require DiskTree absence before removing the shadow; a stale cold
+     owner that remains in DiskTree after row-deletion proof is filtered by the
+     normal row/deletion visibility path.
    - Valid proofs include a globally purgeable deletion-buffer marker under
-     `min_active_sts`, or durable checkpoint state proving the delete and
-     companion DiskTree update are published together.
+     `min_active_sts`, or captured checkpoint state older than every active
+     snapshot proving row absence or cold-key mismatch.
+   - Do not perform hot row-page key-obsolescence proof in the full-scan path;
+     transaction index GC owns that proof because it has row-page undo context.
    - `RowLocation::NotFound`, deletion-buffer absence, or `row_id <
      pivot_row_id` alone is not sufficient.
 
@@ -234,8 +240,10 @@ Table::cleanup_secondary_mem_indexes(
 9. Implement non-unique delete-marked exact cleanup.
    - A delete-marked MemIndex exact entry suppresses only the matching DiskTree
      exact `(logical_key, row_id)` entry.
-   - Remove the MemIndex delete-mark only when the exact DiskTree entry no
-     longer needs suppression and row deletion is globally or durably proven.
+   - Remove the MemIndex delete-mark when overlay obsolescence is globally or
+     durably proven: whole-row deletion, durable row absence, or a captured cold
+     row whose current encoded exact key differs from the scanned exact key.
+   - Do not require exact DiskTree absence before removing the mark.
    - Keep the delete-mark when proof is unavailable, including deletion-buffer
      absence without durable delete/DiskTree evidence.
 
@@ -320,8 +328,9 @@ Implemented RFC 0014 Phase 5 cleanup and hardening.
   checks.
 - Hardened unique and non-unique overlay behavior so cleanup removes redundant
   live MemIndex entries only when the matching cold representation is
-  published, and removes delete overlays only when suppression is no longer
-  needed and row deletion is globally or durably safe.
+  published, and removes delete overlays when whole-row deletion, durable row
+  absence, or captured cold-row key mismatch proves the overlay obsolete
+  without requiring a DiskTree absence probe.
 - Updated conceptual documentation in `docs/secondary-index.md`,
   `docs/index-design.md`, and new `docs/garbage-collect.md`.
 - Added and moved tests covering MemIndex cleanup, composite unique/non-unique
@@ -335,19 +344,17 @@ Implemented RFC 0014 Phase 5 cleanup and hardening.
   only the intentional `table/gc.rs` module-level allowance for the manual
   cleanup entrypoint.
 
-Validation run:
+Latest validation run:
 
 ```bash
-cargo fmt --all --check
-cargo check -p doradb-storage
+cargo fmt -p doradb-storage -- --check
 cargo clippy -p doradb-storage --all-targets -- -D warnings
-cargo test -p doradb-storage secondary_index -- --nocapture
 cargo test -p doradb-storage secondary_mem_index_cleanup -- --nocapture
 cargo nextest run -p doradb-storage
 git diff --check
 ```
 
-The final `cargo nextest run -p doradb-storage` pass ran 576 tests with 576
+The final `cargo nextest run -p doradb-storage` pass ran 581 tests with 581
 passing.
 
 ## Impacts
@@ -382,17 +389,17 @@ timing.
    the same key maps to the same row id in the current DiskTree root.
 2. Full-scan cleanup removes redundant live non-unique exact MemIndex entries
    only after the same exact key exists in the current DiskTree root.
-3. A hot-origin unique delete-shadow that later becomes cold by pivot movement
-   survives cleanup when there is no globally or durably proven delete.
-4. A hot-origin non-unique delete-marked exact entry that later becomes cold by
-   pivot movement survives cleanup when there is no globally or durably proven
-   delete.
-5. Unique delete-shadow cleanup succeeds only after the old owner cannot be
-   visible to any active snapshot and DiskTree no longer needs suppression for
-   that owner.
-6. Non-unique delete-marked exact cleanup succeeds only after the exact cold
-   entry no longer needs suppression and row deletion is globally or durably
-   proven.
+3. A hot unique delete-shadow survives full-scan cleanup when there is no
+   globally proven delete, because hot row-page key proof belongs to transaction
+   index GC.
+4. A hot non-unique delete-marked exact entry survives full-scan cleanup when
+   there is no globally proven delete, for the same hot row-page reason.
+5. Unique delete-shadow cleanup succeeds when row deletion, durable row absence,
+   or captured cold-row key mismatch proves the overlay obsolete; matching stale
+   DiskTree entries are filtered by normal row/deletion visibility.
+6. Non-unique delete-marked exact cleanup succeeds when row deletion, durable
+   row absence, or captured cold-row exact-key mismatch proves the overlay
+   obsolete, even if the matching stale exact entry still exists in DiskTree.
 7. Deletion-buffer absence alone does not allow cleanup of a delete-shadow or
    delete-marked exact entry.
 8. `RowLocation::NotFound` alone does not allow cleanup in the full-scan path.
