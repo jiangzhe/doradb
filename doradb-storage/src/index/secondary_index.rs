@@ -1,19 +1,17 @@
 //! Composite MemIndex/DiskTree secondary-index core.
 //!
-//! The types in this module are the RFC 0014 phase-3 user-table core only.
-//! They group the current in-memory BTree-backed secondary index with the
-//! current published secondary DiskTree root and preserve the existing unique
-//! and non-unique trait contracts without wiring the composite into table
-//! runtime.
+//! The composite types group the current in-memory BTree-backed secondary
+//! index with the current published secondary DiskTree root. Catalog tables use
+//! the catalog-only in-memory enum in this module because they do not have a
+//! cold DiskTree layer.
 
 use super::disk_tree::{
     NonUniqueDiskTree, NonUniqueDiskTreeRuntime, UniqueDiskTree, UniqueDiskTreeRuntime,
 };
-use super::mem_index::MemIndex;
 use super::non_unique_index::{NonUniqueIndex, NonUniqueMemIndex, NonUniqueMemIndexEntry};
 use super::unique_index::{UniqueIndex, UniqueMemIndex, UniqueMemIndexEntry};
 use crate::buffer::{BufferPool, PoolGuard, ReadonlyBufferPool};
-use crate::catalog::TableMetadata;
+use crate::catalog::{IndexSpec, TableMetadata};
 use crate::error::{Error, Result};
 use crate::file::cow_file::BlockID;
 use crate::file::table_file::TableFile;
@@ -21,44 +19,115 @@ use crate::index::util::Maskable;
 use crate::quiescent::QuiescentGuard;
 use crate::row::RowID;
 use crate::trx::TrxID;
-use crate::value::Val;
+use crate::value::{Val, ValType};
 use std::cmp::Ordering;
 use std::sync::Arc;
 
+/// Result of attempting to insert a secondary-index entry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum IndexInsert {
-    /// if flag set to true, means Old entry is masked as deleted,
-    /// value match and merge is enabled.
+    /// Insert succeeded. `true` means a delete-marked entry was merged.
     Ok(bool),
-    // Old row id and its delete flag.
+    /// Insert found an existing owner, carrying row id and delete flag.
     DuplicateKey(RowID, bool),
 }
 
 impl IndexInsert {
+    /// Returns whether the insert attempt succeeded.
     #[inline]
     pub fn is_ok(&self) -> bool {
-        matches!(self, IndexInsert::Ok(false))
+        matches!(self, IndexInsert::Ok(_))
     }
 
+    /// Returns whether the insert succeeded by merging a delete-marked entry.
     #[inline]
     pub fn is_merged(&self) -> bool {
         matches!(self, IndexInsert::Ok(true))
     }
 }
 
+/// Result of a secondary-index compare-exchange operation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum IndexCompareExchange {
+    /// The expected owner matched and the value was updated.
     Ok,
+    /// The key existed but did not carry the expected owner.
     Mismatch,
+    /// The key did not exist in the index.
     NotExists,
 }
 
 impl IndexCompareExchange {
+    /// Returns whether the compare-exchange updated the entry.
     #[inline]
     pub fn is_ok(self) -> bool {
         matches!(self, IndexCompareExchange::Ok)
+    }
+}
+
+/// Catalog-table secondary-index variant over the mutable in-memory layer only.
+pub(crate) enum InMemorySecondaryIndex<P: 'static> {
+    /// Unique MemIndex backend.
+    Unique(UniqueMemIndex<P>),
+    /// Non-unique MemIndex backend.
+    NonUnique(NonUniqueMemIndex<P>),
+}
+
+impl<P: BufferPool> InMemorySecondaryIndex<P> {
+    /// Build an in-memory secondary index from catalog index metadata.
+    #[inline]
+    pub(crate) async fn new<F: Fn(usize) -> ValType>(
+        index_pool: QuiescentGuard<P>,
+        index_pool_guard: &PoolGuard,
+        index_spec: &IndexSpec,
+        ty_infer: F,
+        ts: TrxID,
+    ) -> Result<Self> {
+        if index_spec.unique() {
+            let index =
+                UniqueMemIndex::new(index_pool, index_pool_guard, index_spec, ty_infer, ts).await?;
+            Ok(Self::Unique(index))
+        } else {
+            let index =
+                NonUniqueMemIndex::new(index_pool, index_pool_guard, index_spec, ty_infer, ts)
+                    .await?;
+            Ok(Self::NonUnique(index))
+        }
+    }
+
+    /// Destroy this in-memory secondary index and reclaim all pages it owns.
+    #[inline]
+    pub(crate) async fn destroy(self, pool_guard: &PoolGuard) -> Result<()> {
+        match self {
+            Self::Unique(index) => index.destroy(pool_guard).await,
+            Self::NonUnique(index) => index.destroy(pool_guard).await,
+        }
+    }
+
+    /// Return whether this in-memory index enforces uniqueness.
+    #[inline]
+    pub(crate) fn is_unique(&self) -> bool {
+        matches!(self, Self::Unique(_))
+    }
+
+    /// Returns the unique-index view when this slot is unique.
+    #[inline]
+    pub(crate) fn unique(&self) -> Option<&UniqueMemIndex<P>> {
+        match self {
+            Self::Unique(index) => Some(index),
+            Self::NonUnique(_) => None,
+        }
+    }
+
+    /// Returns the non-unique-index view when this slot is non-unique.
+    #[inline]
+    pub(crate) fn non_unique(&self) -> Option<&NonUniqueMemIndex<P>> {
+        match self {
+            Self::Unique(_) => None,
+            Self::NonUnique(index) => Some(index),
+        }
     }
 }
 
@@ -219,7 +288,6 @@ impl<P: BufferPool> UniqueSecondaryIndex<P> {
 
     /// Scan the mutable MemIndex entries without reading DiskTree.
     #[inline]
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) async fn scan_mem_entries(
         &self,
         pool_guard: &PoolGuard,
@@ -230,7 +298,6 @@ impl<P: BufferPool> UniqueSecondaryIndex<P> {
     /// Remove one scanned MemIndex entry only if its current state still
     /// matches the scan result.
     #[inline]
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) async fn compare_delete_mem_encoded_entry(
         &self,
         pool_guard: &PoolGuard,
@@ -420,7 +487,6 @@ impl<P: BufferPool> NonUniqueSecondaryIndex<P> {
 
     /// Scan the mutable MemIndex entries without reading DiskTree.
     #[inline]
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) async fn scan_mem_entries(
         &self,
         pool_guard: &PoolGuard,
@@ -431,7 +497,6 @@ impl<P: BufferPool> NonUniqueSecondaryIndex<P> {
     /// Remove one scanned MemIndex exact entry only if its current state still
     /// matches the scan result.
     #[inline]
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) async fn compare_delete_mem_encoded_entry(
         &self,
         pool_guard: &PoolGuard,
@@ -616,25 +681,34 @@ pub(crate) enum SecondaryIndex<P: 'static> {
 }
 
 impl<P: BufferPool> SecondaryIndex<P> {
-    /// Pair a freshly built generic MemIndex with its cold DiskTree runtime.
+    /// Pair a freshly built unique MemIndex with its cold DiskTree runtime.
     #[inline]
-    pub(crate) async fn new(
-        mem_index: MemIndex<P>,
+    pub(crate) async fn new_unique(
+        index_no: usize,
+        mem: UniqueMemIndex<P>,
         disk: SecondaryDiskTreeRuntime,
         pool_guard: &PoolGuard,
     ) -> Result<Self> {
-        let unique = mem_index.is_unique();
-        if disk.index_no() != mem_index.index_no || disk.is_unique() != unique {
-            let _ = mem_index.destroy(pool_guard).await;
+        if disk.index_no() != index_no || !disk.is_unique() {
+            let _ = mem.destroy(pool_guard).await;
             return Err(Error::InvalidState);
         }
-        if unique {
-            let (_, mem) = mem_index.into_unique().ok_or(Error::InvalidState)?;
-            Ok(Self::Unique(UniqueSecondaryIndex { mem, disk }))
-        } else {
-            let (_, mem) = mem_index.into_non_unique().ok_or(Error::InvalidState)?;
-            Ok(Self::NonUnique(NonUniqueSecondaryIndex { mem, disk }))
+        Ok(Self::Unique(UniqueSecondaryIndex { mem, disk }))
+    }
+
+    /// Pair a freshly built non-unique MemIndex with its cold DiskTree runtime.
+    #[inline]
+    pub(crate) async fn new_non_unique(
+        index_no: usize,
+        mem: NonUniqueMemIndex<P>,
+        disk: SecondaryDiskTreeRuntime,
+        pool_guard: &PoolGuard,
+    ) -> Result<Self> {
+        if disk.index_no() != index_no || disk.is_unique() {
+            let _ = mem.destroy(pool_guard).await;
+            return Err(Error::InvalidState);
         }
+        Ok(Self::NonUnique(NonUniqueSecondaryIndex { mem, disk }))
     }
 
     /// Destroy the mutable MemIndex owned by this composite index.
@@ -818,7 +892,7 @@ mod tests {
         let tree = BTree::new(pool.guard(), pool_guard, true, 100)
             .await
             .expect("unique MemIndex should be created");
-        UniqueMemIndex::new(
+        UniqueMemIndex::with_encoder(
             tree,
             BTreeKeyEncoder::new(vec![ValType::new(ValKind::U32, false)]),
         )
@@ -831,7 +905,7 @@ mod tests {
         let tree = BTree::new(pool.guard(), pool_guard, true, 100)
             .await
             .expect("non-unique MemIndex should be created");
-        NonUniqueMemIndex::new(
+        NonUniqueMemIndex::with_encoder(
             tree,
             BTreeKeyEncoder::new(vec![
                 ValType::new(ValKind::U32, false),
@@ -1298,7 +1372,7 @@ mod tests {
             let mem = unique_mem_index(&index_pool, &index_guard).await;
             let shadow_key = [Val::from(9u32)];
             assert!(
-                mem.insert_delete_shadow_if_absent(&index_guard, &shadow_key, 90, 2)
+                mem.insert_overlay_if_absent(&index_guard, &shadow_key, 90u64.deleted(), 2)
                     .await
                     .unwrap()
             );

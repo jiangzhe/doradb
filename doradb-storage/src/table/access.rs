@@ -6,8 +6,8 @@ use crate::error::{BlockCorruptionCause, BlockKind, Error, FileKind, Result};
 use crate::file::BlockID;
 use crate::index::util::{Maskable, RowPageCreateRedoCtx};
 use crate::index::{
-    IndexCompareExchange, IndexInsert, MemIndex, NonUniqueIndex, RowLocation, SecondaryIndex,
-    UniqueIndex,
+    InMemorySecondaryIndex, IndexCompareExchange, IndexInsert, NonUniqueIndex, RowLocation,
+    SecondaryIndex, UniqueIndex,
 };
 use crate::lwc::PersistedLwcBlock;
 use crate::row::ops::{
@@ -195,7 +195,7 @@ impl<'a> From<&'a CatalogTable> for TableAccessor<'a, FixedBufferPool, FixedBuff
 
 impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
     #[inline]
-    fn generic_sec_idx(&self) -> &[MemIndex<I>] {
+    fn generic_sec_idx(&self) -> &[InMemorySecondaryIndex<I>] {
         self.mem.sec_idx()
     }
 

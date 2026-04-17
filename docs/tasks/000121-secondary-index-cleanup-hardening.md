@@ -17,13 +17,11 @@ checkpointed cold state, preserving the no-cold-backfill recovery invariant,
 and expanding parity tests around unique ownership transfer, non-unique merge
 and suppression, checkpoint, recovery, and cold-delete companion behavior.
 
-This task also cleans up naming after the dual-tree cutover. The old
-`secondary_index.rs` module now represents only the mutable in-memory index
-layer and should be renamed to `mem_index.rs`; the current
-`secondary_index.rs` module is the runtime secondary-index
-implementation and should become `secondary_index.rs`. Struct names should
-match those roles, such as `MemIndex` for the in-memory layer and
-`SecondaryIndex` for the user-table MemIndex/DiskTree composite.
+This task also cleans up naming after the dual-tree cutover. The mutable
+in-memory layer is represented by concrete `UniqueMemIndex` and
+`NonUniqueMemIndex` types, while the redundant `MemIndex`/`MemIndexKind`
+wrapper module is removed. The user-table runtime MemIndex/DiskTree composite
+is represented by `SecondaryIndex`.
 
 Finally, this task updates the conceptual documentation and adds
 `docs/garbage-collect.md`, describing row-page, undo-log, MemIndex, DiskTree,
@@ -142,17 +140,17 @@ cargo clippy -p doradb-storage --all-targets -- -D warnings
 
 ## Plan
 
-1. Rename modules mechanically before behavior changes.
-   - Rename `doradb-storage/src/index/secondary_index.rs` to
-     `doradb-storage/src/index/mem_index.rs`.
-   - Rename `doradb-storage/src/index/composite_secondary_index.rs` to
-     `doradb-storage/src/index/secondary_index.rs`.
+1. Collapse redundant wrapper modules mechanically before behavior changes.
+   - Remove the `doradb-storage/src/index/mem_index.rs` wrapper module.
+   - Keep the concrete mutable in-memory backends in
+     `unique_index.rs` and `non_unique_index.rs`.
+   - Keep the MemIndex/DiskTree composite runtime in `secondary_index.rs`.
    - Update `doradb-storage/src/index/mod.rs` and all imports.
-   - Keep this step behavior-preserving.
 
 2. Rename internal types to match runtime roles.
-   - Rename `GenericSecondaryIndex<P>` to `MemIndex<P>`.
-   - Rename `GenericIndexKind<P>` to `MemIndexKind<P>`.
+   - Remove the redundant `MemIndex<P>` and `MemIndexKind<P>` wrappers.
+   - Keep a crate-private in-memory secondary-index enum only where catalog
+     tables still need unique/non-unique dispatch without DiskTree.
    - Rename `GenericUniqueBTreeIndex<P>` to `UniqueMemIndex<P>`.
    - Rename `GenericNonUniqueBTreeIndex<P>` to `NonUniqueMemIndex<P>`.
    - Rename encoded unique entry state to `UniqueMemIndexEntry`.

@@ -1562,13 +1562,7 @@ pub fn var_len_for_insert(schema: &TableMetadata, cols: &[Val]) -> usize {
         .var_cols
         .iter()
         .map(|idx| match &cols[*idx] {
-            Val::VarByte(var) => {
-                if var.len() > PAGE_VAR_LEN_INLINE {
-                    var.len()
-                } else {
-                    0
-                }
-            }
+            Val::VarByte(var) if var.len() > PAGE_VAR_LEN_INLINE => var.len(),
             _ => 0,
         })
         .sum()

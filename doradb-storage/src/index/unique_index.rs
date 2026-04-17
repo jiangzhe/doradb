@@ -1,14 +1,16 @@
 use crate::buffer::guard::PageGuard;
 use crate::buffer::{BufferPool, PoolGuard};
+use crate::catalog::IndexSpec;
 use crate::error::{Error, Result};
 use crate::index::btree::{BTreeDelete, BTreeInsert, BTreeUpdate, GenericBTree};
 use crate::index::btree_key::BTreeKeyEncoder;
 use crate::index::btree_value::BTreeU64;
 use crate::index::util::Maskable;
 use crate::index::{IndexCompareExchange, IndexInsert};
+use crate::quiescent::QuiescentGuard;
 use crate::row::RowID;
 use crate::trx::TrxID;
-use crate::value::Val;
+use crate::value::{Val, ValType};
 use futures::FutureExt;
 use std::future::Future;
 
@@ -101,7 +103,6 @@ pub struct UniqueMemIndex<P: 'static> {
 
 /// Encoded MemIndex state for one unique secondary-index entry.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct UniqueMemIndexEntry {
     /// Encoded logical secondary key in BTree order.
     pub(crate) encoded_key: Vec<u8>,
@@ -114,7 +115,6 @@ pub(crate) struct UniqueMemIndexEntry {
 impl UniqueMemIndexEntry {
     /// Return the row id in the same shape as current MemIndex scan results.
     #[inline]
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn scan_row_id(&self) -> RowID {
         if self.deleted {
             self.row_id.deleted()
@@ -125,9 +125,30 @@ impl UniqueMemIndexEntry {
 }
 
 impl<P: BufferPool> UniqueMemIndex<P> {
-    /// Create a unique B-Tree index with key encoder.
+    /// Build a unique MemIndex from catalog index metadata.
     #[inline]
-    pub fn new(tree: GenericBTree<P>, encoder: BTreeKeyEncoder) -> Self {
+    pub(crate) async fn new<F: Fn(usize) -> ValType>(
+        index_pool: QuiescentGuard<P>,
+        index_pool_guard: &PoolGuard,
+        index_spec: &IndexSpec,
+        ty_infer: F,
+        ts: TrxID,
+    ) -> Result<Self> {
+        debug_assert!(index_spec.unique());
+        debug_assert!(!index_spec.index_cols.is_empty());
+        let types = index_spec
+            .index_cols
+            .iter()
+            .map(|key| ty_infer(key.col_no as usize))
+            .collect();
+        let encoder = BTreeKeyEncoder::new(types);
+        let tree = GenericBTree::new(index_pool, index_pool_guard, true, ts).await?;
+        Ok(Self::with_encoder(tree, encoder))
+    }
+
+    /// Wrap an already-created BTree with a key encoder.
+    #[inline]
+    pub fn with_encoder(tree: GenericBTree<P>, encoder: BTreeKeyEncoder) -> Self {
         UniqueMemIndex { tree, encoder }
     }
 
@@ -143,7 +164,6 @@ impl<P: BufferPool> UniqueMemIndex<P> {
     /// dual-tree composite can claim or shadow cold DiskTree owners without
     /// widening the public `UniqueIndex` trait.
     #[inline]
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) async fn insert_overlay_if_absent(
         &self,
         pool_guard: &PoolGuard,
@@ -170,31 +190,11 @@ impl<P: BufferPool> UniqueMemIndex<P> {
         )
     }
 
-    /// Insert a cold-owner delete-shadow when the logical key is absent.
-    ///
-    /// The retained row id remains available for MVCC/key-recheck routing while
-    /// preventing a later composite lookup from falling through to stale
-    /// DiskTree state.
-    #[inline]
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub(crate) async fn insert_delete_shadow_if_absent(
-        &self,
-        pool_guard: &PoolGuard,
-        key: &[Val],
-        row_id: RowID,
-        ts: TrxID,
-    ) -> Result<bool> {
-        debug_assert!(!row_id.is_deleted());
-        self.insert_overlay_if_absent(pool_guard, key, row_id.deleted(), ts)
-            .await
-    }
-
     /// Scan MemIndex entries with encoded logical keys and delete state.
     ///
     /// The returned entries are ordered by encoded key because they are produced
     /// by the underlying BTree leaf cursor.
     #[inline]
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) async fn scan_encoded_entries(
         &self,
         pool_guard: &PoolGuard,
@@ -224,7 +224,6 @@ impl<P: BufferPool> UniqueMemIndex<P> {
     /// should not decode physical BTree keys back into logical `SelectKey`
     /// values.
     #[inline]
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) async fn compare_delete_encoded_entry(
         &self,
         pool_guard: &PoolGuard,
@@ -873,6 +872,7 @@ mod tests {
             .insert_if_not_exists(pool_guard, &key4, row_id4, true, 100)
             .await
             .unwrap();
+        assert!(inserted.is_ok());
         assert!(inserted.is_merged());
         assert_eq!(
             index.lookup(pool_guard, &key4, 100).await.unwrap(),

@@ -1,11 +1,13 @@
 #![cfg_attr(not(test), allow(dead_code))]
 
 use super::Table;
-use crate::buffer::PoolGuards;
+use crate::buffer::{EvictableBufferPool, PoolGuard, PoolGuards};
 use crate::error::{Error, Result};
 use crate::file::BlockID;
 use crate::file::cow_file::SUPER_BLOCK_ID;
-use crate::index::{ColumnBlockIndex, SecondaryIndex};
+use crate::index::{
+    ColumnBlockIndex, NonUniqueSecondaryIndex, SecondaryIndex, UniqueSecondaryIndex,
+};
 use crate::row::RowID;
 use crate::trx::TrxID;
 
@@ -40,6 +42,13 @@ struct MemIndexCleanupSnapshot {
     deletion_cutoff_ts: TrxID,
     secondary_index_roots: Vec<BlockID>,
     min_active_sts: TrxID,
+}
+
+struct MemIndexCleanupContext<'a> {
+    snapshot: &'a MemIndexCleanupSnapshot,
+    column_index: Option<&'a ColumnBlockIndex<'a>>,
+    index_pool_guard: &'a PoolGuard,
+    disk_pool_guard: &'a PoolGuard,
 }
 
 enum CleanupDecision {
@@ -100,6 +109,12 @@ impl Table {
         let column_index = self.cleanup_column_index(guards, &snapshot);
         let index_pool_guard = self.index_pool_guard(guards);
         let disk_pool_guard = guards.disk_guard();
+        let cleanup_context = MemIndexCleanupContext {
+            snapshot: &snapshot,
+            column_index: column_index.as_ref(),
+            index_pool_guard,
+            disk_pool_guard,
+        };
         let mut stats = SecondaryMemIndexCleanupStats {
             indexes: Vec::with_capacity(self.sec_idx().len()),
         };
@@ -115,112 +130,152 @@ impl Table {
                 SecondaryMemIndexCleanupIndexStats::new(index_no, index.is_unique());
             match index {
                 SecondaryIndex::Unique(unique) => {
-                    let disk = unique
-                        .disk()
-                        .open_unique_at(secondary_root, disk_pool_guard)?;
-                    for entry in unique.scan_mem_entries(index_pool_guard).await? {
-                        let decision = if entry.deleted {
-                            match disk.lookup_encoded(&entry.encoded_key).await {
-                                Ok(Some(row_id)) if row_id == entry.row_id => {
-                                    CleanupDecision::Retain
-                                }
-                                Ok(_) => {
-                                    if self
-                                        .cleanup_delete_overlay_is_proven(
-                                            &snapshot,
-                                            column_index.as_ref(),
-                                            entry.row_id,
-                                        )
-                                        .await?
-                                    {
-                                        compare_delete_unique_cleanup_entry(
-                                            unique,
-                                            index_pool_guard,
-                                            &entry,
-                                            min_active_sts,
-                                        )
-                                        .await?
-                                    } else {
-                                        CleanupDecision::Retain
-                                    }
-                                }
-                                Err(_) => CleanupDecision::Error,
-                            }
-                        } else if entry.row_id >= snapshot.pivot_row_id {
-                            CleanupDecision::Retain
-                        } else {
-                            match disk.lookup_encoded(&entry.encoded_key).await {
-                                Ok(Some(row_id)) if row_id == entry.row_id => {
-                                    compare_delete_unique_cleanup_entry(
-                                        unique,
-                                        index_pool_guard,
-                                        &entry,
-                                        min_active_sts,
-                                    )
-                                    .await?
-                                }
-                                Ok(_) => CleanupDecision::Retain,
-                                Err(_) => CleanupDecision::Error,
-                            }
-                        };
-                        index_stats.record(decision);
-                    }
+                    self.cleanup_unique_secondary_mem_index(
+                        &cleanup_context,
+                        unique,
+                        secondary_root,
+                        &mut index_stats,
+                    )
+                    .await?;
                 }
                 SecondaryIndex::NonUnique(non_unique) => {
-                    let disk = non_unique
-                        .disk()
-                        .open_non_unique_at(secondary_root, disk_pool_guard)?;
-                    for entry in non_unique.scan_mem_entries(index_pool_guard).await? {
-                        let decision = if entry.deleted {
-                            match disk.contains_exact_encoded(&entry.encoded_key).await {
-                                Ok(true) => CleanupDecision::Retain,
-                                Ok(false) => {
-                                    if self
-                                        .cleanup_delete_overlay_is_proven(
-                                            &snapshot,
-                                            column_index.as_ref(),
-                                            entry.row_id,
-                                        )
-                                        .await?
-                                    {
-                                        compare_delete_non_unique_cleanup_entry(
-                                            non_unique,
-                                            index_pool_guard,
-                                            &entry,
-                                            min_active_sts,
-                                        )
-                                        .await?
-                                    } else {
-                                        CleanupDecision::Retain
-                                    }
-                                }
-                                Err(_) => CleanupDecision::Error,
-                            }
-                        } else if entry.row_id >= snapshot.pivot_row_id {
-                            CleanupDecision::Retain
-                        } else {
-                            match disk.contains_exact_encoded(&entry.encoded_key).await {
-                                Ok(true) => {
-                                    compare_delete_non_unique_cleanup_entry(
-                                        non_unique,
-                                        index_pool_guard,
-                                        &entry,
-                                        min_active_sts,
-                                    )
-                                    .await?
-                                }
-                                Ok(false) => CleanupDecision::Retain,
-                                Err(_) => CleanupDecision::Error,
-                            }
-                        };
-                        index_stats.record(decision);
-                    }
+                    self.cleanup_non_unique_secondary_mem_index(
+                        &cleanup_context,
+                        non_unique,
+                        secondary_root,
+                        &mut index_stats,
+                    )
+                    .await?;
                 }
             }
             stats.indexes.push(index_stats);
         }
 
         Ok(stats)
+    }
+
+    #[inline]
+    async fn cleanup_unique_secondary_mem_index(
+        &self,
+        cleanup_context: &MemIndexCleanupContext<'_>,
+        index: &UniqueSecondaryIndex<EvictableBufferPool>,
+        secondary_root: BlockID,
+        stats: &mut SecondaryMemIndexCleanupIndexStats,
+    ) -> Result<()> {
+        let disk = index
+            .disk()
+            .open_unique_at(secondary_root, cleanup_context.disk_pool_guard)?;
+        for entry in index
+            .scan_mem_entries(cleanup_context.index_pool_guard)
+            .await?
+        {
+            let decision = if entry.deleted {
+                match disk.lookup_encoded(&entry.encoded_key).await {
+                    Ok(Some(row_id)) if row_id == entry.row_id => CleanupDecision::Retain,
+                    Ok(_) => {
+                        if self
+                            .cleanup_delete_overlay_is_proven(
+                                cleanup_context.snapshot,
+                                cleanup_context.column_index,
+                                entry.row_id,
+                            )
+                            .await?
+                        {
+                            compare_delete_unique_cleanup_entry(
+                                index,
+                                cleanup_context.index_pool_guard,
+                                &entry,
+                                cleanup_context.snapshot.min_active_sts,
+                            )
+                            .await?
+                        } else {
+                            CleanupDecision::Retain
+                        }
+                    }
+                    Err(_) => CleanupDecision::Error,
+                }
+            } else if entry.row_id >= cleanup_context.snapshot.pivot_row_id {
+                CleanupDecision::Retain
+            } else {
+                match disk.lookup_encoded(&entry.encoded_key).await {
+                    Ok(Some(row_id)) if row_id == entry.row_id => {
+                        compare_delete_unique_cleanup_entry(
+                            index,
+                            cleanup_context.index_pool_guard,
+                            &entry,
+                            cleanup_context.snapshot.min_active_sts,
+                        )
+                        .await?
+                    }
+                    Ok(_) => CleanupDecision::Retain,
+                    Err(_) => CleanupDecision::Error,
+                }
+            };
+            stats.record(decision);
+        }
+        Ok(())
+    }
+
+    #[inline]
+    async fn cleanup_non_unique_secondary_mem_index(
+        &self,
+        cleanup_context: &MemIndexCleanupContext<'_>,
+        index: &NonUniqueSecondaryIndex<EvictableBufferPool>,
+        secondary_root: BlockID,
+        stats: &mut SecondaryMemIndexCleanupIndexStats,
+    ) -> Result<()> {
+        let disk = index
+            .disk()
+            .open_non_unique_at(secondary_root, cleanup_context.disk_pool_guard)?;
+        for entry in index
+            .scan_mem_entries(cleanup_context.index_pool_guard)
+            .await?
+        {
+            let decision = if entry.deleted {
+                match disk.contains_exact_encoded(&entry.encoded_key).await {
+                    Ok(true) => CleanupDecision::Retain,
+                    Ok(false) => {
+                        if self
+                            .cleanup_delete_overlay_is_proven(
+                                cleanup_context.snapshot,
+                                cleanup_context.column_index,
+                                entry.row_id,
+                            )
+                            .await?
+                        {
+                            compare_delete_non_unique_cleanup_entry(
+                                index,
+                                cleanup_context.index_pool_guard,
+                                &entry,
+                                cleanup_context.snapshot.min_active_sts,
+                            )
+                            .await?
+                        } else {
+                            CleanupDecision::Retain
+                        }
+                    }
+                    Err(_) => CleanupDecision::Error,
+                }
+            } else if entry.row_id >= cleanup_context.snapshot.pivot_row_id {
+                CleanupDecision::Retain
+            } else {
+                match disk.contains_exact_encoded(&entry.encoded_key).await {
+                    Ok(true) => {
+                        compare_delete_non_unique_cleanup_entry(
+                            index,
+                            cleanup_context.index_pool_guard,
+                            &entry,
+                            cleanup_context.snapshot.min_active_sts,
+                        )
+                        .await?
+                    }
+                    Ok(false) => CleanupDecision::Retain,
+                    Err(_) => CleanupDecision::Error,
+                }
+            };
+            stats.record(decision);
+        }
+        Ok(())
     }
 
     #[inline]

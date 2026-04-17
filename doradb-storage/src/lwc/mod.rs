@@ -917,7 +917,7 @@ impl<'a> LwcBuilder<'a> {
     fn rollback(&mut self, snapshot: LwcSnapshot) {
         self.buffer.truncate(snapshot.row_count);
         self.row_ids.truncate(snapshot.row_ids_len);
-        for (stat, snap) in self.stats.iter_mut().zip(snapshot.stats.into_iter()) {
+        for (stat, snap) in self.stats.iter_mut().zip(snapshot.stats) {
             stat.restore(snap);
         }
     }

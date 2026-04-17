@@ -1,5 +1,6 @@
 use crate::buffer::guard::PageGuard;
 use crate::buffer::{BufferPool, PoolGuard};
+use crate::catalog::IndexSpec;
 use crate::error::{Error, Result};
 use crate::index::IndexInsert;
 use crate::index::btree::{BTreeDelete, BTreeInsert, BTreeUpdate, GenericBTree};
@@ -8,9 +9,10 @@ use crate::index::btree_node::{BTreeNode, BTreeSlot};
 use crate::index::btree_scan::BTreeSlotCallback;
 use crate::index::btree_value::{BTREE_BYTE_ZERO, BTreeByte, BTreeU64};
 use crate::index::util::Maskable;
+use crate::quiescent::QuiescentGuard;
 use crate::row::RowID;
 use crate::trx::TrxID;
-use crate::value::Val;
+use crate::value::{Val, ValKind, ValType};
 use std::future::Future;
 use std::mem;
 
@@ -93,7 +95,6 @@ pub struct NonUniqueMemIndex<P: 'static> {
 
 /// Encoded MemIndex state for one non-unique exact secondary-index entry.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct NonUniqueMemIndexEntry {
     /// Encoded exact key in BTree order, including the row-id suffix.
     pub(crate) encoded_key: Vec<u8>,
@@ -104,9 +105,32 @@ pub(crate) struct NonUniqueMemIndexEntry {
 }
 
 impl<P: BufferPool> NonUniqueMemIndex<P> {
-    /// Create a non-unique B-Tree index with key encoder.
+    /// Build a non-unique MemIndex from catalog index metadata.
     #[inline]
-    pub fn new(tree: GenericBTree<P>, encoder: BTreeKeyEncoder) -> Self {
+    pub(crate) async fn new<F: Fn(usize) -> ValType>(
+        index_pool: QuiescentGuard<P>,
+        index_pool_guard: &PoolGuard,
+        index_spec: &IndexSpec,
+        ty_infer: F,
+        ts: TrxID,
+    ) -> Result<Self> {
+        debug_assert!(!index_spec.unique());
+        debug_assert!(!index_spec.index_cols.is_empty());
+        let mut types: Vec<_> = index_spec
+            .index_cols
+            .iter()
+            .map(|key| ty_infer(key.col_no as usize))
+            .collect();
+        // Non-unique MemIndex keys include RowID so every BTree key is unique.
+        types.push(ValType::new(ValKind::U64, false));
+        let encoder = BTreeKeyEncoder::new(types);
+        let tree = GenericBTree::new(index_pool, index_pool_guard, true, ts).await?;
+        Ok(Self::with_encoder(tree, encoder))
+    }
+
+    /// Wrap an already-created BTree with a key encoder.
+    #[inline]
+    pub fn with_encoder(tree: GenericBTree<P>, encoder: BTreeKeyEncoder) -> Self {
         NonUniqueMemIndex { tree, encoder }
     }
 
@@ -122,7 +146,6 @@ impl<P: BufferPool> NonUniqueMemIndex<P> {
     /// dual-tree composite can shadow cold DiskTree exact entries without
     /// widening the public `NonUniqueIndex` trait.
     #[inline]
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) async fn insert_delete_overlay_if_absent(
         &self,
         pool_guard: &PoolGuard,
@@ -156,7 +179,6 @@ impl<P: BufferPool> NonUniqueMemIndex<P> {
     /// delete-marked overlays so the composite can suppress matching DiskTree
     /// exact entries.
     #[inline]
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) async fn lookup_encoded_entries(
         &self,
         pool_guard: &PoolGuard,
@@ -178,7 +200,6 @@ impl<P: BufferPool> NonUniqueMemIndex<P> {
     /// The returned entries are ordered by encoded exact key because they are
     /// produced by the underlying BTree leaf cursor.
     #[inline]
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) async fn scan_encoded_entries(
         &self,
         pool_guard: &PoolGuard,
@@ -202,7 +223,6 @@ impl<P: BufferPool> NonUniqueMemIndex<P> {
     /// Full-scan cleanup works on encoded exact keys so it can avoid reversing
     /// physical BTree keys back into logical `SelectKey` values.
     #[inline]
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) async fn compare_delete_encoded_entry(
         &self,
         pool_guard: &PoolGuard,
@@ -398,7 +418,6 @@ impl BTreeSlotCallback for CollectRowID<'_> {
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 struct CollectEncodedExactEntries<'a>(&'a mut Vec<NonUniqueMemIndexEntry>);
 
 impl BTreeSlotCallback for CollectEncodedExactEntries<'_> {
@@ -411,7 +430,6 @@ impl BTreeSlotCallback for CollectEncodedExactEntries<'_> {
 }
 
 #[inline]
-#[cfg_attr(not(test), allow(dead_code))]
 fn push_encoded_exact_entry(
     node: &BTreeNode,
     slot: &BTreeSlot,
@@ -771,6 +789,7 @@ mod tests {
             .insert_if_not_exists(pool_guard, &key4, row_id4, true, 100)
             .await
             .unwrap();
+        assert!(inserted.is_ok());
         assert!(inserted.is_merged());
         res.clear();
         index
