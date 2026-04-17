@@ -1,7 +1,7 @@
 ---
 id: 0014
 title: Dual-Tree Secondary Index
-status: proposal
+status: implemented
 tags: [storage, index, checkpoint, recovery]
 created: 2026-04-12
 github_issue: 550
@@ -443,7 +443,7 @@ SAFETY:` comments, and run the repository lint gate. [D10], [C4], [C7]
     catalog-table changes, storage version compatibility with older table-meta
     payloads, and removal of the existing single-tree index.
   - Task Doc: `docs/tasks/000117-disk-tree-format-and-roots.md`
-  - Task Issue: `#0`
+  - Task Issue: `#552`
   - Phase Status: done
   - Implementation Summary: Implemented Phase 1 DiskTree root metadata and persisted unique/non-unique DiskTree primitives [Task Resolve Sync: docs/tasks/000117-disk-tree-format-and-roots.md @ 2026-04-12]
 
@@ -620,13 +620,34 @@ SAFETY:` comments, and run the repository lint gate. [D10], [C4], [C7]
 - Non-unique scans add implementation work to enforce deterministic merge and
   duplicate-suppression logic across two trees.
 
+## Post-Implementation Notes
+
+- Non-unique `DiskTree` keeps row-id-oriented public prefix scan behavior while
+  exposing internal encoded exact-entry scan helpers where the composite
+  secondary-index merge needs deterministic `(logical_key, row_id)` ordering.
+- The implementation reused B+Tree node layout, key/value encoders, scan
+  helpers, and `BTreeNil` support where practical, but it deliberately avoided
+  a generic backend-independent CoW B+Tree refactor.
+
 ## Open Questions
 
-- Given the fixed non-unique exact-entry merge contract, should DiskTree scan
-  APIs expose encoded keys for deterministic merge tests, or should merge order
-  be hidden behind row-id vectors?
-- How much of `GenericBTree` search/cursor logic can be safely reused without
-  broadening this RFC into a generic CoW B+Tree refactor?
+None.
+
+## Deferred Follow-up Backlogs
+
+The implementation intentionally deferred the following non-blocking work. These
+items remain open for future task/RFC planning and are not required to close RFC
+0014:
+
+- `docs/backlogs/000083-full-disk-tree-compaction-policy.md`
+- `docs/backlogs/000084-parallel-secondary-disk-tree-checkpoint-application.md`
+- `docs/backlogs/000085-disk-tree-prefix-compression.md`
+- `docs/backlogs/000086-secondary-index-dual-tree-access-path.md`
+- `docs/backlogs/000087-refactor-recovery-process-parallel-log-replay.md`
+- `docs/backlogs/000088-remove-recovery-skip-option.md`
+- `docs/backlogs/000089-checkpoint-old-root-retention.md`
+- `docs/backlogs/000090-protect-disk-tree-root-lifetime.md`
+- `docs/backlogs/000091-page-level-secondary-mem-index-cleanup-scan.md`
 
 ## Future Work
 
