@@ -3,6 +3,7 @@ use crate::buffer::BufferPool;
 use crate::buffer::frame::FrameKind;
 use crate::buffer::page::{PAGE_SIZE, PageID};
 use crate::buffer::{PoolGuards, PoolRole, test_frame_kind};
+use crate::catalog::tests::table4;
 use crate::conf::{EngineConfig, EvictableBufferPoolConfig, FileSystemConfig, TrxSysConfig};
 use crate::engine::Engine;
 use crate::error::{BlockCorruptionCause, BlockKind, Error, FileKind, Result, StoragePoisonSource};
@@ -1617,6 +1618,912 @@ fn test_checkpoint_publishes_non_unique_secondary_disk_tree_entries_across_lwc_s
 }
 
 #[test]
+fn test_secondary_mem_index_cleanup_removes_redundant_live_unique_entries() {
+    smol::block_on(async {
+        let sys = TestSys::new_evictable().await;
+        let mut session = sys.try_new_session().unwrap();
+        let row_count = 4;
+        insert_rows(&sys, &mut session, 0, row_count, "name").await;
+        sys.table.freeze(&session, usize::MAX).await;
+        sys.table.checkpoint(&mut session).await.unwrap();
+
+        let index = sys.table.sec_idx()[0].unique().unwrap();
+        assert_eq!(
+            index
+                .scan_mem_entries(session.pool_guards().index_guard())
+                .await
+                .unwrap()
+                .len(),
+            row_count as usize
+        );
+
+        let stats = sys
+            .table
+            .cleanup_secondary_mem_indexes(&mut session)
+            .await
+            .unwrap();
+        assert!(!session.in_trx());
+        assert_eq!(stats.indexes.len(), 1);
+        assert_eq!(stats.indexes[0].index_no, 0);
+        assert!(stats.indexes[0].unique);
+        assert_eq!(stats.indexes[0].scanned, row_count as usize);
+        assert_eq!(stats.indexes[0].removed, row_count as usize);
+        assert_eq!(stats.indexes[0].retained, 0);
+        assert!(
+            index
+                .scan_mem_entries(session.pool_guards().index_guard())
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        for key_value in 0..row_count {
+            let key = single_key(key_value);
+            let disk_row_id = unique_disk_tree_lookup(&sys.table, session.pool_guards(), &key)
+                .await
+                .unwrap();
+            assert_eq!(
+                index
+                    .lookup(
+                        session.pool_guards().index_guard(),
+                        &key.vals,
+                        MAX_SNAPSHOT_TS,
+                    )
+                    .await
+                    .unwrap(),
+                Some((disk_row_id, false))
+            );
+        }
+
+        drop(session);
+        sys.clean_all();
+    });
+}
+
+#[test]
+fn test_secondary_mem_index_cleanup_requires_idle_session() {
+    smol::block_on(async {
+        let sys = TestSys::new_evictable().await;
+        let mut session = sys.try_new_session().unwrap();
+        let trx = session.try_begin_trx().unwrap().unwrap();
+
+        let err = sys
+            .table
+            .cleanup_secondary_mem_indexes(&mut session)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            Error::NotSupported("secondary MemIndex cleanup requires idle session")
+        ));
+        assert!(session.in_trx());
+
+        trx.rollback().await.unwrap();
+        assert!(!session.in_trx());
+
+        drop(session);
+        sys.clean_all();
+    });
+}
+
+#[test]
+fn test_secondary_mem_index_cleanup_removes_redundant_live_non_unique_entries() {
+    smol::block_on(async {
+        let sys = TestSys::new_evictable_with_non_unique_name_index().await;
+        let mut session = sys.try_new_session().unwrap();
+        let row_count = 5;
+        insert_rows(&sys, &mut session, 0, row_count, "same-name").await;
+        sys.table.freeze(&session, usize::MAX).await;
+        sys.table.checkpoint(&mut session).await.unwrap();
+
+        let index = sys.table.sec_idx()[1].non_unique().unwrap();
+        assert_eq!(
+            index
+                .scan_mem_entries(session.pool_guards().index_guard())
+                .await
+                .unwrap()
+                .len(),
+            row_count as usize
+        );
+
+        let stats = sys
+            .table
+            .cleanup_secondary_mem_indexes(&mut session)
+            .await
+            .unwrap();
+        assert_eq!(stats.indexes.len(), 2);
+        assert_eq!(stats.indexes[1].index_no, 1);
+        assert!(!stats.indexes[1].unique);
+        assert_eq!(stats.indexes[1].scanned, row_count as usize);
+        assert_eq!(stats.indexes[1].removed, row_count as usize);
+        assert_eq!(stats.indexes[1].retained, 0);
+        assert!(
+            index
+                .scan_mem_entries(session.pool_guards().index_guard())
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        let key = name_key("same-name");
+        let disk_rows =
+            non_unique_disk_tree_prefix_scan(&sys.table, session.pool_guards(), &key).await;
+        assert_eq!(disk_rows.len(), row_count as usize);
+        let mut lookup_rows = Vec::new();
+        index
+            .lookup(
+                session.pool_guards().index_guard(),
+                &key.vals,
+                &mut lookup_rows,
+                MAX_SNAPSHOT_TS,
+            )
+            .await
+            .unwrap();
+        assert_eq!(lookup_rows, disk_rows);
+
+        drop(session);
+        sys.clean_all();
+    });
+}
+
+#[test]
+fn test_secondary_mem_index_cleanup_retains_unique_delete_shadow_without_delete_proof() {
+    smol::block_on(async {
+        let sys = TestSys::new_evictable().await;
+        let mut session = sys.try_new_session().unwrap();
+        insert_rows(&sys, &mut session, 0, 1, "name").await;
+
+        let current_key = single_key(0i32);
+        let stale_key = single_key(-1i32);
+        let index = sys.table.sec_idx()[0].unique().unwrap();
+        let row_id = index
+            .lookup(
+                session.pool_guards().index_guard(),
+                &current_key.vals,
+                MAX_SNAPSHOT_TS,
+            )
+            .await
+            .unwrap()
+            .unwrap()
+            .0;
+        assert!(
+            index
+                .insert_if_not_exists(
+                    session.pool_guards().index_guard(),
+                    &stale_key.vals,
+                    row_id,
+                    false,
+                    MAX_SNAPSHOT_TS,
+                )
+                .await
+                .unwrap()
+                .is_ok()
+        );
+        assert!(
+            index
+                .mask_as_deleted(
+                    session.pool_guards().index_guard(),
+                    &stale_key.vals,
+                    row_id,
+                    MAX_SNAPSHOT_TS,
+                )
+                .await
+                .unwrap()
+        );
+
+        let stats = sys
+            .table
+            .cleanup_secondary_mem_indexes(&mut session)
+            .await
+            .unwrap();
+        assert_eq!(stats.indexes[0].scanned, 2);
+        assert_eq!(stats.indexes[0].removed, 0);
+        assert_eq!(stats.indexes[0].retained, 2);
+        assert_eq!(
+            index
+                .lookup(
+                    session.pool_guards().index_guard(),
+                    &stale_key.vals,
+                    MAX_SNAPSHOT_TS,
+                )
+                .await
+                .unwrap(),
+            Some((row_id, true))
+        );
+        assert_eq!(
+            index
+                .lookup(
+                    session.pool_guards().index_guard(),
+                    &current_key.vals,
+                    MAX_SNAPSHOT_TS,
+                )
+                .await
+                .unwrap(),
+            Some((row_id, false))
+        );
+
+        drop(session);
+        sys.clean_all();
+    });
+}
+
+#[test]
+fn test_secondary_mem_index_cleanup_removes_unique_delete_shadow_with_purgeable_marker() {
+    smol::block_on(async {
+        let sys = TestSys::new_evictable().await;
+        let mut session = sys.try_new_session().unwrap();
+        insert_rows(&sys, &mut session, 0, 1, "name").await;
+        sys.table.freeze(&session, usize::MAX).await;
+        sys.table.checkpoint(&mut session).await.unwrap();
+
+        let current_key = single_key(0i32);
+        let stale_key = single_key(-1i32);
+        let row_id = unique_disk_tree_lookup(&sys.table, session.pool_guards(), &current_key)
+            .await
+            .unwrap();
+        let index = sys.table.sec_idx()[0].unique().unwrap();
+        assert!(
+            index
+                .insert_if_not_exists(
+                    session.pool_guards().index_guard(),
+                    &stale_key.vals,
+                    row_id,
+                    false,
+                    MAX_SNAPSHOT_TS,
+                )
+                .await
+                .unwrap()
+                .is_ok()
+        );
+        assert!(
+            index
+                .mask_as_deleted(
+                    session.pool_guards().index_guard(),
+                    &stale_key.vals,
+                    row_id,
+                    MAX_SNAPSHOT_TS,
+                )
+                .await
+                .unwrap()
+        );
+        sys.table
+            .deletion_buffer()
+            .put_committed(row_id, 1)
+            .unwrap();
+
+        let stats = sys
+            .table
+            .cleanup_secondary_mem_indexes(&mut session)
+            .await
+            .unwrap();
+        assert_eq!(stats.indexes[0].scanned, 2);
+        assert_eq!(stats.indexes[0].removed, 2);
+        assert_eq!(stats.indexes[0].retained, 0);
+        assert_eq!(
+            index
+                .lookup(
+                    session.pool_guards().index_guard(),
+                    &stale_key.vals,
+                    MAX_SNAPSHOT_TS,
+                )
+                .await
+                .unwrap(),
+            None
+        );
+
+        drop(session);
+        sys.clean_all();
+    });
+}
+
+#[test]
+fn test_secondary_mem_index_cleanup_removes_unique_delete_shadow_with_matching_cold_entry() {
+    smol::block_on(async {
+        let sys = TestSys::new_evictable().await;
+        let mut session = sys.try_new_session().unwrap();
+        insert_rows(&sys, &mut session, 0, 1, "name").await;
+        sys.table.freeze(&session, usize::MAX).await;
+        sys.table.checkpoint(&mut session).await.unwrap();
+
+        let current_key = single_key(0i32);
+        let row_id = unique_disk_tree_lookup(&sys.table, session.pool_guards(), &current_key)
+            .await
+            .unwrap();
+        let index = sys.table.sec_idx()[0].unique().unwrap();
+        assert!(
+            index
+                .mask_as_deleted(
+                    session.pool_guards().index_guard(),
+                    &current_key.vals,
+                    row_id,
+                    MAX_SNAPSHOT_TS,
+                )
+                .await
+                .unwrap()
+        );
+
+        let stats = sys
+            .table
+            .cleanup_secondary_mem_indexes(&mut session)
+            .await
+            .unwrap();
+        assert_eq!(stats.indexes[0].scanned, 1);
+        assert_eq!(stats.indexes[0].removed, 0);
+        assert_eq!(stats.indexes[0].retained, 1);
+        let entries = index
+            .scan_mem_entries(session.pool_guards().index_guard())
+            .await
+            .unwrap();
+        assert_eq!(entries.len(), 1);
+        assert!(entries[0].deleted);
+
+        sys.table
+            .deletion_buffer()
+            .put_committed(row_id, 1)
+            .unwrap();
+        let stats = sys
+            .table
+            .cleanup_secondary_mem_indexes(&mut session)
+            .await
+            .unwrap();
+        assert_eq!(stats.indexes[0].scanned, 1);
+        assert_eq!(stats.indexes[0].removed, 1);
+        assert_eq!(stats.indexes[0].retained, 0);
+        assert!(
+            index
+                .scan_mem_entries(session.pool_guards().index_guard())
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        drop(session);
+        sys.clean_all();
+    });
+}
+
+#[test]
+fn test_secondary_mem_index_cleanup_removes_unique_delete_shadow_when_cold_row_key_differs() {
+    smol::block_on(async {
+        let sys = TestSys::new_evictable().await;
+        let mut session = sys.try_new_session().unwrap();
+        insert_rows(&sys, &mut session, 0, 1, "name").await;
+        sys.table.freeze(&session, usize::MAX).await;
+        sys.table.checkpoint(&mut session).await.unwrap();
+
+        let current_key = single_key(0i32);
+        let stale_key = single_key(-1i32);
+        let row_id = unique_disk_tree_lookup(&sys.table, session.pool_guards(), &current_key)
+            .await
+            .unwrap();
+        assert_eq!(
+            unique_disk_tree_lookup(&sys.table, session.pool_guards(), &stale_key).await,
+            None
+        );
+        let index = sys.table.sec_idx()[0].unique().unwrap();
+        assert!(
+            index
+                .insert_if_not_exists(
+                    session.pool_guards().index_guard(),
+                    &stale_key.vals,
+                    row_id,
+                    false,
+                    MAX_SNAPSHOT_TS,
+                )
+                .await
+                .unwrap()
+                .is_ok()
+        );
+        assert!(
+            index
+                .mask_as_deleted(
+                    session.pool_guards().index_guard(),
+                    &stale_key.vals,
+                    row_id,
+                    MAX_SNAPSHOT_TS,
+                )
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            index
+                .lookup(
+                    session.pool_guards().index_guard(),
+                    &stale_key.vals,
+                    MAX_SNAPSHOT_TS,
+                )
+                .await
+                .unwrap(),
+            Some((row_id, true))
+        );
+        assert_eq!(
+            index
+                .lookup(
+                    session.pool_guards().index_guard(),
+                    &current_key.vals,
+                    MAX_SNAPSHOT_TS,
+                )
+                .await
+                .unwrap(),
+            Some((row_id, false))
+        );
+
+        let stats = sys
+            .table
+            .cleanup_secondary_mem_indexes(&mut session)
+            .await
+            .unwrap();
+        assert_eq!(stats.indexes[0].scanned, 2);
+        assert_eq!(stats.indexes[0].removed, 2);
+        assert_eq!(stats.indexes[0].retained, 0);
+        assert!(
+            index
+                .scan_mem_entries(session.pool_guards().index_guard())
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            index
+                .lookup(
+                    session.pool_guards().index_guard(),
+                    &stale_key.vals,
+                    MAX_SNAPSHOT_TS,
+                )
+                .await
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            index
+                .lookup(
+                    session.pool_guards().index_guard(),
+                    &current_key.vals,
+                    MAX_SNAPSHOT_TS,
+                )
+                .await
+                .unwrap(),
+            Some((row_id, false))
+        );
+
+        drop(session);
+        sys.clean_all();
+    });
+}
+
+#[test]
+fn test_secondary_mem_index_cleanup_propagates_cold_delete_overlay_proof_error() {
+    smol::block_on(async {
+        let sys = TestSys::new_evictable().await;
+        let mut session = sys.try_new_session().unwrap();
+        insert_rows(&sys, &mut session, 0, 1, "name").await;
+        sys.table.freeze(&session, usize::MAX).await;
+        sys.table.checkpoint(&mut session).await.unwrap();
+
+        let current_key = single_key(0i32);
+        let stale_key = single_key(-1i32);
+        let row_id = unique_disk_tree_lookup(&sys.table, session.pool_guards(), &current_key)
+            .await
+            .unwrap();
+        let block_id = {
+            let active_root = sys.table.file().active_root();
+            let column_index = ColumnBlockIndex::new(
+                active_root.column_block_index_root,
+                active_root.pivot_row_id,
+                sys.table.file().file_kind(),
+                sys.table.file().sparse_file(),
+                sys.table.disk_pool(),
+                session.pool_guards().disk_guard(),
+            );
+            column_index
+                .locate_block(row_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .block_id()
+        };
+        let index = sys.table.sec_idx()[0].unique().unwrap();
+        assert!(
+            index
+                .insert_if_not_exists(
+                    session.pool_guards().index_guard(),
+                    &stale_key.vals,
+                    row_id,
+                    false,
+                    MAX_SNAPSHOT_TS,
+                )
+                .await
+                .unwrap()
+                .is_ok()
+        );
+        assert!(
+            index
+                .mask_as_deleted(
+                    session.pool_guards().index_guard(),
+                    &stale_key.vals,
+                    row_id,
+                    MAX_SNAPSHOT_TS,
+                )
+                .await
+                .unwrap()
+        );
+
+        let table_file_path = sys.engine.table_fs.table_file_path(sys.table.table_id());
+        corrupt_lwc_row_shape_fingerprint(table_file_path, block_id);
+        let _ = sys
+            .table
+            .disk_pool()
+            .invalidate_block_id(sys.table.file().sparse_file().file_id(), block_id);
+
+        let err = sys
+            .table
+            .cleanup_secondary_mem_indexes(&mut session)
+            .await
+            .unwrap_err();
+        match err {
+            Error::BlockCorrupted {
+                file_kind: FileKind::TableFile,
+                block_kind: BlockKind::LwcBlock,
+                block_id: err_block_id,
+                ..
+            } => assert_eq!(err_block_id, block_id),
+            other => panic!("expected LWC block corruption, got {other:?}"),
+        }
+        assert_eq!(
+            index
+                .lookup(
+                    session.pool_guards().index_guard(),
+                    &stale_key.vals,
+                    MAX_SNAPSHOT_TS,
+                )
+                .await
+                .unwrap(),
+            Some((row_id, true))
+        );
+
+        drop(session);
+        sys.clean_all();
+    });
+}
+
+#[test]
+fn test_secondary_mem_index_cleanup_retains_non_unique_delete_mark_without_delete_proof() {
+    smol::block_on(async {
+        let sys = TestSys::new_evictable_with_non_unique_name_index().await;
+        let mut session = sys.try_new_session().unwrap();
+        insert_rows(&sys, &mut session, 0, 1, "current").await;
+
+        let pk = single_key(0i32);
+        let row_id = sys.table.sec_idx()[0]
+            .unique()
+            .unwrap()
+            .lookup(
+                session.pool_guards().index_guard(),
+                &pk.vals,
+                MAX_SNAPSHOT_TS,
+            )
+            .await
+            .unwrap()
+            .unwrap()
+            .0;
+        let stale_key = name_key("stale");
+        let index = sys.table.sec_idx()[stale_key.index_no]
+            .non_unique()
+            .unwrap();
+        assert!(
+            index
+                .insert_if_not_exists(
+                    session.pool_guards().index_guard(),
+                    &stale_key.vals,
+                    row_id,
+                    false,
+                    MAX_SNAPSHOT_TS,
+                )
+                .await
+                .unwrap()
+                .is_ok()
+        );
+        assert!(
+            index
+                .mask_as_deleted(
+                    session.pool_guards().index_guard(),
+                    &stale_key.vals,
+                    row_id,
+                    MAX_SNAPSHOT_TS,
+                )
+                .await
+                .unwrap()
+        );
+
+        let stats = sys
+            .table
+            .cleanup_secondary_mem_indexes(&mut session)
+            .await
+            .unwrap();
+        assert_eq!(stats.indexes[1].scanned, 2);
+        assert_eq!(stats.indexes[1].removed, 0);
+        assert_eq!(stats.indexes[1].retained, 2);
+        assert_eq!(
+            index
+                .lookup_unique(
+                    session.pool_guards().index_guard(),
+                    &stale_key.vals,
+                    row_id,
+                    MAX_SNAPSHOT_TS,
+                )
+                .await
+                .unwrap(),
+            Some(false)
+        );
+
+        drop(session);
+        sys.clean_all();
+    });
+}
+
+#[test]
+fn test_secondary_mem_index_cleanup_removes_non_unique_delete_mark_with_purgeable_marker() {
+    smol::block_on(async {
+        let sys = TestSys::new_evictable_with_non_unique_name_index().await;
+        let mut session = sys.try_new_session().unwrap();
+        insert_rows(&sys, &mut session, 0, 1, "current").await;
+        sys.table.freeze(&session, usize::MAX).await;
+        sys.table.checkpoint(&mut session).await.unwrap();
+
+        let pk = single_key(0i32);
+        let row_id = unique_disk_tree_lookup(&sys.table, session.pool_guards(), &pk)
+            .await
+            .unwrap();
+        let stale_key = name_key("stale");
+        let index = sys.table.sec_idx()[stale_key.index_no]
+            .non_unique()
+            .unwrap();
+        assert!(
+            index
+                .insert_if_not_exists(
+                    session.pool_guards().index_guard(),
+                    &stale_key.vals,
+                    row_id,
+                    false,
+                    MAX_SNAPSHOT_TS,
+                )
+                .await
+                .unwrap()
+                .is_ok()
+        );
+        assert!(
+            index
+                .mask_as_deleted(
+                    session.pool_guards().index_guard(),
+                    &stale_key.vals,
+                    row_id,
+                    MAX_SNAPSHOT_TS,
+                )
+                .await
+                .unwrap()
+        );
+        sys.table
+            .deletion_buffer()
+            .put_committed(row_id, 1)
+            .unwrap();
+
+        let stats = sys
+            .table
+            .cleanup_secondary_mem_indexes(&mut session)
+            .await
+            .unwrap();
+        assert_eq!(stats.indexes[1].scanned, 2);
+        assert_eq!(stats.indexes[1].removed, 2);
+        assert_eq!(stats.indexes[1].retained, 0);
+        assert_eq!(
+            index
+                .lookup_unique(
+                    session.pool_guards().index_guard(),
+                    &stale_key.vals,
+                    row_id,
+                    MAX_SNAPSHOT_TS,
+                )
+                .await
+                .unwrap(),
+            None
+        );
+
+        drop(session);
+        sys.clean_all();
+    });
+}
+
+#[test]
+fn test_secondary_mem_index_cleanup_removes_non_unique_delete_mark_with_matching_cold_entry() {
+    smol::block_on(async {
+        let sys = TestSys::new_evictable_with_non_unique_name_index().await;
+        let mut session = sys.try_new_session().unwrap();
+        insert_rows(&sys, &mut session, 0, 1, "current").await;
+        sys.table.freeze(&session, usize::MAX).await;
+        sys.table.checkpoint(&mut session).await.unwrap();
+
+        let pk = single_key(0i32);
+        let row_id = unique_disk_tree_lookup(&sys.table, session.pool_guards(), &pk)
+            .await
+            .unwrap();
+        let current_key = name_key("current");
+        let index = sys.table.sec_idx()[current_key.index_no]
+            .non_unique()
+            .unwrap();
+        assert!(
+            index
+                .mask_as_deleted(
+                    session.pool_guards().index_guard(),
+                    &current_key.vals,
+                    row_id,
+                    MAX_SNAPSHOT_TS,
+                )
+                .await
+                .unwrap()
+        );
+
+        let stats = sys
+            .table
+            .cleanup_secondary_mem_indexes(&mut session)
+            .await
+            .unwrap();
+        assert_eq!(stats.indexes[1].scanned, 1);
+        assert_eq!(stats.indexes[1].removed, 0);
+        assert_eq!(stats.indexes[1].retained, 1);
+        let entries = index
+            .scan_mem_entries(session.pool_guards().index_guard())
+            .await
+            .unwrap();
+        assert_eq!(entries.len(), 1);
+        assert!(entries[0].deleted);
+
+        sys.table
+            .deletion_buffer()
+            .put_committed(row_id, 1)
+            .unwrap();
+        let stats = sys
+            .table
+            .cleanup_secondary_mem_indexes(&mut session)
+            .await
+            .unwrap();
+        assert_eq!(stats.indexes[1].scanned, 1);
+        assert_eq!(stats.indexes[1].removed, 1);
+        assert_eq!(stats.indexes[1].retained, 0);
+        assert!(
+            index
+                .scan_mem_entries(session.pool_guards().index_guard())
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        drop(session);
+        sys.clean_all();
+    });
+}
+
+#[test]
+fn test_secondary_mem_index_cleanup_removes_non_unique_delete_mark_when_cold_row_key_differs() {
+    smol::block_on(async {
+        let sys = TestSys::new_evictable_with_non_unique_name_index().await;
+        let mut session = sys.try_new_session().unwrap();
+        insert_rows(&sys, &mut session, 0, 1, "current").await;
+        sys.table.freeze(&session, usize::MAX).await;
+        sys.table.checkpoint(&mut session).await.unwrap();
+
+        let pk = single_key(0i32);
+        let current_key = name_key("current");
+        let stale_key = name_key("stale");
+        let row_id = unique_disk_tree_lookup(&sys.table, session.pool_guards(), &pk)
+            .await
+            .unwrap();
+        assert!(
+            non_unique_disk_tree_prefix_scan(&sys.table, session.pool_guards(), &stale_key)
+                .await
+                .is_empty()
+        );
+        assert_eq!(
+            non_unique_disk_tree_prefix_scan(&sys.table, session.pool_guards(), &current_key).await,
+            vec![row_id]
+        );
+        let index = sys.table.sec_idx()[stale_key.index_no]
+            .non_unique()
+            .unwrap();
+        assert!(
+            index
+                .insert_if_not_exists(
+                    session.pool_guards().index_guard(),
+                    &stale_key.vals,
+                    row_id,
+                    false,
+                    MAX_SNAPSHOT_TS,
+                )
+                .await
+                .unwrap()
+                .is_ok()
+        );
+        assert!(
+            index
+                .mask_as_deleted(
+                    session.pool_guards().index_guard(),
+                    &stale_key.vals,
+                    row_id,
+                    MAX_SNAPSHOT_TS,
+                )
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            index
+                .lookup_unique(
+                    session.pool_guards().index_guard(),
+                    &stale_key.vals,
+                    row_id,
+                    MAX_SNAPSHOT_TS,
+                )
+                .await
+                .unwrap(),
+            Some(false)
+        );
+        assert_eq!(
+            index
+                .lookup_unique(
+                    session.pool_guards().index_guard(),
+                    &current_key.vals,
+                    row_id,
+                    MAX_SNAPSHOT_TS,
+                )
+                .await
+                .unwrap(),
+            Some(true)
+        );
+
+        let stats = sys
+            .table
+            .cleanup_secondary_mem_indexes(&mut session)
+            .await
+            .unwrap();
+        assert_eq!(stats.indexes[1].scanned, 2);
+        assert_eq!(stats.indexes[1].removed, 2);
+        assert_eq!(stats.indexes[1].retained, 0);
+        assert!(
+            index
+                .scan_mem_entries(session.pool_guards().index_guard())
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            index
+                .lookup_unique(
+                    session.pool_guards().index_guard(),
+                    &stale_key.vals,
+                    row_id,
+                    MAX_SNAPSHOT_TS,
+                )
+                .await
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            index
+                .lookup_unique(
+                    session.pool_guards().index_guard(),
+                    &current_key.vals,
+                    row_id,
+                    MAX_SNAPSHOT_TS,
+                )
+                .await
+                .unwrap(),
+            Some(true)
+        );
+
+        drop(session);
+        sys.clean_all();
+    });
+}
+
+#[test]
 fn test_deletion_checkpoint_updates_secondary_disk_tree_roots() {
     smol::block_on(async {
         let sys = TestSys::new_evictable_with_non_unique_name_index().await;
@@ -1911,7 +2818,7 @@ fn test_lwc_unique_index_purge_uses_purgeable_delete_marker_fast_path() {
             .await
             .unwrap();
         assert!(deleted);
-        // A reinsertion attempt must not merge a stale MemTree delete overlay;
+        // A reinsertion attempt must not merge a stale MemIndex delete overlay;
         // after purge it falls through to the immutable cold root instead.
         assert_eq!(
             index
@@ -4172,9 +5079,9 @@ fn test_checkpoint_error_rollback() {
 }
 
 #[test]
-fn test_build_secondary_indexes_reclaims_staged_indexes_on_error() {
+fn test_build_in_memory_secondary_indexes_reclaims_staged_indexes_on_error() {
     smol::block_on(async {
-        use super::build_secondary_indexes;
+        use super::build_in_memory_secondary_indexes;
         use crate::buffer::FixedBufferPool;
         use crate::catalog::{
             ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexSpec, TableMetadata,
@@ -4201,7 +5108,9 @@ fn test_build_secondary_indexes_reclaims_staged_indexes_on_error() {
             ],
         );
 
-        let err = match build_secondary_indexes(pool.guard(), &pool_guard, &metadata, 100).await {
+        let err = match build_in_memory_secondary_indexes(pool.guard(), &pool_guard, &metadata, 100)
+            .await
+        {
             Ok(_) => panic!("second secondary-index construction should fail in one-page pool"),
             Err(err) => err,
         };
@@ -4838,4 +5747,239 @@ async fn delete_key_range_and_wait_gc_cutoff(
         max_delete_cts = max_delete_cts.max(cts);
     }
     wait_gc_cutoff_after(session, max_delete_cts).await;
+}
+
+#[test]
+fn test_secondary_index_common() {
+    smol::block_on(async {
+        let temp_dir = TempDir::new().unwrap();
+        let main_dir = temp_dir.path().to_path_buf();
+        let engine = EngineConfig::default()
+            .storage_root(main_dir)
+            .data_buffer(EvictableBufferPoolConfig::default().role(crate::buffer::PoolRole::Mem))
+            .trx(
+                TrxSysConfig::default()
+                    .log_file_stem("redo_secidx1")
+                    .skip_recovery(true),
+            )
+            .build()
+            .await
+            .unwrap();
+        let table_id = table4(&engine).await;
+        {
+            let table = engine.catalog().get_table(table_id).await.unwrap();
+
+            let mut session = engine.try_new_session().unwrap();
+            let user_read_set = &[0usize, 1];
+            let trx = session.try_begin_trx().unwrap().unwrap();
+            let mut stmt = trx.start_stmt();
+            for i in 0i32..5i32 {
+                let res = table
+                    .accessor()
+                    .insert_mvcc(&mut stmt, vec![Val::from(i), Val::from(i)])
+                    .await;
+                assert!(matches!(res, Ok(InsertMvcc::Inserted(_))));
+            }
+            stmt.succeed().commit().await.unwrap();
+
+            let trx = session.try_begin_trx().unwrap().unwrap();
+            let stmt = trx.start_stmt();
+            let key = SelectKey::new(0, vec![Val::from(1i32)]);
+            let res = table
+                .accessor()
+                .index_lookup_unique_mvcc(&stmt, &key, user_read_set)
+                .await;
+            stmt.succeed().commit().await.unwrap();
+            assert!(matches!(res, Ok(SelectMvcc::Found(_))));
+
+            let trx = session.try_begin_trx().unwrap().unwrap();
+            let stmt = trx.start_stmt();
+            let key = SelectKey::new(1, vec![Val::from(1i32)]);
+            let res = table
+                .accessor()
+                .index_scan_mvcc(&stmt, &key, user_read_set)
+                .await;
+            stmt.succeed().commit().await.unwrap();
+            assert!(res.unwrap().unwrap_rows().len() == 1);
+
+            let trx = session.try_begin_trx().unwrap().unwrap();
+            let mut stmt = trx.start_stmt();
+            let key = SelectKey::new(0, vec![Val::from(1i32)]);
+            let update = vec![UpdateCol {
+                idx: 1,
+                val: Val::from(0i32),
+            }];
+            let res = table
+                .accessor()
+                .update_unique_mvcc(&mut stmt, &key, update)
+                .await;
+            stmt.succeed().commit().await.unwrap();
+            assert!(matches!(res, Ok(UpdateMvcc::Updated(_))));
+
+            let trx = session.try_begin_trx().unwrap().unwrap();
+            let stmt = trx.start_stmt();
+            let key = SelectKey::new(1, vec![Val::from(0i32)]);
+            let res = table
+                .accessor()
+                .index_scan_mvcc(&stmt, &key, user_read_set)
+                .await;
+            stmt.succeed().commit().await.unwrap();
+            assert!(res.unwrap().unwrap_rows().len() == 2);
+
+            let trx = session.try_begin_trx().unwrap().unwrap();
+            let mut stmt = trx.start_stmt();
+            let key = SelectKey::new(0, vec![Val::from(0i32)]);
+            let res = table
+                .accessor()
+                .delete_unique_mvcc(&mut stmt, &key, false)
+                .await;
+            stmt.succeed().commit().await.unwrap();
+            assert!(matches!(res, Ok(DeleteMvcc::Deleted)));
+
+            let trx = session.try_begin_trx().unwrap().unwrap();
+            let stmt = trx.start_stmt();
+            let key = SelectKey::new(1, vec![Val::from(0i32)]);
+            let res = table
+                .accessor()
+                .index_scan_mvcc(&stmt, &key, user_read_set)
+                .await;
+            _ = stmt.succeed().commit().await.unwrap();
+            assert!(res.unwrap().unwrap_rows().len() == 1);
+        }
+        drop(engine);
+    })
+}
+
+#[test]
+fn test_secondary_index_rollback() {
+    smol::block_on(async {
+        let temp_dir = TempDir::new().unwrap();
+        let main_dir = temp_dir.path().to_path_buf();
+        let engine = EngineConfig::default()
+            .storage_root(main_dir)
+            .data_buffer(EvictableBufferPoolConfig::default().role(crate::buffer::PoolRole::Mem))
+            .trx(
+                TrxSysConfig::default()
+                    .log_file_stem("redo_secidx2")
+                    .skip_recovery(true),
+            )
+            .build()
+            .await
+            .unwrap();
+        let table_id = table4(&engine).await;
+        {
+            let table = engine.catalog().get_table(table_id).await.unwrap();
+
+            let mut session = engine.try_new_session().unwrap();
+            let user_read_set = &[0usize, 1];
+            let trx = session.try_begin_trx().unwrap().unwrap();
+            let mut stmt = trx.start_stmt();
+            for i in 0i32..5i32 {
+                let res = table
+                    .accessor()
+                    .insert_mvcc(&mut stmt, vec![Val::from(i), Val::from(i)])
+                    .await;
+                assert!(matches!(res, Ok(InsertMvcc::Inserted(_))));
+            }
+            stmt.succeed().commit().await.unwrap();
+
+            let trx = session.try_begin_trx().unwrap().unwrap();
+            let mut stmt = trx.start_stmt();
+            let res = table
+                .accessor()
+                .insert_mvcc(&mut stmt, vec![Val::from(5i32), Val::from(5i32)])
+                .await;
+            assert!(matches!(res, Ok(InsertMvcc::Inserted(_))));
+            stmt.succeed().rollback().await.unwrap();
+
+            let trx = session.try_begin_trx().unwrap().unwrap();
+            let stmt = trx.start_stmt();
+            let key = SelectKey::new(0, vec![Val::from(5i32)]);
+            let res = table
+                .accessor()
+                .index_lookup_unique_mvcc(&stmt, &key, user_read_set)
+                .await;
+            stmt.succeed().commit().await.unwrap();
+            assert!(matches!(res, Ok(SelectMvcc::NotFound)));
+
+            let trx = session.try_begin_trx().unwrap().unwrap();
+            let mut stmt = trx.start_stmt();
+            let key = SelectKey::new(0, vec![Val::from(1i32)]);
+            let update = vec![UpdateCol {
+                idx: 1,
+                val: Val::from(0i32),
+            }];
+            let res = table
+                .accessor()
+                .update_unique_mvcc(&mut stmt, &key, update)
+                .await;
+            assert!(matches!(res, Ok(UpdateMvcc::Updated(_))));
+            stmt.succeed().rollback().await.unwrap();
+
+            let trx = session.try_begin_trx().unwrap().unwrap();
+            let stmt = trx.start_stmt();
+            let key = SelectKey::new(0, vec![Val::from(1i32)]);
+            let res = table
+                .accessor()
+                .index_lookup_unique_mvcc(&stmt, &key, user_read_set)
+                .await;
+            stmt.succeed().commit().await.unwrap();
+            assert!(matches!(res, Ok(SelectMvcc::Found(_))));
+            let vals = res.unwrap().unwrap_found();
+            assert!(vals[0] == Val::from(1i32) && vals[1] == Val::from(1i32));
+
+            let trx = session.try_begin_trx().unwrap().unwrap();
+            let mut stmt = trx.start_stmt();
+            let key = SelectKey::new(0, vec![Val::from(0i32)]);
+            let res = table
+                .accessor()
+                .delete_unique_mvcc(&mut stmt, &key, false)
+                .await;
+            assert!(matches!(res, Ok(DeleteMvcc::Deleted)));
+            stmt.succeed().rollback().await.unwrap();
+
+            let trx = session.try_begin_trx().unwrap().unwrap();
+            let stmt = trx.start_stmt();
+            let key = SelectKey::new(0, vec![Val::from(0i32)]);
+            let res = table
+                .accessor()
+                .index_lookup_unique_mvcc(&stmt, &key, user_read_set)
+                .await;
+            stmt.succeed().commit().await.unwrap();
+            assert!(matches!(res, Ok(SelectMvcc::Found(_))));
+            let vals = res.unwrap().unwrap_found();
+            assert!(vals[0] == Val::from(0i32) && vals[1] == Val::from(0i32));
+
+            let mut trx = session.try_begin_trx().unwrap().unwrap();
+            let key = SelectKey::new(0, vec![Val::from(3i32)]);
+            let mut stmt = trx.start_stmt();
+            let res = table
+                .accessor()
+                .delete_unique_mvcc(&mut stmt, &key, false)
+                .await;
+            assert!(matches!(res, Ok(DeleteMvcc::Deleted)));
+            trx = stmt.succeed();
+            stmt = trx.start_stmt();
+            let res = table
+                .accessor()
+                .insert_mvcc(&mut stmt, vec![Val::from(3), Val::from(3)])
+                .await;
+            assert!(matches!(res, Ok(InsertMvcc::Inserted(_))));
+            trx = stmt.succeed();
+            trx.rollback().await.unwrap();
+
+            let trx = session.try_begin_trx().unwrap().unwrap();
+            let stmt = trx.start_stmt();
+            let key = SelectKey::new(0, vec![Val::from(3i32)]);
+            let res = table
+                .accessor()
+                .index_lookup_unique_mvcc(&stmt, &key, user_read_set)
+                .await;
+            _ = stmt.succeed().commit().await.unwrap();
+            assert!(matches!(res, Ok(SelectMvcc::Found(_))));
+            let vals = res.unwrap().unwrap_found();
+            assert!(vals[0] == Val::from(3i32) && vals[1] == Val::from(3i32));
+        }
+        drop(engine);
+    })
 }

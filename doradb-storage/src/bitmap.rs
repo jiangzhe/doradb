@@ -32,14 +32,16 @@ pub trait Bitmap {
         if unit_start_idx >= unit_end_idx {
             return None;
         }
-        let mut unit_idx = unit_start_idx;
-        for v in &mut self.bitmap_units_mut()[unit_start_idx..unit_end_idx] {
+        for (offset, v) in self.bitmap_units_mut()[unit_start_idx..unit_end_idx]
+            .iter_mut()
+            .enumerate()
+        {
             let bit_idx = (*v).trailing_ones();
             if bit_idx < 64 {
                 *v |= 1 << bit_idx;
+                let unit_idx = unit_start_idx + offset;
                 return Some(unit_idx * 64 + bit_idx as usize);
             }
-            unit_idx += 1;
         }
         None
     }

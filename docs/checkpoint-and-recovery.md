@@ -66,7 +66,7 @@ Instead:
   the table checkpoint
 - hot secondary-index state is rebuilt through normal redo replay of hot row
   operations
-- stale cold entries are shadowed at runtime by `MemTree` and deletion-buffer
+- stale cold entries are shadowed at runtime by `MemIndex` and deletion-buffer
   state until the next table checkpoint publishes updated `DiskTree` roots
 
 This removes the old `Index_Rec_CTS` problem entirely.
@@ -77,7 +77,7 @@ When a transaction commits on a table:
 
 1. its redo record is appended to the commit log
 2. heap undo state and deletion-buffer state become visible through commit CTS
-3. secondary-index changes remain in `MemTree`
+3. secondary-index changes remain in `MemIndex`
 
 Foreground commit never updates persistent `DiskTree` pages directly.
 
@@ -166,7 +166,7 @@ metadata-only root to advance `deletion_cutoff_ts` to the checkpoint cutoff.
 
 The design explicitly does **not** do the following:
 
-- scan dirty `MemTree` entries looking for committed work
+- scan dirty `MemIndex` entries looking for committed work
 - merge arbitrary committed batches into `DiskTree`
 - advance an index-only replay watermark from a batch max CTS
 
@@ -206,7 +206,7 @@ For each redo record after the coarse replay floor:
 - Heap / hot RowStore:
   - replay if the row belongs to hot RowStore and
     `CTS >= Heap_Redo_Start_TS`
-  - row replay also rebuilds hot secondary-index `MemTree` state through the
+  - row replay also rebuilds hot secondary-index `MemIndex` state through the
     normal row/index update logic
 - Cold-row deletions:
   - replay if `row_id < pivot_row_id` and
@@ -232,7 +232,7 @@ After redo reaches log end:
 
 - RowStore is reconstructed for hot rows
 - deletion buffer is reconstructed for post-checkpoint cold deletes
-- `MemTree` is reconstructed for post-checkpoint hot secondary-index state
+- `MemIndex` is reconstructed for post-checkpoint hot secondary-index state
 - `DiskTree` remains the checkpointed source of truth for cold secondary-index
   state
 
@@ -240,9 +240,9 @@ The engine can then serve traffic.
 
 ## 6. Garbage Collection
 
-### 6.1 MemTree Cleanup
+### 6.1 MemIndex Cleanup
 
-`MemTree` entries may be cleaned or evicted only after the corresponding table
+`MemIndex` entries may be cleaned or evicted only after the corresponding table
 checkpoint makes their state durable:
 
 - hot rows checkpointed into persistent LWC plus companion `DiskTree` entries

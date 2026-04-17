@@ -4,11 +4,10 @@ use crate::buffer::{BufferPool, EvictableBufferPool, FixedBufferPool, PageID, Po
 use crate::catalog::{CatalogTable, TableMetadata};
 use crate::error::{BlockCorruptionCause, BlockKind, Error, FileKind, Result};
 use crate::file::BlockID;
-use crate::index::composite_secondary_index::DualTreeSecondaryIndex;
 use crate::index::util::{Maskable, RowPageCreateRedoCtx};
 use crate::index::{
-    GenericSecondaryIndex, IndexCompareExchange, IndexInsert, NonUniqueIndex, RowLocation,
-    UniqueIndex,
+    InMemorySecondaryIndex, IndexCompareExchange, IndexInsert, NonUniqueIndex, RowLocation,
+    SecondaryIndex, UniqueIndex,
 };
 use crate::lwc::PersistedLwcBlock;
 use crate::row::ops::{
@@ -157,7 +156,7 @@ pub trait TableAccess {
 pub struct TableAccessor<'a, D: 'static, I: 'static> {
     mem: &'a GenericMemTable<D, I>,
     storage: Option<&'a ColumnStorage>,
-    user_sec_idx: Option<&'a [DualTreeSecondaryIndex<EvictableBufferPool>]>,
+    user_sec_idx: Option<&'a [SecondaryIndex<EvictableBufferPool>]>,
 }
 
 enum IndexPurgeDecision {
@@ -196,7 +195,7 @@ impl<'a> From<&'a CatalogTable> for TableAccessor<'a, FixedBufferPool, FixedBuff
 
 impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
     #[inline]
-    fn generic_sec_idx(&self) -> &[GenericSecondaryIndex<I>] {
+    fn generic_sec_idx(&self) -> &[InMemorySecondaryIndex<I>] {
         self.mem.sec_idx()
     }
 
@@ -1174,7 +1173,7 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
                     UpdateRow::Ok(mut row) => {
                         // In-place update keeps the RowID stable. Only changed
                         // columns are copied into undo/redo; indexed old values
-                        // are retained so MemTree can shadow or remap keys
+                        // are retained so MemIndex can shadow or remap keys
                         // after the row latch is released.
                         let mut index_change_cols = HashMap::new();
                         // perform in-place update.
@@ -1278,7 +1277,7 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
             })
             .collect();
         let index_branches = {
-            // Unique indexes keep only the latest owner in MemTree. When a
+            // Unique indexes keep only the latest owner in MemIndex. When a
             // move update changes RowID, the new hot row's insert undo carries
             // runtime branches back to the deleted old hot row so older
             // snapshots can still resolve the previous unique-key owner.
@@ -3108,7 +3107,7 @@ impl<D: BufferPool, I: BufferPool> TableAccess for TableAccessor<'_, D, I> {
                     debug_assert!(row_id == new_row_id);
                     if !index_change_cols.is_empty() {
                         // RowID is unchanged, but logical keys may have moved.
-                        // Update MemTree after the page mutation so rollback
+                        // Update MemIndex after the page mutation so rollback
                         // can restore both row data and index visibility.
                         let res = self
                             .update_indexes_only_key_change(
@@ -3207,7 +3206,7 @@ impl<D: BufferPool, I: BufferPool> TableAccess for TableAccessor<'_, D, I> {
                         // Delete only needs old secondary-index keys, so read
                         // indexed columns instead of decoding the whole row.
                         // The key recheck prevents acting on stale DiskTree or
-                        // MemTree state after another path already moved the
+                        // MemIndex state after another path already moved the
                         // logical key away from this cold row.
                         let index_keys = self
                             .read_lwc_index_keys(

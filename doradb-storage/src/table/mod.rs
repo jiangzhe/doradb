@@ -1,5 +1,6 @@
 mod access;
 mod deletion_buffer;
+mod gc;
 mod persistence;
 mod recover;
 mod rollback;
@@ -18,15 +19,14 @@ use crate::buffer::{
     BufferPool, EvictableBufferPool, PoolGuard, PoolGuards, PoolRole, ReadonlyBufferPool,
     RowPoolRole,
 };
-use crate::catalog::TableMetadata;
-use crate::catalog::{IndexSpec, TableID};
+use crate::catalog::{IndexSpec, TableID, TableMetadata};
 use crate::error::{Error, Result};
 use crate::file::table_file::{LwcBlockPersist, TableFile};
-use crate::index::composite_secondary_index::{DualTreeSecondaryIndex, SecondaryDiskTreeRuntime};
 use crate::index::util::{Maskable, RowPageCreateRedoCtx};
 use crate::index::{
-    BlockIndex, ColumnBlockEntryShape, GenericSecondaryIndex, IndexCompareExchange, IndexInsert,
-    NonUniqueIndex, RowLocation, UniqueIndex,
+    BlockIndex, ColumnBlockEntryShape, InMemorySecondaryIndex, IndexCompareExchange, IndexInsert,
+    NonUniqueIndex, NonUniqueMemIndex, RowLocation, SecondaryDiskTreeRuntime, SecondaryIndex,
+    UniqueIndex, UniqueMemIndex,
 };
 use crate::latch::LatchFallbackMode;
 use crate::lwc::LwcBuilder;
@@ -85,7 +85,7 @@ pub struct GenericMemTable<D: 'static, I: 'static> {
     pub(crate) row_pool_role: RowPoolRole,
     pub(crate) index_pool_role: PoolRole,
     pub(crate) blk_idx: BlockIndex,
-    pub(crate) sec_idx: Box<[GenericSecondaryIndex<I>]>,
+    pub(crate) sec_idx: Box<[InMemorySecondaryIndex<I>]>,
 }
 
 /// Persisted column-store attachments associated with a user table runtime.
@@ -100,7 +100,7 @@ pub struct ColumnStorage {
 pub struct Table {
     pub(crate) mem: GenericMemTable<EvictableBufferPool, EvictableBufferPool>,
     pub(crate) storage: ColumnStorage,
-    pub(crate) sec_idx: Box<[DualTreeSecondaryIndex<EvictableBufferPool>]>,
+    pub(crate) sec_idx: Box<[SecondaryIndex<EvictableBufferPool>]>,
 }
 
 struct FrozenPage {
@@ -116,16 +116,16 @@ type VisibleRowCollector<'a> = &'a mut dyn FnMut(&RowPage, usize, RowID) -> Resu
 /// This keeps the build flow linear: construct each index, then either publish
 /// the whole batch on success or explicitly destroy already-built trees before
 /// returning the original build error.
-struct SecondaryIndexScopedBuilder<P: 'static> {
-    staged: Vec<GenericSecondaryIndex<P>>,
+struct InMemorySecondaryIndexScopedBuilder<P: 'static> {
+    staged: Vec<InMemorySecondaryIndex<P>>,
 }
 
 /// Stages newly built dual-tree secondary indexes until the caller publishes them.
-struct DualTreeSecondaryIndexScopedBuilder {
-    staged: Vec<DualTreeSecondaryIndex<EvictableBufferPool>>,
+struct SecondaryIndexScopedBuilder {
+    staged: Vec<SecondaryIndex<EvictableBufferPool>>,
 }
 
-impl<P: BufferPool> SecondaryIndexScopedBuilder<P> {
+impl<P: BufferPool> InMemorySecondaryIndexScopedBuilder<P> {
     #[inline]
     fn new(capacity: usize) -> Self {
         Self {
@@ -136,7 +136,7 @@ impl<P: BufferPool> SecondaryIndexScopedBuilder<P> {
     #[inline]
     async fn push_or_rollback(
         &mut self,
-        built: Result<GenericSecondaryIndex<P>>,
+        built: Result<InMemorySecondaryIndex<P>>,
         pool_guard: &PoolGuard,
     ) -> Result<()> {
         match built {
@@ -160,12 +160,12 @@ impl<P: BufferPool> SecondaryIndexScopedBuilder<P> {
     }
 
     #[inline]
-    fn publish(self) -> Box<[GenericSecondaryIndex<P>]> {
+    fn publish(self) -> Box<[InMemorySecondaryIndex<P>]> {
         self.staged.into_boxed_slice()
     }
 }
 
-impl DualTreeSecondaryIndexScopedBuilder {
+impl SecondaryIndexScopedBuilder {
     #[inline]
     fn new(capacity: usize) -> Self {
         Self {
@@ -174,7 +174,7 @@ impl DualTreeSecondaryIndexScopedBuilder {
     }
 
     #[inline]
-    fn push(&mut self, index: DualTreeSecondaryIndex<EvictableBufferPool>) {
+    fn push(&mut self, index: SecondaryIndex<EvictableBufferPool>) {
         self.staged.push(index);
     }
 
@@ -187,27 +187,26 @@ impl DualTreeSecondaryIndexScopedBuilder {
     }
 
     #[inline]
-    fn publish(self) -> Box<[DualTreeSecondaryIndex<EvictableBufferPool>]> {
+    fn publish(self) -> Box<[SecondaryIndex<EvictableBufferPool>]> {
         self.staged.into_boxed_slice()
     }
 }
 
 #[inline]
-pub(crate) async fn build_secondary_indexes<I: BufferPool + 'static>(
+pub(crate) async fn build_in_memory_secondary_indexes<I: BufferPool + 'static>(
     index_pool: QuiescentGuard<I>,
     index_pool_guard: &PoolGuard,
     metadata: &TableMetadata,
     index_ts: TrxID,
-) -> Result<Box<[GenericSecondaryIndex<I>]>> {
-    let mut builder = SecondaryIndexScopedBuilder::new(metadata.index_specs.len());
-    for (index_no, index_spec) in metadata.index_specs.iter().enumerate() {
+) -> Result<Box<[InMemorySecondaryIndex<I>]>> {
+    let mut builder = InMemorySecondaryIndexScopedBuilder::new(metadata.index_specs.len());
+    for index_spec in &metadata.index_specs {
         let ty_infer = |col_no: usize| metadata.col_type(col_no);
         builder
             .push_or_rollback(
-                GenericSecondaryIndex::new(
+                InMemorySecondaryIndex::new(
                     index_pool.clone(),
                     index_pool_guard,
-                    index_no,
                     index_spec,
                     ty_infer,
                     index_ts,
@@ -220,7 +219,7 @@ pub(crate) async fn build_secondary_indexes<I: BufferPool + 'static>(
     Ok(builder.publish())
 }
 
-/// Build user-table dual-tree secondary indexes from fresh MemTree backends
+/// Build user-table dual-tree secondary indexes from fresh MemIndex backends
 /// paired with the table file's checkpointed DiskTree runtimes.
 #[inline]
 pub(crate) async fn build_dual_tree_secondary_indexes(
@@ -230,26 +229,9 @@ pub(crate) async fn build_dual_tree_secondary_indexes(
     file: Arc<TableFile>,
     disk_pool: QuiescentGuard<ReadonlyBufferPool>,
     index_ts: TrxID,
-) -> Result<Box<[DualTreeSecondaryIndex<EvictableBufferPool>]>> {
-    let mut builder = DualTreeSecondaryIndexScopedBuilder::new(metadata.index_specs.len());
+) -> Result<Box<[SecondaryIndex<EvictableBufferPool>]>> {
+    let mut builder = SecondaryIndexScopedBuilder::new(metadata.index_specs.len());
     for (index_no, index_spec) in metadata.index_specs.iter().enumerate() {
-        let ty_infer = |col_no: usize| metadata.col_type(col_no);
-        let mem_index = match GenericSecondaryIndex::new(
-            index_pool.clone(),
-            index_pool_guard,
-            index_no,
-            index_spec,
-            ty_infer,
-            index_ts,
-        )
-        .await
-        {
-            Ok(mem_index) => mem_index,
-            Err(err) => {
-                builder.rollback(index_pool_guard).await;
-                return Err(err);
-            }
-        };
         let runtime = match SecondaryDiskTreeRuntime::new(
             index_no,
             Arc::clone(&metadata),
@@ -258,12 +240,47 @@ pub(crate) async fn build_dual_tree_secondary_indexes(
         ) {
             Ok(runtime) => runtime,
             Err(err) => {
-                let _ = mem_index.destroy(index_pool_guard).await;
                 builder.rollback(index_pool_guard).await;
                 return Err(err);
             }
         };
-        let index = match DualTreeSecondaryIndex::new(mem_index, runtime, index_pool_guard).await {
+        let ty_infer = |col_no: usize| metadata.col_type(col_no);
+        let index = if index_spec.unique() {
+            let mem = match UniqueMemIndex::new(
+                index_pool.clone(),
+                index_pool_guard,
+                index_spec,
+                ty_infer,
+                index_ts,
+            )
+            .await
+            {
+                Ok(mem) => mem,
+                Err(err) => {
+                    builder.rollback(index_pool_guard).await;
+                    return Err(err);
+                }
+            };
+            SecondaryIndex::new_unique(index_no, mem, runtime, index_pool_guard).await
+        } else {
+            let mem = match NonUniqueMemIndex::new(
+                index_pool.clone(),
+                index_pool_guard,
+                index_spec,
+                ty_infer,
+                index_ts,
+            )
+            .await
+            {
+                Ok(mem) => mem,
+                Err(err) => {
+                    builder.rollback(index_pool_guard).await;
+                    return Err(err);
+                }
+            };
+            SecondaryIndex::new_non_unique(index_no, mem, runtime, index_pool_guard).await
+        };
+        let index = match index {
             Ok(index) => index,
             Err(err) => {
                 builder.rollback(index_pool_guard).await;
@@ -290,7 +307,8 @@ impl<D: BufferPool, I: BufferPool> GenericMemTable<D, I> {
         index_ts: TrxID,
     ) -> Result<Self> {
         let sec_idx =
-            build_secondary_indexes(index_pool, index_pool_guard, &metadata, index_ts).await?;
+            build_in_memory_secondary_indexes(index_pool, index_pool_guard, &metadata, index_ts)
+                .await?;
         Ok(GenericMemTable {
             table_id,
             metadata,
@@ -328,7 +346,7 @@ impl<D: BufferPool, I: BufferPool> GenericMemTable<D, I> {
 
     /// Returns the secondary-index array owned by this table.
     #[inline]
-    pub fn sec_idx(&self) -> &[GenericSecondaryIndex<I>] {
+    pub(crate) fn sec_idx(&self) -> &[InMemorySecondaryIndex<I>] {
         &self.sec_idx
     }
 
@@ -675,7 +693,7 @@ impl Table {
 
     /// Returns the user-table composite secondary-index array.
     #[inline]
-    pub(crate) fn sec_idx(&self) -> &[DualTreeSecondaryIndex<EvictableBufferPool>] {
+    pub(crate) fn sec_idx(&self) -> &[SecondaryIndex<EvictableBufferPool>] {
         &self.sec_idx
     }
 

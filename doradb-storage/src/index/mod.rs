@@ -9,7 +9,6 @@ mod btree_value;
 mod column_block_index;
 mod column_checkpoint;
 mod column_deletion_blob;
-pub(crate) mod composite_secondary_index;
 pub(crate) mod disk_tree;
 mod non_unique_index;
 mod row_page_index;
@@ -28,5 +27,9 @@ pub use column_checkpoint::*;
 pub use column_deletion_blob::*;
 pub use non_unique_index::*;
 pub use row_page_index::*;
-pub use secondary_index::*;
+pub(crate) use secondary_index::{
+    InMemorySecondaryIndex, NonUniqueSecondaryIndex, SecondaryDiskTreeRuntime, SecondaryIndex,
+    UniqueSecondaryIndex,
+};
+pub use secondary_index::{IndexCompareExchange, IndexInsert};
 pub use unique_index::*;

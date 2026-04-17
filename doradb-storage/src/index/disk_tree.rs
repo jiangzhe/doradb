@@ -753,7 +753,7 @@ impl<'a, F: DiskTreeSpec> DiskTree<'a, F> {
     ///
     /// Branch traversal follows child block ids until a leaf is reached. Empty
     /// roots and leaf misses return `Ok(None)`.
-    async fn lookup_encoded(&self, key: &[u8]) -> Result<Option<LogicalEntry>> {
+    async fn lookup_encoded_entry(&self, key: &[u8]) -> Result<Option<LogicalEntry>> {
         if self.root_block_id == SUPER_BLOCK_ID {
             return Ok(None);
         }
@@ -1529,7 +1529,13 @@ impl<'a> UniqueDiskTree<'a> {
     #[inline]
     pub(crate) async fn lookup(&self, key: &[Val]) -> Result<Option<RowID>> {
         let key = self.encoder().encode(key);
-        match self.lookup_encoded(key.as_bytes()).await? {
+        self.lookup_encoded(key.as_bytes()).await
+    }
+
+    /// Look up one already-encoded logical key.
+    #[inline]
+    pub(crate) async fn lookup_encoded(&self, key: &[u8]) -> Result<Option<RowID>> {
+        match self.lookup_encoded_entry(key).await? {
             Some(entry) => Ok(Some(entry.row_id.ok_or(Error::InvalidFormat)?)),
             None => Ok(None),
         }
@@ -1575,7 +1581,14 @@ impl<'a> NonUniqueDiskTree<'a> {
     #[inline]
     pub(crate) async fn contains_exact(&self, key: &[Val], row_id: RowID) -> Result<bool> {
         let key = self.encoder().encode_pair(key, Val::from(row_id));
-        Ok(self.lookup_encoded(key.as_bytes()).await?.is_some())
+        self.contains_exact_encoded(key.as_bytes()).await
+    }
+
+    /// Return whether one already-encoded exact `(logical_key, row_id)` entry
+    /// exists in the current root snapshot.
+    #[inline]
+    pub(crate) async fn contains_exact_encoded(&self, key: &[u8]) -> Result<bool> {
+        Ok(self.lookup_encoded_entry(key).await?.is_some())
     }
 
     /// Prefix-scan one logical key and return row ids in exact-key order.
@@ -1595,7 +1608,7 @@ impl<'a> NonUniqueDiskTree<'a> {
     /// Prefix-scan one logical key and return encoded exact keys with row ids.
     ///
     /// Composite secondary-index reads use the encoded exact key to merge
-    /// MemTree and DiskTree entries without duplicating key encoders outside the
+    /// MemIndex and DiskTree entries without duplicating key encoders outside the
     /// concrete DiskTree reader.
     #[inline]
     pub(crate) async fn prefix_scan_entries(&self, key: &[Val]) -> Result<Vec<(Vec<u8>, RowID)>> {
