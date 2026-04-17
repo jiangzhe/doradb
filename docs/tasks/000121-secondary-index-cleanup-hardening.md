@@ -180,8 +180,9 @@ cargo clippy -p doradb-storage --all-targets -- -D warnings
      containing the current active table root, `pivot_row_id`,
      `deletion_cutoff_ts`, secondary DiskTree root access, and
      `min_active_sts`.
-   - Add cleanup stats such as scanned, removed, retained, and error counts per
-     index or per index kind.
+   - Add cleanup stats such as scanned, removed, and retained counts per index
+     or per index kind. Unexpected cleanup errors should propagate to the
+     caller instead of being counted as retained entries.
    - Prefer placing the full-scan cleanup implementation in a cohesive table
      module such as `doradb-storage/src/table/gc.rs` if that keeps
      `table/access.rs` focused.
@@ -209,7 +210,7 @@ Table::cleanup_secondary_mem_indexes(
    - If the row id is below the captured `pivot_row_id`, open the current
      unique DiskTree root for that index and remove the live MemIndex entry
      only when DiskTree maps the same encoded logical key to the same row id.
-   - Treat DiskTree read errors as cleanup errors and do not remove the entry.
+   - Propagate DiskTree read errors to the caller and do not remove the entry.
 
 7. Implement unique delete-shadow cleanup.
    - A unique delete-shadow is terminal for tree selection, so removing it must
@@ -331,6 +332,8 @@ Implemented RFC 0014 Phase 5 cleanup and hardening.
   published, and removes delete overlays when whole-row deletion, durable row
   absence, or captured cold-row key mismatch proves the overlay obsolete
   without requiring a DiskTree absence probe.
+- Kept cleanup fail-fast for unexpected DiskTree, cold-row proof, and
+  compare-delete errors rather than retaining failed entries internally.
 - Updated conceptual documentation in `docs/secondary-index.md`,
   `docs/index-design.md`, and new `docs/garbage-collect.md`.
 - Added and moved tests covering MemIndex cleanup, composite unique/non-unique
@@ -354,7 +357,7 @@ cargo nextest run -p doradb-storage
 git diff --check
 ```
 
-The final `cargo nextest run -p doradb-storage` pass ran 581 tests with 581
+The final `cargo nextest run -p doradb-storage` pass ran 582 tests with 582
 passing.
 
 ## Impacts

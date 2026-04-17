@@ -35,8 +35,6 @@ pub(crate) struct SecondaryMemIndexCleanupIndexStats {
     pub(crate) removed: usize,
     /// Number of MemIndex entries intentionally retained.
     pub(crate) retained: usize,
-    /// Number of per-entry cleanup errors that caused retention.
-    pub(crate) errors: usize,
 }
 
 struct MemIndexCleanupSnapshot {
@@ -65,7 +63,6 @@ struct MemIndexCleanupContext<'a> {
 enum CleanupDecision {
     Remove,
     Retain,
-    Error,
 }
 
 enum DeleteOverlayProof {
@@ -83,7 +80,6 @@ impl SecondaryMemIndexCleanupIndexStats {
             scanned: 0,
             removed: 0,
             retained: 0,
-            errors: 0,
         }
     }
 
@@ -93,10 +89,6 @@ impl SecondaryMemIndexCleanupIndexStats {
         match decision {
             CleanupDecision::Remove => self.removed += 1,
             CleanupDecision::Retain => self.retained += 1,
-            CleanupDecision::Error => {
-                self.retained += 1;
-                self.errors += 1;
-            }
         }
     }
 }
@@ -269,7 +261,7 @@ impl Table {
                         .await?
                     }
                     Ok(_) => CleanupDecision::Retain,
-                    Err(_) => CleanupDecision::Error,
+                    Err(err) => return Err(err),
                 }
             };
             stats.record(decision);
@@ -334,7 +326,7 @@ impl Table {
                         .await?
                     }
                     Ok(false) => CleanupDecision::Retain,
-                    Err(_) => CleanupDecision::Error,
+                    Err(err) => return Err(err),
                 }
             };
             stats.record(decision);

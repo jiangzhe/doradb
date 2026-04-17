@@ -1649,7 +1649,6 @@ fn test_secondary_mem_index_cleanup_removes_redundant_live_unique_entries() {
         assert_eq!(stats.indexes[0].scanned, row_count as usize);
         assert_eq!(stats.indexes[0].removed, row_count as usize);
         assert_eq!(stats.indexes[0].retained, 0);
-        assert_eq!(stats.indexes[0].errors, 0);
         assert!(
             index
                 .scan_mem_entries(session.pool_guards().index_guard())
@@ -1738,7 +1737,6 @@ fn test_secondary_mem_index_cleanup_removes_redundant_live_non_unique_entries() 
         assert_eq!(stats.indexes[1].scanned, row_count as usize);
         assert_eq!(stats.indexes[1].removed, row_count as usize);
         assert_eq!(stats.indexes[1].retained, 0);
-        assert_eq!(stats.indexes[1].errors, 0);
         assert!(
             index
                 .scan_mem_entries(session.pool_guards().index_guard())
@@ -1821,7 +1819,6 @@ fn test_secondary_mem_index_cleanup_retains_unique_delete_shadow_without_delete_
         assert_eq!(stats.indexes[0].scanned, 2);
         assert_eq!(stats.indexes[0].removed, 0);
         assert_eq!(stats.indexes[0].retained, 2);
-        assert_eq!(stats.indexes[0].errors, 0);
         assert_eq!(
             index
                 .lookup(
@@ -1902,7 +1899,6 @@ fn test_secondary_mem_index_cleanup_removes_unique_delete_shadow_with_purgeable_
         assert_eq!(stats.indexes[0].scanned, 2);
         assert_eq!(stats.indexes[0].removed, 2);
         assert_eq!(stats.indexes[0].retained, 0);
-        assert_eq!(stats.indexes[0].errors, 0);
         assert_eq!(
             index
                 .lookup(
@@ -1954,7 +1950,6 @@ fn test_secondary_mem_index_cleanup_removes_unique_delete_shadow_with_matching_c
         assert_eq!(stats.indexes[0].scanned, 1);
         assert_eq!(stats.indexes[0].removed, 0);
         assert_eq!(stats.indexes[0].retained, 1);
-        assert_eq!(stats.indexes[0].errors, 0);
         let entries = index
             .scan_mem_entries(session.pool_guards().index_guard())
             .await
@@ -1974,7 +1969,6 @@ fn test_secondary_mem_index_cleanup_removes_unique_delete_shadow_with_matching_c
         assert_eq!(stats.indexes[0].scanned, 1);
         assert_eq!(stats.indexes[0].removed, 1);
         assert_eq!(stats.indexes[0].retained, 0);
-        assert_eq!(stats.indexes[0].errors, 0);
         assert!(
             index
                 .scan_mem_entries(session.pool_guards().index_guard())
@@ -2062,7 +2056,6 @@ fn test_secondary_mem_index_cleanup_removes_unique_delete_shadow_when_cold_row_k
         assert_eq!(stats.indexes[0].scanned, 2);
         assert_eq!(stats.indexes[0].removed, 2);
         assert_eq!(stats.indexes[0].retained, 0);
-        assert_eq!(stats.indexes[0].errors, 0);
         assert!(
             index
                 .scan_mem_entries(session.pool_guards().index_guard())
@@ -2091,6 +2084,101 @@ fn test_secondary_mem_index_cleanup_removes_unique_delete_shadow_when_cold_row_k
                 .await
                 .unwrap(),
             Some((row_id, false))
+        );
+
+        drop(session);
+        sys.clean_all();
+    });
+}
+
+#[test]
+fn test_secondary_mem_index_cleanup_propagates_cold_delete_overlay_proof_error() {
+    smol::block_on(async {
+        let sys = TestSys::new_evictable().await;
+        let mut session = sys.try_new_session().unwrap();
+        insert_rows(&sys, &mut session, 0, 1, "name").await;
+        sys.table.freeze(&session, usize::MAX).await;
+        sys.table.checkpoint(&mut session).await.unwrap();
+
+        let current_key = single_key(0i32);
+        let stale_key = single_key(-1i32);
+        let row_id = unique_disk_tree_lookup(&sys.table, session.pool_guards(), &current_key)
+            .await
+            .unwrap();
+        let block_id = {
+            let active_root = sys.table.file().active_root();
+            let column_index = ColumnBlockIndex::new(
+                active_root.column_block_index_root,
+                active_root.pivot_row_id,
+                sys.table.file().file_kind(),
+                sys.table.file().sparse_file(),
+                sys.table.disk_pool(),
+                session.pool_guards().disk_guard(),
+            );
+            column_index
+                .locate_block(row_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .block_id()
+        };
+        let index = sys.table.sec_idx()[0].unique().unwrap();
+        assert!(
+            index
+                .insert_if_not_exists(
+                    session.pool_guards().index_guard(),
+                    &stale_key.vals,
+                    row_id,
+                    false,
+                    MAX_SNAPSHOT_TS,
+                )
+                .await
+                .unwrap()
+                .is_ok()
+        );
+        assert!(
+            index
+                .mask_as_deleted(
+                    session.pool_guards().index_guard(),
+                    &stale_key.vals,
+                    row_id,
+                    MAX_SNAPSHOT_TS,
+                )
+                .await
+                .unwrap()
+        );
+
+        let table_file_path = sys.engine.table_fs.table_file_path(sys.table.table_id());
+        corrupt_lwc_row_shape_fingerprint(table_file_path, block_id);
+        let _ = sys
+            .table
+            .disk_pool()
+            .invalidate_block_id(sys.table.file().sparse_file().file_id(), block_id);
+
+        let err = sys
+            .table
+            .cleanup_secondary_mem_indexes(&mut session)
+            .await
+            .unwrap_err();
+        match err {
+            Error::BlockCorrupted {
+                file_kind: FileKind::TableFile,
+                block_kind: BlockKind::LwcBlock,
+                block_id: err_block_id,
+                ..
+            } => assert_eq!(err_block_id, block_id),
+            other => panic!("expected LWC block corruption, got {other:?}"),
+        }
+        assert_eq!(
+            index
+                .lookup(
+                    session.pool_guards().index_guard(),
+                    &stale_key.vals,
+                    MAX_SNAPSHOT_TS,
+                )
+                .await
+                .unwrap(),
+            Some((row_id, true))
         );
 
         drop(session);
@@ -2155,7 +2243,6 @@ fn test_secondary_mem_index_cleanup_retains_non_unique_delete_mark_without_delet
         assert_eq!(stats.indexes[1].scanned, 2);
         assert_eq!(stats.indexes[1].removed, 0);
         assert_eq!(stats.indexes[1].retained, 2);
-        assert_eq!(stats.indexes[1].errors, 0);
         assert_eq!(
             index
                 .lookup_unique(
@@ -2228,7 +2315,6 @@ fn test_secondary_mem_index_cleanup_removes_non_unique_delete_mark_with_purgeabl
         assert_eq!(stats.indexes[1].scanned, 2);
         assert_eq!(stats.indexes[1].removed, 2);
         assert_eq!(stats.indexes[1].retained, 0);
-        assert_eq!(stats.indexes[1].errors, 0);
         assert_eq!(
             index
                 .lookup_unique(
@@ -2284,7 +2370,6 @@ fn test_secondary_mem_index_cleanup_removes_non_unique_delete_mark_with_matching
         assert_eq!(stats.indexes[1].scanned, 1);
         assert_eq!(stats.indexes[1].removed, 0);
         assert_eq!(stats.indexes[1].retained, 1);
-        assert_eq!(stats.indexes[1].errors, 0);
         let entries = index
             .scan_mem_entries(session.pool_guards().index_guard())
             .await
@@ -2304,7 +2389,6 @@ fn test_secondary_mem_index_cleanup_removes_non_unique_delete_mark_with_matching
         assert_eq!(stats.indexes[1].scanned, 1);
         assert_eq!(stats.indexes[1].removed, 1);
         assert_eq!(stats.indexes[1].retained, 0);
-        assert_eq!(stats.indexes[1].errors, 0);
         assert!(
             index
                 .scan_mem_entries(session.pool_guards().index_guard())
@@ -2402,7 +2486,6 @@ fn test_secondary_mem_index_cleanup_removes_non_unique_delete_mark_when_cold_row
         assert_eq!(stats.indexes[1].scanned, 2);
         assert_eq!(stats.indexes[1].removed, 2);
         assert_eq!(stats.indexes[1].retained, 0);
-        assert_eq!(stats.indexes[1].errors, 0);
         assert!(
             index
                 .scan_mem_entries(session.pool_guards().index_guard())
