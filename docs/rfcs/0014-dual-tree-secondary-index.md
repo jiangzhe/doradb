@@ -525,10 +525,10 @@ SAFETY:` comments, and run the repository lint gate. [D10], [C4], [C7]
     intentionally deferred optimization work as backlogs.
   - Non-goals: generic B+Tree backend unification and broad query-planner range
     scan features.
-  - Task Doc: `docs/tasks/TBD.md`
-  - Task Issue: `#0`
-  - Phase Status: `pending`
-  - Implementation Summary: `pending`
+  - Task Doc: `docs/tasks/000121-secondary-index-cleanup-hardening.md`
+  - Task Issue: `#562`
+  - Phase Status: done
+  - Implementation Summary: Implemented Phase 5 secondary-index cleanup hardening: removed the transitional MemIndex wrapper, added proof-based MemIndex cleanup, preserved no-cold-backfill recovery, refreshed docs, and validated with clippy and nextest. [Task Resolve Sync: docs/tasks/000121-secondary-index-cleanup-hardening.md @ 2026-04-17]
 
 ## Test Strategy
 

@@ -9,6 +9,7 @@ use crate::index::{
     ColumnBlockIndex, NonUniqueSecondaryIndex, SecondaryIndex, UniqueSecondaryIndex,
 };
 use crate::row::RowID;
+use crate::session::Session;
 use crate::trx::TrxID;
 
 /// Aggregate result for a full-scan user-table secondary MemIndex cleanup pass.
@@ -42,6 +43,13 @@ struct MemIndexCleanupSnapshot {
     deletion_cutoff_ts: TrxID,
     secondary_index_roots: Vec<BlockID>,
     min_active_sts: TrxID,
+}
+
+impl MemIndexCleanupSnapshot {
+    #[inline]
+    fn is_visible_to(&self, cleanup_sts: TrxID) -> bool {
+        self.table_root_ts < cleanup_sts
+    }
 }
 
 struct MemIndexCleanupContext<'a> {
@@ -92,25 +100,63 @@ impl Table {
     /// missing delete proof as a retention decision for delete overlays.
     pub(crate) async fn cleanup_secondary_mem_indexes(
         &self,
-        guards: &PoolGuards,
-        min_active_sts: TrxID,
+        session: &mut Session,
     ) -> Result<SecondaryMemIndexCleanupStats> {
+        let trx_sys = session.engine().trx_sys.clone();
+        loop {
+            let trx = session.try_begin_trx()?.ok_or(Error::NotSupported(
+                "secondary MemIndex cleanup requires idle session",
+            ))?;
+            let cleanup_sts = trx.sts;
+            let min_active_sts = trx_sys.calc_min_active_sts_for_gc();
+            let snapshot = self.capture_mem_index_cleanup_snapshot(min_active_sts);
+            if !snapshot.is_visible_to(cleanup_sts) {
+                trx_sys.rollback(trx).await?;
+                continue;
+            }
+
+            let cleanup_res = self
+                .cleanup_secondary_mem_indexes_at_snapshot(session.pool_guards(), &snapshot)
+                .await;
+            let rollback_res = trx_sys.rollback(trx).await;
+            return match (cleanup_res, rollback_res) {
+                (Ok(stats), Ok(())) => Ok(stats),
+                (Err(err), Ok(())) => Err(err),
+                (_, Err(err)) => Err(err),
+            };
+        }
+    }
+
+    #[inline]
+    fn capture_mem_index_cleanup_snapshot(&self, min_active_sts: TrxID) -> MemIndexCleanupSnapshot {
         let active_root = self.file().active_root();
-        let snapshot = MemIndexCleanupSnapshot {
+        // Keep this as an owned field snapshot until checkpoint old-root
+        // retention is wired through transaction GC. The current checkpoint
+        // path can drop the swapped `OldRoot` immediately after publication,
+        // so holding `&ActiveRoot` across async cleanup is not lifetime-safe.
+        MemIndexCleanupSnapshot {
             table_root_ts: active_root.trx_id,
             pivot_row_id: active_root.pivot_row_id,
             column_block_index_root: active_root.column_block_index_root,
             deletion_cutoff_ts: active_root.deletion_cutoff_ts,
             secondary_index_roots: active_root.secondary_index_roots.clone(),
             min_active_sts,
-        };
+        }
+    }
+
+    #[inline]
+    async fn cleanup_secondary_mem_indexes_at_snapshot(
+        &self,
+        guards: &PoolGuards,
+        snapshot: &MemIndexCleanupSnapshot,
+    ) -> Result<SecondaryMemIndexCleanupStats> {
         debug_assert!(snapshot.deletion_cutoff_ts <= snapshot.table_root_ts);
 
-        let column_index = self.cleanup_column_index(guards, &snapshot);
+        let column_index = self.cleanup_column_index(guards, snapshot);
         let index_pool_guard = self.index_pool_guard(guards);
         let disk_pool_guard = guards.disk_guard();
         let cleanup_context = MemIndexCleanupContext {
-            snapshot: &snapshot,
+            snapshot,
             column_index: column_index.as_ref(),
             index_pool_guard,
             disk_pool_guard,

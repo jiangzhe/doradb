@@ -1639,9 +1639,10 @@ fn test_secondary_mem_index_cleanup_removes_redundant_live_unique_entries() {
 
         let stats = sys
             .table
-            .cleanup_secondary_mem_indexes(session.pool_guards(), MAX_SNAPSHOT_TS)
+            .cleanup_secondary_mem_indexes(&mut session)
             .await
             .unwrap();
+        assert!(!session.in_trx());
         assert_eq!(stats.indexes.len(), 1);
         assert_eq!(stats.indexes[0].index_no, 0);
         assert!(stats.indexes[0].unique);
@@ -1681,6 +1682,32 @@ fn test_secondary_mem_index_cleanup_removes_redundant_live_unique_entries() {
 }
 
 #[test]
+fn test_secondary_mem_index_cleanup_requires_idle_session() {
+    smol::block_on(async {
+        let sys = TestSys::new_evictable().await;
+        let mut session = sys.try_new_session().unwrap();
+        let trx = session.try_begin_trx().unwrap().unwrap();
+
+        let err = sys
+            .table
+            .cleanup_secondary_mem_indexes(&mut session)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            Error::NotSupported("secondary MemIndex cleanup requires idle session")
+        ));
+        assert!(session.in_trx());
+
+        trx.rollback().await.unwrap();
+        assert!(!session.in_trx());
+
+        drop(session);
+        sys.clean_all();
+    });
+}
+
+#[test]
 fn test_secondary_mem_index_cleanup_removes_redundant_live_non_unique_entries() {
     smol::block_on(async {
         let sys = TestSys::new_evictable_with_non_unique_name_index().await;
@@ -1702,7 +1729,7 @@ fn test_secondary_mem_index_cleanup_removes_redundant_live_non_unique_entries() 
 
         let stats = sys
             .table
-            .cleanup_secondary_mem_indexes(session.pool_guards(), MAX_SNAPSHOT_TS)
+            .cleanup_secondary_mem_indexes(&mut session)
             .await
             .unwrap();
         assert_eq!(stats.indexes.len(), 2);
@@ -1783,7 +1810,7 @@ fn test_secondary_mem_index_cleanup_retains_unique_delete_shadow_without_delete_
 
         let stats = sys
             .table
-            .cleanup_secondary_mem_indexes(session.pool_guards(), MAX_SNAPSHOT_TS)
+            .cleanup_secondary_mem_indexes(&mut session)
             .await
             .unwrap();
         assert_eq!(stats.indexes[0].scanned, 2);
@@ -1864,7 +1891,7 @@ fn test_secondary_mem_index_cleanup_removes_unique_delete_shadow_with_purgeable_
 
         let stats = sys
             .table
-            .cleanup_secondary_mem_indexes(session.pool_guards(), MAX_SNAPSHOT_TS)
+            .cleanup_secondary_mem_indexes(&mut session)
             .await
             .unwrap();
         assert_eq!(stats.indexes[0].scanned, 2);
@@ -1932,7 +1959,7 @@ fn test_secondary_mem_index_cleanup_retains_non_unique_delete_mark_without_delet
 
         let stats = sys
             .table
-            .cleanup_secondary_mem_indexes(session.pool_guards(), MAX_SNAPSHOT_TS)
+            .cleanup_secondary_mem_indexes(&mut session)
             .await
             .unwrap();
         assert_eq!(stats.indexes[1].scanned, 2);
@@ -2005,7 +2032,7 @@ fn test_secondary_mem_index_cleanup_removes_non_unique_delete_mark_with_purgeabl
 
         let stats = sys
             .table
-            .cleanup_secondary_mem_indexes(session.pool_guards(), MAX_SNAPSHOT_TS)
+            .cleanup_secondary_mem_indexes(&mut session)
             .await
             .unwrap();
         assert_eq!(stats.indexes[1].scanned, 2);

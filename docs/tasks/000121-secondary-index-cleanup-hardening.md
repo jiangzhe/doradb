@@ -1,7 +1,7 @@
 ---
 id: 000121
 title: Secondary Index Cleanup Hardening
-status: proposal
+status: implemented
 created: 2026-04-16
 github_issue: 562
 ---
@@ -300,6 +300,55 @@ cargo nextest run -p doradb-storage --no-default-features --features libaio
 
 ## Implementation Notes
 
+Implemented RFC 0014 Phase 5 cleanup and hardening.
+
+- Replaced the transitional in-memory wrapper module with concrete
+  `UniqueMemIndex` and `NonUniqueMemIndex` backends plus a crate-private
+  `InMemorySecondaryIndex` for catalog-table single-tree dispatch. Removed
+  `doradb-storage/src/index/mem_index.rs`; user tables now keep the
+  MemIndex/DiskTree runtime composite in `SecondaryIndex`.
+- Added encoded MemIndex scan and compare-delete helpers for unique and
+  non-unique indexes. Cleanup deletes only when the scanned encoded key, row
+  id, and delete state still match current MemIndex state.
+- Added `Table::cleanup_secondary_mem_indexes` in `table/gc.rs` with
+  snapshot-based proof rules over the active table root, pivot row id,
+  secondary DiskTree roots, deletion-buffer/global-purge state, and optional
+  durable row-absence proof via `ColumnBlockIndex`.
+- Preserved the no-cold-backfill recovery invariant: user-table recovery loads
+  checkpointed DiskTree roots directly and rebuilds only hot row-page redo into
+  MemIndex. Recovery helpers insert into MemIndex without DiskTree duplicate
+  checks.
+- Hardened unique and non-unique overlay behavior so cleanup removes redundant
+  live MemIndex entries only when the matching cold representation is
+  published, and removes delete overlays only when suppression is no longer
+  needed and row deletion is globally or durably safe.
+- Updated conceptual documentation in `docs/secondary-index.md`,
+  `docs/index-design.md`, and new `docs/garbage-collect.md`.
+- Added and moved tests covering MemIndex cleanup, composite unique/non-unique
+  merge and overlay semantics, no-cold-backfill recovery, checkpoint sidecar
+  atomicity, rollback paths, constructor/builder rollback, and catalog table
+  single-tree preservation.
+- Post-checklist fixes corrected `IndexInsert::is_ok()` to treat every
+  `Ok(_)` result as success, added public docs for secondary-index result
+  enums, split cleanup helpers to satisfy complexity and clippy guidance,
+  removed stale dead-code allowances from reachable helper methods, and kept
+  only the intentional `table/gc.rs` module-level allowance for the manual
+  cleanup entrypoint.
+
+Validation run:
+
+```bash
+cargo fmt --all --check
+cargo check -p doradb-storage
+cargo clippy -p doradb-storage --all-targets -- -D warnings
+cargo test -p doradb-storage secondary_index -- --nocapture
+cargo test -p doradb-storage secondary_mem_index_cleanup -- --nocapture
+cargo nextest run -p doradb-storage
+git diff --check
+```
+
+The final `cargo nextest run -p doradb-storage` pass ran 576 tests with 576
+passing.
 
 ## Impacts
 
@@ -370,13 +419,13 @@ timing.
 
 ## Open Questions
 
-1. Whether the manual full-scan cleanup function should be exposed only as a
-   crate-internal method or also wired into an existing maintenance/debug
-   surface. The default for this task is crate-internal only.
-2. Whether full-scan cleanup should return detailed per-index statistics or a
-   compact aggregate. Prefer detailed stats if they make tests and future
-   observability easier without complicating runtime code.
-3. Automatic scheduling for full-scan cleanup is intentionally deferred unless
-   implementation reveals a trivial and low-risk integration point.
-4. DiskTree root-reachability GC remains future work and should be documented
-   in `docs/garbage-collect.md`, not implemented here.
+1. Resolved: the manual full-scan cleanup function remains crate-internal and
+   is not wired into a maintenance/debug surface in this task.
+2. Resolved: full-scan cleanup returns detailed per-index statistics for
+   removed and retained unique/non-unique live and delete-overlay entries.
+3. Deferred: automatic scheduling for full-scan cleanup remains future work.
+   This task intentionally keeps cleanup manual to avoid adding scheduling or
+   runtime policy while the proof rules are still new.
+4. Deferred: DiskTree root-reachability GC remains future work documented in
+   `docs/garbage-collect.md`; this task does not reclaim obsolete DiskTree
+   pages.
