@@ -14,6 +14,10 @@ use crate::buffer::{BufferPool, FixedBufferPool, PoolGuard};
 use crate::error::Validation;
 use crate::error::Validation::{Invalid, Valid};
 use crate::error::{Error, Result};
+use crate::index::btree::algo::{
+    KnownFenceNodeParams, MemTreeSiblingMergePlan, NodeSlotRange, pack_node_range_box,
+    pack_node_range_into, pack_node_ranges_box, plan_memtree_sibling_merge,
+};
 use crate::index::util::{Maskable, ParentPosition, SpaceStatistics};
 use crate::latch::LatchFallbackMode;
 use crate::quiescent::QuiescentGuard;
@@ -802,28 +806,32 @@ impl<P: BufferPool> GenericBTree<P> {
         let right_page_id = right_page.page_id();
         let left_node = left_page.page_mut();
         let right_node = right_page.page_mut();
-        // Initialize and copy key values to left node.
-        left_node.init(
-            height,
-            ts,
-            &lower_fence_key,
-            lower_fence_value,
-            &sep_key,
-            hints_enabled,
+        pack_node_range_into::<V>(
+            left_node,
+            root,
+            KnownFenceNodeParams {
+                height,
+                ts,
+                lower_fence: &lower_fence_key,
+                lower_fence_value,
+                upper_fence: Some(&sep_key),
+                hints_enabled,
+            },
+            0..sep_idx,
         );
-        left_node.extend_slots_from::<V>(root, 0, sep_idx);
-        left_node.update_hints();
-        // Initialize and copy key values to right node.
-        right_node.init(
-            height,
-            ts,
-            &sep_key,
-            BTreeU64::INVALID_VALUE,
-            &[],
-            hints_enabled,
+        pack_node_range_into::<V>(
+            right_node,
+            root,
+            KnownFenceNodeParams {
+                height,
+                ts,
+                lower_fence: &sep_key,
+                lower_fence_value: BTreeU64::INVALID_VALUE,
+                upper_fence: None,
+                hints_enabled,
+            },
+            sep_idx..root.count(),
         );
-        right_node.extend_slots_from::<V>(root, sep_idx, root.count() - sep_idx);
-        right_node.update_hints();
         // Re-initialize root in place as branch root and insert right child separator.
         root.init(
             height + 1,
@@ -856,37 +864,39 @@ impl<P: BufferPool> GenericBTree<P> {
         let c_height = c_node.height() as u16;
         let c_lower_fence_key = c_node.lower_fence_key();
         let c_upper_fence_key = c_node.upper_fence_key();
-        // Create temporary node to store the left half data of child node.
-        let mut tmp_l = BTreeNodeBox::alloc(
-            c_height,
-            ts,
-            &c_lower_fence_key,
-            c_node.lower_fence_value(),
-            sep_key,
-            c_node.header_hints_enabled(),
+        let tmp_l = pack_node_range_box::<V>(
+            c_node,
+            KnownFenceNodeParams {
+                height: c_height,
+                ts,
+                lower_fence: &c_lower_fence_key,
+                lower_fence_value: c_node.lower_fence_value(),
+                upper_fence: Some(sep_key),
+                hints_enabled: c_node.header_hints_enabled(),
+            },
+            0..sep_idx,
         );
-        tmp_l.extend_slots_from::<V>(c_node, 0, sep_idx);
-        tmp_l.update_hints();
         // Process right node.
         let right_page_id = r_guard.page_id();
         let right_node = r_guard.page_mut();
-        // Initialize and copy key values to right node.
-        right_node.init(
-            c_node.height() as u16,
-            ts,
-            sep_key,
-            // For leaf node, lower fence value is meaningless.
-            // For branch node, only the leftmost branch node has meaningful
-            // lower fence value pointing to a valid child.
-            // Other branch nodes always have lower fence equal to the first
-            // slot key.
-            // So, right node does not need to copy lower fence value.
-            BTreeU64::INVALID_VALUE,
-            &c_upper_fence_key,
-            c_node.header_hints_enabled(),
+        pack_node_range_into::<V>(
+            right_node,
+            c_node,
+            KnownFenceNodeParams {
+                height: c_height,
+                ts,
+                lower_fence: sep_key,
+                // For leaf node, lower fence value is meaningless.
+                // For branch node, only the leftmost branch node has meaningful
+                // lower fence value pointing to a valid child. Other branch nodes
+                // always have lower fence equal to the first slot key, so the
+                // right node does not need to copy lower fence value.
+                lower_fence_value: BTreeU64::INVALID_VALUE,
+                upper_fence: Some(&c_upper_fence_key),
+                hints_enabled: c_node.header_hints_enabled(),
+            },
+            sep_idx..c_node.count(),
         );
-        right_node.extend_slots_from::<V>(c_node, sep_idx, c_node.count() - sep_idx);
-        right_node.update_hints();
         // Copy left node to current node.
         c_node.clone_from(&tmp_l);
         drop(tmp_l);
@@ -921,33 +931,46 @@ impl<P: BufferPool> GenericBTree<P> {
         upper_fence_key: &[u8], // upper fence key of right node.
         ts: TrxID,
     ) {
-        let value_size = V::ENCODED_LEN;
         debug_assert!(l_node.height() == r_node.height());
         debug_assert!(p_r_idx < p_node.count());
         debug_assert!(p_node.lookup_child_idx(lower_fence_key) == Some(p_r_idx as isize - 1));
-        debug_assert!({
-            let mut estimation =
-                SpaceEstimation::with_fences(lower_fence_key, upper_fence_key, value_size);
-            estimation.add_key_range(l_node, 0, l_node.count());
-            estimation.add_key_range(r_node, 0, r_node.count());
-            estimation.total_space() <= BTREE_NODE_USABLE_SIZE
-        });
+        debug_assert!(matches!(
+            plan_memtree_sibling_merge::<V>(
+                l_node,
+                r_node,
+                lower_fence_key,
+                upper_fence_key,
+                BTREE_NODE_USABLE_SIZE,
+            ),
+            MemTreeSiblingMergePlan::Full
+        ));
         let ts = ts.max(l_node.ts()).max(r_node.ts()).max(p_node.ts());
-        let mut tmp_l = BTreeNodeBox::alloc(
-            l_node.height() as u16,
-            ts,
-            lower_fence_key,
-            l_node.lower_fence_value(),
-            upper_fence_key,
-            l_node.header_hints_enabled(),
+        // Full merge preserves the left page identity and purges the right page.
+        // The helper only rebuilds node bytes; the caller still owns parent
+        // separator deletion and purge-list ordering.
+        let tmp_l = pack_node_ranges_box::<V>(
+            KnownFenceNodeParams {
+                height: l_node.height() as u16,
+                ts,
+                lower_fence: lower_fence_key,
+                lower_fence_value: l_node.lower_fence_value(),
+                upper_fence: Some(upper_fence_key),
+                hints_enabled: l_node.header_hints_enabled(),
+            },
+            &[
+                NodeSlotRange {
+                    node: l_node,
+                    range: 0..l_node.count(),
+                },
+                NodeSlotRange {
+                    node: r_node,
+                    range: 0..r_node.count(),
+                },
+            ],
         );
-        tmp_l.extend_slots_from::<V>(l_node, 0, l_node.count());
-        if r_node.count() > 0 {
-            tmp_l.extend_slots_from::<V>(r_node, 0, r_node.count());
-        }
-        tmp_l.update_hints();
         l_node.clone_from(&tmp_l);
         drop(tmp_l);
+        let value_size = V::ENCODED_LEN;
         p_node.delete_at(p_r_idx, value_size);
         p_node.update_hints();
         p_node.update_ts(ts);
@@ -968,50 +991,55 @@ impl<P: BufferPool> GenericBTree<P> {
         count: usize,
         ts: TrxID,
     ) {
-        let value_size = V::ENCODED_LEN;
         debug_assert!(l_node.height() == r_node.height());
         debug_assert!(p_r_idx < p_node.count());
         debug_assert!(p_node.lookup_child_idx(lower_fence_key) == Some(p_r_idx as isize - 1));
         debug_assert!(count > 0 && count < r_node.count());
         debug_assert!(&r_node.create_sep_key(count, r_node.height() == 0)[..] == sep_key);
-        debug_assert!({
-            let mut estimation = SpaceEstimation::with_fences(lower_fence_key, sep_key, value_size);
-            estimation.add_key_range(l_node, 0, l_node.count());
-            estimation.add_key_range(r_node, 0, count);
-            estimation.total_space() <= BTREE_NODE_USABLE_SIZE
-        });
         let ts = ts.max(l_node.ts()).max(r_node.ts()).max(p_node.ts());
-        let mut tmp_l = BTreeNodeBox::alloc(
-            l_node.height() as u16,
-            ts,
-            lower_fence_key,
-            l_node.lower_fence_value(),
-            sep_key,
-            l_node.header_hints_enabled(),
+        // Partial merge keeps both child pages. The left page absorbs a prefix
+        // of the right page, while the remaining right suffix keeps the original
+        // upper fence and gets a new lower fence equal to the parent separator.
+        let tmp_l = pack_node_ranges_box::<V>(
+            KnownFenceNodeParams {
+                height: l_node.height() as u16,
+                ts,
+                lower_fence: lower_fence_key,
+                lower_fence_value: l_node.lower_fence_value(),
+                upper_fence: Some(sep_key),
+                hints_enabled: l_node.header_hints_enabled(),
+            },
+            &[
+                NodeSlotRange {
+                    node: l_node,
+                    range: 0..l_node.count(),
+                },
+                NodeSlotRange {
+                    node: r_node,
+                    range: 0..count,
+                },
+            ],
         );
-        tmp_l.extend_slots_from::<V>(l_node, 0, l_node.count());
-        tmp_l.extend_slots_from::<V>(r_node, 0, count);
-        tmp_l.update_hints();
         l_node.clone_from(&tmp_l);
         drop(tmp_l);
 
-        let mut tmp_r = {
-            let lower_fence_value = if r_node.height() == 0 {
-                BTreeU64::INVALID_VALUE
-            } else {
-                r_node.value::<BTreeU64>(count)
-            };
-            BTreeNodeBox::alloc(
-                r_node.height() as u16,
-                ts,
-                sep_key,
-                lower_fence_value,
-                upper_fence_key,
-                r_node.header_hints_enabled(),
-            )
+        let lower_fence_value = if r_node.height() == 0 {
+            BTreeU64::INVALID_VALUE
+        } else {
+            r_node.value::<BTreeU64>(count)
         };
-        tmp_r.extend_slots_from::<V>(r_node, count, r_node.count() - count);
-        tmp_r.update_hints();
+        let tmp_r = pack_node_range_box::<V>(
+            r_node,
+            KnownFenceNodeParams {
+                height: r_node.height() as u16,
+                ts,
+                lower_fence: sep_key,
+                lower_fence_value,
+                upper_fence: Some(upper_fence_key),
+                hints_enabled: r_node.header_hints_enabled(),
+            },
+            count..r_node.count(),
+        );
         r_node.clone_from(&tmp_r);
         drop(tmp_r);
         p_node.update_key::<BTreeU64>(p_r_idx, sep_key);
@@ -1706,88 +1734,79 @@ impl<'a, V: BTreeValue, P: BufferPool> BTreeCompactor<'a, V, P> {
                     // until high space is reached.
                     let l_node = self.coupling.node.as_mut().unwrap().page_mut();
                     let r_node = r_guard.page_mut();
-                    // Estimate space after compaction.
                     lower_fence_key_buffer.clear();
                     l_node.extend_lower_fence_key(lower_fence_key_buffer);
                     upper_fence_key_buffer.clear();
                     r_node.extend_upper_fence_key(upper_fence_key_buffer);
                     let ts = l_node.ts().max(r_node.ts());
-                    let mut estimation = SpaceEstimation::with_fences(
-                        lower_fence_key_buffer,
-                        upper_fence_key_buffer,
-                        V::ENCODED_LEN,
-                    );
-                    estimation.add_key_range(l_node, 0, l_node.count());
-                    if estimation.total_space() > BTREE_NODE_USABLE_SIZE {
-                        // fence key change results in a node out of space.
-                        self.coupling.node.replace(r_guard);
-                        self.coupling.parent.as_mut().unwrap().idx = p_r_idx as isize;
-                        return Ok(BTreeCompact::OutOfSpace);
-                    }
-                    if r_node.count() == 0 {
-                        // Special case: right node is empty.
-                        // The merge must succeed.
-                        let p_node = self.coupling.parent.as_mut().unwrap().g.page_mut();
-                        self.tree.merge_node::<V>(
-                            p_node,
-                            p_r_idx,
-                            l_node,
-                            r_node,
-                            lower_fence_key_buffer,
-                            upper_fence_key_buffer,
-                            ts,
-                        );
-                        // Put right node into purge list.
-                        purge_list.push(r_guard);
-                        continue;
-                    }
-                    // find a suitable position to merge.
-                    let sep_idx = estimation.grow_until_threshold(r_node, self.high_space);
-                    if sep_idx == 0 {
-                        // can not add one key to left node.
-                        let res = self.skip().await?;
-                        debug_assert!(res);
-                        return Ok(BTreeCompact::Skip);
-                    }
-                    if sep_idx == r_node.count() {
-                        // All keys in right node can be merged into left node.
-                        let p_node = self.coupling.parent.as_mut().unwrap().g.page_mut();
-                        self.tree.merge_node::<V>(
-                            p_node,
-                            p_r_idx,
-                            l_node,
-                            r_node,
-                            lower_fence_key_buffer,
-                            upper_fence_key_buffer,
-                            ts,
-                        );
-                        // Put right node into purge list.
-                        purge_list.push(r_guard);
-                        continue;
-                    }
-                    let sep_key = r_node.create_sep_key(sep_idx, r_node.height() == 0);
-                    let parent = self.coupling.parent.as_mut().unwrap();
-                    let p_node = parent.g.page_mut();
-                    // check if parent has enough space to update key.
-                    if !p_node.prepare_update_key::<BTreeU64>(p_r_idx, &sep_key) {
-                        self.coupling.node.replace(r_guard);
-                        self.coupling.parent.as_mut().unwrap().idx = p_r_idx as isize;
-                        return Ok(BTreeCompact::OutOfSpace);
-                    }
-                    self.tree.merge_partial::<V>(
-                        p_node,
-                        p_r_idx,
+                    // MemTree compaction is anchored at the underfilled left
+                    // page and may use the immediate right page as a donor even
+                    // when that right page is not itself underfilled. The
+                    // configurable high-space threshold controls how much of
+                    // the donor can move into the anchor.
+                    match plan_memtree_sibling_merge::<V>(
                         l_node,
                         r_node,
                         lower_fence_key_buffer,
-                        &sep_key,
                         upper_fence_key_buffer,
-                        sep_idx,
-                        ts,
-                    );
-                    parent.idx = p_r_idx as isize;
-                    self.coupling.node.replace(r_guard);
-                    return Ok(BTreeCompact::ChildDone);
+                        self.high_space,
+                    ) {
+                        MemTreeSiblingMergePlan::FenceOutOfSpace => {
+                            // fence key change results in a node out of space.
+                            self.coupling.node.replace(r_guard);
+                            self.coupling.parent.as_mut().unwrap().idx = p_r_idx as isize;
+                            return Ok(BTreeCompact::OutOfSpace);
+                        }
+                        MemTreeSiblingMergePlan::NoProgress => {
+                            // can not add one key to left node.
+                            let res = self.skip().await?;
+                            debug_assert!(res);
+                            return Ok(BTreeCompact::Skip);
+                        }
+                        MemTreeSiblingMergePlan::Full => {
+                            // All keys in right node can be merged into left node.
+                            let p_node = self.coupling.parent.as_mut().unwrap().g.page_mut();
+                            self.tree.merge_node::<V>(
+                                p_node,
+                                p_r_idx,
+                                l_node,
+                                r_node,
+                                lower_fence_key_buffer,
+                                upper_fence_key_buffer,
+                                ts,
+                            );
+                            // Put right node into purge list.
+                            purge_list.push(r_guard);
+                            continue;
+                        }
+                        MemTreeSiblingMergePlan::Partial {
+                            right_count: sep_idx,
+                        } => {
+                            let sep_key = r_node.create_sep_key(sep_idx, r_node.height() == 0);
+                            let parent = self.coupling.parent.as_mut().unwrap();
+                            let p_node = parent.g.page_mut();
+                            // check if parent has enough space to update key.
+                            if !p_node.prepare_update_key::<BTreeU64>(p_r_idx, &sep_key) {
+                                self.coupling.node.replace(r_guard);
+                                self.coupling.parent.as_mut().unwrap().idx = p_r_idx as isize;
+                                return Ok(BTreeCompact::OutOfSpace);
+                            }
+                            self.tree.merge_partial::<V>(
+                                p_node,
+                                p_r_idx,
+                                l_node,
+                                r_node,
+                                lower_fence_key_buffer,
+                                &sep_key,
+                                upper_fence_key_buffer,
+                                sep_idx,
+                                ts,
+                            );
+                            parent.idx = p_r_idx as isize;
+                            self.coupling.node.replace(r_guard);
+                            return Ok(BTreeCompact::ChildDone);
+                        }
+                    }
                 }
                 None => {
                     // Current parent done.

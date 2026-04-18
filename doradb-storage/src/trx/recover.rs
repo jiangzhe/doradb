@@ -1444,10 +1444,14 @@ mod tests {
                 .disk()
                 .open_non_unique(session.pool_guards().disk_guard())
                 .unwrap();
-            assert_eq!(
-                disk.prefix_scan(&name_key.vals).await.unwrap(),
-                same_row_ids
-            );
+            let disk_rows = disk
+                .prefix_scan_entries(&name_key.vals)
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|(_, row_id)| row_id)
+                .collect::<Vec<_>>();
+            assert_eq!(disk_rows, same_row_ids);
             match table.deletion_buffer().get(same_row_ids[1]).unwrap() {
                 DeleteMarker::Committed(_) => (),
                 DeleteMarker::Ref(_) => panic!("recovered cold delete should be committed"),

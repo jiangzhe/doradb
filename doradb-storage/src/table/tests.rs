@@ -5538,7 +5538,12 @@ async fn non_unique_disk_tree_prefix_scan(
         .unwrap()
         .open_non_unique_at(root, guards.disk_guard())
         .unwrap();
-    tree.prefix_scan(&key.vals).await.unwrap()
+    tree.prefix_scan_entries(&key.vals)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|(_, row_id)| row_id)
+        .collect()
 }
 
 async fn assert_unique_index_entry(
