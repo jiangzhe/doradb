@@ -28,6 +28,7 @@ The storage engine is designed as a hybrid engine with both in-memory row store 
 - [Deletion Checkpoint](./docs/deletion-checkpoint.md)
 - [Table File](./docs/table-file.md)
 - [Buffer Pool](./docs/buffer-pool.md)
+- [Garbage Collect](./docs/garbage-collect.md)
 
 Above documents describe the core design of this engine. Most parts are update-to-date.
 Some ideas are different from traditional database system.
