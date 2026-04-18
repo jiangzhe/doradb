@@ -189,6 +189,57 @@ struct PendingRewriteEntry {
     payload: RewriteEntryPayload,
 }
 
+/// Tracks rewrite block ids until a materialization tree succeeds.
+///
+/// DiskTree materialization recursively writes children before parents. If any
+/// async write fails, every block id allocated for that unpublished tree must be
+/// returned to the mutable CoW root. Success disarms the guard and leaves the
+/// ids owned by the returned `BranchEntry` payload.
+struct RewriteAllocationGuard<'a, M: MutableCowFile> {
+    mutable_file: &'a mut M,
+    block_ids: Vec<BlockID>,
+}
+
+impl<'a, M: MutableCowFile> RewriteAllocationGuard<'a, M> {
+    #[inline]
+    fn new(mutable_file: &'a mut M) -> Self {
+        Self {
+            mutable_file,
+            block_ids: Vec::new(),
+        }
+    }
+
+    #[inline]
+    fn file(&self) -> &M {
+        self.mutable_file
+    }
+
+    #[inline]
+    fn allocate_block_id(&mut self) -> Result<BlockID> {
+        let block_id = self.mutable_file.allocate_block_id()?;
+        self.block_ids.push(block_id);
+        Ok(block_id)
+    }
+
+    #[inline]
+    fn disarm(mut self) {
+        self.block_ids.clear();
+    }
+}
+
+impl<M: MutableCowFile> Drop for RewriteAllocationGuard<'_, M> {
+    #[inline]
+    fn drop(&mut self) {
+        for block_id in self.block_ids.drain(..).rev() {
+            let res = self.mutable_file.rollback_allocated_block_id(block_id);
+            debug_assert!(
+                res.is_ok(),
+                "DiskTree rewrite allocation rollback failed for block_id={block_id}"
+            );
+        }
+    }
+}
+
 /// One child entry while a rewrite is still being planned.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum RewriteEntry {
@@ -903,7 +954,13 @@ impl<'a, F: DiskTreeSpec> DiskTree<'a, F> {
                     .await;
             }
             let res = self
-                .rewrite_subtree(mutable_file, self.root_block_id, operations, create_ts)
+                .rewrite_subtree(
+                    mutable_file,
+                    self.root_block_id,
+                    operations,
+                    create_ts,
+                    None,
+                )
                 .await?;
             // Finalization decides whether the rewritten result is empty, can
             // promote a single child, or needs new branch levels above it.
@@ -924,6 +981,7 @@ impl<'a, F: DiskTreeSpec> DiskTree<'a, F> {
         block_id: BlockID,
         operations: &'b [DiskTreeOperation],
         create_ts: u64,
+        range_upper_fence: Option<&'b [u8]>,
     ) -> Pin<Box<dyn Future<Output = Result<NodeRewriteResult>> + 'b>> {
         Box::pin(async move {
             let guard = self.read_node(block_id).await?;
@@ -937,15 +995,21 @@ impl<'a, F: DiskTreeSpec> DiskTree<'a, F> {
                 }
                 let entries = F::apply_operations(&entries, operations)?;
                 return Ok(NodeRewriteResult {
-                    entries: self.pack_leaf_rewrite_entries(&entries)?,
+                    entries: self.pack_leaf_rewrite_entries(&entries, range_upper_fence)?,
                 });
             }
             let entries = branch_entries_from_node(node, self.file_kind(), block_id)?;
             // Flatten the branch while the guard is alive, then release it before
             // recursive children perform mutable writes through the CoW fork.
             drop(guard);
-            self.rewrite_branch(entries, mutable_file, operations, create_ts)
-                .await
+            self.rewrite_branch(
+                entries,
+                mutable_file,
+                operations,
+                create_ts,
+                range_upper_fence,
+            )
+            .await
         })
     }
 
@@ -959,6 +1023,7 @@ impl<'a, F: DiskTreeSpec> DiskTree<'a, F> {
         mutable_file: &mut M,
         operations: &[DiskTreeOperation],
         create_ts: u64,
+        range_upper_fence: Option<&[u8]>,
     ) -> Result<NodeRewriteResult> {
         let mut combined = Vec::with_capacity(old_entries.len() + operations.len());
         let mut op_idx = 0usize;
@@ -966,7 +1031,8 @@ impl<'a, F: DiskTreeSpec> DiskTree<'a, F> {
             let start_idx = op_idx;
             let upper = old_entries
                 .get(child_idx + 1)
-                .map(|next| next.key.as_slice());
+                .map(|next| next.key.as_slice())
+                .or(range_upper_fence);
             // Child ranges are half-open: this child's lower fence through the
             // next child's lower fence. The last child owns the remaining suffix.
             while op_idx < operations.len()
@@ -988,6 +1054,7 @@ impl<'a, F: DiskTreeSpec> DiskTree<'a, F> {
                     entry.block_id,
                     &operations[start_idx..op_idx],
                     create_ts,
+                    upper,
                 )
                 .await?;
             combined.extend(child.entries);
@@ -1006,14 +1073,16 @@ impl<'a, F: DiskTreeSpec> DiskTree<'a, F> {
         // It may absorb one or more immediate right siblings, but only when the
         // accepted window can be materialized within the pending anchor's write
         // budget. Unrelated sparse regions are left as their original blocks.
-        let combined = self.absorb_rewrite_siblings(combined).await?;
+        let combined = self
+            .absorb_rewrite_siblings(combined, range_upper_fence)
+            .await?;
         if combined.is_empty() {
             return Ok(NodeRewriteResult {
                 entries: Vec::new(),
             });
         }
         let height = parent_height_from_rewrite_children(&combined)?;
-        let entries = self.pack_branch_rewrite_entries(combined, height)?;
+        let entries = self.pack_branch_rewrite_entries(combined, height, range_upper_fence)?;
         Ok(NodeRewriteResult { entries })
     }
 
@@ -1027,7 +1096,7 @@ impl<'a, F: DiskTreeSpec> DiskTree<'a, F> {
         entries: &[LogicalEntry],
         create_ts: u64,
     ) -> Result<BlockID> {
-        let leaf_entries = self.pack_leaf_rewrite_entries(entries)?;
+        let leaf_entries = self.pack_leaf_rewrite_entries(entries, None)?;
         self.finalize_root_rewrite(mutable_file, leaf_entries, create_ts)
             .await
     }
@@ -1070,7 +1139,7 @@ impl<'a, F: DiskTreeSpec> DiskTree<'a, F> {
             // Pack the current level into parent branch blocks, then repeat with
             // the returned lower-fence entries until one root block remains.
             let height = parent_height_from_rewrite_children(&entries)?;
-            entries = self.pack_branch_rewrite_entries(entries, height)?;
+            entries = self.pack_branch_rewrite_entries(entries, height, None)?;
         }
     }
 
@@ -1089,8 +1158,11 @@ impl<'a, F: DiskTreeSpec> DiskTree<'a, F> {
         Box::pin(async move {
             loop {
                 if entry.height() == 0 {
+                    let root_entry = self
+                        .retarget_rewrite_entry_upper_fence(mutable_file, entry, None)
+                        .await?;
                     return Ok(self
-                        .materialize_rewrite_entry(mutable_file, entry, create_ts)
+                        .materialize_rewrite_entry(mutable_file, root_entry, create_ts)
                         .await?
                         .block_id);
                 }
@@ -1106,8 +1178,11 @@ impl<'a, F: DiskTreeSpec> DiskTree<'a, F> {
                         entry = children.remove(0);
                     }
                     RewriteEntryPayload::Branch(_) => {
+                        let root_entry = self
+                            .retarget_rewrite_entry_upper_fence(mutable_file, entry, None)
+                            .await?;
                         return Ok(self
-                            .materialize_rewrite_entry(mutable_file, entry, create_ts)
+                            .materialize_rewrite_entry(mutable_file, root_entry, create_ts)
                             .await?
                             .block_id);
                     }
@@ -1128,6 +1203,7 @@ impl<'a, F: DiskTreeSpec> DiskTree<'a, F> {
     async fn absorb_rewrite_siblings(
         &self,
         entries: Vec<RewriteEntry>,
+        range_upper_fence: Option<&[u8]>,
     ) -> Result<Vec<RewriteEntry>> {
         if entries.len() < 2 {
             return Ok(entries);
@@ -1151,8 +1227,12 @@ impl<'a, F: DiskTreeSpec> DiskTree<'a, F> {
                 let mut candidate_window = planned.clone();
                 candidate_window.push(entries[idx].clone());
                 let candidate_budget = write_budget + usize::from(entries[idx].is_pending());
+                let candidate_upper_fence = entries
+                    .get(idx + 1)
+                    .map(|entry| entry.key())
+                    .or(range_upper_fence);
                 let candidate = self
-                    .repack_rewrite_window(&candidate_window, height)
+                    .repack_rewrite_window(&candidate_window, height, candidate_upper_fence)
                     .await?;
                 if candidate.len() > candidate_budget {
                     break;
@@ -1172,6 +1252,7 @@ impl<'a, F: DiskTreeSpec> DiskTree<'a, F> {
         &self,
         window: &[RewriteEntry],
         height: u16,
+        upper_fence: Option<&[u8]>,
     ) -> Result<Vec<RewriteEntry>> {
         if window.is_empty() {
             return Err(Error::InvalidArgument);
@@ -1187,7 +1268,7 @@ impl<'a, F: DiskTreeSpec> DiskTree<'a, F> {
                 }
             }
             validate_logical_entries_sorted(&entries)?;
-            return self.pack_leaf_rewrite_entries(&entries);
+            return self.pack_leaf_rewrite_entries(&entries, upper_fence);
         }
 
         let mut children = Vec::new();
@@ -1200,7 +1281,7 @@ impl<'a, F: DiskTreeSpec> DiskTree<'a, F> {
             }
         }
         validate_rewrite_entries_for_height(&children, height - 1)?;
-        self.pack_branch_rewrite_entries(children, height)
+        self.pack_branch_rewrite_entries(children, height, upper_fence)
     }
 
     /// Materialize one rewrite entry's payload without reading newly written blocks.
@@ -1255,8 +1336,50 @@ impl<'a, F: DiskTreeSpec> DiskTree<'a, F> {
         Ok(())
     }
 
+    /// Retarget a rewrite entry to a different upper fence before materializing.
+    ///
+    /// Root promotion uses this to ensure the published root is open-ended. If
+    /// the candidate is an existing finite block, its payload is converted back
+    /// to pending form so the block can be written with the new fence.
+    async fn retarget_rewrite_entry_upper_fence<M: MutableCowFile>(
+        &self,
+        mutable_file: &mut M,
+        entry: RewriteEntry,
+        upper_fence: Option<Vec<u8>>,
+    ) -> Result<RewriteEntry> {
+        match entry {
+            RewriteEntry::Pending(mut entry) => {
+                entry.upper_fence = upper_fence;
+                Ok(RewriteEntry::Pending(entry))
+            }
+            RewriteEntry::Block(entry) => {
+                let payload = match self.branch_entry_payload(&entry).await? {
+                    BranchEntryPayload::Leaf(entries) => RewriteEntryPayload::Leaf(entries),
+                    BranchEntryPayload::Branch(children) => RewriteEntryPayload::Branch(
+                        children.into_iter().map(RewriteEntry::Block).collect(),
+                    ),
+                };
+                self.rollback_rewritten_entry_block(mutable_file, &entry)?;
+                Ok(RewriteEntry::Pending(PendingRewriteEntry {
+                    key: entry.key,
+                    upper_fence,
+                    height: entry.height,
+                    payload,
+                }))
+            }
+        }
+    }
+
     /// Split sorted logical leaf entries into pending leaf blocks.
-    fn pack_leaf_rewrite_entries(&self, entries: &[LogicalEntry]) -> Result<Vec<RewriteEntry>> {
+    ///
+    /// `upper_fence` is the exclusive high fence of the whole run. The final
+    /// planned leaf stores this fence exactly, so bounded subtrees can use the
+    /// same common-prefix compression that materialization will write.
+    fn pack_leaf_rewrite_entries(
+        &self,
+        entries: &[LogicalEntry],
+        upper_fence: Option<&[u8]>,
+    ) -> Result<Vec<RewriteEntry>> {
         validate_logical_entries_sorted(entries)?;
         let slot_entries = entries
             .iter()
@@ -1273,6 +1396,7 @@ impl<'a, F: DiskTreeSpec> DiskTree<'a, F> {
             let plan = plan_sibling_node(
                 PackedNodePlanParams {
                     lower_fence: &entries[start].key,
+                    upper_fence,
                     min_slots: 1,
                 },
                 &slot_entries[start..],
@@ -1290,10 +1414,15 @@ impl<'a, F: DiskTreeSpec> DiskTree<'a, F> {
     }
 
     /// Split child entries into pending branch blocks at `height`.
+    ///
+    /// `upper_fence` is the exclusive high fence of this branch-entry run. It is
+    /// used only by the final planned branch block unless the run must split
+    /// earlier on a following child lower fence.
     fn pack_branch_rewrite_entries(
         &self,
         entries: Vec<RewriteEntry>,
         height: u16,
+        upper_fence: Option<&[u8]>,
     ) -> Result<Vec<RewriteEntry>> {
         if entries.is_empty() {
             return Ok(Vec::new());
@@ -1316,6 +1445,7 @@ impl<'a, F: DiskTreeSpec> DiskTree<'a, F> {
             let plan = plan_sibling_node(
                 PackedNodePlanParams {
                     lower_fence: first.key(),
+                    upper_fence,
                     min_slots: usize::from(start + 1 < entries.len()),
                 },
                 &slot_entries[start + 1..],
@@ -1340,6 +1470,25 @@ impl<'a, F: DiskTreeSpec> DiskTree<'a, F> {
         create_ts: u64,
     ) -> Pin<Box<dyn Future<Output = Result<BranchEntry>> + 'b>> {
         Box::pin(async move {
+            let mut allocations = RewriteAllocationGuard::new(mutable_file);
+            let entry = self
+                .materialize_rewrite_entry_with_allocations(&mut allocations, entry, create_ts)
+                .await?;
+            allocations.disarm();
+            Ok(entry)
+        })
+    }
+
+    fn materialize_rewrite_entry_with_allocations<'b, 'm, M: MutableCowFile + 'm>(
+        &'b self,
+        allocations: &'b mut RewriteAllocationGuard<'m, M>,
+        entry: RewriteEntry,
+        create_ts: u64,
+    ) -> Pin<Box<dyn Future<Output = Result<BranchEntry>> + 'b>>
+    where
+        'm: 'b,
+    {
+        Box::pin(async move {
             match entry {
                 RewriteEntry::Block(entry) => Ok(entry),
                 RewriteEntry::Pending(entry) => match entry {
@@ -1350,7 +1499,7 @@ impl<'a, F: DiskTreeSpec> DiskTree<'a, F> {
                         payload: RewriteEntryPayload::Leaf(entries),
                     } => {
                         self.write_one_leaf_block(
-                            mutable_file,
+                            allocations,
                             key,
                             upper_fence,
                             height,
@@ -1366,10 +1515,10 @@ impl<'a, F: DiskTreeSpec> DiskTree<'a, F> {
                         payload: RewriteEntryPayload::Branch(children),
                     } => {
                         let children = self
-                            .materialize_rewrite_entries(mutable_file, children, create_ts)
+                            .materialize_rewrite_entries(allocations, children, create_ts)
                             .await?;
                         self.write_one_branch_block(
-                            mutable_file,
+                            allocations,
                             key,
                             upper_fence,
                             height,
@@ -1383,16 +1532,16 @@ impl<'a, F: DiskTreeSpec> DiskTree<'a, F> {
         })
     }
 
-    async fn materialize_rewrite_entries<M: MutableCowFile>(
+    async fn materialize_rewrite_entries<'m, M: MutableCowFile + 'm>(
         &self,
-        mutable_file: &mut M,
+        allocations: &mut RewriteAllocationGuard<'m, M>,
         entries: Vec<RewriteEntry>,
         create_ts: u64,
     ) -> Result<Vec<BranchEntry>> {
         let mut materialized = Vec::with_capacity(entries.len());
         for entry in entries {
             materialized.push(
-                self.materialize_rewrite_entry(mutable_file, entry, create_ts)
+                self.materialize_rewrite_entry_with_allocations(allocations, entry, create_ts)
                     .await?,
             );
         }
@@ -1400,9 +1549,9 @@ impl<'a, F: DiskTreeSpec> DiskTree<'a, F> {
     }
 
     /// Write one already planned leaf block with its stored finite upper fence.
-    async fn write_one_leaf_block<M: MutableCowFile>(
+    async fn write_one_leaf_block<'m, M: MutableCowFile + 'm>(
         &self,
-        mutable_file: &mut M,
+        allocations: &mut RewriteAllocationGuard<'m, M>,
         key: Vec<u8>,
         upper_fence: Option<Vec<u8>>,
         height: u16,
@@ -1438,8 +1587,9 @@ impl<'a, F: DiskTreeSpec> DiskTree<'a, F> {
             )?
             .effective_space
         };
-        let block_id = mutable_file.allocate_block_id()?;
-        self.write_node_block(mutable_file, block_id, buf).await?;
+        let block_id = allocations.allocate_block_id()?;
+        self.write_node_block(allocations.file(), block_id, buf)
+            .await?;
         Ok(BranchEntry::rewritten_leaf(
             key,
             block_id,
@@ -1449,9 +1599,9 @@ impl<'a, F: DiskTreeSpec> DiskTree<'a, F> {
     }
 
     /// Write one already planned branch block with its stored finite upper fence.
-    async fn write_one_branch_block<M: MutableCowFile>(
+    async fn write_one_branch_block<'m, M: MutableCowFile + 'm>(
         &self,
-        mutable_file: &mut M,
+        allocations: &mut RewriteAllocationGuard<'m, M>,
         key: Vec<u8>,
         upper_fence: Option<Vec<u8>>,
         height: u16,
@@ -1493,8 +1643,9 @@ impl<'a, F: DiskTreeSpec> DiskTree<'a, F> {
             )?
             .effective_space
         };
-        let block_id = mutable_file.allocate_block_id()?;
-        self.write_node_block(mutable_file, block_id, buf).await?;
+        let block_id = allocations.allocate_block_id()?;
+        self.write_node_block(allocations.file(), block_id, buf)
+            .await?;
         Ok(BranchEntry::rewritten_branch(
             key,
             block_id,
@@ -1886,10 +2037,12 @@ mod tests {
     use crate::buffer::{global_readonly_pool_scope, table_readonly_pool};
     use crate::catalog::{ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey};
     use crate::file::build_test_fs;
+    use crate::file::table_file::MutableTableFile;
     use crate::value::ValKind;
     use std::future::Future;
     use std::pin::Pin;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn metadata_with_indexes() -> Arc<TableMetadata> {
         Arc::new(TableMetadata::new(
@@ -2065,6 +2218,83 @@ mod tests {
         Ok(encoded)
     }
 
+    struct FailingDiskTreeWriteFile {
+        inner: MutableTableFile,
+        fail_leaf_at: Option<usize>,
+        fail_branch_at: Option<usize>,
+        leaf_writes: AtomicUsize,
+        branch_writes: AtomicUsize,
+    }
+
+    impl FailingDiskTreeWriteFile {
+        fn new(
+            inner: MutableTableFile,
+            fail_leaf_at: Option<usize>,
+            fail_branch_at: Option<usize>,
+        ) -> Self {
+            Self {
+                inner,
+                fail_leaf_at,
+                fail_branch_at,
+                leaf_writes: AtomicUsize::new(0),
+                branch_writes: AtomicUsize::new(0),
+            }
+        }
+
+        fn allocated_blocks(&self) -> usize {
+            self.inner.root().alloc_map.allocated()
+        }
+
+        fn leaf_writes(&self) -> usize {
+            self.leaf_writes.load(Ordering::Acquire)
+        }
+
+        fn branch_writes(&self) -> usize {
+            self.branch_writes.load(Ordering::Acquire)
+        }
+
+        fn should_fail(&self, buf: &DirectBuf) -> bool {
+            let Some(node) = btree_node_from_block(buf.data()) else {
+                return false;
+            };
+            if node.is_leaf() {
+                let write_idx = self.leaf_writes.fetch_add(1, Ordering::AcqRel);
+                self.fail_leaf_at == Some(write_idx)
+            } else {
+                let write_idx = self.branch_writes.fetch_add(1, Ordering::AcqRel);
+                self.fail_branch_at == Some(write_idx)
+            }
+        }
+    }
+
+    impl MutableCowFile for FailingDiskTreeWriteFile {
+        fn allocate_block_id(&mut self) -> Result<BlockID> {
+            self.inner.allocate_block_id()
+        }
+
+        fn rollback_allocated_block_id(&mut self, block_id: BlockID) -> Result<()> {
+            self.inner.rollback_allocated_block_id(block_id)
+        }
+
+        fn record_gc_block(&mut self, block_id: BlockID) {
+            self.inner.record_gc_block(block_id)
+        }
+
+        fn write_block(
+            &self,
+            block_id: BlockID,
+            buf: DirectBuf,
+        ) -> impl Future<Output = Result<()>> + Send {
+            let should_fail = self.should_fail(&buf);
+            async move {
+                if should_fail {
+                    return Err(Error::InvalidState);
+                }
+                self.inner.write_block(block_id, buf).await
+            }
+        }
+    }
+
     #[derive(Debug)]
     struct NodeSummary {
         is_leaf: bool,
@@ -2108,6 +2338,8 @@ mod tests {
     #[derive(Debug)]
     struct LeafBlock {
         block_id: BlockID,
+        upper_fence: Option<Vec<u8>>,
+        common_prefix_len: usize,
         keys: Vec<Vec<u8>>,
     }
 
@@ -2127,7 +2359,17 @@ mod tests {
                 for idx in 0..node.count() {
                     keys.push(F::leaf_entry(node, idx, tree.file_kind(), block_id)?.key);
                 }
-                leaves.push(LeafBlock { block_id, keys });
+                let upper_fence = if node.has_no_upper_fence() {
+                    None
+                } else {
+                    Some(node.upper_fence_key().as_bytes().to_vec())
+                };
+                leaves.push(LeafBlock {
+                    block_id,
+                    upper_fence,
+                    common_prefix_len: node.common_prefix().len(),
+                    keys,
+                });
             } else {
                 let branch_entries = branch_entries_from_node(node, tree.file_kind(), block_id)?;
                 for entry in branch_entries.into_iter().rev() {
@@ -2555,6 +2797,93 @@ mod tests {
     }
 
     #[test]
+    fn test_disk_tree_rewrite_rolls_back_leaf_allocations_on_write_failure() {
+        smol::block_on(async {
+            let (_temp_dir, fs) = build_test_fs();
+            let metadata = metadata_with_indexes();
+            let table = fs
+                .create_table_file(310, Arc::clone(&metadata), false)
+                .unwrap();
+            let (table, old_root) = table.commit(1, false).await.unwrap();
+            drop(old_root);
+            let global = global_readonly_pool_scope(64 * 1024 * 1024);
+            let disk_pool = table_readonly_pool(&global, 310, &table);
+            let guard = disk_pool.pool_guard();
+            let inner = MutableTableFile::fork(&table, fs.background_writes());
+            let allocated_before = inner.root().alloc_map.allocated();
+            let mut mutable = FailingDiskTreeWriteFile::new(inner, Some(1), None);
+            let runtime = unique_runtime!(metadata, disk_pool);
+            let tree = runtime.open(SUPER_BLOCK_ID, &guard);
+
+            const ENTRY_COUNT: u32 = 8192;
+            let keys = (0..ENTRY_COUNT)
+                .map(|idx| [Val::from(idx)])
+                .collect::<Vec<_>>();
+            let puts = keys
+                .iter()
+                .enumerate()
+                .map(|(idx, key)| UniqueDiskTreePut {
+                    key,
+                    row_id: idx as RowID + 100,
+                })
+                .collect::<Vec<_>>();
+
+            let mut writer = tree.batch_writer(&mut mutable, 2);
+            writer.batch_put(&puts).unwrap();
+            let err = writer.finish().await.unwrap_err();
+            assert!(matches!(err, Error::InvalidState));
+            assert_eq!(mutable.leaf_writes(), 2);
+            assert_eq!(mutable.branch_writes(), 0);
+            assert_eq!(mutable.allocated_blocks(), allocated_before);
+        });
+    }
+
+    #[test]
+    fn test_disk_tree_rewrite_rolls_back_child_allocations_on_branch_write_failure() {
+        smol::block_on(async {
+            let (_temp_dir, fs) = build_test_fs();
+            let metadata = metadata_with_indexes();
+            let table = fs
+                .create_table_file(311, Arc::clone(&metadata), false)
+                .unwrap();
+            let (table, old_root) = table.commit(1, false).await.unwrap();
+            drop(old_root);
+            let global = global_readonly_pool_scope(64 * 1024 * 1024);
+            let disk_pool = table_readonly_pool(&global, 311, &table);
+            let guard = disk_pool.pool_guard();
+            let inner = MutableTableFile::fork(&table, fs.background_writes());
+            let allocated_before = inner.root().alloc_map.allocated();
+            let mut mutable = FailingDiskTreeWriteFile::new(inner, None, Some(0));
+            let runtime = unique_runtime!(metadata, disk_pool);
+            let tree = runtime.open(SUPER_BLOCK_ID, &guard);
+
+            const ENTRY_COUNT: u32 = 8192;
+            let keys = (0..ENTRY_COUNT)
+                .map(|idx| [Val::from(idx)])
+                .collect::<Vec<_>>();
+            let puts = keys
+                .iter()
+                .enumerate()
+                .map(|(idx, key)| UniqueDiskTreePut {
+                    key,
+                    row_id: idx as RowID + 100,
+                })
+                .collect::<Vec<_>>();
+
+            let mut writer = tree.batch_writer(&mut mutable, 2);
+            writer.batch_put(&puts).unwrap();
+            let err = writer.finish().await.unwrap_err();
+            assert!(matches!(err, Error::InvalidState));
+            assert!(
+                mutable.leaf_writes() > 1,
+                "branch failure test should materialize multiple leaves first"
+            );
+            assert_eq!(mutable.branch_writes(), 1);
+            assert_eq!(mutable.allocated_blocks(), allocated_before);
+        });
+    }
+
+    #[test]
     fn test_encoded_batch_writer_apis() {
         smol::block_on(async {
             let (_temp_dir, fs) = build_test_fs();
@@ -2929,6 +3258,7 @@ mod tests {
             let compacted_tree = runtime.open(compacted_root, &guard);
             let compacted_guard = compacted_tree.read_node(compacted_root).await.unwrap();
             assert!(compacted_guard.node().is_leaf());
+            assert!(compacted_guard.node().has_no_upper_fence());
             assert_eq!(compacted_guard.node().count(), expected_rows.len());
             drop(compacted_guard);
 
@@ -3118,6 +3448,15 @@ mod tests {
 
             let rewritten_tree = runtime.open(rewritten_root, &guard);
             let rewritten_leaves = collect_leaf_blocks(&rewritten_tree).await.unwrap();
+            assert_ne!(rewritten_leaves[0].block_id, leaves[0].block_id);
+            assert_eq!(
+                rewritten_leaves[0].upper_fence,
+                Some(leaves[1].keys[0].clone())
+            );
+            assert!(
+                rewritten_leaves[0].common_prefix_len > 0,
+                "bounded rewritten leaf should use the right sibling key as its upper fence"
+            );
             assert!(
                 rewritten_leaves
                     .iter()

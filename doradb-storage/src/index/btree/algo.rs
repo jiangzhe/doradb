@@ -23,13 +23,17 @@ pub(crate) struct PackedNodeEntry<'a, V> {
 
 /// Immutable parameters for planning one packed sibling node.
 ///
-/// The planner only needs the lower fence and minimum slot count. Callers that
-/// materialize the plan pass full node header fields through
-/// `KnownFenceNodeParams` after the final upper fence is known.
+/// `upper_fence` is the exclusive high fence for the whole packing run. The
+/// planner returns it only when every remaining entry fits into the current
+/// node; otherwise the current node is bounded by the first unpacked entry.
+/// Callers that materialize the plan must pass the returned fence through
+/// `KnownFenceNodeParams` unchanged.
 #[derive(Clone, Copy)]
 pub(crate) struct PackedNodePlanParams<'a> {
     /// Inclusive lower fence key for this node.
     pub(crate) lower_fence: &'a [u8],
+    /// Exclusive upper fence for the packing run, or `None` for open-ended root.
+    pub(crate) upper_fence: Option<&'a [u8]>,
     /// Minimum number of slot entries the node must consume.
     pub(crate) min_slots: usize,
 }
@@ -122,9 +126,10 @@ fn packed_sibling_upper_fence<'a, V>(
 ///
 /// DiskTree rewrite uses this as a dry-run before allocating replacement blocks:
 /// candidate right siblings are only accepted when the final packed block count
-/// stays within the rewrite's write budget. The count and fence selection are
-/// used later by `pack_fixed_entries`, so planning and materialization run
-/// against the same lower/upper fence pair.
+/// stays within the rewrite's write budget. When all entries fit, the returned
+/// fence is the caller-supplied run fence; for split nodes it is the first
+/// unpacked entry. The returned fence is later used by `pack_fixed_entries`, so
+/// planning and materialization run against the same lower/upper fence pair.
 pub(crate) fn plan_sibling_node<'a, V>(
     params: PackedNodePlanParams<'a>,
     entries: &'a [PackedNodeEntry<'a, V>],
@@ -137,12 +142,16 @@ where
     }
 
     let rightmost_count = entries.len();
-    if let Some(space) = packed_node_space::<V>(params.lower_fence, None, entries, rightmost_count)
-        && space.total_space() <= BTREE_NODE_USABLE_SIZE
+    if let Some(space) = packed_node_space::<V>(
+        params.lower_fence,
+        params.upper_fence,
+        entries,
+        rightmost_count,
+    ) && space.total_space() <= BTREE_NODE_USABLE_SIZE
     {
         return Ok(PackedNodePlan {
             packed: rightmost_count,
-            upper_fence: None,
+            upper_fence: params.upper_fence,
         });
     }
 
@@ -226,7 +235,7 @@ pub(crate) fn pack_fixed_entries<'a, V>(
 where
     V: BTreeValue + Copy,
 {
-    if !fences_fit::<V>(params.lower_fence, params.upper_fence.unwrap_or(&[])) {
+    if !fences_fit(params.lower_fence, params.upper_fence.unwrap_or(&[])) {
         return Err(Error::InvalidArgument);
     }
     node.init(
@@ -366,7 +375,7 @@ where
     V: BTreeValue + Copy,
 {
     let upper_fence = upper_fence.unwrap_or(&[]);
-    if !fences_fit::<V>(lower_fence, upper_fence) {
+    if !fences_fit(lower_fence, upper_fence) {
         return false;
     }
     estimate_packed_node_space::<V>(lower_fence, upper_fence, &entries[..count])
@@ -383,7 +392,7 @@ where
     V: BTreeValue + Copy,
 {
     let upper_fence = upper_fence.unwrap_or(&[]);
-    if !fences_fit::<V>(lower_fence, upper_fence) {
+    if !fences_fit(lower_fence, upper_fence) {
         return None;
     }
     estimate_packed_node_space::<V>(lower_fence, upper_fence, &entries[..count])
@@ -410,7 +419,7 @@ where
         let Some(space) = PackedNodeSpace::with_fences(lower_fence, upper_fence) else {
             continue;
         };
-        if !fences_fit::<V>(lower_fence, upper_fence) {
+        if !fences_fit(lower_fence, upper_fence) {
             if space.prefix_is_inline() {
                 break;
             }
@@ -468,12 +477,9 @@ where
     Some(space)
 }
 
-fn fences_fit<V: BTreeValue>(lower_fence: &[u8], upper_fence: &[u8]) -> bool {
-    if lower_fence.len() > u16::MAX as usize || upper_fence.len() > u16::MAX as usize {
-        return false;
-    }
-    SpaceEstimation::with_fences(lower_fence, upper_fence, V::ENCODED_LEN).total_space()
-        <= BTREE_NODE_USABLE_SIZE
+fn fences_fit(lower_fence: &[u8], upper_fence: &[u8]) -> bool {
+    PackedNodeSpace::with_fences(lower_fence, upper_fence)
+        .is_some_and(|space| space.total_space() <= BTREE_NODE_USABLE_SIZE)
 }
 
 #[cfg(test)]
@@ -492,7 +498,7 @@ mod tests {
         V: BTreeValue + Copy,
     {
         let upper_fence = upper_fence.unwrap_or(&[]);
-        if !fences_fit::<V>(lower_fence, upper_fence) {
+        if !fences_fit(lower_fence, upper_fence) {
             return false;
         }
         let mut node = BTreeNodeBox::alloc(
@@ -632,6 +638,51 @@ mod tests {
     }
 
     #[test]
+    fn test_fences_fit_uses_prefix_aware_estimator() {
+        let prefix = vec![b'p'; 16];
+        let make_fences = |suffix_len: usize| {
+            let mut lower_fence = prefix.clone();
+            lower_fence.resize(prefix.len() + suffix_len, b'a');
+            let mut upper_fence = prefix.clone();
+            upper_fence.resize(prefix.len() + suffix_len, b'b');
+            (lower_fence, upper_fence)
+        };
+        let conservative_space = |suffix_len| {
+            let (lower_fence, upper_fence) = make_fences(suffix_len);
+            SpaceEstimation::with_fences(&lower_fence, &upper_fence, BTreeU64::ENCODED_LEN)
+                .total_space()
+        };
+
+        let mut low = 5usize;
+        let mut high = BTREE_NODE_USABLE_SIZE;
+        while low < high {
+            let mid = low + (high - low) / 2;
+            if conservative_space(mid) > BTREE_NODE_USABLE_SIZE {
+                high = mid;
+            } else {
+                low = mid + 1;
+            }
+        }
+
+        let (lower_fence, upper_fence) = make_fences(low);
+        let conservative =
+            SpaceEstimation::with_fences(&lower_fence, &upper_fence, BTreeU64::ENCODED_LEN)
+                .total_space();
+        let packed = PackedNodeSpace::with_fences(&lower_fence, &upper_fence)
+            .unwrap()
+            .total_space();
+        assert!(packed <= BTREE_NODE_USABLE_SIZE);
+        assert!(conservative > BTREE_NODE_USABLE_SIZE);
+        assert!(fences_fit(&lower_fence, &upper_fence));
+        assert!(scratch_node_fits::<BTreeU64>(
+            &lower_fence,
+            Some(&upper_fence),
+            &[],
+            0
+        ));
+    }
+
+    #[test]
     fn test_plan_sibling_node_uses_finite_fence_common_prefix() {
         let entries = [
             PackedNodeEntry {
@@ -651,6 +702,7 @@ mod tests {
         let result = plan_sibling_node(
             PackedNodePlanParams {
                 lower_fence: b"prefix-0001",
+                upper_fence: None,
                 min_slots: 1,
             },
             &entries,
@@ -681,6 +733,33 @@ mod tests {
     }
 
     #[test]
+    fn test_plan_sibling_node_uses_supplied_run_upper_fence() {
+        let entries = [
+            PackedNodeEntry {
+                key: b"prefix-0001",
+                value: BTreeU64::from(1),
+            },
+            PackedNodeEntry {
+                key: b"prefix-0002",
+                value: BTreeU64::from(2),
+            },
+        ];
+
+        let result = plan_sibling_node(
+            PackedNodePlanParams {
+                lower_fence: b"prefix-0001",
+                upper_fence: Some(b"prefix-0003"),
+                min_slots: 1,
+            },
+            &entries,
+        )
+        .unwrap();
+
+        assert_eq!(result.packed, entries.len());
+        assert_eq!(result.upper_fence, Some(b"prefix-0003".as_slice()));
+    }
+
+    #[test]
     fn test_plan_sibling_node_accounts_for_upper_fence_capacity() {
         let long_key = vec![b'x'; BTREE_NODE_USABLE_SIZE];
         let entries = [PackedNodeEntry {
@@ -691,6 +770,7 @@ mod tests {
         let err = plan_sibling_node(
             PackedNodePlanParams {
                 lower_fence: &long_key,
+                upper_fence: None,
                 min_slots: 1,
             },
             &entries,

@@ -1023,18 +1023,13 @@ impl<P: BufferPool> GenericBTree<P> {
         l_node.clone_from(&tmp_l);
         drop(tmp_l);
 
-        let lower_fence_value = if r_node.height() == 0 {
-            BTreeU64::INVALID_VALUE
-        } else {
-            r_node.value::<BTreeU64>(count)
-        };
         let tmp_r = pack_node_range_box::<V>(
             r_node,
             KnownFenceNodeParams {
                 height: r_node.height() as u16,
                 ts,
                 lower_fence: sep_key,
-                lower_fence_value,
+                lower_fence_value: BTreeU64::INVALID_VALUE,
                 upper_fence: Some(upper_fence_key),
                 hints_enabled: r_node.header_hints_enabled(),
             },
@@ -2037,6 +2032,56 @@ mod tests {
             first_right_leaf_page_id,
             second_right_leaf_page_id,
         }
+    }
+
+    #[test]
+    fn test_btree_merge_partial_branch_suffix_drops_lower_fence_child() {
+        smol::block_on(async {
+            let pool = owned_index_pool(64 * 1024 * 1024);
+            let pool_guard = (*pool).pool_guard();
+            let tree = BTree::new(pool.guard(), &pool_guard, false, 200)
+                .await
+                .expect("test btree construction should succeed");
+
+            let mut p_node =
+                BTreeNodeBox::alloc(2, 100, b"aa00", BTreeU64::from(10), b"zzzz", false);
+            p_node.insert(b"mm00", BTreeU64::from(20));
+
+            let mut l_node =
+                BTreeNodeBox::alloc(1, 101, b"aa00", BTreeU64::from(100), b"mm00", false);
+            l_node.insert(b"bb00", BTreeU64::from(101));
+
+            let mut r_node =
+                BTreeNodeBox::alloc(1, 102, b"mm00", BTreeU64::INVALID_VALUE, b"zzzz", false);
+            r_node.insert(b"mm00", BTreeU64::from(200));
+            r_node.insert(b"nn00", BTreeU64::from(201));
+            r_node.insert(b"oo00", BTreeU64::from(202));
+
+            let sep_key = r_node.create_sep_key(1, false);
+            tree.merge_partial::<BTreeU64>(
+                &mut p_node,
+                0,
+                &mut l_node,
+                &mut r_node,
+                b"aa00",
+                &sep_key,
+                b"zzzz",
+                1,
+                103,
+            );
+
+            assert_eq!(r_node.lower_fence_key().as_bytes(), b"nn00");
+            assert_eq!(r_node.lower_fence_value(), BTreeU64::INVALID_VALUE);
+            assert_eq!(r_node.count(), 2);
+            assert_eq!(
+                r_node.lookup_child(b"nn00"),
+                LookupChild::Slot(0, PageID::from(201u64))
+            );
+            assert_eq!(
+                r_node.lookup_child(b"oo00"),
+                LookupChild::Slot(1, PageID::from(202u64))
+            );
+        })
     }
 
     #[test]
