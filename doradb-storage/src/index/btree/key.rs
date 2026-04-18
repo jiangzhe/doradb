@@ -1,6 +1,5 @@
 use crate::memcmp::{
-    BytesExtendable, MemCmpFormat, MemCmpKey, NormalBytes, Null, Nullable, NullableMemCmpFormat,
-    SegmentedBytes,
+    MemCmpFormat, MemCmpKey, NormalBytes, Null, Nullable, NullableMemCmpFormat, SegmentedBytes,
 };
 use crate::value::{Val, ValKind, ValType};
 use std::borrow::Borrow;
@@ -18,13 +17,6 @@ trait KeyEncoder {
 
     /// Encodes a key and copy to given buffer at given start position.
     fn encode_copy(&self, key: &Val, buf: &mut [u8], start_idx: usize) -> usize;
-
-    /// Encode a key and extend to a given collection.
-    /// This method is not recommended, unless the keys are dynamically added.
-    /// Otherwise, we can always create fixed-length container with encode_len()
-    /// and then encode_copy() keys into it.
-    #[allow(dead_code)]
-    fn encode_extend<T: BytesExtendable>(&self, key: &Val, buf: &mut T);
 }
 
 pub struct SingleKeyEncoder(ValType);
@@ -149,37 +141,6 @@ impl KeyEncoder for SingleKeyEncoder {
             }
         }
     }
-
-    #[inline]
-    fn encode_extend<T: BytesExtendable>(&self, key: &Val, buf: &mut T) {
-        if key.is_null() {
-            return Null.extend_nmcf_to(buf);
-        }
-        match (self.0.kind, self.0.nullable) {
-            (ValKind::I8, false) => key.as_i8().unwrap().extend_mcf_to(buf),
-            (ValKind::U8, false) => key.as_u8().unwrap().extend_mcf_to(buf),
-            (ValKind::I16, false) => key.as_i16().unwrap().extend_mcf_to(buf),
-            (ValKind::U16, false) => key.as_u16().unwrap().extend_mcf_to(buf),
-            (ValKind::I32, false) => key.as_i32().unwrap().extend_mcf_to(buf),
-            (ValKind::U32, false) => key.as_u32().unwrap().extend_mcf_to(buf),
-            (ValKind::I64, false) => key.as_i64().unwrap().extend_mcf_to(buf),
-            (ValKind::U64, false) => key.as_u64().unwrap().extend_mcf_to(buf),
-            (ValKind::F32, false) => key.as_f32().unwrap().extend_mcf_to(buf),
-            (ValKind::F64, false) => key.as_f64().unwrap().extend_mcf_to(buf),
-            (ValKind::VarByte, false) => NormalBytes(key.as_bytes().unwrap()).extend_mcf_to(buf),
-            (ValKind::I8, true) => key.as_i8().unwrap().extend_nmcf_to(buf),
-            (ValKind::U8, true) => key.as_u8().unwrap().extend_nmcf_to(buf),
-            (ValKind::I16, true) => key.as_i16().unwrap().extend_nmcf_to(buf),
-            (ValKind::U16, true) => key.as_u16().unwrap().extend_nmcf_to(buf),
-            (ValKind::I32, true) => key.as_i32().unwrap().extend_nmcf_to(buf),
-            (ValKind::U32, true) => key.as_u32().unwrap().extend_nmcf_to(buf),
-            (ValKind::I64, true) => key.as_i64().unwrap().extend_nmcf_to(buf),
-            (ValKind::U64, true) => key.as_u64().unwrap().extend_nmcf_to(buf),
-            (ValKind::F32, true) => key.as_f32().unwrap().extend_nmcf_to(buf),
-            (ValKind::F64, true) => key.as_f64().unwrap().extend_nmcf_to(buf),
-            (ValKind::VarByte, true) => NormalBytes(key.as_bytes().unwrap()).extend_nmcf_to(buf),
-        }
-    }
 }
 
 /// A Special encoder for variable-length string/bytes to be memory comparable
@@ -216,20 +177,6 @@ impl KeyEncoder for SegmentedBytesEncoder {
             bs.copy_mcf_to(buf, start_idx)
         }
     }
-
-    #[inline]
-    fn encode_extend<T: BytesExtendable>(&self, key: &Val, buf: &mut T) {
-        if key.is_null() {
-            Null.extend_nmcf_to(buf);
-            return;
-        }
-        let bs = SegmentedBytes(key.as_bytes().unwrap());
-        if self.nullable {
-            bs.extend_nmcf_to(buf);
-        } else {
-            bs.extend_mcf_to(buf);
-        }
-    }
 }
 
 pub enum PrefixKeyEncoder {
@@ -259,15 +206,6 @@ impl KeyEncoder for PrefixKeyEncoder {
         match self {
             PrefixKeyEncoder::Single(e) => e.encode_copy(key, buf, start_idx),
             PrefixKeyEncoder::Segmented(e) => e.encode_copy(key, buf, start_idx),
-        }
-    }
-
-    /// Encode a key and extend to given collection.
-    #[inline]
-    fn encode_extend<T: BytesExtendable>(&self, key: &Val, buf: &mut T) {
-        match self {
-            PrefixKeyEncoder::Single(e) => e.encode_extend(key, buf),
-            PrefixKeyEncoder::Segmented(e) => e.encode_extend(key, buf),
         }
     }
 }
@@ -609,11 +547,6 @@ mod tests {
             let copied_len = encoder.encode_copy(&val, &mut buf, 0);
             assert_eq!(copied_len, len);
             assert_eq!(buf, key.as_bytes());
-
-            // Test encode_extend
-            let mut extended = Vec::new();
-            encoder.encode_extend(&val, &mut extended);
-            assert_eq!(extended, key.as_bytes());
 
             // Test est_encode_len for non-nullable fixed-size types
             if !ty.nullable && ty.kind != ValKind::VarByte {

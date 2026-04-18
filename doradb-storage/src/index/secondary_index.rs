@@ -887,8 +887,6 @@ mod tests {
     };
     use crate::quiescent::QuiescentBox;
     use crate::value::{ValKind, ValType};
-    use std::future::Future;
-    use std::pin::Pin;
 
     fn metadata_with_indexes() -> Arc<TableMetadata> {
         Arc::new(TableMetadata::new(
@@ -947,27 +945,16 @@ mod tests {
         row_id: RowID,
     }
 
-    trait NonUniqueDiskTreeTestExt {
-        fn prefix_scan<'a>(
-            &'a self,
-            key: &'a [Val],
-        ) -> Pin<Box<dyn Future<Output = Result<Vec<RowID>>> + 'a>>;
-    }
-
-    impl NonUniqueDiskTreeTestExt for NonUniqueDiskTree<'_> {
-        fn prefix_scan<'a>(
-            &'a self,
-            key: &'a [Val],
-        ) -> Pin<Box<dyn Future<Output = Result<Vec<RowID>>> + 'a>> {
-            Box::pin(async move {
-                Ok(self
-                    .prefix_scan_entries(key)
-                    .await?
-                    .into_iter()
-                    .map(|(_, row_id)| row_id)
-                    .collect())
-            })
-        }
+    async fn non_unique_disk_tree_prefix_scan_rows(
+        tree: &NonUniqueDiskTree<'_>,
+        key: &[Val],
+    ) -> Result<Vec<RowID>> {
+        Ok(tree
+            .prefix_scan_entries(key)
+            .await?
+            .into_iter()
+            .map(|(_, row_id)| row_id)
+            .collect())
     }
 
     fn encode_unique_puts(entries: &[UniqueDiskTreePut<'_>]) -> Vec<(Vec<u8>, RowID)> {
@@ -1451,10 +1438,17 @@ mod tests {
 
             let unchanged_disk = disk_runtime.open(root, &disk_guard);
             assert_eq!(
-                unchanged_disk.prefix_scan(&key1).await.unwrap(),
+                non_unique_disk_tree_prefix_scan_rows(&unchanged_disk, &key1)
+                    .await
+                    .unwrap(),
                 vec![10, 11]
             );
-            assert_eq!(unchanged_disk.prefix_scan(&key2).await.unwrap(), vec![20]);
+            assert_eq!(
+                non_unique_disk_tree_prefix_scan_rows(&unchanged_disk, &key2)
+                    .await
+                    .unwrap(),
+                vec![20]
+            );
         });
     }
 

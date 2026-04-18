@@ -628,6 +628,11 @@ SAFETY:` comments, and run the repository lint gate. [D10], [C4], [C7]
 - The implementation reused B+Tree node layout, key/value encoders, scan
   helpers, and `BTreeNil` support where practical, but it deliberately avoided
   a generic backend-independent CoW B+Tree refactor.
+- Follow-up task 000122 resolved DiskTree prefix compression by moving BTree
+  modules under `index/btree`, adding shared fence-aware packing helpers, and
+  persisting finite upper fences for non-rightmost DiskTree leaf and branch
+  nodes. [Task Resolve Sync: docs/tasks/000122-disk-tree-prefix-compression.md
+  @ 2026-04-18]
 
 ## Open Questions
 
@@ -641,7 +646,6 @@ items remain open for future task/RFC planning and are not required to close RFC
 
 - `docs/backlogs/000083-full-disk-tree-compaction-policy.md`
 - `docs/backlogs/000084-parallel-secondary-disk-tree-checkpoint-application.md`
-- `docs/backlogs/000085-disk-tree-prefix-compression.md`
 - `docs/backlogs/000086-secondary-index-dual-tree-access-path.md`
 - `docs/backlogs/000087-refactor-recovery-process-parallel-log-replay.md`
 - `docs/backlogs/000088-remove-recovery-skip-option.md`

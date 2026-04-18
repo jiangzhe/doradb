@@ -1,7 +1,7 @@
 ---
 id: 000122
 title: DiskTree Prefix Compression
-status: proposal
+status: implemented
 created: 2026-04-18
 github_issue: 565
 ---
@@ -45,7 +45,7 @@ Issue Labels:
 - codex
 
 Source Backlogs:
-- docs/backlogs/000085-disk-tree-prefix-compression.md
+- docs/backlogs/closed/000085-disk-tree-prefix-compression.md
 
 Related Design:
 - docs/rfcs/0014-dual-tree-secondary-index.md
@@ -196,6 +196,59 @@ apply `docs/process/unsafe-review-checklist.md`.
 
 ## Implementation Notes
 
+Implemented on branch `btree-fences`.
+
+- Moved the BTree implementation into `doradb-storage/src/index/btree/` and
+  kept the external index re-export surface compatible through
+  `index::btree`/`index::*`.
+- Added `btree::algo` as the shared packing boundary for fence-aware node
+  planning, known-fence node rebuilding, fixed-entry materialization, and
+  sibling-merge planning. The helper stays independent of latches, buffer-pool
+  ownership, CoW file writes, checkpoint publication, and DiskTree batch
+  semantics.
+- Added `PackedNodeSpace` for prefix-aware packed-node estimation and routed
+  DiskTree packed leaf/branch planning through it, including finite upper fences
+  for non-rightmost packed nodes and open-ended fences for rightmost nodes.
+- Ported narrow MemTree split and sibling-merge rebuild paths to the shared
+  helpers without changing online latch coupling, mutation ordering, or the
+  conservative `SpaceEstimation` merge policy.
+- Updated DiskTree rewrite planning to target one or more right-side siblings,
+  skip non-absorbable full siblings, use the parent upper fence for the run
+  upper bound, and preserve compact-write behavior by keeping unchanged nodes
+  above the rewrite threshold.
+- Added rewrite block allocation guards so failed parent or child materialization
+  deallocates all rewrite block ids allocated during that write attempt.
+- Fixed review findings discovered during implementation: branch partial-merge
+  suffix nodes no longer duplicate the first child, parent branch separator
+  deletion uses the parent branch value width, the shared fence-fit check uses
+  the prefix-aware estimator, and test-only/legacy helper code was removed.
+- Retained `SpaceEstimation` only for current MemTree merge-policy compatibility.
+  Its retirement is deferred to `docs/backlogs/000092-refactor-memtree-compaction-policy.md`.
+- Refreshed the unsafe usage baseline; no new unsafe blocks were added by this
+  task.
+
+Validation completed:
+
+```bash
+cargo fmt --all --check
+cargo check -p doradb-storage
+cargo check -p doradb-storage --all-targets
+cargo clippy -p doradb-storage --all-targets -- -D warnings
+cargo nextest run -p doradb-storage btree
+cargo nextest run -p doradb-storage disk_tree
+cargo nextest run -p doradb-storage index::secondary_index::tests
+cargo nextest run -p doradb-storage
+tools/coverage_focus.rs --path doradb-storage/src/index/btree --top-uncovered 20
+tools/coverage_focus.rs --path doradb-storage/src/index/disk_tree.rs --top-uncovered 20
+tools/unsafe_inventory.rs --write <tempfile>
+git diff --check
+```
+
+Focused coverage met the project target for the main changed paths:
+
+- `doradb-storage/src/index/btree`: 91.12%.
+- `doradb-storage/src/index/disk_tree.rs`: 95.53%.
+
 ## Impacts
 
 - `doradb-storage/src/index/mod.rs`
@@ -259,3 +312,9 @@ None blocking.
 Future work can extend `btree::algo` with shared lookup, traversal, split, or
 repacking helpers once those designs are mature enough. This task should not
 start that broader extraction.
+
+Deferred follow-up:
+
+- `docs/backlogs/000092-refactor-memtree-compaction-policy.md` tracks retiring
+  the remaining MemTree `SpaceEstimation` policy after a separate compaction
+  design pass.

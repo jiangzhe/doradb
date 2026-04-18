@@ -1425,7 +1425,6 @@ impl BTreeNode {
 
     /// Returns the value for a known-valid slot.
     #[inline]
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(in crate::index) fn value_for_slot<V: BTreeValue>(&self, slot: &BTreeSlot) -> V {
         self.slot_value(slot)
     }
