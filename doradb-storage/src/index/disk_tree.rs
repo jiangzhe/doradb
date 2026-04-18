@@ -2061,6 +2061,31 @@ mod tests {
         ))
     }
 
+    fn metadata_with_varbyte_unique_index() -> Arc<TableMetadata> {
+        Arc::new(TableMetadata::new(
+            vec![ColumnSpec::new(
+                "c0",
+                ValKind::VarByte,
+                ColumnAttributes::empty(),
+            )],
+            vec![IndexSpec::new(
+                "idx_unique",
+                vec![IndexKey::new(0)],
+                IndexAttributes::UK,
+            )],
+        ))
+    }
+
+    fn long_varbyte_key(idx: u32) -> Vec<u8> {
+        const KEY_LEN: usize = 1024;
+        let mut key = vec![0u8; KEY_LEN];
+        key[..mem::size_of::<u32>()].copy_from_slice(&idx.to_be_bytes());
+        for (pos, byte) in key[mem::size_of::<u32>()..].iter_mut().enumerate() {
+            *byte = (idx as u8).wrapping_mul(31).wrapping_add(pos as u8);
+        }
+        key
+    }
+
     macro_rules! unique_runtime {
         ($metadata:ident, $disk_pool:ident) => {
             UniqueDiskTreeRuntime::new(
@@ -3283,7 +3308,7 @@ mod tests {
     fn test_disk_tree_rewrite_absorbs_immediate_right_sibling_without_extra_writes() {
         smol::block_on(async {
             let (_temp_dir, fs) = build_test_fs();
-            let metadata = metadata_with_indexes();
+            let metadata = metadata_with_varbyte_unique_index();
             let table = fs
                 .create_table_file(313, Arc::clone(&metadata), false)
                 .unwrap();
@@ -3297,9 +3322,12 @@ mod tests {
             let runtime = unique_runtime!(metadata, disk_pool);
             let tree = runtime.open(SUPER_BLOCK_ID, &guard);
 
-            const ENTRY_COUNT: u32 = 10_000;
+            // Long single-column keys make a small fixture produce multiple
+            // leaves, keeping this test focused on rewrite behavior rather
+            // than bulk-loading 10k short keys.
+            const ENTRY_COUNT: u32 = 192;
             let keys = (0..ENTRY_COUNT)
-                .map(|idx| [Val::from(idx)])
+                .map(|idx| [Val::from(long_varbyte_key(idx))])
                 .collect::<Vec<_>>();
             let encoded_keys = keys
                 .iter()
@@ -3328,8 +3356,8 @@ mod tests {
 
             let leaves = collect_leaf_blocks(&tree).await.unwrap();
             assert!(
-                leaves.len() >= 2,
-                "expected at least two leaves, got {}",
+                leaves.len() >= 3,
+                "expected at least three leaves, got {}",
                 leaves.len()
             );
             let anchor_idx = leaves.len() - 2;
@@ -3364,17 +3392,24 @@ mod tests {
             );
             let expected_writes = if rewritten_leaves.len() == 1 { 1 } else { 2 };
             assert_eq!(allocated_delta, expected_writes);
-            assert_eq!(
-                rewritten_tree
-                    .lookup_encoded(&kept_anchor_key)
-                    .await
-                    .unwrap(),
-                Some(*row_by_key.get(&kept_anchor_key).unwrap())
-            );
-            for key in right_keys {
+
+            let rewritten_key_set = rewritten_leaves
+                .iter()
+                .flat_map(|leaf| leaf.keys.iter())
+                .collect::<std::collections::BTreeSet<_>>();
+            for key in &right_keys {
+                assert!(
+                    rewritten_key_set.contains(key),
+                    "absorbed right sibling key should remain in the rewritten leaves"
+                );
+            }
+
+            let first_right_key = right_keys.first().unwrap();
+            let last_right_key = right_keys.last().unwrap();
+            for key in [&kept_anchor_key, first_right_key, last_right_key] {
                 assert_eq!(
-                    rewritten_tree.lookup_encoded(&key).await.unwrap(),
-                    Some(*row_by_key.get(&key).unwrap())
+                    rewritten_tree.lookup_encoded(key.as_slice()).await.unwrap(),
+                    Some(*row_by_key.get(key).unwrap())
                 );
             }
         });
