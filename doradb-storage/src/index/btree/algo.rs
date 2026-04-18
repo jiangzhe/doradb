@@ -6,7 +6,7 @@
 
 use crate::error::{Error, Result};
 use crate::index::btree::{
-    BTREE_NODE_USABLE_SIZE, BTreeNode, BTreeNodeBox, BTreeU64, BTreeValue, SpaceEstimation,
+    BTREE_NODE_USABLE_SIZE, BTreeNode, BTreeU64, BTreeValue, PackedNodeSpace, SpaceEstimation,
 };
 use crate::trx::TrxID;
 
@@ -65,7 +65,9 @@ pub(crate) fn packed_sibling_upper_fence<'a, V>(
 /// The upper fence is selected from the first unpacked entry's lower-fence key,
 /// so capacity checks run against the same fence bytes that will be persisted.
 /// `min_slots` protects callers such as branch packing that must consume at
-/// least one child slot whenever a following sibling remains.
+/// least one child slot whenever a following sibling remains. The split point
+/// is selected with a forward space estimator and the output node is initialized
+/// only once after the final fence is known.
 pub(crate) fn pack_sibling_node<'a, V>(
     node: &mut BTreeNode,
     params: PackedNodeParams<'a>,
@@ -79,7 +81,7 @@ where
     }
 
     let rightmost_count = entries.len();
-    if node_fits(params, None, entries, rightmost_count) {
+    if packed_node_fits::<V>(params.lower_fence, None, entries, rightmost_count) {
         return build_node(node, params, None, entries, rightmost_count);
     }
 
@@ -87,29 +89,13 @@ where
         return Err(Error::InvalidArgument);
     }
 
-    let mut lo = params.min_slots;
-    let mut hi = rightmost_count - 1;
-    let mut best = None;
-    while lo <= hi {
-        let mid = lo + (hi - lo) / 2;
-        let upper_fence = packed_sibling_upper_fence(entries, mid);
-        if node_fits(params, upper_fence, entries, mid) {
-            best = Some(mid);
-            lo = mid + 1;
-        } else if mid == 0 {
-            break;
-        } else {
-            hi = mid - 1;
-        }
-    }
-
-    let packed = best.ok_or(Error::InvalidArgument)?;
+    let packed = select_finite_packed_count::<V>(params.lower_fence, params.min_slots, entries)?;
     let upper_fence = packed_sibling_upper_fence(entries, packed);
     build_node(node, params, upper_fence, entries, packed)
 }
 
-fn node_fits<V>(
-    params: PackedNodeParams<'_>,
+fn packed_node_fits<V>(
+    lower_fence: &[u8],
     upper_fence: Option<&[u8]>,
     entries: &[PackedNodeEntry<'_, V>],
     count: usize,
@@ -118,25 +104,90 @@ where
     V: BTreeValue + Copy,
 {
     let upper_fence = upper_fence.unwrap_or(&[]);
-    if !fences_fit::<V>(params.lower_fence, upper_fence) {
+    if !fences_fit::<V>(lower_fence, upper_fence) {
         return false;
     }
-    let mut node = BTreeNodeBox::alloc(
-        params.height,
-        params.ts,
-        params.lower_fence,
-        params.lower_fence_value,
-        upper_fence,
-        params.hints_enabled,
-    );
-    entries[..count].iter().all(|entry| {
-        if !node.can_insert::<V>(entry.key) {
-            return false;
+    estimate_packed_node_space::<V>(lower_fence, upper_fence, &entries[..count])
+        .is_some_and(|space| space.total_space() <= BTREE_NODE_USABLE_SIZE)
+}
+
+fn select_finite_packed_count<V>(
+    lower_fence: &[u8],
+    min_slots: usize,
+    entries: &[PackedNodeEntry<'_, V>],
+) -> Result<usize>
+where
+    V: BTreeValue + Copy,
+{
+    // Prefix length can decrease as the candidate upper fence moves right.
+    // Recompute included-entry space only when that prefix changes; otherwise
+    // advance the estimate by the newly included previous upper fence.
+    let mut best = None;
+    let mut active_prefix_len = None;
+    let mut included_space = 0usize;
+    let mut included_count = 0usize;
+
+    for packed in min_slots..entries.len() {
+        let upper_fence = entries[packed].key;
+        let Some(space) = PackedNodeSpace::with_fences(lower_fence, upper_fence) else {
+            continue;
+        };
+        if !fences_fit::<V>(lower_fence, upper_fence) {
+            if space.prefix_is_inline() {
+                break;
+            }
+            continue;
         }
-        let idx = node.count();
-        node.insert_at::<V>(idx, entry.key, entry.value);
-        true
-    })
+        let prefix_len = space.prefix_len();
+        if active_prefix_len != Some(prefix_len) || included_count > packed {
+            included_space = entries[..packed]
+                .iter()
+                .try_fold(0usize, |total, entry| {
+                    let entry_space = PackedNodeSpace::entry_space::<V>(entry.key, prefix_len)?;
+                    total.checked_add(entry_space)
+                })
+                .ok_or(Error::InvalidArgument)?;
+            active_prefix_len = Some(prefix_len);
+            included_count = packed;
+        } else {
+            while included_count < packed {
+                let entry_space =
+                    PackedNodeSpace::entry_space::<V>(entries[included_count].key, prefix_len)
+                        .ok_or(Error::InvalidArgument)?;
+                included_space = included_space
+                    .checked_add(entry_space)
+                    .ok_or(Error::InvalidArgument)?;
+                included_count += 1;
+            }
+        }
+
+        let total_space = space
+            .total_space()
+            .checked_add(included_space)
+            .ok_or(Error::InvalidArgument)?;
+        if total_space <= BTREE_NODE_USABLE_SIZE {
+            best = Some(packed);
+        } else if space.prefix_is_inline() {
+            break;
+        }
+    }
+
+    best.ok_or(Error::InvalidArgument)
+}
+
+fn estimate_packed_node_space<V>(
+    lower_fence: &[u8],
+    upper_fence: &[u8],
+    entries: &[PackedNodeEntry<'_, V>],
+) -> Option<PackedNodeSpace>
+where
+    V: BTreeValue + Copy,
+{
+    let mut space = PackedNodeSpace::with_fences(lower_fence, upper_fence)?;
+    for entry in entries {
+        space.add_entry::<V>(entry.key)?;
+    }
+    Some(space)
 }
 
 fn build_node<'a, V>(
@@ -186,8 +237,53 @@ fn fences_fit<V: BTreeValue>(lower_fence: &[u8], upper_fence: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::index::btree::{BTREE_NODE_USABLE_SIZE, BTreeNil};
+    use crate::index::btree::{BTREE_NODE_USABLE_SIZE, BTreeNil, BTreeNodeBox};
     use crate::index::util::Maskable;
+
+    fn scratch_node_fits<V>(
+        lower_fence: &[u8],
+        upper_fence: Option<&[u8]>,
+        entries: &[PackedNodeEntry<'_, V>],
+        count: usize,
+    ) -> bool
+    where
+        V: BTreeValue + Copy,
+    {
+        let upper_fence = upper_fence.unwrap_or(&[]);
+        if !fences_fit::<V>(lower_fence, upper_fence) {
+            return false;
+        }
+        let mut node = BTreeNodeBox::alloc(
+            0,
+            1,
+            lower_fence,
+            BTreeU64::INVALID_VALUE,
+            upper_fence,
+            false,
+        );
+        entries[..count].iter().all(|entry| {
+            if !node.can_insert::<V>(entry.key) {
+                return false;
+            }
+            let idx = node.count();
+            node.insert_at::<V>(idx, entry.key, entry.value);
+            true
+        })
+    }
+
+    fn assert_estimate_matches_scratch<V>(
+        lower_fence: &[u8],
+        upper_fence: Option<&[u8]>,
+        entries: &[PackedNodeEntry<'_, V>],
+        count: usize,
+    ) where
+        V: BTreeValue + Copy,
+    {
+        assert_eq!(
+            packed_node_fits::<V>(lower_fence, upper_fence, entries, count),
+            scratch_node_fits::<V>(lower_fence, upper_fence, entries, count)
+        );
+    }
 
     #[test]
     fn test_packed_sibling_upper_fence_selects_next_lower_fence() {
@@ -207,6 +303,90 @@ mod tests {
             Some(b"abc2".as_slice())
         );
         assert_eq!(packed_sibling_upper_fence(&entries, 2), None);
+    }
+
+    #[test]
+    fn test_packed_node_estimate_matches_scratch_node() {
+        let u64_entries = [
+            PackedNodeEntry {
+                key: b"prefix-0001",
+                value: BTreeU64::from(1),
+            },
+            PackedNodeEntry {
+                key: b"prefix-0002",
+                value: BTreeU64::from(2),
+            },
+            PackedNodeEntry {
+                key: b"prefix-0003",
+                value: BTreeU64::from(3),
+            },
+        ];
+        assert_estimate_matches_scratch::<BTreeU64>(
+            b"prefix-0001",
+            None,
+            &u64_entries,
+            u64_entries.len(),
+        );
+        assert_estimate_matches_scratch::<BTreeU64>(
+            b"prefix-0001",
+            Some(b"prefix-0004"),
+            &u64_entries,
+            2,
+        );
+
+        let nil_entries = [
+            PackedNodeEntry {
+                key: b"nonunique-key-00000001",
+                value: BTreeNil,
+            },
+            PackedNodeEntry {
+                key: b"nonunique-key-00000002",
+                value: BTreeNil,
+            },
+        ];
+        assert_estimate_matches_scratch::<BTreeNil>(
+            b"nonunique-key-00000001",
+            Some(b"nonunique-key-00000003"),
+            &nil_entries,
+            nil_entries.len(),
+        );
+    }
+
+    #[test]
+    fn test_packed_node_estimate_tracks_prefix_shrink() {
+        let lower_fence = b"shared-prefix-long-0001";
+        let long_prefix_upper = b"shared-prefix-long-9999";
+        let inline_prefix_upper = b"shared-split";
+        let long_prefix_space =
+            PackedNodeSpace::with_fences(lower_fence, long_prefix_upper).unwrap();
+        let inline_prefix_space =
+            PackedNodeSpace::with_fences(lower_fence, inline_prefix_upper).unwrap();
+
+        assert!(!long_prefix_space.prefix_is_inline());
+        assert!(inline_prefix_space.prefix_is_inline());
+
+        let entries = [
+            PackedNodeEntry {
+                key: b"shared-prefix-long-0001",
+                value: BTreeU64::from(1),
+            },
+            PackedNodeEntry {
+                key: b"shared-prefix-long-0002",
+                value: BTreeU64::from(2),
+            },
+        ];
+        assert_estimate_matches_scratch::<BTreeU64>(
+            lower_fence,
+            Some(long_prefix_upper),
+            &entries,
+            entries.len(),
+        );
+        assert_estimate_matches_scratch::<BTreeU64>(
+            lower_fence,
+            Some(inline_prefix_upper),
+            &entries,
+            entries.len(),
+        );
     }
 
     #[test]

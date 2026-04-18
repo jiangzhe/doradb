@@ -1872,6 +1872,102 @@ pub(in crate::index) fn common_prefix_len(key1: &[u8], key2: &[u8]) -> usize {
     }
 }
 
+/// Exact space model for a freshly initialized packed `BTreeNode`.
+///
+/// `DiskTree` bulk packing chooses a node's lower and upper fences before slot
+/// insertion. This estimator mirrors that fresh-node layout: header space,
+/// optional common-prefix body space, long fence suffixes, and then each slot's
+/// slot/value/key-suffix bytes. It intentionally differs from
+/// `SpaceEstimation`, which remains a conservative merge-planning helper.
+#[derive(Debug, Clone, Copy)]
+pub(in crate::index) struct PackedNodeSpace {
+    prefix_len: usize,
+    total_space: usize,
+}
+
+impl PackedNodeSpace {
+    /// Initialize the estimate for a node with fixed lower and upper fences.
+    #[inline]
+    pub(in crate::index) fn with_fences(lower_fence: &[u8], upper_fence: &[u8]) -> Option<Self> {
+        if lower_fence.len() > u16::MAX as usize || upper_fence.len() > u16::MAX as usize {
+            return None;
+        }
+        let prefix_len = common_prefix_len(lower_fence, upper_fence);
+        let lower_suffix_len = lower_fence.len() - prefix_len;
+        let upper_suffix_len = upper_fence.len() - prefix_len;
+        let total_space = mem::size_of::<BTreeHeader>()
+            + common_prefix_body_space(prefix_len)
+            + key_suffix_body_space(lower_suffix_len)
+            + key_suffix_body_space(upper_suffix_len);
+        Some(PackedNodeSpace {
+            prefix_len,
+            total_space,
+        })
+    }
+
+    /// Common-prefix length shared by the fixed fences.
+    #[inline]
+    pub(in crate::index) fn prefix_len(&self) -> usize {
+        self.prefix_len
+    }
+
+    /// Whether future smaller prefixes can no longer free body prefix space.
+    #[inline]
+    pub(in crate::index) fn prefix_is_inline(&self) -> bool {
+        self.prefix_len <= INLINE_PREFIX_LEN
+    }
+
+    /// Current estimated total node space.
+    #[inline]
+    pub(in crate::index) fn total_space(&self) -> usize {
+        self.total_space
+    }
+
+    /// Add one slot entry using the estimator's fence-derived common prefix.
+    #[inline]
+    pub(in crate::index) fn add_entry<V: BTreeValue>(&mut self, key: &[u8]) -> Option<usize> {
+        let entry_space = Self::entry_space::<V>(key, self.prefix_len)?;
+        self.total_space = self.total_space.checked_add(entry_space)?;
+        Some(self.total_space)
+    }
+
+    /// Space needed by one slot entry under a known common-prefix length.
+    #[inline]
+    pub(in crate::index) fn entry_space<V: BTreeValue>(
+        key: &[u8],
+        prefix_len: usize,
+    ) -> Option<usize> {
+        if key.len() < prefix_len {
+            return None;
+        }
+        let suffix_len = key.len() - prefix_len;
+        if suffix_len > u16::MAX as usize {
+            return None;
+        }
+        mem::size_of::<BTreeSlot>()
+            .checked_add(V::ENCODED_LEN)?
+            .checked_add(key_suffix_body_space(suffix_len))
+    }
+}
+
+#[inline]
+fn common_prefix_body_space(prefix_len: usize) -> usize {
+    if prefix_len <= INLINE_PREFIX_LEN {
+        0
+    } else {
+        prefix_len
+    }
+}
+
+#[inline]
+fn key_suffix_body_space(suffix_len: usize) -> usize {
+    if suffix_len <= KEY_HEAD_LEN {
+        0
+    } else {
+        suffix_len
+    }
+}
+
 /// Estimate the space of one node after it absorbs another node's data.
 /// The bytes used is not very precise, we only consider lower fence of
 /// left node and upper fence of right node as fence keys of merged node.
