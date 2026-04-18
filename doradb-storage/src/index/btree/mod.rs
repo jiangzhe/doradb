@@ -1,3 +1,10 @@
+pub(crate) mod algo;
+mod hint;
+mod key;
+mod node;
+mod scan;
+mod value;
+
 use crate::buffer::PageID;
 use crate::buffer::guard::{
     ExclusiveLockStrategy, FacadePageGuard, LockStrategy, OptimisticLockStrategy,
@@ -7,11 +14,6 @@ use crate::buffer::{BufferPool, FixedBufferPool, PoolGuard};
 use crate::error::Validation;
 use crate::error::Validation::{Invalid, Valid};
 use crate::error::{Error, Result};
-use crate::index::btree_node::{
-    BTREE_NODE_USABLE_SIZE, BTreeNode, BTreeNodeBox, LookupChild, SpaceEstimation,
-};
-use crate::index::btree_scan::{BTreePrefixScan, BTreeSlotCallback};
-use crate::index::btree_value::{BTreeU64, BTreeValue};
 use crate::index::util::{Maskable, ParentPosition, SpaceStatistics};
 use crate::latch::LatchFallbackMode;
 use crate::quiescent::QuiescentGuard;
@@ -19,6 +21,12 @@ use crate::trx::TrxID;
 use either::Either;
 use std::marker::PhantomData;
 use std::sync::atomic::{AtomicUsize, Ordering};
+
+pub(crate) use hint::*;
+pub use key::*;
+pub use node::*;
+pub use scan::*;
+pub use value::*;
 
 pub type SharedStrategy = SharedLockStrategy<BTreeNode>;
 pub type ExclusiveStrategy = ExclusiveLockStrategy<BTreeNode>;

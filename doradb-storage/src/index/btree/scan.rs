@@ -1,8 +1,8 @@
 use crate::buffer::guard::PageGuard;
 use crate::buffer::{BufferPool, PoolGuard};
 use crate::error::Result;
+use crate::index::btree::{BTreeNode, BTreeSlot};
 use crate::index::btree::{BTreeNodeCursor, GenericBTree};
-use crate::index::btree_node::{BTreeNode, BTreeSlot};
 use std::ops::{Deref, DerefMut};
 
 /// Abstraction on processing B-Tree slot.
@@ -149,7 +149,7 @@ mod tests {
     use crate::buffer::FixedBufferPool;
     use crate::error::Error;
     use crate::index::btree::BTree;
-    use crate::index::btree_value::BTreeU64;
+    use crate::index::btree::BTreeU64;
     use crate::quiescent::QuiescentBox;
     use rand::prelude::IndexedRandom;
     use std::collections::HashMap;

@@ -18,9 +18,10 @@ use crate::error::{BlockCorruptionCause, BlockKind, Error, FileKind, Result};
 use crate::file::SparseFile;
 use crate::file::block_integrity::{validate_block_checksum, write_block_checksum};
 use crate::file::cow_file::{BlockID, COW_FILE_PAGE_SIZE, MutableCowFile, SUPER_BLOCK_ID};
-use crate::index::btree_key::BTreeKeyEncoder;
-use crate::index::btree_node::{BTREE_NODE_USABLE_SIZE, BTreeNode, LookupChild};
-use crate::index::btree_value::{BTreeNil, BTreeU64, BTreeValue, BTreeValuePackable};
+use crate::index::btree::BTreeKeyEncoder;
+use crate::index::btree::algo::{PackedNodeEntry, PackedNodeParams, pack_sibling_node};
+use crate::index::btree::{BTREE_NODE_USABLE_SIZE, BTreeNode, LookupChild};
+use crate::index::btree::{BTreeNil, BTreeU64, BTreeValue, BTreeValuePackable};
 use crate::index::util::Maskable;
 use crate::io::DirectBuf;
 use crate::quiescent::QuiescentGuard;
@@ -1274,52 +1275,41 @@ impl<'a, F: DiskTreeSpec> DiskTree<'a, F> {
         entries: &[LogicalEntry],
         create_ts: u64,
     ) -> Result<Vec<BranchEntry>> {
+        let slot_entries = entries
+            .iter()
+            .map(|entry| {
+                Ok(PackedNodeEntry {
+                    key: entry.key.as_slice(),
+                    value: F::leaf_value(entry)?,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
         let mut branch_entries = Vec::new();
         let mut start = 0usize;
         while start < entries.len() {
             let mut buf = DirectBuf::zeroed(DISK_TREE_BLOCK_SIZE);
-            let (end, effective_space) = {
+            let result = {
                 let node = btree_node_from_block_mut(buf.data_mut())?;
-                // The first logical key becomes the leaf lower fence. Leaf
-                // values follow the tree spec: row-id owners or zero-width nils.
-                node.init(
-                    0,
-                    create_ts,
-                    &entries[start].key,
-                    BTreeU64::INVALID_VALUE,
-                    &[],
-                    true,
-                );
-                let mut end = start;
-                while end < entries.len() {
-                    // Stop before exceeding the shared BTreeNode slot/KV area;
-                    // the outer loop starts a new leaf at the same entry.
-                    if !node.can_insert::<F::LeafValue>(&entries[end].key) {
-                        break;
-                    }
-                    let idx = node.count();
-                    node.insert_at::<F::LeafValue>(
-                        idx,
-                        &entries[end].key,
-                        F::leaf_value(&entries[end])?,
-                    );
-                    end += 1;
-                }
-                // Hints must match the final slot set before checksum/write.
-                node.update_hints();
-                (end, node.effective_space())
+                pack_sibling_node(
+                    node,
+                    PackedNodeParams {
+                        height: 0,
+                        ts: create_ts,
+                        lower_fence: &entries[start].key,
+                        lower_fence_value: BTreeU64::INVALID_VALUE,
+                        min_slots: 1,
+                        hints_enabled: true,
+                    },
+                    &slot_entries[start..],
+                )?
             };
-            if end == start {
-                // The lower fence itself should always fit in an empty node.
-                // Failing to make progress means the entry is too large.
-                return Err(Error::InvalidArgument);
-            }
+            let end = start + result.packed;
             let block_id = mutable_file.allocate_block_id()?;
             self.write_node_block(mutable_file, block_id, buf).await?;
             branch_entries.push(BranchEntry::rewritten_leaf(
                 entries[start].key.clone(),
                 block_id,
-                effective_space,
+                result.effective_space,
                 entries[start..end].to_vec(),
             ));
             start = end;
@@ -1344,6 +1334,18 @@ impl<'a, F: DiskTreeSpec> DiskTree<'a, F> {
         if height == 0 {
             return Err(Error::InvalidArgument);
         }
+        let slot_entries = entries
+            .iter()
+            .map(|entry| {
+                if entry.block_id == SUPER_BLOCK_ID {
+                    return Err(Error::InvalidArgument);
+                }
+                Ok(PackedNodeEntry {
+                    key: entry.key.as_slice(),
+                    value: BTreeU64::from(entry.block_id.as_u64()),
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
         let mut parent_entries = Vec::new();
         let mut start = 0usize;
         while start < entries.len() {
@@ -1354,54 +1356,29 @@ impl<'a, F: DiskTreeSpec> DiskTree<'a, F> {
                 return Err(Error::InvalidArgument);
             }
             let mut buf = DirectBuf::zeroed(DISK_TREE_BLOCK_SIZE);
-            let (end, effective_space) = {
+            let result = {
                 let node = btree_node_from_block_mut(buf.data_mut())?;
-                // Store the first child in the lower fence and subsequent
-                // children as branch slots keyed by their lower fences.
-                node.init(
-                    height,
-                    create_ts,
-                    &first.key,
-                    BTreeU64::from(first.block_id.as_u64()),
-                    &[],
-                    true,
-                );
-                let mut end = start + 1;
-                while end < entries.len() {
-                    if entries[end].block_id == SUPER_BLOCK_ID {
-                        // The empty-root sentinel cannot appear inside a branch
-                        // fanout list either.
-                        return Err(Error::InvalidArgument);
-                    }
-                    // Start another branch block once this node cannot accept
-                    // the next child fence and block-id value.
-                    if !node.can_insert::<BTreeU64>(&entries[end].key) {
-                        break;
-                    }
-                    let idx = node.count();
-                    node.insert_at::<BTreeU64>(
-                        idx,
-                        &entries[end].key,
-                        BTreeU64::from(entries[end].block_id.as_u64()),
-                    );
-                    end += 1;
-                }
-                // Branch search hints are persisted as part of the node image.
-                node.update_hints();
-                (end, node.effective_space())
+                pack_sibling_node(
+                    node,
+                    PackedNodeParams {
+                        height,
+                        ts: create_ts,
+                        lower_fence: &first.key,
+                        lower_fence_value: BTreeU64::from(first.block_id.as_u64()),
+                        min_slots: usize::from(start + 1 < entries.len()),
+                        hints_enabled: true,
+                    },
+                    &slot_entries[start + 1..],
+                )?
             };
-            if end == start + 1 && end < entries.len() {
-                // If a branch cannot fit even one slot after the lower fence, a
-                // higher level cannot make progress with this layout.
-                return Err(Error::InvalidArgument);
-            }
+            let end = start + 1 + result.packed;
             let block_id = mutable_file.allocate_block_id()?;
             self.write_node_block(mutable_file, block_id, buf).await?;
             parent_entries.push(BranchEntry::rewritten_branch(
                 first.key.clone(),
                 block_id,
                 height,
-                effective_space,
+                result.effective_space,
                 entries[start..end].to_vec(),
             ));
             start = end;
@@ -1922,6 +1899,52 @@ mod tests {
         };
     }
 
+    #[derive(Debug)]
+    struct NodeSummary {
+        is_leaf: bool,
+        height: usize,
+        has_upper_fence: bool,
+        common_prefix_len: usize,
+    }
+
+    async fn collect_node_summaries<F: DiskTreeSpec>(
+        tree: &DiskTree<'_, F>,
+    ) -> Result<Vec<NodeSummary>> {
+        if tree.root_block_id == SUPER_BLOCK_ID {
+            return Ok(Vec::new());
+        }
+        let mut summaries = Vec::new();
+        let mut stack = vec![tree.root_block_id];
+        while let Some(block_id) = stack.pop() {
+            let guard = tree.read_node(block_id).await?;
+            let node = guard.node();
+            let child_entries = if node.is_leaf() {
+                None
+            } else {
+                Some(branch_entries_from_node(node, tree.file_kind(), block_id)?)
+            };
+            summaries.push(NodeSummary {
+                is_leaf: node.is_leaf(),
+                height: node.height(),
+                has_upper_fence: !node.has_no_upper_fence(),
+                common_prefix_len: node.common_prefix().len(),
+            });
+            drop(guard);
+            if let Some(child_entries) = child_entries {
+                for entry in child_entries.into_iter().rev() {
+                    stack.push(entry.block_id);
+                }
+            }
+        }
+        Ok(summaries)
+    }
+
+    fn long_encoded_key(idx: usize) -> Vec<u8> {
+        let mut key = format!("branch-prefix-{idx:06}-").into_bytes();
+        key.resize(4096, b'x');
+        key
+    }
+
     #[test]
     fn test_empty_unique_root_reads_empty() {
         smol::block_on(async {
@@ -2042,6 +2065,172 @@ mod tests {
             assert_eq!(new_tree.lookup(&key2).await.unwrap(), None);
             assert_eq!(tree.lookup(&key2).await.unwrap(), Some(20));
             assert!(mutable.root().gc_block_list.is_empty());
+        });
+    }
+
+    #[test]
+    fn test_unique_disk_tree_leaf_fences_enable_common_prefix() {
+        smol::block_on(async {
+            let (_temp_dir, fs) = build_test_fs();
+            let metadata = metadata_with_indexes();
+            let table = fs
+                .create_table_file(310, Arc::clone(&metadata), false)
+                .unwrap();
+            let (table, old_root) = table.commit(1, false).await.unwrap();
+            drop(old_root);
+            let global = global_readonly_pool_scope(64 * 1024 * 1024);
+            let disk_pool = table_readonly_pool(&global, 310, &table);
+            let guard = disk_pool.pool_guard();
+            let mut mutable =
+                crate::file::table_file::MutableTableFile::fork(&table, fs.background_writes());
+            let runtime = unique_runtime!(metadata, disk_pool);
+            let tree = runtime.open(SUPER_BLOCK_ID, &guard);
+
+            const ENTRY_COUNT: u32 = 10_000;
+            let keys = (0..ENTRY_COUNT)
+                .map(|idx| [Val::from(0x1234_0000u32 + idx)])
+                .collect::<Vec<_>>();
+            let puts = keys
+                .iter()
+                .enumerate()
+                .map(|(idx, key)| UniqueDiskTreePut {
+                    key,
+                    row_id: idx as RowID + 100,
+                })
+                .collect::<Vec<_>>();
+            let mut writer = tree.batch_writer(&mut mutable, 2);
+            writer.batch_put(&puts).unwrap();
+            let root = writer.finish().await.unwrap();
+            let tree = runtime.open(root, &guard);
+
+            let summaries = collect_node_summaries(&tree).await.unwrap();
+            assert!(summaries.iter().any(|summary| {
+                summary.is_leaf && summary.has_upper_fence && summary.common_prefix_len > 0
+            }));
+            assert_eq!(tree.lookup(&keys[0]).await.unwrap(), Some(100));
+            assert_eq!(tree.lookup(&keys[4096]).await.unwrap(), Some(4196));
+            assert_eq!(
+                tree.lookup(&keys[ENTRY_COUNT as usize - 1]).await.unwrap(),
+                Some(ENTRY_COUNT as RowID + 99)
+            );
+
+            let scanned = tree.scan_entries().await.unwrap();
+            assert_eq!(scanned.len(), ENTRY_COUNT as usize);
+            assert!(scanned.windows(2).all(|pair| pair[0].0 < pair[1].0));
+
+            let mut writer = tree.batch_writer(&mut mutable, 3);
+            writer
+                .batch_conditional_delete(&[
+                    UniqueDiskTreeDelete {
+                        key: &keys[4096],
+                        expected_old_row_id: 4196,
+                    },
+                    UniqueDiskTreeDelete {
+                        key: &keys[8192],
+                        expected_old_row_id: 8292,
+                    },
+                ])
+                .unwrap();
+            let rewritten_root = writer.finish().await.unwrap();
+            let rewritten_tree = runtime.open(rewritten_root, &guard);
+            assert_eq!(rewritten_tree.lookup(&keys[4096]).await.unwrap(), None);
+            assert_eq!(rewritten_tree.lookup(&keys[8192]).await.unwrap(), None);
+            assert_eq!(tree.lookup(&keys[4096]).await.unwrap(), Some(4196));
+            assert_eq!(tree.lookup(&keys[8192]).await.unwrap(), Some(8292));
+            assert!(mutable.root().gc_block_list.is_empty());
+        });
+    }
+
+    #[test]
+    fn test_non_unique_disk_tree_prefix_scan_crosses_finite_fence_leaves() {
+        smol::block_on(async {
+            let (_temp_dir, fs) = build_test_fs();
+            let metadata = metadata_with_indexes();
+            let table = fs
+                .create_table_file(311, Arc::clone(&metadata), false)
+                .unwrap();
+            let (table, old_root) = table.commit(1, false).await.unwrap();
+            drop(old_root);
+            let global = global_readonly_pool_scope(64 * 1024 * 1024);
+            let disk_pool = table_readonly_pool(&global, 311, &table);
+            let guard = disk_pool.pool_guard();
+            let mut mutable =
+                crate::file::table_file::MutableTableFile::fork(&table, fs.background_writes());
+            let runtime = non_unique_runtime!(metadata, disk_pool);
+            let tree = runtime.open(SUPER_BLOCK_ID, &guard);
+
+            const ENTRY_COUNT: usize = 10_000;
+            let key = [Val::from(0x1234_5678u32)];
+            let entries = (0..ENTRY_COUNT)
+                .map(|idx| NonUniqueDiskTreeExact {
+                    key: &key,
+                    row_id: idx as RowID + 1_000,
+                })
+                .collect::<Vec<_>>();
+            let mut writer = tree.batch_writer(&mut mutable, 2);
+            writer.batch_insert(&entries).unwrap();
+            let root = writer.finish().await.unwrap();
+            let tree = runtime.open(root, &guard);
+
+            let summaries = collect_node_summaries(&tree).await.unwrap();
+            assert!(summaries.iter().any(|summary| {
+                summary.is_leaf && summary.has_upper_fence && summary.common_prefix_len > 0
+            }));
+            let rows = tree.prefix_scan(&key).await.unwrap();
+            assert_eq!(rows.len(), ENTRY_COUNT);
+            assert_eq!(rows.first().copied(), Some(1_000));
+            assert_eq!(rows.last().copied(), Some(ENTRY_COUNT as RowID + 999));
+            assert!(rows.windows(2).all(|pair| pair[0] < pair[1]));
+        });
+    }
+
+    #[test]
+    fn test_disk_tree_branch_fences_enable_common_prefix() {
+        smol::block_on(async {
+            let (_temp_dir, fs) = build_test_fs();
+            let metadata = metadata_with_indexes();
+            let table = fs
+                .create_table_file(312, Arc::clone(&metadata), false)
+                .unwrap();
+            let (table, old_root) = table.commit(1, false).await.unwrap();
+            drop(old_root);
+            let global = global_readonly_pool_scope(64 * 1024 * 1024);
+            let disk_pool = table_readonly_pool(&global, 312, &table);
+            let guard = disk_pool.pool_guard();
+            let mut mutable =
+                crate::file::table_file::MutableTableFile::fork(&table, fs.background_writes());
+            let runtime = unique_runtime!(metadata, disk_pool);
+            let tree = runtime.open(SUPER_BLOCK_ID, &guard);
+
+            const ENTRY_COUNT: usize = 400;
+            let keys = (0..ENTRY_COUNT).map(long_encoded_key).collect::<Vec<_>>();
+            let puts = keys
+                .iter()
+                .enumerate()
+                .map(|(idx, key)| UniqueDiskTreeEncodedPut {
+                    key,
+                    row_id: idx as RowID + 5_000,
+                })
+                .collect::<Vec<_>>();
+            let mut writer = tree.batch_writer(&mut mutable, 2);
+            writer.batch_put_encoded(&puts).unwrap();
+            let root = writer.finish().await.unwrap();
+            let tree = runtime.open(root, &guard);
+
+            let summaries = collect_node_summaries(&tree).await.unwrap();
+            assert!(summaries.iter().any(|summary| summary.height >= 2));
+            assert!(summaries.iter().any(|summary| {
+                !summary.is_leaf && summary.has_upper_fence && summary.common_prefix_len > 0
+            }));
+            for idx in [0usize, 127, 255, 399] {
+                assert_eq!(
+                    tree.lookup_encoded(&keys[idx]).await.unwrap(),
+                    Some(idx as RowID + 5_000)
+                );
+            }
+            let scanned = tree.scan_entries().await.unwrap();
+            assert_eq!(scanned.len(), ENTRY_COUNT);
+            assert!(scanned.windows(2).all(|pair| pair[0].0 < pair[1].0));
         });
     }
 

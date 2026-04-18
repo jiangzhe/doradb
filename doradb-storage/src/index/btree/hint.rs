@@ -1,4 +1,4 @@
-use crate::index::btree_node::KeyHeadInt;
+use crate::index::btree::KeyHeadInt;
 use bytemuck::{Pod, Zeroable};
 
 pub const BTREE_HINTS_LEN: usize = 8;

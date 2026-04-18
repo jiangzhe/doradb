@@ -881,7 +881,7 @@ mod tests {
     use crate::file::cow_file::SUPER_BLOCK_ID;
     use crate::file::table_file::{MutableTableFile, TableFile};
     use crate::index::btree::BTree;
-    use crate::index::btree_key::BTreeKeyEncoder;
+    use crate::index::btree::BTreeKeyEncoder;
     use crate::index::disk_tree::{NonUniqueDiskTreeExact, UniqueDiskTreePut};
     use crate::quiescent::QuiescentBox;
     use crate::value::{ValKind, ValType};

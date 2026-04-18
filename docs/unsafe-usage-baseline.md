@@ -1,6 +1,6 @@
 # Unsafe Usage Baseline
 
-- Generated on: `2026-04-17`
+- Generated on: `2026-04-18`
 - Command: `tools/unsafe_inventory.rs`
 - Scope: `doradb-storage/src/{buffer,latch,row,index,io,trx,lwc,file}`
 
@@ -11,12 +11,12 @@
 | buffer | 13 | 52 | 0 | 0 | 0 | 46 |
 | latch | 4 | 40 | 0 | 0 | 0 | 36 |
 | row | 3 | 5 | 0 | 0 | 0 | 5 |
-| index | 18 | 11 | 0 | 0 | 3 | 5 |
+| index | 19 | 11 | 0 | 0 | 3 | 5 |
 | io | 7 | 20 | 0 | 0 | 1 | 15 |
 | trx | 14 | 5 | 0 | 0 | 0 | 5 |
 | lwc | 2 | 2 | 0 | 0 | 0 | 2 |
 | file | 8 | 12 | 0 | 0 | 2 | 12 |
-| **total** | **69** | **147** | **0** | **0** | **6** | **126** |
+| **total** | **70** | **147** | **0** | **0** | **6** | **126** |
 
 ## File Hotspots (top 40)
 
@@ -30,7 +30,7 @@
 | `doradb-storage/src/buffer/arena.rs` | buffer | 8 | 8 |
 | `doradb-storage/src/file/mod.rs` | file | 8 | 8 |
 | `doradb-storage/src/buffer/evict.rs` | buffer | 7 | 7 |
-| `doradb-storage/src/index/btree_hint.rs` | index | 6 | 0 |
+| `doradb-storage/src/index/btree/hint.rs` | index | 6 | 0 |
 | `doradb-storage/src/latch/hybrid.rs` | latch | 6 | 6 |
 | `doradb-storage/src/buffer/readonly.rs` | buffer | 5 | 5 |
 | `doradb-storage/src/row/mod.rs` | row | 5 | 5 |
@@ -44,7 +44,7 @@
 | `doradb-storage/src/io/libaio_abi.rs` | io | 2 | 1 |
 | `doradb-storage/src/lwc/block.rs` | lwc | 2 | 2 |
 | `doradb-storage/src/buffer/page.rs` | buffer | 1 | 1 |
-| `doradb-storage/src/index/btree_node.rs` | index | 1 | 1 |
+| `doradb-storage/src/index/btree/node.rs` | index | 1 | 1 |
 | `doradb-storage/src/index/column_block_index.rs` | index | 1 | 1 |
 | `doradb-storage/src/io/iouring_backend.rs` | io | 1 | 1 |
 | `doradb-storage/src/trx/log_replay.rs` | trx | 1 | 1 |
@@ -54,6 +54,6 @@
 | file | module | transmute | new_unchecked | assume_init | total |
 |---|---|---:|---:|---:|---:|
 | `doradb-storage/src/file/mod.rs` | file | 0 | 0 | 2 | 2 |
-| `doradb-storage/src/index/btree_node.rs` | index | 0 | 0 | 2 | 2 |
+| `doradb-storage/src/index/btree/node.rs` | index | 0 | 0 | 2 | 2 |
 | `doradb-storage/src/index/column_block_index.rs` | index | 0 | 0 | 1 | 1 |
 | `doradb-storage/src/io/mod.rs` | io | 0 | 0 | 1 | 1 |
