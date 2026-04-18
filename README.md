@@ -3,7 +3,7 @@
 ![build](https://github.com/jiangzhe/doradb/actions/workflows/build.yml/badge.svg)
 ![codecov](https://codecov.io/gh/jiangzhe/doradb/branch/main/graph/badge.svg?token=T3RMZE2998)
 
-DoraDB is an attempt to build a fast storage engine in Rust from scratch.
+DoraDB is an attempt to build a modern and fast storage engine in Rust from scratch.
 It is work in progress.
 
 ## Goal
@@ -24,9 +24,9 @@ The storage engine is designed as a hybrid engine with both in-memory row store 
 - [Block Index](./docs/block-index.md)
 - [Secondary Index](./docs/secondary-index.md)
 - [Checkpoint and Recovery](./docs/checkpoint-and-recovery.md)
-- [Table File](./docs/table-file.md)
 - [Data Checkpoint](./docs/data-checkpoint.md)
 - [Deletion Checkpoint](./docs/deletion-checkpoint.md)
+- [Table File](./docs/table-file.md)
 - [Buffer Pool](./docs/buffer-pool.md)
 
 Above documents describe the core design of this engine. Most parts are update-to-date.
@@ -35,17 +35,12 @@ I'm glad to have discussions if someone is interested in details.
 
 ## Code Structure
 
-I will only focus on [doradb-storage](./doradb-storage) for a long time. 
-And other modules will be left as is for a long time.
-
-Code structure of storage engine:
-
 - [buffer](./doradb-storage/src/buffer): Buffer pool implementation with async direct IO.
 - [catalog](./doradb-storage/src/catalog): Catalog of storage engine.
 - [compression](./doradb-storage/src/compression): Compression algorithms for column store.
 - [file](./doradb-storage/src/file): Storage of table data, index and delete bitmap. The file is page based and organized as CoW B+Tree, to enable simple recovery and fast access.
 - [index](./doradb-storage/src/index): Block index and B+Tree index.
-- [io](./doradb-storage/src/io): Async direct IO system with compile-time-selected `libaio` and `io_uring` backends. `libaio` remains the default.
+- [io](./doradb-storage/src/io): Async direct IO system with compile-time-selected `libaio` and `io_uring` backends, by default `io_uring`.
 - [latch](./doradb-storage/src/latch): Async latch primitives including Mutex, RWLock and HybridLatch(enhanced RWLock with optimistic mode).
 - [lwc](./doradb-storage/src/lwc): LightWeight Columnar format for on-disk warm data.
 - [row](./doradb-storage/src/row): In-memory row store and operations.
@@ -55,7 +50,7 @@ Code structure of storage engine:
 
 ## Document-Driven AI Development Flow
 
-Current devlopment is driven by document, and implemneted by code agent.
+Current devlopment is heavily driven by document, and implemneted by code agent.
 Every task assigned to agent has one associated task document located in `docs/tasks`.
 Larger features/refactors require RFC document inside `docs/rfcs`.
 Deferred tasks are put in `docs/backlogs`.
