@@ -881,8 +881,10 @@ mod tests {
     use crate::file::cow_file::SUPER_BLOCK_ID;
     use crate::file::table_file::{MutableTableFile, TableFile};
     use crate::index::btree::BTree;
-    use crate::index::btree_key::BTreeKeyEncoder;
-    use crate::index::disk_tree::{NonUniqueDiskTreeExact, UniqueDiskTreePut};
+    use crate::index::btree::BTreeKeyEncoder;
+    use crate::index::disk_tree::{
+        NonUniqueDiskTree, NonUniqueDiskTreeEncodedExact, UniqueDiskTreeEncodedPut,
+    };
     use crate::quiescent::QuiescentBox;
     use crate::value::{ValKind, ValType};
 
@@ -931,6 +933,69 @@ mod tests {
                 ValType::new(ValKind::U64, false),
             ]),
         )
+    }
+
+    struct UniqueDiskTreePut<'a> {
+        key: &'a [Val],
+        row_id: RowID,
+    }
+
+    struct NonUniqueDiskTreeExact<'a> {
+        key: &'a [Val],
+        row_id: RowID,
+    }
+
+    async fn non_unique_disk_tree_prefix_scan_rows(
+        tree: &NonUniqueDiskTree<'_>,
+        key: &[Val],
+    ) -> Result<Vec<RowID>> {
+        Ok(tree
+            .prefix_scan_entries(key)
+            .await?
+            .into_iter()
+            .map(|(_, row_id)| row_id)
+            .collect())
+    }
+
+    fn encode_unique_puts(entries: &[UniqueDiskTreePut<'_>]) -> Vec<(Vec<u8>, RowID)> {
+        let encoder = BTreeKeyEncoder::new(vec![ValType::new(ValKind::U32, false)]);
+        entries
+            .iter()
+            .map(|entry| (encoder.encode(entry.key).as_bytes().to_vec(), entry.row_id))
+            .collect()
+    }
+
+    fn unique_put_refs(encoded: &[(Vec<u8>, RowID)]) -> Vec<UniqueDiskTreeEncodedPut<'_>> {
+        encoded
+            .iter()
+            .map(|(key, row_id)| UniqueDiskTreeEncodedPut {
+                key,
+                row_id: *row_id,
+            })
+            .collect()
+    }
+
+    fn encode_non_unique_exact(entries: &[NonUniqueDiskTreeExact<'_>]) -> Vec<Vec<u8>> {
+        let encoder = BTreeKeyEncoder::new(vec![
+            ValType::new(ValKind::U32, false),
+            ValType::new(ValKind::U64, false),
+        ]);
+        entries
+            .iter()
+            .map(|entry| {
+                encoder
+                    .encode_pair(entry.key, Val::from(entry.row_id))
+                    .as_bytes()
+                    .to_vec()
+            })
+            .collect()
+    }
+
+    fn non_unique_exact_refs(encoded: &[Vec<u8>]) -> Vec<NonUniqueDiskTreeEncodedExact<'_>> {
+        encoded
+            .iter()
+            .map(|key| NonUniqueDiskTreeEncodedExact { key })
+            .collect()
     }
 
     async fn publish_secondary_root(
@@ -999,25 +1064,27 @@ mod tests {
             let key5 = [Val::from(5u32)];
             let key6 = [Val::from(6u32)];
             let mut writer = disk.batch_writer(&mut mutable, 2);
+            let puts = [
+                UniqueDiskTreePut {
+                    key: &key1,
+                    row_id: 10,
+                },
+                UniqueDiskTreePut {
+                    key: &key2,
+                    row_id: 20,
+                },
+                UniqueDiskTreePut {
+                    key: &key3,
+                    row_id: 30,
+                },
+                UniqueDiskTreePut {
+                    key: &key4,
+                    row_id: 40,
+                },
+            ];
+            let encoded_puts = encode_unique_puts(&puts);
             writer
-                .batch_put(&[
-                    UniqueDiskTreePut {
-                        key: &key1,
-                        row_id: 10,
-                    },
-                    UniqueDiskTreePut {
-                        key: &key2,
-                        row_id: 20,
-                    },
-                    UniqueDiskTreePut {
-                        key: &key3,
-                        row_id: 30,
-                    },
-                    UniqueDiskTreePut {
-                        key: &key4,
-                        row_id: 40,
-                    },
-                ])
+                .batch_put_encoded(&unique_put_refs(&encoded_puts))
                 .unwrap();
             let root = writer.finish().await.unwrap();
             let table = publish_secondary_root(mutable, 0, root, 2).await;
@@ -1161,11 +1228,13 @@ mod tests {
             let disk = disk_runtime.open(SUPER_BLOCK_ID, &disk_guard);
             let root_a = {
                 let mut writer = disk.batch_writer(&mut mutable, 2);
+                let puts = [UniqueDiskTreePut {
+                    key: &key1,
+                    row_id: 10,
+                }];
+                let encoded_puts = encode_unique_puts(&puts);
                 writer
-                    .batch_put(&[UniqueDiskTreePut {
-                        key: &key1,
-                        row_id: 10,
-                    }])
+                    .batch_put_encoded(&unique_put_refs(&encoded_puts))
                     .unwrap();
                 writer.finish().await.unwrap()
             };
@@ -1188,11 +1257,13 @@ mod tests {
             let disk = disk_runtime.open(root_a, &disk_guard);
             let root_b = {
                 let mut writer = disk.batch_writer(&mut mutable, 3);
+                let puts = [UniqueDiskTreePut {
+                    key: &key2,
+                    row_id: 20,
+                }];
+                let encoded_puts = encode_unique_puts(&puts);
                 writer
-                    .batch_put(&[UniqueDiskTreePut {
-                        key: &key2,
-                        row_id: 20,
-                    }])
+                    .batch_put_encoded(&unique_put_refs(&encoded_puts))
                     .unwrap();
                 writer.finish().await.unwrap()
             };
@@ -1231,25 +1302,27 @@ mod tests {
             let key2 = [Val::from(2u32)];
             let key3 = [Val::from(3u32)];
             let mut writer = disk.batch_writer(&mut mutable, 2);
+            let entries = [
+                NonUniqueDiskTreeExact {
+                    key: &key1,
+                    row_id: 10,
+                },
+                NonUniqueDiskTreeExact {
+                    key: &key1,
+                    row_id: 11,
+                },
+                NonUniqueDiskTreeExact {
+                    key: &key2,
+                    row_id: 20,
+                },
+                NonUniqueDiskTreeExact {
+                    key: &key3,
+                    row_id: 30,
+                },
+            ];
+            let encoded_entries = encode_non_unique_exact(&entries);
             writer
-                .batch_insert(&[
-                    NonUniqueDiskTreeExact {
-                        key: &key1,
-                        row_id: 10,
-                    },
-                    NonUniqueDiskTreeExact {
-                        key: &key1,
-                        row_id: 11,
-                    },
-                    NonUniqueDiskTreeExact {
-                        key: &key2,
-                        row_id: 20,
-                    },
-                    NonUniqueDiskTreeExact {
-                        key: &key3,
-                        row_id: 30,
-                    },
-                ])
+                .batch_insert_encoded(&non_unique_exact_refs(&encoded_entries))
                 .unwrap();
             let root = writer.finish().await.unwrap();
             let table = publish_secondary_root(mutable, 1, root, 2).await;
@@ -1365,10 +1438,17 @@ mod tests {
 
             let unchanged_disk = disk_runtime.open(root, &disk_guard);
             assert_eq!(
-                unchanged_disk.prefix_scan(&key1).await.unwrap(),
+                non_unique_disk_tree_prefix_scan_rows(&unchanged_disk, &key1)
+                    .await
+                    .unwrap(),
                 vec![10, 11]
             );
-            assert_eq!(unchanged_disk.prefix_scan(&key2).await.unwrap(), vec![20]);
+            assert_eq!(
+                non_unique_disk_tree_prefix_scan_rows(&unchanged_disk, &key2)
+                    .await
+                    .unwrap(),
+                vec![20]
+            );
         });
     }
 

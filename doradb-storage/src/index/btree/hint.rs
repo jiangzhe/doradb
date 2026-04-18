@@ -1,4 +1,4 @@
-use crate::index::btree_node::KeyHeadInt;
+use crate::index::btree::KeyHeadInt;
 use bytemuck::{Pod, Zeroable};
 
 pub const BTREE_HINTS_LEN: usize = 8;
@@ -86,7 +86,7 @@ unsafe fn search_hints_avx2(hints: &[u32; 8], key_head: u32) -> (usize, usize) {
 }
 
 /// Search hints fallback method.
-#[allow(dead_code)]
+#[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
 #[inline]
 fn search_hints_scalar(hints: &[u32; 8], key_head: u32) -> (usize, usize) {
     let i = hints.partition_point(|&h| h < key_head);
@@ -117,6 +117,7 @@ mod tests {
         }
     }
 
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
     #[test]
     fn test_btree_search_hints_scalar() {
         let hints = [100, 200, 300, 400, 500, 600, 700, 800];
@@ -143,8 +144,8 @@ mod tests {
             2202962944,
         ];
         let head = 2202603776u32;
-        let res1 = search_hints_scalar(&hints, head);
-        println!("scalar res={:?}", res1);
+        let res1 = expected_search_hints(&hints, head);
+        println!("expected res={:?}", res1);
         let res2 = unsafe { search_hints_avx2(&hints, head) };
         println!("avx2 res={:?}", res2);
         assert_eq!(res1, res2);
@@ -161,12 +162,19 @@ mod tests {
             let hints: [u32; BTREE_HINTS_LEN] = hints.try_into().unwrap();
             for _ in 0..BTREE_HINTS_LEN * 4 {
                 let head = between.sample(&mut rng);
-                let res1 = search_hints_scalar(&hints, head);
-                // println!("scalar res={:?}", res1);
+                let res1 = expected_search_hints(&hints, head);
+                // println!("expected res={:?}", res1);
                 let res2 = unsafe { search_hints_avx2(&hints, head) };
                 // println!("avx2 res={:?}", res2);
                 assert_eq!(res1, res2);
             }
         }
+    }
+
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    fn expected_search_hints(hints: &[u32; 8], key_head: u32) -> (usize, usize) {
+        let i = hints.partition_point(|&h| h < key_head);
+        let j = hints.partition_point(|&h| h <= key_head);
+        (i, j)
     }
 }

@@ -1,3 +1,10 @@
+pub(crate) mod algo;
+mod hint;
+mod key;
+mod node;
+mod scan;
+mod value;
+
 use crate::buffer::PageID;
 use crate::buffer::guard::{
     ExclusiveLockStrategy, FacadePageGuard, LockStrategy, OptimisticLockStrategy,
@@ -7,11 +14,10 @@ use crate::buffer::{BufferPool, FixedBufferPool, PoolGuard};
 use crate::error::Validation;
 use crate::error::Validation::{Invalid, Valid};
 use crate::error::{Error, Result};
-use crate::index::btree_node::{
-    BTREE_NODE_USABLE_SIZE, BTreeNode, BTreeNodeBox, LookupChild, SpaceEstimation,
+use crate::index::btree::algo::{
+    KnownFenceNodeParams, MemTreeSiblingMergePlan, NodeSlotRange, pack_node_range_box,
+    pack_node_range_into, pack_node_ranges_box, plan_memtree_sibling_merge,
 };
-use crate::index::btree_scan::{BTreePrefixScan, BTreeSlotCallback};
-use crate::index::btree_value::{BTreeU64, BTreeValue};
 use crate::index::util::{Maskable, ParentPosition, SpaceStatistics};
 use crate::latch::LatchFallbackMode;
 use crate::quiescent::QuiescentGuard;
@@ -19,6 +25,12 @@ use crate::trx::TrxID;
 use either::Either;
 use std::marker::PhantomData;
 use std::sync::atomic::{AtomicUsize, Ordering};
+
+pub(crate) use hint::*;
+pub use key::*;
+pub use node::*;
+pub use scan::*;
+pub use value::*;
 
 pub type SharedStrategy = SharedLockStrategy<BTreeNode>;
 pub type ExclusiveStrategy = ExclusiveLockStrategy<BTreeNode>;
@@ -794,28 +806,32 @@ impl<P: BufferPool> GenericBTree<P> {
         let right_page_id = right_page.page_id();
         let left_node = left_page.page_mut();
         let right_node = right_page.page_mut();
-        // Initialize and copy key values to left node.
-        left_node.init(
-            height,
-            ts,
-            &lower_fence_key,
-            lower_fence_value,
-            &sep_key,
-            hints_enabled,
+        pack_node_range_into::<V>(
+            left_node,
+            root,
+            KnownFenceNodeParams {
+                height,
+                ts,
+                lower_fence: &lower_fence_key,
+                lower_fence_value,
+                upper_fence: Some(&sep_key),
+                hints_enabled,
+            },
+            0..sep_idx,
         );
-        left_node.extend_slots_from::<V>(root, 0, sep_idx);
-        left_node.update_hints();
-        // Initialize and copy key values to right node.
-        right_node.init(
-            height,
-            ts,
-            &sep_key,
-            BTreeU64::INVALID_VALUE,
-            &[],
-            hints_enabled,
+        pack_node_range_into::<V>(
+            right_node,
+            root,
+            KnownFenceNodeParams {
+                height,
+                ts,
+                lower_fence: &sep_key,
+                lower_fence_value: BTreeU64::INVALID_VALUE,
+                upper_fence: None,
+                hints_enabled,
+            },
+            sep_idx..root.count(),
         );
-        right_node.extend_slots_from::<V>(root, sep_idx, root.count() - sep_idx);
-        right_node.update_hints();
         // Re-initialize root in place as branch root and insert right child separator.
         root.init(
             height + 1,
@@ -848,37 +864,39 @@ impl<P: BufferPool> GenericBTree<P> {
         let c_height = c_node.height() as u16;
         let c_lower_fence_key = c_node.lower_fence_key();
         let c_upper_fence_key = c_node.upper_fence_key();
-        // Create temporary node to store the left half data of child node.
-        let mut tmp_l = BTreeNodeBox::alloc(
-            c_height,
-            ts,
-            &c_lower_fence_key,
-            c_node.lower_fence_value(),
-            sep_key,
-            c_node.header_hints_enabled(),
+        let tmp_l = pack_node_range_box::<V>(
+            c_node,
+            KnownFenceNodeParams {
+                height: c_height,
+                ts,
+                lower_fence: &c_lower_fence_key,
+                lower_fence_value: c_node.lower_fence_value(),
+                upper_fence: Some(sep_key),
+                hints_enabled: c_node.header_hints_enabled(),
+            },
+            0..sep_idx,
         );
-        tmp_l.extend_slots_from::<V>(c_node, 0, sep_idx);
-        tmp_l.update_hints();
         // Process right node.
         let right_page_id = r_guard.page_id();
         let right_node = r_guard.page_mut();
-        // Initialize and copy key values to right node.
-        right_node.init(
-            c_node.height() as u16,
-            ts,
-            sep_key,
-            // For leaf node, lower fence value is meaningless.
-            // For branch node, only the leftmost branch node has meaningful
-            // lower fence value pointing to a valid child.
-            // Other branch nodes always have lower fence equal to the first
-            // slot key.
-            // So, right node does not need to copy lower fence value.
-            BTreeU64::INVALID_VALUE,
-            &c_upper_fence_key,
-            c_node.header_hints_enabled(),
+        pack_node_range_into::<V>(
+            right_node,
+            c_node,
+            KnownFenceNodeParams {
+                height: c_height,
+                ts,
+                lower_fence: sep_key,
+                // For leaf node, lower fence value is meaningless.
+                // For branch node, only the leftmost branch node has meaningful
+                // lower fence value pointing to a valid child. Other branch nodes
+                // always have lower fence equal to the first slot key, so the
+                // right node does not need to copy lower fence value.
+                lower_fence_value: BTreeU64::INVALID_VALUE,
+                upper_fence: Some(&c_upper_fence_key),
+                hints_enabled: c_node.header_hints_enabled(),
+            },
+            sep_idx..c_node.count(),
         );
-        right_node.extend_slots_from::<V>(c_node, sep_idx, c_node.count() - sep_idx);
-        right_node.update_hints();
         // Copy left node to current node.
         c_node.clone_from(&tmp_l);
         drop(tmp_l);
@@ -913,34 +931,48 @@ impl<P: BufferPool> GenericBTree<P> {
         upper_fence_key: &[u8], // upper fence key of right node.
         ts: TrxID,
     ) {
-        let value_size = V::ENCODED_LEN;
         debug_assert!(l_node.height() == r_node.height());
         debug_assert!(p_r_idx < p_node.count());
         debug_assert!(p_node.lookup_child_idx(lower_fence_key) == Some(p_r_idx as isize - 1));
-        debug_assert!({
-            let mut estimation =
-                SpaceEstimation::with_fences(lower_fence_key, upper_fence_key, value_size);
-            estimation.add_key_range(l_node, 0, l_node.count());
-            estimation.add_key_range(r_node, 0, r_node.count());
-            estimation.total_space() <= BTREE_NODE_USABLE_SIZE
-        });
+        debug_assert!(matches!(
+            plan_memtree_sibling_merge::<V>(
+                l_node,
+                r_node,
+                lower_fence_key,
+                upper_fence_key,
+                BTREE_NODE_USABLE_SIZE,
+            ),
+            MemTreeSiblingMergePlan::Full
+        ));
         let ts = ts.max(l_node.ts()).max(r_node.ts()).max(p_node.ts());
-        let mut tmp_l = BTreeNodeBox::alloc(
-            l_node.height() as u16,
-            ts,
-            lower_fence_key,
-            l_node.lower_fence_value(),
-            upper_fence_key,
-            l_node.header_hints_enabled(),
+        // Full merge preserves the left page identity and purges the right page.
+        // The helper only rebuilds node bytes; the caller still owns parent
+        // separator deletion and purge-list ordering.
+        let tmp_l = pack_node_ranges_box::<V>(
+            KnownFenceNodeParams {
+                height: l_node.height() as u16,
+                ts,
+                lower_fence: lower_fence_key,
+                lower_fence_value: l_node.lower_fence_value(),
+                upper_fence: Some(upper_fence_key),
+                hints_enabled: l_node.header_hints_enabled(),
+            },
+            &[
+                NodeSlotRange {
+                    node: l_node,
+                    range: 0..l_node.count(),
+                },
+                NodeSlotRange {
+                    node: r_node,
+                    range: 0..r_node.count(),
+                },
+            ],
         );
-        tmp_l.extend_slots_from::<V>(l_node, 0, l_node.count());
-        if r_node.count() > 0 {
-            tmp_l.extend_slots_from::<V>(r_node, 0, r_node.count());
-        }
-        tmp_l.update_hints();
         l_node.clone_from(&tmp_l);
         drop(tmp_l);
-        p_node.delete_at(p_r_idx, value_size);
+        // Parent separators are branch entries and always store child page ids,
+        // independent of the leaf value type used by this merge.
+        p_node.delete_at(p_r_idx, BTreeU64::ENCODED_LEN);
         p_node.update_hints();
         p_node.update_ts(ts);
     }
@@ -960,50 +992,50 @@ impl<P: BufferPool> GenericBTree<P> {
         count: usize,
         ts: TrxID,
     ) {
-        let value_size = V::ENCODED_LEN;
         debug_assert!(l_node.height() == r_node.height());
         debug_assert!(p_r_idx < p_node.count());
         debug_assert!(p_node.lookup_child_idx(lower_fence_key) == Some(p_r_idx as isize - 1));
         debug_assert!(count > 0 && count < r_node.count());
         debug_assert!(&r_node.create_sep_key(count, r_node.height() == 0)[..] == sep_key);
-        debug_assert!({
-            let mut estimation = SpaceEstimation::with_fences(lower_fence_key, sep_key, value_size);
-            estimation.add_key_range(l_node, 0, l_node.count());
-            estimation.add_key_range(r_node, 0, count);
-            estimation.total_space() <= BTREE_NODE_USABLE_SIZE
-        });
         let ts = ts.max(l_node.ts()).max(r_node.ts()).max(p_node.ts());
-        let mut tmp_l = BTreeNodeBox::alloc(
-            l_node.height() as u16,
-            ts,
-            lower_fence_key,
-            l_node.lower_fence_value(),
-            sep_key,
-            l_node.header_hints_enabled(),
+        // Partial merge keeps both child pages. The left page absorbs a prefix
+        // of the right page, while the remaining right suffix keeps the original
+        // upper fence and gets a new lower fence equal to the parent separator.
+        let tmp_l = pack_node_ranges_box::<V>(
+            KnownFenceNodeParams {
+                height: l_node.height() as u16,
+                ts,
+                lower_fence: lower_fence_key,
+                lower_fence_value: l_node.lower_fence_value(),
+                upper_fence: Some(sep_key),
+                hints_enabled: l_node.header_hints_enabled(),
+            },
+            &[
+                NodeSlotRange {
+                    node: l_node,
+                    range: 0..l_node.count(),
+                },
+                NodeSlotRange {
+                    node: r_node,
+                    range: 0..count,
+                },
+            ],
         );
-        tmp_l.extend_slots_from::<V>(l_node, 0, l_node.count());
-        tmp_l.extend_slots_from::<V>(r_node, 0, count);
-        tmp_l.update_hints();
         l_node.clone_from(&tmp_l);
         drop(tmp_l);
 
-        let mut tmp_r = {
-            let lower_fence_value = if r_node.height() == 0 {
-                BTreeU64::INVALID_VALUE
-            } else {
-                r_node.value::<BTreeU64>(count)
-            };
-            BTreeNodeBox::alloc(
-                r_node.height() as u16,
+        let tmp_r = pack_node_range_box::<V>(
+            r_node,
+            KnownFenceNodeParams {
+                height: r_node.height() as u16,
                 ts,
-                sep_key,
-                lower_fence_value,
-                upper_fence_key,
-                r_node.header_hints_enabled(),
-            )
-        };
-        tmp_r.extend_slots_from::<V>(r_node, count, r_node.count() - count);
-        tmp_r.update_hints();
+                lower_fence: sep_key,
+                lower_fence_value: BTreeU64::INVALID_VALUE,
+                upper_fence: Some(upper_fence_key),
+                hints_enabled: r_node.header_hints_enabled(),
+            },
+            count..r_node.count(),
+        );
         r_node.clone_from(&tmp_r);
         drop(tmp_r);
         p_node.update_key::<BTreeU64>(p_r_idx, sep_key);
@@ -1698,88 +1730,79 @@ impl<'a, V: BTreeValue, P: BufferPool> BTreeCompactor<'a, V, P> {
                     // until high space is reached.
                     let l_node = self.coupling.node.as_mut().unwrap().page_mut();
                     let r_node = r_guard.page_mut();
-                    // Estimate space after compaction.
                     lower_fence_key_buffer.clear();
                     l_node.extend_lower_fence_key(lower_fence_key_buffer);
                     upper_fence_key_buffer.clear();
                     r_node.extend_upper_fence_key(upper_fence_key_buffer);
                     let ts = l_node.ts().max(r_node.ts());
-                    let mut estimation = SpaceEstimation::with_fences(
-                        lower_fence_key_buffer,
-                        upper_fence_key_buffer,
-                        V::ENCODED_LEN,
-                    );
-                    estimation.add_key_range(l_node, 0, l_node.count());
-                    if estimation.total_space() > BTREE_NODE_USABLE_SIZE {
-                        // fence key change results in a node out of space.
-                        self.coupling.node.replace(r_guard);
-                        self.coupling.parent.as_mut().unwrap().idx = p_r_idx as isize;
-                        return Ok(BTreeCompact::OutOfSpace);
-                    }
-                    if r_node.count() == 0 {
-                        // Special case: right node is empty.
-                        // The merge must succeed.
-                        let p_node = self.coupling.parent.as_mut().unwrap().g.page_mut();
-                        self.tree.merge_node::<V>(
-                            p_node,
-                            p_r_idx,
-                            l_node,
-                            r_node,
-                            lower_fence_key_buffer,
-                            upper_fence_key_buffer,
-                            ts,
-                        );
-                        // Put right node into purge list.
-                        purge_list.push(r_guard);
-                        continue;
-                    }
-                    // find a suitable position to merge.
-                    let sep_idx = estimation.grow_until_threshold(r_node, self.high_space);
-                    if sep_idx == 0 {
-                        // can not add one key to left node.
-                        let res = self.skip().await?;
-                        debug_assert!(res);
-                        return Ok(BTreeCompact::Skip);
-                    }
-                    if sep_idx == r_node.count() {
-                        // All keys in right node can be merged into left node.
-                        let p_node = self.coupling.parent.as_mut().unwrap().g.page_mut();
-                        self.tree.merge_node::<V>(
-                            p_node,
-                            p_r_idx,
-                            l_node,
-                            r_node,
-                            lower_fence_key_buffer,
-                            upper_fence_key_buffer,
-                            ts,
-                        );
-                        // Put right node into purge list.
-                        purge_list.push(r_guard);
-                        continue;
-                    }
-                    let sep_key = r_node.create_sep_key(sep_idx, r_node.height() == 0);
-                    let parent = self.coupling.parent.as_mut().unwrap();
-                    let p_node = parent.g.page_mut();
-                    // check if parent has enough space to update key.
-                    if !p_node.prepare_update_key::<BTreeU64>(p_r_idx, &sep_key) {
-                        self.coupling.node.replace(r_guard);
-                        self.coupling.parent.as_mut().unwrap().idx = p_r_idx as isize;
-                        return Ok(BTreeCompact::OutOfSpace);
-                    }
-                    self.tree.merge_partial::<V>(
-                        p_node,
-                        p_r_idx,
+                    // MemTree compaction is anchored at the underfilled left
+                    // page and may use the immediate right page as a donor even
+                    // when that right page is not itself underfilled. The
+                    // configurable high-space threshold controls how much of
+                    // the donor can move into the anchor.
+                    match plan_memtree_sibling_merge::<V>(
                         l_node,
                         r_node,
                         lower_fence_key_buffer,
-                        &sep_key,
                         upper_fence_key_buffer,
-                        sep_idx,
-                        ts,
-                    );
-                    parent.idx = p_r_idx as isize;
-                    self.coupling.node.replace(r_guard);
-                    return Ok(BTreeCompact::ChildDone);
+                        self.high_space,
+                    ) {
+                        MemTreeSiblingMergePlan::FenceOutOfSpace => {
+                            // fence key change results in a node out of space.
+                            self.coupling.node.replace(r_guard);
+                            self.coupling.parent.as_mut().unwrap().idx = p_r_idx as isize;
+                            return Ok(BTreeCompact::OutOfSpace);
+                        }
+                        MemTreeSiblingMergePlan::NoProgress => {
+                            // can not add one key to left node.
+                            let res = self.skip().await?;
+                            debug_assert!(res);
+                            return Ok(BTreeCompact::Skip);
+                        }
+                        MemTreeSiblingMergePlan::Full => {
+                            // All keys in right node can be merged into left node.
+                            let p_node = self.coupling.parent.as_mut().unwrap().g.page_mut();
+                            self.tree.merge_node::<V>(
+                                p_node,
+                                p_r_idx,
+                                l_node,
+                                r_node,
+                                lower_fence_key_buffer,
+                                upper_fence_key_buffer,
+                                ts,
+                            );
+                            // Put right node into purge list.
+                            purge_list.push(r_guard);
+                            continue;
+                        }
+                        MemTreeSiblingMergePlan::Partial {
+                            right_count: sep_idx,
+                        } => {
+                            let sep_key = r_node.create_sep_key(sep_idx, r_node.height() == 0);
+                            let parent = self.coupling.parent.as_mut().unwrap();
+                            let p_node = parent.g.page_mut();
+                            // check if parent has enough space to update key.
+                            if !p_node.prepare_update_key::<BTreeU64>(p_r_idx, &sep_key) {
+                                self.coupling.node.replace(r_guard);
+                                self.coupling.parent.as_mut().unwrap().idx = p_r_idx as isize;
+                                return Ok(BTreeCompact::OutOfSpace);
+                            }
+                            self.tree.merge_partial::<V>(
+                                p_node,
+                                p_r_idx,
+                                l_node,
+                                r_node,
+                                lower_fence_key_buffer,
+                                &sep_key,
+                                upper_fence_key_buffer,
+                                sep_idx,
+                                ts,
+                            );
+                            parent.idx = p_r_idx as isize;
+                            self.coupling.node.replace(r_guard);
+                            return Ok(BTreeCompact::ChildDone);
+                        }
+                    }
                 }
                 None => {
                     // Current parent done.
@@ -1902,10 +1925,18 @@ enum BTreeCompact {
 mod tests {
     use super::*;
     use crate::quiescent::{QuiescentBox, QuiescentGuard};
+    use rand::SeedableRng;
+    use rand_chacha::ChaCha8Rng;
     use rand_distr::{Distribution, Uniform};
     use std::collections::{BTreeMap, HashMap};
     use std::sync::{Arc, Barrier, mpsc};
-    use std::time::{Duration, Instant};
+    use std::time::Instant;
+
+    const WIDE_KEY_LEN: usize = 1000;
+    const WIDE_HEIGHT2_ROWS: u64 = 2_500;
+    const LOOKUP_ROWS: usize = 20_000;
+    const LOOKUP_PROBES: usize = 20_000;
+    const SPLIT_CANDIDATE_SEARCH_LIMIT: u64 = 10_000;
 
     #[derive(Debug, Default)]
     struct LevelStat {
@@ -1928,6 +1959,128 @@ mod tests {
         QuiescentBox::new(
             FixedBufferPool::with_capacity(crate::buffer::PoolRole::Index, pool_size).unwrap(),
         )
+    }
+
+    fn wide_test_key(i: u64) -> [u8; WIDE_KEY_LEN] {
+        let mut key = [0u8; WIDE_KEY_LEN];
+        key[WIDE_KEY_LEN - std::mem::size_of::<u64>()..].copy_from_slice(&i.to_be_bytes());
+        key
+    }
+
+    async fn insert_wide_rows(tree: &BTree, pool_guard: &PoolGuard, rows: u64, ts: TrxID) {
+        for i in 0..rows {
+            let key = wide_test_key(i);
+            let res = tree
+                .insert(pool_guard, &key, BTreeU64::from(i), false, ts)
+                .await
+                .unwrap();
+            assert!(res.is_ok());
+        }
+    }
+
+    async fn delete_wide_rows(tree: &BTree, pool_guard: &PoolGuard, rows: u64, ts: TrxID) {
+        for i in 0..rows {
+            let key = wide_test_key(i);
+            let res = tree
+                .delete(pool_guard, &key, BTreeU64::from(i), true, ts)
+                .await
+                .unwrap();
+            assert!(res.is_ok());
+        }
+    }
+
+    async fn collect_level_stats(
+        tree: &BTree,
+        pool_guard: &PoolGuard,
+    ) -> HashMap<usize, LevelStat> {
+        let mut map = HashMap::new();
+        for height in 0usize..=tree.height() {
+            let mut stat = LevelStat::default();
+            let mut cursor = tree.cursor(pool_guard, height);
+            cursor.seek(&[]).await.unwrap();
+            while let Some(g) = cursor.next().await.unwrap() {
+                let node = g.page();
+                stat.nodes += 1;
+                stat.keys += node.count();
+                if node.count() > 0 {
+                    stat.first_key_len += node.key(0).len();
+                }
+                stat.prefix_len += node.prefix_len();
+            }
+            map.insert(height, stat);
+        }
+        map
+    }
+
+    fn assert_level_links(map: &HashMap<usize, LevelStat>, height: usize) {
+        for h in 1..=height {
+            assert_eq!(map[&h].keys + 1, map[&(h - 1)].nodes);
+        }
+    }
+
+    async fn next_wide_split_key(tree: &BTree, pool_guard: &PoolGuard, ts: TrxID) -> u64 {
+        for i in 0..SPLIT_CANDIDATE_SEARCH_LIMIT {
+            let key = wide_test_key(i);
+            let res = tree
+                .try_find_leaf_with_optimistic_parent::<SharedStrategy>(pool_guard, &key)
+                .await
+                .unwrap();
+            let Validation::Valid((c_guard, p_guard)) = res else {
+                continue;
+            };
+            let next_insert_splits_leaf = tree.height() >= 2
+                && p_guard.is_some()
+                && !c_guard.page().can_insert::<BTreeU64>(&key);
+            drop(c_guard);
+            drop(p_guard);
+            if next_insert_splits_leaf {
+                return i;
+            }
+
+            let res = tree
+                .insert(pool_guard, &key, BTreeU64::from(i), false, ts)
+                .await
+                .unwrap();
+            assert!(res.is_ok());
+        }
+        panic!("wide-key fixture did not reach a height-2 split candidate");
+    }
+
+    async fn run_lookup_against_map(hints_enabled: bool) {
+        let pool = owned_index_pool(64 * 1024 * 1024);
+        let pool_guard = (*pool).pool_guard();
+        let tree = BTree::new(pool.guard(), &pool_guard, hints_enabled, 200)
+            .await
+            .expect("test btree construction should succeed");
+        let mut map = BTreeMap::new();
+
+        let between = Uniform::new(0u64, 10_000_000).unwrap();
+        let mut rng = ChaCha8Rng::seed_from_u64(0u64);
+        for i in 0..LOOKUP_ROWS {
+            let k = between.sample(&mut rng);
+            let res1 = tree
+                .insert(
+                    &pool_guard,
+                    &k.to_be_bytes(),
+                    BTreeU64::from(i as u64),
+                    false,
+                    201,
+                )
+                .await
+                .unwrap();
+            let res2 = map.entry(k).or_insert_with(|| i as u64);
+            assert_eq!(res1.is_ok(), *res2 == i as u64);
+        }
+
+        for _ in 0..LOOKUP_PROBES {
+            let k = between.sample(&mut rng);
+            let res1 = tree
+                .lookup_optimistic::<BTreeU64>(&pool_guard, &k.to_be_bytes())
+                .await
+                .unwrap();
+            let res2 = map.get(&k).copied().map(BTreeU64::from);
+            assert_eq!(res1, res2);
+        }
     }
 
     async fn build_exact_boundary_resume_fixture(
@@ -2010,6 +2163,99 @@ mod tests {
             first_right_leaf_page_id,
             second_right_leaf_page_id,
         }
+    }
+
+    #[test]
+    fn test_btree_merge_partial_branch_suffix_drops_lower_fence_child() {
+        smol::block_on(async {
+            let pool = owned_index_pool(64 * 1024 * 1024);
+            let pool_guard = (*pool).pool_guard();
+            let tree = BTree::new(pool.guard(), &pool_guard, false, 200)
+                .await
+                .expect("test btree construction should succeed");
+
+            let mut p_node =
+                BTreeNodeBox::alloc(2, 100, b"aa00", BTreeU64::from(10), b"zzzz", false);
+            p_node.insert(b"mm00", BTreeU64::from(20));
+
+            let mut l_node =
+                BTreeNodeBox::alloc(1, 101, b"aa00", BTreeU64::from(100), b"mm00", false);
+            l_node.insert(b"bb00", BTreeU64::from(101));
+
+            let mut r_node =
+                BTreeNodeBox::alloc(1, 102, b"mm00", BTreeU64::INVALID_VALUE, b"zzzz", false);
+            r_node.insert(b"mm00", BTreeU64::from(200));
+            r_node.insert(b"nn00", BTreeU64::from(201));
+            r_node.insert(b"oo00", BTreeU64::from(202));
+
+            let sep_key = r_node.create_sep_key(1, false);
+            tree.merge_partial::<BTreeU64>(
+                &mut p_node,
+                0,
+                &mut l_node,
+                &mut r_node,
+                b"aa00",
+                &sep_key,
+                b"zzzz",
+                1,
+                103,
+            );
+
+            assert_eq!(r_node.lower_fence_key().as_bytes(), b"nn00");
+            assert_eq!(r_node.lower_fence_value(), BTreeU64::INVALID_VALUE);
+            assert_eq!(r_node.count(), 2);
+            assert_eq!(
+                r_node.lookup_child(b"nn00"),
+                LookupChild::Slot(0, PageID::from(201u64))
+            );
+            assert_eq!(
+                r_node.lookup_child(b"oo00"),
+                LookupChild::Slot(1, PageID::from(202u64))
+            );
+        })
+    }
+
+    #[test]
+    fn test_btree_merge_full_deletes_parent_separator_with_branch_value_width() {
+        smol::block_on(async {
+            let pool = owned_index_pool(64 * 1024 * 1024);
+            let pool_guard = (*pool).pool_guard();
+            let tree = BTree::new(pool.guard(), &pool_guard, false, 200)
+                .await
+                .expect("test btree construction should succeed");
+
+            let mut p_node =
+                BTreeNodeBox::alloc(1, 100, b"aa00", BTreeU64::from(10), b"zzzz", false);
+            p_node.insert(b"mm00", BTreeU64::from(20));
+
+            let mut l_node =
+                BTreeNodeBox::alloc(0, 101, b"aa00", BTreeU64::INVALID_VALUE, b"mm00", false);
+            l_node.insert(b"bb00", BTREE_BYTE_ZERO);
+
+            let mut r_node =
+                BTreeNodeBox::alloc(0, 102, b"mm00", BTreeU64::INVALID_VALUE, b"zzzz", false);
+            r_node.insert(b"nn00", BTREE_BYTE_ZERO);
+            r_node.insert(b"oo00", BTREE_BYTE_ZERO);
+
+            tree.merge_node::<BTreeByte>(
+                &mut p_node,
+                0,
+                &mut l_node,
+                &mut r_node,
+                b"aa00",
+                b"zzzz",
+                103,
+            );
+
+            let expected_parent =
+                BTreeNodeBox::alloc(1, 103, b"aa00", BTreeU64::from(10), b"zzzz", false);
+            assert_eq!(p_node.count(), 0);
+            assert_eq!(
+                p_node.lookup_child(b"bb00"),
+                LookupChild::LowerFence(PageID::from(10u64))
+            );
+            assert_eq!(p_node.effective_space(), expected_parent.effective_space());
+        })
     }
 
     #[test]
@@ -2327,187 +2573,57 @@ mod tests {
 
     #[test]
     fn test_btree_scale() {
-        const ROWS: u64 = 90089;
         smol::block_on(async {
-            // 1GB buffer pool.
-            let pool = owned_index_pool(3 * 1024 * 1024 * 1024);
+            let pool = owned_index_pool(128 * 1024 * 1024);
             let pool_guard = (*pool).pool_guard();
             {
                 let tree = BTree::new(pool.guard(), &pool_guard, false, 200)
                     .await
                     .expect("test btree construction should succeed");
 
-                // Key length in leaf node is about 1000 bytes.
-                // Key length in branch node is about 8 bytes(with suffix truncation).
-                let mut key = [0u8; 1000];
-                let mut printed1 = false;
-                let mut printed2 = false;
-                for i in 0u64..ROWS {
-                    // let k = i.to_be_bytes();
-                    key[..8].copy_from_slice(&i.to_be_bytes()[..]);
-                    let res = tree
-                        .insert(&pool_guard, &key, BTreeU64::from(i), false, 201)
-                        .await;
-                    assert!(res.is_ok());
-                    if !printed1 && tree.height() == 1 {
-                        printed1 = true;
-                        println!("record {} to height 1", i);
-                    }
-
-                    if !printed2 && tree.height() == 2 {
-                        printed2 = true;
-                        println!("record {} to height 2", i);
-                    }
-                }
-                println!("tree height {}", tree.height());
-                let space_stat = tree.collect_space_statistics(&pool_guard).await.unwrap();
-                println!("tree space statistics: {:?}", space_stat);
-
-                let mut map: HashMap<usize, LevelStat> = HashMap::new();
-                for height in 0usize..3 {
-                    let mut stat = LevelStat::default();
-                    let mut cursor = tree.cursor(&pool_guard, height);
-                    cursor.seek(&[]).await.unwrap();
-                    while let Some(g) = cursor.next().await.unwrap() {
-                        let node = g.page();
-                        stat.nodes += 1;
-                        stat.keys += node.count();
-                        if node.count() > 0 {
-                            stat.first_key_len += node.key(0).len();
-                        }
-                        stat.prefix_len += node.prefix_len();
-                    }
-                    println!(
-                        "height={}, nodes={}, keys={}, keys/node={:.2}, key0len/node={:.2}, prefixlen/node={:.2}",
-                        height,
-                        stat.nodes,
-                        stat.keys,
-                        stat.keys as f64 / stat.nodes as f64,
-                        stat.first_key_len as f64 / stat.nodes as f64,
-                        stat.prefix_len as f64 / stat.nodes as f64,
-                    );
-                    map.insert(height, stat);
-                }
-                // 90122 rows will construct btree with height 2.
-                assert!(map.contains_key(&2));
-                assert!(map[&0].keys as u64 == ROWS);
-                // level N+1 keys plus one(lower fence key of leftmost node)
-                // should be equal to level N nodes.
-                assert!(map[&2].keys + 1 == map[&1].nodes);
-                assert!(map[&1].keys + 1 == map[&0].nodes);
+                insert_wide_rows(&tree, &pool_guard, WIDE_HEIGHT2_ROWS, 201).await;
+                assert_eq!(tree.height(), 2);
+                let map = collect_level_stats(&tree, &pool_guard).await;
+                assert_eq!(map[&0].keys as u64, WIDE_HEIGHT2_ROWS);
+                assert_level_links(&map, tree.height());
             }
         })
     }
 
     #[test]
     fn test_btree_delete() {
-        const ROWS: u64 = 90122;
         smol::block_on(async {
-            // 1GB buffer pool.
-            let pool = owned_index_pool(3 * 1024 * 1024 * 1024);
+            let pool = owned_index_pool(128 * 1024 * 1024);
             let pool_guard = (*pool).pool_guard();
             {
                 let tree = BTree::new(pool.guard(), &pool_guard, false, 200)
                     .await
                     .expect("test btree construction should succeed");
 
-                // Key length in leaf node is about 1000 bytes.
-                // Key length in branch node is about 8 bytes(with suffix truncation).
-                let mut key = [0u8; 1000];
-                for i in 0u64..ROWS {
-                    // let k = i.to_be_bytes();
-                    key[..8].copy_from_slice(&i.to_be_bytes()[..]);
-                    let res = tree
-                        .insert(&pool_guard, &key, BTreeU64::from(i), false, 201)
-                        .await;
-                    assert!(res.is_ok());
-                }
+                insert_wide_rows(&tree, &pool_guard, WIDE_HEIGHT2_ROWS, 201).await;
+                assert_eq!(tree.height(), 2);
+                delete_wide_rows(&tree, &pool_guard, WIDE_HEIGHT2_ROWS, 202).await;
 
-                for i in 0u64..ROWS {
-                    // let k = i.to_be_bytes();
-                    key[..8].copy_from_slice(&i.to_be_bytes()[..]);
-                    let res = tree
-                        .delete(&pool_guard, &key, BTreeU64::from(i), true, 202)
-                        .await;
-                    assert!(res.is_ok());
-                }
-
-                println!("tree height {}", tree.height());
-                let space_stat = tree.collect_space_statistics(&pool_guard).await.unwrap();
-                println!("tree space statistics: {:?}", space_stat);
-
-                let mut map: HashMap<usize, LevelStat> = HashMap::new();
-                for height in 0usize..3 {
-                    let mut stat = LevelStat::default();
-                    let mut cursor = tree.cursor(&pool_guard, height);
-                    cursor.seek(&[]).await.unwrap();
-                    while let Some(g) = cursor.next().await.unwrap() {
-                        let node = g.page();
-                        stat.nodes += 1;
-                        stat.keys += node.count();
-                        if node.count() > 0 {
-                            stat.first_key_len += node.key(0).len();
-                        }
-                        stat.prefix_len += node.prefix_len();
-                    }
-                    println!(
-                        "height={}, nodes={}, keys={}, keys/node={:.2}, key0len/node={:.2}, prefixlen/node={:.2}",
-                        height,
-                        stat.nodes,
-                        stat.keys,
-                        stat.keys as f64 / stat.nodes as f64,
-                        stat.first_key_len as f64 / stat.nodes as f64,
-                        stat.prefix_len as f64 / stat.nodes as f64,
-                    );
-                    map.insert(height, stat);
-                }
-                // 90122 rows will construct btree with height 2.
-                assert!(map.contains_key(&2));
-                // all keys are deleted in leaf nodes.
-                assert!(map[&0].keys as u64 == 0);
-                // level N+1 keys plus one(lower fence key of leftmost node)
-                // should be equal to level N nodes.
-                assert!(map[&2].keys + 1 == map[&1].nodes);
-                assert!(map[&1].keys + 1 == map[&0].nodes);
+                let map = collect_level_stats(&tree, &pool_guard).await;
+                assert_eq!(map[&0].keys, 0);
+                assert_level_links(&map, tree.height());
             }
         })
     }
 
     #[test]
     fn test_btree_compact() {
-        const ROWS: u64 = 90089;
         smol::block_on(async {
-            // 1GB buffer pool.
-            let pool = owned_index_pool(3 * 1024 * 1024 * 1024);
+            let pool = owned_index_pool(128 * 1024 * 1024);
             let pool_guard = (*pool).pool_guard();
             {
                 let tree = BTree::new(pool.guard(), &pool_guard, false, 200)
                     .await
                     .expect("test btree construction should succeed");
 
-                // Key length in leaf node is about 1000 bytes.
-                // Key length in branch node is about 8 bytes(with suffix truncation).
-                let mut key = [0u8; 1000];
-                for i in 0u64..ROWS {
-                    // let k = i.to_be_bytes();
-                    key[..8].copy_from_slice(&i.to_be_bytes()[..]);
-                    let res = tree
-                        .insert(&pool_guard, &key, BTreeU64::from(i), false, 201)
-                        .await;
-                    assert!(res.is_ok());
-                }
-
-                for i in 0u64..ROWS {
-                    key[..8].copy_from_slice(&i.to_be_bytes()[..]);
-                    let res = tree
-                        .delete(&pool_guard, &key, BTreeU64::from(i), true, 202)
-                        .await;
-                    assert!(res.is_ok());
-                }
-
-                println!("tree height {}", tree.height());
-                let space_stat = tree.collect_space_statistics(&pool_guard).await.unwrap();
-                println!("Before compaction, tree space statistics: {:?}", space_stat);
+                insert_wide_rows(&tree, &pool_guard, WIDE_HEIGHT2_ROWS, 201).await;
+                assert_eq!(tree.height(), 2);
+                delete_wide_rows(&tree, &pool_guard, WIDE_HEIGHT2_ROWS, 202).await;
 
                 let config = BTreeCompactConfig::new(1.0, 1.0).unwrap();
                 let purge_list = tree
@@ -2515,159 +2631,28 @@ mod tests {
                     .await
                     .unwrap();
 
-                let space_stat = tree.collect_space_statistics(&pool_guard).await.unwrap();
-                println!("After compaction, tree space statistics: {:?}", space_stat);
-
-                println!("{} pages have been removed from the tree", purge_list.len());
-                println!("tree height: {}", tree.height());
-
                 for g in purge_list {
                     pool.deallocate_page(g);
                 }
 
-                let mut map: HashMap<usize, LevelStat> = HashMap::new();
-                for height in 0usize..=tree.height() {
-                    let mut stat = LevelStat::default();
-                    let mut cursor = tree.cursor(&pool_guard, height);
-                    cursor.seek(&[]).await.unwrap();
-                    while let Some(g) = cursor.next().await.unwrap() {
-                        let node = g.page();
-                        stat.nodes += 1;
-                        stat.keys += node.count();
-                        if node.count() > 0 {
-                            stat.first_key_len += node.key(0).len();
-                        }
-                        stat.prefix_len += node.prefix_len();
-                    }
-                    println!(
-                        "height={}, nodes={}, keys={}, keys/node={:.2}, key0len/node={:.2}, prefixlen/node={:.2}",
-                        height,
-                        stat.nodes,
-                        stat.keys,
-                        stat.keys as f64 / stat.nodes as f64,
-                        stat.first_key_len as f64 / stat.nodes as f64,
-                        stat.prefix_len as f64 / stat.nodes as f64,
-                    );
-                    map.insert(height, stat);
-                }
-                // all keys are deleted in leaf nodes.
-                assert!(map[&0].keys as u64 == 0);
-                for h in 1..=tree.height() {
-                    // level N+1 keys plus one(lower fence key of leftmost node)
-                    // should be equal to level N nodes.
-                    assert!(map[&h].keys + 1 == map[&(h - 1)].nodes);
-                }
+                let map = collect_level_stats(&tree, &pool_guard).await;
+                assert_eq!(map[&0].keys, 0);
+                assert_level_links(&map, tree.height());
             }
         })
     }
 
     #[test]
     fn test_btree_lookup_disable_hints() {
-        const ROWS: usize = 100000;
         smol::block_on(async {
-            // 1GB buffer pool.
-            let pool = owned_index_pool(100 * 1024 * 1024);
-            let pool_guard = (*pool).pool_guard();
-            {
-                let tree = BTree::new(pool.guard(), &pool_guard, false, 200)
-                    .await
-                    .expect("test btree construction should succeed");
-                let mut map = BTreeMap::new();
-
-                // number less than 10 million
-                let between = Uniform::new(0u64, 10_000_000).unwrap();
-                let mut rng = rand::rng();
-                for i in 0..ROWS {
-                    let k = between.sample(&mut rng);
-                    let res1 = tree
-                        .insert(
-                            &pool_guard,
-                            &k.to_be_bytes(),
-                            BTreeU64::from(i as u64),
-                            false,
-                            201,
-                        )
-                        .await
-                        .unwrap();
-                    let res2 = map.entry(k).or_insert_with(|| i as u64);
-                    assert!(res1.is_ok() == (*res2 == i as u64));
-                }
-                println!("tree height {}", tree.height());
-                let space_stat = tree.collect_space_statistics(&pool_guard).await.unwrap();
-                println!("tree space statistics: {:?}", space_stat);
-
-                for _ in 0..ROWS {
-                    let k = between.sample(&mut rng);
-                    let res1 = tree
-                        .lookup_optimistic::<BTreeU64>(&pool_guard, &k.to_be_bytes())
-                        .await
-                        .unwrap();
-                    let res2 = map.get(&k);
-                    if let Some(v) = res2 {
-                        assert!(res1 == Some(BTreeU64::from(*v)));
-                    } else {
-                        assert!(res1.is_none());
-                    }
-                }
-            }
+            run_lookup_against_map(false).await;
         })
     }
 
     #[test]
     fn test_btree_lookup_enable_hints() {
-        use rand::prelude::*;
-        use rand_chacha::ChaCha8Rng;
-        use rand_distr::Distribution;
-        const ROWS: usize = 100000;
         smol::block_on(async {
-            // 1GB buffer pool.
-            let pool = owned_index_pool(100 * 1024 * 1024);
-            let pool_guard = (*pool).pool_guard();
-            {
-                let tree = BTree::new(pool.guard(), &pool_guard, true, 200)
-                    .await
-                    .expect("test btree construction should succeed");
-                let mut map = BTreeMap::new();
-
-                // number less than 10 million
-                let between = Uniform::new(0u64, 10_000_000).unwrap();
-                let mut rng = ChaCha8Rng::seed_from_u64(0u64);
-                for i in 0..ROWS {
-                    let k = between.sample(&mut rng);
-                    // println!("row k={}, i={} sampled", k, i);
-                    let res1 = tree
-                        .insert(
-                            &pool_guard,
-                            &k.to_be_bytes(),
-                            BTreeU64::from(i as u64),
-                            false,
-                            201,
-                        )
-                        .await
-                        .unwrap();
-                    let res2 = map.entry(k).or_insert_with(|| i as u64);
-                    assert!(res1.is_ok() == (*res2 == i as u64));
-                    // println!("row k={}, i={} inserted", k, i);
-                }
-                println!("tree height {}", tree.height());
-                let space_stat = tree.collect_space_statistics(&pool_guard).await.unwrap();
-                println!("tree space statistics: {:?}", space_stat);
-
-                for _ in 0..ROWS {
-                    let k = between.sample(&mut rng);
-                    let res1 = tree
-                        .lookup_optimistic::<BTreeU64>(&pool_guard, &k.to_be_bytes())
-                        .await
-                        .unwrap();
-                    let res2 = map.get(&k);
-                    if let Some(v) = res2 {
-                        assert!(res1 == Some(BTreeU64::from(*v)));
-                    } else {
-                        assert!(res1.is_none());
-                    }
-                }
-            }
-            std::thread::sleep(Duration::from_millis(100));
+            run_lookup_against_map(true).await;
         })
     }
 
@@ -2738,11 +2723,8 @@ mod tests {
 
     #[test]
     fn test_btree_split() {
-        // number 90088 will trigger 2 level b-tree split.
-        const ROWS: u64 = 90088;
         smol::block_on(async {
-            // 1GB buffer pool.
-            let pool = owned_index_pool(3 * 1024 * 1024 * 1024);
+            let pool = owned_index_pool(128 * 1024 * 1024);
             let pool_guard = (*pool).pool_guard();
             {
                 let tree = Arc::new(
@@ -2751,29 +2733,21 @@ mod tests {
                         .expect("test btree construction should succeed"),
                 );
 
-                // Key length in leaf node is about 1000 bytes.
-                // Key length in branch node is about 8 bytes(with suffix truncation).
-                let mut key = [0u8; 1000];
-                for i in 0u64..ROWS {
-                    key[..8].copy_from_slice(&i.to_be_bytes()[..]);
-                    let res = tree
-                        .insert(&pool_guard, &key, BTreeU64::from(i), false, 201)
-                        .await;
-                    assert!(res.is_ok());
-                }
+                let insert_key_idx = next_wide_split_key(&tree, &pool_guard, 201).await;
+                let insert_key = wide_test_key(insert_key_idx);
                 let (parent_locked_tx, parent_locked_rx) = mpsc::channel();
                 let (insert_started_tx, insert_started_rx) = mpsc::channel();
                 let (release_parent_tx, release_parent_rx) = mpsc::channel();
                 let shared_lock_handle = {
                     let tree = Arc::clone(&tree);
                     let pool_guard = pool_guard.clone();
+                    let insert_key = insert_key.to_vec();
                     std::thread::spawn(move || {
                         smol::block_on(async {
-                            let k = 90088u64.to_be_bytes();
                             let res = tree
                                 .try_find_leaf_with_optimistic_parent::<SharedStrategy>(
                                     &pool_guard,
-                                    &k,
+                                    &insert_key,
                                 )
                                 .await
                                 .unwrap();
@@ -2791,16 +2765,19 @@ mod tests {
                 };
                 // Wait for the worker to hold the parent shared lock before starting insert.
                 parent_locked_rx.recv().unwrap();
-                println!("tree height {}", tree.height());
                 let insert_handle = {
                     let tree = Arc::clone(&tree);
                     let pool_guard = pool_guard.clone();
+                    let insert_key = insert_key.to_vec();
                     std::thread::spawn(move || {
                         smol::block_on(async {
-                            let mut key = [0u8; 1000];
-                            key[..8].copy_from_slice(&90088u64.to_be_bytes()[..]);
-                            let insert_fut =
-                                tree.insert(&pool_guard, &key, BTreeU64::from(90088), false, 202);
+                            let insert_fut = tree.insert(
+                                &pool_guard,
+                                &insert_key,
+                                BTreeU64::from(insert_key_idx),
+                                false,
+                                202,
+                            );
                             futures::pin_mut!(insert_fut);
                             assert!(matches!(
                                 futures::poll!(insert_fut.as_mut()),
@@ -2816,21 +2793,20 @@ mod tests {
                 release_parent_tx.send(()).unwrap();
                 shared_lock_handle.join().unwrap();
                 insert_handle.join().unwrap();
-                println!("insert ok");
-                println!("tree height {}", tree.height());
-                let stat = tree.collect_space_statistics(&pool_guard).await.unwrap();
-                println!("tree space statistics: {:?}", stat)
+                assert_eq!(
+                    tree.lookup_optimistic::<BTreeU64>(&pool_guard, &insert_key)
+                        .await
+                        .unwrap(),
+                    Some(BTreeU64::from(insert_key_idx))
+                );
             }
         })
     }
 
     #[test]
     fn test_btree_concurrent_split() {
-        // number 90088 will trigger 2 level b-tree split.
-        const ROWS: u64 = 90088;
         smol::block_on(async {
-            // 1GB buffer pool.
-            let pool = owned_index_pool(3 * 1024 * 1024 * 1024);
+            let pool = owned_index_pool(128 * 1024 * 1024);
             let pool_guard = (*pool).pool_guard();
             {
                 let tree = Arc::new(
@@ -2839,29 +2815,20 @@ mod tests {
                         .expect("test btree construction should succeed"),
                 );
 
-                // Key length in leaf node is about 1000 bytes.
-                // Key length in branch node is about 8 bytes(with suffix truncation).
-                let mut key = [0u8; 1000];
-                for i in 0u64..ROWS {
-                    key[..8].copy_from_slice(&i.to_be_bytes()[..]);
-                    let res = tree
-                        .insert(&pool_guard, &key, BTreeU64::from(i), false, 201)
-                        .await;
-                    assert!(res.is_ok());
-                }
-                let start = Arc::new(Barrier::new((90098u64 - 90088u64) as usize + 1));
+                let first_insert_key = next_wide_split_key(&tree, &pool_guard, 201).await;
+                let concurrent_inserts = 10u64;
+                let start = Arc::new(Barrier::new(concurrent_inserts as usize + 1));
                 let mut handles = Vec::with_capacity(10);
-                for j in 90088u64..90098 {
+                for j in first_insert_key..first_insert_key + concurrent_inserts {
                     let tree = Arc::clone(&tree);
                     let pool_guard = pool_guard.clone();
                     let start = Arc::clone(&start);
                     let handle = std::thread::spawn(move || {
                         start.wait();
                         smol::block_on(async {
-                            let mut key = vec![0u8; 1000];
-                            key[..8].copy_from_slice(&j.to_be_bytes()[..]);
+                            let key = wide_test_key(j);
                             let res = tree
-                                .insert(&pool_guard, &key, BTreeU64::from(90088), false, 202)
+                                .insert(&pool_guard, &key, BTreeU64::from(j), false, 202)
                                 .await;
                             assert!(res.is_ok());
                         })
@@ -2872,57 +2839,45 @@ mod tests {
                 for handle in handles {
                     handle.join().unwrap();
                 }
-                println!("tree height {}", tree.height());
-                let stat = tree.collect_space_statistics(&pool_guard).await.unwrap();
-                println!("tree space statistics: {:?}", stat)
+                for j in first_insert_key..first_insert_key + concurrent_inserts {
+                    let key = wide_test_key(j);
+                    assert_eq!(
+                        tree.lookup_optimistic::<BTreeU64>(&pool_guard, &key)
+                            .await
+                            .unwrap(),
+                        Some(BTreeU64::from(j))
+                    );
+                }
             }
         })
     }
 
     #[test]
     fn test_btree_merge_partial() {
-        const ROWS: usize = 100000;
         smol::block_on(async {
-            // 1GB buffer pool.
-            let pool = owned_index_pool(100 * 1024 * 1024);
+            let pool = owned_index_pool(128 * 1024 * 1024);
             let pool_guard = (*pool).pool_guard();
             {
                 let tree = BTree::new(pool.guard(), &pool_guard, false, 200)
                     .await
                     .expect("test btree construction should succeed");
-                // number less than 10 million
-                let between = Uniform::new(0u64, 10_000_000).unwrap();
-                let mut rng = rand::rng();
-                for i in 0..ROWS {
-                    let k = between.sample(&mut rng);
-                    let _ = tree
-                        .insert(
-                            &pool_guard,
-                            &k.to_be_bytes(),
-                            BTreeU64::from(i as u64),
-                            false,
-                            201,
-                        )
-                        .await;
-                }
-                let space_stat = tree.collect_space_statistics(&pool_guard).await.unwrap();
-                println!(
-                    "before compaction, tree height {}, space statistics: {:?}",
-                    tree.height(),
-                    space_stat
-                );
+                insert_wide_rows(&tree, &pool_guard, WIDE_HEIGHT2_ROWS, 201).await;
+                let before_space = tree.collect_space_statistics(&pool_guard).await.unwrap();
+                let before_levels = collect_level_stats(&tree, &pool_guard).await;
 
                 let config = BTreeCompactConfig::new(1.0, 1.0).unwrap();
-                tree.compact_all::<BTreeU64>(&pool_guard, config)
+                let purge_list = tree
+                    .compact_all::<BTreeU64>(&pool_guard, config)
                     .await
                     .unwrap();
+                for g in purge_list {
+                    pool.deallocate_page(g);
+                }
 
-                let space_stat = tree.collect_space_statistics(&pool_guard).await.unwrap();
-                println!(
-                    "after compaction, tree height {}, space statistics: {:?}",
-                    tree.height(),
-                    space_stat
-                );
+                let after_space = tree.collect_space_statistics(&pool_guard).await.unwrap();
+                let after_levels = collect_level_stats(&tree, &pool_guard).await;
+                assert_eq!(after_levels[&0].keys, before_levels[&0].keys);
+                assert!(after_space.nodes <= before_space.nodes);
             }
         })
     }
@@ -2931,10 +2886,9 @@ mod tests {
     fn test_btree_destory() {
         const H0_ROWS: u64 = 10;
         const H1_ROWS: u64 = 1000;
-        const H2_ROWS: u64 = 100000;
+        const H2_ROWS: u64 = WIDE_HEIGHT2_ROWS;
         smol::block_on(async {
-            // 1GB buffer pool.
-            let pool = owned_index_pool(2 * 1024 * 1024 * 1024);
+            let pool = owned_index_pool(128 * 1024 * 1024);
             let pool_guard = (*pool).pool_guard();
             assert!(pool.allocated() == 0);
             // height=0
@@ -2942,18 +2896,8 @@ mod tests {
                 let tree = BTree::new(pool.guard(), &pool_guard, false, 200)
                     .await
                     .expect("test btree construction should succeed");
-                let mut key = vec![0u8; 1000];
-                for i in 0..H0_ROWS {
-                    key[..8].copy_from_slice(&i.to_be_bytes());
-                    tree.insert(&pool_guard, &key, BTreeU64::from(i), false, 201)
-                        .await
-                        .unwrap();
-                }
-                println!(
-                    "BTree with {} keys occupies {} pages",
-                    H2_ROWS,
-                    pool.allocated()
-                );
+                insert_wide_rows(&tree, &pool_guard, H0_ROWS, 201).await;
+                assert_eq!(tree.height(), 0);
                 tree.destory(&pool_guard).await.unwrap();
                 assert!(pool.allocated() == 0);
             }
@@ -2962,18 +2906,8 @@ mod tests {
                 let tree = BTree::new(pool.guard(), &pool_guard, false, 200)
                     .await
                     .expect("test btree construction should succeed");
-                let mut key = vec![0u8; 1000];
-                for i in 0..H1_ROWS {
-                    key[..8].copy_from_slice(&i.to_be_bytes());
-                    tree.insert(&pool_guard, &key, BTreeU64::from(i), false, 201)
-                        .await
-                        .unwrap();
-                }
-                println!(
-                    "BTree with {} keys occupies {} pages",
-                    H2_ROWS,
-                    pool.allocated()
-                );
+                insert_wide_rows(&tree, &pool_guard, H1_ROWS, 201).await;
+                assert_eq!(tree.height(), 1);
                 tree.destory(&pool_guard).await.unwrap();
                 assert!(pool.allocated() == 0);
             }
@@ -2982,18 +2916,8 @@ mod tests {
                 let tree = BTree::new(pool.guard(), &pool_guard, false, 200)
                     .await
                     .expect("test btree construction should succeed");
-                let mut key = vec![0u8; 1000];
-                for i in 0..H2_ROWS {
-                    key[..8].copy_from_slice(&i.to_be_bytes());
-                    tree.insert(&pool_guard, &key, BTreeU64::from(i), false, 201)
-                        .await
-                        .unwrap();
-                }
-                println!(
-                    "BTree with {} keys occupies {} pages",
-                    H2_ROWS,
-                    pool.allocated()
-                );
+                insert_wide_rows(&tree, &pool_guard, H2_ROWS, 201).await;
+                assert_eq!(tree.height(), 2);
                 tree.destory(&pool_guard).await.unwrap();
                 assert!(pool.allocated() == 0);
             }

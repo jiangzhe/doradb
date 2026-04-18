@@ -657,7 +657,7 @@ mod tests {
         ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexOrder, IndexSpec,
         TableMetadata, TableSpec,
     };
-    use crate::conf::{EngineConfig, EvictableBufferPoolConfig, TrxSysConfig};
+    use crate::conf::{EngineConfig, EvictableBufferPoolConfig, FileSystemConfig, TrxSysConfig};
     use crate::error::{BlockCorruptionCause, BlockKind, Error, FileKind};
     use crate::file::block_integrity::{BLOCK_INTEGRITY_HEADER_SIZE, write_block_checksum};
     use crate::file::cow_file::COW_FILE_PAGE_SIZE;
@@ -674,6 +674,39 @@ mod tests {
     use std::fs::OpenOptions;
     use std::io::{Read, Seek, SeekFrom, Write};
     use tempfile::TempDir;
+
+    const LIGHTWEIGHT_RECOVERY_BUFFER_BYTES: usize = 16 * 1024 * 1024;
+    const LIGHTWEIGHT_RECOVERY_MAX_FILE_BYTES: usize = 32 * 1024 * 1024;
+    const LIGHTWEIGHT_RECOVERY_READONLY_BUFFER_BYTES: usize = 32 * 1024 * 1024;
+
+    fn lightweight_recovery_engine_config(
+        main_dir: impl Into<std::path::PathBuf>,
+        log_file_stem: &str,
+    ) -> EngineConfig {
+        EngineConfig::default()
+            .storage_root(main_dir)
+            .meta_buffer(LIGHTWEIGHT_RECOVERY_BUFFER_BYTES)
+            .index_buffer(LIGHTWEIGHT_RECOVERY_BUFFER_BYTES)
+            .index_max_file_size(LIGHTWEIGHT_RECOVERY_MAX_FILE_BYTES)
+            .data_buffer(
+                EvictableBufferPoolConfig::default()
+                    .role(PoolRole::Mem)
+                    .max_mem_size(LIGHTWEIGHT_RECOVERY_BUFFER_BYTES)
+                    .max_file_size(LIGHTWEIGHT_RECOVERY_MAX_FILE_BYTES),
+            )
+            .trx(
+                TrxSysConfig::default()
+                    .io_depth_per_log(1)
+                    .log_file_stem(log_file_stem)
+                    .purge_threads(1)
+                    .skip_recovery(false),
+            )
+            .file(
+                FileSystemConfig::default()
+                    .io_depth(1)
+                    .readonly_buffer_size(LIGHTWEIGHT_RECOVERY_READONLY_BUFFER_BYTES),
+            )
+    }
 
     #[test]
     fn test_recover_map_tracks_create_cts_and_entries() {
@@ -1337,19 +1370,7 @@ mod tests {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
             let main_dir = temp_dir.path().to_path_buf();
-            let engine = EngineConfig::default()
-                .storage_root(main_dir.clone())
-                .data_buffer(
-                    EvictableBufferPoolConfig::default()
-                        .role(PoolRole::Mem)
-                        .max_mem_size(64usize * 1024 * 1024)
-                        .max_file_size(128usize * 1024 * 1024),
-                )
-                .trx(
-                    TrxSysConfig::default()
-                        .log_file_stem("recover12")
-                        .skip_recovery(false),
-                )
+            let engine = lightweight_recovery_engine_config(main_dir.clone(), "recover12")
                 .build()
                 .await
                 .unwrap();
@@ -1417,19 +1438,7 @@ mod tests {
             drop(session);
             drop(engine);
 
-            let engine = EngineConfig::default()
-                .storage_root(main_dir)
-                .data_buffer(
-                    EvictableBufferPoolConfig::default()
-                        .role(PoolRole::Mem)
-                        .max_mem_size(64usize * 1024 * 1024)
-                        .max_file_size(128usize * 1024 * 1024),
-                )
-                .trx(
-                    TrxSysConfig::default()
-                        .log_file_stem("recover12")
-                        .skip_recovery(false),
-                )
+            let engine = lightweight_recovery_engine_config(main_dir, "recover12")
                 .build()
                 .await
                 .unwrap();
@@ -1444,10 +1453,14 @@ mod tests {
                 .disk()
                 .open_non_unique(session.pool_guards().disk_guard())
                 .unwrap();
-            assert_eq!(
-                disk.prefix_scan(&name_key.vals).await.unwrap(),
-                same_row_ids
-            );
+            let disk_rows = disk
+                .prefix_scan_entries(&name_key.vals)
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|(_, row_id)| row_id)
+                .collect::<Vec<_>>();
+            assert_eq!(disk_rows, same_row_ids);
             match table.deletion_buffer().get(same_row_ids[1]).unwrap() {
                 DeleteMarker::Committed(_) => (),
                 DeleteMarker::Ref(_) => panic!("recovered cold delete should be committed"),

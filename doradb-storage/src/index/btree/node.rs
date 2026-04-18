@@ -3,12 +3,10 @@
 
 use crate::buffer::page::{BufferPage, PAGE_SIZE, PageID};
 use crate::file::block_integrity::{BLOCK_INTEGRITY_TRAILER_SIZE, BlockIntegrityTrailer};
+use crate::index::btree::BTreeKey;
+use crate::index::btree::{BTREE_HINTS_LEN, BTreeHints};
+use crate::index::btree::{BTREE_VALUE_PACK_MAX_LEN, BTreeU64, BTreeValue, BTreeValuePackable};
 use crate::index::btree::{BTreeDelete, BTreeUpdate};
-use crate::index::btree_hint::{BTREE_HINTS_LEN, BTreeHints};
-use crate::index::btree_key::BTreeKey;
-use crate::index::btree_value::{
-    BTREE_VALUE_PACK_MAX_LEN, BTreeU64, BTreeValue, BTreeValuePackable,
-};
 use crate::index::util::Maskable;
 use crate::memcmp::BytesExtendable;
 use crate::trx::TrxID;
@@ -820,7 +818,7 @@ impl BTreeNode {
 
     /// Returns whether the node has space for the insert.
     #[inline]
-    pub(super) fn can_insert<V: BTreeValue>(&self, key: &[u8]) -> bool {
+    pub(in crate::index) fn can_insert<V: BTreeValue>(&self, key: &[u8]) -> bool {
         let space_needed = self.space_needed::<V>(key);
         // todo: compact if neccessary.
         space_needed <= self.free_space()
@@ -856,13 +854,13 @@ impl BTreeNode {
 
     /// Returns slice of slots.
     #[inline]
-    pub(super) fn slots(&self) -> &[BTreeSlot] {
+    pub(in crate::index) fn slots(&self) -> &[BTreeSlot] {
         let len = self.header.count() as usize;
         self.slots_with_len(len)
     }
 
     #[inline]
-    pub(super) fn slots_and_hints(&mut self) -> (&[BTreeSlot], &mut BTreeHints) {
+    pub(in crate::index) fn slots_and_hints(&mut self) -> (&[BTreeSlot], &mut BTreeHints) {
         let (header, body) = (&mut self.header, &self.body);
         let len = header.count() as usize;
         let bytes_len = len * mem::size_of::<BTreeSlot>();
@@ -872,7 +870,7 @@ impl BTreeNode {
 
     /// Returns reference to slot at given position.
     #[inline]
-    pub(super) fn slot(&self, idx: usize) -> &BTreeSlot {
+    pub(in crate::index) fn slot(&self, idx: usize) -> &BTreeSlot {
         debug_assert!(idx < self.header.count() as usize);
         &self.slots_with_len(self.header.count() as usize)[idx]
     }
@@ -955,7 +953,7 @@ impl BTreeNode {
     /// the node common prefix, which range scans need when the lower bound is a
     /// logical-key prefix rather than a full stored key.
     #[inline]
-    pub(super) fn lower_bound_slot_idx(&self, key: &[u8]) -> usize {
+    pub(in crate::index) fn lower_bound_slot_idx(&self, key: &[u8]) -> usize {
         match self.key_suffix_for_probe(key) {
             NodeProbe::Before => 0,
             NodeProbe::Within(k) => match self.search_key_suffix(k) {
@@ -970,7 +968,7 @@ impl BTreeNode {
     /// Child entry `0` is the lower-fence child, and later child entries map to
     /// slot index `child_idx - 1`.
     #[inline]
-    pub(super) fn lower_bound_child_entry_idx(&self, key: &[u8]) -> Option<usize> {
+    pub(in crate::index) fn lower_bound_child_entry_idx(&self, key: &[u8]) -> Option<usize> {
         debug_assert!(!self.is_leaf());
         if self.header.lower_fence_value().is_deleted() {
             return None;
@@ -1036,13 +1034,13 @@ impl BTreeNode {
     }
 
     #[inline]
-    pub(super) fn key_checked(&self, idx: usize) -> Option<Vec<u8>> {
+    pub(in crate::index) fn key_checked(&self, idx: usize) -> Option<Vec<u8>> {
         self.slots()
             .get(idx)
             .and_then(|slot| self.slot_key_checked(slot))
     }
 
-    pub(super) fn validate_persisted_layout<V: BTreeValue>(&self) -> bool {
+    pub(in crate::index) fn validate_persisted_layout<V: BTreeValue>(&self) -> bool {
         if self.header.initialized != 1 || self.header.hints_enabled > 1 {
             return false;
         }
@@ -1251,7 +1249,7 @@ impl BTreeNode {
     }
 
     #[inline]
-    pub(super) fn key(&self, idx: usize) -> BTreeKey {
+    pub(in crate::index) fn key(&self, idx: usize) -> BTreeKey {
         debug_assert!(idx < self.header.count() as usize);
         let slot = self.slot(idx);
         let mut res = BTreeKey::arbitrary((self.header.prefix_len() + slot.len()) as usize);
@@ -1281,7 +1279,7 @@ impl BTreeNode {
     }
 
     #[inline]
-    pub(super) fn lower_fence_key(&self) -> BTreeKey {
+    pub(in crate::index) fn lower_fence_key(&self) -> BTreeKey {
         let slot = &self.header.lower_fence;
         let mut res = BTreeKey::arbitrary((self.header.prefix_len() + slot.len()) as usize);
         let mut g = res.modify_inplace();
@@ -1291,22 +1289,22 @@ impl BTreeNode {
     }
 
     #[inline]
-    pub(super) fn extend_lower_fence_key<T: BytesExtendable>(&self, res: &mut T) {
+    pub(in crate::index) fn extend_lower_fence_key<T: BytesExtendable>(&self, res: &mut T) {
         self.extend_slot_key(&self.header.lower_fence, res);
     }
 
     #[inline]
-    pub(super) fn lower_fence_key_len(&self) -> u16 {
+    pub(in crate::index) fn lower_fence_key_len(&self) -> u16 {
         self.header.prefix_len() + self.header.lower_fence.len()
     }
 
     #[inline]
-    pub(super) fn lower_fence_value(&self) -> BTreeU64 {
+    pub(in crate::index) fn lower_fence_value(&self) -> BTreeU64 {
         self.header.lower_fence_value()
     }
 
     #[inline]
-    pub(super) fn upper_fence_key(&self) -> BTreeKey {
+    pub(in crate::index) fn upper_fence_key(&self) -> BTreeKey {
         if self.has_no_upper_fence() {
             return BTreeKey::empty();
         }
@@ -1319,22 +1317,22 @@ impl BTreeNode {
     }
 
     #[inline]
-    pub(super) fn upper_fence_slot(&self) -> &BTreeSlot {
+    pub(in crate::index) fn upper_fence_slot(&self) -> &BTreeSlot {
         &self.header.upper_fence
     }
 
     #[inline]
-    pub(super) fn extend_upper_fence_key<T: BytesExtendable>(&self, res: &mut T) {
+    pub(in crate::index) fn extend_upper_fence_key<T: BytesExtendable>(&self, res: &mut T) {
         self.extend_slot_key(&self.header.upper_fence, res);
     }
 
     #[inline]
-    pub(super) fn upper_fence_key_len(&self) -> u16 {
+    pub(in crate::index) fn upper_fence_key_len(&self) -> u16 {
         self.header.prefix_len() + self.header.upper_fence.len()
     }
 
     #[inline]
-    pub(super) fn copy_slot_key(&self, slot: &BTreeSlot, res: &mut [u8]) {
+    pub(in crate::index) fn copy_slot_key(&self, slot: &BTreeSlot, res: &mut [u8]) {
         debug_assert!((self.header.prefix_len() + slot.len()) as usize == res.len());
         res[..self.header.prefix_len() as usize].copy_from_slice(self.common_prefix());
         if slot.len() as usize <= KEY_HEAD_LEN {
@@ -1346,7 +1344,11 @@ impl BTreeNode {
     }
 
     #[inline]
-    pub(super) fn extend_slot_key<T: BytesExtendable>(&self, slot: &BTreeSlot, res: &mut T) {
+    pub(in crate::index) fn extend_slot_key<T: BytesExtendable>(
+        &self,
+        slot: &BTreeSlot,
+        res: &mut T,
+    ) {
         res.extend_from_byte_slice(self.common_prefix());
         if slot.len() as usize <= KEY_HEAD_LEN {
             res.extend_from_byte_slice(&slot.head_bytes()[..slot.len() as usize]);
@@ -1357,7 +1359,7 @@ impl BTreeNode {
 
     /// This method is used to unpack value from end of key.
     #[inline]
-    pub(super) fn unpack_value<V: BTreeValuePackable>(&self, slot: &BTreeSlot) -> V {
+    pub(in crate::index) fn unpack_value<V: BTreeValuePackable>(&self, slot: &BTreeSlot) -> V {
         if slot.len() as usize >= V::ENCODED_LEN {
             // all bytes packed in the key suffix.
             if slot.len() as usize <= KEY_HEAD_LEN {
@@ -1385,7 +1387,7 @@ impl BTreeNode {
     }
 
     #[inline]
-    pub(super) fn value<V: BTreeValue>(&self, idx: usize) -> V {
+    pub(in crate::index) fn value<V: BTreeValue>(&self, idx: usize) -> V {
         debug_assert!(idx < self.header.count() as usize);
         let slot = self.slot(idx);
         self.slot_value(slot)
@@ -1399,13 +1401,13 @@ impl BTreeNode {
     /// Returning `None` lets caller mark the optimistic read as invalid and
     /// retry, instead of panicking on transient `idx` stale cases.
     #[inline]
-    pub(super) fn value_checked<V: BTreeValue>(&self, idx: usize) -> Option<V> {
+    pub(in crate::index) fn value_checked<V: BTreeValue>(&self, idx: usize) -> Option<V> {
         self.slots().get(idx).map(|slot| self.slot_value(slot))
     }
 
     /// Convenient method to get value as page id.
     #[inline]
-    pub(super) fn value_as_page_id(&self, idx: usize) -> PageID {
+    pub(in crate::index) fn value_as_page_id(&self, idx: usize) -> PageID {
         self.value::<BTreeU64>(idx).into()
     }
 
@@ -1423,14 +1425,13 @@ impl BTreeNode {
 
     /// Returns the value for a known-valid slot.
     #[inline]
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub(super) fn value_for_slot<V: BTreeValue>(&self, slot: &BTreeSlot) -> V {
+    pub(in crate::index) fn value_for_slot<V: BTreeValue>(&self, slot: &BTreeSlot) -> V {
         self.slot_value(slot)
     }
 
     /// Returns all values in this node.
     #[inline]
-    pub(super) fn values<V: BTreeValue, T, F: Fn(V) -> T>(&self, res: &mut Vec<T>, f: F) {
+    pub(in crate::index) fn values<V: BTreeValue, T, F: Fn(V) -> T>(&self, res: &mut Vec<T>, f: F) {
         res.extend(
             self.slots()
                 .iter()
@@ -1439,7 +1440,7 @@ impl BTreeNode {
     }
 
     #[inline]
-    pub(super) fn update_value<V: BTreeValue>(&mut self, idx: usize, value: V) -> V {
+    pub(in crate::index) fn update_value<V: BTreeValue>(&mut self, idx: usize, value: V) -> V {
         debug_assert!(idx < self.header.count() as usize);
         let slot = self.slot(idx);
         let offset = if slot.len() as usize <= KEY_HEAD_LEN {
@@ -1757,7 +1758,7 @@ impl BTreeNode {
     /// This method is used to check whether the slot key matches partial key prefix,
     /// the common prefix of node is excluded in this check.
     #[inline]
-    pub(super) fn slot_matches_k(&self, slot: &BTreeSlot, k: &[u8]) -> bool {
+    pub(in crate::index) fn slot_matches_k(&self, slot: &BTreeSlot, k: &[u8]) -> bool {
         if (slot.len() as usize) < k.len() {
             return false;
         }
@@ -1862,11 +1863,107 @@ pub enum LookupChild {
 }
 
 #[inline]
-pub(super) fn common_prefix_len(key1: &[u8], key2: &[u8]) -> usize {
+pub(in crate::index) fn common_prefix_len(key1: &[u8], key2: &[u8]) -> usize {
     let l = key1.len().min(key2.len());
     match key1.iter().zip(key2).position(|(a, b)| a != b) {
         Some(idx) => idx,
         None => l,
+    }
+}
+
+/// Exact space model for a freshly initialized packed `BTreeNode`.
+///
+/// `DiskTree` bulk packing chooses a node's lower and upper fences before slot
+/// insertion. This estimator mirrors that fresh-node layout: header space,
+/// optional common-prefix body space, long fence suffixes, and then each slot's
+/// slot/value/key-suffix bytes. It intentionally differs from
+/// `SpaceEstimation`, which remains a conservative merge-planning helper.
+#[derive(Debug, Clone, Copy)]
+pub(in crate::index) struct PackedNodeSpace {
+    prefix_len: usize,
+    total_space: usize,
+}
+
+impl PackedNodeSpace {
+    /// Initialize the estimate for a node with fixed lower and upper fences.
+    #[inline]
+    pub(in crate::index) fn with_fences(lower_fence: &[u8], upper_fence: &[u8]) -> Option<Self> {
+        if lower_fence.len() > u16::MAX as usize || upper_fence.len() > u16::MAX as usize {
+            return None;
+        }
+        let prefix_len = common_prefix_len(lower_fence, upper_fence);
+        let lower_suffix_len = lower_fence.len() - prefix_len;
+        let upper_suffix_len = upper_fence.len() - prefix_len;
+        let total_space = mem::size_of::<BTreeHeader>()
+            + common_prefix_body_space(prefix_len)
+            + key_suffix_body_space(lower_suffix_len)
+            + key_suffix_body_space(upper_suffix_len);
+        Some(PackedNodeSpace {
+            prefix_len,
+            total_space,
+        })
+    }
+
+    /// Common-prefix length shared by the fixed fences.
+    #[inline]
+    pub(in crate::index) fn prefix_len(&self) -> usize {
+        self.prefix_len
+    }
+
+    /// Whether future smaller prefixes can no longer free body prefix space.
+    #[inline]
+    pub(in crate::index) fn prefix_is_inline(&self) -> bool {
+        self.prefix_len <= INLINE_PREFIX_LEN
+    }
+
+    /// Current estimated total node space.
+    #[inline]
+    pub(in crate::index) fn total_space(&self) -> usize {
+        self.total_space
+    }
+
+    /// Add one slot entry using the estimator's fence-derived common prefix.
+    #[inline]
+    pub(in crate::index) fn add_entry<V: BTreeValue>(&mut self, key: &[u8]) -> Option<usize> {
+        let entry_space = Self::entry_space::<V>(key, self.prefix_len)?;
+        self.total_space = self.total_space.checked_add(entry_space)?;
+        Some(self.total_space)
+    }
+
+    /// Space needed by one slot entry under a known common-prefix length.
+    #[inline]
+    pub(in crate::index) fn entry_space<V: BTreeValue>(
+        key: &[u8],
+        prefix_len: usize,
+    ) -> Option<usize> {
+        if key.len() < prefix_len {
+            return None;
+        }
+        let suffix_len = key.len() - prefix_len;
+        if suffix_len > u16::MAX as usize {
+            return None;
+        }
+        mem::size_of::<BTreeSlot>()
+            .checked_add(V::ENCODED_LEN)?
+            .checked_add(key_suffix_body_space(suffix_len))
+    }
+}
+
+#[inline]
+fn common_prefix_body_space(prefix_len: usize) -> usize {
+    if prefix_len <= INLINE_PREFIX_LEN {
+        0
+    } else {
+        prefix_len
+    }
+}
+
+#[inline]
+fn key_suffix_body_space(suffix_len: usize) -> usize {
+    if suffix_len <= KEY_HEAD_LEN {
+        0
+    } else {
+        suffix_len
     }
 }
 
@@ -1996,7 +2093,7 @@ fn head_int(k: &[u8]) -> KeyHeadInt {
 mod tests {
     use super::*;
     use crate::buffer::{BufferPool, FixedBufferPool};
-    use crate::index::btree_value::BTreeNil;
+    use crate::index::btree::BTreeNil;
     use crate::quiescent::QuiescentBox;
     use rand_distr::{Distribution, Uniform};
     use std::collections::BTreeMap;
