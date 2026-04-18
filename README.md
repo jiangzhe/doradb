@@ -51,7 +51,7 @@ I'm glad to have discussions if someone is interested in details.
 
 ## Document-Driven AI Development Flow
 
-Current devlopment is heavily driven by document, and implemneted by code agent.
+Current development is heavily driven by document starting from Jan 2026, and implemneted by code agent.
 Every task assigned to agent has one associated task document located in `docs/tasks`.
 Larger features/refactors require RFC document inside `docs/rfcs`.
 Deferred tasks are put in `docs/backlogs`.
