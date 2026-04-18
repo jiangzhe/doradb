@@ -970,8 +970,9 @@ impl<P: BufferPool> GenericBTree<P> {
         );
         l_node.clone_from(&tmp_l);
         drop(tmp_l);
-        let value_size = V::ENCODED_LEN;
-        p_node.delete_at(p_r_idx, value_size);
+        // Parent separators are branch entries and always store child page ids,
+        // independent of the leaf value type used by this merge.
+        p_node.delete_at(p_r_idx, BTreeU64::ENCODED_LEN);
         p_node.update_hints();
         p_node.update_ts(ts);
     }
@@ -2081,6 +2082,49 @@ mod tests {
                 r_node.lookup_child(b"oo00"),
                 LookupChild::Slot(1, PageID::from(202u64))
             );
+        })
+    }
+
+    #[test]
+    fn test_btree_merge_full_deletes_parent_separator_with_branch_value_width() {
+        smol::block_on(async {
+            let pool = owned_index_pool(64 * 1024 * 1024);
+            let pool_guard = (*pool).pool_guard();
+            let tree = BTree::new(pool.guard(), &pool_guard, false, 200)
+                .await
+                .expect("test btree construction should succeed");
+
+            let mut p_node =
+                BTreeNodeBox::alloc(1, 100, b"aa00", BTreeU64::from(10), b"zzzz", false);
+            p_node.insert(b"mm00", BTreeU64::from(20));
+
+            let mut l_node =
+                BTreeNodeBox::alloc(0, 101, b"aa00", BTreeU64::INVALID_VALUE, b"mm00", false);
+            l_node.insert(b"bb00", BTREE_BYTE_ZERO);
+
+            let mut r_node =
+                BTreeNodeBox::alloc(0, 102, b"mm00", BTreeU64::INVALID_VALUE, b"zzzz", false);
+            r_node.insert(b"nn00", BTREE_BYTE_ZERO);
+            r_node.insert(b"oo00", BTREE_BYTE_ZERO);
+
+            tree.merge_node::<BTreeByte>(
+                &mut p_node,
+                0,
+                &mut l_node,
+                &mut r_node,
+                b"aa00",
+                b"zzzz",
+                103,
+            );
+
+            let expected_parent =
+                BTreeNodeBox::alloc(1, 103, b"aa00", BTreeU64::from(10), b"zzzz", false);
+            assert_eq!(p_node.count(), 0);
+            assert_eq!(
+                p_node.lookup_child(b"bb00"),
+                LookupChild::LowerFence(PageID::from(10u64))
+            );
+            assert_eq!(p_node.effective_space(), expected_parent.effective_space());
         })
     }
 
