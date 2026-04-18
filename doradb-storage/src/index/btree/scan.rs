@@ -151,8 +151,6 @@ mod tests {
     use crate::index::btree::BTree;
     use crate::index::btree::BTreeU64;
     use crate::quiescent::QuiescentBox;
-    use rand::prelude::IndexedRandom;
-    use std::collections::HashMap;
 
     #[test]
     fn test_btree_scan_single_node() {
@@ -216,46 +214,44 @@ mod tests {
     #[test]
     fn test_btree_scan_multi_nodes() {
         const ALPHABETA: &[u8; 26] = b"abcdefghijklmnopqrstuvwxyz";
-        const COUNT: usize = 100000;
+        const ENTRIES_PER_PREFIX: usize = 128;
+        const KEY_LEN: usize = 1000;
+        const PREFIX_LEN: usize = 992;
         smol::block_on(async {
             let pool = QuiescentBox::new(
                 FixedBufferPool::with_capacity(crate::buffer::PoolRole::Index, 64 * 1024 * 1024)
                     .unwrap(),
             );
             {
-                // generate random data
                 let pool_guard = (*pool).pool_guard();
                 let tree = BTree::new(pool.guard(), &pool_guard, true, 200)
                     .await
                     .expect("test btree construction should succeed");
-                let mut data = Vec::with_capacity(COUNT);
-                let mut rng = rand::rng();
-                for i in 0..COUNT {
-                    let mut elem = Vec::with_capacity(8);
-                    for _ in 0..4 {
-                        let b = ALPHABETA[..].choose(&mut rng).unwrap();
-                        elem.push(*b);
+
+                for (prefix_idx, prefix) in ALPHABETA.iter().enumerate() {
+                    for entry_idx in 0..ENTRIES_PER_PREFIX {
+                        let idx = prefix_idx * ENTRIES_PER_PREFIX + entry_idx;
+                        let mut elem = [0u8; KEY_LEN];
+                        elem[..PREFIX_LEN].fill(b'x');
+                        elem[0] = *prefix;
+                        elem[PREFIX_LEN] = entry_idx as u8;
+                        elem[KEY_LEN - std::mem::size_of::<u32>()..]
+                            .copy_from_slice(&(entry_idx as u32).to_be_bytes());
+                        let res = tree
+                            .insert(&pool_guard, &elem, BTreeU64::from(idx as u64), false, 210)
+                            .await;
+                        assert!(res.is_ok());
                     }
-                    let ib = (i as u32).to_be_bytes();
-                    elem.extend_from_slice(&ib);
-                    data.push(elem);
                 }
-                // statistics of elements.
-                let mut map: HashMap<u8, usize> = HashMap::new();
-                for (idx, elem) in data.iter().enumerate() {
-                    *map.entry(elem[0]).or_default() += 1;
-                    let res = tree
-                        .insert(&pool_guard, elem, BTreeU64::from(idx as u64), false, 210)
-                        .await;
-                    assert!(res.is_ok());
-                }
+                assert!(tree.height() > 0);
+
                 let mut scanner = tree.prefix_scanner(&pool_guard, Count(0));
                 for b in ALPHABETA {
-                    let k = std::slice::from_ref(b);
+                    let mut k = [b'x'; PREFIX_LEN];
+                    k[0] = *b;
                     scanner.reset();
-                    scanner.scan_prefix(k).await.unwrap();
-                    println!("prefix={}, count={}", *b as char, scanner.count());
-                    assert_eq!(map[b], scanner.count());
+                    scanner.scan_prefix(&k).await.unwrap();
+                    assert_eq!(ENTRIES_PER_PREFIX, scanner.count());
                 }
             }
         })

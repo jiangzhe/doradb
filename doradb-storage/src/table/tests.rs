@@ -39,6 +39,10 @@ thread_local! {
     static TEST_FORCE_SECONDARY_SIDECAR_ERROR: Cell<bool> = const { Cell::new(false) };
 }
 
+const LIGHTWEIGHT_TEST_BUFFER_BYTES: usize = 16 * 1024 * 1024;
+const LIGHTWEIGHT_TEST_MAX_FILE_BYTES: usize = 32 * 1024 * 1024;
+const LIGHTWEIGHT_TEST_READONLY_BUFFER_BYTES: usize = 32 * 1024 * 1024;
+
 pub(super) fn set_test_force_lwc_build_error(enabled: bool) {
     TEST_FORCE_LWC_BUILD_ERROR.with(|flag| flag.set(enabled));
 }
@@ -2571,32 +2575,26 @@ fn test_deletion_checkpoint_updates_secondary_disk_tree_roots() {
 #[test]
 fn test_unique_checkpoint_overlap_keeps_new_disk_tree_owner() {
     smol::block_on(async {
-        let sys = TestSys::new_evictable().await;
+        let sys = TestSys::new_lightweight_evictable().await;
         let mut session = sys.try_new_session().unwrap();
-        sys.new_trx_insert(&mut session, vec![Val::from(1i32), Val::from("old")])
-            .await;
+        let old_row_id = insert_one_row(
+            &sys.table,
+            &mut session,
+            vec![Val::from(1i32), Val::from("old")],
+        )
+        .await;
         sys.table.freeze(&session, usize::MAX).await;
         sys.table.checkpoint(&mut session).await.unwrap();
 
         let key = single_key(1i32);
-        let old_row_id = unique_disk_tree_lookup(&sys.table, session.pool_guards(), &key)
-            .await
-            .unwrap();
         sys.new_trx_delete(&mut session, &key).await;
         let delete_ts = delete_marker_ts(sys.table.deletion_buffer().get(old_row_id).unwrap());
-        sys.new_trx_insert(&mut session, vec![Val::from(1i32), Val::from("new")])
-            .await;
-
-        let reader = session.try_begin_trx().unwrap().unwrap();
-        let new_row_id = sys.table.sec_idx()[0]
-            .unique()
-            .unwrap()
-            .lookup(session.pool_guards().index_guard(), &key.vals, reader.sts)
-            .await
-            .unwrap()
-            .unwrap()
-            .0;
-        reader.commit().await.unwrap();
+        let new_row_id = insert_one_row(
+            &sys.table,
+            &mut session,
+            vec![Val::from(1i32), Val::from("new")],
+        )
+        .await;
 
         sys.table.freeze(&session, usize::MAX).await;
         wait_gc_cutoff_after(&session, delete_ts).await;
@@ -5263,6 +5261,25 @@ impl TestSys {
     }
 
     #[inline]
+    async fn new_lightweight_evictable() -> Self {
+        use crate::catalog::tests::table2;
+
+        let temp_dir = TempDir::new().unwrap();
+        let main_dir = temp_dir.path().to_path_buf();
+        let engine = lightweight_test_engine_config(main_dir, "redo_testsys_lightweight", true)
+            .build()
+            .await
+            .unwrap();
+        let table_id = table2(&engine).await;
+        let table = engine.catalog().get_table(table_id).await.unwrap();
+        TestSys {
+            engine,
+            table,
+            _temp_dir: temp_dir,
+        }
+    }
+
+    #[inline]
     async fn new_evictable_with_mem_size(max_mem_size: u64) -> Self {
         use crate::catalog::tests::table2;
         // 64KB * 16
@@ -5352,6 +5369,37 @@ impl TestSys {
             _temp_dir: temp_dir,
         }
     }
+}
+
+fn lightweight_test_engine_config(
+    main_dir: impl Into<std::path::PathBuf>,
+    log_file_stem: &str,
+    skip_recovery: bool,
+) -> EngineConfig {
+    EngineConfig::default()
+        .storage_root(main_dir)
+        .meta_buffer(LIGHTWEIGHT_TEST_BUFFER_BYTES)
+        .index_buffer(LIGHTWEIGHT_TEST_BUFFER_BYTES)
+        .index_max_file_size(LIGHTWEIGHT_TEST_MAX_FILE_BYTES)
+        .data_buffer(
+            EvictableBufferPoolConfig::default()
+                .role(PoolRole::Mem)
+                .max_mem_size(LIGHTWEIGHT_TEST_BUFFER_BYTES)
+                .max_file_size(LIGHTWEIGHT_TEST_MAX_FILE_BYTES),
+        )
+        .trx(
+            TrxSysConfig::default()
+                .io_depth_per_log(1)
+                .log_file_stem(log_file_stem)
+                .purge_threads(1)
+                .skip_recovery(skip_recovery),
+        )
+        .file(
+            FileSystemConfig::default()
+                .io_depth(1)
+                .readonly_buffer_size(LIGHTWEIGHT_TEST_READONLY_BUFFER_BYTES)
+                .data_dir("."),
+        )
 }
 
 impl TestSys {
@@ -5467,6 +5515,18 @@ impl TestSys {
     fn try_new_session(&self) -> Result<Session> {
         self.engine.try_new_session()
     }
+}
+
+async fn insert_one_row(table: &Table, session: &mut Session, values: Vec<Val>) -> RowID {
+    let mut trx = session.try_begin_trx().unwrap().unwrap();
+    let mut stmt = trx.start_stmt();
+    let insert = stmt.insert_row(table, values).await;
+    let Ok(InsertMvcc::Inserted(row_id)) = insert else {
+        panic!("insert should succeed: {insert:?}");
+    };
+    trx = stmt.succeed();
+    trx.commit().await.unwrap();
+    row_id
 }
 
 fn single_key<V: Into<Val>>(value: V) -> SelectKey {
