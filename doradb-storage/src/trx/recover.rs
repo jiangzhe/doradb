@@ -99,7 +99,6 @@ pub(crate) async fn log_recover(
     deps: RecoveryDeps,
     catalog: &Catalog,
     mut log_partition_initializers: Vec<LogPartitionInitializer>,
-    skip: bool,
 ) -> Result<(Vec<CachePadded<LogPartition>>, Vec<Receiver<GC>>, TrxID)> {
     let RecoveryDeps {
         index_pool,
@@ -110,29 +109,27 @@ pub(crate) async fn log_recover(
     // In recovery, we disable GC and redo logging.
     // All data are purely processed in memory and if
     // any failure occurs, we abort the whole process.
-    let mut next_trx_ts = MIN_SNAPSHOT_TS;
-    if !skip {
-        let log_partitions = log_partition_initializers.len();
-        let mut log_merger = LogMerger::default();
-        for initializer in log_partition_initializers {
-            let stream = initializer.stream();
-            log_merger.add_stream(stream)?;
-        }
-        let log_recovery = LogRecovery::new(
-            meta_pool, index_pool, mem_pool, table_fs, disk_pool, catalog, log_merger,
-        );
-        let (log_streams, max_recovered_cts) = log_recovery.recover_all().await?;
-        next_trx_ts = max_recovered_cts
-            .checked_add(1)
-            .filter(|ts| *ts < MAX_SNAPSHOT_TS)
-            .ok_or(Error::InvalidState)?;
-        log_partition_initializers = log_streams
-            .into_iter()
-            .map(|s| s.into_initializer())
-            .collect();
-        log_partition_initializers.sort_by_key(|i| i.log_no);
-        debug_assert_eq!(log_partition_initializers.len(), log_partitions);
+    let log_partitions = log_partition_initializers.len();
+    let mut log_merger = LogMerger::default();
+    for initializer in log_partition_initializers {
+        let stream = initializer.stream();
+        log_merger.add_stream(stream)?;
     }
+    let log_recovery = LogRecovery::new(
+        meta_pool, index_pool, mem_pool, table_fs, disk_pool, catalog, log_merger,
+    );
+    let (log_streams, max_recovered_cts) = log_recovery.recover_all().await?;
+    let next_trx_ts = max_recovered_cts
+        .checked_add(1)
+        .filter(|ts| *ts < MAX_SNAPSHOT_TS)
+        .ok_or(Error::InvalidState)?;
+    log_partition_initializers = log_streams
+        .into_iter()
+        .map(|s| s.into_initializer())
+        .collect();
+    log_partition_initializers.sort_by_key(|i| i.log_no);
+    debug_assert_eq!(log_partition_initializers.len(), log_partitions);
+
     let mut partitions = vec![];
     let mut gc_rxs = vec![];
     for initializer in log_partition_initializers {
@@ -698,8 +695,7 @@ mod tests {
                 TrxSysConfig::default()
                     .io_depth_per_log(1)
                     .log_file_stem(log_file_stem)
-                    .purge_threads(1)
-                    .skip_recovery(false),
+                    .purge_threads(1),
             )
             .file(
                 FileSystemConfig::default()
@@ -805,11 +801,7 @@ mod tests {
                         .max_mem_size(64usize * 1024 * 1024)
                         .max_file_size(128usize * 1024 * 1024),
                 )
-                .trx(
-                    TrxSysConfig::default()
-                        .log_file_stem("recover1")
-                        .skip_recovery(false),
-                )
+                .trx(TrxSysConfig::default().log_file_stem("recover1"))
                 .build()
                 .await
                 .unwrap();
@@ -831,11 +823,7 @@ mod tests {
                         .max_mem_size(64usize * 1024 * 1024)
                         .max_file_size(128usize * 1024 * 1024),
                 )
-                .trx(
-                    TrxSysConfig::default()
-                        .log_file_stem("recover2")
-                        .skip_recovery(false),
-                )
+                .trx(TrxSysConfig::default().log_file_stem("recover2"))
                 .build()
                 .await
                 .unwrap();
@@ -877,11 +865,7 @@ mod tests {
                         .max_mem_size(64usize * 1024 * 1024)
                         .max_file_size(128usize * 1024 * 1024),
                 )
-                .trx(
-                    TrxSysConfig::default()
-                        .log_file_stem("recover2")
-                        .skip_recovery(false),
-                )
+                .trx(TrxSysConfig::default().log_file_stem("recover2"))
                 .build()
                 .await
                 .unwrap();
@@ -913,11 +897,7 @@ mod tests {
                         .max_mem_size(64usize * 1024 * 1024)
                         .max_file_size(128usize * 1024 * 1024),
                 )
-                .trx(
-                    TrxSysConfig::default()
-                        .log_file_stem("recover3")
-                        .skip_recovery(false),
-                )
+                .trx(TrxSysConfig::default().log_file_stem("recover3"))
                 .build()
                 .await
                 .unwrap();
@@ -998,11 +978,7 @@ mod tests {
                         .max_mem_size(64usize * 1024 * 1024)
                         .max_file_size(128usize * 1024 * 1024),
                 )
-                .trx(
-                    TrxSysConfig::default()
-                        .log_file_stem("recover3")
-                        .skip_recovery(false),
-                )
+                .trx(TrxSysConfig::default().log_file_stem("recover3"))
                 .build()
                 .await
                 .unwrap();
@@ -1039,11 +1015,7 @@ mod tests {
                         .max_mem_size(64usize * 1024 * 1024)
                         .max_file_size(128usize * 1024 * 1024),
                 )
-                .trx(
-                    TrxSysConfig::default()
-                        .log_file_stem("recover4")
-                        .skip_recovery(false),
-                )
+                .trx(TrxSysConfig::default().log_file_stem("recover4"))
                 .build()
                 .await
                 .unwrap();
@@ -1083,11 +1055,7 @@ mod tests {
                         .max_mem_size(64usize * 1024 * 1024)
                         .max_file_size(128usize * 1024 * 1024),
                 )
-                .trx(
-                    TrxSysConfig::default()
-                        .log_file_stem("recover4")
-                        .skip_recovery(false),
-                )
+                .trx(TrxSysConfig::default().log_file_stem("recover4"))
                 .build()
                 .await
                 .unwrap();
@@ -1110,11 +1078,7 @@ mod tests {
                         .max_mem_size(64usize * 1024 * 1024)
                         .max_file_size(128usize * 1024 * 1024),
                 )
-                .trx(
-                    TrxSysConfig::default()
-                        .log_file_stem("recover5")
-                        .skip_recovery(false),
-                )
+                .trx(TrxSysConfig::default().log_file_stem("recover5"))
                 .build()
                 .await
                 .unwrap();
@@ -1179,11 +1143,7 @@ mod tests {
                         .max_mem_size(64usize * 1024 * 1024)
                         .max_file_size(128usize * 1024 * 1024),
                 )
-                .trx(
-                    TrxSysConfig::default()
-                        .log_file_stem("recover5")
-                        .skip_recovery(false),
-                )
+                .trx(TrxSysConfig::default().log_file_stem("recover5"))
                 .build()
                 .await
                 .unwrap();
@@ -1238,11 +1198,7 @@ mod tests {
                         .max_mem_size(64usize * 1024 * 1024)
                         .max_file_size(128usize * 1024 * 1024),
                 )
-                .trx(
-                    TrxSysConfig::default()
-                        .log_file_stem("recover11")
-                        .skip_recovery(false),
-                )
+                .trx(TrxSysConfig::default().log_file_stem("recover11"))
                 .build()
                 .await
                 .unwrap();
@@ -1319,11 +1275,7 @@ mod tests {
                         .max_mem_size(64usize * 1024 * 1024)
                         .max_file_size(128usize * 1024 * 1024),
                 )
-                .trx(
-                    TrxSysConfig::default()
-                        .log_file_stem("recover11")
-                        .skip_recovery(false),
-                )
+                .trx(TrxSysConfig::default().log_file_stem("recover11"))
                 .build()
                 .await
                 .unwrap();
@@ -1504,11 +1456,7 @@ mod tests {
                         .max_mem_size(64usize * 1024 * 1024)
                         .max_file_size(128usize * 1024 * 1024),
                 )
-                .trx(
-                    TrxSysConfig::default()
-                        .log_file_stem("recover6")
-                        .skip_recovery(false),
-                )
+                .trx(TrxSysConfig::default().log_file_stem("recover6"))
                 .build()
                 .await
                 .unwrap();
@@ -1581,11 +1529,7 @@ mod tests {
                         .max_mem_size(64usize * 1024 * 1024)
                         .max_file_size(128usize * 1024 * 1024),
                 )
-                .trx(
-                    TrxSysConfig::default()
-                        .log_file_stem("recover6")
-                        .skip_recovery(false),
-                )
+                .trx(TrxSysConfig::default().log_file_stem("recover6"))
                 .build()
                 .await
                 .unwrap();
@@ -1632,11 +1576,7 @@ mod tests {
                         .max_mem_size(64usize * 1024 * 1024)
                         .max_file_size(128usize * 1024 * 1024),
                 )
-                .trx(
-                    TrxSysConfig::default()
-                        .log_file_stem("recover10")
-                        .skip_recovery(false),
-                )
+                .trx(TrxSysConfig::default().log_file_stem("recover10"))
                 .build()
                 .await
                 .unwrap();
@@ -1742,11 +1682,7 @@ mod tests {
                         .max_mem_size(64usize * 1024 * 1024)
                         .max_file_size(128usize * 1024 * 1024),
                 )
-                .trx(
-                    TrxSysConfig::default()
-                        .log_file_stem("recover10")
-                        .skip_recovery(false),
-                )
+                .trx(TrxSysConfig::default().log_file_stem("recover10"))
                 .build()
                 .await
                 .unwrap();
@@ -1801,11 +1737,7 @@ mod tests {
                         .max_mem_size(64usize * 1024 * 1024)
                         .max_file_size(128usize * 1024 * 1024),
                 )
-                .trx(
-                    TrxSysConfig::default()
-                        .log_file_stem("recover7")
-                        .skip_recovery(false),
-                )
+                .trx(TrxSysConfig::default().log_file_stem("recover7"))
                 .build()
                 .await
                 .unwrap();
@@ -1929,11 +1861,7 @@ mod tests {
                         .max_mem_size(64usize * 1024 * 1024)
                         .max_file_size(128usize * 1024 * 1024),
                 )
-                .trx(
-                    TrxSysConfig::default()
-                        .log_file_stem("recover7")
-                        .skip_recovery(false),
-                )
+                .trx(TrxSysConfig::default().log_file_stem("recover7"))
                 .build()
                 .await
                 .unwrap();
@@ -2006,11 +1934,7 @@ mod tests {
                         .max_mem_size(64usize * 1024 * 1024)
                         .max_file_size(128usize * 1024 * 1024),
                 )
-                .trx(
-                    TrxSysConfig::default()
-                        .log_file_stem("recover8")
-                        .skip_recovery(false),
-                )
+                .trx(TrxSysConfig::default().log_file_stem("recover8"))
                 .build()
                 .await
                 .unwrap();
@@ -2088,11 +2012,7 @@ mod tests {
                         .max_mem_size(64usize * 1024 * 1024)
                         .max_file_size(128usize * 1024 * 1024),
                 )
-                .trx(
-                    TrxSysConfig::default()
-                        .log_file_stem("recover8")
-                        .skip_recovery(false),
-                )
+                .trx(TrxSysConfig::default().log_file_stem("recover8"))
                 .build()
                 .await
                 .unwrap();
@@ -2134,11 +2054,7 @@ mod tests {
                         .max_mem_size(64usize * 1024 * 1024)
                         .max_file_size(128usize * 1024 * 1024),
                 )
-                .trx(
-                    TrxSysConfig::default()
-                        .log_file_stem("recover9")
-                        .skip_recovery(false),
-                )
+                .trx(TrxSysConfig::default().log_file_stem("recover9"))
                 .build()
                 .await
                 .unwrap();
@@ -2262,11 +2178,7 @@ mod tests {
                         .max_mem_size(64usize * 1024 * 1024)
                         .max_file_size(128usize * 1024 * 1024),
                 )
-                .trx(
-                    TrxSysConfig::default()
-                        .log_file_stem("recover9")
-                        .skip_recovery(false),
-                )
+                .trx(TrxSysConfig::default().log_file_stem("recover9"))
                 .build()
                 .await
                 .unwrap();

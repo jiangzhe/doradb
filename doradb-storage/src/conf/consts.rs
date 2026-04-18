@@ -55,5 +55,3 @@ pub const DEFAULT_LOG_FILE_MAX_SIZE: Byte = Byte::from_u64(1024 * 1024 * 1024);
 pub const DEFAULT_LOG_SYNC: LogSync = LogSync::Fsync;
 /// Default number of background purge threads.
 pub const DEFAULT_PURGE_THREADS: usize = 2;
-/// Default startup behavior: run redo recovery before serving traffic.
-pub const DEFAULT_SKIP_RECOVERY: bool = false;

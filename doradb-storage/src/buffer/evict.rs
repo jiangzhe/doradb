@@ -1629,7 +1629,7 @@ pub(crate) mod tests {
                             .data_dir(".")
                             .readonly_buffer_size(TEST_READONLY_BUFFER_BYTES),
                     )
-                    .trx(TrxSysConfig::default().skip_recovery(true))
+                    .trx(TrxSysConfig::default())
                     .build()
                     .await
                     .unwrap()

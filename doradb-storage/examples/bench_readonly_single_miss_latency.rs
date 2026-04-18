@@ -140,7 +140,7 @@ fn main() {
                     .max_mem_size(64usize * 1024 * 1024)
                     .max_file_size(128usize * 1024 * 1024),
             )
-            .trx(TrxSysConfig::default().skip_recovery(true))
+            .trx(TrxSysConfig::default())
             .build()
             .await
             .unwrap();

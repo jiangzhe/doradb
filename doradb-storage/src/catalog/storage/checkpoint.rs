@@ -736,9 +736,7 @@ mod tests {
             let engine = EngineConfig::default()
                 .storage_root(main_dir)
                 .trx(
-                    TrxSysConfig::default()
-                        .log_file_stem("catalog-checkpoint-canceled-empty-root")
-                        .skip_recovery(false),
+                    TrxSysConfig::default().log_file_stem("catalog-checkpoint-canceled-empty-root"),
                 )
                 .build()
                 .await
@@ -778,8 +776,7 @@ mod tests {
                 .storage_root(main_dir)
                 .trx(
                     TrxSysConfig::default()
-                        .log_file_stem("catalog-checkpoint-canceled-existing-root")
-                        .skip_recovery(false),
+                        .log_file_stem("catalog-checkpoint-canceled-existing-root"),
                 )
                 .build()
                 .await
@@ -822,11 +819,7 @@ mod tests {
             let main_dir = temp_dir.path().to_path_buf();
             let engine = EngineConfig::default()
                 .storage_root(main_dir)
-                .trx(
-                    TrxSysConfig::default()
-                        .log_file_stem("catalog-checkpoint-readonly-cache")
-                        .skip_recovery(false),
-                )
+                .trx(TrxSysConfig::default().log_file_stem("catalog-checkpoint-readonly-cache"))
                 .build()
                 .await
                 .unwrap();
@@ -876,11 +869,7 @@ mod tests {
             let main_dir = temp_dir.path().to_path_buf();
             let engine = EngineConfig::default()
                 .storage_root(main_dir)
-                .trx(
-                    TrxSysConfig::default()
-                        .log_file_stem("catalog-checkpoint-tail-merge")
-                        .skip_recovery(false),
-                )
+                .trx(TrxSysConfig::default().log_file_stem("catalog-checkpoint-tail-merge"))
                 .build()
                 .await
                 .unwrap();

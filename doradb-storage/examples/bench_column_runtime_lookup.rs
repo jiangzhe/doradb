@@ -76,11 +76,7 @@ async fn build_case(
                 .max_mem_size(64u64 * 1024 * 1024)
                 .max_file_size(128u64 * 1024 * 1024),
         )
-        .trx(
-            TrxSysConfig::default()
-                .log_file_stem("bench_column_runtime_lookup")
-                .skip_recovery(true),
-        )
+        .trx(TrxSysConfig::default().log_file_stem("bench_column_runtime_lookup"))
         .file(
             FileSystemConfig::default()
                 .io_depth(16)

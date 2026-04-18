@@ -1711,7 +1711,7 @@ pub(crate) mod tests {
                         .max_file_size(TEST_DATA_MAX_FILE_BYTES),
                 )
                 .file(file)
-                .trx(TrxSysConfig::default().skip_recovery(true))
+                .trx(TrxSysConfig::default())
                 .build()
                 .await
         })

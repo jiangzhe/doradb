@@ -5136,11 +5136,7 @@ fn test_user_secondary_indexes_evict_and_continue_serving_lookups() {
                     .max_mem_size(64u64 * 1024 * 1024)
                     .max_file_size(128u64 * 1024 * 1024),
             )
-            .trx(
-                TrxSysConfig::default()
-                    .log_file_stem("redo_index_evict")
-                    .skip_recovery(true),
-            )
+            .trx(TrxSysConfig::default().log_file_stem("redo_index_evict"))
             .build()
             .await
             .unwrap();
@@ -5266,7 +5262,7 @@ impl TestSys {
 
         let temp_dir = TempDir::new().unwrap();
         let main_dir = temp_dir.path().to_path_buf();
-        let engine = lightweight_test_engine_config(main_dir, "redo_testsys_lightweight", true)
+        let engine = lightweight_test_engine_config(main_dir, "redo_testsys_lightweight")
             .build()
             .await
             .unwrap();
@@ -5293,11 +5289,7 @@ impl TestSys {
                     .max_mem_size(max_mem_size)
                     .max_file_size(128u64 * 1024 * 1024),
             )
-            .trx(
-                TrxSysConfig::default()
-                    .log_file_stem("redo_testsys")
-                    .skip_recovery(true),
-            )
+            .trx(TrxSysConfig::default().log_file_stem("redo_testsys"))
             .file(
                 FileSystemConfig::default()
                     .io_depth(16)
@@ -5333,11 +5325,7 @@ impl TestSys {
                     .max_mem_size(64u64 * 1024 * 1024)
                     .max_file_size(128u64 * 1024 * 1024),
             )
-            .trx(
-                TrxSysConfig::default()
-                    .log_file_stem("redo_testsys_non_unique")
-                    .skip_recovery(true),
-            )
+            .trx(TrxSysConfig::default().log_file_stem("redo_testsys_non_unique"))
             .file(
                 FileSystemConfig::default()
                     .io_depth(16)
@@ -5374,7 +5362,6 @@ impl TestSys {
 fn lightweight_test_engine_config(
     main_dir: impl Into<std::path::PathBuf>,
     log_file_stem: &str,
-    skip_recovery: bool,
 ) -> EngineConfig {
     EngineConfig::default()
         .storage_root(main_dir)
@@ -5391,8 +5378,7 @@ fn lightweight_test_engine_config(
             TrxSysConfig::default()
                 .io_depth_per_log(1)
                 .log_file_stem(log_file_stem)
-                .purge_threads(1)
-                .skip_recovery(skip_recovery),
+                .purge_threads(1),
         )
         .file(
             FileSystemConfig::default()
@@ -5822,11 +5808,7 @@ fn test_secondary_index_common() {
         let engine = EngineConfig::default()
             .storage_root(main_dir)
             .data_buffer(EvictableBufferPoolConfig::default().role(crate::buffer::PoolRole::Mem))
-            .trx(
-                TrxSysConfig::default()
-                    .log_file_stem("redo_secidx1")
-                    .skip_recovery(true),
-            )
+            .trx(TrxSysConfig::default().log_file_stem("redo_secidx1"))
             .build()
             .await
             .unwrap();
@@ -5923,11 +5905,7 @@ fn test_secondary_index_rollback() {
         let engine = EngineConfig::default()
             .storage_root(main_dir)
             .data_buffer(EvictableBufferPoolConfig::default().role(crate::buffer::PoolRole::Mem))
-            .trx(
-                TrxSysConfig::default()
-                    .log_file_stem("redo_secidx2")
-                    .skip_recovery(true),
-            )
+            .trx(TrxSysConfig::default().log_file_stem("redo_secidx2"))
             .build()
             .await
             .unwrap();
