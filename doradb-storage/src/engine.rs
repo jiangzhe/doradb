@@ -374,7 +374,7 @@ mod tests {
                     .max_file_size(128usize * 1024 * 1024),
             )
             .file(FileSystemConfig::default().readonly_buffer_size(TEST_POOL_BYTES))
-            .trx(TrxSysConfig::default().skip_recovery(false))
+            .trx(TrxSysConfig::default())
     }
 
     #[test]
@@ -600,7 +600,7 @@ mod tests {
                         .max_mem_size(1024usize * 1024)
                         .max_file_size(2usize * 1024 * 1024),
                 )
-                .trx(TrxSysConfig::default().skip_recovery(false))
+                .trx(TrxSysConfig::default())
                 .build()
                 .await
             {
@@ -915,7 +915,7 @@ mod tests {
                         .data_dir("data")
                         .readonly_buffer_size(TEST_POOL_BYTES),
                 )
-                .trx(TrxSysConfig::default().skip_recovery(true))
+                .trx(TrxSysConfig::default())
                 .build()
                 .await
                 .unwrap();
@@ -923,7 +923,6 @@ mod tests {
             let (trx_sys, startup) = TrxSysConfig::default()
                 .log_dir(&log_dir)
                 .log_file_stem("pending-startup-cleanup")
-                .skip_recovery(true)
                 .prepare(
                     engine.meta_pool.clone_inner(),
                     engine.index_pool.clone_inner(),

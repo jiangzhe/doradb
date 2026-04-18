@@ -607,11 +607,7 @@ mod tests {
                         .max_mem_size(128usize * 1024 * 1024)
                         .max_file_size(256usize * 1024 * 1024),
                 )
-                .trx(
-                    TrxSysConfig::default()
-                        .log_file_stem("redo_trx")
-                        .skip_recovery(true),
-                )
+                .trx(TrxSysConfig::default().log_file_stem("redo_trx"))
                 .build()
                 .await
                 .unwrap();
@@ -649,11 +645,7 @@ mod tests {
                         .max_mem_size(128usize * 1024 * 1024)
                         .max_file_size(256usize * 1024 * 1024),
                 )
-                .trx(
-                    TrxSysConfig::default()
-                        .log_file_stem("redo_poison_lock_order")
-                        .skip_recovery(true),
-                )
+                .trx(TrxSysConfig::default().log_file_stem("redo_poison_lock_order"))
                 .build()
                 .await
                 .unwrap();
@@ -728,11 +720,7 @@ mod tests {
                         .max_mem_size(128usize * 1024 * 1024)
                         .max_file_size(256usize * 1024 * 1024),
                 )
-                .trx(
-                    TrxSysConfig::default()
-                        .log_file_stem("redo_poison_concurrent")
-                        .skip_recovery(true),
-                )
+                .trx(TrxSysConfig::default().log_file_stem("redo_poison_concurrent"))
                 .build()
                 .await
                 .unwrap();
@@ -931,11 +919,7 @@ mod tests {
                         .max_mem_size(128usize * 1024 * 1024)
                         .max_file_size(256usize * 1024 * 1024),
                 )
-                .trx(
-                    TrxSysConfig::default()
-                        .log_file_stem("redo_trx")
-                        .skip_recovery(true),
-                )
+                .trx(TrxSysConfig::default().log_file_stem("redo_trx"))
                 .build()
                 .await
                 .unwrap();
@@ -980,8 +964,7 @@ mod tests {
                     TrxSysConfig::default()
                         .log_partitions(1)
                         .log_file_stem("redo_rotate")
-                        .log_file_max_size(1024u64 * 1024)
-                        .skip_recovery(true),
+                        .log_file_max_size(1024u64 * 1024),
                 )
                 .build()
                 .await

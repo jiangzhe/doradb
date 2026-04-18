@@ -2676,7 +2676,7 @@ pub(crate) mod tests {
                         .max_file_size(128usize * 1024 * 1024),
                 )
                 .file(FileSystemConfig::default().readonly_buffer_size(frame_page_bytes(1)))
-                .trx(TrxSysConfig::default().skip_recovery(false))
+                .trx(TrxSysConfig::default())
                 .build()
                 .await
                 .unwrap();

@@ -14,12 +14,15 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
+use tempfile::TempDir;
 
 fn main() {
     let args = Args::parse();
     smol::block_on(async {
         let args = args.clone();
+        let temp_dir = TempDir::new().unwrap();
         let engine = EngineConfig::default()
+            .storage_root(temp_dir.path())
             .meta_buffer(64usize * 1024 * 1024)
             .data_buffer(
                 EvictableBufferPoolConfig::default()
@@ -27,7 +30,7 @@ fn main() {
                     .max_file_size(3usize * 1024 * 1024 * 1024)
                     .data_swap_file("data_bench1.swp"),
             )
-            .trx(TrxSysConfig::default().skip_recovery(true))
+            .trx(TrxSysConfig::default())
             .build()
             .await
             .unwrap();
@@ -102,9 +105,7 @@ fn main() {
             drop(meta_guard);
         }
         drop(engine);
-
-        let _ = std::fs::remove_file("data_bench1.swp");
-        remove_files("*.tbl");
+        drop(temp_dir);
     });
 
     bench_btreemap(args);
@@ -245,18 +246,4 @@ struct Args {
     /// query count per thread
     #[arg(long, default_value = "1000000")]
     count: usize,
-}
-
-fn remove_files(file_pattern: &str) {
-    let files = glob::glob(file_pattern);
-    if files.is_err() {
-        return;
-    }
-    for f in files.unwrap() {
-        if f.is_err() {
-            continue;
-        }
-        let fp = f.unwrap();
-        let _ = std::fs::remove_file(&fp);
-    }
 }

@@ -15,11 +15,13 @@ use doradb_storage::value::Val;
 use doradb_storage::value::ValKind;
 use easy_parallel::Parallel;
 use semistr::SemiStr;
+use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use std::time::Instant;
+use tempfile::TempDir;
 
 use tikv_jemallocator::Jemalloc;
 
@@ -29,8 +31,19 @@ static ALLOCATOR: Jemalloc = Jemalloc;
 fn main() {
     smol::block_on(async {
         let args = Args::parse();
+        let temp_storage_root = if args.storage_root.is_none() {
+            Some(TempDir::new().unwrap())
+        } else {
+            None
+        };
+        let storage_root = args
+            .storage_root
+            .as_deref()
+            .or_else(|| temp_storage_root.as_ref().map(TempDir::path))
+            .unwrap();
 
         let engine = EngineConfig::default()
+            .storage_root(storage_root)
             .meta_buffer(64usize * 1024 * 1024)
             .data_buffer(
                 EvictableBufferPoolConfig::default()
@@ -47,8 +60,7 @@ fn main() {
                     .log_file_max_size(args.log_file_max_size)
                     .log_sync(args.log_sync)
                     .max_io_size(args.max_io_size)
-                    .purge_threads(args.purge_threads)
-                    .skip_recovery(true),
+                    .purge_threads(args.purge_threads),
             )
             .build()
             .await
@@ -140,9 +152,7 @@ fn main() {
             );
         }
         drop(engine);
-
-        let _ = std::fs::remove_file("data_bench2.swp");
-        remove_files("*.tbl");
+        drop(temp_storage_root);
     })
 }
 
@@ -236,6 +246,10 @@ struct Args {
 
     #[arg(long, default_value = "1")]
     purge_threads: usize,
+
+    /// storage root for benchmark files; defaults to a temporary directory
+    #[arg(long)]
+    storage_root: Option<PathBuf>,
 }
 
 #[inline]
@@ -288,18 +302,4 @@ pub async fn sbtest(engine: &Engine) -> TableID {
 
     drop(session);
     table_id
-}
-
-fn remove_files(file_pattern: &str) {
-    let files = glob::glob(file_pattern);
-    if files.is_err() {
-        return;
-    }
-    for f in files.unwrap() {
-        if f.is_err() {
-            continue;
-        }
-        let fp = f.unwrap();
-        let _ = std::fs::remove_file(&fp);
-    }
 }

@@ -738,7 +738,7 @@ pub mod tests {
             let main_dir = temp_dir.path().to_path_buf();
             let engine = EngineConfig::default()
                 .storage_root(main_dir.clone())
-                .trx(TrxSysConfig::default().skip_recovery(true))
+                .trx(TrxSysConfig::default())
                 .build()
                 .await
                 .unwrap();
@@ -760,11 +760,7 @@ pub mod tests {
 
             let engine = EngineConfig::default()
                 .storage_root(main_dir.clone())
-                .trx(
-                    TrxSysConfig::default()
-                        .log_file_stem("catalog-allocator")
-                        .skip_recovery(false),
-                )
+                .trx(TrxSysConfig::default().log_file_stem("catalog-allocator"))
                 .build()
                 .await
                 .unwrap();
@@ -808,11 +804,7 @@ pub mod tests {
 
             let engine = EngineConfig::default()
                 .storage_root(main_dir)
-                .trx(
-                    TrxSysConfig::default()
-                        .log_file_stem("catalog-allocator")
-                        .skip_recovery(false),
-                )
+                .trx(TrxSysConfig::default().log_file_stem("catalog-allocator"))
                 .build()
                 .await
                 .unwrap();
@@ -832,11 +824,7 @@ pub mod tests {
 
             let engine = EngineConfig::default()
                 .storage_root(main_dir)
-                .trx(
-                    TrxSysConfig::default()
-                        .log_file_stem("catalog-checkpoint-now")
-                        .skip_recovery(false),
-                )
+                .trx(TrxSysConfig::default().log_file_stem("catalog-checkpoint-now"))
                 .build()
                 .await
                 .unwrap();
@@ -897,11 +885,7 @@ pub mod tests {
 
             let engine = EngineConfig::default()
                 .storage_root(main_dir.clone())
-                .trx(
-                    TrxSysConfig::default()
-                        .log_file_stem("catalog-checkpoint-corrupt-bootstrap")
-                        .skip_recovery(false),
-                )
+                .trx(TrxSysConfig::default().log_file_stem("catalog-checkpoint-corrupt-bootstrap"))
                 .build()
                 .await
                 .unwrap();
@@ -947,11 +931,7 @@ pub mod tests {
 
             let err = match EngineConfig::default()
                 .storage_root(main_dir)
-                .trx(
-                    TrxSysConfig::default()
-                        .log_file_stem("catalog-checkpoint-corrupt-bootstrap")
-                        .skip_recovery(false),
-                )
+                .trx(TrxSysConfig::default().log_file_stem("catalog-checkpoint-corrupt-bootstrap"))
                 .build()
                 .await
             {
@@ -980,8 +960,7 @@ pub mod tests {
                 .storage_root(main_dir.clone())
                 .trx(
                     TrxSysConfig::default()
-                        .log_file_stem("catalog-checkpoint-invalid-delete-metadata")
-                        .skip_recovery(false),
+                        .log_file_stem("catalog-checkpoint-invalid-delete-metadata"),
                 )
                 .build()
                 .await
@@ -1033,8 +1012,7 @@ pub mod tests {
                 .storage_root(main_dir)
                 .trx(
                     TrxSysConfig::default()
-                        .log_file_stem("catalog-checkpoint-invalid-delete-metadata")
-                        .skip_recovery(false),
+                        .log_file_stem("catalog-checkpoint-invalid-delete-metadata"),
                 )
                 .build()
                 .await
@@ -1062,11 +1040,7 @@ pub mod tests {
 
             let engine = EngineConfig::default()
                 .storage_root(main_dir)
-                .trx(
-                    TrxSysConfig::default()
-                        .log_file_stem("catalog-checkpoint-heartbeat")
-                        .skip_recovery(false),
-                )
+                .trx(TrxSysConfig::default().log_file_stem("catalog-checkpoint-heartbeat"))
                 .build()
                 .await
                 .unwrap();
@@ -1108,11 +1082,7 @@ pub mod tests {
 
             let engine = EngineConfig::default()
                 .storage_root(main_dir)
-                .trx(
-                    TrxSysConfig::default()
-                        .log_file_stem("catalog-checkpoint-batch-full-range")
-                        .skip_recovery(false),
-                )
+                .trx(TrxSysConfig::default().log_file_stem("catalog-checkpoint-batch-full-range"))
                 .build()
                 .await
                 .unwrap();
@@ -1162,11 +1132,7 @@ pub mod tests {
 
             let engine = EngineConfig::default()
                 .storage_root(main_dir)
-                .trx(
-                    TrxSysConfig::default()
-                        .log_file_stem("catalog-checkpoint-mixed-user-states")
-                        .skip_recovery(false),
-                )
+                .trx(TrxSysConfig::default().log_file_stem("catalog-checkpoint-mixed-user-states"))
                 .build()
                 .await
                 .unwrap();

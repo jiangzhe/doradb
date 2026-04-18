@@ -20,7 +20,7 @@ use std::path::{Path, PathBuf};
 use super::consts::{
     DEFAULT_LOG_DIR, DEFAULT_LOG_FILE_MAX_SIZE, DEFAULT_LOG_FILE_STEM, DEFAULT_LOG_IO_DEPTH,
     DEFAULT_LOG_IO_MAX_SIZE, DEFAULT_LOG_PARTITIONS, DEFAULT_LOG_SYNC, DEFAULT_PURGE_THREADS,
-    DEFAULT_SKIP_RECOVERY, MAX_LOG_PARTITIONS,
+    MAX_LOG_PARTITIONS,
 };
 use super::path::{path_to_utf8, validate_log_file_stem};
 
@@ -54,8 +54,6 @@ pub struct TrxSysConfig {
     pub log_sync: LogSync,
     // Threads for purging undo logs.
     pub purge_threads: usize,
-    // Controls whether to skip recovery when rebooting transaction system.
-    pub skip_recovery: bool,
 }
 
 pub(crate) struct PendingTransactionSystemStartup {
@@ -166,12 +164,6 @@ impl TrxSysConfig {
     }
 
     #[inline]
-    pub fn skip_recovery(mut self, skip_recovery: bool) -> Self {
-        self.skip_recovery = skip_recovery;
-        self
-    }
-
-    #[inline]
     pub(crate) fn log_dir_ref(&self) -> &Path {
         &self.log_dir
     }
@@ -193,15 +185,11 @@ impl TrxSysConfig {
         let ctx = StorageBackend::new(self.io_depth_per_log)?;
         let file_prefix = self.file_prefix()?;
 
-        let mode = if self.skip_recovery {
+        let logs = list_log_files(&file_prefix, log_no, false)?;
+        let mode = if logs.is_empty() {
             LogPartitionMode::Done
         } else {
-            let logs = list_log_files(&file_prefix, log_no, false)?;
-            if logs.is_empty() {
-                LogPartitionMode::Done
-            } else {
-                LogPartitionMode::Recovery(VecDeque::from(logs))
-            }
+            LogPartitionMode::Recovery(VecDeque::from(logs))
         };
         Ok(LogPartitionInitializer {
             ctx,
@@ -248,7 +236,6 @@ impl TrxSysConfig {
             },
             &catalog,
             log_partition_initializers,
-            self.skip_recovery,
         )
         .await?;
 
@@ -279,7 +266,6 @@ impl Default for TrxSysConfig {
             log_partitions: DEFAULT_LOG_PARTITIONS,
             log_sync: DEFAULT_LOG_SYNC,
             purge_threads: DEFAULT_PURGE_THREADS,
-            skip_recovery: DEFAULT_SKIP_RECOVERY,
         }
     }
 }

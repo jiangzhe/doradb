@@ -1304,8 +1304,7 @@ mod tests {
                     .log_file_stem(log_file_stem)
                     .log_partitions(1)
                     .io_depth_per_log(1)
-                    .log_sync(log_sync)
-                    .skip_recovery(true),
+                    .log_sync(log_sync),
             )
             .data_buffer(
                 EvictableBufferPoolConfig::default()
@@ -1355,9 +1354,7 @@ mod tests {
             let engine = EngineConfig::default()
                 .storage_root(main_dir)
                 .trx(
-                    TrxSysConfig::default()
-                        .log_file_stem(String::from("mmap_log_reader_redo.log"))
-                        .skip_recovery(true),
+                    TrxSysConfig::default().log_file_stem(String::from("mmap_log_reader_redo.log")),
                 )
                 .data_buffer(
                     EvictableBufferPoolConfig::default()
@@ -1429,8 +1426,7 @@ mod tests {
                 .trx(
                     TrxSysConfig::default()
                         .log_file_stem(log_file_stem.clone())
-                        .log_partitions(2)
-                        .skip_recovery(true),
+                        .log_partitions(2),
                 )
                 .data_buffer(
                     EvictableBufferPoolConfig::default()
@@ -1487,8 +1483,7 @@ mod tests {
             let trx_sys_config = TrxSysConfig::default()
                 .log_dir(temp_dir.path())
                 .log_file_stem(log_file_stem)
-                .log_partitions(2)
-                .skip_recovery(true);
+                .log_partitions(2);
 
             let mut log_merger = LogMerger::default();
             for i in 0..trx_sys_config.log_partitions {
@@ -1497,9 +1492,12 @@ mod tests {
                 log_merger.add_stream(stream).unwrap();
             }
 
+            let mut merged_recs = 0usize;
             while let Some(log) = log_merger.try_next().unwrap() {
                 println!("header={:?}, payload={:?}", log.header, log.payload);
+                merged_recs += 1;
             }
+            assert!(merged_recs >= SIZE as usize);
         });
     }
 

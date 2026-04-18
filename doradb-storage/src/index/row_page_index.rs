@@ -1297,11 +1297,7 @@ mod tests {
                         .max_mem_size(64usize * 1024 * 1024)
                         .max_file_size(128usize * 1024 * 1024),
                 )
-                .trx(
-                    TrxSysConfig::default()
-                        .log_file_stem("redo_row_page_idx")
-                        .skip_recovery(true),
-                )
+                .trx(TrxSysConfig::default().log_file_stem("redo_row_page_idx"))
                 .build()
                 .await
                 .unwrap();
@@ -1342,11 +1338,7 @@ mod tests {
                         .max_mem_size(64usize * 1024 * 1024)
                         .max_file_size(128usize * 1024 * 1024),
                 )
-                .trx(
-                    TrxSysConfig::default()
-                        .log_file_stem("redo_row_page_idx")
-                        .skip_recovery(true),
-                )
+                .trx(TrxSysConfig::default().log_file_stem("redo_row_page_idx"))
                 .build()
                 .await
                 .unwrap();
@@ -1572,11 +1564,7 @@ mod tests {
                         .max_mem_size(100usize * 1024 * 1024)
                         .max_file_size(1024usize * 1024 * 1024),
                 )
-                .trx(
-                    TrxSysConfig::default()
-                        .log_file_stem("redo_row_page_idx")
-                        .skip_recovery(true),
-                )
+                .trx(TrxSysConfig::default().log_file_stem("redo_row_page_idx"))
                 .build()
                 .await
                 .unwrap();
@@ -1784,11 +1772,7 @@ mod tests {
                         .max_mem_size(64usize * 1024 * 1024)
                         .max_file_size(128usize * 1024 * 1024),
                 )
-                .trx(
-                    TrxSysConfig::default()
-                        .log_file_stem("redo_row_page_idx")
-                        .skip_recovery(true),
-                )
+                .trx(TrxSysConfig::default().log_file_stem("redo_row_page_idx"))
                 .build()
                 .await
                 .unwrap();

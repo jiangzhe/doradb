@@ -708,8 +708,7 @@ mod tests {
                 .trx(
                     TrxSysConfig::default()
                         .purge_threads(1)
-                        .log_file_stem("redo_purge_poison")
-                        .skip_recovery(true),
+                        .log_file_stem("redo_purge_poison"),
                 )
                 .build()
                 .await
@@ -756,8 +755,7 @@ mod tests {
                 .trx(
                     TrxSysConfig::default()
                         .purge_threads(1)
-                        .log_file_stem("redo_purge_promote")
-                        .skip_recovery(true),
+                        .log_file_stem("redo_purge_promote"),
                 )
                 .build()
                 .await
@@ -846,8 +844,7 @@ mod tests {
                 .trx(
                     TrxSysConfig::default()
                         .purge_threads(1)
-                        .log_file_stem("redo_purge_no_promote")
-                        .skip_recovery(true),
+                        .log_file_stem("redo_purge_no_promote"),
                 )
                 .build()
                 .await
@@ -940,8 +937,7 @@ mod tests {
                 .trx(
                     TrxSysConfig::default()
                         .purge_threads(1)
-                        .log_file_stem("redo_purge_promote_missing_page")
-                        .skip_recovery(true),
+                        .log_file_stem("redo_purge_promote_missing_page"),
                 )
                 .build()
                 .await
@@ -1048,8 +1044,7 @@ mod tests {
                 .trx(
                     TrxSysConfig::default()
                         .purge_threads(1)
-                        .log_file_stem("redo_purge_no_promote_missing_page")
-                        .skip_recovery(true),
+                        .log_file_stem("redo_purge_no_promote_missing_page"),
                 )
                 .build()
                 .await
@@ -1163,8 +1158,7 @@ mod tests {
                 .trx(
                     TrxSysConfig::default()
                         .purge_threads(1)
-                        .log_file_stem("redo_purge")
-                        .skip_recovery(true),
+                        .log_file_stem("redo_purge"),
                 )
                 .build()
                 .await
@@ -1247,8 +1241,7 @@ mod tests {
                 .trx(
                     TrxSysConfig::default()
                         .purge_threads(2)
-                        .log_file_stem("redo_purge")
-                        .skip_recovery(true),
+                        .log_file_stem("redo_purge"),
                 )
                 .build()
                 .await
