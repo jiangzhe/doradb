@@ -1,7 +1,7 @@
 ---
 id: 000123
 title: Remove Recovery Skip Option
-status: proposal
+status: implemented
 created: 2026-04-18
 github_issue: 568
 ---
@@ -155,6 +155,52 @@ checklist before resolving the task.
 
 ## Implementation Notes
 
+- Removed the public recovery-skip configuration surface: `TrxSysConfig` no
+  longer has a `skip_recovery` field or builder, `DEFAULT_SKIP_RECOVERY` is no
+  longer exported, and startup no longer forwards a skip flag into recovery.
+- Made transaction-system startup always inspect redo log partitions.
+  `log_partition_initializer` now lists log files for every partition and uses
+  recovery mode whenever existing logs are present.
+- Simplified `log_recover` so it always builds a `LogMerger`, runs
+  `LogRecovery::recover_all`, converts the returned streams back into
+  partition initializers, and seeds the next transaction timestamp from the
+  recovered maximum commit timestamp.
+- Migrated test, helper, and example call sites by deleting redundant
+  `.skip_recovery(false)` calls and removing `.skip_recovery(true)` from fresh
+  temporary-root setups. Benchmarks that previously defaulted storage files
+  into the current directory now use temporary storage roots by default, with
+  explicit `--storage-root` arguments where persistent benchmark roots remain
+  useful.
+- Verified the nontrivial call sites. The unstarted transaction-system shutdown
+  test still prepares over an empty log directory without a skip mode, and
+  `test_log_merger` now directly reopens recovery streams and asserts that
+  merged records are observed.
+- Removed five benchmark-style transaction-system tests from
+  `doradb-storage/src/trx/sys.rs`: the mutex and atomic transaction-id timing
+  tests, their worker helpers, and the one-million-iteration begin/commit
+  timing test. The remaining `trx::sys` tests cover functional transaction
+  startup, poison handling, and log rotation.
+- Post-implementation checklist found no required fixes. No unsafe code was
+  added or modified, and no deferred follow-up backlog was needed beyond
+  closing the source backlog as implemented.
+
+Validation:
+
+- `cargo fmt --all --check`
+- `cargo check -p doradb-storage --examples`
+- `cargo nextest run -p doradb-storage`
+  - Result: `595` tests passed, `0` skipped.
+- `tools/coverage_focus.rs --path doradb-storage/src/trx`
+  - Result: `6025/6414`, `93.94%`.
+- `tools/coverage_focus.rs --path doradb-storage/src/conf/trx.rs`
+  - Result: `142/148`, `95.95%`.
+- `tools/coverage_focus.rs --path doradb-storage/src`
+  - Result: `52749/57195`, `92.23%`.
+- `cargo clippy -p doradb-storage --all-targets -- -D warnings`
+- `git diff --check origin/main..HEAD`
+- `rg -n "skip_recovery|skip recovery|DEFAULT_SKIP_RECOVERY" .`
+  - Result: remaining references are only in this task document and the source
+    backlog before resolve-time archival.
 
 ## Impacts
 
