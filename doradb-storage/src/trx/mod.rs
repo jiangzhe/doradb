@@ -230,6 +230,11 @@ impl ActiveTrx {
         self.gc_row_pages.extend(pages);
     }
 
+    /// Attach one swapped user-table root to this transaction for GC-horizon retention.
+    ///
+    /// Checkpoint transactions call this after publishing a new table-file root
+    /// so the replaced root remains alive until the committed transaction is
+    /// purged. A transaction may retain at most one table root.
     #[inline]
     pub(crate) fn retain_old_table_root(&mut self, old_root: OldRoot) -> Result<()> {
         if self.old_table_root.is_some() {
@@ -632,6 +637,11 @@ impl CommittedTrx {
         self.payload.as_ref().map(|p| &p.gc_row_pages[..])
     }
 
+    /// Release the retained table root after this committed transaction reaches purge.
+    ///
+    /// Purge calls this only after the transaction's commit timestamp is below
+    /// the active-snapshot horizon, making the previous table-file root
+    /// unreachable by active readers.
     #[inline]
     pub(crate) fn release_old_table_root(&mut self) {
         if let Some(payload) = self.payload.as_mut() {

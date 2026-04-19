@@ -1,7 +1,7 @@
 ---
 id: 000124
 title: Checkpoint Old Root Retention
-status: proposal
+status: implemented
 created: 2026-04-19
 github_issue: 570
 ---
@@ -66,7 +66,7 @@ Issue Labels:
 - codex
 
 Source Backlogs:
-- docs/backlogs/000089-checkpoint-old-root-retention.md
+- docs/backlogs/closed/000089-checkpoint-old-root-retention.md
 
 Related Backlogs:
 - docs/backlogs/000093-transaction-context-effects-split-active-root-proofs.md
@@ -244,6 +244,67 @@ tools/coverage_focus.rs --path doradb-storage/src/table
 
 ## Implementation Notes
 
+Implemented in branch `root-retention` and PR #571 for issue #570.
+
+- Added retained old-root ownership to the transaction lifecycle:
+  `ActiveTrx`, prepared payloads, precommit payloads, and committed payloads
+  now carry an optional `OldRoot`. Checkpoint transactions attach the swapped
+  table-file root with `retain_old_table_root`, and purge explicitly releases
+  it only after the committed transaction crosses the active-snapshot horizon.
+- Replaced `Table::checkpoint`'s direct old-root drop with transaction-owned
+  retention after table-file root publication and block-index refresh. Rollback,
+  fatal rollback cleanup, and precommit abort paths drop retained roots without
+  leaking ownership.
+- Added `Error::OldTableRootAlreadyRetained` so duplicate retained-root
+  attachment fails with a dedicated error instead of generic `InvalidState`.
+- Documented the active-root read contract on `CowFile::active_root` and
+  `TableFile::active_root`, and changed production multi-field call sites to
+  bind one local active-root reference in session table creation,
+  `ColumnStorage::new`, checkpoint block-index refresh, and recovery table-state
+  tracking.
+- Kept secondary MemIndex cleanup on owned scalar root snapshots and updated the
+  comment to point at the deferred transaction context/effects split instead of
+  old-root retention alone.
+- Added a test-only `OldCowRoot` drop observer under
+  `#[cfg(test)] pub(crate) mod tests` in `cow_file.rs`; no production registry
+  or lock was introduced.
+- Added regression coverage for transaction payload movement, duplicate retain
+  errors, active rollback, precommit abort, and checkpoint old-root retention
+  until an active pre-checkpoint reader is gone and purge advances.
+- The implementation required one new unsafe trait impl,
+  `unsafe impl<M> Sync for OldCowRoot<M>`. The safety contract is documented on
+  the impl: shared references to the guard do not expose the pointed
+  `ActiveRoot`, and reclamation only happens when the guard is owned and
+  dropped. The unsafe usage baseline was refreshed.
+- Deferred the broader proof-gated runtime `ActiveRoot` API and transaction
+  context/effects split to
+  `docs/backlogs/000093-transaction-context-effects-split-active-root-proofs.md`.
+- Closed the source backlog
+  `docs/backlogs/closed/000089-checkpoint-old-root-retention.md` as
+  implemented.
+
+Validation completed:
+
+- `cargo fmt --all --check`: passed.
+- `cargo nextest run -p doradb-storage`: 600 tests passed.
+- `tools/coverage_focus.rs --path doradb-storage/src/trx`: 94.07%.
+- `tools/coverage_focus.rs --path doradb-storage/src/table`: 90.38%.
+- `tools/coverage_focus.rs --path doradb-storage/src/file/cow_file.rs`:
+  94.30%.
+- `cargo clippy -p doradb-storage --all-targets -- -D warnings`: passed.
+- `tools/unsafe_inventory.rs --top 40`: matched the refreshed unsafe baseline
+  with total unsafe count 148.
+- `git diff --check origin/main...HEAD`: passed.
+
+Checklist outcome:
+
+- The post-implementation checklist initially found missing doc comments on the
+  new crate-public transaction helpers. Those comments were added to
+  `retain_old_table_root` and `release_old_table_root`, then
+  `cargo fmt --all --check` and
+  `cargo clippy -p doradb-storage --all-targets -- -D warnings` passed.
+- No remaining task-checklist issues are known.
+
 ## Impacts
 
 - `doradb-storage/src/table/persistence.rs`
@@ -272,8 +333,8 @@ tools/coverage_focus.rs --path doradb-storage/src/table
   - `ColumnStorage::new`
 - `doradb-storage/src/trx/recover.rs`
   - recovery root-field binding
-- `docs/backlogs/000089-checkpoint-old-root-retention.md`
-  - source backlog to close during `task resolve`
+- `docs/backlogs/closed/000089-checkpoint-old-root-retention.md`
+  - source backlog closed during `task resolve`
 - `docs/backlogs/000093-transaction-context-effects-split-active-root-proofs.md`
   - deferred follow-up backlog referenced by this task
 
@@ -301,13 +362,13 @@ tools/coverage_focus.rs --path doradb-storage/src/table
 
 ## Open Questions
 
-1. Whether root-drop timing can be asserted cleanly with existing APIs or needs
-   a narrow `#[cfg(test)]` drop-observation hook on `OldCowRoot`.
-2. Whether direct transaction-payload ownership of `Option<OldRoot>` creates an
-   undesirable module dependency from `trx` to `file::table_file::OldRoot`; if
-   so, use a small retained-resource wrapper in an ownership-neutral module
-   instead of adding a second GC queue.
-3. Whether catalog `MultiTableFile` old-root retention should receive the same
-   treatment in a later task. This task is scoped to the user-table checkpoint
-   backlog unless implementation discovers shared generic code that makes the
-   catalog case effectively free and low risk.
+1. Resolved: root-drop timing is asserted through a narrow
+   `#[cfg(test)]` drop-observation hook on `OldCowRoot`.
+2. Resolved: direct transaction-payload ownership of `Option<OldRoot>` is
+   accepted for this task because it keeps the lifecycle explicit and avoids a
+   second retention queue.
+3. Deferred: catalog `MultiTableFile` old-root retention remains out of scope.
+   This task changed only user-table checkpoint root retention.
+4. Deferred: proof-gated runtime `ActiveRoot` borrowing and transaction
+   context/effects splitting are tracked by
+   `docs/backlogs/000093-transaction-context-effects-split-active-root-proofs.md`.
