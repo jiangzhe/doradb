@@ -1,7 +1,7 @@
 ---
 id: 000125
 title: Checkpoint Root Liveness Gate
-status: proposal
+status: implemented
 created: 2026-04-19
 github_issue: 572
 ---
@@ -18,7 +18,7 @@ checkpoint scheduling can distinguish "run now" from "delay and retry later".
 
 This task should add checkpoint readiness and outcome types, return a normal
 delayed outcome when the root horizon has not advanced far enough, and preserve a
-final execution-time guard before checkpoint state is mutated or a root is
+checkpoint execution-time guard before checkpoint state is mutated or a root is
 published. It should also document that `gc_block_list` is not the future block
 reclamation mechanism; future table-file/DiskTree block reclamation should be
 based on root reachability, including recovery-time reclamation when no active
@@ -65,7 +65,7 @@ Issue Labels:
 - codex
 
 Source Backlogs:
-- docs/backlogs/000090-protect-disk-tree-root-lifetime.md
+- docs/backlogs/closed/000090-protect-disk-tree-root-lifetime.md
 
 Related Design:
 - docs/architecture.md
@@ -75,7 +75,7 @@ Related Design:
 - docs/table-file.md
 - docs/garbage-collect.md
 - docs/tasks/000124-checkpoint-old-root-retention.md
-- docs/rfcs/0014-dual-tree-secondary-index.md
+- RFC 0014 dual-tree secondary index design context
 - docs/process/unit-test.md
 
 ## Goals
@@ -89,9 +89,8 @@ Related Design:
    silent no-op.
 4. Include root and horizon details in the delayed reason so callers can log,
    schedule retry/backoff, or expose checkpoint pressure diagnostics.
-5. Keep an execution-time liveness guard tied to the root snapshot that will be
-   published from, so a stale preflight decision cannot race with another root
-   publication.
+5. Keep an execution-time liveness guard before checkpoint mutation, and rely on
+   the monotonic min-active horizon after the entry check succeeds.
 6. Ensure checkpoint returns `Delayed` before moving frozen pages to transition,
    applying deletion checkpoint state, publishing DiskTree roots, or swapping the
    table-file root.
@@ -226,8 +225,59 @@ node code, keep the unsafe boundary private, document each invariant with a
 
 ## Implementation Notes
 
-Keep this section blank in design phase. Fill this section during `task resolve`
-after implementation, tests, review, and verification are completed.
+Implemented in branch `root-live-gate` and PR #573 for issue #572.
+
+- Added `CheckpointReadiness`, `CheckpointDelayReason`, and
+  `CheckpointOutcome` in the user-table persistence API. Checkpoint callers now
+  distinguish `Published` from normal `Delayed` scheduling pressure without
+  treating root-liveness delay as a storage error.
+- Changed `Table::checkpoint` to check
+  `active_root.trx_id < trx_sys.calc_min_active_sts_for_gc()` before
+  checkpoint mutation. Delayed checkpoints return root/horizon diagnostics
+  before `MutableTableFile::fork`, frozen-page transition, deletion checkpoint
+  application, secondary DiskTree publication, or table-file root publication.
+- Kept the refreshed `cutoff_ts` after frozen-page stabilization for transition
+  and LWC build work, but removed the second root-liveness check. The second
+  check is redundant because the min-active horizon only advances for the
+  readiness decision after the entry check succeeds.
+- Added up-front idle-session validation so an active checkpoint session returns
+  `Error::NotSupported("checkpoint requires idle session")` before any delayed
+  outcome can hide misuse. The later checkpoint transaction creation keeps the
+  same `try_begin_trx()?.ok_or(...)` error path and message.
+- Preserved successful publication semantics: checkpoint transaction creation,
+  LWC block building, deletion checkpoint application, secondary DiskTree
+  sidecar publication, block-index root refresh, table-file root publication,
+  and old-root transaction retention remain the success path.
+- Updated direct checkpoint callers and tests to handle `CheckpointOutcome`.
+  Recovery and benchmark paths that require durable checkpoint state assert
+  `Published`.
+- Documented `gc_block_list` as legacy/reserved for user-table reclaim and
+  updated table-file, checkpoint/recovery, and GC docs to point future reclaim
+  work at root reachability instead.
+- Closed the source backlog
+  `docs/backlogs/closed/000090-protect-disk-tree-root-lifetime.md` as replaced:
+  the checkpoint root-liveness gate is implemented here, and broader
+  root-reachability block reclamation is tracked by
+  `docs/backlogs/000094-table-file-root-reachability-gc.md`.
+
+Validation completed:
+
+- `cargo fmt --package doradb-storage -- --check`: passed.
+- `cargo nextest run -p doradb-storage`: 605 tests passed.
+- `cargo nextest run -p doradb-storage test_checkpoint_requires_idle_session_before_delayed_outcome`:
+  1 test passed.
+- `cargo clippy -p doradb-storage --all-targets -- -D warnings`: passed.
+- `tools/coverage_focus.rs --path doradb-storage/src/table`: 90.50% total
+  table coverage; `doradb-storage/src/table/persistence.rs` reached 93.38%.
+- `git diff --check`: passed.
+
+Checklist outcome:
+
+- The prior post-implementation checklist found no required fixes. A later
+  review finding about delayed checkpoint outcomes hiding non-idle session
+  misuse was verified against the current code and fixed with regression
+  coverage.
+- No remaining task-checklist issues are known.
 
 ## Impacts
 
@@ -284,8 +334,9 @@ after implementation, tests, review, and verification are completed.
    checkpoint root CTS crosses the min-active horizon.
 9. Recovery tests that need durable user-table checkpoint state assert
    `Published` and continue to load the latest valid table root.
-10. Secondary DiskTree checkpoint tests cover delayed-then-published behavior so
-    root updates are not partially visible after a delay.
+10. Secondary DiskTree checkpoint tests continue to cover publication and
+    atomicity; delayed checkpoint tests cover that no table-file, block-index,
+    or secondary-root metadata is published while root liveness is delayed.
 11. Existing tests around old-root retention, rollback, precommit abort, and
     purge release continue to pass.
 12. Run the supported validation pass:
@@ -306,10 +357,13 @@ after implementation, tests, review, and verification are completed.
 1. Full table-file and DiskTree root-reachability GC remains follow-up work. If
    it spans allocator rebuild, recovery-time scanning, page reuse, compaction,
    and persistent format cleanup, it should be designed as an RFC rather than a
-   single task.
+   single task. Follow-up is tracked by
+   `docs/backlogs/000094-table-file-root-reachability-gc.md`.
 2. Physical removal of `gc_block_list` from metadata is intentionally deferred.
    A later compatibility or format-cleanup task should decide whether to remove
-   the field, keep it reserved, or replace it with root-reachability GC metadata.
+   the field, keep it reserved, or replace it with root-reachability GC metadata;
+   that decision is included in
+   `docs/backlogs/000094-table-file-root-reachability-gc.md`.
 3. Catalog `MultiTableFile` uses the same CoW helper but has different runtime
    visibility rules. This task should not change catalog checkpoint behavior
    unless implementation finds a small shared helper is unavoidable.
