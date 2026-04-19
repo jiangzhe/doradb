@@ -131,10 +131,9 @@ impl Table {
     #[inline]
     fn capture_mem_index_cleanup_snapshot(&self, min_active_sts: TrxID) -> MemIndexCleanupSnapshot {
         let active_root = self.file().active_root();
-        // Keep this as an owned field snapshot until checkpoint old-root
-        // retention is wired through transaction GC. The current checkpoint
-        // path can drop the swapped `OldRoot` immediately after publication,
-        // so holding `&ActiveRoot` across async cleanup is not lifetime-safe.
+        // Keep this as an owned field snapshot until the deferred
+        // transaction-context/effects split can provide a proof-gated
+        // `ActiveRoot` borrow that fits this async cleanup shape.
         MemIndexCleanupSnapshot {
             table_root_ts: active_root.trx_id,
             pivot_row_id: active_root.pivot_row_id,

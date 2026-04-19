@@ -292,6 +292,7 @@ impl TransactionSystem {
         }
         trx.redo.clear();
         trx.gc_row_pages.clear();
+        trx.old_table_root.take();
         self.log_partitions[trx.log_no].gc_buckets[trx.gc_no].gc_analyze_rollback(trx.sts);
         if let Some(s) = trx.session.take() {
             s.rollback();

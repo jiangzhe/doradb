@@ -30,7 +30,8 @@ pub mod ver_map;
 use crate::buffer::PageID;
 use crate::buffer::PoolGuards;
 use crate::engine::EngineRef;
-use crate::error::Result;
+use crate::error::{Error, Result};
+use crate::file::table_file::OldRoot;
 use crate::session::SessionState;
 use crate::stmt::Statement;
 use crate::trx::log_replay::TrxLog;
@@ -152,6 +153,8 @@ pub struct ActiveTrx {
     pub(crate) redo: RedoLogs,
     // row pages to be GCed after commit.
     pub(crate) gc_row_pages: Vec<PageID>,
+    // Swapped table-file root retained until transaction GC reaches the safe horizon.
+    old_table_root: Option<OldRoot>,
 }
 
 impl ActiveTrx {
@@ -174,6 +177,7 @@ impl ActiveTrx {
             index_undo: IndexUndoLogs::empty(),
             redo: RedoLogs::default(),
             gc_row_pages: Vec::new(),
+            old_table_root: None,
         }
     }
 
@@ -215,12 +219,24 @@ impl ActiveTrx {
     /// Returns whether the transaction is readonly.
     #[inline]
     pub fn readonly(&self) -> bool {
-        self.redo.is_empty() && self.row_undo.is_empty() && self.gc_row_pages.is_empty()
+        self.redo.is_empty()
+            && self.row_undo.is_empty()
+            && self.gc_row_pages.is_empty()
+            && self.old_table_root.is_none()
     }
 
     #[inline]
     pub fn extend_gc_row_pages(&mut self, pages: Vec<PageID>) {
         self.gc_row_pages.extend(pages);
+    }
+
+    #[inline]
+    pub(crate) fn retain_old_table_root(&mut self, old_root: OldRoot) -> Result<()> {
+        if self.old_table_root.is_some() {
+            return Err(Error::OldTableRootAlreadyRetained);
+        }
+        self.old_table_root = Some(old_root);
+        Ok(())
     }
 
     /// Prepare current transaction for committing.
@@ -242,6 +258,7 @@ impl ActiveTrx {
                     row_undo: RowUndoLogs::empty(),
                     index_undo: IndexUndoLogs::empty(),
                     gc_row_pages: Vec::new(),
+                    old_table_root: None,
                 }),
                 session: self.session.take(),
             };
@@ -254,7 +271,10 @@ impl ActiveTrx {
             self.status.preparing.store(true, Ordering::SeqCst);
         }
         // use bincode to serialize redo log
-        let redo_bin = if self.redo.is_empty() && self.gc_row_pages.is_empty() {
+        let redo_bin = if self.redo.is_empty()
+            && self.gc_row_pages.is_empty()
+            && self.old_table_root.is_none()
+        {
             None
         } else {
             Some(TrxLog::new(
@@ -268,6 +288,7 @@ impl ActiveTrx {
         let row_undo = mem::take(&mut self.row_undo);
         let index_undo = mem::take(&mut self.index_undo);
         let gc_row_pages = mem::take(&mut self.gc_row_pages);
+        let old_table_root = self.old_table_root.take();
         PreparedTrx {
             sts: Some(self.sts),
             redo_bin,
@@ -279,6 +300,7 @@ impl ActiveTrx {
                 row_undo,
                 index_undo,
                 gc_row_pages,
+                old_table_root,
             }),
             session: self.session.take(),
         }
@@ -327,6 +349,7 @@ impl ActiveTrx {
         self.row_undo = RowUndoLogs::empty();
         self.index_undo = IndexUndoLogs::empty();
         self.gc_row_pages.clear();
+        self.old_table_root.take();
         if let Some(session) = self.session.take() {
             session.rollback();
         }
@@ -343,6 +366,10 @@ impl Drop for ActiveTrx {
             self.gc_row_pages.is_empty(),
             "gc row pages should be cleared"
         );
+        assert!(
+            self.old_table_root.is_none(),
+            "old table root should be cleared"
+        );
         assert!(self.session.is_none(), "session should be cleared");
     }
 }
@@ -358,6 +385,7 @@ pub struct PreparedTrxPayload {
     row_undo: RowUndoLogs,
     index_undo: IndexUndoLogs,
     gc_row_pages: Vec<PageID>,
+    old_table_root: Option<OldRoot>,
 }
 
 /// PrecommitTrx has been assigned commit timestamp and already prepared redo log binary.
@@ -391,6 +419,7 @@ impl PreparedTrx {
                 row_undo,
                 mut index_undo,
                 gc_row_pages,
+                old_table_root,
             }) => {
                 // Once we get a concrete CTS, we won't rollback this transaction.
                 // So we convert IndexUndo to IndexGC, and let purge threads to
@@ -406,6 +435,7 @@ impl PreparedTrx {
                         row_undo,
                         index_gc,
                         gc_row_pages,
+                        old_table_root,
                     }),
                     session: self.session.take(),
                 }
@@ -429,7 +459,9 @@ impl PreparedTrx {
             && self
                 .payload
                 .as_ref()
-                .map(|p| p.row_undo.is_empty() && p.gc_row_pages.is_empty())
+                .map(|p| {
+                    p.row_undo.is_empty() && p.gc_row_pages.is_empty() && p.old_table_root.is_none()
+                })
                 .unwrap_or(true)
     }
 
@@ -459,6 +491,7 @@ pub struct PrecommitTrxPayload {
     pub row_undo: RowUndoLogs,
     pub index_gc: Vec<IndexPurgeEntry>,
     pub gc_row_pages: Vec<PageID>,
+    old_table_root: Option<OldRoot>,
 }
 
 /// PrecommitTrx has been assigned commit timestamp and already prepared redo log binary.
@@ -495,6 +528,7 @@ impl PrecommitTrx {
                 row_undo,
                 index_gc,
                 gc_row_pages,
+                old_table_root,
             }) => {
                 // For user transaction, we need to notify readers that this transaction is committed,
                 // and readers can continue their work.
@@ -518,6 +552,7 @@ impl PrecommitTrx {
                         row_undo,
                         index_gc,
                         gc_row_pages,
+                        old_table_root,
                     }),
                 }
             }
@@ -562,6 +597,7 @@ pub struct CommittedTrxPayload {
     pub row_undo: RowUndoLogs,
     pub index_gc: Vec<IndexPurgeEntry>,
     pub gc_row_pages: Vec<PageID>,
+    old_table_root: Option<OldRoot>,
 }
 
 pub struct CommittedTrx {
@@ -594,5 +630,165 @@ impl CommittedTrx {
     #[inline]
     pub fn gc_row_pages(&self) -> Option<&[PageID]> {
         self.payload.as_ref().map(|p| &p.gc_row_pages[..])
+    }
+
+    #[inline]
+    pub(crate) fn release_old_table_root(&mut self) {
+        if let Some(payload) = self.payload.as_mut() {
+            payload.old_table_root.take();
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::buffer::PoolRole;
+    use crate::catalog::{ColumnAttributes, ColumnSpec, TableMetadata};
+    use crate::conf::{EngineConfig, EvictableBufferPoolConfig, TrxSysConfig};
+    use crate::engine::Engine;
+    use crate::file::cow_file::tests::old_root_drop_count;
+    use crate::file::table_file::MutableTableFile;
+    use crate::value::ValKind;
+    use std::sync::Arc;
+    use tempfile::TempDir;
+
+    async fn test_engine(log_file_stem: &str) -> (TempDir, Engine) {
+        let temp_dir = TempDir::new().unwrap();
+        let engine = EngineConfig::default()
+            .storage_root(temp_dir.path().to_path_buf())
+            .data_buffer(
+                EvictableBufferPoolConfig::default()
+                    .role(PoolRole::Mem)
+                    .max_mem_size(64usize * 1024 * 1024)
+                    .max_file_size(128usize * 1024 * 1024),
+            )
+            .trx(
+                TrxSysConfig::default()
+                    .purge_threads(1)
+                    .log_file_stem(log_file_stem),
+            )
+            .build()
+            .await
+            .unwrap();
+        (temp_dir, engine)
+    }
+
+    async fn swapped_old_root(engine: &Engine, table_id: u64) -> (usize, OldRoot) {
+        let metadata = Arc::new(TableMetadata::new(
+            vec![ColumnSpec::new(
+                "c0",
+                ValKind::U64,
+                ColumnAttributes::empty(),
+            )],
+            vec![],
+        ));
+        let mutable = engine
+            .table_fs
+            .create_table_file(table_id, metadata, false)
+            .unwrap();
+        let (table_file, old_root) = mutable.commit(1, false).await.unwrap();
+        assert!(old_root.is_none());
+
+        let old_root_ptr = table_file.active_root() as *const _ as usize;
+        let mutable = MutableTableFile::fork(&table_file, engine.table_fs.background_writes());
+        let (_table_file, old_root) = mutable.commit(2, false).await.unwrap();
+        (old_root_ptr, old_root.unwrap())
+    }
+
+    #[test]
+    fn test_old_table_root_moves_to_committed_payload_and_releases_explicitly() {
+        smol::block_on(async {
+            let (_temp_dir, engine) = test_engine("redo_old_root_payload").await;
+            let (old_root_ptr, old_root) = swapped_old_root(&engine, 91_001).await;
+            let drop_count_before = old_root_drop_count(old_root_ptr);
+
+            let session_state = Arc::new(SessionState::new(engine.new_ref().unwrap()));
+            let mut trx = ActiveTrx::new(session_state, MIN_ACTIVE_TRX_ID + 10, 10, 0, 0);
+            trx.retain_old_table_root(old_root).unwrap();
+            assert!(!trx.readonly());
+
+            let prepared = trx.prepare();
+            assert!(prepared.redo_bin.is_some());
+            assert!(prepared.payload.as_ref().unwrap().old_table_root.is_some());
+
+            let mut precommit = prepared.fill_cts(20);
+            assert!(precommit.payload.as_ref().unwrap().old_table_root.is_some());
+            precommit.redo_bin.take();
+
+            let mut committed = precommit.commit();
+            assert_eq!(old_root_drop_count(old_root_ptr), drop_count_before);
+            assert!(committed.payload.as_ref().unwrap().old_table_root.is_some());
+
+            committed.release_old_table_root();
+            assert_eq!(old_root_drop_count(old_root_ptr), drop_count_before + 1);
+        });
+    }
+
+    #[test]
+    fn test_old_table_root_retain_rejects_duplicate_with_dedicated_error() {
+        smol::block_on(async {
+            let (_temp_dir, engine) = test_engine("redo_old_root_duplicate").await;
+            let (first_old_root_ptr, first_old_root) = swapped_old_root(&engine, 91_004).await;
+            let (second_old_root_ptr, second_old_root) = swapped_old_root(&engine, 91_005).await;
+            let first_drop_count_before = old_root_drop_count(first_old_root_ptr);
+            let second_drop_count_before = old_root_drop_count(second_old_root_ptr);
+
+            let session_state = Arc::new(SessionState::new(engine.new_ref().unwrap()));
+            let mut trx = ActiveTrx::new(session_state, MIN_ACTIVE_TRX_ID + 12, 12, 0, 0);
+            trx.retain_old_table_root(first_old_root).unwrap();
+
+            let err = trx.retain_old_table_root(second_old_root).unwrap_err();
+            assert!(matches!(err, Error::OldTableRootAlreadyRetained));
+            assert_eq!(
+                old_root_drop_count(first_old_root_ptr),
+                first_drop_count_before
+            );
+            assert_eq!(
+                old_root_drop_count(second_old_root_ptr),
+                second_drop_count_before + 1
+            );
+
+            trx.discard_after_fatal_rollback();
+            assert_eq!(
+                old_root_drop_count(first_old_root_ptr),
+                first_drop_count_before + 1
+            );
+        });
+    }
+
+    #[test]
+    fn test_old_table_root_drops_on_active_rollback() {
+        smol::block_on(async {
+            let (_temp_dir, engine) = test_engine("redo_old_root_active_rollback").await;
+            let (old_root_ptr, old_root) = swapped_old_root(&engine, 91_002).await;
+            let drop_count_before = old_root_drop_count(old_root_ptr);
+
+            let mut session = engine.try_new_session().unwrap();
+            let mut trx = session.try_begin_trx().unwrap().unwrap();
+            trx.retain_old_table_root(old_root).unwrap();
+            trx.rollback().await.unwrap();
+
+            assert_eq!(old_root_drop_count(old_root_ptr), drop_count_before + 1);
+        });
+    }
+
+    #[test]
+    fn test_old_table_root_drops_on_precommit_abort() {
+        smol::block_on(async {
+            let (_temp_dir, engine) = test_engine("redo_old_root_precommit_abort").await;
+            let (old_root_ptr, old_root) = swapped_old_root(&engine, 91_003).await;
+            let drop_count_before = old_root_drop_count(old_root_ptr);
+
+            let session_state = Arc::new(SessionState::new(engine.new_ref().unwrap()));
+            let mut trx = ActiveTrx::new(session_state, MIN_ACTIVE_TRX_ID + 11, 11, 0, 0);
+            trx.retain_old_table_root(old_root).unwrap();
+
+            let prepared = trx.prepare();
+            let precommit = prepared.fill_cts(21);
+            precommit.abort();
+
+            assert_eq!(old_root_drop_count(old_root_ptr), drop_count_before + 1);
+        });
     }
 }

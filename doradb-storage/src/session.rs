@@ -217,11 +217,12 @@ impl Session {
         // 8. Prepare in-memory representation of new table
         let meta_pool_guard = self.pool_guards().meta_guard();
         let index_pool_guard = self.pool_guards().index_guard();
+        let active_root = table_file.active_root();
         let blk_idx = BlockIndex::new(
             engine.meta_pool.clone_inner(),
             meta_pool_guard,
-            table_file.active_root().pivot_row_id,
-            table_file.active_root().column_block_index_root,
+            active_root.pivot_row_id,
+            active_root.column_block_index_root,
         )
         .await?;
         let disk_pool = engine.disk_pool.clone_inner();

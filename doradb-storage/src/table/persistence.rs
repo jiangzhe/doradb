@@ -767,7 +767,12 @@ impl TablePersistence for Table {
                 active_root.column_block_index_root,
             )
             .await;
-        drop(old_root);
+        if let Some(old_root) = old_root
+            && let Err(err) = trx.retain_old_table_root(old_root)
+        {
+            trx_sys.rollback(trx).await?;
+            return Err(err);
+        }
 
         let _cts = trx_sys.commit(trx).await?;
         Ok(())

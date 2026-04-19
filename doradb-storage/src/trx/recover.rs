@@ -296,9 +296,10 @@ impl<'a> LogRecovery<'a> {
             .get_table(table_id)
             .await
             .ok_or(Error::TableNotFound)?;
+        let active_root = table.file().active_root();
         let state = RecoveryTableState {
-            heap_redo_start_ts: table.file().active_root().heap_redo_start_ts,
-            deletion_cutoff_ts: table.file().active_root().deletion_cutoff_ts,
+            heap_redo_start_ts: active_root.heap_redo_start_ts,
+            deletion_cutoff_ts: active_root.deletion_cutoff_ts,
         };
         self.max_recovered_cts = self
             .max_recovered_cts

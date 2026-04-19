@@ -257,6 +257,10 @@ impl<M> CowFile<M> {
     }
 
     /// Return the current in-memory active root reference.
+    ///
+    /// Every call observes the root pointer currently published at that moment.
+    /// Callers that need multiple fields from one logical root snapshot must
+    /// bind one local reference and reuse it.
     #[inline]
     pub fn active_root(&self) -> &ActiveRoot<M> {
         Self::active_root_from_raw(self.load_active_root_raw())
@@ -550,6 +554,9 @@ pub struct OldCowRoot<M>(NonNull<ActiveRoot<M>>);
 impl<M> Drop for OldCowRoot<M> {
     #[inline]
     fn drop(&mut self) {
+        #[cfg(test)]
+        tests::record_old_root_drop(self.0.as_ptr() as usize);
+
         // SAFETY: old roots are produced by active-root swap and reclaimed once.
         unsafe {
             drop(Box::from_raw(self.0.as_ptr()));
@@ -561,9 +568,42 @@ impl<M> Drop for OldCowRoot<M> {
 // active-root swap path; moving it transfers that one-shot ownership.
 unsafe impl<M: Send> Send for OldCowRoot<M> {}
 
+// SAFETY: shared references to `OldCowRoot` do not expose the pointed
+// `ActiveRoot`; the guard only reclaims the pointer when owned and dropped.
+unsafe impl<M> Sync for OldCowRoot<M> {}
+
 #[inline]
 fn remove_file_by_fd(fd: RawFd) -> std::io::Result<()> {
     let proc_path = format!("/proc/self/fd/{}", fd);
     let real_path = fs::read_link(&proc_path)?;
     fs::remove_file(real_path)
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+
+    static OLD_ROOT_DROPS: OnceLock<Mutex<HashMap<usize, usize>>> = OnceLock::new();
+
+    #[inline]
+    fn old_root_drops() -> &'static Mutex<HashMap<usize, usize>> {
+        OLD_ROOT_DROPS.get_or_init(|| Mutex::new(HashMap::new()))
+    }
+
+    #[inline]
+    pub(super) fn record_old_root_drop(ptr: usize) {
+        let mut drops = old_root_drops().lock().unwrap();
+        *drops.entry(ptr).or_default() += 1;
+    }
+
+    #[inline]
+    pub(crate) fn old_root_drop_count(ptr: usize) -> usize {
+        old_root_drops()
+            .lock()
+            .unwrap()
+            .get(&ptr)
+            .copied()
+            .unwrap_or(0)
+    }
 }

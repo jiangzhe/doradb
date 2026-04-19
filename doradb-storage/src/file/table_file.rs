@@ -261,6 +261,10 @@ impl TableFile {
     }
 
     /// Returns the in-memory active root snapshot.
+    ///
+    /// Each call observes the currently published root. Callers that need
+    /// related fields from one logical checkpoint root must bind one local
+    /// reference and reuse it.
     #[inline]
     pub fn active_root(&self) -> &ActiveRoot {
         self.file.active_root()
