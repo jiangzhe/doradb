@@ -237,6 +237,8 @@ impl Catalog {
                 let table_file = table_fs
                     .open_table_file(table.table_id, disk_pool.clone())
                     .await?;
+                // `catalog_load_boundary`: loading a user table binds one root
+                // for metadata validation and block-index initialization.
                 let active_root = table_file.active_root();
                 let metadata_in_catalog = TableMetadata::new(column_specs, index_specs);
                 let metadata_in_file = &*active_root.metadata;
@@ -316,6 +318,8 @@ impl Catalog {
     #[inline]
     fn loaded_table_replay_start_ts(&self, table_id: TableID) -> Option<u64> {
         self.user_tables.get(&table_id).map(|table| {
+            // `catalog_load_boundary`: replay floors are derived from loaded
+            // table roots during bootstrap/recovery bookkeeping.
             let root = table.file().active_root();
             root.heap_redo_start_ts.min(root.deletion_cutoff_ts)
         })

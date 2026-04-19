@@ -680,6 +680,8 @@ impl TablePersistence for Table {
 
     fn checkpoint_readiness(&self, session: &Session) -> CheckpointReadiness {
         let trx_sys = session.engine().trx_sys.clone();
+        // `checkpoint_internal`: readiness checks the current root liveness
+        // before this path forks and later displaces that root.
         let active_root = self.file().active_root();
         CheckpointReadiness::for_root(active_root, trx_sys.calc_min_active_sts_for_gc())
     }
@@ -696,7 +698,9 @@ impl TablePersistence for Table {
             return Ok(CheckpointOutcome::Delayed { reason });
         }
 
-        // Step 1: claim one mutable root snapshot and initialize checkpoint boundaries.
+        // Step 1: claim one mutable root snapshot and initialize checkpoint
+        // boundaries. This is checkpoint-internal current-root access after
+        // the liveness preflight above.
         let mut mutable_file =
             MutableTableFile::fork(table_file, session.engine().table_fs.background_writes());
         let pivot_row_id = mutable_file.root().pivot_row_id;
@@ -833,6 +837,8 @@ impl TablePersistence for Table {
                 return Err(err);
             }
         };
+        // Read back the just-published checkpoint root to refresh in-memory
+        // block-index routing for the same publication.
         let active_root = table_file.active_root();
         self.blk_idx()
             .update_column_root(

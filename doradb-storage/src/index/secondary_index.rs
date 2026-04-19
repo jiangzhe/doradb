@@ -140,6 +140,9 @@ impl<P: BufferPool> InMemorySecondaryIndex<P> {
 /// The runtime is table-specific by construction. Each open reads the currently
 /// published secondary root from the table file, then hands that copied root to
 /// a typed DiskTree reader. Already opened readers keep their root snapshot.
+///
+/// This is a `runtime_checked_future` boundary. RFC-0015 should migrate normal
+/// runtime opens to root ids captured from `TableRootSnapshot`.
 pub(crate) struct SecondaryDiskTreeRuntime {
     index_no: usize,
     table_file: Arc<TableFile>,
@@ -164,6 +167,8 @@ impl SecondaryDiskTreeRuntime {
             .index_specs
             .get(index_no)
             .ok_or(Error::InvalidArgument)?;
+        // Load-time validation only checks that the checkpoint root contains
+        // this index slot. Foreground opens should later use snapshot roots.
         table_file
             .active_root()
             .secondary_index_roots
@@ -197,6 +202,9 @@ impl SecondaryDiskTreeRuntime {
     }
 
     /// Return the current published DiskTree root for this secondary index.
+    ///
+    /// Runtime callers should treat this as the transitional unchecked root
+    /// source until proof-gated table snapshots provide the root id directly.
     #[inline]
     pub(crate) fn published_root(&self) -> Result<BlockID> {
         self.table_file
@@ -231,6 +239,8 @@ impl SecondaryDiskTreeRuntime {
         &'a self,
         disk_pool_guard: &'a PoolGuard,
     ) -> Result<UniqueDiskTree<'a>> {
+        // Future runtime callers should pass a snapshot-derived root id into
+        // `open_unique_at` instead of reading the moving current root here.
         self.open_unique_at(self.published_root()?, disk_pool_guard)
     }
 
@@ -253,6 +263,8 @@ impl SecondaryDiskTreeRuntime {
         &'a self,
         disk_pool_guard: &'a PoolGuard,
     ) -> Result<NonUniqueDiskTree<'a>> {
+        // Future runtime callers should pass a snapshot-derived root id into
+        // `open_non_unique_at` instead of reading the moving current root here.
         self.open_non_unique_at(self.published_root()?, disk_pool_guard)
     }
 

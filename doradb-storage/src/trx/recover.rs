@@ -296,6 +296,8 @@ impl<'a> LogRecovery<'a> {
             .get_table(table_id)
             .await
             .ok_or(Error::TableNotFound)?;
+        // `recovery_bootstrap_unchecked`: recovery records replay floors from
+        // the table root loaded during restart, before normal transactions run.
         let active_root = table.file().active_root();
         let state = RecoveryTableState {
             heap_redo_start_ts: active_root.heap_redo_start_ts,

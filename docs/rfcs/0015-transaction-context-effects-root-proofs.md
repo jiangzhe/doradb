@@ -143,7 +143,7 @@ Issue Labels:
 
 ### Source Backlogs
 
-- [B1] `docs/backlogs/000093-transaction-context-effects-split-active-root-proofs.md`
+- [B1] `docs/backlogs/closed/000093-transaction-context-effects-split-active-root-proofs.md`
   - original backlog for transaction context/effects split and typed active-root
   read proof.
 
@@ -588,12 +588,12 @@ References:
     paths should eventually use `TableRootSnapshot`.
   - Non-goals: Do not split transaction or statement types; do not change
     `TableAccess` signatures; do not remove existing active-root access.
-  - Task Doc: `docs/tasks/TBD.md`
-  - Task Issue: `#0`
-  - Phase Status: `pending`
-  - Implementation Summary: `pending`
+  - Task Doc: `docs/tasks/000127-root-access-boundary-inventory.md`
+  - Task Issue: `#578`
+  - Phase Status: done
+  - Implementation Summary: Phase 1 completed: refreshed the active-root and published-root inventory, documented checked versus unchecked boundary categories in source comments, preserved behavior, public APIs, and unsafe code, and validated with cargo build, cargo nextest, and focused coverage. [Task Resolve Sync: docs/tasks/000127-root-access-boundary-inventory.md @ 2026-04-19]
   - Related Backlogs:
-    - `docs/backlogs/000093-transaction-context-effects-split-active-root-proofs.md`
+    - `docs/backlogs/closed/000093-transaction-context-effects-split-active-root-proofs.md`
 
 - **Phase 2: Transaction Context And Effects Split**
   - Scope: Introduce `TrxContext` and `TrxEffects` inside `ActiveTrx`, move
@@ -609,7 +609,7 @@ References:
   - Phase Status: `pending`
   - Implementation Summary: `pending`
   - Related Backlogs:
-    - `docs/backlogs/000093-transaction-context-effects-split-active-root-proofs.md`
+    - `docs/backlogs/closed/000093-transaction-context-effects-split-active-root-proofs.md`
 
 - **Phase 3: Statement Effects Split**
   - Scope: Introduce `StatementEffects`, move statement-local row undo, index
@@ -625,7 +625,7 @@ References:
   - Phase Status: `pending`
   - Implementation Summary: `pending`
   - Related Backlogs:
-    - `docs/backlogs/000093-transaction-context-effects-split-active-root-proofs.md`
+    - `docs/backlogs/closed/000093-transaction-context-effects-split-active-root-proofs.md`
 
 - **Phase 4: TableAccess API Migration**
   - Scope: Change `TableAccess` read methods to accept `&TrxContext` and write
@@ -642,7 +642,7 @@ References:
   - Phase Status: `pending`
   - Implementation Summary: `pending`
   - Related Backlogs:
-    - `docs/backlogs/000093-transaction-context-effects-split-active-root-proofs.md`
+    - `docs/backlogs/closed/000093-transaction-context-effects-split-active-root-proofs.md`
 
 - **Phase 5: TrxReadProof And TableRootSnapshot**
   - Scope: Add `TrxReadProof<'ctx>`, `TableRootSnapshot<'ctx>`, proof-gated
@@ -659,7 +659,7 @@ References:
   - Phase Status: `pending`
   - Implementation Summary: `pending`
   - Related Backlogs:
-    - `docs/backlogs/000093-transaction-context-effects-split-active-root-proofs.md`
+    - `docs/backlogs/closed/000093-transaction-context-effects-split-active-root-proofs.md`
 
 - **Phase 6: Seal Old APIs And Validate**
   - Scope: Restrict unconstrained `active_root()` access to file internals,
@@ -674,7 +674,7 @@ References:
   - Phase Status: `pending`
   - Implementation Summary: `pending`
   - Related Backlogs:
-    - `docs/backlogs/000093-transaction-context-effects-split-active-root-proofs.md`
+    - `docs/backlogs/closed/000093-transaction-context-effects-split-active-root-proofs.md`
 
 ## Consequences
 
@@ -731,7 +731,7 @@ References:
 
 ## References
 
-- `docs/backlogs/000093-transaction-context-effects-split-active-root-proofs.md`
+- `docs/backlogs/closed/000093-transaction-context-effects-split-active-root-proofs.md`
 - `docs/tasks/000124-checkpoint-old-root-retention.md`
 - `docs/tasks/000125-checkpoint-root-liveness-gate.md`
 - `docs/table-file.md`

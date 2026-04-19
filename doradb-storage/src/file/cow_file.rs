@@ -262,6 +262,9 @@ impl<M> CowFile<M> {
 
     /// Return the current in-memory active root reference.
     ///
+    /// This is the low-level unchecked current-root boundary for CoW file
+    /// internals and callers explicitly classified as recovery/bootstrap,
+    /// checkpoint, or test-only paths.
     /// Every call observes the root pointer currently published at that moment.
     /// Callers that need multiple fields from one logical root snapshot must
     /// bind one local reference and reuse it.

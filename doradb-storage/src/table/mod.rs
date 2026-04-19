@@ -574,6 +574,8 @@ impl ColumnStorage {
         file: Arc<TableFile>,
         disk_pool: QuiescentGuard<ReadonlyBufferPool>,
     ) -> Result<Self> {
+        // `catalog_load_boundary`: table construction binds the loaded root to
+        // initialize column storage and validate secondary root layout.
         let active_root = file.active_root();
         let metadata = Arc::clone(&active_root.metadata);
         if active_root.secondary_index_roots.len() != metadata.index_specs.len() {
@@ -646,6 +648,8 @@ impl Table {
         file: Arc<TableFile>,
         disk_pool: QuiescentGuard<ReadonlyBufferPool>,
     ) -> Result<Self> {
+        // `catalog_load_boundary`: runtime table construction uses the loaded
+        // root to seed metadata and hot/cold secondary-index state.
         let active_root = file.active_root();
         let metadata = Arc::clone(&active_root.metadata);
         let secondary_index_count = metadata.index_specs.len();

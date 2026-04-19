@@ -194,9 +194,9 @@ impl Table {
     #[inline]
     fn capture_mem_index_cleanup_snapshot(&self, min_active_sts: TrxID) -> MemIndexCleanupSnapshot {
         let active_root = self.file().active_root();
-        // Keep this as an owned field snapshot until the deferred
-        // transaction-context/effects split can provide a proof-gated
-        // `ActiveRoot` borrow that fits this async cleanup shape.
+        // `gc_captured_snapshot`: keep this as an owned field snapshot until
+        // RFC-0015 can replace it with a proof-gated `TableRootSnapshot`.
+        // Cleanup predicates still use the explicit GC horizon below.
         MemIndexCleanupSnapshot {
             table_root_ts: active_root.trx_id,
             pivot_row_id: active_root.pivot_row_id,

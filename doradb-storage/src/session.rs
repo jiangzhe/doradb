@@ -217,6 +217,9 @@ impl Session {
         // 8. Prepare in-memory representation of new table
         let meta_pool_guard = self.pool_guards().meta_guard();
         let index_pool_guard = self.pool_guards().index_guard();
+        // `catalog_load_boundary`: the file was just committed for this DDL,
+        // so this root initializes runtime state rather than serving a
+        // foreground transaction read.
         let active_root = table_file.active_root();
         let blk_idx = BlockIndex::new(
             engine.meta_pool.clone_inner(),

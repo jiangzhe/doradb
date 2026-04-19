@@ -159,6 +159,9 @@ impl TableRecover for Table {
         cts: TrxID,
         disable_index: bool,
     ) -> Result<()> {
+        // `recovery_bootstrap_unchecked`: restart recovery runs without
+        // surviving user transactions, so it binds the current loaded root
+        // directly for cold-row delete replay predicates.
         let active_root = self.file().active_root();
         if row_id < active_root.pivot_row_id {
             if cts < active_root.deletion_cutoff_ts {
