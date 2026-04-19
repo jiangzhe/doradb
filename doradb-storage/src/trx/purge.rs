@@ -142,7 +142,7 @@ impl TransactionSystem {
         catalog: &Catalog,
         guards: &PoolGuards,
         log_no: usize,
-        trx_list: Vec<CommittedTrx>,
+        mut trx_list: Vec<CommittedTrx>,
         min_active_sts: TrxID,
     ) -> HashSet<PageID> {
         let partition = &self.log_partitions[log_no];
@@ -202,7 +202,11 @@ impl TransactionSystem {
             }
         }
 
-        // Finally, delete all transactions
+        // Finally, release payload-owned resources whose transaction CTS has
+        // crossed the purge horizon. This includes retained old table roots.
+        for trx in &mut trx_list {
+            trx.release_old_table_root();
+        }
         drop(trx_list);
 
         partition
@@ -804,6 +808,7 @@ mod tests {
                     row_undo,
                     index_gc: vec![],
                     gc_row_pages: vec![],
+                    old_table_root: None,
                 }),
             };
             {
@@ -893,6 +898,7 @@ mod tests {
                     row_undo,
                     index_gc: vec![],
                     gc_row_pages: vec![],
+                    old_table_root: None,
                 }),
             };
             {
@@ -1004,6 +1010,7 @@ mod tests {
                     row_undo,
                     index_gc: vec![],
                     gc_row_pages: vec![],
+                    old_table_root: None,
                 }),
             };
             {
@@ -1111,6 +1118,7 @@ mod tests {
                     row_undo,
                     index_gc: vec![],
                     gc_row_pages: vec![],
+                    old_table_root: None,
                 }),
             };
             {

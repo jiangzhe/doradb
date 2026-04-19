@@ -134,6 +134,8 @@ pub enum Error {
     InternalError,
     #[error("invalid state")]
     InvalidState,
+    #[error("old table root already retained by transaction")]
+    OldTableRootAlreadyRetained,
     #[error("Invalid format")]
     InvalidFormat,
     #[error("Checksum mismatch")]

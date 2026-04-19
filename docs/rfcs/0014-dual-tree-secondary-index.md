@@ -649,7 +649,6 @@ items remain open for future task/RFC planning and are not required to close RFC
 - `docs/backlogs/000086-secondary-index-dual-tree-access-path.md`
 - `docs/backlogs/000087-refactor-recovery-process-parallel-log-replay.md`
 - `docs/backlogs/000088-remove-recovery-skip-option.md`
-- `docs/backlogs/000089-checkpoint-old-root-retention.md`
 - `docs/backlogs/000090-protect-disk-tree-root-lifetime.md`
 - `docs/backlogs/000091-page-level-secondary-mem-index-cleanup-scan.md`
 

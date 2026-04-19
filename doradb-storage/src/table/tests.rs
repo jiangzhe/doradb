@@ -8,7 +8,7 @@ use crate::conf::{EngineConfig, EvictableBufferPoolConfig, FileSystemConfig, Trx
 use crate::engine::Engine;
 use crate::error::{BlockCorruptionCause, BlockKind, Error, FileKind, Result, StoragePoisonSource};
 use crate::file::block_integrity::{BLOCK_INTEGRITY_HEADER_SIZE, write_block_checksum};
-use crate::file::cow_file::{COW_FILE_PAGE_SIZE, SUPER_BLOCK_ID};
+use crate::file::cow_file::{COW_FILE_PAGE_SIZE, SUPER_BLOCK_ID, tests::old_root_drop_count};
 use crate::index::{
     COLUMN_BLOCK_HEADER_SIZE, COLUMN_BLOCK_LEAF_HEADER_SIZE, ColumnBlockIndex, IndexInsert,
     NonUniqueIndex, RowLocation, UniqueIndex, load_entry_deletion_deltas,
@@ -4559,6 +4559,55 @@ fn test_checkpoint_snapshot_consistency() {
         drop(session);
         drop(write_session);
         drop(checkpoint_session);
+        sys.clean_all();
+    });
+}
+
+#[test]
+fn test_checkpoint_old_root_released_after_active_reader_purged() {
+    smol::block_on(async {
+        let sys = TestSys::new_evictable().await;
+        let mut session = sys.try_new_session().unwrap();
+        let name = "retained-root".repeat(64);
+        insert_rows(&sys, &mut session, 0, 120, &name).await;
+
+        sys.table.freeze(&session, usize::MAX).await;
+        let retained_root_ptr = sys.table.file().active_root() as *const _ as usize;
+        let drop_count_before = old_root_drop_count(retained_root_ptr);
+
+        let mut read_session = sys.try_new_session().unwrap();
+        let read_trx = read_session.try_begin_trx().unwrap().unwrap();
+
+        let mut checkpoint_session = sys.try_new_session().unwrap();
+        sys.table.checkpoint(&mut checkpoint_session).await.unwrap();
+
+        assert_eq!(
+            old_root_drop_count(retained_root_ptr),
+            drop_count_before,
+            "old root must stay retained while a pre-checkpoint transaction is active"
+        );
+
+        read_trx.commit().await.unwrap();
+        sys.new_trx_insert(
+            &mut session,
+            vec![Val::from(50_000i32), Val::from("after-retention-reader")],
+        )
+        .await;
+
+        for _ in 0..50 {
+            if old_root_drop_count(retained_root_ptr) > drop_count_before {
+                break;
+            }
+            smol::Timer::after(Duration::from_millis(20)).await;
+        }
+        assert!(
+            old_root_drop_count(retained_root_ptr) > drop_count_before,
+            "old root should be released after transaction GC crosses the checkpoint"
+        );
+
+        drop(read_session);
+        drop(checkpoint_session);
+        drop(session);
         sys.clean_all();
     });
 }

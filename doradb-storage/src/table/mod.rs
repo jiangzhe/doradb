@@ -574,8 +574,9 @@ impl ColumnStorage {
         file: Arc<TableFile>,
         disk_pool: QuiescentGuard<ReadonlyBufferPool>,
     ) -> Result<Self> {
-        let metadata = Arc::clone(&file.active_root().metadata);
-        if file.active_root().secondary_index_roots.len() != metadata.index_specs.len() {
+        let active_root = file.active_root();
+        let metadata = Arc::clone(&active_root.metadata);
+        if active_root.secondary_index_roots.len() != metadata.index_specs.len() {
             return Err(Error::InvalidState);
         }
         let secondary_indexes = (0..metadata.index_specs.len())
