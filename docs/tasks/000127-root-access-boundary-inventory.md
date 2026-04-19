@@ -1,7 +1,7 @@
 ---
 id: 000127
 title: Root Access Boundary Inventory
-status: proposal
+status: implemented
 created: 2026-04-19
 github_issue: 578
 ---
@@ -44,7 +44,7 @@ Parent RFC:
 - docs/rfcs/0015-transaction-context-effects-root-proofs.md
 
 Source Backlogs:
-- docs/backlogs/000093-transaction-context-effects-split-active-root-proofs.md
+- docs/backlogs/closed/000093-transaction-context-effects-split-active-root-proofs.md
 
 ## Goals
 
@@ -161,6 +161,36 @@ Expected implementation path: no unsafe changes.
    `task resolve` syncs the parent RFC phase block.
 
 ## Implementation Notes
+
+Implemented Phase 1 as a behavior-preserving root-access boundary inventory.
+The implementation refreshed the `active_root()` / `published_root()` search,
+kept the existing inventory categories, and added concise rustdoc or inline
+comments at the main anchors for:
+
+- low-level CoW and table-file current-root boundaries;
+- catalog `MultiTableFile` checkpoint roots outside the user-table snapshot
+  contract;
+- secondary-index runtime roots that should later come from
+  `TableRootSnapshot`;
+- secondary MemIndex cleanup's owned captured root fields;
+- checkpoint readiness/publication as `checkpoint_internal`;
+- catalog load/replay-floor boundaries;
+- recovery/bootstrap unchecked root reads.
+
+No APIs, helper types, visibility, control flow, unsafe blocks, tests, or
+runtime behavior changed. The task intentionally did not introduce
+`TrxReadProof`, `TableRootSnapshot`, transaction/statement splits, an allowlist
+script, or root-access renames.
+
+Validation and review:
+
+- `cargo build -p doradb-storage` passed.
+- `cargo nextest run -p doradb-storage` passed: 610 tests, 610 passed.
+- `tools/coverage_focus.rs --path doradb-storage/src` passed with 92.32%
+  focused line coverage for the source tree.
+- Checklist review found no unsafe changes, no performance-sensitive behavior
+  changes, no test-only code changes, and no required follow-up backlog items.
+- PR opened: #579.
 
 ## Impacts
 

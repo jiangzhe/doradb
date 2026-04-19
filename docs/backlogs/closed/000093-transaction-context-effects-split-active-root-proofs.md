@@ -42,3 +42,11 @@ When a backlog item is moved to `docs/backlogs/closed/`, append:
 - Reference: <task/issue/pr reference>
 - Closed At: <YYYY-MM-DD>
 ```
+
+## Close Reason
+
+- Type: implemented
+- Detail: Implemented through RFC-0015 planning and Phase 1 task docs/tasks/000127-root-access-boundary-inventory.md.
+- Closed By: backlog close
+- Reference: docs/tasks/000127-root-access-boundary-inventory.md; docs/rfcs/0015-transaction-context-effects-root-proofs.md; PR #579
+- Closed At: 2026-04-19
