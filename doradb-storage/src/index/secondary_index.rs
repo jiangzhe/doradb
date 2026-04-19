@@ -8,8 +8,12 @@
 use super::disk_tree::{
     NonUniqueDiskTree, NonUniqueDiskTreeRuntime, UniqueDiskTree, UniqueDiskTreeRuntime,
 };
-use super::non_unique_index::{NonUniqueIndex, NonUniqueMemIndex, NonUniqueMemIndexEntry};
-use super::unique_index::{UniqueIndex, UniqueMemIndex, UniqueMemIndexEntry};
+use super::non_unique_index::{
+    NonUniqueIndex, NonUniqueMemIndex, NonUniqueMemIndexCleanupScan, NonUniqueMemIndexEntry,
+};
+use super::unique_index::{
+    UniqueIndex, UniqueMemIndex, UniqueMemIndexCleanupScan, UniqueMemIndexEntry,
+};
 use crate::buffer::{BufferPool, PoolGuard, ReadonlyBufferPool};
 use crate::catalog::{IndexSpec, TableMetadata};
 use crate::error::{Error, Result};
@@ -287,12 +291,25 @@ impl<P: BufferPool> UniqueSecondaryIndex<P> {
     }
 
     /// Scan the mutable MemIndex entries without reading DiskTree.
+    #[cfg_attr(not(test), allow(dead_code))]
     #[inline]
     pub(crate) async fn scan_mem_entries(
         &self,
         pool_guard: &PoolGuard,
     ) -> Result<Vec<UniqueMemIndexEntry>> {
         self.mem.scan_encoded_entries(pool_guard).await
+    }
+
+    /// Create a cleanup-only MemIndex scan without reading DiskTree.
+    #[inline]
+    pub(crate) fn cleanup_mem_scan<'a>(
+        &'a self,
+        pool_guard: &'a PoolGuard,
+        pivot_row_id: RowID,
+        clean_live_entries: bool,
+    ) -> UniqueMemIndexCleanupScan<'a, P> {
+        self.mem
+            .cleanup_scan(pool_guard, pivot_row_id, clean_live_entries)
     }
 
     /// Return whether `key` encodes to the same MemIndex key bytes captured by
@@ -493,12 +510,25 @@ impl<P: BufferPool> NonUniqueSecondaryIndex<P> {
     }
 
     /// Scan the mutable MemIndex entries without reading DiskTree.
+    #[cfg_attr(not(test), allow(dead_code))]
     #[inline]
     pub(crate) async fn scan_mem_entries(
         &self,
         pool_guard: &PoolGuard,
     ) -> Result<Vec<NonUniqueMemIndexEntry>> {
         self.mem.scan_encoded_entries(pool_guard).await
+    }
+
+    /// Create a cleanup-only MemIndex scan without reading DiskTree.
+    #[inline]
+    pub(crate) fn cleanup_mem_scan<'a>(
+        &'a self,
+        pool_guard: &'a PoolGuard,
+        pivot_row_id: RowID,
+        clean_live_entries: bool,
+    ) -> NonUniqueMemIndexCleanupScan<'a, P> {
+        self.mem
+            .cleanup_scan(pool_guard, pivot_row_id, clean_live_entries)
     }
 
     /// Return whether `key` plus `row_id` encodes to the same exact MemIndex key

@@ -4,6 +4,7 @@ use crate::catalog::IndexSpec;
 use crate::error::{Error, Result};
 use crate::index::IndexInsert;
 use crate::index::btree::BTreeKeyEncoder;
+use crate::index::btree::BTreeNodeCursor;
 use crate::index::btree::BTreeSlotCallback;
 use crate::index::btree::{BTREE_BYTE_ZERO, BTreeByte, BTreeU64};
 use crate::index::btree::{BTreeDelete, BTreeInsert, BTreeUpdate, GenericBTree};
@@ -102,6 +103,84 @@ pub(crate) struct NonUniqueMemIndexEntry {
     pub(crate) row_id: RowID,
     /// Whether the exact entry is delete-marked in MemIndex.
     pub(crate) deleted: bool,
+}
+
+/// Bounded batch of non-unique MemIndex entries selected for cleanup.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct NonUniqueMemIndexCleanupBatch {
+    /// Cleanup candidates copied out of one MemIndex leaf.
+    pub(crate) entries: Vec<NonUniqueMemIndexEntry>,
+    /// Live entries skipped before encoded-key allocation.
+    pub(crate) skipped_live: usize,
+    /// Hot delete overlays skipped before encoded-key allocation.
+    pub(crate) skipped_hot_deleted: usize,
+}
+
+/// Leaf-bounded cleanup scanner for non-unique exact MemIndex entries.
+pub(crate) struct NonUniqueMemIndexCleanupScan<'a, P: 'static> {
+    cursor: BTreeNodeCursor<'a, P>,
+    pivot_row_id: RowID,
+    clean_live_entries: bool,
+    started: bool,
+}
+
+impl<'a, P: BufferPool> NonUniqueMemIndexCleanupScan<'a, P> {
+    #[inline]
+    fn new(
+        tree: &'a GenericBTree<P>,
+        pool_guard: &'a PoolGuard,
+        pivot_row_id: RowID,
+        clean_live_entries: bool,
+    ) -> Self {
+        Self {
+            cursor: tree.cursor(pool_guard, 0),
+            pivot_row_id,
+            clean_live_entries,
+            started: false,
+        }
+    }
+
+    /// Return the next leaf-bounded cleanup candidate batch.
+    #[inline]
+    pub(crate) async fn next_batch(&mut self) -> Result<Option<NonUniqueMemIndexCleanupBatch>> {
+        if !self.started {
+            self.cursor.seek(&[]).await?;
+            self.started = true;
+        }
+        let Some(guard) = self.cursor.next().await? else {
+            return Ok(None);
+        };
+
+        let node = guard.page();
+        let mut batch = NonUniqueMemIndexCleanupBatch::default();
+        for (idx, slot) in node.slots().iter().enumerate() {
+            if node.slot_key_len(slot) < mem::size_of::<RowID>() {
+                return Err(Error::InvalidState);
+            }
+            let value = node.value_for_slot::<BTreeByte>(slot);
+            let deleted = value.is_deleted();
+            let row_id = node.unpack_value::<BTreeU64>(slot).to_u64();
+            if row_id >= self.pivot_row_id {
+                if deleted {
+                    batch.skipped_hot_deleted += 1;
+                } else {
+                    batch.skipped_live += 1;
+                }
+                continue;
+            }
+            if !deleted && !self.clean_live_entries {
+                batch.skipped_live += 1;
+                continue;
+            }
+            let encoded_key = node.key_checked(idx).ok_or(Error::InvalidState)?;
+            batch.entries.push(NonUniqueMemIndexEntry {
+                encoded_key,
+                row_id,
+                deleted,
+            });
+        }
+        Ok(Some(batch))
+    }
 }
 
 impl<P: BufferPool> NonUniqueMemIndex<P> {
@@ -215,6 +294,17 @@ impl<P: BufferPool> NonUniqueMemIndex<P> {
             }
         }
         Ok(entries)
+    }
+
+    /// Create a leaf-bounded scanner for cleanup candidates.
+    #[inline]
+    pub(crate) fn cleanup_scan<'a>(
+        &'a self,
+        pool_guard: &'a PoolGuard,
+        pivot_row_id: RowID,
+        clean_live_entries: bool,
+    ) -> NonUniqueMemIndexCleanupScan<'a, P> {
+        NonUniqueMemIndexCleanupScan::new(&self.tree, pool_guard, pivot_row_id, clean_live_entries)
     }
 
     /// Return whether `key` plus `row_id` encodes to the exact MemIndex key
@@ -661,6 +751,85 @@ mod tests {
                     .unwrap(),
                 None
             );
+        })
+    }
+
+    #[test]
+    fn test_non_unique_mem_index_cleanup_scan_filters_live_entries_by_policy() {
+        smol::block_on(async {
+            let pool = QuiescentBox::new(
+                FixedBufferPool::with_capacity(
+                    crate::buffer::PoolRole::Index,
+                    1024usize * 1024 * 1024,
+                )
+                .unwrap(),
+            );
+            let pool_guard = (*pool).pool_guard();
+            let index = NonUniqueMemIndex {
+                tree: BTree::new(pool.guard(), &pool_guard, true, 100)
+                    .await
+                    .expect("test btree construction should succeed"),
+                encoder: BTreeKeyEncoder::new(vec![
+                    ValType {
+                        kind: ValKind::I32,
+                        nullable: false,
+                    },
+                    ValType {
+                        kind: ValKind::U64,
+                        nullable: false,
+                    },
+                ]),
+            };
+
+            let cold_live_key = vec![Val::from(1i32)];
+            let hot_live_key = vec![Val::from(2i32)];
+            let cold_deleted_key = vec![Val::from(3i32)];
+            let hot_deleted_key = vec![Val::from(4i32)];
+            index
+                .insert_if_not_exists(&pool_guard, &cold_live_key, 10, false, 100)
+                .await
+                .unwrap();
+            index
+                .insert_if_not_exists(&pool_guard, &hot_live_key, 200, false, 100)
+                .await
+                .unwrap();
+            index
+                .insert_if_not_exists(&pool_guard, &cold_deleted_key, 30, false, 100)
+                .await
+                .unwrap();
+            assert!(
+                index
+                    .mask_as_deleted(&pool_guard, &cold_deleted_key, 30, 101)
+                    .await
+                    .unwrap()
+            );
+            index
+                .insert_if_not_exists(&pool_guard, &hot_deleted_key, 300, false, 100)
+                .await
+                .unwrap();
+            assert!(
+                index
+                    .mask_as_deleted(&pool_guard, &hot_deleted_key, 300, 101)
+                    .await
+                    .unwrap()
+            );
+
+            let mut scan = index.cleanup_scan(&pool_guard, 100, true);
+            let batch = scan.next_batch().await.unwrap().unwrap();
+            assert_eq!(batch.skipped_live, 1);
+            assert_eq!(batch.skipped_hot_deleted, 1);
+            assert_eq!(batch.entries.len(), 2);
+            assert!(batch.entries.iter().any(|entry| !entry.deleted));
+            assert!(batch.entries.iter().any(|entry| entry.deleted));
+            assert!(scan.next_batch().await.unwrap().is_none());
+
+            let mut scan = index.cleanup_scan(&pool_guard, 100, false);
+            let batch = scan.next_batch().await.unwrap().unwrap();
+            assert_eq!(batch.skipped_live, 2);
+            assert_eq!(batch.skipped_hot_deleted, 1);
+            assert_eq!(batch.entries.len(), 1);
+            assert!(batch.entries[0].deleted);
+            assert!(scan.next_batch().await.unwrap().is_none());
         })
     }
 

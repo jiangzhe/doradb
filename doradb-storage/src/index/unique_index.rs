@@ -3,6 +3,7 @@ use crate::buffer::{BufferPool, PoolGuard};
 use crate::catalog::IndexSpec;
 use crate::error::{Error, Result};
 use crate::index::btree::BTreeKeyEncoder;
+use crate::index::btree::BTreeNodeCursor;
 use crate::index::btree::BTreeU64;
 use crate::index::btree::{BTreeDelete, BTreeInsert, BTreeUpdate, GenericBTree};
 use crate::index::util::Maskable;
@@ -124,6 +125,81 @@ impl UniqueMemIndexEntry {
     }
 }
 
+/// Bounded batch of unique MemIndex entries selected for cleanup processing.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct UniqueMemIndexCleanupBatch {
+    /// Cleanup candidates copied out of one MemIndex leaf.
+    pub(crate) entries: Vec<UniqueMemIndexEntry>,
+    /// Live entries skipped before encoded-key allocation.
+    pub(crate) skipped_live: usize,
+    /// Hot delete overlays skipped before encoded-key allocation.
+    pub(crate) skipped_hot_deleted: usize,
+}
+
+/// Leaf-bounded cleanup scanner for unique MemIndex entries.
+pub(crate) struct UniqueMemIndexCleanupScan<'a, P: 'static> {
+    cursor: BTreeNodeCursor<'a, P>,
+    pivot_row_id: RowID,
+    clean_live_entries: bool,
+    started: bool,
+}
+
+impl<'a, P: BufferPool> UniqueMemIndexCleanupScan<'a, P> {
+    #[inline]
+    fn new(
+        tree: &'a GenericBTree<P>,
+        pool_guard: &'a PoolGuard,
+        pivot_row_id: RowID,
+        clean_live_entries: bool,
+    ) -> Self {
+        Self {
+            cursor: tree.cursor(pool_guard, 0),
+            pivot_row_id,
+            clean_live_entries,
+            started: false,
+        }
+    }
+
+    /// Return the next leaf-bounded cleanup candidate batch.
+    #[inline]
+    pub(crate) async fn next_batch(&mut self) -> Result<Option<UniqueMemIndexCleanupBatch>> {
+        if !self.started {
+            self.cursor.seek(&[]).await?;
+            self.started = true;
+        }
+        let Some(guard) = self.cursor.next().await? else {
+            return Ok(None);
+        };
+
+        let node = guard.page();
+        let mut batch = UniqueMemIndexCleanupBatch::default();
+        for idx in 0..node.count() {
+            let value = node.value::<BTreeU64>(idx);
+            let row_id = value.value().to_u64();
+            let deleted = value.is_deleted();
+            if row_id >= self.pivot_row_id {
+                if deleted {
+                    batch.skipped_hot_deleted += 1;
+                } else {
+                    batch.skipped_live += 1;
+                }
+                continue;
+            }
+            if !deleted && !self.clean_live_entries {
+                batch.skipped_live += 1;
+                continue;
+            }
+            let encoded_key = node.key_checked(idx).ok_or(Error::InvalidState)?;
+            batch.entries.push(UniqueMemIndexEntry {
+                encoded_key,
+                row_id,
+                deleted,
+            });
+        }
+        Ok(Some(batch))
+    }
+}
+
 impl<P: BufferPool> UniqueMemIndex<P> {
     /// Build a unique MemIndex from catalog index metadata.
     #[inline]
@@ -215,6 +291,17 @@ impl<P: BufferPool> UniqueMemIndex<P> {
             }
         }
         Ok(entries)
+    }
+
+    /// Create a leaf-bounded scanner for cleanup candidates.
+    #[inline]
+    pub(crate) fn cleanup_scan<'a>(
+        &'a self,
+        pool_guard: &'a PoolGuard,
+        pivot_row_id: RowID,
+        clean_live_entries: bool,
+    ) -> UniqueMemIndexCleanupScan<'a, P> {
+        UniqueMemIndexCleanupScan::new(&self.tree, pool_guard, pivot_row_id, clean_live_entries)
     }
 
     /// Return whether `key` encodes to the same MemIndex key bytes captured by
@@ -536,6 +623,79 @@ mod tests {
                     .unwrap()
             );
             assert_eq!(index.lookup(&pool_guard, &key, 104).await.unwrap(), None);
+        });
+    }
+
+    #[test]
+    fn test_unique_mem_index_cleanup_scan_filters_live_entries_by_policy() {
+        smol::block_on(async {
+            let pool = QuiescentBox::new(
+                FixedBufferPool::with_capacity(
+                    crate::buffer::PoolRole::Index,
+                    1024usize * 1024 * 1024,
+                )
+                .unwrap(),
+            );
+            let pool_guard = (*pool).pool_guard();
+            let index = UniqueMemIndex {
+                tree: BTree::new(pool.guard(), &pool_guard, false, 100)
+                    .await
+                    .expect("test btree construction should succeed"),
+                encoder: BTreeKeyEncoder::new(vec![ValType {
+                    kind: ValKind::I32,
+                    nullable: false,
+                }]),
+            };
+
+            let cold_live_key = vec![Val::from(1i32)];
+            let hot_live_key = vec![Val::from(2i32)];
+            let cold_deleted_key = vec![Val::from(3i32)];
+            let hot_deleted_key = vec![Val::from(4i32)];
+            index
+                .insert_if_not_exists(&pool_guard, &cold_live_key, 10, false, 100)
+                .await
+                .unwrap();
+            index
+                .insert_if_not_exists(&pool_guard, &hot_live_key, 200, false, 100)
+                .await
+                .unwrap();
+            index
+                .insert_if_not_exists(&pool_guard, &cold_deleted_key, 30, false, 100)
+                .await
+                .unwrap();
+            assert!(
+                index
+                    .mask_as_deleted(&pool_guard, &cold_deleted_key, 30, 101)
+                    .await
+                    .unwrap()
+            );
+            index
+                .insert_if_not_exists(&pool_guard, &hot_deleted_key, 300, false, 100)
+                .await
+                .unwrap();
+            assert!(
+                index
+                    .mask_as_deleted(&pool_guard, &hot_deleted_key, 300, 101)
+                    .await
+                    .unwrap()
+            );
+
+            let mut scan = index.cleanup_scan(&pool_guard, 100, true);
+            let batch = scan.next_batch().await.unwrap().unwrap();
+            assert_eq!(batch.skipped_live, 1);
+            assert_eq!(batch.skipped_hot_deleted, 1);
+            assert_eq!(batch.entries.len(), 2);
+            assert!(batch.entries.iter().any(|entry| !entry.deleted));
+            assert!(batch.entries.iter().any(|entry| entry.deleted));
+            assert!(scan.next_batch().await.unwrap().is_none());
+
+            let mut scan = index.cleanup_scan(&pool_guard, 100, false);
+            let batch = scan.next_batch().await.unwrap().unwrap();
+            assert_eq!(batch.skipped_live, 2);
+            assert_eq!(batch.skipped_hot_deleted, 1);
+            assert_eq!(batch.entries.len(), 1);
+            assert!(batch.entries[0].deleted);
+            assert!(scan.next_batch().await.unwrap().is_none());
         });
     }
 

@@ -33,8 +33,9 @@ are collectible only when rollback/index-undo obligations are gone and
 ## MemIndex Full-Scan Cleanup
 
 User-table secondary indexes use a hot `MemIndex` and a checkpointed cold
-`DiskTree`. Full-scan cleanup is a memory cleanup pass only. It never mutates
-`DiskTree` and never rebuilds checkpointed cold entries into `MemIndex`.
+`DiskTree`. Full-scan cleanup is a memory cleanup pass only. It scans MemIndex
+leaves in bounded batches, never mutates `DiskTree`, and never rebuilds
+checkpointed cold entries into `MemIndex`.
 
 The cleanup pass captures:
 
@@ -45,15 +46,26 @@ The cleanup pass captures:
 - deletion checkpoint cutoff
 - caller-supplied `Global_Min_STS`
 
-Live entries can be removed when the captured row id is below the captured
-pivot and the captured `DiskTree` already has the same durable entry:
+The scanner inspects each leaf slot's row id and delete state before copying
+encoded key bytes. Hot entries at or above the captured pivot are skipped before
+encoded-key allocation. Hot delete overlays remain transaction index GC's
+responsibility because their proof requires row-page undo-chain context.
+
+Live-entry cleanup is policy-controlled. When enabled, live entries can be
+removed when the captured row id is below the captured pivot and the captured
+`DiskTree` already has the same durable entry:
 
 - unique: same encoded logical key maps to the same row id
 - non-unique: same encoded exact `(logical_key, row_id)` key exists
 
+When live-entry cleanup is disabled, all live entries are skipped before
+encoded-key allocation so the MemIndex can retain a warmer cache over DiskTree.
+Cleanup stats keep live skips and hot delete-overlay skips separate from
+processed cleanup candidate counts.
+
 Delete overlays require overlay-obsolescence proof, not `DiskTree` absence. A
-unique delete-shadow or non-unique delete-marked exact entry can be removed
-when one of these facts is true:
+unique delete-shadow or non-unique delete-marked exact entry below the captured
+pivot can be removed when one of these facts is true:
 
 - a deletion-buffer marker is committed and older than `Global_Min_STS`
 - the captured table root is older than `Global_Min_STS`, the row id is below
