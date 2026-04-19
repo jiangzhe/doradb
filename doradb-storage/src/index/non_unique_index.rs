@@ -153,7 +153,7 @@ impl<'a, P: BufferPool> NonUniqueMemIndexCleanupScan<'a, P> {
 
         let node = guard.page();
         let mut batch = NonUniqueMemIndexCleanupBatch::default();
-        for slot in node.slots() {
+        for (idx, slot) in node.slots().iter().enumerate() {
             if node.slot_key_len(slot) < mem::size_of::<RowID>() {
                 return Err(Error::InvalidState);
             }
@@ -172,8 +172,7 @@ impl<'a, P: BufferPool> NonUniqueMemIndexCleanupScan<'a, P> {
                 batch.skipped_live += 1;
                 continue;
             }
-            let mut encoded_key = Vec::new();
-            node.extend_slot_key(slot, &mut encoded_key);
+            let encoded_key = node.key_checked(idx).ok_or(Error::InvalidState)?;
             batch.entries.push(NonUniqueMemIndexEntry {
                 encoded_key,
                 row_id,
