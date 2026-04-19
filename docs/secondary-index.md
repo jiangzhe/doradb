@@ -229,12 +229,15 @@ Valid cleanup decisions:
 - live non-unique exact entries can be removed only when the row id is below the
   captured `pivot_row_id` and the captured non-unique `DiskTree` contains the
   same encoded exact `(logical_key, row_id)` key
-- delete overlays can be removed with overlay-obsolescence proof even when the
-  captured `DiskTree` still contains a stale cold entry; valid proofs are a
-  deletion-buffer marker committed before `Global_Min_STS`, a captured
-  checkpoint root older than `Global_Min_STS` whose `ColumnBlockIndex` proves
-  the row id is absent below the captured pivot, or a captured cold LWC row
-  whose current indexed values encode to a different scanned MemIndex key
+- delete overlays below the captured pivot can be removed with
+  overlay-obsolescence proof even when the captured `DiskTree` still contains a
+  stale cold entry; valid proofs are a deletion-buffer marker committed before
+  `Global_Min_STS`, a captured checkpoint root older than `Global_Min_STS`
+  whose `ColumnBlockIndex` proves the row id is absent below the captured pivot,
+  or a captured cold LWC row whose current indexed values encode to a different
+  scanned MemIndex key
+- delete overlays at or above the captured pivot are outside full-scan cleanup
+  scope and remain transaction index GC's responsibility
 - removing a proven row-deletion overlay does not mutate `DiskTree`; any stale
   cold entry exposed by the overlay removal is filtered by normal row/deletion
   visibility checks

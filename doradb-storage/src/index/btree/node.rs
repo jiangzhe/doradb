@@ -875,6 +875,12 @@ impl BTreeNode {
         &self.slots_with_len(self.header.count() as usize)[idx]
     }
 
+    /// Return the full encoded key length for a slot, including common prefix.
+    #[inline]
+    pub(in crate::index) fn slot_key_len(&self, slot: &BTreeSlot) -> usize {
+        self.header.prefix_len() as usize + slot.len() as usize
+    }
+
     #[inline]
     fn slot_mut(&mut self, idx: usize) -> &mut BTreeSlot {
         debug_assert!(idx < self.header.count() as usize);

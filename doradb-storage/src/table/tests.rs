@@ -1,3 +1,4 @@
+use super::gc::SecondaryMemIndexCleanupOptions;
 use super::{DeleteInternal, FrozenPage, InsertRowIntoPage, UpdateRowInplace};
 use crate::buffer::BufferPool;
 use crate::buffer::frame::FrameKind;
@@ -1657,6 +1658,8 @@ fn test_secondary_mem_index_cleanup_removes_redundant_live_unique_entries() {
         assert_eq!(stats.indexes[0].scanned, row_count as usize);
         assert_eq!(stats.indexes[0].removed, row_count as usize);
         assert_eq!(stats.indexes[0].retained, 0);
+        assert_eq!(stats.indexes[0].skipped_live, 0);
+        assert_eq!(stats.indexes[0].skipped_hot_deleted, 0);
         assert!(
             index
                 .scan_mem_entries(session.pool_guards().index_guard())
@@ -1745,6 +1748,8 @@ fn test_secondary_mem_index_cleanup_removes_redundant_live_non_unique_entries() 
         assert_eq!(stats.indexes[1].scanned, row_count as usize);
         assert_eq!(stats.indexes[1].removed, row_count as usize);
         assert_eq!(stats.indexes[1].retained, 0);
+        assert_eq!(stats.indexes[1].skipped_live, 0);
+        assert_eq!(stats.indexes[1].skipped_hot_deleted, 0);
         assert!(
             index
                 .scan_mem_entries(session.pool_guards().index_guard())
@@ -1768,6 +1773,117 @@ fn test_secondary_mem_index_cleanup_removes_redundant_live_non_unique_entries() 
             .await
             .unwrap();
         assert_eq!(lookup_rows, disk_rows);
+
+        drop(session);
+        sys.clean_all();
+    });
+}
+
+#[test]
+fn test_secondary_mem_index_cleanup_aggregates_bounded_batches() {
+    smol::block_on(async {
+        let sys = TestSys::new_evictable_with_non_unique_name_index().await;
+        let mut session = sys.try_new_session().unwrap();
+        let name = "batch-name-".repeat(120);
+        let row_count = 80;
+        insert_rows(&sys, &mut session, 0, row_count, &name).await;
+        sys.table.freeze(&session, usize::MAX).await;
+        checkpoint_published(&sys.table, &mut session).await;
+
+        let index = sys.table.sec_idx()[1].non_unique().unwrap();
+        assert_eq!(
+            index
+                .scan_mem_entries(session.pool_guards().index_guard())
+                .await
+                .unwrap()
+                .len(),
+            row_count as usize
+        );
+
+        let stats = sys
+            .table
+            .cleanup_secondary_mem_indexes(&mut session)
+            .await
+            .unwrap();
+        assert_eq!(stats.indexes[1].scanned, row_count as usize);
+        assert_eq!(stats.indexes[1].removed, row_count as usize);
+        assert_eq!(stats.indexes[1].retained, 0);
+        assert_eq!(stats.indexes[1].skipped_live, 0);
+        assert_eq!(stats.indexes[1].skipped_hot_deleted, 0);
+        assert!(
+            index
+                .scan_mem_entries(session.pool_guards().index_guard())
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        drop(session);
+        sys.clean_all();
+    });
+}
+
+#[test]
+fn test_secondary_mem_index_cleanup_can_retain_live_cache_entries() {
+    smol::block_on(async {
+        let sys = TestSys::new_evictable_with_non_unique_name_index().await;
+        let mut session = sys.try_new_session().unwrap();
+        let row_count = 4;
+        insert_rows(&sys, &mut session, 0, row_count, "same-name").await;
+        sys.table.freeze(&session, usize::MAX).await;
+        checkpoint_published(&sys.table, &mut session).await;
+
+        let unique_index = sys.table.sec_idx()[0].unique().unwrap();
+        let non_unique_index = sys.table.sec_idx()[1].non_unique().unwrap();
+        assert_eq!(
+            unique_index
+                .scan_mem_entries(session.pool_guards().index_guard())
+                .await
+                .unwrap()
+                .len(),
+            row_count as usize
+        );
+        assert_eq!(
+            non_unique_index
+                .scan_mem_entries(session.pool_guards().index_guard())
+                .await
+                .unwrap()
+                .len(),
+            row_count as usize
+        );
+
+        let stats = sys
+            .table
+            .cleanup_secondary_mem_indexes_with_options(
+                &mut session,
+                SecondaryMemIndexCleanupOptions::default().retain_live_entries(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(stats.indexes.len(), 2);
+        for index_stats in &stats.indexes {
+            assert_eq!(index_stats.scanned, 0);
+            assert_eq!(index_stats.removed, 0);
+            assert_eq!(index_stats.retained, 0);
+            assert_eq!(index_stats.skipped_live, row_count as usize);
+            assert_eq!(index_stats.skipped_hot_deleted, 0);
+        }
+        assert_eq!(
+            unique_index
+                .scan_mem_entries(session.pool_guards().index_guard())
+                .await
+                .unwrap()
+                .len(),
+            row_count as usize
+        );
+        assert_eq!(
+            non_unique_index
+                .scan_mem_entries(session.pool_guards().index_guard())
+                .await
+                .unwrap()
+                .len(),
+            row_count as usize
+        );
 
         drop(session);
         sys.clean_all();
@@ -1824,9 +1940,11 @@ fn test_secondary_mem_index_cleanup_retains_unique_delete_shadow_without_delete_
             .cleanup_secondary_mem_indexes(&mut session)
             .await
             .unwrap();
-        assert_eq!(stats.indexes[0].scanned, 2);
+        assert_eq!(stats.indexes[0].scanned, 0);
         assert_eq!(stats.indexes[0].removed, 0);
-        assert_eq!(stats.indexes[0].retained, 2);
+        assert_eq!(stats.indexes[0].retained, 0);
+        assert_eq!(stats.indexes[0].skipped_live, 1);
+        assert_eq!(stats.indexes[0].skipped_hot_deleted, 1);
         assert_eq!(
             index
                 .lookup(
@@ -1907,6 +2025,8 @@ fn test_secondary_mem_index_cleanup_removes_unique_delete_shadow_with_purgeable_
         assert_eq!(stats.indexes[0].scanned, 2);
         assert_eq!(stats.indexes[0].removed, 2);
         assert_eq!(stats.indexes[0].retained, 0);
+        assert_eq!(stats.indexes[0].skipped_live, 0);
+        assert_eq!(stats.indexes[0].skipped_hot_deleted, 0);
         assert_eq!(
             index
                 .lookup(
@@ -1917,6 +2037,91 @@ fn test_secondary_mem_index_cleanup_removes_unique_delete_shadow_with_purgeable_
                 .await
                 .unwrap(),
             None
+        );
+
+        drop(session);
+        sys.clean_all();
+    });
+}
+
+#[test]
+fn test_secondary_mem_index_cleanup_removes_delete_shadow_when_live_cleanup_disabled() {
+    smol::block_on(async {
+        let sys = TestSys::new_evictable().await;
+        let mut session = sys.try_new_session().unwrap();
+        insert_rows(&sys, &mut session, 0, 1, "name").await;
+        sys.table.freeze(&session, usize::MAX).await;
+        checkpoint_published(&sys.table, &mut session).await;
+
+        let current_key = single_key(0i32);
+        let stale_key = single_key(-1i32);
+        let row_id = unique_disk_tree_lookup(&sys.table, session.pool_guards(), &current_key)
+            .await
+            .unwrap();
+        let index = sys.table.sec_idx()[0].unique().unwrap();
+        assert!(
+            index
+                .insert_if_not_exists(
+                    session.pool_guards().index_guard(),
+                    &stale_key.vals,
+                    row_id,
+                    false,
+                    MAX_SNAPSHOT_TS,
+                )
+                .await
+                .unwrap()
+                .is_ok()
+        );
+        assert!(
+            index
+                .mask_as_deleted(
+                    session.pool_guards().index_guard(),
+                    &stale_key.vals,
+                    row_id,
+                    MAX_SNAPSHOT_TS,
+                )
+                .await
+                .unwrap()
+        );
+        sys.table
+            .deletion_buffer()
+            .put_committed(row_id, 1)
+            .unwrap();
+
+        let stats = sys
+            .table
+            .cleanup_secondary_mem_indexes_with_options(
+                &mut session,
+                SecondaryMemIndexCleanupOptions::default().retain_live_entries(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(stats.indexes[0].scanned, 1);
+        assert_eq!(stats.indexes[0].removed, 1);
+        assert_eq!(stats.indexes[0].retained, 0);
+        assert_eq!(stats.indexes[0].skipped_live, 1);
+        assert_eq!(stats.indexes[0].skipped_hot_deleted, 0);
+        assert_eq!(
+            index
+                .lookup(
+                    session.pool_guards().index_guard(),
+                    &stale_key.vals,
+                    MAX_SNAPSHOT_TS,
+                )
+                .await
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            index
+                .lookup(
+                    session.pool_guards().index_guard(),
+                    &current_key.vals,
+                    MAX_SNAPSHOT_TS,
+                )
+                .await
+                .unwrap(),
+            Some((row_id, false))
         );
 
         drop(session);
@@ -1958,6 +2163,8 @@ fn test_secondary_mem_index_cleanup_removes_unique_delete_shadow_with_matching_c
         assert_eq!(stats.indexes[0].scanned, 1);
         assert_eq!(stats.indexes[0].removed, 0);
         assert_eq!(stats.indexes[0].retained, 1);
+        assert_eq!(stats.indexes[0].skipped_live, 0);
+        assert_eq!(stats.indexes[0].skipped_hot_deleted, 0);
         let entries = index
             .scan_mem_entries(session.pool_guards().index_guard())
             .await
@@ -1977,6 +2184,8 @@ fn test_secondary_mem_index_cleanup_removes_unique_delete_shadow_with_matching_c
         assert_eq!(stats.indexes[0].scanned, 1);
         assert_eq!(stats.indexes[0].removed, 1);
         assert_eq!(stats.indexes[0].retained, 0);
+        assert_eq!(stats.indexes[0].skipped_live, 0);
+        assert_eq!(stats.indexes[0].skipped_hot_deleted, 0);
         assert!(
             index
                 .scan_mem_entries(session.pool_guards().index_guard())
@@ -2064,6 +2273,8 @@ fn test_secondary_mem_index_cleanup_removes_unique_delete_shadow_when_cold_row_k
         assert_eq!(stats.indexes[0].scanned, 2);
         assert_eq!(stats.indexes[0].removed, 2);
         assert_eq!(stats.indexes[0].retained, 0);
+        assert_eq!(stats.indexes[0].skipped_live, 0);
+        assert_eq!(stats.indexes[0].skipped_hot_deleted, 0);
         assert!(
             index
                 .scan_mem_entries(session.pool_guards().index_guard())
@@ -2248,9 +2459,11 @@ fn test_secondary_mem_index_cleanup_retains_non_unique_delete_mark_without_delet
             .cleanup_secondary_mem_indexes(&mut session)
             .await
             .unwrap();
-        assert_eq!(stats.indexes[1].scanned, 2);
+        assert_eq!(stats.indexes[1].scanned, 0);
         assert_eq!(stats.indexes[1].removed, 0);
-        assert_eq!(stats.indexes[1].retained, 2);
+        assert_eq!(stats.indexes[1].retained, 0);
+        assert_eq!(stats.indexes[1].skipped_live, 1);
+        assert_eq!(stats.indexes[1].skipped_hot_deleted, 1);
         assert_eq!(
             index
                 .lookup_unique(
@@ -2323,6 +2536,8 @@ fn test_secondary_mem_index_cleanup_removes_non_unique_delete_mark_with_purgeabl
         assert_eq!(stats.indexes[1].scanned, 2);
         assert_eq!(stats.indexes[1].removed, 2);
         assert_eq!(stats.indexes[1].retained, 0);
+        assert_eq!(stats.indexes[1].skipped_live, 0);
+        assert_eq!(stats.indexes[1].skipped_hot_deleted, 0);
         assert_eq!(
             index
                 .lookup_unique(
@@ -2378,6 +2593,8 @@ fn test_secondary_mem_index_cleanup_removes_non_unique_delete_mark_with_matching
         assert_eq!(stats.indexes[1].scanned, 1);
         assert_eq!(stats.indexes[1].removed, 0);
         assert_eq!(stats.indexes[1].retained, 1);
+        assert_eq!(stats.indexes[1].skipped_live, 0);
+        assert_eq!(stats.indexes[1].skipped_hot_deleted, 0);
         let entries = index
             .scan_mem_entries(session.pool_guards().index_guard())
             .await
@@ -2397,6 +2614,8 @@ fn test_secondary_mem_index_cleanup_removes_non_unique_delete_mark_with_matching
         assert_eq!(stats.indexes[1].scanned, 1);
         assert_eq!(stats.indexes[1].removed, 1);
         assert_eq!(stats.indexes[1].retained, 0);
+        assert_eq!(stats.indexes[1].skipped_live, 0);
+        assert_eq!(stats.indexes[1].skipped_hot_deleted, 0);
         assert!(
             index
                 .scan_mem_entries(session.pool_guards().index_guard())
@@ -2494,6 +2713,8 @@ fn test_secondary_mem_index_cleanup_removes_non_unique_delete_mark_when_cold_row
         assert_eq!(stats.indexes[1].scanned, 2);
         assert_eq!(stats.indexes[1].removed, 2);
         assert_eq!(stats.indexes[1].retained, 0);
+        assert_eq!(stats.indexes[1].skipped_live, 0);
+        assert_eq!(stats.indexes[1].skipped_hot_deleted, 0);
         assert!(
             index
                 .scan_mem_entries(session.pool_guards().index_guard())
