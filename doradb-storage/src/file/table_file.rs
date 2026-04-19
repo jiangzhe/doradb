@@ -260,8 +260,11 @@ impl TableFile {
             .await
     }
 
-    /// Returns the in-memory active root snapshot.
+    /// Returns the in-memory active table root.
     ///
+    /// This is the transitional unchecked boundary for user-table file roots.
+    /// Foreground runtime reads should move to proof-gated `TableRootSnapshot`
+    /// values once RFC-0015 introduces them.
     /// Each call observes the currently published root. Callers that need
     /// related fields from one logical checkpoint root must bind one local
     /// reference and reuse it.

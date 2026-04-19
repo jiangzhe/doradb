@@ -289,7 +289,11 @@ impl MultiTableFile {
             .await
     }
 
-    /// Returns the in-memory active root snapshot.
+    /// Returns the in-memory active catalog root.
+    ///
+    /// Catalog checkpoint roots are outside the user-table `TableRootSnapshot`
+    /// contract. Callers that need multiple catalog-root fields must still bind
+    /// one local root reference and reuse it.
     #[inline]
     pub fn active_root(&self) -> &MultiTableActiveRoot {
         self.file.active_root()

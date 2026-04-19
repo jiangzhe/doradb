@@ -588,7 +588,7 @@ References:
     paths should eventually use `TableRootSnapshot`.
   - Non-goals: Do not split transaction or statement types; do not change
     `TableAccess` signatures; do not remove existing active-root access.
-  - Task Doc: `docs/tasks/TBD.md`
+  - Task Doc: `docs/tasks/000127-root-access-boundary-inventory.md`
   - Task Issue: `#0`
   - Phase Status: `pending`
   - Implementation Summary: `pending`
