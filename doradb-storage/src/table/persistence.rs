@@ -18,6 +18,8 @@ use crate::value::{Val, ValKind, ValType};
 use std::collections::BTreeSet;
 use std::future::Future;
 
+const CHECKPOINT_REQUIRES_IDLE_SESSION: &str = "checkpoint requires idle session";
+
 pub trait TablePersistence {
     /// Freeze row pages and return approximate non-deleted rows visited.
     fn freeze(&self, session: &Session, max_rows: usize) -> impl Future<Output = usize>;
@@ -683,6 +685,10 @@ impl TablePersistence for Table {
     }
 
     async fn checkpoint(&self, session: &mut Session) -> Result<CheckpointOutcome> {
+        if session.in_trx() {
+            return Err(Error::NotSupported(CHECKPOINT_REQUIRES_IDLE_SESSION));
+        }
+
         let table_file = self.file();
         let disk_pool = self.disk_pool();
         let trx_sys = session.engine().trx_sys.clone();
@@ -697,8 +703,8 @@ impl TablePersistence for Table {
         let mut secondary_sidecar = SecondaryCheckpointSidecar::new(self.metadata())?;
 
         // Step 2: collect frozen pages and refresh checkpoint cutoff after any
-        // stabilization wait. The final root-liveness check below is tied to
-        // `mutable_file.root()`, the exact root snapshot this run would publish from.
+        // stabilization wait. The entry readiness check is enough for root
+        // liveness because the GC horizon used by the check only moves forward.
         let pool_guards = session.pool_guards().clone();
         let (frozen_pages, next_heap_redo_start_ts) = self.collect_frozen_pages(&pool_guards).await;
         if !frozen_pages.is_empty() {
@@ -706,17 +712,12 @@ impl TablePersistence for Table {
                 .await?;
         }
         let cutoff_ts = trx_sys.calc_min_active_sts_for_gc();
-        if let CheckpointReadiness::Delayed { reason } =
-            CheckpointReadiness::for_root(mutable_file.root(), cutoff_ts)
-        {
-            return Ok(CheckpointOutcome::Delayed { reason });
-        }
 
         // Step 3: open a checkpoint transaction, then move frozen pages into
-        // transition state under the checked cutoff timestamp.
+        // transition state under the refreshed cutoff timestamp.
         let mut trx = session
             .try_begin_trx()?
-            .ok_or(Error::NotSupported("checkpoint requires idle session"))?;
+            .ok_or(Error::NotSupported(CHECKPOINT_REQUIRES_IDLE_SESSION))?;
         let checkpoint_ts = trx.sts;
         if !frozen_pages.is_empty() {
             self.set_frozen_pages_to_transition(&pool_guards, &frozen_pages, cutoff_ts)

@@ -176,15 +176,16 @@ node code, keep the unsafe boundary private, document each invariant with a
    - Keep existing storage, IO, session-state, and invalid-state failures as
      `Err(...)`.
 
-4. Tie the execution guard to the root that will be published from.
-   - Recheck root liveness after frozen-page stabilization refreshes
-     `min_active_sts` and before any irreversible checkpoint preparation step.
-   - Move `MutableTableFile::fork` or a new checked fork helper early enough that
-     the mutable root snapshot being checked is the one used for publication.
-   - If that checked root is not live-safe, release the mutable claim and return
-     `Delayed` before calling `set_frozen_pages_to_transition`.
-   - This avoids a time-of-check/time-of-use gap between caller preflight and the
-     root actually displaced by `MutableTableFile::commit`.
+4. Keep the execution guard before checkpoint mutation.
+   - The entry readiness check gates checkpoint execution before
+     `MutableTableFile::fork` and before any irreversible checkpoint preparation
+     step.
+   - After frozen-page stabilization, refresh `cutoff_ts` for transition and LWC
+     build work, but do not re-run root liveness.
+   - A second root-liveness check is redundant because
+     `calc_min_active_sts_for_gc()` only advances for the readiness decision: if
+     `active_root.trx_id < min_active_sts` succeeds at entry, a later refreshed
+     cutoff cannot make that checked root live again.
 
 5. Preserve current successful publication semantics.
    - Keep checkpoint transaction creation, LWC block building, deletion

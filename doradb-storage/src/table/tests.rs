@@ -4570,6 +4570,43 @@ fn test_checkpoint_readiness_delayed_reports_root_and_horizon() {
 }
 
 #[test]
+fn test_checkpoint_requires_idle_session_before_delayed_outcome() {
+    smol::block_on(async {
+        let sys = TestSys::new_evictable().await;
+        let mut session = sys.try_new_session().unwrap();
+        insert_rows(&sys, &mut session, 0, 120, "idle-before-delay").await;
+
+        sys.table.freeze(&session, usize::MAX).await;
+        let mut reader_session = sys.try_new_session().unwrap();
+        let reader = reader_session.try_begin_trx().unwrap().unwrap();
+        let first_checkpoint_ts = checkpoint_published(&sys.table, &mut session).await;
+        assert_eq!(sys.table.file().active_root().trx_id, first_checkpoint_ts);
+
+        let checkpoint_trx = session.try_begin_trx().unwrap().unwrap();
+        assert!(session.in_trx());
+        assert!(matches!(
+            sys.table.checkpoint_readiness(&session),
+            CheckpointReadiness::Delayed { .. }
+        ));
+
+        let err = sys.table.checkpoint(&mut session).await.unwrap_err();
+        assert!(matches!(
+            err,
+            Error::NotSupported("checkpoint requires idle session")
+        ));
+        assert!(session.in_trx());
+
+        checkpoint_trx.rollback().await.unwrap();
+        assert!(!session.in_trx());
+        reader.commit().await.unwrap();
+
+        drop(reader_session);
+        drop(session);
+        sys.clean_all();
+    });
+}
+
+#[test]
 fn test_checkpoint_delayed_preserves_root_and_frozen_pages_until_ready() {
     smol::block_on(async {
         let sys = TestSys::new_evictable().await;
