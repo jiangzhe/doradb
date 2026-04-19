@@ -1,7 +1,7 @@
 ---
 id: 000126
 title: Bound secondary MemIndex cleanup scans
-status: proposal
+status: implemented
 created: 2026-04-19
 github_issue: 574
 ---
@@ -173,6 +173,51 @@ unsafe buffer/page access internals, stop and apply
 
 ## Implementation Notes
 
+Implemented in commit `2f95990`.
+
+- Added leaf-bounded cleanup scanners for unique and non-unique MemIndex
+  entries. The scanners inspect row id and delete state before copying encoded
+  key bytes, skip live entries according to the cleanup option, skip hot delete
+  overlays with `row_id >= pivot_row_id`, and return only bounded cleanup
+  candidate batches.
+- Added `SecondaryMemIndexCleanupOptions` with
+  `retain_live_entries()` so callers can keep live MemIndex cache entries while
+  still allowing cold delete-overlay cleanup.
+- Converted table secondary MemIndex cleanup from full-vector materialization
+  to per-leaf cleanup batches. The cleanup path preserves captured-root proof
+  semantics, encoded compare-delete revalidation, and cold delete-overlay proof
+  rules.
+- Added per-index `skipped_live` and `skipped_hot_deleted` accounting.
+  `scanned`, `removed`, and `retained` now count only processed cleanup
+  candidates.
+- Updated conceptual documentation in `docs/garbage-collect.md` and
+  `docs/secondary-index.md` to describe bounded scans, live cleanup policy, and
+  the rule that hot delete overlays remain transaction index GC responsibility.
+- Created follow-up backlog
+  `docs/backlogs/000095-secondary-mem-index-cleanup-pipeline-optimization.md`
+  for deferred DiskTree range matching, grouped cold-row proof reads, and
+  page-local delete-many optimization work.
+
+Validation completed:
+
+- `cargo fmt -p doradb-storage`
+- `cargo check -p doradb-storage`
+- `cargo nextest run -p doradb-storage cleanup_scan`: 2 passed
+- `cargo nextest run -p doradb-storage secondary_mem_index_cleanup`: 15 passed
+- `cargo nextest run -p doradb-storage`: 610 passed
+- `cargo clippy -p doradb-storage --all-targets -- -D warnings`
+- `git diff --check`
+- `tools/coverage_focus.rs --path doradb-storage/src/table/gc.rs`: 96.11%
+- `tools/coverage_focus.rs --path doradb-storage/src/index/unique_index.rs`:
+  99.42%
+- `tools/coverage_focus.rs --path doradb-storage/src/index/non_unique_index.rs`:
+  98.63%
+- `tools/coverage_focus.rs --path doradb-storage/src/index/secondary_index.rs`:
+  93.12%
+- `tools/coverage_focus.rs --path doradb-storage/src/index/btree/node.rs`:
+  94.07%
+
+Post-implementation checklist found no required fixes before resolve.
 
 ## Impacts
 

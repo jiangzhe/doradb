@@ -43,3 +43,11 @@ When a backlog item is moved to `docs/backlogs/closed/`, append:
 - Reference: <task/issue/pr reference>
 - Closed At: <YYYY-MM-DD>
 ```
+
+## Close Reason
+
+- Type: implemented
+- Detail: Implemented bounded secondary MemIndex cleanup scans via task 000126.
+- Closed By: backlog close
+- Reference: docs/tasks/000126-bound-secondary-mem-index-cleanup-scans.md
+- Closed At: 2026-04-19
