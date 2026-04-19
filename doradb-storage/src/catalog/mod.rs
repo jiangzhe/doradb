@@ -1181,10 +1181,14 @@ pub mod tests {
 
             checkpointed_table.freeze(&session, usize::MAX).await;
             let mut checkpoint_session = engine.try_new_session().unwrap();
-            checkpointed_table
+            let checkpoint_outcome = checkpointed_table
                 .checkpoint(&mut checkpoint_session)
                 .await
                 .unwrap();
+            assert!(matches!(
+                checkpoint_outcome,
+                crate::table::CheckpointOutcome::Published { .. }
+            ));
 
             assert!(checkpointed_table.file().active_root().pivot_row_id > 0);
             assert_eq!(replay_only_table.file().active_root().pivot_row_id, 0);

@@ -2096,7 +2096,10 @@ impl<'a> ColumnBlockIndex<'a> {
         Ok((page_id, node))
     }
 
-    /// Record an obsolete node page to be reclaimed after commit.
+    /// Record an obsolete node page in the table file's legacy GC list.
+    ///
+    /// This preserves current metadata compatibility. Forward user-table block
+    /// reclaim should be based on checkpoint-root reachability.
     #[inline]
     pub(crate) fn record_obsolete_node<M: MutableCowFile>(
         &self,

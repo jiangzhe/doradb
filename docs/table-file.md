@@ -73,12 +73,15 @@ The active `MetaBlock` stores:
 - `heap_redo_start_ts`
 - `deletion_cutoff_ts`
 - checkpoint transaction id / publication timestamp
-- GC list of obsolete pages
+- legacy GC list of obsolete pages
 
 Notably, the table file does **not** need `index_rec_cts`.
 
 Persistent secondary-index state is recovered by loading the checkpointed
 `DiskTree` roots directly. Hot post-checkpoint index state is rebuilt from redo.
+The serialized GC list is compatibility metadata, not the forward block
+reclamation design for user tables. Future table-file cleanup should derive
+reclaimable blocks from checkpoint-root reachability.
 
 ### 4.2 Lifecycle
 
@@ -103,6 +106,9 @@ Long-running readers are protected by root indirection:
 
 - old `MetaBlock` snapshots remain valid until no active reader needs them
 - page reclamation only happens after that retention condition is satisfied
+- transition from `GC_Wait` to `Free` is future root-reachability GC work,
+  covering table metadata, `ColumnBlockIndex` nodes, LWC replacement blocks,
+  and secondary-index `DiskTree` blocks
 
 ## 6. LWC Blocks
 
@@ -167,7 +173,28 @@ If no cold-delete payload changes are selected, checkpoint can still publish a
 metadata-only root that advances `deletion_cutoff_ts` to the checkpoint
 `cutoff_ts`.
 
-### 7.3 Generic Publish Flow
+### 7.3 Checkpoint Readiness
+
+User-table checkpoint publication is gated by the active root's liveness:
+
+```text
+active_root.trx_id < Global_Min_Active_STS
+```
+
+If the active root checkpoint timestamp is equal to or newer than the GC
+horizon, checkpoint returns a normal delayed outcome and does not move frozen
+pages into transition, publish DiskTree roots, advance delete metadata, or swap
+the table-file root.
+
+The check is repeated against the mutable root snapshot that will be published
+from, so a scheduler preflight cannot race with the root actually displaced by
+the A/B super-block swap. Once the active root crosses the horizon, overwriting
+the inactive slot is safe: no active transaction still needs the root that would
+be displaced by that swap, and the old root from the successful publication is
+retained by the publishing checkpoint transaction until transaction purge
+crosses the checkpoint CTS.
+
+### 7.4 Generic Publish Flow
 
 1. read the active `MetaBlock`
 2. allocate new CoW pages for changed structures

@@ -8,7 +8,7 @@ use doradb_storage::conf::{
 use doradb_storage::engine::{Engine, EngineRef};
 use doradb_storage::row::ops::{DeleteMvcc, InsertMvcc, SelectKey, SelectMvcc};
 use doradb_storage::session::Session;
-use doradb_storage::table::{Table, TablePersistence};
+use doradb_storage::table::{CheckpointOutcome, Table, TablePersistence};
 use doradb_storage::value::{Val, ValKind};
 use std::hint::black_box;
 use std::sync::Arc;
@@ -111,7 +111,10 @@ async fn build_case(
         delete_rows(&table, &mut session, rows, sparse_stride).await;
     }
     table.freeze(&session, usize::MAX).await;
-    table.checkpoint(&mut session).await.unwrap();
+    assert!(matches!(
+        table.checkpoint(&mut session).await.unwrap(),
+        CheckpointOutcome::Published { .. }
+    ));
     drop(session);
 
     let keys = live_keys(rows, sparse, sparse_stride);
