@@ -45,7 +45,7 @@ pub(crate) trait MutableCowFile {
 /// Shared in-memory active root for copy-on-write files.
 ///
 /// `ActiveRoot<M>` stores generic CoW bookkeeping (`slot_no`, `meta_block_id`,
-/// allocation map, GC list) plus a file-specific payload `M`.
+/// allocation map, legacy GC list) plus a file-specific payload `M`.
 #[derive(Clone)]
 pub struct ActiveRoot<M> {
     /// Active ping-pong super-block slot (0/1).
@@ -56,7 +56,11 @@ pub struct ActiveRoot<M> {
     pub meta_block_id: BlockID,
     /// Allocation map used for page-id assignment.
     pub alloc_map: AllocMap,
-    /// Obsolete meta blocks pending reclamation.
+    /// Legacy persisted list of obsolete blocks.
+    ///
+    /// Current formats still serialize this list for compatibility. Future
+    /// user-table block reclaim should be driven by root reachability rather
+    /// than treating this list as the durable reclaim contract.
     pub gc_block_list: Vec<BlockID>,
     /// File-specific in-memory metadata payload.
     pub meta: M,
@@ -101,7 +105,7 @@ impl<M> ActiveRoot<M> {
         new
     }
 
-    /// Record one obsolete meta-block id for future reclamation.
+    /// Record one obsolete meta-block id in the legacy GC list.
     ///
     /// This is used during publish so the next root keeps a reclaim list
     /// for historical meta blocks.
@@ -177,7 +181,7 @@ pub struct ParsedMeta<M> {
     pub meta: M,
     /// Decoded allocation bitmap for the file.
     pub alloc_map: AllocMap,
-    /// Decoded obsolete page list.
+    /// Decoded legacy obsolete page list.
     pub gc_block_list: Vec<BlockID>,
 }
 
@@ -415,7 +419,7 @@ impl<M> CowFile<M> {
     /// Publish a new active root via copy-on-write: meta block then super block.
     ///
     /// The sequence is:
-    /// 1. add previous meta block to GC list,
+    /// 1. add previous meta block to the legacy GC list,
     /// 2. allocate + write new meta block,
     /// 3. write next super block slot,
     /// 4. fsync and atomically swap active root pointer.

@@ -93,6 +93,16 @@ deletion checkpoint. Old `DiskTree` pages become reclaimable only after the
 table-file CoW root that references them is no longer reachable by active
 readers. Root reachability GC is separate from `MemIndex` cleanup.
 
+The same root-reachability proof should be the forward reclaim mechanism for
+user-table metadata blocks, `ColumnBlockIndex` nodes, replacement LWC blocks,
+and secondary-index `DiskTree` pages. The persisted `gc_block_list` remains
+compatibility metadata and should not be extended as the future user-table block
+reclaim contract.
+
+Recovery can apply a simpler reachability rule: after restart there are no
+active transactions, so blocks unreachable from the selected latest valid root
+are reclaimable once recovery has validated and installed that root.
+
 ## Deletion Buffer
 
 The deletion buffer tracks tombstones for persisted column-store rows. A marker
@@ -111,4 +121,5 @@ Use the narrowest proof owned by the component being collected:
 - row-page GC uses row undo-chain visibility
 - runtime unique-key links use the undo GC horizon
 - `MemIndex` cleanup uses captured checkpoint roots plus deletion proof
-- `DiskTree` page GC uses table-file CoW root reachability
+- user-table table-file, LWC replacement, `ColumnBlockIndex`, and `DiskTree`
+  page GC use table-file CoW root reachability

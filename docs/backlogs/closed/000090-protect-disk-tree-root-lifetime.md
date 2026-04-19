@@ -42,3 +42,11 @@ When a backlog item is moved to `docs/backlogs/closed/`, append:
 - Reference: <task/issue/pr reference>
 - Closed At: <YYYY-MM-DD>
 ```
+
+## Close Reason
+
+- Type: replaced
+- Detail: Checkpoint root-liveness gate implemented via docs/tasks/000125-checkpoint-root-liveness-gate.md; remaining table-file and DiskTree block reclamation work moved to docs/backlogs/000094-table-file-root-reachability-gc.md
+- Closed By: backlog close
+- Reference: docs/tasks/000125-checkpoint-root-liveness-gate.md; docs/backlogs/000094-table-file-root-reachability-gc.md
+- Closed At: 2026-04-19

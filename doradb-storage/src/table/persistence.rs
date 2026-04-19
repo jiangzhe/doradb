@@ -2,7 +2,7 @@ use crate::buffer::PageID;
 use crate::catalog::{IndexSpec, TableMetadata};
 use crate::error::{Error, Result, StoragePoisonSource};
 use crate::file::cow_file::SUPER_BLOCK_ID;
-use crate::file::table_file::MutableTableFile;
+use crate::file::table_file::{ActiveRoot, MutableTableFile};
 use crate::index::BTreeKeyEncoder;
 use crate::index::disk_tree::{
     NonUniqueDiskTreeEncodedExact, UniqueDiskTreeEncodedDelete, UniqueDiskTreeEncodedPut,
@@ -18,12 +18,69 @@ use crate::value::{Val, ValKind, ValType};
 use std::collections::BTreeSet;
 use std::future::Future;
 
+const CHECKPOINT_REQUIRES_IDLE_SESSION: &str = "checkpoint requires idle session";
+
 pub trait TablePersistence {
     /// Freeze row pages and return approximate non-deleted rows visited.
     fn freeze(&self, session: &Session, max_rows: usize) -> impl Future<Output = usize>;
 
+    /// Report whether a user-table checkpoint can safely publish now.
+    fn checkpoint_readiness(&self, session: &Session) -> CheckpointReadiness;
+
     /// Persist eligible row-store and cold-delete state in one checkpoint run.
-    fn checkpoint(&self, session: &mut Session) -> impl Future<Output = Result<()>>;
+    fn checkpoint(&self, session: &mut Session) -> impl Future<Output = Result<CheckpointOutcome>>;
+}
+
+/// Cheap checkpoint scheduling decision for one user-table root snapshot.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CheckpointReadiness {
+    /// The active root is older than the current GC horizon.
+    Ready,
+    /// Checkpoint should be retried after the GC horizon advances.
+    Delayed {
+        /// Diagnostic details explaining why checkpoint should wait.
+        reason: CheckpointDelayReason,
+    },
+}
+
+/// User-table checkpoint execution result.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CheckpointOutcome {
+    /// A new checkpoint root was durably published.
+    Published {
+        /// Commit timestamp of the publishing checkpoint transaction.
+        checkpoint_ts: TrxID,
+    },
+    /// No checkpoint work was published because the active root is still live.
+    Delayed {
+        /// Diagnostic details explaining why checkpoint waited.
+        reason: CheckpointDelayReason,
+    },
+}
+
+/// Diagnostic payload for normal checkpoint scheduling delay.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CheckpointDelayReason {
+    /// Checkpoint timestamp of the active table-file root.
+    pub root_cts: TrxID,
+    /// Current global minimum active snapshot timestamp used by GC.
+    pub min_active_sts: TrxID,
+}
+
+impl CheckpointReadiness {
+    #[inline]
+    fn for_root(active_root: &ActiveRoot, min_active_sts: TrxID) -> Self {
+        if active_root.trx_id < min_active_sts {
+            Self::Ready
+        } else {
+            Self::Delayed {
+                reason: CheckpointDelayReason {
+                    root_cts: active_root.trx_id,
+                    min_active_sts,
+                },
+            }
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -621,31 +678,49 @@ impl TablePersistence for Table {
         rows
     }
 
-    async fn checkpoint(&self, session: &mut Session) -> Result<()> {
+    fn checkpoint_readiness(&self, session: &Session) -> CheckpointReadiness {
+        let trx_sys = session.engine().trx_sys.clone();
+        let active_root = self.file().active_root();
+        CheckpointReadiness::for_root(active_root, trx_sys.calc_min_active_sts_for_gc())
+    }
+
+    async fn checkpoint(&self, session: &mut Session) -> Result<CheckpointOutcome> {
+        if session.in_trx() {
+            return Err(Error::NotSupported(CHECKPOINT_REQUIRES_IDLE_SESSION));
+        }
+
         let table_file = self.file();
         let disk_pool = self.disk_pool();
-        // Step 1: snapshot current table root and initialize checkpoint boundaries.
         let trx_sys = session.engine().trx_sys.clone();
-        let active_root = table_file.active_root();
-        let pivot_row_id = active_root.pivot_row_id;
+        if let CheckpointReadiness::Delayed { reason } = self.checkpoint_readiness(session) {
+            return Ok(CheckpointOutcome::Delayed { reason });
+        }
+
+        // Step 1: claim one mutable root snapshot and initialize checkpoint boundaries.
+        let mut mutable_file =
+            MutableTableFile::fork(table_file, session.engine().table_fs.background_writes());
+        let pivot_row_id = mutable_file.root().pivot_row_id;
         let mut secondary_sidecar = SecondaryCheckpointSidecar::new(self.metadata())?;
 
-        // Step 2: open a checkpoint transaction and prepare per-phase state.
+        // Step 2: collect frozen pages and refresh checkpoint cutoff after any
+        // stabilization wait. The entry readiness check is enough for root
+        // liveness because the GC horizon used by the check only moves forward.
+        let pool_guards = session.pool_guards().clone();
+        let (frozen_pages, next_heap_redo_start_ts) = self.collect_frozen_pages(&pool_guards).await;
+        if !frozen_pages.is_empty() {
+            self.wait_for_frozen_pages_stable(&pool_guards, &trx_sys, &frozen_pages)
+                .await?;
+        }
+        let cutoff_ts = trx_sys.calc_min_active_sts_for_gc();
+
+        // Step 3: open a checkpoint transaction, then move frozen pages into
+        // transition state under the refreshed cutoff timestamp.
         let mut trx = session
             .try_begin_trx()?
-            .ok_or(Error::NotSupported("checkpoint requires idle session"))?;
+            .ok_or(Error::NotSupported(CHECKPOINT_REQUIRES_IDLE_SESSION))?;
         let checkpoint_ts = trx.sts;
-
-        // Step 3: collect frozen pages and move them into transition state
-        // under a refreshed cutoff timestamp.
-        let mut cutoff_ts = trx_sys.calc_min_active_sts_for_gc();
-        let pool_guards = session.pool_guards();
-        let (frozen_pages, next_heap_redo_start_ts) = self.collect_frozen_pages(pool_guards).await;
         if !frozen_pages.is_empty() {
-            self.wait_for_frozen_pages_stable(pool_guards, &trx_sys, &frozen_pages)
-                .await?;
-            cutoff_ts = trx_sys.calc_min_active_sts_for_gc();
-            self.set_frozen_pages_to_transition(pool_guards, &frozen_pages, cutoff_ts)
+            self.set_frozen_pages_to_transition(&pool_guards, &frozen_pages, cutoff_ts)
                 .await?;
         }
 
@@ -695,9 +770,7 @@ impl TablePersistence for Table {
             sts: checkpoint_ts,
         }));
 
-        // Step 6: fork mutable table-file state and apply checkpoint changes.
-        let mut mutable_file =
-            MutableTableFile::fork(table_file, session.engine().table_fs.background_writes());
+        // Step 6: apply checkpoint changes to the already-checked mutable root.
         if !lwc_blocks.is_empty() {
             if let Err(err) = mutable_file
                 .apply_lwc_blocks(lwc_blocks, heap_redo_start_ts, checkpoint_ts, disk_pool)
@@ -775,7 +848,7 @@ impl TablePersistence for Table {
         }
 
         let _cts = trx_sys.commit(trx).await?;
-        Ok(())
+        Ok(CheckpointOutcome::Published { checkpoint_ts })
     }
 }
 

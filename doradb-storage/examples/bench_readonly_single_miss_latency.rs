@@ -11,7 +11,7 @@ use doradb_storage::conf::{
 use doradb_storage::io::IOBackendStats;
 use doradb_storage::row::ops::{InsertMvcc, SelectKey, SelectMvcc};
 use doradb_storage::session::Session;
-use doradb_storage::table::{Table, TablePersistence};
+use doradb_storage::table::{CheckpointOutcome, Table, TablePersistence};
 use doradb_storage::value::{Val, ValKind};
 use rand::RngCore;
 use std::hint::black_box;
@@ -167,7 +167,10 @@ fn main() {
         let mut write_session = engine.try_new_session().unwrap();
         insert_rows(&table, &mut write_session, args.rows).await;
         table.freeze(&write_session, usize::MAX).await;
-        table.checkpoint(&mut write_session).await.unwrap();
+        assert!(matches!(
+            table.checkpoint(&mut write_session).await.unwrap(),
+            CheckpointOutcome::Published { .. }
+        ));
         drop(write_session);
 
         let keys = build_keys(args.rows);

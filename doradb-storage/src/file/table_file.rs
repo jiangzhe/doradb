@@ -476,7 +476,10 @@ impl MutableTableFile {
         self.new_root_mut().rollback_allocated_block_id(block_id)
     }
 
-    /// Record an obsolete block id to be reclaimed on commit.
+    /// Record an obsolete block id in the legacy compatibility GC list.
+    ///
+    /// User-table block reclamation should move to root reachability instead
+    /// of using this list as the forward reclaim mechanism.
     #[inline]
     pub fn record_gc_block(&mut self, block_id: BlockID) {
         self.new_root_mut().gc_block_list.push(block_id);

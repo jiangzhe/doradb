@@ -665,8 +665,8 @@ mod tests {
     };
     use crate::row::RowRead;
     use crate::row::ops::{DeleteMvcc, InsertMvcc, SelectKey, SelectMvcc, UpdateCol, UpdateMvcc};
-    use crate::table::{DeleteMarker, TableAccess, TablePersistence};
-    use crate::trx::MIN_SNAPSHOT_TS;
+    use crate::table::{CheckpointOutcome, DeleteMarker, Table, TableAccess, TablePersistence};
+    use crate::trx::{MIN_SNAPSHOT_TS, TrxID};
     use crate::value::Val;
     use crate::value::ValKind;
     use std::fs::OpenOptions;
@@ -703,6 +703,15 @@ mod tests {
                     .io_depth(1)
                     .readonly_buffer_size(LIGHTWEIGHT_RECOVERY_READONLY_BUFFER_BYTES),
             )
+    }
+
+    async fn checkpoint_published(table: &Table, session: &mut crate::session::Session) -> TrxID {
+        match table.checkpoint(session).await.unwrap() {
+            CheckpointOutcome::Published { checkpoint_ts } => checkpoint_ts,
+            CheckpointOutcome::Delayed { reason } => {
+                panic!("checkpoint should publish, delayed by {reason:?}")
+            }
+        }
     }
 
     #[test]
@@ -1127,7 +1136,7 @@ mod tests {
 
             table.freeze(&session, usize::MAX).await;
             let mut checkpoint_session = engine.try_new_session().unwrap();
-            table.checkpoint(&mut checkpoint_session).await.unwrap();
+            checkpoint_published(&table, &mut checkpoint_session).await;
             let root_after_checkpoint = table.file().active_root();
             assert!(root_after_checkpoint.heap_redo_start_ts > catalog_replay_start_ts);
 
@@ -1240,7 +1249,7 @@ mod tests {
 
             table.freeze(&session, usize::MAX).await;
             let mut checkpoint_session = engine.try_new_session().unwrap();
-            table.checkpoint(&mut checkpoint_session).await.unwrap();
+            checkpoint_published(&table, &mut checkpoint_session).await;
             assert!(table.file().active_root().pivot_row_id > cold_row_id);
 
             let key = SelectKey::new(0, vec![Val::from(7u32)]);
@@ -1371,7 +1380,7 @@ mod tests {
 
             table.freeze(&session, usize::MAX).await;
             let mut checkpoint_session = engine.try_new_session().unwrap();
-            table.checkpoint(&mut checkpoint_session).await.unwrap();
+            checkpoint_published(&table, &mut checkpoint_session).await;
             assert!(
                 same_row_ids
                     .iter()
@@ -1504,7 +1513,7 @@ mod tests {
 
             table.freeze(&session, usize::MAX).await;
             let mut checkpoint_session = engine.try_new_session().unwrap();
-            table.checkpoint(&mut checkpoint_session).await.unwrap();
+            checkpoint_published(&table, &mut checkpoint_session).await;
             let root_after_checkpoint = table.file().active_root();
             assert!(root_after_checkpoint.heap_redo_start_ts > catalog_replay_start_ts);
 
@@ -1617,7 +1626,7 @@ mod tests {
 
             table.freeze(&session, usize::MAX).await;
             let mut checkpoint_session = engine.try_new_session().unwrap();
-            table.checkpoint(&mut checkpoint_session).await.unwrap();
+            checkpoint_published(&table, &mut checkpoint_session).await;
 
             let mut trx = session.try_begin_trx().unwrap().unwrap();
             let key0 = SelectKey::new(0, vec![Val::from(0u32)]);
@@ -1645,7 +1654,7 @@ mod tests {
                 "deletion marker ts {} not yet below checkpoint cutoff",
                 marker0_ts
             );
-            table.checkpoint(&mut checkpoint_session).await.unwrap();
+            checkpoint_published(&table, &mut checkpoint_session).await;
             let checkpointed_cutoff = table.file().active_root().deletion_cutoff_ts;
             assert!(checkpointed_cutoff > marker0_ts);
 
@@ -1811,10 +1820,7 @@ mod tests {
 
             checkpointed_table.freeze(&session, usize::MAX).await;
             let mut checkpoint_session = engine.try_new_session().unwrap();
-            checkpointed_table
-                .checkpoint(&mut checkpoint_session)
-                .await
-                .unwrap();
+            checkpoint_published(&checkpointed_table, &mut checkpoint_session).await;
 
             let mut trx = session.try_begin_trx().unwrap().unwrap();
             let mut stmt = trx.start_stmt();
@@ -1974,7 +1980,7 @@ mod tests {
 
             table.freeze(&session, usize::MAX).await;
             let mut checkpoint_session = engine.try_new_session().unwrap();
-            table.checkpoint(&mut checkpoint_session).await.unwrap();
+            checkpoint_published(&table, &mut checkpoint_session).await;
 
             let active_root = table.file().active_root();
             let block_id = {
@@ -2095,7 +2101,7 @@ mod tests {
 
             table.freeze(&session, usize::MAX).await;
             let mut checkpoint_session = engine.try_new_session().unwrap();
-            table.checkpoint(&mut checkpoint_session).await.unwrap();
+            checkpoint_published(&table, &mut checkpoint_session).await;
 
             let mut trx = session.try_begin_trx().unwrap().unwrap();
             for i in 0..64u32 {
@@ -2135,7 +2141,7 @@ mod tests {
             trx.commit().await.unwrap();
 
             table.freeze(&session, usize::MAX).await;
-            table.checkpoint(&mut checkpoint_session).await.unwrap();
+            checkpoint_published(&table, &mut checkpoint_session).await;
 
             let active_root = table.file().active_root();
             let blob_ref = {
