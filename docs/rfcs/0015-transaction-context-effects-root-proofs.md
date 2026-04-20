@@ -130,7 +130,7 @@ Issue Labels:
 - [U2] Direction decision: prefer the long-term phased RFC proposal instead of
   a narrow task document.
 - [U3] Design concern: clarify the relationship between `Statement`,
-  `StatementEffects`, `TrxContext`, and `TrxEffects`.
+  `StmtEffects`, `TrxContext`, and `TrxEffects`.
 - [U4] Design concern: `TableAccess` has a large impact surface; immutable and
   mutable methods should accept different parameters and the RFC should analyze
   call-site changes.
@@ -190,21 +190,21 @@ pub struct ActiveTrx {
 ```rust
 pub struct Statement {
     trx: ActiveTrx,
-    effects: StatementEffects,
+    effects: StmtEffects,
 }
 ```
 
-`StatementEffects` is the statement-local mutable accumulator:
+`StmtEffects` is the statement-local mutable accumulator:
 
 - statement-level row undo logs
 - statement-level index undo logs
 - statement-level redo logs
 - helper methods that push row undo, index undo, and redo entries
 
-`Statement::succeed()` merges `StatementEffects` into `TrxEffects` and returns
-`ActiveTrx`. `Statement::fail()` rolls back `StatementEffects`, discards
+`Statement::succeed()` merges `StmtEffects` into `TrxEffects` and returns
+`ActiveTrx`. `Statement::fail()` rolls back `StmtEffects`, discards
 statement redo, and returns `ActiveTrx`. This keeps the current linear API while
-allowing table internals to borrow `&TrxContext` and `&mut StatementEffects`
+allowing table internals to borrow `&TrxContext` and `&mut StmtEffects`
 as disjoint fields. [C3], [C4], [C12], [C13], [U3]
 
 This RFC does not require `Statement<'trx>` borrowing from an external
@@ -291,7 +291,7 @@ impl Table {
 ```
 
 The snapshot owns its field values so it can cross `.await` points and coexist
-with `&mut StatementEffects`. The lifetime parameter still ties root-derived
+with `&mut StmtEffects`. The lifetime parameter still ties root-derived
 block ids and metadata to the transaction context that authorized the read.
 [C5], [C8], [U4], [U7]
 
@@ -356,14 +356,14 @@ effects:
 fn insert_mvcc(
     &self,
     ctx: &TrxContext,
-    effects: &mut StatementEffects,
+    effects: &mut StmtEffects,
     cols: Vec<Val>,
 ) -> impl Future<Output = Result<InsertMvcc>>;
 
 fn update_unique_mvcc(
     &self,
     ctx: &TrxContext,
-    effects: &mut StatementEffects,
+    effects: &mut StmtEffects,
     key: &SelectKey,
     update: Vec<UpdateCol>,
 ) -> impl Future<Output = Result<UpdateMvcc>>;
@@ -371,7 +371,7 @@ fn update_unique_mvcc(
 fn delete_unique_mvcc(
     &self,
     ctx: &TrxContext,
-    effects: &mut StatementEffects,
+    effects: &mut StmtEffects,
     key: &SelectKey,
     log_by_key: bool,
 ) -> impl Future<Output = Result<DeleteMvcc>>;
@@ -386,15 +386,17 @@ The call-site migration is expected to follow these rules:
 - `stmt.load_active_insert_page(...)` and
   `stmt.save_active_insert_page(...)` become context/session helpers.
 - `stmt.row_undo`, `stmt.index_undo`, and `stmt.redo` mutations move to
-  `StatementEffects` methods.
+  `StmtEffects` methods.
 - Row MVCC read helpers that only need visibility take `&TrxContext`.
 - Row write helpers that install locks or undo records take
-  `&TrxContext` plus `&mut StatementEffects`.
+  `&TrxContext` plus `&mut StmtEffects`.
 
-Most external callers can continue using `Statement` convenience methods during
-the compatibility period. Direct `TableAccess` callers, including catalog
-storage insert paths, must either switch to the convenience wrappers or pass
-split parameters explicitly. [C4], [C5], [C6], [C12], [U3], [U4]
+Phase 4 completed the call-site migration without keeping table-operation
+wrappers on `Statement`. External callers obtain `stmt.ctx()` and
+`stmt.effects_mut()` or `stmt.ctx_and_effects_mut()` and call `TableAccess`
+directly; tests may use local helper functions when that keeps scenarios
+readable without widening the production API. [C4], [C5], [C6], [C12], [U3],
+[U4]
 
 ### Active-Root Access Boundary
 
@@ -424,7 +426,7 @@ larger transaction and table-access API churn. [C1], [C7], [C8], [C9], [C10],
 
 `table/access.rs` is the primary API churn point. Its public trait signatures
 change, and most internal helpers must replace `Statement` reach-throughs with
-explicit `TrxContext` reads and `StatementEffects` mutations. The migration must
+explicit `TrxContext` reads and `StmtEffects` mutations. The migration must
 cover row visibility, write-lock installation, index undo pushes, redo pushes,
 active insert page cache access, cold-row deletion markers, and secondary-index
 update helpers. [C5], [C6], [C12], [U4]
@@ -432,7 +434,7 @@ update helpers. [C5], [C6], [C12], [U4]
 Transaction and statement modules provide the enabling split. `ActiveTrx`
 retains the public lifecycle while internally exposing `ctx` and `effects`.
 `Statement` remains the compatibility handle for normal callers, but internally
-splits into `&TrxContext` plus `&mut StatementEffects` before calling table
+splits into `&TrxContext` plus `&mut StmtEffects` before calling table
 access. Commit, rollback, prepare, readonly checks, retained old roots, and
 fatal rollback cleanup remain transaction-effect responsibilities. [C3], [C4],
 [C13], [U3]
@@ -440,7 +442,7 @@ fatal rollback cleanup remain transaction-effect responsibilities. [C3], [C4],
 Row MVCC helpers should no longer depend on the whole transaction when they only
 need identity. Read helpers should accept `&TrxContext`. Write helpers that push
 undo or install logical locks should accept `&TrxContext` plus
-`&mut StatementEffects`. This keeps read-your-own-write and same-transaction
+`&mut StmtEffects`. This keeps read-your-own-write and same-transaction
 checks immutable while making undo mutation explicit. [C5], [C6]
 
 Secondary-index runtime paths need a root-source change rather than a
@@ -477,10 +479,9 @@ multiple root fields such as `pivot_row_id`, `heap_redo_start_ts`, or
 Catalog has three separate impact surfaces:
 
 1. Catalog table storage accessors call `TableAccess` directly for inserts and
-   deletes. These should either switch to `Statement` wrapper methods or pass
-   `stmt.ctx()` and `stmt.effects_mut()` explicitly during Phase 4. Uncommitted
-   catalog scans that take `PoolGuards` and do not use MVCC snapshots should not
-   need `TrxContext`. [C14], [U8]
+   deletes. Phase 4 migrates these paths to explicit split parameters obtained
+   from `Statement`; uncommitted catalog scans that take `PoolGuards` and do
+   not use MVCC snapshots do not need `TrxContext`. [C14], [U8]
 2. Catalog user-table loading reads user table-file active roots to validate
    metadata, initialize block-index roots, and compute loaded-table replay
    floors. This is a bootstrap/load boundary and should use named unchecked or
@@ -490,18 +491,18 @@ Catalog has three separate impact surfaces:
    though transaction context/effects changes may still affect callers that open
    normal transactions around catalog DDL. [C16], [U8]
 
-Tests will need the broadest mechanical cleanup. Runtime behavior tests should
-prefer statement wrappers and proof-gated snapshots once available. File-format,
-checkpoint, recovery, and low-level table-file tests may keep unchecked
-current-root helpers when they are asserting publication internals. [D8], [C1],
-[C2], [U6]
+Tests need the broadest mechanical cleanup. Runtime behavior tests should prefer
+explicit split `TableAccess` calls or narrow test-local helpers, and should move
+to proof-gated snapshots once available. File-format, checkpoint, recovery, and
+low-level table-file tests may keep unchecked current-root helpers when they are
+asserting publication internals. [D8], [C1], [C2], [U6]
 
 ## Alternatives Considered
 
 ### Alternative A: Value Snapshots Only
 
 - Summary: Replace repeated `active_root()` reads with owned snapshots, but do
-  not introduce `TrxContext`, `StatementEffects`, or `TrxReadProof`.
+  not introduce `TrxContext`, `StmtEffects`, or `TrxReadProof`.
 - Analysis: This directly addresses mixed-root field reads and is close to the
   temporary snapshot in MemIndex cleanup. It has lower churn and can improve
   correctness for several paths.
@@ -612,11 +613,11 @@ References:
     - `docs/backlogs/closed/000093-transaction-context-effects-split-active-root-proofs.md`
 
 - **Phase 3: Statement Effects Split**
-  - Scope: Introduce `StatementEffects`, move statement-local row undo, index
+  - Scope: Introduce `StmtEffects`, move statement-local row undo, index
     undo, redo, and push helpers out of `Statement`, and update `succeed()` /
-    `fail()` to merge or roll back `StatementEffects`.
+    `fail()` to merge or roll back `StmtEffects`.
   - Goals: Allow table write code to receive `&TrxContext` and
-    `&mut StatementEffects` as disjoint borrows; preserve existing `Statement`
+    `&mut StmtEffects` as disjoint borrows; preserve existing `Statement`
     convenience methods and statement lifecycle.
   - Non-goals: Do not require a borrowed `Statement<'trx>` ownership model; do
     not seal compatibility accessors yet.
@@ -629,18 +630,19 @@ References:
 
 - **Phase 4: TableAccess API Migration**
   - Scope: Change `TableAccess` read methods to accept `&TrxContext` and write
-    methods to accept `&TrxContext` plus `&mut StatementEffects`; migrate row
+    methods to accept `&TrxContext` plus `&mut StmtEffects`; migrate row
     MVCC helpers, write-lock helpers, index update helpers, and direct
     `TableAccess` callers.
   - Goals: Make immutable versus mutable dependencies explicit throughout table
-    access; keep `Statement` wrapper methods as the compatibility layer for most
-    callers during the transition.
+    access; make explicit split context/effects `TableAccess` calls the normal
+    API; remove public `Statement` table-operation wrappers after call sites are
+    migrated.
   - Non-goals: Do not require proof-gated table-root snapshots for every path in
-    this phase; do not remove all compatibility wrappers.
-  - Task Doc: `docs/tasks/TBD.md`
-  - Task Issue: `#0`
-  - Phase Status: `pending`
-  - Implementation Summary: `pending`
+    this phase; do not remove `Statement` itself or change its linear lifecycle.
+  - Task Doc: `docs/tasks/000130-tableaccess-api-migration.md`
+  - Task Issue: `#584`
+  - Phase Status: done
+  - Implementation Summary: Phase 4 implemented: TableAccess MVCC reads now take &TrxContext; writes take &TrxContext plus &mut StmtEffects; Statement table-operation wrappers were removed; callers, tests, and examples migrated; validation passed with build, clippy, nextest, focused coverage, and git diff check. [Task Resolve Sync: docs/tasks/000130-tableaccess-api-migration.md @ 2026-04-20]
   - Related Backlogs:
     - `docs/backlogs/closed/000093-transaction-context-effects-split-active-root-proofs.md`
 
@@ -688,15 +690,15 @@ References:
   multiple active roots after checkpoint swaps.
 - Owned snapshots fit async table access and cleanup paths better than long
   borrowed `ActiveRoot` lifetimes.
-- The phased plan keeps each downstream task reviewable and gives direct
-  callers a compatibility period.
+- The phased plan keeps each downstream task reviewable while allowing Phase 4
+  to remove transitional table-operation wrappers once call sites are migrated.
 
 ### Negative
 
 - The API churn is large, especially in `table/access.rs`, row MVCC helpers,
   tests, and catalog storage paths that call `TableAccess` directly.
-- Compatibility wrappers temporarily duplicate access patterns and must be
-  removed deliberately.
+- Removing table-operation wrapper compatibility creates one-time call-site
+  churn, but leaves fewer production API paths to maintain afterward.
 - `TableRootSnapshot` clones the secondary-index root vector and the metadata
   `Arc`; this should be low cost relative to disk reads, but hot paths should
   avoid repeated snapshot creation inside tight loops.
@@ -714,10 +716,6 @@ References:
 - Should checkpoint readiness use `TableRootSnapshot`, or should checkpoint
   remain on an internal unchecked active-root path because it is a publication
   coordinator rather than a runtime transaction read?
-- Which direct `TableAccess` callers should be migrated to `Statement` wrapper
-  methods versus explicit split parameters?
-- When compatibility wrappers are removed, should old names be deleted outright
-  or kept as test-only helpers behind `#[cfg(test)]`?
 
 ## Future Work
 

@@ -11,7 +11,7 @@ use doradb_storage::conf::{
 use doradb_storage::io::IOBackendStats;
 use doradb_storage::row::ops::{InsertMvcc, SelectKey, SelectMvcc};
 use doradb_storage::session::Session;
-use doradb_storage::table::{CheckpointOutcome, Table, TablePersistence};
+use doradb_storage::table::{CheckpointOutcome, Table, TableAccess, TablePersistence};
 use doradb_storage::value::{Val, ValKind};
 use rand::RngCore;
 use std::hint::black_box;
@@ -192,8 +192,9 @@ fn main() {
         let mut trx = session.try_begin_trx().unwrap().unwrap();
         for (idx, key) in keys.iter().enumerate() {
             let stmt = trx.start_stmt();
-            let res = stmt
-                .select_row_mvcc(table.as_ref(), key, &READ_SET)
+            let res = table
+                .accessor()
+                .index_lookup_unique_mvcc(stmt.ctx(), key, &READ_SET)
                 .await
                 .unwrap();
             let vals = match res {
@@ -228,8 +229,9 @@ fn main() {
             let idx = (rng.next_u64() % args.rows as u64) as usize;
             let key = &keys[idx];
             let stmt = trx.start_stmt();
-            let res = stmt
-                .select_row_mvcc(table.as_ref(), key, &READ_SET)
+            let res = table
+                .accessor()
+                .index_lookup_unique_mvcc(stmt.ctx(), key, &READ_SET)
                 .await
                 .unwrap();
             let vals = match res {
@@ -270,7 +272,11 @@ async fn insert_rows(table: &Arc<Table>, session: &mut Session, rows: usize) {
     let mut trx = session.try_begin_trx().unwrap().unwrap();
     for idx in 0..rows {
         let mut stmt = trx.start_stmt();
-        let res = stmt.insert_row(table, vec![Val::from(idx as i32)]).await;
+        let (ctx, effects) = stmt.ctx_and_effects_mut();
+        let res = table
+            .accessor()
+            .insert_mvcc(ctx, effects, vec![Val::from(idx as i32)])
+            .await;
         assert!(matches!(res, Ok(InsertMvcc::Inserted(_))));
         trx = stmt.succeed();
     }

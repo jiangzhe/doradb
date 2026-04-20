@@ -649,8 +649,9 @@ mod tests {
     use crate::index::{RowLocation, UniqueIndex};
     use crate::latch::LatchFallbackMode;
     use crate::row::RowPage;
-    use crate::row::ops::SelectKey;
-    use crate::table::DeleteMarker;
+    use crate::row::ops::{DeleteMvcc, InsertMvcc, SelectKey};
+    use crate::stmt::Statement;
+    use crate::table::{DeleteMarker, Table, TableAccess};
     use crate::trx::row::RowReadAccess;
     use crate::trx::undo::{OwnedRowUndo, RowUndoKind, RowUndoLogs};
     use crate::trx::{CommittedTrxPayload, MIN_ACTIVE_TRX_ID, SharedTrxStatus};
@@ -667,6 +668,27 @@ mod tests {
             .push(PoolRole::Mem, engine.mem_pool.pool_guard())
             .push(PoolRole::Disk, engine.disk_pool.pool_guard())
             .build()
+    }
+
+    async fn stmt_insert_row(
+        stmt: &mut Statement,
+        table: &Table,
+        cols: Vec<Val>,
+    ) -> crate::error::Result<InsertMvcc> {
+        let (ctx, effects) = stmt.ctx_and_effects_mut();
+        table.accessor().insert_mvcc(ctx, effects, cols).await
+    }
+
+    async fn stmt_delete_row(
+        stmt: &mut Statement,
+        table: &Table,
+        key: &SelectKey,
+    ) -> crate::error::Result<DeleteMvcc> {
+        let (ctx, effects) = stmt.ctx_and_effects_mut();
+        table
+            .accessor()
+            .delete_unique_mvcc(ctx, effects, key, false)
+            .await
     }
 
     #[test]
@@ -770,7 +792,7 @@ mod tests {
             let mut session = engine.try_new_session().unwrap();
             let mut trx = session.try_begin_trx().unwrap().unwrap();
             let mut stmt = trx.start_stmt();
-            stmt.insert_row(&table, vec![Val::from(1001i32)])
+            stmt_insert_row(&mut stmt, &table, vec![Val::from(1001i32)])
                 .await
                 .unwrap();
             trx = stmt.succeed();
@@ -860,7 +882,7 @@ mod tests {
             let mut session = engine.try_new_session().unwrap();
             let mut trx = session.try_begin_trx().unwrap().unwrap();
             let mut stmt = trx.start_stmt();
-            stmt.insert_row(&table, vec![Val::from(1002i32)])
+            stmt_insert_row(&mut stmt, &table, vec![Val::from(1002i32)])
                 .await
                 .unwrap();
             trx = stmt.succeed();
@@ -954,7 +976,7 @@ mod tests {
             let mut session = engine.try_new_session().unwrap();
             let mut trx = session.try_begin_trx().unwrap().unwrap();
             let mut stmt = trx.start_stmt();
-            stmt.insert_row(&table, vec![Val::from(1003i32)])
+            stmt_insert_row(&mut stmt, &table, vec![Val::from(1003i32)])
                 .await
                 .unwrap();
             trx = stmt.succeed();
@@ -1062,7 +1084,7 @@ mod tests {
             let mut session = engine.try_new_session().unwrap();
             let mut trx = session.try_begin_trx().unwrap().unwrap();
             let mut stmt = trx.start_stmt();
-            stmt.insert_row(&table, vec![Val::from(1004i32)])
+            stmt_insert_row(&mut stmt, &table, vec![Val::from(1004i32)])
                 .await
                 .unwrap();
             trx = stmt.succeed();
@@ -1185,7 +1207,7 @@ mod tests {
             for i in 0..PURGE_SIZE {
                 let mut trx = session.try_begin_trx().unwrap().unwrap();
                 let mut stmt = trx.start_stmt();
-                let res = stmt.insert_row(&table, vec![Val::from(i as i32)]).await;
+                let res = stmt_insert_row(&mut stmt, &table, vec![Val::from(i as i32)]).await;
                 assert!(res.is_ok());
                 trx = stmt.succeed();
                 let res = trx.commit().await;
@@ -1196,7 +1218,7 @@ mod tests {
                 let mut trx = session.try_begin_trx().unwrap().unwrap();
                 let mut stmt = trx.start_stmt();
                 let key = SelectKey::new(0, vec![Val::from(i as i32)]);
-                let res = stmt.delete_row(&table, &key).await;
+                let res = stmt_delete_row(&mut stmt, &table, &key).await;
                 assert!(res.is_ok());
                 trx = stmt.succeed();
                 let res = trx.commit().await;
@@ -1268,7 +1290,7 @@ mod tests {
             for i in 0..PURGE_SIZE {
                 let mut trx = session.try_begin_trx().unwrap().unwrap();
                 let mut stmt = trx.start_stmt();
-                let res = stmt.insert_row(&table, vec![Val::from(i as i32)]).await;
+                let res = stmt_insert_row(&mut stmt, &table, vec![Val::from(i as i32)]).await;
                 assert!(res.is_ok());
                 trx = stmt.succeed();
                 let res = trx.commit().await;
@@ -1279,7 +1301,7 @@ mod tests {
                 let mut trx = session.try_begin_trx().unwrap().unwrap();
                 let mut stmt = trx.start_stmt();
                 let key = SelectKey::new(0, vec![Val::from(i as i32)]);
-                let res = stmt.delete_row(&table, &key).await;
+                let res = stmt_delete_row(&mut stmt, &table, &key).await;
                 assert!(res.is_ok());
                 trx = stmt.succeed();
                 let res = trx.commit().await;

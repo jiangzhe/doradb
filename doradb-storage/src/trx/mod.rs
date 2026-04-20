@@ -136,7 +136,7 @@ pub fn trx_must_not_see_even_if_prepare(sts: TrxID, ts: TrxID) -> bool {
 }
 
 /// Immutable transaction identity and runtime handles.
-pub(crate) struct TrxContext {
+pub struct TrxContext {
     session: Option<Arc<SessionState>>,
     status: Arc<SharedTrxStatus>,
     sts: TrxID,
@@ -576,26 +576,6 @@ impl ActiveTrx {
     ) {
         self.effects
             .merge_statement_effects(row_undo, index_undo, redo);
-    }
-
-    /// Loads the cached active insert page from the attached session.
-    #[inline]
-    pub(crate) fn load_active_insert_page(
-        &self,
-        table_id: TableID,
-    ) -> Option<(VersionedPageID, RowID)> {
-        self.ctx.load_active_insert_page(table_id)
-    }
-
-    /// Saves the cached active insert page into the attached session.
-    #[inline]
-    pub(crate) fn save_active_insert_page(
-        &self,
-        table_id: TableID,
-        page_id: VersionedPageID,
-        row_id: RowID,
-    ) {
-        self.ctx.save_active_insert_page(table_id, page_id, row_id);
     }
 
     /// Takes the attached session from the transaction context.
@@ -1183,9 +1163,10 @@ mod tests {
             let session_state = Arc::new(SessionState::new(engine.new_ref().unwrap()));
             let trx = ActiveTrx::new(session_state, MIN_ACTIVE_TRX_ID + 45, 45, 0, 0);
             let mut stmt = Statement::new(trx);
-            stmt.push_row_undo(OwnedRowUndo::new(12, None, 23, RowUndoKind::Delete));
-            stmt.push_delete_index_undo(12, 23, SelectKey::new(0, vec![]), true);
-            stmt.insert_row_redo(
+            let effects = stmt.effects_mut();
+            effects.push_row_undo(OwnedRowUndo::new(12, None, 23, RowUndoKind::Delete));
+            effects.push_delete_index_undo(12, 23, SelectKey::new(0, vec![]), true);
+            effects.insert_row_redo(
                 12,
                 RowRedo {
                     page_id: PageID::new(0),

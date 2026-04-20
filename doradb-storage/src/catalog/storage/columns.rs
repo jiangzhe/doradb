@@ -119,8 +119,9 @@ impl Columns<'_> {
             Val::from(obj.column_type as u32),
             Val::from(obj.column_attributes.bits()),
         ];
+        let (ctx, effects) = stmt.ctx_and_effects_mut();
         matches!(
-            self.table.accessor().insert_mvcc(stmt, cols).await,
+            self.table.accessor().insert_mvcc(ctx, effects, cols).await,
             Ok(InsertMvcc::Inserted(_))
         )
     }
@@ -161,9 +162,10 @@ impl Columns<'_> {
             PK_NO_COLUMNS,
             vec![Val::from(table_id), Val::from(column_no)],
         );
+        let (ctx, effects) = stmt.ctx_and_effects_mut();
         self.table
             .accessor()
-            .delete_unique_mvcc(stmt, &key, true)
+            .delete_unique_mvcc(ctx, effects, &key, true)
             .await
             .is_ok_and(|res| matches!(res, DeleteMvcc::Deleted))
     }

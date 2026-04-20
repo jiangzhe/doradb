@@ -22,6 +22,7 @@ use crate::latch::LatchFallbackMode;
 use crate::row::ops::{DeleteMvcc, InsertMvcc, SelectKey, SelectMvcc, UpdateCol, UpdateMvcc};
 use crate::row::{RowID, RowPage, RowRead};
 use crate::session::Session;
+use crate::stmt::Statement;
 use crate::table::{
     CheckpointOutcome, CheckpointReadiness, DeleteMarker, Table, TableAccess, TablePersistence,
     TableRecover,
@@ -62,6 +63,52 @@ pub(super) fn set_test_force_secondary_sidecar_error(enabled: bool) {
 
 pub(super) fn test_force_secondary_sidecar_error_enabled() -> bool {
     TEST_FORCE_SECONDARY_SIDECAR_ERROR.with(|flag| flag.get())
+}
+
+async fn stmt_insert_row(
+    stmt: &mut Statement,
+    table: &Table,
+    cols: Vec<Val>,
+) -> Result<InsertMvcc> {
+    let (ctx, effects) = stmt.ctx_and_effects_mut();
+    table.accessor().insert_mvcc(ctx, effects, cols).await
+}
+
+async fn stmt_delete_row(
+    stmt: &mut Statement,
+    table: &Table,
+    key: &SelectKey,
+) -> Result<DeleteMvcc> {
+    let (ctx, effects) = stmt.ctx_and_effects_mut();
+    table
+        .accessor()
+        .delete_unique_mvcc(ctx, effects, key, false)
+        .await
+}
+
+async fn stmt_update_row(
+    stmt: &mut Statement,
+    table: &Table,
+    key: &SelectKey,
+    update: Vec<UpdateCol>,
+) -> Result<UpdateMvcc> {
+    let (ctx, effects) = stmt.ctx_and_effects_mut();
+    table
+        .accessor()
+        .update_unique_mvcc(ctx, effects, key, update)
+        .await
+}
+
+async fn stmt_select_row_mvcc(
+    stmt: &Statement,
+    table: &Table,
+    key: &SelectKey,
+    user_read_set: &[usize],
+) -> Result<SelectMvcc> {
+    table
+        .accessor()
+        .index_lookup_unique_mvcc(stmt.ctx(), key, user_read_set)
+        .await
 }
 
 struct FailingPageReadHook {
@@ -164,7 +211,7 @@ fn test_mvcc_insert_dup_key() {
             let insert = vec![Val::from(1i32), Val::from("world")];
             let mut trx = session.try_begin_trx().unwrap().unwrap();
             let mut stmt = trx.start_stmt();
-            let res = stmt.insert_row(&sys.table, insert).await;
+            let res = stmt_insert_row(&mut stmt, &sys.table, insert).await;
             assert!(matches!(res, Ok(InsertMvcc::DuplicateKey)));
             trx = stmt.fail().await.unwrap();
             trx.rollback().await.unwrap();
@@ -175,7 +222,7 @@ fn test_mvcc_insert_dup_key() {
             let insert1 = vec![Val::from(2i32), Val::from("hello")];
             let mut trx1 = session.try_begin_trx().unwrap().unwrap();
             let mut stmt1 = trx1.start_stmt();
-            let res = stmt1.insert_row(&sys.table, insert1).await;
+            let res = stmt_insert_row(&mut stmt1, &sys.table, insert1).await;
             assert!(matches!(res, Ok(InsertMvcc::Inserted(_))));
             trx1 = stmt1.succeed();
 
@@ -184,7 +231,7 @@ fn test_mvcc_insert_dup_key() {
             let insert2 = vec![Val::from(2i32), Val::from("world")];
             let trx2 = session2.try_begin_trx().unwrap().unwrap();
             let mut stmt2 = trx2.start_stmt();
-            let res = stmt2.insert_row(&sys.table, insert2).await;
+            let res = stmt_insert_row(&mut stmt2, &sys.table, insert2).await;
             // still dup key because circuit breaker on index search.
             assert!(matches!(res, Ok(InsertMvcc::DuplicateKey)));
             stmt2.fail().await.unwrap().rollback().await.unwrap();
@@ -317,7 +364,7 @@ fn test_column_delete_basic() {
 
         let mut trx = session.try_begin_trx().unwrap().unwrap();
         let mut stmt = trx.start_stmt();
-        let res = stmt.delete_row(&sys.table, &key).await;
+        let res = stmt_delete_row(&mut stmt, &sys.table, &key).await;
         assert!(matches!(res, Ok(DeleteMvcc::Deleted)));
         trx = stmt.succeed();
         trx.commit().await.unwrap();
@@ -455,7 +502,7 @@ fn test_lwc_select_surfaces_persisted_corruption() {
 
         let mut trx = session.try_begin_trx().unwrap().unwrap();
         let stmt = trx.start_stmt();
-        let res = stmt.select_row_mvcc(&sys.table, &key, &[0, 1]).await;
+        let res = stmt_select_row_mvcc(&stmt, &sys.table, &key, &[0, 1]).await;
         match res {
             Err(Error::BlockCorrupted {
                 file_kind: FileKind::TableFile,
@@ -507,7 +554,7 @@ fn test_lwc_select_surfaces_column_block_index_row_metadata_corruption() {
 
         let mut trx = session.try_begin_trx().unwrap().unwrap();
         let stmt = trx.start_stmt();
-        let res = stmt.select_row_mvcc(&sys.table, &key, &[0, 1]).await;
+        let res = stmt_select_row_mvcc(&stmt, &sys.table, &key, &[0, 1]).await;
         match res {
             Err(Error::BlockCorrupted {
                 file_kind: FileKind::TableFile,
@@ -559,7 +606,7 @@ fn test_lwc_select_surfaces_column_block_index_zero_block_id_corruption() {
 
         let mut trx = session.try_begin_trx().unwrap().unwrap();
         let stmt = trx.start_stmt();
-        let res = stmt.select_row_mvcc(&sys.table, &key, &[0, 1]).await;
+        let res = stmt_select_row_mvcc(&stmt, &sys.table, &key, &[0, 1]).await;
         match res {
             Err(Error::BlockCorrupted {
                 file_kind: FileKind::TableFile,
@@ -611,7 +658,7 @@ fn test_lwc_select_surfaces_row_shape_fingerprint_mismatch_corruption() {
 
         let mut trx = session.try_begin_trx().unwrap().unwrap();
         let stmt = trx.start_stmt();
-        let res = stmt.select_row_mvcc(&sys.table, &key, &[0, 1]).await;
+        let res = stmt_select_row_mvcc(&stmt, &sys.table, &key, &[0, 1]).await;
         match res {
             Err(Error::BlockCorrupted {
                 file_kind: FileKind::TableFile,
@@ -647,13 +694,13 @@ fn test_column_delete_rollback() {
 
         let mut trx = session.try_begin_trx().unwrap().unwrap();
         let mut stmt = trx.start_stmt();
-        let res = stmt.delete_row(&sys.table, &key).await;
+        let res = stmt_delete_row(&mut stmt, &sys.table, &key).await;
         assert!(matches!(res, Ok(DeleteMvcc::Deleted)));
         assert_unique_index_entry(
             &sys.table,
             session.pool_guards(),
             &key,
-            stmt.trx.sts(),
+            stmt.ctx().sts(),
             old_row_id,
             true,
         )
@@ -694,7 +741,7 @@ fn test_column_delete_rollback_after_checkpoint() {
         let key = single_key(3i32);
         let mut trx_delete = session.try_begin_trx().unwrap().unwrap();
         let mut stmt = trx_delete.start_stmt();
-        let res = stmt.delete_row(&sys.table, &key).await;
+        let res = stmt_delete_row(&mut stmt, &sys.table, &key).await;
         assert!(matches!(res, Ok(DeleteMvcc::Deleted)));
         trx_delete = stmt.succeed();
 
@@ -708,7 +755,7 @@ fn test_column_delete_rollback_after_checkpoint() {
         trx.commit().await.unwrap();
 
         let stmt = trx_delete.start_stmt();
-        let res = stmt.select_row_mvcc(&sys.table, &key, &[0, 1]).await;
+        let res = stmt_select_row_mvcc(&stmt, &sys.table, &key, &[0, 1]).await;
         assert!(matches!(res, Ok(SelectMvcc::NotFound)));
         trx_delete = stmt.succeed();
         trx_delete.rollback().await.unwrap();
@@ -744,14 +791,14 @@ fn test_column_delete_write_conflict() {
 
         let mut trx1 = session.try_begin_trx().unwrap().unwrap();
         let mut stmt1 = trx1.start_stmt();
-        let res1 = stmt1.delete_row(&sys.table, &key).await;
+        let res1 = stmt_delete_row(&mut stmt1, &sys.table, &key).await;
         assert!(matches!(res1, Ok(DeleteMvcc::Deleted)));
         trx1 = stmt1.succeed();
 
         let mut session2 = sys.try_new_session().unwrap();
         let mut trx2 = session2.try_begin_trx().unwrap().unwrap();
         let mut stmt2 = trx2.start_stmt();
-        let res2 = stmt2.delete_row(&sys.table, &key).await;
+        let res2 = stmt_delete_row(&mut stmt2, &sys.table, &key).await;
         assert!(matches!(res2, Ok(DeleteMvcc::WriteConflict)));
         trx2 = stmt2.fail().await.unwrap();
         trx2.rollback().await.unwrap();
@@ -784,7 +831,7 @@ fn test_column_delete_mvcc_visibility() {
         let mut delete_session = sys.try_new_session().unwrap();
         let mut trx_delete = delete_session.try_begin_trx().unwrap().unwrap();
         let mut stmt_delete = trx_delete.start_stmt();
-        let res = stmt_delete.delete_row(&sys.table, &key).await;
+        let res = stmt_delete_row(&mut stmt_delete, &sys.table, &key).await;
         assert!(matches!(res, Ok(DeleteMvcc::Deleted)));
         trx_delete = stmt_delete.succeed();
         trx_delete.commit().await.unwrap();
@@ -834,7 +881,7 @@ fn test_lwc_delete_unique_conflicts_when_delete_committed_after_snapshot() {
             .await;
 
         let mut stmt = writer.start_stmt();
-        let res = stmt.delete_row(&sys.table, &key).await;
+        let res = stmt_delete_row(&mut stmt, &sys.table, &key).await;
         assert!(matches!(res, Ok(DeleteMvcc::WriteConflict)));
         let writer = stmt.fail().await.unwrap();
         writer.rollback().await.unwrap();
@@ -869,16 +916,16 @@ fn test_lwc_update_unique_same_key_reinserts_hot_and_preserves_old_snapshot() {
 
         let mut writer = session.try_begin_trx().unwrap().unwrap();
         let mut stmt = writer.start_stmt();
-        let res = stmt
-            .update_row(
-                &sys.table,
-                &key,
-                vec![UpdateCol {
-                    idx: 1,
-                    val: Val::from("updated"),
-                }],
-            )
-            .await;
+        let res = stmt_update_row(
+            &mut stmt,
+            &sys.table,
+            &key,
+            vec![UpdateCol {
+                idx: 1,
+                val: Val::from("updated"),
+            }],
+        )
+        .await;
         let new_row_id = match res {
             Ok(UpdateMvcc::Updated(row_id)) => row_id,
             other => panic!("expected update success, got {other:?}"),
@@ -888,7 +935,7 @@ fn test_lwc_update_unique_same_key_reinserts_hot_and_preserves_old_snapshot() {
             &sys.table,
             session.pool_guards(),
             &key,
-            stmt.trx.sts(),
+            stmt.ctx().sts(),
             new_row_id,
             false,
         )
@@ -899,12 +946,12 @@ fn test_lwc_update_unique_same_key_reinserts_hot_and_preserves_old_snapshot() {
         ));
         match sys.table.deletion_buffer().get(old_row_id).unwrap() {
             DeleteMarker::Ref(status) => {
-                assert!(Arc::ptr_eq(&status, &stmt.trx.status()));
+                assert!(Arc::ptr_eq(&status, &stmt.ctx().status()));
             }
             DeleteMarker::Committed(_) => panic!("update should hold an in-flight delete marker"),
         }
 
-        let res = stmt.select_row_mvcc(&sys.table, &key, &[0, 1]).await;
+        let res = stmt_select_row_mvcc(&stmt, &sys.table, &key, &[0, 1]).await;
         assert!(matches!(
             res,
             Ok(SelectMvcc::Found(vals))
@@ -963,16 +1010,16 @@ fn test_lwc_update_unique_conflicts_when_delete_committed_after_snapshot() {
             .await;
 
         let mut stmt = writer.start_stmt();
-        let res = stmt
-            .update_row(
-                &sys.table,
-                &key,
-                vec![UpdateCol {
-                    idx: 1,
-                    val: Val::from("updated"),
-                }],
-            )
-            .await;
+        let res = stmt_update_row(
+            &mut stmt,
+            &sys.table,
+            &key,
+            vec![UpdateCol {
+                idx: 1,
+                val: Val::from("updated"),
+            }],
+        )
+        .await;
         assert!(matches!(res, Ok(UpdateMvcc::WriteConflict)));
         let writer = stmt.fail().await.unwrap();
         writer.rollback().await.unwrap();
@@ -1008,22 +1055,22 @@ fn test_lwc_update_unique_key_change_preserves_old_and_new_key_visibility() {
 
         let mut writer = session.try_begin_trx().unwrap().unwrap();
         let mut stmt = writer.start_stmt();
-        let res = stmt
-            .update_row(
-                &sys.table,
-                &old_key,
-                vec![
-                    UpdateCol {
-                        idx: 0,
-                        val: Val::from(20i32),
-                    },
-                    UpdateCol {
-                        idx: 1,
-                        val: Val::from("moved"),
-                    },
-                ],
-            )
-            .await;
+        let res = stmt_update_row(
+            &mut stmt,
+            &sys.table,
+            &old_key,
+            vec![
+                UpdateCol {
+                    idx: 0,
+                    val: Val::from(20i32),
+                },
+                UpdateCol {
+                    idx: 1,
+                    val: Val::from("moved"),
+                },
+            ],
+        )
+        .await;
         let new_row_id = match res {
             Ok(UpdateMvcc::Updated(row_id)) => row_id,
             other => panic!("expected update success, got {other:?}"),
@@ -1032,7 +1079,7 @@ fn test_lwc_update_unique_key_change_preserves_old_and_new_key_visibility() {
             &sys.table,
             session.pool_guards(),
             &old_key,
-            stmt.trx.sts(),
+            stmt.ctx().sts(),
             old_row_id,
             true,
         )
@@ -1041,7 +1088,7 @@ fn test_lwc_update_unique_key_change_preserves_old_and_new_key_visibility() {
             &sys.table,
             session.pool_guards(),
             &new_key,
-            stmt.trx.sts(),
+            stmt.ctx().sts(),
             new_row_id,
             false,
         )
@@ -1087,16 +1134,16 @@ fn test_lwc_update_unique_duplicate_rolls_back_cold_marker_and_hot_insert() {
 
         let trx = session.try_begin_trx().unwrap().unwrap();
         let mut stmt = trx.start_stmt();
-        let res = stmt
-            .update_row(
-                &sys.table,
-                &key,
-                vec![UpdateCol {
-                    idx: 0,
-                    val: Val::from(2i32),
-                }],
-            )
-            .await;
+        let res = stmt_update_row(
+            &mut stmt,
+            &sys.table,
+            &key,
+            vec![UpdateCol {
+                idx: 0,
+                val: Val::from(2i32),
+            }],
+        )
+        .await;
         assert!(matches!(res, Ok(UpdateMvcc::DuplicateKey)));
         let trx = stmt.fail().await.unwrap();
         trx.rollback().await.unwrap();
@@ -1221,22 +1268,22 @@ fn test_lwc_update_unique_rejects_cold_owner_deleted_after_snapshot() {
             .await;
 
         let mut stmt = writer.start_stmt();
-        let res = stmt
-            .update_row(
-                &sys.table,
-                &old_key,
-                vec![
-                    UpdateCol {
-                        idx: 0,
-                        val: Val::from(2i32),
-                    },
-                    UpdateCol {
-                        idx: 1,
-                        val: Val::from("claimed"),
-                    },
-                ],
-            )
-            .await;
+        let res = stmt_update_row(
+            &mut stmt,
+            &sys.table,
+            &old_key,
+            vec![
+                UpdateCol {
+                    idx: 0,
+                    val: Val::from(2i32),
+                },
+                UpdateCol {
+                    idx: 1,
+                    val: Val::from("claimed"),
+                },
+            ],
+        )
+        .await;
         assert!(matches!(res, Ok(UpdateMvcc::DuplicateKey)));
         let writer = stmt.fail().await.unwrap();
         writer.rollback().await.unwrap();
@@ -1297,22 +1344,22 @@ fn test_lwc_update_unique_claim_rollback_restores_deleted_cold_owner() {
 
         let writer = session.try_begin_trx().unwrap().unwrap();
         let mut stmt = writer.start_stmt();
-        let res = stmt
-            .update_row(
-                &sys.table,
-                &old_key,
-                vec![
-                    UpdateCol {
-                        idx: 0,
-                        val: Val::from(2i32),
-                    },
-                    UpdateCol {
-                        idx: 1,
-                        val: Val::from("claimed"),
-                    },
-                ],
-            )
-            .await;
+        let res = stmt_update_row(
+            &mut stmt,
+            &sys.table,
+            &old_key,
+            vec![
+                UpdateCol {
+                    idx: 0,
+                    val: Val::from(2i32),
+                },
+                UpdateCol {
+                    idx: 1,
+                    val: Val::from("claimed"),
+                },
+            ],
+        )
+        .await;
         let new_row_id = match res {
             Ok(UpdateMvcc::Updated(row_id)) => row_id,
             other => panic!("expected update success, got {other:?}"),
@@ -1322,7 +1369,7 @@ fn test_lwc_update_unique_claim_rollback_restores_deleted_cold_owner() {
             &sys.table,
             session.pool_guards(),
             &claimed_key,
-            stmt.trx.sts(),
+            stmt.ctx().sts(),
             new_row_id,
             false,
         )
@@ -1417,22 +1464,22 @@ fn test_lwc_update_unique_claim_rollback_drops_purgeable_deleted_cold_owner() {
                 .delete_marker_is_globally_purgeable(claimed_row_id, writer.sts())
         );
         let mut stmt = writer.start_stmt();
-        let res = stmt
-            .update_row(
-                &sys.table,
-                &old_key,
-                vec![
-                    UpdateCol {
-                        idx: 0,
-                        val: Val::from(2i32),
-                    },
-                    UpdateCol {
-                        idx: 1,
-                        val: Val::from("claimed"),
-                    },
-                ],
-            )
-            .await;
+        let res = stmt_update_row(
+            &mut stmt,
+            &sys.table,
+            &old_key,
+            vec![
+                UpdateCol {
+                    idx: 0,
+                    val: Val::from(2i32),
+                },
+                UpdateCol {
+                    idx: 1,
+                    val: Val::from("claimed"),
+                },
+            ],
+        )
+        .await;
         let new_row_id = match res {
             Ok(UpdateMvcc::Updated(row_id)) => row_id,
             other => panic!("expected update success, got {other:?}"),
@@ -1441,7 +1488,7 @@ fn test_lwc_update_unique_claim_rollback_drops_purgeable_deleted_cold_owner() {
             &sys.table,
             session.pool_guards(),
             &claimed_key,
-            stmt.trx.sts(),
+            stmt.ctx().sts(),
             new_row_id,
             false,
         )
@@ -3388,15 +3435,19 @@ fn test_unique_insert_rollback_restores_deleted_owner_even_when_row_missing() {
         let trx = session.try_begin_trx().unwrap().unwrap();
         let mut stmt = trx.start_stmt();
         let new_row_id = unwrap_insert_result(
-            stmt.insert_row(&sys.table, vec![Val::from(10_001i32), Val::from("reborn")])
-                .await,
+            stmt_insert_row(
+                &mut stmt,
+                &sys.table,
+                vec![Val::from(10_001i32), Val::from("reborn")],
+            )
+            .await,
         );
         assert_ne!(new_row_id, stale_row_id);
         assert_unique_index_entry(
             &sys.table,
             session.pool_guards(),
             &key,
-            stmt.trx.sts(),
+            stmt.ctx().sts(),
             new_row_id,
             false,
         )
@@ -3488,15 +3539,19 @@ fn test_unique_insert_rollback_restores_delete_marked_stale_hot_owner() {
         let trx = session.try_begin_trx().unwrap().unwrap();
         let mut stmt = trx.start_stmt();
         let new_row_id = unwrap_insert_result(
-            stmt.insert_row(&sys.table, vec![Val::from(2i32), Val::from("two")])
-                .await,
+            stmt_insert_row(
+                &mut stmt,
+                &sys.table,
+                vec![Val::from(2i32), Val::from("two")],
+            )
+            .await,
         );
         assert_ne!(new_row_id, old_row_id);
         assert_unique_index_entry(
             &sys.table,
             session.pool_guards(),
             &stale_key,
-            stmt.trx.sts(),
+            stmt.ctx().sts(),
             new_row_id,
             false,
         )
@@ -3939,7 +3994,7 @@ fn test_row_page_transition_retries_update_delete() {
             .lookup(
                 session.pool_guards().index_guard(),
                 &key.vals,
-                stmt.trx.sts(),
+                stmt.ctx().sts(),
             )
             .await
             .unwrap()
@@ -3981,28 +4036,32 @@ fn test_row_page_transition_retries_update_delete() {
             .await
             .unwrap();
         let insert = vec![Val::from(2i32), Val::from("insert")];
-        let insert_res = sys.table.accessor().insert_row_to_page(
-            &mut stmt,
-            insert_page_guard,
-            insert,
-            RowUndoKind::Insert,
-            vec![],
-        );
-        assert!(matches!(
-            insert_res,
-            InsertRowIntoPage::NoSpaceOrFrozen(_, _, _)
-        ));
+        {
+            let (ctx, effects) = stmt.ctx_and_effects_mut();
+            let insert_res = sys.table.accessor().insert_row_to_page(
+                ctx,
+                effects,
+                insert_page_guard,
+                insert,
+                RowUndoKind::Insert,
+                vec![],
+            );
+            assert!(matches!(
+                insert_res,
+                InsertRowIntoPage::NoSpaceOrFrozen(_, _, _)
+            ));
 
-        let update = vec![UpdateCol {
-            idx: 1,
-            val: Val::from("world"),
-        }];
-        let res = sys
-            .table
-            .accessor()
-            .update_row_inplace(&mut stmt, page_guard, &key, row_id, update)
-            .await;
-        assert!(matches!(res, UpdateRowInplace::RetryInTransition));
+            let update = vec![UpdateCol {
+                idx: 1,
+                val: Val::from("world"),
+            }];
+            let res = sys
+                .table
+                .accessor()
+                .update_row_inplace(ctx, effects, page_guard, &key, row_id, update)
+                .await;
+            assert!(matches!(res, UpdateRowInplace::RetryInTransition));
+        }
         trx = stmt.fail().await.unwrap();
         trx.rollback().await.unwrap();
 
@@ -4021,12 +4080,15 @@ fn test_row_page_transition_retries_update_delete() {
             .lock_shared_async()
             .await
             .unwrap();
-        let res = sys
-            .table
-            .accessor()
-            .delete_row_internal(&mut stmt, page_guard, row_id, &key, false)
-            .await;
-        assert!(matches!(res, DeleteInternal::RetryInTransition));
+        {
+            let (ctx, effects) = stmt.ctx_and_effects_mut();
+            let res = sys
+                .table
+                .accessor()
+                .delete_row_internal(ctx, effects, page_guard, row_id, &key, false)
+                .await;
+            assert!(matches!(res, DeleteInternal::RetryInTransition));
+        }
         trx = stmt.fail().await.unwrap();
         trx.rollback().await.unwrap();
 
@@ -4387,7 +4449,7 @@ fn test_string_index_updates() {
             {
                 let insert = vec![Val::from(&s[..0])];
                 let mut stmt = session.try_begin_trx().unwrap().unwrap().start_stmt();
-                let res = stmt.insert_row(&table, insert).await;
+                let res = stmt_insert_row(&mut stmt, &table, insert).await;
                 assert!(matches!(res, Ok(InsertMvcc::Inserted(_))));
                 stmt.succeed().commit().await.unwrap();
             }
@@ -4399,7 +4461,7 @@ fn test_string_index_updates() {
                     val: Val::from(&s[..i + 1]),
                 }];
                 let mut stmt = session.try_begin_trx().unwrap().unwrap().start_stmt();
-                let res = stmt.update_row(&table, &key, update).await;
+                let res = stmt_update_row(&mut stmt, &table, &key, update).await;
                 assert!(matches!(res, Ok(UpdateMvcc::Updated(_))));
                 stmt.succeed().commit().await.unwrap();
             }
@@ -4426,7 +4488,7 @@ fn test_mvcc_out_of_place_update() {
             for i in 0usize..COUNT {
                 let insert = vec![Val::from(&s[..BASE + i])];
                 let mut stmt = session.try_begin_trx().unwrap().unwrap().start_stmt();
-                let res = stmt.insert_row(&table, insert).await;
+                let res = stmt_insert_row(&mut stmt, &table, insert).await;
                 assert!(matches!(res, Ok(InsertMvcc::Inserted(_))));
                 stmt.succeed().commit().await.unwrap();
             }
@@ -4439,7 +4501,7 @@ fn test_mvcc_out_of_place_update() {
                     val: Val::from(&s[..BASE + COUNT + i]),
                 }];
                 let mut stmt = session.try_begin_trx().unwrap().unwrap().start_stmt();
-                let res = stmt.update_row(&table, &key, update).await;
+                let res = stmt_update_row(&mut stmt, &table, &key, update).await;
                 assert!(matches!(res, Ok(UpdateMvcc::Updated(_))));
                 stmt.succeed().commit().await.unwrap();
             }
@@ -4534,7 +4596,7 @@ fn test_table_scan_mvcc() {
             let mut res_len = 0usize;
             sys.table
                 .accessor()
-                .table_scan_mvcc(&stmt, &[0], |_| {
+                .table_scan_mvcc(stmt.ctx(), &[0], |_| {
                     res_len += 1;
                     true
                 })
@@ -4560,7 +4622,7 @@ fn test_table_scan_mvcc() {
             let mut res_len = 0usize;
             sys.table
                 .accessor()
-                .table_scan_mvcc(&stmt, &[0], |_| {
+                .table_scan_mvcc(stmt.ctx(), &[0], |_| {
                     res_len += 1;
                     true
                 })
@@ -4578,7 +4640,7 @@ fn test_table_scan_mvcc() {
             let mut res_len = 0usize;
             sys.table
                 .accessor()
-                .table_scan_mvcc(&stmt, &[0], |_| {
+                .table_scan_mvcc(stmt.ctx(), &[0], |_| {
                     res_len += 1;
                     true
                 })
@@ -4622,16 +4684,16 @@ fn test_table_freeze() {
         {
             let mut stmt = session1.try_begin_trx().unwrap().unwrap().start_stmt();
             let key = SelectKey::new(0, vec![Val::from(1)]);
-            let res = stmt
-                .update_row(
-                    &sys.table,
-                    &key,
-                    vec![UpdateCol {
-                        idx: 1,
-                        val: Val::from("3"),
-                    }],
-                )
-                .await;
+            let res = stmt_update_row(
+                &mut stmt,
+                &sys.table,
+                &key,
+                vec![UpdateCol {
+                    idx: 1,
+                    val: Val::from("3"),
+                }],
+            )
+            .await;
             assert!(matches!(res, Ok(UpdateMvcc::Updated(_))));
             stmt.succeed().commit().await.unwrap();
         }
@@ -4642,16 +4704,16 @@ fn test_table_freeze() {
         {
             let mut stmt = session1.try_begin_trx().unwrap().unwrap().start_stmt();
             let key = SelectKey::new(0, vec![Val::from(1)]);
-            let res = stmt
-                .update_row(
-                    &sys.table,
-                    &key,
-                    vec![UpdateCol {
-                        idx: 1,
-                        val: Val::from("4"),
-                    }],
-                )
-                .await;
+            let res = stmt_update_row(
+                &mut stmt,
+                &sys.table,
+                &key,
+                vec![UpdateCol {
+                    idx: 1,
+                    val: Val::from("4"),
+                }],
+            )
+            .await;
             assert!(matches!(res, Ok(UpdateMvcc::Updated(_))));
             stmt.succeed().commit().await.unwrap();
         }
@@ -4678,7 +4740,7 @@ fn test_transition_captures_uncommitted_lock_into_deletion_buffer() {
             .lookup(
                 session.pool_guards().index_guard(),
                 &key.vals,
-                stmt.trx.sts(),
+                stmt.ctx().sts(),
             )
             .await
             .unwrap()
@@ -4702,11 +4764,12 @@ fn test_transition_captures_uncommitted_lock_into_deletion_buffer() {
             .lock_shared_async()
             .await
             .unwrap();
-        let (ctx, page) = page_guard.ctx_and_page();
+        let (page_ctx, page) = page_guard.ctx_and_page();
+        let (ctx, effects) = stmt.ctx_and_effects_mut();
         let mut lock_row = sys
             .table
             .accessor()
-            .lock_row_for_write(&mut stmt, &page_guard, row_id, Some(&key))
+            .lock_row_for_write(ctx, effects, &page_guard, row_id, Some(&key))
             .await;
         match &mut lock_row {
             LockRowForWrite::Ok(access) => {
@@ -4720,16 +4783,16 @@ fn test_transition_captures_uncommitted_lock_into_deletion_buffer() {
             start_row_id: page.header.start_row_id,
             end_row_id: page.header.start_row_id + page.header.max_row_count as u64,
         };
-        ctx.row_ver().unwrap().set_frozen();
+        page_ctx.row_ver().unwrap().set_frozen();
         sys.table
-            .set_frozen_pages_to_transition(session.pool_guards(), &[frozen_page], stmt.trx.sts())
+            .set_frozen_pages_to_transition(session.pool_guards(), &[frozen_page], stmt.ctx().sts())
             .await
             .unwrap();
 
         let marker = sys.table.deletion_buffer().get(row_id).unwrap();
         match marker {
             DeleteMarker::Ref(status) => {
-                assert!(std::sync::Arc::ptr_eq(&status, &stmt.trx.status()));
+                assert!(std::sync::Arc::ptr_eq(&status, &stmt.ctx().status()));
             }
             DeleteMarker::Committed(_) => panic!("uncommitted lock should remain as marker ref"),
         }
@@ -4957,7 +5020,7 @@ fn test_checkpoint_snapshot_consistency() {
         {
             let key = SelectKey::new(0, vec![Val::from(1)]);
             let stmt = read_trx.start_stmt();
-            let res = stmt.select_row_mvcc(&sys.table, &key, &[0, 1]).await;
+            let res = stmt_select_row_mvcc(&stmt, &sys.table, &key, &[0, 1]).await;
             assert!(matches!(res, Ok(SelectMvcc::Found(_))));
             read_trx = stmt.succeed();
         }
@@ -4967,7 +5030,7 @@ fn test_checkpoint_snapshot_consistency() {
         {
             let mut stmt = write_trx.start_stmt();
             let insert = vec![Val::from(10_000i32), Val::from("new")];
-            let res = stmt.insert_row(&sys.table, insert).await;
+            let res = stmt_insert_row(&mut stmt, &sys.table, insert).await;
             assert!(matches!(res, Ok(InsertMvcc::Inserted(_))));
             write_trx = stmt.succeed();
         }
@@ -4978,7 +5041,7 @@ fn test_checkpoint_snapshot_consistency() {
         {
             let key = SelectKey::new(0, vec![Val::from(10_000i32)]);
             let stmt = read_trx.start_stmt();
-            let res = stmt.select_row_mvcc(&sys.table, &key, &[0, 1]).await;
+            let res = stmt_select_row_mvcc(&stmt, &sys.table, &key, &[0, 1]).await;
             assert!(matches!(res, Ok(SelectMvcc::NotFound)));
             read_trx = stmt.succeed();
         }
@@ -5147,8 +5210,12 @@ fn test_session_cached_insert_page_reuses_live_versioned_page() {
         let mut trx = session.try_begin_trx().unwrap().unwrap();
         let mut stmt = trx.start_stmt();
         let row_id = unwrap_insert_result(
-            stmt.insert_row(&sys.table, vec![Val::from(1), Val::from("cached-row")])
-                .await,
+            stmt_insert_row(
+                &mut stmt,
+                &sys.table,
+                vec![Val::from(1), Val::from("cached-row")],
+            )
+            .await,
         );
         trx = stmt.succeed();
         trx.commit().await.unwrap();
@@ -5169,8 +5236,12 @@ fn test_session_cached_insert_page_reuses_live_versioned_page() {
         let mut trx = session.try_begin_trx().unwrap().unwrap();
         let mut stmt = trx.start_stmt();
         let next_row_id = unwrap_insert_result(
-            stmt.insert_row(&sys.table, vec![Val::from(2), Val::from("still-cached")])
-                .await,
+            stmt_insert_row(
+                &mut stmt,
+                &sys.table,
+                vec![Val::from(2), Val::from("still-cached")],
+            )
+            .await,
         );
         trx = stmt.succeed();
         trx.commit().await.unwrap();
@@ -5203,8 +5274,12 @@ fn test_stale_session_cached_insert_page_falls_back_after_checkpoint_gc() {
         let mut trx = session.try_begin_trx().unwrap().unwrap();
         let mut stmt = trx.start_stmt();
         let row_id = unwrap_insert_result(
-            stmt.insert_row(&sys.table, vec![Val::from(1), Val::from("cached-row")])
-                .await,
+            stmt_insert_row(
+                &mut stmt,
+                &sys.table,
+                vec![Val::from(1), Val::from("cached-row")],
+            )
+            .await,
         );
         trx = stmt.succeed();
         trx.commit().await.unwrap();
@@ -5241,8 +5316,12 @@ fn test_stale_session_cached_insert_page_falls_back_after_checkpoint_gc() {
         let mut trx = session.try_begin_trx().unwrap().unwrap();
         let mut stmt = trx.start_stmt();
         let post_gc_row_id = unwrap_insert_result(
-            stmt.insert_row(&sys.table, vec![Val::from(2), Val::from("post-gc-row")])
-                .await,
+            stmt_insert_row(
+                &mut stmt,
+                &sys.table,
+                vec![Val::from(2), Val::from("post-gc-row")],
+            )
+            .await,
         );
         trx = stmt.succeed();
         trx.commit().await.unwrap();
@@ -5274,8 +5353,12 @@ fn test_validated_row_page_shared_result_rejects_stale_reused_page_range() {
         let mut trx = session.try_begin_trx().unwrap().unwrap();
         let mut stmt = trx.start_stmt();
         let stale_row_id = unwrap_insert_result(
-            stmt.insert_row(&sys.table, vec![Val::from(1), Val::from("cached-row")])
-                .await,
+            stmt_insert_row(
+                &mut stmt,
+                &sys.table,
+                vec![Val::from(1), Val::from("cached-row")],
+            )
+            .await,
         );
         trx = stmt.succeed();
         trx.commit().await.unwrap();
@@ -5314,8 +5397,12 @@ fn test_validated_row_page_shared_result_rejects_stale_reused_page_range() {
             let mut trx = session.try_begin_trx().unwrap().unwrap();
             let mut stmt = trx.start_stmt();
             let row_id = unwrap_insert_result(
-                stmt.insert_row(&sys.table, vec![Val::from(key), Val::from(&large[..])])
-                    .await,
+                stmt_insert_row(
+                    &mut stmt,
+                    &sys.table,
+                    vec![Val::from(key), Val::from(&large[..])],
+                )
+                .await,
             );
             trx = stmt.succeed();
             trx.commit().await.unwrap();
@@ -5380,8 +5467,12 @@ fn test_mvcc_insert_surfaces_cached_insert_page_reload_error() {
         let mut trx = session.try_begin_trx().unwrap().unwrap();
         let mut stmt = trx.start_stmt();
         let row_id = unwrap_insert_result(
-            stmt.insert_row(&sys.table, vec![Val::from(1), Val::from(&large[..])])
-                .await,
+            stmt_insert_row(
+                &mut stmt,
+                &sys.table,
+                vec![Val::from(1), Val::from(&large[..])],
+            )
+            .await,
         );
         trx = stmt.succeed();
         trx.commit().await.unwrap();
@@ -5424,9 +5515,12 @@ fn test_mvcc_insert_surfaces_cached_insert_page_reload_error() {
 
         let trx = session.try_begin_trx().unwrap().unwrap();
         let mut stmt = trx.start_stmt();
-        let res = stmt
-            .insert_row(&sys.table, vec![Val::from(100), Val::from("reload-fails")])
-            .await;
+        let res = stmt_insert_row(
+            &mut stmt,
+            &sys.table,
+            vec![Val::from(100), Val::from("reload-fails")],
+        )
+        .await;
         let trx = stmt.fail().await.unwrap();
         trx.rollback().await.unwrap();
         assert!(
@@ -5453,9 +5547,12 @@ fn test_mvcc_rollback_poisons_runtime_on_row_page_reload_error() {
         let large = "r".repeat(48 * 1024);
         let mut trx = session.try_begin_trx().unwrap().unwrap();
         let mut stmt = trx.start_stmt();
-        let row_id = match stmt
-            .insert_row(&sys.table, vec![Val::from(1), Val::from(&large[..])])
-            .await
+        let row_id = match stmt_insert_row(
+            &mut stmt,
+            &sys.table,
+            vec![Val::from(1), Val::from(&large[..])],
+        )
+        .await
         {
             Ok(InsertMvcc::Inserted(row_id)) => row_id,
             res => panic!("res={res:?}"),
@@ -5657,9 +5754,12 @@ fn test_user_secondary_indexes_evict_and_continue_serving_lookups() {
                 let seed = format!("{:08x}", row_id);
                 let key = seed.repeat(64);
                 let mut stmt = trx.start_stmt();
-                let res = stmt
-                    .insert_row(&table, vec![Val::from(row_id), Val::from(&key[..])])
-                    .await;
+                let res = stmt_insert_row(
+                    &mut stmt,
+                    &table,
+                    vec![Val::from(row_id), Val::from(&key[..])],
+                )
+                .await;
                 assert!(matches!(res, Ok(InsertMvcc::Inserted(_))), "res={res:?}");
                 trx = stmt.succeed();
                 inserted.push((row_id, key));
@@ -5689,7 +5789,7 @@ fn test_user_secondary_indexes_evict_and_continue_serving_lookups() {
             let key = SelectKey::new(0, vec![Val::from(inserted[key_idx].0)]);
             let trx = session.try_begin_trx().unwrap().unwrap();
             let stmt = trx.start_stmt();
-            let res = stmt.select_row_mvcc(&table, &key, &[0, 1]).await;
+            let res = stmt_select_row_mvcc(&stmt, &table, &key, &[0, 1]).await;
             match res {
                 Ok(SelectMvcc::Found(vals)) => {
                     assert_eq!(
@@ -5883,7 +5983,7 @@ impl TestSys {
     #[inline]
     async fn trx_insert(&self, trx: ActiveTrx, insert: Vec<Val>) -> ActiveTrx {
         let mut stmt = trx.start_stmt();
-        let res = stmt.insert_row(&self.table, insert).await;
+        let res = stmt_insert_row(&mut stmt, &self.table, insert).await;
         if !matches!(res, Ok(InsertMvcc::Inserted(_))) {
             panic!("res={:?}", res);
         }
@@ -5901,7 +6001,7 @@ impl TestSys {
     #[inline]
     async fn trx_delete(&self, trx: ActiveTrx, key: &SelectKey) -> ActiveTrx {
         let mut stmt = trx.start_stmt();
-        let res = stmt.delete_row(&self.table, key).await;
+        let res = stmt_delete_row(&mut stmt, &self.table, key).await;
         if !matches!(res, Ok(DeleteMvcc::Deleted)) {
             panic!("res={:?}", res);
         }
@@ -5924,7 +6024,7 @@ impl TestSys {
         update: Vec<UpdateCol>,
     ) -> ActiveTrx {
         let mut stmt = trx.start_stmt();
-        let res = stmt.update_row(&self.table, key, update).await;
+        let res = stmt_update_row(&mut stmt, &self.table, key, update).await;
         if !matches!(res, Ok(UpdateMvcc::Updated(_))) {
             panic!("res={:?}", res);
         }
@@ -5954,7 +6054,7 @@ impl TestSys {
     #[inline]
     async fn trx_select_not_found(&self, trx: ActiveTrx, key: &SelectKey) -> ActiveTrx {
         let stmt = trx.start_stmt();
-        let res = stmt.select_row_mvcc(&self.table, key, &[0, 1]).await;
+        let res = stmt_select_row_mvcc(&stmt, &self.table, key, &[0, 1]).await;
         assert!(matches!(res, Ok(SelectMvcc::NotFound)));
         stmt.succeed()
     }
@@ -5967,7 +6067,7 @@ impl TestSys {
         action: F,
     ) -> ActiveTrx {
         let stmt = trx.start_stmt();
-        let res = stmt.select_row_mvcc(&self.table, key, &[0, 1]).await;
+        let res = stmt_select_row_mvcc(&stmt, &self.table, key, &[0, 1]).await;
         if !matches!(res, Ok(SelectMvcc::Found(_))) {
             panic!("res={:?}", res);
         }
@@ -5985,7 +6085,7 @@ impl TestSys {
 async fn insert_one_row(table: &Table, session: &mut Session, values: Vec<Val>) -> RowID {
     let mut trx = session.try_begin_trx().unwrap().unwrap();
     let mut stmt = trx.start_stmt();
-    let insert = stmt.insert_row(table, values).await;
+    let insert = stmt_insert_row(&mut stmt, table, values).await;
     let Ok(InsertMvcc::Inserted(row_id)) = insert else {
         panic!("insert should succeed: {insert:?}");
     };
@@ -6279,7 +6379,7 @@ async fn insert_rows_direct(
     for i in 0..count {
         let insert = vec![Val::from(start + i), Val::from(name)];
         let mut stmt = trx.start_stmt();
-        let res = stmt.insert_row(table, insert).await;
+        let res = stmt_insert_row(&mut stmt, table, insert).await;
         assert!(matches!(res, Ok(InsertMvcc::Inserted(_))));
         trx = stmt.succeed();
     }
@@ -6323,9 +6423,10 @@ fn test_secondary_index_common() {
             let trx = session.try_begin_trx().unwrap().unwrap();
             let mut stmt = trx.start_stmt();
             for i in 0i32..5i32 {
+                let (ctx, effects) = stmt.ctx_and_effects_mut();
                 let res = table
                     .accessor()
-                    .insert_mvcc(&mut stmt, vec![Val::from(i), Val::from(i)])
+                    .insert_mvcc(ctx, effects, vec![Val::from(i), Val::from(i)])
                     .await;
                 assert!(matches!(res, Ok(InsertMvcc::Inserted(_))));
             }
@@ -6336,7 +6437,7 @@ fn test_secondary_index_common() {
             let key = SelectKey::new(0, vec![Val::from(1i32)]);
             let res = table
                 .accessor()
-                .index_lookup_unique_mvcc(&stmt, &key, user_read_set)
+                .index_lookup_unique_mvcc(stmt.ctx(), &key, user_read_set)
                 .await;
             stmt.succeed().commit().await.unwrap();
             assert!(matches!(res, Ok(SelectMvcc::Found(_))));
@@ -6346,7 +6447,7 @@ fn test_secondary_index_common() {
             let key = SelectKey::new(1, vec![Val::from(1i32)]);
             let res = table
                 .accessor()
-                .index_scan_mvcc(&stmt, &key, user_read_set)
+                .index_scan_mvcc(stmt.ctx(), &key, user_read_set)
                 .await;
             stmt.succeed().commit().await.unwrap();
             assert!(res.unwrap().unwrap_rows().len() == 1);
@@ -6358,9 +6459,10 @@ fn test_secondary_index_common() {
                 idx: 1,
                 val: Val::from(0i32),
             }];
+            let (ctx, effects) = stmt.ctx_and_effects_mut();
             let res = table
                 .accessor()
-                .update_unique_mvcc(&mut stmt, &key, update)
+                .update_unique_mvcc(ctx, effects, &key, update)
                 .await;
             stmt.succeed().commit().await.unwrap();
             assert!(matches!(res, Ok(UpdateMvcc::Updated(_))));
@@ -6370,7 +6472,7 @@ fn test_secondary_index_common() {
             let key = SelectKey::new(1, vec![Val::from(0i32)]);
             let res = table
                 .accessor()
-                .index_scan_mvcc(&stmt, &key, user_read_set)
+                .index_scan_mvcc(stmt.ctx(), &key, user_read_set)
                 .await;
             stmt.succeed().commit().await.unwrap();
             assert!(res.unwrap().unwrap_rows().len() == 2);
@@ -6378,9 +6480,10 @@ fn test_secondary_index_common() {
             let trx = session.try_begin_trx().unwrap().unwrap();
             let mut stmt = trx.start_stmt();
             let key = SelectKey::new(0, vec![Val::from(0i32)]);
+            let (ctx, effects) = stmt.ctx_and_effects_mut();
             let res = table
                 .accessor()
-                .delete_unique_mvcc(&mut stmt, &key, false)
+                .delete_unique_mvcc(ctx, effects, &key, false)
                 .await;
             stmt.succeed().commit().await.unwrap();
             assert!(matches!(res, Ok(DeleteMvcc::Deleted)));
@@ -6390,7 +6493,7 @@ fn test_secondary_index_common() {
             let key = SelectKey::new(1, vec![Val::from(0i32)]);
             let res = table
                 .accessor()
-                .index_scan_mvcc(&stmt, &key, user_read_set)
+                .index_scan_mvcc(stmt.ctx(), &key, user_read_set)
                 .await;
             _ = stmt.succeed().commit().await.unwrap();
             assert!(res.unwrap().unwrap_rows().len() == 1);
@@ -6420,9 +6523,10 @@ fn test_secondary_index_rollback() {
             let trx = session.try_begin_trx().unwrap().unwrap();
             let mut stmt = trx.start_stmt();
             for i in 0i32..5i32 {
+                let (ctx, effects) = stmt.ctx_and_effects_mut();
                 let res = table
                     .accessor()
-                    .insert_mvcc(&mut stmt, vec![Val::from(i), Val::from(i)])
+                    .insert_mvcc(ctx, effects, vec![Val::from(i), Val::from(i)])
                     .await;
                 assert!(matches!(res, Ok(InsertMvcc::Inserted(_))));
             }
@@ -6430,9 +6534,10 @@ fn test_secondary_index_rollback() {
 
             let trx = session.try_begin_trx().unwrap().unwrap();
             let mut stmt = trx.start_stmt();
+            let (ctx, effects) = stmt.ctx_and_effects_mut();
             let res = table
                 .accessor()
-                .insert_mvcc(&mut stmt, vec![Val::from(5i32), Val::from(5i32)])
+                .insert_mvcc(ctx, effects, vec![Val::from(5i32), Val::from(5i32)])
                 .await;
             assert!(matches!(res, Ok(InsertMvcc::Inserted(_))));
             stmt.succeed().rollback().await.unwrap();
@@ -6442,7 +6547,7 @@ fn test_secondary_index_rollback() {
             let key = SelectKey::new(0, vec![Val::from(5i32)]);
             let res = table
                 .accessor()
-                .index_lookup_unique_mvcc(&stmt, &key, user_read_set)
+                .index_lookup_unique_mvcc(stmt.ctx(), &key, user_read_set)
                 .await;
             stmt.succeed().commit().await.unwrap();
             assert!(matches!(res, Ok(SelectMvcc::NotFound)));
@@ -6454,9 +6559,10 @@ fn test_secondary_index_rollback() {
                 idx: 1,
                 val: Val::from(0i32),
             }];
+            let (ctx, effects) = stmt.ctx_and_effects_mut();
             let res = table
                 .accessor()
-                .update_unique_mvcc(&mut stmt, &key, update)
+                .update_unique_mvcc(ctx, effects, &key, update)
                 .await;
             assert!(matches!(res, Ok(UpdateMvcc::Updated(_))));
             stmt.succeed().rollback().await.unwrap();
@@ -6466,7 +6572,7 @@ fn test_secondary_index_rollback() {
             let key = SelectKey::new(0, vec![Val::from(1i32)]);
             let res = table
                 .accessor()
-                .index_lookup_unique_mvcc(&stmt, &key, user_read_set)
+                .index_lookup_unique_mvcc(stmt.ctx(), &key, user_read_set)
                 .await;
             stmt.succeed().commit().await.unwrap();
             assert!(matches!(res, Ok(SelectMvcc::Found(_))));
@@ -6476,9 +6582,10 @@ fn test_secondary_index_rollback() {
             let trx = session.try_begin_trx().unwrap().unwrap();
             let mut stmt = trx.start_stmt();
             let key = SelectKey::new(0, vec![Val::from(0i32)]);
+            let (ctx, effects) = stmt.ctx_and_effects_mut();
             let res = table
                 .accessor()
-                .delete_unique_mvcc(&mut stmt, &key, false)
+                .delete_unique_mvcc(ctx, effects, &key, false)
                 .await;
             assert!(matches!(res, Ok(DeleteMvcc::Deleted)));
             stmt.succeed().rollback().await.unwrap();
@@ -6488,7 +6595,7 @@ fn test_secondary_index_rollback() {
             let key = SelectKey::new(0, vec![Val::from(0i32)]);
             let res = table
                 .accessor()
-                .index_lookup_unique_mvcc(&stmt, &key, user_read_set)
+                .index_lookup_unique_mvcc(stmt.ctx(), &key, user_read_set)
                 .await;
             stmt.succeed().commit().await.unwrap();
             assert!(matches!(res, Ok(SelectMvcc::Found(_))));
@@ -6498,16 +6605,18 @@ fn test_secondary_index_rollback() {
             let mut trx = session.try_begin_trx().unwrap().unwrap();
             let key = SelectKey::new(0, vec![Val::from(3i32)]);
             let mut stmt = trx.start_stmt();
+            let (ctx, effects) = stmt.ctx_and_effects_mut();
             let res = table
                 .accessor()
-                .delete_unique_mvcc(&mut stmt, &key, false)
+                .delete_unique_mvcc(ctx, effects, &key, false)
                 .await;
             assert!(matches!(res, Ok(DeleteMvcc::Deleted)));
             trx = stmt.succeed();
             stmt = trx.start_stmt();
+            let (ctx, effects) = stmt.ctx_and_effects_mut();
             let res = table
                 .accessor()
-                .insert_mvcc(&mut stmt, vec![Val::from(3), Val::from(3)])
+                .insert_mvcc(ctx, effects, vec![Val::from(3), Val::from(3)])
                 .await;
             assert!(matches!(res, Ok(InsertMvcc::Inserted(_))));
             trx = stmt.succeed();
@@ -6518,7 +6627,7 @@ fn test_secondary_index_rollback() {
             let key = SelectKey::new(0, vec![Val::from(3i32)]);
             let res = table
                 .accessor()
-                .index_lookup_unique_mvcc(&stmt, &key, user_read_set)
+                .index_lookup_unique_mvcc(stmt.ctx(), &key, user_read_set)
                 .await;
             _ = stmt.succeed().commit().await.unwrap();
             assert!(matches!(res, Ok(SelectMvcc::Found(_))));
