@@ -560,6 +560,7 @@ mod tests {
     use crate::buffer::PoolRole;
     use crate::catalog::tests::table2;
     use crate::conf::{EngineConfig, EvictableBufferPoolConfig};
+    use crate::table::TableAccess;
     use crate::value::Val;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Barrier};
@@ -785,7 +786,8 @@ mod tests {
                 let trx = session.try_begin_trx().unwrap().unwrap();
                 let mut stmt = trx.start_stmt();
                 let insert = vec![Val::from(i as i32), Val::from(&s[..])];
-                let res = stmt.insert_row(&table, insert).await;
+                let (ctx, effects) = stmt.ctx_and_effects_mut();
+                let res = table.accessor().insert_mvcc(ctx, effects, insert).await;
                 assert!(res.is_ok());
                 let trx = stmt.succeed();
                 trx.commit().await.unwrap();

@@ -516,7 +516,7 @@ pub mod tests {
     use crate::file::block_integrity::{BLOCK_INTEGRITY_HEADER_SIZE, write_block_checksum};
     use crate::file::cow_file::COW_FILE_PAGE_SIZE;
     use crate::index::{COLUMN_BLOCK_HEADER_SIZE, COLUMN_BLOCK_LEAF_HEADER_SIZE, ColumnBlockIndex};
-    use crate::table::TablePersistence;
+    use crate::table::{TableAccess, TablePersistence};
     use crate::trx::MIN_SNAPSHOT_TS;
     use crate::trx::sys::CatalogCheckpointScanStopReason;
     use crate::value::{Val, ValKind};
@@ -1062,7 +1062,11 @@ pub mod tests {
             let table = engine.catalog().get_table(table_id).await.unwrap();
             let mut session = engine.try_new_session().unwrap();
             let mut stmt = session.try_begin_trx().unwrap().unwrap().start_stmt();
-            let res = stmt.insert_row(&table, vec![Val::I32(7)]).await;
+            let (ctx, effects) = stmt.ctx_and_effects_mut();
+            let res = table
+                .accessor()
+                .insert_mvcc(ctx, effects, vec![Val::I32(7)])
+                .await;
             assert!(res.is_ok());
             stmt.succeed().commit().await.unwrap();
 
@@ -1167,18 +1171,19 @@ pub mod tests {
             let mut session = engine.try_new_session().unwrap();
 
             let mut stmt = session.try_begin_trx().unwrap().unwrap().start_stmt();
-            let res = stmt
-                .insert_row(&checkpointed_table, vec![Val::I32(7)])
+            let (ctx, effects) = stmt.ctx_and_effects_mut();
+            let res = checkpointed_table
+                .accessor()
+                .insert_mvcc(ctx, effects, vec![Val::I32(7)])
                 .await;
             assert!(res.is_ok());
             stmt.succeed().commit().await.unwrap();
 
             let mut stmt = session.try_begin_trx().unwrap().unwrap().start_stmt();
-            let res = stmt
-                .insert_row(
-                    &replay_only_table,
-                    vec![Val::I32(9), Val::from("replay-backed")],
-                )
+            let (ctx, effects) = stmt.ctx_and_effects_mut();
+            let res = replay_only_table
+                .accessor()
+                .insert_mvcc(ctx, effects, vec![Val::I32(9), Val::from("replay-backed")])
                 .await;
             assert!(res.is_ok());
             stmt.succeed().commit().await.unwrap();

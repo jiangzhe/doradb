@@ -1,20 +1,19 @@
 use crate::buffer::PoolGuards;
-use crate::buffer::page::VersionedPageID;
 
 use crate::catalog::{TableCache, TableID, TableSpec};
 use crate::error::{Result, StoragePoisonSource};
 use crate::row::RowID;
-use crate::row::ops::{DeleteMvcc, InsertMvcc, SelectKey, SelectMvcc, UpdateCol, UpdateMvcc};
-use crate::table::{Table, TableAccess};
+use crate::row::ops::SelectKey;
 use crate::trx::redo::{RedoLogs, RowRedo};
 use crate::trx::undo::{
     IndexUndo, IndexUndoKind, IndexUndoLogs, OwnedRowUndo, RowUndoKind, RowUndoLogs,
 };
 use crate::trx::{ActiveTrx, TrxContext};
-use crate::value::Val;
 use std::mem;
 
+/// Kind-specific payload for statements with deferred catalog-side effects.
 pub enum StmtKind {
+    /// Create-table statement payload used to record table metadata changes.
     CreateTable(TableSpec),
 }
 
@@ -23,7 +22,7 @@ pub enum StmtKind {
 /// These effects merge into transaction-level `TrxEffects` when the statement
 /// succeeds. If the statement fails, row and index effects roll back in reverse
 /// order and redo is discarded.
-pub(crate) struct StmtEffects {
+pub struct StmtEffects {
     row_undo: RowUndoLogs,
     index_undo: IndexUndoLogs,
     redo: RedoLogs,
@@ -188,7 +187,7 @@ impl StmtEffects {
 /// roll them back or discard them before returning the transaction.
 pub struct Statement {
     /// Transaction this statement belongs to.
-    pub trx: ActiveTrx,
+    trx: ActiveTrx,
     // Statement-level row undo, index undo, and redo effects.
     effects: StmtEffects,
 }
@@ -200,12 +199,6 @@ impl Statement {
         let effects = StmtEffects::empty();
         debug_assert!(effects.is_empty());
         Statement { trx, effects }
-    }
-
-    /// Rewrite the latest provisional row undo lock into its final operation.
-    #[inline]
-    pub fn update_last_row_undo(&mut self, kind: RowUndoKind) {
-        self.effects_mut().update_last_row_undo(kind);
     }
 
     /// Succeed current statement and return transaction it belongs to.
@@ -259,150 +252,22 @@ impl Statement {
         Ok(self.trx)
     }
 
-    /// Loads the cached active insert page for the given table.
-    #[inline]
-    pub fn load_active_insert_page(&self, table_id: TableID) -> Option<(VersionedPageID, RowID)> {
-        self.trx.load_active_insert_page(table_id)
-    }
-
-    /// Saves the cached active insert page for the given table.
-    #[inline]
-    pub fn save_active_insert_page(
-        &self,
-        table_id: TableID,
-        page_id: VersionedPageID,
-        row_id: RowID,
-    ) {
-        self.trx.save_active_insert_page(table_id, page_id, row_id);
-    }
-
-    /// Returns the buffer pool guards attached to this statement's session.
-    #[inline]
-    pub fn pool_guards(&self) -> &PoolGuards {
-        self.ctx()
-            .pool_guards()
-            .expect("statement requires an attached session for pool guards")
-    }
-
     /// Returns this statement's immutable transaction context.
     #[inline]
-    pub(crate) fn ctx(&self) -> &TrxContext {
+    pub fn ctx(&self) -> &TrxContext {
         self.trx.ctx()
     }
 
     /// Returns mutable access to this statement's effect accumulator.
     #[inline]
-    pub(crate) fn effects_mut(&mut self) -> &mut StmtEffects {
+    pub fn effects_mut(&mut self) -> &mut StmtEffects {
         &mut self.effects
     }
 
-    /// Insert a row into a table.
+    /// Returns disjoint transaction context and statement effects references.
     #[inline]
-    pub async fn insert_row(&mut self, table: &Table, cols: Vec<Val>) -> Result<InsertMvcc> {
-        table.accessor().insert_mvcc(self, cols).await
-    }
-
-    /// Delete a row selected by a unique key.
-    #[inline]
-    pub async fn delete_row(&mut self, table: &Table, key: &SelectKey) -> Result<DeleteMvcc> {
-        table.accessor().delete_unique_mvcc(self, key, false).await
-    }
-
-    /// Select a row using MVCC visibility and a unique key lookup.
-    #[inline]
-    pub async fn select_row_mvcc(
-        &self,
-        table: &Table,
-        key: &SelectKey,
-        user_read_set: &[usize],
-    ) -> Result<SelectMvcc> {
-        table
-            .accessor()
-            .index_lookup_unique_mvcc(self, key, user_read_set)
-            .await
-    }
-
-    /// Update a row selected by a unique key.
-    #[inline]
-    pub async fn update_row(
-        &mut self,
-        table: &Table,
-        key: &SelectKey,
-        update: Vec<UpdateCol>,
-    ) -> Result<UpdateMvcc> {
-        table.accessor().update_unique_mvcc(self, key, update).await
-    }
-
-    #[inline]
-    pub(crate) fn push_insert_unique_index_undo(
-        &mut self,
-        table_id: TableID,
-        row_id: RowID,
-        key: SelectKey,
-        merge_old_deleted: bool,
-    ) {
-        self.effects
-            .push_insert_unique_index_undo(table_id, row_id, key, merge_old_deleted);
-    }
-
-    #[inline]
-    pub(crate) fn push_insert_non_unique_index_undo(
-        &mut self,
-        table_id: TableID,
-        row_id: RowID,
-        key: SelectKey,
-        merge_old_deleted: bool,
-    ) {
-        self.effects
-            .push_insert_non_unique_index_undo(table_id, row_id, key, merge_old_deleted);
-    }
-
-    #[inline]
-    pub(crate) fn push_delete_index_undo(
-        &mut self,
-        table_id: TableID,
-        row_id: RowID,
-        key: SelectKey,
-        unique: bool,
-    ) {
-        self.effects
-            .push_delete_index_undo(table_id, row_id, key, unique);
-    }
-
-    #[inline]
-    pub(crate) fn push_update_unique_index_undo(
-        &mut self,
-        table_id: TableID,
-        old_row_id: RowID,
-        new_row_id: RowID,
-        key: SelectKey,
-        old_deleted: bool,
-    ) {
-        self.effects.push_update_unique_index_undo(
-            table_id,
-            old_row_id,
-            new_row_id,
-            key,
-            old_deleted,
-        );
-    }
-
-    /// Push one row undo entry into this statement's effects.
-    #[inline]
-    pub(crate) fn push_row_undo(&mut self, undo: OwnedRowUndo) {
-        self.effects_mut().push_row_undo(undo);
-    }
-
-    /// Insert one row redo entry into this statement's effects.
-    #[inline]
-    pub(crate) fn insert_row_redo(&mut self, table_id: TableID, entry: RowRedo) {
-        self.effects_mut().insert_row_redo(table_id, entry);
-    }
-
-    /// Returns mutable access to statement redo for compatibility callers.
-    #[inline]
-    pub(crate) fn redo_mut(&mut self) -> &mut RedoLogs {
-        self.effects_mut().redo_mut()
+    pub fn ctx_and_effects_mut(&mut self) -> (&TrxContext, &mut StmtEffects) {
+        (self.trx.ctx(), &mut self.effects)
     }
 }
 

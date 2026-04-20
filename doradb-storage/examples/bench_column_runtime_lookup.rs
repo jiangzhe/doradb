@@ -8,7 +8,7 @@ use doradb_storage::conf::{
 use doradb_storage::engine::{Engine, EngineRef};
 use doradb_storage::row::ops::{DeleteMvcc, InsertMvcc, SelectKey, SelectMvcc};
 use doradb_storage::session::Session;
-use doradb_storage::table::{CheckpointOutcome, Table, TablePersistence};
+use doradb_storage::table::{CheckpointOutcome, Table, TableAccess, TablePersistence};
 use doradb_storage::value::{Val, ValKind};
 use std::hint::black_box;
 use std::sync::Arc;
@@ -146,8 +146,14 @@ async fn insert_rows(table: &Arc<Table>, session: &mut Session, rows: usize) {
     for idx in 0..rows {
         let name = format!("name-{idx}");
         let mut stmt = trx.start_stmt();
-        let res = stmt
-            .insert_row(table, vec![Val::from(idx as i32), Val::from(&name[..])])
+        let (ctx, effects) = stmt.ctx_and_effects_mut();
+        let res = table
+            .accessor()
+            .insert_mvcc(
+                ctx,
+                effects,
+                vec![Val::from(idx as i32), Val::from(&name[..])],
+            )
             .await;
         assert!(matches!(res, Ok(InsertMvcc::Inserted(_))));
         trx = stmt.succeed();
@@ -160,7 +166,11 @@ async fn delete_rows(table: &Arc<Table>, session: &mut Session, rows: usize, str
     for idx in (0..rows).step_by(stride) {
         let key = SelectKey::new(0, vec![Val::from(idx as i32)]);
         let mut stmt = trx.start_stmt();
-        let res = stmt.delete_row(table, &key).await;
+        let (ctx, effects) = stmt.ctx_and_effects_mut();
+        let res = table
+            .accessor()
+            .delete_unique_mvcc(ctx, effects, &key, false)
+            .await;
         assert!(matches!(res, Ok(DeleteMvcc::Deleted)));
         trx = stmt.succeed();
     }
@@ -210,8 +220,9 @@ fn bench_parallel(case: &BenchmarkCase, threads: usize, iterations_per_thread: u
                     for step in 0..iterations_per_thread {
                         let key = &keys[(worker_idx + step * threads) % keys.len()];
                         let stmt = trx.start_stmt();
-                        let res = stmt
-                            .select_row_mvcc(table.as_ref(), key, &READ_SET)
+                        let res = table
+                            .accessor()
+                            .index_lookup_unique_mvcc(stmt.ctx(), key, &READ_SET)
                             .await
                             .unwrap();
                         let vals = match res {

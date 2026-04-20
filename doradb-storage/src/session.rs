@@ -196,6 +196,7 @@ impl Session {
 
         // 5. add DDL redo log to redo log buffer
         let res = stmt
+            .effects_mut()
             .redo_mut()
             .ddl
             .replace(Box::new(DDLRedo::CreateTable(table_id)));

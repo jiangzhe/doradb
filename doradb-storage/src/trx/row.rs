@@ -3,14 +3,14 @@ use crate::buffer::page::VersionedPageID;
 use crate::catalog::{TableID, TableMetadata};
 use crate::row::ops::{ReadRow, SelectKey, UndoCol, UndoVal, UpdateCol, UpdateRow};
 use crate::row::{Row, RowID, RowMut, RowPage, RowRead};
-use crate::stmt::Statement;
+use crate::stmt::StmtEffects;
 use crate::trx::recover::RecoverMap;
 use crate::trx::undo::{
     IndexBranch, IndexBranchTarget, MainBranch, NextRowUndo, OwnedRowUndo, RowUndoHead,
     RowUndoKind, RowUndoRef, UndoStatus,
 };
 use crate::trx::ver_map::{RowPageState, RowVersionReadGuard, RowVersionWriteGuard};
-use crate::trx::{ActiveTrx, SharedTrxStatus, TrxID, trx_is_committed};
+use crate::trx::{SharedTrxStatus, TrxContext, TrxID, trx_is_committed};
 use crate::value::Val;
 use event_listener::EventListener;
 use parking_lot::RwLockReadGuard;
@@ -100,7 +100,7 @@ impl<'a> RowReadAccess<'a> {
     #[inline]
     pub fn read_row_mvcc(
         &self,
-        trx: &ActiveTrx,
+        ctx: &TrxContext,
         metadata: &TableMetadata,
         read_set: &[usize],
         key: Option<&SelectKey>,
@@ -117,13 +117,13 @@ impl<'a> RowReadAccess<'a> {
                     // an active transaction.
                     let ts = undo_head.ts();
                     if trx_is_committed(ts) {
-                        if trx.sts() > ts {
+                        if ctx.sts() > ts {
                             // The latest row-page image committed before this
                             // snapshot, so no undo traversal is needed.
                             return self.read_row_latest(metadata, read_set, key);
                         } // Otherwise, go to next version
                     } else {
-                        let trx_id = trx.trx_id();
+                        let trx_id = ctx.trx_id();
                         if trx_id == ts {
                             // Read-your-own-write: the uncommitted page image
                             // belongs to this transaction.
@@ -189,7 +189,7 @@ impl<'a> RowReadAccess<'a> {
                                     cts,
                                     entry: hot_entry,
                                 } => {
-                                    if trx.sts() > *cts {
+                                    if ctx.sts() > *cts {
                                         // The old same-key hot owner stopped
                                         // being visible before this snapshot,
                                         // so the current reconstructed owner is
@@ -210,7 +210,7 @@ impl<'a> RowReadAccess<'a> {
                                     // uncommitted transaction owns the cold
                                     // delete marker.
                                     if let Some(delete_cts) = delete_cts
-                                        && trx.sts() > *delete_cts
+                                        && ctx.sts() > *delete_cts
                                     {
                                         return ReadRow::NotFound;
                                     }
@@ -254,7 +254,7 @@ impl<'a> RowReadAccess<'a> {
                             }
                             Some(nx) => {
                                 let ts = nx.main.status.ts();
-                                if trx.sts() > ts {
+                                if ctx.sts() > ts {
                                     // current version is visible
                                     if ver.deleted {
                                         return ReadRow::NotFound;
@@ -295,7 +295,7 @@ impl<'a> RowReadAccess<'a> {
         &self,
         metadata: &TableMetadata,
         key: &SelectKey,
-        trx: &ActiveTrx,
+        ctx: &TrxContext,
     ) -> FindOldVersion {
         let undo = match &self.state {
             RowReadState::Recover(_) => unreachable!(),
@@ -318,7 +318,7 @@ impl<'a> RowReadAccess<'a> {
             }
             Some(undo_head) => {
                 let ts = undo_head.ts();
-                if !trx_is_committed(ts) && !trx.is_same_trx(undo_head) {
+                if !trx_is_committed(ts) && !ctx.is_same_trx(undo_head) {
                     // Scenario #1.a
                     return FindOldVersion::WriteConflict;
                 }
@@ -735,10 +735,12 @@ impl<'a> RowWriteAccess<'a> {
     }
 
     /// Add a Lock undo entry as a transaction-level logical row lock.
+    #[allow(clippy::too_many_arguments)]
     #[inline]
     pub fn lock_undo(
         &mut self,
-        stmt: &mut Statement,
+        ctx: &TrxContext,
+        effects: &mut StmtEffects,
         metadata: &TableMetadata,
         table_id: TableID,
         page_id: VersionedPageID,
@@ -753,12 +755,12 @@ impl<'a> RowWriteAccess<'a> {
                 // statement-owned row undo before the actual row-page change is
                 // made.
                 let entry = OwnedRowUndo::new(table_id, Some(page_id), row_id, RowUndoKind::Lock);
-                self.add_undo_head(stmt.trx.status(), entry.leak());
-                stmt.push_row_undo(entry);
+                self.add_undo_head(ctx.status(), entry.leak());
+                effects.push_row_undo(entry);
                 LockUndo::Ok
             }
             Some(undo_head) => {
-                if stmt.trx.is_same_trx(undo_head) {
+                if ctx.is_same_trx(undo_head) {
                     // Re-entrant write by the same transaction. Chain another
                     // provisional lock entry so each statement-level operation
                     // can roll back independently in reverse order.
@@ -766,11 +768,11 @@ impl<'a> RowWriteAccess<'a> {
                         OwnedRowUndo::new(table_id, Some(page_id), row_id, RowUndoKind::Lock);
                     let new_next = NextRowUndo::new(MainBranch {
                         entry: entry.leak(),
-                        status: UndoStatus::Ref(stmt.trx.status()),
+                        status: UndoStatus::Ref(ctx.status()),
                     });
                     let old_next = mem::replace(&mut undo_head.next, new_next);
                     entry.next = Some(old_next);
-                    stmt.push_row_undo(entry);
+                    effects.push_row_undo(entry);
                     return LockUndo::Ok;
                 }
                 let old_cts = undo_head.ts();
@@ -831,11 +833,11 @@ impl<'a> RowWriteAccess<'a> {
                         OwnedRowUndo::new(table_id, Some(page_id), row_id, RowUndoKind::Lock);
                     let new_next = NextRowUndo::new(MainBranch {
                         entry: entry.leak(),
-                        status: UndoStatus::Ref(stmt.trx.status()),
+                        status: UndoStatus::Ref(ctx.status()),
                     });
                     let old_next = mem::replace(&mut undo_head.next, new_next);
                     entry.next = Some(old_next);
-                    stmt.push_row_undo(entry);
+                    effects.push_row_undo(entry);
                     return LockUndo::Ok;
                 }
                 // Another active transaction owns the hot-row lock. If it is

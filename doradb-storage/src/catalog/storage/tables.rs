@@ -88,8 +88,9 @@ impl Tables<'_> {
     /// Insert a table.
     pub async fn insert(&self, stmt: &mut Statement, obj: &TableObject) -> bool {
         let cols = vec![Val::from(obj.table_id)];
+        let (ctx, effects) = stmt.ctx_and_effects_mut();
         matches!(
-            self.table.accessor().insert_mvcc(stmt, cols).await,
+            self.table.accessor().insert_mvcc(ctx, effects, cols).await,
             Ok(InsertMvcc::Inserted(_))
         )
     }
@@ -97,9 +98,10 @@ impl Tables<'_> {
     /// Delete a table by id.
     pub async fn delete_by_id(&self, stmt: &mut Statement, id: TableID) -> bool {
         let key = SelectKey::new(PK_NO_TABLES, vec![Val::from(id)]);
+        let (ctx, effects) = stmt.ctx_and_effects_mut();
         self.table
             .accessor()
-            .delete_unique_mvcc(stmt, &key, true)
+            .delete_unique_mvcc(ctx, effects, &key, true)
             .await
             .is_ok_and(|res| matches!(res, DeleteMvcc::Deleted))
     }
