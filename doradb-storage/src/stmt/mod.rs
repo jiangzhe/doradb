@@ -51,9 +51,11 @@ impl Statement {
     /// All undo and redo logs it holds will be merged into transaction buffer.
     #[inline]
     pub fn succeed(mut self) -> ActiveTrx {
-        self.trx.row_undo.merge(&mut self.row_undo);
-        self.trx.index_undo.merge(&mut self.index_undo);
-        self.trx.redo.merge(mem::take(&mut self.redo));
+        self.trx.merge_statement_effects(
+            &mut self.row_undo,
+            &mut self.index_undo,
+            mem::take(&mut self.redo),
+        );
         self.trx
     }
 
@@ -71,9 +73,10 @@ impl Statement {
             .expect("statement rollback requires session pool guards")
             .clone();
         let mut table_cache = TableCache::new(engine.catalog());
+        let sts = self.trx.sts();
         if self
             .row_undo
-            .rollback(&mut table_cache, &pool_guards, Some(self.trx.sts))
+            .rollback(&mut table_cache, &pool_guards, Some(sts))
             .await
             .is_err()
         {
@@ -85,7 +88,7 @@ impl Statement {
         // rollback index data.
         if self
             .index_undo
-            .rollback(&mut table_cache, &pool_guards, self.trx.sts)
+            .rollback(&mut table_cache, &pool_guards, sts)
             .await
             .is_err()
         {
@@ -104,10 +107,7 @@ impl Statement {
         &mut self,
         table_id: TableID,
     ) -> Option<(VersionedPageID, RowID)> {
-        self.trx
-            .session
-            .as_mut()
-            .and_then(|session| session.load_active_insert_page(table_id))
+        self.trx.load_active_insert_page(table_id)
     }
 
     #[inline]
@@ -117,9 +117,7 @@ impl Statement {
         page_id: VersionedPageID,
         row_id: RowID,
     ) {
-        if let Some(session) = self.trx.session.as_mut() {
-            session.save_active_insert_page(table_id, page_id, row_id);
-        }
+        self.trx.save_active_insert_page(table_id, page_id, row_id);
     }
 
     #[inline]

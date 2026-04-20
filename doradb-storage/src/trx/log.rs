@@ -10,7 +10,7 @@ use crate::serde::Ser;
 use crate::session::SessionState;
 use crate::trx::MIN_SNAPSHOT_TS;
 use crate::trx::group::{
-    Commit, CommitGroup, CommitJoin, CommitWaiter, GroupCommit, MutexGroupCommit,
+    Commit, CommitGroup, CommitGroupLog, CommitJoin, CommitWaiter, GroupCommit, MutexGroupCommit,
 };
 use crate::trx::log_replay::{LogBuf, LogPartitionStream, MmapLogReader, TrxLog};
 use crate::trx::purge::{GC, GCBucket};
@@ -253,7 +253,12 @@ impl IOStateMachine for LogIOStateMachine {
 pub(crate) struct LogPartition {
     /// Group commit of this partition.
     pub(super) group_commit: CachePadded<MutexGroupCommit>,
-    /// Maximum persisted CTS of this partition.
+    /// Maximum ordered-completed CTS of this partition.
+    ///
+    /// Durability-required groups advance this after redo write/sync completes.
+    /// No-log groups also advance it after ordered completion, but recovery
+    /// still seeds timestamps only from checkpoint metadata, table roots, and
+    /// redo headers.
     pub(super) persisted_cts: CachePadded<AtomicU64>,
     /// Round-robin GC number generator.
     rr_gc_no: CachePadded<AtomicUsize>,
@@ -367,25 +372,33 @@ impl LogPartition {
         wait_sync: bool,
     ) -> CommitJoin {
         let cts = trx.cts;
-        let redo_bin = trx.redo_bin.take().unwrap();
-        // Serialize redo log to buffer.
-        let log_buf = self.new_buf(redo_bin);
-        let log_file = group_commit_g.log_file.as_ref().unwrap();
-        // Allocate space of log file.
-        let (fd, offset) = match log_file.alloc(log_buf.capacity()) {
-            Ok((offset, _)) => (log_file.as_raw_fd(), offset),
-            Err(Error::StorageFileCapacityExceeded) => {
-                // rotate log file and try again.
-                self.rotate_log_file(group_commit_g)
-                    .expect("rotate log file");
+        let log = if let Some(redo_bin) = trx.take_log() {
+            // Serialize redo log to buffer.
+            let log_buf = self.new_buf(redo_bin);
+            let log_file = group_commit_g.log_file.as_ref().unwrap();
+            // Allocate space of log file.
+            let (fd, offset) = match log_file.alloc(log_buf.capacity()) {
+                Ok((offset, _)) => (log_file.as_raw_fd(), offset),
+                Err(Error::StorageFileCapacityExceeded) => {
+                    // Rotate log file and try again.
+                    self.rotate_log_file(group_commit_g)
+                        .expect("rotate log file");
 
-                let new_log_file = group_commit_g.log_file.as_ref().unwrap();
-                let (offset, _) = new_log_file
-                    .alloc(log_buf.capacity())
-                    .expect("alloc on new log file");
-                (new_log_file.as_raw_fd(), offset)
-            }
-            Err(_) => unreachable!(),
+                    let new_log_file = group_commit_g.log_file.as_ref().unwrap();
+                    let (offset, _) = new_log_file
+                        .alloc(log_buf.capacity())
+                        .expect("alloc on new log file");
+                    (new_log_file.as_raw_fd(), offset)
+                }
+                Err(_) => unreachable!(),
+            };
+            Some(CommitGroupLog {
+                fd,
+                offset,
+                log_buf,
+            })
+        } else {
+            None
         };
         // Session ownership is detached here for the normal user-transaction path.
         // The caller keeps the returned session handle and is responsible for
@@ -401,9 +414,7 @@ impl LogPartition {
         let new_group = CommitGroup {
             trx_list: vec![trx],
             max_cts: cts,
-            fd,
-            offset,
-            log_buf,
+            log,
             completion,
         };
         group_commit_g.queue.push_back(Commit::Group(new_group));
@@ -610,10 +621,8 @@ pub(super) struct SyncGroup {
 
 impl SyncGroup {
     #[inline]
-    fn take_submission(&mut self) -> LogWriteSubmission {
-        self.write
-            .take()
-            .expect("redo sync group submission must exist before enqueue")
+    fn take_submission(&mut self) -> Option<LogWriteSubmission> {
+        self.write.take()
     }
 
     #[inline]
@@ -788,6 +797,7 @@ impl<'a> FileProcessor<'a> {
                 }
             }
             self.submit_io();
+            self.sync_io();
             self.wait_io(false);
             self.sync_io();
 
@@ -800,9 +810,15 @@ impl<'a> FileProcessor<'a> {
     /// Finish pending IOs.
     #[inline]
     fn finish_pending_io(&mut self) {
-        self.submit_io();
-        self.wait_io(true);
-        self.sync_io();
+        while !self.sync_groups.is_empty() || !self.inflight.is_empty() || self.in_progress > 0 {
+            self.submit_io();
+            self.sync_io();
+            if self.in_progress == 0 {
+                continue;
+            }
+            self.wait_io(false);
+            self.sync_io();
+        }
     }
 
     /// Fetch IO requests, returns ended log file if any.
@@ -880,10 +896,14 @@ impl<'a> FileProcessor<'a> {
             let max_cts = self.written.last().unwrap().max_cts;
 
             let start = Instant::now();
-            let sync_res = match self.log_sync {
-                LogSync::Fsync => self.syncer.fsync(),
-                LogSync::Fdatasync => self.syncer.fdatasync(),
-                LogSync::None => Ok(()),
+            let sync_res = if log_bytes == 0 {
+                Ok(())
+            } else {
+                match self.log_sync {
+                    LogSync::Fsync => self.syncer.fsync(),
+                    LogSync::Fdatasync => self.syncer.fdatasync(),
+                    LogSync::None => Ok(()),
+                }
             };
             let sync_dur = start.elapsed();
             if sync_res.is_err() {
@@ -924,8 +944,12 @@ impl<'a> FileProcessor<'a> {
                 trx_count,
                 commit_count,
                 log_bytes,
-                1,
-                sync_dur.as_nanos() as usize,
+                usize::from(log_bytes > 0),
+                if log_bytes > 0 {
+                    sync_dur.as_nanos() as usize
+                } else {
+                    0
+                },
             );
         }
     }
@@ -936,13 +960,24 @@ impl<'a> FileProcessor<'a> {
         if self.sync_groups.is_empty() {
             return;
         }
-        let limit = self.io_depth.saturating_sub(self.in_progress);
-        for _ in 0..limit.min(self.sync_groups.len()) {
+        let write_limit = self.io_depth.saturating_sub(self.in_progress);
+        let mut submitted_writes = 0usize;
+        while !self.sync_groups.is_empty() {
             let mut sync_group = self
                 .sync_groups
                 .pop_front()
                 .expect("redo sync group queue length was checked");
-            let submission = sync_group.take_submission();
+            let Some(submission) = sync_group.take_submission() else {
+                debug_assert!(sync_group.finished);
+                let res = self.inflight.insert(sync_group.max_cts, sync_group);
+                debug_assert!(res.is_none());
+                continue;
+            };
+            if submitted_writes >= write_limit {
+                sync_group.write = Some(submission);
+                self.sync_groups.push_front(sync_group);
+                break;
+            }
             if let Err(err) = self
                 .partition
                 .io_client
@@ -958,6 +993,7 @@ impl<'a> FileProcessor<'a> {
             let res = self.inflight.insert(sync_group.max_cts, sync_group);
             debug_assert!(res.is_none());
             self.in_progress += 1;
+            submitted_writes += 1;
         }
     }
 
@@ -1316,6 +1352,55 @@ mod tests {
             .await
             .unwrap();
         (temp_dir, engine)
+    }
+
+    fn sync_group_for_order_test(cts: TrxID, finished: bool, log_bytes: usize) -> SyncGroup {
+        SyncGroup {
+            trx_list: vec![PrecommitTrx {
+                cts,
+                redo_bin: None,
+                payload: None,
+                session: None,
+            }],
+            max_cts: cts,
+            log_bytes,
+            write: None,
+            returned_buf: None,
+            completion: Arc::new(Completion::new()),
+            finished,
+            failed: false,
+        }
+    }
+
+    #[test]
+    fn test_shrink_inflight_preserves_order_with_no_log_groups() {
+        let mut inflight = BTreeMap::new();
+        let mut written = Vec::new();
+
+        inflight.insert(10, sync_group_for_order_test(10, false, 4096));
+        inflight.insert(11, sync_group_for_order_test(11, true, 0));
+        assert_eq!(shrink_inflight(&mut inflight, &mut written), (0, 0, 0));
+        assert!(written.is_empty());
+        assert_eq!(inflight.len(), 2);
+
+        inflight.get_mut(&10).unwrap().finished = true;
+        assert_eq!(shrink_inflight(&mut inflight, &mut written), (2, 2, 4096));
+        assert_eq!(written.len(), 2);
+        assert_eq!(written[0].max_cts, 10);
+        assert_eq!(written[1].max_cts, 11);
+    }
+
+    #[test]
+    fn test_shrink_inflight_releases_no_log_prefix_without_later_log() {
+        let mut inflight = BTreeMap::new();
+        let mut written = Vec::new();
+
+        inflight.insert(20, sync_group_for_order_test(20, true, 0));
+        inflight.insert(21, sync_group_for_order_test(21, false, 4096));
+        assert_eq!(shrink_inflight(&mut inflight, &mut written), (1, 1, 0));
+        assert_eq!(written.len(), 1);
+        assert_eq!(written[0].max_cts, 20);
+        assert!(inflight.contains_key(&21));
     }
 
     #[test]

@@ -81,26 +81,46 @@ pub(super) type CommitJoin = (Option<Arc<SessionState>>, Option<CommitWaiter>);
 pub(super) struct CommitGroup {
     pub(super) trx_list: Vec<PrecommitTrx>,
     pub(super) max_cts: TrxID,
+    pub(super) log: Option<CommitGroupLog>,
+    pub(super) completion: Arc<Completion<Result<()>>>,
+}
+
+/// Serialized redo buffer and target file allocation for a durability group.
+pub(super) struct CommitGroupLog {
     pub(super) fd: RawFd,
     pub(super) offset: usize,
     pub(super) log_buf: LogBuf,
-    pub(super) completion: Arc<Completion<Result<()>>>,
 }
 
 impl CommitGroup {
     #[inline]
+    pub(super) fn require_durability(&self) -> bool {
+        self.log.is_some()
+    }
+
+    #[inline]
     pub(super) fn can_join(&self, trx: &PrecommitTrx) -> bool {
-        if let Some(redo_bin) = trx.redo_bin.as_ref() {
-            return self.log_buf.capable_for(redo_bin.ser_len());
+        if !trx.require_durability() {
+            return true;
         }
-        true
+        if !self.require_durability() {
+            return false;
+        }
+        self.log.as_ref().is_some_and(|log| {
+            log.log_buf
+                .capable_for(trx.redo_bin.as_ref().unwrap().ser_len())
+        })
     }
 
     #[inline]
     pub(super) fn join(&mut self, mut trx: PrecommitTrx, wait_sync: bool) -> CommitJoin {
         debug_assert!(self.max_cts < trx.cts);
-        if let Some(redo_bin) = trx.redo_bin.take() {
-            self.log_buf.ser(&redo_bin);
+        if let Some(redo_bin) = trx.take_log() {
+            self.log
+                .as_mut()
+                .expect("durability transaction cannot join a no-log group")
+                .log_buf
+                .ser(&redo_bin);
         }
         self.max_cts = trx.cts;
         // Match LogPartition::create_new_group(): synchronous user commits hand
@@ -114,23 +134,33 @@ impl CommitGroup {
 
     #[inline]
     pub(super) fn into_sync_group(self) -> SyncGroup {
-        // confirm data length in buffer header.
-        let buf = self.log_buf.finish();
-        // we always write a complete page instead of partial data.
-        let log_bytes = buf.capacity();
+        let (log_bytes, write, finished) = match self.log {
+            Some(log) => {
+                // Confirm data length in buffer header.
+                let buf = log.log_buf.finish();
+                // We always write a complete page instead of partial data.
+                let log_bytes = buf.capacity();
+                (
+                    log_bytes,
+                    Some(LogWriteSubmission::new(
+                        self.max_cts,
+                        log.fd,
+                        log.offset,
+                        buf,
+                    )),
+                    false,
+                )
+            }
+            None => (0, None, true),
+        };
         SyncGroup {
             trx_list: self.trx_list,
             max_cts: self.max_cts,
             log_bytes,
-            write: Some(LogWriteSubmission::new(
-                self.max_cts,
-                self.fd,
-                self.offset,
-                buf,
-            )),
+            write,
             returned_buf: None,
             completion: self.completion,
-            finished: false,
+            finished,
             failed: false,
         }
     }
@@ -197,6 +227,37 @@ mod tests {
         }
     }
 
+    fn precommit_no_log(cts: TrxID) -> PrecommitTrx {
+        PrecommitTrx {
+            cts,
+            redo_bin: None,
+            payload: None,
+            session: None,
+        }
+    }
+
+    fn log_group(cts: TrxID, log_buf: LogBuf) -> CommitGroup {
+        CommitGroup {
+            trx_list: vec![precommit(cts)],
+            max_cts: cts,
+            log: Some(CommitGroupLog {
+                fd: 0,
+                offset: 0,
+                log_buf,
+            }),
+            completion: Arc::new(Completion::new()),
+        }
+    }
+
+    fn no_log_group(cts: TrxID) -> CommitGroup {
+        CommitGroup {
+            trx_list: vec![precommit_no_log(cts)],
+            max_cts: cts,
+            log: None,
+            completion: Arc::new(Completion::new()),
+        }
+    }
+
     fn clear_redo(trx: &mut PrecommitTrx) {
         trx.redo_bin.take();
     }
@@ -205,15 +266,7 @@ mod tests {
     fn test_commit_group_join_without_sync_listener() {
         let mut log_buf = LogBuf::new(64);
         log_buf.ser(&redo_bin(1));
-        let completion = Arc::new(Completion::new());
-        let mut group = CommitGroup {
-            trx_list: vec![precommit(1)],
-            max_cts: 1,
-            fd: 0,
-            offset: 0,
-            log_buf,
-            completion,
-        };
+        let mut group = log_group(1, log_buf);
 
         let (session, listener) = group.join(precommit(2), false);
         assert!(session.is_none());
@@ -229,15 +282,7 @@ mod tests {
     fn test_commit_group_can_join_respects_capacity() {
         let mut log_buf = LogBuf::new(64);
         log_buf.ser(&redo_bin(100));
-        let completion = Arc::new(Completion::new());
-        let mut group = CommitGroup {
-            trx_list: vec![precommit(1)],
-            max_cts: 1,
-            fd: 0,
-            offset: 0,
-            log_buf,
-            completion,
-        };
+        let mut group = log_group(1, log_buf);
 
         let candidate1 = precommit_large(2);
         assert!(group.can_join(&candidate1));
@@ -245,6 +290,43 @@ mod tests {
         let mut candidate2 = precommit_large(3);
         assert!(!group.can_join(&candidate2));
         clear_redo(&mut candidate2);
+        for trx in &mut group.trx_list {
+            clear_redo(trx);
+        }
+    }
+
+    #[test]
+    fn test_commit_group_no_log_join_rules() {
+        let mut no_log_group = no_log_group(1);
+        assert!(no_log_group.can_join(&precommit_no_log(2)));
+        let mut durability_candidate = precommit(3);
+        assert!(!no_log_group.can_join(&durability_candidate));
+        clear_redo(&mut durability_candidate);
+
+        let (session, listener) = no_log_group.join(precommit_no_log(2), true);
+        assert!(session.is_none());
+        assert!(listener.is_some());
+        assert_eq!(no_log_group.trx_list.len(), 2);
+        assert_eq!(no_log_group.max_cts, 2);
+
+        let sync_group = no_log_group.into_sync_group();
+        assert_eq!(sync_group.log_bytes, 0);
+        assert!(sync_group.write.is_none());
+        assert!(sync_group.finished);
+    }
+
+    #[test]
+    fn test_commit_group_log_group_accepts_no_log_transaction() {
+        let mut log_buf = LogBuf::new(64);
+        log_buf.ser(&redo_bin(10));
+        let mut group = log_group(10, log_buf);
+
+        assert!(group.require_durability());
+        assert!(group.can_join(&precommit_no_log(11)));
+        let _ = group.join(precommit_no_log(11), false);
+        assert_eq!(group.trx_list.len(), 2);
+        assert_eq!(group.max_cts, 11);
+
         for trx in &mut group.trx_list {
             clear_redo(trx);
         }

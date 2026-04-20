@@ -117,7 +117,7 @@ impl<'a> RowReadAccess<'a> {
                     // an active transaction.
                     let ts = undo_head.ts();
                     if trx_is_committed(ts) {
-                        if trx.sts > ts {
+                        if trx.sts() > ts {
                             // The latest row-page image committed before this
                             // snapshot, so no undo traversal is needed.
                             return self.read_row_latest(metadata, read_set, key);
@@ -189,7 +189,7 @@ impl<'a> RowReadAccess<'a> {
                                     cts,
                                     entry: hot_entry,
                                 } => {
-                                    if trx.sts > *cts {
+                                    if trx.sts() > *cts {
                                         // The old same-key hot owner stopped
                                         // being visible before this snapshot,
                                         // so the current reconstructed owner is
@@ -210,7 +210,7 @@ impl<'a> RowReadAccess<'a> {
                                     // uncommitted transaction owns the cold
                                     // delete marker.
                                     if let Some(delete_cts) = delete_cts
-                                        && trx.sts > *delete_cts
+                                        && trx.sts() > *delete_cts
                                     {
                                         return ReadRow::NotFound;
                                     }
@@ -254,7 +254,7 @@ impl<'a> RowReadAccess<'a> {
                             }
                             Some(nx) => {
                                 let ts = nx.main.status.ts();
-                                if trx.sts > ts {
+                                if trx.sts() > ts {
                                     // current version is visible
                                     if ver.deleted {
                                         return ReadRow::NotFound;

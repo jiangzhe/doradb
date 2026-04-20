@@ -533,14 +533,14 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
                     if let Some(marker) = deletion_buffer.get(row_id) {
                         match marker {
                             DeleteMarker::Committed(ts) => {
-                                if ts <= stmt.trx.sts {
+                                if ts <= stmt.trx.sts() {
                                     return Ok(SelectMvcc::NotFound);
                                 }
                             }
                             DeleteMarker::Ref(status) => {
                                 let ts = status.ts();
                                 if trx_is_committed(ts) {
-                                    if ts <= stmt.trx.sts {
+                                    if ts <= stmt.trx.sts() {
                                         return Ok(SelectMvcc::NotFound);
                                     }
                                 } else if Arc::ptr_eq(&status, &stmt.trx.status()) {
@@ -729,14 +729,14 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
         if let Some(marker) = deletion_buffer.get(row_id) {
             match marker {
                 DeleteMarker::Committed(ts) => {
-                    if ts <= stmt.trx.sts {
+                    if ts <= stmt.trx.sts() {
                         return Ok(ColdRowUpdateRead::NotFound);
                     }
                 }
                 DeleteMarker::Ref(status) => {
                     let ts = status.ts();
                     if trx_is_committed(ts) {
-                        if ts <= stmt.trx.sts {
+                        if ts <= stmt.trx.sts() {
                             return Ok(ColdRowUpdateRead::NotFound);
                         }
                     } else if Arc::ptr_eq(&status, &stmt.trx.status()) {
@@ -1034,7 +1034,7 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
             page,
             ctx,
             row_idx,
-            Some(stmt.trx.sts),
+            Some(stmt.trx.sts()),
             true,
             state_guard,
         );
@@ -1798,7 +1798,7 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
                 page,
                 ctx,
                 page.row_idx(row_id),
-                Some(stmt.trx.sts),
+                Some(stmt.trx.sts()),
                 false,
                 state_guard,
             );
@@ -1891,7 +1891,7 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
         let delete_cts = match deletion_buffer.get(old_id) {
             None => None,
             Some(DeleteMarker::Committed(ts)) => {
-                if ts <= stmt.trx.sts {
+                if ts <= stmt.trx.sts() {
                     Some(Some(ts))
                 } else {
                     None
@@ -1900,7 +1900,7 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
             Some(DeleteMarker::Ref(status)) => {
                 let ts = status.ts();
                 if trx_is_committed(ts) {
-                    if ts <= stmt.trx.sts {
+                    if ts <= stmt.trx.sts() {
                         Some(Some(ts))
                     } else {
                         None
@@ -1926,7 +1926,7 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
         let metadata = self.metadata();
         let (ctx, page) = new_guard.ctx_and_page();
         let mut new_access =
-            RowWriteAccess::new(page, ctx, page.row_idx(new_id), Some(stmt.trx.sts), false);
+            RowWriteAccess::new(page, ctx, page.row_idx(new_id), Some(stmt.trx.sts()), false);
         let undo_vals = new_access.row().calc_delta(metadata, &old_row);
         // The new hot row owns the key now. The terminal branch preserves the
         // old cold image for snapshots that still need to see it. The branch is
@@ -2016,8 +2016,13 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
             FindOldVersion::Ok(old_row, cts, old_entry) => {
                 // row latch is enough, because row lock is already acquired.
                 let (ctx, page) = new_guard.ctx_and_page();
-                let mut new_access =
-                    RowWriteAccess::new(page, ctx, page.row_idx(new_id), Some(stmt.trx.sts), false);
+                let mut new_access = RowWriteAccess::new(
+                    page,
+                    ctx,
+                    page.row_idx(new_id),
+                    Some(stmt.trx.sts()),
+                    false,
+                );
                 let undo_vals = new_access.row().calc_delta(metadata, &old_row);
                 new_access.link_for_unique_index(key.clone(), cts, old_entry, undo_vals);
                 Ok(LinkForUniqueIndex::Linked)
@@ -2041,7 +2046,7 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
                     &key.vals,
                     row_id,
                     false,
-                    stmt.trx.sts,
+                    stmt.trx.sts(),
                 )
                 .await?
             {
@@ -2088,7 +2093,7 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
                                     &key.vals,
                                     index_old_row_id,
                                     row_id,
-                                    stmt.trx.sts,
+                                    stmt.trx.sts(),
                                 )
                                 .await?
                             {
@@ -2130,7 +2135,7 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
                                     &key.vals,
                                     index_old_row_id,
                                     row_id,
-                                    stmt.trx.sts,
+                                    stmt.trx.sts(),
                                 )
                                 .await?
                             {
@@ -2175,7 +2180,7 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
                 &key.vals,
                 row_id,
                 false,
-                stmt.trx.sts,
+                stmt.trx.sts(),
             )
             .await?
         {
@@ -2204,7 +2209,7 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
                 key.index_no,
                 &key.vals,
                 row_id,
-                stmt.trx.sts,
+                stmt.trx.sts(),
             )
             .await?;
         debug_assert!(res); // should always succeed.
@@ -2227,7 +2232,7 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
                 key.index_no,
                 &key.vals,
                 row_id,
-                stmt.trx.sts,
+                stmt.trx.sts(),
             )
             .await?;
         debug_assert!(res);
@@ -2259,7 +2264,7 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
                     &new_key.vals,
                     new_row_id,
                     false,
-                    stmt.trx.sts,
+                    stmt.trx.sts(),
                 )
                 .await?
             {
@@ -2313,7 +2318,7 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
                                 &new_key.vals,
                                 old_row_id.deleted(),
                                 new_row_id,
-                                stmt.trx.sts,
+                                stmt.trx.sts(),
                             )
                             .await?
                         {
@@ -2367,7 +2372,7 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
                                     &new_key.vals,
                                     index_old_row_id,
                                     new_row_id,
-                                    stmt.trx.sts,
+                                    stmt.trx.sts(),
                                 )
                                 .await?
                             {
@@ -2412,7 +2417,7 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
                                     &new_key.vals,
                                     index_old_row_id,
                                     new_row_id,
-                                    stmt.trx.sts,
+                                    stmt.trx.sts(),
                                 )
                                 .await?
                             {
@@ -2461,7 +2466,7 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
                 &new_key.vals,
                 new_row_id,
                 false,
-                stmt.trx.sts,
+                stmt.trx.sts(),
             )
             .await?
         {
@@ -2497,7 +2502,7 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
                 &key.vals,
                 old_row_id,
                 new_row_id,
-                stmt.trx.sts,
+                stmt.trx.sts(),
             )
             .await?
         {
@@ -2535,7 +2540,7 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
                 &key.vals,
                 new_row_id,
                 false,
-                stmt.trx.sts,
+                stmt.trx.sts(),
             )
             .await?;
         debug_assert!(res.is_ok());
@@ -2582,7 +2587,7 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
                     &new_key.vals,
                     row_id,
                     true,
-                    stmt.trx.sts,
+                    stmt.trx.sts(),
                 )
                 .await?
             {
@@ -2628,7 +2633,7 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
                                     &new_key.vals,
                                     index_old_row_id,
                                     row_id,
-                                    stmt.trx.sts,
+                                    stmt.trx.sts(),
                                 )
                                 .await?
                             {
@@ -2669,7 +2674,7 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
                                     &new_key.vals,
                                     index_old_row_id,
                                     row_id,
-                                    stmt.trx.sts,
+                                    stmt.trx.sts(),
                                 )
                                 .await?
                             {
@@ -2726,7 +2731,7 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
                 &new_key.vals,
                 row_id,
                 true,
-                stmt.trx.sts,
+                stmt.trx.sts(),
             )
             .await?
         {
@@ -2830,7 +2835,7 @@ impl<D: BufferPool, I: BufferPool> TableAccess for TableAccessor<'_, D, I> {
                     .all(|(l, r)| l < r)
         });
         match self
-            .unique_lookup(stmt.pool_guards(), key.index_no, &key.vals, stmt.trx.sts)
+            .unique_lookup(stmt.pool_guards(), key.index_no, &key.vals, stmt.trx.sts())
             .await?
         {
             None => Ok(SelectMvcc::NotFound),
@@ -2909,7 +2914,7 @@ impl<D: BufferPool, I: BufferPool> TableAccess for TableAccessor<'_, D, I> {
             key.index_no,
             &key.vals,
             &mut row_ids,
-            stmt.trx.sts,
+            stmt.trx.sts(),
         )
         .await?;
         let mut res = vec![];
@@ -2981,7 +2986,7 @@ impl<D: BufferPool, I: BufferPool> TableAccess for TableAccessor<'_, D, I> {
         );
         loop {
             let (page_guard, row_id) = match self
-                .unique_lookup(stmt.pool_guards(), key.index_no, &key.vals, stmt.trx.sts)
+                .unique_lookup(stmt.pool_guards(), key.index_no, &key.vals, stmt.trx.sts())
                 .await?
             {
                 None => return Ok(UpdateMvcc::NotFound),
@@ -3022,7 +3027,7 @@ impl<D: BufferPool, I: BufferPool> TableAccess for TableAccessor<'_, D, I> {
                         // the definitive ownership claim and rechecks the CDB
                         // state under the map entry to catch races with other
                         // cold delete/update transactions.
-                        match deletion_buffer.put_ref(row_id, stmt.trx.status(), stmt.trx.sts) {
+                        match deletion_buffer.put_ref(row_id, stmt.trx.status(), stmt.trx.sts()) {
                             Ok(()) => (),
                             Err(DeletionError::WriteConflict) => {
                                 return Ok(UpdateMvcc::WriteConflict);
@@ -3189,7 +3194,7 @@ impl<D: BufferPool, I: BufferPool> TableAccess for TableAccessor<'_, D, I> {
         debug_assert!(self.metadata().index_type_match(key.index_no, &key.vals));
         loop {
             let (page_guard, row_id) = match self
-                .unique_lookup(stmt.pool_guards(), key.index_no, &key.vals, stmt.trx.sts)
+                .unique_lookup(stmt.pool_guards(), key.index_no, &key.vals, stmt.trx.sts())
                 .await?
             {
                 None => return Ok(DeleteMvcc::NotFound),
@@ -3220,7 +3225,7 @@ impl<D: BufferPool, I: BufferPool> TableAccess for TableAccessor<'_, D, I> {
                             return Ok(DeleteMvcc::NotFound);
                         }
                         let deletion_buffer = self.lwc_deletion_buffer()?;
-                        match deletion_buffer.put_ref(row_id, stmt.trx.status(), stmt.trx.sts) {
+                        match deletion_buffer.put_ref(row_id, stmt.trx.status(), stmt.trx.sts()) {
                             Ok(()) => {
                                 // The marker is the transaction-owned delete
                                 // state. Row undo removes it on rollback; redo

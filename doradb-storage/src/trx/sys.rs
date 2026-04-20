@@ -60,8 +60,10 @@ pub const GC_BUCKETS: usize = 64;
 ///
 /// 4. Transaction final-commit:
 ///
-/// TrxID in all undo log entries of current transaction should be updated to CTS after log
-/// is persisted.
+/// TrxID in all undo log entries of current transaction should be updated to CTS after the
+/// transaction reaches its ordered commit barrier. Durability-required transactions reach that
+/// barrier after redo persistence; no-log runtime-effect transactions reach it through the same
+/// group ordering without publishing a recovery-visible timestamp carrier.
 /// As undo logs are maintained purely in memory, we can use shared pointer with atomic variable
 /// to perform very fast CTS backfill.
 pub struct TransactionSystem {
@@ -221,22 +223,13 @@ impl TransactionSystem {
         }
         // Prepare redo log first, this may take some time,
         // so keep it out of lock scope, and we can fill cts after the lock is held.
-        let partition = &*self.log_partitions[trx.log_no];
+        let partition = &*self.log_partitions[trx.log_no()];
         let prepared_trx = trx.prepare();
-        if prepared_trx.redo_bin.is_none() {
-            // There might be scenario that the transaction does not change anything
-            // logically, but have undo logs.
-            // For example, a transaction
-            // 1) insert one row.
-            // 2) delete it.
-            // 3) commit.
-            //
-            // The preparation should shrink redo logs on row level and finally there
-            // is no redo entry. But we have undo logs and already put them into
-            // page-level undo maps.
-            // In such case, we can just rollback this transaction because it actually
-            // do nothing.
-            self.rollback_prepared(prepared_trx).await?;
+        if !prepared_trx.require_ordered_commit() {
+            // No runtime effects means there is no CTS to publish and no commit
+            // order to preserve. Effects without redo still enter group commit
+            // because readers, sessions, and GC depend on ordered CTS backfill.
+            self.discard_unordered_prepared(prepared_trx);
             return Ok(0);
         }
         // start group commit
@@ -265,16 +258,17 @@ impl TransactionSystem {
     /// Rollback active transaction.
     #[inline]
     pub async fn rollback(&self, mut trx: ActiveTrx) -> Result<()> {
+        let sts = trx.sts();
+        let log_no = trx.log_no();
+        let gc_no = trx.gc_no();
         let pool_guards = trx
-            .session
-            .as_ref()
-            .expect("transaction rollback requires session pool guards")
             .pool_guards()
+            .expect("transaction rollback requires session pool guards")
             .clone();
         let mut table_cache = TableCache::new(&self.catalog);
         if trx
-            .index_undo
-            .rollback(&mut table_cache, &pool_guards, trx.sts)
+            .index_undo_mut()
+            .rollback(&mut table_cache, &pool_guards, sts)
             .await
             .is_err()
         {
@@ -282,65 +276,39 @@ impl TransactionSystem {
             return Err(self.poison_storage(StoragePoisonSource::RollbackAccess));
         }
         if trx
-            .row_undo
-            .rollback(&mut table_cache, &pool_guards, Some(trx.sts))
+            .row_undo_mut()
+            .rollback(&mut table_cache, &pool_guards, Some(sts))
             .await
             .is_err()
         {
             trx.discard_after_fatal_rollback();
             return Err(self.poison_storage(StoragePoisonSource::RollbackAccess));
         }
-        trx.redo.clear();
-        trx.gc_row_pages.clear();
-        trx.old_table_root.take();
-        self.log_partitions[trx.log_no].gc_buckets[trx.gc_no].gc_analyze_rollback(trx.sts);
-        if let Some(s) = trx.session.take() {
+        trx.effects_mut().clear_for_rollback();
+        self.log_partitions[log_no].gc_buckets[gc_no].gc_analyze_rollback(sts);
+        if let Some(s) = trx.take_session() {
             s.rollback();
         }
         Ok(())
     }
 
-    /// Rollback prepared transaction.
-    /// This is special case of transaction commit without redo log.
-    /// In such case, we do not need to go through entire commit process but just
-    /// rollback the transaction, because it actually do nothing.
+    /// Discard a prepared transaction that has no runtime effects.
+    ///
+    /// This path does not assign a CTS. Transactions with volatile effects but
+    /// no log still require ordered commit and must not route here.
     #[inline]
-    async fn rollback_prepared(&self, mut trx: PreparedTrx) -> Result<()> {
-        debug_assert!(trx.redo_bin.is_none());
-        let pool_guards = trx
-            .session
-            .as_ref()
-            .expect("prepared rollback requires session pool guards")
-            .pool_guards()
-            .clone();
-        // Note: rollback can only happens to user transaction, so payload is always non-empty.
-        let mut payload = trx.payload.take().unwrap();
-        let mut table_cache = TableCache::new(&self.catalog);
-        if payload
-            .row_undo
-            .rollback(&mut table_cache, &pool_guards, trx.sts)
-            .await
-            .is_err()
-        {
-            trx.discard_after_fatal_rollback();
-            return Err(self.poison_storage(StoragePoisonSource::RollbackAccess));
-        }
-        if payload
-            .index_undo
-            .rollback(&mut table_cache, &pool_guards, payload.sts)
-            .await
-            .is_err()
-        {
-            trx.discard_after_fatal_rollback();
-            return Err(self.poison_storage(StoragePoisonSource::RollbackAccess));
-        }
-        trx.redo_bin.take();
+    fn discard_unordered_prepared(&self, mut trx: PreparedTrx) {
+        debug_assert!(!trx.require_durability());
+        debug_assert!(!trx.require_ordered_commit());
+        let payload = trx
+            .payload
+            .take()
+            .expect("prepared no-op cleanup requires user transaction payload");
         self.log_partitions[payload.log_no].gc_buckets[payload.gc_no]
             .gc_analyze_rollback(payload.sts);
         if let Some(s) = trx.session.take() {
             s.rollback();
         }
-        Ok(())
     }
 
     /// Returns statistics of group commit.
@@ -428,7 +396,12 @@ impl TransactionSystem {
         )
     }
 
-    /// Returns globally durable log watermark `W` from all partitions.
+    /// Returns the global ordered-completion watermark `W` from all partitions.
+    ///
+    /// This is used as the upper bound for scanning durable redo. No-log
+    /// commit barriers can advance this runtime watermark, but recovery still
+    /// seeds future timestamps only from checkpoint metadata, table roots, and
+    /// real redo headers.
     #[inline]
     pub fn persisted_watermark_cts(&self) -> TrxID {
         self.log_partitions

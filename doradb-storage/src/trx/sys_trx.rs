@@ -48,7 +48,6 @@ impl SysTrx {
             ))
         };
         PreparedTrx {
-            sts: None,
             redo_bin,
             payload: None,
             session: None,
