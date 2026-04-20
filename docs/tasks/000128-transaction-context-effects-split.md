@@ -1,7 +1,7 @@
 ---
 id: 000128
 title: Transaction Context And Effects Split
-status: proposal
+status: implemented
 created: 2026-04-19
 github_issue: 580
 ---
@@ -140,8 +140,10 @@ Reference:
 5. Update `ActiveTrx::prepare()` to:
    - preserve the readonly fast path;
    - set the shared status to preparing for non-readonly transactions;
-   - serialize redo only when redo, GC pages, or old-root retention require a
-     log record;
+   - separate `require_durability` from `require_ordered_commit`;
+   - serialize redo only when a transaction has a recovery-visible log record;
+   - route runtime effects without redo through ordered commit without
+     manufacturing empty redo;
    - move row undo, index undo, GC pages, and old root into the existing
      `PreparedTrxPayload`;
    - move the session handle exactly once into `PreparedTrx`.
@@ -193,6 +195,48 @@ Reference:
 
 ## Implementation Notes
 
+Implemented on 2026-04-20.
+
+- Added `TrxContext` and `TrxEffects` inside `doradb-storage/src/trx/mod.rs`.
+  `ActiveTrx` now owns immutable transaction identity/runtime handles
+  separately from mutable transaction effects while preserving compatibility
+  accessors for current `Statement`, `TableAccess`, row MVCC, checkpoint,
+  recovery, catalog, and tests.
+- Split transaction effect predicates into `require_durability` and
+  `require_ordered_commit`. Durability now means a recovery-visible redo record
+  exists. Ordered commit now means runtime effects need ordered CTS assignment,
+  status/session completion, and GC handoff. `take_log` only returns real redo;
+  GC pages and retained old roots no longer manufacture empty redo records.
+- Updated group commit and log scheduling so ordered transactions without redo
+  can form or join no-log commit groups. No-log groups preserve commit order and
+  CTS backfill without allocating log buffers, submitting writes, consuming IO
+  depth, or calling fsync/fdatasync.
+- Updated `TransactionSystem::commit` so true no-effect transactions still use
+  the readonly/no-op path, while effects-only transactions enter ordered
+  commit. `commit_sys` continues to drop empty system transactions without a
+  user transaction lifecycle.
+- Updated statement success/failure and table/row/persistence callers to use
+  the new compatibility accessors. This task did not introduce
+  `StatementEffects`, `TrxReadProof`, `TableRootSnapshot`, or `TableAccess`
+  signature changes.
+- Updated conceptual documentation in `docs/transaction-system.md` and
+  `docs/checkpoint-and-recovery.md` to document the durability versus ordered
+  commit invariant. Recovery seeds timestamps only from checkpoint metadata,
+  table roots, and real redo headers; no-log ordered CTS values are volatile.
+- No unsafe code was changed. The date-only unsafe baseline refresh was
+  reviewed during checklist and explicitly accepted by the developer.
+- PR created: https://github.com/jiangzhe/doradb/pull/581
+- Validation completed:
+  - `cargo test -p doradb-storage test_effects_only_commit_uses_ordered_barrier_without_log_bytes -- --nocapture`
+  - `cargo test -p doradb-storage no_log -- --nocapture`
+  - `cargo test -p doradb-storage effect_predicates -- --nocapture`
+  - `cargo build -p doradb-storage`
+  - `cargo clippy -p doradb-storage --all-targets -- -D warnings`
+  - `cargo nextest run -p doradb-storage`
+  - `tools/coverage_focus.rs --path doradb-storage/src/trx`
+  - `tools/coverage_focus.rs --path doradb-storage/src/stmt`
+  - `git diff --check`
+
 ## Impacts
 
 - `doradb-storage/src/trx/mod.rs`: defines `TrxContext`, `TrxEffects`, and the
@@ -220,13 +264,17 @@ Reference:
   transaction id, log partition, GC bucket, session engine, and pool guards.
 - A transaction with only empty effects follows the existing readonly prepare
   fast path and yields no redo binary.
-- A transaction with redo, row undo, index undo, GC pages, or retained old root
-  is not readonly and moves the expected payload through
+- A transaction with redo requires durability, writes a real redo record, and
+  moves the expected payload through
   `PreparedTrx -> PrecommitTrx -> CommittedTrx`.
+- A transaction with row undo, index undo, GC pages, or retained old root but no
+  redo requires ordered commit without requiring durability and writes no log
+  bytes.
 - Active rollback clears redo, undo, GC pages, retained old roots, and session
   state while preserving current rollback order.
-- Prepared rollback for a no-redo logical no-op clears payload and session state
-  while preserving current rollback order.
+- Prepared no-effect cleanup clears payload and session state without assigning
+  a CTS, while effects-only prepared transactions remain on the ordered commit
+  path.
 - Statement success merges statement-level row undo, index undo, and redo into
   transaction effects without changing public statement lifecycle behavior.
 - Statement failure rolls back statement-local effects and returns an active
@@ -246,3 +294,5 @@ Reference:
 - Phase 4 owns `TableAccess` signature migration; compatibility methods added
   here should be treated as transitional and revisited when table access accepts
   `&TrxContext` and `&mut StatementEffects` directly.
+- Phase 5 owns proof-gated table-root snapshots. This task preserved existing
+  root access behavior and did not attempt to prove runtime root reads.
