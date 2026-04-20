@@ -1,7 +1,7 @@
 ---
 id: 000130
 title: TableAccess API Migration
-status: proposal
+status: implemented
 created: 2026-04-20
 github_issue: 584
 ---
@@ -209,6 +209,42 @@ Reference:
 
 ## Implementation Notes
 
+Implemented Phase 4 of RFC-0015.
+
+- `TableAccess` MVCC reads now take `&TrxContext`, and MVCC writes now take
+  `&TrxContext` plus `&mut StmtEffects`.
+- `TrxContext` and `StmtEffects` are public opaque types for the public split
+  API surface. `Statement` exposes `ctx()`, `effects_mut()`, and
+  `ctx_and_effects_mut()`, while `Statement::trx` is private.
+- Removed public `Statement::{insert_row, delete_row, select_row_mvcc,
+  update_row}` table-operation wrappers and narrowed statement effect
+  forwarding so table, row, and session paths mutate `StmtEffects` directly.
+- Migrated row MVCC and write-lock helpers, table access private helpers,
+  catalog storage, session DDL redo, recovery/purge/log/sys tests, table tests,
+  catalog tests, and examples to the split `ctx`/`effects` call shape.
+- Preserved MVCC visibility, read-your-own-write behavior, row/index undo,
+  redo logging, active insert page cache behavior, cold deletion markers,
+  secondary-index rollback, statement success/failure behavior, recovery, and
+  transaction lifecycle behavior.
+- No `TrxReadProof`, `TableRootSnapshot`, active-root boundary, root snapshot,
+  checkpoint publication, recovery bootstrap, or root-reachability GC behavior
+  was introduced or changed.
+- No unsafe code was added or changed.
+- Opened PR #585 with `Closes #584`.
+
+Validation:
+
+- `cargo fmt --check && cargo clippy -p doradb-storage --all-targets -- -D warnings`
+- `cargo build -p doradb-storage && cargo nextest run -p doradb-storage`
+  - 621 tests passed.
+- `tools/coverage_focus.rs --path doradb-storage/src/table`
+  - 9257/10185 lines, 90.89%.
+- `tools/coverage_focus.rs --path doradb-storage/src/stmt`
+  - 156/164 lines, 95.12%.
+- `tools/coverage_focus.rs --path doradb-storage/src/trx`
+  - 6735/7122 lines, 94.57%.
+- `git diff --check`
+
 ## Impacts
 
 - `doradb-storage/src/table/access.rs`: primary trait signature migration,
@@ -263,9 +299,10 @@ Reference:
 - Resolved in design: do not preserve `Statement` table-operation wrappers as
   compatibility APIs. Split context/effects usage is the normal API after this
   task.
-- Implementation-time check: whether making `Statement::trx` private can be
-  completed cleanly in this phase. Prefer doing it if call-site churn is
-  contained; otherwise document any remaining public field exposure for a later
-  cleanup.
-- Resolve-time requirement: update RFC-0015 Phase 4 wording so it no longer
-  claims statement wrapper methods are kept as the compatibility layer.
+- Resolved in implementation: `Statement::trx` is private and remaining
+  transaction identity access goes through `stmt.ctx()` or split `ctx`
+  parameters.
+- Resolved during task resolve: RFC-0015 Phase 4 wording was updated so it no
+  longer claims statement table-operation wrappers are kept as the
+  compatibility layer.
+- No remaining open questions for this task.
