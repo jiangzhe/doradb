@@ -14,7 +14,7 @@ The system employs a unique persistence and recovery model that fundamentally di
 | Feature | This System (No-Steal / No-Force) | Traditional ARIES (Steal / No-Force) |
 |----|----|----|
 | **Dirty Page Policy** | **Strict No-Steal**: Disk data structures (DiskTree/ColumnStore) are immutable or CoW, containing only committed data. No dirty pages are flushed. | **Steal**: Dirty pages from uncommitted transactions can be flushed to disk, requiring Undo Logs for rollback. |
-| **Persistence** | **No-Force**: Only commit log is forced to disk at commit. Data pages remain in memory until checkpoint. | **No-Force**: Only WAL is forced. |
+| **Persistence** | **No-Force**: Durability-required commits force the commit log. Data pages remain in memory until checkpoint. Runtime-only effects may still pass through ordered commit without writing log bytes. | **No-Force**: Only WAL is forced. |
 | **Checkpoint** | **Commit-Only**: Background checkpoints publish committed cold data plus companion index/delete state via Copy-on-Write (CoW). | **Fuzzy Checkpoint**: Flushes dirty pages from the buffer pool, dealing with complex LSN ordering. |
 | **Recovery** | **Redo-Only**: Crash recovery involves replaying the Commit Log to rebuild memory state. **No Undo phase** is required for disk structures. | **Redo + Undo**: Requires replaying history and then undoing uncommitted changes using Undo Logs. |
 
@@ -174,15 +174,35 @@ For the detailed index design, see [`secondary-index.md`](./secondary-index.md).
 
 #### Commit Phase
 
-1. **Log**: Serialize all modifications (Heap appends, Index changes, DeletionBuffer updates) and append to the global Commit Log.
-2. **State Update**
+1. **Classify Effects**:
+   - `require_durability`: the transaction has recovery-visible redo and needs
+     a stable CTS carrier in the commit log.
+   - `require_ordered_commit`: the transaction has durable redo or volatile
+     runtime effects that still need ordered CTS assignment, status/session
+     completion, and GC handoff.
+   - A transaction can require ordered commit without requiring durability. In
+     that case it enters the commit ordering path but writes no log bytes.
+2. **Log and Order**:
+   - Durability-required transactions serialize their redo and append it to the
+     global commit log before becoming committed.
+   - Ordered-only transactions use the same commit-order barrier without
+     manufacturing empty redo records.
+   - Transactions with no effects are discarded through the readonly/no-op path
+     and do not receive a CTS.
+3. **State Update**
    - Instead of updating a global transaction table or traversing the MemIndex, the transaction simply backfills the **Commit Timestamp (CTS)** into its Undo Log records.
    - For the **ColumnDeletionBuffer**, the CTS is attached to the delete/update markers.
    - The **CTS** of all undo and deletion-buffer refs in one transaction is
      backed by shared transaction status. This makes the commit operation
      lightweight: setting the shared status makes all related undo records and
      deletion-buffer markers observe the commit timestamp.
-3. **Cleanup**: Discard local write buffers.
+4. **Cleanup**: Discard local write buffers.
+
+Recovery only treats checkpoint metadata, table roots, and real redo headers as
+stable timestamp carriers. A no-log ordered commit has a volatile CTS that is
+valid only for the running process. Any effect that must be reconstructed after
+restart must therefore emit a real redo record or marker instead of relying on
+the ordered-only path.
 
 #### Rollback Phase
 

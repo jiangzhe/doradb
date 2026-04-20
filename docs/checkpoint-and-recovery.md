@@ -4,10 +4,17 @@
 
 Doradb uses a **No-Steal / No-Force** persistence model:
 
-- foreground transactions write memory state plus redo
+- foreground transactions write memory state plus redo when they require
+  recovery-visible durability
 - background checkpoint publishes committed persistent state through CoW roots
 - restart restores the latest committed state by loading checkpointed files and
   replaying redo
+
+Foreground commit separates durability from ordered runtime completion. A
+transaction may have effects that need ordered CTS assignment, status/session
+completion, or GC handoff without having any redo to write. Those transactions
+use the same ordered commit barrier but produce no commit-log record. Their CTS
+is volatile and must not be used by recovery as a timestamp seed.
 
 Checkpoint and recovery are table-centric. Each user table publishes one CoW
 root that includes:
@@ -75,11 +82,19 @@ This removes the old `Index_Rec_CTS` problem entirely.
 
 When a transaction commits on a table:
 
-1. its redo record is appended to the commit log
-2. heap undo state and deletion-buffer state become visible through commit CTS
-3. secondary-index changes remain in `MemIndex`
+1. if it requires durability, its redo record is appended to the commit log
+2. if it has ordered runtime effects but no redo, it passes through the
+   ordered commit barrier without writing log bytes
+3. heap undo state and deletion-buffer state become visible through commit CTS
+4. secondary-index changes remain in `MemIndex`
 
 Foreground commit never updates persistent `DiskTree` pages directly.
+
+The commit log is the recovery-visible CTS carrier for non-checkpointed
+foreground changes. Checkpoint metadata and published table roots are the other
+stable timestamp carriers. An ordered no-log commit is valid only for volatile
+runtime effects. If an effect must survive restart and cannot be recovered from
+checkpoint metadata or table roots, it must emit a real redo record or marker.
 
 ## 4. Checkpoint
 
@@ -225,6 +240,10 @@ For each redo record after the coarse replay floor:
   - insert those deletes into the in-memory deletion buffer
 
 There is no extra per-index replay predicate.
+
+Transactions that committed through the ordered no-log path have no replay
+record. Recovery does not observe their volatile CTS and does not use it when
+seeding future timestamps.
 
 ### 5.4 Why Index Recovery Works Without `Index_Rec_CTS`
 

@@ -722,7 +722,7 @@ impl TablePersistence for Table {
         let mut trx = session
             .try_begin_trx()?
             .ok_or(Error::NotSupported(CHECKPOINT_REQUIRES_IDLE_SESSION))?;
-        let checkpoint_ts = trx.sts;
+        let checkpoint_ts = trx.sts();
         if !frozen_pages.is_empty() {
             self.set_frozen_pages_to_transition(&pool_guards, &frozen_pages, cutoff_ts)
                 .await?;
@@ -768,7 +768,7 @@ impl TablePersistence for Table {
         trx.extend_gc_row_pages(gc_pages);
 
         // Step 5: emit one checkpoint redo marker for recovery.
-        trx.redo.ddl = Some(Box::new(DDLRedo::DataCheckpoint {
+        trx.redo_mut().ddl = Some(Box::new(DDLRedo::DataCheckpoint {
             table_id: self.table_id(),
             pivor_row_id: new_pivot_row_id,
             sts: checkpoint_ts,

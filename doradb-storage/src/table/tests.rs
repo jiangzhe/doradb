@@ -312,7 +312,7 @@ fn test_column_delete_basic() {
         let key = single_key(1i32);
         let mut reader_session = sys.try_new_session().unwrap();
         let trx = reader_session.try_begin_trx().unwrap().unwrap();
-        let _ = assert_row_in_lwc(&sys.table, reader_session.pool_guards(), &key, trx.sts).await;
+        let _ = assert_row_in_lwc(&sys.table, reader_session.pool_guards(), &key, trx.sts()).await;
         trx.commit().await.unwrap();
 
         let mut trx = session.try_begin_trx().unwrap().unwrap();
@@ -344,7 +344,7 @@ fn test_lwc_read_uses_readonly_buffer_pool() {
         let key = single_key(1i32);
         let mut reader_session = sys.try_new_session().unwrap();
         let trx = reader_session.try_begin_trx().unwrap().unwrap();
-        let _ = assert_row_in_lwc(&sys.table, reader_session.pool_guards(), &key, trx.sts).await;
+        let _ = assert_row_in_lwc(&sys.table, reader_session.pool_guards(), &key, trx.sts()).await;
         trx.commit().await.unwrap();
 
         let allocated_after_route = sys.engine.disk_pool.allocated();
@@ -384,7 +384,7 @@ fn test_find_row_returns_resolved_lwc_page_location() {
         let trx = session.try_begin_trx().unwrap().unwrap();
         let index = sys.table.sec_idx()[key.index_no].unique().unwrap();
         let (row_id, _) = index
-            .lookup(session.pool_guards().index_guard(), &key.vals, trx.sts)
+            .lookup(session.pool_guards().index_guard(), &key.vals, trx.sts())
             .await
             .unwrap()
             .unwrap();
@@ -435,7 +435,7 @@ fn test_lwc_select_surfaces_persisted_corruption() {
 
         let key = single_key(1i32);
         let trx = session.try_begin_trx().unwrap().unwrap();
-        let row_id = assert_row_in_lwc(&sys.table, session.pool_guards(), &key, trx.sts).await;
+        let row_id = assert_row_in_lwc(&sys.table, session.pool_guards(), &key, trx.sts()).await;
         trx.commit().await.unwrap();
 
         let active_root = sys.table.file().active_root();
@@ -484,7 +484,7 @@ fn test_lwc_select_surfaces_column_block_index_row_metadata_corruption() {
 
         let key = single_key(1i32);
         let trx = session.try_begin_trx().unwrap().unwrap();
-        let row_id = assert_row_in_lwc(&sys.table, session.pool_guards(), &key, trx.sts).await;
+        let row_id = assert_row_in_lwc(&sys.table, session.pool_guards(), &key, trx.sts()).await;
         trx.commit().await.unwrap();
 
         let active_root = sys.table.file().active_root();
@@ -536,7 +536,7 @@ fn test_lwc_select_surfaces_column_block_index_zero_block_id_corruption() {
 
         let key = single_key(1i32);
         let trx = session.try_begin_trx().unwrap().unwrap();
-        let row_id = assert_row_in_lwc(&sys.table, session.pool_guards(), &key, trx.sts).await;
+        let row_id = assert_row_in_lwc(&sys.table, session.pool_guards(), &key, trx.sts()).await;
         trx.commit().await.unwrap();
 
         let active_root = sys.table.file().active_root();
@@ -588,7 +588,7 @@ fn test_lwc_select_surfaces_row_shape_fingerprint_mismatch_corruption() {
 
         let key = single_key(1i32);
         let trx = session.try_begin_trx().unwrap().unwrap();
-        let row_id = assert_row_in_lwc(&sys.table, session.pool_guards(), &key, trx.sts).await;
+        let row_id = assert_row_in_lwc(&sys.table, session.pool_guards(), &key, trx.sts()).await;
         trx.commit().await.unwrap();
 
         let active_root = sys.table.file().active_root();
@@ -642,7 +642,7 @@ fn test_column_delete_rollback() {
         let mut reader_session = sys.try_new_session().unwrap();
         let trx = reader_session.try_begin_trx().unwrap().unwrap();
         let old_row_id =
-            assert_row_in_lwc(&sys.table, reader_session.pool_guards(), &key, trx.sts).await;
+            assert_row_in_lwc(&sys.table, reader_session.pool_guards(), &key, trx.sts()).await;
         trx.commit().await.unwrap();
 
         let mut trx = session.try_begin_trx().unwrap().unwrap();
@@ -653,7 +653,7 @@ fn test_column_delete_rollback() {
             &sys.table,
             session.pool_guards(),
             &key,
-            stmt.trx.sts,
+            stmt.trx.sts(),
             old_row_id,
             true,
         )
@@ -704,7 +704,7 @@ fn test_column_delete_rollback_after_checkpoint() {
 
         let mut reader_session = sys.try_new_session().unwrap();
         let trx = reader_session.try_begin_trx().unwrap().unwrap();
-        let _ = assert_row_in_lwc(&sys.table, reader_session.pool_guards(), &key, trx.sts).await;
+        let _ = assert_row_in_lwc(&sys.table, reader_session.pool_guards(), &key, trx.sts()).await;
         trx.commit().await.unwrap();
 
         let stmt = trx_delete.start_stmt();
@@ -739,7 +739,7 @@ fn test_column_delete_write_conflict() {
 
         let key = single_key(4i32);
         let trx = session.try_begin_trx().unwrap().unwrap();
-        let _ = assert_row_in_lwc(&sys.table, session.pool_guards(), &key, trx.sts).await;
+        let _ = assert_row_in_lwc(&sys.table, session.pool_guards(), &key, trx.sts()).await;
         trx.commit().await.unwrap();
 
         let mut trx1 = session.try_begin_trx().unwrap().unwrap();
@@ -775,7 +775,7 @@ fn test_column_delete_mvcc_visibility() {
 
         let key = single_key(5i32);
         let trx = session.try_begin_trx().unwrap().unwrap();
-        let _ = assert_row_in_lwc(&sys.table, session.pool_guards(), &key, trx.sts).await;
+        let _ = assert_row_in_lwc(&sys.table, session.pool_guards(), &key, trx.sts()).await;
         trx.commit().await.unwrap();
 
         let mut reader_session = sys.try_new_session().unwrap();
@@ -819,7 +819,7 @@ fn test_lwc_delete_unique_conflicts_when_delete_committed_after_snapshot() {
         let key = single_key(5i32);
         let mut writer_session = sys.try_new_session().unwrap();
         let mut writer = writer_session.try_begin_trx().unwrap().unwrap();
-        let writer_sts = writer.sts;
+        let writer_sts = writer.sts();
         let row_id =
             assert_row_in_lwc(&sys.table, writer_session.pool_guards(), &key, writer_sts).await;
 
@@ -863,7 +863,7 @@ fn test_lwc_update_unique_same_key_reinserts_hot_and_preserves_old_snapshot() {
             &sys.table,
             old_reader_session.pool_guards(),
             &key,
-            old_reader.sts,
+            old_reader.sts(),
         )
         .await;
 
@@ -888,7 +888,7 @@ fn test_lwc_update_unique_same_key_reinserts_hot_and_preserves_old_snapshot() {
             &sys.table,
             session.pool_guards(),
             &key,
-            stmt.trx.sts,
+            stmt.trx.sts(),
             new_row_id,
             false,
         )
@@ -948,7 +948,7 @@ fn test_lwc_update_unique_conflicts_when_delete_committed_after_snapshot() {
         let key = single_key(5i32);
         let mut writer_session = sys.try_new_session().unwrap();
         let mut writer = writer_session.try_begin_trx().unwrap().unwrap();
-        let writer_sts = writer.sts;
+        let writer_sts = writer.sts();
         let row_id =
             assert_row_in_lwc(&sys.table, writer_session.pool_guards(), &key, writer_sts).await;
 
@@ -1002,7 +1002,7 @@ fn test_lwc_update_unique_key_change_preserves_old_and_new_key_visibility() {
             &sys.table,
             old_reader_session.pool_guards(),
             &old_key,
-            old_reader.sts,
+            old_reader.sts(),
         )
         .await;
 
@@ -1032,7 +1032,7 @@ fn test_lwc_update_unique_key_change_preserves_old_and_new_key_visibility() {
             &sys.table,
             session.pool_guards(),
             &old_key,
-            stmt.trx.sts,
+            stmt.trx.sts(),
             old_row_id,
             true,
         )
@@ -1041,7 +1041,7 @@ fn test_lwc_update_unique_key_change_preserves_old_and_new_key_visibility() {
             &sys.table,
             session.pool_guards(),
             &new_key,
-            stmt.trx.sts,
+            stmt.trx.sts(),
             new_row_id,
             false,
         )
@@ -1081,7 +1081,8 @@ fn test_lwc_update_unique_duplicate_rolls_back_cold_marker_and_hot_insert() {
         let key = single_key(1i32);
         let duplicate_key = single_key(2i32);
         let trx = session.try_begin_trx().unwrap().unwrap();
-        let old_row_id = assert_row_in_lwc(&sys.table, session.pool_guards(), &key, trx.sts).await;
+        let old_row_id =
+            assert_row_in_lwc(&sys.table, session.pool_guards(), &key, trx.sts()).await;
         trx.commit().await.unwrap();
 
         let trx = session.try_begin_trx().unwrap().unwrap();
@@ -1132,7 +1133,7 @@ fn test_lwc_update_unique_claims_committed_deleted_cold_owner_with_visibility_br
             &sys.table,
             old_reader_session.pool_guards(),
             &claimed_key,
-            old_reader.sts,
+            old_reader.sts(),
         )
         .await;
 
@@ -1191,7 +1192,7 @@ fn test_lwc_update_unique_rejects_cold_owner_deleted_after_snapshot() {
         let claimed_key = single_key(2i32);
         let mut writer_session = sys.try_new_session().unwrap();
         let mut writer = writer_session.try_begin_trx().unwrap().unwrap();
-        let writer_sts = writer.sts;
+        let writer_sts = writer.sts();
         let claimed_row_id = assert_row_in_lwc(
             &sys.table,
             writer_session.pool_guards(),
@@ -1279,7 +1280,7 @@ fn test_lwc_update_unique_claim_rollback_restores_deleted_cold_owner() {
             &sys.table,
             old_reader_session.pool_guards(),
             &claimed_key,
-            old_reader.sts,
+            old_reader.sts(),
         )
         .await;
 
@@ -1321,7 +1322,7 @@ fn test_lwc_update_unique_claim_rollback_restores_deleted_cold_owner() {
             &sys.table,
             session.pool_guards(),
             &claimed_key,
-            stmt.trx.sts,
+            stmt.trx.sts(),
             new_row_id,
             false,
         )
@@ -1379,8 +1380,13 @@ fn test_lwc_update_unique_claim_rollback_drops_purgeable_deleted_cold_owner() {
         let old_key = single_key(1i32);
         let claimed_key = single_key(2i32);
         let reader = session.try_begin_trx().unwrap().unwrap();
-        let claimed_row_id =
-            assert_row_in_lwc(&sys.table, session.pool_guards(), &claimed_key, reader.sts).await;
+        let claimed_row_id = assert_row_in_lwc(
+            &sys.table,
+            session.pool_guards(),
+            &claimed_key,
+            reader.sts(),
+        )
+        .await;
         reader.commit().await.unwrap();
 
         let index = sys.table.sec_idx()[claimed_key.index_no].unique().unwrap();
@@ -1404,11 +1410,11 @@ fn test_lwc_update_unique_claim_rollback_drops_purgeable_deleted_cold_owner() {
             .await;
 
         let writer = session.try_begin_trx().unwrap().unwrap();
-        assert!(delete_cts < writer.sts);
+        assert!(delete_cts < writer.sts());
         assert!(
             sys.table
                 .deletion_buffer()
-                .delete_marker_is_globally_purgeable(claimed_row_id, writer.sts)
+                .delete_marker_is_globally_purgeable(claimed_row_id, writer.sts())
         );
         let mut stmt = writer.start_stmt();
         let res = stmt
@@ -1435,7 +1441,7 @@ fn test_lwc_update_unique_claim_rollback_drops_purgeable_deleted_cold_owner() {
             &sys.table,
             session.pool_guards(),
             &claimed_key,
-            stmt.trx.sts,
+            stmt.trx.sts(),
             new_row_id,
             false,
         )
@@ -1494,7 +1500,7 @@ fn test_checkpoint_persists_committed_cold_delete_markers() {
 
         let key = single_key(6i32);
         let reader = session.try_begin_trx().unwrap().unwrap();
-        let row_id = assert_row_in_lwc(&sys.table, session.pool_guards(), &key, reader.sts).await;
+        let row_id = assert_row_in_lwc(&sys.table, session.pool_guards(), &key, reader.sts()).await;
         reader.commit().await.unwrap();
 
         sys.new_trx_delete(&mut session, &key).await;
@@ -1562,7 +1568,7 @@ fn test_checkpoint_publishes_unique_secondary_disk_tree_root() {
         for key_value in 0..3 {
             let key = single_key(key_value);
             let row_id =
-                assert_row_in_lwc(&sys.table, session.pool_guards(), &key, reader.sts).await;
+                assert_row_in_lwc(&sys.table, session.pool_guards(), &key, reader.sts()).await;
             assert_eq!(
                 unique_disk_tree_lookup(&sys.table, session.pool_guards(), &key).await,
                 Some(row_id)
@@ -2922,7 +2928,7 @@ fn test_checkpoint_transition_delete_marker_waits_for_next_cutoff_range() {
         let reader = session.try_begin_trx().unwrap().unwrap();
         let index = sys.table.sec_idx()[key.index_no].unique().unwrap();
         let (row_id, _) = index
-            .lookup(session.pool_guards().index_guard(), &key.vals, reader.sts)
+            .lookup(session.pool_guards().index_guard(), &key.vals, reader.sts())
             .await
             .unwrap()
             .expect("row should exist before delete");
@@ -2934,7 +2940,7 @@ fn test_checkpoint_transition_delete_marker_waits_for_next_cutoff_range() {
 
         let mut hold_session = sys.try_new_session().unwrap();
         let hold_trx = hold_session.try_begin_trx().unwrap().unwrap();
-        let hold_sts = hold_trx.sts;
+        let hold_sts = hold_trx.sts();
 
         let mut writer_session = sys.try_new_session().unwrap();
         sys.new_trx_delete(&mut writer_session, &key).await;
@@ -3014,7 +3020,7 @@ fn test_lwc_unique_index_purge_uses_purgeable_delete_marker_fast_path() {
 
         let key = single_key(0i32);
         let reader = session.try_begin_trx().unwrap().unwrap();
-        let row_id = assert_row_in_lwc(&sys.table, session.pool_guards(), &key, reader.sts).await;
+        let row_id = assert_row_in_lwc(&sys.table, session.pool_guards(), &key, reader.sts()).await;
         reader.commit().await.unwrap();
 
         let index = sys.table.sec_idx()[key.index_no].unique().unwrap();
@@ -3074,8 +3080,13 @@ fn test_lwc_unique_index_purge_compares_persisted_key_when_marker_is_not_purgeab
         let current_key = single_key(0i32);
         let stale_key = single_key(-1i32);
         let reader = session.try_begin_trx().unwrap().unwrap();
-        let row_id =
-            assert_row_in_lwc(&sys.table, session.pool_guards(), &current_key, reader.sts).await;
+        let row_id = assert_row_in_lwc(
+            &sys.table,
+            session.pool_guards(),
+            &current_key,
+            reader.sts(),
+        )
+        .await;
         reader.commit().await.unwrap();
 
         let index = sys.table.sec_idx()[current_key.index_no].unique().unwrap();
@@ -3177,7 +3188,7 @@ fn test_lwc_non_unique_index_purge_compares_persisted_key_when_marker_is_not_pur
         let current_key = name_key("current");
         let stale_key = name_key("stale");
         let reader = session.try_begin_trx().unwrap().unwrap();
-        let row_id = assert_row_in_lwc(&sys.table, session.pool_guards(), &pk, reader.sts).await;
+        let row_id = assert_row_in_lwc(&sys.table, session.pool_guards(), &pk, reader.sts()).await;
         reader.commit().await.unwrap();
 
         let index = sys.table.sec_idx()[current_key.index_no]
@@ -3385,7 +3396,7 @@ fn test_unique_insert_rollback_restores_deleted_owner_even_when_row_missing() {
             &sys.table,
             session.pool_guards(),
             &key,
-            stmt.trx.sts,
+            stmt.trx.sts(),
             new_row_id,
             false,
         )
@@ -3436,7 +3447,7 @@ fn test_unique_insert_rollback_restores_delete_marked_stale_hot_owner() {
             .lookup(
                 session.pool_guards().index_guard(),
                 &live_key.vals,
-                reader.sts,
+                reader.sts(),
             )
             .await
             .unwrap()
@@ -3485,7 +3496,7 @@ fn test_unique_insert_rollback_restores_delete_marked_stale_hot_owner() {
             &sys.table,
             session.pool_guards(),
             &stale_key,
-            stmt.trx.sts,
+            stmt.trx.sts(),
             new_row_id,
             false,
         )
@@ -3568,7 +3579,7 @@ fn test_checkpoint_fails_when_eligible_delete_marker_cannot_be_located() {
 
         let key = single_key(0i32);
         let reader = session.try_begin_trx().unwrap().unwrap();
-        let row_id = assert_row_in_lwc(&sys.table, session.pool_guards(), &key, reader.sts).await;
+        let row_id = assert_row_in_lwc(&sys.table, session.pool_guards(), &key, reader.sts()).await;
         reader.commit().await.unwrap();
 
         let root_before = sys.table.file().active_root().clone();
@@ -3615,7 +3626,7 @@ fn test_checkpoint_ignores_missing_old_delete_marker_below_previous_cutoff() {
 
         let key = single_key(0i32);
         let reader = session.try_begin_trx().unwrap().unwrap();
-        let row_id = assert_row_in_lwc(&sys.table, session.pool_guards(), &key, reader.sts).await;
+        let row_id = assert_row_in_lwc(&sys.table, session.pool_guards(), &key, reader.sts()).await;
         reader.commit().await.unwrap();
 
         let root_before = sys.table.file().active_root().clone();
@@ -3648,7 +3659,7 @@ fn test_recover_cold_delete_rejects_already_deleted_with_different_cts() {
 
         let key = single_key(6i32);
         let reader = session.try_begin_trx().unwrap().unwrap();
-        let row_id = assert_row_in_lwc(&sys.table, session.pool_guards(), &key, reader.sts).await;
+        let row_id = assert_row_in_lwc(&sys.table, session.pool_guards(), &key, reader.sts()).await;
         reader.commit().await.unwrap();
 
         let active_root = sys.table.file().active_root();
@@ -3692,12 +3703,12 @@ fn test_checkpoint_skips_cold_delete_markers_at_or_after_cutoff() {
 
         let key = single_key(7i32);
         let reader = session.try_begin_trx().unwrap().unwrap();
-        let row_id = assert_row_in_lwc(&sys.table, session.pool_guards(), &key, reader.sts).await;
+        let row_id = assert_row_in_lwc(&sys.table, session.pool_guards(), &key, reader.sts()).await;
         reader.commit().await.unwrap();
 
         let mut hold_session = sys.try_new_session().unwrap();
         let hold_trx = hold_session.try_begin_trx().unwrap().unwrap();
-        let hold_sts = hold_trx.sts;
+        let hold_sts = hold_trx.sts();
 
         let mut writer_session = sys.try_new_session().unwrap();
         sys.new_trx_delete(&mut writer_session, &key).await;
@@ -3754,7 +3765,8 @@ fn test_checkpoint_fails_on_invalid_v2_delete_metadata() {
 
         let key1 = single_key(6i32);
         let reader = session.try_begin_trx().unwrap().unwrap();
-        let row_id1 = assert_row_in_lwc(&sys.table, session.pool_guards(), &key1, reader.sts).await;
+        let row_id1 =
+            assert_row_in_lwc(&sys.table, session.pool_guards(), &key1, reader.sts()).await;
         reader.commit().await.unwrap();
 
         sys.new_trx_delete(&mut session, &key1).await;
@@ -3781,8 +3793,13 @@ fn test_checkpoint_fails_on_invalid_v2_delete_metadata() {
         let key2 = single_key(7i32);
         let mut reader_session = sys.try_new_session().unwrap();
         let reader = reader_session.try_begin_trx().unwrap().unwrap();
-        let row_id2 =
-            assert_row_in_lwc(&sys.table, reader_session.pool_guards(), &key2, reader.sts).await;
+        let row_id2 = assert_row_in_lwc(
+            &sys.table,
+            reader_session.pool_guards(),
+            &key2,
+            reader.sts(),
+        )
+        .await;
         reader.commit().await.unwrap();
         let entry2 = index
             .locate_block(row_id2)
@@ -3831,7 +3848,8 @@ fn test_checkpoint_fails_on_short_v2_delete_section_header() {
 
         let key1 = single_key(6i32);
         let reader = session.try_begin_trx().unwrap().unwrap();
-        let row_id1 = assert_row_in_lwc(&sys.table, session.pool_guards(), &key1, reader.sts).await;
+        let row_id1 =
+            assert_row_in_lwc(&sys.table, session.pool_guards(), &key1, reader.sts()).await;
         reader.commit().await.unwrap();
 
         sys.new_trx_delete(&mut session, &key1).await;
@@ -3858,8 +3876,13 @@ fn test_checkpoint_fails_on_short_v2_delete_section_header() {
         let key2 = single_key(7i32);
         let mut reader_session = sys.try_new_session().unwrap();
         let reader = reader_session.try_begin_trx().unwrap().unwrap();
-        let row_id2 =
-            assert_row_in_lwc(&sys.table, reader_session.pool_guards(), &key2, reader.sts).await;
+        let row_id2 = assert_row_in_lwc(
+            &sys.table,
+            reader_session.pool_guards(),
+            &key2,
+            reader.sts(),
+        )
+        .await;
         reader.commit().await.unwrap();
         let entry2 = index
             .locate_block(row_id2)
@@ -3913,7 +3936,11 @@ fn test_row_page_transition_retries_update_delete() {
         let mut stmt = trx.start_stmt();
         let index = sys.table.sec_idx()[key.index_no].unique().unwrap();
         let (row_id, _) = index
-            .lookup(session.pool_guards().index_guard(), &key.vals, stmt.trx.sts)
+            .lookup(
+                session.pool_guards().index_guard(),
+                &key.vals,
+                stmt.trx.sts(),
+            )
             .await
             .unwrap()
             .unwrap();
@@ -4648,7 +4675,11 @@ fn test_transition_captures_uncommitted_lock_into_deletion_buffer() {
         let mut stmt = trx.start_stmt();
         let index = sys.table.sec_idx()[key.index_no].unique().unwrap();
         let (row_id, _) = index
-            .lookup(session.pool_guards().index_guard(), &key.vals, stmt.trx.sts)
+            .lookup(
+                session.pool_guards().index_guard(),
+                &key.vals,
+                stmt.trx.sts(),
+            )
             .await
             .unwrap()
             .unwrap();
@@ -4691,7 +4722,7 @@ fn test_transition_captures_uncommitted_lock_into_deletion_buffer() {
         };
         ctx.row_ver().unwrap().set_frozen();
         sys.table
-            .set_frozen_pages_to_transition(session.pool_guards(), &[frozen_page], stmt.trx.sts)
+            .set_frozen_pages_to_transition(session.pool_guards(), &[frozen_page], stmt.trx.sts())
             .await
             .unwrap();
 
@@ -4774,7 +4805,7 @@ fn test_checkpoint_readiness_delayed_reports_root_and_horizon() {
             panic!("expected delayed checkpoint readiness, got {readiness:?}");
         };
         assert_eq!(reason.root_cts, active_root_cts);
-        assert_eq!(reason.min_active_sts, reader.sts);
+        assert_eq!(reason.min_active_sts, reader.sts());
         assert!(reason.root_cts >= reason.min_active_sts);
 
         reader.commit().await.unwrap();
@@ -4852,7 +4883,7 @@ fn test_checkpoint_delayed_preserves_root_and_frozen_pages_until_ready() {
             panic!("expected delayed checkpoint, got {outcome:?}");
         };
         assert_eq!(reason.root_cts, root_protected_by_reader);
-        assert_eq!(reason.min_active_sts, reader.sts);
+        assert_eq!(reason.min_active_sts, reader.sts());
         assert_root_metadata_unchanged(&root_before_delay, &sys.table);
 
         let page_guard = sys
@@ -4898,7 +4929,7 @@ fn test_second_checkpoint_waits_for_previous_root_horizon() {
             panic!("expected second checkpoint to wait, got {outcome:?}");
         };
         assert_eq!(reason.root_cts, first_checkpoint_ts);
-        assert_eq!(reason.min_active_sts, reader.sts);
+        assert_eq!(reason.min_active_sts, reader.sts());
         assert_root_metadata_unchanged(&root_before_second, &sys.table);
 
         reader.commit().await.unwrap();

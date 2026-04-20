@@ -604,10 +604,10 @@ References:
     root retention, and session lifecycle behavior.
   - Non-goals: Do not change `TableAccess` signatures yet except for internal
     compatibility preparation; do not add proof-gated root access yet.
-  - Task Doc: `docs/tasks/TBD.md`
-  - Task Issue: `#0`
-  - Phase Status: `pending`
-  - Implementation Summary: `pending`
+  - Task Doc: `docs/tasks/000128-transaction-context-effects-split.md`
+  - Task Issue: `#580`
+  - Phase Status: done
+  - Implementation Summary: Phase 2 implemented: ActiveTrx now owns separate transaction context and effects, transaction effects distinguish durability from ordered commit, no-log ordered commit groups preserve runtime commit order without empty redo, conceptual transaction and recovery docs were updated, and validation passed with cargo build, clippy, nextest, focused coverage, and git diff check. [Task Resolve Sync: docs/tasks/000128-transaction-context-effects-split.md @ 2026-04-20]
   - Related Backlogs:
     - `docs/backlogs/closed/000093-transaction-context-effects-split-active-root-proofs.md`
 

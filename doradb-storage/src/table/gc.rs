@@ -167,7 +167,7 @@ impl Table {
             let trx = session.try_begin_trx()?.ok_or(Error::NotSupported(
                 "secondary MemIndex cleanup requires idle session",
             ))?;
-            let cleanup_sts = trx.sts;
+            let cleanup_sts = trx.sts();
             let min_active_sts = trx_sys.calc_min_active_sts_for_gc();
             let snapshot = self.capture_mem_index_cleanup_snapshot(min_active_sts);
             if !snapshot.is_visible_to(cleanup_sts) {

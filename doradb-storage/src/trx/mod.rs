@@ -29,9 +29,12 @@ pub mod ver_map;
 
 use crate::buffer::PageID;
 use crate::buffer::PoolGuards;
+use crate::buffer::page::VersionedPageID;
+use crate::catalog::TableID;
 use crate::engine::EngineRef;
 use crate::error::{Error, Result};
 use crate::file::table_file::OldRoot;
+use crate::row::RowID;
 use crate::session::SessionState;
 use crate::stmt::Statement;
 use crate::trx::log_replay::TrxLog;
@@ -132,47 +135,152 @@ pub fn trx_must_not_see_even_if_prepare(sts: TrxID, ts: TrxID) -> bool {
     sts < (ts & SNAPSHOT_TS_MASK)
 }
 
-pub struct ActiveTrx {
-    pub(crate) session: Option<Arc<SessionState>>,
-    // Status of the transaction.
-    // Every undo log will refer to this object on heap.
-    // There are nested pointers to allow atomic update on status when
-    // the transaction enters commit phase.
+/// Immutable transaction identity and runtime handles.
+pub(crate) struct TrxContext {
+    session: Option<Arc<SessionState>>,
     status: Arc<SharedTrxStatus>,
-    // Snapshot timestamp.
-    pub sts: TrxID,
-    // which log partition it belongs to.
-    pub log_no: usize,
-    // which GC bucket it belongs to.
-    pub gc_no: usize,
-    // transaction-level undo logs of row data.
-    pub(crate) row_undo: RowUndoLogs,
-    // transaction-level index undo operations.
-    pub(crate) index_undo: IndexUndoLogs,
-    // transaction-level redo logs.
-    pub(crate) redo: RedoLogs,
-    // row pages to be GCed after commit.
-    pub(crate) gc_row_pages: Vec<PageID>,
-    // Swapped table-file root retained until transaction GC reaches the safe horizon.
-    old_table_root: Option<OldRoot>,
+    sts: TrxID,
+    log_no: usize,
+    gc_no: usize,
 }
 
-impl ActiveTrx {
-    /// Create a new transaction.
+impl TrxContext {
+    /// Create a transaction context from session, status, and partition identity.
     #[inline]
-    pub fn new(
+    pub(crate) fn new(
         session: Arc<SessionState>,
         trx_id: TrxID,
         sts: TrxID,
         log_no: usize,
         gc_no: usize,
     ) -> Self {
-        ActiveTrx {
+        TrxContext {
             session: Some(session),
             status: Arc::new(SharedTrxStatus::new(trx_id)),
             sts,
             log_no,
             gc_no,
+        }
+    }
+
+    /// Returns reference of the storage engine.
+    #[inline]
+    pub(crate) fn engine(&self) -> Option<&EngineRef> {
+        self.session.as_ref().map(|s| s.engine())
+    }
+
+    /// Returns the transaction session pool guards, if the context still owns a session.
+    #[inline]
+    pub(crate) fn pool_guards(&self) -> Option<&PoolGuards> {
+        self.session.as_ref().map(|s| s.pool_guards())
+    }
+
+    /// Returns a clone of the shared transaction status handle.
+    #[inline]
+    pub(crate) fn status(&self) -> Arc<SharedTrxStatus> {
+        self.status.clone()
+    }
+
+    /// Returns whether the row undo head belongs to this transaction.
+    #[inline]
+    pub(crate) fn is_same_trx(&self, undo_head: &RowUndoHead) -> bool {
+        match &undo_head.next.main.status {
+            UndoStatus::Ref(arc) => std::ptr::addr_eq(self.status.as_ref(), arc.as_ref()),
+            _ => false,
+        }
+    }
+
+    /// Returns this transaction's current status timestamp.
+    #[inline]
+    pub(crate) fn trx_id(&self) -> TrxID {
+        self.status.ts()
+    }
+
+    /// Returns the transaction snapshot timestamp.
+    #[inline]
+    pub(crate) fn sts(&self) -> TrxID {
+        self.sts
+    }
+
+    /// Returns the log partition number assigned to the transaction.
+    #[inline]
+    pub(crate) fn log_no(&self) -> usize {
+        self.log_no
+    }
+
+    /// Returns the GC bucket number assigned to the transaction.
+    #[inline]
+    pub(crate) fn gc_no(&self) -> usize {
+        self.gc_no
+    }
+
+    /// Marks the shared transaction status as preparing.
+    #[inline]
+    pub(crate) fn mark_preparing(&self) {
+        let mut g = self.status.prepare_ev.lock();
+        *g = Some(Event::new());
+        self.status.preparing.store(true, Ordering::SeqCst);
+    }
+
+    /// Loads the cached active insert page from the attached session.
+    #[inline]
+    pub(crate) fn load_active_insert_page(
+        &mut self,
+        table_id: TableID,
+    ) -> Option<(VersionedPageID, RowID)> {
+        self.session
+            .as_mut()
+            .and_then(|session| session.load_active_insert_page(table_id))
+    }
+
+    /// Saves the cached active insert page into the attached session.
+    #[inline]
+    pub(crate) fn save_active_insert_page(
+        &mut self,
+        table_id: TableID,
+        page_id: VersionedPageID,
+        row_id: RowID,
+    ) {
+        if let Some(session) = self.session.as_mut() {
+            session.save_active_insert_page(table_id, page_id, row_id);
+        }
+    }
+
+    /// Takes the attached session from the context.
+    #[inline]
+    pub(crate) fn take_session(&mut self) -> Option<Arc<SessionState>> {
+        self.session.take()
+    }
+
+    /// Rolls back and clears the attached session if one remains.
+    #[inline]
+    pub(crate) fn rollback_session(&mut self) {
+        if let Some(session) = self.session.take() {
+            session.rollback();
+        }
+    }
+
+    /// Asserts that terminal lifecycle code has cleared the session.
+    #[inline]
+    fn assert_cleared(&self) {
+        assert!(self.session.is_none(), "session should be cleared");
+    }
+}
+
+/// Mutable transaction-level effects accumulated across successful statements.
+pub(crate) struct TrxEffects {
+    row_undo: RowUndoLogs,
+    index_undo: IndexUndoLogs,
+    redo: RedoLogs,
+    gc_row_pages: Vec<PageID>,
+    old_table_root: Option<OldRoot>,
+}
+
+impl TrxEffects {
+    /// Create an empty transaction effects accumulator.
+    #[inline]
+    pub(crate) fn empty() -> Self {
+        TrxEffects {
             row_undo: RowUndoLogs::empty(),
             index_undo: IndexUndoLogs::empty(),
             redo: RedoLogs::default(),
@@ -181,52 +289,58 @@ impl ActiveTrx {
         }
     }
 
-    /// Returns reference of the storage engine.
+    /// Returns whether this transaction needs a recovery-visible log record.
+    ///
+    /// Durability is the persistent timestamp carrier used by recovery. Runtime
+    /// effects such as undo cleanup, row-page GC, and retained table roots must
+    /// not manufacture empty redo records just to enter group commit.
     #[inline]
-    pub fn engine(&self) -> Option<&EngineRef> {
-        self.session.as_ref().map(|s| s.engine())
+    pub(crate) fn require_durability(&self) -> bool {
+        !self.redo.is_empty()
     }
 
+    /// Returns whether this transaction must pass through ordered commit.
+    ///
+    /// Ordered commit is the runtime barrier for CTS assignment, status/session
+    /// completion, and GC handoff. A transaction may require ordered commit even
+    /// when it does not require durability; in that case its CTS is volatile and
+    /// must not be relied on by recovery.
     #[inline]
-    pub fn pool_guards(&self) -> Option<&PoolGuards> {
-        self.session.as_ref().map(|s| s.pool_guards())
+    pub(crate) fn require_ordered_commit(&self) -> bool {
+        self.require_durability()
+            || !self.row_undo.is_empty()
+            || !self.index_undo.is_empty()
+            || !self.gc_row_pages.is_empty()
+            || self.old_table_root.is_some()
     }
 
+    /// Returns whether transaction effects are logically readonly.
     #[inline]
-    pub fn status(&self) -> Arc<SharedTrxStatus> {
-        self.status.clone()
+    pub(crate) fn readonly(&self) -> bool {
+        !self.require_ordered_commit()
     }
 
+    /// Returns mutable access to transaction row undo logs.
     #[inline]
-    pub fn is_same_trx(&self, undo_head: &RowUndoHead) -> bool {
-        match &undo_head.next.main.status {
-            UndoStatus::Ref(arc) => std::ptr::addr_eq(self.status.as_ref(), arc.as_ref()),
-            _ => false,
-        }
+    pub(crate) fn row_undo_mut(&mut self) -> &mut RowUndoLogs {
+        &mut self.row_undo
     }
 
+    /// Returns mutable access to transaction index undo logs.
     #[inline]
-    pub fn trx_id(&self) -> TrxID {
-        self.status.ts()
+    pub(crate) fn index_undo_mut(&mut self) -> &mut IndexUndoLogs {
+        &mut self.index_undo
     }
 
-    /// Starts a statement.
+    /// Returns mutable access to transaction redo logs.
     #[inline]
-    pub fn start_stmt(self) -> Statement {
-        Statement::new(self)
+    pub(crate) fn redo_mut(&mut self) -> &mut RedoLogs {
+        &mut self.redo
     }
 
-    /// Returns whether the transaction is readonly.
+    /// Extends row pages that should be GCed after commit.
     #[inline]
-    pub fn readonly(&self) -> bool {
-        self.redo.is_empty()
-            && self.row_undo.is_empty()
-            && self.gc_row_pages.is_empty()
-            && self.old_table_root.is_none()
-    }
-
-    #[inline]
-    pub fn extend_gc_row_pages(&mut self, pages: Vec<PageID>) {
+    pub(crate) fn extend_gc_row_pages(&mut self, pages: Vec<PageID>) {
         self.gc_row_pages.extend(pages);
     }
 
@@ -244,42 +358,23 @@ impl ActiveTrx {
         Ok(())
     }
 
-    /// Prepare current transaction for committing.
+    /// Merges one successful statement's effects into this transaction.
     #[inline]
-    pub fn prepare(mut self) -> PreparedTrx {
-        // fast path for readonly transactions
-        if self.readonly() {
-            // there should be no ref count of transaction status.
-            debug_assert!(Arc::strong_count(&self.status) == 1);
-            debug_assert!(self.index_undo.is_empty());
-            return PreparedTrx {
-                sts: Some(self.sts),
-                redo_bin: None,
-                payload: Some(PreparedTrxPayload {
-                    status: Arc::clone(&self.status),
-                    sts: self.sts,
-                    log_no: self.log_no,
-                    gc_no: self.gc_no,
-                    row_undo: RowUndoLogs::empty(),
-                    index_undo: IndexUndoLogs::empty(),
-                    gc_row_pages: Vec::new(),
-                    old_table_root: None,
-                }),
-                session: self.session.take(),
-            };
-        }
+    pub(crate) fn merge_statement_effects(
+        &mut self,
+        row_undo: &mut RowUndoLogs,
+        index_undo: &mut IndexUndoLogs,
+        redo: RedoLogs,
+    ) {
+        self.row_undo.merge(row_undo);
+        self.index_undo.merge(index_undo);
+        self.redo.merge(redo);
+    }
 
-        // change transaction status
-        {
-            let mut g = self.status.prepare_ev.lock();
-            *g = Some(Event::new());
-            self.status.preparing.store(true, Ordering::SeqCst);
-        }
-        // use bincode to serialize redo log
-        let redo_bin = if self.redo.is_empty()
-            && self.gc_row_pages.is_empty()
-            && self.old_table_root.is_none()
-        {
+    /// Builds a redo log record when this transaction requires durability.
+    #[inline]
+    pub(crate) fn take_log(&mut self) -> Option<TrxLog> {
+        if !self.require_durability() {
             None
         } else {
             Some(TrxLog::new(
@@ -289,25 +384,280 @@ impl ActiveTrx {
                 },
                 mem::take(&mut self.redo),
             ))
+        }
+    }
+
+    /// Moves transaction effects into a prepared transaction payload.
+    #[inline]
+    pub(crate) fn take_payload_parts(
+        &mut self,
+    ) -> (RowUndoLogs, IndexUndoLogs, Vec<PageID>, Option<OldRoot>) {
+        (
+            mem::take(&mut self.row_undo),
+            mem::take(&mut self.index_undo),
+            mem::take(&mut self.gc_row_pages),
+            self.old_table_root.take(),
+        )
+    }
+
+    /// Clears effects after rollback or fatal cleanup.
+    #[inline]
+    pub(crate) fn clear_for_rollback(&mut self) {
+        self.redo.clear();
+        self.row_undo = RowUndoLogs::empty();
+        self.index_undo = IndexUndoLogs::empty();
+        self.gc_row_pages.clear();
+        self.old_table_root.take();
+    }
+
+    /// Asserts that all transaction effects have been consumed or cleared.
+    #[inline]
+    fn assert_cleared(&self) {
+        assert!(self.redo.is_empty(), "redo should be cleared");
+        assert!(self.row_undo.is_empty(), "row undo should be cleared");
+        assert!(self.index_undo.is_empty(), "index undo should be cleared");
+        assert!(
+            self.gc_row_pages.is_empty(),
+            "gc row pages should be cleared"
+        );
+        assert!(
+            self.old_table_root.is_none(),
+            "old table root should be cleared"
+        );
+    }
+}
+
+pub struct ActiveTrx {
+    ctx: TrxContext,
+    effects: TrxEffects,
+}
+
+impl ActiveTrx {
+    /// Create a new transaction.
+    #[inline]
+    pub fn new(
+        session: Arc<SessionState>,
+        trx_id: TrxID,
+        sts: TrxID,
+        log_no: usize,
+        gc_no: usize,
+    ) -> Self {
+        ActiveTrx {
+            ctx: TrxContext::new(session, trx_id, sts, log_no, gc_no),
+            effects: TrxEffects::empty(),
+        }
+    }
+
+    /// Returns this transaction's immutable context.
+    #[inline]
+    pub(crate) fn ctx(&self) -> &TrxContext {
+        &self.ctx
+    }
+
+    /// Returns mutable access to this transaction's effects.
+    #[inline]
+    pub(crate) fn effects_mut(&mut self) -> &mut TrxEffects {
+        &mut self.effects
+    }
+
+    /// Returns reference of the storage engine.
+    #[inline]
+    pub fn engine(&self) -> Option<&EngineRef> {
+        self.ctx().engine()
+    }
+
+    /// Returns transaction session pool guards if the session is still attached.
+    #[inline]
+    pub fn pool_guards(&self) -> Option<&PoolGuards> {
+        self.ctx().pool_guards()
+    }
+
+    /// Returns a clone of the shared transaction status handle.
+    #[inline]
+    pub fn status(&self) -> Arc<SharedTrxStatus> {
+        self.ctx().status()
+    }
+
+    /// Returns whether the row undo head belongs to this transaction.
+    #[inline]
+    pub fn is_same_trx(&self, undo_head: &RowUndoHead) -> bool {
+        self.ctx().is_same_trx(undo_head)
+    }
+
+    /// Returns this transaction's current status timestamp.
+    #[inline]
+    pub fn trx_id(&self) -> TrxID {
+        self.ctx().trx_id()
+    }
+
+    /// Returns the transaction snapshot timestamp.
+    #[inline]
+    pub fn sts(&self) -> TrxID {
+        self.ctx().sts()
+    }
+
+    /// Returns the log partition number assigned to this transaction.
+    #[inline]
+    pub(crate) fn log_no(&self) -> usize {
+        self.ctx().log_no()
+    }
+
+    /// Returns the GC bucket number assigned to this transaction.
+    #[inline]
+    pub(crate) fn gc_no(&self) -> usize {
+        self.ctx().gc_no()
+    }
+
+    /// Returns mutable access to transaction redo logs.
+    #[inline]
+    pub(crate) fn redo_mut(&mut self) -> &mut RedoLogs {
+        self.effects.redo_mut()
+    }
+
+    /// Returns mutable access to transaction row undo logs.
+    #[inline]
+    pub(crate) fn row_undo_mut(&mut self) -> &mut RowUndoLogs {
+        self.effects.row_undo_mut()
+    }
+
+    /// Returns mutable access to transaction index undo logs.
+    #[inline]
+    pub(crate) fn index_undo_mut(&mut self) -> &mut IndexUndoLogs {
+        self.effects.index_undo_mut()
+    }
+
+    /// Starts a statement.
+    #[inline]
+    pub fn start_stmt(self) -> Statement {
+        Statement::new(self)
+    }
+
+    /// Returns whether the transaction is readonly.
+    #[inline]
+    pub fn readonly(&self) -> bool {
+        self.effects.readonly()
+    }
+
+    /// Returns whether the transaction needs a recovery-visible log record.
+    #[inline]
+    pub(crate) fn require_durability(&self) -> bool {
+        self.effects.require_durability()
+    }
+
+    /// Returns whether the transaction must pass through ordered commit.
+    #[inline]
+    pub(crate) fn require_ordered_commit(&self) -> bool {
+        self.effects.require_ordered_commit()
+    }
+
+    /// Extends row pages that should be GCed after commit.
+    #[inline]
+    pub fn extend_gc_row_pages(&mut self, pages: Vec<PageID>) {
+        self.effects.extend_gc_row_pages(pages);
+    }
+
+    /// Attach one swapped user-table root to this transaction for GC-horizon retention.
+    ///
+    /// Checkpoint transactions call this after publishing a new table-file root
+    /// so the replaced root remains alive until the committed transaction is
+    /// purged. A transaction may retain at most one table root.
+    #[inline]
+    pub(crate) fn retain_old_table_root(&mut self, old_root: OldRoot) -> Result<()> {
+        self.effects.retain_old_table_root(old_root)
+    }
+
+    /// Merges successful statement effects into transaction effects.
+    #[inline]
+    pub(crate) fn merge_statement_effects(
+        &mut self,
+        row_undo: &mut RowUndoLogs,
+        index_undo: &mut IndexUndoLogs,
+        redo: RedoLogs,
+    ) {
+        self.effects
+            .merge_statement_effects(row_undo, index_undo, redo);
+    }
+
+    /// Loads the cached active insert page from the attached session.
+    #[inline]
+    pub(crate) fn load_active_insert_page(
+        &mut self,
+        table_id: TableID,
+    ) -> Option<(VersionedPageID, RowID)> {
+        self.ctx.load_active_insert_page(table_id)
+    }
+
+    /// Saves the cached active insert page into the attached session.
+    #[inline]
+    pub(crate) fn save_active_insert_page(
+        &mut self,
+        table_id: TableID,
+        page_id: VersionedPageID,
+        row_id: RowID,
+    ) {
+        self.ctx.save_active_insert_page(table_id, page_id, row_id);
+    }
+
+    /// Takes the attached session from the transaction context.
+    #[inline]
+    pub(crate) fn take_session(&mut self) -> Option<Arc<SessionState>> {
+        self.ctx.take_session()
+    }
+
+    /// Clears effects and rolls back the attached session after rollback failure.
+    #[inline]
+    pub(crate) fn discard_after_fatal_rollback(&mut self) {
+        self.effects.clear_for_rollback();
+        self.ctx.rollback_session();
+    }
+
+    /// Prepare current transaction for committing.
+    #[inline]
+    pub fn prepare(mut self) -> PreparedTrx {
+        // fast path for readonly transactions
+        if !self.require_ordered_commit() {
+            // there should be no ref count of transaction status.
+            debug_assert!(Arc::strong_count(&self.ctx.status) == 1);
+            debug_assert!(self.effects.index_undo.is_empty());
+            return PreparedTrx {
+                redo_bin: None,
+                payload: Some(PreparedTrxPayload {
+                    status: self.ctx.status(),
+                    sts: self.ctx.sts(),
+                    log_no: self.ctx.log_no(),
+                    gc_no: self.ctx.gc_no(),
+                    row_undo: RowUndoLogs::empty(),
+                    index_undo: IndexUndoLogs::empty(),
+                    gc_row_pages: Vec::new(),
+                    old_table_root: None,
+                }),
+                session: self.ctx.take_session(),
+            };
+        }
+
+        // change transaction status
+        self.ctx.mark_preparing();
+        // Use bincode to serialize redo log when durability is required.
+        let redo_bin = if self.require_durability() {
+            self.effects.take_log()
+        } else {
+            None
         };
-        let row_undo = mem::take(&mut self.row_undo);
-        let index_undo = mem::take(&mut self.index_undo);
-        let gc_row_pages = mem::take(&mut self.gc_row_pages);
-        let old_table_root = self.old_table_root.take();
+        let (row_undo, index_undo, gc_row_pages, old_table_root) =
+            self.effects.take_payload_parts();
         PreparedTrx {
-            sts: Some(self.sts),
             redo_bin,
             payload: Some(PreparedTrxPayload {
-                status: self.status.clone(),
-                sts: self.sts,
-                log_no: self.log_no,
-                gc_no: self.gc_no,
+                status: self.ctx.status(),
+                sts: self.ctx.sts(),
+                log_no: self.ctx.log_no(),
+                gc_no: self.ctx.gc_no(),
                 row_undo,
                 index_undo,
                 gc_row_pages,
                 old_table_root,
             }),
-            session: self.session.take(),
+            session: self.ctx.take_session(),
         }
     }
 
@@ -332,7 +682,7 @@ impl ActiveTrx {
         // self.trx_redo.push(RedoEntry{page_id: 0, row_id: 0, kind: RedoKind::Delete})
         // simulate sysbench record
         // uint64 + int32 + int32 + char(60) + char(120)
-        self.redo.insert_dml(
+        self.redo_mut().insert_dml(
             0,
             RowRedo {
                 page_id: PageID::new(0),
@@ -347,35 +697,13 @@ impl ActiveTrx {
             },
         )
     }
-
-    #[inline]
-    pub(crate) fn discard_after_fatal_rollback(&mut self) {
-        self.redo.clear();
-        self.row_undo = RowUndoLogs::empty();
-        self.index_undo = IndexUndoLogs::empty();
-        self.gc_row_pages.clear();
-        self.old_table_root.take();
-        if let Some(session) = self.session.take() {
-            session.rollback();
-        }
-    }
 }
 
 impl Drop for ActiveTrx {
     #[inline]
     fn drop(&mut self) {
-        assert!(self.redo.is_empty(), "redo should be cleared");
-        assert!(self.row_undo.is_empty(), "row undo should be cleared");
-        assert!(self.index_undo.is_empty(), "index undo should be cleared");
-        assert!(
-            self.gc_row_pages.is_empty(),
-            "gc row pages should be cleared"
-        );
-        assert!(
-            self.old_table_root.is_none(),
-            "old table root should be cleared"
-        );
-        assert!(self.session.is_none(), "session should be cleared");
+        self.effects.assert_cleared();
+        self.ctx.assert_cleared();
     }
 }
 
@@ -393,9 +721,19 @@ pub struct PreparedTrxPayload {
     old_table_root: Option<OldRoot>,
 }
 
+impl PreparedTrxPayload {
+    /// Returns whether this payload has runtime effects that require ordered commit.
+    #[inline]
+    fn require_ordered_commit(&self) -> bool {
+        !self.row_undo.is_empty()
+            || !self.index_undo.is_empty()
+            || !self.gc_row_pages.is_empty()
+            || self.old_table_root.is_some()
+    }
+}
+
 /// PrecommitTrx has been assigned commit timestamp and already prepared redo log binary.
 pub struct PreparedTrx {
-    sts: Option<TrxID>,
     redo_bin: Option<TrxLog>,
     payload: Option<PreparedTrxPayload>,
     session: Option<Arc<SessionState>>,
@@ -405,6 +743,31 @@ impl PreparedTrx {
     #[inline]
     pub fn engine(&self) -> Option<&EngineRef> {
         self.session.as_ref().map(|s| s.engine())
+    }
+
+    /// Returns whether this transaction needs a recovery-visible log record.
+    ///
+    /// Recovery seeds the next timestamp from checkpoint metadata, table roots,
+    /// and redo headers. A transaction that publishes durable state needing a
+    /// stable CTS must therefore require durability and emit a real log record.
+    #[inline]
+    pub fn require_durability(&self) -> bool {
+        self.redo_bin.is_some()
+    }
+
+    /// Returns whether this transaction must pass through group commit ordering.
+    ///
+    /// This is broader than durability: volatile runtime effects still need CTS
+    /// ordering for status backfill, session completion, and GC handoff even
+    /// when no log record should be written.
+    #[inline]
+    pub fn require_ordered_commit(&self) -> bool {
+        self.require_durability()
+            || self
+                .payload
+                .as_ref()
+                .map(PreparedTrxPayload::require_ordered_commit)
+                .unwrap_or(false)
     }
 
     #[inline]
@@ -460,23 +823,7 @@ impl PreparedTrx {
     /// Returns whether the prepared transaction is readonly.
     #[inline]
     pub fn readonly(&self) -> bool {
-        self.redo_bin.is_none()
-            && self
-                .payload
-                .as_ref()
-                .map(|p| {
-                    p.row_undo.is_empty() && p.gc_row_pages.is_empty() && p.old_table_root.is_none()
-                })
-                .unwrap_or(true)
-    }
-
-    #[inline]
-    pub(crate) fn discard_after_fatal_rollback(&mut self) {
-        self.redo_bin.take();
-        self.payload.take();
-        if let Some(session) = self.session.take() {
-            session.rollback();
-        }
+        !self.require_ordered_commit()
     }
 }
 
@@ -499,6 +846,17 @@ pub struct PrecommitTrxPayload {
     old_table_root: Option<OldRoot>,
 }
 
+impl PrecommitTrxPayload {
+    /// Returns whether this payload has runtime effects that require ordered commit.
+    #[inline]
+    fn require_ordered_commit(&self) -> bool {
+        !self.row_undo.is_empty()
+            || !self.index_gc.is_empty()
+            || !self.gc_row_pages.is_empty()
+            || self.old_table_root.is_some()
+    }
+}
+
 /// PrecommitTrx has been assigned commit timestamp and already prepared redo log binary.
 /// There are two kinds of PrecommitTrx.
 /// One is user transaction which will contains payload such as undo logs and index GC records
@@ -513,6 +871,29 @@ pub struct PrecommitTrx {
 }
 
 impl PrecommitTrx {
+    /// Returns whether this transaction needs a recovery-visible log record.
+    #[inline]
+    pub fn require_durability(&self) -> bool {
+        self.redo_bin.is_some()
+    }
+
+    /// Returns whether this transaction must pass through ordered commit.
+    #[inline]
+    pub fn require_ordered_commit(&self) -> bool {
+        self.require_durability()
+            || self
+                .payload
+                .as_ref()
+                .map(PrecommitTrxPayload::require_ordered_commit)
+                .unwrap_or(false)
+    }
+
+    /// Takes the recovery-visible log record, if this transaction requires one.
+    #[inline]
+    pub fn take_log(&mut self) -> Option<TrxLog> {
+        self.redo_bin.take()
+    }
+
     #[inline]
     pub fn take_session(&mut self) -> Option<Arc<SessionState>> {
         self.session.take()
@@ -659,6 +1040,8 @@ mod tests {
     use crate::engine::Engine;
     use crate::file::cow_file::tests::old_root_drop_count;
     use crate::file::table_file::MutableTableFile;
+    use crate::row::ops::SelectKey;
+    use crate::trx::undo::{IndexUndo, IndexUndoKind, OwnedRowUndo, RowUndoKind};
     use crate::value::ValKind;
     use std::sync::Arc;
     use tempfile::TempDir;
@@ -707,6 +1090,176 @@ mod tests {
     }
 
     #[test]
+    fn test_active_trx_new_splits_context_and_empty_effects() {
+        smol::block_on(async {
+            let (_temp_dir, engine) = test_engine("redo_trx_context_new").await;
+            let session_state = Arc::new(SessionState::new(engine.new_ref().unwrap()));
+            let mut trx = ActiveTrx::new(session_state, MIN_ACTIVE_TRX_ID + 42, 42, 3, 5);
+
+            assert!(trx.readonly());
+            assert!(!trx.require_durability());
+            assert!(!trx.require_ordered_commit());
+            assert_eq!(trx.sts(), 42);
+            assert_eq!(trx.trx_id(), MIN_ACTIVE_TRX_ID + 42);
+            assert_eq!(trx.log_no(), 3);
+            assert_eq!(trx.gc_no(), 5);
+            assert!(trx.engine().is_some());
+            assert!(trx.pool_guards().is_some());
+            assert!(trx.effects.row_undo.is_empty());
+            assert!(trx.effects.index_undo.is_empty());
+            assert!(trx.effects.redo.is_empty());
+            assert!(trx.effects.gc_row_pages.is_empty());
+            assert!(trx.effects.old_table_root.is_none());
+
+            trx.discard_after_fatal_rollback();
+        });
+    }
+
+    #[test]
+    fn test_active_trx_readonly_prepare_keeps_empty_effect_payload() {
+        smol::block_on(async {
+            let (_temp_dir, engine) = test_engine("redo_trx_readonly_prepare").await;
+            let session_state = Arc::new(SessionState::new(engine.new_ref().unwrap()));
+            let trx = ActiveTrx::new(session_state, MIN_ACTIVE_TRX_ID + 43, 43, 1, 2);
+
+            let mut prepared = trx.prepare();
+            assert!(prepared.redo_bin.is_none());
+            assert!(!prepared.require_durability());
+            assert!(!prepared.require_ordered_commit());
+            assert!(prepared.readonly());
+            let payload = prepared.payload.as_ref().unwrap();
+            assert_eq!(payload.sts, 43);
+            assert_eq!(payload.log_no, 1);
+            assert_eq!(payload.gc_no, 2);
+            assert!(payload.row_undo.is_empty());
+            assert!(payload.index_undo.is_empty());
+            assert!(payload.gc_row_pages.is_empty());
+            assert!(payload.old_table_root.is_none());
+
+            prepared.payload.take();
+            prepared.session.take();
+        });
+    }
+
+    #[test]
+    fn test_active_trx_prepare_moves_effect_payload() {
+        smol::block_on(async {
+            let (_temp_dir, engine) = test_engine("redo_trx_effect_prepare").await;
+            let session_state = Arc::new(SessionState::new(engine.new_ref().unwrap()));
+            let mut trx = ActiveTrx::new(session_state, MIN_ACTIVE_TRX_ID + 44, 44, 2, 3);
+            trx.add_pseudo_redo_log_entry();
+            trx.row_undo_mut()
+                .push(OwnedRowUndo::new(11, None, 22, RowUndoKind::Delete));
+            trx.index_undo_mut().push(IndexUndo {
+                table_id: 11,
+                row_id: 22,
+                kind: IndexUndoKind::DeferDelete(SelectKey::new(0, vec![]), true),
+            });
+
+            let mut prepared = trx.prepare();
+            assert!(prepared.redo_bin.is_some());
+            assert!(prepared.require_durability());
+            assert!(prepared.require_ordered_commit());
+            assert!(!prepared.readonly());
+            let payload = prepared.payload.as_ref().unwrap();
+            assert_eq!(payload.sts, 44);
+            assert_eq!(payload.log_no, 2);
+            assert_eq!(payload.gc_no, 3);
+            assert_eq!(payload.row_undo.len(), 1);
+            assert_eq!(payload.index_undo.len(), 1);
+            assert!(payload.gc_row_pages.is_empty());
+            assert!(payload.old_table_root.is_none());
+
+            prepared.redo_bin.take();
+            prepared.payload.take();
+            prepared.session.take();
+        });
+    }
+
+    #[test]
+    fn test_statement_success_merges_statement_effects_into_transaction_effects() {
+        smol::block_on(async {
+            let (_temp_dir, engine) = test_engine("redo_stmt_effect_merge").await;
+            let session_state = Arc::new(SessionState::new(engine.new_ref().unwrap()));
+            let trx = ActiveTrx::new(session_state, MIN_ACTIVE_TRX_ID + 45, 45, 0, 0);
+            let mut stmt = Statement::new(trx);
+            stmt.row_undo
+                .push(OwnedRowUndo::new(12, None, 23, RowUndoKind::Delete));
+            stmt.index_undo.push(IndexUndo {
+                table_id: 12,
+                row_id: 23,
+                kind: IndexUndoKind::DeferDelete(SelectKey::new(0, vec![]), true),
+            });
+            stmt.redo.insert_dml(
+                12,
+                RowRedo {
+                    page_id: PageID::new(0),
+                    row_id: 23,
+                    kind: RowRedoKind::Delete,
+                },
+            );
+
+            let mut trx = stmt.succeed();
+            assert!(!trx.readonly());
+            assert!(trx.require_durability());
+            assert!(trx.require_ordered_commit());
+            assert_eq!(trx.effects.row_undo.len(), 1);
+            assert_eq!(trx.effects.index_undo.len(), 1);
+            assert!(!trx.effects.redo.is_empty());
+
+            trx.discard_after_fatal_rollback();
+        });
+    }
+
+    #[test]
+    fn test_transaction_effect_predicates_split_durability_from_ordering() {
+        smol::block_on(async {
+            let (_temp_dir, engine) = test_engine("redo_trx_effect_predicates").await;
+
+            let session_state = Arc::new(SessionState::new(engine.new_ref().unwrap()));
+            let mut trx = ActiveTrx::new(session_state, MIN_ACTIVE_TRX_ID + 46, 46, 0, 0);
+            trx.extend_gc_row_pages(vec![PageID::new(46)]);
+            assert!(!trx.require_durability());
+            assert!(trx.require_ordered_commit());
+            let mut prepared = trx.prepare();
+            assert!(prepared.redo_bin.is_none());
+            assert!(!prepared.require_durability());
+            assert!(prepared.require_ordered_commit());
+            prepared.payload.take();
+            prepared.session.take();
+
+            let session_state = Arc::new(SessionState::new(engine.new_ref().unwrap()));
+            let mut trx = ActiveTrx::new(session_state, MIN_ACTIVE_TRX_ID + 47, 47, 0, 0);
+            trx.index_undo_mut().push(IndexUndo {
+                table_id: 47,
+                row_id: 1,
+                kind: IndexUndoKind::DeferDelete(SelectKey::new(0, vec![]), true),
+            });
+            assert!(!trx.require_durability());
+            assert!(trx.require_ordered_commit());
+            let mut prepared = trx.prepare();
+            assert!(prepared.redo_bin.is_none());
+            assert!(!prepared.require_durability());
+            assert!(prepared.require_ordered_commit());
+            prepared.payload.take();
+            prepared.session.take();
+
+            let session_state = Arc::new(SessionState::new(engine.new_ref().unwrap()));
+            let mut trx = ActiveTrx::new(session_state, MIN_ACTIVE_TRX_ID + 48, 48, 0, 0);
+            trx.add_pseudo_redo_log_entry();
+            assert!(trx.require_durability());
+            assert!(trx.require_ordered_commit());
+            let mut prepared = trx.prepare();
+            assert!(prepared.redo_bin.is_some());
+            assert!(prepared.require_durability());
+            assert!(prepared.require_ordered_commit());
+            prepared.redo_bin.take();
+            prepared.payload.take();
+            prepared.session.take();
+        });
+    }
+
+    #[test]
     fn test_old_table_root_moves_to_committed_payload_and_releases_explicitly() {
         smol::block_on(async {
             let (_temp_dir, engine) = test_engine("redo_old_root_payload").await;
@@ -719,12 +1272,15 @@ mod tests {
             assert!(!trx.readonly());
 
             let prepared = trx.prepare();
-            assert!(prepared.redo_bin.is_some());
+            assert!(prepared.redo_bin.is_none());
+            assert!(!prepared.require_durability());
+            assert!(prepared.require_ordered_commit());
             assert!(prepared.payload.as_ref().unwrap().old_table_root.is_some());
 
-            let mut precommit = prepared.fill_cts(20);
+            let precommit = prepared.fill_cts(20);
+            assert!(!precommit.require_durability());
+            assert!(precommit.require_ordered_commit());
             assert!(precommit.payload.as_ref().unwrap().old_table_root.is_some());
-            precommit.redo_bin.take();
 
             let mut committed = precommit.commit();
             assert_eq!(old_root_drop_count(old_root_ptr), drop_count_before);
@@ -732,6 +1288,37 @@ mod tests {
 
             committed.release_old_table_root();
             assert_eq!(old_root_drop_count(old_root_ptr), drop_count_before + 1);
+        });
+    }
+
+    #[test]
+    fn test_effects_only_commit_uses_ordered_barrier_without_log_bytes() {
+        smol::block_on(async {
+            let (_temp_dir, engine) = test_engine("redo_effects_only_ordered_commit").await;
+            let (_old_root_ptr, old_root) = swapped_old_root(&engine, 91_006).await;
+            let stats_before = engine.trx_sys.trx_sys_stats();
+
+            let mut session = engine.try_new_session().unwrap();
+            let mut trx = session.try_begin_trx().unwrap().unwrap();
+            trx.retain_old_table_root(old_root).unwrap();
+            assert!(!trx.require_durability());
+            assert!(trx.require_ordered_commit());
+
+            let cts = trx.commit().await.unwrap();
+            assert!(cts >= MIN_SNAPSHOT_TS);
+            assert!(!session.in_trx());
+
+            for _ in 0..100 {
+                let stats_after = engine.trx_sys.trx_sys_stats();
+                if stats_after.commit_count > stats_before.commit_count {
+                    assert_eq!(stats_after.log_bytes, stats_before.log_bytes);
+                    assert_eq!(stats_after.sync_count, stats_before.sync_count);
+                    assert!(stats_after.trx_count > stats_before.trx_count);
+                    return;
+                }
+                smol::Timer::after(std::time::Duration::from_millis(10)).await;
+            }
+            panic!("effects-only commit stats were not updated before timeout");
         });
     }
 
