@@ -1084,8 +1084,8 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
             row_id,
             kind: RowRedoKind::Insert(cols),
         };
-        // store redo log into transaction redo buffer.
-        stmt.redo.insert_dml(self.table_id(), redo_entry);
+        // Store redo in the statement buffer until the statement succeeds.
+        stmt.insert_row_redo(self.table_id(), redo_entry);
         InsertRowIntoPage::Ok(row_id, page_guard)
     }
 
@@ -1167,7 +1167,7 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
                             // use DELETE for redo is ok, no version chain should be maintained if recovering from redo.
                             kind: RowRedoKind::Delete,
                         };
-                        stmt.redo.insert_dml(self.table_id(), redo_entry);
+                        stmt.insert_row_redo(self.table_id(), redo_entry);
                         UpdateRowInplace::NoFreeSpace(row_id, old_row, update, page_guard)
                     }
                     UpdateRow::Ok(mut row) => {
@@ -1219,7 +1219,7 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
                                 row_id,
                                 kind: RowRedoKind::Update(redo_cols),
                             };
-                            stmt.redo.insert_dml(self.table_id(), redo_entry);
+                            stmt.insert_row_redo(self.table_id(), redo_entry);
                         }
                         UpdateRowInplace::Ok(row_id, index_change_cols, page_guard)
                     }
@@ -1500,7 +1500,7 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
                         RowRedoKind::Delete
                     },
                 };
-                stmt.redo.insert_dml(self.table_id(), redo_entry);
+                stmt.insert_row_redo(self.table_id(), redo_entry);
                 DeleteInternal::Ok(page_guard)
             }
         }
@@ -3041,13 +3041,13 @@ impl<D: BufferPool, I: BufferPool> TableAccess for TableAccessor<'_, D, I> {
                         // INVALID_PAGE_ID so recovery replays the delete into
                         // the deletion buffer when it is newer than the
                         // deletion checkpoint cutoff.
-                        stmt.row_undo.push(OwnedRowUndo::new(
+                        stmt.push_row_undo(OwnedRowUndo::new(
                             self.table_id(),
                             None,
                             row_id,
                             RowUndoKind::Delete,
                         ));
-                        stmt.redo.insert_dml(
+                        stmt.insert_row_redo(
                             self.table_id(),
                             RowRedo {
                                 page_id: INVALID_PAGE_ID,
@@ -3227,16 +3227,17 @@ impl<D: BufferPool, I: BufferPool> TableAccess for TableAccessor<'_, D, I> {
                         let deletion_buffer = self.lwc_deletion_buffer()?;
                         match deletion_buffer.put_ref(row_id, stmt.trx.status(), stmt.trx.sts()) {
                             Ok(()) => {
-                                // The marker is the transaction-owned delete
-                                // state. Row undo removes it on rollback; redo
-                                // rebuilds it as a cold delete during recovery.
+                                // The marker is statement-owned delete state
+                                // until success. Row undo removes it on
+                                // rollback; redo rebuilds it as a cold delete
+                                // during recovery.
                                 let undo = OwnedRowUndo::new(
                                     self.table_id(),
                                     None,
                                     row_id,
                                     RowUndoKind::Delete,
                                 );
-                                stmt.row_undo.push(undo);
+                                stmt.push_row_undo(undo);
                                 let redo_kind = if log_by_key {
                                     RowRedoKind::DeleteByUniqueKey(key.clone())
                                 } else {
@@ -3247,7 +3248,7 @@ impl<D: BufferPool, I: BufferPool> TableAccess for TableAccessor<'_, D, I> {
                                     row_id,
                                     kind: redo_kind,
                                 };
-                                stmt.redo.insert_dml(self.table_id(), redo);
+                                stmt.insert_row_redo(self.table_id(), redo);
                                 // Mask old index entries immediately; physical
                                 // deletion remains deferred to index GC.
                                 self.defer_delete_index_keys(stmt, row_id, index_keys)

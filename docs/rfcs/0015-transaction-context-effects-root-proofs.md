@@ -620,8 +620,8 @@ References:
     convenience methods and statement lifecycle.
   - Non-goals: Do not require a borrowed `Statement<'trx>` ownership model; do
     not seal compatibility accessors yet.
-  - Task Doc: `docs/tasks/TBD.md`
-  - Task Issue: `#0`
+  - Task Doc: `docs/tasks/000129-statement-effects-split.md`
+  - Task Issue: `#582`
   - Phase Status: `pending`
   - Implementation Summary: `pending`
   - Related Backlogs:
