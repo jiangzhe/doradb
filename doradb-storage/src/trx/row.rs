@@ -750,11 +750,11 @@ impl<'a> RowWriteAccess<'a> {
             None => {
                 // No undo head exists yet, so this transaction becomes the
                 // first writer for the hot row. The `Lock` entry is pushed to
-                // transaction-owned row undo before the actual row-page change
-                // is made.
+                // statement-owned row undo before the actual row-page change is
+                // made.
                 let entry = OwnedRowUndo::new(table_id, Some(page_id), row_id, RowUndoKind::Lock);
                 self.add_undo_head(stmt.trx.status(), entry.leak());
-                stmt.row_undo.push(entry);
+                stmt.push_row_undo(entry);
                 LockUndo::Ok
             }
             Some(undo_head) => {
@@ -770,7 +770,7 @@ impl<'a> RowWriteAccess<'a> {
                     });
                     let old_next = mem::replace(&mut undo_head.next, new_next);
                     entry.next = Some(old_next);
-                    stmt.row_undo.push(entry);
+                    stmt.push_row_undo(entry);
                     return LockUndo::Ok;
                 }
                 let old_cts = undo_head.ts();
@@ -835,7 +835,7 @@ impl<'a> RowWriteAccess<'a> {
                     });
                     let old_next = mem::replace(&mut undo_head.next, new_next);
                     entry.next = Some(old_next);
-                    stmt.row_undo.push(entry);
+                    stmt.push_row_undo(entry);
                     return LockUndo::Ok;
                 }
                 // Another active transaction owns the hot-row lock. If it is

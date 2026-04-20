@@ -225,23 +225,23 @@ impl TrxContext {
     /// Loads the cached active insert page from the attached session.
     #[inline]
     pub(crate) fn load_active_insert_page(
-        &mut self,
+        &self,
         table_id: TableID,
     ) -> Option<(VersionedPageID, RowID)> {
         self.session
-            .as_mut()
+            .as_ref()
             .and_then(|session| session.load_active_insert_page(table_id))
     }
 
     /// Saves the cached active insert page into the attached session.
     #[inline]
     pub(crate) fn save_active_insert_page(
-        &mut self,
+        &self,
         table_id: TableID,
         page_id: VersionedPageID,
         row_id: RowID,
     ) {
-        if let Some(session) = self.session.as_mut() {
+        if let Some(session) = self.session.as_ref() {
             session.save_active_insert_page(table_id, page_id, row_id);
         }
     }
@@ -581,7 +581,7 @@ impl ActiveTrx {
     /// Loads the cached active insert page from the attached session.
     #[inline]
     pub(crate) fn load_active_insert_page(
-        &mut self,
+        &self,
         table_id: TableID,
     ) -> Option<(VersionedPageID, RowID)> {
         self.ctx.load_active_insert_page(table_id)
@@ -590,7 +590,7 @@ impl ActiveTrx {
     /// Saves the cached active insert page into the attached session.
     #[inline]
     pub(crate) fn save_active_insert_page(
-        &mut self,
+        &self,
         table_id: TableID,
         page_id: VersionedPageID,
         row_id: RowID,
@@ -1183,14 +1183,9 @@ mod tests {
             let session_state = Arc::new(SessionState::new(engine.new_ref().unwrap()));
             let trx = ActiveTrx::new(session_state, MIN_ACTIVE_TRX_ID + 45, 45, 0, 0);
             let mut stmt = Statement::new(trx);
-            stmt.row_undo
-                .push(OwnedRowUndo::new(12, None, 23, RowUndoKind::Delete));
-            stmt.index_undo.push(IndexUndo {
-                table_id: 12,
-                row_id: 23,
-                kind: IndexUndoKind::DeferDelete(SelectKey::new(0, vec![]), true),
-            });
-            stmt.redo.insert_dml(
+            stmt.push_row_undo(OwnedRowUndo::new(12, None, 23, RowUndoKind::Delete));
+            stmt.push_delete_index_undo(12, 23, SelectKey::new(0, vec![]), true);
+            stmt.insert_row_redo(
                 12,
                 RowRedo {
                     page_id: PageID::new(0),
