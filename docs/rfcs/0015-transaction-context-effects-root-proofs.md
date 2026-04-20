@@ -622,8 +622,8 @@ References:
     not seal compatibility accessors yet.
   - Task Doc: `docs/tasks/000129-statement-effects-split.md`
   - Task Issue: `#582`
-  - Phase Status: `pending`
-  - Implementation Summary: `pending`
+  - Phase Status: done
+  - Implementation Summary: Phase 3 implemented: Statement now owns StmtEffects for statement-local row undo, index undo, and redo; success merges effects into ActiveTrx and failure rolls them back or discards redo; direct statement effect field access in table, row, and session paths was replaced with compatibility helpers; Statement exposes context and effect accessors for Phase 4; validation passed with cargo build, full nextest, targeted checkpoint stress, focused coverage, and git diff check. [Task Resolve Sync: docs/tasks/000129-statement-effects-split.md @ 2026-04-20]
   - Related Backlogs:
     - `docs/backlogs/closed/000093-transaction-context-effects-split-active-root-proofs.md`
 

@@ -1,7 +1,7 @@
 ---
 id: 000129
 title: Statement Effects Split
-status: proposal
+status: implemented
 created: 2026-04-20
 github_issue: 582
 ---
@@ -192,6 +192,51 @@ Reference:
 
 ## Implementation Notes
 
+Implemented in PR #583.
+
+`doradb-storage/src/stmt/mod.rs` now defines crate-private `StmtEffects` as the
+owner of statement-local row undo, index undo, and redo effects. `Statement`
+now owns `trx: ActiveTrx` plus private `effects: StmtEffects`; successful
+statements merge the accumulated effects into the active transaction, while
+failed statements delegate row/index rollback and redo discard through the
+effect accumulator.
+
+The implementation preserved the existing statement convenience surface and
+added the Phase 4 borrow-preparation accessors:
+
+- `Statement::ctx()` for immutable transaction context access.
+- `Statement::effects_mut()` for mutable statement-effect access.
+- Compatibility wrappers for row undo, index undo, redo mutation, active insert
+  page cache access, and row read/write helpers.
+
+`TrxContext` and `ActiveTrx` active-insert-page cache helpers now take `&self`
+where possible because the session cache is already protected by interior
+locking. Direct statement effect-field access in `table/access.rs`,
+`trx/row.rs`, and DDL redo construction in `session.rs` was replaced with the
+new statement/effect helper surface. Transaction tests were updated to assert
+statement-effect merging through the new wrappers.
+
+Checklist follow-up fixed the missing rustdoc on `Statement` and its public
+methods. The one observed checklist failure in
+`test_secondary_sidecar_failure_keeps_checkpoint_root_atomic` was investigated:
+the failed checkpoint happened during setup before the secondary-sidecar error
+hook was enabled, and the returned delay was the normal checkpoint readiness
+guard with `root_cts=3` and `min_active_sts=2`. The failure did not reproduce
+in isolated, stress, checkpoint-focused, or full-suite reruns, so no
+task-scope code change was made for that test.
+
+Validation completed:
+
+- `cargo fmt`
+- `cargo build -p doradb-storage`
+- `cargo nextest run -p doradb-storage`
+- `cargo nextest run -p doradb-storage table::tests::test_secondary_sidecar_failure_keeps_checkpoint_root_atomic --stress-count 50`
+- `cargo nextest run -p doradb-storage checkpoint --stress-count 3`
+- `tools/coverage_focus.rs --path doradb-storage/src/stmt` passed at 96.91%.
+- `tools/coverage_focus.rs --path doradb-storage/src/trx` passed at 94.58%.
+- `tools/coverage_focus.rs --path doradb-storage/src/table` passed at 90.73%.
+- `git diff --check`
+
 ## Impacts
 
 - `doradb-storage/src/stmt/mod.rs`: defines `StmtEffects`, changes `Statement`
@@ -234,10 +279,8 @@ Reference:
 
 ## Open Questions
 
-- Should `StmtEffects` become `pub(crate)` immediately for Phase 4, or stay
-  private behind `Statement` wrappers until the Phase 4 migration needs direct
-  imports? Default: keep visibility narrow unless implementation requires
-  wider access.
-- Should Phase 4 use a dedicated adapter for `(&TrxContext, &mut StmtEffects)`,
-  or pass the two references separately? Default: defer until the `TableAccess`
-  migration proves whether an adapter reduces call-site complexity.
+- Resolved: `StmtEffects` is `pub(crate)` so Phase 4 can import it directly
+  while `Statement` still hides the field behind focused accessors.
+- Deferred to Phase 4: decide whether `TableAccess` should pass
+  `(&TrxContext, &mut StmtEffects)` separately or introduce a dedicated adapter
+  after the migration shows the actual call-site shape.
