@@ -44,6 +44,7 @@ use crate::value::Val;
 use event_listener::{Event, EventListener};
 use flume::{Receiver, Sender};
 use parking_lot::Mutex;
+use std::marker::PhantomData;
 use std::mem;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -135,6 +136,15 @@ pub fn trx_must_not_see_even_if_prepare(sts: TrxID, ts: TrxID) -> bool {
     sts < (ts & SNAPSHOT_TS_MASK)
 }
 
+/// Proof that a runtime read is bound to a live transaction context.
+///
+/// The proof carries only the transaction-context lifetime. Callers cannot
+/// construct it directly, and table runtime code uses it to gate active-root
+/// binding without borrowing mutable transaction or statement effects.
+pub struct TrxReadProof<'ctx> {
+    _ctx: PhantomData<&'ctx TrxContext>,
+}
+
 /// Immutable transaction identity and runtime handles.
 pub struct TrxContext {
     session: Option<Arc<SessionState>>,
@@ -212,6 +222,12 @@ impl TrxContext {
     #[inline]
     pub(crate) fn gc_no(&self) -> usize {
         self.gc_no
+    }
+
+    /// Mint a proof for runtime reads tied to this transaction context.
+    #[inline]
+    pub fn read_proof(&self) -> TrxReadProof<'_> {
+        TrxReadProof { _ctx: PhantomData }
     }
 
     /// Marks the shared transaction status as preparing.

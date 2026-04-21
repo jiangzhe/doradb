@@ -39,11 +39,13 @@ checkpointed cold entries into `MemIndex`.
 
 The cleanup pass captures:
 
-- table checkpoint timestamp
-- `pivot_row_id`
-- `ColumnBlockIndex` root
-- secondary `DiskTree` roots
-- deletion checkpoint cutoff
+- a `TrxReadProof<'ctx>` from the cleanup transaction context
+- one proof-gated `TableRootSnapshot<'ctx>` containing:
+  - table checkpoint timestamp
+  - `pivot_row_id`
+  - `ColumnBlockIndex` root
+  - secondary `DiskTree` roots
+  - deletion checkpoint cutoff
 - caller-supplied `Global_Min_STS`
 
 The scanner inspects each leaf slot's row id and delete state before copying

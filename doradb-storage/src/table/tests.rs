@@ -1,4 +1,3 @@
-use super::gc::SecondaryMemIndexCleanupOptions;
 use super::{DeleteInternal, FrozenPage, InsertRowIntoPage, UpdateRowInplace};
 use crate::buffer::BufferPool;
 use crate::buffer::frame::FrameKind;
@@ -1629,6 +1628,60 @@ fn test_checkpoint_publishes_unique_secondary_disk_tree_root() {
 }
 
 #[test]
+fn test_trx_read_proof_root_snapshot_captures_active_root() {
+    smol::block_on(async {
+        let sys = TestSys::new_evictable().await;
+        let mut session = sys.try_new_session().unwrap();
+
+        let mut trx = session.try_begin_trx().unwrap().unwrap();
+        for id in 0..8 {
+            trx = sys
+                .trx_insert(
+                    trx,
+                    vec![Val::from(id), Val::from(format!("v{id}").as_str())],
+                )
+                .await;
+        }
+        trx.commit().await.unwrap();
+        checkpoint_published(&sys.table, &mut session).await;
+
+        let trx = session.try_begin_trx().unwrap().unwrap();
+        let mut stmt = trx.start_stmt();
+        {
+            let (ctx, effects) = stmt.ctx_and_effects_mut();
+            let proof = ctx.read_proof();
+            let snapshot = sys.table.root_snapshot(&proof).unwrap();
+            let _effects_addr = effects as *mut _;
+            sys.table.with_active_root(&proof, |active_root| {
+                assert_eq!(snapshot.root_trx_id(), active_root.trx_id);
+                assert_eq!(snapshot.pivot_row_id(), active_root.pivot_row_id);
+                assert_eq!(
+                    snapshot.column_block_index_root(),
+                    active_root.column_block_index_root
+                );
+                assert_eq!(
+                    snapshot.deletion_cutoff_ts(),
+                    active_root.deletion_cutoff_ts
+                );
+                assert_eq!(
+                    snapshot.secondary_index_root(0).unwrap(),
+                    active_root.secondary_index_roots[0]
+                );
+                assert_eq!(
+                    snapshot.root_is_visible_to(ctx.sts()),
+                    active_root.trx_id < ctx.sts()
+                );
+            });
+        }
+        let trx = stmt.succeed();
+        trx.rollback().await.unwrap();
+
+        drop(session);
+        sys.clean_all();
+    });
+}
+
+#[test]
 fn test_checkpoint_publishes_non_unique_secondary_disk_tree_entries_across_lwc_splits() {
     smol::block_on(async {
         let sys = TestSys::new_evictable_with_non_unique_name_index().await;
@@ -1690,18 +1743,9 @@ fn test_secondary_mem_index_cleanup_removes_redundant_live_unique_entries() {
         checkpoint_published(&sys.table, &mut session).await;
 
         let index = sys.table.sec_idx()[0].unique().unwrap();
-        assert_eq!(
-            index
-                .scan_mem_entries(session.pool_guards().index_guard())
-                .await
-                .unwrap()
-                .len(),
-            row_count as usize
-        );
-
         let stats = sys
             .table
-            .cleanup_secondary_mem_indexes(&mut session)
+            .cleanup_secondary_mem_indexes(&mut session, true)
             .await
             .unwrap();
         assert!(!session.in_trx());
@@ -1713,13 +1757,6 @@ fn test_secondary_mem_index_cleanup_removes_redundant_live_unique_entries() {
         assert_eq!(stats.indexes[0].retained, 0);
         assert_eq!(stats.indexes[0].skipped_live, 0);
         assert_eq!(stats.indexes[0].skipped_hot_deleted, 0);
-        assert!(
-            index
-                .scan_mem_entries(session.pool_guards().index_guard())
-                .await
-                .unwrap()
-                .is_empty()
-        );
 
         for key_value in 0..row_count {
             let key = single_key(key_value);
@@ -1753,7 +1790,7 @@ fn test_secondary_mem_index_cleanup_requires_idle_session() {
 
         let err = sys
             .table
-            .cleanup_secondary_mem_indexes(&mut session)
+            .cleanup_secondary_mem_indexes(&mut session, true)
             .await
             .unwrap_err();
         assert!(matches!(
@@ -1781,18 +1818,9 @@ fn test_secondary_mem_index_cleanup_removes_redundant_live_non_unique_entries() 
         checkpoint_published(&sys.table, &mut session).await;
 
         let index = sys.table.sec_idx()[1].non_unique().unwrap();
-        assert_eq!(
-            index
-                .scan_mem_entries(session.pool_guards().index_guard())
-                .await
-                .unwrap()
-                .len(),
-            row_count as usize
-        );
-
         let stats = sys
             .table
-            .cleanup_secondary_mem_indexes(&mut session)
+            .cleanup_secondary_mem_indexes(&mut session, true)
             .await
             .unwrap();
         assert_eq!(stats.indexes.len(), 2);
@@ -1803,13 +1831,6 @@ fn test_secondary_mem_index_cleanup_removes_redundant_live_non_unique_entries() 
         assert_eq!(stats.indexes[1].retained, 0);
         assert_eq!(stats.indexes[1].skipped_live, 0);
         assert_eq!(stats.indexes[1].skipped_hot_deleted, 0);
-        assert!(
-            index
-                .scan_mem_entries(session.pool_guards().index_guard())
-                .await
-                .unwrap()
-                .is_empty()
-        );
 
         let key = name_key("same-name");
         let disk_rows =
@@ -1843,19 +1864,9 @@ fn test_secondary_mem_index_cleanup_aggregates_bounded_batches() {
         sys.table.freeze(&session, usize::MAX).await;
         checkpoint_published(&sys.table, &mut session).await;
 
-        let index = sys.table.sec_idx()[1].non_unique().unwrap();
-        assert_eq!(
-            index
-                .scan_mem_entries(session.pool_guards().index_guard())
-                .await
-                .unwrap()
-                .len(),
-            row_count as usize
-        );
-
         let stats = sys
             .table
-            .cleanup_secondary_mem_indexes(&mut session)
+            .cleanup_secondary_mem_indexes(&mut session, true)
             .await
             .unwrap();
         assert_eq!(stats.indexes[1].scanned, row_count as usize);
@@ -1863,13 +1874,6 @@ fn test_secondary_mem_index_cleanup_aggregates_bounded_batches() {
         assert_eq!(stats.indexes[1].retained, 0);
         assert_eq!(stats.indexes[1].skipped_live, 0);
         assert_eq!(stats.indexes[1].skipped_hot_deleted, 0);
-        assert!(
-            index
-                .scan_mem_entries(session.pool_guards().index_guard())
-                .await
-                .unwrap()
-                .is_empty()
-        );
 
         drop(session);
         sys.clean_all();
@@ -1888,29 +1892,9 @@ fn test_secondary_mem_index_cleanup_can_retain_live_cache_entries() {
 
         let unique_index = sys.table.sec_idx()[0].unique().unwrap();
         let non_unique_index = sys.table.sec_idx()[1].non_unique().unwrap();
-        assert_eq!(
-            unique_index
-                .scan_mem_entries(session.pool_guards().index_guard())
-                .await
-                .unwrap()
-                .len(),
-            row_count as usize
-        );
-        assert_eq!(
-            non_unique_index
-                .scan_mem_entries(session.pool_guards().index_guard())
-                .await
-                .unwrap()
-                .len(),
-            row_count as usize
-        );
-
         let stats = sys
             .table
-            .cleanup_secondary_mem_indexes_with_options(
-                &mut session,
-                SecondaryMemIndexCleanupOptions::default().retain_live_entries(),
-            )
+            .cleanup_secondary_mem_indexes(&mut session, false)
             .await
             .unwrap();
         assert_eq!(stats.indexes.len(), 2);
@@ -1921,22 +1905,37 @@ fn test_secondary_mem_index_cleanup_can_retain_live_cache_entries() {
             assert_eq!(index_stats.skipped_live, row_count as usize);
             assert_eq!(index_stats.skipped_hot_deleted, 0);
         }
+
+        let unique_key = single_key(0i32);
+        let unique_row_id = unique_disk_tree_lookup(&sys.table, session.pool_guards(), &unique_key)
+            .await
+            .unwrap();
         assert_eq!(
             unique_index
-                .scan_mem_entries(session.pool_guards().index_guard())
+                .lookup(
+                    session.pool_guards().index_guard(),
+                    &unique_key.vals,
+                    MAX_SNAPSHOT_TS,
+                )
                 .await
-                .unwrap()
-                .len(),
-            row_count as usize
+                .unwrap(),
+            Some((unique_row_id, false))
         );
-        assert_eq!(
-            non_unique_index
-                .scan_mem_entries(session.pool_guards().index_guard())
-                .await
-                .unwrap()
-                .len(),
-            row_count as usize
-        );
+
+        let name_key = name_key("same-name");
+        let disk_rows =
+            non_unique_disk_tree_prefix_scan(&sys.table, session.pool_guards(), &name_key).await;
+        let mut lookup_rows = Vec::new();
+        non_unique_index
+            .lookup(
+                session.pool_guards().index_guard(),
+                &name_key.vals,
+                &mut lookup_rows,
+                MAX_SNAPSHOT_TS,
+            )
+            .await
+            .unwrap();
+        assert_eq!(lookup_rows, disk_rows);
 
         drop(session);
         sys.clean_all();
@@ -1990,7 +1989,7 @@ fn test_secondary_mem_index_cleanup_retains_unique_delete_shadow_without_delete_
 
         let stats = sys
             .table
-            .cleanup_secondary_mem_indexes(&mut session)
+            .cleanup_secondary_mem_indexes(&mut session, true)
             .await
             .unwrap();
         assert_eq!(stats.indexes[0].scanned, 0);
@@ -2072,7 +2071,7 @@ fn test_secondary_mem_index_cleanup_removes_unique_delete_shadow_with_purgeable_
 
         let stats = sys
             .table
-            .cleanup_secondary_mem_indexes(&mut session)
+            .cleanup_secondary_mem_indexes(&mut session, true)
             .await
             .unwrap();
         assert_eq!(stats.indexes[0].scanned, 2);
@@ -2143,10 +2142,7 @@ fn test_secondary_mem_index_cleanup_removes_delete_shadow_when_live_cleanup_disa
 
         let stats = sys
             .table
-            .cleanup_secondary_mem_indexes_with_options(
-                &mut session,
-                SecondaryMemIndexCleanupOptions::default().retain_live_entries(),
-            )
+            .cleanup_secondary_mem_indexes(&mut session, false)
             .await
             .unwrap();
         assert_eq!(stats.indexes[0].scanned, 1);
@@ -2210,7 +2206,7 @@ fn test_secondary_mem_index_cleanup_removes_unique_delete_shadow_with_matching_c
 
         let stats = sys
             .table
-            .cleanup_secondary_mem_indexes(&mut session)
+            .cleanup_secondary_mem_indexes(&mut session, true)
             .await
             .unwrap();
         assert_eq!(stats.indexes[0].scanned, 1);
@@ -2218,12 +2214,17 @@ fn test_secondary_mem_index_cleanup_removes_unique_delete_shadow_with_matching_c
         assert_eq!(stats.indexes[0].retained, 1);
         assert_eq!(stats.indexes[0].skipped_live, 0);
         assert_eq!(stats.indexes[0].skipped_hot_deleted, 0);
-        let entries = index
-            .scan_mem_entries(session.pool_guards().index_guard())
-            .await
-            .unwrap();
-        assert_eq!(entries.len(), 1);
-        assert!(entries[0].deleted);
+        assert_eq!(
+            index
+                .lookup(
+                    session.pool_guards().index_guard(),
+                    &current_key.vals,
+                    MAX_SNAPSHOT_TS,
+                )
+                .await
+                .unwrap(),
+            Some((row_id, true))
+        );
 
         sys.table
             .deletion_buffer()
@@ -2231,7 +2232,7 @@ fn test_secondary_mem_index_cleanup_removes_unique_delete_shadow_with_matching_c
             .unwrap();
         let stats = sys
             .table
-            .cleanup_secondary_mem_indexes(&mut session)
+            .cleanup_secondary_mem_indexes(&mut session, true)
             .await
             .unwrap();
         assert_eq!(stats.indexes[0].scanned, 1);
@@ -2239,12 +2240,16 @@ fn test_secondary_mem_index_cleanup_removes_unique_delete_shadow_with_matching_c
         assert_eq!(stats.indexes[0].retained, 0);
         assert_eq!(stats.indexes[0].skipped_live, 0);
         assert_eq!(stats.indexes[0].skipped_hot_deleted, 0);
-        assert!(
+        assert_eq!(
             index
-                .scan_mem_entries(session.pool_guards().index_guard())
+                .lookup(
+                    session.pool_guards().index_guard(),
+                    &current_key.vals,
+                    MAX_SNAPSHOT_TS,
+                )
                 .await
-                .unwrap()
-                .is_empty()
+                .unwrap(),
+            Some((row_id, false))
         );
 
         drop(session);
@@ -2320,7 +2325,7 @@ fn test_secondary_mem_index_cleanup_removes_unique_delete_shadow_when_cold_row_k
 
         let stats = sys
             .table
-            .cleanup_secondary_mem_indexes(&mut session)
+            .cleanup_secondary_mem_indexes(&mut session, true)
             .await
             .unwrap();
         assert_eq!(stats.indexes[0].scanned, 2);
@@ -2328,13 +2333,6 @@ fn test_secondary_mem_index_cleanup_removes_unique_delete_shadow_when_cold_row_k
         assert_eq!(stats.indexes[0].retained, 0);
         assert_eq!(stats.indexes[0].skipped_live, 0);
         assert_eq!(stats.indexes[0].skipped_hot_deleted, 0);
-        assert!(
-            index
-                .scan_mem_entries(session.pool_guards().index_guard())
-                .await
-                .unwrap()
-                .is_empty()
-        );
         assert_eq!(
             index
                 .lookup(
@@ -2429,7 +2427,7 @@ fn test_secondary_mem_index_cleanup_propagates_cold_delete_overlay_proof_error()
 
         let err = sys
             .table
-            .cleanup_secondary_mem_indexes(&mut session)
+            .cleanup_secondary_mem_indexes(&mut session, true)
             .await
             .unwrap_err();
         match err {
@@ -2509,7 +2507,7 @@ fn test_secondary_mem_index_cleanup_retains_non_unique_delete_mark_without_delet
 
         let stats = sys
             .table
-            .cleanup_secondary_mem_indexes(&mut session)
+            .cleanup_secondary_mem_indexes(&mut session, true)
             .await
             .unwrap();
         assert_eq!(stats.indexes[1].scanned, 0);
@@ -2583,7 +2581,7 @@ fn test_secondary_mem_index_cleanup_removes_non_unique_delete_mark_with_purgeabl
 
         let stats = sys
             .table
-            .cleanup_secondary_mem_indexes(&mut session)
+            .cleanup_secondary_mem_indexes(&mut session, true)
             .await
             .unwrap();
         assert_eq!(stats.indexes[1].scanned, 2);
@@ -2640,7 +2638,7 @@ fn test_secondary_mem_index_cleanup_removes_non_unique_delete_mark_with_matching
 
         let stats = sys
             .table
-            .cleanup_secondary_mem_indexes(&mut session)
+            .cleanup_secondary_mem_indexes(&mut session, true)
             .await
             .unwrap();
         assert_eq!(stats.indexes[1].scanned, 1);
@@ -2648,12 +2646,18 @@ fn test_secondary_mem_index_cleanup_removes_non_unique_delete_mark_with_matching
         assert_eq!(stats.indexes[1].retained, 1);
         assert_eq!(stats.indexes[1].skipped_live, 0);
         assert_eq!(stats.indexes[1].skipped_hot_deleted, 0);
-        let entries = index
-            .scan_mem_entries(session.pool_guards().index_guard())
-            .await
-            .unwrap();
-        assert_eq!(entries.len(), 1);
-        assert!(entries[0].deleted);
+        assert_eq!(
+            index
+                .lookup_unique(
+                    session.pool_guards().index_guard(),
+                    &current_key.vals,
+                    row_id,
+                    MAX_SNAPSHOT_TS,
+                )
+                .await
+                .unwrap(),
+            Some(false)
+        );
 
         sys.table
             .deletion_buffer()
@@ -2661,7 +2665,7 @@ fn test_secondary_mem_index_cleanup_removes_non_unique_delete_mark_with_matching
             .unwrap();
         let stats = sys
             .table
-            .cleanup_secondary_mem_indexes(&mut session)
+            .cleanup_secondary_mem_indexes(&mut session, true)
             .await
             .unwrap();
         assert_eq!(stats.indexes[1].scanned, 1);
@@ -2669,12 +2673,17 @@ fn test_secondary_mem_index_cleanup_removes_non_unique_delete_mark_with_matching
         assert_eq!(stats.indexes[1].retained, 0);
         assert_eq!(stats.indexes[1].skipped_live, 0);
         assert_eq!(stats.indexes[1].skipped_hot_deleted, 0);
-        assert!(
+        assert_eq!(
             index
-                .scan_mem_entries(session.pool_guards().index_guard())
+                .lookup_unique(
+                    session.pool_guards().index_guard(),
+                    &current_key.vals,
+                    row_id,
+                    MAX_SNAPSHOT_TS,
+                )
                 .await
-                .unwrap()
-                .is_empty()
+                .unwrap(),
+            Some(true)
         );
 
         drop(session);
@@ -2760,7 +2769,7 @@ fn test_secondary_mem_index_cleanup_removes_non_unique_delete_mark_when_cold_row
 
         let stats = sys
             .table
-            .cleanup_secondary_mem_indexes(&mut session)
+            .cleanup_secondary_mem_indexes(&mut session, true)
             .await
             .unwrap();
         assert_eq!(stats.indexes[1].scanned, 2);
@@ -2768,13 +2777,6 @@ fn test_secondary_mem_index_cleanup_removes_non_unique_delete_mark_when_cold_row
         assert_eq!(stats.indexes[1].retained, 0);
         assert_eq!(stats.indexes[1].skipped_live, 0);
         assert_eq!(stats.indexes[1].skipped_hot_deleted, 0);
-        assert!(
-            index
-                .scan_mem_entries(session.pool_guards().index_guard())
-                .await
-                .unwrap()
-                .is_empty()
-        );
         assert_eq!(
             index
                 .lookup_unique(
