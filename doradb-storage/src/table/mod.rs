@@ -9,6 +9,7 @@ mod tests;
 
 pub use access::*;
 pub use deletion_buffer::*;
+pub use gc::{SecondaryMemIndexCleanupIndexStats, SecondaryMemIndexCleanupStats};
 pub use persistence::*;
 pub use recover::*;
 pub(crate) use rollback::IndexRollback;
@@ -21,7 +22,8 @@ use crate::buffer::{
 };
 use crate::catalog::{IndexSpec, TableID, TableMetadata};
 use crate::error::{Error, Result};
-use crate::file::table_file::{LwcBlockPersist, TableFile};
+use crate::file::BlockID;
+use crate::file::table_file::{ActiveRoot, LwcBlockPersist, TableFile};
 use crate::index::util::{Maskable, RowPageCreateRedoCtx};
 use crate::index::{
     BlockIndex, ColumnBlockEntryShape, InMemorySecondaryIndex, IndexCompareExchange, IndexInsert,
@@ -37,9 +39,12 @@ use crate::trx::row::RowReadAccess;
 use crate::trx::sys::TransactionSystem;
 use crate::trx::undo::{IndexBranch, RowUndoKind, UndoStatus};
 use crate::trx::ver_map::RowPageState;
-use crate::trx::{MAX_SNAPSHOT_TS, MIN_SNAPSHOT_TS, TrxID, trx_is_committed};
+use crate::trx::{
+    MAX_SNAPSHOT_TS, MIN_SNAPSHOT_TS, TrxContext, TrxID, TrxReadProof, trx_is_committed,
+};
 use crate::value::{PAGE_VAR_LEN_INLINE, Val};
 use std::collections::HashMap;
+use std::marker::PhantomData;
 use std::ops::Deref;
 use std::sync::Arc;
 use std::time::Duration;
@@ -101,6 +106,73 @@ pub struct Table {
     pub(crate) mem: GenericMemTable<EvictableBufferPool, EvictableBufferPool>,
     pub(crate) storage: ColumnStorage,
     pub(crate) sec_idx: Box<[SecondaryIndex<EvictableBufferPool>]>,
+}
+
+/// Owned projection of one proof-gated user-table active root.
+///
+/// The snapshot contains only runtime read contract fields copied from a
+/// single active-root observation. Publication and allocation internals remain
+/// behind the table-file boundary.
+pub(crate) struct TableRootSnapshot<'ctx> {
+    root_trx_id: TrxID,
+    pivot_row_id: RowID,
+    column_block_index_root: BlockID,
+    secondary_index_roots: Vec<BlockID>,
+    deletion_cutoff_ts: TrxID,
+    _proof: PhantomData<&'ctx TrxContext>,
+}
+
+impl<'ctx> TableRootSnapshot<'ctx> {
+    #[inline]
+    fn from_active_root(root: &ActiveRoot, _proof: &TrxReadProof<'ctx>) -> Self {
+        Self {
+            root_trx_id: root.trx_id,
+            pivot_row_id: root.pivot_row_id,
+            column_block_index_root: root.column_block_index_root,
+            secondary_index_roots: root.secondary_index_roots.clone(),
+            deletion_cutoff_ts: root.deletion_cutoff_ts,
+            _proof: PhantomData,
+        }
+    }
+
+    /// Returns the checkpoint timestamp carried by the captured root.
+    #[inline]
+    pub(crate) fn root_trx_id(&self) -> TrxID {
+        self.root_trx_id
+    }
+
+    /// Returns the row-id boundary between persisted and in-memory rows.
+    #[inline]
+    pub(crate) fn pivot_row_id(&self) -> RowID {
+        self.pivot_row_id
+    }
+
+    /// Returns the persisted column-block-index root from the captured root.
+    #[inline]
+    pub(crate) fn column_block_index_root(&self) -> BlockID {
+        self.column_block_index_root
+    }
+
+    /// Returns the cold-row deletion replay cutoff from the captured root.
+    #[inline]
+    pub(crate) fn deletion_cutoff_ts(&self) -> TrxID {
+        self.deletion_cutoff_ts
+    }
+
+    /// Returns the captured DiskTree root for one secondary index.
+    #[inline]
+    pub(crate) fn secondary_index_root(&self, index_no: usize) -> Result<BlockID> {
+        self.secondary_index_roots
+            .get(index_no)
+            .copied()
+            .ok_or(Error::InvalidArgument)
+    }
+
+    /// Returns whether the captured root predates the supplied snapshot time.
+    #[inline]
+    pub(crate) fn root_is_visible_to(&self, sts: TrxID) -> bool {
+        self.root_trx_id < sts
+    }
 }
 
 struct FrozenPage {
@@ -606,6 +678,16 @@ impl ColumnStorage {
         &self.file
     }
 
+    /// Bind one active root observation under a transaction read proof.
+    #[inline]
+    pub(crate) fn with_active_root<'ctx, R, F>(&self, _proof: &TrxReadProof<'ctx>, f: F) -> R
+    where
+        F: for<'root> FnOnce(&'root ActiveRoot) -> R,
+    {
+        let root = self.file().active_root();
+        f(root)
+    }
+
     /// Returns the read-only buffer pool used for persisted blocks.
     #[inline]
     pub fn disk_pool(&self) -> &QuiescentGuard<ReadonlyBufferPool> {
@@ -688,6 +770,26 @@ impl Table {
     #[inline]
     pub fn accessor(&self) -> HybridTableAccessor<'_> {
         HybridTableAccessor::from(self)
+    }
+
+    /// Bind one active root observation under a transaction read proof.
+    #[inline]
+    pub(crate) fn with_active_root<'ctx, R, F>(&self, proof: &TrxReadProof<'ctx>, f: F) -> R
+    where
+        F: for<'root> FnOnce(&'root ActiveRoot) -> R,
+    {
+        self.storage.with_active_root(proof, f)
+    }
+
+    /// Capture an owned table-root snapshot for this table.
+    #[inline]
+    pub(crate) fn root_snapshot<'ctx>(
+        &self,
+        proof: &TrxReadProof<'ctx>,
+    ) -> Result<TableRootSnapshot<'ctx>> {
+        Ok(self.with_active_root(proof, |root| {
+            TableRootSnapshot::from_active_root(root, proof)
+        }))
     }
 
     /// Returns the deletion buffer tracking persisted-row tombstones.

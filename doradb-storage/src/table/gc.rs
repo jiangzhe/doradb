@@ -1,7 +1,5 @@
-#![cfg_attr(not(test), allow(dead_code))]
-
-use super::Table;
-use crate::buffer::{EvictableBufferPool, PoolGuard, PoolGuards};
+use super::{Table, TableRootSnapshot};
+use crate::buffer::{BufferPool, EvictableBufferPool, PoolGuard, PoolGuards};
 use crate::error::{BlockCorruptionCause, BlockKind, Error, FileKind, Result};
 use crate::file::BlockID;
 use crate::file::cow_file::SUPER_BLOCK_ID;
@@ -12,83 +10,75 @@ use crate::index::{
 use crate::lwc::PersistedLwcBlock;
 use crate::row::RowID;
 use crate::session::Session;
-use crate::trx::TrxID;
+use crate::trx::{TrxID, TrxReadProof};
 use crate::value::Val;
 
 /// Aggregate result for a full-scan user-table secondary MemIndex cleanup pass.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub(crate) struct SecondaryMemIndexCleanupStats {
+pub struct SecondaryMemIndexCleanupStats {
     /// One row per secondary index scanned by this pass.
-    pub(crate) indexes: Vec<SecondaryMemIndexCleanupIndexStats>,
-}
-
-/// Policy options for user-table secondary MemIndex cleanup.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct SecondaryMemIndexCleanupOptions {
-    clean_live_entries: bool,
-}
-
-impl SecondaryMemIndexCleanupOptions {
-    /// Return options that retain live MemIndex cache entries.
-    #[inline]
-    pub(crate) const fn retain_live_entries(mut self) -> Self {
-        self.clean_live_entries = false;
-        self
-    }
-
-    #[inline]
-    const fn clean_live_entries(self) -> bool {
-        self.clean_live_entries
-    }
-}
-
-impl Default for SecondaryMemIndexCleanupOptions {
-    #[inline]
-    fn default() -> Self {
-        Self {
-            clean_live_entries: true,
-        }
-    }
+    pub indexes: Vec<SecondaryMemIndexCleanupIndexStats>,
 }
 
 /// Cleanup result for one secondary MemIndex.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct SecondaryMemIndexCleanupIndexStats {
+pub struct SecondaryMemIndexCleanupIndexStats {
     /// Table-local secondary-index number.
-    pub(crate) index_no: usize,
+    pub index_no: usize,
     /// Whether the scanned index is unique.
-    pub(crate) unique: bool,
+    pub unique: bool,
     /// Number of MemIndex entries processed as cleanup candidates.
-    pub(crate) scanned: usize,
+    pub scanned: usize,
     /// Number of MemIndex entries physically removed.
-    pub(crate) removed: usize,
+    pub removed: usize,
     /// Number of MemIndex entries intentionally retained.
-    pub(crate) retained: usize,
+    pub retained: usize,
     /// Number of live MemIndex entries skipped before key materialization.
-    pub(crate) skipped_live: usize,
+    pub skipped_live: usize,
     /// Number of hot delete overlays skipped before key materialization.
-    pub(crate) skipped_hot_deleted: usize,
+    pub skipped_hot_deleted: usize,
 }
 
-struct MemIndexCleanupSnapshot {
-    table_root_ts: TrxID,
-    pivot_row_id: RowID,
-    column_block_index_root: BlockID,
-    deletion_cutoff_ts: TrxID,
-    secondary_index_roots: Vec<BlockID>,
+struct MemIndexCleanupSnapshot<'ctx> {
+    root: TableRootSnapshot<'ctx>,
     min_active_sts: TrxID,
 }
 
-impl MemIndexCleanupSnapshot {
+impl MemIndexCleanupSnapshot<'_> {
     #[inline]
     fn is_visible_to(&self, cleanup_sts: TrxID) -> bool {
-        self.table_root_ts < cleanup_sts
+        self.root.root_is_visible_to(cleanup_sts)
+    }
+
+    #[inline]
+    fn root_trx_id(&self) -> TrxID {
+        self.root.root_trx_id()
+    }
+
+    #[inline]
+    fn pivot_row_id(&self) -> RowID {
+        self.root.pivot_row_id()
+    }
+
+    #[inline]
+    fn column_block_index_root(&self) -> BlockID {
+        self.root.column_block_index_root()
+    }
+
+    #[inline]
+    fn deletion_cutoff_ts(&self) -> TrxID {
+        self.root.deletion_cutoff_ts()
+    }
+
+    #[inline]
+    fn secondary_index_root(&self, index_no: usize) -> Result<BlockID> {
+        self.root.secondary_index_root(index_no)
     }
 }
 
-struct MemIndexCleanupContext<'a> {
-    snapshot: &'a MemIndexCleanupSnapshot,
-    options: SecondaryMemIndexCleanupOptions,
+struct MemIndexCleanupContext<'a, 'ctx> {
+    snapshot: &'a MemIndexCleanupSnapshot<'ctx>,
+    clean_live_entries: bool,
     column_index: Option<&'a ColumnBlockIndex<'a>>,
     index_pool_guard: &'a PoolGuard,
     disk_pool_guard: &'a PoolGuard,
@@ -145,22 +135,14 @@ impl Table {
     /// This pass removes only entries proven redundant or obsolete against one
     /// captured table-file root. It never mutates DiskTree state, and it treats
     /// missing delete proof as a retention decision for delete overlays.
-    pub(crate) async fn cleanup_secondary_mem_indexes(
+    ///
+    /// When `clean_live_entries` is `true`, redundant live MemIndex entries are
+    /// removed as part of the pass. When `false`, live MemIndex cache entries
+    /// are retained and only obsolete delete overlays are cleaned.
+    pub async fn cleanup_secondary_mem_indexes(
         &self,
         session: &mut Session,
-    ) -> Result<SecondaryMemIndexCleanupStats> {
-        self.cleanup_secondary_mem_indexes_with_options(
-            session,
-            SecondaryMemIndexCleanupOptions::default(),
-        )
-        .await
-    }
-
-    /// Full-scan cleanup with caller-selected live-entry cleanup policy.
-    pub(crate) async fn cleanup_secondary_mem_indexes_with_options(
-        &self,
-        session: &mut Session,
-        options: SecondaryMemIndexCleanupOptions,
+        clean_live_entries: bool,
     ) -> Result<SecondaryMemIndexCleanupStats> {
         let trx_sys = session.engine().trx_sys.clone();
         loop {
@@ -169,7 +151,8 @@ impl Table {
             ))?;
             let cleanup_sts = trx.sts();
             let min_active_sts = trx_sys.calc_min_active_sts_for_gc();
-            let snapshot = self.capture_mem_index_cleanup_snapshot(min_active_sts);
+            let proof = trx.ctx().read_proof();
+            let snapshot = self.capture_mem_index_cleanup_snapshot(min_active_sts, &proof)?;
             if !snapshot.is_visible_to(cleanup_sts) {
                 trx_sys.rollback(trx).await?;
                 continue;
@@ -179,7 +162,7 @@ impl Table {
                 .cleanup_secondary_mem_indexes_at_snapshot(
                     session.pool_guards(),
                     &snapshot,
-                    options,
+                    clean_live_entries,
                 )
                 .await;
             let rollback_res = trx_sys.rollback(trx).await;
@@ -192,36 +175,32 @@ impl Table {
     }
 
     #[inline]
-    fn capture_mem_index_cleanup_snapshot(&self, min_active_sts: TrxID) -> MemIndexCleanupSnapshot {
-        let active_root = self.file().active_root();
-        // `gc_captured_snapshot`: keep this as an owned field snapshot until
-        // RFC-0015 can replace it with a proof-gated `TableRootSnapshot`.
-        // Cleanup predicates still use the explicit GC horizon below.
-        MemIndexCleanupSnapshot {
-            table_root_ts: active_root.trx_id,
-            pivot_row_id: active_root.pivot_row_id,
-            column_block_index_root: active_root.column_block_index_root,
-            deletion_cutoff_ts: active_root.deletion_cutoff_ts,
-            secondary_index_roots: active_root.secondary_index_roots.clone(),
+    fn capture_mem_index_cleanup_snapshot<'ctx>(
+        &self,
+        min_active_sts: TrxID,
+        proof: &TrxReadProof<'ctx>,
+    ) -> Result<MemIndexCleanupSnapshot<'ctx>> {
+        Ok(MemIndexCleanupSnapshot {
+            root: self.root_snapshot(proof)?,
             min_active_sts,
-        }
+        })
     }
 
     #[inline]
     async fn cleanup_secondary_mem_indexes_at_snapshot(
         &self,
         guards: &PoolGuards,
-        snapshot: &MemIndexCleanupSnapshot,
-        options: SecondaryMemIndexCleanupOptions,
+        snapshot: &MemIndexCleanupSnapshot<'_>,
+        clean_live_entries: bool,
     ) -> Result<SecondaryMemIndexCleanupStats> {
-        debug_assert!(snapshot.deletion_cutoff_ts <= snapshot.table_root_ts);
+        debug_assert!(snapshot.deletion_cutoff_ts() <= snapshot.root_trx_id());
 
         let column_index = self.cleanup_column_index(guards, snapshot);
         let index_pool_guard = self.index_pool_guard(guards);
         let disk_pool_guard = guards.disk_guard();
         let cleanup_context = MemIndexCleanupContext {
             snapshot,
-            options,
+            clean_live_entries,
             column_index: column_index.as_ref(),
             index_pool_guard,
             disk_pool_guard,
@@ -232,11 +211,7 @@ impl Table {
 
         for index in self.sec_idx() {
             let index_no = index.index_no();
-            let secondary_root = snapshot
-                .secondary_index_roots
-                .get(index_no)
-                .copied()
-                .ok_or(Error::InvalidState)?;
+            let secondary_root = snapshot.secondary_index_root(index_no)?;
             let mut index_stats =
                 SecondaryMemIndexCleanupIndexStats::new(index_no, index.is_unique());
             match index {
@@ -270,7 +245,7 @@ impl Table {
     #[inline]
     async fn cleanup_unique_secondary_mem_index(
         &self,
-        cleanup_context: &MemIndexCleanupContext<'_>,
+        cleanup_context: &MemIndexCleanupContext<'_, '_>,
         index_no: usize,
         index: &UniqueSecondaryIndex<EvictableBufferPool>,
         secondary_root: BlockID,
@@ -281,8 +256,8 @@ impl Table {
             .open_unique_at(secondary_root, cleanup_context.disk_pool_guard)?;
         let mut scan = index.cleanup_mem_scan(
             cleanup_context.index_pool_guard,
-            cleanup_context.snapshot.pivot_row_id,
-            cleanup_context.options.clean_live_entries(),
+            cleanup_context.snapshot.pivot_row_id(),
+            cleanup_context.clean_live_entries,
         );
         while let Some(batch) = scan.next_batch().await? {
             stats.record_skipped_live(batch.skipped_live);
@@ -315,8 +290,8 @@ impl Table {
                         CleanupDecision::Retain
                     }
                 } else {
-                    debug_assert!(cleanup_context.options.clean_live_entries());
-                    debug_assert!(entry.row_id < cleanup_context.snapshot.pivot_row_id);
+                    debug_assert!(cleanup_context.clean_live_entries);
+                    debug_assert!(entry.row_id < cleanup_context.snapshot.pivot_row_id());
                     // Live entries need a matching cold mapping before cleanup can
                     // treat the MemIndex copy as redundant.
                     match disk.lookup_encoded(&entry.encoded_key).await {
@@ -342,7 +317,7 @@ impl Table {
     #[inline]
     async fn cleanup_non_unique_secondary_mem_index(
         &self,
-        cleanup_context: &MemIndexCleanupContext<'_>,
+        cleanup_context: &MemIndexCleanupContext<'_, '_>,
         index_no: usize,
         index: &NonUniqueSecondaryIndex<EvictableBufferPool>,
         secondary_root: BlockID,
@@ -353,8 +328,8 @@ impl Table {
             .open_non_unique_at(secondary_root, cleanup_context.disk_pool_guard)?;
         let mut scan = index.cleanup_mem_scan(
             cleanup_context.index_pool_guard,
-            cleanup_context.snapshot.pivot_row_id,
-            cleanup_context.options.clean_live_entries(),
+            cleanup_context.snapshot.pivot_row_id(),
+            cleanup_context.clean_live_entries,
         );
         while let Some(batch) = scan.next_batch().await? {
             stats.record_skipped_live(batch.skipped_live);
@@ -386,8 +361,8 @@ impl Table {
                         CleanupDecision::Retain
                     }
                 } else {
-                    debug_assert!(cleanup_context.options.clean_live_entries());
-                    debug_assert!(entry.row_id < cleanup_context.snapshot.pivot_row_id);
+                    debug_assert!(cleanup_context.clean_live_entries);
+                    debug_assert!(entry.row_id < cleanup_context.snapshot.pivot_row_id());
                     // Live exact entries are redundant only when the same exact
                     // key is already present in the captured cold root.
                     match disk.contains_exact_encoded(&entry.encoded_key).await {
@@ -414,16 +389,16 @@ impl Table {
     fn cleanup_column_index<'a>(
         &'a self,
         guards: &'a PoolGuards,
-        snapshot: &MemIndexCleanupSnapshot,
+        snapshot: &MemIndexCleanupSnapshot<'_>,
     ) -> Option<ColumnBlockIndex<'a>> {
-        if snapshot.column_block_index_root == SUPER_BLOCK_ID
-            || snapshot.table_root_ts >= snapshot.min_active_sts
+        if snapshot.column_block_index_root() == SUPER_BLOCK_ID
+            || snapshot.root_trx_id() >= snapshot.min_active_sts
         {
             return None;
         }
         Some(ColumnBlockIndex::new(
-            snapshot.column_block_index_root,
-            snapshot.pivot_row_id,
+            snapshot.column_block_index_root(),
+            snapshot.pivot_row_id(),
             self.file().file_kind(),
             self.file().sparse_file(),
             self.disk_pool(),
@@ -434,7 +409,7 @@ impl Table {
     #[inline]
     async fn cleanup_unique_delete_overlay_is_obsolete(
         &self,
-        cleanup_context: &MemIndexCleanupContext<'_>,
+        cleanup_context: &MemIndexCleanupContext<'_, '_>,
         index_no: usize,
         index: &UniqueSecondaryIndex<EvictableBufferPool>,
         entry: &UniqueMemIndexEntry,
@@ -454,7 +429,7 @@ impl Table {
     #[inline]
     async fn cleanup_non_unique_delete_overlay_is_obsolete(
         &self,
-        cleanup_context: &MemIndexCleanupContext<'_>,
+        cleanup_context: &MemIndexCleanupContext<'_, '_>,
         index_no: usize,
         index: &NonUniqueSecondaryIndex<EvictableBufferPool>,
         entry: &NonUniqueMemIndexEntry,
@@ -474,7 +449,7 @@ impl Table {
     #[inline]
     async fn cleanup_delete_overlay_proof(
         &self,
-        cleanup_context: &MemIndexCleanupContext<'_>,
+        cleanup_context: &MemIndexCleanupContext<'_, '_>,
         index_no: usize,
         row_id: RowID,
     ) -> Result<DeleteOverlayProof> {
@@ -491,14 +466,14 @@ impl Table {
         // Full-scan cleanup only proves key obsolescence for persisted LWC
         // rows. Hot row pages require undo-chain checks, which transaction
         // index GC already performs while holding the row-page context.
-        if row_id >= snapshot.pivot_row_id {
+        if row_id >= snapshot.pivot_row_id() {
             return Ok(DeleteOverlayProof::NotProven);
         }
         // The captured column root can prove durable row absence or a cold key
         // mismatch only after it is older than every active snapshot. Otherwise
         // removing the overlay could expose this newer cold-root fact to a
         // transaction that still depends on the MemIndex delete marker.
-        if snapshot.table_root_ts >= snapshot.min_active_sts {
+        if snapshot.root_trx_id() >= snapshot.min_active_sts {
             return Ok(DeleteOverlayProof::NotProven);
         }
         let Some(column_index) = cleanup_context.column_index else {
@@ -516,7 +491,7 @@ impl Table {
     #[inline]
     async fn cleanup_read_cold_index_values(
         &self,
-        cleanup_context: &MemIndexCleanupContext<'_>,
+        cleanup_context: &MemIndexCleanupContext<'_, '_>,
         index_no: usize,
         row: ResolvedColumnRow,
     ) -> Result<Vec<Val>> {
@@ -551,10 +526,10 @@ impl Table {
 }
 
 #[inline]
-async fn compare_delete_unique_cleanup_entry<P: crate::buffer::BufferPool>(
-    index: &crate::index::UniqueSecondaryIndex<P>,
-    index_pool_guard: &crate::buffer::PoolGuard,
-    entry: &crate::index::UniqueMemIndexEntry,
+async fn compare_delete_unique_cleanup_entry<P: BufferPool>(
+    index: &UniqueSecondaryIndex<P>,
+    index_pool_guard: &PoolGuard,
+    entry: &UniqueMemIndexEntry,
     min_active_sts: TrxID,
 ) -> Result<CleanupDecision> {
     if index
@@ -574,10 +549,10 @@ async fn compare_delete_unique_cleanup_entry<P: crate::buffer::BufferPool>(
 }
 
 #[inline]
-async fn compare_delete_non_unique_cleanup_entry<P: crate::buffer::BufferPool>(
-    index: &crate::index::NonUniqueSecondaryIndex<P>,
-    index_pool_guard: &crate::buffer::PoolGuard,
-    entry: &crate::index::NonUniqueMemIndexEntry,
+async fn compare_delete_non_unique_cleanup_entry<P: BufferPool>(
+    index: &NonUniqueSecondaryIndex<P>,
+    index_pool_guard: &PoolGuard,
+    entry: &NonUniqueMemIndexEntry,
     min_active_sts: TrxID,
 ) -> Result<CleanupDecision> {
     if index

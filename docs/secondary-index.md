@@ -291,28 +291,37 @@ Each secondary index has its own `DiskTree` root.
 - cold-row deletes are represented by deletion overlay state until companion
   checkpoint work removes or conditionally updates the durable entry
 
+Runtime opens of a user-table `DiskTree` root must come from one proof-gated
+table-root observation. A lookup, scan, insert/update/delete attempt, or GC
+pass copies the needed secondary root id from that bound observation, or carries
+an owned `TableRootSnapshot`, and then uses that captured root consistently for
+the rest of the logical operation. Catalog-table indexes remain outside this
+contract because they do not use table-file roots.
+
 ## 7. Read Path
 
 ### 7.1 Unique Point Lookup
 
 Runtime lookup for a unique secondary index proceeds as follows:
 
-1. Probe `MemIndex` by logical key.
-2. If `MemIndex` hits:
+1. Bind one table root for the logical read via `TrxReadProof` and capture the
+   relevant secondary `DiskTree` root id.
+2. Probe `MemIndex` by logical key.
+3. If `MemIndex` hits:
    - if the entry is live, use its row id as the candidate entry point for the
      normal row/deletion visibility path
    - if the entry is a delete-shadow, do not fall through to a stale
      `DiskTree` value; instead use the retained row id as the candidate entry
      point for the normal row/deletion visibility path
-3. If `MemIndex` misses, probe `DiskTree`.
-4. Route the candidate row id through the normal row lookup path:
+4. If `MemIndex` misses, probe the captured `DiskTree` root.
+5. Route the candidate row id through the normal row lookup path:
    - RowStore + undo chain for hot rows
    - LWC + deletion buffer / persisted delete bitmap for cold rows
-5. For unique indexes, MVCC resolution may additionally follow runtime
+6. For unique indexes, MVCC resolution may additionally follow runtime
    unique-key links when the visible older owner of the logical key is not on
    the ordinary undo chain of the latest row id. That linked older owner may be
    either a hot row/version or an older cold owner/version.
-6. After visibility resolution, recheck that the visible row version still
+7. After visibility resolution, recheck that the visible row version still
    matches the logical lookup key. If the visible version no longer matches,
    treat the candidate as a stale index result and skip it.
 
@@ -328,10 +337,12 @@ MVCC path plus the final key recheck.
 For non-unique indexes, results may exist in both trees at the same logical
 key:
 
-1. Probe or range-scan `MemIndex`.
-2. Probe or range-scan `DiskTree`.
-3. Merge exact entries from both sources.
-4. Use delete-marked `MemIndex` exact entries only to suppress matching
+1. Bind one table root for the logical read via `TrxReadProof` and capture the
+   relevant secondary `DiskTree` root id.
+2. Probe or range-scan `MemIndex`.
+3. Probe or range-scan the captured `DiskTree` root.
+4. Merge exact entries from both sources.
+5. Use delete-marked `MemIndex` exact entries only to suppress matching
    `DiskTree` exact `(logical_key, row_id)` entries.
 5. Route the remaining candidate row ids through the normal row/deletion
    visibility check.

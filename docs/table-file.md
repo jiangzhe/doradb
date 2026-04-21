@@ -91,6 +91,19 @@ reclaimable blocks from checkpoint-root reachability.
 - the previous `MetaBlock` id and other obsolete pages are appended to the new
   GC list
 
+### 4.3 Runtime Root Access
+
+`CowFile::active_root()` and `TableFile::active_root()` remain the low-level
+unchecked root primitives. Runtime user-table readers should not stitch
+together fields from repeated unchecked reads. Instead, transaction-owned read
+paths mint `TrxReadProof<'ctx>` from `TrxContext` and use the runtime table
+layer's proof-gated `with_active_root(...)` helper to bind one root observation
+before copying a secondary `DiskTree` root id or building a `TableRootSnapshot`.
+
+Checkpoint, recovery/bootstrap, catalog load, file-internal publication, and
+test-only helpers remain explicit unchecked boundaries until the later sealing
+phase.
+
 ## 5. Space Management And GC
 
 Pages move through three states:

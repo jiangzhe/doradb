@@ -136,6 +136,14 @@ For the detailed index design, see [`secondary-index.md`](./secondary-index.md).
 
 #### Execution Phase
 
+Runtime user-table root reads are bound through `TrxContext::read_proof()`.
+The proof is a typed witness minted from the reader transaction context and is
+used only to bind one synchronous observation of the current table-file root.
+Runtime helpers may then copy a single secondary `DiskTree` root id or build an
+owned `TableRootSnapshot` for broader MVCC and GC work. Checkpoint, recovery,
+catalog load, and file-internal root reads remain explicit unchecked
+exceptions outside this runtime transaction contract.
+
 1. **Read**: 
    - Probe `MemIndex` first and then `DiskTree` as required by the index type.
    - Route to RowStore or ColumnStore based on `RowID` vs `Pivot`.
