@@ -656,10 +656,10 @@ References:
   - Non-goals: Do not remove all unchecked active-root APIs in this phase; do
     not introduce transaction-owned root guard retention unless a concrete path
     cannot use owned snapshots.
-  - Task Doc: `docs/tasks/TBD.md`
-  - Task Issue: `#0`
-  - Phase Status: `pending`
-  - Implementation Summary: `pending`
+  - Task Doc: `docs/tasks/000131-trx-read-proof-root-binding.md`
+  - Task Issue: `#586`
+  - Phase Status: done
+  - Implementation Summary: Phase 5 implemented: added TrxReadProof and proof-gated root binding, migrated runtime user-table secondary-index root reads and secondary MemIndex cleanup to one bound-root observation, narrowed TableRootSnapshot to runtime-needed fields, simplified rooted secondary-index helpers, and validated with cargo fmt --check, clippy, nextest, and focused coverage. [Task Resolve Sync: docs/tasks/000131-trx-read-proof-root-binding.md @ 2026-04-21]
   - Related Backlogs:
     - `docs/backlogs/closed/000093-transaction-context-effects-split-active-root-proofs.md`
 

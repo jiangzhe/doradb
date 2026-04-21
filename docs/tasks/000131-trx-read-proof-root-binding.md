@@ -1,7 +1,7 @@
 ---
 id: 000131
 title: Trx Read Proof Root Binding
-status: proposal
+status: implemented
 created: 2026-04-20
 github_issue: 586
 ---
@@ -12,11 +12,12 @@ github_issue: 586
 
 Implement Phase 5 of RFC-0015 by adding a typed transaction read proof and
 using it to bind runtime user-table root reads to one active-root observation.
-The main runtime primitive should be a proof-gated closure API that lets callers
-copy only the root fields they need from one bound root view. `TableRootSnapshot`
+The main runtime primitive is a proof-gated closure API that lets callers copy
+only the root fields they need from one bound root view. `TableRootSnapshot`
 remains the owned multi-field projection for paths such as secondary MemIndex
 cleanup that need a reusable root-derived view across helper calls or async
-boundaries.
+boundaries, but the implemented snapshot surface is intentionally narrower than
+the broad inspection shape sketched during planning.
 
 This task intentionally stops before sealing or renaming unchecked
 `active_root()` / `published_root()` APIs. Checkpoint, recovery/bootstrap,
@@ -142,22 +143,21 @@ layering tradeoff must be documented in implementation notes.
 ### Owned Snapshot
 
 Keep `TableRootSnapshot<'ctx>` for paths that need several root fields across
-helper calls or `.await` points. The snapshot should own:
+helper calls or `.await` points. The implemented snapshot owns only the
+runtime-used fields:
 
-- `table_id`
 - `root_trx_id`
-- `root_meta_block_id`
-- `metadata: Arc<TableMetadata>`
 - `pivot_row_id`
 - `column_block_index_root`
 - `secondary_index_roots`
-- `heap_redo_start_ts`
 - `deletion_cutoff_ts`
 - proof lifetime marker
 
-It should intentionally exclude `slot_no`, `alloc_map`, `gc_block_list`, and
-`newly_allocated_ids`; those are publication/allocation internals, not runtime
-read contracts.
+The broader planning-time inspection fields (`table_id`, `root_meta_block_id`,
+`metadata`, and `heap_redo_start_ts`) were intentionally dropped from the final
+runtime surface because they were only supporting test inspection, not runtime
+root-binding behavior. `slot_no`, `alloc_map`, `gc_block_list`, and
+`newly_allocated_ids` remain excluded publication/allocation internals.
 
 ### ActiveRoot Split
 
@@ -196,31 +196,31 @@ Expected implementation path: no unsafe changes.
    - Keep constructor access narrow; do not expose a public unchecked
      constructor.
 2. Add the proof-gated closure API in the runtime table layer.
-   - Prefer `ColumnStorage::with_active_root(...)` or a private helper on
-     `TableAccessor` because user-table access already reaches the file through
-     `ColumnStorage`.
-   - Optionally add `Table::with_active_root(...)` as a convenience wrapper.
-   - The helper should bind `let root = self.file().active_root();` once and
-     invoke the synchronous closure with that reference.
+   - Implement `ColumnStorage::with_active_root(...)` in `table/mod.rs` as the
+     binding primitive used by runtime table code.
+   - Implement `Table::with_active_root(...)` as a narrow convenience wrapper.
+   - Implement `Table::root_snapshot(...)` by delegating through
+     `Table::with_active_root(...)` so one logical call binds one root view.
 3. Add `TableRootSnapshot<'ctx>`.
-   - Locate it in `doradb-storage/src/table/mod.rs` or a small table submodule
-     re-exported only as widely as needed.
-   - Provide focused accessors:
-     `table_id()`, `root_trx_id()`, `root_meta_block_id()`, `metadata()`,
-     `pivot_row_id()`, `column_block_index_root()`, `heap_redo_start_ts()`,
-     `deletion_cutoff_ts()`, `secondary_index_root(index_no)`,
-     `has_column_root()`, and `root_is_visible_to(sts)`.
-   - Build it through the proof-gated closure helper.
+   - Define it in `doradb-storage/src/table/mod.rs`.
+   - Provide the runtime-focused accessors:
+     `root_trx_id()`, `pivot_row_id()`, `column_block_index_root()`,
+     `deletion_cutoff_ts()`, `secondary_index_root(index_no)`, and
+     `root_is_visible_to(sts)`.
+   - Build it through the proof-gated closure helper and do not retain the
+     broader test-inspection accessor surface from the planning draft.
 4. Add root-aware secondary-index runtime methods in
    `doradb-storage/src/index/secondary_index.rs`.
    - Keep `SecondaryDiskTreeRuntime::published_root()` and open-with-current-root
      methods for transitional tests and Phase 6 cleanup.
    - Add or use methods that accept a snapshot-derived `BlockID` and call
      `open_unique_at` / `open_non_unique_at`.
-   - Add root-aware variants for composite secondary-index methods that open
-     DiskTree state, including unique lookup, insert-if-not-exists,
-     compare-exchange, scan, and non-unique lookup, lookup-unique,
-     insert-if-not-exists, mask-as-deleted, and scan.
+   - Use root-aware composite helper methods for the runtime operations that
+     need captured-root DiskTree state: unique lookup, insert-if-not-exists,
+     compare-exchange, non-unique lookup, lookup-unique, insert-if-not-exists,
+     and mask-as-deleted.
+   - Keep rooted scan helpers impl-local unless a sibling module actually needs
+     them.
 5. Migrate user-table `TableAccess` helper paths in
    `doradb-storage/src/table/access.rs`.
    - For `user_sec_idx: Some(...)`, mint a proof from `ctx`, bind the active
@@ -239,6 +239,8 @@ Expected implementation path: no unsafe changes.
    - Keep `min_active_sts` as cleanup-only state outside the snapshot.
    - Preserve explicit checks that the root is visible to the cleanup
      transaction and old enough for the GC horizon before using cold-root facts.
+   - Expose the final cleanup entry point as
+     `cleanup_secondary_mem_indexes(&mut Session, clean_live_entries: bool)`.
 7. Keep checkpoint, recovery, catalog load, file-internal, and test-only
    root-access comments aligned with Phase 1 categories if touched.
 8. Add or update tests close to changed modules. Prefer inline `#[cfg(test)]`
@@ -256,19 +258,62 @@ Expected implementation path: no unsafe changes.
 
 ## Implementation Notes
 
+Implemented Phase 5 of RFC-0015.
+
+- Added `TrxReadProof<'ctx>` and `TrxContext::read_proof()` in
+  `doradb-storage/src/trx/mod.rs` using private `PhantomData<&'ctx TrxContext>`.
+- Implemented proof-gated root binding in `doradb-storage/src/table/mod.rs`
+  through `ColumnStorage::with_active_root(...)` and `Table::with_active_root(...)`.
+- Implemented `Table::root_snapshot(...)` by delegating through
+  `Table::with_active_root(...)` and merged the root snapshot logic into
+  `table/mod.rs` instead of keeping a separate `table/root_snapshot.rs` module.
+- Implemented `TableRootSnapshot<'ctx>` as a runtime-focused owned snapshot
+  rather than the broader planning-time inspection object. The final surface
+  keeps `root_trx_id`, `pivot_row_id`, `column_block_index_root`,
+  `secondary_index_roots`, `deletion_cutoff_ts`, and `root_is_visible_to(...)`.
+- Migrated user-table secondary-index access in `doradb-storage/src/table/access.rs`
+  to bind one active root observation and pass captured secondary roots into
+  rooted composite secondary-index helpers.
+- Migrated secondary MemIndex cleanup in `doradb-storage/src/table/gc.rs` to
+  `TableRootSnapshot<'ctx>` and exposed the final API as
+  `cleanup_secondary_mem_indexes(&mut Session, clean_live_entries: bool)`.
+- Added rooted composite secondary-index helper paths in
+  `doradb-storage/src/index/secondary_index.rs`, removed the `_at_root`
+  trampolines, removed the test-only `scan_mem_entries` API, and kept rooted
+  scan helpers impl-local because no sibling module currently needs them.
+- Simplified composite secondary-index `compare_delete` for both unique and
+  non-unique indexes by removing the redundant pre-lookup and relying on the
+  MemIndex delete path to treat `NotFound` as success.
+- Rewrote cleanup tests to use existing lookup/stats APIs, added proof-gated
+  root snapshot regression coverage, and updated the related concept docs under
+  `docs/`.
+- Validation passed:
+  - `cargo fmt --check`
+  - `cargo clippy -p doradb-storage --all-targets -- -D warnings`
+  - `cargo nextest run -p doradb-storage` (622/622 passing)
+  - focused coverage checks for `doradb-storage/src/table`,
+    `doradb-storage/src/index`, and `doradb-storage/src/trx` remained above the
+    80% task bar
+- Implementation branch: `trx-read-proof`
+- Issue: `#586`
+- PR: `#587`
+
 ## Impacts
 
 - `doradb-storage/src/trx/mod.rs`: defines `TrxReadProof` and
   `TrxContext::read_proof()`.
-- `doradb-storage/src/table/mod.rs` or a small table submodule: defines
-  `TableRootSnapshot` and proof-gated root binding helpers.
+- `doradb-storage/src/table/mod.rs`: defines `TableRootSnapshot`,
+  `ColumnStorage::with_active_root(...)`, `Table::with_active_root(...)`, and
+  `Table::root_snapshot(...)`.
 - `doradb-storage/src/table/access.rs`: migrates user-table MVCC
   secondary-index root access to proof-gated root binding while preserving
   catalog/generic access behavior.
 - `doradb-storage/src/index/secondary_index.rs`: adds root-aware composite
-  secondary-index methods and preserves transitional current-root methods.
+  secondary-index methods, simplifies rooted helper dispatch, and preserves
+  transitional current-root methods.
 - `doradb-storage/src/table/gc.rs`: replaces the ad hoc cleanup root fields
-  with `TableRootSnapshot` plus cleanup horizon state.
+  with `TableRootSnapshot` plus cleanup horizon state and exposes the final
+  cleanup API.
 - `doradb-storage/src/file/table_file.rs` and `doradb-storage/src/file/cow_file.rs`:
   no behavior change expected; comments may be adjusted only if implementation
   touches boundary wording.
