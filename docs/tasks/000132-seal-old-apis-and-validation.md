@@ -1,7 +1,7 @@
 ---
 id: 000132
 title: Seal Old APIs And Validation
-status: proposal
+status: implemented
 created: 2026-04-22
 github_issue: 588
 ---
@@ -214,6 +214,53 @@ Reference:
    ```
 
 ## Implementation Notes
+
+Implemented Phase 6 of RFC-0015.
+
+- Renamed the remaining unchecked user-table current-root file APIs to
+  `active_root_unchecked()` and updated the audited bootstrap, catalog load,
+  checkpoint, recovery, runtime-construction, and test-only exception sites to
+  use the explicit unchecked boundary.
+- Kept proof-gated runtime binding as the normal user-table path through
+  `ColumnStorage::with_active_root(...)`, `Table::with_active_root(...)`, and
+  `Table::root_snapshot(...)`, while narrowing `Table::file()` to `pub(crate)`.
+- Removed transitional current-root helpers from
+  `SecondaryDiskTreeRuntime`, kept only root-explicit `open_unique_at(...)` and
+  `open_non_unique_at(...)`, and moved `UniqueIndex` / `NonUniqueIndex`
+  implementations onto root-bound `UniqueSecondaryIndex` /
+  `NonUniqueSecondaryIndex` views instead of raw user-table runtime storage.
+- Reworked user-table secondary-index runtime access so captured roots are
+  explicit on cold `DiskTree` paths, while mem-only recovery, rollback, and GC
+  paths continue to use dedicated `unique_mem()` / `non_unique_mem()` helpers.
+- Removed the broad `StmtEffects::redo_mut()` migration helper in favor of the
+  focused DDL redo insertion surface and cleaned up repeated unchecked root
+  rereads in checkpoint, session bootstrap, catalog load, and recovery paths.
+- Added and updated regression coverage for captured-root stability across
+  checkpoint swap, explicit root-bound secondary-index opens, and recovery
+  duplicate handling, including a dedicated recovery-specific error for
+  unexpected duplicate non-unique inserts.
+- Review follow-ups after implementation:
+  - made bound secondary-index wrappers first-class crate-internal runtime
+    types used by production code, not test-only exports;
+  - restored direct `SecondaryIndex::{Unique, NonUnique}` construction and
+    removed the redundant constructor-validation layer;
+  - documented the focused-coverage exception for central definition-heavy
+    files and used it for `doradb-storage/src/error.rs`.
+- Validation passed:
+  - `cargo fmt --check`
+  - `cargo clippy -p doradb-storage --all-targets -- -D warnings`
+  - `cargo nextest run -p doradb-storage` (622/622 passing)
+  - focused coverage checks for changed runtime paths:
+    `doradb-storage/src/table` 90.33%, `doradb-storage/src/index` 93.26%,
+    `doradb-storage/src/file` 94.28%, `doradb-storage/src/stmt` 95.12%,
+    `doradb-storage/src/trx` 94.68%, `doradb-storage/src/catalog` 90.99%,
+    `doradb-storage/src/session.rs` 91.82%
+  - `doradb-storage/src/error.rs` remained at 38.14% focused coverage and was
+    accepted under the new central definition-heavy file exception documented
+    in `docs/process/dev-checklist.md` and `docs/process/unit-test.md`
+- Implementation branch: `seal-old-api`
+- Issue: `#588`
+- PR: `#589`
 
 ## Impacts
 

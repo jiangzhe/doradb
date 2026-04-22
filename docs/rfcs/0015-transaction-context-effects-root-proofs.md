@@ -671,10 +671,10 @@ References:
     checkpoint-swap tests; run the standard storage validation pass.
   - Non-goals: Do not implement broader root-reachability GC unless a preceding
     phase exposes it as a required blocker; track such work as follow-up.
-  - Task Doc: `docs/tasks/TBD.md`
-  - Task Issue: `#0`
-  - Phase Status: `pending`
-  - Implementation Summary: `pending`
+  - Task Doc: `docs/tasks/000132-seal-old-apis-and-validation.md`
+  - Task Issue: `#588`
+  - Phase Status: done
+  - Implementation Summary: Phase 6 implemented: renamed unchecked active-root APIs to active_root_unchecked, sealed runtime secondary-index access around explicit captured-root bindings and root-bound wrappers, removed transitional current-root helpers and the broad stmt redo shim, added checkpoint-swap and recovery-duplicate regressions, and validated with cargo fmt --check, clippy, nextest, and focused coverage with the documented definition-heavy exception for error.rs. [Task Resolve Sync: docs/tasks/000132-seal-old-apis-and-validation.md @ 2026-04-23]
   - Related Backlogs:
     - `docs/backlogs/closed/000093-transaction-context-effects-split-active-root-proofs.md`
 
