@@ -333,7 +333,7 @@ pub(crate) async fn build_dual_tree_secondary_indexes(
                     return Err(err);
                 }
             };
-            SecondaryIndex::new_unique(index_no, mem, runtime, index_pool_guard).await
+            SecondaryIndex::Unique { mem, disk: runtime }
         } else {
             let mem = match NonUniqueMemIndex::new(
                 index_pool.clone(),
@@ -350,14 +350,7 @@ pub(crate) async fn build_dual_tree_secondary_indexes(
                     return Err(err);
                 }
             };
-            SecondaryIndex::new_non_unique(index_no, mem, runtime, index_pool_guard).await
-        };
-        let index = match index {
-            Ok(index) => index,
-            Err(err) => {
-                builder.rollback(index_pool_guard).await;
-                return Err(err);
-            }
+            SecondaryIndex::NonUnique { mem, disk: runtime }
         };
         builder.push(index);
     }
@@ -648,7 +641,7 @@ impl ColumnStorage {
     ) -> Result<Self> {
         // `catalog_load_boundary`: table construction binds the loaded root to
         // initialize column storage and validate secondary root layout.
-        let active_root = file.active_root();
+        let active_root = file.active_root_unchecked();
         let metadata = Arc::clone(&active_root.metadata);
         if active_root.secondary_index_roots.len() != metadata.index_specs.len() {
             return Err(Error::InvalidState);
@@ -674,7 +667,7 @@ impl ColumnStorage {
 
     /// Returns the underlying table file for persisted column data.
     #[inline]
-    pub fn file(&self) -> &Arc<TableFile> {
+    pub(crate) fn file(&self) -> &Arc<TableFile> {
         &self.file
     }
 
@@ -684,7 +677,7 @@ impl ColumnStorage {
     where
         F: for<'root> FnOnce(&'root ActiveRoot) -> R,
     {
-        let root = self.file().active_root();
+        let root = self.file().active_root_unchecked();
         f(root)
     }
 
@@ -732,7 +725,7 @@ impl Table {
     ) -> Result<Self> {
         // `catalog_load_boundary`: runtime table construction uses the loaded
         // root to seed metadata and hot/cold secondary-index state.
-        let active_root = file.active_root();
+        let active_root = file.active_root_unchecked();
         let metadata = Arc::clone(&active_root.metadata);
         let secondary_index_count = metadata.index_specs.len();
         let sec_idx = build_dual_tree_secondary_indexes(
@@ -804,6 +797,7 @@ impl Table {
         &self.sec_idx
     }
 
+    /// Returns the readonly disk buffer pool used by persisted table data.
     #[inline]
     pub(crate) fn disk_pool(&self) -> &QuiescentGuard<ReadonlyBufferPool> {
         self.storage.disk_pool()
@@ -811,7 +805,7 @@ impl Table {
 
     /// Returns the backing table file for this user table.
     #[inline]
-    pub fn file(&self) -> &Arc<TableFile> {
+    pub(crate) fn file(&self) -> &Arc<TableFile> {
         self.storage.file()
     }
 
@@ -1291,17 +1285,11 @@ impl Table {
         row_id: RowID,
         cts: TrxID,
     ) -> Result<RecoverIndex> {
-        let index = self.sec_idx()[key.index_no].unique().unwrap();
+        let index = self.sec_idx()[key.index_no].unique_mem()?;
         let index_pool_guard = self.index_pool_guard(guards);
         loop {
             match index
-                .insert_recovery_mem_only(
-                    index_pool_guard,
-                    &key.vals,
-                    row_id,
-                    true,
-                    MIN_SNAPSHOT_TS,
-                )
+                .insert_if_not_exists(index_pool_guard, &key.vals, row_id, true, MIN_SNAPSHOT_TS)
                 .await?
             {
                 IndexInsert::Ok(_) => {
@@ -1326,7 +1314,7 @@ impl Table {
                                 old_row_id
                             };
                             match index
-                                .compare_exchange_recovery_mem_only(
+                                .compare_exchange(
                                     index_pool_guard,
                                     &key.vals,
                                     old_row_id,
@@ -1359,13 +1347,12 @@ impl Table {
         key: SelectKey,
         row_id: RowID,
     ) -> Result<RecoverIndex> {
-        let index = self.sec_idx()[key.index_no].non_unique().unwrap();
+        let index = self.sec_idx()[key.index_no].non_unique_mem()?;
         let index_pool_guard = self.index_pool_guard(guards);
-        // The recovery should make sure no duplicate key.
         let res = index
-            .insert_recovery_mem_only(index_pool_guard, &key.vals, row_id, true, MIN_SNAPSHOT_TS)
+            .insert_if_not_exists(index_pool_guard, &key.vals, row_id, true, MIN_SNAPSHOT_TS)
             .await?;
-        debug_assert!(matches!(res, IndexInsert::Ok(_)));
+        recover::ensure_recovery_index_insert(key.index_no, res)?;
         Ok(RecoverIndex::Ok)
     }
 
@@ -1376,7 +1363,7 @@ impl Table {
         key: SelectKey,
         row_id: RowID,
     ) -> Result<RecoverIndex> {
-        let index = self.sec_idx()[key.index_no].unique().unwrap();
+        let index = self.sec_idx()[key.index_no].unique_mem()?;
         let index_pool_guard = self.index_pool_guard(guards);
         if !index
             .compare_delete(index_pool_guard, &key.vals, row_id, true, MIN_SNAPSHOT_TS)
@@ -1396,7 +1383,7 @@ impl Table {
         key: SelectKey,
         row_id: RowID,
     ) -> Result<RecoverIndex> {
-        let index = self.sec_idx()[key.index_no].non_unique().unwrap();
+        let index = self.sec_idx()[key.index_no].non_unique_mem()?;
         let index_pool_guard = self.index_pool_guard(guards);
         if !index
             .compare_delete(index_pool_guard, &key.vals, row_id, true, MIN_SNAPSHOT_TS)

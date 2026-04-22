@@ -2,16 +2,19 @@ use super::{DeleteInternal, FrozenPage, InsertRowIntoPage, UpdateRowInplace};
 use crate::buffer::BufferPool;
 use crate::buffer::frame::FrameKind;
 use crate::buffer::page::{PAGE_SIZE, PageID};
-use crate::buffer::{PoolGuards, PoolRole, test_frame_kind};
+use crate::buffer::{EvictableBufferPool, PoolGuards, PoolRole, test_frame_kind};
 use crate::catalog::tests::table4;
 use crate::conf::{EngineConfig, EvictableBufferPoolConfig, FileSystemConfig, TrxSysConfig};
 use crate::engine::Engine;
 use crate::error::{BlockCorruptionCause, BlockKind, Error, FileKind, Result, StoragePoisonSource};
 use crate::file::block_integrity::{BLOCK_INTEGRITY_HEADER_SIZE, write_block_checksum};
-use crate::file::cow_file::{COW_FILE_PAGE_SIZE, SUPER_BLOCK_ID, tests::old_root_drop_count};
+use crate::file::cow_file::{
+    BlockID, COW_FILE_PAGE_SIZE, SUPER_BLOCK_ID, tests::old_root_drop_count,
+};
 use crate::index::{
     COLUMN_BLOCK_HEADER_SIZE, COLUMN_BLOCK_LEAF_HEADER_SIZE, ColumnBlockIndex, IndexInsert,
-    NonUniqueIndex, RowLocation, UniqueIndex, load_entry_deletion_deltas,
+    NonUniqueIndex, NonUniqueSecondaryIndex, RowLocation, UniqueIndex, UniqueSecondaryIndex,
+    load_entry_deletion_deltas,
 };
 use crate::io::{
     IOKind, StorageBackendFileIdentity, StorageBackendOp, StorageBackendTestHook,
@@ -428,14 +431,14 @@ fn test_find_row_returns_resolved_lwc_page_location() {
 
         let key = single_key(1i32);
         let trx = session.try_begin_trx().unwrap().unwrap();
-        let index = sys.table.sec_idx()[key.index_no].unique().unwrap();
+        let index = bound_unique_index_no(&sys.table, key.index_no);
         let (row_id, _) = index
             .lookup(session.pool_guards().index_guard(), &key.vals, trx.sts())
             .await
             .unwrap()
             .unwrap();
 
-        let active_root = sys.table.file().active_root();
+        let active_root = sys.table.file().active_root_unchecked();
         let column_index = ColumnBlockIndex::new(
             active_root.column_block_index_root,
             active_root.pivot_row_id,
@@ -484,7 +487,7 @@ fn test_lwc_select_surfaces_persisted_corruption() {
         let row_id = assert_row_in_lwc(&sys.table, session.pool_guards(), &key, trx.sts()).await;
         trx.commit().await.unwrap();
 
-        let active_root = sys.table.file().active_root();
+        let active_root = sys.table.file().active_root_unchecked();
         let index = ColumnBlockIndex::new(
             active_root.column_block_index_root,
             active_root.pivot_row_id,
@@ -533,7 +536,7 @@ fn test_lwc_select_surfaces_column_block_index_row_metadata_corruption() {
         let row_id = assert_row_in_lwc(&sys.table, session.pool_guards(), &key, trx.sts()).await;
         trx.commit().await.unwrap();
 
-        let active_root = sys.table.file().active_root();
+        let active_root = sys.table.file().active_root_unchecked();
         let index = ColumnBlockIndex::new(
             active_root.column_block_index_root,
             active_root.pivot_row_id,
@@ -585,7 +588,7 @@ fn test_lwc_select_surfaces_column_block_index_zero_block_id_corruption() {
         let row_id = assert_row_in_lwc(&sys.table, session.pool_guards(), &key, trx.sts()).await;
         trx.commit().await.unwrap();
 
-        let active_root = sys.table.file().active_root();
+        let active_root = sys.table.file().active_root_unchecked();
         let index = ColumnBlockIndex::new(
             active_root.column_block_index_root,
             active_root.pivot_row_id,
@@ -637,7 +640,7 @@ fn test_lwc_select_surfaces_row_shape_fingerprint_mismatch_corruption() {
         let row_id = assert_row_in_lwc(&sys.table, session.pool_guards(), &key, trx.sts()).await;
         trx.commit().await.unwrap();
 
-        let active_root = sys.table.file().active_root();
+        let active_root = sys.table.file().active_root_unchecked();
         let index = ColumnBlockIndex::new(
             active_root.column_block_index_root,
             active_root.pivot_row_id,
@@ -1435,7 +1438,7 @@ fn test_lwc_update_unique_claim_rollback_drops_purgeable_deleted_cold_owner() {
         .await;
         reader.commit().await.unwrap();
 
-        let index = sys.table.sec_idx()[claimed_key.index_no].unique().unwrap();
+        let index = bound_unique_index_no(&sys.table, claimed_key.index_no);
         assert!(
             index
                 .mask_as_deleted(
@@ -1553,7 +1556,7 @@ fn test_checkpoint_persists_committed_cold_delete_markers() {
         let marker = sys.table.deletion_buffer().get(row_id).unwrap();
         let marker_ts = delete_marker_ts(marker);
         wait_gc_cutoff_after(&session, marker_ts).await;
-        let active_root = sys.table.file().active_root();
+        let active_root = sys.table.file().active_root_unchecked();
         let index_before = ColumnBlockIndex::new(
             active_root.column_block_index_root,
             active_root.pivot_row_id,
@@ -1570,7 +1573,7 @@ fn test_checkpoint_persists_committed_cold_delete_markers() {
 
         checkpoint_published(&sys.table, &mut session).await;
 
-        let active_root = sys.table.file().active_root();
+        let active_root = sys.table.file().active_root_unchecked();
         let index = ColumnBlockIndex::new(
             active_root.column_block_index_root,
             active_root.pivot_row_id,
@@ -1608,7 +1611,7 @@ fn test_checkpoint_publishes_unique_secondary_disk_tree_root() {
         sys.table.freeze(&session, usize::MAX).await;
         checkpoint_published(&sys.table, &mut session).await;
 
-        let active_root = sys.table.file().active_root();
+        let active_root = sys.table.file().active_root_unchecked();
         assert_ne!(active_root.secondary_index_roots[0], SUPER_BLOCK_ID);
         let reader = session.try_begin_trx().unwrap().unwrap();
         for key_value in 0..3 {
@@ -1706,7 +1709,7 @@ fn test_checkpoint_publishes_non_unique_secondary_disk_tree_entries_across_lwc_s
         let last_row_id = unique_disk_tree_lookup(&sys.table, session.pool_guards(), &last_key)
             .await
             .unwrap();
-        let active_root = sys.table.file().active_root();
+        let active_root = sys.table.file().active_root_unchecked();
         let column_index = ColumnBlockIndex::new(
             active_root.column_block_index_root,
             active_root.pivot_row_id,
@@ -1742,7 +1745,7 @@ fn test_secondary_mem_index_cleanup_removes_redundant_live_unique_entries() {
         sys.table.freeze(&session, usize::MAX).await;
         checkpoint_published(&sys.table, &mut session).await;
 
-        let index = sys.table.sec_idx()[0].unique().unwrap();
+        let index = bound_unique_index_no(&sys.table, 0);
         let stats = sys
             .table
             .cleanup_secondary_mem_indexes(&mut session, true)
@@ -1817,7 +1820,7 @@ fn test_secondary_mem_index_cleanup_removes_redundant_live_non_unique_entries() 
         sys.table.freeze(&session, usize::MAX).await;
         checkpoint_published(&sys.table, &mut session).await;
 
-        let index = sys.table.sec_idx()[1].non_unique().unwrap();
+        let index = bound_non_unique_index_no(&sys.table, 1);
         let stats = sys
             .table
             .cleanup_secondary_mem_indexes(&mut session, true)
@@ -1890,8 +1893,8 @@ fn test_secondary_mem_index_cleanup_can_retain_live_cache_entries() {
         sys.table.freeze(&session, usize::MAX).await;
         checkpoint_published(&sys.table, &mut session).await;
 
-        let unique_index = sys.table.sec_idx()[0].unique().unwrap();
-        let non_unique_index = sys.table.sec_idx()[1].non_unique().unwrap();
+        let unique_index = bound_unique_index_no(&sys.table, 0);
+        let non_unique_index = bound_non_unique_index_no(&sys.table, 1);
         let stats = sys
             .table
             .cleanup_secondary_mem_indexes(&mut session, false)
@@ -1951,7 +1954,7 @@ fn test_secondary_mem_index_cleanup_retains_unique_delete_shadow_without_delete_
 
         let current_key = single_key(0i32);
         let stale_key = single_key(-1i32);
-        let index = sys.table.sec_idx()[0].unique().unwrap();
+        let index = bound_unique_index_no(&sys.table, 0);
         let row_id = index
             .lookup(
                 session.pool_guards().index_guard(),
@@ -2039,7 +2042,7 @@ fn test_secondary_mem_index_cleanup_removes_unique_delete_shadow_with_purgeable_
         let row_id = unique_disk_tree_lookup(&sys.table, session.pool_guards(), &current_key)
             .await
             .unwrap();
-        let index = sys.table.sec_idx()[0].unique().unwrap();
+        let index = bound_unique_index_no(&sys.table, 0);
         assert!(
             index
                 .insert_if_not_exists(
@@ -2110,7 +2113,7 @@ fn test_secondary_mem_index_cleanup_removes_delete_shadow_when_live_cleanup_disa
         let row_id = unique_disk_tree_lookup(&sys.table, session.pool_guards(), &current_key)
             .await
             .unwrap();
-        let index = sys.table.sec_idx()[0].unique().unwrap();
+        let index = bound_unique_index_no(&sys.table, 0);
         assert!(
             index
                 .insert_if_not_exists(
@@ -2191,7 +2194,7 @@ fn test_secondary_mem_index_cleanup_removes_unique_delete_shadow_with_matching_c
         let row_id = unique_disk_tree_lookup(&sys.table, session.pool_guards(), &current_key)
             .await
             .unwrap();
-        let index = sys.table.sec_idx()[0].unique().unwrap();
+        let index = bound_unique_index_no(&sys.table, 0);
         assert!(
             index
                 .mask_as_deleted(
@@ -2275,7 +2278,7 @@ fn test_secondary_mem_index_cleanup_removes_unique_delete_shadow_when_cold_row_k
             unique_disk_tree_lookup(&sys.table, session.pool_guards(), &stale_key).await,
             None
         );
-        let index = sys.table.sec_idx()[0].unique().unwrap();
+        let index = bound_unique_index_no(&sys.table, 0);
         assert!(
             index
                 .insert_if_not_exists(
@@ -2376,7 +2379,7 @@ fn test_secondary_mem_index_cleanup_propagates_cold_delete_overlay_proof_error()
             .await
             .unwrap();
         let block_id = {
-            let active_root = sys.table.file().active_root();
+            let active_root = sys.table.file().active_root_unchecked();
             let column_index = ColumnBlockIndex::new(
                 active_root.column_block_index_root,
                 active_root.pivot_row_id,
@@ -2392,7 +2395,7 @@ fn test_secondary_mem_index_cleanup_propagates_cold_delete_overlay_proof_error()
                 .unwrap()
                 .block_id()
         };
-        let index = sys.table.sec_idx()[0].unique().unwrap();
+        let index = bound_unique_index_no(&sys.table, 0);
         assert!(
             index
                 .insert_if_not_exists(
@@ -2464,9 +2467,7 @@ fn test_secondary_mem_index_cleanup_retains_non_unique_delete_mark_without_delet
         insert_rows(&sys, &mut session, 0, 1, "current").await;
 
         let pk = single_key(0i32);
-        let row_id = sys.table.sec_idx()[0]
-            .unique()
-            .unwrap()
+        let row_id = bound_unique_index_no(&sys.table, 0)
             .lookup(
                 session.pool_guards().index_guard(),
                 &pk.vals,
@@ -2477,9 +2478,7 @@ fn test_secondary_mem_index_cleanup_retains_non_unique_delete_mark_without_delet
             .unwrap()
             .0;
         let stale_key = name_key("stale");
-        let index = sys.table.sec_idx()[stale_key.index_no]
-            .non_unique()
-            .unwrap();
+        let index = bound_non_unique_index_no(&sys.table, stale_key.index_no);
         assert!(
             index
                 .insert_if_not_exists(
@@ -2547,9 +2546,7 @@ fn test_secondary_mem_index_cleanup_removes_non_unique_delete_mark_with_purgeabl
             .await
             .unwrap();
         let stale_key = name_key("stale");
-        let index = sys.table.sec_idx()[stale_key.index_no]
-            .non_unique()
-            .unwrap();
+        let index = bound_non_unique_index_no(&sys.table, stale_key.index_no);
         assert!(
             index
                 .insert_if_not_exists(
@@ -2621,9 +2618,7 @@ fn test_secondary_mem_index_cleanup_removes_non_unique_delete_mark_with_matching
             .await
             .unwrap();
         let current_key = name_key("current");
-        let index = sys.table.sec_idx()[current_key.index_no]
-            .non_unique()
-            .unwrap();
+        let index = bound_non_unique_index_no(&sys.table, current_key.index_no);
         assert!(
             index
                 .mask_as_deleted(
@@ -2715,9 +2710,7 @@ fn test_secondary_mem_index_cleanup_removes_non_unique_delete_mark_when_cold_row
             non_unique_disk_tree_prefix_scan(&sys.table, session.pool_guards(), &current_key).await,
             vec![row_id]
         );
-        let index = sys.table.sec_idx()[stale_key.index_no]
-            .non_unique()
-            .unwrap();
+        let index = bound_non_unique_index_no(&sys.table, stale_key.index_no);
         assert!(
             index
                 .insert_if_not_exists(
@@ -2914,14 +2907,14 @@ fn test_secondary_sidecar_failure_keeps_checkpoint_root_atomic() {
         sys.new_trx_delete(&mut session, &key).await;
         let marker_ts = delete_marker_ts(sys.table.deletion_buffer().get(row_id).unwrap());
         wait_gc_cutoff_after(&session, marker_ts).await;
-        let root_before = sys.table.file().active_root().clone();
+        let root_before = sys.table.file().active_root_unchecked().clone();
 
         set_test_force_secondary_sidecar_error(true);
         let _reset = ResetSidecarHook;
         let err = sys.table.checkpoint(&mut session).await.unwrap_err();
         assert!(matches!(err, Error::InvalidState));
 
-        let root_after = sys.table.file().active_root();
+        let root_after = sys.table.file().active_root_unchecked();
         assert_eq!(
             root_after.deletion_cutoff_ts,
             root_before.deletion_cutoff_ts
@@ -2948,11 +2941,11 @@ fn test_checkpoint_all_deleted_row_page_advances_without_column_index() {
         insert_rows(&sys, &mut session, 0, 10, "name").await;
         delete_key_range_and_wait_gc_cutoff(&sys, &mut session, 0, 10).await;
 
-        let root_before = sys.table.file().active_root().clone();
+        let root_before = sys.table.file().active_root_unchecked().clone();
         sys.table.freeze(&session, usize::MAX).await;
         checkpoint_published(&sys.table, &mut session).await;
 
-        let root_after = sys.table.file().active_root();
+        let root_after = sys.table.file().active_root_unchecked();
         assert!(root_after.pivot_row_id > root_before.pivot_row_id);
         assert_eq!(root_after.column_block_index_root, SUPER_BLOCK_ID);
         assert!(root_after.deletion_cutoff_ts > root_before.deletion_cutoff_ts);
@@ -2975,7 +2968,7 @@ fn test_checkpoint_transition_delete_marker_waits_for_next_cutoff_range() {
 
         let key = single_key(0i32);
         let reader = session.try_begin_trx().unwrap().unwrap();
-        let index = sys.table.sec_idx()[key.index_no].unique().unwrap();
+        let index = bound_unique_index_no(&sys.table, key.index_no);
         let (row_id, _) = index
             .lookup(session.pool_guards().index_guard(), &key.vals, reader.sts())
             .await
@@ -3003,7 +2996,7 @@ fn test_checkpoint_transition_delete_marker_waits_for_next_cutoff_range() {
         let delete_cts = delete_marker_ts(marker);
         assert!(delete_cts >= hold_sts);
 
-        let root_after_first = sys.table.file().active_root().clone();
+        let root_after_first = sys.table.file().active_root_unchecked().clone();
         let index_after_first = ColumnBlockIndex::new(
             root_after_first.column_block_index_root,
             root_after_first.pivot_row_id,
@@ -3029,7 +3022,7 @@ fn test_checkpoint_transition_delete_marker_waits_for_next_cutoff_range() {
         wait_gc_cutoff_after(&checkpoint_session, delete_cts).await;
         checkpoint_published(&sys.table, &mut checkpoint_session).await;
 
-        let root_after_second = sys.table.file().active_root();
+        let root_after_second = sys.table.file().active_root_unchecked();
         let index_after_second = ColumnBlockIndex::new(
             root_after_second.column_block_index_root,
             root_after_second.pivot_row_id,
@@ -3072,7 +3065,7 @@ fn test_lwc_unique_index_purge_uses_purgeable_delete_marker_fast_path() {
         let row_id = assert_row_in_lwc(&sys.table, session.pool_guards(), &key, reader.sts()).await;
         reader.commit().await.unwrap();
 
-        let index = sys.table.sec_idx()[key.index_no].unique().unwrap();
+        let index = bound_unique_index_no(&sys.table, key.index_no);
         assert!(
             index
                 .mask_as_deleted(
@@ -3138,7 +3131,7 @@ fn test_lwc_unique_index_purge_compares_persisted_key_when_marker_is_not_purgeab
         .await;
         reader.commit().await.unwrap();
 
-        let index = sys.table.sec_idx()[current_key.index_no].unique().unwrap();
+        let index = bound_unique_index_no(&sys.table, current_key.index_no);
         let _ = index
             .insert_if_not_exists(
                 session.pool_guards().index_guard(),
@@ -3240,9 +3233,7 @@ fn test_lwc_non_unique_index_purge_compares_persisted_key_when_marker_is_not_pur
         let row_id = assert_row_in_lwc(&sys.table, session.pool_guards(), &pk, reader.sts()).await;
         reader.commit().await.unwrap();
 
-        let index = sys.table.sec_idx()[current_key.index_no]
-            .non_unique()
-            .unwrap();
+        let index = bound_non_unique_index_no(&sys.table, current_key.index_no);
         let _ = index
             .insert_if_not_exists(
                 session.pool_guards().index_guard(),
@@ -3337,7 +3328,7 @@ fn test_index_purge_removes_delete_marked_unique_entry_when_row_is_not_found() {
         let session = sys.try_new_session().unwrap();
         let key = single_key(9999i32);
         let row_id = 9999;
-        let index = sys.table.sec_idx()[key.index_no].unique().unwrap();
+        let index = bound_unique_index_no(&sys.table, key.index_no);
         let _ = index
             .insert_if_not_exists(
                 session.pool_guards().index_guard(),
@@ -3399,7 +3390,7 @@ fn test_unique_insert_rollback_restores_deleted_owner_even_when_row_missing() {
             RowLocation::NotFound
         ));
 
-        let index = sys.table.sec_idx()[key.index_no].unique().unwrap();
+        let index = bound_unique_index_no(&sys.table, key.index_no);
         assert!(
             index
                 .insert_if_not_exists(
@@ -3494,9 +3485,7 @@ fn test_unique_insert_rollback_restores_delete_marked_stale_hot_owner() {
             .await;
 
         let reader = session.try_begin_trx().unwrap().unwrap();
-        let old_row_id = sys.table.sec_idx()[live_key.index_no]
-            .unique()
-            .unwrap()
+        let old_row_id = bound_unique_index_no(&sys.table, live_key.index_no)
             .lookup(
                 session.pool_guards().index_guard(),
                 &live_key.vals,
@@ -3512,7 +3501,7 @@ fn test_unique_insert_rollback_restores_delete_marked_stale_hot_owner() {
             RowLocation::RowPage(_)
         ));
 
-        let index = sys.table.sec_idx()[stale_key.index_no].unique().unwrap();
+        let index = bound_unique_index_no(&sys.table, stale_key.index_no);
         assert!(
             index
                 .insert_if_not_exists(
@@ -3598,7 +3587,7 @@ fn test_checkpoint_fails_when_eligible_delete_marker_has_no_column_index() {
         sys.table.freeze(&session, usize::MAX).await;
         checkpoint_published(&sys.table, &mut session).await;
 
-        let root_before = sys.table.file().active_root().clone();
+        let root_before = sys.table.file().active_root_unchecked().clone();
         assert!(root_before.pivot_row_id > 0);
         assert_eq!(root_before.column_block_index_root, SUPER_BLOCK_ID);
         let marker_ts = root_before.deletion_cutoff_ts;
@@ -3610,7 +3599,7 @@ fn test_checkpoint_fails_when_eligible_delete_marker_has_no_column_index() {
 
         let err = sys.table.checkpoint(&mut session).await.unwrap_err();
         assert!(matches!(err, Error::InvalidState));
-        let root_after = sys.table.file().active_root();
+        let root_after = sys.table.file().active_root_unchecked();
         assert_eq!(
             root_after.deletion_cutoff_ts,
             root_before.deletion_cutoff_ts
@@ -3639,7 +3628,7 @@ fn test_checkpoint_fails_when_eligible_delete_marker_cannot_be_located() {
         let row_id = assert_row_in_lwc(&sys.table, session.pool_guards(), &key, reader.sts()).await;
         reader.commit().await.unwrap();
 
-        let root_before = sys.table.file().active_root().clone();
+        let root_before = sys.table.file().active_root_unchecked().clone();
         assert_ne!(root_before.column_block_index_root, SUPER_BLOCK_ID);
         let missing_row_id = row_id + 1;
         assert!(missing_row_id < root_before.pivot_row_id);
@@ -3663,7 +3652,7 @@ fn test_checkpoint_fails_when_eligible_delete_marker_cannot_be_located() {
         let err = sys.table.checkpoint(&mut session).await.unwrap_err();
         assert!(matches!(err, Error::InvalidState));
         assert_eq!(
-            sys.table.file().active_root().deletion_cutoff_ts,
+            sys.table.file().active_root_unchecked().deletion_cutoff_ts,
             root_before.deletion_cutoff_ts
         );
 
@@ -3686,7 +3675,7 @@ fn test_checkpoint_ignores_missing_old_delete_marker_below_previous_cutoff() {
         let row_id = assert_row_in_lwc(&sys.table, session.pool_guards(), &key, reader.sts()).await;
         reader.commit().await.unwrap();
 
-        let root_before = sys.table.file().active_root().clone();
+        let root_before = sys.table.file().active_root_unchecked().clone();
         assert!(root_before.deletion_cutoff_ts > 0);
         let missing_row_id = row_id + 1;
         assert!(missing_row_id < root_before.pivot_row_id);
@@ -3698,7 +3687,10 @@ fn test_checkpoint_ignores_missing_old_delete_marker_below_previous_cutoff() {
         wait_gc_cutoff_after(&session, root_before.deletion_cutoff_ts).await;
 
         checkpoint_published(&sys.table, &mut session).await;
-        assert!(sys.table.file().active_root().deletion_cutoff_ts > root_before.deletion_cutoff_ts);
+        assert!(
+            sys.table.file().active_root_unchecked().deletion_cutoff_ts
+                > root_before.deletion_cutoff_ts
+        );
 
         drop(session);
         sys.clean_all();
@@ -3719,7 +3711,7 @@ fn test_recover_cold_delete_rejects_already_deleted_with_different_cts() {
         let row_id = assert_row_in_lwc(&sys.table, session.pool_guards(), &key, reader.sts()).await;
         reader.commit().await.unwrap();
 
-        let active_root = sys.table.file().active_root();
+        let active_root = sys.table.file().active_root_unchecked();
         assert!(row_id < active_root.pivot_row_id);
         let cts = active_root.deletion_cutoff_ts;
         sys.table
@@ -3780,7 +3772,7 @@ fn test_checkpoint_skips_cold_delete_markers_at_or_after_cutoff() {
         let mut checkpoint_session = sys.try_new_session().unwrap();
         checkpoint_published(&sys.table, &mut checkpoint_session).await;
 
-        let active_root = sys.table.file().active_root();
+        let active_root = sys.table.file().active_root_unchecked();
         let index = ColumnBlockIndex::new(
             active_root.column_block_index_root,
             active_root.pivot_row_id,
@@ -3832,7 +3824,7 @@ fn test_checkpoint_fails_on_invalid_v2_delete_metadata() {
         wait_gc_cutoff_after(&session, marker1_ts).await;
         checkpoint_published(&sys.table, &mut session).await;
 
-        let active_root = sys.table.file().active_root();
+        let active_root = sys.table.file().active_root_unchecked();
         let index = ColumnBlockIndex::new(
             active_root.column_block_index_root,
             active_root.pivot_row_id,
@@ -3915,7 +3907,7 @@ fn test_checkpoint_fails_on_short_v2_delete_section_header() {
         wait_gc_cutoff_after(&session, marker1_ts).await;
         checkpoint_published(&sys.table, &mut session).await;
 
-        let active_root = sys.table.file().active_root();
+        let active_root = sys.table.file().active_root_unchecked();
         let index = ColumnBlockIndex::new(
             active_root.column_block_index_root,
             active_root.pivot_row_id,
@@ -3991,7 +3983,7 @@ fn test_row_page_transition_retries_update_delete() {
         let key = single_key(1i32);
         let mut trx = session.try_begin_trx().unwrap().unwrap();
         let mut stmt = trx.start_stmt();
-        let index = sys.table.sec_idx()[key.index_no].unique().unwrap();
+        let index = bound_unique_index_no(&sys.table, key.index_no);
         let (row_id, _) = index
             .lookup(
                 session.pool_guards().index_guard(),
@@ -4737,7 +4729,7 @@ fn test_transition_captures_uncommitted_lock_into_deletion_buffer() {
         let key = single_key(1i32);
         let mut trx = session.try_begin_trx().unwrap().unwrap();
         let mut stmt = trx.start_stmt();
-        let index = sys.table.sec_idx()[key.index_no].unique().unwrap();
+        let index = bound_unique_index_no(&sys.table, key.index_no);
         let (row_id, _) = index
             .lookup(
                 session.pool_guards().index_guard(),
@@ -4817,14 +4809,14 @@ fn test_checkpoint_basic_flow() {
         let name = "x".repeat(1024);
         insert_rows(&sys, &mut session, 0, 200, &name).await;
 
-        let old_root = sys.table.file().active_root().clone();
+        let old_root = sys.table.file().active_root_unchecked().clone();
         sys.table.freeze(&session, usize::MAX).await;
         let (frozen_pages, _) = sys.table.collect_frozen_pages(session.pool_guards()).await;
         assert!(!frozen_pages.is_empty());
 
         checkpoint_published(&sys.table, &mut session).await;
 
-        let new_root = sys.table.file().active_root();
+        let new_root = sys.table.file().active_root_unchecked();
         assert!(new_root.pivot_row_id > old_root.pivot_row_id);
         assert_ne!(new_root.column_block_index_root, SUPER_BLOCK_ID);
         assert!(new_root.deletion_cutoff_ts > old_root.deletion_cutoff_ts);
@@ -4839,7 +4831,7 @@ fn test_checkpoint_readiness_ready_when_root_crossed_gc_horizon() {
     smol::block_on(async {
         let sys = TestSys::new_evictable().await;
         let session = sys.try_new_session().unwrap();
-        let root_cts = sys.table.file().active_root().trx_id;
+        let root_cts = sys.table.file().active_root_unchecked().trx_id;
         let min_active_sts = sys.engine.trx_sys.calc_min_active_sts_for_gc();
         assert!(root_cts < min_active_sts);
         assert!(matches!(
@@ -4864,7 +4856,7 @@ fn test_checkpoint_readiness_delayed_reports_root_and_horizon() {
         let reader = reader_session.try_begin_trx().unwrap().unwrap();
         checkpoint_published(&sys.table, &mut session).await;
 
-        let active_root_cts = sys.table.file().active_root().trx_id;
+        let active_root_cts = sys.table.file().active_root_unchecked().trx_id;
         let readiness = sys.table.checkpoint_readiness(&session);
         let CheckpointReadiness::Delayed { reason } = readiness else {
             panic!("expected delayed checkpoint readiness, got {readiness:?}");
@@ -4897,7 +4889,10 @@ fn test_checkpoint_requires_idle_session_before_delayed_outcome() {
         let mut reader_session = sys.try_new_session().unwrap();
         let reader = reader_session.try_begin_trx().unwrap().unwrap();
         let first_checkpoint_ts = checkpoint_published(&sys.table, &mut session).await;
-        assert_eq!(sys.table.file().active_root().trx_id, first_checkpoint_ts);
+        assert_eq!(
+            sys.table.file().active_root_unchecked().trx_id,
+            first_checkpoint_ts
+        );
 
         let checkpoint_trx = session.try_begin_trx().unwrap().unwrap();
         assert!(session.in_trx());
@@ -4934,14 +4929,14 @@ fn test_checkpoint_delayed_preserves_root_and_frozen_pages_until_ready() {
         let mut reader_session = sys.try_new_session().unwrap();
         let reader = reader_session.try_begin_trx().unwrap().unwrap();
         checkpoint_published(&sys.table, &mut session).await;
-        let root_protected_by_reader = sys.table.file().active_root().trx_id;
+        let root_protected_by_reader = sys.table.file().active_root_unchecked().trx_id;
 
         insert_rows(&sys, &mut session, 1_000, 80, "delayed-frozen").await;
         sys.table.freeze(&session, usize::MAX).await;
         let (frozen_pages, _) = sys.table.collect_frozen_pages(session.pool_guards()).await;
         assert!(!frozen_pages.is_empty());
         let first_frozen_page = frozen_pages[0].page_id;
-        let root_before_delay = sys.table.file().active_root().clone();
+        let root_before_delay = sys.table.file().active_root_unchecked().clone();
 
         let outcome = sys.table.checkpoint(&mut session).await.unwrap();
         let CheckpointOutcome::Delayed { reason } = outcome else {
@@ -4965,7 +4960,7 @@ fn test_checkpoint_delayed_preserves_root_and_frozen_pages_until_ready() {
         reader.commit().await.unwrap();
         wait_gc_cutoff_after(&session, root_protected_by_reader).await;
         let checkpoint_ts = checkpoint_published(&sys.table, &mut session).await;
-        let root_after_publish = sys.table.file().active_root();
+        let root_after_publish = sys.table.file().active_root_unchecked();
         assert_eq!(root_after_publish.trx_id, checkpoint_ts);
         assert!(root_after_publish.pivot_row_id > root_before_delay.pivot_row_id);
 
@@ -4986,9 +4981,12 @@ fn test_second_checkpoint_waits_for_previous_root_horizon() {
         let mut reader_session = sys.try_new_session().unwrap();
         let reader = reader_session.try_begin_trx().unwrap().unwrap();
         let first_checkpoint_ts = checkpoint_published(&sys.table, &mut session).await;
-        assert_eq!(sys.table.file().active_root().trx_id, first_checkpoint_ts);
+        assert_eq!(
+            sys.table.file().active_root_unchecked().trx_id,
+            first_checkpoint_ts
+        );
 
-        let root_before_second = sys.table.file().active_root().clone();
+        let root_before_second = sys.table.file().active_root_unchecked().clone();
         let outcome = sys.table.checkpoint(&mut session).await.unwrap();
         let CheckpointOutcome::Delayed { reason } = outcome else {
             panic!("expected second checkpoint to wait, got {outcome:?}");
@@ -5067,7 +5065,7 @@ fn test_checkpoint_old_root_released_after_active_reader_purged() {
         insert_rows(&sys, &mut session, 0, 120, &name).await;
 
         sys.table.freeze(&session, usize::MAX).await;
-        let retained_root_ptr = sys.table.file().active_root() as *const _ as usize;
+        let retained_root_ptr = sys.table.file().active_root_unchecked() as *const _ as usize;
         let drop_count_before = old_root_drop_count(retained_root_ptr);
 
         let mut read_session = sys.try_new_session().unwrap();
@@ -5124,7 +5122,7 @@ fn test_checkpoint_persistence_recovery() {
         table.freeze(&session, usize::MAX).await;
         checkpoint_published(&table, &mut session).await;
 
-        let root_before = table.file().active_root().clone();
+        let root_before = table.file().active_root_unchecked().clone();
         drop(table);
 
         let table_file = engine
@@ -5132,7 +5130,7 @@ fn test_checkpoint_persistence_recovery() {
             .open_table_file(table_id, engine.disk_pool.clone_inner())
             .await
             .unwrap();
-        let root_after = table_file.active_root();
+        let root_after = table_file.active_root_unchecked();
         assert_eq!(root_after.pivot_row_id, root_before.pivot_row_id);
         assert_eq!(
             root_after.heap_redo_start_ts,
@@ -5158,9 +5156,9 @@ fn test_checkpoint_heartbeat() {
         let name = "h".repeat(128);
         insert_rows(&sys, &mut session, 0, 40, &name).await;
 
-        let root_before = sys.table.file().active_root().clone();
+        let root_before = sys.table.file().active_root_unchecked().clone();
         checkpoint_published(&sys.table, &mut session).await;
-        let root_after = sys.table.file().active_root();
+        let root_after = sys.table.file().active_root_unchecked();
 
         assert_eq!(root_after.pivot_row_id, root_before.pivot_row_id);
         assert!(root_after.heap_redo_start_ts > root_before.heap_redo_start_ts);
@@ -5627,14 +5625,14 @@ fn test_checkpoint_error_rollback() {
         insert_rows(&sys, &mut session, 0, 80, &name).await;
 
         sys.table.freeze(&session, usize::MAX).await;
-        let root_before = sys.table.file().active_root().clone();
+        let root_before = sys.table.file().active_root_unchecked().clone();
 
         set_test_force_lwc_build_error(true);
         let res = sys.table.checkpoint(&mut session).await;
         set_test_force_lwc_build_error(false);
         assert!(res.is_err());
 
-        let root_after = sys.table.file().active_root();
+        let root_after = sys.table.file().active_root_unchecked();
         assert_eq!(root_after.pivot_row_id, root_before.pivot_row_id);
         assert_eq!(
             root_after.heap_redo_start_ts,
@@ -6117,13 +6115,35 @@ fn unwrap_insert_result(res: Result<InsertMvcc>) -> RowID {
     }
 }
 
+fn active_secondary_root(table: &Table, index_no: usize) -> BlockID {
+    table.file().active_root_unchecked().secondary_index_roots[index_no]
+}
+
+fn bound_unique_index_no(
+    table: &Table,
+    index_no: usize,
+) -> UniqueSecondaryIndex<'_, EvictableBufferPool> {
+    table.sec_idx()[index_no]
+        .bind_unique(active_secondary_root(table, index_no))
+        .unwrap()
+}
+
+fn bound_non_unique_index_no(
+    table: &Table,
+    index_no: usize,
+) -> NonUniqueSecondaryIndex<'_, EvictableBufferPool> {
+    table.sec_idx()[index_no]
+        .bind_non_unique(active_secondary_root(table, index_no))
+        .unwrap()
+}
+
 async fn assert_row_in_lwc(
     table: &Table,
     guards: &PoolGuards,
     key: &SelectKey,
     sts: TrxID,
 ) -> RowID {
-    let index = table.sec_idx()[key.index_no].unique().unwrap();
+    let index = bound_unique_index_no(table, key.index_no);
     let Some((row_id, _)) = index
         .lookup(guards.index_guard(), &key.vals, sts)
         .await
@@ -6143,7 +6163,7 @@ async fn unique_disk_tree_lookup(
     guards: &PoolGuards,
     key: &SelectKey,
 ) -> Option<RowID> {
-    let root = table.file().active_root().secondary_index_roots[key.index_no];
+    let root = active_secondary_root(table, key.index_no);
     let tree = table
         .storage
         .secondary_index_runtime(key.index_no)
@@ -6158,7 +6178,7 @@ async fn non_unique_disk_tree_prefix_scan(
     guards: &PoolGuards,
     key: &SelectKey,
 ) -> Vec<RowID> {
-    let root = table.file().active_root().secondary_index_roots[key.index_no];
+    let root = active_secondary_root(table, key.index_no);
     let tree = table
         .storage
         .secondary_index_runtime(key.index_no)
@@ -6181,7 +6201,7 @@ async fn assert_unique_index_entry(
     expected_row_id: RowID,
     expected_deleted: bool,
 ) {
-    let index = table.sec_idx()[key.index_no].unique().unwrap();
+    let index = bound_unique_index_no(table, key.index_no);
     let Some((row_id, deleted)) = index
         .lookup(guards.index_guard(), &key.vals, sts)
         .await
@@ -6221,7 +6241,7 @@ async fn checkpoint_published(table: &Table, session: &mut Session) -> TrxID {
 }
 
 fn assert_root_metadata_unchanged(before: &crate::file::table_file::ActiveRoot, table: &Table) {
-    let after = table.file().active_root();
+    let after = table.file().active_root_unchecked();
     assert_eq!(after.trx_id, before.trx_id);
     assert_eq!(after.meta_block_id, before.meta_block_id);
     assert_eq!(after.pivot_row_id, before.pivot_row_id);

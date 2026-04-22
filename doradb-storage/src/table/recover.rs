@@ -2,6 +2,7 @@ use crate::buffer::PageID;
 use crate::buffer::PoolGuards;
 use crate::error::{Error, Result};
 use crate::index::IndexInsert;
+use crate::index::{NonUniqueIndex, UniqueIndex};
 use crate::row::ops::{ReadRow, SelectKey, UpdateCol};
 use crate::row::{RowID, RowRead};
 use crate::table::{
@@ -162,7 +163,7 @@ impl TableRecover for Table {
         // `recovery_bootstrap_unchecked`: restart recovery runs without
         // surviving user transactions, so it binds the current loaded root
         // directly for cold-row delete replay predicates.
-        let active_root = self.file().active_root();
+        let active_root = self.file().active_root_unchecked();
         if row_id < active_root.pivot_row_id {
             if cts < active_root.deletion_cutoff_ts {
                 return Ok(());
@@ -234,9 +235,9 @@ impl TableRecover for Table {
                 match row_access.read_row_latest(metadata, &read_set, None) {
                     ReadRow::Ok(vals) => {
                         if index_spec.unique() {
-                            let index = sec_idx.unique().unwrap();
+                            let index = sec_idx.unique_mem()?;
                             let res = index
-                                .insert_recovery_mem_only(
+                                .insert_if_not_exists(
                                     index_pool_guard,
                                     &vals,
                                     row_id,
@@ -246,9 +247,9 @@ impl TableRecover for Table {
                                 .await?;
                             ensure_recovery_index_insert(sec_idx.index_no(), res)?;
                         } else {
-                            let index = sec_idx.non_unique().unwrap();
+                            let index = sec_idx.non_unique_mem()?;
                             let res = index
-                                .insert_recovery_mem_only(
+                                .insert_if_not_exists(
                                     index_pool_guard,
                                     &vals,
                                     row_id,
@@ -268,8 +269,9 @@ impl TableRecover for Table {
     }
 }
 
+/// Reject duplicate secondary-index entries during recovery rebuild.
 #[inline]
-fn ensure_recovery_index_insert(index_no: usize, res: IndexInsert) -> Result<()> {
+pub(super) fn ensure_recovery_index_insert(index_no: usize, res: IndexInsert) -> Result<()> {
     match res {
         IndexInsert::Ok(_) => Ok(()),
         IndexInsert::DuplicateKey(row_id, deleted) => Err(Error::UnexpectedRecoveryDuplicateKey {

@@ -18,7 +18,7 @@ use std::future::Future;
 use std::mem;
 
 /// Abstraction of non-unique index.
-pub trait NonUniqueIndex: Send + Sync + 'static {
+pub trait NonUniqueIndex: Send + Sync {
     /// Lookup key and put associated values into given collection.
     fn lookup(
         &self,

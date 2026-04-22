@@ -142,6 +142,12 @@ The script regenerates coverage artifacts for the default `io_uring`
 configuration and runs `cargo llvm-cov nextest --lcov` before printing focused
 line-coverage summaries and uncovered-line hotspots.
 
+Treat 80% focused coverage as the default review bar for the requested path. If
+the requested path is a central definition-heavy file such as a shared error or
+type declaration module, a lower whole-file result is acceptable only when the
+review notes explain why the file is definition-heavy and cite affected
+consumer/runtime paths whose focused coverage still meets the normal 80% bar.
+
 The script keeps instrumented build artifacts under `target/coverage-focus/`
 for faster warmed reruns while regenerating fresh report output on each run.
 

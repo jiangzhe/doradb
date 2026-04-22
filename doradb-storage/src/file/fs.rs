@@ -1977,7 +1977,7 @@ pub(crate) mod tests {
                 crate::trx::MIN_SNAPSHOT_TS
             );
             assert_eq!(snapshot.meta.next_user_obj_id, USER_OBJ_ID_START);
-            assert!(mtb.active_root().meta_block_id > BlockID::new(0));
+            assert!(mtb.active_root_unchecked().meta_block_id > BlockID::new(0));
         });
     }
 

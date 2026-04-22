@@ -8,12 +8,9 @@
 use super::disk_tree::{
     NonUniqueDiskTree, NonUniqueDiskTreeRuntime, UniqueDiskTree, UniqueDiskTreeRuntime,
 };
-use super::non_unique_index::{
-    NonUniqueIndex, NonUniqueMemIndex, NonUniqueMemIndexCleanupScan, NonUniqueMemIndexEntry,
-};
-use super::unique_index::{
-    UniqueIndex, UniqueMemIndex, UniqueMemIndexCleanupScan, UniqueMemIndexEntry,
-};
+use super::non_unique_index::{NonUniqueIndex, NonUniqueMemIndex, NonUniqueMemIndexEntry};
+use super::unique_index::UniqueMemIndexEntry;
+use super::unique_index::{UniqueIndex, UniqueMemIndex};
 use crate::buffer::{BufferPool, PoolGuard, ReadonlyBufferPool};
 use crate::catalog::{IndexSpec, TableMetadata};
 use crate::error::{Error, Result};
@@ -137,15 +134,11 @@ impl<P: BufferPool> InMemorySecondaryIndex<P> {
 
 /// Runtime cold-layer opener for one user-table secondary DiskTree.
 ///
-/// The runtime is table-specific by construction. Each open reads the currently
-/// published secondary root from the table file, then hands that copied root to
-/// a typed DiskTree reader. Already opened readers keep their root snapshot.
-///
-/// This is a `runtime_checked_future` boundary. RFC-0015 should migrate normal
-/// runtime opens to root ids captured from `TableRootSnapshot`.
+/// The runtime is table-specific by construction. Foreground/runtime callers
+/// must pass a root id captured from a proof-gated table snapshot. Already
+/// opened readers keep their root snapshot.
 pub(crate) struct SecondaryDiskTreeRuntime {
     index_no: usize,
-    table_file: Arc<TableFile>,
     kind: SecondaryDiskTreeRuntimeKind,
 }
 
@@ -167,13 +160,6 @@ impl SecondaryDiskTreeRuntime {
             .index_specs
             .get(index_no)
             .ok_or(Error::InvalidArgument)?;
-        // Load-time validation only checks that the checkpoint root contains
-        // this index slot. Foreground opens should later use snapshot roots.
-        table_file
-            .active_root()
-            .secondary_index_roots
-            .get(index_no)
-            .ok_or(Error::InvalidArgument)?;
         let file_kind = table_file.file_kind();
         let file = Arc::clone(table_file.sparse_file());
         let kind = if index_spec.unique() {
@@ -193,26 +179,8 @@ impl SecondaryDiskTreeRuntime {
                 disk_pool,
             )?)
         };
-        let runtime = Self {
-            index_no,
-            table_file,
-            kind,
-        };
+        let runtime = Self { index_no, kind };
         Ok(runtime)
-    }
-
-    /// Return the current published DiskTree root for this secondary index.
-    ///
-    /// Runtime callers should treat this as the transitional unchecked root
-    /// source until proof-gated table snapshots provide the root id directly.
-    #[inline]
-    pub(crate) fn published_root(&self) -> Result<BlockID> {
-        self.table_file
-            .active_root()
-            .secondary_index_roots
-            .get(self.index_no)
-            .copied()
-            .ok_or(Error::InvalidArgument)
     }
 
     /// Return the table index number represented by this context.
@@ -221,11 +189,7 @@ impl SecondaryDiskTreeRuntime {
         self.index_no
     }
 
-    #[inline]
-    pub(crate) fn is_unique(&self) -> bool {
-        matches!(self.kind, SecondaryDiskTreeRuntimeKind::Unique(_))
-    }
-
+    /// Borrow a guard for opening one or more DiskTree readers on this runtime.
     #[inline]
     pub(crate) fn disk_pool_guard(&self) -> PoolGuard {
         match &self.kind {
@@ -234,16 +198,7 @@ impl SecondaryDiskTreeRuntime {
         }
     }
 
-    #[inline]
-    pub(crate) fn open_unique<'a>(
-        &'a self,
-        disk_pool_guard: &'a PoolGuard,
-    ) -> Result<UniqueDiskTree<'a>> {
-        // Future runtime callers should pass a snapshot-derived root id into
-        // `open_unique_at` instead of reading the moving current root here.
-        self.open_unique_at(self.published_root()?, disk_pool_guard)
-    }
-
+    /// Open the unique secondary DiskTree at one captured root block id.
     #[inline]
     pub(crate) fn open_unique_at<'a>(
         &'a self,
@@ -254,20 +209,14 @@ impl SecondaryDiskTreeRuntime {
             SecondaryDiskTreeRuntimeKind::Unique(runtime) => {
                 Ok(runtime.open(root_block_id, disk_pool_guard))
             }
-            SecondaryDiskTreeRuntimeKind::NonUnique(_) => Err(Error::InvalidArgument),
+            SecondaryDiskTreeRuntimeKind::NonUnique(_) => Err(Error::WrongSecondaryIndexBinding {
+                expected: "unique",
+                actual: "non-unique",
+            }),
         }
     }
 
-    #[inline]
-    pub(crate) fn open_non_unique<'a>(
-        &'a self,
-        disk_pool_guard: &'a PoolGuard,
-    ) -> Result<NonUniqueDiskTree<'a>> {
-        // Future runtime callers should pass a snapshot-derived root id into
-        // `open_non_unique_at` instead of reading the moving current root here.
-        self.open_non_unique_at(self.published_root()?, disk_pool_guard)
-    }
-
+    /// Open the non-unique secondary DiskTree at one captured root block id.
     #[inline]
     pub(crate) fn open_non_unique_at<'a>(
         &'a self,
@@ -275,7 +224,10 @@ impl SecondaryDiskTreeRuntime {
         disk_pool_guard: &'a PoolGuard,
     ) -> Result<NonUniqueDiskTree<'a>> {
         match &self.kind {
-            SecondaryDiskTreeRuntimeKind::Unique(_) => Err(Error::InvalidArgument),
+            SecondaryDiskTreeRuntimeKind::Unique(_) => Err(Error::WrongSecondaryIndexBinding {
+                expected: "non-unique",
+                actual: "unique",
+            }),
             SecondaryDiskTreeRuntimeKind::NonUnique(runtime) => {
                 Ok(runtime.open(root_block_id, disk_pool_guard))
             }
@@ -283,133 +235,143 @@ impl SecondaryDiskTreeRuntime {
     }
 }
 
-/// Composite unique secondary index over a mutable MemIndex and cold DiskTree.
-pub(crate) struct UniqueSecondaryIndex<P: 'static> {
-    mem: UniqueMemIndex<P>,
-    disk: SecondaryDiskTreeRuntime,
+/// Owned user-table secondary-index storage.
+pub(crate) enum SecondaryIndex<P: 'static> {
+    /// Unique MemIndex plus cold DiskTree runtime.
+    Unique {
+        mem: UniqueMemIndex<P>,
+        disk: SecondaryDiskTreeRuntime,
+    },
+    /// Non-unique MemIndex plus cold DiskTree runtime.
+    NonUnique {
+        mem: NonUniqueMemIndex<P>,
+        disk: SecondaryDiskTreeRuntime,
+    },
 }
 
-impl<P: BufferPool> UniqueSecondaryIndex<P> {
-    /// Return the cold DiskTree runtime used by this composite.
-    #[inline]
-    pub(crate) fn disk(&self) -> &SecondaryDiskTreeRuntime {
-        &self.disk
-    }
-
+impl<P: BufferPool> SecondaryIndex<P> {
     /// Destroy the mutable MemIndex owned by this composite index.
     #[inline]
     pub(crate) async fn destroy(self, pool_guard: &PoolGuard) -> Result<()> {
-        self.mem.destroy(pool_guard).await
-    }
-
-    /// Create a cleanup-only MemIndex scan without reading DiskTree.
-    #[inline]
-    pub(crate) fn cleanup_mem_scan<'a>(
-        &'a self,
-        pool_guard: &'a PoolGuard,
-        pivot_row_id: RowID,
-        clean_live_entries: bool,
-    ) -> UniqueMemIndexCleanupScan<'a, P> {
-        self.mem
-            .cleanup_scan(pool_guard, pivot_row_id, clean_live_entries)
-    }
-
-    /// Return whether `key` encodes to the same MemIndex key bytes captured by
-    /// a cleanup scan.
-    #[inline]
-    pub(crate) fn mem_encoded_key_matches(&self, key: &[Val], encoded_key: &[u8]) -> bool {
-        self.mem.encoded_key_matches(key, encoded_key)
-    }
-
-    /// Remove one scanned MemIndex entry only if its current state still
-    /// matches the scan result.
-    #[inline]
-    pub(crate) async fn compare_delete_mem_encoded_entry(
-        &self,
-        pool_guard: &PoolGuard,
-        encoded_key: &[u8],
-        row_id: RowID,
-        deleted: bool,
-        ts: TrxID,
-    ) -> Result<bool> {
-        self.mem
-            .compare_delete_encoded_entry(pool_guard, encoded_key, row_id, deleted, ts)
-            .await
-    }
-
-    /// Insert into the MemIndex backend during recovery without probing DiskTree.
-    ///
-    /// Recovery uses this for hot/post-checkpoint row-page state. Checkpointed
-    /// cold state is already represented by the DiskTree root and must not be
-    /// treated as a duplicate while rebuilding MemIndex.
-    #[inline]
-    pub(crate) async fn insert_recovery_mem_only(
-        &self,
-        pool_guard: &PoolGuard,
-        key: &[Val],
-        row_id: RowID,
-        merge_if_match_deleted: bool,
-        ts: TrxID,
-    ) -> Result<IndexInsert> {
-        self.mem
-            .insert_if_not_exists(pool_guard, key, row_id, merge_if_match_deleted, ts)
-            .await
-    }
-
-    /// Compare-exchange the MemIndex backend during recovery without DiskTree access.
-    #[inline]
-    pub(crate) async fn compare_exchange_recovery_mem_only(
-        &self,
-        pool_guard: &PoolGuard,
-        key: &[Val],
-        old_row_id: RowID,
-        new_row_id: RowID,
-        ts: TrxID,
-    ) -> Result<IndexCompareExchange> {
-        self.mem
-            .compare_exchange(pool_guard, key, old_row_id, new_row_id, ts)
-            .await
-    }
-
-    #[inline]
-    fn open_with_root<'a>(
-        &'a self,
-        secondary_root: Option<BlockID>,
-        disk_pool_guard: &'a PoolGuard,
-    ) -> Result<UniqueDiskTree<'a>> {
-        match secondary_root {
-            Some(root) => self.disk.open_unique_at(root, disk_pool_guard),
-            None => self.disk.open_unique(disk_pool_guard),
+        match self {
+            Self::Unique { mem, .. } => mem.destroy(pool_guard).await,
+            Self::NonUnique { mem, .. } => mem.destroy(pool_guard).await,
         }
     }
 
-    /// Lookup using the current or a caller-captured secondary DiskTree root.
+    /// Return whether this composite index enforces uniqueness.
     #[inline]
-    pub(crate) async fn lookup_with_root(
+    pub(crate) fn is_unique(&self) -> bool {
+        matches!(self, Self::Unique { .. })
+    }
+
+    /// Return the table index number from the cold runtime.
+    #[inline]
+    pub(crate) fn index_no(&self) -> usize {
+        self.disk_runtime().index_no()
+    }
+
+    /// Return the cold DiskTree runtime used by this composite.
+    #[inline]
+    pub(crate) fn disk_runtime(&self) -> &SecondaryDiskTreeRuntime {
+        match self {
+            Self::Unique { disk, .. } | Self::NonUnique { disk, .. } => disk,
+        }
+    }
+
+    /// Return the unique MemIndex when this slot is unique.
+    #[inline]
+    pub(crate) fn unique_mem(&self) -> Result<&UniqueMemIndex<P>> {
+        match self {
+            Self::Unique { mem, .. } => Ok(mem),
+            Self::NonUnique { .. } => Err(Error::WrongSecondaryIndexBinding {
+                expected: "unique",
+                actual: "non-unique",
+            }),
+        }
+    }
+
+    /// Return the non-unique MemIndex when this slot is non-unique.
+    #[inline]
+    pub(crate) fn non_unique_mem(&self) -> Result<&NonUniqueMemIndex<P>> {
+        match self {
+            Self::Unique { .. } => Err(Error::WrongSecondaryIndexBinding {
+                expected: "non-unique",
+                actual: "unique",
+            }),
+            Self::NonUnique { mem, .. } => Ok(mem),
+        }
+    }
+
+    /// Bind a unique user-table secondary index to one captured DiskTree root.
+    #[inline]
+    pub(crate) fn bind_unique(&self, root: BlockID) -> Result<UniqueSecondaryIndex<'_, P>> {
+        match self {
+            Self::Unique { mem, disk } => Ok(UniqueSecondaryIndex::new(mem, disk, root)),
+            Self::NonUnique { .. } => Err(Error::WrongSecondaryIndexBinding {
+                expected: "unique",
+                actual: "non-unique",
+            }),
+        }
+    }
+
+    /// Bind a non-unique user-table secondary index to one captured DiskTree root.
+    #[inline]
+    pub(crate) fn bind_non_unique(&self, root: BlockID) -> Result<NonUniqueSecondaryIndex<'_, P>> {
+        match self {
+            Self::Unique { .. } => Err(Error::WrongSecondaryIndexBinding {
+                expected: "non-unique",
+                actual: "unique",
+            }),
+            Self::NonUnique { mem, disk } => Ok(NonUniqueSecondaryIndex::new(mem, disk, root)),
+        }
+    }
+}
+
+/// Root-bound unique secondary index view over one MemIndex plus DiskTree root.
+#[derive(Clone, Copy)]
+pub(crate) struct UniqueSecondaryIndex<'a, P: 'static> {
+    mem: &'a UniqueMemIndex<P>,
+    disk: &'a SecondaryDiskTreeRuntime,
+    root: BlockID,
+}
+
+impl<'a, P: BufferPool> UniqueSecondaryIndex<'a, P> {
+    #[inline]
+    fn new(mem: &'a UniqueMemIndex<P>, disk: &'a SecondaryDiskTreeRuntime, root: BlockID) -> Self {
+        Self { mem, disk, root }
+    }
+
+    #[inline]
+    fn open<'b>(&'b self, disk_pool_guard: &'b PoolGuard) -> Result<UniqueDiskTree<'b>> {
+        self.disk.open_unique_at(self.root, disk_pool_guard)
+    }
+}
+
+impl<P: BufferPool> UniqueIndex for UniqueSecondaryIndex<'_, P> {
+    #[inline]
+    async fn lookup(
         &self,
         pool_guard: &PoolGuard,
         key: &[Val],
         ts: TrxID,
-        secondary_root: Option<BlockID>,
     ) -> Result<Option<(RowID, bool)>> {
         if let Some(hit) = self.mem.lookup(pool_guard, key, ts).await? {
             return Ok(Some(hit));
         }
         let disk_pool_guard = self.disk.disk_pool_guard();
-        let disk = self.open_with_root(secondary_root, &disk_pool_guard)?;
+        let disk = self.open(&disk_pool_guard)?;
         Ok(disk.lookup(key).await?.map(|row_id| (row_id, false)))
     }
 
-    /// Insert if absent using the current or a caller-captured secondary DiskTree root.
     #[inline]
-    pub(crate) async fn insert_if_not_exists_with_root(
+    async fn insert_if_not_exists(
         &self,
         pool_guard: &PoolGuard,
         key: &[Val],
         row_id: RowID,
         merge_if_match_deleted: bool,
         ts: TrxID,
-        secondary_root: Option<BlockID>,
     ) -> Result<IndexInsert> {
         debug_assert!(!row_id.is_deleted());
         if let Some((old_row_id, deleted)) = self.mem.lookup(pool_guard, key, ts).await? {
@@ -422,122 +384,13 @@ impl<P: BufferPool> UniqueSecondaryIndex<P> {
             return Ok(IndexInsert::DuplicateKey(old_row_id, deleted));
         }
         let disk_pool_guard = self.disk.disk_pool_guard();
-        let disk = self.open_with_root(secondary_root, &disk_pool_guard)?;
+        let disk = self.open(&disk_pool_guard)?;
         if let Some(cold_row_id) = disk.lookup(key).await? {
             return Ok(IndexInsert::DuplicateKey(cold_row_id, false));
         }
         self.mem
             .insert_if_not_exists(pool_guard, key, row_id, false, ts)
             .await
-    }
-
-    /// Compare-exchange using the current or a caller-captured secondary DiskTree root.
-    #[inline]
-    pub(crate) async fn compare_exchange_with_root(
-        &self,
-        pool_guard: &PoolGuard,
-        key: &[Val],
-        old_row_id: RowID,
-        new_row_id: RowID,
-        ts: TrxID,
-        secondary_root: Option<BlockID>,
-    ) -> Result<IndexCompareExchange> {
-        if self.mem.lookup(pool_guard, key, ts).await?.is_some() {
-            return self
-                .mem
-                .compare_exchange(pool_guard, key, old_row_id, new_row_id, ts)
-                .await;
-        }
-        // Delete-shadows are MemIndex overlays. If purge removed the shadow
-        // between the caller's lookup and this compare-exchange, retry instead
-        // of comparing the masked RowID against the unmasked DiskTree owner.
-        if old_row_id.is_deleted() {
-            return Ok(IndexCompareExchange::NotExists);
-        }
-        let disk_pool_guard = self.disk.disk_pool_guard();
-        let disk = self.open_with_root(secondary_root, &disk_pool_guard)?;
-        match disk.lookup(key).await? {
-            Some(cold_row_id) if cold_row_id == old_row_id => {
-                if self
-                    .mem
-                    .insert_overlay_if_absent(pool_guard, key, new_row_id, ts)
-                    .await?
-                {
-                    Ok(IndexCompareExchange::Ok)
-                } else {
-                    Ok(IndexCompareExchange::Mismatch)
-                }
-            }
-            Some(_) => Ok(IndexCompareExchange::Mismatch),
-            None => Ok(IndexCompareExchange::NotExists),
-        }
-    }
-
-    /// Mask an entry as deleted using the current or a caller-captured secondary DiskTree root.
-    #[inline]
-    pub(crate) async fn mask_as_deleted_with_root(
-        &self,
-        pool_guard: &PoolGuard,
-        key: &[Val],
-        row_id: RowID,
-        ts: TrxID,
-        secondary_root: Option<BlockID>,
-    ) -> Result<bool> {
-        debug_assert!(!row_id.is_deleted());
-        let new_row_id = row_id.deleted();
-        self.compare_exchange_with_root(pool_guard, key, row_id, new_row_id, ts, secondary_root)
-            .await
-            .map(|res| match res {
-                IndexCompareExchange::Ok => true,
-                IndexCompareExchange::Mismatch | IndexCompareExchange::NotExists => false,
-            })
-    }
-
-    #[inline]
-    async fn scan_values_with_root(
-        &self,
-        pool_guard: &PoolGuard,
-        values: &mut Vec<RowID>,
-        secondary_root: Option<BlockID>,
-    ) -> Result<()> {
-        let mem_entries = self.mem.scan_encoded_entries(pool_guard).await?;
-        let disk_pool_guard = self.disk.disk_pool_guard();
-        let disk = self.open_with_root(secondary_root, &disk_pool_guard)?;
-        let disk_entries = disk.scan_entries().await?;
-        merge_unique_entries(&mem_entries, &disk_entries, values);
-        Ok(())
-    }
-}
-
-impl<P: BufferPool + 'static> UniqueIndex for UniqueSecondaryIndex<P> {
-    #[inline]
-    async fn lookup(
-        &self,
-        pool_guard: &PoolGuard,
-        key: &[Val],
-        ts: TrxID,
-    ) -> Result<Option<(RowID, bool)>> {
-        self.lookup_with_root(pool_guard, key, ts, None).await
-    }
-
-    #[inline]
-    async fn insert_if_not_exists(
-        &self,
-        pool_guard: &PoolGuard,
-        key: &[Val],
-        row_id: RowID,
-        merge_if_match_deleted: bool,
-        ts: TrxID,
-    ) -> Result<IndexInsert> {
-        self.insert_if_not_exists_with_root(
-            pool_guard,
-            key,
-            row_id,
-            merge_if_match_deleted,
-            ts,
-            None,
-        )
-        .await
     }
 
     #[inline]
@@ -564,8 +417,32 @@ impl<P: BufferPool + 'static> UniqueIndex for UniqueSecondaryIndex<P> {
         new_row_id: RowID,
         ts: TrxID,
     ) -> Result<IndexCompareExchange> {
-        self.compare_exchange_with_root(pool_guard, key, old_row_id, new_row_id, ts, None)
-            .await
+        if self.mem.lookup(pool_guard, key, ts).await?.is_some() {
+            return self
+                .mem
+                .compare_exchange(pool_guard, key, old_row_id, new_row_id, ts)
+                .await;
+        }
+        if old_row_id.is_deleted() {
+            return Ok(IndexCompareExchange::NotExists);
+        }
+        let disk_pool_guard = self.disk.disk_pool_guard();
+        let disk = self.open(&disk_pool_guard)?;
+        match disk.lookup(key).await? {
+            Some(cold_row_id) if cold_row_id == old_row_id => {
+                if self
+                    .mem
+                    .insert_overlay_if_absent(pool_guard, key, new_row_id, ts)
+                    .await?
+                {
+                    Ok(IndexCompareExchange::Ok)
+                } else {
+                    Ok(IndexCompareExchange::Mismatch)
+                }
+            }
+            Some(_) => Ok(IndexCompareExchange::Mismatch),
+            None => Ok(IndexCompareExchange::NotExists),
+        }
     }
 
     #[inline]
@@ -575,131 +452,69 @@ impl<P: BufferPool + 'static> UniqueIndex for UniqueSecondaryIndex<P> {
         values: &mut Vec<RowID>,
         _ts: TrxID,
     ) -> Result<()> {
-        self.scan_values_with_root(pool_guard, values, None).await
+        let mem_entries = self.mem.scan_encoded_entries(pool_guard).await?;
+        let disk_pool_guard = self.disk.disk_pool_guard();
+        let disk = self.open(&disk_pool_guard)?;
+        let disk_entries = disk.scan_entries().await?;
+        merge_unique_entries(&mem_entries, &disk_entries, values);
+        Ok(())
     }
 }
 
-/// Composite non-unique secondary index over a mutable MemIndex and cold DiskTree.
-pub(crate) struct NonUniqueSecondaryIndex<P: 'static> {
-    mem: NonUniqueMemIndex<P>,
-    disk: SecondaryDiskTreeRuntime,
+/// Root-bound non-unique secondary index view over one MemIndex plus DiskTree root.
+#[derive(Clone, Copy)]
+pub(crate) struct NonUniqueSecondaryIndex<'a, P: 'static> {
+    mem: &'a NonUniqueMemIndex<P>,
+    disk: &'a SecondaryDiskTreeRuntime,
+    root: BlockID,
 }
 
-impl<P: BufferPool> NonUniqueSecondaryIndex<P> {
-    /// Return the cold DiskTree runtime used by this composite.
+impl<'a, P: BufferPool> NonUniqueSecondaryIndex<'a, P> {
     #[inline]
-    pub(crate) fn disk(&self) -> &SecondaryDiskTreeRuntime {
-        &self.disk
-    }
-
-    /// Destroy the mutable MemIndex owned by this composite index.
-    #[inline]
-    pub(crate) async fn destroy(self, pool_guard: &PoolGuard) -> Result<()> {
-        self.mem.destroy(pool_guard).await
-    }
-
-    /// Create a cleanup-only MemIndex scan without reading DiskTree.
-    #[inline]
-    pub(crate) fn cleanup_mem_scan<'a>(
-        &'a self,
-        pool_guard: &'a PoolGuard,
-        pivot_row_id: RowID,
-        clean_live_entries: bool,
-    ) -> NonUniqueMemIndexCleanupScan<'a, P> {
-        self.mem
-            .cleanup_scan(pool_guard, pivot_row_id, clean_live_entries)
-    }
-
-    /// Return whether `key` plus `row_id` encodes to the same exact MemIndex key
-    /// bytes captured by a cleanup scan.
-    #[inline]
-    pub(crate) fn mem_encoded_exact_key_matches(
-        &self,
-        key: &[Val],
-        row_id: RowID,
-        encoded_key: &[u8],
-    ) -> bool {
-        self.mem.encoded_exact_key_matches(key, row_id, encoded_key)
-    }
-
-    /// Remove one scanned MemIndex exact entry only if its current state still
-    /// matches the scan result.
-    #[inline]
-    pub(crate) async fn compare_delete_mem_encoded_entry(
-        &self,
-        pool_guard: &PoolGuard,
-        encoded_key: &[u8],
-        deleted: bool,
-        ts: TrxID,
-    ) -> Result<bool> {
-        self.mem
-            .compare_delete_encoded_entry(pool_guard, encoded_key, deleted, ts)
-            .await
-    }
-
-    /// Insert into the MemIndex backend during recovery without probing DiskTree.
-    ///
-    /// Non-unique DiskTree exact entries are checkpointed cold state. Hot redo
-    /// rebuilds only exact MemIndex entries and must not reject a row because a
-    /// checkpointed cold exact entry exists.
-    #[inline]
-    pub(crate) async fn insert_recovery_mem_only(
-        &self,
-        pool_guard: &PoolGuard,
-        key: &[Val],
-        row_id: RowID,
-        merge_if_match_deleted: bool,
-        ts: TrxID,
-    ) -> Result<IndexInsert> {
-        self.mem
-            .insert_if_not_exists(pool_guard, key, row_id, merge_if_match_deleted, ts)
-            .await
+    fn new(
+        mem: &'a NonUniqueMemIndex<P>,
+        disk: &'a SecondaryDiskTreeRuntime,
+        root: BlockID,
+    ) -> Self {
+        Self { mem, disk, root }
     }
 
     #[inline]
-    fn open_with_root<'a>(
-        &'a self,
-        secondary_root: Option<BlockID>,
-        disk_pool_guard: &'a PoolGuard,
-    ) -> Result<NonUniqueDiskTree<'a>> {
-        match secondary_root {
-            Some(root) => self.disk.open_non_unique_at(root, disk_pool_guard),
-            None => self.disk.open_non_unique(disk_pool_guard),
-        }
+    fn open<'b>(&'b self, disk_pool_guard: &'b PoolGuard) -> Result<NonUniqueDiskTree<'b>> {
+        self.disk.open_non_unique_at(self.root, disk_pool_guard)
     }
+}
 
-    /// Lookup using the current or a caller-captured secondary DiskTree root.
+impl<P: BufferPool> NonUniqueIndex for NonUniqueSecondaryIndex<'_, P> {
     #[inline]
-    pub(crate) async fn lookup_with_root(
+    async fn lookup(
         &self,
         pool_guard: &PoolGuard,
         key: &[Val],
         res: &mut Vec<RowID>,
-        secondary_root: Option<BlockID>,
+        _ts: TrxID,
     ) -> Result<()> {
         let mem_entries = self.mem.lookup_encoded_entries(pool_guard, key).await?;
         let disk_pool_guard = self.disk.disk_pool_guard();
-        let disk = self.open_with_root(secondary_root, &disk_pool_guard)?;
+        let disk = self.open(&disk_pool_guard)?;
         let disk_entries = disk.prefix_scan_entries(key).await?;
         merge_non_unique_entries(&mem_entries, &disk_entries, res);
         Ok(())
     }
 
-    /// Lookup an exact key using the current or a caller-captured secondary DiskTree root.
     #[inline]
-    pub(crate) async fn lookup_unique_with_root(
+    async fn lookup_unique(
         &self,
         pool_guard: &PoolGuard,
         key: &[Val],
         row_id: RowID,
         ts: TrxID,
-        secondary_root: Option<BlockID>,
     ) -> Result<Option<bool>> {
         if let Some(mem_hit) = self.mem.lookup_unique(pool_guard, key, row_id, ts).await? {
             return Ok(Some(mem_hit));
         }
         let disk_pool_guard = self.disk.disk_pool_guard();
-        let disk = self.open_with_root(secondary_root, &disk_pool_guard)?;
+        let disk = self.open(&disk_pool_guard)?;
         if disk.contains_exact(key, row_id).await? {
             Ok(Some(true))
         } else {
@@ -707,16 +522,14 @@ impl<P: BufferPool> NonUniqueSecondaryIndex<P> {
         }
     }
 
-    /// Insert if absent using the current or a caller-captured secondary DiskTree root.
     #[inline]
-    pub(crate) async fn insert_if_not_exists_with_root(
+    async fn insert_if_not_exists(
         &self,
         pool_guard: &PoolGuard,
         key: &[Val],
         row_id: RowID,
         merge_if_match_deleted: bool,
         ts: TrxID,
-        secondary_root: Option<BlockID>,
     ) -> Result<IndexInsert> {
         debug_assert!(!row_id.is_deleted());
         if let Some(active) = self.mem.lookup_unique(pool_guard, key, row_id, ts).await? {
@@ -729,101 +542,13 @@ impl<P: BufferPool> NonUniqueSecondaryIndex<P> {
             return Ok(IndexInsert::DuplicateKey(row_id, !active));
         }
         let disk_pool_guard = self.disk.disk_pool_guard();
-        let disk = self.open_with_root(secondary_root, &disk_pool_guard)?;
+        let disk = self.open(&disk_pool_guard)?;
         if disk.contains_exact(key, row_id).await? {
             return Ok(IndexInsert::DuplicateKey(row_id, false));
         }
         self.mem
             .insert_if_not_exists(pool_guard, key, row_id, false, ts)
             .await
-    }
-
-    /// Mask an exact entry as deleted using the current or a caller-captured DiskTree root.
-    #[inline]
-    pub(crate) async fn mask_as_deleted_with_root(
-        &self,
-        pool_guard: &PoolGuard,
-        key: &[Val],
-        row_id: RowID,
-        ts: TrxID,
-        secondary_root: Option<BlockID>,
-    ) -> Result<bool> {
-        debug_assert!(!row_id.is_deleted());
-        match self.mem.lookup_unique(pool_guard, key, row_id, ts).await? {
-            Some(true) => self.mem.mask_as_deleted(pool_guard, key, row_id, ts).await,
-            Some(false) => Ok(false),
-            None => {
-                let disk_pool_guard = self.disk.disk_pool_guard();
-                let disk = self.open_with_root(secondary_root, &disk_pool_guard)?;
-                if disk.contains_exact(key, row_id).await? {
-                    self.mem
-                        .insert_delete_overlay_if_absent(pool_guard, key, row_id, ts)
-                        .await
-                } else {
-                    Ok(false)
-                }
-            }
-        }
-    }
-
-    #[inline]
-    async fn scan_values_with_root(
-        &self,
-        pool_guard: &PoolGuard,
-        values: &mut Vec<RowID>,
-        secondary_root: Option<BlockID>,
-    ) -> Result<()> {
-        let mem_entries = self.mem.scan_encoded_entries(pool_guard).await?;
-        let disk_pool_guard = self.disk.disk_pool_guard();
-        let disk = self.open_with_root(secondary_root, &disk_pool_guard)?;
-        let disk_entries = disk.scan_entries().await?;
-        merge_non_unique_entries(&mem_entries, &disk_entries, values);
-        Ok(())
-    }
-}
-
-impl<P: BufferPool + 'static> NonUniqueIndex for NonUniqueSecondaryIndex<P> {
-    #[inline]
-    async fn lookup(
-        &self,
-        pool_guard: &PoolGuard,
-        key: &[Val],
-        res: &mut Vec<RowID>,
-        _ts: TrxID,
-    ) -> Result<()> {
-        self.lookup_with_root(pool_guard, key, res, None).await
-    }
-
-    #[inline]
-    async fn lookup_unique(
-        &self,
-        pool_guard: &PoolGuard,
-        key: &[Val],
-        row_id: RowID,
-        ts: TrxID,
-    ) -> Result<Option<bool>> {
-        self.lookup_unique_with_root(pool_guard, key, row_id, ts, None)
-            .await
-    }
-
-    #[inline]
-    async fn insert_if_not_exists(
-        &self,
-        pool_guard: &PoolGuard,
-        key: &[Val],
-        row_id: RowID,
-        merge_if_match_deleted: bool,
-        ts: TrxID,
-    ) -> Result<IndexInsert> {
-        self.insert_if_not_exists_with_root(
-            pool_guard,
-            key,
-            row_id,
-            merge_if_match_deleted,
-            ts,
-            None,
-        )
-        .await
     }
 
     #[inline]
@@ -834,8 +559,22 @@ impl<P: BufferPool + 'static> NonUniqueIndex for NonUniqueSecondaryIndex<P> {
         row_id: RowID,
         ts: TrxID,
     ) -> Result<bool> {
-        self.mask_as_deleted_with_root(pool_guard, key, row_id, ts, None)
-            .await
+        debug_assert!(!row_id.is_deleted());
+        match self.mem.lookup_unique(pool_guard, key, row_id, ts).await? {
+            Some(true) => self.mem.mask_as_deleted(pool_guard, key, row_id, ts).await,
+            Some(false) => Ok(false),
+            None => {
+                let disk_pool_guard = self.disk.disk_pool_guard();
+                let disk = self.open(&disk_pool_guard)?;
+                if disk.contains_exact(key, row_id).await? {
+                    self.mem
+                        .insert_delete_overlay_if_absent(pool_guard, key, row_id, ts)
+                        .await
+                } else {
+                    Ok(false)
+                }
+            }
+        }
     }
 
     #[inline]
@@ -871,89 +610,12 @@ impl<P: BufferPool + 'static> NonUniqueIndex for NonUniqueSecondaryIndex<P> {
         values: &mut Vec<RowID>,
         _ts: TrxID,
     ) -> Result<()> {
-        self.scan_values_with_root(pool_guard, values, None).await
-    }
-}
-
-/// Composite secondary-index variant for one table secondary index.
-pub(crate) enum SecondaryIndex<P: 'static> {
-    /// Composite unique secondary index.
-    Unique(UniqueSecondaryIndex<P>),
-    /// Composite non-unique secondary index.
-    NonUnique(NonUniqueSecondaryIndex<P>),
-}
-
-impl<P: BufferPool> SecondaryIndex<P> {
-    /// Pair a freshly built unique MemIndex with its cold DiskTree runtime.
-    #[inline]
-    pub(crate) async fn new_unique(
-        index_no: usize,
-        mem: UniqueMemIndex<P>,
-        disk: SecondaryDiskTreeRuntime,
-        pool_guard: &PoolGuard,
-    ) -> Result<Self> {
-        if disk.index_no() != index_no || !disk.is_unique() {
-            let _ = mem.destroy(pool_guard).await;
-            return Err(Error::InvalidState);
-        }
-        Ok(Self::Unique(UniqueSecondaryIndex { mem, disk }))
-    }
-
-    /// Pair a freshly built non-unique MemIndex with its cold DiskTree runtime.
-    #[inline]
-    pub(crate) async fn new_non_unique(
-        index_no: usize,
-        mem: NonUniqueMemIndex<P>,
-        disk: SecondaryDiskTreeRuntime,
-        pool_guard: &PoolGuard,
-    ) -> Result<Self> {
-        if disk.index_no() != index_no || disk.is_unique() {
-            let _ = mem.destroy(pool_guard).await;
-            return Err(Error::InvalidState);
-        }
-        Ok(Self::NonUnique(NonUniqueSecondaryIndex { mem, disk }))
-    }
-
-    /// Destroy the mutable MemIndex owned by this composite index.
-    #[inline]
-    pub(crate) async fn destroy(self, pool_guard: &PoolGuard) -> Result<()> {
-        match self {
-            Self::Unique(index) => index.destroy(pool_guard).await,
-            Self::NonUnique(index) => index.destroy(pool_guard).await,
-        }
-    }
-
-    /// Return whether this composite index enforces uniqueness.
-    #[inline]
-    pub(crate) fn is_unique(&self) -> bool {
-        matches!(self, Self::Unique(_))
-    }
-
-    /// Return the index number from the cold context.
-    #[inline]
-    pub(crate) fn index_no(&self) -> usize {
-        match self {
-            Self::Unique(index) => index.disk().index_no(),
-            Self::NonUnique(index) => index.disk().index_no(),
-        }
-    }
-
-    /// Returns the unique-index view when this slot is unique.
-    #[inline]
-    pub(crate) fn unique(&self) -> Option<&UniqueSecondaryIndex<P>> {
-        match self {
-            Self::Unique(index) => Some(index),
-            Self::NonUnique(_) => None,
-        }
-    }
-
-    /// Returns the non-unique-index view when this slot is non-unique.
-    #[inline]
-    pub(crate) fn non_unique(&self) -> Option<&NonUniqueSecondaryIndex<P>> {
-        match self {
-            Self::Unique(_) => None,
-            Self::NonUnique(index) => Some(index),
-        }
+        let mem_entries = self.mem.scan_encoded_entries(pool_guard).await?;
+        let disk_pool_guard = self.disk.disk_pool_guard();
+        let disk = self.open(&disk_pool_guard)?;
+        let disk_entries = disk.scan_entries().await?;
+        merge_non_unique_entries(&mem_entries, &disk_entries, values);
+        Ok(())
     }
 }
 
@@ -970,11 +632,19 @@ fn merge_unique_entries(
         let (disk_key, disk_row_id) = &disk_entries[disk_idx];
         match mem.encoded_key.as_slice().cmp(disk_key.as_slice()) {
             Ordering::Less => {
-                values.push(mem.scan_row_id());
+                values.push(if mem.deleted {
+                    mem.row_id.deleted()
+                } else {
+                    mem.row_id
+                });
                 mem_idx += 1;
             }
             Ordering::Equal => {
-                values.push(mem.scan_row_id());
+                values.push(if mem.deleted {
+                    mem.row_id.deleted()
+                } else {
+                    mem.row_id
+                });
                 mem_idx += 1;
                 disk_idx += 1;
             }
@@ -985,7 +655,11 @@ fn merge_unique_entries(
         }
     }
     for mem in &mem_entries[mem_idx..] {
-        values.push(mem.scan_row_id());
+        values.push(if mem.deleted {
+            mem.row_id.deleted()
+        } else {
+            mem.row_id
+        });
     }
     for (_, row_id) in &disk_entries[disk_idx..] {
         values.push(*row_id);
@@ -1291,94 +965,96 @@ mod tests {
                 disk_pool.global_pool().clone(),
             )
             .unwrap();
-            let index = UniqueSecondaryIndex { mem, disk: runtime };
+            let index = SecondaryIndex::Unique { mem, disk: runtime };
+            let bound = index.bind_unique(root).unwrap();
 
-            assert_eq!(index.disk().published_root().unwrap(), root);
-            assert_eq!(index.disk().index_no(), 0);
+            assert_eq!(table.active_root_unchecked().secondary_index_roots[0], root);
+            assert_eq!(index.disk_runtime().index_no(), 0);
             assert!(
                 index
-                    .mem
+                    .unique_mem()
+                    .unwrap()
                     .lookup(&index_guard, &key1, 3)
                     .await
                     .unwrap()
                     .is_some()
             );
             assert_eq!(
-                index.lookup(&index_guard, &key1, 3).await.unwrap(),
+                bound.lookup(&index_guard, &key1, 3).await.unwrap(),
                 Some((100, false))
             );
             assert_eq!(
-                index.lookup(&index_guard, &key2, 3).await.unwrap(),
+                bound.lookup(&index_guard, &key2, 3).await.unwrap(),
                 Some((20, false))
             );
 
             assert!(
-                index
+                bound
                     .mask_as_deleted(&index_guard, &key3, 30, 4)
                     .await
                     .unwrap()
             );
             assert_eq!(
-                index.lookup(&index_guard, &key3, 4).await.unwrap(),
+                bound.lookup(&index_guard, &key3, 4).await.unwrap(),
                 Some((30, true))
             );
             assert_eq!(
-                index
+                bound
                     .insert_if_not_exists(&index_guard, &key4, 400, false, 5)
                     .await
                     .unwrap(),
                 IndexInsert::DuplicateKey(40, false)
             );
             assert!(
-                index
+                bound
                     .insert_if_not_exists(&index_guard, &key5, 50, false, 5)
                     .await
                     .unwrap()
                     .is_ok()
             );
             assert_eq!(
-                index
+                bound
                     .compare_exchange(&index_guard, &key2, 20, 200, 6)
                     .await
                     .unwrap(),
                 IndexCompareExchange::Ok
             );
             assert_eq!(
-                index
+                bound
                     .compare_exchange(&index_guard, &key4, 999, 9999, 6)
                     .await
                     .unwrap(),
                 IndexCompareExchange::Mismatch
             );
             assert_eq!(
-                index
+                bound
                     .compare_exchange(&index_guard, &key4, 40.deleted(), 400, 6)
                     .await
                     .unwrap(),
                 IndexCompareExchange::NotExists
             );
             assert_eq!(
-                index
+                bound
                     .compare_exchange(&index_guard, &key6, 60, 600, 6)
                     .await
                     .unwrap(),
                 IndexCompareExchange::NotExists
             );
             assert!(
-                index
+                bound
                     .compare_delete(&index_guard, &key4, 40, false, 7)
                     .await
                     .unwrap()
             );
             assert!(
-                index
+                bound
                     .compare_delete(&index_guard, &key4, 41, false, 7)
                     .await
                     .unwrap()
             );
 
             let mut values = Vec::new();
-            index
+            bound
                 .scan_values(&index_guard, &mut values, 8)
                 .await
                 .unwrap();
@@ -1430,10 +1106,8 @@ mod tests {
                 disk_pool.global_pool().clone(),
             )
             .unwrap();
-            assert_eq!(runtime.published_root().unwrap(), root_a);
-
             let opened_a_guard = runtime.disk_pool_guard();
-            let opened_a = runtime.open_unique(&opened_a_guard).unwrap();
+            let opened_a = runtime.open_unique_at(root_a, &opened_a_guard).unwrap();
             assert_eq!(opened_a.lookup(&key1).await.unwrap(), Some(10));
             assert_eq!(opened_a.lookup(&key2).await.unwrap(), None);
 
@@ -1453,14 +1127,16 @@ mod tests {
             };
             assert_ne!(root_a, root_b);
             let table_after_b = publish_secondary_root(mutable, 0, root_b, 3).await;
-            assert_eq!(table_after_b.active_root().secondary_index_roots[0], root_b);
-            assert_eq!(runtime.published_root().unwrap(), root_b);
+            assert_eq!(
+                table_after_b.active_root_unchecked().secondary_index_roots[0],
+                root_b
+            );
 
             assert_eq!(opened_a.lookup(&key1).await.unwrap(), Some(10));
             assert_eq!(opened_a.lookup(&key2).await.unwrap(), None);
 
             let opened_b_guard = runtime.disk_pool_guard();
-            let opened_b = runtime.open_unique(&opened_b_guard).unwrap();
+            let opened_b = runtime.open_unique_at(root_b, &opened_b_guard).unwrap();
             assert_eq!(opened_b.lookup(&key1).await.unwrap(), Some(10));
             assert_eq!(opened_b.lookup(&key2).await.unwrap(), Some(20));
         });
@@ -1529,92 +1205,94 @@ mod tests {
                 disk_pool.global_pool().clone(),
             )
             .unwrap();
-            let index = NonUniqueSecondaryIndex { mem, disk: runtime };
+            let index = SecondaryIndex::NonUnique { mem, disk: runtime };
+            let bound = index.bind_non_unique(root).unwrap();
 
-            assert_eq!(index.disk().published_root().unwrap(), root);
-            assert_eq!(index.disk().index_no(), 1);
+            assert_eq!(table.active_root_unchecked().secondary_index_roots[1], root);
+            assert_eq!(index.disk_runtime().index_no(), 1);
             assert!(
                 index
-                    .mem
+                    .non_unique_mem()
+                    .unwrap()
                     .lookup_unique(&index_guard, &key1, 12, 3)
                     .await
                     .unwrap()
                     .is_some()
             );
             assert!(
-                index
+                bound
                     .mask_as_deleted(&index_guard, &key1, 10, 4)
                     .await
                     .unwrap()
             );
             let mut rows = Vec::new();
-            index
+            bound
                 .lookup(&index_guard, &key1, &mut rows, 4)
                 .await
                 .unwrap();
             assert_eq!(rows, vec![11, 12]);
             assert_eq!(
-                index
+                bound
                     .lookup_unique(&index_guard, &key1, 10, 4)
                     .await
                     .unwrap(),
                 Some(false)
             );
             assert_eq!(
-                index
+                bound
                     .lookup_unique(&index_guard, &key1, 11, 4)
                     .await
                     .unwrap(),
                 Some(true)
             );
             assert_eq!(
-                index
+                bound
                     .lookup_unique(&index_guard, &key1, 99, 4)
                     .await
                     .unwrap(),
                 None
             );
             assert_eq!(
-                index
+                bound
                     .insert_if_not_exists(&index_guard, &key1, 11, false, 5)
                     .await
                     .unwrap(),
                 IndexInsert::DuplicateKey(11, false)
             );
             assert!(
-                index
+                bound
                     .mask_as_active(&index_guard, &key1, 10, 5)
                     .await
                     .unwrap()
             );
             rows.clear();
-            index
+            bound
                 .lookup(&index_guard, &key1, &mut rows, 5)
                 .await
                 .unwrap();
             assert_eq!(rows, vec![10, 11, 12]);
             assert!(
-                index
+                bound
                     .insert_if_not_exists(&index_guard, &key1, 13, false, 6)
                     .await
                     .unwrap()
                     .is_ok()
             );
             assert!(
-                index
+                bound
                     .mask_as_deleted(&index_guard, &key2, 20, 7)
                     .await
                     .unwrap()
             );
             assert!(
-                index
+                bound
                     .compare_delete(&index_guard, &key3, 30, false, 7)
                     .await
                     .unwrap()
             );
 
             let mut values = Vec::new();
-            index
+            bound
                 .scan_values(&index_guard, &mut values, 8)
                 .await
                 .unwrap();
@@ -1666,7 +1344,7 @@ mod tests {
                 disk_pool.global_pool().clone(),
             )
             .unwrap();
-            let composite = SecondaryIndex::Unique(UniqueSecondaryIndex { mem, disk: runtime });
+            let composite = SecondaryIndex::Unique { mem, disk: runtime };
             assert!(composite.is_unique());
             assert_eq!(composite.index_no(), 0);
 
@@ -1678,8 +1356,7 @@ mod tests {
                 disk_pool.global_pool().clone(),
             )
             .unwrap();
-            let composite =
-                SecondaryIndex::NonUnique(NonUniqueSecondaryIndex { mem, disk: runtime });
+            let composite = SecondaryIndex::NonUnique { mem, disk: runtime };
             assert!(!composite.is_unique());
             assert_eq!(composite.index_no(), 1);
         });

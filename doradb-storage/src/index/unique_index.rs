@@ -16,7 +16,7 @@ use futures::FutureExt;
 use std::future::Future;
 
 /// Abstraction of unique index.
-pub trait UniqueIndex: Send + Sync + 'static {
+pub trait UniqueIndex: Send + Sync {
     /// Lookup unique key in this index.
     /// Return associated value and delete flag.
     fn lookup(
@@ -111,18 +111,6 @@ pub(crate) struct UniqueMemIndexEntry {
     pub(crate) row_id: RowID,
     /// Whether the MemIndex entry is a delete-shadow.
     pub(crate) deleted: bool,
-}
-
-impl UniqueMemIndexEntry {
-    /// Return the row id in the same shape as current MemIndex scan results.
-    #[inline]
-    pub(crate) fn scan_row_id(&self) -> RowID {
-        if self.deleted {
-            self.row_id.deleted()
-        } else {
-            self.row_id
-        }
-    }
 }
 
 /// Bounded batch of unique MemIndex entries selected for cleanup processing.

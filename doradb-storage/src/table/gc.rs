@@ -4,8 +4,8 @@ use crate::error::{BlockCorruptionCause, BlockKind, Error, FileKind, Result};
 use crate::file::BlockID;
 use crate::file::cow_file::SUPER_BLOCK_ID;
 use crate::index::{
-    ColumnBlockIndex, NonUniqueMemIndexEntry, NonUniqueSecondaryIndex, ResolvedColumnRow,
-    SecondaryIndex, UniqueMemIndexEntry, UniqueSecondaryIndex,
+    ColumnBlockIndex, NonUniqueMemIndex, NonUniqueMemIndexEntry, ResolvedColumnRow, SecondaryIndex,
+    UniqueMemIndex, UniqueMemIndexEntry,
 };
 use crate::lwc::PersistedLwcBlock;
 use crate::row::RowID;
@@ -215,21 +215,21 @@ impl Table {
             let mut index_stats =
                 SecondaryMemIndexCleanupIndexStats::new(index_no, index.is_unique());
             match index {
-                SecondaryIndex::Unique(unique) => {
+                SecondaryIndex::Unique { .. } => {
                     self.cleanup_unique_secondary_mem_index(
                         &cleanup_context,
                         index_no,
-                        unique,
+                        index,
                         secondary_root,
                         &mut index_stats,
                     )
                     .await?;
                 }
-                SecondaryIndex::NonUnique(non_unique) => {
+                SecondaryIndex::NonUnique { .. } => {
                     self.cleanup_non_unique_secondary_mem_index(
                         &cleanup_context,
                         index_no,
-                        non_unique,
+                        index,
                         secondary_root,
                         &mut index_stats,
                     )
@@ -247,14 +247,15 @@ impl Table {
         &self,
         cleanup_context: &MemIndexCleanupContext<'_, '_>,
         index_no: usize,
-        index: &UniqueSecondaryIndex<EvictableBufferPool>,
+        index: &SecondaryIndex<EvictableBufferPool>,
         secondary_root: BlockID,
         stats: &mut SecondaryMemIndexCleanupIndexStats,
     ) -> Result<()> {
         let disk = index
-            .disk()
+            .disk_runtime()
             .open_unique_at(secondary_root, cleanup_context.disk_pool_guard)?;
-        let mut scan = index.cleanup_mem_scan(
+        let mem = index.unique_mem()?;
+        let mut scan = mem.cleanup_scan(
             cleanup_context.index_pool_guard,
             cleanup_context.snapshot.pivot_row_id(),
             cleanup_context.clean_live_entries,
@@ -274,13 +275,13 @@ impl Table {
                         .cleanup_unique_delete_overlay_is_obsolete(
                             cleanup_context,
                             index_no,
-                            index,
+                            mem,
                             &entry,
                         )
                         .await?
                     {
                         compare_delete_unique_cleanup_entry(
-                            index,
+                            mem,
                             cleanup_context.index_pool_guard,
                             &entry,
                             cleanup_context.snapshot.min_active_sts,
@@ -297,7 +298,7 @@ impl Table {
                     match disk.lookup_encoded(&entry.encoded_key).await {
                         Ok(Some(row_id)) if row_id == entry.row_id => {
                             compare_delete_unique_cleanup_entry(
-                                index,
+                                mem,
                                 cleanup_context.index_pool_guard,
                                 &entry,
                                 cleanup_context.snapshot.min_active_sts,
@@ -319,14 +320,15 @@ impl Table {
         &self,
         cleanup_context: &MemIndexCleanupContext<'_, '_>,
         index_no: usize,
-        index: &NonUniqueSecondaryIndex<EvictableBufferPool>,
+        index: &SecondaryIndex<EvictableBufferPool>,
         secondary_root: BlockID,
         stats: &mut SecondaryMemIndexCleanupIndexStats,
     ) -> Result<()> {
         let disk = index
-            .disk()
+            .disk_runtime()
             .open_non_unique_at(secondary_root, cleanup_context.disk_pool_guard)?;
-        let mut scan = index.cleanup_mem_scan(
+        let mem = index.non_unique_mem()?;
+        let mut scan = mem.cleanup_scan(
             cleanup_context.index_pool_guard,
             cleanup_context.snapshot.pivot_row_id(),
             cleanup_context.clean_live_entries,
@@ -345,13 +347,13 @@ impl Table {
                         .cleanup_non_unique_delete_overlay_is_obsolete(
                             cleanup_context,
                             index_no,
-                            index,
+                            mem,
                             &entry,
                         )
                         .await?
                     {
                         compare_delete_non_unique_cleanup_entry(
-                            index,
+                            mem,
                             cleanup_context.index_pool_guard,
                             &entry,
                             cleanup_context.snapshot.min_active_sts,
@@ -368,7 +370,7 @@ impl Table {
                     match disk.contains_exact_encoded(&entry.encoded_key).await {
                         Ok(true) => {
                             compare_delete_non_unique_cleanup_entry(
-                                index,
+                                mem,
                                 cleanup_context.index_pool_guard,
                                 &entry,
                                 cleanup_context.snapshot.min_active_sts,
@@ -411,7 +413,7 @@ impl Table {
         &self,
         cleanup_context: &MemIndexCleanupContext<'_, '_>,
         index_no: usize,
-        index: &UniqueSecondaryIndex<EvictableBufferPool>,
+        index: &UniqueMemIndex<EvictableBufferPool>,
         entry: &UniqueMemIndexEntry,
     ) -> Result<bool> {
         match self
@@ -421,7 +423,7 @@ impl Table {
             DeleteOverlayProof::NotProven => Ok(false),
             DeleteOverlayProof::Obsolete => Ok(true),
             DeleteOverlayProof::ColdRowValues(values) => {
-                Ok(!index.mem_encoded_key_matches(&values, &entry.encoded_key))
+                Ok(!index.encoded_key_matches(&values, &entry.encoded_key))
             }
         }
     }
@@ -431,7 +433,7 @@ impl Table {
         &self,
         cleanup_context: &MemIndexCleanupContext<'_, '_>,
         index_no: usize,
-        index: &NonUniqueSecondaryIndex<EvictableBufferPool>,
+        index: &NonUniqueMemIndex<EvictableBufferPool>,
         entry: &NonUniqueMemIndexEntry,
     ) -> Result<bool> {
         match self
@@ -441,7 +443,7 @@ impl Table {
             DeleteOverlayProof::NotProven => Ok(false),
             DeleteOverlayProof::Obsolete => Ok(true),
             DeleteOverlayProof::ColdRowValues(values) => {
-                Ok(!index.mem_encoded_exact_key_matches(&values, entry.row_id, &entry.encoded_key))
+                Ok(!index.encoded_exact_key_matches(&values, entry.row_id, &entry.encoded_key))
             }
         }
     }
@@ -527,13 +529,13 @@ impl Table {
 
 #[inline]
 async fn compare_delete_unique_cleanup_entry<P: BufferPool>(
-    index: &UniqueSecondaryIndex<P>,
+    index: &UniqueMemIndex<P>,
     index_pool_guard: &PoolGuard,
     entry: &UniqueMemIndexEntry,
     min_active_sts: TrxID,
 ) -> Result<CleanupDecision> {
     if index
-        .compare_delete_mem_encoded_entry(
+        .compare_delete_encoded_entry(
             index_pool_guard,
             &entry.encoded_key,
             entry.row_id,
@@ -550,13 +552,13 @@ async fn compare_delete_unique_cleanup_entry<P: BufferPool>(
 
 #[inline]
 async fn compare_delete_non_unique_cleanup_entry<P: BufferPool>(
-    index: &NonUniqueSecondaryIndex<P>,
+    index: &NonUniqueMemIndex<P>,
     index_pool_guard: &PoolGuard,
     entry: &NonUniqueMemIndexEntry,
     min_active_sts: TrxID,
 ) -> Result<CleanupDecision> {
     if index
-        .compare_delete_mem_encoded_entry(
+        .compare_delete_encoded_entry(
             index_pool_guard,
             &entry.encoded_key,
             entry.deleted,

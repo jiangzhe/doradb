@@ -6,8 +6,8 @@ use crate::error::{BlockCorruptionCause, BlockKind, Error, FileKind, Result};
 use crate::file::BlockID;
 use crate::index::util::{Maskable, RowPageCreateRedoCtx};
 use crate::index::{
-    InMemorySecondaryIndex, IndexCompareExchange, IndexInsert, NonUniqueIndex, RowLocation,
-    SecondaryIndex, UniqueIndex,
+    InMemorySecondaryIndex, IndexCompareExchange, IndexInsert, NonUniqueIndex,
+    NonUniqueSecondaryIndex, RowLocation, SecondaryIndex, UniqueIndex, UniqueSecondaryIndex,
 };
 use crate::lwc::PersistedLwcBlock;
 use crate::row::ops::{
@@ -37,15 +37,27 @@ use std::ops::Deref;
 use std::sync::Arc;
 
 #[derive(Clone, Copy)]
-struct SecondaryIndexView {
-    ts: TrxID,
-    root: Option<BlockID>,
+enum SecondaryIndexView {
+    Catalog { ts: TrxID },
+    User { ts: TrxID, root: BlockID },
 }
 
 impl SecondaryIndexView {
     #[inline]
-    const fn new(ts: TrxID, root: Option<BlockID>) -> Self {
-        Self { ts, root }
+    const fn catalog(ts: TrxID) -> Self {
+        Self::Catalog { ts }
+    }
+
+    #[inline]
+    const fn user(ts: TrxID, root: BlockID) -> Self {
+        Self::User { ts, root }
+    }
+
+    #[inline]
+    const fn ts(self) -> TrxID {
+        match self {
+            Self::Catalog { ts } | Self::User { ts, .. } => ts,
+        }
     }
 }
 
@@ -250,19 +262,37 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
     }
 
     #[inline]
-    fn bind_secondary_root(&self, ctx: &TrxContext, index_no: usize) -> Result<Option<BlockID>> {
+    fn bound_secondary_view(
+        &self,
+        ctx: &TrxContext,
+        index_no: usize,
+    ) -> Result<SecondaryIndexView> {
         let Some(storage) = self.storage else {
-            return Ok(None);
+            return Ok(SecondaryIndexView::catalog(ctx.sts()));
         };
         let proof = ctx.read_proof();
-        storage
-            .with_active_root(&proof, |root| {
-                root.secondary_index_roots
-                    .get(index_no)
-                    .copied()
-                    .ok_or(Error::InvalidArgument)
-            })
-            .map(Some)
+        let root = storage.with_active_root(&proof, |root| {
+            root.secondary_index_roots
+                .get(index_no)
+                .copied()
+                .ok_or(Error::InvalidArgument)
+        })?;
+        Ok(SecondaryIndexView::user(ctx.sts(), root))
+    }
+
+    #[inline]
+    fn unchecked_secondary_view(&self, ts: TrxID, index_no: usize) -> Result<SecondaryIndexView> {
+        let Some(storage) = self.storage else {
+            return Ok(SecondaryIndexView::catalog(ts));
+        };
+        let root = storage
+            .file()
+            .active_root_unchecked()
+            .secondary_index_roots
+            .get(index_no)
+            .copied()
+            .ok_or(Error::InvalidArgument)?;
+        Ok(SecondaryIndexView::user(ts, root))
     }
 
     #[inline]
@@ -280,14 +310,40 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
     }
 
     #[inline]
-    fn snapshot_secondary_root(
+    fn snapshot_secondary_view(
+        &self,
+        ts: TrxID,
         snapshot: Option<&TableRootSnapshot<'_>>,
         index_no: usize,
-    ) -> Result<Option<BlockID>> {
-        match snapshot {
-            Some(snapshot) => snapshot.secondary_index_root(index_no).map(Some),
-            None => Ok(None),
+    ) -> Result<SecondaryIndexView> {
+        match (self.user_sec_idx, snapshot) {
+            (Some(_), Some(snapshot)) => Ok(SecondaryIndexView::user(
+                ts,
+                snapshot.secondary_index_root(index_no)?,
+            )),
+            (Some(_), None) => Err(Error::InvalidState),
+            (None, _) => Ok(SecondaryIndexView::catalog(ts)),
         }
+    }
+
+    #[inline]
+    fn bound_unique_user_index(
+        &self,
+        index_no: usize,
+        root: BlockID,
+    ) -> Result<UniqueSecondaryIndex<'a, EvictableBufferPool>> {
+        let indexes = self.user_sec_idx.ok_or(Error::InvalidState)?;
+        indexes[index_no].bind_unique(root)
+    }
+
+    #[inline]
+    fn bound_non_unique_user_index(
+        &self,
+        index_no: usize,
+        root: BlockID,
+    ) -> Result<NonUniqueSecondaryIndex<'a, EvictableBufferPool>> {
+        let indexes = self.user_sec_idx.ok_or(Error::InvalidState)?;
+        indexes[index_no].bind_non_unique(root)
     }
 
     #[inline]
@@ -296,22 +352,21 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
         guards: &PoolGuards,
         index_no: usize,
         key: &[Val],
-        ts: TrxID,
-        secondary_root: Option<BlockID>,
+        view: SecondaryIndexView,
     ) -> Result<Option<(RowID, bool)>> {
         let index_pool_guard = self.index_pool_guard(guards);
-        match self.user_sec_idx {
-            Some(indexes) => {
-                let index = indexes[index_no].unique().ok_or(Error::InvalidArgument)?;
-                index
-                    .lookup_with_root(index_pool_guard, key, ts, secondary_root)
+        match (self.user_sec_idx, view) {
+            (Some(_), SecondaryIndexView::User { ts, root }) => {
+                self.bound_unique_user_index(index_no, root)?
+                    .lookup(index_pool_guard, key, ts)
                     .await
             }
-            None => {
+            (Some(_), SecondaryIndexView::Catalog { .. }) => Err(Error::InvalidState),
+            (None, view) => {
                 self.generic_sec_idx()[index_no]
                     .unique()
                     .ok_or(Error::InvalidArgument)?
-                    .lookup(index_pool_guard, key, ts)
+                    .lookup(index_pool_guard, key, view.ts())
                     .await
             }
         }
@@ -328,21 +383,14 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
         view: SecondaryIndexView,
     ) -> Result<IndexInsert> {
         let index_pool_guard = self.index_pool_guard(guards);
-        match self.user_sec_idx {
-            Some(indexes) => {
-                let index = indexes[index_no].unique().ok_or(Error::InvalidArgument)?;
-                index
-                    .insert_if_not_exists_with_root(
-                        index_pool_guard,
-                        key,
-                        row_id,
-                        merge_if_match_deleted,
-                        view.ts,
-                        view.root,
-                    )
+        match (self.user_sec_idx, view) {
+            (Some(_), SecondaryIndexView::User { ts, root }) => {
+                self.bound_unique_user_index(index_no, root)?
+                    .insert_if_not_exists(index_pool_guard, key, row_id, merge_if_match_deleted, ts)
                     .await
             }
-            None => {
+            (Some(_), SecondaryIndexView::Catalog { .. }) => Err(Error::InvalidState),
+            (None, view) => {
                 self.generic_sec_idx()[index_no]
                     .unique()
                     .ok_or(Error::InvalidArgument)?
@@ -351,7 +399,7 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
                         key,
                         row_id,
                         merge_if_match_deleted,
-                        view.ts,
+                        view.ts(),
                     )
                     .await
             }
@@ -372,8 +420,7 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
         match self.user_sec_idx {
             Some(indexes) => {
                 indexes[index_no]
-                    .unique()
-                    .ok_or(Error::InvalidArgument)?
+                    .unique_mem()?
                     .compare_delete(index_pool_guard, key, old_row_id, ignore_del_mask, ts)
                     .await
             }
@@ -394,22 +441,21 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
         index_no: usize,
         key: &[Val],
         row_id: RowID,
-        ts: TrxID,
-        secondary_root: Option<BlockID>,
+        view: SecondaryIndexView,
     ) -> Result<bool> {
         let index_pool_guard = self.index_pool_guard(guards);
-        match self.user_sec_idx {
-            Some(indexes) => {
-                let index = indexes[index_no].unique().ok_or(Error::InvalidArgument)?;
-                index
-                    .mask_as_deleted_with_root(index_pool_guard, key, row_id, ts, secondary_root)
+        match (self.user_sec_idx, view) {
+            (Some(_), SecondaryIndexView::User { ts, root }) => {
+                self.bound_unique_user_index(index_no, root)?
+                    .mask_as_deleted(index_pool_guard, key, row_id, ts)
                     .await
             }
-            None => {
+            (Some(_), SecondaryIndexView::Catalog { .. }) => Err(Error::InvalidState),
+            (None, view) => {
                 self.generic_sec_idx()[index_no]
                     .unique()
                     .ok_or(Error::InvalidArgument)?
-                    .mask_as_deleted(index_pool_guard, key, row_id, ts)
+                    .mask_as_deleted(index_pool_guard, key, row_id, view.ts())
                     .await
             }
         }
@@ -426,25 +472,18 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
         view: SecondaryIndexView,
     ) -> Result<IndexCompareExchange> {
         let index_pool_guard = self.index_pool_guard(guards);
-        match self.user_sec_idx {
-            Some(indexes) => {
-                let index = indexes[index_no].unique().ok_or(Error::InvalidArgument)?;
-                index
-                    .compare_exchange_with_root(
-                        index_pool_guard,
-                        key,
-                        old_row_id,
-                        new_row_id,
-                        view.ts,
-                        view.root,
-                    )
+        match (self.user_sec_idx, view) {
+            (Some(_), SecondaryIndexView::User { ts, root }) => {
+                self.bound_unique_user_index(index_no, root)?
+                    .compare_exchange(index_pool_guard, key, old_row_id, new_row_id, ts)
                     .await
             }
-            None => {
+            (Some(_), SecondaryIndexView::Catalog { .. }) => Err(Error::InvalidState),
+            (None, view) => {
                 self.generic_sec_idx()[index_no]
                     .unique()
                     .ok_or(Error::InvalidArgument)?
-                    .compare_exchange(index_pool_guard, key, old_row_id, new_row_id, view.ts)
+                    .compare_exchange(index_pool_guard, key, old_row_id, new_row_id, view.ts())
                     .await
             }
         }
@@ -457,24 +496,21 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
         index_no: usize,
         key: &[Val],
         res: &mut Vec<RowID>,
-        ts: TrxID,
-        secondary_root: Option<BlockID>,
+        view: SecondaryIndexView,
     ) -> Result<()> {
         let index_pool_guard = self.index_pool_guard(guards);
-        match self.user_sec_idx {
-            Some(indexes) => {
-                let index = indexes[index_no]
-                    .non_unique()
-                    .ok_or(Error::InvalidArgument)?;
-                index
-                    .lookup_with_root(index_pool_guard, key, res, secondary_root)
+        match (self.user_sec_idx, view) {
+            (Some(_), SecondaryIndexView::User { ts, root }) => {
+                self.bound_non_unique_user_index(index_no, root)?
+                    .lookup(index_pool_guard, key, res, ts)
                     .await
             }
-            None => {
+            (Some(_), SecondaryIndexView::Catalog { .. }) => Err(Error::InvalidState),
+            (None, view) => {
                 self.generic_sec_idx()[index_no]
                     .non_unique()
                     .ok_or(Error::InvalidArgument)?
-                    .lookup(index_pool_guard, key, res, ts)
+                    .lookup(index_pool_guard, key, res, view.ts())
                     .await
             }
         }
@@ -487,24 +523,21 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
         index_no: usize,
         key: &[Val],
         row_id: RowID,
-        ts: TrxID,
-        secondary_root: Option<BlockID>,
+        view: SecondaryIndexView,
     ) -> Result<Option<bool>> {
         let index_pool_guard = self.index_pool_guard(guards);
-        match self.user_sec_idx {
-            Some(indexes) => {
-                let index = indexes[index_no]
-                    .non_unique()
-                    .ok_or(Error::InvalidArgument)?;
-                index
-                    .lookup_unique_with_root(index_pool_guard, key, row_id, ts, secondary_root)
+        match (self.user_sec_idx, view) {
+            (Some(_), SecondaryIndexView::User { ts, root }) => {
+                self.bound_non_unique_user_index(index_no, root)?
+                    .lookup_unique(index_pool_guard, key, row_id, ts)
                     .await
             }
-            None => {
+            (Some(_), SecondaryIndexView::Catalog { .. }) => Err(Error::InvalidState),
+            (None, view) => {
                 self.generic_sec_idx()[index_no]
                     .non_unique()
                     .ok_or(Error::InvalidArgument)?
-                    .lookup_unique(index_pool_guard, key, row_id, ts)
+                    .lookup_unique(index_pool_guard, key, row_id, view.ts())
                     .await
             }
         }
@@ -521,23 +554,14 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
         view: SecondaryIndexView,
     ) -> Result<IndexInsert> {
         let index_pool_guard = self.index_pool_guard(guards);
-        match self.user_sec_idx {
-            Some(indexes) => {
-                let index = indexes[index_no]
-                    .non_unique()
-                    .ok_or(Error::InvalidArgument)?;
-                index
-                    .insert_if_not_exists_with_root(
-                        index_pool_guard,
-                        key,
-                        row_id,
-                        merge_if_match_deleted,
-                        view.ts,
-                        view.root,
-                    )
+        match (self.user_sec_idx, view) {
+            (Some(_), SecondaryIndexView::User { ts, root }) => {
+                self.bound_non_unique_user_index(index_no, root)?
+                    .insert_if_not_exists(index_pool_guard, key, row_id, merge_if_match_deleted, ts)
                     .await
             }
-            None => {
+            (Some(_), SecondaryIndexView::Catalog { .. }) => Err(Error::InvalidState),
+            (None, view) => {
                 self.generic_sec_idx()[index_no]
                     .non_unique()
                     .ok_or(Error::InvalidArgument)?
@@ -546,7 +570,7 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
                         key,
                         row_id,
                         merge_if_match_deleted,
-                        view.ts,
+                        view.ts(),
                     )
                     .await
             }
@@ -560,24 +584,21 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
         index_no: usize,
         key: &[Val],
         row_id: RowID,
-        ts: TrxID,
-        secondary_root: Option<BlockID>,
+        view: SecondaryIndexView,
     ) -> Result<bool> {
         let index_pool_guard = self.index_pool_guard(guards);
-        match self.user_sec_idx {
-            Some(indexes) => {
-                let index = indexes[index_no]
-                    .non_unique()
-                    .ok_or(Error::InvalidArgument)?;
-                index
-                    .mask_as_deleted_with_root(index_pool_guard, key, row_id, ts, secondary_root)
+        match (self.user_sec_idx, view) {
+            (Some(_), SecondaryIndexView::User { ts, root }) => {
+                self.bound_non_unique_user_index(index_no, root)?
+                    .mask_as_deleted(index_pool_guard, key, row_id, ts)
                     .await
             }
-            None => {
+            (Some(_), SecondaryIndexView::Catalog { .. }) => Err(Error::InvalidState),
+            (None, view) => {
                 self.generic_sec_idx()[index_no]
                     .non_unique()
                     .ok_or(Error::InvalidArgument)?
-                    .mask_as_deleted(index_pool_guard, key, row_id, ts)
+                    .mask_as_deleted(index_pool_guard, key, row_id, view.ts())
                     .await
             }
         }
@@ -597,8 +618,7 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
         match self.user_sec_idx {
             Some(indexes) => {
                 indexes[index_no]
-                    .non_unique()
-                    .ok_or(Error::InvalidArgument)?
+                    .non_unique_mem()?
                     .compare_delete(index_pool_guard, key, row_id, ignore_del_mask, ts)
                     .await
             }
@@ -965,7 +985,7 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
                     &key.vals,
                     row_id,
                     false,
-                    SecondaryIndexView::new(MIN_SNAPSHOT_TS, None),
+                    SecondaryIndexView::catalog(MIN_SNAPSHOT_TS),
                 )
                 .await?;
             assert!(res.is_ok());
@@ -977,7 +997,7 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
                     &key.vals,
                     row_id,
                     false,
-                    SecondaryIndexView::new(MIN_SNAPSHOT_TS, None),
+                    SecondaryIndexView::catalog(MIN_SNAPSHOT_TS),
                 )
                 .await?;
             assert!(res.is_ok());
@@ -1096,8 +1116,9 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
         debug_assert!(key.index_no < self.sec_idx_len());
         debug_assert!(self.metadata().index_specs[key.index_no].unique());
         debug_assert!(self.metadata().index_type_match(key.index_no, &key.vals));
+        let view = self.unchecked_secondary_view(MIN_SNAPSHOT_TS, key.index_no)?;
         let (mut page_guard, row_id) = match self
-            .unique_lookup(guards, key.index_no, &key.vals, MIN_SNAPSHOT_TS, None)
+            .unique_lookup(guards, key.index_no, &key.vals, view)
             .await?
         {
             None => unreachable!(),
@@ -1782,8 +1803,9 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
         min_active_sts: TrxID,
     ) -> Result<bool> {
         let (page_guard, row_id) = loop {
+            let view = self.unchecked_secondary_view(MIN_SNAPSHOT_TS, key.index_no)?;
             match self
-                .unique_lookup(guards, key.index_no, &key.vals, MIN_SNAPSHOT_TS, None)
+                .unique_lookup(guards, key.index_no, &key.vals, view)
                 .await?
             {
                 None => return Ok(false), // Another thread deleted this entry.
@@ -1856,15 +1878,9 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
         min_active_sts: TrxID,
     ) -> Result<bool> {
         let (page_guard, row_id) = loop {
+            let view = self.unchecked_secondary_view(MIN_SNAPSHOT_TS, key.index_no)?;
             match self
-                .non_unique_lookup_unique(
-                    guards,
-                    key.index_no,
-                    &key.vals,
-                    row_id,
-                    MIN_SNAPSHOT_TS,
-                    None,
-                )
+                .non_unique_lookup_unique(guards, key.index_no, &key.vals, row_id, view)
                 .await?
             {
                 None => return Ok(false), // Another thread deleted this entry.
@@ -2254,7 +2270,7 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
         page_guard: &PageSharedGuard<RowPage>,
         root_snapshot: Option<&TableRootSnapshot<'_>>,
     ) -> Result<InsertIndex> {
-        let secondary_root = Self::snapshot_secondary_root(root_snapshot, key.index_no)?;
+        let view = self.snapshot_secondary_view(ctx.sts(), root_snapshot, key.index_no)?;
         loop {
             match self
                 .unique_insert_if_not_exists(
@@ -2263,7 +2279,7 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
                     &key.vals,
                     row_id,
                     false,
-                    SecondaryIndexView::new(ctx.sts(), secondary_root),
+                    view,
                 )
                 .await?
             {
@@ -2310,7 +2326,7 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
                                     &key.vals,
                                     index_old_row_id,
                                     row_id,
-                                    SecondaryIndexView::new(ctx.sts(), secondary_root),
+                                    view,
                                 )
                                 .await?
                             {
@@ -2352,7 +2368,7 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
                                     &key.vals,
                                     index_old_row_id,
                                     row_id,
-                                    SecondaryIndexView::new(ctx.sts(), secondary_root),
+                                    view,
                                 )
                                 .await?
                             {
@@ -2391,7 +2407,7 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
         row_id: RowID,
         root_snapshot: Option<&TableRootSnapshot<'_>>,
     ) -> Result<InsertIndex> {
-        let secondary_root = Self::snapshot_secondary_root(root_snapshot, key.index_no)?;
+        let view = self.snapshot_secondary_view(ctx.sts(), root_snapshot, key.index_no)?;
         // For non-unique index, it's guaranteed to be success.
         match self
             .non_unique_insert_if_not_exists(
@@ -2400,7 +2416,7 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
                 &key.vals,
                 row_id,
                 false,
-                SecondaryIndexView::new(ctx.sts(), secondary_root),
+                view,
             )
             .await?
         {
@@ -2422,19 +2438,12 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
         key: SelectKey,
         root_snapshot: Option<&TableRootSnapshot<'_>>,
     ) -> Result<()> {
-        let secondary_root = Self::snapshot_secondary_root(root_snapshot, key.index_no)?;
+        let view = self.snapshot_secondary_view(ctx.sts(), root_snapshot, key.index_no)?;
         // Foreground hot delete/update masks the latest unique mapping instead
         // of physically removing it. The row id is retained so older snapshots
         // and rollback can still recover the previous owner.
         let res = self
-            .unique_mask_as_deleted(
-                ctx_pool_guards(ctx),
-                key.index_no,
-                &key.vals,
-                row_id,
-                ctx.sts(),
-                secondary_root,
-            )
+            .unique_mask_as_deleted(ctx_pool_guards(ctx), key.index_no, &key.vals, row_id, view)
             .await?;
         debug_assert!(res); // should always succeed.
         effects.push_delete_index_undo(self.table_id(), row_id, key, true);
@@ -2450,18 +2459,11 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
         key: SelectKey,
         root_snapshot: Option<&TableRootSnapshot<'_>>,
     ) -> Result<()> {
-        let secondary_root = Self::snapshot_secondary_root(root_snapshot, key.index_no)?;
+        let view = self.snapshot_secondary_view(ctx.sts(), root_snapshot, key.index_no)?;
         // Non-unique entries are exact `(key, row_id)` claims, so masking this
         // pair shadows the old hot version while preserving rollback state.
         let res = self
-            .non_unique_mask_as_deleted(
-                ctx_pool_guards(ctx),
-                key.index_no,
-                &key.vals,
-                row_id,
-                ctx.sts(),
-                secondary_root,
-            )
+            .non_unique_mask_as_deleted(ctx_pool_guards(ctx), key.index_no, &key.vals, row_id, view)
             .await?;
         debug_assert!(res);
         effects.push_delete_index_undo(self.table_id(), row_id, key, false);
@@ -2482,7 +2484,7 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
         root_snapshot: Option<&TableRootSnapshot<'_>>,
     ) -> Result<UpdateIndex> {
         debug_assert!(old_row_id != new_row_id);
-        let secondary_root = Self::snapshot_secondary_root(root_snapshot, new_key.index_no)?;
+        let view = self.snapshot_secondary_view(ctx.sts(), root_snapshot, new_key.index_no)?;
         loop {
             // Move update with a unique-key change. The new RowID cannot
             // already be in the index; duplicate handling below decides
@@ -2495,7 +2497,7 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
                     &new_key.vals,
                     new_row_id,
                     false,
-                    SecondaryIndexView::new(ctx.sts(), secondary_root),
+                    view,
                 )
                 .await?
             {
@@ -2560,7 +2562,7 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
                                 &new_key.vals,
                                 old_row_id.deleted(),
                                 new_row_id,
-                                SecondaryIndexView::new(ctx.sts(), secondary_root),
+                                view,
                             )
                             .await?
                         {
@@ -2620,7 +2622,7 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
                                     &new_key.vals,
                                     index_old_row_id,
                                     new_row_id,
-                                    SecondaryIndexView::new(ctx.sts(), secondary_root),
+                                    view,
                                 )
                                 .await?
                             {
@@ -2671,7 +2673,7 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
                                     &new_key.vals,
                                     index_old_row_id,
                                     new_row_id,
-                                    SecondaryIndexView::new(ctx.sts(), secondary_root),
+                                    view,
                                 )
                                 .await?
                             {
@@ -2719,7 +2721,7 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
         root_snapshot: Option<&TableRootSnapshot<'_>>,
     ) -> Result<UpdateIndex> {
         debug_assert!(old_row_id != new_row_id);
-        let secondary_root = Self::snapshot_secondary_root(root_snapshot, new_key.index_no)?;
+        let view = self.snapshot_secondary_view(ctx.sts(), root_snapshot, new_key.index_no)?;
         // Non-unique indexes store exact `(key, row_id)` entries, so a move
         // update inserts the new exact entry and masks the old one.
         match self
@@ -2729,7 +2731,7 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
                 &new_key.vals,
                 new_row_id,
                 false,
-                SecondaryIndexView::new(ctx.sts(), secondary_root),
+                view,
             )
             .await?
         {
@@ -2768,7 +2770,7 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
         root_snapshot: Option<&TableRootSnapshot<'_>>,
     ) -> Result<UpdateIndex> {
         debug_assert!(old_row_id != new_row_id);
-        let secondary_root = Self::snapshot_secondary_root(root_snapshot, key.index_no)?;
+        let view = self.snapshot_secondary_view(ctx.sts(), root_snapshot, key.index_no)?;
         // Move update where the unique key is unchanged. The logical key keeps
         // one latest mapping, so atomically replace the old RowID with the new
         // hot RowID and record undo to restore it on rollback.
@@ -2779,7 +2781,7 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
                 &key.vals,
                 old_row_id,
                 new_row_id,
-                SecondaryIndexView::new(ctx.sts(), secondary_root),
+                view,
             )
             .await?
         {
@@ -2810,7 +2812,7 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
         root_snapshot: Option<&TableRootSnapshot<'_>>,
     ) -> Result<UpdateIndex> {
         debug_assert!(old_row_id != new_row_id);
-        let secondary_root = Self::snapshot_secondary_root(root_snapshot, key.index_no)?;
+        let view = self.snapshot_secondary_view(ctx.sts(), root_snapshot, key.index_no)?;
         // Non-unique key unchanged but RowID changed: publish the replacement
         // exact entry, then mask the old exact entry for rollback/GC.
         let res = self
@@ -2820,7 +2822,7 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
                 &key.vals,
                 new_row_id,
                 false,
-                SecondaryIndexView::new(ctx.sts(), secondary_root),
+                view,
             )
             .await?;
         debug_assert!(res.is_ok());
@@ -2846,7 +2848,7 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
         page_guard: &PageSharedGuard<RowPage>,
         root_snapshot: Option<&TableRootSnapshot<'_>>,
     ) -> Result<UpdateIndex> {
-        let secondary_root = Self::snapshot_secondary_root(root_snapshot, new_key.index_no)?;
+        let view = self.snapshot_secondary_view(ctx.sts(), root_snapshot, new_key.index_no)?;
         loop {
             // In-place unique-key change keeps the same RowID. Repeated key
             // changes in the same transaction can encounter this RowID already
@@ -2870,7 +2872,7 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
                     &new_key.vals,
                     row_id,
                     true,
-                    SecondaryIndexView::new(ctx.sts(), secondary_root),
+                    view,
                 )
                 .await?
             {
@@ -2916,7 +2918,7 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
                                     &new_key.vals,
                                     index_old_row_id,
                                     row_id,
-                                    SecondaryIndexView::new(ctx.sts(), secondary_root),
+                                    view,
                                 )
                                 .await?
                             {
@@ -2963,7 +2965,7 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
                                     &new_key.vals,
                                     index_old_row_id,
                                     row_id,
-                                    SecondaryIndexView::new(ctx.sts(), secondary_root),
+                                    view,
                                 )
                                 .await?
                             {
@@ -3011,7 +3013,7 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
         row_id: RowID,
         root_snapshot: Option<&TableRootSnapshot<'_>>,
     ) -> Result<UpdateIndex> {
-        let secondary_root = Self::snapshot_secondary_root(root_snapshot, new_key.index_no)?;
+        let view = self.snapshot_secondary_view(ctx.sts(), root_snapshot, new_key.index_no)?;
         // This is case for one transaction or multiple transactions to update
         // key of the same row back and forth.
         // e.g. update k=1 to k=2, then update k=2 to k=1, ...
@@ -3029,7 +3031,7 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
                 &new_key.vals,
                 row_id,
                 true,
-                SecondaryIndexView::new(ctx.sts(), secondary_root),
+                view,
             )
             .await?
         {
@@ -3132,15 +3134,9 @@ impl<D: BufferPool, I: BufferPool> TableAccess for TableAccessor<'_, D, I> {
                     .zip(user_read_set.iter().skip(1))
                     .all(|(l, r)| l < r)
         });
-        let secondary_root = self.bind_secondary_root(ctx, key.index_no)?;
+        let view = self.bound_secondary_view(ctx, key.index_no)?;
         match self
-            .unique_lookup(
-                ctx_pool_guards(ctx),
-                key.index_no,
-                &key.vals,
-                ctx.sts(),
-                secondary_root,
-            )
+            .unique_lookup(ctx_pool_guards(ctx), key.index_no, &key.vals, view)
             .await?
         {
             None => Ok(SelectMvcc::NotFound),
@@ -3163,8 +3159,9 @@ impl<D: BufferPool, I: BufferPool> TableAccess for TableAccessor<'_, D, I> {
         debug_assert!(key.index_no < self.sec_idx_len());
         debug_assert!(self.metadata().index_specs[key.index_no].unique());
         debug_assert!(self.metadata().index_type_match(key.index_no, &key.vals));
+        let view = self.unchecked_secondary_view(MIN_SNAPSHOT_TS, key.index_no)?;
         let (page_guard, row_id) = match self
-            .unique_lookup(guards, key.index_no, &key.vals, MIN_SNAPSHOT_TS, None)
+            .unique_lookup(guards, key.index_no, &key.vals, view)
             .await?
         {
             None => return Ok(None),
@@ -3214,14 +3211,13 @@ impl<D: BufferPool, I: BufferPool> TableAccess for TableAccessor<'_, D, I> {
         });
         // todo: support batching, streaming and sorting.
         let mut row_ids = vec![];
-        let secondary_root = self.bind_secondary_root(ctx, key.index_no)?;
+        let view = self.bound_secondary_view(ctx, key.index_no)?;
         self.non_unique_lookup(
             ctx_pool_guards(ctx),
             key.index_no,
             &key.vals,
             &mut row_ids,
-            ctx.sts(),
-            secondary_root,
+            view,
         )
         .await?;
         let mut res = vec![];
@@ -3310,15 +3306,10 @@ impl<D: BufferPool, I: BufferPool> TableAccess for TableAccessor<'_, D, I> {
         );
         loop {
             let root_snapshot = self.root_snapshot(ctx)?;
-            let lookup_root = Self::snapshot_secondary_root(root_snapshot.as_ref(), key.index_no)?;
+            let lookup_view =
+                self.snapshot_secondary_view(ctx.sts(), root_snapshot.as_ref(), key.index_no)?;
             let (page_guard, row_id) = match self
-                .unique_lookup(
-                    ctx_pool_guards(ctx),
-                    key.index_no,
-                    &key.vals,
-                    ctx.sts(),
-                    lookup_root,
-                )
+                .unique_lookup(ctx_pool_guards(ctx), key.index_no, &key.vals, lookup_view)
                 .await?
             {
                 None => return Ok(UpdateMvcc::NotFound),
@@ -3557,15 +3548,10 @@ impl<D: BufferPool, I: BufferPool> TableAccess for TableAccessor<'_, D, I> {
         debug_assert!(self.metadata().index_type_match(key.index_no, &key.vals));
         loop {
             let root_snapshot = self.root_snapshot(ctx)?;
-            let lookup_root = Self::snapshot_secondary_root(root_snapshot.as_ref(), key.index_no)?;
+            let lookup_view =
+                self.snapshot_secondary_view(ctx.sts(), root_snapshot.as_ref(), key.index_no)?;
             let (page_guard, row_id) = match self
-                .unique_lookup(
-                    ctx_pool_guards(ctx),
-                    key.index_no,
-                    &key.vals,
-                    ctx.sts(),
-                    lookup_root,
-                )
+                .unique_lookup(ctx_pool_guards(ctx), key.index_no, &key.vals, lookup_view)
                 .await?
             {
                 None => return Ok(DeleteMvcc::NotFound),

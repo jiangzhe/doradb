@@ -295,14 +295,14 @@ impl MultiTableFile {
     /// contract. Callers that need multiple catalog-root fields must still bind
     /// one local root reference and reuse it.
     #[inline]
-    pub fn active_root(&self) -> &MultiTableActiveRoot {
-        self.file.active_root()
+    pub fn active_root_unchecked(&self) -> &MultiTableActiveRoot {
+        self.file.active_root_unchecked()
     }
 
     /// Returns active-root snapshot from in-memory pointer without additional IO.
     #[inline]
     pub fn load_snapshot(&self) -> Result<MultiTableFileSnapshot> {
-        let active_root = self.active_root();
+        let active_root = self.active_root_unchecked();
         Ok(MultiTableFileSnapshot {
             catalog_replay_start_ts: active_root.trx_id,
             meta: active_root.meta.clone(),
@@ -410,7 +410,7 @@ impl MutableMultiTableFile {
         table_file.file().claim_mutable_writer();
         MutableMultiTableFile {
             file: Some(Arc::clone(table_file)),
-            new_root: Some(table_file.active_root().flip()),
+            new_root: Some(table_file.active_root_unchecked().flip()),
             background_writes: background_writes.clone(),
             mutable_writer_claimed: true,
         }
@@ -644,7 +644,7 @@ mod tests {
             let s0 = mtb.load_snapshot().unwrap();
             assert_eq!(s0.catalog_replay_start_ts, MIN_SNAPSHOT_TS);
             assert_eq!(s0.meta.next_user_obj_id, USER_OBJ_ID_START);
-            let meta_block_id_0 = mtb.active_root().meta_block_id;
+            let meta_block_id_0 = mtb.active_root_unchecked().meta_block_id;
             assert!(meta_block_id_0 > test_block_id(0));
 
             let mut roots = [CatalogTableRootDesc::default(); CATALOG_TABLE_ROOT_DESC_COUNT];
@@ -655,7 +655,7 @@ mod tests {
             }
             publish_checkpoint_for_test(&mtb, background_writes, 7, USER_OBJ_ID_START + 16, roots)
                 .await;
-            let meta_block_id_1 = mtb.active_root().meta_block_id;
+            let meta_block_id_1 = mtb.active_root_unchecked().meta_block_id;
             assert_ne!(meta_block_id_0, meta_block_id_1);
             drop(mtb);
 
@@ -690,18 +690,26 @@ mod tests {
                 root.table_id = idx as u64;
             }
 
-            let meta_block_id_0 = mtb.active_root().meta_block_id;
+            let meta_block_id_0 = mtb.active_root_unchecked().meta_block_id;
             publish_checkpoint_for_test(&mtb, background_writes, 3, USER_OBJ_ID_START + 1, roots)
                 .await;
-            let meta_block_id_1 = mtb.active_root().meta_block_id;
+            let meta_block_id_1 = mtb.active_root_unchecked().meta_block_id;
             publish_checkpoint_for_test(&mtb, background_writes, 4, USER_OBJ_ID_START + 2, roots)
                 .await;
-            let meta_block_id_2 = mtb.active_root().meta_block_id;
+            let meta_block_id_2 = mtb.active_root_unchecked().meta_block_id;
 
             assert_ne!(meta_block_id_0, meta_block_id_1);
             assert_ne!(meta_block_id_1, meta_block_id_2);
-            assert!(mtb.active_root().gc_block_list.contains(&meta_block_id_0));
-            assert!(mtb.active_root().gc_block_list.contains(&meta_block_id_1));
+            assert!(
+                mtb.active_root_unchecked()
+                    .gc_block_list
+                    .contains(&meta_block_id_0)
+            );
+            assert!(
+                mtb.active_root_unchecked()
+                    .gc_block_list
+                    .contains(&meta_block_id_1)
+            );
         });
     }
 
@@ -750,7 +758,7 @@ mod tests {
                 .open_or_create_multi_table_file(global.guard())
                 .await
                 .unwrap();
-            let active_meta_block_id = mtb.active_root().meta_block_id;
+            let active_meta_block_id = mtb.active_root_unchecked().meta_block_id;
             drop(mtb);
             drop(fs);
 
@@ -792,7 +800,7 @@ mod tests {
                 .open_or_create_multi_table_file(global.guard())
                 .await
                 .unwrap();
-            let active_meta_block_id = mtb.active_root().meta_block_id;
+            let active_meta_block_id = mtb.active_root_unchecked().meta_block_id;
             drop(mtb);
             drop(fs);
 
@@ -852,7 +860,7 @@ mod tests {
                 roots_v2,
             )
             .await;
-            let active_super_slot = mtb.active_root().slot_no;
+            let active_super_slot = mtb.active_root_unchecked().slot_no;
             drop(mtb);
             drop(fs);
 
@@ -912,7 +920,7 @@ mod tests {
                 roots_v2,
             )
             .await;
-            let active_meta_block_id = mtb.active_root().meta_block_id;
+            let active_meta_block_id = mtb.active_root_unchecked().meta_block_id;
             drop(mtb);
             drop(fs);
 

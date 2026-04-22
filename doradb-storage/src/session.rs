@@ -197,9 +197,7 @@ impl Session {
         // 5. add DDL redo log to redo log buffer
         let res = stmt
             .effects_mut()
-            .redo_mut()
-            .ddl
-            .replace(Box::new(DDLRedo::CreateTable(table_id)));
+            .set_ddl_redo(DDLRedo::CreateTable(table_id));
         debug_assert!(res.is_none());
 
         // 6. commit current transaction implicitly.
@@ -221,7 +219,7 @@ impl Session {
         // `catalog_load_boundary`: the file was just committed for this DDL,
         // so this root initializes runtime state rather than serving a
         // foreground transaction read.
-        let active_root = table_file.active_root();
+        let active_root = table_file.active_root_unchecked();
         let blk_idx = BlockIndex::new(
             engine.meta_pool.clone_inner(),
             meta_pool_guard,
