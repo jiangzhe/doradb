@@ -804,6 +804,7 @@ impl Table {
         &self.sec_idx
     }
 
+    /// Returns the readonly disk buffer pool used by persisted table data.
     #[inline]
     pub(crate) fn disk_pool(&self) -> &QuiescentGuard<ReadonlyBufferPool> {
         self.storage.disk_pool()

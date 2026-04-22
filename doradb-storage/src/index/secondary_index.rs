@@ -189,11 +189,13 @@ impl SecondaryDiskTreeRuntime {
         self.index_no
     }
 
+    /// Return whether this cold runtime opens a unique secondary DiskTree.
     #[inline]
     pub(crate) fn is_unique(&self) -> bool {
         matches!(self.kind, SecondaryDiskTreeRuntimeKind::Unique(_))
     }
 
+    /// Borrow a guard for opening one or more DiskTree readers on this runtime.
     #[inline]
     pub(crate) fn disk_pool_guard(&self) -> PoolGuard {
         match &self.kind {
@@ -202,6 +204,7 @@ impl SecondaryDiskTreeRuntime {
         }
     }
 
+    /// Open the unique secondary DiskTree at one captured root block id.
     #[inline]
     pub(crate) fn open_unique_at<'a>(
         &'a self,
@@ -219,6 +222,7 @@ impl SecondaryDiskTreeRuntime {
         }
     }
 
+    /// Open the non-unique secondary DiskTree at one captured root block id.
     #[inline]
     pub(crate) fn open_non_unique_at<'a>(
         &'a self,

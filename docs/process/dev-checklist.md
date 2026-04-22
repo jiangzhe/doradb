@@ -13,6 +13,11 @@ document is the source of truth for intended behavior when one exists.
       `tools/coverage_focus.rs --path <path/to/file/or/dir>`.
 - [ ] Confirm focused coverage is at least 80% for changed files or
       directories. If it is lower, document the reason and the follow-up needed.
+- [ ] For central definition-heavy files, such as shared error/type enums whose
+      primary role is declarations rather than executable control flow, a lower
+      whole-file focused coverage result is acceptable only when review notes
+      explain why the file fits that category and cite at least one affected
+      consumer/runtime path whose focused coverage still meets the 80% bar.
 - [ ] Check that errors are propagated with `crate::error::Result` where
       appropriate and that runtime paths do not rely on `unwrap()` or
       `expect()`.
