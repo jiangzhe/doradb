@@ -4,7 +4,7 @@ use crate::catalog::{TableCache, TableID, TableSpec};
 use crate::error::{Result, StoragePoisonSource};
 use crate::row::RowID;
 use crate::row::ops::SelectKey;
-use crate::trx::redo::{RedoLogs, RowRedo};
+use crate::trx::redo::{DDLRedo, RedoLogs, RowRedo};
 use crate::trx::undo::{
     IndexUndo, IndexUndoKind, IndexUndoLogs, OwnedRowUndo, RowUndoKind, RowUndoLogs,
 };
@@ -131,10 +131,10 @@ impl StmtEffects {
         self.redo.insert_dml(table_id, entry);
     }
 
-    /// Returns mutable redo access for compatibility during the migration.
+    /// Replace the statement's deferred DDL redo payload.
     #[inline]
-    pub(crate) fn redo_mut(&mut self) -> &mut RedoLogs {
-        &mut self.redo
+    pub(crate) fn set_ddl_redo(&mut self, ddl: DDLRedo) -> Option<Box<DDLRedo>> {
+        self.redo.ddl.replace(Box::new(ddl))
     }
 
     #[inline]

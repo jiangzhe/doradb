@@ -298,7 +298,7 @@ impl<'a> LogRecovery<'a> {
             .ok_or(Error::TableNotFound)?;
         // `recovery_bootstrap_unchecked`: recovery records replay floors from
         // the table root loaded during restart, before normal transactions run.
-        let active_root = table.file().active_root();
+        let active_root = table.file().active_root_unchecked();
         let state = RecoveryTableState {
             heap_redo_start_ts: active_root.heap_redo_start_ts,
             deletion_cutoff_ts: active_root.deletion_cutoff_ts,
@@ -588,7 +588,7 @@ impl<'a> LogRecovery<'a> {
     ) -> Result<()> {
         let heap_redo_start_ts = self.table_heap_redo_start_ts(table_id)?;
         let deletion_cutoff_ts = self.table_deletion_cutoff_ts(table_id)?;
-        let pivot_row_id = table.file().active_root().pivot_row_id;
+        let pivot_row_id = table.file().active_root_unchecked().pivot_row_id;
         for row in rows.values() {
             match &row.kind {
                 RowRedoKind::Insert(vals) => {
@@ -1192,7 +1192,7 @@ mod tests {
             table.freeze(&session, usize::MAX).await;
             let mut checkpoint_session = engine.try_new_session().unwrap();
             checkpoint_published(&table, &mut checkpoint_session).await;
-            let root_after_checkpoint = table.file().active_root();
+            let root_after_checkpoint = table.file().active_root_unchecked();
             assert!(root_after_checkpoint.heap_redo_start_ts > catalog_replay_start_ts);
 
             drop(table);
@@ -1220,14 +1220,17 @@ mod tests {
             let trx = session.try_begin_trx().unwrap().unwrap();
             let stmt = trx.start_stmt();
             let key = SelectKey::new(0, vec![Val::from(7u32)]);
-            let index = table.sec_idx()[key.index_no].unique().unwrap();
+            let index = &table.sec_idx()[key.index_no];
+            let root = table.file().active_root_unchecked().secondary_index_roots[key.index_no];
             let disk = index
-                .disk()
-                .open_unique(session.pool_guards().disk_guard())
+                .disk_runtime()
+                .open_unique_at(root, session.pool_guards().disk_guard())
                 .unwrap();
             assert_eq!(disk.lookup(&key.vals).await.unwrap(), Some(cold_row_id));
             assert_eq!(
                 index
+                    .bind_unique(root)
+                    .unwrap()
                     .lookup(
                         session.pool_guards().index_guard(),
                         &key.vals,
@@ -1308,7 +1311,7 @@ mod tests {
             table.freeze(&session, usize::MAX).await;
             let mut checkpoint_session = engine.try_new_session().unwrap();
             checkpoint_published(&table, &mut checkpoint_session).await;
-            assert!(table.file().active_root().pivot_row_id > cold_row_id);
+            assert!(table.file().active_root_unchecked().pivot_row_id > cold_row_id);
 
             let key = SelectKey::new(0, vec![Val::from(7u32)]);
             let mut trx = session.try_begin_trx().unwrap().unwrap();
@@ -1355,14 +1358,17 @@ mod tests {
             let mut session = engine.try_new_session().unwrap();
             assert!(table.total_row_pages(session.pool_guards()).await > 0);
 
-            let index = table.sec_idx()[key.index_no].unique().unwrap();
+            let index = &table.sec_idx()[key.index_no];
+            let root = table.file().active_root_unchecked().secondary_index_roots[key.index_no];
             let disk = index
-                .disk()
-                .open_unique(session.pool_guards().disk_guard())
+                .disk_runtime()
+                .open_unique_at(root, session.pool_guards().disk_guard())
                 .unwrap();
             assert_eq!(disk.lookup(&key.vals).await.unwrap(), Some(cold_row_id));
             assert_eq!(
                 index
+                    .bind_unique(root)
+                    .unwrap()
                     .lookup(
                         session.pool_guards().index_guard(),
                         &key.vals,
@@ -1448,7 +1454,7 @@ mod tests {
             assert!(
                 same_row_ids
                     .iter()
-                    .all(|row_id| *row_id < table.file().active_root().pivot_row_id)
+                    .all(|row_id| *row_id < table.file().active_root_unchecked().pivot_row_id)
             );
 
             let delete_key = SelectKey::new(0, vec![Val::from(2u32)]);
@@ -1474,10 +1480,12 @@ mod tests {
             assert_eq!(table.total_row_pages(session.pool_guards()).await, 0);
 
             let name_key = SelectKey::new(1, vec![Val::from("same-name")]);
-            let non_unique = table.sec_idx()[name_key.index_no].non_unique().unwrap();
+            let non_unique = &table.sec_idx()[name_key.index_no];
+            let root =
+                table.file().active_root_unchecked().secondary_index_roots[name_key.index_no];
             let disk = non_unique
-                .disk()
-                .open_non_unique(session.pool_guards().disk_guard())
+                .disk_runtime()
+                .open_non_unique_at(root, session.pool_guards().disk_guard())
                 .unwrap();
             let disk_rows = disk
                 .prefix_scan_entries(&name_key.vals)
@@ -1581,7 +1589,7 @@ mod tests {
             table.freeze(&session, usize::MAX).await;
             let mut checkpoint_session = engine.try_new_session().unwrap();
             checkpoint_published(&table, &mut checkpoint_session).await;
-            let root_after_checkpoint = table.file().active_root();
+            let root_after_checkpoint = table.file().active_root_unchecked();
             assert!(root_after_checkpoint.heap_redo_start_ts > catalog_replay_start_ts);
 
             let mut trx = session.try_begin_trx().unwrap().unwrap();
@@ -1725,7 +1733,7 @@ mod tests {
                 marker0_ts
             );
             checkpoint_published(&table, &mut checkpoint_session).await;
-            let checkpointed_cutoff = table.file().active_root().deletion_cutoff_ts;
+            let checkpointed_cutoff = table.file().active_root_unchecked().deletion_cutoff_ts;
             assert!(checkpointed_cutoff > marker0_ts);
 
             let mut trx = session.try_begin_trx().unwrap().unwrap();
@@ -1769,7 +1777,7 @@ mod tests {
 
             let table = engine.catalog().get_table(table_id).await.unwrap();
             assert_eq!(
-                table.file().active_root().deletion_cutoff_ts,
+                table.file().active_root_unchecked().deletion_cutoff_ts,
                 checkpointed_cutoff
             );
             assert!(table.deletion_buffer().get(0).is_none());
@@ -1916,10 +1924,25 @@ mod tests {
             trx = stmt.succeed();
             trx.commit().await.unwrap();
 
-            assert!(checkpointed_table.file().active_root().pivot_row_id > 0);
-            assert_eq!(replay_only_table.file().active_root().pivot_row_id, 0);
             assert!(
-                checkpointed_table.file().active_root().heap_redo_start_ts
+                checkpointed_table
+                    .file()
+                    .active_root_unchecked()
+                    .pivot_row_id
+                    > 0
+            );
+            assert_eq!(
+                replay_only_table
+                    .file()
+                    .active_root_unchecked()
+                    .pivot_row_id,
+                0
+            );
+            assert!(
+                checkpointed_table
+                    .file()
+                    .active_root_unchecked()
+                    .heap_redo_start_ts
                     > baseline_catalog_replay_start_ts
             );
 
@@ -2065,7 +2088,7 @@ mod tests {
             let mut checkpoint_session = engine.try_new_session().unwrap();
             checkpoint_published(&table, &mut checkpoint_session).await;
 
-            let active_root = table.file().active_root();
+            let active_root = table.file().active_root_unchecked();
             let block_id = {
                 let disk_pool_guard = table.disk_pool().pool_guard();
                 let index = ColumnBlockIndex::new(
@@ -2226,7 +2249,7 @@ mod tests {
             table.freeze(&session, usize::MAX).await;
             checkpoint_published(&table, &mut checkpoint_session).await;
 
-            let active_root = table.file().active_root();
+            let active_root = table.file().active_root_unchecked();
             let blob_ref = {
                 let disk_pool_guard = table.disk_pool().pool_guard();
                 let index = ColumnBlockIndex::new(
@@ -2275,7 +2298,7 @@ mod tests {
 
             let table = engine.catalog().get_table(table_id).await.unwrap();
             let session = engine.try_new_session().unwrap();
-            let active_root = table.file().active_root();
+            let active_root = table.file().active_root_unchecked();
             let index = ColumnBlockIndex::new(
                 active_root.column_block_index_root,
                 active_root.pivot_row_id,

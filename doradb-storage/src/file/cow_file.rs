@@ -269,7 +269,7 @@ impl<M> CowFile<M> {
     /// Callers that need multiple fields from one logical root snapshot must
     /// bind one local reference and reuse it.
     #[inline]
-    pub fn active_root(&self) -> &ActiveRoot<M> {
+    pub fn active_root_unchecked(&self) -> &ActiveRoot<M> {
         Self::active_root_from_raw(self.load_active_root_raw())
     }
 

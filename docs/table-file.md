@@ -93,7 +93,7 @@ reclaimable blocks from checkpoint-root reachability.
 
 ### 4.3 Runtime Root Access
 
-`CowFile::active_root()` and `TableFile::active_root()` remain the low-level
+`CowFile::active_root_unchecked()` and `TableFile::active_root_unchecked()` remain the low-level
 unchecked root primitives. Runtime user-table readers should not stitch
 together fields from repeated unchecked reads. Instead, transaction-owned read
 paths mint `TrxReadProof<'ctx>` from `TrxContext` and use the runtime table

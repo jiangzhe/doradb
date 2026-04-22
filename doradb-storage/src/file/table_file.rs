@@ -269,8 +269,8 @@ impl TableFile {
     /// related fields from one logical checkpoint root must bind one local
     /// reference and reuse it.
     #[inline]
-    pub fn active_root(&self) -> &ActiveRoot {
-        self.file.active_root()
+    pub fn active_root_unchecked(&self) -> &ActiveRoot {
+        self.file.active_root_unchecked()
     }
 
     #[inline]
@@ -381,7 +381,7 @@ impl MutableTableFile {
         table_file.file().claim_mutable_writer();
         MutableTableFile {
             file: Some(Arc::clone(table_file)),
-            new_root: Some(table_file.active_root().flip()),
+            new_root: Some(table_file.active_root_unchecked().flip()),
             background_writes: background_writes.clone(),
             mutable_writer_claimed: true,
         }
@@ -718,10 +718,10 @@ mod tests {
             let table_file = fs.create_table_file(41, metadata, false).unwrap();
             let (table_file, old_root) = table_file.commit(1, false).await.unwrap();
             assert!(old_root.is_none());
-            assert_eq!(table_file.active_root().slot_no, 0);
-            assert_eq!(table_file.active_root().trx_id, 1);
+            assert_eq!(table_file.active_root_unchecked().slot_no, 0);
+            assert_eq!(table_file.active_root_unchecked().trx_id, 1);
             assert_eq!(
-                table_file.active_root().secondary_index_roots,
+                table_file.active_root_unchecked().secondary_index_roots,
                 vec![SUPER_BLOCK_ID]
             );
 
@@ -744,7 +744,7 @@ mod tests {
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
             let table_file2 = fs.open_table_file(41, global.guard()).await.unwrap();
             let disk_pool = global.guard();
-            assert_eq!(table_file2.active_root().trx_id, 1);
+            assert_eq!(table_file2.active_root_unchecked().trx_id, 1);
 
             let mut mutable = MutableTableFile::fork(&table_file2, background_writes);
             let secondary_root = mutable.allocate_block_id().unwrap();
@@ -852,8 +852,8 @@ mod tests {
             let table_file = fs.create_table_file(42, metadata, false).unwrap();
             let (table_file, old_root) = table_file.commit(1, false).await.unwrap();
             assert!(old_root.is_none());
-            assert_eq!(table_file.active_root().slot_no, 0);
-            assert_eq!(table_file.active_root().trx_id, 1);
+            assert_eq!(table_file.active_root_unchecked().slot_no, 0);
+            assert_eq!(table_file.active_root_unchecked().trx_id, 1);
 
             let global = QuiescentBox::new(
                 ReadonlyBufferPool::with_capacity(PoolRole::Disk, 64 * 1024 * 1024, fs.guard())
@@ -939,7 +939,7 @@ mod tests {
                 .unwrap();
             let (table_file, old_root) = table_file.commit(1, false).await.unwrap();
             drop(old_root);
-            let active_meta_block_id = table_file.active_root().meta_block_id;
+            let active_meta_block_id = table_file.active_root_unchecked().meta_block_id;
             drop(table_file);
             drop(fs);
 
@@ -972,7 +972,7 @@ mod tests {
                 .unwrap();
             let (table_file, old_root) = table_file.commit(1, false).await.unwrap();
             drop(old_root);
-            let active_meta_block_id = table_file.active_root().meta_block_id;
+            let active_meta_block_id = table_file.active_root_unchecked().meta_block_id;
             drop(table_file);
             drop(fs);
 
@@ -1029,7 +1029,7 @@ mod tests {
                 .unwrap();
             drop(old_root);
 
-            let active_root = table_file.active_root();
+            let active_root = table_file.active_root_unchecked();
             assert_eq!(active_root.trx_id, 2);
             assert_eq!(active_root.pivot_row_id, 20);
             assert_eq!(active_root.heap_redo_start_ts, 7);
@@ -1092,7 +1092,7 @@ mod tests {
                 .await;
 
             assert!(matches!(result, Err(Error::InvalidArgument)));
-            let active_root = table_file.active_root();
+            let active_root = table_file.active_root_unchecked();
             assert_eq!(active_root.pivot_row_id, 0);
             assert_eq!(active_root.column_block_index_root, SUPER_BLOCK_ID);
             assert_eq!(active_root.deletion_cutoff_ts, 1);

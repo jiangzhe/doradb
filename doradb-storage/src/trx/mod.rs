@@ -1079,7 +1079,7 @@ mod tests {
         let (table_file, old_root) = mutable.commit(1, false).await.unwrap();
         assert!(old_root.is_none());
 
-        let old_root_ptr = table_file.active_root() as *const _ as usize;
+        let old_root_ptr = table_file.active_root_unchecked() as *const _ as usize;
         let mutable = MutableTableFile::fork(&table_file, engine.table_fs.background_writes());
         let (_table_file, old_root) = mutable.commit(2, false).await.unwrap();
         (old_root_ptr, old_root.unwrap())

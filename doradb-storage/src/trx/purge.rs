@@ -646,6 +646,7 @@ mod tests {
     use crate::catalog::tests::table1;
     use crate::conf::{EngineConfig, EvictableBufferPoolConfig, TrxSysConfig};
     use crate::error::{Error, StoragePoisonSource};
+    use crate::file::cow_file::BlockID;
     use crate::index::{RowLocation, UniqueIndex};
     use crate::latch::LatchFallbackMode;
     use crate::row::RowPage;
@@ -668,6 +669,18 @@ mod tests {
             .push(PoolRole::Mem, engine.mem_pool.pool_guard())
             .push(PoolRole::Disk, engine.disk_pool.pool_guard())
             .build()
+    }
+
+    #[inline]
+    fn active_secondary_root(table: &Table, index_no: usize) -> BlockID {
+        table.file().active_root_unchecked().secondary_index_roots[index_no]
+    }
+
+    #[inline]
+    fn bound_unique_index_no(table: &Table, index_no: usize) -> impl UniqueIndex + '_ {
+        table.sec_idx()[index_no]
+            .bind_unique(active_secondary_root(table, index_no))
+            .unwrap()
     }
 
     async fn stmt_insert_row(
@@ -800,9 +813,7 @@ mod tests {
             drop(session);
             let pool_guards = full_pool_guards(&engine);
             let key = vec![Val::from(1001i32)];
-            let Some((row_id, _)) = table.sec_idx()[0]
-                .unique()
-                .unwrap()
+            let Some((row_id, _)) = bound_unique_index_no(&table, 0)
                 .lookup(pool_guards.index_guard(), &key, MAX_SNAPSHOT_TS)
                 .await
                 .unwrap()
@@ -890,9 +901,7 @@ mod tests {
             drop(session);
             let pool_guards = full_pool_guards(&engine);
             let key = vec![Val::from(1002i32)];
-            let Some((row_id, _)) = table.sec_idx()[0]
-                .unique()
-                .unwrap()
+            let Some((row_id, _)) = bound_unique_index_no(&table, 0)
                 .lookup(pool_guards.index_guard(), &key, MAX_SNAPSHOT_TS)
                 .await
                 .unwrap()
@@ -984,9 +993,7 @@ mod tests {
             drop(session);
             let pool_guards = full_pool_guards(&engine);
             let key = vec![Val::from(1003i32)];
-            let Some((row_id, _)) = table.sec_idx()[0]
-                .unique()
-                .unwrap()
+            let Some((row_id, _)) = bound_unique_index_no(&table, 0)
                 .lookup(pool_guards.index_guard(), &key, MAX_SNAPSHOT_TS)
                 .await
                 .unwrap()
@@ -1092,9 +1099,7 @@ mod tests {
             drop(session);
             let pool_guards = full_pool_guards(&engine);
             let key = vec![Val::from(1004i32)];
-            let Some((row_id, _)) = table.sec_idx()[0]
-                .unique()
-                .unwrap()
+            let Some((row_id, _)) = bound_unique_index_no(&table, 0)
                 .lookup(pool_guards.index_guard(), &key, MAX_SNAPSHOT_TS)
                 .await
                 .unwrap()
@@ -1337,7 +1342,7 @@ mod tests {
             if gc_timeout {
                 // see which one is not purged, and its cts.
                 let pool_guards = full_pool_guards(&engine);
-                let index = table.sec_idx()[0].unique().unwrap();
+                let index = bound_unique_index_no(&table, 0);
                 let mut remained_row_ids = vec![];
                 index
                     .scan_values(pool_guards.index_guard(), &mut remained_row_ids, 100)

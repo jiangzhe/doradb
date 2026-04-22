@@ -134,6 +134,11 @@ pub enum Error {
     InternalError,
     #[error("invalid state")]
     InvalidState,
+    #[error("wrong secondary index binding: expected {expected}, found {actual}")]
+    WrongSecondaryIndexBinding {
+        expected: &'static str,
+        actual: &'static str,
+    },
     #[error("old table root already retained by transaction")]
     OldTableRootAlreadyRetained,
     #[error("Invalid format")]

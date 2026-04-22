@@ -20,8 +20,8 @@ pub use column_deletion_blob::*;
 pub use non_unique_index::*;
 pub use row_page_index::*;
 pub(crate) use secondary_index::{
-    InMemorySecondaryIndex, NonUniqueSecondaryIndex, SecondaryDiskTreeRuntime, SecondaryIndex,
-    UniqueSecondaryIndex,
+    InMemorySecondaryIndex, SecondaryDiskTreeRuntime, SecondaryIndex,
 };
 pub use secondary_index::{IndexCompareExchange, IndexInsert};
+pub(crate) use secondary_index::{NonUniqueSecondaryIndex, UniqueSecondaryIndex};
 pub use unique_index::*;

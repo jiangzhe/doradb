@@ -199,8 +199,7 @@ impl IndexRollback for Table {
         ts: TrxID,
     ) -> Result<bool> {
         self.sec_idx()[key.index_no]
-            .unique()
-            .ok_or(Error::InvalidArgument)?
+            .unique_mem()?
             .mask_as_deleted(index_pool_guard, &key.vals, row_id, ts)
             .await
     }
@@ -215,8 +214,7 @@ impl IndexRollback for Table {
         ts: TrxID,
     ) -> Result<bool> {
         self.sec_idx()[key.index_no]
-            .unique()
-            .ok_or(Error::InvalidArgument)?
+            .unique_mem()?
             .compare_delete(index_pool_guard, &key.vals, row_id, ignore_del_mask, ts)
             .await
     }
@@ -231,8 +229,7 @@ impl IndexRollback for Table {
         ts: TrxID,
     ) -> Result<IndexCompareExchange> {
         self.sec_idx()[key.index_no]
-            .unique()
-            .ok_or(Error::InvalidArgument)?
+            .unique_mem()?
             .compare_exchange(index_pool_guard, &key.vals, old_row_id, new_row_id, ts)
             .await
     }
@@ -246,8 +243,7 @@ impl IndexRollback for Table {
         ts: TrxID,
     ) -> Result<bool> {
         self.sec_idx()[key.index_no]
-            .non_unique()
-            .ok_or(Error::InvalidArgument)?
+            .non_unique_mem()?
             .mask_as_deleted(index_pool_guard, &key.vals, row_id, ts)
             .await
     }
@@ -261,8 +257,7 @@ impl IndexRollback for Table {
         ts: TrxID,
     ) -> Result<bool> {
         self.sec_idx()[key.index_no]
-            .non_unique()
-            .ok_or(Error::InvalidArgument)?
+            .non_unique_mem()?
             .mask_as_active(index_pool_guard, &key.vals, row_id, ts)
             .await
     }
@@ -277,8 +272,7 @@ impl IndexRollback for Table {
         ts: TrxID,
     ) -> Result<bool> {
         self.sec_idx()[key.index_no]
-            .non_unique()
-            .ok_or(Error::InvalidArgument)?
+            .non_unique_mem()?
             .compare_delete(index_pool_guard, &key.vals, row_id, ignore_del_mask, ts)
             .await
     }

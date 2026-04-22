@@ -239,7 +239,7 @@ impl Catalog {
                     .await?;
                 // `catalog_load_boundary`: loading a user table binds one root
                 // for metadata validation and block-index initialization.
-                let active_root = table_file.active_root();
+                let active_root = table_file.active_root_unchecked();
                 let metadata_in_catalog = TableMetadata::new(column_specs, index_specs);
                 let metadata_in_file = &*active_root.metadata;
                 if &metadata_in_catalog != metadata_in_file {
@@ -320,7 +320,7 @@ impl Catalog {
         self.user_tables.get(&table_id).map(|table| {
             // `catalog_load_boundary`: replay floors are derived from loaded
             // table roots during bootstrap/recovery bookkeeping.
-            let root = table.file().active_root();
+            let root = table.file().active_root_unchecked();
             root.heap_redo_start_ts.min(root.deletion_cutoff_ts)
         })
     }
@@ -1199,10 +1199,25 @@ pub mod tests {
                 crate::table::CheckpointOutcome::Published { .. }
             ));
 
-            assert!(checkpointed_table.file().active_root().pivot_row_id > 0);
-            assert_eq!(replay_only_table.file().active_root().pivot_row_id, 0);
             assert!(
-                checkpointed_table.file().active_root().heap_redo_start_ts
+                checkpointed_table
+                    .file()
+                    .active_root_unchecked()
+                    .pivot_row_id
+                    > 0
+            );
+            assert_eq!(
+                replay_only_table
+                    .file()
+                    .active_root_unchecked()
+                    .pivot_row_id,
+                0
+            );
+            assert!(
+                checkpointed_table
+                    .file()
+                    .active_root_unchecked()
+                    .heap_redo_start_ts
                     > snap1.catalog_replay_start_ts
             );
 

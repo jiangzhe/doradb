@@ -682,7 +682,7 @@ impl TablePersistence for Table {
         let trx_sys = session.engine().trx_sys.clone();
         // `checkpoint_internal`: readiness checks the current root liveness
         // before this path forks and later displaces that root.
-        let active_root = self.file().active_root();
+        let active_root = self.file().active_root_unchecked();
         CheckpointReadiness::for_root(active_root, trx_sys.calc_min_active_sts_for_gc())
     }
 
@@ -825,7 +825,10 @@ impl TablePersistence for Table {
         // transaction. This intentionally happens even when no row data,
         // deletion payload, or secondary index root changed: the root trx_id
         // acts as a checkpoint heartbeat for future redo-log truncation.
-        let (table_file, old_root) = match mutable_file.commit(checkpoint_ts, false).await {
+        let published_root = mutable_file.root();
+        let published_pivot_row_id = published_root.pivot_row_id;
+        let published_column_root = published_root.column_block_index_root;
+        let (_table_file, old_root) = match mutable_file.commit(checkpoint_ts, false).await {
             Ok(res) => res,
             Err(err) if err.is_storage_io_failure() || matches!(err, Error::SendError) => {
                 let _ = trx_sys.rollback(trx).await;
@@ -837,14 +840,8 @@ impl TablePersistence for Table {
                 return Err(err);
             }
         };
-        // Read back the just-published checkpoint root to refresh in-memory
-        // block-index routing for the same publication.
-        let active_root = table_file.active_root();
         self.blk_idx()
-            .update_column_root(
-                active_root.pivot_row_id,
-                active_root.column_block_index_root,
-            )
+            .update_column_root(published_pivot_row_id, published_column_root)
             .await;
         if let Some(old_root) = old_root
             && let Err(err) = trx.retain_old_table_root(old_root)
