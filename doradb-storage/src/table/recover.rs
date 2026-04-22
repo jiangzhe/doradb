@@ -269,8 +269,9 @@ impl TableRecover for Table {
     }
 }
 
+/// Reject duplicate secondary-index entries during recovery rebuild.
 #[inline]
-fn ensure_recovery_index_insert(index_no: usize, res: IndexInsert) -> Result<()> {
+pub(super) fn ensure_recovery_index_insert(index_no: usize, res: IndexInsert) -> Result<()> {
     match res {
         IndexInsert::Ok(_) => Ok(()),
         IndexInsert::DuplicateKey(row_id, deleted) => Err(Error::UnexpectedRecoveryDuplicateKey {

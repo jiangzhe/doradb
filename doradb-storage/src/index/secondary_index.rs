@@ -189,12 +189,6 @@ impl SecondaryDiskTreeRuntime {
         self.index_no
     }
 
-    /// Return whether this cold runtime opens a unique secondary DiskTree.
-    #[inline]
-    pub(crate) fn is_unique(&self) -> bool {
-        matches!(self.kind, SecondaryDiskTreeRuntimeKind::Unique(_))
-    }
-
     /// Borrow a guard for opening one or more DiskTree readers on this runtime.
     #[inline]
     pub(crate) fn disk_pool_guard(&self) -> PoolGuard {
@@ -256,36 +250,6 @@ pub(crate) enum SecondaryIndex<P: 'static> {
 }
 
 impl<P: BufferPool> SecondaryIndex<P> {
-    /// Pair a freshly built unique MemIndex with its cold DiskTree runtime.
-    #[inline]
-    pub(crate) async fn new_unique(
-        index_no: usize,
-        mem: UniqueMemIndex<P>,
-        disk: SecondaryDiskTreeRuntime,
-        pool_guard: &PoolGuard,
-    ) -> Result<Self> {
-        if disk.index_no() != index_no || !disk.is_unique() {
-            let _ = mem.destroy(pool_guard).await;
-            return Err(Error::InvalidState);
-        }
-        Ok(Self::Unique { mem, disk })
-    }
-
-    /// Pair a freshly built non-unique MemIndex with its cold DiskTree runtime.
-    #[inline]
-    pub(crate) async fn new_non_unique(
-        index_no: usize,
-        mem: NonUniqueMemIndex<P>,
-        disk: SecondaryDiskTreeRuntime,
-        pool_guard: &PoolGuard,
-    ) -> Result<Self> {
-        if disk.index_no() != index_no || disk.is_unique() {
-            let _ = mem.destroy(pool_guard).await;
-            return Err(Error::InvalidState);
-        }
-        Ok(Self::NonUnique { mem, disk })
-    }
-
     /// Destroy the mutable MemIndex owned by this composite index.
     #[inline]
     pub(crate) async fn destroy(self, pool_guard: &PoolGuard) -> Result<()> {

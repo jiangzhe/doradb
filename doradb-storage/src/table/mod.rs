@@ -333,7 +333,7 @@ pub(crate) async fn build_dual_tree_secondary_indexes(
                     return Err(err);
                 }
             };
-            SecondaryIndex::new_unique(index_no, mem, runtime, index_pool_guard).await
+            SecondaryIndex::Unique { mem, disk: runtime }
         } else {
             let mem = match NonUniqueMemIndex::new(
                 index_pool.clone(),
@@ -350,14 +350,7 @@ pub(crate) async fn build_dual_tree_secondary_indexes(
                     return Err(err);
                 }
             };
-            SecondaryIndex::new_non_unique(index_no, mem, runtime, index_pool_guard).await
-        };
-        let index = match index {
-            Ok(index) => index,
-            Err(err) => {
-                builder.rollback(index_pool_guard).await;
-                return Err(err);
-            }
+            SecondaryIndex::NonUnique { mem, disk: runtime }
         };
         builder.push(index);
     }
@@ -1356,11 +1349,10 @@ impl Table {
     ) -> Result<RecoverIndex> {
         let index = self.sec_idx()[key.index_no].non_unique_mem()?;
         let index_pool_guard = self.index_pool_guard(guards);
-        // The recovery should make sure no duplicate key.
         let res = index
             .insert_if_not_exists(index_pool_guard, &key.vals, row_id, true, MIN_SNAPSHOT_TS)
             .await?;
-        debug_assert!(matches!(res, IndexInsert::Ok(_)));
+        recover::ensure_recovery_index_insert(key.index_no, res)?;
         Ok(RecoverIndex::Ok)
     }
 
