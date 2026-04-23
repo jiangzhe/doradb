@@ -15,15 +15,15 @@ The storage has three data formats:
 In-memory row pages contain hot data which are processed by recent transactions.
 Row pages support in-place updates.
 
-2. LWC pages on disk.
+2. LWC blocks on disk.
 
-LWC(LightWeight Columnar) pages on disk store warm data for persistence.
-This kind of pages apply lightweight columnar compression, such as bitpacking and dict, to support both fast scan and random access. 
+LWC(LightWeight Columnar) blocks on disk store warm data for persistence.
+This kind of blocks apply lightweight columnar compression, such as bitpacking and dict, to support both fast scan and random access. 
 Updates are converted to delete mask + insert. So there are also delete bitmaps stored accordingly.
 
-3. Column pages on disk(optional).
+3. Column blocks on disk(optional).
 
-Column pages on disk store cold data with columnar encoding.
+Column blocks on disk store cold data with columnar encoding.
 They are transformed by background task to speed up analytical queries.
 If the engine is used as a local storage, columnar encoding is preferred.
 If the engine is used as an ingestion and query node, integration with object store is preferred.
