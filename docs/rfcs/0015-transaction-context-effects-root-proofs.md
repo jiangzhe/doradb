@@ -1,7 +1,7 @@
 ---
 id: 0015
 title: Transaction Context Effects Root Proofs
-status: proposal
+status: implemented
 tags: [storage, transaction, checkpoint, safety]
 created: 2026-04-19
 github_issue: 576
@@ -707,25 +707,27 @@ References:
 
 ## Open Questions
 
-- Should `TrxReadProof<'ctx>` carry only `PhantomData<&'ctx TrxContext>`, or
-  should it hold a private reference to `TrxContext` for stronger compiler
-  diagnostics and easier debugging?
-- Should `TableRootSnapshot` be table-module owned or file-module owned? The
-  proposed fields are table-runtime contracts, but construction reads file-root
-  internals.
-- Should checkpoint readiness use `TableRootSnapshot`, or should checkpoint
-  remain on an internal unchecked active-root path because it is a publication
-  coordinator rather than a runtime transaction read?
+No unresolved open questions remain for the implemented RFC scope.
+
+- `TrxReadProof<'ctx>` was implemented as a private
+  `PhantomData<&'ctx TrxContext>` witness minted from `TrxContext`.
+- `TableRootSnapshot<'ctx>` was implemented as a table-runtime contract in
+  `doradb-storage/src/table/mod.rs`, with construction delegated through
+  proof-gated active-root binding.
+- Checkpoint readiness and publication remain on explicitly named unchecked
+  internal active-root paths because checkpoint is a publication coordinator,
+  not an ordinary runtime transaction read.
 
 ## Future Work
 
-- Root-reachability GC for obsolete table-file and DiskTree pages.
+- Root-reachability GC for obsolete table-file and DiskTree pages, tracked by
+  `docs/backlogs/000094-table-file-root-reachability-gc.md`.
 - A possible transaction-owned root guard for future long scans that cannot use
   owned field snapshots efficiently.
 - Broader typed read proofs for non-root transaction-consistent runtime views if
   future APIs need the same lifetime pattern.
-- Follow-up cleanup of legacy `active_root()` naming in file tests once runtime
-  paths are fully proof-gated.
+- Possible mechanical checking for new unchecked user-table root-access call
+  sites if review alone stops being sufficient.
 
 ## References
 
