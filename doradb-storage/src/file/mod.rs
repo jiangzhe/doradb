@@ -564,7 +564,7 @@ impl SparseFile {
             let offset = self.offset.load(Ordering::Relaxed);
             let new_offset = offset + size;
             if new_offset > self.max_len.load(Ordering::Relaxed) {
-                return Err(Error::StorageFileCapacityExceeded);
+                return Err(Error::storage_file_capacity_exceeded());
             }
             if self
                 .offset
@@ -642,7 +642,9 @@ pub fn sparse_file_size(fd: RawFd) -> std::io::Result<(usize, usize)> {
 
 #[inline]
 fn c_string_from_path(file_path: &str) -> Result<CString> {
-    CString::new(file_path).map_err(|_| Error::InvalidStoragePath(file_path.to_owned()))
+    CString::new(file_path).map_err(|_| {
+        Error::invalid_argument_message(format!("path must not contain NUL: {file_path}"))
+    })
 }
 
 /// Worker-owned table-write request before the backend queue admits it.
@@ -675,7 +677,7 @@ impl WriteSubmission {
             buf,
             completion,
         };
-        (fio, async move { waiter.wait_result().await })
+        (fio, async move { waiter.wait_result_fresh().await })
     }
 
     #[inline]
@@ -747,7 +749,7 @@ pub(crate) async fn write_direct(
         let BackgroundWriteRequest::Table(_submission) = err.into_inner() else {
             unreachable!("write_direct received unexpected background-write send error");
         };
-        return Err(Error::SendError);
+        return Err(Error::send_error());
     }
     result.await
 }
@@ -820,7 +822,7 @@ impl TableFsStateMachine {
                         let result = if len == expected_len {
                             Ok(())
                         } else {
-                            Err(Error::ShortIO)
+                            Err(Error::short_io())
                         };
                         sub.completion.complete(result);
                     }
@@ -1206,13 +1208,14 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let file_path = temp_dir.path().join("sparsefile1.bin");
         let file_path = file_path.to_string_lossy().into_owned();
-        assert!(matches!(
-            SparseFile::open(&file_path, UNTRACKED_FILE_ID),
-            Err(Error::StorageIOError {
-                op: StorageOp::FileOpen,
-                ..
-            })
-        ));
+        let err = match SparseFile::open(&file_path, UNTRACKED_FILE_ID) {
+            Ok(_) => panic!("expected open to fail before create"),
+            Err(err) => err,
+        };
+        assert!(
+            err.storage_io_failure()
+                .is_some_and(|failure| failure.op == StorageOp::FileOpen)
+        );
         let file = SparseFile::create_or_trunc(&file_path, 1024 * 1024, UNTRACKED_FILE_ID).unwrap();
         drop(file);
         let file = SparseFile::open(&file_path, UNTRACKED_FILE_ID).unwrap();
@@ -1228,26 +1231,31 @@ mod tests {
             .join("nested")
             .join("create.bin");
         let file_path = file_path.to_string_lossy().into_owned();
-        assert!(matches!(
-            SparseFile::create_or_trunc(&file_path, 4096, UNTRACKED_FILE_ID),
-            Err(Error::StorageIOError {
-                op: StorageOp::FileCreate,
-                ..
-            })
-        ));
+        let err = match SparseFile::create_or_trunc(&file_path, 4096, UNTRACKED_FILE_ID) {
+            Ok(_) => panic!("expected create to fail for missing parent"),
+            Err(err) => err,
+        };
+        assert!(
+            err.storage_io_failure()
+                .is_some_and(|failure| failure.op == StorageOp::FileCreate)
+        );
     }
 
     #[test]
-    fn test_sparse_file_invalid_path_maps_invalid_storage_path() {
+    fn test_sparse_file_invalid_path_maps_invalid_argument() {
         let invalid_path = "bad\0path";
-        assert!(matches!(
-            SparseFile::open(invalid_path, UNTRACKED_FILE_ID),
-            Err(Error::InvalidStoragePath(path)) if path == invalid_path
-        ));
-        assert!(matches!(
-            SparseFile::create_or_trunc(invalid_path, 4096, UNTRACKED_FILE_ID),
-            Err(Error::InvalidStoragePath(path)) if path == invalid_path
-        ));
+        let err = match SparseFile::open(invalid_path, UNTRACKED_FILE_ID) {
+            Ok(_) => panic!("expected invalid path open failure"),
+            Err(err) => err,
+        };
+        assert!(err.is_kind(crate::error::ErrorKind::InvalidInput));
+        assert!(err.is_code(crate::error::ErrorCode::InvalidArgument));
+        let err = match SparseFile::create_or_trunc(invalid_path, 4096, UNTRACKED_FILE_ID) {
+            Ok(_) => panic!("expected invalid path create failure"),
+            Err(err) => err,
+        };
+        assert!(err.is_kind(crate::error::ErrorKind::InvalidInput));
+        assert!(err.is_code(crate::error::ErrorCode::InvalidArgument));
     }
 
     #[test]
@@ -1261,10 +1269,11 @@ mod tests {
             file.alloc(STORAGE_SECTOR_SIZE).unwrap(),
             (0, STORAGE_SECTOR_SIZE)
         );
-        assert!(matches!(
-            file.alloc(STORAGE_SECTOR_SIZE),
-            Err(Error::StorageFileCapacityExceeded)
-        ));
+        assert!(
+            file.alloc(STORAGE_SECTOR_SIZE)
+                .as_ref()
+                .is_err_and(|err| err.is_storage_file_capacity_exceeded())
+        );
     }
 
     #[test]
@@ -1319,7 +1328,12 @@ mod tests {
                 .on_complete(TableFsSubmission::Write(submission), Ok(expected_len - 1));
 
             assert_eq!(kind, IOKind::Write);
-            assert!(matches!(waiter.await, Err(Error::ShortIO)));
+            assert!(
+                waiter
+                    .await
+                    .as_ref()
+                    .is_err_and(|err| err.is_code(crate::error::ErrorCode::ShortIO))
+            );
             drop(table_file);
             drop(fs);
         });

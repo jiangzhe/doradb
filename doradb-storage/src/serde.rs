@@ -1,6 +1,7 @@
 use crate::catalog::{IndexAttributes, IndexKey, IndexOrder, IndexSpec};
 use crate::compression::bitpacking::*;
-use crate::error::{Error, Result};
+use crate::error::{DataIntegrityError, Result};
+use error_stack::Report;
 use semistr::SemiStr;
 use std::collections::BTreeMap;
 use std::fmt;
@@ -983,7 +984,12 @@ impl<T: BitPackable + Deser> Deser for ForBitpackingDeser<T> {
         let (idx, min) = T::deser(input, idx)?;
         let n_bytes = (n_elems as usize * n_bits as usize).div_ceil(8);
         if idx + n_bytes > input.size() {
-            return Err(Error::InvalidCompressedData);
+            return Err(Report::new(DataIntegrityError::InvalidPayload)
+                .attach(format!(
+                    "FOR bitpacking payload exceeds input size: idx={idx}, n_bytes={n_bytes}, input_size={}",
+                    input.size()
+                ))
+                .into());
         }
         let (idx, packed) = input.deser(idx, n_bytes)?;
         let mut data = vec![T::ZERO; n_elems as usize];
@@ -994,7 +1000,11 @@ impl<T: BitPackable + Deser> Deser for ForBitpackingDeser<T> {
             8 => for_b8_unpack(packed, min, &mut data),
             16 => for_b16_unpack(packed, min, &mut data),
             32 => for_b32_unpack(packed, min, &mut data),
-            _ => return Err(Error::InvalidCompressedData),
+            _ => {
+                return Err(Report::new(DataIntegrityError::InvalidPayload)
+                    .attach(format!("invalid FOR bit width {n_bits}"))
+                    .into());
+            }
         };
         Ok((idx, ForBitpackingDeser(data)))
     }

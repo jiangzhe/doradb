@@ -561,13 +561,10 @@ pub(crate) mod tests {
 
     #[test]
     fn test_libaio_backend_maps_io_setup_failure_to_storage_backend_setup_failed() {
-        assert!(matches!(
-            LibaioBackend::new(0),
-            Err(Error::StorageIOError {
-                op: StorageOp::BackendSetup,
-                ..
-            })
-        ));
+        assert!(LibaioBackend::new(0).as_ref().is_err_and(|err| {
+            err.storage_io_failure()
+                .is_some_and(|failure| failure.op == StorageOp::BackendSetup)
+        }));
     }
 
     #[test]

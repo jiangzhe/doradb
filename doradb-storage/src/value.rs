@@ -1,10 +1,11 @@
-use crate::error::{Error, Result};
+use crate::error::{DataIntegrityError, Error, Result};
 use crate::memcmp::{
     BytesExtendable, MIN_VAR_MCF_LEN, MIN_VAR_NMCF_LEN, MemCmpFormat, Null, NullableMemCmpFormat,
     SegmentedBytes,
 };
 use crate::serde::{Deser, Ser, Serde};
 use bytemuck::{AnyBitPattern, Zeroable};
+use error_stack::Report;
 use ordered_float::OrderedFloat;
 use serde::de::Visitor;
 use serde::{Deserialize, Serialize};
@@ -157,7 +158,11 @@ impl TryFrom<u8> for ValKind {
             9 => ValKind::U64,
             10 => ValKind::F64,
             11 => ValKind::VarByte,
-            _ => return Err(Error::InvalidFormat),
+            _ => {
+                return Err(Report::new(DataIntegrityError::InvalidPayload)
+                    .attach(format!("invalid value kind code {value}"))
+                    .into());
+            }
         };
         Ok(res)
     }

@@ -286,10 +286,10 @@ impl<P: BufferPool> GenericBlockIndex<P> {
         root_block_id: BlockID,
     ) -> Result<RowLocation> {
         let Some(storage) = storage else {
-            return Err(Error::ColumnStorageMissing);
+            return Err(Error::column_storage_missing());
         };
         let Some(disk_pool_guard) = disk_pool_guard else {
-            return Err(Error::InvalidState);
+            return Err(Error::invalid_state());
         };
         let index = ColumnBlockIndex::new(
             root_block_id,
@@ -576,7 +576,7 @@ mod tests {
             Ok(_location) => panic!("expected missing-column-storage error, got row location"),
             Err(err) => err,
         };
-        assert!(matches!(err, Error::ColumnStorageMissing));
+        assert!(err.is_code(crate::error::ErrorCode::ColumnStorageMissing));
     }
 
     #[test]
@@ -618,7 +618,10 @@ mod tests {
             release.wait();
 
             let res = handle.join().unwrap();
-            assert!(matches!(res, Err(Error::ColumnStorageMissing)));
+            assert!(
+                res.as_ref()
+                    .is_err_and(|err| err.is_code(crate::error::ErrorCode::ColumnStorageMissing))
+            );
         });
     }
 
@@ -649,7 +652,7 @@ mod tests {
                 Ok(_) => panic!("expected cached insert-page reload failure"),
                 Err(err) => err,
             };
-            assert!(matches!(err, Error::IOError { .. }));
+            assert!(err.is_code(crate::error::ErrorCode::IOError));
         });
     }
 }

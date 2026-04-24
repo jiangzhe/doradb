@@ -138,7 +138,7 @@ where
     V: BTreeValue + Copy,
 {
     if params.min_slots > entries.len() {
-        return Err(Error::InvalidArgument);
+        return Err(Error::invalid_argument());
     }
 
     let rightmost_count = entries.len();
@@ -156,15 +156,15 @@ where
     }
 
     if rightmost_count == 0 {
-        return Err(Error::InvalidArgument);
+        return Err(Error::invalid_argument());
     }
 
     let packed = select_finite_packed_count::<V>(params.lower_fence, params.min_slots, entries)?;
     let upper_fence = packed_sibling_upper_fence(entries, packed);
     let space = packed_node_space::<V>(params.lower_fence, upper_fence, entries, packed)
-        .ok_or(Error::InvalidArgument)?;
+        .ok_or(Error::invalid_argument())?;
     if space.total_space() > BTREE_NODE_USABLE_SIZE {
-        return Err(Error::InvalidArgument);
+        return Err(Error::invalid_argument());
     }
     Ok(PackedNodePlan {
         packed,
@@ -236,7 +236,7 @@ where
     V: BTreeValue + Copy,
 {
     if !fences_fit(params.lower_fence, params.upper_fence.unwrap_or(&[])) {
-        return Err(Error::InvalidArgument);
+        return Err(Error::invalid_argument());
     }
     node.init(
         params.height,
@@ -248,7 +248,7 @@ where
     );
     for entry in entries {
         if !node.can_insert::<V>(entry.key) {
-            return Err(Error::InvalidArgument);
+            return Err(Error::invalid_argument());
         }
         let idx = node.count();
         node.insert_at::<V>(idx, entry.key, entry.value);
@@ -433,17 +433,17 @@ where
                     let entry_space = PackedNodeSpace::entry_space::<V>(entry.key, prefix_len)?;
                     total.checked_add(entry_space)
                 })
-                .ok_or(Error::InvalidArgument)?;
+                .ok_or(Error::invalid_argument())?;
             active_prefix_len = Some(prefix_len);
             included_count = packed;
         } else {
             while included_count < packed {
                 let entry_space =
                     PackedNodeSpace::entry_space::<V>(entries[included_count].key, prefix_len)
-                        .ok_or(Error::InvalidArgument)?;
+                        .ok_or(Error::invalid_argument())?;
                 included_space = included_space
                     .checked_add(entry_space)
-                    .ok_or(Error::InvalidArgument)?;
+                    .ok_or(Error::invalid_argument())?;
                 included_count += 1;
             }
         }
@@ -451,7 +451,7 @@ where
         let total_space = space
             .total_space()
             .checked_add(included_space)
-            .ok_or(Error::InvalidArgument)?;
+            .ok_or(Error::invalid_argument())?;
         if total_space <= BTREE_NODE_USABLE_SIZE {
             best = Some(packed);
         } else if space.prefix_is_inline() {
@@ -459,7 +459,7 @@ where
         }
     }
 
-    best.ok_or(Error::InvalidArgument)
+    best.ok_or(Error::invalid_argument())
 }
 
 fn estimate_packed_node_space<V>(
@@ -777,7 +777,7 @@ mod tests {
         )
         .unwrap_err();
 
-        assert!(matches!(err, Error::InvalidArgument));
+        assert!(err.is_code(crate::error::ErrorCode::InvalidArgument));
     }
 
     fn leaf_node(keys: &[&[u8]]) -> BTreeNodeBox {

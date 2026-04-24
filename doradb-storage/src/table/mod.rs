@@ -165,7 +165,7 @@ impl<'ctx> TableRootSnapshot<'ctx> {
         self.secondary_index_roots
             .get(index_no)
             .copied()
-            .ok_or(Error::InvalidArgument)
+            .ok_or(Error::invalid_argument())
     }
 
     /// Returns whether the captured root predates the supplied snapshot time.
@@ -499,7 +499,7 @@ impl<D: BufferPool, I: BufferPool> GenericMemTable<D, I> {
     ) -> Result<PageSharedGuard<RowPage>> {
         self.get_row_page_shared(guards, page_id)
             .await
-            .and_then(|guard| guard.ok_or(Error::InvalidState))
+            .and_then(|guard| guard.ok_or(Error::invalid_state()))
     }
 
     #[inline]
@@ -510,7 +510,7 @@ impl<D: BufferPool, I: BufferPool> GenericMemTable<D, I> {
     ) -> Result<PageExclusiveGuard<RowPage>> {
         self.get_row_page_exclusive(guards, page_id)
             .await
-            .and_then(|guard| guard.ok_or(Error::InvalidState))
+            .and_then(|guard| guard.ok_or(Error::invalid_state()))
     }
 
     #[inline]
@@ -644,7 +644,7 @@ impl ColumnStorage {
         let active_root = file.active_root_unchecked();
         let metadata = Arc::clone(&active_root.metadata);
         if active_root.secondary_index_roots.len() != metadata.index_specs.len() {
-            return Err(Error::InvalidState);
+            return Err(Error::invalid_state());
         }
         let secondary_indexes = (0..metadata.index_specs.len())
             .map(|index_no| {
@@ -701,7 +701,7 @@ impl ColumnStorage {
     ) -> Result<&SecondaryDiskTreeRuntime> {
         self.secondary_indexes
             .get(index_no)
-            .ok_or(Error::InvalidArgument)
+            .ok_or(Error::invalid_argument())
     }
 
     /// Returns the reusable secondary DiskTree runtimes owned by this table.
@@ -914,7 +914,7 @@ impl Table {
         #[cfg(test)]
         {
             if tests::test_force_lwc_build_error_enabled() {
-                return Err(Error::InvalidState);
+                return Err(Error::invalid_state());
             }
         }
         let mut lwc_blocks = Vec::new();
@@ -957,7 +957,7 @@ impl Table {
                     current_end = page_info.end_row_id;
                     let view = page.vector_view_in_transition(metadata, ctx, cutoff_ts, cutoff_ts);
                     if !builder.append_view(page, view)? {
-                        return Err(Error::InvalidState);
+                        return Err(Error::invalid_state());
                     }
                 } else {
                     current_end = page_info.end_row_id;

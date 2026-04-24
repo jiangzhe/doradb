@@ -1,11 +1,12 @@
 use crate::buffer::PageID;
 use crate::catalog::{IndexID, TableID};
-use crate::error::{Error, Result};
+use crate::error::{DataIntegrityError, Error, Result};
 use crate::row::RowID;
 use crate::row::ops::{SelectKey, UpdateCol};
 use crate::serde::{Deser, Ser, Serde};
 use crate::trx::TrxID;
 use crate::value::Val;
+use error_stack::Report;
 use std::collections::BTreeMap;
 use std::collections::btree_map::Entry;
 use std::mem;
@@ -93,7 +94,12 @@ impl Deser for RowRedoKind {
     #[inline]
     fn deser<S: Serde + ?Sized>(input: &S, start_idx: usize) -> Result<(usize, Self)> {
         let (idx, code) = input.deser_u8(start_idx)?;
-        let code = RowRedoCode::try_from(code).map_err(|_| Error::InvalidFormat)?;
+        let code = RowRedoCode::try_from(code).map_err(|_| {
+            Error::from(
+                Report::new(DataIntegrityError::InvalidPayload)
+                    .attach(format!("invalid row redo code {code}")),
+            )
+        })?;
         match code {
             RowRedoCode::Insert => {
                 let (idx, vals) = Vec::<Val>::deser(input, idx)?;
@@ -283,7 +289,12 @@ impl Deser for DDLRedo {
     #[inline]
     fn deser<S: Serde + ?Sized>(input: &S, start_idx: usize) -> Result<(usize, Self)> {
         let (idx, code) = input.deser_u8(start_idx)?;
-        let code = DDLRedoCode::try_from(code).map_err(|_| Error::InvalidFormat)?;
+        let code = DDLRedoCode::try_from(code).map_err(|_| {
+            Error::from(
+                Report::new(DataIntegrityError::InvalidPayload)
+                    .attach(format!("invalid DDL redo code {code}")),
+            )
+        })?;
         match code {
             DDLRedoCode::CreateTable => {
                 let (idx, table_id) = input.deser_u64(idx)?;
@@ -464,7 +475,12 @@ impl Deser for RedoHeader {
     fn deser<S: Serde + ?Sized>(input: &S, start_idx: usize) -> Result<(usize, Self)> {
         let (idx, cts) = TrxID::deser(input, start_idx)?;
         let (idx, code) = u8::deser(input, idx)?;
-        let trx_kind = RedoTrxKind::try_from(code).map_err(|_| Error::InvalidFormat)?;
+        let trx_kind = RedoTrxKind::try_from(code).map_err(|_| {
+            Error::from(
+                Report::new(DataIntegrityError::InvalidPayload)
+                    .attach(format!("invalid redo transaction kind code {code}")),
+            )
+        })?;
         Ok((idx, RedoHeader { cts, trx_kind }))
     }
 }
@@ -583,6 +599,7 @@ impl Deser for TableDML {
 mod tests {
     use super::*;
     use crate::buffer::test_page_id;
+    use crate::error::DataIntegrityError;
 
     #[test]
     fn test_redo_log_insert_update_delete() {
@@ -966,14 +983,18 @@ mod tests {
     fn test_row_redo_kind_deser_invalid_code() {
         let buf = [255u8];
         let res = RowRedoKind::deser(&buf[..], 0);
-        assert!(matches!(res, Err(Error::InvalidFormat)));
+        assert!(res.as_ref().is_err_and(
+            |err| err.data_integrity_error() == Some(DataIntegrityError::InvalidPayload)
+        ));
     }
 
     #[test]
     fn test_ddl_redo_deser_invalid_code() {
         let buf = [255u8];
         let res = DDLRedo::deser(&buf[..], 0);
-        assert!(matches!(res, Err(Error::InvalidFormat)));
+        assert!(res.as_ref().is_err_and(
+            |err| err.data_integrity_error() == Some(DataIntegrityError::InvalidPayload)
+        ));
     }
 
     #[test]
@@ -981,6 +1002,8 @@ mod tests {
         let mut buf = [0u8; 9];
         buf[8] = 255;
         let res = RedoHeader::deser(&buf[..], 0);
-        assert!(matches!(res, Err(Error::InvalidFormat)));
+        assert!(res.as_ref().is_err_and(
+            |err| err.data_integrity_error() == Some(DataIntegrityError::InvalidPayload)
+        ));
     }
 }

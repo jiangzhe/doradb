@@ -1,5 +1,5 @@
 use crate::buffer::{PoolGuard, ReadonlyBlockGuard, ReadonlyBufferPool};
-use crate::error::{BlockCorruptionCause, BlockKind, Error, FileKind, Result};
+use crate::error::{DataIntegrityError, Error, FileKind, Result};
 use crate::file::SparseFile;
 use crate::file::block_integrity::{
     BLOCK_INTEGRITY_HEADER_SIZE, COLUMN_BLOCK_INDEX_BLOCK_SPEC, max_payload_len, validate_block,
@@ -14,6 +14,7 @@ use crate::io::DirectBuf;
 use crate::quiescent::QuiescentGuard;
 use crate::row::RowID;
 use bytemuck::{Pod, Zeroable, bytes_of, cast_slice, cast_slice_mut, try_cast_slice};
+use error_stack::{Report, ResultExt};
 use std::future::Future;
 use std::mem;
 use std::pin::Pin;
@@ -69,6 +70,13 @@ const ROW_SHAPE_FINGERPRINT_VERSION: u8 = 1;
 const ROW_SHAPE_KIND_DENSE: u8 = 1;
 const ROW_SHAPE_KIND_PRESENT_DELTA_LIST: u8 = 2;
 
+#[inline]
+fn invalid_payload(message: impl Into<String>) -> Error {
+    Report::new(DataIntegrityError::InvalidPayload)
+        .attach(message.into())
+        .into()
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Pod, Zeroable)]
 struct ColumnBlockLeafHeaderExt {
@@ -109,7 +117,9 @@ impl ColumnBlockLeafSearchType {
             COLUMN_BLOCK_LEAF_SEARCH_TYPE_PLAIN => Ok(ColumnBlockLeafSearchType::Plain),
             COLUMN_BLOCK_LEAF_SEARCH_TYPE_DELTA_U32 => Ok(ColumnBlockLeafSearchType::DeltaU32),
             COLUMN_BLOCK_LEAF_SEARCH_TYPE_DELTA_U16 => Ok(ColumnBlockLeafSearchType::DeltaU16),
-            _ => Err(Error::InvalidFormat),
+            _ => Err(invalid_payload(format!(
+                "invalid column block leaf search type {raw}"
+            ))),
         }
     }
 
@@ -160,7 +170,9 @@ impl ColumnDeleteDomain {
         match raw {
             COLUMN_DELETE_DOMAIN_ROW_ID_DELTA => Ok(ColumnDeleteDomain::RowIdDelta),
             COLUMN_DELETE_DOMAIN_ORDINAL => Ok(ColumnDeleteDomain::Ordinal),
-            _ => Err(Error::InvalidFormat),
+            _ => Err(invalid_payload(format!(
+                "invalid column delete domain {raw}"
+            ))),
         }
     }
 }
@@ -210,7 +222,7 @@ impl ColumnBlockLeafEntryHeader {
     fn end_row_id(&self, start_row_id: RowID) -> Result<RowID> {
         start_row_id
             .checked_add(self.row_id_span() as RowID)
-            .ok_or(Error::InvalidFormat)
+            .ok_or_else(|| invalid_payload("column block leaf row id span overflows"))
     }
 
     fn from_encoded(entry: &EncodedLeafEntry) -> Result<Self> {
@@ -357,7 +369,7 @@ impl ColumnBlockEntryShape {
         mut delete_deltas: Vec<u32>,
     ) -> Result<Self> {
         if start_row_id >= end_row_id || row_ids.is_empty() {
-            return Err(Error::InvalidArgument);
+            return Err(Error::invalid_argument());
         }
         validate_row_ids(&row_ids, start_row_id, end_row_id)?;
         delete_deltas.sort_unstable();
@@ -584,9 +596,9 @@ impl LogicalRowSet {
         validate_row_ids(row_ids, start_row_id, end_row_id)?;
         let span_u64 = end_row_id
             .checked_sub(start_row_id)
-            .ok_or(Error::InvalidArgument)?;
+            .ok_or(Error::invalid_argument())?;
         if span_u64 == 0 || span_u64 > u32::MAX as u64 {
-            return Err(Error::InvalidArgument);
+            return Err(Error::invalid_argument());
         }
         let row_id_span = span_u64 as u32;
         let dense = row_ids.len() == row_id_span as usize
@@ -602,14 +614,14 @@ impl LogicalRowSet {
             .map(|row_id| {
                 let delta = row_id
                     .checked_sub(start_row_id)
-                    .ok_or(Error::InvalidArgument)?;
+                    .ok_or(Error::invalid_argument())?;
                 if delta > u32::MAX as u64 {
-                    return Err(Error::InvalidArgument);
+                    return Err(Error::invalid_argument());
                 }
                 Ok(delta as u32)
             })
             .collect::<Result<Vec<_>>>()?;
-        let first_present_delta = *deltas.first().ok_or(Error::InvalidArgument)?;
+        let first_present_delta = *deltas.first().ok_or(Error::invalid_argument())?;
         Ok(LogicalRowSet::DeltaList {
             row_id_span,
             first_present_delta,
@@ -670,7 +682,7 @@ fn row_shape_fingerprint_for_row_ids(
 }
 
 fn logical_row_shape_fingerprint(start_row_id: RowID, row_set: &LogicalRowSet) -> Result<u128> {
-    let row_count = u32::try_from(row_set.row_count()).map_err(|_| Error::InvalidArgument)?;
+    let row_count = u32::try_from(row_set.row_count()).map_err(|_| Error::invalid_argument())?;
     let mut hasher = blake3::Hasher::new();
     hasher.update(&[ROW_SHAPE_FINGERPRINT_VERSION]);
     let sparse_deltas = match row_set {
@@ -789,7 +801,7 @@ impl ResolvedLeafPatch {
                 entry: replacement,
             } => {
                 if replacement.start_row_id != *start_row_id {
-                    return Err(Error::InvalidArgument);
+                    return Err(Error::invalid_argument());
                 }
                 *entry = replacement.clone();
             }
@@ -848,7 +860,10 @@ impl SectionHeader {
     #[inline]
     fn decode(bytes: &[u8]) -> Result<Self> {
         if bytes.len() < 4 {
-            return Err(Error::InvalidFormat);
+            return Err(invalid_payload(format!(
+                "column block section header is too short: len={}",
+                bytes.len()
+            )));
         }
         Ok(SectionHeader {
             kind: bytes[0],
@@ -998,7 +1013,7 @@ impl<'a> LeafPrefixPlane<'a> {
                     start_row_id: prefix.start_row_id(),
                     entry_offset: prefix.entry_offset(),
                 })
-                .ok_or(Error::InvalidFormat),
+                .ok_or_else(|| invalid_payload("missing plain column block leaf prefix")),
             LeafPrefixPlane::DeltaU32 {
                 header_start_row_id,
                 prefixes,
@@ -1012,7 +1027,7 @@ impl<'a> LeafPrefixPlane<'a> {
                             entry_offset: prefix.entry_offset(),
                         })
                 })
-                .ok_or(Error::InvalidFormat),
+                .ok_or_else(|| invalid_payload("invalid u32-delta column block leaf prefix")),
             LeafPrefixPlane::DeltaU16 {
                 header_start_row_id,
                 prefixes,
@@ -1026,7 +1041,7 @@ impl<'a> LeafPrefixPlane<'a> {
                             entry_offset: prefix.entry_offset(),
                         })
                 })
-                .ok_or(Error::InvalidFormat),
+                .ok_or_else(|| invalid_payload("invalid u16-delta column block leaf prefix")),
         }
     }
 
@@ -1066,18 +1081,23 @@ impl<'a> LeafPrefixPlane<'a> {
         match self {
             LeafPrefixPlane::Plain { prefixes, .. } => prefixes
                 .binary_search_by_key(&start_row_id, |prefix| prefix.start_row_id())
-                .map_err(|_| Error::InvalidFormat),
+                .map_err(|_| invalid_payload("missing exact plain column block leaf prefix")),
             LeafPrefixPlane::DeltaU32 {
                 header_start_row_id,
                 prefixes,
             } => {
                 let delta = start_row_id
                     .checked_sub(*header_start_row_id)
-                    .ok_or(Error::InvalidFormat)?;
-                let delta = u32::try_from(delta).map_err(|_| Error::InvalidFormat)?;
+                    .ok_or_else(|| {
+                        invalid_payload("u32-delta column block leaf prefix underflow")
+                    })?;
+                let delta = u32::try_from(delta)
+                    .map_err(|_| invalid_payload("u32-delta column block leaf prefix overflow"))?;
                 prefixes
                     .binary_search_by_key(&delta, |prefix| prefix.start_row_delta())
-                    .map_err(|_| Error::InvalidFormat)
+                    .map_err(|_| {
+                        invalid_payload("missing exact u32-delta column block leaf prefix")
+                    })
             }
             LeafPrefixPlane::DeltaU16 {
                 header_start_row_id,
@@ -1085,11 +1105,16 @@ impl<'a> LeafPrefixPlane<'a> {
             } => {
                 let delta = start_row_id
                     .checked_sub(*header_start_row_id)
-                    .ok_or(Error::InvalidFormat)?;
-                let delta = u16::try_from(delta).map_err(|_| Error::InvalidFormat)?;
+                    .ok_or_else(|| {
+                        invalid_payload("u16-delta column block leaf prefix underflow")
+                    })?;
+                let delta = u16::try_from(delta)
+                    .map_err(|_| invalid_payload("u16-delta column block leaf prefix overflow"))?;
                 prefixes
                     .binary_search_by_key(&delta, |prefix| prefix.start_row_delta())
-                    .map_err(|_| Error::InvalidFormat)
+                    .map_err(|_| {
+                        invalid_payload("missing exact u16-delta column block leaf prefix")
+                    })
             }
         }
     }
@@ -1145,12 +1170,20 @@ struct NodeRewriteResult {
 
 #[inline]
 fn invalid_node_payload(file_kind: FileKind, page_id: BlockID) -> Error {
-    Error::block_corrupted(
-        file_kind,
-        BlockKind::ColumnBlockIndex,
-        page_id,
-        BlockCorruptionCause::InvalidPayload,
-    )
+    Report::new(DataIntegrityError::InvalidPayload)
+        .attach(format!(
+            "file={file_kind}, block=column-block-index, block_id={page_id}"
+        ))
+        .into()
+}
+
+#[inline]
+fn invalid_blob_payload(file_kind: FileKind, page_id: BlockID) -> Error {
+    Report::new(DataIntegrityError::InvalidPayload)
+        .attach(format!(
+            "file={file_kind}, block=column-deletion-blob, block_id={page_id}"
+        ))
+        .into()
 }
 
 #[inline]
@@ -1159,9 +1192,9 @@ fn validate_node_payload(
     file_kind: FileKind,
     page_id: BlockID,
 ) -> Result<(&[u8], ColumnBlockNodeHeader)> {
-    let payload = validate_block(page, COLUMN_BLOCK_INDEX_BLOCK_SPEC).map_err(|cause| {
-        Error::block_corrupted(file_kind, BlockKind::ColumnBlockIndex, page_id, cause)
-    })?;
+    let payload = validate_block(page, COLUMN_BLOCK_INDEX_BLOCK_SPEC)
+        .attach_with(|| format!("file={file_kind}, block=column-block-index, block_id={page_id}"))
+        .map_err(Error::from)?;
     let header =
         bytemuck::try_from_bytes::<ColumnBlockNodeHeader>(&payload[..COLUMN_BLOCK_HEADER_SIZE])
             .map_err(|_| invalid_node_payload(file_kind, page_id))?;
@@ -1464,7 +1497,7 @@ impl<'a> ColumnBlockIndex<'a> {
             LogicalDeleteSet::None { .. } => Vec::new(),
             LogicalDeleteSet::Inline { row_id_deltas, .. } => row_id_deltas,
             LogicalDeleteSet::External { row_id_deltas, .. } => {
-                row_id_deltas.ok_or(Error::InvalidState)?
+                row_id_deltas.ok_or(Error::invalid_state())?
             }
         })
     }
@@ -1499,7 +1532,7 @@ impl<'a> ColumnBlockIndex<'a> {
             LogicalDeleteSet::None { .. } => Vec::new(),
             LogicalDeleteSet::Inline { row_id_deltas, .. } => row_id_deltas,
             LogicalDeleteSet::External { row_id_deltas, .. } => {
-                row_id_deltas.ok_or(Error::InvalidState)?
+                row_id_deltas.ok_or(Error::invalid_state())?
             }
         };
         let row_ids = decode_row_ids_from_row_set(
@@ -1534,19 +1567,13 @@ impl<'a> ColumnBlockIndex<'a> {
             self.disk_pool,
             self.disk_pool_guard,
         );
-        let (header, payload) =
-            reader
-                .read_framed_blob(blob_ref)
-                .await
-                .map_err(|err| match err {
-                    Error::InvalidFormat => Error::block_corrupted(
-                        self.file_kind(),
-                        BlockKind::ColumnDeletionBlob,
-                        blob_ref.start_page_id,
-                        BlockCorruptionCause::InvalidPayload,
-                    ),
-                    other => other,
-                })?;
+        let (header, payload) = reader.read_framed_blob(blob_ref).await.map_err(|err| {
+            if err.data_integrity_error().is_some() {
+                invalid_blob_payload(self.file_kind(), blob_ref.start_page_id)
+            } else {
+                err
+            }
+        })?;
         if header.blob_kind() != COLUMN_AUX_BLOB_KIND_DELETE_DELTAS
             || header.codec_kind() != COLUMN_AUX_BLOB_CODEC_U32_DELTA_LIST
             || header.codec_version()
@@ -1555,11 +1582,9 @@ impl<'a> ColumnBlockIndex<'a> {
                     .ok_or_else(|| invalid_node_payload(self.file_kind(), page_id))?
                     .version
         {
-            return Err(Error::block_corrupted(
+            return Err(invalid_blob_payload(
                 self.file_kind(),
-                BlockKind::ColumnDeletionBlob,
                 blob_ref.start_page_id,
-                BlockCorruptionCause::InvalidPayload,
             ));
         }
         let row_id_deltas = decode_delete_rows(
@@ -1570,14 +1595,12 @@ impl<'a> ColumnBlockIndex<'a> {
             self.file_kind(),
             page_id,
         )
-        .map_err(|err| match err {
-            Error::InvalidFormat => Error::block_corrupted(
-                self.file_kind(),
-                BlockKind::ColumnDeletionBlob,
-                blob_ref.start_page_id,
-                BlockCorruptionCause::InvalidPayload,
-            ),
-            other => other,
+        .map_err(|err| {
+            if err.data_integrity_error().is_some() {
+                invalid_blob_payload(self.file_kind(), blob_ref.start_page_id)
+            } else {
+                err
+            }
         })?;
         Ok(LogicalDeleteSet::External {
             domain,
@@ -1592,7 +1615,7 @@ impl<'a> ColumnBlockIndex<'a> {
         start_row_id: RowID,
     ) -> Result<(LogicalRowSet, ColumnDeleteDomain)> {
         if self.root_block_id == SUPER_BLOCK_ID {
-            return Err(Error::InvalidArgument);
+            return Err(Error::invalid_argument());
         }
         let mut page_id = self.root_block_id;
         loop {
@@ -1601,7 +1624,7 @@ impl<'a> ColumnBlockIndex<'a> {
                 let prefixes = node.leaf_prefix_plane(self.file_kind(), page_id)?;
                 let idx = prefixes
                     .search_exact(start_row_id)
-                    .map_err(|_| Error::InvalidArgument)?;
+                    .map_err(|_| Error::invalid_argument())?;
                 let view = node.leaf_entry_view(idx, self.file_kind(), page_id)?;
                 let row_set = decode_logical_row_set(&view, self.file_kind(), page_id)?;
                 let delete_domain = decode_default_delete_domain_from_row_header(
@@ -1612,7 +1635,7 @@ impl<'a> ColumnBlockIndex<'a> {
                 return Ok((row_set, delete_domain));
             }
             let entries = node.branch_entries();
-            let idx = search_branch_entry(entries, start_row_id).ok_or(Error::InvalidArgument)?;
+            let idx = search_branch_entry(entries, start_row_id).ok_or(Error::invalid_argument())?;
             page_id = entries[idx].page_id;
         }
     }
@@ -1664,7 +1687,7 @@ impl<'a> ColumnBlockIndex<'a> {
             return Ok(self.root_block_id);
         }
         if self.root_block_id == SUPER_BLOCK_ID || !delete_delta_patches_sorted_unique(patches) {
-            return Err(Error::InvalidArgument);
+            return Err(Error::invalid_argument());
         }
 
         let resolved = {
@@ -1694,7 +1717,7 @@ impl<'a> ColumnBlockIndex<'a> {
             .rewrite_subtree_with_patches(mutable_file, self.root_block_id, &resolved, create_ts)
             .await?;
         if !res.touched {
-            return Err(Error::InvalidState);
+            return Err(Error::invalid_state());
         }
         self.finalize_root_rewrite(mutable_file, root_height, res.entries, create_ts)
             .await
@@ -1713,7 +1736,7 @@ impl<'a> ColumnBlockIndex<'a> {
         if self.root_block_id == SUPER_BLOCK_ID
             || !patches_sorted_unique_by_start_row_id(patches, |patch| patch.start_row_id)
         {
-            return Err(Error::InvalidArgument);
+            return Err(Error::invalid_argument());
         }
 
         let resolved = {
@@ -1734,7 +1757,7 @@ impl<'a> ColumnBlockIndex<'a> {
             .rewrite_subtree_with_patches(mutable_file, self.root_block_id, &resolved, create_ts)
             .await?;
         if !res.touched {
-            return Err(Error::InvalidState);
+            return Err(Error::invalid_state());
         }
         self.finalize_root_rewrite(mutable_file, root_height, res.entries, create_ts)
             .await
@@ -1757,7 +1780,7 @@ impl<'a> ColumnBlockIndex<'a> {
                 .is_none_or(|entry| entry.start_row_id() < self.end_row_id)
             || new_end_row_id < self.end_row_id
         {
-            return Err(Error::InvalidArgument);
+            return Err(Error::invalid_argument());
         }
 
         let logical_entries = {
@@ -1821,7 +1844,7 @@ impl<'a> ColumnBlockIndex<'a> {
         for patch in patches {
             let idx = start_row_ids
                 .binary_search(&patch.start_row_id())
-                .map_err(|_| Error::InvalidArgument)?;
+                .map_err(|_| Error::invalid_argument())?;
             let mut replacement = entries[idx].clone();
             patch.apply(&mut replacement)?;
             entries[idx] = replacement;
@@ -1870,13 +1893,13 @@ impl<'a> ColumnBlockIndex<'a> {
                 )
                 .await?;
             if !child.touched {
-                return Err(Error::InvalidState);
+                return Err(Error::invalid_state());
             }
             touched = true;
             combined.extend(child.entries);
         }
         if patch_idx != patches.len() {
-            return Err(Error::InvalidArgument);
+            return Err(Error::invalid_argument());
         }
         if !touched {
             return Ok(NodeRewriteResult {
@@ -1925,10 +1948,10 @@ impl<'a> ColumnBlockIndex<'a> {
                 .branch_entries()
                 .last()
                 .map(|entry| entry.page_id)
-                .ok_or(Error::InvalidState)?;
+                .ok_or(Error::invalid_state())?;
         }
 
-        let (leaf_page_id, _) = path.pop().ok_or(Error::InvalidState)?;
+        let (leaf_page_id, _) = path.pop().ok_or(Error::invalid_state())?;
         let leaf_node = self.read_node(leaf_page_id).await?;
         let mut combined = self.decode_logical_leaf_entries(&leaf_node, leaf_page_id)?;
         combined.extend_from_slice(entries);
@@ -1943,7 +1966,7 @@ impl<'a> ColumnBlockIndex<'a> {
             let last_idx = old_entries
                 .len()
                 .checked_sub(1)
-                .ok_or(Error::InvalidState)?;
+                .ok_or(Error::invalid_state())?;
             let mut combined_entries =
                 Vec::with_capacity(old_entries.len() - 1 + child_entries.len());
             combined_entries.extend_from_slice(&old_entries[..last_idx]);
@@ -1964,7 +1987,7 @@ impl<'a> ColumnBlockIndex<'a> {
         create_ts: u64,
     ) -> Result<BlockID> {
         if entries.is_empty() {
-            return Err(Error::InvalidState);
+            return Err(Error::invalid_state());
         }
         if entries.len() == 1 {
             return Ok(entries[0].page_id);
@@ -2018,7 +2041,7 @@ impl<'a> ColumnBlockIndex<'a> {
                     break;
                 }
                 if next_len > COLUMN_BLOCK_LEAF_DATA_SIZE {
-                    return Err(Error::InvalidArgument);
+                    return Err(Error::invalid_argument());
                 }
                 selected_search_type = Some(search_type);
                 end += 1;
@@ -2030,7 +2053,7 @@ impl<'a> ColumnBlockIndex<'a> {
             encode_leaf_chunk(
                 node.data_mut(),
                 chunk,
-                selected_search_type.ok_or(Error::InvalidState)?,
+                selected_search_type.ok_or(Error::invalid_state())?,
             )?;
             self.write_node(mutable_file, page_id, &node).await?;
             leaf_entries.push(ColumnBlockBranchEntry {
@@ -2107,7 +2130,7 @@ impl<'a> ColumnBlockIndex<'a> {
         page_id: BlockID,
     ) -> Result<()> {
         if page_id == SUPER_BLOCK_ID {
-            return Err(Error::InvalidState);
+            return Err(Error::invalid_state());
         }
         table_file.record_gc_block(page_id);
         Ok(())
@@ -2133,17 +2156,17 @@ impl<'a> ColumnBlockIndex<'a> {
 
 fn validate_row_ids(row_ids: &[RowID], start_row_id: RowID, end_row_id: RowID) -> Result<()> {
     if row_ids.is_empty() || start_row_id >= end_row_id {
-        return Err(Error::InvalidArgument);
+        return Err(Error::invalid_argument());
     }
     let mut prev = None;
     for row_id in row_ids {
         if *row_id < start_row_id || *row_id >= end_row_id {
-            return Err(Error::InvalidArgument);
+            return Err(Error::invalid_argument());
         }
         if let Some(prev_row_id) = prev
             && *row_id <= prev_row_id
         {
-            return Err(Error::InvalidArgument);
+            return Err(Error::invalid_argument());
         }
         prev = Some(*row_id);
     }
@@ -2434,7 +2457,7 @@ fn decode_logical_delete_set_base(
         COLUMN_DELETE_CODEC_EXTERNAL_BLOB => Ok(LogicalDeleteSet::External {
             domain: delete_meta.delete_domain,
             del_count: delete_meta.del_count,
-            blob_ref: delete_meta.blob_ref.ok_or(Error::InvalidState)?,
+            blob_ref: delete_meta.blob_ref.ok_or(Error::invalid_state())?,
             row_id_deltas: None,
         }),
         _ => Err(invalid_node_payload(file_kind, page_id)),
@@ -2639,7 +2662,7 @@ fn encode_row_section(
     match row_set {
         LogicalRowSet::Dense { row_id_span } => {
             if *row_id_span > u16::MAX as u32 {
-                return Err(Error::InvalidArgument);
+                return Err(Error::invalid_argument());
             }
             Ok(SectionHeader {
                 kind: COLUMN_ROW_CODEC_DENSE,
@@ -2681,7 +2704,7 @@ fn encode_delete_section(
         } => {
             let delete_values = encode_delete_values(row_id_deltas, row_set, *domain)?;
             if !inline_delete_values_fit(&delete_values)? {
-                return Err(Error::InvalidArgument);
+                return Err(Error::invalid_argument());
             }
             let header = DeleteSectionHeader::new(
                 COLUMN_DELETE_CODEC_INLINE_DELTA_LIST,
@@ -2721,7 +2744,10 @@ fn encode_leaf_chunk(
     entries: &[EncodedLeafEntry],
     search_type: ColumnBlockLeafSearchType,
 ) -> Result<()> {
-    let leaf_start_row_id = entries.first().ok_or(Error::InvalidArgument)?.start_row_id;
+    let leaf_start_row_id = entries
+        .first()
+        .ok_or(Error::invalid_argument())?
+        .start_row_id;
     buf.fill(0);
     let (leaf_header, leaf_data) = buf.split_at_mut(COLUMN_BLOCK_LEAF_HEADER_EXT_SIZE);
     leaf_header.copy_from_slice(bytes_of(&ColumnBlockLeafHeaderExt::new(search_type)));
@@ -2731,7 +2757,7 @@ fn encode_leaf_chunk(
     for entry in entries {
         let entry_range = reserve_tail(&mut arena_end, entry.payload_len(), leaf_data.len())?;
         if arena_end < prefix_bytes_len {
-            return Err(Error::InvalidArgument);
+            return Err(Error::invalid_argument());
         }
         let entry_header = ColumnBlockLeafEntryHeader::from_encoded(entry)?;
         let entry_bytes = &mut leaf_data[entry_range.0..entry_range.1];
@@ -2754,13 +2780,16 @@ fn encode_leaf_chunk(
 }
 
 fn select_leaf_search_type(entries: &[EncodedLeafEntry]) -> Result<ColumnBlockLeafSearchType> {
-    let leaf_start_row_id = entries.first().ok_or(Error::InvalidArgument)?.start_row_id;
+    let leaf_start_row_id = entries
+        .first()
+        .ok_or(Error::invalid_argument())?
+        .start_row_id;
     let mut max_delta = 0u64;
     for entry in entries {
         let delta = entry
             .start_row_id
             .checked_sub(leaf_start_row_id)
-            .ok_or(Error::InvalidArgument)?;
+            .ok_or(Error::invalid_argument())?;
         max_delta = max_delta.max(delta);
     }
     Ok(if max_delta <= u16::MAX as u64 {
@@ -2779,11 +2808,11 @@ fn leaf_chunk_encoded_len(
     let mut total = entries
         .len()
         .checked_mul(search_type.prefix_size())
-        .ok_or(Error::InvalidArgument)?;
+        .ok_or(Error::invalid_argument())?;
     for entry in entries {
         total = total
             .checked_add(entry.payload_len())
-            .ok_or(Error::InvalidArgument)?;
+            .ok_or(Error::invalid_argument())?;
     }
     Ok(total)
 }
@@ -2798,30 +2827,30 @@ fn encode_leaf_prefix(
     match search_type {
         ColumnBlockLeafSearchType::Plain => {
             if dst.len() != COLUMN_BLOCK_LEAF_PREFIX_PLAIN_SIZE {
-                return Err(Error::InvalidArgument);
+                return Err(Error::invalid_argument());
             }
             dst[..8].copy_from_slice(&start_row_id.to_le_bytes());
             dst[8..10].copy_from_slice(&entry_offset.to_le_bytes());
         }
         ColumnBlockLeafSearchType::DeltaU32 => {
             if dst.len() != COLUMN_BLOCK_LEAF_PREFIX_U32_SIZE {
-                return Err(Error::InvalidArgument);
+                return Err(Error::invalid_argument());
             }
             let delta = start_row_id
                 .checked_sub(leaf_start_row_id)
-                .ok_or(Error::InvalidArgument)?;
-            let delta = u32::try_from(delta).map_err(|_| Error::InvalidArgument)?;
+                .ok_or(Error::invalid_argument())?;
+            let delta = u32::try_from(delta).map_err(|_| Error::invalid_argument())?;
             dst[..4].copy_from_slice(&delta.to_le_bytes());
             dst[4..6].copy_from_slice(&entry_offset.to_le_bytes());
         }
         ColumnBlockLeafSearchType::DeltaU16 => {
             if dst.len() != COLUMN_BLOCK_LEAF_PREFIX_U16_SIZE {
-                return Err(Error::InvalidArgument);
+                return Err(Error::invalid_argument());
             }
             let delta = start_row_id
                 .checked_sub(leaf_start_row_id)
-                .ok_or(Error::InvalidArgument)?;
-            let delta = u16::try_from(delta).map_err(|_| Error::InvalidArgument)?;
+                .ok_or(Error::invalid_argument())?;
+            let delta = u16::try_from(delta).map_err(|_| Error::invalid_argument())?;
             dst[..2].copy_from_slice(&delta.to_le_bytes());
             dst[2..4].copy_from_slice(&entry_offset.to_le_bytes());
         }
@@ -2831,7 +2860,7 @@ fn encode_leaf_prefix(
 
 fn reserve_tail(arena_end: &mut usize, len: usize, total_len: usize) -> Result<(usize, usize)> {
     if len == 0 || *arena_end > total_len || len > *arena_end {
-        return Err(Error::InvalidArgument);
+        return Err(Error::invalid_argument());
     }
     let start = *arena_end - len;
     let end = *arena_end;
@@ -2841,13 +2870,18 @@ fn reserve_tail(arena_end: &mut usize, len: usize, total_len: usize) -> Result<(
 
 fn decode_blob_ref(bytes: &[u8]) -> Result<BlobRef> {
     if bytes.len() != COLUMN_BLOB_REF_SIZE {
-        return Err(Error::InvalidFormat);
+        return Err(invalid_payload(format!(
+            "column deletion blob reference has invalid length {}, expected {COLUMN_BLOB_REF_SIZE}",
+            bytes.len()
+        )));
     }
     let start_page_id = BlockID::from(u64::from_le_bytes(bytes[0..8].try_into()?));
     let start_offset = u16::from_le_bytes(bytes[8..10].try_into()?);
     let byte_len = u32::from_le_bytes(bytes[10..14].try_into()?);
     if start_page_id == SUPER_BLOCK_ID || byte_len == 0 {
-        return Err(Error::InvalidFormat);
+        return Err(invalid_payload(format!(
+            "invalid column deletion blob reference: start_page_id={start_page_id}, byte_len={byte_len}"
+        )));
     }
     Ok(BlobRef {
         start_page_id,
@@ -2920,7 +2954,10 @@ fn decode_delete_rows(
 
 fn decode_u32_bytes_strict(bytes: &[u8], expected_count: u16) -> Result<Vec<u32>> {
     if bytes.len() != expected_count as usize * mem::size_of::<u32>() {
-        return Err(Error::InvalidFormat);
+        return Err(invalid_payload(format!(
+            "u32 delta payload length {} does not match expected count {expected_count}",
+            bytes.len()
+        )));
     }
     let mut res = Vec::with_capacity(expected_count as usize);
     let mut prev = None;
@@ -2929,7 +2966,9 @@ fn decode_u32_bytes_strict(bytes: &[u8], expected_count: u16) -> Result<Vec<u32>
         if let Some(prev_value) = prev
             && value <= prev_value
         {
-            return Err(Error::InvalidFormat);
+            return Err(invalid_payload(format!(
+                "u32 delta payload is not strictly increasing: previous={prev_value}, current={value}"
+            )));
         }
         prev = Some(value);
         res.push(value);
@@ -2940,7 +2979,7 @@ fn decode_u32_bytes_strict(bytes: &[u8], expected_count: u16) -> Result<Vec<u32>
 fn encode_u32_values_bytes(values: &[u32]) -> Result<Vec<u8>> {
     storage_count_u16(values.len())?;
     if !delete_deltas_sorted_unique(values) {
-        return Err(Error::InvalidArgument);
+        return Err(Error::invalid_argument());
     }
     let mut out = Vec::with_capacity(mem::size_of_val(values));
     for value in values {
@@ -2955,7 +2994,7 @@ fn encode_delete_values(
     delete_domain: ColumnDeleteDomain,
 ) -> Result<Vec<u32>> {
     if !delete_deltas_sorted_unique(row_id_deltas) {
-        return Err(Error::InvalidArgument);
+        return Err(Error::invalid_argument());
     }
     match delete_domain {
         ColumnDeleteDomain::RowIdDelta => {
@@ -2963,7 +3002,7 @@ fn encode_delete_values(
                 .iter()
                 .any(|delta| !row_set.contains_delta(*delta))
             {
-                return Err(Error::InvalidArgument);
+                return Err(Error::invalid_argument());
             }
             Ok(row_id_deltas.to_vec())
         }
@@ -2973,7 +3012,7 @@ fn encode_delete_values(
                 ordinals.push(
                     row_set
                         .ordinal_for_delta(*delta)
-                        .ok_or(Error::InvalidArgument)?,
+                        .ok_or(Error::invalid_argument())?,
                 );
             }
             Ok(ordinals)
@@ -3014,7 +3053,7 @@ async fn build_logical_entry_from_input<M: MutableCowFile>(
     input: &ColumnBlockEntryInput,
 ) -> Result<LogicalLeafEntry> {
     if input.block_id == SUPER_BLOCK_ID {
-        return Err(Error::InvalidArgument);
+        return Err(Error::invalid_argument());
     }
     let row_set =
         LogicalRowSet::from_row_ids(input.start_row_id, input.end_row_id, &input.row_ids)?;
@@ -3042,12 +3081,12 @@ fn inline_delete_values_fit(values: &[u32]) -> Result<bool> {
 
 #[inline]
 fn storage_count_u16(len: usize) -> Result<u16> {
-    u16::try_from(len).map_err(|_| Error::InvalidArgument)
+    u16::try_from(len).map_err(|_| Error::invalid_argument())
 }
 
 #[inline]
 fn storage_len_u16(len: usize) -> Result<u16> {
-    u16::try_from(len).map_err(|_| Error::InvalidArgument)
+    u16::try_from(len).map_err(|_| Error::invalid_argument())
 }
 
 fn entry_inputs_sorted(entries: &[ColumnBlockEntryInput]) -> bool {
@@ -3102,6 +3141,7 @@ mod tests {
     use crate::catalog::{
         ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexSpec, TableMetadata,
     };
+    use crate::error::{DataIntegrityError, Error, FileKind};
     use crate::file::build_test_fs;
     use crate::file::table_file::MutableTableFile;
     use crate::file::test_block_id;
@@ -3134,6 +3174,14 @@ mod tests {
         ColumnBlockEntryShape::new(start, end, row_ids, Vec::new())
             .unwrap()
             .with_block_id(block_id)
+    }
+
+    fn assert_column_index_corruption(err: Error, block_id: BlockID, expected: DataIntegrityError) {
+        assert_eq!(err.data_integrity_error(), Some(expected));
+        let report = format!("{err:?}");
+        assert!(report.contains("table-file"), "{report}");
+        assert!(report.contains("column-block-index"), "{report}");
+        assert!(report.contains(&format!("block_id={block_id}")), "{report}");
     }
 
     fn sparse_entry(
@@ -3208,28 +3256,21 @@ mod tests {
             test_block_id(42),
         )
         .unwrap_err();
-        assert!(matches!(
-            err,
-            Error::BlockCorrupted {
-                file_kind: FileKind::TableFile,
-                block_kind: BlockKind::ColumnBlockIndex,
-                block_id: page_id,
-                cause: BlockCorruptionCause::InvalidPayload,
-            } if page_id == test_block_id(42)
-        ));
+        assert_column_index_corruption(err, test_block_id(42), DataIntegrityError::InvalidPayload);
     }
 
     #[test]
     fn test_encode_row_section_rejects_row_count_above_u16() {
-        assert!(matches!(
+        assert!(
             encode_row_section(
                 &LogicalRowSet::Dense {
                     row_id_span: u16::MAX as u32 + 1,
                 },
                 ColumnDeleteDomain::RowIdDelta
-            ),
-            Err(Error::InvalidArgument)
-        ));
+            )
+            .as_ref()
+            .is_err_and(|err| err.is_code(crate::error::ErrorCode::InvalidArgument))
+        );
     }
 
     #[test]
@@ -3238,10 +3279,12 @@ mod tests {
             domain: ColumnDeleteDomain::RowIdDelta,
             row_id_deltas: (0..=u16::MAX as u32).collect(),
         };
-        assert!(matches!(
-            delete_set.del_count(),
-            Err(Error::InvalidArgument)
-        ));
+        assert!(
+            delete_set
+                .del_count()
+                .as_ref()
+                .is_err_and(|err| err.is_code(crate::error::ErrorCode::InvalidArgument))
+        );
     }
 
     #[test]

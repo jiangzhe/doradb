@@ -2,7 +2,7 @@ use crate::buffer::guard::{PageGuard, PageSharedGuard};
 use crate::buffer::page::INVALID_PAGE_ID;
 use crate::buffer::{BufferPool, EvictableBufferPool, FixedBufferPool, PageID, PoolGuards};
 use crate::catalog::{CatalogTable, TableMetadata};
-use crate::error::{BlockCorruptionCause, BlockKind, Error, FileKind, Result};
+use crate::error::{DataIntegrityError, Error, FileKind, Result};
 use crate::file::BlockID;
 use crate::index::util::{Maskable, RowPageCreateRedoCtx};
 use crate::index::{
@@ -30,11 +30,26 @@ use crate::trx::undo::{IndexBranch, IndexBranchTarget, OwnedRowUndo, RowUndoKind
 use crate::trx::ver_map::RowPageState;
 use crate::trx::{MIN_SNAPSHOT_TS, TrxContext, TrxID, trx_is_committed};
 use crate::value::Val;
+use error_stack::Report;
 use std::collections::HashMap;
 use std::future::Future;
 use std::mem;
 use std::ops::Deref;
 use std::sync::Arc;
+
+#[inline]
+fn invalid_lwc_payload(
+    file_kind: FileKind,
+    block_id: BlockID,
+    message: impl Into<String>,
+) -> Error {
+    let message = message.into();
+    Report::new(DataIntegrityError::InvalidPayload)
+        .attach(format!(
+            "file={file_kind}, block=lwc-block, block_id={block_id}, {message}"
+        ))
+        .into()
+}
 
 #[derive(Clone, Copy)]
 enum SecondaryIndexView {
@@ -275,7 +290,7 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
             root.secondary_index_roots
                 .get(index_no)
                 .copied()
-                .ok_or(Error::InvalidArgument)
+                .ok_or(Error::invalid_argument())
         })?;
         Ok(SecondaryIndexView::user(ctx.sts(), root))
     }
@@ -291,7 +306,7 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
             .secondary_index_roots
             .get(index_no)
             .copied()
-            .ok_or(Error::InvalidArgument)?;
+            .ok_or(Error::invalid_argument())?;
         Ok(SecondaryIndexView::user(ts, root))
     }
 
@@ -321,7 +336,7 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
                 ts,
                 snapshot.secondary_index_root(index_no)?,
             )),
-            (Some(_), None) => Err(Error::InvalidState),
+            (Some(_), None) => Err(Error::invalid_state()),
             (None, _) => Ok(SecondaryIndexView::catalog(ts)),
         }
     }
@@ -332,7 +347,7 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
         index_no: usize,
         root: BlockID,
     ) -> Result<UniqueSecondaryIndex<'a, EvictableBufferPool>> {
-        let indexes = self.user_sec_idx.ok_or(Error::InvalidState)?;
+        let indexes = self.user_sec_idx.ok_or(Error::invalid_state())?;
         indexes[index_no].bind_unique(root)
     }
 
@@ -342,7 +357,7 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
         index_no: usize,
         root: BlockID,
     ) -> Result<NonUniqueSecondaryIndex<'a, EvictableBufferPool>> {
-        let indexes = self.user_sec_idx.ok_or(Error::InvalidState)?;
+        let indexes = self.user_sec_idx.ok_or(Error::invalid_state())?;
         indexes[index_no].bind_non_unique(root)
     }
 
@@ -361,11 +376,11 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
                     .lookup(index_pool_guard, key, ts)
                     .await
             }
-            (Some(_), SecondaryIndexView::Catalog { .. }) => Err(Error::InvalidState),
+            (Some(_), SecondaryIndexView::Catalog { .. }) => Err(Error::invalid_state()),
             (None, view) => {
                 self.generic_sec_idx()[index_no]
                     .unique()
-                    .ok_or(Error::InvalidArgument)?
+                    .ok_or(Error::invalid_argument())?
                     .lookup(index_pool_guard, key, view.ts())
                     .await
             }
@@ -389,11 +404,11 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
                     .insert_if_not_exists(index_pool_guard, key, row_id, merge_if_match_deleted, ts)
                     .await
             }
-            (Some(_), SecondaryIndexView::Catalog { .. }) => Err(Error::InvalidState),
+            (Some(_), SecondaryIndexView::Catalog { .. }) => Err(Error::invalid_state()),
             (None, view) => {
                 self.generic_sec_idx()[index_no]
                     .unique()
-                    .ok_or(Error::InvalidArgument)?
+                    .ok_or(Error::invalid_argument())?
                     .insert_if_not_exists(
                         index_pool_guard,
                         key,
@@ -427,7 +442,7 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
             None => {
                 self.generic_sec_idx()[index_no]
                     .unique()
-                    .ok_or(Error::InvalidArgument)?
+                    .ok_or(Error::invalid_argument())?
                     .compare_delete(index_pool_guard, key, old_row_id, ignore_del_mask, ts)
                     .await
             }
@@ -450,11 +465,11 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
                     .mask_as_deleted(index_pool_guard, key, row_id, ts)
                     .await
             }
-            (Some(_), SecondaryIndexView::Catalog { .. }) => Err(Error::InvalidState),
+            (Some(_), SecondaryIndexView::Catalog { .. }) => Err(Error::invalid_state()),
             (None, view) => {
                 self.generic_sec_idx()[index_no]
                     .unique()
-                    .ok_or(Error::InvalidArgument)?
+                    .ok_or(Error::invalid_argument())?
                     .mask_as_deleted(index_pool_guard, key, row_id, view.ts())
                     .await
             }
@@ -478,11 +493,11 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
                     .compare_exchange(index_pool_guard, key, old_row_id, new_row_id, ts)
                     .await
             }
-            (Some(_), SecondaryIndexView::Catalog { .. }) => Err(Error::InvalidState),
+            (Some(_), SecondaryIndexView::Catalog { .. }) => Err(Error::invalid_state()),
             (None, view) => {
                 self.generic_sec_idx()[index_no]
                     .unique()
-                    .ok_or(Error::InvalidArgument)?
+                    .ok_or(Error::invalid_argument())?
                     .compare_exchange(index_pool_guard, key, old_row_id, new_row_id, view.ts())
                     .await
             }
@@ -505,11 +520,11 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
                     .lookup(index_pool_guard, key, res, ts)
                     .await
             }
-            (Some(_), SecondaryIndexView::Catalog { .. }) => Err(Error::InvalidState),
+            (Some(_), SecondaryIndexView::Catalog { .. }) => Err(Error::invalid_state()),
             (None, view) => {
                 self.generic_sec_idx()[index_no]
                     .non_unique()
-                    .ok_or(Error::InvalidArgument)?
+                    .ok_or(Error::invalid_argument())?
                     .lookup(index_pool_guard, key, res, view.ts())
                     .await
             }
@@ -532,11 +547,11 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
                     .lookup_unique(index_pool_guard, key, row_id, ts)
                     .await
             }
-            (Some(_), SecondaryIndexView::Catalog { .. }) => Err(Error::InvalidState),
+            (Some(_), SecondaryIndexView::Catalog { .. }) => Err(Error::invalid_state()),
             (None, view) => {
                 self.generic_sec_idx()[index_no]
                     .non_unique()
-                    .ok_or(Error::InvalidArgument)?
+                    .ok_or(Error::invalid_argument())?
                     .lookup_unique(index_pool_guard, key, row_id, view.ts())
                     .await
             }
@@ -560,11 +575,11 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
                     .insert_if_not_exists(index_pool_guard, key, row_id, merge_if_match_deleted, ts)
                     .await
             }
-            (Some(_), SecondaryIndexView::Catalog { .. }) => Err(Error::InvalidState),
+            (Some(_), SecondaryIndexView::Catalog { .. }) => Err(Error::invalid_state()),
             (None, view) => {
                 self.generic_sec_idx()[index_no]
                     .non_unique()
-                    .ok_or(Error::InvalidArgument)?
+                    .ok_or(Error::invalid_argument())?
                     .insert_if_not_exists(
                         index_pool_guard,
                         key,
@@ -593,11 +608,11 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
                     .mask_as_deleted(index_pool_guard, key, row_id, ts)
                     .await
             }
-            (Some(_), SecondaryIndexView::Catalog { .. }) => Err(Error::InvalidState),
+            (Some(_), SecondaryIndexView::Catalog { .. }) => Err(Error::invalid_state()),
             (None, view) => {
                 self.generic_sec_idx()[index_no]
                     .non_unique()
-                    .ok_or(Error::InvalidArgument)?
+                    .ok_or(Error::invalid_argument())?
                     .mask_as_deleted(index_pool_guard, key, row_id, view.ts())
                     .await
             }
@@ -625,7 +640,7 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
             None => {
                 self.generic_sec_idx()[index_no]
                     .non_unique()
-                    .ok_or(Error::InvalidArgument)?
+                    .ok_or(Error::invalid_argument())?
                     .compare_delete(index_pool_guard, key, row_id, ignore_del_mask, ts)
                     .await
             }
@@ -642,7 +657,7 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
     /// row ids to persisted LWC blocks.
     #[inline]
     fn lwc_deletion_buffer(&self) -> Result<&ColumnDeletionBuffer> {
-        self.deletion_buffer().ok_or(Error::InvalidState)
+        self.deletion_buffer().ok_or(Error::invalid_state())
     }
 
     #[inline]
@@ -734,7 +749,7 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
         read_set: &[usize],
     ) -> Result<Vec<Val>> {
         let Some(storage) = self.storage else {
-            return Err(Error::InvalidState);
+            return Err(Error::invalid_state());
         };
         let block = PersistedLwcBlock::load(
             storage.file().file_kind(),
@@ -745,11 +760,10 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
         )
         .await?;
         if block.row_shape_fingerprint() != row_shape_fingerprint {
-            return Err(Error::block_corrupted(
+            return Err(invalid_lwc_payload(
                 FileKind::TableFile,
-                BlockKind::LwcBlock,
                 block_id,
-                BlockCorruptionCause::InvalidPayload,
+                "row shape fingerprint mismatch",
             ));
         }
         block.decode_row_values(self.metadata(), row_idx, read_set)
@@ -764,7 +778,7 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
         row_shape_fingerprint: u128,
     ) -> Result<Vec<Val>> {
         let Some(storage) = self.storage else {
-            return Err(Error::InvalidState);
+            return Err(Error::invalid_state());
         };
         let block = PersistedLwcBlock::load(
             storage.file().file_kind(),
@@ -775,11 +789,10 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
         )
         .await?;
         if block.row_shape_fingerprint() != row_shape_fingerprint {
-            return Err(Error::block_corrupted(
+            return Err(invalid_lwc_payload(
                 FileKind::TableFile,
-                BlockKind::LwcBlock,
                 block_id,
-                BlockCorruptionCause::InvalidPayload,
+                "row shape fingerprint mismatch",
             ));
         }
         block.decode_full_row_values(self.metadata(), row_idx)
@@ -792,7 +805,7 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
         vals: Vec<Val>,
     ) -> Result<Vec<SelectKey>> {
         if read_set.len() != vals.len() {
-            return Err(Error::InvalidState);
+            return Err(Error::invalid_state());
         }
         let indexed_vals = read_set
             .iter()
@@ -811,7 +824,7 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
                         indexed_vals
                             .get(&(key.col_no as usize))
                             .cloned()
-                            .ok_or(Error::InvalidState)
+                            .ok_or(Error::invalid_state())
                     })
                     .collect::<Result<Vec<_>>>()?;
                 Ok(SelectKey::new(index_no, vals))
@@ -842,7 +855,7 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
 
     #[inline]
     fn index_key_matches(keys: &[SelectKey], key: &SelectKey) -> Result<bool> {
-        let old_key = keys.get(key.index_no).ok_or(Error::InvalidState)?;
+        let old_key = keys.get(key.index_no).ok_or(Error::invalid_state())?;
         Ok(old_key.vals == key.vals)
     }
 

@@ -1,13 +1,14 @@
 use crate::bitmap::AllocMap;
 use crate::buffer::ReadonlyBufferPool;
 use crate::buffer::page::PAGE_SIZE;
-use crate::error::{BlockCorruptionCause, BlockKind, Error, FileKind, Result};
+use crate::error::{DataIntegrityError, Error, FileKind, Result};
 use crate::file::fs::BackgroundWriteRequest;
 use crate::file::super_block::{SUPER_BLOCK_SIZE, SuperBlock};
 use crate::file::{BlockKey, FileID, SparseFile, write_direct};
 use crate::io::{DirectBuf, IOClient};
 use crate::quiescent::QuiescentGuard;
 use crate::trx::TrxID;
+use error_stack::Report;
 use std::collections::BTreeSet;
 use std::fs;
 use std::future::Future;
@@ -133,17 +134,17 @@ impl<M> ActiveRoot<M> {
     #[inline]
     pub fn rollback_allocated_block_id(&mut self, block_id: BlockID) -> Result<()> {
         if block_id == SUPER_BLOCK_ID {
-            return Err(Error::InvalidState);
+            return Err(Error::invalid_state());
         }
-        let idx = usize::try_from(block_id.as_u64()).map_err(|_| Error::InvalidState)?;
+        let idx = usize::try_from(block_id.as_u64()).map_err(|_| Error::invalid_state())?;
         if idx >= self.alloc_map.len() {
-            return Err(Error::InvalidState);
+            return Err(Error::invalid_state());
         }
         if !self.newly_allocated_ids.contains(&block_id) {
-            return Err(Error::InvalidState);
+            return Err(Error::invalid_state());
         }
         if !self.alloc_map.deallocate(idx) {
-            return Err(Error::InvalidState);
+            return Err(Error::invalid_state());
         }
         self.newly_allocated_ids.remove(&block_id);
         Ok(())
@@ -439,7 +440,7 @@ impl<M> CowFile<M> {
 
         let new_meta_block_id = match new_root.try_allocate_block_id() {
             Some(block_id) => block_id,
-            None => return Err(Error::InvalidState),
+            None => return Err(Error::invalid_state()),
         };
         new_root.meta_block_id = new_meta_block_id;
 
@@ -528,19 +529,18 @@ pub(crate) fn validate_active_meta_block_id(
     alloc_map: &AllocMap,
     meta_block_id: BlockID,
     file_kind: FileKind,
-    block_kind: BlockKind,
+    block_kind: &'static str,
 ) -> Result<()> {
     let meta_block_idx = usize::from(meta_block_id);
     if meta_block_idx == usize::from(SUPER_BLOCK_ID)
         || meta_block_idx >= alloc_map.len()
         || !alloc_map.is_allocated(meta_block_idx)
     {
-        return Err(Error::block_corrupted(
-            file_kind,
-            block_kind,
-            meta_block_id,
-            BlockCorruptionCause::InvalidRootInvariant,
-        ));
+        return Err(Report::new(DataIntegrityError::InvalidRootInvariant)
+            .attach(format!(
+                "file={file_kind}, block={block_kind}, block_id={meta_block_id}"
+            ))
+            .into());
     }
     Ok(())
 }

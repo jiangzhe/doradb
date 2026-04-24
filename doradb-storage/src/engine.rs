@@ -171,7 +171,7 @@ impl Engine {
         // drained before we start disabling runtime state.
         let strong_count = Arc::strong_count(inner);
         if strong_count != 1 {
-            return Err(Error::StorageEngineShutdownBusy(strong_count - 1));
+            return Err(Error::storage_engine_shutdown_busy(strong_count - 1));
         }
 
         self.components().shutdown_all();
@@ -184,7 +184,7 @@ impl Drop for Engine {
     #[inline]
     fn drop(&mut self) {
         if let Err(err) = self.finalize_shutdown() {
-            if matches!(err, Error::StorageEngineShutdownBusy(_)) {
+            if err.is_code(crate::error::ErrorCode::StorageEngineShutdownBusy) {
                 // Fatal owner-drop violations still need to stop background
                 // workers, but the owner registry cannot be dropped while
                 // leaked runtime refs still retain component guards.
@@ -263,7 +263,7 @@ impl EngineInner {
     pub(crate) fn with_running_admission<T>(&self, f: impl FnOnce() -> T) -> Result<T> {
         let _gate = self.lifecycle.admission_gate.read();
         if self.lifecycle.state() != EngineLifecycleState::Running {
-            return Err(Error::StorageEngineShutdown);
+            return Err(Error::storage_engine_shutdown());
         }
         self.trx_sys.ensure_runtime_healthy()?;
         Ok(f())
@@ -352,7 +352,7 @@ mod tests {
     use crate::catalog::tests::table1;
     use crate::conf::consts::STORAGE_LAYOUT_FILE_NAME;
     use crate::conf::{EngineConfig, EvictableBufferPoolConfig, FileSystemConfig, TrxSysConfig};
-    use crate::error::Error;
+    use crate::error::{ConfigError, ErrorKind};
     use crate::file::fs::tests::io_backend_stats_handle_identity as fs_stats_handle_identity;
     use std::fs;
     use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -539,7 +539,8 @@ mod tests {
                 Ok(_) => panic!("expected storage layout mismatch"),
                 Err(err) => err,
             };
-            assert!(matches!(err, Error::StorageLayoutMismatch(_)));
+            assert!(err.is_kind(ErrorKind::Config));
+            assert_eq!(err.config_error(), Some(ConfigError::StorageLayoutMismatch));
         });
     }
 
@@ -561,7 +562,8 @@ mod tests {
                 Ok(_) => panic!("expected storage layout mismatch"),
                 Err(err) => err,
             };
-            assert!(matches!(err, Error::StorageLayoutMismatch(_)));
+            assert!(err.is_kind(ErrorKind::Config));
+            assert_eq!(err.config_error(), Some(ConfigError::StorageLayoutMismatch));
             assert!(!new_data_dir.exists());
         });
     }
@@ -607,7 +609,7 @@ mod tests {
                 Ok(_) => panic!("expected startup failure"),
                 Err(err) => err,
             };
-            assert!(matches!(err, Error::BufferPoolSizeTooSmall));
+            assert!(err.is_code(crate::error::ErrorCode::BufferPoolSizeTooSmall));
             assert!(!marker_path.exists());
 
             let engine = test_engine_config_for(root.path())
@@ -644,7 +646,11 @@ mod tests {
                 Ok(_) => panic!("expected startup failure"),
                 Err(err) => err,
             };
-            assert!(matches!(err, Error::InvalidStoragePath(_)));
+            assert!(err.is_kind(ErrorKind::Config));
+            assert_eq!(
+                err.config_error(),
+                Some(ConfigError::PathMustNotOverlapReservedLocation)
+            );
             assert!(!marker_path.exists());
         });
     }
@@ -662,13 +668,13 @@ mod tests {
                 Ok(_) => panic!("expected shutdown error"),
                 Err(err) => err,
             };
-            assert!(matches!(err, Error::StorageEngineShutdown));
+            assert!(err.is_code(crate::error::ErrorCode::StorageEngineShutdown));
 
             let err = match engine.new_ref() {
                 Ok(_) => panic!("expected shutdown error"),
                 Err(err) => err,
             };
-            assert!(matches!(err, Error::StorageEngineShutdown));
+            assert!(err.is_code(crate::error::ErrorCode::StorageEngineShutdown));
         });
     }
 
@@ -683,19 +689,19 @@ mod tests {
                 Ok(_) => panic!("expected busy shutdown error"),
                 Err(err) => err,
             };
-            assert!(matches!(err, Error::StorageEngineShutdownBusy(1)));
+            assert!(err.is_code(crate::error::ErrorCode::StorageEngineShutdownBusy));
 
             let err = match engine_ref.try_new_session() {
                 Ok(_) => panic!("expected shutdown error"),
                 Err(err) => err,
             };
-            assert!(matches!(err, Error::StorageEngineShutdown));
+            assert!(err.is_code(crate::error::ErrorCode::StorageEngineShutdown));
 
             let err = match engine.new_ref() {
                 Ok(_) => panic!("expected shutdown error"),
                 Err(err) => err,
             };
-            assert!(matches!(err, Error::StorageEngineShutdown));
+            assert!(err.is_code(crate::error::ErrorCode::StorageEngineShutdown));
 
             drop(engine_ref);
             engine.shutdown().unwrap();
@@ -713,19 +719,19 @@ mod tests {
                 Ok(_) => panic!("expected busy shutdown error"),
                 Err(err) => err,
             };
-            assert!(matches!(err, Error::StorageEngineShutdownBusy(1)));
+            assert!(err.is_code(crate::error::ErrorCode::StorageEngineShutdownBusy));
 
             let err = match engine.try_new_session() {
                 Ok(_) => panic!("expected shutdown error"),
                 Err(err) => err,
             };
-            assert!(matches!(err, Error::StorageEngineShutdown));
+            assert!(err.is_code(crate::error::ErrorCode::StorageEngineShutdown));
 
             let err = match session.try_begin_trx() {
                 Ok(_) => panic!("expected shutdown error"),
                 Err(err) => err,
             };
-            assert!(matches!(err, Error::StorageEngineShutdown));
+            assert!(err.is_code(crate::error::ErrorCode::StorageEngineShutdown));
             assert!(!session.in_trx());
 
             drop(session);
@@ -875,8 +881,11 @@ mod tests {
                 let new_ref_res = ref_handle.join().unwrap();
 
                 match (shutdown_res, new_ref_res) {
-                    (Ok(()), Err(Error::StorageEngineShutdown)) => {}
-                    (Err(Error::StorageEngineShutdownBusy(1)), Ok(engine_ref)) => {
+                    (Ok(()), Err(err))
+                        if err.is_code(crate::error::ErrorCode::StorageEngineShutdown) => {}
+                    (Err(err), Ok(engine_ref))
+                        if err.is_code(crate::error::ErrorCode::StorageEngineShutdownBusy) =>
+                    {
                         drop(engine_ref);
                         engine.shutdown().unwrap();
                     }

@@ -5,7 +5,7 @@ use crate::catalog::storage::CatalogStorage;
 use crate::catalog::table::TableMetadata;
 use crate::catalog::{CatalogCheckpointBatch, CatalogRedoEntry};
 use crate::catalog::{ObjID, TableID, USER_OBJ_ID_START};
-use crate::error::{BlockCorruptionCause, BlockKind, Error, Result};
+use crate::error::{DataIntegrityError, Error, FileKind, Result};
 use crate::file::cow_file::{BlockID, SUPER_BLOCK_ID};
 use crate::file::multi_table_file::{
     CATALOG_TABLE_ROOT_DESC_COUNT, CatalogTableRootDesc, MultiTableFileSnapshot,
@@ -21,8 +21,30 @@ use crate::row::ops::SelectKey;
 use crate::row::{InsertRow, RowID, RowPage};
 use crate::trx::redo::RowRedoKind;
 use crate::value::Val;
+use error_stack::Report;
 use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroU64;
+
+#[inline]
+fn invalid_catalog_payload(message: impl Into<String>) -> Error {
+    Report::new(DataIntegrityError::InvalidPayload)
+        .attach(message.into())
+        .into()
+}
+
+#[inline]
+fn invalid_lwc_payload(
+    file_kind: FileKind,
+    block_id: BlockID,
+    message: impl Into<String>,
+) -> Error {
+    let message = message.into();
+    Report::new(DataIntegrityError::InvalidPayload)
+        .attach(format!(
+            "file={file_kind}, block=lwc-block, block_id={block_id}, {message}"
+        ))
+        .into()
+}
 
 struct PendingLwcBlock {
     shape: ColumnBlockEntryShape,
@@ -61,12 +83,12 @@ impl CatalogStorage {
             }
             if root.root_block_id.is_none() {
                 if root.pivot_row_id != 0 {
-                    return Err(Error::InvalidState);
+                    return Err(Error::invalid_state());
                 }
                 continue;
             }
             if root.table_id as usize != idx {
-                return Err(Error::InvalidState);
+                return Err(Error::invalid_state());
             }
             let rows = self
                 .load_visible_rows_from_root(self.tables[idx].metadata(), guards.disk_guard(), root)
@@ -96,7 +118,7 @@ impl CatalogStorage {
             if current_catalog_replay_start_ts >= next_catalog_replay_start_ts {
                 return Ok(());
             }
-            return Err(Error::InvalidState);
+            return Err(Error::invalid_state());
         }
         if safe_cts < replay_start_ts {
             return Ok(());
@@ -170,7 +192,7 @@ impl CatalogStorage {
         let disk_pool_guard = self.disk_pool.pool_guard();
         // Step 1: Validate root invariants and construct a base index snapshot for reads.
         if root.root_block_id.is_none() && root.pivot_row_id != 0 {
-            return Err(Error::InvalidState);
+            return Err(Error::invalid_state());
         }
         let root_block_id = root.checkpoint_root_block_id();
         let entries = if let Some(root_block_id) = root_block_id {
@@ -212,7 +234,11 @@ impl CatalogStorage {
             match kind {
                 RowRedoKind::Insert(vals) => {
                     if vals.len() != metadata.col_count() {
-                        return Err(Error::InvalidFormat);
+                        return Err(invalid_catalog_payload(format!(
+                            "catalog checkpoint insert value count {} does not match column count {}",
+                            vals.len(),
+                            metadata.col_count()
+                        )));
                     }
                     pending_rows.push(PendingInsertRow {
                         row_id: next_row_id,
@@ -238,9 +264,9 @@ impl CatalogStorage {
                         let delta = row
                             .row_id
                             .checked_sub(row.start_row_id)
-                            .ok_or(Error::InvalidState)?;
+                            .ok_or(Error::invalid_state())?;
                         if delta > u32::MAX as u64 {
-                            return Err(Error::InvalidState);
+                            return Err(Error::invalid_state());
                         }
                         delete_deltas
                             .entry(row.start_row_id)
@@ -249,7 +275,7 @@ impl CatalogStorage {
                     }
                 }
                 RowRedoKind::Delete | RowRedoKind::Update(_) => {
-                    return Err(Error::InvalidState);
+                    return Err(Error::invalid_state());
                 }
             }
         }
@@ -360,7 +386,7 @@ impl CatalogStorage {
         for (start_row_id, pending) in &delete_deltas {
             let idx = entries
                 .binary_search_by_key(start_row_id, |entry| entry.start_row_id)
-                .map_err(|_| Error::InvalidState)?;
+                .map_err(|_| Error::invalid_state())?;
             let entry = entries[idx];
             let mut base = load_entry_deletion_deltas(&base_index, &entry).await?;
             let old_len = base.len();
@@ -403,7 +429,7 @@ impl CatalogStorage {
             (root.root_block_id, root.pivot_row_id)
         } else {
             let root_block_id = if entries_changed || next_pivot_row_id > root.pivot_row_id {
-                Some(NonZeroU64::new(current_root_block_id.into()).ok_or(Error::InvalidState)?)
+                Some(NonZeroU64::new(current_root_block_id.into()).ok_or(Error::invalid_state())?)
             } else {
                 root.root_block_id
             };
@@ -444,7 +470,7 @@ impl CatalogStorage {
     ) -> Result<Vec<RowRecord>> {
         if root.root_block_id.is_none() {
             if root.pivot_row_id != 0 {
-                return Err(Error::InvalidState);
+                return Err(Error::invalid_state());
             }
             return Ok(Vec::new());
         }
@@ -472,9 +498,9 @@ impl CatalogStorage {
                 let delta = row
                     .row_id
                     .checked_sub(entry.start_row_id)
-                    .ok_or(Error::InvalidState)?;
+                    .ok_or(Error::invalid_state())?;
                 if delta > u32::MAX as u64 {
-                    return Err(Error::InvalidState);
+                    return Err(Error::invalid_state());
                 }
                 if deleted.contains(&(delta as u32)) {
                     continue;
@@ -502,9 +528,9 @@ impl CatalogStorage {
                 let delta = row
                     .row_id
                     .checked_sub(entry.start_row_id)
-                    .ok_or(Error::InvalidState)?;
+                    .ok_or(Error::invalid_state())?;
                 if delta > u32::MAX as u64 {
-                    return Err(Error::InvalidState);
+                    return Err(Error::invalid_state());
                 }
                 if deleted.contains(&(delta as u32)) {
                     continue;
@@ -538,11 +564,13 @@ impl CatalogStorage {
         let row_count = lwc_block.row_count();
         let row_ids = column_index.load_entry_row_ids(entry).await?;
         if row_count != row_ids.len() {
-            return Err(Error::block_corrupted(
+            return Err(invalid_lwc_payload(
                 self.mtb.file_kind(),
-                BlockKind::LwcBlock,
                 entry.block_id(),
-                BlockCorruptionCause::InvalidPayload,
+                format!(
+                    "LWC row count {row_count} does not match index row id count {}",
+                    row_ids.len()
+                ),
             ));
         }
         let mut rows = Vec::with_capacity(row_count);
@@ -561,7 +589,11 @@ impl CatalogStorage {
     ) -> Result<Vec<PendingLwcBlock>> {
         for row in rows {
             if row.vals.len() != metadata.col_count() {
-                return Err(Error::InvalidFormat);
+                return Err(invalid_catalog_payload(format!(
+                    "catalog checkpoint row value count {} does not match column count {}",
+                    row.vals.len(),
+                    metadata.col_count()
+                )));
             }
         }
         if rows.is_empty() {
@@ -580,9 +612,9 @@ impl CatalogStorage {
                 builder_start = Some(row.row_id);
             }
             if !append_single_row_to_builder(metadata, &mut temp_page, &mut builder, row)? {
-                let start_row_id = builder_start.take().ok_or(Error::InvalidState)?;
+                let start_row_id = builder_start.take().ok_or(Error::invalid_state())?;
                 if builder_end <= start_row_id {
-                    return Err(Error::InvalidState);
+                    return Err(Error::invalid_state());
                 }
                 let shape = ColumnBlockEntryShape::new(
                     start_row_id,
@@ -596,7 +628,7 @@ impl CatalogStorage {
                 builder = LwcBuilder::new(metadata);
                 builder_start = Some(row.row_id);
                 if !append_single_row_to_builder(metadata, &mut temp_page, &mut builder, row)? {
-                    return Err(Error::InvalidState);
+                    return Err(Error::invalid_state());
                 }
             }
             builder_end = row.row_id.saturating_add(1);
@@ -605,9 +637,9 @@ impl CatalogStorage {
         meta_pool.deallocate_page(temp_page);
 
         if !builder.is_empty() {
-            let start_row_id = builder_start.ok_or(Error::InvalidState)?;
+            let start_row_id = builder_start.ok_or(Error::invalid_state())?;
             if builder_end <= start_row_id {
-                return Err(Error::InvalidState);
+                return Err(Error::invalid_state());
             }
             let shape = ColumnBlockEntryShape::new(
                 start_row_id,
@@ -633,12 +665,20 @@ impl CatalogStorage {
         }
         for row in existing_tail_rows {
             if row.vals.len() != metadata.col_count() {
-                return Err(Error::InvalidFormat);
+                return Err(invalid_catalog_payload(format!(
+                    "catalog checkpoint existing row value count {} does not match column count {}",
+                    row.vals.len(),
+                    metadata.col_count()
+                )));
             }
         }
         for row in inserts {
             if row.vals.len() != metadata.col_count() {
-                return Err(Error::InvalidFormat);
+                return Err(invalid_catalog_payload(format!(
+                    "catalog checkpoint insert value count {} does not match column count {}",
+                    row.vals.len(),
+                    metadata.col_count()
+                )));
             }
         }
 
@@ -649,7 +689,7 @@ impl CatalogStorage {
         for row in existing_tail_rows {
             if !append_single_row_to_builder(metadata, &mut temp_page, &mut builder, row)? {
                 self.meta_pool.deallocate_page(temp_page);
-                return Err(Error::InvalidState);
+                return Err(Error::invalid_state());
             }
         }
 
@@ -670,7 +710,7 @@ impl CatalogStorage {
         let end_row_id = row_ids
             .last()
             .copied()
-            .ok_or(Error::InvalidState)?
+            .ok_or(Error::invalid_state())?
             .saturating_add(1);
         let fingerprint =
             ColumnBlockEntryShape::new(start_row_id, end_row_id, row_ids.clone(), Vec::new())?
@@ -692,7 +732,7 @@ fn append_single_row_to_builder(
         page.init(row.row_id, 1, metadata);
         let insert = page.insert(metadata, &row.vals);
         if !matches!(insert, InsertRow::Ok(_)) {
-            return Err(Error::InvalidState);
+            return Err(Error::invalid_state());
         }
     }
     builder.append_row_page(temp_page.page())

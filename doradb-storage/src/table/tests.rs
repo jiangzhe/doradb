@@ -6,7 +6,7 @@ use crate::buffer::{EvictableBufferPool, PoolGuards, PoolRole, test_frame_kind};
 use crate::catalog::tests::table4;
 use crate::conf::{EngineConfig, EvictableBufferPoolConfig, FileSystemConfig, TrxSysConfig};
 use crate::engine::Engine;
-use crate::error::{BlockCorruptionCause, BlockKind, Error, FileKind, Result, StoragePoisonSource};
+use crate::error::{DataIntegrityError, Error, Result, StoragePoisonSource};
 use crate::file::block_integrity::{BLOCK_INTEGRITY_HEADER_SIZE, write_block_checksum};
 use crate::file::cow_file::{
     BlockID, COW_FILE_PAGE_SIZE, SUPER_BLOCK_ID, tests::old_root_drop_count,
@@ -65,6 +65,19 @@ pub(super) fn set_test_force_secondary_sidecar_error(enabled: bool) {
 
 pub(super) fn test_force_secondary_sidecar_error_enabled() -> bool {
     TEST_FORCE_SECONDARY_SIDECAR_ERROR.with(|flag| flag.get())
+}
+
+fn assert_table_data_integrity(
+    err: Error,
+    block_kind: &str,
+    block_id: BlockID,
+    expected: DataIntegrityError,
+) {
+    assert_eq!(err.data_integrity_error(), Some(expected));
+    let report = format!("{err:?}");
+    assert!(report.contains("table-file"), "{report}");
+    assert!(report.contains(block_kind), "{report}");
+    assert!(report.contains(&format!("block_id={block_id}")), "{report}");
 }
 
 async fn stmt_insert_row(
@@ -505,15 +518,16 @@ fn test_lwc_select_surfaces_persisted_corruption() {
         let mut trx = session.try_begin_trx().unwrap().unwrap();
         let stmt = trx.start_stmt();
         let res = stmt_select_row_mvcc(&stmt, &sys.table, &key, &[0, 1]).await;
-        match res {
-            Err(Error::BlockCorrupted {
-                file_kind: FileKind::TableFile,
-                block_kind: BlockKind::LwcBlock,
-                block_id: page_id,
-                cause: BlockCorruptionCause::ChecksumMismatch,
-            }) => assert_eq!(page_id, block_id),
+        let err = match res {
+            Err(err) => err,
             other => panic!("expected persisted LWC corruption, got {other:?}"),
-        }
+        };
+        assert_table_data_integrity(
+            err,
+            "lwc-block",
+            block_id,
+            DataIntegrityError::ChecksumMismatch,
+        );
         trx = stmt.fail().await.unwrap();
         trx.rollback().await.unwrap();
 
@@ -557,15 +571,16 @@ fn test_lwc_select_surfaces_column_block_index_row_metadata_corruption() {
         let mut trx = session.try_begin_trx().unwrap().unwrap();
         let stmt = trx.start_stmt();
         let res = stmt_select_row_mvcc(&stmt, &sys.table, &key, &[0, 1]).await;
-        match res {
-            Err(Error::BlockCorrupted {
-                file_kind: FileKind::TableFile,
-                block_kind: BlockKind::ColumnBlockIndex,
-                block_id: page_id,
-                cause: BlockCorruptionCause::InvalidPayload,
-            }) => assert_eq!(page_id, entry.leaf_page_id),
+        let err = match res {
+            Err(err) => err,
             other => panic!("expected persisted column-block-index corruption, got {other:?}"),
-        }
+        };
+        assert_table_data_integrity(
+            err,
+            "column-block-index",
+            entry.leaf_page_id,
+            DataIntegrityError::InvalidPayload,
+        );
         trx = stmt.fail().await.unwrap();
         trx.rollback().await.unwrap();
 
@@ -609,15 +624,16 @@ fn test_lwc_select_surfaces_column_block_index_zero_block_id_corruption() {
         let mut trx = session.try_begin_trx().unwrap().unwrap();
         let stmt = trx.start_stmt();
         let res = stmt_select_row_mvcc(&stmt, &sys.table, &key, &[0, 1]).await;
-        match res {
-            Err(Error::BlockCorrupted {
-                file_kind: FileKind::TableFile,
-                block_kind: BlockKind::ColumnBlockIndex,
-                block_id: page_id,
-                cause: BlockCorruptionCause::InvalidPayload,
-            }) => assert_eq!(page_id, entry.leaf_page_id),
+        let err = match res {
+            Err(err) => err,
             other => panic!("expected persisted column-block-index corruption, got {other:?}"),
-        }
+        };
+        assert_table_data_integrity(
+            err,
+            "column-block-index",
+            entry.leaf_page_id,
+            DataIntegrityError::InvalidPayload,
+        );
         trx = stmt.fail().await.unwrap();
         trx.rollback().await.unwrap();
 
@@ -661,15 +677,16 @@ fn test_lwc_select_surfaces_row_shape_fingerprint_mismatch_corruption() {
         let mut trx = session.try_begin_trx().unwrap().unwrap();
         let stmt = trx.start_stmt();
         let res = stmt_select_row_mvcc(&stmt, &sys.table, &key, &[0, 1]).await;
-        match res {
-            Err(Error::BlockCorrupted {
-                file_kind: FileKind::TableFile,
-                block_kind: BlockKind::LwcBlock,
-                block_id: page_id,
-                cause: BlockCorruptionCause::InvalidPayload,
-            }) => assert_eq!(page_id, entry.block_id()),
+        let err = match res {
+            Err(err) => err,
             other => panic!("expected persisted LWC invalid-payload corruption, got {other:?}"),
-        }
+        };
+        assert_table_data_integrity(
+            err,
+            "lwc-block",
+            entry.block_id(),
+            DataIntegrityError::InvalidPayload,
+        );
         trx = stmt.fail().await.unwrap();
         trx.rollback().await.unwrap();
 
@@ -1796,10 +1813,7 @@ fn test_secondary_mem_index_cleanup_requires_idle_session() {
             .cleanup_secondary_mem_indexes(&mut session, true)
             .await
             .unwrap_err();
-        assert!(matches!(
-            err,
-            Error::NotSupported("secondary MemIndex cleanup requires idle session")
-        ));
+        assert!(err.is_not_supported("secondary MemIndex cleanup requires idle session"));
         assert!(session.in_trx());
 
         trx.rollback().await.unwrap();
@@ -2433,15 +2447,12 @@ fn test_secondary_mem_index_cleanup_propagates_cold_delete_overlay_proof_error()
             .cleanup_secondary_mem_indexes(&mut session, true)
             .await
             .unwrap_err();
-        match err {
-            Error::BlockCorrupted {
-                file_kind: FileKind::TableFile,
-                block_kind: BlockKind::LwcBlock,
-                block_id: err_block_id,
-                ..
-            } => assert_eq!(err_block_id, block_id),
-            other => panic!("expected LWC block corruption, got {other:?}"),
-        }
+        assert_table_data_integrity(
+            err,
+            "lwc-block",
+            block_id,
+            DataIntegrityError::InvalidPayload,
+        );
         assert_eq!(
             index
                 .lookup(
@@ -2912,7 +2923,7 @@ fn test_secondary_sidecar_failure_keeps_checkpoint_root_atomic() {
         set_test_force_secondary_sidecar_error(true);
         let _reset = ResetSidecarHook;
         let err = sys.table.checkpoint(&mut session).await.unwrap_err();
-        assert!(matches!(err, Error::InvalidState));
+        assert!(err.is_code(crate::error::ErrorCode::InvalidState));
 
         let root_after = sys.table.file().active_root_unchecked();
         assert_eq!(
@@ -3598,7 +3609,7 @@ fn test_checkpoint_fails_when_eligible_delete_marker_has_no_column_index() {
         wait_gc_cutoff_after(&session, marker_ts).await;
 
         let err = sys.table.checkpoint(&mut session).await.unwrap_err();
-        assert!(matches!(err, Error::InvalidState));
+        assert!(err.is_code(crate::error::ErrorCode::InvalidState));
         let root_after = sys.table.file().active_root_unchecked();
         assert_eq!(
             root_after.deletion_cutoff_ts,
@@ -3650,7 +3661,7 @@ fn test_checkpoint_fails_when_eligible_delete_marker_cannot_be_located() {
         wait_gc_cutoff_after(&session, marker_ts).await;
 
         let err = sys.table.checkpoint(&mut session).await.unwrap_err();
-        assert!(matches!(err, Error::InvalidState));
+        assert!(err.is_code(crate::error::ErrorCode::InvalidState));
         assert_eq!(
             sys.table.file().active_root_unchecked().deletion_cutoff_ts,
             root_before.deletion_cutoff_ts
@@ -3734,7 +3745,7 @@ fn test_recover_cold_delete_rejects_already_deleted_with_different_cts() {
             )
             .await
             .unwrap_err();
-        assert!(matches!(err, Error::InvalidState));
+        assert!(err.is_code(crate::error::ErrorCode::InvalidState));
 
         drop(session);
         sys.clean_all();
@@ -3871,15 +3882,12 @@ fn test_checkpoint_fails_on_invalid_v2_delete_metadata() {
             .invalidate_block_id(sys.table.file().sparse_file().file_id(), entry.leaf_page_id);
 
         let err = sys.table.checkpoint(&mut session).await.unwrap_err();
-        assert!(matches!(
+        assert_table_data_integrity(
             err,
-            Error::BlockCorrupted {
-                file_kind: FileKind::TableFile,
-                block_kind: BlockKind::ColumnBlockIndex,
-                block_id: page_id,
-                cause: BlockCorruptionCause::InvalidPayload,
-            } if page_id == entry.leaf_page_id
-        ));
+            "column-block-index",
+            entry.leaf_page_id,
+            DataIntegrityError::InvalidPayload,
+        );
 
         drop(session);
         sys.clean_all();
@@ -3954,15 +3962,12 @@ fn test_checkpoint_fails_on_short_v2_delete_section_header() {
             .invalidate_block_id(sys.table.file().sparse_file().file_id(), entry.leaf_page_id);
 
         let err = sys.table.checkpoint(&mut session).await.unwrap_err();
-        assert!(matches!(
+        assert_table_data_integrity(
             err,
-            Error::BlockCorrupted {
-                file_kind: FileKind::TableFile,
-                block_kind: BlockKind::ColumnBlockIndex,
-                block_id: page_id,
-                cause: BlockCorruptionCause::InvalidPayload,
-            } if page_id == entry.leaf_page_id
-        ));
+            "column-block-index",
+            entry.leaf_page_id,
+            DataIntegrityError::InvalidPayload,
+        );
 
         drop(session);
         sys.clean_all();
@@ -4902,10 +4907,7 @@ fn test_checkpoint_requires_idle_session_before_delayed_outcome() {
         ));
 
         let err = sys.table.checkpoint(&mut session).await.unwrap_err();
-        assert!(matches!(
-            err,
-            Error::NotSupported("checkpoint requires idle session")
-        ));
+        assert!(err.is_not_supported("checkpoint requires idle session"));
         assert!(session.in_trx());
 
         checkpoint_trx.rollback().await.unwrap();
@@ -5524,7 +5526,8 @@ fn test_mvcc_insert_surfaces_cached_insert_page_reload_error() {
         let trx = stmt.fail().await.unwrap();
         trx.rollback().await.unwrap();
         assert!(
-            matches!(res, Err(Error::IOError { .. })),
+            res.as_ref()
+                .is_err_and(|err| err.is_code(crate::error::ErrorCode::IOError)),
             "expected insert-page reload failure, got {res:?}"
         );
         assert!(
@@ -5591,24 +5594,26 @@ fn test_mvcc_rollback_poisons_runtime_on_row_page_reload_error() {
         ));
         let _hook = install_storage_backend_test_hook(read_hook);
 
-        assert!(matches!(
-            trx.rollback().await,
-            Err(Error::StorageEnginePoisoned(
-                StoragePoisonSource::RollbackAccess
-            ))
-        ));
-        assert!(matches!(
-            sys.engine.trx_sys.storage_poison_error(),
-            Some(Error::StorageEnginePoisoned(
-                StoragePoisonSource::RollbackAccess
-            ))
-        ));
-        assert!(matches!(
-            sys.engine.trx_sys.ensure_runtime_healthy(),
-            Err(Error::StorageEnginePoisoned(
-                StoragePoisonSource::RollbackAccess
-            ))
-        ));
+        assert!(
+            trx.rollback()
+                .await
+                .as_ref()
+                .is_err_and(|err| err.is_storage_poisoned_by(StoragePoisonSource::RollbackAccess))
+        );
+        assert!(
+            sys.engine
+                .trx_sys
+                .storage_poison_error()
+                .as_ref()
+                .is_some_and(|err| err.is_storage_poisoned_by(StoragePoisonSource::RollbackAccess))
+        );
+        assert!(
+            sys.engine
+                .trx_sys
+                .ensure_runtime_healthy()
+                .as_ref()
+                .is_err_and(|err| err.is_storage_poisoned_by(StoragePoisonSource::RollbackAccess))
+        );
 
         drop(writer);
         drop(session);
@@ -5688,7 +5693,7 @@ fn test_build_in_memory_secondary_indexes_reclaims_staged_indexes_on_error() {
             Ok(_) => panic!("second secondary-index construction should fail in one-page pool"),
             Err(err) => err,
         };
-        assert!(matches!(err, Error::BufferPoolFull));
+        assert!(err.is_code(crate::error::ErrorCode::BufferPoolFull));
         assert_eq!(pool.allocated(), 0);
     });
 }

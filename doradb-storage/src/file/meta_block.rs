@@ -1,7 +1,7 @@
 use crate::bitmap::AllocMap;
 use crate::catalog::table::{TableBriefMetadata, TableBriefMetadataSerView, TableMetadata};
 use crate::catalog::{ObjID, USER_OBJ_ID_START};
-use crate::error::Result;
+use crate::error::{DataIntegrityError, Error, Result};
 use crate::file::cow_file::{BlockID, SUPER_BLOCK_ID};
 use crate::file::multi_table_file::{
     CATALOG_TABLE_ROOT_DESC_COUNT, CatalogTableRootDesc, MultiTableMetaBlock,
@@ -11,6 +11,7 @@ use crate::row::RowID;
 use crate::serde::{Deser, Ser, Serde};
 use crate::trx::TrxID;
 use bytemuck::cast_slice;
+use error_stack::Report;
 use std::mem;
 use std::num::NonZeroU64;
 
@@ -19,6 +20,13 @@ pub(crate) const TABLE_META_BLOCK_MAGIC_WORD: [u8; 8] =
     [b'T', b'B', b'L', b'M', b'E', b'T', b'A', 0];
 /// Table meta-block envelope version.
 pub(crate) const TABLE_META_BLOCK_VERSION: u64 = 3;
+
+#[inline]
+fn invalid_payload(message: impl Into<String>) -> Error {
+    Report::new(DataIntegrityError::InvalidPayload)
+        .attach(message.into())
+        .into()
+}
 
 /// Parsed payload of one checksummed table meta block.
 ///
@@ -55,7 +63,11 @@ impl Deser for MetaBlock {
         let (idx, column_block_index_root) = input.deser_u64(idx)?;
         let (idx, secondary_index_roots) = <Vec<BlockID>>::deser(input, idx)?;
         if secondary_index_roots.len() != meta.index_specs.len() {
-            return Err(crate::error::Error::InvalidFormat);
+            return Err(invalid_payload(format!(
+                "secondary index root count {} does not match index spec count {}",
+                secondary_index_roots.len(),
+                meta.index_specs.len()
+            )));
         }
         Ok((
             idx,
@@ -108,7 +120,11 @@ impl<'a> MetaBlockSerView<'a> {
         deletion_cutoff_ts: TrxID,
     ) -> Result<Self> {
         if secondary_index_roots.len() != schema.index_specs.len() {
-            return Err(crate::error::Error::InvalidFormat);
+            return Err(invalid_payload(format!(
+                "secondary index root count {} does not match index spec count {}",
+                secondary_index_roots.len(),
+                schema.index_specs.len()
+            )));
         }
         Ok(MetaBlockSerView {
             pivot_row_id,
@@ -163,14 +179,16 @@ impl Deser for AllocMapGcList {
     fn deser<S: Serde + ?Sized>(input: &S, start_idx: usize) -> Result<(usize, Self)> {
         let (idx, alloc_map) = AllocMap::deser(input, start_idx)?;
         if alloc_map.len() == 0 || !alloc_map.is_allocated(usize::from(SUPER_BLOCK_ID)) {
-            return Err(crate::error::Error::InvalidFormat);
+            return Err(invalid_payload(
+                "allocation map must include allocated super block",
+            ));
         }
 
         let (idx, gc_block_list) = LwcPrimitiveDeser::<BlockID>::deser(input, idx)?;
         for page_id in &gc_block_list.0 {
             let raw_block_id = usize::from(*page_id);
             if raw_block_id == usize::from(SUPER_BLOCK_ID) || raw_block_id >= alloc_map.len() {
-                return Err(crate::error::Error::InvalidFormat);
+                return Err(invalid_payload(format!("invalid gc block id {page_id}")));
             }
         }
 
@@ -246,12 +264,16 @@ impl Deser for MultiTableMetaBlockData {
     fn deser<S: Serde + ?Sized>(input: &S, start_idx: usize) -> Result<(usize, Self)> {
         let (idx, next_user_obj_id) = input.deser_u64(start_idx)?;
         if next_user_obj_id < USER_OBJ_ID_START {
-            return Err(crate::error::Error::InvalidFormat);
+            return Err(invalid_payload(format!(
+                "next_user_obj_id {next_user_obj_id} is below user object id start {USER_OBJ_ID_START}"
+            )));
         }
         let (idx, table_count) = input.deser_u32(idx)?;
         let (mut idx, _) = input.deser_u32(idx)?; // reserved
         if table_count as usize != CATALOG_TABLE_ROOT_DESC_COUNT {
-            return Err(crate::error::Error::InvalidFormat);
+            return Err(invalid_payload(format!(
+                "catalog table root count {table_count} does not match expected {CATALOG_TABLE_ROOT_DESC_COUNT}"
+            )));
         }
 
         let mut table_roots = [CatalogTableRootDesc::default(); CATALOG_TABLE_ROOT_DESC_COUNT];
@@ -263,7 +285,9 @@ impl Deser for MultiTableMetaBlockData {
             // is a checkpointed persisted root block id.
             let root_block_id = NonZeroU64::new(root_block_id_raw);
             if root_block_id.is_none() && pivot_row_id != 0 {
-                return Err(crate::error::Error::InvalidFormat);
+                return Err(invalid_payload(format!(
+                    "catalog table root has no root block but pivot_row_id {pivot_row_id}"
+                )));
             }
             *root = CatalogTableRootDesc {
                 table_id,
@@ -484,7 +508,10 @@ mod tests {
         assert_eq!(idx, ser_len);
 
         let err = MetaBlock::deser(&data[..], 0).unwrap_err();
-        assert!(matches!(err, crate::error::Error::InvalidFormat));
+        assert_eq!(
+            err.data_integrity_error(),
+            Some(DataIntegrityError::InvalidPayload)
+        );
     }
 
     #[test]
@@ -513,7 +540,10 @@ mod tests {
         )
         .err()
         .unwrap();
-        assert!(matches!(err, crate::error::Error::InvalidFormat));
+        assert_eq!(
+            err.data_integrity_error(),
+            Some(DataIntegrityError::InvalidPayload)
+        );
     }
 
     #[test]
@@ -555,6 +585,9 @@ mod tests {
         assert_eq!(res_idx, ser_len);
 
         let err = AllocMapGcList::deser(&data[..], 0).unwrap_err();
-        assert!(matches!(err, crate::error::Error::InvalidFormat));
+        assert_eq!(
+            err.data_integrity_error(),
+            Some(DataIntegrityError::InvalidPayload)
+        );
     }
 }

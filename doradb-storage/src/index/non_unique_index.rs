@@ -155,7 +155,7 @@ impl<'a, P: BufferPool> NonUniqueMemIndexCleanupScan<'a, P> {
         let mut batch = NonUniqueMemIndexCleanupBatch::default();
         for (idx, slot) in node.slots().iter().enumerate() {
             if node.slot_key_len(slot) < mem::size_of::<RowID>() {
-                return Err(Error::InvalidState);
+                return Err(Error::invalid_state());
             }
             let value = node.value_for_slot::<BTreeByte>(slot);
             let deleted = value.is_deleted();
@@ -172,7 +172,7 @@ impl<'a, P: BufferPool> NonUniqueMemIndexCleanupScan<'a, P> {
                 batch.skipped_live += 1;
                 continue;
             }
-            let encoded_key = node.key_checked(idx).ok_or(Error::InvalidState)?;
+            let encoded_key = node.key_checked(idx).ok_or(Error::invalid_state())?;
             batch.entries.push(NonUniqueMemIndexEntry {
                 encoded_key,
                 row_id,
@@ -540,7 +540,7 @@ fn push_encoded_exact_entry(
     let mut encoded_key = Vec::new();
     node.extend_slot_key(slot, &mut encoded_key);
     if encoded_key.len() < mem::size_of::<RowID>() {
-        return Err(Error::InvalidState);
+        return Err(Error::invalid_state());
     }
     let row_id = node.unpack_value::<BTreeU64>(slot).to_u64();
     let value = node.value_for_slot::<BTreeByte>(slot);
@@ -641,7 +641,7 @@ mod tests {
                 .lookup_encoded_entries(&pool_guard, &key)
                 .await
                 .expect_err("malformed exact key should fail encoded-entry lookup");
-            assert!(matches!(err, Error::InvalidState));
+            assert!(err.is_code(crate::error::ErrorCode::InvalidState));
         })
     }
 

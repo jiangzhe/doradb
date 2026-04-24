@@ -1,5 +1,5 @@
 use crate::conf::TrxSysConfig;
-use crate::error::{Error, Result, StoragePoisonSource};
+use crate::error::{DataIntegrityError, Error, Result, StoragePoisonSource};
 use crate::file::{FileSyncer, SparseFile, UNTRACKED_FILE_ID};
 use crate::free_list::FreeList;
 use crate::io::{
@@ -18,6 +18,7 @@ use crate::trx::sys::GC_BUCKETS;
 use crate::trx::sys::TransactionSystem;
 use crate::trx::{CommittedTrx, MAX_COMMIT_TS, MAX_SNAPSHOT_TS, PrecommitTrx, PreparedTrx, TrxID};
 use crossbeam_utils::CachePadded;
+use error_stack::Report;
 use flume::{Receiver, Sender};
 use glob::{Pattern, glob};
 use parking_lot::{Mutex, MutexGuard};
@@ -379,7 +380,7 @@ impl LogPartition {
             // Allocate space of log file.
             let (fd, offset) = match log_file.alloc(log_buf.capacity()) {
                 Ok((offset, _)) => (log_file.as_raw_fd(), offset),
-                Err(Error::StorageFileCapacityExceeded) => {
+                Err(err) if err.is_storage_file_capacity_exceeded() => {
                     // Rotate log file and try again.
                     self.rotate_log_file(group_commit_g)
                         .expect("rotate log file");
@@ -440,7 +441,7 @@ impl LogPartition {
             return Ok((cts, session, waiter));
         }
         let last_group = match group_commit_g.queue.back_mut().unwrap() {
-            Commit::Shutdown => return Err(Error::StorageEngineShutdown),
+            Commit::Shutdown => return Err(Error::storage_engine_shutdown()),
             Commit::Group(group) => group,
             Commit::Switch(_) => {
                 // Impossible, switch always has one group followed.
@@ -497,7 +498,7 @@ impl LogPartition {
             return Ok(cts);
         }
         let waiter = waiter.expect("waiter should exist when wait_sync");
-        if let Err(err) = waiter.wait_result().await {
+        if let Err(err) = waiter.wait_result_fresh().await {
             if let Some(s) = session.take() {
                 s.rollback();
             }
@@ -647,7 +648,7 @@ impl SyncGroup {
             return;
         }
         self.failed = true;
-        self.completion.complete(Err(err.clone()));
+        self.completion.complete(Err(err.duplicate()));
         for trx in mem::take(&mut self.trx_list) {
             trx.abort();
         }
@@ -689,7 +690,7 @@ impl FromStr for LogSync {
         } else if s.eq_ignore_ascii_case("none") {
             Ok(LogSync::None)
         } else {
-            Err(Error::InvalidArgument)
+            Err(Error::invalid_argument())
         }
     }
 }
@@ -1093,15 +1094,41 @@ pub fn list_log_files(file_prefix: &str, log_no: usize, desc: bool) -> Result<Ve
 pub fn parse_file_seq(file_path: &Path) -> Result<u32> {
     let file_name = file_path
         .file_name()
-        .ok_or(Error::InvalidFormat)?
+        .ok_or_else(|| {
+            Error::from(
+                Report::new(DataIntegrityError::InvalidPayload)
+                    .attach(format!("missing log file name: {}", file_path.display())),
+            )
+        })?
         .to_str()
-        .ok_or(Error::InvalidFormat)?;
+        .ok_or_else(|| {
+            Error::from(
+                Report::new(DataIntegrityError::InvalidPayload).attach(format!(
+                    "log file name must be valid UTF-8: {}",
+                    file_path.display()
+                )),
+            )
+        })?;
     if file_name.len() < 9 {
-        return Err(Error::InvalidFormat);
+        return Err(Report::new(DataIntegrityError::InvalidPayload)
+            .attach(format!("log file name is too short: {file_name}"))
+            .into());
     }
     // last 8 bytes are hex encoded.
-    let suffix = std::str::from_utf8(&file_name.as_bytes()[file_name.len() - 8..])?;
-    let file_seq = u32::from_str_radix(suffix, 16)?;
+    let suffix =
+        std::str::from_utf8(&file_name.as_bytes()[file_name.len() - 8..]).map_err(|_| {
+            Error::from(
+                Report::new(DataIntegrityError::InvalidPayload).attach(format!(
+                    "log file sequence suffix must be UTF-8: {file_name}"
+                )),
+            )
+        })?;
+    let file_seq = u32::from_str_radix(suffix, 16).map_err(|_| {
+        Error::from(
+            Report::new(DataIntegrityError::InvalidPayload)
+                .attach(format!("log file sequence suffix must be hex: {file_name}")),
+        )
+    })?;
     Ok(file_seq)
 }
 
@@ -1623,18 +1650,21 @@ mod tests {
 
             let res1 = commit1.join().unwrap();
             let res2 = commit2.join().unwrap();
-            assert!(matches!(
-                res1,
-                Err(Error::StorageEnginePoisoned(StoragePoisonSource::RedoWrite))
-            ));
-            assert!(matches!(
-                res2,
-                Err(Error::StorageEnginePoisoned(StoragePoisonSource::RedoWrite))
-            ));
-            assert!(matches!(
-                engine.trx_sys.ensure_runtime_healthy(),
-                Err(Error::StorageEnginePoisoned(StoragePoisonSource::RedoWrite))
-            ));
+            assert!(
+                res1.as_ref()
+                    .is_err_and(|err| err.is_storage_poisoned_by(StoragePoisonSource::RedoWrite))
+            );
+            assert!(
+                res2.as_ref()
+                    .is_err_and(|err| err.is_storage_poisoned_by(StoragePoisonSource::RedoWrite))
+            );
+            assert!(
+                engine
+                    .trx_sys
+                    .ensure_runtime_healthy()
+                    .as_ref()
+                    .is_err_and(|err| err.is_storage_poisoned_by(StoragePoisonSource::RedoWrite))
+            );
         });
     }
 
@@ -1673,18 +1703,21 @@ mod tests {
 
         let res1 = commit1.join().unwrap();
         let res2 = commit2.join().unwrap();
-        assert!(matches!(
-            res1,
-            Err(Error::StorageEnginePoisoned(StoragePoisonSource::RedoSync))
-        ));
-        assert!(matches!(
-            res2,
-            Err(Error::StorageEnginePoisoned(StoragePoisonSource::RedoSync))
-        ));
-        assert!(matches!(
-            engine.trx_sys.ensure_runtime_healthy(),
-            Err(Error::StorageEnginePoisoned(StoragePoisonSource::RedoSync))
-        ));
+        assert!(
+            res1.as_ref()
+                .is_err_and(|err| err.is_storage_poisoned_by(StoragePoisonSource::RedoSync))
+        );
+        assert!(
+            res2.as_ref()
+                .is_err_and(|err| err.is_storage_poisoned_by(StoragePoisonSource::RedoSync))
+        );
+        assert!(
+            engine
+                .trx_sys
+                .ensure_runtime_healthy()
+                .as_ref()
+                .is_err_and(|err| err.is_storage_poisoned_by(StoragePoisonSource::RedoSync))
+        );
     }
 
     #[test]

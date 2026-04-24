@@ -91,8 +91,8 @@ pub struct TransactionSystem {
     pub(crate) catalog: CachePadded<QuiescentGuard<Catalog>>,
     /// Storage-runtime poison flag for fatal storage background or durability failures.
     storage_poisoned: CachePadded<AtomicBool>,
-    /// First fatal storage error that poisoned runtime admission.
-    storage_poison_err: CachePadded<Mutex<Option<Error>>>,
+    /// First fatal storage source that poisoned runtime admission.
+    storage_poison_err: CachePadded<Mutex<Option<StoragePoisonSource>>>,
 }
 
 pub(crate) struct TransactionSystemWorkers;
@@ -138,7 +138,7 @@ impl TransactionSystem {
             guard.is_some(),
             "storage poison flag published before poison error was recorded"
         );
-        guard.as_ref().cloned()
+        guard.as_ref().copied().map(Error::storage_engine_poisoned)
     }
 
     /// Returns `Err` once a fatal storage failure poisoned runtime admission.
@@ -150,18 +150,18 @@ impl TransactionSystem {
         }
     }
 
-    /// Records the first fatal storage poison source and returns the shared poison error.
+    /// Records the first fatal storage poison source and returns a fresh poison error.
     #[inline]
     pub fn poison_storage(&self, source: StoragePoisonSource) -> Error {
-        let err = Error::StorageEnginePoisoned(source);
         {
             let mut guard = self.storage_poison_err.lock();
             if guard.is_none() {
-                *guard = Some(err.clone());
+                *guard = Some(source);
             }
         }
         self.storage_poisoned.swap(true, Ordering::AcqRel);
-        self.storage_poison_error().unwrap_or(err)
+        self.storage_poison_error()
+            .unwrap_or_else(|| Error::storage_engine_poisoned(source))
     }
 
     /// Create a new transaction.
@@ -504,7 +504,7 @@ impl Component for TransactionSystemWorkers {
         let trx_sys = registry.dependency::<TransactionSystem>()?;
         let startup = shelf
             .take::<TransactionSystem>()
-            .ok_or(Error::InvalidState)?;
+            .ok_or(Error::invalid_state())?;
         registry.register::<Self>(startup.start(trx_sys))
     }
 
@@ -657,23 +657,20 @@ mod tests {
             drop(blocked);
 
             let err = handle.join().unwrap();
-            assert!(matches!(
-                err,
-                Error::StorageEnginePoisoned(StoragePoisonSource::RedoSubmit)
-            ));
+            assert!(err.is_storage_poisoned_by(StoragePoisonSource::RedoSubmit));
             assert!(trx_sys.storage_poisoned.load(Ordering::Acquire));
-            assert!(matches!(
-                trx_sys.storage_poison_error(),
-                Some(Error::StorageEnginePoisoned(
-                    StoragePoisonSource::RedoSubmit
-                ))
-            ));
-            assert!(matches!(
-                trx_sys.ensure_runtime_healthy(),
-                Err(Error::StorageEnginePoisoned(
-                    StoragePoisonSource::RedoSubmit
-                ))
-            ));
+            assert!(
+                trx_sys
+                    .storage_poison_error()
+                    .as_ref()
+                    .is_some_and(|err| err.is_storage_poisoned_by(StoragePoisonSource::RedoSubmit))
+            );
+            assert!(
+                trx_sys
+                    .ensure_runtime_healthy()
+                    .as_ref()
+                    .is_err_and(|err| err.is_storage_poisoned_by(StoragePoisonSource::RedoSubmit))
+            );
 
             drop(trx_sys);
             drop(engine);
@@ -720,26 +717,25 @@ mod tests {
             let err_a = worker_a.join().unwrap();
             let err_b = worker_b.join().unwrap();
             let stored = trx_sys.storage_poison_error().unwrap();
-            let err_a_source = match err_a {
-                Error::StorageEnginePoisoned(source) => source,
-                other => panic!("expected poison error, got {other:?}"),
-            };
-            let err_b_source = match err_b {
-                Error::StorageEnginePoisoned(source) => source,
-                other => panic!("expected poison error, got {other:?}"),
-            };
-            let stored_source = match stored {
-                Error::StorageEnginePoisoned(source) => source,
-                other => panic!("expected poison error, got {other:?}"),
-            };
+            let err_a_source = err_a
+                .storage_poison_source()
+                .unwrap_or_else(|| panic!("expected poison error, got {err_a:?}"));
+            let err_b_source = err_b
+                .storage_poison_source()
+                .unwrap_or_else(|| panic!("expected poison error, got {err_b:?}"));
+            let stored_source = stored
+                .storage_poison_source()
+                .unwrap_or_else(|| panic!("expected poison error, got {stored:?}"));
 
             assert!(trx_sys.storage_poisoned.load(Ordering::Acquire));
             assert_eq!(err_a_source, err_b_source);
             assert_eq!(stored_source, err_a_source);
-            assert!(matches!(
-                trx_sys.ensure_runtime_healthy(),
-                Err(Error::StorageEnginePoisoned(source)) if source == stored_source
-            ));
+            assert!(
+                trx_sys
+                    .ensure_runtime_healthy()
+                    .as_ref()
+                    .is_err_and(|err| err.is_storage_poisoned_by(stored_source))
+            );
             assert!(matches!(
                 stored_source,
                 StoragePoisonSource::RedoSubmit | StoragePoisonSource::RedoSync

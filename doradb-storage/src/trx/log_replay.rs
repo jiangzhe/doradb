@@ -1,9 +1,10 @@
-use crate::error::{Error, Result};
+use crate::error::{DataIntegrityError, Result};
 use crate::io::{DirectBuf, IOBuf};
 use crate::io::{STORAGE_SECTOR_SIZE, align_to_sector_size};
 use crate::serde::{Deser, LenPrefixPod, Ser, Serde};
 use crate::trx::log::LogPartitionInitializer;
 use crate::trx::redo::{RedoHeader, RedoLogs};
+use error_stack::Report;
 use memmap2::Mmap;
 use std::collections::{BinaryHeap, VecDeque};
 use std::fs::File;
@@ -174,7 +175,9 @@ impl LogPartitionStream {
             // fill buffer by reading current log file.
             if let Some(reader) = self.reader.as_mut() {
                 match reader.read() {
-                    ReadLog::DataCorrupted => return Err(Error::LogFileCorrupted),
+                    ReadLog::DataCorrupted => {
+                        return Err(Report::new(DataIntegrityError::LogFileCorrupted).into());
+                    }
                     ReadLog::Some(mut log_group) => {
                         while let Some(res) = log_group.try_next()? {
                             self.buffer.push_back(res);

@@ -203,27 +203,27 @@ impl EvictableBufferPool {
                 smol::future::yield_now().await;
             }
             DispatchAction::Shutdown => {
-                return Err(Error::StorageEngineShutdown);
+                return Err(Error::storage_engine_shutdown());
             }
             DispatchAction::Wait(completion) => {
-                completion.wait_result().await?;
+                completion.wait_result_fresh().await?;
             }
             DispatchAction::WaitForLoad(listener) => {
                 listener.await;
                 // Wakeups can come from shutdown as well as real load progress.
                 if self.shutdown_flag.load(Ordering::Acquire) {
-                    return Err(Error::StorageEngineShutdown);
+                    return Err(Error::storage_engine_shutdown());
                 }
                 self.in_mem.load_ev.notify(1);
             }
             DispatchAction::SendRead { req, completion } => {
                 if let Err(send_err) = self.fs.send_pool_read_async(self.role, req).await {
                     let failed_req = send_err.0;
-                    failed_req.fail(Error::SendError);
+                    failed_req.fail(Error::send_error());
                     self.in_mem.load_ev.notify(1);
-                    return Err(Error::SendError);
+                    return Err(Error::send_error());
                 }
-                completion.wait_result().await?;
+                completion.wait_result_fresh().await?;
             }
         }
         Ok(())
@@ -275,7 +275,7 @@ impl EvictableBufferPool {
     #[inline]
     async fn reserve_page(&self) -> Result<()> {
         if self.shutdown_flag.load(Ordering::Acquire) {
-            return Err(Error::StorageEngineShutdown);
+            return Err(Error::storage_engine_shutdown());
         }
         if self.in_mem.try_inc() {
             // `reserve_page()` only acquires in-memory budget. Callers that later
@@ -289,7 +289,7 @@ impl EvictableBufferPool {
             listener!(self.in_mem.load_ev => listener);
             // Check after listener registration so shutdown cannot strand this waiter.
             if self.shutdown_flag.load(Ordering::Acquire) {
-                return Err(Error::StorageEngineShutdown);
+                return Err(Error::storage_engine_shutdown());
             }
             if self.in_mem.try_inc() {
                 self.in_mem.record_alloc_success();
@@ -302,7 +302,7 @@ impl EvictableBufferPool {
             listener.await;
             // Wakeups can come from shutdown as well as real memory progress.
             if self.shutdown_flag.load(Ordering::Acquire) {
-                return Err(Error::StorageEngineShutdown);
+                return Err(Error::storage_engine_shutdown());
             }
         }
     }
@@ -348,7 +348,7 @@ impl BufferPool for EvictableBufferPool {
                         // but we have not acquired a page id yet, so release the reservation
                         // before surfacing shutdown to the caller.
                         self.in_mem.dec();
-                        return Err(Error::StorageEngineShutdown);
+                        return Err(Error::storage_engine_shutdown());
                     }
                     // re-check
                     if let Some(page_id) = self.alloc_map.try_allocate() {
@@ -363,7 +363,7 @@ impl BufferPool for EvictableBufferPool {
                     listener.await;
                     // Wakeups can come from shutdown as well as page deallocation.
                     if self.shutdown_flag.load(Ordering::Acquire) {
-                        return Err(Error::StorageEngineShutdown);
+                        return Err(Error::storage_engine_shutdown());
                     }
                 }
             }
@@ -383,7 +383,7 @@ impl BufferPool for EvictableBufferPool {
             Ok(self.arena.init_page(guard, page_id))
         } else {
             self.in_mem.dec();
-            Err(Error::BufferPageAlreadyAllocated)
+            Err(Error::buffer_page_already_allocated())
         }
     }
 
@@ -732,7 +732,7 @@ impl IOStateMachine for EvictablePoolStateMachine {
                 let _ = block_key;
                 let err = match res {
                     Ok(len) if len == PAGE_SIZE => None,
-                    Ok(_) => Some(Error::ShortIO),
+                    Ok(_) => Some(Error::short_io()),
                     Err(err) => Some(err.into()),
                 };
                 if let Some(err) = err {
@@ -800,7 +800,7 @@ impl EvictableRuntime {
                 self.pool.inflight_io.fail_writeback(
                     &self.pool.stats,
                     page_guard,
-                    Error::SendError,
+                    Error::send_error(),
                 );
             }
             drop(done_ev);
@@ -1216,7 +1216,7 @@ impl EvictReadSubmission {
             }
             Ok(_) => {
                 drop(self.reservation.take());
-                Err(Error::ShortIO)
+                Err(Error::short_io())
             }
             Err(err) => {
                 drop(self.reservation.take());
@@ -1271,7 +1271,7 @@ impl Drop for EvictReadSubmission {
         drop(self.reservation.take());
         self.stats.add_completed_reads(1);
         self.stats.add_read_errors(1);
-        self.complete_waiters(Err(Error::InternalError));
+        self.complete_waiters(Err(Error::internal()));
     }
 }
 
@@ -1282,7 +1282,8 @@ pub(crate) fn build_pool_with_swap_file_field(
     fs: QuiescentGuard<FileSystem>,
 ) -> Result<(EvictableBufferPool, SparseFile)> {
     config.role.assert_valid("evictable buffer pool");
-    validate_swap_file_path_candidate(swap_file_field_name, &config.data_swap_file)?;
+    validate_swap_file_path_candidate(swap_file_field_name, &config.data_swap_file)
+        .map_err(Error::from)?;
     // 1. Calculate memory usage.
     let max_file_size = config.max_file_size.as_u64() as usize;
     let max_mem_size = config.max_mem_size.as_u64() as usize;
@@ -1300,7 +1301,7 @@ pub(crate) fn build_pool_with_swap_file_field(
     );
     let max_nbr_in_mem = (max_mem_size - frame_total_bytes) / mem::size_of::<Page>();
     if max_nbr_in_mem < MIN_IN_MEM_PAGES {
-        return Err(Error::BufferPoolSizeTooSmall);
+        return Err(Error::buffer_pool_size_too_small());
     }
     let eviction_arbiter = config.eviction_arbiter_builder.build(max_nbr_in_mem);
 
@@ -1308,7 +1309,8 @@ pub(crate) fn build_pool_with_swap_file_field(
     let arena = QuiescentArena::new(max_nbr)?;
 
     // 3. Create the swap file and retain the opened descriptor for worker-owned IO.
-    let swap_file_path = path_to_utf8(&config.data_swap_file, swap_file_field_name)?;
+    let swap_file_path =
+        path_to_utf8(&config.data_swap_file, swap_file_field_name).map_err(Error::from)?;
     let file = SparseFile::create_or_trunc(
         swap_file_path,
         max_file_size,
@@ -1375,7 +1377,7 @@ impl InflightIO {
                             completion: Some(Arc::clone(&completion)),
                         });
                         drop(g); // explicit drop guard before await.
-                        completion.wait_result().await.map(|_| ())?;
+                        completion.wait_result_fresh().await.map(|_| ())?;
                     }
                     // In any other kind, we let caller retry.
                     FrameKind::Cool
@@ -1398,7 +1400,7 @@ impl InflightIO {
                     .get_or_insert_with(|| Arc::new(PageIOCompletion::new()))
                     .clone();
                 drop(g); // explicitly drop guard before await.
-                completion.wait_result().await.map(|_| ())?;
+                completion.wait_result_fresh().await.map(|_| ())?;
             }
         }
         Ok(())
@@ -1490,6 +1492,7 @@ pub(crate) mod tests {
     use crate::buffer::test_page_id;
     use crate::conf::{EngineConfig, FileSystemConfig, TrxSysConfig};
     use crate::engine::Engine;
+    use crate::error::{ConfigError, ErrorKind};
     use crate::file::fs::FileSystem;
     use crate::file::fs::tests::{
         build_test_fs_owner_in, io_backend_stats_handle_identity as fs_stats_handle_identity,
@@ -1924,10 +1927,13 @@ pub(crate) mod tests {
 
             assert_eq!(kind, StorageIOKind::Write);
             assert_eq!(owner.arena.frame(page_id).kind(), FrameKind::Hot);
-            assert!(matches!(
-                completion.wait_result().await,
-                Err(Error::IOError { .. })
-            ));
+            assert!(
+                completion
+                    .wait_result_fresh()
+                    .await
+                    .as_ref()
+                    .is_err_and(|err| err.is_code(crate::error::ErrorCode::IOError))
+            );
             assert_eq!(owner.inflight_io.writes.load(Ordering::Relaxed), 0);
             assert!(!owner.inflight_io.map.lock().contains_key(&page_id));
 
@@ -2052,10 +2058,13 @@ pub(crate) mod tests {
                 Err(std::io::Error::from_raw_os_error(libc::EIO)),
             );
             assert_eq!(kind, StorageIOKind::Write);
-            assert!(matches!(
-                completion.wait_result().await,
-                Err(Error::IOError { .. })
-            ));
+            assert!(
+                completion
+                    .wait_result_fresh()
+                    .await
+                    .as_ref()
+                    .is_err_and(|err| err.is_code(crate::error::ErrorCode::IOError))
+            );
 
             assert_eq!(owner.arena.frame(page_id).kind(), FrameKind::Hot);
             assert!(
@@ -2452,13 +2461,11 @@ pub(crate) mod tests {
             Ok(_) => panic!("expected invalid storage path"),
             Err(err) => err,
         };
-        match err {
-            Error::InvalidStoragePath(msg) => {
-                assert!(msg.contains("data_swap_file"));
-                assert!(msg.contains(".swp"));
-            }
-            err => panic!("expected invalid storage path, got {err:?}"),
-        }
+        assert!(err.is_kind(ErrorKind::Config));
+        assert_eq!(
+            err.config_error(),
+            Some(ConfigError::PathMustUseRequiredSuffix)
+        );
     }
 
     #[test]
@@ -2473,12 +2480,10 @@ pub(crate) mod tests {
             Ok(_) => panic!("expected invalid storage path"),
             Err(err) => err,
         };
-        match err {
-            Error::InvalidStoragePath(msg) => {
-                assert!(msg.contains("index_swap_file"));
-                assert!(msg.contains(".swp"));
-            }
-            err => panic!("expected invalid storage path, got {err:?}"),
-        }
+        assert!(err.is_kind(ErrorKind::Config));
+        assert_eq!(
+            err.config_error(),
+            Some(ConfigError::PathMustUseRequiredSuffix)
+        );
     }
 }

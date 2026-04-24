@@ -90,7 +90,7 @@ impl Session {
         index_specs: Vec<IndexSpec>,
     ) -> Result<TableID> {
         if self.in_trx() {
-            return Err(Error::NotSupported("implicit commit due to DDL"));
+            return Err(Error::not_supported("implicit commit due to DDL"));
         }
 
         let engine = self.state.engine().clone();
@@ -163,7 +163,7 @@ impl Session {
         if !inserted {
             uninit_table_file.try_delete();
             stmt.fail().await?.rollback().await?;
-            return Err(Error::TableAlreadyExists);
+            return Err(Error::table_already_exists());
         }
 
         for column_object in column_objects {

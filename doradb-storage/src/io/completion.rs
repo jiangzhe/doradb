@@ -72,6 +72,33 @@ impl<T: Clone> Completion<T> {
     }
 }
 
+impl<T: Clone> Completion<crate::error::Result<T>> {
+    /// Returns the terminal result, reconstructing an equivalent error report
+    /// when the completed value is an error.
+    #[inline]
+    pub fn completed_result_fresh(&self) -> Option<crate::error::Result<T>> {
+        let state = self.state.lock();
+        match &*state {
+            CompletionState::Running => None,
+            CompletionState::Completed(Ok(value)) => Some(Ok(value.clone())),
+            CompletionState::Completed(Err(err)) => Some(Err(err.duplicate())),
+        }
+    }
+
+    /// Waits until completion and returns a fresh equivalent error report when
+    /// the terminal value is an error.
+    #[inline]
+    pub async fn wait_result_fresh(&self) -> crate::error::Result<T> {
+        loop {
+            listener!(self.ev => listener);
+            if let Some(value) = self.completed_result_fresh() {
+                return value;
+            }
+            listener.await;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::Completion;

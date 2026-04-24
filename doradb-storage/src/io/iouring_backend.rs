@@ -23,12 +23,12 @@ impl IouringBackend {
     #[inline]
     pub fn new(max_events: usize) -> Result<Self> {
         if max_events == 0 {
-            return Err(Error::InvalidArgument);
+            return Err(Error::invalid_argument());
         }
         let ring_entries = max_events
             .checked_next_power_of_two()
-            .ok_or(Error::InvalidArgument)?;
-        let ring_entries = u32::try_from(ring_entries).map_err(|_| Error::InvalidArgument)?;
+            .ok_or(Error::invalid_argument())?;
+        let ring_entries = u32::try_from(ring_entries).map_err(|_| Error::invalid_argument())?;
         let ring = IoUring::new(ring_entries)
             .map_err(|err| Error::storage_io_error(StorageOp::BackendSetup, err))?;
         Ok(IouringBackend {
@@ -446,17 +446,19 @@ mod tests {
 
     #[test]
     fn test_iouring_backend_rejects_zero_depth_as_invalid_argument() {
-        assert!(matches!(
-            IouringBackend::new(0),
-            Err(Error::InvalidArgument)
-        ));
+        assert!(
+            IouringBackend::new(0)
+                .as_ref()
+                .is_err_and(|err| err.is_code(crate::error::ErrorCode::InvalidArgument))
+        );
     }
 
     #[test]
     fn test_iouring_backend_rejects_ring_entry_overflow_as_invalid_argument() {
-        assert!(matches!(
-            IouringBackend::new((u32::MAX as usize) + 1),
-            Err(Error::InvalidArgument)
-        ));
+        assert!(
+            IouringBackend::new((u32::MAX as usize) + 1)
+                .as_ref()
+                .is_err_and(|err| err.is_code(crate::error::ErrorCode::InvalidArgument))
+        );
     }
 }

@@ -1,7 +1,7 @@
 use crate::bitmap::AllocMap;
 use crate::buffer::ReadonlyBufferPool;
 use crate::catalog::{TableID, table::TableMetadata};
-use crate::error::{BlockCorruptionCause, BlockKind, Error, FileKind, Result};
+use crate::error::{DataIntegrityError, Error, FileKind, Result};
 use crate::file::block_integrity::{
     BLOCK_INTEGRITY_HEADER_SIZE, BlockIntegritySpec, max_payload_len, validate_block,
     write_block_checksum, write_block_header,
@@ -26,6 +26,7 @@ use crate::quiescent::QuiescentGuard;
 use crate::row::RowID;
 use crate::serde::{Deser, Ser};
 use crate::trx::{MIN_SNAPSHOT_TS, TrxID};
+use error_stack::{Report, ResultExt};
 use futures::future::try_join_all;
 use std::mem;
 use std::sync::Arc;
@@ -134,17 +135,25 @@ fn parse_table_super_block(buf: &[u8]) -> Result<SuperBlock> {
 
 #[inline]
 fn parse_table_meta_block(page_id: BlockID, buf: &[u8]) -> Result<ParsedMeta<TableMeta>> {
-    let payload = validate_block(buf, TABLE_META_BLOCK_SPEC).map_err(|cause| {
-        Error::block_corrupted(FileKind::TableFile, BlockKind::TableMeta, page_id, cause)
-    })?;
-    let (_, meta_block) = MetaBlock::deser(payload, 0).map_err(|err| match err {
-        Error::InvalidFormat => Error::block_corrupted(
-            FileKind::TableFile,
-            BlockKind::TableMeta,
-            page_id,
-            BlockCorruptionCause::InvalidPayload,
-        ),
-        other => other,
+    let payload = validate_block(buf, TABLE_META_BLOCK_SPEC)
+        .attach_with(|| {
+            format!(
+                "file={}, block=table-meta, block_id={page_id}",
+                FileKind::TableFile
+            )
+        })
+        .map_err(Error::from)?;
+    let (_, meta_block) = MetaBlock::deser(payload, 0).map_err(|err| {
+        if err.data_integrity_error().is_some() {
+            Report::new(DataIntegrityError::InvalidPayload)
+                .attach(format!(
+                    "file={}, block=table-meta, block_id={page_id}",
+                    FileKind::TableFile
+                ))
+                .into()
+        } else {
+            err
+        }
     })?;
     Ok(ParsedMeta {
         meta: TableMeta {
@@ -166,7 +175,7 @@ fn validate_table_root(meta_block_id: BlockID, parsed_meta: &ParsedMeta<TableMet
         &parsed_meta.alloc_map,
         meta_block_id,
         FileKind::TableFile,
-        BlockKind::TableMeta,
+        "table-meta",
     )
 }
 
@@ -176,7 +185,7 @@ fn build_table_meta_block(root: &ActiveRoot) -> Result<DirectBuf> {
     let mut meta_buf = DirectBuf::zeroed(COW_FILE_PAGE_SIZE);
     let meta_len = meta_block.ser_len();
     if meta_len > max_payload_len(COW_FILE_PAGE_SIZE) {
-        return Err(Error::InvalidState);
+        return Err(Error::invalid_state());
     }
     let meta_idx = write_block_header(meta_buf.as_bytes_mut(), TABLE_META_BLOCK_SPEC);
     let meta_idx = meta_block.ser(meta_buf.as_bytes_mut(), meta_idx);
@@ -414,7 +423,7 @@ impl MutableTableFile {
             .secondary_index_roots
             .get(index_no)
             .copied()
-            .ok_or(Error::InvalidArgument)
+            .ok_or(Error::invalid_argument())
     }
 
     /// Updates one mutable-root secondary DiskTree root by index number.
@@ -425,7 +434,7 @@ impl MutableTableFile {
         root_block_id: BlockID,
     ) -> Result<()> {
         let roots = &mut self.new_root_mut().secondary_index_roots;
-        let root = roots.get_mut(index_no).ok_or(Error::InvalidArgument)?;
+        let root = roots.get_mut(index_no).ok_or(Error::invalid_argument())?;
         *root = root_block_id;
         Ok(())
     }
@@ -434,7 +443,7 @@ impl MutableTableFile {
     #[inline]
     pub fn set_secondary_index_roots(&mut self, roots: Vec<BlockID>) -> Result<()> {
         if roots.len() != self.root().metadata.index_specs.len() {
-            return Err(Error::InvalidArgument);
+            return Err(Error::invalid_argument());
         }
         self.new_root_mut().secondary_index_roots = roots;
         Ok(())
@@ -449,7 +458,7 @@ impl MutableTableFile {
     ) -> Result<()> {
         let root = self.new_root_mut();
         if pivot_row_id < root.pivot_row_id {
-            return Err(Error::InvalidArgument);
+            return Err(Error::invalid_argument());
         }
         root.pivot_row_id = pivot_row_id;
         root.heap_redo_start_ts = heap_redo_start_ts;
@@ -470,7 +479,7 @@ impl MutableTableFile {
     pub fn allocate_block_id(&mut self) -> Result<BlockID> {
         self.new_root_mut()
             .try_allocate_block_id()
-            .ok_or(Error::InvalidState)
+            .ok_or(Error::invalid_state())
     }
 
     /// Roll back a block id allocated by this unpublished mutable root.
@@ -560,10 +569,10 @@ impl MutableTableFile {
             let block_id = self
                 .new_root_mut()
                 .try_allocate_block_id()
-                .ok_or(Error::InvalidState)?;
+                .ok_or(Error::invalid_state())?;
             max_row_id = max_row_id.max(end_row_id);
             if start_row_id < last_end {
-                return Err(Error::InvalidArgument);
+                return Err(Error::invalid_argument());
             }
             last_end = end_row_id;
             new_entries.push(block.shape.with_block_id(block_id));
@@ -671,7 +680,7 @@ mod tests {
         PoolRole, ReadonlyBufferPool, global_readonly_pool_scope, table_readonly_pool,
     };
     use crate::catalog::{ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexSpec};
-    use crate::error::{BlockCorruptionCause, BlockKind, Error, FileKind};
+    use crate::error::{DataIntegrityError, Error, FileKind};
     use crate::file::block_integrity::BLOCK_INTEGRITY_TRAILER_SIZE;
     use crate::file::{build_test_fs, build_test_fs_in, test_block_id};
     use crate::io::IOBuf;
@@ -753,7 +762,7 @@ mod tests {
             let err = mutable
                 .set_secondary_index_roots(vec![SUPER_BLOCK_ID, secondary_root])
                 .unwrap_err();
-            assert!(matches!(err, Error::InvalidArgument));
+            assert!(err.is_code(crate::error::ErrorCode::InvalidArgument));
             let (table_file3, old_root) = mutable.commit(2, false).await.unwrap();
             drop(old_root);
             let active_root = table_file3
@@ -791,7 +800,7 @@ mod tests {
             let err = mutable
                 .rollback_allocated_block_id(inherited_root)
                 .unwrap_err();
-            assert!(matches!(err, Error::InvalidState));
+            assert!(err.is_code(crate::error::ErrorCode::InvalidState));
             assert_eq!(mutable.root().alloc_map.allocated(), allocated_before);
 
             let fresh_block = mutable.allocate_block_id().unwrap();
@@ -802,7 +811,7 @@ mod tests {
             let err = mutable
                 .rollback_allocated_block_id(fresh_block)
                 .unwrap_err();
-            assert!(matches!(err, Error::InvalidState));
+            assert!(err.is_code(crate::error::ErrorCode::InvalidState));
 
             drop(mutable);
             drop(table_file);
@@ -916,16 +925,12 @@ mod tests {
         file.sync_all().unwrap();
     }
 
-    fn assert_table_meta_corruption(err: Error, page_id: BlockID, cause: BlockCorruptionCause) {
-        assert!(matches!(
-            err,
-            Error::BlockCorrupted {
-                file_kind: FileKind::TableFile,
-                block_kind: BlockKind::TableMeta,
-                block_id: actual_page_id,
-                cause: actual_cause,
-            } if actual_page_id == page_id && actual_cause == cause
-        ));
+    fn assert_table_meta_corruption(err: Error, page_id: BlockID, expected: DataIntegrityError) {
+        assert_eq!(err.data_integrity_error(), Some(expected));
+        let report = format!("{err:?}");
+        assert!(report.contains("table-file"), "{report}");
+        assert!(report.contains("table-meta"), "{report}");
+        assert!(report.contains(&format!("block_id={page_id}")), "{report}");
     }
 
     #[test]
@@ -956,7 +961,7 @@ mod tests {
             assert_table_meta_corruption(
                 err,
                 active_meta_block_id,
-                BlockCorruptionCause::ChecksumMismatch,
+                DataIntegrityError::ChecksumMismatch,
             );
         });
     }
@@ -993,7 +998,7 @@ mod tests {
             assert_table_meta_corruption(
                 err,
                 active_meta_block_id,
-                BlockCorruptionCause::InvalidVersion,
+                DataIntegrityError::InvalidVersion,
             );
         });
     }
@@ -1091,7 +1096,11 @@ mod tests {
                 .persist_lwc_blocks(lwc_blocks, 7, 2, disk_pool.global_pool())
                 .await;
 
-            assert!(matches!(result, Err(Error::InvalidArgument)));
+            assert!(
+                result
+                    .as_ref()
+                    .is_err_and(|err| err.is_code(crate::error::ErrorCode::InvalidArgument))
+            );
             let active_root = table_file.active_root_unchecked();
             assert_eq!(active_root.pivot_row_id, 0);
             assert_eq!(active_root.column_block_index_root, SUPER_BLOCK_ID);

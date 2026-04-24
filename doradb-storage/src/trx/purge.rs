@@ -645,7 +645,7 @@ mod tests {
     use crate::buffer::{BufferPool, PoolGuards, PoolRole};
     use crate::catalog::tests::table1;
     use crate::conf::{EngineConfig, EvictableBufferPoolConfig, TrxSysConfig};
-    use crate::error::{Error, StoragePoisonSource};
+    use crate::error::StoragePoisonSource;
     use crate::file::cow_file::BlockID;
     use crate::index::{RowLocation, UniqueIndex};
     use crate::latch::LatchFallbackMode;
@@ -763,18 +763,16 @@ mod tests {
                 &engine.trx_sys,
                 Err(std::io::Error::from_raw_os_error(libc::EIO).into())
             ));
-            assert!(matches!(
-                engine.trx_sys.storage_poison_error(),
-                Some(Error::StorageEnginePoisoned(
-                    StoragePoisonSource::PurgeDeallocate
-                ))
-            ));
-            assert!(matches!(
-                engine.trx_sys.ensure_runtime_healthy(),
-                Err(Error::StorageEnginePoisoned(
-                    StoragePoisonSource::PurgeDeallocate
-                ))
-            ));
+            assert!(
+                engine.trx_sys.storage_poison_error().as_ref().is_some_and(
+                    |err| err.is_storage_poisoned_by(StoragePoisonSource::PurgeDeallocate)
+                )
+            );
+            assert!(
+                engine.trx_sys.ensure_runtime_healthy().as_ref().is_err_and(
+                    |err| err.is_storage_poisoned_by(StoragePoisonSource::PurgeDeallocate)
+                )
+            );
         });
     }
 

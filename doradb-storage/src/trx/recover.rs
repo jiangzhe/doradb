@@ -122,7 +122,7 @@ pub(crate) async fn log_recover(
     let next_trx_ts = max_recovered_cts
         .checked_add(1)
         .filter(|ts| *ts < MAX_SNAPSHOT_TS)
-        .ok_or(Error::InvalidState)?;
+        .ok_or(Error::invalid_state())?;
     log_partition_initializers = log_streams
         .into_iter()
         .map(|s| s.into_initializer())
@@ -279,7 +279,7 @@ impl<'a> LogRecovery<'a> {
             let state = self
                 .table_states
                 .get(&table.table_id)
-                .ok_or(Error::TableNotFound)?;
+                .ok_or(Error::table_not_found())?;
             self.replay_floor = self.replay_floor.min(state.replay_start_ts());
         }
         Ok(())
@@ -295,7 +295,7 @@ impl<'a> LogRecovery<'a> {
             .catalog
             .get_table(table_id)
             .await
-            .ok_or(Error::TableNotFound)?;
+            .ok_or(Error::table_not_found())?;
         // `recovery_bootstrap_unchecked`: recovery records replay floors from
         // the table root loaded during restart, before normal transactions run.
         let active_root = table.file().active_root_unchecked();
@@ -309,7 +309,7 @@ impl<'a> LogRecovery<'a> {
             .max(state.deletion_cutoff_ts);
         let old = self.table_states.insert(table_id, state);
         if old.is_some() {
-            return Err(Error::TableAlreadyExists);
+            return Err(Error::table_already_exists());
         }
         Ok(())
     }
@@ -319,7 +319,7 @@ impl<'a> LogRecovery<'a> {
         self.table_states
             .get(&table_id)
             .map(|state| state.heap_redo_start_ts)
-            .ok_or(Error::TableNotFound)
+            .ok_or(Error::table_not_found())
     }
 
     #[inline]
@@ -327,7 +327,7 @@ impl<'a> LogRecovery<'a> {
         self.table_states
             .get(&table_id)
             .map(|state| state.deletion_cutoff_ts)
-            .ok_or(Error::TableNotFound)
+            .ok_or(Error::table_not_found())
     }
 
     #[inline]
@@ -335,7 +335,7 @@ impl<'a> LogRecovery<'a> {
         self.table_states
             .get(&table_id)
             .map(|state| state.replay_start_ts())
-            .ok_or(Error::TableNotFound)
+            .ok_or(Error::table_not_found())
     }
 
     async fn replay_log(&mut self, log: TrxLog) -> Result<()> {
@@ -434,7 +434,7 @@ impl<'a> LogRecovery<'a> {
                 }
                 self.replay_catalog_modifications(dml).await?;
                 if self.catalog.remove_user_table(*table_id).is_none() {
-                    return Err(Error::TableNotFound);
+                    return Err(Error::table_not_found());
                 }
                 self.table_states.remove(table_id);
                 self.recovered_tables.remove(table_id);
@@ -455,7 +455,7 @@ impl<'a> LogRecovery<'a> {
                     .catalog
                     .get_table(*table_id)
                     .await
-                    .ok_or(Error::TableNotFound)?;
+                    .ok_or(Error::table_not_found())?;
                 let count = end_row_id - start_row_id;
                 let mut page_guard = table
                     .allocate_row_page_at(&self.pool_guards, count as usize, *page_id)
@@ -488,7 +488,7 @@ impl<'a> LogRecovery<'a> {
                     .catalog
                     .get_table(*table_id)
                     .await
-                    .ok_or(Error::TableNotFound)?;
+                    .ok_or(Error::table_not_found())?;
             }
             _ => todo!(),
         }
@@ -520,7 +520,7 @@ impl<'a> LogRecovery<'a> {
                 let table = self
                     .catalog
                     .get_catalog_table(table_id)
-                    .ok_or(Error::TableNotFound)?;
+                    .ok_or(Error::table_not_found())?;
                 self.replay_catalog_table_modifications(&table, &table_dml.rows)
                     .await?;
                 continue;
@@ -532,7 +532,7 @@ impl<'a> LogRecovery<'a> {
                 .catalog
                 .get_table(table_id)
                 .await
-                .ok_or(Error::TableNotFound)?;
+                .ok_or(Error::table_not_found())?;
             self.replay_table_dml(table_id, &table, &table_dml.rows, cts, disable_index)
                 .await?;
         }
@@ -549,7 +549,7 @@ impl<'a> LogRecovery<'a> {
             let table = self
                 .catalog
                 .get_catalog_table(table_id)
-                .ok_or(Error::TableNotFound)?;
+                .ok_or(Error::table_not_found())?;
             self.replay_catalog_table_modifications(&table, &table_dml.rows)
                 .await?;
         }
@@ -658,7 +658,7 @@ mod tests {
         TableMetadata, TableSpec,
     };
     use crate::conf::{EngineConfig, EvictableBufferPoolConfig, FileSystemConfig, TrxSysConfig};
-    use crate::error::{BlockCorruptionCause, BlockKind, Error, FileKind};
+    use crate::error::{DataIntegrityError, Error};
     use crate::file::block_integrity::{BLOCK_INTEGRITY_HEADER_SIZE, write_block_checksum};
     use crate::file::cow_file::COW_FILE_PAGE_SIZE;
     use crate::index::{
@@ -679,6 +679,19 @@ mod tests {
     const LIGHTWEIGHT_RECOVERY_BUFFER_BYTES: usize = 16 * 1024 * 1024;
     const LIGHTWEIGHT_RECOVERY_MAX_FILE_BYTES: usize = 32 * 1024 * 1024;
     const LIGHTWEIGHT_RECOVERY_READONLY_BUFFER_BYTES: usize = 32 * 1024 * 1024;
+
+    fn assert_table_data_integrity(
+        err: Error,
+        block_kind: &str,
+        block_id: crate::file::BlockID,
+        expected: DataIntegrityError,
+    ) {
+        assert_eq!(err.data_integrity_error(), Some(expected));
+        let report = format!("{err:?}");
+        assert!(report.contains("table-file"), "{report}");
+        assert!(report.contains(block_kind), "{report}");
+        assert!(report.contains(&format!("block_id={block_id}")), "{report}");
+    }
 
     fn lightweight_recovery_engine_config(
         main_dir: impl Into<std::path::PathBuf>,
@@ -2136,15 +2149,16 @@ mod tests {
             let stmt = trx.start_stmt();
             let key = SelectKey::new(0, vec![Val::from(7u32)]);
             let res = stmt_select_row_mvcc(&stmt, &table, &key, &[0, 1]).await;
-            match res {
-                Err(Error::BlockCorrupted {
-                    file_kind: FileKind::TableFile,
-                    block_kind: BlockKind::LwcBlock,
-                    block_id: page_id,
-                    cause: BlockCorruptionCause::ChecksumMismatch,
-                }) => assert_eq!(page_id, block_id),
+            let err = match res {
+                Err(err) => err,
                 other => panic!("expected persisted LWC corruption on read, got {other:?}"),
-            }
+            };
+            assert_table_data_integrity(
+                err,
+                "lwc-block",
+                block_id,
+                DataIntegrityError::ChecksumMismatch,
+            );
             trx = stmt.fail().await.unwrap();
             trx.rollback().await.unwrap();
 
@@ -2316,15 +2330,12 @@ mod tests {
                 Ok(_) => panic!("expected invalid delete blob on delta load"),
                 Err(err) => err,
             };
-            match err {
-                Error::BlockCorrupted {
-                    file_kind: FileKind::TableFile,
-                    block_kind: BlockKind::ColumnDeletionBlob,
-                    block_id: page_id,
-                    cause: BlockCorruptionCause::InvalidPayload,
-                } => assert_eq!(page_id, blob_ref.start_page_id),
-                other => panic!("expected invalid delete blob on delta load, got {other:?}"),
-            }
+            assert_table_data_integrity(
+                err,
+                "column-deletion-blob",
+                blob_ref.start_page_id,
+                DataIntegrityError::InvalidPayload,
+            );
 
             drop(table);
             drop(session);

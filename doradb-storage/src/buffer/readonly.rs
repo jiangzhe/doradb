@@ -84,7 +84,7 @@ impl ReadonlyBufferPool {
         let frame_plus_page = mem::size_of::<BufferFrame>() + mem::size_of::<Page>();
         let size = pool_size / frame_plus_page;
         if size < MIN_READONLY_POOL_PAGES {
-            return Err(Error::BufferPoolSizeTooSmall);
+            return Err(Error::buffer_pool_size_too_small());
         }
         let eviction_arbiter = eviction_arbiter_builder.build(size);
         let arena = QuiescentArena::new(size)?;
@@ -158,7 +158,7 @@ impl ReadonlyBufferPool {
     async fn reserve_frame_id_for_load(&self) -> Result<PageID> {
         loop {
             if self.shutdown_flag.load(Ordering::Acquire) {
-                return Err(Error::InvalidState);
+                return Err(Error::invalid_state());
             }
             if let Some(frame_id) = self.residency.try_reserve_frame() {
                 // Like the mutable pool, terminal shutdown does not try to reclaim
@@ -170,7 +170,7 @@ impl ReadonlyBufferPool {
             listener!(self.residency.free_ev => listener);
             // Check after listener registration so shutdown cannot strand this waiter.
             if self.shutdown_flag.load(Ordering::Acquire) {
-                return Err(Error::InvalidState);
+                return Err(Error::invalid_state());
             }
             if let Some(frame_id) = self.residency.try_reserve_frame() {
                 self.residency.record_alloc_success();
@@ -181,7 +181,7 @@ impl ReadonlyBufferPool {
             listener.await;
             // Wakeups can come from shutdown as well as real frame reclamation.
             if self.shutdown_flag.load(Ordering::Acquire) {
-                return Err(Error::InvalidState);
+                return Err(Error::invalid_state());
             }
         }
     }
@@ -223,7 +223,7 @@ impl ReadonlyBufferPool {
     /// Binds one persisted-block key to an exclusively locked frame.
     ///
     /// Binding is idempotent for the same key/frame pair and returns
-    /// `Error::InvalidState` for conflicting mapping attempts.
+    /// `Error::invalid_state()` for conflicting mapping attempts.
     #[inline]
     pub fn bind_frame(
         &self,
@@ -232,18 +232,18 @@ impl ReadonlyBufferPool {
     ) -> Result<()> {
         let frame_id = frame_guard.page_id();
         if usize::from(frame_id) >= self.size {
-            return Err(Error::InvalidArgument);
+            return Err(Error::invalid_argument());
         }
         let frame = frame_guard.bf_mut();
         let expected_frame = self.arena.frame(frame_id) as *const BufferFrame;
         if !std::ptr::eq(frame as *const BufferFrame, expected_frame) {
-            return Err(Error::InvalidArgument);
+            return Err(Error::invalid_argument());
         }
         let inserted = match self.mappings.entry(key) {
             Entry::Occupied(occ) => {
                 let existing = *occ.get();
                 if existing != frame_id {
-                    return Err(Error::InvalidState);
+                    return Err(Error::invalid_state());
                 }
                 return match frame.persisted_block_key() {
                     Some((file_id, block_id))
@@ -251,15 +251,15 @@ impl ReadonlyBufferPool {
                     {
                         Ok(())
                     }
-                    _ => Err(Error::InvalidState),
+                    _ => Err(Error::invalid_state()),
                 };
             }
             Entry::Vacant(vac) => {
                 if let Some((file_id, block_id)) = frame.persisted_block_key() {
                     if file_id != key.file_id || block_id != key.block_id {
-                        return Err(Error::InvalidState);
+                        return Err(Error::invalid_state());
                     }
-                    return Err(Error::InvalidState);
+                    return Err(Error::invalid_state());
                 }
                 vac.insert(frame_id);
                 true
@@ -462,7 +462,7 @@ impl ReadonlyBufferPool {
     ) -> Result<FacadePageGuard<T>> {
         self.validate_guard(guard);
         if usize::from(frame_id) >= self.size {
-            return Err(Error::InvalidArgument);
+            return Err(Error::invalid_argument());
         }
         let keepalive = guard.clone();
         let bf = self.arena.frame_ptr(frame_id);
@@ -545,7 +545,7 @@ impl ReadonlyPageReservation {
             Some(page_guard) => page_guard,
             None => {
                 pool.residency.release_free(frame_id);
-                return Err(Error::InvalidState);
+                return Err(Error::invalid_state());
             }
         };
         {
@@ -604,7 +604,7 @@ impl PageReservation for ReadonlyPageReservation {
             Entry::Vacant(vac) => {
                 vac.insert(frame_id);
             }
-            Entry::Occupied(_) => return Err(Error::InvalidState),
+            Entry::Occupied(_) => return Err(Error::invalid_state()),
         }
         drop(page_guard);
         pool.residency.mark_resident(frame_id);
@@ -743,7 +743,7 @@ impl ReadSubmission {
             }
             Ok(_) => {
                 drop(self.reservation.take());
-                Err(Error::ShortIO)
+                Err(Error::short_io())
             }
             Err(err) => {
                 drop(self.reservation.take());
@@ -775,7 +775,7 @@ impl Drop for ReadSubmission {
         drop(self.reservation.take());
         self.pool.stats.add_completed_reads(1);
         self.pool.stats.add_read_errors(1);
-        self.complete_inflight_once(Err(Error::InternalError));
+        self.complete_inflight_once(Err(Error::internal()));
     }
 }
 
@@ -1103,7 +1103,7 @@ impl QuiescentGuard<ReadonlyBufferPool> {
                             reservation,
                         );
                         if let Err(err) = self.send_read_async(req).await {
-                            err.into_inner().fail(Error::SendError);
+                            err.into_inner().fail(Error::send_error());
                         }
                     }
                     Err(err) => {
@@ -1133,7 +1133,7 @@ impl QuiescentGuard<ReadonlyBufferPool> {
             return Ok((frame_id, false));
         }
         inflight
-            .wait_result()
+            .wait_result_fresh()
             .await
             .map(|frame_id| (frame_id, false))
     }
@@ -1163,7 +1163,7 @@ impl QuiescentGuard<ReadonlyBufferPool> {
             return Ok((frame_id, false));
         }
         inflight
-            .wait_result()
+            .wait_result_fresh()
             .await
             .map(|frame_id| (frame_id, false))
     }
@@ -1228,7 +1228,7 @@ pub(crate) mod tests {
     use crate::catalog::TableID;
     use crate::catalog::{ColumnAttributes, ColumnSpec, TableMetadata, USER_OBJ_ID_START};
     use crate::conf::{EngineConfig, EvictableBufferPoolConfig, FileSystemConfig, TrxSysConfig};
-    use crate::error::{BlockCorruptionCause, BlockKind};
+    use crate::error::{DataIntegrityError, Error, FileKind};
     use crate::file::block_integrity::{
         BLOCK_INTEGRITY_HEADER_SIZE, COLUMN_BLOCK_INDEX_BLOCK_SPEC,
         COLUMN_DELETION_BLOB_BLOCK_SPEC, LWC_BLOCK_SPEC, max_payload_len, write_block_checksum,
@@ -1277,6 +1277,20 @@ pub(crate) mod tests {
             smol::Timer::after(TEST_WAIT_INTERVAL).await;
         }
         panic!("condition was not satisfied before timeout");
+    }
+
+    fn assert_data_integrity(
+        err: Error,
+        file_kind: FileKind,
+        block_kind: &str,
+        block_id: crate::file::cow_file::BlockID,
+        expected: DataIntegrityError,
+    ) {
+        assert_eq!(err.data_integrity_error(), Some(expected));
+        let report = format!("{err:?}");
+        assert!(report.contains(&file_kind.to_string()), "{report}");
+        assert!(report.contains(block_kind), "{report}");
+        assert!(report.contains(&format!("block_id={block_id}")), "{report}");
     }
 
     fn frame_page_bytes(cap: usize) -> usize {
@@ -1734,7 +1748,7 @@ pub(crate) mod tests {
         let err = global
             .bind_frame(BlockKey::new(test_file_id(7), test_block_id(12)), &mut g3)
             .unwrap_err();
-        assert!(matches!(err, Error::InvalidState));
+        assert!(err.is_code(crate::error::ErrorCode::InvalidState));
 
         drop(g3);
         assert_eq!(global.invalidate_key(&key), Some(test_page_id(3)));
@@ -1777,18 +1791,22 @@ pub(crate) mod tests {
                 reservation,
             );
 
-            submission.complete_inflight_once(Err(Error::SendError));
+            submission.complete_inflight_once(Err(Error::send_error()));
             assert!(submission.completed);
-            assert!(matches!(
-                inflight.completed_result(),
-                Some(Err(Error::SendError))
-            ));
+            assert!(
+                inflight
+                    .completed_result_fresh()
+                    .as_ref()
+                    .is_some_and(|res| res.as_ref().is_err_and(|err| err.is_send_error()))
+            );
 
             drop(submission);
-            assert!(matches!(
-                inflight.completed_result(),
-                Some(Err(Error::SendError))
-            ));
+            assert!(
+                inflight
+                    .completed_result_fresh()
+                    .as_ref()
+                    .is_some_and(|res| res.as_ref().is_err_and(|err| err.is_send_error()))
+            );
 
             drop(pool);
             drop(table_file);
@@ -1803,7 +1821,10 @@ pub(crate) mod tests {
         let temp_dir = TempDir::new().unwrap();
         let fs_owner = build_test_fs_owner_in(temp_dir.path()).unwrap();
         let res = ReadonlyBufferPool::with_capacity(PoolRole::Disk, bytes, fs_owner.guard());
-        assert!(matches!(res, Err(Error::BufferPoolSizeTooSmall)));
+        assert!(
+            res.as_ref()
+                .is_err_and(|err| err.is_code(crate::error::ErrorCode::BufferPoolSizeTooSmall))
+        );
     }
 
     #[test]
@@ -2328,10 +2349,13 @@ pub(crate) mod tests {
             reserve_waiter.await;
             teardown.join().unwrap();
             assert!(dropped.load(Ordering::SeqCst));
-            assert!(matches!(
-                inflight.wait_result().await,
-                Err(Error::InvalidState)
-            ));
+            assert!(
+                inflight
+                    .wait_result_fresh()
+                    .await
+                    .as_ref()
+                    .is_err_and(|err| err.is_code(crate::error::ErrorCode::InvalidState))
+            );
         });
     }
 
@@ -2375,8 +2399,18 @@ pub(crate) mod tests {
             smol::Timer::after(Duration::from_millis(10)).await;
             read_hook.release();
 
-            assert!(matches!(waiter1.await, Err(Error::IOError { .. })));
-            assert!(matches!(waiter2.await, Err(Error::IOError { .. })));
+            assert!(
+                waiter1
+                    .await
+                    .as_ref()
+                    .is_err_and(|err| err.is_code(crate::error::ErrorCode::IOError))
+            );
+            assert!(
+                waiter2
+                    .await
+                    .as_ref()
+                    .is_err_and(|err| err.is_code(crate::error::ErrorCode::IOError))
+            );
             assert_eq!(read_hook.call_count(), 1);
             assert_eq!(global.allocated(), 0);
             assert_eq!(global.try_get_frame_id(&key), None);
@@ -2447,24 +2481,20 @@ pub(crate) mod tests {
                 Ok(_) => panic!("expected persisted LWC corruption"),
                 Err(err) => err,
             };
-            assert!(matches!(
+            assert_data_integrity(
                 err1,
-                Error::BlockCorrupted {
-                    file_kind: FileKind::TableFile,
-                    block_kind: BlockKind::LwcBlock,
-                    block_id: page_id,
-                    cause: BlockCorruptionCause::ChecksumMismatch,
-                } if page_id == test_block_id(8)
-            ));
-            assert!(matches!(
+                FileKind::TableFile,
+                "lwc-block",
+                test_block_id(8),
+                DataIntegrityError::ChecksumMismatch,
+            );
+            assert_data_integrity(
                 err2,
-                Error::BlockCorrupted {
-                    file_kind: FileKind::TableFile,
-                    block_kind: BlockKind::LwcBlock,
-                    block_id: page_id,
-                    cause: BlockCorruptionCause::ChecksumMismatch,
-                } if page_id == test_block_id(8)
-            ));
+                FileKind::TableFile,
+                "lwc-block",
+                test_block_id(8),
+                DataIntegrityError::ChecksumMismatch,
+            );
             assert_eq!(read_hook.call_count(), 1);
             assert_eq!(global.allocated(), 0);
             assert_eq!(global.try_get_frame_id(&key), None);
@@ -2503,15 +2533,13 @@ pub(crate) mod tests {
                 Ok(_) => panic!("expected persisted LWC corruption"),
                 Err(err) => err,
             };
-            assert!(matches!(
+            assert_data_integrity(
                 err,
-                Error::BlockCorrupted {
-                    file_kind: FileKind::TableFile,
-                    block_kind: BlockKind::LwcBlock,
-                    block_id: page_id,
-                    cause: BlockCorruptionCause::ChecksumMismatch,
-                } if page_id == test_block_id(9)
-            ));
+                FileKind::TableFile,
+                "lwc-block",
+                test_block_id(9),
+                DataIntegrityError::ChecksumMismatch,
+            );
             assert_eq!(global.try_get_frame_id(&key), None);
             assert_eq!(global.allocated(), 0);
         });
@@ -2554,15 +2582,13 @@ pub(crate) mod tests {
                 Ok(_) => panic!("expected persisted LWC invalid-payload corruption"),
                 Err(err) => err,
             };
-            assert!(matches!(
+            assert_data_integrity(
                 err,
-                Error::BlockCorrupted {
-                    file_kind: FileKind::TableFile,
-                    block_kind: BlockKind::LwcBlock,
-                    block_id: page_id,
-                    cause: BlockCorruptionCause::InvalidPayload,
-                } if page_id == test_block_id(10)
-            ));
+                FileKind::TableFile,
+                "lwc-block",
+                test_block_id(10),
+                DataIntegrityError::InvalidPayload,
+            );
             assert_eq!(global.try_get_frame_id(&key), None);
             assert_eq!(global.allocated(), 0);
         });
@@ -2601,15 +2627,13 @@ pub(crate) mod tests {
                 Ok(_) => panic!("expected persisted column-block corruption"),
                 Err(err) => err,
             };
-            assert!(matches!(
+            assert_data_integrity(
                 err,
-                Error::BlockCorrupted {
-                    file_kind: FileKind::TableFile,
-                    block_kind: BlockKind::ColumnBlockIndex,
-                    block_id: page_id,
-                    cause: BlockCorruptionCause::ChecksumMismatch,
-                } if page_id == test_block_id(10)
-            ));
+                FileKind::TableFile,
+                "column-block-index",
+                test_block_id(10),
+                DataIntegrityError::ChecksumMismatch,
+            );
             assert_eq!(global.try_get_frame_id(&key), None);
             assert_eq!(global.allocated(), 0);
         });
@@ -2644,15 +2668,13 @@ pub(crate) mod tests {
                 Ok(_) => panic!("expected persisted deletion-blob corruption"),
                 Err(err) => err,
             };
-            assert!(matches!(
+            assert_data_integrity(
                 err,
-                Error::BlockCorrupted {
-                    file_kind: FileKind::TableFile,
-                    block_kind: BlockKind::ColumnDeletionBlob,
-                    block_id: page_id,
-                    cause: BlockCorruptionCause::ChecksumMismatch,
-                } if page_id == test_block_id(11)
-            ));
+                FileKind::TableFile,
+                "column-deletion-blob",
+                test_block_id(11),
+                DataIntegrityError::ChecksumMismatch,
+            );
             assert_eq!(global.try_get_frame_id(&key), None);
             assert_eq!(global.allocated(), 0);
         });

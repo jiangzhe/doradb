@@ -1,8 +1,9 @@
 use crate::buffer::page::PAGE_SIZE;
-use crate::error::{Error, Result};
+use crate::error::{DataIntegrityError, Error, Result};
 use crate::file::BlockID;
 use crate::serde::{Deser, Ser, Serde};
 use crate::trx::TrxID;
+use error_stack::Report;
 use std::mem;
 
 pub const SUPER_BLOCK_VERSION: u64 = 1;
@@ -152,22 +153,54 @@ pub fn parse_super_block(
     expected_magic_word: [u8; 8],
     expected_version: u64,
 ) -> Result<SuperBlock> {
-    let (body_start, header) = SuperBlockHeader::deser(buf, 0)?;
+    let (body_start, header) = SuperBlockHeader::deser(buf, 0).map_err(|_| {
+        Error::from(
+            Report::new(DataIntegrityError::InvalidPayload)
+                .attach("block=super-block, section=header"),
+        )
+    })?;
     if header.magic_word != expected_magic_word {
-        return Err(Error::InvalidFormat);
+        return Err(Report::new(DataIntegrityError::InvalidMagic)
+            .attach(format!(
+                "block=super-block, expected_magic={expected_magic_word:?}, actual_magic={:?}",
+                header.magic_word
+            ))
+            .into());
     }
     if header.version != expected_version {
-        return Err(Error::InvalidFormat);
+        return Err(Report::new(DataIntegrityError::InvalidVersion)
+            .attach(format!(
+                "block=super-block, expected_version={expected_version}, actual_version={}",
+                header.version
+            ))
+            .into());
     }
-    let (_, footer) = SuperBlockFooter::deser(buf, SUPER_BLOCK_FOOTER_OFFSET)?;
+    let (_, footer) = SuperBlockFooter::deser(buf, SUPER_BLOCK_FOOTER_OFFSET).map_err(|_| {
+        Error::from(
+            Report::new(DataIntegrityError::InvalidPayload)
+                .attach("block=super-block, section=footer"),
+        )
+    })?;
     if header.checkpoint_cts != footer.checkpoint_cts {
-        return Err(Error::TornWrite);
+        return Err(Report::new(DataIntegrityError::TornWrite)
+            .attach(format!(
+                "block=super-block, header_checkpoint_cts={}, footer_checkpoint_cts={}",
+                header.checkpoint_cts, footer.checkpoint_cts
+            ))
+            .into());
     }
     let b3sum = blake3::hash(&buf[..SUPER_BLOCK_FOOTER_OFFSET]);
     if b3sum != footer.b3sum {
-        return Err(Error::ChecksumMismatch);
+        return Err(Report::new(DataIntegrityError::ChecksumMismatch)
+            .attach("block=super-block")
+            .into());
     }
-    let (_, body) = SuperBlockBody::deser(buf, body_start)?;
+    let (_, body) = SuperBlockBody::deser(buf, body_start).map_err(|_| {
+        Error::from(
+            Report::new(DataIntegrityError::InvalidPayload)
+                .attach("block=super-block, section=body"),
+        )
+    })?;
     Ok(SuperBlock {
         header,
         body,

@@ -268,7 +268,7 @@ impl SecondaryCheckpointSidecar {
         row_id: RowID,
     ) -> Result<()> {
         if self.indexes.len() != metadata.index_specs.len() {
-            return Err(Error::InvalidState);
+            return Err(Error::invalid_state());
         }
         // Data checkpoint feeds committed-visible transition rows here, once
         // per row selected for persistence.
@@ -284,7 +284,10 @@ impl SecondaryCheckpointSidecar {
     }
 
     fn add_deleted_key(&mut self, index_no: usize, row_id: RowID, key: Vec<Val>) -> Result<()> {
-        let sidecar = self.indexes.get_mut(index_no).ok_or(Error::InvalidState)?;
+        let sidecar = self
+            .indexes
+            .get_mut(index_no)
+            .ok_or(Error::invalid_state())?;
         sidecar.add_delete(key, row_id);
         Ok(())
     }
@@ -296,7 +299,7 @@ fn secondary_disk_tree_encoder(
     append_row_id: bool,
 ) -> Result<BTreeKeyEncoder> {
     if index_spec.index_cols.is_empty() {
-        return Err(Error::InvalidArgument);
+        return Err(Error::invalid_argument());
     }
     let mut types = Vec::with_capacity(index_spec.index_cols.len() + usize::from(append_row_id));
     for key in &index_spec.index_cols {
@@ -305,7 +308,7 @@ fn secondary_disk_tree_encoder(
             .col_types()
             .get(col_no)
             .copied()
-            .ok_or(Error::InvalidArgument)?;
+            .ok_or(Error::invalid_argument())?;
         types.push(ty);
     }
     if append_row_id {
@@ -367,7 +370,7 @@ impl Table {
         // deletion_cutoff_ts here would make recovery skip delete redo that was
         // never reflected in column payloads.
         if column_block_index_root == SUPER_BLOCK_ID || pivot_row_id == 0 {
-            return Err(Error::InvalidState);
+            return Err(Error::invalid_state());
         }
 
         // Step 3: resolve each row-id to its persisted block payload.
@@ -398,16 +401,16 @@ impl Table {
                     // The marker is in [previous_cutoff, current_cutoff), so it is
                     // eligible now. A missing locate_block result means we cannot
                     // prove the delete is already durable; do not advance the cutoff.
-                    return Err(Error::InvalidState);
+                    return Err(Error::invalid_state());
                 };
                 cached_entry = Some(entry);
                 entry
             };
             let delta_u64 = row_id
                 .checked_sub(entry.start_row_id)
-                .ok_or(Error::InvalidState)?;
+                .ok_or(Error::invalid_state())?;
             if delta_u64 > u32::MAX as u64 {
-                return Err(Error::InvalidState);
+                return Err(Error::invalid_state());
             }
             let delta = delta_u64 as u32;
             if let Some(group) = groups
@@ -429,7 +432,7 @@ impl Table {
         if groups.is_empty() {
             // Defensive guard: selected markers should either resolve into at
             // least one patch group or fail above.
-            return Err(Error::InvalidState);
+            return Err(Error::invalid_state());
         }
 
         // Step 4: load authoritative persisted deltas and merge pending row-id deltas.
@@ -499,7 +502,7 @@ impl Table {
         #[cfg(test)]
         {
             if super::tests::test_force_secondary_sidecar_error_enabled() {
-                return Err(Error::InvalidState);
+                return Err(Error::invalid_state());
             }
         }
 
@@ -507,7 +510,7 @@ impl Table {
         if mutable_file.secondary_index_roots().len() != metadata.index_specs.len()
             || sidecar.indexes.len() != metadata.index_specs.len()
         {
-            return Err(Error::InvalidState);
+            return Err(Error::invalid_state());
         }
 
         let disk_pool = self.disk_pool();
@@ -591,7 +594,7 @@ impl Table {
         if row_ids.len() != entry.row_count() as usize
             || row_ids.windows(2).any(|window| window[0] >= window[1])
         {
-            return Err(Error::InvalidState);
+            return Err(Error::invalid_state());
         }
         let dense_row_ids = row_ids.len() == entry.row_id_span() as usize
             && row_ids
@@ -614,7 +617,7 @@ impl Table {
         if block.row_count() != row_ids.len()
             || block.row_shape_fingerprint() != entry.row_shape_fingerprint()
         {
-            return Err(Error::InvalidState);
+            return Err(Error::invalid_state());
         }
 
         let metadata = self.metadata();
@@ -634,9 +637,9 @@ impl Table {
             let row_id = entry
                 .start_row_id
                 .checked_add(RowID::from(*delta))
-                .ok_or(Error::InvalidState)?;
+                .ok_or(Error::invalid_state())?;
             let row_idx = if dense_row_ids {
-                usize::try_from(*delta).map_err(|_| Error::InvalidState)?
+                usize::try_from(*delta).map_err(|_| Error::invalid_state())?
             } else {
                 while row_ids
                     .get(sparse_row_idx)
@@ -645,12 +648,12 @@ impl Table {
                     sparse_row_idx += 1;
                 }
                 if row_ids.get(sparse_row_idx) != Some(&row_id) {
-                    return Err(Error::InvalidState);
+                    return Err(Error::invalid_state());
                 }
                 sparse_row_idx
             };
             if row_idx >= row_ids.len() {
-                return Err(Error::InvalidState);
+                return Err(Error::invalid_state());
             }
             for (index_no, read_set) in index_read_sets.iter().enumerate() {
                 let key = block.decode_row_values(metadata, row_idx, read_set)?;
@@ -688,7 +691,7 @@ impl TablePersistence for Table {
 
     async fn checkpoint(&self, session: &mut Session) -> Result<CheckpointOutcome> {
         if session.in_trx() {
-            return Err(Error::NotSupported(CHECKPOINT_REQUIRES_IDLE_SESSION));
+            return Err(Error::not_supported(CHECKPOINT_REQUIRES_IDLE_SESSION));
         }
 
         let table_file = self.file();
@@ -721,7 +724,7 @@ impl TablePersistence for Table {
         // transition state under the refreshed cutoff timestamp.
         let mut trx = session
             .try_begin_trx()?
-            .ok_or(Error::NotSupported(CHECKPOINT_REQUIRES_IDLE_SESSION))?;
+            .ok_or(Error::not_supported(CHECKPOINT_REQUIRES_IDLE_SESSION))?;
         let checkpoint_ts = trx.sts();
         if !frozen_pages.is_empty() {
             self.set_frozen_pages_to_transition(&pool_guards, &frozen_pages, cutoff_ts)
@@ -830,7 +833,7 @@ impl TablePersistence for Table {
         let published_column_root = published_root.column_block_index_root;
         let (_table_file, old_root) = match mutable_file.commit(checkpoint_ts, false).await {
             Ok(res) => res,
-            Err(err) if err.is_storage_io_failure() || matches!(err, Error::SendError) => {
+            Err(err) if err.is_storage_io_failure() || err.is_send_error() => {
                 let _ = trx_sys.rollback(trx).await;
                 let poison = trx_sys.poison_storage(StoragePoisonSource::CheckpointWrite);
                 return Err(poison);

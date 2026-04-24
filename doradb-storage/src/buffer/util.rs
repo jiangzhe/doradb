@@ -84,7 +84,7 @@ pub(super) unsafe fn mmap_allocate(total_bytes: usize) -> Result<*mut u8> {
             0,
         );
         if memory_chunk == MAP_FAILED {
-            return Err(Error::InsufficientMemory(total_bytes));
+            return Err(Error::insufficient_memory(total_bytes));
         }
         madvise(memory_chunk, total_bytes, MADV_HUGEPAGE);
         madvise(memory_chunk, total_bytes, MADV_DONTFORK);

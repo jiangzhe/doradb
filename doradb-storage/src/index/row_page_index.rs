@@ -604,7 +604,7 @@ impl<P: BufferPool> GenericRowPageIndex<P> {
         let page_id = {
             let mut g = self.insert_free_list.lock();
             if g.is_empty() {
-                return Err(Error::EmptyFreeListOfBufferPool);
+                return Err(Error::empty_free_list_of_buffer_pool());
             }
             g.pop().unwrap()
         };
@@ -614,7 +614,7 @@ impl<P: BufferPool> GenericRowPageIndex<P> {
         let page_guard = page_guard
             .lock_exclusive_async()
             .await
-            .ok_or(Error::InvalidState)?;
+            .ok_or(Error::invalid_state())?;
         Ok(page_guard)
     }
 
@@ -1413,7 +1413,7 @@ mod tests {
                 Ok(_) => panic!("expected free-list page reload failure"),
                 Err(err) => err,
             };
-            assert!(matches!(err, Error::IOError { .. }));
+            assert!(err.is_code(crate::error::ErrorCode::IOError));
         });
     }
 
@@ -1480,7 +1480,7 @@ mod tests {
                 Ok(_) => panic!("metadata split should fail in one-page meta pool"),
                 Err(err) => err,
             };
-            assert!(matches!(err, Error::BufferPoolFull));
+            assert!(err.is_code(crate::error::ErrorCode::BufferPoolFull));
             assert_eq!(mem_pool.allocated(), 0);
         });
     }
@@ -1512,7 +1512,7 @@ mod tests {
                 Ok(_) => panic!("metadata split should fail in one-page meta pool"),
                 Err(err) => err,
             };
-            assert!(matches!(err, Error::BufferPoolFull));
+            assert!(err.is_code(crate::error::ErrorCode::BufferPoolFull));
             assert_eq!(mem_pool.allocated(), 0);
         });
     }
@@ -1538,7 +1538,7 @@ mod tests {
                 Ok(_) => panic!("metadata split should fail in one-page meta pool"),
                 Err(err) => err,
             };
-            assert!(matches!(err, Error::BufferPoolFull));
+            assert!(err.is_code(crate::error::ErrorCode::BufferPoolFull));
             assert_eq!(mem_pool.allocated(), 0);
 
             let page = mem_pool

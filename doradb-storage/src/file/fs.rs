@@ -1301,9 +1301,9 @@ impl Component for FileSystemWorkers {
         registry: &mut ComponentRegistry,
         mut shelf: ShelfScope<'_, Self>,
     ) -> Result<()> {
-        let builder = shelf.take::<FileSystem>().ok_or(Error::InvalidState)?;
-        let mem_pool_file = shelf.take::<MemPool>().ok_or(Error::InvalidState)?;
-        let index_pool_file = shelf.take::<IndexPool>().ok_or(Error::InvalidState)?;
+        let builder = shelf.take::<FileSystem>().ok_or(Error::invalid_state())?;
+        let mem_pool_file = shelf.take::<MemPool>().ok_or(Error::invalid_state())?;
+        let index_pool_file = shelf.take::<IndexPool>().ok_or(Error::invalid_state())?;
 
         let fs = registry.dependency::<FileSystem>()?;
         let mem_pool = registry.dependency::<MemPool>()?;
@@ -1601,7 +1601,7 @@ pub(crate) mod tests {
     use crate::component::{DiskPoolConfig, IndexPoolConfig, MetaPoolConfig, RegistryBuilder};
     use crate::conf::{EngineConfig, EvictableBufferPoolConfig, TrxSysConfig};
     use crate::engine::Engine;
-    use crate::error::Error;
+    use crate::error::{ConfigError, ErrorKind};
     use crate::file::BlockID;
     use crate::file::cow_file::COW_FILE_PAGE_SIZE;
     use crate::file::table_file::TableFile;
@@ -2177,23 +2177,44 @@ pub(crate) mod tests {
     #[test]
     fn test_catalog_file_name_validation() {
         let temp_dir = TempDir::new().unwrap();
-        let res = build_test_engine(
+        let err = match build_test_engine(
             temp_dir.path(),
             FileSystemConfig::default().catalog_file_name("catalog.bin"),
+        ) {
+            Ok(_) => panic!("expected invalid catalog file name"),
+            Err(err) => err,
+        };
+        assert!(err.is_kind(ErrorKind::Config));
+        assert_eq!(
+            err.config_error(),
+            Some(ConfigError::InvalidCatalogFileName)
         );
-        assert!(res.is_err());
 
-        let res = build_test_engine(
+        let err = match build_test_engine(
             temp_dir.path(),
             FileSystemConfig::default().catalog_file_name("dir/catalog.mtb"),
+        ) {
+            Ok(_) => panic!("expected invalid catalog file name"),
+            Err(err) => err,
+        };
+        assert!(err.is_kind(ErrorKind::Config));
+        assert_eq!(
+            err.config_error(),
+            Some(ConfigError::InvalidCatalogFileName)
         );
-        assert!(res.is_err());
 
-        let res = build_test_engine(
+        let err = match build_test_engine(
             temp_dir.path(),
             FileSystemConfig::default().catalog_file_name("../catalog.mtb"),
+        ) {
+            Ok(_) => panic!("expected invalid catalog file name"),
+            Err(err) => err,
+        };
+        assert!(err.is_kind(ErrorKind::Config));
+        assert_eq!(
+            err.config_error(),
+            Some(ConfigError::InvalidCatalogFileName)
         );
-        assert!(res.is_err());
     }
 
     #[test]
@@ -2219,7 +2240,11 @@ pub(crate) mod tests {
             Ok(_) => panic!("expected invalid storage path"),
             Err(err) => err,
         };
-        assert!(matches!(err, Error::InvalidStoragePath(_)));
+        assert!(err.is_kind(ErrorKind::Config));
+        assert_eq!(
+            err.config_error(),
+            Some(ConfigError::PathMustNotEscapeStorageRoot)
+        );
     }
 
     #[cfg(unix)]
@@ -2235,6 +2260,7 @@ pub(crate) mod tests {
                 Ok(_) => panic!("expected invalid storage path"),
                 Err(err) => err,
             };
-        assert!(matches!(err, Error::InvalidStoragePath(_)));
+        assert!(err.is_kind(ErrorKind::Config));
+        assert_eq!(err.config_error(), Some(ConfigError::PathMustBeUtf8));
     }
 }

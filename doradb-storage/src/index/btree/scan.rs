@@ -284,7 +284,7 @@ mod tests {
     impl BTreeSlotCallback for FailOnFirstSlot {
         #[inline]
         fn apply(&mut self, _: &BTreeNode, _: &BTreeSlot) -> Result<bool> {
-            Err(Error::InvalidState)
+            Err(Error::invalid_state())
         }
     }
 
@@ -308,7 +308,7 @@ mod tests {
                 .scan_prefix(b"a")
                 .await
                 .expect_err("callback error should abort the scan");
-            assert!(matches!(err, Error::InvalidState));
+            assert!(err.is_code(crate::error::ErrorCode::InvalidState));
         });
     }
 }

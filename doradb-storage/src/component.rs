@@ -142,7 +142,7 @@ impl Shelf {
             .parts
             .insert(Self::key::<Up, Down>(), Box::new(provision));
         if old.is_some() {
-            return Err(Error::InvalidState);
+            return Err(Error::invalid_state());
         }
         Ok(())
     }
@@ -245,9 +245,9 @@ impl RegistryBuilder {
     #[inline]
     pub(crate) fn finish(mut self) -> Result<ComponentRegistry> {
         if !self.shelf.is_empty() {
-            return Err(Error::InvalidState);
+            return Err(Error::invalid_state());
         }
-        self.registry.take().ok_or(Error::InvalidState)
+        self.registry.take().ok_or(Error::invalid_state())
     }
 }
 
@@ -294,7 +294,7 @@ impl ComponentRegistry {
         );
         let tid = TypeId::of::<C>();
         if self.access_map.contains_key(&tid) {
-            return Err(Error::EngineComponentAlreadyRegistered);
+            return Err(Error::engine_component_already_registered());
         }
 
         let owner = QuiescentBox::new(owned);
@@ -320,7 +320,7 @@ impl ComponentRegistry {
     #[inline]
     pub(crate) fn dependency<C: Component>(&self) -> Result<C::Access> {
         self.get::<C>()
-            .ok_or(Error::EngineComponentMissingDependency)
+            .ok_or(Error::engine_component_missing_dependency())
     }
 
     /// Run explicit component shutdown in reverse registration order.
@@ -572,14 +572,14 @@ mod tests {
         let mut registry = ComponentRegistry::new();
         registry.register::<ValueComponent>(7).unwrap();
         let err = registry.register::<ValueComponent>(11).unwrap_err();
-        assert!(matches!(err, Error::EngineComponentAlreadyRegistered));
+        assert!(err.is_code(crate::error::ErrorCode::EngineComponentAlreadyRegistered));
     }
 
     #[test]
     fn test_component_registry_reports_missing_dependency() {
         let registry = ComponentRegistry::new();
         let err = registry.dependency::<ValueComponent>().unwrap_err();
-        assert!(matches!(err, Error::EngineComponentMissingDependency));
+        assert!(err.is_code(crate::error::ErrorCode::EngineComponentMissingDependency));
     }
 
     #[test]
@@ -698,6 +698,6 @@ mod tests {
         let mut up = shelf.scope::<Upstream>();
         up.put::<Downstream>(7).unwrap();
         let err = up.put::<Downstream>(11).unwrap_err();
-        assert!(matches!(err, Error::InvalidState));
+        assert!(err.is_code(crate::error::ErrorCode::InvalidState));
     }
 }

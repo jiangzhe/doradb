@@ -1,6 +1,6 @@
 use super::{Table, TableRootSnapshot};
 use crate::buffer::{BufferPool, EvictableBufferPool, PoolGuard, PoolGuards};
-use crate::error::{BlockCorruptionCause, BlockKind, Error, FileKind, Result};
+use crate::error::{DataIntegrityError, Error, FileKind, Result};
 use crate::file::BlockID;
 use crate::file::cow_file::SUPER_BLOCK_ID;
 use crate::index::{
@@ -12,6 +12,21 @@ use crate::row::RowID;
 use crate::session::Session;
 use crate::trx::{TrxID, TrxReadProof};
 use crate::value::Val;
+use error_stack::Report;
+
+#[inline]
+fn invalid_lwc_payload(
+    file_kind: FileKind,
+    block_id: BlockID,
+    message: impl Into<String>,
+) -> Error {
+    let message = message.into();
+    Report::new(DataIntegrityError::InvalidPayload)
+        .attach(format!(
+            "file={file_kind}, block=lwc-block, block_id={block_id}, {message}"
+        ))
+        .into()
+}
 
 /// Aggregate result for a full-scan user-table secondary MemIndex cleanup pass.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -146,7 +161,7 @@ impl Table {
     ) -> Result<SecondaryMemIndexCleanupStats> {
         let trx_sys = session.engine().trx_sys.clone();
         loop {
-            let trx = session.try_begin_trx()?.ok_or(Error::NotSupported(
+            let trx = session.try_begin_trx()?.ok_or(Error::not_supported(
                 "secondary MemIndex cleanup requires idle session",
             ))?;
             let cleanup_sts = trx.sts();
@@ -501,7 +516,7 @@ impl Table {
             .metadata()
             .index_specs
             .get(index_no)
-            .ok_or(Error::InvalidState)?;
+            .ok_or(Error::invalid_state())?;
         let read_set = index_spec
             .index_cols
             .iter()
@@ -516,11 +531,10 @@ impl Table {
         )
         .await?;
         if block.row_shape_fingerprint() != row.row_shape_fingerprint() {
-            return Err(Error::block_corrupted(
+            return Err(invalid_lwc_payload(
                 FileKind::TableFile,
-                BlockKind::LwcBlock,
                 row.block_id(),
-                BlockCorruptionCause::InvalidPayload,
+                "row shape fingerprint mismatch",
             ));
         }
         block.decode_row_values(self.metadata(), row.row_idx(), &read_set)

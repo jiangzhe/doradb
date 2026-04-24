@@ -3,7 +3,7 @@ use crate::buffer::{
 };
 use crate::catalog::Catalog;
 use crate::component::Supplier;
-use crate::error::Result;
+use crate::error::{ConfigResult, Error, Result};
 use crate::file::fs::FileSystem;
 use crate::io::{StorageBackend, align_to_sector_size};
 use crate::quiescent::QuiescentGuard;
@@ -12,6 +12,7 @@ use crate::trx::purge::{GC, Purge};
 use crate::trx::recover::{RecoveryDeps, log_recover};
 use crate::trx::sys::{TransactionSystem, TransactionSystemWorkers, TransactionSystemWorkersOwned};
 use byte_unit::Byte;
+use error_stack::ResultExt;
 use flume::{Receiver, Sender};
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
@@ -174,16 +175,18 @@ impl TrxSysConfig {
     }
 
     #[inline]
-    pub(crate) fn file_prefix(&self) -> Result<String> {
+    pub(crate) fn file_prefix(&self) -> ConfigResult<String> {
         let file_prefix = self.log_dir.join(&self.log_file_stem);
-        Ok(path_to_utf8(&file_prefix, "redo log path")?.to_owned())
+        Ok(path_to_utf8(&file_prefix, "redo log path")
+            .attach_with(|| format!("invalid redo log path: {}", file_prefix.display()))?
+            .to_owned())
     }
 
     #[inline]
     pub fn log_partition_initializer(&self, log_no: usize) -> Result<LogPartitionInitializer> {
         debug_assert!(validate_log_file_stem(&self.log_file_stem));
         let ctx = StorageBackend::new(self.io_depth_per_log)?;
-        let file_prefix = self.file_prefix()?;
+        let file_prefix = self.file_prefix().map_err(Error::from)?;
 
         let logs = list_log_files(&file_prefix, log_no, false)?;
         let mode = if logs.is_empty() {

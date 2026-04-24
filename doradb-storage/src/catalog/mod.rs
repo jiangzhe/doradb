@@ -165,7 +165,7 @@ impl Catalog {
         table_id: TableID,
     ) -> Result<()> {
         if self.user_tables.contains_key(&table_id) {
-            return Err(Error::TableAlreadyExists);
+            return Err(Error::table_already_exists());
         }
         let res = self
             .storage
@@ -243,7 +243,7 @@ impl Catalog {
                 let metadata_in_catalog = TableMetadata::new(column_specs, index_specs);
                 let metadata_in_file = &*active_root.metadata;
                 if &metadata_in_catalog != metadata_in_file {
-                    return Err(Error::InvalidState);
+                    return Err(Error::invalid_state());
                 }
                 let row_id_bound = active_root.pivot_row_id;
                 let meta_pool_guard = guards.meta_guard();
@@ -270,11 +270,11 @@ impl Catalog {
                 );
                 let old = self.user_tables.insert(table_id, table);
                 if old.is_some() {
-                    return Err(Error::TableAlreadyExists);
+                    return Err(Error::table_already_exists());
                 }
                 Ok(())
             }
-            None => Err(Error::TableNotFound),
+            None => Err(Error::table_not_found()),
         }
     }
 
@@ -511,7 +511,7 @@ pub mod tests {
     use crate::catalog::{ColumnAttributes, IndexAttributes, IndexKey, IndexSpec, TableSpec};
     use crate::conf::{EngineConfig, TrxSysConfig};
     use crate::engine::Engine;
-    use crate::error::{BlockCorruptionCause, BlockKind, Error, FileKind};
+    use crate::error::{DataIntegrityError, Error};
     use crate::file::BlockID;
     use crate::file::block_integrity::{BLOCK_INTEGRITY_HEADER_SIZE, write_block_checksum};
     use crate::file::cow_file::COW_FILE_PAGE_SIZE;
@@ -725,6 +725,19 @@ pub mod tests {
                 .unwrap(),
         ) as usize;
         payload_start + COLUMN_BLOCK_LEAF_HEADER_SIZE + entry_offset
+    }
+
+    fn assert_catalog_data_integrity(
+        err: Error,
+        block_kind: &str,
+        block_id: BlockID,
+        expected: DataIntegrityError,
+    ) {
+        assert_eq!(err.data_integrity_error(), Some(expected));
+        let report = format!("{err:?}");
+        assert!(report.contains("catalog.mtb"), "{report}");
+        assert!(report.contains(block_kind), "{report}");
+        assert!(report.contains(&format!("block_id={block_id}")), "{report}");
     }
 
     #[test]
@@ -942,15 +955,12 @@ pub mod tests {
                 Ok(_) => panic!("expected catalog bootstrap corruption failure"),
                 Err(err) => err,
             };
-            assert!(matches!(
+            assert_catalog_data_integrity(
                 err,
-                Error::BlockCorrupted {
-                    file_kind: FileKind::CatalogMultiTableFile,
-                    block_kind: BlockKind::LwcBlock,
-                    block_id: page_id,
-                    cause: BlockCorruptionCause::ChecksumMismatch,
-                } if page_id == block_id
-            ));
+                "lwc-block",
+                block_id,
+                DataIntegrityError::ChecksumMismatch,
+            );
         });
     }
 
@@ -1024,15 +1034,12 @@ pub mod tests {
                 Ok(_) => panic!("expected catalog bootstrap invalid-metadata failure"),
                 Err(err) => err,
             };
-            assert!(matches!(
+            assert_catalog_data_integrity(
                 err,
-                Error::BlockCorrupted {
-                    file_kind: FileKind::CatalogMultiTableFile,
-                    block_kind: BlockKind::ColumnBlockIndex,
-                    block_id: page_id,
-                    cause: BlockCorruptionCause::InvalidPayload,
-                } if page_id == entry.leaf_page_id
-            ));
+                "column-block-index",
+                entry.leaf_page_id,
+                DataIntegrityError::InvalidPayload,
+            );
         });
     }
 

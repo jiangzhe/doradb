@@ -297,7 +297,7 @@ impl IndexRollback for CatalogTable {
     ) -> Result<bool> {
         self.mem.sec_idx()[key.index_no]
             .unique()
-            .ok_or(Error::InvalidArgument)?
+            .ok_or(Error::invalid_argument())?
             .mask_as_deleted(index_pool_guard, &key.vals, row_id, ts)
             .await
     }
@@ -313,7 +313,7 @@ impl IndexRollback for CatalogTable {
     ) -> Result<bool> {
         self.mem.sec_idx()[key.index_no]
             .unique()
-            .ok_or(Error::InvalidArgument)?
+            .ok_or(Error::invalid_argument())?
             .compare_delete(index_pool_guard, &key.vals, row_id, ignore_del_mask, ts)
             .await
     }
@@ -329,7 +329,7 @@ impl IndexRollback for CatalogTable {
     ) -> Result<IndexCompareExchange> {
         self.mem.sec_idx()[key.index_no]
             .unique()
-            .ok_or(Error::InvalidArgument)?
+            .ok_or(Error::invalid_argument())?
             .compare_exchange(index_pool_guard, &key.vals, old_row_id, new_row_id, ts)
             .await
     }
@@ -344,7 +344,7 @@ impl IndexRollback for CatalogTable {
     ) -> Result<bool> {
         self.mem.sec_idx()[key.index_no]
             .non_unique()
-            .ok_or(Error::InvalidArgument)?
+            .ok_or(Error::invalid_argument())?
             .mask_as_deleted(index_pool_guard, &key.vals, row_id, ts)
             .await
     }
@@ -359,7 +359,7 @@ impl IndexRollback for CatalogTable {
     ) -> Result<bool> {
         self.mem.sec_idx()[key.index_no]
             .non_unique()
-            .ok_or(Error::InvalidArgument)?
+            .ok_or(Error::invalid_argument())?
             .mask_as_active(index_pool_guard, &key.vals, row_id, ts)
             .await
     }
@@ -375,7 +375,7 @@ impl IndexRollback for CatalogTable {
     ) -> Result<bool> {
         self.mem.sec_idx()[key.index_no]
             .non_unique()
-            .ok_or(Error::InvalidArgument)?
+            .ok_or(Error::invalid_argument())?
             .compare_delete(index_pool_guard, &key.vals, row_id, ignore_del_mask, ts)
             .await
     }

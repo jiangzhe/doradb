@@ -125,7 +125,7 @@ impl ScanBuffer {
                     }
                 }
                 (None, None) => (),
-                _ => return Err(Error::InvalidColumnScan),
+                _ => return Err(Error::invalid_column_scan()),
             }
             // Second, extend values
             match (&mut buf.vals, vals) {
@@ -189,7 +189,7 @@ impl ScanBuffer {
                         }
                     }
                 }
-                _ => return Err(Error::InvalidColumnScan),
+                _ => return Err(Error::invalid_column_scan()),
             }
         }
         self.len = new_len;

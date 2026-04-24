@@ -140,7 +140,7 @@ impl BufferPool for FixedBufferPool {
     ) -> Result<PageExclusiveGuard<T>> {
         match self.alloc_map.try_allocate() {
             Some(page_id) => Ok(self.arena.init_page(guard, PageID::from(page_id))),
-            None => Err(Error::BufferPoolFull),
+            None => Err(Error::buffer_pool_full()),
         }
     }
 
@@ -153,7 +153,7 @@ impl BufferPool for FixedBufferPool {
         if self.alloc_map.allocate_at(usize::from(page_id)) {
             Ok(self.arena.init_page(guard, page_id))
         } else {
-            Err(Error::BufferPageAlreadyAllocated)
+            Err(Error::buffer_page_already_allocated())
         }
     }
 

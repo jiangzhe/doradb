@@ -26,7 +26,7 @@ impl FromStr for LatchFallbackMode {
             "spin" => LatchFallbackMode::Spin,
             "shared" => LatchFallbackMode::Shared,
             "exclusive" => LatchFallbackMode::Exclusive,
-            _ => return Err(Error::InvalidArgument),
+            _ => return Err(Error::invalid_argument()),
         };
         Ok(res)
     }
@@ -486,7 +486,7 @@ impl RawHybridGuard {
                 version: self.version,
             });
         }
-        Err(Error::InvalidState)
+        Err(Error::invalid_state())
     }
 
     #[inline]

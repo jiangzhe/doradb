@@ -368,7 +368,7 @@ impl TrxEffects {
     #[inline]
     pub(crate) fn retain_old_table_root(&mut self, old_root: OldRoot) -> Result<()> {
         if self.old_table_root.is_some() {
-            return Err(Error::OldTableRootAlreadyRetained);
+            return Err(Error::old_table_root_already_retained());
         }
         self.old_table_root = Some(old_root);
         Ok(())
@@ -1328,7 +1328,7 @@ mod tests {
             trx.retain_old_table_root(first_old_root).unwrap();
 
             let err = trx.retain_old_table_root(second_old_root).unwrap_err();
-            assert!(matches!(err, Error::OldTableRootAlreadyRetained));
+            assert!(err.is_code(crate::error::ErrorCode::OldTableRootAlreadyRetained));
             assert_eq!(
                 old_root_drop_count(first_old_root_ptr),
                 first_drop_count_before

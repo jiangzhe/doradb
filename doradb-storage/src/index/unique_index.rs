@@ -177,7 +177,7 @@ impl<'a, P: BufferPool> UniqueMemIndexCleanupScan<'a, P> {
                 batch.skipped_live += 1;
                 continue;
             }
-            let encoded_key = node.key_checked(idx).ok_or(Error::InvalidState)?;
+            let encoded_key = node.key_checked(idx).ok_or(Error::invalid_state())?;
             batch.entries.push(UniqueMemIndexEntry {
                 encoded_key,
                 row_id,
@@ -269,7 +269,7 @@ impl<P: BufferPool> UniqueMemIndex<P> {
         while let Some(guard) = cursor.next().await? {
             let node = guard.page();
             for idx in 0..node.count() {
-                let encoded_key = node.key_checked(idx).ok_or(Error::InvalidState)?;
+                let encoded_key = node.key_checked(idx).ok_or(Error::invalid_state())?;
                 let value = node.value::<BTreeU64>(idx);
                 entries.push(UniqueMemIndexEntry {
                     encoded_key,

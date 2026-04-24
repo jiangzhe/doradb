@@ -1573,7 +1573,7 @@ impl BTreeCompactConfig {
             || !(0.0..=1.0).contains(&high_ratio)
             || high_ratio < low_ratio
         {
-            return Err(Error::InvalidArgument);
+            return Err(Error::invalid_argument());
         }
         Ok(BTreeCompactConfig {
             low_ratio,
@@ -2348,7 +2348,7 @@ mod tests {
                     .split_root::<BTreeU64>(&pool_guard, root, true, 210)
                     .await
                     .expect_err("second split-root allocation should fail");
-                assert!(matches!(err, Error::BufferPoolFull));
+                assert!(err.is_code(crate::error::ErrorCode::BufferPoolFull));
             }
 
             assert_eq!(pool.allocated(), 1);
