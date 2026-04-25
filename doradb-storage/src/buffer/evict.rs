@@ -18,8 +18,8 @@ use crate::conf::EvictableBufferPoolConfig;
 use crate::conf::path::{path_to_utf8, validate_swap_file_path_candidate};
 use crate::error::Validation::Valid;
 use crate::error::{
-    CompletionErrorKind, CompletionResult, Error, IoError, LifecycleError, LifecycleResult, Result,
-    Validation,
+    CompletionErrorKind, CompletionResult, Error, IoError, LifecycleError, LifecycleResult,
+    ResourceError, Result, Validation,
 };
 use crate::file::fs::{FileSystem, FileSystemWorkers};
 use crate::file::{BlockID, BlockKey, INDEX_POOL_SWAP_FILE_ID, MEM_POOL_SWAP_FILE_ID, SparseFile};
@@ -1309,7 +1309,11 @@ pub(crate) fn build_pool_with_swap_file_field(
     );
     let max_nbr_in_mem = (max_mem_size - frame_total_bytes) / mem::size_of::<Page>();
     if max_nbr_in_mem < MIN_IN_MEM_PAGES {
-        return Err(Error::buffer_pool_size_too_small());
+        return Err(Report::new(ResourceError::BufferPoolSizeTooSmall)
+            .attach(format!(
+                "evictable buffer pool sizing: max_mem_size={max_mem_size}, max_file_size={max_file_size}, frame_total_bytes={frame_total_bytes}, in_mem_pages={max_nbr_in_mem}, min_in_mem_pages={MIN_IN_MEM_PAGES}"
+            ))
+            .into());
     }
     let eviction_arbiter = config.eviction_arbiter_builder.build(max_nbr_in_mem);
 

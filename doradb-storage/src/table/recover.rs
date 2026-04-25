@@ -1,6 +1,6 @@
 use crate::buffer::PageID;
 use crate::buffer::PoolGuards;
-use crate::error::{DataIntegrityError, Error, RecoveryDuplicateKey, Result};
+use crate::error::{DataIntegrityError, Error, OperationError, RecoveryDuplicateKey, Result};
 use crate::index::IndexInsert;
 use crate::index::{NonUniqueIndex, UniqueIndex};
 use crate::row::ops::{ReadRow, SelectKey, UpdateCol};
@@ -170,9 +170,9 @@ impl TableRecover for Table {
                 return Ok(());
             }
             if !disable_index {
-                return Err(Error::not_supported(
-                    "cold-row delete recovery requires deferred index rebuild",
-                ));
+                return Err(Report::new(OperationError::NotSupported)
+                    .attach("cold-row delete recovery requires deferred index rebuild")
+                    .into());
             }
             match self.deletion_buffer().put_committed(row_id, cts) {
                 Ok(()) => return Ok(()),

@@ -1,6 +1,7 @@
 use crate::conf::TrxSysConfig;
 use crate::error::{
-    CompletionResult, DataIntegrityError, Error, LifecycleError, Result, StoragePoisonSource,
+    CompletionResult, DataIntegrityError, Error, LifecycleError, ResourceError, Result,
+    StoragePoisonSource,
 };
 use crate::file::{FileSyncer, SparseFile, UNTRACKED_FILE_ID};
 use crate::free_list::FreeList;
@@ -382,7 +383,9 @@ impl LogPartition {
             // Allocate space of log file.
             let (fd, offset) = match log_file.alloc(log_buf.capacity()) {
                 Ok((offset, _)) => (log_file.as_raw_fd(), offset),
-                Err(err) if err.is_storage_file_capacity_exceeded() => {
+                Err(err)
+                    if err.resource_error() == Some(ResourceError::StorageFileCapacityExceeded) =>
+                {
                     // Rotate log file and try again.
                     self.rotate_log_file(group_commit_g)
                         .expect("rotate log file");

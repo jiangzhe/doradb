@@ -17,7 +17,9 @@ pub(crate) use self::tests::{
 use crate::buffer::ReadSubmission;
 use crate::catalog::USER_OBJ_ID_START;
 use crate::compression::BitPackable;
-use crate::error::{CompletionErrorKind, CompletionResult, Error, IoError, Result, StorageOp};
+use crate::error::{
+    CompletionErrorKind, CompletionResult, Error, IoError, ResourceError, Result, StorageOp,
+};
 use crate::free_list::FreeList;
 use crate::io::DirectBuf;
 use crate::io::{
@@ -26,6 +28,7 @@ use crate::io::{
 };
 use crate::serde::{Deser, Ser, Serde};
 use bytemuck::{Pod, Zeroable};
+use error_stack::Report;
 use libc::{
     O_CREAT, O_DIRECT, O_EXCL, O_RDWR, O_TRUNC, close, fdatasync, fstat, fsync, ftruncate, open,
     stat,
@@ -567,8 +570,13 @@ impl SparseFile {
         loop {
             let offset = self.offset.load(Ordering::Relaxed);
             let new_offset = offset + size;
-            if new_offset > self.max_len.load(Ordering::Relaxed) {
-                return Err(Error::storage_file_capacity_exceeded());
+            let max_len = self.max_len.load(Ordering::Relaxed);
+            if new_offset > max_len {
+                return Err(Report::new(ResourceError::StorageFileCapacityExceeded)
+                    .attach(format!(
+                        "sparse file allocation: requested_len={len}, aligned_len={size}, current_offset={offset}, new_offset={new_offset}, max_len={max_len}"
+                    ))
+                    .into());
             }
             if self
                 .offset
@@ -1282,11 +1290,9 @@ mod tests {
             file.alloc(STORAGE_SECTOR_SIZE).unwrap(),
             (0, STORAGE_SECTOR_SIZE)
         );
-        assert!(
-            file.alloc(STORAGE_SECTOR_SIZE)
-                .as_ref()
-                .is_err_and(|err| err.is_storage_file_capacity_exceeded())
-        );
+        assert!(file.alloc(STORAGE_SECTOR_SIZE).as_ref().is_err_and(
+            |err| err.resource_error() == Some(ResourceError::StorageFileCapacityExceeded)
+        ));
     }
 
     #[test]

@@ -2,7 +2,7 @@ use crate::buffer::guard::{PageGuard, PageSharedGuard};
 use crate::buffer::page::INVALID_PAGE_ID;
 use crate::buffer::{BufferPool, EvictableBufferPool, FixedBufferPool, PageID, PoolGuards};
 use crate::catalog::{CatalogTable, TableMetadata};
-use crate::error::{DataIntegrityError, Error, FileKind, Result};
+use crate::error::{DataIntegrityError, Error, FileKind, OperationError, Result};
 use crate::file::BlockID;
 use crate::index::util::{Maskable, RowPageCreateRedoCtx};
 use crate::index::{
@@ -11,8 +11,8 @@ use crate::index::{
 };
 use crate::lwc::PersistedLwcBlock;
 use crate::row::ops::{
-    DeleteMvcc, InsertIndex, InsertMvcc, LinkForUniqueIndex, ReadRow, ScanMvcc, SelectKey,
-    SelectMvcc, UndoCol, UpdateCol, UpdateIndex, UpdateMvcc, UpdateRow,
+    DeleteMvcc, InsertIndex, LinkForUniqueIndex, ReadRow, ScanMvcc, SelectKey, SelectMvcc, UndoCol,
+    UpdateCol, UpdateIndex, UpdateMvcc, UpdateRow,
 };
 use crate::row::{Row, RowID, RowPage, RowRead, estimate_max_row_count, var_len_for_insert};
 use crate::stmt::StmtEffects;
@@ -152,7 +152,7 @@ pub trait TableAccess {
         ctx: &TrxContext,
         effects: &mut StmtEffects,
         cols: Vec<Val>,
-    ) -> impl Future<Output = Result<InsertMvcc>>;
+    ) -> impl Future<Output = Result<RowID>>;
 
     /// Update row in transaction.
     /// This method is for update based on unique index lookup.
@@ -3253,7 +3253,7 @@ impl<D: BufferPool, I: BufferPool> TableAccess for TableAccessor<'_, D, I> {
         ctx: &TrxContext,
         effects: &mut StmtEffects,
         cols: Vec<Val>,
-    ) -> Result<InsertMvcc> {
+    ) -> Result<RowID> {
         let metadata = self.metadata();
         debug_assert!(cols.len() == metadata.col_count());
         debug_assert!({
@@ -3286,15 +3286,19 @@ impl<D: BufferPool, I: BufferPool> TableAccess for TableAccessor<'_, D, I> {
             {
                 InsertIndex::Inserted => (),
                 InsertIndex::DuplicateKey => {
-                    return Ok(InsertMvcc::DuplicateKey);
+                    return Err(Report::new(OperationError::DuplicateKey)
+                        .attach("insert MVCC secondary index claim")
+                        .into());
                 }
                 InsertIndex::WriteConflict => {
-                    return Ok(InsertMvcc::WriteConflict);
+                    return Err(Report::new(OperationError::WriteConflict)
+                        .attach("insert MVCC secondary index claim")
+                        .into());
                 }
             }
         }
         page_guard.set_dirty(); // mark as dirty page.
-        Ok(InsertMvcc::Inserted(row_id))
+        Ok(row_id)
     }
 
     async fn update_unique_mvcc(
@@ -3355,7 +3359,9 @@ impl<D: BufferPool, I: BufferPool> TableAccess for TableAccessor<'_, D, I> {
                             ColdRowUpdateRead::Ok(vals) => vals,
                             ColdRowUpdateRead::NotFound => return Ok(UpdateMvcc::NotFound),
                             ColdRowUpdateRead::WriteConflict => {
-                                return Ok(UpdateMvcc::WriteConflict);
+                                return Err(Report::new(OperationError::WriteConflict)
+                                    .attach("update MVCC cold row read")
+                                    .into());
                             }
                         };
                         let deletion_buffer = self.lwc_deletion_buffer()?;
@@ -3366,7 +3372,9 @@ impl<D: BufferPool, I: BufferPool> TableAccess for TableAccessor<'_, D, I> {
                         match deletion_buffer.put_ref(row_id, ctx.status(), ctx.sts()) {
                             Ok(()) => (),
                             Err(DeletionError::WriteConflict) => {
-                                return Ok(UpdateMvcc::WriteConflict);
+                                return Err(Report::new(OperationError::WriteConflict)
+                                    .attach("update MVCC cold delete marker ownership")
+                                    .into());
                             }
                             Err(DeletionError::AlreadyDeleted) => {
                                 return Ok(UpdateMvcc::NotFound);
@@ -3433,10 +3441,14 @@ impl<D: BufferPool, I: BufferPool> TableAccess for TableAccessor<'_, D, I> {
                             {
                                 InsertIndex::Inserted => (),
                                 InsertIndex::DuplicateKey => {
-                                    return Ok(UpdateMvcc::DuplicateKey);
+                                    return Err(Report::new(OperationError::DuplicateKey)
+                                        .attach("update MVCC cold replacement index claim")
+                                        .into());
                                 }
                                 InsertIndex::WriteConflict => {
-                                    return Ok(UpdateMvcc::WriteConflict);
+                                    return Err(Report::new(OperationError::WriteConflict)
+                                        .attach("update MVCC cold replacement index claim")
+                                        .into());
                                 }
                             }
                         }
@@ -3485,8 +3497,16 @@ impl<D: BufferPool, I: BufferPool> TableAccess for TableAccessor<'_, D, I> {
                         page_guard.set_dirty(); // mark as dirty page.
                         return match res {
                             UpdateIndex::Updated => Ok(UpdateMvcc::Updated(new_row_id)),
-                            UpdateIndex::DuplicateKey => Ok(UpdateMvcc::DuplicateKey),
-                            UpdateIndex::WriteConflict => Ok(UpdateMvcc::WriteConflict),
+                            UpdateIndex::DuplicateKey => {
+                                Err(Report::new(OperationError::DuplicateKey)
+                                    .attach("update MVCC key-change index update")
+                                    .into())
+                            }
+                            UpdateIndex::WriteConflict => {
+                                Err(Report::new(OperationError::WriteConflict)
+                                    .attach("update MVCC key-change index update")
+                                    .into())
+                            }
                         };
                     } // otherwise, do nothing
                     page_guard.set_dirty(); // mark as dirty page.
@@ -3495,7 +3515,11 @@ impl<D: BufferPool, I: BufferPool> TableAccess for TableAccessor<'_, D, I> {
                 UpdateRowInplace::RowDeleted | UpdateRowInplace::RowNotFound => {
                     return Ok(UpdateMvcc::NotFound);
                 }
-                UpdateRowInplace::WriteConflict => return Ok(UpdateMvcc::WriteConflict),
+                UpdateRowInplace::WriteConflict => {
+                    return Err(Report::new(OperationError::WriteConflict)
+                        .attach("update MVCC row-page write lock")
+                        .into());
+                }
                 UpdateRowInplace::RetryInTransition => {
                     smol::Timer::after(std::time::Duration::from_millis(1)).await;
                     continue;
@@ -3523,8 +3547,16 @@ impl<D: BufferPool, I: BufferPool> TableAccess for TableAccessor<'_, D, I> {
                         new_guard.set_dirty(); // mark as dirty page.
                         return match res {
                             UpdateIndex::Updated => Ok(UpdateMvcc::Updated(new_row_id)),
-                            UpdateIndex::DuplicateKey => Ok(UpdateMvcc::DuplicateKey),
-                            UpdateIndex::WriteConflict => Ok(UpdateMvcc::WriteConflict),
+                            UpdateIndex::DuplicateKey => {
+                                Err(Report::new(OperationError::DuplicateKey)
+                                    .attach("update MVCC moved-row index update")
+                                    .into())
+                            }
+                            UpdateIndex::WriteConflict => {
+                                Err(Report::new(OperationError::WriteConflict)
+                                    .attach("update MVCC moved-row index update")
+                                    .into())
+                            }
                         };
                     } else {
                         let res = self
@@ -3540,8 +3572,16 @@ impl<D: BufferPool, I: BufferPool> TableAccess for TableAccessor<'_, D, I> {
                         new_guard.set_dirty(); // mark as dirty page.
                         return match res {
                             UpdateIndex::Updated => Ok(UpdateMvcc::Updated(new_row_id)),
-                            UpdateIndex::DuplicateKey => Ok(UpdateMvcc::DuplicateKey),
-                            UpdateIndex::WriteConflict => Ok(UpdateMvcc::WriteConflict),
+                            UpdateIndex::DuplicateKey => {
+                                Err(Report::new(OperationError::DuplicateKey)
+                                    .attach("update MVCC moved-row index update")
+                                    .into())
+                            }
+                            UpdateIndex::WriteConflict => {
+                                Err(Report::new(OperationError::WriteConflict)
+                                    .attach("update MVCC moved-row index update")
+                                    .into())
+                            }
                         };
                     }
                 }

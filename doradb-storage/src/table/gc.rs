@@ -1,6 +1,6 @@
 use super::{Table, TableRootSnapshot};
 use crate::buffer::{BufferPool, EvictableBufferPool, PoolGuard, PoolGuards};
-use crate::error::{DataIntegrityError, Error, FileKind, Result};
+use crate::error::{DataIntegrityError, Error, FileKind, OperationError, Result};
 use crate::file::BlockID;
 use crate::file::cow_file::SUPER_BLOCK_ID;
 use crate::index::{
@@ -161,9 +161,12 @@ impl Table {
     ) -> Result<SecondaryMemIndexCleanupStats> {
         let trx_sys = session.engine().trx_sys.clone();
         loop {
-            let trx = session.try_begin_trx()?.ok_or(Error::not_supported(
-                "secondary MemIndex cleanup requires idle session",
-            ))?;
+            let trx = session.try_begin_trx()?.ok_or_else(|| {
+                Error::from(
+                    Report::new(OperationError::NotSupported)
+                        .attach("secondary MemIndex cleanup requires idle session"),
+                )
+            })?;
             let cleanup_sts = trx.sts();
             let min_active_sts = trx_sys.calc_min_active_sts_for_gc();
             let proof = trx.ctx().read_proof();

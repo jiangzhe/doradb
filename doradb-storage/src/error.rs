@@ -12,6 +12,10 @@ pub(crate) type DataIntegrityResult<T> = std::result::Result<T, Report<DataInteg
 #[allow(dead_code)]
 pub(crate) type IOResult<T> = std::result::Result<T, Report<IoError>>;
 pub(crate) type LifecycleResult<T> = std::result::Result<T, Report<LifecycleError>>;
+#[allow(dead_code)]
+pub(crate) type ResourceResult<T> = std::result::Result<T, Report<ResourceError>>;
+#[allow(dead_code)]
+pub(crate) type OperationResult<T> = std::result::Result<T, Report<OperationError>>;
 pub(crate) type CompletionResult<T> = std::result::Result<T, Report<CompletionErrorKind>>;
 
 /// Public storage error boundary classification.
@@ -111,6 +115,36 @@ pub(crate) enum LifecycleError {
     Shutdown,
     #[error("storage engine shutdown is busy")]
     ShutdownBusy,
+}
+
+/// Fieldless resource-domain errors carried underneath `ErrorKind::Resource`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ThisError)]
+pub(crate) enum ResourceError {
+    #[error("storage file capacity exceeded")]
+    StorageFileCapacityExceeded,
+    #[error("insufficient memory")]
+    InsufficientMemory,
+    #[error("buffer pool full")]
+    BufferPoolFull,
+    #[error("buffer pool size too small")]
+    BufferPoolSizeTooSmall,
+}
+
+/// Fieldless operation-domain errors carried underneath `ErrorKind::Operation`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ThisError)]
+pub(crate) enum OperationError {
+    #[error("old table root already retained")]
+    OldTableRootAlreadyRetained,
+    #[error("table not found")]
+    TableNotFound,
+    #[error("table already exists")]
+    TableAlreadyExists,
+    #[error("not supported")]
+    NotSupported,
+    #[error("duplicate key")]
+    DuplicateKey,
+    #[error("write conflict")]
+    WriteConflict,
 }
 
 /// IO-domain errors carried underneath `ErrorKind::Io`.
@@ -219,25 +253,12 @@ pub(crate) enum ErrorCode {
     InternalError,
     InvalidState,
     WrongSecondaryIndexBinding,
-    OldTableRootAlreadyRetained,
-    StorageFileCapacityExceeded,
-    DataTypeNotSupported,
     IndexOutOfBound,
     InvalidCodecForSel,
     ValueCountMismatch,
     InvalidDatatype,
-    InsufficientMemory,
     BufferPageAlreadyAllocated,
-    BufferPoolFull,
-    EmptyFreeListOfBufferPool,
-    BufferPoolSizeTooSmall,
-    RowNotFound,
-    InsufficientFreeSpaceForInplaceUpdate,
     StorageEnginePoisoned,
-    TableNotFound,
-    TableNotDeleted,
-    TableAlreadyExists,
-    NotSupported,
     ColumnNeverNull,
     InvalidColumnScan,
     ColumnStorageMissing,
@@ -449,6 +470,16 @@ impl Error {
     }
 
     #[inline]
+    pub(crate) fn resource_error(&self) -> Option<ResourceError> {
+        self.downcast_ref::<ResourceError>().copied()
+    }
+
+    #[inline]
+    pub(crate) fn operation_error(&self) -> Option<OperationError> {
+        self.downcast_ref::<OperationError>().copied()
+    }
+
+    #[inline]
     pub(crate) fn completion_error(&self) -> Option<CompletionErrorKind> {
         self.downcast_ref::<CompletionErrorKind>().copied()
     }
@@ -495,21 +526,6 @@ impl Error {
     }
 
     #[inline]
-    pub(crate) fn old_table_root_already_retained() -> Self {
-        Self::new(ErrorKind::Operation, ErrorCode::OldTableRootAlreadyRetained)
-    }
-
-    #[inline]
-    pub(crate) fn storage_file_capacity_exceeded() -> Self {
-        Self::new(ErrorKind::Resource, ErrorCode::StorageFileCapacityExceeded)
-    }
-
-    #[inline]
-    pub(crate) fn data_type_not_supported() -> Self {
-        Self::new(ErrorKind::Operation, ErrorCode::DataTypeNotSupported)
-    }
-
-    #[inline]
     pub(crate) fn index_out_of_bound() -> Self {
         Self::new(ErrorKind::InvalidInput, ErrorCode::IndexOutOfBound)
     }
@@ -530,45 +546,8 @@ impl Error {
     }
 
     #[inline]
-    pub(crate) fn insufficient_memory(total_bytes: usize) -> Self {
-        Self::new_with_attachment(
-            ErrorKind::Resource,
-            ErrorCode::InsufficientMemory,
-            total_bytes,
-        )
-    }
-
-    #[inline]
     pub(crate) fn buffer_page_already_allocated() -> Self {
         Self::new(ErrorKind::Internal, ErrorCode::BufferPageAlreadyAllocated)
-    }
-
-    #[inline]
-    pub(crate) fn buffer_pool_full() -> Self {
-        Self::new(ErrorKind::Resource, ErrorCode::BufferPoolFull)
-    }
-
-    #[inline]
-    pub(crate) fn empty_free_list_of_buffer_pool() -> Self {
-        Self::new(ErrorKind::Resource, ErrorCode::EmptyFreeListOfBufferPool)
-    }
-
-    #[inline]
-    pub(crate) fn buffer_pool_size_too_small() -> Self {
-        Self::new(ErrorKind::Resource, ErrorCode::BufferPoolSizeTooSmall)
-    }
-
-    #[inline]
-    pub(crate) fn row_not_found() -> Self {
-        Self::new(ErrorKind::Operation, ErrorCode::RowNotFound)
-    }
-
-    #[inline]
-    pub(crate) fn insufficient_free_space_for_inplace_update() -> Self {
-        Self::new(
-            ErrorKind::Operation,
-            ErrorCode::InsufficientFreeSpaceForInplaceUpdate,
-        )
     }
 
     #[inline]
@@ -584,26 +563,6 @@ impl Error {
     #[inline]
     pub(crate) fn is_storage_poisoned_by(&self, source: StoragePoisonSource) -> bool {
         self.storage_poison_source() == Some(source)
-    }
-
-    #[inline]
-    pub(crate) fn table_not_found() -> Self {
-        Self::new(ErrorKind::Operation, ErrorCode::TableNotFound)
-    }
-
-    #[inline]
-    pub(crate) fn table_not_deleted() -> Self {
-        Self::new(ErrorKind::Operation, ErrorCode::TableNotDeleted)
-    }
-
-    #[inline]
-    pub(crate) fn table_already_exists() -> Self {
-        Self::new(ErrorKind::Operation, ErrorCode::TableAlreadyExists)
-    }
-
-    #[inline]
-    pub(crate) fn not_supported(feature: &'static str) -> Self {
-        Self::new_with_attachment(ErrorKind::Operation, ErrorCode::NotSupported, feature)
     }
 
     #[inline]
@@ -636,17 +595,6 @@ impl Error {
             ErrorCode::EngineComponentMissingDependency,
         )
     }
-
-    #[inline]
-    pub(crate) fn is_storage_file_capacity_exceeded(&self) -> bool {
-        self.is_code(ErrorCode::StorageFileCapacityExceeded)
-    }
-
-    #[inline]
-    pub(crate) fn is_not_supported(&self, feature: &'static str) -> bool {
-        self.is_code(ErrorCode::NotSupported)
-            && self.downcast_ref::<&'static str>().copied() == Some(feature)
-    }
 }
 
 impl From<Report<ConfigError>> for Error {
@@ -667,6 +615,20 @@ impl From<Report<LifecycleError>> for Error {
     #[inline]
     fn from(report: Report<LifecycleError>) -> Self {
         Error(report.change_context(ErrorKind::Lifecycle))
+    }
+}
+
+impl From<Report<ResourceError>> for Error {
+    #[inline]
+    fn from(report: Report<ResourceError>) -> Self {
+        Error(report.change_context(ErrorKind::Resource))
+    }
+}
+
+impl From<Report<OperationError>> for Error {
+    #[inline]
+    fn from(report: Report<OperationError>) -> Self {
+        Error(report.change_context(ErrorKind::Operation))
     }
 }
 

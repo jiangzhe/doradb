@@ -649,8 +649,8 @@ mod tests {
     use crate::file::cow_file::BlockID;
     use crate::index::{RowLocation, UniqueIndex};
     use crate::latch::LatchFallbackMode;
-    use crate::row::RowPage;
-    use crate::row::ops::{DeleteMvcc, InsertMvcc, SelectKey};
+    use crate::row::ops::{DeleteMvcc, SelectKey};
+    use crate::row::{RowID, RowPage};
     use crate::stmt::Statement;
     use crate::table::{DeleteMarker, Table, TableAccess};
     use crate::trx::row::RowReadAccess;
@@ -687,7 +687,7 @@ mod tests {
         stmt: &mut Statement,
         table: &Table,
         cols: Vec<Val>,
-    ) -> crate::error::Result<InsertMvcc> {
+    ) -> crate::error::Result<RowID> {
         let (ctx, effects) = stmt.ctx_and_effects_mut();
         table.accessor().insert_mvcc(ctx, effects, cols).await
     }

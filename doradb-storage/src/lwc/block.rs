@@ -2,7 +2,7 @@
 
 use crate::buffer::{PoolGuard, ReadonlyBlockGuard, ReadonlyBufferPool};
 use crate::catalog::TableMetadata;
-use crate::error::{DataIntegrityError, Error, FileKind, Result};
+use crate::error::{DataIntegrityError, Error, FileKind, OperationError, Result};
 use crate::file::SparseFile;
 use crate::file::block_integrity::{
     BLOCK_INTEGRITY_HEADER_SIZE, LWC_BLOCK_SPEC, max_payload_len, validate_block,
@@ -538,7 +538,9 @@ impl Ser<'_> for LwcBlockHeader {
 
 #[inline]
 pub(crate) fn map_persisted_lwc_error(file_kind: FileKind, block_id: BlockID, err: Error) -> Error {
-    if err.data_integrity_error().is_some() || err.is_code(crate::error::ErrorCode::NotSupported) {
+    if err.data_integrity_error().is_some()
+        || err.operation_error() == Some(OperationError::NotSupported)
+    {
         persisted_lwc_payload_error(file_kind, block_id, "invalid persisted LWC payload")
     } else {
         err

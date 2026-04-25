@@ -18,7 +18,7 @@ use crate::buffer::{
     BufferPool, EvictableBufferPool, FixedBufferPool, PoolGuards, PoolRole, ReadonlyBufferPool,
 };
 use crate::component::{Component, ComponentRegistry, MetaPool, ShelfScope};
-use crate::error::{Error, Result};
+use crate::error::{Error, OperationError, Result};
 use crate::file::fs::FileSystem;
 use crate::index::{BlockIndex, RowLocation};
 use crate::quiescent::{QuiescentBox, QuiescentGuard};
@@ -28,6 +28,7 @@ use crate::table::{ColumnDeletionBuffer, IndexRollback, Table, TableAccess};
 use crate::trx::TrxID;
 use crate::trx::undo::IndexUndo;
 use dashmap::DashMap;
+use error_stack::Report;
 use std::collections::hash_map::Entry;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
@@ -165,7 +166,9 @@ impl Catalog {
         table_id: TableID,
     ) -> Result<()> {
         if self.user_tables.contains_key(&table_id) {
-            return Err(Error::table_already_exists());
+            return Err(Report::new(OperationError::TableAlreadyExists)
+                .attach(format!("reload user table: table_id={table_id}"))
+                .into());
         }
         let res = self
             .storage
@@ -270,11 +273,15 @@ impl Catalog {
                 );
                 let old = self.user_tables.insert(table_id, table);
                 if old.is_some() {
-                    return Err(Error::table_already_exists());
+                    return Err(Report::new(OperationError::TableAlreadyExists)
+                        .attach(format!("insert reloaded user table: table_id={table_id}"))
+                        .into());
                 }
                 Ok(())
             }
-            None => Err(Error::table_not_found()),
+            None => Err(Report::new(OperationError::TableNotFound)
+                .attach(format!("reload user table metadata: table_id={table_id}"))
+                .into()),
         }
     }
 

@@ -1,6 +1,7 @@
 use crate::buffer::frame::BufferFrame;
 use crate::buffer::page::{Page, PageID};
-use crate::error::{Error, Result};
+use crate::error::{ResourceError, Result};
+use error_stack::Report;
 use libc::{
     MADV_DONTFORK, MADV_DONTNEED, MADV_HUGEPAGE, MADV_REMOVE, MAP_ANONYMOUS, MAP_FAILED,
     MAP_PRIVATE, PROT_READ, PROT_WRITE, c_void, madvise, mmap, munmap,
@@ -84,7 +85,9 @@ pub(super) unsafe fn mmap_allocate(total_bytes: usize) -> Result<*mut u8> {
             0,
         );
         if memory_chunk == MAP_FAILED {
-            return Err(Error::insufficient_memory(total_bytes));
+            return Err(Report::new(ResourceError::InsufficientMemory)
+                .attach(format!("mmap allocation: total_bytes={total_bytes}"))
+                .into());
         }
         madvise(memory_chunk, total_bytes, MADV_HUGEPAGE);
         madvise(memory_chunk, total_bytes, MADV_DONTFORK);

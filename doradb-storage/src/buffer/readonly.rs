@@ -15,7 +15,7 @@ use crate::buffer::{
     BufferPoolStats, BufferPoolStatsHandle, PageIOCompletion, PoolGuard, PoolIdentity, PoolRole,
     ReadonlyBlockValidator,
 };
-use crate::error::{CompletionErrorKind, CompletionResult, Error, FileKind, Result};
+use crate::error::{CompletionErrorKind, CompletionResult, Error, FileKind, ResourceError, Result};
 use crate::file::fs::FileSystem;
 use crate::file::{BlockID, BlockKey, FileID, SparseFile};
 use crate::io::{IOKind, IOSubmission, Operation, StdIoResult};
@@ -85,7 +85,11 @@ impl ReadonlyBufferPool {
         let frame_plus_page = mem::size_of::<BufferFrame>() + mem::size_of::<Page>();
         let size = pool_size / frame_plus_page;
         if size < MIN_READONLY_POOL_PAGES {
-            return Err(Error::buffer_pool_size_too_small());
+            return Err(Report::new(ResourceError::BufferPoolSizeTooSmall)
+                .attach(format!(
+                    "global readonly buffer pool sizing: role={role:?}, pool_size={pool_size}, frame_plus_page={frame_plus_page}, pages={size}, min_pages={MIN_READONLY_POOL_PAGES}"
+                ))
+                .into());
         }
         let eviction_arbiter = eviction_arbiter_builder.build(size);
         let arena = QuiescentArena::new(size)?;
@@ -1237,7 +1241,7 @@ pub(crate) mod tests {
     use crate::catalog::TableID;
     use crate::catalog::{ColumnAttributes, ColumnSpec, TableMetadata, USER_OBJ_ID_START};
     use crate::conf::{EngineConfig, EvictableBufferPoolConfig, FileSystemConfig, TrxSysConfig};
-    use crate::error::{CompletionErrorKind, Error, FileKind};
+    use crate::error::{CompletionErrorKind, Error, FileKind, ResourceError};
     use crate::file::block_integrity::{
         BLOCK_INTEGRITY_HEADER_SIZE, COLUMN_BLOCK_INDEX_BLOCK_SPEC,
         COLUMN_DELETION_BLOB_BLOCK_SPEC, LWC_BLOCK_SPEC, max_payload_len, write_block_checksum,
@@ -1820,8 +1824,9 @@ pub(crate) mod tests {
         let fs_owner = build_test_fs_owner_in(temp_dir.path()).unwrap();
         let res = ReadonlyBufferPool::with_capacity(PoolRole::Disk, bytes, fs_owner.guard());
         assert!(
-            res.as_ref()
-                .is_err_and(|err| err.is_code(crate::error::ErrorCode::BufferPoolSizeTooSmall))
+            res.as_ref().is_err_and(
+                |err| err.resource_error() == Some(ResourceError::BufferPoolSizeTooSmall)
+            )
         );
     }
 

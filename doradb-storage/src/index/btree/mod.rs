@@ -1924,6 +1924,7 @@ enum BTreeCompact {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error::ResourceError;
     use crate::quiescent::{QuiescentBox, QuiescentGuard};
     use rand::SeedableRng;
     use rand_chacha::ChaCha8Rng;
@@ -2348,7 +2349,7 @@ mod tests {
                     .split_root::<BTreeU64>(&pool_guard, root, true, 210)
                     .await
                     .expect_err("second split-root allocation should fail");
-                assert!(err.is_code(crate::error::ErrorCode::BufferPoolFull));
+                assert_eq!(err.resource_error(), Some(ResourceError::BufferPoolFull));
             }
 
             assert_eq!(pool.allocated(), 1);

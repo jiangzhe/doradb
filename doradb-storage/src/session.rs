@@ -3,12 +3,13 @@ use crate::buffer::{BufferPool, PoolGuards, PoolRole};
 use crate::catalog::{ColumnObject, IndexColumnObject, IndexObject, TableMetadata, TableObject};
 use crate::catalog::{IndexSpec, TableID, TableSpec};
 use crate::engine::EngineRef;
-use crate::error::{Error, Result};
+use crate::error::{OperationError, Result};
 use crate::index::BlockIndex;
 use crate::row::RowID;
 use crate::table::Table;
 use crate::trx::redo::DDLRedo;
 use crate::trx::{ActiveTrx, TrxID};
+use error_stack::Report;
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -90,7 +91,9 @@ impl Session {
         index_specs: Vec<IndexSpec>,
     ) -> Result<TableID> {
         if self.in_trx() {
-            return Err(Error::not_supported("implicit commit due to DDL"));
+            return Err(Report::new(OperationError::NotSupported)
+                .attach("implicit commit due to DDL")
+                .into());
         }
 
         let engine = self.state.engine().clone();
@@ -163,7 +166,9 @@ impl Session {
         if !inserted {
             uninit_table_file.try_delete();
             stmt.fail().await?.rollback().await?;
-            return Err(Error::table_already_exists());
+            return Err(Report::new(OperationError::TableAlreadyExists)
+                .attach(format!("create table catalog object: table_id={table_id}"))
+                .into());
         }
 
         for column_object in column_objects {

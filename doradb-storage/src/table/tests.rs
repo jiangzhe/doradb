@@ -6,7 +6,10 @@ use crate::buffer::{EvictableBufferPool, PoolGuards, PoolRole, test_frame_kind};
 use crate::catalog::tests::table4;
 use crate::conf::{EngineConfig, EvictableBufferPoolConfig, FileSystemConfig, TrxSysConfig};
 use crate::engine::Engine;
-use crate::error::{CompletionErrorKind, DataIntegrityError, Error, Result, StoragePoisonSource};
+use crate::error::{
+    CompletionErrorKind, DataIntegrityError, Error, OperationError, ResourceError, Result,
+    StoragePoisonSource,
+};
 use crate::file::block_integrity::{BLOCK_INTEGRITY_HEADER_SIZE, write_block_checksum};
 use crate::file::cow_file::{
     BlockID, COW_FILE_PAGE_SIZE, SUPER_BLOCK_ID, tests::old_root_drop_count,
@@ -21,7 +24,7 @@ use crate::io::{
     install_storage_backend_test_hook,
 };
 use crate::latch::LatchFallbackMode;
-use crate::row::ops::{DeleteMvcc, InsertMvcc, SelectKey, SelectMvcc, UpdateCol, UpdateMvcc};
+use crate::row::ops::{DeleteMvcc, SelectKey, SelectMvcc, UpdateCol, UpdateMvcc};
 use crate::row::{RowID, RowPage, RowRead};
 use crate::session::Session;
 use crate::stmt::Statement;
@@ -84,11 +87,7 @@ fn assert_table_data_integrity(
     assert!(report.contains(&format!("block_id={block_id}")), "{report}");
 }
 
-async fn stmt_insert_row(
-    stmt: &mut Statement,
-    table: &Table,
-    cols: Vec<Val>,
-) -> Result<InsertMvcc> {
+async fn stmt_insert_row(stmt: &mut Statement, table: &Table, cols: Vec<Val>) -> Result<RowID> {
     let (ctx, effects) = stmt.ctx_and_effects_mut();
     table.accessor().insert_mvcc(ctx, effects, cols).await
 }
@@ -231,7 +230,8 @@ fn test_mvcc_insert_dup_key() {
             let mut trx = session.try_begin_trx().unwrap().unwrap();
             let mut stmt = trx.start_stmt();
             let res = stmt_insert_row(&mut stmt, &sys.table, insert).await;
-            assert!(matches!(res, Ok(InsertMvcc::DuplicateKey)));
+            let err = res.unwrap_err();
+            assert_eq!(err.operation_error(), Some(OperationError::DuplicateKey));
             trx = stmt.fail().await.unwrap();
             trx.rollback().await.unwrap();
         }
@@ -242,7 +242,7 @@ fn test_mvcc_insert_dup_key() {
             let mut trx1 = session.try_begin_trx().unwrap().unwrap();
             let mut stmt1 = trx1.start_stmt();
             let res = stmt_insert_row(&mut stmt1, &sys.table, insert1).await;
-            assert!(matches!(res, Ok(InsertMvcc::Inserted(_))));
+            assert!(res.is_ok());
             trx1 = stmt1.succeed();
 
             // begin concurrent transaction and insert [2, "world"]
@@ -252,7 +252,8 @@ fn test_mvcc_insert_dup_key() {
             let mut stmt2 = trx2.start_stmt();
             let res = stmt_insert_row(&mut stmt2, &sys.table, insert2).await;
             // still dup key because circuit breaker on index search.
-            assert!(matches!(res, Ok(InsertMvcc::DuplicateKey)));
+            let err = res.unwrap_err();
+            assert_eq!(err.operation_error(), Some(OperationError::DuplicateKey));
             stmt2.fail().await.unwrap().rollback().await.unwrap();
             drop(session2);
 
@@ -1043,7 +1044,8 @@ fn test_lwc_update_unique_conflicts_when_delete_committed_after_snapshot() {
             }],
         )
         .await;
-        assert!(matches!(res, Ok(UpdateMvcc::WriteConflict)));
+        let err = res.unwrap_err();
+        assert_eq!(err.operation_error(), Some(OperationError::WriteConflict));
         let writer = stmt.fail().await.unwrap();
         writer.rollback().await.unwrap();
 
@@ -1167,7 +1169,8 @@ fn test_lwc_update_unique_duplicate_rolls_back_cold_marker_and_hot_insert() {
             }],
         )
         .await;
-        assert!(matches!(res, Ok(UpdateMvcc::DuplicateKey)));
+        let err = res.unwrap_err();
+        assert_eq!(err.operation_error(), Some(OperationError::DuplicateKey));
         let trx = stmt.fail().await.unwrap();
         trx.rollback().await.unwrap();
 
@@ -1307,7 +1310,8 @@ fn test_lwc_update_unique_rejects_cold_owner_deleted_after_snapshot() {
             ],
         )
         .await;
-        assert!(matches!(res, Ok(UpdateMvcc::DuplicateKey)));
+        let err = res.unwrap_err();
+        assert_eq!(err.operation_error(), Some(OperationError::DuplicateKey));
         let writer = stmt.fail().await.unwrap();
         writer.rollback().await.unwrap();
 
@@ -1817,7 +1821,8 @@ fn test_secondary_mem_index_cleanup_requires_idle_session() {
             .cleanup_secondary_mem_indexes(&mut session, true)
             .await
             .unwrap_err();
-        assert!(err.is_not_supported("secondary MemIndex cleanup requires idle session"));
+        assert_eq!(err.operation_error(), Some(OperationError::NotSupported));
+        assert!(format!("{err:?}").contains("secondary MemIndex cleanup requires idle session"));
         assert!(session.in_trx());
 
         trx.rollback().await.unwrap();
@@ -4453,7 +4458,7 @@ fn test_string_index_updates() {
                 let insert = vec![Val::from(&s[..0])];
                 let mut stmt = session.try_begin_trx().unwrap().unwrap().start_stmt();
                 let res = stmt_insert_row(&mut stmt, &table, insert).await;
-                assert!(matches!(res, Ok(InsertMvcc::Inserted(_))));
+                assert!(res.is_ok());
                 stmt.succeed().commit().await.unwrap();
             }
             // perform updates.
@@ -4492,7 +4497,7 @@ fn test_mvcc_out_of_place_update() {
                 let insert = vec![Val::from(&s[..BASE + i])];
                 let mut stmt = session.try_begin_trx().unwrap().unwrap().start_stmt();
                 let res = stmt_insert_row(&mut stmt, &table, insert).await;
-                assert!(matches!(res, Ok(InsertMvcc::Inserted(_))));
+                assert!(res.is_ok());
                 stmt.succeed().commit().await.unwrap();
             }
             // perform updates to trigger out-of-place update.
@@ -4911,7 +4916,8 @@ fn test_checkpoint_requires_idle_session_before_delayed_outcome() {
         ));
 
         let err = sys.table.checkpoint(&mut session).await.unwrap_err();
-        assert!(err.is_not_supported("checkpoint requires idle session"));
+        assert_eq!(err.operation_error(), Some(OperationError::NotSupported));
+        assert!(format!("{err:?}").contains("checkpoint requires idle session"));
         assert!(session.in_trx());
 
         checkpoint_trx.rollback().await.unwrap();
@@ -5037,7 +5043,7 @@ fn test_checkpoint_snapshot_consistency() {
             let mut stmt = write_trx.start_stmt();
             let insert = vec![Val::from(10_000i32), Val::from("new")];
             let res = stmt_insert_row(&mut stmt, &sys.table, insert).await;
-            assert!(matches!(res, Ok(InsertMvcc::Inserted(_))));
+            assert!(res.is_ok());
             write_trx = stmt.succeed();
         }
 
@@ -5561,7 +5567,7 @@ fn test_mvcc_rollback_poisons_runtime_on_row_page_reload_error() {
         )
         .await
         {
-            Ok(InsertMvcc::Inserted(row_id)) => row_id,
+            Ok(row_id) => row_id,
             res => panic!("res={res:?}"),
         };
         trx = stmt.succeed();
@@ -5697,7 +5703,7 @@ fn test_build_in_memory_secondary_indexes_reclaims_staged_indexes_on_error() {
             Ok(_) => panic!("second secondary-index construction should fail in one-page pool"),
             Err(err) => err,
         };
-        assert!(err.is_code(crate::error::ErrorCode::BufferPoolFull));
+        assert_eq!(err.resource_error(), Some(ResourceError::BufferPoolFull));
         assert_eq!(pool.allocated(), 0);
     });
 }
@@ -5769,7 +5775,7 @@ fn test_user_secondary_indexes_evict_and_continue_serving_lookups() {
                     vec![Val::from(row_id), Val::from(&key[..])],
                 )
                 .await;
-                assert!(matches!(res, Ok(InsertMvcc::Inserted(_))), "res={res:?}");
+                assert!(res.is_ok(), "res={res:?}");
                 trx = stmt.succeed();
                 inserted.push((row_id, key));
             }
@@ -5993,7 +5999,7 @@ impl TestSys {
     async fn trx_insert(&self, trx: ActiveTrx, insert: Vec<Val>) -> ActiveTrx {
         let mut stmt = trx.start_stmt();
         let res = stmt_insert_row(&mut stmt, &self.table, insert).await;
-        if !matches!(res, Ok(InsertMvcc::Inserted(_))) {
+        if res.is_err() {
             panic!("res={:?}", res);
         }
         // assert!(res.is_ok());
@@ -6095,7 +6101,7 @@ async fn insert_one_row(table: &Table, session: &mut Session, values: Vec<Val>) 
     let mut trx = session.try_begin_trx().unwrap().unwrap();
     let mut stmt = trx.start_stmt();
     let insert = stmt_insert_row(&mut stmt, table, values).await;
-    let Ok(InsertMvcc::Inserted(row_id)) = insert else {
+    let Ok(row_id) = insert else {
         panic!("insert should succeed: {insert:?}");
     };
     trx = stmt.succeed();
@@ -6117,9 +6123,9 @@ fn name_key(value: &str) -> SelectKey {
     }
 }
 
-fn unwrap_insert_result(res: Result<InsertMvcc>) -> RowID {
+fn unwrap_insert_result(res: Result<RowID>) -> RowID {
     match res {
-        Ok(InsertMvcc::Inserted(row_id)) => row_id,
+        Ok(row_id) => row_id,
         res => panic!("unexpected insert result: {res:?}"),
     }
 }
@@ -6411,7 +6417,7 @@ async fn insert_rows_direct(
         let insert = vec![Val::from(start + i), Val::from(name)];
         let mut stmt = trx.start_stmt();
         let res = stmt_insert_row(&mut stmt, table, insert).await;
-        assert!(matches!(res, Ok(InsertMvcc::Inserted(_))));
+        assert!(res.is_ok());
         trx = stmt.succeed();
     }
     trx.commit().await.unwrap();
@@ -6459,7 +6465,7 @@ fn test_secondary_index_common() {
                     .accessor()
                     .insert_mvcc(ctx, effects, vec![Val::from(i), Val::from(i)])
                     .await;
-                assert!(matches!(res, Ok(InsertMvcc::Inserted(_))));
+                assert!(res.is_ok());
             }
             stmt.succeed().commit().await.unwrap();
 
@@ -6559,7 +6565,7 @@ fn test_secondary_index_rollback() {
                     .accessor()
                     .insert_mvcc(ctx, effects, vec![Val::from(i), Val::from(i)])
                     .await;
-                assert!(matches!(res, Ok(InsertMvcc::Inserted(_))));
+                assert!(res.is_ok());
             }
             stmt.succeed().commit().await.unwrap();
 
@@ -6570,7 +6576,7 @@ fn test_secondary_index_rollback() {
                 .accessor()
                 .insert_mvcc(ctx, effects, vec![Val::from(5i32), Val::from(5i32)])
                 .await;
-            assert!(matches!(res, Ok(InsertMvcc::Inserted(_))));
+            assert!(res.is_ok());
             stmt.succeed().rollback().await.unwrap();
 
             let trx = session.try_begin_trx().unwrap().unwrap();
@@ -6649,7 +6655,7 @@ fn test_secondary_index_rollback() {
                 .accessor()
                 .insert_mvcc(ctx, effects, vec![Val::from(3), Val::from(3)])
                 .await;
-            assert!(matches!(res, Ok(InsertMvcc::Inserted(_))));
+            assert!(res.is_ok());
             trx = stmt.succeed();
             trx.rollback().await.unwrap();
 

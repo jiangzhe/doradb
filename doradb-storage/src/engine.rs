@@ -362,7 +362,7 @@ mod tests {
     use crate::catalog::tests::table1;
     use crate::conf::consts::STORAGE_LAYOUT_FILE_NAME;
     use crate::conf::{EngineConfig, EvictableBufferPoolConfig, FileSystemConfig, TrxSysConfig};
-    use crate::error::{ConfigError, ErrorKind, LifecycleError};
+    use crate::error::{ConfigError, ErrorKind, LifecycleError, ResourceError};
     use crate::file::fs::tests::io_backend_stats_handle_identity as fs_stats_handle_identity;
     use std::fs;
     use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -619,7 +619,10 @@ mod tests {
                 Ok(_) => panic!("expected startup failure"),
                 Err(err) => err,
             };
-            assert!(err.is_code(crate::error::ErrorCode::BufferPoolSizeTooSmall));
+            assert_eq!(
+                err.resource_error(),
+                Some(ResourceError::BufferPoolSizeTooSmall)
+            );
             assert!(!marker_path.exists());
 
             let engine = test_engine_config_for(root.path())

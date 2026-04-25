@@ -1,6 +1,6 @@
 use crate::buffer::PageID;
 use crate::catalog::{IndexSpec, TableMetadata};
-use crate::error::{Error, ErrorKind, Result, StoragePoisonSource};
+use crate::error::{Error, ErrorKind, OperationError, Result, StoragePoisonSource};
 use crate::file::cow_file::SUPER_BLOCK_ID;
 use crate::file::table_file::{ActiveRoot, MutableTableFile};
 use crate::index::BTreeKeyEncoder;
@@ -15,6 +15,7 @@ use crate::table::Table;
 use crate::trx::TrxID;
 use crate::trx::redo::DDLRedo;
 use crate::value::{Val, ValKind, ValType};
+use error_stack::Report;
 use std::collections::BTreeSet;
 use std::future::Future;
 
@@ -691,7 +692,9 @@ impl TablePersistence for Table {
 
     async fn checkpoint(&self, session: &mut Session) -> Result<CheckpointOutcome> {
         if session.in_trx() {
-            return Err(Error::not_supported(CHECKPOINT_REQUIRES_IDLE_SESSION));
+            return Err(Report::new(OperationError::NotSupported)
+                .attach(CHECKPOINT_REQUIRES_IDLE_SESSION)
+                .into());
         }
 
         let table_file = self.file();
@@ -722,9 +725,11 @@ impl TablePersistence for Table {
 
         // Step 3: open a checkpoint transaction, then move frozen pages into
         // transition state under the refreshed cutoff timestamp.
-        let mut trx = session
-            .try_begin_trx()?
-            .ok_or(Error::not_supported(CHECKPOINT_REQUIRES_IDLE_SESSION))?;
+        let mut trx = session.try_begin_trx()?.ok_or_else(|| {
+            Error::from(
+                Report::new(OperationError::NotSupported).attach(CHECKPOINT_REQUIRES_IDLE_SESSION),
+            )
+        })?;
         let checkpoint_ts = trx.sts();
         if !frozen_pages.is_empty() {
             self.set_frozen_pages_to_transition(&pool_guards, &frozen_pages, cutoff_ts)

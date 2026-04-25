@@ -7,7 +7,7 @@ pub use block::*;
 use crate::bitmap::Bitmap;
 use crate::catalog::TableMetadata;
 use crate::compression::*;
-use crate::error::{DataIntegrityError, Error, Result};
+use crate::error::{DataIntegrityError, Error, OperationError, Result};
 use crate::file::block_integrity::{LWC_BLOCK_SPEC, write_block_checksum, write_block_header};
 use crate::file::cow_file::COW_FILE_PAGE_SIZE;
 use crate::io::DirectBuf;
@@ -120,7 +120,13 @@ impl<'a> LwcData<'a> {
                             1 => LwcPrimitive::ForBp1I8(ForBitpacking1 { len, min, data }),
                             2 => LwcPrimitive::ForBp2I8(ForBitpacking2 { len, min, data }),
                             4 => LwcPrimitive::ForBp4I8(ForBitpacking4 { len, min, data }),
-                            _ => return Err(Error::not_supported("unexpected packing bits")),
+                            _ => {
+                                return Err(Report::new(OperationError::NotSupported)
+                                    .attach(format!(
+                                        "unexpected packing bits: val_kind={kind:?}, n_bits={n_bits}"
+                                    ))
+                                    .into());
+                            }
                         }
                     }
                     ValKind::U8 => {
@@ -130,7 +136,13 @@ impl<'a> LwcData<'a> {
                             1 => LwcPrimitive::ForBp1U8(ForBitpacking1 { len, min, data }),
                             2 => LwcPrimitive::ForBp2U8(ForBitpacking2 { len, min, data }),
                             4 => LwcPrimitive::ForBp4U8(ForBitpacking4 { len, min, data }),
-                            _ => return Err(Error::not_supported("unexpected packing bits")),
+                            _ => {
+                                return Err(Report::new(OperationError::NotSupported)
+                                    .attach(format!(
+                                        "unexpected packing bits: val_kind={kind:?}, n_bits={n_bits}"
+                                    ))
+                                    .into());
+                            }
                         }
                     }
                     ValKind::I16 => {
@@ -141,7 +153,13 @@ impl<'a> LwcData<'a> {
                             2 => LwcPrimitive::ForBp2I16(ForBitpacking2 { len, min, data }),
                             4 => LwcPrimitive::ForBp4I16(ForBitpacking4 { len, min, data }),
                             8 => LwcPrimitive::ForBp8I16(ForBitpacking8 { min, data }),
-                            _ => return Err(Error::not_supported("unexpected packing bits")),
+                            _ => {
+                                return Err(Report::new(OperationError::NotSupported)
+                                    .attach(format!(
+                                        "unexpected packing bits: val_kind={kind:?}, n_bits={n_bits}"
+                                    ))
+                                    .into());
+                            }
                         }
                     }
                     ValKind::U16 => {
@@ -152,7 +170,13 @@ impl<'a> LwcData<'a> {
                             2 => LwcPrimitive::ForBp2U16(ForBitpacking2 { len, min, data }),
                             4 => LwcPrimitive::ForBp4U16(ForBitpacking4 { len, min, data }),
                             8 => LwcPrimitive::ForBp8U16(ForBitpacking8 { min, data }),
-                            _ => return Err(Error::not_supported("unexpected packing bits")),
+                            _ => {
+                                return Err(Report::new(OperationError::NotSupported)
+                                    .attach(format!(
+                                        "unexpected packing bits: val_kind={kind:?}, n_bits={n_bits}"
+                                    ))
+                                    .into());
+                            }
                         }
                     }
                     ValKind::I32 => {
@@ -167,7 +191,13 @@ impl<'a> LwcData<'a> {
                                 let data = bytemuck::cast_slice::<u8, [u8; 2]>(data);
                                 LwcPrimitive::ForBp16I32(ForBitpacking16 { min, data })
                             }
-                            _ => return Err(Error::not_supported("unexpected packing bits")),
+                            _ => {
+                                return Err(Report::new(OperationError::NotSupported)
+                                    .attach(format!(
+                                        "unexpected packing bits: val_kind={kind:?}, n_bits={n_bits}"
+                                    ))
+                                    .into());
+                            }
                         }
                     }
                     ValKind::U32 => {
@@ -182,7 +212,13 @@ impl<'a> LwcData<'a> {
                                 let data = bytemuck::cast_slice::<u8, [u8; 2]>(data);
                                 LwcPrimitive::ForBp16U32(ForBitpacking16 { min, data })
                             }
-                            _ => return Err(Error::not_supported("unexpected packing bits")),
+                            _ => {
+                                return Err(Report::new(OperationError::NotSupported)
+                                    .attach(format!(
+                                        "unexpected packing bits: val_kind={kind:?}, n_bits={n_bits}"
+                                    ))
+                                    .into());
+                            }
                         }
                     }
                     ValKind::I64 => {
@@ -201,7 +237,13 @@ impl<'a> LwcData<'a> {
                                 let data = bytemuck::cast_slice::<u8, [u8; 4]>(data);
                                 LwcPrimitive::ForBp32I64(ForBitpacking32 { min, data })
                             }
-                            _ => return Err(Error::not_supported("unexpected packing bits")),
+                            _ => {
+                                return Err(Report::new(OperationError::NotSupported)
+                                    .attach(format!(
+                                        "unexpected packing bits: val_kind={kind:?}, n_bits={n_bits}"
+                                    ))
+                                    .into());
+                            }
                         }
                     }
                     ValKind::U64 => {
@@ -222,12 +264,18 @@ impl<'a> LwcData<'a> {
                             }
                             _ => {
                                 // any other number of bits are not supported.
-                                return Err(Error::not_supported("unexpected packing bits"));
+                                return Err(Report::new(OperationError::NotSupported)
+                                    .attach(format!(
+                                        "unexpected packing bits: val_kind={kind:?}, n_bits={n_bits}"
+                                    ))
+                                    .into());
                             }
                         }
                     }
                     ValKind::F32 | ValKind::F64 | ValKind::VarByte => {
-                        return Err(Error::not_supported("unexpected type"));
+                        return Err(Report::new(OperationError::NotSupported)
+                            .attach(format!("unexpected type: val_kind={kind:?}"))
+                            .into());
                     }
                 };
                 LwcData::Primitive(p)
@@ -1609,7 +1657,7 @@ fn read_i8(input: &[u8]) -> Result<(i8, &[u8])> {
 mod tests {
     use super::*;
     use crate::catalog::{ColumnAttributes, ColumnSpec};
-    use crate::error::{DataIntegrityError, FileKind};
+    use crate::error::{DataIntegrityError, FileKind, OperationError};
     use crate::file::test_block_id;
     use crate::index::ColumnBlockEntryShape;
     use crate::io::IOBuf;
@@ -1903,7 +1951,7 @@ mod tests {
         let err = LwcData::from_bytes(ValKind::U8, &payload);
         assert!(
             err.as_ref()
-                .is_err_and(|err| err.is_code(crate::error::ErrorCode::NotSupported))
+                .is_err_and(|err| err.operation_error() == Some(OperationError::NotSupported))
         );
     }
 

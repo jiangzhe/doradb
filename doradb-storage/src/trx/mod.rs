@@ -32,7 +32,7 @@ use crate::buffer::PoolGuards;
 use crate::buffer::page::VersionedPageID;
 use crate::catalog::TableID;
 use crate::engine::EngineRef;
-use crate::error::{Error, Result};
+use crate::error::{OperationError, Result};
 use crate::file::table_file::OldRoot;
 use crate::row::RowID;
 use crate::session::SessionState;
@@ -41,6 +41,7 @@ use crate::trx::log_replay::TrxLog;
 use crate::trx::redo::{RedoHeader, RedoLogs, RedoTrxKind, RowRedo, RowRedoKind};
 use crate::trx::undo::{IndexPurgeEntry, IndexUndoLogs, RowUndoHead, RowUndoLogs, UndoStatus};
 use crate::value::Val;
+use error_stack::Report;
 use event_listener::{Event, EventListener};
 use flume::{Receiver, Sender};
 use parking_lot::Mutex;
@@ -368,7 +369,9 @@ impl TrxEffects {
     #[inline]
     pub(crate) fn retain_old_table_root(&mut self, old_root: OldRoot) -> Result<()> {
         if self.old_table_root.is_some() {
-            return Err(Error::old_table_root_already_retained());
+            return Err(Report::new(OperationError::OldTableRootAlreadyRetained)
+                .attach("retain old table root: transaction effects already hold one old root")
+                .into());
         }
         self.old_table_root = Some(old_root);
         Ok(())
@@ -1328,7 +1331,10 @@ mod tests {
             trx.retain_old_table_root(first_old_root).unwrap();
 
             let err = trx.retain_old_table_root(second_old_root).unwrap_err();
-            assert!(err.is_code(crate::error::ErrorCode::OldTableRootAlreadyRetained));
+            assert_eq!(
+                err.operation_error(),
+                Some(OperationError::OldTableRootAlreadyRetained)
+            );
             assert_eq!(
                 old_root_drop_count(first_old_root_ptr),
                 first_drop_count_before
