@@ -1,6 +1,6 @@
 use crate::buffer::PageID;
 use crate::catalog::{IndexSpec, TableMetadata};
-use crate::error::{Error, ErrorKind, OperationError, Result, StoragePoisonSource};
+use crate::error::{Error, ErrorKind, FatalError, OperationError, Result};
 use crate::file::cow_file::SUPER_BLOCK_ID;
 use crate::file::table_file::{ActiveRoot, MutableTableFile};
 use crate::index::BTreeKeyEncoder;
@@ -840,8 +840,8 @@ impl TablePersistence for Table {
             Ok(res) => res,
             Err(err) if err.kind() == ErrorKind::Io => {
                 let _ = trx_sys.rollback(trx).await;
-                let poison = trx_sys.poison_storage(StoragePoisonSource::CheckpointWrite);
-                return Err(poison);
+                let poison = trx_sys.poison_storage(FatalError::CheckpointWrite);
+                return Err(poison.into());
             }
             Err(err) => {
                 trx_sys.rollback(trx).await?;

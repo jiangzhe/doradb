@@ -7,8 +7,8 @@ use crate::catalog::tests::table4;
 use crate::conf::{EngineConfig, EvictableBufferPoolConfig, FileSystemConfig, TrxSysConfig};
 use crate::engine::Engine;
 use crate::error::{
-    CompletionErrorKind, DataIntegrityError, Error, OperationError, ResourceError, Result,
-    StoragePoisonSource,
+    CompletionErrorKind, DataIntegrityError, Error, FatalError, OperationError, ResourceError,
+    Result,
 };
 use crate::file::block_integrity::{BLOCK_INTEGRITY_HEADER_SIZE, write_block_checksum};
 use crate::file::cow_file::{
@@ -5604,26 +5604,26 @@ fn test_mvcc_rollback_poisons_runtime_on_row_page_reload_error() {
         ));
         let _hook = install_storage_backend_test_hook(read_hook);
 
-        assert!(trx.rollback().await.as_ref().is_err_and(
-            |err| err.storage_poison_source() == Some(StoragePoisonSource::RollbackAccess)
-        ));
+        assert!(
+            trx.rollback().await.as_ref().is_err_and(|err| err
+                .report()
+                .downcast_ref::<FatalError>()
+                .copied()
+                == Some(FatalError::RollbackAccess))
+        );
         assert!(
             sys.engine
                 .trx_sys
                 .storage_poison_error()
                 .as_ref()
-                .is_some_and(
-                    |err| err.storage_poison_source() == Some(StoragePoisonSource::RollbackAccess)
-                )
+                .is_some_and(|err| *err.current_context() == FatalError::RollbackAccess)
         );
         assert!(
             sys.engine
                 .trx_sys
                 .ensure_runtime_healthy()
                 .as_ref()
-                .is_err_and(
-                    |err| err.storage_poison_source() == Some(StoragePoisonSource::RollbackAccess)
-                )
+                .is_err_and(|err| *err.current_context() == FatalError::RollbackAccess)
         );
 
         drop(writer);

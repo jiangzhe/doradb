@@ -1,5 +1,5 @@
 use crate::catalog::{Catalog, TableID, is_catalog_obj_id, is_user_obj_id};
-use crate::error::{ErrorKind, Result, StoragePoisonSource};
+use crate::error::{ErrorKind, FatalError, Result};
 use crate::trx::TrxID;
 use crate::trx::log::{LogPartitionInitializer, list_log_files};
 use crate::trx::log_replay::LogMerger;
@@ -63,7 +63,7 @@ impl Catalog {
         match self.apply_checkpoint_batch(batch).await {
             Ok(()) => Ok(()),
             Err(err) if err.kind() == ErrorKind::Io => {
-                Err(trx_sys.poison_storage(StoragePoisonSource::CheckpointWrite))
+                Err(trx_sys.poison_storage(FatalError::CheckpointWrite).into())
             }
             Err(err) => Err(err),
         }

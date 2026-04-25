@@ -10,6 +10,7 @@ pub type Result<T> = std::result::Result<T, Error>;
 pub(crate) type ConfigResult<T> = std::result::Result<T, Report<ConfigError>>;
 pub(crate) type DataIntegrityResult<T> = std::result::Result<T, Report<DataIntegrityError>>;
 pub(crate) type LifecycleResult<T> = std::result::Result<T, Report<LifecycleError>>;
+pub(crate) type FatalResult<T> = std::result::Result<T, Report<FatalError>>;
 pub(crate) type CompletionResult<T> = std::result::Result<T, Report<CompletionErrorKind>>;
 
 /// Public storage error boundary classification.
@@ -141,6 +142,25 @@ pub(crate) enum OperationError {
     WriteConflict,
 }
 
+/// Fieldless fatal-domain errors carried underneath `ErrorKind::Fatal`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ThisError)]
+pub(crate) enum FatalError {
+    #[error("storage engine poisoned")]
+    Poisoned,
+    #[error("redo submit failed")]
+    RedoSubmit,
+    #[error("redo write failed")]
+    RedoWrite,
+    #[error("redo sync failed")]
+    RedoSync,
+    #[error("checkpoint write failed")]
+    CheckpointWrite,
+    #[error("purge deallocate failed")]
+    PurgeDeallocate,
+    #[error("rollback access failed")]
+    RollbackAccess,
+}
+
 /// IO-domain errors carried underneath `ErrorKind::Io`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ThisError)]
 #[error("{0}")]
@@ -222,6 +242,11 @@ impl CompletionErrorKind {
     }
 
     #[inline]
+    pub(crate) fn report_fatal(reason: FatalError) -> Report<Self> {
+        Report::new(reason).change_context(Self::Fatal)
+    }
+
+    #[inline]
     pub(crate) fn report_internal() -> Report<Self> {
         Report::new(Self::Internal)
     }
@@ -235,7 +260,6 @@ pub(crate) enum ErrorCode {
     WrongSecondaryIndexBinding,
     IndexOutOfBound,
     BufferPageAlreadyAllocated,
-    StorageEnginePoisoned,
     InvalidColumnScan,
     ColumnStorageMissing,
     EngineComponentAlreadyRegistered,
@@ -255,33 +279,6 @@ impl fmt::Display for FileKind {
         f.write_str(match self {
             FileKind::TableFile => "table-file",
             FileKind::CatalogMultiTableFile => "catalog.mtb",
-        })
-    }
-}
-
-/// Classifies which fatal storage path poisoned runtime admission.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum StoragePoisonSource {
-    RedoSubmit,
-    RedoWrite,
-    RedoSync,
-    CheckpointWrite,
-    CheckpointSync,
-    PurgeDeallocate,
-    RollbackAccess,
-}
-
-impl fmt::Display for StoragePoisonSource {
-    #[inline]
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
-            StoragePoisonSource::RedoSubmit => "redo submit",
-            StoragePoisonSource::RedoWrite => "redo write",
-            StoragePoisonSource::RedoSync => "redo sync",
-            StoragePoisonSource::CheckpointWrite => "checkpoint write",
-            StoragePoisonSource::CheckpointSync => "checkpoint sync",
-            StoragePoisonSource::PurgeDeallocate => "purge deallocate",
-            StoragePoisonSource::RollbackAccess => "rollback access",
         })
     }
 }
@@ -496,16 +493,6 @@ impl Error {
     }
 
     #[inline]
-    pub(crate) fn storage_engine_poisoned(source: StoragePoisonSource) -> Self {
-        Self::new_with_attachment(ErrorKind::Fatal, ErrorCode::StorageEnginePoisoned, source)
-    }
-
-    #[inline]
-    pub(crate) fn storage_poison_source(&self) -> Option<StoragePoisonSource> {
-        self.downcast_ref::<StoragePoisonSource>().copied()
-    }
-
-    #[inline]
     pub(crate) fn invalid_column_scan() -> Self {
         Self::new(ErrorKind::InvalidInput, ErrorCode::InvalidColumnScan)
     }
@@ -550,6 +537,13 @@ impl From<Report<LifecycleError>> for Error {
     #[inline]
     fn from(report: Report<LifecycleError>) -> Self {
         Error(report.change_context(ErrorKind::Lifecycle))
+    }
+}
+
+impl From<Report<FatalError>> for Error {
+    #[inline]
+    fn from(report: Report<FatalError>) -> Self {
+        Error(report.change_context(ErrorKind::Fatal))
     }
 }
 

@@ -1,7 +1,7 @@
 use crate::conf::TrxSysConfig;
 use crate::error::{
-    CompletionResult, DataIntegrityError, Error, LifecycleError, ResourceError, Result,
-    StoragePoisonSource,
+    CompletionErrorKind, CompletionResult, DataIntegrityError, Error, FatalError, LifecycleError,
+    ResourceError, Result,
 };
 use crate::file::{FileSyncer, SparseFile, UNTRACKED_FILE_ID};
 use crate::free_list::FreeList;
@@ -193,7 +193,7 @@ enum LogIORequest {
 struct LogWriteCompletion {
     cts: TrxID,
     buf: DirectBuf,
-    poison: Option<StoragePoisonSource>,
+    poison: Option<FatalError>,
 }
 
 struct LogIOStateMachine {
@@ -239,8 +239,8 @@ impl IOStateMachine for LogIOStateMachine {
             .expect("redo write submission must still own its direct buffer");
         let result = match res {
             Ok(len) if len == expected_len => None,
-            Ok(_len) => Some(StoragePoisonSource::RedoWrite),
-            Err(_err) => Some(StoragePoisonSource::RedoWrite),
+            Ok(_len) => Some(FatalError::RedoWrite),
+            Err(_err) => Some(FatalError::RedoWrite),
         };
         let _ = self.done_tx.send(LogWriteCompletion {
             cts: sub.cts,
@@ -648,15 +648,14 @@ impl SyncGroup {
     }
 
     #[inline]
-    fn fail_waiters(&mut self, err: &Error) {
+    fn fail_waiters(&mut self, err: &Report<FatalError>) {
         if self.failed {
             return;
         }
         self.failed = true;
         self.completion
-            .complete(Err(err.storage_poison_source().map_or_else(
-                || Error::internal().into_completion_report(),
-                |source| Error::storage_engine_poisoned(source).into_completion_report(),
+            .complete(Err(CompletionErrorKind::report_fatal(
+                *err.current_context(),
             )));
         for trx in mem::take(&mut self.trx_list) {
             trx.abort();
@@ -753,7 +752,7 @@ impl<'a> FileProcessor<'a> {
     }
 
     #[inline]
-    fn fail_sync_group(&self, sync_group: &mut SyncGroup, err: &Error) {
+    fn fail_sync_group(&self, sync_group: &mut SyncGroup, err: &Report<FatalError>) {
         sync_group.fail_waiters(err);
         if let Some(buf) = sync_group.take_any_buf() {
             self.recycle_buf(buf);
@@ -761,7 +760,7 @@ impl<'a> FileProcessor<'a> {
     }
 
     #[inline]
-    fn fail_pending(&mut self, err: Error) {
+    fn fail_pending(&mut self, err: Report<FatalError>) {
         self.shutdown = true;
         let drained_sync_groups: Vec<_> = self.sync_groups.drain(..).collect();
         for mut sync_group in drained_sync_groups {
@@ -917,7 +916,7 @@ impl<'a> FileProcessor<'a> {
             };
             let sync_dur = start.elapsed();
             if sync_res.is_err() {
-                let err = self.trx_sys.poison_storage(StoragePoisonSource::RedoSync);
+                let err = self.trx_sys.poison_storage(FatalError::RedoSync);
                 let drained_written: Vec<_> = self.written.drain(..).collect();
                 for mut sync_group in drained_written {
                     self.fail_sync_group(&mut sync_group, &err);
@@ -995,7 +994,7 @@ impl<'a> FileProcessor<'a> {
             {
                 let LogIORequest::Write(submission) = err.0;
                 sync_group.write = Some(submission);
-                let poison = self.trx_sys.poison_storage(StoragePoisonSource::RedoSubmit);
+                let poison = self.trx_sys.poison_storage(FatalError::RedoSubmit);
                 self.fail_sync_group(&mut sync_group, &poison);
                 self.fail_pending(poison);
                 return;
@@ -1681,9 +1680,7 @@ mod tests {
                     .trx_sys
                     .ensure_runtime_healthy()
                     .as_ref()
-                    .is_err_and(
-                        |err| err.storage_poison_source() == Some(StoragePoisonSource::RedoWrite)
-                    )
+                    .is_err_and(|err| *err.current_context() == FatalError::RedoWrite)
             );
         });
     }
@@ -1730,9 +1727,7 @@ mod tests {
                 .trx_sys
                 .ensure_runtime_healthy()
                 .as_ref()
-                .is_err_and(
-                    |err| err.storage_poison_source() == Some(StoragePoisonSource::RedoSync)
-                )
+                .is_err_and(|err| *err.current_context() == FatalError::RedoSync)
         );
     }
 

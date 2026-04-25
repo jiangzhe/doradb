@@ -1,7 +1,7 @@
 use crate::buffer::PageID;
 use crate::buffer::{BufferPool, EvictableBufferPool, PoolGuards};
 use crate::catalog::{Catalog, TableCache, TableHandle};
-use crate::error::{Result, StoragePoisonSource};
+use crate::error::{FatalError, Result};
 use crate::latch::LatchFallbackMode;
 use crate::quiescent::{QuiescentGuard, SyncQuiescentGuard};
 use crate::row::RowPage;
@@ -35,7 +35,7 @@ fn handle_gc_row_page_deallocation_result(trx_sys: &TransactionSystem, res: Resu
     match res {
         Ok(()) => true,
         Err(_) => {
-            trx_sys.poison_storage(StoragePoisonSource::PurgeDeallocate);
+            let _ = trx_sys.poison_storage(FatalError::PurgeDeallocate);
             false
         }
     }
@@ -645,7 +645,7 @@ mod tests {
     use crate::buffer::{BufferPool, PoolGuards, PoolRole};
     use crate::catalog::tests::table1;
     use crate::conf::{EngineConfig, EvictableBufferPoolConfig, TrxSysConfig};
-    use crate::error::StoragePoisonSource;
+    use crate::error::FatalError;
     use crate::file::cow_file::BlockID;
     use crate::index::{RowLocation, UniqueIndex};
     use crate::latch::LatchFallbackMode;
@@ -768,16 +768,14 @@ mod tests {
                     .trx_sys
                     .storage_poison_error()
                     .as_ref()
-                    .is_some_and(|err| err.storage_poison_source()
-                        == Some(StoragePoisonSource::PurgeDeallocate))
+                    .is_some_and(|err| *err.current_context() == FatalError::PurgeDeallocate)
             );
             assert!(
                 engine
                     .trx_sys
                     .ensure_runtime_healthy()
                     .as_ref()
-                    .is_err_and(|err| err.storage_poison_source()
-                        == Some(StoragePoisonSource::PurgeDeallocate))
+                    .is_err_and(|err| *err.current_context() == FatalError::PurgeDeallocate)
             );
         });
     }
