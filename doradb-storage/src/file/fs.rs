@@ -2186,7 +2186,7 @@ pub(crate) mod tests {
         };
         assert!(err.is_kind(ErrorKind::Config));
         assert_eq!(
-            err.config_error(),
+            err.report().downcast_ref::<ConfigError>().copied(),
             Some(ConfigError::InvalidCatalogFileName)
         );
 
@@ -2199,7 +2199,7 @@ pub(crate) mod tests {
         };
         assert!(err.is_kind(ErrorKind::Config));
         assert_eq!(
-            err.config_error(),
+            err.report().downcast_ref::<ConfigError>().copied(),
             Some(ConfigError::InvalidCatalogFileName)
         );
 
@@ -2212,7 +2212,7 @@ pub(crate) mod tests {
         };
         assert!(err.is_kind(ErrorKind::Config));
         assert_eq!(
-            err.config_error(),
+            err.report().downcast_ref::<ConfigError>().copied(),
             Some(ConfigError::InvalidCatalogFileName)
         );
     }
@@ -2242,7 +2242,7 @@ pub(crate) mod tests {
         };
         assert!(err.is_kind(ErrorKind::Config));
         assert_eq!(
-            err.config_error(),
+            err.report().downcast_ref::<ConfigError>().copied(),
             Some(ConfigError::PathMustNotEscapeStorageRoot)
         );
     }
@@ -2261,6 +2261,9 @@ pub(crate) mod tests {
                 Err(err) => err,
             };
         assert!(err.is_kind(ErrorKind::Config));
-        assert_eq!(err.config_error(), Some(ConfigError::PathMustBeUtf8));
+        assert_eq!(
+            err.report().downcast_ref::<ConfigError>().copied(),
+            Some(ConfigError::PathMustBeUtf8)
+        );
     }
 }

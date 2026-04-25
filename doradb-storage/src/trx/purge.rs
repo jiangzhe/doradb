@@ -764,14 +764,20 @@ mod tests {
                 Err(std::io::Error::from_raw_os_error(libc::EIO).into())
             ));
             assert!(
-                engine.trx_sys.storage_poison_error().as_ref().is_some_and(
-                    |err| err.is_storage_poisoned_by(StoragePoisonSource::PurgeDeallocate)
-                )
+                engine
+                    .trx_sys
+                    .storage_poison_error()
+                    .as_ref()
+                    .is_some_and(|err| err.storage_poison_source()
+                        == Some(StoragePoisonSource::PurgeDeallocate))
             );
             assert!(
-                engine.trx_sys.ensure_runtime_healthy().as_ref().is_err_and(
-                    |err| err.is_storage_poisoned_by(StoragePoisonSource::PurgeDeallocate)
-                )
+                engine
+                    .trx_sys
+                    .ensure_runtime_healthy()
+                    .as_ref()
+                    .is_err_and(|err| err.storage_poison_source()
+                        == Some(StoragePoisonSource::PurgeDeallocate))
             );
         });
     }

@@ -5604,25 +5604,26 @@ fn test_mvcc_rollback_poisons_runtime_on_row_page_reload_error() {
         ));
         let _hook = install_storage_backend_test_hook(read_hook);
 
-        assert!(
-            trx.rollback()
-                .await
-                .as_ref()
-                .is_err_and(|err| err.is_storage_poisoned_by(StoragePoisonSource::RollbackAccess))
-        );
+        assert!(trx.rollback().await.as_ref().is_err_and(
+            |err| err.storage_poison_source() == Some(StoragePoisonSource::RollbackAccess)
+        ));
         assert!(
             sys.engine
                 .trx_sys
                 .storage_poison_error()
                 .as_ref()
-                .is_some_and(|err| err.is_storage_poisoned_by(StoragePoisonSource::RollbackAccess))
+                .is_some_and(
+                    |err| err.storage_poison_source() == Some(StoragePoisonSource::RollbackAccess)
+                )
         );
         assert!(
             sys.engine
                 .trx_sys
                 .ensure_runtime_healthy()
                 .as_ref()
-                .is_err_and(|err| err.is_storage_poisoned_by(StoragePoisonSource::RollbackAccess))
+                .is_err_and(
+                    |err| err.storage_poison_source() == Some(StoragePoisonSource::RollbackAccess)
+                )
         );
 
         drop(writer);

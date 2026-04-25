@@ -636,7 +636,10 @@ mod tests {
         changed.ensure_directories().unwrap();
         let err = changed.validate_marker_if_present().unwrap_err();
         assert!(err.is_kind(ErrorKind::Config));
-        assert_eq!(err.config_error(), Some(ConfigError::StorageLayoutMismatch));
+        assert_eq!(
+            err.report().downcast_ref::<ConfigError>().copied(),
+            Some(ConfigError::StorageLayoutMismatch)
+        );
     }
 
     #[test]

@@ -2474,7 +2474,7 @@ pub(crate) mod tests {
         };
         assert!(err.is_kind(ErrorKind::Config));
         assert_eq!(
-            err.config_error(),
+            err.report().downcast_ref::<ConfigError>().copied(),
             Some(ConfigError::PathMustUseRequiredSuffix)
         );
     }
@@ -2493,7 +2493,7 @@ pub(crate) mod tests {
         };
         assert!(err.is_kind(ErrorKind::Config));
         assert_eq!(
-            err.config_error(),
+            err.report().downcast_ref::<ConfigError>().copied(),
             Some(ConfigError::PathMustUseRequiredSuffix)
         );
     }

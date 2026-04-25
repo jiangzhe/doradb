@@ -657,20 +657,17 @@ mod tests {
             drop(blocked);
 
             let err = handle.join().unwrap();
-            assert!(err.is_storage_poisoned_by(StoragePoisonSource::RedoSubmit));
+            assert_eq!(
+                err.storage_poison_source(),
+                Some(StoragePoisonSource::RedoSubmit)
+            );
             assert!(trx_sys.storage_poisoned.load(Ordering::Acquire));
-            assert!(
-                trx_sys
-                    .storage_poison_error()
-                    .as_ref()
-                    .is_some_and(|err| err.is_storage_poisoned_by(StoragePoisonSource::RedoSubmit))
-            );
-            assert!(
-                trx_sys
-                    .ensure_runtime_healthy()
-                    .as_ref()
-                    .is_err_and(|err| err.is_storage_poisoned_by(StoragePoisonSource::RedoSubmit))
-            );
+            assert!(trx_sys.storage_poison_error().as_ref().is_some_and(|err| {
+                err.storage_poison_source() == Some(StoragePoisonSource::RedoSubmit)
+            }));
+            assert!(trx_sys.ensure_runtime_healthy().as_ref().is_err_and(|err| {
+                err.storage_poison_source() == Some(StoragePoisonSource::RedoSubmit)
+            }));
 
             drop(trx_sys);
             drop(engine);
@@ -734,7 +731,7 @@ mod tests {
                 trx_sys
                     .ensure_runtime_healthy()
                     .as_ref()
-                    .is_err_and(|err| err.is_storage_poisoned_by(stored_source))
+                    .is_err_and(|err| err.storage_poison_source() == Some(stored_source))
             );
             assert!(matches!(
                 stored_source,

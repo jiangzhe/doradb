@@ -152,7 +152,8 @@ impl LibaioBackend {
                     stats: IOBackendStatsHandle::default(),
                 }),
                 ret => {
-                    Err(IoError::report_raw_os_error_with_op(StorageOp::BackendSetup, -ret).into())
+                    let err = io::Error::from_raw_os_error(-ret);
+                    Err(IoError::report_with_op(StorageOp::BackendSetup, err).into())
                 }
             }
         }
@@ -564,7 +565,7 @@ pub(crate) mod tests {
             Ok(_) => panic!("expected backend setup failure"),
             Err(err) => err,
         };
-        assert!(err.io_error().is_some());
+        assert!(err.report().downcast_ref::<IoError>().is_some());
         assert!(format!("{err:?}").contains("op=backend setup"));
     }
 

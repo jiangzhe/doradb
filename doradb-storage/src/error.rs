@@ -9,13 +9,7 @@ use thiserror::Error as ThisError;
 pub type Result<T> = std::result::Result<T, Error>;
 pub(crate) type ConfigResult<T> = std::result::Result<T, Report<ConfigError>>;
 pub(crate) type DataIntegrityResult<T> = std::result::Result<T, Report<DataIntegrityError>>;
-#[allow(dead_code)]
-pub(crate) type IOResult<T> = std::result::Result<T, Report<IoError>>;
 pub(crate) type LifecycleResult<T> = std::result::Result<T, Report<LifecycleError>>;
-#[allow(dead_code)]
-pub(crate) type ResourceResult<T> = std::result::Result<T, Report<ResourceError>>;
-#[allow(dead_code)]
-pub(crate) type OperationResult<T> = std::result::Result<T, Report<OperationError>>;
 pub(crate) type CompletionResult<T> = std::result::Result<T, Report<CompletionErrorKind>>;
 
 /// Public storage error boundary classification.
@@ -159,12 +153,6 @@ impl IoError {
     }
 
     #[inline]
-    #[allow(dead_code)]
-    pub(crate) fn from_raw_os_error(raw_os_error: i32) -> Self {
-        io::Error::from_raw_os_error(raw_os_error).kind().into()
-    }
-
-    #[inline]
     pub(crate) fn report(err: io::Error) -> Report<Self> {
         Report::new(Self::from(err.kind())).attach(format!("{}", err))
     }
@@ -172,13 +160,6 @@ impl IoError {
     #[inline]
     pub(crate) fn report_with_op(op: StorageOp, err: io::Error) -> Report<Self> {
         Report::new(Self::from(err.kind())).attach(format!("op={op}, {err}"))
-    }
-
-    #[inline]
-    #[allow(dead_code)]
-    pub(crate) fn report_raw_os_error_with_op(op: StorageOp, raw_os_error: i32) -> Report<Self> {
-        let err = io::Error::from_raw_os_error(raw_os_error);
-        Report::new(Self::from_raw_os_error(raw_os_error)).attach(format!("op={op}, {err}"))
     }
 
     #[inline]
@@ -246,7 +227,6 @@ impl CompletionErrorKind {
     }
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ErrorCode {
     InvalidArgument,
@@ -254,12 +234,8 @@ pub(crate) enum ErrorCode {
     InvalidState,
     WrongSecondaryIndexBinding,
     IndexOutOfBound,
-    InvalidCodecForSel,
-    ValueCountMismatch,
-    InvalidDatatype,
     BufferPageAlreadyAllocated,
     StorageEnginePoisoned,
-    ColumnNeverNull,
     InvalidColumnScan,
     ColumnStorageMissing,
     EngineComponentAlreadyRegistered,
@@ -374,7 +350,6 @@ impl fmt::Display for RecoveryDuplicateKey {
 /// Public storage error report.
 pub struct Error(Report<ErrorKind>);
 
-#[allow(dead_code)]
 impl Error {
     #[inline]
     fn new(kind: ErrorKind, code: ErrorCode) -> Self {
@@ -430,11 +405,6 @@ impl Error {
     }
 
     #[inline]
-    fn text_detail(&self) -> Option<&str> {
-        self.downcast_ref::<String>().map(String::as_str)
-    }
-
-    #[inline]
     fn completion_error_kind(&self) -> CompletionErrorKind {
         if let Some(kind) = self.completion_error() {
             return kind;
@@ -452,11 +422,6 @@ impl Error {
             return CompletionErrorKind::InvalidState;
         }
         CompletionErrorKind::Internal
-    }
-
-    #[inline]
-    pub(crate) fn config_error(&self) -> Option<ConfigError> {
-        self.downcast_ref::<ConfigError>().copied()
     }
 
     #[inline]
@@ -482,11 +447,6 @@ impl Error {
     #[inline]
     pub(crate) fn completion_error(&self) -> Option<CompletionErrorKind> {
         self.downcast_ref::<CompletionErrorKind>().copied()
-    }
-
-    #[inline]
-    pub(crate) fn io_error(&self) -> Option<IoError> {
-        self.downcast_ref::<IoError>().copied()
     }
 
     #[inline]
@@ -531,21 +491,6 @@ impl Error {
     }
 
     #[inline]
-    pub(crate) fn invalid_codec_for_sel() -> Self {
-        Self::new(ErrorKind::InvalidInput, ErrorCode::InvalidCodecForSel)
-    }
-
-    #[inline]
-    pub(crate) fn value_count_mismatch() -> Self {
-        Self::new(ErrorKind::InvalidInput, ErrorCode::ValueCountMismatch)
-    }
-
-    #[inline]
-    pub(crate) fn invalid_datatype() -> Self {
-        Self::new(ErrorKind::InvalidInput, ErrorCode::InvalidDatatype)
-    }
-
-    #[inline]
     pub(crate) fn buffer_page_already_allocated() -> Self {
         Self::new(ErrorKind::Internal, ErrorCode::BufferPageAlreadyAllocated)
     }
@@ -558,16 +503,6 @@ impl Error {
     #[inline]
     pub(crate) fn storage_poison_source(&self) -> Option<StoragePoisonSource> {
         self.downcast_ref::<StoragePoisonSource>().copied()
-    }
-
-    #[inline]
-    pub(crate) fn is_storage_poisoned_by(&self, source: StoragePoisonSource) -> bool {
-        self.storage_poison_source() == Some(source)
-    }
-
-    #[inline]
-    pub(crate) fn column_never_null() -> Self {
-        Self::new(ErrorKind::InvalidInput, ErrorCode::ColumnNeverNull)
     }
 
     #[inline]
@@ -802,22 +737,6 @@ macro_rules! verify_continue {
 mod tests {
     use super::*;
 
-    #[inline]
-    fn raw_os_error_result(raw_os_error: i32) -> IOResult<()> {
-        Err(IoError::report_raw_os_error_with_op(
-            StorageOp::BackendSetup,
-            raw_os_error,
-        ))
-    }
-
-    #[test]
-    fn test_io_error_from_raw_os_error_uses_io_kind() {
-        let report = raw_os_error_result(libc::EIO).unwrap_err();
-        let expected = io::Error::from_raw_os_error(libc::EIO).kind();
-        assert_eq!(report.current_context().kind(), expected);
-        assert!(format!("{report:?}").contains("op=backend setup"));
-    }
-
     #[test]
     fn test_io_report_with_op_attaches_formatted_context() {
         let report = IoError::report_with_op(
@@ -843,7 +762,10 @@ mod tests {
 
         assert_eq!(err.kind(), ErrorKind::Io);
         assert_eq!(
-            err.io_error().map(IoError::kind),
+            err.report()
+                .downcast_ref::<IoError>()
+                .copied()
+                .map(IoError::kind),
             Some(IoErrorKind::WouldBlock)
         );
         assert!(format!("{err:?}").contains("not ready"));

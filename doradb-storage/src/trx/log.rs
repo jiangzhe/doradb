@@ -1681,7 +1681,9 @@ mod tests {
                     .trx_sys
                     .ensure_runtime_healthy()
                     .as_ref()
-                    .is_err_and(|err| err.is_storage_poisoned_by(StoragePoisonSource::RedoWrite))
+                    .is_err_and(
+                        |err| err.storage_poison_source() == Some(StoragePoisonSource::RedoWrite)
+                    )
             );
         });
     }
@@ -1728,7 +1730,9 @@ mod tests {
                 .trx_sys
                 .ensure_runtime_healthy()
                 .as_ref()
-                .is_err_and(|err| err.is_storage_poisoned_by(StoragePoisonSource::RedoSync))
+                .is_err_and(
+                    |err| err.storage_poison_source() == Some(StoragePoisonSource::RedoSync)
+                )
         );
     }
 

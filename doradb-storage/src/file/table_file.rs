@@ -820,7 +820,7 @@ mod tests {
     }
 
     #[test]
-    fn test_readonly_buffer_read_propagates_io_error() {
+    fn test_readonly_buffer_read_propagates_io_failure() {
         smol::block_on(async {
             let (_temp_dir, fs) = build_test_fs();
             let table_file = fs

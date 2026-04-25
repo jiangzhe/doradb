@@ -550,7 +550,10 @@ mod tests {
                 Err(err) => err,
             };
             assert!(err.is_kind(ErrorKind::Config));
-            assert_eq!(err.config_error(), Some(ConfigError::StorageLayoutMismatch));
+            assert_eq!(
+                err.report().downcast_ref::<ConfigError>().copied(),
+                Some(ConfigError::StorageLayoutMismatch)
+            );
         });
     }
 
@@ -573,7 +576,10 @@ mod tests {
                 Err(err) => err,
             };
             assert!(err.is_kind(ErrorKind::Config));
-            assert_eq!(err.config_error(), Some(ConfigError::StorageLayoutMismatch));
+            assert_eq!(
+                err.report().downcast_ref::<ConfigError>().copied(),
+                Some(ConfigError::StorageLayoutMismatch)
+            );
             assert!(!new_data_dir.exists());
         });
     }
@@ -661,7 +667,7 @@ mod tests {
             };
             assert!(err.is_kind(ErrorKind::Config));
             assert_eq!(
-                err.config_error(),
+                err.report().downcast_ref::<ConfigError>().copied(),
                 Some(ConfigError::PathMustNotOverlapReservedLocation)
             );
             assert!(!marker_path.exists());

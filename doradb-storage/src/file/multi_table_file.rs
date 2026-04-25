@@ -1,7 +1,7 @@
 use crate::bitmap::AllocMap;
 use crate::buffer::ReadonlyBufferPool;
 use crate::catalog::{ObjID, TableID, USER_OBJ_ID_START};
-use crate::error::{DataIntegrityError, Error, FileKind, Result};
+use crate::error::{DataIntegrityError, Error, FileKind, IoError, Result};
 use crate::file::SparseFile;
 use crate::file::block_integrity::{
     BLOCK_INTEGRITY_HEADER_SIZE, BlockIntegritySpec, max_payload_len, validate_block,
@@ -271,7 +271,9 @@ impl MultiTableFile {
             }
             Err(err)
                 if err
-                    .io_error()
+                    .report()
+                    .downcast_ref::<IoError>()
+                    .copied()
                     .is_some_and(|err| err.kind() == IoErrorKind::AlreadyExists) =>
             {
                 CowFile::open(file_path, CATALOG_MTB_FILE_ID, multi_table_codec())?

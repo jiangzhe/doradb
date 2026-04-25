@@ -1159,7 +1159,7 @@ mod tests {
     use crate::buffer::{BufferPool, FixedBufferPool, PoolGuard};
     use crate::catalog::{ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexSpec};
     use crate::conf::{EngineConfig, EvictableBufferPoolConfig, TrxSysConfig};
-    use crate::error::{ResourceError, Validation};
+    use crate::error::{IoError, ResourceError, Validation};
     use crate::latch::LatchFallbackMode;
     use crate::quiescent::{QuiescentBox, QuiescentGuard};
     use crate::trx::log::list_log_files;
@@ -1429,7 +1429,7 @@ mod tests {
                 Ok(_) => panic!("expected free-list page reload failure"),
                 Err(err) => err,
             };
-            assert!(err.io_error().is_some());
+            assert!(err.report().downcast_ref::<IoError>().is_some());
         });
     }
 
@@ -1467,7 +1467,7 @@ mod tests {
                 Ok(_) => panic!("expected exclusive free-list page reload failure"),
                 Err(err) => err,
             };
-            assert!(err.io_error().is_some());
+            assert!(err.report().downcast_ref::<IoError>().is_some());
             assert!(blk_idx.insert_free_list.lock().is_empty());
         });
     }

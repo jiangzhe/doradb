@@ -95,14 +95,6 @@ impl ArenaInner {
     }
 
     #[inline]
-    #[allow(dead_code)]
-    pub(crate) fn page_ptr(&self, page_id: PageID) -> UnsafePtr<Page> {
-        debug_assert!(usize::from(page_id) < self.capacity);
-        // SAFETY: page memory is one contiguous mmap region indexed by page id.
-        unsafe { UnsafePtr(self.pages.add(usize::from(page_id))) }
-    }
-
-    #[inline]
     pub(crate) fn frame_kind(&self, page_id: PageID) -> FrameKind {
         self.frame(page_id).kind()
     }

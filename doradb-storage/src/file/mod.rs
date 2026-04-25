@@ -1232,7 +1232,10 @@ mod tests {
             Err(err) => err,
         };
         assert_eq!(
-            err.io_error().map(IoError::kind),
+            err.report()
+                .downcast_ref::<IoError>()
+                .copied()
+                .map(IoError::kind),
             Some(IoErrorKind::NotFound)
         );
         assert!(format!("{err:?}").contains("op=file open"));
@@ -1256,7 +1259,10 @@ mod tests {
             Err(err) => err,
         };
         assert_eq!(
-            err.io_error().map(IoError::kind),
+            err.report()
+                .downcast_ref::<IoError>()
+                .copied()
+                .map(IoError::kind),
             Some(IoErrorKind::NotFound)
         );
         assert!(format!("{err:?}").contains("op=file create"));

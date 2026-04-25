@@ -3,8 +3,8 @@ use crate::buffer::page::{Page, PageID};
 use crate::error::{ResourceError, Result};
 use error_stack::Report;
 use libc::{
-    MADV_DONTFORK, MADV_DONTNEED, MADV_HUGEPAGE, MADV_REMOVE, MAP_ANONYMOUS, MAP_FAILED,
-    MAP_PRIVATE, PROT_READ, PROT_WRITE, c_void, madvise, mmap, munmap,
+    MADV_DONTFORK, MADV_DONTNEED, MADV_HUGEPAGE, MAP_ANONYMOUS, MAP_FAILED, MAP_PRIVATE, PROT_READ,
+    PROT_WRITE, c_void, madvise, mmap, munmap,
 };
 use std::mem;
 
@@ -109,12 +109,4 @@ pub(super) unsafe fn madvise_dontneed(ptr: *mut u8, len: usize) -> bool {
     // SAFETY: callers provide a live mapping range owned by the buffer arena,
     // and `madvise` only observes the address range.
     unsafe { madvise(ptr as *mut c_void, len, MADV_DONTNEED) == 0 }
-}
-
-#[allow(dead_code)]
-#[inline]
-pub(super) unsafe fn madvise_remove(ptr: *mut u8, len: usize) -> bool {
-    // SAFETY: callers provide a live mapping range owned by the buffer arena,
-    // and `madvise` only observes the address range.
-    unsafe { madvise(ptr as *mut c_void, len, MADV_REMOVE) == 0 }
 }

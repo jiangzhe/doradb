@@ -318,7 +318,7 @@ mod tests {
     use crate::buffer::page::{BufferPage, INVALID_PAGE_ID, VersionedPageID};
     use crate::buffer::{BufferPool, FixedBufferPool, PoolGuard};
     use crate::catalog::{ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexSpec};
-    use crate::error::Validation;
+    use crate::error::{IoError, Validation};
     use crate::file::test_block_id;
     use crate::latch::LatchFallbackMode;
     use crate::quiescent::{QuiescentBox, QuiescentGuard};
@@ -652,7 +652,7 @@ mod tests {
                 Ok(_) => panic!("expected cached insert-page reload failure"),
                 Err(err) => err,
             };
-            assert!(err.io_error().is_some());
+            assert!(err.report().downcast_ref::<IoError>().is_some());
         });
     }
 }
