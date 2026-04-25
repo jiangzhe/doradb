@@ -2,7 +2,7 @@ use crate::buffer::PageID;
 use crate::buffer::guard::{PageExclusiveGuard, PageSharedGuard};
 use crate::buffer::{BufferPool, FixedBufferPool, PoolGuard};
 use crate::catalog::TableMetadata;
-use crate::error::{Error, Result};
+use crate::error::{Error, InternalError, Result};
 use crate::file::cow_file::{BlockID, SUPER_BLOCK_ID};
 use crate::index::block_index_root::{BlockIndexRoot, BlockIndexRoute};
 use crate::index::column_block_index::ColumnBlockIndex;
@@ -13,6 +13,7 @@ use crate::index::util::{Maskable, RowPageCreateRedoCtx};
 use crate::quiescent::QuiescentGuard;
 use crate::row::{RowID, RowPage};
 use crate::table::ColumnStorage;
+use error_stack::Report;
 use std::sync::Arc;
 
 /// Facade of the hybrid block index.
@@ -289,7 +290,11 @@ impl<P: BufferPool> GenericBlockIndex<P> {
             return Err(Error::column_storage_missing());
         };
         let Some(disk_pool_guard) = disk_pool_guard else {
-            return Err(Error::invalid_state());
+            return Err(Report::new(InternalError::DiskPoolGuardMissing)
+                .attach(format!(
+                    "row_id={row_id}, pivot_row_id={pivot_row_id}, root_block_id={root_block_id}"
+                ))
+                .into());
         };
         let index = ColumnBlockIndex::new(
             root_block_id,
@@ -576,7 +581,10 @@ mod tests {
             Ok(_location) => panic!("expected missing-column-storage error, got row location"),
             Err(err) => err,
         };
-        assert!(err.is_code(crate::error::ErrorCode::ColumnStorageMissing));
+        assert_eq!(
+            err.report().downcast_ref::<InternalError>().copied(),
+            Some(InternalError::ColumnStorageMissing)
+        );
     }
 
     #[test]
@@ -619,8 +627,11 @@ mod tests {
 
             let res = handle.join().unwrap();
             assert!(
-                res.as_ref()
-                    .is_err_and(|err| err.is_code(crate::error::ErrorCode::ColumnStorageMissing))
+                res.as_ref().is_err_and(|err| err
+                    .report()
+                    .downcast_ref::<InternalError>()
+                    .copied()
+                    == Some(InternalError::ColumnStorageMissing))
             );
         });
     }

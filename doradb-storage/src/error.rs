@@ -19,9 +19,6 @@ pub enum ErrorKind {
     /// Invalid static or startup configuration.
     #[error("configuration error")]
     Config,
-    /// Caller-provided arguments or shapes are invalid.
-    #[error("invalid input")]
-    InvalidInput,
     /// A requested storage operation cannot complete in the current logical state.
     #[error("operation error")]
     Operation,
@@ -80,6 +77,18 @@ pub(crate) enum ConfigError {
     InvalidStorageLayoutMarker,
     #[error("storage layout mismatch")]
     StorageLayoutMismatch,
+    #[error("invalid io depth")]
+    InvalidIoDepth,
+    #[error("invalid log sync")]
+    InvalidLogSync,
+    #[error("invalid latch fallback mode")]
+    InvalidLatchFallbackMode,
+    #[error("path must not contain NUL")]
+    PathMustNotContainNul,
+    #[error("invalid B-tree compact ratio")]
+    InvalidBTreeCompactRatio,
+    #[error("invalid index spec")]
+    InvalidIndexSpec,
 }
 
 /// Fieldless data-integrity-domain errors carried underneath `ErrorKind::DataIntegrity`.
@@ -161,6 +170,106 @@ pub(crate) enum FatalError {
     RollbackAccess,
 }
 
+/// Fieldless internal-domain errors carried underneath `ErrorKind::Internal`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ThisError)]
+pub(crate) enum InternalError {
+    #[error("internal storage error")]
+    Generic,
+    #[error("component shelf duplicate provision")]
+    ComponentShelfDuplicateProvision,
+    #[error("component shelf not empty")]
+    ComponentShelfNotEmpty,
+    #[error("component registry missing")]
+    ComponentRegistryMissing,
+    #[error("component provision missing")]
+    ComponentProvisionMissing,
+    #[error("engine component already registered")]
+    EngineComponentAlreadyRegistered,
+    #[error("engine component missing dependency")]
+    EngineComponentMissingDependency,
+    #[error("secondary index binding mismatch")]
+    SecondaryIndexBindingMismatch,
+    #[error("buffer page already allocated")]
+    BufferPageAlreadyAllocated,
+    #[error("column storage missing")]
+    ColumnStorageMissing,
+    #[error("mutable block view mismatch")]
+    MutableBlockViewMismatch,
+    #[error("completion dropped")]
+    CompletionDropped,
+    #[error("readonly buffer mapping conflict")]
+    ReadonlyMappingConflict,
+    #[error("readonly frame lock missing")]
+    ReadonlyFrameLockMissing,
+    #[error("row page missing")]
+    RowPageMissing,
+    #[error("table storage missing")]
+    TableStorageMissing,
+    #[error("disk pool guard missing")]
+    DiskPoolGuardMissing,
+    #[error("user secondary index missing")]
+    UserSecondaryIndexMissing,
+    #[error("secondary index view mismatch")]
+    SecondaryIndexViewMismatch,
+    #[error("deletion buffer missing")]
+    DeletionBufferMissing,
+    #[error("indexed value missing")]
+    IndexedValueMissing,
+    #[error("index key missing")]
+    IndexKeyMissing,
+    #[error("lwc builder misuse")]
+    LwcBuilderMisuse,
+    #[error("latch guard state mismatch")]
+    LatchGuardStateMismatch,
+    #[error("mem index key malformed")]
+    MemIndexKeyMalformed,
+    #[error("column deletion blob writer state mismatch")]
+    ColumnDeletionBlobWriterStateMismatch,
+    #[error("cow file allocation invariant violated")]
+    CowFileAllocationInvariant,
+    #[error("column index rewrite did not touch target")]
+    ColumnIndexRewriteMiss,
+    #[error("column index path invariant violated")]
+    ColumnIndexPathInvariant,
+    #[error("column index search type missing")]
+    ColumnIndexSearchTypeMissing,
+    #[error("column index gc page invariant violated")]
+    ColumnIndexGcPageInvariant,
+    #[error("column index out of bounds")]
+    ColumnIndexOutOfBounds,
+    #[error("secondary index out of bounds")]
+    SecondaryIndexOutOfBounds,
+    #[error("secondary index kind mismatch")]
+    SecondaryIndexKindMismatch,
+    #[error("secondary index root count mismatch")]
+    SecondaryIndexRootCountMismatch,
+    #[error("mutable root metadata regression")]
+    MutableRootMetadataRegression,
+    #[error("catalog root descriptor invariant violated")]
+    CatalogRootDescriptorInvariant,
+    #[error("column scan shape mismatch")]
+    ColumnScanShapeMismatch,
+    #[error("LWC block encoding invariant violated")]
+    LwcBlockEncodingInvariant,
+    #[error("readonly frame index out of bounds")]
+    ReadonlyFrameIndexOutOfBounds,
+    #[error("readonly frame guard mismatch")]
+    ReadonlyFrameGuardMismatch,
+    #[error("B-tree pack invariant violated")]
+    BTreePackInvariant,
+    #[error("DiskTree rewrite invariant violated")]
+    DiskTreeRewriteInvariant,
+    #[error("DiskTree batch order invariant violated")]
+    DiskTreeBatchOrderInvariant,
+    #[error("column block index invariant violated")]
+    ColumnBlockIndexInvariant,
+    #[error("column deletion blob invariant violated")]
+    ColumnDeletionBlobInvariant,
+    #[cfg(test)]
+    #[error("injected test failure")]
+    InjectedTestFailure,
+}
+
 /// IO-domain errors carried underneath `ErrorKind::Io`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ThisError)]
 #[error("{0}")]
@@ -214,12 +323,12 @@ pub(crate) enum CompletionErrorKind {
     Send,
     #[error("data integrity error")]
     DataIntegrity,
+    #[error("storage lifecycle error")]
+    Lifecycle,
     #[error("fatal storage error")]
     Fatal,
     #[error("internal completion error")]
     Internal,
-    #[error("invalid completion state")]
-    InvalidState,
 }
 
 impl CompletionErrorKind {
@@ -247,23 +356,9 @@ impl CompletionErrorKind {
     }
 
     #[inline]
-    pub(crate) fn report_internal() -> Report<Self> {
-        Report::new(Self::Internal)
+    pub(crate) fn report_internal(reason: InternalError) -> Report<Self> {
+        Report::new(reason).change_context(Self::Internal)
     }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ErrorCode {
-    InvalidArgument,
-    InternalError,
-    InvalidState,
-    WrongSecondaryIndexBinding,
-    IndexOutOfBound,
-    BufferPageAlreadyAllocated,
-    InvalidColumnScan,
-    ColumnStorageMissing,
-    EngineComponentAlreadyRegistered,
-    EngineComponentMissingDependency,
 }
 
 /// Identifies which persisted CoW file surfaced a corruption failure.
@@ -348,19 +443,6 @@ impl fmt::Display for RecoveryDuplicateKey {
 pub struct Error(Report<ErrorKind>);
 
 impl Error {
-    #[inline]
-    fn new(kind: ErrorKind, code: ErrorCode) -> Self {
-        Error(Report::new(kind).attach_opaque(code))
-    }
-
-    #[inline]
-    fn new_with_attachment<A>(kind: ErrorKind, code: ErrorCode, attachment: A) -> Self
-    where
-        A: fmt::Debug + fmt::Display + Send + Sync + 'static,
-    {
-        Error(Report::new(kind).attach_opaque(code).attach(attachment))
-    }
-
     /// Return the boundary classification for this error.
     #[inline]
     pub fn kind(&self) -> ErrorKind {
@@ -392,11 +474,6 @@ impl Error {
     }
 
     #[inline]
-    pub(crate) fn is_code(&self, code: ErrorCode) -> bool {
-        self.0.downcast_ref::<ErrorCode>().copied() == Some(code)
-    }
-
-    #[inline]
     pub(crate) fn downcast_ref<T: Send + Sync + 'static>(&self) -> Option<&T> {
         self.0.downcast_ref::<T>()
     }
@@ -412,11 +489,11 @@ impl Error {
         if self.is_kind(ErrorKind::DataIntegrity) {
             return CompletionErrorKind::DataIntegrity;
         }
+        if self.is_kind(ErrorKind::Lifecycle) {
+            return CompletionErrorKind::Lifecycle;
+        }
         if self.is_kind(ErrorKind::Fatal) {
             return CompletionErrorKind::Fatal;
-        }
-        if self.is_code(ErrorCode::InvalidState) {
-            return CompletionErrorKind::InvalidState;
         }
         CompletionErrorKind::Internal
     }
@@ -447,27 +524,8 @@ impl Error {
     }
 
     #[inline]
-    pub(crate) fn invalid_argument() -> Self {
-        Self::new(ErrorKind::InvalidInput, ErrorCode::InvalidArgument)
-    }
-
-    #[inline]
-    pub(crate) fn invalid_argument_message(message: impl Into<String>) -> Self {
-        Self::new_with_attachment(
-            ErrorKind::InvalidInput,
-            ErrorCode::InvalidArgument,
-            message.into(),
-        )
-    }
-
-    #[inline]
     pub(crate) fn internal() -> Self {
-        Self::new(ErrorKind::Internal, ErrorCode::InternalError)
-    }
-
-    #[inline]
-    pub(crate) fn invalid_state() -> Self {
-        Self::new(ErrorKind::Internal, ErrorCode::InvalidState)
+        Report::new(InternalError::Generic).into()
     }
 
     #[inline]
@@ -475,47 +533,29 @@ impl Error {
         expected: &'static str,
         actual: &'static str,
     ) -> Self {
-        Self::new_with_attachment(
-            ErrorKind::Internal,
-            ErrorCode::WrongSecondaryIndexBinding,
-            SecondaryIndexBinding { expected, actual },
-        )
-    }
-
-    #[inline]
-    pub(crate) fn index_out_of_bound() -> Self {
-        Self::new(ErrorKind::InvalidInput, ErrorCode::IndexOutOfBound)
+        Report::new(InternalError::SecondaryIndexBindingMismatch)
+            .attach(SecondaryIndexBinding { expected, actual })
+            .into()
     }
 
     #[inline]
     pub(crate) fn buffer_page_already_allocated() -> Self {
-        Self::new(ErrorKind::Internal, ErrorCode::BufferPageAlreadyAllocated)
-    }
-
-    #[inline]
-    pub(crate) fn invalid_column_scan() -> Self {
-        Self::new(ErrorKind::InvalidInput, ErrorCode::InvalidColumnScan)
+        Report::new(InternalError::BufferPageAlreadyAllocated).into()
     }
 
     #[inline]
     pub(crate) fn column_storage_missing() -> Self {
-        Self::new(ErrorKind::Internal, ErrorCode::ColumnStorageMissing)
+        Report::new(InternalError::ColumnStorageMissing).into()
     }
 
     #[inline]
     pub(crate) fn engine_component_already_registered() -> Self {
-        Self::new(
-            ErrorKind::Internal,
-            ErrorCode::EngineComponentAlreadyRegistered,
-        )
+        Report::new(InternalError::EngineComponentAlreadyRegistered).into()
     }
 
     #[inline]
     pub(crate) fn engine_component_missing_dependency() -> Self {
-        Self::new(
-            ErrorKind::Internal,
-            ErrorCode::EngineComponentMissingDependency,
-        )
+        Report::new(InternalError::EngineComponentMissingDependency).into()
     }
 }
 
@@ -568,16 +608,22 @@ impl From<Report<IoError>> for Error {
     }
 }
 
+impl From<Report<InternalError>> for Error {
+    #[inline]
+    fn from(report: Report<InternalError>) -> Self {
+        Error(report.change_context(ErrorKind::Internal))
+    }
+}
+
 impl From<Report<CompletionErrorKind>> for Error {
     #[inline]
     fn from(report: Report<CompletionErrorKind>) -> Self {
         let kind = match report.current_context() {
             CompletionErrorKind::Io | CompletionErrorKind::Send => ErrorKind::Io,
             CompletionErrorKind::DataIntegrity => ErrorKind::DataIntegrity,
+            CompletionErrorKind::Lifecycle => ErrorKind::Lifecycle,
             CompletionErrorKind::Fatal => ErrorKind::Fatal,
-            CompletionErrorKind::Internal | CompletionErrorKind::InvalidState => {
-                ErrorKind::Internal
-            }
+            CompletionErrorKind::Internal => ErrorKind::Internal,
         };
         Error(report.change_context(kind))
     }

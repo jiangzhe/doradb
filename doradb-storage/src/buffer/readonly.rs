@@ -15,7 +15,10 @@ use crate::buffer::{
     BufferPoolStats, BufferPoolStatsHandle, PageIOCompletion, PoolGuard, PoolIdentity, PoolRole,
     ReadonlyBlockValidator,
 };
-use crate::error::{CompletionErrorKind, CompletionResult, Error, FileKind, ResourceError, Result};
+use crate::error::{
+    CompletionErrorKind, CompletionResult, Error, FileKind, InternalError, LifecycleError,
+    ResourceError, Result,
+};
 use crate::file::fs::FileSystem;
 use crate::file::{BlockID, BlockKey, FileID, SparseFile};
 use crate::io::{IOKind, IOSubmission, Operation, StdIoResult};
@@ -163,7 +166,7 @@ impl ReadonlyBufferPool {
     async fn reserve_frame_id_for_load(&self) -> Result<PageID> {
         loop {
             if self.shutdown_flag.load(Ordering::Acquire) {
-                return Err(Error::invalid_state());
+                return Err(Report::new(LifecycleError::Shutdown).into());
             }
             if let Some(frame_id) = self.residency.try_reserve_frame() {
                 // Like the mutable pool, terminal shutdown does not try to reclaim
@@ -175,7 +178,7 @@ impl ReadonlyBufferPool {
             listener!(self.residency.free_ev => listener);
             // Check after listener registration so shutdown cannot strand this waiter.
             if self.shutdown_flag.load(Ordering::Acquire) {
-                return Err(Error::invalid_state());
+                return Err(Report::new(LifecycleError::Shutdown).into());
             }
             if let Some(frame_id) = self.residency.try_reserve_frame() {
                 self.residency.record_alloc_success();
@@ -186,7 +189,7 @@ impl ReadonlyBufferPool {
             listener.await;
             // Wakeups can come from shutdown as well as real frame reclamation.
             if self.shutdown_flag.load(Ordering::Acquire) {
-                return Err(Error::invalid_state());
+                return Err(Report::new(LifecycleError::Shutdown).into());
             }
         }
     }
@@ -228,7 +231,7 @@ impl ReadonlyBufferPool {
     /// Binds one persisted-block key to an exclusively locked frame.
     ///
     /// Binding is idempotent for the same key/frame pair and returns
-    /// `Error::invalid_state()` for conflicting mapping attempts.
+    /// Returns an internal mapping-conflict error for conflicting mapping attempts.
     #[inline]
     pub fn bind_frame(
         &self,
@@ -237,18 +240,27 @@ impl ReadonlyBufferPool {
     ) -> Result<()> {
         let frame_id = frame_guard.page_id();
         if usize::from(frame_id) >= self.size {
-            return Err(Error::invalid_argument());
+            return Err(Report::new(InternalError::ReadonlyFrameIndexOutOfBounds)
+                .attach(format!("frame_id={frame_id}, size={}", self.size))
+                .into());
         }
         let frame = frame_guard.bf_mut();
         let expected_frame = self.arena.frame(frame_id) as *const BufferFrame;
         if !std::ptr::eq(frame as *const BufferFrame, expected_frame) {
-            return Err(Error::invalid_argument());
+            return Err(Report::new(InternalError::ReadonlyFrameGuardMismatch)
+                .attach(format!("frame_id={frame_id}"))
+                .into());
         }
         let inserted = match self.mappings.entry(key) {
             Entry::Occupied(occ) => {
                 let existing = *occ.get();
                 if existing != frame_id {
-                    return Err(Error::invalid_state());
+                    return Err(Report::new(InternalError::ReadonlyMappingConflict)
+                        .attach(format!(
+                            "key={:?}, existing_frame={}, new_frame={frame_id}",
+                            key, existing
+                        ))
+                        .into());
                 }
                 return match frame.persisted_block_key() {
                     Some((file_id, block_id))
@@ -256,15 +268,26 @@ impl ReadonlyBufferPool {
                     {
                         Ok(())
                     }
-                    _ => Err(Error::invalid_state()),
+                    _ => Err(Report::new(InternalError::ReadonlyMappingConflict)
+                        .attach(format!("key={key:?}, frame_id={frame_id}"))
+                        .into()),
                 };
             }
             Entry::Vacant(vac) => {
                 if let Some((file_id, block_id)) = frame.persisted_block_key() {
                     if file_id != key.file_id || block_id != key.block_id {
-                        return Err(Error::invalid_state());
+                        return Err(Report::new(InternalError::ReadonlyMappingConflict)
+                            .attach(format!(
+                                "key={key:?}, frame_key={:?}",
+                                BlockKey::new(file_id, block_id)
+                            ))
+                            .into());
                     }
-                    return Err(Error::invalid_state());
+                    return Err(Report::new(InternalError::ReadonlyMappingConflict)
+                        .attach(format!(
+                            "duplicate frame binding: key={key:?}, frame_id={frame_id}"
+                        ))
+                        .into());
                 }
                 vac.insert(frame_id);
                 true
@@ -467,7 +490,9 @@ impl ReadonlyBufferPool {
     ) -> Result<FacadePageGuard<T>> {
         self.validate_guard(guard);
         if usize::from(frame_id) >= self.size {
-            return Err(Error::invalid_argument());
+            return Err(Report::new(InternalError::ReadonlyFrameIndexOutOfBounds)
+                .attach(format!("frame_id={frame_id}, size={}", self.size))
+                .into());
         }
         let keepalive = guard.clone();
         let bf = self.arena.frame_ptr(frame_id);
@@ -550,7 +575,9 @@ impl ReadonlyPageReservation {
             Some(page_guard) => page_guard,
             None => {
                 pool.residency.release_free(frame_id);
-                return Err(Error::invalid_state());
+                return Err(Report::new(InternalError::ReadonlyFrameLockMissing)
+                    .attach(format!("frame_id={frame_id}"))
+                    .into());
             }
         };
         {
@@ -609,7 +636,11 @@ impl PageReservation for ReadonlyPageReservation {
             Entry::Vacant(vac) => {
                 vac.insert(frame_id);
             }
-            Entry::Occupied(_) => return Err(Error::invalid_state()),
+            Entry::Occupied(_) => {
+                return Err(Report::new(InternalError::ReadonlyMappingConflict)
+                    .attach(format!("publish key={key:?}, frame_id={frame_id}"))
+                    .into());
+            }
         }
         drop(page_guard);
         pool.residency.mark_resident(frame_id);
@@ -780,7 +811,9 @@ impl Drop for ReadSubmission {
         drop(self.reservation.take());
         self.pool.stats.add_completed_reads(1);
         self.pool.stats.add_read_errors(1);
-        self.complete_inflight_once(Err(CompletionErrorKind::report_internal()));
+        self.complete_inflight_once(Err(CompletionErrorKind::report_internal(
+            InternalError::CompletionDropped,
+        )));
     }
 }
 
@@ -1756,7 +1789,10 @@ pub(crate) mod tests {
         let err = global
             .bind_frame(BlockKey::new(test_file_id(7), test_block_id(12)), &mut g3)
             .unwrap_err();
-        assert!(err.is_code(crate::error::ErrorCode::InvalidState));
+        assert_eq!(
+            err.report().downcast_ref::<InternalError>().copied(),
+            Some(InternalError::ReadonlyMappingConflict)
+        );
 
         drop(g3);
         assert_eq!(global.invalidate_key(&key), Some(test_page_id(3)));
@@ -2355,7 +2391,7 @@ pub(crate) mod tests {
             teardown.join().unwrap();
             assert!(dropped.load(Ordering::SeqCst));
             let report = inflight.wait_result().await.unwrap_err();
-            assert_eq!(*report.current_context(), CompletionErrorKind::InvalidState);
+            assert_eq!(*report.current_context(), CompletionErrorKind::Lifecycle);
         });
     }
 

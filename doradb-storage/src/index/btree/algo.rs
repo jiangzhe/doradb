@@ -4,13 +4,19 @@
 //! logic only. It does not know about latches, buffer-pool allocation, CoW file
 //! writes, checkpoint publication, or DiskTree batch semantics.
 
-use crate::error::{Error, Result};
+use crate::error::{Error, InternalError, Result};
 use crate::index::btree::{
     BTREE_NODE_USABLE_SIZE, BTreeNode, BTreeNodeBox, BTreeU64, BTreeValue, PackedNodeSpace,
     SpaceEstimation,
 };
 use crate::trx::TrxID;
+use error_stack::Report;
 use std::ops::Range;
+
+#[inline]
+fn btree_pack_invariant() -> Error {
+    Report::new(InternalError::BTreePackInvariant).into()
+}
 
 /// One sorted slot entry to be packed into a `BTreeNode`.
 #[derive(Clone, Copy)]
@@ -138,7 +144,7 @@ where
     V: BTreeValue + Copy,
 {
     if params.min_slots > entries.len() {
-        return Err(Error::invalid_argument());
+        return Err(btree_pack_invariant());
     }
 
     let rightmost_count = entries.len();
@@ -156,15 +162,15 @@ where
     }
 
     if rightmost_count == 0 {
-        return Err(Error::invalid_argument());
+        return Err(btree_pack_invariant());
     }
 
     let packed = select_finite_packed_count::<V>(params.lower_fence, params.min_slots, entries)?;
     let upper_fence = packed_sibling_upper_fence(entries, packed);
     let space = packed_node_space::<V>(params.lower_fence, upper_fence, entries, packed)
-        .ok_or(Error::invalid_argument())?;
+        .ok_or_else(btree_pack_invariant)?;
     if space.total_space() > BTREE_NODE_USABLE_SIZE {
-        return Err(Error::invalid_argument());
+        return Err(btree_pack_invariant());
     }
     Ok(PackedNodePlan {
         packed,
@@ -236,7 +242,7 @@ where
     V: BTreeValue + Copy,
 {
     if !fences_fit(params.lower_fence, params.upper_fence.unwrap_or(&[])) {
-        return Err(Error::invalid_argument());
+        return Err(btree_pack_invariant());
     }
     node.init(
         params.height,
@@ -248,7 +254,7 @@ where
     );
     for entry in entries {
         if !node.can_insert::<V>(entry.key) {
-            return Err(Error::invalid_argument());
+            return Err(btree_pack_invariant());
         }
         let idx = node.count();
         node.insert_at::<V>(idx, entry.key, entry.value);
@@ -433,17 +439,17 @@ where
                     let entry_space = PackedNodeSpace::entry_space::<V>(entry.key, prefix_len)?;
                     total.checked_add(entry_space)
                 })
-                .ok_or(Error::invalid_argument())?;
+                .ok_or_else(btree_pack_invariant)?;
             active_prefix_len = Some(prefix_len);
             included_count = packed;
         } else {
             while included_count < packed {
                 let entry_space =
                     PackedNodeSpace::entry_space::<V>(entries[included_count].key, prefix_len)
-                        .ok_or(Error::invalid_argument())?;
+                        .ok_or_else(btree_pack_invariant)?;
                 included_space = included_space
                     .checked_add(entry_space)
-                    .ok_or(Error::invalid_argument())?;
+                    .ok_or_else(btree_pack_invariant)?;
                 included_count += 1;
             }
         }
@@ -451,7 +457,7 @@ where
         let total_space = space
             .total_space()
             .checked_add(included_space)
-            .ok_or(Error::invalid_argument())?;
+            .ok_or_else(btree_pack_invariant)?;
         if total_space <= BTREE_NODE_USABLE_SIZE {
             best = Some(packed);
         } else if space.prefix_is_inline() {
@@ -459,7 +465,7 @@ where
         }
     }
 
-    best.ok_or(Error::invalid_argument())
+    best.ok_or_else(btree_pack_invariant)
 }
 
 fn estimate_packed_node_space<V>(
@@ -777,7 +783,13 @@ mod tests {
         )
         .unwrap_err();
 
-        assert!(err.is_code(crate::error::ErrorCode::InvalidArgument));
+        assert!(err.is_kind(crate::error::ErrorKind::Internal));
+        assert_eq!(
+            err.report()
+                .downcast_ref::<crate::error::InternalError>()
+                .copied(),
+            Some(crate::error::InternalError::BTreePackInvariant)
+        );
     }
 
     fn leaf_node(keys: &[&[u8]]) -> BTreeNodeBox {

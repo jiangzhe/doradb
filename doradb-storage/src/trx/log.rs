@@ -1,7 +1,7 @@
 use crate::conf::TrxSysConfig;
 use crate::error::{
-    CompletionErrorKind, CompletionResult, DataIntegrityError, Error, FatalError, LifecycleError,
-    ResourceError, Result,
+    CompletionErrorKind, CompletionResult, ConfigError, DataIntegrityError, Error, FatalError,
+    LifecycleError, ResourceError, Result,
 };
 use crate::file::{FileSyncer, SparseFile, UNTRACKED_FILE_ID};
 use crate::free_list::FreeList;
@@ -698,7 +698,9 @@ impl FromStr for LogSync {
         } else if s.eq_ignore_ascii_case("none") {
             Ok(LogSync::None)
         } else {
-            Err(Error::invalid_argument())
+            Err(Report::new(ConfigError::InvalidLogSync)
+                .attach(format!("value={s}"))
+                .into())
         }
     }
 }

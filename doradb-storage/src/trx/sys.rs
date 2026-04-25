@@ -2,7 +2,7 @@ use crate::DiskPool;
 use crate::catalog::{Catalog, CatalogCheckpointScanConfig, TableCache};
 use crate::component::{Component, ComponentRegistry, IndexPool, MemPool, MetaPool, ShelfScope};
 use crate::conf::TrxSysConfig;
-use crate::error::{Error, FatalError, FatalResult, Result};
+use crate::error::{Error, FatalError, FatalResult, InternalError, Result};
 use crate::file::fs::FileSystem;
 use crate::quiescent::{QuiescentBox, QuiescentGuard, SyncQuiescentGuard};
 use crate::session::SessionState;
@@ -504,9 +504,12 @@ impl Component for TransactionSystemWorkers {
         mut shelf: ShelfScope<'_, Self>,
     ) -> Result<()> {
         let trx_sys = registry.dependency::<TransactionSystem>()?;
-        let startup = shelf
-            .take::<TransactionSystem>()
-            .ok_or(Error::invalid_state())?;
+        let startup = shelf.take::<TransactionSystem>().ok_or_else(|| {
+            Error::from(
+                Report::new(InternalError::ComponentProvisionMissing)
+                    .attach("provider=TransactionSystem, consumer=TransactionRuntime"),
+            )
+        })?;
         registry.register::<Self>(startup.start(trx_sys))
     }
 

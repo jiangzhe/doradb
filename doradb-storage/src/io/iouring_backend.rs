@@ -2,7 +2,8 @@ use super::{
     BackendToken, IOBackend, IOBackendStats, IOBackendStatsHandle, IOClient, IOKind,
     IOWorkerBuilder, Operation, StdIoResult, build_io_worker,
 };
-use crate::error::{Error, IoError, Result, StorageOp};
+use crate::error::{ConfigError, Error, IoError, Result, StorageOp};
+use error_stack::Report;
 use io_uring::{IoUring, opcode, squeue, types};
 use libc::{EAGAIN, EBUSY, EINTR};
 use std::collections::VecDeque;
@@ -10,6 +11,13 @@ use std::io;
 use std::time::Instant;
 
 const DEFAULT_IO_MAX_EVENTS: usize = 32;
+
+#[inline]
+fn invalid_io_depth(max_events: usize) -> Error {
+    Report::new(ConfigError::InvalidIoDepth)
+        .attach(format!("max_events={max_events}"))
+        .into()
+}
 
 /// Concrete io_uring context used by the storage-engine backend.
 pub struct IouringBackend {
@@ -23,12 +31,12 @@ impl IouringBackend {
     #[inline]
     pub fn new(max_events: usize) -> Result<Self> {
         if max_events == 0 {
-            return Err(Error::invalid_argument());
+            return Err(invalid_io_depth(max_events));
         }
         let ring_entries = max_events
             .checked_next_power_of_two()
-            .ok_or(Error::invalid_argument())?;
-        let ring_entries = u32::try_from(ring_entries).map_err(|_| Error::invalid_argument())?;
+            .ok_or_else(|| invalid_io_depth(max_events))?;
+        let ring_entries = u32::try_from(ring_entries).map_err(|_| invalid_io_depth(max_events))?;
         let ring = IoUring::new(ring_entries)
             .map_err(|err| Error::from(IoError::report_with_op(StorageOp::BackendSetup, err)))?;
         Ok(IouringBackend {
@@ -445,20 +453,28 @@ mod tests {
     }
 
     #[test]
-    fn test_iouring_backend_rejects_zero_depth_as_invalid_argument() {
-        assert!(
-            IouringBackend::new(0)
-                .as_ref()
-                .is_err_and(|err| err.is_code(crate::error::ErrorCode::InvalidArgument))
-        );
+    fn test_iouring_backend_rejects_zero_depth_as_config_error() {
+        assert!(IouringBackend::new(0).as_ref().is_err_and(|err| {
+            err.is_kind(crate::error::ErrorKind::Config)
+                && err
+                    .report()
+                    .downcast_ref::<crate::error::ConfigError>()
+                    .copied()
+                    == Some(crate::error::ConfigError::InvalidIoDepth)
+        }));
     }
 
     #[test]
-    fn test_iouring_backend_rejects_ring_entry_overflow_as_invalid_argument() {
+    fn test_iouring_backend_rejects_ring_entry_overflow_as_config_error() {
         assert!(
             IouringBackend::new((u32::MAX as usize) + 1)
                 .as_ref()
-                .is_err_and(|err| err.is_code(crate::error::ErrorCode::InvalidArgument))
+                .is_err_and(|err| err.is_kind(crate::error::ErrorKind::Config)
+                    && err
+                        .report()
+                        .downcast_ref::<crate::error::ConfigError>()
+                        .copied()
+                        == Some(crate::error::ConfigError::InvalidIoDepth))
         );
     }
 }

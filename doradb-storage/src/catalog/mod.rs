@@ -18,7 +18,7 @@ use crate::buffer::{
     BufferPool, EvictableBufferPool, FixedBufferPool, PoolGuards, PoolRole, ReadonlyBufferPool,
 };
 use crate::component::{Component, ComponentRegistry, MetaPool, ShelfScope};
-use crate::error::{Error, OperationError, Result};
+use crate::error::{DataIntegrityError, OperationError, Result};
 use crate::file::fs::FileSystem;
 use crate::index::{BlockIndex, RowLocation};
 use crate::quiescent::{QuiescentBox, QuiescentGuard};
@@ -246,7 +246,9 @@ impl Catalog {
                 let metadata_in_catalog = TableMetadata::new(column_specs, index_specs);
                 let metadata_in_file = &*active_root.metadata;
                 if &metadata_in_catalog != metadata_in_file {
-                    return Err(Error::invalid_state());
+                    return Err(Report::new(DataIntegrityError::InvalidRootInvariant)
+                        .attach(format!("table_id={}", table.table_id))
+                        .into());
                 }
                 let row_id_bound = active_root.pivot_row_id;
                 let meta_pool_guard = guards.meta_guard();

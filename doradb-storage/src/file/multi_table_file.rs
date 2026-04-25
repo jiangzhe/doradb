@@ -1,7 +1,9 @@
 use crate::bitmap::AllocMap;
 use crate::buffer::ReadonlyBufferPool;
 use crate::catalog::{ObjID, TableID, USER_OBJ_ID_START};
-use crate::error::{DataIntegrityError, Error, FileKind, IoError, Result};
+use crate::error::{
+    DataIntegrityError, Error, FileKind, InternalError, IoError, ResourceError, Result,
+};
 use crate::file::SparseFile;
 use crate::file::block_integrity::{
     BLOCK_INTEGRITY_HEADER_SIZE, BlockIntegritySpec, max_payload_len, validate_block,
@@ -31,6 +33,20 @@ use std::num::NonZeroU64;
 use std::sync::Arc;
 
 pub use crate::file::CATALOG_MTB_FILE_ID;
+
+#[inline]
+fn mutable_root_metadata_regression(message: impl Into<String>) -> Error {
+    Report::new(InternalError::MutableRootMetadataRegression)
+        .attach(message.into())
+        .into()
+}
+
+#[inline]
+fn catalog_root_descriptor_invariant(message: impl Into<String>) -> Error {
+    Report::new(InternalError::CatalogRootDescriptorInvariant)
+        .attach(message.into())
+        .into()
+}
 
 /// On-disk format version of `catalog.mtb`.
 pub const CATALOG_MTB_VERSION: u64 = 2;
@@ -211,7 +227,13 @@ fn build_multi_table_meta_block(root: &MultiTableActiveRoot) -> Result<DirectBuf
     if meta_len > max_payload_len(COW_FILE_PAGE_SIZE)
         || root.gc_block_list.len() > u32::MAX as usize
     {
-        return Err(Error::invalid_state());
+        return Err(Report::new(ResourceError::StorageFileCapacityExceeded)
+            .attach(format!(
+                "multi-table meta block payload too large: actual_bytes={meta_len}, max_bytes={}, gc_blocks={}",
+                max_payload_len(COW_FILE_PAGE_SIZE),
+                root.gc_block_list.len()
+            ))
+            .into());
     }
     let mut buf = DirectBuf::zeroed(COW_FILE_PAGE_SIZE);
     let idx = write_block_header(buf.as_bytes_mut(), MULTI_TABLE_META_BLOCK_SPEC);
@@ -435,9 +457,11 @@ impl MutableMultiTableFile {
     /// Allocate a new page id for copy-on-write updates.
     #[inline]
     pub fn allocate_block_id(&mut self) -> Result<BlockID> {
-        self.new_root_mut()
-            .try_allocate_block_id()
-            .ok_or(Error::invalid_state())
+        self.new_root_mut().try_allocate_block_id().ok_or_else(|| {
+            Report::new(ResourceError::StorageFileCapacityExceeded)
+                .attach("multi-table file could not allocate block")
+                .into()
+        })
     }
 
     /// Roll back a block id allocated by this unpublished mutable root.
@@ -482,14 +506,22 @@ impl MutableMultiTableFile {
     ) -> Result<()> {
         let root = self.new_root_mut();
         if catalog_replay_start_ts < root.trx_id {
-            return Err(Error::invalid_argument());
+            return Err(mutable_root_metadata_regression(format!(
+                "catalog replay start regressed: current={}, new={catalog_replay_start_ts}",
+                root.trx_id
+            )));
         }
         if next_user_obj_id < USER_OBJ_ID_START {
-            return Err(Error::invalid_argument());
+            return Err(catalog_root_descriptor_invariant(format!(
+                "next_user_obj_id={next_user_obj_id}, minimum={USER_OBJ_ID_START}"
+            )));
         }
         for root in &table_roots {
             if root.root_block_id.is_none() && root.pivot_row_id != 0 {
-                return Err(Error::invalid_argument());
+                return Err(catalog_root_descriptor_invariant(format!(
+                    "table_id={}, root block missing but pivot_row_id={}",
+                    root.table_id, root.pivot_row_id
+                )));
             }
         }
 

@@ -1,7 +1,7 @@
 use crate::bitmap::AllocMap;
 use crate::buffer::ReadonlyBufferPool;
 use crate::catalog::{TableID, table::TableMetadata};
-use crate::error::{DataIntegrityError, Error, FileKind, Result};
+use crate::error::{DataIntegrityError, Error, FileKind, InternalError, ResourceError, Result};
 use crate::file::block_integrity::{
     BLOCK_INTEGRITY_HEADER_SIZE, BlockIntegritySpec, max_payload_len, validate_block,
     write_block_checksum, write_block_header,
@@ -34,6 +34,36 @@ use std::sync::Arc;
 pub const TABLE_FILE_MAGIC_WORD: [u8; 8] = [b'D', b'O', b'R', b'A', 0, 0, 0, 0];
 const TABLE_META_BLOCK_SPEC: BlockIntegritySpec =
     BlockIntegritySpec::new(TABLE_META_BLOCK_MAGIC_WORD, TABLE_META_BLOCK_VERSION);
+
+#[inline]
+fn missing_secondary_index(index_no: usize, index_count: usize) -> Error {
+    Report::new(InternalError::SecondaryIndexOutOfBounds)
+        .attach(format!("index_no={index_no}, index_count={index_count}"))
+        .into()
+}
+
+#[inline]
+fn secondary_index_root_count_mismatch(root_count: usize, index_count: usize) -> Error {
+    Report::new(InternalError::SecondaryIndexRootCountMismatch)
+        .attach(format!(
+            "root_count={root_count}, index_count={index_count}"
+        ))
+        .into()
+}
+
+#[inline]
+fn mutable_root_metadata_regression(message: impl Into<String>) -> Error {
+    Report::new(InternalError::MutableRootMetadataRegression)
+        .attach(message.into())
+        .into()
+}
+
+#[inline]
+fn column_block_index_invariant(message: impl Into<String>) -> Error {
+    Report::new(InternalError::ColumnBlockIndexInvariant)
+        .attach(message.into())
+        .into()
+}
 
 /// Initial size of new table file.
 pub const TABLE_FILE_INITIAL_SIZE: usize = 16 * 1024 * 1024;
@@ -185,7 +215,12 @@ fn build_table_meta_block(root: &ActiveRoot) -> Result<DirectBuf> {
     let mut meta_buf = DirectBuf::zeroed(COW_FILE_PAGE_SIZE);
     let meta_len = meta_block.ser_len();
     if meta_len > max_payload_len(COW_FILE_PAGE_SIZE) {
-        return Err(Error::invalid_state());
+        return Err(Report::new(ResourceError::StorageFileCapacityExceeded)
+            .attach(format!(
+                "table meta block payload too large: actual_bytes={meta_len}, max_bytes={}",
+                max_payload_len(COW_FILE_PAGE_SIZE)
+            ))
+            .into());
     }
     let meta_idx = write_block_header(meta_buf.as_bytes_mut(), TABLE_META_BLOCK_SPEC);
     let meta_idx = meta_block.ser(meta_buf.as_bytes_mut(), meta_idx);
@@ -423,7 +458,9 @@ impl MutableTableFile {
             .secondary_index_roots
             .get(index_no)
             .copied()
-            .ok_or(Error::invalid_argument())
+            .ok_or_else(|| {
+                missing_secondary_index(index_no, self.root().secondary_index_roots.len())
+            })
     }
 
     /// Updates one mutable-root secondary DiskTree root by index number.
@@ -434,7 +471,10 @@ impl MutableTableFile {
         root_block_id: BlockID,
     ) -> Result<()> {
         let roots = &mut self.new_root_mut().secondary_index_roots;
-        let root = roots.get_mut(index_no).ok_or(Error::invalid_argument())?;
+        let index_count = roots.len();
+        let root = roots
+            .get_mut(index_no)
+            .ok_or_else(|| missing_secondary_index(index_no, index_count))?;
         *root = root_block_id;
         Ok(())
     }
@@ -443,7 +483,10 @@ impl MutableTableFile {
     #[inline]
     pub fn set_secondary_index_roots(&mut self, roots: Vec<BlockID>) -> Result<()> {
         if roots.len() != self.root().metadata.index_specs.len() {
-            return Err(Error::invalid_argument());
+            return Err(secondary_index_root_count_mismatch(
+                roots.len(),
+                self.root().metadata.index_specs.len(),
+            ));
         }
         self.new_root_mut().secondary_index_roots = roots;
         Ok(())
@@ -458,7 +501,10 @@ impl MutableTableFile {
     ) -> Result<()> {
         let root = self.new_root_mut();
         if pivot_row_id < root.pivot_row_id {
-            return Err(Error::invalid_argument());
+            return Err(mutable_root_metadata_regression(format!(
+                "pivot_row_id regressed: current={}, new={pivot_row_id}",
+                root.pivot_row_id
+            )));
         }
         root.pivot_row_id = pivot_row_id;
         root.heap_redo_start_ts = heap_redo_start_ts;
@@ -477,9 +523,11 @@ impl MutableTableFile {
     /// Allocate a new block id for copy-on-write updates.
     #[inline]
     pub fn allocate_block_id(&mut self) -> Result<BlockID> {
-        self.new_root_mut()
-            .try_allocate_block_id()
-            .ok_or(Error::invalid_state())
+        self.new_root_mut().try_allocate_block_id().ok_or_else(|| {
+            Report::new(ResourceError::StorageFileCapacityExceeded)
+                .attach("table file could not allocate block")
+                .into()
+        })
     }
 
     /// Roll back a block id allocated by this unpublished mutable root.
@@ -566,13 +614,17 @@ impl MutableTableFile {
         for block in lwc_blocks {
             let start_row_id = block.shape.start_row_id();
             let end_row_id = block.shape.end_row_id();
-            let block_id = self
-                .new_root_mut()
-                .try_allocate_block_id()
-                .ok_or(Error::invalid_state())?;
+            let block_id = self.new_root_mut().try_allocate_block_id().ok_or_else(|| {
+                Error::from(
+                    Report::new(ResourceError::StorageFileCapacityExceeded)
+                        .attach("table file could not allocate LWC block"),
+                )
+            })?;
             max_row_id = max_row_id.max(end_row_id);
             if start_row_id < last_end {
-                return Err(Error::invalid_argument());
+                return Err(column_block_index_invariant(format!(
+                    "LWC block start row regressed: start_row_id={start_row_id}, last_end={last_end}"
+                )));
             }
             last_end = end_row_id;
             new_entries.push(block.shape.with_block_id(block_id));
@@ -680,6 +732,7 @@ mod tests {
         PoolRole, ReadonlyBufferPool, global_readonly_pool_scope, table_readonly_pool,
     };
     use crate::catalog::{ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexSpec};
+    use crate::error::InternalError;
     use crate::error::{DataIntegrityError, Error, FileKind};
     use crate::file::block_integrity::BLOCK_INTEGRITY_TRAILER_SIZE;
     use crate::file::{build_test_fs, build_test_fs_in, test_block_id};
@@ -762,7 +815,13 @@ mod tests {
             let err = mutable
                 .set_secondary_index_roots(vec![SUPER_BLOCK_ID, secondary_root])
                 .unwrap_err();
-            assert!(err.is_code(crate::error::ErrorCode::InvalidArgument));
+            assert!(err.is_kind(crate::error::ErrorKind::Internal));
+            assert_eq!(
+                err.report()
+                    .downcast_ref::<crate::error::InternalError>()
+                    .copied(),
+                Some(crate::error::InternalError::SecondaryIndexRootCountMismatch)
+            );
             let (table_file3, old_root) = mutable.commit(2, false).await.unwrap();
             drop(old_root);
             let active_root = table_file3
@@ -800,7 +859,10 @@ mod tests {
             let err = mutable
                 .rollback_allocated_block_id(inherited_root)
                 .unwrap_err();
-            assert!(err.is_code(crate::error::ErrorCode::InvalidState));
+            assert_eq!(
+                err.report().downcast_ref::<InternalError>().copied(),
+                Some(InternalError::CowFileAllocationInvariant)
+            );
             assert_eq!(mutable.root().alloc_map.allocated(), allocated_before);
 
             let fresh_block = mutable.allocate_block_id().unwrap();
@@ -811,7 +873,10 @@ mod tests {
             let err = mutable
                 .rollback_allocated_block_id(fresh_block)
                 .unwrap_err();
-            assert!(err.is_code(crate::error::ErrorCode::InvalidState));
+            assert_eq!(
+                err.report().downcast_ref::<InternalError>().copied(),
+                Some(InternalError::CowFileAllocationInvariant)
+            );
 
             drop(mutable);
             drop(table_file);
@@ -1096,11 +1161,14 @@ mod tests {
                 .persist_lwc_blocks(lwc_blocks, 7, 2, disk_pool.global_pool())
                 .await;
 
-            assert!(
-                result
-                    .as_ref()
-                    .is_err_and(|err| err.is_code(crate::error::ErrorCode::InvalidArgument))
-            );
+            assert!(result.as_ref().is_err_and(|err| {
+                err.is_kind(crate::error::ErrorKind::Internal)
+                    && err
+                        .report()
+                        .downcast_ref::<crate::error::InternalError>()
+                        .copied()
+                        == Some(crate::error::InternalError::ColumnBlockIndexInvariant)
+            }));
             let active_root = table_file.active_root_unchecked();
             assert_eq!(active_root.pivot_row_id, 0);
             assert_eq!(active_root.column_block_index_root, SUPER_BLOCK_ID);

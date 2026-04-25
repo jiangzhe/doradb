@@ -1,4 +1,7 @@
-use crate::error::{Error, Result, Validation, Validation::Invalid, Validation::Valid};
+use crate::error::{
+    ConfigError, Error, InternalError, Result, Validation, Validation::Invalid, Validation::Valid,
+};
+use error_stack::Report;
 use parking_lot::lock_api::{
     RawRwLock as RawRwLockApi, RawRwLockDowngrade as RawRwLockDowngradeAPI,
 };
@@ -26,7 +29,11 @@ impl FromStr for LatchFallbackMode {
             "spin" => LatchFallbackMode::Spin,
             "shared" => LatchFallbackMode::Shared,
             "exclusive" => LatchFallbackMode::Exclusive,
-            _ => return Err(Error::invalid_argument()),
+            _ => {
+                return Err(Report::new(ConfigError::InvalidLatchFallbackMode)
+                    .attach(format!("value={s}"))
+                    .into());
+            }
         };
         Ok(res)
     }
@@ -486,7 +493,9 @@ impl RawHybridGuard {
                 version: self.version,
             });
         }
-        Err(Error::invalid_state())
+        Err(Report::new(InternalError::LatchGuardStateMismatch)
+            .attach(format!("expected=Optimistic, actual={:?}", self.state))
+            .into())
     }
 
     #[inline]

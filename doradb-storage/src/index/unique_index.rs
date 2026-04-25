@@ -1,7 +1,7 @@
 use crate::buffer::guard::PageGuard;
 use crate::buffer::{BufferPool, PoolGuard};
 use crate::catalog::IndexSpec;
-use crate::error::{Error, Result};
+use crate::error::{Error, InternalError, Result};
 use crate::index::btree::BTreeKeyEncoder;
 use crate::index::btree::BTreeNodeCursor;
 use crate::index::btree::BTreeU64;
@@ -12,6 +12,7 @@ use crate::quiescent::QuiescentGuard;
 use crate::row::RowID;
 use crate::trx::TrxID;
 use crate::value::{Val, ValType};
+use error_stack::Report;
 use futures::FutureExt;
 use std::future::Future;
 
@@ -177,7 +178,11 @@ impl<'a, P: BufferPool> UniqueMemIndexCleanupScan<'a, P> {
                 batch.skipped_live += 1;
                 continue;
             }
-            let encoded_key = node.key_checked(idx).ok_or(Error::invalid_state())?;
+            let encoded_key = node.key_checked(idx).ok_or_else(|| {
+                Error::from(
+                    Report::new(InternalError::IndexKeyMissing).attach(format!("slot_idx={idx}")),
+                )
+            })?;
             batch.entries.push(UniqueMemIndexEntry {
                 encoded_key,
                 row_id,
@@ -269,7 +274,12 @@ impl<P: BufferPool> UniqueMemIndex<P> {
         while let Some(guard) = cursor.next().await? {
             let node = guard.page();
             for idx in 0..node.count() {
-                let encoded_key = node.key_checked(idx).ok_or(Error::invalid_state())?;
+                let encoded_key = node.key_checked(idx).ok_or_else(|| {
+                    Error::from(
+                        Report::new(InternalError::IndexKeyMissing)
+                            .attach(format!("slot_idx={idx}")),
+                    )
+                })?;
                 let value = node.value::<BTreeU64>(idx);
                 entries.push(UniqueMemIndexEntry {
                     encoded_key,

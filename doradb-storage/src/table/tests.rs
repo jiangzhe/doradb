@@ -7,8 +7,8 @@ use crate::catalog::tests::table4;
 use crate::conf::{EngineConfig, EvictableBufferPoolConfig, FileSystemConfig, TrxSysConfig};
 use crate::engine::Engine;
 use crate::error::{
-    CompletionErrorKind, DataIntegrityError, Error, FatalError, OperationError, ResourceError,
-    Result,
+    CompletionErrorKind, DataIntegrityError, Error, FatalError, InternalError, OperationError,
+    ResourceError, Result,
 };
 use crate::file::block_integrity::{BLOCK_INTEGRITY_HEADER_SIZE, write_block_checksum};
 use crate::file::cow_file::{
@@ -2932,7 +2932,10 @@ fn test_secondary_sidecar_failure_keeps_checkpoint_root_atomic() {
         set_test_force_secondary_sidecar_error(true);
         let _reset = ResetSidecarHook;
         let err = sys.table.checkpoint(&mut session).await.unwrap_err();
-        assert!(err.is_code(crate::error::ErrorCode::InvalidState));
+        assert_eq!(
+            err.report().downcast_ref::<InternalError>().copied(),
+            Some(InternalError::InjectedTestFailure)
+        );
 
         let root_after = sys.table.file().active_root_unchecked();
         assert_eq!(
@@ -3618,7 +3621,10 @@ fn test_checkpoint_fails_when_eligible_delete_marker_has_no_column_index() {
         wait_gc_cutoff_after(&session, marker_ts).await;
 
         let err = sys.table.checkpoint(&mut session).await.unwrap_err();
-        assert!(err.is_code(crate::error::ErrorCode::InvalidState));
+        assert_eq!(
+            err.report().downcast_ref::<DataIntegrityError>().copied(),
+            Some(DataIntegrityError::InvalidRootInvariant)
+        );
         let root_after = sys.table.file().active_root_unchecked();
         assert_eq!(
             root_after.deletion_cutoff_ts,
@@ -3670,7 +3676,10 @@ fn test_checkpoint_fails_when_eligible_delete_marker_cannot_be_located() {
         wait_gc_cutoff_after(&session, marker_ts).await;
 
         let err = sys.table.checkpoint(&mut session).await.unwrap_err();
-        assert!(err.is_code(crate::error::ErrorCode::InvalidState));
+        assert_eq!(
+            err.report().downcast_ref::<DataIntegrityError>().copied(),
+            Some(DataIntegrityError::InvalidRootInvariant)
+        );
         assert_eq!(
             sys.table.file().active_root_unchecked().deletion_cutoff_ts,
             root_before.deletion_cutoff_ts
@@ -3754,7 +3763,10 @@ fn test_recover_cold_delete_rejects_already_deleted_with_different_cts() {
             )
             .await
             .unwrap_err();
-        assert!(err.is_code(crate::error::ErrorCode::InvalidState));
+        assert_eq!(
+            err.report().downcast_ref::<DataIntegrityError>().copied(),
+            Some(DataIntegrityError::InvalidRootInvariant)
+        );
 
         drop(session);
         sys.clean_all();

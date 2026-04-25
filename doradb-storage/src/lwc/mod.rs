@@ -7,7 +7,7 @@ pub use block::*;
 use crate::bitmap::Bitmap;
 use crate::catalog::TableMetadata;
 use crate::compression::*;
-use crate::error::{DataIntegrityError, Error, OperationError, Result};
+use crate::error::{DataIntegrityError, Error, InternalError, OperationError, Result};
 use crate::file::block_integrity::{LWC_BLOCK_SPEC, write_block_checksum, write_block_header};
 use crate::file::cow_file::COW_FILE_PAGE_SIZE;
 use crate::io::DirectBuf;
@@ -23,6 +23,16 @@ fn invalid_compressed_payload(message: impl Into<String>) -> Error {
     Report::new(DataIntegrityError::InvalidPayload)
         .attach(message.into())
         .into()
+}
+
+#[inline]
+fn lwc_block_encoding_invariant() -> Error {
+    Report::new(InternalError::LwcBlockEncodingInvariant).into()
+}
+
+#[inline]
+fn column_scan_shape_mismatch() -> Error {
+    Report::new(InternalError::ColumnScanShapeMismatch).into()
 }
 
 /// Lightweight compressed data.
@@ -861,11 +871,13 @@ impl<'a> LwcBuilder<'a> {
 
     pub fn build(&self, row_shape_fingerprint: u128) -> Result<DirectBuf> {
         if self.buffer.is_empty() {
-            return Err(Error::invalid_state());
+            return Err(Report::new(InternalError::LwcBuilderMisuse)
+                .attach("cannot build an empty LWC block")
+                .into());
         }
         let row_count = self.buffer.len();
         if row_count > u16::MAX as usize {
-            return Err(Error::invalid_argument());
+            return Err(lwc_block_encoding_invariant());
         }
         let mut column_payloads = Vec::with_capacity(self.metadata.col_count());
         let mut col_offsets = Vec::with_capacity(self.metadata.col_count());
@@ -875,7 +887,7 @@ impl<'a> LwcBuilder<'a> {
             let column = self
                 .buffer
                 .column(col_idx)
-                .ok_or(Error::invalid_column_scan())?;
+                .ok_or_else(column_scan_shape_mismatch)?;
             let mut data = Vec::new();
             if let Some(bitmap) = column.null_bitmap {
                 let bytes = bitmap_to_bytes(bitmap, row_count);
@@ -941,7 +953,7 @@ impl<'a> LwcBuilder<'a> {
             data.extend_from_slice(&payload);
             offset += data.len();
             if offset > u16::MAX as usize {
-                return Err(Error::invalid_argument());
+                return Err(lwc_block_encoding_invariant());
             }
             col_offsets.push(offset as u16);
             column_payloads.push(data);
@@ -1112,7 +1124,9 @@ fn estimate_columns_size(
     let mut total = 0usize;
     debug_assert!(stats.len() == metadata.col_count());
     for (col_idx, st) in stats.iter().enumerate() {
-        let column = buffer.column(col_idx).ok_or(Error::invalid_column_scan())?;
+        let column = buffer
+            .column(col_idx)
+            .ok_or_else(column_scan_shape_mismatch)?;
         if column.null_bitmap.is_some() {
             total += mem::size_of::<u16>() + row_count.div_ceil(8);
         }
@@ -1166,7 +1180,7 @@ fn estimate_column_payload(
                 + (count + 1) * mem::size_of::<u32>()
                 + data.len()
         }
-        _ => return Err(Error::invalid_column_scan()),
+        _ => return Err(column_scan_shape_mismatch()),
     };
     Ok(size)
 }

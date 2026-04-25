@@ -20,7 +20,7 @@ use crate::buffer::{
 use crate::catalog::{
     Catalog, CatalogTable, TableID, TableMetadata, is_catalog_obj_id, is_user_obj_id,
 };
-use crate::error::{Error, OperationError, Result};
+use crate::error::{DataIntegrityError, Error, OperationError, Result};
 use crate::file::fs::FileSystem;
 use crate::latch::LatchFallbackMode;
 use crate::quiescent::QuiescentGuard;
@@ -123,7 +123,13 @@ pub(crate) async fn log_recover(
     let next_trx_ts = max_recovered_cts
         .checked_add(1)
         .filter(|ts| *ts < MAX_SNAPSHOT_TS)
-        .ok_or(Error::invalid_state())?;
+        .ok_or_else(|| {
+            Error::from(
+                Report::new(DataIntegrityError::LogFileCorrupted).attach(format!(
+                    "recovered commit timestamp out of range: max_recovered_cts={max_recovered_cts}"
+                )),
+            )
+        })?;
     log_partition_initializers = log_streams
         .into_iter()
         .map(|s| s.into_initializer())

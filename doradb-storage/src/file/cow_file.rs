@@ -1,7 +1,7 @@
 use crate::bitmap::AllocMap;
 use crate::buffer::ReadonlyBufferPool;
 use crate::buffer::page::PAGE_SIZE;
-use crate::error::{DataIntegrityError, Error, FileKind, Result};
+use crate::error::{DataIntegrityError, Error, FileKind, InternalError, ResourceError, Result};
 use crate::file::fs::BackgroundWriteRequest;
 use crate::file::super_block::{SUPER_BLOCK_SIZE, SuperBlock};
 use crate::file::{BlockKey, FileID, SparseFile, write_direct};
@@ -134,17 +134,35 @@ impl<M> ActiveRoot<M> {
     #[inline]
     pub fn rollback_allocated_block_id(&mut self, block_id: BlockID) -> Result<()> {
         if block_id == SUPER_BLOCK_ID {
-            return Err(Error::invalid_state());
+            return Err(Report::new(InternalError::CowFileAllocationInvariant)
+                .attach(format!("cannot roll back super block id {block_id}"))
+                .into());
         }
-        let idx = usize::try_from(block_id.as_u64()).map_err(|_| Error::invalid_state())?;
+        let idx = usize::try_from(block_id.as_u64()).map_err(|_| {
+            Error::from(
+                Report::new(InternalError::CowFileAllocationInvariant)
+                    .attach(format!("block_id={block_id}")),
+            )
+        })?;
         if idx >= self.alloc_map.len() {
-            return Err(Error::invalid_state());
+            return Err(Report::new(InternalError::CowFileAllocationInvariant)
+                .attach(format!(
+                    "block_id={block_id}, alloc_map_len={}",
+                    self.alloc_map.len()
+                ))
+                .into());
         }
         if !self.newly_allocated_ids.contains(&block_id) {
-            return Err(Error::invalid_state());
+            return Err(Report::new(InternalError::CowFileAllocationInvariant)
+                .attach(format!(
+                    "block_id={block_id} was not allocated by this mutable root"
+                ))
+                .into());
         }
         if !self.alloc_map.deallocate(idx) {
-            return Err(Error::invalid_state());
+            return Err(Report::new(InternalError::CowFileAllocationInvariant)
+                .attach(format!("block_id={block_id} allocation bit was not set"))
+                .into());
         }
         self.newly_allocated_ids.remove(&block_id);
         Ok(())
@@ -440,7 +458,11 @@ impl<M> CowFile<M> {
 
         let new_meta_block_id = match new_root.try_allocate_block_id() {
             Some(block_id) => block_id,
-            None => return Err(Error::invalid_state()),
+            None => {
+                return Err(Report::new(ResourceError::StorageFileCapacityExceeded)
+                    .attach("publish root could not allocate meta block")
+                    .into());
+            }
         };
         new_root.meta_block_id = new_meta_block_id;
 

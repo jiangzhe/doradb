@@ -2,7 +2,7 @@
 
 use crate::buffer::{PoolGuard, ReadonlyBlockGuard, ReadonlyBufferPool};
 use crate::catalog::TableMetadata;
-use crate::error::{DataIntegrityError, Error, FileKind, OperationError, Result};
+use crate::error::{DataIntegrityError, Error, FileKind, InternalError, OperationError, Result};
 use crate::file::SparseFile;
 use crate::file::block_integrity::{
     BLOCK_INTEGRITY_HEADER_SIZE, LWC_BLOCK_SPEC, max_payload_len, validate_block,
@@ -179,7 +179,12 @@ impl LwcBlock {
         col_idx: usize,
     ) -> Result<LwcColumn<'a>> {
         if col_idx >= metadata.col_count() {
-            return Err(Error::index_out_of_bound());
+            return Err(Report::new(InternalError::ColumnIndexOutOfBounds)
+                .attach(format!(
+                    "col_idx={col_idx}, col_count={}",
+                    metadata.col_count()
+                ))
+                .into());
         }
         let (start_idx, end_idx) = self.col_offsets().and_then(|offsets| {
             offsets.get(col_idx).ok_or_else(|| {
@@ -703,10 +708,14 @@ mod tests {
         page.body[2..4].copy_from_slice(&end_offset.to_le_bytes());
 
         let err = page.column(&metadata, 1);
-        assert!(
-            err.as_ref()
-                .is_err_and(|err| err.is_code(crate::error::ErrorCode::IndexOutOfBound))
-        );
+        assert!(err.as_ref().is_err_and(|err| {
+            err.is_kind(crate::error::ErrorKind::Internal)
+                && err
+                    .report()
+                    .downcast_ref::<crate::error::InternalError>()
+                    .copied()
+                    == Some(crate::error::InternalError::ColumnIndexOutOfBounds)
+        }));
     }
 
     #[test]

@@ -3,7 +3,8 @@ use super::{
     IOWorkerBuilder, Operation, StdIoResult, build_io_worker, io_context_t, io_destroy, io_event,
     io_getevents, io_iocb_cmd, io_setup, io_submit, iocb,
 };
-use crate::error::{IoError, Result, StorageOp};
+use crate::error::{ConfigError, IoError, Result, StorageOp};
+use error_stack::Report;
 use libc::{EAGAIN, EINTR, c_long};
 use std::collections::VecDeque;
 use std::io;
@@ -139,7 +140,11 @@ impl LibaioBackend {
     /// Create a new libaio context with max events(io depth).
     #[inline]
     pub fn new(max_events: usize) -> Result<Self> {
-        debug_assert!(max_events < isize::MAX as usize);
+        if max_events == 0 || max_events > i32::MAX as usize {
+            return Err(Report::new(ConfigError::InvalidIoDepth)
+                .attach(format!("max_events={max_events}"))
+                .into());
+        }
         let mut ctx = std::ptr::null_mut();
         // SAFETY: `ctx` points to writable storage for the kernel-owned libaio
         // context handle, and the return code is checked before constructing
@@ -560,13 +565,18 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn test_libaio_backend_maps_io_setup_failure_to_storage_backend_setup_failed() {
+    fn test_libaio_backend_rejects_zero_depth_as_config_error() {
         let err = match LibaioBackend::new(0) {
-            Ok(_) => panic!("expected backend setup failure"),
+            Ok(_) => panic!("expected invalid io depth"),
             Err(err) => err,
         };
-        assert!(err.report().downcast_ref::<IoError>().is_some());
-        assert!(format!("{err:?}").contains("op=backend setup"));
+        assert!(err.is_kind(crate::error::ErrorKind::Config));
+        assert_eq!(
+            err.report()
+                .downcast_ref::<crate::error::ConfigError>()
+                .copied(),
+            Some(crate::error::ConfigError::InvalidIoDepth)
+        );
     }
 
     #[test]

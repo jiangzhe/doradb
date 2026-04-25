@@ -1,6 +1,6 @@
 use crate::buffer::PageID;
 use crate::buffer::PoolGuards;
-use crate::error::{DataIntegrityError, Error, OperationError, RecoveryDuplicateKey, Result};
+use crate::error::{DataIntegrityError, OperationError, RecoveryDuplicateKey, Result};
 use crate::index::IndexInsert;
 use crate::index::{NonUniqueIndex, UniqueIndex};
 use crate::row::ops::{ReadRow, SelectKey, UpdateCol};
@@ -177,7 +177,9 @@ impl TableRecover for Table {
             match self.deletion_buffer().put_committed(row_id, cts) {
                 Ok(()) => return Ok(()),
                 Err(DeletionError::AlreadyDeleted | DeletionError::WriteConflict) => {
-                    return Err(Error::invalid_state());
+                    return Err(Report::new(DataIntegrityError::InvalidRootInvariant)
+                        .attach(format!("row_id={row_id}, cts={cts}"))
+                        .into());
                 }
             }
         }

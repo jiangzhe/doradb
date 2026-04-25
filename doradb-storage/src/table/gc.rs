@@ -1,6 +1,6 @@
 use super::{Table, TableRootSnapshot};
 use crate::buffer::{BufferPool, EvictableBufferPool, PoolGuard, PoolGuards};
-use crate::error::{DataIntegrityError, Error, FileKind, OperationError, Result};
+use crate::error::{DataIntegrityError, Error, FileKind, InternalError, OperationError, Result};
 use crate::file::BlockID;
 use crate::file::cow_file::SUPER_BLOCK_ID;
 use crate::index::{
@@ -515,11 +515,11 @@ impl Table {
         index_no: usize,
         row: ResolvedColumnRow,
     ) -> Result<Vec<Val>> {
-        let index_spec = self
-            .metadata()
-            .index_specs
-            .get(index_no)
-            .ok_or(Error::invalid_state())?;
+        let index_spec = self.metadata().index_specs.get(index_no).ok_or_else(|| {
+            Error::from(
+                Report::new(InternalError::IndexKeyMissing).attach(format!("index_no={index_no}")),
+            )
+        })?;
         let read_set = index_spec
             .index_cols
             .iter()

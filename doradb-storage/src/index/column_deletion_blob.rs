@@ -1,5 +1,5 @@
 use crate::buffer::{PoolGuard, ReadonlyBufferPool};
-use crate::error::{DataIntegrityError, Error, FileKind, Result};
+use crate::error::{DataIntegrityError, Error, FileKind, InternalError, Result};
 use crate::file::SparseFile;
 use crate::file::block_integrity::{
     BLOCK_INTEGRITY_HEADER_SIZE, COLUMN_DELETION_BLOB_BLOCK_SPEC, max_payload_len, validate_block,
@@ -30,6 +30,11 @@ pub const COLUMN_AUX_BLOB_HEADER_SIZE: usize = 8;
 pub const COLUMN_AUX_BLOB_KIND_DELETE_DELTAS: u8 = 1;
 /// Codec kind for little-endian `u32` delete-delta payload bytes.
 pub const COLUMN_AUX_BLOB_CODEC_U32_DELTA_LIST: u8 = 1;
+
+#[inline]
+fn column_deletion_blob_invariant() -> Error {
+    Report::new(InternalError::ColumnDeletionBlobInvariant).into()
+}
 
 #[inline]
 fn invalid_payload(message: impl Into<String>) -> Error {
@@ -71,7 +76,7 @@ impl ColumnAuxBlobHeader {
         payload_len: usize,
     ) -> Result<Self> {
         if payload_len == 0 || payload_len > u32::MAX as usize {
-            return Err(Error::invalid_argument());
+            return Err(column_deletion_blob_invariant());
         }
         Ok(ColumnAuxBlobHeader {
             blob_kind,
@@ -220,7 +225,7 @@ fn validated_blob_page_payload(page: &[u8]) -> &[u8] {
 
 fn encode_blob_page_header(buf: &mut [u8], next_page_id: BlockID, used_size: usize) -> Result<()> {
     if used_size > COLUMN_DELETION_BLOB_PAGE_BODY_SIZE {
-        return Err(Error::invalid_argument());
+        return Err(column_deletion_blob_invariant());
     }
     buf[..COLUMN_DELETION_BLOB_PAGE_HEADER_SIZE].fill(0);
     buf[COLUMN_DELETION_BLOB_NEXT_PAGE_OFFSET..COLUMN_DELETION_BLOB_NEXT_PAGE_OFFSET + 8]
@@ -301,11 +306,16 @@ impl<'a, M: MutableCowFile> ColumnDeletionBlobWriter<'a, M> {
     ) -> Result<BlobRef> {
         let framed_len = COLUMN_AUX_BLOB_HEADER_SIZE + bytes.len();
         if framed_len > u32::MAX as usize {
-            return Err(Error::invalid_argument());
+            return Err(column_deletion_blob_invariant());
         }
         self.ensure_current_page()?;
         let (start_page_id, start_offset) = {
-            let current = self.current_page.as_ref().ok_or(Error::invalid_state())?;
+            let current = self.current_page.as_ref().ok_or_else(|| {
+                Error::from(
+                    Report::new(InternalError::ColumnDeletionBlobWriterStateMismatch)
+                        .attach("current page missing after ensure_current_page"),
+                )
+            })?;
             (current.page_id, current.used_size)
         };
         let header_bytes = header.encode();
@@ -365,14 +375,24 @@ impl<'a, M: MutableCowFile> ColumnDeletionBlobWriter<'a, M> {
             let free_space = self
                 .current_page
                 .as_ref()
-                .ok_or(Error::invalid_state())?
+                .ok_or_else(|| {
+                    Error::from(
+                        Report::new(InternalError::ColumnDeletionBlobWriterStateMismatch)
+                            .attach("current page missing while writing stream"),
+                    )
+                })?
                 .free_space();
             if free_space == 0 {
                 self.roll_to_next_page()?;
                 continue;
             }
             let take = bytes.len().min(free_space);
-            let current = self.current_page.as_mut().ok_or(Error::invalid_state())?;
+            let current = self.current_page.as_mut().ok_or_else(|| {
+                Error::from(
+                    Report::new(InternalError::ColumnDeletionBlobWriterStateMismatch)
+                        .attach("current page missing before write"),
+                )
+            })?;
             current.write_bytes(&bytes[..take]);
             bytes = &bytes[take..];
         }
@@ -381,7 +401,12 @@ impl<'a, M: MutableCowFile> ColumnDeletionBlobWriter<'a, M> {
 
     fn roll_to_next_page(&mut self) -> Result<()> {
         let next_page_id = self.mutable_file.allocate_block_id()?;
-        let page = self.current_page.take().ok_or(Error::invalid_state())?;
+        let page = self.current_page.take().ok_or_else(|| {
+            Error::from(
+                Report::new(InternalError::ColumnDeletionBlobWriterStateMismatch)
+                    .attach("current page missing during page roll"),
+            )
+        })?;
         self.sealed_pages
             .push(SealedBlobPage { page, next_page_id });
         self.current_page = Some(PendingBlobPage::new(next_page_id));

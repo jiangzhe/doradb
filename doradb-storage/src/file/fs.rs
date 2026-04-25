@@ -9,7 +9,7 @@ use crate::catalog::{TableID, USER_OBJ_ID_START};
 use crate::component::{Component, ComponentRegistry, ShelfScope, Supplier};
 use crate::conf::FileSystemConfig;
 use crate::conf::path::path_to_utf8;
-use crate::error::{Error, Result};
+use crate::error::{Error, InternalError, Result};
 use crate::file::cow_file::COW_FILE_PAGE_SIZE;
 use crate::file::multi_table_file::{
     MultiTableActiveRoot, MultiTableFile, MultiTableFileOpenOutcome, MutableMultiTableFile,
@@ -25,6 +25,7 @@ use crate::notify::EventNotifyOnDrop;
 use crate::quiescent::{QuiescentBox, QuiescentGuard, SyncQuiescentGuard};
 use crate::thread;
 use crate::{IndexPool, MemPool};
+use error_stack::Report;
 use flume::{Receiver, RecvError, Selector, SendError, TryRecvError};
 use parking_lot::Mutex;
 use std::collections::VecDeque;
@@ -1301,9 +1302,24 @@ impl Component for FileSystemWorkers {
         registry: &mut ComponentRegistry,
         mut shelf: ShelfScope<'_, Self>,
     ) -> Result<()> {
-        let builder = shelf.take::<FileSystem>().ok_or(Error::invalid_state())?;
-        let mem_pool_file = shelf.take::<MemPool>().ok_or(Error::invalid_state())?;
-        let index_pool_file = shelf.take::<IndexPool>().ok_or(Error::invalid_state())?;
+        let builder = shelf.take::<FileSystem>().ok_or_else(|| {
+            Error::from(
+                Report::new(InternalError::ComponentProvisionMissing)
+                    .attach("provider=FileSystem, consumer=FileSystemWorkers"),
+            )
+        })?;
+        let mem_pool_file = shelf.take::<MemPool>().ok_or_else(|| {
+            Error::from(
+                Report::new(InternalError::ComponentProvisionMissing)
+                    .attach("provider=MemPool, consumer=FileSystemWorkers"),
+            )
+        })?;
+        let index_pool_file = shelf.take::<IndexPool>().ok_or_else(|| {
+            Error::from(
+                Report::new(InternalError::ComponentProvisionMissing)
+                    .attach("provider=IndexPool, consumer=FileSystemWorkers"),
+            )
+        })?;
 
         let fs = registry.dependency::<FileSystem>()?;
         let mem_pool = registry.dependency::<MemPool>()?;

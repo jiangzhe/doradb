@@ -18,8 +18,8 @@ use crate::conf::EvictableBufferPoolConfig;
 use crate::conf::path::{path_to_utf8, validate_swap_file_path_candidate};
 use crate::error::Validation::Valid;
 use crate::error::{
-    CompletionErrorKind, CompletionResult, Error, IoError, LifecycleError, LifecycleResult,
-    ResourceError, Result, Validation,
+    CompletionErrorKind, CompletionResult, Error, InternalError, IoError, LifecycleError,
+    LifecycleResult, ResourceError, Result, Validation,
 };
 use crate::file::fs::{FileSystem, FileSystemWorkers};
 use crate::file::{BlockID, BlockKey, INDEX_POOL_SWAP_FILE_ID, MEM_POOL_SWAP_FILE_ID, SparseFile};
@@ -1279,7 +1279,9 @@ impl Drop for EvictReadSubmission {
         drop(self.reservation.take());
         self.stats.add_completed_reads(1);
         self.stats.add_read_errors(1);
-        self.complete_waiters(Err(CompletionErrorKind::report_internal()));
+        self.complete_waiters(Err(CompletionErrorKind::report_internal(
+            InternalError::CompletionDropped,
+        )));
     }
 }
 

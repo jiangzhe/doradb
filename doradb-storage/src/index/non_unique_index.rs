@@ -1,7 +1,7 @@
 use crate::buffer::guard::PageGuard;
 use crate::buffer::{BufferPool, PoolGuard};
 use crate::catalog::IndexSpec;
-use crate::error::{Error, Result};
+use crate::error::{Error, InternalError, Result};
 use crate::index::IndexInsert;
 use crate::index::btree::BTreeKeyEncoder;
 use crate::index::btree::BTreeNodeCursor;
@@ -14,6 +14,7 @@ use crate::quiescent::QuiescentGuard;
 use crate::row::RowID;
 use crate::trx::TrxID;
 use crate::value::{Val, ValKind, ValType};
+use error_stack::Report;
 use std::future::Future;
 use std::mem;
 
@@ -155,7 +156,12 @@ impl<'a, P: BufferPool> NonUniqueMemIndexCleanupScan<'a, P> {
         let mut batch = NonUniqueMemIndexCleanupBatch::default();
         for (idx, slot) in node.slots().iter().enumerate() {
             if node.slot_key_len(slot) < mem::size_of::<RowID>() {
-                return Err(Error::invalid_state());
+                return Err(Report::new(InternalError::MemIndexKeyMalformed)
+                    .attach(format!(
+                        "slot_idx={idx}, key_len={}",
+                        node.slot_key_len(slot)
+                    ))
+                    .into());
             }
             let value = node.value_for_slot::<BTreeByte>(slot);
             let deleted = value.is_deleted();
@@ -172,7 +178,11 @@ impl<'a, P: BufferPool> NonUniqueMemIndexCleanupScan<'a, P> {
                 batch.skipped_live += 1;
                 continue;
             }
-            let encoded_key = node.key_checked(idx).ok_or(Error::invalid_state())?;
+            let encoded_key = node.key_checked(idx).ok_or_else(|| {
+                Error::from(
+                    Report::new(InternalError::IndexKeyMissing).attach(format!("slot_idx={idx}")),
+                )
+            })?;
             batch.entries.push(NonUniqueMemIndexEntry {
                 encoded_key,
                 row_id,
@@ -540,7 +550,9 @@ fn push_encoded_exact_entry(
     let mut encoded_key = Vec::new();
     node.extend_slot_key(slot, &mut encoded_key);
     if encoded_key.len() < mem::size_of::<RowID>() {
-        return Err(Error::invalid_state());
+        return Err(Report::new(InternalError::MemIndexKeyMalformed)
+            .attach(format!("key_len={}", encoded_key.len()))
+            .into());
     }
     let row_id = node.unpack_value::<BTreeU64>(slot).to_u64();
     let value = node.value_for_slot::<BTreeByte>(slot);
@@ -641,7 +653,10 @@ mod tests {
                 .lookup_encoded_entries(&pool_guard, &key)
                 .await
                 .expect_err("malformed exact key should fail encoded-entry lookup");
-            assert!(err.is_code(crate::error::ErrorCode::InvalidState));
+            assert_eq!(
+                err.report().downcast_ref::<InternalError>().copied(),
+                Some(InternalError::MemIndexKeyMalformed)
+            );
         })
     }
 

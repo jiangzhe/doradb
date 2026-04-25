@@ -18,7 +18,8 @@ use crate::buffer::ReadSubmission;
 use crate::catalog::USER_OBJ_ID_START;
 use crate::compression::BitPackable;
 use crate::error::{
-    CompletionErrorKind, CompletionResult, Error, IoError, ResourceError, Result, StorageOp,
+    CompletionErrorKind, CompletionResult, ConfigError, Error, IoError, ResourceError, Result,
+    StorageOp,
 };
 use crate::free_list::FreeList;
 use crate::io::DirectBuf;
@@ -655,7 +656,9 @@ pub fn sparse_file_size(fd: RawFd) -> io::Result<(usize, usize)> {
 #[inline]
 fn c_string_from_path(file_path: &str) -> Result<CString> {
     CString::new(file_path).map_err(|_| {
-        Error::invalid_argument_message(format!("path must not contain NUL: {file_path}"))
+        Report::new(ConfigError::PathMustNotContainNul)
+            .attach(format!("path={file_path}"))
+            .into()
     })
 }
 
@@ -1269,20 +1272,30 @@ mod tests {
     }
 
     #[test]
-    fn test_sparse_file_invalid_path_maps_invalid_argument() {
+    fn test_sparse_file_invalid_path_maps_config_error() {
         let invalid_path = "bad\0path";
         let err = match SparseFile::open(invalid_path, UNTRACKED_FILE_ID) {
             Ok(_) => panic!("expected invalid path open failure"),
             Err(err) => err,
         };
-        assert!(err.is_kind(crate::error::ErrorKind::InvalidInput));
-        assert!(err.is_code(crate::error::ErrorCode::InvalidArgument));
+        assert!(err.is_kind(crate::error::ErrorKind::Config));
+        assert_eq!(
+            err.report()
+                .downcast_ref::<crate::error::ConfigError>()
+                .copied(),
+            Some(crate::error::ConfigError::PathMustNotContainNul)
+        );
         let err = match SparseFile::create_or_trunc(invalid_path, 4096, UNTRACKED_FILE_ID) {
             Ok(_) => panic!("expected invalid path create failure"),
             Err(err) => err,
         };
-        assert!(err.is_kind(crate::error::ErrorKind::InvalidInput));
-        assert!(err.is_code(crate::error::ErrorCode::InvalidArgument));
+        assert!(err.is_kind(crate::error::ErrorKind::Config));
+        assert_eq!(
+            err.report()
+                .downcast_ref::<crate::error::ConfigError>()
+                .copied(),
+            Some(crate::error::ConfigError::PathMustNotContainNul)
+        );
     }
 
     #[test]

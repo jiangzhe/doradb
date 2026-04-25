@@ -13,7 +13,7 @@ use super::unique_index::UniqueMemIndexEntry;
 use super::unique_index::{UniqueIndex, UniqueMemIndex};
 use crate::buffer::{BufferPool, PoolGuard, ReadonlyBufferPool};
 use crate::catalog::{IndexSpec, TableMetadata};
-use crate::error::{Error, Result};
+use crate::error::{Error, InternalError, Result};
 use crate::file::cow_file::BlockID;
 use crate::file::table_file::TableFile;
 use crate::index::util::Maskable;
@@ -21,6 +21,7 @@ use crate::quiescent::QuiescentGuard;
 use crate::row::RowID;
 use crate::trx::TrxID;
 use crate::value::{Val, ValType};
+use error_stack::Report;
 use std::cmp::Ordering;
 use std::sync::Arc;
 
@@ -156,10 +157,14 @@ impl SecondaryDiskTreeRuntime {
         table_file: Arc<TableFile>,
         disk_pool: QuiescentGuard<ReadonlyBufferPool>,
     ) -> Result<Self> {
-        let index_spec = metadata
-            .index_specs
-            .get(index_no)
-            .ok_or(Error::invalid_argument())?;
+        let index_spec = metadata.index_specs.get(index_no).ok_or_else(|| {
+            Error::from(
+                Report::new(InternalError::SecondaryIndexOutOfBounds).attach(format!(
+                    "index_no={index_no}, index_count={}",
+                    metadata.index_specs.len()
+                )),
+            )
+        })?;
         let file_kind = table_file.file_kind();
         let file = Arc::clone(table_file.sparse_file());
         let kind = if index_spec.unique() {
