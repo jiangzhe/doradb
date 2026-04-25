@@ -1413,7 +1413,7 @@ mod tests {
                 Ok(_) => panic!("expected free-list page reload failure"),
                 Err(err) => err,
             };
-            assert!(err.is_code(crate::error::ErrorCode::IOError));
+            assert!(err.io_error().is_some());
         });
     }
 

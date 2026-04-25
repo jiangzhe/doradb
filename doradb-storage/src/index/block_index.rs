@@ -652,7 +652,7 @@ mod tests {
                 Ok(_) => panic!("expected cached insert-page reload failure"),
                 Err(err) => err,
             };
-            assert!(err.is_code(crate::error::ErrorCode::IOError));
+            assert!(err.io_error().is_some());
         });
     }
 }

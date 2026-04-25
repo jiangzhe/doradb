@@ -2,12 +2,17 @@ use crate::row::RowID;
 use error_stack::Report;
 use std::array::TryFromSliceError;
 use std::fmt;
+use std::io::{self, ErrorKind as IoErrorKind};
 use std::ops::ControlFlow;
 use thiserror::Error as ThisError;
 
 pub type Result<T> = std::result::Result<T, Error>;
 pub(crate) type ConfigResult<T> = std::result::Result<T, Report<ConfigError>>;
 pub(crate) type DataIntegrityResult<T> = std::result::Result<T, Report<DataIntegrityError>>;
+#[allow(dead_code)]
+pub(crate) type IOResult<T> = std::result::Result<T, Report<IoError>>;
+pub(crate) type LifecycleResult<T> = std::result::Result<T, Report<LifecycleError>>;
+pub(crate) type CompletionResult<T> = std::result::Result<T, Report<CompletionErrorKind>>;
 
 /// Public storage error boundary classification.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ThisError)]
@@ -99,6 +104,114 @@ pub(crate) enum DataIntegrityError {
     UnexpectedRecoveryDuplicateKey,
 }
 
+/// Fieldless lifecycle-domain errors carried underneath `ErrorKind::Lifecycle`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ThisError)]
+pub(crate) enum LifecycleError {
+    #[error("storage engine is shut down")]
+    Shutdown,
+    #[error("storage engine shutdown is busy")]
+    ShutdownBusy,
+}
+
+/// IO-domain errors carried underneath `ErrorKind::Io`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ThisError)]
+#[error("{0}")]
+pub(crate) struct IoError(IoErrorKind);
+
+impl IoError {
+    #[inline]
+    pub(crate) fn kind(self) -> IoErrorKind {
+        self.0
+    }
+
+    #[inline]
+    #[allow(dead_code)]
+    pub(crate) fn from_raw_os_error(raw_os_error: i32) -> Self {
+        io::Error::from_raw_os_error(raw_os_error).kind().into()
+    }
+
+    #[inline]
+    pub(crate) fn report(err: io::Error) -> Report<Self> {
+        Report::new(Self::from(err.kind())).attach(format!("{}", err))
+    }
+
+    #[inline]
+    pub(crate) fn report_with_op(op: StorageOp, err: io::Error) -> Report<Self> {
+        Report::new(Self::from(err.kind())).attach(format!("op={op}, {err}"))
+    }
+
+    #[inline]
+    #[allow(dead_code)]
+    pub(crate) fn report_raw_os_error_with_op(op: StorageOp, raw_os_error: i32) -> Report<Self> {
+        let err = io::Error::from_raw_os_error(raw_os_error);
+        Report::new(Self::from_raw_os_error(raw_os_error)).attach(format!("op={op}, {err}"))
+    }
+
+    #[inline]
+    pub(crate) fn report_unexpected_eof(
+        actual_bytes: usize,
+        expected_bytes: usize,
+    ) -> Report<Self> {
+        Report::new(Self::from(IoErrorKind::UnexpectedEof)).attach(format!(
+            "unexpected eof: actual_bytes={actual_bytes}, expected_bytes={expected_bytes}"
+        ))
+    }
+
+    #[inline]
+    pub(crate) fn report_send(message: impl Into<String>) -> Report<Self> {
+        Report::new(Self::from(IoErrorKind::BrokenPipe)).attach(message.into())
+    }
+}
+
+impl From<IoErrorKind> for IoError {
+    #[inline]
+    fn from(kind: IoErrorKind) -> Self {
+        IoError(kind)
+    }
+}
+
+/// Fieldless cross-thread completion transport errors.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ThisError)]
+pub(crate) enum CompletionErrorKind {
+    #[error("io error")]
+    Io,
+    #[error("send error")]
+    Send,
+    #[error("data integrity error")]
+    DataIntegrity,
+    #[error("fatal storage error")]
+    Fatal,
+    #[error("internal completion error")]
+    Internal,
+    #[error("invalid completion state")]
+    InvalidState,
+}
+
+impl CompletionErrorKind {
+    #[inline]
+    pub(crate) fn report_io(err: io::Error) -> Report<Self> {
+        IoError::report(err).change_context(Self::Io)
+    }
+
+    #[inline]
+    pub(crate) fn report_unexpected_eof(
+        actual_bytes: usize,
+        expected_bytes: usize,
+    ) -> Report<Self> {
+        IoError::report_unexpected_eof(actual_bytes, expected_bytes).change_context(Self::Io)
+    }
+
+    #[inline]
+    pub(crate) fn report_send(message: impl Into<String>) -> Report<Self> {
+        IoError::report_send(message).change_context(Self::Send)
+    }
+
+    #[inline]
+    pub(crate) fn report_internal() -> Report<Self> {
+        Report::new(Self::Internal)
+    }
+}
+
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ErrorCode {
@@ -107,9 +220,6 @@ pub(crate) enum ErrorCode {
     InvalidState,
     WrongSecondaryIndexBinding,
     OldTableRootAlreadyRetained,
-    IOError,
-    StorageIOError,
-    ShortIO,
     StorageFileCapacityExceeded,
     DataTypeNotSupported,
     IndexOutOfBound,
@@ -123,14 +233,10 @@ pub(crate) enum ErrorCode {
     BufferPoolSizeTooSmall,
     RowNotFound,
     InsufficientFreeSpaceForInplaceUpdate,
-    StorageEngineShutdown,
-    StorageEngineShutdownBusy,
     StorageEnginePoisoned,
     TableNotFound,
     TableNotDeleted,
     TableAlreadyExists,
-    GlobError,
-    SendError,
     NotSupported,
     ColumnNeverNull,
     InvalidColumnScan,
@@ -244,36 +350,6 @@ impl fmt::Display for RecoveryDuplicateKey {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct IoFailure {
-    pub(crate) kind: std::io::ErrorKind,
-    pub(crate) raw_os_error: Option<i32>,
-}
-
-impl fmt::Display for IoFailure {
-    #[inline]
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "kind={:?}, raw_os_error={:?}",
-            self.kind, self.raw_os_error
-        )
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct StorageIoFailure {
-    pub(crate) op: StorageOp,
-    pub(crate) failure: IoFailure,
-}
-
-impl fmt::Display for StorageIoFailure {
-    #[inline]
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "op={}, {}", self.op, self.failure)
-    }
-}
-
 /// Public storage error report.
 pub struct Error(Report<ErrorKind>);
 
@@ -317,27 +393,9 @@ impl Error {
     }
 
     #[inline]
-    pub(crate) fn duplicate(&self) -> Self {
-        if let Some(config) = self.config_error() {
-            let report = match self.text_detail() {
-                Some(detail) => Report::new(config).attach(detail.to_owned()),
-                None => Report::new(config),
-            };
-            return report.into();
-        }
-        if let Some(data_integrity) = self.data_integrity_error() {
-            if let Some(detail) = self.text_detail() {
-                return Report::new(data_integrity).attach(detail.to_owned()).into();
-            }
-            if let Some(duplicate) = self.downcast_ref::<RecoveryDuplicateKey>().copied() {
-                return Report::new(data_integrity).attach(duplicate).into();
-            }
-            return Report::new(data_integrity).into();
-        }
-        self.0
-            .downcast_ref::<ErrorCode>()
-            .copied()
-            .map_or_else(Self::internal, |code| self.duplicate_from_code(code))
+    pub(crate) fn into_completion_report(self) -> Report<CompletionErrorKind> {
+        let kind = self.completion_error_kind();
+        self.into_report().change_context(kind)
     }
 
     #[inline]
@@ -356,81 +414,23 @@ impl Error {
     }
 
     #[inline]
-    fn duplicate_from_code(&self, code: ErrorCode) -> Self {
-        match code {
-            ErrorCode::InvalidArgument => self
-                .text_detail()
-                .map_or_else(Self::invalid_argument, |message| {
-                    Self::invalid_argument_message(message.to_owned())
-                }),
-            ErrorCode::InternalError => Self::internal(),
-            ErrorCode::InvalidState => Self::invalid_state(),
-            ErrorCode::WrongSecondaryIndexBinding => self
-                .downcast_ref::<SecondaryIndexBinding>()
-                .copied()
-                .map_or_else(Self::internal, |binding| {
-                    Self::wrong_secondary_index_binding(binding.expected, binding.actual)
-                }),
-            ErrorCode::OldTableRootAlreadyRetained => Self::old_table_root_already_retained(),
-            ErrorCode::IOError => self.io_failure().map_or_else(Self::internal, |failure| {
-                Self::io_error_parts(failure.kind, failure.raw_os_error)
-            }),
-            ErrorCode::StorageIOError => {
-                self.storage_io_failure()
-                    .map_or_else(Self::internal, |failure| {
-                        Self::storage_io_error_parts(
-                            failure.op,
-                            failure.failure.kind,
-                            failure.failure.raw_os_error,
-                        )
-                    })
-            }
-            ErrorCode::ShortIO => Self::short_io(),
-            ErrorCode::StorageFileCapacityExceeded => Self::storage_file_capacity_exceeded(),
-            ErrorCode::DataTypeNotSupported => Self::data_type_not_supported(),
-            ErrorCode::IndexOutOfBound => Self::index_out_of_bound(),
-            ErrorCode::InvalidCodecForSel => Self::invalid_codec_for_sel(),
-            ErrorCode::ValueCountMismatch => Self::value_count_mismatch(),
-            ErrorCode::InvalidDatatype => Self::invalid_datatype(),
-            ErrorCode::InsufficientMemory => self
-                .downcast_ref::<usize>()
-                .copied()
-                .map_or_else(Self::internal, Self::insufficient_memory),
-            ErrorCode::BufferPageAlreadyAllocated => Self::buffer_page_already_allocated(),
-            ErrorCode::BufferPoolFull => Self::buffer_pool_full(),
-            ErrorCode::EmptyFreeListOfBufferPool => Self::empty_free_list_of_buffer_pool(),
-            ErrorCode::BufferPoolSizeTooSmall => Self::buffer_pool_size_too_small(),
-            ErrorCode::RowNotFound => Self::row_not_found(),
-            ErrorCode::InsufficientFreeSpaceForInplaceUpdate => {
-                Self::insufficient_free_space_for_inplace_update()
-            }
-            ErrorCode::StorageEngineShutdown => Self::storage_engine_shutdown(),
-            ErrorCode::StorageEngineShutdownBusy => self
-                .downcast_ref::<usize>()
-                .copied()
-                .map_or_else(Self::internal, Self::storage_engine_shutdown_busy),
-            ErrorCode::StorageEnginePoisoned => self
-                .storage_poison_source()
-                .map_or_else(Self::internal, Self::storage_engine_poisoned),
-            ErrorCode::TableNotFound => Self::table_not_found(),
-            ErrorCode::TableNotDeleted => Self::table_not_deleted(),
-            ErrorCode::TableAlreadyExists => Self::table_already_exists(),
-            ErrorCode::GlobError => Self::glob_error(),
-            ErrorCode::SendError => Self::send_error(),
-            ErrorCode::NotSupported => self
-                .downcast_ref::<&'static str>()
-                .copied()
-                .map_or_else(|| Self::not_supported("<unknown>"), Self::not_supported),
-            ErrorCode::ColumnNeverNull => Self::column_never_null(),
-            ErrorCode::InvalidColumnScan => Self::invalid_column_scan(),
-            ErrorCode::ColumnStorageMissing => Self::column_storage_missing(),
-            ErrorCode::EngineComponentAlreadyRegistered => {
-                Self::engine_component_already_registered()
-            }
-            ErrorCode::EngineComponentMissingDependency => {
-                Self::engine_component_missing_dependency()
-            }
+    fn completion_error_kind(&self) -> CompletionErrorKind {
+        if let Some(kind) = self.completion_error() {
+            return kind;
         }
+        if self.is_kind(ErrorKind::Io) {
+            return CompletionErrorKind::Io;
+        }
+        if self.is_kind(ErrorKind::DataIntegrity) {
+            return CompletionErrorKind::DataIntegrity;
+        }
+        if self.is_kind(ErrorKind::Fatal) {
+            return CompletionErrorKind::Fatal;
+        }
+        if self.is_code(ErrorCode::InvalidState) {
+            return CompletionErrorKind::InvalidState;
+        }
+        CompletionErrorKind::Internal
     }
 
     #[inline]
@@ -441,6 +441,21 @@ impl Error {
     #[inline]
     pub(crate) fn data_integrity_error(&self) -> Option<DataIntegrityError> {
         self.downcast_ref::<DataIntegrityError>().copied()
+    }
+
+    #[inline]
+    pub(crate) fn lifecycle_error(&self) -> Option<LifecycleError> {
+        self.downcast_ref::<LifecycleError>().copied()
+    }
+
+    #[inline]
+    pub(crate) fn completion_error(&self) -> Option<CompletionErrorKind> {
+        self.downcast_ref::<CompletionErrorKind>().copied()
+    }
+
+    #[inline]
+    pub(crate) fn io_error(&self) -> Option<IoError> {
+        self.downcast_ref::<IoError>().copied()
     }
 
     #[inline]
@@ -482,46 +497,6 @@ impl Error {
     #[inline]
     pub(crate) fn old_table_root_already_retained() -> Self {
         Self::new(ErrorKind::Operation, ErrorCode::OldTableRootAlreadyRetained)
-    }
-
-    #[inline]
-    pub(crate) fn io_error(err: std::io::Error) -> Self {
-        Self::io_error_parts(err.kind(), err.raw_os_error())
-    }
-
-    #[inline]
-    pub(crate) fn io_error_parts(kind: std::io::ErrorKind, raw_os_error: Option<i32>) -> Self {
-        Self::new_with_attachment(
-            ErrorKind::Io,
-            ErrorCode::IOError,
-            IoFailure { kind, raw_os_error },
-        )
-    }
-
-    #[inline]
-    pub(crate) fn storage_io_error(op: StorageOp, err: std::io::Error) -> Self {
-        Self::storage_io_error_parts(op, err.kind(), err.raw_os_error())
-    }
-
-    #[inline]
-    pub(crate) fn storage_io_error_parts(
-        op: StorageOp,
-        kind: std::io::ErrorKind,
-        raw_os_error: Option<i32>,
-    ) -> Self {
-        Self::new_with_attachment(
-            ErrorKind::Io,
-            ErrorCode::StorageIOError,
-            StorageIoFailure {
-                op,
-                failure: IoFailure { kind, raw_os_error },
-            },
-        )
-    }
-
-    #[inline]
-    pub(crate) fn short_io() -> Self {
-        Self::new(ErrorKind::Io, ErrorCode::ShortIO)
     }
 
     #[inline]
@@ -597,20 +572,6 @@ impl Error {
     }
 
     #[inline]
-    pub(crate) fn storage_engine_shutdown() -> Self {
-        Self::new(ErrorKind::Lifecycle, ErrorCode::StorageEngineShutdown)
-    }
-
-    #[inline]
-    pub(crate) fn storage_engine_shutdown_busy(extra_refs: usize) -> Self {
-        Self::new_with_attachment(
-            ErrorKind::Lifecycle,
-            ErrorCode::StorageEngineShutdownBusy,
-            extra_refs,
-        )
-    }
-
-    #[inline]
     pub(crate) fn storage_engine_poisoned(source: StoragePoisonSource) -> Self {
         Self::new_with_attachment(ErrorKind::Fatal, ErrorCode::StorageEnginePoisoned, source)
     }
@@ -638,16 +599,6 @@ impl Error {
     #[inline]
     pub(crate) fn table_already_exists() -> Self {
         Self::new(ErrorKind::Operation, ErrorCode::TableAlreadyExists)
-    }
-
-    #[inline]
-    pub(crate) fn glob_error() -> Self {
-        Self::new(ErrorKind::Io, ErrorCode::GlobError)
-    }
-
-    #[inline]
-    pub(crate) fn send_error() -> Self {
-        Self::new(ErrorKind::Io, ErrorCode::SendError)
     }
 
     #[inline]
@@ -692,40 +643,6 @@ impl Error {
     }
 
     #[inline]
-    pub(crate) fn is_storage_io_failure(&self) -> bool {
-        self.is_code(ErrorCode::IOError)
-            || self.is_code(ErrorCode::StorageIOError)
-            || self.is_code(ErrorCode::ShortIO)
-    }
-
-    #[inline]
-    pub(crate) fn io_failure(&self) -> Option<IoFailure> {
-        self.downcast_ref::<IoFailure>().copied()
-    }
-
-    #[inline]
-    pub(crate) fn is_io_error_kind(&self, kind: std::io::ErrorKind) -> bool {
-        self.io_failure()
-            .is_some_and(|failure| failure.kind == kind)
-    }
-
-    #[inline]
-    pub(crate) fn storage_io_failure(&self) -> Option<StorageIoFailure> {
-        self.downcast_ref::<StorageIoFailure>().copied()
-    }
-
-    #[inline]
-    pub(crate) fn is_storage_io_error(&self, op: StorageOp, kind: std::io::ErrorKind) -> bool {
-        self.downcast_ref::<StorageIoFailure>()
-            .is_some_and(|failure| failure.op == op && failure.failure.kind == kind)
-    }
-
-    #[inline]
-    pub(crate) fn is_send_error(&self) -> bool {
-        self.is_code(ErrorCode::SendError)
-    }
-
-    #[inline]
     pub(crate) fn is_not_supported(&self, feature: &'static str) -> bool {
         self.is_code(ErrorCode::NotSupported)
             && self.downcast_ref::<&'static str>().copied() == Some(feature)
@@ -746,6 +663,35 @@ impl From<Report<DataIntegrityError>> for Error {
     }
 }
 
+impl From<Report<LifecycleError>> for Error {
+    #[inline]
+    fn from(report: Report<LifecycleError>) -> Self {
+        Error(report.change_context(ErrorKind::Lifecycle))
+    }
+}
+
+impl From<Report<IoError>> for Error {
+    #[inline]
+    fn from(report: Report<IoError>) -> Self {
+        Error(report.change_context(ErrorKind::Io))
+    }
+}
+
+impl From<Report<CompletionErrorKind>> for Error {
+    #[inline]
+    fn from(report: Report<CompletionErrorKind>) -> Self {
+        let kind = match report.current_context() {
+            CompletionErrorKind::Io | CompletionErrorKind::Send => ErrorKind::Io,
+            CompletionErrorKind::DataIntegrity => ErrorKind::DataIntegrity,
+            CompletionErrorKind::Fatal => ErrorKind::Fatal,
+            CompletionErrorKind::Internal | CompletionErrorKind::InvalidState => {
+                ErrorKind::Internal
+            }
+        };
+        Error(report.change_context(kind))
+    }
+}
+
 impl From<TryFromSliceError> for Error {
     #[inline]
     fn from(_src: TryFromSliceError) -> Error {
@@ -753,13 +699,10 @@ impl From<TryFromSliceError> for Error {
     }
 }
 
-impl From<std::io::Error> for Error {
+impl From<io::Error> for Error {
     #[inline]
-    fn from(src: std::io::Error) -> Self {
-        match (src.kind(), src.raw_os_error()) {
-            (std::io::ErrorKind::UnexpectedEof, None) => Error::short_io(),
-            _ => Error::io_error(src),
-        }
+    fn from(src: io::Error) -> Self {
+        IoError::report(src).into()
     }
 }
 
@@ -779,8 +722,10 @@ impl From<std::num::ParseIntError> for Error {
 
 impl From<glob::GlobError> for Error {
     #[inline]
-    fn from(_src: glob::GlobError) -> Self {
-        Error::glob_error()
+    fn from(src: glob::GlobError) -> Self {
+        Report::new(IoError::from(src.error().kind()))
+            .attach(format!("{}", src))
+            .into()
     }
 }
 
@@ -889,4 +834,56 @@ macro_rules! verify_continue {
             Validation::Valid(v) => v,
         }
     };
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[inline]
+    fn raw_os_error_result(raw_os_error: i32) -> IOResult<()> {
+        Err(IoError::report_raw_os_error_with_op(
+            StorageOp::BackendSetup,
+            raw_os_error,
+        ))
+    }
+
+    #[test]
+    fn test_io_error_from_raw_os_error_uses_io_kind() {
+        let report = raw_os_error_result(libc::EIO).unwrap_err();
+        let expected = io::Error::from_raw_os_error(libc::EIO).kind();
+        assert_eq!(report.current_context().kind(), expected);
+        assert!(format!("{report:?}").contains("op=backend setup"));
+    }
+
+    #[test]
+    fn test_io_report_with_op_attaches_formatted_context() {
+        let report = IoError::report_with_op(
+            StorageOp::FileOpen,
+            io::Error::new(IoErrorKind::PermissionDenied, "open denied"),
+        );
+
+        assert_eq!(
+            report.current_context().kind(),
+            IoErrorKind::PermissionDenied
+        );
+        let output = format!("{report:?}");
+        assert!(output.contains("op=file open"));
+        assert!(output.contains("open denied"));
+    }
+
+    #[test]
+    fn test_io_report_converts_to_top_level_io() {
+        let err = Error::from(IoError::report(io::Error::new(
+            IoErrorKind::WouldBlock,
+            "not ready",
+        )));
+
+        assert_eq!(err.kind(), ErrorKind::Io);
+        assert_eq!(
+            err.io_error().map(IoError::kind),
+            Some(IoErrorKind::WouldBlock)
+        );
+        assert!(format!("{err:?}").contains("not ready"));
+    }
 }

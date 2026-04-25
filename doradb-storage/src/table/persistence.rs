@@ -1,6 +1,6 @@
 use crate::buffer::PageID;
 use crate::catalog::{IndexSpec, TableMetadata};
-use crate::error::{Error, Result, StoragePoisonSource};
+use crate::error::{Error, ErrorKind, Result, StoragePoisonSource};
 use crate::file::cow_file::SUPER_BLOCK_ID;
 use crate::file::table_file::{ActiveRoot, MutableTableFile};
 use crate::index::BTreeKeyEncoder;
@@ -833,7 +833,7 @@ impl TablePersistence for Table {
         let published_column_root = published_root.column_block_index_root;
         let (_table_file, old_root) = match mutable_file.commit(checkpoint_ts, false).await {
             Ok(res) => res,
-            Err(err) if err.is_storage_io_failure() || err.is_send_error() => {
+            Err(err) if err.kind() == ErrorKind::Io => {
                 let _ = trx_sys.rollback(trx).await;
                 let poison = trx_sys.poison_storage(StoragePoisonSource::CheckpointWrite);
                 return Err(poison);

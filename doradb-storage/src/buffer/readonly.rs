@@ -15,14 +15,15 @@ use crate::buffer::{
     BufferPoolStats, BufferPoolStatsHandle, PageIOCompletion, PoolGuard, PoolIdentity, PoolRole,
     ReadonlyBlockValidator,
 };
-use crate::error::{Error, FileKind, Result};
+use crate::error::{CompletionErrorKind, CompletionResult, Error, FileKind, Result};
 use crate::file::fs::FileSystem;
 use crate::file::{BlockID, BlockKey, FileID, SparseFile};
-use crate::io::{IOKind, IOSubmission, Operation};
+use crate::io::{IOKind, IOSubmission, Operation, StdIoResult};
 use crate::latch::LatchFallbackMode;
 use crate::quiescent::{QuiescentGuard, SyncQuiescentGuard};
 use dashmap::DashMap;
 use dashmap::mapref::entry::Entry;
+use error_stack::Report;
 use event_listener::{Event, EventListener, listener};
 use parking_lot::Mutex;
 use std::collections::BTreeSet;
@@ -191,7 +192,7 @@ impl ReadonlyBufferPool {
         &self,
         key: BlockKey,
         inflight: &Arc<PageIOCompletion>,
-        result: Result<PageID>,
+        result: CompletionResult<PageID>,
     ) {
         inflight.complete(result);
         match self.inflight_loads.entry(key) {
@@ -688,7 +689,7 @@ impl ReadSubmission {
     /// `ReadSubmission` also completes in `Drop` as a last-resort rollback
     /// path, so every explicit terminal path must mark the submission as
     /// completed to avoid a redundant second completion and inflight-map check.
-    fn complete_inflight_once(&mut self, result: Result<PageID>) {
+    fn complete_inflight_once(&mut self, result: CompletionResult<PageID>) {
         if self.completed {
             return;
         }
@@ -699,7 +700,7 @@ impl ReadSubmission {
 
     #[inline]
     /// Fails the miss before worker completion and wakes all joined waiters.
-    pub(crate) fn fail(mut self, err: Error) {
+    pub(crate) fn fail(mut self, err: Report<CompletionErrorKind>) {
         drop(self.reservation.take());
         self.pool.stats.add_completed_reads(1);
         self.pool.stats.add_read_errors(1);
@@ -716,7 +717,7 @@ impl ReadSubmission {
     ///
     /// Exact-page reads publish the reserved frame; short reads and IO errors
     /// drop the reservation so rollback returns the frame to the free list.
-    pub(crate) fn complete(mut self, res: std::io::Result<usize>) -> IOKind {
+    pub(crate) fn complete(mut self, res: StdIoResult<usize>) -> IOKind {
         let result = match res {
             Ok(len) if len == PAGE_SIZE => {
                 if let Some(validation) = self.validation {
@@ -729,7 +730,7 @@ impl ReadSubmission {
                         self.key.block_id,
                     ) {
                         drop(self.reservation.take());
-                        self.complete_inflight_once(Err(err));
+                        self.complete_inflight_once(Err(err.into_completion_report()));
                         return IOKind::Read;
                     }
                 }
@@ -738,16 +739,16 @@ impl ReadSubmission {
                 );
                 match reservation.publish() {
                     Ok(page_id) => Ok(page_id),
-                    Err(err) => Err(err),
+                    Err(err) => Err(err.into_completion_report()),
                 }
             }
-            Ok(_) => {
+            Ok(len) => {
                 drop(self.reservation.take());
-                Err(Error::short_io())
+                Err(CompletionErrorKind::report_unexpected_eof(len, PAGE_SIZE))
             }
             Err(err) => {
                 drop(self.reservation.take());
-                Err(err.into())
+                Err(CompletionErrorKind::report_io(err))
             }
         };
         self.pool.stats.add_completed_reads(1);
@@ -775,7 +776,7 @@ impl Drop for ReadSubmission {
         drop(self.reservation.take());
         self.pool.stats.add_completed_reads(1);
         self.pool.stats.add_read_errors(1);
-        self.complete_inflight_once(Err(Error::internal()));
+        self.complete_inflight_once(Err(CompletionErrorKind::report_internal()));
     }
 }
 
@@ -1103,11 +1104,17 @@ impl QuiescentGuard<ReadonlyBufferPool> {
                             reservation,
                         );
                         if let Err(err) = self.send_read_async(req).await {
-                            err.into_inner().fail(Error::send_error());
+                            err.into_inner().fail(CompletionErrorKind::report_send(
+                                "send readonly pool read request",
+                            ));
                         }
                     }
                     Err(err) => {
-                        self.complete_inflight_load(key, &inflight, Err(err));
+                        self.complete_inflight_load(
+                            key,
+                            &inflight,
+                            Err(err.into_completion_report()),
+                        );
                     }
                 }
                 inflight
@@ -1133,8 +1140,9 @@ impl QuiescentGuard<ReadonlyBufferPool> {
             return Ok((frame_id, false));
         }
         inflight
-            .wait_result_fresh()
+            .wait_result()
             .await
+            .map_err(Error::from)
             .map(|frame_id| (frame_id, false))
     }
 
@@ -1163,8 +1171,9 @@ impl QuiescentGuard<ReadonlyBufferPool> {
             return Ok((frame_id, false));
         }
         inflight
-            .wait_result_fresh()
+            .wait_result()
             .await
+            .map_err(Error::from)
             .map(|frame_id| (frame_id, false))
     }
 
@@ -1228,7 +1237,7 @@ pub(crate) mod tests {
     use crate::catalog::TableID;
     use crate::catalog::{ColumnAttributes, ColumnSpec, TableMetadata, USER_OBJ_ID_START};
     use crate::conf::{EngineConfig, EvictableBufferPoolConfig, FileSystemConfig, TrxSysConfig};
-    use crate::error::{DataIntegrityError, Error, FileKind};
+    use crate::error::{CompletionErrorKind, Error, FileKind};
     use crate::file::block_integrity::{
         BLOCK_INTEGRITY_HEADER_SIZE, COLUMN_BLOCK_INDEX_BLOCK_SPEC,
         COLUMN_DELETION_BLOB_BLOCK_SPEC, LWC_BLOCK_SPEC, max_payload_len, write_block_checksum,
@@ -1279,18 +1288,13 @@ pub(crate) mod tests {
         panic!("condition was not satisfied before timeout");
     }
 
-    fn assert_data_integrity(
-        err: Error,
-        file_kind: FileKind,
-        block_kind: &str,
-        block_id: crate::file::cow_file::BlockID,
-        expected: DataIntegrityError,
-    ) {
-        assert_eq!(err.data_integrity_error(), Some(expected));
+    fn assert_completion_data_integrity(err: Error) {
+        assert_eq!(
+            err.completion_error(),
+            Some(CompletionErrorKind::DataIntegrity)
+        );
         let report = format!("{err:?}");
-        assert!(report.contains(&file_kind.to_string()), "{report}");
-        assert!(report.contains(block_kind), "{report}");
-        assert!(report.contains(&format!("block_id={block_id}")), "{report}");
+        assert!(report.contains("propagate from other threads"), "{report}");
     }
 
     fn frame_page_bytes(cap: usize) -> usize {
@@ -1708,7 +1712,7 @@ pub(crate) mod tests {
             }
         }
 
-        fn on_complete(&self, op: StorageBackendOp, res: &mut std::io::Result<usize>) {
+        fn on_complete(&self, op: StorageBackendOp, res: &mut StdIoResult<usize>) {
             if !self.matches(op) {
                 return;
             }
@@ -1791,22 +1795,16 @@ pub(crate) mod tests {
                 reservation,
             );
 
-            submission.complete_inflight_once(Err(Error::send_error()));
+            submission.complete_inflight_once(Err(CompletionErrorKind::report_send(
+                "complete readonly inflight test send failure",
+            )));
             assert!(submission.completed);
-            assert!(
-                inflight
-                    .completed_result_fresh()
-                    .as_ref()
-                    .is_some_and(|res| res.as_ref().is_err_and(|err| err.is_send_error()))
-            );
+            let report = inflight.completed_result().unwrap().unwrap_err();
+            assert_eq!(*report.current_context(), CompletionErrorKind::Send);
 
             drop(submission);
-            assert!(
-                inflight
-                    .completed_result_fresh()
-                    .as_ref()
-                    .is_some_and(|res| res.as_ref().is_err_and(|err| err.is_send_error()))
-            );
+            let report = inflight.completed_result().unwrap().unwrap_err();
+            assert_eq!(*report.current_context(), CompletionErrorKind::Send);
 
             drop(pool);
             drop(table_file);
@@ -2325,9 +2323,11 @@ pub(crate) mod tests {
                         Ok((_frame_id, _page_guard)) => {
                             panic!("reserve waiter unexpectedly acquired a frame");
                         }
-                        Err(err) => {
-                            global.complete_inflight_load(key, &inflight_for_waiter, Err(err))
-                        }
+                        Err(err) => global.complete_inflight_load(
+                            key,
+                            &inflight_for_waiter,
+                            Err(err.into_completion_report()),
+                        ),
                     }
                 });
                 evict_listener.await;
@@ -2349,13 +2349,8 @@ pub(crate) mod tests {
             reserve_waiter.await;
             teardown.join().unwrap();
             assert!(dropped.load(Ordering::SeqCst));
-            assert!(
-                inflight
-                    .wait_result_fresh()
-                    .await
-                    .as_ref()
-                    .is_err_and(|err| err.is_code(crate::error::ErrorCode::InvalidState))
-            );
+            let report = inflight.wait_result().await.unwrap_err();
+            assert_eq!(*report.current_context(), CompletionErrorKind::InvalidState);
         });
     }
 
@@ -2403,13 +2398,13 @@ pub(crate) mod tests {
                 waiter1
                     .await
                     .as_ref()
-                    .is_err_and(|err| err.is_code(crate::error::ErrorCode::IOError))
+                    .is_err_and(|err| err.completion_error() == Some(CompletionErrorKind::Io))
             );
             assert!(
                 waiter2
                     .await
                     .as_ref()
-                    .is_err_and(|err| err.is_code(crate::error::ErrorCode::IOError))
+                    .is_err_and(|err| err.completion_error() == Some(CompletionErrorKind::Io))
             );
             assert_eq!(read_hook.call_count(), 1);
             assert_eq!(global.allocated(), 0);
@@ -2481,20 +2476,8 @@ pub(crate) mod tests {
                 Ok(_) => panic!("expected persisted LWC corruption"),
                 Err(err) => err,
             };
-            assert_data_integrity(
-                err1,
-                FileKind::TableFile,
-                "lwc-block",
-                test_block_id(8),
-                DataIntegrityError::ChecksumMismatch,
-            );
-            assert_data_integrity(
-                err2,
-                FileKind::TableFile,
-                "lwc-block",
-                test_block_id(8),
-                DataIntegrityError::ChecksumMismatch,
-            );
+            assert_completion_data_integrity(err1);
+            assert_completion_data_integrity(err2);
             assert_eq!(read_hook.call_count(), 1);
             assert_eq!(global.allocated(), 0);
             assert_eq!(global.try_get_frame_id(&key), None);
@@ -2533,13 +2516,7 @@ pub(crate) mod tests {
                 Ok(_) => panic!("expected persisted LWC corruption"),
                 Err(err) => err,
             };
-            assert_data_integrity(
-                err,
-                FileKind::TableFile,
-                "lwc-block",
-                test_block_id(9),
-                DataIntegrityError::ChecksumMismatch,
-            );
+            assert_completion_data_integrity(err);
             assert_eq!(global.try_get_frame_id(&key), None);
             assert_eq!(global.allocated(), 0);
         });
@@ -2582,13 +2559,7 @@ pub(crate) mod tests {
                 Ok(_) => panic!("expected persisted LWC invalid-payload corruption"),
                 Err(err) => err,
             };
-            assert_data_integrity(
-                err,
-                FileKind::TableFile,
-                "lwc-block",
-                test_block_id(10),
-                DataIntegrityError::InvalidPayload,
-            );
+            assert_completion_data_integrity(err);
             assert_eq!(global.try_get_frame_id(&key), None);
             assert_eq!(global.allocated(), 0);
         });
@@ -2627,13 +2598,7 @@ pub(crate) mod tests {
                 Ok(_) => panic!("expected persisted column-block corruption"),
                 Err(err) => err,
             };
-            assert_data_integrity(
-                err,
-                FileKind::TableFile,
-                "column-block-index",
-                test_block_id(10),
-                DataIntegrityError::ChecksumMismatch,
-            );
+            assert_completion_data_integrity(err);
             assert_eq!(global.try_get_frame_id(&key), None);
             assert_eq!(global.allocated(), 0);
         });
@@ -2668,13 +2633,7 @@ pub(crate) mod tests {
                 Ok(_) => panic!("expected persisted deletion-blob corruption"),
                 Err(err) => err,
             };
-            assert_data_integrity(
-                err,
-                FileKind::TableFile,
-                "column-deletion-blob",
-                test_block_id(11),
-                DataIntegrityError::ChecksumMismatch,
-            );
+            assert_completion_data_integrity(err);
             assert_eq!(global.try_get_frame_id(&key), None);
             assert_eq!(global.allocated(), 0);
         });

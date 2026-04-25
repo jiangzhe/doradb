@@ -17,12 +17,12 @@ pub(crate) use self::tests::{
 use crate::buffer::ReadSubmission;
 use crate::catalog::USER_OBJ_ID_START;
 use crate::compression::BitPackable;
-use crate::error::{Error, Result, StorageOp};
+use crate::error::{CompletionErrorKind, CompletionResult, Error, IoError, Result, StorageOp};
 use crate::free_list::FreeList;
 use crate::io::DirectBuf;
 use crate::io::{
     Completion, IOClient, IOKind, IOQueue, IOSubmission, Operation, STORAGE_SECTOR_SIZE,
-    align_to_sector_size,
+    StdIoResult, align_to_sector_size,
 };
 use crate::serde::{Deser, Ser, Serde};
 use bytemuck::{Pod, Zeroable};
@@ -36,6 +36,7 @@ use scopeguard::defer;
 use std::ffi::CString;
 use std::fmt;
 use std::future::Future;
+use std::io;
 use std::mem::MaybeUninit;
 use std::ops::Deref;
 use std::ops::{Add, AddAssign, Sub, SubAssign};
@@ -463,16 +464,17 @@ impl SparseFile {
                 0o644,
             );
             if fd < 0 {
-                return Err(Error::storage_io_error(
+                return Err(IoError::report_with_op(
                     StorageOp::FileCreate,
-                    std::io::Error::last_os_error(),
-                ));
+                    io::Error::last_os_error(),
+                )
+                .into());
             }
             let ret = ftruncate(fd, max_size as i64);
             if ret < 0 {
-                let err = std::io::Error::last_os_error();
+                let err = io::Error::last_os_error();
                 let _ = close(fd); // close file descriptor if truncate fail.
-                return Err(Error::storage_io_error(StorageOp::FileResize, err));
+                return Err(IoError::report_with_op(StorageOp::FileResize, err).into());
             }
             Ok(SparseFile::new(fd, 0, max_size, file_id))
         }
@@ -497,16 +499,17 @@ impl SparseFile {
                 0o644,
             );
             if fd < 0 {
-                return Err(Error::storage_io_error(
+                return Err(IoError::report_with_op(
                     StorageOp::FileCreate,
-                    std::io::Error::last_os_error(),
-                ));
+                    io::Error::last_os_error(),
+                )
+                .into());
             }
             let ret = ftruncate(fd, max_size as i64);
             if ret < 0 {
-                let err = std::io::Error::last_os_error();
+                let err = io::Error::last_os_error();
                 let _ = close(fd); // close file descriptor if truncate fail.
-                return Err(Error::storage_io_error(StorageOp::FileResize, err));
+                return Err(IoError::report_with_op(StorageOp::FileResize, err).into());
             }
             Ok(SparseFile::new(fd, 0, max_size, file_id))
         }
@@ -521,16 +524,17 @@ impl SparseFile {
             let c_string = c_string_from_path(file_path.as_ref())?;
             let fd = open(c_string.as_ptr(), O_RDWR | O_DIRECT, 0o644);
             if fd < 0 {
-                return Err(Error::storage_io_error(
+                return Err(IoError::report_with_op(
                     StorageOp::FileOpen,
-                    std::io::Error::last_os_error(),
-                ));
+                    io::Error::last_os_error(),
+                )
+                .into());
             }
             let (logical_size, _) = match sparse_file_size(fd) {
                 Ok((l, a)) => (l, a),
                 Err(err) => {
                     let _ = close(fd);
-                    return Err(Error::storage_io_error(StorageOp::FileStat, err));
+                    return Err(IoError::report_with_op(StorageOp::FileStat, err).into());
                 }
             };
             Ok(SparseFile::new(fd, 0, logical_size, file_id))
@@ -584,7 +588,7 @@ impl SparseFile {
 
     /// Grow the file to given size.
     #[inline]
-    pub fn extend_to(&self, max_len: usize) -> std::io::Result<()> {
+    pub fn extend_to(&self, max_len: usize) -> io::Result<()> {
         self.size_lock.lock();
         defer! {
             // SAFETY: this path holds `size_lock`, so the matching unlock is
@@ -602,12 +606,12 @@ impl SparseFile {
             return Ok(());
         }
         debug_assert!(retcode == -1);
-        Err(std::io::Error::last_os_error())
+        Err(io::Error::last_os_error())
     }
 
     /// Get the logical size and allocated size of this file.
     #[inline]
-    pub fn size(&self) -> std::io::Result<(usize, usize)> {
+    pub fn size(&self) -> io::Result<(usize, usize)> {
         sparse_file_size(self.fd)
     }
 }
@@ -623,7 +627,7 @@ impl Drop for SparseFile {
 }
 
 #[inline]
-pub fn sparse_file_size(fd: RawFd) -> std::io::Result<(usize, usize)> {
+pub fn sparse_file_size(fd: RawFd) -> io::Result<(usize, usize)> {
     // SAFETY: `fstat` fully initializes `stat` on success; `assume_init_ref` is used only
     // when return code is 0.
     unsafe {
@@ -636,7 +640,7 @@ pub fn sparse_file_size(fd: RawFd) -> std::io::Result<(usize, usize)> {
             return Ok((logical_size, allocated_size));
         }
         debug_assert!(retcode == -1);
-        Err(std::io::Error::last_os_error())
+        Err(io::Error::last_os_error())
     }
 }
 
@@ -657,7 +661,7 @@ pub struct WriteSubmission {
     file: Arc<SparseFile>,
     offset: usize,
     buf: DirectBuf,
-    completion: Arc<Completion<Result<()>>>,
+    completion: Arc<Completion<CompletionResult<()>>>,
 }
 
 impl WriteSubmission {
@@ -677,7 +681,9 @@ impl WriteSubmission {
             buf,
             completion,
         };
-        (fio, async move { waiter.wait_result_fresh().await })
+        (fio, async move {
+            waiter.wait_result().await.map_err(Error::from)
+        })
     }
 
     #[inline]
@@ -703,7 +709,7 @@ pub(crate) struct PreparedWriteSubmission {
     key: BlockKey,
     _file: Arc<SparseFile>,
     operation: Operation,
-    completion: Arc<Completion<Result<()>>>,
+    completion: Arc<Completion<CompletionResult<()>>>,
 }
 
 impl IOSubmission for PreparedWriteSubmission {
@@ -749,7 +755,7 @@ pub(crate) async fn write_direct(
         let BackgroundWriteRequest::Table(_submission) = err.into_inner() else {
             unreachable!("write_direct received unexpected background-write send error");
         };
-        return Err(Error::send_error());
+        return Err(IoError::report_send("send background table write request").into());
     }
     result.await
 }
@@ -805,7 +811,7 @@ impl TableFsStateMachine {
     pub(crate) fn on_complete(
         &mut self,
         sub: TableFsSubmission,
-        res: std::io::Result<usize>,
+        res: StdIoResult<usize>,
     ) -> IOKind {
         match sub {
             TableFsSubmission::Write(mut sub) => {
@@ -822,13 +828,17 @@ impl TableFsStateMachine {
                         let result = if len == expected_len {
                             Ok(())
                         } else {
-                            Err(Error::short_io())
+                            Err(CompletionErrorKind::report_unexpected_eof(
+                                len,
+                                expected_len,
+                            ))
                         };
                         sub.completion.complete(result);
                     }
                     Err(err) => {
                         drop(buf);
-                        sub.completion.complete(Err(err.into()));
+                        sub.completion
+                            .complete(Err(CompletionErrorKind::report_io(err)));
                     }
                 }
                 IOKind::Write
@@ -886,7 +896,7 @@ impl FileSyncer {
             return Ok(());
         }
         debug_assert!(ret == -1);
-        Err(std::io::Error::last_os_error().into())
+        Err(IoError::report(io::Error::last_os_error()).into())
     }
 }
 
@@ -937,6 +947,7 @@ mod tests {
     use crate::file::table_file::TableFile;
     use crate::serde::{Deser, Ser};
     use crate::value::ValKind;
+    use std::io::ErrorKind as IoErrorKind;
     use std::mem;
     use std::sync::{Arc, Mutex};
     use tempfile::TempDir;
@@ -1212,10 +1223,11 @@ mod tests {
             Ok(_) => panic!("expected open to fail before create"),
             Err(err) => err,
         };
-        assert!(
-            err.storage_io_failure()
-                .is_some_and(|failure| failure.op == StorageOp::FileOpen)
+        assert_eq!(
+            err.io_error().map(IoError::kind),
+            Some(IoErrorKind::NotFound)
         );
+        assert!(format!("{err:?}").contains("op=file open"));
         let file = SparseFile::create_or_trunc(&file_path, 1024 * 1024, UNTRACKED_FILE_ID).unwrap();
         drop(file);
         let file = SparseFile::open(&file_path, UNTRACKED_FILE_ID).unwrap();
@@ -1235,10 +1247,11 @@ mod tests {
             Ok(_) => panic!("expected create to fail for missing parent"),
             Err(err) => err,
         };
-        assert!(
-            err.storage_io_failure()
-                .is_some_and(|failure| failure.op == StorageOp::FileCreate)
+        assert_eq!(
+            err.io_error().map(IoError::kind),
+            Some(IoErrorKind::NotFound)
         );
+        assert!(format!("{err:?}").contains("op=file create"));
     }
 
     #[test]
@@ -1328,12 +1341,10 @@ mod tests {
                 .on_complete(TableFsSubmission::Write(submission), Ok(expected_len - 1));
 
             assert_eq!(kind, IOKind::Write);
-            assert!(
-                waiter
-                    .await
-                    .as_ref()
-                    .is_err_and(|err| err.is_code(crate::error::ErrorCode::ShortIO))
-            );
+            assert!(waiter.await.as_ref().is_err_and(|err| {
+                err.completion_error() == Some(CompletionErrorKind::Io)
+                    && format!("{err:?}").contains("propagate from other threads")
+            }));
             drop(table_file);
             drop(fs);
         });

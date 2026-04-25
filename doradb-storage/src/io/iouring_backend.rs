@@ -1,12 +1,12 @@
 use super::{
     BackendToken, IOBackend, IOBackendStats, IOBackendStatsHandle, IOClient, IOKind,
-    IOWorkerBuilder, Operation, build_io_worker,
+    IOWorkerBuilder, Operation, StdIoResult, build_io_worker,
 };
-use crate::error::{Error, Result, StorageOp};
+use crate::error::{Error, IoError, Result, StorageOp};
 use io_uring::{IoUring, opcode, squeue, types};
 use libc::{EAGAIN, EBUSY, EINTR};
 use std::collections::VecDeque;
-use std::result::Result as StdResult;
+use std::io;
 use std::time::Instant;
 
 const DEFAULT_IO_MAX_EVENTS: usize = 32;
@@ -30,7 +30,7 @@ impl IouringBackend {
             .ok_or(Error::invalid_argument())?;
         let ring_entries = u32::try_from(ring_entries).map_err(|_| Error::invalid_argument())?;
         let ring = IoUring::new(ring_entries)
-            .map_err(|err| Error::storage_io_error(StorageOp::BackendSetup, err))?;
+            .map_err(|err| Error::from(IoError::report_with_op(StorageOp::BackendSetup, err)))?;
         Ok(IouringBackend {
             ring,
             max_events,
@@ -116,8 +116,8 @@ fn submit_pending_sqes<Submit, SubmitAndWait>(
     mut submit_and_wait: SubmitAndWait,
 ) -> SubmitOutcome
 where
-    Submit: FnMut() -> std::io::Result<usize>,
-    SubmitAndWait: FnMut(usize) -> std::io::Result<usize>,
+    Submit: FnMut() -> StdIoResult<usize>,
+    SubmitAndWait: FnMut(usize) -> StdIoResult<usize>,
 {
     debug_assert!(batch.pending_sqes != 0);
 
@@ -164,7 +164,7 @@ fn blocking_submit_and_wait<SubmitAndWait>(
     mut submit_and_wait: SubmitAndWait,
 ) -> BlockingWaitOutcome
 where
-    SubmitAndWait: FnMut(usize) -> std::io::Result<usize>,
+    SubmitAndWait: FnMut(usize) -> StdIoResult<usize>,
 {
     let mut call_count = 0usize;
     let submitted = loop {
@@ -218,14 +218,14 @@ impl IouringBackend {
     }
 
     #[inline]
-    fn take_completions(&mut self) -> Vec<(BackendToken, StdResult<usize, std::io::Error>)> {
+    fn take_completions(&mut self) -> Vec<(BackendToken, StdIoResult<usize>)> {
         let mut completed = Vec::new();
         let cq = self.ring.completion();
         for cqe in cq {
             let res = if cqe.result() >= 0 {
                 Ok(cqe.result() as usize)
             } else {
-                Err(std::io::Error::from_raw_os_error(-cqe.result()))
+                Err(io::Error::from_raw_os_error(-cqe.result()))
             };
             completed.push((BackendToken::from_raw(cqe.user_data()), res));
         }
@@ -299,7 +299,7 @@ impl IOBackend for IouringBackend {
         &mut self,
         _events: &mut Self::Events,
         min_nr: usize,
-    ) -> Vec<(BackendToken, StdResult<usize, std::io::Error>)> {
+    ) -> Vec<(BackendToken, StdIoResult<usize>)> {
         {
             let cq = self.ring.completion();
             if cq.len() < min_nr {
@@ -362,7 +362,7 @@ mod tests {
             2,
             || {
                 submit_calls += 1;
-                Err(std::io::Error::from_raw_os_error(EAGAIN))
+                Err(io::Error::from_raw_os_error(EAGAIN))
             },
             |min_nr| {
                 assert_eq!(min_nr, 1);
@@ -382,7 +382,7 @@ mod tests {
         let outcome = submit_pending_sqes(
             &mut batch,
             3,
-            || Err(std::io::Error::from_raw_os_error(EBUSY)),
+            || Err(io::Error::from_raw_os_error(EBUSY)),
             |min_nr| {
                 assert_eq!(min_nr, 1);
                 Ok(1)
@@ -414,7 +414,7 @@ mod tests {
             calls += 1;
             assert_eq!(min_nr, 4);
             if calls == 1 {
-                Err(std::io::Error::from_raw_os_error(EINTR))
+                Err(io::Error::from_raw_os_error(EINTR))
             } else {
                 Ok(3)
             }

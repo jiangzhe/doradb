@@ -658,7 +658,7 @@ mod tests {
         TableMetadata, TableSpec,
     };
     use crate::conf::{EngineConfig, EvictableBufferPoolConfig, FileSystemConfig, TrxSysConfig};
-    use crate::error::{DataIntegrityError, Error};
+    use crate::error::{CompletionErrorKind, DataIntegrityError, Error};
     use crate::file::block_integrity::{BLOCK_INTEGRITY_HEADER_SIZE, write_block_checksum};
     use crate::file::cow_file::COW_FILE_PAGE_SIZE;
     use crate::index::{
@@ -686,8 +686,12 @@ mod tests {
         block_id: crate::file::BlockID,
         expected: DataIntegrityError,
     ) {
-        assert_eq!(err.data_integrity_error(), Some(expected));
         let report = format!("{err:?}");
+        if err.completion_error() == Some(CompletionErrorKind::DataIntegrity) {
+            assert!(report.contains("propagate from other threads"), "{report}");
+            return;
+        }
+        assert_eq!(err.data_integrity_error(), Some(expected), "{report}");
         assert!(report.contains("table-file"), "{report}");
         assert!(report.contains(block_kind), "{report}");
         assert!(report.contains(&format!("block_id={block_id}")), "{report}");

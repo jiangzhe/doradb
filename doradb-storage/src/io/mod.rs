@@ -419,7 +419,7 @@ pub trait IOStateMachine {
 
     /// Called when IO is completed.
     /// The result contains number of bytes read/write, or the IO error.
-    fn on_complete(&mut self, sub: Self::Submission, res: std::io::Result<usize>) -> IOKind;
+    fn on_complete(&mut self, sub: Self::Submission, res: StdIoResult<usize>) -> IOKind;
 
     /// Called when event loop is ended.
     fn end_loop(self);
@@ -845,7 +845,7 @@ mod tests {
     pub(crate) trait StorageBackendTestHook: Send + Sync {
         fn on_submit(&self, _op: StorageBackendOp) {}
 
-        fn on_complete(&self, _op: StorageBackendOp, _res: &mut StdResult<usize, std::io::Error>) {}
+        fn on_complete(&self, _op: StorageBackendOp, _res: &mut StdIoResult<usize>) {}
     }
 
     type StorageBackendHook = Arc<dyn StorageBackendTestHook>;
@@ -982,7 +982,7 @@ mod tests {
             &mut self,
             _events: &mut Self::Events,
             _min_nr: usize,
-        ) -> Vec<(BackendToken, StdResult<usize, std::io::Error>)> {
+        ) -> Vec<(BackendToken, StdIoResult<usize>)> {
             unreachable!("test backend does not wait for kernel IO")
         }
     }
@@ -1031,7 +1031,7 @@ mod tests {
 
         fn on_submit(&mut self, _sub: &ExpandSubmission) {}
 
-        fn on_complete(&mut self, _sub: ExpandSubmission, _res: std::io::Result<usize>) -> IOKind {
+        fn on_complete(&mut self, _sub: ExpandSubmission, _res: StdIoResult<usize>) -> IOKind {
             unreachable!("fetch-only tests never complete IO")
         }
 
@@ -1104,7 +1104,7 @@ mod tests {
             &mut self,
             _events: &mut Self::Events,
             min_nr: usize,
-        ) -> Vec<(BackendToken, StdResult<usize, std::io::Error>)> {
+        ) -> Vec<(BackendToken, StdIoResult<usize>)> {
             assert!(
                 self.inflight.len() >= min_nr,
                 "immediate backend requires enough inflight work to satisfy wait"
@@ -1209,7 +1209,7 @@ mod tests {
             self.log.submits.lock().unwrap().push(sub.op);
         }
 
-        fn on_complete(&mut self, sub: RecordedSubmission, _res: std::io::Result<usize>) -> IOKind {
+        fn on_complete(&mut self, sub: RecordedSubmission, _res: StdIoResult<usize>) -> IOKind {
             self.log.completes.lock().unwrap().push(sub.op);
             IOKind::Write
         }

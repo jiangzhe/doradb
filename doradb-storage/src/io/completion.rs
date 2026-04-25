@@ -1,12 +1,30 @@
+use crate::error::CompletionResult;
+use error_stack::Report;
 use event_listener::{Event, listener};
 use parking_lot::Mutex;
+
+const PROPAGATE_ATTACHMENT: &str = "propagate from other threads";
+
+pub trait CompletionValue {
+    fn propagate(&self) -> Self;
+}
+
+impl<T: Clone> CompletionValue for CompletionResult<T> {
+    #[inline]
+    fn propagate(&self) -> Self {
+        match self {
+            Ok(value) => Ok(value.clone()),
+            Err(report) => Err(Report::new(*report.current_context()).attach(PROPAGATE_ATTACHMENT)),
+        }
+    }
+}
 
 /// Shared terminal-status cell for one asynchronous IO flow.
 ///
 /// Producers call [`Self::complete`] exactly once to publish the final result.
 /// Waiters can either poll [`Self::completed_result`] or await
-/// [`Self::wait_result`]. The stored value is cloned so multiple
-/// waiters can observe the same terminal state.
+/// [`Self::wait_result`]. The stored value is propagated so multiple waiters can
+/// observe equivalent terminal state without cloning non-cloneable reports.
 pub struct Completion<T> {
     state: Mutex<CompletionState<T>>,
     ev: Event,
@@ -48,18 +66,19 @@ impl<T> Default for Completion<T> {
     }
 }
 
-impl<T: Clone> Completion<T> {
-    /// Returns the terminal result if this completion has already finished.
+impl<T: CompletionValue> Completion<T> {
+    /// Returns the propagated terminal result if this completion has already
+    /// finished.
     #[inline]
     pub fn completed_result(&self) -> Option<T> {
         let state = self.state.lock();
         match &*state {
             CompletionState::Running => None,
-            CompletionState::Completed(value) => Some(value.clone()),
+            CompletionState::Completed(value) => Some(value.propagate()),
         }
     }
 
-    /// Waits until the completion reaches a terminal state and returns it.
+    /// Waits until completion and returns the propagated terminal result.
     #[inline]
     pub async fn wait_result(&self) -> T {
         loop {
@@ -72,52 +91,71 @@ impl<T: Clone> Completion<T> {
     }
 }
 
-impl<T: Clone> Completion<crate::error::Result<T>> {
-    /// Returns the terminal result, reconstructing an equivalent error report
-    /// when the completed value is an error.
-    #[inline]
-    pub fn completed_result_fresh(&self) -> Option<crate::error::Result<T>> {
-        let state = self.state.lock();
-        match &*state {
-            CompletionState::Running => None,
-            CompletionState::Completed(Ok(value)) => Some(Ok(value.clone())),
-            CompletionState::Completed(Err(err)) => Some(Err(err.duplicate())),
-        }
-    }
-
-    /// Waits until completion and returns a fresh equivalent error report when
-    /// the terminal value is an error.
-    #[inline]
-    pub async fn wait_result_fresh(&self) -> crate::error::Result<T> {
-        loop {
-            listener!(self.ev => listener);
-            if let Some(value) = self.completed_result_fresh() {
-                return value;
-            }
-            listener.await;
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::Completion;
+    use crate::error::{CompletionErrorKind, CompletionResult, IoError};
+    use error_stack::Report;
+    use std::io::{self, ErrorKind as IoErrorKind};
 
     #[test]
     fn test_completion_completed_result_is_stable() {
-        let completion = Completion::new();
+        let completion = Completion::<CompletionResult<usize>>::new();
         assert!(completion.completed_result().is_none());
-        completion.complete(7usize);
-        assert_eq!(completion.completed_result(), Some(7));
-        assert_eq!(completion.completed_result(), Some(7));
+        completion.complete(Ok(7));
+        assert_eq!(completion.completed_result().unwrap().unwrap(), 7);
+        assert_eq!(completion.completed_result().unwrap().unwrap(), 7);
     }
 
     #[test]
     fn test_completion_waiter_can_observe_precompleted_state() {
         smol::block_on(async {
-            let completion = Completion::new();
-            completion.complete(11usize);
-            assert_eq!(completion.wait_result().await, 11);
+            let completion = Completion::<CompletionResult<usize>>::new();
+            completion.complete(Ok(11));
+            assert_eq!(completion.wait_result().await.unwrap(), 11);
         });
+    }
+
+    #[test]
+    fn test_completion_error_propagates_context_only() {
+        let completion = Completion::<CompletionResult<usize>>::new();
+        completion.complete(Err(
+            Report::new(CompletionErrorKind::Send).attach("original detail")
+        ));
+
+        let report = completion.completed_result().unwrap().unwrap_err();
+        assert_eq!(*report.current_context(), CompletionErrorKind::Send);
+        let output = format!("{report:?}");
+        assert!(output.contains("propagate from other threads"));
+        assert!(!output.contains("original detail"));
+    }
+
+    #[test]
+    fn test_completion_report_unexpected_eof_reports_io() {
+        let report = CompletionErrorKind::report_unexpected_eof(17, 4096);
+        assert_eq!(*report.current_context(), CompletionErrorKind::Io);
+        assert_eq!(
+            report.downcast_ref::<IoError>().copied().map(IoError::kind),
+            Some(IoErrorKind::UnexpectedEof)
+        );
+        let output = format!("{report:?}");
+        assert!(output.contains("unexpected eof"));
+        assert!(output.contains("actual_bytes=17"));
+        assert!(output.contains("expected_bytes=4096"));
+    }
+
+    #[test]
+    fn test_completion_report_io_attaches_error_detail() {
+        let err = io::Error::new(IoErrorKind::PermissionDenied, "completion io denied");
+        let message = format!("{}", err);
+
+        let report = CompletionErrorKind::report_io(err);
+
+        assert_eq!(*report.current_context(), CompletionErrorKind::Io);
+        assert_eq!(
+            report.downcast_ref::<IoError>().copied().map(IoError::kind),
+            Some(IoErrorKind::PermissionDenied)
+        );
+        assert!(format!("{report:?}").contains(&message));
     }
 }

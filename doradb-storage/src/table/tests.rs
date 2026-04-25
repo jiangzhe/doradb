@@ -6,7 +6,7 @@ use crate::buffer::{EvictableBufferPool, PoolGuards, PoolRole, test_frame_kind};
 use crate::catalog::tests::table4;
 use crate::conf::{EngineConfig, EvictableBufferPoolConfig, FileSystemConfig, TrxSysConfig};
 use crate::engine::Engine;
-use crate::error::{DataIntegrityError, Error, Result, StoragePoisonSource};
+use crate::error::{CompletionErrorKind, DataIntegrityError, Error, Result, StoragePoisonSource};
 use crate::file::block_integrity::{BLOCK_INTEGRITY_HEADER_SIZE, write_block_checksum};
 use crate::file::cow_file::{
     BlockID, COW_FILE_PAGE_SIZE, SUPER_BLOCK_ID, tests::old_root_drop_count,
@@ -17,7 +17,7 @@ use crate::index::{
     load_entry_deletion_deltas,
 };
 use crate::io::{
-    IOKind, StorageBackendFileIdentity, StorageBackendOp, StorageBackendTestHook,
+    IOKind, StdIoResult, StorageBackendFileIdentity, StorageBackendOp, StorageBackendTestHook,
     install_storage_backend_test_hook,
 };
 use crate::latch::LatchFallbackMode;
@@ -73,8 +73,12 @@ fn assert_table_data_integrity(
     block_id: BlockID,
     expected: DataIntegrityError,
 ) {
-    assert_eq!(err.data_integrity_error(), Some(expected));
     let report = format!("{err:?}");
+    if err.completion_error() == Some(CompletionErrorKind::DataIntegrity) {
+        assert!(report.contains("propagate from other threads"), "{report}");
+        return;
+    }
+    assert_eq!(err.data_integrity_error(), Some(expected), "{report}");
     assert!(report.contains("table-file"), "{report}");
     assert!(report.contains(block_kind), "{report}");
     assert!(report.contains(&format!("block_id={block_id}")), "{report}");
@@ -164,7 +168,7 @@ impl StorageBackendTestHook for FailingPageReadHook {
         }
     }
 
-    fn on_complete(&self, op: StorageBackendOp, res: &mut std::io::Result<usize>) {
+    fn on_complete(&self, op: StorageBackendOp, res: &mut StdIoResult<usize>) {
         if self.matches(op) {
             *res = Err(std::io::Error::from_raw_os_error(self.errno));
         }
@@ -5527,7 +5531,7 @@ fn test_mvcc_insert_surfaces_cached_insert_page_reload_error() {
         trx.rollback().await.unwrap();
         assert!(
             res.as_ref()
-                .is_err_and(|err| err.is_code(crate::error::ErrorCode::IOError)),
+                .is_err_and(|err| err.completion_error() == Some(CompletionErrorKind::Io)),
             "expected insert-page reload failure, got {res:?}"
         );
         assert!(

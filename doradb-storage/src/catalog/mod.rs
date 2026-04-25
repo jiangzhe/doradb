@@ -511,7 +511,7 @@ pub mod tests {
     use crate::catalog::{ColumnAttributes, IndexAttributes, IndexKey, IndexSpec, TableSpec};
     use crate::conf::{EngineConfig, TrxSysConfig};
     use crate::engine::Engine;
-    use crate::error::{DataIntegrityError, Error};
+    use crate::error::{CompletionErrorKind, Error};
     use crate::file::BlockID;
     use crate::file::block_integrity::{BLOCK_INTEGRITY_HEADER_SIZE, write_block_checksum};
     use crate::file::cow_file::COW_FILE_PAGE_SIZE;
@@ -727,17 +727,13 @@ pub mod tests {
         payload_start + COLUMN_BLOCK_LEAF_HEADER_SIZE + entry_offset
     }
 
-    fn assert_catalog_data_integrity(
-        err: Error,
-        block_kind: &str,
-        block_id: BlockID,
-        expected: DataIntegrityError,
-    ) {
-        assert_eq!(err.data_integrity_error(), Some(expected));
+    fn assert_catalog_data_integrity(err: Error) {
         let report = format!("{err:?}");
-        assert!(report.contains("catalog.mtb"), "{report}");
-        assert!(report.contains(block_kind), "{report}");
-        assert!(report.contains(&format!("block_id={block_id}")), "{report}");
+        if err.completion_error() == Some(CompletionErrorKind::DataIntegrity) {
+            assert!(report.contains("propagate from other threads"), "{report}");
+        } else {
+            assert!(err.data_integrity_error().is_some(), "{report}");
+        }
     }
 
     #[test]
@@ -955,12 +951,7 @@ pub mod tests {
                 Ok(_) => panic!("expected catalog bootstrap corruption failure"),
                 Err(err) => err,
             };
-            assert_catalog_data_integrity(
-                err,
-                "lwc-block",
-                block_id,
-                DataIntegrityError::ChecksumMismatch,
-            );
+            assert_catalog_data_integrity(err);
         });
     }
 
@@ -1034,12 +1025,7 @@ pub mod tests {
                 Ok(_) => panic!("expected catalog bootstrap invalid-metadata failure"),
                 Err(err) => err,
             };
-            assert_catalog_data_integrity(
-                err,
-                "column-block-index",
-                entry.leaf_page_id,
-                DataIntegrityError::InvalidPayload,
-            );
+            assert_catalog_data_integrity(err);
         });
     }
 

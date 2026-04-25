@@ -19,7 +19,7 @@ use crate::file::table_file::{MutableTableFile, TableFile};
 use crate::file::{SparseFile, TableFsStateMachine, TableFsSubmission, WriteSubmission};
 use crate::io::{
     BackendToken, IOBackend, IOBackendStats, IOBackendStatsHandle, IOClient, IOKind, IOMessage,
-    IOQueue, IOStateMachine, IOSubmission, Operation, StorageBackend,
+    IOQueue, IOStateMachine, IOSubmission, Operation, StdIoResult, StorageBackend,
 };
 use crate::notify::EventNotifyOnDrop;
 use crate::quiescent::{QuiescentBox, QuiescentGuard, SyncQuiescentGuard};
@@ -397,7 +397,7 @@ impl StorageStateMachine {
 
     /// Route one backend completion back to the owning domain state machine.
     #[inline]
-    fn on_complete(&mut self, sub: StorageSubmission, res: std::io::Result<usize>) -> IOKind {
+    fn on_complete(&mut self, sub: StorageSubmission, res: StdIoResult<usize>) -> IOKind {
         match sub.inner {
             StorageSubmissionKind::Table(sub) => self.table_fs.on_complete(sub, res),
             StorageSubmissionKind::MemPool(sub) => self.mem_pool.on_complete(sub, res),
@@ -1890,7 +1890,7 @@ pub(crate) mod tests {
             }
         }
 
-        fn on_complete(&self, op: StorageBackendOp, _res: &mut std::io::Result<usize>) {
+        fn on_complete(&self, op: StorageBackendOp, _res: &mut StdIoResult<usize>) {
             if !self.matches_blocked(op) {
                 return;
             }
@@ -1920,7 +1920,7 @@ pub(crate) mod tests {
     }
 
     impl StorageBackendTestHook for FailingFirstWriteHook {
-        fn on_complete(&self, op: StorageBackendOp, res: &mut std::io::Result<usize>) {
+        fn on_complete(&self, op: StorageBackendOp, res: &mut StdIoResult<usize>) {
             if op.kind() == IOKind::Write && !self.failed.swap(true, Ordering::SeqCst) {
                 *res = Err(std::io::Error::from_raw_os_error(libc::EIO));
             }
@@ -1959,7 +1959,7 @@ pub(crate) mod tests {
                     Ok(_) => panic!("expected initial catalog.mtb publish failure"),
                     Err(err) => err,
                 };
-                assert!(err.is_storage_io_failure(), "unexpected error: {err:?}");
+                assert_eq!(err.kind(), ErrorKind::Io, "unexpected error: {err:?}");
             }
 
             assert!(

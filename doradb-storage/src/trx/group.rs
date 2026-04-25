@@ -1,4 +1,4 @@
-use crate::error::Result;
+use crate::error::CompletionResult;
 use crate::file::SparseFile;
 use crate::io::Completion;
 use crate::serde::Ser;
@@ -70,7 +70,7 @@ pub(super) enum Commit {
     Shutdown,
 }
 
-pub(super) type CommitWaiter = Arc<Completion<Result<()>>>;
+pub(super) type CommitWaiter = Arc<Completion<CompletionResult<()>>>;
 pub(super) type CommitJoin = (Option<Arc<SessionState>>, Option<CommitWaiter>);
 
 /// CommitGroup groups multiple transactions with only
@@ -82,7 +82,7 @@ pub(super) struct CommitGroup {
     pub(super) trx_list: Vec<PrecommitTrx>,
     pub(super) max_cts: TrxID,
     pub(super) log: Option<CommitGroupLog>,
-    pub(super) completion: Arc<Completion<Result<()>>>,
+    pub(super) completion: Arc<Completion<CompletionResult<()>>>,
 }
 
 /// Serialized redo buffer and target file allocation for a durability group.

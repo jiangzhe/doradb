@@ -1,10 +1,12 @@
 use crate::conf::TrxSysConfig;
-use crate::error::{DataIntegrityError, Error, Result, StoragePoisonSource};
+use crate::error::{
+    CompletionResult, DataIntegrityError, Error, LifecycleError, Result, StoragePoisonSource,
+};
 use crate::file::{FileSyncer, SparseFile, UNTRACKED_FILE_ID};
 use crate::free_list::FreeList;
 use crate::io::{
     Completion, DirectBuf, IOBackendStats, IOBackendStatsHandle, IOClient, IOKind, IOQueue,
-    IOStateMachine, IOSubmission, IOWorkerBuilder, Operation, StorageBackend,
+    IOStateMachine, IOSubmission, IOWorkerBuilder, Operation, StdIoResult, StorageBackend,
 };
 use crate::serde::Ser;
 use crate::session::SessionState;
@@ -228,7 +230,7 @@ impl IOStateMachine for LogIOStateMachine {
     fn on_submit(&mut self, _sub: &LogWriteSubmission) {}
 
     #[inline]
-    fn on_complete(&mut self, mut sub: LogWriteSubmission, res: std::io::Result<usize>) -> IOKind {
+    fn on_complete(&mut self, mut sub: LogWriteSubmission, res: StdIoResult<usize>) -> IOKind {
         let expected_len = sub.operation.len();
         let buf = sub
             .operation
@@ -441,7 +443,7 @@ impl LogPartition {
             return Ok((cts, session, waiter));
         }
         let last_group = match group_commit_g.queue.back_mut().unwrap() {
-            Commit::Shutdown => return Err(Error::storage_engine_shutdown()),
+            Commit::Shutdown => return Err(Report::new(LifecycleError::Shutdown).into()),
             Commit::Group(group) => group,
             Commit::Switch(_) => {
                 // Impossible, switch always has one group followed.
@@ -498,7 +500,7 @@ impl LogPartition {
             return Ok(cts);
         }
         let waiter = waiter.expect("waiter should exist when wait_sync");
-        if let Err(err) = waiter.wait_result_fresh().await {
+        if let Err(err) = waiter.wait_result().await.map_err(Error::from) {
             if let Some(s) = session.take() {
                 s.rollback();
             }
@@ -615,7 +617,7 @@ pub(super) struct SyncGroup {
     pub(super) log_bytes: usize,
     pub(super) write: Option<LogWriteSubmission>,
     pub(super) returned_buf: Option<DirectBuf>,
-    pub(super) completion: Arc<Completion<Result<()>>>,
+    pub(super) completion: Arc<Completion<CompletionResult<()>>>,
     pub(super) finished: bool,
     pub(super) failed: bool,
 }
@@ -648,7 +650,11 @@ impl SyncGroup {
             return;
         }
         self.failed = true;
-        self.completion.complete(Err(err.duplicate()));
+        self.completion
+            .complete(Err(err.storage_poison_source().map_or_else(
+                || Error::internal().into_completion_report(),
+                |source| Error::storage_engine_poisoned(source).into_completion_report(),
+            )));
         for trx in mem::take(&mut self.trx_list) {
             trx.abort();
         }
@@ -1139,6 +1145,7 @@ mod tests {
     use crate::catalog::tests::table2;
     use crate::conf::{EngineConfig, EvictableBufferPoolConfig, TrxSysConfig};
     use crate::engine::{Engine, EngineRef};
+    use crate::error::CompletionErrorKind;
     use crate::file::{FileSyncKind, FileSyncOp, FileSyncTestHook, set_file_sync_test_hook};
     use crate::io::{
         IOKind, StorageBackendOp, StorageBackendTestHook, install_storage_backend_test_hook,
@@ -1252,7 +1259,7 @@ mod tests {
             }
         }
 
-        fn on_complete(&self, op: StorageBackendOp, res: &mut std::io::Result<usize>) {
+        fn on_complete(&self, op: StorageBackendOp, res: &mut StdIoResult<usize>) {
             if !self.matches(op) {
                 return;
             }
@@ -1357,6 +1364,20 @@ mod tests {
                     .await
             })
         })
+    }
+
+    fn assert_propagated_completion_fatal<T: std::fmt::Debug>(res: &Result<T>) {
+        let err = match res {
+            Ok(value) => panic!("expected propagated completion failure, got {value:?}"),
+            Err(err) => err,
+        };
+        assert_eq!(
+            err.completion_error(),
+            Some(CompletionErrorKind::Fatal),
+            "{err:?}"
+        );
+        let report = format!("{err:?}");
+        assert!(report.contains("propagate from other threads"), "{report}");
     }
 
     async fn build_redo_test_engine(log_file_stem: &str, log_sync: LogSync) -> (TempDir, Engine) {
@@ -1650,14 +1671,8 @@ mod tests {
 
             let res1 = commit1.join().unwrap();
             let res2 = commit2.join().unwrap();
-            assert!(
-                res1.as_ref()
-                    .is_err_and(|err| err.is_storage_poisoned_by(StoragePoisonSource::RedoWrite))
-            );
-            assert!(
-                res2.as_ref()
-                    .is_err_and(|err| err.is_storage_poisoned_by(StoragePoisonSource::RedoWrite))
-            );
+            assert_propagated_completion_fatal(&res1);
+            assert_propagated_completion_fatal(&res2);
             assert!(
                 engine
                     .trx_sys
@@ -1703,14 +1718,8 @@ mod tests {
 
         let res1 = commit1.join().unwrap();
         let res2 = commit2.join().unwrap();
-        assert!(
-            res1.as_ref()
-                .is_err_and(|err| err.is_storage_poisoned_by(StoragePoisonSource::RedoSync))
-        );
-        assert!(
-            res2.as_ref()
-                .is_err_and(|err| err.is_storage_poisoned_by(StoragePoisonSource::RedoSync))
-        );
+        assert_propagated_completion_fatal(&res1);
+        assert_propagated_completion_fatal(&res2);
         assert!(
             engine
                 .trx_sys

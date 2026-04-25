@@ -1,13 +1,13 @@
 use super::{
     BackendToken, IOBackend, IOBackendStats, IOBackendStatsHandle, IOBuf, IOClient, IOKey, IOKind,
-    IOWorkerBuilder, Operation, build_io_worker, io_context_t, io_destroy, io_event, io_getevents,
-    io_iocb_cmd, io_setup, io_submit, iocb,
+    IOWorkerBuilder, Operation, StdIoResult, build_io_worker, io_context_t, io_destroy, io_event,
+    io_getevents, io_iocb_cmd, io_setup, io_submit, iocb,
 };
-use crate::error::{Error, Result, StorageOp};
+use crate::error::{IoError, Result, StorageOp};
 use libc::{EAGAIN, EINTR, c_long};
 use std::collections::VecDeque;
+use std::io;
 use std::os::unix::io::RawFd;
-use std::result::Result as StdResult;
 use std::time::Instant;
 
 const DEFAULT_IO_MAX_EVENTS: usize = 32;
@@ -151,10 +151,9 @@ impl LibaioBackend {
                     max_events,
                     stats: IOBackendStatsHandle::default(),
                 }),
-                ret => Err(Error::storage_io_error(
-                    StorageOp::BackendSetup,
-                    std::io::Error::from_raw_os_error(-ret),
-                )),
+                ret => {
+                    Err(IoError::report_raw_os_error_with_op(StorageOp::BackendSetup, -ret).into())
+                }
             }
         }
     }
@@ -221,7 +220,7 @@ impl LibaioBackend {
         callback: F,
     ) -> (usize, usize)
     where
-        F: FnMut(IOKey, StdResult<usize, std::io::Error>) -> IOKind,
+        F: FnMut(IOKey, StdIoResult<usize>) -> IOKind,
     {
         let (_, read_count, write_count) =
             self.wait_at_least_with_attempts(events, min_nr, callback);
@@ -236,7 +235,7 @@ impl LibaioBackend {
         mut callback: F,
     ) -> (usize, usize, usize)
     where
-        F: FnMut(IOKey, StdResult<usize, std::io::Error>) -> IOKind,
+        F: FnMut(IOKey, StdIoResult<usize>) -> IOKind,
     {
         let max_nwait = events.len();
         let mut wait_calls = 0;
@@ -268,7 +267,7 @@ impl LibaioBackend {
             let res = if ev.res >= 0 {
                 Ok(ev.res as usize)
             } else {
-                let err = std::io::Error::from_raw_os_error(-ev.res as i32);
+                let err = io::Error::from_raw_os_error(-ev.res as i32);
                 Err(err)
             };
             match callback(key, res) {
@@ -437,7 +436,7 @@ impl IOBackend for LibaioBackend {
         &mut self,
         events: &mut Self::Events,
         min_nr: usize,
-    ) -> Vec<(BackendToken, StdResult<usize, std::io::Error>)> {
+    ) -> Vec<(BackendToken, StdIoResult<usize>)> {
         let start = Instant::now();
         let mut completed = Vec::new();
         let (wait_calls, _read_count, _write_count) =
@@ -561,10 +560,12 @@ pub(crate) mod tests {
 
     #[test]
     fn test_libaio_backend_maps_io_setup_failure_to_storage_backend_setup_failed() {
-        assert!(LibaioBackend::new(0).as_ref().is_err_and(|err| {
-            err.storage_io_failure()
-                .is_some_and(|failure| failure.op == StorageOp::BackendSetup)
-        }));
+        let err = match LibaioBackend::new(0) {
+            Ok(_) => panic!("expected backend setup failure"),
+            Err(err) => err,
+        };
+        assert!(err.io_error().is_some());
+        assert!(format!("{err:?}").contains("op=backend setup"));
     }
 
     #[test]
@@ -665,7 +666,7 @@ pub(crate) mod tests {
 
         fn on_submit(&mut self, _sub: &Submission) {}
 
-        fn on_complete(&mut self, sub: Submission, res: std::io::Result<usize>) -> IOKind {
+        fn on_complete(&mut self, sub: Submission, res: StdIoResult<usize>) -> IOKind {
             match res {
                 Ok(len) => {
                     match sub.kind {
