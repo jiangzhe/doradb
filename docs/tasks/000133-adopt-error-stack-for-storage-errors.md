@@ -3,6 +3,7 @@ id: 000133
 title: Adopt error-stack for storage errors
 status: proposal
 created: 2026-04-23
+github_issue: 591
 ---
 
 # Task: Adopt error-stack for storage errors
