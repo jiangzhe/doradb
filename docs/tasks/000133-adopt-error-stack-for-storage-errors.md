@@ -37,8 +37,8 @@ Issue Labels:
 
 - Add `error-stack` to `doradb-storage` dependencies.
 - Define public `ErrorKind` with these boundary categories: `Config`,
-  `InvalidInput`, `Operation`, `Resource`, `Io`, `DataIntegrity`,
-  `Lifecycle`, `Internal`, and `Fatal`.
+  `Operation`, `Resource`, `Io`, `DataIntegrity`, `Lifecycle`, `Internal`,
+  and `Fatal`.
 - Define public `Error` as a newtype over `error_stack::Report<ErrorKind>`.
 - Preserve `pub type Result<T> = std::result::Result<T, Error>`.
 - Provide public inspection APIs on `Error`, including `kind()`,
@@ -47,17 +47,18 @@ Issue Labels:
   fine-grained context types rather than one rich flat enum.
 - Use `error_stack::Report`, `change_context`, and `attach_with` so rich values
   are carried as report context or attachments instead of enum fields.
-- Migrate the first representative domain slice: config/bootstrap, API/input
-  validation, resource exhaustion, IO setup, storage lifecycle, storage
-  poison/fatal paths, data-integrity helpers, component/internal lifecycle,
-  secondary-index binding, recovery duplicate-key, and operation conflicts.
+- Migrate the first representative domain slice: config/bootstrap, resource
+  exhaustion, IO setup, storage lifecycle, storage poison/fatal paths,
+  data-integrity helpers, component/internal lifecycle, secondary-index
+  binding, recovery duplicate-key, and operation conflicts.
 - Remove the requirement that public `Error` is `Clone`; update clone/fanout
   paths to store cloneable summaries and construct fresh reports.
 
 ## Non-Goals
 
-- Do not rewrite every ambiguous `InvalidArgument`, `InvalidState`, and
-  `InvalidFormat` call if ownership is not obvious during this task.
+- Do not keep a dedicated `InvalidInput` public boundary. Caller-facing
+  validation should use the closest domain-specific category, usually
+  `Config`, while low-level storage contract violations should use `Internal`.
 - Do not change transaction visibility, checkpoint/recovery protocol, file
   formats, IO scheduling, table/index semantics, or persisted metadata.
 - Do not introduce or modify unsafe code.
@@ -76,8 +77,8 @@ touches unsafe code while updating IO or buffer error propagation, follow
 2. Replace the flat enum in `doradb-storage/src/error.rs` with the new boundary
    shape:
    - `pub struct Error(error_stack::Report<ErrorKind>)`
-   - `pub enum ErrorKind { Config, InvalidInput, Operation, Resource, Io,
-     DataIntegrity, Lifecycle, Internal, Fatal }`
+   - `pub enum ErrorKind { Config, Operation, Resource, Io, DataIntegrity,
+     Lifecycle, Internal, Fatal }`
    - `pub type Result<T> = std::result::Result<T, Error>`
    - helpers for report access, kind inspection, and common constructors
 3. Keep existing small classifier types where useful as attachments or
@@ -86,9 +87,8 @@ touches unsafe code while updating IO or buffer error propagation, follow
 4. Add fieldless domain error enums for the first migration slice. Expected
    initial groups:
    - config/bootstrap errors for invalid path, invalid directory, invalid
-     storage layout, and layout mismatch
-   - invalid-input errors for bad API arguments, invalid index numbers,
-     invalid runtime configuration values, and caller-supplied shape mismatches
+     storage layout, layout mismatch, invalid runtime configuration values,
+     and caller-facing index/configuration specifications
    - operation errors for table/index operation conflicts, unsupported
      operation paths, duplicate/missing table outcomes, and row-level
      conflict outcomes
@@ -99,8 +99,8 @@ touches unsafe code while updating IO or buffer error propagation, follow
    - lifecycle errors for clean storage-engine shutdown, busy shutdown, and
      admission rejected because shutdown has started
    - internal errors for violated runtime invariants, component registry
-     construction errors, impossible buffer state, and ambiguous `InvalidState`
-     compatibility paths that are not externally actionable
+     construction errors, impossible buffer state, low-level index bounds, and
+     caller-supplied shape mismatches that represent storage contract failures
    - fatal errors for poisoned runtime admission and fatal failures that should
      halt future admission
    - data-integrity errors for corrupted blocks, checksum/torn-write failures,
@@ -109,11 +109,10 @@ touches unsafe code while updating IO or buffer error propagation, follow
    changing context to the correct `ErrorKind`.
 6. Update constructors such as block-corruption and storage-IO helpers to create
    reports with typed attachments instead of rich enum fields.
-7. Update first-pass call sites in config/bootstrap, API/input validation,
-   resource exhaustion, IO setup, engine lifecycle, component/internal
-   invariants, secondary-index binding, recovery duplicate-key, storage poison,
-   and selected operation-conflict paths to use the new constructors and report
-   APIs.
+7. Update first-pass call sites in config/bootstrap, resource exhaustion, IO
+   setup, engine lifecycle, component/internal invariants, secondary-index
+   binding, recovery duplicate-key, storage poison, and selected
+   operation-conflict paths to use the new constructors and report APIs.
 8. Update clone-sensitive fanout paths:
    - transaction system poison state stores `StoragePoisonSource` or another
      cloneable summary instead of a cloned `Error`
@@ -123,9 +122,9 @@ touches unsafe code while updating IO or buffer error propagation, follow
      is no longer viable
 9. Update tests that currently match enum variants to assert `err.kind()` and,
    where needed, inspect domain context or rendered report output.
-10. Keep any remaining ambiguous generic errors working through compatibility
-    constructors so the crate does not require a whole-codebase semantic rewrite
-    in this task.
+10. Replace remaining ambiguous generic errors with the closest
+    domain-specific error kind rather than preserving a catch-all
+    `InvalidInput` compatibility path.
 
 ## Implementation Notes
 
@@ -169,8 +168,9 @@ after implementation, tests, review, and verification are completed.
 - Unit-test `ErrorKind` mapping and `Error` inspection APIs.
 - Verify config invalid path, invalid directory, and layout mismatch errors map
   to `ErrorKind::Config` and include printable path/field/layout context.
-- Verify invalid arguments, invalid index numbers, and bad caller-supplied
-  shapes map to `ErrorKind::InvalidInput`.
+- Verify caller-facing config validation maps to `ErrorKind::Config`, and
+  low-level index bounds or shape contract violations map to
+  `ErrorKind::Internal`.
 - Verify memory allocation failure, buffer-pool exhaustion, too-small pool
   sizing, and storage-file capacity exhaustion map to `ErrorKind::Resource`.
 - Verify OS-backed IO errors, short IO, storage operation failures, and channel
@@ -195,9 +195,7 @@ after implementation, tests, review, and verification are completed.
 
 ## Open Questions
 
-- Complete cleanup of ambiguous `InvalidArgument`, `InvalidState`, and
-  `InvalidFormat` call sites is intentionally deferred unless ownership is
-  obvious during implementation. Remaining compatibility constructors should
-  choose the safest boundary kind (`InvalidInput`, `Internal`, or
-  `DataIntegrity`) based on source context, and any unresolved generic paths
-  should be listed as follow-up backlog candidates during task resolution.
+- The dedicated `InvalidInput` boundary was removed from the implemented
+  design. Future caller-facing non-config validation failures should be
+  assigned to an existing domain-specific category, or proposed as a separate
+  boundary only if a concrete call path cannot fit the current model.

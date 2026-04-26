@@ -18,8 +18,7 @@ use crate::buffer::ReadSubmission;
 use crate::catalog::USER_OBJ_ID_START;
 use crate::compression::BitPackable;
 use crate::error::{
-    CompletionErrorKind, CompletionResult, ConfigError, Error, IoError, ResourceError, Result,
-    StorageOp,
+    CompletionErrorKind, ConfigError, Error, IoError, ResourceError, Result, StorageOp,
 };
 use crate::free_list::FreeList;
 use crate::io::DirectBuf;
@@ -672,7 +671,7 @@ pub struct WriteSubmission {
     file: Arc<SparseFile>,
     offset: usize,
     buf: DirectBuf,
-    completion: Arc<Completion<CompletionResult<()>>>,
+    completion: Arc<Completion<()>>,
 }
 
 impl WriteSubmission {
@@ -725,7 +724,7 @@ pub(crate) struct PreparedWriteSubmission {
     key: BlockKey,
     _file: Arc<SparseFile>,
     operation: Operation,
-    completion: Arc<Completion<CompletionResult<()>>>,
+    completion: Arc<Completion<()>>,
 }
 
 impl IOSubmission for PreparedWriteSubmission {

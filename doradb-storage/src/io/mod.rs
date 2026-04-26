@@ -23,7 +23,7 @@ use std::thread::JoinHandle;
 pub(crate) use backend::IOBackendStatsHandle;
 pub use backend::*;
 pub use buf::*;
-pub use completion::*;
+pub(crate) use completion::Completion;
 #[cfg(feature = "iouring")]
 pub use iouring_backend::IouringBackend;
 #[cfg(feature = "libaio")]

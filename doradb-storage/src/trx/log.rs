@@ -1,7 +1,7 @@
 use crate::conf::TrxSysConfig;
 use crate::error::{
-    CompletionErrorKind, CompletionResult, ConfigError, DataIntegrityError, Error, FatalError,
-    LifecycleError, ResourceError, Result,
+    CompletionErrorKind, ConfigError, DataIntegrityError, Error, FatalError, LifecycleError,
+    ResourceError, Result,
 };
 use crate::file::{FileSyncer, SparseFile, UNTRACKED_FILE_ID};
 use crate::free_list::FreeList;
@@ -625,7 +625,7 @@ pub(super) struct SyncGroup {
     pub(super) log_bytes: usize,
     pub(super) write: Option<LogWriteSubmission>,
     pub(super) returned_buf: Option<DirectBuf>,
-    pub(super) completion: Arc<Completion<CompletionResult<()>>>,
+    pub(super) completion: Arc<Completion<()>>,
     pub(super) finished: bool,
     pub(super) failed: bool,
 }
