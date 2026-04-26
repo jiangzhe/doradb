@@ -375,16 +375,57 @@ const BTREE_BODY_USABLE_LEN: usize = BTREE_NODE_USABLE_SIZE - mem::size_of::<BTr
 /// support "wider" covering index, but currently we do not consider it.
 ///
 #[repr(C)]
-#[derive(Clone, FromBytes, IntoBytes, KnownLayout, Immutable)]
+#[derive(Clone)]
 pub struct BTreeNode {
     header: BTreeHeader,
     body: BTreeBody,
     footer: BlockIntegrityTrailer,
 }
 
+#[repr(C)]
+#[derive(FromBytes, IntoBytes, KnownLayout, Immutable)]
+struct BTreeNodeLayout {
+    header: BTreeHeader,
+    body: BTreeBody,
+    footer: BlockIntegrityTrailer,
+}
+
+const _: () = assert!(mem::size_of::<BTreeNodeLayout>() == mem::size_of::<BTreeNode>());
+const _: () = assert!(mem::align_of::<BTreeNodeLayout>() == mem::align_of::<BTreeNode>());
+
 impl BufferPage for BTreeNode {}
 
 impl BTreeNode {
+    /// Views exact persisted block bytes as a B-tree node.
+    #[inline]
+    pub(in crate::index) fn try_from_block_bytes(block: &[u8]) -> Option<&Self> {
+        let layout = layout::try_ref_from_bytes::<BTreeNodeLayout>(block).ok()?;
+        // SAFETY: `BTreeNode` and `BTreeNodeLayout` are both `repr(C)` with
+        // identical fields, and the const assertions above verify equal size
+        // and alignment. The returned reference keeps the input borrow.
+        Some(unsafe { &*(layout as *const BTreeNodeLayout).cast::<BTreeNode>() })
+    }
+
+    /// Views exact writable persisted block bytes as a mutable B-tree node.
+    #[inline]
+    pub(in crate::index) fn try_from_block_bytes_mut(block: &mut [u8]) -> Option<&mut Self> {
+        let layout = layout::try_mut_from_bytes::<BTreeNodeLayout>(block).ok()?;
+        // SAFETY: `BTreeNode` and `BTreeNodeLayout` are both `repr(C)` with
+        // identical fields, and the const assertions above verify equal size
+        // and alignment. The mutable reference preserves the unique input borrow.
+        Some(unsafe { &mut *(layout as *mut BTreeNodeLayout).cast::<BTreeNode>() })
+    }
+
+    #[cfg(test)]
+    #[inline]
+    fn as_block_bytes(&self) -> &[u8] {
+        // SAFETY: `BTreeNode` and `BTreeNodeLayout` are layout-identical by the
+        // const assertions above, so the private zerocopy mirror can provide
+        // the byte view needed by layout tests.
+        let layout = unsafe { &*(self as *const BTreeNode).cast::<BTreeNodeLayout>() };
+        layout::bytes_of(layout)
+    }
+
     /// Initialize B-Tree node.
     /// Common prefix, lower fence and upper fence are initialized using this method
     /// and will be immutable
@@ -2120,9 +2161,9 @@ mod tests {
         assert_eq!(mem::size_of::<BTreeNode>(), PAGE_SIZE);
         assert_eq!(BTREE_NODE_USABLE_SIZE, PAGE_SIZE - BTREE_NODE_FOOTER_SIZE);
         assert_eq!(BTREE_NODE_FOOTER_SIZE, BLOCK_INTEGRITY_TRAILER_SIZE);
-        assert_eq!(layout::bytes_of(&*node).len(), PAGE_SIZE);
+        assert_eq!(node.as_block_bytes().len(), PAGE_SIZE);
         assert_eq!(
-            &layout::bytes_of(&*node)[BTREE_NODE_USABLE_SIZE..],
+            &node.as_block_bytes()[BTREE_NODE_USABLE_SIZE..],
             &[0u8; BTREE_NODE_FOOTER_SIZE]
         );
 

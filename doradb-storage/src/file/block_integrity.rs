@@ -77,7 +77,7 @@ impl Deser for BlockIntegrityHeader {
 /// Fixed checksum trailer stored at the end of persisted block images.
 #[derive(Debug, Clone, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable)]
 #[repr(C)]
-pub struct BlockIntegrityTrailer {
+pub(crate) struct BlockIntegrityTrailer {
     b3sum: [u8; 32],
 }
 

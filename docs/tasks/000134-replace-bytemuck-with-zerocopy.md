@@ -1,7 +1,7 @@
 ---
 id: 000134
 title: Replace bytemuck with zerocopy layout casts
-status: proposal
+status: implemented
 created: 2026-04-26
 github_issue: 593
 ---
@@ -160,7 +160,50 @@ Expected safety direction:
 
 ## Implementation Notes
 
-Keep this section blank in design phase. Fill this section during `task resolve` after implementation, tests, review, and verification are completed.
+Implemented in branch `zerocopy-casts` and PR #594 for issue #593.
+
+- Replaced the direct `doradb-storage` `bytemuck` dependency with direct
+  `zerocopy` and `zerocopy-derive` dependencies, and added
+  `doradb-storage/src/layout.rs` as the shared internal helper for exact
+  byte-to-reference, byte-to-slice, mutable view, and byte-emission operations.
+- Converted production bytemuck marker derives and casts across buffer IDs,
+  file metadata and block integrity records, row pages, LWC blocks, column
+  block-index pages, row-page indexes, B-tree values/hints/nodes, and the
+  compression bitpacking byte-emission path.
+- Made persisted multi-byte storage paths explicit little-endian where the
+  previous bytemuck/native representation leaked host endianness, including
+  row-page fixed values and `PageVar`, LWC flat primitive serialization, and
+  column block-index node/header entries.
+- Preserved B-tree node sizing and footer layout while keeping
+  `BlockIntegrityTrailer` crate-private. `BTreeNode` remains public with
+  private fields; disk-tree block ref-casts use a private zerocopy-derived
+  `BTreeNodeLayout` mirror with documented localized unsafe casts and size /
+  alignment assertions.
+- Added or updated exact-byte tests for row-page little-endian values, LWC flat
+  primitive payloads, column block-index persisted layouts, and B-tree/footer
+  layout preservation.
+- Refreshed `docs/unsafe-usage-baseline.md`. The final scoped inventory is
+  total unsafe 146 with 126 `// SAFETY:` comments; the LWC module no longer has
+  unsafe sites, and the B-tree node mirror adds documented index-module unsafe
+  casts.
+- Created follow-up backlog
+  `docs/backlogs/000096-audit-buffer-page-reinterpretation-casts.md` for the
+  intentionally deferred buffer-pool raw `Page` to `T` reinterpretation audit.
+
+Validation and review completed:
+
+- `cargo check -p doradb-storage`
+- `cargo fmt --check`
+- `cargo clippy -p doradb-storage --all-targets -- -D warnings`
+- `cargo nextest run -p doradb-storage` (632 passed)
+- `cargo build -p doradb-storage`
+- `git diff --check`
+- `rg bytemuck doradb-storage/src doradb-storage/Cargo.toml` (clean)
+- `cargo tree -p doradb-storage -i bytemuck` (no matching package)
+- `tools/coverage_focus.rs --path doradb-storage/src/layout.rs` (91.87%)
+- `tools/coverage_focus.rs --path doradb-storage/src/row` (90.55%)
+- `tools/coverage_focus.rs --path doradb-storage/src/lwc` (92.44%)
+- `tools/coverage_focus.rs --path doradb-storage/src/index` (92.19%)
 
 ## Impacts
 
@@ -190,6 +233,4 @@ Keep this section blank in design phase. Fill this section during `task resolve`
 
 ## Open Questions
 
-- The preferred row-page API shape is endian-aware wrapper slices or iterators instead of native typed slices. Implementation should choose the smallest API change that keeps scans efficient and makes little-endian storage explicit.
-- If any zerocopy derive exposes hidden padding in existing layouts, prefer explicit padding fields over field reordering.
 - Raw buffer-pool `Page` to `T` reinterpretation is intentionally deferred to `docs/backlogs/000096-audit-buffer-page-reinterpretation-casts.md`.

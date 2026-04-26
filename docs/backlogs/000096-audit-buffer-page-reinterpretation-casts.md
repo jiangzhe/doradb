@@ -10,9 +10,22 @@ Discovered while planning the bytemuck-to-zerocopy replacement. Relevant startin
 
 ## Deferred From (Optional)
 
+- `docs/tasks/000134-replace-bytemuck-with-zerocopy.md`
+- GitHub issue #593 / PR #594
 
 ## Deferral Context (Optional)
 
+The bytemuck-to-zerocopy task removed direct bytemuck usage and tightened
+persisted byte-layout handling without redesigning the buffer pool's generic
+guard-level page reinterpretation contract. That path still relies on raw
+`Page` to caller-selected `BufferPage` casts, but changing it would mix a
+separate buffer lifetime/alignment/latch contract review into an otherwise
+narrow storage-layout dependency replacement.
+
+Future planning should revisit whether the buffer guard layer can make this
+contract explicit with stronger layout assertions, documented unsafe
+preconditions, or limited zerocopy-based validation while preserving row-page
+atomics and existing hot-path performance.
 
 ## Scope Hint
 
