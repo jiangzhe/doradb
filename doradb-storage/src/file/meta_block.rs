@@ -10,7 +10,6 @@ use crate::lwc::{LwcPrimitiveDeser, LwcPrimitiveSer};
 use crate::row::RowID;
 use crate::serde::{Deser, Ser, Serde};
 use crate::trx::TrxID;
-use bytemuck::cast_slice;
 use error_stack::Report;
 use std::mem;
 use std::num::NonZeroU64;
@@ -216,7 +215,12 @@ impl<'a> AllocMapGcListSerView<'a> {
     pub fn new(alloc_map: &'a AllocMap, gc_block_list: &'a [BlockID]) -> Self {
         AllocMapGcListSerView {
             alloc_map,
-            gc_block_list: LwcPrimitiveSer::new_u64(cast_slice(gc_block_list)),
+            gc_block_list: LwcPrimitiveSer::new_u64_flat_owned(
+                gc_block_list
+                    .iter()
+                    .map(|block_id| block_id.as_u64())
+                    .collect(),
+            ),
         }
     }
 }

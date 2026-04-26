@@ -8,13 +8,14 @@ use crate::index::btree::{BTREE_HINTS_LEN, BTreeHints};
 use crate::index::btree::{BTREE_VALUE_PACK_MAX_LEN, BTreeU64, BTreeValue, BTreeValuePackable};
 use crate::index::btree::{BTreeDelete, BTreeUpdate};
 use crate::index::util::Maskable;
+use crate::layout;
 use crate::memcmp::BytesExtendable;
 use crate::trx::TrxID;
-use bytemuck::{Pod, Zeroable, cast_slice, cast_slice_mut};
 use std::cmp;
 use std::cmp::Ordering;
 use std::mem;
 use std::ops::{Deref, DerefMut, Range};
+use zerocopy_derive::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 /// Bytes reserved at the end of every B-tree page.
 ///
@@ -65,7 +66,7 @@ const _: () = assert!(mem::size_of::<BTreeNode>() == PAGE_SIZE);
 /// node body. Lower fence is always the first one inserted into node
 /// and it can be valid or invalid(deleted).
 #[repr(C)]
-#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+#[derive(Debug, Clone, FromBytes, IntoBytes, KnownLayout, Immutable)]
 pub struct BTreeHeader {
     /// Height of the node.
     /// 0 means leaf.
@@ -245,7 +246,7 @@ pub type KeyHeadBytes = [u8; 4];
 const _: () = assert!(mem::size_of::<BTreeSlot>() == 8);
 
 #[repr(C)]
-#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+#[derive(Debug, Clone, Copy, FromBytes, IntoBytes, KnownLayout, Immutable)]
 pub struct BTreeSlot {
     len_le: [u8; 2],
     offset_le: [u8; 2],
@@ -372,7 +373,7 @@ const BTREE_BODY_USABLE_LEN: usize = BTREE_NODE_USABLE_SIZE - mem::size_of::<BTr
 /// support "wider" covering index, but currently we do not consider it.
 ///
 #[repr(C)]
-#[derive(Clone, Copy, Pod, Zeroable)]
+#[derive(Clone, FromBytes, IntoBytes, KnownLayout, Immutable)]
 pub struct BTreeNode {
     header: BTreeHeader,
     body: BTreeBody,
@@ -864,7 +865,7 @@ impl BTreeNode {
         let (header, body) = (&mut self.header, &self.body);
         let len = header.count() as usize;
         let bytes_len = len * mem::size_of::<BTreeSlot>();
-        let slots = cast_slice(&body[..bytes_len]);
+        let slots = layout::slice_from_bytes(&body[..bytes_len]);
         (slots, &mut header.hints)
     }
 
@@ -1777,13 +1778,13 @@ impl BTreeNode {
     #[inline]
     fn slots_with_len(&self, len: usize) -> &[BTreeSlot] {
         let bytes_len = len * mem::size_of::<BTreeSlot>();
-        cast_slice(&self.body[..bytes_len])
+        layout::slice_from_bytes(&self.body[..bytes_len])
     }
 
     #[inline]
     fn slots_mut_with_len(&mut self, len: usize) -> &mut [BTreeSlot] {
         let bytes_len = len * mem::size_of::<BTreeSlot>();
-        cast_slice_mut(&mut self.body[..bytes_len])
+        layout::slice_from_bytes_mut(&mut self.body[..bytes_len])
     }
 
     #[inline]
@@ -2103,6 +2104,7 @@ mod tests {
     use crate::quiescent::QuiescentBox;
     use rand_distr::{Distribution, Uniform};
     use std::collections::BTreeMap;
+    use zerocopy::FromZeros as _;
 
     fn test_buf_pool() -> QuiescentBox<FixedBufferPool> {
         QuiescentBox::new(
@@ -2117,9 +2119,9 @@ mod tests {
         assert_eq!(mem::size_of::<BTreeNode>(), PAGE_SIZE);
         assert_eq!(BTREE_NODE_USABLE_SIZE, PAGE_SIZE - BTREE_NODE_FOOTER_SIZE);
         assert_eq!(BTREE_NODE_FOOTER_SIZE, BLOCK_INTEGRITY_TRAILER_SIZE);
-        assert_eq!(bytemuck::bytes_of(&*node).len(), PAGE_SIZE);
+        assert_eq!(layout::bytes_of(&*node).len(), PAGE_SIZE);
         assert_eq!(
-            &bytemuck::bytes_of(&*node)[BTREE_NODE_USABLE_SIZE..],
+            &layout::bytes_of(&*node)[BTREE_NODE_USABLE_SIZE..],
             &[0u8; BTREE_NODE_FOOTER_SIZE]
         );
 
@@ -2196,7 +2198,7 @@ mod tests {
 
     #[test]
     fn test_btree_header_and_slot_store_little_endian_fields() {
-        let mut header = BTreeHeader::zeroed();
+        let mut header = BTreeHeader::new_zeroed();
         header.set_height(0x1234);
         header.set_count(0x2345);
         header.set_start_offset(0x3456);

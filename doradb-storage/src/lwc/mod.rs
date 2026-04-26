@@ -11,12 +11,15 @@ use crate::error::{DataIntegrityError, Error, InternalError, OperationError, Res
 use crate::file::block_integrity::{LWC_BLOCK_SPEC, write_block_checksum, write_block_header};
 use crate::file::cow_file::COW_FILE_PAGE_SIZE;
 use crate::io::DirectBuf;
+use crate::layout;
 use crate::row::vector_scan::{PageVectorView, ScanBuffer, ScanColumnValues};
 use crate::row::{RowID, RowPage};
 use crate::serde::{Deser, ForBitpackingDeser, ForBitpackingSer, Ser, Serde};
 use crate::value::{MemVar, Val, ValKind};
 use error_stack::Report;
+use std::borrow::Cow;
 use std::mem;
+use zerocopy::{Immutable, IntoBytes};
 
 #[inline]
 fn invalid_compressed_payload(message: impl Into<String>) -> Error {
@@ -63,42 +66,42 @@ impl<'a> LwcData<'a> {
                         LwcData::Primitive(LwcPrimitive::FlatU8(FlatU8(input)))
                     }
                     ValKind::I16 => {
-                        let input = bytemuck::cast_slice::<u8, [u8; 2]>(input);
+                        let input = layout::slice_from_bytes::<[u8; 2]>(input);
                         debug_assert_eq!(input.len(), len as usize);
                         LwcData::Primitive(LwcPrimitive::FlatI16(FlatI16(input)))
                     }
                     ValKind::U16 => {
-                        let input = bytemuck::cast_slice::<u8, [u8; 2]>(input);
+                        let input = layout::slice_from_bytes::<[u8; 2]>(input);
                         debug_assert_eq!(input.len(), len as usize);
                         LwcData::Primitive(LwcPrimitive::FlatU16(FlatU16(input)))
                     }
                     ValKind::I32 => {
-                        let input = bytemuck::cast_slice::<u8, [u8; 4]>(input);
+                        let input = layout::slice_from_bytes::<[u8; 4]>(input);
                         debug_assert_eq!(input.len(), len as usize);
                         LwcData::Primitive(LwcPrimitive::FlatI32(FlatI32(input)))
                     }
                     ValKind::U32 => {
-                        let input = bytemuck::cast_slice::<u8, [u8; 4]>(input);
+                        let input = layout::slice_from_bytes::<[u8; 4]>(input);
                         debug_assert_eq!(input.len(), len as usize);
                         LwcData::Primitive(LwcPrimitive::FlatU32(FlatU32(input)))
                     }
                     ValKind::F32 => {
-                        let input = bytemuck::cast_slice::<u8, [u8; 4]>(input);
+                        let input = layout::slice_from_bytes::<[u8; 4]>(input);
                         debug_assert_eq!(input.len(), len as usize);
                         LwcData::Primitive(LwcPrimitive::FlatF32(FlatF32(input)))
                     }
                     ValKind::I64 => {
-                        let input = bytemuck::cast_slice::<u8, [u8; 8]>(input);
+                        let input = layout::slice_from_bytes::<[u8; 8]>(input);
                         debug_assert_eq!(input.len(), len as usize);
                         LwcData::Primitive(LwcPrimitive::FlatI64(FlatI64(input)))
                     }
                     ValKind::U64 => {
-                        let input = bytemuck::cast_slice::<u8, [u8; 8]>(input);
+                        let input = layout::slice_from_bytes::<[u8; 8]>(input);
                         debug_assert_eq!(input.len(), len as usize);
                         LwcData::Primitive(LwcPrimitive::FlatU64(FlatU64(input)))
                     }
                     ValKind::F64 => {
-                        let input = bytemuck::cast_slice::<u8, [u8; 8]>(input);
+                        let input = layout::slice_from_bytes::<[u8; 8]>(input);
                         debug_assert_eq!(input.len(), len as usize);
                         LwcData::Primitive(LwcPrimitive::FlatF64(FlatF64(input)))
                     }
@@ -111,7 +114,7 @@ impl<'a> LwcData<'a> {
                         }
                         let (offset_bytes, data) =
                             input.split_at((len + 1) * mem::size_of::<u32>());
-                        let offsets = bytemuck::cast_slice::<u8, [u8; 4]>(offset_bytes);
+                        let offsets = layout::slice_from_bytes::<[u8; 4]>(offset_bytes);
                         LwcData::Bytes(LwcBytes { offsets, data })
                     }
                 }
@@ -198,7 +201,7 @@ impl<'a> LwcData<'a> {
                             4 => LwcPrimitive::ForBp4I32(ForBitpacking4 { len, min, data }),
                             8 => LwcPrimitive::ForBp8I32(ForBitpacking8 { min, data }),
                             16 => {
-                                let data = bytemuck::cast_slice::<u8, [u8; 2]>(data);
+                                let data = layout::slice_from_bytes::<[u8; 2]>(data);
                                 LwcPrimitive::ForBp16I32(ForBitpacking16 { min, data })
                             }
                             _ => {
@@ -219,7 +222,7 @@ impl<'a> LwcData<'a> {
                             4 => LwcPrimitive::ForBp4U32(ForBitpacking4 { len, min, data }),
                             8 => LwcPrimitive::ForBp8U32(ForBitpacking8 { min, data }),
                             16 => {
-                                let data = bytemuck::cast_slice::<u8, [u8; 2]>(data);
+                                let data = layout::slice_from_bytes::<[u8; 2]>(data);
                                 LwcPrimitive::ForBp16U32(ForBitpacking16 { min, data })
                             }
                             _ => {
@@ -240,11 +243,11 @@ impl<'a> LwcData<'a> {
                             4 => LwcPrimitive::ForBp4I64(ForBitpacking4 { len, min, data }),
                             8 => LwcPrimitive::ForBp8I64(ForBitpacking8 { min, data }),
                             16 => {
-                                let data = bytemuck::cast_slice::<u8, [u8; 2]>(data);
+                                let data = layout::slice_from_bytes::<[u8; 2]>(data);
                                 LwcPrimitive::ForBp16I64(ForBitpacking16 { min, data })
                             }
                             32 => {
-                                let data = bytemuck::cast_slice::<u8, [u8; 4]>(data);
+                                let data = layout::slice_from_bytes::<[u8; 4]>(data);
                                 LwcPrimitive::ForBp32I64(ForBitpacking32 { min, data })
                             }
                             _ => {
@@ -265,11 +268,11 @@ impl<'a> LwcData<'a> {
                             4 => LwcPrimitive::ForBp4U64(ForBitpacking4 { len, min, data }),
                             8 => LwcPrimitive::ForBp8U64(ForBitpacking8 { min, data }),
                             16 => {
-                                let data = bytemuck::cast_slice::<u8, [u8; 2]>(data);
+                                let data = layout::slice_from_bytes::<[u8; 2]>(data);
                                 LwcPrimitive::ForBp16U64(ForBitpacking16 { min, data })
                             }
                             32 => {
-                                let data = bytemuck::cast_slice::<u8, [u8; 4]>(data);
+                                let data = layout::slice_from_bytes::<[u8; 4]>(data);
                                 LwcPrimitive::ForBp32U64(ForBitpacking32 { min, data })
                             }
                             _ => {
@@ -520,18 +523,122 @@ impl LwcPrimitive<'_> {
     }
 }
 
+#[inline]
+fn flat_bytes_borrowed<'a, T, const N: usize>(input: &'a [T]) -> Cow<'a, [[u8; N]]>
+where
+    [T]: IntoBytes + Immutable,
+{
+    Cow::Borrowed(layout::slice_from_bytes::<[u8; N]>(input.as_bytes()))
+}
+
+#[cfg(target_endian = "little")]
+#[inline]
+fn flat_i16_bytes(input: &[i16]) -> Cow<'_, [[u8; 2]]> {
+    flat_bytes_borrowed(input)
+}
+
+#[cfg(not(target_endian = "little"))]
+#[inline]
+fn flat_i16_bytes(input: &[i16]) -> Cow<'_, [[u8; 2]]> {
+    Cow::Owned(input.iter().map(|v| v.to_le_bytes()).collect())
+}
+
+#[cfg(target_endian = "little")]
+#[inline]
+fn flat_u16_bytes(input: &[u16]) -> Cow<'_, [[u8; 2]]> {
+    flat_bytes_borrowed(input)
+}
+
+#[cfg(not(target_endian = "little"))]
+#[inline]
+fn flat_u16_bytes(input: &[u16]) -> Cow<'_, [[u8; 2]]> {
+    Cow::Owned(input.iter().map(|v| v.to_le_bytes()).collect())
+}
+
+#[cfg(target_endian = "little")]
+#[inline]
+fn flat_i32_bytes(input: &[i32]) -> Cow<'_, [[u8; 4]]> {
+    flat_bytes_borrowed(input)
+}
+
+#[cfg(not(target_endian = "little"))]
+#[inline]
+fn flat_i32_bytes(input: &[i32]) -> Cow<'_, [[u8; 4]]> {
+    Cow::Owned(input.iter().map(|v| v.to_le_bytes()).collect())
+}
+
+#[cfg(target_endian = "little")]
+#[inline]
+fn flat_u32_bytes(input: &[u32]) -> Cow<'_, [[u8; 4]]> {
+    flat_bytes_borrowed(input)
+}
+
+#[cfg(not(target_endian = "little"))]
+#[inline]
+fn flat_u32_bytes(input: &[u32]) -> Cow<'_, [[u8; 4]]> {
+    Cow::Owned(input.iter().map(|v| v.to_le_bytes()).collect())
+}
+
+#[cfg(target_endian = "little")]
+#[inline]
+fn flat_f32_bytes(input: &[f32]) -> Cow<'_, [[u8; 4]]> {
+    flat_bytes_borrowed(input)
+}
+
+#[cfg(not(target_endian = "little"))]
+#[inline]
+fn flat_f32_bytes(input: &[f32]) -> Cow<'_, [[u8; 4]]> {
+    Cow::Owned(input.iter().map(|v| v.to_le_bytes()).collect())
+}
+
+#[cfg(target_endian = "little")]
+#[inline]
+fn flat_i64_bytes(input: &[i64]) -> Cow<'_, [[u8; 8]]> {
+    flat_bytes_borrowed(input)
+}
+
+#[cfg(not(target_endian = "little"))]
+#[inline]
+fn flat_i64_bytes(input: &[i64]) -> Cow<'_, [[u8; 8]]> {
+    Cow::Owned(input.iter().map(|v| v.to_le_bytes()).collect())
+}
+
+#[cfg(target_endian = "little")]
+#[inline]
+fn flat_u64_bytes(input: &[u64]) -> Cow<'_, [[u8; 8]]> {
+    flat_bytes_borrowed(input)
+}
+
+#[cfg(not(target_endian = "little"))]
+#[inline]
+fn flat_u64_bytes(input: &[u64]) -> Cow<'_, [[u8; 8]]> {
+    Cow::Owned(input.iter().map(|v| v.to_le_bytes()).collect())
+}
+
+#[cfg(target_endian = "little")]
+#[inline]
+fn flat_f64_bytes(input: &[f64]) -> Cow<'_, [[u8; 8]]> {
+    flat_bytes_borrowed(input)
+}
+
+#[cfg(not(target_endian = "little"))]
+#[inline]
+fn flat_f64_bytes(input: &[f64]) -> Cow<'_, [[u8; 8]]> {
+    Cow::Owned(input.iter().map(|v| v.to_le_bytes()).collect())
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LwcPrimitiveSer<'a> {
     FlatI8(&'a [i8]),
     FlatU8(&'a [u8]),
-    FlatI16(&'a [[u8; 2]]),
-    FlatU16(&'a [[u8; 2]]),
-    FlatI32(&'a [[u8; 4]]),
-    FlatU32(&'a [[u8; 4]]),
-    FlatF32(&'a [[u8; 4]]),
-    FlatI64(&'a [[u8; 8]]),
-    FlatU64(&'a [[u8; 8]]),
-    FlatF64(&'a [[u8; 8]]),
+    FlatI16(Cow<'a, [[u8; 2]]>),
+    FlatU16(Cow<'a, [[u8; 2]]>),
+    FlatI32(Cow<'a, [[u8; 4]]>),
+    FlatU32(Cow<'a, [[u8; 4]]>),
+    FlatF32(Cow<'a, [[u8; 4]]>),
+    FlatI64(Cow<'a, [[u8; 8]]>),
+    FlatU64(Cow<'a, [[u8; 8]]>),
+    FlatF64(Cow<'a, [[u8; 8]]>),
     ForBpI8(ForBitpackingSer<'a, i8>),
     ForBpU8(ForBitpackingSer<'a, u8>),
     ForBpI16(ForBitpackingSer<'a, i16>),
@@ -569,19 +676,27 @@ impl<'a> LwcPrimitiveSer<'a> {
     #[inline]
     pub fn new_u64(input: &'a [u64]) -> Self {
         if input.is_empty() {
-            return LwcPrimitiveSer::FlatU64(bytemuck::cast_slice(input));
+            return LwcPrimitiveSer::FlatU64(flat_u64_bytes(input));
         }
         match ForBitpackingSer::new(input) {
             Some(fbp) => LwcPrimitiveSer::ForBpU64(fbp),
-            None => LwcPrimitiveSer::FlatU64(bytemuck::cast_slice(input)),
+            None => LwcPrimitiveSer::FlatU64(flat_u64_bytes(input)),
         }
+    }
+
+    /// Creates flat little-endian `u64` serialization storage from an owned vector.
+    #[inline]
+    pub(crate) fn new_u64_flat_owned(input: Vec<u64>) -> Self {
+        LwcPrimitiveSer::FlatU64(Cow::Owned(
+            input.into_iter().map(|v| v.to_le_bytes()).collect(),
+        ))
     }
 
     #[inline]
     pub fn new_i16(input: &'a [i16]) -> Self {
         match ForBitpackingSer::new(input) {
             Some(fbp) => LwcPrimitiveSer::ForBpI16(fbp),
-            None => LwcPrimitiveSer::FlatI16(bytemuck::cast_slice(input)),
+            None => LwcPrimitiveSer::FlatI16(flat_i16_bytes(input)),
         }
     }
 
@@ -589,7 +704,7 @@ impl<'a> LwcPrimitiveSer<'a> {
     pub fn new_u16(input: &'a [u16]) -> Self {
         match ForBitpackingSer::new(input) {
             Some(fbp) => LwcPrimitiveSer::ForBpU16(fbp),
-            None => LwcPrimitiveSer::FlatU16(bytemuck::cast_slice(input)),
+            None => LwcPrimitiveSer::FlatU16(flat_u16_bytes(input)),
         }
     }
 
@@ -597,7 +712,7 @@ impl<'a> LwcPrimitiveSer<'a> {
     pub fn new_i32(input: &'a [i32]) -> Self {
         match ForBitpackingSer::new(input) {
             Some(fbp) => LwcPrimitiveSer::ForBpI32(fbp),
-            None => LwcPrimitiveSer::FlatI32(bytemuck::cast_slice(input)),
+            None => LwcPrimitiveSer::FlatI32(flat_i32_bytes(input)),
         }
     }
 
@@ -605,7 +720,7 @@ impl<'a> LwcPrimitiveSer<'a> {
     pub fn new_u32(input: &'a [u32]) -> Self {
         match ForBitpackingSer::new(input) {
             Some(fbp) => LwcPrimitiveSer::ForBpU32(fbp),
-            None => LwcPrimitiveSer::FlatU32(bytemuck::cast_slice(input)),
+            None => LwcPrimitiveSer::FlatU32(flat_u32_bytes(input)),
         }
     }
 
@@ -613,18 +728,18 @@ impl<'a> LwcPrimitiveSer<'a> {
     pub fn new_i64(input: &'a [i64]) -> Self {
         match ForBitpackingSer::new(input) {
             Some(fbp) => LwcPrimitiveSer::ForBpI64(fbp),
-            None => LwcPrimitiveSer::FlatI64(bytemuck::cast_slice(input)),
+            None => LwcPrimitiveSer::FlatI64(flat_i64_bytes(input)),
         }
     }
 
     #[inline]
     pub fn new_f32(input: &'a [f32]) -> Self {
-        LwcPrimitiveSer::FlatF32(bytemuck::cast_slice(input))
+        LwcPrimitiveSer::FlatF32(flat_f32_bytes(input))
     }
 
     #[inline]
     pub fn new_f64(input: &'a [f64]) -> Self {
-        LwcPrimitiveSer::FlatF64(bytemuck::cast_slice(input))
+        LwcPrimitiveSer::FlatF64(flat_f64_bytes(input))
     }
 
     #[inline]
@@ -1010,30 +1125,79 @@ impl<'a> LwcBuilder<'a> {
         }
         for col_idx in 0..self.metadata.col_count() {
             let (null_bitmap, values) = view.col(col_idx);
+            let null_bitmap = null_bitmap.as_deref();
             match values {
                 crate::row::vector_scan::ValArrayRef::I8(vals) => {
-                    self.update_stats_i64(col_idx, null_bitmap, vals, view.range_non_deleted());
+                    self.update_stats_i64(
+                        col_idx,
+                        null_bitmap,
+                        vals,
+                        view.range_non_deleted(),
+                        |v| v as i64,
+                    );
                 }
                 crate::row::vector_scan::ValArrayRef::U8(vals) => {
-                    self.update_stats_u64(col_idx, null_bitmap, vals, view.range_non_deleted());
+                    self.update_stats_u64(
+                        col_idx,
+                        null_bitmap,
+                        vals,
+                        view.range_non_deleted(),
+                        |v| v as u64,
+                    );
                 }
                 crate::row::vector_scan::ValArrayRef::I16(vals) => {
-                    self.update_stats_i64(col_idx, null_bitmap, vals, view.range_non_deleted());
+                    self.update_stats_i64(
+                        col_idx,
+                        null_bitmap,
+                        vals,
+                        view.range_non_deleted(),
+                        |v| v.get() as i64,
+                    );
                 }
                 crate::row::vector_scan::ValArrayRef::U16(vals) => {
-                    self.update_stats_u64(col_idx, null_bitmap, vals, view.range_non_deleted());
+                    self.update_stats_u64(
+                        col_idx,
+                        null_bitmap,
+                        vals,
+                        view.range_non_deleted(),
+                        |v| v.get() as u64,
+                    );
                 }
                 crate::row::vector_scan::ValArrayRef::I32(vals) => {
-                    self.update_stats_i64(col_idx, null_bitmap, vals, view.range_non_deleted());
+                    self.update_stats_i64(
+                        col_idx,
+                        null_bitmap,
+                        vals,
+                        view.range_non_deleted(),
+                        |v| v.get() as i64,
+                    );
                 }
                 crate::row::vector_scan::ValArrayRef::U32(vals) => {
-                    self.update_stats_u64(col_idx, null_bitmap, vals, view.range_non_deleted());
+                    self.update_stats_u64(
+                        col_idx,
+                        null_bitmap,
+                        vals,
+                        view.range_non_deleted(),
+                        |v| v.get() as u64,
+                    );
                 }
                 crate::row::vector_scan::ValArrayRef::I64(vals) => {
-                    self.update_stats_i64(col_idx, null_bitmap, vals, view.range_non_deleted());
+                    self.update_stats_i64(
+                        col_idx,
+                        null_bitmap,
+                        vals,
+                        view.range_non_deleted(),
+                        |v| v.get(),
+                    );
                 }
                 crate::row::vector_scan::ValArrayRef::U64(vals) => {
-                    self.update_stats_u64(col_idx, null_bitmap, vals, view.range_non_deleted());
+                    self.update_stats_u64(
+                        col_idx,
+                        null_bitmap,
+                        vals,
+                        view.range_non_deleted(),
+                        |v| v.get(),
+                    );
                 }
                 crate::row::vector_scan::ValArrayRef::F32(_)
                 | crate::row::vector_scan::ValArrayRef::F64(_)
@@ -1043,12 +1207,13 @@ impl<'a> LwcBuilder<'a> {
         Ok(())
     }
 
-    fn update_stats_i64<T: Copy + Into<i64>, R: Iterator<Item = (usize, usize)>>(
+    fn update_stats_i64<T: Copy, R: Iterator<Item = (usize, usize)>>(
         &mut self,
         col_idx: usize,
         null_bitmap: Option<&[u64]>,
         values: &[T],
         ranges: R,
+        decode: impl Fn(T) -> i64,
     ) {
         for (start_idx, end_idx) in ranges {
             for idx in start_idx..end_idx {
@@ -1056,18 +1221,19 @@ impl<'a> LwcBuilder<'a> {
                     continue;
                 }
                 if let Some(value) = values.get(idx) {
-                    self.stats[col_idx].update_i64((*value).into());
+                    self.stats[col_idx].update_i64(decode(*value));
                 }
             }
         }
     }
 
-    fn update_stats_u64<T: Copy + Into<u64>, R: Iterator<Item = (usize, usize)>>(
+    fn update_stats_u64<T: Copy, R: Iterator<Item = (usize, usize)>>(
         &mut self,
         col_idx: usize,
         null_bitmap: Option<&[u64]>,
         values: &[T],
         ranges: R,
+        decode: impl Fn(T) -> u64,
     ) {
         for (start_idx, end_idx) in ranges {
             for idx in start_idx..end_idx {
@@ -1075,7 +1241,7 @@ impl<'a> LwcBuilder<'a> {
                     continue;
                 }
                 if let Some(value) = values.get(idx) {
-                    self.stats[col_idx].update_u64((*value).into());
+                    self.stats[col_idx].update_u64(decode(*value));
                 }
             }
         }

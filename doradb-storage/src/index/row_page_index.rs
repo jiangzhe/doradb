@@ -11,14 +11,15 @@ use crate::error::{
 use crate::file::BlockID;
 use crate::index::util::{Maskable, ParentPosition, RowPageCreateRedoCtx};
 use crate::latch::LatchFallbackMode;
+use crate::layout;
 use crate::quiescent::QuiescentGuard;
 use crate::row::{INVALID_ROW_ID, RowID, RowPage};
-use bytemuck::{Pod, Zeroable, cast_slice, cast_slice_mut};
 use either::Either::{Left, Right};
 use parking_lot::Mutex;
 use std::mem;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use zerocopy_derive::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 pub const ROW_PAGE_INDEX_NODE_SIZE: usize = PAGE_SIZE;
 pub const ROW_PAGE_INDEX_NODE_HEADER_SIZE: usize = mem::size_of::<RowPageIndexNodeHeader>();
@@ -239,13 +240,13 @@ impl RowPageIndexNode {
     #[inline]
     fn entries(&self, len: usize) -> &[PageEntry] {
         let bytes_len = len * mem::size_of::<PageEntry>();
-        cast_slice(&self.data[..bytes_len])
+        layout::slice_from_bytes(&self.data[..bytes_len])
     }
 
     #[inline]
     fn entries_mut(&mut self, len: usize) -> &mut [PageEntry] {
         let bytes_len = len * mem::size_of::<PageEntry>();
-        cast_slice_mut(&mut self.data[..bytes_len])
+        layout::slice_from_bytes_mut(&mut self.data[..bytes_len])
     }
 }
 
@@ -268,7 +269,7 @@ pub struct RowPageIndexNodeHeader {
 
 #[repr(C)]
 /// Entry mapping a row-id boundary to a row-page or child node page id.
-#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+#[derive(Debug, Clone, Copy, FromBytes, IntoBytes, KnownLayout, Immutable)]
 pub struct PageEntry {
     pub row_id: RowID,
     pub page_id: PageID,

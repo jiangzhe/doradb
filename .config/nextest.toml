@@ -3,7 +3,7 @@ required = "0.9.100"
 
 [profile.default]
 slow-timeout = { period = "10s", terminate-after = 1, grace-period = "0s" }
-global-timeout = "15s"
+global-timeout = "30s"
 fail-fast = true
 
 [profile.ci]

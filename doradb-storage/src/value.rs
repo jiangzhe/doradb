@@ -4,7 +4,6 @@ use crate::memcmp::{
     SegmentedBytes,
 };
 use crate::serde::{Deser, Ser, Serde};
-use bytemuck::{AnyBitPattern, Zeroable};
 use error_stack::Report;
 use ordered_float::OrderedFloat;
 use serde::de::Visitor;
@@ -15,6 +14,7 @@ use std::hash::{Hash, Hasher};
 use std::mem::{self, ManuallyDrop, MaybeUninit};
 use std::result::Result as StdResult;
 use std::sync::atomic::*;
+use zerocopy_derive::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 pub const PAGE_VAR_HEADER: usize = 8;
 pub const PAGE_VAR_LEN_INLINE: usize = 6;
@@ -707,7 +707,7 @@ macro_rules! impl_value_fixed_size {
                 // storage.
                 unsafe {
                     let atom = $at::from_ptr(ptr as *mut u8 as *mut $t);
-                    atom.store(*self, Ordering::Release);
+                    atom.store(self.to_le(), Ordering::Release);
                 }
             }
 
@@ -716,7 +716,7 @@ macro_rules! impl_value_fixed_size {
                 // SAFETY: the trait contract guarantees `ptr` points to a
                 // writable slot laid out as `$t`.
                 unsafe {
-                    *(ptr as *mut $t) = *self;
+                    std::ptr::copy_nonoverlapping(self.to_le_bytes().as_ptr(), ptr, $size);
                 }
             }
         }
@@ -740,7 +740,7 @@ impl Value for f32 {
         // 4-byte slot for storing the raw bits of this `f32`.
         unsafe {
             let atom = AtomicU32::from_ptr(ptr as *mut u8 as *mut u32);
-            atom.store(self.to_bits(), Ordering::Release);
+            atom.store(self.to_bits().to_le(), Ordering::Release);
         }
     }
 
@@ -749,7 +749,7 @@ impl Value for f32 {
         // SAFETY: the trait contract guarantees `ptr` points to a writable
         // 4-byte slot for storing the raw bits of this `f32`.
         unsafe {
-            *(ptr as *mut u32) = self.to_bits();
+            std::ptr::copy_nonoverlapping(self.to_bits().to_le_bytes().as_ptr(), ptr, 4);
         }
     }
 }
@@ -762,7 +762,7 @@ impl Value for f64 {
         // 8-byte slot for storing the raw bits of this `f64`.
         unsafe {
             let atom = AtomicU64::from_ptr(ptr as *mut u8 as *mut u64);
-            atom.store(self.to_bits(), Ordering::Release);
+            atom.store(self.to_bits().to_le(), Ordering::Release);
         }
     }
 
@@ -771,7 +771,7 @@ impl Value for f64 {
         // SAFETY: the trait contract guarantees `ptr` points to a writable
         // 8-byte slot for storing the raw bits of this `f64`.
         unsafe {
-            *(ptr as *mut u64) = self.to_bits();
+            std::ptr::copy_nonoverlapping(self.to_bits().to_le_bytes().as_ptr(), ptr, 8);
         }
     }
 }
@@ -845,11 +845,9 @@ impl ValBuffer {
 /// Outline means the fixed field only store length,
 /// offset and prfix. Entire value is located at
 /// tail of page.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, FromBytes, IntoBytes, KnownLayout, Immutable)]
 #[repr(C, align(8))]
-pub union PageVar {
-    i: PageVarInline,
-    o: PageVarOutline,
+pub struct PageVar {
     b: [u8; 8],
 }
 
@@ -859,12 +857,10 @@ impl PageVar {
     #[inline]
     pub fn inline(data: &[u8]) -> Self {
         debug_assert!(data.len() <= PAGE_VAR_LEN_INLINE);
-        let mut i = PageVarInline {
-            len: data.len() as u16,
-            data: [0u8; PAGE_VAR_LEN_INLINE],
-        };
-        i.data[..data.len()].copy_from_slice(data);
-        PageVar { i }
+        let mut b = [0u8; PAGE_VAR_HEADER];
+        b[..2].copy_from_slice(&(data.len() as u16).to_le_bytes());
+        b[2..2 + data.len()].copy_from_slice(data);
+        PageVar { b }
     }
 
     /// Create a new PageVar with pointer info.
@@ -872,22 +868,18 @@ impl PageVar {
     #[inline]
     pub fn outline(len: u16, offset: u16, prefix: &[u8]) -> Self {
         debug_assert!(prefix.len() == PAGE_VAR_LEN_PREFIX);
-        let mut o = PageVarOutline {
-            len,
-            offset,
-            prefix: [0u8; PAGE_VAR_LEN_PREFIX],
-        };
-        o.prefix.copy_from_slice(prefix);
-        PageVar { o }
+        let mut b = [0u8; PAGE_VAR_HEADER];
+        b[..2].copy_from_slice(&len.to_le_bytes());
+        b[2..4].copy_from_slice(&offset.to_le_bytes());
+        b[4..].copy_from_slice(prefix);
+        PageVar { b }
     }
 
     /// Returns length of the value.
     #[allow(clippy::len_without_is_empty)]
     #[inline]
     pub fn len(&self) -> usize {
-        // SAFETY: all `PageVar` union variants store `len` in the same leading
-        // position.
-        unsafe { self.i.len as usize }
+        u16::from_le_bytes([self.b[0], self.b[1]]) as usize
     }
 
     /// Returns offset if outlined.
@@ -896,9 +888,7 @@ impl PageVar {
         if self.is_inlined() {
             return None;
         }
-        // SAFETY: the `!is_inlined()` branch means the outlined layout is the
-        // active interpretation and stores `offset`.
-        unsafe { Some(self.o.offset as usize) }
+        Some(u16::from_le_bytes([self.b[2], self.b[3]]) as usize)
     }
 
     /// Returns whether the value is inlined.
@@ -933,9 +923,10 @@ impl PageVar {
         unsafe {
             let len = self.len();
             if len <= PAGE_VAR_LEN_INLINE {
-                &self.i.data[..len]
+                &self.b[2..2 + len]
             } else {
-                let data = ptr.add(self.o.offset as usize);
+                let offset = u16::from_le_bytes([self.b[2], self.b[3]]) as usize;
+                let data = ptr.add(offset);
                 std::slice::from_raw_parts(data, len)
             }
         }
@@ -946,13 +937,9 @@ impl PageVar {
     pub fn as_bytes<'a>(&'a self, page_data: &'a [u8]) -> &'a [u8] {
         let len = self.len();
         if len <= PAGE_VAR_LEN_INLINE {
-            // SAFETY: the inline representation stores the payload bytes in the
-            // union's fixed-size inline field.
-            unsafe { &self.i.data[..len] }
+            &self.b[2..2 + len]
         } else {
-            // SAFETY: the outlined representation is active when `len` exceeds
-            // the inline threshold.
-            let offset = unsafe { self.o.offset as usize };
+            let offset = u16::from_le_bytes([self.b[2], self.b[3]]) as usize;
             &page_data[offset..offset + len]
         }
     }
@@ -977,15 +964,16 @@ impl PageVar {
             if val.len() > PAGE_VAR_LEN_INLINE {
                 // all not inline, but original is longer or equal to input value.
                 debug_assert!(self.len() > PAGE_VAR_LEN_INLINE);
-                self.o.len = val.len() as u16;
-                let target =
-                    std::slice::from_raw_parts_mut(ptr.add(self.o.offset as usize), val.len());
+                self.b[..2].copy_from_slice(&(val.len() as u16).to_le_bytes());
+                let offset = u16::from_le_bytes([self.b[2], self.b[3]]) as usize;
+                let target = std::slice::from_raw_parts_mut(ptr.add(offset), val.len());
                 target.copy_from_slice(val);
             } else {
                 // input is inlined.
                 // better to reuse release page data.
-                self.i.len = val.len() as u16;
-                self.i.data[..val.len()].copy_from_slice(val);
+                self.b[..2].copy_from_slice(&(val.len() as u16).to_le_bytes());
+                self.b[2..].fill(0);
+                self.b[2..2 + val.len()].copy_from_slice(val);
             }
         }
     }
@@ -993,37 +981,19 @@ impl PageVar {
     #[inline]
     pub fn from_u64(raw: u64) -> Self {
         PageVar {
-            b: raw.to_ne_bytes(),
+            b: raw.to_le_bytes(),
         }
     }
 
     #[inline]
     pub fn into_u64(self) -> u64 {
-        // SAFETY: `PageVar` is an 8-byte tagged payload and any bit-pattern is allowed.
-        unsafe { u64::from_ne_bytes(self.b) }
+        u64::from_le_bytes(self.b)
     }
-}
 
-// SAFETY: `PageVar` is an 8-byte union of integer/byte-array layouts without
-// references or niche-invalid bit patterns.
-unsafe impl Zeroable for PageVar {}
-// SAFETY: every 8-byte pattern is a valid structural representation for the
-// plain-data fields in `PageVar`.
-unsafe impl AnyBitPattern for PageVar {}
-
-#[derive(Debug, Clone, Copy, AnyBitPattern)]
-#[repr(C, align(8))]
-struct PageVarInline {
-    len: u16,
-    data: [u8; PAGE_VAR_LEN_INLINE],
-}
-
-#[derive(Debug, Clone, Copy, AnyBitPattern)]
-#[repr(C, align(8))]
-struct PageVarOutline {
-    len: u16,
-    offset: u16,
-    prefix: [u8; PAGE_VAR_LEN_PREFIX],
+    #[inline]
+    pub(crate) fn from_le_bytes(b: [u8; PAGE_VAR_HEADER]) -> Self {
+        PageVar { b }
+    }
 }
 
 /// VarBytes is similar to PageVar, but more general to use.

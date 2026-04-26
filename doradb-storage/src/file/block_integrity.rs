@@ -1,8 +1,8 @@
 use crate::error::{DataIntegrityError, DataIntegrityResult, Result};
 use crate::serde::{Deser, Ser, Serde};
-use bytemuck::{Pod, Zeroable};
 use error_stack::{Report, ensure};
 use std::mem;
+use zerocopy_derive::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 /// Size in bytes of the fixed block-integrity header.
 pub(crate) const BLOCK_INTEGRITY_HEADER_SIZE: usize = mem::size_of::<BlockIntegrityHeader>();
@@ -74,9 +74,10 @@ impl Deser for BlockIntegrityHeader {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Pod, Zeroable)]
+/// Fixed checksum trailer stored at the end of persisted block images.
+#[derive(Debug, Clone, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable)]
 #[repr(C)]
-pub(crate) struct BlockIntegrityTrailer {
+pub struct BlockIntegrityTrailer {
     b3sum: [u8; 32],
 }
 

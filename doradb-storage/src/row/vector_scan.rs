@@ -14,6 +14,10 @@ use crate::trx::undo::RowUndoKind;
 use crate::trx::{TrxID, trx_is_committed};
 use crate::value::{PageVar, ValBuffer, ValType};
 use error_stack::Report;
+use zerocopy::byteorder::little_endian::{
+    F32 as LeF32, F64 as LeF64, I16 as LeI16, I32 as LeI32, I64 as LeI64, U16 as LeU16,
+    U32 as LeU32, U64 as LeU64,
+};
 
 #[inline]
 fn column_scan_shape_mismatch() -> Error {
@@ -147,42 +151,42 @@ impl ScanBuffer {
                 }
                 (ValBuffer::I16(res), ValArrayRef::I16(delta)) => {
                     for (start_idx, end_idx) in view.range_non_deleted() {
-                        res.extend(&delta[start_idx..end_idx]);
+                        res.extend(delta[start_idx..end_idx].iter().map(|v| v.get()));
                     }
                 }
                 (ValBuffer::U16(res), ValArrayRef::U16(delta)) => {
                     for (start_idx, end_idx) in view.range_non_deleted() {
-                        res.extend(&delta[start_idx..end_idx]);
+                        res.extend(delta[start_idx..end_idx].iter().map(|v| v.get()));
                     }
                 }
                 (ValBuffer::I32(res), ValArrayRef::I32(delta)) => {
                     for (start_idx, end_idx) in view.range_non_deleted() {
-                        res.extend(&delta[start_idx..end_idx]);
+                        res.extend(delta[start_idx..end_idx].iter().map(|v| v.get()));
                     }
                 }
                 (ValBuffer::U32(res), ValArrayRef::U32(delta)) => {
                     for (start_idx, end_idx) in view.range_non_deleted() {
-                        res.extend(&delta[start_idx..end_idx]);
+                        res.extend(delta[start_idx..end_idx].iter().map(|v| v.get()));
                     }
                 }
                 (ValBuffer::F32(res), ValArrayRef::F32(delta)) => {
                     for (start_idx, end_idx) in view.range_non_deleted() {
-                        res.extend(&delta[start_idx..end_idx]);
+                        res.extend(delta[start_idx..end_idx].iter().map(|v| v.get()));
                     }
                 }
                 (ValBuffer::I64(res), ValArrayRef::I64(delta)) => {
                     for (start_idx, end_idx) in view.range_non_deleted() {
-                        res.extend(&delta[start_idx..end_idx]);
+                        res.extend(delta[start_idx..end_idx].iter().map(|v| v.get()));
                     }
                 }
                 (ValBuffer::U64(res), ValArrayRef::U64(delta)) => {
                     for (start_idx, end_idx) in view.range_non_deleted() {
-                        res.extend(&delta[start_idx..end_idx]);
+                        res.extend(delta[start_idx..end_idx].iter().map(|v| v.get()));
                     }
                 }
                 (ValBuffer::F64(res), ValArrayRef::F64(delta)) => {
                     for (start_idx, end_idx) in view.range_non_deleted() {
-                        res.extend(&delta[start_idx..end_idx]);
+                        res.extend(delta[start_idx..end_idx].iter().map(|v| v.get()));
                     }
                 }
                 (ValBuffer::VarByte { offsets, data }, ValArrayRef::VarByte(delta, page)) => {
@@ -317,7 +321,7 @@ impl RowPage {
             }
         }
         let row_count = self.header.row_count();
-        let mut del_bitmap = Vec::from(self.del_bitmap(row_count));
+        let mut del_bitmap = self.del_bitmap(row_count);
         for row_idx in 0..row_count {
             let undo_guard = map.read_latch(row_idx);
             let Some(head) = undo_guard.as_ref() else {
@@ -367,7 +371,7 @@ impl<'p, 'm> PageVectorView<'p, 'm> {
     #[inline]
     pub fn new(page: &'p RowPage, metadata: &'m TableMetadata) -> Self {
         let row_count = page.header.row_count();
-        let del_bitmap = Vec::from(page.del_bitmap(row_count));
+        let del_bitmap = page.del_bitmap(row_count);
         PageVectorView {
             page,
             metadata,
@@ -393,7 +397,7 @@ impl<'p, 'm> PageVectorView<'p, 'm> {
 
     /// Returns null bitmap and value data of given column.
     #[inline]
-    pub fn col(&self, col_idx: usize) -> (Option<&'p [u64]>, ValArrayRef<'p>) {
+    pub fn col(&self, col_idx: usize) -> (Option<Vec<u64>>, ValArrayRef<'p>) {
         self.page.vals(self.metadata, col_idx, self.row_count)
     }
 }
@@ -402,14 +406,14 @@ impl<'p, 'm> PageVectorView<'p, 'm> {
 pub enum ValArrayRef<'a> {
     I8(&'a [i8]),
     U8(&'a [u8]),
-    I16(&'a [i16]),
-    U16(&'a [u16]),
-    I32(&'a [i32]),
-    U32(&'a [u32]),
-    F32(&'a [f32]),
-    I64(&'a [i64]),
-    U64(&'a [u64]),
-    F64(&'a [f64]),
+    I16(&'a [LeI16]),
+    U16(&'a [LeU16]),
+    I32(&'a [LeI32]),
+    U32(&'a [LeU32]),
+    F32(&'a [LeF32]),
+    I64(&'a [LeI64]),
+    U64(&'a [LeU64]),
+    F64(&'a [LeF64]),
     VarByte(&'a [PageVar], &'a [u8]),
 }
 

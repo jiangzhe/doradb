@@ -3,10 +3,12 @@ use crate::compression::bitpacking::*;
 use crate::error::{DataIntegrityError, Result};
 use error_stack::Report;
 use semistr::SemiStr;
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::fmt;
 use std::marker::PhantomData;
 use std::mem;
+use zerocopy::IntoBytes;
 
 pub trait Serde {
     /// Serialize a u64 value to a byte slice.
@@ -499,6 +501,19 @@ impl<const N: usize> Deser for [u8; N] {
     #[inline]
     fn deser<S: Serde + ?Sized>(input: &S, start_idx: usize) -> Result<(usize, Self)> {
         input.deser_byte_array(start_idx)
+    }
+}
+
+impl<const N: usize> Ser<'_> for Cow<'_, [[u8; N]]> {
+    #[inline]
+    fn ser_len(&self) -> usize {
+        mem::size_of::<u64>() + self.len() * N
+    }
+
+    #[inline]
+    fn ser<S: Serde + ?Sized>(&self, out: &mut S, start_idx: usize) -> usize {
+        let idx = out.ser_u64(start_idx, self.len() as u64);
+        out.ser_byte_slice(idx, self.as_ref().as_bytes())
     }
 }
 

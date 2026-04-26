@@ -8,14 +8,15 @@ use crate::file::block_integrity::{
     BLOCK_INTEGRITY_HEADER_SIZE, LWC_BLOCK_SPEC, max_payload_len, validate_block,
 };
 use crate::file::cow_file::{BlockID, COW_FILE_PAGE_SIZE};
+use crate::layout;
 use crate::lwc::{LwcData, LwcNullBitmap};
 use crate::quiescent::QuiescentGuard;
 use crate::serde::{Ser, Serde};
 use crate::value::{Val, ValKind};
-use bytemuck::{Pod, Zeroable};
 use error_stack::{Report, ResultExt};
 use std::mem;
 use std::sync::Arc;
+use zerocopy_derive::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 /// Size in bytes of one validated persisted LWC payload, excluding the shared block envelope.
 pub const LWC_BLOCK_PAYLOAD_SIZE: usize = max_payload_len(COW_FILE_PAGE_SIZE);
@@ -87,7 +88,7 @@ fn persisted_lwc_payload_error(
 /// ```
 ///
 #[repr(C)]
-#[derive(Clone, Copy)]
+#[derive(Clone, FromBytes, IntoBytes, KnownLayout, Immutable)]
 pub struct LwcBlock {
     // The conversion from raw bytes to payload view is not endianness-safe for
     // arbitrary external input. Persisted callers must validate the outer page
@@ -96,18 +97,12 @@ pub struct LwcBlock {
     pub body: [u8; LWC_BLOCK_PAYLOAD_SIZE - mem::size_of::<LwcBlockHeader>()],
 }
 
-// SAFETY: `LwcBlock` is `repr(C)` and consists only of byte-array based fields.
-// Any bit pattern is valid and there is no interior mutability or drop glue.
-unsafe impl Zeroable for LwcBlock {}
-// SAFETY: same reasoning as above; plain immutable byte data layout.
-unsafe impl Pod for LwcBlock {}
-
 impl LwcBlock {
     pub const BODY_SIZE: usize = LWC_BLOCK_PAYLOAD_SIZE - mem::size_of::<LwcBlockHeader>();
 
     #[inline]
     pub fn try_from_bytes(input: &[u8]) -> Result<&Self> {
-        let block = bytemuck::try_from_bytes::<Self>(input).map_err(|_| {
+        let block = layout::try_ref_from_bytes::<Self>(input).map_err(|_| {
             invalid_lwc_payload(format!(
                 "LWC block payload has invalid length {}, expected {}",
                 input.len(),
@@ -121,7 +116,7 @@ impl LwcBlock {
     #[inline]
     pub fn try_from_bytes_mut(input: &mut [u8]) -> Result<&mut Self> {
         let input_len = input.len();
-        bytemuck::try_from_bytes_mut::<Self>(input).map_err(|_| {
+        layout::try_mut_from_bytes::<Self>(input).map_err(|_| {
             invalid_lwc_payload(format!(
                 "mutable LWC block payload has invalid length {input_len}, expected {LWC_BLOCK_PAYLOAD_SIZE}"
             ))
@@ -164,7 +159,7 @@ impl LwcBlock {
             )));
         }
         let raw = &self.body[..end_idx];
-        let offsets = bytemuck::cast_slice::<u8, [u8; 2]>(raw);
+        let offsets = layout::slice_from_bytes::<[u8; 2]>(raw);
         Ok(ColOffsets {
             data_start: end_idx,
             offsets,
@@ -483,7 +478,7 @@ const _: () = assert!(mem::size_of::<LwcBlock>() == LWC_BLOCK_PAYLOAD_SIZE);
 /// The fields are all defined as byte array
 /// to avoid endianess mistakes in serialization and deserialization.
 #[repr(C)]
-#[derive(Clone, Copy, Pod, Zeroable)]
+#[derive(Clone, FromBytes, IntoBytes, KnownLayout, Immutable)]
 pub struct LwcBlockHeader {
     /// Canonical row-shape fingerprint sourced from column-block index shape.
     row_shape_fingerprint: [u8; 16],
@@ -641,7 +636,7 @@ mod tests {
         let mut header_vec = vec![0u8; page.header.ser_len()];
         let ser_idx = page.header.ser(&mut header_vec[..], 0);
         assert!(ser_idx == header_vec.len());
-        assert_eq!(&header_vec, bytemuck::bytes_of(&page.header));
+        assert_eq!(&header_vec, layout::bytes_of(&page.header));
     }
 
     #[test]

@@ -1,5 +1,5 @@
 use crate::index::btree::KeyHeadInt;
-use bytemuck::{Pod, Zeroable};
+use zerocopy_derive::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 pub const BTREE_HINTS_LEN: usize = 8;
 
@@ -18,7 +18,7 @@ pub const BTREE_HINTS_LEN: usize = 8;
 /// Find the position i where for all j <= i, hint[j] < head(key).
 /// If key is 1410, hint[0] is picked.
 /// If key is 1800, hint[1] is picked.
-#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+#[derive(Debug, Clone, FromBytes, IntoBytes, KnownLayout, Immutable)]
 #[repr(C, align(32))]
 pub struct BTreeHints([[u8; 4]; BTREE_HINTS_LEN]);
 
@@ -97,10 +97,11 @@ fn search_hints_scalar(hints: &[u32; 8], key_head: u32) -> (usize, usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use zerocopy::FromZeros as _;
 
     #[test]
     fn test_btree_hints_store_little_endian_heads() {
-        let mut hints = BTreeHints::zeroed();
+        let mut hints = BTreeHints::new_zeroed();
         hints.update(3, 0x0102_0304);
 
         assert_eq!(hints.0[3], 0x0102_0304u32.to_le_bytes());

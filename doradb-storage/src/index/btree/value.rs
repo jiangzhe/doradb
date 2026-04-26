@@ -1,9 +1,9 @@
 use crate::buffer::page::{INVALID_PAGE_ID, PageID};
 use crate::index::util::Maskable;
 use crate::row::INVALID_ROW_ID;
-use bytemuck::{Pod, Zeroable};
 use std::mem;
 use std::ops::Deref;
+use zerocopy_derive::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 /// BTreeValue is the value type stored in leaf node.
 /// In branch node, the value type is always page id,
@@ -44,7 +44,21 @@ pub trait BTreeValuePackable: BTreeValue {
 
 /// U64 value type to support both page id in branch node
 /// and row id in leaf node.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Pod, Zeroable)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    FromBytes,
+    IntoBytes,
+    KnownLayout,
+    Immutable,
+)]
 #[repr(transparent)]
 pub struct BTreeU64(u64);
 
@@ -135,7 +149,21 @@ impl BTreeValuePackable for BTreeU64 {
 
 /// U8 value type to support non-unique-index.
 /// Only one bit is used for delete flag.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Pod, Zeroable)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    FromBytes,
+    IntoBytes,
+    KnownLayout,
+    Immutable,
+)]
 #[repr(transparent)]
 pub struct BTreeByte(u8);
 

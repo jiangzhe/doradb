@@ -2,8 +2,10 @@
 //!
 //! Current implementation only support bits=1, 2, 4, 8, 16, 32.
 
+use crate::layout;
 use crate::lwc::{LwcPrimitiveData, SortedPosition};
 use std::mem;
+use zerocopy::IntoBytes;
 
 /// Data type that supports bitpacking.
 /// constant ZERO is used to unify both bitpacking and FOR+bitpacking.
@@ -631,7 +633,7 @@ pub fn b16_pack<T: BitPackable>(input: &[T], res: &mut [u8]) {
 pub fn for_b16_pack<T: BitPackable>(input: &[T], min: T, res: &mut [u8]) {
     debug_assert!(res.len() >= input.len() * 2);
     // convert slice of u8 to slice of u16(unaligned) for better auto-vectorization.
-    let res = bytemuck::cast_slice_mut::<u8, [u8; 2]>(&mut res[..input.len() * 2]);
+    let res = layout::slice_from_bytes_mut::<[u8; 2]>(&mut res[..input.len() * 2]);
     input.iter().zip(res).for_each(|(src, tgt)| {
         let val = src.sub_to_u16(min);
         *tgt = val.to_le_bytes();
@@ -650,7 +652,7 @@ pub fn b16_unpack<T: BitPackable>(input: &[u8], res: &mut [T]) {
 #[inline]
 pub fn for_b16_unpack<T: BitPackable>(input: &[u8], min: T, res: &mut [T]) {
     debug_assert!(input.len() >= res.len() * 2);
-    let input = bytemuck::cast_slice::<u8, [u8; 2]>(&input[..res.len() * 2]);
+    let input = layout::slice_from_bytes::<[u8; 2]>(&input[..res.len() * 2]);
     input.iter().zip(res).for_each(|(src, tgt)| {
         let delta = u16::from_le_bytes(*src);
         *tgt = min.add_from_u16(delta);
@@ -660,7 +662,7 @@ pub fn for_b16_unpack<T: BitPackable>(input: &[u8], min: T, res: &mut [T]) {
 #[inline]
 pub fn for_b16_unpack_extend<T: BitPackable, E: Extend<T>>(input: &[u8], min: T, res: &mut E) {
     debug_assert!(input.len().is_multiple_of(2));
-    let input = bytemuck::cast_slice::<u8, [u8; 2]>(input);
+    let input = layout::slice_from_bytes::<[u8; 2]>(input);
     res.extend(input.iter().map(|src| {
         let delta = u16::from_le_bytes(*src);
         min.add_from_u16(delta)
@@ -679,7 +681,7 @@ pub fn b32_pack<T: BitPackable>(input: &[T], res: &mut [u8]) {
 #[inline]
 pub fn for_b32_pack<T: BitPackable>(input: &[T], min: T, res: &mut [u8]) {
     debug_assert!(res.len() >= input.len() * 4);
-    let res = bytemuck::cast_slice_mut::<u8, [u8; 4]>(&mut res[..input.len() * 4]);
+    let res = layout::slice_from_bytes_mut::<[u8; 4]>(&mut res[..input.len() * 4]);
     input.iter().zip(res).for_each(|(src, tgt)| {
         let val = src.sub_to_u32(min);
         *tgt = val.to_le_bytes();
@@ -698,7 +700,7 @@ pub fn b32_unpack<T: BitPackable>(input: &[u8], res: &mut [T]) {
 #[inline]
 pub fn for_b32_unpack<T: BitPackable>(input: &[u8], min: T, res: &mut [T]) {
     debug_assert!(input.len() >= res.len() * 4);
-    let input = bytemuck::cast_slice::<u8, [u8; 4]>(&input[..res.len() * 4]);
+    let input = layout::slice_from_bytes::<[u8; 4]>(&input[..res.len() * 4]);
     input.iter().zip(res).for_each(|(src, tgt)| {
         let delta = u32::from_le_bytes(*src);
         *tgt = min.add_from_u32(delta);
@@ -708,7 +710,7 @@ pub fn for_b32_unpack<T: BitPackable>(input: &[u8], min: T, res: &mut [T]) {
 #[inline]
 pub fn for_b32_unpack_extend<T: BitPackable, E: Extend<T>>(input: &[u8], min: T, res: &mut E) {
     debug_assert!(input.len().is_multiple_of(4));
-    let input = bytemuck::cast_slice::<u8, [u8; 4]>(input);
+    let input = layout::slice_from_bytes::<[u8; 4]>(input);
     res.extend(input.iter().map(|src| {
         let delta = u32::from_le_bytes(*src);
         min.add_from_u32(delta)
@@ -909,7 +911,7 @@ impl<'a, T: BitPackable> LwcPrimitiveData for ForBitpacking16<'a, T> {
 
     #[inline]
     fn extend_to<E: Extend<Self::Value>>(&self, target: &mut E) {
-        let input = bytemuck::cast_slice::<[u8; 2], u8>(self.data);
+        let input = self.data.as_bytes();
         for_b16_unpack_extend(input, self.min, target);
     }
 
@@ -985,7 +987,7 @@ impl<'a, T: BitPackable> LwcPrimitiveData for ForBitpacking32<'a, T> {
 
     #[inline]
     fn extend_to<E: Extend<Self::Value>>(&self, target: &mut E) {
-        let input = bytemuck::cast_slice::<[u8; 4], u8>(self.data);
+        let input = self.data.as_bytes();
         for_b32_unpack_extend(input, self.min, target);
     }
 
