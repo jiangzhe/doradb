@@ -503,7 +503,12 @@ impl LogPartition {
             return Ok(cts);
         }
         let waiter = waiter.expect("waiter should exist when wait_sync");
-        if let Err(err) = waiter.wait_result().await.map_err(Error::from) {
+        if let Err(err) = waiter.wait_result().await.map_err(|report| {
+            Error::from_completion_report(
+                report,
+                format!("wait for redo group commit: commit_ts={cts}"),
+            )
+        }) {
             if let Some(s) = session.take() {
                 s.rollback();
             }
@@ -656,6 +661,7 @@ impl SyncGroup {
         self.completion
             .complete(Err(CompletionErrorKind::report_fatal(
                 *err.current_context(),
+                "fail redo group commit waiters",
             )));
         for trx in mem::take(&mut self.trx_list) {
             trx.abort();
@@ -1149,7 +1155,7 @@ mod tests {
     use crate::catalog::tests::table2;
     use crate::conf::{EngineConfig, EvictableBufferPoolConfig, TrxSysConfig};
     use crate::engine::{Engine, EngineRef};
-    use crate::error::CompletionErrorKind;
+    use crate::error::{CompletionErrorKind, FatalError};
     use crate::file::{FileSyncKind, FileSyncOp, FileSyncTestHook, set_file_sync_test_hook};
     use crate::io::{
         IOKind, StorageBackendOp, StorageBackendTestHook, install_storage_backend_test_hook,
@@ -1370,18 +1376,22 @@ mod tests {
         })
     }
 
-    fn assert_propagated_completion_fatal<T: std::fmt::Debug>(res: &Result<T>) {
+    fn assert_propagated_completion_fatal<T: std::fmt::Debug>(
+        res: &Result<T>,
+        expected: FatalError,
+    ) {
         let err = match res {
             Ok(value) => panic!("expected propagated completion failure, got {value:?}"),
             Err(err) => err,
         };
         assert_eq!(
             err.completion_error(),
-            Some(CompletionErrorKind::Fatal),
+            Some(CompletionErrorKind::Fatal(expected)),
             "{err:?}"
         );
         let report = format!("{err:?}");
         assert!(report.contains("propagate from other threads"), "{report}");
+        assert!(report.contains("wait for redo group commit"), "{report}");
     }
 
     async fn build_redo_test_engine(log_file_stem: &str, log_sync: LogSync) -> (TempDir, Engine) {
@@ -1675,8 +1685,8 @@ mod tests {
 
             let res1 = commit1.join().unwrap();
             let res2 = commit2.join().unwrap();
-            assert_propagated_completion_fatal(&res1);
-            assert_propagated_completion_fatal(&res2);
+            assert_propagated_completion_fatal(&res1, FatalError::RedoWrite);
+            assert_propagated_completion_fatal(&res2, FatalError::RedoWrite);
             assert!(
                 engine
                     .trx_sys
@@ -1722,8 +1732,8 @@ mod tests {
 
         let res1 = commit1.join().unwrap();
         let res2 = commit2.join().unwrap();
-        assert_propagated_completion_fatal(&res1);
-        assert_propagated_completion_fatal(&res2);
+        assert_propagated_completion_fatal(&res1, FatalError::RedoSync);
+        assert_propagated_completion_fatal(&res2, FatalError::RedoSync);
         assert!(
             engine
                 .trx_sys

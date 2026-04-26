@@ -132,8 +132,12 @@ mod tests {
 
     #[test]
     fn test_completion_report_unexpected_eof_reports_io() {
-        let report = CompletionErrorKind::report_unexpected_eof(17, 4096);
-        assert_eq!(*report.current_context(), CompletionErrorKind::Io);
+        let report =
+            CompletionErrorKind::report_unexpected_eof(17, 4096, "test completion short read");
+        assert_eq!(
+            *report.current_context(),
+            CompletionErrorKind::Io(IoErrorKind::UnexpectedEof)
+        );
         assert_eq!(
             report.downcast_ref::<IoError>().copied().map(IoError::kind),
             Some(IoErrorKind::UnexpectedEof)
@@ -142,6 +146,7 @@ mod tests {
         assert!(output.contains("unexpected eof"));
         assert!(output.contains("actual_bytes=17"));
         assert!(output.contains("expected_bytes=4096"));
+        assert!(output.contains("test completion short read"));
     }
 
     #[test]
@@ -149,13 +154,18 @@ mod tests {
         let err = io::Error::new(IoErrorKind::PermissionDenied, "completion io denied");
         let message = format!("{}", err);
 
-        let report = CompletionErrorKind::report_io(err);
+        let report = CompletionErrorKind::report_io(err, "test completion io");
 
-        assert_eq!(*report.current_context(), CompletionErrorKind::Io);
+        assert_eq!(
+            *report.current_context(),
+            CompletionErrorKind::Io(IoErrorKind::PermissionDenied)
+        );
         assert_eq!(
             report.downcast_ref::<IoError>().copied().map(IoError::kind),
             Some(IoErrorKind::PermissionDenied)
         );
-        assert!(format!("{report:?}").contains(&message));
+        let output = format!("{report:?}");
+        assert!(output.contains(&message));
+        assert!(output.contains("test completion io"));
     }
 }

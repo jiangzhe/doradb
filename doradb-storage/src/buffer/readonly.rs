@@ -765,7 +765,13 @@ impl ReadSubmission {
                         self.key.block_id,
                     ) {
                         drop(self.reservation.take());
-                        self.complete_inflight_once(Err(err.into_completion_report()));
+                        self.complete_inflight_once(Err(CompletionErrorKind::report_error(
+                            err,
+                            format!(
+                                "validate readonly block load: file={}, key={:?}",
+                                validation.file_kind, self.key
+                            ),
+                        )));
                         return IOKind::Read;
                     }
                 }
@@ -774,16 +780,26 @@ impl ReadSubmission {
                 );
                 match reservation.publish() {
                     Ok(page_id) => Ok(page_id),
-                    Err(err) => Err(err.into_completion_report()),
+                    Err(err) => Err(CompletionErrorKind::report_error(
+                        err,
+                        format!("publish readonly block load: key={:?}", self.key),
+                    )),
                 }
             }
             Ok(len) => {
                 drop(self.reservation.take());
-                Err(CompletionErrorKind::report_unexpected_eof(len, PAGE_SIZE))
+                Err(CompletionErrorKind::report_unexpected_eof(
+                    len,
+                    PAGE_SIZE,
+                    format!("complete readonly block load: key={:?}", self.key),
+                ))
             }
             Err(err) => {
                 drop(self.reservation.take());
-                Err(CompletionErrorKind::report_io(err))
+                Err(CompletionErrorKind::report_io(
+                    err,
+                    format!("complete readonly block load: key={:?}", self.key),
+                ))
             }
         };
         self.pool.stats.add_completed_reads(1);
@@ -813,6 +829,10 @@ impl Drop for ReadSubmission {
         self.pool.stats.add_read_errors(1);
         self.complete_inflight_once(Err(CompletionErrorKind::report_internal(
             InternalError::CompletionDropped,
+            format!(
+                "drop readonly read submission before completion: key={:?}",
+                self.key
+            ),
         )));
     }
 }
@@ -1150,7 +1170,10 @@ impl QuiescentGuard<ReadonlyBufferPool> {
                         self.complete_inflight_load(
                             key,
                             &inflight,
-                            Err(err.into_completion_report()),
+                            Err(CompletionErrorKind::report_error(
+                                err,
+                                format!("reserve readonly block load frame: key={key:?}"),
+                            )),
                         );
                     }
                 }
@@ -1179,7 +1202,12 @@ impl QuiescentGuard<ReadonlyBufferPool> {
         inflight
             .wait_result()
             .await
-            .map_err(Error::from)
+            .map_err(|report| {
+                Error::from_completion_report(
+                    report,
+                    format!("wait for readonly block load: key={key:?}"),
+                )
+            })
             .map(|frame_id| (frame_id, false))
     }
 
@@ -1210,7 +1238,14 @@ impl QuiescentGuard<ReadonlyBufferPool> {
         inflight
             .wait_result()
             .await
-            .map_err(Error::from)
+            .map_err(|report| {
+                Error::from_completion_report(
+                    report,
+                    format!(
+                        "wait for validated readonly block load: file={file_kind}, key={key:?}"
+                    ),
+                )
+            })
             .map(|frame_id| (frame_id, false))
     }
 
@@ -1274,7 +1309,7 @@ pub(crate) mod tests {
     use crate::catalog::TableID;
     use crate::catalog::{ColumnAttributes, ColumnSpec, TableMetadata, USER_OBJ_ID_START};
     use crate::conf::{EngineConfig, EvictableBufferPoolConfig, FileSystemConfig, TrxSysConfig};
-    use crate::error::{CompletionErrorKind, Error, FileKind, ResourceError};
+    use crate::error::{CompletionErrorKind, Error, FileKind, LifecycleError, ResourceError};
     use crate::file::block_integrity::{
         BLOCK_INTEGRITY_HEADER_SIZE, COLUMN_BLOCK_INDEX_BLOCK_SPEC,
         COLUMN_DELETION_BLOB_BLOCK_SPEC, LWC_BLOCK_SPEC, max_payload_len, write_block_checksum,
@@ -1326,12 +1361,13 @@ pub(crate) mod tests {
     }
 
     fn assert_completion_data_integrity(err: Error) {
-        assert_eq!(
+        assert!(matches!(
             err.completion_error(),
-            Some(CompletionErrorKind::DataIntegrity)
-        );
+            Some(CompletionErrorKind::DataIntegrity(_))
+        ));
         let report = format!("{err:?}");
         assert!(report.contains("propagate from other threads"), "{report}");
+        assert!(report.contains("wait for"), "{report}");
     }
 
     fn frame_page_bytes(cap: usize) -> usize {
@@ -2367,7 +2403,10 @@ pub(crate) mod tests {
                         Err(err) => global.complete_inflight_load(
                             key,
                             &inflight_for_waiter,
-                            Err(err.into_completion_report()),
+                            Err(CompletionErrorKind::report_error(
+                                err,
+                                format!("reserve readonly test block load frame: key={key:?}"),
+                            )),
                         ),
                     }
                 });
@@ -2391,7 +2430,10 @@ pub(crate) mod tests {
             teardown.join().unwrap();
             assert!(dropped.load(Ordering::SeqCst));
             let report = inflight.wait_result().await.unwrap_err();
-            assert_eq!(*report.current_context(), CompletionErrorKind::Lifecycle);
+            assert_eq!(
+                *report.current_context(),
+                CompletionErrorKind::Lifecycle(LifecycleError::Shutdown)
+            );
         });
     }
 
@@ -2435,18 +2477,14 @@ pub(crate) mod tests {
             smol::Timer::after(Duration::from_millis(10)).await;
             read_hook.release();
 
-            assert!(
-                waiter1
-                    .await
-                    .as_ref()
-                    .is_err_and(|err| err.completion_error() == Some(CompletionErrorKind::Io))
-            );
-            assert!(
-                waiter2
-                    .await
-                    .as_ref()
-                    .is_err_and(|err| err.completion_error() == Some(CompletionErrorKind::Io))
-            );
+            assert!(waiter1.await.as_ref().is_err_and(|err| matches!(
+                err.completion_error(),
+                Some(CompletionErrorKind::Io(_))
+            )));
+            assert!(waiter2.await.as_ref().is_err_and(|err| matches!(
+                err.completion_error(),
+                Some(CompletionErrorKind::Io(_))
+            )));
             assert_eq!(read_hook.call_count(), 1);
             assert_eq!(global.allocated(), 0);
             assert_eq!(global.try_get_frame_id(&key), None);

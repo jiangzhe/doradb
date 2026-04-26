@@ -738,8 +738,12 @@ pub mod tests {
 
     fn assert_catalog_data_integrity(err: Error) {
         let report = format!("{err:?}");
-        if err.completion_error() == Some(CompletionErrorKind::DataIntegrity) {
+        if matches!(
+            err.completion_error(),
+            Some(CompletionErrorKind::DataIntegrity(_))
+        ) {
             assert!(report.contains("propagate from other threads"), "{report}");
+            assert!(report.contains("wait for"), "{report}");
         } else {
             assert!(err.data_integrity_error().is_some(), "{report}");
         }

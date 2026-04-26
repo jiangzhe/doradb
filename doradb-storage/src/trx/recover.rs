@@ -719,8 +719,9 @@ mod tests {
         expected: DataIntegrityError,
     ) {
         let report = format!("{err:?}");
-        if err.completion_error() == Some(CompletionErrorKind::DataIntegrity) {
+        if err.completion_error() == Some(CompletionErrorKind::DataIntegrity(expected)) {
             assert!(report.contains("propagate from other threads"), "{report}");
+            assert!(report.contains("wait for"), "{report}");
             return;
         }
         assert_eq!(err.data_integrity_error(), Some(expected), "{report}");

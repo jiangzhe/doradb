@@ -39,7 +39,7 @@ use crate::trx::{ActiveTrx, MAX_SNAPSHOT_TS, TrxID};
 use crate::value::Val;
 use std::cell::Cell;
 use std::fs::OpenOptions;
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
@@ -77,8 +77,9 @@ fn assert_table_data_integrity(
     expected: DataIntegrityError,
 ) {
     let report = format!("{err:?}");
-    if err.completion_error() == Some(CompletionErrorKind::DataIntegrity) {
+    if err.completion_error() == Some(CompletionErrorKind::DataIntegrity(expected)) {
         assert!(report.contains("propagate from other threads"), "{report}");
+        assert!(report.contains("wait for"), "{report}");
         return;
     }
     assert_eq!(err.data_integrity_error(), Some(expected), "{report}");
@@ -169,7 +170,7 @@ impl StorageBackendTestHook for FailingPageReadHook {
 
     fn on_complete(&self, op: StorageBackendOp, res: &mut StdIoResult<usize>) {
         if self.matches(op) {
-            *res = Err(std::io::Error::from_raw_os_error(self.errno));
+            *res = Err(io::Error::from_raw_os_error(self.errno));
         }
     }
 }
@@ -5536,6 +5537,7 @@ fn test_mvcc_insert_surfaces_cached_insert_page_reload_error() {
             libc::EIO,
         ));
         let _hook = install_storage_backend_test_hook(read_hook.clone());
+        let expected_error_kind = io::Error::from_raw_os_error(libc::EIO).kind();
 
         let trx = session.try_begin_trx().unwrap().unwrap();
         let mut stmt = trx.start_stmt();
@@ -5549,7 +5551,8 @@ fn test_mvcc_insert_surfaces_cached_insert_page_reload_error() {
         trx.rollback().await.unwrap();
         assert!(
             res.as_ref()
-                .is_err_and(|err| err.completion_error() == Some(CompletionErrorKind::Io)),
+                .is_err_and(|err| err.completion_error()
+                    == Some(CompletionErrorKind::Io(expected_error_kind))),
             "expected insert-page reload failure, got {res:?}"
         );
         assert!(

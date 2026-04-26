@@ -314,50 +314,129 @@ impl From<IoErrorKind> for IoError {
     }
 }
 
-/// Fieldless cross-thread completion transport errors.
+/// Cross-thread completion transport errors preserving their exact cause.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ThisError)]
 pub(crate) enum CompletionErrorKind {
-    #[error("io error")]
-    Io,
+    #[error("io error: {0:?}")]
+    Io(IoErrorKind),
     #[error("send error")]
     Send,
-    #[error("data integrity error")]
-    DataIntegrity,
-    #[error("storage lifecycle error")]
-    Lifecycle,
-    #[error("fatal storage error")]
-    Fatal,
-    #[error("internal completion error")]
-    Internal,
+    #[error("configuration error: {0}")]
+    Config(ConfigError),
+    #[error("operation error: {0}")]
+    Operation(OperationError),
+    #[error("resource exhausted: {0}")]
+    Resource(ResourceError),
+    #[error("data integrity error: {0}")]
+    DataIntegrity(DataIntegrityError),
+    #[error("storage lifecycle error: {0}")]
+    Lifecycle(LifecycleError),
+    #[error("fatal storage error: {0}")]
+    Fatal(FatalError),
+    #[error("internal completion error: {0}")]
+    Internal(InternalError),
 }
 
 impl CompletionErrorKind {
     #[inline]
-    pub(crate) fn report_io(err: io::Error) -> Report<Self> {
-        IoError::report(err).change_context(Self::Io)
+    pub(crate) fn report_io(err: io::Error, message: impl Into<String>) -> Report<Self> {
+        let kind = err.kind();
+        Report::new(IoError::from(kind))
+            .change_context(Self::Io(kind))
+            .attach(format!("{err}"))
+            .attach(message.into())
     }
 
     #[inline]
     pub(crate) fn report_unexpected_eof(
         actual_bytes: usize,
         expected_bytes: usize,
+        message: impl Into<String>,
     ) -> Report<Self> {
-        IoError::report_unexpected_eof(actual_bytes, expected_bytes).change_context(Self::Io)
+        Report::new(IoError::from(IoErrorKind::UnexpectedEof))
+            .change_context(Self::Io(IoErrorKind::UnexpectedEof))
+            .attach(format!(
+                "unexpected eof: actual_bytes={actual_bytes}, expected_bytes={expected_bytes}"
+            ))
+            .attach(message.into())
     }
 
     #[inline]
     pub(crate) fn report_send(message: impl Into<String>) -> Report<Self> {
-        IoError::report_send(message).change_context(Self::Send)
+        Report::new(IoError::from(IoErrorKind::BrokenPipe))
+            .change_context(Self::Send)
+            .attach(message.into())
     }
 
     #[inline]
-    pub(crate) fn report_fatal(reason: FatalError) -> Report<Self> {
-        Report::new(reason).change_context(Self::Fatal)
+    pub(crate) fn report_fatal(reason: FatalError, message: impl Into<String>) -> Report<Self> {
+        Report::new(reason)
+            .change_context(Self::Fatal(reason))
+            .attach(message.into())
     }
 
     #[inline]
-    pub(crate) fn report_internal(reason: InternalError) -> Report<Self> {
-        Report::new(reason).change_context(Self::Internal)
+    pub(crate) fn report_internal(
+        reason: InternalError,
+        message: impl Into<String>,
+    ) -> Report<Self> {
+        Report::new(reason)
+            .change_context(Self::Internal(reason))
+            .attach(message.into())
+    }
+
+    #[inline]
+    pub(crate) fn report_error(err: Error, message: impl Into<String>) -> Report<Self> {
+        let kind = Self::from_error(&err);
+        err.into_report()
+            .change_context(kind)
+            .attach(message.into())
+    }
+
+    #[inline]
+    fn from_error(err: &Error) -> Self {
+        if let Some(kind) = err.completion_error() {
+            return kind;
+        }
+        if let Some(reason) = err.downcast_ref::<IoError>().copied() {
+            return Self::Io(reason.kind());
+        }
+        if let Some(reason) = err.downcast_ref::<ConfigError>().copied() {
+            return Self::Config(reason);
+        }
+        if let Some(reason) = err.downcast_ref::<OperationError>().copied() {
+            return Self::Operation(reason);
+        }
+        if let Some(reason) = err.downcast_ref::<ResourceError>().copied() {
+            return Self::Resource(reason);
+        }
+        if let Some(reason) = err.downcast_ref::<DataIntegrityError>().copied() {
+            return Self::DataIntegrity(reason);
+        }
+        if let Some(reason) = err.downcast_ref::<LifecycleError>().copied() {
+            return Self::Lifecycle(reason);
+        }
+        if let Some(reason) = err.downcast_ref::<FatalError>().copied() {
+            return Self::Fatal(reason);
+        }
+        if let Some(reason) = err.downcast_ref::<InternalError>().copied() {
+            return Self::Internal(reason);
+        }
+        Self::Internal(InternalError::Generic)
+    }
+
+    #[inline]
+    fn error_kind(self) -> ErrorKind {
+        match self {
+            CompletionErrorKind::Io(_) | CompletionErrorKind::Send => ErrorKind::Io,
+            CompletionErrorKind::Config(_) => ErrorKind::Config,
+            CompletionErrorKind::Operation(_) => ErrorKind::Operation,
+            CompletionErrorKind::Resource(_) => ErrorKind::Resource,
+            CompletionErrorKind::DataIntegrity(_) => ErrorKind::DataIntegrity,
+            CompletionErrorKind::Lifecycle(_) => ErrorKind::Lifecycle,
+            CompletionErrorKind::Fatal(_) => ErrorKind::Fatal,
+            CompletionErrorKind::Internal(_) => ErrorKind::Internal,
+        }
     }
 }
 
@@ -468,34 +547,8 @@ impl Error {
     }
 
     #[inline]
-    pub(crate) fn into_completion_report(self) -> Report<CompletionErrorKind> {
-        let kind = self.completion_error_kind();
-        self.into_report().change_context(kind)
-    }
-
-    #[inline]
     pub(crate) fn downcast_ref<T: Send + Sync + 'static>(&self) -> Option<&T> {
         self.0.downcast_ref::<T>()
-    }
-
-    #[inline]
-    fn completion_error_kind(&self) -> CompletionErrorKind {
-        if let Some(kind) = self.completion_error() {
-            return kind;
-        }
-        if self.is_kind(ErrorKind::Io) {
-            return CompletionErrorKind::Io;
-        }
-        if self.is_kind(ErrorKind::DataIntegrity) {
-            return CompletionErrorKind::DataIntegrity;
-        }
-        if self.is_kind(ErrorKind::Lifecycle) {
-            return CompletionErrorKind::Lifecycle;
-        }
-        if self.is_kind(ErrorKind::Fatal) {
-            return CompletionErrorKind::Fatal;
-        }
-        CompletionErrorKind::Internal
     }
 
     #[inline]
@@ -521,6 +574,15 @@ impl Error {
     #[inline]
     pub(crate) fn completion_error(&self) -> Option<CompletionErrorKind> {
         self.downcast_ref::<CompletionErrorKind>().copied()
+    }
+
+    #[inline]
+    pub(crate) fn from_completion_report(
+        report: Report<CompletionErrorKind>,
+        message: impl Into<String>,
+    ) -> Self {
+        let kind = report.current_context().error_kind();
+        Error(report.change_context(kind).attach(message.into()))
     }
 
     #[inline]
@@ -612,20 +674,6 @@ impl From<Report<InternalError>> for Error {
     #[inline]
     fn from(report: Report<InternalError>) -> Self {
         Error(report.change_context(ErrorKind::Internal))
-    }
-}
-
-impl From<Report<CompletionErrorKind>> for Error {
-    #[inline]
-    fn from(report: Report<CompletionErrorKind>) -> Self {
-        let kind = match report.current_context() {
-            CompletionErrorKind::Io | CompletionErrorKind::Send => ErrorKind::Io,
-            CompletionErrorKind::DataIntegrity => ErrorKind::DataIntegrity,
-            CompletionErrorKind::Lifecycle => ErrorKind::Lifecycle,
-            CompletionErrorKind::Fatal => ErrorKind::Fatal,
-            CompletionErrorKind::Internal => ErrorKind::Internal,
-        };
-        Error(report.change_context(kind))
     }
 }
 

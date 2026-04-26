@@ -693,7 +693,12 @@ impl WriteSubmission {
             completion,
         };
         (fio, async move {
-            waiter.wait_result().await.map_err(Error::from)
+            waiter.wait_result().await.map_err(|report| {
+                Error::from_completion_report(
+                    report,
+                    format!("wait for table file background write: key={key:?}, offset={offset}"),
+                )
+            })
         })
     }
 
@@ -826,7 +831,6 @@ impl TableFsStateMachine {
     ) -> IOKind {
         match sub {
             TableFsSubmission::Write(mut sub) => {
-                let _ = sub.key;
                 let expected_len = sub.operation.len();
                 let buf = sub
                     .operation
@@ -842,14 +846,17 @@ impl TableFsStateMachine {
                             Err(CompletionErrorKind::report_unexpected_eof(
                                 len,
                                 expected_len,
+                                format!("complete table file write: key={:?}", sub.key),
                             ))
                         };
                         sub.completion.complete(result);
                     }
                     Err(err) => {
                         drop(buf);
-                        sub.completion
-                            .complete(Err(CompletionErrorKind::report_io(err)));
+                        sub.completion.complete(Err(CompletionErrorKind::report_io(
+                            err,
+                            format!("complete table file write: key={:?}", sub.key),
+                        )));
                     }
                 }
                 IOKind::Write
@@ -1367,8 +1374,9 @@ mod tests {
 
             assert_eq!(kind, IOKind::Write);
             assert!(waiter.await.as_ref().is_err_and(|err| {
-                err.completion_error() == Some(CompletionErrorKind::Io)
+                err.completion_error() == Some(CompletionErrorKind::Io(IoErrorKind::UnexpectedEof))
                     && format!("{err:?}").contains("propagate from other threads")
+                    && format!("{err:?}").contains("wait for table file background write")
             }));
             drop(table_file);
             drop(fs);

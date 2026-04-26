@@ -220,7 +220,12 @@ impl EvictableBufferPool {
                 return Err(Report::new(LifecycleError::Shutdown).into());
             }
             DispatchAction::Wait(completion) => {
-                completion.wait_result().await.map_err(Error::from)?;
+                completion.wait_result().await.map_err(|report| {
+                    Error::from_completion_report(
+                        report,
+                        format!("wait for evict pool read: page_id={page_id}"),
+                    )
+                })?;
             }
             DispatchAction::WaitForLoad(listener) => {
                 listener.await;
@@ -237,7 +242,12 @@ impl EvictableBufferPool {
                     self.in_mem.load_ev.notify(1);
                     return Err(IoError::report_send("send evict pool read request").into());
                 }
-                completion.wait_result().await.map_err(Error::from)?;
+                completion.wait_result().await.map_err(|report| {
+                    Error::from_completion_report(
+                        report,
+                        format!("wait for dispatched evict pool read: page_id={page_id}"),
+                    )
+                })?;
             }
         }
         Ok(())
@@ -1213,22 +1223,33 @@ impl EvictReadSubmission {
     /// Short reads and IO errors drop the reservation so memory accounting is
     /// rolled back before waiters are released.
     pub(crate) fn complete(mut self, res: StdIoResult<usize>) -> IOKind {
+        let page_id = self.key;
         let result = match res {
             Ok(len) if len == PAGE_SIZE => {
                 let reservation = self.reservation.take().expect(
                     "evict read submission must still own its page reservation before publish",
                 );
-                (*reservation)
-                    .publish()
-                    .map_err(Error::into_completion_report)
+                (*reservation).publish().map_err(|err| {
+                    CompletionErrorKind::report_error(
+                        err,
+                        format!("publish evict pool read: page_id={page_id}"),
+                    )
+                })
             }
             Ok(len) => {
                 drop(self.reservation.take());
-                Err(CompletionErrorKind::report_unexpected_eof(len, PAGE_SIZE))
+                Err(CompletionErrorKind::report_unexpected_eof(
+                    len,
+                    PAGE_SIZE,
+                    format!("complete evict pool read: page_id={page_id}"),
+                ))
             }
             Err(err) => {
                 drop(self.reservation.take());
-                Err(CompletionErrorKind::report_io(err))
+                Err(CompletionErrorKind::report_io(
+                    err,
+                    format!("complete evict pool read: page_id={page_id}"),
+                ))
             }
         };
         self.stats.add_completed_reads(1);
@@ -1281,6 +1302,10 @@ impl Drop for EvictReadSubmission {
         self.stats.add_read_errors(1);
         self.complete_waiters(Err(CompletionErrorKind::report_internal(
             InternalError::CompletionDropped,
+            format!(
+                "drop evict read submission before completion: page_id={}",
+                self.key
+            ),
         )));
     }
 }
@@ -1394,7 +1419,12 @@ impl InflightIO {
                         completion
                             .wait_result()
                             .await
-                            .map_err(Error::from)
+                            .map_err(|report| {
+                                Error::from_completion_report(
+                                    report,
+                                    format!("wait for evict pool writeback: page_id={page_id}"),
+                                )
+                            })
                             .map(|_| ())?;
                     }
                     // In any other kind, we let caller retry.
@@ -1421,7 +1451,12 @@ impl InflightIO {
                 completion
                     .wait_result()
                     .await
-                    .map_err(Error::from)
+                    .map_err(|report| {
+                        Error::from_completion_report(
+                            report,
+                            format!("wait for evict pool writeback: page_id={page_id}"),
+                        )
+                    })
                     .map(|_| ())?;
             }
         }
@@ -1486,7 +1521,10 @@ impl InflightIO {
         };
         drop(page_guard);
         if let Some(completion) = completion {
-            completion.complete(Err(err.into_completion_report()));
+            completion.complete(Err(CompletionErrorKind::report_error(
+                err,
+                format!("fail evict pool writeback: page_id={page_id}"),
+            )));
         }
     }
 
@@ -1951,7 +1989,10 @@ pub(crate) mod tests {
             assert_eq!(kind, StorageIOKind::Write);
             assert_eq!(owner.arena.frame(page_id).kind(), FrameKind::Hot);
             let report = completion.wait_result().await.unwrap_err();
-            assert_eq!(*report.current_context(), CompletionErrorKind::Io);
+            assert_eq!(
+                *report.current_context(),
+                CompletionErrorKind::Io(io::Error::from_raw_os_error(libc::EIO).kind())
+            );
             assert_eq!(owner.inflight_io.writes.load(Ordering::Relaxed), 0);
             assert!(!owner.inflight_io.map.lock().contains_key(&page_id));
 
@@ -2077,7 +2118,10 @@ pub(crate) mod tests {
             );
             assert_eq!(kind, StorageIOKind::Write);
             let report = completion.wait_result().await.unwrap_err();
-            assert_eq!(*report.current_context(), CompletionErrorKind::Io);
+            assert_eq!(
+                *report.current_context(),
+                CompletionErrorKind::Io(io::Error::from_raw_os_error(libc::EIO).kind())
+            );
 
             assert_eq!(owner.arena.frame(page_id).kind(), FrameKind::Hot);
             assert!(
