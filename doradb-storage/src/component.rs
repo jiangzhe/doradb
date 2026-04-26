@@ -1,6 +1,7 @@
 use crate::buffer::{EvictableBufferPool, FixedBufferPool, ReadonlyBufferPool};
-use crate::error::{Error, Result};
+use crate::error::{Error, InternalError, Result};
 use crate::quiescent::{QuiescentBox, QuiescentGuard};
+use error_stack::Report;
 use std::any::{Any, TypeId};
 use std::collections::HashMap;
 use std::future::Future;
@@ -142,7 +143,9 @@ impl Shelf {
             .parts
             .insert(Self::key::<Up, Down>(), Box::new(provision));
         if old.is_some() {
-            return Err(Error::InvalidState);
+            return Err(Report::new(InternalError::ComponentShelfDuplicateProvision)
+                .attach(format!("edge={} -> {}", Up::NAME, Down::NAME))
+                .into());
         }
         Ok(())
     }
@@ -245,9 +248,11 @@ impl RegistryBuilder {
     #[inline]
     pub(crate) fn finish(mut self) -> Result<ComponentRegistry> {
         if !self.shelf.is_empty() {
-            return Err(Error::InvalidState);
+            return Err(Report::new(InternalError::ComponentShelfNotEmpty).into());
         }
-        self.registry.take().ok_or(Error::InvalidState)
+        self.registry
+            .take()
+            .ok_or_else(|| Report::new(InternalError::ComponentRegistryMissing).into())
     }
 }
 
@@ -294,7 +299,7 @@ impl ComponentRegistry {
         );
         let tid = TypeId::of::<C>();
         if self.access_map.contains_key(&tid) {
-            return Err(Error::EngineComponentAlreadyRegistered);
+            return Err(Error::engine_component_already_registered());
         }
 
         let owner = QuiescentBox::new(owned);
@@ -320,7 +325,7 @@ impl ComponentRegistry {
     #[inline]
     pub(crate) fn dependency<C: Component>(&self) -> Result<C::Access> {
         self.get::<C>()
-            .ok_or(Error::EngineComponentMissingDependency)
+            .ok_or(Error::engine_component_missing_dependency())
     }
 
     /// Run explicit component shutdown in reverse registration order.
@@ -572,14 +577,20 @@ mod tests {
         let mut registry = ComponentRegistry::new();
         registry.register::<ValueComponent>(7).unwrap();
         let err = registry.register::<ValueComponent>(11).unwrap_err();
-        assert!(matches!(err, Error::EngineComponentAlreadyRegistered));
+        assert_eq!(
+            err.report().downcast_ref::<InternalError>().copied(),
+            Some(InternalError::EngineComponentAlreadyRegistered)
+        );
     }
 
     #[test]
     fn test_component_registry_reports_missing_dependency() {
         let registry = ComponentRegistry::new();
         let err = registry.dependency::<ValueComponent>().unwrap_err();
-        assert!(matches!(err, Error::EngineComponentMissingDependency));
+        assert_eq!(
+            err.report().downcast_ref::<InternalError>().copied(),
+            Some(InternalError::EngineComponentMissingDependency)
+        );
     }
 
     #[test]
@@ -698,6 +709,9 @@ mod tests {
         let mut up = shelf.scope::<Upstream>();
         up.put::<Downstream>(7).unwrap();
         let err = up.put::<Downstream>(11).unwrap_err();
-        assert!(matches!(err, Error::InvalidState));
+        assert_eq!(
+            err.report().downcast_ref::<InternalError>().copied(),
+            Some(InternalError::ComponentShelfDuplicateProvision)
+        );
     }
 }

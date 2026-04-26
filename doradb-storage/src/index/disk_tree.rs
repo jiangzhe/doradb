@@ -12,7 +12,7 @@
 
 use crate::buffer::{PoolGuard, ReadonlyBlockGuard, ReadonlyBufferPool};
 use crate::catalog::{IndexSpec, TableMetadata};
-use crate::error::{BlockCorruptionCause, BlockKind, Error, FileKind, Result};
+use crate::error::{ConfigError, DataIntegrityError, Error, FileKind, InternalError, Result};
 use crate::file::SparseFile;
 use crate::file::block_integrity::{validate_block_checksum, write_block_checksum};
 use crate::file::cow_file::{BlockID, COW_FILE_PAGE_SIZE, MutableCowFile, SUPER_BLOCK_ID};
@@ -28,6 +28,7 @@ use crate::io::DirectBuf;
 use crate::quiescent::QuiescentGuard;
 use crate::row::RowID;
 use crate::value::{Val, ValKind, ValType};
+use error_stack::{Report, ResultExt};
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::marker::PhantomData;
@@ -40,6 +41,41 @@ pub(crate) const DISK_TREE_BLOCK_SIZE: usize = COW_FILE_PAGE_SIZE;
 const ROW_ID_SIZE: usize = mem::size_of::<RowID>();
 
 const _: () = assert!(DISK_TREE_BLOCK_SIZE == mem::size_of::<BTreeNode>());
+
+#[inline]
+fn invalid_index_spec(message: impl Into<String>) -> Error {
+    Report::new(ConfigError::InvalidIndexSpec)
+        .attach(message.into())
+        .into()
+}
+
+#[inline]
+fn secondary_index_kind_mismatch(message: impl Into<String>) -> Error {
+    Report::new(InternalError::SecondaryIndexKindMismatch)
+        .attach(message.into())
+        .into()
+}
+
+#[inline]
+fn disk_tree_rewrite_invariant(message: impl Into<String>) -> Error {
+    Report::new(InternalError::DiskTreeRewriteInvariant)
+        .attach(message.into())
+        .into()
+}
+
+#[inline]
+fn disk_tree_batch_order_invariant(message: impl Into<String>) -> Error {
+    Report::new(InternalError::DiskTreeBatchOrderInvariant)
+        .attach(message.into())
+        .into()
+}
+
+#[inline]
+fn invalid_payload(message: impl Into<String>) -> Error {
+    Report::new(DataIntegrityError::InvalidPayload)
+        .attach(message.into())
+        .into()
+}
 
 /// One unique DiskTree batch insertion item with an already-encoded key.
 pub(crate) struct UniqueDiskTreeEncodedPut<'a> {
@@ -363,9 +399,13 @@ impl DiskTreeSpec for UniqueDiskTreeSpec {
 
     #[inline]
     fn leaf_value(entry: &LogicalEntry) -> Result<Self::LeafValue> {
-        let row_id = entry.row_id.ok_or(Error::InvalidArgument)?;
+        let row_id = entry
+            .row_id
+            .ok_or_else(|| disk_tree_rewrite_invariant("unique leaf entry missing row id"))?;
         if row_id.is_deleted() {
-            return Err(Error::InvalidArgument);
+            return Err(disk_tree_rewrite_invariant(
+                "unique leaf entry row id is delete-marked",
+            ));
         }
         Ok(BTreeU64::from(row_id))
     }
@@ -393,7 +433,9 @@ impl DiskTreeSpec for UniqueDiskTreeSpec {
     ) -> Result<Vec<LogicalEntry>> {
         let mut map = BTreeMap::new();
         for entry in entries {
-            let row_id = entry.row_id.ok_or(Error::InvalidFormat)?;
+            let row_id = entry
+                .row_id
+                .ok_or_else(|| invalid_payload("unique DiskTree entry is missing row id"))?;
             map.insert(entry.key.clone(), row_id);
         }
         for op in operations {
@@ -407,7 +449,9 @@ impl DiskTreeSpec for UniqueDiskTreeSpec {
                     }
                 }
                 DiskTreeOperationKind::NonUniqueSetPresent(_) => {
-                    return Err(Error::InvalidArgument);
+                    return Err(disk_tree_rewrite_invariant(
+                        "unique DiskTree received non-unique operation",
+                    ));
                 }
             }
         }
@@ -440,7 +484,9 @@ impl DiskTreeSpec for NonUniqueDiskTreeSpec {
     #[inline]
     fn leaf_value(entry: &LogicalEntry) -> Result<Self::LeafValue> {
         if entry.row_id.is_some() {
-            return Err(Error::InvalidArgument);
+            return Err(disk_tree_rewrite_invariant(
+                "non-unique leaf entry unexpectedly has row id",
+            ));
         }
         Ok(BTreeNil)
     }
@@ -465,7 +511,9 @@ impl DiskTreeSpec for NonUniqueDiskTreeSpec {
         let mut set = BTreeSet::new();
         for entry in entries {
             if entry.row_id.is_some() {
-                return Err(Error::InvalidFormat);
+                return Err(invalid_payload(
+                    "non-unique DiskTree entry unexpectedly has row id",
+                ));
             }
             set.insert(entry.key.clone());
         }
@@ -477,7 +525,11 @@ impl DiskTreeSpec for NonUniqueDiskTreeSpec {
                 DiskTreeOperationKind::NonUniqueSetPresent(false) => {
                     set.remove(&op.key);
                 }
-                DiskTreeOperationKind::Unique(_) => return Err(Error::InvalidArgument),
+                DiskTreeOperationKind::Unique(_) => {
+                    return Err(disk_tree_rewrite_invariant(
+                        "non-unique DiskTree received unique operation",
+                    ));
+                }
             }
         }
         Ok(set.into_iter().map(LogicalEntry::non_unique).collect())
@@ -503,17 +555,11 @@ impl<F: DiskTreeSpec> ValidatedDiskTreeNode<F> {
 
 #[inline]
 fn invalid_node_payload(file_kind: FileKind, block_id: BlockID) -> Error {
-    Error::block_corrupted(
-        file_kind,
-        BlockKind::SecondaryDiskTree,
-        block_id,
-        BlockCorruptionCause::InvalidPayload,
-    )
-}
-
-#[inline]
-fn corrupted_block(file_kind: FileKind, block_id: BlockID, cause: BlockCorruptionCause) -> Error {
-    Error::block_corrupted(file_kind, BlockKind::SecondaryDiskTree, block_id, cause)
+    Report::new(DataIntegrityError::InvalidPayload)
+        .attach(format!(
+            "file={file_kind}, block=secondary-disk-tree, block_id={block_id}"
+        ))
+        .into()
 }
 
 /// View a validated block as an immutable B-tree node image.
@@ -528,19 +574,18 @@ fn btree_node_from_block(block: &[u8]) -> Option<&BTreeNode> {
 /// can be computed over exactly the bytes that will be written.
 #[inline]
 fn btree_node_from_block_mut(block: &mut [u8]) -> Result<&mut BTreeNode> {
-    bytemuck::try_from_bytes_mut::<BTreeNode>(block).map_err(|_| Error::InternalError)
+    bytemuck::try_from_bytes_mut::<BTreeNode>(block)
+        .map_err(|_| Report::new(InternalError::MutableBlockViewMismatch).into())
 }
 
 #[inline]
 fn validate_checksum(block: &[u8], file_kind: FileKind, block_id: BlockID) -> Result<()> {
     if block.len() != DISK_TREE_BLOCK_SIZE {
-        return Err(corrupted_block(
-            file_kind,
-            block_id,
-            BlockCorruptionCause::InvalidPayload,
-        ));
+        return Err(invalid_node_payload(file_kind, block_id));
     }
-    validate_block_checksum(block).map_err(|cause| corrupted_block(file_kind, block_id, cause))?;
+    validate_block_checksum(block)
+        .attach_with(|| format!("file={file_kind}, block=secondary-disk-tree, block_id={block_id}"))
+        .map_err(Error::from)?;
     Ok(())
 }
 
@@ -606,16 +651,15 @@ fn index_key_types(
     append_row_id: bool,
 ) -> Result<Vec<ValType>> {
     if index_spec.index_cols.is_empty() {
-        return Err(Error::InvalidArgument);
+        return Err(invalid_index_spec("index has no key columns"));
     }
     let mut types = Vec::with_capacity(index_spec.index_cols.len() + usize::from(append_row_id));
     for key in &index_spec.index_cols {
         let col_no = key.col_no as usize;
-        let ty = metadata
-            .col_types()
-            .get(col_no)
-            .copied()
-            .ok_or(Error::InvalidArgument)?;
+        let ty =
+            metadata.col_types().get(col_no).copied().ok_or_else(|| {
+                invalid_index_spec(format!("index column {col_no} is out of range"))
+            })?;
         types.push(ty);
     }
     if append_row_id {
@@ -632,7 +676,9 @@ fn validate_sorted_unique_keys<'a>(keys: impl IntoIterator<Item = &'a [u8]>) -> 
     let mut prev = None;
     for key in keys {
         if prev.is_some_and(|prev_key: &[u8]| prev_key >= key) {
-            return Err(Error::InvalidArgument);
+            return Err(disk_tree_batch_order_invariant(
+                "keys are not strictly sorted and unique",
+            ));
         }
         prev = Some(key);
     }
@@ -645,7 +691,7 @@ fn validate_sorted_keys<'a>(keys: impl IntoIterator<Item = &'a [u8]>) -> Result<
     let mut prev = None;
     for key in keys {
         if prev.is_some_and(|prev_key: &[u8]| prev_key > key) {
-            return Err(Error::InvalidArgument);
+            return Err(disk_tree_batch_order_invariant("keys are not sorted"));
         }
         prev = Some(key);
     }
@@ -656,7 +702,10 @@ fn validate_sorted_keys<'a>(keys: impl IntoIterator<Item = &'a [u8]>) -> Result<
 #[inline]
 fn unpack_row_id_from_exact_key(key: &[u8]) -> Result<RowID> {
     if key.len() < ROW_ID_SIZE {
-        return Err(Error::InvalidFormat);
+        return Err(invalid_payload(format!(
+            "non-unique DiskTree exact key length {} is shorter than row id suffix size {ROW_ID_SIZE}",
+            key.len()
+        )));
     }
     Ok(BTreeU64::unpack(&key[key.len() - ROW_ID_SIZE..]).to_u64())
 }
@@ -672,7 +721,9 @@ fn validate_sorted_non_unique_exact_keys(
     for entry in entries {
         unpack_row_id_from_exact_key(entry.key)?;
         if prev.is_some_and(|prev_key: &[u8]| prev_key >= entry.key) {
-            return Err(Error::InvalidArgument);
+            return Err(disk_tree_batch_order_invariant(
+                "non-unique exact keys are not strictly sorted and unique",
+            ));
         }
         prev = Some(entry.key);
     }
@@ -742,7 +793,9 @@ impl UniqueDiskTreeRuntime {
         disk_pool: QuiescentGuard<ReadonlyBufferPool>,
     ) -> Result<Self> {
         if !index_spec.unique() {
-            return Err(Error::InvalidArgument);
+            return Err(secondary_index_kind_mismatch(
+                "unique DiskTree runtime received non-unique index spec",
+            ));
         }
         let encoder = BTreeKeyEncoder::new(index_key_types(metadata, index_spec, false)?);
         Ok(Self::from_shape(encoder, file_kind, file, disk_pool))
@@ -763,7 +816,9 @@ impl NonUniqueDiskTreeRuntime {
         disk_pool: QuiescentGuard<ReadonlyBufferPool>,
     ) -> Result<Self> {
         if index_spec.unique() {
-            return Err(Error::InvalidArgument);
+            return Err(secondary_index_kind_mismatch(
+                "non-unique DiskTree runtime received unique index spec",
+            ));
         }
         let encoder = BTreeKeyEncoder::new(index_key_types(metadata, index_spec, true)?);
         Ok(Self::from_shape(encoder, file_kind, file, disk_pool))
@@ -1062,7 +1117,9 @@ impl<'a, F: DiskTreeSpec> DiskTree<'a, F> {
         if op_idx != operations.len() {
             // Sorted operations should all be consumed by the existing branch
             // ranges. Leftovers indicate invalid caller ordering or routing.
-            return Err(Error::InvalidArgument);
+            return Err(disk_tree_rewrite_invariant(
+                "operations were not consumed by branch ranges",
+            ));
         }
         if combined.is_empty() {
             return Ok(NodeRewriteResult {
@@ -1130,7 +1187,9 @@ impl<'a, F: DiskTreeSpec> DiskTree<'a, F> {
             if entries.is_empty() {
                 // This is defensive: callers normally handle empty rewrites
                 // before entering the branch-level builder.
-                return Err(Error::InvalidArgument);
+                return Err(disk_tree_rewrite_invariant(
+                    "branch-level builder received empty rewrite entries",
+                ));
             }
             if entries.len() == 1 {
                 // Stop as soon as the current level has a single root candidate.
@@ -1186,7 +1245,11 @@ impl<'a, F: DiskTreeSpec> DiskTree<'a, F> {
                             .await?
                             .block_id);
                     }
-                    RewriteEntryPayload::Leaf(_) => return Err(Error::InvalidFormat),
+                    RewriteEntryPayload::Leaf(_) => {
+                        return Err(invalid_payload(
+                            "DiskTree root rewrite expected branch payload",
+                        ));
+                    }
                 }
             }
         })
@@ -1255,7 +1318,9 @@ impl<'a, F: DiskTreeSpec> DiskTree<'a, F> {
         upper_fence: Option<&[u8]>,
     ) -> Result<Vec<RewriteEntry>> {
         if window.is_empty() {
-            return Err(Error::InvalidArgument);
+            return Err(disk_tree_rewrite_invariant(
+                "rewrite repack received empty window",
+            ));
         }
         if height == 0 {
             let mut entries = Vec::new();
@@ -1264,7 +1329,11 @@ impl<'a, F: DiskTreeSpec> DiskTree<'a, F> {
                     RewriteEntryPayload::Leaf(mut leaf_entries) => {
                         entries.append(&mut leaf_entries);
                     }
-                    RewriteEntryPayload::Branch(_) => return Err(Error::InvalidFormat),
+                    RewriteEntryPayload::Branch(_) => {
+                        return Err(invalid_payload(
+                            "DiskTree leaf repack received branch payload",
+                        ));
+                    }
                 }
             }
             validate_logical_entries_sorted(&entries)?;
@@ -1277,7 +1346,11 @@ impl<'a, F: DiskTreeSpec> DiskTree<'a, F> {
                 RewriteEntryPayload::Branch(mut child_entries) => {
                     children.append(&mut child_entries);
                 }
-                RewriteEntryPayload::Leaf(_) => return Err(Error::InvalidFormat),
+                RewriteEntryPayload::Leaf(_) => {
+                    return Err(invalid_payload(
+                        "DiskTree branch repack received leaf payload",
+                    ));
+                }
             }
         }
         validate_rewrite_entries_for_height(&children, height - 1)?;
@@ -1428,7 +1501,9 @@ impl<'a, F: DiskTreeSpec> DiskTree<'a, F> {
             return Ok(Vec::new());
         }
         if height == 0 {
-            return Err(Error::InvalidArgument);
+            return Err(disk_tree_rewrite_invariant(
+                "branch rewrite packing received leaf height",
+            ));
         }
         validate_rewrite_entries_for_height(&entries, height - 1)?;
         let slot_entries = entries
@@ -1559,7 +1634,9 @@ impl<'a, F: DiskTreeSpec> DiskTree<'a, F> {
         create_ts: u64,
     ) -> Result<BranchEntry> {
         if entries.is_empty() || height != 0 || key.as_slice() != entries[0].key.as_slice() {
-            return Err(Error::InvalidArgument);
+            return Err(disk_tree_rewrite_invariant(
+                "leaf block materialization received invalid entry shape",
+            ));
         }
         let slot_entries = entries
             .iter()
@@ -1609,7 +1686,9 @@ impl<'a, F: DiskTreeSpec> DiskTree<'a, F> {
         create_ts: u64,
     ) -> Result<BranchEntry> {
         if height == 0 || children.is_empty() || key.as_slice() != children[0].key.as_slice() {
-            return Err(Error::InvalidArgument);
+            return Err(disk_tree_rewrite_invariant(
+                "branch block materialization received invalid child shape",
+            ));
         }
         validate_branch_entries_for_height(&children, height - 1)?;
         let first = &children[0];
@@ -1618,7 +1697,9 @@ impl<'a, F: DiskTreeSpec> DiskTree<'a, F> {
             .skip(1)
             .map(|entry| {
                 if entry.block_id == SUPER_BLOCK_ID {
-                    return Err(Error::InvalidArgument);
+                    return Err(disk_tree_rewrite_invariant(
+                        "branch child points to empty-root sentinel",
+                    ));
                 }
                 Ok(PackedNodeEntry {
                     key: entry.key.as_slice(),
@@ -1671,9 +1752,14 @@ impl<'a, F: DiskTreeSpec> DiskTree<'a, F> {
 
 /// Calculate a branch height from a homogeneous rewrite child-entry run.
 fn parent_height_from_rewrite_children(entries: &[RewriteEntry]) -> Result<u16> {
-    let first = entries.first().ok_or(Error::InvalidArgument)?;
+    let first = entries
+        .first()
+        .ok_or_else(|| disk_tree_rewrite_invariant("rewrite child run is empty"))?;
     validate_rewrite_entries_for_height(entries, first.height())?;
-    first.height().checked_add(1).ok_or(Error::InvalidArgument)
+    first
+        .height()
+        .checked_add(1)
+        .ok_or_else(|| disk_tree_rewrite_invariant("rewrite child height overflow"))
 }
 
 /// Validate that logical leaf entries are strictly sorted by encoded key.
@@ -1681,7 +1767,9 @@ fn validate_logical_entries_sorted(entries: &[LogicalEntry]) -> Result<()> {
     let mut prev = None;
     for entry in entries {
         if prev.is_some_and(|prev_key: &[u8]| prev_key >= entry.key.as_slice()) {
-            return Err(Error::InvalidFormat);
+            return Err(invalid_payload(
+                "DiskTree logical leaf entries are not strictly sorted",
+            ));
         }
         prev = Some(entry.key.as_slice());
     }
@@ -1691,15 +1779,20 @@ fn validate_logical_entries_sorted(entries: &[LogicalEntry]) -> Result<()> {
 /// Validate a flattened branch-entry run before writing it into branch blocks.
 fn validate_branch_entries_for_height(entries: &[BranchEntry], height: u16) -> Result<()> {
     if entries.is_empty() {
-        return Err(Error::InvalidArgument);
+        return Err(disk_tree_rewrite_invariant("branch entry run is empty"));
     }
     let mut prev = None;
     for entry in entries {
         if entry.height != height || entry.block_id == SUPER_BLOCK_ID {
-            return Err(Error::InvalidArgument);
+            return Err(disk_tree_rewrite_invariant(format!(
+                "branch entry has invalid height or block id: expected_height={height}, actual_height={}, block_id={}",
+                entry.height, entry.block_id
+            )));
         }
         if prev.is_some_and(|prev_key: &[u8]| prev_key >= entry.key.as_slice()) {
-            return Err(Error::InvalidArgument);
+            return Err(disk_tree_rewrite_invariant(
+                "branch entries are not strictly sorted",
+            ));
         }
         prev = Some(entry.key.as_slice());
     }
@@ -1709,20 +1802,27 @@ fn validate_branch_entries_for_height(entries: &[BranchEntry], height: u16) -> R
 /// Validate flattened rewrite entries before planning branch blocks.
 fn validate_rewrite_entries_for_height(entries: &[RewriteEntry], height: u16) -> Result<()> {
     if entries.is_empty() {
-        return Err(Error::InvalidArgument);
+        return Err(disk_tree_rewrite_invariant("rewrite entry run is empty"));
     }
     let mut prev = None;
     for entry in entries {
         if entry.height() != height {
-            return Err(Error::InvalidArgument);
+            return Err(disk_tree_rewrite_invariant(format!(
+                "rewrite entry height mismatch: expected_height={height}, actual_height={}",
+                entry.height()
+            )));
         }
         if let RewriteEntry::Block(entry) = entry
             && entry.block_id == SUPER_BLOCK_ID
         {
-            return Err(Error::InvalidArgument);
+            return Err(disk_tree_rewrite_invariant(
+                "rewrite entry points to empty-root sentinel",
+            ));
         }
         if prev.is_some_and(|prev_key: &[u8]| prev_key >= entry.key()) {
-            return Err(Error::InvalidArgument);
+            return Err(disk_tree_rewrite_invariant(
+                "rewrite entries are not strictly sorted",
+            ));
         }
         prev = Some(entry.key());
     }
@@ -1798,7 +1898,9 @@ impl<'a> UniqueDiskTree<'a> {
     #[inline]
     pub(crate) async fn lookup_encoded(&self, key: &[u8]) -> Result<Option<RowID>> {
         match self.lookup_encoded_entry(key).await? {
-            Some(entry) => Ok(Some(entry.row_id.ok_or(Error::InvalidFormat)?)),
+            Some(entry) => Ok(Some(entry.row_id.ok_or_else(|| {
+                invalid_payload("unique DiskTree lookup entry is missing row id")
+            })?)),
             None => Ok(None),
         }
     }
@@ -1809,7 +1911,14 @@ impl<'a> UniqueDiskTree<'a> {
         self.collect_entries()
             .await?
             .into_iter()
-            .map(|entry| Ok((entry.key, entry.row_id.ok_or(Error::InvalidFormat)?)))
+            .map(|entry| {
+                Ok((
+                    entry.key,
+                    entry.row_id.ok_or_else(|| {
+                        invalid_payload("unique DiskTree scan entry is missing row id")
+                    })?,
+                ))
+            })
             .collect()
     }
 
@@ -2036,6 +2145,7 @@ mod tests {
     use super::*;
     use crate::buffer::{global_readonly_pool_scope, table_readonly_pool};
     use crate::catalog::{ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey};
+    use crate::error::{DataIntegrityError, Error, FileKind};
     use crate::file::build_test_fs;
     use crate::file::table_file::MutableTableFile;
     use crate::value::ValKind;
@@ -2059,6 +2169,13 @@ mod tests {
                 ),
             ],
         ))
+    }
+
+    fn assert_disk_tree_corruption(err: Error, expected: DataIntegrityError) {
+        assert_eq!(err.data_integrity_error(), Some(expected));
+        let report = format!("{err:?}");
+        assert!(report.contains("table-file"), "{report}");
+        assert!(report.contains("secondary-disk-tree"), "{report}");
     }
 
     fn metadata_with_varbyte_unique_index() -> Arc<TableMetadata> {
@@ -2313,7 +2430,7 @@ mod tests {
             let should_fail = self.should_fail(&buf);
             async move {
                 if should_fail {
-                    return Err(Error::InvalidState);
+                    return Err(Report::new(InternalError::InjectedTestFailure).into());
                 }
                 self.inner.write_block(block_id, buf).await
             }
@@ -2856,7 +2973,10 @@ mod tests {
             let mut writer = tree.batch_writer(&mut mutable, 2);
             writer.batch_put(&puts).unwrap();
             let err = writer.finish().await.unwrap_err();
-            assert!(matches!(err, Error::InvalidState));
+            assert_eq!(
+                err.report().downcast_ref::<InternalError>().copied(),
+                Some(InternalError::InjectedTestFailure)
+            );
             assert_eq!(mutable.leaf_writes(), 2);
             assert_eq!(mutable.branch_writes(), 0);
             assert_eq!(mutable.allocated_blocks(), allocated_before);
@@ -2898,7 +3018,10 @@ mod tests {
             let mut writer = tree.batch_writer(&mut mutable, 2);
             writer.batch_put(&puts).unwrap();
             let err = writer.finish().await.unwrap_err();
-            assert!(matches!(err, Error::InvalidState));
+            assert_eq!(
+                err.report().downcast_ref::<InternalError>().copied(),
+                Some(InternalError::InjectedTestFailure)
+            );
             assert!(
                 mutable.leaf_writes() > 1,
                 "branch failure test should materialize multiple leaves first"
@@ -2933,19 +3056,26 @@ mod tests {
 
             {
                 let mut writer = unique_tree.batch_writer(&mut mutable, 2);
-                assert!(matches!(
-                    writer.batch_put_encoded(&[
-                        UniqueDiskTreeEncodedPut {
-                            key: &encoded_unique2,
-                            row_id: 20,
-                        },
-                        UniqueDiskTreeEncodedPut {
-                            key: &encoded_unique1,
-                            row_id: 10,
-                        },
-                    ]),
-                    Err(Error::InvalidArgument)
-                ));
+                assert!(
+                    writer
+                        .batch_put_encoded(&[
+                            UniqueDiskTreeEncodedPut {
+                                key: &encoded_unique2,
+                                row_id: 20,
+                            },
+                            UniqueDiskTreeEncodedPut {
+                                key: &encoded_unique1,
+                                row_id: 10,
+                            },
+                        ])
+                        .as_ref()
+                        .is_err_and(|err| err.is_kind(crate::error::ErrorKind::Internal)
+                            && err
+                                .report()
+                                .downcast_ref::<crate::error::InternalError>()
+                                .copied()
+                                == Some(crate::error::InternalError::DiskTreeBatchOrderInvariant))
+                );
             }
             let mut writer = unique_tree.batch_writer(&mut mutable, 2);
             writer
@@ -2995,35 +3125,48 @@ mod tests {
             let malformed_exact = [0u8; ROW_ID_SIZE - 1];
             {
                 let mut writer = non_unique_tree.batch_writer(&mut mutable, 4);
-                assert!(matches!(
-                    writer.batch_insert_encoded(&[NonUniqueDiskTreeEncodedExact {
-                        key: &malformed_exact
-                    }]),
-                    Err(Error::InvalidFormat)
-                ));
+                assert!(
+                    writer
+                        .batch_insert_encoded(&[NonUniqueDiskTreeEncodedExact {
+                            key: &malformed_exact
+                        }])
+                        .as_ref()
+                        .is_err_and(|err| err.data_integrity_error()
+                            == Some(DataIntegrityError::InvalidPayload))
+                );
             }
             {
                 let mut writer = non_unique_tree.batch_writer(&mut mutable, 4);
-                assert!(matches!(
-                    writer.batch_exact_delete_encoded(&[NonUniqueDiskTreeEncodedExact {
-                        key: &malformed_exact
-                    }]),
-                    Err(Error::InvalidFormat)
-                ));
+                assert!(
+                    writer
+                        .batch_exact_delete_encoded(&[NonUniqueDiskTreeEncodedExact {
+                            key: &malformed_exact
+                        }])
+                        .as_ref()
+                        .is_err_and(|err| err.data_integrity_error()
+                            == Some(DataIntegrityError::InvalidPayload))
+                );
             }
             {
                 let mut writer = non_unique_tree.batch_writer(&mut mutable, 4);
-                assert!(matches!(
-                    writer.batch_insert_encoded(&[
-                        NonUniqueDiskTreeEncodedExact {
-                            key: &encoded_exact11
-                        },
-                        NonUniqueDiskTreeEncodedExact {
-                            key: &encoded_exact10
-                        },
-                    ]),
-                    Err(Error::InvalidArgument)
-                ));
+                assert!(
+                    writer
+                        .batch_insert_encoded(&[
+                            NonUniqueDiskTreeEncodedExact {
+                                key: &encoded_exact11
+                            },
+                            NonUniqueDiskTreeEncodedExact {
+                                key: &encoded_exact10
+                            },
+                        ])
+                        .as_ref()
+                        .is_err_and(|err| err.is_kind(crate::error::ErrorKind::Internal)
+                            && err
+                                .report()
+                                .downcast_ref::<crate::error::InternalError>()
+                                .copied()
+                                == Some(crate::error::InternalError::DiskTreeBatchOrderInvariant))
+                );
             }
             let mut writer = non_unique_tree.batch_writer(&mut mutable, 4);
             writer
@@ -3538,7 +3681,13 @@ mod tests {
                     },
                 ])
                 .unwrap_err();
-            assert!(matches!(err, Error::InvalidArgument));
+            assert!(err.is_kind(crate::error::ErrorKind::Internal));
+            assert_eq!(
+                err.report()
+                    .downcast_ref::<crate::error::InternalError>()
+                    .copied(),
+                Some(crate::error::InternalError::DiskTreeBatchOrderInvariant)
+            );
 
             let err = writer
                 .batch_put(&[
@@ -3552,7 +3701,13 @@ mod tests {
                     },
                 ])
                 .unwrap_err();
-            assert!(matches!(err, Error::InvalidArgument));
+            assert!(err.is_kind(crate::error::ErrorKind::Internal));
+            assert_eq!(
+                err.report()
+                    .downcast_ref::<crate::error::InternalError>()
+                    .copied(),
+                Some(crate::error::InternalError::DiskTreeBatchOrderInvariant)
+            );
         });
     }
 
@@ -3581,13 +3736,7 @@ mod tests {
             BlockID::from(1u64),
         )
         .unwrap_err();
-        assert!(matches!(
-            err,
-            Error::BlockCorrupted {
-                cause: BlockCorruptionCause::ChecksumMismatch,
-                ..
-            }
-        ));
+        assert_disk_tree_corruption(err, DataIntegrityError::ChecksumMismatch);
 
         let mut footer_corrupted = buf.data().to_vec();
         let checksum_idx = crate::file::block_integrity::checksum_offset(footer_corrupted.len());
@@ -3598,12 +3747,6 @@ mod tests {
             BlockID::from(1u64),
         )
         .unwrap_err();
-        assert!(matches!(
-            err,
-            Error::BlockCorrupted {
-                cause: BlockCorruptionCause::ChecksumMismatch,
-                ..
-            }
-        ));
+        assert_disk_tree_corruption(err, DataIntegrityError::ChecksumMismatch);
     }
 }

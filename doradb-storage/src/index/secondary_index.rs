@@ -13,7 +13,7 @@ use super::unique_index::UniqueMemIndexEntry;
 use super::unique_index::{UniqueIndex, UniqueMemIndex};
 use crate::buffer::{BufferPool, PoolGuard, ReadonlyBufferPool};
 use crate::catalog::{IndexSpec, TableMetadata};
-use crate::error::{Error, Result};
+use crate::error::{Error, InternalError, Result};
 use crate::file::cow_file::BlockID;
 use crate::file::table_file::TableFile;
 use crate::index::util::Maskable;
@@ -21,6 +21,7 @@ use crate::quiescent::QuiescentGuard;
 use crate::row::RowID;
 use crate::trx::TrxID;
 use crate::value::{Val, ValType};
+use error_stack::Report;
 use std::cmp::Ordering;
 use std::sync::Arc;
 
@@ -156,10 +157,14 @@ impl SecondaryDiskTreeRuntime {
         table_file: Arc<TableFile>,
         disk_pool: QuiescentGuard<ReadonlyBufferPool>,
     ) -> Result<Self> {
-        let index_spec = metadata
-            .index_specs
-            .get(index_no)
-            .ok_or(Error::InvalidArgument)?;
+        let index_spec = metadata.index_specs.get(index_no).ok_or_else(|| {
+            Error::from(
+                Report::new(InternalError::SecondaryIndexOutOfBounds).attach(format!(
+                    "index_no={index_no}, index_count={}",
+                    metadata.index_specs.len()
+                )),
+            )
+        })?;
         let file_kind = table_file.file_kind();
         let file = Arc::clone(table_file.sparse_file());
         let kind = if index_spec.unique() {
@@ -209,10 +214,9 @@ impl SecondaryDiskTreeRuntime {
             SecondaryDiskTreeRuntimeKind::Unique(runtime) => {
                 Ok(runtime.open(root_block_id, disk_pool_guard))
             }
-            SecondaryDiskTreeRuntimeKind::NonUnique(_) => Err(Error::WrongSecondaryIndexBinding {
-                expected: "unique",
-                actual: "non-unique",
-            }),
+            SecondaryDiskTreeRuntimeKind::NonUnique(_) => {
+                Err(Error::wrong_secondary_index_binding("unique", "non-unique"))
+            }
         }
     }
 
@@ -224,10 +228,9 @@ impl SecondaryDiskTreeRuntime {
         disk_pool_guard: &'a PoolGuard,
     ) -> Result<NonUniqueDiskTree<'a>> {
         match &self.kind {
-            SecondaryDiskTreeRuntimeKind::Unique(_) => Err(Error::WrongSecondaryIndexBinding {
-                expected: "non-unique",
-                actual: "unique",
-            }),
+            SecondaryDiskTreeRuntimeKind::Unique(_) => {
+                Err(Error::wrong_secondary_index_binding("non-unique", "unique"))
+            }
             SecondaryDiskTreeRuntimeKind::NonUnique(runtime) => {
                 Ok(runtime.open(root_block_id, disk_pool_guard))
             }
@@ -284,10 +287,9 @@ impl<P: BufferPool> SecondaryIndex<P> {
     pub(crate) fn unique_mem(&self) -> Result<&UniqueMemIndex<P>> {
         match self {
             Self::Unique { mem, .. } => Ok(mem),
-            Self::NonUnique { .. } => Err(Error::WrongSecondaryIndexBinding {
-                expected: "unique",
-                actual: "non-unique",
-            }),
+            Self::NonUnique { .. } => {
+                Err(Error::wrong_secondary_index_binding("unique", "non-unique"))
+            }
         }
     }
 
@@ -295,10 +297,9 @@ impl<P: BufferPool> SecondaryIndex<P> {
     #[inline]
     pub(crate) fn non_unique_mem(&self) -> Result<&NonUniqueMemIndex<P>> {
         match self {
-            Self::Unique { .. } => Err(Error::WrongSecondaryIndexBinding {
-                expected: "non-unique",
-                actual: "unique",
-            }),
+            Self::Unique { .. } => {
+                Err(Error::wrong_secondary_index_binding("non-unique", "unique"))
+            }
             Self::NonUnique { mem, .. } => Ok(mem),
         }
     }
@@ -308,10 +309,9 @@ impl<P: BufferPool> SecondaryIndex<P> {
     pub(crate) fn bind_unique(&self, root: BlockID) -> Result<UniqueSecondaryIndex<'_, P>> {
         match self {
             Self::Unique { mem, disk } => Ok(UniqueSecondaryIndex::new(mem, disk, root)),
-            Self::NonUnique { .. } => Err(Error::WrongSecondaryIndexBinding {
-                expected: "unique",
-                actual: "non-unique",
-            }),
+            Self::NonUnique { .. } => {
+                Err(Error::wrong_secondary_index_binding("unique", "non-unique"))
+            }
         }
     }
 
@@ -319,10 +319,9 @@ impl<P: BufferPool> SecondaryIndex<P> {
     #[inline]
     pub(crate) fn bind_non_unique(&self, root: BlockID) -> Result<NonUniqueSecondaryIndex<'_, P>> {
         match self {
-            Self::Unique { .. } => Err(Error::WrongSecondaryIndexBinding {
-                expected: "non-unique",
-                actual: "unique",
-            }),
+            Self::Unique { .. } => {
+                Err(Error::wrong_secondary_index_binding("non-unique", "unique"))
+            }
             Self::NonUnique { mem, disk } => Ok(NonUniqueSecondaryIndex::new(mem, disk, root)),
         }
     }

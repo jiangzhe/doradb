@@ -1,6 +1,7 @@
 use crate::conf::path::{path_to_utf8, validate_catalog_file_name};
-use crate::error::{Error, Result};
+use crate::error::{ConfigError, ConfigResult, Error, Result};
 use crate::file::fs::{FileSystem, StorageIOWorkerBuilder, build_file_system};
+use error_stack::{ResultExt, ensure};
 use serde::{Deserialize, Serialize};
 use std::path::{Component as PathComponent, Path, PathBuf};
 
@@ -51,20 +52,28 @@ impl FileSystemConfig {
     }
 
     #[inline]
-    fn validate_parts(self) -> Result<(PathBuf, String, usize)> {
-        if !validate_catalog_file_name(&self.catalog_file_name) {
-            return Err(Error::InvalidStoragePath(format!(
+    fn validate_parts(self) -> ConfigResult<(PathBuf, String, usize)> {
+        (|| {
+            ensure!(
+                validate_catalog_file_name(&self.catalog_file_name),
+                ConfigError::InvalidCatalogFileName
+            );
+            Ok(())
+        })()
+        .attach_with(|| {
+            format!(
                 "catalog file name must be a plain `.mtb` file name: {}",
                 self.catalog_file_name
-            )));
-        }
-        let data_dir = validate_data_dir(&self.data_dir)?;
+            )
+        })?;
+        let data_dir = validate_data_dir(&self.data_dir)
+            .attach_with(|| format!("invalid data_dir: {}", self.data_dir.display()))?;
         Ok((data_dir, self.catalog_file_name, self.io_depth))
     }
 
     #[inline]
     pub(crate) fn build_engine_parts(self) -> Result<(FileSystem, StorageIOWorkerBuilder)> {
-        let (data_dir, catalog_file_name, io_depth) = self.validate_parts()?;
+        let (data_dir, catalog_file_name, io_depth) = self.validate_parts().map_err(Error::from)?;
         build_file_system(io_depth, data_dir, catalog_file_name)
     }
 }
@@ -82,21 +91,31 @@ impl Default for FileSystemConfig {
 }
 
 #[inline]
-fn validate_data_dir(data_dir: &Path) -> Result<PathBuf> {
-    if data_dir.as_os_str().is_empty() {
-        return Err(Error::InvalidStoragePath(
-            "data_dir must not be empty".into(),
-        ));
-    }
-    path_to_utf8(data_dir, "data_dir")?;
-    if data_dir
-        .components()
-        .any(|component| matches!(component, PathComponent::ParentDir))
-    {
-        return Err(Error::InvalidStoragePath(format!(
+fn validate_data_dir(data_dir: &Path) -> ConfigResult<PathBuf> {
+    (|| {
+        ensure!(
+            !data_dir.as_os_str().is_empty(),
+            ConfigError::PathMustNotBeEmpty
+        );
+        Ok(())
+    })()
+    .attach_with(|| "data_dir must not be empty".to_string())?;
+    path_to_utf8(data_dir, "data_dir")
+        .attach_with(|| format!("invalid data_dir: {}", data_dir.display()))?;
+    (|| {
+        ensure!(
+            !data_dir
+                .components()
+                .any(|component| matches!(component, PathComponent::ParentDir)),
+            ConfigError::PathMustNotContainParentTraversal
+        );
+        Ok(())
+    })()
+    .attach_with(|| {
+        format!(
             "data_dir must not contain parent traversal: {}",
             data_dir.display()
-        )));
-    }
+        )
+    })?;
     Ok(data_dir.to_path_buf())
 }

@@ -1,7 +1,7 @@
 use crate::buffer::PageID;
 use crate::buffer::{BufferPool, EvictableBufferPool, PoolGuards};
 use crate::catalog::{Catalog, TableCache, TableHandle};
-use crate::error::{Result, StoragePoisonSource};
+use crate::error::{FatalError, Result};
 use crate::latch::LatchFallbackMode;
 use crate::quiescent::{QuiescentGuard, SyncQuiescentGuard};
 use crate::row::RowPage;
@@ -35,7 +35,7 @@ fn handle_gc_row_page_deallocation_result(trx_sys: &TransactionSystem, res: Resu
     match res {
         Ok(()) => true,
         Err(_) => {
-            trx_sys.poison_storage(StoragePoisonSource::PurgeDeallocate);
+            let _ = trx_sys.poison_storage(FatalError::PurgeDeallocate);
             false
         }
     }
@@ -645,12 +645,12 @@ mod tests {
     use crate::buffer::{BufferPool, PoolGuards, PoolRole};
     use crate::catalog::tests::table1;
     use crate::conf::{EngineConfig, EvictableBufferPoolConfig, TrxSysConfig};
-    use crate::error::{Error, StoragePoisonSource};
+    use crate::error::FatalError;
     use crate::file::cow_file::BlockID;
     use crate::index::{RowLocation, UniqueIndex};
     use crate::latch::LatchFallbackMode;
-    use crate::row::RowPage;
-    use crate::row::ops::{DeleteMvcc, InsertMvcc, SelectKey};
+    use crate::row::ops::{DeleteMvcc, SelectKey};
+    use crate::row::{RowID, RowPage};
     use crate::stmt::Statement;
     use crate::table::{DeleteMarker, Table, TableAccess};
     use crate::trx::row::RowReadAccess;
@@ -687,7 +687,7 @@ mod tests {
         stmt: &mut Statement,
         table: &Table,
         cols: Vec<Val>,
-    ) -> crate::error::Result<InsertMvcc> {
+    ) -> crate::error::Result<RowID> {
         let (ctx, effects) = stmt.ctx_and_effects_mut();
         table.accessor().insert_mvcc(ctx, effects, cols).await
     }
@@ -763,18 +763,20 @@ mod tests {
                 &engine.trx_sys,
                 Err(std::io::Error::from_raw_os_error(libc::EIO).into())
             ));
-            assert!(matches!(
-                engine.trx_sys.storage_poison_error(),
-                Some(Error::StorageEnginePoisoned(
-                    StoragePoisonSource::PurgeDeallocate
-                ))
-            ));
-            assert!(matches!(
-                engine.trx_sys.ensure_runtime_healthy(),
-                Err(Error::StorageEnginePoisoned(
-                    StoragePoisonSource::PurgeDeallocate
-                ))
-            ));
+            assert!(
+                engine
+                    .trx_sys
+                    .storage_poison_error()
+                    .as_ref()
+                    .is_some_and(|err| *err.current_context() == FatalError::PurgeDeallocate)
+            );
+            assert!(
+                engine
+                    .trx_sys
+                    .ensure_runtime_healthy()
+                    .as_ref()
+                    .is_err_and(|err| *err.current_context() == FatalError::PurgeDeallocate)
+            );
         });
     }
 

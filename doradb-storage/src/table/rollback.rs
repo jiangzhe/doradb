@@ -1,13 +1,21 @@
 use super::{GenericMemTable, Table};
 use crate::buffer::{BufferPool, EvictableBufferPool, FixedBufferPool, PoolGuard, PoolGuards};
 use crate::catalog::CatalogTable;
-use crate::error::{Error, Result};
+use crate::error::{Error, InternalError, Result};
 use crate::index::util::Maskable;
 use crate::index::{IndexCompareExchange, NonUniqueIndex, UniqueIndex};
 use crate::row::RowID;
 use crate::row::ops::SelectKey;
 use crate::trx::TrxID;
 use crate::trx::undo::{IndexUndo, IndexUndoKind};
+use error_stack::Report;
+
+#[inline]
+fn secondary_index_kind_mismatch(operation: &'static str, expected: &'static str) -> Error {
+    Report::new(InternalError::SecondaryIndexKindMismatch)
+        .attach(format!("operation={operation}, expected={expected}"))
+        .into()
+}
 
 /// Rollback adapter for table-specific secondary-index runtimes.
 ///
@@ -297,7 +305,7 @@ impl IndexRollback for CatalogTable {
     ) -> Result<bool> {
         self.mem.sec_idx()[key.index_no]
             .unique()
-            .ok_or(Error::InvalidArgument)?
+            .ok_or_else(|| secondary_index_kind_mismatch("rollback unique mask deleted", "unique"))?
             .mask_as_deleted(index_pool_guard, &key.vals, row_id, ts)
             .await
     }
@@ -313,7 +321,9 @@ impl IndexRollback for CatalogTable {
     ) -> Result<bool> {
         self.mem.sec_idx()[key.index_no]
             .unique()
-            .ok_or(Error::InvalidArgument)?
+            .ok_or_else(|| {
+                secondary_index_kind_mismatch("rollback unique compare delete", "unique")
+            })?
             .compare_delete(index_pool_guard, &key.vals, row_id, ignore_del_mask, ts)
             .await
     }
@@ -329,7 +339,9 @@ impl IndexRollback for CatalogTable {
     ) -> Result<IndexCompareExchange> {
         self.mem.sec_idx()[key.index_no]
             .unique()
-            .ok_or(Error::InvalidArgument)?
+            .ok_or_else(|| {
+                secondary_index_kind_mismatch("rollback unique compare exchange", "unique")
+            })?
             .compare_exchange(index_pool_guard, &key.vals, old_row_id, new_row_id, ts)
             .await
     }
@@ -344,7 +356,9 @@ impl IndexRollback for CatalogTable {
     ) -> Result<bool> {
         self.mem.sec_idx()[key.index_no]
             .non_unique()
-            .ok_or(Error::InvalidArgument)?
+            .ok_or_else(|| {
+                secondary_index_kind_mismatch("rollback non-unique mask deleted", "non-unique")
+            })?
             .mask_as_deleted(index_pool_guard, &key.vals, row_id, ts)
             .await
     }
@@ -359,7 +373,9 @@ impl IndexRollback for CatalogTable {
     ) -> Result<bool> {
         self.mem.sec_idx()[key.index_no]
             .non_unique()
-            .ok_or(Error::InvalidArgument)?
+            .ok_or_else(|| {
+                secondary_index_kind_mismatch("rollback non-unique mask active", "non-unique")
+            })?
             .mask_as_active(index_pool_guard, &key.vals, row_id, ts)
             .await
     }
@@ -375,7 +391,9 @@ impl IndexRollback for CatalogTable {
     ) -> Result<bool> {
         self.mem.sec_idx()[key.index_no]
             .non_unique()
-            .ok_or(Error::InvalidArgument)?
+            .ok_or_else(|| {
+                secondary_index_kind_mismatch("rollback non-unique compare delete", "non-unique")
+            })?
             .compare_delete(index_pool_guard, &key.vals, row_id, ignore_del_mask, ts)
             .await
     }

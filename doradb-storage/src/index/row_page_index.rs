@@ -5,7 +5,7 @@ use crate::buffer::page::{BufferPage, PAGE_SIZE};
 use crate::buffer::{BufferPool, FixedBufferPool, PageID, PoolGuard};
 use crate::catalog::TableMetadata;
 use crate::error::{
-    Error, Result, Validation,
+    Result, Validation,
     Validation::{Invalid, Valid},
 };
 use crate::file::BlockID;
@@ -57,6 +57,16 @@ const _: () = assert!(
     { mem::size_of::<PageEntry>() == ENTRY_SIZE },
     "ENTRY_SIZE must match PageEntry size"
 );
+
+enum InsertFreeListProbe<T> {
+    Hit(T),
+    Miss(InsertFreeListMiss),
+}
+
+enum InsertFreeListMiss {
+    Empty,
+    BufferPageGenerationMismatch,
+}
 
 /// RowPageIndexNode is one B-tree node of the row-page index.
 /// It can be either branch or leaf.
@@ -456,14 +466,18 @@ impl<P: BufferPool> GenericRowPageIndex<P> {
         count: usize,
         redo_ctx: Option<RowPageCreateRedoCtx<'_>>,
     ) -> Result<PageExclusiveGuard<RowPage>> {
-        if let Ok(free_page) = self
+        use self::InsertFreeListMiss::{BufferPageGenerationMismatch, Empty};
+        use self::InsertFreeListProbe::{Hit, Miss};
+
+        match self
             .get_insert_page_exclusive_from_free_list(mem_pool, mem_pool_guard)
             .await
         {
-            return Ok(free_page);
+            Ok(Hit(free_page)) => return Ok(free_page),
+            Ok(Miss(Empty | BufferPageGenerationMismatch)) => (),
+            Err(err) => return Err(err),
         }
-        // Free-list reload failures and stale exclusive-lock attempts are best-effort only here.
-        // Fall back to a fresh page instead of aborting the insert-page acquisition path.
+        // Empty or stale free-list entries fall back to allocating a fresh row page.
         let mut new_page = mem_pool.allocate_page::<RowPage>(mem_pool_guard).await?;
         if let Err(err) = self
             .insert_page_guard(meta_pool_guard, metadata, count, redo_ctx, &mut new_page)
@@ -600,22 +614,24 @@ impl<P: BufferPool> GenericRowPageIndex<P> {
         &self,
         mem_pool: &B,
         mem_pool_guard: &PoolGuard,
-    ) -> Result<PageExclusiveGuard<RowPage>> {
+    ) -> Result<InsertFreeListProbe<PageExclusiveGuard<RowPage>>> {
+        use self::InsertFreeListMiss::{BufferPageGenerationMismatch, Empty};
+        use self::InsertFreeListProbe::{Hit, Miss};
+
         let page_id = {
             let mut g = self.insert_free_list.lock();
             if g.is_empty() {
-                return Err(Error::EmptyFreeListOfBufferPool);
+                return Ok(Miss(Empty));
             }
             g.pop().unwrap()
         };
         let page_guard = mem_pool
             .get_page::<RowPage>(mem_pool_guard, page_id, LatchFallbackMode::Exclusive)
             .await?;
-        let page_guard = page_guard
-            .lock_exclusive_async()
-            .await
-            .ok_or(Error::InvalidState)?;
-        Ok(page_guard)
+        let Some(page_guard) = page_guard.lock_exclusive_async().await else {
+            return Ok(Miss(BufferPageGenerationMismatch));
+        };
+        Ok(Hit(page_guard))
     }
 
     /// Insert row page by splitting root.
@@ -1143,7 +1159,7 @@ mod tests {
     use crate::buffer::{BufferPool, FixedBufferPool, PoolGuard};
     use crate::catalog::{ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexSpec};
     use crate::conf::{EngineConfig, EvictableBufferPoolConfig, TrxSysConfig};
-    use crate::error::Validation;
+    use crate::error::{IoError, ResourceError, Validation};
     use crate::latch::LatchFallbackMode;
     use crate::quiescent::{QuiescentBox, QuiescentGuard};
     use crate::trx::log::list_log_files;
@@ -1413,12 +1429,12 @@ mod tests {
                 Ok(_) => panic!("expected free-list page reload failure"),
                 Err(err) => err,
             };
-            assert!(matches!(err, Error::IOError { .. }));
+            assert!(err.report().downcast_ref::<IoError>().is_some());
         });
     }
 
     #[test]
-    fn test_get_insert_page_exclusive_with_redo_falls_back_on_free_list_io_failure() {
+    fn test_get_insert_page_exclusive_with_redo_propagates_free_list_io_failure() {
         smol::block_on(async {
             let meta_pool = owned_index_pool(64 * 1024 * 1024);
             let mem_pool = owned_mem_pool(64 * 1024 * 1024);
@@ -1437,7 +1453,7 @@ mod tests {
             blk_idx.cache_exclusive_insert_page(page_guard);
 
             let failing_pool = FailingInsertPagePool::new(mem_pool.guard(), failed_page_id);
-            let page_guard = blk_idx
+            let res = blk_idx
                 .get_insert_page_exclusive_with_redo(
                     &meta_guard,
                     &failing_pool,
@@ -1446,9 +1462,12 @@ mod tests {
                     100,
                     None,
                 )
-                .await
-                .expect("exclusive free-list reload failure should fall back to fresh allocation");
-            assert_ne!(failed_page_id, page_guard.page_id());
+                .await;
+            let err = match res {
+                Ok(_) => panic!("expected exclusive free-list page reload failure"),
+                Err(err) => err,
+            };
+            assert!(err.report().downcast_ref::<IoError>().is_some());
             assert!(blk_idx.insert_free_list.lock().is_empty());
         });
     }
@@ -1480,7 +1499,7 @@ mod tests {
                 Ok(_) => panic!("metadata split should fail in one-page meta pool"),
                 Err(err) => err,
             };
-            assert!(matches!(err, Error::BufferPoolFull));
+            assert_eq!(err.resource_error(), Some(ResourceError::BufferPoolFull));
             assert_eq!(mem_pool.allocated(), 0);
         });
     }
@@ -1512,7 +1531,7 @@ mod tests {
                 Ok(_) => panic!("metadata split should fail in one-page meta pool"),
                 Err(err) => err,
             };
-            assert!(matches!(err, Error::BufferPoolFull));
+            assert_eq!(err.resource_error(), Some(ResourceError::BufferPoolFull));
             assert_eq!(mem_pool.allocated(), 0);
         });
     }
@@ -1538,7 +1557,7 @@ mod tests {
                 Ok(_) => panic!("metadata split should fail in one-page meta pool"),
                 Err(err) => err,
             };
-            assert!(matches!(err, Error::BufferPoolFull));
+            assert_eq!(err.resource_error(), Some(ResourceError::BufferPoolFull));
             assert_eq!(mem_pool.allocated(), 0);
 
             let page = mem_pool

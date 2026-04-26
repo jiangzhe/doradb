@@ -15,14 +15,18 @@ use crate::buffer::{
     BufferPoolStats, BufferPoolStatsHandle, PageIOCompletion, PoolGuard, PoolIdentity, PoolRole,
     ReadonlyBlockValidator,
 };
-use crate::error::{Error, FileKind, Result};
+use crate::error::{
+    CompletionErrorKind, CompletionResult, Error, FileKind, InternalError, LifecycleError,
+    ResourceError, Result,
+};
 use crate::file::fs::FileSystem;
 use crate::file::{BlockID, BlockKey, FileID, SparseFile};
-use crate::io::{IOKind, IOSubmission, Operation};
+use crate::io::{IOKind, IOSubmission, Operation, StdIoResult};
 use crate::latch::LatchFallbackMode;
 use crate::quiescent::{QuiescentGuard, SyncQuiescentGuard};
 use dashmap::DashMap;
 use dashmap::mapref::entry::Entry;
+use error_stack::Report;
 use event_listener::{Event, EventListener, listener};
 use parking_lot::Mutex;
 use std::collections::BTreeSet;
@@ -84,7 +88,11 @@ impl ReadonlyBufferPool {
         let frame_plus_page = mem::size_of::<BufferFrame>() + mem::size_of::<Page>();
         let size = pool_size / frame_plus_page;
         if size < MIN_READONLY_POOL_PAGES {
-            return Err(Error::BufferPoolSizeTooSmall);
+            return Err(Report::new(ResourceError::BufferPoolSizeTooSmall)
+                .attach(format!(
+                    "global readonly buffer pool sizing: role={role:?}, pool_size={pool_size}, frame_plus_page={frame_plus_page}, pages={size}, min_pages={MIN_READONLY_POOL_PAGES}"
+                ))
+                .into());
         }
         let eviction_arbiter = eviction_arbiter_builder.build(size);
         let arena = QuiescentArena::new(size)?;
@@ -158,7 +166,7 @@ impl ReadonlyBufferPool {
     async fn reserve_frame_id_for_load(&self) -> Result<PageID> {
         loop {
             if self.shutdown_flag.load(Ordering::Acquire) {
-                return Err(Error::InvalidState);
+                return Err(Report::new(LifecycleError::Shutdown).into());
             }
             if let Some(frame_id) = self.residency.try_reserve_frame() {
                 // Like the mutable pool, terminal shutdown does not try to reclaim
@@ -170,7 +178,7 @@ impl ReadonlyBufferPool {
             listener!(self.residency.free_ev => listener);
             // Check after listener registration so shutdown cannot strand this waiter.
             if self.shutdown_flag.load(Ordering::Acquire) {
-                return Err(Error::InvalidState);
+                return Err(Report::new(LifecycleError::Shutdown).into());
             }
             if let Some(frame_id) = self.residency.try_reserve_frame() {
                 self.residency.record_alloc_success();
@@ -181,7 +189,7 @@ impl ReadonlyBufferPool {
             listener.await;
             // Wakeups can come from shutdown as well as real frame reclamation.
             if self.shutdown_flag.load(Ordering::Acquire) {
-                return Err(Error::InvalidState);
+                return Err(Report::new(LifecycleError::Shutdown).into());
             }
         }
     }
@@ -191,7 +199,7 @@ impl ReadonlyBufferPool {
         &self,
         key: BlockKey,
         inflight: &Arc<PageIOCompletion>,
-        result: Result<PageID>,
+        result: CompletionResult<PageID>,
     ) {
         inflight.complete(result);
         match self.inflight_loads.entry(key) {
@@ -223,7 +231,7 @@ impl ReadonlyBufferPool {
     /// Binds one persisted-block key to an exclusively locked frame.
     ///
     /// Binding is idempotent for the same key/frame pair and returns
-    /// `Error::InvalidState` for conflicting mapping attempts.
+    /// Returns an internal mapping-conflict error for conflicting mapping attempts.
     #[inline]
     pub fn bind_frame(
         &self,
@@ -232,18 +240,27 @@ impl ReadonlyBufferPool {
     ) -> Result<()> {
         let frame_id = frame_guard.page_id();
         if usize::from(frame_id) >= self.size {
-            return Err(Error::InvalidArgument);
+            return Err(Report::new(InternalError::ReadonlyFrameIndexOutOfBounds)
+                .attach(format!("frame_id={frame_id}, size={}", self.size))
+                .into());
         }
         let frame = frame_guard.bf_mut();
         let expected_frame = self.arena.frame(frame_id) as *const BufferFrame;
         if !std::ptr::eq(frame as *const BufferFrame, expected_frame) {
-            return Err(Error::InvalidArgument);
+            return Err(Report::new(InternalError::ReadonlyFrameGuardMismatch)
+                .attach(format!("frame_id={frame_id}"))
+                .into());
         }
         let inserted = match self.mappings.entry(key) {
             Entry::Occupied(occ) => {
                 let existing = *occ.get();
                 if existing != frame_id {
-                    return Err(Error::InvalidState);
+                    return Err(Report::new(InternalError::ReadonlyMappingConflict)
+                        .attach(format!(
+                            "key={:?}, existing_frame={}, new_frame={frame_id}",
+                            key, existing
+                        ))
+                        .into());
                 }
                 return match frame.persisted_block_key() {
                     Some((file_id, block_id))
@@ -251,15 +268,26 @@ impl ReadonlyBufferPool {
                     {
                         Ok(())
                     }
-                    _ => Err(Error::InvalidState),
+                    _ => Err(Report::new(InternalError::ReadonlyMappingConflict)
+                        .attach(format!("key={key:?}, frame_id={frame_id}"))
+                        .into()),
                 };
             }
             Entry::Vacant(vac) => {
                 if let Some((file_id, block_id)) = frame.persisted_block_key() {
                     if file_id != key.file_id || block_id != key.block_id {
-                        return Err(Error::InvalidState);
+                        return Err(Report::new(InternalError::ReadonlyMappingConflict)
+                            .attach(format!(
+                                "key={key:?}, frame_key={:?}",
+                                BlockKey::new(file_id, block_id)
+                            ))
+                            .into());
                     }
-                    return Err(Error::InvalidState);
+                    return Err(Report::new(InternalError::ReadonlyMappingConflict)
+                        .attach(format!(
+                            "duplicate frame binding: key={key:?}, frame_id={frame_id}"
+                        ))
+                        .into());
                 }
                 vac.insert(frame_id);
                 true
@@ -462,7 +490,9 @@ impl ReadonlyBufferPool {
     ) -> Result<FacadePageGuard<T>> {
         self.validate_guard(guard);
         if usize::from(frame_id) >= self.size {
-            return Err(Error::InvalidArgument);
+            return Err(Report::new(InternalError::ReadonlyFrameIndexOutOfBounds)
+                .attach(format!("frame_id={frame_id}, size={}", self.size))
+                .into());
         }
         let keepalive = guard.clone();
         let bf = self.arena.frame_ptr(frame_id);
@@ -545,7 +575,9 @@ impl ReadonlyPageReservation {
             Some(page_guard) => page_guard,
             None => {
                 pool.residency.release_free(frame_id);
-                return Err(Error::InvalidState);
+                return Err(Report::new(InternalError::ReadonlyFrameLockMissing)
+                    .attach(format!("frame_id={frame_id}"))
+                    .into());
             }
         };
         {
@@ -604,7 +636,11 @@ impl PageReservation for ReadonlyPageReservation {
             Entry::Vacant(vac) => {
                 vac.insert(frame_id);
             }
-            Entry::Occupied(_) => return Err(Error::InvalidState),
+            Entry::Occupied(_) => {
+                return Err(Report::new(InternalError::ReadonlyMappingConflict)
+                    .attach(format!("publish key={key:?}, frame_id={frame_id}"))
+                    .into());
+            }
         }
         drop(page_guard);
         pool.residency.mark_resident(frame_id);
@@ -688,7 +724,7 @@ impl ReadSubmission {
     /// `ReadSubmission` also completes in `Drop` as a last-resort rollback
     /// path, so every explicit terminal path must mark the submission as
     /// completed to avoid a redundant second completion and inflight-map check.
-    fn complete_inflight_once(&mut self, result: Result<PageID>) {
+    fn complete_inflight_once(&mut self, result: CompletionResult<PageID>) {
         if self.completed {
             return;
         }
@@ -699,7 +735,7 @@ impl ReadSubmission {
 
     #[inline]
     /// Fails the miss before worker completion and wakes all joined waiters.
-    pub(crate) fn fail(mut self, err: Error) {
+    pub(crate) fn fail(mut self, err: Report<CompletionErrorKind>) {
         drop(self.reservation.take());
         self.pool.stats.add_completed_reads(1);
         self.pool.stats.add_read_errors(1);
@@ -716,7 +752,7 @@ impl ReadSubmission {
     ///
     /// Exact-page reads publish the reserved frame; short reads and IO errors
     /// drop the reservation so rollback returns the frame to the free list.
-    pub(crate) fn complete(mut self, res: std::io::Result<usize>) -> IOKind {
+    pub(crate) fn complete(mut self, res: StdIoResult<usize>) -> IOKind {
         let result = match res {
             Ok(len) if len == PAGE_SIZE => {
                 if let Some(validation) = self.validation {
@@ -729,7 +765,13 @@ impl ReadSubmission {
                         self.key.block_id,
                     ) {
                         drop(self.reservation.take());
-                        self.complete_inflight_once(Err(err));
+                        self.complete_inflight_once(Err(CompletionErrorKind::report_error(
+                            err,
+                            format!(
+                                "validate readonly block load: file={}, key={:?}",
+                                validation.file_kind, self.key
+                            ),
+                        )));
                         return IOKind::Read;
                     }
                 }
@@ -738,16 +780,26 @@ impl ReadSubmission {
                 );
                 match reservation.publish() {
                     Ok(page_id) => Ok(page_id),
-                    Err(err) => Err(err),
+                    Err(err) => Err(CompletionErrorKind::report_error(
+                        err,
+                        format!("publish readonly block load: key={:?}", self.key),
+                    )),
                 }
             }
-            Ok(_) => {
+            Ok(len) => {
                 drop(self.reservation.take());
-                Err(Error::ShortIO)
+                Err(CompletionErrorKind::report_unexpected_eof(
+                    len,
+                    PAGE_SIZE,
+                    format!("complete readonly block load: key={:?}", self.key),
+                ))
             }
             Err(err) => {
                 drop(self.reservation.take());
-                Err(err.into())
+                Err(CompletionErrorKind::report_io(
+                    err,
+                    format!("complete readonly block load: key={:?}", self.key),
+                ))
             }
         };
         self.pool.stats.add_completed_reads(1);
@@ -775,7 +827,13 @@ impl Drop for ReadSubmission {
         drop(self.reservation.take());
         self.pool.stats.add_completed_reads(1);
         self.pool.stats.add_read_errors(1);
-        self.complete_inflight_once(Err(Error::InternalError));
+        self.complete_inflight_once(Err(CompletionErrorKind::report_internal(
+            InternalError::CompletionDropped,
+            format!(
+                "drop readonly read submission before completion: key={:?}",
+                self.key
+            ),
+        )));
     }
 }
 
@@ -1103,11 +1161,20 @@ impl QuiescentGuard<ReadonlyBufferPool> {
                             reservation,
                         );
                         if let Err(err) = self.send_read_async(req).await {
-                            err.into_inner().fail(Error::SendError);
+                            err.into_inner().fail(CompletionErrorKind::report_send(
+                                "send readonly pool read request",
+                            ));
                         }
                     }
                     Err(err) => {
-                        self.complete_inflight_load(key, &inflight, Err(err));
+                        self.complete_inflight_load(
+                            key,
+                            &inflight,
+                            Err(CompletionErrorKind::report_error(
+                                err,
+                                format!("reserve readonly block load frame: key={key:?}"),
+                            )),
+                        );
                     }
                 }
                 inflight
@@ -1135,6 +1202,12 @@ impl QuiescentGuard<ReadonlyBufferPool> {
         inflight
             .wait_result()
             .await
+            .map_err(|report| {
+                Error::from_completion_report(
+                    report,
+                    format!("wait for readonly block load: key={key:?}"),
+                )
+            })
             .map(|frame_id| (frame_id, false))
     }
 
@@ -1165,6 +1238,14 @@ impl QuiescentGuard<ReadonlyBufferPool> {
         inflight
             .wait_result()
             .await
+            .map_err(|report| {
+                Error::from_completion_report(
+                    report,
+                    format!(
+                        "wait for validated readonly block load: file={file_kind}, key={key:?}"
+                    ),
+                )
+            })
             .map(|frame_id| (frame_id, false))
     }
 
@@ -1228,7 +1309,7 @@ pub(crate) mod tests {
     use crate::catalog::TableID;
     use crate::catalog::{ColumnAttributes, ColumnSpec, TableMetadata, USER_OBJ_ID_START};
     use crate::conf::{EngineConfig, EvictableBufferPoolConfig, FileSystemConfig, TrxSysConfig};
-    use crate::error::{BlockCorruptionCause, BlockKind};
+    use crate::error::{CompletionErrorKind, Error, FileKind, LifecycleError, ResourceError};
     use crate::file::block_integrity::{
         BLOCK_INTEGRITY_HEADER_SIZE, COLUMN_BLOCK_INDEX_BLOCK_SPEC,
         COLUMN_DELETION_BLOB_BLOCK_SPEC, LWC_BLOCK_SPEC, max_payload_len, write_block_checksum,
@@ -1277,6 +1358,16 @@ pub(crate) mod tests {
             smol::Timer::after(TEST_WAIT_INTERVAL).await;
         }
         panic!("condition was not satisfied before timeout");
+    }
+
+    fn assert_completion_data_integrity(err: Error) {
+        assert!(matches!(
+            err.completion_error(),
+            Some(CompletionErrorKind::DataIntegrity(_))
+        ));
+        let report = format!("{err:?}");
+        assert!(report.contains("propagate from other threads"), "{report}");
+        assert!(report.contains("wait for"), "{report}");
     }
 
     fn frame_page_bytes(cap: usize) -> usize {
@@ -1694,7 +1785,7 @@ pub(crate) mod tests {
             }
         }
 
-        fn on_complete(&self, op: StorageBackendOp, res: &mut std::io::Result<usize>) {
+        fn on_complete(&self, op: StorageBackendOp, res: &mut StdIoResult<usize>) {
             if !self.matches(op) {
                 return;
             }
@@ -1734,7 +1825,10 @@ pub(crate) mod tests {
         let err = global
             .bind_frame(BlockKey::new(test_file_id(7), test_block_id(12)), &mut g3)
             .unwrap_err();
-        assert!(matches!(err, Error::InvalidState));
+        assert_eq!(
+            err.report().downcast_ref::<InternalError>().copied(),
+            Some(InternalError::ReadonlyMappingConflict)
+        );
 
         drop(g3);
         assert_eq!(global.invalidate_key(&key), Some(test_page_id(3)));
@@ -1777,18 +1871,16 @@ pub(crate) mod tests {
                 reservation,
             );
 
-            submission.complete_inflight_once(Err(Error::SendError));
+            submission.complete_inflight_once(Err(CompletionErrorKind::report_send(
+                "complete readonly inflight test send failure",
+            )));
             assert!(submission.completed);
-            assert!(matches!(
-                inflight.completed_result(),
-                Some(Err(Error::SendError))
-            ));
+            let report = inflight.completed_result().unwrap().unwrap_err();
+            assert_eq!(*report.current_context(), CompletionErrorKind::Send);
 
             drop(submission);
-            assert!(matches!(
-                inflight.completed_result(),
-                Some(Err(Error::SendError))
-            ));
+            let report = inflight.completed_result().unwrap().unwrap_err();
+            assert_eq!(*report.current_context(), CompletionErrorKind::Send);
 
             drop(pool);
             drop(table_file);
@@ -1803,7 +1895,11 @@ pub(crate) mod tests {
         let temp_dir = TempDir::new().unwrap();
         let fs_owner = build_test_fs_owner_in(temp_dir.path()).unwrap();
         let res = ReadonlyBufferPool::with_capacity(PoolRole::Disk, bytes, fs_owner.guard());
-        assert!(matches!(res, Err(Error::BufferPoolSizeTooSmall)));
+        assert!(
+            res.as_ref().is_err_and(
+                |err| err.resource_error() == Some(ResourceError::BufferPoolSizeTooSmall)
+            )
+        );
     }
 
     #[test]
@@ -2304,9 +2400,14 @@ pub(crate) mod tests {
                         Ok((_frame_id, _page_guard)) => {
                             panic!("reserve waiter unexpectedly acquired a frame");
                         }
-                        Err(err) => {
-                            global.complete_inflight_load(key, &inflight_for_waiter, Err(err))
-                        }
+                        Err(err) => global.complete_inflight_load(
+                            key,
+                            &inflight_for_waiter,
+                            Err(CompletionErrorKind::report_error(
+                                err,
+                                format!("reserve readonly test block load frame: key={key:?}"),
+                            )),
+                        ),
                     }
                 });
                 evict_listener.await;
@@ -2328,10 +2429,11 @@ pub(crate) mod tests {
             reserve_waiter.await;
             teardown.join().unwrap();
             assert!(dropped.load(Ordering::SeqCst));
-            assert!(matches!(
-                inflight.wait_result().await,
-                Err(Error::InvalidState)
-            ));
+            let report = inflight.wait_result().await.unwrap_err();
+            assert_eq!(
+                *report.current_context(),
+                CompletionErrorKind::Lifecycle(LifecycleError::Shutdown)
+            );
         });
     }
 
@@ -2375,8 +2477,14 @@ pub(crate) mod tests {
             smol::Timer::after(Duration::from_millis(10)).await;
             read_hook.release();
 
-            assert!(matches!(waiter1.await, Err(Error::IOError { .. })));
-            assert!(matches!(waiter2.await, Err(Error::IOError { .. })));
+            assert!(waiter1.await.as_ref().is_err_and(|err| matches!(
+                err.completion_error(),
+                Some(CompletionErrorKind::Io(_))
+            )));
+            assert!(waiter2.await.as_ref().is_err_and(|err| matches!(
+                err.completion_error(),
+                Some(CompletionErrorKind::Io(_))
+            )));
             assert_eq!(read_hook.call_count(), 1);
             assert_eq!(global.allocated(), 0);
             assert_eq!(global.try_get_frame_id(&key), None);
@@ -2447,24 +2555,8 @@ pub(crate) mod tests {
                 Ok(_) => panic!("expected persisted LWC corruption"),
                 Err(err) => err,
             };
-            assert!(matches!(
-                err1,
-                Error::BlockCorrupted {
-                    file_kind: FileKind::TableFile,
-                    block_kind: BlockKind::LwcBlock,
-                    block_id: page_id,
-                    cause: BlockCorruptionCause::ChecksumMismatch,
-                } if page_id == test_block_id(8)
-            ));
-            assert!(matches!(
-                err2,
-                Error::BlockCorrupted {
-                    file_kind: FileKind::TableFile,
-                    block_kind: BlockKind::LwcBlock,
-                    block_id: page_id,
-                    cause: BlockCorruptionCause::ChecksumMismatch,
-                } if page_id == test_block_id(8)
-            ));
+            assert_completion_data_integrity(err1);
+            assert_completion_data_integrity(err2);
             assert_eq!(read_hook.call_count(), 1);
             assert_eq!(global.allocated(), 0);
             assert_eq!(global.try_get_frame_id(&key), None);
@@ -2503,15 +2595,7 @@ pub(crate) mod tests {
                 Ok(_) => panic!("expected persisted LWC corruption"),
                 Err(err) => err,
             };
-            assert!(matches!(
-                err,
-                Error::BlockCorrupted {
-                    file_kind: FileKind::TableFile,
-                    block_kind: BlockKind::LwcBlock,
-                    block_id: page_id,
-                    cause: BlockCorruptionCause::ChecksumMismatch,
-                } if page_id == test_block_id(9)
-            ));
+            assert_completion_data_integrity(err);
             assert_eq!(global.try_get_frame_id(&key), None);
             assert_eq!(global.allocated(), 0);
         });
@@ -2554,15 +2638,7 @@ pub(crate) mod tests {
                 Ok(_) => panic!("expected persisted LWC invalid-payload corruption"),
                 Err(err) => err,
             };
-            assert!(matches!(
-                err,
-                Error::BlockCorrupted {
-                    file_kind: FileKind::TableFile,
-                    block_kind: BlockKind::LwcBlock,
-                    block_id: page_id,
-                    cause: BlockCorruptionCause::InvalidPayload,
-                } if page_id == test_block_id(10)
-            ));
+            assert_completion_data_integrity(err);
             assert_eq!(global.try_get_frame_id(&key), None);
             assert_eq!(global.allocated(), 0);
         });
@@ -2601,15 +2677,7 @@ pub(crate) mod tests {
                 Ok(_) => panic!("expected persisted column-block corruption"),
                 Err(err) => err,
             };
-            assert!(matches!(
-                err,
-                Error::BlockCorrupted {
-                    file_kind: FileKind::TableFile,
-                    block_kind: BlockKind::ColumnBlockIndex,
-                    block_id: page_id,
-                    cause: BlockCorruptionCause::ChecksumMismatch,
-                } if page_id == test_block_id(10)
-            ));
+            assert_completion_data_integrity(err);
             assert_eq!(global.try_get_frame_id(&key), None);
             assert_eq!(global.allocated(), 0);
         });
@@ -2644,15 +2712,7 @@ pub(crate) mod tests {
                 Ok(_) => panic!("expected persisted deletion-blob corruption"),
                 Err(err) => err,
             };
-            assert!(matches!(
-                err,
-                Error::BlockCorrupted {
-                    file_kind: FileKind::TableFile,
-                    block_kind: BlockKind::ColumnDeletionBlob,
-                    block_id: page_id,
-                    cause: BlockCorruptionCause::ChecksumMismatch,
-                } if page_id == test_block_id(11)
-            ));
+            assert_completion_data_integrity(err);
             assert_eq!(global.try_get_frame_id(&key), None);
             assert_eq!(global.allocated(), 0);
         });

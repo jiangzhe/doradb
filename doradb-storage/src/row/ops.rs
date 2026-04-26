@@ -168,32 +168,6 @@ impl InsertRow {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum InsertMvcc {
-    // PageGuard is required if table has unique index and
-    // we may need to linke a deleted version to the new version.
-    // In such scenario, we should keep the page for shared mode
-    // and acquire row lock when we do the linking.
-    Inserted(RowID),
-    WriteConflict,
-    DuplicateKey,
-}
-
-impl InsertMvcc {
-    #[inline]
-    pub fn is_inserted(&self) -> bool {
-        matches!(self, InsertMvcc::Inserted(_))
-    }
-
-    #[inline]
-    pub fn unwrap_inserted(self) -> RowID {
-        match self {
-            InsertMvcc::Inserted(row_id) => row_id,
-            _ => panic!("insert not ok"),
-        }
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LinkForUniqueIndex {
     Linked,
@@ -225,8 +199,6 @@ impl Update {
 pub enum UpdateMvcc {
     Updated(RowID),
     NotFound,
-    WriteConflict,
-    DuplicateKey,
 }
 
 impl UpdateMvcc {

@@ -147,10 +147,11 @@ impl<'a, C: BTreeSlotCallback, P: BufferPool> BTreePrefixScan<'a, C, P> {
 mod tests {
     use super::*;
     use crate::buffer::FixedBufferPool;
-    use crate::error::Error;
+    use crate::error::InternalError;
     use crate::index::btree::BTree;
     use crate::index::btree::BTreeU64;
     use crate::quiescent::QuiescentBox;
+    use error_stack::Report;
 
     #[test]
     fn test_btree_scan_single_node() {
@@ -284,7 +285,7 @@ mod tests {
     impl BTreeSlotCallback for FailOnFirstSlot {
         #[inline]
         fn apply(&mut self, _: &BTreeNode, _: &BTreeSlot) -> Result<bool> {
-            Err(Error::InvalidState)
+            Err(Report::new(InternalError::InjectedTestFailure).into())
         }
     }
 
@@ -308,7 +309,10 @@ mod tests {
                 .scan_prefix(b"a")
                 .await
                 .expect_err("callback error should abort the scan");
-            assert!(matches!(err, Error::InvalidState));
+            assert_eq!(
+                err.report().downcast_ref::<InternalError>().copied(),
+                Some(InternalError::InjectedTestFailure)
+            );
         });
     }
 }

@@ -2,6 +2,8 @@ use std::result::Result as StdResult;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+pub type StdIoResult<T> = StdResult<T, std::io::Error>;
+
 /// Worker-owned completion token stored in backend user-data fields.
 ///
 /// The token packs the inflight-slot generation into the high 32 bits and the
@@ -177,5 +179,5 @@ pub trait IOBackend {
         &mut self,
         events: &mut Self::Events,
         min_nr: usize,
-    ) -> Vec<(BackendToken, StdResult<usize, std::io::Error>)>;
+    ) -> Vec<(BackendToken, StdIoResult<usize>)>;
 }

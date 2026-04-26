@@ -1,7 +1,7 @@
 use crate::buffer::PoolGuards;
 
 use crate::catalog::{TableCache, TableID, TableSpec};
-use crate::error::{Result, StoragePoisonSource};
+use crate::error::{FatalError, Result};
 use crate::row::RowID;
 use crate::row::ops::SelectKey;
 use crate::trx::redo::{DDLRedo, RedoLogs, RowRedo};
@@ -233,7 +233,8 @@ impl Statement {
             self.trx.discard_after_fatal_rollback();
             return Err(engine
                 .trx_sys
-                .poison_storage(StoragePoisonSource::RollbackAccess));
+                .poison_storage(FatalError::RollbackAccess)
+                .into());
         }
         // rollback index data.
         if self
@@ -245,7 +246,8 @@ impl Statement {
             self.trx.discard_after_fatal_rollback();
             return Err(engine
                 .trx_sys
-                .poison_storage(StoragePoisonSource::RollbackAccess));
+                .poison_storage(FatalError::RollbackAccess)
+                .into());
         }
         // clear redo logs.
         self.effects.clear_redo();

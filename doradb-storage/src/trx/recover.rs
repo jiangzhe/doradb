@@ -20,7 +20,7 @@ use crate::buffer::{
 use crate::catalog::{
     Catalog, CatalogTable, TableID, TableMetadata, is_catalog_obj_id, is_user_obj_id,
 };
-use crate::error::{Error, Result};
+use crate::error::{DataIntegrityError, Error, OperationError, Result};
 use crate::file::fs::FileSystem;
 use crate::latch::LatchFallbackMode;
 use crate::quiescent::QuiescentGuard;
@@ -32,6 +32,7 @@ use crate::trx::purge::GC;
 use crate::trx::redo::{DDLRedo, RedoLogs, RowRedo, RowRedoKind, TableDML};
 use crate::trx::{MAX_SNAPSHOT_TS, MIN_SNAPSHOT_TS, TrxID};
 use crossbeam_utils::CachePadded;
+use error_stack::Report;
 use flume::Receiver;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
@@ -122,7 +123,13 @@ pub(crate) async fn log_recover(
     let next_trx_ts = max_recovered_cts
         .checked_add(1)
         .filter(|ts| *ts < MAX_SNAPSHOT_TS)
-        .ok_or(Error::InvalidState)?;
+        .ok_or_else(|| {
+            Error::from(
+                Report::new(DataIntegrityError::LogFileCorrupted).attach(format!(
+                    "recovered commit timestamp out of range: max_recovered_cts={max_recovered_cts}"
+                )),
+            )
+        })?;
     log_partition_initializers = log_streams
         .into_iter()
         .map(|s| s.into_initializer())
@@ -276,10 +283,12 @@ impl<'a> LogRecovery<'a> {
                 )
                 .await?;
             self.track_loaded_table(table.table_id).await?;
-            let state = self
-                .table_states
-                .get(&table.table_id)
-                .ok_or(Error::TableNotFound)?;
+            let state = self.table_states.get(&table.table_id).ok_or_else(|| {
+                Error::from(Report::new(OperationError::TableNotFound).attach(format!(
+                    "bootstrap checkpointed table state: table_id={}",
+                    table.table_id
+                )))
+            })?;
             self.replay_floor = self.replay_floor.min(state.replay_start_ts());
         }
         Ok(())
@@ -291,11 +300,12 @@ impl<'a> LogRecovery<'a> {
     }
 
     async fn track_loaded_table(&mut self, table_id: TableID) -> Result<()> {
-        let table = self
-            .catalog
-            .get_table(table_id)
-            .await
-            .ok_or(Error::TableNotFound)?;
+        let table = self.catalog.get_table(table_id).await.ok_or_else(|| {
+            Error::from(
+                Report::new(OperationError::TableNotFound)
+                    .attach(format!("track loaded table runtime: table_id={table_id}")),
+            )
+        })?;
         // `recovery_bootstrap_unchecked`: recovery records replay floors from
         // the table root loaded during restart, before normal transactions run.
         let active_root = table.file().active_root_unchecked();
@@ -309,7 +319,9 @@ impl<'a> LogRecovery<'a> {
             .max(state.deletion_cutoff_ts);
         let old = self.table_states.insert(table_id, state);
         if old.is_some() {
-            return Err(Error::TableAlreadyExists);
+            return Err(Report::new(OperationError::TableAlreadyExists)
+                .attach(format!("track loaded table state: table_id={table_id}"))
+                .into());
         }
         Ok(())
     }
@@ -319,7 +331,11 @@ impl<'a> LogRecovery<'a> {
         self.table_states
             .get(&table_id)
             .map(|state| state.heap_redo_start_ts)
-            .ok_or(Error::TableNotFound)
+            .ok_or_else(|| {
+                Error::from(Report::new(OperationError::TableNotFound).attach(format!(
+                    "lookup heap redo start timestamp: table_id={table_id}"
+                )))
+            })
     }
 
     #[inline]
@@ -327,7 +343,11 @@ impl<'a> LogRecovery<'a> {
         self.table_states
             .get(&table_id)
             .map(|state| state.deletion_cutoff_ts)
-            .ok_or(Error::TableNotFound)
+            .ok_or_else(|| {
+                Error::from(Report::new(OperationError::TableNotFound).attach(format!(
+                    "lookup deletion cutoff timestamp: table_id={table_id}"
+                )))
+            })
     }
 
     #[inline]
@@ -335,7 +355,11 @@ impl<'a> LogRecovery<'a> {
         self.table_states
             .get(&table_id)
             .map(|state| state.replay_start_ts())
-            .ok_or(Error::TableNotFound)
+            .ok_or_else(|| {
+                Error::from(Report::new(OperationError::TableNotFound).attach(format!(
+                    "lookup replay start timestamp: table_id={table_id}"
+                )))
+            })
     }
 
     async fn replay_log(&mut self, log: TrxLog) -> Result<()> {
@@ -434,7 +458,9 @@ impl<'a> LogRecovery<'a> {
                 }
                 self.replay_catalog_modifications(dml).await?;
                 if self.catalog.remove_user_table(*table_id).is_none() {
-                    return Err(Error::TableNotFound);
+                    return Err(Report::new(OperationError::TableNotFound)
+                        .attach(format!("replay drop table: table_id={table_id}"))
+                        .into());
                 }
                 self.table_states.remove(table_id);
                 self.recovered_tables.remove(table_id);
@@ -451,11 +477,12 @@ impl<'a> LogRecovery<'a> {
                 }
                 // Row page creation is guaranteed to be ordered in the redo log,
                 // so its safe to recreate it and the row id range must be identical.
-                let table = self
-                    .catalog
-                    .get_table(*table_id)
-                    .await
-                    .ok_or(Error::TableNotFound)?;
+                let table = self.catalog.get_table(*table_id).await.ok_or_else(|| {
+                    Error::from(
+                        Report::new(OperationError::TableNotFound)
+                            .attach(format!("replay create row page: table_id={table_id}")),
+                    )
+                })?;
                 let count = end_row_id - start_row_id;
                 let mut page_guard = table
                     .allocate_row_page_at(&self.pool_guards, count as usize, *page_id)
@@ -484,11 +511,12 @@ impl<'a> LogRecovery<'a> {
                 if cts < self.table_heap_redo_start_ts(*table_id)? {
                     return Ok(());
                 }
-                let _ = self
-                    .catalog
-                    .get_table(*table_id)
-                    .await
-                    .ok_or(Error::TableNotFound)?;
+                let _ = self.catalog.get_table(*table_id).await.ok_or_else(|| {
+                    Error::from(
+                        Report::new(OperationError::TableNotFound)
+                            .attach(format!("replay data checkpoint: table_id={table_id}")),
+                    )
+                })?;
             }
             _ => todo!(),
         }
@@ -517,10 +545,12 @@ impl<'a> LogRecovery<'a> {
                 if !self.should_replay_catalog(cts) {
                     continue;
                 }
-                let table = self
-                    .catalog
-                    .get_catalog_table(table_id)
-                    .ok_or(Error::TableNotFound)?;
+                let table = self.catalog.get_catalog_table(table_id).ok_or_else(|| {
+                    Error::from(
+                        Report::new(OperationError::TableNotFound)
+                            .attach(format!("replay catalog DML: table_id={table_id}")),
+                    )
+                })?;
                 self.replay_catalog_table_modifications(&table, &table_dml.rows)
                     .await?;
                 continue;
@@ -528,11 +558,12 @@ impl<'a> LogRecovery<'a> {
             if cts < self.table_replay_start_ts(table_id)? {
                 continue;
             }
-            let table = self
-                .catalog
-                .get_table(table_id)
-                .await
-                .ok_or(Error::TableNotFound)?;
+            let table = self.catalog.get_table(table_id).await.ok_or_else(|| {
+                Error::from(
+                    Report::new(OperationError::TableNotFound)
+                        .attach(format!("replay user table DML: table_id={table_id}")),
+                )
+            })?;
             self.replay_table_dml(table_id, &table, &table_dml.rows, cts, disable_index)
                 .await?;
         }
@@ -546,10 +577,11 @@ impl<'a> LogRecovery<'a> {
         dml: BTreeMap<TableID, TableDML>,
     ) -> Result<()> {
         for (table_id, table_dml) in dml {
-            let table = self
-                .catalog
-                .get_catalog_table(table_id)
-                .ok_or(Error::TableNotFound)?;
+            let table = self.catalog.get_catalog_table(table_id).ok_or_else(|| {
+                Error::from(Report::new(OperationError::TableNotFound).attach(format!(
+                    "replay catalog table modifications: table_id={table_id}"
+                )))
+            })?;
             self.replay_catalog_table_modifications(&table, &table_dml.rows)
                 .await?;
         }
@@ -658,15 +690,15 @@ mod tests {
         TableMetadata, TableSpec,
     };
     use crate::conf::{EngineConfig, EvictableBufferPoolConfig, FileSystemConfig, TrxSysConfig};
-    use crate::error::{BlockCorruptionCause, BlockKind, Error, FileKind};
+    use crate::error::{CompletionErrorKind, DataIntegrityError, Error};
     use crate::file::block_integrity::{BLOCK_INTEGRITY_HEADER_SIZE, write_block_checksum};
     use crate::file::cow_file::COW_FILE_PAGE_SIZE;
     use crate::index::{
         COLUMN_DELETION_BLOB_PAGE_HEADER_SIZE, ColumnBlockIndex, UniqueIndex,
         load_entry_deletion_deltas,
     };
-    use crate::row::RowRead;
-    use crate::row::ops::{DeleteMvcc, InsertMvcc, SelectKey, SelectMvcc, UpdateCol, UpdateMvcc};
+    use crate::row::ops::{DeleteMvcc, SelectKey, SelectMvcc, UpdateCol, UpdateMvcc};
+    use crate::row::{RowID, RowRead};
     use crate::stmt::Statement;
     use crate::table::{CheckpointOutcome, DeleteMarker, Table, TableAccess, TablePersistence};
     use crate::trx::{MIN_SNAPSHOT_TS, TrxID};
@@ -679,6 +711,24 @@ mod tests {
     const LIGHTWEIGHT_RECOVERY_BUFFER_BYTES: usize = 16 * 1024 * 1024;
     const LIGHTWEIGHT_RECOVERY_MAX_FILE_BYTES: usize = 32 * 1024 * 1024;
     const LIGHTWEIGHT_RECOVERY_READONLY_BUFFER_BYTES: usize = 32 * 1024 * 1024;
+
+    fn assert_table_data_integrity(
+        err: Error,
+        block_kind: &str,
+        block_id: crate::file::BlockID,
+        expected: DataIntegrityError,
+    ) {
+        let report = format!("{err:?}");
+        if err.completion_error() == Some(CompletionErrorKind::DataIntegrity(expected)) {
+            assert!(report.contains("propagate from other threads"), "{report}");
+            assert!(report.contains("wait for"), "{report}");
+            return;
+        }
+        assert_eq!(err.data_integrity_error(), Some(expected), "{report}");
+        assert!(report.contains("table-file"), "{report}");
+        assert!(report.contains(block_kind), "{report}");
+        assert!(report.contains(&format!("block_id={block_id}")), "{report}");
+    }
 
     fn lightweight_recovery_engine_config(
         main_dir: impl Into<std::path::PathBuf>,
@@ -721,7 +771,7 @@ mod tests {
         stmt: &mut Statement,
         table: &Table,
         cols: Vec<Val>,
-    ) -> crate::error::Result<InsertMvcc> {
+    ) -> crate::error::Result<RowID> {
         let (ctx, effects) = stmt.ctx_and_effects_mut();
         table.accessor().insert_mvcc(ctx, effects, cols).await
     }
@@ -998,7 +1048,7 @@ mod tests {
                         vec![Val::from(j as u32), Val::from(&s[..])],
                     )
                     .await;
-                    assert!(matches!(res, Ok(InsertMvcc::Inserted(_))));
+                    assert!(res.is_ok());
                     trx = stmt.succeed();
                 }
                 trx.commit().await.unwrap();
@@ -1183,7 +1233,7 @@ mod tests {
             )
             .await;
             let cold_row_id = match insert {
-                Ok(InsertMvcc::Inserted(row_id)) => row_id,
+                Ok(row_id) => row_id,
                 other => panic!("expected cold insert success, got {other:?}"),
             };
             trx = stmt.succeed();
@@ -1302,7 +1352,7 @@ mod tests {
                 vec![Val::from(7u32), Val::from("cold-row")],
             )
             .await;
-            let Ok(InsertMvcc::Inserted(cold_row_id)) = insert else {
+            let Ok(cold_row_id) = insert else {
                 panic!("cold insert should succeed");
             };
             trx = stmt.succeed();
@@ -1329,7 +1379,7 @@ mod tests {
                 vec![Val::from(7u32), Val::from("hot-row")],
             )
             .await;
-            let Ok(InsertMvcc::Inserted(hot_row_id)) = insert else {
+            let Ok(hot_row_id) = insert else {
                 panic!("hot insert should reclaim deleted cold key");
             };
             assert_ne!(cold_row_id, hot_row_id);
@@ -1440,7 +1490,7 @@ mod tests {
                     vec![Val::from(id), Val::from("same-name")],
                 )
                 .await;
-                let Ok(InsertMvcc::Inserted(row_id)) = insert else {
+                let Ok(row_id) = insert else {
                     panic!("same-name insert should succeed");
                 };
                 same_row_ids.push(row_id);
@@ -1582,7 +1632,7 @@ mod tests {
                 vec![Val::from(7u32), Val::from("cold-row")],
             )
             .await;
-            assert!(matches!(insert, Ok(InsertMvcc::Inserted(_))));
+            assert!(insert.is_ok());
             trx = stmt.succeed();
             trx.commit().await.unwrap();
 
@@ -1600,7 +1650,7 @@ mod tests {
                 vec![Val::from(8u32), Val::from("hot-row")],
             )
             .await;
-            assert!(matches!(insert, Ok(InsertMvcc::Inserted(_))));
+            assert!(insert.is_ok());
             trx = stmt.succeed();
             trx.commit().await.unwrap();
 
@@ -1697,7 +1747,7 @@ mod tests {
             for i in 0..10u32 {
                 let mut stmt = trx.start_stmt();
                 let insert = stmt_insert_row(&mut stmt, &table, vec![Val::from(i)]).await;
-                assert!(matches!(insert, Ok(InsertMvcc::Inserted(_))));
+                assert!(insert.is_ok());
                 trx = stmt.succeed();
             }
             trx.commit().await.unwrap();
@@ -1752,7 +1802,7 @@ mod tests {
             let mut trx = session.try_begin_trx().unwrap().unwrap();
             let mut stmt = trx.start_stmt();
             let insert = stmt_insert_row(&mut stmt, &table, vec![Val::from(100u32)]).await;
-            assert!(matches!(insert, Ok(InsertMvcc::Inserted(_))));
+            assert!(insert.is_ok());
             trx = stmt.succeed();
             trx.commit().await.unwrap();
 
@@ -1904,7 +1954,7 @@ mod tests {
                 vec![Val::from(7u32), Val::from("persisted-row")],
             )
             .await;
-            assert!(matches!(insert, Ok(InsertMvcc::Inserted(_))));
+            assert!(insert.is_ok());
             trx = stmt.succeed();
             trx.commit().await.unwrap();
 
@@ -1920,7 +1970,7 @@ mod tests {
                 vec![Val::from(8u32), Val::from("replayed-row")],
             )
             .await;
-            assert!(matches!(insert, Ok(InsertMvcc::Inserted(_))));
+            assert!(insert.is_ok());
             trx = stmt.succeed();
             trx.commit().await.unwrap();
 
@@ -2080,7 +2130,7 @@ mod tests {
                 vec![Val::from(7u32), Val::from("persisted-row")],
             )
             .await;
-            assert!(matches!(insert, Ok(InsertMvcc::Inserted(_))));
+            assert!(insert.is_ok());
             trx = stmt.succeed();
             trx.commit().await.unwrap();
 
@@ -2136,15 +2186,16 @@ mod tests {
             let stmt = trx.start_stmt();
             let key = SelectKey::new(0, vec![Val::from(7u32)]);
             let res = stmt_select_row_mvcc(&stmt, &table, &key, &[0, 1]).await;
-            match res {
-                Err(Error::BlockCorrupted {
-                    file_kind: FileKind::TableFile,
-                    block_kind: BlockKind::LwcBlock,
-                    block_id: page_id,
-                    cause: BlockCorruptionCause::ChecksumMismatch,
-                }) => assert_eq!(page_id, block_id),
+            let err = match res {
+                Err(err) => err,
                 other => panic!("expected persisted LWC corruption on read, got {other:?}"),
-            }
+            };
+            assert_table_data_integrity(
+                err,
+                "lwc-block",
+                block_id,
+                DataIntegrityError::ChecksumMismatch,
+            );
             trx = stmt.fail().await.unwrap();
             trx.rollback().await.unwrap();
 
@@ -2200,7 +2251,7 @@ mod tests {
             for i in 0..80u32 {
                 let mut stmt = trx.start_stmt();
                 let insert = stmt_insert_row(&mut stmt, &table, vec![Val::from(i)]).await;
-                assert!(matches!(insert, Ok(InsertMvcc::Inserted(_))));
+                assert!(insert.is_ok());
                 trx = stmt.succeed();
             }
             trx.commit().await.unwrap();
@@ -2242,7 +2293,7 @@ mod tests {
             let mut trx = session.try_begin_trx().unwrap().unwrap();
             let mut stmt = trx.start_stmt();
             let insert = stmt_insert_row(&mut stmt, &table, vec![Val::from(1000u32)]).await;
-            assert!(matches!(insert, Ok(InsertMvcc::Inserted(_))));
+            assert!(insert.is_ok());
             trx = stmt.succeed();
             trx.commit().await.unwrap();
 
@@ -2316,15 +2367,12 @@ mod tests {
                 Ok(_) => panic!("expected invalid delete blob on delta load"),
                 Err(err) => err,
             };
-            match err {
-                Error::BlockCorrupted {
-                    file_kind: FileKind::TableFile,
-                    block_kind: BlockKind::ColumnDeletionBlob,
-                    block_id: page_id,
-                    cause: BlockCorruptionCause::InvalidPayload,
-                } => assert_eq!(page_id, blob_ref.start_page_id),
-                other => panic!("expected invalid delete blob on delta load, got {other:?}"),
-            }
+            assert_table_data_integrity(
+                err,
+                "column-deletion-blob",
+                blob_ref.start_page_id,
+                DataIntegrityError::InvalidPayload,
+            );
 
             drop(table);
             drop(session);

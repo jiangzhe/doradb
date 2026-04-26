@@ -13,7 +13,7 @@ use crate::buffer::guard::{
 use crate::buffer::{BufferPool, FixedBufferPool, PoolGuard};
 use crate::error::Validation;
 use crate::error::Validation::{Invalid, Valid};
-use crate::error::{Error, Result};
+use crate::error::{ConfigError, Result};
 use crate::index::btree::algo::{
     KnownFenceNodeParams, MemTreeSiblingMergePlan, NodeSlotRange, pack_node_range_box,
     pack_node_range_into, pack_node_ranges_box, plan_memtree_sibling_merge,
@@ -23,6 +23,7 @@ use crate::latch::LatchFallbackMode;
 use crate::quiescent::QuiescentGuard;
 use crate::trx::TrxID;
 use either::Either;
+use error_stack::Report;
 use std::marker::PhantomData;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -1573,7 +1574,9 @@ impl BTreeCompactConfig {
             || !(0.0..=1.0).contains(&high_ratio)
             || high_ratio < low_ratio
         {
-            return Err(Error::InvalidArgument);
+            return Err(Report::new(ConfigError::InvalidBTreeCompactRatio)
+                .attach(format!("low_ratio={low_ratio}, high_ratio={high_ratio}"))
+                .into());
         }
         Ok(BTreeCompactConfig {
             low_ratio,
@@ -1924,6 +1927,7 @@ enum BTreeCompact {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error::ResourceError;
     use crate::quiescent::{QuiescentBox, QuiescentGuard};
     use rand::SeedableRng;
     use rand_chacha::ChaCha8Rng;
@@ -2348,7 +2352,7 @@ mod tests {
                     .split_root::<BTreeU64>(&pool_guard, root, true, 210)
                     .await
                     .expect_err("second split-root allocation should fail");
-                assert!(matches!(err, Error::BufferPoolFull));
+                assert_eq!(err.resource_error(), Some(ResourceError::BufferPoolFull));
             }
 
             assert_eq!(pool.allocated(), 1);

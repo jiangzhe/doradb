@@ -21,7 +21,7 @@ use crate::buffer::{
     RowPoolRole,
 };
 use crate::catalog::{IndexSpec, TableID, TableMetadata};
-use crate::error::{Error, Result};
+use crate::error::{DataIntegrityError, Error, InternalError, Result};
 use crate::file::BlockID;
 use crate::file::table_file::{ActiveRoot, LwcBlockPersist, TableFile};
 use crate::index::util::{Maskable, RowPageCreateRedoCtx};
@@ -43,11 +43,19 @@ use crate::trx::{
     MAX_SNAPSHOT_TS, MIN_SNAPSHOT_TS, TrxContext, TrxID, TrxReadProof, trx_is_committed,
 };
 use crate::value::{PAGE_VAR_LEN_INLINE, Val};
+use error_stack::Report;
 use std::collections::HashMap;
 use std::marker::PhantomData;
 use std::ops::Deref;
 use std::sync::Arc;
 use std::time::Duration;
+
+#[inline]
+fn missing_secondary_index(index_no: usize, index_count: usize) -> Error {
+    Report::new(InternalError::SecondaryIndexOutOfBounds)
+        .attach(format!("index_no={index_no}, index_count={index_count}"))
+        .into()
+}
 
 /// Table is a logical data set of rows.
 /// It combines components such as row page, undo map, block index, secondary
@@ -165,7 +173,7 @@ impl<'ctx> TableRootSnapshot<'ctx> {
         self.secondary_index_roots
             .get(index_no)
             .copied()
-            .ok_or(Error::InvalidArgument)
+            .ok_or_else(|| missing_secondary_index(index_no, self.secondary_index_roots.len()))
     }
 
     /// Returns whether the captured root predates the supplied snapshot time.
@@ -499,7 +507,13 @@ impl<D: BufferPool, I: BufferPool> GenericMemTable<D, I> {
     ) -> Result<PageSharedGuard<RowPage>> {
         self.get_row_page_shared(guards, page_id)
             .await
-            .and_then(|guard| guard.ok_or(Error::InvalidState))
+            .and_then(|guard| {
+                guard.ok_or_else(|| {
+                    Report::new(InternalError::RowPageMissing)
+                        .attach(format!("page_id={page_id}"))
+                        .into()
+                })
+            })
     }
 
     #[inline]
@@ -510,7 +524,13 @@ impl<D: BufferPool, I: BufferPool> GenericMemTable<D, I> {
     ) -> Result<PageExclusiveGuard<RowPage>> {
         self.get_row_page_exclusive(guards, page_id)
             .await
-            .and_then(|guard| guard.ok_or(Error::InvalidState))
+            .and_then(|guard| {
+                guard.ok_or_else(|| {
+                    Report::new(InternalError::RowPageMissing)
+                        .attach(format!("page_id={page_id}"))
+                        .into()
+                })
+            })
     }
 
     #[inline]
@@ -644,7 +664,13 @@ impl ColumnStorage {
         let active_root = file.active_root_unchecked();
         let metadata = Arc::clone(&active_root.metadata);
         if active_root.secondary_index_roots.len() != metadata.index_specs.len() {
-            return Err(Error::InvalidState);
+            return Err(Report::new(DataIntegrityError::InvalidRootInvariant)
+                .attach(format!(
+                    "secondary root count mismatch: root_count={}, index_count={}",
+                    active_root.secondary_index_roots.len(),
+                    metadata.index_specs.len()
+                ))
+                .into());
         }
         let secondary_indexes = (0..metadata.index_specs.len())
             .map(|index_no| {
@@ -701,7 +727,7 @@ impl ColumnStorage {
     ) -> Result<&SecondaryDiskTreeRuntime> {
         self.secondary_indexes
             .get(index_no)
-            .ok_or(Error::InvalidArgument)
+            .ok_or_else(|| missing_secondary_index(index_no, self.secondary_indexes.len()))
     }
 
     /// Returns the reusable secondary DiskTree runtimes owned by this table.
@@ -914,7 +940,7 @@ impl Table {
         #[cfg(test)]
         {
             if tests::test_force_lwc_build_error_enabled() {
-                return Err(Error::InvalidState);
+                return Err(Report::new(InternalError::InjectedTestFailure).into());
             }
         }
         let mut lwc_blocks = Vec::new();
@@ -957,7 +983,12 @@ impl Table {
                     current_end = page_info.end_row_id;
                     let view = page.vector_view_in_transition(metadata, ctx, cutoff_ts, cutoff_ts);
                     if !builder.append_view(page, view)? {
-                        return Err(Error::InvalidState);
+                        return Err(Report::new(InternalError::LwcBuilderMisuse)
+                            .attach(format!(
+                                "single row page does not fit in LWC block: page_id={}",
+                                page_info.page_id
+                            ))
+                            .into());
                     }
                 } else {
                     current_end = page_info.end_row_id;

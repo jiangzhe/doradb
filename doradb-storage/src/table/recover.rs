@@ -1,6 +1,6 @@
 use crate::buffer::PageID;
 use crate::buffer::PoolGuards;
-use crate::error::{Error, Result};
+use crate::error::{DataIntegrityError, OperationError, RecoveryDuplicateKey, Result};
 use crate::index::IndexInsert;
 use crate::index::{NonUniqueIndex, UniqueIndex};
 use crate::row::ops::{ReadRow, SelectKey, UpdateCol};
@@ -13,6 +13,7 @@ use crate::trx::MIN_SNAPSHOT_TS;
 use crate::trx::TrxID;
 use crate::trx::row::ReadAllRows;
 use crate::value::Val;
+use error_stack::Report;
 use std::collections::HashMap;
 use std::future::Future;
 
@@ -169,14 +170,16 @@ impl TableRecover for Table {
                 return Ok(());
             }
             if !disable_index {
-                return Err(Error::NotSupported(
-                    "cold-row delete recovery requires deferred index rebuild",
-                ));
+                return Err(Report::new(OperationError::NotSupported)
+                    .attach("cold-row delete recovery requires deferred index rebuild")
+                    .into());
             }
             match self.deletion_buffer().put_committed(row_id, cts) {
                 Ok(()) => return Ok(()),
                 Err(DeletionError::AlreadyDeleted | DeletionError::WriteConflict) => {
-                    return Err(Error::InvalidState);
+                    return Err(Report::new(DataIntegrityError::InvalidRootInvariant)
+                        .attach(format!("row_id={row_id}, cts={cts}"))
+                        .into());
                 }
             }
         }
@@ -274,18 +277,21 @@ impl TableRecover for Table {
 pub(super) fn ensure_recovery_index_insert(index_no: usize, res: IndexInsert) -> Result<()> {
     match res {
         IndexInsert::Ok(_) => Ok(()),
-        IndexInsert::DuplicateKey(row_id, deleted) => Err(Error::UnexpectedRecoveryDuplicateKey {
+        IndexInsert::DuplicateKey(row_id, deleted) => Err(Report::new(
+            DataIntegrityError::UnexpectedRecoveryDuplicateKey,
+        )
+        .attach(RecoveryDuplicateKey {
             index_no,
             row_id,
             deleted,
-        }),
+        })
+        .into()),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::ensure_recovery_index_insert;
-    use crate::error::Error;
     use crate::index::IndexInsert;
 
     #[test]
@@ -298,17 +304,11 @@ mod tests {
     fn test_ensure_recovery_index_insert_rejects_duplicate_key() {
         let err =
             ensure_recovery_index_insert(3, IndexInsert::DuplicateKey(42, false)).unwrap_err();
-        match err {
-            Error::UnexpectedRecoveryDuplicateKey {
-                index_no,
-                row_id,
-                deleted,
-            } => {
-                assert_eq!(index_no, 3);
-                assert_eq!(row_id, 42);
-                assert!(!deleted);
-            }
-            _ => panic!("unexpected error: {err:?}"),
-        }
+        let duplicate = err
+            .downcast_ref::<crate::error::RecoveryDuplicateKey>()
+            .unwrap_or_else(|| panic!("unexpected error: {err:?}"));
+        assert_eq!(duplicate.index_no, 3);
+        assert_eq!(duplicate.row_id, 42);
+        assert!(!duplicate.deleted);
     }
 }

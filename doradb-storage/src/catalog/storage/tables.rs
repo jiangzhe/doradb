@@ -4,7 +4,7 @@ use crate::catalog::storage::CatalogDefinition;
 use crate::catalog::storage::object::TableObject;
 use crate::catalog::table::TableMetadata;
 use crate::catalog::{ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexSpec, TableID};
-use crate::row::ops::{DeleteMvcc, InsertMvcc, SelectKey};
+use crate::row::ops::{DeleteMvcc, SelectKey};
 use crate::row::{Row, RowRead};
 use crate::stmt::Statement;
 use crate::table::TableAccess;
@@ -89,10 +89,11 @@ impl Tables<'_> {
     pub async fn insert(&self, stmt: &mut Statement, obj: &TableObject) -> bool {
         let cols = vec![Val::from(obj.table_id)];
         let (ctx, effects) = stmt.ctx_and_effects_mut();
-        matches!(
-            self.table.accessor().insert_mvcc(ctx, effects, cols).await,
-            Ok(InsertMvcc::Inserted(_))
-        )
+        self.table
+            .accessor()
+            .insert_mvcc(ctx, effects, cols)
+            .await
+            .is_ok()
     }
 
     /// Delete a table by id.

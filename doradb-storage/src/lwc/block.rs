@@ -2,7 +2,7 @@
 
 use crate::buffer::{PoolGuard, ReadonlyBlockGuard, ReadonlyBufferPool};
 use crate::catalog::TableMetadata;
-use crate::error::{BlockCorruptionCause, BlockKind, Error, FileKind, Result};
+use crate::error::{DataIntegrityError, Error, FileKind, InternalError, OperationError, Result};
 use crate::file::SparseFile;
 use crate::file::block_integrity::{
     BLOCK_INTEGRITY_HEADER_SIZE, LWC_BLOCK_SPEC, max_payload_len, validate_block,
@@ -13,11 +13,33 @@ use crate::quiescent::QuiescentGuard;
 use crate::serde::{Ser, Serde};
 use crate::value::{Val, ValKind};
 use bytemuck::{Pod, Zeroable};
+use error_stack::{Report, ResultExt};
 use std::mem;
 use std::sync::Arc;
 
 /// Size in bytes of one validated persisted LWC payload, excluding the shared block envelope.
 pub const LWC_BLOCK_PAYLOAD_SIZE: usize = max_payload_len(COW_FILE_PAGE_SIZE);
+
+#[inline]
+fn invalid_lwc_payload(message: impl Into<String>) -> Error {
+    Report::new(DataIntegrityError::InvalidPayload)
+        .attach(message.into())
+        .into()
+}
+
+#[inline]
+fn persisted_lwc_payload_error(
+    file_kind: FileKind,
+    block_id: BlockID,
+    message: impl Into<String>,
+) -> Error {
+    let message = message.into();
+    Report::new(DataIntegrityError::InvalidPayload)
+        .attach(format!(
+            "file={file_kind}, block=lwc-block, block_id={block_id}, {message}"
+        ))
+        .into()
+}
 
 /// LwcBlock stores the payload of one immutable checksummed LWC block.
 ///
@@ -85,15 +107,25 @@ impl LwcBlock {
 
     #[inline]
     pub fn try_from_bytes(input: &[u8]) -> Result<&Self> {
-        let block =
-            bytemuck::try_from_bytes::<Self>(input).map_err(|_| Error::InvalidCompressedData)?;
+        let block = bytemuck::try_from_bytes::<Self>(input).map_err(|_| {
+            invalid_lwc_payload(format!(
+                "LWC block payload has invalid length {}, expected {}",
+                input.len(),
+                LWC_BLOCK_PAYLOAD_SIZE
+            ))
+        })?;
         block.validate_structure()?;
         Ok(block)
     }
 
     #[inline]
     pub fn try_from_bytes_mut(input: &mut [u8]) -> Result<&mut Self> {
-        bytemuck::try_from_bytes_mut::<Self>(input).map_err(|_| Error::InvalidCompressedData)
+        let input_len = input.len();
+        bytemuck::try_from_bytes_mut::<Self>(input).map_err(|_| {
+            invalid_lwc_payload(format!(
+                "mutable LWC block payload has invalid length {input_len}, expected {LWC_BLOCK_PAYLOAD_SIZE}"
+            ))
+        })
     }
 
     /// Validates a full persisted LWC block image and returns its payload view.
@@ -103,9 +135,9 @@ impl LwcBlock {
         file_kind: FileKind,
         block_id: BlockID,
     ) -> Result<&Self> {
-        let payload = validate_block(input, LWC_BLOCK_SPEC).map_err(|cause| {
-            Error::block_corrupted(file_kind, BlockKind::LwcBlock, block_id, cause)
-        })?;
+        let payload = validate_block(input, LWC_BLOCK_SPEC)
+            .attach_with(|| format!("file={file_kind}, block=lwc-block, block_id={block_id}"))
+            .map_err(Error::from)?;
         Self::try_from_bytes(payload)
             .map_err(|err| map_persisted_lwc_error(file_kind, block_id, err))
     }
@@ -126,7 +158,10 @@ impl LwcBlock {
         let col_count = self.header.col_count() as usize;
         let end_idx = col_count * mem::size_of::<u16>();
         if end_idx > self.body.len() {
-            return Err(Error::InvalidCompressedData);
+            return Err(invalid_lwc_payload(format!(
+                "LWC column offset table length {end_idx} exceeds body length {}",
+                self.body.len()
+            )));
         }
         let raw = &self.body[..end_idx];
         let offsets = bytemuck::cast_slice::<u8, [u8; 2]>(raw);
@@ -144,13 +179,23 @@ impl LwcBlock {
         col_idx: usize,
     ) -> Result<LwcColumn<'a>> {
         if col_idx >= metadata.col_count() {
-            return Err(Error::IndexOutOfBound);
+            return Err(Report::new(InternalError::ColumnIndexOutOfBounds)
+                .attach(format!(
+                    "col_idx={col_idx}, col_count={}",
+                    metadata.col_count()
+                ))
+                .into());
         }
-        let (start_idx, end_idx) = self
-            .col_offsets()
-            .and_then(|offsets| offsets.get(col_idx).ok_or(Error::InvalidCompressedData))?;
+        let (start_idx, end_idx) = self.col_offsets().and_then(|offsets| {
+            offsets.get(col_idx).ok_or_else(|| {
+                invalid_lwc_payload(format!("LWC column index {col_idx} is out of range"))
+            })
+        })?;
         if end_idx > self.body.len() || start_idx > end_idx {
-            return Err(Error::InvalidCompressedData);
+            return Err(invalid_lwc_payload(format!(
+                "invalid LWC column slice start={start_idx}, end={end_idx}, body_len={}",
+                self.body.len()
+            )));
         }
         let data = &self.body[start_idx..end_idx];
         let row_count = self.header.row_count() as usize;
@@ -159,7 +204,10 @@ impl LwcBlock {
             let (bitmap, values) = LwcNullBitmap::from_bytes(data)?;
             let required = row_count.div_ceil(8);
             if bitmap.len() < required {
-                return Err(Error::InvalidCompressedData);
+                return Err(invalid_lwc_payload(format!(
+                    "LWC null bitmap length {} is shorter than required {required}",
+                    bitmap.len()
+                )));
             }
             Ok(LwcColumn {
                 kind,
@@ -257,7 +305,7 @@ impl LwcBlock {
             .data()
             .map_err(|err| map_persisted_lwc_error(file_kind, block_id, err))?;
         data.value(row_idx)
-            .ok_or(Error::InvalidCompressedData)
+            .ok_or_else(|| invalid_lwc_payload(format!("LWC row index {row_idx} is out of range")))
             .map_err(|err| map_persisted_lwc_error(file_kind, block_id, err))
     }
 }
@@ -395,12 +443,16 @@ impl ColOffsets<'_> {
     pub fn validate(&self, body_len: usize) -> Result<()> {
         let mut start_idx = self.data_start;
         if start_idx > body_len {
-            return Err(Error::InvalidCompressedData);
+            return Err(invalid_lwc_payload(format!(
+                "LWC data start {start_idx} exceeds body length {body_len}"
+            )));
         }
         for offset in self.offsets {
             let end_idx = u16::from_le_bytes(*offset) as usize;
             if end_idx > body_len || start_idx > end_idx {
-                return Err(Error::InvalidCompressedData);
+                return Err(invalid_lwc_payload(format!(
+                    "invalid LWC column offset start={start_idx}, end={end_idx}, body_len={body_len}"
+                )));
             }
             start_idx = end_idx;
         }
@@ -491,16 +543,12 @@ impl Ser<'_> for LwcBlockHeader {
 
 #[inline]
 pub(crate) fn map_persisted_lwc_error(file_kind: FileKind, block_id: BlockID, err: Error) -> Error {
-    match err {
-        Error::InvalidCompressedData | Error::InvalidFormat | Error::NotSupported(_) => {
-            Error::block_corrupted(
-                file_kind,
-                BlockKind::LwcBlock,
-                block_id,
-                BlockCorruptionCause::InvalidPayload,
-            )
-        }
-        other => other,
+    if err.data_integrity_error().is_some()
+        || err.operation_error() == Some(OperationError::NotSupported)
+    {
+        persisted_lwc_payload_error(file_kind, block_id, "invalid persisted LWC payload")
+    } else {
+        err
     }
 }
 
@@ -508,7 +556,7 @@ pub(crate) fn map_persisted_lwc_error(file_kind: FileKind, block_id: BlockID, er
 mod tests {
     use super::*;
     use crate::catalog::{ColumnAttributes, ColumnSpec, TableMetadata};
-    use crate::error::{BlockCorruptionCause, BlockKind, FileKind};
+    use crate::error::{DataIntegrityError, Error, FileKind};
     use crate::file::block_integrity::{
         BLOCK_INTEGRITY_HEADER_SIZE, write_block_checksum, write_block_header,
     };
@@ -525,6 +573,18 @@ mod tests {
         ColumnBlockEntryShape::new(start_row_id, end_row_id, row_ids.to_vec(), Vec::new())
             .unwrap()
             .row_shape_fingerprint()
+    }
+
+    fn assert_lwc_data_integrity(
+        err: Error,
+        block_id: crate::file::cow_file::BlockID,
+        expected: DataIntegrityError,
+    ) {
+        assert_eq!(err.data_integrity_error(), Some(expected));
+        let report = format!("{err:?}");
+        assert!(report.contains("table-file"), "{report}");
+        assert!(report.contains("lwc-block"), "{report}");
+        assert!(report.contains(&format!("block_id={block_id}")), "{report}");
     }
 
     fn build_persisted_lwc_block() -> DirectBuf {
@@ -648,14 +708,23 @@ mod tests {
         page.body[2..4].copy_from_slice(&end_offset.to_le_bytes());
 
         let err = page.column(&metadata, 1);
-        assert!(matches!(err, Err(Error::IndexOutOfBound)));
+        assert!(err.as_ref().is_err_and(|err| {
+            err.is_kind(crate::error::ErrorKind::Internal)
+                && err
+                    .report()
+                    .downcast_ref::<crate::error::InternalError>()
+                    .copied()
+                    == Some(crate::error::InternalError::ColumnIndexOutOfBounds)
+        }));
     }
 
     #[test]
     fn test_lwc_block_try_from_bytes_invalid_len() {
         let bytes = [0u8; LWC_BLOCK_PAYLOAD_SIZE - 1];
         let err = LwcBlock::try_from_bytes(&bytes);
-        assert!(matches!(err, Err(Error::InvalidCompressedData)));
+        assert!(err.as_ref().is_err_and(
+            |err| err.data_integrity_error() == Some(DataIntegrityError::InvalidPayload)
+        ));
     }
 
     #[test]
@@ -689,15 +758,7 @@ mod tests {
             Ok(_) => panic!("expected LWC checksum corruption"),
             Err(err) => err,
         };
-        assert!(matches!(
-            err,
-            Error::BlockCorrupted {
-                file_kind: FileKind::TableFile,
-                block_kind: BlockKind::LwcBlock,
-                block_id: page_id,
-                cause: BlockCorruptionCause::ChecksumMismatch,
-            } if page_id == test_block_id(7)
-        ));
+        assert_lwc_data_integrity(err, test_block_id(7), DataIntegrityError::ChecksumMismatch);
     }
 
     #[test]
@@ -760,15 +821,7 @@ mod tests {
             Ok(_) => panic!("expected invalid persisted offsets"),
             Err(err) => err,
         };
-        assert!(matches!(
-            err,
-            Error::BlockCorrupted {
-                file_kind: FileKind::TableFile,
-                block_kind: BlockKind::LwcBlock,
-                block_id: page_id,
-                cause: BlockCorruptionCause::InvalidPayload,
-            } if page_id == test_block_id(9)
-        ));
+        assert_lwc_data_integrity(err, test_block_id(9), DataIntegrityError::InvalidPayload);
     }
 
     #[test]
@@ -802,14 +855,6 @@ mod tests {
         let err = page
             .decode_persisted_full_row_values(&metadata, 0, FileKind::TableFile, test_block_id(10))
             .unwrap_err();
-        assert!(matches!(
-            err,
-            Error::BlockCorrupted {
-                file_kind: FileKind::TableFile,
-                block_kind: BlockKind::LwcBlock,
-                block_id: page_id,
-                cause: BlockCorruptionCause::InvalidPayload,
-            } if page_id == test_block_id(10)
-        ));
+        assert_lwc_data_integrity(err, test_block_id(10), DataIntegrityError::InvalidPayload);
     }
 }

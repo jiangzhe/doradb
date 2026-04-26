@@ -18,7 +18,7 @@ use crate::buffer::{
     BufferPool, EvictableBufferPool, FixedBufferPool, PoolGuards, PoolRole, ReadonlyBufferPool,
 };
 use crate::component::{Component, ComponentRegistry, MetaPool, ShelfScope};
-use crate::error::{Error, Result};
+use crate::error::{DataIntegrityError, OperationError, Result};
 use crate::file::fs::FileSystem;
 use crate::index::{BlockIndex, RowLocation};
 use crate::quiescent::{QuiescentBox, QuiescentGuard};
@@ -28,6 +28,7 @@ use crate::table::{ColumnDeletionBuffer, IndexRollback, Table, TableAccess};
 use crate::trx::TrxID;
 use crate::trx::undo::IndexUndo;
 use dashmap::DashMap;
+use error_stack::Report;
 use std::collections::hash_map::Entry;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
@@ -165,7 +166,9 @@ impl Catalog {
         table_id: TableID,
     ) -> Result<()> {
         if self.user_tables.contains_key(&table_id) {
-            return Err(Error::TableAlreadyExists);
+            return Err(Report::new(OperationError::TableAlreadyExists)
+                .attach(format!("reload user table: table_id={table_id}"))
+                .into());
         }
         let res = self
             .storage
@@ -243,7 +246,9 @@ impl Catalog {
                 let metadata_in_catalog = TableMetadata::new(column_specs, index_specs);
                 let metadata_in_file = &*active_root.metadata;
                 if &metadata_in_catalog != metadata_in_file {
-                    return Err(Error::InvalidState);
+                    return Err(Report::new(DataIntegrityError::InvalidRootInvariant)
+                        .attach(format!("table_id={}", table.table_id))
+                        .into());
                 }
                 let row_id_bound = active_root.pivot_row_id;
                 let meta_pool_guard = guards.meta_guard();
@@ -270,11 +275,15 @@ impl Catalog {
                 );
                 let old = self.user_tables.insert(table_id, table);
                 if old.is_some() {
-                    return Err(Error::TableAlreadyExists);
+                    return Err(Report::new(OperationError::TableAlreadyExists)
+                        .attach(format!("insert reloaded user table: table_id={table_id}"))
+                        .into());
                 }
                 Ok(())
             }
-            None => Err(Error::TableNotFound),
+            None => Err(Report::new(OperationError::TableNotFound)
+                .attach(format!("reload user table metadata: table_id={table_id}"))
+                .into()),
         }
     }
 
@@ -511,7 +520,7 @@ pub mod tests {
     use crate::catalog::{ColumnAttributes, IndexAttributes, IndexKey, IndexSpec, TableSpec};
     use crate::conf::{EngineConfig, TrxSysConfig};
     use crate::engine::Engine;
-    use crate::error::{BlockCorruptionCause, BlockKind, Error, FileKind};
+    use crate::error::{CompletionErrorKind, Error};
     use crate::file::BlockID;
     use crate::file::block_integrity::{BLOCK_INTEGRITY_HEADER_SIZE, write_block_checksum};
     use crate::file::cow_file::COW_FILE_PAGE_SIZE;
@@ -725,6 +734,19 @@ pub mod tests {
                 .unwrap(),
         ) as usize;
         payload_start + COLUMN_BLOCK_LEAF_HEADER_SIZE + entry_offset
+    }
+
+    fn assert_catalog_data_integrity(err: Error) {
+        let report = format!("{err:?}");
+        if matches!(
+            err.completion_error(),
+            Some(CompletionErrorKind::DataIntegrity(_))
+        ) {
+            assert!(report.contains("propagate from other threads"), "{report}");
+            assert!(report.contains("wait for"), "{report}");
+        } else {
+            assert!(err.data_integrity_error().is_some(), "{report}");
+        }
     }
 
     #[test]
@@ -942,15 +964,7 @@ pub mod tests {
                 Ok(_) => panic!("expected catalog bootstrap corruption failure"),
                 Err(err) => err,
             };
-            assert!(matches!(
-                err,
-                Error::BlockCorrupted {
-                    file_kind: FileKind::CatalogMultiTableFile,
-                    block_kind: BlockKind::LwcBlock,
-                    block_id: page_id,
-                    cause: BlockCorruptionCause::ChecksumMismatch,
-                } if page_id == block_id
-            ));
+            assert_catalog_data_integrity(err);
         });
     }
 
@@ -1024,15 +1038,7 @@ pub mod tests {
                 Ok(_) => panic!("expected catalog bootstrap invalid-metadata failure"),
                 Err(err) => err,
             };
-            assert!(matches!(
-                err,
-                Error::BlockCorrupted {
-                    file_kind: FileKind::CatalogMultiTableFile,
-                    block_kind: BlockKind::ColumnBlockIndex,
-                    block_id: page_id,
-                    cause: BlockCorruptionCause::InvalidPayload,
-                } if page_id == entry.leaf_page_id
-            ));
+            assert_catalog_data_integrity(err);
         });
     }
 

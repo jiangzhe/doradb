@@ -1,10 +1,13 @@
 use crate::conf::TrxSysConfig;
-use crate::error::{Error, Result, StoragePoisonSource};
+use crate::error::{
+    CompletionErrorKind, ConfigError, DataIntegrityError, Error, FatalError, LifecycleError,
+    ResourceError, Result,
+};
 use crate::file::{FileSyncer, SparseFile, UNTRACKED_FILE_ID};
 use crate::free_list::FreeList;
 use crate::io::{
     Completion, DirectBuf, IOBackendStats, IOBackendStatsHandle, IOClient, IOKind, IOQueue,
-    IOStateMachine, IOSubmission, IOWorkerBuilder, Operation, StorageBackend,
+    IOStateMachine, IOSubmission, IOWorkerBuilder, Operation, StdIoResult, StorageBackend,
 };
 use crate::serde::Ser;
 use crate::session::SessionState;
@@ -18,6 +21,7 @@ use crate::trx::sys::GC_BUCKETS;
 use crate::trx::sys::TransactionSystem;
 use crate::trx::{CommittedTrx, MAX_COMMIT_TS, MAX_SNAPSHOT_TS, PrecommitTrx, PreparedTrx, TrxID};
 use crossbeam_utils::CachePadded;
+use error_stack::Report;
 use flume::{Receiver, Sender};
 use glob::{Pattern, glob};
 use parking_lot::{Mutex, MutexGuard};
@@ -189,7 +193,7 @@ enum LogIORequest {
 struct LogWriteCompletion {
     cts: TrxID,
     buf: DirectBuf,
-    poison: Option<StoragePoisonSource>,
+    poison: Option<FatalError>,
 }
 
 struct LogIOStateMachine {
@@ -227,7 +231,7 @@ impl IOStateMachine for LogIOStateMachine {
     fn on_submit(&mut self, _sub: &LogWriteSubmission) {}
 
     #[inline]
-    fn on_complete(&mut self, mut sub: LogWriteSubmission, res: std::io::Result<usize>) -> IOKind {
+    fn on_complete(&mut self, mut sub: LogWriteSubmission, res: StdIoResult<usize>) -> IOKind {
         let expected_len = sub.operation.len();
         let buf = sub
             .operation
@@ -235,8 +239,8 @@ impl IOStateMachine for LogIOStateMachine {
             .expect("redo write submission must still own its direct buffer");
         let result = match res {
             Ok(len) if len == expected_len => None,
-            Ok(_len) => Some(StoragePoisonSource::RedoWrite),
-            Err(_err) => Some(StoragePoisonSource::RedoWrite),
+            Ok(_len) => Some(FatalError::RedoWrite),
+            Err(_err) => Some(FatalError::RedoWrite),
         };
         let _ = self.done_tx.send(LogWriteCompletion {
             cts: sub.cts,
@@ -379,7 +383,9 @@ impl LogPartition {
             // Allocate space of log file.
             let (fd, offset) = match log_file.alloc(log_buf.capacity()) {
                 Ok((offset, _)) => (log_file.as_raw_fd(), offset),
-                Err(Error::StorageFileCapacityExceeded) => {
+                Err(err)
+                    if err.resource_error() == Some(ResourceError::StorageFileCapacityExceeded) =>
+                {
                     // Rotate log file and try again.
                     self.rotate_log_file(group_commit_g)
                         .expect("rotate log file");
@@ -440,7 +446,7 @@ impl LogPartition {
             return Ok((cts, session, waiter));
         }
         let last_group = match group_commit_g.queue.back_mut().unwrap() {
-            Commit::Shutdown => return Err(Error::StorageEngineShutdown),
+            Commit::Shutdown => return Err(Report::new(LifecycleError::Shutdown).into()),
             Commit::Group(group) => group,
             Commit::Switch(_) => {
                 // Impossible, switch always has one group followed.
@@ -497,7 +503,12 @@ impl LogPartition {
             return Ok(cts);
         }
         let waiter = waiter.expect("waiter should exist when wait_sync");
-        if let Err(err) = waiter.wait_result().await {
+        if let Err(err) = waiter.wait_result().await.map_err(|report| {
+            Error::from_completion_report(
+                report,
+                format!("wait for redo group commit: commit_ts={cts}"),
+            )
+        }) {
             if let Some(s) = session.take() {
                 s.rollback();
             }
@@ -614,7 +625,7 @@ pub(super) struct SyncGroup {
     pub(super) log_bytes: usize,
     pub(super) write: Option<LogWriteSubmission>,
     pub(super) returned_buf: Option<DirectBuf>,
-    pub(super) completion: Arc<Completion<Result<()>>>,
+    pub(super) completion: Arc<Completion<()>>,
     pub(super) finished: bool,
     pub(super) failed: bool,
 }
@@ -642,12 +653,16 @@ impl SyncGroup {
     }
 
     #[inline]
-    fn fail_waiters(&mut self, err: &Error) {
+    fn fail_waiters(&mut self, err: &Report<FatalError>) {
         if self.failed {
             return;
         }
         self.failed = true;
-        self.completion.complete(Err(err.clone()));
+        self.completion
+            .complete(Err(CompletionErrorKind::report_fatal(
+                *err.current_context(),
+                "fail redo group commit waiters",
+            )));
         for trx in mem::take(&mut self.trx_list) {
             trx.abort();
         }
@@ -689,7 +704,9 @@ impl FromStr for LogSync {
         } else if s.eq_ignore_ascii_case("none") {
             Ok(LogSync::None)
         } else {
-            Err(Error::InvalidArgument)
+            Err(Report::new(ConfigError::InvalidLogSync)
+                .attach(format!("value={s}"))
+                .into())
         }
     }
 }
@@ -743,7 +760,7 @@ impl<'a> FileProcessor<'a> {
     }
 
     #[inline]
-    fn fail_sync_group(&self, sync_group: &mut SyncGroup, err: &Error) {
+    fn fail_sync_group(&self, sync_group: &mut SyncGroup, err: &Report<FatalError>) {
         sync_group.fail_waiters(err);
         if let Some(buf) = sync_group.take_any_buf() {
             self.recycle_buf(buf);
@@ -751,7 +768,7 @@ impl<'a> FileProcessor<'a> {
     }
 
     #[inline]
-    fn fail_pending(&mut self, err: Error) {
+    fn fail_pending(&mut self, err: Report<FatalError>) {
         self.shutdown = true;
         let drained_sync_groups: Vec<_> = self.sync_groups.drain(..).collect();
         for mut sync_group in drained_sync_groups {
@@ -907,7 +924,7 @@ impl<'a> FileProcessor<'a> {
             };
             let sync_dur = start.elapsed();
             if sync_res.is_err() {
-                let err = self.trx_sys.poison_storage(StoragePoisonSource::RedoSync);
+                let err = self.trx_sys.poison_storage(FatalError::RedoSync);
                 let drained_written: Vec<_> = self.written.drain(..).collect();
                 for mut sync_group in drained_written {
                     self.fail_sync_group(&mut sync_group, &err);
@@ -985,7 +1002,7 @@ impl<'a> FileProcessor<'a> {
             {
                 let LogIORequest::Write(submission) = err.0;
                 sync_group.write = Some(submission);
-                let poison = self.trx_sys.poison_storage(StoragePoisonSource::RedoSubmit);
+                let poison = self.trx_sys.poison_storage(FatalError::RedoSubmit);
                 self.fail_sync_group(&mut sync_group, &poison);
                 self.fail_pending(poison);
                 return;
@@ -1093,15 +1110,41 @@ pub fn list_log_files(file_prefix: &str, log_no: usize, desc: bool) -> Result<Ve
 pub fn parse_file_seq(file_path: &Path) -> Result<u32> {
     let file_name = file_path
         .file_name()
-        .ok_or(Error::InvalidFormat)?
+        .ok_or_else(|| {
+            Error::from(
+                Report::new(DataIntegrityError::InvalidPayload)
+                    .attach(format!("missing log file name: {}", file_path.display())),
+            )
+        })?
         .to_str()
-        .ok_or(Error::InvalidFormat)?;
+        .ok_or_else(|| {
+            Error::from(
+                Report::new(DataIntegrityError::InvalidPayload).attach(format!(
+                    "log file name must be valid UTF-8: {}",
+                    file_path.display()
+                )),
+            )
+        })?;
     if file_name.len() < 9 {
-        return Err(Error::InvalidFormat);
+        return Err(Report::new(DataIntegrityError::InvalidPayload)
+            .attach(format!("log file name is too short: {file_name}"))
+            .into());
     }
     // last 8 bytes are hex encoded.
-    let suffix = std::str::from_utf8(&file_name.as_bytes()[file_name.len() - 8..])?;
-    let file_seq = u32::from_str_radix(suffix, 16)?;
+    let suffix =
+        std::str::from_utf8(&file_name.as_bytes()[file_name.len() - 8..]).map_err(|_| {
+            Error::from(
+                Report::new(DataIntegrityError::InvalidPayload).attach(format!(
+                    "log file sequence suffix must be UTF-8: {file_name}"
+                )),
+            )
+        })?;
+    let file_seq = u32::from_str_radix(suffix, 16).map_err(|_| {
+        Error::from(
+            Report::new(DataIntegrityError::InvalidPayload)
+                .attach(format!("log file sequence suffix must be hex: {file_name}")),
+        )
+    })?;
     Ok(file_seq)
 }
 
@@ -1112,6 +1155,7 @@ mod tests {
     use crate::catalog::tests::table2;
     use crate::conf::{EngineConfig, EvictableBufferPoolConfig, TrxSysConfig};
     use crate::engine::{Engine, EngineRef};
+    use crate::error::{CompletionErrorKind, FatalError};
     use crate::file::{FileSyncKind, FileSyncOp, FileSyncTestHook, set_file_sync_test_hook};
     use crate::io::{
         IOKind, StorageBackendOp, StorageBackendTestHook, install_storage_backend_test_hook,
@@ -1225,7 +1269,7 @@ mod tests {
             }
         }
 
-        fn on_complete(&self, op: StorageBackendOp, res: &mut std::io::Result<usize>) {
+        fn on_complete(&self, op: StorageBackendOp, res: &mut StdIoResult<usize>) {
             if !self.matches(op) {
                 return;
             }
@@ -1330,6 +1374,24 @@ mod tests {
                     .await
             })
         })
+    }
+
+    fn assert_propagated_completion_fatal<T: std::fmt::Debug>(
+        res: &Result<T>,
+        expected: FatalError,
+    ) {
+        let err = match res {
+            Ok(value) => panic!("expected propagated completion failure, got {value:?}"),
+            Err(err) => err,
+        };
+        assert_eq!(
+            err.completion_error(),
+            Some(CompletionErrorKind::Fatal(expected)),
+            "{err:?}"
+        );
+        let report = format!("{err:?}");
+        assert!(report.contains("propagate from other threads"), "{report}");
+        assert!(report.contains("wait for redo group commit"), "{report}");
     }
 
     async fn build_redo_test_engine(log_file_stem: &str, log_sync: LogSync) -> (TempDir, Engine) {
@@ -1623,18 +1685,15 @@ mod tests {
 
             let res1 = commit1.join().unwrap();
             let res2 = commit2.join().unwrap();
-            assert!(matches!(
-                res1,
-                Err(Error::StorageEnginePoisoned(StoragePoisonSource::RedoWrite))
-            ));
-            assert!(matches!(
-                res2,
-                Err(Error::StorageEnginePoisoned(StoragePoisonSource::RedoWrite))
-            ));
-            assert!(matches!(
-                engine.trx_sys.ensure_runtime_healthy(),
-                Err(Error::StorageEnginePoisoned(StoragePoisonSource::RedoWrite))
-            ));
+            assert_propagated_completion_fatal(&res1, FatalError::RedoWrite);
+            assert_propagated_completion_fatal(&res2, FatalError::RedoWrite);
+            assert!(
+                engine
+                    .trx_sys
+                    .ensure_runtime_healthy()
+                    .as_ref()
+                    .is_err_and(|err| *err.current_context() == FatalError::RedoWrite)
+            );
         });
     }
 
@@ -1673,18 +1732,15 @@ mod tests {
 
         let res1 = commit1.join().unwrap();
         let res2 = commit2.join().unwrap();
-        assert!(matches!(
-            res1,
-            Err(Error::StorageEnginePoisoned(StoragePoisonSource::RedoSync))
-        ));
-        assert!(matches!(
-            res2,
-            Err(Error::StorageEnginePoisoned(StoragePoisonSource::RedoSync))
-        ));
-        assert!(matches!(
-            engine.trx_sys.ensure_runtime_healthy(),
-            Err(Error::StorageEnginePoisoned(StoragePoisonSource::RedoSync))
-        ));
+        assert_propagated_completion_fatal(&res1, FatalError::RedoSync);
+        assert_propagated_completion_fatal(&res2, FatalError::RedoSync);
+        assert!(
+            engine
+                .trx_sys
+                .ensure_runtime_healthy()
+                .as_ref()
+                .is_err_and(|err| *err.current_context() == FatalError::RedoSync)
+        );
     }
 
     #[test]

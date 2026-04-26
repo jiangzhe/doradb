@@ -8,11 +8,17 @@
 use crate::bitmap::{Bitmap, BitmapRangeFilter};
 use crate::buffer::frame::FrameContext;
 use crate::catalog::TableMetadata;
-use crate::error::{Error, Result};
+use crate::error::{Error, InternalError, Result};
 use crate::row::RowPage;
 use crate::trx::undo::RowUndoKind;
 use crate::trx::{TrxID, trx_is_committed};
 use crate::value::{PageVar, ValBuffer, ValType};
+use error_stack::Report;
+
+#[inline]
+fn column_scan_shape_mismatch() -> Error {
+    Report::new(InternalError::ColumnScanShapeMismatch).into()
+}
 
 pub struct ScanBuffer {
     cols: Vec<ColBuffer>,
@@ -125,7 +131,7 @@ impl ScanBuffer {
                     }
                 }
                 (None, None) => (),
-                _ => return Err(Error::InvalidColumnScan),
+                _ => return Err(column_scan_shape_mismatch()),
             }
             // Second, extend values
             match (&mut buf.vals, vals) {
@@ -189,7 +195,7 @@ impl ScanBuffer {
                         }
                     }
                 }
-                _ => return Err(Error::InvalidColumnScan),
+                _ => return Err(column_scan_shape_mismatch()),
             }
         }
         self.len = new_len;

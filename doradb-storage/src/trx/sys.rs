@@ -2,7 +2,7 @@ use crate::DiskPool;
 use crate::catalog::{Catalog, CatalogCheckpointScanConfig, TableCache};
 use crate::component::{Component, ComponentRegistry, IndexPool, MemPool, MetaPool, ShelfScope};
 use crate::conf::TrxSysConfig;
-use crate::error::{Error, Result, StoragePoisonSource};
+use crate::error::{Error, FatalError, FatalResult, InternalError, Result};
 use crate::file::fs::FileSystem;
 use crate::quiescent::{QuiescentBox, QuiescentGuard, SyncQuiescentGuard};
 use crate::session::SessionState;
@@ -17,6 +17,7 @@ use crate::trx::{
     ActiveTrx, MAX_SNAPSHOT_TS, MIN_ACTIVE_TRX_ID, MIN_SNAPSHOT_TS, PreparedTrx, TrxID,
 };
 use crossbeam_utils::CachePadded;
+use error_stack::Report;
 use flume::{Receiver, Sender};
 use parking_lot::Mutex;
 use std::mem;
@@ -91,8 +92,8 @@ pub struct TransactionSystem {
     pub(crate) catalog: CachePadded<QuiescentGuard<Catalog>>,
     /// Storage-runtime poison flag for fatal storage background or durability failures.
     storage_poisoned: CachePadded<AtomicBool>,
-    /// First fatal storage error that poisoned runtime admission.
-    storage_poison_err: CachePadded<Mutex<Option<Error>>>,
+    /// First fatal storage reason that poisoned runtime admission.
+    storage_poison_err: CachePadded<Mutex<Option<FatalError>>>,
 }
 
 pub(crate) struct TransactionSystemWorkers;
@@ -129,7 +130,7 @@ impl TransactionSystem {
 
     /// Returns the first fatal storage poison error, if runtime admission has been poisoned.
     #[inline]
-    pub fn storage_poison_error(&self) -> Option<Error> {
+    pub(crate) fn storage_poison_error(&self) -> Option<Report<FatalError>> {
         if !self.storage_poisoned.load(Ordering::Acquire) {
             return None;
         }
@@ -138,30 +139,31 @@ impl TransactionSystem {
             guard.is_some(),
             "storage poison flag published before poison error was recorded"
         );
-        guard.as_ref().cloned()
+        guard.as_ref().copied().map(Report::new)
     }
 
     /// Returns `Err` once a fatal storage failure poisoned runtime admission.
     #[inline]
-    pub fn ensure_runtime_healthy(&self) -> Result<()> {
+    pub(crate) fn ensure_runtime_healthy(&self) -> FatalResult<()> {
         match self.storage_poison_error() {
             Some(err) => Err(err),
             None => Ok(()),
         }
     }
 
-    /// Records the first fatal storage poison source and returns the shared poison error.
+    /// Records the first fatal storage poison reason and returns a fresh poison error.
     #[inline]
-    pub fn poison_storage(&self, source: StoragePoisonSource) -> Error {
-        let err = Error::StorageEnginePoisoned(source);
+    pub(crate) fn poison_storage(&self, reason: FatalError) -> Report<FatalError> {
         {
             let mut guard = self.storage_poison_err.lock();
             if guard.is_none() {
-                *guard = Some(err.clone());
+                *guard = Some(reason);
             }
         }
         self.storage_poisoned.swap(true, Ordering::AcqRel);
-        self.storage_poison_error().unwrap_or(err)
+        self.storage_poison_error().unwrap_or_else(|| {
+            Report::new(FatalError::Poisoned).attach(format!("poisoned_by={reason}"))
+        })
     }
 
     /// Create a new transaction.
@@ -219,7 +221,7 @@ impl TransactionSystem {
     pub async fn commit(&self, trx: ActiveTrx) -> Result<TrxID> {
         if let Err(err) = self.ensure_runtime_healthy() {
             self.rollback(trx).await?;
-            return Err(err);
+            return Err(err.into());
         }
         // Prepare redo log first, this may take some time,
         // so keep it out of lock scope, and we can fill cts after the lock is held.
@@ -273,7 +275,7 @@ impl TransactionSystem {
             .is_err()
         {
             trx.discard_after_fatal_rollback();
-            return Err(self.poison_storage(StoragePoisonSource::RollbackAccess));
+            return Err(self.poison_storage(FatalError::RollbackAccess).into());
         }
         if trx
             .row_undo_mut()
@@ -282,7 +284,7 @@ impl TransactionSystem {
             .is_err()
         {
             trx.discard_after_fatal_rollback();
-            return Err(self.poison_storage(StoragePoisonSource::RollbackAccess));
+            return Err(self.poison_storage(FatalError::RollbackAccess).into());
         }
         trx.effects_mut().clear_for_rollback();
         self.log_partitions[log_no].gc_buckets[gc_no].gc_analyze_rollback(sts);
@@ -502,9 +504,12 @@ impl Component for TransactionSystemWorkers {
         mut shelf: ShelfScope<'_, Self>,
     ) -> Result<()> {
         let trx_sys = registry.dependency::<TransactionSystem>()?;
-        let startup = shelf
-            .take::<TransactionSystem>()
-            .ok_or(Error::InvalidState)?;
+        let startup = shelf.take::<TransactionSystem>().ok_or_else(|| {
+            Error::from(
+                Report::new(InternalError::ComponentProvisionMissing)
+                    .attach("provider=TransactionSystem, consumer=TransactionRuntime"),
+            )
+        })?;
         registry.register::<Self>(startup.start(trx_sys))
     }
 
@@ -633,7 +638,7 @@ mod tests {
             let worker_trx_sys = trx_sys.clone();
             let handle = std::thread::spawn(move || {
                 worker_started.store(true, Ordering::Release);
-                let err = worker_trx_sys.poison_storage(StoragePoisonSource::RedoSubmit);
+                let err = worker_trx_sys.poison_storage(FatalError::RedoSubmit);
                 worker_finished.store(true, Ordering::Release);
                 err
             });
@@ -657,23 +662,20 @@ mod tests {
             drop(blocked);
 
             let err = handle.join().unwrap();
-            assert!(matches!(
-                err,
-                Error::StorageEnginePoisoned(StoragePoisonSource::RedoSubmit)
-            ));
+            assert_eq!(*err.current_context(), FatalError::RedoSubmit);
             assert!(trx_sys.storage_poisoned.load(Ordering::Acquire));
-            assert!(matches!(
-                trx_sys.storage_poison_error(),
-                Some(Error::StorageEnginePoisoned(
-                    StoragePoisonSource::RedoSubmit
-                ))
-            ));
-            assert!(matches!(
-                trx_sys.ensure_runtime_healthy(),
-                Err(Error::StorageEnginePoisoned(
-                    StoragePoisonSource::RedoSubmit
-                ))
-            ));
+            assert!(
+                trx_sys
+                    .storage_poison_error()
+                    .as_ref()
+                    .is_some_and(|err| { *err.current_context() == FatalError::RedoSubmit })
+            );
+            assert!(
+                trx_sys
+                    .ensure_runtime_healthy()
+                    .as_ref()
+                    .is_err_and(|err| { *err.current_context() == FatalError::RedoSubmit })
+            );
 
             drop(trx_sys);
             drop(engine);
@@ -705,14 +707,14 @@ mod tests {
             let worker_a_trx_sys = trx_sys.clone();
             let worker_a = std::thread::spawn(move || {
                 worker_a_barrier.wait();
-                worker_a_trx_sys.poison_storage(StoragePoisonSource::RedoSubmit)
+                worker_a_trx_sys.poison_storage(FatalError::RedoSubmit)
             });
 
             let worker_b_barrier = Arc::clone(&barrier);
             let worker_b_trx_sys = trx_sys.clone();
             let worker_b = std::thread::spawn(move || {
                 worker_b_barrier.wait();
-                worker_b_trx_sys.poison_storage(StoragePoisonSource::RedoSync)
+                worker_b_trx_sys.poison_storage(FatalError::RedoSync)
             });
 
             barrier.wait();
@@ -720,29 +722,22 @@ mod tests {
             let err_a = worker_a.join().unwrap();
             let err_b = worker_b.join().unwrap();
             let stored = trx_sys.storage_poison_error().unwrap();
-            let err_a_source = match err_a {
-                Error::StorageEnginePoisoned(source) => source,
-                other => panic!("expected poison error, got {other:?}"),
-            };
-            let err_b_source = match err_b {
-                Error::StorageEnginePoisoned(source) => source,
-                other => panic!("expected poison error, got {other:?}"),
-            };
-            let stored_source = match stored {
-                Error::StorageEnginePoisoned(source) => source,
-                other => panic!("expected poison error, got {other:?}"),
-            };
+            let err_a_reason = *err_a.current_context();
+            let err_b_reason = *err_b.current_context();
+            let stored_reason = *stored.current_context();
 
             assert!(trx_sys.storage_poisoned.load(Ordering::Acquire));
-            assert_eq!(err_a_source, err_b_source);
-            assert_eq!(stored_source, err_a_source);
+            assert_eq!(err_a_reason, err_b_reason);
+            assert_eq!(stored_reason, err_a_reason);
+            assert!(
+                trx_sys
+                    .ensure_runtime_healthy()
+                    .as_ref()
+                    .is_err_and(|err| *err.current_context() == stored_reason)
+            );
             assert!(matches!(
-                trx_sys.ensure_runtime_healthy(),
-                Err(Error::StorageEnginePoisoned(source)) if source == stored_source
-            ));
-            assert!(matches!(
-                stored_source,
-                StoragePoisonSource::RedoSubmit | StoragePoisonSource::RedoSync
+                stored_reason,
+                FatalError::RedoSubmit | FatalError::RedoSync
             ));
 
             drop(trx_sys);

@@ -6,7 +6,7 @@ use crate::catalog::table::TableMetadata;
 use crate::catalog::{
     ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexOrder, IndexSpec, TableID,
 };
-use crate::row::ops::{DeleteMvcc, InsertMvcc, SelectKey};
+use crate::row::ops::{DeleteMvcc, SelectKey};
 use crate::row::{Row, RowRead};
 use crate::stmt::Statement;
 use crate::table::TableAccess;
@@ -107,10 +107,11 @@ impl Indexes<'_> {
             Val::from(obj.index_attributes.bits()),
         ];
         let (ctx, effects) = stmt.ctx_and_effects_mut();
-        matches!(
-            self.table.accessor().insert_mvcc(ctx, effects, cols).await,
-            Ok(InsertMvcc::Inserted(_))
-        )
+        self.table
+            .accessor()
+            .insert_mvcc(ctx, effects, cols)
+            .await
+            .is_ok()
     }
 
     /// Delete an index by (table_id, index_no).
@@ -279,10 +280,11 @@ impl IndexColumns<'_> {
             Val::from(obj.index_order as u8),
         ];
         let (ctx, effects) = stmt.ctx_and_effects_mut();
-        matches!(
-            self.table.accessor().insert_mvcc(ctx, effects, cols).await,
-            Ok(InsertMvcc::Inserted(_))
-        )
+        self.table
+            .accessor()
+            .insert_mvcc(ctx, effects, cols)
+            .await
+            .is_ok()
     }
 
     /// Delete all index-column rows by `(table_id, index_no)`.

@@ -4,7 +4,7 @@ use crate::catalog::storage::CatalogDefinition;
 use crate::catalog::storage::object::ColumnObject;
 use crate::catalog::table::TableMetadata;
 use crate::catalog::{ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexSpec, TableID};
-use crate::row::ops::{DeleteMvcc, InsertMvcc, SelectKey};
+use crate::row::ops::{DeleteMvcc, SelectKey};
 use crate::row::{Row, RowRead};
 use crate::stmt::Statement;
 use crate::table::TableAccess;
@@ -120,10 +120,11 @@ impl Columns<'_> {
             Val::from(obj.column_attributes.bits()),
         ];
         let (ctx, effects) = stmt.ctx_and_effects_mut();
-        matches!(
-            self.table.accessor().insert_mvcc(ctx, effects, cols).await,
-            Ok(InsertMvcc::Inserted(_))
-        )
+        self.table
+            .accessor()
+            .insert_mvcc(ctx, effects, cols)
+            .await
+            .is_ok()
     }
 
     /// List all columns of one table from uncommitted-visible catalog rows.

@@ -17,16 +17,21 @@ use crate::component::Supplier;
 use crate::conf::EvictableBufferPoolConfig;
 use crate::conf::path::{path_to_utf8, validate_swap_file_path_candidate};
 use crate::error::Validation::Valid;
-use crate::error::{Error, Result, Validation};
+use crate::error::{
+    CompletionErrorKind, CompletionResult, Error, InternalError, IoError, LifecycleError,
+    LifecycleResult, ResourceError, Result, Validation,
+};
 use crate::file::fs::{FileSystem, FileSystemWorkers};
 use crate::file::{BlockID, BlockKey, INDEX_POOL_SWAP_FILE_ID, MEM_POOL_SWAP_FILE_ID, SparseFile};
 use crate::io::{
     IOBackendStats, IOKind as StorageIOKind, IOQueue, IOStateMachine, IOSubmission, Operation,
+    StdIoResult,
 };
 use crate::latch::{GuardState, LatchFallbackMode};
 use crate::notify::EventNotifyOnDrop;
 use crate::quiescent::{QuiescentGuard, SyncQuiescentGuard};
 use crate::{IndexPool, MemPool};
+use error_stack::{Report, ensure};
 use event_listener::{Event, EventListener, listener};
 use parking_lot::Mutex;
 use std::collections::hash_map::Entry;
@@ -64,6 +69,15 @@ pub struct EvictableBufferPool {
 }
 
 impl EvictableBufferPool {
+    #[inline]
+    fn ensure_not_shutdown(&self) -> LifecycleResult<()> {
+        ensure!(
+            !self.shutdown_flag.load(Ordering::Acquire),
+            LifecycleError::Shutdown
+        );
+        Ok(())
+    }
+
     #[inline]
     pub(crate) fn identity(&self) -> PoolIdentity {
         self.arena.identity()
@@ -203,27 +217,37 @@ impl EvictableBufferPool {
                 smol::future::yield_now().await;
             }
             DispatchAction::Shutdown => {
-                return Err(Error::StorageEngineShutdown);
+                return Err(Report::new(LifecycleError::Shutdown).into());
             }
             DispatchAction::Wait(completion) => {
-                completion.wait_result().await?;
+                completion.wait_result().await.map_err(|report| {
+                    Error::from_completion_report(
+                        report,
+                        format!("wait for evict pool read: page_id={page_id}"),
+                    )
+                })?;
             }
             DispatchAction::WaitForLoad(listener) => {
                 listener.await;
                 // Wakeups can come from shutdown as well as real load progress.
-                if self.shutdown_flag.load(Ordering::Acquire) {
-                    return Err(Error::StorageEngineShutdown);
-                }
+                self.ensure_not_shutdown()?;
                 self.in_mem.load_ev.notify(1);
             }
             DispatchAction::SendRead { req, completion } => {
                 if let Err(send_err) = self.fs.send_pool_read_async(self.role, req).await {
                     let failed_req = send_err.0;
-                    failed_req.fail(Error::SendError);
+                    failed_req.fail(CompletionErrorKind::report_send(
+                        "send evict pool read request",
+                    ));
                     self.in_mem.load_ev.notify(1);
-                    return Err(Error::SendError);
+                    return Err(IoError::report_send("send evict pool read request").into());
                 }
-                completion.wait_result().await?;
+                completion.wait_result().await.map_err(|report| {
+                    Error::from_completion_report(
+                        report,
+                        format!("wait for dispatched evict pool read: page_id={page_id}"),
+                    )
+                })?;
             }
         }
         Ok(())
@@ -274,9 +298,7 @@ impl EvictableBufferPool {
     /// Caller should handle the failure of add a page into memory and decrease this number.
     #[inline]
     async fn reserve_page(&self) -> Result<()> {
-        if self.shutdown_flag.load(Ordering::Acquire) {
-            return Err(Error::StorageEngineShutdown);
-        }
+        self.ensure_not_shutdown()?;
         if self.in_mem.try_inc() {
             // `reserve_page()` only acquires in-memory budget. Callers that later
             // fail before publishing a page decide whether that reservation
@@ -288,9 +310,7 @@ impl EvictableBufferPool {
         loop {
             listener!(self.in_mem.load_ev => listener);
             // Check after listener registration so shutdown cannot strand this waiter.
-            if self.shutdown_flag.load(Ordering::Acquire) {
-                return Err(Error::StorageEngineShutdown);
-            }
+            self.ensure_not_shutdown()?;
             if self.in_mem.try_inc() {
                 self.in_mem.record_alloc_success();
                 self.in_mem.load_ev.notify(1);
@@ -301,9 +321,7 @@ impl EvictableBufferPool {
             self.in_mem.notify_evictor();
             listener.await;
             // Wakeups can come from shutdown as well as real memory progress.
-            if self.shutdown_flag.load(Ordering::Acquire) {
-                return Err(Error::StorageEngineShutdown);
-            }
+            self.ensure_not_shutdown()?;
         }
     }
 }
@@ -343,12 +361,12 @@ impl BufferPool for EvictableBufferPool {
                     listener!(self.alloc_ev => listener);
                     // Check after listener registration so shutdown terminates the wait path
                     // directly instead of waiting for a page id to become available.
-                    if self.shutdown_flag.load(Ordering::Acquire) {
+                    if let Err(report) = self.ensure_not_shutdown() {
                         // `reserve_page()` already claimed in-memory budget for this attempt,
                         // but we have not acquired a page id yet, so release the reservation
                         // before surfacing shutdown to the caller.
                         self.in_mem.dec();
-                        return Err(Error::StorageEngineShutdown);
+                        return Err(report.into());
                     }
                     // re-check
                     if let Some(page_id) = self.alloc_map.try_allocate() {
@@ -362,9 +380,7 @@ impl BufferPool for EvictableBufferPool {
                     self.in_mem.dec();
                     listener.await;
                     // Wakeups can come from shutdown as well as page deallocation.
-                    if self.shutdown_flag.load(Ordering::Acquire) {
-                        return Err(Error::StorageEngineShutdown);
-                    }
+                    self.ensure_not_shutdown()?;
                 }
             }
         }
@@ -383,7 +399,7 @@ impl BufferPool for EvictableBufferPool {
             Ok(self.arena.init_page(guard, page_id))
         } else {
             self.in_mem.dec();
-            Err(Error::BufferPageAlreadyAllocated)
+            Err(Error::buffer_page_already_allocated())
         }
     }
 
@@ -715,7 +731,7 @@ impl IOStateMachine for EvictablePoolStateMachine {
 
     /// Reconcile inflight/page state after one backend completion.
     #[inline]
-    fn on_complete(&mut self, sub: EvictSubmission, res: std::io::Result<usize>) -> StorageIOKind {
+    fn on_complete(&mut self, sub: EvictSubmission, res: StdIoResult<usize>) -> StorageIOKind {
         match sub {
             EvictSubmission::Read(sub) => {
                 let _ = sub.block_key;
@@ -732,7 +748,7 @@ impl IOStateMachine for EvictablePoolStateMachine {
                 let _ = block_key;
                 let err = match res {
                     Ok(len) if len == PAGE_SIZE => None,
-                    Ok(_) => Some(Error::ShortIO),
+                    Ok(len) => Some(IoError::report_unexpected_eof(len, PAGE_SIZE).into()),
                     Err(err) => Some(err.into()),
                 };
                 if let Some(err) = err {
@@ -800,7 +816,7 @@ impl EvictableRuntime {
                 self.pool.inflight_io.fail_writeback(
                     &self.pool.stats,
                     page_guard,
-                    Error::SendError,
+                    IoError::report_send("send evict pool batch write request").into(),
                 );
             }
             drop(done_ev);
@@ -1164,7 +1180,7 @@ impl EvictReadSubmission {
 
     #[inline]
     /// Removes the pool inflight entry and wakes all waiters exactly once.
-    fn complete_waiters(&mut self, result: Result<PageID>) {
+    fn complete_waiters(&mut self, result: CompletionResult<PageID>) {
         if self.completed {
             return;
         }
@@ -1188,7 +1204,7 @@ impl EvictReadSubmission {
 
     #[inline]
     /// Fails the reload before worker completion and wakes joined readers.
-    pub(crate) fn fail(mut self, err: Error) {
+    pub(crate) fn fail(mut self, err: Report<CompletionErrorKind>) {
         drop(self.reservation.take());
         self.stats.add_completed_reads(1);
         self.stats.add_read_errors(1);
@@ -1206,21 +1222,34 @@ impl EvictReadSubmission {
     /// Successful full-page reads publish the reserved page back to `Hot`.
     /// Short reads and IO errors drop the reservation so memory accounting is
     /// rolled back before waiters are released.
-    pub(crate) fn complete(mut self, res: std::io::Result<usize>) -> IOKind {
+    pub(crate) fn complete(mut self, res: StdIoResult<usize>) -> IOKind {
+        let page_id = self.key;
         let result = match res {
             Ok(len) if len == PAGE_SIZE => {
                 let reservation = self.reservation.take().expect(
                     "evict read submission must still own its page reservation before publish",
                 );
-                (*reservation).publish()
+                (*reservation).publish().map_err(|err| {
+                    CompletionErrorKind::report_error(
+                        err,
+                        format!("publish evict pool read: page_id={page_id}"),
+                    )
+                })
             }
-            Ok(_) => {
+            Ok(len) => {
                 drop(self.reservation.take());
-                Err(Error::ShortIO)
+                Err(CompletionErrorKind::report_unexpected_eof(
+                    len,
+                    PAGE_SIZE,
+                    format!("complete evict pool read: page_id={page_id}"),
+                ))
             }
             Err(err) => {
                 drop(self.reservation.take());
-                Err(err.into())
+                Err(CompletionErrorKind::report_io(
+                    err,
+                    format!("complete evict pool read: page_id={page_id}"),
+                ))
             }
         };
         self.stats.add_completed_reads(1);
@@ -1250,7 +1279,7 @@ impl PreparedEvictReadSubmission {
     }
 
     #[inline]
-    fn complete(self, res: std::io::Result<usize>) -> IOKind {
+    fn complete(self, res: StdIoResult<usize>) -> IOKind {
         self.inner.complete(res)
     }
 }
@@ -1271,7 +1300,13 @@ impl Drop for EvictReadSubmission {
         drop(self.reservation.take());
         self.stats.add_completed_reads(1);
         self.stats.add_read_errors(1);
-        self.complete_waiters(Err(Error::InternalError));
+        self.complete_waiters(Err(CompletionErrorKind::report_internal(
+            InternalError::CompletionDropped,
+            format!(
+                "drop evict read submission before completion: page_id={}",
+                self.key
+            ),
+        )));
     }
 }
 
@@ -1282,7 +1317,8 @@ pub(crate) fn build_pool_with_swap_file_field(
     fs: QuiescentGuard<FileSystem>,
 ) -> Result<(EvictableBufferPool, SparseFile)> {
     config.role.assert_valid("evictable buffer pool");
-    validate_swap_file_path_candidate(swap_file_field_name, &config.data_swap_file)?;
+    validate_swap_file_path_candidate(swap_file_field_name, &config.data_swap_file)
+        .map_err(Error::from)?;
     // 1. Calculate memory usage.
     let max_file_size = config.max_file_size.as_u64() as usize;
     let max_mem_size = config.max_mem_size.as_u64() as usize;
@@ -1300,7 +1336,11 @@ pub(crate) fn build_pool_with_swap_file_field(
     );
     let max_nbr_in_mem = (max_mem_size - frame_total_bytes) / mem::size_of::<Page>();
     if max_nbr_in_mem < MIN_IN_MEM_PAGES {
-        return Err(Error::BufferPoolSizeTooSmall);
+        return Err(Report::new(ResourceError::BufferPoolSizeTooSmall)
+            .attach(format!(
+                "evictable buffer pool sizing: max_mem_size={max_mem_size}, max_file_size={max_file_size}, frame_total_bytes={frame_total_bytes}, in_mem_pages={max_nbr_in_mem}, min_in_mem_pages={MIN_IN_MEM_PAGES}"
+            ))
+            .into());
     }
     let eviction_arbiter = config.eviction_arbiter_builder.build(max_nbr_in_mem);
 
@@ -1308,7 +1348,8 @@ pub(crate) fn build_pool_with_swap_file_field(
     let arena = QuiescentArena::new(max_nbr)?;
 
     // 3. Create the swap file and retain the opened descriptor for worker-owned IO.
-    let swap_file_path = path_to_utf8(&config.data_swap_file, swap_file_field_name)?;
+    let swap_file_path =
+        path_to_utf8(&config.data_swap_file, swap_file_field_name).map_err(Error::from)?;
     let file = SparseFile::create_or_trunc(
         swap_file_path,
         max_file_size,
@@ -1375,7 +1416,16 @@ impl InflightIO {
                             completion: Some(Arc::clone(&completion)),
                         });
                         drop(g); // explicit drop guard before await.
-                        completion.wait_result().await.map(|_| ())?;
+                        completion
+                            .wait_result()
+                            .await
+                            .map_err(|report| {
+                                Error::from_completion_report(
+                                    report,
+                                    format!("wait for evict pool writeback: page_id={page_id}"),
+                                )
+                            })
+                            .map(|_| ())?;
                     }
                     // In any other kind, we let caller retry.
                     FrameKind::Cool
@@ -1398,7 +1448,16 @@ impl InflightIO {
                     .get_or_insert_with(|| Arc::new(PageIOCompletion::new()))
                     .clone();
                 drop(g); // explicitly drop guard before await.
-                completion.wait_result().await.map(|_| ())?;
+                completion
+                    .wait_result()
+                    .await
+                    .map_err(|report| {
+                        Error::from_completion_report(
+                            report,
+                            format!("wait for evict pool writeback: page_id={page_id}"),
+                        )
+                    })
+                    .map(|_| ())?;
             }
         }
         Ok(())
@@ -1462,7 +1521,10 @@ impl InflightIO {
         };
         drop(page_guard);
         if let Some(completion) = completion {
-            completion.complete(Err(err));
+            completion.complete(Err(CompletionErrorKind::report_error(
+                err,
+                format!("fail evict pool writeback: page_id={page_id}"),
+            )));
         }
     }
 
@@ -1490,12 +1552,14 @@ pub(crate) mod tests {
     use crate::buffer::test_page_id;
     use crate::conf::{EngineConfig, FileSystemConfig, TrxSysConfig};
     use crate::engine::Engine;
+    use crate::error::{CompletionErrorKind, ConfigError, ErrorKind};
     use crate::file::fs::FileSystem;
     use crate::file::fs::tests::{
         build_test_fs_owner_in, io_backend_stats_handle_identity as fs_stats_handle_identity,
     };
     use crate::quiescent::{QuiescentBox, QuiescentGuard};
     use crate::row::RowPage;
+    use std::io;
     use std::ops::Deref;
     use std::path::PathBuf;
     use std::sync::Arc;
@@ -1919,15 +1983,16 @@ pub(crate) mod tests {
                     page_guard,
                     batch_done: None,
                 }),
-                Err(std::io::Error::from_raw_os_error(libc::EIO)),
+                Err(io::Error::from_raw_os_error(libc::EIO)),
             );
 
             assert_eq!(kind, StorageIOKind::Write);
             assert_eq!(owner.arena.frame(page_id).kind(), FrameKind::Hot);
-            assert!(matches!(
-                completion.wait_result().await,
-                Err(Error::IOError { .. })
-            ));
+            let report = completion.wait_result().await.unwrap_err();
+            assert_eq!(
+                *report.current_context(),
+                CompletionErrorKind::Io(io::Error::from_raw_os_error(libc::EIO).kind())
+            );
             assert_eq!(owner.inflight_io.writes.load(Ordering::Relaxed), 0);
             assert!(!owner.inflight_io.map.lock().contains_key(&page_id));
 
@@ -2049,13 +2114,14 @@ pub(crate) mod tests {
                     page_guard,
                     batch_done: None,
                 }),
-                Err(std::io::Error::from_raw_os_error(libc::EIO)),
+                Err(io::Error::from_raw_os_error(libc::EIO)),
             );
             assert_eq!(kind, StorageIOKind::Write);
-            assert!(matches!(
-                completion.wait_result().await,
-                Err(Error::IOError { .. })
-            ));
+            let report = completion.wait_result().await.unwrap_err();
+            assert_eq!(
+                *report.current_context(),
+                CompletionErrorKind::Io(io::Error::from_raw_os_error(libc::EIO).kind())
+            );
 
             assert_eq!(owner.arena.frame(page_id).kind(), FrameKind::Hot);
             assert!(
@@ -2452,13 +2518,11 @@ pub(crate) mod tests {
             Ok(_) => panic!("expected invalid storage path"),
             Err(err) => err,
         };
-        match err {
-            Error::InvalidStoragePath(msg) => {
-                assert!(msg.contains("data_swap_file"));
-                assert!(msg.contains(".swp"));
-            }
-            err => panic!("expected invalid storage path, got {err:?}"),
-        }
+        assert!(err.is_kind(ErrorKind::Config));
+        assert_eq!(
+            err.report().downcast_ref::<ConfigError>().copied(),
+            Some(ConfigError::PathMustUseRequiredSuffix)
+        );
     }
 
     #[test]
@@ -2473,12 +2537,10 @@ pub(crate) mod tests {
             Ok(_) => panic!("expected invalid storage path"),
             Err(err) => err,
         };
-        match err {
-            Error::InvalidStoragePath(msg) => {
-                assert!(msg.contains("index_swap_file"));
-                assert!(msg.contains(".swp"));
-            }
-            err => panic!("expected invalid storage path, got {err:?}"),
-        }
+        assert!(err.is_kind(ErrorKind::Config));
+        assert_eq!(
+            err.report().downcast_ref::<ConfigError>().copied(),
+            Some(ConfigError::PathMustUseRequiredSuffix)
+        );
     }
 }

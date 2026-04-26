@@ -6,7 +6,7 @@ use doradb_storage::conf::{
     EngineConfig, EvictableBufferPoolConfig, FileSystemConfig, TrxSysConfig,
 };
 use doradb_storage::engine::{Engine, EngineRef};
-use doradb_storage::row::ops::{DeleteMvcc, InsertMvcc, SelectKey, SelectMvcc};
+use doradb_storage::row::ops::{DeleteMvcc, SelectKey, SelectMvcc};
 use doradb_storage::session::Session;
 use doradb_storage::table::{CheckpointOutcome, Table, TableAccess, TablePersistence};
 use doradb_storage::value::{Val, ValKind};
@@ -155,7 +155,7 @@ async fn insert_rows(table: &Arc<Table>, session: &mut Session, rows: usize) {
                 vec![Val::from(idx as i32), Val::from(&name[..])],
             )
             .await;
-        assert!(matches!(res, Ok(InsertMvcc::Inserted(_))));
+        assert!(res.is_ok());
         trx = stmt.succeed();
     }
     trx.commit().await.unwrap();

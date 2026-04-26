@@ -1,6 +1,7 @@
-use crate::error::{BlockCorruptionCause, Result};
+use crate::error::{DataIntegrityError, DataIntegrityResult, Result};
 use crate::serde::{Deser, Ser, Serde};
 use bytemuck::{Pod, Zeroable};
+use error_stack::{Report, ensure};
 use std::mem;
 
 /// Size in bytes of the fixed block-integrity header.
@@ -139,17 +140,19 @@ pub(crate) fn write_block_checksum(buf: &mut [u8]) {
 /// This is used by block formats, such as DiskTree nodes, that reuse the
 /// shared checksum trailer without the shared magic/version header.
 #[inline]
-pub(crate) fn validate_block_checksum(buf: &[u8]) -> std::result::Result<(), BlockCorruptionCause> {
-    if buf.len() < BLOCK_INTEGRITY_TRAILER_SIZE {
-        return Err(BlockCorruptionCause::InvalidPayload);
-    }
+pub(crate) fn validate_block_checksum(buf: &[u8]) -> DataIntegrityResult<()> {
+    ensure!(
+        buf.len() >= BLOCK_INTEGRITY_TRAILER_SIZE,
+        DataIntegrityError::InvalidPayload
+    );
     let checksum_offset = checksum_offset(buf.len());
     let (_, trailer) = BlockIntegrityTrailer::deser(buf, checksum_offset)
-        .map_err(|_| BlockCorruptionCause::ChecksumMismatch)?;
+        .map_err(|_| Report::new(DataIntegrityError::ChecksumMismatch))?;
     let b3sum = blake3::hash(&buf[..checksum_offset]);
-    if b3sum.as_bytes() != &trailer.b3sum {
-        return Err(BlockCorruptionCause::ChecksumMismatch);
-    }
+    ensure!(
+        b3sum.as_bytes() == &trailer.b3sum,
+        DataIntegrityError::ChecksumMismatch
+    );
     Ok(())
 }
 
@@ -161,19 +164,25 @@ pub(crate) fn validate_block_checksum(buf: &[u8]) -> std::result::Result<(), Blo
 pub(crate) fn validate_block(
     buf: &[u8],
     expected: BlockIntegritySpec,
-) -> std::result::Result<&[u8], BlockCorruptionCause> {
+) -> DataIntegrityResult<&[u8]> {
     debug_assert!(
         buf.len() >= BLOCK_INTEGRITY_HEADER_SIZE + BLOCK_INTEGRITY_TRAILER_SIZE,
         "validate_block expects a full persisted block image"
     );
-    let (payload_start, header) =
-        BlockIntegrityHeader::deser(buf, 0).map_err(|_| BlockCorruptionCause::InvalidMagic)?;
-    if header.magic_word != expected.magic_word {
-        return Err(BlockCorruptionCause::InvalidMagic);
-    }
-    if header.version != expected.version {
-        return Err(BlockCorruptionCause::InvalidVersion);
-    }
+    ensure!(
+        buf.len() >= BLOCK_INTEGRITY_HEADER_SIZE + BLOCK_INTEGRITY_TRAILER_SIZE,
+        DataIntegrityError::InvalidPayload
+    );
+    let (payload_start, header) = BlockIntegrityHeader::deser(buf, 0)
+        .map_err(|_| Report::new(DataIntegrityError::InvalidMagic))?;
+    ensure!(
+        header.magic_word == expected.magic_word,
+        DataIntegrityError::InvalidMagic
+    );
+    ensure!(
+        header.version == expected.version,
+        DataIntegrityError::InvalidVersion
+    );
     validate_block_checksum(buf)?;
     let checksum_offset = checksum_offset(buf.len());
     Ok(&buf[payload_start..checksum_offset])
@@ -206,7 +215,7 @@ mod tests {
         buf[checksum_idx] ^= 0xff;
 
         let err = validate_block(&buf, spec).unwrap_err();
-        assert_eq!(err, BlockCorruptionCause::ChecksumMismatch);
+        assert_eq!(*err.current_context(), DataIntegrityError::ChecksumMismatch);
     }
 
     #[test]
@@ -218,6 +227,6 @@ mod tests {
 
         buf[10] ^= 0xff;
         let err = validate_block_checksum(&buf).unwrap_err();
-        assert_eq!(err, BlockCorruptionCause::ChecksumMismatch);
+        assert_eq!(*err.current_context(), DataIntegrityError::ChecksumMismatch);
     }
 }

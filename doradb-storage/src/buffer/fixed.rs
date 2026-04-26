@@ -8,8 +8,9 @@ use crate::buffer::{
     RowPoolRole,
 };
 use crate::error::Validation::Valid;
-use crate::error::{Error, Result, Validation};
+use crate::error::{Error, ResourceError, Result, Validation};
 use crate::latch::LatchFallbackMode;
+use error_stack::Report;
 use std::mem;
 
 /// A simple buffer pool with fixed size pre-allocated using mmap() and
@@ -140,7 +141,14 @@ impl BufferPool for FixedBufferPool {
     ) -> Result<PageExclusiveGuard<T>> {
         match self.alloc_map.try_allocate() {
             Some(page_id) => Ok(self.arena.init_page(guard, PageID::from(page_id))),
-            None => Err(Error::BufferPoolFull),
+            None => Err(Report::new(ResourceError::BufferPoolFull)
+                .attach(format!(
+                    "fixed buffer pool allocation: role={:?}, capacity={}, allocated={}",
+                    self.role,
+                    self.size,
+                    self.alloc_map.allocated()
+                ))
+                .into()),
         }
     }
 
@@ -153,7 +161,7 @@ impl BufferPool for FixedBufferPool {
         if self.alloc_map.allocate_at(usize::from(page_id)) {
             Ok(self.arena.init_page(guard, page_id))
         } else {
-            Err(Error::BufferPageAlreadyAllocated)
+            Err(Error::buffer_page_already_allocated())
         }
     }
 

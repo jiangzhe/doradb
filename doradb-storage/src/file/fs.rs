@@ -9,7 +9,7 @@ use crate::catalog::{TableID, USER_OBJ_ID_START};
 use crate::component::{Component, ComponentRegistry, ShelfScope, Supplier};
 use crate::conf::FileSystemConfig;
 use crate::conf::path::path_to_utf8;
-use crate::error::{Error, Result};
+use crate::error::{Error, InternalError, Result};
 use crate::file::cow_file::COW_FILE_PAGE_SIZE;
 use crate::file::multi_table_file::{
     MultiTableActiveRoot, MultiTableFile, MultiTableFileOpenOutcome, MutableMultiTableFile,
@@ -19,12 +19,13 @@ use crate::file::table_file::{MutableTableFile, TableFile};
 use crate::file::{SparseFile, TableFsStateMachine, TableFsSubmission, WriteSubmission};
 use crate::io::{
     BackendToken, IOBackend, IOBackendStats, IOBackendStatsHandle, IOClient, IOKind, IOMessage,
-    IOQueue, IOStateMachine, IOSubmission, Operation, StorageBackend,
+    IOQueue, IOStateMachine, IOSubmission, Operation, StdIoResult, StorageBackend,
 };
 use crate::notify::EventNotifyOnDrop;
 use crate::quiescent::{QuiescentBox, QuiescentGuard, SyncQuiescentGuard};
 use crate::thread;
 use crate::{IndexPool, MemPool};
+use error_stack::Report;
 use flume::{Receiver, RecvError, Selector, SendError, TryRecvError};
 use parking_lot::Mutex;
 use std::collections::VecDeque;
@@ -397,7 +398,7 @@ impl StorageStateMachine {
 
     /// Route one backend completion back to the owning domain state machine.
     #[inline]
-    fn on_complete(&mut self, sub: StorageSubmission, res: std::io::Result<usize>) -> IOKind {
+    fn on_complete(&mut self, sub: StorageSubmission, res: StdIoResult<usize>) -> IOKind {
         match sub.inner {
             StorageSubmissionKind::Table(sub) => self.table_fs.on_complete(sub, res),
             StorageSubmissionKind::MemPool(sub) => self.mem_pool.on_complete(sub, res),
@@ -1301,9 +1302,24 @@ impl Component for FileSystemWorkers {
         registry: &mut ComponentRegistry,
         mut shelf: ShelfScope<'_, Self>,
     ) -> Result<()> {
-        let builder = shelf.take::<FileSystem>().ok_or(Error::InvalidState)?;
-        let mem_pool_file = shelf.take::<MemPool>().ok_or(Error::InvalidState)?;
-        let index_pool_file = shelf.take::<IndexPool>().ok_or(Error::InvalidState)?;
+        let builder = shelf.take::<FileSystem>().ok_or_else(|| {
+            Error::from(
+                Report::new(InternalError::ComponentProvisionMissing)
+                    .attach("provider=FileSystem, consumer=FileSystemWorkers"),
+            )
+        })?;
+        let mem_pool_file = shelf.take::<MemPool>().ok_or_else(|| {
+            Error::from(
+                Report::new(InternalError::ComponentProvisionMissing)
+                    .attach("provider=MemPool, consumer=FileSystemWorkers"),
+            )
+        })?;
+        let index_pool_file = shelf.take::<IndexPool>().ok_or_else(|| {
+            Error::from(
+                Report::new(InternalError::ComponentProvisionMissing)
+                    .attach("provider=IndexPool, consumer=FileSystemWorkers"),
+            )
+        })?;
 
         let fs = registry.dependency::<FileSystem>()?;
         let mem_pool = registry.dependency::<MemPool>()?;
@@ -1601,7 +1617,7 @@ pub(crate) mod tests {
     use crate::component::{DiskPoolConfig, IndexPoolConfig, MetaPoolConfig, RegistryBuilder};
     use crate::conf::{EngineConfig, EvictableBufferPoolConfig, TrxSysConfig};
     use crate::engine::Engine;
-    use crate::error::Error;
+    use crate::error::{ConfigError, ErrorKind};
     use crate::file::BlockID;
     use crate::file::cow_file::COW_FILE_PAGE_SIZE;
     use crate::file::table_file::TableFile;
@@ -1890,7 +1906,7 @@ pub(crate) mod tests {
             }
         }
 
-        fn on_complete(&self, op: StorageBackendOp, _res: &mut std::io::Result<usize>) {
+        fn on_complete(&self, op: StorageBackendOp, _res: &mut StdIoResult<usize>) {
             if !self.matches_blocked(op) {
                 return;
             }
@@ -1920,7 +1936,7 @@ pub(crate) mod tests {
     }
 
     impl StorageBackendTestHook for FailingFirstWriteHook {
-        fn on_complete(&self, op: StorageBackendOp, res: &mut std::io::Result<usize>) {
+        fn on_complete(&self, op: StorageBackendOp, res: &mut StdIoResult<usize>) {
             if op.kind() == IOKind::Write && !self.failed.swap(true, Ordering::SeqCst) {
                 *res = Err(std::io::Error::from_raw_os_error(libc::EIO));
             }
@@ -1959,7 +1975,7 @@ pub(crate) mod tests {
                     Ok(_) => panic!("expected initial catalog.mtb publish failure"),
                     Err(err) => err,
                 };
-                assert!(err.is_storage_io_failure(), "unexpected error: {err:?}");
+                assert_eq!(err.kind(), ErrorKind::Io, "unexpected error: {err:?}");
             }
 
             assert!(
@@ -2177,23 +2193,44 @@ pub(crate) mod tests {
     #[test]
     fn test_catalog_file_name_validation() {
         let temp_dir = TempDir::new().unwrap();
-        let res = build_test_engine(
+        let err = match build_test_engine(
             temp_dir.path(),
             FileSystemConfig::default().catalog_file_name("catalog.bin"),
+        ) {
+            Ok(_) => panic!("expected invalid catalog file name"),
+            Err(err) => err,
+        };
+        assert!(err.is_kind(ErrorKind::Config));
+        assert_eq!(
+            err.report().downcast_ref::<ConfigError>().copied(),
+            Some(ConfigError::InvalidCatalogFileName)
         );
-        assert!(res.is_err());
 
-        let res = build_test_engine(
+        let err = match build_test_engine(
             temp_dir.path(),
             FileSystemConfig::default().catalog_file_name("dir/catalog.mtb"),
+        ) {
+            Ok(_) => panic!("expected invalid catalog file name"),
+            Err(err) => err,
+        };
+        assert!(err.is_kind(ErrorKind::Config));
+        assert_eq!(
+            err.report().downcast_ref::<ConfigError>().copied(),
+            Some(ConfigError::InvalidCatalogFileName)
         );
-        assert!(res.is_err());
 
-        let res = build_test_engine(
+        let err = match build_test_engine(
             temp_dir.path(),
             FileSystemConfig::default().catalog_file_name("../catalog.mtb"),
+        ) {
+            Ok(_) => panic!("expected invalid catalog file name"),
+            Err(err) => err,
+        };
+        assert!(err.is_kind(ErrorKind::Config));
+        assert_eq!(
+            err.report().downcast_ref::<ConfigError>().copied(),
+            Some(ConfigError::InvalidCatalogFileName)
         );
-        assert!(res.is_err());
     }
 
     #[test]
@@ -2219,7 +2256,11 @@ pub(crate) mod tests {
             Ok(_) => panic!("expected invalid storage path"),
             Err(err) => err,
         };
-        assert!(matches!(err, Error::InvalidStoragePath(_)));
+        assert!(err.is_kind(ErrorKind::Config));
+        assert_eq!(
+            err.report().downcast_ref::<ConfigError>().copied(),
+            Some(ConfigError::PathMustNotEscapeStorageRoot)
+        );
     }
 
     #[cfg(unix)]
@@ -2235,6 +2276,10 @@ pub(crate) mod tests {
                 Ok(_) => panic!("expected invalid storage path"),
                 Err(err) => err,
             };
-        assert!(matches!(err, Error::InvalidStoragePath(_)));
+        assert!(err.is_kind(ErrorKind::Config));
+        assert_eq!(
+            err.report().downcast_ref::<ConfigError>().copied(),
+            Some(ConfigError::PathMustBeUtf8)
+        );
     }
 }

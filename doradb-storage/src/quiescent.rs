@@ -2,7 +2,6 @@ use crate::buffer::PoolIdentity;
 use std::ops::Deref;
 use std::pin::Pin;
 use std::ptr::{NonNull, addr_of_mut};
-use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
@@ -216,18 +215,6 @@ impl<T> QuiescentGuard<T> {
         }
     }
 
-    /// Converts this direct guard into a clone-cheap single-thread wrapper.
-    ///
-    /// The wrapped direct guard still holds exactly one quiescent keepalive.
-    /// Further clones only clone the outer `Rc` and do not touch guard_count.
-    #[inline]
-    #[allow(dead_code)]
-    pub(crate) fn into_unsync(self) -> UnsyncQuiescentGuard<T> {
-        UnsyncQuiescentGuard {
-            guard: Rc::new(self),
-        }
-    }
-
     /// Returns the raw pointer to the guarded value.
     #[inline]
     pub fn as_ptr(&self) -> *const T {
@@ -273,12 +260,6 @@ pub struct SyncQuiescentGuard<T> {
     guard: Arc<QuiescentGuard<T>>,
 }
 
-/// Clone-cheap single-thread wrapper for one acquired [`QuiescentGuard`].
-#[allow(dead_code)]
-pub(crate) struct UnsyncQuiescentGuard<T> {
-    guard: Rc<QuiescentGuard<T>>,
-}
-
 impl<T> Clone for SyncQuiescentGuard<T> {
     #[inline]
     fn clone(&self) -> Self {
@@ -288,25 +269,7 @@ impl<T> Clone for SyncQuiescentGuard<T> {
     }
 }
 
-impl<T> Clone for UnsyncQuiescentGuard<T> {
-    #[inline]
-    fn clone(&self) -> Self {
-        Self {
-            guard: Rc::clone(&self.guard),
-        }
-    }
-}
-
 impl<T> Deref for SyncQuiescentGuard<T> {
-    type Target = T;
-
-    #[inline]
-    fn deref(&self) -> &Self::Target {
-        self.guard.as_ref()
-    }
-}
-
-impl<T> Deref for UnsyncQuiescentGuard<T> {
     type Target = T;
 
     #[inline]
@@ -480,72 +443,12 @@ mod tests {
     }
 
     #[test]
-    fn test_quiescent_box_drop_waits_for_last_unsync_guard_wrapper() {
-        let owner = QuiescentBox::new(());
-        let guard = owner.guard().into_unsync();
-        let guard_clone = guard.clone();
-        let (started_tx, started_rx) = mpsc::channel();
-        let (done_tx, done_rx) = mpsc::channel();
-
-        let owner_handle = thread::spawn(move || {
-            started_tx.send(()).unwrap();
-            drop(owner);
-            done_tx.send(()).unwrap();
-        });
-
-        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
-        assert!(done_rx.recv_timeout(Duration::from_millis(100)).is_err());
-
-        drop(guard_clone);
-        assert!(done_rx.recv_timeout(Duration::from_millis(100)).is_err());
-
-        drop(guard);
-        done_rx.recv_timeout(Duration::from_secs(1)).unwrap();
-        owner_handle.join().unwrap();
-    }
-
-    #[test]
     fn test_sync_quiescent_guard_clones_do_not_touch_guard_count() {
         let owner = QuiescentBox::new(());
         let guard = owner.guard();
         assert_eq!(guard.inner_ref().guard_count.load(Ordering::Relaxed), 1);
 
         let guard = guard.into_sync();
-        assert_eq!(
-            guard.guard.inner_ref().guard_count.load(Ordering::Relaxed),
-            1
-        );
-
-        let guard_clone1 = guard.clone();
-        let guard_clone2 = guard.clone();
-        assert_eq!(
-            guard.guard.inner_ref().guard_count.load(Ordering::Relaxed),
-            1
-        );
-
-        drop(guard_clone1);
-        assert_eq!(
-            guard.guard.inner_ref().guard_count.load(Ordering::Relaxed),
-            1
-        );
-
-        drop(guard_clone2);
-        assert_eq!(
-            guard.guard.inner_ref().guard_count.load(Ordering::Relaxed),
-            1
-        );
-
-        drop(guard);
-        drop(owner);
-    }
-
-    #[test]
-    fn test_unsync_quiescent_guard_clones_do_not_touch_guard_count() {
-        let owner = QuiescentBox::new(());
-        let guard = owner.guard();
-        assert_eq!(guard.inner_ref().guard_count.load(Ordering::Relaxed), 1);
-
-        let guard = guard.into_unsync();
         assert_eq!(
             guard.guard.inner_ref().guard_count.load(Ordering::Relaxed),
             1

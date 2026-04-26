@@ -1,7 +1,9 @@
 use crate::bitmap::AllocMap;
 use crate::buffer::ReadonlyBufferPool;
 use crate::catalog::{ObjID, TableID, USER_OBJ_ID_START};
-use crate::error::{BlockCorruptionCause, BlockKind, Error, FileKind, Result, StorageOp};
+use crate::error::{
+    DataIntegrityError, Error, FileKind, InternalError, IoError, ResourceError, Result,
+};
 use crate::file::SparseFile;
 use crate::file::block_integrity::{
     BLOCK_INTEGRITY_HEADER_SIZE, BlockIntegritySpec, max_payload_len, validate_block,
@@ -25,11 +27,26 @@ use crate::quiescent::QuiescentGuard;
 use crate::row::RowID;
 use crate::serde::{Deser, Ser};
 use crate::trx::{MIN_SNAPSHOT_TS, TrxID};
-use std::io::ErrorKind;
+use error_stack::{Report, ResultExt};
+use std::io::ErrorKind as IoErrorKind;
 use std::num::NonZeroU64;
 use std::sync::Arc;
 
 pub use crate::file::CATALOG_MTB_FILE_ID;
+
+#[inline]
+fn mutable_root_metadata_regression(message: impl Into<String>) -> Error {
+    Report::new(InternalError::MutableRootMetadataRegression)
+        .attach(message.into())
+        .into()
+}
+
+#[inline]
+fn catalog_root_descriptor_invariant(message: impl Into<String>) -> Error {
+    Report::new(InternalError::CatalogRootDescriptorInvariant)
+        .attach(message.into())
+        .into()
+}
 
 /// On-disk format version of `catalog.mtb`.
 pub const CATALOG_MTB_VERSION: u64 = 2;
@@ -159,22 +176,25 @@ fn parse_multi_table_meta_block(
     page_id: BlockID,
     buf: &[u8],
 ) -> Result<ParsedMeta<MultiTableMetaBlock>> {
-    let payload = validate_block(buf, MULTI_TABLE_META_BLOCK_SPEC).map_err(|cause| {
-        Error::block_corrupted(
-            FileKind::CatalogMultiTableFile,
-            BlockKind::MultiTableMeta,
-            page_id,
-            cause,
-        )
-    })?;
-    let (_, meta_block) = MultiTableMetaBlockData::deser(payload, 0).map_err(|err| match err {
-        Error::InvalidFormat => Error::block_corrupted(
-            FileKind::CatalogMultiTableFile,
-            BlockKind::MultiTableMeta,
-            page_id,
-            BlockCorruptionCause::InvalidPayload,
-        ),
-        other => other,
+    let payload = validate_block(buf, MULTI_TABLE_META_BLOCK_SPEC)
+        .attach_with(|| {
+            format!(
+                "file={}, block=multi-table-meta, block_id={page_id}",
+                FileKind::CatalogMultiTableFile
+            )
+        })
+        .map_err(Error::from)?;
+    let (_, meta_block) = MultiTableMetaBlockData::deser(payload, 0).map_err(|err| {
+        if err.data_integrity_error().is_some() {
+            Report::new(DataIntegrityError::InvalidPayload)
+                .attach(format!(
+                    "file={}, block=multi-table-meta, block_id={page_id}",
+                    FileKind::CatalogMultiTableFile
+                ))
+                .into()
+        } else {
+            err
+        }
     })?;
 
     Ok(ParsedMeta {
@@ -196,7 +216,7 @@ fn validate_multi_table_root(
         &parsed_meta.alloc_map,
         meta_block_id,
         FileKind::CatalogMultiTableFile,
-        BlockKind::MultiTableMeta,
+        "multi-table-meta",
     )
 }
 
@@ -207,7 +227,13 @@ fn build_multi_table_meta_block(root: &MultiTableActiveRoot) -> Result<DirectBuf
     if meta_len > max_payload_len(COW_FILE_PAGE_SIZE)
         || root.gc_block_list.len() > u32::MAX as usize
     {
-        return Err(Error::InvalidState);
+        return Err(Report::new(ResourceError::StorageFileCapacityExceeded)
+            .attach(format!(
+                "multi-table meta block payload too large: actual_bytes={meta_len}, max_bytes={}, gc_blocks={}",
+                max_payload_len(COW_FILE_PAGE_SIZE),
+                root.gc_block_list.len()
+            ))
+            .into());
     }
     let mut buf = DirectBuf::zeroed(COW_FILE_PAGE_SIZE);
     let idx = write_block_header(buf.as_bytes_mut(), MULTI_TABLE_META_BLOCK_SPEC);
@@ -265,11 +291,15 @@ impl MultiTableFile {
                     MultiTableFile { file },
                 )));
             }
-            Err(Error::StorageIOError {
-                op: StorageOp::FileCreate,
-                kind: ErrorKind::AlreadyExists,
-                ..
-            }) => CowFile::open(file_path, CATALOG_MTB_FILE_ID, multi_table_codec())?,
+            Err(err)
+                if err
+                    .report()
+                    .downcast_ref::<IoError>()
+                    .copied()
+                    .is_some_and(|err| err.kind() == IoErrorKind::AlreadyExists) =>
+            {
+                CowFile::open(file_path, CATALOG_MTB_FILE_ID, multi_table_codec())?
+            }
             Err(err) => return Err(err),
         };
 
@@ -427,9 +457,11 @@ impl MutableMultiTableFile {
     /// Allocate a new page id for copy-on-write updates.
     #[inline]
     pub fn allocate_block_id(&mut self) -> Result<BlockID> {
-        self.new_root_mut()
-            .try_allocate_block_id()
-            .ok_or(Error::InvalidState)
+        self.new_root_mut().try_allocate_block_id().ok_or_else(|| {
+            Report::new(ResourceError::StorageFileCapacityExceeded)
+                .attach("multi-table file could not allocate block")
+                .into()
+        })
     }
 
     /// Roll back a block id allocated by this unpublished mutable root.
@@ -474,14 +506,22 @@ impl MutableMultiTableFile {
     ) -> Result<()> {
         let root = self.new_root_mut();
         if catalog_replay_start_ts < root.trx_id {
-            return Err(Error::InvalidArgument);
+            return Err(mutable_root_metadata_regression(format!(
+                "catalog replay start regressed: current={}, new={catalog_replay_start_ts}",
+                root.trx_id
+            )));
         }
         if next_user_obj_id < USER_OBJ_ID_START {
-            return Err(Error::InvalidArgument);
+            return Err(catalog_root_descriptor_invariant(format!(
+                "next_user_obj_id={next_user_obj_id}, minimum={USER_OBJ_ID_START}"
+            )));
         }
         for root in &table_roots {
             if root.root_block_id.is_none() && root.pivot_row_id != 0 {
-                return Err(Error::InvalidArgument);
+                return Err(catalog_root_descriptor_invariant(format!(
+                    "table_id={}, root block missing but pivot_row_id={}",
+                    root.table_id, root.pivot_row_id
+                )));
             }
         }
 
@@ -578,7 +618,7 @@ fn build_super_block(slot_no: u64, checkpoint_cts: TrxID, meta_block_id: BlockID
 mod tests {
     use super::*;
     use crate::buffer::global_readonly_pool_scope;
-    use crate::error::{BlockCorruptionCause, BlockKind, Error, FileKind};
+    use crate::error::{DataIntegrityError, Error};
     use crate::file::block_integrity::BLOCK_INTEGRITY_TRAILER_SIZE;
     use crate::file::test_block_id;
     use crate::file::{build_test_fs, build_test_fs_in};
@@ -601,17 +641,13 @@ mod tests {
     fn assert_multi_table_meta_corruption(
         err: Error,
         page_id: BlockID,
-        cause: BlockCorruptionCause,
+        expected: DataIntegrityError,
     ) {
-        assert!(matches!(
-            err,
-            Error::BlockCorrupted {
-                file_kind: FileKind::CatalogMultiTableFile,
-                block_kind: BlockKind::MultiTableMeta,
-                block_id: actual_page_id,
-                cause: actual_cause,
-            } if actual_page_id == page_id && actual_cause == cause
-        ));
+        assert_eq!(err.data_integrity_error(), Some(expected));
+        let report = format!("{err:?}");
+        assert!(report.contains("catalog.mtb"), "{report}");
+        assert!(report.contains("multi-table-meta"), "{report}");
+        assert!(report.contains(&format!("block_id={page_id}")), "{report}");
     }
 
     async fn publish_checkpoint_for_test(
@@ -785,7 +821,7 @@ mod tests {
             assert_multi_table_meta_corruption(
                 err,
                 active_meta_block_id,
-                BlockCorruptionCause::InvalidVersion,
+                DataIntegrityError::InvalidVersion,
             );
         });
     }
@@ -816,7 +852,7 @@ mod tests {
             assert_multi_table_meta_corruption(
                 err,
                 active_meta_block_id,
-                BlockCorruptionCause::ChecksumMismatch,
+                DataIntegrityError::ChecksumMismatch,
             );
         });
     }
@@ -960,7 +996,7 @@ mod tests {
             assert_multi_table_meta_corruption(
                 err,
                 active_meta_block_id,
-                BlockCorruptionCause::InvalidRootInvariant,
+                DataIntegrityError::InvalidRootInvariant,
             );
         });
     }

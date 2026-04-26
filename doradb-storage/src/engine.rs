@@ -11,12 +11,13 @@ use crate::component::{
     ComponentRegistry, DiskPoolConfig, IndexPoolConfig, MetaPoolConfig, RegistryBuilder,
 };
 use crate::conf::EngineConfig;
-use crate::error::{Error, Result};
+use crate::error::{LifecycleError, LifecycleResult, Result};
 use crate::file::fs::{FileSystem, FileSystemWorkers};
 use crate::quiescent::QuiescentGuard;
 use crate::session::Session;
 use crate::trx::sys::TransactionSystem;
 use crate::{DiskPool, IndexPool, MemPool, MetaPool};
+use error_stack::{Report, ensure};
 use parking_lot::{Mutex, RwLock};
 use std::ops::Deref;
 use std::sync::Arc;
@@ -61,6 +62,15 @@ impl EngineLifecycle {
     #[inline]
     fn set_state(&self, state: EngineLifecycleState) {
         self.state.store(state as u8, Ordering::Release);
+    }
+
+    #[inline]
+    fn ensure_running(&self) -> LifecycleResult<()> {
+        ensure!(
+            self.state() == EngineLifecycleState::Running,
+            LifecycleError::Shutdown
+        );
+        Ok(())
     }
 }
 
@@ -171,7 +181,9 @@ impl Engine {
         // drained before we start disabling runtime state.
         let strong_count = Arc::strong_count(inner);
         if strong_count != 1 {
-            return Err(Error::StorageEngineShutdownBusy(strong_count - 1));
+            return Err(Report::new(LifecycleError::ShutdownBusy)
+                .attach(strong_count - 1)
+                .into());
         }
 
         self.components().shutdown_all();
@@ -184,7 +196,7 @@ impl Drop for Engine {
     #[inline]
     fn drop(&mut self) {
         if let Err(err) = self.finalize_shutdown() {
-            if matches!(err, Error::StorageEngineShutdownBusy(_)) {
+            if err.lifecycle_error() == Some(LifecycleError::ShutdownBusy) {
                 // Fatal owner-drop violations still need to stop background
                 // workers, but the owner registry cannot be dropped while
                 // leaked runtime refs still retain component guards.
@@ -262,9 +274,7 @@ impl EngineInner {
     #[inline]
     pub(crate) fn with_running_admission<T>(&self, f: impl FnOnce() -> T) -> Result<T> {
         let _gate = self.lifecycle.admission_gate.read();
-        if self.lifecycle.state() != EngineLifecycleState::Running {
-            return Err(Error::StorageEngineShutdown);
-        }
+        self.lifecycle.ensure_running()?;
         self.trx_sys.ensure_runtime_healthy()?;
         Ok(f())
     }
@@ -352,7 +362,7 @@ mod tests {
     use crate::catalog::tests::table1;
     use crate::conf::consts::STORAGE_LAYOUT_FILE_NAME;
     use crate::conf::{EngineConfig, EvictableBufferPoolConfig, FileSystemConfig, TrxSysConfig};
-    use crate::error::Error;
+    use crate::error::{ConfigError, ErrorKind, LifecycleError, ResourceError};
     use crate::file::fs::tests::io_backend_stats_handle_identity as fs_stats_handle_identity;
     use std::fs;
     use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -539,7 +549,11 @@ mod tests {
                 Ok(_) => panic!("expected storage layout mismatch"),
                 Err(err) => err,
             };
-            assert!(matches!(err, Error::StorageLayoutMismatch(_)));
+            assert!(err.is_kind(ErrorKind::Config));
+            assert_eq!(
+                err.report().downcast_ref::<ConfigError>().copied(),
+                Some(ConfigError::StorageLayoutMismatch)
+            );
         });
     }
 
@@ -561,7 +575,11 @@ mod tests {
                 Ok(_) => panic!("expected storage layout mismatch"),
                 Err(err) => err,
             };
-            assert!(matches!(err, Error::StorageLayoutMismatch(_)));
+            assert!(err.is_kind(ErrorKind::Config));
+            assert_eq!(
+                err.report().downcast_ref::<ConfigError>().copied(),
+                Some(ConfigError::StorageLayoutMismatch)
+            );
             assert!(!new_data_dir.exists());
         });
     }
@@ -607,7 +625,10 @@ mod tests {
                 Ok(_) => panic!("expected startup failure"),
                 Err(err) => err,
             };
-            assert!(matches!(err, Error::BufferPoolSizeTooSmall));
+            assert_eq!(
+                err.resource_error(),
+                Some(ResourceError::BufferPoolSizeTooSmall)
+            );
             assert!(!marker_path.exists());
 
             let engine = test_engine_config_for(root.path())
@@ -644,7 +665,11 @@ mod tests {
                 Ok(_) => panic!("expected startup failure"),
                 Err(err) => err,
             };
-            assert!(matches!(err, Error::InvalidStoragePath(_)));
+            assert!(err.is_kind(ErrorKind::Config));
+            assert_eq!(
+                err.report().downcast_ref::<ConfigError>().copied(),
+                Some(ConfigError::PathMustNotOverlapReservedLocation)
+            );
             assert!(!marker_path.exists());
         });
     }
@@ -662,13 +687,15 @@ mod tests {
                 Ok(_) => panic!("expected shutdown error"),
                 Err(err) => err,
             };
-            assert!(matches!(err, Error::StorageEngineShutdown));
+            assert_eq!(err.kind(), ErrorKind::Lifecycle);
+            assert_eq!(err.lifecycle_error(), Some(LifecycleError::Shutdown));
 
             let err = match engine.new_ref() {
                 Ok(_) => panic!("expected shutdown error"),
                 Err(err) => err,
             };
-            assert!(matches!(err, Error::StorageEngineShutdown));
+            assert_eq!(err.kind(), ErrorKind::Lifecycle);
+            assert_eq!(err.lifecycle_error(), Some(LifecycleError::Shutdown));
         });
     }
 
@@ -683,19 +710,23 @@ mod tests {
                 Ok(_) => panic!("expected busy shutdown error"),
                 Err(err) => err,
             };
-            assert!(matches!(err, Error::StorageEngineShutdownBusy(1)));
+            assert_eq!(err.kind(), ErrorKind::Lifecycle);
+            assert_eq!(err.lifecycle_error(), Some(LifecycleError::ShutdownBusy));
+            assert_eq!(err.downcast_ref::<usize>().copied(), Some(1));
 
             let err = match engine_ref.try_new_session() {
                 Ok(_) => panic!("expected shutdown error"),
                 Err(err) => err,
             };
-            assert!(matches!(err, Error::StorageEngineShutdown));
+            assert_eq!(err.kind(), ErrorKind::Lifecycle);
+            assert_eq!(err.lifecycle_error(), Some(LifecycleError::Shutdown));
 
             let err = match engine.new_ref() {
                 Ok(_) => panic!("expected shutdown error"),
                 Err(err) => err,
             };
-            assert!(matches!(err, Error::StorageEngineShutdown));
+            assert_eq!(err.kind(), ErrorKind::Lifecycle);
+            assert_eq!(err.lifecycle_error(), Some(LifecycleError::Shutdown));
 
             drop(engine_ref);
             engine.shutdown().unwrap();
@@ -713,19 +744,23 @@ mod tests {
                 Ok(_) => panic!("expected busy shutdown error"),
                 Err(err) => err,
             };
-            assert!(matches!(err, Error::StorageEngineShutdownBusy(1)));
+            assert_eq!(err.kind(), ErrorKind::Lifecycle);
+            assert_eq!(err.lifecycle_error(), Some(LifecycleError::ShutdownBusy));
+            assert_eq!(err.downcast_ref::<usize>().copied(), Some(1));
 
             let err = match engine.try_new_session() {
                 Ok(_) => panic!("expected shutdown error"),
                 Err(err) => err,
             };
-            assert!(matches!(err, Error::StorageEngineShutdown));
+            assert_eq!(err.kind(), ErrorKind::Lifecycle);
+            assert_eq!(err.lifecycle_error(), Some(LifecycleError::Shutdown));
 
             let err = match session.try_begin_trx() {
                 Ok(_) => panic!("expected shutdown error"),
                 Err(err) => err,
             };
-            assert!(matches!(err, Error::StorageEngineShutdown));
+            assert_eq!(err.kind(), ErrorKind::Lifecycle);
+            assert_eq!(err.lifecycle_error(), Some(LifecycleError::Shutdown));
             assert!(!session.in_trx());
 
             drop(session);
@@ -875,8 +910,11 @@ mod tests {
                 let new_ref_res = ref_handle.join().unwrap();
 
                 match (shutdown_res, new_ref_res) {
-                    (Ok(()), Err(Error::StorageEngineShutdown)) => {}
-                    (Err(Error::StorageEngineShutdownBusy(1)), Ok(engine_ref)) => {
+                    (Ok(()), Err(err))
+                        if err.lifecycle_error() == Some(LifecycleError::Shutdown) => {}
+                    (Err(err), Ok(engine_ref))
+                        if err.lifecycle_error() == Some(LifecycleError::ShutdownBusy) =>
+                    {
                         drop(engine_ref);
                         engine.shutdown().unwrap();
                     }

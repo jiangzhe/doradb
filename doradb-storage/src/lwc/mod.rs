@@ -7,7 +7,7 @@ pub use block::*;
 use crate::bitmap::Bitmap;
 use crate::catalog::TableMetadata;
 use crate::compression::*;
-use crate::error::{Error, Result};
+use crate::error::{DataIntegrityError, Error, InternalError, OperationError, Result};
 use crate::file::block_integrity::{LWC_BLOCK_SPEC, write_block_checksum, write_block_header};
 use crate::file::cow_file::COW_FILE_PAGE_SIZE;
 use crate::io::DirectBuf;
@@ -15,7 +15,25 @@ use crate::row::vector_scan::{PageVectorView, ScanBuffer, ScanColumnValues};
 use crate::row::{RowID, RowPage};
 use crate::serde::{Deser, ForBitpackingDeser, ForBitpackingSer, Ser, Serde};
 use crate::value::{MemVar, Val, ValKind};
+use error_stack::Report;
 use std::mem;
+
+#[inline]
+fn invalid_compressed_payload(message: impl Into<String>) -> Error {
+    Report::new(DataIntegrityError::InvalidPayload)
+        .attach(message.into())
+        .into()
+}
+
+#[inline]
+fn lwc_block_encoding_invariant() -> Error {
+    Report::new(InternalError::LwcBlockEncodingInvariant).into()
+}
+
+#[inline]
+fn column_scan_shape_mismatch() -> Error {
+    Report::new(InternalError::ColumnScanShapeMismatch).into()
+}
 
 /// Lightweight compressed data.
 pub enum LwcData<'a> {
@@ -87,7 +105,9 @@ impl<'a> LwcData<'a> {
                     ValKind::VarByte => {
                         let len = len as usize;
                         if input.len() < (len + 1) * mem::size_of::<u32>() {
-                            return Err(Error::InvalidCompressedData);
+                            return Err(invalid_compressed_payload(
+                                "LWC varbyte payload is shorter than its offset table",
+                            ));
                         }
                         let (offset_bytes, data) =
                             input.split_at((len + 1) * mem::size_of::<u32>());
@@ -110,7 +130,13 @@ impl<'a> LwcData<'a> {
                             1 => LwcPrimitive::ForBp1I8(ForBitpacking1 { len, min, data }),
                             2 => LwcPrimitive::ForBp2I8(ForBitpacking2 { len, min, data }),
                             4 => LwcPrimitive::ForBp4I8(ForBitpacking4 { len, min, data }),
-                            _ => return Err(Error::NotSupported("unexpected packing bits")),
+                            _ => {
+                                return Err(Report::new(OperationError::NotSupported)
+                                    .attach(format!(
+                                        "unexpected packing bits: val_kind={kind:?}, n_bits={n_bits}"
+                                    ))
+                                    .into());
+                            }
                         }
                     }
                     ValKind::U8 => {
@@ -120,7 +146,13 @@ impl<'a> LwcData<'a> {
                             1 => LwcPrimitive::ForBp1U8(ForBitpacking1 { len, min, data }),
                             2 => LwcPrimitive::ForBp2U8(ForBitpacking2 { len, min, data }),
                             4 => LwcPrimitive::ForBp4U8(ForBitpacking4 { len, min, data }),
-                            _ => return Err(Error::NotSupported("unexpected packing bits")),
+                            _ => {
+                                return Err(Report::new(OperationError::NotSupported)
+                                    .attach(format!(
+                                        "unexpected packing bits: val_kind={kind:?}, n_bits={n_bits}"
+                                    ))
+                                    .into());
+                            }
                         }
                     }
                     ValKind::I16 => {
@@ -131,7 +163,13 @@ impl<'a> LwcData<'a> {
                             2 => LwcPrimitive::ForBp2I16(ForBitpacking2 { len, min, data }),
                             4 => LwcPrimitive::ForBp4I16(ForBitpacking4 { len, min, data }),
                             8 => LwcPrimitive::ForBp8I16(ForBitpacking8 { min, data }),
-                            _ => return Err(Error::NotSupported("unexpected packing bits")),
+                            _ => {
+                                return Err(Report::new(OperationError::NotSupported)
+                                    .attach(format!(
+                                        "unexpected packing bits: val_kind={kind:?}, n_bits={n_bits}"
+                                    ))
+                                    .into());
+                            }
                         }
                     }
                     ValKind::U16 => {
@@ -142,7 +180,13 @@ impl<'a> LwcData<'a> {
                             2 => LwcPrimitive::ForBp2U16(ForBitpacking2 { len, min, data }),
                             4 => LwcPrimitive::ForBp4U16(ForBitpacking4 { len, min, data }),
                             8 => LwcPrimitive::ForBp8U16(ForBitpacking8 { min, data }),
-                            _ => return Err(Error::NotSupported("unexpected packing bits")),
+                            _ => {
+                                return Err(Report::new(OperationError::NotSupported)
+                                    .attach(format!(
+                                        "unexpected packing bits: val_kind={kind:?}, n_bits={n_bits}"
+                                    ))
+                                    .into());
+                            }
                         }
                     }
                     ValKind::I32 => {
@@ -157,7 +201,13 @@ impl<'a> LwcData<'a> {
                                 let data = bytemuck::cast_slice::<u8, [u8; 2]>(data);
                                 LwcPrimitive::ForBp16I32(ForBitpacking16 { min, data })
                             }
-                            _ => return Err(Error::NotSupported("unexpected packing bits")),
+                            _ => {
+                                return Err(Report::new(OperationError::NotSupported)
+                                    .attach(format!(
+                                        "unexpected packing bits: val_kind={kind:?}, n_bits={n_bits}"
+                                    ))
+                                    .into());
+                            }
                         }
                     }
                     ValKind::U32 => {
@@ -172,7 +222,13 @@ impl<'a> LwcData<'a> {
                                 let data = bytemuck::cast_slice::<u8, [u8; 2]>(data);
                                 LwcPrimitive::ForBp16U32(ForBitpacking16 { min, data })
                             }
-                            _ => return Err(Error::NotSupported("unexpected packing bits")),
+                            _ => {
+                                return Err(Report::new(OperationError::NotSupported)
+                                    .attach(format!(
+                                        "unexpected packing bits: val_kind={kind:?}, n_bits={n_bits}"
+                                    ))
+                                    .into());
+                            }
                         }
                     }
                     ValKind::I64 => {
@@ -191,7 +247,13 @@ impl<'a> LwcData<'a> {
                                 let data = bytemuck::cast_slice::<u8, [u8; 4]>(data);
                                 LwcPrimitive::ForBp32I64(ForBitpacking32 { min, data })
                             }
-                            _ => return Err(Error::NotSupported("unexpected packing bits")),
+                            _ => {
+                                return Err(Report::new(OperationError::NotSupported)
+                                    .attach(format!(
+                                        "unexpected packing bits: val_kind={kind:?}, n_bits={n_bits}"
+                                    ))
+                                    .into());
+                            }
                         }
                     }
                     ValKind::U64 => {
@@ -212,12 +274,18 @@ impl<'a> LwcData<'a> {
                             }
                             _ => {
                                 // any other number of bits are not supported.
-                                return Err(Error::NotSupported("unexpected packing bits"));
+                                return Err(Report::new(OperationError::NotSupported)
+                                    .attach(format!(
+                                        "unexpected packing bits: val_kind={kind:?}, n_bits={n_bits}"
+                                    ))
+                                    .into());
                             }
                         }
                     }
                     ValKind::F32 | ValKind::F64 | ValKind::VarByte => {
-                        return Err(Error::NotSupported("unexpected type"));
+                        return Err(Report::new(OperationError::NotSupported)
+                            .attach(format!("unexpected type: val_kind={kind:?}"))
+                            .into());
                     }
                 };
                 LwcData::Primitive(p)
@@ -337,7 +405,11 @@ impl TryFrom<u8> for LwcCode {
         let res = match value {
             1 => LwcCode::Flat,
             3 => LwcCode::ForBitpacking,
-            _ => return Err(Error::InvalidCompressedData),
+            _ => {
+                return Err(invalid_compressed_payload(format!(
+                    "invalid LWC code {value}"
+                )));
+            }
         };
         Ok(res)
     }
@@ -558,7 +630,9 @@ impl<'a> LwcPrimitiveSer<'a> {
     #[inline]
     pub fn new_bytes(offsets: &[u32], data: &[u8]) -> Result<Self> {
         if offsets.is_empty() || offsets[0] != 0 {
-            return Err(Error::InvalidCompressedData);
+            return Err(invalid_compressed_payload(
+                "LWC bytes offsets must be non-empty and start at zero",
+            ));
         }
         Ok(LwcPrimitiveSer::Bytes(LwcBytesSer {
             offsets: offsets.to_vec(),
@@ -569,7 +643,9 @@ impl<'a> LwcPrimitiveSer<'a> {
     #[inline]
     pub fn new_bytes_owned(offsets: Vec<u32>, data: Vec<u8>) -> Result<Self> {
         if offsets.is_empty() || offsets[0] != 0 {
-            return Err(Error::InvalidCompressedData);
+            return Err(invalid_compressed_payload(
+                "LWC bytes offsets must be non-empty and start at zero",
+            ));
         }
         Ok(LwcPrimitiveSer::Bytes(LwcBytesSer { offsets, data }))
     }
@@ -795,11 +871,13 @@ impl<'a> LwcBuilder<'a> {
 
     pub fn build(&self, row_shape_fingerprint: u128) -> Result<DirectBuf> {
         if self.buffer.is_empty() {
-            return Err(Error::InvalidState);
+            return Err(Report::new(InternalError::LwcBuilderMisuse)
+                .attach("cannot build an empty LWC block")
+                .into());
         }
         let row_count = self.buffer.len();
         if row_count > u16::MAX as usize {
-            return Err(Error::InvalidArgument);
+            return Err(lwc_block_encoding_invariant());
         }
         let mut column_payloads = Vec::with_capacity(self.metadata.col_count());
         let mut col_offsets = Vec::with_capacity(self.metadata.col_count());
@@ -809,7 +887,7 @@ impl<'a> LwcBuilder<'a> {
             let column = self
                 .buffer
                 .column(col_idx)
-                .ok_or(Error::InvalidColumnScan)?;
+                .ok_or_else(column_scan_shape_mismatch)?;
             let mut data = Vec::new();
             if let Some(bitmap) = column.null_bitmap {
                 let bytes = bitmap_to_bytes(bitmap, row_count);
@@ -875,7 +953,7 @@ impl<'a> LwcBuilder<'a> {
             data.extend_from_slice(&payload);
             offset += data.len();
             if offset > u16::MAX as usize {
-                return Err(Error::InvalidArgument);
+                return Err(lwc_block_encoding_invariant());
             }
             col_offsets.push(offset as u16);
             column_payloads.push(data);
@@ -1046,7 +1124,9 @@ fn estimate_columns_size(
     let mut total = 0usize;
     debug_assert!(stats.len() == metadata.col_count());
     for (col_idx, st) in stats.iter().enumerate() {
-        let column = buffer.column(col_idx).ok_or(Error::InvalidColumnScan)?;
+        let column = buffer
+            .column(col_idx)
+            .ok_or_else(column_scan_shape_mismatch)?;
         if column.null_bitmap.is_some() {
             total += mem::size_of::<u16>() + row_count.div_ceil(8);
         }
@@ -1100,7 +1180,7 @@ fn estimate_column_payload(
                 + (count + 1) * mem::size_of::<u32>()
                 + data.len()
         }
-        _ => return Err(Error::InvalidColumnScan),
+        _ => return Err(column_scan_shape_mismatch()),
     };
     Ok(size)
 }
@@ -1367,7 +1447,9 @@ impl<'a> LwcNullBitmap<'a> {
         let (len, input) = read_le_u16(input)?;
         let len = len as usize;
         if input.len() < len {
-            return Err(Error::InvalidCompressedData);
+            return Err(invalid_compressed_payload(
+                "LWC null bitmap payload is shorter than declared length",
+            ));
         }
         let (bytes, rest) = input.split_at(len);
         Ok((LwcNullBitmap { bytes }, rest))
@@ -1403,7 +1485,9 @@ impl<'a> LwcNullBitmapSer<'a> {
     #[inline]
     pub fn new(bytes: &'a [u8]) -> Result<Self> {
         if bytes.len() > u16::MAX as usize {
-            return Err(Error::InvalidCompressedData);
+            return Err(invalid_compressed_payload(
+                "LWC null bitmap payload length exceeds u16::MAX",
+            ));
         }
         Ok(LwcNullBitmapSer { bytes })
     }
@@ -1513,7 +1597,7 @@ impl_sorted_position!(FlatU64, u64);
 #[inline]
 fn read_le_u64(input: &[u8]) -> Result<(u64, &[u8])> {
     if input.len() < 8 {
-        return Err(Error::InvalidCompressedData);
+        return Err(invalid_compressed_payload("expected LWC little-endian u64"));
     }
     let u: [u8; 8] = input[..8].try_into().unwrap();
     let v = u64::from_le_bytes(u);
@@ -1523,7 +1607,7 @@ fn read_le_u64(input: &[u8]) -> Result<(u64, &[u8])> {
 #[inline]
 fn read_le_u32(input: &[u8]) -> Result<(u32, &[u8])> {
     if input.len() < 4 {
-        return Err(Error::InvalidCompressedData);
+        return Err(invalid_compressed_payload("expected LWC little-endian u32"));
     }
     let u: [u8; 4] = input[..4].try_into().unwrap();
     Ok((u32::from_le_bytes(u), &input[4..]))
@@ -1532,7 +1616,7 @@ fn read_le_u32(input: &[u8]) -> Result<(u32, &[u8])> {
 #[inline]
 fn read_le_i32(input: &[u8]) -> Result<(i32, &[u8])> {
     if input.len() < 4 {
-        return Err(Error::InvalidCompressedData);
+        return Err(invalid_compressed_payload("expected LWC little-endian i32"));
     }
     let u: [u8; 4] = input[..4].try_into().unwrap();
     Ok((i32::from_le_bytes(u), &input[4..]))
@@ -1541,7 +1625,7 @@ fn read_le_i32(input: &[u8]) -> Result<(i32, &[u8])> {
 #[inline]
 fn read_le_u16(input: &[u8]) -> Result<(u16, &[u8])> {
     if input.len() < 2 {
-        return Err(Error::InvalidCompressedData);
+        return Err(invalid_compressed_payload("expected LWC little-endian u16"));
     }
     let u: [u8; 2] = input[..2].try_into().unwrap();
     Ok((u16::from_le_bytes(u), &input[2..]))
@@ -1550,7 +1634,7 @@ fn read_le_u16(input: &[u8]) -> Result<(u16, &[u8])> {
 #[inline]
 fn read_le_i16(input: &[u8]) -> Result<(i16, &[u8])> {
     if input.len() < 2 {
-        return Err(Error::InvalidCompressedData);
+        return Err(invalid_compressed_payload("expected LWC little-endian i16"));
     }
     let u: [u8; 2] = input[..2].try_into().unwrap();
     Ok((i16::from_le_bytes(u), &input[2..]))
@@ -1559,7 +1643,7 @@ fn read_le_i16(input: &[u8]) -> Result<(i16, &[u8])> {
 #[inline]
 fn read_le_i64(input: &[u8]) -> Result<(i64, &[u8])> {
     if input.len() < 8 {
-        return Err(Error::InvalidCompressedData);
+        return Err(invalid_compressed_payload("expected LWC little-endian i64"));
     }
     let u: [u8; 8] = input[..8].try_into().unwrap();
     Ok((i64::from_le_bytes(u), &input[8..]))
@@ -1568,7 +1652,7 @@ fn read_le_i64(input: &[u8]) -> Result<(i64, &[u8])> {
 #[inline]
 fn read_u8(input: &[u8]) -> Result<(u8, &[u8])> {
     if input.is_empty() {
-        return Err(Error::InvalidCompressedData);
+        return Err(invalid_compressed_payload("expected LWC u8"));
     }
     let v = input[0];
     Ok((v, &input[1..]))
@@ -1577,7 +1661,7 @@ fn read_u8(input: &[u8]) -> Result<(u8, &[u8])> {
 #[inline]
 fn read_i8(input: &[u8]) -> Result<(i8, &[u8])> {
     if input.is_empty() {
-        return Err(Error::InvalidCompressedData);
+        return Err(invalid_compressed_payload("expected LWC i8"));
     }
     let v = input[0] as i8;
     Ok((v, &input[1..]))
@@ -1587,7 +1671,7 @@ fn read_i8(input: &[u8]) -> Result<(i8, &[u8])> {
 mod tests {
     use super::*;
     use crate::catalog::{ColumnAttributes, ColumnSpec};
-    use crate::error::FileKind;
+    use crate::error::{DataIntegrityError, FileKind, OperationError};
     use crate::file::test_block_id;
     use crate::index::ColumnBlockEntryShape;
     use crate::io::IOBuf;
@@ -1833,10 +1917,14 @@ mod tests {
     #[test]
     fn test_lwc_bytes_invalid() {
         let err = LwcPrimitiveSer::new_bytes(&[], &[]);
-        assert!(matches!(err, Err(Error::InvalidCompressedData)));
+        assert!(err.as_ref().is_err_and(
+            |err| err.data_integrity_error() == Some(DataIntegrityError::InvalidPayload)
+        ));
 
         let err = LwcPrimitiveSer::new_bytes(&[1, 2], &[0u8]);
-        assert!(matches!(err, Err(Error::InvalidCompressedData)));
+        assert!(err.as_ref().is_err_and(
+            |err| err.data_integrity_error() == Some(DataIntegrityError::InvalidPayload)
+        ));
 
         let offsets = vec![0u32, 0];
         let bytes = vec![];
@@ -1844,7 +1932,9 @@ mod tests {
         let mut res = vec![0u8; lwc_ser.ser_len()];
         lwc_ser.ser(&mut res[..], 0);
         let err = LwcData::from_bytes(ValKind::VarByte, &res[..res.len() - 1]);
-        assert!(matches!(err, Err(Error::InvalidCompressedData)));
+        assert!(err.as_ref().is_err_and(
+            |err| err.data_integrity_error() == Some(DataIntegrityError::InvalidPayload)
+        ));
     }
 
     #[test]
@@ -1873,7 +1963,10 @@ mod tests {
         payload.push(0); // data byte (div_ceil(1 * 3, 8) == 1)
 
         let err = LwcData::from_bytes(ValKind::U8, &payload);
-        assert!(matches!(err, Err(Error::NotSupported(_))));
+        assert!(
+            err.as_ref()
+                .is_err_and(|err| err.operation_error() == Some(OperationError::NotSupported))
+        );
     }
 
     #[test]

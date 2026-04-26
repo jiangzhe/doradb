@@ -273,7 +273,7 @@ pub const INVALID_PAGE_ID: PageID = PageID::new(u64::MAX);
 /// Readonly pools use this cell to fan out one deduplicated miss load to many
 /// waiters. Evictable pools use the same cell for read reloads and for readers
 /// waiting behind writeback of the same page.
-pub(crate) type PageIOCompletion = Completion<Result<PageID>>;
+pub(crate) type PageIOCompletion = Completion<PageID>;
 
 /// Validation callback for one persisted readonly-cache block image.
 pub(crate) type ReadonlyBlockValidator = fn(&[u8], FileKind, BlockID) -> Result<()>;

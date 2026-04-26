@@ -6,7 +6,10 @@ use crate::buffer::{EvictableBufferPool, PoolGuards, PoolRole, test_frame_kind};
 use crate::catalog::tests::table4;
 use crate::conf::{EngineConfig, EvictableBufferPoolConfig, FileSystemConfig, TrxSysConfig};
 use crate::engine::Engine;
-use crate::error::{BlockCorruptionCause, BlockKind, Error, FileKind, Result, StoragePoisonSource};
+use crate::error::{
+    CompletionErrorKind, DataIntegrityError, Error, FatalError, InternalError, OperationError,
+    ResourceError, Result,
+};
 use crate::file::block_integrity::{BLOCK_INTEGRITY_HEADER_SIZE, write_block_checksum};
 use crate::file::cow_file::{
     BlockID, COW_FILE_PAGE_SIZE, SUPER_BLOCK_ID, tests::old_root_drop_count,
@@ -17,11 +20,11 @@ use crate::index::{
     load_entry_deletion_deltas,
 };
 use crate::io::{
-    IOKind, StorageBackendFileIdentity, StorageBackendOp, StorageBackendTestHook,
+    IOKind, StdIoResult, StorageBackendFileIdentity, StorageBackendOp, StorageBackendTestHook,
     install_storage_backend_test_hook,
 };
 use crate::latch::LatchFallbackMode;
-use crate::row::ops::{DeleteMvcc, InsertMvcc, SelectKey, SelectMvcc, UpdateCol, UpdateMvcc};
+use crate::row::ops::{DeleteMvcc, SelectKey, SelectMvcc, UpdateCol, UpdateMvcc};
 use crate::row::{RowID, RowPage, RowRead};
 use crate::session::Session;
 use crate::stmt::Statement;
@@ -36,7 +39,7 @@ use crate::trx::{ActiveTrx, MAX_SNAPSHOT_TS, TrxID};
 use crate::value::Val;
 use std::cell::Cell;
 use std::fs::OpenOptions;
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
@@ -67,11 +70,25 @@ pub(super) fn test_force_secondary_sidecar_error_enabled() -> bool {
     TEST_FORCE_SECONDARY_SIDECAR_ERROR.with(|flag| flag.get())
 }
 
-async fn stmt_insert_row(
-    stmt: &mut Statement,
-    table: &Table,
-    cols: Vec<Val>,
-) -> Result<InsertMvcc> {
+fn assert_table_data_integrity(
+    err: Error,
+    block_kind: &str,
+    block_id: BlockID,
+    expected: DataIntegrityError,
+) {
+    let report = format!("{err:?}");
+    if err.completion_error() == Some(CompletionErrorKind::DataIntegrity(expected)) {
+        assert!(report.contains("propagate from other threads"), "{report}");
+        assert!(report.contains("wait for"), "{report}");
+        return;
+    }
+    assert_eq!(err.data_integrity_error(), Some(expected), "{report}");
+    assert!(report.contains("table-file"), "{report}");
+    assert!(report.contains(block_kind), "{report}");
+    assert!(report.contains(&format!("block_id={block_id}")), "{report}");
+}
+
+async fn stmt_insert_row(stmt: &mut Statement, table: &Table, cols: Vec<Val>) -> Result<RowID> {
     let (ctx, effects) = stmt.ctx_and_effects_mut();
     table.accessor().insert_mvcc(ctx, effects, cols).await
 }
@@ -151,9 +168,9 @@ impl StorageBackendTestHook for FailingPageReadHook {
         }
     }
 
-    fn on_complete(&self, op: StorageBackendOp, res: &mut std::io::Result<usize>) {
+    fn on_complete(&self, op: StorageBackendOp, res: &mut StdIoResult<usize>) {
         if self.matches(op) {
-            *res = Err(std::io::Error::from_raw_os_error(self.errno));
+            *res = Err(io::Error::from_raw_os_error(self.errno));
         }
     }
 }
@@ -214,7 +231,8 @@ fn test_mvcc_insert_dup_key() {
             let mut trx = session.try_begin_trx().unwrap().unwrap();
             let mut stmt = trx.start_stmt();
             let res = stmt_insert_row(&mut stmt, &sys.table, insert).await;
-            assert!(matches!(res, Ok(InsertMvcc::DuplicateKey)));
+            let err = res.unwrap_err();
+            assert_eq!(err.operation_error(), Some(OperationError::DuplicateKey));
             trx = stmt.fail().await.unwrap();
             trx.rollback().await.unwrap();
         }
@@ -225,7 +243,7 @@ fn test_mvcc_insert_dup_key() {
             let mut trx1 = session.try_begin_trx().unwrap().unwrap();
             let mut stmt1 = trx1.start_stmt();
             let res = stmt_insert_row(&mut stmt1, &sys.table, insert1).await;
-            assert!(matches!(res, Ok(InsertMvcc::Inserted(_))));
+            assert!(res.is_ok());
             trx1 = stmt1.succeed();
 
             // begin concurrent transaction and insert [2, "world"]
@@ -235,7 +253,8 @@ fn test_mvcc_insert_dup_key() {
             let mut stmt2 = trx2.start_stmt();
             let res = stmt_insert_row(&mut stmt2, &sys.table, insert2).await;
             // still dup key because circuit breaker on index search.
-            assert!(matches!(res, Ok(InsertMvcc::DuplicateKey)));
+            let err = res.unwrap_err();
+            assert_eq!(err.operation_error(), Some(OperationError::DuplicateKey));
             stmt2.fail().await.unwrap().rollback().await.unwrap();
             drop(session2);
 
@@ -505,15 +524,16 @@ fn test_lwc_select_surfaces_persisted_corruption() {
         let mut trx = session.try_begin_trx().unwrap().unwrap();
         let stmt = trx.start_stmt();
         let res = stmt_select_row_mvcc(&stmt, &sys.table, &key, &[0, 1]).await;
-        match res {
-            Err(Error::BlockCorrupted {
-                file_kind: FileKind::TableFile,
-                block_kind: BlockKind::LwcBlock,
-                block_id: page_id,
-                cause: BlockCorruptionCause::ChecksumMismatch,
-            }) => assert_eq!(page_id, block_id),
+        let err = match res {
+            Err(err) => err,
             other => panic!("expected persisted LWC corruption, got {other:?}"),
-        }
+        };
+        assert_table_data_integrity(
+            err,
+            "lwc-block",
+            block_id,
+            DataIntegrityError::ChecksumMismatch,
+        );
         trx = stmt.fail().await.unwrap();
         trx.rollback().await.unwrap();
 
@@ -557,15 +577,16 @@ fn test_lwc_select_surfaces_column_block_index_row_metadata_corruption() {
         let mut trx = session.try_begin_trx().unwrap().unwrap();
         let stmt = trx.start_stmt();
         let res = stmt_select_row_mvcc(&stmt, &sys.table, &key, &[0, 1]).await;
-        match res {
-            Err(Error::BlockCorrupted {
-                file_kind: FileKind::TableFile,
-                block_kind: BlockKind::ColumnBlockIndex,
-                block_id: page_id,
-                cause: BlockCorruptionCause::InvalidPayload,
-            }) => assert_eq!(page_id, entry.leaf_page_id),
+        let err = match res {
+            Err(err) => err,
             other => panic!("expected persisted column-block-index corruption, got {other:?}"),
-        }
+        };
+        assert_table_data_integrity(
+            err,
+            "column-block-index",
+            entry.leaf_page_id,
+            DataIntegrityError::InvalidPayload,
+        );
         trx = stmt.fail().await.unwrap();
         trx.rollback().await.unwrap();
 
@@ -609,15 +630,16 @@ fn test_lwc_select_surfaces_column_block_index_zero_block_id_corruption() {
         let mut trx = session.try_begin_trx().unwrap().unwrap();
         let stmt = trx.start_stmt();
         let res = stmt_select_row_mvcc(&stmt, &sys.table, &key, &[0, 1]).await;
-        match res {
-            Err(Error::BlockCorrupted {
-                file_kind: FileKind::TableFile,
-                block_kind: BlockKind::ColumnBlockIndex,
-                block_id: page_id,
-                cause: BlockCorruptionCause::InvalidPayload,
-            }) => assert_eq!(page_id, entry.leaf_page_id),
+        let err = match res {
+            Err(err) => err,
             other => panic!("expected persisted column-block-index corruption, got {other:?}"),
-        }
+        };
+        assert_table_data_integrity(
+            err,
+            "column-block-index",
+            entry.leaf_page_id,
+            DataIntegrityError::InvalidPayload,
+        );
         trx = stmt.fail().await.unwrap();
         trx.rollback().await.unwrap();
 
@@ -661,15 +683,16 @@ fn test_lwc_select_surfaces_row_shape_fingerprint_mismatch_corruption() {
         let mut trx = session.try_begin_trx().unwrap().unwrap();
         let stmt = trx.start_stmt();
         let res = stmt_select_row_mvcc(&stmt, &sys.table, &key, &[0, 1]).await;
-        match res {
-            Err(Error::BlockCorrupted {
-                file_kind: FileKind::TableFile,
-                block_kind: BlockKind::LwcBlock,
-                block_id: page_id,
-                cause: BlockCorruptionCause::InvalidPayload,
-            }) => assert_eq!(page_id, entry.block_id()),
+        let err = match res {
+            Err(err) => err,
             other => panic!("expected persisted LWC invalid-payload corruption, got {other:?}"),
-        }
+        };
+        assert_table_data_integrity(
+            err,
+            "lwc-block",
+            entry.block_id(),
+            DataIntegrityError::InvalidPayload,
+        );
         trx = stmt.fail().await.unwrap();
         trx.rollback().await.unwrap();
 
@@ -1022,7 +1045,8 @@ fn test_lwc_update_unique_conflicts_when_delete_committed_after_snapshot() {
             }],
         )
         .await;
-        assert!(matches!(res, Ok(UpdateMvcc::WriteConflict)));
+        let err = res.unwrap_err();
+        assert_eq!(err.operation_error(), Some(OperationError::WriteConflict));
         let writer = stmt.fail().await.unwrap();
         writer.rollback().await.unwrap();
 
@@ -1146,7 +1170,8 @@ fn test_lwc_update_unique_duplicate_rolls_back_cold_marker_and_hot_insert() {
             }],
         )
         .await;
-        assert!(matches!(res, Ok(UpdateMvcc::DuplicateKey)));
+        let err = res.unwrap_err();
+        assert_eq!(err.operation_error(), Some(OperationError::DuplicateKey));
         let trx = stmt.fail().await.unwrap();
         trx.rollback().await.unwrap();
 
@@ -1286,7 +1311,8 @@ fn test_lwc_update_unique_rejects_cold_owner_deleted_after_snapshot() {
             ],
         )
         .await;
-        assert!(matches!(res, Ok(UpdateMvcc::DuplicateKey)));
+        let err = res.unwrap_err();
+        assert_eq!(err.operation_error(), Some(OperationError::DuplicateKey));
         let writer = stmt.fail().await.unwrap();
         writer.rollback().await.unwrap();
 
@@ -1796,10 +1822,8 @@ fn test_secondary_mem_index_cleanup_requires_idle_session() {
             .cleanup_secondary_mem_indexes(&mut session, true)
             .await
             .unwrap_err();
-        assert!(matches!(
-            err,
-            Error::NotSupported("secondary MemIndex cleanup requires idle session")
-        ));
+        assert_eq!(err.operation_error(), Some(OperationError::NotSupported));
+        assert!(format!("{err:?}").contains("secondary MemIndex cleanup requires idle session"));
         assert!(session.in_trx());
 
         trx.rollback().await.unwrap();
@@ -2433,15 +2457,12 @@ fn test_secondary_mem_index_cleanup_propagates_cold_delete_overlay_proof_error()
             .cleanup_secondary_mem_indexes(&mut session, true)
             .await
             .unwrap_err();
-        match err {
-            Error::BlockCorrupted {
-                file_kind: FileKind::TableFile,
-                block_kind: BlockKind::LwcBlock,
-                block_id: err_block_id,
-                ..
-            } => assert_eq!(err_block_id, block_id),
-            other => panic!("expected LWC block corruption, got {other:?}"),
-        }
+        assert_table_data_integrity(
+            err,
+            "lwc-block",
+            block_id,
+            DataIntegrityError::InvalidPayload,
+        );
         assert_eq!(
             index
                 .lookup(
@@ -2912,7 +2933,10 @@ fn test_secondary_sidecar_failure_keeps_checkpoint_root_atomic() {
         set_test_force_secondary_sidecar_error(true);
         let _reset = ResetSidecarHook;
         let err = sys.table.checkpoint(&mut session).await.unwrap_err();
-        assert!(matches!(err, Error::InvalidState));
+        assert_eq!(
+            err.report().downcast_ref::<InternalError>().copied(),
+            Some(InternalError::InjectedTestFailure)
+        );
 
         let root_after = sys.table.file().active_root_unchecked();
         assert_eq!(
@@ -3598,7 +3622,10 @@ fn test_checkpoint_fails_when_eligible_delete_marker_has_no_column_index() {
         wait_gc_cutoff_after(&session, marker_ts).await;
 
         let err = sys.table.checkpoint(&mut session).await.unwrap_err();
-        assert!(matches!(err, Error::InvalidState));
+        assert_eq!(
+            err.report().downcast_ref::<DataIntegrityError>().copied(),
+            Some(DataIntegrityError::InvalidRootInvariant)
+        );
         let root_after = sys.table.file().active_root_unchecked();
         assert_eq!(
             root_after.deletion_cutoff_ts,
@@ -3650,7 +3677,10 @@ fn test_checkpoint_fails_when_eligible_delete_marker_cannot_be_located() {
         wait_gc_cutoff_after(&session, marker_ts).await;
 
         let err = sys.table.checkpoint(&mut session).await.unwrap_err();
-        assert!(matches!(err, Error::InvalidState));
+        assert_eq!(
+            err.report().downcast_ref::<DataIntegrityError>().copied(),
+            Some(DataIntegrityError::InvalidRootInvariant)
+        );
         assert_eq!(
             sys.table.file().active_root_unchecked().deletion_cutoff_ts,
             root_before.deletion_cutoff_ts
@@ -3734,7 +3764,10 @@ fn test_recover_cold_delete_rejects_already_deleted_with_different_cts() {
             )
             .await
             .unwrap_err();
-        assert!(matches!(err, Error::InvalidState));
+        assert_eq!(
+            err.report().downcast_ref::<DataIntegrityError>().copied(),
+            Some(DataIntegrityError::InvalidRootInvariant)
+        );
 
         drop(session);
         sys.clean_all();
@@ -3871,15 +3904,12 @@ fn test_checkpoint_fails_on_invalid_v2_delete_metadata() {
             .invalidate_block_id(sys.table.file().sparse_file().file_id(), entry.leaf_page_id);
 
         let err = sys.table.checkpoint(&mut session).await.unwrap_err();
-        assert!(matches!(
+        assert_table_data_integrity(
             err,
-            Error::BlockCorrupted {
-                file_kind: FileKind::TableFile,
-                block_kind: BlockKind::ColumnBlockIndex,
-                block_id: page_id,
-                cause: BlockCorruptionCause::InvalidPayload,
-            } if page_id == entry.leaf_page_id
-        ));
+            "column-block-index",
+            entry.leaf_page_id,
+            DataIntegrityError::InvalidPayload,
+        );
 
         drop(session);
         sys.clean_all();
@@ -3954,15 +3984,12 @@ fn test_checkpoint_fails_on_short_v2_delete_section_header() {
             .invalidate_block_id(sys.table.file().sparse_file().file_id(), entry.leaf_page_id);
 
         let err = sys.table.checkpoint(&mut session).await.unwrap_err();
-        assert!(matches!(
+        assert_table_data_integrity(
             err,
-            Error::BlockCorrupted {
-                file_kind: FileKind::TableFile,
-                block_kind: BlockKind::ColumnBlockIndex,
-                block_id: page_id,
-                cause: BlockCorruptionCause::InvalidPayload,
-            } if page_id == entry.leaf_page_id
-        ));
+            "column-block-index",
+            entry.leaf_page_id,
+            DataIntegrityError::InvalidPayload,
+        );
 
         drop(session);
         sys.clean_all();
@@ -4444,7 +4471,7 @@ fn test_string_index_updates() {
                 let insert = vec![Val::from(&s[..0])];
                 let mut stmt = session.try_begin_trx().unwrap().unwrap().start_stmt();
                 let res = stmt_insert_row(&mut stmt, &table, insert).await;
-                assert!(matches!(res, Ok(InsertMvcc::Inserted(_))));
+                assert!(res.is_ok());
                 stmt.succeed().commit().await.unwrap();
             }
             // perform updates.
@@ -4483,7 +4510,7 @@ fn test_mvcc_out_of_place_update() {
                 let insert = vec![Val::from(&s[..BASE + i])];
                 let mut stmt = session.try_begin_trx().unwrap().unwrap().start_stmt();
                 let res = stmt_insert_row(&mut stmt, &table, insert).await;
-                assert!(matches!(res, Ok(InsertMvcc::Inserted(_))));
+                assert!(res.is_ok());
                 stmt.succeed().commit().await.unwrap();
             }
             // perform updates to trigger out-of-place update.
@@ -4902,10 +4929,8 @@ fn test_checkpoint_requires_idle_session_before_delayed_outcome() {
         ));
 
         let err = sys.table.checkpoint(&mut session).await.unwrap_err();
-        assert!(matches!(
-            err,
-            Error::NotSupported("checkpoint requires idle session")
-        ));
+        assert_eq!(err.operation_error(), Some(OperationError::NotSupported));
+        assert!(format!("{err:?}").contains("checkpoint requires idle session"));
         assert!(session.in_trx());
 
         checkpoint_trx.rollback().await.unwrap();
@@ -5031,7 +5056,7 @@ fn test_checkpoint_snapshot_consistency() {
             let mut stmt = write_trx.start_stmt();
             let insert = vec![Val::from(10_000i32), Val::from("new")];
             let res = stmt_insert_row(&mut stmt, &sys.table, insert).await;
-            assert!(matches!(res, Ok(InsertMvcc::Inserted(_))));
+            assert!(res.is_ok());
             write_trx = stmt.succeed();
         }
 
@@ -5512,6 +5537,7 @@ fn test_mvcc_insert_surfaces_cached_insert_page_reload_error() {
             libc::EIO,
         ));
         let _hook = install_storage_backend_test_hook(read_hook.clone());
+        let expected_error_kind = io::Error::from_raw_os_error(libc::EIO).kind();
 
         let trx = session.try_begin_trx().unwrap().unwrap();
         let mut stmt = trx.start_stmt();
@@ -5524,7 +5550,9 @@ fn test_mvcc_insert_surfaces_cached_insert_page_reload_error() {
         let trx = stmt.fail().await.unwrap();
         trx.rollback().await.unwrap();
         assert!(
-            matches!(res, Err(Error::IOError { .. })),
+            res.as_ref()
+                .is_err_and(|err| err.completion_error()
+                    == Some(CompletionErrorKind::Io(expected_error_kind))),
             "expected insert-page reload failure, got {res:?}"
         );
         assert!(
@@ -5554,7 +5582,7 @@ fn test_mvcc_rollback_poisons_runtime_on_row_page_reload_error() {
         )
         .await
         {
-            Ok(InsertMvcc::Inserted(row_id)) => row_id,
+            Ok(row_id) => row_id,
             res => panic!("res={res:?}"),
         };
         trx = stmt.succeed();
@@ -5591,24 +5619,27 @@ fn test_mvcc_rollback_poisons_runtime_on_row_page_reload_error() {
         ));
         let _hook = install_storage_backend_test_hook(read_hook);
 
-        assert!(matches!(
-            trx.rollback().await,
-            Err(Error::StorageEnginePoisoned(
-                StoragePoisonSource::RollbackAccess
-            ))
-        ));
-        assert!(matches!(
-            sys.engine.trx_sys.storage_poison_error(),
-            Some(Error::StorageEnginePoisoned(
-                StoragePoisonSource::RollbackAccess
-            ))
-        ));
-        assert!(matches!(
-            sys.engine.trx_sys.ensure_runtime_healthy(),
-            Err(Error::StorageEnginePoisoned(
-                StoragePoisonSource::RollbackAccess
-            ))
-        ));
+        assert!(
+            trx.rollback().await.as_ref().is_err_and(|err| err
+                .report()
+                .downcast_ref::<FatalError>()
+                .copied()
+                == Some(FatalError::RollbackAccess))
+        );
+        assert!(
+            sys.engine
+                .trx_sys
+                .storage_poison_error()
+                .as_ref()
+                .is_some_and(|err| *err.current_context() == FatalError::RollbackAccess)
+        );
+        assert!(
+            sys.engine
+                .trx_sys
+                .ensure_runtime_healthy()
+                .as_ref()
+                .is_err_and(|err| *err.current_context() == FatalError::RollbackAccess)
+        );
 
         drop(writer);
         drop(session);
@@ -5688,7 +5719,7 @@ fn test_build_in_memory_secondary_indexes_reclaims_staged_indexes_on_error() {
             Ok(_) => panic!("second secondary-index construction should fail in one-page pool"),
             Err(err) => err,
         };
-        assert!(matches!(err, Error::BufferPoolFull));
+        assert_eq!(err.resource_error(), Some(ResourceError::BufferPoolFull));
         assert_eq!(pool.allocated(), 0);
     });
 }
@@ -5760,7 +5791,7 @@ fn test_user_secondary_indexes_evict_and_continue_serving_lookups() {
                     vec![Val::from(row_id), Val::from(&key[..])],
                 )
                 .await;
-                assert!(matches!(res, Ok(InsertMvcc::Inserted(_))), "res={res:?}");
+                assert!(res.is_ok(), "res={res:?}");
                 trx = stmt.succeed();
                 inserted.push((row_id, key));
             }
@@ -5984,7 +6015,7 @@ impl TestSys {
     async fn trx_insert(&self, trx: ActiveTrx, insert: Vec<Val>) -> ActiveTrx {
         let mut stmt = trx.start_stmt();
         let res = stmt_insert_row(&mut stmt, &self.table, insert).await;
-        if !matches!(res, Ok(InsertMvcc::Inserted(_))) {
+        if res.is_err() {
             panic!("res={:?}", res);
         }
         // assert!(res.is_ok());
@@ -6086,7 +6117,7 @@ async fn insert_one_row(table: &Table, session: &mut Session, values: Vec<Val>) 
     let mut trx = session.try_begin_trx().unwrap().unwrap();
     let mut stmt = trx.start_stmt();
     let insert = stmt_insert_row(&mut stmt, table, values).await;
-    let Ok(InsertMvcc::Inserted(row_id)) = insert else {
+    let Ok(row_id) = insert else {
         panic!("insert should succeed: {insert:?}");
     };
     trx = stmt.succeed();
@@ -6108,9 +6139,9 @@ fn name_key(value: &str) -> SelectKey {
     }
 }
 
-fn unwrap_insert_result(res: Result<InsertMvcc>) -> RowID {
+fn unwrap_insert_result(res: Result<RowID>) -> RowID {
     match res {
-        Ok(InsertMvcc::Inserted(row_id)) => row_id,
+        Ok(row_id) => row_id,
         res => panic!("unexpected insert result: {res:?}"),
     }
 }
@@ -6402,7 +6433,7 @@ async fn insert_rows_direct(
         let insert = vec![Val::from(start + i), Val::from(name)];
         let mut stmt = trx.start_stmt();
         let res = stmt_insert_row(&mut stmt, table, insert).await;
-        assert!(matches!(res, Ok(InsertMvcc::Inserted(_))));
+        assert!(res.is_ok());
         trx = stmt.succeed();
     }
     trx.commit().await.unwrap();
@@ -6450,7 +6481,7 @@ fn test_secondary_index_common() {
                     .accessor()
                     .insert_mvcc(ctx, effects, vec![Val::from(i), Val::from(i)])
                     .await;
-                assert!(matches!(res, Ok(InsertMvcc::Inserted(_))));
+                assert!(res.is_ok());
             }
             stmt.succeed().commit().await.unwrap();
 
@@ -6550,7 +6581,7 @@ fn test_secondary_index_rollback() {
                     .accessor()
                     .insert_mvcc(ctx, effects, vec![Val::from(i), Val::from(i)])
                     .await;
-                assert!(matches!(res, Ok(InsertMvcc::Inserted(_))));
+                assert!(res.is_ok());
             }
             stmt.succeed().commit().await.unwrap();
 
@@ -6561,7 +6592,7 @@ fn test_secondary_index_rollback() {
                 .accessor()
                 .insert_mvcc(ctx, effects, vec![Val::from(5i32), Val::from(5i32)])
                 .await;
-            assert!(matches!(res, Ok(InsertMvcc::Inserted(_))));
+            assert!(res.is_ok());
             stmt.succeed().rollback().await.unwrap();
 
             let trx = session.try_begin_trx().unwrap().unwrap();
@@ -6640,7 +6671,7 @@ fn test_secondary_index_rollback() {
                 .accessor()
                 .insert_mvcc(ctx, effects, vec![Val::from(3), Val::from(3)])
                 .await;
-            assert!(matches!(res, Ok(InsertMvcc::Inserted(_))));
+            assert!(res.is_ok());
             trx = stmt.succeed();
             trx.rollback().await.unwrap();
 
