@@ -42,3 +42,11 @@ When a backlog item is moved to `docs/backlogs/closed/`, append:
 - Reference: <task/issue/pr reference>
 - Closed At: <YYYY-MM-DD>
 ```
+
+## Close Reason
+
+- Type: implemented
+- Detail: Implemented via task 000135 and PR #596.
+- Closed By: backlog close
+- Reference: docs/tasks/000135-borrow-rowpage-null-bitmaps-vector-scans.md; GitHub PR #596
+- Closed At: 2026-04-27

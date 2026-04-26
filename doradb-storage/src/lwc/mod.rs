@@ -2227,6 +2227,46 @@ mod tests {
     }
 
     #[test]
+    fn test_lwc_builder_nullable_integer_stats_skip_nulls_and_deleted_rows() {
+        let metadata = TableMetadata::new(
+            vec![ColumnSpec::new(
+                "nullable_i16",
+                ValKind::I16,
+                ColumnAttributes::NULLABLE,
+            )],
+            vec![],
+        );
+        let mut page = RowPage::new_test_page();
+        page.init(0, 8, &metadata);
+
+        for (row_id, value) in [
+            Val::Null,
+            Val::I16(5),
+            Val::I16(-10),
+            Val::Null,
+            Val::I16(1000),
+            Val::I16(8),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            assert!(matches!(
+                page.insert(&metadata, &[value]),
+                InsertRow::Ok(inserted) if inserted == row_id as u64
+            ));
+        }
+        assert!(matches!(page.delete(4), Delete::Ok));
+
+        let mut builder = LwcBuilder::new(&metadata);
+        assert!(builder.append_row_page(&page).unwrap());
+
+        let stats = builder.stats[0].snapshot();
+        assert!(stats.initialized);
+        assert_eq!(stats.min_i64, -10);
+        assert_eq!(stats.max_i64, 8);
+    }
+
+    #[test]
     fn test_lwc_builder_rollback() {
         let metadata = TableMetadata::new(
             vec![
