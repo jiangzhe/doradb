@@ -25,6 +25,7 @@ use crate::index::btree::{BTreeNil, BTreeU64, BTreeValue, BTreeValuePackable};
 use crate::index::btree::{BTreeNode, LookupChild};
 use crate::index::util::Maskable;
 use crate::io::DirectBuf;
+use crate::layout;
 use crate::quiescent::QuiescentGuard;
 use crate::row::RowID;
 use crate::value::{Val, ValKind, ValType};
@@ -565,7 +566,7 @@ fn invalid_node_payload(file_kind: FileKind, block_id: BlockID) -> Error {
 /// View a validated block as an immutable B-tree node image.
 #[inline]
 fn btree_node_from_block(block: &[u8]) -> Option<&BTreeNode> {
-    BTreeNode::try_from_block_bytes(block)
+    layout::try_ref_from_bytes::<BTreeNode>(block).ok()
 }
 
 /// Safely view a zeroed direct buffer as a mutable B-tree node image.
@@ -574,8 +575,8 @@ fn btree_node_from_block(block: &[u8]) -> Option<&BTreeNode> {
 /// can be computed over exactly the bytes that will be written.
 #[inline]
 fn btree_node_from_block_mut(block: &mut [u8]) -> Result<&mut BTreeNode> {
-    BTreeNode::try_from_block_bytes_mut(block)
-        .ok_or_else(|| Report::new(InternalError::MutableBlockViewMismatch).into())
+    layout::try_mut_from_bytes::<BTreeNode>(block)
+        .map_err(|_| Report::new(InternalError::MutableBlockViewMismatch).into())
 }
 
 #[inline]

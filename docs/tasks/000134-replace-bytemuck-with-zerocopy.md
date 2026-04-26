@@ -53,6 +53,7 @@ Import derives from `zerocopy_derive`, which is the pattern recommended by `zero
 Related follow-up intentionally deferred out of this task:
 
 - `docs/backlogs/000096-audit-buffer-page-reinterpretation-casts.md` covers the buffer pool's generic raw page reinterpretation contract. This task should not redesign `BufferPage` guard-level `Page` to `T` casts.
+- `docs/backlogs/000097-borrow-rowpage-null-bitmaps-vector-scans.md` covers the row-page vector scan follow-up for borrowing little-endian null bitmap words directly from the page buffer instead of materializing `Vec<u64>` per column.
 
 ## Goals
 
@@ -69,6 +70,7 @@ Related follow-up intentionally deferred out of this task:
 ## Non-Goals
 
 - Do not redesign the buffer pool's generic `BufferPage` raw pointer reinterpretation path; that is deferred to backlog `000096`.
+- Do not optimize row-page vector scan null bitmap reads to avoid per-column bitmap materialization; that is deferred to backlog `000097`.
 - Do not introduce an incompatible storage migration framework or file-format versioning program.
 - Do not refactor unrelated serialization code that already uses explicit `to_le_bytes`/`from_le_bytes`.
 - Do not change B-tree key byte ordering semantics where big-endian byte order is intentionally used for memcmp-sortable keys.
@@ -174,21 +176,21 @@ Implemented in branch `zerocopy-casts` and PR #594 for issue #593.
   previous bytemuck/native representation leaked host endianness, including
   row-page fixed values and `PageVar`, LWC flat primitive serialization, and
   column block-index node/header entries.
-- Preserved B-tree node sizing and footer layout while keeping
-  `BlockIntegrityTrailer` crate-private. `BTreeNode` remains public with
-  private fields; disk-tree block ref-casts use a private zerocopy-derived
-  `BTreeNodeLayout` mirror with documented localized unsafe casts and size /
-  alignment assertions.
+- Preserved B-tree node sizing and footer layout. `BlockIntegrityTrailer` is
+  public so public `BTreeNode` can derive zerocopy traits directly while still
+  keeping its fields private; disk-tree block ref-casts use the shared layout
+  helper against `BTreeNode`.
 - Added or updated exact-byte tests for row-page little-endian values, LWC flat
   primitive payloads, column block-index persisted layouts, and B-tree/footer
   layout preservation.
 - Refreshed `docs/unsafe-usage-baseline.md`. The final scoped inventory is
-  total unsafe 146 with 126 `// SAFETY:` comments; the LWC module no longer has
-  unsafe sites, and the B-tree node mirror adds documented index-module unsafe
-  casts.
-- Created follow-up backlog
+  total unsafe 143 with 123 `// SAFETY:` comments, and the LWC module no
+  longer has unsafe sites.
+- Created follow-up backlogs
   `docs/backlogs/000096-audit-buffer-page-reinterpretation-casts.md` for the
-  intentionally deferred buffer-pool raw `Page` to `T` reinterpretation audit.
+  intentionally deferred buffer-pool raw `Page` to `T` reinterpretation audit,
+  and `docs/backlogs/000097-borrow-rowpage-null-bitmaps-vector-scans.md` for
+  the out-of-scope row-page vector scan borrowed-bitmap optimization.
 
 Validation and review completed:
 
@@ -234,3 +236,4 @@ Validation and review completed:
 ## Open Questions
 
 - Raw buffer-pool `Page` to `T` reinterpretation is intentionally deferred to `docs/backlogs/000096-audit-buffer-page-reinterpretation-casts.md`.
+- Borrowed row-page null bitmap views for the vector scan critical path are intentionally deferred to `docs/backlogs/000097-borrow-rowpage-null-bitmaps-vector-scans.md`.
