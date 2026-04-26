@@ -1,7 +1,7 @@
 ---
 id: 000133
 title: Adopt error-stack for storage errors
-status: proposal
+status: implemented
 created: 2026-04-23
 github_issue: 591
 ---
@@ -129,8 +129,36 @@ touches unsafe code while updating IO or buffer error propagation, follow
 
 ## Implementation Notes
 
-Keep this section blank in design phase. Fill this section during `task resolve`
-after implementation, tests, review, and verification are completed.
+- Implemented public `Error(Report<ErrorKind>)` backed by `error-stack`, with
+  crate-level `Result<T>` preserved and boundary categories for config,
+  operation, resource, IO, data integrity, lifecycle, internal, and fatal
+  failures.
+- Replaced the flat rich error enum with fieldless domain errors and report
+  attachments. Config, data-integrity, lifecycle, resource, operation, fatal,
+  internal, IO, and completion transport paths now carry precise domain context
+  through `Report<E>` and convert to public `Error` at boundaries.
+- Moved config internals to `ConfigResult<Report<ConfigError>>`, used imported
+  `ensure!` for predicate failures, and removed the dedicated `InvalidInput`
+  boundary from the final model. Caller-facing config validation now maps to
+  `Config`; low-level storage contract violations map to `Internal`.
+- Refactored IO and completion fanout so `Completion<T>` stores
+  `CompletionResult<T>` directly. Removed `CompletionValue` and
+  `Error::duplicate`; propagated completion errors rebuild only the top-level
+  `CompletionErrorKind` and attach `"propagate from other threads"`.
+- Updated affected call sites and assertions across config, buffer, file,
+  index, table, transaction, engine, and component code. No transaction
+  visibility, recovery protocol, file-format, or unsafe-code behavior was
+  intentionally changed.
+- Checklist follow-ups were handled: completion behavior was documented,
+  `InvalidInput` task-doc scope was synced to the implemented model, and later
+  review findings around catalog duplicate publication and parent-component
+  path normalization were verified as no-fix policy decisions.
+- Verification completed with `cargo fmt -p doradb-storage -- --check`,
+  `cargo check -p doradb-storage --tests`,
+  `cargo clippy -p doradb-storage --all-targets -- -D warnings`,
+  `cargo nextest run -p doradb-storage` (625 passed),
+  `cargo nextest run -p doradb-storage --no-default-features --features libaio`
+  (623 passed), and `git diff --check`.
 
 ## Impacts
 
@@ -196,7 +224,4 @@ after implementation, tests, review, and verification are completed.
 
 ## Open Questions
 
-- The dedicated `InvalidInput` boundary was removed from the implemented
-  design. Future caller-facing non-config validation failures should be
-  assigned to an existing domain-specific category, or proposed as a separate
-  boundary only if a concrete call path cannot fit the current model.
+None.
