@@ -15,8 +15,6 @@ use std::cmp;
 use std::cmp::Ordering;
 use std::mem;
 use std::ops::{Deref, DerefMut, Range};
-#[cfg(test)]
-use zerocopy::FromZeros as _;
 use zerocopy_derive::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 /// Bytes reserved at the end of every B-tree page.
@@ -2106,6 +2104,7 @@ mod tests {
     use crate::quiescent::QuiescentBox;
     use rand_distr::{Distribution, Uniform};
     use std::collections::BTreeMap;
+    use zerocopy::FromZeros as _;
 
     fn test_buf_pool() -> QuiescentBox<FixedBufferPool> {
         QuiescentBox::new(

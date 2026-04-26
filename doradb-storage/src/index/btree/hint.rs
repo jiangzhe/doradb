@@ -1,6 +1,4 @@
 use crate::index::btree::KeyHeadInt;
-#[cfg(test)]
-use zerocopy::FromZeros as _;
 use zerocopy_derive::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 pub const BTREE_HINTS_LEN: usize = 8;
@@ -99,6 +97,7 @@ fn search_hints_scalar(hints: &[u32; 8], key_head: u32) -> (usize, usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use zerocopy::FromZeros as _;
 
     #[test]
     fn test_btree_hints_store_little_endian_heads() {

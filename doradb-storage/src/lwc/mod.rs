@@ -523,19 +523,6 @@ impl LwcPrimitive<'_> {
     }
 }
 
-impl<const N: usize> Ser<'_> for Cow<'_, [[u8; N]]> {
-    #[inline]
-    fn ser_len(&self) -> usize {
-        mem::size_of::<u64>() + self.len() * N
-    }
-
-    #[inline]
-    fn ser<S: Serde + ?Sized>(&self, out: &mut S, start_idx: usize) -> usize {
-        let idx = out.ser_u64(start_idx, self.len() as u64);
-        out.ser_byte_slice(idx, self.as_ref().as_bytes())
-    }
-}
-
 #[inline]
 fn flat_bytes_borrowed<'a, T, const N: usize>(input: &'a [T]) -> Cow<'a, [[u8; N]]>
 where
