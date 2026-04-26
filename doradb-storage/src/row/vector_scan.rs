@@ -9,7 +9,7 @@ use crate::bitmap::{Bitmap, BitmapRangeFilter};
 use crate::buffer::frame::FrameContext;
 use crate::catalog::TableMetadata;
 use crate::error::{Error, InternalError, Result};
-use crate::row::RowPage;
+use crate::row::{RowPage, RowPageNullBitmap};
 use crate::trx::undo::RowUndoKind;
 use crate::trx::{TrxID, trx_is_committed};
 use crate::value::{PageVar, ValBuffer, ValType};
@@ -116,6 +116,7 @@ impl ScanBuffer {
             // First, extend null bitmap.
             match (buf.null_bitmap.as_mut(), null_bitmap) {
                 (Some(res), Some(delta)) => {
+                    let delta = delta.as_ref();
                     let new_units = new_len.div_ceil(64);
                     if new_units > res.len() {
                         res.resize(new_units, 0);
@@ -397,7 +398,7 @@ impl<'p, 'm> PageVectorView<'p, 'm> {
 
     /// Returns null bitmap and value data of given column.
     #[inline]
-    pub fn col(&self, col_idx: usize) -> (Option<Vec<u64>>, ValArrayRef<'p>) {
+    pub fn col(&self, col_idx: usize) -> (Option<RowPageNullBitmap<'p>>, ValArrayRef<'p>) {
         self.page.vals(self.metadata, col_idx, self.row_count)
     }
 }
@@ -433,6 +434,7 @@ mod tests {
     use crate::trx::{MIN_ACTIVE_TRX_ID, MIN_SNAPSHOT_TS};
     use crate::value::{Val, ValKind};
     use semistr::SemiStr;
+    use std::borrow::Cow;
     use std::sync::Arc;
 
     #[test]
@@ -542,6 +544,77 @@ mod tests {
         assert!(scanner.len() == 98);
         scanner.clear();
         assert!(scanner.is_empty());
+    }
+
+    #[test]
+    fn test_page_vector_view_col_borrows_nullable_null_bitmap() {
+        let metadata = TableMetadata::new(
+            vec![
+                ColumnSpec::new("nullable_u64", ValKind::U64, ColumnAttributes::NULLABLE),
+                ColumnSpec::new("plain_u8", ValKind::U8, ColumnAttributes::empty()),
+            ],
+            vec![],
+        );
+        let mut page = create_row_page();
+        page.init(0, 8, &metadata);
+        assert!(matches!(
+            page.insert(&metadata, &[Val::Null, Val::U8(1)]),
+            InsertRow::Ok(0)
+        ));
+        assert!(matches!(
+            page.insert(&metadata, &[Val::U64(42), Val::U8(2)]),
+            InsertRow::Ok(1)
+        ));
+
+        let view = page.vector_view(&metadata);
+        let (null_bitmap, _) = view.col(0);
+        let null_bitmap = null_bitmap.expect("nullable column has null bitmap");
+        let bits = null_bitmap.as_ref();
+        assert!(bits.bitmap_get(0));
+        assert!(!bits.bitmap_get(1));
+
+        #[cfg(target_endian = "little")]
+        assert!(matches!(null_bitmap, Cow::Borrowed(_)));
+        #[cfg(not(target_endian = "little"))]
+        assert!(matches!(null_bitmap, Cow::Owned(_)));
+
+        let (null_bitmap, _) = view.col(1);
+        assert!(null_bitmap.is_none());
+    }
+
+    #[test]
+    fn test_nullable_vector_scan_null_bitmap_compacts_deleted_rows() {
+        let metadata = TableMetadata::new(
+            vec![ColumnSpec::new(
+                "nullable_u8",
+                ValKind::U8,
+                ColumnAttributes::NULLABLE,
+            )],
+            vec![],
+        );
+        let mut page = create_row_page();
+        page.init(0, 8, &metadata);
+        for (row_id, value) in [Val::U8(10), Val::Null, Val::U8(12), Val::Null, Val::U8(14)]
+            .into_iter()
+            .enumerate()
+        {
+            assert!(matches!(
+                page.insert(&metadata, &[value]),
+                InsertRow::Ok(inserted) if inserted == row_id as u64
+            ));
+        }
+        assert!(matches!(page.delete(2), Delete::Ok));
+
+        let mut scanner = ScanBuffer::new(&metadata, &[0]);
+        scanner.scan(page.vector_view(&metadata)).unwrap();
+
+        assert_eq!(scanner.len(), 4);
+        let col = scanner.column(0).unwrap();
+        let null_bitmap = col.null_bitmap.expect("nullable column result bitmap");
+        assert!(!null_bitmap.bitmap_get(0));
+        assert!(null_bitmap.bitmap_get(1));
+        assert!(null_bitmap.bitmap_get(2));
+        assert!(!null_bitmap.bitmap_get(3));
     }
 
     #[test]

@@ -10,6 +10,7 @@ use crate::catalog::TableMetadata;
 use crate::layout;
 use crate::value::*;
 use ordered_float::OrderedFloat;
+use std::borrow::Cow;
 use std::fmt;
 use std::mem;
 use std::sync::atomic::{AtomicU8, AtomicU16, AtomicU32, Ordering};
@@ -19,6 +20,8 @@ use zerocopy::byteorder::little_endian::{
 };
 
 pub type RowID = u64;
+/// Borrowed or owned row-page null bitmap words.
+pub type RowPageNullBitmap<'a> = Cow<'a, [u64]>;
 pub const INVALID_ROW_ID: RowID = !0;
 
 const _: () = assert!(
@@ -432,7 +435,7 @@ impl RowPage {
         metadata: &TableMetadata,
         col_idx: usize,
         row_count: usize,
-    ) -> (Option<Vec<u64>>, ValArrayRef<'_>) {
+    ) -> (Option<RowPageNullBitmap<'_>>, ValArrayRef<'_>) {
         debug_assert!(row_count <= self.header.row_count());
         let null_bitmap = self.null_bitmap(metadata, col_idx, row_count);
         let offset = self.col_offset(col_idx) as usize;
@@ -851,13 +854,13 @@ impl RowPage {
         metadata: &TableMetadata,
         col_idx: usize,
         row_count: usize,
-    ) -> Option<Vec<u64>> {
+    ) -> Option<RowPageNullBitmap<'_>> {
         match self.header.null_bitmap_range(metadata, col_idx) {
             None => None,
             Some((start_idx, _)) => {
                 let bitmap_len = bitmap_len(row_count);
                 let bm = &self.data()[start_idx..start_idx + bitmap_len];
-                Some(le_u64_words(bm))
+                Some(null_bitmap_words(bm))
             }
         }
     }
@@ -1528,6 +1531,19 @@ fn le_u64_words(bytes: &[u8]) -> Vec<u64> {
         .chunks_exact(mem::size_of::<u64>())
         .map(|chunk| u64::from_le_bytes(chunk.try_into().unwrap()))
         .collect()
+}
+
+#[cfg(target_endian = "little")]
+#[inline]
+fn null_bitmap_words(bytes: &[u8]) -> RowPageNullBitmap<'_> {
+    debug_assert!(bytes.len().is_multiple_of(mem::size_of::<u64>()));
+    Cow::Borrowed(layout::slice_from_bytes::<u64>(bytes))
+}
+
+#[cfg(not(target_endian = "little"))]
+#[inline]
+fn null_bitmap_words(bytes: &[u8]) -> RowPageNullBitmap<'_> {
+    Cow::Owned(le_u64_words(bytes))
 }
 
 /// delete bitmap length, align to 8 bytes.
