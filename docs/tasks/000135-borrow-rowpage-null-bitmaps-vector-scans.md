@@ -1,7 +1,7 @@
 ---
 id: 000135
 title: Borrow RowPage null bitmaps in vector scans
-status: proposal
+status: implemented
 created: 2026-04-26
 github_issue: 595
 ---
@@ -25,7 +25,7 @@ Issue Labels:
 - codex
 
 Source Backlogs:
-- docs/backlogs/000097-borrow-rowpage-null-bitmaps-vector-scans.md
+- docs/backlogs/closed/000097-borrow-rowpage-null-bitmaps-vector-scans.md
 
 This task was deferred from `docs/tasks/000134-replace-bytemuck-with-zerocopy.md`
 after the bytemuck-to-zerocopy replacement made row-page fixed values and
@@ -154,6 +154,37 @@ resolution.
 
 ## Implementation Notes
 
+Implemented in branch `row-null-bitmap` and PR #596 for issue #595.
+
+- Changed `RowPage::null_bitmap`, `RowPage::vals`, and
+  `PageVectorView::col` to return `Option<RowPageNullBitmap<'_>>`, where
+  `RowPageNullBitmap<'a>` is a `Cow<'a, [u64]>`.
+- Added a conditional-endian row-page null bitmap helper. Little-endian targets
+  borrow page-resident null bitmap bytes as native `&[u64]` through
+  `layout::slice_from_bytes`; non-little-endian targets keep the existing
+  `le_u64_words` decode into an owned `Vec<u64>`.
+- Updated `ScanBuffer::scan` to read nullable source bitmaps through the
+  borrowed/owned `Cow` while preserving owned destination result bitmaps for
+  compacted scan output.
+- Kept `ValArrayRef` unchanged and left `PageVectorView` delete bitmap behavior
+  owned and mutable for MVCC transition visibility.
+- LWC stats scanning required no production logic change beyond the API type
+  compatibility because it already converted nullable column bitmaps with
+  `as_deref()`.
+- Added focused tests for nullable column `Cow` behavior, non-nullable no-bitmap
+  behavior, deleted-row null bitmap compaction, and nullable integer LWC stats
+  skipping null/deleted rows.
+- No new unsafe code was added.
+
+Validation and review completed:
+
+- `cargo fmt --check`
+- `cargo clippy -p doradb-storage --all-targets -- -D warnings`
+- `cargo nextest run -p doradb-storage` (635 passed)
+- `tools/coverage_focus.rs --path doradb-storage/src/row` (90.81%)
+- `tools/coverage_focus.rs --path doradb-storage/src/lwc/mod.rs` (91.47%)
+- `git diff --check`
+- `$task checklist 000135` completed with no required fixes before resolve.
 
 ## Impacts
 
