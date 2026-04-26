@@ -52,20 +52,34 @@ use crate::io::Completion;
 use crate::latch::LatchFallbackMode;
 use crate::quiescent::QuiescentBox;
 use crate::serde::{Deser, Ser, Serde};
-use bytemuck::{Pod, Zeroable};
 use std::fmt;
 use std::future::Future;
 use std::mem;
 use std::ops::{Add, AddAssign, Sub, SubAssign};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use zerocopy_derive::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 /// Runtime buffer-managed page identity.
 ///
 /// This id is reserved for mutable or cached pages owned by the buffer layer.
 /// Persisted fixed-size file units use [`BlockID`] instead.
 #[repr(transparent)]
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Zeroable, Pod)]
+#[derive(
+    Debug,
+    Default,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    FromBytes,
+    IntoBytes,
+    KnownLayout,
+    Immutable,
+)]
 pub struct PageID(u64);
 
 impl PageID {

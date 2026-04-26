@@ -11,14 +11,16 @@ use crate::index::column_deletion_blob::{
     ColumnDeletionBlobReader, ColumnDeletionBlobWriter,
 };
 use crate::io::DirectBuf;
+use crate::layout;
 use crate::quiescent::QuiescentGuard;
 use crate::row::RowID;
-use bytemuck::{Pod, Zeroable, bytes_of, cast_slice, cast_slice_mut, try_cast_slice};
 use error_stack::{Report, ResultExt};
 use std::future::Future;
 use std::mem;
 use std::pin::Pin;
 use std::sync::Arc;
+use zerocopy::byteorder::little_endian::{U32 as LeU32, U64 as LeU64};
+use zerocopy_derive::{FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned};
 
 /// Physical size of one persisted column block-index page.
 pub const COLUMN_BLOCK_PAGE_SIZE: usize = COW_FILE_PAGE_SIZE;
@@ -83,14 +85,18 @@ fn invalid_payload(message: impl Into<String>) -> Error {
 }
 
 #[repr(C)]
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Pod, Zeroable)]
+#[derive(
+    Clone, Debug, Default, Eq, PartialEq, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned,
+)]
 struct ColumnBlockLeafHeaderExt {
     search_type: u8,
     reserved: [u8; 7],
 }
 
 #[repr(C)]
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Pod, Zeroable)]
+#[derive(
+    Clone, Debug, Default, Eq, PartialEq, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned,
+)]
 struct ColumnBlockLeafEntryHeader {
     block_id: [u8; 8],
     row_shape_fingerprint: [u8; 16],
@@ -244,7 +250,9 @@ impl ColumnBlockLeafEntryHeader {
 }
 
 #[repr(C)]
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Pod, Zeroable)]
+#[derive(
+    Clone, Debug, Default, Eq, PartialEq, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned,
+)]
 struct DeleteSectionHeader {
     kind: u8,
     version: u8,
@@ -280,26 +288,81 @@ impl DeleteSectionHeader {
 
 #[repr(C)]
 /// Header stored at the beginning of each on-disk column block-index node.
-#[derive(Clone, Copy, Debug, Default, Pod, Zeroable)]
+#[derive(Clone, Debug, Default, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned)]
 pub struct ColumnBlockNodeHeader {
     /// Tree height of this node. `0` denotes a leaf.
-    pub height: u32,
+    height: LeU32,
     /// Number of encoded entries stored in the node payload.
-    pub count: u32,
+    count: LeU32,
     /// Inclusive lower row-id bound covered by this node.
-    pub start_row_id: RowID,
+    start_row_id: LeU64,
     /// Creation timestamp associated with this copy-on-write node version.
-    pub create_ts: u64,
+    create_ts: LeU64,
 }
 
 #[repr(C)]
 /// Branch entry mapping a child lower bound to a child page id.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Pod, Zeroable)]
+#[derive(
+    Clone, Copy, Debug, Eq, PartialEq, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned,
+)]
 pub struct ColumnBlockBranchEntry {
     /// Inclusive lower row-id bound routed to the child subtree.
-    pub start_row_id: RowID,
+    start_row_id: LeU64,
     /// Page id of the child node.
-    pub page_id: BlockID,
+    page_id: LeU64,
+}
+
+impl ColumnBlockNodeHeader {
+    /// Creates a persisted node header with host-order inputs encoded as little-endian fields.
+    #[inline]
+    pub(crate) fn new(height: u32, count: u32, start_row_id: RowID, create_ts: u64) -> Self {
+        ColumnBlockNodeHeader {
+            height: LeU32::new(height),
+            count: LeU32::new(count),
+            start_row_id: LeU64::new(start_row_id),
+            create_ts: LeU64::new(create_ts),
+        }
+    }
+
+    #[inline]
+    fn height(&self) -> u32 {
+        self.height.get()
+    }
+
+    #[inline]
+    fn count(&self) -> u32 {
+        self.count.get()
+    }
+
+    #[inline]
+    fn set_count(&mut self, count: u32) {
+        self.count.set(count);
+    }
+
+    #[inline]
+    fn start_row_id(&self) -> RowID {
+        self.start_row_id.get()
+    }
+}
+
+impl ColumnBlockBranchEntry {
+    #[inline]
+    fn new(start_row_id: RowID, page_id: BlockID) -> Self {
+        ColumnBlockBranchEntry {
+            start_row_id: LeU64::new(start_row_id),
+            page_id: LeU64::new(page_id.as_u64()),
+        }
+    }
+
+    #[inline]
+    fn start_row_id(&self) -> RowID {
+        self.start_row_id.get()
+    }
+
+    #[inline]
+    fn page_id(&self) -> BlockID {
+        BlockID::from(self.page_id.get())
+    }
 }
 
 #[repr(C)]
@@ -320,12 +383,7 @@ impl ColumnBlockNode {
         // SAFETY: `ColumnBlockNode` contains only integer and byte-array fields,
         // so the all-zero bit pattern is valid for the whole value.
         let mut node = unsafe { Box::<ColumnBlockNode>::new_zeroed().assume_init() };
-        node.header = ColumnBlockNodeHeader {
-            height,
-            count: 0,
-            start_row_id,
-            create_ts,
-        };
+        node.header = ColumnBlockNodeHeader::new(height, 0, start_row_id, create_ts);
         if height == 0 {
             // Leaf nodes reserve the first bytes of `data` for the leaf-only
             // header extension, while branch nodes use the full region for
@@ -333,7 +391,8 @@ impl ColumnBlockNode {
             // always decodes with a valid `search_type` before leaf encoding
             // rewrites it with the actual compact prefix mode.
             let header = ColumnBlockLeafHeaderExt::new(ColumnBlockLeafSearchType::Plain);
-            node.data[..COLUMN_BLOCK_LEAF_HEADER_EXT_SIZE].copy_from_slice(bytes_of(&header));
+            node.data[..COLUMN_BLOCK_LEAF_HEADER_EXT_SIZE]
+                .copy_from_slice(layout::bytes_of(&header));
         }
         node
     }
@@ -349,7 +408,7 @@ impl ColumnBlockNode {
     }
 
     fn branch_entries_mut(&mut self) -> &mut [ColumnBlockBranchEntry] {
-        branch_entries_from_bytes_mut(&mut self.data, self.header.count as usize)
+        branch_entries_from_bytes_mut(&mut self.data, self.header.count() as usize)
     }
 }
 
@@ -883,11 +942,11 @@ impl SectionHeader {
 #[derive(Clone, Debug)]
 struct LeafEntryView<'a> {
     start_row_id: RowID,
-    entry_header: ColumnBlockLeafEntryHeader,
+    entry_header: &'a ColumnBlockLeafEntryHeader,
     row_section: &'a [u8],
     delete_section: Option<&'a [u8]>,
     row_header: SectionHeader,
-    delete_header: Option<DeleteSectionHeader>,
+    delete_header: Option<&'a DeleteSectionHeader>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -897,7 +956,9 @@ struct DecodedLeafPrefix {
 }
 
 #[repr(C)]
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Pod, Zeroable)]
+#[derive(
+    Clone, Debug, Default, Eq, PartialEq, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned,
+)]
 struct ColumnBlockLeafPrefixPlain {
     start_row_id: [u8; 8],
     entry_offset: [u8; 2],
@@ -916,7 +977,9 @@ impl ColumnBlockLeafPrefixPlain {
 }
 
 #[repr(C)]
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Pod, Zeroable)]
+#[derive(
+    Clone, Debug, Default, Eq, PartialEq, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned,
+)]
 struct ColumnBlockLeafPrefixDeltaU32 {
     start_row_delta: [u8; 4],
     entry_offset: [u8; 2],
@@ -935,7 +998,9 @@ impl ColumnBlockLeafPrefixDeltaU32 {
 }
 
 #[repr(C)]
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Pod, Zeroable)]
+#[derive(
+    Clone, Debug, Default, Eq, PartialEq, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned,
+)]
 struct ColumnBlockLeafPrefixDeltaU16 {
     start_row_delta: [u8; 2],
     entry_offset: [u8; 2],
@@ -1132,11 +1197,11 @@ trait ColumnBlockNodeRead {
 
     #[inline]
     fn is_leaf(&self) -> bool {
-        self.header_ref().height == 0
+        self.header_ref().height() == 0
     }
     #[inline]
     fn branch_entries(&self) -> &[ColumnBlockBranchEntry] {
-        branch_entries_from_bytes(self.data_ref(), self.header_ref().count as usize)
+        branch_entries_from_bytes(self.data_ref(), self.header_ref().count() as usize)
     }
 
     #[inline]
@@ -1193,24 +1258,20 @@ fn invalid_blob_payload(file_kind: FileKind, page_id: BlockID) -> Error {
 }
 
 #[inline]
-fn validate_node_payload(
-    page: &[u8],
-    file_kind: FileKind,
-    page_id: BlockID,
-) -> Result<(&[u8], ColumnBlockNodeHeader)> {
+fn validate_node_payload(page: &[u8], file_kind: FileKind, page_id: BlockID) -> Result<&[u8]> {
     let payload = validate_block(page, COLUMN_BLOCK_INDEX_BLOCK_SPEC)
         .attach_with(|| format!("file={file_kind}, block=column-block-index, block_id={page_id}"))
         .map_err(Error::from)?;
     let header =
-        bytemuck::try_from_bytes::<ColumnBlockNodeHeader>(&payload[..COLUMN_BLOCK_HEADER_SIZE])
+        layout::try_ref_from_bytes::<ColumnBlockNodeHeader>(&payload[..COLUMN_BLOCK_HEADER_SIZE])
             .map_err(|_| invalid_node_payload(file_kind, page_id))?;
-    let count = header.count as usize;
-    if (header.height == 0 && count > COLUMN_BLOCK_MAX_ENTRIES)
-        || (header.height > 0 && count > COLUMN_BLOCK_MAX_BRANCH_ENTRIES)
+    let count = header.count() as usize;
+    if (header.height() == 0 && count > COLUMN_BLOCK_MAX_ENTRIES)
+        || (header.height() > 0 && count > COLUMN_BLOCK_MAX_BRANCH_ENTRIES)
     {
         return Err(invalid_node_payload(file_kind, page_id));
     }
-    Ok((payload, *header))
+    Ok(payload)
 }
 
 #[inline]
@@ -1231,18 +1292,17 @@ fn validated_node_payload(page: &[u8]) -> &[u8] {
 #[inline]
 fn branch_entries_from_bytes(data: &[u8], count: usize) -> &[ColumnBlockBranchEntry] {
     let bytes_len = count * mem::size_of::<ColumnBlockBranchEntry>();
-    cast_slice(&data[..bytes_len])
+    layout::slice_from_bytes(&data[..bytes_len])
 }
 
 #[inline]
 fn branch_entries_from_bytes_mut(data: &mut [u8], count: usize) -> &mut [ColumnBlockBranchEntry] {
     let bytes_len = count * mem::size_of::<ColumnBlockBranchEntry>();
-    cast_slice_mut(&mut data[..bytes_len])
+    layout::slice_from_bytes_mut(&mut data[..bytes_len])
 }
 
 struct ValidatedColumnBlockNode {
     guard: ReadonlyBlockGuard,
-    header: ColumnBlockNodeHeader,
 }
 
 impl ValidatedColumnBlockNode {
@@ -1252,8 +1312,8 @@ impl ValidatedColumnBlockNode {
         file_kind: FileKind,
         page_id: BlockID,
     ) -> Result<Self> {
-        let (_, header) = validate_node_payload(guard.page(), file_kind, page_id)?;
-        Ok(ValidatedColumnBlockNode { guard, header })
+        validate_node_payload(guard.page(), file_kind, page_id)?;
+        Ok(ValidatedColumnBlockNode { guard })
     }
 
     fn leaf_header_ext(
@@ -1261,7 +1321,7 @@ impl ValidatedColumnBlockNode {
         file_kind: FileKind,
         page_id: BlockID,
     ) -> Result<&ColumnBlockLeafHeaderExt> {
-        bytemuck::try_from_bytes::<ColumnBlockLeafHeaderExt>(
+        layout::try_ref_from_bytes::<ColumnBlockLeafHeaderExt>(
             &self.data_ref()[..COLUMN_BLOCK_LEAF_HEADER_EXT_SIZE],
         )
         .map_err(|_| invalid_node_payload(file_kind, page_id))
@@ -1276,7 +1336,8 @@ impl ValidatedColumnBlockNode {
             .leaf_header_ext(file_kind, page_id)?
             .search_type()
             .map_err(|_| invalid_node_payload(file_kind, page_id))?;
-        let count = self.header.count as usize;
+        let header = self.header_ref();
+        let count = header.count() as usize;
         let data = self.leaf_data_ref();
         let prefix_bytes_len = count
             .checked_mul(search_type.prefix_size())
@@ -1287,18 +1348,18 @@ impl ValidatedColumnBlockNode {
         let prefix_bytes = &data[..prefix_bytes_len];
         let plane = match search_type {
             ColumnBlockLeafSearchType::Plain => LeafPrefixPlane::Plain {
-                header_start_row_id: self.header.start_row_id,
-                prefixes: try_cast_slice(prefix_bytes)
+                header_start_row_id: header.start_row_id(),
+                prefixes: layout::try_slice_from_bytes(prefix_bytes)
                     .map_err(|_| invalid_node_payload(file_kind, page_id))?,
             },
             ColumnBlockLeafSearchType::DeltaU32 => LeafPrefixPlane::DeltaU32 {
-                header_start_row_id: self.header.start_row_id,
-                prefixes: try_cast_slice(prefix_bytes)
+                header_start_row_id: header.start_row_id(),
+                prefixes: layout::try_slice_from_bytes(prefix_bytes)
                     .map_err(|_| invalid_node_payload(file_kind, page_id))?,
             },
             ColumnBlockLeafSearchType::DeltaU16 => LeafPrefixPlane::DeltaU16 {
-                header_start_row_id: self.header.start_row_id,
-                prefixes: try_cast_slice(prefix_bytes)
+                header_start_row_id: header.start_row_id(),
+                prefixes: layout::try_slice_from_bytes(prefix_bytes)
                     .map_err(|_| invalid_node_payload(file_kind, page_id))?,
             },
         };
@@ -1320,7 +1381,7 @@ impl ValidatedColumnBlockNode {
         let prefix_end = prefixes.prefix_bytes_len();
         let entry_bytes =
             leaf_entry_slice(data, prefix_end, prefix.entry_offset, file_kind, page_id)?;
-        let entry_header = *bytemuck::try_from_bytes::<ColumnBlockLeafEntryHeader>(
+        let entry_header = layout::try_ref_from_bytes::<ColumnBlockLeafEntryHeader>(
             &entry_bytes[..COLUMN_BLOCK_LEAF_ENTRY_HEADER_SIZE],
         )
         .map_err(|_| invalid_node_payload(file_kind, page_id))?;
@@ -1342,7 +1403,7 @@ impl ValidatedColumnBlockNode {
                 if bytes.len() < COLUMN_DELETE_SECTION_HEADER_SIZE {
                     return Err(invalid_node_payload(file_kind, page_id));
                 }
-                let header = *bytemuck::try_from_bytes::<DeleteSectionHeader>(
+                let header = layout::try_ref_from_bytes::<DeleteSectionHeader>(
                     &bytes[..COLUMN_DELETE_SECTION_HEADER_SIZE],
                 )
                 .map_err(|_| invalid_node_payload(file_kind, page_id))?;
@@ -1367,7 +1428,8 @@ impl ValidatedColumnBlockNode {
 impl ColumnBlockNodeRead for ValidatedColumnBlockNode {
     #[inline]
     fn header_ref(&self) -> &ColumnBlockNodeHeader {
-        &self.header
+        let payload = validated_node_payload(self.guard.page());
+        layout::ref_from_bytes(&payload[..COLUMN_BLOCK_HEADER_SIZE])
     }
 
     #[inline]
@@ -1456,7 +1518,7 @@ impl<'a> ColumnBlockIndex<'a> {
                 Some(idx) => idx,
                 None => return Ok(None),
             };
-            page_id = entries[idx].page_id;
+            page_id = entries[idx].page_id();
         }
     }
 
@@ -1487,7 +1549,7 @@ impl<'a> ColumnBlockIndex<'a> {
                 Some(idx) => idx,
                 None => return Ok(None),
             };
-            page_id = entries[idx].page_id;
+            page_id = entries[idx].page_id();
         }
     }
 
@@ -1641,7 +1703,7 @@ impl<'a> ColumnBlockIndex<'a> {
             let entries = node.branch_entries();
             let idx = search_branch_entry(entries, start_row_id)
                 .ok_or_else(column_block_index_invariant)?;
-            page_id = entries[idx].page_id;
+            page_id = entries[idx].page_id();
         }
     }
 
@@ -1672,10 +1734,11 @@ impl<'a> ColumnBlockIndex<'a> {
             }
             let branch_entries = node.branch_entries();
             for entry in branch_entries.iter().rev() {
-                if entry.page_id == SUPER_BLOCK_ID {
+                let child_page_id = entry.page_id();
+                if child_page_id == SUPER_BLOCK_ID {
                     return Err(invalid_node_payload(self.file_kind(), page_id));
                 }
-                stack.push(entry.page_id);
+                stack.push(child_page_id);
             }
         }
         Ok(entries)
@@ -1717,7 +1780,11 @@ impl<'a> ColumnBlockIndex<'a> {
             resolved
         };
 
-        let root_height = self.read_node(self.root_block_id).await?.header.height;
+        let root_height = self
+            .read_node(self.root_block_id)
+            .await?
+            .header_ref()
+            .height();
         let res = self
             .rewrite_subtree_with_patches(mutable_file, self.root_block_id, &resolved, create_ts)
             .await?;
@@ -1762,7 +1829,11 @@ impl<'a> ColumnBlockIndex<'a> {
             writer.finish().await?;
             resolved
         };
-        let root_height = self.read_node(self.root_block_id).await?.header.height;
+        let root_height = self
+            .read_node(self.root_block_id)
+            .await?
+            .header_ref()
+            .height();
         let res = self
             .rewrite_subtree_with_patches(mutable_file, self.root_block_id, &resolved, create_ts)
             .await?;
@@ -1813,7 +1884,11 @@ impl<'a> ColumnBlockIndex<'a> {
                 .await;
         }
 
-        let root_height = self.read_node(self.root_block_id).await?.header.height;
+        let root_height = self
+            .read_node(self.root_block_id)
+            .await?
+            .header_ref()
+            .height();
         let new_root_entries = self
             .append_rightmost_path(mutable_file, &logical_entries, create_ts)
             .await?;
@@ -1889,7 +1964,7 @@ impl<'a> ColumnBlockIndex<'a> {
         for (child_idx, entry) in old_entries.iter().enumerate() {
             let next_start = old_entries
                 .get(child_idx + 1)
-                .map(|next| next.start_row_id)
+                .map(|next| next.start_row_id())
                 .unwrap_or(RowID::MAX);
             let start_idx = patch_idx;
             while patch_idx < patches.len() && patches[patch_idx].start_row_id() < next_start {
@@ -1902,7 +1977,7 @@ impl<'a> ColumnBlockIndex<'a> {
             let child = self
                 .rewrite_subtree_with_patches(
                     mutable_file,
-                    entry.page_id,
+                    entry.page_id(),
                     &patches[start_idx..patch_idx],
                     create_ts,
                 )
@@ -1911,7 +1986,7 @@ impl<'a> ColumnBlockIndex<'a> {
                 return Err(Report::new(InternalError::ColumnIndexRewriteMiss)
                     .attach(format!(
                         "child rewrite missed branch_page_id={}",
-                        entry.page_id
+                        entry.page_id()
                     ))
                     .into());
             }
@@ -1928,7 +2003,12 @@ impl<'a> ColumnBlockIndex<'a> {
             });
         }
         let new_entries = self
-            .write_branch_pages(mutable_file, &combined, node.header.height, create_ts)
+            .write_branch_pages(
+                mutable_file,
+                &combined,
+                node.header_ref().height(),
+                create_ts,
+            )
             .await?;
         self.record_obsolete_node(mutable_file, page_id)?;
         Ok(NodeRewriteResult {
@@ -1960,14 +2040,14 @@ impl<'a> ColumnBlockIndex<'a> {
         let mut page_id = self.root_block_id;
         loop {
             let node = self.read_node(page_id).await?;
-            path.push((page_id, node.header.height));
+            path.push((page_id, node.header_ref().height()));
             if node.is_leaf() {
                 break;
             }
             page_id = node
                 .branch_entries()
                 .last()
-                .map(|entry| entry.page_id)
+                .map(|entry| entry.page_id())
                 .ok_or_else(|| {
                     Error::from(
                         Report::new(InternalError::ColumnIndexPathInvariant)
@@ -2026,7 +2106,7 @@ impl<'a> ColumnBlockIndex<'a> {
                 .into());
         }
         if entries.len() == 1 {
-            return Ok(entries[0].page_id);
+            return Ok(entries[0].page_id());
         }
         self.build_branch_levels(mutable_file, entries, old_root_height + 1, create_ts)
             .await
@@ -2085,7 +2165,7 @@ impl<'a> ColumnBlockIndex<'a> {
             let chunk = &encoded[start..end];
             let (page_id, mut node) =
                 self.allocate_node(mutable_file, 0, chunk[0].start_row_id, create_ts)?;
-            node.header.count = chunk.len() as u32;
+            node.header.set_count(chunk.len() as u32);
             encode_leaf_chunk(
                 node.data_mut(),
                 chunk,
@@ -2100,10 +2180,7 @@ impl<'a> ColumnBlockIndex<'a> {
                 })?,
             )?;
             self.write_node(mutable_file, page_id, &node).await?;
-            leaf_entries.push(ColumnBlockBranchEntry {
-                start_row_id: chunk[0].start_row_id,
-                page_id,
-            });
+            leaf_entries.push(ColumnBlockBranchEntry::new(chunk[0].start_row_id, page_id));
             start = end;
         }
         Ok(leaf_entries)
@@ -2119,14 +2196,14 @@ impl<'a> ColumnBlockIndex<'a> {
         let mut res = Vec::new();
         for chunk in entries.chunks(COLUMN_BLOCK_MAX_BRANCH_ENTRIES) {
             let (page_id, mut node) =
-                self.allocate_node(mutable_file, height, chunk[0].start_row_id, create_ts)?;
-            node.header.count = chunk.len() as u32;
+                self.allocate_node(mutable_file, height, chunk[0].start_row_id(), create_ts)?;
+            node.header.set_count(chunk.len() as u32);
             node.branch_entries_mut().copy_from_slice(chunk);
             self.write_node(mutable_file, page_id, &node).await?;
-            res.push(ColumnBlockBranchEntry {
-                start_row_id: chunk[0].start_row_id,
+            res.push(ColumnBlockBranchEntry::new(
+                chunk[0].start_row_id(),
                 page_id,
-            });
+            ));
         }
         Ok(res)
     }
@@ -2140,7 +2217,7 @@ impl<'a> ColumnBlockIndex<'a> {
     ) -> Result<BlockID> {
         loop {
             if entries.len() == 1 {
-                return Ok(entries[0].page_id);
+                return Ok(entries[0].page_id());
             }
             entries = self
                 .write_branch_pages(mutable_file, &entries, height, create_ts)
@@ -2192,7 +2269,7 @@ impl<'a> ColumnBlockIndex<'a> {
         let payload_start = write_block_header(buf.data_mut(), COLUMN_BLOCK_INDEX_BLOCK_SPEC);
         let payload_end = payload_start + COLUMN_BLOCK_NODE_PAYLOAD_SIZE;
         let dst = &mut buf.data_mut()[payload_start..payload_end];
-        dst[..COLUMN_BLOCK_HEADER_SIZE].copy_from_slice(bytes_of(&node.header));
+        dst[..COLUMN_BLOCK_HEADER_SIZE].copy_from_slice(layout::bytes_of(&node.header));
         dst[COLUMN_BLOCK_HEADER_SIZE..COLUMN_BLOCK_HEADER_SIZE + COLUMN_BLOCK_DATA_SIZE]
             .copy_from_slice(node.data_ref());
         write_block_checksum(buf.data_mut());
@@ -2247,8 +2324,9 @@ fn leaf_entry_slice(
     if offset < prefix_end || header_end > data.len() {
         return Err(invalid_node_payload(file_kind, page_id));
     }
-    let header = bytemuck::try_from_bytes::<ColumnBlockLeafEntryHeader>(&data[offset..header_end])
-        .map_err(|_| invalid_node_payload(file_kind, page_id))?;
+    let header =
+        layout::try_ref_from_bytes::<ColumnBlockLeafEntryHeader>(&data[offset..header_end])
+            .map_err(|_| invalid_node_payload(file_kind, page_id))?;
     let entry_len = header.entry_len() as usize;
     if entry_len < COLUMN_BLOCK_LEAF_ENTRY_HEADER_SIZE + header.row_section_len() as usize {
         return Err(invalid_node_payload(file_kind, page_id));
@@ -2280,7 +2358,7 @@ fn validate_leaf_prefixes(
             .map_err(|_| invalid_node_payload(file_kind, page_id))?;
         let entry_bytes =
             leaf_entry_slice(data, prefix_end, prefix.entry_offset, file_kind, page_id)?;
-        let entry_header = bytemuck::try_from_bytes::<ColumnBlockLeafEntryHeader>(
+        let entry_header = layout::try_ref_from_bytes::<ColumnBlockLeafEntryHeader>(
             &entry_bytes[..COLUMN_BLOCK_LEAF_ENTRY_HEADER_SIZE],
         )
         .map_err(|_| invalid_node_payload(file_kind, page_id))?;
@@ -2643,7 +2721,7 @@ fn decode_delete_section_metadata(
     if bytes.len() < COLUMN_DELETE_SECTION_HEADER_SIZE {
         return Err(invalid_node_payload(file_kind, page_id));
     }
-    let header = bytemuck::try_from_bytes::<DeleteSectionHeader>(
+    let header = layout::try_ref_from_bytes::<DeleteSectionHeader>(
         &bytes[..COLUMN_DELETE_SECTION_HEADER_SIZE],
     )
     .map_err(|_| invalid_node_payload(file_kind, page_id))?;
@@ -2763,7 +2841,7 @@ fn encode_delete_section(
             let mut bytes = Vec::with_capacity(
                 COLUMN_DELETE_SECTION_HEADER_SIZE + mem::size_of_val(delete_values.as_slice()),
             );
-            bytes.extend_from_slice(bytes_of(&header));
+            bytes.extend_from_slice(layout::bytes_of(&header));
             for value in delete_values {
                 bytes.extend_from_slice(&value.to_le_bytes());
             }
@@ -2780,7 +2858,7 @@ fn encode_delete_section(
             );
             let mut bytes =
                 Vec::with_capacity(COLUMN_DELETE_SECTION_HEADER_SIZE + COLUMN_BLOB_REF_SIZE);
-            bytes.extend_from_slice(bytes_of(&header));
+            bytes.extend_from_slice(layout::bytes_of(&header));
             encode_blob_ref(blob_ref, &mut bytes);
             Ok(bytes)
         }
@@ -2798,7 +2876,9 @@ fn encode_leaf_chunk(
         .start_row_id;
     buf.fill(0);
     let (leaf_header, leaf_data) = buf.split_at_mut(COLUMN_BLOCK_LEAF_HEADER_EXT_SIZE);
-    leaf_header.copy_from_slice(bytes_of(&ColumnBlockLeafHeaderExt::new(search_type)));
+    leaf_header.copy_from_slice(layout::bytes_of(&ColumnBlockLeafHeaderExt::new(
+        search_type,
+    )));
     let prefix_bytes_len = entries.len() * search_type.prefix_size();
     let mut prefix_cursor = 0usize;
     let mut arena_end = leaf_data.len();
@@ -2809,7 +2889,8 @@ fn encode_leaf_chunk(
         }
         let entry_header = ColumnBlockLeafEntryHeader::from_encoded(entry)?;
         let entry_bytes = &mut leaf_data[entry_range.0..entry_range.1];
-        entry_bytes[..COLUMN_BLOCK_LEAF_ENTRY_HEADER_SIZE].copy_from_slice(bytes_of(&entry_header));
+        entry_bytes[..COLUMN_BLOCK_LEAF_ENTRY_HEADER_SIZE]
+            .copy_from_slice(layout::bytes_of(&entry_header));
         let row_section_end = COLUMN_BLOCK_LEAF_ENTRY_HEADER_SIZE + entry.row_section.len();
         entry_bytes[COLUMN_BLOCK_LEAF_ENTRY_HEADER_SIZE..row_section_end]
             .copy_from_slice(&entry.row_section);
@@ -3175,7 +3256,7 @@ fn search_start_row_id(prefixes: &LeafPrefixPlane<'_>, row_id: RowID) -> Result<
 }
 
 fn search_branch_entry(entries: &[ColumnBlockBranchEntry], row_id: RowID) -> Option<usize> {
-    match entries.binary_search_by_key(&row_id, |entry| entry.start_row_id) {
+    match entries.binary_search_by_key(&row_id, |entry| entry.start_row_id()) {
         Ok(idx) => Some(idx),
         Err(0) => None,
         Err(idx) => Some(idx - 1),

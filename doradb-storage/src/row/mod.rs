@@ -7,11 +7,16 @@ pub use vector_scan::*;
 use crate::bitmap::bitmap_required_units;
 use crate::buffer::page::{BufferPage, PAGE_SIZE};
 use crate::catalog::TableMetadata;
+use crate::layout;
 use crate::value::*;
 use ordered_float::OrderedFloat;
 use std::fmt;
 use std::mem;
 use std::sync::atomic::{AtomicU8, AtomicU16, AtomicU32, Ordering};
+use zerocopy::byteorder::little_endian::{
+    F32 as LeF32, F64 as LeF64, I16 as LeI16, I32 as LeI32, I64 as LeI64, U16 as LeU16,
+    U32 as LeU32, U64 as LeU64,
+};
 
 pub type RowID = u64;
 pub const INVALID_ROW_ID: RowID = !0;
@@ -114,7 +119,7 @@ impl RowPage {
         let mut col_offset = self.header.fix_field_offset;
         let col_offsets = self.col_offsets_mut();
         for (i, ty) in schema.col_types().iter().enumerate() {
-            col_offsets[i] = col_offset;
+            col_offsets[i].set(col_offset);
             col_offset += col_inline_len(ty.kind, row_count as usize) as u16;
         }
         self.header.fix_field_end = col_offset;
@@ -427,7 +432,7 @@ impl RowPage {
         metadata: &TableMetadata,
         col_idx: usize,
         row_count: usize,
-    ) -> (Option<&[u64]>, ValArrayRef<'_>) {
+    ) -> (Option<Vec<u64>>, ValArrayRef<'_>) {
         debug_assert!(row_count <= self.header.row_count());
         let null_bitmap = self.null_bitmap(metadata, col_idx, row_count);
         let offset = self.col_offset(col_idx) as usize;
@@ -436,44 +441,44 @@ impl RowPage {
         let raw_bytes = &self.data()[offset..offset + inline_len * row_count];
         let val_array = match metadata.val_kind(col_idx) {
             ValKind::I8 => {
-                let va = bytemuck::cast_slice::<u8, i8>(raw_bytes);
+                let va = layout::slice_from_bytes::<i8>(raw_bytes);
                 ValArrayRef::I8(va)
             }
             ValKind::U8 => ValArrayRef::U8(raw_bytes),
             ValKind::I16 => {
-                let va = bytemuck::cast_slice::<u8, i16>(raw_bytes);
+                let va = layout::slice_from_bytes::<LeI16>(raw_bytes);
                 ValArrayRef::I16(va)
             }
             ValKind::U16 => {
-                let va = bytemuck::cast_slice::<u8, u16>(raw_bytes);
+                let va = layout::slice_from_bytes::<LeU16>(raw_bytes);
                 ValArrayRef::U16(va)
             }
             ValKind::I32 => {
-                let va = bytemuck::cast_slice::<u8, i32>(raw_bytes);
+                let va = layout::slice_from_bytes::<LeI32>(raw_bytes);
                 ValArrayRef::I32(va)
             }
             ValKind::U32 => {
-                let va = bytemuck::cast_slice::<u8, u32>(raw_bytes);
+                let va = layout::slice_from_bytes::<LeU32>(raw_bytes);
                 ValArrayRef::U32(va)
             }
             ValKind::F32 => {
-                let va = bytemuck::cast_slice::<u8, f32>(raw_bytes);
+                let va = layout::slice_from_bytes::<LeF32>(raw_bytes);
                 ValArrayRef::F32(va)
             }
             ValKind::I64 => {
-                let va = bytemuck::cast_slice::<u8, i64>(raw_bytes);
+                let va = layout::slice_from_bytes::<LeI64>(raw_bytes);
                 ValArrayRef::I64(va)
             }
             ValKind::U64 => {
-                let va = bytemuck::cast_slice::<u8, u64>(raw_bytes);
+                let va = layout::slice_from_bytes::<LeU64>(raw_bytes);
                 ValArrayRef::U64(va)
             }
             ValKind::F64 => {
-                let va = bytemuck::cast_slice::<u8, f64>(raw_bytes);
+                let va = layout::slice_from_bytes::<LeF64>(raw_bytes);
                 ValArrayRef::F64(va)
             }
             ValKind::VarByte => {
-                let va = bytemuck::cast_slice::<u8, PageVar>(raw_bytes);
+                let va = layout::slice_from_bytes::<PageVar>(raw_bytes);
                 ValArrayRef::VarByte(va, self.data())
             }
         };
@@ -488,39 +493,39 @@ impl RowPage {
             ValKind::U8 => Val::U8(bs[0]),
             ValKind::I16 => {
                 let b: [u8; mem::size_of::<i16>()] = bs.try_into().unwrap();
-                Val::I16(i16::from_ne_bytes(b))
+                Val::I16(i16::from_le_bytes(b))
             }
             ValKind::U16 => {
                 let b: [u8; mem::size_of::<u16>()] = bs.try_into().unwrap();
-                Val::U16(u16::from_ne_bytes(b))
+                Val::U16(u16::from_le_bytes(b))
             }
             ValKind::I32 => {
                 let b: [u8; mem::size_of::<i32>()] = bs.try_into().unwrap();
-                Val::I32(i32::from_ne_bytes(b))
+                Val::I32(i32::from_le_bytes(b))
             }
             ValKind::U32 => {
                 let b: [u8; mem::size_of::<u32>()] = bs.try_into().unwrap();
-                Val::U32(u32::from_ne_bytes(b))
+                Val::U32(u32::from_le_bytes(b))
             }
             ValKind::F32 => {
                 let b: [u8; mem::size_of::<f32>()] = bs.try_into().unwrap();
-                Val::F32(OrderedFloat(f32::from_ne_bytes(b)))
+                Val::F32(OrderedFloat(f32::from_le_bytes(b)))
             }
             ValKind::I64 => {
                 let b: [u8; mem::size_of::<i64>()] = bs.try_into().unwrap();
-                Val::I64(i64::from_ne_bytes(b))
+                Val::I64(i64::from_le_bytes(b))
             }
             ValKind::U64 => {
                 let b: [u8; mem::size_of::<u64>()] = bs.try_into().unwrap();
-                Val::U64(u64::from_ne_bytes(b))
+                Val::U64(u64::from_le_bytes(b))
             }
             ValKind::F64 => {
                 let b: [u8; mem::size_of::<f64>()] = bs.try_into().unwrap();
-                Val::F64(OrderedFloat(f64::from_ne_bytes(b)))
+                Val::F64(OrderedFloat(f64::from_le_bytes(b)))
             }
             ValKind::VarByte => {
                 let b: [u8; 8] = bs.try_into().unwrap();
-                let var = PageVar::from_u64(u64::from_ne_bytes(b));
+                let var = PageVar::from_le_bytes(b);
                 Val::VarByte(MemVar::from(var.as_bytes(self.data())))
             }
         }
@@ -742,8 +747,7 @@ impl RowPage {
         let offset = self.col_offset(col_idx) as usize;
         // size of page var is 8.
         let offset = offset + row_idx * 8;
-        let vs = bytemuck::cast_slice::<u8, PageVar>(&self.data()[offset..offset + 8]);
-        &vs[0]
+        layout::ref_from_bytes::<PageVar>(&self.data()[offset..offset + 8])
     }
 
     /// Returns the data slice of current page.
@@ -760,10 +764,10 @@ impl RowPage {
 
     /// Returns delete bitmap on page.
     #[inline]
-    pub fn del_bitmap(&self, row_count: usize) -> &[u64] {
+    pub fn del_bitmap(&self, row_count: usize) -> Vec<u64> {
         let bitmap_len = bitmap_len(row_count);
         let offset = self.header.del_bitmap_offset as usize;
-        bytemuck::cast_slice::<u8, u64>(&self.data()[offset..offset + bitmap_len])
+        le_u64_words(&self.data()[offset..offset + bitmap_len])
     }
 
     /// Returns whether given row is deleted.
@@ -847,13 +851,13 @@ impl RowPage {
         metadata: &TableMetadata,
         col_idx: usize,
         row_count: usize,
-    ) -> Option<&[u64]> {
+    ) -> Option<Vec<u64>> {
         match self.header.null_bitmap_range(metadata, col_idx) {
             None => None,
             Some((start_idx, _)) => {
                 let bitmap_len = bitmap_len(row_count);
                 let bm = &self.data()[start_idx..start_idx + bitmap_len];
-                Some(bytemuck::cast_slice::<u8, u64>(bm))
+                Some(le_u64_words(bm))
             }
         }
     }
@@ -940,23 +944,21 @@ impl RowPage {
 
     #[inline]
     fn col_offset(&self, col_idx: usize) -> u16 {
-        self.col_offsets()[col_idx]
+        self.col_offsets()[col_idx].get()
     }
 
     #[inline]
-    fn col_offsets(&self) -> &[u16] {
+    fn col_offsets(&self) -> &[LeU16] {
         let col_count = self.header.col_count as usize;
         let offset = self.header.col_offset_list_offset as usize;
-        bytemuck::cast_slice::<u8, u16>(
-            &self.data()[offset..offset + col_count * mem::size_of::<u16>()],
-        )
+        layout::slice_from_bytes(&self.data()[offset..offset + col_count * mem::size_of::<u16>()])
     }
 
     #[inline]
-    fn col_offsets_mut(&mut self) -> &mut [u16] {
+    fn col_offsets_mut(&mut self) -> &mut [LeU16] {
         let col_count = self.header.col_count as usize;
         let offset = self.header.col_offset_list_offset as usize;
-        bytemuck::cast_slice_mut::<u8, u16>(
+        layout::slice_from_bytes_mut(
             &mut self.data_mut()[offset..offset + col_count * mem::size_of::<u16>()],
         )
     }
@@ -1517,6 +1519,15 @@ impl RowMutExclusive<'_> {
         debug_assert!(!self.page.is_deleted(self.row_idx));
         Recover::Ok
     }
+}
+
+#[inline]
+fn le_u64_words(bytes: &[u8]) -> Vec<u64> {
+    debug_assert!(bytes.len().is_multiple_of(mem::size_of::<u64>()));
+    bytes
+        .chunks_exact(mem::size_of::<u64>())
+        .map(|chunk| u64::from_le_bytes(chunk.try_into().unwrap()))
+        .collect()
 }
 
 /// delete bitmap length, align to 8 bytes.

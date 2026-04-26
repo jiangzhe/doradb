@@ -27,7 +27,6 @@ use crate::io::{
     StdIoResult, align_to_sector_size,
 };
 use crate::serde::{Deser, Ser, Serde};
-use bytemuck::{Pod, Zeroable};
 use error_stack::Report;
 use libc::{
     O_CREAT, O_DIRECT, O_EXCL, O_RDWR, O_TRUNC, close, fdatasync, fstat, fsync, ftruncate, open,
@@ -46,10 +45,25 @@ use std::ops::{Add, AddAssign, Sub, SubAssign};
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use zerocopy_derive::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 /// Physical file identity used by persisted-block mappings and shared-storage routing.
 #[repr(transparent)]
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Zeroable, Pod)]
+#[derive(
+    Debug,
+    Default,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    FromBytes,
+    IntoBytes,
+    KnownLayout,
+    Immutable,
+)]
 pub struct FileID(u64);
 
 impl FileID {
@@ -230,7 +244,21 @@ pub const CATALOG_MTB_FILE_ID: FileID = FileID::new(USER_OBJ_ID_START - 1);
 /// readonly-cache lookups. Runtime buffer-managed pages use
 /// `crate::buffer::PageID` instead.
 #[repr(transparent)]
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Zeroable, Pod)]
+#[derive(
+    Debug,
+    Default,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    FromBytes,
+    IntoBytes,
+    KnownLayout,
+    Immutable,
+)]
 pub struct BlockID(u64);
 
 impl BlockID {

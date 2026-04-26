@@ -14,9 +14,9 @@
 | index | 19 | 11 | 0 | 0 | 3 | 5 |
 | io | 7 | 20 | 0 | 0 | 1 | 15 |
 | trx | 14 | 5 | 0 | 0 | 0 | 5 |
-| lwc | 2 | 2 | 0 | 0 | 0 | 2 |
+| lwc | 2 | 0 | 0 | 0 | 0 | 0 |
 | file | 8 | 13 | 0 | 0 | 2 | 13 |
-| **total** | **70** | **145** | **0** | **0** | **6** | **125** |
+| **total** | **70** | **143** | **0** | **0** | **6** | **123** |
 
 ## File Hotspots (top 40)
 
@@ -42,7 +42,6 @@
 | `doradb-storage/src/buffer/fixed.rs` | buffer | 2 | 2 |
 | `doradb-storage/src/buffer/frame.rs` | buffer | 2 | 2 |
 | `doradb-storage/src/io/libaio_abi.rs` | io | 2 | 1 |
-| `doradb-storage/src/lwc/block.rs` | lwc | 2 | 2 |
 | `doradb-storage/src/buffer/page.rs` | buffer | 1 | 1 |
 | `doradb-storage/src/index/btree/node.rs` | index | 1 | 1 |
 | `doradb-storage/src/index/column_block_index.rs` | index | 1 | 1 |

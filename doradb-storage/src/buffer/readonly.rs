@@ -1331,6 +1331,7 @@ pub(crate) mod tests {
         DirectBuf, IOBuf, IOKind, StorageBackendOp, StorageBackendTestHook,
         install_storage_backend_test_hook,
     };
+    use crate::layout;
     use crate::lwc::{
         LWC_BLOCK_PAYLOAD_SIZE, LwcBlock, LwcBlockHeader, validate_persisted_lwc_block,
     };
@@ -1664,13 +1665,8 @@ pub(crate) mod tests {
         let mut buf = vec![0u8; COW_FILE_PAGE_SIZE];
         let payload_start = write_block_header(&mut buf, COLUMN_BLOCK_INDEX_BLOCK_SPEC);
         let payload_end = payload_start + COLUMN_BLOCK_NODE_PAYLOAD_SIZE;
-        let header = ColumnBlockNodeHeader {
-            height: 0,
-            count: 0,
-            start_row_id: 0,
-            create_ts: 1,
-        };
-        let header_bytes = bytemuck::bytes_of(&header);
+        let header = ColumnBlockNodeHeader::new(0, 0, 0, 1);
+        let header_bytes = layout::bytes_of(&header);
         buf[payload_start..payload_start + COLUMN_BLOCK_HEADER_SIZE].copy_from_slice(header_bytes);
         buf[payload_start + COLUMN_BLOCK_HEADER_SIZE..payload_end].fill(0);
         write_block_checksum(&mut buf);
