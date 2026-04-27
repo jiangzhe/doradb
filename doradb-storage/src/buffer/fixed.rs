@@ -86,6 +86,19 @@ impl FixedBufferPool {
         FacadePageGuard::new(PageLatchGuard::new(keepalive, g), bf)
     }
 
+    #[inline]
+    fn validate_guard_page_kind<T: BufferPage>(
+        guard: FacadePageGuard<T>,
+    ) -> Result<FacadePageGuard<T>> {
+        if let Err(err) = validate_frame_page_kind::<T>(guard.bf()) {
+            if guard.is_exclusive() {
+                guard.rollback_exclusive_version_change();
+            }
+            return Err(err);
+        }
+        Ok(guard)
+    }
+
     /// Since all pages are kept in memory, we can use spin mode to eliminate
     /// the cost of async/await calls.
     #[inline]
@@ -180,7 +193,7 @@ impl BufferPool for FixedBufferPool {
             "page not allocated"
         );
         let guard = self.get_page_internal(guard, page_id, mode).await;
-        validate_frame_page_kind::<T>(guard.bf())?;
+        let guard = Self::validate_guard_page_kind(guard)?;
         self.stats.record_cache_hit();
         Ok(guard)
     }
@@ -203,7 +216,7 @@ impl BufferPool for FixedBufferPool {
             }
             return Ok(None);
         }
-        validate_frame_page_kind::<T>(bf)?;
+        let g = Self::validate_guard_page_kind(g)?;
         self.stats.record_cache_hit();
         Ok(Some(g))
     }
@@ -241,7 +254,7 @@ impl BufferPool for FixedBufferPool {
         // the validation make sure parent page does not change until child
         // page is acquired.
         if p_guard.validate_bool() {
-            validate_frame_page_kind::<T>(g.bf())?;
+            let g = Self::validate_guard_page_kind(g)?;
             self.stats.record_cache_hit();
             return Ok(Valid(g));
         }
@@ -268,8 +281,12 @@ mod tests {
     use crate::error::ErrorKind;
     use crate::index::{BTreeNode, RowPageIndexNode};
     use crate::quiescent::QuiescentBox;
+    use futures::task::noop_waker;
+    use std::future::Future;
+    use std::pin::Pin;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
+    use std::task::{Context, Poll};
     use std::thread;
     use std::time::Duration;
 
@@ -282,6 +299,17 @@ mod tests {
             Ok(_) => panic!("expected internal buffer-page kind mismatch"),
             Err(err) => assert!(err.is_kind(ErrorKind::Internal)),
         }
+    }
+
+    fn assert_pending_once<F: Future>(future: Pin<&mut F>) {
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        assert!(matches!(future.poll(&mut cx), Poll::Pending));
+    }
+
+    fn assert_exclusive_fallback_rolled_back(frame: &BufferFrame, held_version: u64) {
+        assert_eq!(held_version & 1, 1, "test must hold the exclusive latch");
+        assert_eq!(frame.latch.version_seqcst(), held_version + 1);
     }
 
     #[test]
@@ -502,6 +530,82 @@ mod tests {
                 )
                 .await,
             );
+        });
+    }
+
+    #[test]
+    fn test_fixed_buffer_pool_rolls_back_exclusive_fallback_on_page_kind_mismatch() {
+        smol::block_on(async {
+            let pool = test_pool();
+            let pool_guard = FixedBufferPool::pool_guard(&pool);
+
+            {
+                let page = pool
+                    .allocate_page::<RowPageIndexNode>(&pool_guard)
+                    .await
+                    .expect("test page allocation should succeed");
+                let page_id = page.page_id();
+                let frame = pool.arena.frame(page_id);
+                let held_version = frame.latch.version_seqcst();
+                let mut get_page = Box::pin(pool.get_page::<BTreeNode>(
+                    &pool_guard,
+                    page_id,
+                    LatchFallbackMode::Exclusive,
+                ));
+                assert_pending_once(get_page.as_mut());
+
+                drop(page);
+                assert_internal_error(get_page.await);
+                assert_exclusive_fallback_rolled_back(frame, held_version);
+            }
+
+            {
+                let page = pool
+                    .allocate_page::<RowPageIndexNode>(&pool_guard)
+                    .await
+                    .expect("test page allocation should succeed");
+                let page_id = page.page_id();
+                let versioned = page.versioned_page_id();
+                let frame = pool.arena.frame(page_id);
+                let held_version = frame.latch.version_seqcst();
+                let mut get_page_versioned = Box::pin(pool.get_page_versioned::<BTreeNode>(
+                    &pool_guard,
+                    versioned,
+                    LatchFallbackMode::Exclusive,
+                ));
+                assert_pending_once(get_page_versioned.as_mut());
+
+                drop(page);
+                assert_internal_error(get_page_versioned.await);
+                assert_exclusive_fallback_rolled_back(frame, held_version);
+            }
+
+            {
+                let parent = pool
+                    .allocate_page::<BTreeNode>(&pool_guard)
+                    .await
+                    .expect("test page allocation should succeed")
+                    .downgrade()
+                    .facade();
+                let child = pool
+                    .allocate_page::<RowPageIndexNode>(&pool_guard)
+                    .await
+                    .expect("test page allocation should succeed");
+                let child_page_id = child.page_id();
+                let frame = pool.arena.frame(child_page_id);
+                let held_version = frame.latch.version_seqcst();
+                let mut get_child_page = Box::pin(pool.get_child_page::<BTreeNode>(
+                    &pool_guard,
+                    &parent,
+                    child_page_id,
+                    LatchFallbackMode::Exclusive,
+                ));
+                assert_pending_once(get_child_page.as_mut());
+
+                drop(child);
+                assert_internal_error(get_child_page.await);
+                assert_exclusive_fallback_rolled_back(frame, held_version);
+            }
         });
     }
 
