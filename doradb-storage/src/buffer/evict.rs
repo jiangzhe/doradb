@@ -7,7 +7,9 @@ use crate::buffer::evictor::{
 use crate::buffer::frame::{BufferFrame, FrameKind};
 use crate::buffer::guard::{FacadePageGuard, PageExclusiveGuard, PageGuard, PageLatchGuard};
 use crate::buffer::load::{PageReservation, PageReservationGuard};
-use crate::buffer::page::{BufferPage, IOKind, PAGE_SIZE, Page, PageID, PageIO, VersionedPageID};
+use crate::buffer::page::{
+    BufferPage, IOKind, PAGE_SIZE, Page, PageID, PageIO, VersionedPageID, validate_frame_page_kind,
+};
 use crate::buffer::util::{frame_total_bytes, madvise_dontneed};
 use crate::buffer::{
     BufferPool, BufferPoolStats, BufferPoolStatsHandle, PageIOCompletion, PoolGuard, PoolIdentity,
@@ -40,6 +42,7 @@ use std::mem;
 use std::os::fd::{AsRawFd, RawFd};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use zerocopy::FromZeros;
 // min buffer pool size is 64KB * 128 = 8MB.
 const MIN_IN_MEM_PAGES: usize = 128;
 
@@ -414,17 +417,19 @@ impl BufferPool for EvictableBufferPool {
         loop {
             let bf = self.arena.frame_ptr(page_id);
             let frame = self.arena.frame(page_id);
+            if frame.kind() != FrameKind::Uninitialized {
+                validate_frame_page_kind::<T>(frame)?;
+            }
             match frame.kind() {
                 FrameKind::Uninitialized => {
                     panic!("get an uninitialized page");
                 }
                 FrameKind::Fixed | FrameKind::Hot => {
                     let g = frame.latch.optimistic_fallback_raw(mode).await;
+                    let guard = FacadePageGuard::new(PageLatchGuard::new(guard.clone(), g), bf);
+                    validate_frame_page_kind::<T>(guard.bf())?;
                     self.stats.record_cache_hit();
-                    return Ok(FacadePageGuard::new(
-                        PageLatchGuard::new(guard.clone(), g),
-                        bf,
-                    ));
+                    return Ok(guard);
                 }
                 FrameKind::Cool => {
                     // Try to mark this page as HOT.
@@ -435,11 +440,10 @@ impl BufferPool for EvictableBufferPool {
                         continue;
                     }
                     let g = frame.latch.optimistic_fallback_raw(mode).await;
+                    let guard = FacadePageGuard::new(PageLatchGuard::new(guard.clone(), g), bf);
+                    validate_frame_page_kind::<T>(guard.bf())?;
                     self.stats.record_cache_hit();
-                    return Ok(FacadePageGuard::new(
-                        PageLatchGuard::new(guard.clone(), g),
-                        bf,
-                    ));
+                    return Ok(guard);
                 }
                 FrameKind::Evicting => {
                     // The page is marked evicting in order to be evicted to disk in near future.
@@ -473,6 +477,9 @@ impl BufferPool for EvictableBufferPool {
             if frame.generation() != id.generation {
                 return Ok(None);
             }
+            if frame.kind() != FrameKind::Uninitialized {
+                validate_frame_page_kind::<T>(frame)?;
+            }
             match frame.kind() {
                 FrameKind::Uninitialized => return Ok(None),
                 FrameKind::Fixed | FrameKind::Hot => {
@@ -485,6 +492,7 @@ impl BufferPool for EvictableBufferPool {
                         }
                         return Ok(None);
                     }
+                    validate_frame_page_kind::<T>(bf)?;
                     self.stats.record_cache_hit();
                     return Ok(Some(g));
                 }
@@ -503,6 +511,7 @@ impl BufferPool for EvictableBufferPool {
                         }
                         return Ok(None);
                     }
+                    validate_frame_page_kind::<T>(bf)?;
                     self.stats.record_cache_hit();
                     return Ok(Some(g));
                 }
@@ -541,6 +550,9 @@ impl BufferPool for EvictableBufferPool {
         loop {
             let bf = self.arena.frame_ptr(page_id);
             let frame = self.arena.frame(page_id);
+            if frame.kind() != FrameKind::Uninitialized {
+                validate_frame_page_kind::<T>(frame)?;
+            }
             match frame.kind() {
                 FrameKind::Uninitialized => {
                     panic!("get an uninitialized page");
@@ -551,11 +563,10 @@ impl BufferPool for EvictableBufferPool {
                     // the validation make sure parent page does not change until child
                     // page is acquired.
                     if p_guard.validate_bool() {
+                        let child = FacadePageGuard::new(PageLatchGuard::new(guard.clone(), g), bf);
+                        validate_frame_page_kind::<T>(child.bf())?;
                         self.stats.record_cache_hit();
-                        return Ok(Valid(FacadePageGuard::new(
-                            PageLatchGuard::new(guard.clone(), g),
-                            bf,
-                        )));
+                        return Ok(Valid(child));
                     }
                     if g.state() == GuardState::Exclusive {
                         g.rollback_exclusive_bit();
@@ -581,6 +592,9 @@ impl BufferPool for EvictableBufferPool {
                         ))
                     });
                     if matches!(validated, Validation::Valid(_)) {
+                        if let Validation::Valid(child) = &validated {
+                            validate_frame_page_kind::<T>(child.bf())?;
+                        }
                         self.stats.record_cache_hit();
                     }
                     return Ok(validated);
@@ -1557,6 +1571,7 @@ pub(crate) mod tests {
     use crate::file::fs::tests::{
         build_test_fs_owner_in, io_backend_stats_handle_identity as fs_stats_handle_identity,
     };
+    use crate::index::BTreeNode;
     use crate::quiescent::{QuiescentBox, QuiescentGuard};
     use crate::row::RowPage;
     use std::io;
@@ -1638,6 +1653,13 @@ pub(crate) mod tests {
             thread::sleep(TEST_WAIT_INTERVAL);
         }
         panic!("condition was not satisfied before timeout");
+    }
+
+    fn assert_internal_error<T>(result: Result<T>) {
+        match result {
+            Ok(_) => panic!("expected internal buffer-page kind mismatch"),
+            Err(err) => assert!(err.is_kind(ErrorKind::Internal)),
+        }
     }
 
     fn build_raw_pool_for_test(
@@ -1922,6 +1944,43 @@ pub(crate) mod tests {
 
             let page_guard = pool.try_lock_page_exclusive(&pool_guard, page_id).unwrap();
             assert_eq!(page_guard.page()[0], 0);
+        });
+    }
+
+    #[test]
+    fn test_evictable_buffer_pool_rejects_evicted_page_kind_mismatch_before_reload() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let (_fs_owner, pool, _storage) = build_raw_pool_for_test(
+                EvictableBufferPoolConfig::default()
+                    .role(PoolRole::Mem)
+                    .data_swap_file(temp_dir.path().join("data.swp"))
+                    .max_mem_size(64u64 * 1024 * 1024)
+                    .max_file_size(128u64 * 1024 * 1024),
+            )
+            .unwrap();
+            let pool_guard = pool.pool_guard();
+            let page = pool
+                .allocate_page::<RowPage>(&pool_guard)
+                .await
+                .expect("test page allocation should succeed");
+            let page_id = page.page_id();
+            drop(page);
+
+            let mut raw_page = pool.try_lock_page_exclusive(&pool_guard, page_id).unwrap();
+            raw_page.bf_mut().set_kind(FrameKind::Evicting);
+            pool.in_mem.evict_page(raw_page);
+            assert_eq!(pool.arena.frame(page_id).kind(), FrameKind::Evicted);
+
+            let baseline = pool.stats();
+            assert_internal_error(
+                pool.get_page::<BTreeNode>(&pool_guard, page_id, LatchFallbackMode::Shared)
+                    .await,
+            );
+            let delta = pool.stats().delta_since(baseline);
+            assert_eq!(delta.cache_misses, 0);
+            assert_eq!(delta.queued_reads, 0);
+            assert_eq!(pool.arena.frame(page_id).kind(), FrameKind::Evicted);
         });
     }
 

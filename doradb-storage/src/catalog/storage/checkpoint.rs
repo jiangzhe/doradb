@@ -1,5 +1,4 @@
 use crate::buffer::guard::{PageExclusiveGuard, PageGuard};
-use crate::buffer::page::BufferPage;
 use crate::buffer::{BufferPool, FixedBufferPool, PoolGuard, PoolGuards};
 use crate::catalog::storage::CatalogStorage;
 use crate::catalog::table::TableMetadata;
@@ -24,6 +23,7 @@ use crate::value::Val;
 use error_stack::Report;
 use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroU64;
+use zerocopy::FromZeros;
 
 #[inline]
 fn invalid_catalog_payload(message: impl Into<String>) -> Error {

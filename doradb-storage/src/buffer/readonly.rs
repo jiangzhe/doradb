@@ -9,7 +9,7 @@ use crate::buffer::guard::{
     FacadePageGuard, PageExclusiveGuard, PageGuard, PageLatchGuard, PageSharedGuard,
 };
 use crate::buffer::load::{PageReservation, PageReservationGuard};
-use crate::buffer::page::{BufferPage, PAGE_SIZE, Page, PageID};
+use crate::buffer::page::{PAGE_SIZE, Page, PageID};
 use crate::buffer::util::madvise_dontneed;
 use crate::buffer::{
     BufferPoolStats, BufferPoolStatsHandle, PageIOCompletion, PoolGuard, PoolIdentity, PoolRole,
@@ -34,6 +34,7 @@ use std::mem;
 use std::os::fd::AsRawFd;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use zerocopy::FromZeros;
 
 /// Minimum number of frames required for global readonly pool.
 ///

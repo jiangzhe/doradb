@@ -1,4 +1,4 @@
-use crate::buffer::page::{Page, PageID, VersionedPageID};
+use crate::buffer::page::{BufferPageKind, Page, PageID, VersionedPageID};
 use crate::catalog::TableMetadata;
 use crate::file::FileID;
 use crate::file::cow_file::{BlockID, INVALID_BLOCK_ID};
@@ -37,6 +37,7 @@ pub struct BufferFrame {
     pub page_id: PageID,
     generation: AtomicU64,
     frame_kind: AtomicU8,
+    page_kind: AtomicU8,
     dirty: AtomicBool,
     has_persisted_block_key: AtomicBool,
     persisted_file_id: AtomicU64,
@@ -57,6 +58,19 @@ impl BufferFrame {
     #[inline]
     pub fn set_kind(&self, kind: FrameKind) {
         self.frame_kind.store(kind as u8, Ordering::Release);
+    }
+
+    /// Returns the logical page image kind stored in this frame.
+    #[inline]
+    pub fn page_kind(&self) -> BufferPageKind {
+        let value = self.page_kind.load(Ordering::Acquire);
+        BufferPageKind::from(value)
+    }
+
+    /// Stores the logical page image kind for this frame.
+    #[inline]
+    pub fn set_page_kind(&self, kind: BufferPageKind) {
+        self.page_kind.store(kind as u8, Ordering::Release);
     }
 
     #[inline]
@@ -152,6 +166,7 @@ impl Default for BufferFrame {
             latch: HybridLatch::new(),
             page_id: PageID::new(0),
             frame_kind: AtomicU8::new(FrameKind::Uninitialized as u8),
+            page_kind: AtomicU8::new(BufferPageKind::Uninitialized as u8),
             generation: AtomicU64::new(0),
             // by default the page is dirty because no copy on disk.
             dirty: AtomicBool::new(true),
