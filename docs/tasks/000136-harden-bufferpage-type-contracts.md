@@ -1,7 +1,7 @@
 ---
 id: 000136
 title: Harden BufferPage type contracts
-status: proposal
+status: implemented
 created: 2026-04-27
 github_issue: 597
 ---
@@ -177,8 +177,58 @@ Reference:
 
 ## Implementation Notes
 
-Keep this section blank in design phase. Fill this section during `task resolve`
-after implementation, tests, review, and verification are completed.
+1. Fixed the row-page native layout contract:
+   - added `#[repr(C)]` to `RowPage`;
+   - made `RowPageHeader` an explicit 32-byte layout with `[u8; 4]` padding;
+   - documented `approx_deleted` in the row-page header diagram;
+   - added size and offset assertions for `RowPage`, `RowPageHeader`, and
+     related page-image structs.
+2. Strengthened the buffer page contract:
+   - made `BufferPage` an unsafe sealed trait bounded by zerocopy layout
+     traits that match the native page-image contract;
+   - added `assert_buffer_page::<T>()` checks for audited page image types;
+   - kept `Page` as a raw-byte `BufferPage` for internal IO and raw-page tests.
+3. Added logical page-kind protection:
+   - introduced `BufferPageKind` storage in `BufferFrame` while preserving the
+     128-byte frame layout contract;
+   - set and reset page kind during page initialization/deinitialization;
+   - validate typed fixed and evictable buffer-pool access before returning
+     typed guards, including versioned and child-page access;
+   - wrong typed access now returns a deterministic internal page-kind mismatch
+     error instead of silently reinterpreting the page bytes.
+4. Preserved raw IO behavior:
+   - eviction, reload, checkpoint, and readonly raw-page byte paths continue to
+     use `Page` under existing ownership/latch protocols;
+   - evicted frames retain logical page kind so mismatched typed access can fail
+     before unnecessary reload work.
+5. Updated unsafe guard documentation and debug checks:
+   - refreshed `page_ref` and `page_mut` `// SAFETY:` comments with size,
+     alignment, lifetime, latch-state, and page-kind preconditions;
+   - added debug assertions for page pointer nullness, size, and alignment.
+6. Review follow-up fixed the exclusive-fallback page-kind error path in
+   `FixedBufferPool`:
+   - `get_page`, `get_page_versioned`, and `get_child_page` now roll back an
+     exclusive fallback version bump before returning a kind-mismatch error;
+   - added a regression test that forces the pending exclusive fallback path
+     and verifies the latch version is restored after the error.
+7. Verification completed with:
+   - `cargo fmt -p doradb-storage`
+   - `cargo nextest run -p doradb-storage test_fixed_buffer_pool_rolls_back_exclusive_fallback_on_page_kind_mismatch test_fixed_buffer_pool_rejects_page_kind_mismatch`
+   - `cargo nextest run -p doradb-storage`
+   - `git diff --check`
+   The crate-wide nextest run passed with `639/639` tests.
+8. Review/traceability:
+   - task issue: `#597`
+   - implementation PR: `#598`
+   - post-implementation checklist completed before resolve with no unresolved
+     required fixes.
+9. Resolve-time synchronization:
+   - `tools/task.rs resolve-task-next-id --task docs/tasks/000136-harden-bufferpage-type-contracts.md`
+     advanced `docs/tasks/next-id` to `000137`;
+   - `tools/task.rs resolve-task-rfc --task docs/tasks/000136-harden-bufferpage-type-contracts.md`
+     found no parent RFC reference;
+   - source backlog `000096` was archived as implemented:
+     `docs/backlogs/closed/000096-audit-buffer-page-reinterpretation-casts.md`.
 
 ## Impacts
 
@@ -247,9 +297,10 @@ cargo nextest run -p doradb-storage
 
 ## Open Questions
 
-- Whether to keep `Page: BufferPage` for raw test pages or remove it from the
-  ordinary logical typed-access path and expose raw-page helpers only to buffer
-  internals.
-- Whether page-kind checks should be compiled in all builds or debug-only. The
-  preferred direction is all builds because wrong page-type access is an
-  internal correctness bug and should fail deterministically.
+No unresolved task-scope questions remain.
+
+- `Page` remains a `BufferPage` with `BufferPageKind::RawBytes` for raw IO and
+  raw-page tests; ordinary logical typed access is protected by page-kind
+  validation.
+- Page-kind checks are compiled in all builds and return internal mismatch
+  errors because wrong page-type access is a correctness bug.
