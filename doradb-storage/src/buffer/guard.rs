@@ -1,6 +1,6 @@
 use crate::buffer::PoolGuard;
 use crate::buffer::frame::{BufferFrame, FrameContext};
-use crate::buffer::page::{PageID, VersionedPageID};
+use crate::buffer::page::{PAGE_SIZE, PageID, VersionedPageID};
 use crate::error::{
     Validation,
     Validation::{Invalid, Valid},
@@ -10,6 +10,7 @@ use crate::ptr::UnsafePtr;
 use either::Either;
 use std::future::Future;
 use std::marker::PhantomData;
+use std::mem;
 
 pub trait PageGuard<T: 'static> {
     fn page(&self) -> &T;
@@ -762,11 +763,12 @@ impl<T: 'static> PageExclusiveGuard<T> {
     #[inline]
     pub fn ctx_and_page_mut(&mut self) -> (&mut FrameContext, &mut T) {
         let bf = self.frame_mut();
+        debug_assert_page_cast::<T>(bf);
         let ctx = bf.ctx.as_mut().unwrap().as_mut();
-        // SAFETY: the exclusive page guard owns the latch exclusively and the
-        // retained pool guard keeps the page allocation alive while this mutable borrow
-        // exists.
-        let page = unsafe { &mut *(bf.page as *mut T) };
+        // SAFETY: the exclusive page guard owns the latch exclusively, the
+        // retained pool guard keeps the page allocation alive, and callers only
+        // construct typed guards after validating the frame's logical page kind.
+        let page = unsafe { &mut *(bf.page.cast::<T>()) };
         (ctx, page)
     }
 
@@ -807,16 +809,37 @@ unsafe impl<T: Sync + 'static> Sync for PageExclusiveGuard<T> {}
 
 #[inline]
 fn page_ref<T>(bf: &BufferFrame) -> &T {
-    // SAFETY: the owning guard keeps the arena allocation alive and callers
-    // choose `T` that matches the page type stored in this frame.
-    unsafe { &*(bf.page as *const T) }
+    debug_assert_page_cast::<T>(bf);
+    // SAFETY: the owning guard keeps the arena allocation alive, typed
+    // foreground access validates the frame's logical page kind before guard
+    // construction, and internal raw-page IO guards only request `Page` while
+    // holding the frame latch according to their access mode.
+    unsafe { &*(bf.page.cast::<T>()) }
 }
 
 #[inline]
 fn page_mut<T>(bf: &mut BufferFrame) -> &mut T {
+    debug_assert_page_cast::<T>(bf);
     // SAFETY: the owning guard keeps the arena allocation alive, the exclusive
-    // latch guarantees uniqueness, and callers choose the correct page type.
-    unsafe { &mut *(bf.page as *mut T) }
+    // latch guarantees uniqueness for mutable access, typed foreground access
+    // validates the frame's logical page kind before guard construction, and
+    // internal raw-page IO guards only request `Page` under exclusive ownership.
+    unsafe { &mut *(bf.page.cast::<T>()) }
+}
+
+#[inline]
+fn debug_assert_page_cast<T>(bf: &BufferFrame) {
+    debug_assert!(!bf.page.is_null(), "buffer frame page pointer is null");
+    debug_assert_eq!(
+        mem::size_of::<T>(),
+        PAGE_SIZE,
+        "buffer guard page casts require page-sized T"
+    );
+    debug_assert_eq!(
+        (bf.page as usize) % mem::align_of::<T>(),
+        0,
+        "buffer frame page pointer is not aligned for T"
+    );
 }
 
 #[inline]

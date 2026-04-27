@@ -2,7 +2,7 @@ use crate::bitmap::AllocMap;
 use crate::buffer::arena::QuiescentArena;
 use crate::buffer::frame::{BufferFrame, FrameKind};
 use crate::buffer::guard::{FacadePageGuard, PageExclusiveGuard, PageLatchGuard};
-use crate::buffer::page::{BufferPage, Page, PageID, VersionedPageID};
+use crate::buffer::page::{BufferPage, Page, PageID, VersionedPageID, validate_frame_page_kind};
 use crate::buffer::{
     BufferPool, BufferPoolStats, BufferPoolStatsHandle, PoolGuard, PoolIdentity, PoolRole,
     RowPoolRole,
@@ -93,14 +93,15 @@ impl FixedBufferPool {
         &self,
         guard: &PoolGuard,
         page_id: PageID,
-    ) -> FacadePageGuard<T> {
+    ) -> Result<FacadePageGuard<T>> {
         debug_assert!(
             self.alloc_map.is_allocated(usize::from(page_id)),
             "page not allocated"
         );
         let guard = self.get_page_spin_internal(guard, page_id);
+        validate_frame_page_kind::<T>(guard.bf())?;
         self.stats.record_cache_hit();
-        guard
+        Ok(guard)
     }
 
     #[inline]
@@ -179,6 +180,7 @@ impl BufferPool for FixedBufferPool {
             "page not allocated"
         );
         let guard = self.get_page_internal(guard, page_id, mode).await;
+        validate_frame_page_kind::<T>(guard.bf())?;
         self.stats.record_cache_hit();
         Ok(guard)
     }
@@ -201,6 +203,7 @@ impl BufferPool for FixedBufferPool {
             }
             return Ok(None);
         }
+        validate_frame_page_kind::<T>(bf)?;
         self.stats.record_cache_hit();
         Ok(Some(g))
     }
@@ -238,6 +241,7 @@ impl BufferPool for FixedBufferPool {
         // the validation make sure parent page does not change until child
         // page is acquired.
         if p_guard.validate_bool() {
+            validate_frame_page_kind::<T>(g.bf())?;
             self.stats.record_cache_hit();
             return Ok(Valid(g));
         }
@@ -259,8 +263,10 @@ unsafe impl Sync for FixedBufferPool {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::buffer::page::BufferPageKind;
     use crate::buffer::test_page_id;
-    use crate::index::RowPageIndexNode;
+    use crate::error::ErrorKind;
+    use crate::index::{BTreeNode, RowPageIndexNode};
     use crate::quiescent::QuiescentBox;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -269,6 +275,13 @@ mod tests {
 
     fn test_pool() -> QuiescentBox<FixedBufferPool> {
         QuiescentBox::new(FixedBufferPool::with_capacity(PoolRole::Meta, 64 * 1024 * 1024).unwrap())
+    }
+
+    fn assert_internal_error<T>(result: Result<T>) {
+        match result {
+            Ok(_) => panic!("expected internal buffer-page kind mismatch"),
+            Err(err) => assert!(err.is_kind(ErrorKind::Internal)),
+        }
     }
 
     #[test]
@@ -315,7 +328,9 @@ mod tests {
                     .expect("test page allocation should succeed");
                 let page_id = g.page_id();
                 drop(g);
-                let g = pool.get_page_spin::<RowPageIndexNode>(&pool_guard, page_id);
+                let g = pool
+                    .get_page_spin::<RowPageIndexNode>(&pool_guard, page_id)
+                    .expect("buffer-pool read failed in test");
                 assert!(g.page_id() == page_id);
                 drop(g);
 
@@ -442,6 +457,51 @@ mod tests {
             assert_eq!(delta.queued_reads, 0);
             assert_eq!(delta.running_reads, 0);
             assert_eq!(delta.completed_reads, 0);
+        });
+    }
+
+    #[test]
+    fn test_fixed_buffer_pool_rejects_page_kind_mismatch() {
+        smol::block_on(async {
+            let pool = test_pool();
+            let pool_guard = FixedBufferPool::pool_guard(&pool);
+            let page = pool
+                .allocate_page::<RowPageIndexNode>(&pool_guard)
+                .await
+                .expect("test page allocation should succeed");
+            let page_id = page.page_id();
+            let versioned = page.versioned_page_id();
+            assert_eq!(page.bf().page_kind(), BufferPageKind::RowPageIndexNode);
+            drop(page);
+
+            assert_internal_error(
+                pool.get_page::<BTreeNode>(&pool_guard, page_id, LatchFallbackMode::Shared)
+                    .await,
+            );
+            assert_internal_error(
+                pool.get_page_versioned::<BTreeNode>(
+                    &pool_guard,
+                    versioned,
+                    LatchFallbackMode::Shared,
+                )
+                .await,
+            );
+            assert_internal_error(pool.get_page_spin::<BTreeNode>(&pool_guard, page_id));
+
+            let parent = pool
+                .allocate_page::<BTreeNode>(&pool_guard)
+                .await
+                .expect("test page allocation should succeed");
+            let parent = parent.downgrade().facade();
+            assert_internal_error(
+                pool.get_child_page::<BTreeNode>(
+                    &pool_guard,
+                    &parent,
+                    page_id,
+                    LatchFallbackMode::Shared,
+                )
+                .await,
+            );
         });
     }
 

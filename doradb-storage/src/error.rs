@@ -191,6 +191,8 @@ pub(crate) enum InternalError {
     SecondaryIndexBindingMismatch,
     #[error("buffer page already allocated")]
     BufferPageAlreadyAllocated,
+    #[error("buffer page kind mismatch")]
+    BufferPageKindMismatch,
     #[error("column storage missing")]
     ColumnStorageMissing,
     #[error("mutable block view mismatch")]
@@ -496,6 +498,19 @@ impl fmt::Display for SecondaryIndexBinding {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BufferPageKindMismatch {
+    expected: &'static str,
+    actual: &'static str,
+}
+
+impl fmt::Display for BufferPageKindMismatch {
+    #[inline]
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "expected {}, found {}", self.expected, self.actual)
+    }
+}
+
 /// Printable recovery duplicate-key context.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RecoveryDuplicateKey {
@@ -603,6 +618,14 @@ impl Error {
     #[inline]
     pub(crate) fn buffer_page_already_allocated() -> Self {
         Report::new(InternalError::BufferPageAlreadyAllocated).into()
+    }
+
+    /// Builds an internal error for typed buffer-page access with the wrong page kind.
+    #[inline]
+    pub(crate) fn buffer_page_kind_mismatch(expected: &'static str, actual: &'static str) -> Self {
+        Report::new(InternalError::BufferPageKindMismatch)
+            .attach(BufferPageKindMismatch { expected, actual })
+            .into()
     }
 
     #[inline]

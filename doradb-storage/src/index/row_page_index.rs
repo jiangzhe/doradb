@@ -1,7 +1,7 @@
 use crate::buffer::guard::{
     FacadePageGuard, PageExclusiveGuard, PageGuard, PageOptimisticGuard, PageSharedGuard,
 };
-use crate::buffer::page::{BufferPage, PAGE_SIZE};
+use crate::buffer::page::{BufferPage, BufferPageKind, PAGE_SIZE, assert_buffer_page, sealed};
 use crate::buffer::{BufferPool, FixedBufferPool, PageID, PoolGuard};
 use crate::catalog::TableMetadata;
 use crate::error::{
@@ -74,7 +74,7 @@ enum InsertFreeListMiss {
 /// Branch contains at most 4093 child node pointers.
 /// Leaf contains at most NBR_ROW_PAGE_ENTRIES_IN_LEAF page entries.
 #[repr(C)]
-#[derive(Clone)]
+#[derive(Clone, FromBytes, IntoBytes, KnownLayout, Immutable)]
 pub struct RowPageIndexNode {
     pub header: RowPageIndexNodeHeader,
     data: [u8; ROW_PAGE_INDEX_NODE_SIZE - ROW_PAGE_INDEX_NODE_HEADER_SIZE],
@@ -250,11 +250,20 @@ impl RowPageIndexNode {
     }
 }
 
-impl BufferPage for RowPageIndexNode {}
+impl sealed::Sealed for RowPageIndexNode {}
 
-#[repr(C)]
+// SAFETY: `RowPageIndexNode` is one explicit `repr(C)` page image, derives the
+// required zerocopy layout traits, has no drop glue, and is accessed through the
+// buffer-pool and row-page-index latch protocol.
+unsafe impl BufferPage for RowPageIndexNode {
+    const KIND: BufferPageKind = BufferPageKind::RowPageIndexNode;
+}
+
+const _: () = assert_buffer_page::<RowPageIndexNode>();
+
 /// Header metadata for one in-memory row-page-index node.
-#[derive(Clone)]
+#[repr(C)]
+#[derive(Clone, FromBytes, IntoBytes, KnownLayout, Immutable)]
 pub struct RowPageIndexNodeHeader {
     // height of the node
     pub height: u32,
@@ -1643,6 +1652,7 @@ mod tests {
             {
                 let root = pool
                     .get_page_spin::<RowPageIndexNode>(&pool_guard, blk_idx.root_page_id())
+                    .expect("buffer-pool read failed in test")
                     .lock_shared_async()
                     .await
                     .unwrap();

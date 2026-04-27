@@ -5,7 +5,7 @@ pub use ops::*;
 pub use vector_scan::*;
 
 use crate::bitmap::bitmap_required_units;
-use crate::buffer::page::{BufferPage, PAGE_SIZE};
+use crate::buffer::page::{BufferPage, BufferPageKind, PAGE_SIZE, assert_buffer_page, sealed};
 use crate::catalog::TableMetadata;
 use crate::layout;
 use crate::value::*;
@@ -18,6 +18,7 @@ use zerocopy::byteorder::little_endian::{
     F32 as LeF32, F64 as LeF64, I16 as LeI16, I32 as LeI32, I64 as LeI64, U16 as LeU16,
     U32 as LeU32, U64 as LeU64,
 };
+use zerocopy_derive::{FromBytes, IntoBytes, KnownLayout};
 
 pub type RowID = u64;
 /// Borrowed or owned row-page null bitmap words.
@@ -49,7 +50,8 @@ const _: () = assert!(
 /// | col_offset_list_offset  | 2         |
 /// | fix_field_offset        | 2         |
 /// | fix_field_end           | 2         |
-/// | padding                 | 6         |
+/// | approx_deleted          | 2         |
+/// | padding                 | 4         |
 /// |-------------------------|-----------|
 /// ```
 ///
@@ -70,10 +72,54 @@ const _: () = assert!(
 /// | var_len_data     | data of var-len column                        |
 /// |------------------|-----------------------------------------------|
 /// ```
+#[repr(C)]
+#[derive(FromBytes, IntoBytes, KnownLayout)]
 pub struct RowPage {
     pub header: RowPageHeader,
     pub data: [u8; PAGE_SIZE - mem::size_of::<RowPageHeader>()],
 }
+
+const ROW_PAGE_HEADER_SIZE: usize = 32;
+
+const _: () = assert!(
+    { mem::size_of::<RowPageHeader>() == ROW_PAGE_HEADER_SIZE },
+    "RowPageHeader should have an explicit 32-byte layout"
+);
+
+const _: () = assert!(
+    { mem::size_of::<RowPage>() == PAGE_SIZE },
+    "RowPage should occupy exactly one buffer page"
+);
+
+const _: () = assert!(
+    { mem::offset_of!(RowPageHeader, start_row_id) == 0 },
+    "RowPageHeader start_row_id offset changed"
+);
+
+const _: () = assert!(
+    { mem::offset_of!(RowPageHeader, row_count_and_var_field_offset) == 8 },
+    "RowPageHeader row_count_and_var_field_offset offset changed"
+);
+
+const _: () = assert!(
+    { mem::offset_of!(RowPageHeader, max_row_count) == 12 },
+    "RowPageHeader max_row_count offset changed"
+);
+
+const _: () = assert!(
+    { mem::offset_of!(RowPageHeader, approx_deleted) == 26 },
+    "RowPageHeader approx_deleted offset changed"
+);
+
+const _: () = assert!(
+    { mem::offset_of!(RowPageHeader, padding) == 28 },
+    "RowPageHeader padding offset changed"
+);
+
+const _: () = assert!(
+    { mem::offset_of!(RowPage, data) == ROW_PAGE_HEADER_SIZE },
+    "RowPage data offset should match RowPageHeader size"
+);
 
 impl RowPage {
     /// Initialize row page.
@@ -992,16 +1038,28 @@ impl RowPage {
                 fix_field_offset: 0,
                 fix_field_end: 0,
                 approx_deleted: AtomicU16::new(0),
-                padding: [0; 6],
+                padding: [0; 4],
             },
             data: [0; PAGE_SIZE - mem::size_of::<RowPageHeader>()],
         }
     }
 }
 
-impl BufferPage for RowPage {}
+impl sealed::Sealed for RowPage {}
 
+// SAFETY: `RowPage` is a native in-process page image with explicit `repr(C)`
+// layout, exactly one page of storage, no drop glue, and zero-valid atomic and
+// byte fields. Interior mutation is coordinated by row/page protocols and the
+// buffer-pool latch state.
+unsafe impl BufferPage for RowPage {
+    const KIND: BufferPageKind = BufferPageKind::RowPage;
+}
+
+const _: () = assert_buffer_page::<RowPage>();
+
+/// Native header stored at the front of every in-memory row page.
 #[repr(C)]
+#[derive(FromBytes, IntoBytes, KnownLayout)]
 pub struct RowPageHeader {
     pub start_row_id: u64,
     // higher two bytes is row count.
@@ -1017,7 +1075,7 @@ pub struct RowPageHeader {
     // approximate deleted count, used by checkpoint thread
     // to estimate row count to migrate.
     pub approx_deleted: AtomicU16,
-    padding: [u8; 6],
+    padding: [u8; 4],
 }
 
 impl RowPageHeader {
@@ -1608,6 +1666,27 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_row_page_layout_contract() {
+        assert_eq!(mem::size_of::<RowPageHeader>(), 32);
+        assert_eq!(mem::size_of::<RowPage>(), PAGE_SIZE);
+        assert_eq!(mem::offset_of!(RowPageHeader, start_row_id), 0);
+        assert_eq!(
+            mem::offset_of!(RowPageHeader, row_count_and_var_field_offset),
+            8
+        );
+        assert_eq!(mem::offset_of!(RowPageHeader, max_row_count), 12);
+        assert_eq!(mem::offset_of!(RowPageHeader, col_count), 14);
+        assert_eq!(mem::offset_of!(RowPageHeader, del_bitmap_offset), 16);
+        assert_eq!(mem::offset_of!(RowPageHeader, null_bitmap_list_offset), 18);
+        assert_eq!(mem::offset_of!(RowPageHeader, col_offset_list_offset), 20);
+        assert_eq!(mem::offset_of!(RowPageHeader, fix_field_offset), 22);
+        assert_eq!(mem::offset_of!(RowPageHeader, fix_field_end), 24);
+        assert_eq!(mem::offset_of!(RowPageHeader, approx_deleted), 26);
+        assert_eq!(mem::offset_of!(RowPageHeader, padding), 28);
+        assert_eq!(mem::offset_of!(RowPage, data), 32);
+    }
+
+    #[test]
     fn test_estimate_max_row_count() {
         for row_len in (100..600).step_by(100) {
             for col_count in 1..6 {
@@ -1649,6 +1728,7 @@ mod tests {
         assert!(page.header.fix_field_offset.is_multiple_of(8));
         assert!(page.header.fix_field_end.is_multiple_of(8));
         assert!(page.header.var_field_offset().is_multiple_of(8));
+        assert_eq!(page.header.var_field_offset(), PAGE_SIZE - 32);
     }
 
     #[test]
