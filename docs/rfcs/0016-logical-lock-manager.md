@@ -4,6 +4,7 @@ title: Logical Lock Manager
 status: draft
 tags: [storage, transaction, ddl, lock]
 created: 2026-04-29
+github_issue: 599
 ---
 
 # RFC-0016: Logical Lock Manager
