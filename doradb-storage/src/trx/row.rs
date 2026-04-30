@@ -3,8 +3,8 @@ use crate::buffer::page::VersionedPageID;
 use crate::catalog::{TableID, TableMetadata};
 use crate::row::ops::{ReadRow, SelectKey, UndoCol, UndoVal, UpdateCol, UpdateRow};
 use crate::row::{Row, RowID, RowMut, RowPage, RowRead};
-use crate::stmt::StmtEffects;
 use crate::trx::recover::RecoverMap;
+use crate::trx::stmt::StmtEffects;
 use crate::trx::undo::{
     IndexBranch, IndexBranchTarget, MainBranch, NextRowUndo, OwnedRowUndo, RowUndoHead,
     RowUndoKind, RowUndoRef, UndoStatus,

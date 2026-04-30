@@ -265,7 +265,10 @@ impl TransactionSystem {
         let gc_no = trx.gc_no();
         let pool_guards = trx
             .pool_guards()
-            .expect("transaction rollback requires session pool guards")
+            .ok_or_else(|| {
+                Report::new(InternalError::ActiveTransactionDiscarded)
+                    .attach("operation=rollback active transaction")
+            })?
             .clone();
         let mut table_cache = TableCache::new(&self.catalog);
         if trx
@@ -778,13 +781,15 @@ mod tests {
             let mut session = engine.try_new_session().unwrap();
             let s = [1u8; 196];
             for i in 0..COUNT {
-                let trx = session.try_begin_trx().unwrap().unwrap();
-                let mut stmt = trx.start_stmt();
-                let insert = vec![Val::from(i as i32), Val::from(&s[..])];
-                let (ctx, effects) = stmt.ctx_and_effects_mut();
-                let res = table.accessor().insert_mvcc(ctx, effects, insert).await;
-                assert!(res.is_ok());
-                let trx = stmt.succeed();
+                let mut trx = session.try_begin_trx().unwrap().unwrap();
+                trx.exec(async |stmt| {
+                    let insert = vec![Val::from(i as i32), Val::from(&s[..])];
+                    let (ctx, effects) = stmt.ctx_and_effects_mut();
+                    table.accessor().insert_mvcc(ctx, effects, insert).await?;
+                    Ok(())
+                })
+                .await
+                .unwrap();
                 trx.commit().await.unwrap();
             }
             drop(session);

@@ -15,7 +15,6 @@ use crate::row::ops::{
     UpdateCol, UpdateIndex, UpdateMvcc, UpdateRow,
 };
 use crate::row::{Row, RowID, RowPage, RowRead, estimate_max_row_count, var_len_for_insert};
-use crate::stmt::StmtEffects;
 use crate::table::{
     ColumnDeletionBuffer, ColumnStorage, DeleteInternal, DeleteMarker, DeletionError,
     GenericMemTable, InsertRowIntoPage, Table, TableRootSnapshot, UpdateRowInplace,
@@ -26,6 +25,7 @@ use crate::trx::redo::{RowRedo, RowRedoKind};
 use crate::trx::row::{
     FindOldVersion, LockRowForWrite, LockUndo, ReadAllRows, RowReadAccess, RowWriteAccess,
 };
+use crate::trx::stmt::StmtEffects;
 use crate::trx::undo::{IndexBranch, IndexBranchTarget, OwnedRowUndo, RowUndoKind};
 use crate::trx::ver_map::RowPageState;
 use crate::trx::{MIN_SNAPSHOT_TS, TrxContext, TrxID, trx_is_committed};

@@ -1520,13 +1520,15 @@ mod tests {
             {
                 for i in 0..SIZE {
                     let mut trx = session.try_begin_trx().unwrap().unwrap();
-                    let mut stmt = trx.start_stmt();
-                    let s = format!("{}", i);
-                    let insert = vec![Val::from(i), Val::from(&s[..])];
-                    let (ctx, effects) = stmt.ctx_and_effects_mut();
-                    let res = table.accessor().insert_mvcc(ctx, effects, insert).await;
-                    debug_assert!(res.is_ok());
-                    trx = stmt.succeed();
+                    trx.exec(async |stmt| {
+                        let s = format!("{}", i);
+                        let insert = vec![Val::from(i), Val::from(&s[..])];
+                        let (ctx, effects) = stmt.ctx_and_effects_mut();
+                        table.accessor().insert_mvcc(ctx, effects, insert).await?;
+                        Ok(())
+                    })
+                    .await
+                    .unwrap();
                     trx.commit().await.unwrap();
                 }
             }
@@ -1593,13 +1595,15 @@ mod tests {
             {
                 for i in 0..SIZE {
                     let mut trx = session.try_begin_trx().unwrap().unwrap();
-                    let mut stmt = trx.start_stmt();
-                    let s = format!("{}", i);
-                    let insert = vec![Val::from(i), Val::from(&s[..])];
-                    let (ctx, effects) = stmt.ctx_and_effects_mut();
-                    let res = table.accessor().insert_mvcc(ctx, effects, insert).await;
-                    debug_assert!(res.is_ok());
-                    trx = stmt.succeed();
+                    trx.exec(async |stmt| {
+                        let s = format!("{}", i);
+                        let insert = vec![Val::from(i), Val::from(&s[..])];
+                        let (ctx, effects) = stmt.ctx_and_effects_mut();
+                        table.accessor().insert_mvcc(ctx, effects, insert).await?;
+                        Ok(())
+                    })
+                    .await
+                    .unwrap();
                     trx.commit().await.unwrap();
                 }
             }

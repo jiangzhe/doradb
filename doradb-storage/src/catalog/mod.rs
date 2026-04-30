@@ -1067,14 +1067,18 @@ pub mod tests {
 
             let table = engine.catalog().get_table(table_id).await.unwrap();
             let mut session = engine.try_new_session().unwrap();
-            let mut stmt = session.try_begin_trx().unwrap().unwrap().start_stmt();
-            let (ctx, effects) = stmt.ctx_and_effects_mut();
-            let res = table
-                .accessor()
-                .insert_mvcc(ctx, effects, vec![Val::I32(7)])
-                .await;
-            assert!(res.is_ok());
-            stmt.succeed().commit().await.unwrap();
+            let mut trx = session.try_begin_trx().unwrap().unwrap();
+            trx.exec(async |stmt| {
+                let (ctx, effects) = stmt.ctx_and_effects_mut();
+                table
+                    .accessor()
+                    .insert_mvcc(ctx, effects, vec![Val::I32(7)])
+                    .await?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+            trx.commit().await.unwrap();
 
             engine
                 .catalog()
@@ -1176,23 +1180,31 @@ pub mod tests {
 
             let mut session = engine.try_new_session().unwrap();
 
-            let mut stmt = session.try_begin_trx().unwrap().unwrap().start_stmt();
-            let (ctx, effects) = stmt.ctx_and_effects_mut();
-            let res = checkpointed_table
-                .accessor()
-                .insert_mvcc(ctx, effects, vec![Val::I32(7)])
-                .await;
-            assert!(res.is_ok());
-            stmt.succeed().commit().await.unwrap();
+            let mut trx = session.try_begin_trx().unwrap().unwrap();
+            trx.exec(async |stmt| {
+                let (ctx, effects) = stmt.ctx_and_effects_mut();
+                checkpointed_table
+                    .accessor()
+                    .insert_mvcc(ctx, effects, vec![Val::I32(7)])
+                    .await?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+            trx.commit().await.unwrap();
 
-            let mut stmt = session.try_begin_trx().unwrap().unwrap().start_stmt();
-            let (ctx, effects) = stmt.ctx_and_effects_mut();
-            let res = replay_only_table
-                .accessor()
-                .insert_mvcc(ctx, effects, vec![Val::I32(9), Val::from("replay-backed")])
-                .await;
-            assert!(res.is_ok());
-            stmt.succeed().commit().await.unwrap();
+            let mut trx = session.try_begin_trx().unwrap().unwrap();
+            trx.exec(async |stmt| {
+                let (ctx, effects) = stmt.ctx_and_effects_mut();
+                replay_only_table
+                    .accessor()
+                    .insert_mvcc(ctx, effects, vec![Val::I32(9), Val::from("replay-backed")])
+                    .await?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+            trx.commit().await.unwrap();
 
             checkpointed_table.freeze(&session, usize::MAX).await;
             let mut checkpoint_session = engine.try_new_session().unwrap();

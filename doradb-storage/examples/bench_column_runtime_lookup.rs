@@ -145,18 +145,20 @@ async fn insert_rows(table: &Arc<Table>, session: &mut Session, rows: usize) {
     let mut trx = session.try_begin_trx().unwrap().unwrap();
     for idx in 0..rows {
         let name = format!("name-{idx}");
-        let mut stmt = trx.start_stmt();
-        let (ctx, effects) = stmt.ctx_and_effects_mut();
-        let res = table
-            .accessor()
-            .insert_mvcc(
-                ctx,
-                effects,
-                vec![Val::from(idx as i32), Val::from(&name[..])],
-            )
-            .await;
-        assert!(res.is_ok());
-        trx = stmt.succeed();
+        trx.exec(async |stmt| {
+            let (ctx, effects) = stmt.ctx_and_effects_mut();
+            table
+                .accessor()
+                .insert_mvcc(
+                    ctx,
+                    effects,
+                    vec![Val::from(idx as i32), Val::from(&name[..])],
+                )
+                .await?;
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
     trx.commit().await.unwrap();
 }
@@ -165,14 +167,17 @@ async fn delete_rows(table: &Arc<Table>, session: &mut Session, rows: usize, str
     let mut trx = session.try_begin_trx().unwrap().unwrap();
     for idx in (0..rows).step_by(stride) {
         let key = SelectKey::new(0, vec![Val::from(idx as i32)]);
-        let mut stmt = trx.start_stmt();
-        let (ctx, effects) = stmt.ctx_and_effects_mut();
-        let res = table
-            .accessor()
-            .delete_unique_mvcc(ctx, effects, &key, false)
-            .await;
-        assert!(matches!(res, Ok(DeleteMvcc::Deleted)));
-        trx = stmt.succeed();
+        trx.exec(async |stmt| {
+            let (ctx, effects) = stmt.ctx_and_effects_mut();
+            let res = table
+                .accessor()
+                .delete_unique_mvcc(ctx, effects, &key, false)
+                .await?;
+            assert!(matches!(res, DeleteMvcc::Deleted));
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
     trx.commit().await.unwrap();
 }
@@ -219,18 +224,23 @@ fn bench_parallel(case: &BenchmarkCase, threads: usize, iterations_per_thread: u
                     let mut trx = session.try_begin_trx().unwrap().unwrap();
                     for step in 0..iterations_per_thread {
                         let key = &keys[(worker_idx + step * threads) % keys.len()];
-                        let stmt = trx.start_stmt();
-                        let res = table
-                            .accessor()
-                            .index_lookup_unique_mvcc(stmt.ctx(), key, &READ_SET)
+                        let vals = trx
+                            .exec(async |stmt| {
+                                let res = table
+                                    .accessor()
+                                    .index_lookup_unique_mvcc(stmt.ctx(), key, &READ_SET)
+                                    .await?;
+                                let vals = match res {
+                                    SelectMvcc::Found(vals) => vals,
+                                    SelectMvcc::NotFound => {
+                                        panic!("benchmark key unexpectedly missing")
+                                    }
+                                };
+                                Ok(vals)
+                            })
                             .await
                             .unwrap();
-                        let vals = match res {
-                            SelectMvcc::Found(vals) => vals,
-                            SelectMvcc::NotFound => panic!("benchmark key unexpectedly missing"),
-                        };
                         black_box(vals);
-                        trx = stmt.succeed();
                     }
                     trx.commit().await.unwrap();
                     drop(session);

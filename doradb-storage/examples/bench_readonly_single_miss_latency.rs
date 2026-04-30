@@ -191,19 +191,24 @@ fn main() {
         let mut cold_checksum = 0u64;
         let mut trx = session.try_begin_trx().unwrap().unwrap();
         for (idx, key) in keys.iter().enumerate() {
-            let stmt = trx.start_stmt();
-            let res = table
-                .accessor()
-                .index_lookup_unique_mvcc(stmt.ctx(), key, &READ_SET)
+            let vals = trx
+                .exec(async |stmt| {
+                    let res = table
+                        .accessor()
+                        .index_lookup_unique_mvcc(stmt.ctx(), key, &READ_SET)
+                        .await?;
+                    let vals = match res {
+                        SelectMvcc::Found(vals) => vals,
+                        SelectMvcc::NotFound => {
+                            panic!("cold benchmark key unexpectedly missing")
+                        }
+                    };
+                    Ok(vals)
+                })
                 .await
                 .unwrap();
-            let vals = match res {
-                SelectMvcc::Found(vals) => vals,
-                SelectMvcc::NotFound => panic!("cold benchmark key unexpectedly missing"),
-            };
             black_box(vals);
             cold_checksum ^= idx as u64;
-            trx = stmt.succeed();
         }
         trx.commit().await.unwrap();
         let cold_elapsed = cold_start.elapsed();
@@ -228,19 +233,24 @@ fn main() {
         for _ in 0..args.warm_reads {
             let idx = (rng.next_u64() % args.rows as u64) as usize;
             let key = &keys[idx];
-            let stmt = trx.start_stmt();
-            let res = table
-                .accessor()
-                .index_lookup_unique_mvcc(stmt.ctx(), key, &READ_SET)
+            let vals = trx
+                .exec(async |stmt| {
+                    let res = table
+                        .accessor()
+                        .index_lookup_unique_mvcc(stmt.ctx(), key, &READ_SET)
+                        .await?;
+                    let vals = match res {
+                        SelectMvcc::Found(vals) => vals,
+                        SelectMvcc::NotFound => {
+                            panic!("warm benchmark key unexpectedly missing")
+                        }
+                    };
+                    Ok(vals)
+                })
                 .await
                 .unwrap();
-            let vals = match res {
-                SelectMvcc::Found(vals) => vals,
-                SelectMvcc::NotFound => panic!("warm benchmark key unexpectedly missing"),
-            };
             black_box(vals);
             warm_checksum ^= idx as u64;
-            trx = stmt.succeed();
         }
         trx.commit().await.unwrap();
         let warm_elapsed = warm_start.elapsed();
@@ -271,14 +281,16 @@ fn build_keys(rows: usize) -> Vec<SelectKey> {
 async fn insert_rows(table: &Arc<Table>, session: &mut Session, rows: usize) {
     let mut trx = session.try_begin_trx().unwrap().unwrap();
     for idx in 0..rows {
-        let mut stmt = trx.start_stmt();
-        let (ctx, effects) = stmt.ctx_and_effects_mut();
-        let res = table
-            .accessor()
-            .insert_mvcc(ctx, effects, vec![Val::from(idx as i32)])
-            .await;
-        assert!(res.is_ok());
-        trx = stmt.succeed();
+        trx.exec(async |stmt| {
+            let (ctx, effects) = stmt.ctx_and_effects_mut();
+            table
+                .accessor()
+                .insert_mvcc(ctx, effects, vec![Val::from(idx as i32)])
+                .await?;
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
     trx.commit().await.unwrap();
 }

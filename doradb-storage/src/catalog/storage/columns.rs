@@ -6,8 +6,8 @@ use crate::catalog::table::TableMetadata;
 use crate::catalog::{ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexSpec, TableID};
 use crate::row::ops::{DeleteMvcc, SelectKey};
 use crate::row::{Row, RowRead};
-use crate::stmt::Statement;
 use crate::table::TableAccess;
+use crate::trx::stmt::Statement;
 use crate::value::Val;
 use crate::value::ValKind;
 use semistr::SemiStr;
@@ -111,7 +111,7 @@ pub struct Columns<'a> {
 
 impl Columns<'_> {
     /// Insert a column.
-    pub async fn insert(&self, stmt: &mut Statement, obj: &ColumnObject) -> bool {
+    pub async fn insert(&self, stmt: &mut Statement<'_>, obj: &ColumnObject) -> bool {
         let cols = vec![
             Val::from(obj.table_id),
             Val::from(obj.column_no),
@@ -155,7 +155,7 @@ impl Columns<'_> {
     /// Delete a column by (table_id, column_no).
     pub async fn delete_by_id(
         &self,
-        stmt: &mut Statement,
+        stmt: &mut Statement<'_>,
         table_id: TableID,
         column_no: u16,
     ) -> bool {
@@ -213,51 +213,61 @@ mod tests {
                 column_attributes: ColumnAttributes::empty(),
             };
 
-            let mut stmt = session.try_begin_trx().unwrap().unwrap().start_stmt();
-            assert!(
-                engine
-                    .catalog()
-                    .storage
-                    .columns()
-                    .insert(&mut stmt, &col_42_0)
-                    .await
-            );
-            assert!(
-                engine
-                    .catalog()
-                    .storage
-                    .columns()
-                    .insert(&mut stmt, &col_42_1)
-                    .await
-            );
-            assert!(
-                engine
-                    .catalog()
-                    .storage
-                    .columns()
-                    .insert(&mut stmt, &col_43_0)
-                    .await
-            );
-            stmt.succeed().commit().await.unwrap();
+            let mut trx = session.try_begin_trx().unwrap().unwrap();
+            trx.exec(async |stmt| {
+                assert!(
+                    engine
+                        .catalog()
+                        .storage
+                        .columns()
+                        .insert(stmt, &col_42_0)
+                        .await
+                );
+                assert!(
+                    engine
+                        .catalog()
+                        .storage
+                        .columns()
+                        .insert(stmt, &col_42_1)
+                        .await
+                );
+                assert!(
+                    engine
+                        .catalog()
+                        .storage
+                        .columns()
+                        .insert(stmt, &col_43_0)
+                        .await
+                );
+                Ok(())
+            })
+            .await
+            .unwrap();
+            trx.commit().await.unwrap();
 
-            let mut stmt = session.try_begin_trx().unwrap().unwrap().start_stmt();
-            assert!(
-                engine
-                    .catalog()
-                    .storage
-                    .columns()
-                    .delete_by_id(&mut stmt, 42, 1)
-                    .await
-            );
-            assert!(
-                !engine
-                    .catalog()
-                    .storage
-                    .columns()
-                    .delete_by_id(&mut stmt, 42, 9)
-                    .await
-            );
-            stmt.succeed().commit().await.unwrap();
+            let mut trx = session.try_begin_trx().unwrap().unwrap();
+            trx.exec(async |stmt| {
+                assert!(
+                    engine
+                        .catalog()
+                        .storage
+                        .columns()
+                        .delete_by_id(stmt, 42, 1)
+                        .await
+                );
+                assert!(
+                    !engine
+                        .catalog()
+                        .storage
+                        .columns()
+                        .delete_by_id(stmt, 42, 9)
+                        .await
+                );
+                Ok(())
+            })
+            .await
+            .unwrap();
+            trx.commit().await.unwrap();
 
             let cols_42 = engine
                 .catalog()
@@ -277,32 +287,37 @@ mod tests {
             assert_eq!(cols_43.len(), 1);
             assert_eq!(cols_43[0].column_no, 0);
 
-            let mut stmt = session.try_begin_trx().unwrap().unwrap().start_stmt();
-            assert!(
-                !engine
-                    .catalog()
-                    .storage
-                    .columns()
-                    .delete_by_id(&mut stmt, 42, 1)
-                    .await
-            );
-            assert!(
-                engine
-                    .catalog()
-                    .storage
-                    .columns()
-                    .delete_by_id(&mut stmt, 42, 0)
-                    .await
-            );
-            assert!(
-                engine
-                    .catalog()
-                    .storage
-                    .columns()
-                    .delete_by_id(&mut stmt, 43, 0)
-                    .await
-            );
-            stmt.succeed().commit().await.unwrap();
+            let mut trx = session.try_begin_trx().unwrap().unwrap();
+            trx.exec(async |stmt| {
+                assert!(
+                    !engine
+                        .catalog()
+                        .storage
+                        .columns()
+                        .delete_by_id(stmt, 42, 1)
+                        .await
+                );
+                assert!(
+                    engine
+                        .catalog()
+                        .storage
+                        .columns()
+                        .delete_by_id(stmt, 42, 0)
+                        .await
+                );
+                assert!(
+                    engine
+                        .catalog()
+                        .storage
+                        .columns()
+                        .delete_by_id(stmt, 43, 0)
+                        .await
+                );
+                Ok(())
+            })
+            .await
+            .unwrap();
+            trx.commit().await.unwrap();
 
             assert!(
                 engine
