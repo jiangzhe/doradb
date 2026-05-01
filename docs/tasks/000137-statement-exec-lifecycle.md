@@ -1,7 +1,7 @@
 ---
 id: 000137
 title: Statement Exec Lifecycle
-status: proposal
+status: implemented
 created: 2026-04-30
 github_issue: 602
 ---
@@ -247,25 +247,87 @@ Reference:
 
 ## Implementation Notes
 
+Implemented the statement execution lifecycle cleanup.
+
+- Added `ActiveTrx::exec(async |stmt| { ... })` as the statement execution
+  boundary. Successful callbacks merge statement-local row undo, index undo,
+  and redo into the active transaction, while ordinary callback errors roll
+  back only the current statement's effects and return the original error.
+- Converted `Statement` into a borrowed facade over `&TrxContext` and
+  `&mut StmtEffects`, removed public manual lifecycle APIs, and migrated
+  catalog, session, recovery, purge, transaction-log, table test, and example
+  call sites from `start_stmt` / `succeed` / `fail` to `exec`.
+- Moved the statement module from `doradb-storage/src/stmt/mod.rs` to
+  `doradb-storage/src/trx/stmt.rs`, removed the crate-root `stmt` module, and
+  kept statement test-only hooks and fault-injection helpers inside the same
+  file's `#[cfg(test)] mod tests`.
+- Added fatal rollback-discard handling for statement rollback failures. If
+  row or index rollback cannot access required storage, storage is poisoned
+  with `FatalError::RollbackAccess`, the active transaction is detached from
+  its session, and later `commit()` or `rollback()` on that handle returns
+  `InternalError::ActiveTransactionDiscarded` instead of panicking.
+- Adjusted statement rollback order so index undo rolls back before row undo,
+  preventing secondary-index entries from continuing to point at uncommitted
+  row state while row undo is unwound.
+- Added a `StmtEffects` leak guard so non-empty statement effects cannot be
+  silently dropped outside the normal success/error cleanup path. The public
+  `ActiveTrx::exec` documentation records that a polled statement future must
+  be driven to completion because async rollback cannot be performed from
+  `Drop`.
+- Updated `docs/transaction-system.md` to describe statement execution as an
+  internally managed subtransaction boundary.
+- Refreshed `docs/unsafe-usage-baseline.md` after moving the statement module
+  under `trx`. No unsafe code was added or changed; the `trx` module file count
+  changed because the statement file moved.
+- Added regression coverage for effect merge, ordinary statement error
+  rollback, fatal row/index rollback discard behavior, commit/rollback after
+  fatal discard, statement-effect leak detection, and index-before-row
+  statement rollback ordering.
+
+Validation:
+
+- `cargo fmt --all`
+- `cargo check -p doradb-storage --all-targets`
+- `cargo clippy -p doradb-storage --all-targets -- -D warnings`
+- `cargo nextest run -p doradb-storage trx::stmt trx::tests::`
+- `cargo nextest run -p doradb-storage` passed with `644/644` tests.
+- `tools/coverage_focus.rs --path doradb-storage/src/trx` reported
+  `7156/7598` lines, `94.18%`.
+- `tools/coverage_focus.rs --path doradb-storage/src/trx/stmt.rs` reported
+  `208/208` lines, `100.00%`.
+
+Review/traceability:
+
+- task issue: `#602`
+- implementation PR: `#603`
+- post-implementation checklist completed during resolve with no unresolved
+  required fixes.
+- resolve sync ran
+  `tools/task.rs resolve-task-next-id --task docs/tasks/000137-statement-exec-lifecycle.md`
+  and advanced `docs/tasks/next-id` to `000138`.
+- RFC-0015 was treated as design context only. This task is separate from the
+  RFC implementation phases, so no RFC document update is part of resolve.
+
 ## Impacts
 
 - `doradb-storage/src/trx/mod.rs`: add `ActiveTrx::exec`, remove
   `start_stmt`, update terminal checked engine/session access, and preserve
   transaction effect merge behavior.
-- `doradb-storage/src/stmt/mod.rs`: convert `Statement` to a borrowed facade,
-  remove public lifecycle methods, add or preserve effect cleanup helpers, and
-  add a non-empty-effect drop guard.
-- `doradb-storage/src/trx/sys.rs`: may need small helper changes if active
-  rollback or fatal discard needs a clearer invalid-transaction path.
+- `doradb-storage/src/trx/stmt.rs`: host the moved statement module, convert
+  `Statement` to a borrowed facade, remove public lifecycle methods, preserve
+  effect cleanup helpers, add a non-empty-effect drop guard, and keep
+  statement-specific test hooks under the local test module.
+- `doradb-storage/src/lib.rs`: remove the crate-root `stmt` module export.
+- `doradb-storage/src/trx/sys.rs`: migrate transaction-system tests and
+  helpers from manual statement lifecycle calls to `ActiveTrx::exec`.
 - `doradb-storage/src/session.rs`: migrate DDL statement handling so catalog
   changes run inside `ActiveTrx::exec`.
 - `doradb-storage/src/catalog/storage/tables.rs`,
   `doradb-storage/src/catalog/storage/columns.rs`, and
   `doradb-storage/src/catalog/storage/indexes.rs`: update statement helper
   signatures for the borrowed statement lifetime.
-- `doradb-storage/src/table/access.rs`: no trait signature change expected,
-  but may need type annotations or imports because `Statement` now has a
-  lifetime parameter.
+- `doradb-storage/src/table/access.rs`: update statement imports for the moved
+  `trx::stmt` module without changing the `TableAccess` trait signatures.
 - `doradb-storage/src/trx/recover.rs`, `doradb-storage/src/trx/purge.rs`,
   `doradb-storage/src/trx/log.rs`, and `doradb-storage/src/trx/sys.rs`: migrate
   test/recovery helpers from manual `start_stmt` / `succeed` / `fail` flows.
