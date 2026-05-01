@@ -8,8 +8,8 @@ use crate::catalog::{
 };
 use crate::row::ops::{DeleteMvcc, SelectKey};
 use crate::row::{Row, RowRead};
-use crate::stmt::Statement;
 use crate::table::TableAccess;
+use crate::trx::stmt::Statement;
 use crate::value::Val;
 use crate::value::ValKind;
 use semistr::SemiStr;
@@ -99,7 +99,7 @@ pub struct Indexes<'a> {
 
 impl Indexes<'_> {
     /// Insert an index.
-    pub async fn insert(&self, stmt: &mut Statement, obj: &IndexObject) -> bool {
+    pub async fn insert(&self, stmt: &mut Statement<'_>, obj: &IndexObject) -> bool {
         let cols = vec![
             Val::from(obj.table_id),
             Val::from(obj.index_no),
@@ -117,7 +117,7 @@ impl Indexes<'_> {
     /// Delete an index by (table_id, index_no).
     pub async fn delete_by_id(
         &self,
-        stmt: &mut Statement,
+        stmt: &mut Statement<'_>,
         table_id: TableID,
         index_no: u16,
     ) -> bool {
@@ -271,7 +271,7 @@ pub struct IndexColumns<'a> {
 
 impl IndexColumns<'_> {
     /// Insert one index-column mapping row.
-    pub async fn insert(&self, stmt: &mut Statement, obj: &IndexColumnObject) -> bool {
+    pub async fn insert(&self, stmt: &mut Statement<'_>, obj: &IndexColumnObject) -> bool {
         let cols = vec![
             Val::from(obj.table_id),
             Val::from(obj.index_no),
@@ -292,7 +292,7 @@ impl IndexColumns<'_> {
     /// This is not implemented yet and currently always panics.
     pub async fn delete_by_index(
         &self,
-        _stmt: &mut Statement,
+        _stmt: &mut Statement<'_>,
         _table_id: TableID,
         _index_no: u16,
     ) -> bool {
@@ -365,51 +365,61 @@ mod tests {
                 index_attributes: IndexAttributes::PK,
             };
 
-            let mut stmt = session.try_begin_trx().unwrap().unwrap().start_stmt();
-            assert!(
-                engine
-                    .catalog()
-                    .storage
-                    .indexes()
-                    .insert(&mut stmt, &idx_42_0)
-                    .await
-            );
-            assert!(
-                engine
-                    .catalog()
-                    .storage
-                    .indexes()
-                    .insert(&mut stmt, &idx_42_1)
-                    .await
-            );
-            assert!(
-                engine
-                    .catalog()
-                    .storage
-                    .indexes()
-                    .insert(&mut stmt, &idx_43_0)
-                    .await
-            );
-            stmt.succeed().commit().await.unwrap();
+            let mut trx = session.try_begin_trx().unwrap().unwrap();
+            trx.exec(async |stmt| {
+                assert!(
+                    engine
+                        .catalog()
+                        .storage
+                        .indexes()
+                        .insert(stmt, &idx_42_0)
+                        .await
+                );
+                assert!(
+                    engine
+                        .catalog()
+                        .storage
+                        .indexes()
+                        .insert(stmt, &idx_42_1)
+                        .await
+                );
+                assert!(
+                    engine
+                        .catalog()
+                        .storage
+                        .indexes()
+                        .insert(stmt, &idx_43_0)
+                        .await
+                );
+                Ok(())
+            })
+            .await
+            .unwrap();
+            trx.commit().await.unwrap();
 
-            let mut stmt = session.try_begin_trx().unwrap().unwrap().start_stmt();
-            assert!(
-                engine
-                    .catalog()
-                    .storage
-                    .indexes()
-                    .delete_by_id(&mut stmt, 42, 1)
-                    .await
-            );
-            assert!(
-                !engine
-                    .catalog()
-                    .storage
-                    .indexes()
-                    .delete_by_id(&mut stmt, 42, 9)
-                    .await
-            );
-            stmt.succeed().commit().await.unwrap();
+            let mut trx = session.try_begin_trx().unwrap().unwrap();
+            trx.exec(async |stmt| {
+                assert!(
+                    engine
+                        .catalog()
+                        .storage
+                        .indexes()
+                        .delete_by_id(stmt, 42, 1)
+                        .await
+                );
+                assert!(
+                    !engine
+                        .catalog()
+                        .storage
+                        .indexes()
+                        .delete_by_id(stmt, 42, 9)
+                        .await
+                );
+                Ok(())
+            })
+            .await
+            .unwrap();
+            trx.commit().await.unwrap();
 
             let idx_42 = engine
                 .catalog()
@@ -429,32 +439,37 @@ mod tests {
             assert_eq!(idx_43.len(), 1);
             assert_eq!(idx_43[0].index_no, 0);
 
-            let mut stmt = session.try_begin_trx().unwrap().unwrap().start_stmt();
-            assert!(
-                !engine
-                    .catalog()
-                    .storage
-                    .indexes()
-                    .delete_by_id(&mut stmt, 42, 1)
-                    .await
-            );
-            assert!(
-                engine
-                    .catalog()
-                    .storage
-                    .indexes()
-                    .delete_by_id(&mut stmt, 42, 0)
-                    .await
-            );
-            assert!(
-                engine
-                    .catalog()
-                    .storage
-                    .indexes()
-                    .delete_by_id(&mut stmt, 43, 0)
-                    .await
-            );
-            stmt.succeed().commit().await.unwrap();
+            let mut trx = session.try_begin_trx().unwrap().unwrap();
+            trx.exec(async |stmt| {
+                assert!(
+                    !engine
+                        .catalog()
+                        .storage
+                        .indexes()
+                        .delete_by_id(stmt, 42, 1)
+                        .await
+                );
+                assert!(
+                    engine
+                        .catalog()
+                        .storage
+                        .indexes()
+                        .delete_by_id(stmt, 42, 0)
+                        .await
+                );
+                assert!(
+                    engine
+                        .catalog()
+                        .storage
+                        .indexes()
+                        .delete_by_id(stmt, 43, 0)
+                        .await
+                );
+                Ok(())
+            })
+            .await
+            .unwrap();
+            trx.commit().await.unwrap();
 
             assert!(
                 engine

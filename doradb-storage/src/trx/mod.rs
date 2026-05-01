@@ -22,6 +22,7 @@ pub mod purge;
 pub mod recover;
 pub mod redo;
 pub mod row;
+pub mod stmt;
 pub mod sys;
 pub mod sys_trx;
 pub mod undo;
@@ -30,15 +31,15 @@ pub mod ver_map;
 use crate::buffer::PageID;
 use crate::buffer::PoolGuards;
 use crate::buffer::page::VersionedPageID;
-use crate::catalog::TableID;
+use crate::catalog::{TableCache, TableID};
 use crate::engine::EngineRef;
-use crate::error::{OperationError, Result};
+use crate::error::{FatalError, InternalError, OperationError, Result};
 use crate::file::table_file::OldRoot;
 use crate::row::RowID;
 use crate::session::SessionState;
-use crate::stmt::Statement;
 use crate::trx::log_replay::TrxLog;
 use crate::trx::redo::{RedoHeader, RedoLogs, RedoTrxKind, RowRedo, RowRedoKind};
+use crate::trx::stmt::{Statement, StmtEffects};
 use crate::trx::undo::{IndexPurgeEntry, IndexUndoLogs, RowUndoHead, RowUndoLogs, UndoStatus};
 use crate::value::Val;
 use error_stack::Report;
@@ -47,6 +48,7 @@ use flume::{Receiver, Sender};
 use parking_lot::Mutex;
 use std::marker::PhantomData;
 use std::mem;
+use std::ops::AsyncFnOnce;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
@@ -479,6 +481,26 @@ impl ActiveTrx {
         &mut self.effects
     }
 
+    #[inline]
+    fn discarded_err(operation: &'static str) -> crate::error::Error {
+        Report::new(InternalError::ActiveTransactionDiscarded)
+            .attach(format!("operation={operation}"))
+            .into()
+    }
+
+    #[inline]
+    fn checked_engine(&self, operation: &'static str) -> Result<EngineRef> {
+        self.engine()
+            .cloned()
+            .ok_or_else(|| Self::discarded_err(operation))
+    }
+
+    #[inline]
+    fn checked_pool_guards(&self, operation: &'static str) -> Result<&PoolGuards> {
+        self.pool_guards()
+            .ok_or_else(|| Self::discarded_err(operation))
+    }
+
     /// Returns reference of the storage engine.
     #[inline]
     pub fn engine(&self) -> Option<&EngineRef> {
@@ -545,10 +567,35 @@ impl ActiveTrx {
         self.effects.index_undo_mut()
     }
 
-    /// Starts a statement.
+    /// Executes one scoped statement callback inside this active transaction.
+    ///
+    /// Successful callbacks merge statement-local row undo, index undo, and
+    /// redo effects into the transaction. Ordinary callback errors roll back
+    /// only the current statement and leave previous successful statements
+    /// transaction-owned. Once the returned future has been polled, callers
+    /// must drive it to completion; dropping a non-empty statement future is
+    /// detected by the `StmtEffects` leak guard rather than repaired by async
+    /// rollback from `Drop`.
     #[inline]
-    pub fn start_stmt(self) -> Statement {
-        Statement::new(self)
+    pub async fn exec<T, F>(&mut self, f: F) -> Result<T>
+    where
+        F: for<'borrow> AsyncFnOnce(&'borrow mut Statement<'_>) -> Result<T>,
+    {
+        let mut effects = StmtEffects::empty();
+        let res = {
+            let mut stmt = Statement::new(self.ctx(), &mut effects);
+            f(&mut stmt).await
+        };
+        match res {
+            Ok(value) => {
+                effects.merge_into_trx(self);
+                Ok(value)
+            }
+            Err(err) => {
+                self.rollback_statement_effects(&mut effects).await?;
+                Err(err)
+            }
+        }
     }
 
     /// Returns whether the transaction is readonly.
@@ -610,6 +657,49 @@ impl ActiveTrx {
         self.ctx.rollback_session();
     }
 
+    /// Rolls back statement-local effects after an ordinary callback error.
+    ///
+    /// Index effects roll back before row effects so index entries stop
+    /// pointing at uncommitted row state before row undo is unwound.
+    #[inline]
+    pub(crate) async fn rollback_statement_effects(
+        &mut self,
+        effects: &mut StmtEffects,
+    ) -> Result<()> {
+        let engine = self.checked_engine("rollback statement effects")?;
+        let pool_guards = self
+            .checked_pool_guards("rollback statement effects")?
+            .clone();
+        let mut table_cache = TableCache::new(engine.catalog());
+        let sts = self.sts();
+        if effects
+            .rollback_index(&mut table_cache, &pool_guards, sts)
+            .await
+            .is_err()
+        {
+            effects.clear_for_discard();
+            self.discard_after_fatal_rollback();
+            return Err(engine
+                .trx_sys
+                .poison_storage(FatalError::RollbackAccess)
+                .into());
+        }
+        if effects
+            .rollback_row(&mut table_cache, &pool_guards, Some(sts))
+            .await
+            .is_err()
+        {
+            effects.clear_for_discard();
+            self.discard_after_fatal_rollback();
+            return Err(engine
+                .trx_sys
+                .poison_storage(FatalError::RollbackAccess)
+                .into());
+        }
+        effects.clear_redo();
+        Ok(())
+    }
+
     /// Prepare current transaction for committing.
     #[inline]
     pub fn prepare(mut self) -> PreparedTrx {
@@ -663,14 +753,14 @@ impl ActiveTrx {
     /// Commit the transaction.
     #[inline]
     pub async fn commit(self) -> Result<TrxID> {
-        let engine = self.engine().cloned().unwrap();
+        let engine = self.checked_engine("commit active transaction")?;
         engine.trx_sys.commit(self).await
     }
 
     /// Rollback the transaction.
     #[inline]
     pub async fn rollback(self) -> Result<()> {
-        let engine = self.engine().cloned().unwrap();
+        let engine = self.checked_engine("rollback active transaction")?;
         engine.trx_sys.rollback(self).await
     }
 
@@ -1180,21 +1270,23 @@ mod tests {
         smol::block_on(async {
             let (_temp_dir, engine) = test_engine("redo_stmt_effect_merge").await;
             let session_state = Arc::new(SessionState::new(engine.new_ref().unwrap()));
-            let trx = ActiveTrx::new(session_state, MIN_ACTIVE_TRX_ID + 45, 45, 0, 0);
-            let mut stmt = Statement::new(trx);
-            let effects = stmt.effects_mut();
-            effects.push_row_undo(OwnedRowUndo::new(12, None, 23, RowUndoKind::Delete));
-            effects.push_delete_index_undo(12, 23, SelectKey::new(0, vec![]), true);
-            effects.insert_row_redo(
-                12,
-                RowRedo {
-                    page_id: PageID::new(0),
-                    row_id: 23,
-                    kind: RowRedoKind::Delete,
-                },
-            );
-
-            let mut trx = stmt.succeed();
+            let mut trx = ActiveTrx::new(session_state, MIN_ACTIVE_TRX_ID + 45, 45, 0, 0);
+            trx.exec(async |stmt| {
+                let effects = stmt.effects_mut();
+                effects.push_row_undo(OwnedRowUndo::new(12, None, 23, RowUndoKind::Delete));
+                effects.push_delete_index_undo(12, 23, SelectKey::new(0, vec![]), true);
+                effects.insert_row_redo(
+                    12,
+                    RowRedo {
+                        page_id: PageID::new(0),
+                        row_id: 23,
+                        kind: RowRedoKind::Delete,
+                    },
+                );
+                Ok(())
+            })
+            .await
+            .unwrap();
             assert!(!trx.readonly());
             assert!(trx.require_durability());
             assert!(trx.require_ordered_commit());
@@ -1203,6 +1295,76 @@ mod tests {
             assert!(!trx.effects.redo.is_empty());
 
             trx.discard_after_fatal_rollback();
+        });
+    }
+
+    #[test]
+    fn test_statement_error_rolls_back_only_statement_effects() {
+        smol::block_on(async {
+            let (_temp_dir, engine) = test_engine("redo_stmt_error_rollback").await;
+            let session_state = Arc::new(SessionState::new(engine.new_ref().unwrap()));
+            let mut trx = ActiveTrx::new(session_state, MIN_ACTIVE_TRX_ID + 49, 49, 0, 0);
+
+            trx.exec(async |stmt| {
+                stmt.effects_mut().insert_row_redo(
+                    12,
+                    RowRedo {
+                        page_id: PageID::new(0),
+                        row_id: 23,
+                        kind: RowRedoKind::Delete,
+                    },
+                );
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+            let res: Result<()> = trx
+                .exec(async |stmt| {
+                    stmt.effects_mut().insert_row_redo(
+                        12,
+                        RowRedo {
+                            page_id: PageID::new(0),
+                            row_id: 24,
+                            kind: RowRedoKind::Delete,
+                        },
+                    );
+                    Err(Report::new(OperationError::NotSupported).into())
+                })
+                .await;
+            let err = res.unwrap_err();
+
+            assert_eq!(err.operation_error(), Some(OperationError::NotSupported));
+            let table_redo = trx.effects.redo.dml.get(&12).unwrap();
+            assert!(table_redo.rows.contains_key(&23));
+            assert!(!table_redo.rows.contains_key(&24));
+
+            trx.discard_after_fatal_rollback();
+        });
+    }
+
+    #[test]
+    fn test_commit_and_rollback_after_fatal_discard_return_error() {
+        smol::block_on(async {
+            let (_temp_dir, engine) = test_engine("redo_trx_discard_errors").await;
+
+            let session_state = Arc::new(SessionState::new(engine.new_ref().unwrap()));
+            let mut trx = ActiveTrx::new(session_state, MIN_ACTIVE_TRX_ID + 50, 50, 0, 0);
+            trx.discard_after_fatal_rollback();
+            let err = trx.commit().await.unwrap_err();
+            assert_eq!(
+                err.downcast_ref::<InternalError>().copied(),
+                Some(InternalError::ActiveTransactionDiscarded)
+            );
+
+            let session_state = Arc::new(SessionState::new(engine.new_ref().unwrap()));
+            let mut trx = ActiveTrx::new(session_state, MIN_ACTIVE_TRX_ID + 51, 51, 0, 0);
+            trx.discard_after_fatal_rollback();
+            let err = trx.rollback().await.unwrap_err();
+            assert_eq!(
+                err.downcast_ref::<InternalError>().copied(),
+                Some(InternalError::ActiveTransactionDiscarded)
+            );
         });
     }
 

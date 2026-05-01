@@ -267,6 +267,8 @@ pub(crate) enum InternalError {
     ColumnBlockIndexInvariant,
     #[error("column deletion blob invariant violated")]
     ColumnDeletionBlobInvariant,
+    #[error("active transaction is discarded")]
+    ActiveTransactionDiscarded,
     #[cfg(test)]
     #[error("injected test failure")]
     InjectedTestFailure,

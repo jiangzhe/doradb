@@ -651,9 +651,9 @@ mod tests {
     use crate::latch::LatchFallbackMode;
     use crate::row::ops::{DeleteMvcc, SelectKey};
     use crate::row::{RowID, RowPage};
-    use crate::stmt::Statement;
     use crate::table::{DeleteMarker, Table, TableAccess};
     use crate::trx::row::RowReadAccess;
+    use crate::trx::stmt::Statement;
     use crate::trx::undo::{OwnedRowUndo, RowUndoKind, RowUndoLogs};
     use crate::trx::{CommittedTrxPayload, MIN_ACTIVE_TRX_ID, SharedTrxStatus};
     use crate::value::Val;
@@ -684,7 +684,7 @@ mod tests {
     }
 
     async fn stmt_insert_row(
-        stmt: &mut Statement,
+        stmt: &mut Statement<'_>,
         table: &Table,
         cols: Vec<Val>,
     ) -> crate::error::Result<RowID> {
@@ -693,7 +693,7 @@ mod tests {
     }
 
     async fn stmt_delete_row(
-        stmt: &mut Statement,
+        stmt: &mut Statement<'_>,
         table: &Table,
         key: &SelectKey,
     ) -> crate::error::Result<DeleteMvcc> {
@@ -806,11 +806,12 @@ mod tests {
             let table = engine.catalog().get_table(table_id).await.unwrap();
             let mut session = engine.try_new_session().unwrap();
             let mut trx = session.try_begin_trx().unwrap().unwrap();
-            let mut stmt = trx.start_stmt();
-            stmt_insert_row(&mut stmt, &table, vec![Val::from(1001i32)])
-                .await
-                .unwrap();
-            trx = stmt.succeed();
+            trx.exec(async |stmt| {
+                stmt_insert_row(stmt, &table, vec![Val::from(1001i32)]).await?;
+                Ok(())
+            })
+            .await
+            .unwrap();
             trx.commit().await.unwrap();
             drop(session);
             let pool_guards = full_pool_guards(&engine);
@@ -894,11 +895,12 @@ mod tests {
             let table = engine.catalog().get_table(table_id).await.unwrap();
             let mut session = engine.try_new_session().unwrap();
             let mut trx = session.try_begin_trx().unwrap().unwrap();
-            let mut stmt = trx.start_stmt();
-            stmt_insert_row(&mut stmt, &table, vec![Val::from(1002i32)])
-                .await
-                .unwrap();
-            trx = stmt.succeed();
+            trx.exec(async |stmt| {
+                stmt_insert_row(stmt, &table, vec![Val::from(1002i32)]).await?;
+                Ok(())
+            })
+            .await
+            .unwrap();
             trx.commit().await.unwrap();
             drop(session);
             let pool_guards = full_pool_guards(&engine);
@@ -986,11 +988,12 @@ mod tests {
             let table = engine.catalog().get_table(table_id).await.unwrap();
             let mut session = engine.try_new_session().unwrap();
             let mut trx = session.try_begin_trx().unwrap().unwrap();
-            let mut stmt = trx.start_stmt();
-            stmt_insert_row(&mut stmt, &table, vec![Val::from(1003i32)])
-                .await
-                .unwrap();
-            trx = stmt.succeed();
+            trx.exec(async |stmt| {
+                stmt_insert_row(stmt, &table, vec![Val::from(1003i32)]).await?;
+                Ok(())
+            })
+            .await
+            .unwrap();
             trx.commit().await.unwrap();
             drop(session);
             let pool_guards = full_pool_guards(&engine);
@@ -1092,11 +1095,12 @@ mod tests {
             let table = engine.catalog().get_table(table_id).await.unwrap();
             let mut session = engine.try_new_session().unwrap();
             let mut trx = session.try_begin_trx().unwrap().unwrap();
-            let mut stmt = trx.start_stmt();
-            stmt_insert_row(&mut stmt, &table, vec![Val::from(1004i32)])
-                .await
-                .unwrap();
-            trx = stmt.succeed();
+            trx.exec(async |stmt| {
+                stmt_insert_row(stmt, &table, vec![Val::from(1004i32)]).await?;
+                Ok(())
+            })
+            .await
+            .unwrap();
             trx.commit().await.unwrap();
             drop(session);
             let pool_guards = full_pool_guards(&engine);
@@ -1213,21 +1217,27 @@ mod tests {
             // insert
             for i in 0..PURGE_SIZE {
                 let mut trx = session.try_begin_trx().unwrap().unwrap();
-                let mut stmt = trx.start_stmt();
-                let res = stmt_insert_row(&mut stmt, &table, vec![Val::from(i as i32)]).await;
+                let res = trx
+                    .exec(async |stmt| {
+                        stmt_insert_row(stmt, &table, vec![Val::from(i as i32)]).await?;
+                        Ok(())
+                    })
+                    .await;
                 assert!(res.is_ok());
-                trx = stmt.succeed();
                 let res = trx.commit().await;
                 assert!(res.is_ok());
             }
             // delete
             for i in 0..PURGE_SIZE {
                 let mut trx = session.try_begin_trx().unwrap().unwrap();
-                let mut stmt = trx.start_stmt();
                 let key = SelectKey::new(0, vec![Val::from(i as i32)]);
-                let res = stmt_delete_row(&mut stmt, &table, &key).await;
+                let res = trx
+                    .exec(async |stmt| {
+                        stmt_delete_row(stmt, &table, &key).await?;
+                        Ok(())
+                    })
+                    .await;
                 assert!(res.is_ok());
-                trx = stmt.succeed();
                 let res = trx.commit().await;
                 assert!(res.is_ok());
             }
@@ -1296,21 +1306,27 @@ mod tests {
             // insert
             for i in 0..PURGE_SIZE {
                 let mut trx = session.try_begin_trx().unwrap().unwrap();
-                let mut stmt = trx.start_stmt();
-                let res = stmt_insert_row(&mut stmt, &table, vec![Val::from(i as i32)]).await;
+                let res = trx
+                    .exec(async |stmt| {
+                        stmt_insert_row(stmt, &table, vec![Val::from(i as i32)]).await?;
+                        Ok(())
+                    })
+                    .await;
                 assert!(res.is_ok());
-                trx = stmt.succeed();
                 let res = trx.commit().await;
                 assert!(res.is_ok());
             }
             // delete
             for i in 0..PURGE_SIZE {
                 let mut trx = session.try_begin_trx().unwrap().unwrap();
-                let mut stmt = trx.start_stmt();
                 let key = SelectKey::new(0, vec![Val::from(i as i32)]);
-                let res = stmt_delete_row(&mut stmt, &table, &key).await;
+                let res = trx
+                    .exec(async |stmt| {
+                        stmt_delete_row(stmt, &table, &key).await?;
+                        Ok(())
+                    })
+                    .await;
                 assert!(res.is_ok());
-                trx = stmt.succeed();
                 let res = trx.commit().await;
                 assert!(res.is_ok());
             }

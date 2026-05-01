@@ -24,7 +24,6 @@ pub mod quiescent;
 pub mod row;
 pub mod serde;
 pub mod session;
-pub mod stmt;
 pub mod table;
 pub mod thread;
 pub mod trx;

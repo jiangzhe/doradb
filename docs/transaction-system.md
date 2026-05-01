@@ -144,6 +144,16 @@ owned `TableRootSnapshot` for broader MVCC and GC work. Checkpoint, recovery,
 catalog load, and file-internal root reads remain explicit unchecked
 exceptions outside this runtime transaction contract.
 
+Each user statement runs through `ActiveTrx::exec(async |stmt| { ... })`.
+`Statement` is a borrowed facade over immutable `TrxContext` and
+statement-local `StmtEffects`; callers cannot construct or finish it directly.
+When the callback succeeds, statement row undo, index undo, and redo effects
+merge into the active transaction. When the callback returns an ordinary error,
+only the current statement effects are rolled back and the original error is
+returned. If that rollback cannot access required storage, the rollback failure
+is fatal: storage is poisoned, the transaction is detached from its session, and
+later commit or rollback attempts on that discarded transaction return an error.
+
 1. **Read**: 
    - Probe `MemIndex` first and then `DiskTree` as required by the index type.
    - Route to RowStore or ColumnStore based on `RowID` vs `Pivot`.

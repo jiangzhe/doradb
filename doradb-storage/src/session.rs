@@ -147,8 +147,8 @@ impl Session {
         }
 
         // 3. begin transaction
-        let mut stmt = match self.try_begin_trx() {
-            Ok(Some(trx)) => trx.start_stmt(),
+        let mut trx = match self.try_begin_trx() {
+            Ok(Some(trx)) => trx,
             Ok(None) => unreachable!("create_table requires idle session"),
             Err(err) => {
                 uninit_table_file.try_delete();
@@ -157,56 +157,66 @@ impl Session {
         };
 
         // 4. insert catalog related objects.
-        let inserted = engine
-            .catalog()
-            .storage
-            .tables()
-            .insert(&mut stmt, &table_object)
+        let exec_res = trx
+            .exec(async |stmt| {
+                let inserted = engine
+                    .catalog()
+                    .storage
+                    .tables()
+                    .insert(stmt, &table_object)
+                    .await;
+                if !inserted {
+                    return Err(Report::new(OperationError::TableAlreadyExists)
+                        .attach(format!("create table catalog object: table_id={table_id}"))
+                        .into());
+                }
+
+                for column_object in column_objects {
+                    let inserted = engine
+                        .catalog()
+                        .storage
+                        .columns()
+                        .insert(stmt, &column_object)
+                        .await;
+                    debug_assert!(inserted);
+                }
+                for index_object in index_objects {
+                    let inserted = engine
+                        .catalog()
+                        .storage
+                        .indexes()
+                        .insert(stmt, &index_object)
+                        .await;
+                    debug_assert!(inserted);
+                }
+                for index_column_object in index_column_objects {
+                    let inserted = engine
+                        .catalog()
+                        .storage
+                        .index_columns()
+                        .insert(stmt, &index_column_object)
+                        .await;
+                    debug_assert!(inserted);
+                }
+
+                // 5. add DDL redo log to redo log buffer
+                let res = stmt
+                    .effects_mut()
+                    .set_ddl_redo(DDLRedo::CreateTable(table_id));
+                debug_assert!(res.is_none());
+                Ok(())
+            })
             .await;
-        if !inserted {
+        if let Err(err) = exec_res {
             uninit_table_file.try_delete();
-            stmt.fail().await?.rollback().await?;
-            return Err(Report::new(OperationError::TableAlreadyExists)
-                .attach(format!("create table catalog object: table_id={table_id}"))
-                .into());
+            if trx.engine().is_some() {
+                trx.rollback().await?;
+            }
+            return Err(err);
         }
-
-        for column_object in column_objects {
-            let inserted = engine
-                .catalog()
-                .storage
-                .columns()
-                .insert(&mut stmt, &column_object)
-                .await;
-            debug_assert!(inserted);
-        }
-        for index_object in index_objects {
-            let inserted = engine
-                .catalog()
-                .storage
-                .indexes()
-                .insert(&mut stmt, &index_object)
-                .await;
-            debug_assert!(inserted);
-        }
-        for index_column_object in index_column_objects {
-            let inserted = engine
-                .catalog()
-                .storage
-                .index_columns()
-                .insert(&mut stmt, &index_column_object)
-                .await;
-            debug_assert!(inserted);
-        }
-
-        // 5. add DDL redo log to redo log buffer
-        let res = stmt
-            .effects_mut()
-            .set_ddl_redo(DDLRedo::CreateTable(table_id));
-        debug_assert!(res.is_none());
 
         // 6. commit current transaction implicitly.
-        let cts = match stmt.succeed().commit().await {
+        let cts = match trx.commit().await {
             Ok(cts) => cts,
             Err(e) => {
                 uninit_table_file.try_delete();

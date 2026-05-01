@@ -6,8 +6,8 @@ use crate::catalog::table::TableMetadata;
 use crate::catalog::{ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexSpec, TableID};
 use crate::row::ops::{DeleteMvcc, SelectKey};
 use crate::row::{Row, RowRead};
-use crate::stmt::Statement;
 use crate::table::TableAccess;
+use crate::trx::stmt::Statement;
 use crate::value::Val;
 use crate::value::ValKind;
 use semistr::SemiStr;
@@ -86,7 +86,7 @@ impl Tables<'_> {
     }
 
     /// Insert a table.
-    pub async fn insert(&self, stmt: &mut Statement, obj: &TableObject) -> bool {
+    pub async fn insert(&self, stmt: &mut Statement<'_>, obj: &TableObject) -> bool {
         let cols = vec![Val::from(obj.table_id)];
         let (ctx, effects) = stmt.ctx_and_effects_mut();
         self.table
@@ -97,7 +97,7 @@ impl Tables<'_> {
     }
 
     /// Delete a table by id.
-    pub async fn delete_by_id(&self, stmt: &mut Statement, id: TableID) -> bool {
+    pub async fn delete_by_id(&self, stmt: &mut Statement<'_>, id: TableID) -> bool {
         let key = SelectKey::new(PK_NO_TABLES, vec![Val::from(id)]);
         let (ctx, effects) = stmt.ctx_and_effects_mut();
         self.table
@@ -131,43 +131,53 @@ mod tests {
 
             let table100 = TableObject { table_id: 100 };
             let table101 = TableObject { table_id: 101 };
-            let mut stmt = session.try_begin_trx().unwrap().unwrap().start_stmt();
-            assert!(
-                engine
-                    .catalog()
-                    .storage
-                    .tables()
-                    .insert(&mut stmt, &table100)
-                    .await
-            );
-            assert!(
-                engine
-                    .catalog()
-                    .storage
-                    .tables()
-                    .insert(&mut stmt, &table101)
-                    .await
-            );
-            stmt.succeed().commit().await.unwrap();
+            let mut trx = session.try_begin_trx().unwrap().unwrap();
+            trx.exec(async |stmt| {
+                assert!(
+                    engine
+                        .catalog()
+                        .storage
+                        .tables()
+                        .insert(stmt, &table100)
+                        .await
+                );
+                assert!(
+                    engine
+                        .catalog()
+                        .storage
+                        .tables()
+                        .insert(stmt, &table101)
+                        .await
+                );
+                Ok(())
+            })
+            .await
+            .unwrap();
+            trx.commit().await.unwrap();
 
-            let mut stmt = session.try_begin_trx().unwrap().unwrap().start_stmt();
-            assert!(
-                engine
-                    .catalog()
-                    .storage
-                    .tables()
-                    .delete_by_id(&mut stmt, table100.table_id)
-                    .await
-            );
-            assert!(
-                !engine
-                    .catalog()
-                    .storage
-                    .tables()
-                    .delete_by_id(&mut stmt, 999)
-                    .await
-            );
-            stmt.succeed().commit().await.unwrap();
+            let mut trx = session.try_begin_trx().unwrap().unwrap();
+            trx.exec(async |stmt| {
+                assert!(
+                    engine
+                        .catalog()
+                        .storage
+                        .tables()
+                        .delete_by_id(stmt, table100.table_id)
+                        .await
+                );
+                assert!(
+                    !engine
+                        .catalog()
+                        .storage
+                        .tables()
+                        .delete_by_id(stmt, 999)
+                        .await
+                );
+                Ok(())
+            })
+            .await
+            .unwrap();
+            trx.commit().await.unwrap();
 
             assert!(
                 engine

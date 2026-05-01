@@ -180,24 +180,27 @@ async fn worker(
         pad.iter_mut().for_each(|b| {
             *b = fastrand::alphabetic() as u8;
         });
-        let trx = session.try_begin_trx().unwrap().unwrap();
-        let mut stmt = trx.start_stmt();
-        let (ctx, effects) = stmt.ctx_and_effects_mut();
-        let res = table
-            .accessor()
-            .insert_mvcc(
-                ctx,
-                effects,
-                vec![
-                    Val::from(id),
-                    Val::from(k),
-                    Val::from(&c[..]),
-                    Val::from(&pad[..]),
-                ],
-            )
-            .await;
-        assert!(res.is_ok());
-        stmt.succeed().commit().await.unwrap();
+        let mut trx = session.try_begin_trx().unwrap().unwrap();
+        trx.exec(async |stmt| {
+            let (ctx, effects) = stmt.ctx_and_effects_mut();
+            table
+                .accessor()
+                .insert_mvcc(
+                    ctx,
+                    effects,
+                    vec![
+                        Val::from(id),
+                        Val::from(k),
+                        Val::from(&c[..]),
+                        Val::from(&pad[..]),
+                    ],
+                )
+                .await?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+        trx.commit().await.unwrap();
         id += id_step;
     }
     drop(wg);
