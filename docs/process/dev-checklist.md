@@ -10,7 +10,8 @@ document is the source of truth for intended behavior when one exists.
 - [ ] Run the normal validation pass:
       `cargo nextest run -p doradb-storage`.
 - [ ] Run focused coverage for changed code with:
-      `tools/coverage_focus.rs --path <path/to/file/or/dir>`.
+      `tools/coverage_focus.rs --path <path/to/file/or/dir>` or repeated
+      `--path` flags for multiple changed paths.
 - [ ] Confirm focused coverage is at least 80% for changed files or
       directories. If it is lower, document the reason and the follow-up needed.
 - [ ] For central definition-heavy files, such as shared error/type enums whose

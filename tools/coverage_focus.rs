@@ -19,13 +19,18 @@ const COVERAGE_IGNORE_FILENAME_REGEX: &str =
 
 #[derive(Debug)]
 struct Args {
-    target_raw: String,
-    target_abs: PathBuf,
-    target_display: String,
-    target_is_dir: bool,
+    targets: Vec<FocusTarget>,
     write_path: Option<PathBuf>,
     top_uncovered: usize,
     show_output: bool,
+}
+
+#[derive(Debug, Clone)]
+struct FocusTarget {
+    raw: String,
+    abs_key: String,
+    display: String,
+    is_dir: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -37,6 +42,7 @@ struct FileCoverage {
 
 #[derive(Debug, Clone)]
 struct FileReport {
+    abs_key: String,
     path: String,
     lines_found: usize,
     lines_hit: usize,
@@ -55,8 +61,21 @@ struct MatchResult {
     totals: CoverageTotals,
 }
 
+#[derive(Debug, Clone)]
+struct TargetReport {
+    target: FocusTarget,
+    result: MatchResult,
+}
+
+#[derive(Debug, Clone)]
+struct FocusReport {
+    targets: Vec<TargetReport>,
+    totals: CoverageTotals,
+    unique_file_count: usize,
+}
+
 fn usage() -> &'static str {
-    "Usage: tools/coverage_focus.rs --path <repo-path> [--write <markdown-path>] [--top-uncovered <n>] [--verbose]\n\
+    "Usage: tools/coverage_focus.rs --path <repo-path> [--path <repo-path> ...] [--write <markdown-path>] [--top-uncovered <n>] [--verbose]\n\
 \n\
 Prerequisites:\n\
 - `cargo-nextest` available in PATH (`cargo install --locked cargo-nextest`)\n\
@@ -67,6 +86,7 @@ Prerequisites:\n\
 \n\
 Output:\n\
 - By default, command stdout/stderr is hidden and only step descriptions are printed\n\
+- Repeat `--path` to compute several focused reports from one coverage run\n\
 - Use `--verbose` to stream full build/test/report output"
 }
 
@@ -95,7 +115,7 @@ fn run() -> Result<(), String> {
     validate_lcov_output()?;
 
     let lcov_rows = parse_lcov(Path::new(LCOV_OUT), &repo_root)?;
-    let matched = focus_target(&lcov_rows, &args, &repo_root)?;
+    let matched = focus_targets(&lcov_rows, &args)?;
 
     let report = render_console_report(&args, &matched);
     print!("{report}");
@@ -116,7 +136,7 @@ fn run() -> Result<(), String> {
 
 fn parse_args(repo_root: &Path) -> Result<Args, String> {
     let mut args = env::args().skip(1);
-    let mut target_raw: Option<String> = None;
+    let mut target_raws: Vec<String> = Vec::new();
     let mut write_path: Option<PathBuf> = None;
     let mut top_uncovered: usize = 10;
     let mut show_output = false;
@@ -127,7 +147,7 @@ fn parse_args(repo_root: &Path) -> Result<Args, String> {
                 let Some(v) = args.next() else {
                     return Err(format!("missing value for --path\n{}", usage()));
                 };
-                target_raw = Some(v);
+                target_raws.push(v);
             }
             "--write" => {
                 let Some(v) = args.next() else {
@@ -154,40 +174,61 @@ fn parse_args(repo_root: &Path) -> Result<Args, String> {
         }
     }
 
-    let target_raw = target_raw.ok_or_else(|| format!("missing required --path\n{}", usage()))?;
-    let target_path = PathBuf::from(&target_raw);
-    let target_abs = if target_path.is_absolute() {
-        target_path
-    } else {
-        repo_root.join(target_path)
-    };
-
-    if !target_abs.exists() {
-        return Err(format!(
-            "target path does not exist: {}",
-            target_abs.display()
-        ));
+    if target_raws.is_empty() {
+        return Err(format!("missing required --path\n{}", usage()));
     }
-
-    let target_abs = target_abs.canonicalize().map_err(|e| {
-        format!(
-            "failed to canonicalize target path {}: {e}",
-            target_abs.display()
-        )
-    })?;
-
-    let target_display = rel_display(&target_abs, repo_root);
-    let target_is_dir = target_abs.is_dir();
+    let targets = parse_focus_targets(target_raws, repo_root)?;
 
     Ok(Args {
-        target_raw,
-        target_abs,
-        target_display,
-        target_is_dir,
+        targets,
         write_path,
         top_uncovered,
         show_output,
     })
+}
+
+fn parse_focus_targets(raws: Vec<String>, repo_root: &Path) -> Result<Vec<FocusTarget>, String> {
+    let mut targets = Vec::with_capacity(raws.len());
+    let mut seen: BTreeMap<String, String> = BTreeMap::new();
+
+    for raw in raws {
+        let target_path = PathBuf::from(&raw);
+        let target_abs = if target_path.is_absolute() {
+            target_path
+        } else {
+            repo_root.join(target_path)
+        };
+
+        if !target_abs.exists() {
+            return Err(format!(
+                "target path does not exist: {}",
+                target_abs.display()
+            ));
+        }
+
+        let target_abs = target_abs.canonicalize().map_err(|e| {
+            format!(
+                "failed to canonicalize target path {}: {e}",
+                target_abs.display()
+            )
+        })?;
+
+        let abs_key = normalize_abs_key(&target_abs, repo_root);
+        if let Some(prev_raw) = seen.insert(abs_key.clone(), raw.clone()) {
+            return Err(format!(
+                "duplicate target path after canonicalization: `{raw}` duplicates `{prev_raw}`"
+            ));
+        }
+
+        targets.push(FocusTarget {
+            raw,
+            abs_key,
+            display: rel_display(&target_abs, repo_root),
+            is_dir: target_abs.is_dir(),
+        });
+    }
+
+    Ok(targets)
 }
 
 fn precheck_repo_layout(repo_root: &Path) -> Result<(), String> {
@@ -474,50 +515,91 @@ fn parse_lcov(path: &Path, repo_root: &Path) -> Result<Vec<FileCoverage>, String
     Ok(files.into_values().collect())
 }
 
-fn focus_target(
-    rows: &[FileCoverage],
-    args: &Args,
-    repo_root: &Path,
-) -> Result<MatchResult, String> {
-    let target_key = normalize_abs_key(&args.target_abs, repo_root);
-    let mut out: Vec<FileReport> = Vec::new();
+fn focus_targets(rows: &[FileCoverage], args: &Args) -> Result<FocusReport, String> {
+    let mut reports = Vec::with_capacity(args.targets.len());
+    let mut unmatched = Vec::new();
+    let mut unique_files: BTreeMap<String, FileReport> = BTreeMap::new();
 
-    for row in rows {
-        let is_match = if args.target_is_dir {
-            is_prefix_path(&target_key, &row.abs_key)
+    for target in &args.targets {
+        let result = focus_target(rows, target);
+        if result.files.is_empty() {
+            unmatched.push(target.display.clone());
         } else {
-            row.abs_key == target_key
-        };
-        if !is_match {
-            continue;
-        }
-
-        let mut uncovered = Vec::new();
-        let mut lines_hit = 0usize;
-        for (line_no, hits) in &row.line_hits {
-            if *hits > 0 {
-                lines_hit += 1;
-            } else {
-                uncovered.push(*line_no);
+            for file in &result.files {
+                unique_files
+                    .entry(file.abs_key.clone())
+                    .or_insert_with(|| file.clone());
             }
+            reports.push(TargetReport {
+                target: target.clone(),
+                result,
+            });
         }
-
-        out.push(FileReport {
-            path: row.display_path.clone(),
-            lines_found: row.line_hits.len(),
-            lines_hit,
-            uncovered_lines: uncovered,
-        });
     }
 
-    if out.is_empty() {
+    if !unmatched.is_empty() {
         return Err(format!(
-            "no LCOV entries matched target `{}`. Confirm the path is part of instrumented Rust sources.",
-            args.target_display
+            "no LCOV entries matched target(s): {}. Confirm each path is part of instrumented Rust sources.",
+            unmatched
+                .iter()
+                .map(|target| format!("`{target}`"))
+                .collect::<Vec<_>>()
+                .join(", ")
         ));
     }
 
-    out.sort_by(|a, b| {
+    let unique_file_count = unique_files.len();
+    let totals = coverage_totals(unique_files.values());
+
+    Ok(FocusReport {
+        targets: reports,
+        totals,
+        unique_file_count,
+    })
+}
+
+fn focus_target(rows: &[FileCoverage], target: &FocusTarget) -> MatchResult {
+    let mut out: Vec<FileReport> = Vec::new();
+
+    for row in rows {
+        let is_match = if target.is_dir {
+            is_prefix_path(&target.abs_key, &row.abs_key)
+        } else {
+            row.abs_key == target.abs_key
+        };
+        if is_match {
+            out.push(file_report(row));
+        }
+    }
+
+    sort_file_reports(&mut out);
+    let totals = coverage_totals(out.iter());
+
+    MatchResult { files: out, totals }
+}
+
+fn file_report(row: &FileCoverage) -> FileReport {
+    let mut uncovered = Vec::new();
+    let mut lines_hit = 0usize;
+    for (line_no, hits) in &row.line_hits {
+        if *hits > 0 {
+            lines_hit += 1;
+        } else {
+            uncovered.push(*line_no);
+        }
+    }
+
+    FileReport {
+        abs_key: row.abs_key.clone(),
+        path: row.display_path.clone(),
+        lines_found: row.line_hits.len(),
+        lines_hit,
+        uncovered_lines: uncovered,
+    }
+}
+
+fn sort_file_reports(files: &mut [FileReport]) {
+    files.sort_by(|a, b| {
         let ac = coverage_pct(a.lines_hit, a.lines_found);
         let bc = coverage_pct(b.lines_hit, b.lines_found);
         ac.partial_cmp(&bc)
@@ -525,29 +607,92 @@ fn focus_target(
             .then_with(|| b.lines_found.cmp(&a.lines_found))
             .then_with(|| a.path.cmp(&b.path))
     });
-
-    let totals = CoverageTotals {
-        lines_found: out.iter().map(|r| r.lines_found).sum(),
-        lines_hit: out.iter().map(|r| r.lines_hit).sum(),
-    };
-
-    Ok(MatchResult { files: out, totals })
 }
 
-fn render_console_report(args: &Args, result: &MatchResult) -> String {
+fn coverage_totals<'a>(files: impl IntoIterator<Item = &'a FileReport>) -> CoverageTotals {
+    let mut totals = CoverageTotals {
+        lines_found: 0,
+        lines_hit: 0,
+    };
+    for file in files {
+        totals.lines_found += file.lines_found;
+        totals.lines_hit += file.lines_hit;
+    }
+    totals
+}
+
+fn render_console_report(args: &Args, report: &FocusReport) -> String {
+    if report.targets.len() == 1 {
+        return render_single_target_report(args, &report.targets[0]);
+    }
+
     let mut out = String::new();
+    let summary_pct = coverage_pct(report.totals.lines_hit, report.totals.lines_found);
+
+    out.push_str("# Coverage Focus Report\n\n");
+    out.push_str(&format!("- Requested path args: {}\n", args.targets.len()));
+    out.push_str(&format!(
+        "- Unique matched files: {}\n",
+        report.unique_file_count
+    ));
+    out.push_str(&format!(
+        "- Deduplicated total line coverage: {}/{} ({summary_pct:.2}%)\n\n",
+        report.totals.lines_hit, report.totals.lines_found
+    ));
+
+    out.push_str("## Requested targets\n\n");
+    out.push_str("| target | kind | matched files | line coverage |\n");
+    out.push_str("|---|---|---:|---:|\n");
+    for target_report in &report.targets {
+        let result = &target_report.result;
+        let pct = coverage_pct(result.totals.lines_hit, result.totals.lines_found);
+        out.push_str(&format!(
+            "| `{}` | {} | {} | {}/{} ({:.2}%) |\n",
+            target_report.target.display,
+            target_kind(&target_report.target),
+            result.files.len(),
+            result.totals.lines_hit,
+            result.totals.lines_found,
+            pct
+        ));
+    }
+
+    for target_report in &report.targets {
+        out.push_str(&format!(
+            "\n## Target: `{}`\n\n",
+            target_report.target.display
+        ));
+        write_target_summary(&mut out, target_report);
+        write_file_table(
+            &mut out,
+            "### Per-file line coverage",
+            &target_report.result.files,
+        );
+        write_hotspots(
+            &mut out,
+            "### Uncovered-line hotspots",
+            &target_report.result.files,
+            args.top_uncovered,
+        );
+    }
+
+    out
+}
+
+fn render_single_target_report(args: &Args, target_report: &TargetReport) -> String {
+    let mut out = String::new();
+    let result = &target_report.result;
     let summary_pct = coverage_pct(result.totals.lines_hit, result.totals.lines_found);
 
     out.push_str("# Coverage Focus Report\n\n");
-    out.push_str(&format!("- Requested path arg: `{}`\n", args.target_raw));
-    out.push_str(&format!("- Target: `{}`\n", args.target_display));
+    out.push_str(&format!(
+        "- Requested path arg: `{}`\n",
+        target_report.target.raw
+    ));
+    out.push_str(&format!("- Target: `{}`\n", target_report.target.display));
     out.push_str(&format!(
         "- Target kind: {}\n",
-        if args.target_is_dir {
-            "directory"
-        } else {
-            "file"
-        }
+        target_kind(&target_report.target)
     ));
     out.push_str(&format!("- Matched files: {}\n", result.files.len()));
     out.push_str(&format!(
@@ -555,10 +700,41 @@ fn render_console_report(args: &Args, result: &MatchResult) -> String {
         result.totals.lines_hit, result.totals.lines_found
     ));
 
-    out.push_str("## Per-file line coverage\n\n");
+    write_file_table(&mut out, "## Per-file line coverage", &result.files);
+    write_hotspots(
+        &mut out,
+        "## Uncovered-line hotspots",
+        &result.files,
+        args.top_uncovered,
+    );
+
+    out
+}
+
+fn write_target_summary(out: &mut String, target_report: &TargetReport) {
+    let result = &target_report.result;
+    let pct = coverage_pct(result.totals.lines_hit, result.totals.lines_found);
+    out.push_str(&format!(
+        "- Requested path arg: `{}`\n",
+        target_report.target.raw
+    ));
+    out.push_str(&format!(
+        "- Target kind: {}\n",
+        target_kind(&target_report.target)
+    ));
+    out.push_str(&format!("- Matched files: {}\n", result.files.len()));
+    out.push_str(&format!(
+        "- Target line coverage: {}/{} ({pct:.2}%)\n\n",
+        result.totals.lines_hit, result.totals.lines_found
+    ));
+}
+
+fn write_file_table(out: &mut String, heading: &str, files: &[FileReport]) {
+    out.push_str(heading);
+    out.push_str("\n\n");
     out.push_str("| file | lines hit | lines found | coverage | uncovered |\n");
     out.push_str("|---|---:|---:|---:|---:|\n");
-    for row in &result.files {
+    for row in files {
         let pct = coverage_pct(row.lines_hit, row.lines_found);
         out.push_str(&format!(
             "| `{}` | {} | {} | {:.2}% | {} |\n",
@@ -569,10 +745,13 @@ fn render_console_report(args: &Args, result: &MatchResult) -> String {
             row.uncovered_lines.len()
         ));
     }
+}
 
-    out.push_str("\n## Uncovered-line hotspots\n\n");
-    let mut hotspots: Vec<&FileReport> = result
-        .files
+fn write_hotspots(out: &mut String, heading: &str, files: &[FileReport], top_uncovered: usize) {
+    out.push_str("\n");
+    out.push_str(heading);
+    out.push_str("\n\n");
+    let mut hotspots: Vec<&FileReport> = files
         .iter()
         .filter(|r| !r.uncovered_lines.is_empty())
         .collect();
@@ -585,10 +764,10 @@ fn render_console_report(args: &Args, result: &MatchResult) -> String {
 
     if hotspots.is_empty() {
         out.push_str("All matched executable lines are covered.\n");
-        return out;
+        return;
     }
 
-    for row in hotspots.into_iter().take(args.top_uncovered) {
+    for row in hotspots.into_iter().take(top_uncovered) {
         let preview = row
             .uncovered_lines
             .iter()
@@ -609,11 +788,13 @@ fn render_console_report(args: &Args, result: &MatchResult) -> String {
             suffix
         ));
     }
-
-    out
 }
 
-fn render_markdown_report(args: &Args, result: &MatchResult) -> String {
+fn target_kind(target: &FocusTarget) -> &'static str {
+    if target.is_dir { "directory" } else { "file" }
+}
+
+fn render_markdown_report(args: &Args, result: &FocusReport) -> String {
     render_console_report(args, result)
 }
 
@@ -792,7 +973,6 @@ mod tests {
 
     #[test]
     fn focus_target_file_and_directory() {
-        let repo = Path::new("/repo");
         let rows = vec![
             FileCoverage {
                 abs_key: "/repo/src/a.rs".to_string(),
@@ -806,33 +986,157 @@ mod tests {
             },
         ];
 
-        let file_args = Args {
-            target_raw: "src/a.rs".to_string(),
-            target_abs: PathBuf::from("/repo/src/a.rs"),
-            target_display: "src/a.rs".to_string(),
-            target_is_dir: false,
-            write_path: None,
-            top_uncovered: 10,
-            show_output: false,
+        let file_target = FocusTarget {
+            raw: "src/a.rs".to_string(),
+            abs_key: "/repo/src/a.rs".to_string(),
+            display: "src/a.rs".to_string(),
+            is_dir: false,
         };
-        let file_report = focus_target(&rows, &file_args, repo).unwrap();
+        let file_report = focus_target(&rows, &file_target);
         assert_eq!(file_report.files.len(), 1);
         assert_eq!(file_report.totals.lines_found, 2);
         assert_eq!(file_report.totals.lines_hit, 1);
 
-        let dir_args = Args {
-            target_raw: "src".to_string(),
-            target_abs: PathBuf::from("/repo/src"),
-            target_display: "src".to_string(),
-            target_is_dir: true,
+        let dir_target = FocusTarget {
+            raw: "src".to_string(),
+            abs_key: "/repo/src".to_string(),
+            display: "src".to_string(),
+            is_dir: true,
+        };
+        let dir_report = focus_target(&rows, &dir_target);
+        assert_eq!(dir_report.files.len(), 2);
+        assert_eq!(dir_report.totals.lines_found, 3);
+        assert_eq!(dir_report.totals.lines_hit, 2);
+    }
+
+    #[test]
+    fn parse_focus_targets_allows_multiple_paths_and_rejects_duplicates() {
+        let fixture =
+            std::env::temp_dir().join(format!("coverage-focus-targets-{}", std::process::id()));
+        remove_path_if_exists(&fixture).unwrap();
+        fs::create_dir_all(fixture.join("src")).unwrap();
+        fs::write(fixture.join("src/a.rs"), "").unwrap();
+
+        let targets =
+            parse_focus_targets(vec!["src".to_string(), "src/a.rs".to_string()], &fixture).unwrap();
+        assert_eq!(targets.len(), 2);
+        assert!(targets[0].is_dir);
+        assert!(!targets[1].is_dir);
+
+        let duplicate = parse_focus_targets(
+            vec!["src/a.rs".to_string(), "./src/a.rs".to_string()],
+            &fixture,
+        )
+        .unwrap_err();
+        assert!(duplicate.contains("duplicate target path"));
+
+        fs::remove_dir_all(fixture).ok();
+    }
+
+    #[test]
+    fn focus_targets_deduplicates_overlapping_rollup() {
+        let rows = vec![
+            FileCoverage {
+                abs_key: "/repo/src/a.rs".to_string(),
+                display_path: "src/a.rs".to_string(),
+                line_hits: BTreeMap::from([(1, 0), (2, 1)]),
+            },
+            FileCoverage {
+                abs_key: "/repo/src/b.rs".to_string(),
+                display_path: "src/b.rs".to_string(),
+                line_hits: BTreeMap::from([(10, 1)]),
+            },
+        ];
+        let args = Args {
+            targets: vec![
+                FocusTarget {
+                    raw: "src".to_string(),
+                    abs_key: "/repo/src".to_string(),
+                    display: "src".to_string(),
+                    is_dir: true,
+                },
+                FocusTarget {
+                    raw: "src/a.rs".to_string(),
+                    abs_key: "/repo/src/a.rs".to_string(),
+                    display: "src/a.rs".to_string(),
+                    is_dir: false,
+                },
+            ],
             write_path: None,
             top_uncovered: 10,
             show_output: false,
         };
-        let dir_report = focus_target(&rows, &dir_args, repo).unwrap();
-        assert_eq!(dir_report.files.len(), 2);
-        assert_eq!(dir_report.totals.lines_found, 3);
-        assert_eq!(dir_report.totals.lines_hit, 2);
+
+        let report = focus_targets(&rows, &args).unwrap();
+        assert_eq!(report.targets.len(), 2);
+        assert_eq!(report.unique_file_count, 2);
+        assert_eq!(report.totals.lines_found, 3);
+        assert_eq!(report.totals.lines_hit, 2);
+
+        let rendered = render_console_report(&args, &report);
+        assert!(rendered.contains("- Requested path args: 2"));
+        assert!(rendered.contains("- Deduplicated total line coverage: 2/3 (66.67%)"));
+        assert!(rendered.contains("## Target: `src`"));
+        assert!(rendered.contains("## Target: `src/a.rs`"));
+    }
+
+    #[test]
+    fn focus_targets_reports_all_unmatched_targets() {
+        let rows = vec![FileCoverage {
+            abs_key: "/repo/src/a.rs".to_string(),
+            display_path: "src/a.rs".to_string(),
+            line_hits: BTreeMap::from([(1, 1)]),
+        }];
+        let args = Args {
+            targets: vec![
+                FocusTarget {
+                    raw: "src/missing.rs".to_string(),
+                    abs_key: "/repo/src/missing.rs".to_string(),
+                    display: "src/missing.rs".to_string(),
+                    is_dir: false,
+                },
+                FocusTarget {
+                    raw: "tests".to_string(),
+                    abs_key: "/repo/tests".to_string(),
+                    display: "tests".to_string(),
+                    is_dir: true,
+                },
+            ],
+            write_path: None,
+            top_uncovered: 10,
+            show_output: false,
+        };
+
+        let err = focus_targets(&rows, &args).unwrap_err();
+        assert!(err.contains("`src/missing.rs`"));
+        assert!(err.contains("`tests`"));
+    }
+
+    #[test]
+    fn single_target_report_keeps_existing_summary_shape() {
+        let rows = vec![FileCoverage {
+            abs_key: "/repo/src/a.rs".to_string(),
+            display_path: "src/a.rs".to_string(),
+            line_hits: BTreeMap::from([(1, 0), (2, 1)]),
+        }];
+        let args = Args {
+            targets: vec![FocusTarget {
+                raw: "src/a.rs".to_string(),
+                abs_key: "/repo/src/a.rs".to_string(),
+                display: "src/a.rs".to_string(),
+                is_dir: false,
+            }],
+            write_path: None,
+            top_uncovered: 10,
+            show_output: false,
+        };
+
+        let report = focus_targets(&rows, &args).unwrap();
+        let rendered = render_console_report(&args, &report);
+        assert!(rendered.contains("- Requested path arg: `src/a.rs`"));
+        assert!(rendered.contains("- Target: `src/a.rs`"));
+        assert!(rendered.contains("- Total line coverage: 1/2 (50.00%)"));
+        assert!(!rendered.contains("Deduplicated total line coverage"));
     }
 
     #[test]
