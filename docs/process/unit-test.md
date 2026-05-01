@@ -91,7 +91,8 @@ path above.
 
 ## Local Coverage Focus
 
-Use the local coverage focus script when you need fast feedback for one file or directory.
+Use the local coverage focus script when you need fast feedback for one or more
+files or directories.
 
 ### Prerequisites
 
@@ -138,14 +139,26 @@ tools/coverage_focus.rs \
   --write target/coverage/table-focus.md
 ```
 
+Repeat `--path` to report several files or directories from one coverage run:
+
+```bash
+tools/coverage_focus.rs \
+  --path doradb-storage/src/table/tests.rs \
+  --path doradb-storage/src/index \
+  --top-uncovered 15 \
+  --write target/coverage/multi-focus.md
+```
+
 The script regenerates coverage artifacts for the default `io_uring`
 configuration and runs `cargo llvm-cov nextest --lcov` before printing focused
-line-coverage summaries and uncovered-line hotspots.
+line-coverage summaries and uncovered-line hotspots. When multiple paths are
+requested, the script parses one LCOV file and prints a deduplicated overall
+summary plus per-target sections.
 
-Treat 80% focused coverage as the default review bar for the requested path. If
-the requested path is a central definition-heavy file such as a shared error or
-type declaration module, a lower whole-file result is acceptable only when the
-review notes explain why the file is definition-heavy and cite affected
+Treat 80% focused coverage as the default review bar for the requested path or
+paths. If a requested path is a central definition-heavy file such as a shared
+error or type declaration module, a lower whole-file result is acceptable only
+when the review notes explain why the file is definition-heavy and cite affected
 consumer/runtime paths whose focused coverage still meets the normal 80% bar.
 
 The script keeps instrumented build artifacts under `target/coverage-focus/`
