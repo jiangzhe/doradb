@@ -1156,6 +1156,12 @@ mod tests {
         (temp_dir, engine)
     }
 
+    fn test_session_state(engine: &Engine) -> Arc<SessionState> {
+        let engine_ref = engine.new_ref().unwrap();
+        let session_id = engine_ref.next_session_id();
+        Arc::new(SessionState::new(engine_ref, session_id))
+    }
+
     async fn swapped_old_root(engine: &Engine, table_id: u64) -> (usize, OldRoot) {
         let metadata = Arc::new(TableMetadata::new(
             vec![ColumnSpec::new(
@@ -1182,7 +1188,7 @@ mod tests {
     fn test_active_trx_new_splits_context_and_empty_effects() {
         smol::block_on(async {
             let (_temp_dir, engine) = test_engine("redo_trx_context_new").await;
-            let session_state = Arc::new(SessionState::new(engine.new_ref().unwrap()));
+            let session_state = test_session_state(&engine);
             let mut trx = ActiveTrx::new(session_state, MIN_ACTIVE_TRX_ID + 42, 42, 3, 5);
 
             assert!(trx.readonly());
@@ -1208,7 +1214,7 @@ mod tests {
     fn test_active_trx_readonly_prepare_keeps_empty_effect_payload() {
         smol::block_on(async {
             let (_temp_dir, engine) = test_engine("redo_trx_readonly_prepare").await;
-            let session_state = Arc::new(SessionState::new(engine.new_ref().unwrap()));
+            let session_state = test_session_state(&engine);
             let trx = ActiveTrx::new(session_state, MIN_ACTIVE_TRX_ID + 43, 43, 1, 2);
 
             let mut prepared = trx.prepare();
@@ -1234,7 +1240,7 @@ mod tests {
     fn test_active_trx_prepare_moves_effect_payload() {
         smol::block_on(async {
             let (_temp_dir, engine) = test_engine("redo_trx_effect_prepare").await;
-            let session_state = Arc::new(SessionState::new(engine.new_ref().unwrap()));
+            let session_state = test_session_state(&engine);
             let mut trx = ActiveTrx::new(session_state, MIN_ACTIVE_TRX_ID + 44, 44, 2, 3);
             trx.add_pseudo_redo_log_entry();
             trx.row_undo_mut()
@@ -1269,7 +1275,7 @@ mod tests {
     fn test_statement_success_merges_statement_effects_into_transaction_effects() {
         smol::block_on(async {
             let (_temp_dir, engine) = test_engine("redo_stmt_effect_merge").await;
-            let session_state = Arc::new(SessionState::new(engine.new_ref().unwrap()));
+            let session_state = test_session_state(&engine);
             let mut trx = ActiveTrx::new(session_state, MIN_ACTIVE_TRX_ID + 45, 45, 0, 0);
             trx.exec(async |stmt| {
                 let effects = stmt.effects_mut();
@@ -1302,7 +1308,7 @@ mod tests {
     fn test_statement_error_rolls_back_only_statement_effects() {
         smol::block_on(async {
             let (_temp_dir, engine) = test_engine("redo_stmt_error_rollback").await;
-            let session_state = Arc::new(SessionState::new(engine.new_ref().unwrap()));
+            let session_state = test_session_state(&engine);
             let mut trx = ActiveTrx::new(session_state, MIN_ACTIVE_TRX_ID + 49, 49, 0, 0);
 
             trx.exec(async |stmt| {
@@ -1348,7 +1354,7 @@ mod tests {
         smol::block_on(async {
             let (_temp_dir, engine) = test_engine("redo_trx_discard_errors").await;
 
-            let session_state = Arc::new(SessionState::new(engine.new_ref().unwrap()));
+            let session_state = test_session_state(&engine);
             let mut trx = ActiveTrx::new(session_state, MIN_ACTIVE_TRX_ID + 50, 50, 0, 0);
             trx.discard_after_fatal_rollback();
             let err = trx.commit().await.unwrap_err();
@@ -1357,7 +1363,7 @@ mod tests {
                 Some(InternalError::ActiveTransactionDiscarded)
             );
 
-            let session_state = Arc::new(SessionState::new(engine.new_ref().unwrap()));
+            let session_state = test_session_state(&engine);
             let mut trx = ActiveTrx::new(session_state, MIN_ACTIVE_TRX_ID + 51, 51, 0, 0);
             trx.discard_after_fatal_rollback();
             let err = trx.rollback().await.unwrap_err();
@@ -1373,7 +1379,7 @@ mod tests {
         smol::block_on(async {
             let (_temp_dir, engine) = test_engine("redo_trx_effect_predicates").await;
 
-            let session_state = Arc::new(SessionState::new(engine.new_ref().unwrap()));
+            let session_state = test_session_state(&engine);
             let mut trx = ActiveTrx::new(session_state, MIN_ACTIVE_TRX_ID + 46, 46, 0, 0);
             trx.extend_gc_row_pages(vec![PageID::new(46)]);
             assert!(!trx.require_durability());
@@ -1385,7 +1391,7 @@ mod tests {
             prepared.payload.take();
             prepared.session.take();
 
-            let session_state = Arc::new(SessionState::new(engine.new_ref().unwrap()));
+            let session_state = test_session_state(&engine);
             let mut trx = ActiveTrx::new(session_state, MIN_ACTIVE_TRX_ID + 47, 47, 0, 0);
             trx.index_undo_mut().push(IndexUndo {
                 table_id: 47,
@@ -1401,7 +1407,7 @@ mod tests {
             prepared.payload.take();
             prepared.session.take();
 
-            let session_state = Arc::new(SessionState::new(engine.new_ref().unwrap()));
+            let session_state = test_session_state(&engine);
             let mut trx = ActiveTrx::new(session_state, MIN_ACTIVE_TRX_ID + 48, 48, 0, 0);
             trx.add_pseudo_redo_log_entry();
             assert!(trx.require_durability());
@@ -1423,7 +1429,7 @@ mod tests {
             let (old_root_ptr, old_root) = swapped_old_root(&engine, 91_001).await;
             let drop_count_before = old_root_drop_count(old_root_ptr);
 
-            let session_state = Arc::new(SessionState::new(engine.new_ref().unwrap()));
+            let session_state = test_session_state(&engine);
             let mut trx = ActiveTrx::new(session_state, MIN_ACTIVE_TRX_ID + 10, 10, 0, 0);
             trx.retain_old_table_root(old_root).unwrap();
             assert!(!trx.readonly());
@@ -1488,7 +1494,7 @@ mod tests {
             let first_drop_count_before = old_root_drop_count(first_old_root_ptr);
             let second_drop_count_before = old_root_drop_count(second_old_root_ptr);
 
-            let session_state = Arc::new(SessionState::new(engine.new_ref().unwrap()));
+            let session_state = test_session_state(&engine);
             let mut trx = ActiveTrx::new(session_state, MIN_ACTIVE_TRX_ID + 12, 12, 0, 0);
             trx.retain_old_table_root(first_old_root).unwrap();
 
@@ -1537,7 +1543,7 @@ mod tests {
             let (old_root_ptr, old_root) = swapped_old_root(&engine, 91_003).await;
             let drop_count_before = old_root_drop_count(old_root_ptr);
 
-            let session_state = Arc::new(SessionState::new(engine.new_ref().unwrap()));
+            let session_state = test_session_state(&engine);
             let mut trx = ActiveTrx::new(session_state, MIN_ACTIVE_TRX_ID + 11, 11, 0, 0);
             trx.retain_old_table_root(old_root).unwrap();
 

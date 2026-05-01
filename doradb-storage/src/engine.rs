@@ -14,14 +14,16 @@ use crate::conf::EngineConfig;
 use crate::error::{LifecycleError, LifecycleResult, Result};
 use crate::file::fs::{FileSystem, FileSystemWorkers};
 use crate::quiescent::QuiescentGuard;
-use crate::session::Session;
+use crate::session::{Session, SessionID};
 use crate::trx::sys::TransactionSystem;
 use crate::{DiskPool, IndexPool, MemPool, MetaPool};
 use error_stack::{Report, ensure};
 use parking_lot::{Mutex, RwLock};
 use std::ops::Deref;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+
+const FIRST_SESSION_ID: SessionID = 1;
 
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -127,7 +129,10 @@ impl Engine {
     #[inline]
     pub fn try_new_session(&self) -> Result<Session> {
         let inner = self.inner();
-        inner.with_running_admission(|| Session::new(EngineRef(Arc::clone(inner))))
+        inner.with_running_admission(|| {
+            let id = inner.next_session_id();
+            Session::new(EngineRef(Arc::clone(inner)), id)
+        })
     }
 
     /// Return the shared catalog handle.
@@ -238,13 +243,22 @@ impl EngineRef {
     /// Try to create a new session while the engine is still running.
     #[inline]
     pub fn try_new_session(&self) -> Result<Session> {
-        self.0.with_running_admission(|| Session::new(self.clone()))
+        self.0.with_running_admission(|| {
+            let id = self.next_session_id();
+            Session::new(self.clone(), id)
+        })
     }
 
     /// Return the shared catalog handle.
     #[inline]
     pub fn catalog(&self) -> &Catalog {
         &self.catalog
+    }
+
+    /// Returns the next engine-local session identity.
+    #[inline]
+    pub(crate) fn next_session_id(&self) -> SessionID {
+        self.0.next_session_id()
     }
 }
 
@@ -267,10 +281,18 @@ pub struct EngineInner {
     pub table_fs: QuiescentGuard<FileSystem>,
     /// Global readonly pool for persisted table-file reads.
     pub disk_pool: DiskPool,
+    /// Monotonically increasing engine-local session identity source.
+    next_session_id: AtomicU64,
     lifecycle: EngineLifecycle,
 }
 
 impl EngineInner {
+    /// Returns the next engine-local session identity.
+    #[inline]
+    pub(crate) fn next_session_id(&self) -> SessionID {
+        self.next_session_id.fetch_add(1, Ordering::Relaxed)
+    }
+
     #[inline]
     pub(crate) fn with_running_admission<T>(&self, f: impl FnOnce() -> T) -> Result<T> {
         let _gate = self.lifecycle.admission_gate.read();
@@ -346,6 +368,7 @@ impl EngineConfig {
             mem_pool,
             table_fs,
             disk_pool,
+            next_session_id: AtomicU64::new(FIRST_SESSION_ID),
             lifecycle: EngineLifecycle::new(),
         };
         Ok(Engine {
@@ -397,6 +420,23 @@ mod tests {
         assert!(config_str.contains("log_dir"));
         assert!(config_str.contains("log_file_stem"));
         assert!(!config_str.contains("max_io_depth"));
+    }
+
+    #[test]
+    fn test_session_ids_are_monotonic_across_engine_handles() {
+        smol::block_on(async {
+            let root = TempDir::new().unwrap();
+            let engine = test_engine_config_for(root.path()).build().await.unwrap();
+            let engine_ref = engine.new_ref().unwrap();
+
+            let session1 = engine.try_new_session().unwrap();
+            let session2 = engine_ref.try_new_session().unwrap();
+            let session3 = engine.try_new_session().unwrap();
+
+            assert_eq!(session1.id(), FIRST_SESSION_ID);
+            assert_eq!(session2.id(), session1.id() + 1);
+            assert_eq!(session3.id(), session2.id() + 1);
+        });
     }
 
     #[test]

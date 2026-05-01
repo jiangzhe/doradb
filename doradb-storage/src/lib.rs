@@ -16,6 +16,7 @@ pub mod free_list;
 pub mod index;
 pub mod latch;
 mod layout;
+pub mod lock;
 pub mod lwc;
 pub mod memcmp;
 pub mod notify;

@@ -523,10 +523,10 @@ unsafe boundary and apply the repository unsafe review process before merging.
     granted and waiting requests, and an internal debug snapshot.
   - Non-goals: Integrating table access paths, implementing row resources,
     adding deadlock detection, or exposing SQL-level lock syntax.
-  - Task Doc: `docs/tasks/TBD.md`
-  - Task Issue: `#0`
-  - Phase Status: `pending`
-  - Implementation Summary: `pending`
+  - Task Doc: `docs/tasks/000138-lock-manager-core.md`
+  - Task Issue: `#604`
+  - Phase Status: done
+  - Implementation Summary: Implemented Phase 1 of RFC-0016 as the standalone logical lock-manager core. [Task Resolve Sync: docs/tasks/000138-lock-manager-core.md @ 2026-05-01]
 
 - **Phase 2: Engine, Transaction, And Session Integration**
   - Scope: Register or attach the lock manager to engine runtime state; add

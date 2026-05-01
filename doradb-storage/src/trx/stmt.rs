@@ -294,7 +294,9 @@ mod tests {
     }
 
     fn test_trx(engine: &Engine, sts: TrxID) -> ActiveTrx {
-        let session_state = Arc::new(SessionState::new(engine.new_ref().unwrap()));
+        let engine_ref = engine.new_ref().unwrap();
+        let session_id = engine_ref.next_session_id();
+        let session_state = Arc::new(SessionState::new(engine_ref, session_id));
         ActiveTrx::new(session_state, MIN_ACTIVE_TRX_ID + sts, sts, 0, 0)
     }
 
