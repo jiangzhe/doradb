@@ -1,7 +1,7 @@
 ---
 id: 000138
 title: Lock Manager Core
-status: proposal
+status: implemented
 created: 2026-05-01
 github_issue: 604
 ---
@@ -198,6 +198,57 @@ Reference:
 
 ## Implementation Notes
 
+Implemented Phase 1 of RFC-0016 as the standalone logical lock-manager core.
+The implementation added `doradb-storage/src/lock/` and exported it from
+`doradb-storage/src/lib.rs`, with:
+
+- `LockResource`, `LockMode`, `LockOwner`, `LockLifetime`, and documented
+  resource acquisition order.
+- Mode/resource validation, compatibility, and coverage helpers for
+  `CatalogNamespace`, `TableMetadata(TableID)`, and `TableData(TableID)`.
+- A `DashMap`-backed `LockManager` with non-blocking `try_acquire`, async
+  `acquire`, scoped `release`, whole-owner `release_owner`, FIFO-compatible
+  wait granting, immediate-only conversion, and internal debug snapshots.
+- Cancellation-safe queued acquisition using waiter guards, including
+  duplicate same-owner waiter deduplication and grant-side same-owner
+  deduplication.
+- Explicit lock operation errors for invalid modes, unsupported conversions,
+  upgrades that would block, and released waiters.
+
+Implementation also added engine-level monotonically increasing `SessionID`
+generation and storage on `SessionState` as a narrow owner-identity prerequisite
+requested during implementation. This did not register the lock manager on the
+engine or integrate lock lifecycle behavior into sessions, transactions,
+statements, DML, DDL, checkpoint, or recovery.
+
+Review follow-ups handled before resolve:
+
+- Added descriptive comments for the core acquire and conversion paths.
+- Documented `modes_are_compatible` and `mode_covers` with lock-mode tables.
+- Documented `LockManager::release` as both granted-lock release and queued
+  waiter cancellation for lifecycle/admin cleanup.
+- Documented the lock-resource acquisition order on `LockResource`.
+- Fixed cancellation safety for dropped `acquire` futures.
+- Fixed same-owner duplicate queued waiter and granted-entry handling.
+
+Validation and review:
+
+- `cargo fmt` passed.
+- `cargo build -p doradb-storage` passed.
+- `cargo nextest run -p doradb-storage lock::tests` passed: 44 tests, 44
+  passed.
+- `cargo nextest run -p doradb-storage` passed on rerun: 666 tests, 666 passed.
+  One earlier full-suite run hit
+  `table::tests::test_find_row_returns_resolved_lwc_page_location`; that test
+  passed in isolation and the full suite passed on rerun, so it was treated as
+  an unrelated intermittent parallel-test condition.
+- `cargo clippy -p doradb-storage --all-targets -- -D warnings` passed.
+- `tools/coverage_focus.rs --path doradb-storage/src/lock` reported 97.19%
+  focused line coverage.
+- Checklist review found no new unsafe code, no unresolved required fixes, and
+  no follow-up backlog items required before this phase can resolve.
+- PR opened: #605.
+
 ## Impacts
 
 - `doradb-storage/src/lib.rs`
@@ -251,8 +302,10 @@ Reference:
 
 ## Open Questions
 
-- Timeout/cancellation-aware acquisition remains future work before broad
-  user-facing waits or arbitrary multi-resource session locks are exposed.
+- Public timeout APIs and explicit user-facing wait cancellation semantics
+  remain future work before broad user-facing waits or arbitrary multi-resource
+  session locks are exposed. Internal future-drop cleanup for queued
+  `acquire` calls is implemented in this task.
 - Deadlock detection remains future work; Phase 1 relies on no blocking
   conversion and later built-in acquisition-order rules.
 - Engine/session/transaction integration, transaction lock caching, metadata
