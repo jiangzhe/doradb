@@ -15,6 +15,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
+/// Engine-local session identity.
+pub type SessionID = u64;
+
 /// Per-client execution context bound to one engine instance.
 pub struct Session {
     state: Arc<SessionState>,
@@ -22,10 +25,16 @@ pub struct Session {
 
 impl Session {
     #[inline]
-    pub(crate) fn new(engine_ref: EngineRef) -> Self {
+    pub(crate) fn new(engine_ref: EngineRef, id: SessionID) -> Self {
         Session {
-            state: Arc::new(SessionState::new(engine_ref)),
+            state: Arc::new(SessionState::new(engine_ref, id)),
         }
+    }
+
+    /// Returns the engine-local session identity.
+    #[inline]
+    pub fn id(&self) -> SessionID {
+        self.state.id()
     }
 
     /// Returns the engine handle bound to this session.
@@ -264,6 +273,7 @@ impl Session {
 
 /// Shared mutable state referenced by transactions started from one [`Session`].
 pub struct SessionState {
+    id: SessionID,
     engine_ref: EngineRef,
     pool_guards: PoolGuards,
     in_trx: AtomicBool,
@@ -274,7 +284,7 @@ pub struct SessionState {
 impl SessionState {
     /// Create a new session state and populate its default pool guards.
     #[inline]
-    pub fn new(engine_ref: EngineRef) -> Self {
+    pub fn new(engine_ref: EngineRef, id: SessionID) -> Self {
         let pool_guards = PoolGuards::builder()
             .push(PoolRole::Meta, engine_ref.meta_pool.pool_guard())
             .push(PoolRole::Index, engine_ref.index_pool.pool_guard())
@@ -282,12 +292,19 @@ impl SessionState {
             .push(PoolRole::Disk, engine_ref.disk_pool.pool_guard())
             .build();
         SessionState {
+            id,
             engine_ref,
             pool_guards,
             in_trx: AtomicBool::new(false),
             last_cts: AtomicU64::new(0),
             active_insert_pages: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Returns the engine-local session identity.
+    #[inline]
+    pub fn id(&self) -> SessionID {
+        self.id
     }
 
     /// Returns the engine handle for this session state.

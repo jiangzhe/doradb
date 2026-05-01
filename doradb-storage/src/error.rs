@@ -149,6 +149,14 @@ pub(crate) enum OperationError {
     DuplicateKey,
     #[error("write conflict")]
     WriteConflict,
+    #[error("invalid lock mode")]
+    InvalidLockMode,
+    #[error("lock upgrade would block")]
+    LockUpgradeWouldBlock,
+    #[error("lock conversion is not supported")]
+    LockConversionNotSupported,
+    #[error("lock waiter released")]
+    LockWaiterReleased,
 }
 
 /// Fieldless fatal-domain errors carried underneath `ErrorKind::Fatal`.
