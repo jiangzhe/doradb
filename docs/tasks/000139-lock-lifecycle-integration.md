@@ -1,7 +1,7 @@
 ---
 id: 000139
 title: Lock Lifecycle Integration
-status: proposal
+status: implemented
 created: 2026-05-01
 github_issue: 606
 ---
@@ -12,10 +12,11 @@ github_issue: 606
 
 Implement Phase 2 of RFC-0016 by wiring the standalone logical lock manager
 into engine, session, statement, and transaction lifecycle state. This task
-registers the lock manager as shared engine runtime state, adds deterministic
-owner cleanup for statement, transaction, and session owners, and adds a
-transaction-level table-lock cache on mutable `ActiveTrx` state without putting
-interior mutable lock state inside `TrxContext`.
+registers the lock manager as a normal engine component exposed through a
+runtime guard, adds deterministic owner cleanup for statement, transaction,
+and session owners, and adds a transaction-level table-lock cache on mutable
+`ActiveTrx` state without putting interior mutable lock state inside
+`TrxContext`.
 
 This task intentionally stops before metadata/read/write path enforcement,
 `CREATE TABLE` locking, public table-lock APIs, or row-lock-manager
@@ -229,6 +230,59 @@ Reference:
      checklist and still run the supported nextest validation.
 
 ## Implementation Notes
+
+Status: Implemented.
+
+Implemented Phase 2 of RFC-0016 with the lock manager owned by the engine
+component registry rather than cloned as a plain `EngineInner` value.
+`LockManager` no longer implements `Clone`; it implements the repository
+`Component` contract with `Access = QuiescentGuard<LockManager>`, is registered
+before `Catalog`, and is exposed through narrow engine/runtime accessors.
+
+Statement lifecycle integration now uses `StmtNo` and
+`LockOwner::Statement(TrxID, StmtNo)`. `ActiveTrx::exec` allocates a
+monotonic statement number, constructs the statement owner, and releases
+statement-owned locks after successful effect merge or after statement rollback
+and fatal cleanup complete.
+
+Transaction lifecycle integration adds `TrxLockState` as mutable state adjacent
+to `TrxEffects`, not inside `TrxContext`. `TrxLockState` stores only the
+transaction owner and strongest cached `LockMode` per `LockResource`; it does
+not own `LockManager`. Acquisition and release receive the engine's
+`LockManager` guard at method boundaries. `PreparedTrx` and `PrecommitTrx`
+carry that guard separately so ordered/group commit cleanup can still release
+transaction locks after session ownership has been detached.
+
+Terminal cleanup now releases transaction-owned locks on active rollback,
+fatal statement rollback discard, readonly/no-op commit discard, ordered commit
+success, and precommit abort/durability failure. `SessionState` drop releases
+session-owned granted locks and pending waiters. Logical lock acquisition does
+not affect redo durability, ordered commit classification, or rollbackable
+statement effects.
+
+Documentation was synchronized in `docs/engine-component-lifetime.md` and
+`docs/transaction-system.md`, including the rationale that recovery does not
+acquire logical locks because recovery runs before foreground sessions/waiters
+exist and logical lock table contents are volatile runtime coordination state,
+not durable replay state.
+
+No unsafe code was added or modified.
+
+Validation completed:
+
+- `cargo fmt`
+- `cargo build -p doradb-storage`
+- `cargo nextest run -p doradb-storage lock` passed 105/105 tests.
+- `cargo nextest run -p doradb-storage` passed 673/673 tests.
+- `cargo clippy -p doradb-storage --all-targets -- -D warnings`
+- `tools/coverage_focus.rs --path doradb-storage/src/lock`: 97.79%
+- `tools/coverage_focus.rs --path doradb-storage/src/trx`: 94.10%
+- `tools/coverage_focus.rs --path doradb-storage/src/engine.rs`: 96.73%
+- `git diff --check`
+
+Task checklist result: pass. No required fixes or deferred backlog follow-ups
+remain from the post-implementation review. PR opened as
+<https://github.com/jiangzhe/doradb/pull/608>.
 
 ## Impacts
 
