@@ -24,6 +24,7 @@ The runtime uses an explicit owner/runtime split:
 - `EngineInner` owns only shared runtime handles and the lifecycle gate:
   - catalog
   - transaction system
+  - logical lock manager
   - fixed and evictable buffer pools
   - table-file subsystem
   - readonly buffer pool
@@ -46,9 +47,10 @@ components in one fixed dependency order:
 5. `MemPool`
 6. `FileSystemWorkers`
 7. `SharedPoolEvictorWorkers`
-8. `Catalog`
-9. `TransactionSystem`
-10. `TransactionSystemWorkers`
+8. `LockManager`
+9. `Catalog`
+10. `TransactionSystem`
+11. `TransactionSystemWorkers`
 
 `DiskPool` now depends on `FileSystem` directly because readonly-cache miss
 loads are dispatched through the shared storage worker rather than file-scoped
@@ -67,6 +69,13 @@ guards before the pool and file owners begin final teardown.
 Worker components are separate registry entries because they need explicit
 shutdown before their owner objects are dropped, but their long-lived
 dependencies are still encoded by the same topological order.
+
+The logical lock manager is a normal registry component. It has no workers and
+no explicit shutdown work, but registry ownership still matters: `EngineInner`
+retains only a `QuiescentGuard<LockManager>`, and final drop waits for runtime
+guards before the component owner is released. Statement, transaction, and
+session lifecycle code release owner entries explicitly before runtime handles
+are dropped.
 
 The two storage-runtime worker components currently own:
 

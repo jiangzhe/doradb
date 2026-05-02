@@ -5,6 +5,7 @@ use crate::catalog::{IndexSpec, TableID, TableSpec};
 use crate::engine::EngineRef;
 use crate::error::{OperationError, Result};
 use crate::index::BlockIndex;
+use crate::lock::LockOwner;
 use crate::row::RowID;
 use crate::table::Table;
 use crate::trx::redo::DDLRedo;
@@ -367,5 +368,14 @@ impl SessionState {
         let mut g = self.active_insert_pages.lock();
         let res = g.insert(table_id, (page_id, row_id));
         debug_assert!(res.is_none());
+    }
+}
+
+impl Drop for SessionState {
+    #[inline]
+    fn drop(&mut self) {
+        self.engine_ref
+            .lock_manager()
+            .release_owner(LockOwner::Session(self.id));
     }
 }

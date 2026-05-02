@@ -51,6 +51,8 @@ impl SysTrx {
             redo_bin,
             payload: None,
             session: None,
+            lock_manager: None,
+            lock_state: None,
         }
     }
 }

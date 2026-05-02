@@ -540,10 +540,10 @@ unsafe boundary and apply the repository unsafe review process before merging.
     transaction; preserve `TrxContext` as immutable identity/runtime view.
   - Non-goals: Changing row undo/CDB semantics or implementing DDL features
     beyond the lock plumbing needed by later phases.
-  - Task Doc: `docs/tasks/TBD.md`
-  - Task Issue: `#0`
-  - Phase Status: `pending`
-  - Implementation Summary: `pending`
+  - Task Doc: `docs/tasks/000139-lock-lifecycle-integration.md`
+  - Task Issue: `#606`
+  - Phase Status: done
+  - Implementation Summary: Implemented Phase 2 by making LockManager a registry-owned component exposed via QuiescentGuard, adding statement/session/transaction owner cleanup, and adding a TrxLockState cache outside TrxContext with terminal release across rollback, no-op commit, ordered commit, and abort paths. Validation passed. [Task Resolve Sync: docs/tasks/000139-lock-lifecycle-integration.md @ 2026-05-02]
 
 - **Phase 3: Metadata And Row-Write Lock Integration**
   - Scope: Acquire statement-lifetime `TableMetadata(S)` for MVCC reads;

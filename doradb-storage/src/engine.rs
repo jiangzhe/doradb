@@ -13,6 +13,7 @@ use crate::component::{
 use crate::conf::EngineConfig;
 use crate::error::{LifecycleError, LifecycleResult, Result};
 use crate::file::fs::{FileSystem, FileSystemWorkers};
+use crate::lock::LockManager;
 use crate::quiescent::QuiescentGuard;
 use crate::session::{Session, SessionID};
 use crate::trx::sys::TransactionSystem;
@@ -255,6 +256,12 @@ impl EngineRef {
         &self.catalog
     }
 
+    /// Return the shared logical lock manager.
+    #[inline]
+    pub(crate) fn lock_manager(&self) -> &QuiescentGuard<LockManager> {
+        self.0.lock_manager()
+    }
+
     /// Returns the next engine-local session identity.
     #[inline]
     pub(crate) fn next_session_id(&self) -> SessionID {
@@ -281,12 +288,20 @@ pub struct EngineInner {
     pub table_fs: QuiescentGuard<FileSystem>,
     /// Global readonly pool for persisted table-file reads.
     pub disk_pool: DiskPool,
+    /// Shared logical metadata and table-data lock manager.
+    lock_manager: QuiescentGuard<LockManager>,
     /// Monotonically increasing engine-local session identity source.
     next_session_id: AtomicU64,
     lifecycle: EngineLifecycle,
 }
 
 impl EngineInner {
+    /// Return the shared logical lock manager.
+    #[inline]
+    pub(crate) fn lock_manager(&self) -> &QuiescentGuard<LockManager> {
+        &self.lock_manager
+    }
+
     /// Returns the next engine-local session identity.
     #[inline]
     pub(crate) fn next_session_id(&self) -> SessionID {
@@ -344,6 +359,7 @@ impl EngineConfig {
             .await?;
         builder.build::<FileSystemWorkers>(()).await?;
         builder.build::<SharedPoolEvictorWorkers>(()).await?;
+        builder.build::<LockManager>(()).await?;
         // Catalog owns user-table runtimes, and those runtimes retain buffer-pool
         // guards for row/index/readonly access. Register catalog after the pools it
         // can pin so reverse shutdown/drop order releases table guards before pool
@@ -360,6 +376,7 @@ impl EngineConfig {
         let mem_pool = registry.dependency::<MemPool>()?;
         let table_fs = registry.dependency::<FileSystem>()?;
         let disk_pool = registry.dependency::<DiskPool>()?;
+        let lock_manager = registry.dependency::<LockManager>()?;
         let engine_inner = EngineInner {
             catalog,
             trx_sys,
@@ -368,6 +385,7 @@ impl EngineConfig {
             mem_pool,
             table_fs,
             disk_pool,
+            lock_manager,
             next_session_id: AtomicU64::new(FIRST_SESSION_ID),
             lifecycle: EngineLifecycle::new(),
         };
@@ -385,11 +403,13 @@ mod tests {
     use crate::catalog::tests::table1;
     use crate::conf::consts::STORAGE_LAYOUT_FILE_NAME;
     use crate::conf::{EngineConfig, EvictableBufferPoolConfig, FileSystemConfig, TrxSysConfig};
-    use crate::error::{ConfigError, ErrorKind, LifecycleError, ResourceError};
+    use crate::error::{ConfigError, ErrorKind, LifecycleError, OperationError, ResourceError};
     use crate::file::fs::tests::io_backend_stats_handle_identity as fs_stats_handle_identity;
+    use crate::lock::{LockMode, LockOwner, LockResource};
     use std::fs;
     use std::panic::{AssertUnwindSafe, catch_unwind};
     use std::sync::{Arc as StdArc, Barrier};
+    use std::time::Duration;
     use tempfile::TempDir;
 
     const TEST_POOL_BYTES: usize = 64 * 1024 * 1024;
@@ -440,6 +460,114 @@ mod tests {
     }
 
     #[test]
+    fn test_engine_lock_manager_is_shared_across_runtime_handles() {
+        smol::block_on(async {
+            let root = TempDir::new().unwrap();
+            let engine = test_engine_config_for(root.path()).build().await.unwrap();
+            let engine_ref = engine.new_ref().unwrap();
+            let resource = LockResource::CatalogNamespace;
+            let owner = LockOwner::Session(10);
+
+            assert!(
+                engine
+                    .lock_manager()
+                    .try_acquire(resource, LockMode::Exclusive, owner)
+                    .unwrap()
+            );
+            assert!(
+                !engine_ref
+                    .lock_manager()
+                    .try_acquire(resource, LockMode::Shared, LockOwner::Session(11))
+                    .unwrap()
+            );
+            assert_eq!(engine_ref.lock_manager().release_owner(owner), 1);
+            assert!(
+                engine
+                    .lock_manager()
+                    .try_acquire(resource, LockMode::Shared, LockOwner::Session(11))
+                    .unwrap()
+            );
+        });
+    }
+
+    #[test]
+    fn test_session_drop_releases_session_owned_locks() {
+        smol::block_on(async {
+            let root = TempDir::new().unwrap();
+            let engine = test_engine_config_for(root.path()).build().await.unwrap();
+            let session = engine.try_new_session().unwrap();
+            let resource = LockResource::TableData(91_200);
+
+            assert!(
+                engine
+                    .lock_manager()
+                    .try_acquire(
+                        resource,
+                        LockMode::Exclusive,
+                        LockOwner::Session(session.id())
+                    )
+                    .unwrap()
+            );
+            drop(session);
+
+            assert!(
+                engine
+                    .lock_manager()
+                    .try_acquire(resource, LockMode::Shared, LockOwner::Session(91_201))
+                    .unwrap()
+            );
+        });
+    }
+
+    #[test]
+    fn test_session_drop_releases_session_owned_waiters() {
+        smol::block_on(async {
+            let root = TempDir::new().unwrap();
+            let engine = test_engine_config_for(root.path()).build().await.unwrap();
+            let resource = LockResource::TableMetadata(91_202);
+            let blocking_owner = LockOwner::Session(91_203);
+            assert!(
+                engine
+                    .lock_manager()
+                    .try_acquire(resource, LockMode::Exclusive, blocking_owner)
+                    .unwrap()
+            );
+
+            let session = engine.try_new_session().unwrap();
+            let waiting_owner = LockOwner::Session(session.id());
+            let manager = engine.lock_manager().clone();
+            let wait_task = smol::spawn(async move {
+                manager
+                    .acquire(resource, LockMode::Shared, waiting_owner)
+                    .await
+            });
+
+            let mut waiter_seen = false;
+            for _ in 0..100 {
+                waiter_seen = engine
+                    .lock_manager()
+                    .debug_snapshot()
+                    .entries
+                    .iter()
+                    .any(|entry| entry.owner == waiting_owner);
+                if waiter_seen {
+                    break;
+                }
+                smol::Timer::after(Duration::from_millis(1)).await;
+            }
+            assert!(waiter_seen);
+
+            drop(session);
+            let err = wait_task.await.unwrap_err();
+            assert_eq!(
+                err.operation_error(),
+                Some(OperationError::LockWaiterReleased)
+            );
+            assert_eq!(engine.lock_manager().release_owner(blocking_owner), 1);
+        });
+    }
+
+    #[test]
     fn test_engine_component_order_uses_shared_storage_and_evictor_workers() {
         smol::block_on(async {
             let root = TempDir::new().unwrap();
@@ -455,6 +583,7 @@ mod tests {
                     "mem_pool",
                     "fs_workers",
                     "shared_pool_evictor_workers",
+                    "lock_manager",
                     "catalog",
                     "trx_sys",
                     "trx_sys_workers",

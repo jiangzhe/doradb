@@ -1,7 +1,8 @@
 use crate::buffer::PoolGuards;
 
 use crate::catalog::{TableCache, TableID, TableSpec};
-use crate::error::Result;
+use crate::error::{InternalError, Result};
+use crate::lock::{LockMode, LockOwner, LockResource};
 use crate::row::RowID;
 use crate::row::ops::SelectKey;
 use crate::trx::redo::{DDLRedo, RedoLogs, RowRedo};
@@ -9,6 +10,7 @@ use crate::trx::undo::{
     IndexUndo, IndexUndoKind, IndexUndoLogs, OwnedRowUndo, RowUndoKind, RowUndoLogs,
 };
 use crate::trx::{ActiveTrx, TrxContext};
+use error_stack::Report;
 use std::mem;
 
 /// Kind-specific payload for statements with deferred catalog-side effects.
@@ -216,14 +218,24 @@ impl Drop for StmtEffects {
 pub struct Statement<'stmt> {
     ctx: &'stmt TrxContext,
     effects: &'stmt mut StmtEffects,
+    #[allow(dead_code)]
+    owner: LockOwner,
 }
 
 impl<'stmt> Statement<'stmt> {
     /// Create a new statement.
     #[inline]
-    pub(crate) fn new(ctx: &'stmt TrxContext, effects: &'stmt mut StmtEffects) -> Self {
+    pub(crate) fn new(
+        ctx: &'stmt TrxContext,
+        effects: &'stmt mut StmtEffects,
+        owner: LockOwner,
+    ) -> Self {
         debug_assert!(effects.is_empty());
-        Statement { ctx, effects }
+        Statement {
+            ctx,
+            effects,
+            owner,
+        }
     }
 
     /// Returns this statement's immutable transaction context.
@@ -236,6 +248,48 @@ impl<'stmt> Statement<'stmt> {
     #[inline]
     pub fn effects_mut(&mut self) -> &mut StmtEffects {
         self.effects
+    }
+
+    /// Returns the statement-owned logical lock owner.
+    #[inline]
+    #[allow(dead_code)]
+    pub(crate) fn lock_owner(&self) -> LockOwner {
+        self.owner
+    }
+
+    /// Attempts to acquire a statement-owned logical lock without waiting.
+    #[inline]
+    #[allow(dead_code)]
+    pub(crate) fn try_acquire_statement_lock(
+        &self,
+        resource: LockResource,
+        mode: LockMode,
+    ) -> Result<bool> {
+        let engine = self.ctx.engine().ok_or_else(|| {
+            Report::new(InternalError::ActiveTransactionDiscarded)
+                .attach("operation=try acquire statement lock")
+        })?;
+        engine
+            .lock_manager()
+            .try_acquire(resource, mode, self.owner)
+    }
+
+    /// Acquires a statement-owned logical lock.
+    #[inline]
+    #[allow(dead_code)]
+    pub(crate) async fn acquire_statement_lock(
+        &self,
+        resource: LockResource,
+        mode: LockMode,
+    ) -> Result<()> {
+        let engine = self.ctx.engine().ok_or_else(|| {
+            Report::new(InternalError::ActiveTransactionDiscarded)
+                .attach("operation=acquire statement lock")
+        })?;
+        engine
+            .lock_manager()
+            .acquire(resource, mode, self.owner)
+            .await
     }
 
     /// Returns disjoint transaction context and statement effects references.
@@ -300,6 +354,16 @@ mod tests {
         ActiveTrx::new(session_state, MIN_ACTIVE_TRX_ID + sts, sts, 0, 0)
     }
 
+    fn lock_entry_count(engine: &Engine, owner: LockOwner) -> usize {
+        engine
+            .lock_manager()
+            .debug_snapshot()
+            .entries
+            .iter()
+            .filter(|entry| entry.owner == owner)
+            .count()
+    }
+
     #[test]
     fn test_stmt_effects_empty() {
         let effects = StmtEffects::empty();
@@ -324,9 +388,21 @@ mod tests {
         smol::block_on(async {
             let (_temp_dir, engine) = test_engine("redo_stmt_index_rollback_fail").await;
             let mut trx = test_trx(&engine, 52);
+            let trx_owner = trx.lock_owner().unwrap();
+            trx.try_acquire_transaction_lock(
+                LockResource::TableData(91_250),
+                LockMode::IntentExclusive,
+            )
+            .unwrap();
+            let stmt_owner = Cell::new(None);
 
             let res: Result<()> = trx
                 .exec(async |stmt| {
+                    stmt_owner.set(Some(stmt.lock_owner()));
+                    stmt.try_acquire_statement_lock(
+                        LockResource::TableMetadata(91_250),
+                        LockMode::Shared,
+                    )?;
                     // This row undo references a table that does not exist. If
                     // statement rollback ever runs row rollback before index
                     // rollback, this test fails before the injected index
@@ -354,6 +430,8 @@ mod tests {
                 err.report().downcast_ref::<FatalError>().copied(),
                 Some(FatalError::RollbackAccess)
             );
+            assert_eq!(lock_entry_count(&engine, stmt_owner.get().unwrap()), 0);
+            assert_eq!(lock_entry_count(&engine, trx_owner), 0);
             assert!(
                 engine
                     .trx_sys
