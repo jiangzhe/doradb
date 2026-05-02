@@ -154,6 +154,24 @@ returned. If that rollback cannot access required storage, the rollback failure
 is fatal: storage is poisoned, the transaction is detached from its session, and
 later commit or rollback attempts on that discarded transaction return an error.
 
+Logical lock ownership is tracked outside `TrxContext`. `ActiveTrx` owns a
+mutable `TrxLockState` that caches the strongest transaction-owned lock per
+logical resource. The cache does not own the lock manager; acquisition and
+release receive the engine's `LockManager` component guard at the lifecycle
+method boundary. Transaction-owned locks are released on commit, rollback,
+no-op discard, or fatal transaction discard. `ActiveTrx::exec` assigns each
+statement a monotonic statement number and releases statement-owned logical
+locks after statement success or after statement rollback/fatal cleanup.
+Session-owned logical locks are released when the session state is dropped.
+
+Recovery does not acquire logical locks. Recovery runs during engine startup
+before foreground sessions, user transactions, or lock waiters exist, and it
+reconstructs catalog/table runtime state directly from checkpoint and redo
+inputs. Logical lock table contents are volatile coordination state rather than
+durable data, so replaying or synthesizing locks during recovery would add no
+serialization guarantee and would risk leaking startup-only owners into normal
+runtime execution.
+
 1. **Read**: 
    - Probe `MemIndex` first and then `DiskTree` as required by the index type.
    - Route to RowStore or ColumnStore based on `RowID` vs `Pivot`.
@@ -215,6 +233,11 @@ later commit or rollback attempts on that discarded transaction return an error.
      lightweight: setting the shared status makes all related undo records and
      deletion-buffer markers observe the commit timestamp.
 4. **Cleanup**: Discard local write buffers.
+
+Transaction-owned logical locks are not redo, undo, durability, or ordered
+commit effects by themselves. A transaction that only acquired logical locks
+still uses the readonly/no-op commit discard path, which releases those locks
+without assigning a commit timestamp.
 
 Recovery only treats checkpoint metadata, table roots, and real redo headers as
 stable timestamp carriers. A no-log ordered commit has a volatile CTS that is

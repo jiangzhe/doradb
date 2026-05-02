@@ -214,6 +214,8 @@ mod tests {
             redo_bin: Some(redo_bin(cts)),
             payload: None,
             session: None,
+            lock_manager: None,
+            lock_state: None,
         }
     }
 
@@ -223,6 +225,8 @@ mod tests {
             redo_bin: Some(redo_bin_large(cts)),
             payload: None,
             session: None,
+            lock_manager: None,
+            lock_state: None,
         }
     }
 
@@ -232,6 +236,8 @@ mod tests {
             redo_bin: None,
             payload: None,
             session: None,
+            lock_manager: None,
+            lock_state: None,
         }
     }
 

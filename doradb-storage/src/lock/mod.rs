@@ -5,7 +5,9 @@
 //! engine/session/transaction lifecycle wiring that later phases will add.
 
 use crate::catalog::TableID;
+use crate::component::{Component, ComponentRegistry, ShelfScope};
 use crate::error::{OperationError, Result};
+use crate::quiescent::{QuiescentBox, QuiescentGuard};
 use crate::session::SessionID;
 use crate::trx::TrxID;
 use dashmap::DashMap;
@@ -16,8 +18,8 @@ use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
 
-/// Statement sequence placeholder for statement-owned logical locks.
-pub type StatementSeq = u64;
+/// Statement number for statement-owned logical locks.
+pub type StmtNo = u64;
 
 /// Logical resource protected by the lock manager.
 ///
@@ -99,7 +101,7 @@ pub enum LockOwner {
     /// Lock held for a transaction lifetime.
     Transaction(TrxID),
     /// Lock held for one statement inside a transaction.
-    Statement(TrxID, StatementSeq),
+    Statement(TrxID, StmtNo),
 }
 
 /// Intended lifetime category for a logical lock.
@@ -346,6 +348,31 @@ impl Default for LockManager {
     fn default() -> Self {
         Self::new()
     }
+}
+
+impl Component for LockManager {
+    type Config = ();
+    type Owned = Self;
+    type Access = QuiescentGuard<Self>;
+
+    const NAME: &'static str = "lock_manager";
+
+    #[inline]
+    async fn build(
+        _config: Self::Config,
+        registry: &mut ComponentRegistry,
+        _shelf: ShelfScope<'_, Self>,
+    ) -> Result<()> {
+        registry.register::<Self>(Self::new())
+    }
+
+    #[inline]
+    fn access(owner: &QuiescentBox<Self::Owned>) -> Self::Access {
+        owner.guard()
+    }
+
+    #[inline]
+    fn shutdown(_component: &Self::Owned) {}
 }
 
 #[derive(Default)]
@@ -922,8 +949,8 @@ mod tests {
         LockOwner::Transaction(id)
     }
 
-    fn stmt(trx_id: TrxID, seq: StatementSeq) -> LockOwner {
-        LockOwner::Statement(trx_id, seq)
+    fn stmt(trx_id: TrxID, stmt_no: StmtNo) -> LockOwner {
+        LockOwner::Statement(trx_id, stmt_no)
     }
 
     fn session(id: SessionID) -> LockOwner {

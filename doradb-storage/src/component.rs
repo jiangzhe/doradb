@@ -93,10 +93,11 @@ impl<C: Component> ErasedComponentBox for TypedComponentBox<C> {
 /// 5. `MemPool`
 /// 6. `FileSystemWorkers` -> `FileSystem`, `IndexPool`, `MemPool`
 /// 7. `SharedPoolEvictorWorkers` -> `DiskPool`, `IndexPool`, `MemPool`
-/// 8. `Catalog` -> `MetaPool`, `FileSystem`, `DiskPool`
-/// 9. `TransactionSystem` -> `MetaPool`, `IndexPool`, `MemPool`, `FileSystem`,
-///    `DiskPool`, `Catalog`
-/// 10. `TransactionSystemWorkers` -> `TransactionSystem`
+/// 8. `LockManager`
+/// 9. `Catalog` -> `MetaPool`, `FileSystem`, `DiskPool`
+/// 10. `TransactionSystem` -> `MetaPool`, `IndexPool`, `MemPool`, `FileSystem`,
+///     `DiskPool`, `Catalog`
+/// 11. `TransactionSystemWorkers` -> `TransactionSystem`
 ///
 /// In addition to the direct component edges above, `Catalog` owns user-table
 /// runtimes that retain guards into `MemPool`, `IndexPool`, `FileSystem`,

@@ -277,6 +277,8 @@ pub(crate) enum InternalError {
     ColumnDeletionBlobInvariant,
     #[error("active transaction is discarded")]
     ActiveTransactionDiscarded,
+    #[error("statement number overflow")]
+    StatementNumberOverflow,
     #[cfg(test)]
     #[error("injected test failure")]
     InjectedTestFailure,

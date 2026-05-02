@@ -291,6 +291,7 @@ impl TransactionSystem {
         }
         trx.effects_mut().clear_for_rollback();
         self.log_partitions[log_no].gc_buckets[gc_no].gc_analyze_rollback(sts);
+        trx.release_transaction_locks();
         if let Some(s) = trx.take_session() {
             s.rollback();
         }
@@ -314,6 +315,7 @@ impl TransactionSystem {
         if let Some(s) = trx.session.take() {
             s.rollback();
         }
+        trx.release_transaction_locks();
     }
 
     /// Returns statistics of group commit.

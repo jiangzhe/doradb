@@ -1424,6 +1424,8 @@ mod tests {
                 redo_bin: None,
                 payload: None,
                 session: None,
+                lock_manager: None,
+                lock_state: None,
             }],
             max_cts: cts,
             log_bytes,
