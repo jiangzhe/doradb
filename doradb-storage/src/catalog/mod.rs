@@ -525,7 +525,7 @@ pub mod tests {
     use crate::file::block_integrity::{BLOCK_INTEGRITY_HEADER_SIZE, write_block_checksum};
     use crate::file::cow_file::COW_FILE_PAGE_SIZE;
     use crate::index::{COLUMN_BLOCK_HEADER_SIZE, COLUMN_BLOCK_LEAF_HEADER_SIZE, ColumnBlockIndex};
-    use crate::table::{TableAccess, TablePersistence};
+    use crate::table::TablePersistence;
     use crate::trx::MIN_SNAPSHOT_TS;
     use crate::trx::sys::CatalogCheckpointScanStopReason;
     use crate::value::{Val, ValKind};
@@ -1069,11 +1069,7 @@ pub mod tests {
             let mut session = engine.try_new_session().unwrap();
             let mut trx = session.try_begin_trx().unwrap().unwrap();
             trx.exec(async |stmt| {
-                let (ctx, effects) = stmt.ctx_and_effects_mut();
-                table
-                    .accessor()
-                    .insert_mvcc(ctx, effects, vec![Val::I32(7)])
-                    .await?;
+                stmt.table_insert_mvcc(&table, vec![Val::I32(7)]).await?;
                 Ok(())
             })
             .await
@@ -1182,10 +1178,7 @@ pub mod tests {
 
             let mut trx = session.try_begin_trx().unwrap().unwrap();
             trx.exec(async |stmt| {
-                let (ctx, effects) = stmt.ctx_and_effects_mut();
-                checkpointed_table
-                    .accessor()
-                    .insert_mvcc(ctx, effects, vec![Val::I32(7)])
+                stmt.table_insert_mvcc(&checkpointed_table, vec![Val::I32(7)])
                     .await?;
                 Ok(())
             })
@@ -1195,11 +1188,11 @@ pub mod tests {
 
             let mut trx = session.try_begin_trx().unwrap().unwrap();
             trx.exec(async |stmt| {
-                let (ctx, effects) = stmt.ctx_and_effects_mut();
-                replay_only_table
-                    .accessor()
-                    .insert_mvcc(ctx, effects, vec![Val::I32(9), Val::from("replay-backed")])
-                    .await?;
+                stmt.table_insert_mvcc(
+                    &replay_only_table,
+                    vec![Val::I32(9), Val::from("replay-backed")],
+                )
+                .await?;
                 Ok(())
             })
             .await

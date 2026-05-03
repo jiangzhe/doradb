@@ -145,24 +145,41 @@ catalog load, and file-internal root reads remain explicit unchecked
 exceptions outside this runtime transaction contract.
 
 Each user statement runs through `ActiveTrx::exec(async |stmt| { ... })`.
-`Statement` is a borrowed facade over immutable `TrxContext` and
+`Statement` is a borrowed facade over immutable `TrxContext` and owned
 statement-local `StmtEffects`; callers cannot construct or finish it directly.
 When the callback succeeds, statement row undo, index undo, and redo effects
 merge into the active transaction. When the callback returns an ordinary error,
 only the current statement effects are rolled back and the original error is
 returned. If that rollback cannot access required storage, the rollback failure
-is fatal: storage is poisoned, the transaction is detached from its session, and
-later commit or rollback attempts on that discarded transaction return an error.
+is fatal: storage is poisoned, the session is marked out of transaction, and the
+active transaction is marked discarded so later commit or rollback attempts
+return an error.
 
-Logical lock ownership is tracked outside `TrxContext`. `ActiveTrx` owns a
-mutable `TrxLockState` that caches the strongest transaction-owned lock per
-logical resource. The cache does not own the lock manager; acquisition and
-release receive the engine's `LockManager` component guard at the lifecycle
-method boundary. Transaction-owned locks are released on commit, rollback,
-no-op discard, or fatal transaction discard. `ActiveTrx::exec` assigns each
-statement a monotonic statement number and releases statement-owned logical
-locks after statement success or after statement rollback/fatal cleanup.
-Session-owned logical locks are released when the session state is dropped.
+Logical lock ownership is tracked outside `TrxContext`. `ActiveTrx` owns an
+`OwnerLockState` for the transaction owner that caches the strongest granted
+mode per logical resource. `Statement` owns its statement-owner
+`OwnerLockState` and releases statement-owned locks from its drop guard after
+statement success or after statement rollback/fatal cleanup. The caches do not
+own the lock manager; acquisition and release receive the engine's
+`LockManager` component guard at the lifecycle boundary. Transaction-owned
+locks are released on commit, rollback, no-op discard, or fatal transaction
+discard. Session-owned logical locks are released when the session state is
+dropped.
+
+Foreground table access enters through lock-aware `Statement` APIs. Plain MVCC
+table scans, unique lookups, and index scans acquire statement-lifetime
+`TableMetadata(S)` and do not acquire `TableData`. Row inserts, updates, and
+deletes acquire transaction-lifetime `TableMetadata(S)` followed by
+`TableData(IX)` before installing row undo, deletion-buffer ownership, or
+secondary-index write undo. Repeated writes to the same table reuse the
+transaction lock cache rather than re-entering the lock manager.
+
+`CREATE TABLE` acquires a session-owned `CatalogNamespace(X)` before allocating
+the user table id and holds it through catalog-row writes, implicit DDL commit,
+table-file publication, runtime table construction, and catalog runtime
+publication. Recovery, checkpoint, purge, and no-transaction catalog replay
+remain outside logical lock acquisition because they run at internal lifecycle
+boundaries rather than through foreground sessions and waiters.
 
 Recovery does not acquire logical locks. Recovery runs during engine startup
 before foreground sessions, user transactions, or lock waiters exist, and it

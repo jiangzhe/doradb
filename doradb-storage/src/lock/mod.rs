@@ -334,8 +334,14 @@ impl LockManager {
         }
     }
 
+    /// Returns whether `owner` currently holds a mode covering `requested`.
     #[inline]
-    fn owner_holds(&self, resource: LockResource, owner: LockOwner, requested: LockMode) -> bool {
+    pub(crate) fn owner_holds(
+        &self,
+        resource: LockResource,
+        owner: LockOwner,
+        requested: LockMode,
+    ) -> bool {
         self.resources
             .get(&resource)
             .and_then(|resource_state| resource_state.granted_mode(owner))

@@ -8,7 +8,7 @@ use doradb_storage::conf::{
 use doradb_storage::engine::{Engine, EngineRef};
 use doradb_storage::row::ops::{DeleteMvcc, SelectKey, SelectMvcc};
 use doradb_storage::session::Session;
-use doradb_storage::table::{CheckpointOutcome, Table, TableAccess, TablePersistence};
+use doradb_storage::table::{CheckpointOutcome, Table, TablePersistence};
 use doradb_storage::value::{Val, ValKind};
 use std::hint::black_box;
 use std::sync::Arc;
@@ -146,14 +146,7 @@ async fn insert_rows(table: &Arc<Table>, session: &mut Session, rows: usize) {
     for idx in 0..rows {
         let name = format!("name-{idx}");
         trx.exec(async |stmt| {
-            let (ctx, effects) = stmt.ctx_and_effects_mut();
-            table
-                .accessor()
-                .insert_mvcc(
-                    ctx,
-                    effects,
-                    vec![Val::from(idx as i32), Val::from(&name[..])],
-                )
+            stmt.table_insert_mvcc(table, vec![Val::from(idx as i32), Val::from(&name[..])])
                 .await?;
             Ok(())
         })
@@ -168,11 +161,7 @@ async fn delete_rows(table: &Arc<Table>, session: &mut Session, rows: usize, str
     for idx in (0..rows).step_by(stride) {
         let key = SelectKey::new(0, vec![Val::from(idx as i32)]);
         trx.exec(async |stmt| {
-            let (ctx, effects) = stmt.ctx_and_effects_mut();
-            let res = table
-                .accessor()
-                .delete_unique_mvcc(ctx, effects, &key, false)
-                .await?;
+            let res = stmt.table_delete_unique_mvcc(table, &key, false).await?;
             assert!(matches!(res, DeleteMvcc::Deleted));
             Ok(())
         })
@@ -226,9 +215,8 @@ fn bench_parallel(case: &BenchmarkCase, threads: usize, iterations_per_thread: u
                         let key = &keys[(worker_idx + step * threads) % keys.len()];
                         let vals = trx
                             .exec(async |stmt| {
-                                let res = table
-                                    .accessor()
-                                    .index_lookup_unique_mvcc(stmt.ctx(), key, &READ_SET)
+                                let res = stmt
+                                    .table_lookup_unique_mvcc(&table, key, &READ_SET)
                                     .await?;
                                 let vals = match res {
                                     SelectMvcc::Found(vals) => vals,

@@ -651,7 +651,7 @@ mod tests {
     use crate::latch::LatchFallbackMode;
     use crate::row::ops::{DeleteMvcc, SelectKey};
     use crate::row::{RowID, RowPage};
-    use crate::table::{DeleteMarker, Table, TableAccess};
+    use crate::table::{DeleteMarker, Table};
     use crate::trx::row::RowReadAccess;
     use crate::trx::stmt::Statement;
     use crate::trx::undo::{OwnedRowUndo, RowUndoKind, RowUndoLogs};
@@ -688,8 +688,7 @@ mod tests {
         table: &Table,
         cols: Vec<Val>,
     ) -> crate::error::Result<RowID> {
-        let (ctx, effects) = stmt.ctx_and_effects_mut();
-        table.accessor().insert_mvcc(ctx, effects, cols).await
+        stmt.table_insert_mvcc(table, cols).await
     }
 
     async fn stmt_delete_row(
@@ -697,11 +696,7 @@ mod tests {
         table: &Table,
         key: &SelectKey,
     ) -> crate::error::Result<DeleteMvcc> {
-        let (ctx, effects) = stmt.ctx_and_effects_mut();
-        table
-            .accessor()
-            .delete_unique_mvcc(ctx, effects, key, false)
-            .await
+        stmt.table_delete_unique_mvcc(table, key, false).await
     }
 
     #[test]

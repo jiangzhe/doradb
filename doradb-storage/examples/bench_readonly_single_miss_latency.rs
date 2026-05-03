@@ -11,7 +11,7 @@ use doradb_storage::conf::{
 use doradb_storage::io::IOBackendStats;
 use doradb_storage::row::ops::{SelectKey, SelectMvcc};
 use doradb_storage::session::Session;
-use doradb_storage::table::{CheckpointOutcome, Table, TableAccess, TablePersistence};
+use doradb_storage::table::{CheckpointOutcome, Table, TablePersistence};
 use doradb_storage::value::{Val, ValKind};
 use rand::RngCore;
 use std::hint::black_box;
@@ -193,9 +193,8 @@ fn main() {
         for (idx, key) in keys.iter().enumerate() {
             let vals = trx
                 .exec(async |stmt| {
-                    let res = table
-                        .accessor()
-                        .index_lookup_unique_mvcc(stmt.ctx(), key, &READ_SET)
+                    let res = stmt
+                        .table_lookup_unique_mvcc(&table, key, &READ_SET)
                         .await?;
                     let vals = match res {
                         SelectMvcc::Found(vals) => vals,
@@ -235,9 +234,8 @@ fn main() {
             let key = &keys[idx];
             let vals = trx
                 .exec(async |stmt| {
-                    let res = table
-                        .accessor()
-                        .index_lookup_unique_mvcc(stmt.ctx(), key, &READ_SET)
+                    let res = stmt
+                        .table_lookup_unique_mvcc(&table, key, &READ_SET)
                         .await?;
                     let vals = match res {
                         SelectMvcc::Found(vals) => vals,
@@ -282,10 +280,7 @@ async fn insert_rows(table: &Arc<Table>, session: &mut Session, rows: usize) {
     let mut trx = session.try_begin_trx().unwrap().unwrap();
     for idx in 0..rows {
         trx.exec(async |stmt| {
-            let (ctx, effects) = stmt.ctx_and_effects_mut();
-            table
-                .accessor()
-                .insert_mvcc(ctx, effects, vec![Val::from(idx as i32)])
+            stmt.table_insert_mvcc(table, vec![Val::from(idx as i32)])
                 .await?;
             Ok(())
         })

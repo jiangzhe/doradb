@@ -119,12 +119,7 @@ impl Columns<'_> {
             Val::from(obj.column_type as u32),
             Val::from(obj.column_attributes.bits()),
         ];
-        let (ctx, effects) = stmt.ctx_and_effects_mut();
-        self.table
-            .accessor()
-            .insert_mvcc(ctx, effects, cols)
-            .await
-            .is_ok()
+        stmt.catalog_insert_mvcc(self.table, cols).await.is_ok()
     }
 
     /// List all columns of one table from uncommitted-visible catalog rows.
@@ -163,10 +158,7 @@ impl Columns<'_> {
             PK_NO_COLUMNS,
             vec![Val::from(table_id), Val::from(column_no)],
         );
-        let (ctx, effects) = stmt.ctx_and_effects_mut();
-        self.table
-            .accessor()
-            .delete_unique_mvcc(ctx, effects, &key, true)
+        stmt.catalog_delete_unique_mvcc(self.table, &key, true)
             .await
             .is_ok_and(|res| matches!(res, DeleteMvcc::Deleted))
     }

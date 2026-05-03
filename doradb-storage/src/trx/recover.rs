@@ -772,8 +772,7 @@ mod tests {
         table: &Table,
         cols: Vec<Val>,
     ) -> crate::error::Result<RowID> {
-        let (ctx, effects) = stmt.ctx_and_effects_mut();
-        table.accessor().insert_mvcc(ctx, effects, cols).await
+        stmt.table_insert_mvcc(table, cols).await
     }
 
     async fn stmt_delete_row(
@@ -781,11 +780,7 @@ mod tests {
         table: &Table,
         key: &SelectKey,
     ) -> crate::error::Result<DeleteMvcc> {
-        let (ctx, effects) = stmt.ctx_and_effects_mut();
-        table
-            .accessor()
-            .delete_unique_mvcc(ctx, effects, key, false)
-            .await
+        stmt.table_delete_unique_mvcc(table, key, false).await
     }
 
     async fn stmt_update_row(
@@ -794,22 +789,16 @@ mod tests {
         key: &SelectKey,
         update: Vec<UpdateCol>,
     ) -> crate::error::Result<UpdateMvcc> {
-        let (ctx, effects) = stmt.ctx_and_effects_mut();
-        table
-            .accessor()
-            .update_unique_mvcc(ctx, effects, key, update)
-            .await
+        stmt.table_update_unique_mvcc(table, key, update).await
     }
 
     async fn stmt_select_row_mvcc(
-        stmt: &Statement<'_>,
+        stmt: &mut Statement<'_>,
         table: &Table,
         key: &SelectKey,
         user_read_set: &[usize],
     ) -> crate::error::Result<SelectMvcc> {
-        table
-            .accessor()
-            .index_lookup_unique_mvcc(stmt.ctx(), key, user_read_set)
+        stmt.table_lookup_unique_mvcc(table, key, user_read_set)
             .await
     }
 
@@ -1573,9 +1562,8 @@ mod tests {
             let mut trx = session.try_begin_trx().unwrap().unwrap();
             let rows = trx
                 .exec(async |stmt| {
-                    Ok(table
-                        .accessor()
-                        .index_scan_mvcc(stmt.ctx(), &name_key, &[0, 1])
+                    Ok(stmt
+                        .table_index_scan_mvcc(&table, &name_key, &[0, 1])
                         .await?
                         .unwrap_rows())
                 })

@@ -5,7 +5,7 @@ use crate::catalog::{IndexSpec, TableID, TableSpec};
 use crate::engine::EngineRef;
 use crate::error::{OperationError, Result};
 use crate::index::BlockIndex;
-use crate::lock::LockOwner;
+use crate::lock::{LockManager, LockMode, LockOwner, LockResource};
 use crate::row::RowID;
 use crate::table::Table;
 use crate::trx::redo::DDLRedo;
@@ -107,6 +107,9 @@ impl Session {
         }
 
         let engine = self.state.engine().clone();
+        let _namespace_lock = self
+            .acquire_catalog_namespace_lock(engine.lock_manager())
+            .await?;
         // 1. Prepare a new table file.
         //    User table file name is <table-id:016x>.tbl
         let table_id = engine.catalog().next_user_obj_id();
@@ -269,6 +272,36 @@ impl Session {
         engine.catalog().insert_user_table(table);
 
         Ok(table_id)
+    }
+
+    #[inline]
+    async fn acquire_catalog_namespace_lock<'a>(
+        &self,
+        lock_manager: &'a LockManager,
+    ) -> Result<ScopedSessionLock<'a>> {
+        let owner = LockOwner::Session(self.id());
+        let resource = LockResource::CatalogNamespace;
+        lock_manager
+            .acquire(resource, LockMode::Exclusive, owner)
+            .await?;
+        Ok(ScopedSessionLock {
+            lock_manager,
+            resource,
+            owner,
+        })
+    }
+}
+
+struct ScopedSessionLock<'a> {
+    lock_manager: &'a LockManager,
+    resource: LockResource,
+    owner: LockOwner,
+}
+
+impl Drop for ScopedSessionLock<'_> {
+    #[inline]
+    fn drop(&mut self) {
+        self.lock_manager.release(self.resource, self.owner);
     }
 }
 

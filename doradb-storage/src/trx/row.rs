@@ -737,7 +737,7 @@ impl<'a> RowWriteAccess<'a> {
     /// Add a Lock undo entry as a transaction-level logical row lock.
     #[allow(clippy::too_many_arguments)]
     #[inline]
-    pub fn lock_undo(
+    pub(crate) fn lock_undo(
         &mut self,
         ctx: &TrxContext,
         effects: &mut StmtEffects,
@@ -747,6 +747,7 @@ impl<'a> RowWriteAccess<'a> {
         row_id: RowID,
         key: Option<&SelectKey>,
     ) -> LockUndo {
+        ctx.debug_assert_table_write_lock_held(table_id);
         let row = self.page.row(self.row_idx);
         match &mut *self.guard {
             None => {

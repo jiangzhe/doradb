@@ -10,7 +10,6 @@ use doradb_storage::catalog::{
 };
 use doradb_storage::conf::{EngineConfig, EvictableBufferPoolConfig, TrxSysConfig};
 use doradb_storage::engine::{Engine, EngineRef};
-use doradb_storage::table::TableAccess;
 use doradb_storage::trx::log::LogSync;
 use doradb_storage::value::Val;
 use doradb_storage::value::ValKind;
@@ -182,20 +181,16 @@ async fn worker(
         });
         let mut trx = session.try_begin_trx().unwrap().unwrap();
         trx.exec(async |stmt| {
-            let (ctx, effects) = stmt.ctx_and_effects_mut();
-            table
-                .accessor()
-                .insert_mvcc(
-                    ctx,
-                    effects,
-                    vec![
-                        Val::from(id),
-                        Val::from(k),
-                        Val::from(&c[..]),
-                        Val::from(&pad[..]),
-                    ],
-                )
-                .await?;
+            stmt.table_insert_mvcc(
+                &table,
+                vec![
+                    Val::from(id),
+                    Val::from(k),
+                    Val::from(&c[..]),
+                    Val::from(&pad[..]),
+                ],
+            )
+            .await?;
             Ok(())
         })
         .await
