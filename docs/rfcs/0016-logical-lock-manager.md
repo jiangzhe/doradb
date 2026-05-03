@@ -589,8 +589,8 @@ unsafe boundary and apply the repository unsafe review process before merging.
     lock-manager migration.
   - Task Doc: `docs/tasks/000141-explicit-table-lock-interface-and-validation.md`
   - Task Issue: `#611`
-  - Phase Status: `pending`
-  - Implementation Summary: `pending`
+  - Phase Status: done
+  - Implementation Summary: Implemented explicit transaction/session table locks, owner-group coverage semantics, validation, cancellation-safe metadata cleanup, and focused tests. [Task Resolve Sync: docs/tasks/000141-explicit-table-lock-interface-and-validation.md @ 2026-05-03]
 
 ## Consequences
 

@@ -1,7 +1,7 @@
 ---
 id: 000141
 title: Explicit Table Lock Interface And Validation
-status: proposal
+status: implemented
 created: 2026-05-03
 github_issue: 611
 ---
@@ -215,6 +215,39 @@ References:
      checks, not as a new user-facing observability API.
 
 ## Implementation Notes
+
+- Implemented explicit table-lock validation through `LockMode` so only
+  `Shared` and `Exclusive` are accepted by public explicit table-lock APIs.
+- Added session owner-group semantics in the logical lock manager. Grouped
+  acquisition preserves exact-owner reentrancy, rejects non-covered same-group
+  conflicts with `LockOwnerGroupConflict`, and allows covered same-session
+  requests such as a transaction `IX` under a session-owned `TableData(X)`.
+- Added `Session::lock_table`, `Session::unlock_table`, and
+  `ActiveTrx::lock_table`. Transaction and statement lock state now carries
+  the session owner group, and transaction table locks reuse the transaction
+  lock cache.
+- Added cancellation-safe metadata cleanup for two-step explicit table-lock
+  acquisition. Fresh `TableMetadata(S)` grants are protected by a disarmable
+  RAII guard until the corresponding `TableData(S/X)` acquire succeeds, with
+  transaction cache insertion delayed until both locks are held.
+- Updated RFC-0016 to document the implemented limited owner-group behavior,
+  the no-`SIX` policy, the session unlock restriction while a transaction is
+  active, and Phase 4 task linkage.
+- Added integration coverage for invalid explicit modes, transaction and
+  session shared/exclusive table locks, same-session covered and non-covered
+  behavior, session unlock restrictions, repeated transaction cache reuse, and
+  metadata cleanup on failure/cancellation.
+- Task checklist found no unresolved required fixes and no deferred actionable
+  backlog items.
+- Validation passed:
+  `cargo fmt --check`;
+  `git diff --check`;
+  `cargo check -p doradb-storage --tests`;
+  `cargo clippy -p doradb-storage --all-targets -- -D warnings`;
+  `cargo nextest run -p doradb-storage` (688 passed);
+  `tools/coverage_focus.rs --path doradb-storage/src/lock --path doradb-storage/src/trx --path doradb-storage/src/session.rs --path doradb-storage/src/table/tests.rs`
+  (overall 96.25%; lock 97.52%; trx 94.26%; session 91.64%;
+  table tests 98.96%).
 
 ## Impacts
 
