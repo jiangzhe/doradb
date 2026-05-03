@@ -1,7 +1,7 @@
 ---
 id: 0016
 title: Logical Lock Manager
-status: draft
+status: implemented
 tags: [storage, transaction, ddl, lock]
 created: 2026-04-29
 github_issue: 599
