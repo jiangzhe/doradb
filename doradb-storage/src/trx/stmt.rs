@@ -242,12 +242,16 @@ impl<'stmt> Statement<'stmt> {
         lock_manager: QuiescentGuard<LockManager>,
         trx_locks: &'stmt mut OwnerLockState,
     ) -> Self {
+        let owner_group = trx_locks.owner_group();
         Statement {
             ctx,
             effects: StmtEffects::empty(),
             lock_manager,
             trx_locks,
-            stmt_locks: OwnerLockState::new(owner),
+            stmt_locks: match owner_group {
+                Some(owner_group) => OwnerLockState::new_grouped(owner, owner_group),
+                None => OwnerLockState::new(owner),
+            },
         }
     }
 

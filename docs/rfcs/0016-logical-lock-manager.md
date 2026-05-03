@@ -246,9 +246,15 @@ unless the command also changes schema, in which case it uses
 `TableMetadata(X)`. A session-owned table lock also constrains transactions
 started by the same session: for example, a session holding `TableData(S)` must
 not write that table until it releases the session lock or explicitly upgrades
-to a compatible stronger lock. The first implementation does not treat
-same-session transaction owners as automatically compatible with
-session-owned locks. [U6], [U9], [U12], [D9]
+to `TableData(X)`. The first implementation uses limited owner-group
+semantics rather than treating same-session owners as generally compatible. A
+different owner in the same session group may proceed only when an already
+granted same-group mode covers the requested mode for that resource. Thus a
+session-owned `TableData(X)` covers same-session transaction `TableData(IX)`
+for protected row writes, while a session-owned `TableData(S)` does not. Same
+exact-owner reentrancy and immediate conversion continue to use ordinary
+coverage rules, and v1 still does not synthesize `SIX`. [U6], [U9], [U12],
+[D9]
 
 `CREATE TABLE` acquires `CatalogNamespace(X)` before checking name absence,
 allocating a table id, creating table files, inserting catalog rows, inserting
@@ -325,6 +331,12 @@ including autocommit statements. If future execution paths allow
 statement-lifetime metadata reads without an active transaction, statement
 owner identity should be extended with `SessionId`. [U7], [U9], [U13], [D10],
 [C8], [C9]
+
+The implementation may also associate owners with an optional owner group keyed
+by `SessionId`. Owner groups are not general compatibility classes: they only
+allow a same-session request to proceed when an existing same-session granted
+mode covers that request. Non-covered same-session requests fail rather than
+waiting on the caller's own session lock. [U9], [U12], [D9], [D10]
 
 Statement-lifetime locks are released when `Statement::succeed()` or
 `Statement::fail()` completes. Transaction-lifetime locks are released after
@@ -410,7 +422,10 @@ rollback, or fatal transaction cleanup. Early transaction unlock would require
 downgrade and cache-invalidation semantics, and could violate metadata/data-lock
 protection for uncommitted row, index, or rollback obligations. Session-owned
 locks have an explicit unlock API because their lifetime is not bounded by
-transaction cleanup. [U9], [U15], [C8], [C9]
+transaction cleanup. A session unlock must fail while the session still has an
+active transaction, so a group-covered transaction lock cannot outlive the
+session lock that allowed it to proceed ahead of external waiters. [U9], [U15],
+[C8], [C9]
 
 ### Row-Level Locking Remains As-Is
 
@@ -572,8 +587,8 @@ unsafe boundary and apply the repository unsafe review process before merging.
     same-session DML until unlocked or upgraded.
   - Non-goals: SQL parser integration, online DDL, deadlock detection, or row
     lock-manager migration.
-  - Task Doc: `docs/tasks/TBD.md`
-  - Task Issue: `#0`
+  - Task Doc: `docs/tasks/000141-explicit-table-lock-interface-and-validation.md`
+  - Task Issue: `#611`
   - Phase Status: `pending`
   - Implementation Summary: `pending`
 

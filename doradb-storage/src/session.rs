@@ -5,7 +5,7 @@ use crate::catalog::{IndexSpec, TableID, TableSpec};
 use crate::engine::EngineRef;
 use crate::error::{OperationError, Result};
 use crate::index::BlockIndex;
-use crate::lock::{LockManager, LockMode, LockOwner, LockResource};
+use crate::lock::{LockManager, LockMode, LockOwner, LockOwnerGroup, LockResource};
 use crate::row::RowID;
 use crate::table::Table;
 use crate::trx::redo::DDLRedo;
@@ -274,15 +274,51 @@ impl Session {
         Ok(table_id)
     }
 
+    /// Acquires an explicit session-lifetime table lock.
+    #[inline]
+    pub async fn lock_table(&self, table_id: TableID, mode: LockMode) -> Result<()> {
+        mode.validate_explicit_table_lock()?;
+        let lock_manager = self.state.engine().lock_manager();
+        let owner = LockOwner::Session(self.id());
+        let owner_group = LockOwnerGroup::Session(self.id());
+        lock_manager
+            .acquire_grouped(
+                LockResource::TableMetadata(table_id),
+                LockMode::Shared,
+                owner,
+                owner_group,
+            )
+            .await?;
+        lock_manager
+            .acquire_grouped(LockResource::TableData(table_id), mode, owner, owner_group)
+            .await
+    }
+
+    /// Releases an explicit session-lifetime table lock when no transaction is active.
+    #[inline]
+    pub fn unlock_table(&self, table_id: TableID) -> Result<()> {
+        if self.in_trx() {
+            return Err(Report::new(OperationError::NotSupported)
+                .attach("unlock table while session has an active transaction")
+                .into());
+        }
+        let owner = LockOwner::Session(self.id());
+        let lock_manager = self.state.engine().lock_manager();
+        lock_manager.release(LockResource::TableData(table_id), owner);
+        lock_manager.release(LockResource::TableMetadata(table_id), owner);
+        Ok(())
+    }
+
     #[inline]
     async fn acquire_catalog_namespace_lock<'a>(
         &self,
         lock_manager: &'a LockManager,
     ) -> Result<ScopedSessionLock<'a>> {
         let owner = LockOwner::Session(self.id());
+        let owner_group = LockOwnerGroup::Session(self.id());
         let resource = LockResource::CatalogNamespace;
         lock_manager
-            .acquire(resource, LockMode::Exclusive, owner)
+            .acquire_grouped(resource, LockMode::Exclusive, owner, owner_group)
             .await?;
         Ok(ScopedSessionLock {
             lock_manager,

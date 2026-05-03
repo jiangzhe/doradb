@@ -35,7 +35,7 @@ use crate::catalog::TableID;
 use crate::engine::EngineRef;
 use crate::error::{InternalError, OperationError, Result};
 use crate::file::table_file::OldRoot;
-use crate::lock::{LockManager, LockMode, LockOwner, LockResource, StmtNo};
+use crate::lock::{LockManager, LockMode, LockOwner, LockOwnerGroup, LockResource, StmtNo};
 use crate::quiescent::QuiescentGuard;
 use crate::row::RowID;
 use crate::session::SessionState;
@@ -486,6 +486,7 @@ impl TrxEffects {
 /// whole lock table.
 pub(crate) struct OwnerLockState {
     owner: LockOwner,
+    owner_group: Option<LockOwnerGroup>,
     held: HashMap<LockResource, LockMode>,
 }
 
@@ -495,6 +496,17 @@ impl OwnerLockState {
     pub(crate) fn new(owner: LockOwner) -> Self {
         OwnerLockState {
             owner,
+            owner_group: None,
+            held: HashMap::new(),
+        }
+    }
+
+    /// Create an empty cache for one logical owner inside an owner group.
+    #[inline]
+    pub(crate) fn new_grouped(owner: LockOwner, owner_group: LockOwnerGroup) -> Self {
+        OwnerLockState {
+            owner,
+            owner_group: Some(owner_group),
             held: HashMap::new(),
         }
     }
@@ -503,6 +515,12 @@ impl OwnerLockState {
     #[inline]
     pub(crate) fn owner(&self) -> LockOwner {
         self.owner
+    }
+
+    /// Returns the owner group represented by this state, if any.
+    #[inline]
+    pub(crate) fn owner_group(&self) -> Option<LockOwnerGroup> {
+        self.owner_group
     }
 
     /// Returns whether the cached lock mode covers the requested mode.
@@ -532,7 +550,13 @@ impl OwnerLockState {
         if self.cached_covers(resource, mode)? {
             return Ok(true);
         }
-        if !lock_manager.try_acquire(resource, mode, self.owner)? {
+        let acquired = match self.owner_group {
+            Some(owner_group) => {
+                lock_manager.try_acquire_grouped(resource, mode, self.owner, owner_group)?
+            }
+            None => lock_manager.try_acquire(resource, mode, self.owner)?,
+        };
+        if !acquired {
             return Ok(false);
         }
         self.cache_granted(resource, mode);
@@ -553,7 +577,16 @@ impl OwnerLockState {
         if self.cached_covers(resource, mode)? {
             return Ok(());
         }
-        lock_manager.acquire(resource, mode, self.owner).await?;
+        match self.owner_group {
+            Some(owner_group) => {
+                lock_manager
+                    .acquire_grouped(resource, mode, self.owner, owner_group)
+                    .await?;
+            }
+            None => {
+                lock_manager.acquire(resource, mode, self.owner).await?;
+            }
+        }
         self.cache_granted(resource, mode);
         Ok(())
     }
@@ -621,10 +654,14 @@ impl ActiveTrx {
         log_no: usize,
         gc_no: usize,
     ) -> Self {
+        let owner_group = LockOwnerGroup::Session(session.id());
         ActiveTrx {
             ctx: TrxContext::new(session, trx_id, sts, log_no, gc_no),
             effects: TrxEffects::empty(),
-            lock_state: Some(OwnerLockState::new(LockOwner::Transaction(trx_id))),
+            lock_state: Some(OwnerLockState::new_grouped(
+                LockOwner::Transaction(trx_id),
+                owner_group,
+            )),
             next_stmt_no: 1,
             state: ActiveTrxState::Active,
         }
@@ -822,6 +859,16 @@ impl ActiveTrx {
         let lock_manager = self.checked_lock_manager("acquire transaction lock")?;
         self.checked_lock_state_mut("acquire transaction lock")?
             .acquire(&lock_manager, resource, mode)
+            .await
+    }
+
+    /// Acquires an explicit transaction-lifetime table lock.
+    #[inline]
+    pub async fn lock_table(&mut self, table_id: TableID, mode: LockMode) -> Result<()> {
+        mode.validate_explicit_table_lock()?;
+        self.acquire_transaction_lock(LockResource::TableMetadata(table_id), LockMode::Shared)
+            .await?;
+        self.acquire_transaction_lock(LockResource::TableData(table_id), mode)
             .await
     }
 
