@@ -117,7 +117,7 @@ impl RowIdMove {
     }
 }
 
-pub trait TableAccess {
+pub(crate) trait TableAccess {
     /// Table scan including uncommitted versions.
     ///
     /// This method iterates raw latest row versions and includes rows marked
@@ -238,7 +238,7 @@ pub trait TableAccess {
 /// `D` is the row-page pool type and `I` is the secondary-index pool type.
 /// Runtime aliases bind user tables to evictable row/index pools and catalog
 /// tables to the fixed metadata pool for both roles.
-pub struct TableAccessor<'a, D: 'static, I: 'static> {
+pub(crate) struct TableAccessor<'a, D: 'static, I: 'static> {
     mem: &'a GenericMemTable<D, I>,
     storage: Option<&'a ColumnStorage>,
     user_sec_idx: Option<&'a [SecondaryIndex<EvictableBufferPool>]>,
@@ -733,6 +733,70 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
                 .attach("LWC row access requires column storage")
                 .into()
         })
+    }
+
+    #[inline]
+    fn debug_assert_table_write_lock_held(&self, ctx: &TrxContext) {
+        ctx.debug_assert_table_write_lock_held(self.table_id());
+    }
+
+    #[inline]
+    fn push_insert_unique_index_undo(
+        &self,
+        ctx: &TrxContext,
+        effects: &mut StmtEffects,
+        row_id: RowID,
+        key: SelectKey,
+        merge_old_deleted: bool,
+    ) {
+        self.debug_assert_table_write_lock_held(ctx);
+        effects.push_insert_unique_index_undo(self.table_id(), row_id, key, merge_old_deleted);
+    }
+
+    #[inline]
+    fn push_insert_non_unique_index_undo(
+        &self,
+        ctx: &TrxContext,
+        effects: &mut StmtEffects,
+        row_id: RowID,
+        key: SelectKey,
+        merge_old_deleted: bool,
+    ) {
+        self.debug_assert_table_write_lock_held(ctx);
+        effects.push_insert_non_unique_index_undo(self.table_id(), row_id, key, merge_old_deleted);
+    }
+
+    #[inline]
+    fn push_delete_index_undo(
+        &self,
+        ctx: &TrxContext,
+        effects: &mut StmtEffects,
+        row_id: RowID,
+        key: SelectKey,
+        unique: bool,
+    ) {
+        self.debug_assert_table_write_lock_held(ctx);
+        effects.push_delete_index_undo(self.table_id(), row_id, key, unique);
+    }
+
+    #[inline]
+    fn push_update_unique_index_undo(
+        &self,
+        ctx: &TrxContext,
+        effects: &mut StmtEffects,
+        old_row_id: RowID,
+        new_row_id: RowID,
+        key: SelectKey,
+        old_deleted: bool,
+    ) {
+        self.debug_assert_table_write_lock_held(ctx);
+        effects.push_update_unique_index_undo(
+            self.table_id(),
+            old_row_id,
+            new_row_id,
+            key,
+            old_deleted,
+        );
     }
 
     #[inline]
@@ -2393,7 +2457,7 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
             {
                 IndexInsert::Ok(merged) => {
                     // insert index success.
-                    effects.push_insert_unique_index_undo(self.table_id(), row_id, key, merged);
+                    self.push_insert_unique_index_undo(ctx, effects, row_id, key, merged);
                     return Ok(InsertIndex::Inserted);
                 }
                 IndexInsert::DuplicateKey(old_row_id, deleted) => {
@@ -2440,12 +2504,8 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
                             {
                                 IndexCompareExchange::Ok => {
                                     // If we rollback this transaction, we need to undo the index update.
-                                    effects.push_update_unique_index_undo(
-                                        self.table_id(),
-                                        old_row_id,
-                                        row_id,
-                                        key,
-                                        deleted,
+                                    self.push_update_unique_index_undo(
+                                        ctx, effects, old_row_id, row_id, key, deleted,
                                     );
                                     return Ok(InsertIndex::Inserted);
                                 }
@@ -2481,12 +2541,8 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
                                 .await?
                             {
                                 IndexCompareExchange::Ok => {
-                                    effects.push_update_unique_index_undo(
-                                        self.table_id(),
-                                        old_row_id,
-                                        row_id,
-                                        key,
-                                        deleted,
+                                    self.push_update_unique_index_undo(
+                                        ctx, effects, old_row_id, row_id, key, deleted,
                                     );
                                     return Ok(InsertIndex::Inserted);
                                 }
@@ -2530,7 +2586,7 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
         {
             IndexInsert::Ok(merged) => {
                 // insert index success.
-                effects.push_insert_non_unique_index_undo(self.table_id(), row_id, key, merged);
+                self.push_insert_non_unique_index_undo(ctx, effects, row_id, key, merged);
                 Ok(InsertIndex::Inserted)
             }
             IndexInsert::DuplicateKey(..) => unreachable!(),
@@ -2554,7 +2610,7 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
             .unique_mask_as_deleted(ctx_pool_guards(ctx), key.index_no, &key.vals, row_id, view)
             .await?;
         debug_assert!(res); // should always succeed.
-        effects.push_delete_index_undo(self.table_id(), row_id, key, true);
+        self.push_delete_index_undo(ctx, effects, row_id, key, true);
         Ok(())
     }
 
@@ -2574,7 +2630,7 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
             .non_unique_mask_as_deleted(ctx_pool_guards(ctx), key.index_no, &key.vals, row_id, view)
             .await?;
         debug_assert!(res);
-        effects.push_delete_index_undo(self.table_id(), row_id, key, false);
+        self.push_delete_index_undo(ctx, effects, row_id, key, false);
         Ok(())
     }
 
@@ -2612,12 +2668,7 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
                 IndexInsert::Ok(merged) => {
                     debug_assert!(!merged);
                     // New key insert succeed.
-                    effects.push_insert_unique_index_undo(
-                        self.table_id(),
-                        new_row_id,
-                        new_key,
-                        false,
-                    );
+                    self.push_insert_unique_index_undo(ctx, effects, new_row_id, new_key, false);
                     // mark index of old row as deleted and defer delete.
                     self.defer_delete_unique_index(
                         ctx,
@@ -2676,12 +2727,8 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
                         {
                             IndexCompareExchange::Ok => {
                                 // New key update succeed.
-                                effects.push_update_unique_index_undo(
-                                    self.table_id(),
-                                    old_row_id,
-                                    new_row_id,
-                                    new_key,
-                                    deleted,
+                                self.push_update_unique_index_undo(
+                                    ctx, effects, old_row_id, new_row_id, new_key, deleted,
                                 );
                                 // mark index of old row as deleted and defer delete.
                                 self.defer_delete_unique_index(
@@ -2736,8 +2783,9 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
                             {
                                 IndexCompareExchange::Ok => {
                                     // New key update succeed.
-                                    effects.push_update_unique_index_undo(
-                                        self.table_id(),
+                                    self.push_update_unique_index_undo(
+                                        ctx,
+                                        effects,
                                         index_row_id,
                                         new_row_id,
                                         new_key,
@@ -2787,8 +2835,9 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
                             {
                                 IndexCompareExchange::Ok => {
                                     // New key update succeeds.
-                                    effects.push_update_unique_index_undo(
-                                        self.table_id(),
+                                    self.push_update_unique_index_undo(
+                                        ctx,
+                                        effects,
                                         index_row_id,
                                         new_row_id,
                                         new_key,
@@ -2846,12 +2895,7 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
             IndexInsert::Ok(merged) => {
                 debug_assert!(!merged);
                 // New key insert succeed.
-                effects.push_insert_non_unique_index_undo(
-                    self.table_id(),
-                    new_row_id,
-                    new_key,
-                    false,
-                );
+                self.push_insert_non_unique_index_undo(ctx, effects, new_row_id, new_key, false);
                 // mark index of old row as deleted and defer delete.
                 self.defer_delete_non_unique_index(
                     ctx,
@@ -2894,12 +2938,8 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
             .await?
         {
             IndexCompareExchange::Ok => {
-                effects.push_update_unique_index_undo(
-                    self.table_id(),
-                    old_row_id,
-                    new_row_id,
-                    key,
-                    false,
+                self.push_update_unique_index_undo(
+                    ctx, effects, old_row_id, new_row_id, key, false,
                 );
                 Ok(UpdateIndex::Updated)
             }
@@ -2934,7 +2974,7 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
             )
             .await?;
         debug_assert!(res.is_ok());
-        effects.push_insert_non_unique_index_undo(self.table_id(), new_row_id, key.clone(), false);
+        self.push_insert_non_unique_index_undo(ctx, effects, new_row_id, key.clone(), false);
         // defer delete old entry.
         self.defer_delete_non_unique_index(ctx, effects, old_row_id, key, root_snapshot)
             .await?;
@@ -2986,7 +3026,7 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
             {
                 IndexInsert::Ok(merged) => {
                     // Insert new key success.
-                    effects.push_insert_unique_index_undo(self.table_id(), row_id, new_key, merged);
+                    self.push_insert_unique_index_undo(ctx, effects, row_id, new_key, merged);
                     // Defer delete old key.
                     self.defer_delete_unique_index(ctx, effects, row_id, old_key, root_snapshot)
                         .await?;
@@ -3032,8 +3072,9 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
                             {
                                 IndexCompareExchange::Ok => {
                                     // Update new key succeeds.
-                                    effects.push_update_unique_index_undo(
-                                        self.table_id(),
+                                    self.push_update_unique_index_undo(
+                                        ctx,
+                                        effects,
                                         index_row_id,
                                         row_id,
                                         new_key,
@@ -3079,8 +3120,9 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
                             {
                                 IndexCompareExchange::Ok => {
                                     // New key update succeeds.
-                                    effects.push_update_unique_index_undo(
-                                        self.table_id(),
+                                    self.push_update_unique_index_undo(
+                                        ctx,
+                                        effects,
                                         index_row_id,
                                         row_id,
                                         new_key,
@@ -3144,7 +3186,7 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
             .await?
         {
             IndexInsert::Ok(merged) => {
-                effects.push_insert_non_unique_index_undo(self.table_id(), row_id, new_key, merged);
+                self.push_insert_non_unique_index_undo(ctx, effects, row_id, new_key, merged);
                 // Defer delete old key.
                 self.defer_delete_non_unique_index(ctx, effects, row_id, old_key, root_snapshot)
                     .await?;
@@ -3158,12 +3200,13 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
 /// Runtime accessor type binding for user tables:
 /// - `D = EvictableBufferPool` for row pages
 /// - `I = EvictableBufferPool` for secondary indexes
-pub type HybridTableAccessor<'a> = TableAccessor<'a, EvictableBufferPool, EvictableBufferPool>;
+pub(crate) type HybridTableAccessor<'a> =
+    TableAccessor<'a, EvictableBufferPool, EvictableBufferPool>;
 
 /// Runtime accessor type binding for in-memory catalog tables:
 /// - `D = FixedBufferPool` for row pages
 /// - `I = FixedBufferPool` for secondary indexes
-pub type MemTableAccessor<'a> = TableAccessor<'a, FixedBufferPool, FixedBufferPool>;
+pub(crate) type MemTableAccessor<'a> = TableAccessor<'a, FixedBufferPool, FixedBufferPool>;
 
 impl TableAccessor<'_, FixedBufferPool, FixedBufferPool> {
     #[inline]
@@ -3464,6 +3507,7 @@ impl<D: BufferPool, I: BufferPool> TableAccess for TableAccessor<'_, D, I> {
                         // the definitive ownership claim and rechecks the CDB
                         // state under the map entry to catch races with other
                         // cold delete/update transactions.
+                        self.debug_assert_table_write_lock_held(ctx);
                         match deletion_buffer.put_ref(row_id, ctx.status(), ctx.sts()) {
                             Ok(()) => (),
                             Err(DeletionError::WriteConflict) => {
@@ -3730,6 +3774,7 @@ impl<D: BufferPool, I: BufferPool> TableAccess for TableAccessor<'_, D, I> {
                             return Ok(DeleteMvcc::NotFound);
                         }
                         let deletion_buffer = self.lwc_deletion_buffer()?;
+                        self.debug_assert_table_write_lock_held(ctx);
                         match deletion_buffer.put_ref(row_id, ctx.status(), ctx.sts()) {
                             Ok(()) => {
                                 // The marker is statement-owned delete state

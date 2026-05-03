@@ -42,7 +42,7 @@ impl CatalogTable {
 
     /// Build a lightweight operation accessor over this catalog table runtime.
     #[inline]
-    pub fn accessor(&self) -> MemTableAccessor<'_> {
+    pub(crate) fn accessor(&self) -> MemTableAccessor<'_> {
         MemTableAccessor::from(self)
     }
 

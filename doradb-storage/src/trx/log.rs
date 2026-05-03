@@ -1160,7 +1160,6 @@ mod tests {
     use crate::io::{
         IOKind, StorageBackendOp, StorageBackendTestHook, install_storage_backend_test_hook,
     };
-    use crate::table::TableAccess;
     use crate::trx::log_replay::{LogMerger, ReadLog};
     use crate::value::Val;
     use std::fs::{self, File};
@@ -1525,8 +1524,7 @@ mod tests {
                     trx.exec(async |stmt| {
                         let s = format!("{}", i);
                         let insert = vec![Val::from(i), Val::from(&s[..])];
-                        let (ctx, effects) = stmt.ctx_and_effects_mut();
-                        table.accessor().insert_mvcc(ctx, effects, insert).await?;
+                        stmt.table_insert_mvcc(&table, insert).await?;
                         Ok(())
                     })
                     .await
@@ -1600,8 +1598,7 @@ mod tests {
                     trx.exec(async |stmt| {
                         let s = format!("{}", i);
                         let insert = vec![Val::from(i), Val::from(&s[..])];
-                        let (ctx, effects) = stmt.ctx_and_effects_mut();
-                        table.accessor().insert_mvcc(ctx, effects, insert).await?;
+                        stmt.table_insert_mvcc(&table, insert).await?;
                         Ok(())
                     })
                     .await

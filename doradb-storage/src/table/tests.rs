@@ -4,6 +4,9 @@ use crate::buffer::frame::FrameKind;
 use crate::buffer::page::{PAGE_SIZE, PageID};
 use crate::buffer::{EvictableBufferPool, PoolGuards, PoolRole, test_frame_kind};
 use crate::catalog::tests::table4;
+use crate::catalog::{
+    ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexSpec, TableSpec,
+};
 use crate::conf::{EngineConfig, EvictableBufferPoolConfig, FileSystemConfig, TrxSysConfig};
 use crate::engine::Engine;
 use crate::error::{
@@ -24,6 +27,7 @@ use crate::io::{
     install_storage_backend_test_hook,
 };
 use crate::latch::LatchFallbackMode;
+use crate::lock::{LockDebugEntryState, LockMode, LockOwner, LockResource};
 use crate::row::ops::{DeleteMvcc, SelectKey, SelectMvcc, UpdateCol, UpdateMvcc};
 use crate::row::{RowID, RowPage, RowRead};
 use crate::session::Session;
@@ -90,8 +94,7 @@ fn assert_table_data_integrity(
 }
 
 async fn stmt_insert_row(stmt: &mut Statement<'_>, table: &Table, cols: Vec<Val>) -> Result<RowID> {
-    let (ctx, effects) = stmt.ctx_and_effects_mut();
-    table.accessor().insert_mvcc(ctx, effects, cols).await
+    stmt.table_insert_mvcc(table, cols).await
 }
 
 async fn stmt_delete_row(
@@ -99,11 +102,7 @@ async fn stmt_delete_row(
     table: &Table,
     key: &SelectKey,
 ) -> Result<DeleteMvcc> {
-    let (ctx, effects) = stmt.ctx_and_effects_mut();
-    table
-        .accessor()
-        .delete_unique_mvcc(ctx, effects, key, false)
-        .await
+    stmt.table_delete_unique_mvcc(table, key, false).await
 }
 
 async fn stmt_update_row(
@@ -112,22 +111,16 @@ async fn stmt_update_row(
     key: &SelectKey,
     update: Vec<UpdateCol>,
 ) -> Result<UpdateMvcc> {
-    let (ctx, effects) = stmt.ctx_and_effects_mut();
-    table
-        .accessor()
-        .update_unique_mvcc(ctx, effects, key, update)
-        .await
+    stmt.table_update_unique_mvcc(table, key, update).await
 }
 
 async fn stmt_select_row_mvcc(
-    stmt: &Statement<'_>,
+    stmt: &mut Statement<'_>,
     table: &Table,
     key: &SelectKey,
     user_read_set: &[usize],
 ) -> Result<SelectMvcc> {
-    table
-        .accessor()
-        .index_lookup_unique_mvcc(stmt.ctx(), key, user_read_set)
+    stmt.table_lookup_unique_mvcc(table, key, user_read_set)
         .await
 }
 
@@ -4082,6 +4075,7 @@ fn test_row_page_transition_retries_update_delete() {
         let insert = vec![Val::from(2i32), Val::from("insert")];
         let res: Result<()> = trx
             .exec(async |stmt| {
+                stmt.acquire_table_write_locks(sys.table.table_id()).await?;
                 let (ctx, effects) = stmt.ctx_and_effects_mut();
                 let insert_res = sys.table.accessor().insert_row_to_page(
                     ctx,
@@ -4131,6 +4125,7 @@ fn test_row_page_transition_retries_update_delete() {
             .unwrap();
         let res: Result<()> = trx
             .exec(async |stmt| {
+                stmt.acquire_table_write_locks(sys.table.table_id()).await?;
                 let (ctx, effects) = stmt.ctx_and_effects_mut();
                 let res = sys
                     .table
@@ -4626,6 +4621,148 @@ fn test_table_scan_uncommitted() {
 }
 
 #[test]
+fn test_statement_read_takes_metadata_lock_only() {
+    smol::block_on(async {
+        let sys = TestSys::new_evictable().await;
+        let mut session = sys.engine.try_new_session().unwrap();
+        insert_rows(&sys, &mut session, 0, 1, "name").await;
+
+        let table_id = sys.table.table_id();
+        let stmt_owner = Cell::new(None);
+        let mut trx = session.try_begin_trx().unwrap().unwrap();
+        trx.exec(async |stmt| {
+            let owner = stmt.lock_owner();
+            stmt_owner.set(Some(owner));
+            let selected = stmt
+                .table_lookup_unique_mvcc(&sys.table, &single_key(0i32), &[0, 1])
+                .await?;
+            assert!(selected.is_found());
+            let repeated = stmt
+                .table_lookup_unique_mvcc(&sys.table, &single_key(0i32), &[0, 1])
+                .await?;
+            assert!(repeated.is_found());
+            assert_eq!(lock_entry_count(&sys.engine, owner), 1);
+            assert!(has_lock_entry(
+                &sys.engine,
+                owner,
+                LockResource::TableMetadata(table_id),
+                LockMode::Shared,
+                LockDebugEntryState::Granted,
+            ));
+            assert!(!has_lock_resource(
+                &sys.engine,
+                owner,
+                LockResource::TableData(table_id),
+            ));
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+        let owner = stmt_owner.get().unwrap();
+        assert_eq!(lock_entry_count(&sys.engine, owner), 0);
+        trx.commit().await.unwrap();
+    });
+}
+
+#[test]
+fn test_statement_write_locks_are_transaction_owned_and_cached() {
+    smol::block_on(async {
+        let sys = TestSys::new_evictable().await;
+        let mut session = sys.engine.try_new_session().unwrap();
+        let table_id = sys.table.table_id();
+        let mut trx = session.try_begin_trx().unwrap().unwrap();
+        let owner = trx.lock_owner().unwrap();
+
+        trx.exec(async |stmt| {
+            stmt.table_insert_mvcc(&sys.table, vec![Val::from(10i32), Val::from("a")])
+                .await?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+        assert!(has_lock_entry(
+            &sys.engine,
+            owner,
+            LockResource::TableMetadata(table_id),
+            LockMode::Shared,
+            LockDebugEntryState::Granted,
+        ));
+        assert!(has_lock_entry(
+            &sys.engine,
+            owner,
+            LockResource::TableData(table_id),
+            LockMode::IntentExclusive,
+            LockDebugEntryState::Granted,
+        ));
+        assert_eq!(lock_entry_count(&sys.engine, owner), 2);
+
+        trx.exec(async |stmt| {
+            stmt.table_insert_mvcc(&sys.table, vec![Val::from(11i32), Val::from("b")])
+                .await?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+        assert_eq!(lock_entry_count(&sys.engine, owner), 2);
+
+        trx.rollback().await.unwrap();
+        assert_eq!(lock_entry_count(&sys.engine, owner), 0);
+    });
+}
+
+#[test]
+fn test_create_table_waits_on_catalog_namespace_lock() {
+    smol::block_on(async {
+        let sys = TestSys::new_evictable().await;
+        let blocker = LockOwner::Session(91_400);
+        assert!(
+            sys.engine
+                .lock_manager()
+                .try_acquire(LockResource::CatalogNamespace, LockMode::Exclusive, blocker,)
+                .unwrap()
+        );
+
+        let mut session = sys.engine.try_new_session().unwrap();
+        let waiting_owner = LockOwner::Session(session.id());
+        let create_task = smol::spawn(async move {
+            session
+                .create_table(
+                    TableSpec::new(vec![ColumnSpec::new(
+                        "id",
+                        crate::value::ValKind::I32,
+                        ColumnAttributes::empty(),
+                    )]),
+                    vec![IndexSpec::new(
+                        "pk_id",
+                        vec![IndexKey::new(0)],
+                        IndexAttributes::PK,
+                    )],
+                )
+                .await
+        });
+
+        wait_for_lock_entry(
+            &sys.engine,
+            waiting_owner,
+            LockResource::CatalogNamespace,
+            LockMode::Exclusive,
+            LockDebugEntryState::Waiting,
+        )
+        .await;
+
+        assert_eq!(sys.engine.lock_manager().release_owner(blocker), 1);
+        let table_id = create_task.await.unwrap();
+        assert!(sys.engine.catalog().get_table(table_id).await.is_some());
+        assert!(!has_lock_resource(
+            &sys.engine,
+            waiting_owner,
+            LockResource::CatalogNamespace,
+        ));
+    });
+}
+
+#[test]
 fn test_table_scan_mvcc() {
     smol::block_on(async {
         const SIZE: i32 = 100;
@@ -4649,13 +4786,11 @@ fn test_table_scan_mvcc() {
             let mut trx = session2.try_begin_trx().unwrap().unwrap();
             let mut res_len = 0usize;
             trx.exec(async |stmt| {
-                sys.table
-                    .accessor()
-                    .table_scan_mvcc(stmt.ctx(), &[0], |_| {
-                        res_len += 1;
-                        true
-                    })
-                    .await;
+                stmt.table_scan_mvcc(&sys.table, &[0], |_| {
+                    res_len += 1;
+                    true
+                })
+                .await?;
                 Ok(())
             })
             .await
@@ -4679,13 +4814,11 @@ fn test_table_scan_mvcc() {
             let mut trx = session2.try_begin_trx().unwrap().unwrap();
             let mut res_len = 0usize;
             trx.exec(async |stmt| {
-                sys.table
-                    .accessor()
-                    .table_scan_mvcc(stmt.ctx(), &[0], |_| {
-                        res_len += 1;
-                        true
-                    })
-                    .await;
+                stmt.table_scan_mvcc(&sys.table, &[0], |_| {
+                    res_len += 1;
+                    true
+                })
+                .await?;
                 Ok(())
             })
             .await
@@ -4701,13 +4834,11 @@ fn test_table_scan_mvcc() {
             let mut trx = session2.try_begin_trx().unwrap().unwrap();
             let mut res_len = 0usize;
             trx.exec(async |stmt| {
-                sys.table
-                    .accessor()
-                    .table_scan_mvcc(stmt.ctx(), &[0], |_| {
-                        res_len += 1;
-                        true
-                    })
-                    .await;
+                stmt.table_scan_mvcc(&sys.table, &[0], |_| {
+                    res_len += 1;
+                    true
+                })
+                .await?;
                 Ok(())
             })
             .await
@@ -4828,6 +4959,7 @@ fn test_transition_captures_uncommitted_lock_into_deletion_buffer() {
                     .lock_shared_async()
                     .await
                     .unwrap();
+                stmt.acquire_table_write_locks(sys.table.table_id()).await?;
                 let (ctx, effects) = stmt.ctx_and_effects_mut();
                 let mut lock_row = sys
                     .table
@@ -6253,6 +6385,63 @@ fn single_key<V: Into<Val>>(value: V) -> SelectKey {
     }
 }
 
+fn lock_entry_count(engine: &Engine, owner: LockOwner) -> usize {
+    engine
+        .lock_manager()
+        .debug_snapshot()
+        .entries
+        .iter()
+        .filter(|entry| entry.owner == owner)
+        .count()
+}
+
+fn has_lock_entry(
+    engine: &Engine,
+    owner: LockOwner,
+    resource: LockResource,
+    mode: LockMode,
+    state: LockDebugEntryState,
+) -> bool {
+    engine
+        .lock_manager()
+        .debug_snapshot()
+        .entries
+        .iter()
+        .any(|entry| {
+            entry.owner == owner
+                && entry.resource == resource
+                && entry.mode == mode
+                && entry.state == state
+        })
+}
+
+fn has_lock_resource(engine: &Engine, owner: LockOwner, resource: LockResource) -> bool {
+    engine
+        .lock_manager()
+        .debug_snapshot()
+        .entries
+        .iter()
+        .any(|entry| entry.owner == owner && entry.resource == resource)
+}
+
+async fn wait_for_lock_entry(
+    engine: &Engine,
+    owner: LockOwner,
+    resource: LockResource,
+    mode: LockMode,
+    state: LockDebugEntryState,
+) {
+    for _ in 0..100 {
+        if has_lock_entry(engine, owner, resource, mode, state) {
+            return;
+        }
+        smol::Timer::after(Duration::from_millis(1)).await;
+    }
+    panic!(
+        "lock entry not observed: owner={owner:?}, resource={resource:?}, mode={mode:?}, state={state:?}"
+    );
+}
+
 fn name_key(value: &str) -> SelectKey {
     SelectKey {
         index_no: 1,
@@ -6609,9 +6798,7 @@ fn test_secondary_index_common() {
             let key = SelectKey::new(1, vec![Val::from(1i32)]);
             let res = trx
                 .exec(async |stmt| {
-                    table
-                        .accessor()
-                        .index_scan_mvcc(stmt.ctx(), &key, user_read_set)
+                    stmt.table_index_scan_mvcc(&table, &key, user_read_set)
                         .await
                 })
                 .await;
@@ -6632,9 +6819,7 @@ fn test_secondary_index_common() {
             let key = SelectKey::new(1, vec![Val::from(0i32)]);
             let res = trx
                 .exec(async |stmt| {
-                    table
-                        .accessor()
-                        .index_scan_mvcc(stmt.ctx(), &key, user_read_set)
+                    stmt.table_index_scan_mvcc(&table, &key, user_read_set)
                         .await
                 })
                 .await;
@@ -6651,9 +6836,7 @@ fn test_secondary_index_common() {
             let key = SelectKey::new(1, vec![Val::from(0i32)]);
             let res = trx
                 .exec(async |stmt| {
-                    table
-                        .accessor()
-                        .index_scan_mvcc(stmt.ctx(), &key, user_read_set)
+                    stmt.table_index_scan_mvcc(&table, &key, user_read_set)
                         .await
                 })
                 .await;

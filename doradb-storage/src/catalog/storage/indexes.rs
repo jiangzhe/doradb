@@ -106,12 +106,7 @@ impl Indexes<'_> {
             Val::from(obj.index_name.as_str()),
             Val::from(obj.index_attributes.bits()),
         ];
-        let (ctx, effects) = stmt.ctx_and_effects_mut();
-        self.table
-            .accessor()
-            .insert_mvcc(ctx, effects, cols)
-            .await
-            .is_ok()
+        stmt.catalog_insert_mvcc(self.table, cols).await.is_ok()
     }
 
     /// Delete an index by (table_id, index_no).
@@ -125,10 +120,7 @@ impl Indexes<'_> {
             PK_NO_INDEXES,
             vec![Val::from(table_id), Val::from(index_no)],
         );
-        let (ctx, effects) = stmt.ctx_and_effects_mut();
-        self.table
-            .accessor()
-            .delete_unique_mvcc(ctx, effects, &key, true)
+        stmt.catalog_delete_unique_mvcc(self.table, &key, true)
             .await
             .is_ok_and(|res| matches!(res, DeleteMvcc::Deleted))
     }
@@ -279,12 +271,7 @@ impl IndexColumns<'_> {
             Val::from(obj.column_no),
             Val::from(obj.index_order as u8),
         ];
-        let (ctx, effects) = stmt.ctx_and_effects_mut();
-        self.table
-            .accessor()
-            .insert_mvcc(ctx, effects, cols)
-            .await
-            .is_ok()
+        stmt.catalog_insert_mvcc(self.table, cols).await.is_ok()
     }
 
     /// Delete all index-column rows by `(table_id, index_no)`.

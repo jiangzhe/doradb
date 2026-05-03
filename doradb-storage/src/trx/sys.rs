@@ -226,7 +226,7 @@ impl TransactionSystem {
         // Prepare redo log first, this may take some time,
         // so keep it out of lock scope, and we can fill cts after the lock is held.
         let partition = &*self.log_partitions[trx.log_no()];
-        let prepared_trx = trx.prepare();
+        let prepared_trx = trx.prepare()?;
         if !prepared_trx.require_ordered_commit() {
             // No runtime effects means there is no CTS to publish and no commit
             // order to preserve. Effects without redo still enter group commit
@@ -292,9 +292,7 @@ impl TransactionSystem {
         trx.effects_mut().clear_for_rollback();
         self.log_partitions[log_no].gc_buckets[gc_no].gc_analyze_rollback(sts);
         trx.release_transaction_locks();
-        if let Some(s) = trx.take_session() {
-            s.rollback();
-        }
+        trx.finish_session_rollback();
         Ok(())
     }
 
@@ -570,7 +568,6 @@ mod tests {
     use crate::buffer::PoolRole;
     use crate::catalog::tests::table2;
     use crate::conf::{EngineConfig, EvictableBufferPoolConfig};
-    use crate::table::TableAccess;
     use crate::value::Val;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Barrier};
@@ -786,8 +783,7 @@ mod tests {
                 let mut trx = session.try_begin_trx().unwrap().unwrap();
                 trx.exec(async |stmt| {
                     let insert = vec![Val::from(i as i32), Val::from(&s[..])];
-                    let (ctx, effects) = stmt.ctx_and_effects_mut();
-                    table.accessor().insert_mvcc(ctx, effects, insert).await?;
+                    stmt.table_insert_mvcc(&table, insert).await?;
                     Ok(())
                 })
                 .await

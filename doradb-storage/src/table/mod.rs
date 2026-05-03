@@ -7,7 +7,7 @@ mod rollback;
 #[cfg(test)]
 mod tests;
 
-pub use access::*;
+pub(crate) use access::*;
 pub use deletion_buffer::*;
 pub use gc::{SecondaryMemIndexCleanupIndexStats, SecondaryMemIndexCleanupStats};
 pub use persistence::*;
@@ -787,7 +787,7 @@ impl Table {
 
     /// Build a lightweight operation accessor over this table runtime.
     #[inline]
-    pub fn accessor(&self) -> HybridTableAccessor<'_> {
+    pub(crate) fn accessor(&self) -> HybridTableAccessor<'_> {
         HybridTableAccessor::from(self)
     }
 

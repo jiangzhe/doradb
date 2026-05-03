@@ -31,9 +31,9 @@ pub mod ver_map;
 use crate::buffer::PageID;
 use crate::buffer::PoolGuards;
 use crate::buffer::page::VersionedPageID;
-use crate::catalog::{TableCache, TableID};
+use crate::catalog::TableID;
 use crate::engine::EngineRef;
-use crate::error::{FatalError, InternalError, OperationError, Result};
+use crate::error::{InternalError, OperationError, Result};
 use crate::file::table_file::OldRoot;
 use crate::lock::{LockManager, LockMode, LockOwner, LockResource, StmtNo};
 use crate::quiescent::QuiescentGuard;
@@ -41,7 +41,7 @@ use crate::row::RowID;
 use crate::session::SessionState;
 use crate::trx::log_replay::TrxLog;
 use crate::trx::redo::{RedoHeader, RedoLogs, RedoTrxKind, RowRedo, RowRedoKind};
-use crate::trx::stmt::{Statement, StmtEffects};
+use crate::trx::stmt::Statement;
 use crate::trx::undo::{IndexPurgeEntry, IndexUndoLogs, RowUndoHead, RowUndoLogs, UndoStatus};
 use crate::value::Val;
 use error_stack::Report;
@@ -212,6 +212,34 @@ impl TrxContext {
         self.status.ts()
     }
 
+    /// Debug-asserts that this transaction owns table-write intent.
+    ///
+    /// Foreground row, CDB, and index write paths call this before installing
+    /// lower-level ownership. Recovery and no-transaction lifecycle paths stay
+    /// outside those foreground call sites.
+    #[inline]
+    pub(crate) fn debug_assert_table_write_lock_held(&self, table_id: TableID) {
+        #[cfg(debug_assertions)]
+        {
+            let resource = LockResource::TableData(table_id);
+            let owner = LockOwner::Transaction(self.trx_id());
+            let held = self.engine().is_some_and(|engine| {
+                engine
+                    .lock_manager()
+                    .owner_holds(resource, owner, LockMode::IntentExclusive)
+            });
+            debug_assert!(
+                held,
+                "transaction owner must hold TableData(IX) or stronger before row/index ownership"
+            );
+        }
+
+        #[cfg(not(debug_assertions))]
+        {
+            let _ = table_id;
+        }
+    }
+
     /// Returns the transaction snapshot timestamp.
     #[inline]
     pub(crate) fn sts(&self) -> TrxID {
@@ -274,10 +302,10 @@ impl TrxContext {
         self.session.take()
     }
 
-    /// Rolls back and clears the attached session if one remains.
+    /// Marks the attached session as no longer running this transaction.
     #[inline]
-    pub(crate) fn rollback_session(&mut self) {
-        if let Some(session) = self.session.take() {
+    pub(crate) fn rollback_session(&self) {
+        if let Some(session) = self.session.as_ref() {
             session.rollback();
         }
     }
@@ -451,29 +479,27 @@ impl TrxEffects {
     }
 }
 
-/// Mutable transaction-owned logical lock cache.
+/// Owner-local logical lock cache.
 ///
-/// This state is separate from [`TrxContext`] and [`TrxEffects`]. It records
-/// only lock-manager ownership and strongest granted modes, so it must not
-/// influence redo durability, ordered commit classification, or rollbackable
-/// statement effects.
-pub(crate) struct TrxLockState {
+/// The cache records only successfully granted resources for one logical owner.
+/// It lets owner cleanup release exactly those resources instead of scanning the
+/// whole lock table.
+pub(crate) struct OwnerLockState {
     owner: LockOwner,
     held: HashMap<LockResource, LockMode>,
 }
 
-#[allow(dead_code)]
-impl TrxLockState {
-    /// Create an empty lock cache for one active transaction owner.
+impl OwnerLockState {
+    /// Create an empty cache for one logical lock owner.
     #[inline]
-    pub(crate) fn new(trx_id: TrxID) -> Self {
-        TrxLockState {
-            owner: LockOwner::Transaction(trx_id),
+    pub(crate) fn new(owner: LockOwner) -> Self {
+        OwnerLockState {
+            owner,
             held: HashMap::new(),
         }
     }
 
-    /// Returns the transaction lock owner represented by this state.
+    /// Returns the logical lock owner represented by this state.
     #[inline]
     pub(crate) fn owner(&self) -> LockOwner {
         self.owner
@@ -491,7 +517,7 @@ impl TrxLockState {
         }
     }
 
-    /// Attempts to acquire a transaction-owned lock without waiting.
+    /// Attempts to acquire an owner-scoped lock without waiting.
     ///
     /// A covering cached mode skips the lock manager. Fresh conflicts return
     /// `Ok(false)`, while invalid modes and unsupported or blocking conversions
@@ -513,7 +539,7 @@ impl TrxLockState {
         Ok(true)
     }
 
-    /// Acquires a transaction-owned lock, waiting for fresh conflicts.
+    /// Acquires an owner-scoped lock, waiting for fresh conflicts.
     ///
     /// Blocking conversion is still delegated to the lock manager and remains
     /// unsupported; the cache updates only after a successful grant.
@@ -543,26 +569,46 @@ impl TrxLockState {
         self.held.insert(resource, mode);
     }
 
-    /// Releases every transaction-owned lock and clears the cache.
+    /// Releases every cached lock and clears the cache.
     #[inline]
     pub(crate) fn release_all(&mut self, lock_manager: &LockManager) -> usize {
-        let removed = lock_manager.release_owner(self.owner);
+        let mut resources: Vec<_> = self.held.keys().copied().collect();
+        resources.sort_unstable();
+        let mut removed = 0;
+        for resource in resources {
+            removed += lock_manager.release(resource, self.owner);
+        }
         self.held.clear();
         removed
     }
 
-    /// Asserts that every cached transaction lock has been cleared.
+    /// Asserts that every cached lock has been cleared.
     #[inline]
-    fn assert_cleared(&self) {
-        assert!(self.held.is_empty(), "transaction locks should be cleared");
+    pub(crate) fn assert_cleared(&self) {
+        assert!(self.held.is_empty(), "logical locks should be cleared");
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ActiveTrxState {
+    Active,
+    RollbackFinished,
+    Discarded,
+}
+
+impl ActiveTrxState {
+    #[inline]
+    fn is_active(self) -> bool {
+        matches!(self, ActiveTrxState::Active)
     }
 }
 
 pub struct ActiveTrx {
     ctx: TrxContext,
     effects: TrxEffects,
-    lock_state: Option<TrxLockState>,
+    lock_state: Option<OwnerLockState>,
     next_stmt_no: StmtNo,
+    state: ActiveTrxState,
 }
 
 impl ActiveTrx {
@@ -578,8 +624,9 @@ impl ActiveTrx {
         ActiveTrx {
             ctx: TrxContext::new(session, trx_id, sts, log_no, gc_no),
             effects: TrxEffects::empty(),
-            lock_state: Some(TrxLockState::new(trx_id)),
+            lock_state: Some(OwnerLockState::new(LockOwner::Transaction(trx_id))),
             next_stmt_no: 1,
+            state: ActiveTrxState::Active,
         }
     }
 
@@ -604,14 +651,11 @@ impl ActiveTrx {
 
     #[inline]
     fn checked_engine(&self, operation: &'static str) -> Result<EngineRef> {
+        if !self.state.is_active() {
+            return Err(Self::discarded_err(operation));
+        }
         self.engine()
             .cloned()
-            .ok_or_else(|| Self::discarded_err(operation))
-    }
-
-    #[inline]
-    fn checked_pool_guards(&self, operation: &'static str) -> Result<&PoolGuards> {
-        self.pool_guards()
             .ok_or_else(|| Self::discarded_err(operation))
     }
 
@@ -622,13 +666,19 @@ impl ActiveTrx {
 
     #[inline]
     fn checked_lock_manager(&self, operation: &'static str) -> Result<QuiescentGuard<LockManager>> {
+        if !self.state.is_active() {
+            return Err(Self::discarded_err(operation));
+        }
         self.lock_manager_guard()
             .ok_or_else(|| Self::discarded_err(operation))
     }
 
     #[inline]
     #[allow(dead_code)]
-    fn checked_lock_state(&self, operation: &'static str) -> Result<&TrxLockState> {
+    fn checked_lock_state(&self, operation: &'static str) -> Result<&OwnerLockState> {
+        if !self.state.is_active() {
+            return Err(Self::discarded_err(operation));
+        }
         self.lock_state
             .as_ref()
             .ok_or_else(|| Self::discarded_err(operation))
@@ -636,7 +686,10 @@ impl ActiveTrx {
 
     #[inline]
     #[allow(dead_code)]
-    fn checked_lock_state_mut(&mut self, operation: &'static str) -> Result<&mut TrxLockState> {
+    fn checked_lock_state_mut(&mut self, operation: &'static str) -> Result<&mut OwnerLockState> {
+        if !self.state.is_active() {
+            return Err(Self::discarded_err(operation));
+        }
         self.lock_state
             .as_mut()
             .ok_or_else(|| Self::discarded_err(operation))
@@ -655,12 +708,18 @@ impl ActiveTrx {
     /// Returns reference of the storage engine.
     #[inline]
     pub fn engine(&self) -> Option<&EngineRef> {
+        if !self.state.is_active() {
+            return None;
+        }
         self.ctx().engine()
     }
 
     /// Returns transaction session pool guards if the session is still attached.
     #[inline]
     pub fn pool_guards(&self) -> Option<&PoolGuards> {
+        if !self.state.is_active() {
+            return None;
+        }
         self.ctx().pool_guards()
     }
 
@@ -794,21 +853,39 @@ impl ActiveTrx {
         let lock_manager = self.checked_lock_manager("execute statement")?;
         let stmt_no = self.next_stmt_no()?;
         let stmt_owner = LockOwner::Statement(self.trx_id(), stmt_no);
-        let mut effects = StmtEffects::empty();
-        let res = {
-            let mut stmt = Statement::new(self.ctx(), &mut effects, stmt_owner);
-            f(&mut stmt).await
-        };
-        match res {
-            Ok(value) => {
-                effects.merge_into_trx(self);
-                lock_manager.release_owner(stmt_owner);
-                Ok(value)
+        let ActiveTrx {
+            ctx,
+            effects,
+            lock_state,
+            ..
+        } = self;
+        let trx_locks = lock_state
+            .as_mut()
+            .ok_or_else(|| Self::discarded_err("execute statement"))?;
+        enum ExecOutcome<T> {
+            Success(T),
+            StatementError(crate::error::Error),
+            FatalRollback(crate::error::Error),
+        }
+        let outcome = {
+            let mut stmt = Statement::new(ctx, stmt_owner, lock_manager, trx_locks);
+            let res = f(&mut stmt).await;
+            match res {
+                Ok(value) => {
+                    stmt.merge_effects_into(effects);
+                    ExecOutcome::Success(value)
+                }
+                Err(err) => match stmt.rollback_effects().await {
+                    Ok(()) => ExecOutcome::StatementError(err),
+                    Err(rollback_err) => ExecOutcome::FatalRollback(rollback_err),
+                },
             }
-            Err(err) => {
-                let rollback_res = self.rollback_statement_effects(&mut effects).await;
-                lock_manager.release_owner(stmt_owner);
-                rollback_res?;
+        };
+        match outcome {
+            ExecOutcome::Success(value) => Ok(value),
+            ExecOutcome::StatementError(err) => Err(err),
+            ExecOutcome::FatalRollback(err) => {
+                self.discard_after_fatal_rollback();
                 Err(err)
             }
         }
@@ -848,22 +925,11 @@ impl ActiveTrx {
         self.effects.retain_old_table_root(old_root)
     }
 
-    /// Merges successful statement effects into transaction effects.
+    /// Marks the attached session as rolled back without detaching it.
     #[inline]
-    pub(crate) fn merge_statement_effects(
-        &mut self,
-        row_undo: &mut RowUndoLogs,
-        index_undo: &mut IndexUndoLogs,
-        redo: RedoLogs,
-    ) {
-        self.effects
-            .merge_statement_effects(row_undo, index_undo, redo);
-    }
-
-    /// Takes the attached session from the transaction context.
-    #[inline]
-    pub(crate) fn take_session(&mut self) -> Option<Arc<SessionState>> {
-        self.ctx.take_session()
+    pub(crate) fn finish_session_rollback(&mut self) {
+        self.ctx.rollback_session();
+        self.state = ActiveTrxState::RollbackFinished;
     }
 
     /// Clears effects and rolls back the attached session after rollback failure.
@@ -871,62 +937,23 @@ impl ActiveTrx {
     pub(crate) fn discard_after_fatal_rollback(&mut self) {
         self.effects.clear_for_rollback();
         self.release_transaction_locks();
-        self.ctx.rollback_session();
-    }
-
-    /// Rolls back statement-local effects after an ordinary callback error.
-    ///
-    /// Index effects roll back before row effects so index entries stop
-    /// pointing at uncommitted row state before row undo is unwound.
-    #[inline]
-    pub(crate) async fn rollback_statement_effects(
-        &mut self,
-        effects: &mut StmtEffects,
-    ) -> Result<()> {
-        let engine = self.checked_engine("rollback statement effects")?;
-        let pool_guards = self
-            .checked_pool_guards("rollback statement effects")?
-            .clone();
-        let mut table_cache = TableCache::new(engine.catalog());
-        let sts = self.sts();
-        if effects
-            .rollback_index(&mut table_cache, &pool_guards, sts)
-            .await
-            .is_err()
-        {
-            effects.clear_for_discard();
-            self.discard_after_fatal_rollback();
-            return Err(engine
-                .trx_sys
-                .poison_storage(FatalError::RollbackAccess)
-                .into());
-        }
-        if effects
-            .rollback_row(&mut table_cache, &pool_guards, Some(sts))
-            .await
-            .is_err()
-        {
-            effects.clear_for_discard();
-            self.discard_after_fatal_rollback();
-            return Err(engine
-                .trx_sys
-                .poison_storage(FatalError::RollbackAccess)
-                .into());
-        }
-        effects.clear_redo();
-        Ok(())
+        self.finish_session_rollback();
+        self.state = ActiveTrxState::Discarded;
     }
 
     /// Prepare current transaction for committing.
     #[inline]
-    pub fn prepare(mut self) -> PreparedTrx {
+    pub fn prepare(mut self) -> Result<PreparedTrx> {
+        if !self.state.is_active() {
+            return Err(Self::discarded_err("prepare active transaction"));
+        }
         // fast path for readonly transactions
         if !self.require_ordered_commit() {
             let lock_manager = self.lock_manager_guard();
             // there should be no ref count of transaction status.
             debug_assert!(Arc::strong_count(&self.ctx.status) == 1);
             debug_assert!(self.effects.index_undo.is_empty());
-            return PreparedTrx {
+            return Ok(PreparedTrx {
                 redo_bin: None,
                 payload: Some(PreparedTrxPayload {
                     status: self.ctx.status(),
@@ -941,7 +968,7 @@ impl ActiveTrx {
                 session: self.ctx.take_session(),
                 lock_manager,
                 lock_state: self.lock_state.take(),
-            };
+            });
         }
 
         // change transaction status
@@ -955,7 +982,7 @@ impl ActiveTrx {
         let (row_undo, index_undo, gc_row_pages, old_table_root) =
             self.effects.take_payload_parts();
         let lock_manager = self.lock_manager_guard();
-        PreparedTrx {
+        Ok(PreparedTrx {
             redo_bin,
             payload: Some(PreparedTrxPayload {
                 status: self.ctx.status(),
@@ -970,7 +997,7 @@ impl ActiveTrx {
             session: self.ctx.take_session(),
             lock_manager,
             lock_state: self.lock_state.take(),
-        }
+        })
     }
 
     /// Commit the transaction.
@@ -1018,13 +1045,15 @@ impl Drop for ActiveTrx {
         if let Some(lock_state) = self.lock_state.as_ref() {
             lock_state.assert_cleared();
         }
-        self.ctx.assert_cleared();
+        if self.state.is_active() {
+            self.ctx.assert_cleared();
+        }
     }
 }
 
 #[inline]
 fn release_carried_transaction_locks(
-    lock_state: &mut Option<TrxLockState>,
+    lock_state: &mut Option<OwnerLockState>,
     lock_manager: &mut Option<QuiescentGuard<LockManager>>,
 ) -> usize {
     match (lock_state.take(), lock_manager.take()) {
@@ -1070,7 +1099,7 @@ pub struct PreparedTrx {
     payload: Option<PreparedTrxPayload>,
     session: Option<Arc<SessionState>>,
     lock_manager: Option<QuiescentGuard<LockManager>>,
-    lock_state: Option<TrxLockState>,
+    lock_state: Option<OwnerLockState>,
 }
 
 impl PreparedTrx {
@@ -1218,7 +1247,7 @@ pub struct PrecommitTrx {
     pub payload: Option<PrecommitTrxPayload>,
     session: Option<Arc<SessionState>>,
     lock_manager: Option<QuiescentGuard<LockManager>>,
-    lock_state: Option<TrxLockState>,
+    lock_state: Option<OwnerLockState>,
 }
 
 impl PrecommitTrx {
@@ -1502,7 +1531,7 @@ mod tests {
             let session_state = test_session_state(&engine);
             let trx = ActiveTrx::new(session_state, MIN_ACTIVE_TRX_ID + 43, 43, 1, 2);
 
-            let mut prepared = trx.prepare();
+            let mut prepared = trx.prepare().unwrap();
             assert!(prepared.redo_bin.is_none());
             assert!(!prepared.require_durability());
             assert!(!prepared.require_ordered_commit());
@@ -1537,7 +1566,7 @@ mod tests {
                 kind: IndexUndoKind::DeferDelete(SelectKey::new(0, vec![]), true),
             });
 
-            let mut prepared = trx.prepare();
+            let mut prepared = trx.prepare().unwrap();
             assert!(prepared.redo_bin.is_some());
             assert!(prepared.require_durability());
             assert!(prepared.require_ordered_commit());
@@ -1651,9 +1680,13 @@ mod tests {
 
             let first_owner = std::cell::Cell::new(None);
             trx.exec(async |stmt| {
-                first_owner.set(Some(stmt.lock_owner()));
+                let owner = stmt.lock_owner();
+                first_owner.set(Some(owner));
                 stmt.acquire_statement_lock(LockResource::TableMetadata(91_210), LockMode::Shared)
                     .await?;
+                stmt.acquire_statement_lock(LockResource::TableMetadata(91_210), LockMode::Shared)
+                    .await?;
+                assert_eq!(lock_entry_count(&engine, owner), 1);
                 Ok(())
             })
             .await
@@ -1661,22 +1694,50 @@ mod tests {
 
             let second_owner = std::cell::Cell::new(None);
             trx.exec(async |stmt| {
-                second_owner.set(Some(stmt.lock_owner()));
+                let owner = stmt.lock_owner();
+                second_owner.set(Some(owner));
                 assert!(stmt.try_acquire_statement_lock(
                     LockResource::TableMetadata(91_211),
                     LockMode::Shared,
                 )?);
+                assert!(stmt.try_acquire_statement_lock(
+                    LockResource::TableMetadata(91_211),
+                    LockMode::Shared,
+                )?);
+                assert_eq!(lock_entry_count(&engine, owner), 1);
                 Ok(())
             })
             .await
             .unwrap();
 
+            let error_owner = std::cell::Cell::new(None);
+            let res: Result<()> = trx
+                .exec(async |stmt| {
+                    let owner = stmt.lock_owner();
+                    error_owner.set(Some(owner));
+                    stmt.acquire_statement_lock(
+                        LockResource::TableMetadata(91_212),
+                        LockMode::Shared,
+                    )
+                    .await?;
+                    assert_eq!(lock_entry_count(&engine, owner), 1);
+                    Err(Report::new(OperationError::NotSupported).into())
+                })
+                .await;
+            assert_eq!(
+                res.unwrap_err().operation_error(),
+                Some(OperationError::NotSupported)
+            );
+
             let first_owner = first_owner.get().unwrap();
             let second_owner = second_owner.get().unwrap();
+            let error_owner = error_owner.get().unwrap();
             assert_eq!(first_owner, LockOwner::Statement(trx.trx_id(), 1));
             assert_eq!(second_owner, LockOwner::Statement(trx.trx_id(), 2));
+            assert_eq!(error_owner, LockOwner::Statement(trx.trx_id(), 3));
             assert_eq!(lock_entry_count(&engine, first_owner), 0);
             assert_eq!(lock_entry_count(&engine, second_owner), 0);
+            assert_eq!(lock_entry_count(&engine, error_owner), 0);
             assert_eq!(lock_entry_count(&engine, trx_owner), 1);
 
             trx.rollback().await.unwrap();
@@ -1798,7 +1859,7 @@ mod tests {
             .unwrap();
             trx.add_pseudo_redo_log_entry();
 
-            let prepared = trx.prepare();
+            let prepared = trx.prepare().unwrap();
             let precommit = prepared.fill_cts(91_241);
             precommit.abort();
             assert_eq!(lock_entry_count(&engine, owner), 0);
@@ -1810,18 +1871,48 @@ mod tests {
         smol::block_on(async {
             let (_temp_dir, engine) = test_engine("redo_trx_discard_errors").await;
 
-            let session_state = test_session_state(&engine);
-            let mut trx = ActiveTrx::new(session_state, MIN_ACTIVE_TRX_ID + 50, 50, 0, 0);
+            let mut session = engine.try_new_session().unwrap();
+            let mut trx = session.try_begin_trx().unwrap().unwrap();
             trx.discard_after_fatal_rollback();
+            let replacement = session.try_begin_trx().unwrap();
+            assert!(
+                replacement.is_some(),
+                "fatal discard should release the session transaction slot"
+            );
+            replacement.unwrap().rollback().await.unwrap();
+            let err = match trx.prepare() {
+                Ok(_) => panic!("discarded transaction prepare should fail"),
+                Err(err) => err,
+            };
+            assert_eq!(
+                err.downcast_ref::<InternalError>().copied(),
+                Some(InternalError::ActiveTransactionDiscarded)
+            );
+
+            let mut session = engine.try_new_session().unwrap();
+            let mut trx = session.try_begin_trx().unwrap().unwrap();
+            trx.discard_after_fatal_rollback();
+            let replacement = session.try_begin_trx().unwrap();
+            assert!(
+                replacement.is_some(),
+                "fatal discard should release the session transaction slot"
+            );
+            replacement.unwrap().rollback().await.unwrap();
             let err = trx.commit().await.unwrap_err();
             assert_eq!(
                 err.downcast_ref::<InternalError>().copied(),
                 Some(InternalError::ActiveTransactionDiscarded)
             );
 
-            let session_state = test_session_state(&engine);
-            let mut trx = ActiveTrx::new(session_state, MIN_ACTIVE_TRX_ID + 51, 51, 0, 0);
+            let mut session = engine.try_new_session().unwrap();
+            let mut trx = session.try_begin_trx().unwrap().unwrap();
             trx.discard_after_fatal_rollback();
+            let replacement = session.try_begin_trx().unwrap();
+            assert!(
+                replacement.is_some(),
+                "fatal discard should release the session transaction slot"
+            );
+            replacement.unwrap().rollback().await.unwrap();
             let err = trx.rollback().await.unwrap_err();
             assert_eq!(
                 err.downcast_ref::<InternalError>().copied(),
@@ -1840,7 +1931,7 @@ mod tests {
             trx.extend_gc_row_pages(vec![PageID::new(46)]);
             assert!(!trx.require_durability());
             assert!(trx.require_ordered_commit());
-            let mut prepared = trx.prepare();
+            let mut prepared = trx.prepare().unwrap();
             assert!(prepared.redo_bin.is_none());
             assert!(!prepared.require_durability());
             assert!(prepared.require_ordered_commit());
@@ -1857,7 +1948,7 @@ mod tests {
             });
             assert!(!trx.require_durability());
             assert!(trx.require_ordered_commit());
-            let mut prepared = trx.prepare();
+            let mut prepared = trx.prepare().unwrap();
             assert!(prepared.redo_bin.is_none());
             assert!(!prepared.require_durability());
             assert!(prepared.require_ordered_commit());
@@ -1870,7 +1961,7 @@ mod tests {
             trx.add_pseudo_redo_log_entry();
             assert!(trx.require_durability());
             assert!(trx.require_ordered_commit());
-            let mut prepared = trx.prepare();
+            let mut prepared = trx.prepare().unwrap();
             assert!(prepared.redo_bin.is_some());
             assert!(prepared.require_durability());
             assert!(prepared.require_ordered_commit());
@@ -1893,7 +1984,7 @@ mod tests {
             trx.retain_old_table_root(old_root).unwrap();
             assert!(!trx.readonly());
 
-            let prepared = trx.prepare();
+            let prepared = trx.prepare().unwrap();
             assert!(prepared.redo_bin.is_none());
             assert!(!prepared.require_durability());
             assert!(prepared.require_ordered_commit());
@@ -2006,7 +2097,7 @@ mod tests {
             let mut trx = ActiveTrx::new(session_state, MIN_ACTIVE_TRX_ID + 11, 11, 0, 0);
             trx.retain_old_table_root(old_root).unwrap();
 
-            let prepared = trx.prepare();
+            let prepared = trx.prepare().unwrap();
             let precommit = prepared.fill_cts(21);
             precommit.abort();
 

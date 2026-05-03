@@ -1,15 +1,18 @@
 use crate::buffer::PoolGuards;
 
-use crate::catalog::{TableCache, TableID, TableSpec};
-use crate::error::{InternalError, Result};
-use crate::lock::{LockMode, LockOwner, LockResource};
+use crate::catalog::{CatalogTable, TableCache, TableID, TableSpec};
+use crate::error::{FatalError, InternalError, Result};
+use crate::lock::{LockManager, LockMode, LockOwner, LockResource};
+use crate::quiescent::QuiescentGuard;
 use crate::row::RowID;
-use crate::row::ops::SelectKey;
+use crate::row::ops::{DeleteMvcc, ScanMvcc, SelectKey, SelectMvcc, UpdateCol, UpdateMvcc};
+use crate::table::{Table, TableAccess};
 use crate::trx::redo::{DDLRedo, RedoLogs, RowRedo};
 use crate::trx::undo::{
     IndexUndo, IndexUndoKind, IndexUndoLogs, OwnedRowUndo, RowUndoKind, RowUndoLogs,
 };
-use crate::trx::{ActiveTrx, TrxContext};
+use crate::trx::{OwnerLockState, TrxContext, TrxEffects};
+use crate::value::Val;
 use error_stack::Report;
 use std::mem;
 
@@ -19,12 +22,19 @@ pub enum StmtKind {
     CreateTable(TableSpec),
 }
 
+#[inline]
+fn active_transaction_discarded_err(operation: &'static str) -> crate::error::Error {
+    Report::new(InternalError::ActiveTransactionDiscarded)
+        .attach(format!("operation={operation}"))
+        .into()
+}
+
 /// Mutable effects accumulated by one statement before success or rollback.
 ///
 /// These effects merge into transaction-level `TrxEffects` when the statement
 /// succeeds. If the statement fails, index effects roll back before row effects
 /// and redo is discarded.
-pub struct StmtEffects {
+pub(crate) struct StmtEffects {
     row_undo: RowUndoLogs,
     index_undo: IndexUndoLogs,
     redo: RedoLogs,
@@ -144,10 +154,10 @@ impl StmtEffects {
         self.index_undo.push(index_undo);
     }
 
-    /// Moves successful statement effects into the active transaction.
+    /// Moves successful statement effects into the active transaction effects.
     #[inline]
-    pub(crate) fn merge_into_trx(&mut self, trx: &mut ActiveTrx) {
-        trx.merge_statement_effects(
+    pub(crate) fn merge_into_trx_effects(&mut self, trx_effects: &mut TrxEffects) {
+        trx_effects.merge_statement_effects(
             &mut self.row_undo,
             &mut self.index_undo,
             mem::take(&mut self.redo),
@@ -209,17 +219,18 @@ impl Drop for StmtEffects {
     }
 }
 
-/// Borrowed statement facade for one operation inside an active transaction.
+/// Statement-scoped facade for one operation inside an active transaction.
 ///
 /// `ActiveTrx::exec` owns the statement lifecycle. It passes this facade to the
-/// callback with immutable transaction context and mutable statement-local
-/// effects. Successful callbacks merge effects into the transaction; ordinary
-/// callback errors roll back only the current statement.
+/// callback with transaction context, statement-local effects, and
+/// statement-owned logical locks. Dropping this value releases every
+/// statement-owned lock, so success and rollback paths cannot forget cleanup.
 pub struct Statement<'stmt> {
     ctx: &'stmt TrxContext,
-    effects: &'stmt mut StmtEffects,
-    #[allow(dead_code)]
-    owner: LockOwner,
+    effects: StmtEffects,
+    lock_manager: QuiescentGuard<LockManager>,
+    trx_locks: &'stmt mut OwnerLockState,
+    stmt_locks: OwnerLockState,
 }
 
 impl<'stmt> Statement<'stmt> {
@@ -227,14 +238,16 @@ impl<'stmt> Statement<'stmt> {
     #[inline]
     pub(crate) fn new(
         ctx: &'stmt TrxContext,
-        effects: &'stmt mut StmtEffects,
         owner: LockOwner,
+        lock_manager: QuiescentGuard<LockManager>,
+        trx_locks: &'stmt mut OwnerLockState,
     ) -> Self {
-        debug_assert!(effects.is_empty());
         Statement {
             ctx,
-            effects,
-            owner,
+            effects: StmtEffects::empty(),
+            lock_manager,
+            trx_locks,
+            stmt_locks: OwnerLockState::new(owner),
         }
     }
 
@@ -246,56 +259,251 @@ impl<'stmt> Statement<'stmt> {
 
     /// Returns mutable access to this statement's effect accumulator.
     #[inline]
-    pub fn effects_mut(&mut self) -> &mut StmtEffects {
-        self.effects
+    pub(crate) fn effects_mut(&mut self) -> &mut StmtEffects {
+        &mut self.effects
     }
 
     /// Returns the statement-owned logical lock owner.
     #[inline]
     #[allow(dead_code)]
     pub(crate) fn lock_owner(&self) -> LockOwner {
-        self.owner
+        self.stmt_locks.owner()
     }
 
     /// Attempts to acquire a statement-owned logical lock without waiting.
     #[inline]
     #[allow(dead_code)]
     pub(crate) fn try_acquire_statement_lock(
-        &self,
+        &mut self,
         resource: LockResource,
         mode: LockMode,
     ) -> Result<bool> {
-        let engine = self.ctx.engine().ok_or_else(|| {
-            Report::new(InternalError::ActiveTransactionDiscarded)
-                .attach("operation=try acquire statement lock")
-        })?;
-        engine
-            .lock_manager()
-            .try_acquire(resource, mode, self.owner)
+        self.stmt_locks
+            .try_acquire(&self.lock_manager, resource, mode)
     }
 
     /// Acquires a statement-owned logical lock.
     #[inline]
     #[allow(dead_code)]
     pub(crate) async fn acquire_statement_lock(
-        &self,
+        &mut self,
         resource: LockResource,
         mode: LockMode,
     ) -> Result<()> {
-        let engine = self.ctx.engine().ok_or_else(|| {
-            Report::new(InternalError::ActiveTransactionDiscarded)
-                .attach("operation=acquire statement lock")
-        })?;
-        engine
-            .lock_manager()
-            .acquire(resource, mode, self.owner)
+        self.stmt_locks
+            .acquire(&self.lock_manager, resource, mode)
             .await
+    }
+
+    /// Acquires statement-lifetime metadata protection for a table read.
+    #[inline]
+    pub(crate) async fn acquire_table_read_lock(&mut self, table_id: TableID) -> Result<()> {
+        self.acquire_statement_lock(LockResource::TableMetadata(table_id), LockMode::Shared)
+            .await
+    }
+
+    /// Acquires transaction-lifetime metadata and table-data intent for a write.
+    #[inline]
+    pub(crate) async fn acquire_table_write_locks(&mut self, table_id: TableID) -> Result<()> {
+        self.trx_locks
+            .acquire(
+                &self.lock_manager,
+                LockResource::TableMetadata(table_id),
+                LockMode::Shared,
+            )
+            .await?;
+        self.trx_locks
+            .acquire(
+                &self.lock_manager,
+                LockResource::TableData(table_id),
+                LockMode::IntentExclusive,
+            )
+            .await
+    }
+
+    /// Scans the table's row store under statement-lifetime metadata protection.
+    #[inline]
+    pub async fn table_scan_mvcc<F>(
+        &mut self,
+        table: &Table,
+        read_set: &[usize],
+        row_action: F,
+    ) -> Result<()>
+    where
+        F: FnMut(Vec<Val>) -> bool,
+    {
+        self.acquire_table_read_lock(table.table_id()).await?;
+        table
+            .accessor()
+            .table_scan_mvcc(self.ctx, read_set, row_action)
+            .await;
+        Ok(())
+    }
+
+    /// Looks up one unique-key row under statement-lifetime metadata protection.
+    #[inline]
+    pub async fn table_lookup_unique_mvcc(
+        &mut self,
+        table: &Table,
+        key: &SelectKey,
+        user_read_set: &[usize],
+    ) -> Result<SelectMvcc> {
+        self.acquire_table_read_lock(table.table_id()).await?;
+        table
+            .accessor()
+            .index_lookup_unique_mvcc(self.ctx, key, user_read_set)
+            .await
+    }
+
+    /// Scans one secondary-index key under statement-lifetime metadata protection.
+    #[inline]
+    pub async fn table_index_scan_mvcc(
+        &mut self,
+        table: &Table,
+        key: &SelectKey,
+        user_read_set: &[usize],
+    ) -> Result<ScanMvcc> {
+        self.acquire_table_read_lock(table.table_id()).await?;
+        table
+            .accessor()
+            .index_scan_mvcc(self.ctx, key, user_read_set)
+            .await
+    }
+
+    /// Inserts one user-table row after acquiring transaction-lifetime write locks.
+    #[inline]
+    pub async fn table_insert_mvcc(&mut self, table: &Table, cols: Vec<Val>) -> Result<RowID> {
+        self.acquire_table_write_locks(table.table_id()).await?;
+        table
+            .accessor()
+            .insert_mvcc(self.ctx, &mut self.effects, cols)
+            .await
+    }
+
+    /// Updates one user-table row by unique key after acquiring write locks.
+    #[inline]
+    pub async fn table_update_unique_mvcc(
+        &mut self,
+        table: &Table,
+        key: &SelectKey,
+        update: Vec<UpdateCol>,
+    ) -> Result<UpdateMvcc> {
+        self.acquire_table_write_locks(table.table_id()).await?;
+        table
+            .accessor()
+            .update_unique_mvcc(self.ctx, &mut self.effects, key, update)
+            .await
+    }
+
+    /// Deletes one user-table row by unique key after acquiring write locks.
+    #[inline]
+    pub async fn table_delete_unique_mvcc(
+        &mut self,
+        table: &Table,
+        key: &SelectKey,
+        log_by_key: bool,
+    ) -> Result<DeleteMvcc> {
+        self.acquire_table_write_locks(table.table_id()).await?;
+        table
+            .accessor()
+            .delete_unique_mvcc(self.ctx, &mut self.effects, key, log_by_key)
+            .await
+    }
+
+    /// Inserts one catalog-table row through the foreground lock-aware path.
+    #[inline]
+    pub(crate) async fn catalog_insert_mvcc(
+        &mut self,
+        table: &CatalogTable,
+        cols: Vec<Val>,
+    ) -> Result<RowID> {
+        self.acquire_table_write_locks(table.table_id()).await?;
+        table
+            .accessor()
+            .insert_mvcc(self.ctx, &mut self.effects, cols)
+            .await
+    }
+
+    /// Deletes one catalog-table row through the foreground lock-aware path.
+    #[inline]
+    pub(crate) async fn catalog_delete_unique_mvcc(
+        &mut self,
+        table: &CatalogTable,
+        key: &SelectKey,
+        log_by_key: bool,
+    ) -> Result<DeleteMvcc> {
+        self.acquire_table_write_locks(table.table_id()).await?;
+        table
+            .accessor()
+            .delete_unique_mvcc(self.ctx, &mut self.effects, key, log_by_key)
+            .await
+    }
+
+    /// Moves successful statement effects into transaction effects.
+    #[inline]
+    pub(crate) fn merge_effects_into(&mut self, trx_effects: &mut TrxEffects) {
+        self.effects.merge_into_trx_effects(trx_effects);
+    }
+
+    /// Rolls back statement-local effects after an ordinary callback error.
+    ///
+    /// Index effects roll back before row effects so index entries stop
+    /// pointing at uncommitted row state before row undo is unwound. Statement
+    /// locks stay held until this method returns and `Statement` drops.
+    #[inline]
+    pub(crate) async fn rollback_effects(&mut self) -> Result<()> {
+        let engine = self
+            .ctx
+            .engine()
+            .cloned()
+            .ok_or_else(|| active_transaction_discarded_err("rollback statement effects"))?;
+        let pool_guards = self
+            .ctx
+            .pool_guards()
+            .cloned()
+            .ok_or_else(|| active_transaction_discarded_err("rollback statement effects"))?;
+        let mut table_cache = TableCache::new(engine.catalog());
+        let sts = self.ctx.sts();
+        if self
+            .effects
+            .rollback_index(&mut table_cache, &pool_guards, sts)
+            .await
+            .is_err()
+        {
+            self.effects.clear_for_discard();
+            return Err(engine
+                .trx_sys
+                .poison_storage(FatalError::RollbackAccess)
+                .into());
+        }
+        if self
+            .effects
+            .rollback_row(&mut table_cache, &pool_guards, Some(sts))
+            .await
+            .is_err()
+        {
+            self.effects.clear_for_discard();
+            return Err(engine
+                .trx_sys
+                .poison_storage(FatalError::RollbackAccess)
+                .into());
+        }
+        self.effects.clear_redo();
+        Ok(())
     }
 
     /// Returns disjoint transaction context and statement effects references.
     #[inline]
-    pub fn ctx_and_effects_mut(&mut self) -> (&TrxContext, &mut StmtEffects) {
-        (self.ctx, self.effects)
+    #[allow(dead_code)]
+    pub(crate) fn ctx_and_effects_mut(&mut self) -> (&TrxContext, &mut StmtEffects) {
+        (self.ctx, &mut self.effects)
+    }
+}
+
+impl Drop for Statement<'_> {
+    #[inline]
+    fn drop(&mut self) {
+        self.stmt_locks.release_all(&self.lock_manager);
     }
 }
 
@@ -308,7 +516,7 @@ mod tests {
     use crate::error::{FatalError, InternalError, OperationError};
     use crate::session::SessionState;
     use crate::trx::undo::{OwnedRowUndo, RowUndoKind};
-    use crate::trx::{MIN_ACTIVE_TRX_ID, TrxID};
+    use crate::trx::{ActiveTrx, MIN_ACTIVE_TRX_ID, TrxID};
     use error_stack::Report;
     use std::cell::Cell;
     use std::sync::Arc;
