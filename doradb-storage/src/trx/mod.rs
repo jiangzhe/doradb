@@ -35,7 +35,10 @@ use crate::catalog::TableID;
 use crate::engine::EngineRef;
 use crate::error::{InternalError, OperationError, Result};
 use crate::file::table_file::OldRoot;
-use crate::lock::{LockManager, LockMode, LockOwner, LockResource, StmtNo};
+use crate::lock::{
+    FreshLockGuard, LockGrant, LockManager, LockMode, LockOwner, LockOwnerGroup, LockResource,
+    StmtNo,
+};
 use crate::quiescent::QuiescentGuard;
 use crate::row::RowID;
 use crate::session::SessionState;
@@ -486,6 +489,7 @@ impl TrxEffects {
 /// whole lock table.
 pub(crate) struct OwnerLockState {
     owner: LockOwner,
+    owner_group: Option<LockOwnerGroup>,
     held: HashMap<LockResource, LockMode>,
 }
 
@@ -495,6 +499,17 @@ impl OwnerLockState {
     pub(crate) fn new(owner: LockOwner) -> Self {
         OwnerLockState {
             owner,
+            owner_group: None,
+            held: HashMap::new(),
+        }
+    }
+
+    /// Create an empty cache for one logical owner inside an owner group.
+    #[inline]
+    pub(crate) fn new_grouped(owner: LockOwner, owner_group: LockOwnerGroup) -> Self {
+        OwnerLockState {
+            owner,
+            owner_group: Some(owner_group),
             held: HashMap::new(),
         }
     }
@@ -503,6 +518,12 @@ impl OwnerLockState {
     #[inline]
     pub(crate) fn owner(&self) -> LockOwner {
         self.owner
+    }
+
+    /// Returns the owner group represented by this state, if any.
+    #[inline]
+    pub(crate) fn owner_group(&self) -> Option<LockOwnerGroup> {
+        self.owner_group
     }
 
     /// Returns whether the cached lock mode covers the requested mode.
@@ -532,7 +553,13 @@ impl OwnerLockState {
         if self.cached_covers(resource, mode)? {
             return Ok(true);
         }
-        if !lock_manager.try_acquire(resource, mode, self.owner)? {
+        let acquired = match self.owner_group {
+            Some(owner_group) => {
+                lock_manager.try_acquire_grouped(resource, mode, self.owner, owner_group)?
+            }
+            None => lock_manager.try_acquire(resource, mode, self.owner)?,
+        };
+        if !acquired {
             return Ok(false);
         }
         self.cache_granted(resource, mode);
@@ -553,9 +580,43 @@ impl OwnerLockState {
         if self.cached_covers(resource, mode)? {
             return Ok(());
         }
-        lock_manager.acquire(resource, mode, self.owner).await?;
+        match self.owner_group {
+            Some(owner_group) => {
+                lock_manager
+                    .acquire_grouped(resource, mode, self.owner, owner_group)
+                    .await?;
+            }
+            None => {
+                lock_manager.acquire(resource, mode, self.owner).await?;
+            }
+        }
         self.cache_granted(resource, mode);
         Ok(())
+    }
+
+    /// Acquires through the lock manager without updating the local cache.
+    #[inline]
+    async fn acquire_uncached(
+        &self,
+        lock_manager: &LockManager,
+        resource: LockResource,
+        mode: LockMode,
+    ) -> Result<LockGrant> {
+        if self.cached_covers(resource, mode)? {
+            return Ok(LockGrant::Existing);
+        }
+        match self.owner_group {
+            Some(owner_group) => {
+                lock_manager
+                    .acquire_grouped_with_grant(resource, mode, self.owner, owner_group)
+                    .await
+            }
+            None => {
+                lock_manager
+                    .acquire_with_grant(resource, mode, self.owner)
+                    .await
+            }
+        }
     }
 
     #[inline]
@@ -621,10 +682,14 @@ impl ActiveTrx {
         log_no: usize,
         gc_no: usize,
     ) -> Self {
+        let owner_group = LockOwnerGroup::Session(session.id());
         ActiveTrx {
             ctx: TrxContext::new(session, trx_id, sts, log_no, gc_no),
             effects: TrxEffects::empty(),
-            lock_state: Some(OwnerLockState::new(LockOwner::Transaction(trx_id))),
+            lock_state: Some(OwnerLockState::new_grouped(
+                LockOwner::Transaction(trx_id),
+                owner_group,
+            )),
             next_stmt_no: 1,
             state: ActiveTrxState::Active,
         }
@@ -823,6 +888,31 @@ impl ActiveTrx {
         self.checked_lock_state_mut("acquire transaction lock")?
             .acquire(&lock_manager, resource, mode)
             .await
+    }
+
+    /// Acquires an explicit transaction-lifetime table lock.
+    #[inline]
+    pub async fn lock_table(&mut self, table_id: TableID, mode: LockMode) -> Result<()> {
+        mode.validate_explicit_table_lock()?;
+        let lock_manager = self.checked_lock_manager("lock explicit table")?;
+        let metadata_resource = LockResource::TableMetadata(table_id);
+        let data_resource = LockResource::TableData(table_id);
+        let owner = self.checked_lock_state("lock explicit table")?.owner();
+        let metadata_grant = self
+            .checked_lock_state("lock explicit table")?
+            .acquire_uncached(&lock_manager, metadata_resource, LockMode::Shared)
+            .await?;
+        let mut metadata_guard =
+            FreshLockGuard::new(&lock_manager, metadata_resource, owner, metadata_grant);
+        self.checked_lock_state_mut("lock explicit table")?
+            .acquire(&lock_manager, data_resource, mode)
+            .await?;
+        self.checked_lock_state_mut("lock explicit table")?
+            .cache_granted(metadata_resource, LockMode::Shared);
+        if let Some(guard) = metadata_guard.as_mut() {
+            guard.disarm();
+        }
+        Ok(())
     }
 
     /// Releases every transaction-owned logical lock.

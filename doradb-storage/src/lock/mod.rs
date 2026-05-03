@@ -91,6 +91,17 @@ impl LockMode {
         validate_mode(resource, requested)?;
         Ok(mode_covers(resource, self, requested))
     }
+
+    /// Validates that this mode is allowed for explicit table-lock APIs.
+    #[inline]
+    pub(crate) fn validate_explicit_table_lock(self) -> Result<()> {
+        if matches!(self, LockMode::Shared | LockMode::Exclusive) {
+            return Ok(());
+        }
+        Err(Report::new(OperationError::InvalidLockMode)
+            .attach(format!("explicit table lock mode={self:?}"))
+            .into())
+    }
 }
 
 /// Logical lock owner independent from Rust object lifetimes.
@@ -102,6 +113,68 @@ pub enum LockOwner {
     Transaction(TrxID),
     /// Lock held for one statement inside a transaction.
     Statement(TrxID, StmtNo),
+}
+
+/// Logical owner group for locks created by the same client session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub(crate) enum LockOwnerGroup {
+    /// Owners associated with one engine-local session.
+    Session(SessionID),
+}
+
+/// Whether an acquisition created a new granted lock entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LockGrant {
+    /// The acquire call created a fresh granted entry.
+    Fresh,
+    /// The requested mode was already represented by this owner or waiter.
+    Existing,
+}
+
+impl LockGrant {
+    #[inline]
+    fn is_fresh(self) -> bool {
+        self == LockGrant::Fresh
+    }
+}
+
+/// Releases a freshly acquired lock unless the caller completes and disarms it.
+pub(crate) struct FreshLockGuard<'a> {
+    lock_manager: &'a LockManager,
+    resource: LockResource,
+    owner: LockOwner,
+    active: bool,
+}
+
+impl<'a> FreshLockGuard<'a> {
+    #[inline]
+    pub(crate) fn new(
+        lock_manager: &'a LockManager,
+        resource: LockResource,
+        owner: LockOwner,
+        grant: LockGrant,
+    ) -> Option<Self> {
+        grant.is_fresh().then(|| FreshLockGuard {
+            lock_manager,
+            resource,
+            owner,
+            active: true,
+        })
+    }
+
+    #[inline]
+    pub(crate) fn disarm(&mut self) {
+        self.active = false;
+    }
+}
+
+impl Drop for FreshLockGuard<'_> {
+    #[inline]
+    fn drop(&mut self) {
+        if self.active {
+            self.lock_manager.release(self.resource, self.owner);
+        }
+    }
 }
 
 /// Intended lifetime category for a logical lock.
@@ -141,13 +214,36 @@ impl LockManager {
         mode: LockMode,
         owner: LockOwner,
     ) -> Result<bool> {
+        self.try_acquire_with_group(resource, mode, owner, None)
+    }
+
+    /// Attempts to acquire a lock for an owner inside a session owner group.
+    #[inline]
+    pub(crate) fn try_acquire_grouped(
+        &self,
+        resource: LockResource,
+        mode: LockMode,
+        owner: LockOwner,
+        owner_group: LockOwnerGroup,
+    ) -> Result<bool> {
+        self.try_acquire_with_group(resource, mode, owner, Some(owner_group))
+    }
+
+    #[inline]
+    fn try_acquire_with_group(
+        &self,
+        resource: LockResource,
+        mode: LockMode,
+        owner: LockOwner,
+        owner_group: Option<LockOwnerGroup>,
+    ) -> Result<bool> {
         validate_mode(resource, mode)?;
         // The DashMap entry guard is the per-resource serialization boundary:
         // callers for different resources can proceed independently, while all
         // grant/queue decisions for this resource stay atomic.
         let mut resource_state = self.resources.entry(resource).or_default();
-        match resource_state.try_acquire_immediate(resource, mode, owner)? {
-            AcquireImmediate::Granted => Ok(true),
+        match resource_state.try_acquire_immediate(resource, mode, owner, owner_group)? {
+            AcquireImmediate::Granted(_) => Ok(true),
             AcquireImmediate::WouldWait | AcquireImmediate::AlreadyWaiting(_) => Ok(false),
         }
     }
@@ -164,34 +260,85 @@ impl LockManager {
         mode: LockMode,
         owner: LockOwner,
     ) -> Result<()> {
+        self.acquire_with_group(resource, mode, owner, None)
+            .await
+            .map(|_| ())
+    }
+
+    /// Acquires a lock and reports whether this call created a grant.
+    #[inline]
+    pub(crate) async fn acquire_with_grant(
+        &self,
+        resource: LockResource,
+        mode: LockMode,
+        owner: LockOwner,
+    ) -> Result<LockGrant> {
+        self.acquire_with_group(resource, mode, owner, None).await
+    }
+
+    /// Acquires a lock for an owner inside a session owner group.
+    #[inline]
+    pub(crate) async fn acquire_grouped(
+        &self,
+        resource: LockResource,
+        mode: LockMode,
+        owner: LockOwner,
+        owner_group: LockOwnerGroup,
+    ) -> Result<()> {
+        self.acquire_with_group(resource, mode, owner, Some(owner_group))
+            .await
+            .map(|_| ())
+    }
+
+    /// Acquires a grouped lock and reports whether this call created a grant.
+    #[inline]
+    pub(crate) async fn acquire_grouped_with_grant(
+        &self,
+        resource: LockResource,
+        mode: LockMode,
+        owner: LockOwner,
+        owner_group: LockOwnerGroup,
+    ) -> Result<LockGrant> {
+        self.acquire_with_group(resource, mode, owner, Some(owner_group))
+            .await
+    }
+
+    #[inline]
+    async fn acquire_with_group(
+        &self,
+        resource: LockResource,
+        mode: LockMode,
+        owner: LockOwner,
+        owner_group: Option<LockOwnerGroup>,
+    ) -> Result<LockGrant> {
         validate_mode(resource, mode)?;
-        let (waiter, waiter_guard) = {
+        let (waiter, waiter_guard, grant) = {
             // Reuse the non-blocking path first. If the request must wait,
             // enqueue the waiter while still holding the resource guard so a
             // concurrent release cannot miss this request.
             let mut resource_state = self.resources.entry(resource).or_default();
-            match resource_state.try_acquire_immediate(resource, mode, owner)? {
-                AcquireImmediate::Granted => return Ok(()),
+            match resource_state.try_acquire_immediate(resource, mode, owner, owner_group)? {
+                AcquireImmediate::Granted(grant) => return Ok(grant),
                 AcquireImmediate::WouldWait => {
-                    let waiter = Arc::new(Waiter::new(owner, mode));
+                    let waiter = Arc::new(Waiter::new(owner, owner_group, mode));
                     resource_state.waiters.push_back(Arc::clone(&waiter));
                     // Keep the queued request cancellation-safe after the resource
                     // guard is released and before the grant is observed.
                     let waiter_guard =
                         WaiterGuard::new(&self.resources, resource, Arc::clone(&waiter));
-                    (waiter, waiter_guard)
+                    (waiter, waiter_guard, LockGrant::Fresh)
                 }
                 AcquireImmediate::AlreadyWaiting(waiter) => {
                     let waiter_guard =
                         WaiterGuard::new(&self.resources, resource, Arc::clone(&waiter));
-                    (waiter, waiter_guard)
+                    (waiter, waiter_guard, LockGrant::Existing)
                 }
             }
         };
         // The resource guard is dropped before awaiting; grant notification
         // and cleanup paths can keep mutating the same resource while this task
         // is parked.
-        self.wait_for_grant_with_guard(resource, mode, owner, waiter, waiter_guard)
+        self.wait_for_grant_with_guard(resource, mode, owner, waiter, waiter_guard, grant)
             .await
     }
 
@@ -203,12 +350,13 @@ impl LockManager {
         owner: LockOwner,
         waiter: Arc<Waiter>,
         mut waiter_guard: WaiterGuard,
-    ) -> Result<()> {
+        grant: LockGrant,
+    ) -> Result<LockGrant> {
         let res = self.wait_for_grant(resource, mode, owner, waiter).await;
         if res.is_ok() {
             waiter_guard.disarm_after_grant_observed();
         }
-        res
+        res.map(|_| grant)
     }
 
     /// Releases locks and waiters for one owner/resource pair.
@@ -394,13 +542,14 @@ impl ResourceState {
         resource: LockResource,
         mode: LockMode,
         owner: LockOwner,
+        owner_group: Option<LockOwnerGroup>,
     ) -> Result<AcquireImmediate> {
         if let Some(idx) = self.granted_idx(owner) {
             // Reentrant requests that are already covered do not create
             // duplicate granted entries.
             let held = self.granted[idx].mode;
             if mode_covers(resource, held, mode) {
-                return Ok(AcquireImmediate::Granted);
+                return Ok(AcquireImmediate::Granted(LockGrant::Existing));
             }
             // Conversions are immediate-only in this phase. Incomparable modes
             // are rejected rather than synthesized into a combined mode such as
@@ -411,11 +560,14 @@ impl ResourceState {
             // A stronger same-owner mode may replace the existing grant only
             // when it does not conflict with current holders and does not jump
             // ahead of any queued request.
-            if !self.waiters.is_empty() || !self.compatible_with_granted(resource, mode, owner) {
+            self.validate_owner_group_coverage(resource, mode, owner, owner_group)?;
+            if !self.waiters.is_empty()
+                || !self.compatible_with_granted(resource, mode, owner, owner_group)
+            {
                 return Err(upgrade_would_block_err(resource, held, mode, owner));
             }
             self.granted[idx].mode = mode;
-            return Ok(AcquireImmediate::Granted);
+            return Ok(AcquireImmediate::Granted(LockGrant::Existing));
         }
         if let Some(waiter) = self.waiter_by_owner(owner) {
             let waiting = waiter.mode;
@@ -427,11 +579,20 @@ impl ResourceState {
             }
             return Err(upgrade_would_block_err(resource, waiting, mode, owner));
         }
+        let owner_group_covered =
+            self.validate_owner_group_coverage(resource, mode, owner, owner_group)?;
         // Fresh compatible requests still wait behind an existing queue so
-        // readers or intent holders cannot starve an older incompatible waiter.
-        if self.waiters.is_empty() && self.compatible_with_granted(resource, mode, owner) {
-            self.granted.push(GrantedLock { owner, mode });
-            return Ok(AcquireImmediate::Granted);
+        // readers or intent holders cannot starve an older incompatible waiter,
+        // unless an already-granted same-session lock covers this request.
+        if self.compatible_with_granted(resource, mode, owner, owner_group)
+            && (owner_group_covered || self.waiters.is_empty())
+        {
+            self.granted.push(GrantedLock {
+                owner,
+                owner_group,
+                mode,
+            });
+            return Ok(AcquireImmediate::Granted(LockGrant::Fresh));
         }
         Ok(AcquireImmediate::WouldWait)
     }
@@ -465,10 +626,63 @@ impl ResourceState {
         resource: LockResource,
         mode: LockMode,
         owner: LockOwner,
+        owner_group: Option<LockOwnerGroup>,
     ) -> bool {
         self.granted.iter().all(|granted| {
-            granted.owner == owner || modes_are_compatible(resource, granted.mode, mode)
+            if granted.owner == owner {
+                return true;
+            }
+            if owner_group.is_some() && granted.owner_group == owner_group {
+                return mode_covers(resource, granted.mode, mode);
+            }
+            modes_are_compatible(resource, granted.mode, mode)
         })
+    }
+
+    #[inline]
+    fn validate_owner_group_coverage(
+        &self,
+        resource: LockResource,
+        mode: LockMode,
+        owner: LockOwner,
+        owner_group: Option<LockOwnerGroup>,
+    ) -> Result<bool> {
+        let Some(owner_group) = owner_group else {
+            return Ok(false);
+        };
+        let mut covered = false;
+        for granted in self.granted.iter() {
+            if granted.owner == owner || granted.owner_group != Some(owner_group) {
+                continue;
+            }
+            if !mode_covers(resource, granted.mode, mode) {
+                return Err(owner_group_conflict_err(
+                    resource,
+                    granted.mode,
+                    mode,
+                    owner,
+                    owner_group,
+                    granted.owner,
+                ));
+            }
+            covered = true;
+        }
+        for waiter in self.waiters.iter() {
+            if waiter.owner == owner || waiter.owner_group != Some(owner_group) {
+                continue;
+            }
+            if !mode_covers(resource, waiter.mode, mode) {
+                return Err(owner_group_conflict_err(
+                    resource,
+                    waiter.mode,
+                    mode,
+                    owner,
+                    owner_group,
+                    waiter.owner,
+                ));
+            }
+        }
+        Ok(covered)
     }
 
     #[inline]
@@ -511,12 +725,12 @@ impl ResourceState {
     #[inline]
     fn grant_waiters(&mut self, resource: LockResource) -> Vec<Arc<Waiter>> {
         let mut granted_waiters = Vec::new();
-        while let Some((mode, owner)) = self
+        while let Some((mode, owner, owner_group)) = self
             .waiters
             .front()
-            .map(|waiter| (waiter.mode, waiter.owner))
+            .map(|waiter| (waiter.mode, waiter.owner, waiter.owner_group))
         {
-            if !self.compatible_with_granted(resource, mode, owner) {
+            if !self.compatible_with_granted(resource, mode, owner, owner_group) {
                 break;
             }
             let Some(waiter) = self.waiters.pop_front() else {
@@ -534,6 +748,7 @@ impl ResourceState {
             } else {
                 self.granted.push(GrantedLock {
                     owner: waiter.owner,
+                    owner_group: waiter.owner_group,
                     mode: waiter.mode,
                 });
             }
@@ -556,6 +771,7 @@ impl ResourceState {
             resource,
             mode: granted.mode,
             owner: granted.owner,
+            owner_group: granted.owner_group,
             state: LockDebugEntryState::Granted,
             queue_order: None,
         }));
@@ -567,6 +783,7 @@ impl ResourceState {
                     resource,
                     mode: waiter.mode,
                     owner: waiter.owner,
+                    owner_group: waiter.owner_group,
                     state: LockDebugEntryState::Waiting,
                     queue_order: Some(queue_order),
                 }),
@@ -578,6 +795,7 @@ impl ResourceState {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct GrantedLock {
     owner: LockOwner,
+    owner_group: Option<LockOwnerGroup>,
     mode: LockMode,
 }
 
@@ -662,6 +880,7 @@ impl Drop for WaiterGuard {
 
 struct Waiter {
     owner: LockOwner,
+    owner_group: Option<LockOwnerGroup>,
     mode: LockMode,
     outcome: Mutex<WaitOutcome>,
     event: Event,
@@ -671,9 +890,10 @@ struct Waiter {
 
 impl Waiter {
     #[inline]
-    fn new(owner: LockOwner, mode: LockMode) -> Self {
+    fn new(owner: LockOwner, owner_group: Option<LockOwnerGroup>, mode: LockMode) -> Self {
         Waiter {
             owner,
+            owner_group,
             mode,
             outcome: Mutex::new(WaitOutcome::Waiting),
             event: Event::new(),
@@ -727,7 +947,7 @@ enum WaitOutcome {
 }
 
 enum AcquireImmediate {
-    Granted,
+    Granted(LockGrant),
     WouldWait,
     AlreadyWaiting(Arc<Waiter>),
 }
@@ -750,6 +970,8 @@ pub(crate) struct LockDebugEntry {
     pub(crate) mode: LockMode,
     /// Owner for this entry.
     pub(crate) owner: LockOwner,
+    /// Owner group for this entry, when grouped acquisition was used.
+    pub(crate) owner_group: Option<LockOwnerGroup>,
     /// Whether the entry is granted or waiting.
     pub(crate) state: LockDebugEntryState,
     /// FIFO queue order for waiters; `None` for granted locks.
@@ -926,6 +1148,23 @@ fn conversion_not_supported_err(
 }
 
 #[inline]
+fn owner_group_conflict_err(
+    resource: LockResource,
+    held: LockMode,
+    requested: LockMode,
+    owner: LockOwner,
+    owner_group: LockOwnerGroup,
+    held_owner: LockOwner,
+) -> crate::error::Error {
+    Report::new(OperationError::LockOwnerGroupConflict)
+        .attach(format!(
+            "resource={resource:?}, owner={owner:?}, owner_group={owner_group:?}, \
+             held_owner={held_owner:?}, held={held:?}, requested={requested:?}"
+        ))
+        .into()
+}
+
+#[inline]
 fn waiter_released_err(
     resource: LockResource,
     mode: LockMode,
@@ -961,6 +1200,10 @@ mod tests {
 
     fn session(id: SessionID) -> LockOwner {
         LockOwner::Session(id)
+    }
+
+    fn group(id: SessionID) -> LockOwnerGroup {
+        LockOwnerGroup::Session(id)
     }
 
     fn assert_operation_err<T>(res: Result<T>, expected: OperationError) {
@@ -1336,6 +1579,108 @@ mod tests {
     }
 
     #[test]
+    fn same_group_covered_request_grants_without_waiting() {
+        smol::block_on(async {
+            let manager = Arc::new(LockManager::new());
+            let resource = table_data(60);
+            assert!(
+                manager
+                    .try_acquire_grouped(resource, LockMode::Exclusive, session(1), group(1))
+                    .unwrap()
+            );
+
+            let external_waiter = {
+                let manager = Arc::clone(&manager);
+                smol::spawn(
+                    async move { manager.acquire(resource, LockMode::Shared, trx(2)).await },
+                )
+            };
+            wait_for_waiters(&manager, resource, 1).await;
+
+            assert!(
+                manager
+                    .try_acquire_grouped(resource, LockMode::IntentExclusive, trx(3), group(1),)
+                    .unwrap()
+            );
+
+            let snapshot = manager.debug_snapshot();
+            assert!(snapshot.entries.iter().any(|entry| {
+                entry.owner == trx(3)
+                    && entry.owner_group == Some(group(1))
+                    && entry.mode == LockMode::IntentExclusive
+                    && entry.state == LockDebugEntryState::Granted
+            }));
+            assert!(snapshot.entries.iter().any(|entry| {
+                entry.owner == trx(2) && entry.state == LockDebugEntryState::Waiting
+            }));
+
+            assert_eq!(manager.release(resource, trx(3)), 1);
+            assert_eq!(manager.release(resource, session(1)), 1);
+            external_waiter.await.unwrap();
+        });
+    }
+
+    #[test]
+    fn same_group_noncovered_request_errors_without_waiter() {
+        let manager = LockManager::new();
+        let resource = table_data(61);
+        assert!(
+            manager
+                .try_acquire_grouped(resource, LockMode::Shared, session(1), group(1))
+                .unwrap()
+        );
+
+        assert_operation_err(
+            manager.try_acquire_grouped(resource, LockMode::IntentExclusive, trx(2), group(1)),
+            OperationError::LockOwnerGroupConflict,
+        );
+
+        let snapshot = manager.debug_snapshot();
+        assert_eq!(
+            count_entries(&snapshot, resource, LockDebugEntryState::Waiting),
+            0
+        );
+        assert!(!snapshot.entries.iter().any(|entry| entry.owner == trx(2)));
+    }
+
+    #[test]
+    fn same_group_noncovered_request_does_not_queue_behind_same_group_waiter() {
+        smol::block_on(async {
+            let manager = Arc::new(LockManager::new());
+            let resource = table_data(62);
+            assert!(
+                manager
+                    .try_acquire(resource, LockMode::Exclusive, trx(99))
+                    .unwrap()
+            );
+
+            let session_waiter = {
+                let manager = Arc::clone(&manager);
+                smol::spawn(async move {
+                    manager
+                        .acquire_grouped(resource, LockMode::Shared, session(1), group(1))
+                        .await
+                })
+            };
+            wait_for_waiters(&manager, resource, 1).await;
+
+            assert_operation_err(
+                manager.try_acquire_grouped(resource, LockMode::IntentExclusive, trx(2), group(1)),
+                OperationError::LockOwnerGroupConflict,
+            );
+            let snapshot = manager.debug_snapshot();
+            assert_eq!(
+                count_entries(&snapshot, resource, LockDebugEntryState::Waiting),
+                1
+            );
+            assert!(!snapshot.entries.iter().any(|entry| entry.owner == trx(2)));
+
+            assert_eq!(manager.release(resource, trx(99)), 1);
+            session_waiter.await.unwrap();
+        });
+    }
+
+    #[test]
     fn immediate_conversion_succeeds_only_when_it_will_not_wait() {
         let manager = LockManager::new();
         let resource = table_data(6);
@@ -1602,7 +1947,7 @@ mod tests {
     fn active_waiter_guard_removes_unobserved_grant() {
         let manager = LockManager::new();
         let resource = table_metadata(52);
-        let waiter = Arc::new(Waiter::new(trx(2), LockMode::Shared));
+        let waiter = Arc::new(Waiter::new(trx(2), None, LockMode::Shared));
         {
             let mut resource_state = manager.resources.entry(resource).or_default();
             resource_state.waiters.push_back(Arc::clone(&waiter));
@@ -1625,10 +1970,11 @@ mod tests {
         let mut resource_state = ResourceState::default();
         resource_state.granted.push(GrantedLock {
             owner: trx(2),
+            owner_group: None,
             mode: LockMode::IntentShared,
         });
-        let covered_waiter = Arc::new(Waiter::new(trx(2), LockMode::IntentShared));
-        let stronger_waiter = Arc::new(Waiter::new(trx(2), LockMode::IntentExclusive));
+        let covered_waiter = Arc::new(Waiter::new(trx(2), None, LockMode::IntentShared));
+        let stronger_waiter = Arc::new(Waiter::new(trx(2), None, LockMode::IntentExclusive));
         resource_state
             .waiters
             .push_back(Arc::clone(&covered_waiter));
