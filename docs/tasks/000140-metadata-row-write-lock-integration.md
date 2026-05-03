@@ -1,7 +1,7 @@
 ---
 id: 000140
 title: Metadata And Row-Write Lock Integration
-status: proposal
+status: implemented
 created: 2026-05-02
 github_issue: 609
 ---
@@ -236,6 +236,65 @@ References:
 
 ## Implementation Notes
 
+Status: Implemented.
+
+Implemented Phase 3 of RFC-0016 by moving foreground table access behind
+lock-aware `Statement` APIs. MVCC table scans, unique lookups, and index scans
+now acquire statement-owned `TableMetadata(S)` before entering lower-level table
+access. Foreground inserts, unique updates, unique deletes, catalog row writes,
+and recovery/purge helper DML now acquire transaction-owned
+`TableMetadata(S)` plus cached `TableData(IX)` before row undo, cold-row CDB,
+or index write ownership is installed.
+
+`Statement` now owns its statement lock state and acts as the statement-scope
+guard: statement-owned locks release from `Statement::drop` after success or
+rollback cleanup. Transaction-owned locks use the same `OwnerLockState`
+structure with cached resources, so release does not scan the full lock-manager
+map. `Statement` only captures an immutable `TrxContext` reference plus a
+narrow mutable transaction lock-state reference, and the old separate
+transaction/statement lock-state wrappers were collapsed into `OwnerLockState`.
+
+`Session::create_table` now acquires session-owned `CatalogNamespace(X)` before
+user table id allocation and holds it through catalog row writes, table-file
+commit, runtime table construction, and `Catalog::insert_user_table`. The scoped
+session lock releases on success and on error cleanup paths.
+
+Table internals now assert the foreground row-write invariant before installing
+hot row undo ownership, cold-row deletion-buffer ownership, and foreground index
+write ownership: the transaction owner must hold `TableData(IX)` or
+`TableData(X)` for the target table. Recovery, checkpoint, purge, rollback, and
+no-trx bootstrap boundaries remain outside foreground logical locking.
+
+The direct table-access surface was narrowed after migration. Public examples
+and foreground tests now use statement APIs instead of importing `TableAccess`;
+lower-level table accessors are retained as crate-private implementation
+surfaces.
+
+Transaction terminal state is represented by a single `ActiveTrxState` instead
+of separate `session_finished` and `discarded` flags. Fatal rollback discard
+continues to release transaction locks and session ownership, and commit,
+rollback, and prepare on a discarded active transaction now return
+`InternalError::ActiveTransactionDiscarded` instead of panicking.
+
+No unsafe code was added or modified.
+
+Validation completed:
+
+- `cargo fmt --check`
+- `git diff --check`
+- `cargo build -p doradb-storage`
+- `cargo check -p doradb-storage --tests`
+- `cargo check -p doradb-storage --examples`
+- `cargo clippy -p doradb-storage --all-targets -- -D warnings`
+- `cargo nextest run -p doradb-storage --no-fail-fast` passed 676/676 tests.
+- `tools/coverage_focus.rs --path doradb-storage/src/trx --path doradb-storage/src/table --path doradb-storage/src/session.rs --path doradb-storage/src/lock`: 91.58% combined focused coverage.
+  - `doradb-storage/src/trx`: 94.16%
+  - `doradb-storage/src/table`: 89.08%
+  - `doradb-storage/src/session.rs`: 90.64%
+  - `doradb-storage/src/lock`: 97.81%
+
+Task checklist result: pass. No required fixes or deferred backlog follow-ups
+remain from the post-implementation review.
 
 ## Impacts
 

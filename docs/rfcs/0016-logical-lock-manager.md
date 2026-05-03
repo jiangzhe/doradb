@@ -557,10 +557,10 @@ unsafe boundary and apply the repository unsafe review process before merging.
     installed without `TableData(IX)` or `TableData(X)`.
   - Non-goals: Implementing `DROP TABLE`, `CREATE INDEX`, or public SQL table
     lock statements.
-  - Task Doc: `docs/tasks/TBD.md`
-  - Task Issue: `#0`
-  - Phase Status: `pending`
-  - Implementation Summary: `pending`
+  - Task Doc: `docs/tasks/000140-metadata-row-write-lock-integration.md`
+  - Task Issue: `#609`
+  - Phase Status: done
+  - Implementation Summary: Implemented Phase 3 by routing foreground table reads and writes through lock-aware Statement APIs, adding CREATE TABLE CatalogNamespace protection, enforcing table-data write-lock assertions, narrowing direct table access, and validating the storage crate. [Task Resolve Sync: docs/tasks/000140-metadata-row-write-lock-integration.md @ 2026-05-03]
 
 - **Phase 4: Explicit Table Lock Interface And Validation**
   - Scope: Add explicit table-lock APIs for transaction/session callers; test
