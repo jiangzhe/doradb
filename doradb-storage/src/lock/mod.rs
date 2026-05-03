@@ -122,6 +122,61 @@ pub(crate) enum LockOwnerGroup {
     Session(SessionID),
 }
 
+/// Whether an acquisition created a new granted lock entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LockGrant {
+    /// The acquire call created a fresh granted entry.
+    Fresh,
+    /// The requested mode was already represented by this owner or waiter.
+    Existing,
+}
+
+impl LockGrant {
+    #[inline]
+    fn is_fresh(self) -> bool {
+        self == LockGrant::Fresh
+    }
+}
+
+/// Releases a freshly acquired lock unless the caller completes and disarms it.
+pub(crate) struct FreshLockGuard<'a> {
+    lock_manager: &'a LockManager,
+    resource: LockResource,
+    owner: LockOwner,
+    active: bool,
+}
+
+impl<'a> FreshLockGuard<'a> {
+    #[inline]
+    pub(crate) fn new(
+        lock_manager: &'a LockManager,
+        resource: LockResource,
+        owner: LockOwner,
+        grant: LockGrant,
+    ) -> Option<Self> {
+        grant.is_fresh().then(|| FreshLockGuard {
+            lock_manager,
+            resource,
+            owner,
+            active: true,
+        })
+    }
+
+    #[inline]
+    pub(crate) fn disarm(&mut self) {
+        self.active = false;
+    }
+}
+
+impl Drop for FreshLockGuard<'_> {
+    #[inline]
+    fn drop(&mut self) {
+        if self.active {
+            self.lock_manager.release(self.resource, self.owner);
+        }
+    }
+}
+
 /// Intended lifetime category for a logical lock.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum LockLifetime {
@@ -188,7 +243,7 @@ impl LockManager {
         // grant/queue decisions for this resource stay atomic.
         let mut resource_state = self.resources.entry(resource).or_default();
         match resource_state.try_acquire_immediate(resource, mode, owner, owner_group)? {
-            AcquireImmediate::Granted => Ok(true),
+            AcquireImmediate::Granted(_) => Ok(true),
             AcquireImmediate::WouldWait | AcquireImmediate::AlreadyWaiting(_) => Ok(false),
         }
     }
@@ -205,6 +260,19 @@ impl LockManager {
         mode: LockMode,
         owner: LockOwner,
     ) -> Result<()> {
+        self.acquire_with_group(resource, mode, owner, None)
+            .await
+            .map(|_| ())
+    }
+
+    /// Acquires a lock and reports whether this call created a grant.
+    #[inline]
+    pub(crate) async fn acquire_with_grant(
+        &self,
+        resource: LockResource,
+        mode: LockMode,
+        owner: LockOwner,
+    ) -> Result<LockGrant> {
         self.acquire_with_group(resource, mode, owner, None).await
     }
 
@@ -219,6 +287,20 @@ impl LockManager {
     ) -> Result<()> {
         self.acquire_with_group(resource, mode, owner, Some(owner_group))
             .await
+            .map(|_| ())
+    }
+
+    /// Acquires a grouped lock and reports whether this call created a grant.
+    #[inline]
+    pub(crate) async fn acquire_grouped_with_grant(
+        &self,
+        resource: LockResource,
+        mode: LockMode,
+        owner: LockOwner,
+        owner_group: LockOwnerGroup,
+    ) -> Result<LockGrant> {
+        self.acquire_with_group(resource, mode, owner, Some(owner_group))
+            .await
     }
 
     #[inline]
@@ -228,15 +310,15 @@ impl LockManager {
         mode: LockMode,
         owner: LockOwner,
         owner_group: Option<LockOwnerGroup>,
-    ) -> Result<()> {
+    ) -> Result<LockGrant> {
         validate_mode(resource, mode)?;
-        let (waiter, waiter_guard) = {
+        let (waiter, waiter_guard, grant) = {
             // Reuse the non-blocking path first. If the request must wait,
             // enqueue the waiter while still holding the resource guard so a
             // concurrent release cannot miss this request.
             let mut resource_state = self.resources.entry(resource).or_default();
             match resource_state.try_acquire_immediate(resource, mode, owner, owner_group)? {
-                AcquireImmediate::Granted => return Ok(()),
+                AcquireImmediate::Granted(grant) => return Ok(grant),
                 AcquireImmediate::WouldWait => {
                     let waiter = Arc::new(Waiter::new(owner, owner_group, mode));
                     resource_state.waiters.push_back(Arc::clone(&waiter));
@@ -244,19 +326,19 @@ impl LockManager {
                     // guard is released and before the grant is observed.
                     let waiter_guard =
                         WaiterGuard::new(&self.resources, resource, Arc::clone(&waiter));
-                    (waiter, waiter_guard)
+                    (waiter, waiter_guard, LockGrant::Fresh)
                 }
                 AcquireImmediate::AlreadyWaiting(waiter) => {
                     let waiter_guard =
                         WaiterGuard::new(&self.resources, resource, Arc::clone(&waiter));
-                    (waiter, waiter_guard)
+                    (waiter, waiter_guard, LockGrant::Existing)
                 }
             }
         };
         // The resource guard is dropped before awaiting; grant notification
         // and cleanup paths can keep mutating the same resource while this task
         // is parked.
-        self.wait_for_grant_with_guard(resource, mode, owner, waiter, waiter_guard)
+        self.wait_for_grant_with_guard(resource, mode, owner, waiter, waiter_guard, grant)
             .await
     }
 
@@ -268,12 +350,13 @@ impl LockManager {
         owner: LockOwner,
         waiter: Arc<Waiter>,
         mut waiter_guard: WaiterGuard,
-    ) -> Result<()> {
+        grant: LockGrant,
+    ) -> Result<LockGrant> {
         let res = self.wait_for_grant(resource, mode, owner, waiter).await;
         if res.is_ok() {
             waiter_guard.disarm_after_grant_observed();
         }
-        res
+        res.map(|_| grant)
     }
 
     /// Releases locks and waiters for one owner/resource pair.
@@ -466,7 +549,7 @@ impl ResourceState {
             // duplicate granted entries.
             let held = self.granted[idx].mode;
             if mode_covers(resource, held, mode) {
-                return Ok(AcquireImmediate::Granted);
+                return Ok(AcquireImmediate::Granted(LockGrant::Existing));
             }
             // Conversions are immediate-only in this phase. Incomparable modes
             // are rejected rather than synthesized into a combined mode such as
@@ -484,7 +567,7 @@ impl ResourceState {
                 return Err(upgrade_would_block_err(resource, held, mode, owner));
             }
             self.granted[idx].mode = mode;
-            return Ok(AcquireImmediate::Granted);
+            return Ok(AcquireImmediate::Granted(LockGrant::Existing));
         }
         if let Some(waiter) = self.waiter_by_owner(owner) {
             let waiting = waiter.mode;
@@ -509,7 +592,7 @@ impl ResourceState {
                 owner_group,
                 mode,
             });
-            return Ok(AcquireImmediate::Granted);
+            return Ok(AcquireImmediate::Granted(LockGrant::Fresh));
         }
         Ok(AcquireImmediate::WouldWait)
     }
@@ -864,7 +947,7 @@ enum WaitOutcome {
 }
 
 enum AcquireImmediate {
-    Granted,
+    Granted(LockGrant),
     WouldWait,
     AlreadyWaiting(Arc<Waiter>),
 }

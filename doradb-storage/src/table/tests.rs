@@ -4929,6 +4929,217 @@ fn test_session_shared_table_lock_allows_reads_but_rejects_same_session_writes()
 }
 
 #[test]
+fn test_session_table_lock_failure_releases_fresh_metadata() {
+    smol::block_on(async {
+        let sys = TestSys::new_lightweight_evictable().await;
+        let table_id = sys.table.table_id();
+        let mut session = sys.engine.try_new_session().unwrap();
+        let session_owner = LockOwner::Session(session.id());
+        let mut trx = session.try_begin_trx().unwrap().unwrap();
+
+        trx_insert_row(
+            &mut trx,
+            &sys.table,
+            vec![Val::from(31_301i32), Val::from("same-session-ix")],
+        )
+        .await
+        .unwrap();
+
+        let err = session
+            .lock_table(table_id, LockMode::Shared)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.operation_error(),
+            Some(OperationError::LockOwnerGroupConflict)
+        );
+        assert!(!has_lock_resource(
+            &sys.engine,
+            session_owner,
+            LockResource::TableMetadata(table_id),
+        ));
+        assert!(!has_lock_resource(
+            &sys.engine,
+            session_owner,
+            LockResource::TableData(table_id),
+        ));
+
+        trx.rollback().await.unwrap();
+    });
+}
+
+#[test]
+fn test_session_table_lock_cancellation_releases_fresh_metadata() {
+    smol::block_on(async {
+        let sys = TestSys::new_lightweight_evictable().await;
+        let table_id = sys.table.table_id();
+        let blocker = LockOwner::Transaction(91_301);
+        assert!(
+            sys.engine
+                .lock_manager()
+                .try_acquire(
+                    LockResource::TableData(table_id),
+                    LockMode::Exclusive,
+                    blocker,
+                )
+                .unwrap()
+        );
+
+        let session = sys.engine.try_new_session().unwrap();
+        let session_owner = LockOwner::Session(session.id());
+        let mut lock_fut = Box::pin(session.lock_table(table_id, LockMode::Shared));
+        assert!(matches!(
+            futures::poll!(lock_fut.as_mut()),
+            std::task::Poll::Pending
+        ));
+        assert!(has_lock_entry(
+            &sys.engine,
+            session_owner,
+            LockResource::TableMetadata(table_id),
+            LockMode::Shared,
+            LockDebugEntryState::Granted,
+        ));
+        assert!(has_lock_entry(
+            &sys.engine,
+            session_owner,
+            LockResource::TableData(table_id),
+            LockMode::Shared,
+            LockDebugEntryState::Waiting,
+        ));
+
+        drop(lock_fut);
+        wait_for_no_lock_resource(
+            &sys.engine,
+            session_owner,
+            LockResource::TableMetadata(table_id),
+        )
+        .await;
+        wait_for_no_lock_resource(
+            &sys.engine,
+            session_owner,
+            LockResource::TableData(table_id),
+        )
+        .await;
+        assert_eq!(
+            sys.engine
+                .lock_manager()
+                .release(LockResource::TableData(table_id), blocker),
+            1
+        );
+    });
+}
+
+#[test]
+fn test_transaction_table_lock_failure_releases_fresh_metadata() {
+    smol::block_on(async {
+        let sys = TestSys::new_lightweight_evictable().await;
+        let table_id = sys.table.table_id();
+        let mut session = sys.engine.try_new_session().unwrap();
+        let session_owner = LockOwner::Session(session.id());
+        session
+            .lock_table(table_id, LockMode::Shared)
+            .await
+            .unwrap();
+        let mut trx = session.try_begin_trx().unwrap().unwrap();
+        let trx_owner = trx.lock_owner().unwrap();
+
+        let err = trx
+            .lock_table(table_id, LockMode::Exclusive)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.operation_error(),
+            Some(OperationError::LockOwnerGroupConflict)
+        );
+        assert!(!has_lock_resource(
+            &sys.engine,
+            trx_owner,
+            LockResource::TableMetadata(table_id),
+        ));
+        assert!(
+            !trx.cached_transaction_lock_covers(
+                LockResource::TableMetadata(table_id),
+                LockMode::Shared
+            )
+            .unwrap()
+        );
+        assert!(has_lock_resource(
+            &sys.engine,
+            session_owner,
+            LockResource::TableMetadata(table_id),
+        ));
+
+        trx.rollback().await.unwrap();
+        session.unlock_table(table_id).unwrap();
+    });
+}
+
+#[test]
+fn test_transaction_table_lock_cancellation_releases_fresh_metadata() {
+    smol::block_on(async {
+        let sys = TestSys::new_lightweight_evictable().await;
+        let table_id = sys.table.table_id();
+        let blocker = LockOwner::Transaction(91_302);
+        assert!(
+            sys.engine
+                .lock_manager()
+                .try_acquire(
+                    LockResource::TableData(table_id),
+                    LockMode::Exclusive,
+                    blocker,
+                )
+                .unwrap()
+        );
+
+        let mut session = sys.engine.try_new_session().unwrap();
+        let mut trx = session.try_begin_trx().unwrap().unwrap();
+        let trx_owner = trx.lock_owner().unwrap();
+        let mut lock_fut = Box::pin(trx.lock_table(table_id, LockMode::Shared));
+        assert!(matches!(
+            futures::poll!(lock_fut.as_mut()),
+            std::task::Poll::Pending
+        ));
+        assert!(has_lock_entry(
+            &sys.engine,
+            trx_owner,
+            LockResource::TableMetadata(table_id),
+            LockMode::Shared,
+            LockDebugEntryState::Granted,
+        ));
+        assert!(has_lock_entry(
+            &sys.engine,
+            trx_owner,
+            LockResource::TableData(table_id),
+            LockMode::Shared,
+            LockDebugEntryState::Waiting,
+        ));
+
+        drop(lock_fut);
+        wait_for_no_lock_resource(
+            &sys.engine,
+            trx_owner,
+            LockResource::TableMetadata(table_id),
+        )
+        .await;
+        wait_for_no_lock_resource(&sys.engine, trx_owner, LockResource::TableData(table_id)).await;
+        assert!(
+            !trx.cached_transaction_lock_covers(
+                LockResource::TableMetadata(table_id),
+                LockMode::Shared
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            sys.engine
+                .lock_manager()
+                .release(LockResource::TableData(table_id), blocker),
+            1
+        );
+        trx.rollback().await.unwrap();
+    });
+}
+
+#[test]
 fn test_session_exclusive_table_lock_covers_same_session_writer() {
     smol::block_on(async {
         let sys = TestSys::new_lightweight_evictable().await;
@@ -6675,6 +6886,16 @@ fn has_lock_resource(engine: &Engine, owner: LockOwner, resource: LockResource) 
         .entries
         .iter()
         .any(|entry| entry.owner == owner && entry.resource == resource)
+}
+
+async fn wait_for_no_lock_resource(engine: &Engine, owner: LockOwner, resource: LockResource) {
+    for _ in 0..100 {
+        if !has_lock_resource(engine, owner, resource) {
+            return;
+        }
+        smol::Timer::after(Duration::from_millis(1)).await;
+    }
+    panic!("lock resource still present: owner={owner:?}, resource={resource:?}");
 }
 
 async fn wait_for_lock_entry(

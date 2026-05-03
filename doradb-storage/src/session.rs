@@ -5,7 +5,7 @@ use crate::catalog::{IndexSpec, TableID, TableSpec};
 use crate::engine::EngineRef;
 use crate::error::{OperationError, Result};
 use crate::index::BlockIndex;
-use crate::lock::{LockManager, LockMode, LockOwner, LockOwnerGroup, LockResource};
+use crate::lock::{FreshLockGuard, LockManager, LockMode, LockOwner, LockOwnerGroup, LockResource};
 use crate::row::RowID;
 use crate::table::Table;
 use crate::trx::redo::DDLRedo;
@@ -281,17 +281,19 @@ impl Session {
         let lock_manager = self.state.engine().lock_manager();
         let owner = LockOwner::Session(self.id());
         let owner_group = LockOwnerGroup::Session(self.id());
-        lock_manager
-            .acquire_grouped(
-                LockResource::TableMetadata(table_id),
-                LockMode::Shared,
-                owner,
-                owner_group,
-            )
+        let metadata_resource = LockResource::TableMetadata(table_id);
+        let metadata_grant = lock_manager
+            .acquire_grouped_with_grant(metadata_resource, LockMode::Shared, owner, owner_group)
             .await?;
+        let mut metadata_guard =
+            FreshLockGuard::new(lock_manager, metadata_resource, owner, metadata_grant);
         lock_manager
             .acquire_grouped(LockResource::TableData(table_id), mode, owner, owner_group)
-            .await
+            .await?;
+        if let Some(guard) = metadata_guard.as_mut() {
+            guard.disarm();
+        }
+        Ok(())
     }
 
     /// Releases an explicit session-lifetime table lock when no transaction is active.
