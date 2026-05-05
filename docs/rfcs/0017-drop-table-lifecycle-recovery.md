@@ -4,6 +4,7 @@ title: Drop Table Lifecycle And Recovery
 status: proposal
 tags: [storage, ddl, recovery, checkpoint, catalog]
 created: 2026-05-05
+github_issue: 614
 ---
 
 # RFC-0017: Drop Table Lifecycle And Recovery
