@@ -190,6 +190,9 @@ pub struct LogRecovery<'a> {
     /// Hot row pages touched by redo replay, grouped by table for post-replay
     /// index rebuild and undo-map refresh.
     recovered_tables: HashMap<TableID, BTreeSet<PageID>>,
+    /// Count of unknown user-table redo entries skipped because checkpointed
+    /// catalog absence proves they are older than the catalog replay boundary.
+    skipped_checkpoint_covered_unknown_table_redo: usize,
     /// Stable pool guards shared by recovery operations.
     pool_guards: PoolGuards,
 }
@@ -207,6 +210,12 @@ impl RecoveryTableState {
     fn replay_start_ts(self) -> TrxID {
         self.heap_redo_start_ts.min(self.deletion_cutoff_ts)
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum UserTableRedoAction {
+    Replay,
+    SkipCheckpointCoveredUnknownTable,
 }
 
 impl<'a> LogRecovery<'a> {
@@ -238,6 +247,7 @@ impl<'a> LogRecovery<'a> {
             max_recovered_cts: MIN_SNAPSHOT_TS,
             table_states: HashMap::new(),
             recovered_tables: HashMap::new(),
+            skipped_checkpoint_covered_unknown_table_redo: 0,
             pool_guards,
         }
     }
@@ -297,6 +307,40 @@ impl<'a> LogRecovery<'a> {
     #[inline]
     fn should_replay_catalog(&self, cts: TrxID) -> bool {
         cts >= self.catalog_replay_start_ts
+    }
+
+    #[inline]
+    fn classify_user_table_redo(
+        &self,
+        table_id: TableID,
+        cts: TrxID,
+        context: &'static str,
+    ) -> Result<UserTableRedoAction> {
+        if self.table_states.contains_key(&table_id) {
+            return Ok(UserTableRedoAction::Replay);
+        }
+        if cts < self.catalog_replay_start_ts {
+            return Ok(UserTableRedoAction::SkipCheckpointCoveredUnknownTable);
+        }
+        Err(Report::new(OperationError::TableNotFound)
+            .attach(format!(
+                "invalid recovery ordering: {context}: unknown user table redo at or after catalog replay boundary: table_id={table_id}, cts={cts}, catalog_replay_start_ts={}",
+                self.catalog_replay_start_ts
+            ))
+            .into())
+    }
+
+    #[inline]
+    fn record_skipped_checkpoint_covered_unknown_table_redo(&mut self, count: usize) {
+        self.skipped_checkpoint_covered_unknown_table_redo = self
+            .skipped_checkpoint_covered_unknown_table_redo
+            .saturating_add(count);
+    }
+
+    #[cfg(test)]
+    #[inline]
+    fn skipped_checkpoint_covered_unknown_table_redo(&self) -> usize {
+        self.skipped_checkpoint_covered_unknown_table_redo
     }
 
     async fn track_loaded_table(&mut self, table_id: TableID) -> Result<()> {
@@ -472,6 +516,12 @@ impl<'a> LogRecovery<'a> {
                 end_row_id,
             } => {
                 debug_assert!(dml.is_empty());
+                if self.classify_user_table_redo(*table_id, cts, "replay create row page")?
+                    == UserTableRedoAction::SkipCheckpointCoveredUnknownTable
+                {
+                    self.record_skipped_checkpoint_covered_unknown_table_redo(1);
+                    return Ok(());
+                }
                 if cts < self.table_heap_redo_start_ts(*table_id)? {
                     return Ok(());
                 }
@@ -508,6 +558,12 @@ impl<'a> LogRecovery<'a> {
             }
             DDLRedo::DataCheckpoint { table_id, .. } => {
                 debug_assert!(dml.is_empty());
+                if self.classify_user_table_redo(*table_id, cts, "replay data checkpoint")?
+                    == UserTableRedoAction::SkipCheckpointCoveredUnknownTable
+                {
+                    self.record_skipped_checkpoint_covered_unknown_table_redo(1);
+                    return Ok(());
+                }
                 if cts < self.table_heap_redo_start_ts(*table_id)? {
                     return Ok(());
                 }
@@ -553,6 +609,12 @@ impl<'a> LogRecovery<'a> {
                 })?;
                 self.replay_catalog_table_modifications(&table, &table_dml.rows)
                     .await?;
+                continue;
+            }
+            if self.classify_user_table_redo(table_id, cts, "replay user table DML")?
+                == UserTableRedoAction::SkipCheckpointCoveredUnknownTable
+            {
+                self.record_skipped_checkpoint_covered_unknown_table_redo(table_dml.rows.len());
                 continue;
             }
             if cts < self.table_replay_start_ts(table_id)? {
@@ -683,14 +745,14 @@ impl<'a> LogRecovery<'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::{RecoverMap, RecoveryTableState};
-    use crate::buffer::PoolRole;
+    use super::{LogRecovery, RecoverMap, RecoveryTableState};
+    use crate::buffer::{PageID, PoolRole};
     use crate::catalog::{
         ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexOrder, IndexSpec,
-        TableMetadata, TableSpec,
+        TableMetadata, TableSpec, USER_OBJ_ID_START,
     };
     use crate::conf::{EngineConfig, EvictableBufferPoolConfig, FileSystemConfig, TrxSysConfig};
-    use crate::error::{CompletionErrorKind, DataIntegrityError, Error};
+    use crate::error::{CompletionErrorKind, DataIntegrityError, Error, OperationError};
     use crate::file::block_integrity::{BLOCK_INTEGRITY_HEADER_SIZE, write_block_checksum};
     use crate::file::cow_file::COW_FILE_PAGE_SIZE;
     use crate::index::{
@@ -700,6 +762,8 @@ mod tests {
     use crate::row::ops::{DeleteMvcc, SelectKey, SelectMvcc, UpdateCol, UpdateMvcc};
     use crate::row::{RowID, RowRead};
     use crate::table::{CheckpointOutcome, DeleteMarker, Table, TableAccess, TablePersistence};
+    use crate::trx::log_replay::{LogMerger, TrxLog};
+    use crate::trx::redo::{DDLRedo, RedoHeader, RedoLogs, RedoTrxKind, RowRedo, RowRedoKind};
     use crate::trx::stmt::Statement;
     use crate::trx::{ActiveTrx, MIN_SNAPSHOT_TS, TrxID};
     use crate::value::Val;
@@ -756,6 +820,73 @@ mod tests {
                     .io_depth(1)
                     .readonly_buffer_size(LIGHTWEIGHT_RECOVERY_READONLY_BUFFER_BYTES),
             )
+    }
+
+    fn log_recovery_for_engine<'a>(
+        engine: &'a crate::engine::Engine,
+        catalog_replay_start_ts: TrxID,
+    ) -> LogRecovery<'a> {
+        let mut recovery = LogRecovery::new(
+            &engine.meta_pool,
+            engine.index_pool.clone_inner(),
+            engine.mem_pool.clone_inner(),
+            engine.table_fs.clone(),
+            engine.disk_pool.clone_inner(),
+            engine.catalog(),
+            LogMerger::default(),
+        );
+        recovery.catalog_replay_start_ts = catalog_replay_start_ts;
+        recovery.replay_floor = MIN_SNAPSHOT_TS;
+        recovery
+    }
+
+    fn redo_header(cts: TrxID) -> RedoHeader {
+        RedoHeader {
+            cts,
+            trx_kind: RedoTrxKind::User,
+        }
+    }
+
+    fn unknown_table_dml_log(table_id: u64, cts: TrxID) -> TrxLog {
+        let mut redo = RedoLogs::default();
+        redo.insert_dml(
+            table_id,
+            RowRedo {
+                page_id: PageID::new(1),
+                row_id: 0,
+                kind: RowRedoKind::Insert(vec![Val::from(1u32)]),
+            },
+        );
+        TrxLog::new(redo_header(cts), redo)
+    }
+
+    fn unknown_table_create_row_page_log(table_id: u64, cts: TrxID) -> TrxLog {
+        TrxLog::new(
+            redo_header(cts),
+            RedoLogs {
+                ddl: Some(Box::new(DDLRedo::CreateRowPage {
+                    table_id,
+                    page_id: PageID::new(2),
+                    start_row_id: 0,
+                    end_row_id: 1,
+                })),
+                dml: Default::default(),
+            },
+        )
+    }
+
+    fn unknown_table_data_checkpoint_log(table_id: u64, cts: TrxID) -> TrxLog {
+        TrxLog::new(
+            redo_header(cts),
+            RedoLogs {
+                ddl: Some(Box::new(DDLRedo::DataCheckpoint {
+                    table_id,
+                    pivor_row_id: 0,
+                    sts: cts,
+                })),
+                dml: Default::default(),
+            },
+        )
     }
 
     async fn checkpoint_published(table: &Table, session: &mut crate::session::Session) -> TrxID {
@@ -870,6 +1001,90 @@ mod tests {
             deletion_cutoff_ts: 13,
         };
         assert_eq!(deletion_first.replay_start_ts(), 13);
+    }
+
+    #[test]
+    fn test_log_recovery_skips_checkpoint_covered_unknown_user_table_redo() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine = lightweight_recovery_engine_config(
+                temp_dir.path().to_path_buf(),
+                "recover-unknown-table-skip",
+            )
+            .build()
+            .await
+            .unwrap();
+            let unknown_table_id = USER_OBJ_ID_START + 142;
+            let mut recovery = log_recovery_for_engine(&engine, 10);
+
+            recovery
+                .replay_log(unknown_table_dml_log(unknown_table_id, 9))
+                .await
+                .unwrap();
+            assert_eq!(recovery.skipped_checkpoint_covered_unknown_table_redo(), 1);
+
+            recovery
+                .replay_log(unknown_table_create_row_page_log(unknown_table_id, 9))
+                .await
+                .unwrap();
+            assert_eq!(recovery.skipped_checkpoint_covered_unknown_table_redo(), 2);
+
+            recovery
+                .replay_log(unknown_table_data_checkpoint_log(unknown_table_id, 9))
+                .await
+                .unwrap();
+            assert_eq!(recovery.skipped_checkpoint_covered_unknown_table_redo(), 3);
+
+            drop(recovery);
+            drop(engine);
+        });
+    }
+
+    #[test]
+    fn test_log_recovery_fails_unknown_user_table_redo_at_catalog_boundary() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine = lightweight_recovery_engine_config(
+                temp_dir.path().to_path_buf(),
+                "recover-unknown-table-invalid",
+            )
+            .build()
+            .await
+            .unwrap();
+            let unknown_table_id = USER_OBJ_ID_START + 143;
+
+            let mut dml_recovery = log_recovery_for_engine(&engine, 10);
+            let err = dml_recovery
+                .replay_log(unknown_table_dml_log(unknown_table_id, 10))
+                .await
+                .unwrap_err();
+            assert_eq!(err.operation_error(), Some(OperationError::TableNotFound));
+            let report = format!("{err:?}");
+            assert!(report.contains("invalid recovery ordering"), "{report}");
+            assert!(report.contains("replay user table DML"), "{report}");
+            assert_eq!(
+                dml_recovery.skipped_checkpoint_covered_unknown_table_redo(),
+                0
+            );
+
+            let mut ddl_recovery = log_recovery_for_engine(&engine, 10);
+            let err = ddl_recovery
+                .replay_log(unknown_table_create_row_page_log(unknown_table_id, 10))
+                .await
+                .unwrap_err();
+            assert_eq!(err.operation_error(), Some(OperationError::TableNotFound));
+            let report = format!("{err:?}");
+            assert!(report.contains("invalid recovery ordering"), "{report}");
+            assert!(report.contains("replay create row page"), "{report}");
+            assert_eq!(
+                ddl_recovery.skipped_checkpoint_covered_unknown_table_redo(),
+                0
+            );
+
+            drop(ddl_recovery);
+            drop(dml_recovery);
+            drop(engine);
+        });
     }
 
     fn corrupt_page_checksum(path: impl AsRef<std::path::Path>, page_id: impl Into<u64>) {

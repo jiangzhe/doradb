@@ -500,7 +500,7 @@ the table-file/root design. [D4], [C8], [C9]
   - Goals: provide catalog/recovery primitives needed before public
     `DROP TABLE`.
   - Non-goals: no public `DROP TABLE`; no table-file deletion; no index DDL.
-  - Task Doc: `docs/tasks/TBD.md`
+  - Task Doc: `docs/tasks/000142-catalog-delete-helpers-and-recovery-classification.md`
   - Task Issue: `#0`
   - Phase Status: `pending`
   - Implementation Summary: `pending`
