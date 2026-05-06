@@ -500,10 +500,10 @@ the table-file/root design. [D4], [C8], [C9]
   - Goals: provide catalog/recovery primitives needed before public
     `DROP TABLE`.
   - Non-goals: no public `DROP TABLE`; no table-file deletion; no index DDL.
-  - Task Doc: `docs/tasks/TBD.md`
-  - Task Issue: `#0`
-  - Phase Status: `pending`
-  - Implementation Summary: `pending`
+  - Task Doc: `docs/tasks/000142-catalog-delete-helpers-and-recovery-classification.md`
+  - Task Issue: `#617`
+  - Phase Status: done
+  - Implementation Summary: Implemented table-scoped catalog delete helpers and recovery classification for checkpoint-covered unknown user-table redo; added diagnostics and focused catalog/recovery tests. [Task Resolve Sync: docs/tasks/000142-catalog-delete-helpers-and-recovery-classification.md @ 2026-05-06]
 
 - **Phase 2: Runtime Lifecycle And Checkpoint Gate**
   - Scope: add volatile table lifecycle state, foreground lifecycle checks, and

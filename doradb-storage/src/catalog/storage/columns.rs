@@ -162,6 +162,21 @@ impl Columns<'_> {
             .await
             .is_ok_and(|res| matches!(res, DeleteMvcc::Deleted))
     }
+
+    /// Delete all columns for one table and return the number of deleted rows.
+    pub async fn delete_by_table_id(&self, stmt: &mut Statement<'_>, table_id: TableID) -> usize {
+        let Some(guards) = stmt.ctx().pool_guards().cloned() else {
+            return 0;
+        };
+        let columns = self.list_uncommitted_by_table_id(&guards, table_id).await;
+        let mut deleted = 0;
+        for column in columns {
+            if self.delete_by_id(stmt, table_id, column.column_no).await {
+                deleted += 1;
+            }
+        }
+        deleted
+    }
 }
 
 #[cfg(test)]
@@ -329,6 +344,110 @@ mod tests {
                     .await
                     .is_empty()
             );
+
+            drop(session);
+            drop(engine);
+        });
+    }
+
+    #[test]
+    fn test_columns_delete_by_table_id_counts_and_is_idempotent() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let main_dir = temp_dir.path().to_path_buf();
+            let engine = EngineConfig::default()
+                .storage_root(main_dir)
+                .trx(TrxSysConfig::default())
+                .build()
+                .await
+                .unwrap();
+            let mut session = engine.try_new_session().unwrap();
+
+            let columns = [
+                ColumnObject {
+                    table_id: 42,
+                    column_no: 0,
+                    column_name: SemiStr::new("c0"),
+                    column_type: ValKind::U32,
+                    column_attributes: ColumnAttributes::empty(),
+                },
+                ColumnObject {
+                    table_id: 42,
+                    column_no: 1,
+                    column_name: SemiStr::new("c1"),
+                    column_type: ValKind::U64,
+                    column_attributes: ColumnAttributes::empty(),
+                },
+                ColumnObject {
+                    table_id: 43,
+                    column_no: 0,
+                    column_name: SemiStr::new("other"),
+                    column_type: ValKind::U16,
+                    column_attributes: ColumnAttributes::empty(),
+                },
+            ];
+
+            let mut trx = session.try_begin_trx().unwrap().unwrap();
+            trx.exec(async |stmt| {
+                for column in &columns {
+                    assert!(
+                        engine
+                            .catalog()
+                            .storage
+                            .columns()
+                            .insert(stmt, column)
+                            .await
+                    );
+                }
+                Ok(())
+            })
+            .await
+            .unwrap();
+            trx.commit().await.unwrap();
+
+            let mut trx = session.try_begin_trx().unwrap().unwrap();
+            trx.exec(async |stmt| {
+                assert_eq!(
+                    engine
+                        .catalog()
+                        .storage
+                        .columns()
+                        .delete_by_table_id(stmt, 42)
+                        .await,
+                    2
+                );
+                assert_eq!(
+                    engine
+                        .catalog()
+                        .storage
+                        .columns()
+                        .delete_by_table_id(stmt, 42)
+                        .await,
+                    0
+                );
+                Ok(())
+            })
+            .await
+            .unwrap();
+            trx.commit().await.unwrap();
+
+            assert!(
+                engine
+                    .catalog()
+                    .storage
+                    .columns()
+                    .list_uncommitted_by_table_id(session.pool_guards(), 42)
+                    .await
+                    .is_empty()
+            );
+            let remaining = engine
+                .catalog()
+                .storage
+                .columns()
+                .list_uncommitted_by_table_id(session.pool_guards(), 43)
+                .await;
+            assert_eq!(remaining.len(), 1);
+            assert_eq!(remaining[0].column_no, 0);
 
             drop(session);
             drop(engine);

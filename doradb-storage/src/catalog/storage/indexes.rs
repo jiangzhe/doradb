@@ -125,6 +125,21 @@ impl Indexes<'_> {
             .is_ok_and(|res| matches!(res, DeleteMvcc::Deleted))
     }
 
+    /// Delete all indexes for one table and return the number of deleted rows.
+    pub async fn delete_by_table_id(&self, stmt: &mut Statement<'_>, table_id: TableID) -> usize {
+        let Some(guards) = stmt.ctx().pool_guards().cloned() else {
+            return 0;
+        };
+        let indexes = self.list_uncommitted_by_table_id(&guards, table_id).await;
+        let mut deleted = 0;
+        for index in indexes {
+            if self.delete_by_id(stmt, table_id, index.index_no).await {
+                deleted += 1;
+            }
+        }
+        deleted
+    }
+
     /// List all indexes by given table id.
     pub async fn list_uncommitted_by_table_id(
         &self,
@@ -165,10 +180,6 @@ const COL_NAME_INDEX_COLUMNS_COLUMN_NO: &str = "column_no";
 
 const COL_NO_INDEX_COLUMNS_INDEX_ORDER: usize = 4;
 const COL_NAME_INDEX_COLUMNS_INDEX_ORDER: &str = "index_order";
-#[expect(
-    dead_code,
-    reason = "reserved for future unique-key lookups on index_columns primary key"
-)]
 const PK_NO_INDEX_COLUMNS: usize = 0;
 const PK_NAME_INDEX_COLUMNS: &str = "pk_index_columns";
 
@@ -274,16 +285,73 @@ impl IndexColumns<'_> {
         stmt.catalog_insert_mvcc(self.table, cols).await.is_ok()
     }
 
+    async fn delete_by_id(
+        &self,
+        stmt: &mut Statement<'_>,
+        table_id: TableID,
+        index_no: u16,
+        index_column_no: u16,
+    ) -> bool {
+        let key = SelectKey::new(
+            PK_NO_INDEX_COLUMNS,
+            vec![
+                Val::from(table_id),
+                Val::from(index_no),
+                Val::from(index_column_no),
+            ],
+        );
+        stmt.catalog_delete_unique_mvcc(self.table, &key, true)
+            .await
+            .is_ok_and(|res| matches!(res, DeleteMvcc::Deleted))
+    }
+
     /// Delete all index-column rows by `(table_id, index_no)`.
-    ///
-    /// This is not implemented yet and currently always panics.
     pub async fn delete_by_index(
         &self,
-        _stmt: &mut Statement<'_>,
-        _table_id: TableID,
-        _index_no: u16,
-    ) -> bool {
-        todo!()
+        stmt: &mut Statement<'_>,
+        table_id: TableID,
+        index_no: u16,
+    ) -> usize {
+        let Some(guards) = stmt.ctx().pool_guards().cloned() else {
+            return 0;
+        };
+        let index_columns = self.list_uncommitted_by_table_id(&guards, table_id).await;
+        let mut deleted = 0;
+        for index_column in index_columns
+            .into_iter()
+            .filter(|index_column| index_column.index_no == index_no)
+        {
+            if self
+                .delete_by_id(stmt, table_id, index_no, index_column.index_column_no)
+                .await
+            {
+                deleted += 1;
+            }
+        }
+        deleted
+    }
+
+    /// Delete all index-column rows for one table and return the number of deleted rows.
+    pub async fn delete_by_table_id(&self, stmt: &mut Statement<'_>, table_id: TableID) -> usize {
+        let Some(guards) = stmt.ctx().pool_guards().cloned() else {
+            return 0;
+        };
+        let index_columns = self.list_uncommitted_by_table_id(&guards, table_id).await;
+        let mut deleted = 0;
+        for index_column in index_columns {
+            if self
+                .delete_by_id(
+                    stmt,
+                    table_id,
+                    index_column.index_no,
+                    index_column.index_column_no,
+                )
+                .await
+            {
+                deleted += 1;
+            }
+        }
+        deleted
     }
 
     /// List all index-column rows of one table from uncommitted-visible rows.
@@ -476,6 +544,247 @@ mod tests {
                     .await
                     .is_empty()
             );
+
+            drop(session);
+            drop(engine);
+        });
+    }
+
+    #[test]
+    fn test_indexes_delete_by_table_id_counts_and_is_idempotent() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let main_dir = temp_dir.path().to_path_buf();
+            let engine = EngineConfig::default()
+                .storage_root(main_dir)
+                .trx(TrxSysConfig::default())
+                .build()
+                .await
+                .unwrap();
+            let mut session = engine.try_new_session().unwrap();
+
+            let indexes = [
+                IndexObject {
+                    table_id: 42,
+                    index_no: 0,
+                    index_name: SemiStr::new("pk"),
+                    index_attributes: IndexAttributes::PK,
+                },
+                IndexObject {
+                    table_id: 42,
+                    index_no: 1,
+                    index_name: SemiStr::new("secondary"),
+                    index_attributes: IndexAttributes::empty(),
+                },
+                IndexObject {
+                    table_id: 43,
+                    index_no: 0,
+                    index_name: SemiStr::new("other_pk"),
+                    index_attributes: IndexAttributes::PK,
+                },
+            ];
+
+            let mut trx = session.try_begin_trx().unwrap().unwrap();
+            trx.exec(async |stmt| {
+                for index in &indexes {
+                    assert!(engine.catalog().storage.indexes().insert(stmt, index).await);
+                }
+                Ok(())
+            })
+            .await
+            .unwrap();
+            trx.commit().await.unwrap();
+
+            let mut trx = session.try_begin_trx().unwrap().unwrap();
+            trx.exec(async |stmt| {
+                assert_eq!(
+                    engine
+                        .catalog()
+                        .storage
+                        .indexes()
+                        .delete_by_table_id(stmt, 42)
+                        .await,
+                    2
+                );
+                assert_eq!(
+                    engine
+                        .catalog()
+                        .storage
+                        .indexes()
+                        .delete_by_table_id(stmt, 42)
+                        .await,
+                    0
+                );
+                Ok(())
+            })
+            .await
+            .unwrap();
+            trx.commit().await.unwrap();
+
+            assert!(
+                engine
+                    .catalog()
+                    .storage
+                    .indexes()
+                    .list_uncommitted_by_table_id(session.pool_guards(), 42)
+                    .await
+                    .is_empty()
+            );
+            let remaining = engine
+                .catalog()
+                .storage
+                .indexes()
+                .list_uncommitted_by_table_id(session.pool_guards(), 43)
+                .await;
+            assert_eq!(remaining.len(), 1);
+            assert_eq!(remaining[0].index_no, 0);
+
+            drop(session);
+            drop(engine);
+        });
+    }
+
+    #[test]
+    fn test_index_columns_delete_by_index_and_table_id() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let main_dir = temp_dir.path().to_path_buf();
+            let engine = EngineConfig::default()
+                .storage_root(main_dir)
+                .trx(TrxSysConfig::default())
+                .build()
+                .await
+                .unwrap();
+            let mut session = engine.try_new_session().unwrap();
+
+            let index_columns = [
+                IndexColumnObject {
+                    table_id: 42,
+                    index_no: 0,
+                    index_column_no: 0,
+                    column_no: 0,
+                    index_order: IndexOrder::Asc,
+                },
+                IndexColumnObject {
+                    table_id: 42,
+                    index_no: 1,
+                    index_column_no: 0,
+                    column_no: 1,
+                    index_order: IndexOrder::Asc,
+                },
+                IndexColumnObject {
+                    table_id: 42,
+                    index_no: 1,
+                    index_column_no: 1,
+                    column_no: 2,
+                    index_order: IndexOrder::Desc,
+                },
+                IndexColumnObject {
+                    table_id: 43,
+                    index_no: 1,
+                    index_column_no: 0,
+                    column_no: 0,
+                    index_order: IndexOrder::Asc,
+                },
+            ];
+
+            let mut trx = session.try_begin_trx().unwrap().unwrap();
+            trx.exec(async |stmt| {
+                for index_column in &index_columns {
+                    assert!(
+                        engine
+                            .catalog()
+                            .storage
+                            .index_columns()
+                            .insert(stmt, index_column)
+                            .await
+                    );
+                }
+                Ok(())
+            })
+            .await
+            .unwrap();
+            trx.commit().await.unwrap();
+
+            let mut trx = session.try_begin_trx().unwrap().unwrap();
+            trx.exec(async |stmt| {
+                assert_eq!(
+                    engine
+                        .catalog()
+                        .storage
+                        .index_columns()
+                        .delete_by_index(stmt, 42, 1)
+                        .await,
+                    2
+                );
+                assert_eq!(
+                    engine
+                        .catalog()
+                        .storage
+                        .index_columns()
+                        .delete_by_index(stmt, 42, 1)
+                        .await,
+                    0
+                );
+                Ok(())
+            })
+            .await
+            .unwrap();
+            trx.commit().await.unwrap();
+
+            let remaining_42 = engine
+                .catalog()
+                .storage
+                .index_columns()
+                .list_uncommitted_by_table_id(session.pool_guards(), 42)
+                .await;
+            assert_eq!(remaining_42.len(), 1);
+            assert_eq!(remaining_42[0].index_no, 0);
+
+            let mut trx = session.try_begin_trx().unwrap().unwrap();
+            trx.exec(async |stmt| {
+                assert_eq!(
+                    engine
+                        .catalog()
+                        .storage
+                        .index_columns()
+                        .delete_by_table_id(stmt, 42)
+                        .await,
+                    1
+                );
+                assert_eq!(
+                    engine
+                        .catalog()
+                        .storage
+                        .index_columns()
+                        .delete_by_table_id(stmt, 42)
+                        .await,
+                    0
+                );
+                Ok(())
+            })
+            .await
+            .unwrap();
+            trx.commit().await.unwrap();
+
+            assert!(
+                engine
+                    .catalog()
+                    .storage
+                    .index_columns()
+                    .list_uncommitted_by_table_id(session.pool_guards(), 42)
+                    .await
+                    .is_empty()
+            );
+            let remaining_43 = engine
+                .catalog()
+                .storage
+                .index_columns()
+                .list_uncommitted_by_table_id(session.pool_guards(), 43)
+                .await;
+            assert_eq!(remaining_43.len(), 1);
+            assert_eq!(remaining_43[0].table_id, 43);
+            assert_eq!(remaining_43[0].index_no, 1);
 
             drop(session);
             drop(engine);
