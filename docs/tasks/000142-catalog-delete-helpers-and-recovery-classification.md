@@ -1,7 +1,7 @@
 ---
 id: 000142
 title: Catalog Delete Helpers And Recovery Classification
-status: proposal
+status: implemented
 created: 2026-05-05
 github_issue: 617
 ---
@@ -131,6 +131,38 @@ task resolution.
 
 ## Implementation Notes
 
+- Implemented catalog delete helpers for table-scoped metadata cleanup:
+  `Columns::delete_by_table_id`, `Indexes::delete_by_table_id`,
+  `IndexColumns::delete_by_index`, and `IndexColumns::delete_by_table_id`.
+  The helpers enumerate uncommitted-visible catalog rows, delete by existing
+  primary-key MVCC paths, return `usize` deleted-row counts, and remain
+  idempotent for missing rows.
+- Added centralized user-table redo classification in recovery. Known loaded
+  tables continue through the existing replay path; unknown user-table redo
+  with `cts < catalog_replay_start_ts` is skipped as checkpoint-covered catalog
+  negative knowledge; unknown user-table redo at or after the catalog replay
+  boundary still fails with `OperationError::TableNotFound` and invalid ordering
+  context.
+- Routed user-table DML, `DDLRedo::CreateRowPage`, and
+  `DDLRedo::DataCheckpoint` through the classifier before table-state lookups.
+  The skip branch avoids absent-table replay-boundary lookups and increments an
+  internal diagnostic counter exposed only to tests.
+- Added focused inline tests for column/index/index-column delete helper counts,
+  idempotence, and table/index isolation. Added recovery tests for
+  checkpoint-covered unknown-table DML, `CreateRowPage`, and `DataCheckpoint`
+  skips, diagnostic counts, and invalid boundary failure.
+- Verification completed:
+  - `cargo nextest run -p doradb-storage`: 693 tests passed.
+  - `tools/coverage_focus.rs --verbose --path doradb-storage/src/catalog/storage/columns.rs --path doradb-storage/src/catalog/storage/indexes.rs --path doradb-storage/src/trx/recover.rs`:
+    97.01% combined focused line coverage; changed-file coverage was 99.72%,
+    99.52%, and 95.74% respectively.
+  - `cargo fmt --check`: passed.
+  - `git diff --check origin/main...HEAD`: passed.
+  - `tools/unsafe_inventory.rs`: verified the refreshed unsafe baseline; no
+    unsafe code was added or modified.
+- Checklist review found no remaining required fixes and no deferred follow-up
+  backlog items.
+
 ## Impacts
 
 - `doradb-storage/src/catalog/storage/columns.rs`
@@ -173,6 +205,5 @@ task resolution.
 
 ## Open Questions
 
-- During implementation, confirm whether `usize` row-count return values fit the
-  local helper style for table-wide deletes. If not, keep single-key helpers as
-  booleans and document any table-wide count limitation in implementation notes.
+- None. The table-wide delete helpers use `usize` row-count return values, which
+  fit the future drop-cascade requirement for catalog completeness checks.
