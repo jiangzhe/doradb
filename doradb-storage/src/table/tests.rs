@@ -32,8 +32,8 @@ use crate::row::ops::{DeleteMvcc, SelectKey, SelectMvcc, UpdateCol, UpdateMvcc};
 use crate::row::{RowID, RowPage, RowRead};
 use crate::session::Session;
 use crate::table::{
-    CheckpointOutcome, CheckpointReadiness, DeleteMarker, Table, TableAccess, TablePersistence,
-    TableRecover,
+    CheckpointCancelReason, CheckpointOutcome, CheckpointReadiness, DeleteMarker, Table,
+    TableAccess, TableLifecycleState, TablePersistence, TableRecover,
 };
 use crate::trx::row::LockRowForWrite;
 use crate::trx::stmt::Statement;
@@ -53,6 +53,7 @@ use tempfile::TempDir;
 thread_local! {
     static TEST_FORCE_LWC_BUILD_ERROR: Cell<bool> = const { Cell::new(false) };
     static TEST_FORCE_SECONDARY_SIDECAR_ERROR: Cell<bool> = const { Cell::new(false) };
+    static TEST_FORCE_POST_PUBLISH_CHECKPOINT_ERROR: Cell<bool> = const { Cell::new(false) };
 }
 
 const LIGHTWEIGHT_TEST_BUFFER_BYTES: usize = 16 * 1024 * 1024;
@@ -75,6 +76,14 @@ pub(super) fn test_force_secondary_sidecar_error_enabled() -> bool {
     TEST_FORCE_SECONDARY_SIDECAR_ERROR.with(|flag| flag.get())
 }
 
+pub(super) fn set_test_force_post_publish_checkpoint_error(enabled: bool) {
+    TEST_FORCE_POST_PUBLISH_CHECKPOINT_ERROR.with(|flag| flag.set(enabled));
+}
+
+pub(super) fn test_force_post_publish_checkpoint_error_enabled() -> bool {
+    TEST_FORCE_POST_PUBLISH_CHECKPOINT_ERROR.with(|flag| flag.get())
+}
+
 fn assert_table_data_integrity(
     err: Error,
     block_kind: &str,
@@ -91,6 +100,20 @@ fn assert_table_data_integrity(
     assert!(report.contains("table-file"), "{report}");
     assert!(report.contains(block_kind), "{report}");
     assert!(report.contains(&format!("block_id={block_id}")), "{report}");
+}
+
+fn assert_checkpoint_write_poisoned(err: &Error, sys: &TestSys) {
+    assert_eq!(
+        err.report().downcast_ref::<FatalError>().copied(),
+        Some(FatalError::CheckpointWrite)
+    );
+    assert!(
+        sys.engine
+            .trx_sys
+            .storage_poison_error()
+            .as_ref()
+            .is_some_and(|err| *err.current_context() == FatalError::CheckpointWrite)
+    );
 }
 
 async fn stmt_insert_row(stmt: &mut Statement<'_>, table: &Table, cols: Vec<Val>) -> Result<RowID> {
@@ -195,6 +218,32 @@ impl StorageBackendTestHook for FailingPageReadHook {
     fn on_complete(&self, op: StorageBackendOp, res: &mut StdIoResult<usize>) {
         if self.matches(op) {
             *res = Err(io::Error::from_raw_os_error(self.errno));
+        }
+    }
+}
+
+struct FailingFirstWriteHook {
+    calls: AtomicUsize,
+}
+
+impl FailingFirstWriteHook {
+    #[inline]
+    fn new() -> Self {
+        Self {
+            calls: AtomicUsize::new(0),
+        }
+    }
+
+    #[inline]
+    fn call_count(&self) -> usize {
+        self.calls.load(Ordering::SeqCst)
+    }
+}
+
+impl StorageBackendTestHook for FailingFirstWriteHook {
+    fn on_complete(&self, op: StorageBackendOp, res: &mut StdIoResult<usize>) {
+        if op.kind() == IOKind::Write && self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+            *res = Err(io::Error::from_raw_os_error(libc::EIO));
         }
     }
 }
@@ -5507,6 +5556,154 @@ fn test_checkpoint_basic_flow() {
 }
 
 #[test]
+fn test_foreground_lifecycle_rejects_dropping_and_dropped_handles() {
+    smol::block_on(async {
+        let sys = TestSys::new_lightweight_evictable().await;
+        let mut session = sys.try_new_session().unwrap();
+        insert_one_row(
+            &sys.table,
+            &mut session,
+            vec![Val::from(1), Val::from("lifecycle")],
+        )
+        .await;
+
+        sys.table.begin_drop_lifecycle().await.unwrap();
+
+        let mut read_trx = session.try_begin_trx().unwrap().unwrap();
+        let err = trx_select_row_mvcc(&mut read_trx, &sys.table, &single_key(1), &[0, 1])
+            .await
+            .unwrap_err();
+        assert_eq!(err.operation_error(), Some(OperationError::TableDropping));
+        assert_eq!(read_trx.commit().await.unwrap(), 0);
+
+        let mut write_trx = session.try_begin_trx().unwrap().unwrap();
+        let err = trx_insert_row(
+            &mut write_trx,
+            &sys.table,
+            vec![Val::from(2), Val::from("blocked")],
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.operation_error(), Some(OperationError::TableDropping));
+        assert!(write_trx.readonly());
+        assert_eq!(write_trx.commit().await.unwrap(), 0);
+
+        sys.table.mark_dropped_lifecycle().unwrap();
+
+        let mut dropped_read = session.try_begin_trx().unwrap().unwrap();
+        let err = trx_select_row_mvcc(&mut dropped_read, &sys.table, &single_key(1), &[0, 1])
+            .await
+            .unwrap_err();
+        assert_eq!(err.operation_error(), Some(OperationError::TableNotFound));
+        assert_eq!(dropped_read.commit().await.unwrap(), 0);
+
+        let mut dropped_write = session.try_begin_trx().unwrap().unwrap();
+        let err = trx_insert_row(
+            &mut dropped_write,
+            &sys.table,
+            vec![Val::from(3), Val::from("dropped")],
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.operation_error(), Some(OperationError::TableNotFound));
+        assert!(dropped_write.readonly());
+        assert_eq!(dropped_write.commit().await.unwrap(), 0);
+
+        drop(session);
+        sys.clean_all();
+    });
+}
+
+#[test]
+fn test_table_drop_gate_waits_for_checkpoint_publish_lease() {
+    smol::block_on(async {
+        let sys = TestSys::new_lightweight_evictable().await;
+        let publish_lease = sys.table.try_begin_checkpoint_publish().unwrap();
+        let mut drop_fut = Box::pin(sys.table.begin_drop_lifecycle());
+
+        assert!(matches!(
+            futures::poll!(drop_fut.as_mut()),
+            std::task::Poll::Pending
+        ));
+        assert_eq!(sys.table.lifecycle_state(), TableLifecycleState::Live);
+        match sys.table.try_begin_checkpoint_publish() {
+            Ok(_lease) => panic!("publish lease should be blocked by drop gate"),
+            Err(reason) => assert_eq!(reason, CheckpointCancelReason::TableDropping),
+        }
+
+        drop(publish_lease);
+        drop_fut.await.unwrap();
+        assert_eq!(sys.table.lifecycle_state(), TableLifecycleState::Dropping);
+
+        sys.clean_all();
+    });
+}
+
+#[test]
+fn test_checkpoint_cancelled_when_table_dropping() {
+    smol::block_on(async {
+        let sys = TestSys::new_lightweight_evictable().await;
+        let mut session = sys.try_new_session().unwrap();
+        let root_before = sys.table.file().active_root_unchecked().clone();
+
+        sys.table.begin_drop_lifecycle().await.unwrap();
+        let outcome = sys.table.checkpoint(&mut session).await.unwrap();
+        assert_eq!(
+            outcome,
+            CheckpointOutcome::Cancelled {
+                reason: CheckpointCancelReason::TableDropping
+            }
+        );
+        assert_root_metadata_unchanged(&root_before, &sys.table);
+        assert!(!session.in_trx());
+
+        drop(session);
+        sys.clean_all();
+    });
+}
+
+#[test]
+fn test_checkpoint_publish_write_failure_poisons_storage() {
+    smol::block_on(async {
+        let sys = TestSys::new_lightweight_evictable().await;
+        let mut session = sys.try_new_session().unwrap();
+        let root_before = sys.table.file().active_root_unchecked().clone();
+        let hook = Arc::new(FailingFirstWriteHook::new());
+        let _install = install_storage_backend_test_hook(hook.clone());
+
+        let err = sys.table.checkpoint(&mut session).await.unwrap_err();
+        assert_checkpoint_write_poisoned(&err, &sys);
+        assert!(hook.call_count() > 0);
+        assert_root_metadata_unchanged(&root_before, &sys.table);
+        assert!(!session.in_trx());
+
+        drop(session);
+        sys.clean_all();
+    });
+}
+
+#[test]
+fn test_checkpoint_post_publication_failure_poisons_storage() {
+    smol::block_on(async {
+        let sys = TestSys::new_lightweight_evictable().await;
+        let mut session = sys.try_new_session().unwrap();
+        let root_before = sys.table.file().active_root_unchecked().clone();
+
+        set_test_force_post_publish_checkpoint_error(true);
+        let res = sys.table.checkpoint(&mut session).await;
+        set_test_force_post_publish_checkpoint_error(false);
+
+        let err = res.unwrap_err();
+        assert_checkpoint_write_poisoned(&err, &sys);
+        assert!(sys.table.file().active_root_unchecked().trx_id > root_before.trx_id);
+        assert!(!session.in_trx());
+
+        drop(session);
+        sys.clean_all();
+    });
+}
+
+#[test]
 fn test_checkpoint_readiness_ready_when_root_crossed_gc_horizon() {
     smol::block_on(async {
         let sys = TestSys::new_evictable().await;
@@ -7051,6 +7248,9 @@ async fn checkpoint_published(table: &Table, session: &mut Session) -> TrxID {
         CheckpointOutcome::Published { checkpoint_ts } => checkpoint_ts,
         CheckpointOutcome::Delayed { reason } => {
             panic!("checkpoint should publish, delayed by {reason:?}")
+        }
+        CheckpointOutcome::Cancelled { reason } => {
+            panic!("checkpoint should publish, cancelled by {reason:?}")
         }
     }
 }

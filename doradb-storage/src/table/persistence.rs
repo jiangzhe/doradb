@@ -14,7 +14,7 @@ use crate::index::{ColumnBlockIndex, ColumnDeleteDeltaPatch, ColumnLeafEntry};
 use crate::lwc::PersistedLwcBlock;
 use crate::row::RowID;
 use crate::session::Session;
-use crate::table::Table;
+use crate::table::{CheckpointCancelReason, Table};
 use crate::trx::TrxID;
 use crate::trx::redo::DDLRedo;
 use crate::value::{Val, ValKind, ValType};
@@ -66,6 +66,11 @@ pub enum CheckpointOutcome {
     Delayed {
         /// Diagnostic details explaining why checkpoint waited.
         reason: CheckpointDelayReason,
+    },
+    /// No checkpoint work was published because checkpoint publication was cancelled.
+    Cancelled {
+        /// Diagnostic details explaining why checkpoint publication was cancelled.
+        reason: CheckpointCancelReason,
     },
 }
 
@@ -909,10 +914,18 @@ impl TablePersistence for Table {
             return Err(err);
         }
 
-        // Step 9: publish a new table-file root and then commit the checkpoint
-        // transaction. This intentionally happens even when no row data,
-        // deletion payload, or secondary index root changed: the root trx_id
-        // acts as a checkpoint heartbeat for future redo-log truncation.
+        // Step 9: enter the no-cancel publication section, publish a new
+        // table-file root, and then commit the checkpoint transaction. This
+        // intentionally happens even when no row data, deletion payload, or
+        // secondary index root changed: the root trx_id acts as a checkpoint
+        // heartbeat for future redo-log truncation.
+        let publish_lease = match self.try_begin_checkpoint_publish() {
+            Ok(lease) => lease,
+            Err(reason) => {
+                trx_sys.rollback(trx).await?;
+                return Ok(CheckpointOutcome::Cancelled { reason });
+            }
+        };
         let published_root = mutable_file.root();
         let published_pivot_row_id = published_root.pivot_row_id;
         let published_column_root = published_root.column_block_index_root;
@@ -931,14 +944,25 @@ impl TablePersistence for Table {
         self.blk_idx()
             .update_column_root(published_pivot_row_id, published_column_root)
             .await;
+        #[cfg(test)]
+        if super::tests::test_force_post_publish_checkpoint_error_enabled() {
+            let poison = trx_sys.poison_storage(FatalError::CheckpointWrite);
+            trx.discard_after_fatal_rollback();
+            return Err(poison.into());
+        }
         if let Some(old_root) = old_root
-            && let Err(err) = trx.retain_old_table_root(old_root)
+            && trx.retain_old_table_root(old_root).is_err()
         {
-            trx_sys.rollback(trx).await?;
-            return Err(err);
+            let poison = trx_sys.poison_storage(FatalError::CheckpointWrite);
+            trx.discard_after_fatal_rollback();
+            return Err(poison.into());
         }
 
-        let _cts = trx_sys.commit(trx).await?;
+        if trx_sys.commit(trx).await.is_err() {
+            let poison = trx_sys.poison_storage(FatalError::CheckpointWrite);
+            return Err(poison.into());
+        }
+        drop(publish_lease);
         Ok(CheckpointOutcome::Published { checkpoint_ts })
     }
 }
