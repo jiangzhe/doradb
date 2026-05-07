@@ -1,7 +1,7 @@
 ---
 id: 000143
 title: Runtime Lifecycle And Checkpoint Gate
-status: proposal
+status: implemented
 created: 2026-05-06
 github_issue: 619
 ---
@@ -197,6 +197,46 @@ resolution.
 
 ## Implementation Notes
 
+- Implemented a crate-private `TableLifecycle` owned by `Table` with terminal
+  runtime states `Live -> Dropping -> Dropped`, foreground access validation,
+  and drop-side lifecycle methods for the later public DDL phase.
+- Added a single atomic checkpoint publish gate with states `Open`,
+  `Publishing`, `ClosingPublishing`, and `Closed`. Checkpoint publication now
+  acquires a `CheckpointPublishLease` immediately before table-root publication
+  and holds it through runtime root update, old-root retention, and checkpoint
+  transaction commit. Drop closes the gate, waits for the single active
+  publisher when present, then marks the table `Dropping`.
+- Added `OperationError::TableDropping`,
+  `CheckpointCancelReason::{TableDropping, TableDropped}`, and
+  `CheckpointOutcome::Cancelled { reason }` so foreground stale-handle access
+  and checkpoint publish cancellation are explicit and distinct from
+  GC-horizon delays.
+- Integrated foreground lifecycle checks into `Statement` read/write user-table
+  paths after logical lock acquisition and before table row/index access.
+- Audited checkpoint publication failure handling. Root publication IO errors
+  still poison storage with `FatalError::CheckpointWrite`; ambiguous failures
+  after root publication, including old-root retention or checkpoint commit
+  failure, now poison storage before returning.
+- Added lifecycle and checkpoint gate tests covering foreground `Dropping` and
+  `Dropped` rejection, publish/drop exclusion, checkpoint cancellation after
+  drop, root publication write failure poisoning, and post-publication failure
+  poisoning. The drop/publish tests exercise production futures and do not add
+  test-only helper APIs to production impls.
+- Verification completed:
+  - `cargo fmt --check`: passed.
+  - `cargo clippy -p doradb-storage --all-targets -- -D warnings`: passed.
+  - `git diff --check`: passed.
+  - `cargo nextest run -p doradb-storage lifecycle`: 5 passed.
+  - `cargo nextest run -p doradb-storage table_drop_gate_waits`: 1 passed.
+  - `cargo nextest run -p doradb-storage`: 701 passed.
+  - `tools/coverage_focus.rs --path doradb-storage/src/table/lifecycle.rs --path doradb-storage/src/table/persistence.rs --path doradb-storage/src/trx/stmt.rs --path doradb-storage/src/error.rs --path doradb-storage/src/trx/recover.rs --path doradb-storage/src/table/mod.rs`:
+    89.01% combined focused coverage. Changed runtime paths met the focused
+    coverage target except `error.rs`, which is a central definition-heavy file
+    and was covered through the lifecycle, persistence, statement, table, and
+    recovery consumer paths.
+- Task checklist found no remaining required fixes and no deferred actionable
+  backlog items. PR #620 was opened with `Closes #619`.
+
 ## Impacts
 
 - `doradb-storage/src/table/lifecycle.rs`
@@ -219,8 +259,7 @@ resolution.
   - Add integration-style lifecycle and checkpoint gate tests using real table
     and statement paths.
 - `docs/rfcs/0017-drop-table-lifecycle-recovery.md`
-  - Later `task resolve` must sync the phase 2 block with the implemented task
-    outcome.
+  - Synced the phase 2 block with the implemented task outcome.
 
 ## Test Cases
 
@@ -251,8 +290,7 @@ resolution.
 
 ## Open Questions
 
-- The exact name of the non-published checkpoint outcome may be adjusted during
-  implementation, but it must remain distinct from GC-horizon `Delayed`.
-- The exact fatal reason for ambiguous post-publication checkpoint failure may
-  reuse `FatalError::CheckpointWrite` unless implementation finds that a new
-  fieldless fatal reason materially improves diagnostics.
+- Resolved during implementation. The non-published checkpoint outcome is
+  `CheckpointOutcome::Cancelled { reason }`, and ambiguous post-publication
+  checkpoint failures reuse `FatalError::CheckpointWrite`.
+- No deferred follow-up backlog items were identified during task checklist.
