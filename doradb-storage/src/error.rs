@@ -141,6 +141,8 @@ pub(crate) enum OperationError {
     OldTableRootAlreadyRetained,
     #[error("table not found")]
     TableNotFound,
+    #[error("table is dropping")]
+    TableDropping,
     #[error("table already exists")]
     TableAlreadyExists,
     #[error("not supported")]

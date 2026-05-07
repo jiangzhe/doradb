@@ -895,6 +895,9 @@ mod tests {
             CheckpointOutcome::Delayed { reason } => {
                 panic!("checkpoint should publish, delayed by {reason:?}")
             }
+            CheckpointOutcome::Cancelled { reason } => {
+                panic!("checkpoint should publish, cancelled by {reason:?}")
+            }
         }
     }
 

@@ -1,6 +1,7 @@
 mod access;
 mod deletion_buffer;
 mod gc;
+mod lifecycle;
 mod persistence;
 mod recover;
 mod rollback;
@@ -10,6 +11,8 @@ mod tests;
 pub(crate) use access::*;
 pub use deletion_buffer::*;
 pub use gc::{SecondaryMemIndexCleanupIndexStats, SecondaryMemIndexCleanupStats};
+pub use lifecycle::CheckpointCancelReason;
+pub(crate) use lifecycle::{CheckpointPublishLease, TableLifecycle, TableLifecycleState};
 pub use persistence::*;
 pub use recover::*;
 pub(crate) use rollback::IndexRollback;
@@ -114,6 +117,7 @@ pub struct Table {
     pub(crate) mem: GenericMemTable<EvictableBufferPool, EvictableBufferPool>,
     pub(crate) storage: ColumnStorage,
     pub(crate) sec_idx: Box<[SecondaryIndex<EvictableBufferPool>]>,
+    pub(crate) lifecycle: TableLifecycle,
 }
 
 /// Owned projection of one proof-gated user-table active root.
@@ -782,7 +786,44 @@ impl Table {
             mem,
             storage,
             sec_idx,
+            lifecycle: TableLifecycle::new(),
         })
+    }
+
+    /// Ensures a foreground operation may access this table after logical locks.
+    #[inline]
+    pub(crate) fn check_foreground_live(&self, operation: &'static str) -> Result<()> {
+        self.lifecycle
+            .check_foreground_live(self.table_id(), operation)
+    }
+
+    /// Attempts to enter the checkpoint no-cancel publish section.
+    #[inline]
+    pub(crate) fn try_begin_checkpoint_publish(
+        &self,
+    ) -> std::result::Result<CheckpointPublishLease<'_>, CheckpointCancelReason> {
+        self.lifecycle.try_begin_checkpoint_publish()
+    }
+
+    /// Starts the irreversible drop lifecycle gate for this table.
+    #[inline]
+    #[allow(dead_code)]
+    pub(crate) async fn begin_drop_lifecycle(&self) -> Result<()> {
+        self.lifecycle.begin_drop(self.table_id()).await
+    }
+
+    /// Marks this table lifecycle as fully dropped.
+    #[inline]
+    #[allow(dead_code)]
+    pub(crate) fn mark_dropped_lifecycle(&self) -> Result<()> {
+        self.lifecycle.mark_dropped(self.table_id())
+    }
+
+    /// Returns the current volatile lifecycle state.
+    #[inline]
+    #[allow(dead_code)]
+    pub(crate) fn lifecycle_state(&self) -> TableLifecycleState {
+        self.lifecycle.state()
     }
 
     /// Build a lightweight operation accessor over this table runtime.

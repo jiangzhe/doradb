@@ -507,17 +507,18 @@ the table-file/root design. [D4], [C8], [C9]
 
 - **Phase 2: Runtime Lifecycle And Checkpoint Gate**
   - Scope: add volatile table lifecycle state, foreground lifecycle checks, and
-    checkpoint lease/cancellation protocol.
-  - Goals: reject stale foreground handles after locks, restore `Live` on failed
-    drop attempts, prevent new checkpoints during drop, cancel in-flight
-    checkpoint work before root publication, and ensure no `DataCheckpoint`
-    commits after `DropTable`.
+    checkpoint publish lease/cancellation protocol.
+  - Goals: reject stale foreground handles after locks, add the terminal
+    `Live -> Dropping -> Dropped` runtime barrier, prevent new checkpoint
+    publication once drop starts, wait for the single active checkpoint
+    publisher when present, cancel checkpoint at the publish boundary, and
+    poison ambiguous publication failures.
   - Non-goals: no physical file deletion; no background logical-lock
     acquisition; no index DDL.
-  - Task Doc: `docs/tasks/TBD.md`
-  - Task Issue: `#0`
-  - Phase Status: `pending`
-  - Implementation Summary: `pending`
+  - Task Doc: `docs/tasks/000143-runtime-lifecycle-and-checkpoint-gate.md`
+  - Task Issue: `#619`
+  - Phase Status: done
+  - Implementation Summary: Implemented terminal table lifecycle state, foreground stale-handle rejection, and a single-state checkpoint publish/drop gate with cancellation and fatal handling for ambiguous publication failures. [Task Resolve Sync: docs/tasks/000143-runtime-lifecycle-and-checkpoint-gate.md @ 2026-05-07]
 
 - **Phase 3: Drop Table DDL**
   - Scope: implement `Session::drop_table(table_id)` with DDL lock order,
