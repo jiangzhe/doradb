@@ -583,8 +583,13 @@ the table-file/root design. [D4], [C8], [C9]
     SQL parser surface beyond existing storage API conventions, or index DDL.
   - Task Doc: `docs/tasks/000144-drop-table-ddl.md`
   - Task Issue: `#621`
-  - Phase Status: `pending`
-  - Implementation Summary: `pending`
+  - Phase Status: done
+  - Implementation Summary: Implemented the storage-level
+    `Session::drop_table(table_id)` DDL path with DDL lock ordering, catalog
+    cascade deletion, `DDLRedo::DropTable`, runtime removal,
+    checkpoint/recovery validation, and source-preserving poison diagnostics
+    for post-gate failures. [Task Resolve Sync:
+    docs/tasks/000144-drop-table-ddl.md @ 2026-05-09]
 
 - **Phase 4: GC-Managed Dropped Table Destroy**
   - Scope: add consuming table/block-index destroy primitives, attach removed

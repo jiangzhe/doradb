@@ -1,7 +1,7 @@
 ---
 id: 000144
 title: Drop Table DDL
-status: proposal
+status: implemented
 created: 2026-05-07
 github_issue: 621
 ---
@@ -208,6 +208,43 @@ task resolution.
      any touched paths.
 
 ## Implementation Notes
+
+- Implemented the storage-level `Session::drop_table(table_id)` DDL path. The
+  path rejects active sessions, acquires `CatalogNamespace(X)`,
+  `TableMetadata(X)`, then `TableData(X)`, validates user-table runtime and
+  catalog state, crosses the phase 2 lifecycle/drop gate, deletes catalog rows
+  in dependency order, emits `DDLRedo::DropTable`, commits durably, marks the
+  runtime table `Dropped`, and removes it from `Catalog.user_tables`.
+- Kept phase 3 within the logical-drop boundary. The implementation does not
+  destroy runtime table state, reclaim buffer-pool/index pages, unlink table
+  files, add table-id reuse, add tombstones, or add SQL/name-resolution DDL.
+- Updated catalog checkpoint handling so committed `DropTable` redo can be
+  checkpoint-covered for a runtime-removed table when the catalog cascade is in
+  the checkpoint batch, using the catalog tables id constant instead of a
+  literal table id.
+- Added drop-table behavior, lock-drain, stale-handle, catalog cascade,
+  catalog checkpoint, and recovery tests covering the task acceptance cases,
+  including restart before drop commit, restart after committed drop, and
+  checkpoint-covered catalog absence.
+- Preserved root-cause diagnostics for fatal post-gate drop failures. The
+  catalog-cascade and commit poison paths now return the drop poison context
+  while retaining the original `execute_drop_table_catalog_cascade` or
+  `trx.commit()` error chain. Regression tests cover both source-preserving
+  paths.
+- Verification completed:
+  - `cargo fmt --all --check`: passed.
+  - `cargo clippy -p doradb-storage --all-targets -- -D warnings`: passed.
+  - `git diff --check`: passed.
+  - `cargo check -p doradb-storage`: passed.
+  - `cargo nextest run -p doradb-storage poison_preserves_source_error`: 2
+    passed.
+  - `cargo nextest run -p doradb-storage drop_table`: 14 passed.
+  - `cargo nextest run -p doradb-storage`: 717 passed.
+  - `tools/coverage_focus.rs --path doradb-storage/src/session.rs --path doradb-storage/src/table/tests.rs`:
+    98.60% combined focused coverage, with `session.rs` at 93.24% and
+    `table/tests.rs` at 99.06%.
+- Task checklist found no remaining required fixes and no deferred actionable
+  backlog items. No unsafe code was added or modified.
 
 ## Impacts
 
