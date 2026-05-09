@@ -13,7 +13,7 @@ use crate::value::ValKind;
 use semistr::SemiStr;
 use std::sync::OnceLock;
 
-pub const TABLE_ID_TABLES: TableID = 0;
+pub(crate) const TABLE_ID_TABLES: TableID = 0;
 const COL_NO_TABLES_TABLE_ID: usize = 0;
 const COL_NAME_TABLES_TABLE_ID: &str = "table_id";
 const PK_NO_TABLES: usize = 0;

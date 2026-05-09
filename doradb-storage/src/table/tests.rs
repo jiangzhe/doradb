@@ -6066,6 +6066,112 @@ fn test_drop_table_logical_cascade_and_stale_handles() {
 }
 
 #[test]
+fn test_drop_table_catalog_cascade_poison_preserves_source_error() {
+    smol::block_on(async {
+        let sys = TestSys::new_lightweight_evictable().await;
+        let table_id = sys.table.table_id();
+        let mut corrupt_session = sys.try_new_session().unwrap();
+        let mut corrupt_trx = corrupt_session.try_begin_trx().unwrap().unwrap();
+
+        corrupt_trx
+            .exec(async |stmt| {
+                let deleted = sys
+                    .engine
+                    .catalog()
+                    .storage
+                    .index_columns()
+                    .delete_by_index(stmt, table_id, 0)
+                    .await;
+                assert_eq!(deleted, 1);
+                Ok(())
+            })
+            .await
+            .unwrap();
+        corrupt_trx.commit().await.unwrap();
+
+        let mut drop_session = sys.try_new_session().unwrap();
+        let err = drop_session.drop_table(table_id).await.unwrap_err();
+        let report = format!("{err:?}");
+
+        assert_eq!(
+            err.report().downcast_ref::<FatalError>().copied(),
+            Some(FatalError::Poisoned),
+            "{report}"
+        );
+        assert_eq!(
+            err.report().downcast_ref::<InternalError>().copied(),
+            Some(InternalError::Generic),
+            "{report}"
+        );
+        assert!(
+            report.contains("drop table failed after lifecycle gate: table_id="),
+            "{report}"
+        );
+        assert!(report.contains("operation=catalog cascade"), "{report}");
+        assert!(
+            report.contains("drop table catalog cascade count mismatch"),
+            "{report}"
+        );
+        assert!(
+            sys.engine
+                .trx_sys
+                .storage_poison_error()
+                .as_ref()
+                .is_some_and(|err| *err.current_context() == FatalError::Poisoned)
+        );
+        assert!(!drop_session.in_trx());
+
+        drop(corrupt_session);
+        drop(drop_session);
+        sys.clean_all();
+    });
+}
+
+#[test]
+fn test_drop_table_commit_poison_preserves_source_error() {
+    smol::block_on(async {
+        let sys = TestSys::new_lightweight_evictable().await;
+        let table_id = sys.table.table_id();
+        let hook = Arc::new(FailingFirstWriteHook::new());
+        let _install = install_storage_backend_test_hook(hook.clone());
+        let mut session = sys.try_new_session().unwrap();
+
+        let err = session.drop_table(table_id).await.unwrap_err();
+        let report = format!("{err:?}");
+
+        assert!(hook.call_count() > 0);
+        assert_eq!(
+            err.report().downcast_ref::<FatalError>().copied(),
+            Some(FatalError::RedoWrite),
+            "{report}"
+        );
+        assert_eq!(
+            err.completion_error(),
+            Some(CompletionErrorKind::Fatal(FatalError::RedoWrite)),
+            "{report}"
+        );
+        assert!(
+            report.contains("drop table failed after lifecycle gate: table_id="),
+            "{report}"
+        );
+        assert!(report.contains("operation=commit"), "{report}");
+        assert!(report.contains("wait for redo group commit"), "{report}");
+        assert!(report.contains("propagate from other threads"), "{report}");
+        assert!(
+            sys.engine
+                .trx_sys
+                .storage_poison_error()
+                .as_ref()
+                .is_some_and(|err| *err.current_context() == FatalError::RedoWrite)
+        );
+        assert!(!session.in_trx());
+
+        drop(session);
+        sys.clean_all();
+    });
+}
+
+#[test]
 fn test_drop_table_waits_for_active_metadata_reader() {
     smol::block_on(async {
         let sys = TestSys::new_lightweight_evictable().await;

@@ -311,16 +311,24 @@ impl Session {
         let metadata = table.metadata().clone();
         let exec_res =
             execute_drop_table_catalog_cascade(&engine, &mut trx, table_id, &metadata).await;
-        if let Err(_err) = exec_res {
+        if let Err(err) = exec_res {
             // `trx.exec` may have already discarded the transaction after a
             // fatal statement-rollback failure. In either case the drop gate
             // has been crossed, so preserve the poison outcome below.
             let _ = trx.rollback().await;
-            return Err(poison_drop_table_after_gate(&engine, table_id, "catalog cascade").into());
+            return Err(poison_drop_table_after_gate_with_source(
+                &engine,
+                table_id,
+                "catalog cascade",
+                err,
+            )
+            .into());
         }
 
-        if let Err(_err) = trx.commit().await {
-            return Err(poison_drop_table_after_gate(&engine, table_id, "commit").into());
+        if let Err(err) = trx.commit().await {
+            return Err(
+                poison_drop_table_after_gate_with_source(&engine, table_id, "commit", err).into(),
+            );
         }
 
         let res = finish_drop_table_runtime_removal(&engine, table_id, &table);
@@ -656,9 +664,26 @@ fn poison_drop_table_after_gate(
     engine
         .trx_sys
         .poison_storage(FatalError::Poisoned)
-        .attach(format!(
-            "drop table failed after lifecycle gate: table_id={table_id}, operation={operation}"
-        ))
+        .attach(drop_table_after_gate_message(table_id, operation))
+}
+
+#[inline]
+fn poison_drop_table_after_gate_with_source(
+    engine: &EngineRef,
+    table_id: TableID,
+    operation: &'static str,
+    source: crate::error::Error,
+) -> Report<FatalError> {
+    let poison = poison_drop_table_after_gate(engine, table_id, operation);
+    source
+        .into_report()
+        .change_context(*poison.current_context())
+        .attach(drop_table_after_gate_message(table_id, operation))
+}
+
+#[inline]
+fn drop_table_after_gate_message(table_id: TableID, operation: &'static str) -> String {
+    format!("drop table failed after lifecycle gate: table_id={table_id}, operation={operation}")
 }
 
 /// Shared mutable state referenced by transactions started from one [`Session`].

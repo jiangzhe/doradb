@@ -1,3 +1,4 @@
+use crate::catalog::storage::tables::TABLE_ID_TABLES;
 use crate::catalog::{Catalog, TableID, is_catalog_obj_id, is_user_obj_id};
 use crate::error::{ErrorKind, FatalError, Result};
 use crate::trx::TrxID;
@@ -189,7 +190,7 @@ fn drop_table_has_catalog_table_delete(
     table_id: TableID,
     dml: &BTreeMap<TableID, TableDML>,
 ) -> bool {
-    let Some(tables_dml) = dml.get(&0) else {
+    let Some(tables_dml) = dml.get(&TABLE_ID_TABLES) else {
         return false;
     };
     tables_dml.rows.values().any(|row| {
