@@ -28,13 +28,13 @@ use crate::row::{RowID, RowPage};
 use crate::table::{Table, TableRecover};
 use crate::trx::log::{LogPartition, LogPartitionInitializer};
 use crate::trx::log_replay::{LogMerger, LogPartitionStream, TrxLog};
-use crate::trx::purge::GC;
+use crate::trx::purge::{DroppedTableFileDeleteItem, GC};
 use crate::trx::redo::{DDLRedo, RedoLogs, RowRedo, RowRedoKind, TableDML};
 use crate::trx::{MAX_SNAPSHOT_TS, MIN_SNAPSHOT_TS, TrxID};
 use crossbeam_utils::CachePadded;
 use error_stack::Report;
 use flume::Receiver;
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
 /// Per-row recovery map used while rebuilding one row page from redo.
@@ -100,7 +100,12 @@ pub(crate) async fn log_recover(
     deps: RecoveryDeps,
     catalog: &Catalog,
     mut log_partition_initializers: Vec<LogPartitionInitializer>,
-) -> Result<(Vec<CachePadded<LogPartition>>, Vec<Receiver<GC>>, TrxID)> {
+) -> Result<(
+    Vec<CachePadded<LogPartition>>,
+    Vec<Receiver<GC>>,
+    TrxID,
+    Vec<DroppedTableFileDeleteItem>,
+)> {
     let RecoveryDeps {
         index_pool,
         mem_pool,
@@ -119,7 +124,8 @@ pub(crate) async fn log_recover(
     let log_recovery = LogRecovery::new(
         meta_pool, index_pool, mem_pool, table_fs, disk_pool, catalog, log_merger,
     );
-    let (log_streams, max_recovered_cts) = log_recovery.recover_all().await?;
+    let (log_streams, max_recovered_cts, dropped_table_file_deletes) =
+        log_recovery.recover_all().await?;
     let next_trx_ts = max_recovered_cts
         .checked_add(1)
         .filter(|ts| *ts < MAX_SNAPSHOT_TS)
@@ -144,7 +150,7 @@ pub(crate) async fn log_recover(
         partitions.push(CachePadded::new(partition));
         gc_rxs.push(gc_rx);
     }
-    Ok((partitions, gc_rxs, next_trx_ts))
+    Ok((partitions, gc_rxs, next_trx_ts, dropped_table_file_deletes))
 }
 
 pub(crate) struct RecoveryDeps {
@@ -193,6 +199,8 @@ pub struct LogRecovery<'a> {
     /// Count of unknown user-table redo entries skipped because checkpointed
     /// catalog absence proves they are older than the catalog replay boundary.
     skipped_checkpoint_covered_unknown_table_redo: usize,
+    /// Dropped user-table files whose runtime state was destroyed during replay.
+    dropped_table_file_deletes: Vec<DroppedTableFileDeleteItem>,
     /// Stable pool guards shared by recovery operations.
     pool_guards: PoolGuards,
 }
@@ -248,13 +256,20 @@ impl<'a> LogRecovery<'a> {
             table_states: HashMap::new(),
             recovered_tables: HashMap::new(),
             skipped_checkpoint_covered_unknown_table_redo: 0,
+            dropped_table_file_deletes: Vec::new(),
             pool_guards,
         }
     }
 
     /// Replay all redo streams, rebuild indexes, and return reopened partition streams.
     #[inline]
-    pub async fn recover_all(mut self) -> Result<(Vec<LogPartitionStream>, TrxID)> {
+    pub(crate) async fn recover_all(
+        mut self,
+    ) -> Result<(
+        Vec<LogPartitionStream>,
+        TrxID,
+        Vec<DroppedTableFileDeleteItem>,
+    )> {
         self.bootstrap_checkpointed_user_tables().await?;
         // 1. replay all DDLs and DMLs.
         while let Some(log) = self.log_merger.try_next()? {
@@ -263,7 +278,11 @@ impl<'a> LogRecovery<'a> {
         // 2. Rebuild all indexes and refresh pages to enable undo map.
         self.recover_indexes_and_refresh_pages().await?;
 
-        Ok((self.log_merger.finished_streams(), self.max_recovered_cts))
+        Ok((
+            self.log_merger.finished_streams(),
+            self.max_recovered_cts,
+            self.dropped_table_file_deletes,
+        ))
     }
 
     async fn bootstrap_checkpointed_user_tables(&mut self) -> Result<()> {
@@ -272,13 +291,23 @@ impl<'a> LogRecovery<'a> {
         self.replay_floor = snapshot.catalog_replay_start_ts;
         self.max_recovered_cts = self.max_recovered_cts.max(snapshot.catalog_replay_start_ts);
 
-        for table in self
+        let checkpointed_tables = self
             .catalog
             .storage
             .tables()
             .list_uncommitted(&self.pool_guards)
-            .await
-        {
+            .await;
+        let checkpointed_user_table_ids = checkpointed_tables
+            .iter()
+            .filter(|table| is_user_obj_id(table.table_id))
+            .map(|table| table.table_id)
+            .collect::<HashSet<_>>();
+        self.table_fs.cleanup_checkpoint_absent_user_table_files(
+            snapshot.meta.next_user_obj_id,
+            &checkpointed_user_table_ids,
+        )?;
+
+        for table in checkpointed_tables {
             if !is_user_obj_id(table.table_id) {
                 continue;
             }
@@ -501,11 +530,21 @@ impl<'a> LogRecovery<'a> {
                     return Ok(());
                 }
                 self.replay_catalog_modifications(dml).await?;
-                if self.catalog.remove_user_table(*table_id).is_none() {
-                    return Err(Report::new(OperationError::TableNotFound)
-                        .attach(format!("replay drop table: table_id={table_id}"))
-                        .into());
-                }
+                let removed = self.catalog.remove_user_table(*table_id).ok_or_else(|| {
+                    Error::from(
+                        Report::new(OperationError::TableNotFound)
+                            .attach(format!("replay drop table: table_id={table_id}")),
+                    )
+                })?;
+                let table = Arc::try_unwrap(removed).map_err(|table| {
+                    Error::from(Report::new(OperationError::TableNotFound).attach(format!(
+                        "replay drop table found stale runtime handle: table_id={table_id}, strong_count={}",
+                        Arc::strong_count(&table)
+                    )))
+                })?;
+                table.destroy_dropped_runtime(&self.pool_guards).await?;
+                self.dropped_table_file_deletes
+                    .push(DroppedTableFileDeleteItem::new(*table_id, cts));
                 self.table_states.remove(table_id);
                 self.recovered_tables.remove(table_id);
             }
@@ -2368,7 +2407,7 @@ mod tests {
                 entry.block_id()
             };
 
-            let table_file_path = engine.table_fs.table_file_path(table_id);
+            let table_file_path = engine.table_fs.user_table_file_path(table_id);
             drop(checkpoint_session);
             drop(table);
             drop(session);
@@ -2522,7 +2561,7 @@ mod tests {
                     .expect("delete checkpoint should offload large delete sets")
             };
 
-            let table_file_path = engine.table_fs.table_file_path(table_id);
+            let table_file_path = engine.table_fs.user_table_file_path(table_id);
             drop(trx_sys);
             drop(checkpoint_session);
             drop(table);

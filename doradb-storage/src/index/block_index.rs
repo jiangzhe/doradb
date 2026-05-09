@@ -88,6 +88,19 @@ impl<P: BufferPool> GenericBlockIndex<P> {
         self.root.column_root_block_id()
     }
 
+    /// Destroy the in-memory row-page index owned by this facade.
+    #[inline]
+    pub(crate) async fn destroy<B: BufferPool>(
+        self,
+        meta_pool_guard: &PoolGuard,
+        mem_pool: &B,
+        mem_pool_guard: &PoolGuard,
+    ) -> Result<()> {
+        self.row
+            .destroy(meta_pool_guard, mem_pool, mem_pool_guard)
+            .await
+    }
+
     /// Returns a shared row page suitable for insert operations.
     #[inline]
     pub async fn get_insert_page<B: BufferPool>(

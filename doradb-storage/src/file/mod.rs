@@ -986,7 +986,9 @@ impl Deref for FixedSizeBufferFreeList {
 mod tests {
     use super::*;
     use crate::catalog::table::TableMetadata;
-    use crate::catalog::{ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexSpec};
+    use crate::catalog::{
+        ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexSpec, USER_OBJ_ID_START,
+    };
     use crate::compression::BitPackable;
     use crate::file::fs::tests::{TestFileSystem, build_test_fs};
     use crate::file::table_file::TableFile;
@@ -1025,7 +1027,7 @@ mod tests {
     async fn committed_test_table_file() -> (TempDir, TestFileSystem, Arc<TableFile>) {
         let (temp_dir, fs) = build_test_fs();
         let mutable = fs
-            .create_table_file(801, build_test_metadata(), false)
+            .create_table_file(USER_OBJ_ID_START + 801, build_test_metadata(), false)
             .unwrap();
         let (table_file, old_root) = mutable.commit(1, false).await.unwrap();
         drop(old_root);
