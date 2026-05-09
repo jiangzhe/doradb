@@ -16,8 +16,12 @@ Define the storage-engine lifecycle and recovery contract for logical
 volatile table lifecycle gate for stale runtime handles and background
 checkpoint cancellation, and a catalog checkpoint/recovery rule that treats
 checkpointed catalog absence plus a monotonic non-reused table id as sufficient
-durable negative knowledge. Physical table-file deletion, table-id reuse, and
-`CREATE INDEX`/`DROP INDEX` are out of scope and should be handled by later RFCs.
+durable negative knowledge. The logical DDL phase deliberately separates runtime
+unreachability from resource reclamation; a later phase in this RFC reuses the
+transaction GC horizon to destroy dropped table memory and waits for catalog
+checkpoint negative knowledge before deleting table files. Table-id reuse and
+`CREATE INDEX`/`DROP INDEX` remain out of scope and should be handled by later
+RFCs.
 
 ## Context
 
@@ -104,8 +108,12 @@ Issue Labels:
 - [C12] `doradb-storage/src/file/fs.rs` and
   `doradb-storage/src/file/table_file.rs` - table files are deterministic paths;
   current deletion support is limited to uncommitted/failed table creation.
-- [C13] `doradb-storage/src/trx/purge.rs` - old table roots are released through
-  transaction/purge retention, but dropped table-file reclamation is not present.
+- [C13] `doradb-storage/src/trx/purge.rs` and `doradb-storage/src/trx/mod.rs` -
+  transaction GC advances on the oldest-active-snapshot horizon and already
+  releases retained old table roots after they cross that horizon.
+- [C14] `doradb-storage/src/index/secondary_index.rs` and
+  `doradb-storage/src/index/btree/mod.rs` - secondary MemIndex/BTree destroy
+  helpers can reclaim index pages, but table/block-index destroy is not wired.
 
 ### Conversation References
 
@@ -124,6 +132,11 @@ Issue Labels:
   be explicit.
 - [U7] Scope revision: `CREATE INDEX` and `DROP INDEX` should move to a future
   separate RFC.
+- [U8] Phase 3 review found that task 000144 intentionally removes runtime
+  reachability but lacks a step for releasing hot row pages and index state.
+- [U9] Follow-up decision: phase 4 should reuse the GC path rather than a
+  standalone dropped-table reclaimer; memory destroy can happen at the GC
+  horizon, while physical file deletion waits for catalog replay-boundary safety.
 
 ## Decision
 
@@ -134,7 +147,7 @@ This RFC chooses a logical `DROP TABLE` implementation built on:
 - a checkpoint lease/cancellation gate;
 - replay rules based on checkpointed catalog absence and monotonic table-id
   non-reuse;
-- deferred physical file deletion.
+- deferred, GC-managed runtime memory reclamation and physical file deletion.
 
 The RFC does not add a durable drop tombstone table. The no-tombstone rule is
 valid only because user table ids are persisted through a monotonic allocator and
@@ -175,8 +188,9 @@ are never reused after crash/restart. [D1], [D3], [D5], [D6], [C5], [C6], [U3],
    [U5]
 9. Drop abort recovery: a failed uncommitted drop must restore volatile lifecycle
    from `Dropping` to `Live`. [C9], [U6]
-10. Physical unlink separation: logical drop commit must not require table-file
-    deletion or quarantine. [D4], [D5], [C12], [C13]
+10. Reclamation separation: logical drop commit must not require in-memory
+    table destroy, table-file deletion, or quarantine. [D4], [D5], [C12],
+    [C13], [C14], [U8], [U9]
 
 ### Foreground DDL Locking
 
@@ -303,8 +317,9 @@ idempotent under the existing catalog no-transaction replay model. [C2], [C3],
 [C7]
 
 After durable commit, runtime marks the old table handle `Dropped`, removes it
-from `Catalog.user_tables`, and then releases DDL locks. Physical table-file
-deletion is not part of this phase. [C5], [C9], [C12], [U1], [U5]
+from `Catalog.user_tables`, and then releases DDL locks. Runtime memory destroy
+and physical table-file deletion are not part of the logical DDL phase. [C5],
+[C9], [C12], [C13], [C14], [U1], [U5], [U8], [U9]
 
 The RFC does not require a durable `catalog.object_lifecycle` table for
 `DROP TABLE` v1. Because table ids are not reused, checkpointed catalog absence
@@ -337,8 +352,8 @@ and advance catalog_replay_start_ts to safe_cts + 1 only if:
 Checkpointed dropped tables do not participate in the recovery coarse replay
 floor because they are not loaded user tables. Their pre-drop redo is covered by
 catalog negative knowledge, not by table-file replay boundaries. A leftover table
-file for a checkpoint-absent table is ignored by recovery until a future
-reclaimer handles it. [D1], [D3], [C3], [C4], [C12]
+file for a checkpoint-absent table is ignored by recovery until phase 4's
+GC-managed file-deletion stage handles it. [D1], [D3], [C3], [C4], [C12], [U9]
 
 Recovery must classify table-scoped redo for unknown table ids by CTS:
 
@@ -377,8 +392,20 @@ The implementation must satisfy these restart cases:
 
 ### Physical Table-File Deletion Contract
 
-The first `DROP TABLE` implementation leaves the table file in place. A future
-reclaimer may physically delete or quarantine the file only after:
+Phase 3 leaves both hot runtime reclamation and table-file deletion out of the
+logical DDL path. Phase 4 reuses transaction GC rather than adding a standalone
+dropped-table reclaimer:
+
+- after `min_active_sts > drop_cts`, GC may attempt to consume the removed
+  runtime table handle and reclaim in-memory resources such as hot row pages,
+  row-page-index nodes, secondary MemIndex pages, deletion-buffer runtime state,
+  and other volatile table-owned structures;
+- if stale `Arc<Table>` handles still exist, GC keeps the dropped-table item and
+  retries in a later cycle;
+- after in-memory destroy succeeds, GC keeps a lightweight file-deletion item
+  until catalog checkpoint safety is visible.
+
+Physical table-file deletion may happen only after:
 
 - drop commit is durable;
 - catalog checkpoint persisted table absence with `catalog_replay_start_ts`
@@ -391,7 +418,7 @@ reclaimer may physically delete or quarantine the file only after:
 Immediate unlink at drop commit is unsafe because a crash before catalog
 checkpoint could restart from checkpointed catalog metadata that still names the
 table and then fail opening the missing table file. [D1], [D3], [D4], [C12],
-[C13], [U5], [U6]
+[C13], [C14], [U5], [U6], [U8], [U9]
 
 ### Test Strategy
 
@@ -437,6 +464,20 @@ Required catalog integrity tests:
 - creating a later table uses a new table id;
 - dropping a table with indexes cascades metadata deletes correctly.
 
+Required phase 4 destroy tests:
+
+- GC does not destroy a dropped table while `min_active_sts <= drop_cts`;
+- stale `Arc<Table>` handles delay consuming in-memory destroy;
+- memory destroy returns hot row pages, row-page-index nodes, and MemIndex pages
+  to their buffer pools;
+- table-file deletion does not run before
+  `catalog_replay_start_ts > drop_cts`;
+- crash before catalog checkpoint still recovers by opening the table file and
+  replaying `DropTable`;
+- crash after catalog checkpoint can tolerate an already-deleted table file for
+  the checkpoint-absent table;
+- repeated file deletion is idempotent.
+
 ## Alternatives Considered
 
 ### Alternative A: Mandatory Durable Drop Tombstone Table
@@ -469,9 +510,21 @@ Required catalog integrity tests:
   restart uses a checkpointed catalog state that still contains the table.
 - Why Not Chosen: Physical deletion needs a crash-idempotent reclaimer and should
   be separate from logical drop correctness.
-- References: [D1], [D3], [D4], [C12], [C13], [U5], [U6]
+- References: [D1], [D3], [D4], [C12], [C13], [U5], [U6], [U9]
 
-### Alternative D: Include Offline Create/Drop Index In This RFC
+### Alternative D: Standalone Dropped-Table Reclaimer
+
+- Summary: Add a new dropped-table reclaimer service separate from transaction
+  GC.
+- Analysis: A dedicated service could reclaim dropped tables as soon as its own
+  handle/refcount and catalog-checkpoint predicates pass.
+- Why Not Chosen: The existing GC horizon already represents the conservative
+  "no active snapshot can see this" boundary. Reusing it keeps the first
+  destroy implementation smaller, even if reclamation happens later than the
+  earliest possible moment.
+- References: [D2], [D4], [C13], [C14], [U8], [U9]
+
+### Alternative E: Include Offline Create/Drop Index In This RFC
 
 - Summary: Keep `CREATE INDEX` and `DROP INDEX` phases in this RFC alongside
   `DROP TABLE`.
@@ -525,9 +578,29 @@ the table-file/root design. [D4], [C8], [C9]
     catalog cascade deletes, `DDLRedo::DropTable`, runtime removal, catalog
     checkpoint rule change, restart validation, and drop behavior tests.
   - Goals: support logical `DROP TABLE` end to end with crash-safe recovery.
-  - Non-goals: no table-file unlink/quarantine; no table-id reuse; no drop by
-    name; no SQL parser surface beyond existing storage API conventions; no
-    index DDL.
+  - Non-goals: no runtime table destroy, buffer-pool page reclamation, GC
+    integration, table-file unlink/quarantine, table-id reuse, drop by name,
+    SQL parser surface beyond existing storage API conventions, or index DDL.
+  - Task Doc: `docs/tasks/000144-drop-table-ddl.md`
+  - Task Issue: `#621`
+  - Phase Status: done
+  - Implementation Summary: Implemented the storage-level
+    `Session::drop_table(table_id)` DDL path with DDL lock ordering, catalog
+    cascade deletion, `DDLRedo::DropTable`, runtime removal,
+    checkpoint/recovery validation, and source-preserving poison diagnostics
+    for post-gate failures. [Task Resolve Sync:
+    docs/tasks/000144-drop-table-ddl.md @ 2026-05-09]
+
+- **Phase 4: GC-Managed Dropped Table Destroy**
+  - Scope: add consuming table/block-index destroy primitives, attach removed
+    dropped-table runtime handles to transaction GC, reclaim in-memory table
+    resources after `min_active_sts > drop_cts`, and delete/quarantine table
+    files only after `catalog_replay_start_ts > drop_cts`.
+  - Goals: reclaim dropped-table memory and eventually disk space without making
+    logical `DROP TABLE` wait for stale handles, GC, or catalog checkpoint.
+  - Non-goals: no table-id reuse, durable tombstone table, standalone
+    dropped-table reclaimer, synchronous destroy inside `Session::drop_table`,
+    or index DDL.
   - Task Doc: `docs/tasks/TBD.md`
   - Task Issue: `#0`
   - Phase Status: `pending`
@@ -543,14 +616,18 @@ the table-file/root design. [D4], [C8], [C9]
   long logical-lock waits.
 - Recovery gets a precise rule for old redo belonging to checkpoint-absent
   tables.
-- Physical reclamation remains separated from logical DDL correctness.
+- Dropped-table reclamation has a clear follow-up phase that reuses the existing
+  GC horizon and keeps physical deletion behind restart-safe catalog negative
+  knowledge.
 
 ### Negative
 
-- Physical disk space for dropped tables is not reclaimed by the first
-  implementation.
+- Physical disk space and hot buffer-pool pages for dropped tables are not
+  reclaimed by phase 3.
 - Runtime table access paths must add lifecycle checks after lock acquisition.
 - Table checkpoint needs a new lifecycle/cancellation boundary.
+- Phase 4 must add table/block-index destroy code and retry behavior for stale
+  runtime handles.
 - `CREATE INDEX` and `DROP INDEX` remain unimplemented and require a separate
   RFC.
 

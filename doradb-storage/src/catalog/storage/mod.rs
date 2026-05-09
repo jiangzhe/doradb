@@ -2,7 +2,7 @@ mod checkpoint;
 mod columns;
 mod indexes;
 mod object;
-mod tables;
+pub(crate) mod tables;
 
 use crate::buffer::{BufferPool, FixedBufferPool, ReadonlyBufferPool};
 use crate::catalog::runtime::CatalogTable;

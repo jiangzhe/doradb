@@ -12,7 +12,9 @@ pub(crate) use access::*;
 pub use deletion_buffer::*;
 pub use gc::{SecondaryMemIndexCleanupIndexStats, SecondaryMemIndexCleanupStats};
 pub use lifecycle::CheckpointCancelReason;
-pub(crate) use lifecycle::{CheckpointPublishLease, TableLifecycle, TableLifecycleState};
+#[cfg(test)]
+pub(crate) use lifecycle::TableLifecycleState;
+pub(crate) use lifecycle::{CheckpointPublishLease, TableLifecycle};
 pub use persistence::*;
 pub use recover::*;
 pub(crate) use rollback::IndexRollback;
@@ -807,23 +809,14 @@ impl Table {
 
     /// Starts the irreversible drop lifecycle gate for this table.
     #[inline]
-    #[allow(dead_code)]
     pub(crate) async fn begin_drop_lifecycle(&self) -> Result<()> {
         self.lifecycle.begin_drop(self.table_id()).await
     }
 
     /// Marks this table lifecycle as fully dropped.
     #[inline]
-    #[allow(dead_code)]
     pub(crate) fn mark_dropped_lifecycle(&self) -> Result<()> {
         self.lifecycle.mark_dropped(self.table_id())
-    }
-
-    /// Returns the current volatile lifecycle state.
-    #[inline]
-    #[allow(dead_code)]
-    pub(crate) fn lifecycle_state(&self) -> TableLifecycleState {
-        self.lifecycle.state()
     }
 
     /// Build a lightweight operation accessor over this table runtime.

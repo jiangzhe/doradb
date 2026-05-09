@@ -110,7 +110,6 @@ impl TableLifecycle {
     ///
     /// This closes the checkpoint publish gate first, waits for any already-held
     /// publish lease to drain, and only then makes `Dropping` visible.
-    #[allow(dead_code)]
     pub(crate) async fn begin_drop(&self, table_id: TableID) -> Result<()> {
         match self.state() {
             TableLifecycleState::Live => {}
@@ -173,7 +172,6 @@ impl TableLifecycle {
 
     /// Marks a dropping table handle as fully dropped.
     #[inline]
-    #[allow(dead_code)]
     pub(crate) fn mark_dropped(&self, table_id: TableID) -> Result<()> {
         self.state
             .compare_exchange(
@@ -337,7 +335,6 @@ fn foreground_not_live_err(
 }
 
 #[inline]
-#[allow(dead_code)]
 fn drop_not_live_err(
     table_id: TableID,
     operation: &'static str,
@@ -356,7 +353,6 @@ fn drop_not_live_err(
 }
 
 #[inline]
-#[allow(dead_code)]
 fn mark_dropped_err(table_id: TableID, state: TableLifecycleState) -> Error {
     Report::new(InternalError::Generic)
         .attach(format!(

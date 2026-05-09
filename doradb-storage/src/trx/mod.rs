@@ -538,34 +538,6 @@ impl OwnerLockState {
         }
     }
 
-    /// Attempts to acquire an owner-scoped lock without waiting.
-    ///
-    /// A covering cached mode skips the lock manager. Fresh conflicts return
-    /// `Ok(false)`, while invalid modes and unsupported or blocking conversions
-    /// propagate the lock-manager error.
-    #[inline]
-    pub(crate) fn try_acquire(
-        &mut self,
-        lock_manager: &LockManager,
-        resource: LockResource,
-        mode: LockMode,
-    ) -> Result<bool> {
-        if self.cached_covers(resource, mode)? {
-            return Ok(true);
-        }
-        let acquired = match self.owner_group {
-            Some(owner_group) => {
-                lock_manager.try_acquire_grouped(resource, mode, self.owner, owner_group)?
-            }
-            None => lock_manager.try_acquire(resource, mode, self.owner)?,
-        };
-        if !acquired {
-            return Ok(false);
-        }
-        self.cache_granted(resource, mode);
-        Ok(true)
-    }
-
     /// Acquires an owner-scoped lock, waiting for fresh conflicts.
     ///
     /// Blocking conversion is still delegated to the lock manager and remains
@@ -739,7 +711,6 @@ impl ActiveTrx {
     }
 
     #[inline]
-    #[allow(dead_code)]
     fn checked_lock_state(&self, operation: &'static str) -> Result<&OwnerLockState> {
         if !self.state.is_active() {
             return Err(Self::discarded_err(operation));
@@ -750,7 +721,6 @@ impl ActiveTrx {
     }
 
     #[inline]
-    #[allow(dead_code)]
     fn checked_lock_state_mut(&mut self, operation: &'static str) -> Result<&mut OwnerLockState> {
         if !self.state.is_active() {
             return Err(Self::discarded_err(operation));
@@ -806,15 +776,6 @@ impl ActiveTrx {
         self.ctx().trx_id()
     }
 
-    /// Returns the transaction-owned logical lock owner.
-    #[inline]
-    #[allow(dead_code)]
-    pub(crate) fn lock_owner(&self) -> Result<LockOwner> {
-        Ok(self
-            .checked_lock_state("read transaction lock owner")?
-            .owner())
-    }
-
     /// Returns the transaction snapshot timestamp.
     #[inline]
     pub fn sts(&self) -> TrxID {
@@ -851,64 +812,51 @@ impl ActiveTrx {
         self.effects.index_undo_mut()
     }
 
-    /// Returns whether the transaction lock cache covers the requested lock.
-    #[inline]
-    #[allow(dead_code)]
-    pub(crate) fn cached_transaction_lock_covers(
-        &self,
-        resource: LockResource,
-        mode: LockMode,
-    ) -> Result<bool> {
-        self.checked_lock_state("check transaction lock cache")?
-            .cached_covers(resource, mode)
-    }
-
-    /// Attempts to acquire a transaction-owned logical lock without waiting.
-    #[inline]
-    #[allow(dead_code)]
-    pub(crate) fn try_acquire_transaction_lock(
-        &mut self,
-        resource: LockResource,
-        mode: LockMode,
-    ) -> Result<bool> {
-        let lock_manager = self.checked_lock_manager("try acquire transaction lock")?;
-        self.checked_lock_state_mut("try acquire transaction lock")?
-            .try_acquire(&lock_manager, resource, mode)
-    }
-
-    /// Acquires a transaction-owned logical lock.
-    #[inline]
-    #[allow(dead_code)]
-    pub(crate) async fn acquire_transaction_lock(
-        &mut self,
-        resource: LockResource,
-        mode: LockMode,
-    ) -> Result<()> {
-        let lock_manager = self.checked_lock_manager("acquire transaction lock")?;
-        self.checked_lock_state_mut("acquire transaction lock")?
-            .acquire(&lock_manager, resource, mode)
-            .await
-    }
-
     /// Acquires an explicit transaction-lifetime table lock.
     #[inline]
     pub async fn lock_table(&mut self, table_id: TableID, mode: LockMode) -> Result<()> {
         mode.validate_explicit_table_lock()?;
+        let engine = self.checked_engine("lock explicit table")?;
+        engine
+            .catalog()
+            .validate_user_table_live(table_id, "lock explicit table")
+            .await?;
         let lock_manager = self.checked_lock_manager("lock explicit table")?;
         let metadata_resource = LockResource::TableMetadata(table_id);
         let data_resource = LockResource::TableData(table_id);
         let owner = self.checked_lock_state("lock explicit table")?.owner();
+        let metadata_cached = self
+            .checked_lock_state("lock explicit table")?
+            .cached_covers(metadata_resource, LockMode::Shared)?;
+        let data_cached = self
+            .checked_lock_state("lock explicit table")?
+            .cached_covers(data_resource, mode)?;
         let metadata_grant = self
             .checked_lock_state("lock explicit table")?
             .acquire_uncached(&lock_manager, metadata_resource, LockMode::Shared)
             .await?;
         let mut metadata_guard =
             FreshLockGuard::new(&lock_manager, metadata_resource, owner, metadata_grant);
-        self.checked_lock_state_mut("lock explicit table")?
-            .acquire(&lock_manager, data_resource, mode)
+        let data_grant = self
+            .checked_lock_state("lock explicit table")?
+            .acquire_uncached(&lock_manager, data_resource, mode)
             .await?;
-        self.checked_lock_state_mut("lock explicit table")?
-            .cache_granted(metadata_resource, LockMode::Shared);
+        let mut data_guard = FreshLockGuard::new(&lock_manager, data_resource, owner, data_grant);
+        engine
+            .catalog()
+            .validate_user_table_live(table_id, "lock explicit table")
+            .await?;
+        if !data_cached {
+            self.checked_lock_state_mut("lock explicit table")?
+                .cache_granted(data_resource, mode);
+        }
+        if !metadata_cached {
+            self.checked_lock_state_mut("lock explicit table")?
+                .cache_granted(metadata_resource, LockMode::Shared);
+        }
+        if let Some(guard) = data_guard.as_mut() {
+            guard.disarm();
+        }
         if let Some(guard) = metadata_guard.as_mut() {
             guard.disarm();
         }
@@ -1515,7 +1463,7 @@ impl CommittedTrx {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::buffer::PoolRole;
     use crate::catalog::{ColumnAttributes, ColumnSpec, TableMetadata};
@@ -1523,7 +1471,9 @@ mod tests {
     use crate::engine::Engine;
     use crate::file::cow_file::tests::old_root_drop_count;
     use crate::file::table_file::MutableTableFile;
+    use crate::lock::tests::{debug_snapshot, try_acquire, try_acquire_grouped};
     use crate::row::ops::SelectKey;
+    use crate::trx::stmt::tests as stmt_tests;
     use crate::trx::undo::{IndexUndo, IndexUndoKind, OwnedRowUndo, RowUndoKind};
     use crate::value::ValKind;
     use std::sync::Arc;
@@ -1556,10 +1506,74 @@ mod tests {
         Arc::new(SessionState::new(engine_ref, session_id))
     }
 
+    #[inline]
+    pub(crate) fn lock_owner(trx: &ActiveTrx) -> Result<LockOwner> {
+        Ok(trx
+            .checked_lock_state("read transaction lock owner")?
+            .owner())
+    }
+
+    #[inline]
+    pub(crate) fn cached_transaction_lock_covers(
+        trx: &ActiveTrx,
+        resource: LockResource,
+        mode: LockMode,
+    ) -> Result<bool> {
+        trx.checked_lock_state("check transaction lock cache")?
+            .cached_covers(resource, mode)
+    }
+
+    #[inline]
+    pub(crate) fn try_acquire_transaction_lock(
+        trx: &mut ActiveTrx,
+        resource: LockResource,
+        mode: LockMode,
+    ) -> Result<bool> {
+        let lock_manager = trx.checked_lock_manager("try acquire transaction lock")?;
+        try_acquire_owner_lock_state(
+            trx.checked_lock_state_mut("try acquire transaction lock")?,
+            &lock_manager,
+            resource,
+            mode,
+        )
+    }
+
+    #[inline]
+    fn try_acquire_owner_lock_state(
+        lock_state: &mut OwnerLockState,
+        lock_manager: &LockManager,
+        resource: LockResource,
+        mode: LockMode,
+    ) -> Result<bool> {
+        if lock_state.cached_covers(resource, mode)? {
+            return Ok(true);
+        }
+        let acquired = match lock_state.owner_group {
+            Some(owner_group) => {
+                try_acquire_grouped(lock_manager, resource, mode, lock_state.owner, owner_group)?
+            }
+            None => try_acquire(lock_manager, resource, mode, lock_state.owner)?,
+        };
+        if acquired {
+            lock_state.cache_granted(resource, mode);
+        }
+        Ok(acquired)
+    }
+
+    #[inline]
+    pub(crate) async fn acquire_transaction_lock(
+        trx: &mut ActiveTrx,
+        resource: LockResource,
+        mode: LockMode,
+    ) -> Result<()> {
+        let lock_manager = trx.checked_lock_manager("acquire transaction lock")?;
+        trx.checked_lock_state_mut("acquire transaction lock")?
+            .acquire(&lock_manager, resource, mode)
+            .await
+    }
+
     fn lock_entry_count(engine: &Engine, owner: LockOwner) -> usize {
-        engine
-            .lock_manager()
-            .debug_snapshot()
+        debug_snapshot(engine.lock_manager())
             .entries
             .iter()
             .filter(|entry| entry.owner == owner)
@@ -1761,21 +1775,29 @@ mod tests {
             let (_temp_dir, engine) = test_engine("redo_stmt_lock_release").await;
             let mut session = engine.try_new_session().unwrap();
             let mut trx = session.try_begin_trx().unwrap().unwrap();
-            let trx_owner = trx.lock_owner().unwrap();
+            let trx_owner = lock_owner(&trx).unwrap();
             let trx_resource = LockResource::TableData(91_210);
             assert!(
-                trx.try_acquire_transaction_lock(trx_resource, LockMode::IntentExclusive)
+                try_acquire_transaction_lock(&mut trx, trx_resource, LockMode::IntentExclusive)
                     .unwrap()
             );
 
             let first_owner = std::cell::Cell::new(None);
             trx.exec(async |stmt| {
-                let owner = stmt.lock_owner();
+                let owner = stmt_tests::lock_owner(stmt);
                 first_owner.set(Some(owner));
-                stmt.acquire_statement_lock(LockResource::TableMetadata(91_210), LockMode::Shared)
-                    .await?;
-                stmt.acquire_statement_lock(LockResource::TableMetadata(91_210), LockMode::Shared)
-                    .await?;
+                stmt_tests::acquire_statement_lock(
+                    stmt,
+                    LockResource::TableMetadata(91_210),
+                    LockMode::Shared,
+                )
+                .await?;
+                stmt_tests::acquire_statement_lock(
+                    stmt,
+                    LockResource::TableMetadata(91_210),
+                    LockMode::Shared,
+                )
+                .await?;
                 assert_eq!(lock_entry_count(&engine, owner), 1);
                 Ok(())
             })
@@ -1784,13 +1806,15 @@ mod tests {
 
             let second_owner = std::cell::Cell::new(None);
             trx.exec(async |stmt| {
-                let owner = stmt.lock_owner();
+                let owner = stmt_tests::lock_owner(stmt);
                 second_owner.set(Some(owner));
-                assert!(stmt.try_acquire_statement_lock(
+                assert!(stmt_tests::try_acquire_statement_lock(
+                    stmt,
                     LockResource::TableMetadata(91_211),
                     LockMode::Shared,
                 )?);
-                assert!(stmt.try_acquire_statement_lock(
+                assert!(stmt_tests::try_acquire_statement_lock(
+                    stmt,
                     LockResource::TableMetadata(91_211),
                     LockMode::Shared,
                 )?);
@@ -1803,9 +1827,10 @@ mod tests {
             let error_owner = std::cell::Cell::new(None);
             let res: Result<()> = trx
                 .exec(async |stmt| {
-                    let owner = stmt.lock_owner();
+                    let owner = stmt_tests::lock_owner(stmt);
                     error_owner.set(Some(owner));
-                    stmt.acquire_statement_lock(
+                    stmt_tests::acquire_statement_lock(
+                        stmt,
                         LockResource::TableMetadata(91_212),
                         LockMode::Shared,
                     )
@@ -1841,26 +1866,17 @@ mod tests {
             let (_temp_dir, engine) = test_engine("redo_trx_lock_cache").await;
             let mut session = engine.try_new_session().unwrap();
             let mut trx = session.try_begin_trx().unwrap().unwrap();
-            let owner = trx.lock_owner().unwrap();
+            let owner = lock_owner(&trx).unwrap();
             let data = LockResource::TableData(91_220);
 
             assert!(
-                trx.try_acquire_transaction_lock(data, LockMode::IntentExclusive)
-                    .unwrap()
+                try_acquire_transaction_lock(&mut trx, data, LockMode::IntentExclusive).unwrap()
             );
-            assert!(
-                trx.cached_transaction_lock_covers(data, LockMode::IntentShared)
-                    .unwrap()
-            );
-            assert!(
-                trx.try_acquire_transaction_lock(data, LockMode::IntentShared)
-                    .unwrap()
-            );
+            assert!(cached_transaction_lock_covers(&trx, data, LockMode::IntentShared).unwrap());
+            assert!(try_acquire_transaction_lock(&mut trx, data, LockMode::IntentShared).unwrap());
             assert_eq!(lock_entry_count(&engine, owner), 1);
 
-            let err = trx
-                .try_acquire_transaction_lock(data, LockMode::Shared)
-                .unwrap_err();
+            let err = try_acquire_transaction_lock(&mut trx, data, LockMode::Shared).unwrap_err();
             assert_eq!(
                 err.operation_error(),
                 Some(OperationError::LockConversionNotSupported)
@@ -1868,19 +1884,18 @@ mod tests {
             assert_eq!(lock_entry_count(&engine, owner), 1);
 
             let metadata = LockResource::TableMetadata(91_221);
+            assert!(try_acquire_transaction_lock(&mut trx, metadata, LockMode::Shared).unwrap());
             assert!(
-                trx.try_acquire_transaction_lock(metadata, LockMode::Shared)
-                    .unwrap()
+                try_acquire(
+                    engine.lock_manager(),
+                    metadata,
+                    LockMode::Shared,
+                    LockOwner::Session(91_221)
+                )
+                .unwrap()
             );
-            assert!(
-                engine
-                    .lock_manager()
-                    .try_acquire(metadata, LockMode::Shared, LockOwner::Session(91_221))
-                    .unwrap()
-            );
-            let err = trx
-                .try_acquire_transaction_lock(metadata, LockMode::Exclusive)
-                .unwrap_err();
+            let err =
+                try_acquire_transaction_lock(&mut trx, metadata, LockMode::Exclusive).unwrap_err();
             assert_eq!(
                 err.operation_error(),
                 Some(OperationError::LockUpgradeWouldBlock)
@@ -1901,17 +1916,22 @@ mod tests {
 
             let mut session = engine.try_new_session().unwrap();
             let mut trx = session.try_begin_trx().unwrap().unwrap();
-            let owner = trx.lock_owner().unwrap();
-            trx.acquire_transaction_lock(LockResource::TableData(91_230), LockMode::IntentShared)
-                .await
-                .unwrap();
+            let owner = lock_owner(&trx).unwrap();
+            acquire_transaction_lock(
+                &mut trx,
+                LockResource::TableData(91_230),
+                LockMode::IntentShared,
+            )
+            .await
+            .unwrap();
             assert!(trx.readonly());
             assert_eq!(trx.commit().await.unwrap(), 0);
             assert_eq!(lock_entry_count(&engine, owner), 0);
 
             let mut trx = session.try_begin_trx().unwrap().unwrap();
-            let owner = trx.lock_owner().unwrap();
-            trx.acquire_transaction_lock(
+            let owner = lock_owner(&trx).unwrap();
+            acquire_transaction_lock(
+                &mut trx,
                 LockResource::TableData(91_231),
                 LockMode::IntentExclusive,
             )
@@ -1921,8 +1941,9 @@ mod tests {
             assert_eq!(lock_entry_count(&engine, owner), 0);
 
             let mut trx = session.try_begin_trx().unwrap().unwrap();
-            let owner = trx.lock_owner().unwrap();
-            trx.acquire_transaction_lock(
+            let owner = lock_owner(&trx).unwrap();
+            acquire_transaction_lock(
+                &mut trx,
                 LockResource::TableData(91_232),
                 LockMode::IntentExclusive,
             )
@@ -1940,8 +1961,9 @@ mod tests {
             let (_temp_dir, engine) = test_engine("redo_trx_lock_abort").await;
             let session_state = test_session_state(&engine);
             let mut trx = ActiveTrx::new(session_state, MIN_ACTIVE_TRX_ID + 55, 55, 0, 0);
-            let owner = trx.lock_owner().unwrap();
-            trx.acquire_transaction_lock(
+            let owner = lock_owner(&trx).unwrap();
+            acquire_transaction_lock(
+                &mut trx,
                 LockResource::TableData(91_240),
                 LockMode::IntentExclusive,
             )
