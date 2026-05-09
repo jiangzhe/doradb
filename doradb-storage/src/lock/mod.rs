@@ -396,6 +396,42 @@ impl LockManager {
         removed
     }
 
+    /// Releases `owner` on `resource` and fails every queued waiter.
+    ///
+    /// This is for resource invalidation, not ordinary unlock. A successful
+    /// `DROP TABLE` uses it so waiters queued behind the drop do not acquire
+    /// locks for a table that has just left the runtime catalog.
+    #[inline]
+    pub(crate) fn release_and_fail_waiters(
+        &self,
+        resource: LockResource,
+        owner: LockOwner,
+        error: OperationError,
+    ) -> usize {
+        let mut notify = Vec::new();
+        let mut removed = 0;
+        let remove_resource = {
+            if let Some(mut resource_state) = self.resources.get_mut(&resource) {
+                removed += resource_state.remove_granted(owner);
+                let failed_waiters = resource_state.drain_waiters();
+                removed += failed_waiters.len();
+                mark_waiters(&failed_waiters, WaitOutcome::Failed(error));
+                notify.extend(failed_waiters);
+                resource_state.is_empty()
+            } else {
+                false
+            }
+        };
+        if remove_resource {
+            self.resources
+                .remove_if(&resource, |_resource, resource_state| {
+                    resource_state.is_empty()
+                });
+        }
+        notify_waiters(notify);
+        removed
+    }
+
     /// Releases every granted lock and queued request owned by `owner`.
     ///
     /// This is the authoritative cleanup path for later statement, transaction,
@@ -478,6 +514,9 @@ impl LockManager {
                     return Err(waiter_released_err(resource, mode, owner));
                 }
                 WaitOutcome::Released => return Err(waiter_released_err(resource, mode, owner)),
+                WaitOutcome::Failed(error) => {
+                    return Err(waiter_failed_err(resource, mode, owner, error));
+                }
             }
         }
     }
@@ -705,6 +744,11 @@ impl ResourceState {
         }
         self.waiters = retained;
         removed
+    }
+
+    #[inline]
+    fn drain_waiters(&mut self) -> Vec<Arc<Waiter>> {
+        self.waiters.drain(..).collect()
     }
 
     #[inline]
@@ -944,6 +988,7 @@ enum WaitOutcome {
     Waiting,
     Granted,
     Released,
+    Failed(OperationError),
 }
 
 enum AcquireImmediate {
@@ -1171,6 +1216,20 @@ fn waiter_released_err(
     owner: LockOwner,
 ) -> crate::error::Error {
     Report::new(OperationError::LockWaiterReleased)
+        .attach(format!(
+            "resource={resource:?}, owner={owner:?}, mode={mode:?}"
+        ))
+        .into()
+}
+
+#[inline]
+fn waiter_failed_err(
+    resource: LockResource,
+    mode: LockMode,
+    owner: LockOwner,
+    error: OperationError,
+) -> crate::error::Error {
+    Report::new(error)
         .attach(format!(
             "resource={resource:?}, owner={owner:?}, mode={mode:?}"
         ))
@@ -1456,6 +1515,58 @@ mod tests {
             count_entries(&snapshot, second, LockDebugEntryState::Granted),
             1
         );
+    }
+
+    #[test]
+    fn release_and_fail_waiters_does_not_grant_queue() {
+        smol::block_on(async {
+            let manager = Arc::new(LockManager::new());
+            let resource = table_metadata(41);
+            assert!(
+                manager
+                    .try_acquire(resource, LockMode::Exclusive, trx(1))
+                    .unwrap()
+            );
+
+            let first_waiter = {
+                let manager = Arc::clone(&manager);
+                smol::spawn(
+                    async move { manager.acquire(resource, LockMode::Shared, trx(2)).await },
+                )
+            };
+            let second_waiter = {
+                let manager = Arc::clone(&manager);
+                smol::spawn(
+                    async move { manager.acquire(resource, LockMode::Shared, trx(3)).await },
+                )
+            };
+            wait_for_waiters(&manager, resource, 2).await;
+
+            assert_eq!(
+                manager.release_and_fail_waiters(resource, trx(1), OperationError::TableNotFound,),
+                3
+            );
+            for waiter in [first_waiter, second_waiter] {
+                let err = waiter.await.unwrap_err();
+                assert_eq!(err.operation_error(), Some(OperationError::TableNotFound));
+            }
+            assert_eq!(
+                count_entries(
+                    &manager.debug_snapshot(),
+                    resource,
+                    LockDebugEntryState::Granted,
+                ),
+                0
+            );
+            assert_eq!(
+                count_entries(
+                    &manager.debug_snapshot(),
+                    resource,
+                    LockDebugEntryState::Waiting,
+                ),
+                0
+            );
+        });
     }
 
     #[test]

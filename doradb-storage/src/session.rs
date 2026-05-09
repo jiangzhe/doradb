@@ -1,11 +1,13 @@
 use crate::buffer::page::VersionedPageID;
 use crate::buffer::{BufferPool, PoolGuards, PoolRole};
 use crate::catalog::{ColumnObject, IndexColumnObject, IndexObject, TableMetadata, TableObject};
-use crate::catalog::{IndexSpec, TableID, TableSpec};
+use crate::catalog::{IndexSpec, TableID, TableSpec, is_user_obj_id};
 use crate::engine::EngineRef;
-use crate::error::{OperationError, Result};
+use crate::error::{FatalError, InternalError, OperationError, Result};
 use crate::index::BlockIndex;
-use crate::lock::{FreshLockGuard, LockManager, LockMode, LockOwner, LockOwnerGroup, LockResource};
+use crate::lock::{
+    FreshLockGuard, LockGrant, LockManager, LockMode, LockOwner, LockOwnerGroup, LockResource,
+};
 use crate::row::RowID;
 use crate::table::Table;
 use crate::trx::redo::DDLRedo;
@@ -274,11 +276,70 @@ impl Session {
         Ok(table_id)
     }
 
+    /// Logically drop an existing user table.
+    #[inline]
+    pub async fn drop_table(&mut self, table_id: TableID) -> Result<()> {
+        if self.in_trx() {
+            return Err(Report::new(OperationError::NotSupported)
+                .attach("implicit commit due to DDL")
+                .into());
+        }
+
+        let engine = self.state.engine().clone();
+        let owner = LockOwner::Session(self.id());
+        let lock_manager = engine.lock_manager();
+        let _namespace_lock = self.acquire_catalog_namespace_lock(lock_manager).await?;
+
+        let table = self.validated_drop_table_target(&engine, table_id).await?;
+        reject_drop_table_explicit_session_lock(lock_manager, table_id, owner)?;
+        let mut table_locks = self
+            .acquire_drop_table_locks(lock_manager, table_id, owner)
+            .await?;
+        engine.trx_sys.ensure_runtime_healthy()?;
+
+        let mut trx = match self.try_begin_trx() {
+            Ok(Some(trx)) => trx,
+            Ok(None) => unreachable!("drop_table requires idle session"),
+            Err(err) => return Err(err),
+        };
+
+        if let Err(err) = table.begin_drop_lifecycle().await {
+            trx.rollback().await?;
+            return Err(err);
+        }
+
+        let metadata = table.metadata().clone();
+        let exec_res =
+            execute_drop_table_catalog_cascade(&engine, &mut trx, table_id, &metadata).await;
+        if let Err(_err) = exec_res {
+            // `trx.exec` may have already discarded the transaction after a
+            // fatal statement-rollback failure. In either case the drop gate
+            // has been crossed, so preserve the poison outcome below.
+            let _ = trx.rollback().await;
+            return Err(poison_drop_table_after_gate(&engine, table_id, "catalog cascade").into());
+        }
+
+        if let Err(_err) = trx.commit().await {
+            return Err(poison_drop_table_after_gate(&engine, table_id, "commit").into());
+        }
+
+        let res = finish_drop_table_runtime_removal(&engine, table_id, &table);
+        if res.is_ok() {
+            table_locks.fail_waiters_on_release(OperationError::TableNotFound);
+        }
+        res
+    }
+
     /// Acquires an explicit session-lifetime table lock.
     #[inline]
     pub async fn lock_table(&self, table_id: TableID, mode: LockMode) -> Result<()> {
         mode.validate_explicit_table_lock()?;
-        let lock_manager = self.state.engine().lock_manager();
+        let engine = self.state.engine().clone();
+        engine
+            .catalog()
+            .validate_user_table_live(table_id, "lock explicit table")
+            .await?;
+        let lock_manager = engine.lock_manager();
         let owner = LockOwner::Session(self.id());
         let owner_group = LockOwnerGroup::Session(self.id());
         let metadata_resource = LockResource::TableMetadata(table_id);
@@ -287,9 +348,18 @@ impl Session {
             .await?;
         let mut metadata_guard =
             FreshLockGuard::new(lock_manager, metadata_resource, owner, metadata_grant);
-        lock_manager
-            .acquire_grouped(LockResource::TableData(table_id), mode, owner, owner_group)
+        let data_resource = LockResource::TableData(table_id);
+        let data_grant = lock_manager
+            .acquire_grouped_with_grant(data_resource, mode, owner, owner_group)
             .await?;
+        let mut data_guard = FreshLockGuard::new(lock_manager, data_resource, owner, data_grant);
+        engine
+            .catalog()
+            .validate_user_table_live(table_id, "lock explicit table")
+            .await?;
+        if let Some(guard) = data_guard.as_mut() {
+            guard.disarm();
+        }
         if let Some(guard) = metadata_guard.as_mut() {
             guard.disarm();
         }
@@ -328,6 +398,100 @@ impl Session {
             owner,
         })
     }
+
+    async fn acquire_drop_table_locks<'a>(
+        &self,
+        lock_manager: &'a LockManager,
+        table_id: TableID,
+        owner: LockOwner,
+    ) -> Result<ScopedDropTableLocks<'a>> {
+        let owner_group = LockOwnerGroup::Session(self.id());
+        let metadata_resource = LockResource::TableMetadata(table_id);
+        let metadata_grant = lock_manager
+            .acquire_grouped_with_grant(metadata_resource, LockMode::Exclusive, owner, owner_group)
+            .await?;
+        let mut metadata_guard =
+            FreshLockGuard::new(lock_manager, metadata_resource, owner, metadata_grant);
+
+        let data_resource = LockResource::TableData(table_id);
+        let data_grant = lock_manager
+            .acquire_grouped_with_grant(data_resource, LockMode::Exclusive, owner, owner_group)
+            .await?;
+        if let Some(guard) = metadata_guard.as_mut() {
+            guard.disarm();
+        }
+
+        Ok(ScopedDropTableLocks {
+            lock_manager,
+            table_id,
+            owner,
+            metadata_fresh: metadata_grant == LockGrant::Fresh,
+            data_fresh: data_grant == LockGrant::Fresh,
+            fail_waiters: None,
+        })
+    }
+
+    async fn validated_drop_table_target(
+        &self,
+        engine: &EngineRef,
+        table_id: TableID,
+    ) -> Result<Arc<Table>> {
+        if !is_user_obj_id(table_id) {
+            return Err(Report::new(OperationError::TableNotFound)
+                .attach(format!(
+                    "drop table requires user table id: table_id={table_id}"
+                ))
+                .into());
+        }
+        let Some(table) = engine.catalog().get_table(table_id).await else {
+            return Err(Report::new(OperationError::TableNotFound)
+                .attach(format!("drop table runtime lookup: table_id={table_id}"))
+                .into());
+        };
+        if engine
+            .catalog()
+            .storage
+            .tables()
+            .find_uncommitted_by_id(self.pool_guards(), table_id)
+            .await?
+            .is_none()
+        {
+            return Err(Report::new(OperationError::TableNotFound)
+                .attach(format!("drop table catalog lookup: table_id={table_id}"))
+                .into());
+        }
+        Ok(table)
+    }
+}
+
+#[inline]
+fn reject_drop_table_explicit_session_lock(
+    lock_manager: &LockManager,
+    table_id: TableID,
+    owner: LockOwner,
+) -> Result<()> {
+    // `drop_table` uses the session owner for scoped DDL locks. If an explicit
+    // session table lock already exists, reusing that owner would become a
+    // same-owner conversion and scoped cleanup could not distinguish the DDL
+    // lock from the user-held session lock.
+    let metadata_locked = lock_manager.owner_holds(
+        LockResource::TableMetadata(table_id),
+        owner,
+        LockMode::Shared,
+    );
+    let data_locked = lock_manager.owner_holds(
+        LockResource::TableData(table_id),
+        owner,
+        LockMode::IntentShared,
+    );
+    if !metadata_locked && !data_locked {
+        return Ok(());
+    }
+    Err(Report::new(OperationError::LockOwnerGroupConflict)
+        .attach(format!(
+            "drop table while session owns explicit table lock: table_id={table_id}, owner={owner:?}"
+        ))
+        .into())
 }
 
 struct ScopedSessionLock<'a> {
@@ -341,6 +505,160 @@ impl Drop for ScopedSessionLock<'_> {
     fn drop(&mut self) {
         self.lock_manager.release(self.resource, self.owner);
     }
+}
+
+struct ScopedDropTableLocks<'a> {
+    lock_manager: &'a LockManager,
+    table_id: TableID,
+    owner: LockOwner,
+    metadata_fresh: bool,
+    data_fresh: bool,
+    fail_waiters: Option<OperationError>,
+}
+
+impl ScopedDropTableLocks<'_> {
+    #[inline]
+    fn fail_waiters_on_release(&mut self, error: OperationError) {
+        self.fail_waiters = Some(error);
+    }
+}
+
+impl Drop for ScopedDropTableLocks<'_> {
+    #[inline]
+    fn drop(&mut self) {
+        if self.data_fresh {
+            let resource = LockResource::TableData(self.table_id);
+            if let Some(error) = self.fail_waiters {
+                self.lock_manager
+                    .release_and_fail_waiters(resource, self.owner, error);
+            } else {
+                self.lock_manager.release(resource, self.owner);
+            }
+        }
+        if self.metadata_fresh {
+            let resource = LockResource::TableMetadata(self.table_id);
+            if let Some(error) = self.fail_waiters {
+                self.lock_manager
+                    .release_and_fail_waiters(resource, self.owner, error);
+            } else {
+                self.lock_manager.release(resource, self.owner);
+            }
+        }
+    }
+}
+
+#[inline]
+async fn execute_drop_table_catalog_cascade(
+    engine: &EngineRef,
+    trx: &mut ActiveTrx,
+    table_id: TableID,
+    metadata: &TableMetadata,
+) -> Result<()> {
+    trx.exec(async |stmt| {
+        let index_columns_deleted = engine
+            .catalog()
+            .storage
+            .index_columns()
+            .delete_by_table_id(stmt, table_id)
+            .await;
+        let indexes_deleted = engine
+            .catalog()
+            .storage
+            .indexes()
+            .delete_by_table_id(stmt, table_id)
+            .await;
+        let columns_deleted = engine
+            .catalog()
+            .storage
+            .columns()
+            .delete_by_table_id(stmt, table_id)
+            .await;
+        let table_deleted = engine
+            .catalog()
+            .storage
+            .tables()
+            .delete_by_id(stmt, table_id)
+            .await;
+        if !table_deleted {
+            return Err(Report::new(OperationError::TableNotFound)
+                .attach(format!("drop table catalog row: table_id={table_id}"))
+                .into());
+        }
+
+        validate_drop_catalog_delete_counts(
+            table_id,
+            metadata,
+            columns_deleted,
+            indexes_deleted,
+            index_columns_deleted,
+        )?;
+
+        let res = stmt
+            .effects_mut()
+            .set_ddl_redo(DDLRedo::DropTable(table_id));
+        debug_assert!(res.is_none());
+        Ok(())
+    })
+    .await
+}
+
+#[inline]
+fn validate_drop_catalog_delete_counts(
+    table_id: TableID,
+    metadata: &TableMetadata,
+    columns_deleted: usize,
+    indexes_deleted: usize,
+    index_columns_deleted: usize,
+) -> Result<()> {
+    let expected_index_columns = metadata
+        .index_specs
+        .iter()
+        .map(|spec| spec.index_cols.len())
+        .sum::<usize>();
+    if columns_deleted == metadata.col_count()
+        && indexes_deleted == metadata.index_specs.len()
+        && index_columns_deleted == expected_index_columns
+    {
+        return Ok(());
+    }
+    Err(Report::new(InternalError::Generic)
+        .attach(format!(
+            "drop table catalog cascade count mismatch: table_id={table_id}, columns_deleted={columns_deleted}, expected_columns={}, indexes_deleted={indexes_deleted}, expected_indexes={}, index_columns_deleted={index_columns_deleted}, expected_index_columns={expected_index_columns}",
+            metadata.col_count(),
+            metadata.index_specs.len(),
+        ))
+        .into())
+}
+
+#[inline]
+fn finish_drop_table_runtime_removal(
+    engine: &EngineRef,
+    table_id: TableID,
+    table: &Arc<Table>,
+) -> Result<()> {
+    if let Err(_err) = table.mark_dropped_lifecycle() {
+        return Err(poison_drop_table_after_gate(engine, table_id, "mark dropped").into());
+    }
+    match engine.catalog().remove_user_table(table_id) {
+        Some(removed) if Arc::ptr_eq(&removed, table) => Ok(()),
+        Some(_) | None => {
+            Err(poison_drop_table_after_gate(engine, table_id, "runtime removal").into())
+        }
+    }
+}
+
+#[inline]
+fn poison_drop_table_after_gate(
+    engine: &EngineRef,
+    table_id: TableID,
+    operation: &'static str,
+) -> Report<FatalError> {
+    engine
+        .trx_sys
+        .poison_storage(FatalError::Poisoned)
+        .attach(format!(
+            "drop table failed after lifecycle gate: table_id={table_id}, operation={operation}"
+        ))
 }
 
 /// Shared mutable state referenced by transactions started from one [`Session`].

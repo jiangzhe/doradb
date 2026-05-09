@@ -3,8 +3,9 @@ use crate::error::{ErrorKind, FatalError, Result};
 use crate::trx::TrxID;
 use crate::trx::log::{LogPartitionInitializer, list_log_files};
 use crate::trx::log_replay::LogMerger;
-use crate::trx::redo::{DDLRedo, RowRedoKind};
+use crate::trx::redo::{DDLRedo, RowRedoKind, TableDML};
 use crate::trx::sys::TransactionSystem;
+use std::collections::BTreeMap;
 
 /// One catalog-row redo operation extracted from persisted logs.
 pub struct CatalogRedoEntry {
@@ -136,24 +137,15 @@ impl Catalog {
             }
 
             if let Some(ddl) = redo.ddl.as_deref()
-                && let Some((table_id, ddl_kind)) = blocking_table_ddl(ddl)
+                && let Some(table_id) = drop_table_id(ddl)
                 && is_user_obj_id(table_id)
+                && !drop_table_has_catalog_table_delete(table_id, &redo.dml)
             {
-                let Some(table_replay_start_ts) = self.loaded_table_replay_start_ts(table_id)
-                else {
-                    batch.stop_reason = CatalogCheckpointScanStopReason::BlockedByTableDDL {
-                        table_id,
-                        ddl: ddl_kind,
-                    };
-                    break;
+                batch.stop_reason = CatalogCheckpointScanStopReason::BlockedByTableDDL {
+                    table_id,
+                    ddl: CatalogCheckpointBlockingDDL::DropTable,
                 };
-                if table_replay_start_ts <= header.cts {
-                    batch.stop_reason = CatalogCheckpointScanStopReason::BlockedByTableDDL {
-                        table_id,
-                        ddl: ddl_kind,
-                    };
-                    break;
-                }
+                break;
             }
 
             batch.safe_cts = header.cts;
@@ -181,9 +173,9 @@ impl Catalog {
 }
 
 #[inline]
-fn blocking_table_ddl(ddl: &DDLRedo) -> Option<(TableID, CatalogCheckpointBlockingDDL)> {
+fn drop_table_id(ddl: &DDLRedo) -> Option<TableID> {
     match ddl {
-        DDLRedo::DropTable(table_id) => Some((*table_id, CatalogCheckpointBlockingDDL::DropTable)),
+        DDLRedo::DropTable(table_id) => Some(*table_id),
         _ => None,
     }
 }
@@ -191,4 +183,21 @@ fn blocking_table_ddl(ddl: &DDLRedo) -> Option<(TableID, CatalogCheckpointBlocki
 #[inline]
 fn is_catalog_ddl(ddl: &DDLRedo) -> bool {
     matches!(ddl, DDLRedo::CreateTable(_) | DDLRedo::DropTable(_))
+}
+
+fn drop_table_has_catalog_table_delete(
+    table_id: TableID,
+    dml: &BTreeMap<TableID, TableDML>,
+) -> bool {
+    let Some(tables_dml) = dml.get(&0) else {
+        return false;
+    };
+    tables_dml.rows.values().any(|row| {
+        let RowRedoKind::DeleteByUniqueKey(key) = &row.kind else {
+            return false;
+        };
+        key.index_no == 0
+            && key.vals.len() == 1
+            && key.vals[0].as_u64().is_some_and(|id| id == table_id)
+    })
 }

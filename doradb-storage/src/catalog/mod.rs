@@ -298,6 +298,22 @@ impl Catalog {
             .map(|table| Arc::clone(table.value()))
     }
 
+    /// Validates that a user-table runtime exists and still admits foreground work.
+    #[inline]
+    pub(crate) async fn validate_user_table_live(
+        &self,
+        table_id: TableID,
+        operation: &'static str,
+    ) -> Result<Arc<Table>> {
+        let Some(table) = self.get_table(table_id).await else {
+            return Err(Report::new(OperationError::TableNotFound)
+                .attach(format!("operation={operation}, table_id={table_id}"))
+                .into());
+        };
+        table.check_foreground_live(operation)?;
+        Ok(table)
+    }
+
     /// Get a catalog-table runtime handle by table id.
     #[inline]
     pub fn get_catalog_table(&self, table_id: TableID) -> Option<Arc<CatalogTable>> {
@@ -322,16 +338,6 @@ impl Catalog {
     #[inline]
     pub fn meta_pool(&self) -> &FixedBufferPool {
         &self.storage.meta_pool
-    }
-
-    #[inline]
-    fn loaded_table_replay_start_ts(&self, table_id: TableID) -> Option<u64> {
-        self.user_tables.get(&table_id).map(|table| {
-            // `catalog_load_boundary`: replay floors are derived from loaded
-            // table roots during bootstrap/recovery bookkeeping.
-            let root = table.file().active_root_unchecked();
-            root.heap_redo_start_ts.min(root.deletion_cutoff_ts)
-        })
     }
 }
 

@@ -894,21 +894,47 @@ impl ActiveTrx {
     #[inline]
     pub async fn lock_table(&mut self, table_id: TableID, mode: LockMode) -> Result<()> {
         mode.validate_explicit_table_lock()?;
+        let engine = self.checked_engine("lock explicit table")?;
+        engine
+            .catalog()
+            .validate_user_table_live(table_id, "lock explicit table")
+            .await?;
         let lock_manager = self.checked_lock_manager("lock explicit table")?;
         let metadata_resource = LockResource::TableMetadata(table_id);
         let data_resource = LockResource::TableData(table_id);
         let owner = self.checked_lock_state("lock explicit table")?.owner();
+        let metadata_cached = self
+            .checked_lock_state("lock explicit table")?
+            .cached_covers(metadata_resource, LockMode::Shared)?;
+        let data_cached = self
+            .checked_lock_state("lock explicit table")?
+            .cached_covers(data_resource, mode)?;
         let metadata_grant = self
             .checked_lock_state("lock explicit table")?
             .acquire_uncached(&lock_manager, metadata_resource, LockMode::Shared)
             .await?;
         let mut metadata_guard =
             FreshLockGuard::new(&lock_manager, metadata_resource, owner, metadata_grant);
-        self.checked_lock_state_mut("lock explicit table")?
-            .acquire(&lock_manager, data_resource, mode)
+        let data_grant = self
+            .checked_lock_state("lock explicit table")?
+            .acquire_uncached(&lock_manager, data_resource, mode)
             .await?;
-        self.checked_lock_state_mut("lock explicit table")?
-            .cache_granted(metadata_resource, LockMode::Shared);
+        let mut data_guard = FreshLockGuard::new(&lock_manager, data_resource, owner, data_grant);
+        engine
+            .catalog()
+            .validate_user_table_live(table_id, "lock explicit table")
+            .await?;
+        if !data_cached {
+            self.checked_lock_state_mut("lock explicit table")?
+                .cache_granted(data_resource, mode);
+        }
+        if !metadata_cached {
+            self.checked_lock_state_mut("lock explicit table")?
+                .cache_granted(metadata_resource, LockMode::Shared);
+        }
+        if let Some(guard) = data_guard.as_mut() {
+            guard.disarm();
+        }
         if let Some(guard) = metadata_guard.as_mut() {
             guard.disarm();
         }

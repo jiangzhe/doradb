@@ -5,7 +5,8 @@ use crate::buffer::page::{PAGE_SIZE, PageID};
 use crate::buffer::{EvictableBufferPool, PoolGuards, PoolRole, test_frame_kind};
 use crate::catalog::tests::table4;
 use crate::catalog::{
-    ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexSpec, TableSpec,
+    CatalogCheckpointScanStopReason, ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey,
+    IndexSpec, TableSpec,
 };
 use crate::conf::{EngineConfig, EvictableBufferPoolConfig, FileSystemConfig, TrxSysConfig};
 use crate::engine::Engine;
@@ -40,7 +41,7 @@ use crate::trx::stmt::Statement;
 use crate::trx::undo::RowUndoKind;
 use crate::trx::ver_map::RowPageState;
 use crate::trx::{ActiveTrx, MAX_SNAPSHOT_TS, TrxID};
-use crate::value::Val;
+use crate::value::{Val, ValKind};
 use error_stack::Report;
 use std::cell::Cell;
 use std::fs::OpenOptions;
@@ -5663,6 +5664,617 @@ fn test_checkpoint_cancelled_when_table_dropping() {
 }
 
 #[test]
+fn test_drop_table_rejects_active_transaction() {
+    smol::block_on(async {
+        let sys = TestSys::new_lightweight_evictable().await;
+        let table_id = sys.table.table_id();
+        let mut session = sys.try_new_session().unwrap();
+        let trx = session.try_begin_trx().unwrap().unwrap();
+
+        let err = session.drop_table(table_id).await.unwrap_err();
+        assert_eq!(err.operation_error(), Some(OperationError::NotSupported));
+
+        trx.rollback().await.unwrap();
+        drop(session);
+        sys.clean_all();
+    });
+}
+
+#[test]
+fn test_drop_table_returns_not_found_for_missing_table() {
+    smol::block_on(async {
+        let sys = TestSys::new_lightweight_evictable().await;
+        let mut session = sys.try_new_session().unwrap();
+
+        let err = session.drop_table(0).await.unwrap_err();
+        assert_eq!(err.operation_error(), Some(OperationError::TableNotFound));
+
+        let missing_user_table_id = sys.table.table_id() + 1000;
+        let err = session.drop_table(missing_user_table_id).await.unwrap_err();
+        assert_eq!(err.operation_error(), Some(OperationError::TableNotFound));
+
+        drop(session);
+        sys.clean_all();
+    });
+}
+
+#[test]
+fn test_drop_table_rejects_same_session_explicit_table_lock() {
+    smol::block_on(async {
+        for mode in [LockMode::Shared, LockMode::Exclusive] {
+            let sys = TestSys::new_lightweight_evictable().await;
+            let table_id = sys.table.table_id();
+            let mut session = sys.try_new_session().unwrap();
+            let owner = LockOwner::Session(session.id());
+
+            session.lock_table(table_id, mode).await.unwrap();
+            let err = session.drop_table(table_id).await.unwrap_err();
+            assert_eq!(
+                err.operation_error(),
+                Some(OperationError::LockOwnerGroupConflict)
+            );
+
+            assert_eq!(sys.table.lifecycle_state(), TableLifecycleState::Live);
+            assert!(sys.engine.catalog().get_table(table_id).await.is_some());
+            assert!(!has_lock_resource(
+                &sys.engine,
+                owner,
+                LockResource::CatalogNamespace,
+            ));
+            assert!(has_lock_entry(
+                &sys.engine,
+                owner,
+                LockResource::TableMetadata(table_id),
+                LockMode::Shared,
+                LockDebugEntryState::Granted,
+            ));
+            assert!(has_lock_entry(
+                &sys.engine,
+                owner,
+                LockResource::TableData(table_id),
+                mode,
+                LockDebugEntryState::Granted,
+            ));
+
+            session.unlock_table(table_id).unwrap();
+            assert!(!has_lock_resource(
+                &sys.engine,
+                owner,
+                LockResource::TableMetadata(table_id),
+            ));
+            assert!(!has_lock_resource(
+                &sys.engine,
+                owner,
+                LockResource::TableData(table_id),
+            ));
+            session.drop_table(table_id).await.unwrap();
+
+            drop(session);
+            sys.clean_all();
+        }
+    });
+}
+
+#[test]
+fn test_drop_table_fails_waiting_session_table_lock() {
+    smol::block_on(async {
+        let sys = TestSys::new_lightweight_evictable().await;
+        let table_id = sys.table.table_id();
+        let publish_lease = sys.table.try_begin_checkpoint_publish().unwrap();
+        let mut drop_session = sys.try_new_session().unwrap();
+        let drop_owner = LockOwner::Session(drop_session.id());
+        let mut drop_fut = Box::pin(drop_session.drop_table(table_id));
+        assert!(matches!(
+            futures::poll!(drop_fut.as_mut()),
+            std::task::Poll::Pending
+        ));
+        assert!(has_lock_entry(
+            &sys.engine,
+            drop_owner,
+            LockResource::TableMetadata(table_id),
+            LockMode::Exclusive,
+            LockDebugEntryState::Granted,
+        ));
+
+        let lock_session = sys.try_new_session().unwrap();
+        let lock_owner = LockOwner::Session(lock_session.id());
+        let mut lock_fut = Box::pin(lock_session.lock_table(table_id, LockMode::Shared));
+        assert!(matches!(
+            futures::poll!(lock_fut.as_mut()),
+            std::task::Poll::Pending
+        ));
+        assert!(has_lock_entry(
+            &sys.engine,
+            lock_owner,
+            LockResource::TableMetadata(table_id),
+            LockMode::Shared,
+            LockDebugEntryState::Waiting,
+        ));
+
+        drop(publish_lease);
+        drop_fut.await.unwrap();
+        let err = lock_fut.await.unwrap_err();
+        assert_eq!(err.operation_error(), Some(OperationError::TableNotFound));
+        assert!(!has_lock_resource(
+            &sys.engine,
+            lock_owner,
+            LockResource::TableMetadata(table_id),
+        ));
+        assert!(!has_lock_resource(
+            &sys.engine,
+            lock_owner,
+            LockResource::TableData(table_id),
+        ));
+
+        drop(lock_session);
+        drop(drop_session);
+        sys.clean_all();
+    });
+}
+
+#[test]
+fn test_drop_table_fails_waiting_transaction_table_lock() {
+    smol::block_on(async {
+        let sys = TestSys::new_lightweight_evictable().await;
+        let table_id = sys.table.table_id();
+        let publish_lease = sys.table.try_begin_checkpoint_publish().unwrap();
+        let mut drop_session = sys.try_new_session().unwrap();
+        let drop_owner = LockOwner::Session(drop_session.id());
+        let mut drop_fut = Box::pin(drop_session.drop_table(table_id));
+        assert!(matches!(
+            futures::poll!(drop_fut.as_mut()),
+            std::task::Poll::Pending
+        ));
+        assert!(has_lock_entry(
+            &sys.engine,
+            drop_owner,
+            LockResource::TableMetadata(table_id),
+            LockMode::Exclusive,
+            LockDebugEntryState::Granted,
+        ));
+
+        let mut lock_session = sys.try_new_session().unwrap();
+        let mut trx = lock_session.try_begin_trx().unwrap().unwrap();
+        let lock_owner = trx.lock_owner().unwrap();
+        let mut lock_fut = Box::pin(trx.lock_table(table_id, LockMode::Exclusive));
+        assert!(matches!(
+            futures::poll!(lock_fut.as_mut()),
+            std::task::Poll::Pending
+        ));
+        assert!(has_lock_entry(
+            &sys.engine,
+            lock_owner,
+            LockResource::TableMetadata(table_id),
+            LockMode::Shared,
+            LockDebugEntryState::Waiting,
+        ));
+
+        drop(publish_lease);
+        drop_fut.await.unwrap();
+        let err = lock_fut.await.unwrap_err();
+        assert_eq!(err.operation_error(), Some(OperationError::TableNotFound));
+        assert!(!has_lock_resource(
+            &sys.engine,
+            lock_owner,
+            LockResource::TableMetadata(table_id),
+        ));
+        assert!(!has_lock_resource(
+            &sys.engine,
+            lock_owner,
+            LockResource::TableData(table_id),
+        ));
+
+        trx.rollback().await.unwrap();
+        drop(lock_session);
+        drop(drop_session);
+        sys.clean_all();
+    });
+}
+
+#[test]
+fn test_explicit_table_lock_after_drop_returns_not_found_without_locks() {
+    smol::block_on(async {
+        let sys = TestSys::new_lightweight_evictable().await;
+        let table_id = sys.table.table_id();
+        let mut drop_session = sys.try_new_session().unwrap();
+        drop_session.drop_table(table_id).await.unwrap();
+
+        let lock_session = sys.try_new_session().unwrap();
+        let session_owner = LockOwner::Session(lock_session.id());
+        let err = lock_session
+            .lock_table(table_id, LockMode::Shared)
+            .await
+            .unwrap_err();
+        assert_eq!(err.operation_error(), Some(OperationError::TableNotFound));
+        assert!(!has_lock_resource(
+            &sys.engine,
+            session_owner,
+            LockResource::TableMetadata(table_id),
+        ));
+        assert!(!has_lock_resource(
+            &sys.engine,
+            session_owner,
+            LockResource::TableData(table_id),
+        ));
+
+        let mut trx_session = sys.try_new_session().unwrap();
+        let mut trx = trx_session.try_begin_trx().unwrap().unwrap();
+        let trx_owner = trx.lock_owner().unwrap();
+        let err = trx
+            .lock_table(table_id, LockMode::Exclusive)
+            .await
+            .unwrap_err();
+        assert_eq!(err.operation_error(), Some(OperationError::TableNotFound));
+        assert!(!has_lock_resource(
+            &sys.engine,
+            trx_owner,
+            LockResource::TableMetadata(table_id),
+        ));
+        assert!(!has_lock_resource(
+            &sys.engine,
+            trx_owner,
+            LockResource::TableData(table_id),
+        ));
+        trx.rollback().await.unwrap();
+
+        drop(trx_session);
+        drop(lock_session);
+        drop(drop_session);
+        sys.clean_all();
+    });
+}
+
+#[test]
+fn test_drop_table_logical_cascade_and_stale_handles() {
+    smol::block_on(async {
+        let sys = TestSys::new_evictable_with_non_unique_name_index().await;
+        let table_id = sys.table.table_id();
+        let stale_table = Arc::clone(&sys.table);
+        let table_file_path = sys.engine.table_fs.table_file_path(table_id);
+        let mut session = sys.try_new_session().unwrap();
+        insert_one_row(
+            &stale_table,
+            &mut session,
+            vec![Val::from(1), Val::from("drop-me")],
+        )
+        .await;
+        let (other_spec, other_indexes) = drop_table_test_spec();
+        let other_table_id = session
+            .create_table(other_spec, other_indexes)
+            .await
+            .unwrap();
+        let owner = LockOwner::Session(session.id());
+
+        assert!(std::path::Path::new(&table_file_path).exists());
+        session.drop_table(table_id).await.unwrap();
+
+        assert_eq!(stale_table.lifecycle_state(), TableLifecycleState::Dropped);
+        assert!(!has_lock_resource(
+            &sys.engine,
+            owner,
+            LockResource::CatalogNamespace,
+        ));
+        assert!(!has_lock_resource(
+            &sys.engine,
+            owner,
+            LockResource::TableMetadata(table_id),
+        ));
+        assert!(!has_lock_resource(
+            &sys.engine,
+            owner,
+            LockResource::TableData(table_id),
+        ));
+        assert!(sys.engine.catalog().get_table(table_id).await.is_none());
+        assert!(
+            sys.engine
+                .catalog()
+                .storage
+                .tables()
+                .find_uncommitted_by_id(session.pool_guards(), table_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            sys.engine
+                .catalog()
+                .storage
+                .columns()
+                .list_uncommitted_by_table_id(session.pool_guards(), table_id)
+                .await
+                .is_empty()
+        );
+        assert!(
+            sys.engine
+                .catalog()
+                .storage
+                .indexes()
+                .list_uncommitted_by_table_id(session.pool_guards(), table_id)
+                .await
+                .is_empty()
+        );
+        assert!(
+            sys.engine
+                .catalog()
+                .storage
+                .index_columns()
+                .list_uncommitted_by_table_id(session.pool_guards(), table_id)
+                .await
+                .is_empty()
+        );
+        assert!(
+            sys.engine
+                .catalog()
+                .storage
+                .tables()
+                .find_uncommitted_by_id(session.pool_guards(), other_table_id)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            !sys.engine
+                .catalog()
+                .storage
+                .columns()
+                .list_uncommitted_by_table_id(session.pool_guards(), other_table_id)
+                .await
+                .is_empty()
+        );
+        assert!(std::path::Path::new(&table_file_path).exists());
+
+        let err = session.drop_table(table_id).await.unwrap_err();
+        assert_eq!(err.operation_error(), Some(OperationError::TableNotFound));
+
+        let mut stale_read = session.try_begin_trx().unwrap().unwrap();
+        let err = trx_select_row_mvcc(&mut stale_read, &stale_table, &single_key(1), &[0, 1])
+            .await
+            .unwrap_err();
+        assert_eq!(err.operation_error(), Some(OperationError::TableNotFound));
+        assert_eq!(stale_read.commit().await.unwrap(), 0);
+
+        let mut stale_write = session.try_begin_trx().unwrap().unwrap();
+        let err = trx_insert_row(
+            &mut stale_write,
+            &stale_table,
+            vec![Val::from(2), Val::from("blocked")],
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.operation_error(), Some(OperationError::TableNotFound));
+        assert!(stale_write.readonly());
+        assert_eq!(stale_write.commit().await.unwrap(), 0);
+
+        let (later_spec, later_indexes) = drop_table_test_spec();
+        let later_table_id = session
+            .create_table(later_spec, later_indexes)
+            .await
+            .unwrap();
+        assert!(later_table_id > table_id);
+        assert!(later_table_id > other_table_id);
+
+        drop(stale_table);
+        drop(session);
+        sys.clean_all();
+    });
+}
+
+#[test]
+fn test_drop_table_waits_for_active_metadata_reader() {
+    smol::block_on(async {
+        let sys = TestSys::new_lightweight_evictable().await;
+        let table_id = sys.table.table_id();
+        let mut reader_session = sys.try_new_session().unwrap();
+        let mut reader_trx = reader_session.try_begin_trx().unwrap().unwrap();
+        let (held_tx, held_rx) = flume::bounded(1);
+        let (release_tx, release_rx) = flume::bounded(1);
+        let mut reader_fut = Box::pin(reader_trx.exec(async |stmt| {
+            stmt.acquire_statement_lock(LockResource::TableMetadata(table_id), LockMode::Shared)
+                .await?;
+            held_tx.send_async(()).await.unwrap();
+            release_rx.recv_async().await.unwrap();
+            Ok(())
+        }));
+
+        loop {
+            if held_rx.try_recv().is_ok() {
+                break;
+            }
+            assert!(matches!(
+                futures::poll!(reader_fut.as_mut()),
+                std::task::Poll::Pending
+            ));
+        }
+
+        let mut drop_session = sys.try_new_session().unwrap();
+        let mut drop_fut = Box::pin(drop_session.drop_table(table_id));
+        assert!(matches!(
+            futures::poll!(drop_fut.as_mut()),
+            std::task::Poll::Pending
+        ));
+
+        release_tx.send_async(()).await.unwrap();
+        reader_fut.await.unwrap();
+        assert_eq!(reader_trx.commit().await.unwrap(), 0);
+        drop_fut.await.unwrap();
+
+        drop(drop_session);
+        drop(reader_session);
+        sys.clean_all();
+    });
+}
+
+#[test]
+fn test_drop_table_waits_for_active_table_writer() {
+    smol::block_on(async {
+        let sys = TestSys::new_lightweight_evictable().await;
+        let table_id = sys.table.table_id();
+        let mut writer_session = sys.try_new_session().unwrap();
+        let mut writer_trx = writer_session.try_begin_trx().unwrap().unwrap();
+        trx_insert_row(
+            &mut writer_trx,
+            &sys.table,
+            vec![Val::from(91), Val::from("writer")],
+        )
+        .await
+        .unwrap();
+
+        let mut drop_session = sys.try_new_session().unwrap();
+        let mut drop_fut = Box::pin(drop_session.drop_table(table_id));
+        assert!(matches!(
+            futures::poll!(drop_fut.as_mut()),
+            std::task::Poll::Pending
+        ));
+
+        assert!(writer_trx.commit().await.unwrap() > 0);
+        drop_fut.await.unwrap();
+
+        drop(drop_session);
+        drop(writer_session);
+        sys.clean_all();
+    });
+}
+
+#[test]
+fn test_catalog_checkpoint_scan_allows_runtime_removed_drop_table() {
+    smol::block_on(async {
+        let sys = TestSys::new_lightweight_evictable().await;
+        let table_id = sys.table.table_id();
+        let mut session = sys.try_new_session().unwrap();
+
+        session.drop_table(table_id).await.unwrap();
+        let batch = sys
+            .engine
+            .catalog()
+            .scan_checkpoint_batch(&sys.engine.trx_sys)
+            .unwrap();
+
+        assert_eq!(
+            batch.stop_reason,
+            CatalogCheckpointScanStopReason::ReachedDurableUpper
+        );
+        assert_eq!(batch.catalog_ddl_txn_count, 2);
+        assert!(batch.safe_cts >= batch.replay_start_ts);
+
+        drop(session);
+        sys.clean_all();
+    });
+}
+
+#[test]
+fn test_drop_table_recovery_keeps_table_live_without_committed_drop() {
+    smol::block_on(async {
+        let temp_dir = TempDir::new().unwrap();
+        let main_dir = temp_dir.path().to_path_buf();
+        let engine = lightweight_test_engine_config(main_dir.clone(), "drop_recover_uncommitted")
+            .build()
+            .await
+            .unwrap();
+        let mut session = engine.try_new_session().unwrap();
+        let (table_spec, index_specs) = drop_table_test_spec();
+        let table_id = session.create_table(table_spec, index_specs).await.unwrap();
+        let table = engine.catalog().get_table(table_id).await.unwrap();
+        table.begin_drop_lifecycle().await.unwrap();
+
+        drop(table);
+        drop(session);
+        drop(engine);
+
+        let engine = lightweight_test_engine_config(main_dir, "drop_recover_uncommitted")
+            .build()
+            .await
+            .unwrap();
+        assert!(engine.catalog().get_table(table_id).await.is_some());
+        drop(engine);
+        drop(temp_dir);
+    });
+}
+
+#[test]
+fn test_drop_table_recovery_replays_committed_drop_before_catalog_checkpoint() {
+    smol::block_on(async {
+        let temp_dir = TempDir::new().unwrap();
+        let main_dir = temp_dir.path().to_path_buf();
+        let engine = lightweight_test_engine_config(main_dir.clone(), "drop_recover_replay")
+            .build()
+            .await
+            .unwrap();
+        let mut session = engine.try_new_session().unwrap();
+        let (table_spec, index_specs) = drop_table_test_spec();
+        let table_id = session.create_table(table_spec, index_specs).await.unwrap();
+        let table_file_path = engine.table_fs.table_file_path(table_id);
+
+        session.drop_table(table_id).await.unwrap();
+        assert!(std::path::Path::new(&table_file_path).exists());
+
+        drop(session);
+        drop(engine);
+
+        let engine = lightweight_test_engine_config(main_dir, "drop_recover_replay")
+            .build()
+            .await
+            .unwrap();
+        assert!(engine.catalog().get_table(table_id).await.is_none());
+        assert!(std::path::Path::new(&table_file_path).exists());
+        drop(engine);
+        drop(temp_dir);
+    });
+}
+
+#[test]
+fn test_drop_table_catalog_checkpoint_persists_absence_with_leftover_file() {
+    smol::block_on(async {
+        let temp_dir = TempDir::new().unwrap();
+        let main_dir = temp_dir.path().to_path_buf();
+        let engine = lightweight_test_engine_config(main_dir.clone(), "drop_recover_absence")
+            .build()
+            .await
+            .unwrap();
+        let mut session = engine.try_new_session().unwrap();
+        let (table_spec, index_specs) = drop_table_test_spec();
+        let table_id = session.create_table(table_spec, index_specs).await.unwrap();
+        let table = engine.catalog().get_table(table_id).await.unwrap();
+        insert_one_row(
+            &table,
+            &mut session,
+            vec![Val::from(7), Val::from("checkpoint-covered")],
+        )
+        .await;
+        let table_file_path = engine.table_fs.table_file_path(table_id);
+
+        session.drop_table(table_id).await.unwrap();
+        engine
+            .catalog()
+            .checkpoint_now(&engine.trx_sys)
+            .await
+            .unwrap();
+        assert!(
+            engine
+                .catalog()
+                .storage
+                .checkpoint_snapshot()
+                .unwrap()
+                .catalog_replay_start_ts
+                > 1
+        );
+        assert!(std::path::Path::new(&table_file_path).exists());
+
+        drop(table);
+        drop(session);
+        drop(engine);
+
+        let engine = lightweight_test_engine_config(main_dir, "drop_recover_absence")
+            .build()
+            .await
+            .unwrap();
+        assert!(engine.catalog().get_table(table_id).await.is_none());
+        assert!(std::path::Path::new(&table_file_path).exists());
+        drop(engine);
+        drop(temp_dir);
+    });
+}
+
+#[test]
 fn test_checkpoint_publish_write_failure_poisons_storage() {
     smol::block_on(async {
         let sys = TestSys::new_lightweight_evictable().await;
@@ -7044,6 +7656,23 @@ fn single_key<V: Into<Val>>(value: V) -> SelectKey {
         index_no: 0,
         vals: vec![value.into()],
     }
+}
+
+fn drop_table_test_spec() -> (TableSpec, Vec<IndexSpec>) {
+    (
+        TableSpec::new(vec![
+            ColumnSpec::new("id", ValKind::I32, ColumnAttributes::empty()),
+            ColumnSpec::new("name", ValKind::VarByte, ColumnAttributes::empty()),
+        ]),
+        vec![
+            IndexSpec::new("idx_drop_id", vec![IndexKey::new(0)], IndexAttributes::PK),
+            IndexSpec::new(
+                "idx_drop_name",
+                vec![IndexKey::new(1)],
+                IndexAttributes::empty(),
+            ),
+        ],
+    )
 }
 
 fn lock_entry_count(engine: &Engine, owner: LockOwner) -> usize {
