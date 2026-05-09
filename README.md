@@ -8,13 +8,9 @@ It is work in progress.
 
 ## Goal
 
-The original goal is to build a complete relational database, compatible with MySQL.
+Build a modern and fast storage engine.
 
-After coding about 70k lines of Rust, I have to admit it's really too ambitious to achieve as a single-person project.
-
-Current goal is to build a modern and fast storage engine, which is probably achievable. I also want it to be useful (not just a toy) after major features are done.
-
-The storage engine is designed as a hybrid engine with both in-memory row store and on-disk column store, and have full transactional support across all data.
+The storage engine is designed as a hybrid engine managing both in-memory row store and on-disk column store, with full transactional support across all data.
 
 ## Design 
 
@@ -45,7 +41,6 @@ I'm glad to have discussions if someone is interested in details.
 - [latch](./doradb-storage/src/latch): Async latch primitives including Mutex, RWLock and HybridLatch(enhanced RWLock with optimistic mode).
 - [lwc](./doradb-storage/src/lwc): LightWeight Columnar format for on-disk warm data.
 - [row](./doradb-storage/src/row): In-memory row store and operations.
-- [stmt](./doradb-storage/src/stmt): Statements.
 - [table](./doradb-storage/src/table): Table of data, composite of block index, secondary index, buffer pool and table file. Support operations like index lookup, index scan, table scan, insert, delete, update, etc.
 - [trx](./doradb-storage/src/trx): Transaction system, including transaction lifecycle, redo log, undo log, recovery, garbage collect, etc.
 
