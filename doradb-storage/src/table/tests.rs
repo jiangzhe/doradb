@@ -28,7 +28,8 @@ use crate::io::{
     install_storage_backend_test_hook,
 };
 use crate::latch::LatchFallbackMode;
-use crate::lock::{LockDebugEntryState, LockMode, LockOwner, LockResource};
+use crate::lock::tests::{LockDebugEntryState, debug_snapshot, try_acquire};
+use crate::lock::{LockMode, LockOwner, LockResource};
 use crate::row::ops::{DeleteMvcc, SelectKey, SelectMvcc, UpdateCol, UpdateMvcc};
 use crate::row::{RowID, RowPage, RowRead};
 use crate::session::Session;
@@ -38,6 +39,8 @@ use crate::table::{
 };
 use crate::trx::row::LockRowForWrite;
 use crate::trx::stmt::Statement;
+use crate::trx::stmt::tests as stmt_tests;
+use crate::trx::tests as trx_tests;
 use crate::trx::undo::RowUndoKind;
 use crate::trx::ver_map::RowPageState;
 use crate::trx::{ActiveTrx, MAX_SNAPSHOT_TS, TrxID};
@@ -1738,7 +1741,7 @@ fn test_trx_read_proof_root_snapshot_captures_active_root() {
 
         let mut trx = session.try_begin_trx().unwrap().unwrap();
         trx.exec(async |stmt| {
-            let (ctx, effects) = stmt.ctx_and_effects_mut();
+            let (ctx, effects) = stmt_tests::ctx_and_effects_mut(stmt);
             let proof = ctx.read_proof();
             let snapshot = sys.table.root_snapshot(&proof).unwrap();
             let _effects_addr = effects as *mut _;
@@ -4126,7 +4129,7 @@ fn test_row_page_transition_retries_update_delete() {
         let res: Result<()> = trx
             .exec(async |stmt| {
                 stmt.acquire_table_write_locks(sys.table.table_id()).await?;
-                let (ctx, effects) = stmt.ctx_and_effects_mut();
+                let (ctx, effects) = stmt_tests::ctx_and_effects_mut(stmt);
                 let insert_res = sys.table.accessor().insert_row_to_page(
                     ctx,
                     effects,
@@ -4176,7 +4179,7 @@ fn test_row_page_transition_retries_update_delete() {
         let res: Result<()> = trx
             .exec(async |stmt| {
                 stmt.acquire_table_write_locks(sys.table.table_id()).await?;
-                let (ctx, effects) = stmt.ctx_and_effects_mut();
+                let (ctx, effects) = stmt_tests::ctx_and_effects_mut(stmt);
                 let res = sys
                     .table
                     .accessor()
@@ -4681,7 +4684,7 @@ fn test_statement_read_takes_metadata_lock_only() {
         let stmt_owner = Cell::new(None);
         let mut trx = session.try_begin_trx().unwrap().unwrap();
         trx.exec(async |stmt| {
-            let owner = stmt.lock_owner();
+            let owner = stmt_tests::lock_owner(stmt);
             stmt_owner.set(Some(owner));
             let selected = stmt
                 .table_lookup_unique_mvcc(&sys.table, &single_key(0i32), &[0, 1])
@@ -4722,7 +4725,7 @@ fn test_statement_write_locks_are_transaction_owned_and_cached() {
         let mut session = sys.engine.try_new_session().unwrap();
         let table_id = sys.table.table_id();
         let mut trx = session.try_begin_trx().unwrap().unwrap();
-        let owner = trx.lock_owner().unwrap();
+        let owner = trx_tests::lock_owner(&trx).unwrap();
 
         trx.exec(async |stmt| {
             stmt.table_insert_mvcc(&sys.table, vec![Val::from(10i32), Val::from("a")])
@@ -4767,10 +4770,13 @@ fn test_create_table_waits_on_catalog_namespace_lock() {
         let sys = TestSys::new_evictable().await;
         let blocker = LockOwner::Session(91_400);
         assert!(
-            sys.engine
-                .lock_manager()
-                .try_acquire(LockResource::CatalogNamespace, LockMode::Exclusive, blocker,)
-                .unwrap()
+            try_acquire(
+                sys.engine.lock_manager(),
+                LockResource::CatalogNamespace,
+                LockMode::Exclusive,
+                blocker,
+            )
+            .unwrap()
         );
 
         let mut session = sys.engine.try_new_session().unwrap();
@@ -4840,7 +4846,7 @@ fn test_transaction_shared_table_lock_blocks_external_row_writer() {
         let table_id = sys.table.table_id();
         let mut session = sys.engine.try_new_session().unwrap();
         let mut trx = session.try_begin_trx().unwrap().unwrap();
-        let owner = trx.lock_owner().unwrap();
+        let owner = trx_tests::lock_owner(&trx).unwrap();
 
         trx.lock_table(table_id, LockMode::Shared).await.unwrap();
         assert!(has_lock_entry(
@@ -4865,7 +4871,7 @@ fn test_transaction_shared_table_lock_blocks_external_row_writer() {
             let mut writer_session = engine_ref.try_new_session().unwrap();
             let mut writer_trx = writer_session.try_begin_trx().unwrap().unwrap();
             owner_tx
-                .send_async(writer_trx.lock_owner().unwrap())
+                .send_async(trx_tests::lock_owner(&writer_trx).unwrap())
                 .await
                 .unwrap();
             trx_insert_row(
@@ -4899,7 +4905,7 @@ fn test_transaction_exclusive_table_lock_uses_cache_and_releases_on_commit() {
         let table_id = sys.table.table_id();
         let mut session = sys.engine.try_new_session().unwrap();
         let mut trx = session.try_begin_trx().unwrap().unwrap();
-        let owner = trx.lock_owner().unwrap();
+        let owner = trx_tests::lock_owner(&trx).unwrap();
 
         trx.lock_table(table_id, LockMode::Exclusive).await.unwrap();
         trx.lock_table(table_id, LockMode::Shared).await.unwrap();
@@ -4967,7 +4973,7 @@ fn test_session_shared_table_lock_allows_reads_but_rejects_same_session_writes()
         );
         assert!(!has_lock_entry(
             &sys.engine,
-            write_trx.lock_owner().unwrap(),
+            trx_tests::lock_owner(&write_trx).unwrap(),
             LockResource::TableData(table_id),
             LockMode::IntentExclusive,
             LockDebugEntryState::Waiting,
@@ -5025,14 +5031,13 @@ fn test_session_table_lock_cancellation_releases_fresh_metadata() {
         let table_id = sys.table.table_id();
         let blocker = LockOwner::Transaction(91_301);
         assert!(
-            sys.engine
-                .lock_manager()
-                .try_acquire(
-                    LockResource::TableData(table_id),
-                    LockMode::Exclusive,
-                    blocker,
-                )
-                .unwrap()
+            try_acquire(
+                sys.engine.lock_manager(),
+                LockResource::TableData(table_id),
+                LockMode::Exclusive,
+                blocker,
+            )
+            .unwrap()
         );
 
         let session = sys.engine.try_new_session().unwrap();
@@ -5091,7 +5096,7 @@ fn test_transaction_table_lock_failure_releases_fresh_metadata() {
             .await
             .unwrap();
         let mut trx = session.try_begin_trx().unwrap().unwrap();
-        let trx_owner = trx.lock_owner().unwrap();
+        let trx_owner = trx_tests::lock_owner(&trx).unwrap();
 
         let err = trx
             .lock_table(table_id, LockMode::Exclusive)
@@ -5107,7 +5112,8 @@ fn test_transaction_table_lock_failure_releases_fresh_metadata() {
             LockResource::TableMetadata(table_id),
         ));
         assert!(
-            !trx.cached_transaction_lock_covers(
+            !trx_tests::cached_transaction_lock_covers(
+                &trx,
                 LockResource::TableMetadata(table_id),
                 LockMode::Shared
             )
@@ -5131,19 +5137,18 @@ fn test_transaction_table_lock_cancellation_releases_fresh_metadata() {
         let table_id = sys.table.table_id();
         let blocker = LockOwner::Transaction(91_302);
         assert!(
-            sys.engine
-                .lock_manager()
-                .try_acquire(
-                    LockResource::TableData(table_id),
-                    LockMode::Exclusive,
-                    blocker,
-                )
-                .unwrap()
+            try_acquire(
+                sys.engine.lock_manager(),
+                LockResource::TableData(table_id),
+                LockMode::Exclusive,
+                blocker,
+            )
+            .unwrap()
         );
 
         let mut session = sys.engine.try_new_session().unwrap();
         let mut trx = session.try_begin_trx().unwrap().unwrap();
-        let trx_owner = trx.lock_owner().unwrap();
+        let trx_owner = trx_tests::lock_owner(&trx).unwrap();
         let mut lock_fut = Box::pin(trx.lock_table(table_id, LockMode::Shared));
         assert!(matches!(
             futures::poll!(lock_fut.as_mut()),
@@ -5173,7 +5178,8 @@ fn test_transaction_table_lock_cancellation_releases_fresh_metadata() {
         .await;
         wait_for_no_lock_resource(&sys.engine, trx_owner, LockResource::TableData(table_id)).await;
         assert!(
-            !trx.cached_transaction_lock_covers(
+            !trx_tests::cached_transaction_lock_covers(
+                &trx,
                 LockResource::TableMetadata(table_id),
                 LockMode::Shared
             )
@@ -5208,7 +5214,7 @@ fn test_session_exclusive_table_lock_covers_same_session_writer() {
             let mut writer_session = engine_ref.try_new_session().unwrap();
             let mut writer_trx = writer_session.try_begin_trx().unwrap().unwrap();
             owner_tx
-                .send_async(writer_trx.lock_owner().unwrap())
+                .send_async(trx_tests::lock_owner(&writer_trx).unwrap())
                 .await
                 .unwrap();
             trx_insert_row(
@@ -5231,7 +5237,7 @@ fn test_session_exclusive_table_lock_covers_same_session_writer() {
         .await;
 
         let mut same_session_trx = session.try_begin_trx().unwrap().unwrap();
-        let same_session_owner = same_session_trx.lock_owner().unwrap();
+        let same_session_owner = trx_tests::lock_owner(&same_session_trx).unwrap();
         trx_insert_row(
             &mut same_session_trx,
             &sys.table,
@@ -5474,7 +5480,7 @@ fn test_transition_captures_uncommitted_lock_into_deletion_buffer() {
                     .await
                     .unwrap();
                 stmt.acquire_table_write_locks(sys.table.table_id()).await?;
-                let (ctx, effects) = stmt.ctx_and_effects_mut();
+                let (ctx, effects) = stmt_tests::ctx_and_effects_mut(stmt);
                 let mut lock_row = sys
                     .table
                     .accessor()
@@ -5626,7 +5632,7 @@ fn test_table_drop_gate_waits_for_checkpoint_publish_lease() {
             futures::poll!(drop_fut.as_mut()),
             std::task::Poll::Pending
         ));
-        assert_eq!(sys.table.lifecycle_state(), TableLifecycleState::Live);
+        assert_eq!(sys.table.lifecycle.state(), TableLifecycleState::Live);
         match sys.table.try_begin_checkpoint_publish() {
             Ok(_lease) => panic!("publish lease should be blocked by drop gate"),
             Err(reason) => assert_eq!(reason, CheckpointCancelReason::TableDropping),
@@ -5634,7 +5640,7 @@ fn test_table_drop_gate_waits_for_checkpoint_publish_lease() {
 
         drop(publish_lease);
         drop_fut.await.unwrap();
-        assert_eq!(sys.table.lifecycle_state(), TableLifecycleState::Dropping);
+        assert_eq!(sys.table.lifecycle.state(), TableLifecycleState::Dropping);
 
         sys.clean_all();
     });
@@ -5714,7 +5720,7 @@ fn test_drop_table_rejects_same_session_explicit_table_lock() {
                 Some(OperationError::LockOwnerGroupConflict)
             );
 
-            assert_eq!(sys.table.lifecycle_state(), TableLifecycleState::Live);
+            assert_eq!(sys.table.lifecycle.state(), TableLifecycleState::Live);
             assert!(sys.engine.catalog().get_table(table_id).await.is_some());
             assert!(!has_lock_resource(
                 &sys.engine,
@@ -5835,7 +5841,7 @@ fn test_drop_table_fails_waiting_transaction_table_lock() {
 
         let mut lock_session = sys.try_new_session().unwrap();
         let mut trx = lock_session.try_begin_trx().unwrap().unwrap();
-        let lock_owner = trx.lock_owner().unwrap();
+        let lock_owner = trx_tests::lock_owner(&trx).unwrap();
         let mut lock_fut = Box::pin(trx.lock_table(table_id, LockMode::Exclusive));
         assert!(matches!(
             futures::poll!(lock_fut.as_mut()),
@@ -5899,7 +5905,7 @@ fn test_explicit_table_lock_after_drop_returns_not_found_without_locks() {
 
         let mut trx_session = sys.try_new_session().unwrap();
         let mut trx = trx_session.try_begin_trx().unwrap().unwrap();
-        let trx_owner = trx.lock_owner().unwrap();
+        let trx_owner = trx_tests::lock_owner(&trx).unwrap();
         let err = trx
             .lock_table(table_id, LockMode::Exclusive)
             .await
@@ -5948,7 +5954,7 @@ fn test_drop_table_logical_cascade_and_stale_handles() {
         assert!(std::path::Path::new(&table_file_path).exists());
         session.drop_table(table_id).await.unwrap();
 
-        assert_eq!(stale_table.lifecycle_state(), TableLifecycleState::Dropped);
+        assert_eq!(stale_table.lifecycle.state(), TableLifecycleState::Dropped);
         assert!(!has_lock_resource(
             &sys.engine,
             owner,
@@ -6069,8 +6075,12 @@ fn test_drop_table_waits_for_active_metadata_reader() {
         let (held_tx, held_rx) = flume::bounded(1);
         let (release_tx, release_rx) = flume::bounded(1);
         let mut reader_fut = Box::pin(reader_trx.exec(async |stmt| {
-            stmt.acquire_statement_lock(LockResource::TableMetadata(table_id), LockMode::Shared)
-                .await?;
+            stmt_tests::acquire_statement_lock(
+                stmt,
+                LockResource::TableMetadata(table_id),
+                LockMode::Shared,
+            )
+            .await?;
             held_tx.send_async(()).await.unwrap();
             release_rx.recv_async().await.unwrap();
             Ok(())
@@ -7676,9 +7686,7 @@ fn drop_table_test_spec() -> (TableSpec, Vec<IndexSpec>) {
 }
 
 fn lock_entry_count(engine: &Engine, owner: LockOwner) -> usize {
-    engine
-        .lock_manager()
-        .debug_snapshot()
+    debug_snapshot(engine.lock_manager())
         .entries
         .iter()
         .filter(|entry| entry.owner == owner)
@@ -7692,9 +7700,7 @@ fn has_lock_entry(
     mode: LockMode,
     state: LockDebugEntryState,
 ) -> bool {
-    engine
-        .lock_manager()
-        .debug_snapshot()
+    debug_snapshot(engine.lock_manager())
         .entries
         .iter()
         .any(|entry| {
@@ -7706,9 +7712,7 @@ fn has_lock_entry(
 }
 
 fn has_lock_resource(engine: &Engine, owner: LockOwner, resource: LockResource) -> bool {
-    engine
-        .lock_manager()
-        .debug_snapshot()
+    debug_snapshot(engine.lock_manager())
         .entries
         .iter()
         .any(|entry| entry.owner == owner && entry.resource == resource)

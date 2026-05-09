@@ -405,6 +405,7 @@ mod tests {
     use crate::conf::{EngineConfig, EvictableBufferPoolConfig, FileSystemConfig, TrxSysConfig};
     use crate::error::{ConfigError, ErrorKind, LifecycleError, OperationError, ResourceError};
     use crate::file::fs::tests::io_backend_stats_handle_identity as fs_stats_handle_identity;
+    use crate::lock::tests::{debug_snapshot, try_acquire};
     use crate::lock::{LockMode, LockOwner, LockResource};
     use std::fs;
     use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -469,23 +470,26 @@ mod tests {
             let owner = LockOwner::Session(10);
 
             assert!(
-                engine
-                    .lock_manager()
-                    .try_acquire(resource, LockMode::Exclusive, owner)
-                    .unwrap()
+                try_acquire(engine.lock_manager(), resource, LockMode::Exclusive, owner).unwrap()
             );
             assert!(
-                !engine_ref
-                    .lock_manager()
-                    .try_acquire(resource, LockMode::Shared, LockOwner::Session(11))
-                    .unwrap()
+                !try_acquire(
+                    engine_ref.lock_manager(),
+                    resource,
+                    LockMode::Shared,
+                    LockOwner::Session(11)
+                )
+                .unwrap()
             );
             assert_eq!(engine_ref.lock_manager().release_owner(owner), 1);
             assert!(
-                engine
-                    .lock_manager()
-                    .try_acquire(resource, LockMode::Shared, LockOwner::Session(11))
-                    .unwrap()
+                try_acquire(
+                    engine.lock_manager(),
+                    resource,
+                    LockMode::Shared,
+                    LockOwner::Session(11)
+                )
+                .unwrap()
             );
         });
     }
@@ -499,22 +503,24 @@ mod tests {
             let resource = LockResource::TableData(91_200);
 
             assert!(
-                engine
-                    .lock_manager()
-                    .try_acquire(
-                        resource,
-                        LockMode::Exclusive,
-                        LockOwner::Session(session.id())
-                    )
-                    .unwrap()
+                try_acquire(
+                    engine.lock_manager(),
+                    resource,
+                    LockMode::Exclusive,
+                    LockOwner::Session(session.id())
+                )
+                .unwrap()
             );
             drop(session);
 
             assert!(
-                engine
-                    .lock_manager()
-                    .try_acquire(resource, LockMode::Shared, LockOwner::Session(91_201))
-                    .unwrap()
+                try_acquire(
+                    engine.lock_manager(),
+                    resource,
+                    LockMode::Shared,
+                    LockOwner::Session(91_201)
+                )
+                .unwrap()
             );
         });
     }
@@ -527,10 +533,13 @@ mod tests {
             let resource = LockResource::TableMetadata(91_202);
             let blocking_owner = LockOwner::Session(91_203);
             assert!(
-                engine
-                    .lock_manager()
-                    .try_acquire(resource, LockMode::Exclusive, blocking_owner)
-                    .unwrap()
+                try_acquire(
+                    engine.lock_manager(),
+                    resource,
+                    LockMode::Exclusive,
+                    blocking_owner
+                )
+                .unwrap()
             );
 
             let session = engine.try_new_session().unwrap();
@@ -544,9 +553,7 @@ mod tests {
 
             let mut waiter_seen = false;
             for _ in 0..100 {
-                waiter_seen = engine
-                    .lock_manager()
-                    .debug_snapshot()
+                waiter_seen = debug_snapshot(engine.lock_manager())
                     .entries
                     .iter()
                     .any(|entry| entry.owner == waiting_owner);

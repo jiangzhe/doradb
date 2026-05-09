@@ -267,29 +267,9 @@ impl<'stmt> Statement<'stmt> {
         &mut self.effects
     }
 
-    /// Returns the statement-owned logical lock owner.
-    #[inline]
-    #[allow(dead_code)]
-    pub(crate) fn lock_owner(&self) -> LockOwner {
-        self.stmt_locks.owner()
-    }
-
-    /// Attempts to acquire a statement-owned logical lock without waiting.
-    #[inline]
-    #[allow(dead_code)]
-    pub(crate) fn try_acquire_statement_lock(
-        &mut self,
-        resource: LockResource,
-        mode: LockMode,
-    ) -> Result<bool> {
-        self.stmt_locks
-            .try_acquire(&self.lock_manager, resource, mode)
-    }
-
     /// Acquires a statement-owned logical lock.
     #[inline]
-    #[allow(dead_code)]
-    pub(crate) async fn acquire_statement_lock(
+    async fn acquire_statement_lock(
         &mut self,
         resource: LockResource,
         mode: LockMode,
@@ -501,13 +481,6 @@ impl<'stmt> Statement<'stmt> {
         self.effects.clear_redo();
         Ok(())
     }
-
-    /// Returns disjoint transaction context and statement effects references.
-    #[inline]
-    #[allow(dead_code)]
-    pub(crate) fn ctx_and_effects_mut(&mut self) -> (&TrxContext, &mut StmtEffects) {
-        (self.ctx, &mut self.effects)
-    }
 }
 
 impl Drop for Statement<'_> {
@@ -518,12 +491,13 @@ impl Drop for Statement<'_> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::buffer::PoolRole;
     use crate::conf::{EngineConfig, EvictableBufferPoolConfig, TrxSysConfig};
     use crate::engine::Engine;
     use crate::error::{FatalError, InternalError, OperationError};
+    use crate::lock::tests::{debug_snapshot, try_acquire, try_acquire_grouped};
     use crate::session::SessionState;
     use crate::trx::undo::{OwnedRowUndo, RowUndoKind};
     use crate::trx::{ActiveTrx, MIN_ACTIVE_TRX_ID, TrxID};
@@ -542,6 +516,82 @@ mod tests {
 
     pub(super) fn test_force_stmt_index_rollback_error_enabled() -> bool {
         TEST_FORCE_STMT_INDEX_ROLLBACK_ERROR.with(|flag| flag.get())
+    }
+
+    #[inline]
+    pub(crate) fn lock_owner(stmt: &Statement<'_>) -> LockOwner {
+        stmt.stmt_locks.owner()
+    }
+
+    #[inline]
+    pub(crate) fn try_acquire_statement_lock(
+        stmt: &mut Statement<'_>,
+        resource: LockResource,
+        mode: LockMode,
+    ) -> Result<bool> {
+        try_acquire_owner_lock_state(&mut stmt.stmt_locks, &stmt.lock_manager, resource, mode)
+    }
+
+    #[inline]
+    pub(crate) async fn acquire_statement_lock(
+        stmt: &mut Statement<'_>,
+        resource: LockResource,
+        mode: LockMode,
+    ) -> Result<()> {
+        stmt.stmt_locks
+            .acquire(&stmt.lock_manager, resource, mode)
+            .await
+    }
+
+    #[inline]
+    pub(crate) fn ctx_and_effects_mut<'stmt, 'borrow>(
+        stmt: &'borrow mut Statement<'stmt>,
+    ) -> (&'stmt TrxContext, &'borrow mut StmtEffects) {
+        (stmt.ctx, &mut stmt.effects)
+    }
+
+    #[inline]
+    fn trx_lock_owner(trx: &ActiveTrx) -> Result<LockOwner> {
+        Ok(trx
+            .checked_lock_state("read transaction lock owner")?
+            .owner())
+    }
+
+    #[inline]
+    fn try_acquire_transaction_lock(
+        trx: &mut ActiveTrx,
+        resource: LockResource,
+        mode: LockMode,
+    ) -> Result<bool> {
+        let lock_manager = trx.checked_lock_manager("try acquire transaction lock")?;
+        try_acquire_owner_lock_state(
+            trx.checked_lock_state_mut("try acquire transaction lock")?,
+            &lock_manager,
+            resource,
+            mode,
+        )
+    }
+
+    #[inline]
+    fn try_acquire_owner_lock_state(
+        lock_state: &mut OwnerLockState,
+        lock_manager: &LockManager,
+        resource: LockResource,
+        mode: LockMode,
+    ) -> Result<bool> {
+        if lock_state.cached_covers(resource, mode)? {
+            return Ok(true);
+        }
+        let acquired = match lock_state.owner_group {
+            Some(owner_group) => {
+                try_acquire_grouped(lock_manager, resource, mode, lock_state.owner, owner_group)?
+            }
+            None => try_acquire(lock_manager, resource, mode, lock_state.owner)?,
+        };
+        if acquired {
+            lock_state.cache_granted(resource, mode);
+        }
+        Ok(acquired)
     }
 
     async fn test_engine(log_file_stem: &str) -> (TempDir, Engine) {
@@ -573,9 +623,7 @@ mod tests {
     }
 
     fn lock_entry_count(engine: &Engine, owner: LockOwner) -> usize {
-        engine
-            .lock_manager()
-            .debug_snapshot()
+        debug_snapshot(engine.lock_manager())
             .entries
             .iter()
             .filter(|entry| entry.owner == owner)
@@ -606,8 +654,9 @@ mod tests {
         smol::block_on(async {
             let (_temp_dir, engine) = test_engine("redo_stmt_index_rollback_fail").await;
             let mut trx = test_trx(&engine, 52);
-            let trx_owner = trx.lock_owner().unwrap();
-            trx.try_acquire_transaction_lock(
+            let trx_owner = trx_lock_owner(&trx).unwrap();
+            try_acquire_transaction_lock(
+                &mut trx,
                 LockResource::TableData(91_250),
                 LockMode::IntentExclusive,
             )
@@ -616,8 +665,9 @@ mod tests {
 
             let res: Result<()> = trx
                 .exec(async |stmt| {
-                    stmt_owner.set(Some(stmt.lock_owner()));
-                    stmt.try_acquire_statement_lock(
+                    stmt_owner.set(Some(lock_owner(stmt)));
+                    try_acquire_statement_lock(
+                        stmt,
                         LockResource::TableMetadata(91_250),
                         LockMode::Shared,
                     )?;
