@@ -1,7 +1,7 @@
 ---
 id: 0017
 title: Drop Table Lifecycle And Recovery
-status: proposal
+status: implemented
 tags: [storage, ddl, recovery, checkpoint, catalog]
 created: 2026-05-05
 github_issue: 614
@@ -16,9 +16,9 @@ Define the storage-engine lifecycle and recovery contract for logical
 volatile table lifecycle gate for stale runtime handles and background
 checkpoint cancellation, and a catalog checkpoint/recovery rule that treats
 checkpointed catalog absence plus a monotonic non-reused table id as sufficient
-durable negative knowledge. The logical DDL phase deliberately separates runtime
-unreachability from resource reclamation; a later phase in this RFC reuses the
-transaction GC horizon to destroy dropped table memory and waits for catalog
+durable negative knowledge. The implemented logical DDL path deliberately
+separates runtime unreachability from resource reclamation; transaction GC then
+destroys dropped table memory after the GC horizon and waits for catalog
 checkpoint negative knowledge before deleting table files. Table-id reuse and
 `CREATE INDEX`/`DROP INDEX` remain out of scope and should be handled by later
 RFCs.
@@ -186,8 +186,11 @@ are never reused after crash/restart. [D1], [D3], [D5], [D6], [C5], [C6], [U3],
 8. Lifecycle gate: foreground access through an `Arc<Table>` is valid only after
    acquiring logical locks and observing lifecycle `Live`. [C5], [C9], [C10],
    [U5]
-9. Drop abort recovery: a failed uncommitted drop must restore volatile lifecycle
-   from `Dropping` to `Live`. [C9], [U6]
+9. Terminal drop gate: ordinary fallible drop preparation must happen before
+   `Dropping` is visible. After `Dropping`, runtime must either finish the
+   durable drop path or fail/poison without reopening the table; a crash before
+   durable drop commit loses volatile state and recovers the table from durable
+   catalog state. [C3], [C9], [U6]
 10. Reclamation separation: logical drop commit must not require in-memory
     table destroy, table-file deletion, or quarantine. [D4], [D5], [C12],
     [C13], [C14], [U8], [U9]
@@ -224,16 +227,21 @@ lifecycle state:
 
 ```text
 Live -> Dropping -> Dropped
-Live -> Dropping -> Live
 ```
 
-The abort path returns to `Live` when drop fails before durable commit. The
-successful path transitions to `Dropped` after the drop commit is durable and
-before releasing DDL locks. Runtime catalog removal happens only after the handle
-has been marked `Dropped`, so newly resolved handles disappear and stale handles
-fail lifecycle checks. The state transition must use a synchronization primitive
-with acquire/release ordering or stronger so a thread that observes `Dropped`
-cannot proceed using stale table state. [C5], [C9], [C10], [U5], [U6]
+The implementation treats `Dropping` as terminal for normal runtime execution.
+Fallible preconditions run before the lifecycle gate is crossed. After
+`Dropping` is visible, failures that could make catalog deletion, drop redo,
+checkpoint publication, or runtime removal ambiguous must fail or poison
+storage while preserving the source error rather than silently restoring
+`Live`. The successful path transitions to `Dropped` after the drop commit is
+durable and before releasing DDL locks. Runtime catalog removal happens only
+after the handle has been marked `Dropped`, so newly resolved handles disappear
+and stale handles fail lifecycle checks. The state transition must use a
+synchronization primitive with acquire/release ordering or stronger so a thread
+that observes `Dropped` cannot proceed using stale table state. A process crash
+before durable drop commit discards volatile lifecycle state and recovers the
+table as live from durable catalog state. [C3], [C5], [C9], [C10], [U5], [U6]
 
 Foreground statement APIs must check lifecycle after acquiring their normal
 logical locks and before touching row, index, deletion-buffer, or table-file
@@ -248,50 +256,45 @@ Live     -> proceed
 The first implementation should classify access paths explicitly:
 
 - foreground user reads/writes require `Live`;
-- checkpoint requires a checkpoint lease acquired from `Live`;
+- checkpoint publication requires a publish lease acquired from `Live`;
 - drop DDL owns `Dropping` and `Dropped` transitions;
 - recovery may construct/remove runtime state without volatile lifecycle locks;
-- purge/GC may touch retained physical roots only through existing retention or
-  a future reclamation protocol;
+- purge/GC consumes dropped runtime state only after the transaction GC horizon
+  and stale-handle checks permit it;
 - diagnostics/tests may bypass lifecycle only through explicit test/internal
   helpers. [D2], [C3], [C8], [C9], [C10]
 
 ### Background Checkpoint Lease
 
 Table checkpoint must not acquire logical locks. Instead, table runtime must
-provide a lightweight checkpoint lease protocol:
+provide a lightweight publish/drop gate:
 
 ```text
-try_begin_checkpoint():
-    atomically verify lifecycle == Live
-    increment active checkpoint lease count
-    return checkpoint lease
+checkpoint_enter_publish():
+    atomically verify lifecycle == Live and publish gate is open
+    claim the single no-cancel publish lease
+    otherwise return Cancelled(TableDropping/TableDropped)
 
 drop_begin():
-    while holding DDL locks, CAS Live -> Dropping
-    prevent new checkpoint leases
-    request cancellation for active cancellable leases
-    wait for active no-cancel publish leases to exit
-
-checkpoint_enter_publish():
-    atomically verify lifecycle == Live and no drop cancellation
-    convert checkpoint lease to no-cancel publish lease
-    otherwise return cancelled before table-root publication
+    while holding DDL locks, close the publish gate
+    wait for any active publish lease to exit
+    transition Live -> Dropping
 ```
 
-A checkpoint lease is cancellable during collection, frozen-page stabilization,
-LWC construction, deletion checkpoint, and secondary sidecar work. A checkpoint
-may enter table-root publication only after it successfully converts to a
-no-cancel publish lease. Once in the no-cancel section, drop must wait for the
-checkpoint to finish publishing and committing or to reach a fatal storage error.
-[D2], [D4], [C8], [U5], [U6]
+Checkpoint preparation may run before the publish lease is claimed, but
+pre-publication work must remain discardable. A checkpoint may publish a
+table-file root only after it successfully obtains the no-cancel publish lease.
+If the lifecycle has reached `Dropping` or `Dropped`, checkpoint returns
+`CheckpointOutcome::Cancelled { reason }` without publishing a root or
+committing `DDLRedo::DataCheckpoint`. Once in the no-cancel section, drop waits
+for the checkpoint to finish publishing and committing or for storage to reach a
+fatal state. [D2], [D4], [C8], [U5], [U6]
 
 The no-cancel section covers table-root publication, old-root retention, and the
 ordered checkpoint transaction commit that emits `DDLRedo::DataCheckpoint`.
-Phase 2 must audit the existing root-publish-before-transaction-commit path: if
-root publication succeeds but the checkpoint transaction cannot commit, storage
-must either make the outcome recoverable under existing checkpoint rules or
-poison/fail the runtime before drop can proceed normally. [D4], [C8], [U6]
+If root publication succeeds but old-root retention or checkpoint transaction
+commit fails, storage poisons with checkpoint-write fatal handling before drop
+can proceed normally. [D4], [C8], [U6]
 
 ### Drop Table Catalog And Runtime Shape
 
@@ -352,8 +355,9 @@ and advance catalog_replay_start_ts to safe_cts + 1 only if:
 Checkpointed dropped tables do not participate in the recovery coarse replay
 floor because they are not loaded user tables. Their pre-drop redo is covered by
 catalog negative knowledge, not by table-file replay boundaries. A leftover table
-file for a checkpoint-absent table is ignored by recovery until phase 4's
-GC-managed file-deletion stage handles it. [D1], [D3], [C3], [C4], [C12], [U9]
+file for a checkpoint-absent table is ignored by recovery and can be removed by
+runtime GC file-delete work or checkpoint-absence startup cleanup. [D1], [D3],
+[C3], [C4], [C12], [U9]
 
 Recovery must classify table-scoped redo for unknown table ids by CTS:
 
@@ -392,9 +396,9 @@ The implementation must satisfy these restart cases:
 
 ### Physical Table-File Deletion Contract
 
-Phase 3 leaves both hot runtime reclamation and table-file deletion out of the
-logical DDL path. Phase 4 reuses transaction GC rather than adding a standalone
-dropped-table reclaimer:
+Logical DDL leaves both hot runtime reclamation and table-file deletion out of
+the foreground drop path. Phase 4 reuses transaction GC rather than adding a
+standalone dropped-table reclaimer:
 
 - after `min_active_sts > drop_cts`, GC may attempt to consume the removed
   runtime table handle and reclaim in-memory resources such as hot row pages,
@@ -435,8 +439,9 @@ Required runtime/concurrency tests:
   error;
 - stale `Arc<Table>` write after committed drop cannot emit redo;
 - drop waits for active table read statements and writer transactions;
-- drop abort after `Live -> Dropping` restores table to `Live`;
-- new checkpoint cannot start after `Dropping`;
+- failures after `Live -> Dropping` preserve source diagnostics and fail/poison
+  instead of reopening the table;
+- new checkpoint publication cannot proceed after `Dropping`;
 - in-flight checkpoint cancels before root publication;
 - checkpoint already in publish/commit critical section commits before drop
   commit or forces fatal/poisoned runtime behavior.
@@ -616,36 +621,36 @@ the table-file/root design. [D4], [C8], [C9]
   long logical-lock waits.
 - Recovery gets a precise rule for old redo belonging to checkpoint-absent
   tables.
-- Dropped-table reclamation has a clear follow-up phase that reuses the existing
-  GC horizon and keeps physical deletion behind restart-safe catalog negative
-  knowledge.
+- Dropped-table reclamation reuses the existing GC horizon and keeps physical
+  deletion behind restart-safe catalog negative knowledge.
 
 ### Negative
 
-- Physical disk space and hot buffer-pool pages for dropped tables are not
-  reclaimed by phase 3.
+- Physical disk space and hot buffer-pool pages for dropped tables are
+  reclaimed asynchronously, so stale handles, GC cadence, and catalog checkpoint
+  cadence can delay cleanup after logical drop commits.
 - Runtime table access paths must add lifecycle checks after lock acquisition.
 - Table checkpoint needs a new lifecycle/cancellation boundary.
-- Phase 4 must add table/block-index destroy code and retry behavior for stale
-  runtime handles.
+- Retained dropped-table GC and file-delete retry wake policy remains deferred
+  to `docs/backlogs/000098-dropped-table-purge-retry-stall.md`.
 - `CREATE INDEX` and `DROP INDEX` remain unimplemented and require a separate
   RFC.
 
 ## Open Questions
 
-- What exact error variant should foreground access return for `Dropping` and
-  `Dropped` handles?
-- Should checkpoint cancellation reuse `CheckpointOutcome::Delayed`, add a new
-  `CheckpointOutcome::Cancelled`, or return a normal operation error?
-- Should recovery diagnostics for skipped unknown-table redo be counters, trace
-  logs, test-only counters, or all three?
+- None remain open for this RFC. Foreground `Dropping` access returns
+  `OperationError::TableDropping`, `Dropped` access returns
+  `OperationError::TableNotFound`, checkpoint publication cancellation uses
+  `CheckpointOutcome::Cancelled { reason }`, and skipped unknown-table redo is
+  tracked by an internal test-visible counter.
 
 ## Future Work
 
 - Dedicated RFC for offline `CREATE INDEX` and `DROP INDEX`, including
   table-root/catalog atomicity, sparse index slots, stable `index_no`
   allocation, and post-index-DDL DML guarantees.
-- Crash-idempotent dropped table-file quarantine/unlink and startup cleanup.
+- Non-busy retry scheduling for retained dropped-table runtime/file cleanup:
+  `docs/backlogs/000098-dropped-table-purge-retry-stall.md`.
 - Lifecycle garbage collection for any future durable lifecycle ledger.
 - Table-id reuse or generation-aware object identity, if the storage engine ever
   needs it.
