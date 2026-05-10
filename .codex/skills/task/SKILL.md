@@ -1,20 +1,19 @@
 ---
 name: task
-description: Design a task document for a feature or bug fix through deep research and multi-round design review, and run task lifecycle workflows. Use when planning implementation work in this repository, running pre-edit `task implement` planning from a task worktree, running post-implementation `task checklist` review, resolving task docs, or purging completed task worktrees. Enforce background-doc research, codebase impact analysis, explicit first-principles/long-term/original-fit proposal lenses with tradeoffs, two formal review rounds with user feedback, strict RFC escalation for oversized scope, explicit user approval before writing docs/tasks files, and explicit developer approval before implementation edits.
+description: Design an implementation-ready task document for a feature or bug fix through deep research and multi-round design review, and run task lifecycle workflows. Use when creating task docs in this repository, running post-implementation `task checklist` review, resolving task docs, or purging completed task worktrees. Enforce background-doc research, codebase impact analysis, explicit first-principles/long-term/original-fit proposal lenses with tradeoffs, two formal review rounds with user feedback, strict RFC escalation for oversized scope, explicit user approval before writing docs/tasks files, and task-doc quality sufficient for direct implementation.
 ---
 
 # Task Workflow
 
-Use this skill to design a high-quality task document before coding and to
+Use this skill to design a high-quality, implementation-ready task document and to
 run post-implementation task lifecycle checks.
 Scripts are executable; invoke them directly (no `cargo +nightly -Zscript` prefix).
 
-This skill has five prompt workflows:
-1. `task create`: design-phase planning and task doc creation.
-2. `task implement`: pre-edit implementation planning from a task worktree.
-3. `task checklist`: post-implementation review against `docs/process/dev-checklist.md`.
-4. `task resolve`: post-implementation synchronization after code/tests/review are complete.
-5. `task purge worktree`: inspect task worktrees and remove only the ones that are safe to purge.
+This skill has four prompt workflows:
+1. `task create`: design-phase planning and implementation-ready task doc creation.
+2. `task checklist`: post-implementation review against `docs/process/dev-checklist.md`.
+3. `task resolve`: post-implementation synchronization after code/tests/review are complete.
+4. `task purge worktree`: inspect task worktrees and remove only the ones that are safe to purge.
 
 ## `task create` Required Flow
 
@@ -151,59 +150,11 @@ tools/task.rs create-task-doc \
    - Manual backlog create/close workflow is owned by `$backlog` skill (`tools/backlog.rs`), not by this skill.
 8. Fill the file according to `docs/tasks/000000-template.md` in the task worktree.
 
-## `task implement` Required Flow
-
-Use `task implement` only from the task-specific worktree root after the task
-doc has already been created. This workflow prepares a detailed implementation
-plan and must stop for explicit developer approval before editing code.
-
-Reject the command immediately unless all entry checks pass:
-1. Current directory is the git worktree root:
-```bash
-test "$(pwd -P)" = "$(git rev-parse --show-toplevel)"
-```
-2. Current directory basename is exactly the 6-digit task id:
-```bash
-basename "$(pwd -P)"
-```
-3. The worktree root path is under `.worktrees/<task-id>` as created by
-   `task create`.
-4. Current git branch is named, not detached, and is not `main`.
-5. Exactly one task doc exists at `docs/tasks/<task-id>-*.md`.
-6. The task doc frontmatter `id:` matches `<task-id>`.
-
-After entry validation:
-1. Read the task doc first, especially Goals, Non-Goals, Plan, Impacts, Test
-   Cases, Open Questions, and Unsafe Considerations.
-2. If the task doc has `Parent RFC:`, read the parent RFC before inspecting
-   code.
-3. If the parent RFC has an `Implementation Phases` section:
-   - locate the current phase by the current task doc path or task id;
-   - read previous phase task docs whose phase blocks precede the current
-     phase and are already implemented, identified by `status: implemented`,
-     `Status: Implemented`, or an `Implementation Summary`;
-   - if the current phase cannot be located, ask the developer instead of
-     guessing which previous phase docs are required.
-4. Read relevant source files and conceptual docs referenced by the task doc,
-   parent RFC, and implemented previous phase task docs.
-5. Produce a detailed implementation plan before making code edits. The plan
-   must include:
-   - files and modules to change;
-   - core logic and control flow;
-   - data structures, structs, traits, methods, and APIs to add or modify;
-   - error handling, unsafe handling, transaction/recovery implications, and
-     performance-sensitive paths when relevant;
-   - tests mapped back to task-doc requirements;
-   - documentation updates required by `docs/process/dev-checklist.md`.
-6. If any hard implementation decision remains, present the decision, viable
-   options, recommendation, and tradeoff, then ask the developer to decide.
-   Do not silently choose.
-7. Ask for explicit developer approval before editing code.
-   - Do not infer approval from silence or vague agreement.
-   - Do not edit code, run formatters that rewrite files, update task docs, or
-     create backlog docs before approval.
-   - After approval, implementation edits may proceed in the same task
-     worktree.
+The finished task doc is the implementation source of truth. It must contain
+enough goals, non-goals, plan detail, impacted interfaces, test cases, risks,
+and resolved decisions for an implementation agent to start coding directly
+from the task worktree and task doc, without running a separate planning
+command.
 
 ## `task checklist` Required Flow
 
