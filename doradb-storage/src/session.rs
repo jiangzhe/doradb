@@ -325,17 +325,27 @@ impl Session {
             .into());
         }
 
-        if let Err(err) = trx.commit().await {
-            return Err(
-                poison_drop_table_after_gate_with_source(&engine, table_id, "commit", err).into(),
-            );
-        }
+        let drop_cts = match trx.commit().await {
+            Ok(drop_cts) => drop_cts,
+            Err(err) => {
+                return Err(poison_drop_table_after_gate_with_source(
+                    &engine, table_id, "commit", err,
+                )
+                .into());
+            }
+        };
 
-        let res = finish_drop_table_runtime_removal(&engine, table_id, &table);
-        if res.is_ok() {
-            table_locks.fail_waiters_on_release(OperationError::TableNotFound);
-        }
-        res
+        let removed = finish_drop_table_runtime_removal(&engine, table_id, &table)?;
+        table_locks.fail_waiters_on_release(OperationError::TableNotFound);
+        drop(table);
+        // Foreground DROP TABLE stops at logical/runtime removal. Physical
+        // runtime destruction and file unlink are purge-owned so stale handles,
+        // active snapshots, and catalog checkpoint durability can be honored
+        // without blocking this DDL call on best-effort cleanup work.
+        engine
+            .trx_sys
+            .enqueue_dropped_table(table_id, drop_cts, removed);
+        Ok(())
     }
 
     /// Acquires an explicit session-lifetime table lock.
@@ -643,12 +653,12 @@ fn finish_drop_table_runtime_removal(
     engine: &EngineRef,
     table_id: TableID,
     table: &Arc<Table>,
-) -> Result<()> {
+) -> Result<Arc<Table>> {
     if let Err(_err) = table.mark_dropped_lifecycle() {
         return Err(poison_drop_table_after_gate(engine, table_id, "mark dropped").into());
     }
     match engine.catalog().remove_user_table(table_id) {
-        Some(removed) if Arc::ptr_eq(&removed, table) => Ok(()),
+        Some(removed) if Arc::ptr_eq(&removed, table) => Ok(removed),
         Some(_) | None => {
             Err(poison_drop_table_after_gate(engine, table_id, "runtime removal").into())
         }
@@ -661,6 +671,10 @@ fn poison_drop_table_after_gate(
     table_id: TableID,
     operation: &'static str,
 ) -> Report<FatalError> {
+    // Once `begin_drop_lifecycle` succeeds, the table's checkpoint publish gate
+    // is closed and the operation cannot be safely retried as an ordinary DDL
+    // failure. Poison admission so future work sees the fatal state; explicit
+    // engine shutdown remains responsible for stopping background workers.
     engine
         .trx_sys
         .poison_storage(FatalError::Poisoned)

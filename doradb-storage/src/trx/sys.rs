@@ -10,7 +10,7 @@ use crate::thread;
 use crate::trx::group::Commit;
 use crate::trx::log::{LOG_HEADER_PAGES, LogPartition};
 use crate::trx::log_replay::MmapLogReader;
-use crate::trx::purge::{GC, Purge};
+use crate::trx::purge::{DroppedTableFileDeleteItem, DroppedTableGcQueues, GC, Purge};
 use crate::trx::redo::RedoLogs;
 use crate::trx::sys_trx::SysTrx;
 use crate::trx::{
@@ -90,6 +90,12 @@ pub struct TransactionSystem {
     pub(super) config: CachePadded<TrxSysConfig>,
     /// Catalog of the database.
     pub(crate) catalog: CachePadded<QuiescentGuard<Catalog>>,
+    /// Table file facade used by background dropped-table cleanup.
+    pub(super) table_fs: CachePadded<QuiescentGuard<FileSystem>>,
+    /// Wakeup channel for purge coordination.
+    pub(super) purge_tx: CachePadded<Sender<Purge>>,
+    /// Dropped table runtime and file cleanup queues.
+    pub(super) dropped_table_gc: CachePadded<Mutex<DroppedTableGcQueues>>,
     /// Storage-runtime poison flag for fatal storage background or durability failures.
     storage_poisoned: CachePadded<AtomicBool>,
     /// First fatal storage reason that poisoned runtime admission.
@@ -112,8 +118,11 @@ impl TransactionSystem {
     pub(crate) fn new(
         config: TrxSysConfig,
         catalog: QuiescentGuard<Catalog>,
+        table_fs: QuiescentGuard<FileSystem>,
         log_partitions: Vec<CachePadded<LogPartition>>,
         initial_ts: TrxID,
+        purge_tx: Sender<Purge>,
+        initial_file_deletes: Vec<DroppedTableFileDeleteItem>,
     ) -> Self {
         debug_assert!((MIN_SNAPSHOT_TS..MAX_SNAPSHOT_TS).contains(&initial_ts));
         TransactionSystem {
@@ -123,12 +132,22 @@ impl TransactionSystem {
             log_partitions: CachePadded::new(log_partitions.into_boxed_slice()),
             config: CachePadded::new(config),
             catalog: CachePadded::new(catalog),
+            table_fs: CachePadded::new(table_fs),
+            purge_tx: CachePadded::new(purge_tx),
+            dropped_table_gc: CachePadded::new(Mutex::new(
+                DroppedTableGcQueues::from_file_deletes(initial_file_deletes),
+            )),
             storage_poisoned: CachePadded::new(AtomicBool::new(false)),
             storage_poison_err: CachePadded::new(Mutex::new(None)),
         }
     }
 
     /// Returns the first fatal storage poison error, if runtime admission has been poisoned.
+    ///
+    /// Poison is an admission barrier, not a shutdown mechanism. It prevents new
+    /// foreground/system work from entering paths that depend on durable
+    /// consistency, while the engine owner remains responsible for the normal
+    /// explicit shutdown sequence.
     #[inline]
     pub(crate) fn storage_poison_error(&self) -> Option<Report<FatalError>> {
         if !self.storage_poisoned.load(Ordering::Acquire) {
@@ -143,6 +162,10 @@ impl TransactionSystem {
     }
 
     /// Returns `Err` once a fatal storage failure poisoned runtime admission.
+    ///
+    /// Call this at work-admission boundaries. Background worker shutdown must
+    /// not call it, because shutdown must remain available after the runtime has
+    /// already been poisoned.
     #[inline]
     pub(crate) fn ensure_runtime_healthy(&self) -> FatalResult<()> {
         match self.storage_poison_error() {
@@ -152,6 +175,13 @@ impl TransactionSystem {
     }
 
     /// Records the first fatal storage poison reason and returns a fresh poison error.
+    ///
+    /// The first caller wins: later poison attempts keep returning the already
+    /// recorded reason. The reason is stored before the atomic flag is published
+    /// so a thread that observes `storage_poisoned == true` can immediately load
+    /// a meaningful error. This method intentionally does not wake or stop worker
+    /// threads; callers that hit an unrecoverable background failure should
+    /// return from their worker loop after poisoning.
     #[inline]
     pub(crate) fn poison_storage(&self, reason: FatalError) -> Report<FatalError> {
         {
@@ -525,6 +555,9 @@ impl Component for TransactionSystemWorkers {
             return;
         }
 
+        // Shutdown is independent from storage poison. A poisoned runtime may
+        // have already caused one worker to exit early, but owner-side teardown
+        // still has to signal every channel and join every worker handle.
         let log_partitions = &*component.trx_sys.log_partitions;
         for partition in log_partitions {
             {

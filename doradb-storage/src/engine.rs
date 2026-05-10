@@ -155,6 +155,10 @@ impl Engine {
     /// Shutdown rejects new work immediately, waits for user-owned
     /// [`EngineRef`]s and sessions to drain, then dispatches component shutdown
     /// in reverse registration order.
+    ///
+    /// This path is valid after storage poison. Poison only blocks admission; it
+    /// does not replace the owner-side responsibility to stop background workers
+    /// and drop components in the registered order.
     #[inline]
     pub fn shutdown(&self) -> Result<()> {
         self.finalize_shutdown()
@@ -184,7 +188,9 @@ impl Engine {
         // new owner-created runtime handles can appear before this snapshot.
         // Requiring the last strong reference here gives transaction-system
         // shutdown a clean point where user-originated work has already
-        // drained before we start disabling runtime state.
+        // drained before we start disabling runtime state. This requirement is
+        // unchanged for poisoned engines: poison does not drain sessions or old
+        // table handles for us.
         let strong_count = Arc::strong_count(inner);
         if strong_count != 1 {
             return Err(Report::new(LifecycleError::ShutdownBusy)
@@ -205,7 +211,9 @@ impl Drop for Engine {
             if err.lifecycle_error() == Some(LifecycleError::ShutdownBusy) {
                 // Fatal owner-drop violations still need to stop background
                 // workers, but the owner registry cannot be dropped while
-                // leaked runtime refs still retain component guards.
+                // leaked runtime refs still retain component guards. This keeps
+                // worker threads from escaping even after poison, while avoiding
+                // quiescent owner teardown that could otherwise wait forever.
                 let components = self
                     .components
                     .take()

@@ -28,7 +28,10 @@ use crate::{IndexPool, MemPool};
 use error_stack::Report;
 use flume::{Receiver, RecvError, Selector, SendError, TryRecvError};
 use parking_lot::Mutex;
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
+use std::ffi::OsStr;
+use std::fs;
+use std::io::ErrorKind as IoErrorKind;
 use std::path::{Path, PathBuf};
 use std::result::Result as StdResult;
 use std::sync::Arc;
@@ -1455,7 +1458,7 @@ impl FileSystem {
         self.background_writes.shutdown();
     }
 
-    /// Create a new table file.
+    /// Create a new user table file.
     /// If trunc is set to true, old file will be overwritten.
     /// Otherwise, an error will be returned if file already exists.
     #[inline]
@@ -1465,7 +1468,7 @@ impl FileSystem {
         metadata: Arc<TableMetadata>,
         trunc: bool,
     ) -> Result<MutableTableFile> {
-        let file_path = self.table_file_path(table_id);
+        let file_path = self.user_table_file_path(table_id);
         let table_file = TableFile::create(&file_path, TABLE_FILE_INITIAL_SIZE, table_id, trunc)?;
         let initial_pages = TABLE_FILE_INITIAL_SIZE / COW_FILE_PAGE_SIZE;
         let active_root = ActiveRoot::new(0, initial_pages, metadata);
@@ -1476,14 +1479,14 @@ impl FileSystem {
         ))
     }
 
-    /// Open an existing table file.
+    /// Open an existing user table file.
     #[inline]
     pub async fn open_table_file(
         &self,
         table_id: TableID,
         disk_pool: QuiescentGuard<ReadonlyBufferPool>,
     ) -> Result<Arc<TableFile>> {
-        let file_path = self.table_file_path(table_id);
+        let file_path = self.user_table_file_path(table_id);
         let table_file = Arc::new(TableFile::open(&file_path, table_id)?);
         let active_root = table_file.load_active_root_from_pool(&disk_pool).await?;
         let old_root = table_file.install_loaded_root(active_root);
@@ -1491,18 +1494,55 @@ impl FileSystem {
         Ok(table_file)
     }
 
-    /// Build file path for a logical table id.
-    ///
-    /// User table ids use fixed-width hex naming (`<016x>.tbl`), while
-    /// reserved/catalog ids keep compact decimal names.
+    /// Build file path for a deterministic user-table file.
     #[inline]
-    pub fn table_file_path(&self, table_id: TableID) -> String {
-        let file_name = if table_id >= USER_OBJ_ID_START {
-            format!("{table_id:016x}.tbl")
-        } else {
-            format!("{table_id}.tbl")
-        };
-        path_to_string(&self.data_dir.join(file_name), "table file path")
+    pub fn user_table_file_path(&self, table_id: TableID) -> String {
+        let file_name = user_table_file_name(table_id);
+        path_to_string(&self.data_dir.join(file_name), "user table file path")
+    }
+
+    /// Delete one deterministic user-table file.
+    #[inline]
+    pub(crate) fn delete_user_table_file(&self, table_id: TableID) -> Result<()> {
+        debug_assert!(table_id >= USER_OBJ_ID_START);
+        match fs::remove_file(self.data_dir.join(user_table_file_name(table_id))) {
+            Ok(()) => Ok(()),
+            Err(err) if err.kind() == IoErrorKind::NotFound => Ok(()),
+            Err(err) => Err(err.into()),
+        }
+    }
+
+    /// Delete checkpoint-absent user-table files left behind by a prior crash.
+    #[inline]
+    pub(crate) fn cleanup_checkpoint_absent_user_table_files(
+        &self,
+        checkpointed_next_user_obj_id: TableID,
+        checkpointed_user_table_ids: &HashSet<TableID>,
+    ) -> Result<()> {
+        for entry in fs::read_dir(&self.data_dir)? {
+            let entry = entry?;
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if !file_type.is_file() {
+                continue;
+            }
+            let Some(table_id) = parse_user_table_file_name(&entry.file_name()) else {
+                continue;
+            };
+            if table_id >= checkpointed_next_user_obj_id {
+                continue;
+            }
+            if checkpointed_user_table_ids.contains(&table_id) {
+                continue;
+            }
+            match fs::remove_file(entry.path()) {
+                Ok(()) => {}
+                Err(err) if err.kind() == IoErrorKind::NotFound => {}
+                Err(err) => return Err(err.into()),
+            }
+        }
+        Ok(())
     }
 
     /// Build absolute path for the unified catalog file (`*.mtb`).
@@ -1600,6 +1640,23 @@ fn path_to_string(path: &Path, field: &str) -> String {
     path_to_utf8(path, field)
         .expect("table file system paths are validated during construction")
         .to_owned()
+}
+
+#[inline]
+fn user_table_file_name(table_id: TableID) -> String {
+    debug_assert!(table_id >= USER_OBJ_ID_START);
+    format!("{table_id:016x}.tbl")
+}
+
+#[inline]
+fn parse_user_table_file_name(file_name: &OsStr) -> Option<TableID> {
+    let file_name = file_name.to_str()?;
+    let table_id_hex = file_name.strip_suffix(".tbl")?;
+    if table_id_hex.len() != 16 {
+        return None;
+    }
+    let table_id = TableID::from_str_radix(table_id_hex, 16).ok()?;
+    (table_id >= USER_OBJ_ID_START).then_some(table_id)
 }
 
 #[cfg(test)]
@@ -2007,13 +2064,16 @@ pub(crate) mod tests {
             )
             .unwrap();
 
-            let table_file = fs.create_table_file(130, make_metadata(), false).unwrap();
+            let table_id = USER_OBJ_ID_START + 130;
+            let table_file = fs
+                .create_table_file(table_id, make_metadata(), false)
+                .unwrap();
             let (table_file, old_root) = table_file.commit(1, false).await.unwrap();
             drop(old_root);
             write_payload(&fs, &table_file, BlockID::from(7usize), b"table-read").await;
 
             let reopened = fs
-                .open_table_file(130, fs.disk_pool().clone_inner())
+                .open_table_file(table_id, fs.disk_pool().clone_inner())
                 .await
                 .unwrap();
             let readonly_pool = fs.disk_pool().clone_inner();
@@ -2161,7 +2221,7 @@ pub(crate) mod tests {
             let (table_file, old_root) = mutable.commit(1, false).await.unwrap();
             drop(old_root);
 
-            let path = fs.table_file_path(USER_OBJ_ID_START);
+            let path = fs.user_table_file_path(USER_OBJ_ID_START);
             assert!(
                 path.ends_with("0001000000000000.tbl"),
                 "unexpected user table file path: {path}"
@@ -2171,6 +2231,80 @@ pub(crate) mod tests {
             drop(table_file);
             drop(fs);
         });
+    }
+
+    #[test]
+    fn test_delete_user_table_file_is_idempotent() {
+        smol::block_on(async {
+            let (_temp_dir, fs) = build_test_fs();
+            let table_id = USER_OBJ_ID_START + 9;
+            let metadata = Arc::new(TableMetadata::new(
+                vec![ColumnSpec::new(
+                    "c0",
+                    ValKind::U32,
+                    ColumnAttributes::empty(),
+                )],
+                vec![IndexSpec::new(
+                    "idx_pk",
+                    vec![IndexKey::new(0)],
+                    IndexAttributes::PK,
+                )],
+            ));
+            let mutable = fs
+                .create_table_file(table_id, Arc::clone(&metadata), false)
+                .unwrap();
+            let (table_file, old_root) = mutable.commit(1, false).await.unwrap();
+            drop(old_root);
+            drop(table_file);
+            let path = fs.user_table_file_path(table_id);
+            assert!(Path::new(&path).exists());
+
+            fs.delete_user_table_file(table_id).unwrap();
+            assert!(!Path::new(&path).exists());
+            fs.delete_user_table_file(table_id).unwrap();
+        });
+    }
+
+    #[test]
+    fn test_cleanup_checkpoint_absent_user_table_files_filters_catalog_and_future_ids() {
+        let (_temp_dir, fs) = build_test_fs();
+        let present_id = USER_OBJ_ID_START + 1;
+        let absent_id = USER_OBJ_ID_START + 2;
+        let future_id = USER_OBJ_ID_START + 5;
+        let catalog_path = fs.data_dir.join("1.tbl");
+        let present_path = fs.data_dir.join(user_table_file_name(present_id));
+        let absent_path = fs.data_dir.join(user_table_file_name(absent_id));
+        let future_path = fs.data_dir.join(user_table_file_name(future_id));
+        std::fs::write(&catalog_path, b"catalog").unwrap();
+        std::fs::write(&present_path, b"present").unwrap();
+        std::fs::write(&absent_path, b"absent").unwrap();
+        std::fs::write(&future_path, b"future").unwrap();
+
+        let checkpointed_tables = HashSet::from([present_id]);
+        fs.cleanup_checkpoint_absent_user_table_files(USER_OBJ_ID_START + 4, &checkpointed_tables)
+            .unwrap();
+
+        assert!(catalog_path.exists());
+        assert!(present_path.exists());
+        assert!(!absent_path.exists());
+        assert!(future_path.exists());
+    }
+
+    #[test]
+    fn test_cleanup_checkpoint_absent_user_table_files_skips_non_files() {
+        let (_temp_dir, fs) = build_test_fs();
+        let dir_id = USER_OBJ_ID_START + 1;
+        let absent_id = USER_OBJ_ID_START + 2;
+        let dir_path = fs.data_dir.join(user_table_file_name(dir_id));
+        let absent_path = fs.data_dir.join(user_table_file_name(absent_id));
+        std::fs::create_dir(&dir_path).unwrap();
+        std::fs::write(&absent_path, b"absent").unwrap();
+
+        fs.cleanup_checkpoint_absent_user_table_files(USER_OBJ_ID_START + 4, &HashSet::new())
+            .unwrap();
+
+        assert!(dir_path.is_dir());
+        assert!(!absent_path.exists());
     }
 
     #[test]

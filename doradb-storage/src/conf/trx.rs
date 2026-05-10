@@ -229,12 +229,13 @@ impl TrxSysConfig {
             .push(PoolRole::Disk, disk_pool.pool_guard())
             .build();
 
-        let (log_partitions, gc_rxs, initial_trx_ts) = log_recover(
+        let (purge_tx, purge_rx) = flume::unbounded();
+        let (log_partitions, gc_rxs, initial_trx_ts, initial_file_deletes) = log_recover(
             &meta_pool,
             RecoveryDeps {
                 index_pool,
                 mem_pool: mem_pool.clone(),
-                table_fs,
+                table_fs: table_fs.clone(),
                 disk_pool,
             },
             &catalog,
@@ -242,8 +243,15 @@ impl TrxSysConfig {
         )
         .await?;
 
-        let (purge_tx, purge_rx) = flume::unbounded();
-        let trx_sys = TransactionSystem::new(self, catalog, log_partitions, initial_trx_ts);
+        let trx_sys = TransactionSystem::new(
+            self,
+            catalog,
+            table_fs,
+            log_partitions,
+            initial_trx_ts,
+            purge_tx.clone(),
+            initial_file_deletes,
+        );
         Ok((
             trx_sys,
             PendingTransactionSystemStartup {

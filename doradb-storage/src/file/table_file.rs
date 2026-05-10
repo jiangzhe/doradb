@@ -738,6 +738,7 @@ mod tests {
     use crate::file::{build_test_fs, build_test_fs_in, test_block_id};
     use crate::io::IOBuf;
     use crate::quiescent::QuiescentBox;
+    use crate::table::test_user_table_id;
     use crate::value::ValKind;
     use std::fs::OpenOptions;
     use std::io::{Seek, SeekFrom, Write};
@@ -751,7 +752,7 @@ mod tests {
         page_id: BlockID,
     ) -> Result<DirectBuf> {
         let global = global_readonly_pool_scope(64 * 1024 * 1024);
-        let disk_pool = table_readonly_pool(&global, 0, table_file);
+        let disk_pool = table_readonly_pool(&global, test_user_table_id(0), table_file);
         let disk_pool_guard = disk_pool.pool_guard();
         let page = disk_pool
             .read_validated_block(&disk_pool_guard, page_id, accept_any_page)
@@ -777,7 +778,8 @@ mod tests {
                     IndexAttributes::PK,
                 )],
             ));
-            let table_file = fs.create_table_file(41, metadata, false).unwrap();
+            let table_id = test_user_table_id(41);
+            let table_file = fs.create_table_file(table_id, metadata, false).unwrap();
             let (table_file, old_root) = table_file.commit(1, false).await.unwrap();
             assert!(old_root.is_none());
             assert_eq!(table_file.active_root_unchecked().slot_no, 0);
@@ -804,7 +806,7 @@ mod tests {
             drop(table_file);
 
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
-            let table_file2 = fs.open_table_file(41, global.guard()).await.unwrap();
+            let table_file2 = fs.open_table_file(table_id, global.guard()).await.unwrap();
             let disk_pool = global.guard();
             assert_eq!(table_file2.active_root_unchecked().trx_id, 1);
 
@@ -844,7 +846,8 @@ mod tests {
             let (_temp_dir, fs) = build_test_fs();
             let background_writes = fs.background_writes();
             let metadata = build_test_metadata();
-            let table_file = fs.create_table_file(143, metadata, false).unwrap();
+            let table_id = test_user_table_id(143);
+            let table_file = fs.create_table_file(table_id, metadata, false).unwrap();
             let (table_file, old_root) = table_file.commit(1, false).await.unwrap();
             drop(old_root);
 
@@ -888,14 +891,15 @@ mod tests {
     fn test_readonly_buffer_read_propagates_io_failure() {
         smol::block_on(async {
             let (_temp_dir, fs) = build_test_fs();
+            let table_id = test_user_table_id(145);
             let table_file = fs
-                .create_table_file(145, build_test_metadata(), false)
+                .create_table_file(table_id, build_test_metadata(), false)
                 .unwrap();
             let (table_file, old_root) = table_file.commit(1, false).await.unwrap();
             drop(old_root);
 
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
-            let disk_pool = table_readonly_pool(&global, 145, &table_file);
+            let disk_pool = table_readonly_pool(&global, table_id, &table_file);
             let disk_pool_guard = disk_pool.pool_guard();
             let out_of_range_page_id = test_block_id(1_000_000);
             let res = disk_pool
@@ -923,7 +927,8 @@ mod tests {
                     IndexAttributes::PK,
                 )],
             ));
-            let table_file = fs.create_table_file(42, metadata, false).unwrap();
+            let table_id = test_user_table_id(42);
+            let table_file = fs.create_table_file(table_id, metadata, false).unwrap();
             let (table_file, old_root) = table_file.commit(1, false).await.unwrap();
             assert!(old_root.is_none());
             assert_eq!(table_file.active_root_unchecked().slot_no, 0);
@@ -1002,8 +1007,8 @@ mod tests {
     fn test_table_file_rejects_meta_checksum_corruption() {
         smol::block_on(async {
             let (temp_dir, fs) = build_test_fs();
-            let table_id = 146;
-            let path = fs.table_file_path(table_id);
+            let table_id = test_user_table_id(146);
+            let path = fs.user_table_file_path(table_id);
             let table_file = fs
                 .create_table_file(table_id, build_test_metadata(), false)
                 .unwrap();
@@ -1035,8 +1040,8 @@ mod tests {
     fn test_table_file_rejects_meta_version_mismatch() {
         smol::block_on(async {
             let (temp_dir, fs) = build_test_fs();
-            let table_id = 147;
-            let path = fs.table_file_path(table_id);
+            let table_id = test_user_table_id(147);
+            let path = fs.user_table_file_path(table_id);
             let table_file = fs
                 .create_table_file(table_id, build_test_metadata(), false)
                 .unwrap();
@@ -1074,7 +1079,8 @@ mod tests {
             let (_temp_dir, fs) = build_test_fs();
             let background_writes = fs.background_writes();
             let metadata = build_test_metadata();
-            let table_file = fs.create_table_file(43, metadata, false).unwrap();
+            let table_id = test_user_table_id(43);
+            let table_file = fs.create_table_file(table_id, metadata, false).unwrap();
             let (table_file, old_root) = table_file.commit(1, false).await.unwrap();
             drop(old_root);
 
@@ -1092,7 +1098,7 @@ mod tests {
             ];
 
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
-            let disk_pool = table_readonly_pool(&global, 43, &table_file);
+            let disk_pool = table_readonly_pool(&global, table_id, &table_file);
             let (table_file, old_root) = MutableTableFile::fork(&table_file, background_writes)
                 .persist_lwc_blocks(lwc_blocks, 7, 2, disk_pool.global_pool())
                 .await
@@ -1105,7 +1111,7 @@ mod tests {
             assert_eq!(active_root.heap_redo_start_ts, 7);
             assert_eq!(active_root.deletion_cutoff_ts, 1);
             assert_ne!(active_root.column_block_index_root, SUPER_BLOCK_ID);
-            let disk_pool = table_readonly_pool(&global, 43, &table_file);
+            let disk_pool = table_readonly_pool(&global, table_id, &table_file);
             let disk_pool_guard = disk_pool.pool_guard();
 
             let column_index = ColumnBlockIndex::new(
@@ -1138,7 +1144,8 @@ mod tests {
             let (_temp_dir, fs) = build_test_fs();
             let background_writes = fs.background_writes();
             let metadata = build_test_metadata();
-            let table_file = fs.create_table_file(44, metadata, false).unwrap();
+            let table_id = test_user_table_id(44);
+            let table_file = fs.create_table_file(table_id, metadata, false).unwrap();
             let (table_file, old_root) = table_file.commit(1, false).await.unwrap();
             drop(old_root);
 
@@ -1156,7 +1163,7 @@ mod tests {
             ];
 
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
-            let disk_pool = table_readonly_pool(&global, 44, &table_file);
+            let disk_pool = table_readonly_pool(&global, table_id, &table_file);
             let result = MutableTableFile::fork(&table_file, background_writes)
                 .persist_lwc_blocks(lwc_blocks, 7, 2, disk_pool.global_pool())
                 .await;
@@ -1186,7 +1193,8 @@ mod tests {
             let (_temp_dir, fs) = build_test_fs();
             let background_writes = fs.background_writes();
             let metadata = build_test_metadata();
-            let table_file = fs.create_table_file(45, metadata, false).unwrap();
+            let table_id = test_user_table_id(45);
+            let table_file = fs.create_table_file(table_id, metadata, false).unwrap();
             let (table_file, old_root) = table_file.commit(1, false).await.unwrap();
             drop(old_root);
 
@@ -1201,7 +1209,8 @@ mod tests {
             let (_temp_dir, fs) = build_test_fs();
             let background_writes = fs.background_writes();
             let metadata = build_test_metadata();
-            let table_file = fs.create_table_file(46, metadata, false).unwrap();
+            let table_id = test_user_table_id(46);
+            let table_file = fs.create_table_file(table_id, metadata, false).unwrap();
             let (table_file, old_root) = table_file.commit(1, false).await.unwrap();
             drop(old_root);
 

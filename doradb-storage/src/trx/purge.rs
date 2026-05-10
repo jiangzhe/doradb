@@ -1,10 +1,11 @@
 use crate::buffer::PageID;
 use crate::buffer::{BufferPool, EvictableBufferPool, PoolGuards};
-use crate::catalog::{Catalog, TableCache, TableHandle};
+use crate::catalog::{Catalog, TableCache, TableHandle, TableID};
 use crate::error::{FatalError, Result};
 use crate::latch::LatchFallbackMode;
 use crate::quiescent::{QuiescentGuard, SyncQuiescentGuard};
 use crate::row::RowPage;
+use crate::table::Table;
 use crate::thread;
 use crate::trx::log::LogPartition;
 use crate::trx::row::RowWriteAccess;
@@ -35,13 +36,123 @@ fn handle_gc_row_page_deallocation_result(trx_sys: &TransactionSystem, res: Resu
     match res {
         Ok(()) => true,
         Err(_) => {
+            // Runtime resource destruction is not replayable once purge has
+            // started mutating in-memory ownership. Treat any error here as a
+            // fatal storage failure: reject new work, let explicit shutdown join
+            // the worker later, and stop this purge cycle immediately.
             let _ = trx_sys.poison_storage(FatalError::PurgeDeallocate);
             false
         }
     }
 }
 
+/// Runtime table handle waiting for purge-horizon destruction after DROP TABLE.
+///
+/// The catalog no longer exposes this table once foreground DROP TABLE commits,
+/// but stale `Arc<Table>` handles may still exist in old sessions or other
+/// runtime holders. Purge owns the final runtime destroy step so it can wait
+/// until the drop commit is older than every active snapshot.
+pub(crate) struct DroppedTableGcItem {
+    pub(crate) table_id: TableID,
+    pub(crate) drop_cts: TrxID,
+    pub(crate) table: Arc<Table>,
+}
+
+/// User table file waiting for checkpoint-safe deletion after runtime destroy.
+///
+/// Physical file unlink must lag runtime destroy until a catalog checkpoint has
+/// made the table absence durable. Before that point recovery may still need the
+/// file to replay the committed drop.
+#[derive(Clone, Copy)]
+pub(crate) struct DroppedTableFileDeleteItem {
+    pub(crate) table_id: TableID,
+    pub(crate) drop_cts: TrxID,
+}
+
+impl DroppedTableFileDeleteItem {
+    #[inline]
+    pub(crate) fn new(table_id: TableID, drop_cts: TrxID) -> Self {
+        Self { table_id, drop_cts }
+    }
+}
+
+/// Purge-owned queues for GC-managed dropped-table cleanup.
+///
+/// `runtime` entries wait for both the purge horizon and exclusive ownership of
+/// the table `Arc`; `files` entries wait for the catalog checkpoint replay floor.
+/// These queues are deliberately purge-owned so foreground DROP TABLE can finish
+/// after logical removal without synchronously reclaiming memory or unlinking
+/// files.
+#[derive(Default)]
+pub(crate) struct DroppedTableGcQueues {
+    runtime: VecDeque<DroppedTableGcItem>,
+    files: VecDeque<DroppedTableFileDeleteItem>,
+}
+
+impl DroppedTableGcQueues {
+    #[inline]
+    pub(crate) fn from_file_deletes(
+        file_deletes: Vec<DroppedTableFileDeleteItem>,
+    ) -> DroppedTableGcQueues {
+        DroppedTableGcQueues {
+            runtime: VecDeque::new(),
+            files: VecDeque::from(file_deletes),
+        }
+    }
+
+    #[inline]
+    fn push_runtime(&mut self, item: DroppedTableGcItem) {
+        self.runtime.push_back(item);
+    }
+
+    #[cfg(test)]
+    #[inline]
+    fn pending_counts(&self) -> (usize, usize) {
+        (self.runtime.len(), self.files.len())
+    }
+}
+
 impl TransactionSystem {
+    /// Enqueue a logically dropped table runtime for purge-horizon destruction.
+    ///
+    /// The wake requests only dropped-table cleanup, so foreground DROP TABLE
+    /// does not trigger a full undo/index/page GC cycle.
+    ///
+    /// A send failure is harmless during shutdown: the engine owner will join the
+    /// purge worker, and any remaining queue entries become irrelevant once the
+    /// owner tears down the whole runtime.
+    #[inline]
+    pub(crate) fn enqueue_dropped_table(
+        &self,
+        table_id: TableID,
+        drop_cts: TrxID,
+        table: Arc<Table>,
+    ) {
+        self.dropped_table_gc
+            .lock()
+            .push_runtime(DroppedTableGcItem {
+                table_id,
+                drop_cts,
+                table,
+            });
+        self.request_dropped_table_purge();
+    }
+
+    /// Wake the purge coordinator for dropped-table cleanup only.
+    ///
+    /// This is best-effort. Dropping the purge receiver is the normal shutdown
+    /// signal path, so callers must not treat a failed send as a storage error.
+    #[inline]
+    pub(crate) fn request_dropped_table_purge(&self) {
+        let _ = self.purge_tx.send(Purge::DroppedTable);
+    }
+
+    #[cfg(test)]
+    #[inline]
+    pub(crate) fn dropped_table_gc_pending_counts(&self) -> (usize, usize) {
+        self.dropped_table_gc.lock().pending_counts()
+    }
+
     #[inline]
     pub(crate) fn start_purge_threads(
         trx_sys: QuiescentGuard<Self>,
@@ -242,6 +353,100 @@ impl TransactionSystem {
         }
         Ok(())
     }
+
+    #[inline]
+    async fn process_dropped_table_gc(
+        &self,
+        guards: &PoolGuards,
+        min_active_sts: TrxID,
+    ) -> Result<()> {
+        // First detach eligible runtime entries under the queue lock, then do
+        // async destruction without holding the lock. Entries that are not past
+        // the purge horizon stay queued for a later wake.
+        let eligible = {
+            let mut queues = self.dropped_table_gc.lock();
+            let mut eligible = Vec::new();
+            let mut retained = VecDeque::new();
+            while let Some(item) = queues.runtime.pop_front() {
+                if item.drop_cts < min_active_sts {
+                    eligible.push(item);
+                } else {
+                    retained.push_back(item);
+                }
+            }
+            queues.runtime = retained;
+            eligible
+        };
+
+        let mut stale_handles = Vec::new();
+        let mut file_deletes = Vec::new();
+        for DroppedTableGcItem {
+            table_id,
+            drop_cts,
+            table,
+        } in eligible
+        {
+            match Arc::try_unwrap(table) {
+                Ok(table) => {
+                    // At this point purge has exclusive ownership of the dropped
+                    // runtime. Any destroy error is fatal to the storage runtime
+                    // and is converted to poison by the caller.
+                    table.destroy_dropped_runtime(guards).await?;
+                    file_deletes.push(DroppedTableFileDeleteItem::new(table_id, drop_cts));
+                }
+                Err(table) => {
+                    // Stale external table handles are not fatal. Keep retrying
+                    // on future purge wakes until the last handle is released.
+                    stale_handles.push(DroppedTableGcItem {
+                        table_id,
+                        drop_cts,
+                        table,
+                    })
+                }
+            }
+        }
+
+        {
+            let mut queues = self.dropped_table_gc.lock();
+            queues.runtime.extend(stale_handles);
+            queues.files.extend(file_deletes);
+        }
+
+        self.process_dropped_table_file_deletes();
+        Ok(())
+    }
+
+    #[inline]
+    fn process_dropped_table_file_deletes(&self) {
+        // File deletion is a checkpoint-gated housekeeping step. Unlike runtime
+        // destroy, unlink failure is retryable and does not poison the engine:
+        // retain the item and let a later purge wake try again.
+        let catalog_replay_start_ts = match self.catalog.storage.checkpoint_snapshot() {
+            Ok(snapshot) => snapshot.catalog_replay_start_ts,
+            Err(_) => return,
+        };
+        let file_deletes = {
+            let mut queues = self.dropped_table_gc.lock();
+            queues.files.drain(..).collect::<Vec<_>>()
+        };
+        if file_deletes.is_empty() {
+            return;
+        }
+
+        let mut retained = Vec::new();
+        for item in file_deletes {
+            if catalog_replay_start_ts <= item.drop_cts {
+                retained.push(item);
+                continue;
+            }
+            if self.table_fs.delete_user_table_file(item.table_id).is_err() {
+                retained.push(item);
+            }
+        }
+        if !retained.is_empty() {
+            self.dropped_table_gc.lock().files.extend(retained);
+        }
+    }
 }
 
 /// ActiveStsList maintains snapshot timestamps of active transactions
@@ -432,10 +637,40 @@ pub enum GC {
     Commit(HashMap<usize, Vec<CommittedTrx>>),
 }
 
-/// Commands sent from GC analyzers to purge workers.
+/// Commands sent to purge workers.
 pub enum Purge {
+    /// Stop the purge coordinator and let worker shutdown join the thread.
     Stop,
+    /// Run a full transaction/index/row-page purge cycle.
     Next,
+    /// Run only dropped-table runtime/file cleanup.
+    DroppedTable,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PurgeWork {
+    Full,
+    DroppedTable,
+}
+
+#[inline]
+fn coalesce_purge_work(purge_chan: &Receiver<Purge>, initial: Purge) -> Option<PurgeWork> {
+    // Collapse queued wakeups so a burst of dropped-table-only requests does not
+    // trigger repeated scans, while any full GC request upgrades the cycle.
+    // `Stop` always wins because shutdown must not be delayed behind cleanup.
+    let mut work = match initial {
+        Purge::Stop => return None,
+        Purge::Next => PurgeWork::Full,
+        Purge::DroppedTable => PurgeWork::DroppedTable,
+    };
+    while let Ok(purge) = purge_chan.try_recv() {
+        match purge {
+            Purge::Stop => return None,
+            Purge::Next => work = PurgeWork::Full,
+            Purge::DroppedTable => (),
+        }
+    }
+    Some(work)
 }
 
 struct PurgeTask {
@@ -474,46 +709,51 @@ impl PurgeLoop for PurgeSingleThreaded {
         // initialize min_active_sts.
         let mut min_sts = trx_sys.global_visible_sts();
         while let Ok(purge) = purge_chan.recv() {
-            match purge {
-                Purge::Stop => return,
-                Purge::Next => {
-                    // Cascade multiple Next message to avoid unnecessary work.
-                    while let Ok(p) = purge_chan.try_recv() {
-                        match p {
-                            Purge::Stop => return,
-                            Purge::Next => (),
-                        }
+            let Some(work) = coalesce_purge_work(&purge_chan, purge) else {
+                return;
+            };
+            let curr_sts = trx_sys.calc_min_active_sts_for_gc();
+            if work == PurgeWork::Full && curr_sts > min_sts {
+                // Start GC. Purge undo/index for all partitions first, then
+                // deallocate retired row pages once to avoid cross-partition ordering issue.
+                let mut gc_row_pages = HashSet::new();
+                for partition in &*trx_sys.log_partitions {
+                    let mut trx_list = vec![];
+                    for gc_bucket in &partition.gc_buckets {
+                        gc_bucket.get_purge_list(curr_sts, &mut trx_list);
                     }
-                    let curr_sts = trx_sys.calc_min_active_sts_for_gc();
-                    if curr_sts > min_sts {
-                        // Start GC. Purge undo/index for all partitions first, then
-                        // deallocate retired row pages once to avoid cross-partition ordering issue.
-                        let mut gc_row_pages = HashSet::new();
-                        for partition in &*trx_sys.log_partitions {
-                            let mut trx_list = vec![];
-                            for gc_bucket in &partition.gc_buckets {
-                                gc_bucket.get_purge_list(curr_sts, &mut trx_list);
-                            }
-                            let log_no = partition.log_no;
-                            let partition_gc_pages = trx_sys
-                                .purge_trx_list(catalog, &pool_guards, log_no, trx_list, curr_sts)
-                                .await;
-                            gc_row_pages.extend(partition_gc_pages);
-                        }
-                        if !handle_gc_row_page_deallocation_result(
-                            trx_sys,
-                            trx_sys
-                                .deallocate_gc_row_pages(mem_pool, &pool_guards, gc_row_pages)
-                                .await,
-                        ) {
-                            return;
-                        }
-                    }
-                    // Once GC is finished, update global_visible_sts so other threads can use it to
-                    // speed up visibility check.
-                    trx_sys.update_global_visible_sts(curr_sts);
-                    min_sts = curr_sts;
+                    let log_no = partition.log_no;
+                    let partition_gc_pages = trx_sys
+                        .purge_trx_list(catalog, &pool_guards, log_no, trx_list, curr_sts)
+                        .await;
+                    gc_row_pages.extend(partition_gc_pages);
                 }
+                if !handle_gc_row_page_deallocation_result(
+                    trx_sys,
+                    trx_sys
+                        .deallocate_gc_row_pages(mem_pool, &pool_guards, gc_row_pages)
+                        .await,
+                ) {
+                    // The helper already poisoned runtime admission. Exiting the
+                    // loop leaves shutdown to join this already-finished worker.
+                    return;
+                }
+            }
+            if !handle_gc_row_page_deallocation_result(
+                trx_sys,
+                trx_sys
+                    .process_dropped_table_gc(&pool_guards, curr_sts)
+                    .await,
+            ) {
+                // Dropped-table runtime destruction failed after purge took
+                // ownership. Do not retry in-place against a poisoned runtime.
+                return;
+            }
+            if work == PurgeWork::Full {
+                // Once GC is finished, update global_visible_sts so other threads can use it to
+                // speed up visibility check.
+                trx_sys.update_global_visible_sts(curr_sts);
+                min_sts = curr_sts;
             }
         }
     }
@@ -535,68 +775,76 @@ impl PurgeLoop for PurgeDispatcher {
         let mut min_sts = trx_sys.global_visible_sts();
         let mut dispatch_no: usize = 0;
         'DISPATCH_LOOP: while let Ok(purge) = purge_chan.recv_async().await {
-            match purge {
-                Purge::Stop => break 'DISPATCH_LOOP,
-                Purge::Next => {
-                    // Cascade multiple Next message to avoid unnecessary work.
-                    while let Ok(p) = purge_chan.try_recv() {
-                        match p {
-                            Purge::Stop => break 'DISPATCH_LOOP,
-                            Purge::Next => (),
-                        }
-                    }
-                    let curr_sts = trx_sys.calc_min_active_sts_for_gc();
-                    if curr_sts > min_sts {
-                        // dispatch tasks to executors
-                        let (done_tx, done_rx) = flume::unbounded();
-                        let mut expected_tasks = 0usize;
-                        let gc_row_pages = Arc::new(Mutex::new(vec![]));
-                        for partition in &*trx_sys.log_partitions {
-                            let log_no = partition.log_no;
-                            for gc_no in 0..partition.gc_buckets.len() {
-                                let task = PurgeTask {
-                                    log_no,
-                                    gc_no,
-                                    min_active_sts: curr_sts,
-                                    done: done_tx.clone(),
-                                    gc_row_pages: Arc::clone(&gc_row_pages),
-                                };
-                                if self.0[dispatch_no % self.0.len()].send(task).is_ok() {
-                                    expected_tasks += 1;
-                                }
-                                dispatch_no += 1;
-                            }
-                        }
-                        drop(done_tx);
-                        // wait for all executors to finish their tasks in this cycle.
-                        for _ in 0..expected_tasks {
-                            if done_rx.recv_async().await.is_err() {
-                                break 'DISPATCH_LOOP;
-                            }
-                        }
-                        let gc_row_pages = {
-                            let mut g = gc_row_pages.lock();
-                            g.drain(..).collect::<HashSet<PageID>>()
+            let Some(work) = coalesce_purge_work(&purge_chan, purge) else {
+                break 'DISPATCH_LOOP;
+            };
+            let curr_sts = trx_sys.calc_min_active_sts_for_gc();
+            if work == PurgeWork::Full && curr_sts > min_sts {
+                // dispatch tasks to executors
+                let (done_tx, done_rx) = flume::unbounded();
+                let mut expected_tasks = 0usize;
+                let gc_row_pages = Arc::new(Mutex::new(vec![]));
+                for partition in &*trx_sys.log_partitions {
+                    let log_no = partition.log_no;
+                    for gc_no in 0..partition.gc_buckets.len() {
+                        let task = PurgeTask {
+                            log_no,
+                            gc_no,
+                            min_active_sts: curr_sts,
+                            done: done_tx.clone(),
+                            gc_row_pages: Arc::clone(&gc_row_pages),
                         };
-                        if !handle_gc_row_page_deallocation_result(
-                            trx_sys,
-                            trx_sys
-                                .deallocate_gc_row_pages(mem_pool, &pool_guards, gc_row_pages)
-                                .await,
-                        ) {
-                            return;
+                        if self.0[dispatch_no % self.0.len()].send(task).is_ok() {
+                            expected_tasks += 1;
                         }
-
-                        // Once GC is finished, update global_visible_sts so other threads can use it to
-                        // speed up visibility check.
-                        trx_sys.update_global_visible_sts(curr_sts);
-                        min_sts = curr_sts;
+                        dispatch_no += 1;
                     }
                 }
+                drop(done_tx);
+                // wait for all executors to finish their tasks in this cycle.
+                for _ in 0..expected_tasks {
+                    if done_rx.recv_async().await.is_err() {
+                        break 'DISPATCH_LOOP;
+                    }
+                }
+                let gc_row_pages = {
+                    let mut g = gc_row_pages.lock();
+                    g.drain(..).collect::<HashSet<PageID>>()
+                };
+                if !handle_gc_row_page_deallocation_result(
+                    trx_sys,
+                    trx_sys
+                        .deallocate_gc_row_pages(mem_pool, &pool_guards, gc_row_pages)
+                        .await,
+                ) {
+                    // Poison is the durable-consistency boundary here. The
+                    // dispatcher exits; once the worker closure drops the
+                    // dispatcher value, executor task channels close and
+                    // executor threads can exit before shutdown joins them.
+                    return;
+                }
+            }
+            if !handle_gc_row_page_deallocation_result(
+                trx_sys,
+                trx_sys
+                    .process_dropped_table_gc(&pool_guards, curr_sts)
+                    .await,
+            ) {
+                // Dropped-table destroy failure is fatal; exiting also closes
+                // the executor task channels when this dispatcher is dropped.
+                return;
+            }
+            if work == PurgeWork::Full && curr_sts > min_sts {
+                // Once GC is finished, update global_visible_sts so other threads can use it to
+                // speed up visibility check.
+                trx_sys.update_global_visible_sts(curr_sts);
+                min_sts = curr_sts;
             }
         }
 
-        // notify executors to quit
+        // Notify executors to quit after a normal Stop or channel close. Fatal
+        // poison returns above; then the worker closure drops the dispatcher and
+        // closes these same task channels.
         self.0.clear();
     }
 }
@@ -697,6 +945,37 @@ mod tests {
         key: &SelectKey,
     ) -> crate::error::Result<DeleteMvcc> {
         stmt.table_delete_unique_mvcc(table, key, false).await
+    }
+
+    #[test]
+    fn test_coalesce_purge_work_preserves_strongest_request() {
+        let (_tx, rx) = flume::unbounded();
+        assert_eq!(
+            coalesce_purge_work(&rx, Purge::DroppedTable),
+            Some(PurgeWork::DroppedTable)
+        );
+
+        let (tx, rx) = flume::unbounded();
+        tx.send(Purge::DroppedTable).unwrap();
+        tx.send(Purge::Next).unwrap();
+        assert_eq!(
+            coalesce_purge_work(&rx, Purge::DroppedTable),
+            Some(PurgeWork::Full)
+        );
+
+        let (tx, rx) = flume::unbounded();
+        tx.send(Purge::DroppedTable).unwrap();
+        assert_eq!(coalesce_purge_work(&rx, Purge::Next), Some(PurgeWork::Full));
+    }
+
+    #[test]
+    fn test_coalesce_purge_work_stop_wins() {
+        let (tx, rx) = flume::unbounded();
+        tx.send(Purge::Next).unwrap();
+        tx.send(Purge::Stop).unwrap();
+        tx.send(Purge::DroppedTable).unwrap();
+        assert_eq!(coalesce_purge_work(&rx, Purge::DroppedTable), None);
+        assert_eq!(coalesce_purge_work(&rx, Purge::Stop), None);
     }
 
     #[test]

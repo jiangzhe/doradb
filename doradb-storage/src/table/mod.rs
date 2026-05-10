@@ -18,6 +18,8 @@ pub(crate) use lifecycle::{CheckpointPublishLease, TableLifecycle};
 pub use persistence::*;
 pub use recover::*;
 pub(crate) use rollback::IndexRollback;
+#[cfg(test)]
+pub(crate) use tests::test_user_table_id;
 
 use crate::buffer::guard::{PageExclusiveGuard, PageGuard, PageSharedGuard};
 use crate::buffer::page::{PageID, VersionedPageID};
@@ -449,6 +451,29 @@ impl<D: BufferPool, I: BufferPool> GenericMemTable<D, I> {
             .expect("missing secondary-index pool guard")
     }
 
+    /// Destroy all mutable memory structures owned by this table runtime.
+    #[inline]
+    pub(crate) async fn destroy(self, guards: &PoolGuards) -> Result<()> {
+        let row_pool_guard = guards
+            .try_row_guard(self.row_pool_role)
+            .expect("missing row-page pool guard");
+        let index_pool_guard = guards
+            .try_guard(self.index_pool_role)
+            .expect("missing secondary-index pool guard");
+        let GenericMemTable {
+            mem_pool,
+            blk_idx,
+            sec_idx,
+            ..
+        } = self;
+        for index in sec_idx {
+            index.destroy(index_pool_guard).await?;
+        }
+        blk_idx
+            .destroy(guards.meta_guard(), &*mem_pool, row_pool_guard)
+            .await
+    }
+
     #[inline]
     pub(crate) async fn get_row_page_shared(
         &self,
@@ -817,6 +842,29 @@ impl Table {
     #[inline]
     pub(crate) fn mark_dropped_lifecycle(&self) -> Result<()> {
         self.lifecycle.mark_dropped(self.table_id())
+    }
+
+    /// Consume and destroy all in-memory runtime state for a dropped table.
+    ///
+    /// At runtime this is called by purge after the table has been logically
+    /// removed from catalog and no stale `Arc<Table>` handles remain. Recovery
+    /// can also use it before normal admission opens. Any runtime error means
+    /// purge may have partially traversed owned memory/index structures, so the
+    /// purge caller treats failure as fatal storage poison rather than retrying
+    /// inline.
+    #[inline]
+    pub(crate) async fn destroy_dropped_runtime(self, guards: &PoolGuards) -> Result<()> {
+        let Table {
+            mem,
+            storage: _storage,
+            sec_idx,
+            lifecycle: _lifecycle,
+        } = self;
+        let index_pool_guard = guards.index_guard();
+        for index in sec_idx {
+            index.destroy(index_pool_guard).await?;
+        }
+        mem.destroy(guards).await
     }
 
     /// Build a lightweight operation accessor over this table runtime.

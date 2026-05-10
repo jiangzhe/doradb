@@ -1473,6 +1473,7 @@ pub(crate) mod tests {
     use crate::file::table_file::MutableTableFile;
     use crate::lock::tests::{debug_snapshot, try_acquire, try_acquire_grouped};
     use crate::row::ops::SelectKey;
+    use crate::table::test_user_table_id;
     use crate::trx::stmt::tests as stmt_tests;
     use crate::trx::undo::{IndexUndo, IndexUndoKind, OwnedRowUndo, RowUndoKind};
     use crate::value::ValKind;
@@ -1580,7 +1581,7 @@ pub(crate) mod tests {
             .count()
     }
 
-    async fn swapped_old_root(engine: &Engine, table_id: u64) -> (usize, OldRoot) {
+    async fn swapped_old_root(engine: &Engine, table_id_offset: u64) -> (usize, OldRoot) {
         let metadata = Arc::new(TableMetadata::new(
             vec![ColumnSpec::new(
                 "c0",
@@ -1589,6 +1590,7 @@ pub(crate) mod tests {
             )],
             vec![],
         ));
+        let table_id = test_user_table_id(table_id_offset);
         let mutable = engine
             .table_fs
             .create_table_file(table_id, metadata, false)

@@ -6,7 +6,7 @@ use crate::buffer::{EvictableBufferPool, PoolGuards, PoolRole, test_frame_kind};
 use crate::catalog::tests::table4;
 use crate::catalog::{
     CatalogCheckpointScanStopReason, ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey,
-    IndexSpec, TableSpec,
+    IndexSpec, TableID, TableSpec, USER_OBJ_ID_START,
 };
 use crate::conf::{EngineConfig, EvictableBufferPoolConfig, FileSystemConfig, TrxSysConfig};
 use crate::engine::Engine;
@@ -63,6 +63,13 @@ thread_local! {
 const LIGHTWEIGHT_TEST_BUFFER_BYTES: usize = 16 * 1024 * 1024;
 const LIGHTWEIGHT_TEST_MAX_FILE_BYTES: usize = 32 * 1024 * 1024;
 const LIGHTWEIGHT_TEST_READONLY_BUFFER_BYTES: usize = 32 * 1024 * 1024;
+
+#[inline]
+pub(crate) fn test_user_table_id(offset: TableID) -> TableID {
+    USER_OBJ_ID_START
+        .checked_add(offset)
+        .expect("test user table id offset overflow")
+}
 
 pub(super) fn set_test_force_lwc_build_error(enabled: bool) {
     TEST_FORCE_LWC_BUILD_ERROR.with(|flag| flag.set(enabled));
@@ -588,7 +595,10 @@ fn test_lwc_select_surfaces_persisted_corruption() {
         let entry = index.locate_block(row_id).await.unwrap().unwrap();
         let block_id = entry.block_id();
 
-        let table_file_path = sys.engine.table_fs.table_file_path(sys.table.table_id());
+        let table_file_path = sys
+            .engine
+            .table_fs
+            .user_table_file_path(sys.table.table_id());
         corrupt_page_checksum(table_file_path, block_id);
 
         let mut trx = session.try_begin_trx().unwrap().unwrap();
@@ -635,7 +645,10 @@ fn test_lwc_select_surfaces_column_block_index_row_metadata_corruption() {
         );
         let entry = index.locate_block(row_id).await.unwrap().unwrap();
 
-        let table_file_path = sys.engine.table_fs.table_file_path(sys.table.table_id());
+        let table_file_path = sys
+            .engine
+            .table_fs
+            .user_table_file_path(sys.table.table_id());
         corrupt_leaf_row_codec(table_file_path, entry.leaf_page_id, 0);
         let _ = sys
             .table
@@ -686,7 +699,10 @@ fn test_lwc_select_surfaces_column_block_index_zero_block_id_corruption() {
         );
         let entry = index.locate_block(row_id).await.unwrap().unwrap();
 
-        let table_file_path = sys.engine.table_fs.table_file_path(sys.table.table_id());
+        let table_file_path = sys
+            .engine
+            .table_fs
+            .user_table_file_path(sys.table.table_id());
         corrupt_leaf_block_id(table_file_path, entry.leaf_page_id, 0);
         let _ = sys
             .table
@@ -737,7 +753,10 @@ fn test_lwc_select_surfaces_row_shape_fingerprint_mismatch_corruption() {
         );
         let entry = index.locate_block(row_id).await.unwrap().unwrap();
 
-        let table_file_path = sys.engine.table_fs.table_file_path(sys.table.table_id());
+        let table_file_path = sys
+            .engine
+            .table_fs
+            .user_table_file_path(sys.table.table_id());
         corrupt_lwc_row_shape_fingerprint(table_file_path, entry.block_id());
         let _ = sys
             .table
@@ -2511,7 +2530,10 @@ fn test_secondary_mem_index_cleanup_propagates_cold_delete_overlay_proof_error()
                 .unwrap()
         );
 
-        let table_file_path = sys.engine.table_fs.table_file_path(sys.table.table_id());
+        let table_file_path = sys
+            .engine
+            .table_fs
+            .user_table_file_path(sys.table.table_id());
         corrupt_lwc_row_shape_fingerprint(table_file_path, block_id);
         let _ = sys
             .table
@@ -3970,7 +3992,10 @@ fn test_checkpoint_fails_on_invalid_v2_delete_metadata() {
         let marker2_ts = delete_marker_ts(marker2);
         wait_gc_cutoff_after(&session, marker2_ts).await;
 
-        let table_file_path = sys.engine.table_fs.table_file_path(sys.table.table_id());
+        let table_file_path = sys
+            .engine
+            .table_fs
+            .user_table_file_path(sys.table.table_id());
         corrupt_leaf_delete_codec(table_file_path, entry.leaf_page_id, 0);
         let _ = sys
             .table
@@ -4050,7 +4075,10 @@ fn test_checkpoint_fails_on_short_v2_delete_section_header() {
         let marker2_ts = delete_marker_ts(marker2);
         wait_gc_cutoff_after(&session, marker2_ts).await;
 
-        let table_file_path = sys.engine.table_fs.table_file_path(sys.table.table_id());
+        let table_file_path = sys
+            .engine
+            .table_fs
+            .user_table_file_path(sys.table.table_id());
         corrupt_leaf_short_delete_section_header(table_file_path, entry.leaf_page_id, 0);
         let _ = sys
             .table
@@ -5936,7 +5964,7 @@ fn test_drop_table_logical_cascade_and_stale_handles() {
         let sys = TestSys::new_evictable_with_non_unique_name_index().await;
         let table_id = sys.table.table_id();
         let stale_table = Arc::clone(&sys.table);
-        let table_file_path = sys.engine.table_fs.table_file_path(table_id);
+        let table_file_path = sys.engine.table_fs.user_table_file_path(table_id);
         let mut session = sys.try_new_session().unwrap();
         insert_one_row(
             &stale_table,
@@ -6028,6 +6056,7 @@ fn test_drop_table_logical_cascade_and_stale_handles() {
                 .is_empty()
         );
         assert!(std::path::Path::new(&table_file_path).exists());
+        assert_eq!(sys.engine.trx_sys.dropped_table_gc_pending_counts(), (1, 0));
 
         let err = session.drop_table(table_id).await.unwrap_err();
         assert_eq!(err.operation_error(), Some(OperationError::TableNotFound));
@@ -6062,6 +6091,51 @@ fn test_drop_table_logical_cascade_and_stale_handles() {
         drop(stale_table);
         drop(session);
         sys.clean_all();
+    });
+}
+
+#[test]
+fn test_drop_table_gc_retries_stale_handle_and_deletes_file_after_catalog_checkpoint() {
+    smol::block_on(async {
+        let temp_dir = TempDir::new().unwrap();
+        let main_dir = temp_dir.path().to_path_buf();
+        let engine = lightweight_test_engine_config(main_dir, "drop_gc_destroy")
+            .build()
+            .await
+            .unwrap();
+        let mut session = engine.try_new_session().unwrap();
+        let (table_spec, index_specs) = drop_table_test_spec();
+        let table_id = session.create_table(table_spec, index_specs).await.unwrap();
+        let stale_table = engine.catalog().get_table(table_id).await.unwrap();
+        insert_one_row(
+            &stale_table,
+            &mut session,
+            vec![Val::from(11), Val::from("gc-delete")],
+        )
+        .await;
+        let table_file_path = engine.table_fs.user_table_file_path(table_id);
+
+        session.drop_table(table_id).await.unwrap();
+        engine.trx_sys.request_dropped_table_purge();
+        wait_dropped_table_gc_counts(&engine, (1, 0)).await;
+        assert!(std::path::Path::new(&table_file_path).exists());
+
+        drop(stale_table);
+        engine.trx_sys.request_dropped_table_purge();
+        wait_dropped_table_gc_counts(&engine, (0, 1)).await;
+        assert!(std::path::Path::new(&table_file_path).exists());
+
+        engine
+            .catalog()
+            .checkpoint_now(&engine.trx_sys)
+            .await
+            .unwrap();
+        wait_dropped_table_gc_counts(&engine, (0, 0)).await;
+        wait_path_exists(&table_file_path, false).await;
+
+        drop(session);
+        drop(engine);
+        drop(temp_dir);
     });
 }
 
@@ -6318,7 +6392,7 @@ fn test_drop_table_recovery_replays_committed_drop_before_catalog_checkpoint() {
         let mut session = engine.try_new_session().unwrap();
         let (table_spec, index_specs) = drop_table_test_spec();
         let table_id = session.create_table(table_spec, index_specs).await.unwrap();
-        let table_file_path = engine.table_fs.table_file_path(table_id);
+        let table_file_path = engine.table_fs.user_table_file_path(table_id);
 
         session.drop_table(table_id).await.unwrap();
         assert!(std::path::Path::new(&table_file_path).exists());
@@ -6331,14 +6405,26 @@ fn test_drop_table_recovery_replays_committed_drop_before_catalog_checkpoint() {
             .await
             .unwrap();
         assert!(engine.catalog().get_table(table_id).await.is_none());
+        wait_dropped_table_gc_counts(&engine, (0, 1)).await;
         assert!(std::path::Path::new(&table_file_path).exists());
+        let mut session = engine.try_new_session().unwrap();
+        let (table_spec, index_specs) = drop_table_test_spec();
+        let _ = session.create_table(table_spec, index_specs).await.unwrap();
+        engine
+            .catalog()
+            .checkpoint_now(&engine.trx_sys)
+            .await
+            .unwrap();
+        wait_dropped_table_gc_counts(&engine, (0, 0)).await;
+        wait_path_exists(&table_file_path, false).await;
+        drop(session);
         drop(engine);
         drop(temp_dir);
     });
 }
 
 #[test]
-fn test_drop_table_catalog_checkpoint_persists_absence_with_leftover_file() {
+fn test_drop_table_catalog_checkpoint_cleans_absent_leftover_file_on_startup() {
     smol::block_on(async {
         let temp_dir = TempDir::new().unwrap();
         let main_dir = temp_dir.path().to_path_buf();
@@ -6356,7 +6442,7 @@ fn test_drop_table_catalog_checkpoint_persists_absence_with_leftover_file() {
             vec![Val::from(7), Val::from("checkpoint-covered")],
         )
         .await;
-        let table_file_path = engine.table_fs.table_file_path(table_id);
+        let table_file_path = engine.table_fs.user_table_file_path(table_id);
 
         session.drop_table(table_id).await.unwrap();
         engine
@@ -6384,7 +6470,7 @@ fn test_drop_table_catalog_checkpoint_persists_absence_with_leftover_file() {
             .await
             .unwrap();
         assert!(engine.catalog().get_table(table_id).await.is_none());
-        assert!(std::path::Path::new(&table_file_path).exists());
+        wait_path_exists(&table_file_path, false).await;
         drop(engine);
         drop(temp_dir);
     });
@@ -7980,6 +8066,29 @@ async fn wait_gc_cutoff_after(session: &Session, ts: TrxID) {
         smol::Timer::after(Duration::from_millis(20)).await;
     }
     panic!("GC cutoff did not advance past {ts}");
+}
+
+async fn wait_dropped_table_gc_counts(engine: &Engine, expected: (usize, usize)) {
+    for _ in 0..250 {
+        if engine.trx_sys.dropped_table_gc_pending_counts() == expected {
+            return;
+        }
+        smol::Timer::after(Duration::from_millis(50)).await;
+    }
+    panic!(
+        "dropped table GC counts did not reach {expected:?}; actual={:?}",
+        engine.trx_sys.dropped_table_gc_pending_counts()
+    );
+}
+
+async fn wait_path_exists(path: &str, expected: bool) {
+    for _ in 0..250 {
+        if std::path::Path::new(path).exists() == expected {
+            return;
+        }
+        smol::Timer::after(Duration::from_millis(50)).await;
+    }
+    panic!("path existence did not become {expected}: {path}");
 }
 
 async fn checkpoint_published(table: &Table, session: &mut Session) -> TrxID {

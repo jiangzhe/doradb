@@ -123,6 +123,14 @@ Long-running readers are protected by root indirection:
   covering table metadata, `ColumnBlockIndex` nodes, LWC replacement blocks,
   and secondary-index `DiskTree` blocks
 
+Whole-table deletion is outside table-file page GC. After a committed
+`DROP TABLE`, transaction GC first destroys the removed runtime after
+`Global_Min_Active_STS > drop_cts`. The table file itself is unlinked only
+after the catalog checkpoint boundary proves the catalog absence is durable:
+`catalog_replay_start_ts > drop_cts`. Startup may delete leftover deterministic
+user-table files that are below checkpointed `next_user_obj_id` and absent from
+the checkpointed catalog table list.
+
 ## 6. LWC Blocks
 
 Persistent rows are stored in LWC blocks using a PAX-style layout optimized for:

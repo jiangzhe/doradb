@@ -223,6 +223,16 @@ On restart:
 At this point the engine has all checkpointed cold data, cold delete state, and
 checkpointed cold secondary-index state.
 
+Startup also removes leftover deterministic user-table files when all of these
+conditions are true:
+
+- the file name decodes to a user table id
+- the id is below checkpointed `next_user_obj_id`
+- the id is absent from the checkpointed catalog table list
+
+This cleanup is safe because catalog absence is already durable in
+`catalog.mtb`.
+
 ### 5.3 Log Replay
 
 For each redo record after the coarse replay floor:
@@ -244,6 +254,11 @@ There is no extra per-index replay predicate.
 Transactions that committed through the ordered no-log path have no replay
 record. Recovery does not observe their volatile CTS and does not use it when
 seeding future timestamps.
+
+For replayed `DropTable` DDL, recovery removes the user-table runtime and
+destroys its in-memory state immediately. It does not unlink the table file at
+replay time. File deletion is deferred until a later catalog checkpoint advances
+`catalog_replay_start_ts` past the drop CTS.
 
 ### 5.4 Why Index Recovery Works Without `Index_Rec_CTS`
 
@@ -292,6 +307,22 @@ $$ \text{Entry.CTS} < \text{Global\_Min\_Active\_STS} $$
 
 - each checkpoint publishes new roots
 - unreachable old pages are reclaimed later
+
+### 6.4 Dropped Table Cleanup
+
+Foreground `DROP TABLE` commits the catalog deletion and removes the runtime
+handle from the catalog cache. The removed runtime is handed to transaction GC.
+
+Cleanup proceeds in two gates:
+
+1. In-memory runtime state is destroyed only after
+   `Global_Min_Active_STS > drop_cts`. If stale `Arc<Table>` handles still
+   exist, the item remains queued for a later GC cycle.
+2. The deterministic table file is deleted only after
+   `catalog_replay_start_ts > drop_cts`, proving the catalog absence is durable.
+
+Missing files are treated as already deleted. Other unlink errors keep the file
+delete item queued for retry.
 
 ## 7. Summary
 

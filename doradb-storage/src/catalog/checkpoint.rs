@@ -63,7 +63,10 @@ impl Catalog {
     pub async fn checkpoint_now(&self, trx_sys: &TransactionSystem) -> Result<()> {
         let batch = self.scan_checkpoint_batch(trx_sys)?;
         match self.apply_checkpoint_batch(batch).await {
-            Ok(()) => Ok(()),
+            Ok(()) => {
+                trx_sys.request_dropped_table_purge();
+                Ok(())
+            }
             Err(err) if err.kind() == ErrorKind::Io => {
                 Err(trx_sys.poison_storage(FatalError::CheckpointWrite).into())
             }

@@ -1337,6 +1337,7 @@ pub(crate) mod tests {
         LWC_BLOCK_PAYLOAD_SIZE, LwcBlock, LwcBlockHeader, validate_persisted_lwc_block,
     };
     use crate::quiescent::{QuiescentBox, QuiescentGuard};
+    use crate::table::test_user_table_id;
     use crate::value::ValKind;
     use std::ops::Deref;
     use std::os::fd::{AsRawFd, RawFd};
@@ -1360,6 +1361,11 @@ pub(crate) mod tests {
             smol::Timer::after(TEST_WAIT_INTERVAL).await;
         }
         panic!("condition was not satisfied before timeout");
+    }
+
+    #[inline]
+    fn test_user_file_id(offset: TableID) -> FileID {
+        FileID::from(test_user_table_id(offset))
     }
 
     fn assert_completion_data_integrity(err: Error) {
@@ -1569,12 +1575,14 @@ pub(crate) mod tests {
     fn test_readonly_pool_global_stats_track_single_miss_then_warm_hit() {
         smol::block_on(async {
             let (_temp_dir, fs) = build_test_fs();
-            let table_file = fs.create_table_file(120, make_metadata(), false).unwrap();
+            let table_file = fs
+                .create_table_file(test_user_table_id(120), make_metadata(), false)
+                .unwrap();
             let table_file = commit_table_file(&fs, table_file).await;
             write_payload(&fs, &table_file, test_block_id(0), b"readonly-stats").await;
 
             let scope = global_readonly_pool_scope(frame_page_bytes(4));
-            let pool = table_readonly_pool(&scope, 120, &table_file);
+            let pool = table_readonly_pool(&scope, test_user_table_id(120), &table_file);
             let pool_guard = pool.pool_guard();
 
             let cold_start = pool.global_stats();
@@ -1615,17 +1623,21 @@ pub(crate) mod tests {
     fn test_readonly_pool_global_stats_are_shared_across_file_wrappers() {
         smol::block_on(async {
             let (_temp_dir, fs) = build_test_fs();
-            let table_file_a = fs.create_table_file(121, make_metadata(), false).unwrap();
+            let table_file_a = fs
+                .create_table_file(test_user_table_id(121), make_metadata(), false)
+                .unwrap();
             let table_file_a = commit_table_file(&fs, table_file_a).await;
             write_payload(&fs, &table_file_a, test_block_id(0), b"readonly-shared-a").await;
 
-            let table_file_b = fs.create_table_file(122, make_metadata(), false).unwrap();
+            let table_file_b = fs
+                .create_table_file(test_user_table_id(122), make_metadata(), false)
+                .unwrap();
             let table_file_b = commit_table_file(&fs, table_file_b).await;
             write_payload(&fs, &table_file_b, test_block_id(0), b"readonly-shared-b").await;
 
             let scope = global_readonly_pool_scope(frame_page_bytes(4));
-            let pool_a = table_readonly_pool(&scope, 121, &table_file_a);
-            let pool_b = table_readonly_pool(&scope, 122, &table_file_b);
+            let pool_a = table_readonly_pool(&scope, test_user_table_id(121), &table_file_a);
+            let pool_b = table_readonly_pool(&scope, test_user_table_id(122), &table_file_b);
             let pool_a_guard = pool_a.pool_guard();
 
             let start_a = pool_a.global_stats();
@@ -1836,17 +1848,19 @@ pub(crate) mod tests {
     fn test_read_submission_terminal_completion_is_one_shot() {
         smol::block_on(async {
             let (_temp_dir, fs) = build_test_fs();
-            let table_file = fs.create_table_file(118, make_metadata(), false).unwrap();
+            let table_file = fs
+                .create_table_file(test_user_table_id(118), make_metadata(), false)
+                .unwrap();
             let table_file = commit_table_file(&fs, table_file).await;
 
             let global = owned_global_pool(frame_page_bytes(2));
             let pool = owned_readonly_pool(
-                test_file_id(118),
+                test_user_file_id(118),
                 FileKind::TableFile,
                 Arc::clone(table_file.sparse_file()),
                 &global,
             );
-            let key = BlockKey::new(test_file_id(118), test_block_id(14));
+            let key = BlockKey::new(test_user_file_id(118), test_block_id(14));
             let inflight = Arc::new(PageIOCompletion::new());
             let task_arena = global.arena.arena_guard(global.pool_guard());
             let (frame_id, page_guard) =
@@ -2007,13 +2021,15 @@ pub(crate) mod tests {
     fn test_readonly_pool_reloads_when_mapping_points_to_uninitialized_frame() {
         smol::block_on(async {
             let (_temp_dir, fs) = build_test_fs();
-            let table_file = fs.create_table_file(111, make_metadata(), false).unwrap();
+            let table_file = fs
+                .create_table_file(test_user_table_id(111), make_metadata(), false)
+                .unwrap();
             let table_file = commit_table_file(&fs, table_file).await;
             write_payload(&fs, &table_file, test_block_id(9), b"reload").await;
 
             let global = owned_global_pool(frame_page_bytes(2));
             let global_guard = (*global).pool_guard();
-            let key = BlockKey::new(test_file_id(111), test_block_id(9));
+            let key = BlockKey::new(test_user_file_id(111), test_block_id(9));
 
             let mut g0 = global
                 .try_lock_page_exclusive(&global_guard, test_page_id(0))
@@ -2027,7 +2043,7 @@ pub(crate) mod tests {
             drop(g0);
 
             let pool = owned_readonly_pool(
-                test_file_id(111),
+                test_user_file_id(111),
                 FileKind::TableFile,
                 Arc::clone(table_file.sparse_file()),
                 &global,
@@ -2061,7 +2077,9 @@ pub(crate) mod tests {
     fn test_readonly_pool_validated_reload_counts_miss_then_warm_hit() {
         smol::block_on(async {
             let (_temp_dir, fs) = build_test_fs();
-            let table_file = fs.create_table_file(123, make_metadata(), false).unwrap();
+            let table_file = fs
+                .create_table_file(test_user_table_id(123), make_metadata(), false)
+                .unwrap();
             let table_file = commit_table_file(&fs, table_file).await;
 
             let persisted_page = build_valid_persisted_lwc_block();
@@ -2069,7 +2087,7 @@ pub(crate) mod tests {
 
             let global = owned_global_pool(frame_page_bytes(2));
             let global_guard = (*global).pool_guard();
-            let key = BlockKey::new(test_file_id(123), test_block_id(12));
+            let key = BlockKey::new(test_user_file_id(123), test_block_id(12));
 
             let mut g0 = global
                 .try_lock_page_exclusive(&global_guard, test_page_id(0))
@@ -2083,7 +2101,7 @@ pub(crate) mod tests {
             drop(g0);
 
             let pool = owned_readonly_pool(
-                test_file_id(123),
+                test_user_file_id(123),
                 FileKind::TableFile,
                 Arc::clone(table_file.sparse_file()),
                 &global,
@@ -2128,13 +2146,15 @@ pub(crate) mod tests {
     fn test_readonly_pool_miss_load_and_hit() {
         smol::block_on(async {
             let (_temp_dir, fs) = build_test_fs();
-            let table_file = fs.create_table_file(101, make_metadata(), false).unwrap();
+            let table_file = fs
+                .create_table_file(test_user_table_id(101), make_metadata(), false)
+                .unwrap();
             let table_file = commit_table_file(&fs, table_file).await;
             write_payload(&fs, &table_file, test_block_id(3), b"hello").await;
 
             let global = owned_global_pool(frame_page_bytes(4));
             let pool = owned_readonly_pool(
-                test_file_id(101),
+                test_user_file_id(101),
                 FileKind::TableFile,
                 Arc::clone(table_file.sparse_file()),
                 &global,
@@ -2163,13 +2183,15 @@ pub(crate) mod tests {
     fn test_readonly_pool_dedup_concurrent_miss() {
         smol::block_on(async {
             let (_temp_dir, fs) = build_test_fs();
-            let table_file = fs.create_table_file(102, make_metadata(), false).unwrap();
+            let table_file = fs
+                .create_table_file(test_user_table_id(102), make_metadata(), false)
+                .unwrap();
             let table_file = commit_table_file(&fs, table_file).await;
             write_payload(&fs, &table_file, test_block_id(5), b"world").await;
 
             let global = owned_global_pool(frame_page_bytes(8));
             let pool = owned_readonly_pool(
-                test_file_id(102),
+                test_user_file_id(102),
                 FileKind::TableFile,
                 Arc::clone(table_file.sparse_file()),
                 &global,
@@ -2201,7 +2223,9 @@ pub(crate) mod tests {
     fn test_readonly_pool_cancelled_loader_keeps_shared_miss_attempt_alive() {
         smol::block_on(async {
             let (_temp_dir, fs) = build_test_fs();
-            let table_file = fs.create_table_file(112, make_metadata(), false).unwrap();
+            let table_file = fs
+                .create_table_file(test_user_table_id(112), make_metadata(), false)
+                .unwrap();
             let table_file = commit_table_file(&fs, table_file).await;
             write_payload(&fs, &table_file, test_block_id(5), b"hello").await;
             let read_hook = Arc::new(ControlledReadHook::for_page(
@@ -2212,13 +2236,13 @@ pub(crate) mod tests {
 
             let global = owned_global_pool(frame_page_bytes(2));
             let pool = owned_readonly_pool(
-                test_file_id(112),
+                test_user_file_id(112),
                 FileKind::TableFile,
                 Arc::clone(table_file.sparse_file()),
                 &global,
             );
             let pool_guard = pool.pool_guard();
-            let key = BlockKey::new(test_file_id(112), test_block_id(5));
+            let key = BlockKey::new(test_user_file_id(112), test_block_id(5));
 
             let pool_for_loader = (*pool).clone();
             let loader_guard = pool_guard.clone();
@@ -2260,7 +2284,9 @@ pub(crate) mod tests {
     fn test_readonly_pool_cancelled_single_loader_does_not_leak_completed_inflight() {
         smol::block_on(async {
             let (_temp_dir, fs) = build_test_fs();
-            let table_file = fs.create_table_file(113, make_metadata(), false).unwrap();
+            let table_file = fs
+                .create_table_file(test_user_table_id(113), make_metadata(), false)
+                .unwrap();
             let table_file = commit_table_file(&fs, table_file).await;
             write_payload(&fs, &table_file, test_block_id(9), b"solo").await;
             let read_hook = Arc::new(ControlledReadHook::for_page(
@@ -2271,13 +2297,13 @@ pub(crate) mod tests {
 
             let global = owned_global_pool(frame_page_bytes(2));
             let pool = owned_readonly_pool(
-                test_file_id(113),
+                test_user_file_id(113),
                 FileKind::TableFile,
                 Arc::clone(table_file.sparse_file()),
                 &global,
             );
             let pool_guard = pool.pool_guard();
-            let key = BlockKey::new(test_file_id(113), test_block_id(9));
+            let key = BlockKey::new(test_user_file_id(113), test_block_id(9));
 
             let pool_for_loader = (*pool).clone();
             let loader_guard = pool_guard.clone();
@@ -2314,7 +2340,9 @@ pub(crate) mod tests {
     fn test_readonly_pool_detached_miss_load_survives_pool_drop() {
         smol::block_on(async {
             let (_temp_dir, fs) = build_test_fs();
-            let table_file = fs.create_table_file(116, make_metadata(), false).unwrap();
+            let table_file = fs
+                .create_table_file(test_user_table_id(116), make_metadata(), false)
+                .unwrap();
             let table_file = commit_table_file(&fs, table_file).await;
             write_payload(&fs, &table_file, test_block_id(12), b"drop").await;
             let read_hook = Arc::new(ControlledReadHook::for_page(
@@ -2322,11 +2350,11 @@ pub(crate) mod tests {
                 test_block_id(12),
             ));
             let _hook = install_storage_backend_test_hook(read_hook.clone());
-            let key = BlockKey::new(test_file_id(116), test_block_id(12));
+            let key = BlockKey::new(test_user_file_id(116), test_block_id(12));
 
             let global = owned_global_pool(frame_page_bytes(2));
             let pool = owned_readonly_pool(
-                test_file_id(116),
+                test_user_file_id(116),
                 FileKind::TableFile,
                 Arc::clone(table_file.sparse_file()),
                 &global,
@@ -2438,7 +2466,9 @@ pub(crate) mod tests {
     fn test_readonly_pool_shared_io_failure_propagates_to_all_waiters() {
         smol::block_on(async {
             let (_temp_dir, fs) = build_test_fs();
-            let table_file = fs.create_table_file(114, make_metadata(), false).unwrap();
+            let table_file = fs
+                .create_table_file(test_user_table_id(114), make_metadata(), false)
+                .unwrap();
             let table_file = commit_table_file(&fs, table_file).await;
             let read_hook = Arc::new(ControlledReadHook::with_errno(
                 table_file.sparse_file().as_raw_fd(),
@@ -2449,13 +2479,13 @@ pub(crate) mod tests {
 
             let global = owned_global_pool(frame_page_bytes(2));
             let pool = owned_readonly_pool(
-                test_file_id(114),
+                test_user_file_id(114),
                 FileKind::TableFile,
                 Arc::clone(table_file.sparse_file()),
                 &global,
             );
             let pool_guard = pool.pool_guard();
-            let key = BlockKey::new(test_file_id(114), test_block_id(7));
+            let key = BlockKey::new(test_user_file_id(114), test_block_id(7));
 
             let pool_1 = (*pool).clone();
             let waiter1_guard = pool_guard.clone();
@@ -2495,7 +2525,9 @@ pub(crate) mod tests {
     fn test_readonly_pool_shared_validated_load_propagates_validation_failure() {
         smol::block_on(async {
             let (_temp_dir, fs) = build_test_fs();
-            let table_file = fs.create_table_file(115, make_metadata(), false).unwrap();
+            let table_file = fs
+                .create_table_file(test_user_table_id(115), make_metadata(), false)
+                .unwrap();
             let table_file = commit_table_file(&fs, table_file).await;
             let mut page = build_valid_persisted_lwc_block();
             let last_idx = page.len() - 1;
@@ -2509,13 +2541,13 @@ pub(crate) mod tests {
 
             let global = owned_global_pool(frame_page_bytes(2));
             let pool = owned_readonly_pool(
-                test_file_id(115),
+                test_user_file_id(115),
                 FileKind::TableFile,
                 Arc::clone(table_file.sparse_file()),
                 &global,
             );
             let pool_guard = pool.pool_guard();
-            let key = BlockKey::new(test_file_id(115), test_block_id(8));
+            let key = BlockKey::new(test_user_file_id(115), test_block_id(8));
 
             let pool_1 = (*pool).clone();
             let waiter1_guard = pool_guard.clone();
@@ -2567,7 +2599,9 @@ pub(crate) mod tests {
     fn test_readonly_pool_validated_lwc_miss_rejects_corruption_without_mapping() {
         smol::block_on(async {
             let (_temp_dir, fs) = build_test_fs();
-            let table_file = fs.create_table_file(107, make_metadata(), false).unwrap();
+            let table_file = fs
+                .create_table_file(test_user_table_id(107), make_metadata(), false)
+                .unwrap();
             let table_file = commit_table_file(&fs, table_file).await;
 
             let mut page = build_valid_persisted_lwc_block();
@@ -2577,13 +2611,13 @@ pub(crate) mod tests {
 
             let global = owned_global_pool(frame_page_bytes(4));
             let pool = owned_readonly_pool(
-                test_file_id(107),
+                test_user_file_id(107),
                 FileKind::TableFile,
                 Arc::clone(table_file.sparse_file()),
                 &global,
             );
             let pool_guard = pool.pool_guard();
-            let key = BlockKey::new(test_file_id(107), test_block_id(9));
+            let key = BlockKey::new(test_user_file_id(107), test_block_id(9));
 
             let err = match pool
                 .read_validated_block(&pool_guard, test_block_id(9), validate_persisted_lwc_block)
@@ -2602,7 +2636,9 @@ pub(crate) mod tests {
     fn test_readonly_pool_validated_lwc_miss_rejects_invalid_offsets_without_mapping() {
         smol::block_on(async {
             let (_temp_dir, fs) = build_test_fs();
-            let table_file = fs.create_table_file(116, make_metadata(), false).unwrap();
+            let table_file = fs
+                .create_table_file(test_user_table_id(116), make_metadata(), false)
+                .unwrap();
             let table_file = commit_table_file(&fs, table_file).await;
 
             let mut page = build_valid_persisted_lwc_block();
@@ -2620,13 +2656,13 @@ pub(crate) mod tests {
 
             let global = owned_global_pool(frame_page_bytes(4));
             let pool = owned_readonly_pool(
-                test_file_id(116),
+                test_user_file_id(116),
                 FileKind::TableFile,
                 Arc::clone(table_file.sparse_file()),
                 &global,
             );
             let pool_guard = pool.pool_guard();
-            let key = BlockKey::new(test_file_id(116), test_block_id(10));
+            let key = BlockKey::new(test_user_file_id(116), test_block_id(10));
 
             let err = match pool
                 .read_validated_block(&pool_guard, test_block_id(10), validate_persisted_lwc_block)
@@ -2645,7 +2681,9 @@ pub(crate) mod tests {
     fn test_readonly_pool_validated_column_index_miss_rejects_corruption_without_mapping() {
         smol::block_on(async {
             let (_temp_dir, fs) = build_test_fs();
-            let table_file = fs.create_table_file(108, make_metadata(), false).unwrap();
+            let table_file = fs
+                .create_table_file(test_user_table_id(108), make_metadata(), false)
+                .unwrap();
             let table_file = commit_table_file(&fs, table_file).await;
 
             let mut page = build_valid_persisted_column_block_page();
@@ -2655,13 +2693,13 @@ pub(crate) mod tests {
 
             let global = owned_global_pool(frame_page_bytes(4));
             let pool = owned_readonly_pool(
-                test_file_id(108),
+                test_user_file_id(108),
                 FileKind::TableFile,
                 Arc::clone(table_file.sparse_file()),
                 &global,
             );
             let pool_guard = pool.pool_guard();
-            let key = BlockKey::new(test_file_id(108), test_block_id(10));
+            let key = BlockKey::new(test_user_file_id(108), test_block_id(10));
 
             let err = match pool
                 .read_validated_block(
@@ -2684,7 +2722,9 @@ pub(crate) mod tests {
     fn test_readonly_pool_validated_blob_miss_rejects_corruption_without_mapping() {
         smol::block_on(async {
             let (_temp_dir, fs) = build_test_fs();
-            let table_file = fs.create_table_file(109, make_metadata(), false).unwrap();
+            let table_file = fs
+                .create_table_file(test_user_table_id(109), make_metadata(), false)
+                .unwrap();
             let table_file = commit_table_file(&fs, table_file).await;
 
             let mut page = build_valid_persisted_blob_page();
@@ -2694,13 +2734,13 @@ pub(crate) mod tests {
 
             let global = owned_global_pool(frame_page_bytes(4));
             let pool = owned_readonly_pool(
-                test_file_id(109),
+                test_user_file_id(109),
                 FileKind::TableFile,
                 Arc::clone(table_file.sparse_file()),
                 &global,
             );
             let pool_guard = pool.pool_guard();
-            let key = BlockKey::new(test_file_id(109), test_block_id(11));
+            let key = BlockKey::new(test_user_file_id(109), test_block_id(11));
 
             let err = match pool
                 .read_validated_block(&pool_guard, test_block_id(11), validate_persisted_blob_page)
@@ -2740,7 +2780,7 @@ pub(crate) mod tests {
 
             let table_file = engine
                 .table_fs
-                .create_table_file(103, make_metadata(), false)
+                .create_table_file(test_user_table_id(103), make_metadata(), false)
                 .unwrap();
             let table_file = commit_table_file(&engine.table_fs, table_file).await;
 
@@ -2757,7 +2797,7 @@ pub(crate) mod tests {
 
             let table_file = engine
                 .table_fs
-                .open_table_file(103, engine.disk_pool.clone_inner())
+                .open_table_file(test_user_table_id(103), engine.disk_pool.clone_inner())
                 .await
                 .unwrap();
             let pool = engine.disk_pool.clone_inner();
@@ -2782,8 +2822,10 @@ pub(crate) mod tests {
             let loaded_count = capacity + 1;
             let mapped_count = (0..=capacity)
                 .filter(|i| {
-                    let key =
-                        BlockKey::new(test_file_id(103), BlockID::from(base_page_id + *i as u64));
+                    let key = BlockKey::new(
+                        test_user_file_id(103),
+                        BlockID::from(base_page_id + *i as u64),
+                    );
                     engine.disk_pool.try_get_frame_id(&key).is_some()
                 })
                 .count();
@@ -2813,12 +2855,14 @@ pub(crate) mod tests {
         smol::block_on(async {
             let global = owned_global_pool(frame_page_bytes(2));
             let (_temp_dir, fs) = build_test_fs();
-            let table_file = fs.create_table_file(105, make_metadata(), false).unwrap();
+            let table_file = fs
+                .create_table_file(test_user_table_id(105), make_metadata(), false)
+                .unwrap();
             let table_file = commit_table_file(&fs, table_file).await;
             write_payload(&fs, &table_file, test_block_id(9), b"drop-order").await;
 
             let pool = owned_readonly_pool(
-                test_file_id(105),
+                test_user_file_id(105),
                 FileKind::TableFile,
                 Arc::clone(table_file.sparse_file()),
                 &global,
@@ -2839,13 +2883,15 @@ pub(crate) mod tests {
     fn test_readonly_pool_read_block_returns_immutable_guard_type() {
         smol::block_on(async {
             let (_temp_dir, fs) = build_test_fs();
-            let table_file = fs.create_table_file(104, make_metadata(), false).unwrap();
+            let table_file = fs
+                .create_table_file(test_user_table_id(104), make_metadata(), false)
+                .unwrap();
             let table_file = commit_table_file(&fs, table_file).await;
             write_payload(&fs, &table_file, test_block_id(4), b"guard").await;
 
             let global = owned_global_pool(64 * 1024 * 1024);
             let pool = owned_readonly_pool(
-                test_file_id(104),
+                test_user_file_id(104),
                 FileKind::TableFile,
                 Arc::clone(table_file.sparse_file()),
                 &global,

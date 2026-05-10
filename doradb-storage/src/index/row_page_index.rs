@@ -5,7 +5,7 @@ use crate::buffer::page::{BufferPage, BufferPageKind, PAGE_SIZE, assert_buffer_p
 use crate::buffer::{BufferPool, FixedBufferPool, PageID, PoolGuard};
 use crate::catalog::TableMetadata;
 use crate::error::{
-    Result, Validation,
+    InternalError, Result, Validation,
     Validation::{Invalid, Valid},
 };
 use crate::file::BlockID;
@@ -15,6 +15,7 @@ use crate::layout;
 use crate::quiescent::QuiescentGuard;
 use crate::row::{INVALID_ROW_ID, RowID, RowPage};
 use either::Either::{Left, Right};
+use error_stack::Report;
 use parking_lot::Mutex;
 use std::mem;
 use std::sync::Arc;
@@ -367,6 +368,71 @@ impl<P: BufferPool> GenericRowPageIndex<P> {
     #[inline]
     pub fn root_page_id(&self) -> PageID {
         self.root_page_id
+    }
+
+    /// Destroy this row-page index and all in-memory row pages referenced by it.
+    #[inline]
+    pub(crate) async fn destroy<B: BufferPool>(
+        self,
+        meta_pool_guard: &PoolGuard,
+        mem_pool: &B,
+        mem_pool_guard: &PoolGuard,
+    ) -> Result<()> {
+        let mut stack = vec![(self.root_page_id, false)];
+        while let Some((page_id, visited_children)) = stack.pop() {
+            let guard = self
+                .pool
+                .get_page::<RowPageIndexNode>(
+                    meta_pool_guard,
+                    page_id,
+                    LatchFallbackMode::Exclusive,
+                )
+                .await?
+                .lock_exclusive_async()
+                .await
+                .ok_or_else(|| {
+                    Report::new(InternalError::RowPageMissing)
+                        .attach(format!("row-page-index node missing: page_id={page_id}"))
+                })?;
+            if guard.page().is_branch() && !visited_children {
+                let child_page_ids = guard
+                    .page()
+                    .branch_entries()
+                    .iter()
+                    .map(|entry| entry.page_id)
+                    .collect::<Vec<_>>();
+                drop(guard);
+                stack.push((page_id, true));
+                stack.extend(child_page_ids.into_iter().rev().map(|child| (child, false)));
+                continue;
+            }
+            if guard.page().is_leaf() {
+                let row_page_ids = guard
+                    .page()
+                    .leaf_entries()
+                    .iter()
+                    .map(|entry| entry.page_id)
+                    .collect::<Vec<_>>();
+                for row_page_id in row_page_ids {
+                    let row_page = mem_pool
+                        .get_page::<RowPage>(
+                            mem_pool_guard,
+                            row_page_id,
+                            LatchFallbackMode::Exclusive,
+                        )
+                        .await?
+                        .lock_exclusive_async()
+                        .await
+                        .ok_or_else(|| {
+                            Report::new(InternalError::RowPageMissing)
+                                .attach(format!("row page missing: page_id={row_page_id}"))
+                        })?;
+                    mem_pool.deallocate_page(row_page);
+                }
+            }
+            self.pool.deallocate_page(guard);
+        }
+        Ok(())
     }
 
     /// Get row page for insertion.
@@ -1403,6 +1469,37 @@ mod tests {
             }
             drop(engine);
         })
+    }
+
+    #[test]
+    fn test_row_page_index_destroy_reclaims_leaf_row_pages_and_root() {
+        smol::block_on(async {
+            let meta_pool = owned_index_pool(64 * 1024 * 1024);
+            let mem_pool = owned_mem_pool(64 * 1024 * 1024);
+            let meta_guard = (*meta_pool).pool_guard();
+            let mem_guard = (*mem_pool).pool_guard();
+            let metadata = make_test_metadata();
+            let blk_idx = RowPageIndex::new(meta_pool.guard(), &meta_guard, 0)
+                .await
+                .expect("test row-page-index construction should succeed");
+
+            for _ in 0..3 {
+                let page = blk_idx
+                    .get_insert_page_exclusive(&meta_guard, &*mem_pool, &mem_guard, &metadata, 100)
+                    .await
+                    .expect("test insert-page allocation should succeed");
+                drop(page);
+            }
+            assert_eq!((*meta_pool).allocated(), 1);
+            assert_eq!((*mem_pool).allocated(), 3);
+
+            blk_idx
+                .destroy(&meta_guard, &*mem_pool, &mem_guard)
+                .await
+                .unwrap();
+            assert_eq!((*meta_pool).allocated(), 0);
+            assert_eq!((*mem_pool).allocated(), 0);
+        });
     }
 
     #[test]
