@@ -14,7 +14,10 @@ Current code references:
 
 ## Deferred From (Optional)
 
-Current review-finding verification for `doradb-storage/src/trx/purge.rs`; related design source `docs/rfcs/0017-drop-table-lifecycle-recovery.md`.
+- Task: `docs/tasks/000145-gc-managed-dropped-table-destroy.md`
+- RFC: `docs/rfcs/0017-drop-table-lifecycle-recovery.md` phase 4
+- Review Finding: `doradb-storage/src/trx/purge.rs` retained dropped-table GC
+  and file-delete work can wait for a later unrelated wake.
 
 ## Deferral Context (Optional)
 

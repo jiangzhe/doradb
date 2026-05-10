@@ -1,7 +1,7 @@
 ---
 id: 000145
 title: GC-Managed Dropped Table Destroy
-status: proposal
+status: implemented
 created: 2026-05-09
 github_issue: 623
 ---
@@ -273,6 +273,39 @@ Reference:
 
 ## Implementation Notes
 
+- Implemented GC-owned dropped-table cleanup. `Session::drop_table` captures
+  the committed drop CTS, removes the runtime table after durable logical drop,
+  and enqueues the removed table handle with transaction GC. Purge waits for
+  `min_active_sts > drop_cts`, uses `Arc::try_unwrap` to protect stale handles,
+  consumes dropped runtime state, and defers deterministic table-file deletion
+  until `catalog_replay_start_ts > drop_cts`.
+- Added consuming destroy paths for table-owned hot state. Dropped table,
+  mem-table, block-index, row-page-index, and secondary-index runtime destroy
+  paths release hot row pages, row-page-index nodes, and secondary MemIndex
+  pages through the existing pool guards while leaving persistent table-file
+  and DiskTree state intact.
+- Extended recovery and restart cleanup. `DDLRedo::DropTable` replay removes
+  and destroys recovered runtime state without unlinking table files
+  prematurely, and startup checkpoint-absence cleanup deletes deterministic
+  user-table files only when the checkpointed catalog proves absence. The
+  cleanup scan skips non-regular filesystem entries before parsing or unlinking
+  candidate table files.
+- Hardened the test surface around real user-table file ids and asynchronous
+  cleanup. Added a shared user-table-id test helper, updated old tests that
+  created table files below `USER_OBJ_ID_START`, replaced an immediate file
+  absence assertion with `wait_path_exists`, and widened dropped-table cleanup
+  polling helpers.
+- Deferred the dropped-table purge retry wake policy to
+  `docs/backlogs/000098-dropped-table-purge-retry-stall.md`. The reported
+  retained-work stall is real, but an unconditional wake-on-requeue can spin
+  the purge thread while stale table handles remain held.
+- Validation completed: `cargo fmt --all --check`,
+  `cargo clippy -p doradb-storage --all-targets -- -D warnings`,
+  `cargo nextest run -p doradb-storage`,
+  `cargo nextest run -p doradb-storage --no-default-features --features libaio`,
+  and focused coverage for the changed storage paths. Focused coverage for the
+  relevant changed Rust directories/files was 92.41% overall, with each
+  requested target group above 80%.
 
 ## Impacts
 
@@ -358,7 +391,8 @@ Reference:
 
 ## Open Questions
 
-- None. The task uses checkpointed catalog absence plus checkpointed
-  `next_user_obj_id` for startup cleanup, and keeps final-recovered-catalog
-  absence out of the unlink predicate unless a later catalog checkpoint makes
-  that absence durable.
+- Follow-up retry semantics remain deferred for retained dropped-table GC and
+  file-delete work. Track a non-busy retry design in
+  `docs/backlogs/000098-dropped-table-purge-retry-stall.md`; avoid
+  unconditional purge self-wakes while stale `Arc<Table>` handles can remain
+  held indefinitely.

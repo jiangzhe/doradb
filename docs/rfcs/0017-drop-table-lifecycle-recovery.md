@@ -601,10 +601,10 @@ the table-file/root design. [D4], [C8], [C9]
   - Non-goals: no table-id reuse, durable tombstone table, standalone
     dropped-table reclaimer, synchronous destroy inside `Session::drop_table`,
     or index DDL.
-  - Task Doc: `docs/tasks/TBD.md`
-  - Task Issue: `#0`
-  - Phase Status: `pending`
-  - Implementation Summary: `pending`
+  - Task Doc: `docs/tasks/000145-gc-managed-dropped-table-destroy.md`
+  - Task Issue: `#623`
+  - Phase Status: done
+  - Implementation Summary: Implemented transaction-GC-managed dropped-table runtime destroy, checkpoint-gated table-file deletion, recovery/startup cleanup, and focused tests; deferred non-busy retry wake policy to backlog 000098. [Task Resolve Sync: docs/tasks/000145-gc-managed-dropped-table-destroy.md @ 2026-05-10]
 
 ## Consequences
 
