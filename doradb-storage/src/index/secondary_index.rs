@@ -743,6 +743,7 @@ mod tests {
         NonUniqueDiskTree, NonUniqueDiskTreeEncodedExact, UniqueDiskTreeEncodedPut,
     };
     use crate::quiescent::QuiescentBox;
+    use crate::table::test_user_table_id;
     use crate::value::{ValKind, ValType};
 
     fn metadata_with_indexes() -> Arc<TableMetadata> {
@@ -904,12 +905,12 @@ mod tests {
             let (_temp_dir, fs) = build_test_fs();
             let metadata = metadata_with_indexes();
             let table = fs
-                .create_table_file(611, Arc::clone(&metadata), false)
+                .create_table_file(test_user_table_id(611), Arc::clone(&metadata), false)
                 .unwrap();
             let (table, old_root) = table.commit(1, false).await.unwrap();
             drop(old_root);
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
-            let disk_pool = table_readonly_pool(&global, 611, &table);
+            let disk_pool = table_readonly_pool(&global, test_user_table_id(611), &table);
             let disk_guard = disk_pool.pool_guard();
             let mut mutable = MutableTableFile::fork(&table, fs.background_writes());
             let disk_runtime = unique_runtime!(metadata, disk_pool);
@@ -1072,12 +1073,12 @@ mod tests {
             let (_temp_dir, fs) = build_test_fs();
             let metadata = metadata_with_indexes();
             let table = fs
-                .create_table_file(614, Arc::clone(&metadata), false)
+                .create_table_file(test_user_table_id(614), Arc::clone(&metadata), false)
                 .unwrap();
             let (table, old_root) = table.commit(1, false).await.unwrap();
             drop(old_root);
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
-            let disk_pool = table_readonly_pool(&global, 614, &table);
+            let disk_pool = table_readonly_pool(&global, test_user_table_id(614), &table);
             let disk_guard = disk_pool.pool_guard();
             let key1 = [Val::from(1u32)];
             let key2 = [Val::from(2u32)];
@@ -1147,12 +1148,12 @@ mod tests {
             let (_temp_dir, fs) = build_test_fs();
             let metadata = metadata_with_indexes();
             let table = fs
-                .create_table_file(612, Arc::clone(&metadata), false)
+                .create_table_file(test_user_table_id(612), Arc::clone(&metadata), false)
                 .unwrap();
             let (table, old_root) = table.commit(1, false).await.unwrap();
             drop(old_root);
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
-            let disk_pool = table_readonly_pool(&global, 612, &table);
+            let disk_pool = table_readonly_pool(&global, test_user_table_id(612), &table);
             let disk_guard = disk_pool.pool_guard();
             let mut mutable = MutableTableFile::fork(&table, fs.background_writes());
             let disk_runtime = non_unique_runtime!(metadata, disk_pool);
@@ -1319,12 +1320,12 @@ mod tests {
             let (_temp_dir, fs) = build_test_fs();
             let metadata = metadata_with_indexes();
             let table = fs
-                .create_table_file(613, Arc::clone(&metadata), false)
+                .create_table_file(test_user_table_id(613), Arc::clone(&metadata), false)
                 .unwrap();
             let (table, old_root) = table.commit(1, false).await.unwrap();
             drop(old_root);
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
-            let disk_pool = table_readonly_pool(&global, 613, &table);
+            let disk_pool = table_readonly_pool(&global, test_user_table_id(613), &table);
             let index_pool = QuiescentBox::new(
                 FixedBufferPool::with_capacity(PoolRole::Index, 64 * 1024 * 1024).unwrap(),
             );

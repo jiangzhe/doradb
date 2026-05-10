@@ -1521,6 +1521,12 @@ impl FileSystem {
     ) -> Result<()> {
         for entry in fs::read_dir(&self.data_dir)? {
             let entry = entry?;
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if !file_type.is_file() {
+                continue;
+            }
             let Some(table_id) = parse_user_table_file_name(&entry.file_name()) else {
                 continue;
             };
@@ -2282,6 +2288,23 @@ pub(crate) mod tests {
         assert!(present_path.exists());
         assert!(!absent_path.exists());
         assert!(future_path.exists());
+    }
+
+    #[test]
+    fn test_cleanup_checkpoint_absent_user_table_files_skips_non_files() {
+        let (_temp_dir, fs) = build_test_fs();
+        let dir_id = USER_OBJ_ID_START + 1;
+        let absent_id = USER_OBJ_ID_START + 2;
+        let dir_path = fs.data_dir.join(user_table_file_name(dir_id));
+        let absent_path = fs.data_dir.join(user_table_file_name(absent_id));
+        std::fs::create_dir(&dir_path).unwrap();
+        std::fs::write(&absent_path, b"absent").unwrap();
+
+        fs.cleanup_checkpoint_absent_user_table_files(USER_OBJ_ID_START + 4, &HashSet::new())
+            .unwrap();
+
+        assert!(dir_path.is_dir());
+        assert!(!absent_path.exists());
     }
 
     #[test]

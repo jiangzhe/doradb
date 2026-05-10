@@ -2149,6 +2149,7 @@ mod tests {
     use crate::error::{DataIntegrityError, Error, FileKind};
     use crate::file::build_test_fs;
     use crate::file::table_file::MutableTableFile;
+    use crate::table::test_user_table_id;
     use crate::value::ValKind;
     use std::future::Future;
     use std::pin::Pin;
@@ -2535,12 +2536,12 @@ mod tests {
             let (_temp_dir, fs) = build_test_fs();
             let metadata = metadata_with_indexes();
             let table = fs
-                .create_table_file(301, Arc::clone(&metadata), false)
+                .create_table_file(test_user_table_id(301), Arc::clone(&metadata), false)
                 .unwrap();
             let (table, old_root) = table.commit(1, false).await.unwrap();
             drop(old_root);
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
-            let disk_pool = table_readonly_pool(&global, 301, &table);
+            let disk_pool = table_readonly_pool(&global, test_user_table_id(301), &table);
             let guard = disk_pool.pool_guard();
             let runtime = unique_runtime!(metadata, disk_pool);
             let tree = runtime.open(SUPER_BLOCK_ID, &guard);
@@ -2557,12 +2558,12 @@ mod tests {
             let (_temp_dir, fs) = build_test_fs();
             let metadata = metadata_with_indexes();
             let table = fs
-                .create_table_file(302, Arc::clone(&metadata), false)
+                .create_table_file(test_user_table_id(302), Arc::clone(&metadata), false)
                 .unwrap();
             let (table, old_root) = table.commit(1, false).await.unwrap();
             drop(old_root);
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
-            let disk_pool = table_readonly_pool(&global, 302, &table);
+            let disk_pool = table_readonly_pool(&global, test_user_table_id(302), &table);
             let guard = disk_pool.pool_guard();
             let runtime = non_unique_runtime!(metadata, disk_pool);
             let tree = runtime.open(SUPER_BLOCK_ID, &guard);
@@ -2585,12 +2586,12 @@ mod tests {
             let (_temp_dir, fs) = build_test_fs();
             let metadata = metadata_with_indexes();
             let table = fs
-                .create_table_file(303, Arc::clone(&metadata), false)
+                .create_table_file(test_user_table_id(303), Arc::clone(&metadata), false)
                 .unwrap();
             let (table, old_root) = table.commit(1, false).await.unwrap();
             drop(old_root);
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
-            let disk_pool = table_readonly_pool(&global, 303, &table);
+            let disk_pool = table_readonly_pool(&global, test_user_table_id(303), &table);
             let guard = disk_pool.pool_guard();
             let mut mutable =
                 crate::file::table_file::MutableTableFile::fork(&table, fs.background_writes());
@@ -2658,12 +2659,12 @@ mod tests {
             let (_temp_dir, fs) = build_test_fs();
             let metadata = metadata_with_indexes();
             let table = fs
-                .create_table_file(310, Arc::clone(&metadata), false)
+                .create_table_file(test_user_table_id(310), Arc::clone(&metadata), false)
                 .unwrap();
             let (table, old_root) = table.commit(1, false).await.unwrap();
             drop(old_root);
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
-            let disk_pool = table_readonly_pool(&global, 310, &table);
+            let disk_pool = table_readonly_pool(&global, test_user_table_id(310), &table);
             let guard = disk_pool.pool_guard();
             let mut mutable =
                 crate::file::table_file::MutableTableFile::fork(&table, fs.background_writes());
@@ -2731,12 +2732,12 @@ mod tests {
             let (_temp_dir, fs) = build_test_fs();
             let metadata = metadata_with_indexes();
             let table = fs
-                .create_table_file(311, Arc::clone(&metadata), false)
+                .create_table_file(test_user_table_id(311), Arc::clone(&metadata), false)
                 .unwrap();
             let (table, old_root) = table.commit(1, false).await.unwrap();
             drop(old_root);
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
-            let disk_pool = table_readonly_pool(&global, 311, &table);
+            let disk_pool = table_readonly_pool(&global, test_user_table_id(311), &table);
             let guard = disk_pool.pool_guard();
             let mut mutable =
                 crate::file::table_file::MutableTableFile::fork(&table, fs.background_writes());
@@ -2774,12 +2775,12 @@ mod tests {
             let (_temp_dir, fs) = build_test_fs();
             let metadata = metadata_with_indexes();
             let table = fs
-                .create_table_file(312, Arc::clone(&metadata), false)
+                .create_table_file(test_user_table_id(312), Arc::clone(&metadata), false)
                 .unwrap();
             let (table, old_root) = table.commit(1, false).await.unwrap();
             drop(old_root);
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
-            let disk_pool = table_readonly_pool(&global, 312, &table);
+            let disk_pool = table_readonly_pool(&global, test_user_table_id(312), &table);
             let guard = disk_pool.pool_guard();
             let mut mutable =
                 crate::file::table_file::MutableTableFile::fork(&table, fs.background_writes());
@@ -2824,12 +2825,12 @@ mod tests {
             let (_temp_dir, fs) = build_test_fs();
             let metadata = metadata_with_indexes();
             let table = fs
-                .create_table_file(304, Arc::clone(&metadata), false)
+                .create_table_file(test_user_table_id(304), Arc::clone(&metadata), false)
                 .unwrap();
             let (table, old_root) = table.commit(1, false).await.unwrap();
             drop(old_root);
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
-            let disk_pool = table_readonly_pool(&global, 304, &table);
+            let disk_pool = table_readonly_pool(&global, test_user_table_id(304), &table);
             let guard = disk_pool.pool_guard();
             let mut mutable =
                 crate::file::table_file::MutableTableFile::fork(&table, fs.background_writes());
@@ -2893,12 +2894,12 @@ mod tests {
             let (_temp_dir, fs) = build_test_fs();
             let metadata = metadata_with_indexes();
             let table = fs
-                .create_table_file(309, Arc::clone(&metadata), false)
+                .create_table_file(test_user_table_id(309), Arc::clone(&metadata), false)
                 .unwrap();
             let (table, old_root) = table.commit(1, false).await.unwrap();
             drop(old_root);
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
-            let disk_pool = table_readonly_pool(&global, 309, &table);
+            let disk_pool = table_readonly_pool(&global, test_user_table_id(309), &table);
             let guard = disk_pool.pool_guard();
             let mut mutable =
                 crate::file::table_file::MutableTableFile::fork(&table, fs.background_writes());
@@ -2945,12 +2946,12 @@ mod tests {
             let (_temp_dir, fs) = build_test_fs();
             let metadata = metadata_with_indexes();
             let table = fs
-                .create_table_file(310, Arc::clone(&metadata), false)
+                .create_table_file(test_user_table_id(310), Arc::clone(&metadata), false)
                 .unwrap();
             let (table, old_root) = table.commit(1, false).await.unwrap();
             drop(old_root);
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
-            let disk_pool = table_readonly_pool(&global, 310, &table);
+            let disk_pool = table_readonly_pool(&global, test_user_table_id(310), &table);
             let guard = disk_pool.pool_guard();
             let inner = MutableTableFile::fork(&table, fs.background_writes());
             let allocated_before = inner.root().alloc_map.allocated();
@@ -2990,12 +2991,12 @@ mod tests {
             let (_temp_dir, fs) = build_test_fs();
             let metadata = metadata_with_indexes();
             let table = fs
-                .create_table_file(311, Arc::clone(&metadata), false)
+                .create_table_file(test_user_table_id(311), Arc::clone(&metadata), false)
                 .unwrap();
             let (table, old_root) = table.commit(1, false).await.unwrap();
             drop(old_root);
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
-            let disk_pool = table_readonly_pool(&global, 311, &table);
+            let disk_pool = table_readonly_pool(&global, test_user_table_id(311), &table);
             let guard = disk_pool.pool_guard();
             let inner = MutableTableFile::fork(&table, fs.background_writes());
             let allocated_before = inner.root().alloc_map.allocated();
@@ -3038,12 +3039,12 @@ mod tests {
             let (_temp_dir, fs) = build_test_fs();
             let metadata = metadata_with_indexes();
             let table = fs
-                .create_table_file(305, Arc::clone(&metadata), false)
+                .create_table_file(test_user_table_id(305), Arc::clone(&metadata), false)
                 .unwrap();
             let (table, old_root) = table.commit(1, false).await.unwrap();
             drop(old_root);
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
-            let disk_pool = table_readonly_pool(&global, 305, &table);
+            let disk_pool = table_readonly_pool(&global, test_user_table_id(305), &table);
             let guard = disk_pool.pool_guard();
             let mut mutable =
                 crate::file::table_file::MutableTableFile::fork(&table, fs.background_writes());
@@ -3200,12 +3201,12 @@ mod tests {
             let (_temp_dir, fs) = build_test_fs();
             let metadata = metadata_with_indexes();
             let table = fs
-                .create_table_file(306, Arc::clone(&metadata), false)
+                .create_table_file(test_user_table_id(306), Arc::clone(&metadata), false)
                 .unwrap();
             let (table, old_root) = table.commit(1, false).await.unwrap();
             drop(old_root);
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
-            let disk_pool = table_readonly_pool(&global, 306, &table);
+            let disk_pool = table_readonly_pool(&global, test_user_table_id(306), &table);
             let guard = disk_pool.pool_guard();
             let mut mutable =
                 crate::file::table_file::MutableTableFile::fork(&table, fs.background_writes());
@@ -3288,12 +3289,12 @@ mod tests {
             let (_temp_dir, fs) = build_test_fs();
             let metadata = metadata_with_indexes();
             let table = fs
-                .create_table_file(307, Arc::clone(&metadata), false)
+                .create_table_file(test_user_table_id(307), Arc::clone(&metadata), false)
                 .unwrap();
             let (table, old_root) = table.commit(1, false).await.unwrap();
             drop(old_root);
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
-            let disk_pool = table_readonly_pool(&global, 307, &table);
+            let disk_pool = table_readonly_pool(&global, test_user_table_id(307), &table);
             let guard = disk_pool.pool_guard();
             let mut mutable =
                 crate::file::table_file::MutableTableFile::fork(&table, fs.background_writes());
@@ -3365,12 +3366,12 @@ mod tests {
             let (_temp_dir, fs) = build_test_fs();
             let metadata = metadata_with_indexes();
             let table = fs
-                .create_table_file(308, Arc::clone(&metadata), false)
+                .create_table_file(test_user_table_id(308), Arc::clone(&metadata), false)
                 .unwrap();
             let (table, old_root) = table.commit(1, false).await.unwrap();
             drop(old_root);
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
-            let disk_pool = table_readonly_pool(&global, 308, &table);
+            let disk_pool = table_readonly_pool(&global, test_user_table_id(308), &table);
             let guard = disk_pool.pool_guard();
             let mut mutable =
                 crate::file::table_file::MutableTableFile::fork(&table, fs.background_writes());
@@ -3454,12 +3455,12 @@ mod tests {
             let (_temp_dir, fs) = build_test_fs();
             let metadata = metadata_with_varbyte_unique_index();
             let table = fs
-                .create_table_file(313, Arc::clone(&metadata), false)
+                .create_table_file(test_user_table_id(313), Arc::clone(&metadata), false)
                 .unwrap();
             let (table, old_root) = table.commit(1, false).await.unwrap();
             drop(old_root);
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
-            let disk_pool = table_readonly_pool(&global, 313, &table);
+            let disk_pool = table_readonly_pool(&global, test_user_table_id(313), &table);
             let guard = disk_pool.pool_guard();
             let mut mutable =
                 crate::file::table_file::MutableTableFile::fork(&table, fs.background_writes());
@@ -3565,12 +3566,12 @@ mod tests {
             let (_temp_dir, fs) = build_test_fs();
             let metadata = metadata_with_indexes();
             let table = fs
-                .create_table_file(314, Arc::clone(&metadata), false)
+                .create_table_file(test_user_table_id(314), Arc::clone(&metadata), false)
                 .unwrap();
             let (table, old_root) = table.commit(1, false).await.unwrap();
             drop(old_root);
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
-            let disk_pool = table_readonly_pool(&global, 314, &table);
+            let disk_pool = table_readonly_pool(&global, test_user_table_id(314), &table);
             let guard = disk_pool.pool_guard();
             let mut mutable =
                 crate::file::table_file::MutableTableFile::fork(&table, fs.background_writes());
@@ -3656,12 +3657,12 @@ mod tests {
             let (_temp_dir, fs) = build_test_fs();
             let metadata = metadata_with_indexes();
             let table = fs
-                .create_table_file(305, Arc::clone(&metadata), false)
+                .create_table_file(test_user_table_id(305), Arc::clone(&metadata), false)
                 .unwrap();
             let (table, old_root) = table.commit(1, false).await.unwrap();
             drop(old_root);
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
-            let disk_pool = table_readonly_pool(&global, 305, &table);
+            let disk_pool = table_readonly_pool(&global, test_user_table_id(305), &table);
             let guard = disk_pool.pool_guard();
             let mut mutable =
                 crate::file::table_file::MutableTableFile::fork(&table, fs.background_writes());

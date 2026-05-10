@@ -18,6 +18,8 @@ pub(crate) use lifecycle::{CheckpointPublishLease, TableLifecycle};
 pub use persistence::*;
 pub use recover::*;
 pub(crate) use rollback::IndexRollback;
+#[cfg(test)]
+pub(crate) use tests::test_user_table_id;
 
 use crate::buffer::guard::{PageExclusiveGuard, PageGuard, PageSharedGuard};
 use crate::buffer::page::{PageID, VersionedPageID};

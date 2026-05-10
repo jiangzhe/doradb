@@ -731,15 +731,14 @@ mod tests {
     use crate::buffer::{
         PoolRole, ReadonlyBufferPool, global_readonly_pool_scope, table_readonly_pool,
     };
-    use crate::catalog::{
-        ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexSpec, USER_OBJ_ID_START,
-    };
+    use crate::catalog::{ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexSpec};
     use crate::error::InternalError;
     use crate::error::{DataIntegrityError, Error, FileKind};
     use crate::file::block_integrity::BLOCK_INTEGRITY_TRAILER_SIZE;
     use crate::file::{build_test_fs, build_test_fs_in, test_block_id};
     use crate::io::IOBuf;
     use crate::quiescent::QuiescentBox;
+    use crate::table::test_user_table_id;
     use crate::value::ValKind;
     use std::fs::OpenOptions;
     use std::io::{Seek, SeekFrom, Write};
@@ -748,17 +747,12 @@ mod tests {
         Ok(())
     }
 
-    #[inline]
-    fn test_user_table_id(offset: TableID) -> TableID {
-        USER_OBJ_ID_START + offset
-    }
-
     async fn read_page_for_test(
         table_file: &Arc<TableFile>,
         page_id: BlockID,
     ) -> Result<DirectBuf> {
         let global = global_readonly_pool_scope(64 * 1024 * 1024);
-        let disk_pool = table_readonly_pool(&global, USER_OBJ_ID_START, table_file);
+        let disk_pool = table_readonly_pool(&global, test_user_table_id(0), table_file);
         let disk_pool_guard = disk_pool.pool_guard();
         let page = disk_pool
             .read_validated_block(&disk_pool_guard, page_id, accept_any_page)

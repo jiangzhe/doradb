@@ -3275,6 +3275,7 @@ mod tests {
     use crate::file::table_file::MutableTableFile;
     use crate::file::test_block_id;
     use crate::index::load_entry_deletion_deltas;
+    use crate::table::test_user_table_id;
     use crate::value::ValKind;
     use std::collections::BTreeSet;
     use std::sync::Arc;
@@ -3429,11 +3430,13 @@ mod tests {
             let (_temp_dir, fs) = build_test_fs();
             let background_writes = fs.background_writes();
             let metadata = metadata();
-            let table = fs.create_table_file(1, metadata, false).unwrap();
+            let table = fs
+                .create_table_file(test_user_table_id(1), metadata, false)
+                .unwrap();
             let (table, old_root) = table.commit(1, false).await.unwrap();
             drop(old_root);
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
-            let disk_pool = table_readonly_pool(&global, 1, &table);
+            let disk_pool = table_readonly_pool(&global, test_user_table_id(1), &table);
             let disk_pool_guard = disk_pool.pool_guard();
             let mut mutable = MutableTableFile::fork(&table, background_writes);
             let index = ColumnBlockIndex::new(
@@ -3485,11 +3488,13 @@ mod tests {
         let (_temp_dir, fs) = build_test_fs();
         let background_writes = fs.background_writes();
         let metadata = metadata();
-        let table = fs.create_table_file(1, metadata, false).unwrap();
+        let table = fs
+            .create_table_file(test_user_table_id(1), metadata, false)
+            .unwrap();
         let (table, old_root) = table.commit(1, false).await.unwrap();
         drop(old_root);
         let global = global_readonly_pool_scope(64 * 1024 * 1024);
-        let disk_pool = table_readonly_pool(&global, 1, &table);
+        let disk_pool = table_readonly_pool(&global, test_user_table_id(1), &table);
         let disk_pool_guard = disk_pool.pool_guard();
         let mut mutable = MutableTableFile::fork(&table, background_writes);
         let root_block_id = ColumnBlockIndex::new(
@@ -3579,11 +3584,13 @@ mod tests {
             let (_temp_dir, fs) = build_test_fs();
             let background_writes = fs.background_writes();
             let metadata = metadata();
-            let table = fs.create_table_file(1, metadata, false).unwrap();
+            let table = fs
+                .create_table_file(test_user_table_id(1), metadata, false)
+                .unwrap();
             let (table, old_root) = table.commit(1, false).await.unwrap();
             drop(old_root);
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
-            let disk_pool = table_readonly_pool(&global, 1, &table);
+            let disk_pool = table_readonly_pool(&global, test_user_table_id(1), &table);
             let disk_pool_guard = disk_pool.pool_guard();
             let mut mutable = MutableTableFile::fork(&table, background_writes);
             let root_block_id = ColumnBlockIndex::new(
@@ -3643,11 +3650,13 @@ mod tests {
             let (_temp_dir, fs) = build_test_fs();
             let background_writes = fs.background_writes();
             let metadata = metadata();
-            let table = fs.create_table_file(1, metadata, false).unwrap();
+            let table = fs
+                .create_table_file(test_user_table_id(1), metadata, false)
+                .unwrap();
             let (table, old_root) = table.commit(1, false).await.unwrap();
             drop(old_root);
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
-            let disk_pool = table_readonly_pool(&global, 1, &table);
+            let disk_pool = table_readonly_pool(&global, test_user_table_id(1), &table);
             let disk_pool_guard = disk_pool.pool_guard();
             let mut mutable = MutableTableFile::fork(&table, background_writes);
             let entries = vec![
@@ -3712,11 +3721,13 @@ mod tests {
             let (_temp_dir, fs) = build_test_fs();
             let background_writes = fs.background_writes();
             let metadata = metadata();
-            let table = fs.create_table_file(1, metadata, false).unwrap();
+            let table = fs
+                .create_table_file(test_user_table_id(1), metadata, false)
+                .unwrap();
             let (table, old_root) = table.commit(1, false).await.unwrap();
             drop(old_root);
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
-            let disk_pool = table_readonly_pool(&global, 1, &table);
+            let disk_pool = table_readonly_pool(&global, test_user_table_id(1), &table);
             let disk_pool_guard = disk_pool.pool_guard();
             let mut mutable = MutableTableFile::fork(&table, background_writes);
             let root_v1 = ColumnBlockIndex::new(
@@ -3790,11 +3801,13 @@ mod tests {
             let (_temp_dir, fs) = build_test_fs();
             let background_writes = fs.background_writes();
             let metadata = metadata();
-            let table = fs.create_table_file(1, metadata, false).unwrap();
+            let table = fs
+                .create_table_file(test_user_table_id(1), metadata, false)
+                .unwrap();
             let (table, old_root) = table.commit(1, false).await.unwrap();
             drop(old_root);
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
-            let disk_pool = table_readonly_pool(&global, 1, &table);
+            let disk_pool = table_readonly_pool(&global, test_user_table_id(1), &table);
             let disk_pool_guard = disk_pool.pool_guard();
             let mut mutable = MutableTableFile::fork(&table, background_writes);
             let root_v1 = ColumnBlockIndex::new(
@@ -3860,11 +3873,13 @@ mod tests {
             let (_temp_dir, fs) = build_test_fs();
             let background_writes = fs.background_writes();
             let metadata = metadata();
-            let table = fs.create_table_file(1, metadata, false).unwrap();
+            let table = fs
+                .create_table_file(test_user_table_id(1), metadata, false)
+                .unwrap();
             let (table, old_root) = table.commit(1, false).await.unwrap();
             drop(old_root);
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
-            let disk_pool = table_readonly_pool(&global, 1, &table);
+            let disk_pool = table_readonly_pool(&global, test_user_table_id(1), &table);
             let disk_pool_guard = disk_pool.pool_guard();
             let mut mutable = MutableTableFile::fork(&table, background_writes);
             let root_v1 = ColumnBlockIndex::new(
@@ -3933,11 +3948,13 @@ mod tests {
             let (_temp_dir, fs) = build_test_fs();
             let background_writes = fs.background_writes();
             let metadata = metadata();
-            let table = fs.create_table_file(1, metadata, false).unwrap();
+            let table = fs
+                .create_table_file(test_user_table_id(1), metadata, false)
+                .unwrap();
             let (table, old_root) = table.commit(1, false).await.unwrap();
             drop(old_root);
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
-            let disk_pool = table_readonly_pool(&global, 1, &table);
+            let disk_pool = table_readonly_pool(&global, test_user_table_id(1), &table);
             let disk_pool_guard = disk_pool.pool_guard();
 
             let seed = ColumnBlockEntryShape::new(0, 8, (0..8).collect(), vec![1, 3])
@@ -4002,11 +4019,13 @@ mod tests {
             let (_temp_dir, fs) = build_test_fs();
             let background_writes = fs.background_writes();
             let metadata = metadata();
-            let table = fs.create_table_file(1, metadata, false).unwrap();
+            let table = fs
+                .create_table_file(test_user_table_id(1), metadata, false)
+                .unwrap();
             let (table, old_root) = table.commit(1, false).await.unwrap();
             drop(old_root);
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
-            let disk_pool = table_readonly_pool(&global, 1, &table);
+            let disk_pool = table_readonly_pool(&global, test_user_table_id(1), &table);
             let disk_pool_guard = disk_pool.pool_guard();
             let mut mutable = MutableTableFile::fork(&table, background_writes);
             let mut entries = Vec::new();

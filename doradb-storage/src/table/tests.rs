@@ -6,7 +6,7 @@ use crate::buffer::{EvictableBufferPool, PoolGuards, PoolRole, test_frame_kind};
 use crate::catalog::tests::table4;
 use crate::catalog::{
     CatalogCheckpointScanStopReason, ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey,
-    IndexSpec, TableSpec,
+    IndexSpec, TableID, TableSpec, USER_OBJ_ID_START,
 };
 use crate::conf::{EngineConfig, EvictableBufferPoolConfig, FileSystemConfig, TrxSysConfig};
 use crate::engine::Engine;
@@ -63,6 +63,13 @@ thread_local! {
 const LIGHTWEIGHT_TEST_BUFFER_BYTES: usize = 16 * 1024 * 1024;
 const LIGHTWEIGHT_TEST_MAX_FILE_BYTES: usize = 32 * 1024 * 1024;
 const LIGHTWEIGHT_TEST_READONLY_BUFFER_BYTES: usize = 32 * 1024 * 1024;
+
+#[inline]
+pub(crate) fn test_user_table_id(offset: TableID) -> TableID {
+    USER_OBJ_ID_START
+        .checked_add(offset)
+        .expect("test user table id offset overflow")
+}
 
 pub(super) fn set_test_force_lwc_build_error(enabled: bool) {
     TEST_FORCE_LWC_BUILD_ERROR.with(|flag| flag.set(enabled));

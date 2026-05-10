@@ -968,6 +968,7 @@ mod tests {
     use crate::file::table_file::{MutableTableFile, TableFile};
     use crate::io::{DirectBuf, IOBuf};
     use crate::quiescent::QuiescentGuard;
+    use crate::table::test_user_table_id;
     use crate::value::ValKind;
     use crate::{DiskPool, IndexPool, MemPool};
     use event_listener::Event;
@@ -1406,7 +1407,8 @@ mod tests {
                 assert!(parked.wait_count > 0);
 
                 let readonly_fixture =
-                    prepare_read_pressure(&runtime.fs, &runtime.disk_pool, 201).await;
+                    prepare_read_pressure(&runtime.fs, &runtime.disk_pool, test_user_table_id(201))
+                        .await;
 
                 let start = runtime.stats();
                 drive_read_pressure(&readonly_fixture).await;
@@ -1455,7 +1457,7 @@ mod tests {
             let runtime = StartedSharedEvictorRuntime::new(root.path());
             runtime.wait_until_idle();
 
-            let table_id = 202u64;
+            let table_id = test_user_table_id(202);
             let readonly_fixture =
                 prepare_read_pressure(&runtime.fs, &runtime.disk_pool, table_id).await;
 
