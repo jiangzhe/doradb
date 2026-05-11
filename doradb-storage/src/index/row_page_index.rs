@@ -1975,7 +1975,7 @@ mod tests {
     }
 
     fn first_i32_unique_index() -> IndexSpec {
-        IndexSpec::new("idx_id", vec![IndexKey::new(0)], IndexAttributes::UK)
+        IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::UK)
     }
 
     fn make_test_metadata() -> Arc<TableMetadata> {

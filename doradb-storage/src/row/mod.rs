@@ -1342,7 +1342,7 @@ pub(crate) trait RowRead {
     #[inline]
     fn clone_index_vals(&self, metadata: &TableMetadata, index_no: usize) -> Vec<Val> {
         metadata.index_specs[index_no]
-            .index_cols
+            .cols
             .iter()
             .map(|key| self.val(metadata, key.col_no as usize))
             .collect()
@@ -1395,7 +1395,7 @@ pub(crate) trait RowRead {
     fn is_key_different(&self, metadata: &TableMetadata, key: &SelectKey) -> bool {
         debug_assert!(!key.vals.is_empty());
         metadata.index_specs[key.index_no]
-            .index_cols
+            .cols
             .iter()
             .zip(&key.vals)
             .any(|(key, val)| self.is_different(metadata, key.col_no as usize, val))
@@ -1708,12 +1708,11 @@ mod tests {
                 column_attributes: ColumnAttributes::empty(),
             }],
             vec![IndexSpec {
-                index_name: SemiStr::new("idx_tb1_id"),
-                index_cols: vec![IndexKey {
+                cols: vec![IndexKey {
                     col_no: 0,
                     order: IndexOrder::Asc,
                 }],
-                index_attributes: IndexAttributes::PK,
+                attributes: IndexAttributes::PK,
             }],
         );
         let mut page = create_row_page();
@@ -1740,9 +1739,8 @@ mod tests {
                 column_attributes: ColumnAttributes::empty(),
             }],
             vec![IndexSpec {
-                index_name: SemiStr::new("idx_tb1_id"),
-                index_cols: vec![IndexKey::new(0)],
-                index_attributes: IndexAttributes::PK,
+                cols: vec![IndexKey::new(0)],
+                attributes: IndexAttributes::PK,
             }],
         );
         let mut page = create_row_page();
@@ -1773,9 +1771,8 @@ mod tests {
                 },
             ],
             vec![IndexSpec {
-                index_name: SemiStr::new("idx_tb1_id"),
-                index_cols: vec![IndexKey::new(0)],
-                index_attributes: IndexAttributes::PK,
+                cols: vec![IndexKey::new(0)],
+                attributes: IndexAttributes::PK,
             }],
         );
         assert!(metadata.nullable(0));
@@ -1849,9 +1846,8 @@ mod tests {
                 },
             ],
             vec![IndexSpec {
-                index_name: SemiStr::new("idx_tb1_col3"),
-                index_cols: vec![IndexKey::new(2)],
-                index_attributes: IndexAttributes::PK,
+                cols: vec![IndexKey::new(2)],
+                attributes: IndexAttributes::PK,
             }],
         );
         let mut page = create_row_page();

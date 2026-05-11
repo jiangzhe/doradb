@@ -2,6 +2,9 @@ use crate::value::ValKind;
 use bitflags::bitflags;
 use semistr::SemiStr;
 
+/// Stable table-local secondary-index number.
+pub type IndexNo = u16;
+
 /// User-facing table definition used by DDL/create-table paths.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TableSpec {
@@ -43,28 +46,38 @@ impl ColumnSpec {
 /// Logical index definition in a table schema.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IndexSpec {
-    pub index_name: SemiStr,
-    pub index_cols: Vec<IndexKey>,
-    pub index_attributes: IndexAttributes,
+    pub cols: Vec<IndexKey>,
+    pub attributes: IndexAttributes,
 }
 
 impl IndexSpec {
     /// Create one index specification.
     #[inline]
-    pub fn new(name: &str, index_cols: Vec<IndexKey>, index_attributes: IndexAttributes) -> Self {
-        let index_name = SemiStr::new(name);
-        Self {
-            index_name,
-            index_cols,
-            index_attributes,
-        }
+    pub fn new(cols: Vec<IndexKey>, attributes: IndexAttributes) -> Self {
+        Self { cols, attributes }
     }
 
     /// Return whether this index enforces uniqueness.
     #[inline]
     pub fn unique(&self) -> bool {
-        self.index_attributes.contains(IndexAttributes::PK)
-            || self.index_attributes.contains(IndexAttributes::UK)
+        self.attributes.contains(IndexAttributes::PK)
+            || self.attributes.contains(IndexAttributes::UK)
+    }
+}
+
+/// One active index definition paired with its allocated stable table-local
+/// index number.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActiveIndexSpec {
+    pub index_no: IndexNo,
+    pub spec: IndexSpec,
+}
+
+impl ActiveIndexSpec {
+    /// Create one active index specification.
+    #[inline]
+    pub fn new(index_no: IndexNo, spec: IndexSpec) -> Self {
+        Self { index_no, spec }
     }
 }
 

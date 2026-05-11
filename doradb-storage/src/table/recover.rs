@@ -127,8 +127,11 @@ impl TableRecover for Table {
                 let page_guard = self.must_get_row_page_shared(guards, page_id).await?;
 
                 let metadata = self.metadata();
-                for (index_no, index_schema) in metadata.index_specs.iter().enumerate() {
-                    debug_assert_eq!(self.sec_idx()[index_no].is_unique(), index_schema.unique());
+                for (index_no, index_schema) in metadata.active_indexes() {
+                    debug_assert_eq!(
+                        self.require_sec_idx(index_no)?.is_unique(),
+                        index_schema.unique()
+                    );
                     if index_key_is_changed(index_schema, &index_change_cols) {
                         let new_key =
                             read_latest_index_key(metadata, index_no, &page_guard, row_id);
@@ -200,10 +203,13 @@ impl TableRecover for Table {
             );
             assert!(res.is_ok());
             page_guard.set_dirty(); // mark as dirty page.
-            for (index_no, index_schema) in self.metadata().index_specs.iter().enumerate() {
-                debug_assert_eq!(self.sec_idx()[index_no].is_unique(), index_schema.unique());
+            for (index_no, index_schema) in self.metadata().active_indexes() {
+                debug_assert_eq!(
+                    self.require_sec_idx(index_no)?.is_unique(),
+                    index_schema.unique()
+                );
                 let vals: Vec<Val> = index_schema
-                    .index_cols
+                    .cols
                     .iter()
                     .map(|ik| index_cols[&(ik.col_no as usize)].clone())
                     .collect();
@@ -226,13 +232,9 @@ impl TableRecover for Table {
         let metadata = self.metadata();
         let index_pool_guard = self.index_pool_guard(guards);
         let (ctx, page) = page_guard.ctx_and_page();
-        for (index_no, index_spec) in metadata.index_specs.iter().enumerate() {
-            let sec_idx = &self.sec_idx()[index_no];
-            let read_set: Vec<_> = index_spec
-                .index_cols
-                .iter()
-                .map(|c| c.col_no as usize)
-                .collect();
+        for (index_no, index_spec) in metadata.active_indexes() {
+            let sec_idx = self.require_sec_idx(index_no)?;
+            let read_set: Vec<_> = index_spec.cols.iter().map(|c| c.col_no as usize).collect();
             for row_access in ReadAllRows::new(page, ctx) {
                 let row_id = row_access.row().row_id();
                 match row_access.read_row_latest(metadata, &read_set, None) {

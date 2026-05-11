@@ -1,4 +1,4 @@
-use crate::catalog::{IndexAttributes, IndexKey, IndexOrder, IndexSpec};
+use crate::catalog::{ActiveIndexSpec, IndexAttributes, IndexKey, IndexOrder, IndexSpec};
 use crate::compression::bitpacking::*;
 use crate::error::{DataIntegrityError, Result};
 use error_stack::Report;
@@ -735,31 +735,44 @@ impl Deser for IndexAttributes {
 impl Ser<'_> for IndexSpec {
     #[inline]
     fn ser_len(&self) -> usize {
-        self.index_name.ser_len() + self.index_cols.ser_len() + self.index_attributes.ser_len()
+        self.cols.ser_len() + self.attributes.ser_len()
     }
 
     #[inline]
     fn ser<S: Serde + ?Sized>(&self, out: &mut S, start_idx: usize) -> usize {
-        let idx = self.index_name.ser(out, start_idx);
-        let idx = self.index_cols.ser(out, idx);
-        self.index_attributes.ser(out, idx)
+        let idx = self.cols.ser(out, start_idx);
+        self.attributes.ser(out, idx)
     }
 }
 
 impl Deser for IndexSpec {
     #[inline]
     fn deser<S: Serde + ?Sized>(input: &S, start_idx: usize) -> Result<(usize, Self)> {
-        let (idx, index_name) = SemiStr::deser(input, start_idx)?;
-        let (idx, index_cols) = <Vec<IndexKey>>::deser(input, idx)?;
-        let (idx, index_attributes) = IndexAttributes::deser(input, idx)?;
-        Ok((
-            idx,
-            IndexSpec {
-                index_name,
-                index_cols,
-                index_attributes,
-            },
-        ))
+        let (idx, cols) = <Vec<IndexKey>>::deser(input, start_idx)?;
+        let (idx, attributes) = IndexAttributes::deser(input, idx)?;
+        Ok((idx, IndexSpec { cols, attributes }))
+    }
+}
+
+impl Ser<'_> for ActiveIndexSpec {
+    #[inline]
+    fn ser_len(&self) -> usize {
+        mem::size_of::<u16>() + self.spec.ser_len()
+    }
+
+    #[inline]
+    fn ser<S: Serde + ?Sized>(&self, out: &mut S, start_idx: usize) -> usize {
+        let idx = out.ser_u16(start_idx, self.index_no);
+        self.spec.ser(out, idx)
+    }
+}
+
+impl Deser for ActiveIndexSpec {
+    #[inline]
+    fn deser<S: Serde + ?Sized>(input: &S, start_idx: usize) -> Result<(usize, Self)> {
+        let (idx, index_no) = input.deser_u16(start_idx)?;
+        let (idx, spec) = IndexSpec::deser(input, idx)?;
+        Ok((idx, ActiveIndexSpec { index_no, spec }))
     }
 }
 
@@ -1089,23 +1102,17 @@ mod tests {
 
     #[test]
     fn test_index_spec_serde() {
-        let index_name = SemiStr::new("index1");
-        println!("index_name ser_len={}", index_name.ser_len());
-        let index_cols = vec![
+        let cols = vec![
             IndexKey::new(0),
             IndexKey {
                 col_no: 1,
                 order: IndexOrder::Desc,
             },
         ];
-        println!("index_cols ser_len={}", index_cols.ser_len());
-        let index_attributes = IndexAttributes::PK;
-        println!("index_attributes ser_len={}", index_attributes.ser_len());
-        let spec = IndexSpec {
-            index_name,
-            index_cols,
-            index_attributes,
-        };
+        println!("cols ser_len={}", cols.ser_len());
+        let attributes = IndexAttributes::PK;
+        println!("attributes ser_len={}", attributes.ser_len());
+        let spec = IndexSpec { cols, attributes };
         let len = spec.ser_len();
         println!("index_spec ser_len={}", len);
         let mut vec = vec![0u8; len];

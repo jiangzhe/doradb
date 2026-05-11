@@ -565,11 +565,7 @@ mod tests {
                 column_type: ValKind::I32,
                 column_attributes: ColumnAttributes::empty(),
             }],
-            vec![IndexSpec::new(
-                "idx_id",
-                vec![IndexKey::new(0)],
-                IndexAttributes::UK,
-            )],
+            vec![IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::UK)],
         ))
     }
 

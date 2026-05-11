@@ -120,12 +120,16 @@ impl Session {
             table_spec.columns.clone(),
             index_specs.clone(),
         ));
-        let uninit_table_file = engine
-            .table_fs
-            .create_table_file(table_id, metadata, false)?;
+        let uninit_table_file =
+            engine
+                .table_fs
+                .create_table_file(table_id, Arc::clone(&metadata), false)?;
 
         // 2. Prepare catalog related object
-        let table_object = TableObject { table_id };
+        let table_object = TableObject {
+            table_id,
+            next_index_no: metadata.next_index_no(),
+        };
 
         let column_objects: Vec<_> = table_spec
             .columns
@@ -143,14 +147,13 @@ impl Session {
         let mut index_objects = vec![];
         let mut index_column_objects = vec![];
 
-        for (index_no, index_spec) in index_specs.iter().enumerate() {
+        for (index_no, index_spec) in metadata.active_indexes() {
             index_objects.push(IndexObject {
                 table_id,
                 index_no: index_no as u16,
-                index_name: index_spec.index_name.clone(),
-                index_attributes: index_spec.index_attributes,
+                index_attributes: index_spec.attributes,
             });
-            for (index_column_no, ik) in index_spec.index_cols.iter().enumerate() {
+            for (index_column_no, ik) in index_spec.cols.iter().enumerate() {
                 index_column_objects.push(IndexColumnObject {
                     table_id,
                     index_no: index_no as u16,
@@ -629,12 +632,11 @@ fn validate_drop_catalog_delete_counts(
     index_columns_deleted: usize,
 ) -> Result<()> {
     let expected_index_columns = metadata
-        .index_specs
-        .iter()
-        .map(|spec| spec.index_cols.len())
+        .active_indexes()
+        .map(|(_, spec)| spec.cols.len())
         .sum::<usize>();
     if columns_deleted == metadata.col_count()
-        && indexes_deleted == metadata.index_specs.len()
+        && indexes_deleted == metadata.active_index_count()
         && index_columns_deleted == expected_index_columns
     {
         return Ok(());
@@ -643,7 +645,7 @@ fn validate_drop_catalog_delete_counts(
         .attach(format!(
             "drop table catalog cascade count mismatch: table_id={table_id}, columns_deleted={columns_deleted}, expected_columns={}, indexes_deleted={indexes_deleted}, expected_indexes={}, index_columns_deleted={index_columns_deleted}, expected_index_columns={expected_index_columns}",
             metadata.col_count(),
-            metadata.index_specs.len(),
+            metadata.active_index_count(),
         ))
         .into())
 }

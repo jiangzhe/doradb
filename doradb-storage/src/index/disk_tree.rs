@@ -651,11 +651,11 @@ fn index_key_types(
     index_spec: &IndexSpec,
     append_row_id: bool,
 ) -> Result<Vec<ValType>> {
-    if index_spec.index_cols.is_empty() {
+    if index_spec.cols.is_empty() {
         return Err(invalid_index_spec("index has no key columns"));
     }
-    let mut types = Vec::with_capacity(index_spec.index_cols.len() + usize::from(append_row_id));
-    for key in &index_spec.index_cols {
+    let mut types = Vec::with_capacity(index_spec.cols.len() + usize::from(append_row_id));
+    for key in &index_spec.cols {
         let col_no = key.col_no as usize;
         let ty =
             metadata.col_types().get(col_no).copied().ok_or_else(|| {
@@ -2163,12 +2163,8 @@ mod tests {
                 ColumnSpec::new("c1", ValKind::U64, ColumnAttributes::empty()),
             ],
             vec![
-                IndexSpec::new("idx_unique", vec![IndexKey::new(0)], IndexAttributes::UK),
-                IndexSpec::new(
-                    "idx_non_unique",
-                    vec![IndexKey::new(0)],
-                    IndexAttributes::empty(),
-                ),
+                IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::UK),
+                IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::empty()),
             ],
         ))
     }
@@ -2187,11 +2183,7 @@ mod tests {
                 ValKind::VarByte,
                 ColumnAttributes::empty(),
             )],
-            vec![IndexSpec::new(
-                "idx_unique",
-                vec![IndexKey::new(0)],
-                IndexAttributes::UK,
-            )],
+            vec![IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::UK)],
         ))
     }
 

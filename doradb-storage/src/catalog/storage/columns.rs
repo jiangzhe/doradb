@@ -25,7 +25,6 @@ const COL_NAME_COLUMNS_COLUMN_TYPE: &str = "column_type";
 const COL_NO_COLUMNS_COLUMN_ATTRIBUTES: usize = 4;
 const COL_NAME_COLUMNS_COLUMN_ATTRIBUTES: &str = "column_attributes";
 const PK_NO_COLUMNS: usize = 0;
-const PK_NAME_COLUMNS: &str = "pk_columns";
 
 /// Return static table definition of `catalog.columns`.
 pub fn catalog_definition_of_columns() -> &'static CatalogDefinition {
@@ -69,7 +68,6 @@ pub fn catalog_definition_of_columns() -> &'static CatalogDefinition {
                 vec![
                     // primary key pk_columns (table_id, column_no)
                     IndexSpec::new(
-                        PK_NAME_COLUMNS,
                         vec![IndexKey::new(0), IndexKey::new(1)],
                         IndexAttributes::PK,
                     ),

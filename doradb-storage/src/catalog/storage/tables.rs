@@ -16,8 +16,9 @@ use std::sync::OnceLock;
 pub(crate) const TABLE_ID_TABLES: TableID = 0;
 const COL_NO_TABLES_TABLE_ID: usize = 0;
 const COL_NAME_TABLES_TABLE_ID: &str = "table_id";
+const COL_NO_TABLES_NEXT_INDEX_NO: usize = 1;
+const COL_NAME_TABLES_NEXT_INDEX_NO: &str = "next_index_no";
 const PK_NO_TABLES: usize = 0;
-const PK_NAME_TABLES: &str = "pk_tables";
 
 /// Return static table definition of `catalog.tables`.
 pub fn catalog_definition_of_tables() -> &'static CatalogDefinition {
@@ -33,10 +34,16 @@ pub fn catalog_definition_of_tables() -> &'static CatalogDefinition {
                         column_type: ValKind::U64,
                         column_attributes: ColumnAttributes::INDEX,
                     },
+                    // next_index_no unsigned smallint not null
+                    ColumnSpec {
+                        column_name: SemiStr::new(COL_NAME_TABLES_NEXT_INDEX_NO),
+                        column_type: ValKind::U16,
+                        column_attributes: ColumnAttributes::empty(),
+                    },
                 ],
                 vec![
-                    // primary key pk_tables (table_id)
-                    IndexSpec::new(PK_NAME_TABLES, vec![IndexKey::new(0)], IndexAttributes::PK),
+                    // primary key (table_id)
+                    IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::PK),
                 ],
             ),
         }
@@ -46,7 +53,14 @@ pub fn catalog_definition_of_tables() -> &'static CatalogDefinition {
 #[inline]
 fn row_to_table_object(metadata: &TableMetadata, row: Row<'_>) -> TableObject {
     let table_id = row.val(metadata, COL_NO_TABLES_TABLE_ID).as_u64().unwrap();
-    TableObject { table_id }
+    let next_index_no = row
+        .val(metadata, COL_NO_TABLES_NEXT_INDEX_NO)
+        .as_u16()
+        .unwrap();
+    TableObject {
+        table_id,
+        next_index_no,
+    }
 }
 
 /// Runtime accessor for `catalog.tables`.
@@ -87,7 +101,7 @@ impl Tables<'_> {
 
     /// Insert a table.
     pub async fn insert(&self, stmt: &mut Statement<'_>, obj: &TableObject) -> bool {
-        let cols = vec![Val::from(obj.table_id)];
+        let cols = vec![Val::from(obj.table_id), Val::from(obj.next_index_no)];
         stmt.catalog_insert_mvcc(self.table, cols).await.is_ok()
     }
 
@@ -121,8 +135,14 @@ mod tests {
                 .unwrap();
             let mut session = engine.try_new_session().unwrap();
 
-            let table100 = TableObject { table_id: 100 };
-            let table101 = TableObject { table_id: 101 };
+            let table100 = TableObject {
+                table_id: 100,
+                next_index_no: 0,
+            };
+            let table101 = TableObject {
+                table_id: 101,
+                next_index_no: 0,
+            };
             let mut trx = session.try_begin_trx().unwrap().unwrap();
             trx.exec(async |stmt| {
                 assert!(

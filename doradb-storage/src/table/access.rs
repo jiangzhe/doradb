@@ -241,7 +241,7 @@ pub(crate) trait TableAccess {
 pub(crate) struct TableAccessor<'a, D: 'static, I: 'static> {
     mem: &'a GenericMemTable<D, I>,
     storage: Option<&'a ColumnStorage>,
-    user_sec_idx: Option<&'a [SecondaryIndex<EvictableBufferPool>]>,
+    user_sec_idx: Option<&'a [Option<SecondaryIndex<EvictableBufferPool>>]>,
 }
 
 enum IndexPurgeDecision {
@@ -260,6 +260,37 @@ enum ColdRowUpdateRead {
 fn ctx_pool_guards(ctx: &TrxContext) -> &PoolGuards {
     ctx.pool_guards()
         .expect("table access requires an attached session for pool guards")
+}
+
+#[inline]
+fn require_user_sec_idx(
+    indexes: &[Option<SecondaryIndex<EvictableBufferPool>>],
+    index_no: usize,
+) -> Result<&SecondaryIndex<EvictableBufferPool>> {
+    indexes
+        .get(index_no)
+        .and_then(Option::as_ref)
+        .ok_or_else(|| missing_secondary_index(index_no, indexes.len()))
+}
+
+#[inline]
+fn bound_unique_user_index<'a>(
+    indexes: Option<&'a [Option<SecondaryIndex<EvictableBufferPool>>]>,
+    index_no: usize,
+    root: BlockID,
+) -> Result<UniqueSecondaryIndex<'a, EvictableBufferPool>> {
+    let indexes = indexes.ok_or_else(|| missing_user_secondary_index(index_no))?;
+    require_user_sec_idx(indexes, index_no)?.bind_unique(root)
+}
+
+#[inline]
+fn bound_non_unique_user_index<'a>(
+    indexes: Option<&'a [Option<SecondaryIndex<EvictableBufferPool>>]>,
+    index_no: usize,
+    root: BlockID,
+) -> Result<NonUniqueSecondaryIndex<'a, EvictableBufferPool>> {
+    let indexes = indexes.ok_or_else(|| missing_user_secondary_index(index_no))?;
+    require_user_sec_idx(indexes, index_no)?.bind_non_unique(root)
 }
 
 impl<'a> From<&'a Table> for TableAccessor<'a, EvictableBufferPool, EvictableBufferPool> {
@@ -286,21 +317,38 @@ impl<'a> From<&'a CatalogTable> for TableAccessor<'a, FixedBufferPool, FixedBuff
 
 impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
     #[inline]
-    fn generic_sec_idx(&self) -> &[InMemorySecondaryIndex<I>] {
-        self.mem.sec_idx()
+    fn require_generic_sec_idx(&self, index_no: usize) -> Result<&InMemorySecondaryIndex<I>> {
+        self.mem.require_sec_idx(index_no)
     }
 
     #[inline]
     fn sec_idx_len(&self) -> usize {
         self.user_sec_idx
-            .map_or_else(|| self.generic_sec_idx().len(), <[_]>::len)
+            .map_or_else(|| self.mem.sec_idx().len(), <[_]>::len)
+    }
+
+    #[inline]
+    fn sec_idx_is_active(&self, index_no: usize) -> bool {
+        match self.user_sec_idx {
+            Some(indexes) => indexes.get(index_no).is_some_and(Option::is_some),
+            None => self
+                .mem
+                .sec_idx()
+                .get(index_no)
+                .is_some_and(Option::is_some),
+        }
     }
 
     #[inline]
     fn sec_idx_is_unique(&self, index_no: usize) -> bool {
         match self.user_sec_idx {
-            Some(indexes) => indexes[index_no].is_unique(),
-            None => self.generic_sec_idx()[index_no].is_unique(),
+            Some(indexes) => require_user_sec_idx(indexes, index_no)
+                .expect("active user index slot")
+                .is_unique(),
+            None => self
+                .require_generic_sec_idx(index_no)
+                .expect("active generic index slot")
+                .is_unique(),
         }
     }
 
@@ -379,30 +427,6 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
     }
 
     #[inline]
-    fn bound_unique_user_index(
-        &self,
-        index_no: usize,
-        root: BlockID,
-    ) -> Result<UniqueSecondaryIndex<'a, EvictableBufferPool>> {
-        let indexes = self
-            .user_sec_idx
-            .ok_or_else(|| missing_user_secondary_index(index_no))?;
-        indexes[index_no].bind_unique(root)
-    }
-
-    #[inline]
-    fn bound_non_unique_user_index(
-        &self,
-        index_no: usize,
-        root: BlockID,
-    ) -> Result<NonUniqueSecondaryIndex<'a, EvictableBufferPool>> {
-        let indexes = self
-            .user_sec_idx
-            .ok_or_else(|| missing_user_secondary_index(index_no))?;
-        indexes[index_no].bind_non_unique(root)
-    }
-
-    #[inline]
     async fn unique_lookup(
         &self,
         guards: &PoolGuards,
@@ -413,7 +437,7 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
         let index_pool_guard = self.index_pool_guard(guards);
         match (self.user_sec_idx, view) {
             (Some(_), SecondaryIndexView::User { ts, root }) => {
-                self.bound_unique_user_index(index_no, root)?
+                bound_unique_user_index(self.user_sec_idx, index_no, root)?
                     .lookup(index_pool_guard, key, ts)
                     .await
             }
@@ -421,7 +445,7 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
                 Err(secondary_index_view_mismatch("unique lookup"))
             }
             (None, view) => {
-                self.generic_sec_idx()[index_no]
+                self.require_generic_sec_idx(index_no)?
                     .unique()
                     .ok_or_else(|| secondary_index_kind_mismatch("unique lookup", "unique"))?
                     .lookup(index_pool_guard, key, view.ts())
@@ -443,7 +467,7 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
         let index_pool_guard = self.index_pool_guard(guards);
         match (self.user_sec_idx, view) {
             (Some(_), SecondaryIndexView::User { ts, root }) => {
-                self.bound_unique_user_index(index_no, root)?
+                bound_unique_user_index(self.user_sec_idx, index_no, root)?
                     .insert_if_not_exists(index_pool_guard, key, row_id, merge_if_match_deleted, ts)
                     .await
             }
@@ -451,7 +475,7 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
                 Err(secondary_index_view_mismatch("unique insert"))
             }
             (None, view) => {
-                self.generic_sec_idx()[index_no]
+                self.require_generic_sec_idx(index_no)?
                     .unique()
                     .ok_or_else(|| secondary_index_kind_mismatch("unique insert", "unique"))?
                     .insert_if_not_exists(
@@ -479,13 +503,13 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
         let index_pool_guard = self.index_pool_guard(guards);
         match self.user_sec_idx {
             Some(indexes) => {
-                indexes[index_no]
+                require_user_sec_idx(indexes, index_no)?
                     .unique_mem()?
                     .compare_delete(index_pool_guard, key, old_row_id, ignore_del_mask, ts)
                     .await
             }
             None => {
-                self.generic_sec_idx()[index_no]
+                self.require_generic_sec_idx(index_no)?
                     .unique()
                     .ok_or_else(|| {
                         secondary_index_kind_mismatch("unique compare delete", "unique")
@@ -508,7 +532,7 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
         let index_pool_guard = self.index_pool_guard(guards);
         match (self.user_sec_idx, view) {
             (Some(_), SecondaryIndexView::User { ts, root }) => {
-                self.bound_unique_user_index(index_no, root)?
+                bound_unique_user_index(self.user_sec_idx, index_no, root)?
                     .mask_as_deleted(index_pool_guard, key, row_id, ts)
                     .await
             }
@@ -516,7 +540,7 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
                 Err(secondary_index_view_mismatch("unique mask deleted"))
             }
             (None, view) => {
-                self.generic_sec_idx()[index_no]
+                self.require_generic_sec_idx(index_no)?
                     .unique()
                     .ok_or_else(|| secondary_index_kind_mismatch("unique mask deleted", "unique"))?
                     .mask_as_deleted(index_pool_guard, key, row_id, view.ts())
@@ -538,7 +562,7 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
         let index_pool_guard = self.index_pool_guard(guards);
         match (self.user_sec_idx, view) {
             (Some(_), SecondaryIndexView::User { ts, root }) => {
-                self.bound_unique_user_index(index_no, root)?
+                bound_unique_user_index(self.user_sec_idx, index_no, root)?
                     .compare_exchange(index_pool_guard, key, old_row_id, new_row_id, ts)
                     .await
             }
@@ -546,7 +570,7 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
                 Err(secondary_index_view_mismatch("unique compare exchange"))
             }
             (None, view) => {
-                self.generic_sec_idx()[index_no]
+                self.require_generic_sec_idx(index_no)?
                     .unique()
                     .ok_or_else(|| {
                         secondary_index_kind_mismatch("unique compare exchange", "unique")
@@ -569,7 +593,7 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
         let index_pool_guard = self.index_pool_guard(guards);
         match (self.user_sec_idx, view) {
             (Some(_), SecondaryIndexView::User { ts, root }) => {
-                self.bound_non_unique_user_index(index_no, root)?
+                bound_non_unique_user_index(self.user_sec_idx, index_no, root)?
                     .lookup(index_pool_guard, key, res, ts)
                     .await
             }
@@ -577,7 +601,7 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
                 Err(secondary_index_view_mismatch("non-unique lookup"))
             }
             (None, view) => {
-                self.generic_sec_idx()[index_no]
+                self.require_generic_sec_idx(index_no)?
                     .non_unique()
                     .ok_or_else(|| {
                         secondary_index_kind_mismatch("non-unique lookup", "non-unique")
@@ -600,7 +624,7 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
         let index_pool_guard = self.index_pool_guard(guards);
         match (self.user_sec_idx, view) {
             (Some(_), SecondaryIndexView::User { ts, root }) => {
-                self.bound_non_unique_user_index(index_no, root)?
+                bound_non_unique_user_index(self.user_sec_idx, index_no, root)?
                     .lookup_unique(index_pool_guard, key, row_id, ts)
                     .await
             }
@@ -608,7 +632,7 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
                 Err(secondary_index_view_mismatch("non-unique lookup unique"))
             }
             (None, view) => {
-                self.generic_sec_idx()[index_no]
+                self.require_generic_sec_idx(index_no)?
                     .non_unique()
                     .ok_or_else(|| {
                         secondary_index_kind_mismatch("non-unique lookup unique", "non-unique")
@@ -632,7 +656,7 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
         let index_pool_guard = self.index_pool_guard(guards);
         match (self.user_sec_idx, view) {
             (Some(_), SecondaryIndexView::User { ts, root }) => {
-                self.bound_non_unique_user_index(index_no, root)?
+                bound_non_unique_user_index(self.user_sec_idx, index_no, root)?
                     .insert_if_not_exists(index_pool_guard, key, row_id, merge_if_match_deleted, ts)
                     .await
             }
@@ -640,7 +664,7 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
                 Err(secondary_index_view_mismatch("non-unique insert"))
             }
             (None, view) => {
-                self.generic_sec_idx()[index_no]
+                self.require_generic_sec_idx(index_no)?
                     .non_unique()
                     .ok_or_else(|| {
                         secondary_index_kind_mismatch("non-unique insert", "non-unique")
@@ -669,7 +693,7 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
         let index_pool_guard = self.index_pool_guard(guards);
         match (self.user_sec_idx, view) {
             (Some(_), SecondaryIndexView::User { ts, root }) => {
-                self.bound_non_unique_user_index(index_no, root)?
+                bound_non_unique_user_index(self.user_sec_idx, index_no, root)?
                     .mask_as_deleted(index_pool_guard, key, row_id, ts)
                     .await
             }
@@ -677,7 +701,7 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
                 Err(secondary_index_view_mismatch("non-unique mask deleted"))
             }
             (None, view) => {
-                self.generic_sec_idx()[index_no]
+                self.require_generic_sec_idx(index_no)?
                     .non_unique()
                     .ok_or_else(|| {
                         secondary_index_kind_mismatch("non-unique mask deleted", "non-unique")
@@ -701,13 +725,13 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
         let index_pool_guard = self.index_pool_guard(guards);
         match self.user_sec_idx {
             Some(indexes) => {
-                indexes[index_no]
+                require_user_sec_idx(indexes, index_no)?
                     .non_unique_mem()?
                     .compare_delete(index_pool_guard, key, row_id, ignore_del_mask, ts)
                     .await
             }
             None => {
-                self.generic_sec_idx()[index_no]
+                self.require_generic_sec_idx(index_no)?
                     .non_unique()
                     .ok_or_else(|| {
                         secondary_index_kind_mismatch("non-unique compare delete", "non-unique")
@@ -962,12 +986,10 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
             .zip(vals)
             .collect::<HashMap<_, _>>();
         self.metadata()
-            .index_specs
-            .iter()
-            .enumerate()
+            .active_indexes()
             .map(|(index_no, index)| {
                 let vals = index
-                    .index_cols
+                    .cols
                     .iter()
                     .map(|key| {
                         indexed_vals
@@ -1008,13 +1030,16 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
 
     #[inline]
     fn index_key_matches(keys: &[SelectKey], key: &SelectKey) -> Result<bool> {
-        let old_key = keys.get(key.index_no).ok_or_else(|| {
-            Error::from(Report::new(InternalError::IndexKeyMissing).attach(format!(
-                "index_no={}, key_count={}",
-                key.index_no,
-                keys.len()
-            )))
-        })?;
+        let old_key = keys
+            .iter()
+            .find(|old_key| old_key.index_no == key.index_no)
+            .ok_or_else(|| {
+                Error::from(Report::new(InternalError::IndexKeyMissing).attach(format!(
+                    "index_no={}, key_count={}",
+                    key.index_no,
+                    keys.len()
+                )))
+            })?;
         Ok(old_key.vals == key.vals)
     }
 
@@ -1083,8 +1108,10 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
         row_idx: usize,
         row_shape_fingerprint: u128,
     ) -> Result<bool> {
-        let read_set = self.metadata().index_specs[key.index_no]
-            .index_cols
+        let read_set = self
+            .metadata()
+            .require_index_spec(key.index_no)?
+            .cols
             .iter()
             .map(|key| key.col_no as usize)
             .collect::<Vec<_>>();
@@ -1149,7 +1176,7 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
         key: SelectKey,
         row_id: RowID,
     ) -> Result<()> {
-        if self.metadata().index_specs[key.index_no].unique() {
+        if self.metadata().require_index_spec(key.index_no)?.unique() {
             let res = self
                 .unique_insert_if_not_exists(
                     guards,
@@ -1187,7 +1214,7 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
         page_guard: &PageSharedGuard<RowPage>,
         root_snapshot: Option<&TableRootSnapshot<'_>>,
     ) -> Result<InsertIndex> {
-        if self.metadata().index_specs[key.index_no].unique() {
+        if self.metadata().require_index_spec(key.index_no)?.unique() {
             self.insert_unique_index(ctx, effects, key, row_id, page_guard, root_snapshot)
                 .await
         } else {
@@ -1286,7 +1313,12 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
     #[inline]
     async fn delete_unique_no_trx_inner(&self, guards: &PoolGuards, key: &SelectKey) -> Result<()> {
         debug_assert!(key.index_no < self.sec_idx_len());
-        debug_assert!(self.metadata().index_specs[key.index_no].unique());
+        debug_assert!(
+            self.metadata()
+                .require_index_spec(key.index_no)
+                .unwrap()
+                .unique()
+        );
         debug_assert!(self.metadata().index_type_match(key.index_no, &key.vals));
         let view = self.unchecked_secondary_view(MIN_SNAPSHOT_TS, key.index_no)?;
         let (mut page_guard, row_id) = match self
@@ -1618,13 +1650,11 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
             let old_entry = old_access.first_undo_entry().expect("old undo entry");
             debug_assert!(matches!(old_entry.as_ref().kind, RowUndoKind::Delete));
             metadata
-                .index_specs
-                .iter()
-                .enumerate()
+                .active_indexes()
                 .filter(|(_, index)| index.unique())
                 .map(|(index_no, index)| {
                     let vals = index
-                        .index_cols
+                        .cols
                         .iter()
                         .map(|key| new_row[key.col_no as usize].clone())
                         .collect();
@@ -1669,7 +1699,7 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
         root_snapshot: Option<&TableRootSnapshot<'_>>,
     ) -> Result<UpdateIndex> {
         let metadata = self.metadata();
-        for (index_no, index_schema) in metadata.index_specs.iter().enumerate() {
+        for (index_no, index_schema) in metadata.active_indexes() {
             debug_assert_eq!(self.sec_idx_is_unique(index_no), index_schema.unique());
             if index_key_is_changed(index_schema, index_change_cols) {
                 let new_key = read_latest_index_key(metadata, index_no, page_guard, row_id);
@@ -1724,7 +1754,7 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
     ) -> Result<UpdateIndex> {
         debug_assert!(old_row_id != new_row_id);
         let metadata = self.metadata();
-        for (index_no, index_schema) in metadata.index_specs.iter().enumerate() {
+        for (index_no, index_schema) in metadata.active_indexes() {
             debug_assert_eq!(self.sec_idx_is_unique(index_no), index_schema.unique());
             let key = read_latest_index_key(metadata, index_no, page_guard, new_row_id);
             if index_schema.unique() {
@@ -1768,7 +1798,7 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
     ) -> Result<UpdateIndex> {
         debug_assert!(row_id_move.old != row_id_move.new);
         let metadata = self.metadata();
-        for (index_no, index_schema) in metadata.index_specs.iter().enumerate() {
+        for (index_no, index_schema) in metadata.active_indexes() {
             debug_assert_eq!(self.sec_idx_is_unique(index_no), index_schema.unique());
             let key = read_latest_index_key(metadata, index_no, page_guard, row_id_move.new);
             if index_key_is_changed(index_schema, index_change_cols) {
@@ -1904,8 +1934,9 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
         root_snapshot: Option<&TableRootSnapshot<'_>>,
     ) -> Result<()> {
         let metadata = self.metadata();
-        let keys = (0..self.sec_idx_len())
-            .map(|index_no| read_latest_index_key(metadata, index_no, page_guard, row_id))
+        let keys = metadata
+            .active_indexes()
+            .map(|(index_no, _)| read_latest_index_key(metadata, index_no, page_guard, row_id))
             .collect();
         self.defer_delete_index_keys(ctx, effects, row_id, keys, root_snapshot)
             .await
@@ -1920,9 +1951,8 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
         keys: Vec<SelectKey>,
         root_snapshot: Option<&TableRootSnapshot<'_>>,
     ) -> Result<()> {
-        debug_assert_eq!(keys.len(), self.sec_idx_len());
         for key in keys {
-            let index_schema = &self.metadata().index_specs[key.index_no];
+            let index_schema = self.metadata().require_index_spec(key.index_no)?;
             debug_assert_eq!(self.sec_idx_is_unique(key.index_no), index_schema.unique());
             if index_schema.unique() {
                 self.defer_delete_unique_index(ctx, effects, row_id, key, root_snapshot)
@@ -1942,7 +1972,7 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
         key: &SelectKey,
         row_id: RowID,
     ) -> Result<bool> {
-        let index_schema = &self.metadata().index_specs[key.index_no];
+        let index_schema = self.metadata().require_index_spec(key.index_no)?;
         if index_schema.unique() {
             self.unique_compare_delete(
                 guards,
@@ -3276,7 +3306,12 @@ impl<D: BufferPool, I: BufferPool> TableAccess for TableAccessor<'_, D, I> {
         user_read_set: &[usize],
     ) -> Result<SelectMvcc> {
         debug_assert!(key.index_no < self.sec_idx_len());
-        debug_assert!(self.metadata().index_specs[key.index_no].unique());
+        debug_assert!(
+            self.metadata()
+                .require_index_spec(key.index_no)
+                .unwrap()
+                .unique()
+        );
         debug_assert!(self.metadata().index_type_match(key.index_no, &key.vals));
         debug_assert!({
             !user_read_set.is_empty()
@@ -3308,7 +3343,12 @@ impl<D: BufferPool, I: BufferPool> TableAccess for TableAccessor<'_, D, I> {
         for<'m, 'p> F: FnOnce(&'m TableMetadata, Row<'p>) -> R,
     {
         debug_assert!(key.index_no < self.sec_idx_len());
-        debug_assert!(self.metadata().index_specs[key.index_no].unique());
+        debug_assert!(
+            self.metadata()
+                .require_index_spec(key.index_no)
+                .unwrap()
+                .unique()
+        );
         debug_assert!(self.metadata().index_type_match(key.index_no, &key.vals));
         let view = self.unchecked_secondary_view(MIN_SNAPSHOT_TS, key.index_no)?;
         let (page_guard, row_id) = match self
@@ -3351,7 +3391,13 @@ impl<D: BufferPool, I: BufferPool> TableAccess for TableAccessor<'_, D, I> {
         debug_assert!(key.index_no < self.sec_idx_len());
         // Index scan should be applied to non-unique index.
         // todo: support partial key scan on unique index.
-        debug_assert!(!self.metadata().index_specs[key.index_no].unique());
+        debug_assert!(
+            !self
+                .metadata()
+                .require_index_spec(key.index_no)
+                .unwrap()
+                .unique()
+        );
         debug_assert!(self.metadata().index_type_match(key.index_no, &key.vals));
         debug_assert!({
             !user_read_set.is_empty()
@@ -3447,7 +3493,12 @@ impl<D: BufferPool, I: BufferPool> TableAccess for TableAccessor<'_, D, I> {
         update: Vec<UpdateCol>,
     ) -> Result<UpdateMvcc> {
         debug_assert!(key.index_no < self.sec_idx_len());
-        debug_assert!(self.metadata().index_specs[key.index_no].unique());
+        debug_assert!(
+            self.metadata()
+                .require_index_spec(key.index_no)
+                .unwrap()
+                .unique()
+        );
         debug_assert!(self.metadata().index_type_match(key.index_no, &key.vals));
         debug_assert!(update.iter().all(|uc| {
             uc.idx < self.metadata().col_count() && self.metadata().col_type_match(uc.idx, &uc.val)
@@ -3736,7 +3787,12 @@ impl<D: BufferPool, I: BufferPool> TableAccess for TableAccessor<'_, D, I> {
         log_by_key: bool,
     ) -> Result<DeleteMvcc> {
         debug_assert!(key.index_no < self.sec_idx_len());
-        debug_assert!(self.metadata().index_specs[key.index_no].unique());
+        debug_assert!(
+            self.metadata()
+                .require_index_spec(key.index_no)
+                .unwrap()
+                .unique()
+        );
         debug_assert!(self.metadata().index_type_match(key.index_no, &key.vals));
         loop {
             let root_snapshot = self.root_snapshot(ctx)?;
@@ -3875,8 +3931,14 @@ impl<D: BufferPool, I: BufferPool> TableAccess for TableAccessor<'_, D, I> {
         unique: bool,
         min_active_sts: TrxID,
     ) -> Result<bool> {
-        // todo: consider index drop.
-        let index_schema = &self.metadata().index_specs[key.index_no];
+        // Undo can outlive the secondary index that produced it. Once the
+        // index slot is inactive, row-level purge has no per-entry cleanup to do.
+        let Some(index_schema) = self.metadata().index_spec(key.index_no) else {
+            return Ok(false);
+        };
+        if !self.sec_idx_is_active(key.index_no) {
+            return Ok(false);
+        }
         debug_assert_eq!(unique, index_schema.unique());
         if unique {
             self.delete_unique_index(guards, key, row_id, min_active_sts)

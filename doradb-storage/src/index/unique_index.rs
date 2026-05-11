@@ -204,9 +204,9 @@ impl<P: BufferPool> UniqueMemIndex<P> {
         ts: TrxID,
     ) -> Result<Self> {
         debug_assert!(index_spec.unique());
-        debug_assert!(!index_spec.index_cols.is_empty());
+        debug_assert!(!index_spec.cols.is_empty());
         let types = index_spec
-            .index_cols
+            .cols
             .iter()
             .map(|key| ty_infer(key.col_no as usize))
             .collect();

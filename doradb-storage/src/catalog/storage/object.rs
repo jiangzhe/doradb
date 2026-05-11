@@ -6,6 +6,7 @@ use semistr::SemiStr;
 #[derive(Debug)]
 pub struct TableObject {
     pub table_id: TableID,
+    pub next_index_no: u16,
 }
 
 /// One row object in `catalog.columns`.
@@ -23,7 +24,6 @@ pub struct ColumnObject {
 pub struct IndexObject {
     pub table_id: TableID,
     pub index_no: u16,
-    pub index_name: SemiStr,
     pub index_attributes: IndexAttributes,
 }
 

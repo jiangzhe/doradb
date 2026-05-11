@@ -142,7 +142,7 @@ impl<'a> RowReadAccess<'a> {
                         // versions, even when the user read set omitted them.
                         let index_spec = &metadata.index_specs[key.index_no];
                         let user_key_idx_map: HashMap<usize, usize> = index_spec
-                            .index_cols
+                            .cols
                             .iter()
                             .enumerate()
                             .map(|(key_pos, key)| (key.col_no as usize, key_pos))
@@ -420,7 +420,7 @@ impl<'a> RowReadAccess<'a> {
                     let vals = row.clone_index_vals(metadata, key.index_no);
                     let mvcc_key = SelectKey::new(key.index_no, vals);
                     let mapping: HashMap<usize, usize> = metadata.index_specs[key.index_no]
-                        .index_cols
+                        .cols
                         .iter()
                         .enumerate()
                         .map(|(key_no, key)| (key.col_no as usize, key_no))
@@ -573,7 +573,7 @@ impl RowVersion {
                 // compare key using read set and latest row page
                 let index_spec = &metadata.index_specs[search_key.index_no];
                 let key_different = search_key.vals.iter().enumerate().any(|(pos, search_val)| {
-                    let user_col_idx = index_spec.index_cols[pos].col_no as usize;
+                    let user_col_idx = index_spec.cols[pos].col_no as usize;
                     if let Some(undo_val) = self.undo_vals.get(&user_col_idx) {
                         search_val != undo_val
                     } else {

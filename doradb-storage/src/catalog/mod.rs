@@ -231,10 +231,9 @@ impl Catalog {
                         };
                         index_cols.push(ik);
                     }
-                    index_specs.push(IndexSpec::new(
-                        &index.index_name,
-                        index_cols,
-                        index.index_attributes,
+                    index_specs.push(ActiveIndexSpec::new(
+                        index.index_no,
+                        IndexSpec::new(index_cols, index.index_attributes),
                     ));
                 }
                 let table_file = table_fs
@@ -243,7 +242,11 @@ impl Catalog {
                 // `catalog_load_boundary`: loading a user table binds one root
                 // for metadata validation and block-index initialization.
                 let active_root = table_file.active_root_unchecked();
-                let metadata_in_catalog = TableMetadata::new(column_specs, index_specs);
+                let metadata_in_catalog = TableMetadata::try_new_with_next_index_no(
+                    column_specs,
+                    index_specs,
+                    table.next_index_no,
+                )?;
                 let metadata_in_file = &*active_root.metadata;
                 if &metadata_in_catalog != metadata_in_file {
                     return Err(Report::new(DataIntegrityError::InvalidRootInvariant)
@@ -553,11 +556,7 @@ pub mod tests {
                         column_attributes: ColumnAttributes::empty(),
                     }],
                 },
-                vec![IndexSpec::new(
-                    "idx_table1_id",
-                    vec![IndexKey::new(0)],
-                    IndexAttributes::PK,
-                )],
+                vec![IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::PK)],
             )
             .await
             .unwrap();
@@ -586,11 +585,7 @@ pub mod tests {
                         },
                     ],
                 },
-                vec![IndexSpec::new(
-                    "idx_table2_id",
-                    vec![IndexKey::new(0)],
-                    IndexAttributes::PK,
-                )],
+                vec![IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::PK)],
             )
             .await
             .unwrap();
@@ -613,11 +608,7 @@ pub mod tests {
                         column_attributes: ColumnAttributes::empty(),
                     }],
                 },
-                vec![IndexSpec::new(
-                    "idx_table3_name",
-                    vec![IndexKey::new(0)],
-                    IndexAttributes::PK,
-                )],
+                vec![IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::PK)],
             )
             .await
             .unwrap();
@@ -651,13 +642,11 @@ pub mod tests {
                 },
                 vec![
                     IndexSpec::new(
-                        "idx_table4_id",
                         vec![IndexKey::new(0)],
                         // unique index.
                         IndexAttributes::PK,
                     ),
                     IndexSpec::new(
-                        "idx_table4_val",
                         vec![IndexKey::new(1)],
                         // non-unique index.
                         IndexAttributes::empty(),
@@ -818,13 +807,8 @@ pub mod tests {
                 ],
             };
             let index_specs = vec![
+                IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::PK),
                 IndexSpec::new(
-                    "idx_allocator_pk",
-                    vec![IndexKey::new(0)],
-                    IndexAttributes::PK,
-                ),
-                IndexSpec::new(
-                    "idx_allocator_k12",
                     vec![IndexKey::new(1), IndexKey::new(2)],
                     IndexAttributes::empty(),
                 ),
@@ -844,6 +828,121 @@ pub mod tests {
             let table_id2 = table1(&engine).await;
             assert!(table_id1 >= USER_OBJ_ID_START);
             assert_eq!(table_id2, table_id1 + 1);
+            drop(engine);
+        });
+    }
+
+    #[test]
+    fn test_next_index_no_persists_across_restart_and_catalog_checkpoint() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let main_dir = temp_dir.path().to_path_buf();
+            let log_stem = "stable-index-metadata";
+
+            let engine = EngineConfig::default()
+                .storage_root(main_dir.clone())
+                .trx(TrxSysConfig::default().log_file_stem(log_stem))
+                .build()
+                .await
+                .unwrap();
+            let mut session = engine.try_new_session().unwrap();
+            let table_id = session
+                .create_table(
+                    TableSpec {
+                        columns: vec![
+                            ColumnSpec::new("id", ValKind::I32, ColumnAttributes::empty()),
+                            ColumnSpec::new("name", ValKind::VarByte, ColumnAttributes::empty()),
+                        ],
+                    },
+                    vec![
+                        IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::PK),
+                        IndexSpec::new(vec![IndexKey::new(1)], IndexAttributes::empty()),
+                    ],
+                )
+                .await
+                .unwrap();
+            let table = engine.catalog().get_table(table_id).await.unwrap();
+            assert_eq!(table.metadata().next_index_no(), 2);
+            assert_eq!(
+                table
+                    .metadata()
+                    .active_indexes()
+                    .map(|(index_no, _)| index_no)
+                    .collect::<Vec<_>>(),
+                vec![0, 1]
+            );
+            assert_eq!(
+                table
+                    .file()
+                    .active_root_unchecked()
+                    .secondary_index_roots
+                    .len(),
+                2
+            );
+            drop(table);
+            drop(session);
+            drop(engine);
+
+            let engine = EngineConfig::default()
+                .storage_root(main_dir.clone())
+                .trx(TrxSysConfig::default().log_file_stem(log_stem))
+                .build()
+                .await
+                .unwrap();
+            let table = engine.catalog().get_table(table_id).await.unwrap();
+            assert_eq!(table.metadata().next_index_no(), 2);
+            assert_eq!(
+                table
+                    .file()
+                    .active_root_unchecked()
+                    .secondary_index_roots
+                    .len(),
+                2
+            );
+            let indexes = engine
+                .catalog()
+                .storage
+                .indexes()
+                .list_uncommitted_by_table_id(
+                    &PoolGuards::builder()
+                        .push(PoolRole::Meta, engine.meta_pool.pool_guard())
+                        .build(),
+                    table_id,
+                )
+                .await;
+            assert_eq!(
+                indexes
+                    .iter()
+                    .map(|index| index.index_no)
+                    .collect::<Vec<_>>(),
+                vec![0, 1]
+            );
+            drop(table);
+            engine
+                .catalog()
+                .checkpoint_now(&engine.trx_sys)
+                .await
+                .unwrap();
+            drop(engine);
+
+            let engine = EngineConfig::default()
+                .storage_root(main_dir)
+                .trx(TrxSysConfig::default().log_file_stem(log_stem))
+                .build()
+                .await
+                .unwrap();
+            let table = engine.catalog().get_table(table_id).await.unwrap();
+            assert_eq!(table.metadata().next_index_no(), 2);
+            assert_eq!(table.metadata().active_index_count(), 2);
+            assert_eq!(
+                table
+                    .file()
+                    .active_root_unchecked()
+                    .secondary_index_roots
+                    .len(),
+                2
+            );
+            drop(table);
             drop(engine);
         });
     }

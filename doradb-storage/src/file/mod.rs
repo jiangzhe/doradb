@@ -1016,11 +1016,7 @@ mod tests {
                 ValKind::U32,
                 ColumnAttributes::empty(),
             )],
-            vec![IndexSpec::new(
-                "idx_pk",
-                vec![IndexKey::new(0)],
-                IndexAttributes::PK,
-            )],
+            vec![IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::PK)],
         ))
     }
 
