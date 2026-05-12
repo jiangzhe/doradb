@@ -108,7 +108,7 @@ impl ActiveRoot {
         let alloc_map = AllocMap::new(max_pages);
         let super_block_allocated = alloc_map.allocate_at(usize::from(SUPER_BLOCK_ID));
         assert!(super_block_allocated);
-        let secondary_index_roots = vec![SUPER_BLOCK_ID; metadata.index_specs.len()];
+        let secondary_index_roots = vec![SUPER_BLOCK_ID; metadata.index_slot_count()];
 
         ActiveRoot::from_parts(
             0,
@@ -482,10 +482,10 @@ impl MutableTableFile {
     /// Replaces all mutable-root secondary DiskTree roots.
     #[inline]
     pub fn set_secondary_index_roots(&mut self, roots: Vec<BlockID>) -> Result<()> {
-        if roots.len() != self.root().metadata.index_specs.len() {
+        if roots.len() != self.root().metadata.index_slot_count() {
             return Err(secondary_index_root_count_mismatch(
                 roots.len(),
-                self.root().metadata.index_specs.len(),
+                self.root().metadata.index_slot_count(),
             ));
         }
         self.new_root_mut().secondary_index_roots = roots;
@@ -772,11 +772,7 @@ mod tests {
                     ColumnSpec::new("c0", ValKind::U32, ColumnAttributes::empty()),
                     ColumnSpec::new("c1", ValKind::U64, ColumnAttributes::NULLABLE),
                 ],
-                vec![IndexSpec::new(
-                    "idx1",
-                    vec![IndexKey::new(0)],
-                    IndexAttributes::PK,
-                )],
+                vec![IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::PK)],
             ));
             let table_id = test_user_table_id(41);
             let table_file = fs.create_table_file(table_id, metadata, false).unwrap();
@@ -921,11 +917,7 @@ mod tests {
                     ColumnSpec::new("c0", ValKind::U32, ColumnAttributes::empty()),
                     ColumnSpec::new("c1", ValKind::U64, ColumnAttributes::NULLABLE),
                 ],
-                vec![IndexSpec::new(
-                    "idx1",
-                    vec![IndexKey::new(0)],
-                    IndexAttributes::PK,
-                )],
+                vec![IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::PK)],
             ));
             let table_id = test_user_table_id(42);
             let table_file = fs.create_table_file(table_id, metadata, false).unwrap();
@@ -970,11 +962,7 @@ mod tests {
                 ColumnSpec::new("c0", ValKind::U32, ColumnAttributes::empty()),
                 ColumnSpec::new("c1", ValKind::U64, ColumnAttributes::NULLABLE),
             ],
-            vec![IndexSpec::new(
-                "idx1",
-                vec![IndexKey::new(0)],
-                IndexAttributes::PK,
-            )],
+            vec![IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::PK)],
         ))
     }
 

@@ -140,9 +140,11 @@ impl<'a> RowReadAccess<'a> {
                         // current key no longer matches the lookup key. Track
                         // enough key columns to validate older reconstructed
                         // versions, even when the user read set omitted them.
-                        let index_spec = &metadata.index_specs[key.index_no];
+                        let Some(index_spec) = metadata.index_spec(key.index_no) else {
+                            return ReadRow::InvalidIndex;
+                        };
                         let user_key_idx_map: HashMap<usize, usize> = index_spec
-                            .index_cols
+                            .cols
                             .iter()
                             .enumerate()
                             .map(|(key_pos, key)| (key.col_no as usize, key_pos))
@@ -153,7 +155,11 @@ impl<'a> RowReadAccess<'a> {
                         let undo_key = if read_set_contains_key {
                             None
                         } else {
-                            let vals = self.row().clone_index_vals(metadata, key.index_no);
+                            let vals = index_spec
+                                .cols
+                                .iter()
+                                .map(|key| self.row().val(metadata, key.col_no as usize))
+                                .collect();
                             Some(SelectKey {
                                 index_no: key.index_no,
                                 vals,
@@ -301,6 +307,9 @@ impl<'a> RowReadAccess<'a> {
             RowReadState::Recover(_) => unreachable!(),
             RowReadState::RowVer(undo) => undo,
         };
+        if metadata.index_spec(key.index_no).is_none() {
+            return FindOldVersion::None;
+        }
 
         match &**undo {
             None => {
@@ -402,6 +411,9 @@ impl<'a> RowReadAccess<'a> {
     /// This method is used by purge threads to correctly remove unnecessary index entry.
     #[inline]
     pub fn any_version_matches_key(&self, metadata: &TableMetadata, key: &SelectKey) -> bool {
+        let Some(index_spec) = metadata.index_spec(key.index_no) else {
+            return false;
+        };
         // Check page data first.
         let row = self.row();
         let deleted = row.is_deleted();
@@ -417,10 +429,14 @@ impl<'a> RowReadAccess<'a> {
                     // Page data is already checked, we can traverse version
                     // chain now.
                     let mut entry = undo_head.next.main.entry.as_ref();
-                    let vals = row.clone_index_vals(metadata, key.index_no);
+                    let vals = index_spec
+                        .cols
+                        .iter()
+                        .map(|key| row.val(metadata, key.col_no as usize))
+                        .collect();
                     let mvcc_key = SelectKey::new(key.index_no, vals);
-                    let mapping: HashMap<usize, usize> = metadata.index_specs[key.index_no]
-                        .index_cols
+                    let mapping: HashMap<usize, usize> = index_spec
+                        .cols
                         .iter()
                         .enumerate()
                         .map(|(key_no, key)| (key.col_no as usize, key_no))
@@ -555,6 +571,12 @@ impl RowVersion {
         search_key: Option<&SelectKey>,
     ) -> ReadRow {
         if let Some(search_key) = search_key {
+            let Some(index_spec) = metadata.index_spec(search_key.index_no) else {
+                return ReadRow::InvalidIndex;
+            };
+            if index_spec.cols.len() != search_key.vals.len() {
+                return ReadRow::InvalidIndex;
+            }
             // If search key is provided, we need to validate key before
             // returning visible values.
             if let Some(tracker) = self.key_tracker.as_ref()
@@ -571,9 +593,8 @@ impl RowVersion {
                 }
             } else {
                 // compare key using read set and latest row page
-                let index_spec = &metadata.index_specs[search_key.index_no];
                 let key_different = search_key.vals.iter().enumerate().any(|(pos, search_val)| {
-                    let user_col_idx = index_spec.index_cols[pos].col_no as usize;
+                    let user_col_idx = index_spec.cols[pos].col_no as usize;
                     if let Some(undo_val) = self.undo_vals.get(&user_col_idx) {
                         search_val != undo_val
                     } else {
@@ -1065,4 +1086,136 @@ pub enum FindOldVersion {
     WriteConflict,
     DuplicateKey,
     None,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::catalog::{
+        ActiveIndexSpec, ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexSpec,
+    };
+    use crate::trx::{MIN_ACTIVE_TRX_ID, ver_map::RowVersionMap};
+    use crate::value::ValKind;
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
+
+    fn sparse_metadata() -> TableMetadata {
+        TableMetadata::try_new_with_next_index_no(
+            vec![
+                ColumnSpec::new("c0", ValKind::I32, ColumnAttributes::empty()),
+                ColumnSpec::new("c1", ValKind::I32, ColumnAttributes::empty()),
+            ],
+            vec![ActiveIndexSpec::new(
+                0,
+                IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::PK),
+            )],
+            2,
+        )
+        .unwrap()
+    }
+
+    fn row_page(metadata: &TableMetadata) -> RowPage {
+        let mut page = RowPage::new_test_page();
+        page.init(100, 4, metadata);
+        assert!(
+            page.insert(metadata, &[Val::from(10i32), Val::from(20i32)])
+                .is_ok()
+        );
+        page
+    }
+
+    fn test_trx_context(sts: TrxID) -> TrxContext {
+        TrxContext {
+            session: None,
+            status: Arc::new(SharedTrxStatus::new(MIN_ACTIVE_TRX_ID + sts)),
+            sts,
+            log_no: 0,
+            gc_no: 0,
+        }
+    }
+
+    #[test]
+    fn test_read_row_latest_inactive_index_returns_invalid_index() {
+        let metadata = sparse_metadata();
+        let page = row_page(&metadata);
+        let frame_ctx = FrameContext::RecoverMap(RecoverMap::empty());
+        let access = RowReadAccess::new(&page, &frame_ctx, 0);
+        let key = SelectKey::new(1, vec![Val::from(10i32)]);
+
+        let res = access.read_row_latest(&metadata, &[0], Some(&key));
+
+        assert!(matches!(res, ReadRow::InvalidIndex));
+    }
+
+    #[test]
+    fn test_read_row_mvcc_inactive_index_returns_invalid_index() {
+        let metadata = sparse_metadata();
+        let page = row_page(&metadata);
+        let mut row_ver = RowVersionMap::new(Arc::new(metadata.clone()), 4);
+        let undo = OwnedRowUndo::new(
+            1,
+            None,
+            100,
+            RowUndoKind::Update(vec![UndoCol {
+                idx: 0,
+                val: Val::from(9i32),
+                var_offset: None,
+            }]),
+        );
+        *row_ver.write_exclusive(0) = Some(Box::new(RowUndoHead::new(
+            Arc::new(SharedTrxStatus::new(MIN_ACTIVE_TRX_ID + 99)),
+            undo.leak(),
+        )));
+        let frame_ctx = FrameContext::RowVerMap(row_ver);
+        let access = RowReadAccess::new(&page, &frame_ctx, 0);
+        let trx_ctx = test_trx_context(1);
+        let key = SelectKey::new(1, vec![Val::from(10i32)]);
+
+        let res = access.read_row_mvcc(&trx_ctx, &metadata, &[0], Some(&key));
+
+        assert!(matches!(res, ReadRow::InvalidIndex));
+    }
+
+    #[test]
+    fn test_any_version_matches_key_inactive_index_returns_false() {
+        let metadata = sparse_metadata();
+        let page = row_page(&metadata);
+        let frame_ctx = FrameContext::RecoverMap(RecoverMap::empty());
+        let access = RowReadAccess::new(&page, &frame_ctx, 0);
+        let key = SelectKey::new(1, vec![Val::from(10i32)]);
+
+        assert!(!access.any_version_matches_key(&metadata, &key));
+    }
+
+    #[test]
+    fn test_row_version_visible_vals_inactive_index_returns_invalid_index() {
+        let metadata = sparse_metadata();
+        let page = row_page(&metadata);
+        let ver = RowVersion {
+            deleted: false,
+            read_set: [0usize].into_iter().collect(),
+            key_tracker: None,
+            undo_vals: BTreeMap::new(),
+        };
+        let key = SelectKey::new(1, vec![Val::from(10i32)]);
+
+        let res = ver.get_visible_vals(&metadata, page.row(0), Some(&key));
+
+        assert!(matches!(res, ReadRow::InvalidIndex));
+    }
+
+    #[test]
+    fn test_find_old_version_for_unique_key_inactive_index_returns_none() {
+        let metadata = sparse_metadata();
+        let page = row_page(&metadata);
+        let row_ver = RowVersionMap::new(Arc::new(metadata.clone()), 4);
+        let frame_ctx = FrameContext::RowVerMap(row_ver);
+        let access = RowReadAccess::new(&page, &frame_ctx, 0);
+        let key = SelectKey::new(1, vec![Val::from(10i32)]);
+        let trx_ctx = test_trx_context(1);
+
+        let res = access.find_old_version_for_unique_key(&metadata, &key, &trx_ctx);
+
+        assert!(matches!(res, FindOldVersion::None));
+    }
 }

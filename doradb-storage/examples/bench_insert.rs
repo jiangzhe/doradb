@@ -291,12 +291,8 @@ pub async fn sbtest(engine: &Engine) -> TableID {
                 ],
             },
             vec![
-                IndexSpec::new("idx_sbtest_id", vec![IndexKey::new(0)], IndexAttributes::PK),
-                IndexSpec::new(
-                    "idx_sbtest_k",
-                    vec![IndexKey::new(1)],
-                    IndexAttributes::empty(),
-                ),
+                IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::PK),
+                IndexSpec::new(vec![IndexKey::new(1)], IndexAttributes::empty()),
             ],
         )
         .await

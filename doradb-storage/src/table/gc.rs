@@ -224,10 +224,10 @@ impl Table {
             disk_pool_guard,
         };
         let mut stats = SecondaryMemIndexCleanupStats {
-            indexes: Vec::with_capacity(self.sec_idx().len()),
+            indexes: Vec::with_capacity(self.metadata().active_index_count()),
         };
 
-        for index in self.sec_idx() {
+        for index in self.sec_idx().iter().filter_map(Option::as_ref) {
             let index_no = index.index_no();
             let secondary_root = snapshot.secondary_index_root(index_no)?;
             let mut index_stats =
@@ -515,13 +515,13 @@ impl Table {
         index_no: usize,
         row: ResolvedColumnRow,
     ) -> Result<Vec<Val>> {
-        let index_spec = self.metadata().index_specs.get(index_no).ok_or_else(|| {
+        let index_spec = self.metadata().index_spec(index_no).ok_or_else(|| {
             Error::from(
                 Report::new(InternalError::IndexKeyMissing).attach(format!("index_no={index_no}")),
             )
         })?;
         let read_set = index_spec
-            .index_cols
+            .cols
             .iter()
             .map(|key| key.col_no as usize)
             .collect::<Vec<_>>();

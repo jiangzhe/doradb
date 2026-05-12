@@ -257,23 +257,32 @@ fn normalize_encoded_keys(keys: &mut Vec<Vec<u8>>) {
     keys.dedup();
 }
 
+struct ActiveSecondaryIndexSidecar {
+    index_no: usize,
+    sidecar: SecondaryIndexSidecar,
+}
+
 struct SecondaryCheckpointSidecar {
-    indexes: Vec<SecondaryIndexSidecar>,
+    indexes: Vec<ActiveSecondaryIndexSidecar>,
 }
 
 impl SecondaryCheckpointSidecar {
     fn new(metadata: &TableMetadata) -> Result<Self> {
         let indexes = metadata
-            .index_specs
-            .iter()
-            .map(|index_spec| SecondaryIndexSidecar::new(metadata, index_spec))
+            .active_indexes()
+            .map(|(index_no, index_spec)| {
+                Ok(ActiveSecondaryIndexSidecar {
+                    index_no,
+                    sidecar: SecondaryIndexSidecar::new(metadata, index_spec)?,
+                })
+            })
             .collect::<Result<Vec<_>>>()?;
         Ok(Self { indexes })
     }
 
     #[inline]
     fn is_empty(&self) -> bool {
-        self.indexes.iter().all(|index| !index.has_work())
+        self.indexes.iter().all(|index| !index.sidecar.has_work())
     }
 
     fn add_data_row(
@@ -283,35 +292,43 @@ impl SecondaryCheckpointSidecar {
         row_idx: usize,
         row_id: RowID,
     ) -> Result<()> {
-        if self.indexes.len() != metadata.index_specs.len() {
-            return Err(Report::new(InternalError::IndexKeyMissing)
-                .attach(format!(
-                    "secondary sidecar count mismatch: sidecar_count={}, index_count={}",
-                    self.indexes.len(),
-                    metadata.index_specs.len()
-                ))
-                .into());
-        }
         // Data checkpoint feeds committed-visible transition rows here, once
         // per row selected for persistence.
-        for (index_spec, sidecar) in metadata.index_specs.iter().zip(self.indexes.iter_mut()) {
+        for active in &mut self.indexes {
+            let index_no = active.index_no;
+            let index_spec = metadata.require_index_spec(index_no)?;
             let key = index_spec
-                .index_cols
+                .cols
                 .iter()
                 .map(|index_key| page.val(metadata, row_idx, index_key.col_no as usize))
                 .collect();
-            sidecar.add_data(key, row_id);
+            active.sidecar.add_data(key, row_id);
         }
         Ok(())
     }
 
-    fn add_deleted_key(&mut self, index_no: usize, row_id: RowID, key: Vec<Val>) -> Result<()> {
-        let sidecar = self.indexes.get_mut(index_no).ok_or_else(|| {
+    fn add_deleted_key_at(
+        &mut self,
+        sidecar_pos: usize,
+        index_no: usize,
+        row_id: RowID,
+        key: Vec<Val>,
+    ) -> Result<()> {
+        let active = self.indexes.get_mut(sidecar_pos).ok_or_else(|| {
             Error::from(
-                Report::new(InternalError::IndexKeyMissing).attach(format!("index_no={index_no}")),
+                Report::new(InternalError::IndexKeyMissing)
+                    .attach(format!("index_no={index_no}, sidecar_pos={sidecar_pos}")),
             )
         })?;
-        sidecar.add_delete(key, row_id);
+        if active.index_no != index_no {
+            return Err(Report::new(InternalError::IndexKeyMissing)
+                .attach(format!(
+                    "secondary sidecar index mismatch: sidecar_pos={sidecar_pos}, expected_index_no={index_no}, actual_index_no={}",
+                    active.index_no
+                ))
+                .into());
+        }
+        active.sidecar.add_delete(key, row_id);
         Ok(())
     }
 }
@@ -321,11 +338,11 @@ fn secondary_disk_tree_encoder(
     index_spec: &IndexSpec,
     append_row_id: bool,
 ) -> Result<BTreeKeyEncoder> {
-    if index_spec.index_cols.is_empty() {
+    if index_spec.cols.is_empty() {
         return Err(invalid_index_spec("index has no key columns"));
     }
-    let mut types = Vec::with_capacity(index_spec.index_cols.len() + usize::from(append_row_id));
-    for key in &index_spec.index_cols {
+    let mut types = Vec::with_capacity(index_spec.cols.len() + usize::from(append_row_id));
+    for key in &index_spec.cols {
         let col_no = key.col_no as usize;
         let ty =
             metadata.col_types().get(col_no).copied().ok_or_else(|| {
@@ -549,22 +566,26 @@ impl Table {
         }
 
         let metadata = self.metadata();
-        if mutable_file.secondary_index_roots().len() != metadata.index_specs.len()
-            || sidecar.indexes.len() != metadata.index_specs.len()
-        {
+        if mutable_file.secondary_index_roots().len() != metadata.index_slot_count() {
             return Err(Report::new(DataIntegrityError::InvalidRootInvariant)
                 .attach(format!(
-                    "secondary root count mismatch: root_count={}, sidecar_count={}, index_count={}",
+                    "secondary root count mismatch: root_count={}, index_slot_count={}",
                     mutable_file.secondary_index_roots().len(),
-                    sidecar.indexes.len(),
-                    metadata.index_specs.len()
+                    metadata.index_slot_count()
                 ))
                 .into());
         }
 
         let disk_pool = self.disk_pool();
         let disk_pool_guard = disk_pool.pool_guard();
-        for (index_no, index_sidecar) in sidecar.indexes.iter_mut().enumerate() {
+        for active in &mut sidecar.indexes {
+            let index_no = active.index_no;
+            if metadata.index_spec(index_no).is_none() {
+                return Err(Report::new(InternalError::IndexKeyMissing)
+                    .attach(format!("index_no={index_no}"))
+                    .into());
+            }
+            let index_sidecar = &mut active.sidecar;
             index_sidecar.normalize();
             if !index_sidecar.has_work() {
                 continue;
@@ -634,7 +655,7 @@ impl Table {
         delete_deltas: &[u32],
         secondary_sidecar: &mut SecondaryCheckpointSidecar,
     ) -> Result<()> {
-        if self.metadata().index_specs.is_empty() || delete_deltas.is_empty() {
+        if secondary_sidecar.indexes.is_empty() || delete_deltas.is_empty() {
             return Ok(());
         }
 
@@ -686,17 +707,21 @@ impl Table {
         }
 
         let metadata = self.metadata();
-        let index_read_sets = metadata
-            .index_specs
+        let index_read_sets = secondary_sidecar
+            .indexes
             .iter()
-            .map(|index_spec| {
-                index_spec
-                    .index_cols
+            .enumerate()
+            .map(|(sidecar_pos, active)| {
+                let index_no = active.index_no;
+                let index_spec = metadata.require_index_spec(index_no)?;
+                let read_set = index_spec
+                    .cols
                     .iter()
                     .map(|index_key| index_key.col_no as usize)
-                    .collect::<Vec<_>>()
+                    .collect::<Vec<_>>();
+                Ok((sidecar_pos, index_no, read_set))
             })
-            .collect::<Vec<_>>();
+            .collect::<Result<Vec<_>>>()?;
         let mut sparse_row_idx = 0usize;
         for delta in delete_deltas {
             let row_id = entry
@@ -741,9 +766,9 @@ impl Table {
                     ))
                     .into());
             }
-            for (index_no, read_set) in index_read_sets.iter().enumerate() {
+            for (sidecar_pos, index_no, read_set) in &index_read_sets {
                 let key = block.decode_row_values(metadata, row_idx, read_set)?;
-                secondary_sidecar.add_deleted_key(index_no, row_id, key)?;
+                secondary_sidecar.add_deleted_key_at(*sidecar_pos, *index_no, row_id, key)?;
             }
         }
         Ok(())

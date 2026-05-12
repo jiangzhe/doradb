@@ -157,11 +157,11 @@ impl SecondaryDiskTreeRuntime {
         table_file: Arc<TableFile>,
         disk_pool: QuiescentGuard<ReadonlyBufferPool>,
     ) -> Result<Self> {
-        let index_spec = metadata.index_specs.get(index_no).ok_or_else(|| {
+        let index_spec = metadata.index_spec(index_no).ok_or_else(|| {
             Error::from(
                 Report::new(InternalError::SecondaryIndexOutOfBounds).attach(format!(
-                    "index_no={index_no}, index_count={}",
-                    metadata.index_specs.len()
+                    "index_no={index_no}, index_slot_count={}",
+                    metadata.index_slot_count()
                 )),
             )
         })?;
@@ -754,12 +754,8 @@ mod tests {
                 ColumnAttributes::empty(),
             )],
             vec![
-                IndexSpec::new("idx_unique", vec![IndexKey::new(0)], IndexAttributes::UK),
-                IndexSpec::new(
-                    "idx_non_unique",
-                    vec![IndexKey::new(0)],
-                    IndexAttributes::empty(),
-                ),
+                IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::UK),
+                IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::empty()),
             ],
         ))
     }

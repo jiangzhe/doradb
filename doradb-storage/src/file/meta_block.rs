@@ -18,13 +18,48 @@ use std::num::NonZeroU64;
 pub(crate) const TABLE_META_BLOCK_MAGIC_WORD: [u8; 8] =
     [b'T', b'B', b'L', b'M', b'E', b'T', b'A', 0];
 /// Table meta-block envelope version.
-pub(crate) const TABLE_META_BLOCK_VERSION: u64 = 3;
+pub(crate) const TABLE_META_BLOCK_VERSION: u64 = 4;
 
 #[inline]
 fn invalid_payload(message: impl Into<String>) -> Error {
     Report::new(DataIntegrityError::InvalidPayload)
         .attach(message.into())
         .into()
+}
+
+#[inline]
+fn validate_secondary_index_roots(
+    secondary_index_roots: &[BlockID],
+    next_index_no: u16,
+    active_index_nos: impl IntoIterator<Item = usize>,
+) -> Result<()> {
+    let index_slot_count = next_index_no as usize;
+    if secondary_index_roots.len() != index_slot_count {
+        return Err(invalid_payload(format!(
+            "secondary index root count {} does not match next_index_no {}",
+            secondary_index_roots.len(),
+            next_index_no
+        )));
+    }
+
+    let mut active_slots = vec![false; index_slot_count];
+    for index_no in active_index_nos {
+        if let Some(active_slot) = active_slots.get_mut(index_no) {
+            *active_slot = true;
+        }
+    }
+    for (index_no, (&root, active)) in secondary_index_roots
+        .iter()
+        .zip(active_slots.iter())
+        .enumerate()
+    {
+        if !active && root != SUPER_BLOCK_ID {
+            return Err(invalid_payload(format!(
+                "inactive secondary index slot {index_no} has root {root}, expected SUPER_BLOCK_ID {SUPER_BLOCK_ID}"
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Parsed payload of one checksummed table meta block.
@@ -61,20 +96,21 @@ impl Deser for MetaBlock {
         let (idx, meta) = TableBriefMetadata::deser(input, idx)?;
         let (idx, column_block_index_root) = input.deser_u64(idx)?;
         let (idx, secondary_index_roots) = <Vec<BlockID>>::deser(input, idx)?;
-        if secondary_index_roots.len() != meta.index_specs.len() {
-            return Err(invalid_payload(format!(
-                "secondary index root count {} does not match index spec count {}",
-                secondary_index_roots.len(),
-                meta.index_specs.len()
-            )));
-        }
+        validate_secondary_index_roots(
+            &secondary_index_roots,
+            meta.next_index_no,
+            meta.index_specs
+                .iter()
+                .map(|active_index_spec| active_index_spec.index_no as usize),
+        )?;
+        let schema = TableMetadata::try_from(meta)?;
         Ok((
             idx,
             MetaBlock {
                 pivot_row_id,
                 heap_redo_start_ts,
                 deletion_cutoff_ts,
-                schema: TableMetadata::from(meta),
+                schema,
                 column_block_index_root: BlockID::from(column_block_index_root),
                 secondary_index_roots,
                 alloc_map: space.alloc_map,
@@ -118,13 +154,14 @@ impl<'a> MetaBlockSerView<'a> {
         heap_redo_start_ts: TrxID,
         deletion_cutoff_ts: TrxID,
     ) -> Result<Self> {
-        if secondary_index_roots.len() != schema.index_specs.len() {
-            return Err(invalid_payload(format!(
-                "secondary index root count {} does not match index spec count {}",
-                secondary_index_roots.len(),
-                schema.index_specs.len()
-            )));
-        }
+        validate_secondary_index_roots(
+            secondary_index_roots,
+            schema.next_index_no,
+            schema
+                .index_specs
+                .active_indexes()
+                .map(|(index_no, _)| index_no),
+        )?;
         Ok(MetaBlockSerView {
             pivot_row_id,
             heap_redo_start_ts,
@@ -377,11 +414,62 @@ impl<'a> Ser<'a> for MultiTableMetaBlockSerView<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::catalog::{ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexSpec};
+    use crate::catalog::{
+        ActiveIndexSpec, ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexSpec,
+    };
     use crate::file::multi_table_file::CATALOG_TABLE_ROOT_DESC_COUNT;
     use crate::file::table_file::ActiveRoot;
     use crate::value::ValKind;
     use std::sync::Arc;
+
+    fn sparse_secondary_root_metadata() -> Arc<TableMetadata> {
+        Arc::new(
+            TableMetadata::try_new_with_next_index_no(
+                vec![
+                    ColumnSpec::new("c0", ValKind::U32, ColumnAttributes::empty()),
+                    ColumnSpec::new("c1", ValKind::U64, ColumnAttributes::empty()),
+                    ColumnSpec::new("c2", ValKind::U32, ColumnAttributes::empty()),
+                ],
+                vec![
+                    ActiveIndexSpec::new(
+                        0,
+                        IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::PK),
+                    ),
+                    ActiveIndexSpec::new(
+                        2,
+                        IndexSpec::new(vec![IndexKey::new(2)], IndexAttributes::empty()),
+                    ),
+                ],
+                3,
+            )
+            .unwrap(),
+        )
+    }
+
+    fn serialize_meta_block_with_secondary_roots(
+        active_root: &ActiveRoot,
+        secondary_index_roots: &[BlockID],
+    ) -> Vec<u8> {
+        let schema = active_root.metadata.ser_view();
+        let space = AllocMapGcListSerView::new(&active_root.alloc_map, &active_root.gc_block_list);
+        let ser_len = mem::size_of::<RowID>()
+            + mem::size_of::<TrxID>()
+            + mem::size_of::<TrxID>()
+            + space.ser_len()
+            + schema.ser_len()
+            + mem::size_of::<BlockID>()
+            + secondary_index_roots.ser_len();
+        let mut data = vec![0u8; ser_len];
+        let mut idx = data.ser_u64(0, active_root.pivot_row_id);
+        idx = data.ser_u64(idx, active_root.heap_redo_start_ts);
+        idx = data.ser_u64(idx, active_root.deletion_cutoff_ts);
+        idx = space.ser(&mut data[..], idx);
+        idx = schema.ser(&mut data[..], idx);
+        idx = data.ser_u64(idx, active_root.column_block_index_root.into());
+        idx = secondary_index_roots.ser(&mut data[..], idx);
+        assert_eq!(idx, ser_len);
+        data
+    }
 
     #[test]
     fn test_meta_block_serde() {
@@ -390,11 +478,7 @@ mod tests {
                 ColumnSpec::new("c0", ValKind::U32, ColumnAttributes::empty()),
                 ColumnSpec::new("c1", ValKind::U64, ColumnAttributes::NULLABLE),
             ],
-            vec![IndexSpec::new(
-                "idx1",
-                vec![IndexKey::new(0)],
-                IndexAttributes::PK,
-            )],
+            vec![IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::PK)],
         ));
         let mut active_root = ActiveRoot::new(7, 1024, Arc::clone(&metadata));
         active_root.secondary_index_roots = vec![BlockID::new(11)];
@@ -457,8 +541,8 @@ mod tests {
                 ColumnSpec::new("c1", ValKind::U64, ColumnAttributes::NULLABLE),
             ],
             vec![
-                IndexSpec::new("idx1", vec![IndexKey::new(0)], IndexAttributes::PK),
-                IndexSpec::new("idx2", vec![IndexKey::new(1)], IndexAttributes::empty()),
+                IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::PK),
+                IndexSpec::new(vec![IndexKey::new(1)], IndexAttributes::empty()),
             ],
         ));
         let mut active_root = ActiveRoot::new(7, 1024, Arc::clone(&metadata));
@@ -477,6 +561,64 @@ mod tests {
     }
 
     #[test]
+    fn test_meta_block_serde_sparse_secondary_roots() {
+        let metadata = sparse_secondary_root_metadata();
+        let mut active_root = ActiveRoot::new(7, 1024, Arc::clone(&metadata));
+        active_root.secondary_index_roots =
+            vec![BlockID::new(11), SUPER_BLOCK_ID, BlockID::new(12)];
+        let ser_view = active_root.meta_block_ser_view().unwrap();
+        let ser_len = ser_view.ser_len();
+        let mut data = vec![0u8; ser_len];
+        let res_idx = ser_view.ser(&mut data[..], 0);
+        assert_eq!(res_idx, ser_len);
+
+        let (_, meta_block) = MetaBlock::deser(&data[..], 0).unwrap();
+        assert_eq!(meta_block.schema.next_index_no(), 3);
+        assert!(meta_block.schema.index_spec(1).is_none());
+        assert_eq!(
+            meta_block.secondary_index_roots,
+            active_root.secondary_index_roots
+        );
+    }
+
+    #[test]
+    fn test_meta_block_deser_rejects_inactive_secondary_root() {
+        let metadata = sparse_secondary_root_metadata();
+        let active_root = ActiveRoot::new(7, 1024, Arc::clone(&metadata));
+        let secondary_index_roots = vec![BlockID::new(11), BlockID::new(13), BlockID::new(12)];
+        let data = serialize_meta_block_with_secondary_roots(&active_root, &secondary_index_roots);
+
+        let err = MetaBlock::deser(&data[..], 0).unwrap_err();
+        assert_eq!(
+            err.data_integrity_error(),
+            Some(DataIntegrityError::InvalidPayload)
+        );
+    }
+
+    #[test]
+    fn test_meta_block_ser_view_rejects_inactive_secondary_root() {
+        let metadata = sparse_secondary_root_metadata();
+        let active_root = ActiveRoot::new(7, 1024, Arc::clone(&metadata));
+        let secondary_index_roots = vec![BlockID::new(11), BlockID::new(13), BlockID::new(12)];
+
+        let err = MetaBlockSerView::new(
+            active_root.metadata.ser_view(),
+            active_root.column_block_index_root,
+            &secondary_index_roots,
+            AllocMapGcListSerView::new(&active_root.alloc_map, &active_root.gc_block_list),
+            active_root.pivot_row_id,
+            active_root.heap_redo_start_ts,
+            active_root.deletion_cutoff_ts,
+        )
+        .err()
+        .unwrap();
+        assert_eq!(
+            err.data_integrity_error(),
+            Some(DataIntegrityError::InvalidPayload)
+        );
+    }
+
+    #[test]
     fn test_meta_block_deser_rejects_secondary_root_count_mismatch() {
         let metadata = Arc::new(TableMetadata::new(
             vec![ColumnSpec::new(
@@ -484,11 +626,7 @@ mod tests {
                 ValKind::U32,
                 ColumnAttributes::empty(),
             )],
-            vec![IndexSpec::new(
-                "idx1",
-                vec![IndexKey::new(0)],
-                IndexAttributes::PK,
-            )],
+            vec![IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::PK)],
         ));
         let active_root = ActiveRoot::new(7, 1024, Arc::clone(&metadata));
         let schema = active_root.metadata.ser_view();
@@ -526,11 +664,7 @@ mod tests {
                 ValKind::U32,
                 ColumnAttributes::empty(),
             )],
-            vec![IndexSpec::new(
-                "idx1",
-                vec![IndexKey::new(0)],
-                IndexAttributes::PK,
-            )],
+            vec![IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::PK)],
         ));
         let active_root = ActiveRoot::new(7, 1024, Arc::clone(&metadata));
         let err = MetaBlockSerView::new(

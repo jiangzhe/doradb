@@ -22,12 +22,9 @@ const COL_NO_INDEXES_TABLE_ID: usize = 0;
 const COL_NAME_INDEXES_TABLE_ID: &str = "table_id";
 const COL_NO_INDEXES_INDEX_NO: usize = 1;
 const COL_NAME_INDEXES_INDEX_NO: &str = "index_no";
-const COL_NO_INDEXES_INDEX_NAME: usize = 2;
-const COL_NAME_INDEXES_INDEX_NAME: &str = "index_name";
-const COL_NO_INDEXES_INDEX_ATTRIBUTES: usize = 3;
+const COL_NO_INDEXES_INDEX_ATTRIBUTES: usize = 2;
 const COL_NAME_INDEXES_INDEX_ATTRIBUTES: &str = "index_attributes";
 const PK_NO_INDEXES: usize = 0;
-const PK_NAME_INDEXES: &str = "pk_indexes";
 
 /// Return static table definition of `catalog.indexes`.
 pub fn catalog_definition_of_indexes() -> &'static CatalogDefinition {
@@ -49,12 +46,6 @@ pub fn catalog_definition_of_indexes() -> &'static CatalogDefinition {
                         column_type: ValKind::U16,
                         column_attributes: ColumnAttributes::INDEX,
                     },
-                    // index_name string unique not null
-                    ColumnSpec {
-                        column_name: SemiStr::new(COL_NAME_INDEXES_INDEX_NAME),
-                        column_type: ValKind::VarByte,
-                        column_attributes: ColumnAttributes::empty(),
-                    },
                     // index_attributes unsigned int not null
                     ColumnSpec {
                         column_name: SemiStr::new(COL_NAME_INDEXES_INDEX_ATTRIBUTES),
@@ -63,9 +54,8 @@ pub fn catalog_definition_of_indexes() -> &'static CatalogDefinition {
                     },
                 ],
                 vec![
-                    // primary key pk_indexes (table_id, index_no)
+                    // primary key (table_id, index_no)
                     IndexSpec::new(
-                        PK_NAME_INDEXES,
                         vec![IndexKey::new(0), IndexKey::new(1)],
                         IndexAttributes::PK,
                     ),
@@ -79,7 +69,6 @@ pub fn catalog_definition_of_indexes() -> &'static CatalogDefinition {
 fn row_to_index_object(metadata: &TableMetadata, row: Row<'_>) -> IndexObject {
     let table_id = row.val(metadata, COL_NO_INDEXES_TABLE_ID).as_u64().unwrap();
     let index_no = row.val(metadata, COL_NO_INDEXES_INDEX_NO).as_u16().unwrap();
-    let index_name = row.str(COL_NO_INDEXES_INDEX_NAME).unwrap();
     let index_attributes = row
         .val(metadata, COL_NO_INDEXES_INDEX_ATTRIBUTES)
         .as_u32()
@@ -87,7 +76,6 @@ fn row_to_index_object(metadata: &TableMetadata, row: Row<'_>) -> IndexObject {
     IndexObject {
         table_id,
         index_no,
-        index_name: SemiStr::new(index_name),
         index_attributes: IndexAttributes::from_bits_truncate(index_attributes),
     }
 }
@@ -103,7 +91,6 @@ impl Indexes<'_> {
         let cols = vec![
             Val::from(obj.table_id),
             Val::from(obj.index_no),
-            Val::from(obj.index_name.as_str()),
             Val::from(obj.index_attributes.bits()),
         ];
         stmt.catalog_insert_mvcc(self.table, cols).await.is_ok()
@@ -181,7 +168,6 @@ const COL_NAME_INDEX_COLUMNS_COLUMN_NO: &str = "column_no";
 const COL_NO_INDEX_COLUMNS_INDEX_ORDER: usize = 4;
 const COL_NAME_INDEX_COLUMNS_INDEX_ORDER: &str = "index_order";
 const PK_NO_INDEX_COLUMNS: usize = 0;
-const PK_NAME_INDEX_COLUMNS: &str = "pk_index_columns";
 
 /// Return static table definition of `catalog.index_columns`.
 pub fn catalog_definition_of_index_columns() -> &'static CatalogDefinition {
@@ -226,7 +212,6 @@ pub fn catalog_definition_of_index_columns() -> &'static CatalogDefinition {
                     // primary key pk_index_columns
                     // (table_id, index_no, index_column_no)
                     IndexSpec::new(
-                        PK_NAME_INDEX_COLUMNS,
                         vec![IndexKey::new(0), IndexKey::new(1), IndexKey::new(2)],
                         IndexAttributes::PK,
                     ),
@@ -404,19 +389,16 @@ mod tests {
             let idx_42_0 = IndexObject {
                 table_id: 42,
                 index_no: 0,
-                index_name: SemiStr::new("pk"),
                 index_attributes: IndexAttributes::PK,
             };
             let idx_42_1 = IndexObject {
                 table_id: 42,
                 index_no: 1,
-                index_name: SemiStr::new("k1"),
                 index_attributes: IndexAttributes::empty(),
             };
             let idx_43_0 = IndexObject {
                 table_id: 43,
                 index_no: 0,
-                index_name: SemiStr::new("pk"),
                 index_attributes: IndexAttributes::PK,
             };
 
@@ -567,19 +549,16 @@ mod tests {
                 IndexObject {
                     table_id: 42,
                     index_no: 0,
-                    index_name: SemiStr::new("pk"),
                     index_attributes: IndexAttributes::PK,
                 },
                 IndexObject {
                     table_id: 42,
                     index_no: 1,
-                    index_name: SemiStr::new("secondary"),
                     index_attributes: IndexAttributes::empty(),
                 },
                 IndexObject {
                     table_id: 43,
                     index_no: 0,
-                    index_name: SemiStr::new("other_pk"),
                     index_attributes: IndexAttributes::PK,
                 },
             ];

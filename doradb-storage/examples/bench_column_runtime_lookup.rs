@@ -94,11 +94,7 @@ async fn build_case(
                 ColumnSpec::new("id", ValKind::I32, ColumnAttributes::empty()),
                 ColumnSpec::new("name", ValKind::VarByte, ColumnAttributes::empty()),
             ]),
-            vec![IndexSpec::new(
-                "idx_pk",
-                vec![IndexKey::new(0)],
-                IndexAttributes::PK,
-            )],
+            vec![IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::PK)],
         )
         .await
         .unwrap();

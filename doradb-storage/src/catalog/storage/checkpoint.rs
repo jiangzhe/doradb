@@ -795,13 +795,13 @@ fn append_single_row_to_builder(
 }
 
 fn row_matches_key(metadata: &TableMetadata, row: &[Val], key: &SelectKey) -> bool {
-    let Some(index_spec) = metadata.index_specs.get(key.index_no) else {
+    let Some(index_spec) = metadata.index_spec(key.index_no) else {
         return false;
     };
-    if index_spec.index_cols.len() != key.vals.len() {
+    if index_spec.cols.len() != key.vals.len() {
         return false;
     }
-    for (index_key, key_val) in index_spec.index_cols.iter().zip(&key.vals) {
+    for (index_key, key_val) in index_spec.cols.iter().zip(&key.vals) {
         let col_idx = index_key.col_no as usize;
         if row.get(col_idx) != Some(key_val) {
             return false;
@@ -847,7 +847,7 @@ mod tests {
             };
             let table_id = USER_OBJ_ID_START + 42;
             let table_ops = vec![
-                RowRedoKind::Insert(vec![Val::from(table_id)]),
+                RowRedoKind::Insert(vec![Val::from(table_id), Val::from(0u16)]),
                 RowRedoKind::DeleteByUniqueKey(SelectKey::new(0, vec![Val::from(table_id)])),
             ];
             let mut mutable =
@@ -892,7 +892,7 @@ mod tests {
 
             let table_id = USER_OBJ_ID_START + 4242;
             let table_ops = vec![
-                RowRedoKind::Insert(vec![Val::from(table_id)]),
+                RowRedoKind::Insert(vec![Val::from(table_id), Val::from(0u16)]),
                 RowRedoKind::DeleteByUniqueKey(SelectKey::new(0, vec![Val::from(table_id)])),
             ];
             let mut mutable =

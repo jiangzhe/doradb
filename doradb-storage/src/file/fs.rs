@@ -1856,11 +1856,7 @@ pub(crate) mod tests {
                 ValKind::U32,
                 ColumnAttributes::empty(),
             )],
-            vec![IndexSpec::new(
-                "idx_pk",
-                vec![IndexKey::new(0)],
-                IndexAttributes::PK,
-            )],
+            vec![IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::PK)],
         ))
     }
 
@@ -2209,11 +2205,7 @@ pub(crate) mod tests {
                     ValKind::U32,
                     ColumnAttributes::empty(),
                 )],
-                vec![IndexSpec::new(
-                    "idx_pk",
-                    vec![IndexKey::new(0)],
-                    IndexAttributes::PK,
-                )],
+                vec![IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::PK)],
             ));
             let mutable = fs
                 .create_table_file(USER_OBJ_ID_START, Arc::clone(&metadata), false)
@@ -2244,11 +2236,7 @@ pub(crate) mod tests {
                     ValKind::U32,
                     ColumnAttributes::empty(),
                 )],
-                vec![IndexSpec::new(
-                    "idx_pk",
-                    vec![IndexKey::new(0)],
-                    IndexAttributes::PK,
-                )],
+                vec![IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::PK)],
             ));
             let mutable = fs
                 .create_table_file(table_id, Arc::clone(&metadata), false)

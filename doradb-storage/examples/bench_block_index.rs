@@ -41,11 +41,7 @@ fn main() {
                     column_type: ValKind::I32,
                     column_attributes: ColumnAttributes::INDEX,
                 }],
-                vec![IndexSpec::new(
-                    "idx_tb1_id",
-                    vec![IndexKey::new(0)],
-                    IndexAttributes::PK,
-                )],
+                vec![IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::PK)],
             ));
             let meta_guard = engine.meta_pool.pool_guard();
             let blk_idx = Arc::new(

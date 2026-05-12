@@ -1,6 +1,6 @@
 # Unsafe Usage Baseline
 
-- Generated on: `2026-05-10`
+- Generated on: `2026-05-12`
 - Command: `tools/unsafe_inventory.rs`
 - Scope: `doradb-storage/src/{buffer,latch,row,index,io,trx,lwc,file}`
 

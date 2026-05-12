@@ -105,7 +105,7 @@ pub struct GenericMemTable<D: 'static, I: 'static> {
     pub(crate) row_pool_role: RowPoolRole,
     pub(crate) index_pool_role: PoolRole,
     pub(crate) blk_idx: BlockIndex,
-    pub(crate) sec_idx: Box<[InMemorySecondaryIndex<I>]>,
+    pub(crate) sec_idx: Box<[Option<InMemorySecondaryIndex<I>>]>,
 }
 
 /// Persisted column-store attachments associated with a user table runtime.
@@ -113,14 +113,14 @@ pub struct ColumnStorage {
     pub(crate) file: Arc<TableFile>,
     pub(crate) disk_pool: QuiescentGuard<ReadonlyBufferPool>,
     pub(crate) deletion_buffer: ColumnDeletionBuffer,
-    secondary_indexes: Box<[SecondaryDiskTreeRuntime]>,
+    secondary_indexes: Box<[Option<SecondaryDiskTreeRuntime>]>,
 }
 
 /// Runtime handle for a user table, combining in-memory and persisted storage.
 pub struct Table {
     pub(crate) mem: GenericMemTable<EvictableBufferPool, EvictableBufferPool>,
     pub(crate) storage: ColumnStorage,
-    pub(crate) sec_idx: Box<[SecondaryIndex<EvictableBufferPool>]>,
+    pub(crate) sec_idx: Box<[Option<SecondaryIndex<EvictableBufferPool>>]>,
     pub(crate) lifecycle: TableLifecycle,
 }
 
@@ -205,31 +205,33 @@ type VisibleRowCollector<'a> = &'a mut dyn FnMut(&RowPage, usize, RowID) -> Resu
 /// the whole batch on success or explicitly destroy already-built trees before
 /// returning the original build error.
 struct InMemorySecondaryIndexScopedBuilder<P: 'static> {
-    staged: Vec<InMemorySecondaryIndex<P>>,
+    staged: Vec<Option<InMemorySecondaryIndex<P>>>,
 }
 
 /// Stages newly built dual-tree secondary indexes until the caller publishes them.
 struct SecondaryIndexScopedBuilder {
-    staged: Vec<SecondaryIndex<EvictableBufferPool>>,
+    staged: Vec<Option<SecondaryIndex<EvictableBufferPool>>>,
 }
 
 impl<P: BufferPool> InMemorySecondaryIndexScopedBuilder<P> {
     #[inline]
     fn new(capacity: usize) -> Self {
-        Self {
-            staged: Vec::with_capacity(capacity),
-        }
+        let mut staged = Vec::with_capacity(capacity);
+        staged.resize_with(capacity, || None);
+        Self { staged }
     }
 
     #[inline]
     async fn push_or_rollback(
         &mut self,
+        index_no: usize,
         built: Result<InMemorySecondaryIndex<P>>,
         pool_guard: &PoolGuard,
     ) -> Result<()> {
         match built {
             Ok(index) => {
-                self.staged.push(index);
+                debug_assert!(self.staged[index_no].is_none());
+                self.staged[index_no] = Some(index);
                 Ok(())
             }
             Err(err) => {
@@ -241,14 +243,14 @@ impl<P: BufferPool> InMemorySecondaryIndexScopedBuilder<P> {
 
     #[inline]
     async fn rollback(&mut self, pool_guard: &PoolGuard) {
-        for index in std::mem::take(&mut self.staged).into_iter().rev() {
+        for index in std::mem::take(&mut self.staged).into_iter().rev().flatten() {
             // Keep the original construction error as the function result.
             let _ = index.destroy(pool_guard).await;
         }
     }
 
     #[inline]
-    fn publish(self) -> Box<[InMemorySecondaryIndex<P>]> {
+    fn publish(self) -> Box<[Option<InMemorySecondaryIndex<P>>]> {
         self.staged.into_boxed_slice()
     }
 }
@@ -256,26 +258,27 @@ impl<P: BufferPool> InMemorySecondaryIndexScopedBuilder<P> {
 impl SecondaryIndexScopedBuilder {
     #[inline]
     fn new(capacity: usize) -> Self {
-        Self {
-            staged: Vec::with_capacity(capacity),
-        }
+        let mut staged = Vec::with_capacity(capacity);
+        staged.resize_with(capacity, || None);
+        Self { staged }
     }
 
     #[inline]
-    fn push(&mut self, index: SecondaryIndex<EvictableBufferPool>) {
-        self.staged.push(index);
+    fn push(&mut self, index_no: usize, index: SecondaryIndex<EvictableBufferPool>) {
+        debug_assert!(self.staged[index_no].is_none());
+        self.staged[index_no] = Some(index);
     }
 
     #[inline]
     async fn rollback(&mut self, pool_guard: &PoolGuard) {
-        for index in std::mem::take(&mut self.staged).into_iter().rev() {
+        for index in std::mem::take(&mut self.staged).into_iter().rev().flatten() {
             // Keep the original construction error as the function result.
             let _ = index.destroy(pool_guard).await;
         }
     }
 
     #[inline]
-    fn publish(self) -> Box<[SecondaryIndex<EvictableBufferPool>]> {
+    fn publish(self) -> Box<[Option<SecondaryIndex<EvictableBufferPool>>]> {
         self.staged.into_boxed_slice()
     }
 }
@@ -286,12 +289,13 @@ pub(crate) async fn build_in_memory_secondary_indexes<I: BufferPool + 'static>(
     index_pool_guard: &PoolGuard,
     metadata: &TableMetadata,
     index_ts: TrxID,
-) -> Result<Box<[InMemorySecondaryIndex<I>]>> {
-    let mut builder = InMemorySecondaryIndexScopedBuilder::new(metadata.index_specs.len());
-    for index_spec in &metadata.index_specs {
+) -> Result<Box<[Option<InMemorySecondaryIndex<I>>]>> {
+    let mut builder = InMemorySecondaryIndexScopedBuilder::new(metadata.index_slot_count());
+    for (index_no, index_spec) in metadata.active_indexes() {
         let ty_infer = |col_no: usize| metadata.col_type(col_no);
         builder
             .push_or_rollback(
+                index_no,
                 InMemorySecondaryIndex::new(
                     index_pool.clone(),
                     index_pool_guard,
@@ -317,9 +321,9 @@ pub(crate) async fn build_dual_tree_secondary_indexes(
     file: Arc<TableFile>,
     disk_pool: QuiescentGuard<ReadonlyBufferPool>,
     index_ts: TrxID,
-) -> Result<Box<[SecondaryIndex<EvictableBufferPool>]>> {
-    let mut builder = SecondaryIndexScopedBuilder::new(metadata.index_specs.len());
-    for (index_no, index_spec) in metadata.index_specs.iter().enumerate() {
+) -> Result<Box<[Option<SecondaryIndex<EvictableBufferPool>>]>> {
+    let mut builder = SecondaryIndexScopedBuilder::new(metadata.index_slot_count());
+    for (index_no, index_spec) in metadata.active_indexes() {
         let runtime = match SecondaryDiskTreeRuntime::new(
             index_no,
             Arc::clone(&metadata),
@@ -368,7 +372,7 @@ pub(crate) async fn build_dual_tree_secondary_indexes(
             };
             SecondaryIndex::NonUnique { mem, disk: runtime }
         };
-        builder.push(index);
+        builder.push(index_no, index);
     }
     Ok(builder.publish())
 }
@@ -427,8 +431,16 @@ impl<D: BufferPool, I: BufferPool> GenericMemTable<D, I> {
 
     /// Returns the secondary-index array owned by this table.
     #[inline]
-    pub(crate) fn sec_idx(&self) -> &[InMemorySecondaryIndex<I>] {
+    pub(crate) fn sec_idx(&self) -> &[Option<InMemorySecondaryIndex<I>>] {
         &self.sec_idx
+    }
+
+    #[inline]
+    pub(crate) fn require_sec_idx(&self, index_no: usize) -> Result<&InMemorySecondaryIndex<I>> {
+        self.sec_idx
+            .get(index_no)
+            .and_then(Option::as_ref)
+            .ok_or_else(|| missing_secondary_index(index_no, self.sec_idx.len()))
     }
 
     /// Returns the row-id boundary between persisted and in-memory rows.
@@ -466,7 +478,7 @@ impl<D: BufferPool, I: BufferPool> GenericMemTable<D, I> {
             sec_idx,
             ..
         } = self;
-        for index in sec_idx {
+        for index in sec_idx.into_iter().flatten() {
             index.destroy(index_pool_guard).await?;
         }
         blk_idx
@@ -694,26 +706,26 @@ impl ColumnStorage {
         // initialize column storage and validate secondary root layout.
         let active_root = file.active_root_unchecked();
         let metadata = Arc::clone(&active_root.metadata);
-        if active_root.secondary_index_roots.len() != metadata.index_specs.len() {
+        if active_root.secondary_index_roots.len() != metadata.index_slot_count() {
             return Err(Report::new(DataIntegrityError::InvalidRootInvariant)
                 .attach(format!(
-                    "secondary root count mismatch: root_count={}, index_count={}",
+                    "secondary root count mismatch: root_count={}, index_slot_count={}",
                     active_root.secondary_index_roots.len(),
-                    metadata.index_specs.len()
+                    metadata.index_slot_count()
                 ))
                 .into());
         }
-        let secondary_indexes = (0..metadata.index_specs.len())
-            .map(|index_no| {
-                SecondaryDiskTreeRuntime::new(
-                    index_no,
-                    Arc::clone(&metadata),
-                    Arc::clone(&file),
-                    disk_pool.clone(),
-                )
-            })
-            .collect::<Result<Vec<_>>>()?
-            .into_boxed_slice();
+        let mut secondary_indexes = Vec::with_capacity(metadata.index_slot_count());
+        secondary_indexes.resize_with(metadata.index_slot_count(), || None);
+        for (index_no, _) in metadata.active_indexes() {
+            secondary_indexes[index_no] = Some(SecondaryDiskTreeRuntime::new(
+                index_no,
+                Arc::clone(&metadata),
+                Arc::clone(&file),
+                disk_pool.clone(),
+            )?);
+        }
+        let secondary_indexes = secondary_indexes.into_boxed_slice();
         Ok(ColumnStorage {
             file,
             disk_pool,
@@ -758,12 +770,13 @@ impl ColumnStorage {
     ) -> Result<&SecondaryDiskTreeRuntime> {
         self.secondary_indexes
             .get(index_no)
+            .and_then(Option::as_ref)
             .ok_or_else(|| missing_secondary_index(index_no, self.secondary_indexes.len()))
     }
 
     /// Returns the reusable secondary DiskTree runtimes owned by this table.
     #[inline]
-    pub(crate) fn secondary_index_runtimes(&self) -> &[SecondaryDiskTreeRuntime] {
+    pub(crate) fn secondary_index_runtimes(&self) -> &[Option<SecondaryDiskTreeRuntime>] {
         &self.secondary_indexes
     }
 }
@@ -784,7 +797,7 @@ impl Table {
         // root to seed metadata and hot/cold secondary-index state.
         let active_root = file.active_root_unchecked();
         let metadata = Arc::clone(&active_root.metadata);
-        let secondary_index_count = metadata.index_specs.len();
+        let secondary_index_count = metadata.index_slot_count();
         let sec_idx = build_dual_tree_secondary_indexes(
             index_pool,
             index_pool_guard,
@@ -861,7 +874,7 @@ impl Table {
             lifecycle: _lifecycle,
         } = self;
         let index_pool_guard = guards.index_guard();
-        for index in sec_idx {
+        for index in sec_idx.into_iter().flatten() {
             index.destroy(index_pool_guard).await?;
         }
         mem.destroy(guards).await
@@ -901,8 +914,19 @@ impl Table {
 
     /// Returns the user-table composite secondary-index array.
     #[inline]
-    pub(crate) fn sec_idx(&self) -> &[SecondaryIndex<EvictableBufferPool>] {
+    pub(crate) fn sec_idx(&self) -> &[Option<SecondaryIndex<EvictableBufferPool>>] {
         &self.sec_idx
+    }
+
+    #[inline]
+    pub(crate) fn require_sec_idx(
+        &self,
+        index_no: usize,
+    ) -> Result<&SecondaryIndex<EvictableBufferPool>> {
+        self.sec_idx
+            .get(index_no)
+            .and_then(Option::as_ref)
+            .ok_or_else(|| missing_secondary_index(index_no, self.sec_idx.len()))
     }
 
     /// Returns the readonly disk buffer pool used by persisted table data.
@@ -1264,7 +1288,7 @@ impl Table {
         row_id: RowID,
         cts: TrxID,
     ) -> Result<RecoverIndex> {
-        if self.metadata().index_specs[key.index_no].unique() {
+        if self.metadata().require_index_spec(key.index_no)?.unique() {
             self.recover_unique_index_insert(guards, key, row_id, cts)
                 .await
         } else {
@@ -1280,7 +1304,7 @@ impl Table {
         key: SelectKey,
         row_id: RowID,
     ) -> Result<RecoverIndex> {
-        if self.metadata().index_specs[key.index_no].unique() {
+        if self.metadata().require_index_spec(key.index_no)?.unique() {
             self.recover_unique_index_delete(guards, key, row_id).await
         } else {
             self.recover_non_unique_index_delete(guards, key, row_id)
@@ -1366,7 +1390,7 @@ impl Table {
         page_guard: &mut PageExclusiveGuard<RowPage>,
         row_id: RowID,
         cts: TrxID,
-        index_cols: Option<&mut HashMap<usize, Val>>,
+        cols: Option<&mut HashMap<usize, Val>>,
     ) -> Recover {
         let (ctx, page) = page_guard.ctx_and_page_mut();
         if !page.row_id_in_valid_range(row_id) {
@@ -1379,7 +1403,7 @@ impl Table {
         ctx.recover_mut().unwrap().update_at(row_idx, cts);
         page.set_deleted_exclusive(row_idx, true);
         let metadata = self.metadata();
-        if let Some(index_cols) = index_cols {
+        if let Some(index_cols) = cols {
             // save index columns for index update.
             let row = page.row(row_idx);
             for idx_col_no in &metadata.index_cols {
@@ -1398,7 +1422,7 @@ impl Table {
         row_id: RowID,
         cts: TrxID,
     ) -> Result<RecoverIndex> {
-        let index = self.sec_idx()[key.index_no].unique_mem()?;
+        let index = self.require_sec_idx(key.index_no)?.unique_mem()?;
         let index_pool_guard = self.index_pool_guard(guards);
         loop {
             match index
@@ -1460,7 +1484,7 @@ impl Table {
         key: SelectKey,
         row_id: RowID,
     ) -> Result<RecoverIndex> {
-        let index = self.sec_idx()[key.index_no].non_unique_mem()?;
+        let index = self.require_sec_idx(key.index_no)?.non_unique_mem()?;
         let index_pool_guard = self.index_pool_guard(guards);
         let res = index
             .insert_if_not_exists(index_pool_guard, &key.vals, row_id, true, MIN_SNAPSHOT_TS)
@@ -1476,7 +1500,7 @@ impl Table {
         key: SelectKey,
         row_id: RowID,
     ) -> Result<RecoverIndex> {
-        let index = self.sec_idx()[key.index_no].unique_mem()?;
+        let index = self.require_sec_idx(key.index_no)?.unique_mem()?;
         let index_pool_guard = self.index_pool_guard(guards);
         if !index
             .compare_delete(index_pool_guard, &key.vals, row_id, true, MIN_SNAPSHOT_TS)
@@ -1496,7 +1520,7 @@ impl Table {
         key: SelectKey,
         row_id: RowID,
     ) -> Result<RecoverIndex> {
-        let index = self.sec_idx()[key.index_no].non_unique_mem()?;
+        let index = self.require_sec_idx(key.index_no)?.non_unique_mem()?;
         let index_pool_guard = self.index_pool_guard(guards);
         if !index
             .compare_delete(index_pool_guard, &key.vals, row_id, true, MIN_SNAPSHOT_TS)
@@ -1606,7 +1630,7 @@ enum DeleteInternal {
 #[inline]
 fn index_key_is_changed(index_spec: &IndexSpec, index_change_cols: &HashMap<usize, Val>) -> bool {
     index_spec
-        .index_cols
+        .cols
         .iter()
         .any(|key| index_change_cols.contains_key(&(key.col_no as usize)))
 }
@@ -1618,7 +1642,7 @@ fn index_key_replace(
     updates: &HashMap<usize, Val>,
 ) -> SelectKey {
     let vals: Vec<Val> = index_spec
-        .index_cols
+        .cols
         .iter()
         .zip(&key.vals)
         .map(|(ik, val)| {
@@ -1636,9 +1660,11 @@ fn read_latest_index_key(
     page_guard: &PageSharedGuard<RowPage>,
     row_id: RowID,
 ) -> SelectKey {
-    let index_spec = &metadata.index_specs[index_no];
-    let mut new_key = SelectKey::null(index_no, index_spec.index_cols.len());
-    for (pos, key) in index_spec.index_cols.iter().enumerate() {
+    let index_spec = metadata
+        .index_spec(index_no)
+        .expect("active index spec must exist for latest key read");
+    let mut new_key = SelectKey::null(index_no, index_spec.cols.len());
+    for (pos, key) in index_spec.cols.iter().enumerate() {
         let (ctx, page) = page_guard.ctx_and_page();
         let access = RowReadAccess::new(page, ctx, page.row_idx(row_id));
         let val = access.row().val(metadata, key.col_no as usize);

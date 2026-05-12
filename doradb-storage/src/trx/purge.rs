@@ -926,7 +926,9 @@ mod tests {
 
     #[inline]
     fn bound_unique_index_no(table: &Table, index_no: usize) -> impl UniqueIndex + '_ {
-        table.sec_idx()[index_no]
+        table
+            .require_sec_idx(index_no)
+            .unwrap()
             .bind_unique(active_secondary_root(table, index_no))
             .unwrap()
     }

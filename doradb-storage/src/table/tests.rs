@@ -4817,11 +4817,7 @@ fn test_create_table_waits_on_catalog_namespace_lock() {
                         crate::value::ValKind::I32,
                         ColumnAttributes::empty(),
                     )]),
-                    vec![IndexSpec::new(
-                        "pk_id",
-                        vec![IndexKey::new(0)],
-                        IndexAttributes::PK,
-                    )],
+                    vec![IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::PK)],
                 )
                 .await
         });
@@ -7450,8 +7446,8 @@ fn test_build_in_memory_secondary_indexes_reclaims_staged_indexes_on_error() {
                 ColumnAttributes::empty(),
             )],
             vec![
-                IndexSpec::new("idx_a", vec![IndexKey::new(0)], IndexAttributes::PK),
-                IndexSpec::new("idx_b", vec![IndexKey::new(0)], IndexAttributes::empty()),
+                IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::PK),
+                IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::empty()),
             ],
         );
 
@@ -7491,15 +7487,9 @@ fn test_user_secondary_indexes_evict_and_continue_serving_lookups() {
             .unwrap();
 
         let mut ddl_session = engine.try_new_session().unwrap();
-        let mut index_specs = vec![IndexSpec::new(
-            "idx_pk",
-            vec![IndexKey::new(0)],
-            IndexAttributes::PK,
-        )];
-        for idx in 0..12 {
-            let name = format!("idx_name_{idx}");
+        let mut index_specs = vec![IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::PK)];
+        for _ in 0..12 {
             index_specs.push(IndexSpec::new(
-                &name,
                 vec![IndexKey::new(1)],
                 IndexAttributes::empty(),
             ));
@@ -7692,8 +7682,8 @@ impl TestSys {
                     ColumnSpec::new("name", ValKind::VarByte, ColumnAttributes::empty()),
                 ]),
                 vec![
-                    IndexSpec::new("idx_id", vec![IndexKey::new(0)], IndexAttributes::PK),
-                    IndexSpec::new("idx_name", vec![IndexKey::new(1)], IndexAttributes::empty()),
+                    IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::PK),
+                    IndexSpec::new(vec![IndexKey::new(1)], IndexAttributes::empty()),
                 ],
             )
             .await
@@ -7867,12 +7857,8 @@ fn drop_table_test_spec() -> (TableSpec, Vec<IndexSpec>) {
             ColumnSpec::new("name", ValKind::VarByte, ColumnAttributes::empty()),
         ]),
         vec![
-            IndexSpec::new("idx_drop_id", vec![IndexKey::new(0)], IndexAttributes::PK),
-            IndexSpec::new(
-                "idx_drop_name",
-                vec![IndexKey::new(1)],
-                IndexAttributes::empty(),
-            ),
+            IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::PK),
+            IndexSpec::new(vec![IndexKey::new(1)], IndexAttributes::empty()),
         ],
     )
 }
@@ -7960,7 +7946,9 @@ fn bound_unique_index_no(
     table: &Table,
     index_no: usize,
 ) -> UniqueSecondaryIndex<'_, EvictableBufferPool> {
-    table.sec_idx()[index_no]
+    table
+        .require_sec_idx(index_no)
+        .unwrap()
         .bind_unique(active_secondary_root(table, index_no))
         .unwrap()
 }
@@ -7969,7 +7957,9 @@ fn bound_non_unique_index_no(
     table: &Table,
     index_no: usize,
 ) -> NonUniqueSecondaryIndex<'_, EvictableBufferPool> {
-    table.sec_idx()[index_no]
+    table
+        .require_sec_idx(index_no)
+        .unwrap()
         .bind_non_unique(active_secondary_root(table, index_no))
         .unwrap()
 }

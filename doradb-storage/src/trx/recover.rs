@@ -1228,9 +1228,8 @@ mod tests {
                 ColumnSpec::new("c2", ValKind::U32, ColumnAttributes::empty()),
             ]);
             let index_specs = vec![
-                IndexSpec::new("idx_t1_pk", vec![IndexKey::new(0)], IndexAttributes::PK),
+                IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::PK),
                 IndexSpec::new(
-                    "idx_t1_c1_c2",
                     vec![
                         IndexKey {
                             col_no: 1,
@@ -1304,11 +1303,7 @@ mod tests {
             let table_id = session
                 .create_table(
                     table_spec,
-                    vec![IndexSpec::new(
-                        "idx_t1_pk",
-                        vec![IndexKey::new(0)],
-                        IndexAttributes::PK,
-                    )],
+                    vec![IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::PK)],
                 )
                 .await
                 .unwrap();
@@ -1420,11 +1415,7 @@ mod tests {
                         ValKind::U32,
                         ColumnAttributes::empty(),
                     )]),
-                    vec![IndexSpec::new(
-                        "idx_t4_pk",
-                        vec![IndexKey::new(0)],
-                        IndexAttributes::PK,
-                    )],
+                    vec![IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::PK)],
                 )
                 .await
                 .unwrap();
@@ -1482,11 +1473,7 @@ mod tests {
                         ColumnSpec::new("id", ValKind::U32, ColumnAttributes::empty()),
                         ColumnSpec::new("name", ValKind::VarByte, ColumnAttributes::empty()),
                     ]),
-                    vec![IndexSpec::new(
-                        "idx_t5_pk",
-                        vec![IndexKey::new(0)],
-                        IndexAttributes::PK,
-                    )],
+                    vec![IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::PK)],
                 )
                 .await
                 .unwrap();
@@ -1547,7 +1534,7 @@ mod tests {
 
             let mut trx = session.try_begin_trx().unwrap().unwrap();
             let key = SelectKey::new(0, vec![Val::from(7u32)]);
-            let index = &table.sec_idx()[key.index_no];
+            let index = table.require_sec_idx(key.index_no).unwrap();
             let root = table.file().active_root_unchecked().secondary_index_roots[key.index_no];
             let disk = index
                 .disk_runtime()
@@ -1605,11 +1592,7 @@ mod tests {
                         ColumnSpec::new("id", ValKind::U32, ColumnAttributes::empty()),
                         ColumnSpec::new("name", ValKind::VarByte, ColumnAttributes::empty()),
                     ]),
-                    vec![IndexSpec::new(
-                        "idx_t11_pk",
-                        vec![IndexKey::new(0)],
-                        IndexAttributes::PK,
-                    )],
+                    vec![IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::PK)],
                 )
                 .await
                 .unwrap();
@@ -1679,7 +1662,7 @@ mod tests {
             let mut session = engine.try_new_session().unwrap();
             assert!(table.total_row_pages(session.pool_guards()).await > 0);
 
-            let index = &table.sec_idx()[key.index_no];
+            let index = table.require_sec_idx(key.index_no).unwrap();
             let root = table.file().active_root_unchecked().secondary_index_roots[key.index_no];
             let disk = index
                 .disk_runtime()
@@ -1732,12 +1715,8 @@ mod tests {
                         ColumnSpec::new("name", ValKind::VarByte, ColumnAttributes::empty()),
                     ]),
                     vec![
-                        IndexSpec::new("idx_t12_pk", vec![IndexKey::new(0)], IndexAttributes::PK),
-                        IndexSpec::new(
-                            "idx_t12_name",
-                            vec![IndexKey::new(1)],
-                            IndexAttributes::empty(),
-                        ),
+                        IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::PK),
+                        IndexSpec::new(vec![IndexKey::new(1)], IndexAttributes::empty()),
                     ],
                 )
                 .await
@@ -1796,7 +1775,7 @@ mod tests {
             assert_eq!(table.total_row_pages(session.pool_guards()).await, 0);
 
             let name_key = SelectKey::new(1, vec![Val::from("same-name")]);
-            let non_unique = &table.sec_idx()[name_key.index_no];
+            let non_unique = table.require_sec_idx(name_key.index_no).unwrap();
             let root =
                 table.file().active_root_unchecked().secondary_index_roots[name_key.index_no];
             let disk = non_unique
@@ -1868,11 +1847,7 @@ mod tests {
                         ColumnSpec::new("id", ValKind::U32, ColumnAttributes::empty()),
                         ColumnSpec::new("name", ValKind::VarByte, ColumnAttributes::empty()),
                     ]),
-                    vec![IndexSpec::new(
-                        "idx_t6_pk",
-                        vec![IndexKey::new(0)],
-                        IndexAttributes::PK,
-                    )],
+                    vec![IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::PK)],
                 )
                 .await
                 .unwrap();
@@ -1990,11 +1965,7 @@ mod tests {
                         ValKind::U32,
                         ColumnAttributes::empty(),
                     )]),
-                    vec![IndexSpec::new(
-                        "idx_t10_pk",
-                        vec![IndexKey::new(0)],
-                        IndexAttributes::PK,
-                    )],
+                    vec![IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::PK)],
                 )
                 .await
                 .unwrap();
@@ -2153,11 +2124,7 @@ mod tests {
                         ColumnSpec::new("id", ValKind::U32, ColumnAttributes::empty()),
                         ColumnSpec::new("name", ValKind::VarByte, ColumnAttributes::empty()),
                     ]),
-                    vec![IndexSpec::new(
-                        "idx_t7a_pk",
-                        vec![IndexKey::new(0)],
-                        IndexAttributes::PK,
-                    )],
+                    vec![IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::PK)],
                 )
                 .await
                 .unwrap();
@@ -2167,11 +2134,7 @@ mod tests {
                         ColumnSpec::new("id", ValKind::U32, ColumnAttributes::empty()),
                         ColumnSpec::new("name", ValKind::VarByte, ColumnAttributes::empty()),
                     ]),
-                    vec![IndexSpec::new(
-                        "idx_t7b_pk",
-                        vec![IndexKey::new(0)],
-                        IndexAttributes::PK,
-                    )],
+                    vec![IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::PK)],
                 )
                 .await
                 .unwrap();
@@ -2356,11 +2319,7 @@ mod tests {
                         ColumnSpec::new("id", ValKind::U32, ColumnAttributes::empty()),
                         ColumnSpec::new("name", ValKind::VarByte, ColumnAttributes::empty()),
                     ]),
-                    vec![IndexSpec::new(
-                        "idx_t8_pk",
-                        vec![IndexKey::new(0)],
-                        IndexAttributes::PK,
-                    )],
+                    vec![IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::PK)],
                 )
                 .await
                 .unwrap();
@@ -2477,11 +2436,7 @@ mod tests {
                         ValKind::U32,
                         ColumnAttributes::empty(),
                     )]),
-                    vec![IndexSpec::new(
-                        "idx_t9_pk",
-                        vec![IndexKey::new(0)],
-                        IndexAttributes::PK,
-                    )],
+                    vec![IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::PK)],
                 )
                 .await
                 .unwrap();

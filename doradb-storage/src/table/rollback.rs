@@ -206,7 +206,7 @@ impl IndexRollback for Table {
         row_id: RowID,
         ts: TrxID,
     ) -> Result<bool> {
-        self.sec_idx()[key.index_no]
+        self.require_sec_idx(key.index_no)?
             .unique_mem()?
             .mask_as_deleted(index_pool_guard, &key.vals, row_id, ts)
             .await
@@ -221,7 +221,7 @@ impl IndexRollback for Table {
         ignore_del_mask: bool,
         ts: TrxID,
     ) -> Result<bool> {
-        self.sec_idx()[key.index_no]
+        self.require_sec_idx(key.index_no)?
             .unique_mem()?
             .compare_delete(index_pool_guard, &key.vals, row_id, ignore_del_mask, ts)
             .await
@@ -236,7 +236,7 @@ impl IndexRollback for Table {
         new_row_id: RowID,
         ts: TrxID,
     ) -> Result<IndexCompareExchange> {
-        self.sec_idx()[key.index_no]
+        self.require_sec_idx(key.index_no)?
             .unique_mem()?
             .compare_exchange(index_pool_guard, &key.vals, old_row_id, new_row_id, ts)
             .await
@@ -250,7 +250,7 @@ impl IndexRollback for Table {
         row_id: RowID,
         ts: TrxID,
     ) -> Result<bool> {
-        self.sec_idx()[key.index_no]
+        self.require_sec_idx(key.index_no)?
             .non_unique_mem()?
             .mask_as_deleted(index_pool_guard, &key.vals, row_id, ts)
             .await
@@ -264,7 +264,7 @@ impl IndexRollback for Table {
         row_id: RowID,
         ts: TrxID,
     ) -> Result<bool> {
-        self.sec_idx()[key.index_no]
+        self.require_sec_idx(key.index_no)?
             .non_unique_mem()?
             .mask_as_active(index_pool_guard, &key.vals, row_id, ts)
             .await
@@ -279,7 +279,7 @@ impl IndexRollback for Table {
         ignore_del_mask: bool,
         ts: TrxID,
     ) -> Result<bool> {
-        self.sec_idx()[key.index_no]
+        self.require_sec_idx(key.index_no)?
             .non_unique_mem()?
             .compare_delete(index_pool_guard, &key.vals, row_id, ignore_del_mask, ts)
             .await
@@ -303,7 +303,8 @@ impl IndexRollback for CatalogTable {
         row_id: RowID,
         ts: TrxID,
     ) -> Result<bool> {
-        self.mem.sec_idx()[key.index_no]
+        self.mem
+            .require_sec_idx(key.index_no)?
             .unique()
             .ok_or_else(|| secondary_index_kind_mismatch("rollback unique mask deleted", "unique"))?
             .mask_as_deleted(index_pool_guard, &key.vals, row_id, ts)
@@ -319,7 +320,8 @@ impl IndexRollback for CatalogTable {
         ignore_del_mask: bool,
         ts: TrxID,
     ) -> Result<bool> {
-        self.mem.sec_idx()[key.index_no]
+        self.mem
+            .require_sec_idx(key.index_no)?
             .unique()
             .ok_or_else(|| {
                 secondary_index_kind_mismatch("rollback unique compare delete", "unique")
@@ -337,7 +339,8 @@ impl IndexRollback for CatalogTable {
         new_row_id: RowID,
         ts: TrxID,
     ) -> Result<IndexCompareExchange> {
-        self.mem.sec_idx()[key.index_no]
+        self.mem
+            .require_sec_idx(key.index_no)?
             .unique()
             .ok_or_else(|| {
                 secondary_index_kind_mismatch("rollback unique compare exchange", "unique")
@@ -354,7 +357,8 @@ impl IndexRollback for CatalogTable {
         row_id: RowID,
         ts: TrxID,
     ) -> Result<bool> {
-        self.mem.sec_idx()[key.index_no]
+        self.mem
+            .require_sec_idx(key.index_no)?
             .non_unique()
             .ok_or_else(|| {
                 secondary_index_kind_mismatch("rollback non-unique mask deleted", "non-unique")
@@ -371,7 +375,8 @@ impl IndexRollback for CatalogTable {
         row_id: RowID,
         ts: TrxID,
     ) -> Result<bool> {
-        self.mem.sec_idx()[key.index_no]
+        self.mem
+            .require_sec_idx(key.index_no)?
             .non_unique()
             .ok_or_else(|| {
                 secondary_index_kind_mismatch("rollback non-unique mask active", "non-unique")
@@ -389,7 +394,8 @@ impl IndexRollback for CatalogTable {
         ignore_del_mask: bool,
         ts: TrxID,
     ) -> Result<bool> {
-        self.mem.sec_idx()[key.index_no]
+        self.mem
+            .require_sec_idx(key.index_no)?
             .non_unique()
             .ok_or_else(|| {
                 secondary_index_kind_mismatch("rollback non-unique compare delete", "non-unique")
