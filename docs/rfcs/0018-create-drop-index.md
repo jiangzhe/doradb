@@ -459,10 +459,10 @@ on. Safe synchronization primitives or existing project patterns are preferred.
   - Goals: Preserve non-reuse across restart and make catalog/table-file reload
     compare sparse active metadata correctly.
   - Non-goals: Implement public create/drop index APIs.
-  - Task Doc: `docs/tasks/TBD.md`
-  - Task Issue: `#0`
-  - Phase Status: `pending`
-  - Implementation Summary: `pending`
+  - Task Doc: `docs/tasks/000146-stable-index-metadata.md`
+  - Task Issue: `#630`
+  - Phase Status: done
+  - Implementation Summary: Implemented Phase 1 stable index metadata: removed storage-layer index names, added sparse stable index slots and durable next_index_no, updated catalog/table-file metadata and reload, converted runtime/checkpoint/recovery/purge paths to active sparse iteration, validated inactive root slots with SUPER_BLOCK_ID, and deferred DROP INDEX-specific purge tests to docs/backlogs/000099-drop-index-purge-skip-tests.md. [Task Resolve Sync: docs/tasks/000146-stable-index-metadata.md @ 2026-05-12]
 
 - **Phase 2: Runtime Layout And Checkpoint Gate**
   - Scope: Add the runtime layout update mechanism for existing table handles

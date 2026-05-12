@@ -1,7 +1,7 @@
 ---
 id: 000146
 title: Stable Index Metadata
-status: proposal
+status: implemented
 created: 2026-05-10
 github_issue: 630
 ---
@@ -241,6 +241,44 @@ cargo nextest run -p doradb-storage --no-default-features --features libaio
 
 ## Implementation Notes
 
+- Implemented the RFC 0018 Phase 1 metadata split. `IndexSpec` is now logical
+  input metadata with `cols` and `attributes`, while persisted/reloaded active
+  metadata uses `ActiveIndexSpec { index_no, spec }`. `TableMetadata` now owns
+  sparse secondary-index slots keyed by stable `index_no`, derives dense
+  initial index numbers for create-table input, preserves durable
+  `next_index_no`, and exposes active/sparse helpers for callers.
+- Removed storage-layer index names from catalog rows, table-file metadata,
+  serialization, examples, and tests. `catalog.tables` now persists
+  `next_index_no`; `catalog.indexes` stores active `index_no` rows without
+  names; catalog reload reconstructs sparse active metadata and compares it
+  with table-file metadata.
+- Converted table-file, runtime, checkpoint, recovery, rollback, purge, and row
+  helper paths to use stable sparse slots. User-table secondary runtime arrays
+  remain slot-addressable `Option` arrays, table-file secondary roots are
+  sparse vectors of length `next_index_no`, inactive slots are represented with
+  `SUPER_BLOCK_ID`, and checkpoint sidecars keep only active indexes while
+  carrying each stable `index_no`.
+- Hardened meta-block validation beyond slot-count checks. Both
+  `MetaBlock::deser` and `MetaBlockSerView::new` now reject inactive secondary
+  root slots whose root is not `SUPER_BLOCK_ID`.
+- Made stale index-GC entries for inactive or dropped index slots explicit
+  no-ops in purge by returning `Ok(false)` when purge sees missing index
+  metadata or a missing runtime secondary-index slot. End-to-end DROP INDEX
+  tests are deferred because public DROP INDEX is not implemented yet.
+- Created deferred follow-up backlog
+  `docs/backlogs/000099-drop-index-purge-skip-tests.md` for DROP INDEX purge
+  tests that require the later DDL implementation.
+- Validation completed: `cargo fmt --all`, `cargo check -p doradb-storage
+  --tests`, `cargo clippy -p doradb-storage --all-targets -- -D warnings`,
+  `cargo nextest run -p doradb-storage` (731 passed),
+  `cargo nextest run -p doradb-storage --no-default-features --features
+  libaio` (729 passed), focused `cargo nextest run -p doradb-storage
+  test_meta_block` (8 passed), and `git diff --check`.
+- Focused coverage completed with `tools/coverage_focus.rs --path
+  doradb-storage/src/catalog --path doradb-storage/src/file --path
+  doradb-storage/src/table --path doradb-storage/src/trx --path
+  doradb-storage/src/serde.rs`: deduplicated total coverage was 28027/30422
+  lines, 92.13%, and every requested target group was above 80%.
 
 ## Impacts
 
@@ -317,6 +355,14 @@ cargo nextest run -p doradb-storage --no-default-features --features libaio
 
 ## Open Questions
 
-None for this task. Later RFC 0018 phases decide runtime layout mutation,
-checkpoint exclusion, index-DDL redo/recovery, public `CREATE INDEX`, public
-`DROP INDEX`, and any dedicated physical cleanup of dropped-index pages.
+No unresolved Phase 1 questions remain.
+
+Deferred follow-up: `docs/backlogs/000099-drop-index-purge-skip-tests.md`
+tracks end-to-end tests for stale purge/index-GC entries targeting dropped
+indexes. The implementation now has explicit no-op behavior for missing
+metadata/runtime slots, but DROP INDEX-specific tests require the future public
+DROP INDEX path.
+
+Later RFC 0018 phases decide runtime layout mutation, checkpoint exclusion,
+index-DDL redo/recovery, public `CREATE INDEX`, public `DROP INDEX`, and any
+dedicated physical cleanup of dropped-index pages.
