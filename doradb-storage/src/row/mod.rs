@@ -1338,16 +1338,6 @@ pub(crate) trait RowRead {
         self.page().var_len_for_update(self.row_idx(), cols)
     }
 
-    /// Clone index values.
-    #[inline]
-    fn clone_index_vals(&self, metadata: &TableMetadata, index_no: usize) -> Vec<Val> {
-        metadata.index_specs[index_no]
-            .cols
-            .iter()
-            .map(|key| self.val(metadata, key.col_no as usize))
-            .collect()
-    }
-
     /// Returns value with optional intra-page offset if stored in page.
     #[inline]
     fn val_with_var_offset(&self, metadata: &TableMetadata, col_idx: usize) -> (Val, Option<u16>) {
@@ -1394,7 +1384,13 @@ pub(crate) trait RowRead {
     #[inline]
     fn is_key_different(&self, metadata: &TableMetadata, key: &SelectKey) -> bool {
         debug_assert!(!key.vals.is_empty());
-        metadata.index_specs[key.index_no]
+        let Some(index_spec) = metadata.index_spec(key.index_no) else {
+            return true;
+        };
+        if index_spec.cols.len() != key.vals.len() {
+            return true;
+        }
+        index_spec
             .cols
             .iter()
             .zip(&key.vals)
