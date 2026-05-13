@@ -318,8 +318,9 @@ impl<'stmt> Statement<'stmt> {
     {
         self.acquire_table_read_lock(table.table_id()).await?;
         table.check_foreground_live("table_scan_mvcc")?;
+        let layout = table.layout_snapshot();
         table
-            .accessor()
+            .accessor_with_layout(layout)
             .table_scan_mvcc(self.ctx, read_set, row_action)
             .await;
         Ok(())
@@ -335,8 +336,9 @@ impl<'stmt> Statement<'stmt> {
     ) -> Result<SelectMvcc> {
         self.acquire_table_read_lock(table.table_id()).await?;
         table.check_foreground_live("table_lookup_unique_mvcc")?;
+        let layout = table.layout_snapshot();
         table
-            .accessor()
+            .accessor_with_layout(layout)
             .index_lookup_unique_mvcc(self.ctx, key, user_read_set)
             .await
     }
@@ -351,8 +353,9 @@ impl<'stmt> Statement<'stmt> {
     ) -> Result<ScanMvcc> {
         self.acquire_table_read_lock(table.table_id()).await?;
         table.check_foreground_live("table_index_scan_mvcc")?;
+        let layout = table.layout_snapshot();
         table
-            .accessor()
+            .accessor_with_layout(layout)
             .index_scan_mvcc(self.ctx, key, user_read_set)
             .await
     }
@@ -362,8 +365,9 @@ impl<'stmt> Statement<'stmt> {
     pub async fn table_insert_mvcc(&mut self, table: &Table, cols: Vec<Val>) -> Result<RowID> {
         self.acquire_table_write_locks(table.table_id()).await?;
         table.check_foreground_live("table_insert_mvcc")?;
+        let layout = table.layout_snapshot();
         table
-            .accessor()
+            .accessor_with_layout(layout)
             .insert_mvcc(self.ctx, &mut self.effects, cols)
             .await
     }
@@ -378,8 +382,9 @@ impl<'stmt> Statement<'stmt> {
     ) -> Result<UpdateMvcc> {
         self.acquire_table_write_locks(table.table_id()).await?;
         table.check_foreground_live("table_update_unique_mvcc")?;
+        let layout = table.layout_snapshot();
         table
-            .accessor()
+            .accessor_with_layout(layout)
             .update_unique_mvcc(self.ctx, &mut self.effects, key, update)
             .await
     }
@@ -394,8 +399,9 @@ impl<'stmt> Statement<'stmt> {
     ) -> Result<DeleteMvcc> {
         self.acquire_table_write_locks(table.table_id()).await?;
         table.check_foreground_live("table_delete_unique_mvcc")?;
+        let layout = table.layout_snapshot();
         table
-            .accessor()
+            .accessor_with_layout(layout)
             .delete_unique_mvcc(self.ctx, &mut self.effects, key, log_by_key)
             .await
     }

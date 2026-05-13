@@ -2,11 +2,11 @@ use super::{DeleteInternal, FrozenPage, InsertRowIntoPage, UpdateRowInplace};
 use crate::buffer::BufferPool;
 use crate::buffer::frame::FrameKind;
 use crate::buffer::page::{PAGE_SIZE, PageID};
-use crate::buffer::{EvictableBufferPool, PoolGuards, PoolRole, test_frame_kind};
+use crate::buffer::{EvictableBufferPool, PoolGuard, PoolGuards, PoolRole, test_frame_kind};
 use crate::catalog::tests::table4;
 use crate::catalog::{
     CatalogCheckpointScanStopReason, ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey,
-    IndexSpec, TableID, TableSpec, USER_OBJ_ID_START,
+    IndexSpec, TableID, TableMetadata, TableSpec, USER_OBJ_ID_START,
 };
 use crate::conf::{EngineConfig, EvictableBufferPoolConfig, FileSystemConfig, TrxSysConfig};
 use crate::engine::Engine;
@@ -20,8 +20,7 @@ use crate::file::cow_file::{
 };
 use crate::index::{
     COLUMN_BLOCK_HEADER_SIZE, COLUMN_BLOCK_LEAF_HEADER_SIZE, ColumnBlockIndex, IndexInsert,
-    NonUniqueIndex, NonUniqueSecondaryIndex, RowLocation, UniqueIndex, UniqueSecondaryIndex,
-    load_entry_deletion_deltas,
+    NonUniqueIndex, RowLocation, SecondaryIndex, UniqueIndex, load_entry_deletion_deltas,
 };
 use crate::io::{
     IOKind, StdIoResult, StorageBackendFileIdentity, StorageBackendOp, StorageBackendTestHook,
@@ -35,7 +34,7 @@ use crate::row::{RowID, RowPage, RowRead};
 use crate::session::Session;
 use crate::table::{
     CheckpointCancelReason, CheckpointOutcome, CheckpointReadiness, DeleteMarker, Table,
-    TableAccess, TableLifecycleState, TablePersistence, TableRecover,
+    TableAccess, TableLifecycleState, TablePersistence, TableRecover, TableRuntimeLayout,
 };
 use crate::trx::row::LockRowForWrite;
 use crate::trx::stmt::Statement;
@@ -1619,7 +1618,7 @@ fn test_lwc_update_unique_claim_rollback_drops_purgeable_deleted_cold_owner() {
         // delete-masked owner.
         let deleted = sys
             .table
-            .accessor()
+            .accessor_with_layout(sys.table.layout_snapshot())
             .delete_index(
                 session.pool_guards(),
                 &claimed_key,
@@ -2979,7 +2978,8 @@ fn test_unique_checkpoint_overlap_keeps_new_disk_tree_owner() {
         .await;
 
         sys.table.freeze(&session, usize::MAX).await;
-        wait_gc_cutoff_after(&session, delete_ts).await;
+        let readiness_ts = delete_ts.max(sys.table.file().active_root_unchecked().trx_id);
+        wait_gc_cutoff_after(&session, readiness_ts).await;
         checkpoint_published(&sys.table, &mut session).await;
 
         assert_eq!(
@@ -3196,7 +3196,7 @@ fn test_lwc_unique_index_purge_uses_purgeable_delete_marker_fast_path() {
 
         let deleted = sys
             .table
-            .accessor()
+            .accessor_with_layout(sys.table.layout_snapshot())
             .delete_index(session.pool_guards(), &key, row_id, true, 11)
             .await
             .unwrap();
@@ -3267,7 +3267,7 @@ fn test_lwc_unique_index_purge_compares_persisted_key_when_marker_is_not_purgeab
         );
         let deleted = sys
             .table
-            .accessor()
+            .accessor_with_layout(sys.table.layout_snapshot())
             .delete_index(
                 session.pool_guards(),
                 &stale_key,
@@ -3307,7 +3307,7 @@ fn test_lwc_unique_index_purge_compares_persisted_key_when_marker_is_not_purgeab
             .unwrap();
         let deleted = sys
             .table
-            .accessor()
+            .accessor_with_layout(sys.table.layout_snapshot())
             .delete_index(session.pool_guards(), &current_key, row_id, true, 100)
             .await
             .unwrap();
@@ -3369,7 +3369,7 @@ fn test_lwc_non_unique_index_purge_compares_persisted_key_when_marker_is_not_pur
         );
         let deleted = sys
             .table
-            .accessor()
+            .accessor_with_layout(sys.table.layout_snapshot())
             .delete_index(
                 session.pool_guards(),
                 &stale_key,
@@ -3410,7 +3410,7 @@ fn test_lwc_non_unique_index_purge_compares_persisted_key_when_marker_is_not_pur
             .unwrap();
         let deleted = sys
             .table
-            .accessor()
+            .accessor_with_layout(sys.table.layout_snapshot())
             .delete_index(session.pool_guards(), &current_key, row_id, false, 200)
             .await
             .unwrap();
@@ -3465,7 +3465,7 @@ fn test_index_purge_removes_delete_marked_unique_entry_when_row_is_not_found() {
 
         let deleted = sys
             .table
-            .accessor()
+            .accessor_with_layout(sys.table.layout_snapshot())
             .delete_index(session.pool_guards(), &key, row_id, true, MAX_SNAPSHOT_TS)
             .await
             .unwrap();
@@ -4158,14 +4158,17 @@ fn test_row_page_transition_retries_update_delete() {
             .exec(async |stmt| {
                 stmt.acquire_table_write_locks(sys.table.table_id()).await?;
                 let (ctx, effects) = stmt_tests::ctx_and_effects_mut(stmt);
-                let insert_res = sys.table.accessor().insert_row_to_page(
-                    ctx,
-                    effects,
-                    insert_page_guard,
-                    insert,
-                    RowUndoKind::Insert,
-                    vec![],
-                );
+                let insert_res = sys
+                    .table
+                    .accessor_with_layout(sys.table.layout_snapshot())
+                    .insert_row_to_page(
+                        ctx,
+                        effects,
+                        insert_page_guard,
+                        insert,
+                        RowUndoKind::Insert,
+                        vec![],
+                    );
                 assert!(matches!(
                     insert_res,
                     InsertRowIntoPage::NoSpaceOrFrozen(_, _, _)
@@ -4177,7 +4180,7 @@ fn test_row_page_transition_retries_update_delete() {
                 }];
                 let res = sys
                     .table
-                    .accessor()
+                    .accessor_with_layout(sys.table.layout_snapshot())
                     .update_row_inplace(ctx, effects, page_guard, &key, row_id, update)
                     .await;
                 assert!(matches!(res, UpdateRowInplace::RetryInTransition));
@@ -4210,7 +4213,7 @@ fn test_row_page_transition_retries_update_delete() {
                 let (ctx, effects) = stmt_tests::ctx_and_effects_mut(stmt);
                 let res = sys
                     .table
-                    .accessor()
+                    .accessor_with_layout(sys.table.layout_snapshot())
                     .delete_row_internal(ctx, effects, page_guard, row_id, &key, false)
                     .await;
                 assert!(matches!(res, DeleteInternal::RetryInTransition));
@@ -4686,7 +4689,7 @@ fn test_table_scan_uncommitted() {
         {
             let mut res_len = 0usize;
             sys.table
-                .accessor()
+                .accessor_with_layout(sys.table.layout_snapshot())
                 .table_scan_uncommitted(session.pool_guards(), |_metadata, _row| {
                     res_len += 1;
                     true
@@ -5507,7 +5510,7 @@ fn test_transition_captures_uncommitted_lock_into_deletion_buffer() {
                 let (ctx, effects) = stmt_tests::ctx_and_effects_mut(stmt);
                 let mut lock_row = sys
                     .table
-                    .accessor()
+                    .accessor_with_layout(sys.table.layout_snapshot())
                     .lock_row_for_write(ctx, effects, &page_guard, row_id, Some(&key))
                     .await;
                 match &mut lock_row {
@@ -5649,6 +5652,7 @@ fn test_foreground_lifecycle_rejects_dropping_and_dropped_handles() {
 fn test_table_drop_gate_waits_for_checkpoint_publish_lease() {
     smol::block_on(async {
         let sys = TestSys::new_lightweight_evictable().await;
+        let root_lease = sys.table.try_begin_checkpoint_root_mutation().unwrap();
         let publish_lease = sys.table.try_begin_checkpoint_publish().unwrap();
         let mut drop_fut = Box::pin(sys.table.begin_drop_lifecycle());
 
@@ -5656,7 +5660,7 @@ fn test_table_drop_gate_waits_for_checkpoint_publish_lease() {
             futures::poll!(drop_fut.as_mut()),
             std::task::Poll::Pending
         ));
-        assert_eq!(sys.table.lifecycle.state(), TableLifecycleState::Live);
+        assert_eq!(sys.table.lifecycle.state(), TableLifecycleState::Dropping);
         match sys.table.try_begin_checkpoint_publish() {
             Ok(_lease) => panic!("publish lease should be blocked by drop gate"),
             Err(reason) => assert_eq!(reason, CheckpointCancelReason::TableDropping),
@@ -5665,6 +5669,7 @@ fn test_table_drop_gate_waits_for_checkpoint_publish_lease() {
         drop(publish_lease);
         drop_fut.await.unwrap();
         assert_eq!(sys.table.lifecycle.state(), TableLifecycleState::Dropping);
+        drop(root_lease);
 
         sys.clean_all();
     });
@@ -5790,6 +5795,7 @@ fn test_drop_table_fails_waiting_session_table_lock() {
     smol::block_on(async {
         let sys = TestSys::new_lightweight_evictable().await;
         let table_id = sys.table.table_id();
+        let root_lease = sys.table.try_begin_checkpoint_root_mutation().unwrap();
         let publish_lease = sys.table.try_begin_checkpoint_publish().unwrap();
         let mut drop_session = sys.try_new_session().unwrap();
         let drop_owner = LockOwner::Session(drop_session.id());
@@ -5808,23 +5814,20 @@ fn test_drop_table_fails_waiting_session_table_lock() {
 
         let lock_session = sys.try_new_session().unwrap();
         let lock_owner = LockOwner::Session(lock_session.id());
-        let mut lock_fut = Box::pin(lock_session.lock_table(table_id, LockMode::Shared));
-        assert!(matches!(
-            futures::poll!(lock_fut.as_mut()),
-            std::task::Poll::Pending
-        ));
-        assert!(has_lock_entry(
+        let err = lock_session
+            .lock_table(table_id, LockMode::Shared)
+            .await
+            .unwrap_err();
+        assert_eq!(err.operation_error(), Some(OperationError::TableDropping));
+        assert!(!has_lock_resource(
             &sys.engine,
             lock_owner,
             LockResource::TableMetadata(table_id),
-            LockMode::Shared,
-            LockDebugEntryState::Waiting,
         ));
 
         drop(publish_lease);
         drop_fut.await.unwrap();
-        let err = lock_fut.await.unwrap_err();
-        assert_eq!(err.operation_error(), Some(OperationError::TableNotFound));
+        drop(root_lease);
         assert!(!has_lock_resource(
             &sys.engine,
             lock_owner,
@@ -5847,6 +5850,7 @@ fn test_drop_table_fails_waiting_transaction_table_lock() {
     smol::block_on(async {
         let sys = TestSys::new_lightweight_evictable().await;
         let table_id = sys.table.table_id();
+        let root_lease = sys.table.try_begin_checkpoint_root_mutation().unwrap();
         let publish_lease = sys.table.try_begin_checkpoint_publish().unwrap();
         let mut drop_session = sys.try_new_session().unwrap();
         let drop_owner = LockOwner::Session(drop_session.id());
@@ -5866,23 +5870,20 @@ fn test_drop_table_fails_waiting_transaction_table_lock() {
         let mut lock_session = sys.try_new_session().unwrap();
         let mut trx = lock_session.try_begin_trx().unwrap().unwrap();
         let lock_owner = trx_tests::lock_owner(&trx).unwrap();
-        let mut lock_fut = Box::pin(trx.lock_table(table_id, LockMode::Exclusive));
-        assert!(matches!(
-            futures::poll!(lock_fut.as_mut()),
-            std::task::Poll::Pending
-        ));
-        assert!(has_lock_entry(
+        let err = trx
+            .lock_table(table_id, LockMode::Exclusive)
+            .await
+            .unwrap_err();
+        assert_eq!(err.operation_error(), Some(OperationError::TableDropping));
+        assert!(!has_lock_resource(
             &sys.engine,
             lock_owner,
             LockResource::TableMetadata(table_id),
-            LockMode::Shared,
-            LockDebugEntryState::Waiting,
         ));
 
         drop(publish_lease);
         drop_fut.await.unwrap();
-        let err = lock_fut.await.unwrap_err();
-        assert_eq!(err.operation_error(), Some(OperationError::TableNotFound));
+        drop(root_lease);
         assert!(!has_lock_resource(
             &sys.engine,
             lock_owner,
@@ -7088,7 +7089,7 @@ fn test_validated_row_page_shared_result_rejects_stale_reused_page_range() {
 
         let stale_guard = sys
             .table
-            .accessor()
+            .accessor_with_layout(sys.table.layout_snapshot())
             .try_get_validated_row_page_shared_result(
                 session.pool_guards(),
                 stale_page.page_id,
@@ -7103,7 +7104,7 @@ fn test_validated_row_page_shared_result_rejects_stale_reused_page_range() {
 
         let reused_guard = sys
             .table
-            .accessor()
+            .accessor_with_layout(sys.table.layout_snapshot())
             .try_get_validated_row_page_shared_result(
                 session.pool_guards(),
                 stale_page.page_id,
@@ -7567,7 +7568,7 @@ fn test_user_secondary_indexes_evict_and_continue_serving_lookups() {
 
         let mut visible_rows = 0usize;
         table
-            .accessor()
+            .accessor_with_layout(table.layout_snapshot())
             .table_scan_uncommitted(session.pool_guards(), |_metadata, row| {
                 if !row.is_deleted() {
                     visible_rows += 1;
@@ -7942,26 +7943,230 @@ fn active_secondary_root(table: &Table, index_no: usize) -> BlockID {
     table.file().active_root_unchecked().secondary_index_roots[index_no]
 }
 
-fn bound_unique_index_no(
-    table: &Table,
+struct BoundUniqueIndexNo<'a> {
+    table: &'a Table,
     index_no: usize,
-) -> UniqueSecondaryIndex<'_, EvictableBufferPool> {
-    table
-        .require_sec_idx(index_no)
-        .unwrap()
-        .bind_unique(active_secondary_root(table, index_no))
-        .unwrap()
+    root: BlockID,
 }
 
-fn bound_non_unique_index_no(
-    table: &Table,
+impl UniqueIndex for BoundUniqueIndexNo<'_> {
+    #[inline]
+    async fn lookup(
+        &self,
+        pool_guard: &PoolGuard,
+        key: &[Val],
+        ts: TrxID,
+    ) -> Result<Option<(RowID, bool)>> {
+        let layout = self.table.layout_snapshot();
+        let index = layout.secondary_index(self.index_no)?;
+        index
+            .bind_unique(self.root)?
+            .lookup(pool_guard, key, ts)
+            .await
+    }
+
+    #[inline]
+    async fn insert_if_not_exists(
+        &self,
+        pool_guard: &PoolGuard,
+        key: &[Val],
+        row_id: RowID,
+        merge_if_match_deleted: bool,
+        ts: TrxID,
+    ) -> Result<IndexInsert> {
+        let layout = self.table.layout_snapshot();
+        let index = layout.secondary_index(self.index_no)?;
+        index
+            .bind_unique(self.root)?
+            .insert_if_not_exists(pool_guard, key, row_id, merge_if_match_deleted, ts)
+            .await
+    }
+
+    #[inline]
+    async fn compare_delete(
+        &self,
+        pool_guard: &PoolGuard,
+        key: &[Val],
+        old_row_id: RowID,
+        ignore_del_mask: bool,
+        ts: TrxID,
+    ) -> Result<bool> {
+        let layout = self.table.layout_snapshot();
+        let index = layout.secondary_index(self.index_no)?;
+        index
+            .bind_unique(self.root)?
+            .compare_delete(pool_guard, key, old_row_id, ignore_del_mask, ts)
+            .await
+    }
+
+    #[inline]
+    async fn compare_exchange(
+        &self,
+        pool_guard: &PoolGuard,
+        key: &[Val],
+        old_row_id: RowID,
+        new_row_id: RowID,
+        ts: TrxID,
+    ) -> Result<crate::index::IndexCompareExchange> {
+        let layout = self.table.layout_snapshot();
+        let index = layout.secondary_index(self.index_no)?;
+        index
+            .bind_unique(self.root)?
+            .compare_exchange(pool_guard, key, old_row_id, new_row_id, ts)
+            .await
+    }
+
+    #[inline]
+    async fn scan_values(
+        &self,
+        pool_guard: &PoolGuard,
+        values: &mut Vec<RowID>,
+        ts: TrxID,
+    ) -> Result<()> {
+        let layout = self.table.layout_snapshot();
+        let index = layout.secondary_index(self.index_no)?;
+        index
+            .bind_unique(self.root)?
+            .scan_values(pool_guard, values, ts)
+            .await
+    }
+}
+
+struct BoundNonUniqueIndexNo<'a> {
+    table: &'a Table,
     index_no: usize,
-) -> NonUniqueSecondaryIndex<'_, EvictableBufferPool> {
-    table
-        .require_sec_idx(index_no)
-        .unwrap()
-        .bind_non_unique(active_secondary_root(table, index_no))
-        .unwrap()
+    root: BlockID,
+}
+
+impl NonUniqueIndex for BoundNonUniqueIndexNo<'_> {
+    #[inline]
+    async fn lookup(
+        &self,
+        pool_guard: &PoolGuard,
+        key: &[Val],
+        res: &mut Vec<RowID>,
+        ts: TrxID,
+    ) -> Result<()> {
+        let layout = self.table.layout_snapshot();
+        let index = layout.secondary_index(self.index_no)?;
+        index
+            .bind_non_unique(self.root)?
+            .lookup(pool_guard, key, res, ts)
+            .await
+    }
+
+    #[inline]
+    async fn lookup_unique(
+        &self,
+        pool_guard: &PoolGuard,
+        key: &[Val],
+        row_id: RowID,
+        ts: TrxID,
+    ) -> Result<Option<bool>> {
+        let layout = self.table.layout_snapshot();
+        let index = layout.secondary_index(self.index_no)?;
+        index
+            .bind_non_unique(self.root)?
+            .lookup_unique(pool_guard, key, row_id, ts)
+            .await
+    }
+
+    #[inline]
+    async fn insert_if_not_exists(
+        &self,
+        pool_guard: &PoolGuard,
+        key: &[Val],
+        row_id: RowID,
+        merge_if_match_deleted: bool,
+        ts: TrxID,
+    ) -> Result<IndexInsert> {
+        let layout = self.table.layout_snapshot();
+        let index = layout.secondary_index(self.index_no)?;
+        index
+            .bind_non_unique(self.root)?
+            .insert_if_not_exists(pool_guard, key, row_id, merge_if_match_deleted, ts)
+            .await
+    }
+
+    #[inline]
+    async fn mask_as_deleted(
+        &self,
+        pool_guard: &PoolGuard,
+        key: &[Val],
+        row_id: RowID,
+        ts: TrxID,
+    ) -> Result<bool> {
+        let layout = self.table.layout_snapshot();
+        let index = layout.secondary_index(self.index_no)?;
+        index
+            .bind_non_unique(self.root)?
+            .mask_as_deleted(pool_guard, key, row_id, ts)
+            .await
+    }
+
+    #[inline]
+    async fn mask_as_active(
+        &self,
+        pool_guard: &PoolGuard,
+        key: &[Val],
+        row_id: RowID,
+        ts: TrxID,
+    ) -> Result<bool> {
+        let layout = self.table.layout_snapshot();
+        let index = layout.secondary_index(self.index_no)?;
+        index
+            .bind_non_unique(self.root)?
+            .mask_as_active(pool_guard, key, row_id, ts)
+            .await
+    }
+
+    #[inline]
+    async fn compare_delete(
+        &self,
+        pool_guard: &PoolGuard,
+        key: &[Val],
+        row_id: RowID,
+        ignore_del_mask: bool,
+        ts: TrxID,
+    ) -> Result<bool> {
+        let layout = self.table.layout_snapshot();
+        let index = layout.secondary_index(self.index_no)?;
+        index
+            .bind_non_unique(self.root)?
+            .compare_delete(pool_guard, key, row_id, ignore_del_mask, ts)
+            .await
+    }
+
+    #[inline]
+    async fn scan_values(
+        &self,
+        pool_guard: &PoolGuard,
+        values: &mut Vec<RowID>,
+        ts: TrxID,
+    ) -> Result<()> {
+        let layout = self.table.layout_snapshot();
+        let index = layout.secondary_index(self.index_no)?;
+        index
+            .bind_non_unique(self.root)?
+            .scan_values(pool_guard, values, ts)
+            .await
+    }
+}
+
+fn bound_unique_index_no(table: &Table, index_no: usize) -> BoundUniqueIndexNo<'_> {
+    BoundUniqueIndexNo {
+        table,
+        index_no,
+        root: active_secondary_root(table, index_no),
+    }
+}
+
+fn bound_non_unique_index_no(table: &Table, index_no: usize) -> BoundNonUniqueIndexNo<'_> {
+    BoundNonUniqueIndexNo {
+        table,
+        index_no,
+        root: active_secondary_root(table, index_no),
+    }
 }
 
 async fn assert_row_in_lwc(
@@ -7991,10 +8196,11 @@ async fn unique_disk_tree_lookup(
     key: &SelectKey,
 ) -> Option<RowID> {
     let root = active_secondary_root(table, key.index_no);
-    let tree = table
-        .storage
-        .secondary_index_runtime(key.index_no)
+    let layout = table.layout_snapshot();
+    let tree = layout
+        .secondary_index(key.index_no)
         .unwrap()
+        .disk_runtime()
         .open_unique_at(root, guards.disk_guard())
         .unwrap();
     tree.lookup(&key.vals).await.unwrap()
@@ -8006,10 +8212,11 @@ async fn non_unique_disk_tree_prefix_scan(
     key: &SelectKey,
 ) -> Vec<RowID> {
     let root = active_secondary_root(table, key.index_no);
-    let tree = table
-        .storage
-        .secondary_index_runtime(key.index_no)
+    let layout = table.layout_snapshot();
+    let tree = layout
+        .secondary_index(key.index_no)
         .unwrap()
+        .disk_runtime()
         .open_non_unique_at(root, guards.disk_guard())
         .unwrap();
     tree.prefix_scan_entries(&key.vals)
@@ -8356,6 +8563,86 @@ fn test_secondary_index_common() {
             assert!(res.unwrap().unwrap_rows().len() == 1);
         }
         drop(engine);
+    })
+}
+
+#[test]
+fn test_checkpoint_cancelled_while_table_metadata_change_active() {
+    smol::block_on(async {
+        let sys = TestSys::new_lightweight_evictable().await;
+        let mut checkpoint_session = sys.engine.try_new_session().unwrap();
+        let metadata_lease = sys.table.begin_metadata_change().await.unwrap();
+
+        let outcome = sys
+            .table
+            .checkpoint(&mut checkpoint_session)
+            .await
+            .expect("checkpoint should return a normal cancellation");
+
+        assert_eq!(
+            outcome,
+            CheckpointOutcome::Cancelled {
+                reason: CheckpointCancelReason::TableMetadataChanging,
+            }
+        );
+        drop(metadata_lease);
+        drop(checkpoint_session);
+        sys.clean_all();
+    })
+}
+
+#[test]
+fn test_runtime_layout_install_retires_removed_index_after_old_snapshot_drops() {
+    smol::block_on(async {
+        let sys = TestSys::new_lightweight_evictable().await;
+        let old_layout = sys.table.layout_snapshot();
+        assert_eq!(old_layout.metadata().active_index_count(), 1);
+
+        let metadata_without_indexes = Arc::new(TableMetadata::new(
+            vec![
+                ColumnSpec::new("id", ValKind::I32, ColumnAttributes::empty()),
+                ColumnSpec::new("name", ValKind::VarByte, ColumnAttributes::empty()),
+            ],
+            vec![],
+        ));
+        let new_layout = TableRuntimeLayout::new(
+            old_layout.generation() + 1,
+            metadata_without_indexes,
+            Vec::<Option<Arc<SecondaryIndex<EvictableBufferPool>>>>::new().into_boxed_slice(),
+        )
+        .unwrap();
+
+        let installed = sys
+            .table
+            .install_runtime_layout(old_layout.generation(), new_layout)
+            .unwrap();
+        assert_eq!(old_layout.metadata().active_index_count(), 1);
+        assert_eq!(installed.metadata().active_index_count(), 0);
+        assert_eq!(sys.table.metadata().active_index_count(), 0);
+        assert!(sys.table.has_retired_secondary_indexes());
+
+        let guards = PoolGuards::builder()
+            .push(PoolRole::Index, sys.engine.index_pool.pool_guard())
+            .build();
+        assert_eq!(
+            sys.table
+                .cleanup_retired_secondary_indexes(&guards)
+                .await
+                .unwrap(),
+            0
+        );
+        drop(old_layout);
+        assert_eq!(
+            sys.table
+                .cleanup_retired_secondary_indexes(&guards)
+                .await
+                .unwrap(),
+            1
+        );
+        assert!(!sys.table.has_retired_secondary_indexes());
+        drop(installed);
+        drop(guards);
+        sys.clean_all();
     })
 }
 

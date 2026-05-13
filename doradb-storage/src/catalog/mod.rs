@@ -24,7 +24,7 @@ use crate::index::{BlockIndex, RowLocation};
 use crate::quiescent::{QuiescentBox, QuiescentGuard};
 use crate::row::ops::SelectKey;
 use crate::row::{RowID, RowPage};
-use crate::table::{ColumnDeletionBuffer, IndexRollback, Table, TableAccess};
+use crate::table::{ColumnDeletionBuffer, IndexRollback, Table, TableAccess, TableRuntimeLayout};
 use crate::trx::TrxID;
 use crate::trx::undo::IndexUndo;
 use dashmap::DashMap;
@@ -59,6 +59,7 @@ pub struct Catalog {
     next_user_obj_id: AtomicU64,
     user_tables: DashMap<TableID, Arc<Table>>,
     pub storage: CatalogStorage,
+    checkpoint_gate: CatalogCheckpointGate,
 }
 
 impl Component for Catalog {
@@ -112,6 +113,7 @@ impl Catalog {
             next_user_obj_id: AtomicU64::new(next_user_obj_id),
             user_tables: DashMap::new(),
             storage,
+            checkpoint_gate: CatalogCheckpointGate::new(),
         })
     }
 
@@ -301,6 +303,16 @@ impl Catalog {
             .map(|table| Arc::clone(table.value()))
     }
 
+    /// Acquires the catalog metadata-change gate for future index DDL.
+    #[inline]
+    #[allow(
+        dead_code,
+        reason = "future index DDL uses this checkpoint exclusion gate"
+    )]
+    pub(crate) async fn begin_metadata_change(&self) -> CatalogMetadataChangeLease<'_> {
+        self.checkpoint_gate.begin_metadata_change().await
+    }
+
     /// Validates that a user-table runtime exists and still admits foreground work.
     #[inline]
     pub(crate) async fn validate_user_table_live(
@@ -411,21 +423,72 @@ impl TableHandle {
             TableHandle::Catalog(table) => table.get_row_page_shared(guards, page_id).await,
         }
     }
+}
+
+/// Operation-local table binding cached by rollback and purge paths.
+pub(crate) struct TableBinding {
+    handle: TableHandle,
+    /// Lazy user-table runtime layout snapshot for index maintenance.
+    ///
+    /// Row-only paths use `handle` directly and never pin a layout. Index
+    /// rollback and purge initialize this once per cached user table, then
+    /// borrow it for repeated same-table index operations.
+    user_layout: Option<Arc<TableRuntimeLayout>>,
+}
+
+impl TableBinding {
+    #[inline]
+    fn new(handle: TableHandle) -> Self {
+        TableBinding {
+            handle,
+            user_layout: None,
+        }
+    }
+
+    /// Returns the plain table runtime handle.
+    #[inline]
+    pub(crate) fn handle(&self) -> &TableHandle {
+        &self.handle
+    }
+
+    /// Roll back one secondary-index undo entry through the bound table runtime.
+    #[inline]
+    pub(crate) async fn rollback_index_entry(
+        &mut self,
+        entry: IndexUndo,
+        guards: &PoolGuards,
+        ts: TrxID,
+    ) -> Result<()> {
+        match &self.handle {
+            TableHandle::User(table) => {
+                let layout = self
+                    .user_layout
+                    .get_or_insert_with(|| table.layout_snapshot());
+                table
+                    .rollback_index_entry_with_layout(layout, entry, guards, ts)
+                    .await
+            }
+            TableHandle::Catalog(table) => table.rollback_index_entry(entry, guards, ts).await,
+        }
+    }
 
     /// Delete one secondary-index entry if it is no longer needed.
     #[inline]
-    pub async fn delete_index(
-        &self,
+    pub(crate) async fn delete_index(
+        &mut self,
         guards: &PoolGuards,
         key: &SelectKey,
         row_id: RowID,
         unique: bool,
         min_active_sts: TrxID,
     ) -> Result<bool> {
-        match self {
+        match &self.handle {
             TableHandle::User(table) => {
+                let layout = self
+                    .user_layout
+                    .get_or_insert_with(|| table.layout_snapshot());
                 table
-                    .accessor()
+                    .accessor_with_borrowed_layout(layout)
                     .delete_index(guards, key, row_id, unique, min_active_sts)
                     .await
             }
@@ -437,26 +500,12 @@ impl TableHandle {
             }
         }
     }
-
-    /// Roll back one secondary-index undo entry through the concrete table runtime.
-    #[inline]
-    pub(crate) async fn rollback_index_entry(
-        &self,
-        entry: IndexUndo,
-        guards: &PoolGuards,
-        ts: TrxID,
-    ) -> Result<()> {
-        match self {
-            TableHandle::User(table) => table.rollback_index_entry(entry, guards, ts).await,
-            TableHandle::Catalog(table) => table.rollback_index_entry(entry, guards, ts).await,
-        }
-    }
 }
 
 /// Per-operation table handle cache used by rollback/recovery paths.
 pub struct TableCache<'a> {
     catalog: &'a Catalog,
-    tables: HashMap<TableID, TableHandle>,
+    tables: HashMap<TableID, TableBinding>,
     missing: HashSet<TableID>,
 }
 
@@ -477,6 +526,20 @@ impl<'a> TableCache<'a> {
     /// positive/negative lookup result.
     #[inline]
     pub async fn get_table_ref(&mut self, table_id: TableID) -> Option<&TableHandle> {
+        self.get_table_binding_mut(table_id)
+            .await
+            .map(|binding| binding.handle())
+    }
+
+    /// Returns cached table binding for given id.
+    ///
+    /// Index maintenance paths use this mutable binding to lazily pin one
+    /// user-table layout snapshot for repeated same-table index operations.
+    #[inline]
+    pub(crate) async fn get_table_binding_mut(
+        &mut self,
+        table_id: TableID,
+    ) -> Option<&mut TableBinding> {
         match self.tables.entry(table_id) {
             Entry::Vacant(vac) => {
                 if self.missing.contains(&table_id) {
@@ -494,8 +557,8 @@ impl<'a> TableCache<'a> {
                 };
                 match loaded {
                     Some(table) => {
-                        let res = vac.insert(table);
-                        Some(&*res)
+                        let res = vac.insert(TableBinding::new(table));
+                        Some(res)
                     }
                     None => {
                         let _ = self.missing.insert(table_id);
@@ -505,7 +568,7 @@ impl<'a> TableCache<'a> {
             }
             Entry::Occupied(occ) => {
                 let res = occ.into_mut();
-                Some(&*res)
+                Some(res)
             }
         }
     }
@@ -518,6 +581,21 @@ impl<'a> TableCache<'a> {
     pub async fn must_get_table(&mut self, table_id: TableID) -> &TableHandle {
         match self.get_table_ref(table_id).await {
             Some(table) => table,
+            None => panic!("table {table_id} not found in catalog"),
+        }
+    }
+
+    /// Returns cached table binding and requires table to exist.
+    ///
+    /// This method is intended for rollback paths where table id in undo log
+    /// must always map to an existing table.
+    #[inline]
+    pub(crate) async fn must_get_table_binding_mut(
+        &mut self,
+        table_id: TableID,
+    ) -> &mut TableBinding {
+        match self.get_table_binding_mut(table_id).await {
+            Some(binding) => binding,
             None => panic!("table {table_id} not found in catalog"),
         }
     }

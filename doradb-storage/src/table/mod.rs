@@ -1,6 +1,7 @@
 mod access;
 mod deletion_buffer;
 mod gc;
+mod layout;
 mod lifecycle;
 mod persistence;
 mod recover;
@@ -11,10 +12,14 @@ mod tests;
 pub(crate) use access::*;
 pub use deletion_buffer::*;
 pub use gc::{SecondaryMemIndexCleanupIndexStats, SecondaryMemIndexCleanupStats};
+pub(crate) use layout::{RetiredSecondaryIndex, TableRuntimeLayout};
 pub use lifecycle::CheckpointCancelReason;
 #[cfg(test)]
 pub(crate) use lifecycle::TableLifecycleState;
-pub(crate) use lifecycle::{CheckpointPublishLease, TableLifecycle};
+pub(crate) use lifecycle::{
+    CheckpointPublishLease, TableCheckpointRootMutationLease, TableLifecycle,
+    TableMetadataChangeLease,
+};
 pub use persistence::*;
 pub use recover::*;
 pub(crate) use rollback::IndexRollback;
@@ -51,6 +56,7 @@ use crate::trx::{
 };
 use crate::value::{PAGE_VAR_LEN_INLINE, Val};
 use error_stack::Report;
+use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::marker::PhantomData;
 use std::ops::Deref;
@@ -120,7 +126,8 @@ pub struct ColumnStorage {
 pub struct Table {
     pub(crate) mem: GenericMemTable<EvictableBufferPool, EvictableBufferPool>,
     pub(crate) storage: ColumnStorage,
-    pub(crate) sec_idx: Box<[Option<SecondaryIndex<EvictableBufferPool>>]>,
+    layout: Mutex<Arc<TableRuntimeLayout>>,
+    retired_secondary_indexes: Mutex<Vec<RetiredSecondaryIndex>>,
     pub(crate) lifecycle: TableLifecycle,
 }
 
@@ -278,8 +285,12 @@ impl SecondaryIndexScopedBuilder {
     }
 
     #[inline]
-    fn publish(self) -> Box<[Option<SecondaryIndex<EvictableBufferPool>>]> {
-        self.staged.into_boxed_slice()
+    fn publish(self) -> Box<[Option<Arc<SecondaryIndex<EvictableBufferPool>>>]> {
+        self.staged
+            .into_iter()
+            .map(|index| index.map(Arc::new))
+            .collect::<Vec<_>>()
+            .into_boxed_slice()
     }
 }
 
@@ -321,7 +332,7 @@ pub(crate) async fn build_dual_tree_secondary_indexes(
     file: Arc<TableFile>,
     disk_pool: QuiescentGuard<ReadonlyBufferPool>,
     index_ts: TrxID,
-) -> Result<Box<[Option<SecondaryIndex<EvictableBufferPool>>]>> {
+) -> Result<Box<[Option<Arc<SecondaryIndex<EvictableBufferPool>>>]>> {
     let mut builder = SecondaryIndexScopedBuilder::new(metadata.index_slot_count());
     for (index_no, index_spec) in metadata.active_indexes() {
         let runtime = match SecondaryDiskTreeRuntime::new(
@@ -396,7 +407,7 @@ impl<D: BufferPool, I: BufferPool> GenericMemTable<D, I> {
                 .await?;
         Ok(GenericMemTable {
             table_id,
-            metadata,
+            metadata: Arc::clone(&metadata),
             mem_pool,
             row_pool_role,
             index_pool_role,
@@ -762,18 +773,6 @@ impl ColumnStorage {
         &self.deletion_buffer
     }
 
-    /// Returns one reusable secondary DiskTree runtime by index number.
-    #[inline]
-    pub(crate) fn secondary_index_runtime(
-        &self,
-        index_no: usize,
-    ) -> Result<&SecondaryDiskTreeRuntime> {
-        self.secondary_indexes
-            .get(index_no)
-            .and_then(Option::as_ref)
-            .ok_or_else(|| missing_secondary_index(index_no, self.secondary_indexes.len()))
-    }
-
     /// Returns the reusable secondary DiskTree runtimes owned by this table.
     #[inline]
     pub(crate) fn secondary_index_runtimes(&self) -> &[Option<SecondaryDiskTreeRuntime>] {
@@ -809,7 +808,7 @@ impl Table {
         .await?;
         let mem = GenericMemTable {
             table_id,
-            metadata,
+            metadata: Arc::clone(&metadata),
             mem_pool: mem_pool.clone(),
             row_pool_role: mem_pool.row_pool_role(),
             index_pool_role: PoolRole::Index,
@@ -822,10 +821,12 @@ impl Table {
             secondary_index_count
         );
         debug_assert_eq!(sec_idx.len(), secondary_index_count);
+        let layout = TableRuntimeLayout::new(0, Arc::clone(&metadata), sec_idx)?;
         Ok(Table {
             mem,
             storage,
-            sec_idx,
+            layout: Mutex::new(Arc::new(layout)),
+            retired_secondary_indexes: Mutex::new(Vec::new()),
             lifecycle: TableLifecycle::new(),
         })
     }
@@ -843,6 +844,24 @@ impl Table {
         &self,
     ) -> std::result::Result<CheckpointPublishLease<'_>, CheckpointCancelReason> {
         self.lifecycle.try_begin_checkpoint_publish()
+    }
+
+    /// Acquires the reversible metadata-change gate for future index DDL.
+    #[inline]
+    #[allow(
+        dead_code,
+        reason = "future index DDL uses this checkpoint exclusion gate"
+    )]
+    pub(crate) async fn begin_metadata_change(&self) -> Result<TableMetadataChangeLease<'_>> {
+        self.lifecycle.begin_metadata_change(self.table_id()).await
+    }
+
+    /// Attempts to enter the checkpoint table-root mutation section.
+    #[inline]
+    pub(crate) fn try_begin_checkpoint_root_mutation(
+        &self,
+    ) -> std::result::Result<TableCheckpointRootMutationLease<'_>, CheckpointCancelReason> {
+        self.lifecycle.try_begin_checkpoint_root_mutation()
     }
 
     /// Starts the irreversible drop lifecycle gate for this table.
@@ -870,20 +889,85 @@ impl Table {
         let Table {
             mem,
             storage: _storage,
-            sec_idx,
+            layout,
+            retired_secondary_indexes,
             lifecycle: _lifecycle,
         } = self;
         let index_pool_guard = guards.index_guard();
-        for index in sec_idx.into_iter().flatten() {
+        for retired in retired_secondary_indexes.into_inner() {
+            let _retired_identity = (retired.index_no, retired.retired_generation);
+            let index = Arc::try_unwrap(retired.index).map_err(|index| {
+                Report::new(InternalError::Generic)
+                    .attach(format!(
+                        "retired secondary index still referenced during runtime destroy: index_no={}, strong_count={}",
+                        index.index_no(),
+                        Arc::strong_count(&index)
+                    ))
+            })?;
+            index.destroy(index_pool_guard).await?;
+        }
+        let layout = Arc::try_unwrap(layout.into_inner()).map_err(|layout| {
+            Report::new(InternalError::Generic)
+                .attach(format!(
+                    "table runtime layout still referenced during runtime destroy: generation={}, strong_count={}",
+                    layout.generation(),
+                    Arc::strong_count(&layout)
+                ))
+        })?;
+        let indexes = layout.into_secondary_indexes();
+        for index in indexes.iter().flatten() {
+            if Arc::strong_count(index) != 1 {
+                return Err(Report::new(InternalError::Generic)
+                    .attach(format!(
+                        "secondary index still referenced during runtime destroy: index_no={}, strong_count={}",
+                        index.index_no(),
+                        Arc::strong_count(index)
+                    ))
+                    .into());
+            }
+        }
+        for index in indexes.into_iter().flatten() {
+            let index = Arc::try_unwrap(index).map_err(|index| {
+                Report::new(InternalError::Generic)
+                    .attach(format!(
+                        "secondary index still referenced during runtime destroy: index_no={}, strong_count={}",
+                        index.index_no(),
+                        Arc::strong_count(&index)
+                    ))
+            })?;
             index.destroy(index_pool_guard).await?;
         }
         mem.destroy(guards).await
     }
 
-    /// Build a lightweight operation accessor over this table runtime.
+    /// Build a lightweight operation accessor over an already captured layout.
     #[inline]
-    pub(crate) fn accessor(&self) -> HybridTableAccessor<'_> {
-        HybridTableAccessor::from(self)
+    pub(crate) fn accessor_with_layout(
+        &self,
+        layout: Arc<TableRuntimeLayout>,
+    ) -> HybridTableAccessor<'_> {
+        HybridTableAccessor::new_user(self, layout)
+    }
+
+    /// Build a lightweight operation accessor over an externally pinned layout.
+    #[inline]
+    pub(crate) fn accessor_with_borrowed_layout<'a>(
+        &'a self,
+        layout: &'a TableRuntimeLayout,
+    ) -> HybridTableAccessor<'a> {
+        HybridTableAccessor::new_user_borrowed(self, layout)
+    }
+
+    /// Capture the current user-table runtime layout.
+    #[inline]
+    pub(crate) fn layout_snapshot(&self) -> Arc<TableRuntimeLayout> {
+        Arc::clone(&self.layout.lock())
+    }
+
+    /// Returns a current-layout metadata owner for this table.
+    #[inline]
+    pub fn metadata(&self) -> Arc<TableMetadata> {
+        Arc::clone(self.layout_snapshot().metadata_arc())
     }
 
     /// Bind one active root observation under a transaction read proof.
@@ -912,21 +996,131 @@ impl Table {
         self.storage.deletion_buffer()
     }
 
-    /// Returns the user-table composite secondary-index array.
+    /// Returns whether any retired secondary-index runtimes are queued.
     #[inline]
-    pub(crate) fn sec_idx(&self) -> &[Option<SecondaryIndex<EvictableBufferPool>>] {
-        &self.sec_idx
+    #[allow(
+        dead_code,
+        reason = "future index DDL tests and maintenance use this helper"
+    )]
+    pub(crate) fn has_retired_secondary_indexes(&self) -> bool {
+        !self.retired_secondary_indexes.lock().is_empty()
     }
 
+    /// Installs a new user-table runtime layout for future index DDL paths.
     #[inline]
-    pub(crate) fn require_sec_idx(
+    #[allow(
+        dead_code,
+        reason = "future index DDL uses this runtime install boundary"
+    )]
+    pub(crate) fn install_runtime_layout(
         &self,
-        index_no: usize,
-    ) -> Result<&SecondaryIndex<EvictableBufferPool>> {
-        self.sec_idx
-            .get(index_no)
-            .and_then(Option::as_ref)
-            .ok_or_else(|| missing_secondary_index(index_no, self.sec_idx.len()))
+        expected_generation: u64,
+        new_layout: TableRuntimeLayout,
+    ) -> Result<Arc<TableRuntimeLayout>> {
+        new_layout.validate()?;
+        if new_layout.generation() <= expected_generation {
+            return Err(Report::new(InternalError::Generic)
+                .attach(format!(
+                    "new layout generation must advance: expected_generation={}, new_generation={}",
+                    expected_generation,
+                    new_layout.generation()
+                ))
+                .into());
+        }
+
+        let new_layout = Arc::new(new_layout);
+        let old_layout = {
+            let mut guard = self.layout.lock();
+            if guard.generation() != expected_generation {
+                return Err(Report::new(InternalError::Generic)
+                    .attach(format!(
+                        "layout generation mismatch: expected={}, actual={}",
+                        expected_generation,
+                        guard.generation()
+                    ))
+                    .into());
+            }
+            let old_layout = Arc::clone(&guard);
+            *guard = Arc::clone(&new_layout);
+            old_layout
+        };
+
+        let mut retired = Vec::new();
+        for (index_no, old_index) in old_layout.secondary_indexes().iter().enumerate() {
+            let Some(old_index) = old_index else {
+                continue;
+            };
+            let unchanged = new_layout
+                .secondary_indexes()
+                .get(index_no)
+                .and_then(Option::as_ref)
+                .is_some_and(|new_index| Arc::ptr_eq(old_index, new_index));
+            if !unchanged {
+                retired.push(RetiredSecondaryIndex {
+                    index_no,
+                    retired_generation: old_layout.generation(),
+                    index: Arc::clone(old_index),
+                });
+            }
+        }
+        if !retired.is_empty() {
+            self.retired_secondary_indexes.lock().extend(retired);
+        }
+        Ok(new_layout)
+    }
+
+    /// Destroys retired secondary-index runtimes whose old layout snapshots drained.
+    #[allow(
+        dead_code,
+        reason = "future index DDL and maintenance use this cleanup primitive"
+    )]
+    pub(crate) async fn cleanup_retired_secondary_indexes(
+        &self,
+        guards: &PoolGuards,
+    ) -> Result<usize> {
+        let mut ready = Vec::new();
+        {
+            let mut queued = self.retired_secondary_indexes.lock();
+            let mut pending = Vec::with_capacity(queued.len());
+            for retired in queued.drain(..) {
+                if Arc::strong_count(&retired.index) > 1 {
+                    pending.push(retired);
+                } else {
+                    ready.push(retired);
+                }
+            }
+            *queued = pending;
+        }
+
+        let index_pool_guard = guards.index_guard();
+        let mut cleaned = 0usize;
+        while let Some(retired) = ready.pop() {
+            let index_no = retired.index_no;
+            let retired_generation = retired.retired_generation;
+            let index = match Arc::try_unwrap(retired.index) {
+                Ok(index) => index,
+                Err(index) => {
+                    self.retired_secondary_indexes
+                        .lock()
+                        .push(RetiredSecondaryIndex {
+                            index_no,
+                            retired_generation,
+                            index,
+                        });
+                    continue;
+                }
+            };
+            if let Err(err) = index.destroy(index_pool_guard).await {
+                // The failing index has been consumed by destroy. Keep the
+                // remaining ready entries queued so a later maintenance pass
+                // can continue after the caller handles the error.
+                self.retired_secondary_indexes.lock().extend(ready);
+                return Err(err);
+            }
+            let _destroyed_identity = (index_no, retired_generation);
+            cleaned += 1;
+        }
+        Ok(cleaned)
     }
 
     /// Returns the readonly disk buffer pool used by persisted table data.
@@ -1038,6 +1232,7 @@ impl Table {
 
     async fn build_lwc_blocks(
         &self,
+        metadata: &TableMetadata,
         guards: &PoolGuards,
         cutoff_ts: TrxID,
         frozen_pages: &[FrozenPage],
@@ -1051,7 +1246,6 @@ impl Table {
         }
         let mut lwc_blocks = Vec::new();
         if !frozen_pages.is_empty() {
-            let metadata = self.metadata();
             let mut builder = LwcBuilder::new(metadata);
             let mut current_start: RowID = 0;
             let mut current_end: RowID = 0;
@@ -1249,18 +1443,19 @@ impl Table {
     #[inline]
     fn recover_row_insert_to_page(
         &self,
+        metadata: &TableMetadata,
         page_guard: &mut PageExclusiveGuard<RowPage>,
         row_id: RowID,
         cols: &[Val],
         cts: TrxID,
     ) -> Recover {
         let (ctx, page) = page_guard.ctx_and_page_mut();
-        debug_assert!(self.metadata().col_count() == page.header.col_count as usize);
+        debug_assert!(metadata.col_count() == page.header.col_count as usize);
         debug_assert!(cols.len() == page.header.col_count as usize);
         let row_idx = page.row_idx(row_id);
         // Insert log should always be located to an empty slot.
         debug_assert!(ctx.recover().unwrap().is_vacant(row_idx));
-        let var_len = var_len_for_insert(self.metadata(), cols);
+        let var_len = var_len_for_insert(metadata, cols);
         let (var_offset, var_end) = if let Some(var_offset) = page.request_free_space(var_len) {
             (var_offset, var_offset + var_len)
         } else {
@@ -1273,7 +1468,6 @@ impl Table {
         let row_idx = page.row_idx(row_id);
         let mut row = page.row_mut_exclusive(row_idx, var_offset, var_end);
         debug_assert!(row.is_deleted()); // before recovery, this row should be initialized as deleted.
-        let metadata = self.metadata();
         for (user_col_idx, user_col) in cols.iter().enumerate() {
             row.update_col(metadata, user_col_idx, user_col, false);
         }
@@ -1283,16 +1477,20 @@ impl Table {
     #[inline]
     async fn recover_index_insert(
         &self,
+        layout: &TableRuntimeLayout,
         guards: &PoolGuards,
         key: SelectKey,
         row_id: RowID,
         cts: TrxID,
     ) -> Result<RecoverIndex> {
-        if self.metadata().require_index_spec(key.index_no)?.unique() {
-            self.recover_unique_index_insert(guards, key, row_id, cts)
+        let index = layout.secondary_index(key.index_no)?;
+        let index_unique = layout.metadata().require_index_spec(key.index_no)?.unique();
+        debug_assert_eq!(index.is_unique(), index_unique);
+        if index_unique {
+            self.recover_unique_index_insert(index.unique_mem()?, guards, key, row_id, cts)
                 .await
         } else {
-            self.recover_non_unique_index_insert(guards, key, row_id)
+            self.recover_non_unique_index_insert(index.non_unique_mem()?, guards, key, row_id)
                 .await
         }
     }
@@ -1300,14 +1498,19 @@ impl Table {
     #[inline]
     async fn recover_index_delete(
         &self,
+        layout: &TableRuntimeLayout,
         guards: &PoolGuards,
         key: SelectKey,
         row_id: RowID,
     ) -> Result<RecoverIndex> {
-        if self.metadata().require_index_spec(key.index_no)?.unique() {
-            self.recover_unique_index_delete(guards, key, row_id).await
+        let index = layout.secondary_index(key.index_no)?;
+        let index_unique = layout.metadata().require_index_spec(key.index_no)?.unique();
+        debug_assert_eq!(index.is_unique(), index_unique);
+        if index_unique {
+            self.recover_unique_index_delete(index.unique_mem()?, guards, key, row_id)
+                .await
         } else {
-            self.recover_non_unique_index_delete(guards, key, row_id)
+            self.recover_non_unique_index_delete(index.non_unique_mem()?, guards, key, row_id)
                 .await
         }
     }
@@ -1315,6 +1518,7 @@ impl Table {
     #[inline]
     fn recover_row_update_to_page(
         &self,
+        metadata: &TableMetadata,
         page_guard: &mut PageExclusiveGuard<RowPage>,
         row_id: RowID,
         cols: &[UpdateCol],
@@ -1359,7 +1563,6 @@ impl Table {
         let mut row = page.row_mut_exclusive(row_idx, var_offset, var_end);
         debug_assert_eq!(row_id, row.row_id());
 
-        let metadata = self.metadata();
         let disable_index = index_change_cols.is_none();
         if disable_index {
             for uc in cols {
@@ -1387,6 +1590,7 @@ impl Table {
     #[inline]
     fn recover_row_delete_to_page(
         &self,
+        metadata: &TableMetadata,
         page_guard: &mut PageExclusiveGuard<RowPage>,
         row_id: RowID,
         cts: TrxID,
@@ -1402,7 +1606,6 @@ impl Table {
         }
         ctx.recover_mut().unwrap().update_at(row_idx, cts);
         page.set_deleted_exclusive(row_idx, true);
-        let metadata = self.metadata();
         if let Some(index_cols) = cols {
             // save index columns for index update.
             let row = page.row(row_idx);
@@ -1417,12 +1620,12 @@ impl Table {
     #[inline]
     async fn recover_unique_index_insert(
         &self,
+        index: &UniqueMemIndex<EvictableBufferPool>,
         guards: &PoolGuards,
         key: SelectKey,
         row_id: RowID,
         cts: TrxID,
     ) -> Result<RecoverIndex> {
-        let index = self.require_sec_idx(key.index_no)?.unique_mem()?;
         let index_pool_guard = self.index_pool_guard(guards);
         loop {
             match index
@@ -1480,11 +1683,11 @@ impl Table {
     #[inline]
     async fn recover_non_unique_index_insert(
         &self,
+        index: &NonUniqueMemIndex<EvictableBufferPool>,
         guards: &PoolGuards,
         key: SelectKey,
         row_id: RowID,
     ) -> Result<RecoverIndex> {
-        let index = self.require_sec_idx(key.index_no)?.non_unique_mem()?;
         let index_pool_guard = self.index_pool_guard(guards);
         let res = index
             .insert_if_not_exists(index_pool_guard, &key.vals, row_id, true, MIN_SNAPSHOT_TS)
@@ -1496,11 +1699,11 @@ impl Table {
     #[inline]
     async fn recover_unique_index_delete(
         &self,
+        index: &UniqueMemIndex<EvictableBufferPool>,
         guards: &PoolGuards,
         key: SelectKey,
         row_id: RowID,
     ) -> Result<RecoverIndex> {
-        let index = self.require_sec_idx(key.index_no)?.unique_mem()?;
         let index_pool_guard = self.index_pool_guard(guards);
         if !index
             .compare_delete(index_pool_guard, &key.vals, row_id, true, MIN_SNAPSHOT_TS)
@@ -1516,11 +1719,11 @@ impl Table {
     #[inline]
     async fn recover_non_unique_index_delete(
         &self,
+        index: &NonUniqueMemIndex<EvictableBufferPool>,
         guards: &PoolGuards,
         key: SelectKey,
         row_id: RowID,
     ) -> Result<RecoverIndex> {
-        let index = self.require_sec_idx(key.index_no)?.non_unique_mem()?;
         let index_pool_guard = self.index_pool_guard(guards);
         if !index
             .compare_delete(index_pool_guard, &key.vals, row_id, true, MIN_SNAPSHOT_TS)

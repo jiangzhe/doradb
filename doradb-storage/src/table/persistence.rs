@@ -14,7 +14,7 @@ use crate::index::{ColumnBlockIndex, ColumnDeleteDeltaPatch, ColumnLeafEntry};
 use crate::lwc::PersistedLwcBlock;
 use crate::row::RowID;
 use crate::session::Session;
-use crate::table::{CheckpointCancelReason, Table};
+use crate::table::{CheckpointCancelReason, Table, TableRuntimeLayout};
 use crate::trx::TrxID;
 use crate::trx::redo::DDLRedo;
 use crate::value::{Val, ValKind, ValType};
@@ -360,6 +360,7 @@ impl Table {
     async fn apply_deletion_checkpoint(
         &self,
         mutable_file: &mut MutableTableFile,
+        metadata: &TableMetadata,
         secondary_sidecar: &mut SecondaryCheckpointSidecar,
         cutoff_ts: TrxID,
         checkpoint_ts: TrxID,
@@ -515,6 +516,7 @@ impl Table {
                 &group.entry,
                 &row_ids,
                 &new_deltas,
+                metadata,
                 secondary_sidecar,
             )
             .await?;
@@ -549,6 +551,7 @@ impl Table {
     async fn apply_secondary_checkpoint_sidecar(
         &self,
         mutable_file: &mut MutableTableFile,
+        layout: &TableRuntimeLayout,
         sidecar: &mut SecondaryCheckpointSidecar,
         checkpoint_ts: TrxID,
     ) -> Result<()> {
@@ -565,7 +568,7 @@ impl Table {
             }
         }
 
-        let metadata = self.metadata();
+        let metadata = layout.metadata();
         if mutable_file.secondary_index_roots().len() != metadata.index_slot_count() {
             return Err(Report::new(DataIntegrityError::InvalidRootInvariant)
                 .attach(format!(
@@ -591,7 +594,7 @@ impl Table {
                 continue;
             }
             let old_root = mutable_file.secondary_index_root(index_no)?;
-            let runtime = self.storage.secondary_index_runtime(index_no)?;
+            let runtime = layout.secondary_index(index_no)?.disk_runtime();
             let new_root = match index_sidecar {
                 SecondaryIndexSidecar::Unique { puts, deletes, .. } => {
                     // Use one writer per affected index so same-run puts and
@@ -653,6 +656,7 @@ impl Table {
         entry: &ColumnLeafEntry,
         row_ids: &[RowID],
         delete_deltas: &[u32],
+        metadata: &TableMetadata,
         secondary_sidecar: &mut SecondaryCheckpointSidecar,
     ) -> Result<()> {
         if secondary_sidecar.indexes.is_empty() || delete_deltas.is_empty() {
@@ -706,7 +710,6 @@ impl Table {
                 .into());
         }
 
-        let metadata = self.metadata();
         let index_read_sets = secondary_sidecar
             .indexes
             .iter()
@@ -813,6 +816,12 @@ impl TablePersistence for Table {
         if let CheckpointReadiness::Delayed { reason } = self.checkpoint_readiness(session) {
             return Ok(CheckpointOutcome::Delayed { reason });
         }
+        let root_mutation_lease = match self.try_begin_checkpoint_root_mutation() {
+            Ok(lease) => lease,
+            Err(reason) => return Ok(CheckpointOutcome::Cancelled { reason }),
+        };
+        let layout = self.layout_snapshot();
+        let metadata = layout.metadata();
 
         // Step 1: claim one mutable root snapshot and initialize checkpoint
         // boundaries. This is checkpoint-internal current-root access after
@@ -820,7 +829,7 @@ impl TablePersistence for Table {
         let mut mutable_file =
             MutableTableFile::fork(table_file, session.engine().table_fs.background_writes());
         let pivot_row_id = mutable_file.root().pivot_row_id;
-        let mut secondary_sidecar = SecondaryCheckpointSidecar::new(self.metadata())?;
+        let mut secondary_sidecar = SecondaryCheckpointSidecar::new(metadata)?;
 
         // Step 2: collect frozen pages and refresh checkpoint cutoff after any
         // stabilization wait. The entry readiness check is enough for root
@@ -854,14 +863,15 @@ impl TablePersistence for Table {
             .map(|page| page.end_row_id)
             .unwrap_or(pivot_row_id);
         let mut collect_secondary_row = |page: &crate::row::RowPage, row_idx, row_id| {
-            secondary_sidecar.add_data_row(self.metadata(), page, row_idx, row_id)
+            secondary_sidecar.add_data_row(metadata, page, row_idx, row_id)
         };
-        let collect_visible_row = (!self.metadata().index_specs.is_empty()).then_some(
+        let collect_visible_row = (!metadata.index_specs.is_empty()).then_some(
             &mut collect_secondary_row
                 as &mut dyn FnMut(&crate::row::RowPage, usize, RowID) -> Result<()>,
         );
         let (mut lwc_blocks, heap_redo_start_ts) = match self
             .build_lwc_blocks(
+                metadata,
                 session.pool_guards(),
                 cutoff_ts,
                 &frozen_pages,
@@ -914,6 +924,7 @@ impl TablePersistence for Table {
         if let Err(err) = self
             .apply_deletion_checkpoint(
                 &mut mutable_file,
+                metadata,
                 &mut secondary_sidecar,
                 cutoff_ts,
                 checkpoint_ts,
@@ -930,6 +941,7 @@ impl TablePersistence for Table {
         if let Err(err) = self
             .apply_secondary_checkpoint_sidecar(
                 &mut mutable_file,
+                &layout,
                 &mut secondary_sidecar,
                 checkpoint_ts,
             )
@@ -988,6 +1000,7 @@ impl TablePersistence for Table {
             return Err(poison.into());
         }
         drop(publish_lease);
+        drop(root_mutation_lease);
         Ok(CheckpointOutcome::Published { checkpoint_ts })
     }
 }
