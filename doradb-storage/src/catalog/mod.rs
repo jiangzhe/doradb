@@ -432,7 +432,12 @@ pub(crate) struct TableBinding {
     ///
     /// Row-only paths use `handle` directly and never pin a layout. Index
     /// rollback and purge initialize this once per cached user table, then
-    /// borrow it for repeated same-table index operations.
+    /// borrow it for repeated same-table index operations. A purge cycle may
+    /// cache a layout before a later DROP INDEX publishes a new inactive slot;
+    /// that is safe only because RFC 0018 keeps `index_no` stable and
+    /// non-reused. If the cached/current layout sees the slot inactive, index
+    /// purge is a no-op; if it still sees the old slot active, it can only touch
+    /// the old runtime/root identity for that same stable slot.
     user_layout: Option<Arc<TableRuntimeLayout>>,
 }
 

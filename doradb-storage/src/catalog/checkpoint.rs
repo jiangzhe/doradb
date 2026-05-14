@@ -148,10 +148,14 @@ impl CatalogCheckpointGate {
             listener!(self.changed => listener);
             {
                 let state = self.state.lock();
-                if state.metadata_change == CatalogMetadataChangePhase::Pending
-                    && pending.is_some()
-                    && !state.checkpoint_active
-                {
+                let can_retry = match state.metadata_change {
+                    CatalogMetadataChangePhase::Open => true,
+                    CatalogMetadataChangePhase::Pending => {
+                        pending.is_some() && !state.checkpoint_active
+                    }
+                    CatalogMetadataChangePhase::Active => false,
+                };
+                if can_retry {
                     continue;
                 }
             }
@@ -457,6 +461,40 @@ mod tests {
             drop(metadata_fut);
             drop(checkpoint_lease);
             let _checkpoint_lease = gate.begin_checkpoint().await;
+        });
+    }
+
+    #[test]
+    fn test_catalog_second_metadata_change_completes_after_pending_waiter_cancelled() {
+        smol::block_on(async {
+            let gate = CatalogCheckpointGate::new();
+            let checkpoint_lease = gate.begin_checkpoint().await;
+            let mut pending_owner = Box::pin(gate.begin_metadata_change());
+            let mut second_waiter = Box::pin(gate.begin_metadata_change());
+
+            assert!(matches!(
+                futures::poll!(pending_owner.as_mut()),
+                std::task::Poll::Pending
+            ));
+            assert!(matches!(
+                futures::poll!(second_waiter.as_mut()),
+                std::task::Poll::Pending
+            ));
+
+            drop(pending_owner);
+            drop(checkpoint_lease);
+
+            let waiter = async {
+                let metadata_lease = second_waiter.await;
+                drop(metadata_lease);
+            };
+            smol::future::or(waiter, async {
+                smol::Timer::after(std::time::Duration::from_secs(1)).await;
+                panic!(
+                    "second metadata-change waiter failed to acquire after pending cancellation"
+                );
+            })
+            .await;
         });
     }
 }

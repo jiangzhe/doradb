@@ -816,23 +816,28 @@ impl TablePersistence for Table {
         if let CheckpointReadiness::Delayed { reason } = self.checkpoint_readiness(session) {
             return Ok(CheckpointOutcome::Delayed { reason });
         }
+        #[cfg(test)]
+        super::tests::run_test_checkpoint_after_readiness_hook().await;
         let root_mutation_lease = match self.try_begin_checkpoint_root_mutation() {
             Ok(lease) => lease,
             Err(reason) => return Ok(CheckpointOutcome::Cancelled { reason }),
         };
+        if let CheckpointReadiness::Delayed { reason } = self.checkpoint_readiness(session) {
+            return Ok(CheckpointOutcome::Delayed { reason });
+        }
         let layout = self.layout_snapshot();
         let metadata = layout.metadata();
 
         // Step 1: claim one mutable root snapshot and initialize checkpoint
-        // boundaries. This is checkpoint-internal current-root access after
-        // the liveness preflight above.
+        // boundaries. This is checkpoint-internal current-root access after the
+        // post-lease liveness check above.
         let mut mutable_file =
             MutableTableFile::fork(table_file, session.engine().table_fs.background_writes());
         let pivot_row_id = mutable_file.root().pivot_row_id;
         let mut secondary_sidecar = SecondaryCheckpointSidecar::new(metadata)?;
 
         // Step 2: collect frozen pages and refresh checkpoint cutoff after any
-        // stabilization wait. The entry readiness check is enough for root
+        // stabilization wait. The post-lease readiness check is enough for root
         // liveness because the GC horizon used by the check only moves forward.
         let pool_guards = session.pool_guards().clone();
         let (frozen_pages, next_heap_redo_start_ts) = self.collect_frozen_pages(&pool_guards).await;

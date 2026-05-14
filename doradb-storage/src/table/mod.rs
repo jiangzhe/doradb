@@ -981,6 +981,10 @@ impl Table {
 
     /// Capture an owned table-root snapshot for this table.
     #[inline]
+    #[allow(
+        dead_code,
+        reason = "proof-bound root snapshot tests and future read paths use this helper"
+    )]
     pub(crate) fn root_snapshot<'ctx>(
         &self,
         proof: &TrxReadProof<'ctx>,
@@ -1037,6 +1041,15 @@ impl Table {
                         "layout generation mismatch: expected={}, actual={}",
                         expected_generation,
                         guard.generation()
+                    ))
+                    .into());
+            }
+            if new_layout.index_slot_count() < guard.index_slot_count() {
+                return Err(Report::new(InternalError::Generic)
+                    .attach(format!(
+                        "new layout must not shrink sparse index slots: old_slots={}, new_slots={}",
+                        guard.index_slot_count(),
+                        new_layout.index_slot_count()
                     ))
                     .into());
             }

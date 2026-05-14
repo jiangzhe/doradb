@@ -409,6 +409,11 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
         let Some(storage) = self.storage else {
             return Ok(SecondaryIndexView::catalog(ctx.sts()));
         };
+        // User accessors pin the metadata/runtime layout, but intentionally
+        // bind secondary DiskTree operations to the latest proof-gated root.
+        // Checkpoint publication may advance roots without changing layout
+        // shape. Layout-changing DDL must preserve sparse slot numbers and
+        // exclude foreground users before publishing an incompatible layout.
         let proof = ctx.read_proof();
         let root = storage.with_active_root(&proof, |root| {
             root.secondary_index_roots
@@ -424,6 +429,9 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
         let Some(storage) = self.storage else {
             return Ok(SecondaryIndexView::catalog(ts));
         };
+        // Unchecked internal callers share the same layout/root compatibility
+        // contract as proof-gated foreground reads. Purge additionally treats
+        // inactive layout slots as no-ops before reaching this binding point.
         let root = storage
             .file()
             .active_root_unchecked()

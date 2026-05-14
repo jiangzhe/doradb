@@ -1,4 +1,4 @@
-use super::{Table, TableRootSnapshot};
+use super::{Table, TableRootSnapshot, TableRuntimeLayout};
 use crate::buffer::{BufferPool, EvictableBufferPool, PoolGuard, PoolGuards};
 use crate::catalog::TableMetadata;
 use crate::error::{DataIntegrityError, Error, FileKind, InternalError, OperationError, Result};
@@ -14,6 +14,7 @@ use crate::session::Session;
 use crate::trx::{TrxID, TrxReadProof};
 use crate::value::Val;
 use error_stack::Report;
+use std::sync::Arc;
 
 #[inline]
 fn invalid_lwc_payload(
@@ -57,6 +58,8 @@ pub struct SecondaryMemIndexCleanupIndexStats {
 
 struct MemIndexCleanupSnapshot<'ctx> {
     root: TableRootSnapshot<'ctx>,
+    root_metadata: Arc<TableMetadata>,
+    layout: Arc<TableRuntimeLayout>,
     min_active_sts: TrxID,
 }
 
@@ -89,6 +92,16 @@ impl MemIndexCleanupSnapshot<'_> {
     #[inline]
     fn secondary_index_root(&self, index_no: usize) -> Result<BlockID> {
         self.root.secondary_index_root(index_no)
+    }
+
+    #[inline]
+    fn root_index_is_active(&self, index_no: usize) -> bool {
+        self.root_metadata.index_spec(index_no).is_some()
+    }
+
+    #[inline]
+    fn layout(&self) -> &TableRuntimeLayout {
+        &self.layout
     }
 }
 
@@ -200,8 +213,17 @@ impl Table {
         min_active_sts: TrxID,
         proof: &TrxReadProof<'ctx>,
     ) -> Result<MemIndexCleanupSnapshot<'ctx>> {
+        let layout = self.layout_snapshot();
+        let (root, root_metadata) = self.with_active_root(proof, |root| {
+            (
+                TableRootSnapshot::from_active_root(root, proof),
+                Arc::clone(&root.metadata),
+            )
+        });
         Ok(MemIndexCleanupSnapshot {
-            root: self.root_snapshot(proof)?,
+            root,
+            root_metadata,
+            layout,
             min_active_sts,
         })
     }
@@ -215,7 +237,7 @@ impl Table {
     ) -> Result<SecondaryMemIndexCleanupStats> {
         debug_assert!(snapshot.deletion_cutoff_ts() <= snapshot.root_trx_id());
 
-        let layout = self.layout_snapshot();
+        let layout = snapshot.layout();
         let metadata = layout.metadata();
         let column_index = self.cleanup_column_index(guards, snapshot);
         let index_pool_guard = self.index_pool_guard(guards);
@@ -234,6 +256,9 @@ impl Table {
 
         for (_, index) in layout.active_secondary_indexes() {
             let index_no = index.index_no();
+            if !snapshot.root_index_is_active(index_no) {
+                continue;
+            }
             let secondary_root = snapshot.secondary_index_root(index_no)?;
             let mut index_stats =
                 SecondaryMemIndexCleanupIndexStats::new(index_no, index.is_unique());

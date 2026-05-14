@@ -45,18 +45,25 @@ use crate::trx::ver_map::RowPageState;
 use crate::trx::{ActiveTrx, MAX_SNAPSHOT_TS, TrxID};
 use crate::value::{Val, ValKind};
 use error_stack::Report;
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::fs::OpenOptions;
+use std::future::Future;
 use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 use tempfile::TempDir;
 
+type CheckpointAfterReadinessHook =
+    Box<dyn FnOnce() -> Pin<Box<dyn Future<Output = ()> + 'static>> + 'static>;
+
 thread_local! {
     static TEST_FORCE_LWC_BUILD_ERROR: Cell<bool> = const { Cell::new(false) };
     static TEST_FORCE_SECONDARY_SIDECAR_ERROR: Cell<bool> = const { Cell::new(false) };
     static TEST_FORCE_POST_PUBLISH_CHECKPOINT_ERROR: Cell<bool> = const { Cell::new(false) };
+    static TEST_CHECKPOINT_AFTER_READINESS_HOOK: RefCell<Option<CheckpointAfterReadinessHook>> =
+        const { RefCell::new(None) };
 }
 
 const LIGHTWEIGHT_TEST_BUFFER_BYTES: usize = 16 * 1024 * 1024;
@@ -92,6 +99,26 @@ pub(super) fn set_test_force_post_publish_checkpoint_error(enabled: bool) {
 
 pub(super) fn test_force_post_publish_checkpoint_error_enabled() -> bool {
     TEST_FORCE_POST_PUBLISH_CHECKPOINT_ERROR.with(|flag| flag.get())
+}
+
+fn set_test_checkpoint_after_readiness_hook<F, Fut>(hook: F)
+where
+    F: FnOnce() -> Fut + 'static,
+    Fut: Future<Output = ()> + 'static,
+{
+    TEST_CHECKPOINT_AFTER_READINESS_HOOK.with(|slot| {
+        let old = slot
+            .borrow_mut()
+            .replace(Box::new(move || Box::pin(hook())));
+        assert!(old.is_none(), "checkpoint readiness hook already installed");
+    });
+}
+
+pub(super) async fn run_test_checkpoint_after_readiness_hook() {
+    let hook = TEST_CHECKPOINT_AFTER_READINESS_HOOK.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook().await;
+    }
 }
 
 fn assert_table_data_integrity(
@@ -292,7 +319,6 @@ fn test_mvcc_insert_normal() {
         }
 
         drop(session);
-        sys.clean_all();
     });
 }
 
@@ -339,8 +365,6 @@ fn test_mvcc_insert_dup_key() {
             trx1.commit().await.unwrap();
             drop(session);
         }
-
-        sys.clean_all();
     });
 }
 
@@ -405,7 +429,6 @@ fn test_mvcc_update_normal() {
 
             let _ = trx.commit().await.unwrap();
         }
-        sys.clean_all();
     });
 }
 
@@ -442,7 +465,6 @@ fn test_mvcc_delete_normal() {
             trx = sys.trx_select_not_found(trx, &k1).await;
             let _ = trx.commit().await.unwrap();
         }
-        sys.clean_all();
     });
 }
 
@@ -472,7 +494,6 @@ fn test_column_delete_basic() {
 
         drop(reader_session);
         drop(session);
-        sys.clean_all();
     });
 }
 
@@ -511,7 +532,6 @@ fn test_lwc_read_uses_readonly_buffer_pool() {
 
         drop(reader_session);
         drop(session);
-        sys.clean_all();
     });
 }
 
@@ -562,9 +582,7 @@ fn test_find_row_returns_resolved_lwc_page_location() {
             RowLocation::NotFound => panic!("row should exist"),
         }
         trx.commit().await.unwrap();
-
         drop(session);
-        sys.clean_all();
     });
 }
 
@@ -613,9 +631,7 @@ fn test_lwc_select_surfaces_persisted_corruption() {
             DataIntegrityError::ChecksumMismatch,
         );
         trx.rollback().await.unwrap();
-
         drop(session);
-        sys.clean_all();
     });
 }
 
@@ -669,7 +685,6 @@ fn test_lwc_select_surfaces_column_block_index_row_metadata_corruption() {
         trx.rollback().await.unwrap();
 
         drop(session);
-        sys.clean_all();
     });
 }
 
@@ -723,7 +738,6 @@ fn test_lwc_select_surfaces_column_block_index_zero_block_id_corruption() {
         trx.rollback().await.unwrap();
 
         drop(session);
-        sys.clean_all();
     });
 }
 
@@ -777,7 +791,6 @@ fn test_lwc_select_surfaces_row_shape_fingerprint_mismatch_corruption() {
         trx.rollback().await.unwrap();
 
         drop(session);
-        sys.clean_all();
     });
 }
 
@@ -835,7 +848,6 @@ fn test_column_delete_rollback() {
 
         drop(reader_session);
         drop(session);
-        sys.clean_all();
     });
 }
 
@@ -875,7 +887,6 @@ fn test_column_delete_rollback_after_checkpoint() {
         drop(reader_session);
         drop(checkpoint_session);
         drop(session);
-        sys.clean_all();
     });
 }
 
@@ -907,7 +918,6 @@ fn test_column_delete_write_conflict() {
         trx1.rollback().await.unwrap();
 
         drop(session);
-        sys.clean_all();
     });
 }
 
@@ -948,7 +958,6 @@ fn test_column_delete_mvcc_visibility() {
         drop(delete_session);
         drop(reader_session);
         drop(session);
-        sys.clean_all();
     });
 }
 
@@ -986,7 +995,6 @@ fn test_lwc_delete_unique_conflicts_when_delete_committed_after_snapshot() {
 
         drop(writer_session);
         drop(session);
-        sys.clean_all();
     });
 }
 
@@ -1081,7 +1089,6 @@ fn test_lwc_update_unique_same_key_reinserts_hot_and_preserves_old_snapshot() {
 
         drop(old_reader_session);
         drop(session);
-        sys.clean_all();
     });
 }
 
@@ -1129,7 +1136,6 @@ fn test_lwc_update_unique_conflicts_when_delete_committed_after_snapshot() {
 
         drop(writer_session);
         drop(session);
-        sys.clean_all();
     });
 }
 
@@ -1217,7 +1223,6 @@ fn test_lwc_update_unique_key_change_preserves_old_and_new_key_visibility() {
 
         drop(old_reader_session);
         drop(session);
-        sys.clean_all();
     });
 }
 
@@ -1263,7 +1268,6 @@ fn test_lwc_update_unique_duplicate_rolls_back_cold_marker_and_hot_insert() {
         .await;
 
         drop(session);
-        sys.clean_all();
     });
 }
 
@@ -1326,7 +1330,6 @@ fn test_lwc_update_unique_claims_committed_deleted_cold_owner_with_visibility_br
         drop(gap_reader_session);
         drop(old_reader_session);
         drop(session);
-        sys.clean_all();
     });
 }
 
@@ -1409,7 +1412,6 @@ fn test_lwc_update_unique_rejects_cold_owner_deleted_after_snapshot() {
 
         drop(writer_session);
         drop(session);
-        sys.clean_all();
     });
 }
 
@@ -1518,7 +1520,6 @@ fn test_lwc_update_unique_claim_rollback_restores_deleted_cold_owner() {
 
         drop(old_reader_session);
         drop(session);
-        sys.clean_all();
     });
 }
 
@@ -1641,9 +1642,7 @@ fn test_lwc_update_unique_claim_rollback_drops_purgeable_deleted_cold_owner() {
         .await;
         sys.new_trx_select_not_found(&mut session, &claimed_key)
             .await;
-
         drop(session);
-        sys.clean_all();
     });
 }
 
@@ -1706,7 +1705,6 @@ fn test_checkpoint_persists_committed_cold_delete_markers() {
         assert!(deltas.contains(&expected_delta));
 
         drop(session);
-        sys.clean_all();
     });
 }
 
@@ -1735,7 +1733,6 @@ fn test_checkpoint_publishes_unique_secondary_disk_tree_root() {
         reader.commit().await.unwrap();
 
         drop(session);
-        sys.clean_all();
     });
 }
 
@@ -1790,7 +1787,6 @@ fn test_trx_read_proof_root_snapshot_captures_active_root() {
         trx.rollback().await.unwrap();
 
         drop(session);
-        sys.clean_all();
     });
 }
 
@@ -1841,7 +1837,6 @@ fn test_checkpoint_publishes_non_unique_secondary_disk_tree_entries_across_lwc_s
         assert_ne!(first_entry.block_id(), last_entry.block_id());
 
         drop(session);
-        sys.clean_all();
     });
 }
 
@@ -1888,9 +1883,7 @@ fn test_secondary_mem_index_cleanup_removes_redundant_live_unique_entries() {
                 Some((disk_row_id, false))
             );
         }
-
         drop(session);
-        sys.clean_all();
     });
 }
 
@@ -1914,7 +1907,6 @@ fn test_secondary_mem_index_cleanup_requires_idle_session() {
         assert!(!session.in_trx());
 
         drop(session);
-        sys.clean_all();
     });
 }
 
@@ -1958,9 +1950,7 @@ fn test_secondary_mem_index_cleanup_removes_redundant_live_non_unique_entries() 
             .await
             .unwrap();
         assert_eq!(lookup_rows, disk_rows);
-
         drop(session);
-        sys.clean_all();
     });
 }
 
@@ -1987,7 +1977,6 @@ fn test_secondary_mem_index_cleanup_aggregates_bounded_batches() {
         assert_eq!(stats.indexes[1].skipped_hot_deleted, 0);
 
         drop(session);
-        sys.clean_all();
     });
 }
 
@@ -2047,9 +2036,7 @@ fn test_secondary_mem_index_cleanup_can_retain_live_cache_entries() {
             .await
             .unwrap();
         assert_eq!(lookup_rows, disk_rows);
-
         drop(session);
-        sys.clean_all();
     });
 }
 
@@ -2130,9 +2117,7 @@ fn test_secondary_mem_index_cleanup_retains_unique_delete_shadow_without_delete_
                 .unwrap(),
             Some((row_id, false))
         );
-
         drop(session);
-        sys.clean_all();
     });
 }
 
@@ -2201,9 +2186,7 @@ fn test_secondary_mem_index_cleanup_removes_unique_delete_shadow_with_purgeable_
                 .unwrap(),
             None
         );
-
         drop(session);
-        sys.clean_all();
     });
 }
 
@@ -2283,9 +2266,7 @@ fn test_secondary_mem_index_cleanup_removes_delete_shadow_when_live_cleanup_disa
                 .unwrap(),
             Some((row_id, false))
         );
-
         drop(session);
-        sys.clean_all();
     });
 }
 
@@ -2362,9 +2343,7 @@ fn test_secondary_mem_index_cleanup_removes_unique_delete_shadow_with_matching_c
                 .unwrap(),
             Some((row_id, false))
         );
-
         drop(session);
-        sys.clean_all();
     });
 }
 
@@ -2466,9 +2445,7 @@ fn test_secondary_mem_index_cleanup_removes_unique_delete_shadow_when_cold_row_k
                 .unwrap(),
             Some((row_id, false))
         );
-
         drop(session);
-        sys.clean_all();
     });
 }
 
@@ -2561,9 +2538,7 @@ fn test_secondary_mem_index_cleanup_propagates_cold_delete_overlay_proof_error()
                 .unwrap(),
             Some((row_id, true))
         );
-
         drop(session);
-        sys.clean_all();
     });
 }
 
@@ -2634,9 +2609,7 @@ fn test_secondary_mem_index_cleanup_retains_non_unique_delete_mark_without_delet
                 .unwrap(),
             Some(false)
         );
-
         drop(session);
-        sys.clean_all();
     });
 }
 
@@ -2706,9 +2679,7 @@ fn test_secondary_mem_index_cleanup_removes_non_unique_delete_mark_with_purgeabl
                 .unwrap(),
             None
         );
-
         drop(session);
-        sys.clean_all();
     });
 }
 
@@ -2788,9 +2759,7 @@ fn test_secondary_mem_index_cleanup_removes_non_unique_delete_mark_with_matching
                 .unwrap(),
             Some(true)
         );
-
         drop(session);
-        sys.clean_all();
     });
 }
 
@@ -2902,9 +2871,7 @@ fn test_secondary_mem_index_cleanup_removes_non_unique_delete_mark_when_cold_row
                 .unwrap(),
             Some(true)
         );
-
         drop(session);
-        sys.clean_all();
     });
 }
 
@@ -2949,7 +2916,6 @@ fn test_deletion_checkpoint_updates_secondary_disk_tree_roots() {
         assert_eq!(exact_rows, vec![kept_row_id]);
 
         drop(session);
-        sys.clean_all();
     });
 }
 
@@ -2988,7 +2954,6 @@ fn test_unique_checkpoint_overlap_keeps_new_disk_tree_owner() {
         );
 
         drop(session);
-        sys.clean_all();
     });
 }
 
@@ -3041,7 +3006,6 @@ fn test_secondary_sidecar_failure_keeps_checkpoint_root_atomic() {
         );
 
         drop(session);
-        sys.clean_all();
     });
 }
 
@@ -3067,7 +3031,6 @@ fn test_checkpoint_all_deleted_row_page_advances_without_column_index() {
         }
 
         drop(session);
-        sys.clean_all();
     });
 }
 
@@ -3154,12 +3117,10 @@ fn test_checkpoint_transition_delete_marker_waits_for_next_cutoff_range() {
         let expected_delta = (row_id - entry_after_second.start_row_id) as u32;
         assert!(root_after_second.deletion_cutoff_ts > delete_cts);
         assert!(deltas.contains(&expected_delta));
-
         drop(checkpoint_session);
         drop(writer_session);
         drop(hold_session);
         drop(session);
-        sys.clean_all();
     });
 }
 
@@ -3216,9 +3177,7 @@ fn test_lwc_unique_index_purge_uses_purgeable_delete_marker_fast_path() {
                 .unwrap(),
             IndexInsert::DuplicateKey(row_id, false)
         );
-
         drop(session);
-        sys.clean_all();
     });
 }
 
@@ -3323,9 +3282,7 @@ fn test_lwc_unique_index_purge_compares_persisted_key_when_marker_is_not_purgeab
                 .unwrap(),
             Some((actual_row_id, true)) if actual_row_id == row_id
         ));
-
         drop(session);
-        sys.clean_all();
     });
 }
 
@@ -3427,9 +3384,7 @@ fn test_lwc_non_unique_index_purge_compares_persisted_key_when_marker_is_not_pur
                 .unwrap(),
             Some(false)
         ));
-
         drop(session);
-        sys.clean_all();
     });
 }
 
@@ -3481,9 +3436,7 @@ fn test_index_purge_removes_delete_marked_unique_entry_when_row_is_not_found() {
                 .unwrap()
                 .is_none()
         );
-
         drop(session);
-        sys.clean_all();
     });
 }
 
@@ -3586,9 +3539,7 @@ fn test_unique_insert_rollback_restores_deleted_owner_even_when_row_missing() {
             assert_eq!(vals, vec![Val::from(10_001i32), Val::from("reclaimed")]);
         })
         .await;
-
         drop(session);
-        sys.clean_all();
     });
 }
 
@@ -3691,9 +3642,7 @@ fn test_unique_insert_rollback_restores_delete_marked_stale_hot_owner() {
             assert_eq!(vals, vec![Val::from(2i32), Val::from("two-final")]);
         })
         .await;
-
         drop(session);
-        sys.clean_all();
     });
 }
 
@@ -3733,7 +3682,6 @@ fn test_checkpoint_fails_when_eligible_delete_marker_has_no_column_index() {
         );
 
         drop(session);
-        sys.clean_all();
     });
 }
 
@@ -3783,7 +3731,6 @@ fn test_checkpoint_fails_when_eligible_delete_marker_cannot_be_located() {
         );
 
         drop(session);
-        sys.clean_all();
     });
 }
 
@@ -3819,7 +3766,6 @@ fn test_checkpoint_ignores_missing_old_delete_marker_below_previous_cutoff() {
         );
 
         drop(session);
-        sys.clean_all();
     });
 }
 
@@ -3866,7 +3812,6 @@ fn test_recover_cold_delete_rejects_already_deleted_with_different_cts() {
         );
 
         drop(session);
-        sys.clean_all();
     });
 }
 
@@ -3928,7 +3873,6 @@ fn test_checkpoint_skips_cold_delete_markers_at_or_after_cutoff() {
         drop(writer_session);
         drop(hold_session);
         drop(session);
-        sys.clean_all();
     });
 }
 
@@ -4011,7 +3955,6 @@ fn test_checkpoint_fails_on_invalid_v2_delete_metadata() {
         );
 
         drop(session);
-        sys.clean_all();
     });
 }
 
@@ -4094,7 +4037,6 @@ fn test_checkpoint_fails_on_short_v2_delete_section_header() {
         );
 
         drop(session);
-        sys.clean_all();
     });
 }
 
@@ -4225,9 +4167,7 @@ fn test_row_page_transition_retries_update_delete() {
             Some(OperationError::NotSupported)
         );
         trx.rollback().await.unwrap();
-
         drop(session);
-        sys.clean_all();
     });
 }
 
@@ -4248,7 +4188,6 @@ fn test_mvcc_rollback_insert_normal() {
             let key = single_key(1i32);
             _ = sys.new_trx_select_not_found(&mut session, &key).await;
         }
-        sys.clean_all();
     });
 }
 
@@ -4289,7 +4228,6 @@ fn test_mvcc_insert_link_unique_index() {
                 })
                 .await;
         }
-        sys.clean_all();
     });
 }
 
@@ -4318,7 +4256,6 @@ fn test_mvcc_rollback_insert_link_unique_index() {
             let key = single_key(1i32);
             _ = sys.new_trx_select_not_found(&mut session, &key).await;
         }
-        sys.clean_all();
     });
 }
 
@@ -4387,7 +4324,6 @@ fn test_mvcc_insert_link_update() {
                 })
                 .await;
         }
-        sys.clean_all();
     });
 }
 
@@ -4472,7 +4408,6 @@ fn test_mvcc_update_link_insert() {
                 assert!(vals[1] == Val::from("c++"));
             })
         }
-        sys.clean_all();
     });
 }
 
@@ -4535,7 +4470,6 @@ fn test_mvcc_multi_update() {
                 .await;
             trx1.commit().await.unwrap();
         }
-        sys.clean_all();
     });
 }
 
@@ -4563,7 +4497,6 @@ fn test_string_non_index_updates() {
                 .await;
             }
         }
-        sys.clean_all();
     });
 }
 
@@ -4600,7 +4533,6 @@ fn test_string_index_updates() {
                 trx.commit().await.unwrap();
             }
         }
-        sys.clean_all();
     });
 }
 
@@ -4640,7 +4572,6 @@ fn test_mvcc_out_of_place_update() {
                 trx.commit().await.unwrap();
             }
         }
-        sys.clean_all();
     });
 }
 
@@ -4665,7 +4596,6 @@ fn test_evict_pool_insert_full() {
             }
             let _ = trx.commit().await.unwrap();
         }
-        sys.clean_all();
     });
 }
 
@@ -4700,7 +4630,6 @@ fn test_table_scan_uncommitted() {
         }
 
         drop(session);
-        sys.clean_all();
     });
 }
 
@@ -5397,7 +5326,6 @@ fn test_table_scan_mvcc() {
 
         drop(session1);
         drop(session2);
-        sys.clean_all();
     });
 }
 
@@ -5466,7 +5394,6 @@ fn test_table_freeze() {
         assert!(row_pages == 3);
 
         drop(session1);
-        sys.clean_all();
     });
 }
 
@@ -5558,9 +5485,7 @@ fn test_transition_captures_uncommitted_lock_into_deletion_buffer() {
             Some(OperationError::NotSupported)
         );
         trx.rollback().await.unwrap();
-
         drop(session);
-        sys.clean_all();
     });
 }
 
@@ -5585,7 +5510,6 @@ fn test_checkpoint_basic_flow() {
         assert!(new_root.deletion_cutoff_ts > old_root.deletion_cutoff_ts);
 
         drop(session);
-        sys.clean_all();
     });
 }
 
@@ -5644,7 +5568,6 @@ fn test_foreground_lifecycle_rejects_dropping_and_dropped_handles() {
         assert_eq!(dropped_write.commit().await.unwrap(), 0);
 
         drop(session);
-        sys.clean_all();
     });
 }
 
@@ -5670,8 +5593,6 @@ fn test_table_drop_gate_waits_for_checkpoint_publish_lease() {
         drop_fut.await.unwrap();
         assert_eq!(sys.table.lifecycle.state(), TableLifecycleState::Dropping);
         drop(root_lease);
-
-        sys.clean_all();
     });
 }
 
@@ -5694,7 +5615,6 @@ fn test_checkpoint_cancelled_when_table_dropping() {
         assert!(!session.in_trx());
 
         drop(session);
-        sys.clean_all();
     });
 }
 
@@ -5711,7 +5631,6 @@ fn test_drop_table_rejects_active_transaction() {
 
         trx.rollback().await.unwrap();
         drop(session);
-        sys.clean_all();
     });
 }
 
@@ -5729,7 +5648,6 @@ fn test_drop_table_returns_not_found_for_missing_table() {
         assert_eq!(err.operation_error(), Some(OperationError::TableNotFound));
 
         drop(session);
-        sys.clean_all();
     });
 }
 
@@ -5785,7 +5703,6 @@ fn test_drop_table_rejects_same_session_explicit_table_lock() {
             session.drop_table(table_id).await.unwrap();
 
             drop(session);
-            sys.clean_all();
         }
     });
 }
@@ -5841,7 +5758,6 @@ fn test_drop_table_fails_waiting_session_table_lock() {
 
         drop(lock_session);
         drop(drop_session);
-        sys.clean_all();
     });
 }
 
@@ -5898,7 +5814,6 @@ fn test_drop_table_fails_waiting_transaction_table_lock() {
         trx.rollback().await.unwrap();
         drop(lock_session);
         drop(drop_session);
-        sys.clean_all();
     });
 }
 
@@ -5951,7 +5866,6 @@ fn test_explicit_table_lock_after_drop_returns_not_found_without_locks() {
         drop(trx_session);
         drop(lock_session);
         drop(drop_session);
-        sys.clean_all();
     });
 }
 
@@ -6087,7 +6001,6 @@ fn test_drop_table_logical_cascade_and_stale_handles() {
 
         drop(stale_table);
         drop(session);
-        sys.clean_all();
     });
 }
 
@@ -6194,7 +6107,6 @@ fn test_drop_table_catalog_cascade_poison_preserves_source_error() {
 
         drop(corrupt_session);
         drop(drop_session);
-        sys.clean_all();
     });
 }
 
@@ -6238,7 +6150,6 @@ fn test_drop_table_commit_poison_preserves_source_error() {
         assert!(!session.in_trx());
 
         drop(session);
-        sys.clean_all();
     });
 }
 
@@ -6287,7 +6198,6 @@ fn test_drop_table_waits_for_active_metadata_reader() {
 
         drop(drop_session);
         drop(reader_session);
-        sys.clean_all();
     });
 }
 
@@ -6318,7 +6228,6 @@ fn test_drop_table_waits_for_active_table_writer() {
 
         drop(drop_session);
         drop(writer_session);
-        sys.clean_all();
     });
 }
 
@@ -6344,7 +6253,6 @@ fn test_catalog_checkpoint_scan_allows_runtime_removed_drop_table() {
         assert!(batch.safe_cts >= batch.replay_start_ts);
 
         drop(session);
-        sys.clean_all();
     });
 }
 
@@ -6489,7 +6397,6 @@ fn test_checkpoint_publish_write_failure_poisons_storage() {
         assert!(!session.in_trx());
 
         drop(session);
-        sys.clean_all();
     });
 }
 
@@ -6510,7 +6417,6 @@ fn test_checkpoint_post_publication_failure_poisons_storage() {
         assert!(!session.in_trx());
 
         drop(session);
-        sys.clean_all();
     });
 }
 
@@ -6528,7 +6434,6 @@ fn test_checkpoint_readiness_ready_when_root_crossed_gc_horizon() {
         ));
 
         drop(session);
-        sys.clean_all();
     });
 }
 
@@ -6562,7 +6467,6 @@ fn test_checkpoint_readiness_delayed_reports_root_and_horizon() {
 
         drop(reader_session);
         drop(session);
-        sys.clean_all();
     });
 }
 
@@ -6600,7 +6504,6 @@ fn test_checkpoint_requires_idle_session_before_delayed_outcome() {
 
         drop(reader_session);
         drop(session);
-        sys.clean_all();
     });
 }
 
@@ -6652,7 +6555,6 @@ fn test_checkpoint_delayed_preserves_root_and_frozen_pages_until_ready() {
 
         drop(reader_session);
         drop(session);
-        sys.clean_all();
     });
 }
 
@@ -6688,7 +6590,45 @@ fn test_second_checkpoint_waits_for_previous_root_horizon() {
 
         drop(reader_session);
         drop(session);
-        sys.clean_all();
+    });
+}
+
+#[test]
+fn test_checkpoint_rechecks_readiness_after_root_mutation_lease() {
+    smol::block_on(async {
+        let sys = TestSys::new_lightweight_evictable().await;
+        let mut checkpoint_session = sys.try_new_session().unwrap();
+        let root_before = sys.table.file().active_root_unchecked().clone();
+        wait_gc_cutoff_after(&checkpoint_session, root_before.trx_id).await;
+
+        let mut reader_session = sys.try_new_session().unwrap();
+        let reader = reader_session.try_begin_trx().unwrap().unwrap();
+        assert!(matches!(
+            sys.table.checkpoint_readiness(&checkpoint_session),
+            CheckpointReadiness::Ready
+        ));
+
+        let hook_table = Arc::clone(&sys.table);
+        let hook_engine = sys.engine.new_ref().unwrap();
+        let root_before_trx = root_before.trx_id;
+        set_test_checkpoint_after_readiness_hook(move || async move {
+            let mut competing_session = hook_engine.try_new_session().unwrap();
+            let checkpoint_ts = checkpoint_published(&hook_table, &mut competing_session).await;
+            assert!(checkpoint_ts > root_before_trx);
+        });
+
+        let outcome = sys.table.checkpoint(&mut checkpoint_session).await.unwrap();
+        let CheckpointOutcome::Delayed { reason } = outcome else {
+            panic!("expected post-lease readiness delay, got {outcome:?}");
+        };
+        let root_after = sys.table.file().active_root_unchecked();
+        assert!(root_after.trx_id > root_before.trx_id);
+        assert_eq!(reason.root_cts, root_after.trx_id);
+        assert_eq!(reason.min_active_sts, reader.sts());
+
+        reader.commit().await.unwrap();
+        drop(reader_session);
+        drop(checkpoint_session);
     });
 }
 
@@ -6732,7 +6672,6 @@ fn test_checkpoint_snapshot_consistency() {
         drop(session);
         drop(write_session);
         drop(checkpoint_session);
-        sys.clean_all();
     });
 }
 
@@ -6781,7 +6720,6 @@ fn test_checkpoint_old_root_released_after_active_reader_purged() {
         drop(read_session);
         drop(checkpoint_session);
         drop(session);
-        sys.clean_all();
     });
 }
 
@@ -6849,7 +6787,6 @@ fn test_checkpoint_heartbeat() {
         );
 
         drop(session);
-        sys.clean_all();
     });
 }
 
@@ -6877,7 +6814,6 @@ fn test_checkpoint_gc_verification() {
         assert!(reclaimed, "row pages should be reclaimed after purge");
 
         drop(session);
-        sys.clean_all();
     });
 }
 
@@ -6937,7 +6873,6 @@ fn test_session_cached_insert_page_reuses_live_versioned_page() {
         assert_eq!(next_cached_page, cached_page);
 
         drop(session);
-        sys.clean_all();
     });
 }
 
@@ -7012,7 +6947,6 @@ fn test_stale_session_cached_insert_page_falls_back_after_checkpoint_gc() {
 
         drop(checkpoint_session);
         drop(session);
-        sys.clean_all();
     });
 }
 
@@ -7121,7 +7055,6 @@ fn test_validated_row_page_shared_result_rejects_stale_reused_page_range() {
         drop(stale_guard);
         drop(checkpoint_session);
         drop(session);
-        sys.clean_all();
     });
 }
 
@@ -7201,7 +7134,6 @@ fn test_mvcc_insert_surfaces_cached_insert_page_reload_error() {
 
         drop(writer);
         drop(session);
-        sys.clean_all();
     });
 }
 
@@ -7281,7 +7213,6 @@ fn test_mvcc_rollback_poisons_runtime_on_row_page_reload_error() {
 
         drop(writer);
         drop(session);
-        sys.clean_all();
     });
 }
 
@@ -7382,7 +7313,6 @@ fn test_statement_rollback_poisons_runtime_on_row_page_reload_error() {
         drop(hook_guard);
         drop(writer);
         drop(session);
-        sys.clean_all();
     });
 }
 
@@ -7418,7 +7348,6 @@ fn test_checkpoint_error_rollback() {
         );
 
         drop(session);
-        sys.clean_all();
     });
 }
 
@@ -7730,11 +7659,6 @@ fn lightweight_test_engine_config(
 
 impl TestSys {
     #[inline]
-    fn clean_all(self) {
-        drop(self);
-    }
-
-    #[inline]
     async fn new_trx_insert(&self, session: &mut Session, insert: Vec<Val>) {
         let mut trx = session.try_begin_trx().unwrap().unwrap();
         trx = self.trx_insert(trx, insert).await;
@@ -7943,13 +7867,13 @@ fn active_secondary_root(table: &Table, index_no: usize) -> BlockID {
     table.file().active_root_unchecked().secondary_index_roots[index_no]
 }
 
-struct BoundUniqueIndexNo<'a> {
-    table: &'a Table,
+struct BoundUniqueIndexNo {
+    layout: Arc<TableRuntimeLayout>,
     index_no: usize,
     root: BlockID,
 }
 
-impl UniqueIndex for BoundUniqueIndexNo<'_> {
+impl UniqueIndex for BoundUniqueIndexNo {
     #[inline]
     async fn lookup(
         &self,
@@ -7957,8 +7881,7 @@ impl UniqueIndex for BoundUniqueIndexNo<'_> {
         key: &[Val],
         ts: TrxID,
     ) -> Result<Option<(RowID, bool)>> {
-        let layout = self.table.layout_snapshot();
-        let index = layout.secondary_index(self.index_no)?;
+        let index = self.layout.secondary_index(self.index_no)?;
         index
             .bind_unique(self.root)?
             .lookup(pool_guard, key, ts)
@@ -7974,8 +7897,7 @@ impl UniqueIndex for BoundUniqueIndexNo<'_> {
         merge_if_match_deleted: bool,
         ts: TrxID,
     ) -> Result<IndexInsert> {
-        let layout = self.table.layout_snapshot();
-        let index = layout.secondary_index(self.index_no)?;
+        let index = self.layout.secondary_index(self.index_no)?;
         index
             .bind_unique(self.root)?
             .insert_if_not_exists(pool_guard, key, row_id, merge_if_match_deleted, ts)
@@ -7991,8 +7913,7 @@ impl UniqueIndex for BoundUniqueIndexNo<'_> {
         ignore_del_mask: bool,
         ts: TrxID,
     ) -> Result<bool> {
-        let layout = self.table.layout_snapshot();
-        let index = layout.secondary_index(self.index_no)?;
+        let index = self.layout.secondary_index(self.index_no)?;
         index
             .bind_unique(self.root)?
             .compare_delete(pool_guard, key, old_row_id, ignore_del_mask, ts)
@@ -8008,8 +7929,7 @@ impl UniqueIndex for BoundUniqueIndexNo<'_> {
         new_row_id: RowID,
         ts: TrxID,
     ) -> Result<crate::index::IndexCompareExchange> {
-        let layout = self.table.layout_snapshot();
-        let index = layout.secondary_index(self.index_no)?;
+        let index = self.layout.secondary_index(self.index_no)?;
         index
             .bind_unique(self.root)?
             .compare_exchange(pool_guard, key, old_row_id, new_row_id, ts)
@@ -8023,8 +7943,7 @@ impl UniqueIndex for BoundUniqueIndexNo<'_> {
         values: &mut Vec<RowID>,
         ts: TrxID,
     ) -> Result<()> {
-        let layout = self.table.layout_snapshot();
-        let index = layout.secondary_index(self.index_no)?;
+        let index = self.layout.secondary_index(self.index_no)?;
         index
             .bind_unique(self.root)?
             .scan_values(pool_guard, values, ts)
@@ -8032,13 +7951,13 @@ impl UniqueIndex for BoundUniqueIndexNo<'_> {
     }
 }
 
-struct BoundNonUniqueIndexNo<'a> {
-    table: &'a Table,
+struct BoundNonUniqueIndexNo {
+    layout: Arc<TableRuntimeLayout>,
     index_no: usize,
     root: BlockID,
 }
 
-impl NonUniqueIndex for BoundNonUniqueIndexNo<'_> {
+impl NonUniqueIndex for BoundNonUniqueIndexNo {
     #[inline]
     async fn lookup(
         &self,
@@ -8047,8 +7966,7 @@ impl NonUniqueIndex for BoundNonUniqueIndexNo<'_> {
         res: &mut Vec<RowID>,
         ts: TrxID,
     ) -> Result<()> {
-        let layout = self.table.layout_snapshot();
-        let index = layout.secondary_index(self.index_no)?;
+        let index = self.layout.secondary_index(self.index_no)?;
         index
             .bind_non_unique(self.root)?
             .lookup(pool_guard, key, res, ts)
@@ -8063,8 +7981,7 @@ impl NonUniqueIndex for BoundNonUniqueIndexNo<'_> {
         row_id: RowID,
         ts: TrxID,
     ) -> Result<Option<bool>> {
-        let layout = self.table.layout_snapshot();
-        let index = layout.secondary_index(self.index_no)?;
+        let index = self.layout.secondary_index(self.index_no)?;
         index
             .bind_non_unique(self.root)?
             .lookup_unique(pool_guard, key, row_id, ts)
@@ -8080,8 +7997,7 @@ impl NonUniqueIndex for BoundNonUniqueIndexNo<'_> {
         merge_if_match_deleted: bool,
         ts: TrxID,
     ) -> Result<IndexInsert> {
-        let layout = self.table.layout_snapshot();
-        let index = layout.secondary_index(self.index_no)?;
+        let index = self.layout.secondary_index(self.index_no)?;
         index
             .bind_non_unique(self.root)?
             .insert_if_not_exists(pool_guard, key, row_id, merge_if_match_deleted, ts)
@@ -8096,8 +8012,7 @@ impl NonUniqueIndex for BoundNonUniqueIndexNo<'_> {
         row_id: RowID,
         ts: TrxID,
     ) -> Result<bool> {
-        let layout = self.table.layout_snapshot();
-        let index = layout.secondary_index(self.index_no)?;
+        let index = self.layout.secondary_index(self.index_no)?;
         index
             .bind_non_unique(self.root)?
             .mask_as_deleted(pool_guard, key, row_id, ts)
@@ -8112,8 +8027,7 @@ impl NonUniqueIndex for BoundNonUniqueIndexNo<'_> {
         row_id: RowID,
         ts: TrxID,
     ) -> Result<bool> {
-        let layout = self.table.layout_snapshot();
-        let index = layout.secondary_index(self.index_no)?;
+        let index = self.layout.secondary_index(self.index_no)?;
         index
             .bind_non_unique(self.root)?
             .mask_as_active(pool_guard, key, row_id, ts)
@@ -8129,8 +8043,7 @@ impl NonUniqueIndex for BoundNonUniqueIndexNo<'_> {
         ignore_del_mask: bool,
         ts: TrxID,
     ) -> Result<bool> {
-        let layout = self.table.layout_snapshot();
-        let index = layout.secondary_index(self.index_no)?;
+        let index = self.layout.secondary_index(self.index_no)?;
         index
             .bind_non_unique(self.root)?
             .compare_delete(pool_guard, key, row_id, ignore_del_mask, ts)
@@ -8144,8 +8057,7 @@ impl NonUniqueIndex for BoundNonUniqueIndexNo<'_> {
         values: &mut Vec<RowID>,
         ts: TrxID,
     ) -> Result<()> {
-        let layout = self.table.layout_snapshot();
-        let index = layout.secondary_index(self.index_no)?;
+        let index = self.layout.secondary_index(self.index_no)?;
         index
             .bind_non_unique(self.root)?
             .scan_values(pool_guard, values, ts)
@@ -8153,17 +8065,19 @@ impl NonUniqueIndex for BoundNonUniqueIndexNo<'_> {
     }
 }
 
-fn bound_unique_index_no(table: &Table, index_no: usize) -> BoundUniqueIndexNo<'_> {
+fn bound_unique_index_no(table: &Table, index_no: usize) -> BoundUniqueIndexNo {
+    let layout = table.layout_snapshot();
     BoundUniqueIndexNo {
-        table,
+        layout,
         index_no,
         root: active_secondary_root(table, index_no),
     }
 }
 
-fn bound_non_unique_index_no(table: &Table, index_no: usize) -> BoundNonUniqueIndexNo<'_> {
+fn bound_non_unique_index_no(table: &Table, index_no: usize) -> BoundNonUniqueIndexNo {
+    let layout = table.layout_snapshot();
     BoundNonUniqueIndexNo {
-        table,
+        layout,
         index_no,
         root: active_secondary_root(table, index_no),
     }
@@ -8587,7 +8501,6 @@ fn test_checkpoint_cancelled_while_table_metadata_change_active() {
         );
         drop(metadata_lease);
         drop(checkpoint_session);
-        sys.clean_all();
     })
 }
 
@@ -8598,17 +8511,24 @@ fn test_runtime_layout_install_retires_removed_index_after_old_snapshot_drops() 
         let old_layout = sys.table.layout_snapshot();
         assert_eq!(old_layout.metadata().active_index_count(), 1);
 
-        let metadata_without_indexes = Arc::new(TableMetadata::new(
-            vec![
-                ColumnSpec::new("id", ValKind::I32, ColumnAttributes::empty()),
-                ColumnSpec::new("name", ValKind::VarByte, ColumnAttributes::empty()),
-            ],
-            vec![],
-        ));
+        let metadata_without_indexes = Arc::new(
+            TableMetadata::try_new_with_next_index_no(
+                vec![
+                    ColumnSpec::new("id", ValKind::I32, ColumnAttributes::empty()),
+                    ColumnSpec::new("name", ValKind::VarByte, ColumnAttributes::empty()),
+                ],
+                vec![],
+                old_layout.metadata().next_index_no(),
+            )
+            .unwrap(),
+        );
+        let mut inactive_slots: Vec<Option<Arc<SecondaryIndex<EvictableBufferPool>>>> =
+            Vec::with_capacity(old_layout.index_slot_count());
+        inactive_slots.resize_with(old_layout.index_slot_count(), || None);
         let new_layout = TableRuntimeLayout::new(
             old_layout.generation() + 1,
             metadata_without_indexes,
-            Vec::<Option<Arc<SecondaryIndex<EvictableBufferPool>>>>::new().into_boxed_slice(),
+            inactive_slots.into_boxed_slice(),
         )
         .unwrap();
 
@@ -8618,6 +8538,16 @@ fn test_runtime_layout_install_retires_removed_index_after_old_snapshot_drops() 
             .unwrap();
         assert_eq!(old_layout.metadata().active_index_count(), 1);
         assert_eq!(installed.metadata().active_index_count(), 0);
+        assert_eq!(
+            installed.metadata().next_index_no(),
+            old_layout.metadata().next_index_no()
+        );
+        assert_eq!(
+            installed.metadata().index_slot_count(),
+            old_layout.metadata().index_slot_count()
+        );
+        assert_eq!(installed.index_slot_count(), old_layout.index_slot_count());
+        assert!(installed.secondary_indexes()[0].is_none());
         assert_eq!(sys.table.metadata().active_index_count(), 0);
         assert!(sys.table.has_retired_secondary_indexes());
 
@@ -8642,7 +8572,44 @@ fn test_runtime_layout_install_retires_removed_index_after_old_snapshot_drops() 
         assert!(!sys.table.has_retired_secondary_indexes());
         drop(installed);
         drop(guards);
-        sys.clean_all();
+    })
+}
+
+#[test]
+fn test_runtime_layout_install_rejects_shrinking_index_slots() {
+    smol::block_on(async {
+        let sys = TestSys::new_lightweight_evictable().await;
+        let old_layout = sys.table.layout_snapshot();
+        assert_eq!(old_layout.index_slot_count(), 1);
+
+        let shrinking_metadata = Arc::new(TableMetadata::new(
+            vec![
+                ColumnSpec::new("id", ValKind::I32, ColumnAttributes::empty()),
+                ColumnSpec::new("name", ValKind::VarByte, ColumnAttributes::empty()),
+            ],
+            vec![],
+        ));
+        let shrinking_layout = TableRuntimeLayout::new(
+            old_layout.generation() + 1,
+            shrinking_metadata,
+            Vec::<Option<Arc<SecondaryIndex<EvictableBufferPool>>>>::new().into_boxed_slice(),
+        )
+        .unwrap();
+
+        let result = sys
+            .table
+            .install_runtime_layout(old_layout.generation(), shrinking_layout);
+        assert!(result.is_err());
+        let err = result.err().unwrap();
+        assert!(
+            format!("{err:?}").contains("new layout must not shrink sparse index slots"),
+            "{err:?}"
+        );
+        assert_eq!(
+            sys.table.layout_snapshot().generation(),
+            old_layout.generation()
+        );
+        drop(old_layout);
     })
 }
 
