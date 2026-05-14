@@ -1,7 +1,7 @@
 ---
 id: 000147
 title: Runtime Layout And Checkpoint Gate
-status: proposal
+status: implemented
 created: 2026-05-12
 github_issue: 632
 ---
@@ -374,6 +374,55 @@ cargo nextest run -p doradb-storage --no-default-features --features libaio
 
 ## Implementation Notes
 
+Implemented RFC 0018 Phase 2.
+
+- Added `TableRuntimeLayout` as the immutable user-table metadata and
+  secondary-index runtime snapshot. User tables now keep the current layout
+  behind a short `parking_lot::Mutex<Arc<TableRuntimeLayout>>`, expose explicit
+  current-layout snapshots, validate sparse index slot/runtime consistency, and
+  install new layouts by generation while retiring removed/replaced secondary
+  runtimes for later cleanup.
+- Moved foreground user-table access to layout-bound accessors. Statement entry
+  points capture a layout after normal logical locks and foreground lifecycle
+  checks, and the accessor uses that snapshot for metadata, index specs, key
+  generation, and secondary-index runtime binding. Internal checkpoint, purge,
+  rollback, recovery, and test helper paths were updated to take explicit
+  layout snapshots instead of reading fixed user-table metadata/index fields.
+- Added the reversible table metadata-change/root-mutation gate inside
+  `TableLifecycle` while preserving the existing terminal drop lifecycle and
+  checkpoint publish gate. User-table checkpoint now acquires the root-mutation
+  lease before `MutableTableFile::fork()`, returns
+  `CheckpointCancelReason::TableMetadataChanging` when DDL exclusion is active,
+  and re-checks checkpoint readiness after taking the root-mutation lease.
+- Added the catalog checkpoint gate and lease types. Catalog checkpoint now
+  holds a checkpoint lease across scan/apply, future catalog metadata changes
+  can reserve and then acquire the exclusive metadata-change phase, and the
+  pending-waiter cancellation race is covered by regression tests.
+- Preserved Phase 1 sparse-index behavior for inactive slots: purge and cleanup
+  skip inactive indexes, recovery rebuild remains deferred through the existing
+  recovery path, and table layout installation rejects shrinking sparse slot
+  vectors so historical `index_no` references keep their meaning.
+- Removed the old `Table::accessor()` convenience path and updated bound index
+  test helpers to pin one layout snapshot with their root proof. Removed
+  `TestSys::clean_all()` call sites because the method only wrapped `drop`.
+- Added follow-up backlog items for intentionally deferred maintenance:
+  `docs/backlogs/000100-avoid-catalog-checkpoint-gate-with-index-ddl-completion-markers.md`,
+  `docs/backlogs/000101-unify-catalog-user-runtime-layout-abstraction.md`,
+  `docs/backlogs/000102-split-table-metadata-column-index-layouts.md`, and
+  `docs/backlogs/000103-remove-inline-index-recovery-branch.md`.
+
+Validation completed:
+
+- `cargo fmt --all --check`
+- `cargo clippy -p doradb-storage --all-targets -- -D warnings`
+- `cargo nextest run -p doradb-storage`: 753 passed.
+- `tools/coverage_focus.rs --path doradb-storage/src/table --path doradb-storage/src/catalog/checkpoint.rs --path doradb-storage/src/catalog/mod.rs --top-uncovered 15`: deduplicated 90.52%; table directory 90.06%; catalog checkpoint 93.31%; catalog module 95.83%.
+- `cargo nextest run -p doradb-storage --no-default-features --features libaio`: 751 passed.
+
+Checklist review outcome: no unresolved blocking issues. No unsafe Rust was
+added or modified; `docs/unsafe-usage-baseline.md` was refreshed by the
+existing unsafe inventory process.
+
 ## Impacts
 
 - `doradb-storage/src/table/layout.rs`
@@ -469,3 +518,10 @@ Future RFC 0018 phases will decide the concrete `CREATE INDEX` and `DROP INDEX`
 API flow, index-DDL redo payload shape, root-publish durability checks,
 recovery reconciliation, and any dedicated physical cleanup of dropped
 secondary `DiskTree` pages.
+
+Deferred follow-up items from implementation review:
+
+- `docs/backlogs/000100-avoid-catalog-checkpoint-gate-with-index-ddl-completion-markers.md`
+- `docs/backlogs/000101-unify-catalog-user-runtime-layout-abstraction.md`
+- `docs/backlogs/000102-split-table-metadata-column-index-layouts.md`
+- `docs/backlogs/000103-remove-inline-index-recovery-branch.md`

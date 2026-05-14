@@ -472,10 +472,10 @@ on. Safe synchronization primitives or existing project patterns are preferred.
     foreground access, and prevent checkpoint from observing provisional index
     DDL.
   - Non-goals: Add online DDL or multi-version metadata.
-  - Task Doc: `docs/tasks/TBD.md`
-  - Task Issue: `#0`
-  - Phase Status: `pending`
-  - Implementation Summary: `pending`
+  - Task Doc: `docs/tasks/000147-runtime-layout-and-checkpoint-gate.md`
+  - Task Issue: `#632`
+  - Phase Status: done
+  - Implementation Summary: Implemented Phase 2 runtime layout and checkpoint gates: added immutable TableRuntimeLayout snapshots and install/retired-index cleanup, bound foreground and internal table access to captured layouts, added table metadata-change/root-mutation and catalog checkpoint gates, preserved drop lifecycle semantics, documented deferred refactors in backlogs 000100-000103, and validated default plus libaio nextest and focused coverage. [Task Resolve Sync: docs/tasks/000147-runtime-layout-and-checkpoint-gate.md @ 2026-05-14]
 
 - **Phase 3: Index DDL Redo And Recovery**
   - Scope: Change `CreateIndex`/`DropIndex` redo payloads to
