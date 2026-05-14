@@ -1,0 +1,223 @@
+use crate::buffer::EvictableBufferPool;
+use crate::catalog::TableMetadata;
+use crate::error::{Error, InternalError, Result};
+use crate::index::SecondaryIndex;
+use error_stack::Report;
+use std::sync::Arc;
+
+#[inline]
+fn invalid_runtime_layout(message: impl Into<String>) -> Error {
+    Report::new(InternalError::Generic)
+        .attach(format!("invalid table runtime layout: {}", message.into()))
+        .into()
+}
+
+/// Immutable metadata and secondary-index runtime snapshot for a user table.
+pub(crate) struct TableRuntimeLayout {
+    generation: u64,
+    metadata: Arc<TableMetadata>,
+    secondary_indexes: Box<[Option<Arc<SecondaryIndex<EvictableBufferPool>>>]>,
+}
+
+impl TableRuntimeLayout {
+    /// Create a validated user-table runtime layout snapshot.
+    #[inline]
+    pub(crate) fn new(
+        generation: u64,
+        metadata: Arc<TableMetadata>,
+        secondary_indexes: Box<[Option<Arc<SecondaryIndex<EvictableBufferPool>>>]>,
+    ) -> Result<Self> {
+        let layout = Self {
+            generation,
+            metadata,
+            secondary_indexes,
+        };
+        layout.validate()?;
+        Ok(layout)
+    }
+
+    /// Validate layout shape against metadata and index runtime identity.
+    #[inline]
+    pub(crate) fn validate(&self) -> Result<()> {
+        if self.secondary_indexes.len() != self.metadata.index_slot_count() {
+            return Err(invalid_runtime_layout(format!(
+                "slot count mismatch: runtime_slots={}, metadata_slots={}",
+                self.secondary_indexes.len(),
+                self.metadata.index_slot_count()
+            )));
+        }
+
+        for (index_no, _) in self.metadata.active_indexes() {
+            if self
+                .secondary_indexes
+                .get(index_no)
+                .and_then(Option::as_ref)
+                .is_none()
+            {
+                return Err(invalid_runtime_layout(format!(
+                    "active metadata index missing runtime slot: index_no={index_no}"
+                )));
+            }
+        }
+
+        for (index_no, index) in self.secondary_indexes.iter().enumerate() {
+            let Some(index) = index else {
+                continue;
+            };
+            if self.metadata.index_spec(index_no).is_none() {
+                return Err(invalid_runtime_layout(format!(
+                    "runtime slot has no active metadata spec: index_no={index_no}"
+                )));
+            }
+            if index.index_no() != index_no {
+                return Err(invalid_runtime_layout(format!(
+                    "runtime index_no mismatch: slot={index_no}, runtime={}",
+                    index.index_no()
+                )));
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Returns the monotonic runtime layout generation.
+    #[inline]
+    pub(crate) fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// Returns this layout's table metadata.
+    #[inline]
+    pub(crate) fn metadata(&self) -> &TableMetadata {
+        &self.metadata
+    }
+
+    /// Returns this layout's table metadata as a shared owner.
+    #[inline]
+    pub(crate) fn metadata_arc(&self) -> &Arc<TableMetadata> {
+        &self.metadata
+    }
+
+    /// Returns the sparse secondary-index slot count.
+    #[inline]
+    pub(crate) fn index_slot_count(&self) -> usize {
+        self.secondary_indexes.len()
+    }
+
+    /// Returns the sparse secondary-index runtime slots.
+    #[inline]
+    pub(crate) fn secondary_indexes(&self) -> &[Option<Arc<SecondaryIndex<EvictableBufferPool>>>] {
+        &self.secondary_indexes
+    }
+
+    /// Consumes the layout and returns its secondary-index runtime slots.
+    #[inline]
+    pub(crate) fn into_secondary_indexes(
+        self,
+    ) -> Box<[Option<Arc<SecondaryIndex<EvictableBufferPool>>>]> {
+        self.secondary_indexes
+    }
+
+    /// Returns one active secondary-index runtime by stable index number.
+    #[inline]
+    pub(crate) fn secondary_index(
+        &self,
+        index_no: usize,
+    ) -> Result<&SecondaryIndex<EvictableBufferPool>> {
+        self.secondary_indexes
+            .get(index_no)
+            .and_then(Option::as_deref)
+            .ok_or_else(|| {
+                Report::new(InternalError::SecondaryIndexOutOfBounds)
+                    .attach(format!(
+                        "index_no={index_no}, index_slot_count={}",
+                        self.index_slot_count()
+                    ))
+                    .into()
+            })
+    }
+
+    /// Iterates active secondary-index runtimes by stable index number.
+    #[inline]
+    pub(crate) fn active_secondary_indexes(
+        &self,
+    ) -> impl Iterator<Item = (usize, &SecondaryIndex<EvictableBufferPool>)> + '_ {
+        self.secondary_indexes
+            .iter()
+            .enumerate()
+            .filter_map(|(index_no, index)| index.as_deref().map(|index| (index_no, index)))
+    }
+}
+
+/// Retired user-table secondary-index runtime awaiting async MemIndex destroy.
+pub(crate) struct RetiredSecondaryIndex {
+    pub(crate) index_no: usize,
+    pub(crate) retired_generation: u64,
+    pub(crate) index: Arc<SecondaryIndex<EvictableBufferPool>>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::catalog::{ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexSpec};
+    use crate::value::ValKind;
+
+    fn metadata_without_indexes() -> Arc<TableMetadata> {
+        Arc::new(TableMetadata::new(
+            vec![ColumnSpec::new(
+                "id",
+                ValKind::I32,
+                ColumnAttributes::empty(),
+            )],
+            vec![],
+        ))
+    }
+
+    fn metadata_with_primary_index() -> Arc<TableMetadata> {
+        Arc::new(TableMetadata::new(
+            vec![ColumnSpec::new(
+                "id",
+                ValKind::I32,
+                ColumnAttributes::empty(),
+            )],
+            vec![IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::PK)],
+        ))
+    }
+
+    #[test]
+    fn runtime_layout_accepts_matching_empty_index_shape() {
+        let metadata = metadata_without_indexes();
+        let layout = TableRuntimeLayout::new(
+            7,
+            Arc::clone(&metadata),
+            Vec::<Option<Arc<SecondaryIndex<EvictableBufferPool>>>>::new().into_boxed_slice(),
+        )
+        .expect("empty index layout should be valid");
+
+        assert_eq!(layout.generation(), 7);
+        assert_eq!(layout.metadata().index_slot_count(), 0);
+        assert_eq!(layout.index_slot_count(), 0);
+    }
+
+    #[test]
+    fn runtime_layout_rejects_slot_count_mismatch() {
+        let metadata = metadata_without_indexes();
+        let err = match TableRuntimeLayout::new(0, metadata, vec![None].into_boxed_slice()) {
+            Ok(_) => panic!("extra runtime slot should be rejected"),
+            Err(err) => err,
+        };
+
+        assert!(err.is_kind(crate::error::ErrorKind::Internal), "{err:?}");
+    }
+
+    #[test]
+    fn runtime_layout_rejects_active_index_without_runtime_slot() {
+        let metadata = metadata_with_primary_index();
+        let err = match TableRuntimeLayout::new(0, metadata, vec![None].into_boxed_slice()) {
+            Ok(_) => panic!("active metadata index requires runtime slot"),
+            Err(err) => err,
+        };
+
+        assert!(err.is_kind(crate::error::ErrorKind::Internal), "{err:?}");
+    }
+}

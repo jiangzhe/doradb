@@ -461,7 +461,7 @@ impl<'a> LogRecovery<'a> {
         // the table's DiskTree roots. Rebuild only hot row-page MemIndex state.
         for (table_id, pages) in &self.recovered_tables {
             if let Some(table) = self.catalog.get_table(*table_id).await {
-                let metadata = Arc::new(table.metadata().clone());
+                let metadata = table.metadata();
                 for page_id in pages {
                     table
                         .populate_index_via_row_page(&self.pool_guards, *page_id)
@@ -1264,7 +1264,7 @@ mod tests {
 
             assert!(engine.catalog().get_table(table_id).await.is_some());
             let table = engine.catalog().get_table(table_id).await.unwrap();
-            assert_eq!(table.metadata(), &expected_metadata);
+            assert_eq!(table.metadata().as_ref(), &expected_metadata);
 
             drop(table);
             drop(engine);
@@ -1374,7 +1374,7 @@ mod tests {
             let session = engine.try_new_session().unwrap();
             let mut rows = 0usize;
             table
-                .accessor()
+                .accessor_with_layout(table.layout_snapshot())
                 .table_scan_uncommitted(session.pool_guards(), |_metadata, row| {
                     assert!(row.row_id() as usize <= DML_SIZE);
                     rows += if row.is_deleted() { 0 } else { 1 };
@@ -1532,15 +1532,17 @@ mod tests {
             let mut session = engine.try_new_session().unwrap();
             assert_eq!(table.total_row_pages(session.pool_guards()).await, 0);
 
-            let mut trx = session.try_begin_trx().unwrap().unwrap();
             let key = SelectKey::new(0, vec![Val::from(7u32)]);
-            let index = table.require_sec_idx(key.index_no).unwrap();
+            let layout = table.layout_snapshot();
+            let index = layout.secondary_index(key.index_no).unwrap();
             let root = table.file().active_root_unchecked().secondary_index_roots[key.index_no];
-            let disk = index
-                .disk_runtime()
-                .open_unique_at(root, session.pool_guards().disk_guard())
-                .unwrap();
-            assert_eq!(disk.lookup(&key.vals).await.unwrap(), Some(cold_row_id));
+            {
+                let disk = index
+                    .disk_runtime()
+                    .open_unique_at(root, session.pool_guards().disk_guard())
+                    .unwrap();
+                assert_eq!(disk.lookup(&key.vals).await.unwrap(), Some(cold_row_id));
+            }
             assert_eq!(
                 index
                     .bind_unique(root)
@@ -1554,6 +1556,7 @@ mod tests {
                     .unwrap(),
                 Some((cold_row_id, false))
             );
+            let mut trx = session.try_begin_trx().unwrap().unwrap();
             let row = trx_select_row_mvcc(&mut trx, &table, &key, &[0, 1]).await;
             assert_eq!(
                 row.unwrap().unwrap_found(),
@@ -1561,6 +1564,7 @@ mod tests {
             );
             trx.commit().await.unwrap();
 
+            drop(layout);
             drop(table);
             drop(session);
             drop(engine);
@@ -1662,13 +1666,16 @@ mod tests {
             let mut session = engine.try_new_session().unwrap();
             assert!(table.total_row_pages(session.pool_guards()).await > 0);
 
-            let index = table.require_sec_idx(key.index_no).unwrap();
+            let layout = table.layout_snapshot();
+            let index = layout.secondary_index(key.index_no).unwrap();
             let root = table.file().active_root_unchecked().secondary_index_roots[key.index_no];
-            let disk = index
-                .disk_runtime()
-                .open_unique_at(root, session.pool_guards().disk_guard())
-                .unwrap();
-            assert_eq!(disk.lookup(&key.vals).await.unwrap(), Some(cold_row_id));
+            {
+                let disk = index
+                    .disk_runtime()
+                    .open_unique_at(root, session.pool_guards().disk_guard())
+                    .unwrap();
+                assert_eq!(disk.lookup(&key.vals).await.unwrap(), Some(cold_row_id));
+            }
             assert_eq!(
                 index
                     .bind_unique(root)
@@ -1691,6 +1698,7 @@ mod tests {
             );
             trx.commit().await.unwrap();
 
+            drop(layout);
             drop(table);
             drop(session);
             drop(engine);
@@ -1775,21 +1783,24 @@ mod tests {
             assert_eq!(table.total_row_pages(session.pool_guards()).await, 0);
 
             let name_key = SelectKey::new(1, vec![Val::from("same-name")]);
-            let non_unique = table.require_sec_idx(name_key.index_no).unwrap();
+            let layout = table.layout_snapshot();
+            let non_unique = layout.secondary_index(name_key.index_no).unwrap();
             let root =
                 table.file().active_root_unchecked().secondary_index_roots[name_key.index_no];
-            let disk = non_unique
-                .disk_runtime()
-                .open_non_unique_at(root, session.pool_guards().disk_guard())
-                .unwrap();
-            let disk_rows = disk
-                .prefix_scan_entries(&name_key.vals)
-                .await
-                .unwrap()
-                .into_iter()
-                .map(|(_, row_id)| row_id)
-                .collect::<Vec<_>>();
+            let disk_rows = {
+                let disk = non_unique
+                    .disk_runtime()
+                    .open_non_unique_at(root, session.pool_guards().disk_guard())
+                    .unwrap();
+                disk.prefix_scan_entries(&name_key.vals)
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .map(|(_, row_id)| row_id)
+                    .collect::<Vec<_>>()
+            };
             assert_eq!(disk_rows, same_row_ids);
+            drop(layout);
             match table.deletion_buffer().get(same_row_ids[1]).unwrap() {
                 DeleteMarker::Committed(_) => (),
                 DeleteMarker::Ref(_) => panic!("recovered cold delete should be committed"),

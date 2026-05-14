@@ -6,6 +6,8 @@ use crate::trx::log::{LogPartitionInitializer, list_log_files};
 use crate::trx::log_replay::LogMerger;
 use crate::trx::redo::{DDLRedo, RowRedoKind, TableDML};
 use crate::trx::sys::TransactionSystem;
+use event_listener::{Event, listener};
+use parking_lot::Mutex;
 use std::collections::BTreeMap;
 
 /// One catalog-row redo operation extracted from persisted logs.
@@ -49,6 +51,197 @@ pub(crate) struct CatalogCheckpointScanConfig {
     pub(crate) max_io_size: usize,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum CatalogMetadataChangePhase {
+    #[default]
+    Open,
+    Pending,
+    Active,
+}
+
+#[derive(Debug, Default)]
+struct CatalogCheckpointGateState {
+    checkpoint_active: bool,
+    metadata_change: CatalogMetadataChangePhase,
+}
+
+/// Reversible catalog metadata-change gate for catalog checkpoint exclusion.
+pub(crate) struct CatalogCheckpointGate {
+    state: Mutex<CatalogCheckpointGateState>,
+    changed: Event,
+}
+
+impl CatalogCheckpointGate {
+    /// Create an open catalog checkpoint gate.
+    #[inline]
+    pub(crate) fn new() -> Self {
+        Self {
+            state: Mutex::new(CatalogCheckpointGateState::default()),
+            changed: Event::new(),
+        }
+    }
+
+    /// Acquires a catalog checkpoint lease, waiting for active metadata DDL.
+    pub(crate) async fn begin_checkpoint(&self) -> CatalogCheckpointLease<'_> {
+        loop {
+            {
+                let mut state = self.state.lock();
+                if state.metadata_change == CatalogMetadataChangePhase::Open {
+                    assert!(
+                        !state.checkpoint_active,
+                        "concurrent catalog checkpoint is not supported"
+                    );
+                    state.checkpoint_active = true;
+                    return CatalogCheckpointLease { gate: self };
+                }
+            }
+            listener!(self.changed => listener);
+            {
+                let state = self.state.lock();
+                if state.metadata_change == CatalogMetadataChangePhase::Open {
+                    continue;
+                }
+            }
+            listener.await;
+        }
+    }
+
+    /// Acquires a catalog metadata-change lease for future index DDL.
+    pub(crate) async fn begin_metadata_change(&self) -> CatalogMetadataChangeLease<'_> {
+        let mut pending = None;
+        loop {
+            {
+                let mut state = self.state.lock();
+                match state.metadata_change {
+                    CatalogMetadataChangePhase::Open if !state.checkpoint_active => {
+                        // No checkpoint is running, so this metadata DDL can
+                        // immediately exclude future catalog checkpoints.
+                        state.metadata_change = CatalogMetadataChangePhase::Active;
+                        return CatalogMetadataChangeLease { gate: self };
+                    }
+                    CatalogMetadataChangePhase::Open => {
+                        // A checkpoint is already inside the gated section.
+                        // Reserve the metadata change as pending so later
+                        // checkpoints cannot enter ahead of it.
+                        state.metadata_change = CatalogMetadataChangePhase::Pending;
+                        pending = Some(PendingCatalogMetadataChange::new(self));
+                    }
+                    CatalogMetadataChangePhase::Pending
+                        if pending.is_some() && !state.checkpoint_active =>
+                    {
+                        // This waiter owns the pending reservation, and the
+                        // active checkpoint has drained. Promote the
+                        // reservation into the exclusive metadata-change lease.
+                        state.metadata_change = CatalogMetadataChangePhase::Active;
+                        if let Some(pending) = &mut pending {
+                            pending.disarm();
+                        }
+                        return CatalogMetadataChangeLease { gate: self };
+                    }
+                    CatalogMetadataChangePhase::Pending | CatalogMetadataChangePhase::Active => {
+                        // Another metadata change is either already active or
+                        // has the pending reservation; wait for the next state
+                        // transition and retry.
+                    }
+                }
+            }
+            listener!(self.changed => listener);
+            {
+                let state = self.state.lock();
+                let can_retry = match state.metadata_change {
+                    CatalogMetadataChangePhase::Open => true,
+                    CatalogMetadataChangePhase::Pending => {
+                        pending.is_some() && !state.checkpoint_active
+                    }
+                    CatalogMetadataChangePhase::Active => false,
+                };
+                if can_retry {
+                    continue;
+                }
+            }
+            listener.await;
+        }
+    }
+
+    #[inline]
+    fn release_checkpoint(&self) {
+        let mut state = self.state.lock();
+        debug_assert!(state.checkpoint_active);
+        state.checkpoint_active = false;
+        drop(state);
+        self.changed.notify(usize::MAX);
+    }
+
+    #[inline]
+    fn release_metadata_change(&self) {
+        let mut state = self.state.lock();
+        debug_assert_eq!(state.metadata_change, CatalogMetadataChangePhase::Active);
+        state.metadata_change = CatalogMetadataChangePhase::Open;
+        drop(state);
+        self.changed.notify(usize::MAX);
+    }
+
+    #[inline]
+    fn release_pending_metadata_change(&self) {
+        let mut state = self.state.lock();
+        if state.metadata_change == CatalogMetadataChangePhase::Pending {
+            state.metadata_change = CatalogMetadataChangePhase::Open;
+            drop(state);
+            self.changed.notify(usize::MAX);
+        }
+    }
+}
+
+struct PendingCatalogMetadataChange<'a> {
+    gate: &'a CatalogCheckpointGate,
+    armed: bool,
+}
+
+impl<'a> PendingCatalogMetadataChange<'a> {
+    #[inline]
+    fn new(gate: &'a CatalogCheckpointGate) -> Self {
+        Self { gate, armed: true }
+    }
+
+    #[inline]
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for PendingCatalogMetadataChange<'_> {
+    #[inline]
+    fn drop(&mut self) {
+        if self.armed {
+            self.gate.release_pending_metadata_change();
+        }
+    }
+}
+
+/// RAII guard for a catalog checkpoint scan/apply section.
+pub(crate) struct CatalogCheckpointLease<'a> {
+    gate: &'a CatalogCheckpointGate,
+}
+
+impl Drop for CatalogCheckpointLease<'_> {
+    #[inline]
+    fn drop(&mut self) {
+        self.gate.release_checkpoint();
+    }
+}
+
+/// RAII guard for future catalog metadata DDL sections.
+pub(crate) struct CatalogMetadataChangeLease<'a> {
+    gate: &'a CatalogCheckpointGate,
+}
+
+impl Drop for CatalogMetadataChangeLease<'_> {
+    #[inline]
+    fn drop(&mut self) {
+        self.gate.release_metadata_change();
+    }
+}
+
 impl Catalog {
     /// Trigger one ad-hoc catalog checkpoint publish.
     ///
@@ -61,6 +254,7 @@ impl Catalog {
     /// an atomic claim and will panic on violation.
     #[inline]
     pub async fn checkpoint_now(&self, trx_sys: &TransactionSystem) -> Result<()> {
+        let _checkpoint_lease = self.checkpoint_gate.begin_checkpoint().await;
         let batch = self.scan_checkpoint_batch(trx_sys)?;
         match self.apply_checkpoint_batch(batch).await {
             Ok(()) => {
@@ -204,4 +398,103 @@ fn drop_table_has_catalog_table_delete(
             && key.vals.len() == 1
             && key.vals[0].as_u64().is_some_and(|id| id == table_id)
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_catalog_metadata_change_waits_for_active_checkpoint() {
+        smol::block_on(async {
+            let gate = CatalogCheckpointGate::new();
+            let checkpoint_lease = gate.begin_checkpoint().await;
+            let mut metadata_fut = Box::pin(gate.begin_metadata_change());
+
+            assert!(matches!(
+                futures::poll!(metadata_fut.as_mut()),
+                std::task::Poll::Pending
+            ));
+
+            drop(checkpoint_lease);
+            let metadata_lease = metadata_fut.await;
+            let mut checkpoint_fut = Box::pin(gate.begin_checkpoint());
+            assert!(matches!(
+                futures::poll!(checkpoint_fut.as_mut()),
+                std::task::Poll::Pending
+            ));
+
+            drop(metadata_lease);
+            let _checkpoint_lease = checkpoint_fut.await;
+        });
+    }
+
+    #[test]
+    fn test_catalog_checkpoint_waits_for_active_metadata_change() {
+        smol::block_on(async {
+            let gate = CatalogCheckpointGate::new();
+            let metadata_lease = gate.begin_metadata_change().await;
+            let mut checkpoint_fut = Box::pin(gate.begin_checkpoint());
+
+            assert!(matches!(
+                futures::poll!(checkpoint_fut.as_mut()),
+                std::task::Poll::Pending
+            ));
+
+            drop(metadata_lease);
+            let _checkpoint_lease = checkpoint_fut.await;
+        });
+    }
+
+    #[test]
+    fn test_catalog_pending_metadata_change_cancellation_reopens_checkpoint() {
+        smol::block_on(async {
+            let gate = CatalogCheckpointGate::new();
+            let checkpoint_lease = gate.begin_checkpoint().await;
+            let mut metadata_fut = Box::pin(gate.begin_metadata_change());
+
+            assert!(matches!(
+                futures::poll!(metadata_fut.as_mut()),
+                std::task::Poll::Pending
+            ));
+
+            drop(metadata_fut);
+            drop(checkpoint_lease);
+            let _checkpoint_lease = gate.begin_checkpoint().await;
+        });
+    }
+
+    #[test]
+    fn test_catalog_second_metadata_change_completes_after_pending_waiter_cancelled() {
+        smol::block_on(async {
+            let gate = CatalogCheckpointGate::new();
+            let checkpoint_lease = gate.begin_checkpoint().await;
+            let mut pending_owner = Box::pin(gate.begin_metadata_change());
+            let mut second_waiter = Box::pin(gate.begin_metadata_change());
+
+            assert!(matches!(
+                futures::poll!(pending_owner.as_mut()),
+                std::task::Poll::Pending
+            ));
+            assert!(matches!(
+                futures::poll!(second_waiter.as_mut()),
+                std::task::Poll::Pending
+            ));
+
+            drop(pending_owner);
+            drop(checkpoint_lease);
+
+            let waiter = async {
+                let metadata_lease = second_waiter.await;
+                drop(metadata_lease);
+            };
+            smol::future::or(waiter, async {
+                smol::Timer::after(std::time::Duration::from_secs(1)).await;
+                panic!(
+                    "second metadata-change waiter failed to acquire after pending cancellation"
+                );
+            })
+            .await;
+        });
+    }
 }

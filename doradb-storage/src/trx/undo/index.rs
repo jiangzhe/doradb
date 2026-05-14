@@ -47,7 +47,7 @@ impl IndexUndoLogs {
         ts: TrxID,
     ) -> Result<()> {
         while let Some(entry) = self.0.pop() {
-            let table = table_cache.must_get_table(entry.table_id).await;
+            let table = table_cache.must_get_table_binding_mut(entry.table_id).await;
             table.rollback_index_entry(entry, guards, ts).await?;
         }
         Ok(())

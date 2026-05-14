@@ -1,5 +1,6 @@
-use super::{Table, TableRootSnapshot};
+use super::{Table, TableRootSnapshot, TableRuntimeLayout};
 use crate::buffer::{BufferPool, EvictableBufferPool, PoolGuard, PoolGuards};
+use crate::catalog::TableMetadata;
 use crate::error::{DataIntegrityError, Error, FileKind, InternalError, OperationError, Result};
 use crate::file::BlockID;
 use crate::file::cow_file::SUPER_BLOCK_ID;
@@ -13,6 +14,7 @@ use crate::session::Session;
 use crate::trx::{TrxID, TrxReadProof};
 use crate::value::Val;
 use error_stack::Report;
+use std::sync::Arc;
 
 #[inline]
 fn invalid_lwc_payload(
@@ -56,6 +58,8 @@ pub struct SecondaryMemIndexCleanupIndexStats {
 
 struct MemIndexCleanupSnapshot<'ctx> {
     root: TableRootSnapshot<'ctx>,
+    root_metadata: Arc<TableMetadata>,
+    layout: Arc<TableRuntimeLayout>,
     min_active_sts: TrxID,
 }
 
@@ -89,10 +93,21 @@ impl MemIndexCleanupSnapshot<'_> {
     fn secondary_index_root(&self, index_no: usize) -> Result<BlockID> {
         self.root.secondary_index_root(index_no)
     }
+
+    #[inline]
+    fn root_index_is_active(&self, index_no: usize) -> bool {
+        self.root_metadata.index_spec(index_no).is_some()
+    }
+
+    #[inline]
+    fn layout(&self) -> &TableRuntimeLayout {
+        &self.layout
+    }
 }
 
 struct MemIndexCleanupContext<'a, 'ctx> {
     snapshot: &'a MemIndexCleanupSnapshot<'ctx>,
+    metadata: &'a TableMetadata,
     clean_live_entries: bool,
     column_index: Option<&'a ColumnBlockIndex<'a>>,
     index_pool_guard: &'a PoolGuard,
@@ -198,8 +213,17 @@ impl Table {
         min_active_sts: TrxID,
         proof: &TrxReadProof<'ctx>,
     ) -> Result<MemIndexCleanupSnapshot<'ctx>> {
+        let layout = self.layout_snapshot();
+        let (root, root_metadata) = self.with_active_root(proof, |root| {
+            (
+                TableRootSnapshot::from_active_root(root, proof),
+                Arc::clone(&root.metadata),
+            )
+        });
         Ok(MemIndexCleanupSnapshot {
-            root: self.root_snapshot(proof)?,
+            root,
+            root_metadata,
+            layout,
             min_active_sts,
         })
     }
@@ -213,22 +237,28 @@ impl Table {
     ) -> Result<SecondaryMemIndexCleanupStats> {
         debug_assert!(snapshot.deletion_cutoff_ts() <= snapshot.root_trx_id());
 
+        let layout = snapshot.layout();
+        let metadata = layout.metadata();
         let column_index = self.cleanup_column_index(guards, snapshot);
         let index_pool_guard = self.index_pool_guard(guards);
         let disk_pool_guard = guards.disk_guard();
         let cleanup_context = MemIndexCleanupContext {
             snapshot,
+            metadata,
             clean_live_entries,
             column_index: column_index.as_ref(),
             index_pool_guard,
             disk_pool_guard,
         };
         let mut stats = SecondaryMemIndexCleanupStats {
-            indexes: Vec::with_capacity(self.metadata().active_index_count()),
+            indexes: Vec::with_capacity(metadata.active_index_count()),
         };
 
-        for index in self.sec_idx().iter().filter_map(Option::as_ref) {
+        for (_, index) in layout.active_secondary_indexes() {
             let index_no = index.index_no();
+            if !snapshot.root_index_is_active(index_no) {
+                continue;
+            }
             let secondary_root = snapshot.secondary_index_root(index_no)?;
             let mut index_stats =
                 SecondaryMemIndexCleanupIndexStats::new(index_no, index.is_unique());
@@ -515,7 +545,8 @@ impl Table {
         index_no: usize,
         row: ResolvedColumnRow,
     ) -> Result<Vec<Val>> {
-        let index_spec = self.metadata().index_spec(index_no).ok_or_else(|| {
+        let metadata = cleanup_context.metadata;
+        let index_spec = metadata.index_spec(index_no).ok_or_else(|| {
             Error::from(
                 Report::new(InternalError::IndexKeyMissing).attach(format!("index_no={index_no}")),
             )
@@ -540,7 +571,7 @@ impl Table {
                 "row shape fingerprint mismatch",
             ));
         }
-        block.decode_row_values(self.metadata(), row.row_idx(), &read_set)
+        block.decode_row_values(metadata, row.row_idx(), &read_set)
     }
 }
 

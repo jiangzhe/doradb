@@ -17,8 +17,8 @@ use crate::row::ops::{
 use crate::row::{Row, RowID, RowPage, RowRead, estimate_max_row_count, var_len_for_insert};
 use crate::table::{
     ColumnDeletionBuffer, ColumnStorage, DeleteInternal, DeleteMarker, DeletionError,
-    GenericMemTable, InsertRowIntoPage, Table, TableRootSnapshot, UpdateRowInplace,
-    index_key_is_changed, index_key_replace, read_latest_index_key, row_len,
+    GenericMemTable, InsertRowIntoPage, Table, TableRootSnapshot, TableRuntimeLayout,
+    UpdateRowInplace, index_key_is_changed, index_key_replace, read_latest_index_key, row_len,
     validate_page_row_range,
 };
 use crate::trx::redo::{RowRedo, RowRedoKind};
@@ -241,7 +241,22 @@ pub(crate) trait TableAccess {
 pub(crate) struct TableAccessor<'a, D: 'static, I: 'static> {
     mem: &'a GenericMemTable<D, I>,
     storage: Option<&'a ColumnStorage>,
-    user_sec_idx: Option<&'a [Option<SecondaryIndex<EvictableBufferPool>>]>,
+    user_layout: Option<UserLayout<'a>>,
+}
+
+enum UserLayout<'a> {
+    Owned(Arc<TableRuntimeLayout>),
+    Borrowed(&'a TableRuntimeLayout),
+}
+
+impl UserLayout<'_> {
+    #[inline]
+    fn as_layout(&self) -> &TableRuntimeLayout {
+        match self {
+            UserLayout::Owned(layout) => layout,
+            UserLayout::Borrowed(layout) => layout,
+        }
+    }
 }
 
 enum IndexPurgeDecision {
@@ -264,18 +279,18 @@ fn ctx_pool_guards(ctx: &TrxContext) -> &PoolGuards {
 
 #[inline]
 fn require_user_sec_idx(
-    indexes: &[Option<SecondaryIndex<EvictableBufferPool>>],
+    indexes: &[Option<Arc<SecondaryIndex<EvictableBufferPool>>>],
     index_no: usize,
 ) -> Result<&SecondaryIndex<EvictableBufferPool>> {
     indexes
         .get(index_no)
-        .and_then(Option::as_ref)
+        .and_then(Option::as_deref)
         .ok_or_else(|| missing_secondary_index(index_no, indexes.len()))
 }
 
 #[inline]
 fn bound_unique_user_index<'a>(
-    indexes: Option<&'a [Option<SecondaryIndex<EvictableBufferPool>>]>,
+    indexes: Option<&'a [Option<Arc<SecondaryIndex<EvictableBufferPool>>>]>,
     index_no: usize,
     root: BlockID,
 ) -> Result<UniqueSecondaryIndex<'a, EvictableBufferPool>> {
@@ -285,7 +300,7 @@ fn bound_unique_user_index<'a>(
 
 #[inline]
 fn bound_non_unique_user_index<'a>(
-    indexes: Option<&'a [Option<SecondaryIndex<EvictableBufferPool>>]>,
+    indexes: Option<&'a [Option<Arc<SecondaryIndex<EvictableBufferPool>>>]>,
     index_no: usize,
     root: BlockID,
 ) -> Result<NonUniqueSecondaryIndex<'a, EvictableBufferPool>> {
@@ -296,11 +311,7 @@ fn bound_non_unique_user_index<'a>(
 impl<'a> From<&'a Table> for TableAccessor<'a, EvictableBufferPool, EvictableBufferPool> {
     #[inline]
     fn from(table: &'a Table) -> Self {
-        TableAccessor {
-            mem: table,
-            storage: Some(&table.storage),
-            user_sec_idx: Some(table.sec_idx()),
-        }
+        Self::new_user(table, table.layout_snapshot())
     }
 }
 
@@ -310,12 +321,49 @@ impl<'a> From<&'a CatalogTable> for TableAccessor<'a, FixedBufferPool, FixedBuff
         TableAccessor {
             mem: table,
             storage: None,
-            user_sec_idx: None,
+            user_layout: None,
+        }
+    }
+}
+
+impl<'a> TableAccessor<'a, EvictableBufferPool, EvictableBufferPool> {
+    /// Create a user-table accessor bound to one runtime layout snapshot.
+    #[inline]
+    pub(crate) fn new_user(table: &'a Table, layout: Arc<TableRuntimeLayout>) -> Self {
+        TableAccessor {
+            mem: table,
+            storage: Some(&table.storage),
+            user_layout: Some(UserLayout::Owned(layout)),
+        }
+    }
+
+    /// Create a user-table accessor over an externally pinned layout snapshot.
+    #[inline]
+    pub(crate) fn new_user_borrowed(table: &'a Table, layout: &'a TableRuntimeLayout) -> Self {
+        TableAccessor {
+            mem: table,
+            storage: Some(&table.storage),
+            user_layout: Some(UserLayout::Borrowed(layout)),
         }
     }
 }
 
 impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
+    #[inline]
+    fn user_sec_idx(&self) -> Option<&[Option<Arc<SecondaryIndex<EvictableBufferPool>>>]> {
+        self.user_layout
+            .as_ref()
+            .map(|layout| layout.as_layout().secondary_indexes())
+    }
+
+    #[inline]
+    fn metadata(&self) -> &TableMetadata {
+        self.user_layout.as_ref().map_or_else(
+            || self.mem.metadata(),
+            |layout| layout.as_layout().metadata(),
+        )
+    }
+
     #[inline]
     fn require_generic_sec_idx(&self, index_no: usize) -> Result<&InMemorySecondaryIndex<I>> {
         self.mem.require_sec_idx(index_no)
@@ -323,13 +371,13 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
 
     #[inline]
     fn sec_idx_len(&self) -> usize {
-        self.user_sec_idx
+        self.user_sec_idx()
             .map_or_else(|| self.mem.sec_idx().len(), <[_]>::len)
     }
 
     #[inline]
     fn sec_idx_is_active(&self, index_no: usize) -> bool {
-        match self.user_sec_idx {
+        match self.user_sec_idx() {
             Some(indexes) => indexes.get(index_no).is_some_and(Option::is_some),
             None => self
                 .mem
@@ -341,7 +389,7 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
 
     #[inline]
     fn sec_idx_is_unique(&self, index_no: usize) -> bool {
-        match self.user_sec_idx {
+        match self.user_sec_idx() {
             Some(indexes) => require_user_sec_idx(indexes, index_no)
                 .expect("active user index slot")
                 .is_unique(),
@@ -361,6 +409,11 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
         let Some(storage) = self.storage else {
             return Ok(SecondaryIndexView::catalog(ctx.sts()));
         };
+        // User accessors pin the metadata/runtime layout, but intentionally
+        // bind secondary DiskTree operations to the latest proof-gated root.
+        // Checkpoint publication may advance roots without changing layout
+        // shape. Layout-changing DDL must preserve sparse slot numbers and
+        // exclude foreground users before publishing an incompatible layout.
         let proof = ctx.read_proof();
         let root = storage.with_active_root(&proof, |root| {
             root.secondary_index_roots
@@ -376,6 +429,9 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
         let Some(storage) = self.storage else {
             return Ok(SecondaryIndexView::catalog(ts));
         };
+        // Unchecked internal callers share the same layout/root compatibility
+        // contract as proof-gated foreground reads. Purge additionally treats
+        // inactive layout slots as no-ops before reaching this binding point.
         let root = storage
             .file()
             .active_root_unchecked()
@@ -416,7 +472,7 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
         snapshot: Option<&TableRootSnapshot<'_>>,
         index_no: usize,
     ) -> Result<SecondaryIndexView> {
-        match (self.user_sec_idx, snapshot) {
+        match (self.user_sec_idx(), snapshot) {
             (Some(_), Some(snapshot)) => Ok(SecondaryIndexView::user(
                 ts,
                 snapshot.secondary_index_root(index_no)?,
@@ -435,9 +491,10 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
         view: SecondaryIndexView,
     ) -> Result<Option<(RowID, bool)>> {
         let index_pool_guard = self.index_pool_guard(guards);
-        match (self.user_sec_idx, view) {
+        let user_sec_idx = self.user_sec_idx();
+        match (user_sec_idx, view) {
             (Some(_), SecondaryIndexView::User { ts, root }) => {
-                bound_unique_user_index(self.user_sec_idx, index_no, root)?
+                bound_unique_user_index(user_sec_idx, index_no, root)?
                     .lookup(index_pool_guard, key, ts)
                     .await
             }
@@ -465,9 +522,10 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
         view: SecondaryIndexView,
     ) -> Result<IndexInsert> {
         let index_pool_guard = self.index_pool_guard(guards);
-        match (self.user_sec_idx, view) {
+        let user_sec_idx = self.user_sec_idx();
+        match (user_sec_idx, view) {
             (Some(_), SecondaryIndexView::User { ts, root }) => {
-                bound_unique_user_index(self.user_sec_idx, index_no, root)?
+                bound_unique_user_index(user_sec_idx, index_no, root)?
                     .insert_if_not_exists(index_pool_guard, key, row_id, merge_if_match_deleted, ts)
                     .await
             }
@@ -501,7 +559,7 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
         ts: TrxID,
     ) -> Result<bool> {
         let index_pool_guard = self.index_pool_guard(guards);
-        match self.user_sec_idx {
+        match self.user_sec_idx() {
             Some(indexes) => {
                 require_user_sec_idx(indexes, index_no)?
                     .unique_mem()?
@@ -530,9 +588,10 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
         view: SecondaryIndexView,
     ) -> Result<bool> {
         let index_pool_guard = self.index_pool_guard(guards);
-        match (self.user_sec_idx, view) {
+        let user_sec_idx = self.user_sec_idx();
+        match (user_sec_idx, view) {
             (Some(_), SecondaryIndexView::User { ts, root }) => {
-                bound_unique_user_index(self.user_sec_idx, index_no, root)?
+                bound_unique_user_index(user_sec_idx, index_no, root)?
                     .mask_as_deleted(index_pool_guard, key, row_id, ts)
                     .await
             }
@@ -560,9 +619,10 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
         view: SecondaryIndexView,
     ) -> Result<IndexCompareExchange> {
         let index_pool_guard = self.index_pool_guard(guards);
-        match (self.user_sec_idx, view) {
+        let user_sec_idx = self.user_sec_idx();
+        match (user_sec_idx, view) {
             (Some(_), SecondaryIndexView::User { ts, root }) => {
-                bound_unique_user_index(self.user_sec_idx, index_no, root)?
+                bound_unique_user_index(user_sec_idx, index_no, root)?
                     .compare_exchange(index_pool_guard, key, old_row_id, new_row_id, ts)
                     .await
             }
@@ -591,9 +651,10 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
         view: SecondaryIndexView,
     ) -> Result<()> {
         let index_pool_guard = self.index_pool_guard(guards);
-        match (self.user_sec_idx, view) {
+        let user_sec_idx = self.user_sec_idx();
+        match (user_sec_idx, view) {
             (Some(_), SecondaryIndexView::User { ts, root }) => {
-                bound_non_unique_user_index(self.user_sec_idx, index_no, root)?
+                bound_non_unique_user_index(user_sec_idx, index_no, root)?
                     .lookup(index_pool_guard, key, res, ts)
                     .await
             }
@@ -622,9 +683,10 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
         view: SecondaryIndexView,
     ) -> Result<Option<bool>> {
         let index_pool_guard = self.index_pool_guard(guards);
-        match (self.user_sec_idx, view) {
+        let user_sec_idx = self.user_sec_idx();
+        match (user_sec_idx, view) {
             (Some(_), SecondaryIndexView::User { ts, root }) => {
-                bound_non_unique_user_index(self.user_sec_idx, index_no, root)?
+                bound_non_unique_user_index(user_sec_idx, index_no, root)?
                     .lookup_unique(index_pool_guard, key, row_id, ts)
                     .await
             }
@@ -654,9 +716,10 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
         view: SecondaryIndexView,
     ) -> Result<IndexInsert> {
         let index_pool_guard = self.index_pool_guard(guards);
-        match (self.user_sec_idx, view) {
+        let user_sec_idx = self.user_sec_idx();
+        match (user_sec_idx, view) {
             (Some(_), SecondaryIndexView::User { ts, root }) => {
-                bound_non_unique_user_index(self.user_sec_idx, index_no, root)?
+                bound_non_unique_user_index(user_sec_idx, index_no, root)?
                     .insert_if_not_exists(index_pool_guard, key, row_id, merge_if_match_deleted, ts)
                     .await
             }
@@ -691,9 +754,10 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
         view: SecondaryIndexView,
     ) -> Result<bool> {
         let index_pool_guard = self.index_pool_guard(guards);
-        match (self.user_sec_idx, view) {
+        let user_sec_idx = self.user_sec_idx();
+        match (user_sec_idx, view) {
             (Some(_), SecondaryIndexView::User { ts, root }) => {
-                bound_non_unique_user_index(self.user_sec_idx, index_no, root)?
+                bound_non_unique_user_index(user_sec_idx, index_no, root)?
                     .mask_as_deleted(index_pool_guard, key, row_id, ts)
                     .await
             }
@@ -723,7 +787,7 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
         ts: TrxID,
     ) -> Result<bool> {
         let index_pool_guard = self.index_pool_guard(guards);
-        match self.user_sec_idx {
+        match self.user_sec_idx() {
             Some(indexes) => {
                 require_user_sec_idx(indexes, index_no)?
                     .non_unique_mem()?

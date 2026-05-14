@@ -296,10 +296,12 @@ impl TransactionSystem {
         for trx in &trx_list {
             if let Some(index_gc) = trx.index_gc() {
                 for ip in index_gc {
-                    if let Some(table) = table_cache.get_table_ref(ip.table_id).await
-                        && let Ok(true) = table
-                            .delete_index(guards, &ip.key, ip.row_id, ip.unique, min_active_sts)
-                            .await
+                    let Some(table) = table_cache.get_table_binding_mut(ip.table_id).await else {
+                        continue;
+                    };
+                    if let Ok(true) = table
+                        .delete_index(guards, &ip.key, ip.row_id, ip.unique, min_active_sts)
+                        .await
                     {
                         purge_index_count += 1;
                     }
@@ -890,12 +892,12 @@ mod tests {
     use super::*;
     use crate::buffer::guard::PageSharedGuard;
     use crate::buffer::page::VersionedPageID;
-    use crate::buffer::{BufferPool, PoolGuards, PoolRole};
+    use crate::buffer::{BufferPool, PoolGuard, PoolGuards, PoolRole};
     use crate::catalog::tests::table1;
     use crate::conf::{EngineConfig, EvictableBufferPoolConfig, TrxSysConfig};
     use crate::error::FatalError;
     use crate::file::cow_file::BlockID;
-    use crate::index::{RowLocation, UniqueIndex};
+    use crate::index::{IndexCompareExchange, IndexInsert, RowLocation, UniqueIndex};
     use crate::latch::LatchFallbackMode;
     use crate::row::ops::{DeleteMvcc, SelectKey};
     use crate::row::{RowID, RowPage};
@@ -924,13 +926,102 @@ mod tests {
         table.file().active_root_unchecked().secondary_index_roots[index_no]
     }
 
+    struct BoundUniqueIndexNo<'a> {
+        table: &'a Table,
+        index_no: usize,
+        root: BlockID,
+    }
+
+    impl UniqueIndex for BoundUniqueIndexNo<'_> {
+        #[inline]
+        async fn lookup(
+            &self,
+            pool_guard: &PoolGuard,
+            key: &[Val],
+            ts: TrxID,
+        ) -> crate::error::Result<Option<(RowID, bool)>> {
+            let layout = self.table.layout_snapshot();
+            let index = layout.secondary_index(self.index_no)?;
+            index
+                .bind_unique(self.root)?
+                .lookup(pool_guard, key, ts)
+                .await
+        }
+
+        #[inline]
+        async fn insert_if_not_exists(
+            &self,
+            pool_guard: &PoolGuard,
+            key: &[Val],
+            row_id: RowID,
+            merge_if_match_deleted: bool,
+            ts: TrxID,
+        ) -> crate::error::Result<IndexInsert> {
+            let layout = self.table.layout_snapshot();
+            let index = layout.secondary_index(self.index_no)?;
+            index
+                .bind_unique(self.root)?
+                .insert_if_not_exists(pool_guard, key, row_id, merge_if_match_deleted, ts)
+                .await
+        }
+
+        #[inline]
+        async fn compare_delete(
+            &self,
+            pool_guard: &PoolGuard,
+            key: &[Val],
+            old_row_id: RowID,
+            ignore_del_mask: bool,
+            ts: TrxID,
+        ) -> crate::error::Result<bool> {
+            let layout = self.table.layout_snapshot();
+            let index = layout.secondary_index(self.index_no)?;
+            index
+                .bind_unique(self.root)?
+                .compare_delete(pool_guard, key, old_row_id, ignore_del_mask, ts)
+                .await
+        }
+
+        #[inline]
+        async fn compare_exchange(
+            &self,
+            pool_guard: &PoolGuard,
+            key: &[Val],
+            old_row_id: RowID,
+            new_row_id: RowID,
+            ts: TrxID,
+        ) -> crate::error::Result<IndexCompareExchange> {
+            let layout = self.table.layout_snapshot();
+            let index = layout.secondary_index(self.index_no)?;
+            index
+                .bind_unique(self.root)?
+                .compare_exchange(pool_guard, key, old_row_id, new_row_id, ts)
+                .await
+        }
+
+        #[inline]
+        async fn scan_values(
+            &self,
+            pool_guard: &PoolGuard,
+            values: &mut Vec<RowID>,
+            ts: TrxID,
+        ) -> crate::error::Result<()> {
+            let layout = self.table.layout_snapshot();
+            let index = layout.secondary_index(self.index_no)?;
+            index
+                .bind_unique(self.root)?
+                .scan_values(pool_guard, values, ts)
+                .await
+        }
+    }
+
     #[inline]
-    fn bound_unique_index_no(table: &Table, index_no: usize) -> impl UniqueIndex + '_ {
-        table
-            .require_sec_idx(index_no)
-            .unwrap()
-            .bind_unique(active_secondary_root(table, index_no))
-            .unwrap()
+    fn bound_unique_index_no(table: &Table, index_no: usize) -> BoundUniqueIndexNo<'_> {
+        BoundUniqueIndexNo {
+            table,
+            index_no,
+            root: active_secondary_root(table, index_no),
+        }
     }
 
     async fn stmt_insert_row(

@@ -1,4 +1,4 @@
-use super::{GenericMemTable, Table};
+use super::{GenericMemTable, Table, TableRuntimeLayout};
 use crate::buffer::{BufferPool, EvictableBufferPool, FixedBufferPool, PoolGuard, PoolGuards};
 use crate::catalog::CatalogTable;
 use crate::error::{Error, InternalError, Result};
@@ -189,13 +189,37 @@ pub(crate) trait IndexRollback {
     }
 }
 
-impl IndexRollback for Table {
+struct UserTableRollback<'a> {
+    table: &'a Table,
+    layout: &'a TableRuntimeLayout,
+}
+
+impl Table {
+    /// Roll back one secondary-index undo entry against a pinned runtime layout.
+    #[inline]
+    pub(crate) async fn rollback_index_entry_with_layout(
+        &self,
+        layout: &TableRuntimeLayout,
+        entry: IndexUndo,
+        guards: &PoolGuards,
+        ts: TrxID,
+    ) -> Result<()> {
+        UserTableRollback {
+            table: self,
+            layout,
+        }
+        .rollback_index_entry(entry, guards, ts)
+        .await
+    }
+}
+
+impl IndexRollback for UserTableRollback<'_> {
     type RowPool = EvictableBufferPool;
     type IndexPool = EvictableBufferPool;
 
     #[inline]
     fn mem_table(&self) -> &GenericMemTable<Self::RowPool, Self::IndexPool> {
-        &self.mem
+        &self.table.mem
     }
 
     #[inline]
@@ -206,7 +230,8 @@ impl IndexRollback for Table {
         row_id: RowID,
         ts: TrxID,
     ) -> Result<bool> {
-        self.require_sec_idx(key.index_no)?
+        let index = self.layout.secondary_index(key.index_no)?;
+        index
             .unique_mem()?
             .mask_as_deleted(index_pool_guard, &key.vals, row_id, ts)
             .await
@@ -221,7 +246,8 @@ impl IndexRollback for Table {
         ignore_del_mask: bool,
         ts: TrxID,
     ) -> Result<bool> {
-        self.require_sec_idx(key.index_no)?
+        let index = self.layout.secondary_index(key.index_no)?;
+        index
             .unique_mem()?
             .compare_delete(index_pool_guard, &key.vals, row_id, ignore_del_mask, ts)
             .await
@@ -236,7 +262,8 @@ impl IndexRollback for Table {
         new_row_id: RowID,
         ts: TrxID,
     ) -> Result<IndexCompareExchange> {
-        self.require_sec_idx(key.index_no)?
+        let index = self.layout.secondary_index(key.index_no)?;
+        index
             .unique_mem()?
             .compare_exchange(index_pool_guard, &key.vals, old_row_id, new_row_id, ts)
             .await
@@ -250,7 +277,8 @@ impl IndexRollback for Table {
         row_id: RowID,
         ts: TrxID,
     ) -> Result<bool> {
-        self.require_sec_idx(key.index_no)?
+        let index = self.layout.secondary_index(key.index_no)?;
+        index
             .non_unique_mem()?
             .mask_as_deleted(index_pool_guard, &key.vals, row_id, ts)
             .await
@@ -264,7 +292,8 @@ impl IndexRollback for Table {
         row_id: RowID,
         ts: TrxID,
     ) -> Result<bool> {
-        self.require_sec_idx(key.index_no)?
+        let index = self.layout.secondary_index(key.index_no)?;
+        index
             .non_unique_mem()?
             .mask_as_active(index_pool_guard, &key.vals, row_id, ts)
             .await
@@ -279,7 +308,8 @@ impl IndexRollback for Table {
         ignore_del_mask: bool,
         ts: TrxID,
     ) -> Result<bool> {
-        self.require_sec_idx(key.index_no)?
+        let index = self.layout.secondary_index(key.index_no)?;
+        index
             .non_unique_mem()?
             .compare_delete(index_pool_guard, &key.vals, row_id, ignore_del_mask, ts)
             .await

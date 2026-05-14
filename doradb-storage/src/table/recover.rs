@@ -69,24 +69,29 @@ impl TableRecover for Table {
         cts: TrxID,
         disable_index: bool,
     ) -> Result<()> {
-        debug_assert!(cols.len() == self.metadata().col_count());
+        let layout = self.layout_snapshot();
+        let metadata = layout.metadata();
+        debug_assert!(cols.len() == metadata.col_count());
         debug_assert!({
             cols.iter()
                 .enumerate()
-                .all(|(idx, val)| self.metadata().col_type_match(idx, val))
+                .all(|(idx, val)| metadata.col_type_match(idx, val))
         });
         // Since we always dispatch rows of one page to same thread,
         // we can just hold exclusive lock on this page and process all rows in it.
         let mut page_guard = self.must_get_row_page_exclusive(guards, page_id).await?;
 
-        let res = self.recover_row_insert_to_page(&mut page_guard, row_id, cols, cts);
+        let res = self.recover_row_insert_to_page(metadata, &mut page_guard, row_id, cols, cts);
         assert!(res.is_ok());
         page_guard.set_dirty(); // mark as dirty page.
 
         if !disable_index {
-            let keys = self.metadata().keys_for_insert(cols);
+            let keys = metadata.keys_for_insert(cols);
             for key in keys {
-                match self.recover_index_insert(guards, key, row_id, cts).await? {
+                match self
+                    .recover_index_insert(&layout, guards, key, row_id, cts)
+                    .await?
+                {
                     RecoverIndex::Ok | RecoverIndex::InsertOutdated => (),
                     RecoverIndex::DeleteOutdated => unreachable!(),
                 }
@@ -104,15 +109,25 @@ impl TableRecover for Table {
         cts: TrxID,
         disable_index: bool,
     ) -> Result<()> {
+        let layout = self.layout_snapshot();
+        let metadata = layout.metadata();
         let mut page_guard = self.must_get_row_page_exclusive(guards, page_id).await?;
 
         if disable_index {
-            let res = self.recover_row_update_to_page(&mut page_guard, row_id, update, cts, None);
+            let res = self.recover_row_update_to_page(
+                metadata,
+                &mut page_guard,
+                row_id,
+                update,
+                cts,
+                None,
+            );
             assert!(res.is_ok());
             page_guard.set_dirty(); // mark as dirty page.
         } else {
             let mut index_change_cols = HashMap::new();
             let res = self.recover_row_update_to_page(
+                metadata,
                 &mut page_guard,
                 row_id,
                 update,
@@ -126,26 +141,26 @@ impl TableRecover for Table {
                 // There is index change, we need to update index.
                 let page_guard = self.must_get_row_page_shared(guards, page_id).await?;
 
-                let metadata = self.metadata();
                 for (index_no, index_schema) in metadata.active_indexes() {
-                    debug_assert_eq!(
-                        self.require_sec_idx(index_no)?.is_unique(),
-                        index_schema.unique()
-                    );
+                    let index = layout.secondary_index(index_no)?;
+                    debug_assert_eq!(index.is_unique(), index_schema.unique());
                     if index_key_is_changed(index_schema, &index_change_cols) {
                         let new_key =
                             read_latest_index_key(metadata, index_no, &page_guard, row_id);
                         let old_key = index_key_replace(index_schema, &new_key, &index_change_cols);
                         // insert new index entry.
                         match self
-                            .recover_index_insert(guards, new_key, row_id, cts)
+                            .recover_index_insert(&layout, guards, new_key, row_id, cts)
                             .await?
                         {
                             RecoverIndex::Ok | RecoverIndex::InsertOutdated => (),
                             RecoverIndex::DeleteOutdated => unreachable!(),
                         }
                         // delete old index entry.
-                        match self.recover_index_delete(guards, old_key, row_id).await? {
+                        match self
+                            .recover_index_delete(&layout, guards, old_key, row_id)
+                            .await?
+                        {
                             RecoverIndex::Ok | RecoverIndex::DeleteOutdated => (),
                             RecoverIndex::InsertOutdated => unreachable!(),
                         }
@@ -188,14 +203,17 @@ impl TableRecover for Table {
         }
 
         let mut page_guard = self.must_get_row_page_exclusive(guards, page_id).await?;
+        let layout = self.layout_snapshot();
+        let metadata = layout.metadata();
 
         if disable_index {
-            let res = self.recover_row_delete_to_page(&mut page_guard, row_id, cts, None);
+            let res = self.recover_row_delete_to_page(metadata, &mut page_guard, row_id, cts, None);
             assert!(res.is_ok());
             page_guard.set_dirty(); // mark as dirty page.
         } else {
             let mut index_cols = HashMap::new();
             let res = self.recover_row_delete_to_page(
+                metadata,
                 &mut page_guard,
                 row_id,
                 cts,
@@ -203,18 +221,19 @@ impl TableRecover for Table {
             );
             assert!(res.is_ok());
             page_guard.set_dirty(); // mark as dirty page.
-            for (index_no, index_schema) in self.metadata().active_indexes() {
-                debug_assert_eq!(
-                    self.require_sec_idx(index_no)?.is_unique(),
-                    index_schema.unique()
-                );
+            for (index_no, index_schema) in metadata.active_indexes() {
+                let index = layout.secondary_index(index_no)?;
+                debug_assert_eq!(index.is_unique(), index_schema.unique());
                 let vals: Vec<Val> = index_schema
                     .cols
                     .iter()
                     .map(|ik| index_cols[&(ik.col_no as usize)].clone())
                     .collect();
                 let key = SelectKey::new(index_no, vals);
-                match self.recover_index_delete(guards, key, row_id).await? {
+                match self
+                    .recover_index_delete(&layout, guards, key, row_id)
+                    .await?
+                {
                     RecoverIndex::Ok | RecoverIndex::DeleteOutdated => (),
                     RecoverIndex::InsertOutdated => unreachable!(),
                 }
@@ -229,11 +248,12 @@ impl TableRecover for Table {
         page_id: PageID,
     ) -> Result<()> {
         let page_guard = self.must_get_row_page_shared(guards, page_id).await?;
-        let metadata = self.metadata();
+        let layout = self.layout_snapshot();
+        let metadata = layout.metadata();
         let index_pool_guard = self.index_pool_guard(guards);
         let (ctx, page) = page_guard.ctx_and_page();
         for (index_no, index_spec) in metadata.active_indexes() {
-            let sec_idx = self.require_sec_idx(index_no)?;
+            let sec_idx = layout.secondary_index(index_no)?;
             let read_set: Vec<_> = index_spec.cols.iter().map(|c| c.col_no as usize).collect();
             for row_access in ReadAllRows::new(page, ctx) {
                 let row_id = row_access.row().row_id();
