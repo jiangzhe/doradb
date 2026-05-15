@@ -36,6 +36,7 @@ use crate::table::{
     CheckpointCancelReason, CheckpointOutcome, CheckpointReadiness, DeleteMarker, Table,
     TableAccess, TableLifecycleState, TablePersistence, TableRecover, TableRuntimeLayout,
 };
+use crate::trx::redo::DDLRedo;
 use crate::trx::row::LockRowForWrite;
 use crate::trx::stmt::Statement;
 use crate::trx::stmt::tests as stmt_tests;
@@ -317,8 +318,6 @@ fn test_mvcc_insert_normal() {
             }
             let _ = trx.commit().await.unwrap();
         }
-
-        drop(session);
     });
 }
 
@@ -363,7 +362,6 @@ fn test_mvcc_insert_dup_key() {
             drop(session2);
 
             trx1.commit().await.unwrap();
-            drop(session);
         }
     });
 }
@@ -491,9 +489,6 @@ fn test_column_delete_basic() {
         let mut trx = session.try_begin_trx().unwrap().unwrap();
         trx = sys.trx_select_not_found(trx, &key).await;
         trx.commit().await.unwrap();
-
-        drop(reader_session);
-        drop(session);
     });
 }
 
@@ -529,9 +524,6 @@ fn test_lwc_read_uses_readonly_buffer_pool() {
         })
         .await;
         assert_eq!(sys.engine.disk_pool.allocated(), allocated_after_first);
-
-        drop(reader_session);
-        drop(session);
     });
 }
 
@@ -582,7 +574,6 @@ fn test_find_row_returns_resolved_lwc_page_location() {
             RowLocation::NotFound => panic!("row should exist"),
         }
         trx.commit().await.unwrap();
-        drop(session);
     });
 }
 
@@ -631,7 +622,6 @@ fn test_lwc_select_surfaces_persisted_corruption() {
             DataIntegrityError::ChecksumMismatch,
         );
         trx.rollback().await.unwrap();
-        drop(session);
     });
 }
 
@@ -683,8 +673,6 @@ fn test_lwc_select_surfaces_column_block_index_row_metadata_corruption() {
             DataIntegrityError::InvalidPayload,
         );
         trx.rollback().await.unwrap();
-
-        drop(session);
     });
 }
 
@@ -736,8 +724,6 @@ fn test_lwc_select_surfaces_column_block_index_zero_block_id_corruption() {
             DataIntegrityError::InvalidPayload,
         );
         trx.rollback().await.unwrap();
-
-        drop(session);
     });
 }
 
@@ -789,8 +775,6 @@ fn test_lwc_select_surfaces_row_shape_fingerprint_mismatch_corruption() {
             DataIntegrityError::InvalidPayload,
         );
         trx.rollback().await.unwrap();
-
-        drop(session);
     });
 }
 
@@ -845,9 +829,6 @@ fn test_column_delete_rollback() {
             })
             .await;
         trx.commit().await.unwrap();
-
-        drop(reader_session);
-        drop(session);
     });
 }
 
@@ -883,10 +864,6 @@ fn test_column_delete_rollback_after_checkpoint() {
             })
             .await;
         trx.commit().await.unwrap();
-
-        drop(reader_session);
-        drop(checkpoint_session);
-        drop(session);
     });
 }
 
@@ -916,8 +893,6 @@ fn test_column_delete_write_conflict() {
         drop(session2);
 
         trx1.rollback().await.unwrap();
-
-        drop(session);
     });
 }
 
@@ -954,10 +929,6 @@ fn test_column_delete_mvcc_visibility() {
         let mut trx_new = session.try_begin_trx().unwrap().unwrap();
         trx_new = sys.trx_select_not_found(trx_new, &key).await;
         trx_new.commit().await.unwrap();
-
-        drop(delete_session);
-        drop(reader_session);
-        drop(session);
     });
 }
 
@@ -992,9 +963,6 @@ fn test_lwc_delete_unique_conflicts_when_delete_committed_after_snapshot() {
         writer.rollback().await.unwrap();
 
         sys.new_trx_select_not_found(&mut session, &key).await;
-
-        drop(writer_session);
-        drop(session);
     });
 }
 
@@ -1086,9 +1054,6 @@ fn test_lwc_update_unique_same_key_reinserts_hot_and_preserves_old_snapshot() {
             })
             .await;
         old_reader.commit().await.unwrap();
-
-        drop(old_reader_session);
-        drop(session);
     });
 }
 
@@ -1133,9 +1098,6 @@ fn test_lwc_update_unique_conflicts_when_delete_committed_after_snapshot() {
         writer.rollback().await.unwrap();
 
         sys.new_trx_select_not_found(&mut session, &key).await;
-
-        drop(writer_session);
-        drop(session);
     });
 }
 
@@ -1220,9 +1182,6 @@ fn test_lwc_update_unique_key_change_preserves_old_and_new_key_visibility() {
             .await;
         old_reader = sys.trx_select_not_found(old_reader, &new_key).await;
         old_reader.commit().await.unwrap();
-
-        drop(old_reader_session);
-        drop(session);
     });
 }
 
@@ -1266,8 +1225,6 @@ fn test_lwc_update_unique_duplicate_rolls_back_cold_marker_and_hot_insert() {
             assert_eq!(vals, vec![Val::from(2i32), Val::from("name")]);
         })
         .await;
-
-        drop(session);
     });
 }
 
@@ -1326,10 +1283,6 @@ fn test_lwc_update_unique_claims_committed_deleted_cold_owner_with_visibility_br
 
         old_reader.commit().await.unwrap();
         gap_reader.commit().await.unwrap();
-
-        drop(gap_reader_session);
-        drop(old_reader_session);
-        drop(session);
     });
 }
 
@@ -1409,9 +1362,6 @@ fn test_lwc_update_unique_rejects_cold_owner_deleted_after_snapshot() {
         .await;
         sys.new_trx_select_not_found(&mut session, &claimed_key)
             .await;
-
-        drop(writer_session);
-        drop(session);
     });
 }
 
@@ -1517,9 +1467,6 @@ fn test_lwc_update_unique_claim_rollback_restores_deleted_cold_owner() {
             })
             .await;
         old_reader.commit().await.unwrap();
-
-        drop(old_reader_session);
-        drop(session);
     });
 }
 
@@ -1642,7 +1589,6 @@ fn test_lwc_update_unique_claim_rollback_drops_purgeable_deleted_cold_owner() {
         .await;
         sys.new_trx_select_not_found(&mut session, &claimed_key)
             .await;
-        drop(session);
     });
 }
 
@@ -1703,8 +1649,6 @@ fn test_checkpoint_persists_committed_cold_delete_markers() {
         let deltas = load_entry_deletion_deltas(&index, &entry).await.unwrap();
         let expected_delta = (row_id - entry.start_row_id) as u32;
         assert!(deltas.contains(&expected_delta));
-
-        drop(session);
     });
 }
 
@@ -1731,8 +1675,6 @@ fn test_checkpoint_publishes_unique_secondary_disk_tree_root() {
             );
         }
         reader.commit().await.unwrap();
-
-        drop(session);
     });
 }
 
@@ -1785,8 +1727,6 @@ fn test_trx_read_proof_root_snapshot_captures_active_root() {
         .await
         .unwrap();
         trx.rollback().await.unwrap();
-
-        drop(session);
     });
 }
 
@@ -1835,8 +1775,6 @@ fn test_checkpoint_publishes_non_unique_secondary_disk_tree_entries_across_lwc_s
             .unwrap()
             .unwrap();
         assert_ne!(first_entry.block_id(), last_entry.block_id());
-
-        drop(session);
     });
 }
 
@@ -1883,7 +1821,6 @@ fn test_secondary_mem_index_cleanup_removes_redundant_live_unique_entries() {
                 Some((disk_row_id, false))
             );
         }
-        drop(session);
     });
 }
 
@@ -1905,8 +1842,6 @@ fn test_secondary_mem_index_cleanup_requires_idle_session() {
 
         trx.rollback().await.unwrap();
         assert!(!session.in_trx());
-
-        drop(session);
     });
 }
 
@@ -1950,7 +1885,6 @@ fn test_secondary_mem_index_cleanup_removes_redundant_live_non_unique_entries() 
             .await
             .unwrap();
         assert_eq!(lookup_rows, disk_rows);
-        drop(session);
     });
 }
 
@@ -1975,8 +1909,6 @@ fn test_secondary_mem_index_cleanup_aggregates_bounded_batches() {
         assert_eq!(stats.indexes[1].retained, 0);
         assert_eq!(stats.indexes[1].skipped_live, 0);
         assert_eq!(stats.indexes[1].skipped_hot_deleted, 0);
-
-        drop(session);
     });
 }
 
@@ -2036,7 +1968,6 @@ fn test_secondary_mem_index_cleanup_can_retain_live_cache_entries() {
             .await
             .unwrap();
         assert_eq!(lookup_rows, disk_rows);
-        drop(session);
     });
 }
 
@@ -2117,7 +2048,6 @@ fn test_secondary_mem_index_cleanup_retains_unique_delete_shadow_without_delete_
                 .unwrap(),
             Some((row_id, false))
         );
-        drop(session);
     });
 }
 
@@ -2186,7 +2116,6 @@ fn test_secondary_mem_index_cleanup_removes_unique_delete_shadow_with_purgeable_
                 .unwrap(),
             None
         );
-        drop(session);
     });
 }
 
@@ -2266,7 +2195,6 @@ fn test_secondary_mem_index_cleanup_removes_delete_shadow_when_live_cleanup_disa
                 .unwrap(),
             Some((row_id, false))
         );
-        drop(session);
     });
 }
 
@@ -2343,7 +2271,6 @@ fn test_secondary_mem_index_cleanup_removes_unique_delete_shadow_with_matching_c
                 .unwrap(),
             Some((row_id, false))
         );
-        drop(session);
     });
 }
 
@@ -2445,7 +2372,6 @@ fn test_secondary_mem_index_cleanup_removes_unique_delete_shadow_when_cold_row_k
                 .unwrap(),
             Some((row_id, false))
         );
-        drop(session);
     });
 }
 
@@ -2538,7 +2464,6 @@ fn test_secondary_mem_index_cleanup_propagates_cold_delete_overlay_proof_error()
                 .unwrap(),
             Some((row_id, true))
         );
-        drop(session);
     });
 }
 
@@ -2609,7 +2534,6 @@ fn test_secondary_mem_index_cleanup_retains_non_unique_delete_mark_without_delet
                 .unwrap(),
             Some(false)
         );
-        drop(session);
     });
 }
 
@@ -2679,7 +2603,6 @@ fn test_secondary_mem_index_cleanup_removes_non_unique_delete_mark_with_purgeabl
                 .unwrap(),
             None
         );
-        drop(session);
     });
 }
 
@@ -2759,7 +2682,6 @@ fn test_secondary_mem_index_cleanup_removes_non_unique_delete_mark_with_matching
                 .unwrap(),
             Some(true)
         );
-        drop(session);
     });
 }
 
@@ -2871,7 +2793,6 @@ fn test_secondary_mem_index_cleanup_removes_non_unique_delete_mark_when_cold_row
                 .unwrap(),
             Some(true)
         );
-        drop(session);
     });
 }
 
@@ -2914,8 +2835,6 @@ fn test_deletion_checkpoint_updates_secondary_disk_tree_roots() {
         )
         .await;
         assert_eq!(exact_rows, vec![kept_row_id]);
-
-        drop(session);
     });
 }
 
@@ -2952,8 +2871,6 @@ fn test_unique_checkpoint_overlap_keeps_new_disk_tree_owner() {
             unique_disk_tree_lookup(&sys.table, session.pool_guards(), &key).await,
             Some(new_row_id)
         );
-
-        drop(session);
     });
 }
 
@@ -3004,8 +2921,6 @@ fn test_secondary_sidecar_failure_keeps_checkpoint_root_atomic() {
             root_after.secondary_index_roots,
             root_before.secondary_index_roots
         );
-
-        drop(session);
     });
 }
 
@@ -3029,8 +2944,6 @@ fn test_checkpoint_all_deleted_row_page_advances_without_column_index() {
             sys.new_trx_select_not_found(&mut session, &single_key(i))
                 .await;
         }
-
-        drop(session);
     });
 }
 
@@ -3117,10 +3030,6 @@ fn test_checkpoint_transition_delete_marker_waits_for_next_cutoff_range() {
         let expected_delta = (row_id - entry_after_second.start_row_id) as u32;
         assert!(root_after_second.deletion_cutoff_ts > delete_cts);
         assert!(deltas.contains(&expected_delta));
-        drop(checkpoint_session);
-        drop(writer_session);
-        drop(hold_session);
-        drop(session);
     });
 }
 
@@ -3177,7 +3086,6 @@ fn test_lwc_unique_index_purge_uses_purgeable_delete_marker_fast_path() {
                 .unwrap(),
             IndexInsert::DuplicateKey(row_id, false)
         );
-        drop(session);
     });
 }
 
@@ -3282,7 +3190,6 @@ fn test_lwc_unique_index_purge_compares_persisted_key_when_marker_is_not_purgeab
                 .unwrap(),
             Some((actual_row_id, true)) if actual_row_id == row_id
         ));
-        drop(session);
     });
 }
 
@@ -3384,7 +3291,6 @@ fn test_lwc_non_unique_index_purge_compares_persisted_key_when_marker_is_not_pur
                 .unwrap(),
             Some(false)
         ));
-        drop(session);
     });
 }
 
@@ -3436,7 +3342,6 @@ fn test_index_purge_removes_delete_marked_unique_entry_when_row_is_not_found() {
                 .unwrap()
                 .is_none()
         );
-        drop(session);
     });
 }
 
@@ -3539,7 +3444,6 @@ fn test_unique_insert_rollback_restores_deleted_owner_even_when_row_missing() {
             assert_eq!(vals, vec![Val::from(10_001i32), Val::from("reclaimed")]);
         })
         .await;
-        drop(session);
     });
 }
 
@@ -3642,7 +3546,6 @@ fn test_unique_insert_rollback_restores_delete_marked_stale_hot_owner() {
             assert_eq!(vals, vec![Val::from(2i32), Val::from("two-final")]);
         })
         .await;
-        drop(session);
     });
 }
 
@@ -3680,8 +3583,6 @@ fn test_checkpoint_fails_when_eligible_delete_marker_has_no_column_index() {
             root_after.column_block_index_root,
             root_before.column_block_index_root
         );
-
-        drop(session);
     });
 }
 
@@ -3729,8 +3630,6 @@ fn test_checkpoint_fails_when_eligible_delete_marker_cannot_be_located() {
             sys.table.file().active_root_unchecked().deletion_cutoff_ts,
             root_before.deletion_cutoff_ts
         );
-
-        drop(session);
     });
 }
 
@@ -3764,8 +3663,6 @@ fn test_checkpoint_ignores_missing_old_delete_marker_below_previous_cutoff() {
             sys.table.file().active_root_unchecked().deletion_cutoff_ts
                 > root_before.deletion_cutoff_ts
         );
-
-        drop(session);
     });
 }
 
@@ -3810,8 +3707,6 @@ fn test_recover_cold_delete_rejects_already_deleted_with_different_cts() {
             err.report().downcast_ref::<DataIntegrityError>().copied(),
             Some(DataIntegrityError::InvalidRootInvariant)
         );
-
-        drop(session);
     });
 }
 
@@ -3869,10 +3764,6 @@ fn test_checkpoint_skips_cold_delete_markers_at_or_after_cutoff() {
         );
 
         hold_trx.rollback().await.unwrap();
-        drop(checkpoint_session);
-        drop(writer_session);
-        drop(hold_session);
-        drop(session);
     });
 }
 
@@ -3953,8 +3844,6 @@ fn test_checkpoint_fails_on_invalid_v2_delete_metadata() {
             entry.leaf_page_id,
             DataIntegrityError::InvalidPayload,
         );
-
-        drop(session);
     });
 }
 
@@ -4035,8 +3924,6 @@ fn test_checkpoint_fails_on_short_v2_delete_section_header() {
             entry.leaf_page_id,
             DataIntegrityError::InvalidPayload,
         );
-
-        drop(session);
     });
 }
 
@@ -4167,7 +4054,6 @@ fn test_row_page_transition_retries_update_delete() {
             Some(OperationError::NotSupported)
         );
         trx.rollback().await.unwrap();
-        drop(session);
     });
 }
 
@@ -4628,8 +4514,6 @@ fn test_table_scan_uncommitted() {
             println!("res.len()={}", res_len);
             assert!(res_len == SIZE as usize);
         }
-
-        drop(session);
     });
 }
 
@@ -5323,9 +5207,6 @@ fn test_table_scan_mvcc() {
             assert!(res_len == (SIZE * 2) as usize);
             trx.commit().await.unwrap();
         }
-
-        drop(session1);
-        drop(session2);
     });
 }
 
@@ -5392,8 +5273,6 @@ fn test_table_freeze() {
         }
         let row_pages = sys.table.total_row_pages(session1.pool_guards()).await;
         assert!(row_pages == 3);
-
-        drop(session1);
     });
 }
 
@@ -5485,7 +5364,6 @@ fn test_transition_captures_uncommitted_lock_into_deletion_buffer() {
             Some(OperationError::NotSupported)
         );
         trx.rollback().await.unwrap();
-        drop(session);
     });
 }
 
@@ -5508,8 +5386,6 @@ fn test_checkpoint_basic_flow() {
         assert!(new_root.pivot_row_id > old_root.pivot_row_id);
         assert_ne!(new_root.column_block_index_root, SUPER_BLOCK_ID);
         assert!(new_root.deletion_cutoff_ts > old_root.deletion_cutoff_ts);
-
-        drop(session);
     });
 }
 
@@ -5566,8 +5442,6 @@ fn test_foreground_lifecycle_rejects_dropping_and_dropped_handles() {
         assert_eq!(err.operation_error(), Some(OperationError::TableNotFound));
         assert!(dropped_write.readonly());
         assert_eq!(dropped_write.commit().await.unwrap(), 0);
-
-        drop(session);
     });
 }
 
@@ -5575,7 +5449,7 @@ fn test_foreground_lifecycle_rejects_dropping_and_dropped_handles() {
 fn test_table_drop_gate_waits_for_checkpoint_publish_lease() {
     smol::block_on(async {
         let sys = TestSys::new_lightweight_evictable().await;
-        let root_lease = sys.table.try_begin_checkpoint_root_mutation().unwrap();
+        let _root_lease = sys.table.try_begin_checkpoint_root_mutation().unwrap();
         let publish_lease = sys.table.try_begin_checkpoint_publish().unwrap();
         let mut drop_fut = Box::pin(sys.table.begin_drop_lifecycle());
 
@@ -5592,7 +5466,6 @@ fn test_table_drop_gate_waits_for_checkpoint_publish_lease() {
         drop(publish_lease);
         drop_fut.await.unwrap();
         assert_eq!(sys.table.lifecycle.state(), TableLifecycleState::Dropping);
-        drop(root_lease);
     });
 }
 
@@ -5613,8 +5486,6 @@ fn test_checkpoint_cancelled_when_table_dropping() {
         );
         assert_root_metadata_unchanged(&root_before, &sys.table);
         assert!(!session.in_trx());
-
-        drop(session);
     });
 }
 
@@ -5630,7 +5501,6 @@ fn test_drop_table_rejects_active_transaction() {
         assert_eq!(err.operation_error(), Some(OperationError::NotSupported));
 
         trx.rollback().await.unwrap();
-        drop(session);
     });
 }
 
@@ -5646,8 +5516,6 @@ fn test_drop_table_returns_not_found_for_missing_table() {
         let missing_user_table_id = sys.table.table_id() + 1000;
         let err = session.drop_table(missing_user_table_id).await.unwrap_err();
         assert_eq!(err.operation_error(), Some(OperationError::TableNotFound));
-
-        drop(session);
     });
 }
 
@@ -5701,8 +5569,6 @@ fn test_drop_table_rejects_same_session_explicit_table_lock() {
                 LockResource::TableData(table_id),
             ));
             session.drop_table(table_id).await.unwrap();
-
-            drop(session);
         }
     });
 }
@@ -5755,9 +5621,6 @@ fn test_drop_table_fails_waiting_session_table_lock() {
             lock_owner,
             LockResource::TableData(table_id),
         ));
-
-        drop(lock_session);
-        drop(drop_session);
     });
 }
 
@@ -5812,8 +5675,6 @@ fn test_drop_table_fails_waiting_transaction_table_lock() {
         ));
 
         trx.rollback().await.unwrap();
-        drop(lock_session);
-        drop(drop_session);
     });
 }
 
@@ -5862,10 +5723,6 @@ fn test_explicit_table_lock_after_drop_returns_not_found_without_locks() {
             LockResource::TableData(table_id),
         ));
         trx.rollback().await.unwrap();
-
-        drop(trx_session);
-        drop(lock_session);
-        drop(drop_session);
     });
 }
 
@@ -5998,9 +5855,6 @@ fn test_drop_table_logical_cascade_and_stale_handles() {
             .unwrap();
         assert!(later_table_id > table_id);
         assert!(later_table_id > other_table_id);
-
-        drop(stale_table);
-        drop(session);
     });
 }
 
@@ -6042,10 +5896,6 @@ fn test_drop_table_gc_retries_stale_handle_and_deletes_file_after_catalog_checkp
             .unwrap();
         wait_dropped_table_gc_counts(&engine, (0, 0)).await;
         wait_path_exists(&table_file_path, false).await;
-
-        drop(session);
-        drop(engine);
-        drop(temp_dir);
     });
 }
 
@@ -6067,6 +5917,11 @@ fn test_drop_table_catalog_cascade_poison_preserves_source_error() {
                     .delete_by_index(stmt, table_id, 0)
                     .await;
                 assert_eq!(deleted, 1);
+                let old = stmt.effects_mut().set_ddl_redo(DDLRedo::DropIndex {
+                    table_id,
+                    index_no: 0,
+                });
+                debug_assert!(old.is_none());
                 Ok(())
             })
             .await
@@ -6104,9 +5959,6 @@ fn test_drop_table_catalog_cascade_poison_preserves_source_error() {
                 .is_some_and(|err| *err.current_context() == FatalError::Poisoned)
         );
         assert!(!drop_session.in_trx());
-
-        drop(corrupt_session);
-        drop(drop_session);
     });
 }
 
@@ -6148,8 +6000,6 @@ fn test_drop_table_commit_poison_preserves_source_error() {
                 .is_some_and(|err| *err.current_context() == FatalError::RedoWrite)
         );
         assert!(!session.in_trx());
-
-        drop(session);
     });
 }
 
@@ -6195,9 +6045,6 @@ fn test_drop_table_waits_for_active_metadata_reader() {
         reader_fut.await.unwrap();
         assert_eq!(reader_trx.commit().await.unwrap(), 0);
         drop_fut.await.unwrap();
-
-        drop(drop_session);
-        drop(reader_session);
     });
 }
 
@@ -6225,9 +6072,6 @@ fn test_drop_table_waits_for_active_table_writer() {
 
         assert!(writer_trx.commit().await.unwrap() > 0);
         drop_fut.await.unwrap();
-
-        drop(drop_session);
-        drop(writer_session);
     });
 }
 
@@ -6251,8 +6095,6 @@ fn test_catalog_checkpoint_scan_allows_runtime_removed_drop_table() {
         );
         assert_eq!(batch.catalog_ddl_txn_count, 2);
         assert!(batch.safe_cts >= batch.replay_start_ts);
-
-        drop(session);
     });
 }
 
@@ -6280,8 +6122,6 @@ fn test_drop_table_recovery_keeps_table_live_without_committed_drop() {
             .await
             .unwrap();
         assert!(engine.catalog().get_table(table_id).await.is_some());
-        drop(engine);
-        drop(temp_dir);
     });
 }
 
@@ -6322,9 +6162,6 @@ fn test_drop_table_recovery_replays_committed_drop_before_catalog_checkpoint() {
             .unwrap();
         wait_dropped_table_gc_counts(&engine, (0, 0)).await;
         wait_path_exists(&table_file_path, false).await;
-        drop(session);
-        drop(engine);
-        drop(temp_dir);
     });
 }
 
@@ -6376,8 +6213,6 @@ fn test_drop_table_catalog_checkpoint_cleans_absent_leftover_file_on_startup() {
             .unwrap();
         assert!(engine.catalog().get_table(table_id).await.is_none());
         wait_path_exists(&table_file_path, false).await;
-        drop(engine);
-        drop(temp_dir);
     });
 }
 
@@ -6395,8 +6230,6 @@ fn test_checkpoint_publish_write_failure_poisons_storage() {
         assert!(hook.call_count() > 0);
         assert_root_metadata_unchanged(&root_before, &sys.table);
         assert!(!session.in_trx());
-
-        drop(session);
     });
 }
 
@@ -6415,8 +6248,6 @@ fn test_checkpoint_post_publication_failure_poisons_storage() {
         assert_checkpoint_write_poisoned(&err, &sys);
         assert!(sys.table.file().active_root_unchecked().trx_id > root_before.trx_id);
         assert!(!session.in_trx());
-
-        drop(session);
     });
 }
 
@@ -6432,8 +6263,6 @@ fn test_checkpoint_readiness_ready_when_root_crossed_gc_horizon() {
             sys.table.checkpoint_readiness(&session),
             CheckpointReadiness::Ready
         ));
-
-        drop(session);
     });
 }
 
@@ -6464,9 +6293,6 @@ fn test_checkpoint_readiness_delayed_reports_root_and_horizon() {
             sys.table.checkpoint_readiness(&session),
             CheckpointReadiness::Ready
         ));
-
-        drop(reader_session);
-        drop(session);
     });
 }
 
@@ -6501,9 +6327,6 @@ fn test_checkpoint_requires_idle_session_before_delayed_outcome() {
         checkpoint_trx.rollback().await.unwrap();
         assert!(!session.in_trx());
         reader.commit().await.unwrap();
-
-        drop(reader_session);
-        drop(session);
     });
 }
 
@@ -6552,9 +6375,6 @@ fn test_checkpoint_delayed_preserves_root_and_frozen_pages_until_ready() {
         let root_after_publish = sys.table.file().active_root_unchecked();
         assert_eq!(root_after_publish.trx_id, checkpoint_ts);
         assert!(root_after_publish.pivot_row_id > root_before_delay.pivot_row_id);
-
-        drop(reader_session);
-        drop(session);
     });
 }
 
@@ -6587,9 +6407,6 @@ fn test_second_checkpoint_waits_for_previous_root_horizon() {
         wait_gc_cutoff_after(&session, first_checkpoint_ts).await;
         let second_checkpoint_ts = checkpoint_published(&sys.table, &mut session).await;
         assert!(second_checkpoint_ts > first_checkpoint_ts);
-
-        drop(reader_session);
-        drop(session);
     });
 }
 
@@ -6627,8 +6444,6 @@ fn test_checkpoint_rechecks_readiness_after_root_mutation_lease() {
         assert_eq!(reason.min_active_sts, reader.sts());
 
         reader.commit().await.unwrap();
-        drop(reader_session);
-        drop(checkpoint_session);
     });
 }
 
@@ -6668,10 +6483,6 @@ fn test_checkpoint_snapshot_consistency() {
 
         write_trx.rollback().await.unwrap();
         read_trx.commit().await.unwrap();
-
-        drop(session);
-        drop(write_session);
-        drop(checkpoint_session);
     });
 }
 
@@ -6716,10 +6527,6 @@ fn test_checkpoint_old_root_released_after_active_reader_purged() {
             old_root_drop_count(retained_root_ptr) > drop_count_before,
             "old root should be released after transaction GC crosses the checkpoint"
         );
-
-        drop(read_session);
-        drop(checkpoint_session);
-        drop(session);
     });
 }
 
@@ -6758,11 +6565,6 @@ fn test_checkpoint_persistence_recovery() {
             root_after.deletion_cutoff_ts,
             root_before.deletion_cutoff_ts
         );
-
-        drop(session);
-        drop(table_file);
-        drop(engine);
-        drop(_temp_dir);
     });
 }
 
@@ -6785,8 +6587,6 @@ fn test_checkpoint_heartbeat() {
             root_after.column_block_index_root,
             root_before.column_block_index_root
         );
-
-        drop(session);
     });
 }
 
@@ -6812,8 +6612,6 @@ fn test_checkpoint_gc_verification() {
             }
         }
         assert!(reclaimed, "row pages should be reclaimed after purge");
-
-        drop(session);
     });
 }
 
@@ -6871,8 +6669,6 @@ fn test_session_cached_insert_page_reuses_live_versioned_page() {
             .unwrap();
         assert_eq!(next_cached_row_id, next_row_id);
         assert_eq!(next_cached_page, cached_page);
-
-        drop(session);
     });
 }
 
@@ -6944,9 +6740,6 @@ fn test_stale_session_cached_insert_page_falls_back_after_checkpoint_gc() {
             .unwrap();
         assert_eq!(next_cached_row_id, post_gc_row_id);
         assert_ne!(next_cached_page, cached_page);
-
-        drop(checkpoint_session);
-        drop(session);
     });
 }
 
@@ -7050,11 +6843,6 @@ fn test_validated_row_page_shared_result_rejects_stale_reused_page_range() {
             reused_guard.is_some(),
             "reused row should validate on the reused page"
         );
-
-        drop(reused_guard);
-        drop(stale_guard);
-        drop(checkpoint_session);
-        drop(session);
     });
 }
 
@@ -7131,9 +6919,6 @@ fn test_mvcc_insert_surfaces_cached_insert_page_reload_error() {
             read_hook.call_count() > 0,
             "cached insert page should reload from disk"
         );
-
-        drop(writer);
-        drop(session);
     });
 }
 
@@ -7210,9 +6995,6 @@ fn test_mvcc_rollback_poisons_runtime_on_row_page_reload_error() {
                 .is_err_and(|err| *err.current_context() == FatalError::RollbackAccess)
         );
         assert!(!session.in_trx());
-
-        drop(writer);
-        drop(session);
     });
 }
 
@@ -7309,10 +7091,6 @@ fn test_statement_rollback_poisons_runtime_on_row_page_reload_error() {
             err.downcast_ref::<InternalError>().copied(),
             Some(InternalError::ActiveTransactionDiscarded)
         );
-
-        drop(hook_guard);
-        drop(writer);
-        drop(session);
     });
 }
 
@@ -7346,8 +7124,6 @@ fn test_checkpoint_error_rollback() {
             root_after.column_block_index_root,
             root_before.column_block_index_root
         );
-
-        drop(session);
     });
 }
 
@@ -7506,10 +7282,6 @@ fn test_user_secondary_indexes_evict_and_continue_serving_lookups() {
             })
             .await;
         assert_eq!(visible_rows, inserted.len());
-
-        drop(session);
-        drop(table);
-        drop(engine);
     });
 }
 
@@ -8476,7 +8248,6 @@ fn test_secondary_index_common() {
             _ = trx.commit().await.unwrap();
             assert!(res.unwrap().unwrap_rows().len() == 1);
         }
-        drop(engine);
     })
 }
 
@@ -8485,7 +8256,7 @@ fn test_checkpoint_cancelled_while_table_metadata_change_active() {
     smol::block_on(async {
         let sys = TestSys::new_lightweight_evictable().await;
         let mut checkpoint_session = sys.engine.try_new_session().unwrap();
-        let metadata_lease = sys.table.begin_metadata_change().await.unwrap();
+        let _metadata_lease = sys.table.begin_metadata_change().await.unwrap();
 
         let outcome = sys
             .table
@@ -8499,8 +8270,6 @@ fn test_checkpoint_cancelled_while_table_metadata_change_active() {
                 reason: CheckpointCancelReason::TableMetadataChanging,
             }
         );
-        drop(metadata_lease);
-        drop(checkpoint_session);
     })
 }
 
@@ -8570,8 +8339,6 @@ fn test_runtime_layout_install_retires_removed_index_after_old_snapshot_drops() 
             1
         );
         assert!(!sys.table.has_retired_secondary_indexes());
-        drop(installed);
-        drop(guards);
     })
 }
 
@@ -8609,7 +8376,6 @@ fn test_runtime_layout_install_rejects_shrinking_index_slots() {
             sys.table.layout_snapshot().generation(),
             old_layout.generation()
         );
-        drop(old_layout);
     })
 }
 
@@ -8698,6 +8464,5 @@ fn test_secondary_index_rollback() {
             let vals = res.unwrap().unwrap_found();
             assert!(vals[0] == Val::from(3i32) && vals[1] == Val::from(3i32));
         }
-        drop(engine);
     })
 }

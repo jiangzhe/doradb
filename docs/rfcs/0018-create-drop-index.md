@@ -485,8 +485,8 @@ on. Safe synchronization primitives or existing project patterns are preferred.
   - Goals: Make crash windows deterministic and idempotent before exposing
     foreground APIs.
   - Non-goals: Rebuild missing indexes during normal recovery.
-  - Task Doc: `docs/tasks/TBD.md`
-  - Task Issue: `#0`
+  - Task Doc: `docs/tasks/000148-index-ddl-redo-and-recovery.md`
+  - Task Issue: `#634`
   - Phase Status: `pending`
   - Implementation Summary: `pending`
 

@@ -1,11 +1,12 @@
 mod checkpoint;
-// mod index;
+mod index;
 pub mod runtime;
 pub mod spec;
 pub mod storage;
 pub mod table;
 
 pub use checkpoint::*;
+pub(crate) use index::*;
 pub use runtime::*;
 pub use spec::*;
 pub use storage::*;
@@ -18,7 +19,7 @@ use crate::buffer::{
     BufferPool, EvictableBufferPool, FixedBufferPool, PoolGuards, PoolRole, ReadonlyBufferPool,
 };
 use crate::component::{Component, ComponentRegistry, MetaPool, ShelfScope};
-use crate::error::{DataIntegrityError, OperationError, Result};
+use crate::error::{DataIntegrityError, Error, OperationError, Result};
 use crate::file::fs::FileSystem;
 use crate::index::{BlockIndex, RowLocation};
 use crate::quiescent::{QuiescentBox, QuiescentGuard};
@@ -38,8 +39,6 @@ pub const ROW_ID_COL_NAME: &str = "__row_id";
 
 pub type ObjID = u64;
 pub type TableID = ObjID;
-pub type ColumnID = ObjID;
-pub type IndexID = ObjID;
 pub const USER_OBJ_ID_START: ObjID = 0x0001_0000_0000_0000;
 
 /// Return whether an object id belongs to user-managed catalog space.
@@ -158,143 +157,176 @@ impl Catalog {
     }
 
     /// Reload one user table runtime from catalog metadata and table file.
+    ///
+    /// Returns `true` when catalog metadata exactly matches the table-file root
+    /// metadata. Returns `false` when the metadata differs only by a recoverable
+    /// index-DDL gap and recovery must replay catalog index-DDL rows before final
+    /// metadata validation.
     pub(crate) async fn reload_create_table(
         &self,
         mem_pool: QuiescentGuard<EvictableBufferPool>,
         index_pool: QuiescentGuard<EvictableBufferPool>,
         table_fs: &FileSystem,
         disk_pool: QuiescentGuard<ReadonlyBufferPool>,
-        guards: &PoolGuards,
         table_id: TableID,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         if self.user_tables.contains_key(&table_id) {
             return Err(Report::new(OperationError::TableAlreadyExists)
                 .attach(format!("reload user table: table_id={table_id}"))
                 .into());
         }
-        let res = self
+        let guards = PoolGuards::builder()
+            .push(PoolRole::Meta, self.storage.meta_pool.pool_guard())
+            .push(PoolRole::Index, index_pool.pool_guard())
+            .push(PoolRole::Disk, disk_pool.pool_guard())
+            .build();
+        let (table, metadata_in_catalog) = self
+            .user_table_metadata_from_catalog(&guards, table_id)
+            .await?;
+
+        // Phase 2 allocator semantics: only table ids consume global user object ids.
+        self.try_update_next_user_obj_id(table.table_id.saturating_add(1).max(USER_OBJ_ID_START));
+
+        let table_file = table_fs
+            .open_table_file(table.table_id, disk_pool.clone())
+            .await?;
+        // `catalog_load_boundary`: loading a user table binds one root for
+        // metadata validation and block-index initialization.
+        let active_root = table_file.active_root_unchecked();
+        let metadata_in_file = &*active_root.metadata;
+        let metadata_matched = if &metadata_in_catalog == metadata_in_file {
+            true
+        } else if index_ddl_metadata_reconcilable(&metadata_in_catalog, metadata_in_file) {
+            false
+        } else {
+            return Err(Report::new(DataIntegrityError::InvalidRootInvariant)
+                .attach(format!(
+                    "reload user table metadata mismatch outside index-DDL reconciliation: table_id={}",
+                    table.table_id
+                ))
+                .into());
+        };
+
+        let row_id_bound = active_root.pivot_row_id;
+        let meta_pool_guard = guards.meta_guard();
+        let index_pool_guard = guards.index_guard();
+
+        let blk_idx = BlockIndex::new(
+            self.storage.meta_pool.clone(),
+            meta_pool_guard,
+            row_id_bound,
+            active_root.column_block_index_root,
+        )
+        .await?;
+        let table = Arc::new(
+            Table::new(
+                mem_pool.clone(),
+                index_pool.clone(),
+                index_pool_guard,
+                table.table_id,
+                blk_idx,
+                table_file,
+                disk_pool.clone(),
+            )
+            .await?,
+        );
+        let old = self.user_tables.insert(table_id, table);
+        if old.is_some() {
+            return Err(Report::new(OperationError::TableAlreadyExists)
+                .attach(format!("insert reloaded user table: table_id={table_id}"))
+                .into());
+        }
+        Ok(metadata_matched)
+    }
+
+    /// Build user-table metadata from current in-memory catalog rows.
+    pub(crate) async fn user_table_metadata_from_catalog(
+        &self,
+        guards: &PoolGuards,
+        table_id: TableID,
+    ) -> Result<(TableObject, TableMetadata)> {
+        let table = self
             .storage
             .tables()
             .find_uncommitted_by_id(guards, table_id)
-            .await?;
-        match res {
-            Some(table) => {
-                // Phase 2 allocator semantics: only table ids consume global user object ids.
-                self.try_update_next_user_obj_id(
-                    table.table_id.saturating_add(1).max(USER_OBJ_ID_START),
-                );
-
-                // todo: use secondary index to improve performance
-                let mut columns = self
-                    .storage
-                    .columns()
-                    .list_uncommitted_by_table_id(guards, table_id)
-                    .await;
-                debug_assert!(!columns.is_empty());
-                columns.sort_by_key(|c| c.column_no);
-
-                let column_specs = columns
-                    .into_iter()
-                    .map(|c| ColumnSpec::new(&c.column_name, c.column_type, c.column_attributes))
-                    .collect::<Vec<_>>();
-
-                let mut indexes = self
-                    .storage
-                    .indexes()
-                    .list_uncommitted_by_table_id(guards, table_id)
-                    .await;
-                indexes.sort_by_key(|index| index.index_no);
-
-                let mut index_columns = self
-                    .storage
-                    .index_columns()
-                    .list_uncommitted_by_table_id(guards, table_id)
-                    .await;
-                index_columns.sort_by_key(|ic| (ic.index_no, ic.index_column_no));
-                let mut index_columns_by_index_no: BTreeMap<u16, Vec<IndexColumnObject>> =
-                    BTreeMap::new();
-                for index_column in index_columns {
-                    index_columns_by_index_no
-                        .entry(index_column.index_no)
-                        .or_default()
-                        .push(index_column);
-                }
-
-                let mut index_specs = vec![];
-                for index in indexes {
-                    let mut index_cols = vec![];
-                    for index_column in index_columns_by_index_no
-                        .remove(&index.index_no)
-                        .unwrap_or_default()
-                    {
-                        let ik = IndexKey {
-                            col_no: index_column.column_no,
-                            order: index_column.index_order,
-                        };
-                        index_cols.push(ik);
-                    }
-                    index_specs.push(ActiveIndexSpec::new(
-                        index.index_no,
-                        IndexSpec::new(index_cols, index.index_attributes),
-                    ));
-                }
-                let table_file = table_fs
-                    .open_table_file(table.table_id, disk_pool.clone())
-                    .await?;
-                // `catalog_load_boundary`: loading a user table binds one root
-                // for metadata validation and block-index initialization.
-                let active_root = table_file.active_root_unchecked();
-                let metadata_in_catalog = TableMetadata::try_new_with_next_index_no(
-                    column_specs,
-                    index_specs,
-                    table.next_index_no,
-                )?;
-                let metadata_in_file = &*active_root.metadata;
-                if &metadata_in_catalog != metadata_in_file {
-                    return Err(Report::new(DataIntegrityError::InvalidRootInvariant)
-                        .attach(format!("table_id={}", table.table_id))
-                        .into());
-                }
-                let row_id_bound = active_root.pivot_row_id;
-                let meta_pool_guard = guards.meta_guard();
-                let index_pool_guard = guards.index_guard();
-
-                let blk_idx = BlockIndex::new(
-                    self.storage.meta_pool.clone(),
-                    meta_pool_guard,
-                    row_id_bound,
-                    active_root.column_block_index_root,
+            .await?
+            .ok_or_else(|| {
+                Error::from(
+                    Report::new(OperationError::TableNotFound)
+                        .attach(format!("reload user table metadata: table_id={table_id}")),
                 )
-                .await?;
-                let table = Arc::new(
-                    Table::new(
-                        mem_pool.clone(),
-                        index_pool.clone(),
-                        index_pool_guard,
-                        table.table_id,
-                        blk_idx,
-                        table_file,
-                        disk_pool.clone(),
-                    )
-                    .await?,
-                );
-                let old = self.user_tables.insert(table_id, table);
-                if old.is_some() {
-                    return Err(Report::new(OperationError::TableAlreadyExists)
-                        .attach(format!("insert reloaded user table: table_id={table_id}"))
-                        .into());
-                }
-                Ok(())
-            }
-            None => Err(Report::new(OperationError::TableNotFound)
-                .attach(format!("reload user table metadata: table_id={table_id}"))
-                .into()),
+            })?;
+
+        // todo: use secondary index to improve performance
+        let mut columns = self
+            .storage
+            .columns()
+            .list_uncommitted_by_table_id(guards, table_id)
+            .await;
+        debug_assert!(!columns.is_empty());
+        columns.sort_by_key(|c| c.column_no);
+
+        let column_specs = columns
+            .into_iter()
+            .map(|c| ColumnSpec::new(&c.column_name, c.column_type, c.column_attributes))
+            .collect::<Vec<_>>();
+
+        let mut indexes = self
+            .storage
+            .indexes()
+            .list_uncommitted_by_table_id(guards, table_id)
+            .await;
+        indexes.sort_by_key(|index| index.index_no);
+
+        let mut index_columns = self
+            .storage
+            .index_columns()
+            .list_uncommitted_by_table_id(guards, table_id)
+            .await;
+        index_columns.sort_by_key(|ic| (ic.index_no, ic.index_column_no));
+        let mut index_columns_by_index_no: BTreeMap<u16, Vec<IndexColumnObject>> = BTreeMap::new();
+        for index_column in index_columns {
+            index_columns_by_index_no
+                .entry(index_column.index_no)
+                .or_default()
+                .push(index_column);
         }
+
+        let mut index_specs = vec![];
+        for index in indexes {
+            let mut index_cols = vec![];
+            for index_column in index_columns_by_index_no
+                .remove(&index.index_no)
+                .unwrap_or_default()
+            {
+                let ik = IndexKey {
+                    col_no: index_column.column_no,
+                    order: index_column.index_order,
+                };
+                index_cols.push(ik);
+            }
+            index_specs.push(ActiveIndexSpec::new(
+                index.index_no,
+                IndexSpec::new(index_cols, index.index_attributes),
+            ));
+        }
+        let metadata = TableMetadata::try_new_with_next_index_no(
+            column_specs,
+            index_specs,
+            table.next_index_no,
+        )?;
+        Ok((table, metadata))
     }
 
     /// Get a user-table runtime handle by table id.
     #[inline]
     pub async fn get_table(&self, table_id: TableID) -> Option<Arc<Table>> {
+        self.get_table_now(table_id)
+    }
+
+    /// Get a user-table runtime handle synchronously by table id.
+    #[inline]
+    pub(crate) fn get_table_now(&self, table_id: TableID) -> Option<Arc<Table>> {
         if is_catalog_obj_id(table_id) {
             return None;
         }
@@ -354,6 +386,28 @@ impl Catalog {
     pub fn meta_pool(&self) -> &FixedBufferPool {
         &self.storage.meta_pool
     }
+}
+
+#[inline]
+fn index_ddl_metadata_reconcilable(catalog: &TableMetadata, file: &TableMetadata) -> bool {
+    if catalog.col_names != file.col_names || catalog.col_types != file.col_types {
+        return false;
+    }
+    if file.next_index_no() < catalog.next_index_no() {
+        return false;
+    }
+
+    let max_slots = catalog.index_slot_count().max(file.index_slot_count());
+    for index_no in 0..max_slots {
+        let catalog_spec = catalog.index_spec(index_no);
+        let file_spec = file.index_spec(index_no);
+        if let (Some(catalog_spec), Some(file_spec)) = (catalog_spec, file_spec)
+            && catalog_spec != file_spec
+        {
+            return false;
+        }
+    }
+    true
 }
 
 /// Unified runtime handle for either user table or catalog table.

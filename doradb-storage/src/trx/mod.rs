@@ -31,7 +31,7 @@ pub mod ver_map;
 use crate::buffer::PageID;
 use crate::buffer::PoolGuards;
 use crate::buffer::page::VersionedPageID;
-use crate::catalog::TableID;
+use crate::catalog::{TableID, USER_OBJ_ID_START, is_catalog_obj_id};
 use crate::engine::EngineRef;
 use crate::error::{InternalError, OperationError, Result};
 use crate::file::table_file::OldRoot;
@@ -43,7 +43,7 @@ use crate::quiescent::QuiescentGuard;
 use crate::row::RowID;
 use crate::session::SessionState;
 use crate::trx::log_replay::TrxLog;
-use crate::trx::redo::{RedoHeader, RedoLogs, RedoTrxKind, RowRedo, RowRedoKind};
+use crate::trx::redo::{DDLRedo, RedoHeader, RedoLogs, RedoTrxKind, RowRedo, RowRedoKind};
 use crate::trx::stmt::Statement;
 use crate::trx::undo::{IndexPurgeEntry, IndexUndoLogs, RowUndoHead, RowUndoLogs, UndoStatus};
 use crate::value::Val;
@@ -442,6 +442,20 @@ impl TrxEffects {
         }
     }
 
+    /// Validate invariants that need both DDL and DML redo context.
+    #[inline]
+    fn debug_assert_redo_invariants(&self) {
+        debug_assert!(
+            !self
+                .redo
+                .dml
+                .keys()
+                .any(|table_id| is_catalog_obj_id(*table_id))
+                || is_catalog_metadata_ddl(self.redo.ddl.as_deref()),
+            "catalog table DML must be logged by a catalog metadata DDL transaction"
+        );
+    }
+
     /// Moves transaction effects into a prepared transaction payload.
     #[inline]
     pub(crate) fn take_payload_parts(
@@ -480,6 +494,19 @@ impl TrxEffects {
             "old table root should be cleared"
         );
     }
+}
+
+#[inline]
+fn is_catalog_metadata_ddl(ddl: Option<&DDLRedo>) -> bool {
+    matches!(
+        ddl,
+        Some(
+            DDLRedo::CreateTable(_)
+                | DDLRedo::DropTable(_)
+                | DDLRedo::CreateIndex { .. }
+                | DDLRedo::DropIndex { .. }
+        )
+    )
 }
 
 /// Owner-local logical lock cache.
@@ -677,6 +704,11 @@ impl ActiveTrx {
     #[inline]
     pub(crate) fn effects_mut(&mut self) -> &mut TrxEffects {
         &mut self.effects
+    }
+
+    #[inline]
+    pub(crate) fn debug_assert_redo_invariants(&self) {
+        self.effects.debug_assert_redo_invariants();
     }
 
     #[inline]
@@ -1060,7 +1092,7 @@ impl ActiveTrx {
         // simulate sysbench record
         // uint64 + int32 + int32 + char(60) + char(120)
         self.redo_mut().insert_dml(
-            0,
+            USER_OBJ_ID_START,
             RowRedo {
                 page_id: PageID::new(0),
                 row_id: 0,
@@ -1466,6 +1498,7 @@ impl CommittedTrx {
 pub(crate) mod tests {
     use super::*;
     use crate::buffer::PoolRole;
+    use crate::catalog::storage::tables::TABLE_ID_TABLES;
     use crate::catalog::{ColumnAttributes, ColumnSpec, TableMetadata};
     use crate::conf::{EngineConfig, EvictableBufferPoolConfig, TrxSysConfig};
     use crate::engine::Engine;
@@ -1724,6 +1757,21 @@ pub(crate) mod tests {
 
             trx.discard_after_fatal_rollback();
         });
+    }
+
+    #[test]
+    #[should_panic(expected = "catalog table DML must be logged")]
+    fn test_redo_invariants_debug_assert_catalog_dml_without_metadata_ddl() {
+        let mut effects = TrxEffects::empty();
+        effects.redo.insert_dml(
+            TABLE_ID_TABLES,
+            RowRedo {
+                page_id: PageID::new(0),
+                row_id: 0,
+                kind: RowRedoKind::Insert(vec![Val::U64(1)]),
+            },
+        );
+        effects.debug_assert_redo_invariants();
     }
 
     #[test]
