@@ -196,7 +196,11 @@ impl Catalog {
         let metadata_in_file = &*active_root.metadata;
         let metadata_matched = if &metadata_in_catalog == metadata_in_file {
             true
-        } else if index_ddl_metadata_reconcilable(&metadata_in_catalog, metadata_in_file) {
+        } else if index_ddl_metadata_reconcilable(
+            table.table_id,
+            &metadata_in_catalog,
+            metadata_in_file,
+        )? {
             false
         } else {
             return Err(Report::new(DataIntegrityError::InvalidRootInvariant)
@@ -404,15 +408,29 @@ impl Catalog {
 }
 
 #[inline]
-fn index_ddl_metadata_reconcilable(catalog: &TableMetadata, file: &TableMetadata) -> bool {
+fn index_ddl_metadata_reconcilable(
+    table_id: TableID,
+    catalog: &TableMetadata,
+    file: &TableMetadata,
+) -> Result<bool> {
+    // The active table root may be ahead of checkpointed catalog rows: recovery
+    // can replay later index-DDL catalog rows to make catalog metadata catch up.
+    // The opposite direction is unrecoverable here because replay cannot make a
+    // table root that has already been opened acquire missing allocation state.
+    if file.next_index_no() < catalog.next_index_no() {
+        return Err(Report::new(DataIntegrityError::InvalidRootInvariant)
+            .attach(format!(
+                "index-DDL reconciliation found catalog allocation ahead of table root: table_id={table_id}, catalog_next_index_no={}, file_next_index_no={}",
+                catalog.next_index_no(),
+                file.next_index_no()
+            ))
+            .into());
+    }
     if catalog.col_names != file.col_names
         || catalog.col_types != file.col_types
         || catalog.col_attrs != file.col_attrs
     {
-        return false;
-    }
-    if file.next_index_no() < catalog.next_index_no() {
-        return false;
+        return Ok(false);
     }
 
     let max_slots = catalog.index_slot_count().max(file.index_slot_count());
@@ -422,10 +440,10 @@ fn index_ddl_metadata_reconcilable(catalog: &TableMetadata, file: &TableMetadata
         if let (Some(catalog_spec), Some(file_spec)) = (catalog_spec, file_spec)
             && catalog_spec != file_spec
         {
-            return false;
+            return Ok(false);
         }
     }
-    true
+    Ok(true)
 }
 
 /// Unified runtime handle for either user table or catalog table.
@@ -930,10 +948,53 @@ pub mod tests {
         assert_eq!(catalog_metadata.col_names, file_metadata.col_names);
         assert_eq!(catalog_metadata.col_types, file_metadata.col_types);
         assert_ne!(catalog_metadata.col_attrs, file_metadata.col_attrs);
-        assert!(!index_ddl_metadata_reconcilable(
-            &catalog_metadata,
-            &file_metadata
-        ));
+        assert!(!index_ddl_metadata_reconcilable(42, &catalog_metadata, &file_metadata).unwrap());
+    }
+
+    #[test]
+    fn test_index_ddl_metadata_reconcilable_allows_file_ahead_of_catalog() {
+        let columns = || {
+            vec![
+                ColumnSpec::new("id", ValKind::I32, ColumnAttributes::empty()),
+                ColumnSpec::new("value", ValKind::I32, ColumnAttributes::empty()),
+            ]
+        };
+        let primary_index = || IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::PK);
+        let secondary_index = || IndexSpec::new(vec![IndexKey::new(1)], IndexAttributes::empty());
+
+        let catalog_metadata = TableMetadata::new(columns(), vec![primary_index()]);
+        let file_metadata = TableMetadata::new(columns(), vec![primary_index(), secondary_index()]);
+
+        assert!(file_metadata.next_index_no() > catalog_metadata.next_index_no());
+        assert!(index_ddl_metadata_reconcilable(42, &catalog_metadata, &file_metadata).unwrap());
+    }
+
+    #[test]
+    fn test_index_ddl_metadata_reconcilable_errors_when_catalog_ahead_of_file() {
+        let columns = || {
+            vec![
+                ColumnSpec::new("id", ValKind::I32, ColumnAttributes::empty()),
+                ColumnSpec::new("value", ValKind::I32, ColumnAttributes::empty()),
+            ]
+        };
+        let primary_index = || IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::PK);
+        let secondary_index = || IndexSpec::new(vec![IndexKey::new(1)], IndexAttributes::empty());
+
+        let catalog_metadata =
+            TableMetadata::new(columns(), vec![primary_index(), secondary_index()]);
+        let file_metadata = TableMetadata::new(columns(), vec![primary_index()]);
+
+        assert!(catalog_metadata.next_index_no() > file_metadata.next_index_no());
+        let err =
+            index_ddl_metadata_reconcilable(42, &catalog_metadata, &file_metadata).unwrap_err();
+        assert_eq!(
+            err.data_integrity_error(),
+            Some(DataIntegrityError::InvalidRootInvariant)
+        );
+        let report = format!("{err:?}");
+        assert!(report.contains("table_id=42"), "{report}");
+        assert!(report.contains("catalog_next_index_no=2"), "{report}");
+        assert!(report.contains("file_next_index_no=1"), "{report}");
     }
 
     #[test]

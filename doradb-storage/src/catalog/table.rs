@@ -207,6 +207,18 @@ impl TableMetadata {
                 col_attrs.len()
             )));
         }
+        for (idx, ((col_name, col_type), col_attr)) in
+            col_names.iter().zip(&col_types).zip(&col_attrs).enumerate()
+        {
+            let type_nullable = col_type.nullable;
+            let attr_nullable = col_attr.contains(ColumnAttributes::NULLABLE);
+            if type_nullable != attr_nullable {
+                return Err(invalid_table_metadata(format!(
+                    "column nullability metadata mismatch: column_index={idx}, column_name={}, type_nullable={type_nullable}, attr_nullable={attr_nullable}",
+                    col_name.as_str()
+                )));
+            }
+        }
         let mut fix_len = 0;
         let mut var_cols = vec![];
         for (idx, ty) in col_types.iter().enumerate() {
@@ -545,6 +557,24 @@ mod tests {
         assert_eq!(metadata.next_index_no(), 2);
         assert_eq!(metadata.index_slot_count(), 2);
         assert_eq!(metadata.active_index_count(), 2);
+    }
+
+    #[test]
+    fn test_table_metadata_rejects_inconsistent_column_nullability() {
+        let brief = TableBriefMetadata {
+            col_names: vec![SemiStr::new("c0")],
+            col_types: vec![ValType::new(ValKind::U32, true)],
+            col_attrs: vec![ColumnAttributes::empty()],
+            next_index_no: 0,
+            index_specs: vec![],
+        };
+
+        let err = TableMetadata::try_from(brief).unwrap_err();
+        let report = format!("{err:?}");
+        assert!(report.contains("column_index=0"), "{report}");
+        assert!(report.contains("column_name=c0"), "{report}");
+        assert!(report.contains("type_nullable=true"), "{report}");
+        assert!(report.contains("attr_nullable=false"), "{report}");
     }
 
     #[test]
