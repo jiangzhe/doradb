@@ -2281,7 +2281,8 @@ fn test_secondary_mem_index_cleanup_removes_unique_delete_shadow_when_cold_row_k
         let mut session = sys.try_new_session().unwrap();
         insert_rows(&sys, &mut session, 0, 1, "name").await;
         sys.table.freeze(&session, usize::MAX).await;
-        checkpoint_published(&sys.table, &mut session).await;
+        let checkpoint_ts = checkpoint_published(&sys.table, &mut session).await;
+        wait_gc_cutoff_after(&session, checkpoint_ts).await;
 
         let current_key = single_key(0i32);
         let stale_key = single_key(-1i32);
@@ -2382,7 +2383,8 @@ fn test_secondary_mem_index_cleanup_propagates_cold_delete_overlay_proof_error()
         let mut session = sys.try_new_session().unwrap();
         insert_rows(&sys, &mut session, 0, 1, "name").await;
         sys.table.freeze(&session, usize::MAX).await;
-        checkpoint_published(&sys.table, &mut session).await;
+        let checkpoint_ts = checkpoint_published(&sys.table, &mut session).await;
+        wait_gc_cutoff_after(&session, checkpoint_ts).await;
 
         let current_key = single_key(0i32);
         let stale_key = single_key(-1i32);
@@ -2692,7 +2694,8 @@ fn test_secondary_mem_index_cleanup_removes_non_unique_delete_mark_when_cold_row
         let mut session = sys.try_new_session().unwrap();
         insert_rows(&sys, &mut session, 0, 1, "current").await;
         sys.table.freeze(&session, usize::MAX).await;
-        checkpoint_published(&sys.table, &mut session).await;
+        let checkpoint_ts = checkpoint_published(&sys.table, &mut session).await;
+        wait_gc_cutoff_after(&session, checkpoint_ts).await;
 
         let pk = single_key(0i32);
         let current_key = name_key("current");
