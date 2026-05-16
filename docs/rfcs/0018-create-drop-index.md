@@ -485,10 +485,10 @@ on. Safe synchronization primitives or existing project patterns are preferred.
   - Goals: Make crash windows deterministic and idempotent before exposing
     foreground APIs.
   - Non-goals: Rebuild missing indexes during normal recovery.
-  - Task Doc: `docs/tasks/TBD.md`
-  - Task Issue: `#0`
-  - Phase Status: `pending`
-  - Implementation Summary: `pending`
+  - Task Doc: `docs/tasks/000148-index-ddl-redo-and-recovery.md`
+  - Task Issue: `#634`
+  - Phase Status: done
+  - Implementation Summary: Implemented Phase 3 index DDL redo and recovery: switched create/drop index redo to table_id/index_no payloads, added table-root proof classification for recovery and catalog checkpoint, allowed recovery-only pending metadata reconciliation with final validation, preserved create-then-drop allocation replay, advanced timestamp recovery from published roots, hardened catalog/table metadata validation, and validated default, libaio, clippy, and focused coverage. [Task Resolve Sync: docs/tasks/000148-index-ddl-redo-and-recovery.md @ 2026-05-16]
 
 - **Phase 4: CREATE INDEX**
   - Scope: Add the storage API and implementation for single-threaded index

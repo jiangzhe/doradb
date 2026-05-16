@@ -1,5 +1,8 @@
 use crate::catalog::storage::tables::TABLE_ID_TABLES;
-use crate::catalog::{Catalog, TableID, is_catalog_obj_id, is_user_obj_id};
+use crate::catalog::{
+    Catalog, IndexDdlKind, IndexDdlRootProof, TableID, classify_index_ddl_root, is_catalog_obj_id,
+    is_user_obj_id,
+};
 use crate::error::{ErrorKind, FatalError, Result};
 use crate::trx::TrxID;
 use crate::trx::log::{LogPartitionInitializer, list_log_files};
@@ -295,6 +298,9 @@ impl Catalog {
         durable_upper_cts: TrxID,
         scan_cfg: &CatalogCheckpointScanConfig,
     ) -> Result<CatalogCheckpointBatch> {
+        // Start with an empty batch whose safe point is just before the
+        // catalog replay cursor. The scan only advances `safe_cts` after a
+        // redo record is proven safe to cover in this checkpoint.
         let mut batch = CatalogCheckpointBatch {
             replay_start_ts,
             durable_upper_cts,
@@ -304,9 +310,13 @@ impl Catalog {
             stop_reason: CatalogCheckpointScanStopReason::ReachedDurableUpper,
         };
         if durable_upper_cts < replay_start_ts {
+            // Nothing durable has reached the catalog replay cursor yet, so
+            // there are no log records this checkpoint can consume.
             return Ok(batch);
         }
 
+        // Build a merged CTS-ordered stream over all log partitions. Missing
+        // partitions simply contribute no records to this checkpoint batch.
         let mut log_merger = LogMerger::default();
         for log_no in 0..scan_cfg.log_partitions {
             let logs = list_log_files(&scan_cfg.file_prefix, log_no, false)?;
@@ -328,59 +338,145 @@ impl Catalog {
         while let Some(log) = log_merger.try_next()? {
             let (header, redo) = log.into_inner();
             if header.cts < replay_start_ts {
+                // Older records are already represented by the current
+                // catalog storage checkpoint.
                 continue;
             }
             if header.cts > durable_upper_cts {
+                // The global durable watermark bounds this batch. Later
+                // records may exist in logs but are not checkpoint-safe yet.
                 break;
             }
 
-            if let Some(ddl) = redo.ddl.as_deref()
-                && let Some(table_id) = drop_table_id(ddl)
-                && is_user_obj_id(table_id)
-                && !drop_table_has_catalog_table_delete(table_id, &redo.dml)
-            {
-                batch.stop_reason = CatalogCheckpointScanStopReason::BlockedByTableDDL {
-                    table_id,
-                    ddl: CatalogCheckpointBlockingDDL::DropTable,
-                };
-                break;
-            }
+            let Some(ddl) = redo.ddl.as_deref() else {
+                // DML-only transactions do not participate in catalog
+                // checkpoint state. Foreground commit enforces that catalog
+                // table DML must carry a catalog metadata DDL marker.
+                batch.safe_cts = header.cts;
+                continue;
+            };
 
-            batch.safe_cts = header.cts;
+            // Decide how this DDL transaction participates in the catalog
+            // checkpoint before advancing the safe cursor. The decision covers
+            // both table DDL ordering rules and index DDL root-proof rules.
+            match self.catalog_checkpoint_txn_action(ddl, &redo.dml, header.cts)? {
+                CatalogCheckpointTxnAction::Include => {
+                    // Reaching here means this transaction will never need to be
+                    // replayed as catalog history before the next checkpoint cursor.
+                    batch.safe_cts = header.cts;
+                    batch.catalog_ddl_txn_count = batch.catalog_ddl_txn_count.saturating_add(1);
 
-            if let Some(ddl) = redo.ddl.as_deref()
-                && is_catalog_ddl(ddl)
-            {
-                batch.catalog_ddl_txn_count = batch.catalog_ddl_txn_count.saturating_add(1);
-            }
-
-            for (table_id, table_dml) in redo.dml {
-                if !is_catalog_obj_id(table_id) {
-                    continue;
+                    // Only catalog-table row redo is materialized into the catalog
+                    // checkpoint; user-table row data remains owned by table
+                    // files and is not part of catalog storage state.
+                    for (table_id, table_dml) in redo.dml {
+                        if !is_catalog_obj_id(table_id) {
+                            continue;
+                        }
+                        for row_redo in table_dml.rows.into_values() {
+                            batch.catalog_ops.push(CatalogRedoEntry {
+                                table_id,
+                                kind: row_redo.kind,
+                            });
+                        }
+                    }
                 }
-                for row_redo in table_dml.rows.into_values() {
-                    batch.catalog_ops.push(CatalogRedoEntry {
-                        table_id,
-                        kind: row_redo.kind,
-                    });
+                CatalogCheckpointTxnAction::Skip => {
+                    // Reaching here means this transaction will never need to be
+                    // replayed as catalog history before the next checkpoint cursor.
+                    batch.safe_cts = header.cts;
+                }
+                CatalogCheckpointTxnAction::Stop(reason) => {
+                    batch.stop_reason = reason;
+                    break;
                 }
             }
         }
         Ok(batch)
     }
-}
 
-#[inline]
-fn drop_table_id(ddl: &DDLRedo) -> Option<TableID> {
-    match ddl {
-        DDLRedo::DropTable(table_id) => Some(*table_id),
-        _ => None,
+    fn catalog_checkpoint_txn_action(
+        &self,
+        ddl: &DDLRedo,
+        dml: &BTreeMap<TableID, TableDML>,
+        cts: TrxID,
+    ) -> Result<CatalogCheckpointTxnAction> {
+        match ddl {
+            DDLRedo::CreateTable(_) => Ok(CatalogCheckpointTxnAction::Include),
+            DDLRedo::DropTable(table_id)
+                if is_user_obj_id(*table_id)
+                    && !drop_table_has_catalog_table_delete(*table_id, dml) =>
+            {
+                // A user-table drop without the matching catalog-table delete
+                // cannot be folded into the catalog checkpoint. Stop before
+                // it so replay still sees the table DDL in log order.
+                Ok(CatalogCheckpointTxnAction::Stop(
+                    CatalogCheckpointScanStopReason::BlockedByTableDDL {
+                        table_id: *table_id,
+                        ddl: CatalogCheckpointBlockingDDL::DropTable,
+                    },
+                ))
+            }
+            DDLRedo::DropTable(_) => Ok(CatalogCheckpointTxnAction::Include),
+            DDLRedo::CreateRowPage { .. } | DDLRedo::DataCheckpoint { .. } => {
+                Ok(CatalogCheckpointTxnAction::Skip)
+            }
+            DDLRedo::CreateIndex { table_id, index_no } => self
+                .catalog_checkpoint_index_ddl_action(
+                    IndexDdlKind::Create,
+                    *table_id,
+                    *index_no,
+                    cts,
+                ),
+            DDLRedo::DropIndex { table_id, index_no } => self.catalog_checkpoint_index_ddl_action(
+                IndexDdlKind::Drop,
+                *table_id,
+                *index_no,
+                cts,
+            ),
+        }
+    }
+
+    fn catalog_checkpoint_index_ddl_action(
+        &self,
+        kind: IndexDdlKind,
+        table_id: TableID,
+        index_no: u16,
+        cts: TrxID,
+    ) -> Result<CatalogCheckpointTxnAction> {
+        let table = self.get_table_now(table_id);
+        let active_root = table
+            .as_ref()
+            .map(|table| table.file().active_root_unchecked());
+        // Index DDL needs root proof because its catalog rows may be logged
+        // before the table root is durably published. Proven index DDL is
+        // folded into the checkpoint; provisional index DDL advances the safe
+        // point but leaves catalog row redo for recovery to skip/replay from
+        // the still-authoritative root.
+        let proof = classify_index_ddl_root(kind, table_id, index_no, cts, active_root)?;
+        match (kind, proof) {
+            (
+                IndexDdlKind::Create,
+                IndexDdlRootProof::DurableFinalCreate | IndexDdlRootProof::DurableAllocationOnly,
+            )
+            | (IndexDdlKind::Drop, IndexDdlRootProof::DurableFinalDrop) => {
+                Ok(CatalogCheckpointTxnAction::Include)
+            }
+            (_, IndexDdlRootProof::Provisional) => Ok(CatalogCheckpointTxnAction::Skip),
+            (IndexDdlKind::Create, IndexDdlRootProof::DurableFinalDrop)
+            | (
+                IndexDdlKind::Drop,
+                IndexDdlRootProof::DurableFinalCreate | IndexDdlRootProof::DurableAllocationOnly,
+            ) => unreachable!("index DDL root proof kind mismatch"),
+        }
     }
 }
 
-#[inline]
-fn is_catalog_ddl(ddl: &DDLRedo) -> bool {
-    matches!(ddl, DDLRedo::CreateTable(_) | DDLRedo::DropTable(_))
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CatalogCheckpointTxnAction {
+    Include,
+    Skip,
+    Stop(CatalogCheckpointScanStopReason),
 }
 
 fn drop_table_has_catalog_table_delete(

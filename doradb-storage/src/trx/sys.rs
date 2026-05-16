@@ -255,6 +255,7 @@ impl TransactionSystem {
         }
         // Prepare redo log first, this may take some time,
         // so keep it out of lock scope, and we can fill cts after the lock is held.
+        trx.debug_assert_redo_invariants();
         let partition = &*self.log_partitions[trx.log_no()];
         let prepared_trx = trx.prepare()?;
         if !prepared_trx.require_ordered_commit() {

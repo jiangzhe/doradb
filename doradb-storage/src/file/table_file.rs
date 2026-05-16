@@ -52,6 +52,15 @@ fn secondary_index_root_count_mismatch(root_count: usize, index_count: usize) ->
 }
 
 #[inline]
+fn secondary_index_root_inactive_slot_mismatch(index_no: usize, root: BlockID) -> Error {
+    Report::new(InternalError::SecondaryIndexRootCountMismatch)
+        .attach(format!(
+            "inactive index slot {index_no} has root {root}, expected SUPER_BLOCK_ID {SUPER_BLOCK_ID}"
+        ))
+        .into()
+}
+
+#[inline]
 fn mutable_root_metadata_regression(message: impl Into<String>) -> Error {
     Report::new(InternalError::MutableRootMetadataRegression)
         .attach(message.into())
@@ -489,6 +498,34 @@ impl MutableTableFile {
             ));
         }
         self.new_root_mut().secondary_index_roots = roots;
+        Ok(())
+    }
+
+    /// Replaces table metadata and the matching sparse secondary-root slots.
+    #[inline]
+    #[allow(
+        dead_code,
+        reason = "future index DDL uses this root-metadata mutation boundary"
+    )]
+    pub(crate) fn replace_metadata_and_secondary_index_roots(
+        &mut self,
+        metadata: Arc<TableMetadata>,
+        roots: Vec<BlockID>,
+    ) -> Result<()> {
+        if roots.len() != metadata.index_slot_count() {
+            return Err(secondary_index_root_count_mismatch(
+                roots.len(),
+                metadata.index_slot_count(),
+            ));
+        }
+        for (index_no, root) in roots.iter().copied().enumerate() {
+            if metadata.index_spec(index_no).is_none() && root != SUPER_BLOCK_ID {
+                return Err(secondary_index_root_inactive_slot_mismatch(index_no, root));
+            }
+        }
+        let root = self.new_root_mut();
+        root.metadata = metadata;
+        root.secondary_index_roots = roots;
         Ok(())
     }
 

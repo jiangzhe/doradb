@@ -1,5 +1,5 @@
 use crate::buffer::PageID;
-use crate::catalog::{IndexID, TableID};
+use crate::catalog::TableID;
 use crate::error::{DataIntegrityError, Error, Result};
 use crate::row::RowID;
 use crate::row::ops::{SelectKey, UpdateCol};
@@ -193,8 +193,14 @@ pub enum DDLRedo {
     // Actual metadata change is recorded in DML logs.
     CreateTable(TableID),
     DropTable(TableID),
-    CreateIndex(IndexID),
-    DropIndex(IndexID),
+    CreateIndex {
+        table_id: TableID,
+        index_no: u16,
+    },
+    DropIndex {
+        table_id: TableID,
+        index_no: u16,
+    },
     CreateRowPage {
         table_id: TableID,
         page_id: PageID,
@@ -215,8 +221,8 @@ impl DDLRedo {
         match self {
             DDLRedo::CreateTable(..) => DDLRedoCode::CreateTable,
             DDLRedo::DropTable(..) => DDLRedoCode::DropTable,
-            DDLRedo::CreateIndex(..) => DDLRedoCode::CreateIndex,
-            DDLRedo::DropIndex(..) => DDLRedoCode::DropIndex,
+            DDLRedo::CreateIndex { .. } => DDLRedoCode::CreateIndex,
+            DDLRedo::DropIndex { .. } => DDLRedoCode::DropIndex,
             DDLRedo::CreateRowPage { .. } => DDLRedoCode::CreateRowPage,
             DDLRedo::DataCheckpoint { .. } => DDLRedoCode::DataCheckpoint,
         }
@@ -230,8 +236,9 @@ impl Ser<'_> for DDLRedo {
             + match self {
                 DDLRedo::CreateTable(_) => mem::size_of::<TableID>(),
                 DDLRedo::DropTable(_) => mem::size_of::<TableID>(),
-                DDLRedo::CreateIndex(_) => mem::size_of::<IndexID>(),
-                DDLRedo::DropIndex(_) => mem::size_of::<IndexID>(),
+                DDLRedo::CreateIndex { .. } | DDLRedo::DropIndex { .. } => {
+                    mem::size_of::<TableID>() + mem::size_of::<u16>()
+                }
                 DDLRedo::CreateRowPage { .. } => {
                     mem::size_of::<TableID>()
                         + mem::size_of::<PageID>()
@@ -254,11 +261,13 @@ impl Ser<'_> for DDLRedo {
             DDLRedo::DropTable(table_id) => {
                 idx = out.ser_u64(idx, *table_id);
             }
-            DDLRedo::CreateIndex(index_id) => {
-                idx = out.ser_u64(idx, *index_id);
+            DDLRedo::CreateIndex { table_id, index_no } => {
+                idx = out.ser_u64(idx, *table_id);
+                idx = out.ser_u16(idx, *index_no);
             }
-            DDLRedo::DropIndex(index_id) => {
-                idx = out.ser_u64(idx, *index_id);
+            DDLRedo::DropIndex { table_id, index_no } => {
+                idx = out.ser_u64(idx, *table_id);
+                idx = out.ser_u16(idx, *index_no);
             }
             DDLRedo::CreateRowPage {
                 table_id,
@@ -305,12 +314,14 @@ impl Deser for DDLRedo {
                 Ok((idx, DDLRedo::DropTable(table_id)))
             }
             DDLRedoCode::CreateIndex => {
-                let (idx, index_id) = input.deser_u64(idx)?;
-                Ok((idx, DDLRedo::CreateIndex(index_id)))
+                let (idx, table_id) = input.deser_u64(idx)?;
+                let (idx, index_no) = input.deser_u16(idx)?;
+                Ok((idx, DDLRedo::CreateIndex { table_id, index_no }))
             }
             DDLRedoCode::DropIndex => {
-                let (idx, index_id) = input.deser_u64(idx)?;
-                Ok((idx, DDLRedo::DropIndex(index_id)))
+                let (idx, table_id) = input.deser_u64(idx)?;
+                let (idx, index_no) = input.deser_u16(idx)?;
+                Ok((idx, DDLRedo::DropIndex { table_id, index_no }))
             }
             DDLRedoCode::CreateRowPage => {
                 let (idx, table_id) = input.deser_u64(idx)?;
@@ -904,7 +915,10 @@ mod tests {
         }
 
         // 测试用例3：CreateIndex
-        let create_index = DDLRedo::CreateIndex(1);
+        let create_index = DDLRedo::CreateIndex {
+            table_id: 11,
+            index_no: 1,
+        };
         let mut buf = vec![0; create_index.ser_len()];
         create_index.ser(&mut buf[..], 0);
 
@@ -914,14 +928,18 @@ mod tests {
         // 验证反序列化结果
         let (_, deserialized) = DDLRedo::deser(&buf[..], 0).unwrap();
         match deserialized {
-            DDLRedo::CreateIndex(index_id) => {
-                assert_eq!(index_id, 1);
+            DDLRedo::CreateIndex { table_id, index_no } => {
+                assert_eq!(table_id, 11);
+                assert_eq!(index_no, 1);
             }
             _ => panic!("Expected CreateIndex"),
         }
 
         // 测试用例4：DropIndex
-        let drop_index = DDLRedo::DropIndex(2);
+        let drop_index = DDLRedo::DropIndex {
+            table_id: 22,
+            index_no: 2,
+        };
         let mut buf = vec![0; drop_index.ser_len()];
         drop_index.ser(&mut buf[..], 0);
 
@@ -931,8 +949,9 @@ mod tests {
         // 验证反序列化结果
         let (_, deserialized) = DDLRedo::deser(&buf[..], 0).unwrap();
         match deserialized {
-            DDLRedo::DropIndex(index_id) => {
-                assert_eq!(index_id, 2);
+            DDLRedo::DropIndex { table_id, index_no } => {
+                assert_eq!(table_id, 22);
+                assert_eq!(index_no, 2);
             }
             _ => panic!("Expected DropIndex"),
         }

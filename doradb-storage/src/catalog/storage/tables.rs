@@ -120,7 +120,14 @@ mod tests {
     use crate::buffer::{BufferPool, PoolGuards, PoolRole};
     use crate::catalog::tests::table1;
     use crate::conf::{EngineConfig, TrxSysConfig};
+    use crate::trx::ActiveTrx;
+    use crate::trx::redo::DDLRedo;
     use tempfile::TempDir;
+
+    fn mark_catalog_ddl(trx: &mut ActiveTrx, ddl: DDLRedo) {
+        let old = trx.effects_mut().redo_mut().ddl.replace(Box::new(ddl));
+        debug_assert!(old.is_none());
+    }
 
     #[test]
     fn test_tables_delete_by_id() {
@@ -165,6 +172,7 @@ mod tests {
             })
             .await
             .unwrap();
+            mark_catalog_ddl(&mut trx, DDLRedo::CreateTable(table100.table_id));
             trx.commit().await.unwrap();
 
             let mut trx = session.try_begin_trx().unwrap().unwrap();
@@ -189,6 +197,7 @@ mod tests {
             })
             .await
             .unwrap();
+            mark_catalog_ddl(&mut trx, DDLRedo::DropTable(table100.table_id));
             trx.commit().await.unwrap();
 
             assert!(

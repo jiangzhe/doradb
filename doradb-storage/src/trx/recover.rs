@@ -18,7 +18,8 @@ use crate::buffer::{
     BufferPool, EvictableBufferPool, FixedBufferPool, PoolGuards, PoolRole, ReadonlyBufferPool,
 };
 use crate::catalog::{
-    Catalog, CatalogTable, TableID, TableMetadata, is_catalog_obj_id, is_user_obj_id,
+    Catalog, CatalogTable, IndexDdlKind, IndexDdlRootProof, TableID, TableMetadata,
+    classify_index_ddl_root, is_catalog_obj_id, is_user_obj_id,
 };
 use crate::error::{DataIntegrityError, Error, OperationError, Result};
 use crate::file::fs::FileSystem;
@@ -193,6 +194,8 @@ pub struct LogRecovery<'a> {
     max_recovered_cts: TrxID,
     /// Per loaded user table, the persisted replay boundaries from its active root.
     table_states: HashMap<TableID, RecoveryTableState>,
+    /// Tables loaded from table-file metadata while catalog index DDL redo is pending.
+    pending_index_ddl_reconciliations: HashSet<TableID>,
     /// Hot row pages touched by redo replay, grouped by table for post-replay
     /// index rebuild and undo-map refresh.
     recovered_tables: HashMap<TableID, BTreeSet<PageID>>,
@@ -207,6 +210,8 @@ pub struct LogRecovery<'a> {
 
 #[derive(Clone, Copy, Debug)]
 struct RecoveryTableState {
+    /// Active table-root publication timestamp observed during recovery bootstrap.
+    root_trx_id: TrxID,
     /// Lower bound for replaying heap row-page redo for this table.
     heap_redo_start_ts: TrxID,
     /// Lower bound for replaying persisted cold-delete metadata for this table.
@@ -218,6 +223,39 @@ impl RecoveryTableState {
     fn replay_start_ts(self) -> TrxID {
         self.heap_redo_start_ts.min(self.deletion_cutoff_ts)
     }
+}
+
+#[inline]
+fn validate_create_table_reloaded_root_cts(
+    table_id: TableID,
+    create_table_cts: TrxID,
+    state: RecoveryTableState,
+    pending_index_ddl_reconciliation: bool,
+) -> Result<()> {
+    // Create-table redo reopens the latest table root, not a historical root
+    // pinned to the create-table CTS. The root is allowed to be newer, but it
+    // must at least include the create-table publication itself.
+    if state.root_trx_id < create_table_cts {
+        return Err(Report::new(DataIntegrityError::InvalidRootInvariant)
+            .attach(format!(
+                "recovered create-table root predates create-table redo: table_id={table_id}, root_trx_id={}, create_table_cts={create_table_cts}",
+                state.root_trx_id
+            ))
+            .into());
+    }
+    // A metadata mismatch accepted by reload means the file root is ahead of
+    // the catalog rows via later index DDL. If the root CTS is exactly the
+    // create-table CTS, there is no later root publication to justify that
+    // temporary divergence.
+    if pending_index_ddl_reconciliation && state.root_trx_id <= create_table_cts {
+        return Err(Report::new(DataIntegrityError::InvalidRootInvariant)
+            .attach(format!(
+                "create-table pending index-DDL reconciliation requires later table root: table_id={table_id}, root_trx_id={}, create_table_cts={create_table_cts}",
+                state.root_trx_id
+            ))
+            .into());
+    }
+    Ok(())
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -254,6 +292,7 @@ impl<'a> LogRecovery<'a> {
             replay_floor: MIN_SNAPSHOT_TS,
             max_recovered_cts: MIN_SNAPSHOT_TS,
             table_states: HashMap::new(),
+            pending_index_ddl_reconciliations: HashSet::new(),
             recovered_tables: HashMap::new(),
             skipped_checkpoint_covered_unknown_table_redo: 0,
             dropped_table_file_deletes: Vec::new(),
@@ -275,7 +314,9 @@ impl<'a> LogRecovery<'a> {
         while let Some(log) = self.log_merger.try_next()? {
             self.replay_log(log).await?;
         }
-        // 2. Rebuild all indexes and refresh pages to enable undo map.
+        // 2. Ensure catalog metadata caught up with table-file roots.
+        self.validate_loaded_table_metadata().await?;
+        // 3. Rebuild all indexes and refresh pages to enable undo map.
         self.recover_indexes_and_refresh_pages().await?;
 
         Ok((
@@ -311,23 +352,30 @@ impl<'a> LogRecovery<'a> {
             if !is_user_obj_id(table.table_id) {
                 continue;
             }
-            self.catalog
+            // Checkpoint bootstrap can see table-file metadata that already includes
+            // index-DDL roots whose catalog rows are replayed later. Such a
+            // narrow mismatch is temporary and must reconcile by final validation.
+            let metadata_matched = self
+                .catalog
                 .reload_create_table(
                     self.mem_pool.clone(),
                     self.index_pool.clone(),
                     &self.table_fs,
                     self.disk_pool.clone(),
-                    &self.pool_guards,
                     table.table_id,
                 )
                 .await?;
-            self.track_loaded_table(table.table_id).await?;
-            let state = self.table_states.get(&table.table_id).ok_or_else(|| {
-                Error::from(Report::new(OperationError::TableNotFound).attach(format!(
-                    "bootstrap checkpointed table state: table_id={}",
-                    table.table_id
-                )))
-            })?;
+            let state = self.track_loaded_table(table.table_id).await?;
+            let pending_index_ddl_reconciliation = !metadata_matched;
+            if pending_index_ddl_reconciliation {
+                // The catalog checkpoint cursor has already skipped older catalog
+                // redo. A pending mismatch is recoverable only when the file root
+                // is at or beyond that cursor, so later replay can still supply
+                // the catalog index-DDL rows needed to match the root metadata.
+                self.validate_checkpoint_pending_reconciliation_cts(table.table_id, state)?;
+                self.pending_index_ddl_reconciliations
+                    .insert(table.table_id);
+            }
             self.replay_floor = self.replay_floor.min(state.replay_start_ts());
         }
         Ok(())
@@ -372,7 +420,7 @@ impl<'a> LogRecovery<'a> {
         self.skipped_checkpoint_covered_unknown_table_redo
     }
 
-    async fn track_loaded_table(&mut self, table_id: TableID) -> Result<()> {
+    async fn track_loaded_table(&mut self, table_id: TableID) -> Result<RecoveryTableState> {
         let table = self.catalog.get_table(table_id).await.ok_or_else(|| {
             Error::from(
                 Report::new(OperationError::TableNotFound)
@@ -383,17 +431,41 @@ impl<'a> LogRecovery<'a> {
         // the table root loaded during restart, before normal transactions run.
         let active_root = table.file().active_root_unchecked();
         let state = RecoveryTableState {
+            root_trx_id: active_root.trx_id,
             heap_redo_start_ts: active_root.heap_redo_start_ts,
             deletion_cutoff_ts: active_root.deletion_cutoff_ts,
         };
         self.max_recovered_cts = self
             .max_recovered_cts
+            .max(state.root_trx_id)
             .max(state.heap_redo_start_ts)
             .max(state.deletion_cutoff_ts);
         let old = self.table_states.insert(table_id, state);
         if old.is_some() {
             return Err(Report::new(OperationError::TableAlreadyExists)
                 .attach(format!("track loaded table state: table_id={table_id}"))
+                .into());
+        }
+        Ok(state)
+    }
+
+    #[inline]
+    fn validate_checkpoint_pending_reconciliation_cts(
+        &self,
+        table_id: TableID,
+        state: RecoveryTableState,
+    ) -> Result<()> {
+        // No upper bound is checked here: a table root may legitimately be newer
+        // than the catalog checkpoint. The invalid state is the opposite case,
+        // where a pre-cursor root would require catalog redo that checkpoint
+        // bootstrap has already declared unnecessary.
+        if state.root_trx_id < self.catalog_replay_start_ts {
+            return Err(Report::new(DataIntegrityError::InvalidRootInvariant)
+                .attach(format!(
+                    "checkpointed table pending index-DDL reconciliation has root before catalog replay boundary: table_id={table_id}, root_trx_id={}, catalog_replay_start_ts={}",
+                    state.root_trx_id,
+                    self.catalog_replay_start_ts
+                ))
                 .into());
         }
         Ok(())
@@ -473,6 +545,48 @@ impl<'a> LogRecovery<'a> {
         Ok(())
     }
 
+    async fn validate_loaded_table_metadata(&mut self) -> Result<()> {
+        let table_ids = self.table_states.keys().copied().collect::<Vec<_>>();
+        for table_id in table_ids {
+            let table = self.catalog.get_table(table_id).await.ok_or_else(|| {
+                Error::from(Report::new(OperationError::TableNotFound).attach(format!(
+                    "validate recovered user table metadata: table_id={table_id}"
+                )))
+            })?;
+            let active_root = table.file().active_root_unchecked();
+            let (_, catalog_metadata) = self
+                .catalog
+                .user_table_metadata_from_catalog(&self.pool_guards, table_id)
+                .await?;
+            if catalog_metadata != *active_root.metadata {
+                let pending = self.pending_index_ddl_reconciliations.contains(&table_id);
+                return Err(Report::new(DataIntegrityError::InvalidRootInvariant)
+                    .attach(format!(
+                        "recovered user table metadata mismatch after redo replay: table_id={table_id}, root_trx_id={}, catalog_replay_start_ts={}, pending_index_ddl_reconciliation={pending}, catalog_next_index_no={}, root_next_index_no={}",
+                        active_root.trx_id,
+                        self.catalog_replay_start_ts,
+                        catalog_metadata.next_index_no(),
+                        active_root.metadata.next_index_no()
+                    ))
+                    .into());
+            }
+            self.pending_index_ddl_reconciliations.remove(&table_id);
+        }
+        if let Some(table_id) = self
+            .pending_index_ddl_reconciliations
+            .iter()
+            .next()
+            .copied()
+        {
+            return Err(Report::new(DataIntegrityError::InvalidRootInvariant)
+                .attach(format!(
+                    "pending index-DDL reconciliation left after recovered metadata validation: table_id={table_id}"
+                ))
+                .into());
+        }
+        Ok(())
+    }
+
     async fn refresh_page(&self, metadata: Arc<TableMetadata>, page_id: PageID) -> Result<()> {
         let mut page_guard = self
             .mem_pool
@@ -513,17 +627,33 @@ impl<'a> LogRecovery<'a> {
                     return Ok(());
                 }
                 self.replay_catalog_modifications(dml).await?;
-                self.catalog
+                // The table file stores only the latest active root, so create-table
+                // redo may load metadata from later durable index DDL. Recovery
+                // tracks that temporary gap until index-DDL redo reconciles catalog rows.
+                let metadata_matched = self
+                    .catalog
                     .reload_create_table(
                         self.mem_pool.clone(),
                         self.index_pool.clone(),
                         &self.table_fs,
                         self.disk_pool.clone(),
-                        &self.pool_guards,
                         *table_id,
                     )
                     .await?;
-                self.track_loaded_table(*table_id).await?;
+                let state = self.track_loaded_table(*table_id).await?;
+                let pending_index_ddl_reconciliation = !metadata_matched;
+                // Validate the root/create CTS relation before marking the table
+                // as pending, so impossible metadata divergence fails at the
+                // source instead of surfacing only in final equality validation.
+                validate_create_table_reloaded_root_cts(
+                    *table_id,
+                    cts,
+                    state,
+                    pending_index_ddl_reconciliation,
+                )?;
+                if pending_index_ddl_reconciliation {
+                    self.pending_index_ddl_reconciliations.insert(*table_id);
+                }
             }
             DDLRedo::DropTable(table_id) => {
                 if !self.should_replay_catalog(cts) {
@@ -547,6 +677,53 @@ impl<'a> LogRecovery<'a> {
                     .push(DroppedTableFileDeleteItem::new(*table_id, cts));
                 self.table_states.remove(table_id);
                 self.recovered_tables.remove(table_id);
+                self.pending_index_ddl_reconciliations.remove(table_id);
+            }
+            DDLRedo::CreateIndex { table_id, index_no } => {
+                if !self.should_replay_catalog(cts) {
+                    return Ok(());
+                }
+                if self.classify_user_table_redo(*table_id, cts, "replay create index")?
+                    == UserTableRedoAction::SkipCheckpointCoveredUnknownTable
+                {
+                    self.record_skipped_checkpoint_covered_unknown_table_redo(1);
+                    return Ok(());
+                }
+                let proof =
+                    self.classify_index_ddl_root(IndexDdlKind::Create, *table_id, *index_no, cts)?;
+                match proof {
+                    IndexDdlRootProof::DurableFinalCreate
+                    | IndexDdlRootProof::DurableAllocationOnly => {
+                        self.replay_catalog_modifications(dml).await?;
+                    }
+                    IndexDdlRootProof::Provisional => {}
+                    IndexDdlRootProof::DurableFinalDrop => unreachable!(
+                        "create-index root proof cannot classify as durable final drop"
+                    ),
+                }
+            }
+            DDLRedo::DropIndex { table_id, index_no } => {
+                if !self.should_replay_catalog(cts) {
+                    return Ok(());
+                }
+                if self.classify_user_table_redo(*table_id, cts, "replay drop index")?
+                    == UserTableRedoAction::SkipCheckpointCoveredUnknownTable
+                {
+                    self.record_skipped_checkpoint_covered_unknown_table_redo(1);
+                    return Ok(());
+                }
+                let proof =
+                    self.classify_index_ddl_root(IndexDdlKind::Drop, *table_id, *index_no, cts)?;
+                match proof {
+                    IndexDdlRootProof::DurableFinalDrop => {
+                        self.replay_catalog_modifications(dml).await?;
+                    }
+                    IndexDdlRootProof::Provisional => {}
+                    IndexDdlRootProof::DurableFinalCreate
+                    | IndexDdlRootProof::DurableAllocationOnly => {
+                        unreachable!("drop-index root proof cannot classify as create proof")
+                    }
+                }
             }
             DDLRedo::CreateRowPage {
                 table_id,
@@ -613,9 +790,22 @@ impl<'a> LogRecovery<'a> {
                     )
                 })?;
             }
-            _ => todo!(),
         }
         Ok(())
+    }
+
+    fn classify_index_ddl_root(
+        &self,
+        kind: IndexDdlKind,
+        table_id: TableID,
+        index_no: u16,
+        cts: TrxID,
+    ) -> Result<IndexDdlRootProof> {
+        let table = self.catalog.get_table_now(table_id);
+        let active_root = table
+            .as_ref()
+            .map(|table| table.file().active_root_unchecked());
+        classify_index_ddl_root(kind, table_id, index_no, cts, active_root)
     }
 
     async fn dispatch_dml(&mut self, dml: BTreeMap<TableID, TableDML>, cts: TrxID) -> Result<()> {
@@ -784,16 +974,20 @@ impl<'a> LogRecovery<'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::{LogRecovery, RecoverMap, RecoveryTableState};
+    use super::{
+        LogRecovery, RecoverMap, RecoveryTableState, validate_create_table_reloaded_root_cts,
+    };
     use crate::buffer::{PageID, PoolRole};
     use crate::catalog::{
-        ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexOrder, IndexSpec,
-        TableMetadata, TableSpec, USER_OBJ_ID_START,
+        ActiveIndexSpec, ColumnAttributes, ColumnSpec, IndexAttributes, IndexColumnObject,
+        IndexKey, IndexObject, IndexOrder, IndexSpec, TableID, TableMetadata, TableObject,
+        TableSpec, USER_OBJ_ID_START,
     };
     use crate::conf::{EngineConfig, EvictableBufferPoolConfig, FileSystemConfig, TrxSysConfig};
     use crate::error::{CompletionErrorKind, DataIntegrityError, Error, OperationError};
     use crate::file::block_integrity::{BLOCK_INTEGRITY_HEADER_SIZE, write_block_checksum};
-    use crate::file::cow_file::COW_FILE_PAGE_SIZE;
+    use crate::file::cow_file::{COW_FILE_PAGE_SIZE, SUPER_BLOCK_ID};
+    use crate::file::table_file::MutableTableFile;
     use crate::index::{
         COLUMN_DELETION_BLOB_PAGE_HEADER_SIZE, ColumnBlockIndex, UniqueIndex,
         load_entry_deletion_deltas,
@@ -809,6 +1003,7 @@ mod tests {
     use crate::value::ValKind;
     use std::fs::OpenOptions;
     use std::io::{Read, Seek, SeekFrom, Write};
+    use std::sync::Arc;
     use tempfile::TempDir;
 
     const LIGHTWEIGHT_RECOVERY_BUFFER_BYTES: usize = 16 * 1024 * 1024;
@@ -1013,6 +1208,234 @@ mod tests {
             .await
     }
 
+    fn index_ddl_columns() -> Vec<ColumnSpec> {
+        vec![
+            ColumnSpec::new("id", ValKind::I32, ColumnAttributes::empty()),
+            ColumnSpec::new("value", ValKind::I32, ColumnAttributes::empty()),
+        ]
+    }
+
+    fn primary_index_spec() -> IndexSpec {
+        IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::PK)
+    }
+
+    fn added_index_spec() -> IndexSpec {
+        IndexSpec::new(vec![IndexKey::new(1)], IndexAttributes::empty())
+    }
+
+    fn created_index_metadata() -> Arc<TableMetadata> {
+        Arc::new(
+            TableMetadata::try_new_with_next_index_no(
+                index_ddl_columns(),
+                vec![
+                    ActiveIndexSpec::new(0, primary_index_spec()),
+                    ActiveIndexSpec::new(1, added_index_spec()),
+                ],
+                2,
+            )
+            .unwrap(),
+        )
+    }
+
+    fn dropped_index_metadata() -> Arc<TableMetadata> {
+        Arc::new(
+            TableMetadata::try_new_with_next_index_no(
+                index_ddl_columns(),
+                vec![ActiveIndexSpec::new(0, primary_index_spec())],
+                2,
+            )
+            .unwrap(),
+        )
+    }
+
+    async fn create_index_ddl_base_table(
+        engine: &crate::engine::Engine,
+        indexes: Vec<IndexSpec>,
+    ) -> TableID {
+        let mut session = engine.try_new_session().unwrap();
+        let table_id = session
+            .create_table(TableSpec::new(index_ddl_columns()), indexes)
+            .await
+            .unwrap();
+        drop(session);
+        table_id
+    }
+
+    async fn commit_create_index_catalog_ddl(
+        engine: &crate::engine::Engine,
+        table_id: TableID,
+    ) -> TrxID {
+        let mut session = engine.try_new_session().unwrap();
+        let mut trx = session.try_begin_trx().unwrap().unwrap();
+        trx.exec(async |stmt| {
+            assert!(
+                engine
+                    .catalog()
+                    .storage
+                    .tables()
+                    .delete_by_id(stmt, table_id)
+                    .await
+            );
+            assert!(
+                engine
+                    .catalog()
+                    .storage
+                    .tables()
+                    .insert(
+                        stmt,
+                        &TableObject {
+                            table_id,
+                            next_index_no: 2,
+                        },
+                    )
+                    .await
+            );
+            assert!(
+                engine
+                    .catalog()
+                    .storage
+                    .indexes()
+                    .insert(
+                        stmt,
+                        &IndexObject {
+                            table_id,
+                            index_no: 1,
+                            index_attributes: IndexAttributes::empty(),
+                        },
+                    )
+                    .await
+            );
+            assert!(
+                engine
+                    .catalog()
+                    .storage
+                    .index_columns()
+                    .insert(
+                        stmt,
+                        &IndexColumnObject {
+                            table_id,
+                            index_no: 1,
+                            index_column_no: 0,
+                            column_no: 1,
+                            index_order: IndexOrder::Asc,
+                        },
+                    )
+                    .await
+            );
+            let old = stmt.effects_mut().set_ddl_redo(DDLRedo::CreateIndex {
+                table_id,
+                index_no: 1,
+            });
+            debug_assert!(old.is_none());
+            Ok(())
+        })
+        .await
+        .unwrap();
+        let cts = trx.commit().await.unwrap();
+        drop(session);
+        cts
+    }
+
+    async fn commit_drop_index_catalog_ddl(
+        engine: &crate::engine::Engine,
+        table_id: TableID,
+    ) -> TrxID {
+        let mut session = engine.try_new_session().unwrap();
+        let mut trx = session.try_begin_trx().unwrap().unwrap();
+        trx.exec(async |stmt| {
+            assert_eq!(
+                engine
+                    .catalog()
+                    .storage
+                    .index_columns()
+                    .delete_by_index(stmt, table_id, 1)
+                    .await,
+                1
+            );
+            assert!(
+                engine
+                    .catalog()
+                    .storage
+                    .indexes()
+                    .delete_by_id(stmt, table_id, 1)
+                    .await
+            );
+            let old = stmt.effects_mut().set_ddl_redo(DDLRedo::DropIndex {
+                table_id,
+                index_no: 1,
+            });
+            debug_assert!(old.is_none());
+            Ok(())
+        })
+        .await
+        .unwrap();
+        let cts = trx.commit().await.unwrap();
+        drop(session);
+        cts
+    }
+
+    async fn publish_index_metadata_root(
+        engine: &crate::engine::Engine,
+        table_id: TableID,
+        metadata: Arc<TableMetadata>,
+        cts: TrxID,
+    ) {
+        let table = engine.catalog().get_table(table_id).await.unwrap();
+        let table_file = Arc::clone(table.file());
+        let mut roots = table_file
+            .active_root_unchecked()
+            .secondary_index_roots
+            .clone();
+        roots.resize(metadata.index_slot_count(), SUPER_BLOCK_ID);
+        for (index_no, root) in roots.iter_mut().enumerate() {
+            if metadata.index_spec(index_no).is_none() {
+                *root = SUPER_BLOCK_ID;
+            }
+        }
+        let mut mutable = MutableTableFile::fork(&table_file, engine.table_fs.background_writes());
+        mutable
+            .replace_metadata_and_secondary_index_roots(metadata, roots)
+            .unwrap();
+        let (_table_file, old_root) = mutable.commit(cts, false).await.unwrap();
+        drop(old_root);
+        drop(table);
+    }
+
+    async fn assert_recovered_index_state(
+        engine: &crate::engine::Engine,
+        table_id: TableID,
+        next_index_no: u16,
+        index_one_active: bool,
+    ) {
+        let table = engine.catalog().get_table(table_id).await.unwrap();
+        let metadata = table.metadata();
+        assert_eq!(metadata.next_index_no(), next_index_no);
+        assert_eq!(metadata.index_spec(1).is_some(), index_one_active);
+
+        let session = engine.try_new_session().unwrap();
+        let table_obj = engine
+            .catalog()
+            .storage
+            .tables()
+            .find_uncommitted_by_id(session.pool_guards(), table_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(table_obj.next_index_no, next_index_no);
+        let indexes = engine
+            .catalog()
+            .storage
+            .indexes()
+            .list_uncommitted_by_table_id(session.pool_guards(), table_id)
+            .await;
+        assert_eq!(
+            indexes.iter().any(|index| index.index_no == 1),
+            index_one_active
+        );
+        drop(session);
+        drop(table);
+    }
+
     #[test]
     fn test_recover_map_tracks_create_cts_and_entries() {
         let mut map = RecoverMap::new(7);
@@ -1033,16 +1456,72 @@ mod tests {
     #[test]
     fn test_recovery_table_state_replay_start_uses_heap_and_deletion_floor() {
         let heap_first = RecoveryTableState {
+            root_trx_id: 5,
             heap_redo_start_ts: 7,
             deletion_cutoff_ts: 11,
         };
         assert_eq!(heap_first.replay_start_ts(), 7);
 
         let deletion_first = RecoveryTableState {
+            root_trx_id: 17,
             heap_redo_start_ts: 19,
             deletion_cutoff_ts: 13,
         };
         assert_eq!(deletion_first.replay_start_ts(), 13);
+    }
+
+    #[test]
+    fn test_create_table_root_cts_validation_rejects_impossible_states() {
+        let root_before_create = RecoveryTableState {
+            root_trx_id: 9,
+            heap_redo_start_ts: 9,
+            deletion_cutoff_ts: 9,
+        };
+        let err = validate_create_table_reloaded_root_cts(
+            USER_OBJ_ID_START,
+            10,
+            root_before_create,
+            false,
+        )
+        .unwrap_err();
+        assert_eq!(
+            err.data_integrity_error(),
+            Some(DataIntegrityError::InvalidRootInvariant)
+        );
+        let report = format!("{err:?}");
+        assert!(report.contains("predates create-table redo"), "{report}");
+
+        let pending_without_later_root = RecoveryTableState {
+            root_trx_id: 10,
+            heap_redo_start_ts: 10,
+            deletion_cutoff_ts: 10,
+        };
+        let err = validate_create_table_reloaded_root_cts(
+            USER_OBJ_ID_START,
+            10,
+            pending_without_later_root,
+            true,
+        )
+        .unwrap_err();
+        assert_eq!(
+            err.data_integrity_error(),
+            Some(DataIntegrityError::InvalidRootInvariant)
+        );
+        let report = format!("{err:?}");
+        assert!(report.contains("requires later table root"), "{report}");
+
+        let pending_with_later_root = RecoveryTableState {
+            root_trx_id: 11,
+            heap_redo_start_ts: 10,
+            deletion_cutoff_ts: 10,
+        };
+        validate_create_table_reloaded_root_cts(
+            USER_OBJ_ID_START,
+            10,
+            pending_with_later_root,
+            true,
+        )
+        .unwrap();
     }
 
     #[test]
@@ -1126,6 +1605,286 @@ mod tests {
             drop(ddl_recovery);
             drop(dml_recovery);
             drop(engine);
+        });
+    }
+
+    #[test]
+    fn test_recovery_skips_provisional_create_index_redo() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let main_dir = temp_dir.path().to_path_buf();
+            let engine = lightweight_recovery_engine_config(
+                main_dir.clone(),
+                "recover-provisional-create-index",
+            )
+            .build()
+            .await
+            .unwrap();
+            let table_id = create_index_ddl_base_table(&engine, vec![primary_index_spec()]).await;
+            engine
+                .catalog()
+                .checkpoint_now(&engine.trx_sys)
+                .await
+                .unwrap();
+
+            let _cts = commit_create_index_catalog_ddl(&engine, table_id).await;
+            drop(engine);
+
+            let recovered =
+                lightweight_recovery_engine_config(main_dir, "recover-provisional-create-index")
+                    .build()
+                    .await
+                    .unwrap();
+            assert_recovered_index_state(&recovered, table_id, 1, false).await;
+            drop(recovered);
+        });
+    }
+
+    #[test]
+    fn test_recovery_replays_root_proven_create_index_redo() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let main_dir = temp_dir.path().to_path_buf();
+            let engine =
+                lightweight_recovery_engine_config(main_dir.clone(), "recover-create-index")
+                    .build()
+                    .await
+                    .unwrap();
+            let table_id = create_index_ddl_base_table(&engine, vec![primary_index_spec()]).await;
+            engine
+                .catalog()
+                .checkpoint_now(&engine.trx_sys)
+                .await
+                .unwrap();
+
+            let cts = commit_create_index_catalog_ddl(&engine, table_id).await;
+            publish_index_metadata_root(&engine, table_id, created_index_metadata(), cts).await;
+            drop(engine);
+
+            let recovered = lightweight_recovery_engine_config(main_dir, "recover-create-index")
+                .build()
+                .await
+                .unwrap();
+            assert_recovered_index_state(&recovered, table_id, 2, true).await;
+            drop(recovered);
+        });
+    }
+
+    #[test]
+    fn test_recovery_replays_root_proven_drop_index_redo() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let main_dir = temp_dir.path().to_path_buf();
+            let engine = lightweight_recovery_engine_config(main_dir.clone(), "recover-drop-index")
+                .build()
+                .await
+                .unwrap();
+            let table_id = create_index_ddl_base_table(
+                &engine,
+                vec![primary_index_spec(), added_index_spec()],
+            )
+            .await;
+            engine
+                .catalog()
+                .checkpoint_now(&engine.trx_sys)
+                .await
+                .unwrap();
+
+            let cts = commit_drop_index_catalog_ddl(&engine, table_id).await;
+            publish_index_metadata_root(&engine, table_id, dropped_index_metadata(), cts).await;
+            drop(engine);
+
+            let recovered = lightweight_recovery_engine_config(main_dir, "recover-drop-index")
+                .build()
+                .await
+                .unwrap();
+            assert_recovered_index_state(&recovered, table_id, 2, false).await;
+            drop(recovered);
+        });
+    }
+
+    #[test]
+    fn test_recovery_replays_create_then_drop_index_allocation_history() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let main_dir = temp_dir.path().to_path_buf();
+            let engine =
+                lightweight_recovery_engine_config(main_dir.clone(), "recover-create-drop-index")
+                    .build()
+                    .await
+                    .unwrap();
+            let table_id = create_index_ddl_base_table(&engine, vec![primary_index_spec()]).await;
+            engine
+                .catalog()
+                .checkpoint_now(&engine.trx_sys)
+                .await
+                .unwrap();
+
+            let create_cts = commit_create_index_catalog_ddl(&engine, table_id).await;
+            publish_index_metadata_root(&engine, table_id, created_index_metadata(), create_cts)
+                .await;
+            let drop_cts = commit_drop_index_catalog_ddl(&engine, table_id).await;
+            publish_index_metadata_root(&engine, table_id, dropped_index_metadata(), drop_cts)
+                .await;
+            drop(engine);
+
+            let recovered =
+                lightweight_recovery_engine_config(main_dir, "recover-create-drop-index")
+                    .build()
+                    .await
+                    .unwrap();
+            assert_recovered_index_state(&recovered, table_id, 2, false).await;
+            drop(recovered);
+        });
+    }
+
+    #[test]
+    fn test_recovery_replays_new_table_with_later_create_index_root() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let main_dir = temp_dir.path().to_path_buf();
+            let engine = lightweight_recovery_engine_config(
+                main_dir.clone(),
+                "recover-new-table-create-index",
+            )
+            .build()
+            .await
+            .unwrap();
+            engine
+                .catalog()
+                .checkpoint_now(&engine.trx_sys)
+                .await
+                .unwrap();
+
+            let table_id = create_index_ddl_base_table(&engine, vec![primary_index_spec()]).await;
+            let index_cts = commit_create_index_catalog_ddl(&engine, table_id).await;
+            publish_index_metadata_root(&engine, table_id, created_index_metadata(), index_cts)
+                .await;
+            drop(engine);
+
+            let recovered =
+                lightweight_recovery_engine_config(main_dir, "recover-new-table-create-index")
+                    .build()
+                    .await
+                    .unwrap();
+            assert_recovered_index_state(&recovered, table_id, 2, true).await;
+            drop(recovered);
+        });
+    }
+
+    #[test]
+    fn test_recovery_replays_new_table_with_later_create_drop_index_roots() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let main_dir = temp_dir.path().to_path_buf();
+            let engine = lightweight_recovery_engine_config(
+                main_dir.clone(),
+                "recover-new-table-create-drop-index",
+            )
+            .build()
+            .await
+            .unwrap();
+            engine
+                .catalog()
+                .checkpoint_now(&engine.trx_sys)
+                .await
+                .unwrap();
+
+            let table_id = create_index_ddl_base_table(&engine, vec![primary_index_spec()]).await;
+            let create_cts = commit_create_index_catalog_ddl(&engine, table_id).await;
+            publish_index_metadata_root(&engine, table_id, created_index_metadata(), create_cts)
+                .await;
+            let drop_cts = commit_drop_index_catalog_ddl(&engine, table_id).await;
+            publish_index_metadata_root(&engine, table_id, dropped_index_metadata(), drop_cts)
+                .await;
+            drop(engine);
+
+            let recovered =
+                lightweight_recovery_engine_config(main_dir, "recover-new-table-create-drop-index")
+                    .build()
+                    .await
+                    .unwrap();
+            assert_recovered_index_state(&recovered, table_id, 2, false).await;
+            drop(recovered);
+        });
+    }
+
+    #[test]
+    fn test_catalog_checkpoint_skips_unproved_index_ddl_catalog_dml() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let main_dir = temp_dir.path().to_path_buf();
+            let engine = lightweight_recovery_engine_config(
+                main_dir.clone(),
+                "checkpoint-skip-provisional-index",
+            )
+            .build()
+            .await
+            .unwrap();
+            let table_id = create_index_ddl_base_table(&engine, vec![primary_index_spec()]).await;
+            engine
+                .catalog()
+                .checkpoint_now(&engine.trx_sys)
+                .await
+                .unwrap();
+
+            let ddl_cts = commit_create_index_catalog_ddl(&engine, table_id).await;
+            engine
+                .catalog()
+                .checkpoint_now(&engine.trx_sys)
+                .await
+                .unwrap();
+            let snapshot = engine.catalog().storage.checkpoint_snapshot().unwrap();
+            assert!(snapshot.catalog_replay_start_ts > ddl_cts);
+            drop(engine);
+
+            let recovered =
+                lightweight_recovery_engine_config(main_dir, "checkpoint-skip-provisional-index")
+                    .build()
+                    .await
+                    .unwrap();
+            assert_recovered_index_state(&recovered, table_id, 1, false).await;
+            drop(recovered);
+        });
+    }
+
+    #[test]
+    fn test_catalog_checkpoint_includes_root_proven_index_ddl_catalog_dml() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let main_dir = temp_dir.path().to_path_buf();
+            let engine = lightweight_recovery_engine_config(
+                main_dir.clone(),
+                "checkpoint-include-durable-index",
+            )
+            .build()
+            .await
+            .unwrap();
+            let table_id = create_index_ddl_base_table(&engine, vec![primary_index_spec()]).await;
+            engine
+                .catalog()
+                .checkpoint_now(&engine.trx_sys)
+                .await
+                .unwrap();
+
+            let ddl_cts = commit_create_index_catalog_ddl(&engine, table_id).await;
+            publish_index_metadata_root(&engine, table_id, created_index_metadata(), ddl_cts).await;
+            engine
+                .catalog()
+                .checkpoint_now(&engine.trx_sys)
+                .await
+                .unwrap();
+            let snapshot = engine.catalog().storage.checkpoint_snapshot().unwrap();
+            assert!(snapshot.catalog_replay_start_ts > ddl_cts);
+            drop(engine);
+
+            let recovered =
+                lightweight_recovery_engine_config(main_dir, "checkpoint-include-durable-index")
+                    .build()
+                    .await
+                    .unwrap();
+            assert_recovered_index_state(&recovered, table_id, 2, true).await;
+            drop(recovered);
         });
     }
 

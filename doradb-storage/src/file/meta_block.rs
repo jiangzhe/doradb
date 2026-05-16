@@ -18,7 +18,7 @@ use std::num::NonZeroU64;
 pub(crate) const TABLE_META_BLOCK_MAGIC_WORD: [u8; 8] =
     [b'T', b'B', b'L', b'M', b'E', b'T', b'A', 0];
 /// Table meta-block envelope version.
-pub(crate) const TABLE_META_BLOCK_VERSION: u64 = 4;
+pub(crate) const TABLE_META_BLOCK_VERSION: u64 = 5;
 
 #[inline]
 fn invalid_payload(message: impl Into<String>) -> Error {

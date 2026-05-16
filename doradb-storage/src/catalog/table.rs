@@ -118,7 +118,7 @@ impl Index<usize> for IndexSpecs {
     }
 }
 
-/// Table metadata including column names, column types,
+/// Table metadata including column names, column types, column attributes, and
 /// index specifications.
 /// Constraints and other advanced configurations are
 /// not implemented.
@@ -126,6 +126,7 @@ impl Index<usize> for IndexSpecs {
 pub struct TableMetadata {
     pub(crate) col_names: Vec<SemiStr>,
     pub(crate) col_types: Vec<ValType>,
+    pub(crate) col_attrs: Vec<ColumnAttributes>,
     // fix length is the total inline length of all columns.
     pub fix_len: usize,
     // index of var-length columns.
@@ -176,6 +177,7 @@ impl TableMetadata {
             return Err(invalid_table_metadata("table metadata requires columns"));
         }
         let col_names: Vec<_> = column_specs.iter().map(|c| c.column_name.clone()).collect();
+        let col_attrs: Vec<_> = column_specs.iter().map(|c| c.column_attributes).collect();
         let col_types: Vec<_> = column_specs
             .iter()
             .map(|c| {
@@ -186,16 +188,37 @@ impl TableMetadata {
                 }
             })
             .collect();
-        TableMetadata::try_create(col_names, col_types, index_specs, next_index_no)
+        TableMetadata::try_create(col_names, col_types, col_attrs, index_specs, next_index_no)
     }
 
     #[inline]
     fn try_create(
         col_names: Vec<SemiStr>,
         col_types: Vec<ValType>,
+        col_attrs: Vec<ColumnAttributes>,
         index_specs: Vec<ActiveIndexSpec>,
         next_index_no: IndexNo,
     ) -> Result<Self> {
+        if col_names.len() != col_types.len() || col_names.len() != col_attrs.len() {
+            return Err(invalid_table_metadata(format!(
+                "column metadata length mismatch: names={}, types={}, attrs={}",
+                col_names.len(),
+                col_types.len(),
+                col_attrs.len()
+            )));
+        }
+        for (idx, ((col_name, col_type), col_attr)) in
+            col_names.iter().zip(&col_types).zip(&col_attrs).enumerate()
+        {
+            let type_nullable = col_type.nullable;
+            let attr_nullable = col_attr.contains(ColumnAttributes::NULLABLE);
+            if type_nullable != attr_nullable {
+                return Err(invalid_table_metadata(format!(
+                    "column nullability metadata mismatch: column_index={idx}, column_name={}, type_nullable={type_nullable}, attr_nullable={attr_nullable}",
+                    col_name.as_str()
+                )));
+            }
+        }
         let mut fix_len = 0;
         let mut var_cols = vec![];
         for (idx, ty) in col_types.iter().enumerate() {
@@ -221,6 +244,7 @@ impl TableMetadata {
         Ok(TableMetadata {
             col_names,
             col_types,
+            col_attrs,
             fix_len,
             var_cols,
             nullable_cols,
@@ -388,6 +412,7 @@ impl TableMetadata {
         TableBriefMetadataSerView {
             col_names: &self.col_names,
             col_types: &self.col_types,
+            col_attrs: &self.col_attrs,
             next_index_no: self.next_index_no,
             index_specs: &self.index_specs,
         }
@@ -402,6 +427,7 @@ impl TryFrom<TableBriefMetadata> for TableMetadata {
         TableMetadata::try_create(
             value.col_names,
             value.col_types,
+            value.col_attrs,
             value.index_specs,
             value.next_index_no,
         )
@@ -414,6 +440,7 @@ impl TryFrom<TableBriefMetadata> for TableMetadata {
 pub struct TableBriefMetadataSerView<'a> {
     pub col_names: &'a [SemiStr],
     pub col_types: &'a [ValType],
+    pub col_attrs: &'a [ColumnAttributes],
     pub next_index_no: IndexNo,
     pub index_specs: &'a IndexSpecs,
 }
@@ -423,6 +450,7 @@ impl<'a> Ser<'a> for TableBriefMetadataSerView<'a> {
     fn ser_len(&self) -> usize {
         self.col_names.ser_len()
             + self.col_types.ser_len()
+            + self.col_attrs.ser_len()
             + mem::size_of::<IndexNo>()
             + mem::size_of::<u64>()
             + self
@@ -436,6 +464,7 @@ impl<'a> Ser<'a> for TableBriefMetadataSerView<'a> {
     fn ser<S: Serde + ?Sized>(&self, out: &mut S, start_idx: usize) -> usize {
         let idx = self.col_names.ser(out, start_idx);
         let idx = self.col_types.ser(out, idx);
+        let idx = self.col_attrs.ser(out, idx);
         let mut idx = out.ser_u16(idx, self.next_index_no);
         idx = out.ser_u64(idx, self.index_specs.active_count() as u64);
         for (index_no, index_spec) in self.index_specs.active_indexes() {
@@ -452,6 +481,7 @@ impl<'a> Ser<'a> for TableBriefMetadataSerView<'a> {
 pub struct TableBriefMetadata {
     pub col_names: Vec<SemiStr>,
     pub col_types: Vec<ValType>,
+    pub col_attrs: Vec<ColumnAttributes>,
     pub next_index_no: IndexNo,
     pub index_specs: Vec<ActiveIndexSpec>,
 }
@@ -460,6 +490,7 @@ impl Deser for TableBriefMetadata {
     fn deser<S: Serde + ?Sized>(input: &S, start_idx: usize) -> Result<(usize, Self)> {
         let (idx, col_names) = <Vec<SemiStr>>::deser(input, start_idx)?;
         let (idx, col_types) = <Vec<ValType>>::deser(input, idx)?;
+        let (idx, col_attrs) = <Vec<ColumnAttributes>>::deser(input, idx)?;
         let (idx, next_index_no) = input.deser_u16(idx)?;
         let (idx, index_specs) = <Vec<ActiveIndexSpec>>::deser(input, idx)?;
         Ok((
@@ -467,6 +498,7 @@ impl Deser for TableBriefMetadata {
             TableBriefMetadata {
                 col_names,
                 col_types,
+                col_attrs,
                 next_index_no,
                 index_specs,
             },
@@ -499,6 +531,7 @@ mod tests {
         assert_eq!(idx, vec.len());
         assert_eq!(metadata.col_names, brief.col_names);
         assert_eq!(metadata.col_types, brief.col_types);
+        assert_eq!(metadata.col_attrs, brief.col_attrs);
         assert_eq!(metadata.next_index_no(), brief.next_index_no);
         assert_eq!(
             metadata
@@ -524,6 +557,24 @@ mod tests {
         assert_eq!(metadata.next_index_no(), 2);
         assert_eq!(metadata.index_slot_count(), 2);
         assert_eq!(metadata.active_index_count(), 2);
+    }
+
+    #[test]
+    fn test_table_metadata_rejects_inconsistent_column_nullability() {
+        let brief = TableBriefMetadata {
+            col_names: vec![SemiStr::new("c0")],
+            col_types: vec![ValType::new(ValKind::U32, true)],
+            col_attrs: vec![ColumnAttributes::empty()],
+            next_index_no: 0,
+            index_specs: vec![],
+        };
+
+        let err = TableMetadata::try_from(brief).unwrap_err();
+        let report = format!("{err:?}");
+        assert!(report.contains("column_index=0"), "{report}");
+        assert!(report.contains("column_name=c0"), "{report}");
+        assert!(report.contains("type_nullable=true"), "{report}");
+        assert!(report.contains("attr_nullable=false"), "{report}");
     }
 
     #[test]
