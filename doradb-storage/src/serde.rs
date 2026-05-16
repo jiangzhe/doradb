@@ -1,4 +1,6 @@
-use crate::catalog::{ActiveIndexSpec, IndexAttributes, IndexKey, IndexOrder, IndexSpec};
+use crate::catalog::{
+    ActiveIndexSpec, ColumnAttributes, IndexAttributes, IndexKey, IndexOrder, IndexSpec,
+};
 use crate::compression::bitpacking::*;
 use crate::error::{DataIntegrityError, Result};
 use error_stack::Report;
@@ -729,6 +731,26 @@ impl Deser for IndexAttributes {
     fn deser<S: Serde + ?Sized>(input: &S, start_idx: usize) -> Result<(usize, Self)> {
         let (idx, v) = input.deser_u32(start_idx)?;
         Ok((idx, IndexAttributes::from_bits_truncate(v)))
+    }
+}
+
+impl Ser<'_> for ColumnAttributes {
+    #[inline]
+    fn ser_len(&self) -> usize {
+        mem::size_of::<u32>()
+    }
+
+    #[inline]
+    fn ser<S: Serde + ?Sized>(&self, out: &mut S, start_idx: usize) -> usize {
+        out.ser_u32(start_idx, self.bits())
+    }
+}
+
+impl Deser for ColumnAttributes {
+    #[inline]
+    fn deser<S: Serde + ?Sized>(input: &S, start_idx: usize) -> Result<(usize, Self)> {
+        let (idx, v) = input.deser_u32(start_idx)?;
+        Ok((idx, ColumnAttributes::from_bits_truncate(v)))
     }
 }
 

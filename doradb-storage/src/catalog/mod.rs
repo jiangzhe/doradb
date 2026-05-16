@@ -310,6 +310,21 @@ impl Catalog {
                 IndexSpec::new(index_cols, index.index_attributes),
             ));
         }
+        if !index_columns_by_index_no.is_empty() {
+            let index_numbers = index_columns_by_index_no
+                .keys()
+                .copied()
+                .collect::<Vec<_>>();
+            let count: usize = index_columns_by_index_no
+                .values()
+                .map(|index_columns| index_columns.len())
+                .sum();
+            return Err(Report::new(DataIntegrityError::InvalidRootInvariant)
+                .attach(format!(
+                    "orphaned catalog index-column rows without matching index rows: table_id={table_id}, index_numbers={index_numbers:?}, count={count}"
+                ))
+                .into());
+        }
         let metadata = TableMetadata::try_new_with_next_index_no(
             column_specs,
             index_specs,
@@ -390,7 +405,10 @@ impl Catalog {
 
 #[inline]
 fn index_ddl_metadata_reconcilable(catalog: &TableMetadata, file: &TableMetadata) -> bool {
-    if catalog.col_names != file.col_names || catalog.col_types != file.col_types {
+    if catalog.col_names != file.col_names
+        || catalog.col_types != file.col_types
+        || catalog.col_attrs != file.col_attrs
+    {
         return false;
     }
     if file.next_index_no() < catalog.next_index_no() {
@@ -666,14 +684,15 @@ pub mod tests {
     use crate::catalog::{ColumnAttributes, IndexAttributes, IndexKey, IndexSpec, TableSpec};
     use crate::conf::{EngineConfig, TrxSysConfig};
     use crate::engine::Engine;
-    use crate::error::{CompletionErrorKind, Error};
+    use crate::error::{CompletionErrorKind, DataIntegrityError, Error};
     use crate::file::BlockID;
     use crate::file::block_integrity::{BLOCK_INTEGRITY_HEADER_SIZE, write_block_checksum};
     use crate::file::cow_file::COW_FILE_PAGE_SIZE;
     use crate::index::{COLUMN_BLOCK_HEADER_SIZE, COLUMN_BLOCK_LEAF_HEADER_SIZE, ColumnBlockIndex};
     use crate::table::TablePersistence;
-    use crate::trx::MIN_SNAPSHOT_TS;
+    use crate::trx::redo::DDLRedo;
     use crate::trx::sys::CatalogCheckpointScanStopReason;
+    use crate::trx::{ActiveTrx, MIN_SNAPSHOT_TS};
     use crate::value::{Val, ValKind};
     use semistr::SemiStr;
     use std::fs::OpenOptions;
@@ -881,12 +900,120 @@ pub mod tests {
         }
     }
 
+    fn mark_catalog_ddl(trx: &mut ActiveTrx, ddl: DDLRedo) {
+        let old = trx.effects_mut().redo_mut().ddl.replace(Box::new(ddl));
+        debug_assert!(old.is_none());
+    }
+
     #[test]
     fn test_catalog_user_obj_id_boundary_predicates() {
         assert!(is_catalog_obj_id(USER_OBJ_ID_START - 1));
         assert!(!is_catalog_obj_id(USER_OBJ_ID_START));
         assert!(!is_user_obj_id(USER_OBJ_ID_START - 1));
         assert!(is_user_obj_id(USER_OBJ_ID_START));
+    }
+
+    #[test]
+    fn test_index_ddl_metadata_reconcilable_rejects_column_attribute_mismatch() {
+        let catalog_metadata = TableMetadata::new(
+            vec![ColumnSpec::new(
+                "id",
+                ValKind::I32,
+                ColumnAttributes::empty(),
+            )],
+            vec![IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::PK)],
+        );
+        let file_metadata = TableMetadata::new(
+            vec![ColumnSpec::new("id", ValKind::I32, ColumnAttributes::INDEX)],
+            vec![IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::PK)],
+        );
+        assert_eq!(catalog_metadata.col_names, file_metadata.col_names);
+        assert_eq!(catalog_metadata.col_types, file_metadata.col_types);
+        assert_ne!(catalog_metadata.col_attrs, file_metadata.col_attrs);
+        assert!(!index_ddl_metadata_reconcilable(
+            &catalog_metadata,
+            &file_metadata
+        ));
+    }
+
+    #[test]
+    fn test_user_table_metadata_rejects_orphan_index_columns() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine = EngineConfig::default()
+                .storage_root(temp_dir.path().to_path_buf())
+                .trx(TrxSysConfig::default().log_file_stem("catalog-orphan-index-column"))
+                .build()
+                .await
+                .unwrap();
+            let mut session = engine.try_new_session().unwrap();
+            let table_id = session
+                .create_table(
+                    TableSpec {
+                        columns: vec![ColumnSpec::new(
+                            "id",
+                            ValKind::I32,
+                            ColumnAttributes::empty(),
+                        )],
+                    },
+                    vec![IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::PK)],
+                )
+                .await
+                .unwrap();
+            let orphan_index_no = 7;
+
+            let mut trx = session.try_begin_trx().unwrap().unwrap();
+            trx.exec(async |stmt| {
+                assert!(
+                    engine
+                        .catalog()
+                        .storage
+                        .index_columns()
+                        .insert(
+                            stmt,
+                            &IndexColumnObject {
+                                table_id,
+                                index_no: orphan_index_no,
+                                index_column_no: 0,
+                                column_no: 0,
+                                index_order: IndexOrder::Asc,
+                            },
+                        )
+                        .await
+                );
+                Ok(())
+            })
+            .await
+            .unwrap();
+            mark_catalog_ddl(
+                &mut trx,
+                DDLRedo::CreateIndex {
+                    table_id,
+                    index_no: orphan_index_no,
+                },
+            );
+            trx.commit().await.unwrap();
+
+            let guards = PoolGuards::builder()
+                .push(PoolRole::Meta, engine.meta_pool.pool_guard())
+                .build();
+            let err = engine
+                .catalog()
+                .user_table_metadata_from_catalog(&guards, table_id)
+                .await
+                .unwrap_err();
+            assert_eq!(
+                err.data_integrity_error(),
+                Some(DataIntegrityError::InvalidRootInvariant)
+            );
+            let report = format!("{err:?}");
+            assert!(report.contains(&format!("table_id={table_id}")), "{report}");
+            assert!(
+                report.contains(&format!("index_numbers=[{orphan_index_no}]")),
+                "{report}"
+            );
+            assert!(report.contains("count=1"), "{report}");
+        });
     }
 
     #[test]
