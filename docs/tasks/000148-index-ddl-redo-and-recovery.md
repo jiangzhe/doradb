@@ -1,7 +1,7 @@
 ---
 id: 000148
 title: Index DDL Redo And Recovery
-status: proposal
+status: implemented
 created: 2026-05-14
 github_issue: 634
 ---
@@ -275,6 +275,49 @@ catalog.index_columns:
    - Keep `Implementation Notes` blank until `task resolve`.
 
 ## Implementation Notes
+
+Resolved on 2026-05-16.
+
+- Replaced index DDL redo payloads with `{ table_id, index_no }` while
+  preserving redo op codes, and updated redo serialization/deserialization
+  tests.
+- Added table-root proof classification for index DDL and used it in both
+  recovery replay and catalog checkpoint scanning. Root-proven
+  `CreateIndex`/`DropIndex` catalog DML is replayed or checkpointed; unproved
+  provisional index DDL advances past the transaction without materializing its
+  catalog rows.
+- Added recovery reload modes so normal runtime reload stays strict while
+  recovery bootstrap can temporarily load from table-file metadata when the
+  mismatch is limited to index-DDL reconciliation. Recovery now validates exact
+  catalog/table-file metadata agreement before foreground admission.
+- Preserved durable allocation history for create-then-drop replay, kept
+  `DataCheckpoint` as a recovery state-application no-op, and advanced the
+  recovered timestamp watermark from published table-root `trx_id` values.
+- Added integrity hardening found during review: orphan
+  `IndexColumnObject` rows now fail metadata rebuild, reconciliation compares
+  full column metadata, impossible catalog/file `next_index_no` ordering returns
+  an explicit data-integrity error, and table metadata rejects inconsistent
+  nullable column metadata.
+- Stabilized secondary mem-index cleanup tests that require the checkpoint root
+  to cross the GC horizon before cold-row delete-overlay proof is valid.
+
+Validation and checklist outcome:
+
+- `tools/task.rs resolve-task-next-id --task docs/tasks/000148-index-ddl-redo-and-recovery.md`
+  confirmed local `docs/tasks/next-id` was already `000149`.
+- `cargo fmt -p doradb-storage -- --check` passed.
+- `git diff --check` passed.
+- `cargo clippy -p doradb-storage --all-targets -- -D warnings` passed.
+- `cargo nextest run -p doradb-storage` passed: 770 tests.
+- `tools/coverage_focus.rs --path doradb-storage/src/catalog --path doradb-storage/src/trx --path doradb-storage/src/file --path doradb-storage/src/table --verbose`
+  passed with 91.86% deduplicated focused coverage; requested targets were
+  catalog 92.39%, trx 94.03%, file 92.25%, and table 89.98%.
+- `cargo nextest run -p doradb-storage --no-default-features --features libaio`
+  passed: 768 tests.
+- No new unsafe code was introduced; the unsafe baseline date was refreshed
+  during implementation review.
+- No unresolved checklist issues remain and no follow-up backlog item was
+  needed for this task.
 
 ## Impacts
 
