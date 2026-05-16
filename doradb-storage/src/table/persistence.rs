@@ -333,7 +333,8 @@ impl SecondaryCheckpointSidecar {
     }
 }
 
-fn secondary_disk_tree_encoder(
+/// Builds the durable secondary DiskTree key encoder for one index spec.
+pub(crate) fn secondary_disk_tree_encoder(
     metadata: &TableMetadata,
     index_spec: &IndexSpec,
     append_row_id: bool,

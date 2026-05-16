@@ -5493,6 +5493,285 @@ fn test_checkpoint_cancelled_when_table_dropping() {
 }
 
 #[test]
+fn test_create_index_builds_non_unique_hot_runtime() {
+    smol::block_on(async {
+        let sys = TestSys::new_lightweight_evictable().await;
+        let table_id = sys.table.table_id();
+        let mut session = sys.try_new_session().unwrap();
+        let row1 = insert_one_row(
+            &sys.table,
+            &mut session,
+            vec![Val::from(1), Val::from("alpha")],
+        )
+        .await;
+        let _row2 = insert_one_row(
+            &sys.table,
+            &mut session,
+            vec![Val::from(2), Val::from("beta")],
+        )
+        .await;
+        let row3 = insert_one_row(
+            &sys.table,
+            &mut session,
+            vec![Val::from(3), Val::from("alpha")],
+        )
+        .await;
+        let old_generation = sys.table.layout_snapshot().generation();
+
+        let index_no = session
+            .create_index(
+                table_id,
+                IndexSpec::new(vec![IndexKey::new(1)], IndexAttributes::empty()),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(index_no, 1);
+        assert_eq!(sys.table.metadata().next_index_no(), 2);
+        assert!(sys.table.metadata().index_spec(1).is_some());
+        assert_eq!(sys.table.layout_snapshot().generation(), old_generation + 1);
+        assert_eq!(
+            sys.table
+                .file()
+                .active_root_unchecked()
+                .secondary_index_roots[1],
+            SUPER_BLOCK_ID
+        );
+        let table_object = sys
+            .engine
+            .catalog()
+            .storage
+            .tables()
+            .find_uncommitted_by_id(session.pool_guards(), table_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(table_object.next_index_no, 2);
+
+        let index = bound_non_unique_index_no(&sys.table, 1);
+        let mut rows = Vec::new();
+        index
+            .lookup(
+                session.pool_guards().index_guard(),
+                &[Val::from("alpha")],
+                &mut rows,
+                MAX_SNAPSHOT_TS,
+            )
+            .await
+            .unwrap();
+        rows.sort_unstable();
+        assert_eq!(rows, vec![row1, row3]);
+
+        let row4 = insert_one_row(
+            &sys.table,
+            &mut session,
+            vec![Val::from(4), Val::from("alpha")],
+        )
+        .await;
+        rows.clear();
+        index
+            .lookup(
+                session.pool_guards().index_guard(),
+                &[Val::from("alpha")],
+                &mut rows,
+                MAX_SNAPSHOT_TS,
+            )
+            .await
+            .unwrap();
+        rows.sort_unstable();
+        assert_eq!(rows, vec![row1, row3, row4]);
+    });
+}
+
+#[test]
+fn test_create_index_builds_non_unique_cold_disk_tree() {
+    smol::block_on(async {
+        let sys = TestSys::new_lightweight_evictable().await;
+        let table_id = sys.table.table_id();
+        let mut session = sys.try_new_session().unwrap();
+        insert_rows(&sys, &mut session, 10, 8, "cold").await;
+        sys.table.freeze(&session, usize::MAX).await;
+        checkpoint_published(&sys.table, &mut session).await;
+
+        let index_no = session
+            .create_index(
+                table_id,
+                IndexSpec::new(vec![IndexKey::new(1)], IndexAttributes::empty()),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(index_no, 1);
+        assert_ne!(active_secondary_root(&sys.table, 1), SUPER_BLOCK_ID);
+        let mut rows =
+            non_unique_disk_tree_prefix_scan(&sys.table, session.pool_guards(), &name_key("cold"))
+                .await;
+        rows.sort_unstable();
+        assert_eq!(rows.len(), 8);
+    });
+}
+
+#[test]
+fn test_create_unique_index_rejects_duplicate_hot_rows_without_publish() {
+    smol::block_on(async {
+        let sys = TestSys::new_lightweight_evictable().await;
+        let table_id = sys.table.table_id();
+        let mut session = sys.try_new_session().unwrap();
+        insert_one_row(
+            &sys.table,
+            &mut session,
+            vec![Val::from(1), Val::from("dup")],
+        )
+        .await;
+        insert_one_row(
+            &sys.table,
+            &mut session,
+            vec![Val::from(2), Val::from("dup")],
+        )
+        .await;
+        let root_before = sys.table.file().active_root_unchecked().clone();
+        let old_generation = sys.table.layout_snapshot().generation();
+
+        let err = session
+            .create_index(
+                table_id,
+                IndexSpec::new(vec![IndexKey::new(1)], IndexAttributes::UK),
+            )
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.operation_error(), Some(OperationError::DuplicateKey));
+        assert_root_metadata_unchanged(&root_before, &sys.table);
+        assert_eq!(sys.table.layout_snapshot().generation(), old_generation);
+        assert_eq!(sys.table.metadata().next_index_no(), 1);
+        assert!(sys.table.metadata().index_spec(1).is_none());
+    });
+}
+
+#[test]
+fn test_create_unique_index_skips_committed_cold_delete_marker() {
+    smol::block_on(async {
+        let sys = TestSys::new_lightweight_evictable().await;
+        let table_id = sys.table.table_id();
+        let mut session = sys.try_new_session().unwrap();
+        let row1 = insert_one_row(
+            &sys.table,
+            &mut session,
+            vec![Val::from(1), Val::from("dup")],
+        )
+        .await;
+        insert_one_row(
+            &sys.table,
+            &mut session,
+            vec![Val::from(2), Val::from("dup")],
+        )
+        .await;
+        sys.table.freeze(&session, usize::MAX).await;
+        checkpoint_published(&sys.table, &mut session).await;
+        sys.new_trx_delete(&mut session, &single_key(2)).await;
+
+        let index_no = session
+            .create_index(
+                table_id,
+                IndexSpec::new(vec![IndexKey::new(1)], IndexAttributes::UK),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(index_no, 1);
+        let index = bound_unique_index_no(&sys.table, 1);
+        assert_eq!(
+            index
+                .lookup(
+                    session.pool_guards().index_guard(),
+                    &[Val::from("dup")],
+                    MAX_SNAPSHOT_TS,
+                )
+                .await
+                .unwrap(),
+            Some((row1, false))
+        );
+    });
+}
+
+#[test]
+fn test_create_index_rejects_active_transaction() {
+    smol::block_on(async {
+        let sys = TestSys::new_lightweight_evictable().await;
+        let table_id = sys.table.table_id();
+        let mut session = sys.try_new_session().unwrap();
+        let trx = session.try_begin_trx().unwrap().unwrap();
+
+        let err = session
+            .create_index(
+                table_id,
+                IndexSpec::new(vec![IndexKey::new(1)], IndexAttributes::empty()),
+            )
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.operation_error(), Some(OperationError::NotSupported));
+        trx.rollback().await.unwrap();
+    });
+}
+
+#[test]
+fn test_create_index_recovery_loads_published_index() {
+    smol::block_on(async {
+        use crate::catalog::tests::table2;
+
+        let temp_dir = TempDir::new().unwrap();
+        let main_dir = temp_dir.path().to_path_buf();
+        let engine = lightweight_test_engine_config(main_dir.clone(), "create_index_recover")
+            .build()
+            .await
+            .unwrap();
+        let table_id = table2(&engine).await;
+        let table = engine.catalog().get_table(table_id).await.unwrap();
+        let mut session = engine.try_new_session().unwrap();
+        let row_id = insert_one_row(
+            &table,
+            &mut session,
+            vec![Val::from(1), Val::from("persisted")],
+        )
+        .await;
+        table.freeze(&session, usize::MAX).await;
+        checkpoint_published(&table, &mut session).await;
+        assert_eq!(
+            session
+                .create_index(
+                    table_id,
+                    IndexSpec::new(vec![IndexKey::new(1)], IndexAttributes::empty()),
+                )
+                .await
+                .unwrap(),
+            1
+        );
+        drop(session);
+        drop(table);
+        drop(engine);
+
+        let engine = lightweight_test_engine_config(main_dir, "create_index_recover")
+            .build()
+            .await
+            .unwrap();
+        let table = engine.catalog().get_table(table_id).await.unwrap();
+        assert_eq!(table.metadata().next_index_no(), 2);
+        assert!(table.metadata().index_spec(1).is_some());
+        let session = engine.try_new_session().unwrap();
+        assert_eq!(
+            non_unique_disk_tree_prefix_scan(
+                &table,
+                session.pool_guards(),
+                &SelectKey::new(1, vec![Val::from("persisted")]),
+            )
+            .await,
+            vec![row_id]
+        );
+    });
+}
+
+#[test]
 fn test_drop_table_rejects_active_transaction() {
     smol::block_on(async {
         let sys = TestSys::new_lightweight_evictable().await;

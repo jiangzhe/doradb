@@ -1,5 +1,5 @@
 use crate::catalog::spec::{ActiveIndexSpec, ColumnAttributes, ColumnSpec, IndexNo, IndexSpec};
-use crate::error::{Error, InternalError, Result};
+use crate::error::{ConfigError, Error, InternalError, Result};
 use crate::row::ops::{SelectKey, UpdateCol};
 use crate::row::{Row, RowRead};
 use crate::serde::{Deser, Ser, Serde};
@@ -13,6 +13,13 @@ use std::ops::Index;
 #[inline]
 fn invalid_table_metadata(message: impl Into<String>) -> Error {
     Report::new(InternalError::Generic)
+        .attach(message.into())
+        .into()
+}
+
+#[inline]
+fn invalid_index_spec(message: impl Into<String>) -> Error {
+    Report::new(ConfigError::InvalidIndexSpec)
         .attach(message.into())
         .into()
 }
@@ -53,6 +60,11 @@ impl IndexSpecs {
             {
                 return Err(invalid_table_metadata(format!(
                     "index_no {index_no} references a column outside column count {col_count}"
+                )));
+            }
+            if active_index_spec.spec.cols.is_empty() {
+                return Err(invalid_table_metadata(format!(
+                    "index_no {index_no} has no key columns"
                 )));
             }
             slots[index_no] = Some(active_index_spec.spec);
@@ -302,6 +314,40 @@ impl TableMetadata {
     #[inline]
     pub fn next_index_no(&self) -> IndexNo {
         self.next_index_no
+    }
+
+    /// Allocates the next table-local index number and returns metadata with
+    /// the new active index appended in the corresponding sparse slot.
+    #[inline]
+    pub fn try_with_created_index(&self, index_spec: IndexSpec) -> Result<(IndexNo, Self)> {
+        if index_spec.cols.is_empty() {
+            return Err(invalid_index_spec("index has no key columns"));
+        }
+        for key in &index_spec.cols {
+            let col_no = key.col_no as usize;
+            if col_no >= self.col_count() {
+                return Err(invalid_index_spec(format!(
+                    "index column {col_no} is out of range"
+                )));
+            }
+        }
+        let index_no = self.next_index_no;
+        let next_index_no = index_no
+            .checked_add(1)
+            .ok_or_else(|| invalid_index_spec("next_index_no overflow"))?;
+        let mut index_specs = self
+            .active_indexes()
+            .map(|(index_no, spec)| ActiveIndexSpec::new(index_no as IndexNo, spec.clone()))
+            .collect::<Vec<_>>();
+        index_specs.push(ActiveIndexSpec::new(index_no, index_spec));
+        let metadata = Self::try_create(
+            self.col_names.clone(),
+            self.col_types.clone(),
+            self.col_attrs.clone(),
+            index_specs,
+            next_index_no,
+        )?;
+        Ok((index_no, metadata))
     }
 
     /// Returns the sparse secondary-index slot count.
@@ -652,10 +698,105 @@ mod tests {
         );
         assert!(
             TableMetadata::try_new(
+                columns.clone(),
+                vec![IndexSpec::new(vec![], IndexAttributes::PK)],
+            )
+            .is_err()
+        );
+        assert!(
+            TableMetadata::try_new(
                 columns,
                 vec![IndexSpec::new(vec![IndexKey::new(1)], IndexAttributes::PK)],
             )
             .is_err()
+        );
+    }
+
+    #[test]
+    fn test_table_metadata_create_index_allocates_sparse_next_slot() {
+        let metadata = TableMetadata::try_new_with_next_index_no(
+            vec![
+                ColumnSpec::new("c0", ValKind::U32, ColumnAttributes::empty()),
+                ColumnSpec::new("c1", ValKind::U64, ColumnAttributes::empty()),
+                ColumnSpec::new("c2", ValKind::U32, ColumnAttributes::empty()),
+            ],
+            vec![
+                ActiveIndexSpec::new(
+                    0,
+                    IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::PK),
+                ),
+                ActiveIndexSpec::new(
+                    2,
+                    IndexSpec::new(vec![IndexKey::new(2)], IndexAttributes::empty()),
+                ),
+            ],
+            3,
+        )
+        .unwrap();
+
+        let (index_no, metadata) = metadata
+            .try_with_created_index(IndexSpec::new(vec![IndexKey::new(1)], IndexAttributes::UK))
+            .unwrap();
+
+        assert_eq!(index_no, 3);
+        assert_eq!(metadata.next_index_no(), 4);
+        assert_eq!(metadata.index_slot_count(), 4);
+        assert!(metadata.index_spec(1).is_none());
+        assert!(metadata.index_spec(3).unwrap().unique());
+        assert_eq!(
+            metadata
+                .active_indexes()
+                .map(|(index_no, _)| index_no)
+                .collect::<Vec<_>>(),
+            vec![0, 2, 3]
+        );
+    }
+
+    #[test]
+    fn test_table_metadata_create_index_rejects_invalid_spec() {
+        let metadata = TableMetadata::new(
+            vec![ColumnSpec::new(
+                "c0",
+                ValKind::U32,
+                ColumnAttributes::empty(),
+            )],
+            vec![],
+        );
+
+        assert!(
+            metadata
+                .try_with_created_index(IndexSpec::new(vec![], IndexAttributes::UK))
+                .is_err()
+        );
+        assert!(
+            metadata
+                .try_with_created_index(
+                    IndexSpec::new(vec![IndexKey::new(1)], IndexAttributes::UK,)
+                )
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn test_table_metadata_create_index_rejects_next_index_overflow() {
+        let metadata = TableMetadata::try_new_with_next_index_no(
+            vec![ColumnSpec::new(
+                "c0",
+                ValKind::U32,
+                ColumnAttributes::empty(),
+            )],
+            vec![],
+            IndexNo::MAX,
+        )
+        .unwrap();
+
+        assert!(
+            metadata
+                .try_with_created_index(IndexSpec::new(
+                    vec![IndexKey::new(0)],
+                    IndexAttributes::empty(),
+                ))
+                .is_err()
         );
     }
 }
