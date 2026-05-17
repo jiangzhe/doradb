@@ -568,6 +568,18 @@ fn validate_create_index_root_shape(
     Ok(())
 }
 
+#[inline]
+fn create_index_cold_root_has_rows(column_block_index_root: BlockID, pivot_row_id: RowID) -> bool {
+    if column_block_index_root == SUPER_BLOCK_ID {
+        return false;
+    }
+    assert!(
+        pivot_row_id != 0,
+        "create index found non-empty cold root with pivot_row_id == 0: column_block_index_root={column_block_index_root}, pivot_row_id={pivot_row_id}"
+    );
+    true
+}
+
 // Future improvement: stream/batch and parallelize this cold-row build to avoid
 // materializing every persisted row. See docs/backlogs/000104.
 async fn collect_create_index_cold_rows(
@@ -578,7 +590,7 @@ async fn collect_create_index_cold_rows(
     column_block_index_root: BlockID,
     pivot_row_id: RowID,
 ) -> Result<Vec<CreateIndexRowEntry>> {
-    if column_block_index_root == SUPER_BLOCK_ID || pivot_row_id == 0 {
+    if !create_index_cold_root_has_rows(column_block_index_root, pivot_row_id) {
         return Ok(Vec::new());
     }
     let disk_guard = guards.disk_guard();
@@ -1267,6 +1279,18 @@ mod tests {
         assert!(report.contains("inactive secondary-root slot"), "{report}");
         assert!(report.contains("index_no=1"), "{report}");
         assert!(report.contains("root_block_id=99"), "{report}");
+    }
+
+    #[test]
+    fn create_index_cold_root_shape_accepts_empty_root() {
+        assert!(!create_index_cold_root_has_rows(SUPER_BLOCK_ID, 0));
+        assert!(!create_index_cold_root_has_rows(SUPER_BLOCK_ID, 10));
+    }
+
+    #[test]
+    #[should_panic(expected = "non-empty cold root with pivot_row_id == 0")]
+    fn create_index_cold_root_shape_panics_on_non_empty_root_without_pivot() {
+        let _ = create_index_cold_root_has_rows(BlockID::new(99), 0);
     }
 
     #[test]
