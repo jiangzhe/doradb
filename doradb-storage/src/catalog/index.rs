@@ -96,13 +96,13 @@ pub(crate) async fn create_index_for_session(
     // metadata/root shape, preserving existing sparse index slots.
     let old_layout = table.layout_snapshot();
     let old_metadata = old_layout.metadata();
+    let active_root = table.file().active_root_unchecked().clone();
+    validate_create_index_root_shape(table_id, &active_root, old_metadata)?;
     let (index_no, new_metadata_value) = old_metadata.try_with_created_index(index_spec)?;
     let new_metadata = Arc::new(new_metadata_value);
     let index_no_usize = usize::from(index_no);
     let new_index_spec = new_metadata.require_index_spec(index_no_usize)?.clone();
 
-    let active_root = table.file().active_root_unchecked().clone();
-    validate_create_index_root_shape(table_id, &active_root, old_metadata)?;
     let mut secondary_index_roots = active_root.secondary_index_roots.clone();
     secondary_index_roots.resize(new_metadata.index_slot_count(), SUPER_BLOCK_ID);
     let disk_runtime = SecondaryDiskTreeRuntime::new(
@@ -550,6 +550,20 @@ fn validate_create_index_root_shape(
                 "create index secondary-root slot mismatch: table_id={table_id}, actual_slots={actual_slots}, expected_slots={expected_slots}"
             ))
             .into());
+    }
+    for (index_no, root) in active_root
+        .secondary_index_roots
+        .iter()
+        .copied()
+        .enumerate()
+    {
+        if metadata.index_spec(index_no).is_none() && root != SUPER_BLOCK_ID {
+            return Err(Report::new(DataIntegrityError::InvalidRootInvariant)
+                .attach(format!(
+                    "create index inactive secondary-root slot is non-empty before sparse slot reuse: table_id={table_id}, index_no={index_no}, root_block_id={root}, expected_root_block_id={SUPER_BLOCK_ID}"
+                ))
+                .into());
+        }
     }
     Ok(())
 }
@@ -1227,6 +1241,32 @@ mod tests {
             classify_index_ddl_root(IndexDdlKind::Drop, 42, 1, 19, Some(&dropped_root)).unwrap(),
             IndexDdlRootProof::DurableFinalDrop
         );
+    }
+
+    #[test]
+    fn validate_create_index_root_shape_rejects_non_empty_inactive_slot() {
+        let metadata = TableMetadata::try_new_with_next_index_no(
+            columns(),
+            vec![ActiveIndexSpec::new(
+                0,
+                IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::PK),
+            )],
+            2,
+        )
+        .unwrap();
+        let mut active_root = root_with_metadata(metadata.clone(), 20);
+        active_root.secondary_index_roots[1] = BlockID::new(99);
+
+        let err = validate_create_index_root_shape(42, &active_root, &metadata).unwrap_err();
+
+        assert_eq!(
+            err.data_integrity_error(),
+            Some(DataIntegrityError::InvalidRootInvariant)
+        );
+        let report = format!("{err:?}");
+        assert!(report.contains("inactive secondary-root slot"), "{report}");
+        assert!(report.contains("index_no=1"), "{report}");
+        assert!(report.contains("root_block_id=99"), "{report}");
     }
 
     #[test]

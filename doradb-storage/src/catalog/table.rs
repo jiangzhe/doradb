@@ -28,6 +28,24 @@ fn invalid_index_spec(message: impl Into<String>) -> Error {
 }
 
 #[inline]
+fn validate_index_spec(index_no: usize, spec: &IndexSpec, col_count: usize) -> Result<()> {
+    if spec.cols.is_empty() {
+        return Err(invalid_index_spec(format!(
+            "index_no {index_no} has no key columns"
+        )));
+    }
+    for key in &spec.cols {
+        let col_no = key.col_no as usize;
+        if col_no >= col_count {
+            return Err(invalid_index_spec(format!(
+                "index_no {index_no} references column {col_no} outside column count {col_count}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+#[inline]
 pub(crate) async fn acquire_table_ddl_locks<'a>(
     lock_manager: &'a LockManager,
     table_id: crate::catalog::TableID,
@@ -158,21 +176,7 @@ impl IndexSpecs {
                     "duplicate index_no {index_no}"
                 )));
             }
-            if active_index_spec
-                .spec
-                .cols
-                .iter()
-                .any(|key| key.col_no as usize >= col_count)
-            {
-                return Err(invalid_table_metadata(format!(
-                    "index_no {index_no} references a column outside column count {col_count}"
-                )));
-            }
-            if active_index_spec.spec.cols.is_empty() {
-                return Err(invalid_table_metadata(format!(
-                    "index_no {index_no} has no key columns"
-                )));
-            }
+            validate_index_spec(index_no, &active_index_spec.spec, col_count)?;
             slots[index_no] = Some(active_index_spec.spec);
             active_count += 1;
         }
@@ -276,11 +280,17 @@ impl TableMetadata {
         let next_index_no = IndexNo::try_from(index_specs.len()).map_err(|_| {
             invalid_table_metadata("next_index_no overflow while deriving table metadata")
         })?;
+        let col_count = column_specs.len();
         let active_index_specs = index_specs
             .into_iter()
             .enumerate()
-            .map(|(index_no, spec)| ActiveIndexSpec::new(index_no as IndexNo, spec))
-            .collect();
+            .map(|(index_no, spec)| {
+                if col_count > 0 {
+                    validate_index_spec(index_no, &spec, col_count)?;
+                }
+                Ok(ActiveIndexSpec::new(index_no as IndexNo, spec))
+            })
+            .collect::<Result<Vec<_>>>()?;
         Self::try_new_with_next_index_no(column_specs, active_index_specs, next_index_no)
     }
 
@@ -426,18 +436,8 @@ impl TableMetadata {
     /// the new active index appended in the corresponding sparse slot.
     #[inline]
     pub fn try_with_created_index(&self, index_spec: IndexSpec) -> Result<(IndexNo, Self)> {
-        if index_spec.cols.is_empty() {
-            return Err(invalid_index_spec("index has no key columns"));
-        }
-        for key in &index_spec.cols {
-            let col_no = key.col_no as usize;
-            if col_no >= self.col_count() {
-                return Err(invalid_index_spec(format!(
-                    "index column {col_no} is out of range"
-                )));
-            }
-        }
         let index_no = self.next_index_no;
+        validate_index_spec(index_no as usize, &index_spec, self.col_count())?;
         let next_index_no = index_no
             .checked_add(1)
             .ok_or_else(|| invalid_index_spec("next_index_no overflow"))?;
@@ -663,6 +663,16 @@ mod tests {
     use super::*;
     use crate::catalog::{ColumnSpec, IndexAttributes, IndexKey};
 
+    fn assert_invalid_index_spec(err: Error, expected_message: &str) {
+        assert!(err.is_kind(crate::error::ErrorKind::Config));
+        assert_eq!(
+            err.report().downcast_ref::<ConfigError>().copied(),
+            Some(ConfigError::InvalidIndexSpec)
+        );
+        let report = format!("{err:?}");
+        assert!(report.contains(expected_message), "{report}");
+    }
+
     #[test]
     fn test_table_metadata_serde() {
         let metadata = TableMetadata::new(
@@ -802,20 +812,40 @@ mod tests {
             )
             .is_err()
         );
-        assert!(
-            TableMetadata::try_new(
-                columns.clone(),
-                vec![IndexSpec::new(vec![], IndexAttributes::PK)],
-            )
-            .is_err()
-        );
-        assert!(
-            TableMetadata::try_new(
-                columns,
-                vec![IndexSpec::new(vec![IndexKey::new(1)], IndexAttributes::PK)],
-            )
-            .is_err()
-        );
+    }
+
+    #[test]
+    fn test_table_metadata_rejects_invalid_index_specs_as_config_errors() {
+        let columns = vec![ColumnSpec::new(
+            "c0",
+            ValKind::U32,
+            ColumnAttributes::empty(),
+        )];
+
+        let err = TableMetadata::try_new(
+            columns.clone(),
+            vec![IndexSpec::new(vec![], IndexAttributes::PK)],
+        )
+        .unwrap_err();
+        assert_invalid_index_spec(err, "index_no 0 has no key columns");
+
+        let err = TableMetadata::try_new_with_next_index_no(
+            columns.clone(),
+            vec![ActiveIndexSpec::new(
+                1,
+                IndexSpec::new(vec![], IndexAttributes::PK),
+            )],
+            2,
+        )
+        .unwrap_err();
+        assert_invalid_index_spec(err, "index_no 1 has no key columns");
+
+        let err = TableMetadata::try_new(
+            columns,
+            vec![IndexSpec::new(vec![IndexKey::new(1)], IndexAttributes::PK)],
+        )
+        .unwrap_err();
+        assert_invalid_index_spec(err, "index_no 0 references column 1 outside column count 1");
     }
 
     #[test]
