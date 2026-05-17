@@ -6,7 +6,7 @@ CREATE INDEX cold-row build currently collects all live persisted rows into memo
 
 ## Reference
 
-Deferred from docs/tasks/000149-implement-create-index-storage-api.md while implementing RFC 0018 Phase 4 CREATE INDEX storage API. Relevant implementation is collect_create_index_cold_rows and the cold DiskTree build path in doradb-storage/src/session.rs.
+Deferred from docs/tasks/000149-implement-create-index-storage-api.md while implementing RFC 0018 Phase 4 CREATE INDEX storage API. Relevant implementation is collect_create_index_cold_rows and the cold DiskTree build path in doradb-storage/src/catalog/index.rs.
 
 ## Deferred From (Optional)
 

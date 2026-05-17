@@ -497,10 +497,10 @@ on. Safe synchronization primitives or existing project patterns are preferred.
   - Goals: Correctly create unique and non-unique indexes on existing tables
     while blocking foreground table access.
   - Non-goals: Parallel index build, online create index, or build throttling.
-  - Task Doc: `docs/tasks/TBD.md`
-  - Task Issue: `#0`
-  - Phase Status: `pending`
-  - Implementation Summary: `pending`
+  - Task Doc: `docs/tasks/000149-implement-create-index-storage-api.md`
+  - Task Issue: `#636`
+  - Phase Status: done
+  - Implementation Summary: Implemented Phase 4 CREATE INDEX storage API: added `Session::create_index`, moved create-index orchestration into catalog/index code with an explicit builder state machine, allocated stable sparse index slots through table metadata helpers, built cold DiskTree and hot MemIndex state from logically live rows, validated unique keys before catalog commit, published matching table-file roots with stricter sparse-root validation, installed runtime layouts in place, and deferred bounded-memory/parallel cold builds to docs/backlogs/000104-stream-parallel-create-index-cold-build.md. [Task Resolve Sync: docs/tasks/000149-implement-create-index-storage-api.md @ 2026-05-17]
 
 - **Phase 5: DROP INDEX**
   - Scope: Add the storage API and implementation for dropping active indexes,

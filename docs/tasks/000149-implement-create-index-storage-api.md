@@ -1,7 +1,7 @@
 ---
 id: 000149
 title: Implement CREATE INDEX Storage API
-status: proposal
+status: implemented
 created: 2026-05-16
 github_issue: 636
 ---
@@ -341,6 +341,64 @@ tools/coverage_focus.rs \
 
 ## Implementation Notes
 
+Implemented RFC 0018 Phase 4 `CREATE INDEX` storage support.
+
+- Added `Session::create_index` as the public storage API, with the session
+  method delegating to `catalog::create_index_for_session` so the create-index
+  workflow lives with catalog/index code.
+- Added `CreateIndexBuilder` to drive the build state machine explicitly:
+  acquire table DDL locks and metadata-change gates, stage the cold and hot
+  index resources, commit catalog DML with `DDLRedo::CreateIndex`, publish the
+  matching table-file root, install the new runtime layout, and destroy staged
+  resources on pre-publish failure.
+- Added table metadata helpers that validate index specs, allocate a monotonic
+  stable `index_no`, advance `next_index_no`, preserve sparse active/inactive
+  slots, and report invalid user index specs as `InvalidIndexSpec`.
+- Built new secondary indexes from logically live rows: cold rows are decoded
+  from persisted column blocks while filtering persisted delete deltas and
+  committed `ColumnDeletionBuffer` markers; hot rows are scanned from row pages
+  after DDL locks drain foreground access.
+- Validated unique indexes across cold/cold, hot/hot, and cold/hot entries
+  before catalog DML commit. Failures leave old catalog metadata, table-file
+  root, and runtime layout installed.
+- Published table roots with stricter sparse-root validation: inactive slots
+  must remain `SUPER_BLOCK_ID`, and a non-empty cold column-block root must not
+  have `pivot_row_id == 0`.
+- Moved index-DDL implementation and tests into
+  `doradb-storage/src/catalog/index.rs`; kept session code as a thin
+  delegation surface; moved table DDL lock helpers to
+  `doradb-storage/src/catalog/table.rs`.
+- Deferred streaming and parallel cold-row builds to
+  `docs/backlogs/000104-stream-parallel-create-index-cold-build.md`.
+
+Post-implementation review found no unresolved correctness issues. The known
+performance limitation is the intentionally single-threaded cold build that
+materializes live cold rows before DiskTree construction; it is tracked in the
+backlog above.
+
+Validation run during resolve:
+
+```bash
+cargo fmt --all
+cargo clippy -p doradb-storage --all-targets -- -D warnings
+cargo nextest run -p doradb-storage
+tools/coverage_focus.rs \
+  --path doradb-storage/src/session.rs \
+  --path doradb-storage/src/catalog \
+  --path doradb-storage/src/table \
+  --path doradb-storage/src/index
+cargo nextest run -p doradb-storage --no-default-features --features libaio
+```
+
+Results:
+
+- `cargo clippy`: passed with `-D warnings`.
+- Default backend nextest: 783 tests passed.
+- Focused coverage: 31,850/34,937 lines, 91.16% combined; requested targets
+  were 92.94% for `session.rs`, 90.94% for `catalog`, 89.99% for `table`, and
+  92.18% for `index`.
+- `libaio` backend nextest: 781 tests passed.
+
 ## Impacts
 
 - `doradb-storage/src/session.rs`
@@ -454,6 +512,12 @@ cargo nextest run -p doradb-storage --no-default-features --features libaio
 ## Open Questions
 
 None blocking.
+
+Deferred follow-up:
+
+- `docs/backlogs/000104-stream-parallel-create-index-cold-build.md` tracks
+  bounded-memory streaming and parallel execution for the cold-row CREATE INDEX
+  build path.
 
 Phase 5 `DROP INDEX` remains the next RFC 0018 task and must not be folded into
 this implementation.
