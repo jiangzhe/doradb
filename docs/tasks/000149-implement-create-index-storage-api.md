@@ -368,6 +368,25 @@ Implemented RFC 0018 Phase 4 `CREATE INDEX` storage support.
   `doradb-storage/src/catalog/index.rs`; kept session code as a thin
   delegation surface; moved table DDL lock helpers to
   `doradb-storage/src/catalog/table.rs`.
+- Changed post-publication table-root lifetime handling so both CREATE INDEX
+  and checkpoint publication retain replaced table roots in
+  `TransactionSystem::table_roots` behind a post-publish fence timestamp. The
+  old root is released only after the active-snapshot purge horizon crosses
+  the fence.
+- Kept root-retention cleanup separate from dropped-table cleanup:
+  `TransactionSystem::table_roots` and `TransactionSystem::dropped_tables` use
+  separate locks, separate purge notifications (`TableRootRetention` and
+  `DroppedTable`), and separate purge-loop actions.
+- Removed the earlier transaction-payload old-root retention path and its
+  duplicate-retention error. Table-root publication is not modeled as a normal
+  transaction payload because CREATE INDEX root publication happens after the
+  catalog transaction commits, and checkpoint publication must retain the old
+  root even if post-publication fatal handling aborts local control flow.
+- Cleaned test-only support out of production APIs:
+  `doradb-storage/src/trx/purge.rs` no longer exposes `#[cfg(test)]` queue
+  counters, dropped-table tests assert observable file/catalog behavior, and
+  `MutableTableFile::persist_lwc_blocks` was removed in favor of a local
+  helper inside the `table_file.rs` test module.
 - Deferred streaming and parallel cold-row builds to
   `docs/backlogs/000104-stream-parallel-create-index-cold-build.md`.
 
@@ -376,7 +395,7 @@ performance limitation is the intentionally single-threaded cold build that
 materializes live cold rows before DiskTree construction; it is tracked in the
 backlog above.
 
-Validation run during resolve:
+Validation run during initial resolve:
 
 ```bash
 cargo fmt --all
@@ -399,6 +418,24 @@ Results:
   92.18% for `index`.
 - `libaio` backend nextest: 781 tests passed.
 
+Latest validation after the root-retention, cleanup-split, and test-helper
+follow-ups:
+
+```bash
+cargo fmt --all
+cargo check -p doradb-storage --all-targets
+cargo clippy -p doradb-storage --all-targets -- -D warnings
+cargo nextest run -p doradb-storage
+git diff --check
+```
+
+Results:
+
+- `cargo check`: passed.
+- `cargo clippy`: passed with `-D warnings`.
+- Default backend nextest: 780 tests passed.
+- `git diff --check`: passed.
+
 ## Impacts
 
 - `doradb-storage/src/session.rs`
@@ -420,13 +457,14 @@ Results:
 - `doradb-storage/src/table/layout.rs`
   - Validation of the new runtime layout generation and sparse slots.
 - `doradb-storage/src/table/persistence.rs`
-  - Extraction or reuse of secondary-index encoding and disk-tree batch-writing
-    helpers.
+  - Secondary-index checkpoint sidecar reuse and checkpoint table-root old-root
+    retention through the shared post-publish fence queue.
 - `doradb-storage/src/table/deletion_buffer.rs`
   - Read-only liveness checks for committed cold-delete markers during the
     cold build.
 - `doradb-storage/src/file/table_file.rs`
-  - Existing mutable-root metadata/root replacement helpers.
+  - Existing mutable-root metadata/root replacement helpers; test-only LWC
+    publish wrapper removed from production methods.
 - `doradb-storage/src/file/meta_block.rs`
   - Tests may need assertions that root slot validation still accepts the
     created index root and sparse inactive slots.
@@ -439,6 +477,9 @@ Results:
 - `doradb-storage/src/trx/redo.rs` and `doradb-storage/src/trx/recover.rs`
   - No payload-shape redesign is planned, but tests should cover the existing
     Phase 3 `CreateIndex { table_id, index_no }` recovery contract.
+- `doradb-storage/src/trx/purge.rs` and `doradb-storage/src/trx/sys.rs`
+  - Post-publish table-root retention queue, separate dropped-table cleanup
+    queue, and distinct purge notifications/actions for both cleanup domains.
 - `docs/rfcs/0018-create-drop-index.md`
   - Resolve-time synchronization for Phase 4 task status and any refined
     implementation summary.
@@ -494,7 +535,15 @@ Results:
     fails closed rather than admitting unsafe foreground access.
 23. Existing Phase 3 provisional-recovery tests still pass with the real
     create-index catalog DML contract.
-24. Validation commands pass:
+24. CREATE INDEX table-root publication retains the replaced root while an
+    earlier transaction is active and releases it after the purge horizon
+    crosses the post-publish fence.
+25. Checkpoint table-root publication uses the same post-publish root-retention
+    queue and releases old roots only after active readers drain.
+26. Dropped-table cleanup remains independent from table-root retention and is
+    validated through observable file/catalog behavior rather than
+    production-only test counters.
+27. Validation commands pass:
 
 ```bash
 cargo fmt --all
@@ -502,7 +551,7 @@ cargo clippy -p doradb-storage --all-targets -- -D warnings
 cargo nextest run -p doradb-storage
 ```
 
-25. Alternate backend validation passes when `libaio1` and `libaio-dev` are
+28. Alternate backend validation passes when `libaio1` and `libaio-dev` are
     installed:
 
 ```bash
