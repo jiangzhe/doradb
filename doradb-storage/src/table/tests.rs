@@ -8257,15 +8257,23 @@ async fn wait_path_exists(path: &str, expected: bool) {
 }
 
 async fn checkpoint_published(table: &Table, session: &mut Session) -> TrxID {
-    match table.checkpoint(session).await.unwrap() {
-        CheckpointOutcome::Published { checkpoint_ts } => checkpoint_ts,
-        CheckpointOutcome::Delayed { reason } => {
-            panic!("checkpoint should publish, delayed by {reason:?}")
-        }
-        CheckpointOutcome::Cancelled { reason } => {
-            panic!("checkpoint should publish, cancelled by {reason:?}")
+    let mut last_delay = None;
+    for _ in 0..50 {
+        match table.checkpoint(session).await.unwrap() {
+            CheckpointOutcome::Published { checkpoint_ts } => return checkpoint_ts,
+            CheckpointOutcome::Delayed { reason } => {
+                last_delay = Some(reason);
+                smol::Timer::after(Duration::from_millis(20)).await;
+            }
+            CheckpointOutcome::Cancelled { reason } => {
+                panic!("checkpoint should publish, cancelled by {reason:?}")
+            }
         }
     }
+    panic!(
+        "checkpoint should publish, delayed after retries by {:?}",
+        last_delay.unwrap()
+    )
 }
 
 fn assert_root_metadata_unchanged(before: &crate::file::table_file::ActiveRoot, table: &Table) {
