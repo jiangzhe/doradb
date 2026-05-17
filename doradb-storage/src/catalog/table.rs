@@ -1,5 +1,8 @@
 use crate::catalog::spec::{ActiveIndexSpec, ColumnAttributes, ColumnSpec, IndexNo, IndexSpec};
-use crate::error::{ConfigError, Error, InternalError, Result};
+use crate::error::{ConfigError, Error, InternalError, OperationError, Result};
+use crate::lock::{
+    FreshLockGuard, LockGrant, LockManager, LockMode, LockOwner, LockOwnerGroup, LockResource,
+};
 use crate::row::ops::{SelectKey, UpdateCol};
 use crate::row::{Row, RowRead};
 use crate::serde::{Deser, Ser, Serde};
@@ -22,6 +25,109 @@ fn invalid_index_spec(message: impl Into<String>) -> Error {
     Report::new(ConfigError::InvalidIndexSpec)
         .attach(message.into())
         .into()
+}
+
+#[inline]
+pub(crate) async fn acquire_table_ddl_locks<'a>(
+    lock_manager: &'a LockManager,
+    table_id: crate::catalog::TableID,
+    owner: LockOwner,
+    owner_group: LockOwnerGroup,
+) -> Result<ScopedTableDdlLocks<'a>> {
+    let metadata_resource = LockResource::TableMetadata(table_id);
+    let metadata_grant = lock_manager
+        .acquire_grouped_with_grant(metadata_resource, LockMode::Exclusive, owner, owner_group)
+        .await?;
+    let mut metadata_guard =
+        FreshLockGuard::new(lock_manager, metadata_resource, owner, metadata_grant);
+
+    let data_resource = LockResource::TableData(table_id);
+    let data_grant = lock_manager
+        .acquire_grouped_with_grant(data_resource, LockMode::Exclusive, owner, owner_group)
+        .await?;
+    if let Some(guard) = metadata_guard.as_mut() {
+        guard.disarm();
+    }
+
+    Ok(ScopedTableDdlLocks {
+        lock_manager,
+        table_id,
+        owner,
+        metadata_fresh: metadata_grant == LockGrant::Fresh,
+        data_fresh: data_grant == LockGrant::Fresh,
+        fail_waiters: None,
+    })
+}
+
+#[inline]
+pub(crate) fn reject_table_ddl_explicit_session_lock(
+    lock_manager: &LockManager,
+    table_id: crate::catalog::TableID,
+    owner: LockOwner,
+    operation: &'static str,
+) -> Result<()> {
+    // Table DDL uses the session owner for scoped DDL locks. If an explicit
+    // session table lock already exists, reusing that owner would become a
+    // same-owner conversion and scoped cleanup could not distinguish the DDL
+    // lock from the user-held session lock.
+    let metadata_locked = lock_manager.owner_holds(
+        LockResource::TableMetadata(table_id),
+        owner,
+        LockMode::Shared,
+    );
+    let data_locked = lock_manager.owner_holds(
+        LockResource::TableData(table_id),
+        owner,
+        LockMode::IntentShared,
+    );
+    if !metadata_locked && !data_locked {
+        return Ok(());
+    }
+    Err(Report::new(OperationError::LockOwnerGroupConflict)
+        .attach(format!(
+            "{operation} while session owns explicit table lock: table_id={table_id}, owner={owner:?}"
+        ))
+        .into())
+}
+
+pub(crate) struct ScopedTableDdlLocks<'a> {
+    lock_manager: &'a LockManager,
+    table_id: crate::catalog::TableID,
+    owner: LockOwner,
+    metadata_fresh: bool,
+    data_fresh: bool,
+    fail_waiters: Option<OperationError>,
+}
+
+impl ScopedTableDdlLocks<'_> {
+    #[inline]
+    pub(crate) fn fail_waiters_on_release(&mut self, error: OperationError) {
+        self.fail_waiters = Some(error);
+    }
+}
+
+impl Drop for ScopedTableDdlLocks<'_> {
+    #[inline]
+    fn drop(&mut self) {
+        if self.data_fresh {
+            let resource = LockResource::TableData(self.table_id);
+            if let Some(error) = self.fail_waiters {
+                self.lock_manager
+                    .release_and_fail_waiters(resource, self.owner, error);
+            } else {
+                self.lock_manager.release(resource, self.owner);
+            }
+        }
+        if self.metadata_fresh {
+            let resource = LockResource::TableMetadata(self.table_id);
+            if let Some(error) = self.fail_waiters {
+                self.lock_manager
+                    .release_and_fail_waiters(resource, self.owner, error);
+            } else {
+                self.lock_manager.release(resource, self.owner);
+            }
+        }
+    }
 }
 
 /// Sparse secondary-index metadata slots keyed by stable table-local index number.
