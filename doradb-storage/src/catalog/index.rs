@@ -230,7 +230,7 @@ pub(crate) async fn create_index_for_session(
                 .await;
         }
     };
-    drop(old_root);
+    engine.trx_sys.retain_published_table_root(old_root);
 
     // 9. Install the new runtime layout last. Existing snapshots keep their old
     // layout Arcs, while later foreground work observes the new index.
@@ -1148,6 +1148,7 @@ mod tests {
     };
     use crate::conf::{EngineConfig, EvictableBufferPoolConfig, FileSystemConfig, TrxSysConfig};
     use crate::engine::Engine;
+    use crate::file::cow_file::tests::old_root_drop_count;
     use crate::file::table_file::ActiveRoot;
     use crate::row::ops::{DeleteMvcc, SelectKey};
     use crate::table::{CheckpointOutcome, TablePersistence};
@@ -1403,6 +1404,48 @@ mod tests {
             .await;
             rows.sort_unstable();
             assert_eq!(rows.len(), 8);
+        });
+    }
+
+    #[test]
+    fn test_create_index_retains_old_root_until_purge_horizon() {
+        smol::block_on(async {
+            let sys = CreateIndexTestSys::new_lightweight_evictable().await;
+            let table_id = sys.table.table_id();
+            let retained_root_ptr = sys.table.file().active_root_unchecked() as *const _ as usize;
+            let drop_count_before = old_root_drop_count(retained_root_ptr);
+
+            let mut read_session = sys.try_new_session().unwrap();
+            let read_trx = read_session.try_begin_trx().unwrap().unwrap();
+
+            let mut session = sys.try_new_session().unwrap();
+            session
+                .create_index(
+                    table_id,
+                    IndexSpec::new(vec![IndexKey::new(1)], IndexAttributes::empty()),
+                )
+                .await
+                .unwrap();
+            sys.engine.trx_sys.request_table_root_retention_purge();
+
+            for _ in 0..10 {
+                smol::Timer::after(Duration::from_millis(10)).await;
+                assert_eq!(
+                    old_root_drop_count(retained_root_ptr),
+                    drop_count_before,
+                    "create index old root must stay retained while an earlier transaction is active"
+                );
+            }
+
+            read_trx.commit().await.unwrap();
+            sys.engine.trx_sys.request_table_root_retention_purge();
+            for _ in 0..100 {
+                if old_root_drop_count(retained_root_ptr) > drop_count_before {
+                    return;
+                }
+                smol::Timer::after(Duration::from_millis(10)).await;
+            }
+            panic!("create index old root was not released after purge crossed the fence");
         });
     }
 

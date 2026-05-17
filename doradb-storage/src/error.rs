@@ -137,8 +137,6 @@ pub(crate) enum ResourceError {
 /// Fieldless operation-domain errors carried underneath `ErrorKind::Operation`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ThisError)]
 pub(crate) enum OperationError {
-    #[error("old table root already retained")]
-    OldTableRootAlreadyRetained,
     #[error("table not found")]
     TableNotFound,
     #[error("table is dropping")]

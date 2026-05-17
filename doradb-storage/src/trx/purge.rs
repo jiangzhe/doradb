@@ -2,6 +2,7 @@ use crate::buffer::PageID;
 use crate::buffer::{BufferPool, EvictableBufferPool, PoolGuards};
 use crate::catalog::{Catalog, TableCache, TableHandle, TableID};
 use crate::error::{FatalError, Result};
+use crate::file::table_file::OldRoot;
 use crate::latch::LatchFallbackMode;
 use crate::quiescent::{QuiescentGuard, SyncQuiescentGuard};
 use crate::row::RowPage;
@@ -76,25 +77,55 @@ impl DroppedTableFileDeleteItem {
     }
 }
 
+/// Swapped user-table active root retained until post-publish readers drain.
+struct RetainedTableRoot {
+    fence_ts: TrxID,
+    _old_root: OldRoot,
+}
+
+/// Purge-owned queue for swapped table roots awaiting post-publish reader drain.
+#[derive(Default)]
+pub(crate) struct TableRootQueue {
+    roots: VecDeque<RetainedTableRoot>,
+}
+
+impl TableRootQueue {
+    #[inline]
+    fn push(&mut self, item: RetainedTableRoot) {
+        self.roots.push_back(item);
+    }
+
+    #[inline]
+    fn release_ready(&mut self, min_active_sts: TrxID) {
+        let mut retained = VecDeque::new();
+        while let Some(item) = self.roots.pop_front() {
+            if item.fence_ts < min_active_sts {
+                drop(item);
+            } else {
+                retained.push_back(item);
+            }
+        }
+        self.roots = retained;
+    }
+}
+
 /// Purge-owned queues for GC-managed dropped-table cleanup.
 ///
 /// `runtime` entries wait for both the purge horizon and exclusive ownership of
-/// the table `Arc`; `files` entries wait for the catalog checkpoint replay floor.
-/// These queues are deliberately purge-owned so foreground DROP TABLE can finish
-/// after logical removal without synchronously reclaiming memory or unlinking
-/// files.
+/// the table `Arc`; `files` entries wait for the catalog checkpoint replay
+/// floor. These queues are deliberately purge-owned so foreground DROP TABLE can
+/// finish after logical removal without synchronously reclaiming memory or
+/// unlinking files.
 #[derive(Default)]
-pub(crate) struct DroppedTableGcQueues {
+pub(crate) struct DroppedTableQueue {
     runtime: VecDeque<DroppedTableGcItem>,
     files: VecDeque<DroppedTableFileDeleteItem>,
 }
 
-impl DroppedTableGcQueues {
+impl DroppedTableQueue {
     #[inline]
-    pub(crate) fn from_file_deletes(
-        file_deletes: Vec<DroppedTableFileDeleteItem>,
-    ) -> DroppedTableGcQueues {
-        DroppedTableGcQueues {
+    pub(crate) fn from_file_deletes(file_deletes: Vec<DroppedTableFileDeleteItem>) -> Self {
+        Self {
             runtime: VecDeque::new(),
             files: VecDeque::from(file_deletes),
         }
@@ -104,15 +135,29 @@ impl DroppedTableGcQueues {
     fn push_runtime(&mut self, item: DroppedTableGcItem) {
         self.runtime.push_back(item);
     }
-
-    #[cfg(test)]
-    #[inline]
-    fn pending_counts(&self) -> (usize, usize) {
-        (self.runtime.len(), self.files.len())
-    }
 }
 
 impl TransactionSystem {
+    /// Retain a swapped user-table root until post-publish readers are gone.
+    ///
+    /// The fence timestamp is allocated after the active-root pointer has been
+    /// swapped. Any transaction that could have observed the old root must have
+    /// started before this fence, so purge can release the root once the global
+    /// active-snapshot horizon crosses it.
+    #[inline]
+    pub(crate) fn retain_published_table_root(&self, old_root: Option<OldRoot>) {
+        let Some(old_root) = old_root else {
+            return;
+        };
+        let fence_ts = self.ts.fetch_add(1, Ordering::SeqCst);
+        debug_assert!(fence_ts < MAX_SNAPSHOT_TS);
+        self.table_roots.lock().push(RetainedTableRoot {
+            fence_ts,
+            _old_root: old_root,
+        });
+        self.request_table_root_retention_purge();
+    }
+
     /// Enqueue a logically dropped table runtime for purge-horizon destruction.
     ///
     /// The wake requests only dropped-table cleanup, so foreground DROP TABLE
@@ -128,14 +173,21 @@ impl TransactionSystem {
         drop_cts: TrxID,
         table: Arc<Table>,
     ) {
-        self.dropped_table_gc
-            .lock()
-            .push_runtime(DroppedTableGcItem {
-                table_id,
-                drop_cts,
-                table,
-            });
+        self.dropped_tables.lock().push_runtime(DroppedTableGcItem {
+            table_id,
+            drop_cts,
+            table,
+        });
         self.request_dropped_table_purge();
+    }
+
+    /// Wake the purge coordinator for table-root retention cleanup only.
+    ///
+    /// This is best-effort. Dropping the purge receiver is the normal shutdown
+    /// signal path, so callers must not treat a failed send as a storage error.
+    #[inline]
+    pub(crate) fn request_table_root_retention_purge(&self) {
+        let _ = self.purge_tx.send(Purge::TableRootRetention);
     }
 
     /// Wake the purge coordinator for dropped-table cleanup only.
@@ -145,12 +197,6 @@ impl TransactionSystem {
     #[inline]
     pub(crate) fn request_dropped_table_purge(&self) {
         let _ = self.purge_tx.send(Purge::DroppedTable);
-    }
-
-    #[cfg(test)]
-    #[inline]
-    pub(crate) fn dropped_table_gc_pending_counts(&self) -> (usize, usize) {
-        self.dropped_table_gc.lock().pending_counts()
     }
 
     #[inline]
@@ -253,7 +299,7 @@ impl TransactionSystem {
         catalog: &Catalog,
         guards: &PoolGuards,
         log_no: usize,
-        mut trx_list: Vec<CommittedTrx>,
+        trx_list: Vec<CommittedTrx>,
         min_active_sts: TrxID,
     ) -> HashSet<PageID> {
         let partition = &self.log_partitions[log_no];
@@ -315,11 +361,6 @@ impl TransactionSystem {
             }
         }
 
-        // Finally, release payload-owned resources whose transaction CTS has
-        // crossed the purge horizon. This includes retained old table roots.
-        for trx in &mut trx_list {
-            trx.release_old_table_root();
-        }
         drop(trx_list);
 
         partition
@@ -357,6 +398,11 @@ impl TransactionSystem {
     }
 
     #[inline]
+    fn process_retained_table_roots(&self, min_active_sts: TrxID) {
+        self.table_roots.lock().release_ready(min_active_sts);
+    }
+
+    #[inline]
     async fn process_dropped_table_gc(
         &self,
         guards: &PoolGuards,
@@ -366,7 +412,7 @@ impl TransactionSystem {
         // async destruction without holding the lock. Entries that are not past
         // the purge horizon stay queued for a later wake.
         let eligible = {
-            let mut queues = self.dropped_table_gc.lock();
+            let mut queues = self.dropped_tables.lock();
             let mut eligible = Vec::new();
             let mut retained = VecDeque::new();
             while let Some(item) = queues.runtime.pop_front() {
@@ -409,7 +455,7 @@ impl TransactionSystem {
         }
 
         {
-            let mut queues = self.dropped_table_gc.lock();
+            let mut queues = self.dropped_tables.lock();
             queues.runtime.extend(stale_handles);
             queues.files.extend(file_deletes);
         }
@@ -428,7 +474,7 @@ impl TransactionSystem {
             Err(_) => return,
         };
         let file_deletes = {
-            let mut queues = self.dropped_table_gc.lock();
+            let mut queues = self.dropped_tables.lock();
             queues.files.drain(..).collect::<Vec<_>>()
         };
         if file_deletes.is_empty() {
@@ -446,7 +492,7 @@ impl TransactionSystem {
             }
         }
         if !retained.is_empty() {
-            self.dropped_table_gc.lock().files.extend(retained);
+            self.dropped_tables.lock().files.extend(retained);
         }
     }
 }
@@ -645,31 +691,73 @@ pub enum Purge {
     Stop,
     /// Run a full transaction/index/row-page purge cycle.
     Next,
+    /// Release retained table roots whose post-publish readers have drained.
+    TableRootRetention,
     /// Run only dropped-table runtime/file cleanup.
     DroppedTable,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum PurgeWork {
-    Full,
-    DroppedTable,
+struct PurgeWork {
+    full_gc: bool,
+    table_root_retention: bool,
+    dropped_table: bool,
+}
+
+impl PurgeWork {
+    #[inline]
+    const fn full() -> Self {
+        Self {
+            full_gc: true,
+            table_root_retention: true,
+            dropped_table: true,
+        }
+    }
+
+    #[inline]
+    const fn table_root_retention() -> Self {
+        Self {
+            full_gc: false,
+            table_root_retention: true,
+            dropped_table: false,
+        }
+    }
+
+    #[inline]
+    const fn dropped_table() -> Self {
+        Self {
+            full_gc: false,
+            table_root_retention: false,
+            dropped_table: true,
+        }
+    }
+
+    #[inline]
+    fn absorb(&mut self, purge: Purge) -> bool {
+        match purge {
+            Purge::Stop => return false,
+            Purge::Next => *self = PurgeWork::full(),
+            Purge::TableRootRetention => self.table_root_retention = true,
+            Purge::DroppedTable => self.dropped_table = true,
+        }
+        true
+    }
 }
 
 #[inline]
 fn coalesce_purge_work(purge_chan: &Receiver<Purge>, initial: Purge) -> Option<PurgeWork> {
-    // Collapse queued wakeups so a burst of dropped-table-only requests does not
-    // trigger repeated scans, while any full GC request upgrades the cycle.
+    // Collapse queued wakeups so a burst of lightweight cleanup requests does
+    // not trigger repeated scans, while any full GC request upgrades the cycle.
     // `Stop` always wins because shutdown must not be delayed behind cleanup.
     let mut work = match initial {
         Purge::Stop => return None,
-        Purge::Next => PurgeWork::Full,
-        Purge::DroppedTable => PurgeWork::DroppedTable,
+        Purge::Next => PurgeWork::full(),
+        Purge::TableRootRetention => PurgeWork::table_root_retention(),
+        Purge::DroppedTable => PurgeWork::dropped_table(),
     };
     while let Ok(purge) = purge_chan.try_recv() {
-        match purge {
-            Purge::Stop => return None,
-            Purge::Next => work = PurgeWork::Full,
-            Purge::DroppedTable => (),
+        if !work.absorb(purge) {
+            return None;
         }
     }
     Some(work)
@@ -715,7 +803,7 @@ impl PurgeLoop for PurgeSingleThreaded {
                 return;
             };
             let curr_sts = trx_sys.calc_min_active_sts_for_gc();
-            if work == PurgeWork::Full && curr_sts > min_sts {
+            if work.full_gc && curr_sts > min_sts {
                 // Start GC. Purge undo/index for all partitions first, then
                 // deallocate retired row pages once to avoid cross-partition ordering issue.
                 let mut gc_row_pages = HashSet::new();
@@ -741,17 +829,22 @@ impl PurgeLoop for PurgeSingleThreaded {
                     return;
                 }
             }
-            if !handle_gc_row_page_deallocation_result(
-                trx_sys,
-                trx_sys
-                    .process_dropped_table_gc(&pool_guards, curr_sts)
-                    .await,
-            ) {
+            if work.table_root_retention {
+                trx_sys.process_retained_table_roots(curr_sts);
+            }
+            if work.dropped_table
+                && !handle_gc_row_page_deallocation_result(
+                    trx_sys,
+                    trx_sys
+                        .process_dropped_table_gc(&pool_guards, curr_sts)
+                        .await,
+                )
+            {
                 // Dropped-table runtime destruction failed after purge took
                 // ownership. Do not retry in-place against a poisoned runtime.
                 return;
             }
-            if work == PurgeWork::Full {
+            if work.full_gc {
                 // Once GC is finished, update global_visible_sts so other threads can use it to
                 // speed up visibility check.
                 trx_sys.update_global_visible_sts(curr_sts);
@@ -781,7 +874,7 @@ impl PurgeLoop for PurgeDispatcher {
                 break 'DISPATCH_LOOP;
             };
             let curr_sts = trx_sys.calc_min_active_sts_for_gc();
-            if work == PurgeWork::Full && curr_sts > min_sts {
+            if work.full_gc && curr_sts > min_sts {
                 // dispatch tasks to executors
                 let (done_tx, done_rx) = flume::unbounded();
                 let mut expected_tasks = 0usize;
@@ -826,17 +919,22 @@ impl PurgeLoop for PurgeDispatcher {
                     return;
                 }
             }
-            if !handle_gc_row_page_deallocation_result(
-                trx_sys,
-                trx_sys
-                    .process_dropped_table_gc(&pool_guards, curr_sts)
-                    .await,
-            ) {
+            if work.table_root_retention {
+                trx_sys.process_retained_table_roots(curr_sts);
+            }
+            if work.dropped_table
+                && !handle_gc_row_page_deallocation_result(
+                    trx_sys,
+                    trx_sys
+                        .process_dropped_table_gc(&pool_guards, curr_sts)
+                        .await,
+                )
+            {
                 // Dropped-table destroy failure is fatal; exiting also closes
                 // the executor task channels when this dispatcher is dropped.
                 return;
             }
-            if work == PurgeWork::Full && curr_sts > min_sts {
+            if work.full_gc && curr_sts > min_sts {
                 // Once GC is finished, update global_visible_sts so other threads can use it to
                 // speed up visibility check.
                 trx_sys.update_global_visible_sts(curr_sts);
@@ -1044,21 +1142,35 @@ mod tests {
     fn test_coalesce_purge_work_preserves_strongest_request() {
         let (_tx, rx) = flume::unbounded();
         assert_eq!(
-            coalesce_purge_work(&rx, Purge::DroppedTable),
-            Some(PurgeWork::DroppedTable)
+            coalesce_purge_work(&rx, Purge::TableRootRetention),
+            Some(PurgeWork::table_root_retention())
         );
 
         let (tx, rx) = flume::unbounded();
         tx.send(Purge::DroppedTable).unwrap();
+        assert_eq!(
+            coalesce_purge_work(&rx, Purge::TableRootRetention),
+            Some(PurgeWork {
+                full_gc: false,
+                table_root_retention: true,
+                dropped_table: true,
+            })
+        );
+
+        let (tx, rx) = flume::unbounded();
+        tx.send(Purge::TableRootRetention).unwrap();
         tx.send(Purge::Next).unwrap();
         assert_eq!(
             coalesce_purge_work(&rx, Purge::DroppedTable),
-            Some(PurgeWork::Full)
+            Some(PurgeWork::full())
         );
 
         let (tx, rx) = flume::unbounded();
         tx.send(Purge::DroppedTable).unwrap();
-        assert_eq!(coalesce_purge_work(&rx, Purge::Next), Some(PurgeWork::Full));
+        assert_eq!(
+            coalesce_purge_work(&rx, Purge::Next),
+            Some(PurgeWork::full())
+        );
     }
 
     #[test]
@@ -1066,7 +1178,7 @@ mod tests {
         let (tx, rx) = flume::unbounded();
         tx.send(Purge::Next).unwrap();
         tx.send(Purge::Stop).unwrap();
-        tx.send(Purge::DroppedTable).unwrap();
+        tx.send(Purge::TableRootRetention).unwrap();
         assert_eq!(coalesce_purge_work(&rx, Purge::DroppedTable), None);
         assert_eq!(coalesce_purge_work(&rx, Purge::Stop), None);
     }
@@ -1211,7 +1323,6 @@ mod tests {
                     row_undo,
                     index_gc: vec![],
                     gc_row_pages: vec![],
-                    old_table_root: None,
                 }),
             };
             {
@@ -1300,7 +1411,6 @@ mod tests {
                     row_undo,
                     index_gc: vec![],
                     gc_row_pages: vec![],
-                    old_table_root: None,
                 }),
             };
             {
@@ -1411,7 +1521,6 @@ mod tests {
                     row_undo,
                     index_gc: vec![],
                     gc_row_pages: vec![],
-                    old_table_root: None,
                 }),
             };
             {
@@ -1518,7 +1627,6 @@ mod tests {
                     row_undo,
                     index_gc: vec![],
                     gc_row_pages: vec![],
-                    old_table_root: None,
                 }),
             };
             {

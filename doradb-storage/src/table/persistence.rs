@@ -984,18 +984,12 @@ impl TablePersistence for Table {
                 return Err(err);
             }
         };
+        trx_sys.retain_published_table_root(old_root);
         self.blk_idx()
             .update_column_root(published_pivot_row_id, published_column_root)
             .await;
         #[cfg(test)]
         if super::tests::test_force_post_publish_checkpoint_error_enabled() {
-            let poison = trx_sys.poison_storage(FatalError::CheckpointWrite);
-            trx.discard_after_fatal_rollback();
-            return Err(poison.into());
-        }
-        if let Some(old_root) = old_root
-            && trx.retain_old_table_root(old_root).is_err()
-        {
             let poison = trx_sys.poison_storage(FatalError::CheckpointWrite);
             trx.discard_after_fatal_rollback();
             return Err(poison.into());

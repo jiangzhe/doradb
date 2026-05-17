@@ -5827,7 +5827,6 @@ fn test_drop_table_logical_cascade_and_stale_handles() {
                 .is_empty()
         );
         assert!(std::path::Path::new(&table_file_path).exists());
-        assert_eq!(sys.engine.trx_sys.dropped_table_gc_pending_counts(), (1, 0));
 
         let err = session.drop_table(table_id).await.unwrap_err();
         assert_eq!(err.operation_error(), Some(OperationError::TableNotFound));
@@ -5884,20 +5883,21 @@ fn test_drop_table_gc_retries_stale_handle_and_deletes_file_after_catalog_checkp
 
         session.drop_table(table_id).await.unwrap();
         engine.trx_sys.request_dropped_table_purge();
-        wait_dropped_table_gc_counts(&engine, (1, 0)).await;
-        assert!(std::path::Path::new(&table_file_path).exists());
+        engine
+            .catalog()
+            .checkpoint_now(&engine.trx_sys)
+            .await
+            .unwrap();
+        assert_path_remains_after_dropped_table_purge(&engine, &table_file_path, true).await;
 
         drop(stale_table);
         engine.trx_sys.request_dropped_table_purge();
-        wait_dropped_table_gc_counts(&engine, (0, 1)).await;
-        assert!(std::path::Path::new(&table_file_path).exists());
 
         engine
             .catalog()
             .checkpoint_now(&engine.trx_sys)
             .await
             .unwrap();
-        wait_dropped_table_gc_counts(&engine, (0, 0)).await;
         wait_path_exists(&table_file_path, false).await;
     });
 }
@@ -6153,7 +6153,6 @@ fn test_drop_table_recovery_replays_committed_drop_before_catalog_checkpoint() {
             .await
             .unwrap();
         assert!(engine.catalog().get_table(table_id).await.is_none());
-        wait_dropped_table_gc_counts(&engine, (0, 1)).await;
         assert!(std::path::Path::new(&table_file_path).exists());
         let mut session = engine.try_new_session().unwrap();
         let (table_spec, index_specs) = drop_table_test_spec();
@@ -6163,7 +6162,6 @@ fn test_drop_table_recovery_replays_committed_drop_before_catalog_checkpoint() {
             .checkpoint_now(&engine.trx_sys)
             .await
             .unwrap();
-        wait_dropped_table_gc_counts(&engine, (0, 0)).await;
         wait_path_exists(&table_file_path, false).await;
     });
 }
@@ -7954,19 +7952,6 @@ async fn wait_gc_cutoff_after(session: &Session, ts: TrxID) {
     panic!("GC cutoff did not advance past {ts}");
 }
 
-async fn wait_dropped_table_gc_counts(engine: &Engine, expected: (usize, usize)) {
-    for _ in 0..250 {
-        if engine.trx_sys.dropped_table_gc_pending_counts() == expected {
-            return;
-        }
-        smol::Timer::after(Duration::from_millis(50)).await;
-    }
-    panic!(
-        "dropped table GC counts did not reach {expected:?}; actual={:?}",
-        engine.trx_sys.dropped_table_gc_pending_counts()
-    );
-}
-
 async fn wait_path_exists(path: &str, expected: bool) {
     for _ in 0..250 {
         if std::path::Path::new(path).exists() == expected {
@@ -7975,6 +7960,22 @@ async fn wait_path_exists(path: &str, expected: bool) {
         smol::Timer::after(Duration::from_millis(50)).await;
     }
     panic!("path existence did not become {expected}: {path}");
+}
+
+async fn assert_path_remains_after_dropped_table_purge(
+    engine: &Engine,
+    path: &str,
+    expected: bool,
+) {
+    for _ in 0..10 {
+        engine.trx_sys.request_dropped_table_purge();
+        smol::Timer::after(Duration::from_millis(20)).await;
+        assert_eq!(
+            std::path::Path::new(path).exists(),
+            expected,
+            "path existence changed while dropped-table purge was retried: {path}"
+        );
+    }
 }
 
 async fn checkpoint_published(table: &Table, session: &mut Session) -> TrxID {

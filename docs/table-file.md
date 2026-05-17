@@ -212,8 +212,12 @@ from, so a scheduler preflight cannot race with the root actually displaced by
 the A/B super-block swap. Once the active root crosses the horizon, overwriting
 the inactive slot is safe: no active transaction still needs the root that would
 be displaced by that swap, and the old root from the successful publication is
-retained by the publishing checkpoint transaction until transaction purge
-crosses the checkpoint CTS.
+retained in the table-root retention queue.
+
+Root retention uses a post-publish fence timestamp allocated immediately after
+the active-root pointer swap. The old root is released only after
+`fence_ts < Global_Min_Active_STS`, which covers both checkpoint publication
+and metadata-changing DDL such as `CREATE INDEX`.
 
 ### 7.4 Generic Publish Flow
 
