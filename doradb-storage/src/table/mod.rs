@@ -666,7 +666,13 @@ impl<D: BufferPool, I: BufferPool> GenericMemTable<D, I> {
             let g = leaf.lock_shared_async().await.unwrap();
             debug_assert!(g.page().is_leaf());
             let entries = g.page().leaf_entries();
+            let pivot_row_id = self.pivot_row_id();
             for page_entry in entries {
+                // Row-page index entries below the pivot have already moved to
+                // column storage; their row-page frames may be deallocated.
+                if page_entry.row_id < pivot_row_id {
+                    continue;
+                }
                 let page_guard = self
                     .must_get_row_page_shared(guards, page_entry.page_id)
                     .await

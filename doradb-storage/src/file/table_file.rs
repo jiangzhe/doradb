@@ -695,20 +695,6 @@ impl MutableTableFile {
         Ok(())
     }
 
-    /// Persist LWC blocks and commit the resulting root as one CoW publish.
-    #[cfg(test)]
-    pub(crate) async fn persist_lwc_blocks(
-        mut self,
-        lwc_blocks: Vec<LwcBlockPersist>,
-        heap_redo_start_ts: TrxID,
-        ts: TrxID,
-        disk_pool: &QuiescentGuard<ReadonlyBufferPool>,
-    ) -> Result<(Arc<TableFile>, Option<OldRoot>)> {
-        self.apply_lwc_blocks(lwc_blocks, heap_redo_start_ts, ts, disk_pool)
-            .await?;
-        self.commit(ts, false).await
-    }
-
     #[inline]
     pub fn try_delete(mut self) -> bool {
         let table_file = self
@@ -797,6 +783,19 @@ mod tests {
         let mut buf = DirectBuf::zeroed(COW_FILE_PAGE_SIZE);
         buf.as_bytes_mut().copy_from_slice(page.page());
         Ok(buf)
+    }
+
+    async fn persist_lwc_blocks_for_test(
+        mut mutable_file: MutableTableFile,
+        lwc_blocks: Vec<LwcBlockPersist>,
+        heap_redo_start_ts: TrxID,
+        ts: TrxID,
+        disk_pool: &QuiescentGuard<ReadonlyBufferPool>,
+    ) -> Result<(Arc<TableFile>, Option<OldRoot>)> {
+        mutable_file
+            .apply_lwc_blocks(lwc_blocks, heap_redo_start_ts, ts, disk_pool)
+            .await?;
+        mutable_file.commit(ts, false).await
     }
 
     #[test]
@@ -1124,10 +1123,15 @@ mod tests {
 
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
             let disk_pool = table_readonly_pool(&global, table_id, &table_file);
-            let (table_file, old_root) = MutableTableFile::fork(&table_file, background_writes)
-                .persist_lwc_blocks(lwc_blocks, 7, 2, disk_pool.global_pool())
-                .await
-                .unwrap();
+            let (table_file, old_root) = persist_lwc_blocks_for_test(
+                MutableTableFile::fork(&table_file, background_writes),
+                lwc_blocks,
+                7,
+                2,
+                disk_pool.global_pool(),
+            )
+            .await
+            .unwrap();
             drop(old_root);
 
             let active_root = table_file.active_root_unchecked();
@@ -1189,9 +1193,14 @@ mod tests {
 
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
             let disk_pool = table_readonly_pool(&global, table_id, &table_file);
-            let result = MutableTableFile::fork(&table_file, background_writes)
-                .persist_lwc_blocks(lwc_blocks, 7, 2, disk_pool.global_pool())
-                .await;
+            let result = persist_lwc_blocks_for_test(
+                MutableTableFile::fork(&table_file, background_writes),
+                lwc_blocks,
+                7,
+                2,
+                disk_pool.global_pool(),
+            )
+            .await;
 
             assert!(result.as_ref().is_err_and(|err| {
                 err.is_kind(crate::error::ErrorKind::Internal)

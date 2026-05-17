@@ -33,8 +33,7 @@ use crate::buffer::PoolGuards;
 use crate::buffer::page::VersionedPageID;
 use crate::catalog::{TableID, USER_OBJ_ID_START, is_catalog_obj_id};
 use crate::engine::EngineRef;
-use crate::error::{InternalError, OperationError, Result};
-use crate::file::table_file::OldRoot;
+use crate::error::{InternalError, Result};
 use crate::lock::{
     FreshLockGuard, LockGrant, LockManager, LockMode, LockOwner, LockOwnerGroup, LockResource,
     StmtNo,
@@ -326,7 +325,6 @@ pub(crate) struct TrxEffects {
     index_undo: IndexUndoLogs,
     redo: RedoLogs,
     gc_row_pages: Vec<PageID>,
-    old_table_root: Option<OldRoot>,
 }
 
 impl TrxEffects {
@@ -338,14 +336,13 @@ impl TrxEffects {
             index_undo: IndexUndoLogs::empty(),
             redo: RedoLogs::default(),
             gc_row_pages: Vec::new(),
-            old_table_root: None,
         }
     }
 
     /// Returns whether this transaction needs a recovery-visible log record.
     ///
     /// Durability is the persistent timestamp carrier used by recovery. Runtime
-    /// effects such as undo cleanup, row-page GC, and retained table roots must
+    /// effects such as undo cleanup and row-page GC must
     /// not manufacture empty redo records just to enter group commit.
     #[inline]
     pub(crate) fn require_durability(&self) -> bool {
@@ -364,7 +361,6 @@ impl TrxEffects {
             || !self.row_undo.is_empty()
             || !self.index_undo.is_empty()
             || !self.gc_row_pages.is_empty()
-            || self.old_table_root.is_some()
     }
 
     /// Returns whether transaction effects are logically readonly.
@@ -395,22 +391,6 @@ impl TrxEffects {
     #[inline]
     pub(crate) fn extend_gc_row_pages(&mut self, pages: Vec<PageID>) {
         self.gc_row_pages.extend(pages);
-    }
-
-    /// Attach one swapped user-table root to this transaction for GC-horizon retention.
-    ///
-    /// Checkpoint transactions call this after publishing a new table-file root
-    /// so the replaced root remains alive until the committed transaction is
-    /// purged. A transaction may retain at most one table root.
-    #[inline]
-    pub(crate) fn retain_old_table_root(&mut self, old_root: OldRoot) -> Result<()> {
-        if self.old_table_root.is_some() {
-            return Err(Report::new(OperationError::OldTableRootAlreadyRetained)
-                .attach("retain old table root: transaction effects already hold one old root")
-                .into());
-        }
-        self.old_table_root = Some(old_root);
-        Ok(())
     }
 
     /// Merges one successful statement's effects into this transaction.
@@ -458,14 +438,11 @@ impl TrxEffects {
 
     /// Moves transaction effects into a prepared transaction payload.
     #[inline]
-    pub(crate) fn take_payload_parts(
-        &mut self,
-    ) -> (RowUndoLogs, IndexUndoLogs, Vec<PageID>, Option<OldRoot>) {
+    pub(crate) fn take_payload_parts(&mut self) -> (RowUndoLogs, IndexUndoLogs, Vec<PageID>) {
         (
             mem::take(&mut self.row_undo),
             mem::take(&mut self.index_undo),
             mem::take(&mut self.gc_row_pages),
-            self.old_table_root.take(),
         )
     }
 
@@ -476,7 +453,6 @@ impl TrxEffects {
         self.row_undo = RowUndoLogs::empty();
         self.index_undo = IndexUndoLogs::empty();
         self.gc_row_pages.clear();
-        self.old_table_root.take();
     }
 
     /// Asserts that all transaction effects have been consumed or cleared.
@@ -488,10 +464,6 @@ impl TrxEffects {
         assert!(
             self.gc_row_pages.is_empty(),
             "gc row pages should be cleared"
-        );
-        assert!(
-            self.old_table_root.is_none(),
-            "old table root should be cleared"
         );
     }
 }
@@ -985,16 +957,6 @@ impl ActiveTrx {
         self.effects.extend_gc_row_pages(pages);
     }
 
-    /// Attach one swapped user-table root to this transaction for GC-horizon retention.
-    ///
-    /// Checkpoint transactions call this after publishing a new table-file root
-    /// so the replaced root remains alive until the committed transaction is
-    /// purged. A transaction may retain at most one table root.
-    #[inline]
-    pub(crate) fn retain_old_table_root(&mut self, old_root: OldRoot) -> Result<()> {
-        self.effects.retain_old_table_root(old_root)
-    }
-
     /// Marks the attached session as rolled back without detaching it.
     #[inline]
     pub(crate) fn finish_session_rollback(&mut self) {
@@ -1033,7 +995,6 @@ impl ActiveTrx {
                     row_undo: RowUndoLogs::empty(),
                     index_undo: IndexUndoLogs::empty(),
                     gc_row_pages: Vec::new(),
-                    old_table_root: None,
                 }),
                 session: self.ctx.take_session(),
                 lock_manager,
@@ -1049,8 +1010,7 @@ impl ActiveTrx {
         } else {
             None
         };
-        let (row_undo, index_undo, gc_row_pages, old_table_root) =
-            self.effects.take_payload_parts();
+        let (row_undo, index_undo, gc_row_pages) = self.effects.take_payload_parts();
         let lock_manager = self.lock_manager_guard();
         Ok(PreparedTrx {
             redo_bin,
@@ -1062,7 +1022,6 @@ impl ActiveTrx {
                 row_undo,
                 index_undo,
                 gc_row_pages,
-                old_table_root,
             }),
             session: self.ctx.take_session(),
             lock_manager,
@@ -1149,17 +1108,13 @@ pub struct PreparedTrxPayload {
     row_undo: RowUndoLogs,
     index_undo: IndexUndoLogs,
     gc_row_pages: Vec<PageID>,
-    old_table_root: Option<OldRoot>,
 }
 
 impl PreparedTrxPayload {
     /// Returns whether this payload has runtime effects that require ordered commit.
     #[inline]
     fn require_ordered_commit(&self) -> bool {
-        !self.row_undo.is_empty()
-            || !self.index_undo.is_empty()
-            || !self.gc_row_pages.is_empty()
-            || self.old_table_root.is_some()
+        !self.row_undo.is_empty() || !self.index_undo.is_empty() || !self.gc_row_pages.is_empty()
     }
 }
 
@@ -1220,7 +1175,6 @@ impl PreparedTrx {
                 row_undo,
                 mut index_undo,
                 gc_row_pages,
-                old_table_root,
             }) => {
                 // Once we get a concrete CTS, we won't rollback this transaction.
                 // So we convert IndexUndo to IndexGC, and let purge threads to
@@ -1236,7 +1190,6 @@ impl PreparedTrx {
                         row_undo,
                         index_gc,
                         gc_row_pages,
-                        old_table_root,
                     }),
                     session: self.session.take(),
                     lock_manager: self.lock_manager.take(),
@@ -1291,17 +1244,13 @@ pub struct PrecommitTrxPayload {
     pub row_undo: RowUndoLogs,
     pub index_gc: Vec<IndexPurgeEntry>,
     pub gc_row_pages: Vec<PageID>,
-    old_table_root: Option<OldRoot>,
 }
 
 impl PrecommitTrxPayload {
     /// Returns whether this payload has runtime effects that require ordered commit.
     #[inline]
     fn require_ordered_commit(&self) -> bool {
-        !self.row_undo.is_empty()
-            || !self.index_gc.is_empty()
-            || !self.gc_row_pages.is_empty()
-            || self.old_table_root.is_some()
+        !self.row_undo.is_empty() || !self.index_gc.is_empty() || !self.gc_row_pages.is_empty()
     }
 }
 
@@ -1364,7 +1313,6 @@ impl PrecommitTrx {
                 row_undo,
                 index_gc,
                 gc_row_pages,
-                old_table_root,
             }) => {
                 // For user transaction, we need to notify readers that this transaction is committed,
                 // and readers can continue their work.
@@ -1388,7 +1336,6 @@ impl PrecommitTrx {
                         row_undo,
                         index_gc,
                         gc_row_pages,
-                        old_table_root,
                     }),
                 }
             }
@@ -1446,7 +1393,6 @@ pub struct CommittedTrxPayload {
     pub row_undo: RowUndoLogs,
     pub index_gc: Vec<IndexPurgeEntry>,
     pub gc_row_pages: Vec<PageID>,
-    old_table_root: Option<OldRoot>,
 }
 
 pub struct CommittedTrx {
@@ -1480,18 +1426,6 @@ impl CommittedTrx {
     pub fn gc_row_pages(&self) -> Option<&[PageID]> {
         self.payload.as_ref().map(|p| &p.gc_row_pages[..])
     }
-
-    /// Release the retained table root after this committed transaction reaches purge.
-    ///
-    /// Purge calls this only after the transaction's commit timestamp is below
-    /// the active-snapshot horizon, making the previous table-file root
-    /// unreachable by active readers.
-    #[inline]
-    pub(crate) fn release_old_table_root(&mut self) {
-        if let Some(payload) = self.payload.as_mut() {
-            payload.old_table_root.take();
-        }
-    }
 }
 
 #[cfg(test)]
@@ -1502,8 +1436,9 @@ pub(crate) mod tests {
     use crate::catalog::{ColumnAttributes, ColumnSpec, TableMetadata};
     use crate::conf::{EngineConfig, EvictableBufferPoolConfig, TrxSysConfig};
     use crate::engine::Engine;
+    use crate::error::OperationError;
     use crate::file::cow_file::tests::old_root_drop_count;
-    use crate::file::table_file::MutableTableFile;
+    use crate::file::table_file::{MutableTableFile, OldRoot};
     use crate::lock::tests::{debug_snapshot, try_acquire, try_acquire_grouped};
     use crate::row::ops::SelectKey;
     use crate::table::test_user_table_id;
@@ -1657,7 +1592,6 @@ pub(crate) mod tests {
             assert!(trx.effects.index_undo.is_empty());
             assert!(trx.effects.redo.is_empty());
             assert!(trx.effects.gc_row_pages.is_empty());
-            assert!(trx.effects.old_table_root.is_none());
 
             trx.discard_after_fatal_rollback();
         });
@@ -1682,7 +1616,6 @@ pub(crate) mod tests {
             assert!(payload.row_undo.is_empty());
             assert!(payload.index_undo.is_empty());
             assert!(payload.gc_row_pages.is_empty());
-            assert!(payload.old_table_root.is_none());
 
             prepared.payload.take();
             prepared.session.take();
@@ -1717,7 +1650,6 @@ pub(crate) mod tests {
             assert_eq!(payload.row_undo.len(), 1);
             assert_eq!(payload.index_undo.len(), 1);
             assert!(payload.gc_row_pages.is_empty());
-            assert!(payload.old_table_root.is_none());
 
             prepared.redo_bin.take();
             prepared.payload.take();
@@ -2135,135 +2067,34 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn test_old_table_root_moves_to_committed_payload_and_releases_explicitly() {
+    fn test_published_table_root_retention_waits_for_fence_horizon() {
         smol::block_on(async {
-            let (_temp_dir, engine) = test_engine("redo_old_root_payload").await;
+            let (_temp_dir, engine) = test_engine("published_root_retention_fence").await;
             let (old_root_ptr, old_root) = swapped_old_root(&engine, 91_001).await;
             let drop_count_before = old_root_drop_count(old_root_ptr);
 
-            let session_state = test_session_state(&engine);
-            let mut trx = ActiveTrx::new(session_state, MIN_ACTIVE_TRX_ID + 10, 10, 0, 0);
-            trx.retain_old_table_root(old_root).unwrap();
-            assert!(!trx.readonly());
-
-            let prepared = trx.prepare().unwrap();
-            assert!(prepared.redo_bin.is_none());
-            assert!(!prepared.require_durability());
-            assert!(prepared.require_ordered_commit());
-            assert!(prepared.payload.as_ref().unwrap().old_table_root.is_some());
-
-            let precommit = prepared.fill_cts(20);
-            assert!(!precommit.require_durability());
-            assert!(precommit.require_ordered_commit());
-            assert!(precommit.payload.as_ref().unwrap().old_table_root.is_some());
-
-            let mut committed = precommit.commit();
-            assert_eq!(old_root_drop_count(old_root_ptr), drop_count_before);
-            assert!(committed.payload.as_ref().unwrap().old_table_root.is_some());
-
-            committed.release_old_table_root();
-            assert_eq!(old_root_drop_count(old_root_ptr), drop_count_before + 1);
-        });
-    }
-
-    #[test]
-    fn test_effects_only_commit_uses_ordered_barrier_without_log_bytes() {
-        smol::block_on(async {
-            let (_temp_dir, engine) = test_engine("redo_effects_only_ordered_commit").await;
-            let (_old_root_ptr, old_root) = swapped_old_root(&engine, 91_006).await;
-            let stats_before = engine.trx_sys.trx_sys_stats();
-
             let mut session = engine.try_new_session().unwrap();
-            let mut trx = session.try_begin_trx().unwrap().unwrap();
-            trx.retain_old_table_root(old_root).unwrap();
-            assert!(!trx.require_durability());
-            assert!(trx.require_ordered_commit());
+            let read_trx = session.try_begin_trx().unwrap().unwrap();
+            engine.trx_sys.retain_published_table_root(Some(old_root));
+            engine.trx_sys.request_table_root_retention_purge();
 
-            let cts = trx.commit().await.unwrap();
-            assert!(cts >= MIN_SNAPSHOT_TS);
-            assert!(!session.in_trx());
-
+            for _ in 0..10 {
+                smol::Timer::after(std::time::Duration::from_millis(10)).await;
+                assert_eq!(
+                    old_root_drop_count(old_root_ptr),
+                    drop_count_before,
+                    "old root must stay retained while an earlier transaction is active"
+                );
+            }
+            read_trx.commit().await.unwrap();
+            engine.trx_sys.request_table_root_retention_purge();
             for _ in 0..100 {
-                let stats_after = engine.trx_sys.trx_sys_stats();
-                if stats_after.commit_count > stats_before.commit_count {
-                    assert_eq!(stats_after.log_bytes, stats_before.log_bytes);
-                    assert_eq!(stats_after.sync_count, stats_before.sync_count);
-                    assert!(stats_after.trx_count > stats_before.trx_count);
+                if old_root_drop_count(old_root_ptr) > drop_count_before {
                     return;
                 }
                 smol::Timer::after(std::time::Duration::from_millis(10)).await;
             }
-            panic!("effects-only commit stats were not updated before timeout");
-        });
-    }
-
-    #[test]
-    fn test_old_table_root_retain_rejects_duplicate_with_dedicated_error() {
-        smol::block_on(async {
-            let (_temp_dir, engine) = test_engine("redo_old_root_duplicate").await;
-            let (first_old_root_ptr, first_old_root) = swapped_old_root(&engine, 91_004).await;
-            let (second_old_root_ptr, second_old_root) = swapped_old_root(&engine, 91_005).await;
-            let first_drop_count_before = old_root_drop_count(first_old_root_ptr);
-            let second_drop_count_before = old_root_drop_count(second_old_root_ptr);
-
-            let session_state = test_session_state(&engine);
-            let mut trx = ActiveTrx::new(session_state, MIN_ACTIVE_TRX_ID + 12, 12, 0, 0);
-            trx.retain_old_table_root(first_old_root).unwrap();
-
-            let err = trx.retain_old_table_root(second_old_root).unwrap_err();
-            assert_eq!(
-                err.operation_error(),
-                Some(OperationError::OldTableRootAlreadyRetained)
-            );
-            assert_eq!(
-                old_root_drop_count(first_old_root_ptr),
-                first_drop_count_before
-            );
-            assert_eq!(
-                old_root_drop_count(second_old_root_ptr),
-                second_drop_count_before + 1
-            );
-
-            trx.discard_after_fatal_rollback();
-            assert_eq!(
-                old_root_drop_count(first_old_root_ptr),
-                first_drop_count_before + 1
-            );
-        });
-    }
-
-    #[test]
-    fn test_old_table_root_drops_on_active_rollback() {
-        smol::block_on(async {
-            let (_temp_dir, engine) = test_engine("redo_old_root_active_rollback").await;
-            let (old_root_ptr, old_root) = swapped_old_root(&engine, 91_002).await;
-            let drop_count_before = old_root_drop_count(old_root_ptr);
-
-            let mut session = engine.try_new_session().unwrap();
-            let mut trx = session.try_begin_trx().unwrap().unwrap();
-            trx.retain_old_table_root(old_root).unwrap();
-            trx.rollback().await.unwrap();
-
-            assert_eq!(old_root_drop_count(old_root_ptr), drop_count_before + 1);
-        });
-    }
-
-    #[test]
-    fn test_old_table_root_drops_on_precommit_abort() {
-        smol::block_on(async {
-            let (_temp_dir, engine) = test_engine("redo_old_root_precommit_abort").await;
-            let (old_root_ptr, old_root) = swapped_old_root(&engine, 91_003).await;
-            let drop_count_before = old_root_drop_count(old_root_ptr);
-
-            let session_state = test_session_state(&engine);
-            let mut trx = ActiveTrx::new(session_state, MIN_ACTIVE_TRX_ID + 11, 11, 0, 0);
-            trx.retain_old_table_root(old_root).unwrap();
-
-            let prepared = trx.prepare().unwrap();
-            let precommit = prepared.fill_cts(21);
-            precommit.abort();
-
-            assert_eq!(old_root_drop_count(old_root_ptr), drop_count_before + 1);
+            panic!("old root was not released after the fence crossed the purge horizon");
         });
     }
 }

@@ -1,13 +1,11 @@
 use crate::buffer::page::VersionedPageID;
 use crate::buffer::{BufferPool, PoolGuards, PoolRole};
 use crate::catalog::{ColumnObject, IndexColumnObject, IndexObject, TableMetadata, TableObject};
-use crate::catalog::{IndexSpec, TableID, TableSpec, is_user_obj_id};
+use crate::catalog::{IndexNo, IndexSpec, TableID, TableSpec, is_user_obj_id};
 use crate::engine::EngineRef;
-use crate::error::{FatalError, InternalError, OperationError, Result};
+use crate::error::{Error, FatalError, InternalError, OperationError, Result};
 use crate::index::BlockIndex;
-use crate::lock::{
-    FreshLockGuard, LockGrant, LockManager, LockMode, LockOwner, LockOwnerGroup, LockResource,
-};
+use crate::lock::{FreshLockGuard, LockManager, LockMode, LockOwner, LockOwnerGroup, LockResource};
 use crate::row::RowID;
 use crate::table::Table;
 use crate::trx::redo::DDLRedo;
@@ -109,6 +107,9 @@ impl Session {
         }
 
         let engine = self.state.engine().clone();
+        // Keep this guard alive through runtime catalog publication so table-id
+        // allocation, catalog DML, file publish, and runtime insertion remain
+        // one namespace-serialized create-table sequence.
         let _namespace_lock = self
             .acquire_catalog_namespace_lock(engine.lock_manager())
             .await?;
@@ -279,6 +280,16 @@ impl Session {
         Ok(table_id)
     }
 
+    /// Build and publish a new secondary index for an existing user table.
+    #[inline]
+    pub async fn create_index(
+        &mut self,
+        table_id: TableID,
+        index_spec: IndexSpec,
+    ) -> Result<IndexNo> {
+        crate::catalog::create_index_for_session(self, table_id, index_spec).await
+    }
+
     /// Logically drop an existing user table.
     #[inline]
     pub async fn drop_table(&mut self, table_id: TableID) -> Result<()> {
@@ -291,13 +302,24 @@ impl Session {
         let engine = self.state.engine().clone();
         let owner = LockOwner::Session(self.id());
         let lock_manager = engine.lock_manager();
+        // Keep this guard alive until runtime removal is complete so table
+        // identity removal remains namespace-serialized.
         let _namespace_lock = self.acquire_catalog_namespace_lock(lock_manager).await?;
 
         let table = self.validated_drop_table_target(&engine, table_id).await?;
-        reject_drop_table_explicit_session_lock(lock_manager, table_id, owner)?;
-        let mut table_locks = self
-            .acquire_drop_table_locks(lock_manager, table_id, owner)
-            .await?;
+        crate::catalog::reject_table_ddl_explicit_session_lock(
+            lock_manager,
+            table_id,
+            owner,
+            "drop table",
+        )?;
+        let mut table_locks = crate::catalog::acquire_table_ddl_locks(
+            lock_manager,
+            table_id,
+            owner,
+            LockOwnerGroup::Session(self.id()),
+        )
+        .await?;
         engine.trx_sys.ensure_runtime_healthy()?;
 
         let mut trx = match self.try_begin_trx() {
@@ -420,38 +442,6 @@ impl Session {
         })
     }
 
-    async fn acquire_drop_table_locks<'a>(
-        &self,
-        lock_manager: &'a LockManager,
-        table_id: TableID,
-        owner: LockOwner,
-    ) -> Result<ScopedDropTableLocks<'a>> {
-        let owner_group = LockOwnerGroup::Session(self.id());
-        let metadata_resource = LockResource::TableMetadata(table_id);
-        let metadata_grant = lock_manager
-            .acquire_grouped_with_grant(metadata_resource, LockMode::Exclusive, owner, owner_group)
-            .await?;
-        let mut metadata_guard =
-            FreshLockGuard::new(lock_manager, metadata_resource, owner, metadata_grant);
-
-        let data_resource = LockResource::TableData(table_id);
-        let data_grant = lock_manager
-            .acquire_grouped_with_grant(data_resource, LockMode::Exclusive, owner, owner_group)
-            .await?;
-        if let Some(guard) = metadata_guard.as_mut() {
-            guard.disarm();
-        }
-
-        Ok(ScopedDropTableLocks {
-            lock_manager,
-            table_id,
-            owner,
-            metadata_fresh: metadata_grant == LockGrant::Fresh,
-            data_fresh: data_grant == LockGrant::Fresh,
-            fail_waiters: None,
-        })
-    }
-
     async fn validated_drop_table_target(
         &self,
         engine: &EngineRef,
@@ -485,36 +475,6 @@ impl Session {
     }
 }
 
-#[inline]
-fn reject_drop_table_explicit_session_lock(
-    lock_manager: &LockManager,
-    table_id: TableID,
-    owner: LockOwner,
-) -> Result<()> {
-    // `drop_table` uses the session owner for scoped DDL locks. If an explicit
-    // session table lock already exists, reusing that owner would become a
-    // same-owner conversion and scoped cleanup could not distinguish the DDL
-    // lock from the user-held session lock.
-    let metadata_locked = lock_manager.owner_holds(
-        LockResource::TableMetadata(table_id),
-        owner,
-        LockMode::Shared,
-    );
-    let data_locked = lock_manager.owner_holds(
-        LockResource::TableData(table_id),
-        owner,
-        LockMode::IntentShared,
-    );
-    if !metadata_locked && !data_locked {
-        return Ok(());
-    }
-    Err(Report::new(OperationError::LockOwnerGroupConflict)
-        .attach(format!(
-            "drop table while session owns explicit table lock: table_id={table_id}, owner={owner:?}"
-        ))
-        .into())
-}
-
 struct ScopedSessionLock<'a> {
     lock_manager: &'a LockManager,
     resource: LockResource,
@@ -525,46 +485,6 @@ impl Drop for ScopedSessionLock<'_> {
     #[inline]
     fn drop(&mut self) {
         self.lock_manager.release(self.resource, self.owner);
-    }
-}
-
-struct ScopedDropTableLocks<'a> {
-    lock_manager: &'a LockManager,
-    table_id: TableID,
-    owner: LockOwner,
-    metadata_fresh: bool,
-    data_fresh: bool,
-    fail_waiters: Option<OperationError>,
-}
-
-impl ScopedDropTableLocks<'_> {
-    #[inline]
-    fn fail_waiters_on_release(&mut self, error: OperationError) {
-        self.fail_waiters = Some(error);
-    }
-}
-
-impl Drop for ScopedDropTableLocks<'_> {
-    #[inline]
-    fn drop(&mut self) {
-        if self.data_fresh {
-            let resource = LockResource::TableData(self.table_id);
-            if let Some(error) = self.fail_waiters {
-                self.lock_manager
-                    .release_and_fail_waiters(resource, self.owner, error);
-            } else {
-                self.lock_manager.release(resource, self.owner);
-            }
-        }
-        if self.metadata_fresh {
-            let resource = LockResource::TableMetadata(self.table_id);
-            if let Some(error) = self.fail_waiters {
-                self.lock_manager
-                    .release_and_fail_waiters(resource, self.owner, error);
-            } else {
-                self.lock_manager.release(resource, self.owner);
-            }
-        }
     }
 }
 
@@ -688,7 +608,7 @@ fn poison_drop_table_after_gate_with_source(
     engine: &EngineRef,
     table_id: TableID,
     operation: &'static str,
-    source: crate::error::Error,
+    source: Error,
 ) -> Report<FatalError> {
     let poison = poison_drop_table_after_gate(engine, table_id, operation);
     source

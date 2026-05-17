@@ -10,7 +10,7 @@ use crate::thread;
 use crate::trx::group::Commit;
 use crate::trx::log::{LOG_HEADER_PAGES, LogPartition};
 use crate::trx::log_replay::MmapLogReader;
-use crate::trx::purge::{DroppedTableFileDeleteItem, DroppedTableGcQueues, GC, Purge};
+use crate::trx::purge::{DroppedTableFileDeleteItem, DroppedTableQueue, GC, Purge, TableRootQueue};
 use crate::trx::redo::RedoLogs;
 use crate::trx::sys_trx::SysTrx;
 use crate::trx::{
@@ -94,8 +94,10 @@ pub struct TransactionSystem {
     pub(super) table_fs: CachePadded<QuiescentGuard<FileSystem>>,
     /// Wakeup channel for purge coordination.
     pub(super) purge_tx: CachePadded<Sender<Purge>>,
+    /// Swapped table roots retained until post-publish readers drain.
+    pub(super) table_roots: CachePadded<Mutex<TableRootQueue>>,
     /// Dropped table runtime and file cleanup queues.
-    pub(super) dropped_table_gc: CachePadded<Mutex<DroppedTableGcQueues>>,
+    pub(super) dropped_tables: CachePadded<Mutex<DroppedTableQueue>>,
     /// Storage-runtime poison flag for fatal storage background or durability failures.
     storage_poisoned: CachePadded<AtomicBool>,
     /// First fatal storage reason that poisoned runtime admission.
@@ -134,9 +136,10 @@ impl TransactionSystem {
             catalog: CachePadded::new(catalog),
             table_fs: CachePadded::new(table_fs),
             purge_tx: CachePadded::new(purge_tx),
-            dropped_table_gc: CachePadded::new(Mutex::new(
-                DroppedTableGcQueues::from_file_deletes(initial_file_deletes),
-            )),
+            table_roots: CachePadded::new(Mutex::new(TableRootQueue::default())),
+            dropped_tables: CachePadded::new(Mutex::new(DroppedTableQueue::from_file_deletes(
+                initial_file_deletes,
+            ))),
             storage_poisoned: CachePadded::new(AtomicBool::new(false)),
             storage_poison_err: CachePadded::new(Mutex::new(None)),
         }
