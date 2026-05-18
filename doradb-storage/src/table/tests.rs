@@ -8355,6 +8355,74 @@ fn test_runtime_layout_install_retires_removed_index_after_old_snapshot_drops() 
 }
 
 #[test]
+fn test_dropped_unique_index_purge_delete_is_noop() {
+    smol::block_on(async {
+        let sys = TestSys::new_lightweight_evictable().await;
+        let mut session = sys.try_new_session().unwrap();
+        let row_id = insert_one_row(
+            &sys.table,
+            &mut session,
+            vec![Val::from(1i32), Val::from("name")],
+        )
+        .await;
+
+        session.drop_index(sys.table.table_id(), 0).await.unwrap();
+
+        let deleted = sys
+            .table
+            .accessor_with_layout(sys.table.layout_snapshot())
+            .delete_index(
+                session.pool_guards(),
+                &single_key(1i32),
+                row_id,
+                true,
+                MAX_SNAPSHOT_TS,
+            )
+            .await
+            .unwrap();
+        assert!(!deleted);
+    })
+}
+
+#[test]
+fn test_dropped_non_unique_index_purge_delete_is_noop() {
+    smol::block_on(async {
+        let sys = TestSys::new_lightweight_evictable().await;
+        let mut session = sys.try_new_session().unwrap();
+        let table_id = sys.table.table_id();
+        let row_id = insert_one_row(
+            &sys.table,
+            &mut session,
+            vec![Val::from(1i32), Val::from("name")],
+        )
+        .await;
+        let index_no = session
+            .create_index(
+                table_id,
+                IndexSpec::new(vec![IndexKey::new(1)], IndexAttributes::empty()),
+            )
+            .await
+            .unwrap();
+
+        session.drop_index(table_id, index_no).await.unwrap();
+
+        let deleted = sys
+            .table
+            .accessor_with_layout(sys.table.layout_snapshot())
+            .delete_index(
+                session.pool_guards(),
+                &SelectKey::new(index_no as usize, vec![Val::from("name")]),
+                row_id,
+                false,
+                MAX_SNAPSHOT_TS,
+            )
+            .await
+            .unwrap();
+        assert!(!deleted);
+    })
+}
+
+#[test]
 fn test_runtime_layout_install_rejects_shrinking_index_slots() {
     smol::block_on(async {
         let sys = TestSys::new_lightweight_evictable().await;

@@ -143,6 +143,8 @@ pub(crate) enum OperationError {
     TableDropping,
     #[error("table already exists")]
     TableAlreadyExists,
+    #[error("index not found")]
+    IndexNotFound,
     #[error("not supported")]
     NotSupported,
     #[error("duplicate key")]

@@ -252,6 +252,117 @@ pub(crate) async fn create_index_for_session(
     Ok(index_no)
 }
 
+/// Drop an active secondary index for a user-table session request.
+pub(crate) async fn drop_index_for_session(
+    session: &mut Session,
+    table_id: TableID,
+    index_no: IndexNo,
+) -> Result<()> {
+    if session.in_trx() {
+        return Err(Report::new(OperationError::NotSupported)
+            .attach("implicit commit due to DDL")
+            .into());
+    }
+
+    let engine = session.engine().clone();
+    let owner = LockOwner::Session(session.id());
+    let owner_group = LockOwnerGroup::Session(session.id());
+    let lock_manager = engine.lock_manager();
+
+    precheck_drop_index_target(session, &engine, table_id).await?;
+    reject_table_ddl_explicit_session_lock(lock_manager, table_id, owner, "drop index")?;
+    let _table_locks = acquire_table_ddl_locks(lock_manager, table_id, owner, owner_group).await?;
+    let table = validated_drop_index_target(session, &engine, table_id).await?;
+    engine.trx_sys.ensure_runtime_healthy()?;
+    table.check_foreground_live("drop index")?;
+
+    let _table_metadata_lease = table.begin_metadata_change().await?;
+    let _catalog_metadata_lease = engine.catalog().begin_metadata_change().await;
+
+    let old_layout = table.layout_snapshot();
+    let old_generation = old_layout.generation();
+    let old_metadata = old_layout.metadata();
+    let index_no_usize = usize::from(index_no);
+    let old_index_spec = old_metadata
+        .index_spec(index_no_usize)
+        .ok_or_else(|| drop_index_not_found(table_id, index_no, "inactive metadata slot"))?
+        .clone();
+    old_layout.secondary_index(index_no_usize)?;
+
+    let active_root = table.file().active_root_unchecked().clone();
+    validate_drop_index_root_shape(table_id, index_no_usize, &active_root, old_metadata)?;
+    let new_metadata = Arc::new(old_metadata.try_without_index(index_no)?);
+
+    let mut secondary_index_roots = active_root.secondary_index_roots.clone();
+    secondary_index_roots[index_no_usize] = SUPER_BLOCK_ID;
+    let mut mutable_file =
+        MutableTableFile::fork(table.file(), engine.table_fs.background_writes());
+    mutable_file.replace_metadata_and_secondary_index_roots(
+        Arc::clone(&new_metadata),
+        secondary_index_roots,
+    )?;
+
+    let new_layout = build_dropped_index_runtime_layout(
+        table_id,
+        &old_layout,
+        Arc::clone(&new_metadata),
+        index_no_usize,
+    )?;
+
+    let trx = match session.try_begin_trx() {
+        Ok(Some(trx)) => trx,
+        Ok(None) => unreachable!("drop_index requires idle session"),
+        Err(err) => return Err(err),
+    };
+    let mut builder = DropIndexBuilder::new(&engine, table_id, index_no, trx);
+    builder.stage_layout(new_layout);
+    builder.execute_catalog_update(&old_index_spec).await?;
+    let drop_cts = builder.commit_catalog().await?;
+
+    let root_publish = mutable_file.commit(drop_cts, false).await;
+    let (_table_file, old_root) = match root_publish {
+        Ok(res) => res,
+        Err(err) => {
+            return builder
+                .cleanup_after_catalog_commit_failure("table root publish", err)
+                .await;
+        }
+    };
+    engine.trx_sys.retain_published_table_root(old_root);
+
+    let new_layout = match builder.take_layout_for_install() {
+        Ok(layout) => layout,
+        Err(err) => {
+            return builder
+                .cleanup_after_catalog_commit_failure("runtime layout install", err)
+                .await;
+        }
+    };
+    if let Err(err) = table.install_runtime_layout(old_generation, new_layout) {
+        return builder
+            .cleanup_after_catalog_commit_failure("runtime layout install", err)
+            .await;
+    }
+    builder.mark_installed();
+    drop(old_layout);
+
+    if let Err(err) = table
+        .cleanup_retired_secondary_indexes(session.pool_guards())
+        .await
+    {
+        return Err(poison_drop_index_after_catalog_commit_with_source(
+            &engine,
+            table_id,
+            index_no,
+            "retired secondary-index cleanup",
+            err,
+        )
+        .into());
+    }
+
+    Ok(())
+}
+
 async fn precheck_create_index_target(
     session: &Session,
     engine: &EngineRef,
@@ -287,6 +398,46 @@ async fn validated_create_index_target(
     {
         return Err(Report::new(OperationError::TableNotFound)
             .attach(format!("create index catalog lookup: table_id={table_id}"))
+            .into());
+    }
+    Ok(table)
+}
+
+async fn precheck_drop_index_target(
+    session: &Session,
+    engine: &EngineRef,
+    table_id: TableID,
+) -> Result<()> {
+    let _ = validated_drop_index_target(session, engine, table_id).await?;
+    Ok(())
+}
+
+async fn validated_drop_index_target(
+    session: &Session,
+    engine: &EngineRef,
+    table_id: TableID,
+) -> Result<Arc<Table>> {
+    if !is_user_obj_id(table_id) {
+        return Err(Report::new(OperationError::TableNotFound)
+            .attach(format!(
+                "drop index requires user table id: table_id={table_id}"
+            ))
+            .into());
+    }
+    let table = engine
+        .catalog()
+        .validate_user_table_live(table_id, "drop index")
+        .await?;
+    if engine
+        .catalog()
+        .storage
+        .tables()
+        .find_uncommitted_by_id(session.pool_guards(), table_id)
+        .await?
+        .is_none()
+    {
+        return Err(Report::new(OperationError::TableNotFound)
+            .attach(format!("drop index catalog lookup: table_id={table_id}"))
             .into());
     }
     Ok(table)
@@ -508,6 +659,149 @@ impl Drop for CreateIndexBuilder<'_> {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DropIndexBuildPhase {
+    LayoutStaged,
+    CatalogCommitted,
+    Installed,
+    Aborted,
+}
+
+struct DropIndexBuilder<'a> {
+    engine: &'a EngineRef,
+    table_id: TableID,
+    index_no: IndexNo,
+    phase: DropIndexBuildPhase,
+    trx: Option<ActiveTrx>,
+    new_layout: Option<TableRuntimeLayout>,
+}
+
+impl<'a> DropIndexBuilder<'a> {
+    #[inline]
+    fn new(engine: &'a EngineRef, table_id: TableID, index_no: IndexNo, trx: ActiveTrx) -> Self {
+        Self {
+            engine,
+            table_id,
+            index_no,
+            phase: DropIndexBuildPhase::LayoutStaged,
+            trx: Some(trx),
+            new_layout: None,
+        }
+    }
+
+    #[inline]
+    fn stage_layout(&mut self, layout: TableRuntimeLayout) {
+        debug_assert_eq!(self.phase, DropIndexBuildPhase::LayoutStaged);
+        debug_assert!(self.new_layout.is_none());
+        self.new_layout = Some(layout);
+    }
+
+    async fn execute_catalog_update(&mut self, old_index_spec: &IndexSpec) -> Result<()> {
+        debug_assert_eq!(self.phase, DropIndexBuildPhase::LayoutStaged);
+        let Some(trx) = self.trx.as_mut() else {
+            let err =
+                drop_index_internal("drop index transaction is missing before catalog update");
+            return self.rollback_before_catalog_commit(err).await;
+        };
+        let res = execute_drop_index_catalog_update(
+            self.engine,
+            trx,
+            self.table_id,
+            self.index_no,
+            old_index_spec,
+        )
+        .await;
+        match res {
+            Ok(()) => Ok(()),
+            Err(err) => self.rollback_before_catalog_commit(err).await,
+        }
+    }
+
+    async fn commit_catalog(&mut self) -> Result<TrxID> {
+        debug_assert_eq!(self.phase, DropIndexBuildPhase::LayoutStaged);
+        let Some(trx) = self.trx.take() else {
+            self.new_layout = None;
+            self.phase = DropIndexBuildPhase::Aborted;
+            return Err(drop_index_internal(
+                "drop index transaction is missing before commit",
+            ));
+        };
+        match trx.commit().await {
+            Ok(cts) => {
+                self.phase = DropIndexBuildPhase::CatalogCommitted;
+                Ok(cts)
+            }
+            Err(err) => {
+                self.new_layout = None;
+                self.phase = DropIndexBuildPhase::Aborted;
+                Err(err)
+            }
+        }
+    }
+
+    fn take_layout_for_install(&mut self) -> Result<TableRuntimeLayout> {
+        debug_assert_eq!(self.phase, DropIndexBuildPhase::CatalogCommitted);
+        self.new_layout.take().ok_or_else(|| {
+            drop_index_internal("drop index runtime layout is missing before install")
+        })
+    }
+
+    #[inline]
+    fn mark_installed(&mut self) {
+        debug_assert_eq!(self.phase, DropIndexBuildPhase::CatalogCommitted);
+        self.phase = DropIndexBuildPhase::Installed;
+    }
+
+    async fn rollback_before_catalog_commit<T>(&mut self, err: Error) -> Result<T> {
+        self.new_layout = None;
+        let rollback_res = self.rollback_active().await;
+        self.phase = DropIndexBuildPhase::Aborted;
+        rollback_res?;
+        Err(err)
+    }
+
+    async fn cleanup_after_catalog_commit_failure<T>(
+        &mut self,
+        operation: &'static str,
+        source: Error,
+    ) -> Result<T> {
+        self.new_layout = None;
+        self.phase = DropIndexBuildPhase::Aborted;
+        Err(poison_drop_index_after_catalog_commit_with_source(
+            self.engine,
+            self.table_id,
+            self.index_no,
+            operation,
+            source,
+        )
+        .into())
+    }
+
+    async fn rollback_active(&mut self) -> Result<()> {
+        let Some(trx) = self.trx.take() else {
+            return Ok(());
+        };
+        if trx.engine().is_some() {
+            trx.rollback().await?;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for DropIndexBuilder<'_> {
+    #[inline]
+    fn drop(&mut self) {
+        debug_assert!(
+            matches!(
+                self.phase,
+                DropIndexBuildPhase::Installed | DropIndexBuildPhase::Aborted
+            ),
+            "drop index state dropped before terminal cleanup: {:?}",
+            self.phase
+        );
+    }
+}
+
 #[inline]
 fn create_index_duplicate_key(message: impl Into<String>) -> Error {
     Report::new(OperationError::DuplicateKey)
@@ -526,6 +820,22 @@ fn create_index_invalid_payload(message: impl Into<String>) -> Error {
 fn create_index_internal(message: impl Into<String>) -> Error {
     Report::new(InternalError::Generic)
         .attach(message.into())
+        .into()
+}
+
+#[inline]
+fn drop_index_internal(message: impl Into<String>) -> Error {
+    Report::new(InternalError::Generic)
+        .attach(message.into())
+        .into()
+}
+
+#[inline]
+fn drop_index_not_found(table_id: TableID, index_no: IndexNo, reason: &'static str) -> Error {
+    Report::new(OperationError::IndexNotFound)
+        .attach(format!(
+            "drop index target not found: table_id={table_id}, index_no={index_no}, reason={reason}"
+        ))
         .into()
 }
 
@@ -561,6 +871,53 @@ fn validate_create_index_root_shape(
             return Err(Report::new(DataIntegrityError::InvalidRootInvariant)
                 .attach(format!(
                     "create index inactive secondary-root slot is non-empty before sparse slot reuse: table_id={table_id}, index_no={index_no}, root_block_id={root}, expected_root_block_id={SUPER_BLOCK_ID}"
+                ))
+                .into());
+        }
+    }
+    Ok(())
+}
+
+#[inline]
+fn validate_drop_index_root_shape(
+    table_id: TableID,
+    index_no: usize,
+    active_root: &ActiveRoot,
+    metadata: &TableMetadata,
+) -> Result<()> {
+    if active_root.metadata.as_ref() != metadata {
+        return Err(Report::new(DataIntegrityError::InvalidRootInvariant)
+            .attach(format!(
+                "drop index root metadata mismatch: table_id={table_id}"
+            ))
+            .into());
+    }
+    let expected_slots = metadata.index_slot_count();
+    let actual_slots = active_root.secondary_index_roots.len();
+    if actual_slots != expected_slots {
+        return Err(Report::new(DataIntegrityError::InvalidRootInvariant)
+            .attach(format!(
+                "drop index secondary-root slot mismatch: table_id={table_id}, actual_slots={actual_slots}, expected_slots={expected_slots}"
+            ))
+            .into());
+    }
+    if metadata.index_spec(index_no).is_none() {
+        return Err(drop_index_not_found(
+            table_id,
+            index_no as IndexNo,
+            "inactive metadata slot",
+        ));
+    }
+    for (slot_no, root) in active_root
+        .secondary_index_roots
+        .iter()
+        .copied()
+        .enumerate()
+    {
+        if metadata.index_spec(slot_no).is_none() && root != SUPER_BLOCK_ID {
+            return Err(Report::new(DataIntegrityError::InvalidRootInvariant)
+                .attach(format!(
+                    "drop index inactive secondary-root slot is non-empty: table_id={table_id}, index_no={slot_no}, root_block_id={root}, expected_root_block_id={SUPER_BLOCK_ID}"
                 ))
                 .into());
         }
@@ -929,6 +1286,35 @@ fn build_created_index_runtime_layout(
     TableRuntimeLayout::new(generation, new_metadata, slots.into_boxed_slice())
 }
 
+fn build_dropped_index_runtime_layout(
+    table_id: TableID,
+    old_layout: &Arc<TableRuntimeLayout>,
+    new_metadata: Arc<TableMetadata>,
+    index_no: usize,
+) -> Result<TableRuntimeLayout> {
+    let generation = old_layout
+        .generation()
+        .checked_add(1)
+        .ok_or_else(|| drop_index_internal("table runtime layout generation overflow"))?;
+    let mut slots = old_layout.secondary_indexes().to_vec();
+    let Some(slot) = slots.get_mut(index_no) else {
+        return Err(drop_index_not_found(
+            table_id,
+            index_no as IndexNo,
+            "runtime slot out of range",
+        ));
+    };
+    if slot.is_none() {
+        return Err(drop_index_not_found(
+            table_id,
+            index_no as IndexNo,
+            "inactive runtime slot",
+        ));
+    }
+    *slot = None;
+    TableRuntimeLayout::new(generation, new_metadata, slots.into_boxed_slice())
+}
+
 async fn destroy_uninstalled_staged_index(
     index: Arc<SecondaryIndex<EvictableBufferPool>>,
     guards: &PoolGuards,
@@ -937,6 +1323,53 @@ async fn destroy_uninstalled_staged_index(
         return;
     };
     let _ = index.destroy(guards.index_guard()).await;
+}
+
+#[inline]
+async fn execute_drop_index_catalog_update(
+    engine: &EngineRef,
+    trx: &mut ActiveTrx,
+    table_id: TableID,
+    index_no: IndexNo,
+    old_index_spec: &IndexSpec,
+) -> Result<()> {
+    trx.exec(async |stmt| {
+        let deleted_columns = engine
+            .catalog()
+            .storage
+            .index_columns()
+            .delete_by_index(stmt, table_id, index_no)
+            .await;
+        if deleted_columns != old_index_spec.cols.len() {
+            return Err(Report::new(DataIntegrityError::InvalidRootInvariant)
+                .attach(format!(
+                    "drop index catalog index-column delete count mismatch: table_id={table_id}, index_no={index_no}, deleted={deleted_columns}, expected={}",
+                    old_index_spec.cols.len()
+                ))
+                .into());
+        }
+
+        let index_deleted = engine
+            .catalog()
+            .storage
+            .indexes()
+            .delete_by_id(stmt, table_id, index_no)
+            .await;
+        if !index_deleted {
+            return Err(Report::new(DataIntegrityError::InvalidRootInvariant)
+                .attach(format!(
+                    "drop index catalog index row missing: table_id={table_id}, index_no={index_no}"
+                ))
+                .into());
+        }
+
+        let res = stmt
+            .effects_mut()
+            .set_ddl_redo(DDLRedo::DropIndex { table_id, index_no });
+        debug_assert!(res.is_none());
+        Ok(())
+    })
+    .await
 }
 
 #[inline]
@@ -1044,6 +1477,23 @@ fn poison_create_index_after_catalog_commit_with_source(
         .change_context(*poison.current_context())
         .attach(format!(
             "create index failed after catalog commit: table_id={table_id}, index_no={index_no}, operation={operation}"
+        ))
+}
+
+#[inline]
+fn poison_drop_index_after_catalog_commit_with_source(
+    engine: &EngineRef,
+    table_id: TableID,
+    index_no: IndexNo,
+    operation: &'static str,
+    source: Error,
+) -> Report<FatalError> {
+    let poison = engine.trx_sys.poison_storage(FatalError::Poisoned);
+    source
+        .into_report()
+        .change_context(*poison.current_context())
+        .attach(format!(
+            "drop index failed after catalog commit: table_id={table_id}, index_no={index_no}, operation={operation}"
         ))
 }
 
@@ -1599,6 +2049,203 @@ mod tests {
                 .await,
                 vec![row_id]
             );
+        });
+    }
+
+    #[test]
+    fn test_drop_index_removes_sparse_slot_and_preserves_allocation_after_restart() {
+        smol::block_on(async {
+            use crate::catalog::tests::table2;
+
+            let temp_dir = TempDir::new().unwrap();
+            let main_dir = temp_dir.path().to_path_buf();
+            let log_stem = "drop-index-recover";
+            let engine = lightweight_test_engine_config(main_dir.clone(), log_stem)
+                .build()
+                .await
+                .unwrap();
+            let table_id = table2(&engine).await;
+            let table = engine.catalog().get_table(table_id).await.unwrap();
+            let mut session = engine.try_new_session().unwrap();
+
+            assert_eq!(
+                session
+                    .create_index(
+                        table_id,
+                        IndexSpec::new(vec![IndexKey::new(1)], IndexAttributes::empty()),
+                    )
+                    .await
+                    .unwrap(),
+                1
+            );
+            session.drop_index(table_id, 1).await.unwrap();
+
+            let metadata = table.metadata();
+            assert_eq!(metadata.next_index_no(), 2);
+            assert!(metadata.index_spec(0).is_some());
+            assert!(metadata.index_spec(1).is_none());
+            let root = table.file().active_root_unchecked();
+            assert_eq!(root.secondary_index_roots.len(), 2);
+            assert_eq!(root.secondary_index_roots[1], SUPER_BLOCK_ID);
+            let catalog_indexes = engine
+                .catalog()
+                .storage
+                .indexes()
+                .list_uncommitted_by_table_id(session.pool_guards(), table_id)
+                .await;
+            assert_eq!(catalog_indexes.len(), 1);
+            assert_eq!(catalog_indexes[0].index_no, 0);
+            engine
+                .catalog()
+                .checkpoint_now(&engine.trx_sys)
+                .await
+                .unwrap();
+            drop(session);
+            drop(table);
+            drop(engine);
+
+            let engine = lightweight_test_engine_config(main_dir, log_stem)
+                .build()
+                .await
+                .unwrap();
+            let table = engine.catalog().get_table(table_id).await.unwrap();
+            assert_eq!(table.metadata().next_index_no(), 2);
+            assert!(table.metadata().index_spec(1).is_none());
+            assert_eq!(
+                table.file().active_root_unchecked().secondary_index_roots[1],
+                SUPER_BLOCK_ID
+            );
+
+            let mut session = engine.try_new_session().unwrap();
+            assert_eq!(
+                session
+                    .create_index(
+                        table_id,
+                        IndexSpec::new(vec![IndexKey::new(1)], IndexAttributes::empty()),
+                    )
+                    .await
+                    .unwrap(),
+                2
+            );
+        });
+    }
+
+    #[test]
+    fn test_drop_unique_and_primary_indexes_remove_uniqueness_enforcement() {
+        smol::block_on(async {
+            let sys = CreateIndexTestSys::new_lightweight_evictable().await;
+            let table_id = sys.table.table_id();
+            let mut session = sys.try_new_session().unwrap();
+            insert_one_row(
+                &sys.table,
+                &mut session,
+                vec![Val::from(1), Val::from("same")],
+            )
+            .await;
+
+            assert_eq!(
+                session
+                    .create_index(
+                        table_id,
+                        IndexSpec::new(vec![IndexKey::new(1)], IndexAttributes::UK),
+                    )
+                    .await
+                    .unwrap(),
+                1
+            );
+            session.drop_index(table_id, 1).await.unwrap();
+            insert_one_row(
+                &sys.table,
+                &mut session,
+                vec![Val::from(2), Val::from("same")],
+            )
+            .await;
+
+            session.drop_index(table_id, 0).await.unwrap();
+            insert_one_row(
+                &sys.table,
+                &mut session,
+                vec![Val::from(1), Val::from("different")],
+            )
+            .await;
+        });
+    }
+
+    #[test]
+    fn test_drop_index_rejects_active_transaction_and_missing_slots() {
+        smol::block_on(async {
+            let sys = CreateIndexTestSys::new_lightweight_evictable().await;
+            let table_id = sys.table.table_id();
+            let mut session = sys.try_new_session().unwrap();
+
+            let trx = session.try_begin_trx().unwrap().unwrap();
+            let err = session.drop_index(table_id, 0).await.unwrap_err();
+            assert_eq!(err.operation_error(), Some(OperationError::NotSupported));
+            trx.rollback().await.unwrap();
+
+            let root_before = sys.table.file().active_root_unchecked().clone();
+            let old_generation = sys.table.layout_snapshot().generation();
+            let err = session.drop_index(table_id, 1).await.unwrap_err();
+            assert_eq!(err.operation_error(), Some(OperationError::IndexNotFound));
+            assert_root_metadata_unchanged(&root_before, &sys.table);
+            assert_eq!(sys.table.layout_snapshot().generation(), old_generation);
+
+            session.drop_index(table_id, 0).await.unwrap();
+            let root_before = sys.table.file().active_root_unchecked().clone();
+            let old_generation = sys.table.layout_snapshot().generation();
+            let err = session.drop_index(table_id, 0).await.unwrap_err();
+            assert_eq!(err.operation_error(), Some(OperationError::IndexNotFound));
+            assert_root_metadata_unchanged(&root_before, &sys.table);
+            assert_eq!(sys.table.layout_snapshot().generation(), old_generation);
+        });
+    }
+
+    #[test]
+    fn test_drop_index_runtime_install_retires_removed_runtime() {
+        smol::block_on(async {
+            let sys = CreateIndexTestSys::new_lightweight_evictable().await;
+            let table_id = sys.table.table_id();
+            let mut session = sys.try_new_session().unwrap();
+            assert_eq!(
+                session
+                    .create_index(
+                        table_id,
+                        IndexSpec::new(vec![IndexKey::new(1)], IndexAttributes::empty()),
+                    )
+                    .await
+                    .unwrap(),
+                1
+            );
+            let old_layout = sys.table.layout_snapshot();
+            let old_generation = old_layout.generation();
+            let old_pk = Arc::clone(old_layout.secondary_indexes()[0].as_ref().unwrap());
+
+            session.drop_index(table_id, 1).await.unwrap();
+
+            let installed = sys.table.layout_snapshot();
+            assert_eq!(installed.generation(), old_generation + 1);
+            assert!(installed.secondary_indexes()[1].is_none());
+            assert!(Arc::ptr_eq(
+                installed.secondary_indexes()[0].as_ref().unwrap(),
+                &old_pk
+            ));
+            assert!(sys.table.has_retired_secondary_indexes());
+            assert_eq!(
+                sys.table
+                    .cleanup_retired_secondary_indexes(session.pool_guards())
+                    .await
+                    .unwrap(),
+                0
+            );
+            drop(old_layout);
+            assert_eq!(
+                sys.table
+                    .cleanup_retired_secondary_indexes(session.pool_guards())
+                    .await
+                    .unwrap(),
+                1
+            );
+            assert!(!sys.table.has_retired_secondary_indexes());
         });
     }
 
