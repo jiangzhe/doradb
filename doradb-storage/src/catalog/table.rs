@@ -28,6 +28,13 @@ fn invalid_index_spec(message: impl Into<String>) -> Error {
 }
 
 #[inline]
+fn index_not_found(message: impl Into<String>) -> Error {
+    Report::new(OperationError::IndexNotFound)
+        .attach(message.into())
+        .into()
+}
+
+#[inline]
 fn validate_index_spec(index_no: usize, spec: &IndexSpec, col_count: usize) -> Result<()> {
     if spec.cols.is_empty() {
         return Err(invalid_index_spec(format!(
@@ -454,6 +461,39 @@ impl TableMetadata {
             next_index_no,
         )?;
         Ok((index_no, metadata))
+    }
+
+    /// Returns metadata with one active index slot made inactive.
+    #[inline]
+    pub(crate) fn try_without_index(&self, index_no: IndexNo) -> Result<Self> {
+        let index_no_usize = usize::from(index_no);
+        if index_no_usize >= self.index_slot_count() {
+            return Err(index_not_found(format!(
+                "drop index out of range: index_no={index_no}, next_index_no={}",
+                self.next_index_no
+            )));
+        }
+        if self.index_spec(index_no_usize).is_none() {
+            return Err(index_not_found(format!(
+                "drop index inactive slot: index_no={index_no}, next_index_no={}",
+                self.next_index_no
+            )));
+        }
+
+        let index_specs = self
+            .active_indexes()
+            .filter(|(active_index_no, _)| *active_index_no != index_no_usize)
+            .map(|(active_index_no, spec)| {
+                ActiveIndexSpec::new(active_index_no as IndexNo, spec.clone())
+            })
+            .collect::<Vec<_>>();
+        Self::try_create(
+            self.col_names.clone(),
+            self.col_types.clone(),
+            self.col_attrs.clone(),
+            index_specs,
+            self.next_index_no,
+        )
     }
 
     /// Returns the sparse secondary-index slot count.
@@ -933,6 +973,68 @@ mod tests {
                     IndexAttributes::empty(),
                 ))
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn test_table_metadata_drop_index_preserves_sparse_allocation() {
+        let metadata = TableMetadata::try_new_with_next_index_no(
+            vec![
+                ColumnSpec::new("c0", ValKind::U32, ColumnAttributes::empty()),
+                ColumnSpec::new("c1", ValKind::U64, ColumnAttributes::empty()),
+                ColumnSpec::new("c2", ValKind::U32, ColumnAttributes::empty()),
+            ],
+            vec![
+                ActiveIndexSpec::new(
+                    0,
+                    IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::PK),
+                ),
+                ActiveIndexSpec::new(
+                    2,
+                    IndexSpec::new(vec![IndexKey::new(2)], IndexAttributes::empty()),
+                ),
+            ],
+            4,
+        )
+        .unwrap();
+
+        let dropped = metadata.try_without_index(2).unwrap();
+
+        assert_eq!(dropped.next_index_no(), 4);
+        assert_eq!(dropped.index_slot_count(), 4);
+        assert_eq!(dropped.active_index_count(), 1);
+        assert!(dropped.index_spec(0).is_some());
+        assert!(dropped.index_spec(1).is_none());
+        assert!(dropped.index_spec(2).is_none());
+        assert!(dropped.index_spec(3).is_none());
+        assert_eq!(dropped.index_cols, HashSet::from([0]));
+    }
+
+    #[test]
+    fn test_table_metadata_drop_index_rejects_inactive_and_out_of_range() {
+        let metadata = TableMetadata::try_new_with_next_index_no(
+            vec![ColumnSpec::new(
+                "c0",
+                ValKind::U32,
+                ColumnAttributes::empty(),
+            )],
+            vec![ActiveIndexSpec::new(
+                0,
+                IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::PK),
+            )],
+            2,
+        )
+        .unwrap();
+
+        let inactive = metadata.try_without_index(1).unwrap_err();
+        assert_eq!(
+            inactive.operation_error(),
+            Some(OperationError::IndexNotFound)
+        );
+        let out_of_range = metadata.try_without_index(2).unwrap_err();
+        assert_eq!(
+            out_of_range.operation_error(),
+            Some(OperationError::IndexNotFound)
         );
     }
 }

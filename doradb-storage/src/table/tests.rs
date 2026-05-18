@@ -6,7 +6,7 @@ use crate::buffer::{EvictableBufferPool, PoolGuard, PoolGuards, PoolRole, test_f
 use crate::catalog::tests::table4;
 use crate::catalog::{
     CatalogCheckpointScanStopReason, ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey,
-    IndexSpec, TableID, TableMetadata, TableSpec, USER_OBJ_ID_START,
+    IndexNo, IndexSpec, TableID, TableMetadata, TableSpec, USER_OBJ_ID_START,
 };
 use crate::conf::{EngineConfig, EvictableBufferPoolConfig, FileSystemConfig, TrxSysConfig};
 use crate::engine::Engine;
@@ -8351,6 +8351,100 @@ fn test_runtime_layout_install_retires_removed_index_after_old_snapshot_drops() 
             1
         );
         assert!(!sys.table.has_retired_secondary_indexes());
+    })
+}
+
+#[test]
+fn test_dropped_unique_index_purge_delete_is_noop() {
+    smol::block_on(async {
+        let sys = TestSys::new_lightweight_evictable().await;
+        let mut session = sys.try_new_session().unwrap();
+        let key = single_key(1i32);
+        let row_id = insert_one_row(
+            &sys.table,
+            &mut session,
+            vec![Val::from(1i32), Val::from("name")],
+        )
+        .await;
+        sys.table.freeze(&session, usize::MAX).await;
+        checkpoint_published(&sys.table, &mut session).await;
+        let mut hold_session = sys.try_new_session().unwrap();
+        let hold_trx = hold_session.try_begin_trx().unwrap().unwrap();
+        sys.new_trx_delete(&mut session, &key).await;
+        let min_active_sts = delete_marker_ts(sys.table.deletion_buffer().get(row_id).unwrap()) + 1;
+        let index = bound_unique_index_no(&sys.table, key.index_no);
+        assert!(matches!(
+            index
+                .lookup(
+                    session.pool_guards().index_guard(),
+                    &key.vals,
+                    MAX_SNAPSHOT_TS,
+                )
+                .await
+                .unwrap(),
+            Some((actual_row_id, true)) if actual_row_id == row_id
+        ));
+
+        session.drop_index(sys.table.table_id(), 0).await.unwrap();
+
+        let deleted = sys
+            .table
+            .accessor_with_layout(sys.table.layout_snapshot())
+            .delete_index(session.pool_guards(), &key, row_id, true, min_active_sts)
+            .await
+            .unwrap();
+        assert!(!deleted);
+        hold_trx.commit().await.unwrap();
+    })
+}
+
+#[test]
+fn test_dropped_non_unique_index_purge_delete_is_noop() {
+    smol::block_on(async {
+        let sys = TestSys::new_evictable_with_non_unique_name_index().await;
+        let mut session = sys.try_new_session().unwrap();
+        let table_id = sys.table.table_id();
+        let pk = single_key(1i32);
+        let row_id = insert_one_row(
+            &sys.table,
+            &mut session,
+            vec![Val::from(1i32), Val::from("name")],
+        )
+        .await;
+        let key = name_key("name");
+        sys.table.freeze(&session, usize::MAX).await;
+        checkpoint_published(&sys.table, &mut session).await;
+        let mut hold_session = sys.try_new_session().unwrap();
+        let hold_trx = hold_session.try_begin_trx().unwrap().unwrap();
+        sys.new_trx_delete(&mut session, &pk).await;
+        let min_active_sts = delete_marker_ts(sys.table.deletion_buffer().get(row_id).unwrap()) + 1;
+        let index = bound_non_unique_index_no(&sys.table, key.index_no);
+        assert!(matches!(
+            index
+                .lookup_unique(
+                    session.pool_guards().index_guard(),
+                    &key.vals,
+                    row_id,
+                    MAX_SNAPSHOT_TS,
+                )
+                .await
+                .unwrap(),
+            Some(false)
+        ));
+
+        session
+            .drop_index(table_id, key.index_no as IndexNo)
+            .await
+            .unwrap();
+
+        let deleted = sys
+            .table
+            .accessor_with_layout(sys.table.layout_snapshot())
+            .delete_index(session.pool_guards(), &key, row_id, false, min_active_sts)
+            .await
+            .unwrap();
+        assert!(!deleted);
+        hold_trx.commit().await.unwrap();
     })
 }
 

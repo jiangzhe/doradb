@@ -290,6 +290,12 @@ impl Session {
         crate::catalog::create_index_for_session(self, table_id, index_spec).await
     }
 
+    /// Logically drop an active secondary index from an existing user table.
+    #[inline]
+    pub async fn drop_index(&mut self, table_id: TableID, index_no: IndexNo) -> Result<()> {
+        crate::catalog::drop_index_for_session(self, table_id, index_no).await
+    }
+
     /// Logically drop an existing user table.
     #[inline]
     pub async fn drop_table(&mut self, table_id: TableID) -> Result<()> {

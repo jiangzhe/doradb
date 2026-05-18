@@ -509,10 +509,10 @@ on. Safe synchronization primitives or existing project patterns are preferred.
   - Goals: Remove storage-level index enforcement without reusing `index_no` or
     requiring durable tombstone specs.
   - Non-goals: Immediate physical reclamation of all old index pages.
-  - Task Doc: `docs/tasks/TBD.md`
-  - Task Issue: `#0`
-  - Phase Status: `pending`
-  - Implementation Summary: `pending`
+  - Task Doc: `docs/tasks/000150-implement-drop-index-storage-api.md`
+  - Task Issue: `#638`
+  - Phase Status: done
+  - Implementation Summary: Implemented Phase 5 DROP INDEX storage API: added Session drop_index, sparse metadata removal, catalog DML and DDL redo, root publication with SUPER_BLOCK_ID, runtime layout slot removal and retired-index cleanup, uniqueness-removal behavior, stale purge no-op handling, restart/checkpoint/recovery coverage, and validated default, libaio, clippy, and focused coverage. [Task Resolve Sync: docs/tasks/000150-implement-drop-index-storage-api.md @ 2026-05-18]
 
 ## Consequences
 
