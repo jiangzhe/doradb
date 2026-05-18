@@ -1,7 +1,7 @@
 ---
 id: 0018
 title: Create and Drop Index
-status: draft
+status: implemented
 tags: [storage, ddl, index, catalog, checkpoint, recovery]
 created: 2026-05-10
 github_issue: 627
@@ -463,6 +463,8 @@ on. Safe synchronization primitives or existing project patterns are preferred.
   - Task Issue: `#630`
   - Phase Status: done
   - Implementation Summary: Implemented Phase 1 stable index metadata: removed storage-layer index names, added sparse stable index slots and durable next_index_no, updated catalog/table-file metadata and reload, converted runtime/checkpoint/recovery/purge paths to active sparse iteration, validated inactive root slots with SUPER_BLOCK_ID, and deferred DROP INDEX-specific purge tests to docs/backlogs/000099-drop-index-purge-skip-tests.md. [Task Resolve Sync: docs/tasks/000146-stable-index-metadata.md @ 2026-05-12]
+  - Related Backlogs:
+    - `docs/backlogs/closed/000099-drop-index-purge-skip-tests.md`
 
 - **Phase 2: Runtime Layout And Checkpoint Gate**
   - Scope: Add the runtime layout update mechanism for existing table handles
@@ -513,6 +515,8 @@ on. Safe synchronization primitives or existing project patterns are preferred.
   - Task Issue: `#638`
   - Phase Status: done
   - Implementation Summary: Implemented Phase 5 DROP INDEX storage API: added Session drop_index, sparse metadata removal, catalog DML and DDL redo, root publication with SUPER_BLOCK_ID, runtime layout slot removal and retired-index cleanup, uniqueness-removal behavior, stale purge no-op handling, restart/checkpoint/recovery coverage, and validated default, libaio, clippy, and focused coverage. [Task Resolve Sync: docs/tasks/000150-implement-drop-index-storage-api.md @ 2026-05-18]
+  - Related Backlogs:
+    - `docs/backlogs/closed/000099-drop-index-purge-skip-tests.md`
 
 ## Consequences
 
@@ -541,20 +545,28 @@ on. Safe synchronization primitives or existing project patterns are preferred.
 
 ## Open Questions
 
-- Should `next_index_no` remain `u16` to match current catalog storage, or
-  should this RFC use a wider type while the metadata format is changing?
-- Which concrete safe runtime-layout mechanism should implementation choose for
-  in-place updates of existing `Arc<Table>` handles?
-- Should dropped-index page reclamation get a dedicated follow-up task, or is
-  existing root/page reclamation sufficient for the initial implementation?
+No open questions remain after implementation.
+
+Resolved during implementation:
+
+- `next_index_no` remains `IndexNo`/`u16` for this storage format, with
+  explicit overflow validation in create-index metadata helpers.
+- Runtime layout updates use safe `parking_lot::Mutex<Arc<TableRuntimeLayout>>`
+  snapshots and generation-checked layout installation.
+- Dropped-index persistent page reclamation stays out of foreground
+  `DROP INDEX`; active-root detachment is implemented, while broader
+  root-reachability reclamation remains tracked by
+  `docs/backlogs/000094-table-file-root-reachability-gc.md`.
 
 ## Future Work
 
-- Parallel index build.
+- Bounded-memory and parallel index build
+  (`docs/backlogs/000104-stream-parallel-create-index-cold-build.md`).
 - Online index DDL with multi-version metadata.
 - Higher-level index naming and name-to-`index_no` mapping.
 - Rename index and richer catalog index introspection.
-- Dedicated physical reclamation improvements for dropped index pages.
+- Dedicated physical reclamation improvements for dropped index pages
+  (`docs/backlogs/000094-table-file-root-reachability-gc.md`).
 - Recovery fallback that rebuilds an index if the durable root is found
   corrupt or incomplete.
 
