@@ -42,3 +42,11 @@ When a backlog item is moved to `docs/backlogs/closed/`, append:
 - Reference: <task/issue/pr reference>
 - Closed At: <YYYY-MM-DD>
 ```
+
+## Close Reason
+
+- Type: implemented
+- Detail: Implemented via docs/tasks/000150-implement-drop-index-storage-api.md with end-to-end dropped unique and non-unique index purge no-op tests.
+- Closed By: backlog close
+- Reference: docs/tasks/000150-implement-drop-index-storage-api.md; docs/rfcs/0018-create-drop-index.md
+- Closed At: 2026-05-18

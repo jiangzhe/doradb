@@ -1,7 +1,7 @@
 ---
 id: 000150
 title: Implement DROP INDEX Storage API
-status: proposal
+status: implemented
 created: 2026-05-17
 github_issue: 638
 ---
@@ -336,6 +336,50 @@ tools/coverage_focus.rs \
 
 ## Implementation Notes
 
+Implemented on 2026-05-18.
+
+- Added `Session::drop_index(table_id, index_no)` and the storage drop-index
+  workflow for active user-table indexes. The implementation validates the live
+  user table and active sparse slot, rejects active user transactions, acquires
+  the table/catalog DDL gates, deletes matching `catalog.indexes` and
+  `catalog.index_columns` rows, commits `DDLRedo::DropIndex { table_id,
+  index_no }`, publishes a root with the dropped slot set to `SUPER_BLOCK_ID`,
+  and installs a new runtime layout with that slot set to `None`.
+- Added `TableMetadata::try_without_index` and `OperationError::IndexNotFound`
+  so inactive, never-allocated, or out-of-range slots fail as normal operation
+  errors while preserving `next_index_no`, sparse inactive slots, and active
+  column/index metadata.
+- Preserved runtime safety by retaining unchanged secondary-index `Arc`s,
+  advancing the layout generation, queuing the removed runtime index for
+  retired cleanup, and treating stale purge entries for dropped unique and
+  non-unique indexes as `Ok(false)` no-ops.
+- Covered successful drop/restart/allocation behavior, uniqueness removal for
+  dropped unique and primary-key indexes, validation failures, runtime layout
+  install and retired cleanup, metadata helper invariants, root-proof catalog
+  checkpoint/recovery behavior, and stale dropped-index purge no-ops. The purge
+  no-op tests were strengthened during review so rows are delete-marked and
+  purge-eligible before `drop_index`, proving the dropped-slot path is exercised.
+- Checklist result: pass. Reliability, feature completeness, documentation,
+  performance, test-only code, and complexity checks were reviewed against
+  `docs/process/dev-checklist.md`; unsafe-specific checks were not applicable
+  because no unsafe code was added or modified.
+- Validation passed:
+
+```bash
+cargo fmt --all --check
+cargo clippy -p doradb-storage --all-targets -- -D warnings
+cargo nextest run -p doradb-storage
+cargo nextest run -p doradb-storage --no-default-features --features libaio
+tools/coverage_focus.rs \
+  --path doradb-storage/src/session.rs \
+  --path doradb-storage/src/catalog \
+  --path doradb-storage/src/table \
+  --path doradb-storage/src/trx \
+  --path doradb-storage/src/index
+```
+
+Focused coverage result: 41306/45092 lines, 91.60% overall; every requested
+target directory or file was above the 80% threshold.
 
 ## Impacts
 
@@ -453,6 +497,9 @@ Deferred follow-ups remain out of this task:
 
 - Dedicated physical reclamation improvements for dropped index `DiskTree`
   pages should stay in future root-reachability/page-GC work, not the
-  foreground `DROP INDEX` DDL path.
+  foreground `DROP INDEX` DDL path. This is tracked in
+  `docs/backlogs/000094-table-file-root-reachability-gc.md`, which now includes
+  dropped persisted secondary indexes, block-index, and deletion-offload
+  consumers.
 - A generic shared create/drop index DDL state machine can be considered after
   both storage APIs are complete and stable.
