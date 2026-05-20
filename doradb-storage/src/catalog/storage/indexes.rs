@@ -6,9 +6,9 @@ use crate::catalog::table::TableMetadata;
 use crate::catalog::{
     ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexOrder, IndexSpec, TableID,
 };
+use crate::error::Result;
 use crate::row::ops::{DeleteMvcc, SelectKey};
 use crate::row::{Row, RowRead};
-use crate::table::TableAccess;
 use crate::trx::stmt::Statement;
 use crate::value::Val;
 use crate::value::ValKind;
@@ -113,18 +113,22 @@ impl Indexes<'_> {
     }
 
     /// Delete all indexes for one table and return the number of deleted rows.
-    pub async fn delete_by_table_id(&self, stmt: &mut Statement<'_>, table_id: TableID) -> usize {
+    pub async fn delete_by_table_id(
+        &self,
+        stmt: &mut Statement<'_>,
+        table_id: TableID,
+    ) -> Result<usize> {
         let Some(guards) = stmt.ctx().pool_guards().cloned() else {
-            return 0;
+            return Ok(0);
         };
-        let indexes = self.list_uncommitted_by_table_id(&guards, table_id).await;
+        let indexes = self.list_uncommitted_by_table_id(&guards, table_id).await?;
         let mut deleted = 0;
         for index in indexes {
             if self.delete_by_id(stmt, table_id, index.index_no).await {
                 deleted += 1;
             }
         }
-        deleted
+        Ok(deleted)
     }
 
     /// List all indexes by given table id.
@@ -132,10 +136,9 @@ impl Indexes<'_> {
         &self,
         guards: &PoolGuards,
         table_id: TableID,
-    ) -> Vec<IndexObject> {
+    ) -> Result<Vec<IndexObject>> {
         let mut res = vec![];
         self.table
-            .accessor()
             .table_scan_uncommitted(guards, |metadata, row| {
                 if row.is_deleted() {
                     return true;
@@ -148,8 +151,8 @@ impl Indexes<'_> {
                 }
                 true
             })
-            .await;
-        res
+            .await?;
+        Ok(res)
     }
 }
 
@@ -296,11 +299,11 @@ impl IndexColumns<'_> {
         stmt: &mut Statement<'_>,
         table_id: TableID,
         index_no: u16,
-    ) -> usize {
+    ) -> Result<usize> {
         let Some(guards) = stmt.ctx().pool_guards().cloned() else {
-            return 0;
+            return Ok(0);
         };
-        let index_columns = self.list_uncommitted_by_table_id(&guards, table_id).await;
+        let index_columns = self.list_uncommitted_by_table_id(&guards, table_id).await?;
         let mut deleted = 0;
         for index_column in index_columns
             .into_iter()
@@ -313,15 +316,19 @@ impl IndexColumns<'_> {
                 deleted += 1;
             }
         }
-        deleted
+        Ok(deleted)
     }
 
     /// Delete all index-column rows for one table and return the number of deleted rows.
-    pub async fn delete_by_table_id(&self, stmt: &mut Statement<'_>, table_id: TableID) -> usize {
+    pub async fn delete_by_table_id(
+        &self,
+        stmt: &mut Statement<'_>,
+        table_id: TableID,
+    ) -> Result<usize> {
         let Some(guards) = stmt.ctx().pool_guards().cloned() else {
-            return 0;
+            return Ok(0);
         };
-        let index_columns = self.list_uncommitted_by_table_id(&guards, table_id).await;
+        let index_columns = self.list_uncommitted_by_table_id(&guards, table_id).await?;
         let mut deleted = 0;
         for index_column in index_columns {
             if self
@@ -336,7 +343,7 @@ impl IndexColumns<'_> {
                 deleted += 1;
             }
         }
-        deleted
+        Ok(deleted)
     }
 
     /// List all index-column rows of one table from uncommitted-visible rows.
@@ -344,10 +351,9 @@ impl IndexColumns<'_> {
         &self,
         guards: &PoolGuards,
         table_id: TableID,
-    ) -> Vec<IndexColumnObject> {
+    ) -> Result<Vec<IndexColumnObject>> {
         let mut res = vec![];
         self.table
-            .accessor()
             .table_scan_uncommitted(guards, |metadata, row| {
                 if row.is_deleted() {
                     return true;
@@ -362,8 +368,8 @@ impl IndexColumns<'_> {
                 }
                 true
             })
-            .await;
-        res
+            .await?;
+        Ok(res)
     }
 }
 
@@ -472,7 +478,8 @@ mod tests {
                 .storage
                 .indexes()
                 .list_uncommitted_by_table_id(session.pool_guards(), 42)
-                .await;
+                .await
+                .unwrap();
             assert_eq!(idx_42.len(), 1);
             assert_eq!(idx_42[0].index_no, 0);
 
@@ -481,7 +488,8 @@ mod tests {
                 .storage
                 .indexes()
                 .list_uncommitted_by_table_id(session.pool_guards(), 43)
-                .await;
+                .await
+                .unwrap();
             assert_eq!(idx_43.len(), 1);
             assert_eq!(idx_43[0].index_no, 0);
 
@@ -525,6 +533,7 @@ mod tests {
                     .indexes()
                     .list_uncommitted_by_table_id(session.pool_guards(), 42)
                     .await
+                    .unwrap()
                     .is_empty()
             );
             assert!(
@@ -534,6 +543,7 @@ mod tests {
                     .indexes()
                     .list_uncommitted_by_table_id(session.pool_guards(), 43)
                     .await
+                    .unwrap()
                     .is_empty()
             );
 
@@ -593,7 +603,8 @@ mod tests {
                         .storage
                         .indexes()
                         .delete_by_table_id(stmt, 42)
-                        .await,
+                        .await
+                        .unwrap(),
                     2
                 );
                 assert_eq!(
@@ -602,7 +613,8 @@ mod tests {
                         .storage
                         .indexes()
                         .delete_by_table_id(stmt, 42)
-                        .await,
+                        .await
+                        .unwrap(),
                     0
                 );
                 Ok(())
@@ -619,6 +631,7 @@ mod tests {
                     .indexes()
                     .list_uncommitted_by_table_id(session.pool_guards(), 42)
                     .await
+                    .unwrap()
                     .is_empty()
             );
             let remaining = engine
@@ -626,7 +639,8 @@ mod tests {
                 .storage
                 .indexes()
                 .list_uncommitted_by_table_id(session.pool_guards(), 43)
-                .await;
+                .await
+                .unwrap();
             assert_eq!(remaining.len(), 1);
             assert_eq!(remaining[0].index_no, 0);
 
@@ -706,7 +720,8 @@ mod tests {
                         .storage
                         .index_columns()
                         .delete_by_index(stmt, 42, 1)
-                        .await,
+                        .await
+                        .unwrap(),
                     2
                 );
                 assert_eq!(
@@ -715,7 +730,8 @@ mod tests {
                         .storage
                         .index_columns()
                         .delete_by_index(stmt, 42, 1)
-                        .await,
+                        .await
+                        .unwrap(),
                     0
                 );
                 Ok(())
@@ -730,7 +746,8 @@ mod tests {
                 .storage
                 .index_columns()
                 .list_uncommitted_by_table_id(session.pool_guards(), 42)
-                .await;
+                .await
+                .unwrap();
             assert_eq!(remaining_42.len(), 1);
             assert_eq!(remaining_42[0].index_no, 0);
 
@@ -742,7 +759,8 @@ mod tests {
                         .storage
                         .index_columns()
                         .delete_by_table_id(stmt, 42)
-                        .await,
+                        .await
+                        .unwrap(),
                     1
                 );
                 assert_eq!(
@@ -751,7 +769,8 @@ mod tests {
                         .storage
                         .index_columns()
                         .delete_by_table_id(stmt, 42)
-                        .await,
+                        .await
+                        .unwrap(),
                     0
                 );
                 Ok(())
@@ -768,6 +787,7 @@ mod tests {
                     .index_columns()
                     .list_uncommitted_by_table_id(session.pool_guards(), 42)
                     .await
+                    .unwrap()
                     .is_empty()
             );
             let remaining_43 = engine
@@ -775,7 +795,8 @@ mod tests {
                 .storage
                 .index_columns()
                 .list_uncommitted_by_table_id(session.pool_guards(), 43)
-                .await;
+                .await
+                .unwrap();
             assert_eq!(remaining_43.len(), 1);
             assert_eq!(remaining_43[0].table_id, 43);
             assert_eq!(remaining_43[0].index_no, 1);

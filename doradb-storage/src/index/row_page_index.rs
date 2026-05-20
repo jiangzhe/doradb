@@ -632,12 +632,13 @@ impl<P: BufferPool> GenericRowPageIndex<P> {
 
     /// Find location of given row id in in-memory row store.
     #[inline]
-    pub async fn find_row(&self, pool_guard: &PoolGuard, row_id: RowID) -> RowLocation {
+    pub async fn find_row(&self, pool_guard: &PoolGuard, row_id: RowID) -> Result<RowLocation> {
         debug_assert!(!row_id.is_deleted());
         loop {
-            let res = self.try_find_row(pool_guard, row_id).await;
-            let res = verify_continue!(res);
-            return res;
+            match self.try_find_row(pool_guard, row_id).await? {
+                Valid(row_location) => return Ok(row_location),
+                Invalid => continue,
+            }
         }
     }
 
@@ -981,7 +982,11 @@ impl<P: BufferPool> GenericRowPageIndex<P> {
     }
 
     #[inline]
-    async fn try_find_row(&self, pool_guard: &PoolGuard, row_id: RowID) -> Validation<RowLocation> {
+    async fn try_find_row(
+        &self,
+        pool_guard: &PoolGuard,
+        row_id: RowID,
+    ) -> Result<Validation<RowLocation>> {
         enum SearchStep {
             Found(RowLocation),
             Next(PageID),
@@ -990,10 +995,9 @@ impl<P: BufferPool> GenericRowPageIndex<P> {
         let mut g = self
             .pool
             .get_page::<RowPageIndexNode>(pool_guard, self.root_page_id, LatchFallbackMode::Spin)
-            .await
-            .expect("row-page-index lookup should not ignore buffer-pool errors");
+            .await?;
         loop {
-            let step = verify!(g.with_page_ref_validated(|page| {
+            let step = match g.with_page_ref_validated(|page| {
                 if page.is_leaf() {
                     // for leaf node, end_row_id is always correct,
                     // so we can quickly determine if row id exists
@@ -1038,16 +1042,21 @@ impl<P: BufferPool> GenericRowPageIndex<P> {
                     entries[idx].page_id
                 };
                 SearchStep::Next(page_id)
-            }));
+            }) {
+                Valid(step) => step,
+                Invalid => return Ok(Invalid),
+            };
             match step {
-                SearchStep::Found(found) => return Valid(found),
+                SearchStep::Found(found) => return Ok(Valid(found)),
                 SearchStep::Next(page_id) => {
-                    g = verify!(
-                        self.pool
-                            .get_child_page(pool_guard, &g, page_id, LatchFallbackMode::Spin)
-                            .await
-                            .expect("row-page-index lookup should not ignore buffer-pool errors")
-                    );
+                    g = match self
+                        .pool
+                        .get_child_page(pool_guard, &g, page_id, LatchFallbackMode::Spin)
+                        .await?
+                    {
+                        Valid(g) => g,
+                        Invalid => return Ok(Invalid),
+                    };
                 }
             }
         }
@@ -1230,12 +1239,12 @@ impl<P: BufferPool> GenericRowPageIndexMemCursor<'_, P> {
 mod tests {
     use super::*;
     use crate::buffer::guard::{FacadePageGuard, PageExclusiveGuard};
-    use crate::buffer::page::{BufferPage, VersionedPageID};
+    use crate::buffer::page::{BufferPage, INVALID_PAGE_ID, VersionedPageID};
     use crate::buffer::test_page_id;
     use crate::buffer::{BufferPool, FixedBufferPool, PoolGuard};
     use crate::catalog::{ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexSpec};
     use crate::conf::{EngineConfig, EvictableBufferPoolConfig, TrxSysConfig};
-    use crate::error::{IoError, ResourceError, Validation};
+    use crate::error::{ErrorKind, IoError, ResourceError, Validation};
     use crate::latch::LatchFallbackMode;
     use crate::quiescent::{QuiescentBox, QuiescentGuard};
     use crate::trx::log::list_log_files;
@@ -1300,6 +1309,12 @@ mod tests {
                 inner,
                 fail_page_id: AtomicU64::new(u64::from(fail_page_id)),
             }
+        }
+
+        #[inline]
+        fn set_fail_page_id(&self, fail_page_id: PageID) {
+            self.fail_page_id
+                .store(u64::from(fail_page_id), Ordering::Release);
         }
     }
 
@@ -1809,7 +1824,11 @@ mod tests {
             }
             for i in 0..row_pages {
                 let row_id = (i * rows_per_page + rows_per_page / 2) as RowID;
-                match blk_idx.find_row(&pool_guard, row_id).await {
+                match blk_idx
+                    .find_row(&pool_guard, row_id)
+                    .await
+                    .expect("test row-page lookup should succeed")
+                {
                     RowLocation::RowPage(page_id) => assert_eq!(page_id, PageID::from(i)),
                     _ => panic!("invalid search result for i={i}"),
                 }
@@ -1817,9 +1836,30 @@ mod tests {
             assert!(matches!(
                 blk_idx
                     .find_row(&pool_guard, (row_pages * rows_per_page) as RowID)
-                    .await,
+                    .await
+                    .expect("test row-page lookup should succeed"),
                 RowLocation::NotFound
             ));
+        })
+    }
+
+    #[test]
+    fn test_row_page_index_find_row_returns_error_on_root_lookup_failure() {
+        smol::block_on(async {
+            let inner = owned_index_pool(64 * 1024 * 1024);
+            let pool =
+                QuiescentBox::new(FailingInsertPagePool::new(inner.guard(), INVALID_PAGE_ID));
+            let pool_guard = (*pool).pool_guard();
+            let blk_idx = GenericRowPageIndex::new(pool.guard(), &pool_guard, 0)
+                .await
+                .expect("test row-page-index construction should succeed");
+            pool.set_fail_page_id(blk_idx.root_page_id());
+
+            let err = match blk_idx.find_row(&pool_guard, 0).await {
+                Ok(_location) => panic!("expected lookup error"),
+                Err(err) => err,
+            };
+            assert!(err.is_kind(ErrorKind::Io));
         })
     }
 

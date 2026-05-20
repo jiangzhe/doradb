@@ -98,7 +98,7 @@ pub(crate) trait IndexRollback {
         ts: TrxID,
     ) -> Result<()> {
         let table = self.mem_table();
-        let index_pool_guard = table.index_pool_guard(guards);
+        let index_pool_guard = table.index_pool_guard(guards)?;
         match entry.kind {
             IndexUndoKind::InsertUnique(key, merge_old_deleted) => {
                 if merge_old_deleted {

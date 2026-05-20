@@ -3,9 +3,11 @@ mod deletion_buffer;
 mod gc;
 mod layout;
 mod lifecycle;
+mod mem_table;
 mod persistence;
 mod recover;
 mod rollback;
+mod storage;
 #[cfg(test)]
 mod tests;
 
@@ -20,29 +22,29 @@ pub(crate) use lifecycle::{
     CheckpointPublishLease, TableCheckpointRootMutationLease, TableLifecycle,
     TableMetadataChangeLease,
 };
+pub(crate) use mem_table::GenericMemTable;
+#[cfg(test)]
+pub(crate) use mem_table::build_in_memory_secondary_indexes;
 pub use persistence::*;
 pub use recover::*;
 pub(crate) use rollback::IndexRollback;
+pub use storage::ColumnStorage;
 #[cfg(test)]
 pub(crate) use tests::test_user_table_id;
 
 use crate::buffer::guard::{PageExclusiveGuard, PageGuard, PageSharedGuard};
-use crate::buffer::page::{PageID, VersionedPageID};
-use crate::buffer::{
-    BufferPool, EvictableBufferPool, PoolGuard, PoolGuards, PoolRole, ReadonlyBufferPool,
-    RowPoolRole,
-};
+use crate::buffer::page::PageID;
+use crate::buffer::{EvictableBufferPool, PoolGuard, PoolGuards, PoolRole, ReadonlyBufferPool};
 use crate::catalog::{IndexSpec, TableID, TableMetadata};
-use crate::error::{DataIntegrityError, Error, InternalError, Result};
+use crate::error::{Error, InternalError, Result};
 use crate::file::BlockID;
 use crate::file::table_file::{ActiveRoot, LwcBlockPersist, TableFile};
-use crate::index::util::{Maskable, RowPageCreateRedoCtx};
+use crate::index::util::Maskable;
 use crate::index::{
-    BlockIndex, ColumnBlockEntryShape, InMemorySecondaryIndex, IndexCompareExchange, IndexInsert,
-    NonUniqueIndex, NonUniqueMemIndex, RowLocation, SecondaryDiskTreeRuntime, SecondaryIndex,
-    UniqueIndex, UniqueMemIndex,
+    BlockIndex, ColumnBlockEntryShape, IndexCompareExchange, IndexInsert, NonUniqueIndex,
+    NonUniqueMemIndex, RowLocation, SecondaryDiskTreeRuntime, SecondaryIndex, UniqueIndex,
+    UniqueMemIndex,
 };
-use crate::latch::LatchFallbackMode;
 use crate::lwc::LwcBuilder;
 use crate::quiescent::QuiescentGuard;
 use crate::row::ops::{Recover, RecoverIndex, SelectKey, UpdateCol};
@@ -59,68 +61,8 @@ use error_stack::Report;
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::marker::PhantomData;
-use std::ops::Deref;
 use std::sync::Arc;
 use std::time::Duration;
-
-#[inline]
-fn missing_secondary_index(index_no: usize, index_count: usize) -> Error {
-    Report::new(InternalError::SecondaryIndexOutOfBounds)
-        .attach(format!("index_no={index_no}, index_count={index_count}"))
-        .into()
-}
-
-/// Table is a logical data set of rows.
-/// It combines components such as row page, undo map, block index, secondary
-/// index to provide full-featured CRUD and MVCC functionalities.
-///
-/// The basic flow is:
-///
-/// secondary index -> block index -> buffer pool -> row page -> undo map.
-///
-/// 1. secondary index stores mapping from key to row id.
-///
-/// 2. block index stores mapping from row id to page.
-///
-/// 3. Buffer pool takes care of creating and fetching pages.
-///
-/// 4. Row page stores latest version fo row data.
-///
-/// 5. Undo map stores old versions of row data.
-///
-/// We have a separate undo array associated to each row in row page.
-///
-/// The undo head also acts as *physical* row lock, so that threads need to
-/// synchronize the row access.
-///
-/// Undo entry with uncommitted timestamp represents *logical* row lock and
-/// only released once transaction commits.
-///
-/// Insert/update/delete operation will add one or more undo entry to the
-/// chain linked to undo head.
-///
-/// Select operation will traverse undo chain to find visible version.
-///
-/// Additional key validation is performed if index lookup is used, because
-/// index does not contain version information, and out-of-date index entry
-/// should ignored if visible data version does not match index key.
-pub struct GenericMemTable<D: 'static, I: 'static> {
-    pub(crate) table_id: TableID,
-    pub(crate) metadata: Arc<TableMetadata>,
-    pub(crate) mem_pool: QuiescentGuard<D>,
-    pub(crate) row_pool_role: RowPoolRole,
-    pub(crate) index_pool_role: PoolRole,
-    pub(crate) blk_idx: BlockIndex,
-    pub(crate) sec_idx: Box<[Option<InMemorySecondaryIndex<I>>]>,
-}
-
-/// Persisted column-store attachments associated with a user table runtime.
-pub struct ColumnStorage {
-    pub(crate) file: Arc<TableFile>,
-    pub(crate) disk_pool: QuiescentGuard<ReadonlyBufferPool>,
-    pub(crate) deletion_buffer: ColumnDeletionBuffer,
-    secondary_indexes: Box<[Option<SecondaryDiskTreeRuntime>]>,
-}
 
 /// Runtime handle for a user table, combining in-memory and persisted storage.
 pub struct Table {
@@ -129,661 +71,6 @@ pub struct Table {
     layout: Mutex<Arc<TableRuntimeLayout>>,
     retired_secondary_indexes: Mutex<Vec<RetiredSecondaryIndex>>,
     pub(crate) lifecycle: TableLifecycle,
-}
-
-/// Owned projection of one proof-gated user-table active root.
-///
-/// The snapshot contains only runtime read contract fields copied from a
-/// single active-root observation. Publication and allocation internals remain
-/// behind the table-file boundary.
-pub(crate) struct TableRootSnapshot<'ctx> {
-    root_trx_id: TrxID,
-    pivot_row_id: RowID,
-    column_block_index_root: BlockID,
-    secondary_index_roots: Vec<BlockID>,
-    deletion_cutoff_ts: TrxID,
-    _proof: PhantomData<&'ctx TrxContext>,
-}
-
-impl<'ctx> TableRootSnapshot<'ctx> {
-    #[inline]
-    fn from_active_root(root: &ActiveRoot, _proof: &TrxReadProof<'ctx>) -> Self {
-        Self {
-            root_trx_id: root.trx_id,
-            pivot_row_id: root.pivot_row_id,
-            column_block_index_root: root.column_block_index_root,
-            secondary_index_roots: root.secondary_index_roots.clone(),
-            deletion_cutoff_ts: root.deletion_cutoff_ts,
-            _proof: PhantomData,
-        }
-    }
-
-    /// Returns the checkpoint timestamp carried by the captured root.
-    #[inline]
-    pub(crate) fn root_trx_id(&self) -> TrxID {
-        self.root_trx_id
-    }
-
-    /// Returns the row-id boundary between persisted and in-memory rows.
-    #[inline]
-    pub(crate) fn pivot_row_id(&self) -> RowID {
-        self.pivot_row_id
-    }
-
-    /// Returns the persisted column-block-index root from the captured root.
-    #[inline]
-    pub(crate) fn column_block_index_root(&self) -> BlockID {
-        self.column_block_index_root
-    }
-
-    /// Returns the cold-row deletion replay cutoff from the captured root.
-    #[inline]
-    pub(crate) fn deletion_cutoff_ts(&self) -> TrxID {
-        self.deletion_cutoff_ts
-    }
-
-    /// Returns the captured DiskTree root for one secondary index.
-    #[inline]
-    pub(crate) fn secondary_index_root(&self, index_no: usize) -> Result<BlockID> {
-        self.secondary_index_roots
-            .get(index_no)
-            .copied()
-            .ok_or_else(|| missing_secondary_index(index_no, self.secondary_index_roots.len()))
-    }
-
-    /// Returns whether the captured root predates the supplied snapshot time.
-    #[inline]
-    pub(crate) fn root_is_visible_to(&self, sts: TrxID) -> bool {
-        self.root_trx_id < sts
-    }
-}
-
-struct FrozenPage {
-    page_id: PageID,
-    start_row_id: RowID,
-    end_row_id: RowID,
-}
-
-type VisibleRowCollector<'a> = &'a mut dyn FnMut(&RowPage, usize, RowID) -> Result<()>;
-
-/// Stages newly built secondary indexes until the caller publishes them.
-///
-/// This keeps the build flow linear: construct each index, then either publish
-/// the whole batch on success or explicitly destroy already-built trees before
-/// returning the original build error.
-struct InMemorySecondaryIndexScopedBuilder<P: 'static> {
-    staged: Vec<Option<InMemorySecondaryIndex<P>>>,
-}
-
-/// Stages newly built dual-tree secondary indexes until the caller publishes them.
-struct SecondaryIndexScopedBuilder {
-    staged: Vec<Option<SecondaryIndex<EvictableBufferPool>>>,
-}
-
-impl<P: BufferPool> InMemorySecondaryIndexScopedBuilder<P> {
-    #[inline]
-    fn new(capacity: usize) -> Self {
-        let mut staged = Vec::with_capacity(capacity);
-        staged.resize_with(capacity, || None);
-        Self { staged }
-    }
-
-    #[inline]
-    async fn push_or_rollback(
-        &mut self,
-        index_no: usize,
-        built: Result<InMemorySecondaryIndex<P>>,
-        pool_guard: &PoolGuard,
-    ) -> Result<()> {
-        match built {
-            Ok(index) => {
-                debug_assert!(self.staged[index_no].is_none());
-                self.staged[index_no] = Some(index);
-                Ok(())
-            }
-            Err(err) => {
-                self.rollback(pool_guard).await;
-                Err(err)
-            }
-        }
-    }
-
-    #[inline]
-    async fn rollback(&mut self, pool_guard: &PoolGuard) {
-        for index in std::mem::take(&mut self.staged).into_iter().rev().flatten() {
-            // Keep the original construction error as the function result.
-            let _ = index.destroy(pool_guard).await;
-        }
-    }
-
-    #[inline]
-    fn publish(self) -> Box<[Option<InMemorySecondaryIndex<P>>]> {
-        self.staged.into_boxed_slice()
-    }
-}
-
-impl SecondaryIndexScopedBuilder {
-    #[inline]
-    fn new(capacity: usize) -> Self {
-        let mut staged = Vec::with_capacity(capacity);
-        staged.resize_with(capacity, || None);
-        Self { staged }
-    }
-
-    #[inline]
-    fn push(&mut self, index_no: usize, index: SecondaryIndex<EvictableBufferPool>) {
-        debug_assert!(self.staged[index_no].is_none());
-        self.staged[index_no] = Some(index);
-    }
-
-    #[inline]
-    async fn rollback(&mut self, pool_guard: &PoolGuard) {
-        for index in std::mem::take(&mut self.staged).into_iter().rev().flatten() {
-            // Keep the original construction error as the function result.
-            let _ = index.destroy(pool_guard).await;
-        }
-    }
-
-    #[inline]
-    fn publish(self) -> Box<[Option<Arc<SecondaryIndex<EvictableBufferPool>>>]> {
-        self.staged
-            .into_iter()
-            .map(|index| index.map(Arc::new))
-            .collect::<Vec<_>>()
-            .into_boxed_slice()
-    }
-}
-
-#[inline]
-pub(crate) async fn build_in_memory_secondary_indexes<I: BufferPool + 'static>(
-    index_pool: QuiescentGuard<I>,
-    index_pool_guard: &PoolGuard,
-    metadata: &TableMetadata,
-    index_ts: TrxID,
-) -> Result<Box<[Option<InMemorySecondaryIndex<I>>]>> {
-    let mut builder = InMemorySecondaryIndexScopedBuilder::new(metadata.index_slot_count());
-    for (index_no, index_spec) in metadata.active_indexes() {
-        let ty_infer = |col_no: usize| metadata.col_type(col_no);
-        builder
-            .push_or_rollback(
-                index_no,
-                InMemorySecondaryIndex::new(
-                    index_pool.clone(),
-                    index_pool_guard,
-                    index_spec,
-                    ty_infer,
-                    index_ts,
-                )
-                .await,
-                index_pool_guard,
-            )
-            .await?;
-    }
-    Ok(builder.publish())
-}
-
-/// Build user-table dual-tree secondary indexes from fresh MemIndex backends
-/// paired with the table file's checkpointed DiskTree runtimes.
-#[inline]
-pub(crate) async fn build_dual_tree_secondary_indexes(
-    index_pool: QuiescentGuard<EvictableBufferPool>,
-    index_pool_guard: &PoolGuard,
-    metadata: Arc<TableMetadata>,
-    file: Arc<TableFile>,
-    disk_pool: QuiescentGuard<ReadonlyBufferPool>,
-    index_ts: TrxID,
-) -> Result<Box<[Option<Arc<SecondaryIndex<EvictableBufferPool>>>]>> {
-    let mut builder = SecondaryIndexScopedBuilder::new(metadata.index_slot_count());
-    for (index_no, index_spec) in metadata.active_indexes() {
-        let runtime = match SecondaryDiskTreeRuntime::new(
-            index_no,
-            Arc::clone(&metadata),
-            Arc::clone(&file),
-            disk_pool.clone(),
-        ) {
-            Ok(runtime) => runtime,
-            Err(err) => {
-                builder.rollback(index_pool_guard).await;
-                return Err(err);
-            }
-        };
-        let ty_infer = |col_no: usize| metadata.col_type(col_no);
-        let index = if index_spec.unique() {
-            let mem = match UniqueMemIndex::new(
-                index_pool.clone(),
-                index_pool_guard,
-                index_spec,
-                ty_infer,
-                index_ts,
-            )
-            .await
-            {
-                Ok(mem) => mem,
-                Err(err) => {
-                    builder.rollback(index_pool_guard).await;
-                    return Err(err);
-                }
-            };
-            SecondaryIndex::Unique { mem, disk: runtime }
-        } else {
-            let mem = match NonUniqueMemIndex::new(
-                index_pool.clone(),
-                index_pool_guard,
-                index_spec,
-                ty_infer,
-                index_ts,
-            )
-            .await
-            {
-                Ok(mem) => mem,
-                Err(err) => {
-                    builder.rollback(index_pool_guard).await;
-                    return Err(err);
-                }
-            };
-            SecondaryIndex::NonUnique { mem, disk: runtime }
-        };
-        builder.push(index_no, index);
-    }
-    Ok(builder.publish())
-}
-
-impl<D: BufferPool, I: BufferPool> GenericMemTable<D, I> {
-    #[inline]
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) async fn new(
-        mem_pool: QuiescentGuard<D>,
-        row_pool_role: RowPoolRole,
-        index_pool: QuiescentGuard<I>,
-        index_pool_role: PoolRole,
-        index_pool_guard: &crate::buffer::PoolGuard,
-        table_id: TableID,
-        metadata: Arc<TableMetadata>,
-        blk_idx: BlockIndex,
-        index_ts: TrxID,
-    ) -> Result<Self> {
-        let sec_idx =
-            build_in_memory_secondary_indexes(index_pool, index_pool_guard, &metadata, index_ts)
-                .await?;
-        Ok(GenericMemTable {
-            table_id,
-            metadata: Arc::clone(&metadata),
-            mem_pool,
-            row_pool_role,
-            index_pool_role,
-            blk_idx,
-            sec_idx,
-        })
-    }
-
-    /// Returns the logical table id of this runtime.
-    #[inline]
-    pub fn table_id(&self) -> TableID {
-        self.table_id
-    }
-
-    /// Returns the immutable metadata for this table.
-    #[inline]
-    pub fn metadata(&self) -> &TableMetadata {
-        &self.metadata
-    }
-
-    /// Returns the buffer pool used for in-memory row pages.
-    #[inline]
-    pub fn mem_pool(&self) -> &D {
-        &self.mem_pool
-    }
-
-    /// Returns the row page index used by this table.
-    #[inline]
-    pub fn blk_idx(&self) -> &BlockIndex {
-        &self.blk_idx
-    }
-
-    /// Returns the secondary-index array owned by this table.
-    #[inline]
-    pub(crate) fn sec_idx(&self) -> &[Option<InMemorySecondaryIndex<I>>] {
-        &self.sec_idx
-    }
-
-    #[inline]
-    pub(crate) fn require_sec_idx(&self, index_no: usize) -> Result<&InMemorySecondaryIndex<I>> {
-        self.sec_idx
-            .get(index_no)
-            .and_then(Option::as_ref)
-            .ok_or_else(|| missing_secondary_index(index_no, self.sec_idx.len()))
-    }
-
-    /// Returns the row-id boundary between persisted and in-memory rows.
-    #[inline]
-    pub fn pivot_row_id(&self) -> RowID {
-        self.blk_idx.pivot_row_id()
-    }
-
-    #[inline]
-    fn row_pool_guard<'a>(&self, guards: &'a PoolGuards) -> &'a PoolGuard {
-        guards
-            .try_row_guard(self.row_pool_role)
-            .expect("missing row-page pool guard")
-    }
-
-    #[inline]
-    pub(crate) fn index_pool_guard<'a>(&self, guards: &'a PoolGuards) -> &'a PoolGuard {
-        guards
-            .try_guard(self.index_pool_role)
-            .expect("missing secondary-index pool guard")
-    }
-
-    /// Destroy all mutable memory structures owned by this table runtime.
-    #[inline]
-    pub(crate) async fn destroy(self, guards: &PoolGuards) -> Result<()> {
-        let row_pool_guard = guards
-            .try_row_guard(self.row_pool_role)
-            .expect("missing row-page pool guard");
-        let index_pool_guard = guards
-            .try_guard(self.index_pool_role)
-            .expect("missing secondary-index pool guard");
-        let GenericMemTable {
-            mem_pool,
-            blk_idx,
-            sec_idx,
-            ..
-        } = self;
-        for index in sec_idx.into_iter().flatten() {
-            index.destroy(index_pool_guard).await?;
-        }
-        blk_idx
-            .destroy(guards.meta_guard(), &*mem_pool, row_pool_guard)
-            .await
-    }
-
-    #[inline]
-    pub(crate) async fn get_row_page_shared(
-        &self,
-        guards: &PoolGuards,
-        page_id: PageID,
-    ) -> Result<Option<PageSharedGuard<RowPage>>> {
-        Ok(self
-            .mem_pool()
-            .get_page::<RowPage>(
-                self.row_pool_guard(guards),
-                page_id,
-                LatchFallbackMode::Shared,
-            )
-            .await?
-            .lock_shared_async()
-            .await)
-    }
-
-    #[inline]
-    pub(crate) async fn get_row_page_versioned_shared(
-        &self,
-        guards: &PoolGuards,
-        page_id: VersionedPageID,
-    ) -> Result<Option<PageSharedGuard<RowPage>>> {
-        let guard = self
-            .mem_pool()
-            .get_page_versioned::<RowPage>(
-                self.row_pool_guard(guards),
-                page_id,
-                LatchFallbackMode::Shared,
-            )
-            .await?;
-        Ok(match guard {
-            Some(guard) => guard.lock_shared_async().await,
-            None => None,
-        })
-    }
-
-    #[inline]
-    pub(crate) async fn get_row_page_exclusive(
-        &self,
-        guards: &PoolGuards,
-        page_id: PageID,
-    ) -> Result<Option<PageExclusiveGuard<RowPage>>> {
-        Ok(self
-            .mem_pool()
-            .get_page::<RowPage>(
-                self.row_pool_guard(guards),
-                page_id,
-                LatchFallbackMode::Exclusive,
-            )
-            .await?
-            .lock_exclusive_async()
-            .await)
-    }
-
-    #[inline]
-    async fn must_get_row_page_shared(
-        &self,
-        guards: &PoolGuards,
-        page_id: PageID,
-    ) -> Result<PageSharedGuard<RowPage>> {
-        self.get_row_page_shared(guards, page_id)
-            .await
-            .and_then(|guard| {
-                guard.ok_or_else(|| {
-                    Report::new(InternalError::RowPageMissing)
-                        .attach(format!("page_id={page_id}"))
-                        .into()
-                })
-            })
-    }
-
-    #[inline]
-    async fn must_get_row_page_exclusive(
-        &self,
-        guards: &PoolGuards,
-        page_id: PageID,
-    ) -> Result<PageExclusiveGuard<RowPage>> {
-        self.get_row_page_exclusive(guards, page_id)
-            .await
-            .and_then(|guard| {
-                guard.ok_or_else(|| {
-                    Report::new(InternalError::RowPageMissing)
-                        .attach(format!("page_id={page_id}"))
-                        .into()
-                })
-            })
-    }
-
-    #[inline]
-    pub(crate) async fn try_get_insert_page(
-        &self,
-        guards: &PoolGuards,
-        count: usize,
-        redo_ctx: Option<RowPageCreateRedoCtx<'_>>,
-    ) -> Result<PageSharedGuard<RowPage>> {
-        let meta_pool_guard = guards.meta_guard();
-        let row_pool_guard = self.row_pool_guard(guards);
-        self.blk_idx
-            .try_get_insert_page_with_redo(
-                meta_pool_guard,
-                self.mem_pool(),
-                row_pool_guard,
-                &self.metadata,
-                count,
-                redo_ctx,
-            )
-            .await
-    }
-
-    #[inline]
-    pub(crate) async fn get_insert_page_exclusive(
-        &self,
-        guards: &PoolGuards,
-        count: usize,
-        redo_ctx: Option<RowPageCreateRedoCtx<'_>>,
-    ) -> Result<PageExclusiveGuard<RowPage>> {
-        let meta_pool_guard = guards.meta_guard();
-        let row_pool_guard = self.row_pool_guard(guards);
-        self.blk_idx
-            .get_insert_page_exclusive_with_redo(
-                meta_pool_guard,
-                self.mem_pool(),
-                row_pool_guard,
-                &self.metadata,
-                count,
-                redo_ctx,
-            )
-            .await
-    }
-
-    #[inline]
-    pub(crate) async fn allocate_row_page_at(
-        &self,
-        guards: &PoolGuards,
-        count: usize,
-        page_id: PageID,
-    ) -> Result<PageExclusiveGuard<RowPage>> {
-        let meta_pool_guard = guards.meta_guard();
-        let row_pool_guard = self.row_pool_guard(guards);
-        self.blk_idx
-            .allocate_row_page_at(
-                meta_pool_guard,
-                self.mem_pool(),
-                row_pool_guard,
-                &self.metadata,
-                count,
-                page_id,
-            )
-            .await
-    }
-
-    #[inline]
-    pub(crate) fn cache_exclusive_insert_page(&self, guard: PageExclusiveGuard<RowPage>) {
-        self.blk_idx.cache_exclusive_insert_page(guard)
-    }
-
-    pub(crate) async fn mem_scan<F>(&self, guards: &PoolGuards, mut page_action: F)
-    where
-        F: FnMut(PageSharedGuard<RowPage>) -> bool,
-    {
-        let meta_pool_guard = guards.meta_guard();
-        let mut cursor = self.blk_idx.mem_cursor(meta_pool_guard);
-        cursor.seek(0).await;
-        while let Some(leaf) = cursor.next().await {
-            let g = leaf.lock_shared_async().await.unwrap();
-            debug_assert!(g.page().is_leaf());
-            let entries = g.page().leaf_entries();
-            let pivot_row_id = self.pivot_row_id();
-            for page_entry in entries {
-                // Row-page index entries below the pivot have already moved to
-                // column storage; their row-page frames may be deallocated.
-                if page_entry.row_id < pivot_row_id {
-                    continue;
-                }
-                let page_guard = self
-                    .must_get_row_page_shared(guards, page_entry.page_id)
-                    .await
-                    .expect("table mem scan should not ignore row-page access failures");
-                if !page_action(page_guard) {
-                    return;
-                }
-            }
-        }
-    }
-
-    #[inline]
-    pub(crate) async fn find_row(
-        &self,
-        guards: &PoolGuards,
-        row_id: RowID,
-        storage: Option<&ColumnStorage>,
-    ) -> RowLocation {
-        let meta_pool_guard = guards.meta_guard();
-        let disk_pool_guard = storage.map(|_| guards.disk_guard());
-        self.blk_idx
-            .find_row(meta_pool_guard, disk_pool_guard, row_id, storage)
-            .await
-    }
-
-    #[inline]
-    pub(crate) async fn try_find_row(
-        &self,
-        guards: &PoolGuards,
-        row_id: RowID,
-        storage: Option<&ColumnStorage>,
-    ) -> Result<RowLocation> {
-        let meta_pool_guard = guards.meta_guard();
-        let disk_pool_guard = storage.map(|_| guards.disk_guard());
-        self.blk_idx
-            .try_find_row(meta_pool_guard, disk_pool_guard, row_id, storage)
-            .await
-    }
-}
-
-impl ColumnStorage {
-    #[inline]
-    pub(crate) fn new(
-        file: Arc<TableFile>,
-        disk_pool: QuiescentGuard<ReadonlyBufferPool>,
-    ) -> Result<Self> {
-        // `catalog_load_boundary`: table construction binds the loaded root to
-        // initialize column storage and validate secondary root layout.
-        let active_root = file.active_root_unchecked();
-        let metadata = Arc::clone(&active_root.metadata);
-        if active_root.secondary_index_roots.len() != metadata.index_slot_count() {
-            return Err(Report::new(DataIntegrityError::InvalidRootInvariant)
-                .attach(format!(
-                    "secondary root count mismatch: root_count={}, index_slot_count={}",
-                    active_root.secondary_index_roots.len(),
-                    metadata.index_slot_count()
-                ))
-                .into());
-        }
-        let mut secondary_indexes = Vec::with_capacity(metadata.index_slot_count());
-        secondary_indexes.resize_with(metadata.index_slot_count(), || None);
-        for (index_no, _) in metadata.active_indexes() {
-            secondary_indexes[index_no] = Some(SecondaryDiskTreeRuntime::new(
-                index_no,
-                Arc::clone(&metadata),
-                Arc::clone(&file),
-                disk_pool.clone(),
-            )?);
-        }
-        let secondary_indexes = secondary_indexes.into_boxed_slice();
-        Ok(ColumnStorage {
-            file,
-            disk_pool,
-            deletion_buffer: ColumnDeletionBuffer::new(),
-            secondary_indexes,
-        })
-    }
-
-    /// Returns the underlying table file for persisted column data.
-    #[inline]
-    pub(crate) fn file(&self) -> &Arc<TableFile> {
-        &self.file
-    }
-
-    /// Bind one active root observation under a transaction read proof.
-    #[inline]
-    pub(crate) fn with_active_root<'ctx, R, F>(&self, _proof: &TrxReadProof<'ctx>, f: F) -> R
-    where
-        F: for<'root> FnOnce(&'root ActiveRoot) -> R,
-    {
-        let root = self.file().active_root_unchecked();
-        f(root)
-    }
-
-    /// Returns the read-only buffer pool used for persisted blocks.
-    #[inline]
-    pub fn disk_pool(&self) -> &QuiescentGuard<ReadonlyBufferPool> {
-        &self.disk_pool
-    }
-
-    /// Returns the deletion buffer tracking persisted-row tombstones.
-    #[inline]
-    pub fn deletion_buffer(&self) -> &ColumnDeletionBuffer {
-        &self.deletion_buffer
-    }
-
-    /// Returns the reusable secondary DiskTree runtimes owned by this table.
-    #[inline]
-    pub(crate) fn secondary_index_runtimes(&self) -> &[Option<SecondaryDiskTreeRuntime>] {
-        &self.secondary_indexes
-    }
 }
 
 impl Table {
@@ -835,6 +122,12 @@ impl Table {
             retired_secondary_indexes: Mutex::new(Vec::new()),
             lifecycle: TableLifecycle::new(),
         })
+    }
+
+    /// Returns the logical table id of this user-table runtime.
+    #[inline]
+    pub fn table_id(&self) -> TableID {
+        self.mem.table_id()
     }
 
     /// Ensures a foreground operation may access this table after logical locks.
@@ -948,20 +241,11 @@ impl Table {
 
     /// Build a lightweight operation accessor over an already captured layout.
     #[inline]
-    pub(crate) fn accessor_with_layout(
-        &self,
-        layout: Arc<TableRuntimeLayout>,
-    ) -> HybridTableAccessor<'_> {
-        HybridTableAccessor::new_user(self, layout)
-    }
-
-    /// Build a lightweight operation accessor over an externally pinned layout.
-    #[inline]
-    pub(crate) fn accessor_with_borrowed_layout<'a>(
+    pub(crate) fn accessor_with_layout<'a>(
         &'a self,
         layout: &'a TableRuntimeLayout,
-    ) -> HybridTableAccessor<'a> {
-        HybridTableAccessor::new_user_borrowed(self, layout)
+    ) -> UserTableAccessor<'a> {
+        UserTableAccessor::new(self, layout)
     }
 
     /// Capture the current user-table runtime layout.
@@ -1155,13 +439,55 @@ impl Table {
     }
 
     #[inline]
-    pub(crate) async fn find_row(&self, guards: &PoolGuards, row_id: RowID) -> RowLocation {
-        GenericMemTable::find_row(self, guards, row_id, Some(&self.storage)).await
+    pub(crate) async fn find_row(&self, guards: &PoolGuards, row_id: RowID) -> Result<RowLocation> {
+        self.mem
+            .blk_idx
+            .find_row(
+                guards.meta_guard(),
+                Some(guards.disk_guard()),
+                row_id,
+                Some(&self.storage),
+            )
+            .await
     }
 
-    async fn collect_frozen_pages(&self, guards: &PoolGuards) -> (Vec<FrozenPage>, Option<TrxID>) {
+    #[inline]
+    fn missing_pool_guard(&self, operation: &'static str, role: &'static str) -> Error {
+        Report::new(InternalError::Generic)
+            .attach(format!(
+                "operation={operation}, table_id={}, missing {role} pool guard",
+                self.table_id()
+            ))
+            .into()
+    }
+
+    #[inline]
+    fn stale_block_index_leaf(&self, operation: &'static str) -> Error {
+        Report::new(InternalError::Generic)
+            .attach(format!(
+                "operation={operation}, table_id={}, stale block-index leaf lock",
+                self.table_id()
+            ))
+            .into()
+    }
+
+    #[inline]
+    fn meta_pool_guard<'a>(
+        &self,
+        guards: &'a PoolGuards,
+        operation: &'static str,
+    ) -> Result<&'a PoolGuard> {
+        guards
+            .try_guard(PoolRole::Meta)
+            .ok_or_else(|| self.missing_pool_guard(operation, "meta"))
+    }
+
+    async fn collect_frozen_pages(
+        &self,
+        guards: &PoolGuards,
+    ) -> Result<(Vec<FrozenPage>, Option<TrxID>)> {
         let mut frozen_pages = Vec::new();
-        let pivot_row_id = self.pivot_row_id();
+        let pivot_row_id = self.mem.pivot_row_id();
         let mut expected_row_id = pivot_row_id;
         let mut heap_redo_start_ts = None;
         let mut seen_first_page = false;
@@ -1195,8 +521,8 @@ impl Table {
             expected_row_id = end_row_id;
             true
         })
-        .await;
-        (frozen_pages, heap_redo_start_ts)
+        .await?;
+        Ok((frozen_pages, heap_redo_start_ts))
     }
 
     async fn wait_for_frozen_pages_stable(
@@ -1212,6 +538,7 @@ impl Table {
                 // A potential optimization is to check row version map without loading
                 // row page back. This requires interface change of buffer pool.
                 let page_guard = self
+                    .mem
                     .must_get_row_page_shared(guards, page_info.page_id)
                     .await?;
                 let (ctx, _) = page_guard.ctx_and_page();
@@ -1240,6 +567,7 @@ impl Table {
     ) -> Result<()> {
         for page_info in frozen_pages {
             let page_guard = self
+                .mem
                 .must_get_row_page_shared(guards, page_info.page_id)
                 .await?;
             let (ctx, page) = page_guard.ctx_and_page();
@@ -1270,6 +598,7 @@ impl Table {
             let mut current_end: RowID = 0;
             for page_info in frozen_pages {
                 let page_guard = self
+                    .mem
                     .must_get_row_page_shared(guards, page_info.page_id)
                     .await?;
                 let (ctx, page) = page_guard.ctx_and_page();
@@ -1413,9 +742,9 @@ impl Table {
     #[inline]
     pub async fn total_row_pages(&self, guards: &PoolGuards) -> usize {
         let mut res = 0usize;
-        let pivot_row_id = self.pivot_row_id();
+        let pivot_row_id = self.mem.pivot_row_id();
         let meta_pool_guard = guards.meta_guard();
-        let mut cursor = self.blk_idx().mem_cursor(meta_pool_guard);
+        let mut cursor = self.mem.blk_idx().mem_cursor(meta_pool_guard);
         cursor.seek(pivot_row_id).await;
         while let Some(leaf) = cursor.next().await {
             let g = leaf.lock_shared_async().await.unwrap();
@@ -1430,18 +759,20 @@ impl Table {
         res
     }
 
-    async fn mem_scan<F>(&self, guards: &PoolGuards, mut page_action: F)
+    async fn mem_scan<F>(&self, guards: &PoolGuards, mut page_action: F) -> Result<()>
     where
         F: FnMut(PageSharedGuard<RowPage>) -> bool,
     {
         // With cursor, we lock two pages in block index and one row page
         // when scanning rows.
-        let meta_pool_guard = guards.meta_guard();
-        let pivot_row_id = self.pivot_row_id();
-        let mut cursor = self.blk_idx().mem_cursor(meta_pool_guard);
+        let meta_pool_guard = self.meta_pool_guard(guards, "table mem scan")?;
+        let pivot_row_id = self.mem.pivot_row_id();
+        let mut cursor = self.mem.blk_idx().mem_cursor(meta_pool_guard);
         cursor.seek(pivot_row_id).await;
         while let Some(leaf) = cursor.next().await {
-            let g = leaf.lock_shared_async().await.unwrap();
+            let Some(g) = leaf.lock_shared_async().await else {
+                return Err(self.stale_block_index_leaf("table mem scan"));
+            };
             debug_assert!(g.page().is_leaf());
             let entries = g.page().leaf_entries();
             for page_entry in entries {
@@ -1449,14 +780,15 @@ impl Table {
                     continue;
                 }
                 let page_guard = self
+                    .mem
                     .must_get_row_page_shared(guards, page_entry.page_id)
-                    .await
-                    .expect("table mem scan should not ignore row-page access failures");
+                    .await?;
                 if !page_action(page_guard) {
-                    return;
+                    return Ok(());
                 }
             }
         }
+        Ok(())
     }
 
     #[inline]
@@ -1645,7 +977,7 @@ impl Table {
         row_id: RowID,
         cts: TrxID,
     ) -> Result<RecoverIndex> {
-        let index_pool_guard = self.index_pool_guard(guards);
+        let index_pool_guard = self.mem.index_pool_guard(guards)?;
         loop {
             match index
                 .insert_if_not_exists(index_pool_guard, &key.vals, row_id, true, MIN_SNAPSHOT_TS)
@@ -1707,7 +1039,7 @@ impl Table {
         key: SelectKey,
         row_id: RowID,
     ) -> Result<RecoverIndex> {
-        let index_pool_guard = self.index_pool_guard(guards);
+        let index_pool_guard = self.mem.index_pool_guard(guards)?;
         let res = index
             .insert_if_not_exists(index_pool_guard, &key.vals, row_id, true, MIN_SNAPSHOT_TS)
             .await?;
@@ -1723,7 +1055,7 @@ impl Table {
         key: SelectKey,
         row_id: RowID,
     ) -> Result<RecoverIndex> {
-        let index_pool_guard = self.index_pool_guard(guards);
+        let index_pool_guard = self.mem.index_pool_guard(guards)?;
         if !index
             .compare_delete(index_pool_guard, &key.vals, row_id, true, MIN_SNAPSHOT_TS)
             .await?
@@ -1743,7 +1075,7 @@ impl Table {
         key: SelectKey,
         row_id: RowID,
     ) -> Result<RecoverIndex> {
-        let index_pool_guard = self.index_pool_guard(guards);
+        let index_pool_guard = self.mem.index_pool_guard(guards)?;
         if !index
             .compare_delete(index_pool_guard, &key.vals, row_id, true, MIN_SNAPSHOT_TS)
             .await?
@@ -1759,11 +1091,11 @@ impl Table {
         guards: &PoolGuards,
         row_id: RowID,
     ) -> Result<Option<TrxID>> {
-        Ok(match self.find_row(guards, row_id).await {
+        Ok(match self.find_row(guards, row_id).await? {
             RowLocation::NotFound => None,
             RowLocation::LwcBlock { .. } => todo!("lwc block"),
             RowLocation::RowPage(page_id) => {
-                let page_guard = self.must_get_row_page_shared(guards, page_id).await?;
+                let page_guard = self.mem.must_get_row_page_shared(guards, page_id).await?;
                 debug_assert!(validate_page_row_range(&page_guard, page_id, row_id));
                 let (ctx, page) = page_guard.ctx_and_page();
                 let row_idx = page.row_idx(row_id);
@@ -1774,13 +1106,182 @@ impl Table {
     }
 }
 
-impl Deref for Table {
-    type Target = GenericMemTable<EvictableBufferPool, EvictableBufferPool>;
+/// Owned projection of one proof-gated user-table active root.
+///
+/// The snapshot contains only runtime read contract fields copied from a
+/// single active-root observation. Publication and allocation internals remain
+/// behind the table-file boundary.
+pub(crate) struct TableRootSnapshot<'ctx> {
+    root_trx_id: TrxID,
+    pivot_row_id: RowID,
+    column_block_index_root: BlockID,
+    secondary_index_roots: Vec<BlockID>,
+    deletion_cutoff_ts: TrxID,
+    _proof: PhantomData<&'ctx TrxContext>,
+}
+
+impl<'ctx> TableRootSnapshot<'ctx> {
+    #[inline]
+    fn from_active_root(root: &ActiveRoot, _proof: &TrxReadProof<'ctx>) -> Self {
+        Self {
+            root_trx_id: root.trx_id,
+            pivot_row_id: root.pivot_row_id,
+            column_block_index_root: root.column_block_index_root,
+            secondary_index_roots: root.secondary_index_roots.clone(),
+            deletion_cutoff_ts: root.deletion_cutoff_ts,
+            _proof: PhantomData,
+        }
+    }
+
+    /// Returns the checkpoint timestamp carried by the captured root.
+    #[inline]
+    pub(crate) fn root_trx_id(&self) -> TrxID {
+        self.root_trx_id
+    }
+
+    /// Returns the row-id boundary between persisted and in-memory rows.
+    #[inline]
+    pub(crate) fn pivot_row_id(&self) -> RowID {
+        self.pivot_row_id
+    }
+
+    /// Returns the persisted column-block-index root from the captured root.
+    #[inline]
+    pub(crate) fn column_block_index_root(&self) -> BlockID {
+        self.column_block_index_root
+    }
+
+    /// Returns the cold-row deletion replay cutoff from the captured root.
+    #[inline]
+    pub(crate) fn deletion_cutoff_ts(&self) -> TrxID {
+        self.deletion_cutoff_ts
+    }
+
+    /// Returns the captured DiskTree root for one secondary index.
+    #[inline]
+    pub(crate) fn secondary_index_root(&self, index_no: usize) -> Result<BlockID> {
+        self.secondary_index_roots
+            .get(index_no)
+            .copied()
+            .ok_or_else(|| missing_secondary_index(index_no, self.secondary_index_roots.len()))
+    }
+
+    /// Returns whether the captured root predates the supplied snapshot time.
+    #[inline]
+    pub(crate) fn root_is_visible_to(&self, sts: TrxID) -> bool {
+        self.root_trx_id < sts
+    }
+}
+
+struct FrozenPage {
+    page_id: PageID,
+    start_row_id: RowID,
+    end_row_id: RowID,
+}
+
+type VisibleRowCollector<'a> = &'a mut dyn FnMut(&RowPage, usize, RowID) -> Result<()>;
+
+/// Stages newly built dual-tree secondary indexes until the caller publishes them.
+struct SecondaryIndexScopedBuilder {
+    staged: Vec<Option<SecondaryIndex<EvictableBufferPool>>>,
+}
+
+impl SecondaryIndexScopedBuilder {
+    #[inline]
+    fn new(capacity: usize) -> Self {
+        let mut staged = Vec::with_capacity(capacity);
+        staged.resize_with(capacity, || None);
+        Self { staged }
+    }
 
     #[inline]
-    fn deref(&self) -> &Self::Target {
-        &self.mem
+    fn push(&mut self, index_no: usize, index: SecondaryIndex<EvictableBufferPool>) {
+        debug_assert!(self.staged[index_no].is_none());
+        self.staged[index_no] = Some(index);
     }
+
+    #[inline]
+    async fn rollback(&mut self, pool_guard: &PoolGuard) {
+        for index in std::mem::take(&mut self.staged).into_iter().rev().flatten() {
+            // Keep the original construction error as the function result.
+            let _ = index.destroy(pool_guard).await;
+        }
+    }
+
+    #[inline]
+    fn publish(self) -> Box<[Option<Arc<SecondaryIndex<EvictableBufferPool>>>]> {
+        self.staged
+            .into_iter()
+            .map(|index| index.map(Arc::new))
+            .collect::<Vec<_>>()
+            .into_boxed_slice()
+    }
+}
+
+/// Build user-table dual-tree secondary indexes from fresh MemIndex backends
+/// paired with the table file's checkpointed DiskTree runtimes.
+#[inline]
+pub(crate) async fn build_dual_tree_secondary_indexes(
+    index_pool: QuiescentGuard<EvictableBufferPool>,
+    index_pool_guard: &PoolGuard,
+    metadata: Arc<TableMetadata>,
+    file: Arc<TableFile>,
+    disk_pool: QuiescentGuard<ReadonlyBufferPool>,
+    index_ts: TrxID,
+) -> Result<Box<[Option<Arc<SecondaryIndex<EvictableBufferPool>>>]>> {
+    let mut builder = SecondaryIndexScopedBuilder::new(metadata.index_slot_count());
+    for (index_no, index_spec) in metadata.active_indexes() {
+        let runtime = match SecondaryDiskTreeRuntime::new(
+            index_no,
+            Arc::clone(&metadata),
+            Arc::clone(&file),
+            disk_pool.clone(),
+        ) {
+            Ok(runtime) => runtime,
+            Err(err) => {
+                builder.rollback(index_pool_guard).await;
+                return Err(err);
+            }
+        };
+        let ty_infer = |col_no: usize| metadata.col_type(col_no);
+        let index = if index_spec.unique() {
+            let mem = match UniqueMemIndex::new(
+                index_pool.clone(),
+                index_pool_guard,
+                index_spec,
+                ty_infer,
+                index_ts,
+            )
+            .await
+            {
+                Ok(mem) => mem,
+                Err(err) => {
+                    builder.rollback(index_pool_guard).await;
+                    return Err(err);
+                }
+            };
+            SecondaryIndex::Unique { mem, disk: runtime }
+        } else {
+            let mem = match NonUniqueMemIndex::new(
+                index_pool.clone(),
+                index_pool_guard,
+                index_spec,
+                ty_infer,
+                index_ts,
+            )
+            .await
+            {
+                Ok(mem) => mem,
+                Err(err) => {
+                    builder.rollback(index_pool_guard).await;
+                    return Err(err);
+                }
+            };
+            SecondaryIndex::NonUnique { mem, disk: runtime }
+        };
+        builder.push(index_no, index);
+    }
+    Ok(builder.publish())
 }
 
 #[inline]
@@ -1893,4 +1394,18 @@ fn read_latest_index_key(
         new_key.vals[pos] = val;
     }
     new_key
+}
+
+#[inline]
+fn missing_secondary_index(index_no: usize, index_count: usize) -> Error {
+    Report::new(InternalError::SecondaryIndexOutOfBounds)
+        .attach(format!("index_no={index_no}, index_count={index_count}"))
+        .into()
+}
+
+#[inline]
+fn secondary_index_kind_mismatch(operation: &'static str, expected: &'static str) -> Error {
+    Report::new(InternalError::SecondaryIndexKindMismatch)
+        .attach(format!("operation={operation}, expected={expected}"))
+        .into()
 }

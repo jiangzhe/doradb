@@ -1,8 +1,9 @@
 use crate::buffer::PoolGuards;
-use crate::catalog::{TableCache, TableID};
+use crate::catalog::{TableCache, TableID, is_catalog_obj_id};
 use crate::error::Result;
 use crate::row::RowID;
 use crate::row::ops::SelectKey;
+use crate::table::IndexRollback;
 use crate::trx::TrxID;
 
 /// Buffer of index undo entries accumulated for rollback and GC handoff.
@@ -47,8 +48,13 @@ impl IndexUndoLogs {
         ts: TrxID,
     ) -> Result<()> {
         while let Some(entry) = self.0.pop() {
-            let table = table_cache.must_get_table_binding_mut(entry.table_id).await;
-            table.rollback_index_entry(entry, guards, ts).await?;
+            if is_catalog_obj_id(entry.table_id) {
+                let table = table_cache.must_get_catalog_table(entry.table_id);
+                table.rollback_index_entry(entry, guards, ts).await?;
+            } else {
+                let table = table_cache.must_get_user_entry_mut(entry.table_id).await;
+                table.rollback_index_entry(entry, guards, ts).await?;
+            }
         }
         Ok(())
     }

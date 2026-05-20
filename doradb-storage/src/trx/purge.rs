@@ -1,6 +1,7 @@
 use crate::buffer::PageID;
+use crate::buffer::guard::PageSharedGuard;
 use crate::buffer::{BufferPool, EvictableBufferPool, PoolGuards};
-use crate::catalog::{Catalog, TableCache, TableHandle, TableID};
+use crate::catalog::{Catalog, TableCache, TableID, is_catalog_obj_id};
 use crate::error::{FatalError, Result};
 use crate::file::table_file::OldRoot;
 use crate::latch::LatchFallbackMode;
@@ -24,12 +25,27 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread::JoinHandle;
 
 #[inline]
-fn promote_delete_marker_if_needed(table: &TableHandle, undo: &OwnedRowUndo) {
-    if matches!(&undo.kind, RowUndoKind::Delete)
-        && let Some(deletion_buffer) = table.deletion_buffer()
-    {
-        deletion_buffer.promote_delete_marker_if_committed(undo.row_id);
+fn promote_delete_marker_if_needed(table: &Table, undo: &OwnedRowUndo) {
+    if matches!(&undo.kind, RowUndoKind::Delete) {
+        table
+            .deletion_buffer()
+            .promote_delete_marker_if_committed(undo.row_id);
     }
+}
+
+#[inline]
+fn purge_undo_chain_from_page(
+    page_guard: PageSharedGuard<RowPage>,
+    undo: &OwnedRowUndo,
+    min_active_sts: TrxID,
+) {
+    let (ctx, page) = page_guard.ctx_and_page();
+    if !page.row_id_in_valid_range(undo.row_id) {
+        return;
+    }
+    let row_idx = page.row_idx(undo.row_id);
+    let mut access = RowWriteAccess::new(page, ctx, row_idx, None, false);
+    access.purge_undo_chain(min_active_sts);
 }
 
 #[inline]
@@ -312,28 +328,41 @@ impl TransactionSystem {
             if let Some(row_undo) = trx.row_undo() {
                 purge_row_count += row_undo.len();
                 for undo in &**row_undo {
-                    let Some(table) = table_cache.get_table_ref(undo.table_id).await else {
-                        continue;
-                    };
-                    let page_guard = if let Some(page_id) = undo.page_id {
-                        table
-                            .get_row_page_versioned_shared(guards, page_id)
-                            .await
-                            .expect("purge should not ignore row-page access failures")
+                    if is_catalog_obj_id(undo.table_id) {
+                        let Some(table) = table_cache.get_catalog_table(undo.table_id) else {
+                            continue;
+                        };
+                        let page_guard = if let Some(page_id) = undo.page_id {
+                            table
+                                .get_row_page_versioned_shared(guards, page_id)
+                                .await
+                                .expect("purge should not ignore row-page access failures")
+                        } else {
+                            None
+                        };
+                        let Some(page_guard) = page_guard else {
+                            continue;
+                        };
+                        purge_undo_chain_from_page(page_guard, undo, min_active_sts);
                     } else {
-                        None
-                    };
-                    let Some(page_guard) = page_guard else {
-                        promote_delete_marker_if_needed(table, undo);
-                        continue;
-                    };
-                    let (ctx, page) = page_guard.ctx_and_page();
-                    if !page.row_id_in_valid_range(undo.row_id) {
-                        continue;
+                        let Some(table) = table_cache.get_user_table(undo.table_id).await else {
+                            continue;
+                        };
+                        let page_guard = if let Some(page_id) = undo.page_id {
+                            table
+                                .mem
+                                .get_row_page_versioned_shared(guards, page_id)
+                                .await
+                                .expect("purge should not ignore row-page access failures")
+                        } else {
+                            None
+                        };
+                        let Some(page_guard) = page_guard else {
+                            promote_delete_marker_if_needed(table, undo);
+                            continue;
+                        };
+                        purge_undo_chain_from_page(page_guard, undo, min_active_sts);
                     }
-                    let row_idx = page.row_idx(undo.row_id);
-                    let mut access = RowWriteAccess::new(page, ctx, row_idx, None, false);
-                    access.purge_undo_chain(min_active_sts);
                 }
             }
         }
@@ -342,14 +371,26 @@ impl TransactionSystem {
         for trx in &trx_list {
             if let Some(index_gc) = trx.index_gc() {
                 for ip in index_gc {
-                    let Some(table) = table_cache.get_table_binding_mut(ip.table_id).await else {
-                        continue;
-                    };
-                    if let Ok(true) = table
-                        .delete_index(guards, &ip.key, ip.row_id, ip.unique, min_active_sts)
-                        .await
-                    {
-                        purge_index_count += 1;
+                    if is_catalog_obj_id(ip.table_id) {
+                        let Some(table) = table_cache.get_catalog_table(ip.table_id) else {
+                            continue;
+                        };
+                        if let Ok(true) = table
+                            .delete_index(guards, &ip.key, ip.row_id, ip.unique, min_active_sts)
+                            .await
+                        {
+                            purge_index_count += 1;
+                        }
+                    } else {
+                        let Some(table) = table_cache.get_user_entry_mut(ip.table_id).await else {
+                            continue;
+                        };
+                        if let Ok(true) = table
+                            .delete_index(guards, &ip.key, ip.row_id, ip.unique, min_active_sts)
+                            .await
+                        {
+                            purge_index_count += 1;
+                        }
                     }
                 }
             }
@@ -1482,14 +1523,19 @@ mod tests {
             else {
                 panic!("row should exist");
             };
-            let page_id = match table.find_row(&pool_guards, row_id).await {
+            let page_id = match table
+                .find_row(&pool_guards, row_id)
+                .await
+                .expect("test row lookup should succeed")
+            {
                 RowLocation::RowPage(page_id) => page_id,
                 RowLocation::LwcBlock { .. } | RowLocation::NotFound => unreachable!(),
             };
             let page_guard = table
+                .mem
                 .mem_pool()
                 .get_page::<RowPage>(
-                    &table.mem_pool().pool_guard(),
+                    &table.mem.mem_pool().pool_guard(),
                     page_id,
                     LatchFallbackMode::Shared,
                 )
@@ -1588,14 +1634,19 @@ mod tests {
             else {
                 panic!("row should exist");
             };
-            let page_id = match table.find_row(&pool_guards, row_id).await {
+            let page_id = match table
+                .find_row(&pool_guards, row_id)
+                .await
+                .expect("test row lookup should succeed")
+            {
                 RowLocation::RowPage(page_id) => page_id,
                 RowLocation::LwcBlock { .. } | RowLocation::NotFound => unreachable!(),
             };
             let page_guard = table
+                .mem
                 .mem_pool()
                 .get_page::<RowPage>(
-                    &table.mem_pool().pool_guard(),
+                    &table.mem.mem_pool().pool_guard(),
                     page_id,
                     LatchFallbackMode::Shared,
                 )
@@ -1843,7 +1894,10 @@ mod tests {
                     .unwrap();
                 println!("gc timeout, remained_row_ids={:?}", remained_row_ids);
                 let row_id = remained_row_ids[0];
-                let location = table.find_row(&pool_guards, row_id).await;
+                let location = table
+                    .find_row(&pool_guards, row_id)
+                    .await
+                    .expect("test row lookup should succeed");
                 let page_id = match location {
                     RowLocation::RowPage(page_id) => page_id,
                     _ => unreachable!(),

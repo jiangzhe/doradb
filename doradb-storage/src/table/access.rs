@@ -1,13 +1,14 @@
+use super::missing_secondary_index;
 use crate::buffer::guard::{PageGuard, PageSharedGuard};
-use crate::buffer::page::INVALID_PAGE_ID;
-use crate::buffer::{BufferPool, EvictableBufferPool, FixedBufferPool, PageID, PoolGuards};
-use crate::catalog::{CatalogTable, TableMetadata};
+use crate::buffer::page::{INVALID_PAGE_ID, VersionedPageID};
+use crate::buffer::{EvictableBufferPool, PageID, PoolGuards};
+use crate::catalog::{TableID, TableMetadata};
 use crate::error::{DataIntegrityError, Error, FileKind, InternalError, OperationError, Result};
 use crate::file::BlockID;
 use crate::index::util::{Maskable, RowPageCreateRedoCtx};
 use crate::index::{
-    InMemorySecondaryIndex, IndexCompareExchange, IndexInsert, NonUniqueIndex,
-    NonUniqueSecondaryIndex, RowLocation, SecondaryIndex, UniqueIndex, UniqueSecondaryIndex,
+    IndexCompareExchange, IndexInsert, NonUniqueIndex, NonUniqueSecondaryIndex, RowLocation,
+    SecondaryIndex, UniqueIndex, UniqueSecondaryIndex,
 };
 use crate::lwc::PersistedLwcBlock;
 use crate::row::ops::{
@@ -32,9 +33,7 @@ use crate::trx::{MIN_SNAPSHOT_TS, TrxContext, TrxID, trx_is_committed};
 use crate::value::Val;
 use error_stack::Report;
 use std::collections::HashMap;
-use std::future::Future;
 use std::mem;
-use std::ops::Deref;
 use std::sync::Arc;
 
 #[inline]
@@ -51,61 +50,8 @@ fn invalid_lwc_payload(
         .into()
 }
 
-#[inline]
-fn missing_user_secondary_index(index_no: usize) -> Error {
-    Report::new(InternalError::UserSecondaryIndexMissing)
-        .attach(format!("index_no={index_no}"))
-        .into()
-}
-
-#[inline]
-fn secondary_index_view_mismatch(operation: &'static str) -> Error {
-    Report::new(InternalError::SecondaryIndexViewMismatch)
-        .attach(format!("operation={operation}"))
-        .into()
-}
-
-#[inline]
-fn missing_secondary_index(index_no: usize, index_count: usize) -> Error {
-    Report::new(InternalError::SecondaryIndexOutOfBounds)
-        .attach(format!("index_no={index_no}, index_count={index_count}"))
-        .into()
-}
-
-#[inline]
-fn secondary_index_kind_mismatch(operation: &'static str, expected: &'static str) -> Error {
-    Report::new(InternalError::SecondaryIndexKindMismatch)
-        .attach(format!("operation={operation}, expected={expected}"))
-        .into()
-}
-
 #[derive(Clone, Copy)]
-enum SecondaryIndexView {
-    Catalog { ts: TrxID },
-    User { ts: TrxID, root: BlockID },
-}
-
-impl SecondaryIndexView {
-    #[inline]
-    const fn catalog(ts: TrxID) -> Self {
-        Self::Catalog { ts }
-    }
-
-    #[inline]
-    const fn user(ts: TrxID, root: BlockID) -> Self {
-        Self::User { ts, root }
-    }
-
-    #[inline]
-    const fn ts(self) -> TrxID {
-        match self {
-            Self::Catalog { ts } | Self::User { ts, .. } => ts,
-        }
-    }
-}
-
-#[derive(Clone, Copy)]
-struct RowIdMove {
+pub(super) struct RowIdMove {
     old: RowID,
     new: RowID,
 }
@@ -117,322 +63,130 @@ impl RowIdMove {
     }
 }
 
-pub(crate) trait TableAccess {
-    /// Table scan including uncommitted versions.
-    ///
-    /// This method iterates raw latest row versions and includes rows marked
-    /// as deleted. Callers should explicitly filter `row.is_deleted()` if they
-    /// only need live rows.
-    ///
-    /// Note: this scans only in-memory row-store pages and does not include
-    /// persisted column-store rows on disk.
-    fn table_scan_uncommitted<F>(
-        &self,
-        guards: &PoolGuards,
-        row_action: F,
-    ) -> impl Future<Output = ()>
-    where
-        F: for<'m, 'p> FnMut(&'m TableMetadata, Row<'p>) -> bool;
-
-    /// Table scan with MVCC.
-    ///
-    /// Note: this scans only in-memory row-store pages and does not include
-    /// persisted column-store rows on disk.
-    fn table_scan_mvcc<F>(
-        &self,
-        ctx: &TrxContext,
-        read_set: &[usize],
-        row_action: F,
-    ) -> impl Future<Output = ()>
-    where
-        F: FnMut(Vec<Val>) -> bool;
-
-    /// Index lookup unique row with MVCC.
-    /// Result should be no more than one row.
-    fn index_lookup_unique_mvcc(
-        &self,
-        ctx: &TrxContext,
-        key: &SelectKey,
-        user_read_set: &[usize],
-    ) -> impl Future<Output = Result<SelectMvcc>>;
-
-    /// Index lookup unique row including uncommitted version.
-    fn index_lookup_unique_uncommitted<R, F>(
-        &self,
-        guards: &PoolGuards,
-        key: &SelectKey,
-        row_action: F,
-    ) -> impl Future<Output = Result<Option<R>>>
-    where
-        for<'m, 'p> F: FnOnce(&'m TableMetadata, Row<'p>) -> R;
-
-    /// Index scan with MVCC of given key.
-    fn index_scan_mvcc(
-        &self,
-        ctx: &TrxContext,
-        key: &SelectKey,
-        user_read_set: &[usize],
-    ) -> impl Future<Output = Result<ScanMvcc>>;
-
-    /// Insert row in transaction.
-    fn insert_mvcc(
-        &self,
-        ctx: &TrxContext,
-        effects: &mut StmtEffects,
-        cols: Vec<Val>,
-    ) -> impl Future<Output = Result<RowID>>;
-
-    /// Update row in transaction.
-    /// This method is for update based on unique index lookup.
-    /// It also takes care of index change.
-    fn update_unique_mvcc(
-        &self,
-        ctx: &TrxContext,
-        effects: &mut StmtEffects,
-        key: &SelectKey,
-        update: Vec<UpdateCol>,
-    ) -> impl Future<Output = Result<UpdateMvcc>>;
-
-    /// Delete row in transaction.
-    /// This method is for delete based on unique index lookup.
-    ///
-    /// If the parameter log_by_key is set to true, the delete operation
-    /// is logged with (unique) key instead of row id.
-    /// Such type of log is used for catalog tables, which will have
-    /// inconsistent page_id/row_id among multiple restarts(recoveries)
-    /// of database.
-    fn delete_unique_mvcc(
-        &self,
-        ctx: &TrxContext,
-        effects: &mut StmtEffects,
-        key: &SelectKey,
-        log_by_key: bool,
-    ) -> impl Future<Output = Result<DeleteMvcc>>;
-
-    /// Delete index by purge threads.
-    /// This method will be only called by internal threads and don't maintain
-    /// transaction properties.
-    ///
-    /// It checks whether the index entry still points to valid row, and if not,
-    /// remove the entry.
-    ///
-    /// The validation is based on MVCC with minimum active STS. If the input
-    /// key is not found on the path of undo chain, it means the index entry can be
-    /// removed.
-    ///
-    /// todo: The look-back mechanism for each index entry is not performant. A
-    /// potential optimization is similar to covering index, page ts can be checked
-    /// to see if all delete-masked values in it can be remove directly.
-    fn delete_index(
-        &self,
-        guards: &PoolGuards,
-        key: &SelectKey,
-        row_id: RowID,
-        unique: bool,
-        min_active_sts: TrxID,
-    ) -> impl Future<Output = Result<bool>>;
-}
-
-/// Thin operation wrapper that exposes `TableAccess` over a table reference.
+/// Operation accessor for user tables.
 ///
-/// `D` is the row-page pool type and `I` is the secondary-index pool type.
-/// Runtime aliases bind user tables to evictable row/index pools and catalog
-/// tables to the fixed metadata pool for both roles.
-pub(crate) struct TableAccessor<'a, D: 'static, I: 'static> {
-    mem: &'a GenericMemTable<D, I>,
-    storage: Option<&'a ColumnStorage>,
-    user_layout: Option<UserLayout<'a>>,
+/// Construction is intentionally explicit: statement paths must acquire the
+/// appropriate logical locks, check table lifecycle, capture one
+/// `TableRuntimeLayout`, and then build this accessor with both column storage
+/// and the pinned layout. That keeps user metadata/index runtime binding
+/// independent from catalog fixed-schema access.
+pub(crate) struct UserTableAccessor<'a> {
+    table: &'a Table,
+    storage: &'a ColumnStorage,
+    layout: &'a TableRuntimeLayout,
 }
 
-enum UserLayout<'a> {
-    Owned(Arc<TableRuntimeLayout>),
-    Borrowed(&'a TableRuntimeLayout),
-}
-
-impl UserLayout<'_> {
-    #[inline]
-    fn as_layout(&self) -> &TableRuntimeLayout {
-        match self {
-            UserLayout::Owned(layout) => layout,
-            UserLayout::Borrowed(layout) => layout,
-        }
-    }
-}
-
-enum IndexPurgeDecision {
+pub(super) enum IndexPurgeDecision {
     Delete,
     Keep,
     RowPage(PageID),
 }
 
-enum ColdRowUpdateRead {
+pub(super) enum ColdRowUpdateRead {
     Ok(Vec<Val>),
     NotFound,
     WriteConflict,
 }
 
-#[inline]
-fn ctx_pool_guards(ctx: &TrxContext) -> &PoolGuards {
-    ctx.pool_guards()
-        .expect("table access requires an attached session for pool guards")
-}
-
-#[inline]
-fn require_user_sec_idx(
-    indexes: &[Option<Arc<SecondaryIndex<EvictableBufferPool>>>],
-    index_no: usize,
-) -> Result<&SecondaryIndex<EvictableBufferPool>> {
-    indexes
-        .get(index_no)
-        .and_then(Option::as_deref)
-        .ok_or_else(|| missing_secondary_index(index_no, indexes.len()))
-}
-
-#[inline]
-fn bound_unique_user_index<'a>(
-    indexes: Option<&'a [Option<Arc<SecondaryIndex<EvictableBufferPool>>>]>,
-    index_no: usize,
-    root: BlockID,
-) -> Result<UniqueSecondaryIndex<'a, EvictableBufferPool>> {
-    let indexes = indexes.ok_or_else(|| missing_user_secondary_index(index_no))?;
-    require_user_sec_idx(indexes, index_no)?.bind_unique(root)
-}
-
-#[inline]
-fn bound_non_unique_user_index<'a>(
-    indexes: Option<&'a [Option<Arc<SecondaryIndex<EvictableBufferPool>>>]>,
-    index_no: usize,
-    root: BlockID,
-) -> Result<NonUniqueSecondaryIndex<'a, EvictableBufferPool>> {
-    let indexes = indexes.ok_or_else(|| missing_user_secondary_index(index_no))?;
-    require_user_sec_idx(indexes, index_no)?.bind_non_unique(root)
-}
-
-impl<'a> From<&'a Table> for TableAccessor<'a, EvictableBufferPool, EvictableBufferPool> {
-    #[inline]
-    fn from(table: &'a Table) -> Self {
-        Self::new_user(table, table.layout_snapshot())
-    }
-}
-
-impl<'a> From<&'a CatalogTable> for TableAccessor<'a, FixedBufferPool, FixedBufferPool> {
-    #[inline]
-    fn from(table: &'a CatalogTable) -> Self {
-        TableAccessor {
-            mem: table,
-            storage: None,
-            user_layout: None,
-        }
-    }
-}
-
-impl<'a> TableAccessor<'a, EvictableBufferPool, EvictableBufferPool> {
-    /// Create a user-table accessor bound to one runtime layout snapshot.
-    #[inline]
-    pub(crate) fn new_user(table: &'a Table, layout: Arc<TableRuntimeLayout>) -> Self {
-        TableAccessor {
-            mem: table,
-            storage: Some(&table.storage),
-            user_layout: Some(UserLayout::Owned(layout)),
-        }
-    }
-
+impl<'a> UserTableAccessor<'a> {
     /// Create a user-table accessor over an externally pinned layout snapshot.
     #[inline]
-    pub(crate) fn new_user_borrowed(table: &'a Table, layout: &'a TableRuntimeLayout) -> Self {
-        TableAccessor {
-            mem: table,
-            storage: Some(&table.storage),
-            user_layout: Some(UserLayout::Borrowed(layout)),
+    pub(crate) fn new(table: &'a Table, layout: &'a TableRuntimeLayout) -> Self {
+        UserTableAccessor {
+            table,
+            storage: &table.storage,
+            layout,
         }
+    }
+
+    #[inline]
+    fn layout(&self) -> &TableRuntimeLayout {
+        self.layout
+    }
+
+    #[inline]
+    fn user_sec_idx(&self) -> &[Option<Arc<SecondaryIndex<EvictableBufferPool>>>] {
+        self.layout().secondary_indexes()
     }
 }
 
-impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
+impl UserTableAccessor<'_> {
     #[inline]
-    fn user_sec_idx(&self) -> Option<&[Option<Arc<SecondaryIndex<EvictableBufferPool>>>]> {
-        self.user_layout
-            .as_ref()
-            .map(|layout| layout.as_layout().secondary_indexes())
+    fn mem(&self) -> &GenericMemTable<EvictableBufferPool, EvictableBufferPool> {
+        &self.table.mem
     }
 
     #[inline]
     fn metadata(&self) -> &TableMetadata {
-        self.user_layout.as_ref().map_or_else(
-            || self.mem.metadata(),
-            |layout| layout.as_layout().metadata(),
-        )
-    }
-
-    #[inline]
-    fn require_generic_sec_idx(&self, index_no: usize) -> Result<&InMemorySecondaryIndex<I>> {
-        self.mem.require_sec_idx(index_no)
+        self.layout().metadata()
     }
 
     #[inline]
     fn sec_idx_len(&self) -> usize {
-        self.user_sec_idx()
-            .map_or_else(|| self.mem.sec_idx().len(), <[_]>::len)
+        self.layout().index_slot_count()
     }
 
     #[inline]
     fn sec_idx_is_active(&self, index_no: usize) -> bool {
-        match self.user_sec_idx() {
-            Some(indexes) => indexes.get(index_no).is_some_and(Option::is_some),
-            None => self
-                .mem
-                .sec_idx()
-                .get(index_no)
-                .is_some_and(Option::is_some),
-        }
+        self.user_sec_idx()
+            .get(index_no)
+            .is_some_and(Option::is_some)
     }
 
     #[inline]
     fn sec_idx_is_unique(&self, index_no: usize) -> bool {
-        match self.user_sec_idx() {
-            Some(indexes) => require_user_sec_idx(indexes, index_no)
-                .expect("active user index slot")
-                .is_unique(),
-            None => self
-                .require_generic_sec_idx(index_no)
-                .expect("active generic index slot")
-                .is_unique(),
-        }
+        self.require_sec_idx(index_no)
+            .expect("active user index slot")
+            .is_unique()
     }
 
     #[inline]
-    fn bound_secondary_view(
+    fn require_sec_idx(&self, index_no: usize) -> Result<&SecondaryIndex<EvictableBufferPool>> {
+        self.user_sec_idx()
+            .get(index_no)
+            .and_then(Option::as_deref)
+            .ok_or_else(|| missing_secondary_index(index_no, self.user_sec_idx().len()))
+    }
+
+    #[inline]
+    fn unique_user_index(
         &self,
-        ctx: &TrxContext,
-        index_no: usize,
-    ) -> Result<SecondaryIndexView> {
-        let Some(storage) = self.storage else {
-            return Ok(SecondaryIndexView::catalog(ctx.sts()));
-        };
-        // User accessors pin the metadata/runtime layout, but intentionally
-        // bind secondary DiskTree operations to the latest proof-gated root.
-        // Checkpoint publication may advance roots without changing layout
-        // shape. Layout-changing DDL must preserve sparse slot numbers and
-        // exclude foreground users before publishing an incompatible layout.
+        key: &SelectKey,
+        root: BlockID,
+    ) -> Result<UniqueSecondaryIndex<'_, EvictableBufferPool>> {
+        self.require_sec_idx(key.index_no)?.bind_unique(root)
+    }
+
+    #[inline]
+    fn non_unique_user_index(
+        &self,
+        key: &SelectKey,
+        root: BlockID,
+    ) -> Result<NonUniqueSecondaryIndex<'_, EvictableBufferPool>> {
+        self.require_sec_idx(key.index_no)?.bind_non_unique(root)
+    }
+
+    #[inline]
+    fn read_proof_secondary_root(&self, ctx: &TrxContext, index_no: usize) -> Result<BlockID> {
+        // User accessors pin metadata/runtime layout, while secondary DiskTree
+        // operations bind to the latest proof-gated root for the same stable
+        // slot. Checkpoint publication may advance roots without changing
+        // layout shape.
         let proof = ctx.read_proof();
-        let root = storage.with_active_root(&proof, |root| {
+        self.storage.with_active_root(&proof, |root| {
             root.secondary_index_roots
                 .get(index_no)
                 .copied()
                 .ok_or_else(|| missing_secondary_index(index_no, root.secondary_index_roots.len()))
-        })?;
-        Ok(SecondaryIndexView::user(ctx.sts(), root))
+        })
     }
 
     #[inline]
-    fn unchecked_secondary_view(&self, ts: TrxID, index_no: usize) -> Result<SecondaryIndexView> {
-        let Some(storage) = self.storage else {
-            return Ok(SecondaryIndexView::catalog(ts));
-        };
+    fn unchecked_secondary_root(&self, index_no: usize) -> Result<BlockID> {
         // Unchecked internal callers share the same layout/root compatibility
         // contract as proof-gated foreground reads. Purge additionally treats
         // inactive layout slots as no-ops before reaching this binding point.
-        let root = storage
+        self.storage
             .file()
             .active_root_unchecked()
             .secondary_index_roots
@@ -441,386 +195,273 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
             .ok_or_else(|| {
                 missing_secondary_index(
                     index_no,
-                    storage
+                    self.storage
                         .file()
                         .active_root_unchecked()
                         .secondary_index_roots
                         .len(),
                 )
-            })?;
-        Ok(SecondaryIndexView::user(ts, root))
+            })
     }
 
     #[inline]
-    fn root_snapshot<'ctx>(
-        &self,
-        ctx: &'ctx TrxContext,
-    ) -> Result<Option<TableRootSnapshot<'ctx>>> {
-        let Some(storage) = self.storage else {
-            return Ok(None);
-        };
+    fn root_snapshot<'ctx>(&self, ctx: &'ctx TrxContext) -> Result<TableRootSnapshot<'ctx>> {
         let proof = ctx.read_proof();
-        Ok(Some(storage.with_active_root(&proof, |root| {
+        Ok(self.storage.with_active_root(&proof, |root| {
             TableRootSnapshot::from_active_root(root, &proof)
-        })))
+        }))
     }
 
     #[inline]
-    fn snapshot_secondary_view(
+    fn snapshot_secondary_root(
         &self,
-        ts: TrxID,
-        snapshot: Option<&TableRootSnapshot<'_>>,
+        snapshot: &TableRootSnapshot<'_>,
         index_no: usize,
-    ) -> Result<SecondaryIndexView> {
-        match (self.user_sec_idx(), snapshot) {
-            (Some(_), Some(snapshot)) => Ok(SecondaryIndexView::user(
-                ts,
-                snapshot.secondary_index_root(index_no)?,
-            )),
-            (Some(_), None) => Err(missing_user_secondary_index(index_no)),
-            (None, _) => Ok(SecondaryIndexView::catalog(ts)),
-        }
+    ) -> Result<BlockID> {
+        snapshot.secondary_index_root(index_no)
     }
 
     #[inline]
     async fn unique_lookup(
         &self,
         guards: &PoolGuards,
-        index_no: usize,
-        key: &[Val],
-        view: SecondaryIndexView,
+        key: &SelectKey,
+        root: BlockID,
+        sts: TrxID,
     ) -> Result<Option<(RowID, bool)>> {
-        let index_pool_guard = self.index_pool_guard(guards);
-        let user_sec_idx = self.user_sec_idx();
-        match (user_sec_idx, view) {
-            (Some(_), SecondaryIndexView::User { ts, root }) => {
-                bound_unique_user_index(user_sec_idx, index_no, root)?
-                    .lookup(index_pool_guard, key, ts)
-                    .await
-            }
-            (Some(_), SecondaryIndexView::Catalog { .. }) => {
-                Err(secondary_index_view_mismatch("unique lookup"))
-            }
-            (None, view) => {
-                self.require_generic_sec_idx(index_no)?
-                    .unique()
-                    .ok_or_else(|| secondary_index_kind_mismatch("unique lookup", "unique"))?
-                    .lookup(index_pool_guard, key, view.ts())
-                    .await
-            }
-        }
+        self.unique_user_index(key, root)?
+            .lookup(self.mem().index_pool_guard(guards)?, &key.vals, sts)
+            .await
     }
 
     #[inline]
     async fn unique_insert_if_not_exists(
         &self,
         guards: &PoolGuards,
-        index_no: usize,
-        key: &[Val],
+        key: &SelectKey,
         row_id: RowID,
         merge_if_match_deleted: bool,
-        view: SecondaryIndexView,
+        root: BlockID,
+        sts: TrxID,
     ) -> Result<IndexInsert> {
-        let index_pool_guard = self.index_pool_guard(guards);
-        let user_sec_idx = self.user_sec_idx();
-        match (user_sec_idx, view) {
-            (Some(_), SecondaryIndexView::User { ts, root }) => {
-                bound_unique_user_index(user_sec_idx, index_no, root)?
-                    .insert_if_not_exists(index_pool_guard, key, row_id, merge_if_match_deleted, ts)
-                    .await
-            }
-            (Some(_), SecondaryIndexView::Catalog { .. }) => {
-                Err(secondary_index_view_mismatch("unique insert"))
-            }
-            (None, view) => {
-                self.require_generic_sec_idx(index_no)?
-                    .unique()
-                    .ok_or_else(|| secondary_index_kind_mismatch("unique insert", "unique"))?
-                    .insert_if_not_exists(
-                        index_pool_guard,
-                        key,
-                        row_id,
-                        merge_if_match_deleted,
-                        view.ts(),
-                    )
-                    .await
-            }
-        }
+        self.unique_user_index(key, root)?
+            .insert_if_not_exists(
+                self.mem().index_pool_guard(guards)?,
+                &key.vals,
+                row_id,
+                merge_if_match_deleted,
+                sts,
+            )
+            .await
     }
 
     #[inline]
     async fn unique_compare_delete(
         &self,
         guards: &PoolGuards,
-        index_no: usize,
-        key: &[Val],
+        key: &SelectKey,
         old_row_id: RowID,
         ignore_del_mask: bool,
         ts: TrxID,
     ) -> Result<bool> {
-        let index_pool_guard = self.index_pool_guard(guards);
-        match self.user_sec_idx() {
-            Some(indexes) => {
-                require_user_sec_idx(indexes, index_no)?
-                    .unique_mem()?
-                    .compare_delete(index_pool_guard, key, old_row_id, ignore_del_mask, ts)
-                    .await
-            }
-            None => {
-                self.require_generic_sec_idx(index_no)?
-                    .unique()
-                    .ok_or_else(|| {
-                        secondary_index_kind_mismatch("unique compare delete", "unique")
-                    })?
-                    .compare_delete(index_pool_guard, key, old_row_id, ignore_del_mask, ts)
-                    .await
-            }
-        }
+        self.require_sec_idx(key.index_no)?
+            .unique_mem()?
+            .compare_delete(
+                self.mem().index_pool_guard(guards)?,
+                &key.vals,
+                old_row_id,
+                ignore_del_mask,
+                ts,
+            )
+            .await
     }
 
     #[inline]
     async fn unique_mask_as_deleted(
         &self,
         guards: &PoolGuards,
-        index_no: usize,
-        key: &[Val],
+        key: &SelectKey,
         row_id: RowID,
-        view: SecondaryIndexView,
+        root: BlockID,
+        sts: TrxID,
     ) -> Result<bool> {
-        let index_pool_guard = self.index_pool_guard(guards);
-        let user_sec_idx = self.user_sec_idx();
-        match (user_sec_idx, view) {
-            (Some(_), SecondaryIndexView::User { ts, root }) => {
-                bound_unique_user_index(user_sec_idx, index_no, root)?
-                    .mask_as_deleted(index_pool_guard, key, row_id, ts)
-                    .await
-            }
-            (Some(_), SecondaryIndexView::Catalog { .. }) => {
-                Err(secondary_index_view_mismatch("unique mask deleted"))
-            }
-            (None, view) => {
-                self.require_generic_sec_idx(index_no)?
-                    .unique()
-                    .ok_or_else(|| secondary_index_kind_mismatch("unique mask deleted", "unique"))?
-                    .mask_as_deleted(index_pool_guard, key, row_id, view.ts())
-                    .await
-            }
-        }
+        self.unique_user_index(key, root)?
+            .mask_as_deleted(self.mem().index_pool_guard(guards)?, &key.vals, row_id, sts)
+            .await
     }
 
     #[inline]
     async fn unique_compare_exchange(
         &self,
         guards: &PoolGuards,
-        index_no: usize,
-        key: &[Val],
+        key: &SelectKey,
         old_row_id: RowID,
         new_row_id: RowID,
-        view: SecondaryIndexView,
+        root: BlockID,
+        sts: TrxID,
     ) -> Result<IndexCompareExchange> {
-        let index_pool_guard = self.index_pool_guard(guards);
-        let user_sec_idx = self.user_sec_idx();
-        match (user_sec_idx, view) {
-            (Some(_), SecondaryIndexView::User { ts, root }) => {
-                bound_unique_user_index(user_sec_idx, index_no, root)?
-                    .compare_exchange(index_pool_guard, key, old_row_id, new_row_id, ts)
-                    .await
-            }
-            (Some(_), SecondaryIndexView::Catalog { .. }) => {
-                Err(secondary_index_view_mismatch("unique compare exchange"))
-            }
-            (None, view) => {
-                self.require_generic_sec_idx(index_no)?
-                    .unique()
-                    .ok_or_else(|| {
-                        secondary_index_kind_mismatch("unique compare exchange", "unique")
-                    })?
-                    .compare_exchange(index_pool_guard, key, old_row_id, new_row_id, view.ts())
-                    .await
-            }
-        }
+        self.unique_user_index(key, root)?
+            .compare_exchange(
+                self.mem().index_pool_guard(guards)?,
+                &key.vals,
+                old_row_id,
+                new_row_id,
+                sts,
+            )
+            .await
     }
 
     #[inline]
     async fn non_unique_lookup(
         &self,
         guards: &PoolGuards,
-        index_no: usize,
-        key: &[Val],
+        key: &SelectKey,
         res: &mut Vec<RowID>,
-        view: SecondaryIndexView,
+        root: BlockID,
+        sts: TrxID,
     ) -> Result<()> {
-        let index_pool_guard = self.index_pool_guard(guards);
-        let user_sec_idx = self.user_sec_idx();
-        match (user_sec_idx, view) {
-            (Some(_), SecondaryIndexView::User { ts, root }) => {
-                bound_non_unique_user_index(user_sec_idx, index_no, root)?
-                    .lookup(index_pool_guard, key, res, ts)
-                    .await
-            }
-            (Some(_), SecondaryIndexView::Catalog { .. }) => {
-                Err(secondary_index_view_mismatch("non-unique lookup"))
-            }
-            (None, view) => {
-                self.require_generic_sec_idx(index_no)?
-                    .non_unique()
-                    .ok_or_else(|| {
-                        secondary_index_kind_mismatch("non-unique lookup", "non-unique")
-                    })?
-                    .lookup(index_pool_guard, key, res, view.ts())
-                    .await
-            }
-        }
+        self.non_unique_user_index(key, root)?
+            .lookup(self.mem().index_pool_guard(guards)?, &key.vals, res, sts)
+            .await
     }
 
     #[inline]
     async fn non_unique_lookup_unique(
         &self,
         guards: &PoolGuards,
-        index_no: usize,
-        key: &[Val],
+        key: &SelectKey,
         row_id: RowID,
-        view: SecondaryIndexView,
+        root: BlockID,
+        sts: TrxID,
     ) -> Result<Option<bool>> {
-        let index_pool_guard = self.index_pool_guard(guards);
-        let user_sec_idx = self.user_sec_idx();
-        match (user_sec_idx, view) {
-            (Some(_), SecondaryIndexView::User { ts, root }) => {
-                bound_non_unique_user_index(user_sec_idx, index_no, root)?
-                    .lookup_unique(index_pool_guard, key, row_id, ts)
-                    .await
-            }
-            (Some(_), SecondaryIndexView::Catalog { .. }) => {
-                Err(secondary_index_view_mismatch("non-unique lookup unique"))
-            }
-            (None, view) => {
-                self.require_generic_sec_idx(index_no)?
-                    .non_unique()
-                    .ok_or_else(|| {
-                        secondary_index_kind_mismatch("non-unique lookup unique", "non-unique")
-                    })?
-                    .lookup_unique(index_pool_guard, key, row_id, view.ts())
-                    .await
-            }
-        }
+        self.non_unique_user_index(key, root)?
+            .lookup_unique(self.mem().index_pool_guard(guards)?, &key.vals, row_id, sts)
+            .await
     }
 
     #[inline]
     async fn non_unique_insert_if_not_exists(
         &self,
         guards: &PoolGuards,
-        index_no: usize,
-        key: &[Val],
+        key: &SelectKey,
         row_id: RowID,
         merge_if_match_deleted: bool,
-        view: SecondaryIndexView,
+        root: BlockID,
+        sts: TrxID,
     ) -> Result<IndexInsert> {
-        let index_pool_guard = self.index_pool_guard(guards);
-        let user_sec_idx = self.user_sec_idx();
-        match (user_sec_idx, view) {
-            (Some(_), SecondaryIndexView::User { ts, root }) => {
-                bound_non_unique_user_index(user_sec_idx, index_no, root)?
-                    .insert_if_not_exists(index_pool_guard, key, row_id, merge_if_match_deleted, ts)
-                    .await
-            }
-            (Some(_), SecondaryIndexView::Catalog { .. }) => {
-                Err(secondary_index_view_mismatch("non-unique insert"))
-            }
-            (None, view) => {
-                self.require_generic_sec_idx(index_no)?
-                    .non_unique()
-                    .ok_or_else(|| {
-                        secondary_index_kind_mismatch("non-unique insert", "non-unique")
-                    })?
-                    .insert_if_not_exists(
-                        index_pool_guard,
-                        key,
-                        row_id,
-                        merge_if_match_deleted,
-                        view.ts(),
-                    )
-                    .await
-            }
-        }
+        self.non_unique_user_index(key, root)?
+            .insert_if_not_exists(
+                self.mem().index_pool_guard(guards)?,
+                &key.vals,
+                row_id,
+                merge_if_match_deleted,
+                sts,
+            )
+            .await
     }
 
     #[inline]
     async fn non_unique_mask_as_deleted(
         &self,
         guards: &PoolGuards,
-        index_no: usize,
-        key: &[Val],
+        key: &SelectKey,
         row_id: RowID,
-        view: SecondaryIndexView,
+        root: BlockID,
+        sts: TrxID,
     ) -> Result<bool> {
-        let index_pool_guard = self.index_pool_guard(guards);
-        let user_sec_idx = self.user_sec_idx();
-        match (user_sec_idx, view) {
-            (Some(_), SecondaryIndexView::User { ts, root }) => {
-                bound_non_unique_user_index(user_sec_idx, index_no, root)?
-                    .mask_as_deleted(index_pool_guard, key, row_id, ts)
-                    .await
-            }
-            (Some(_), SecondaryIndexView::Catalog { .. }) => {
-                Err(secondary_index_view_mismatch("non-unique mask deleted"))
-            }
-            (None, view) => {
-                self.require_generic_sec_idx(index_no)?
-                    .non_unique()
-                    .ok_or_else(|| {
-                        secondary_index_kind_mismatch("non-unique mask deleted", "non-unique")
-                    })?
-                    .mask_as_deleted(index_pool_guard, key, row_id, view.ts())
-                    .await
-            }
-        }
+        self.non_unique_user_index(key, root)?
+            .mask_as_deleted(self.mem().index_pool_guard(guards)?, &key.vals, row_id, sts)
+            .await
     }
 
     #[inline]
     async fn non_unique_compare_delete(
         &self,
         guards: &PoolGuards,
-        index_no: usize,
-        key: &[Val],
+        key: &SelectKey,
         row_id: RowID,
         ignore_del_mask: bool,
         ts: TrxID,
     ) -> Result<bool> {
-        let index_pool_guard = self.index_pool_guard(guards);
-        match self.user_sec_idx() {
-            Some(indexes) => {
-                require_user_sec_idx(indexes, index_no)?
-                    .non_unique_mem()?
-                    .compare_delete(index_pool_guard, key, row_id, ignore_del_mask, ts)
-                    .await
-            }
-            None => {
-                self.require_generic_sec_idx(index_no)?
-                    .non_unique()
-                    .ok_or_else(|| {
-                        secondary_index_kind_mismatch("non-unique compare delete", "non-unique")
-                    })?
-                    .compare_delete(index_pool_guard, key, row_id, ignore_del_mask, ts)
-                    .await
-            }
-        }
+        self.require_sec_idx(key.index_no)?
+            .non_unique_mem()?
+            .compare_delete(
+                self.mem().index_pool_guard(guards)?,
+                &key.vals,
+                row_id,
+                ignore_del_mask,
+                ts,
+            )
+            .await
     }
 
     #[inline]
-    fn deletion_buffer(&self) -> Option<&ColumnDeletionBuffer> {
-        self.storage.map(ColumnStorage::deletion_buffer)
+    async fn find_row_location(&self, guards: &PoolGuards, row_id: RowID) -> Result<RowLocation> {
+        self.table.find_row(guards, row_id).await
     }
 
-    /// Returns the deletion buffer for paths that already resolved a row as LWC.
-    /// Catalog accessors have no column storage, but they also must not resolve
-    /// row ids to persisted LWC blocks.
+    #[inline]
+    fn row_page_create_redo_ctx<'b>(
+        &self,
+        ctx: &'b TrxContext,
+    ) -> Option<RowPageCreateRedoCtx<'b>> {
+        let engine = ctx
+            .engine()
+            .expect("user-table insert requires an attached engine");
+        Some(RowPageCreateRedoCtx::new(&engine.trx_sys, self.table_id()))
+    }
+
+    #[inline]
+    fn column_storage(&self) -> Result<&ColumnStorage> {
+        Ok(self.storage)
+    }
+
+    #[inline]
+    fn cold_delete_marker_is_globally_purgeable(
+        &self,
+        row_id: RowID,
+        min_active_sts: TrxID,
+    ) -> bool {
+        self.storage
+            .deletion_buffer()
+            .delete_marker_is_globally_purgeable(row_id, min_active_sts)
+    }
+
     #[inline]
     fn lwc_deletion_buffer(&self) -> Result<&ColumnDeletionBuffer> {
-        self.deletion_buffer().ok_or_else(|| {
-            Report::new(InternalError::DeletionBufferMissing)
-                .attach("LWC row access requires column storage")
-                .into()
-        })
+        Ok(self.storage.deletion_buffer())
+    }
+    #[inline]
+    fn table_id(&self) -> TableID {
+        self.mem().table_id()
+    }
+
+    #[inline]
+    async fn mem_scan<F>(&self, guards: &PoolGuards, page_action: F) -> Result<()>
+    where
+        F: FnMut(PageSharedGuard<RowPage>) -> bool,
+    {
+        self.mem().mem_scan(guards, page_action).await
+    }
+
+    #[inline]
+    async fn get_row_page_shared(
+        &self,
+        guards: &PoolGuards,
+        page_id: PageID,
+    ) -> Result<Option<PageSharedGuard<RowPage>>> {
+        self.mem().get_row_page_shared(guards, page_id).await
+    }
+
+    #[inline]
+    async fn get_row_page_versioned_shared(
+        &self,
+        guards: &PoolGuards,
+        page_id: VersionedPageID,
+    ) -> Result<Option<PageSharedGuard<RowPage>>> {
+        self.mem()
+            .get_row_page_versioned_shared(guards, page_id)
+            .await
     }
 
     #[inline]
@@ -897,7 +538,7 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
     ) -> Result<SelectMvcc> {
         loop {
             let location = self
-                .try_find_row(ctx_pool_guards(ctx), row_id, self.storage)
+                .find_row_location(ctx.require_pool_guards("table access")?, row_id)
                 .await?;
             match location {
                 RowLocation::NotFound => return Ok(SelectMvcc::NotFound),
@@ -928,7 +569,7 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
                     }
                     let vals = self
                         .read_lwc_row(
-                            ctx_pool_guards(ctx),
+                            ctx.require_pool_guards("table access")?,
                             block_id,
                             row_idx,
                             row_shape_fingerprint,
@@ -939,7 +580,7 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
                 }
                 RowLocation::RowPage(page_id) => {
                     let page_guard = match self
-                        .get_row_page_shared(ctx_pool_guards(ctx), page_id)
+                        .get_row_page_shared(ctx.require_pool_guards("table access")?, page_id)
                         .await
                     {
                         Ok(Some(page_guard)) => page_guard,
@@ -975,11 +616,7 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
         row_shape_fingerprint: u128,
         read_set: &[usize],
     ) -> Result<Vec<Val>> {
-        let Some(storage) = self.storage else {
-            return Err(Report::new(InternalError::TableStorageMissing)
-                .attach(format!("block_id={block_id}, row_idx={row_idx}"))
-                .into());
-        };
+        let storage = self.column_storage()?;
         let block = PersistedLwcBlock::load(
             storage.file().file_kind(),
             storage.file().sparse_file(),
@@ -1006,11 +643,7 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
         row_idx: usize,
         row_shape_fingerprint: u128,
     ) -> Result<Vec<Val>> {
-        let Some(storage) = self.storage else {
-            return Err(Report::new(InternalError::TableStorageMissing)
-                .attach(format!("block_id={block_id}, row_idx={row_idx}"))
-                .into());
-        };
+        let storage = self.column_storage()?;
         let block = PersistedLwcBlock::load(
             storage.file().file_kind(),
             storage.file().sparse_file(),
@@ -1151,7 +784,7 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
         // cleanup catches up with a cold-row delete.
         let vals = self
             .read_lwc_full_row(
-                ctx_pool_guards(ctx),
+                ctx.require_pool_guards("table access")?,
                 block_id,
                 row_idx,
                 row_shape_fingerprint,
@@ -1197,13 +830,11 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
         // secondary-index entry. A cold delete marker proves that every key for
         // the row is unreachable only after its transaction is committed and
         // older than the current purge horizon.
-        if self.deletion_buffer().is_some_and(|deletion_buffer| {
-            deletion_buffer.delete_marker_is_globally_purgeable(row_id, min_active_sts)
-        }) {
+        if self.cold_delete_marker_is_globally_purgeable(row_id, min_active_sts) {
             return Ok(IndexPurgeDecision::Delete);
         }
 
-        match self.try_find_row(guards, row_id, self.storage).await? {
+        match self.find_row_location(guards, row_id).await? {
             RowLocation::NotFound => Ok(IndexPurgeDecision::Delete),
             RowLocation::LwcBlock {
                 block_id,
@@ -1234,41 +865,6 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
     }
 
     #[inline]
-    async fn insert_index_no_trx(
-        &self,
-        guards: &PoolGuards,
-        key: SelectKey,
-        row_id: RowID,
-    ) -> Result<()> {
-        if self.metadata().require_index_spec(key.index_no)?.unique() {
-            let res = self
-                .unique_insert_if_not_exists(
-                    guards,
-                    key.index_no,
-                    &key.vals,
-                    row_id,
-                    false,
-                    SecondaryIndexView::catalog(MIN_SNAPSHOT_TS),
-                )
-                .await?;
-            assert!(res.is_ok());
-        } else {
-            let res = self
-                .non_unique_insert_if_not_exists(
-                    guards,
-                    key.index_no,
-                    &key.vals,
-                    row_id,
-                    false,
-                    SecondaryIndexView::catalog(MIN_SNAPSHOT_TS),
-                )
-                .await?;
-            assert!(res.is_ok());
-        }
-        Ok(())
-    }
-
-    #[inline]
     async fn insert_index(
         &self,
         ctx: &TrxContext,
@@ -1276,7 +872,7 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
         key: SelectKey,
         row_id: RowID,
         page_guard: &PageSharedGuard<RowPage>,
-        root_snapshot: Option<&TableRootSnapshot<'_>>,
+        root_snapshot: &TableRootSnapshot<'_>,
     ) -> Result<InsertIndex> {
         if self.metadata().require_index_spec(key.index_no)?.unique() {
             self.insert_unique_index(ctx, effects, key, row_id, page_guard, root_snapshot)
@@ -1325,96 +921,6 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
                 }
             }
         }
-    }
-
-    #[inline]
-    async fn insert_no_trx_inner(&self, guards: &PoolGuards, cols: &[Val]) -> Result<()> {
-        debug_assert!(cols.len() == self.metadata().col_count());
-        debug_assert!({
-            cols.iter()
-                .enumerate()
-                .all(|(idx, val)| self.metadata().col_type_match(idx, val))
-        });
-        let metadata = self.metadata();
-        // prepare index keys.
-        let keys = metadata.keys_for_insert(cols);
-        // calculate row length.
-        let row_len = row_len(metadata, cols);
-        // estimate max row count for insert page.
-        let row_count = estimate_max_row_count(row_len, metadata.col_count());
-        loop {
-            // acquire insert page from block index.
-            let mut page_guard =
-                GenericMemTable::get_insert_page_exclusive(self, guards, row_count, None).await?;
-            let page = page_guard.page_mut();
-            debug_assert!(metadata.col_count() == page.header.col_count as usize);
-            debug_assert!(cols.len() == page.header.col_count as usize);
-            let var_len = var_len_for_insert(metadata, cols);
-            let (row_idx, var_offset) =
-                if let Some((row_idx, var_offset)) = page.request_row_idx_and_free_space(var_len) {
-                    (row_idx, var_offset)
-                } else {
-                    // we just ignore this page and retry.
-                    continue;
-                };
-            let row_id = page.header.start_row_id + row_idx as RowID;
-            let mut row = page.row_mut_exclusive(row_idx, var_offset, var_offset + var_len);
-            debug_assert!(row.is_deleted());
-            for (col_idx, user_col) in cols.iter().enumerate() {
-                row.update_col(metadata, col_idx, user_col, false);
-            }
-            // update index
-            for key in keys {
-                self.insert_index_no_trx(guards, key, row_id).await?;
-            }
-            row.finish_insert();
-            // Cache insert page.
-            GenericMemTable::cache_exclusive_insert_page(self, page_guard);
-            return Ok(());
-        }
-    }
-
-    #[inline]
-    async fn delete_unique_no_trx_inner(&self, guards: &PoolGuards, key: &SelectKey) -> Result<()> {
-        debug_assert!(key.index_no < self.sec_idx_len());
-        debug_assert!(
-            self.metadata()
-                .require_index_spec(key.index_no)
-                .unwrap()
-                .unique()
-        );
-        debug_assert!(self.metadata().index_type_match(key.index_no, &key.vals));
-        let view = self.unchecked_secondary_view(MIN_SNAPSHOT_TS, key.index_no)?;
-        let (mut page_guard, row_id) = match self
-            .unique_lookup(guards, key.index_no, &key.vals, view)
-            .await?
-        {
-            None => unreachable!(),
-            Some((row_id, _)) => match self.find_row(guards, row_id, self.storage).await {
-                RowLocation::NotFound => unreachable!(),
-                RowLocation::LwcBlock { .. } => todo!("lwc block"),
-                RowLocation::RowPage(page_id) => {
-                    let page_guard = self
-                        .get_row_page_exclusive(guards, page_id)
-                        .await
-                        .expect("delete_unique_no_trx_inner should not ignore page-I/O failures")
-                        .expect("failed to lock exclusive row page");
-                    (page_guard, row_id)
-                }
-            },
-        };
-        let page = page_guard.page_mut();
-        let row_idx = page.row_idx(row_id);
-        debug_assert!(!page.is_deleted(row_idx));
-        let row = page.row(row_idx);
-        let keys = self.metadata().keys_for_delete(row);
-        // delete index immediately.
-        for key in keys {
-            let res = self.delete_index_directly(guards, &key, row_id).await?;
-            assert!(res);
-        }
-        page.set_deleted_exclusive(row_idx, true);
-        Ok(())
     }
 
     /// Insert row into given page.
@@ -1760,7 +1266,7 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
         row_id: RowID,
         page_guard: &PageSharedGuard<RowPage>,
         index_change_cols: &HashMap<usize, Val>,
-        root_snapshot: Option<&TableRootSnapshot<'_>>,
+        root_snapshot: &TableRootSnapshot<'_>,
     ) -> Result<UpdateIndex> {
         let metadata = self.metadata();
         for (index_no, index_schema) in metadata.active_indexes() {
@@ -1814,7 +1320,7 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
         old_row_id: RowID,
         new_row_id: RowID,
         page_guard: &PageSharedGuard<RowPage>,
-        root_snapshot: Option<&TableRootSnapshot<'_>>,
+        root_snapshot: &TableRootSnapshot<'_>,
     ) -> Result<UpdateIndex> {
         debug_assert!(old_row_id != new_row_id);
         let metadata = self.metadata();
@@ -1858,7 +1364,7 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
         row_id_move: RowIdMove,
         index_change_cols: &HashMap<usize, Val>,
         page_guard: &PageSharedGuard<RowPage>,
-        root_snapshot: Option<&TableRootSnapshot<'_>>,
+        root_snapshot: &TableRootSnapshot<'_>,
     ) -> Result<UpdateIndex> {
         debug_assert!(row_id_move.old != row_id_move.new);
         let metadata = self.metadata();
@@ -1995,7 +1501,7 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
         effects: &mut StmtEffects,
         row_id: RowID,
         page_guard: &PageSharedGuard<RowPage>,
-        root_snapshot: Option<&TableRootSnapshot<'_>>,
+        root_snapshot: &TableRootSnapshot<'_>,
     ) -> Result<()> {
         let metadata = self.metadata();
         let keys = metadata
@@ -2013,7 +1519,7 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
         effects: &mut StmtEffects,
         row_id: RowID,
         keys: Vec<SelectKey>,
-        root_snapshot: Option<&TableRootSnapshot<'_>>,
+        root_snapshot: &TableRootSnapshot<'_>,
     ) -> Result<()> {
         for key in keys {
             let index_schema = self.metadata().require_index_spec(key.index_no)?;
@@ -2030,37 +1536,6 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
     }
 
     #[inline]
-    async fn delete_index_directly(
-        &self,
-        guards: &PoolGuards,
-        key: &SelectKey,
-        row_id: RowID,
-    ) -> Result<bool> {
-        let index_schema = self.metadata().require_index_spec(key.index_no)?;
-        if index_schema.unique() {
-            self.unique_compare_delete(
-                guards,
-                key.index_no,
-                &key.vals,
-                row_id,
-                true,
-                MIN_SNAPSHOT_TS,
-            )
-            .await
-        } else {
-            self.non_unique_compare_delete(
-                guards,
-                key.index_no,
-                &key.vals,
-                row_id,
-                true,
-                MIN_SNAPSHOT_TS,
-            )
-            .await
-        }
-    }
-
-    #[inline]
     async fn delete_unique_index(
         &self,
         guards: &PoolGuards,
@@ -2069,9 +1544,9 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
         min_active_sts: TrxID,
     ) -> Result<bool> {
         let (page_guard, row_id) = loop {
-            let view = self.unchecked_secondary_view(MIN_SNAPSHOT_TS, key.index_no)?;
+            let root = self.unchecked_secondary_root(key.index_no)?;
             match self
-                .unique_lookup(guards, key.index_no, &key.vals, view)
+                .unique_lookup(guards, key, root, MIN_SNAPSHOT_TS)
                 .await?
             {
                 None => return Ok(false), // Another thread deleted this entry.
@@ -2090,14 +1565,7 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
                     {
                         IndexPurgeDecision::Delete => {
                             return self
-                                .unique_compare_delete(
-                                    guards,
-                                    key.index_no,
-                                    &key.vals,
-                                    row_id,
-                                    false,
-                                    MIN_SNAPSHOT_TS,
-                                )
+                                .unique_compare_delete(guards, key, row_id, false, MIN_SNAPSHOT_TS)
                                 .await;
                         }
                         IndexPurgeDecision::Keep => return Ok(false),
@@ -2122,14 +1590,7 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
         // LWC rows whose persisted image is the only current key material.
         if !access.any_version_matches_key(self.metadata(), key) {
             return self
-                .unique_compare_delete(
-                    guards,
-                    key.index_no,
-                    &key.vals,
-                    row_id,
-                    false,
-                    MIN_SNAPSHOT_TS,
-                )
+                .unique_compare_delete(guards, key, row_id, false, MIN_SNAPSHOT_TS)
                 .await;
         }
         Ok(false)
@@ -2144,9 +1605,9 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
         min_active_sts: TrxID,
     ) -> Result<bool> {
         let (page_guard, row_id) = loop {
-            let view = self.unchecked_secondary_view(MIN_SNAPSHOT_TS, key.index_no)?;
+            let root = self.unchecked_secondary_root(key.index_no)?;
             match self
-                .non_unique_lookup_unique(guards, key.index_no, &key.vals, row_id, view)
+                .non_unique_lookup_unique(guards, key, row_id, root, MIN_SNAPSHOT_TS)
                 .await?
             {
                 None => return Ok(false), // Another thread deleted this entry.
@@ -2167,8 +1628,7 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
                             return self
                                 .non_unique_compare_delete(
                                     guards,
-                                    key.index_no,
-                                    &key.vals,
+                                    key,
                                     row_id,
                                     false,
                                     MIN_SNAPSHOT_TS,
@@ -2197,14 +1657,7 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
         // LWC rows whose persisted image is the only current key material.
         if !access.any_version_matches_key(self.metadata(), key) {
             return self
-                .non_unique_compare_delete(
-                    guards,
-                    key.index_no,
-                    &key.vals,
-                    row_id,
-                    false,
-                    MIN_SNAPSHOT_TS,
-                )
+                .non_unique_compare_delete(guards, key, row_id, false, MIN_SNAPSHOT_TS)
                 .await;
         }
         Ok(false)
@@ -2235,7 +1688,7 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
     ) -> Result<PageSharedGuard<RowPage>> {
         if let Some((page_id, row_id)) = ctx.load_active_insert_page(self.table_id()) {
             let page_guard = self
-                .get_row_page_versioned_shared(ctx_pool_guards(ctx), page_id)
+                .get_row_page_versioned_shared(ctx.require_pool_guards("table access")?, page_id)
                 .await?;
             if let Some(page_guard) = page_guard {
                 // because we save last insert page in session and meanwhile other thread may access this page
@@ -2248,19 +1701,13 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
             }
         }
         let redo_ctx = self.row_page_create_redo_ctx(ctx);
-        GenericMemTable::try_get_insert_page(self, ctx_pool_guards(ctx), row_count, redo_ctx).await
-    }
-
-    #[inline]
-    fn row_page_create_redo_ctx<'b>(
-        &self,
-        ctx: &'b TrxContext,
-    ) -> Option<RowPageCreateRedoCtx<'b>> {
-        self.storage?;
-        let engine = ctx
-            .engine()
-            .expect("user-table insert requires an attached engine");
-        Some(RowPageCreateRedoCtx::new(&engine.trx_sys, self.table_id()))
+        self.mem()
+            .try_get_insert_page(
+                ctx.require_pool_guards("table access")?,
+                row_count,
+                redo_ctx,
+            )
+            .await
     }
 
     // Hot-row writes acquire ownership by installing a `Lock` undo entry at
@@ -2344,7 +1791,7 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
         // duplicate path through link_for_unique_index_lwc(), where snapshot
         // visibility decides between duplicate, link, and write conflict.
         match self
-            .try_find_row(ctx_pool_guards(ctx), row_id, self.storage)
+            .find_row_location(ctx.require_pool_guards("table access")?, row_id)
             .await?
         {
             RowLocation::LwcBlock { .. } => {
@@ -2405,7 +1852,7 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
         };
         let old_row = self
             .read_lwc_full_row(
-                ctx_pool_guards(ctx),
+                ctx.require_pool_guards("table access")?,
                 block_id,
                 row_idx,
                 row_shape_fingerprint,
@@ -2455,7 +1902,7 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
         debug_assert!(old_id != new_id);
         let (old_guard, old_id) = loop {
             match self
-                .try_find_row(ctx_pool_guards(ctx), old_id, self.storage)
+                .find_row_location(ctx.require_pool_guards("table access")?, old_id)
                 .await
             {
                 Ok(RowLocation::NotFound) => return Ok(LinkForUniqueIndex::NotNeeded),
@@ -2484,7 +1931,7 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
                     // duplicate visible to this transaction.
                     let Some(old_guard) = self
                         .try_get_validated_row_page_shared_result(
-                            ctx_pool_guards(ctx),
+                            ctx.require_pool_guards("table access")?,
                             page_id,
                             old_id,
                         )
@@ -2534,18 +1981,19 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
         key: SelectKey,
         row_id: RowID,
         page_guard: &PageSharedGuard<RowPage>,
-        root_snapshot: Option<&TableRootSnapshot<'_>>,
+        root_snapshot: &TableRootSnapshot<'_>,
     ) -> Result<InsertIndex> {
-        let view = self.snapshot_secondary_view(ctx.sts(), root_snapshot, key.index_no)?;
+        let root = self.snapshot_secondary_root(root_snapshot, key.index_no)?;
+        let sts = ctx.sts();
         loop {
             match self
                 .unique_insert_if_not_exists(
-                    ctx_pool_guards(ctx),
-                    key.index_no,
-                    &key.vals,
+                    ctx.require_pool_guards("table access")?,
+                    &key,
                     row_id,
                     false,
-                    view,
+                    root,
+                    sts,
                 )
                 .await?
             {
@@ -2575,11 +2023,10 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
                         LinkForUniqueIndex::WriteConflict => {
                             return Ok(InsertIndex::WriteConflict);
                         }
-                        LinkForUniqueIndex::NotNeeded => {
-                            // No old version matched the key. The index entry
-                            // was stale or has already been purged, so claim
-                            // the latest mapping if it still points to the
-                            // same old row id.
+                        LinkForUniqueIndex::NotNeeded | LinkForUniqueIndex::Linked => {
+                            // Claim the latest mapping if it still points to
+                            // the owner inspected above. A concurrent purge may
+                            // remove the entry first, so retry insertion.
                             let index_old_row_id = if deleted {
                                 old_row_id.deleted()
                             } else {
@@ -2587,50 +2034,12 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
                             };
                             match self
                                 .unique_compare_exchange(
-                                    ctx_pool_guards(ctx),
-                                    key.index_no,
-                                    &key.vals,
+                                    ctx.require_pool_guards("table access")?,
+                                    &key,
                                     index_old_row_id,
                                     row_id,
-                                    view,
-                                )
-                                .await?
-                            {
-                                IndexCompareExchange::Ok => {
-                                    // If we rollback this transaction, we need to undo the index update.
-                                    self.push_update_unique_index_undo(
-                                        ctx, effects, old_row_id, row_id, key, deleted,
-                                    );
-                                    return Ok(InsertIndex::Inserted);
-                                }
-                                IndexCompareExchange::NotExists => {
-                                    // There is race condition when GC thread delete the index entry concurrently.
-                                    // So try to insert index entry again.
-                                    continue;
-                                }
-                                IndexCompareExchange::Mismatch => {
-                                    return Ok(InsertIndex::WriteConflict);
-                                }
-                            }
-                        }
-                        LinkForUniqueIndex::Linked => {
-                            // Linking preserved the older visible owner but
-                            // does not lock the logical key globally. Competing
-                            // transactions can race here; compare_exchange is
-                            // the serialization point for the new latest owner.
-                            let index_old_row_id = if deleted {
-                                old_row_id.deleted()
-                            } else {
-                                old_row_id
-                            };
-                            match self
-                                .unique_compare_exchange(
-                                    ctx_pool_guards(ctx),
-                                    key.index_no,
-                                    &key.vals,
-                                    index_old_row_id,
-                                    row_id,
-                                    view,
+                                    root,
+                                    sts,
                                 )
                                 .await?
                             {
@@ -2641,8 +2050,6 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
                                     return Ok(InsertIndex::Inserted);
                                 }
                                 IndexCompareExchange::NotExists => {
-                                    // The purge thread may concurrently delete the index entry.
-                                    // In this case, we need to retry the insertion of index.
                                     continue;
                                 }
                                 IndexCompareExchange::Mismatch => {
@@ -2663,18 +2070,19 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
         effects: &mut StmtEffects,
         key: SelectKey,
         row_id: RowID,
-        root_snapshot: Option<&TableRootSnapshot<'_>>,
+        root_snapshot: &TableRootSnapshot<'_>,
     ) -> Result<InsertIndex> {
-        let view = self.snapshot_secondary_view(ctx.sts(), root_snapshot, key.index_no)?;
+        let root = self.snapshot_secondary_root(root_snapshot, key.index_no)?;
+        let sts = ctx.sts();
         // For non-unique index, it's guaranteed to be success.
         match self
             .non_unique_insert_if_not_exists(
-                ctx_pool_guards(ctx),
-                key.index_no,
-                &key.vals,
+                ctx.require_pool_guards("table access")?,
+                &key,
                 row_id,
                 false,
-                view,
+                root,
+                sts,
             )
             .await?
         {
@@ -2694,14 +2102,20 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
         effects: &mut StmtEffects,
         row_id: RowID,
         key: SelectKey,
-        root_snapshot: Option<&TableRootSnapshot<'_>>,
+        root_snapshot: &TableRootSnapshot<'_>,
     ) -> Result<()> {
-        let view = self.snapshot_secondary_view(ctx.sts(), root_snapshot, key.index_no)?;
+        let root = self.snapshot_secondary_root(root_snapshot, key.index_no)?;
         // Foreground hot delete/update masks the latest unique mapping instead
         // of physically removing it. The row id is retained so older snapshots
         // and rollback can still recover the previous owner.
         let res = self
-            .unique_mask_as_deleted(ctx_pool_guards(ctx), key.index_no, &key.vals, row_id, view)
+            .unique_mask_as_deleted(
+                ctx.require_pool_guards("table access")?,
+                &key,
+                row_id,
+                root,
+                ctx.sts(),
+            )
             .await?;
         debug_assert!(res); // should always succeed.
         self.push_delete_index_undo(ctx, effects, row_id, key, true);
@@ -2715,13 +2129,19 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
         effects: &mut StmtEffects,
         row_id: RowID,
         key: SelectKey,
-        root_snapshot: Option<&TableRootSnapshot<'_>>,
+        root_snapshot: &TableRootSnapshot<'_>,
     ) -> Result<()> {
-        let view = self.snapshot_secondary_view(ctx.sts(), root_snapshot, key.index_no)?;
+        let root = self.snapshot_secondary_root(root_snapshot, key.index_no)?;
         // Non-unique entries are exact `(key, row_id)` claims, so masking this
         // pair shadows the old hot version while preserving rollback state.
         let res = self
-            .non_unique_mask_as_deleted(ctx_pool_guards(ctx), key.index_no, &key.vals, row_id, view)
+            .non_unique_mask_as_deleted(
+                ctx.require_pool_guards("table access")?,
+                &key,
+                row_id,
+                root,
+                ctx.sts(),
+            )
             .await?;
         debug_assert!(res);
         self.push_delete_index_undo(ctx, effects, row_id, key, false);
@@ -2739,10 +2159,11 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
         old_row_id: RowID,
         new_row_id: RowID,
         new_guard: &PageSharedGuard<RowPage>,
-        root_snapshot: Option<&TableRootSnapshot<'_>>,
+        root_snapshot: &TableRootSnapshot<'_>,
     ) -> Result<UpdateIndex> {
         debug_assert!(old_row_id != new_row_id);
-        let view = self.snapshot_secondary_view(ctx.sts(), root_snapshot, new_key.index_no)?;
+        let root = self.snapshot_secondary_root(root_snapshot, new_key.index_no)?;
+        let sts = ctx.sts();
         loop {
             // Move update with a unique-key change. The new RowID cannot
             // already be in the index; duplicate handling below decides
@@ -2750,12 +2171,12 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
             // should be linked for older snapshots.
             match self
                 .unique_insert_if_not_exists(
-                    ctx_pool_guards(ctx),
-                    new_key.index_no,
-                    &new_key.vals,
+                    ctx.require_pool_guards("table access")?,
+                    &new_key,
                     new_row_id,
                     false,
-                    view,
+                    root,
+                    sts,
                 )
                 .await?
             {
@@ -2810,12 +2231,12 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
                         // But I think the case is rare so keep as is.
                         match self
                             .unique_compare_exchange(
-                                ctx_pool_guards(ctx),
-                                new_key.index_no,
-                                &new_key.vals,
+                                ctx.require_pool_guards("table access")?,
+                                &new_key,
                                 old_row_id.deleted(),
                                 new_row_id,
-                                view,
+                                root,
+                                sts,
                             )
                             .await?
                         {
@@ -2866,12 +2287,12 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
                             };
                             match self
                                 .unique_compare_exchange(
-                                    ctx_pool_guards(ctx),
-                                    new_key.index_no,
-                                    &new_key.vals,
+                                    ctx.require_pool_guards("table access")?,
+                                    &new_key,
                                     index_old_row_id,
                                     new_row_id,
-                                    view,
+                                    root,
+                                    sts,
                                 )
                                 .await?
                             {
@@ -2918,12 +2339,12 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
                             };
                             match self
                                 .unique_compare_exchange(
-                                    ctx_pool_guards(ctx),
-                                    new_key.index_no,
-                                    &new_key.vals,
+                                    ctx.require_pool_guards("table access")?,
+                                    &new_key,
                                     index_old_row_id,
                                     new_row_id,
-                                    view,
+                                    root,
+                                    sts,
                                 )
                                 .await?
                             {
@@ -2969,20 +2390,21 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
         new_key: SelectKey,
         old_row_id: RowID,
         new_row_id: RowID,
-        root_snapshot: Option<&TableRootSnapshot<'_>>,
+        root_snapshot: &TableRootSnapshot<'_>,
     ) -> Result<UpdateIndex> {
         debug_assert!(old_row_id != new_row_id);
-        let view = self.snapshot_secondary_view(ctx.sts(), root_snapshot, new_key.index_no)?;
+        let root = self.snapshot_secondary_root(root_snapshot, new_key.index_no)?;
+        let sts = ctx.sts();
         // Non-unique indexes store exact `(key, row_id)` entries, so a move
         // update inserts the new exact entry and masks the old one.
         match self
             .non_unique_insert_if_not_exists(
-                ctx_pool_guards(ctx),
-                new_key.index_no,
-                &new_key.vals,
+                ctx.require_pool_guards("table access")?,
+                &new_key,
                 new_row_id,
                 false,
-                view,
+                root,
+                sts,
             )
             .await?
         {
@@ -3013,21 +2435,21 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
         key: SelectKey,
         old_row_id: RowID,
         new_row_id: RowID,
-        root_snapshot: Option<&TableRootSnapshot<'_>>,
+        root_snapshot: &TableRootSnapshot<'_>,
     ) -> Result<UpdateIndex> {
         debug_assert!(old_row_id != new_row_id);
-        let view = self.snapshot_secondary_view(ctx.sts(), root_snapshot, key.index_no)?;
+        let root = self.snapshot_secondary_root(root_snapshot, key.index_no)?;
         // Move update where the unique key is unchanged. The logical key keeps
         // one latest mapping, so atomically replace the old RowID with the new
         // hot RowID and record undo to restore it on rollback.
         match self
             .unique_compare_exchange(
-                ctx_pool_guards(ctx),
-                key.index_no,
-                &key.vals,
+                ctx.require_pool_guards("table access")?,
+                &key,
                 old_row_id,
                 new_row_id,
-                view,
+                root,
+                ctx.sts(),
             )
             .await?
         {
@@ -3051,20 +2473,20 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
         key: SelectKey,
         old_row_id: RowID,
         new_row_id: RowID,
-        root_snapshot: Option<&TableRootSnapshot<'_>>,
+        root_snapshot: &TableRootSnapshot<'_>,
     ) -> Result<UpdateIndex> {
         debug_assert!(old_row_id != new_row_id);
-        let view = self.snapshot_secondary_view(ctx.sts(), root_snapshot, key.index_no)?;
+        let root = self.snapshot_secondary_root(root_snapshot, key.index_no)?;
         // Non-unique key unchanged but RowID changed: publish the replacement
         // exact entry, then mask the old exact entry for rollback/GC.
         let res = self
             .non_unique_insert_if_not_exists(
-                ctx_pool_guards(ctx),
-                key.index_no,
-                &key.vals,
+                ctx.require_pool_guards("table access")?,
+                &key,
                 new_row_id,
                 false,
-                view,
+                root,
+                ctx.sts(),
             )
             .await?;
         debug_assert!(res.is_ok());
@@ -3088,9 +2510,10 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
         new_key: SelectKey,
         row_id: RowID,
         page_guard: &PageSharedGuard<RowPage>,
-        root_snapshot: Option<&TableRootSnapshot<'_>>,
+        root_snapshot: &TableRootSnapshot<'_>,
     ) -> Result<UpdateIndex> {
-        let view = self.snapshot_secondary_view(ctx.sts(), root_snapshot, new_key.index_no)?;
+        let root = self.snapshot_secondary_root(root_snapshot, new_key.index_no)?;
+        let sts = ctx.sts();
         loop {
             // In-place unique-key change keeps the same RowID. Repeated key
             // changes in the same transaction can encounter this RowID already
@@ -3109,12 +2532,12 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
             // So we set merge_if_match_deleted to true.
             match self
                 .unique_insert_if_not_exists(
-                    ctx_pool_guards(ctx),
-                    new_key.index_no,
-                    &new_key.vals,
+                    ctx.require_pool_guards("table access")?,
+                    &new_key,
                     row_id,
                     true,
-                    view,
+                    root,
+                    sts,
                 )
                 .await?
             {
@@ -3146,8 +2569,10 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
                         LinkForUniqueIndex::WriteConflict => {
                             return Ok(UpdateIndex::WriteConflict);
                         }
-                        LinkForUniqueIndex::NotNeeded => {
-                            // no old row found.
+                        LinkForUniqueIndex::NotNeeded | LinkForUniqueIndex::Linked => {
+                            // Claim the latest mapping if it still points to
+                            // the owner inspected above. A concurrent purge may
+                            // remove the entry first, so retry insertion.
                             let index_old_row_id = if deleted {
                                 index_row_id.deleted()
                             } else {
@@ -3155,60 +2580,12 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
                             };
                             match self
                                 .unique_compare_exchange(
-                                    ctx_pool_guards(ctx),
-                                    new_key.index_no,
-                                    &new_key.vals,
+                                    ctx.require_pool_guards("table access")?,
+                                    &new_key,
                                     index_old_row_id,
                                     row_id,
-                                    view,
-                                )
-                                .await?
-                            {
-                                IndexCompareExchange::Ok => {
-                                    // Update new key succeeds.
-                                    self.push_update_unique_index_undo(
-                                        ctx,
-                                        effects,
-                                        index_row_id,
-                                        row_id,
-                                        new_key,
-                                        deleted,
-                                    );
-                                    self.defer_delete_unique_index(
-                                        ctx,
-                                        effects,
-                                        row_id,
-                                        old_key,
-                                        root_snapshot,
-                                    )
-                                    .await?;
-                                    return Ok(UpdateIndex::Updated);
-                                }
-                                IndexCompareExchange::Mismatch => {
-                                    return Ok(UpdateIndex::WriteConflict);
-                                }
-                                IndexCompareExchange::NotExists => {
-                                    // re-insert
-                                    continue;
-                                }
-                            }
-                        }
-                        LinkForUniqueIndex::Linked => {
-                            // Both old row(index points to) and new row are locked.
-                            // we must succeed on updating index.
-                            let index_old_row_id = if deleted {
-                                index_row_id.deleted()
-                            } else {
-                                index_row_id
-                            };
-                            match self
-                                .unique_compare_exchange(
-                                    ctx_pool_guards(ctx),
-                                    new_key.index_no,
-                                    &new_key.vals,
-                                    index_old_row_id,
-                                    row_id,
-                                    view,
+                                    root,
+                                    sts,
                                 )
                                 .await?
                             {
@@ -3235,10 +2612,7 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
                                 IndexCompareExchange::Mismatch => {
                                     return Ok(UpdateIndex::WriteConflict);
                                 }
-                                IndexCompareExchange::NotExists => {
-                                    // re-insert
-                                    continue;
-                                }
+                                IndexCompareExchange::NotExists => continue,
                             }
                         }
                     }
@@ -3255,9 +2629,9 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
         old_key: SelectKey,
         new_key: SelectKey,
         row_id: RowID,
-        root_snapshot: Option<&TableRootSnapshot<'_>>,
+        root_snapshot: &TableRootSnapshot<'_>,
     ) -> Result<UpdateIndex> {
-        let view = self.snapshot_secondary_view(ctx.sts(), root_snapshot, new_key.index_no)?;
+        let root = self.snapshot_secondary_root(root_snapshot, new_key.index_no)?;
         // This is case for one transaction or multiple transactions to update
         // key of the same row back and forth.
         // e.g. update k=1 to k=2, then update k=2 to k=1, ...
@@ -3270,12 +2644,12 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
         // So we set merge_if_match_deleted to true.
         match self
             .non_unique_insert_if_not_exists(
-                ctx_pool_guards(ctx),
-                new_key.index_no,
-                &new_key.vals,
+                ctx.require_pool_guards("table access")?,
+                &new_key,
                 row_id,
                 true,
-                view,
+                root,
+                ctx.sts(),
             )
             .await?
         {
@@ -3289,41 +2663,11 @@ impl<'a, D: BufferPool, I: BufferPool> TableAccessor<'a, D, I> {
             IndexInsert::DuplicateKey(..) => unreachable!(),
         }
     }
-}
-
-/// Runtime accessor type binding for user tables:
-/// - `D = EvictableBufferPool` for row pages
-/// - `I = EvictableBufferPool` for secondary indexes
-pub(crate) type HybridTableAccessor<'a> =
-    TableAccessor<'a, EvictableBufferPool, EvictableBufferPool>;
-
-/// Runtime accessor type binding for in-memory catalog tables:
-/// - `D = FixedBufferPool` for row pages
-/// - `I = FixedBufferPool` for secondary indexes
-pub(crate) type MemTableAccessor<'a> = TableAccessor<'a, FixedBufferPool, FixedBufferPool>;
-
-impl TableAccessor<'_, FixedBufferPool, FixedBufferPool> {
-    #[inline]
-    pub(crate) async fn insert_catalog_no_trx(
+    pub(crate) async fn table_scan_uncommitted<F>(
         &self,
         guards: &PoolGuards,
-        cols: &[Val],
-    ) -> Result<()> {
-        self.insert_no_trx_inner(guards, cols).await
-    }
-
-    #[inline]
-    pub(crate) async fn delete_catalog_unique_no_trx(
-        &self,
-        guards: &PoolGuards,
-        key: &SelectKey,
-    ) -> Result<()> {
-        self.delete_unique_no_trx_inner(guards, key).await
-    }
-}
-
-impl<D: BufferPool, I: BufferPool> TableAccess for TableAccessor<'_, D, I> {
-    async fn table_scan_uncommitted<F>(&self, guards: &PoolGuards, mut row_action: F)
+        mut row_action: F,
+    ) -> Result<()>
     where
         F: for<'m, 'p> FnMut(&'m TableMetadata, Row<'p>) -> bool,
     {
@@ -3337,14 +2681,20 @@ impl<D: BufferPool, I: BufferPool> TableAccess for TableAccessor<'_, D, I> {
             }
             true
         })
-        .await;
+        .await
     }
 
-    async fn table_scan_mvcc<F>(&self, ctx: &TrxContext, read_set: &[usize], mut row_action: F)
+    pub(crate) async fn table_scan_mvcc<F>(
+        &self,
+        ctx: &TrxContext,
+        read_set: &[usize],
+        mut row_action: F,
+    ) -> Result<()>
     where
         F: FnMut(Vec<Val>) -> bool,
     {
-        self.mem_scan(ctx_pool_guards(ctx), |page_guard| {
+        let guards = ctx.require_pool_guards("table scan MVCC")?;
+        self.mem_scan(guards, |page_guard| {
             let (page_ctx, page) = page_guard.ctx_and_page();
             let metadata = &*page_ctx.row_ver().unwrap().metadata;
             for row_access in ReadAllRows::new(page, page_ctx) {
@@ -3360,10 +2710,10 @@ impl<D: BufferPool, I: BufferPool> TableAccess for TableAccessor<'_, D, I> {
             }
             true
         })
-        .await;
+        .await
     }
 
-    async fn index_lookup_unique_mvcc(
+    pub(crate) async fn index_lookup_unique_mvcc(
         &self,
         ctx: &TrxContext,
         key: &SelectKey,
@@ -3384,9 +2734,14 @@ impl<D: BufferPool, I: BufferPool> TableAccess for TableAccessor<'_, D, I> {
                     .zip(user_read_set.iter().skip(1))
                     .all(|(l, r)| l < r)
         });
-        let view = self.bound_secondary_view(ctx, key.index_no)?;
+        let root = self.read_proof_secondary_root(ctx, key.index_no)?;
         match self
-            .unique_lookup(ctx_pool_guards(ctx), key.index_no, &key.vals, view)
+            .unique_lookup(
+                ctx.require_pool_guards("table access")?,
+                key,
+                root,
+                ctx.sts(),
+            )
             .await?
         {
             None => Ok(SelectMvcc::NotFound),
@@ -3397,56 +2752,7 @@ impl<D: BufferPool, I: BufferPool> TableAccess for TableAccessor<'_, D, I> {
         }
     }
 
-    async fn index_lookup_unique_uncommitted<R, F>(
-        &self,
-        guards: &PoolGuards,
-        key: &SelectKey,
-        row_action: F,
-    ) -> Result<Option<R>>
-    where
-        for<'m, 'p> F: FnOnce(&'m TableMetadata, Row<'p>) -> R,
-    {
-        debug_assert!(key.index_no < self.sec_idx_len());
-        debug_assert!(
-            self.metadata()
-                .require_index_spec(key.index_no)
-                .unwrap()
-                .unique()
-        );
-        debug_assert!(self.metadata().index_type_match(key.index_no, &key.vals));
-        let view = self.unchecked_secondary_view(MIN_SNAPSHOT_TS, key.index_no)?;
-        let (page_guard, row_id) = match self
-            .unique_lookup(guards, key.index_no, &key.vals, view)
-            .await?
-        {
-            None => return Ok(None),
-            Some((row_id, _)) => match self.find_row(guards, row_id, self.storage).await {
-                RowLocation::NotFound => return Ok(None),
-                RowLocation::LwcBlock { .. } => todo!("lwc block"),
-                RowLocation::RowPage(page_id) => {
-                    let page_guard = self.must_get_row_page_shared(guards, page_id).await?;
-                    (page_guard, row_id)
-                }
-            },
-        };
-        let (ctx, page) = page_guard.ctx_and_page();
-        if !page.row_id_in_valid_range(row_id) {
-            return Ok(None);
-        }
-        let metadata = &*ctx.row_ver().unwrap().metadata;
-        let access = RowReadAccess::new(page, ctx, page.row_idx(row_id));
-        let row = access.row();
-        // latest version in row page.
-        if row.is_deleted() {
-            return Ok(None);
-        }
-        if row.is_key_different(self.metadata(), key) {
-            return Ok(None);
-        }
-        Ok(Some(row_action(metadata, row)))
-    }
-
-    async fn index_scan_mvcc(
+    pub(crate) async fn index_scan_mvcc(
         &self,
         ctx: &TrxContext,
         key: &SelectKey,
@@ -3472,13 +2778,13 @@ impl<D: BufferPool, I: BufferPool> TableAccess for TableAccessor<'_, D, I> {
         });
         // todo: support batching, streaming and sorting.
         let mut row_ids = vec![];
-        let view = self.bound_secondary_view(ctx, key.index_no)?;
+        let root = self.read_proof_secondary_root(ctx, key.index_no)?;
         self.non_unique_lookup(
-            ctx_pool_guards(ctx),
-            key.index_no,
-            &key.vals,
+            ctx.require_pool_guards("table access")?,
+            key,
             &mut row_ids,
-            view,
+            root,
+            ctx.sts(),
         )
         .await?;
         let mut res = vec![];
@@ -3496,7 +2802,7 @@ impl<D: BufferPool, I: BufferPool> TableAccess for TableAccessor<'_, D, I> {
         Ok(ScanMvcc::Rows(res))
     }
 
-    async fn insert_mvcc(
+    pub(crate) async fn insert_mvcc(
         &self,
         ctx: &TrxContext,
         effects: &mut StmtEffects,
@@ -3522,14 +2828,7 @@ impl<D: BufferPool, I: BufferPool> TableAccess for TableAccessor<'_, D, I> {
         // needed for MVCC visibility.
         for key in keys {
             match self
-                .insert_index(
-                    ctx,
-                    effects,
-                    key,
-                    row_id,
-                    &page_guard,
-                    root_snapshot.as_ref(),
-                )
+                .insert_index(ctx, effects, key, row_id, &page_guard, &root_snapshot)
                 .await?
             {
                 InsertIndex::Inserted => (),
@@ -3549,7 +2848,7 @@ impl<D: BufferPool, I: BufferPool> TableAccess for TableAccessor<'_, D, I> {
         Ok(row_id)
     }
 
-    async fn update_unique_mvcc(
+    pub(crate) async fn update_unique_mvcc(
         &self,
         ctx: &TrxContext,
         effects: &mut StmtEffects,
@@ -3576,157 +2875,163 @@ impl<D: BufferPool, I: BufferPool> TableAccess for TableAccessor<'_, D, I> {
         );
         loop {
             let root_snapshot = self.root_snapshot(ctx)?;
-            let lookup_view =
-                self.snapshot_secondary_view(ctx.sts(), root_snapshot.as_ref(), key.index_no)?;
+            let lookup_root = self.snapshot_secondary_root(&root_snapshot, key.index_no)?;
             let (page_guard, row_id) = match self
-                .unique_lookup(ctx_pool_guards(ctx), key.index_no, &key.vals, lookup_view)
+                .unique_lookup(
+                    ctx.require_pool_guards("table access")?,
+                    key,
+                    lookup_root,
+                    ctx.sts(),
+                )
                 .await?
             {
                 None => return Ok(UpdateMvcc::NotFound),
-                Some((row_id, _)) => match self
-                    .try_find_row(ctx_pool_guards(ctx), row_id, self.storage)
-                    .await
-                {
-                    Ok(RowLocation::NotFound) => return Ok(UpdateMvcc::NotFound),
-                    Ok(RowLocation::LwcBlock {
-                        block_id,
-                        row_idx,
-                        row_shape_fingerprint,
-                    }) => {
-                        // LWC rows are immutable. A cold update is represented
-                        // as an owned CDB delete marker for the old row plus a
-                        // new hot RowStore row containing the updated values.
-                        // read_lwc_row_for_update() checks snapshot visibility
-                        // before decoding and key revalidation.
-                        let old_vals = match self
-                            .read_lwc_row_for_update(
-                                ctx,
-                                key,
-                                row_id,
-                                block_id,
-                                row_idx,
-                                row_shape_fingerprint,
-                            )
-                            .await?
-                        {
-                            ColdRowUpdateRead::Ok(vals) => vals,
-                            ColdRowUpdateRead::NotFound => return Ok(UpdateMvcc::NotFound),
-                            ColdRowUpdateRead::WriteConflict => {
-                                return Err(Report::new(OperationError::WriteConflict)
-                                    .attach("update MVCC cold row read")
-                                    .into());
-                            }
-                        };
-                        let deletion_buffer = self.lwc_deletion_buffer()?;
-                        // The read above is only validation. This put_ref() is
-                        // the definitive ownership claim and rechecks the CDB
-                        // state under the map entry to catch races with other
-                        // cold delete/update transactions.
-                        self.debug_assert_table_write_lock_held(ctx);
-                        match deletion_buffer.put_ref(row_id, ctx.status(), ctx.sts()) {
-                            Ok(()) => (),
-                            Err(DeletionError::WriteConflict) => {
-                                return Err(Report::new(OperationError::WriteConflict)
-                                    .attach("update MVCC cold delete marker ownership")
-                                    .into());
-                            }
-                            Err(DeletionError::AlreadyDeleted) => {
-                                return Ok(UpdateMvcc::NotFound);
-                            }
-                        }
-                        // Cold delete undo has no row page. Rollback routes
-                        // page_id=None to CDB marker removal; redo uses
-                        // INVALID_PAGE_ID so recovery replays the delete into
-                        // the deletion buffer when it is newer than the
-                        // deletion checkpoint cutoff.
-                        effects.push_row_undo(OwnedRowUndo::new(
-                            self.table_id(),
-                            None,
-                            row_id,
-                            RowUndoKind::Delete,
-                        ));
-                        effects.insert_row_redo(
-                            self.table_id(),
-                            RowRedo {
-                                page_id: INVALID_PAGE_ID,
-                                row_id,
-                                kind: RowRedoKind::Delete,
-                            },
-                        );
-
-                        // Match row-page update/delete behavior: mask the old
-                        // cold index entries now and let index undo restore
-                        // them on rollback or GC remove them after commit.
-                        // Unique indexes may also install runtime branches from
-                        // the hot replacement to the old cold owner while the
-                        // new row's index entries are inserted below.
-                        let old_index_keys = self.metadata().keys_for_insert(&old_vals);
-                        self.defer_delete_index_keys(
-                            ctx,
-                            effects,
-                            row_id,
-                            old_index_keys,
-                            root_snapshot.as_ref(),
-                        )
-                        .await?;
-
-                        let new_row = self.build_cold_update_row(old_vals, update.clone());
-                        let new_index_keys = self.metadata().keys_for_insert(&new_row);
-                        let (new_row_id, new_guard) = self
-                            .insert_row_internal(
-                                ctx,
-                                effects,
-                                new_row,
-                                RowUndoKind::Insert,
-                                Vec::new(),
-                            )
-                            .await?;
-                        for key in new_index_keys {
-                            match self
-                                .insert_index(
+                Some((row_id, _)) => {
+                    match self
+                        .find_row_location(ctx.require_pool_guards("table access")?, row_id)
+                        .await
+                    {
+                        Ok(RowLocation::NotFound) => return Ok(UpdateMvcc::NotFound),
+                        Ok(RowLocation::LwcBlock {
+                            block_id,
+                            row_idx,
+                            row_shape_fingerprint,
+                        }) => {
+                            // LWC rows are immutable. A cold update is represented
+                            // as an owned CDB delete marker for the old row plus a
+                            // new hot RowStore row containing the updated values.
+                            // read_lwc_row_for_update() checks snapshot visibility
+                            // before decoding and key revalidation.
+                            let old_vals = match self
+                                .read_lwc_row_for_update(
                                     ctx,
-                                    effects,
                                     key,
-                                    new_row_id,
-                                    &new_guard,
-                                    root_snapshot.as_ref(),
+                                    row_id,
+                                    block_id,
+                                    row_idx,
+                                    row_shape_fingerprint,
                                 )
                                 .await?
                             {
-                                InsertIndex::Inserted => (),
-                                InsertIndex::DuplicateKey => {
-                                    return Err(Report::new(OperationError::DuplicateKey)
-                                        .attach("update MVCC cold replacement index claim")
+                                ColdRowUpdateRead::Ok(vals) => vals,
+                                ColdRowUpdateRead::NotFound => return Ok(UpdateMvcc::NotFound),
+                                ColdRowUpdateRead::WriteConflict => {
+                                    return Err(Report::new(OperationError::WriteConflict)
+                                        .attach("update MVCC cold row read")
                                         .into());
                                 }
-                                InsertIndex::WriteConflict => {
+                            };
+                            let deletion_buffer = self.lwc_deletion_buffer()?;
+                            // The read above is only validation. This put_ref() is
+                            // the definitive ownership claim and rechecks the CDB
+                            // state under the map entry to catch races with other
+                            // cold delete/update transactions.
+                            self.debug_assert_table_write_lock_held(ctx);
+                            match deletion_buffer.put_ref(row_id, ctx.status(), ctx.sts()) {
+                                Ok(()) => (),
+                                Err(DeletionError::WriteConflict) => {
                                     return Err(Report::new(OperationError::WriteConflict)
-                                        .attach("update MVCC cold replacement index claim")
+                                        .attach("update MVCC cold delete marker ownership")
                                         .into());
+                                }
+                                Err(DeletionError::AlreadyDeleted) => {
+                                    return Ok(UpdateMvcc::NotFound);
                                 }
                             }
-                        }
-                        new_guard.set_dirty();
-                        return Ok(UpdateMvcc::Updated(new_row_id));
-                    }
-                    Ok(RowLocation::RowPage(page_id)) => {
-                        // Hot-row update proceeds through row-page locking and
-                        // undo-chain visibility. A stale index location is
-                        // retried or rejected before any row mutation.
-                        let Some(page_guard) = self
-                            .try_get_validated_row_page_shared_result(
-                                ctx_pool_guards(ctx),
-                                page_id,
+                            // Cold delete undo has no row page. Rollback routes
+                            // page_id=None to CDB marker removal; redo uses
+                            // INVALID_PAGE_ID so recovery replays the delete into
+                            // the deletion buffer when it is newer than the
+                            // deletion checkpoint cutoff.
+                            effects.push_row_undo(OwnedRowUndo::new(
+                                self.table_id(),
+                                None,
                                 row_id,
+                                RowUndoKind::Delete,
+                            ));
+                            effects.insert_row_redo(
+                                self.table_id(),
+                                RowRedo {
+                                    page_id: INVALID_PAGE_ID,
+                                    row_id,
+                                    kind: RowRedoKind::Delete,
+                                },
+                            );
+
+                            // Match row-page update/delete behavior: mask the old
+                            // cold index entries now and let index undo restore
+                            // them on rollback or GC remove them after commit.
+                            // Unique indexes may also install runtime branches from
+                            // the hot replacement to the old cold owner while the
+                            // new row's index entries are inserted below.
+                            let old_index_keys = self.metadata().keys_for_insert(&old_vals);
+                            self.defer_delete_index_keys(
+                                ctx,
+                                effects,
+                                row_id,
+                                old_index_keys,
+                                &root_snapshot,
                             )
-                            .await?
-                        else {
-                            continue;
-                        };
-                        (page_guard, row_id)
+                            .await?;
+
+                            let new_row = self.build_cold_update_row(old_vals, update.clone());
+                            let new_index_keys = self.metadata().keys_for_insert(&new_row);
+                            let (new_row_id, new_guard) = self
+                                .insert_row_internal(
+                                    ctx,
+                                    effects,
+                                    new_row,
+                                    RowUndoKind::Insert,
+                                    Vec::new(),
+                                )
+                                .await?;
+                            for key in new_index_keys {
+                                match self
+                                    .insert_index(
+                                        ctx,
+                                        effects,
+                                        key,
+                                        new_row_id,
+                                        &new_guard,
+                                        &root_snapshot,
+                                    )
+                                    .await?
+                                {
+                                    InsertIndex::Inserted => (),
+                                    InsertIndex::DuplicateKey => {
+                                        return Err(Report::new(OperationError::DuplicateKey)
+                                            .attach("update MVCC cold replacement index claim")
+                                            .into());
+                                    }
+                                    InsertIndex::WriteConflict => {
+                                        return Err(Report::new(OperationError::WriteConflict)
+                                            .attach("update MVCC cold replacement index claim")
+                                            .into());
+                                    }
+                                }
+                            }
+                            new_guard.set_dirty();
+                            return Ok(UpdateMvcc::Updated(new_row_id));
+                        }
+                        Ok(RowLocation::RowPage(page_id)) => {
+                            // Hot-row update proceeds through row-page locking and
+                            // undo-chain visibility. A stale index location is
+                            // retried or rejected before any row mutation.
+                            let Some(page_guard) = self
+                                .try_get_validated_row_page_shared_result(
+                                    ctx.require_pool_guards("table access")?,
+                                    page_id,
+                                    row_id,
+                                )
+                                .await?
+                            else {
+                                continue;
+                            };
+                            (page_guard, row_id)
+                        }
+                        Err(err) => return Err(err),
                     }
-                    Err(err) => return Err(err),
-                },
+                }
             };
             let res = self
                 .update_row_inplace(ctx, effects, page_guard, key, row_id, update.clone())
@@ -3745,7 +3050,7 @@ impl<D: BufferPool, I: BufferPool> TableAccess for TableAccessor<'_, D, I> {
                                 row_id,
                                 &page_guard,
                                 &index_change_cols,
-                                root_snapshot.as_ref(),
+                                &root_snapshot,
                             )
                             .await?;
                         page_guard.set_dirty(); // mark as dirty page.
@@ -3794,7 +3099,7 @@ impl<D: BufferPool, I: BufferPool> TableAccess for TableAccessor<'_, D, I> {
                                 RowIdMove::new(old_row_id, new_row_id),
                                 &index_change_cols,
                                 &new_guard,
-                                root_snapshot.as_ref(),
+                                &root_snapshot,
                             )
                             .await?;
                         // old guard is already marked inside.
@@ -3820,7 +3125,7 @@ impl<D: BufferPool, I: BufferPool> TableAccess for TableAccessor<'_, D, I> {
                                 old_row_id,
                                 new_row_id,
                                 &new_guard,
-                                root_snapshot.as_ref(),
+                                &root_snapshot,
                             )
                             .await?;
                         new_guard.set_dirty(); // mark as dirty page.
@@ -3843,7 +3148,7 @@ impl<D: BufferPool, I: BufferPool> TableAccess for TableAccessor<'_, D, I> {
         }
     }
 
-    async fn delete_unique_mvcc(
+    pub(crate) async fn delete_unique_mvcc(
         &self,
         ctx: &TrxContext,
         effects: &mut StmtEffects,
@@ -3860,103 +3165,109 @@ impl<D: BufferPool, I: BufferPool> TableAccess for TableAccessor<'_, D, I> {
         debug_assert!(self.metadata().index_type_match(key.index_no, &key.vals));
         loop {
             let root_snapshot = self.root_snapshot(ctx)?;
-            let lookup_view =
-                self.snapshot_secondary_view(ctx.sts(), root_snapshot.as_ref(), key.index_no)?;
+            let lookup_root = self.snapshot_secondary_root(&root_snapshot, key.index_no)?;
             let (page_guard, row_id) = match self
-                .unique_lookup(ctx_pool_guards(ctx), key.index_no, &key.vals, lookup_view)
+                .unique_lookup(
+                    ctx.require_pool_guards("table access")?,
+                    key,
+                    lookup_root,
+                    ctx.sts(),
+                )
                 .await?
             {
                 None => return Ok(DeleteMvcc::NotFound),
-                Some((row_id, _)) => match self
-                    .try_find_row(ctx_pool_guards(ctx), row_id, self.storage)
-                    .await
-                {
-                    Ok(RowLocation::NotFound) => return Ok(DeleteMvcc::NotFound),
-                    Ok(RowLocation::LwcBlock {
-                        block_id,
-                        row_idx,
-                        row_shape_fingerprint,
-                    }) => {
-                        // Delete only needs old secondary-index keys, so read
-                        // indexed columns instead of decoding the whole row.
-                        // The key recheck prevents acting on stale DiskTree or
-                        // MemIndex state after another path already moved the
-                        // logical key away from this cold row.
-                        let index_keys = self
-                            .read_lwc_index_keys(
-                                ctx_pool_guards(ctx),
-                                block_id,
-                                row_idx,
-                                row_shape_fingerprint,
-                            )
-                            .await?;
-                        if !Self::index_key_matches(&index_keys, key)? {
-                            return Ok(DeleteMvcc::NotFound);
-                        }
-                        let deletion_buffer = self.lwc_deletion_buffer()?;
-                        self.debug_assert_table_write_lock_held(ctx);
-                        match deletion_buffer.put_ref(row_id, ctx.status(), ctx.sts()) {
-                            Ok(()) => {
-                                // The marker is statement-owned delete state
-                                // until success. Row undo removes it on
-                                // rollback; redo rebuilds it as a cold delete
-                                // during recovery.
-                                let undo = OwnedRowUndo::new(
-                                    self.table_id(),
-                                    None,
-                                    row_id,
-                                    RowUndoKind::Delete,
-                                );
-                                effects.push_row_undo(undo);
-                                let redo_kind = if log_by_key {
-                                    RowRedoKind::DeleteByUniqueKey(key.clone())
-                                } else {
-                                    RowRedoKind::Delete
-                                };
-                                let redo = RowRedo {
-                                    page_id: INVALID_PAGE_ID,
-                                    row_id,
-                                    kind: redo_kind,
-                                };
-                                effects.insert_row_redo(self.table_id(), redo);
-                                // Mask old index entries immediately; physical
-                                // deletion remains deferred to index GC.
-                                self.defer_delete_index_keys(
-                                    ctx,
-                                    effects,
-                                    row_id,
-                                    index_keys,
-                                    root_snapshot.as_ref(),
+                Some((row_id, _)) => {
+                    match self
+                        .find_row_location(ctx.require_pool_guards("table access")?, row_id)
+                        .await
+                    {
+                        Ok(RowLocation::NotFound) => return Ok(DeleteMvcc::NotFound),
+                        Ok(RowLocation::LwcBlock {
+                            block_id,
+                            row_idx,
+                            row_shape_fingerprint,
+                        }) => {
+                            // Delete only needs old secondary-index keys, so read
+                            // indexed columns instead of decoding the whole row.
+                            // The key recheck prevents acting on stale DiskTree or
+                            // MemIndex state after another path already moved the
+                            // logical key away from this cold row.
+                            let index_keys = self
+                                .read_lwc_index_keys(
+                                    ctx.require_pool_guards("table access")?,
+                                    block_id,
+                                    row_idx,
+                                    row_shape_fingerprint,
                                 )
                                 .await?;
-                                return Ok(DeleteMvcc::Deleted);
-                            }
-                            Err(DeletionError::WriteConflict) => {
-                                return Ok(DeleteMvcc::WriteConflict);
-                            }
-                            Err(DeletionError::AlreadyDeleted) => {
+                            if !Self::index_key_matches(&index_keys, key)? {
                                 return Ok(DeleteMvcc::NotFound);
                             }
+                            let deletion_buffer = self.lwc_deletion_buffer()?;
+                            self.debug_assert_table_write_lock_held(ctx);
+                            match deletion_buffer.put_ref(row_id, ctx.status(), ctx.sts()) {
+                                Ok(()) => {
+                                    // The marker is statement-owned delete state
+                                    // until success. Row undo removes it on
+                                    // rollback; redo rebuilds it as a cold delete
+                                    // during recovery.
+                                    let undo = OwnedRowUndo::new(
+                                        self.table_id(),
+                                        None,
+                                        row_id,
+                                        RowUndoKind::Delete,
+                                    );
+                                    effects.push_row_undo(undo);
+                                    let redo_kind = if log_by_key {
+                                        RowRedoKind::DeleteByUniqueKey(key.clone())
+                                    } else {
+                                        RowRedoKind::Delete
+                                    };
+                                    let redo = RowRedo {
+                                        page_id: INVALID_PAGE_ID,
+                                        row_id,
+                                        kind: redo_kind,
+                                    };
+                                    effects.insert_row_redo(self.table_id(), redo);
+                                    // Mask old index entries immediately; physical
+                                    // deletion remains deferred to index GC.
+                                    self.defer_delete_index_keys(
+                                        ctx,
+                                        effects,
+                                        row_id,
+                                        index_keys,
+                                        &root_snapshot,
+                                    )
+                                    .await?;
+                                    return Ok(DeleteMvcc::Deleted);
+                                }
+                                Err(DeletionError::WriteConflict) => {
+                                    return Ok(DeleteMvcc::WriteConflict);
+                                }
+                                Err(DeletionError::AlreadyDeleted) => {
+                                    return Ok(DeleteMvcc::NotFound);
+                                }
+                            }
                         }
+                        Ok(RowLocation::RowPage(page_id)) => {
+                            // Hot delete is an in-page delete bit guarded by row
+                            // undo. Index entries are masked after the row mutation
+                            // and restored by index undo on rollback.
+                            let Some(page_guard) = self
+                                .try_get_validated_row_page_shared_result(
+                                    ctx.require_pool_guards("table access")?,
+                                    page_id,
+                                    row_id,
+                                )
+                                .await?
+                            else {
+                                continue;
+                            };
+                            (page_guard, row_id)
+                        }
+                        Err(err) => return Err(err),
                     }
-                    Ok(RowLocation::RowPage(page_id)) => {
-                        // Hot delete is an in-page delete bit guarded by row
-                        // undo. Index entries are masked after the row mutation
-                        // and restored by index undo on rollback.
-                        let Some(page_guard) = self
-                            .try_get_validated_row_page_shared_result(
-                                ctx_pool_guards(ctx),
-                                page_id,
-                                row_id,
-                            )
-                            .await?
-                        else {
-                            continue;
-                        };
-                        (page_guard, row_id)
-                    }
-                    Err(err) => return Err(err),
-                },
+                }
             };
             match self
                 .delete_row_internal(ctx, effects, page_guard, row_id, key, log_by_key)
@@ -3972,14 +3283,8 @@ impl<D: BufferPool, I: BufferPool> TableAccess for TableAccessor<'_, D, I> {
                     // Mask every secondary-index entry for this hot row. The
                     // physical index entry remains until rollback unmasks it
                     // or index GC removes it after it is no longer visible.
-                    self.defer_delete_indexes(
-                        ctx,
-                        effects,
-                        row_id,
-                        &page_guard,
-                        root_snapshot.as_ref(),
-                    )
-                    .await?;
+                    self.defer_delete_indexes(ctx, effects, row_id, &page_guard, &root_snapshot)
+                        .await?;
                     page_guard.set_dirty(); // mark as dirty.
                     return Ok(DeleteMvcc::Deleted);
                 }
@@ -3987,7 +3292,7 @@ impl<D: BufferPool, I: BufferPool> TableAccess for TableAccessor<'_, D, I> {
         }
     }
 
-    async fn delete_index(
+    pub(crate) async fn delete_index(
         &self,
         guards: &PoolGuards,
         key: &SelectKey,
@@ -4011,14 +3316,5 @@ impl<D: BufferPool, I: BufferPool> TableAccess for TableAccessor<'_, D, I> {
             self.delete_non_unique_index(guards, key, row_id, min_active_sts)
                 .await
         }
-    }
-}
-
-impl<D: BufferPool, I: BufferPool> Deref for TableAccessor<'_, D, I> {
-    type Target = GenericMemTable<D, I>;
-
-    #[inline]
-    fn deref(&self) -> &Self::Target {
-        self.mem
     }
 }

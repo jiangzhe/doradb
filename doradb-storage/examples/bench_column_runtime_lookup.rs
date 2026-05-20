@@ -106,7 +106,7 @@ async fn build_case(
     if sparse {
         delete_rows(&table, &mut session, rows, sparse_stride).await;
     }
-    table.freeze(&session, usize::MAX).await;
+    table.freeze(&session, usize::MAX).await.unwrap();
     assert!(matches!(
         table.checkpoint(&mut session).await.unwrap(),
         CheckpointOutcome::Published { .. }

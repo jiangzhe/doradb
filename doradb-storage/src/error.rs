@@ -217,16 +217,8 @@ pub(crate) enum InternalError {
     ReadonlyFrameLockMissing,
     #[error("row page missing")]
     RowPageMissing,
-    #[error("table storage missing")]
-    TableStorageMissing,
     #[error("disk pool guard missing")]
     DiskPoolGuardMissing,
-    #[error("user secondary index missing")]
-    UserSecondaryIndexMissing,
-    #[error("secondary index view mismatch")]
-    SecondaryIndexViewMismatch,
-    #[error("deletion buffer missing")]
-    DeletionBufferMissing,
     #[error("indexed value missing")]
     IndexedValueMissing,
     #[error("index key missing")]

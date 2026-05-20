@@ -507,19 +507,19 @@ async fn execute_drop_table_catalog_cascade(
             .storage
             .index_columns()
             .delete_by_table_id(stmt, table_id)
-            .await;
+            .await?;
         let indexes_deleted = engine
             .catalog()
             .storage
             .indexes()
             .delete_by_table_id(stmt, table_id)
-            .await;
+            .await?;
         let columns_deleted = engine
             .catalog()
             .storage
             .columns()
             .delete_by_table_id(stmt, table_id)
-            .await;
+            .await?;
         let table_deleted = engine
             .catalog()
             .storage

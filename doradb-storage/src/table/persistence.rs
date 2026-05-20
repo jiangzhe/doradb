@@ -33,7 +33,7 @@ fn invalid_index_spec(message: impl Into<String>) -> Error {
 
 pub trait TablePersistence {
     /// Freeze row pages and return approximate non-deleted rows visited.
-    fn freeze(&self, session: &Session, max_rows: usize) -> impl Future<Output = usize>;
+    fn freeze(&self, session: &Session, max_rows: usize) -> impl Future<Output = Result<usize>>;
 
     /// Report whether a user-table checkpoint can safely publish now.
     fn checkpoint_readiness(&self, session: &Session) -> CheckpointReadiness;
@@ -780,7 +780,7 @@ impl Table {
 }
 
 impl TablePersistence for Table {
-    async fn freeze(&self, session: &Session, max_rows: usize) -> usize {
+    async fn freeze(&self, session: &Session, max_rows: usize) -> Result<usize> {
         let mut rows = 0usize;
         self.mem_scan(session.pool_guards(), |page_guard| {
             let (ctx, page) = page_guard.ctx_and_page();
@@ -792,8 +792,8 @@ impl TablePersistence for Table {
             vmap.set_frozen();
             rows < max_rows
         })
-        .await;
-        rows
+        .await?;
+        Ok(rows)
     }
 
     fn checkpoint_readiness(&self, session: &Session) -> CheckpointReadiness {
@@ -841,7 +841,8 @@ impl TablePersistence for Table {
         // stabilization wait. The post-lease readiness check is enough for root
         // liveness because the GC horizon used by the check only moves forward.
         let pool_guards = session.pool_guards().clone();
-        let (frozen_pages, next_heap_redo_start_ts) = self.collect_frozen_pages(&pool_guards).await;
+        let (frozen_pages, next_heap_redo_start_ts) =
+            self.collect_frozen_pages(&pool_guards).await?;
         if !frozen_pages.is_empty() {
             self.wait_for_frozen_pages_stable(&pool_guards, &trx_sys, &frozen_pages)
                 .await?;
@@ -985,7 +986,8 @@ impl TablePersistence for Table {
             }
         };
         trx_sys.retain_published_table_root(old_root);
-        self.blk_idx()
+        self.mem
+            .blk_idx()
             .update_column_root(published_pivot_row_id, published_column_root)
             .await;
         #[cfg(test)]

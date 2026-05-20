@@ -1,12 +1,10 @@
-use crate::buffer::{FixedBufferPool, PoolGuard, PoolGuards};
+use crate::buffer::{FixedBufferPool, PoolGuard, PoolRole};
 use crate::catalog::{TableID, TableMetadata};
 use crate::error::Result;
-use crate::index::{BlockIndex, RowLocation};
+use crate::index::BlockIndex;
 use crate::quiescent::QuiescentGuard;
-use crate::row::ops::SelectKey;
-use crate::table::{GenericMemTable, MemTableAccessor};
+use crate::table::GenericMemTable;
 use crate::trx::MIN_SNAPSHOT_TS;
-use crate::value::Val;
 use std::ops::Deref;
 use std::sync::Arc;
 
@@ -29,7 +27,7 @@ impl CatalogTable {
             mem_pool.clone(),
             mem_pool.row_pool_role(),
             mem_pool,
-            crate::buffer::PoolRole::Meta,
+            PoolRole::Meta,
             meta_pool_guard,
             table_id,
             metadata,
@@ -38,37 +36,6 @@ impl CatalogTable {
         )
         .await?;
         Ok(CatalogTable { mem })
-    }
-
-    /// Build a lightweight operation accessor over this catalog table runtime.
-    #[inline]
-    pub(crate) fn accessor(&self) -> MemTableAccessor<'_> {
-        MemTableAccessor::from(self)
-    }
-
-    #[inline]
-    pub(crate) async fn insert_no_trx(&self, guards: &PoolGuards, cols: &[Val]) -> Result<()> {
-        self.accessor().insert_catalog_no_trx(guards, cols).await
-    }
-
-    #[inline]
-    pub(crate) async fn delete_unique_no_trx(
-        &self,
-        guards: &PoolGuards,
-        key: &SelectKey,
-    ) -> Result<()> {
-        self.accessor()
-            .delete_catalog_unique_no_trx(guards, key)
-            .await
-    }
-
-    #[inline]
-    pub(crate) async fn find_row(
-        &self,
-        guards: &crate::buffer::PoolGuards,
-        row_id: crate::row::RowID,
-    ) -> RowLocation {
-        GenericMemTable::find_row(self, guards, row_id, None).await
     }
 }
 

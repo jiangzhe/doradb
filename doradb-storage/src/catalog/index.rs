@@ -18,9 +18,7 @@ use crate::lock::{LockOwner, LockOwnerGroup};
 use crate::lwc::PersistedLwcBlock;
 use crate::row::{RowID, RowRead};
 use crate::session::Session;
-use crate::table::{
-    DeleteMarker, Table, TableAccess, TableRuntimeLayout, secondary_disk_tree_encoder,
-};
+use crate::table::{DeleteMarker, Table, TableRuntimeLayout, secondary_disk_tree_encoder};
 use crate::trx::redo::DDLRedo;
 use crate::trx::{ActiveTrx, TrxID, trx_is_committed};
 use crate::value::Val;
@@ -172,7 +170,7 @@ pub(crate) async fn create_index_for_session(
     // layout that future readers can install atomically.
     let hot_rows =
         collect_create_index_hot_rows(&table, &old_layout, session.pool_guards(), &new_index_spec)
-            .await;
+            .await?;
     match build_create_index_runtime_index(CreateIndexRuntimeBuild {
         engine: &engine,
         guards: session.pool_guards(),
@@ -1119,10 +1117,10 @@ async fn collect_create_index_hot_rows(
     layout: &Arc<TableRuntimeLayout>,
     guards: &PoolGuards,
     index_spec: &IndexSpec,
-) -> Vec<CreateIndexRowEntry> {
+) -> Result<Vec<CreateIndexRowEntry>> {
     let mut rows = Vec::new();
     table
-        .accessor_with_layout(Arc::clone(layout))
+        .accessor_with_layout(layout.as_ref())
         .table_scan_uncommitted(guards, |metadata, row| {
             if row.is_deleted() {
                 return true;
@@ -1138,8 +1136,8 @@ async fn collect_create_index_hot_rows(
             });
             true
         })
-        .await;
-    rows
+        .await?;
+    Ok(rows)
 }
 
 async fn build_create_index_runtime_index(
@@ -1339,7 +1337,7 @@ async fn execute_drop_index_catalog_update(
             .storage
             .index_columns()
             .delete_by_index(stmt, table_id, index_no)
-            .await;
+            .await?;
         if deleted_columns != old_index_spec.cols.len() {
             return Err(Report::new(DataIntegrityError::InvalidRootInvariant)
                 .attach(format!(
@@ -1833,7 +1831,7 @@ mod tests {
             let table_id = sys.table.table_id();
             let mut session = sys.try_new_session().unwrap();
             insert_rows(&sys, &mut session, 10, 8, "cold").await;
-            sys.table.freeze(&session, usize::MAX).await;
+            sys.table.freeze(&session, usize::MAX).await.unwrap();
             checkpoint_published(&sys.table, &mut session).await;
 
             let index_no = session
@@ -1954,7 +1952,7 @@ mod tests {
                 vec![Val::from(2), Val::from("dup")],
             )
             .await;
-            sys.table.freeze(&session, usize::MAX).await;
+            sys.table.freeze(&session, usize::MAX).await.unwrap();
             checkpoint_published(&sys.table, &mut session).await;
             sys.new_trx_delete(&mut session, &single_key(2)).await;
 
@@ -2016,7 +2014,7 @@ mod tests {
                 vec![Val::from(1), Val::from("persisted")],
             )
             .await;
-            table.freeze(&session, usize::MAX).await;
+            table.freeze(&session, usize::MAX).await.unwrap();
             checkpoint_published(&table, &mut session).await;
             assert_eq!(
                 session
@@ -2092,7 +2090,8 @@ mod tests {
                 .storage
                 .indexes()
                 .list_uncommitted_by_table_id(session.pool_guards(), table_id)
-                .await;
+                .await
+                .unwrap();
             assert_eq!(catalog_indexes.len(), 1);
             assert_eq!(catalog_indexes[0].index_no, 0);
             engine

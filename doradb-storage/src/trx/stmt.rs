@@ -6,7 +6,7 @@ use crate::lock::{LockManager, LockMode, LockOwner, LockResource};
 use crate::quiescent::QuiescentGuard;
 use crate::row::RowID;
 use crate::row::ops::{DeleteMvcc, ScanMvcc, SelectKey, SelectMvcc, UpdateCol, UpdateMvcc};
-use crate::table::{Table, TableAccess};
+use crate::table::Table;
 use crate::trx::redo::{DDLRedo, RedoLogs, RowRedo};
 use crate::trx::undo::{
     IndexUndo, IndexUndoKind, IndexUndoLogs, OwnedRowUndo, RowUndoKind, RowUndoLogs,
@@ -170,7 +170,7 @@ impl StmtEffects {
         &mut self,
         table_cache: &mut TableCache<'_>,
         pool_guards: &PoolGuards,
-        sts: Option<crate::trx::TrxID>,
+        sts: crate::trx::TrxID,
     ) -> Result<()> {
         self.row_undo.rollback(table_cache, pool_guards, sts).await
     }
@@ -320,10 +320,9 @@ impl<'stmt> Statement<'stmt> {
         table.check_foreground_live("table_scan_mvcc")?;
         let layout = table.layout_snapshot();
         table
-            .accessor_with_layout(layout)
+            .accessor_with_layout(&layout)
             .table_scan_mvcc(self.ctx, read_set, row_action)
-            .await;
-        Ok(())
+            .await
     }
 
     /// Looks up one unique-key row under statement-lifetime metadata protection.
@@ -338,7 +337,7 @@ impl<'stmt> Statement<'stmt> {
         table.check_foreground_live("table_lookup_unique_mvcc")?;
         let layout = table.layout_snapshot();
         table
-            .accessor_with_layout(layout)
+            .accessor_with_layout(&layout)
             .index_lookup_unique_mvcc(self.ctx, key, user_read_set)
             .await
     }
@@ -355,7 +354,7 @@ impl<'stmt> Statement<'stmt> {
         table.check_foreground_live("table_index_scan_mvcc")?;
         let layout = table.layout_snapshot();
         table
-            .accessor_with_layout(layout)
+            .accessor_with_layout(&layout)
             .index_scan_mvcc(self.ctx, key, user_read_set)
             .await
     }
@@ -367,7 +366,7 @@ impl<'stmt> Statement<'stmt> {
         table.check_foreground_live("table_insert_mvcc")?;
         let layout = table.layout_snapshot();
         table
-            .accessor_with_layout(layout)
+            .accessor_with_layout(&layout)
             .insert_mvcc(self.ctx, &mut self.effects, cols)
             .await
     }
@@ -384,7 +383,7 @@ impl<'stmt> Statement<'stmt> {
         table.check_foreground_live("table_update_unique_mvcc")?;
         let layout = table.layout_snapshot();
         table
-            .accessor_with_layout(layout)
+            .accessor_with_layout(&layout)
             .update_unique_mvcc(self.ctx, &mut self.effects, key, update)
             .await
     }
@@ -401,7 +400,7 @@ impl<'stmt> Statement<'stmt> {
         table.check_foreground_live("table_delete_unique_mvcc")?;
         let layout = table.layout_snapshot();
         table
-            .accessor_with_layout(layout)
+            .accessor_with_layout(&layout)
             .delete_unique_mvcc(self.ctx, &mut self.effects, key, log_by_key)
             .await
     }
@@ -414,10 +413,7 @@ impl<'stmt> Statement<'stmt> {
         cols: Vec<Val>,
     ) -> Result<RowID> {
         self.acquire_table_write_locks(table.table_id()).await?;
-        table
-            .accessor()
-            .insert_mvcc(self.ctx, &mut self.effects, cols)
-            .await
+        table.insert_mvcc(self.ctx, &mut self.effects, cols).await
     }
 
     /// Deletes one catalog-table row through the foreground lock-aware path.
@@ -430,7 +426,6 @@ impl<'stmt> Statement<'stmt> {
     ) -> Result<DeleteMvcc> {
         self.acquire_table_write_locks(table.table_id()).await?;
         table
-            .accessor()
             .delete_unique_mvcc(self.ctx, &mut self.effects, key, log_by_key)
             .await
     }
@@ -474,7 +469,7 @@ impl<'stmt> Statement<'stmt> {
         }
         if self
             .effects
-            .rollback_row(&mut table_cache, &pool_guards, Some(sts))
+            .rollback_row(&mut table_cache, &pool_guards, sts)
             .await
             .is_err()
         {
