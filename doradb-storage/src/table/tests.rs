@@ -43,7 +43,7 @@ use crate::trx::stmt::tests as stmt_tests;
 use crate::trx::tests as trx_tests;
 use crate::trx::undo::RowUndoKind;
 use crate::trx::ver_map::RowPageState;
-use crate::trx::{ActiveTrx, MAX_SNAPSHOT_TS, TrxID};
+use crate::trx::{ActiveTrx, MAX_SNAPSHOT_TS, MIN_SNAPSHOT_TS, TrxID};
 use crate::value::{Val, ValKind};
 use error_stack::Report;
 use std::cell::{Cell, RefCell};
@@ -579,6 +579,30 @@ fn test_find_row_returns_resolved_lwc_page_location() {
             RowLocation::NotFound => panic!("row should exist"),
         }
         trx.commit().await.unwrap();
+    });
+}
+
+#[test]
+fn test_find_recover_cts_for_lwc_row_returns_min_snapshot_ts() {
+    smol::block_on(async {
+        let sys = TestSys::new_evictable().await;
+        let mut session = sys.try_new_session().unwrap();
+        insert_rows(&sys, &mut session, 0, 10, "name").await;
+        sys.table.freeze(&session, usize::MAX).await.unwrap();
+        checkpoint_published(&sys.table, &mut session).await;
+
+        let key = single_key(1i32);
+        let trx = session.try_begin_trx().unwrap().unwrap();
+        let row_id = assert_row_in_lwc(&sys.table, session.pool_guards(), &key, trx.sts()).await;
+        trx.commit().await.unwrap();
+
+        assert_eq!(
+            sys.table
+                .find_recover_cts_for_row_id(session.pool_guards(), row_id)
+                .await
+                .unwrap(),
+            Some(MIN_SNAPSHOT_TS)
+        );
     });
 }
 

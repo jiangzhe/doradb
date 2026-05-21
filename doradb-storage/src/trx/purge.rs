@@ -309,6 +309,11 @@ impl TransactionSystem {
 
     /// Purge row undo logs and index entries according to given transaction
     /// list and minimum active STS.
+    ///
+    /// This method is the purge access-failure boundary. If row-page access or
+    /// secondary-index cleanup fails, purge cannot replay the same in-memory
+    /// mutation safely, so it poisons runtime admission before returning the
+    /// fatal purge error.
     #[inline]
     pub(super) async fn purge_trx_list(
         &self,
@@ -317,106 +322,111 @@ impl TransactionSystem {
         log_no: usize,
         trx_list: Vec<CommittedTrx>,
         min_active_sts: TrxID,
-    ) -> HashSet<PageID> {
-        let partition = &self.log_partitions[log_no];
-        let mut table_cache = TableCache::new(catalog);
-        let purge_trx_count = trx_list.len();
-        let mut purge_row_count = 0;
-        let mut purge_index_count = 0;
-        // First, purge row undo logs by versioned page identity.
-        for trx in &trx_list {
-            if let Some(row_undo) = trx.row_undo() {
-                purge_row_count += row_undo.len();
-                for undo in &**row_undo {
-                    if is_catalog_obj_id(undo.table_id) {
-                        let Some(table) = table_cache.get_catalog_table(undo.table_id) else {
-                            continue;
-                        };
-                        let page_guard = if let Some(page_id) = undo.page_id {
-                            table
-                                .get_row_page_versioned_shared(guards, page_id)
-                                .await
-                                .expect("purge should not ignore row-page access failures")
+    ) -> Result<HashSet<PageID>> {
+        let res: Result<HashSet<PageID>> = async {
+            let partition = &self.log_partitions[log_no];
+            let mut table_cache = TableCache::new(catalog);
+            let purge_trx_count = trx_list.len();
+            let mut purge_row_count = 0;
+            let mut purge_index_count = 0;
+            // First, purge row undo logs by versioned page identity.
+            for trx in &trx_list {
+                if let Some(row_undo) = trx.row_undo() {
+                    purge_row_count += row_undo.len();
+                    for undo in &**row_undo {
+                        if is_catalog_obj_id(undo.table_id) {
+                            let Some(table) = table_cache.get_catalog_table(undo.table_id) else {
+                                continue;
+                            };
+                            let page_guard = if let Some(page_id) = undo.page_id {
+                                table.get_row_page_versioned_shared(guards, page_id).await?
+                            } else {
+                                None
+                            };
+                            let Some(page_guard) = page_guard else {
+                                continue;
+                            };
+                            purge_undo_chain_from_page(page_guard, undo, min_active_sts);
                         } else {
-                            None
-                        };
-                        let Some(page_guard) = page_guard else {
-                            continue;
-                        };
-                        purge_undo_chain_from_page(page_guard, undo, min_active_sts);
-                    } else {
-                        let Some(table) = table_cache.get_user_table(undo.table_id).await else {
-                            continue;
-                        };
-                        let page_guard = if let Some(page_id) = undo.page_id {
-                            table
-                                .mem
-                                .get_row_page_versioned_shared(guards, page_id)
-                                .await
-                                .expect("purge should not ignore row-page access failures")
-                        } else {
-                            None
-                        };
-                        let Some(page_guard) = page_guard else {
-                            promote_delete_marker_if_needed(table, undo);
-                            continue;
-                        };
-                        purge_undo_chain_from_page(page_guard, undo, min_active_sts);
-                    }
-                }
-            }
-        }
-
-        // Second, we purge index.
-        for trx in &trx_list {
-            if let Some(index_gc) = trx.index_gc() {
-                for ip in index_gc {
-                    if is_catalog_obj_id(ip.table_id) {
-                        let Some(table) = table_cache.get_catalog_table(ip.table_id) else {
-                            continue;
-                        };
-                        if let Ok(true) = table
-                            .delete_index(guards, &ip.key, ip.row_id, ip.unique, min_active_sts)
-                            .await
-                        {
-                            purge_index_count += 1;
-                        }
-                    } else {
-                        let Some(table) = table_cache.get_user_entry_mut(ip.table_id).await else {
-                            continue;
-                        };
-                        if let Ok(true) = table
-                            .delete_index(guards, &ip.key, ip.row_id, ip.unique, min_active_sts)
-                            .await
-                        {
-                            purge_index_count += 1;
+                            let Some(table) = table_cache.get_user_table(undo.table_id).await
+                            else {
+                                continue;
+                            };
+                            let page_guard = if let Some(page_id) = undo.page_id {
+                                table
+                                    .mem
+                                    .get_row_page_versioned_shared(guards, page_id)
+                                    .await?
+                            } else {
+                                None
+                            };
+                            let Some(page_guard) = page_guard else {
+                                promote_delete_marker_if_needed(table, undo);
+                                continue;
+                            };
+                            purge_undo_chain_from_page(page_guard, undo, min_active_sts);
                         }
                     }
                 }
             }
-        }
-        let mut gc_row_pages = HashSet::new();
-        for trx in &trx_list {
-            if let Some(pages) = trx.gc_row_pages() {
-                gc_row_pages.extend(pages.iter().copied());
+
+            // Second, we purge index.
+            for trx in &trx_list {
+                if let Some(index_gc) = trx.index_gc() {
+                    for ip in index_gc {
+                        if is_catalog_obj_id(ip.table_id) {
+                            let Some(table) = table_cache.get_catalog_table(ip.table_id) else {
+                                continue;
+                            };
+                            if table
+                                .delete_index(guards, &ip.key, ip.row_id, ip.unique, min_active_sts)
+                                .await?
+                            {
+                                purge_index_count += 1;
+                            }
+                        } else {
+                            let Some(table) = table_cache.get_user_entry_mut(ip.table_id).await
+                            else {
+                                continue;
+                            };
+                            if table
+                                .delete_index(guards, &ip.key, ip.row_id, ip.unique, min_active_sts)
+                                .await?
+                            {
+                                purge_index_count += 1;
+                            }
+                        }
+                    }
+                }
             }
+            let mut gc_row_pages = HashSet::new();
+            for trx in &trx_list {
+                if let Some(pages) = trx.gc_row_pages() {
+                    gc_row_pages.extend(pages.iter().copied());
+                }
+            }
+
+            drop(trx_list);
+
+            partition
+                .stats
+                .purge_trx_count
+                .fetch_add(purge_trx_count, Ordering::Relaxed);
+            partition
+                .stats
+                .purge_row_count
+                .fetch_add(purge_row_count, Ordering::Relaxed);
+            partition
+                .stats
+                .purge_index_count
+                .fetch_add(purge_index_count, Ordering::Relaxed);
+            Ok(gc_row_pages)
         }
-
-        drop(trx_list);
-
-        partition
-            .stats
-            .purge_trx_count
-            .fetch_add(purge_trx_count, Ordering::Relaxed);
-        partition
-            .stats
-            .purge_row_count
-            .fetch_add(purge_row_count, Ordering::Relaxed);
-        partition
-            .stats
-            .purge_index_count
-            .fetch_add(purge_index_count, Ordering::Relaxed);
-        gc_row_pages
+        .await;
+        match res {
+            Ok(gc_row_pages) => Ok(gc_row_pages),
+            Err(_) => Err(self.poison_storage(FatalError::PurgeAccess).into()),
+        }
     }
 
     #[inline]
@@ -808,7 +818,7 @@ struct PurgeTask {
     log_no: usize,
     gc_no: usize,
     min_active_sts: TrxID,
-    done: Sender<()>,
+    done: Sender<Result<()>>,
     gc_row_pages: Arc<Mutex<Vec<PageID>>>,
 }
 
@@ -854,9 +864,13 @@ impl PurgeLoop for PurgeSingleThreaded {
                         gc_bucket.get_purge_list(curr_sts, &mut trx_list);
                     }
                     let log_no = partition.log_no;
-                    let partition_gc_pages = trx_sys
+                    let partition_gc_pages = match trx_sys
                         .purge_trx_list(catalog, &pool_guards, log_no, trx_list, curr_sts)
-                        .await;
+                        .await
+                    {
+                        Ok(gc_pages) => gc_pages,
+                        Err(_) => return,
+                    };
                     gc_row_pages.extend(partition_gc_pages);
                 }
                 if !handle_gc_row_page_deallocation_result(
@@ -939,8 +953,10 @@ impl PurgeLoop for PurgeDispatcher {
                 drop(done_tx);
                 // wait for all executors to finish their tasks in this cycle.
                 for _ in 0..expected_tasks {
-                    if done_rx.recv_async().await.is_err() {
-                        break 'DISPATCH_LOOP;
+                    match done_rx.recv_async().await {
+                        Ok(Ok(())) => (),
+                        Ok(Err(_)) => return,
+                        Err(_) => break 'DISPATCH_LOOP,
                     }
                 }
                 let gc_row_pages = {
@@ -1015,13 +1031,20 @@ impl PurgeExecutor {
             let partition = &trx_sys.log_partitions[log_no];
             partition.gc_buckets[gc_no].get_purge_list(min_active_sts, &mut trx_list);
             // actual purge here
-            let gc_pages = trx_sys
+            let res = trx_sys
                 .purge_trx_list(catalog, &pool_guards, log_no, trx_list, min_active_sts)
                 .await;
-            if !gc_pages.is_empty() {
-                gc_row_pages.lock().extend(gc_pages);
+            match res {
+                Ok(gc_pages) => {
+                    if !gc_pages.is_empty() {
+                        gc_row_pages.lock().extend(gc_pages);
+                    }
+                    let _ = done.send(Ok(()));
+                }
+                Err(err) => {
+                    let _ = done.send(Err(err));
+                }
             }
-            let _ = done.send(());
         }
     }
 }
@@ -1301,6 +1324,72 @@ mod tests {
     }
 
     #[test]
+    fn test_purge_trx_list_returns_error_on_row_page_access_failure() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let main_dir = temp_dir.path().to_path_buf();
+            let engine = EngineConfig::default()
+                .storage_root(main_dir)
+                .data_buffer(
+                    EvictableBufferPoolConfig::default()
+                        .role(crate::buffer::PoolRole::Mem)
+                        .max_mem_size(64usize * 1024 * 1024)
+                        .max_file_size(128usize * 1024 * 1024),
+                )
+                .trx(
+                    TrxSysConfig::default()
+                        .purge_threads(1)
+                        .log_file_stem("redo_purge_access_error"),
+                )
+                .build()
+                .await
+                .unwrap();
+
+            let table_id = table1(&engine).await;
+            let mut row_undo = RowUndoLogs::empty();
+            row_undo.push(OwnedRowUndo::new(
+                table_id,
+                Some(VersionedPageID {
+                    page_id: PageID::from(0u64),
+                    generation: 0,
+                }),
+                0,
+                RowUndoKind::Delete,
+            ));
+            let trx = CommittedTrx {
+                cts: 100,
+                payload: Some(CommittedTrxPayload {
+                    sts: 1,
+                    gc_no: 0,
+                    row_undo,
+                    index_gc: vec![],
+                    gc_row_pages: vec![],
+                }),
+            };
+            let guards = PoolGuards::builder()
+                .push(PoolRole::Index, engine.index_pool.pool_guard())
+                .build();
+
+            let err = engine
+                .trx_sys
+                .purge_trx_list(engine.catalog(), &guards, 0, vec![trx], MAX_SNAPSHOT_TS)
+                .await
+                .unwrap_err();
+            assert_eq!(
+                err.report().downcast_ref::<FatalError>().copied(),
+                Some(FatalError::PurgeAccess)
+            );
+            assert!(
+                engine
+                    .trx_sys
+                    .storage_poison_error()
+                    .as_ref()
+                    .is_some_and(|err| *err.current_context() == FatalError::PurgeAccess)
+            );
+        });
+    }
+
+    #[test]
     fn test_purge_promote_delete_marker_if_committed_for_delete_without_page_id() {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
@@ -1377,7 +1466,8 @@ mod tests {
                         vec![trx],
                         MAX_SNAPSHOT_TS,
                     )
-                    .await;
+                    .await
+                    .unwrap();
             }
 
             match table.deletion_buffer().get(row_id) {
@@ -1465,7 +1555,8 @@ mod tests {
                         vec![trx],
                         MAX_SNAPSHOT_TS,
                     )
-                    .await;
+                    .await
+                    .unwrap();
             }
 
             match table.deletion_buffer().get(row_id) {
@@ -1580,7 +1671,8 @@ mod tests {
                         vec![trx],
                         MAX_SNAPSHOT_TS,
                     )
-                    .await;
+                    .await
+                    .unwrap();
             }
 
             match table.deletion_buffer().get(row_id) {
@@ -1691,7 +1783,8 @@ mod tests {
                         vec![trx],
                         MAX_SNAPSHOT_TS,
                     )
-                    .await;
+                    .await
+                    .unwrap();
             }
 
             match table.deletion_buffer().get(row_id) {

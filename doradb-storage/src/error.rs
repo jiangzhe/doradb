@@ -178,6 +178,8 @@ pub(crate) enum FatalError {
     CheckpointWrite,
     #[error("purge deallocate failed")]
     PurgeDeallocate,
+    #[error("purge access failed")]
+    PurgeAccess,
     #[error("rollback access failed")]
     RollbackAccess,
 }

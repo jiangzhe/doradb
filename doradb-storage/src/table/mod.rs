@@ -1093,7 +1093,12 @@ impl Table {
     ) -> Result<Option<TrxID>> {
         Ok(match self.find_row(guards, row_id).await? {
             RowLocation::NotFound => None,
-            RowLocation::LwcBlock { .. } => todo!("lwc block"),
+            RowLocation::LwcBlock { .. } => {
+                // Recovery replay applies only in-memory rows. A row resolved
+                // to LWC is below the pivot and has no row-page recover CTS, so
+                // use the minimum CTS for duplicate ordering.
+                Some(MIN_SNAPSHOT_TS)
+            }
             RowLocation::RowPage(page_id) => {
                 let page_guard = self.mem.must_get_row_page_shared(guards, page_id).await?;
                 debug_assert!(validate_page_row_range(&page_guard, page_id, row_id));

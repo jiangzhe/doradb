@@ -168,9 +168,19 @@ pub(crate) async fn create_index_for_session(
 
     // 6. Build the hot MemIndex from row-store rows and assemble a runtime
     // layout that future readers can install atomically.
-    let hot_rows =
-        collect_create_index_hot_rows(&table, &old_layout, session.pool_guards(), &new_index_spec)
-            .await?;
+    let hot_rows = match collect_create_index_hot_rows(
+        &table,
+        &old_layout,
+        session.pool_guards(),
+        &new_index_spec,
+    )
+    .await
+    {
+        Ok(hot_rows) => hot_rows,
+        Err(err) => {
+            return builder.rollback_before_catalog_commit(err).await;
+        }
+    };
     match build_create_index_runtime_index(CreateIndexRuntimeBuild {
         engine: &engine,
         guards: session.pool_guards(),
