@@ -42,3 +42,11 @@ When a backlog item is moved to `docs/backlogs/closed/`, append:
 - Reference: <task/issue/pr reference>
 - Closed At: <YYYY-MM-DD>
 ```
+
+## Close Reason
+
+- Type: replaced
+- Detail: Task 000151 replaced this follow-up with an explicit catalog/user access split: catalog tables now expose fixed GenericMemTable operations, user tables require a pinned TableRuntimeLayout through UserTableAccessor, and the old mixed optional accessor invariant is gone.
+- Closed By: backlog close
+- Reference: docs/tasks/000151-split-catalog-user-runtime-layout-accessors.md
+- Closed At: 2026-05-21
