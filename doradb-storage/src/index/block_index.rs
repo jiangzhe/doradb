@@ -227,26 +227,20 @@ impl<P: BufferPool> GenericBlockIndex<P> {
         self.row.mem_cursor(meta_pool_guard)
     }
 
-    /// Finds the physical location of one row id.
-    ///
-    /// It first follows the root route decision and may fallback to the column
-    /// path when the row lookup misses due to concurrent boundary movement.
+    /// Finds one in-memory row-page location without consulting column storage.
     #[inline]
-    pub(crate) async fn find_row(
+    pub(crate) async fn find_mem_row(
         &self,
         meta_pool_guard: &PoolGuard,
-        disk_pool_guard: Option<&PoolGuard>,
         row_id: RowID,
-        storage: Option<&ColumnStorage>,
-    ) -> RowLocation {
-        self.try_find_row(meta_pool_guard, disk_pool_guard, row_id, storage)
-            .await
-            .expect("block-index find_row should not ignore persisted lookup I/O failures")
+    ) -> Result<RowLocation> {
+        debug_assert!(!row_id.is_deleted());
+        self.row.find_row(meta_pool_guard, row_id).await
     }
 
     /// Finds the physical location of one row id with persisted column-path errors surfaced.
     #[inline]
-    pub(crate) async fn try_find_row(
+    pub(crate) async fn find_row(
         &self,
         meta_pool_guard: &PoolGuard,
         disk_pool_guard: Option<&PoolGuard>,
@@ -269,7 +263,7 @@ impl<P: BufferPool> GenericBlockIndex<P> {
                 .await
             }
             BlockIndexRoute::Row => {
-                let found = self.row.find_row(meta_pool_guard, row_id).await;
+                let found = self.row.find_row(meta_pool_guard, row_id).await?;
                 if !matches!(found, RowLocation::NotFound) {
                     return Ok(found);
                 }
@@ -348,7 +342,7 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     // Test helper that lets us pause one row-index page fetch at a precise point.
-    // The fallback test uses this to hold `try_find_row()` after the initial route
+    // The fallback test uses this to hold `find_row()` after the initial route
     // decision but before the row-store lookup completes, so we can move the pivot
     // and force the fallback-to-column path deterministically.
     struct StallingBufferPool {
@@ -570,7 +564,7 @@ mod tests {
     }
 
     #[test]
-    fn test_try_find_row_returns_error_when_column_route_has_no_storage() {
+    fn test_find_row_returns_error_when_column_route_has_no_storage() {
         let pool = QuiescentBox::new(
             FixedBufferPool::with_capacity(crate::buffer::PoolRole::Index, 64 * 1024 * 1024)
                 .unwrap(),
@@ -586,7 +580,7 @@ mod tests {
 
         // Row id 9 is below the pivot, so lookup goes straight to the column path.
         // Without column storage this must surface as an error, not as "not found".
-        let err = match smol::block_on(blk_idx.try_find_row(&meta_guard, None, 9, None)) {
+        let err = match smol::block_on(blk_idx.find_row(&meta_guard, None, 9, None)) {
             Ok(_location) => panic!("expected missing-column-storage error, got row location"),
             Err(err) => err,
         };
@@ -597,7 +591,7 @@ mod tests {
     }
 
     #[test]
-    fn test_try_find_row_returns_error_when_column_fallback_has_no_storage() {
+    fn test_find_row_returns_error_when_column_fallback_has_no_storage() {
         let inner = QuiescentBox::new(
             FixedBufferPool::with_capacity(crate::buffer::PoolRole::Index, 64 * 1024 * 1024)
                 .unwrap(),
@@ -624,7 +618,7 @@ mod tests {
             let blk_idx = &blk_idx;
             let meta_guard = meta_guard.clone();
             let handle = s.spawn(move || {
-                smol::block_on(async { blk_idx.try_find_row(&meta_guard, None, 10, None).await })
+                smol::block_on(async { blk_idx.find_row(&meta_guard, None, 10, None).await })
             });
 
             // Wait until the row-store root fetch is paused, then move the pivot past

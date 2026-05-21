@@ -4,9 +4,9 @@ use crate::catalog::storage::CatalogDefinition;
 use crate::catalog::storage::object::ColumnObject;
 use crate::catalog::table::TableMetadata;
 use crate::catalog::{ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexSpec, TableID};
+use crate::error::Result;
 use crate::row::ops::{DeleteMvcc, SelectKey};
 use crate::row::{Row, RowRead};
-use crate::table::TableAccess;
 use crate::trx::stmt::Statement;
 use crate::value::Val;
 use crate::value::ValKind;
@@ -125,10 +125,9 @@ impl Columns<'_> {
         &self,
         guards: &PoolGuards,
         table_id: TableID,
-    ) -> Vec<ColumnObject> {
+    ) -> Result<Vec<ColumnObject>> {
         let mut res = vec![];
         self.table
-            .accessor()
             .table_scan_uncommitted(guards, |metadata, row| {
                 if row.is_deleted() {
                     return true;
@@ -141,8 +140,8 @@ impl Columns<'_> {
                 }
                 true
             })
-            .await;
-        res
+            .await?;
+        Ok(res)
     }
 
     /// Delete a column by (table_id, column_no).
@@ -162,18 +161,22 @@ impl Columns<'_> {
     }
 
     /// Delete all columns for one table and return the number of deleted rows.
-    pub async fn delete_by_table_id(&self, stmt: &mut Statement<'_>, table_id: TableID) -> usize {
+    pub async fn delete_by_table_id(
+        &self,
+        stmt: &mut Statement<'_>,
+        table_id: TableID,
+    ) -> Result<usize> {
         let Some(guards) = stmt.ctx().pool_guards().cloned() else {
-            return 0;
+            return Ok(0);
         };
-        let columns = self.list_uncommitted_by_table_id(&guards, table_id).await;
+        let columns = self.list_uncommitted_by_table_id(&guards, table_id).await?;
         let mut deleted = 0;
         for column in columns {
             if self.delete_by_id(stmt, table_id, column.column_no).await {
                 deleted += 1;
             }
         }
-        deleted
+        Ok(deleted)
     }
 }
 
@@ -288,7 +291,8 @@ mod tests {
                 .storage
                 .columns()
                 .list_uncommitted_by_table_id(session.pool_guards(), 42)
-                .await;
+                .await
+                .unwrap();
             assert_eq!(cols_42.len(), 1);
             assert_eq!(cols_42[0].column_no, 0);
 
@@ -297,7 +301,8 @@ mod tests {
                 .storage
                 .columns()
                 .list_uncommitted_by_table_id(session.pool_guards(), 43)
-                .await;
+                .await
+                .unwrap();
             assert_eq!(cols_43.len(), 1);
             assert_eq!(cols_43[0].column_no, 0);
 
@@ -341,6 +346,7 @@ mod tests {
                     .columns()
                     .list_uncommitted_by_table_id(session.pool_guards(), 42)
                     .await
+                    .unwrap()
                     .is_empty()
             );
             assert!(
@@ -350,6 +356,7 @@ mod tests {
                     .columns()
                     .list_uncommitted_by_table_id(session.pool_guards(), 43)
                     .await
+                    .unwrap()
                     .is_empty()
             );
 
@@ -422,7 +429,8 @@ mod tests {
                         .storage
                         .columns()
                         .delete_by_table_id(stmt, 42)
-                        .await,
+                        .await
+                        .unwrap(),
                     2
                 );
                 assert_eq!(
@@ -431,7 +439,8 @@ mod tests {
                         .storage
                         .columns()
                         .delete_by_table_id(stmt, 42)
-                        .await,
+                        .await
+                        .unwrap(),
                     0
                 );
                 Ok(())
@@ -448,6 +457,7 @@ mod tests {
                     .columns()
                     .list_uncommitted_by_table_id(session.pool_guards(), 42)
                     .await
+                    .unwrap()
                     .is_empty()
             );
             let remaining = engine
@@ -455,7 +465,8 @@ mod tests {
                 .storage
                 .columns()
                 .list_uncommitted_by_table_id(session.pool_guards(), 43)
-                .await;
+                .await
+                .unwrap();
             assert_eq!(remaining.len(), 1);
             assert_eq!(remaining[0].column_no, 0);
 

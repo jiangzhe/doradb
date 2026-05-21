@@ -316,7 +316,7 @@ impl TransactionSystem {
         }
         if trx
             .row_undo_mut()
-            .rollback(&mut table_cache, &pool_guards, Some(sts))
+            .rollback(&mut table_cache, &pool_guards, sts)
             .await
             .is_err()
         {

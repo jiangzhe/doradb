@@ -337,7 +337,7 @@ impl<'a> LogRecovery<'a> {
             .storage
             .tables()
             .list_uncommitted(&self.pool_guards)
-            .await;
+            .await?;
         let checkpointed_user_table_ids = checkpointed_tables
             .iter()
             .filter(|table| is_user_obj_id(table.table_id))
@@ -751,6 +751,7 @@ impl<'a> LogRecovery<'a> {
                 })?;
                 let count = end_row_id - start_row_id;
                 let mut page_guard = table
+                    .mem
                     .allocate_row_page_at(&self.pool_guards, count as usize, *page_id)
                     .await?;
                 // Here we switch row page to recover mode.
@@ -994,7 +995,7 @@ mod tests {
     };
     use crate::row::ops::{DeleteMvcc, SelectKey, SelectMvcc, UpdateCol, UpdateMvcc};
     use crate::row::{RowID, RowRead};
-    use crate::table::{CheckpointOutcome, DeleteMarker, Table, TableAccess, TablePersistence};
+    use crate::table::{CheckpointOutcome, DeleteMarker, Table, TablePersistence};
     use crate::trx::log_replay::{LogMerger, TrxLog};
     use crate::trx::redo::{DDLRedo, RedoHeader, RedoLogs, RedoTrxKind, RowRedo, RowRedoKind};
     use crate::trx::stmt::Statement;
@@ -1349,7 +1350,7 @@ mod tests {
                     .storage
                     .index_columns()
                     .delete_by_index(stmt, table_id, 1)
-                    .await,
+                    .await?,
                 1
             );
             assert!(
@@ -1427,7 +1428,8 @@ mod tests {
             .storage
             .indexes()
             .list_uncommitted_by_table_id(session.pool_guards(), table_id)
-            .await;
+            .await
+            .unwrap();
         assert_eq!(
             indexes.iter().any(|index| index.index_no == 1),
             index_one_active
@@ -2132,14 +2134,18 @@ mod tests {
             let table = engine.catalog().get_table(table_id).await.unwrap();
             let session = engine.try_new_session().unwrap();
             let mut rows = 0usize;
-            table
-                .accessor_with_layout(table.layout_snapshot())
-                .table_scan_uncommitted(session.pool_guards(), |_metadata, row| {
-                    assert!(row.row_id() as usize <= DML_SIZE);
-                    rows += if row.is_deleted() { 0 } else { 1 };
-                    true
-                })
-                .await;
+            {
+                let layout = table.layout_snapshot();
+                table
+                    .accessor_with_layout(&layout)
+                    .table_scan_uncommitted(session.pool_guards(), |_metadata, row| {
+                        assert!(row.row_id() as usize <= DML_SIZE);
+                        rows += if row.is_deleted() { 0 } else { 1 };
+                        true
+                    })
+                    .await
+                    .unwrap();
+            }
             assert_eq!(rows, DML_SIZE - (DML_SIZE / DEL_STEP + 1));
 
             drop(session);
@@ -2263,7 +2269,7 @@ mod tests {
             };
             trx.commit().await.unwrap();
 
-            table.freeze(&session, usize::MAX).await;
+            table.freeze(&session, usize::MAX).await.unwrap();
             let mut checkpoint_session = engine.try_new_session().unwrap();
             checkpoint_published(&table, &mut checkpoint_session).await;
             let root_after_checkpoint = table.file().active_root_unchecked();
@@ -2379,7 +2385,7 @@ mod tests {
             };
             trx.commit().await.unwrap();
 
-            table.freeze(&session, usize::MAX).await;
+            table.freeze(&session, usize::MAX).await.unwrap();
             let mut checkpoint_session = engine.try_new_session().unwrap();
             checkpoint_published(&table, &mut checkpoint_session).await;
             assert!(table.file().active_root_unchecked().pivot_row_id > cold_row_id);
@@ -2512,7 +2518,7 @@ mod tests {
             }
             trx.commit().await.unwrap();
 
-            table.freeze(&session, usize::MAX).await;
+            table.freeze(&session, usize::MAX).await.unwrap();
             let mut checkpoint_session = engine.try_new_session().unwrap();
             checkpoint_published(&table, &mut checkpoint_session).await;
             assert!(
@@ -2647,7 +2653,7 @@ mod tests {
             assert!(insert.is_ok());
             trx.commit().await.unwrap();
 
-            table.freeze(&session, usize::MAX).await;
+            table.freeze(&session, usize::MAX).await.unwrap();
             let mut checkpoint_session = engine.try_new_session().unwrap();
             checkpoint_published(&table, &mut checkpoint_session).await;
             let root_after_checkpoint = table.file().active_root_unchecked();
@@ -2754,7 +2760,7 @@ mod tests {
             }
             trx.commit().await.unwrap();
 
-            table.freeze(&session, usize::MAX).await;
+            table.freeze(&session, usize::MAX).await.unwrap();
             let mut checkpoint_session = engine.try_new_session().unwrap();
             checkpoint_published(&table, &mut checkpoint_session).await;
 
@@ -2943,7 +2949,10 @@ mod tests {
             assert!(insert.is_ok());
             trx.commit().await.unwrap();
 
-            checkpointed_table.freeze(&session, usize::MAX).await;
+            checkpointed_table
+                .freeze(&session, usize::MAX)
+                .await
+                .unwrap();
             let mut checkpoint_session = engine.try_new_session().unwrap();
             checkpoint_published(&checkpointed_table, &mut checkpoint_session).await;
 
@@ -3111,7 +3120,7 @@ mod tests {
             assert!(insert.is_ok());
             trx.commit().await.unwrap();
 
-            table.freeze(&session, usize::MAX).await;
+            table.freeze(&session, usize::MAX).await.unwrap();
             let mut checkpoint_session = engine.try_new_session().unwrap();
             checkpoint_published(&table, &mut checkpoint_session).await;
 
@@ -3225,7 +3234,7 @@ mod tests {
             }
             trx.commit().await.unwrap();
 
-            table.freeze(&session, usize::MAX).await;
+            table.freeze(&session, usize::MAX).await.unwrap();
             let mut checkpoint_session = engine.try_new_session().unwrap();
             checkpoint_published(&table, &mut checkpoint_session).await;
 
@@ -3262,7 +3271,7 @@ mod tests {
             assert!(insert.is_ok());
             trx.commit().await.unwrap();
 
-            table.freeze(&session, usize::MAX).await;
+            table.freeze(&session, usize::MAX).await.unwrap();
             checkpoint_published(&table, &mut checkpoint_session).await;
 
             let active_root = table.file().active_root_unchecked();

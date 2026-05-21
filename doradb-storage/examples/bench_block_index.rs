@@ -171,7 +171,10 @@ async fn worker(
     let mut sum_page_id = 0u64;
     for _ in 0..args.count {
         let row_id = rng.next_u64() % max_row_id;
-        let res = blk_idx.find_row(&meta_guard, row_id).await;
+        let res = blk_idx
+            .find_row(&meta_guard, row_id)
+            .await
+            .expect("benchmark row-page lookup should succeed");
         match res {
             RowLocation::RowPage(page_id) => {
                 count += 1;

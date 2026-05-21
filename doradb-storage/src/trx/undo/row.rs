@@ -1,10 +1,9 @@
 use crate::buffer::PoolGuards;
 use crate::buffer::page::VersionedPageID;
-use crate::catalog::{TableCache, TableHandle, TableID};
+use crate::catalog::{TableCache, TableID, is_catalog_obj_id};
 use crate::error::Result;
 use crate::row::RowID;
 use crate::row::ops::{SelectKey, UndoCol, UpdateCol};
-use crate::trx::row::RowWriteAccess;
 use crate::trx::{MIN_SNAPSHOT_TS, SharedTrxStatus, TrxID, trx_is_committed};
 use event_listener::EventListener;
 use std::fmt;
@@ -128,42 +127,25 @@ impl RowUndoLogs {
         &mut self,
         table_cache: &mut TableCache<'_>,
         guards: &PoolGuards,
-        sts: Option<TrxID>,
+        sts: TrxID,
     ) -> Result<()> {
         while let Some(entry) = self.0.pop() {
-            let table = table_cache.must_get_table(entry.table_id).await;
-            Self::rollback_entry_in_table(entry, table, guards, sts).await?;
-        }
-        Ok(())
-    }
-
-    #[inline]
-    async fn rollback_entry_in_table(
-        entry: OwnedRowUndo,
-        table: &TableHandle,
-        guards: &PoolGuards,
-        sts: Option<TrxID>,
-    ) -> Result<()> {
-        let pivot_row_id = table.pivot_row_id();
-        if entry.page_id.is_none() || entry.row_id < pivot_row_id {
-            if let Some(deletion_buffer) = table.deletion_buffer() {
-                deletion_buffer.remove(entry.row_id);
+            if is_catalog_obj_id(entry.table_id) {
+                let table = table_cache.must_get_catalog_table(entry.table_id);
+                table
+                    .mem
+                    .rollback_row_undo(entry, guards, sts, |_| {})
+                    .await?;
+            } else {
+                let table = table_cache.must_get_user_table(entry.table_id).await;
+                table
+                    .mem
+                    .rollback_row_undo(entry, guards, sts, |row_id| {
+                        table.deletion_buffer().remove(row_id);
+                    })
+                    .await?;
             }
-            return Ok(());
         }
-        let Some(page_guard) = table
-            .get_row_page_versioned_shared(guards, entry.page_id.unwrap())
-            .await?
-        else {
-            return Ok(());
-        };
-        let (ctx, page) = page_guard.ctx_and_page();
-        let metadata = &*ctx.row_ver().unwrap().metadata;
-        // TODO: we should retry or wait for notification if rollback happens on a page
-        // in transition state. This will be handled in a future task.
-        let row_idx = page.row_idx(entry.row_id);
-        let mut access = RowWriteAccess::new(page, ctx, row_idx, sts, false);
-        access.rollback_first_undo(metadata, entry);
         Ok(())
     }
 }

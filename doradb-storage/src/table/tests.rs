@@ -34,7 +34,7 @@ use crate::row::{RowID, RowPage, RowRead};
 use crate::session::Session;
 use crate::table::{
     CheckpointCancelReason, CheckpointOutcome, CheckpointReadiness, DeleteMarker, Table,
-    TableAccess, TableLifecycleState, TablePersistence, TableRecover, TableRuntimeLayout,
+    TableLifecycleState, TablePersistence, TableRecover, TableRuntimeLayout,
 };
 use crate::trx::redo::DDLRedo;
 use crate::trx::row::LockRowForWrite;
@@ -43,7 +43,7 @@ use crate::trx::stmt::tests as stmt_tests;
 use crate::trx::tests as trx_tests;
 use crate::trx::undo::RowUndoKind;
 use crate::trx::ver_map::RowPageState;
-use crate::trx::{ActiveTrx, MAX_SNAPSHOT_TS, TrxID};
+use crate::trx::{ActiveTrx, MAX_SNAPSHOT_TS, MIN_SNAPSHOT_TS, TrxID};
 use crate::value::{Val, ValKind};
 use error_stack::Report;
 use std::cell::{Cell, RefCell};
@@ -472,7 +472,7 @@ fn test_column_delete_basic() {
         let sys = TestSys::new_evictable().await;
         let mut session = sys.try_new_session().unwrap();
         insert_rows(&sys, &mut session, 0, 10, "name").await;
-        sys.table.freeze(&session, usize::MAX).await;
+        sys.table.freeze(&session, usize::MAX).await.unwrap();
         checkpoint_published(&sys.table, &mut session).await;
 
         let key = single_key(1i32);
@@ -498,7 +498,7 @@ fn test_lwc_read_uses_readonly_buffer_pool() {
         let sys = TestSys::new_evictable().await;
         let mut session = sys.try_new_session().unwrap();
         insert_rows(&sys, &mut session, 0, 10, "name").await;
-        sys.table.freeze(&session, usize::MAX).await;
+        sys.table.freeze(&session, usize::MAX).await.unwrap();
         checkpoint_published(&sys.table, &mut session).await;
 
         let key = single_key(1i32);
@@ -533,7 +533,7 @@ fn test_find_row_returns_resolved_lwc_page_location() {
         let sys = TestSys::new_evictable().await;
         let mut session = sys.try_new_session().unwrap();
         insert_rows(&sys, &mut session, 0, 10, "name").await;
-        sys.table.freeze(&session, usize::MAX).await;
+        sys.table.freeze(&session, usize::MAX).await.unwrap();
         checkpoint_published(&sys.table, &mut session).await;
 
         let key = single_key(1i32);
@@ -560,7 +560,12 @@ fn test_find_row_returns_resolved_lwc_page_location() {
             .unwrap()
             .unwrap();
 
-        match sys.table.find_row(session.pool_guards(), row_id).await {
+        match sys
+            .table
+            .find_row(session.pool_guards(), row_id)
+            .await
+            .unwrap()
+        {
             RowLocation::LwcBlock {
                 block_id,
                 row_idx,
@@ -578,12 +583,36 @@ fn test_find_row_returns_resolved_lwc_page_location() {
 }
 
 #[test]
+fn test_find_recover_cts_for_lwc_row_returns_min_snapshot_ts() {
+    smol::block_on(async {
+        let sys = TestSys::new_evictable().await;
+        let mut session = sys.try_new_session().unwrap();
+        insert_rows(&sys, &mut session, 0, 10, "name").await;
+        sys.table.freeze(&session, usize::MAX).await.unwrap();
+        checkpoint_published(&sys.table, &mut session).await;
+
+        let key = single_key(1i32);
+        let trx = session.try_begin_trx().unwrap().unwrap();
+        let row_id = assert_row_in_lwc(&sys.table, session.pool_guards(), &key, trx.sts()).await;
+        trx.commit().await.unwrap();
+
+        assert_eq!(
+            sys.table
+                .find_recover_cts_for_row_id(session.pool_guards(), row_id)
+                .await
+                .unwrap(),
+            Some(MIN_SNAPSHOT_TS)
+        );
+    });
+}
+
+#[test]
 fn test_lwc_select_surfaces_persisted_corruption() {
     smol::block_on(async {
         let sys = TestSys::new_evictable().await;
         let mut session = sys.try_new_session().unwrap();
         insert_rows(&sys, &mut session, 0, 10, "name").await;
-        sys.table.freeze(&session, usize::MAX).await;
+        sys.table.freeze(&session, usize::MAX).await.unwrap();
         checkpoint_published(&sys.table, &mut session).await;
 
         let key = single_key(1i32);
@@ -631,7 +660,7 @@ fn test_lwc_select_surfaces_column_block_index_row_metadata_corruption() {
         let sys = TestSys::new_evictable().await;
         let mut session = sys.try_new_session().unwrap();
         insert_rows(&sys, &mut session, 0, 4, "name").await;
-        sys.table.freeze(&session, usize::MAX).await;
+        sys.table.freeze(&session, usize::MAX).await.unwrap();
         checkpoint_published(&sys.table, &mut session).await;
 
         let key = single_key(1i32);
@@ -682,7 +711,7 @@ fn test_lwc_select_surfaces_column_block_index_zero_block_id_corruption() {
         let sys = TestSys::new_evictable().await;
         let mut session = sys.try_new_session().unwrap();
         insert_rows(&sys, &mut session, 0, 4, "name").await;
-        sys.table.freeze(&session, usize::MAX).await;
+        sys.table.freeze(&session, usize::MAX).await.unwrap();
         checkpoint_published(&sys.table, &mut session).await;
 
         let key = single_key(1i32);
@@ -733,7 +762,7 @@ fn test_lwc_select_surfaces_row_shape_fingerprint_mismatch_corruption() {
         let sys = TestSys::new_evictable().await;
         let mut session = sys.try_new_session().unwrap();
         insert_rows(&sys, &mut session, 0, 4, "name").await;
-        sys.table.freeze(&session, usize::MAX).await;
+        sys.table.freeze(&session, usize::MAX).await.unwrap();
         checkpoint_published(&sys.table, &mut session).await;
 
         let key = single_key(1i32);
@@ -784,7 +813,7 @@ fn test_column_delete_rollback() {
         let sys = TestSys::new_evictable().await;
         let mut session = sys.try_new_session().unwrap();
         insert_rows(&sys, &mut session, 0, 10, "name").await;
-        sys.table.freeze(&session, usize::MAX).await;
+        sys.table.freeze(&session, usize::MAX).await.unwrap();
         checkpoint_published(&sys.table, &mut session).await;
 
         let key = single_key(2i32);
@@ -844,7 +873,7 @@ fn test_column_delete_rollback_after_checkpoint() {
         let res = trx_delete_row(&mut trx_delete, &sys.table, &key).await;
         assert!(matches!(res, Ok(DeleteMvcc::Deleted)));
 
-        sys.table.freeze(&session, usize::MAX).await;
+        sys.table.freeze(&session, usize::MAX).await.unwrap();
         let mut checkpoint_session = sys.try_new_session().unwrap();
         checkpoint_published(&sys.table, &mut checkpoint_session).await;
 
@@ -873,7 +902,7 @@ fn test_column_delete_write_conflict() {
         let sys = TestSys::new_evictable().await;
         let mut session = sys.try_new_session().unwrap();
         insert_rows(&sys, &mut session, 0, 10, "name").await;
-        sys.table.freeze(&session, usize::MAX).await;
+        sys.table.freeze(&session, usize::MAX).await.unwrap();
         checkpoint_published(&sys.table, &mut session).await;
 
         let key = single_key(4i32);
@@ -902,7 +931,7 @@ fn test_column_delete_mvcc_visibility() {
         let sys = TestSys::new_evictable().await;
         let mut session = sys.try_new_session().unwrap();
         insert_rows(&sys, &mut session, 0, 10, "name").await;
-        sys.table.freeze(&session, usize::MAX).await;
+        sys.table.freeze(&session, usize::MAX).await.unwrap();
         checkpoint_published(&sys.table, &mut session).await;
 
         let key = single_key(5i32);
@@ -938,7 +967,7 @@ fn test_lwc_delete_unique_conflicts_when_delete_committed_after_snapshot() {
         let sys = TestSys::new_evictable().await;
         let mut session = sys.try_new_session().unwrap();
         insert_rows(&sys, &mut session, 0, 10, "name").await;
-        sys.table.freeze(&session, usize::MAX).await;
+        sys.table.freeze(&session, usize::MAX).await.unwrap();
         checkpoint_published(&sys.table, &mut session).await;
 
         let key = single_key(5i32);
@@ -972,7 +1001,7 @@ fn test_lwc_update_unique_same_key_reinserts_hot_and_preserves_old_snapshot() {
         let sys = TestSys::new_evictable().await;
         let mut session = sys.try_new_session().unwrap();
         insert_rows(&sys, &mut session, 0, 4, "name").await;
-        sys.table.freeze(&session, usize::MAX).await;
+        sys.table.freeze(&session, usize::MAX).await.unwrap();
         checkpoint_published(&sys.table, &mut session).await;
 
         let key = single_key(1i32);
@@ -1014,7 +1043,10 @@ fn test_lwc_update_unique_same_key_reinserts_hot_and_preserves_old_snapshot() {
                 )
                 .await;
                 assert!(matches!(
-                    sys.table.find_row(session.pool_guards(), new_row_id).await,
+                    sys.table
+                        .find_row(session.pool_guards(), new_row_id)
+                        .await
+                        .unwrap(),
                     RowLocation::RowPage(_)
                 ));
                 match sys.table.deletion_buffer().get(old_row_id).unwrap() {
@@ -1063,7 +1095,7 @@ fn test_lwc_update_unique_conflicts_when_delete_committed_after_snapshot() {
         let sys = TestSys::new_evictable().await;
         let mut session = sys.try_new_session().unwrap();
         insert_rows(&sys, &mut session, 0, 10, "name").await;
-        sys.table.freeze(&session, usize::MAX).await;
+        sys.table.freeze(&session, usize::MAX).await.unwrap();
         checkpoint_published(&sys.table, &mut session).await;
 
         let key = single_key(5i32);
@@ -1107,7 +1139,7 @@ fn test_lwc_update_unique_key_change_preserves_old_and_new_key_visibility() {
         let sys = TestSys::new_evictable().await;
         let mut session = sys.try_new_session().unwrap();
         insert_rows(&sys, &mut session, 0, 4, "name").await;
-        sys.table.freeze(&session, usize::MAX).await;
+        sys.table.freeze(&session, usize::MAX).await.unwrap();
         checkpoint_published(&sys.table, &mut session).await;
 
         let old_key = single_key(2i32);
@@ -1191,7 +1223,7 @@ fn test_lwc_update_unique_duplicate_rolls_back_cold_marker_and_hot_insert() {
         let sys = TestSys::new_evictable().await;
         let mut session = sys.try_new_session().unwrap();
         insert_rows(&sys, &mut session, 0, 4, "name").await;
-        sys.table.freeze(&session, usize::MAX).await;
+        sys.table.freeze(&session, usize::MAX).await.unwrap();
         checkpoint_published(&sys.table, &mut session).await;
 
         let key = single_key(1i32);
@@ -1234,7 +1266,7 @@ fn test_lwc_update_unique_claims_committed_deleted_cold_owner_with_visibility_br
         let sys = TestSys::new_evictable().await;
         let mut session = sys.try_new_session().unwrap();
         insert_rows(&sys, &mut session, 1, 2, "name").await;
-        sys.table.freeze(&session, usize::MAX).await;
+        sys.table.freeze(&session, usize::MAX).await.unwrap();
         checkpoint_published(&sys.table, &mut session).await;
 
         let old_key = single_key(1i32);
@@ -1292,7 +1324,7 @@ fn test_lwc_update_unique_rejects_cold_owner_deleted_after_snapshot() {
         let sys = TestSys::new_evictable().await;
         let mut session = sys.try_new_session().unwrap();
         insert_rows(&sys, &mut session, 1, 2, "name").await;
-        sys.table.freeze(&session, usize::MAX).await;
+        sys.table.freeze(&session, usize::MAX).await.unwrap();
         checkpoint_published(&sys.table, &mut session).await;
 
         let old_key = single_key(1i32);
@@ -1371,7 +1403,7 @@ fn test_lwc_update_unique_claim_rollback_restores_deleted_cold_owner() {
         let sys = TestSys::new_evictable().await;
         let mut session = sys.try_new_session().unwrap();
         insert_rows(&sys, &mut session, 1, 2, "name").await;
-        sys.table.freeze(&session, usize::MAX).await;
+        sys.table.freeze(&session, usize::MAX).await.unwrap();
         checkpoint_published(&sys.table, &mut session).await;
 
         let old_key = single_key(1i32);
@@ -1433,7 +1465,8 @@ fn test_lwc_update_unique_claim_rollback_restores_deleted_cold_owner() {
                 assert!(matches!(
                     sys.table
                         .find_row(session.pool_guards(), claimed_row_id)
-                        .await,
+                        .await
+                        .unwrap(),
                     RowLocation::LwcBlock { .. }
                 ));
                 Ok(())
@@ -1476,7 +1509,7 @@ fn test_lwc_update_unique_claim_rollback_drops_purgeable_deleted_cold_owner() {
         let sys = TestSys::new_evictable().await;
         let mut session = sys.try_new_session().unwrap();
         insert_rows(&sys, &mut session, 1, 2, "name").await;
-        sys.table.freeze(&session, usize::MAX).await;
+        sys.table.freeze(&session, usize::MAX).await.unwrap();
         checkpoint_published(&sys.table, &mut session).await;
 
         let old_key = single_key(1i32);
@@ -1552,7 +1585,8 @@ fn test_lwc_update_unique_claim_rollback_drops_purgeable_deleted_cold_owner() {
                 assert!(matches!(
                     sys.table
                         .find_row(session.pool_guards(), claimed_row_id)
-                        .await,
+                        .await
+                        .unwrap(),
                     RowLocation::LwcBlock { .. }
                 ));
                 Ok(())
@@ -1564,9 +1598,10 @@ fn test_lwc_update_unique_claim_rollback_drops_purgeable_deleted_cold_owner() {
         // replacement claim owns the unique key, GC observes a row-id mismatch
         // and skips the entry, so rollback must not recreate that skipped
         // delete-masked owner.
+        let layout = sys.table.layout_snapshot();
         let deleted = sys
             .table
-            .accessor_with_layout(sys.table.layout_snapshot())
+            .accessor_with_layout(&layout)
             .delete_index(
                 session.pool_guards(),
                 &claimed_key,
@@ -1598,7 +1633,7 @@ fn test_checkpoint_persists_committed_cold_delete_markers() {
         let sys = TestSys::new_evictable().await;
         let mut session = sys.try_new_session().unwrap();
         insert_rows(&sys, &mut session, 0, 10, "name").await;
-        sys.table.freeze(&session, usize::MAX).await;
+        sys.table.freeze(&session, usize::MAX).await.unwrap();
         checkpoint_published(&sys.table, &mut session).await;
 
         let key = single_key(6i32);
@@ -1659,7 +1694,7 @@ fn test_checkpoint_publishes_unique_secondary_disk_tree_root() {
         let mut session = sys.try_new_session().unwrap();
         insert_rows(&sys, &mut session, 0, 3, "name").await;
 
-        sys.table.freeze(&session, usize::MAX).await;
+        sys.table.freeze(&session, usize::MAX).await.unwrap();
         checkpoint_published(&sys.table, &mut session).await;
 
         let active_root = sys.table.file().active_root_unchecked();
@@ -1739,7 +1774,7 @@ fn test_checkpoint_publishes_non_unique_secondary_disk_tree_entries_across_lwc_s
         let row_count = 80;
         insert_rows(&sys, &mut session, 0, row_count, &name).await;
 
-        sys.table.freeze(&session, usize::MAX).await;
+        sys.table.freeze(&session, usize::MAX).await.unwrap();
         checkpoint_published(&sys.table, &mut session).await;
 
         let name_key = name_key(&name);
@@ -1785,7 +1820,7 @@ fn test_secondary_mem_index_cleanup_removes_redundant_live_unique_entries() {
         let mut session = sys.try_new_session().unwrap();
         let row_count = 4;
         insert_rows(&sys, &mut session, 0, row_count, "name").await;
-        sys.table.freeze(&session, usize::MAX).await;
+        sys.table.freeze(&session, usize::MAX).await.unwrap();
         checkpoint_published(&sys.table, &mut session).await;
 
         let index = bound_unique_index_no(&sys.table, 0);
@@ -1852,7 +1887,7 @@ fn test_secondary_mem_index_cleanup_removes_redundant_live_non_unique_entries() 
         let mut session = sys.try_new_session().unwrap();
         let row_count = 5;
         insert_rows(&sys, &mut session, 0, row_count, "same-name").await;
-        sys.table.freeze(&session, usize::MAX).await;
+        sys.table.freeze(&session, usize::MAX).await.unwrap();
         checkpoint_published(&sys.table, &mut session).await;
 
         let index = bound_non_unique_index_no(&sys.table, 1);
@@ -1896,7 +1931,7 @@ fn test_secondary_mem_index_cleanup_aggregates_bounded_batches() {
         let name = "batch-name-".repeat(120);
         let row_count = 80;
         insert_rows(&sys, &mut session, 0, row_count, &name).await;
-        sys.table.freeze(&session, usize::MAX).await;
+        sys.table.freeze(&session, usize::MAX).await.unwrap();
         checkpoint_published(&sys.table, &mut session).await;
 
         let stats = sys
@@ -1919,7 +1954,7 @@ fn test_secondary_mem_index_cleanup_can_retain_live_cache_entries() {
         let mut session = sys.try_new_session().unwrap();
         let row_count = 4;
         insert_rows(&sys, &mut session, 0, row_count, "same-name").await;
-        sys.table.freeze(&session, usize::MAX).await;
+        sys.table.freeze(&session, usize::MAX).await.unwrap();
         checkpoint_published(&sys.table, &mut session).await;
 
         let unique_index = bound_unique_index_no(&sys.table, 0);
@@ -2057,7 +2092,7 @@ fn test_secondary_mem_index_cleanup_removes_unique_delete_shadow_with_purgeable_
         let sys = TestSys::new_evictable().await;
         let mut session = sys.try_new_session().unwrap();
         insert_rows(&sys, &mut session, 0, 1, "name").await;
-        sys.table.freeze(&session, usize::MAX).await;
+        sys.table.freeze(&session, usize::MAX).await.unwrap();
         checkpoint_published(&sys.table, &mut session).await;
 
         let current_key = single_key(0i32);
@@ -2125,7 +2160,7 @@ fn test_secondary_mem_index_cleanup_removes_delete_shadow_when_live_cleanup_disa
         let sys = TestSys::new_evictable().await;
         let mut session = sys.try_new_session().unwrap();
         insert_rows(&sys, &mut session, 0, 1, "name").await;
-        sys.table.freeze(&session, usize::MAX).await;
+        sys.table.freeze(&session, usize::MAX).await.unwrap();
         checkpoint_published(&sys.table, &mut session).await;
 
         let current_key = single_key(0i32);
@@ -2204,7 +2239,7 @@ fn test_secondary_mem_index_cleanup_removes_unique_delete_shadow_with_matching_c
         let sys = TestSys::new_evictable().await;
         let mut session = sys.try_new_session().unwrap();
         insert_rows(&sys, &mut session, 0, 1, "name").await;
-        sys.table.freeze(&session, usize::MAX).await;
+        sys.table.freeze(&session, usize::MAX).await.unwrap();
         checkpoint_published(&sys.table, &mut session).await;
 
         let current_key = single_key(0i32);
@@ -2280,7 +2315,7 @@ fn test_secondary_mem_index_cleanup_removes_unique_delete_shadow_when_cold_row_k
         let sys = TestSys::new_evictable().await;
         let mut session = sys.try_new_session().unwrap();
         insert_rows(&sys, &mut session, 0, 1, "name").await;
-        sys.table.freeze(&session, usize::MAX).await;
+        sys.table.freeze(&session, usize::MAX).await.unwrap();
         let checkpoint_ts = checkpoint_published(&sys.table, &mut session).await;
         wait_gc_cutoff_after(&session, checkpoint_ts).await;
 
@@ -2382,7 +2417,7 @@ fn test_secondary_mem_index_cleanup_propagates_cold_delete_overlay_proof_error()
         let sys = TestSys::new_evictable().await;
         let mut session = sys.try_new_session().unwrap();
         insert_rows(&sys, &mut session, 0, 1, "name").await;
-        sys.table.freeze(&session, usize::MAX).await;
+        sys.table.freeze(&session, usize::MAX).await.unwrap();
         let checkpoint_ts = checkpoint_published(&sys.table, &mut session).await;
         wait_gc_cutoff_after(&session, checkpoint_ts).await;
 
@@ -2545,7 +2580,7 @@ fn test_secondary_mem_index_cleanup_removes_non_unique_delete_mark_with_purgeabl
         let sys = TestSys::new_evictable_with_non_unique_name_index().await;
         let mut session = sys.try_new_session().unwrap();
         insert_rows(&sys, &mut session, 0, 1, "current").await;
-        sys.table.freeze(&session, usize::MAX).await;
+        sys.table.freeze(&session, usize::MAX).await.unwrap();
         checkpoint_published(&sys.table, &mut session).await;
 
         let pk = single_key(0i32);
@@ -2614,7 +2649,7 @@ fn test_secondary_mem_index_cleanup_removes_non_unique_delete_mark_with_matching
         let sys = TestSys::new_evictable_with_non_unique_name_index().await;
         let mut session = sys.try_new_session().unwrap();
         insert_rows(&sys, &mut session, 0, 1, "current").await;
-        sys.table.freeze(&session, usize::MAX).await;
+        sys.table.freeze(&session, usize::MAX).await.unwrap();
         checkpoint_published(&sys.table, &mut session).await;
 
         let pk = single_key(0i32);
@@ -2693,7 +2728,7 @@ fn test_secondary_mem_index_cleanup_removes_non_unique_delete_mark_when_cold_row
         let sys = TestSys::new_evictable_with_non_unique_name_index().await;
         let mut session = sys.try_new_session().unwrap();
         insert_rows(&sys, &mut session, 0, 1, "current").await;
-        sys.table.freeze(&session, usize::MAX).await;
+        sys.table.freeze(&session, usize::MAX).await.unwrap();
         let checkpoint_ts = checkpoint_published(&sys.table, &mut session).await;
         wait_gc_cutoff_after(&session, checkpoint_ts).await;
 
@@ -2805,7 +2840,7 @@ fn test_deletion_checkpoint_updates_secondary_disk_tree_roots() {
         let sys = TestSys::new_evictable_with_non_unique_name_index().await;
         let mut session = sys.try_new_session().unwrap();
         insert_rows(&sys, &mut session, 0, 2, "same-name").await;
-        sys.table.freeze(&session, usize::MAX).await;
+        sys.table.freeze(&session, usize::MAX).await.unwrap();
         checkpoint_published(&sys.table, &mut session).await;
 
         let delete_key = single_key(0i32);
@@ -2852,7 +2887,7 @@ fn test_unique_checkpoint_overlap_keeps_new_disk_tree_owner() {
             vec![Val::from(1i32), Val::from("old")],
         )
         .await;
-        sys.table.freeze(&session, usize::MAX).await;
+        sys.table.freeze(&session, usize::MAX).await.unwrap();
         checkpoint_published(&sys.table, &mut session).await;
 
         let key = single_key(1i32);
@@ -2865,7 +2900,7 @@ fn test_unique_checkpoint_overlap_keeps_new_disk_tree_owner() {
         )
         .await;
 
-        sys.table.freeze(&session, usize::MAX).await;
+        sys.table.freeze(&session, usize::MAX).await.unwrap();
         let readiness_ts = delete_ts.max(sys.table.file().active_root_unchecked().trx_id);
         wait_gc_cutoff_after(&session, readiness_ts).await;
         checkpoint_published(&sys.table, &mut session).await;
@@ -2891,7 +2926,7 @@ fn test_secondary_sidecar_failure_keeps_checkpoint_root_atomic() {
         let sys = TestSys::new_evictable().await;
         let mut session = sys.try_new_session().unwrap();
         insert_rows(&sys, &mut session, 0, 2, "name").await;
-        sys.table.freeze(&session, usize::MAX).await;
+        sys.table.freeze(&session, usize::MAX).await.unwrap();
         checkpoint_published(&sys.table, &mut session).await;
 
         let key = single_key(0i32);
@@ -2936,7 +2971,7 @@ fn test_checkpoint_all_deleted_row_page_advances_without_column_index() {
         delete_key_range_and_wait_gc_cutoff(&sys, &mut session, 0, 10).await;
 
         let root_before = sys.table.file().active_root_unchecked().clone();
-        sys.table.freeze(&session, usize::MAX).await;
+        sys.table.freeze(&session, usize::MAX).await.unwrap();
         checkpoint_published(&sys.table, &mut session).await;
 
         let root_after = sys.table.file().active_root_unchecked();
@@ -2966,7 +3001,10 @@ fn test_checkpoint_transition_delete_marker_waits_for_next_cutoff_range() {
             .unwrap()
             .expect("row should exist before delete");
         assert!(matches!(
-            sys.table.find_row(session.pool_guards(), row_id).await,
+            sys.table
+                .find_row(session.pool_guards(), row_id)
+                .await
+                .unwrap(),
             RowLocation::RowPage(_)
         ));
         reader.commit().await.unwrap();
@@ -2979,7 +3017,7 @@ fn test_checkpoint_transition_delete_marker_waits_for_next_cutoff_range() {
         sys.new_trx_delete(&mut writer_session, &key).await;
         assert!(sys.table.deletion_buffer().get(row_id).is_none());
 
-        sys.table.freeze(&session, usize::MAX).await;
+        sys.table.freeze(&session, usize::MAX).await.unwrap();
         let mut checkpoint_session = sys.try_new_session().unwrap();
         checkpoint_published(&sys.table, &mut checkpoint_session).await;
 
@@ -3042,7 +3080,7 @@ fn test_lwc_unique_index_purge_uses_purgeable_delete_marker_fast_path() {
         let sys = TestSys::new_evictable().await;
         let mut session = sys.try_new_session().unwrap();
         insert_rows(&sys, &mut session, 0, 1, "name").await;
-        sys.table.freeze(&session, usize::MAX).await;
+        sys.table.freeze(&session, usize::MAX).await.unwrap();
         checkpoint_published(&sys.table, &mut session).await;
 
         let key = single_key(0i32);
@@ -3067,9 +3105,11 @@ fn test_lwc_unique_index_purge_uses_purgeable_delete_marker_fast_path() {
             .put_committed(row_id, 10)
             .unwrap();
 
+        let layout = sys.table.layout_snapshot();
+
         let deleted = sys
             .table
-            .accessor_with_layout(sys.table.layout_snapshot())
+            .accessor_with_layout(&layout)
             .delete_index(session.pool_guards(), &key, row_id, true, 11)
             .await
             .unwrap();
@@ -3098,7 +3138,7 @@ fn test_lwc_unique_index_purge_compares_persisted_key_when_marker_is_not_purgeab
         let sys = TestSys::new_evictable().await;
         let mut session = sys.try_new_session().unwrap();
         insert_rows(&sys, &mut session, 0, 1, "name").await;
-        sys.table.freeze(&session, usize::MAX).await;
+        sys.table.freeze(&session, usize::MAX).await.unwrap();
         checkpoint_published(&sys.table, &mut session).await;
 
         let current_key = single_key(0i32);
@@ -3135,9 +3175,10 @@ fn test_lwc_unique_index_purge_compares_persisted_key_when_marker_is_not_purgeab
                 .await
                 .unwrap()
         );
+        let layout = sys.table.layout_snapshot();
         let deleted = sys
             .table
-            .accessor_with_layout(sys.table.layout_snapshot())
+            .accessor_with_layout(&layout)
             .delete_index(
                 session.pool_guards(),
                 &stale_key,
@@ -3175,9 +3216,10 @@ fn test_lwc_unique_index_purge_compares_persisted_key_when_marker_is_not_purgeab
             .deletion_buffer()
             .put_committed(row_id, 100)
             .unwrap();
+        let layout = sys.table.layout_snapshot();
         let deleted = sys
             .table
-            .accessor_with_layout(sys.table.layout_snapshot())
+            .accessor_with_layout(&layout)
             .delete_index(session.pool_guards(), &current_key, row_id, true, 100)
             .await
             .unwrap();
@@ -3202,7 +3244,7 @@ fn test_lwc_non_unique_index_purge_compares_persisted_key_when_marker_is_not_pur
         let sys = TestSys::new_evictable_with_non_unique_name_index().await;
         let mut session = sys.try_new_session().unwrap();
         insert_rows(&sys, &mut session, 0, 1, "current").await;
-        sys.table.freeze(&session, usize::MAX).await;
+        sys.table.freeze(&session, usize::MAX).await.unwrap();
         checkpoint_published(&sys.table, &mut session).await;
 
         let pk = single_key(0i32);
@@ -3234,9 +3276,10 @@ fn test_lwc_non_unique_index_purge_compares_persisted_key_when_marker_is_not_pur
                 .await
                 .unwrap()
         );
+        let layout = sys.table.layout_snapshot();
         let deleted = sys
             .table
-            .accessor_with_layout(sys.table.layout_snapshot())
+            .accessor_with_layout(&layout)
             .delete_index(
                 session.pool_guards(),
                 &stale_key,
@@ -3275,9 +3318,10 @@ fn test_lwc_non_unique_index_purge_compares_persisted_key_when_marker_is_not_pur
             .deletion_buffer()
             .put_committed(row_id, 200)
             .unwrap();
+        let layout = sys.table.layout_snapshot();
         let deleted = sys
             .table
-            .accessor_with_layout(sys.table.layout_snapshot())
+            .accessor_with_layout(&layout)
             .delete_index(session.pool_guards(), &current_key, row_id, false, 200)
             .await
             .unwrap();
@@ -3327,9 +3371,11 @@ fn test_index_purge_removes_delete_marked_unique_entry_when_row_is_not_found() {
                 .unwrap()
         );
 
+        let layout = sys.table.layout_snapshot();
+
         let deleted = sys
             .table
-            .accessor_with_layout(sys.table.layout_snapshot())
+            .accessor_with_layout(&layout)
             .delete_index(session.pool_guards(), &key, row_id, true, MAX_SNAPSHOT_TS)
             .await
             .unwrap();
@@ -3359,7 +3405,8 @@ fn test_unique_insert_rollback_restores_deleted_owner_even_when_row_missing() {
         assert!(matches!(
             sys.table
                 .find_row(session.pool_guards(), stale_row_id)
-                .await,
+                .await
+                .unwrap(),
             RowLocation::NotFound
         ));
 
@@ -3473,7 +3520,10 @@ fn test_unique_insert_rollback_restores_delete_marked_stale_hot_owner() {
             .0;
         reader.commit().await.unwrap();
         assert!(matches!(
-            sys.table.find_row(session.pool_guards(), old_row_id).await,
+            sys.table
+                .find_row(session.pool_guards(), old_row_id)
+                .await
+                .unwrap(),
             RowLocation::RowPage(_)
         ));
 
@@ -3559,7 +3609,7 @@ fn test_checkpoint_fails_when_eligible_delete_marker_has_no_column_index() {
         let mut session = sys.try_new_session().unwrap();
         insert_rows(&sys, &mut session, 0, 4, "name").await;
         delete_key_range_and_wait_gc_cutoff(&sys, &mut session, 0, 4).await;
-        sys.table.freeze(&session, usize::MAX).await;
+        sys.table.freeze(&session, usize::MAX).await.unwrap();
         checkpoint_published(&sys.table, &mut session).await;
 
         let root_before = sys.table.file().active_root_unchecked().clone();
@@ -3595,7 +3645,7 @@ fn test_checkpoint_fails_when_eligible_delete_marker_cannot_be_located() {
         let sys = TestSys::new_evictable().await;
         let mut session = sys.try_new_session().unwrap();
         insert_rows(&sys, &mut session, 0, 1, "name").await;
-        sys.table.freeze(&session, usize::MAX).await;
+        sys.table.freeze(&session, usize::MAX).await.unwrap();
         checkpoint_published(&sys.table, &mut session).await;
 
         let key = single_key(0i32);
@@ -3642,7 +3692,7 @@ fn test_checkpoint_ignores_missing_old_delete_marker_below_previous_cutoff() {
         let sys = TestSys::new_evictable().await;
         let mut session = sys.try_new_session().unwrap();
         insert_rows(&sys, &mut session, 0, 1, "name").await;
-        sys.table.freeze(&session, usize::MAX).await;
+        sys.table.freeze(&session, usize::MAX).await.unwrap();
         checkpoint_published(&sys.table, &mut session).await;
 
         let key = single_key(0i32);
@@ -3675,7 +3725,7 @@ fn test_recover_cold_delete_rejects_already_deleted_with_different_cts() {
         let sys = TestSys::new_evictable().await;
         let mut session = sys.try_new_session().unwrap();
         insert_rows(&sys, &mut session, 0, 10, "name").await;
-        sys.table.freeze(&session, usize::MAX).await;
+        sys.table.freeze(&session, usize::MAX).await.unwrap();
         checkpoint_published(&sys.table, &mut session).await;
 
         let key = single_key(6i32);
@@ -3719,7 +3769,7 @@ fn test_checkpoint_skips_cold_delete_markers_at_or_after_cutoff() {
         let sys = TestSys::new_evictable().await;
         let mut session = sys.try_new_session().unwrap();
         insert_rows(&sys, &mut session, 0, 10, "name").await;
-        sys.table.freeze(&session, usize::MAX).await;
+        sys.table.freeze(&session, usize::MAX).await.unwrap();
         checkpoint_published(&sys.table, &mut session).await;
 
         let key = single_key(7i32);
@@ -3776,7 +3826,7 @@ fn test_checkpoint_fails_on_invalid_v2_delete_metadata() {
         let sys = TestSys::new_evictable().await;
         let mut session = sys.try_new_session().unwrap();
         insert_rows(&sys, &mut session, 0, 10, "name").await;
-        sys.table.freeze(&session, usize::MAX).await;
+        sys.table.freeze(&session, usize::MAX).await.unwrap();
         checkpoint_published(&sys.table, &mut session).await;
 
         let key1 = single_key(6i32);
@@ -3856,7 +3906,7 @@ fn test_checkpoint_fails_on_short_v2_delete_section_header() {
         let sys = TestSys::new_evictable().await;
         let mut session = sys.try_new_session().unwrap();
         insert_rows(&sys, &mut session, 0, 10, "name").await;
-        sys.table.freeze(&session, usize::MAX).await;
+        sys.table.freeze(&session, usize::MAX).await.unwrap();
         checkpoint_published(&sys.table, &mut session).await;
 
         let key1 = single_key(6i32);
@@ -3949,7 +3999,12 @@ fn test_row_page_transition_retries_update_delete() {
             .await
             .unwrap()
             .unwrap();
-        let page_id = match sys.table.find_row(session.pool_guards(), row_id).await {
+        let page_id = match sys
+            .table
+            .find_row(session.pool_guards(), row_id)
+            .await
+            .unwrap()
+        {
             RowLocation::RowPage(page_id) => page_id,
             RowLocation::NotFound => panic!("row should exist"),
             RowLocation::LwcBlock { .. } => unreachable!("lwc block"),
@@ -3990,17 +4045,15 @@ fn test_row_page_transition_retries_update_delete() {
             .exec(async |stmt| {
                 stmt.acquire_table_write_locks(sys.table.table_id()).await?;
                 let (ctx, effects) = stmt_tests::ctx_and_effects_mut(stmt);
-                let insert_res = sys
-                    .table
-                    .accessor_with_layout(sys.table.layout_snapshot())
-                    .insert_row_to_page(
-                        ctx,
-                        effects,
-                        insert_page_guard,
-                        insert,
-                        RowUndoKind::Insert,
-                        vec![],
-                    );
+                let layout = sys.table.layout_snapshot();
+                let insert_res = sys.table.accessor_with_layout(&layout).insert_row_to_page(
+                    ctx,
+                    effects,
+                    insert_page_guard,
+                    insert,
+                    RowUndoKind::Insert,
+                    vec![],
+                );
                 assert!(matches!(
                     insert_res,
                     InsertRowIntoPage::NoSpaceOrFrozen(_, _, _)
@@ -4010,9 +4063,10 @@ fn test_row_page_transition_retries_update_delete() {
                     idx: 1,
                     val: Val::from("world"),
                 }];
+                let layout = sys.table.layout_snapshot();
                 let res = sys
                     .table
-                    .accessor_with_layout(sys.table.layout_snapshot())
+                    .accessor_with_layout(&layout)
                     .update_row_inplace(ctx, effects, page_guard, &key, row_id, update)
                     .await;
                 assert!(matches!(res, UpdateRowInplace::RetryInTransition));
@@ -4043,9 +4097,10 @@ fn test_row_page_transition_retries_update_delete() {
             .exec(async |stmt| {
                 stmt.acquire_table_write_locks(sys.table.table_id()).await?;
                 let (ctx, effects) = stmt_tests::ctx_and_effects_mut(stmt);
+                let layout = sys.table.layout_snapshot();
                 let res = sys
                     .table
-                    .accessor_with_layout(sys.table.layout_snapshot())
+                    .accessor_with_layout(&layout)
                     .delete_row_internal(ctx, effects, page_guard, row_id, &key, false)
                     .await;
                 assert!(matches!(res, DeleteInternal::RetryInTransition));
@@ -4507,16 +4562,39 @@ fn test_table_scan_uncommitted() {
         }
         {
             let mut res_len = 0usize;
+            let layout = sys.table.layout_snapshot();
             sys.table
-                .accessor_with_layout(sys.table.layout_snapshot())
+                .accessor_with_layout(&layout)
                 .table_scan_uncommitted(session.pool_guards(), |_metadata, _row| {
                     res_len += 1;
                     true
                 })
-                .await;
+                .await
+                .unwrap();
             println!("res.len()={}", res_len);
             assert!(res_len == SIZE as usize);
         }
+    });
+}
+
+#[test]
+fn test_table_scan_uncommitted_returns_error_without_meta_guard() {
+    smol::block_on(async {
+        let sys = TestSys::new_evictable().await;
+        let layout = sys.table.layout_snapshot();
+        let empty_guards = PoolGuards::builder().build();
+
+        let err = sys
+            .table
+            .accessor_with_layout(&layout)
+            .table_scan_uncommitted(&empty_guards, |_metadata, _row| true)
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            err.downcast_ref::<InternalError>().copied(),
+            Some(InternalError::Generic)
+        );
     });
 }
 
@@ -5226,7 +5304,7 @@ fn test_table_freeze() {
         }
         let row_pages = sys.table.total_row_pages(session1.pool_guards()).await;
         assert!(row_pages == 1);
-        sys.table.freeze(&session1, 10).await;
+        sys.table.freeze(&session1, 10).await.unwrap();
         // after freezing, new row should be inserted into second page.
         {
             let trx = session1.try_begin_trx().unwrap().unwrap();
@@ -5235,7 +5313,7 @@ fn test_table_freeze() {
         }
         let row_pages = sys.table.total_row_pages(session1.pool_guards()).await;
         assert!(row_pages == 2);
-        sys.table.freeze(&session1, 10).await;
+        sys.table.freeze(&session1, 10).await.unwrap();
 
         // update row 1 will cause new insert into new page.
         {
@@ -5294,7 +5372,12 @@ fn test_transition_captures_uncommitted_lock_into_deletion_buffer() {
             .await
             .unwrap()
             .unwrap();
-        let page_id = match sys.table.find_row(session.pool_guards(), row_id).await {
+        let page_id = match sys
+            .table
+            .find_row(session.pool_guards(), row_id)
+            .await
+            .unwrap()
+        {
             RowLocation::RowPage(page_id) => page_id,
             RowLocation::NotFound => panic!("row should exist"),
             RowLocation::LwcBlock { .. } => unreachable!("row page expected"),
@@ -5317,9 +5400,10 @@ fn test_transition_captures_uncommitted_lock_into_deletion_buffer() {
                     .unwrap();
                 stmt.acquire_table_write_locks(sys.table.table_id()).await?;
                 let (ctx, effects) = stmt_tests::ctx_and_effects_mut(stmt);
+                let layout = sys.table.layout_snapshot();
                 let mut lock_row = sys
                     .table
-                    .accessor_with_layout(sys.table.layout_snapshot())
+                    .accessor_with_layout(&layout)
                     .lock_row_for_write(ctx, effects, &page_guard, row_id, Some(&key))
                     .await;
                 match &mut lock_row {
@@ -5379,8 +5463,12 @@ fn test_checkpoint_basic_flow() {
         insert_rows(&sys, &mut session, 0, 200, &name).await;
 
         let old_root = sys.table.file().active_root_unchecked().clone();
-        sys.table.freeze(&session, usize::MAX).await;
-        let (frozen_pages, _) = sys.table.collect_frozen_pages(session.pool_guards()).await;
+        sys.table.freeze(&session, usize::MAX).await.unwrap();
+        let (frozen_pages, _) = sys
+            .table
+            .collect_frozen_pages(session.pool_guards())
+            .await
+            .unwrap();
         assert!(!frozen_pages.is_empty());
 
         checkpoint_published(&sys.table, &mut session).await;
@@ -5787,6 +5875,7 @@ fn test_drop_table_logical_cascade_and_stale_handles() {
                 .columns()
                 .list_uncommitted_by_table_id(session.pool_guards(), table_id)
                 .await
+                .unwrap()
                 .is_empty()
         );
         assert!(
@@ -5796,6 +5885,7 @@ fn test_drop_table_logical_cascade_and_stale_handles() {
                 .indexes()
                 .list_uncommitted_by_table_id(session.pool_guards(), table_id)
                 .await
+                .unwrap()
                 .is_empty()
         );
         assert!(
@@ -5805,6 +5895,7 @@ fn test_drop_table_logical_cascade_and_stale_handles() {
                 .index_columns()
                 .list_uncommitted_by_table_id(session.pool_guards(), table_id)
                 .await
+                .unwrap()
                 .is_empty()
         );
         assert!(
@@ -5824,6 +5915,7 @@ fn test_drop_table_logical_cascade_and_stale_handles() {
                 .columns()
                 .list_uncommitted_by_table_id(session.pool_guards(), other_table_id)
                 .await
+                .unwrap()
                 .is_empty()
         );
         assert!(std::path::Path::new(&table_file_path).exists());
@@ -5918,7 +6010,8 @@ fn test_drop_table_catalog_cascade_poison_preserves_source_error() {
                     .storage
                     .index_columns()
                     .delete_by_index(stmt, table_id, 0)
-                    .await;
+                    .await
+                    .unwrap();
                 assert_eq!(deleted, 1);
                 let old = stmt.effects_mut().set_ddl_redo(DDLRedo::DropIndex {
                     table_id,
@@ -6274,7 +6367,7 @@ fn test_checkpoint_readiness_delayed_reports_root_and_horizon() {
         let mut session = sys.try_new_session().unwrap();
         insert_rows(&sys, &mut session, 0, 120, "readiness-delay").await;
 
-        sys.table.freeze(&session, usize::MAX).await;
+        sys.table.freeze(&session, usize::MAX).await.unwrap();
         let mut reader_session = sys.try_new_session().unwrap();
         let reader = reader_session.try_begin_trx().unwrap().unwrap();
         checkpoint_published(&sys.table, &mut session).await;
@@ -6304,7 +6397,7 @@ fn test_checkpoint_requires_idle_session_before_delayed_outcome() {
         let mut session = sys.try_new_session().unwrap();
         insert_rows(&sys, &mut session, 0, 120, "idle-before-delay").await;
 
-        sys.table.freeze(&session, usize::MAX).await;
+        sys.table.freeze(&session, usize::MAX).await.unwrap();
         let mut reader_session = sys.try_new_session().unwrap();
         let reader = reader_session.try_begin_trx().unwrap().unwrap();
         let first_checkpoint_ts = checkpoint_published(&sys.table, &mut session).await;
@@ -6338,15 +6431,19 @@ fn test_checkpoint_delayed_preserves_root_and_frozen_pages_until_ready() {
         let mut session = sys.try_new_session().unwrap();
         insert_rows(&sys, &mut session, 0, 120, "delayed-root").await;
 
-        sys.table.freeze(&session, usize::MAX).await;
+        sys.table.freeze(&session, usize::MAX).await.unwrap();
         let mut reader_session = sys.try_new_session().unwrap();
         let reader = reader_session.try_begin_trx().unwrap().unwrap();
         checkpoint_published(&sys.table, &mut session).await;
         let root_protected_by_reader = sys.table.file().active_root_unchecked().trx_id;
 
         insert_rows(&sys, &mut session, 1_000, 80, "delayed-frozen").await;
-        sys.table.freeze(&session, usize::MAX).await;
-        let (frozen_pages, _) = sys.table.collect_frozen_pages(session.pool_guards()).await;
+        sys.table.freeze(&session, usize::MAX).await.unwrap();
+        let (frozen_pages, _) = sys
+            .table
+            .collect_frozen_pages(session.pool_guards())
+            .await
+            .unwrap();
         assert!(!frozen_pages.is_empty());
         let first_frozen_page = frozen_pages[0].page_id;
         let root_before_delay = sys.table.file().active_root_unchecked().clone();
@@ -6361,13 +6458,18 @@ fn test_checkpoint_delayed_preserves_root_and_frozen_pages_until_ready() {
 
         let page_guard = sys
             .table
+            .mem
             .must_get_row_page_shared(session.pool_guards(), first_frozen_page)
             .await
             .unwrap();
         let (ctx, _) = page_guard.ctx_and_page();
         assert_eq!(ctx.row_ver().unwrap().state(), RowPageState::Frozen);
         drop(page_guard);
-        let (still_frozen_pages, _) = sys.table.collect_frozen_pages(session.pool_guards()).await;
+        let (still_frozen_pages, _) = sys
+            .table
+            .collect_frozen_pages(session.pool_guards())
+            .await
+            .unwrap();
         assert_eq!(still_frozen_pages[0].page_id, first_frozen_page);
 
         reader.commit().await.unwrap();
@@ -6386,7 +6488,7 @@ fn test_second_checkpoint_waits_for_previous_root_horizon() {
         let mut session = sys.try_new_session().unwrap();
         insert_rows(&sys, &mut session, 0, 120, "second-delay").await;
 
-        sys.table.freeze(&session, usize::MAX).await;
+        sys.table.freeze(&session, usize::MAX).await.unwrap();
         let mut reader_session = sys.try_new_session().unwrap();
         let reader = reader_session.try_begin_trx().unwrap().unwrap();
         let first_checkpoint_ts = checkpoint_published(&sys.table, &mut session).await;
@@ -6456,7 +6558,7 @@ fn test_checkpoint_snapshot_consistency() {
         let name = "y".repeat(256);
         insert_rows(&sys, &mut session, 0, 120, &name).await;
 
-        sys.table.freeze(&session, 1).await;
+        sys.table.freeze(&session, 1).await.unwrap();
 
         let mut read_trx = session.try_begin_trx().unwrap().unwrap();
         {
@@ -6495,7 +6597,7 @@ fn test_checkpoint_old_root_released_after_active_reader_purged() {
         let name = "retained-root".repeat(64);
         insert_rows(&sys, &mut session, 0, 120, &name).await;
 
-        sys.table.freeze(&session, usize::MAX).await;
+        sys.table.freeze(&session, usize::MAX).await.unwrap();
         let retained_root_ptr = sys.table.file().active_root_unchecked() as *const _ as usize;
         let drop_count_before = old_root_drop_count(retained_root_ptr);
 
@@ -6545,7 +6647,7 @@ fn test_checkpoint_persistence_recovery() {
         let name = "z".repeat(512);
         insert_rows_direct(&table, &mut session, 0, 150, &name).await;
 
-        table.freeze(&session, usize::MAX).await;
+        table.freeze(&session, usize::MAX).await.unwrap();
         checkpoint_published(&table, &mut session).await;
 
         let root_before = table.file().active_root_unchecked().clone();
@@ -6600,7 +6702,7 @@ fn test_checkpoint_gc_verification() {
         insert_rows(&sys, &mut session, 0, 200, &name).await;
 
         let allocated_before = sys.engine.mem_pool.allocated();
-        sys.table.freeze(&session, usize::MAX).await;
+        sys.table.freeze(&session, usize::MAX).await.unwrap();
         checkpoint_published(&sys.table, &mut session).await;
         let allocated_after = sys.engine.mem_pool.allocated();
         let mut reclaimed = allocated_after < allocated_before;
@@ -6639,6 +6741,7 @@ fn test_session_cached_insert_page_reuses_live_versioned_page() {
         assert_eq!(cached_row_id, row_id);
         assert!(
             sys.table
+                .mem
                 .get_row_page_versioned_shared(session.pool_guards(), cached_page)
                 .await
                 .unwrap()
@@ -6657,7 +6760,12 @@ fn test_session_cached_insert_page_reuses_live_versioned_page() {
         );
         trx.commit().await.unwrap();
 
-        let next_page_id = match sys.table.find_row(session.pool_guards(), next_row_id).await {
+        let next_page_id = match sys
+            .table
+            .find_row(session.pool_guards(), next_row_id)
+            .await
+            .unwrap()
+        {
             RowLocation::RowPage(page_id) => page_id,
             RowLocation::LwcBlock { .. } | RowLocation::NotFound => {
                 panic!("row should still be in the in-memory row store")
@@ -6696,7 +6804,7 @@ fn test_stale_session_cached_insert_page_falls_back_after_checkpoint_gc() {
         assert_eq!(cached_row_id, row_id);
         session.save_active_insert_page(sys.table.table_id(), cached_page, cached_row_id);
 
-        sys.table.freeze(&session, usize::MAX).await;
+        sys.table.freeze(&session, usize::MAX).await.unwrap();
         let mut checkpoint_session = sys.try_new_session().unwrap();
         checkpoint_published(&sys.table, &mut checkpoint_session).await;
 
@@ -6704,6 +6812,7 @@ fn test_stale_session_cached_insert_page_falls_back_after_checkpoint_gc() {
         for _ in 0..20 {
             if sys
                 .table
+                .mem
                 .get_row_page_versioned_shared(session.pool_guards(), cached_page)
                 .await
                 .unwrap()
@@ -6766,7 +6875,7 @@ fn test_validated_row_page_shared_result_rejects_stale_reused_page_range() {
             .unwrap();
         assert_eq!(cached_row_id, stale_row_id);
 
-        sys.table.freeze(&session, usize::MAX).await;
+        sys.table.freeze(&session, usize::MAX).await.unwrap();
         let mut checkpoint_session = sys.try_new_session().unwrap();
         checkpoint_published(&sys.table, &mut checkpoint_session).await;
 
@@ -6774,6 +6883,7 @@ fn test_validated_row_page_shared_result_rejects_stale_reused_page_range() {
         for _ in 0..20 {
             if sys
                 .table
+                .mem
                 .get_row_page_versioned_shared(session.pool_guards(), stale_page)
                 .await
                 .unwrap()
@@ -6802,7 +6912,12 @@ fn test_validated_row_page_shared_result_rejects_stale_reused_page_range() {
                 .await,
             );
             trx.commit().await.unwrap();
-            match sys.table.find_row(session.pool_guards(), row_id).await {
+            match sys
+                .table
+                .find_row(session.pool_guards(), row_id)
+                .await
+                .unwrap()
+            {
                 RowLocation::RowPage(page_id) if page_id == stale_page.page_id => {
                     reused_row_id = Some(row_id);
                     break;
@@ -6815,9 +6930,11 @@ fn test_validated_row_page_shared_result_rejects_stale_reused_page_range() {
         }
         let reused_row_id = reused_row_id.expect("stale row-page slot should be reused");
 
+        let layout = sys.table.layout_snapshot();
+
         let stale_guard = sys
             .table
-            .accessor_with_layout(sys.table.layout_snapshot())
+            .accessor_with_layout(&layout)
             .try_get_validated_row_page_shared_result(
                 session.pool_guards(),
                 stale_page.page_id,
@@ -6830,9 +6947,11 @@ fn test_validated_row_page_shared_result_rejects_stale_reused_page_range() {
             "stale row id should not validate against the reused page range"
         );
 
+        let layout = sys.table.layout_snapshot();
+
         let reused_guard = sys
             .table
-            .accessor_with_layout(sys.table.layout_snapshot())
+            .accessor_with_layout(&layout)
             .try_get_validated_row_page_shared_result(
                 session.pool_guards(),
                 stale_page.page_id,
@@ -7103,7 +7222,7 @@ fn test_checkpoint_error_rollback() {
         let name = "e".repeat(256);
         insert_rows(&sys, &mut session, 0, 80, &name).await;
 
-        sys.table.freeze(&session, usize::MAX).await;
+        sys.table.freeze(&session, usize::MAX).await.unwrap();
         let root_before = sys.table.file().active_root_unchecked().clone();
 
         set_test_force_lwc_build_error(true);
@@ -7273,15 +7392,17 @@ fn test_user_secondary_indexes_evict_and_continue_serving_lookups() {
         }
 
         let mut visible_rows = 0usize;
+        let layout = table.layout_snapshot();
         table
-            .accessor_with_layout(table.layout_snapshot())
+            .accessor_with_layout(&layout)
             .table_scan_uncommitted(session.pool_guards(), |_metadata, row| {
                 if !row.is_deleted() {
                     visible_rows += 1;
                 }
                 true
             })
-            .await;
+            .await
+            .unwrap();
         assert_eq!(visible_rows, inserted.len());
     });
 }
@@ -7870,7 +7991,7 @@ async fn assert_row_in_lwc(
     else {
         panic!("row should exist");
     };
-    match table.find_row(guards, row_id).await {
+    match table.find_row(guards, row_id).await.unwrap() {
         RowLocation::LwcBlock { .. } => row_id,
         RowLocation::RowPage(..) => panic!("row should be in lwc"),
         RowLocation::NotFound => panic!("row should exist"),
@@ -8366,7 +8487,7 @@ fn test_dropped_unique_index_purge_delete_is_noop() {
             vec![Val::from(1i32), Val::from("name")],
         )
         .await;
-        sys.table.freeze(&session, usize::MAX).await;
+        sys.table.freeze(&session, usize::MAX).await.unwrap();
         checkpoint_published(&sys.table, &mut session).await;
         let mut hold_session = sys.try_new_session().unwrap();
         let hold_trx = hold_session.try_begin_trx().unwrap().unwrap();
@@ -8387,9 +8508,11 @@ fn test_dropped_unique_index_purge_delete_is_noop() {
 
         session.drop_index(sys.table.table_id(), 0).await.unwrap();
 
+        let layout = sys.table.layout_snapshot();
+
         let deleted = sys
             .table
-            .accessor_with_layout(sys.table.layout_snapshot())
+            .accessor_with_layout(&layout)
             .delete_index(session.pool_guards(), &key, row_id, true, min_active_sts)
             .await
             .unwrap();
@@ -8412,7 +8535,7 @@ fn test_dropped_non_unique_index_purge_delete_is_noop() {
         )
         .await;
         let key = name_key("name");
-        sys.table.freeze(&session, usize::MAX).await;
+        sys.table.freeze(&session, usize::MAX).await.unwrap();
         checkpoint_published(&sys.table, &mut session).await;
         let mut hold_session = sys.try_new_session().unwrap();
         let hold_trx = hold_session.try_begin_trx().unwrap().unwrap();
@@ -8437,9 +8560,11 @@ fn test_dropped_non_unique_index_purge_delete_is_noop() {
             .await
             .unwrap();
 
+        let layout = sys.table.layout_snapshot();
+
         let deleted = sys
             .table
-            .accessor_with_layout(sys.table.layout_snapshot())
+            .accessor_with_layout(&layout)
             .delete_index(session.pool_guards(), &key, row_id, false, min_active_sts)
             .await
             .unwrap();

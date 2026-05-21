@@ -4,9 +4,9 @@ use crate::catalog::storage::CatalogDefinition;
 use crate::catalog::storage::object::TableObject;
 use crate::catalog::table::TableMetadata;
 use crate::catalog::{ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexSpec, TableID};
+use crate::error::Result;
 use crate::row::ops::{DeleteMvcc, SelectKey};
 use crate::row::{Row, RowRead};
-use crate::table::TableAccess;
 use crate::trx::stmt::Statement;
 use crate::value::Val;
 use crate::value::ValKind;
@@ -70,10 +70,9 @@ pub struct Tables<'a> {
 
 impl Tables<'_> {
     /// List all table rows from uncommitted-visible catalog state.
-    pub async fn list_uncommitted(&self, guards: &PoolGuards) -> Vec<TableObject> {
+    pub async fn list_uncommitted(&self, guards: &PoolGuards) -> Result<Vec<TableObject>> {
         let mut res = vec![];
         self.table
-            .accessor()
             .table_scan_uncommitted(guards, |metadata, row| {
                 if row.is_deleted() {
                     return true;
@@ -81,8 +80,8 @@ impl Tables<'_> {
                 res.push(row_to_table_object(metadata, row));
                 true
             })
-            .await;
-        res
+            .await?;
+        Ok(res)
     }
 
     /// Find a table by id.
@@ -94,7 +93,6 @@ impl Tables<'_> {
     ) -> crate::error::Result<Option<TableObject>> {
         let key = SelectKey::new(PK_NO_TABLES, vec![Val::from(table_id)]);
         self.table
-            .accessor()
             .index_lookup_unique_uncommitted(guards, &key, row_to_table_object)
             .await
     }

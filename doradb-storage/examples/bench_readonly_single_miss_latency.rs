@@ -162,7 +162,7 @@ fn main() {
         let table = engine.catalog().get_table(table_id).await.unwrap();
         let mut write_session = engine.try_new_session().unwrap();
         insert_rows(&table, &mut write_session, args.rows).await;
-        table.freeze(&write_session, usize::MAX).await;
+        table.freeze(&write_session, usize::MAX).await.unwrap();
         assert!(matches!(
             table.checkpoint(&mut write_session).await.unwrap(),
             CheckpointOutcome::Published { .. }

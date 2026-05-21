@@ -193,6 +193,16 @@ impl TrxContext {
         self.session.as_ref().map(|s| s.pool_guards())
     }
 
+    /// Requires the transaction session pool guards.
+    #[inline]
+    pub(crate) fn require_pool_guards(&self, operation: &'static str) -> Result<&PoolGuards> {
+        self.pool_guards().ok_or_else(|| {
+            Report::new(InternalError::ActiveTransactionDiscarded)
+                .attach(format!("operation={operation}"))
+                .into()
+        })
+    }
+
     /// Returns a clone of the shared transaction status handle.
     #[inline]
     pub(crate) fn status(&self) -> Arc<SharedTrxStatus> {
@@ -1594,6 +1604,26 @@ pub(crate) mod tests {
             assert!(trx.effects.gc_row_pages.is_empty());
 
             trx.discard_after_fatal_rollback();
+        });
+    }
+
+    #[test]
+    fn test_trx_context_require_pool_guards_returns_error_after_detach() {
+        smol::block_on(async {
+            let (_temp_dir, engine) = test_engine("redo_trx_require_pool_guards").await;
+            let session_state = test_session_state(&engine);
+            let mut ctx = TrxContext::new(session_state, MIN_ACTIVE_TRX_ID + 43, 43, 1, 2);
+
+            assert!(ctx.require_pool_guards("attached test").is_ok());
+            let _session = ctx.take_session().unwrap();
+            let err = match ctx.require_pool_guards("detached test") {
+                Ok(_) => panic!("detached context should not return pool guards"),
+                Err(err) => err,
+            };
+            assert_eq!(
+                err.downcast_ref::<InternalError>().copied(),
+                Some(InternalError::ActiveTransactionDiscarded)
+            );
         });
     }
 
