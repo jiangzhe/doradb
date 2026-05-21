@@ -17,15 +17,16 @@ layouts and cold storage roots. The code should make that difference explicit.
 
 The final shape is:
 
-- `BaseTableAccess` contains only common row/index operations.
-- `GenericMemTable<FixedBufferPool, FixedBufferPool>` implements the common
-  operations used by catalog tables.
+- shared hot row/index behavior is implemented as inherent methods on
+  `GenericMemTable`, not as a delegate trait layer;
+- `GenericMemTable<FixedBufferPool, FixedBufferPool>` provides the fixed
+  catalog-table operations;
 - `CatalogTable` stays a thin wrapper over that fixed mem-table and exposes the
-  common operations through `Deref`.
-- `UserTableAccessor` pins a user-table runtime layout and implements
-  `BaseTableAccess`.
-- `TableAccessExt` contains user-table-only MVCC scan, lookup, index scan, and
-  update methods, and is implemented only by `UserTableAccessor`.
+  base methods through `Deref`;
+- user tables embed `GenericMemTable<EvictableBufferPool, EvictableBufferPool>`
+  beside `ColumnStorage` and a swappable `TableRuntimeLayout`;
+- `UserTableAccessor` is the only user-table accessor and pins a borrowed
+  runtime layout for user-only MVCC, cold-storage, and secondary-index access.
 
 This task is a behavior-preserving refactor. It does not change storage
 formats, checkpoint/recovery semantics, index DDL behavior, or catalog schema
@@ -79,40 +80,67 @@ Related RFC:
 
 ## Implementation Notes
 
-`BaseTableAccess` provides:
+Implemented the catalog/user table access split with minimal shared surface:
 
-- `table_scan_uncommitted`
-- `index_lookup_unique_uncommitted`
-- `insert_mvcc`
-- `delete_unique_mvcc`
-- `delete_index`
-
-`TableAccessExt` provides user-only operations:
-
-- `table_scan_mvcc`
-- `index_lookup_unique_mvcc`
-- `index_scan_mvcc`
-- `update_unique_mvcc`
-
-`TableAccessorOps` remains a private implementation detail in
-`table/access.rs` for the existing shared row/index algorithms. It is not part
-of the external access surface. The public split is expressed only through
-`BaseTableAccess`, `TableAccessExt`, and the concrete table/accessor types that
-implement them.
-
-Catalog no-transaction recovery helpers are inherent methods on the fixed
-mem-table and are reached through `CatalogTable` deref. User tables continue to
-use `Table::accessor_with_layout` or `Table::accessor_with_borrowed_layout` so
-layout-sensitive operations are tied to an explicit runtime layout snapshot.
+- Moved hot row/index runtime state into `table/mem_table.rs` as
+  `GenericMemTable`. It owns row pages, row-id block index, and in-memory
+  secondary-index slots, and intentionally has no column storage, table file,
+  disk cache, or runtime-layout ownership.
+- Moved persisted user-table storage state into `table/storage.rs` as
+  `ColumnStorage`.
+- Removed the intermediate table access trait stack. Shared behavior is local
+  to `GenericMemTable`; user-table-only behavior is implemented directly on
+  `UserTableAccessor`.
+- Kept `CatalogTable` as a thin wrapper over
+  `GenericMemTable<FixedBufferPool, FixedBufferPool>` with `Deref`, while
+  removing `Deref` from user `Table` to avoid accidental generic mem-table use
+  through user-table handles.
+- Kept user-table access layout-bound through `UserTableAccessor`, which is
+  built by `Table::accessor_with_layout` over an explicitly captured
+  `TableRuntimeLayout`.
+- Simplified user layout borrowing by using borrowed runtime layouts directly
+  instead of a separate `UserLayout` wrapper.
+- Converted row lookup and scan helpers that can touch pages or indexes to
+  return `Result`, including row/block-index lookup, table scans, mem scans,
+  and transaction pool-guard access. Scan callbacks remain infallible.
+- Consolidated rollback entry handling onto `GenericMemTable` and renamed
+  helper parameters to use `sts` consistently for transaction status
+  timestamps.
+- Updated create-index hot-row collection to run pre-catalog-commit rollback on
+  collection failure before returning the original build error.
+- Updated recovery CTS lookup for LWC row locations to return
+  `MIN_SNAPSHOT_TS`, with comments explaining that recovery replay only applies
+  in-memory rows and rows below the pivot do not have row-page recovery CTS.
+- Updated purge row/index cleanup so row-page access and `delete_index` errors
+  return through `purge_trx_list`, which poisons runtime admission with
+  `FatalError::PurgeAccess`.
 
 ## Validation
 
 Run:
 
 ```bash
-cargo fmt --check
-cargo check -p doradb-storage --tests
-cargo nextest run -p doradb-storage
+cargo check -p doradb-storage --tests --examples
+cargo nextest run -p doradb-storage purge
 cargo clippy -p doradb-storage --all-targets -- -D warnings
+cargo nextest run -p doradb-storage
+cargo fmt --check
 git diff --check
 ```
+
+Final validation passed:
+
+- `cargo check -p doradb-storage --tests --examples`
+- `cargo nextest run -p doradb-storage purge`
+- `cargo clippy -p doradb-storage --all-targets -- -D warnings`
+- `cargo nextest run -p doradb-storage` (793 passed)
+- `cargo fmt --check`
+- `git diff --check`
+
+## Open Questions
+
+- Deferred inline index maintenance removal in recovery remains tracked by
+  `docs/backlogs/000103-remove-inline-index-recovery-branch.md`. Current
+  recovery always replays user-table DML with deferred hot-index rebuild, so the
+  unreachable `disable_index=false` branch was intentionally left for that
+  follow-up rather than folded into this access-surface refactor.
