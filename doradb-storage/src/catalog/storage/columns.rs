@@ -2,7 +2,7 @@ use crate::buffer::PoolGuards;
 use crate::catalog::CatalogTable;
 use crate::catalog::storage::CatalogDefinition;
 use crate::catalog::storage::object::ColumnObject;
-use crate::catalog::table::TableMetadata;
+use crate::catalog::table::{TableColumnLayout, TableMetadata};
 use crate::catalog::{ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexSpec, TableID};
 use crate::error::Result;
 use crate::row::ops::{DeleteMvcc, SelectKey};
@@ -78,19 +78,22 @@ pub fn catalog_definition_of_columns() -> &'static CatalogDefinition {
 }
 
 #[inline]
-fn row_to_column_object(metadata: &TableMetadata, row: Row<'_>) -> ColumnObject {
-    let table_id = row.val(metadata, COL_NO_COLUMNS_TABLE_ID).as_u64().unwrap();
+fn row_to_column_object(col_layout: &TableColumnLayout, row: Row<'_>) -> ColumnObject {
+    let table_id = row
+        .val(col_layout, COL_NO_COLUMNS_TABLE_ID)
+        .as_u64()
+        .unwrap();
     let column_no = row
-        .val(metadata, COL_NO_COLUMNS_COLUMN_NO)
+        .val(col_layout, COL_NO_COLUMNS_COLUMN_NO)
         .as_u16()
         .unwrap();
     let column_name = row.str(COL_NO_COLUMNS_COLUMN_NAME).unwrap();
     let column_type = row
-        .val(metadata, COL_NO_COLUMNS_COLUMN_TYPE)
+        .val(col_layout, COL_NO_COLUMNS_COLUMN_TYPE)
         .as_u32()
         .unwrap();
     let column_attributes = row
-        .val(metadata, COL_NO_COLUMNS_COLUMN_ATTRIBUTES)
+        .val(col_layout, COL_NO_COLUMNS_COLUMN_ATTRIBUTES)
         .as_u32()
         .unwrap();
     ColumnObject {
@@ -128,14 +131,17 @@ impl Columns<'_> {
     ) -> Result<Vec<ColumnObject>> {
         let mut res = vec![];
         self.table
-            .table_scan_uncommitted(guards, |metadata, row| {
+            .table_scan_uncommitted(guards, |col_layout, row| {
                 if row.is_deleted() {
                     return true;
                 }
                 // filter by table id before deserializing the whole object.
-                let table_id_in_row = row.val(metadata, COL_NO_COLUMNS_TABLE_ID).as_u64().unwrap();
+                let table_id_in_row = row
+                    .val(col_layout, COL_NO_COLUMNS_TABLE_ID)
+                    .as_u64()
+                    .unwrap();
                 if table_id_in_row == table_id {
-                    let obj = row_to_column_object(metadata, row);
+                    let obj = row_to_column_object(col_layout, row);
                     res.push(obj);
                 }
                 true

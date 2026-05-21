@@ -26,18 +26,18 @@ impl ColumnStorage {
         // initialize column storage and validate secondary root layout.
         let active_root = file.active_root_unchecked();
         let metadata = Arc::clone(&active_root.metadata);
-        if active_root.secondary_index_roots.len() != metadata.index_slot_count() {
+        if active_root.secondary_index_roots.len() != metadata.idx.index_slot_count() {
             return Err(Report::new(DataIntegrityError::InvalidRootInvariant)
                 .attach(format!(
                     "secondary root count mismatch: root_count={}, index_slot_count={}",
                     active_root.secondary_index_roots.len(),
-                    metadata.index_slot_count()
+                    metadata.idx.index_slot_count()
                 ))
                 .into());
         }
-        let mut secondary_indexes = Vec::with_capacity(metadata.index_slot_count());
-        secondary_indexes.resize_with(metadata.index_slot_count(), || None);
-        for (index_no, _) in metadata.active_indexes() {
+        let mut secondary_indexes = Vec::with_capacity(metadata.idx.index_slot_count());
+        secondary_indexes.resize_with(metadata.idx.index_slot_count(), || None);
+        for (index_no, _) in metadata.idx.active_indexes() {
             secondary_indexes[index_no] = Some(SecondaryDiskTreeRuntime::new(
                 index_no,
                 Arc::clone(&metadata),

@@ -1,4 +1,4 @@
-use crate::catalog::TableMetadata;
+use crate::catalog::TableColumnLayout;
 use crate::trx::TrxID;
 use crate::trx::undo::RowUndoHead;
 use parking_lot::{RwLock, RwLockReadGuard, RwLockWriteGuard};
@@ -15,11 +15,10 @@ pub struct RowVersionMap {
     // It wastes 16 bytes(one lock and one pointer)
     // for each row if no undo associated.
     entries: Box<[RwLock<Option<Box<RowUndoHead>>>]>,
-    // Metadata fixed when the version map is created.
-    // Currently it should be same as metadata of table
-    // file because we do not support change of table
-    // structure.
-    pub metadata: Arc<TableMetadata>,
+    // Column layout fixed when the version map is created.
+    // Currently it should be same as the table-file column layout because we
+    // do not support physical column-layout changes.
+    pub(crate) column_layout: Arc<TableColumnLayout>,
     // Monotonically increasing version number.
     // indicates whether the undo map is changed.
     mod_counter: AtomicU64,
@@ -62,11 +61,11 @@ pub enum RowPageState {
 impl RowVersionMap {
     /// Create a new version map.
     #[inline]
-    pub fn new(metadata: Arc<TableMetadata>, max_size: usize) -> Self {
+    pub fn new(column_layout: Arc<TableColumnLayout>, max_size: usize) -> Self {
         let vec: Vec<_> = (0..max_size).map(|_| RwLock::new(None)).collect();
         RowVersionMap {
             entries: vec.into_boxed_slice(),
-            metadata,
+            column_layout,
             mod_counter: AtomicU64::new(0),
             create_cts: AtomicU64::new(0),
             max_sts: AtomicU64::new(0),
@@ -248,7 +247,9 @@ impl<'a> DerefMut for RowVersionWriteGuard<'a> {
 mod tests {
     use super::*;
     use crate::catalog::TableMetadata;
-    use crate::catalog::spec::{ColumnAttributes, ColumnSpec, IndexSpec};
+    use crate::catalog::spec::{
+        ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexSpec,
+    };
     use crate::value::ValKind;
 
     #[test]
@@ -261,7 +262,7 @@ mod tests {
             )],
             Vec::<IndexSpec>::new(),
         );
-        let map = RowVersionMap::new(Arc::new(metadata), 1);
+        let map = RowVersionMap::new(Arc::clone(&metadata.col), 1);
         assert_eq!(map.create_cts(), 0);
         map.set_create_cts(42);
         assert_eq!(map.create_cts(), 42);
@@ -277,7 +278,7 @@ mod tests {
             )],
             Vec::<IndexSpec>::new(),
         );
-        let map = RowVersionMap::new(Arc::new(metadata), 1);
+        let map = RowVersionMap::new(Arc::clone(&metadata.col), 1);
         assert_eq!(map.state(), RowPageState::Active);
         assert!(!map.is_frozen());
         assert!(!map.is_transition());
@@ -291,5 +292,33 @@ mod tests {
         assert_eq!(map.state(), RowPageState::Transition);
         assert!(map.is_frozen());
         assert!(map.is_transition());
+    }
+
+    #[test]
+    fn test_row_version_map_stores_column_layout_arc_only() {
+        let metadata = TableMetadata::new(
+            vec![ColumnSpec::new(
+                "id",
+                ValKind::I64,
+                ColumnAttributes::empty(),
+            )],
+            Vec::<IndexSpec>::new(),
+        );
+        let (index_no, indexed_metadata) = metadata
+            .try_with_created_index(IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::UK))
+            .unwrap();
+        assert_eq!(index_no, 0);
+        assert!(Arc::ptr_eq(&metadata.col, &indexed_metadata.col));
+        assert_ne!(
+            metadata.idx.active_index_count(),
+            indexed_metadata.idx.active_index_count()
+        );
+
+        let map = RowVersionMap::new(Arc::clone(&metadata.col), 1);
+        assert!(Arc::ptr_eq(&map.column_layout, &metadata.col));
+        assert_eq!(
+            map.column_layout.col_count(),
+            indexed_metadata.col.col_count()
+        );
     }
 }

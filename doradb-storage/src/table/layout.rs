@@ -39,15 +39,15 @@ impl TableRuntimeLayout {
     /// Validate layout shape against metadata and index runtime identity.
     #[inline]
     pub(crate) fn validate(&self) -> Result<()> {
-        if self.secondary_indexes.len() != self.metadata.index_slot_count() {
+        if self.secondary_indexes.len() != self.metadata.idx.index_slot_count() {
             return Err(invalid_runtime_layout(format!(
                 "slot count mismatch: runtime_slots={}, metadata_slots={}",
                 self.secondary_indexes.len(),
-                self.metadata.index_slot_count()
+                self.metadata.idx.index_slot_count()
             )));
         }
 
-        for (index_no, _) in self.metadata.active_indexes() {
+        for (index_no, _) in self.metadata.idx.active_indexes() {
             if self
                 .secondary_indexes
                 .get(index_no)
@@ -64,7 +64,7 @@ impl TableRuntimeLayout {
             let Some(index) = index else {
                 continue;
             };
-            if self.metadata.index_spec(index_no).is_none() {
+            if self.metadata.idx.index_spec(index_no).is_none() {
                 return Err(invalid_runtime_layout(format!(
                     "runtime slot has no active metadata spec: index_no={index_no}"
                 )));
@@ -195,7 +195,7 @@ mod tests {
         .expect("empty index layout should be valid");
 
         assert_eq!(layout.generation(), 7);
-        assert_eq!(layout.metadata().index_slot_count(), 0);
+        assert_eq!(layout.metadata().idx.index_slot_count(), 0);
         assert_eq!(layout.index_slot_count(), 0);
     }
 

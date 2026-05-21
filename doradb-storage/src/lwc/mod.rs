@@ -5,7 +5,7 @@ pub mod block;
 pub use block::*;
 
 use crate::bitmap::Bitmap;
-use crate::catalog::TableMetadata;
+use crate::catalog::TableColumnLayout;
 use crate::compression::*;
 use crate::error::{DataIntegrityError, Error, InternalError, OperationError, Result};
 use crate::file::block_integrity::{LWC_BLOCK_SPEC, write_block_checksum, write_block_header};
@@ -925,21 +925,21 @@ struct LwcSnapshot {
 }
 
 pub struct LwcBuilder<'a> {
-    metadata: &'a TableMetadata,
+    col_layout: &'a TableColumnLayout,
     buffer: ScanBuffer,
     row_ids: Vec<RowID>,
     stats: Vec<LwcColumnStats>,
 }
 
 impl<'a> LwcBuilder<'a> {
-    pub fn new(metadata: &'a TableMetadata) -> Self {
-        let scan_set: Vec<_> = (0..metadata.col_count()).collect();
-        let stats = (0..metadata.col_count())
+    pub fn new(col_layout: &'a TableColumnLayout) -> Self {
+        let scan_set: Vec<_> = (0..col_layout.col_count()).collect();
+        let stats = (0..col_layout.col_count())
             .map(|_| LwcColumnStats::new())
             .collect();
-        let buffer = ScanBuffer::new(metadata, &scan_set);
+        let buffer = ScanBuffer::new(col_layout, &scan_set);
         LwcBuilder {
-            metadata,
+            col_layout,
             buffer,
             row_ids: Vec::new(),
             stats,
@@ -962,7 +962,7 @@ impl<'a> LwcBuilder<'a> {
     }
 
     pub fn append_row_page(&mut self, page: &RowPage) -> Result<bool> {
-        let view = page.vector_view(self.metadata);
+        let view = page.vector_view(self.col_layout);
         self.append_view(page, view)
     }
 
@@ -994,11 +994,11 @@ impl<'a> LwcBuilder<'a> {
         if row_count > u16::MAX as usize {
             return Err(lwc_block_encoding_invariant());
         }
-        let mut column_payloads = Vec::with_capacity(self.metadata.col_count());
-        let mut col_offsets = Vec::with_capacity(self.metadata.col_count());
-        let mut offset = mem::size_of::<u16>() * self.metadata.col_count();
+        let mut column_payloads = Vec::with_capacity(self.col_layout.col_count());
+        let mut col_offsets = Vec::with_capacity(self.col_layout.col_count());
+        let mut offset = mem::size_of::<u16>() * self.col_layout.col_count();
 
-        for col_idx in 0..self.metadata.col_count() {
+        for col_idx in 0..self.col_layout.col_count() {
             let column = self
                 .buffer
                 .column(col_idx)
@@ -1077,7 +1077,7 @@ impl<'a> LwcBuilder<'a> {
         let header = LwcBlockHeader::new(
             row_shape_fingerprint,
             row_count as u16,
-            self.metadata.col_count() as u16,
+            self.col_layout.col_count() as u16,
             0,
         );
 
@@ -1123,7 +1123,7 @@ impl<'a> LwcBuilder<'a> {
         if row_ids.is_empty() {
             return Ok(());
         }
-        for col_idx in 0..self.metadata.col_count() {
+        for col_idx in 0..self.col_layout.col_count() {
             let (null_bitmap, values) = view.col(col_idx);
             let null_bitmap = null_bitmap.as_deref();
             match values {
@@ -1250,8 +1250,8 @@ impl<'a> LwcBuilder<'a> {
     fn estimate_size(&self) -> Result<usize> {
         let row_count = self.buffer.len();
         let mut total = LWC_BLOCK_HEADER_SIZE;
-        total += mem::size_of::<u16>() * self.metadata.col_count();
-        total += estimate_columns_size(self.metadata, &self.buffer, &self.stats, row_count)?;
+        total += mem::size_of::<u16>() * self.col_layout.col_count();
+        total += estimate_columns_size(self.col_layout, &self.buffer, &self.stats, row_count)?;
         Ok(total)
     }
 }
@@ -1282,13 +1282,13 @@ fn bitmap_to_bytes(bitmap: &[u64], len: usize) -> Vec<u8> {
 }
 
 fn estimate_columns_size(
-    metadata: &TableMetadata,
+    col_layout: &TableColumnLayout,
     buffer: &ScanBuffer,
     stats: &[LwcColumnStats],
     row_count: usize,
 ) -> Result<usize> {
     let mut total = 0usize;
-    debug_assert!(stats.len() == metadata.col_count());
+    debug_assert!(stats.len() == col_layout.col_count());
     for (col_idx, st) in stats.iter().enumerate() {
         let column = buffer
             .column(col_idx)
@@ -1297,7 +1297,7 @@ fn estimate_columns_size(
             total += mem::size_of::<u16>() + row_count.div_ceil(8);
         }
         total +=
-            estimate_column_payload(metadata.val_kind(col_idx), &column.values, st, row_count)?;
+            estimate_column_payload(col_layout.val_kind(col_idx), &column.values, st, row_count)?;
     }
     Ok(total)
 }
@@ -1836,7 +1836,7 @@ fn read_i8(input: &[u8]) -> Result<(i8, &[u8])> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::catalog::{ColumnAttributes, ColumnSpec};
+    use crate::catalog::{ColumnAttributes, ColumnSpec, TableMetadata};
     use crate::error::{DataIntegrityError, FileKind, OperationError};
     use crate::file::test_block_id;
     use crate::index::ColumnBlockEntryShape;
@@ -2163,7 +2163,7 @@ mod tests {
             vec![],
         );
         let mut page = RowPage::new_test_page();
-        page.init(100, 20, &metadata);
+        page.init(100, 20, metadata.col.as_ref());
 
         let mut expected_rows = Vec::new();
         for offset in 0..10u64 {
@@ -2174,7 +2174,7 @@ mod tests {
             } else {
                 Val::I16(offset as i16)
             };
-            let res = page.insert(&metadata, &[c0, c1]);
+            let res = page.insert(metadata.col.as_ref(), &[c0, c1]);
             assert!(matches!(res, InsertRow::Ok(_)));
             expected_rows.push((
                 row_id,
@@ -2191,7 +2191,7 @@ mod tests {
         assert!(matches!(page.delete(105), Delete::Ok));
         expected_rows.retain(|(row_id, _, _)| *row_id != 102 && *row_id != 105);
 
-        let mut builder = LwcBuilder::new(&metadata);
+        let mut builder = LwcBuilder::new(metadata.col.as_ref());
         assert!(builder.is_empty());
         assert!(builder.row_count() == 0);
         let appended = builder.append_row_page(&page).unwrap();
@@ -2211,8 +2211,8 @@ mod tests {
             expected_fingerprint
         );
 
-        let column0 = lwc_block.column(&metadata, 0).unwrap();
-        let column1 = lwc_block.column(&metadata, 1).unwrap();
+        let column0 = lwc_block.column(metadata.col.as_ref(), 0).unwrap();
+        let column1 = lwc_block.column(metadata.col.as_ref(), 1).unwrap();
         let data0 = column0.data().unwrap();
         let data1 = column1.data().unwrap();
         for (idx, (_row_id, c0, c1)) in expected_rows.iter().enumerate() {
@@ -2237,7 +2237,7 @@ mod tests {
             vec![],
         );
         let mut page = RowPage::new_test_page();
-        page.init(0, 8, &metadata);
+        page.init(0, 8, metadata.col.as_ref());
 
         for (row_id, value) in [
             Val::Null,
@@ -2251,13 +2251,13 @@ mod tests {
         .enumerate()
         {
             assert!(matches!(
-                page.insert(&metadata, &[value]),
+                page.insert(metadata.col.as_ref(), &[value]),
                 InsertRow::Ok(inserted) if inserted == row_id as u64
             ));
         }
         assert!(matches!(page.delete(4), Delete::Ok));
 
-        let mut builder = LwcBuilder::new(&metadata);
+        let mut builder = LwcBuilder::new(metadata.col.as_ref());
         assert!(builder.append_row_page(&page).unwrap());
 
         let stats = builder.stats[0].snapshot();
@@ -2276,18 +2276,18 @@ mod tests {
             vec![],
         );
         let mut page = RowPage::new_test_page();
-        page.init(1, 4, &metadata);
+        page.init(1, 4, metadata.col.as_ref());
 
         for offset in 0..2u64 {
             let c0 = Val::U8((10 + offset) as u8);
             let c1 = Val::I16((20 + offset) as i16);
             assert!(matches!(
-                page.insert(&metadata, &[c0, c1]),
+                page.insert(metadata.col.as_ref(), &[c0, c1]),
                 InsertRow::Ok(_)
             ));
         }
 
-        let mut builder = LwcBuilder::new(&metadata);
+        let mut builder = LwcBuilder::new(metadata.col.as_ref());
         assert!(builder.append_row_page(&page).unwrap());
 
         let snapshot = builder.snapshot_state();
@@ -2312,7 +2312,7 @@ mod tests {
             let c0 = Val::U8((30 + offset) as u8);
             let c1 = Val::I16((40 + offset) as i16);
             assert!(matches!(
-                page.insert(&metadata, &[c0, c1]),
+                page.insert(metadata.col.as_ref(), &[c0, c1]),
                 InsertRow::Ok(_)
             ));
         }
@@ -2358,7 +2358,7 @@ mod tests {
             vec![],
         );
         let mut page = RowPage::new_test_page();
-        page.init(10, 6, &metadata);
+        page.init(10, 6, metadata.col.as_ref());
 
         let rows = vec![
             vec![
@@ -2403,10 +2403,13 @@ mod tests {
         ];
 
         for row in &rows {
-            assert!(matches!(page.insert(&metadata, row), InsertRow::Ok(_)));
+            assert!(matches!(
+                page.insert(metadata.col.as_ref(), row),
+                InsertRow::Ok(_)
+            ));
         }
 
-        let mut builder = LwcBuilder::new(&metadata);
+        let mut builder = LwcBuilder::new(metadata.col.as_ref());
         assert!(builder.append_row_page(&page).unwrap());
         let buf = builder
             .build(row_shape_fingerprint_for(builder.row_ids(), 10, 13))
@@ -2436,7 +2439,7 @@ mod tests {
         .iter()
         .enumerate()
         {
-            let column = lwc_block.column(&metadata, col_idx).unwrap();
+            let column = lwc_block.column(metadata.col.as_ref(), col_idx).unwrap();
             let data = column.data().unwrap();
             assert_eq!(data.len(), rows.len());
             for (row_idx, expected_row) in rows.iter().enumerate() {

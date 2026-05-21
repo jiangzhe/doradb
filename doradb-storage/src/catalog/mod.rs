@@ -415,26 +415,26 @@ fn index_ddl_metadata_reconcilable(
     // can replay later index-DDL catalog rows to make catalog metadata catch up.
     // The opposite direction is unrecoverable here because replay cannot make a
     // table root that has already been opened acquire missing allocation state.
-    if file.next_index_no() < catalog.next_index_no() {
+    if file.idx.next_index_no() < catalog.idx.next_index_no() {
         return Err(Report::new(DataIntegrityError::InvalidRootInvariant)
             .attach(format!(
                 "index-DDL reconciliation found catalog allocation ahead of table root: table_id={table_id}, catalog_next_index_no={}, file_next_index_no={}",
-                catalog.next_index_no(),
-                file.next_index_no()
+                catalog.idx.next_index_no(),
+                file.idx.next_index_no()
             ))
             .into());
     }
-    if catalog.col_names != file.col_names
-        || catalog.col_types != file.col_types
-        || catalog.col_attrs != file.col_attrs
-    {
+    if catalog.col != file.col {
         return Ok(false);
     }
 
-    let max_slots = catalog.index_slot_count().max(file.index_slot_count());
+    let max_slots = catalog
+        .idx
+        .index_slot_count()
+        .max(file.idx.index_slot_count());
     for index_no in 0..max_slots {
-        let catalog_spec = catalog.index_spec(index_no);
-        let file_spec = file.index_spec(index_no);
+        let catalog_spec = catalog.idx.index_spec(index_no);
+        let file_spec = file.idx.index_spec(index_no);
         if let (Some(catalog_spec), Some(file_spec)) = (catalog_spec, file_spec)
             && catalog_spec != file_spec
         {
@@ -892,9 +892,9 @@ pub mod tests {
             vec![ColumnSpec::new("id", ValKind::I32, ColumnAttributes::INDEX)],
             vec![IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::PK)],
         );
-        assert_eq!(catalog_metadata.col_names, file_metadata.col_names);
-        assert_eq!(catalog_metadata.col_types, file_metadata.col_types);
-        assert_ne!(catalog_metadata.col_attrs, file_metadata.col_attrs);
+        assert_eq!(catalog_metadata.col.col_names, file_metadata.col.col_names);
+        assert_eq!(catalog_metadata.col.col_types, file_metadata.col.col_types);
+        assert_ne!(catalog_metadata.col.col_attrs, file_metadata.col.col_attrs);
         assert!(!index_ddl_metadata_reconcilable(42, &catalog_metadata, &file_metadata).unwrap());
     }
 
@@ -912,7 +912,7 @@ pub mod tests {
         let catalog_metadata = TableMetadata::new(columns(), vec![primary_index()]);
         let file_metadata = TableMetadata::new(columns(), vec![primary_index(), secondary_index()]);
 
-        assert!(file_metadata.next_index_no() > catalog_metadata.next_index_no());
+        assert!(file_metadata.idx.next_index_no() > catalog_metadata.idx.next_index_no());
         assert!(index_ddl_metadata_reconcilable(42, &catalog_metadata, &file_metadata).unwrap());
     }
 
@@ -931,7 +931,7 @@ pub mod tests {
             TableMetadata::new(columns(), vec![primary_index(), secondary_index()]);
         let file_metadata = TableMetadata::new(columns(), vec![primary_index()]);
 
-        assert!(catalog_metadata.next_index_no() > file_metadata.next_index_no());
+        assert!(catalog_metadata.idx.next_index_no() > file_metadata.idx.next_index_no());
         let err =
             index_ddl_metadata_reconcilable(42, &catalog_metadata, &file_metadata).unwrap_err();
         assert_eq!(
@@ -1134,10 +1134,11 @@ pub mod tests {
                 .await
                 .unwrap();
             let table = engine.catalog().get_table(table_id).await.unwrap();
-            assert_eq!(table.metadata().next_index_no(), 2);
+            assert_eq!(table.metadata().idx.next_index_no(), 2);
             assert_eq!(
                 table
                     .metadata()
+                    .idx
                     .active_indexes()
                     .map(|(index_no, _)| index_no)
                     .collect::<Vec<_>>(),
@@ -1162,7 +1163,7 @@ pub mod tests {
                 .await
                 .unwrap();
             let table = engine.catalog().get_table(table_id).await.unwrap();
-            assert_eq!(table.metadata().next_index_no(), 2);
+            assert_eq!(table.metadata().idx.next_index_no(), 2);
             assert_eq!(
                 table
                     .file()
@@ -1205,8 +1206,8 @@ pub mod tests {
                 .await
                 .unwrap();
             let table = engine.catalog().get_table(table_id).await.unwrap();
-            assert_eq!(table.metadata().next_index_no(), 2);
-            assert_eq!(table.metadata().active_index_count(), 2);
+            assert_eq!(table.metadata().idx.next_index_no(), 2);
+            assert_eq!(table.metadata().idx.active_index_count(), 2);
             assert_eq!(
                 table
                     .file()

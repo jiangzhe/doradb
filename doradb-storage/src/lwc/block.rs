@@ -1,7 +1,7 @@
 //! This module contains definition and functions of LWC(Lightweight Compression) Block.
 
 use crate::buffer::{PoolGuard, ReadonlyBlockGuard, ReadonlyBufferPool};
-use crate::catalog::TableMetadata;
+use crate::catalog::TableColumnLayout;
 use crate::error::{DataIntegrityError, Error, FileKind, InternalError, OperationError, Result};
 use crate::file::SparseFile;
 use crate::file::block_integrity::{
@@ -166,18 +166,18 @@ impl LwcBlock {
         })
     }
 
-    /// Returns column data for given column index based on metadata.
+    /// Returns column data for given column index based on column layout.
     #[inline]
     pub fn column<'a>(
         &'a self,
-        metadata: &'a TableMetadata,
+        col_layout: &'a TableColumnLayout,
         col_idx: usize,
     ) -> Result<LwcColumn<'a>> {
-        if col_idx >= metadata.col_count() {
+        if col_idx >= col_layout.col_count() {
             return Err(Report::new(InternalError::ColumnIndexOutOfBounds)
                 .attach(format!(
                     "col_idx={col_idx}, col_count={}",
-                    metadata.col_count()
+                    col_layout.col_count()
                 ))
                 .into());
         }
@@ -194,8 +194,8 @@ impl LwcBlock {
         }
         let data = &self.body[start_idx..end_idx];
         let row_count = self.header.row_count() as usize;
-        let kind = metadata.val_kind(col_idx);
-        if metadata.nullable(col_idx) {
+        let kind = col_layout.val_kind(col_idx);
+        if col_layout.nullable(col_idx) {
             let (bitmap, values) = LwcNullBitmap::from_bytes(data)?;
             let required = row_count.div_ceil(8);
             if bitmap.len() < required {
@@ -226,14 +226,14 @@ impl LwcBlock {
     #[inline]
     pub fn decode_persisted_row_values(
         &self,
-        metadata: &TableMetadata,
+        col_layout: &TableColumnLayout,
         row_idx: usize,
         read_set: &[usize],
         file_kind: FileKind,
         block_id: BlockID,
     ) -> Result<Vec<Val>> {
         self.decode_persisted_row_values_inner(
-            metadata,
+            col_layout,
             row_idx,
             read_set.iter().copied(),
             read_set.len(),
@@ -247,16 +247,16 @@ impl LwcBlock {
     #[inline]
     pub fn decode_persisted_full_row_values(
         &self,
-        metadata: &TableMetadata,
+        col_layout: &TableColumnLayout,
         row_idx: usize,
         file_kind: FileKind,
         block_id: BlockID,
     ) -> Result<Vec<Val>> {
         self.decode_persisted_row_values_inner(
-            metadata,
+            col_layout,
             row_idx,
-            0..metadata.col_count(),
-            metadata.col_count(),
+            0..col_layout.col_count(),
+            col_layout.col_count(),
             file_kind,
             block_id,
         )
@@ -265,7 +265,7 @@ impl LwcBlock {
     #[inline]
     fn decode_persisted_row_values_inner(
         &self,
-        metadata: &TableMetadata,
+        col_layout: &TableColumnLayout,
         row_idx: usize,
         col_indices: impl Iterator<Item = usize>,
         capacity: usize,
@@ -275,7 +275,7 @@ impl LwcBlock {
         let mut vals = Vec::with_capacity(capacity);
         for col_idx in col_indices {
             vals.push(
-                self.decode_persisted_value(metadata, row_idx, col_idx, file_kind, block_id)?,
+                self.decode_persisted_value(col_layout, row_idx, col_idx, file_kind, block_id)?,
             );
         }
         Ok(vals)
@@ -284,14 +284,14 @@ impl LwcBlock {
     #[inline]
     fn decode_persisted_value(
         &self,
-        metadata: &TableMetadata,
+        col_layout: &TableColumnLayout,
         row_idx: usize,
         col_idx: usize,
         file_kind: FileKind,
         block_id: BlockID,
     ) -> Result<Val> {
         let column = self
-            .column(metadata, col_idx)
+            .column(col_layout, col_idx)
             .map_err(|err| map_persisted_lwc_error(file_kind, block_id, err))?;
         if column.is_null(row_idx) {
             return Ok(Val::Null);
@@ -369,12 +369,12 @@ impl PersistedLwcBlock {
     #[inline]
     pub fn decode_row_values(
         &self,
-        metadata: &TableMetadata,
+        col_layout: &TableColumnLayout,
         row_idx: usize,
         read_set: &[usize],
     ) -> Result<Vec<Val>> {
         self.block().decode_persisted_row_values(
-            metadata,
+            col_layout,
             row_idx,
             read_set,
             self.file_kind,
@@ -385,11 +385,11 @@ impl PersistedLwcBlock {
     #[inline]
     pub fn decode_full_row_values(
         &self,
-        metadata: &TableMetadata,
+        col_layout: &TableColumnLayout,
         row_idx: usize,
     ) -> Result<Vec<Val>> {
         self.block().decode_persisted_full_row_values(
-            metadata,
+            col_layout,
             row_idx,
             self.file_kind,
             self.block_id,
@@ -550,7 +550,9 @@ pub(crate) fn map_persisted_lwc_error(file_kind: FileKind, block_id: BlockID, er
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::catalog::{ColumnAttributes, ColumnSpec, TableMetadata};
+    use crate::catalog::{
+        ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexSpec, TableMetadata,
+    };
     use crate::error::{DataIntegrityError, Error, FileKind};
     use crate::file::block_integrity::{
         BLOCK_INTEGRITY_HEADER_SIZE, write_block_checksum, write_block_header,
@@ -603,21 +605,21 @@ mod tests {
             vec![],
         );
         let mut page = RowPage::new_test_page();
-        page.init(100, 8, &metadata);
+        page.init(100, 8, metadata.col.as_ref());
         assert!(matches!(
-            page.insert(&metadata, &[Val::U8(10), Val::I16(20)]),
+            page.insert(metadata.col.as_ref(), &[Val::U8(10), Val::I16(20)]),
             InsertRow::Ok(_)
         ));
         assert!(matches!(
-            page.insert(&metadata, &[Val::U8(11), Val::Null]),
+            page.insert(metadata.col.as_ref(), &[Val::U8(11), Val::Null]),
             InsertRow::Ok(_)
         ));
         assert!(matches!(
-            page.insert(&metadata, &[Val::U8(12), Val::I16(22)]),
+            page.insert(metadata.col.as_ref(), &[Val::U8(12), Val::I16(22)]),
             InsertRow::Ok(_)
         ));
         let buf = {
-            let mut builder = LwcBuilder::new(&metadata);
+            let mut builder = LwcBuilder::new(metadata.col.as_ref());
             assert!(builder.append_row_page(&page).unwrap());
             let fingerprint = row_shape_fingerprint_for(builder.row_ids());
             builder.build(fingerprint).unwrap()
@@ -669,7 +671,7 @@ mod tests {
         page.body[..col_offsets_len].copy_from_slice(&(col_end as u16).to_le_bytes());
         page.body[col_start..col_end].copy_from_slice(&column_bytes);
 
-        let column = page.column(&metadata, 0).unwrap();
+        let column = page.column(metadata.col.as_ref(), 0).unwrap();
         assert_eq!(column.row_count(), values.len());
         assert!(!column.is_null(0));
         assert!(column.is_null(1));
@@ -702,7 +704,7 @@ mod tests {
         page.body[..2].copy_from_slice(&end_offset.to_le_bytes());
         page.body[2..4].copy_from_slice(&end_offset.to_le_bytes());
 
-        let err = page.column(&metadata, 1);
+        let err = page.column(metadata.col.as_ref(), 1);
         assert!(err.as_ref().is_err_and(|err| {
             err.is_kind(crate::error::ErrorKind::Internal)
                 && err
@@ -764,7 +766,7 @@ mod tests {
                 .unwrap();
         let vals = page
             .decode_persisted_row_values(
-                &metadata,
+                metadata.col.as_ref(),
                 1,
                 &[1, 0],
                 FileKind::TableFile,
@@ -786,13 +788,58 @@ mod tests {
                 .unwrap();
         assert_eq!(
             page.decode_persisted_full_row_values(
-                &metadata,
+                metadata.col.as_ref(),
                 0,
                 FileKind::TableFile,
                 test_block_id(8),
             )
             .unwrap(),
             vec![Val::U8(10), Val::I16(20)]
+        );
+    }
+
+    #[test]
+    fn test_lwc_block_decode_stable_across_index_only_metadata_changes() {
+        let (metadata, buf) = build_valid_persisted_lwc_block();
+        let (index_no, indexed_metadata) = metadata
+            .try_with_created_index(IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::UK))
+            .unwrap();
+        let dropped_metadata = indexed_metadata.try_without_index(index_no).unwrap();
+        let page =
+            LwcBlock::try_from_persisted_bytes(buf.data(), FileKind::TableFile, test_block_id(8))
+                .unwrap();
+
+        let expected = vec![Val::U8(11), Val::Null];
+        assert_eq!(
+            page.decode_persisted_full_row_values(
+                metadata.col.as_ref(),
+                1,
+                FileKind::TableFile,
+                test_block_id(8),
+            )
+            .unwrap(),
+            expected
+        );
+        assert_eq!(
+            page.decode_persisted_full_row_values(
+                indexed_metadata.col.as_ref(),
+                1,
+                FileKind::TableFile,
+                test_block_id(8),
+            )
+            .unwrap(),
+            expected
+        );
+        assert_eq!(
+            page.decode_persisted_row_values(
+                dropped_metadata.col.as_ref(),
+                1,
+                &[1, 0],
+                FileKind::TableFile,
+                test_block_id(8),
+            )
+            .unwrap(),
+            vec![Val::Null, Val::U8(11)]
         );
     }
 
@@ -848,7 +895,12 @@ mod tests {
             LwcBlock::try_from_persisted_bytes(buf.data(), FileKind::TableFile, test_block_id(10))
                 .unwrap();
         let err = page
-            .decode_persisted_full_row_values(&metadata, 0, FileKind::TableFile, test_block_id(10))
+            .decode_persisted_full_row_values(
+                metadata.col.as_ref(),
+                0,
+                FileKind::TableFile,
+                test_block_id(10),
+            )
             .unwrap_err();
         assert_lwc_data_integrity(err, test_block_id(10), DataIntegrityError::InvalidPayload);
     }

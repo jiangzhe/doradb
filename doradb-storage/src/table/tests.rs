@@ -8411,7 +8411,7 @@ fn test_runtime_layout_install_retires_removed_index_after_old_snapshot_drops() 
     smol::block_on(async {
         let sys = TestSys::new_lightweight_evictable().await;
         let old_layout = sys.table.layout_snapshot();
-        assert_eq!(old_layout.metadata().active_index_count(), 1);
+        assert_eq!(old_layout.metadata().idx.active_index_count(), 1);
 
         let metadata_without_indexes = Arc::new(
             TableMetadata::try_new_with_next_index_no(
@@ -8420,7 +8420,7 @@ fn test_runtime_layout_install_retires_removed_index_after_old_snapshot_drops() 
                     ColumnSpec::new("name", ValKind::VarByte, ColumnAttributes::empty()),
                 ],
                 vec![],
-                old_layout.metadata().next_index_no(),
+                old_layout.metadata().idx.next_index_no(),
             )
             .unwrap(),
         );
@@ -8438,19 +8438,19 @@ fn test_runtime_layout_install_retires_removed_index_after_old_snapshot_drops() 
             .table
             .install_runtime_layout(old_layout.generation(), new_layout)
             .unwrap();
-        assert_eq!(old_layout.metadata().active_index_count(), 1);
-        assert_eq!(installed.metadata().active_index_count(), 0);
+        assert_eq!(old_layout.metadata().idx.active_index_count(), 1);
+        assert_eq!(installed.metadata().idx.active_index_count(), 0);
         assert_eq!(
-            installed.metadata().next_index_no(),
-            old_layout.metadata().next_index_no()
+            installed.metadata().idx.next_index_no(),
+            old_layout.metadata().idx.next_index_no()
         );
         assert_eq!(
-            installed.metadata().index_slot_count(),
-            old_layout.metadata().index_slot_count()
+            installed.metadata().idx.index_slot_count(),
+            old_layout.metadata().idx.index_slot_count()
         );
         assert_eq!(installed.index_slot_count(), old_layout.index_slot_count());
         assert!(installed.secondary_indexes()[0].is_none());
-        assert_eq!(sys.table.metadata().active_index_count(), 0);
+        assert_eq!(sys.table.metadata().idx.active_index_count(), 0);
         assert!(sys.table.has_retired_secondary_indexes());
 
         let guards = PoolGuards::builder()

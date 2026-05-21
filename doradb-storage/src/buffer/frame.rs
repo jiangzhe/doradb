@@ -1,5 +1,5 @@
-use crate::buffer::page::{BufferPageKind, Page, PageID, VersionedPageID};
-use crate::catalog::TableMetadata;
+use crate::buffer::page::{BufferPageKind, Page, PageID};
+use crate::catalog::TableColumnLayout;
 use crate::file::FileID;
 use crate::file::cow_file::{BlockID, INVALID_BLOCK_ID};
 use crate::latch::HybridLatch;
@@ -50,31 +50,35 @@ pub struct BufferFrame {
 
 impl BufferFrame {
     #[inline]
-    pub fn kind(&self) -> FrameKind {
+    pub(crate) fn kind(&self) -> FrameKind {
         let value = self.frame_kind.load(Ordering::Acquire);
         FrameKind::from(value)
     }
 
     #[inline]
-    pub fn set_kind(&self, kind: FrameKind) {
+    pub(crate) fn set_kind(&self, kind: FrameKind) {
         self.frame_kind.store(kind as u8, Ordering::Release);
     }
 
     /// Returns the logical page image kind stored in this frame.
     #[inline]
-    pub fn page_kind(&self) -> BufferPageKind {
+    pub(crate) fn page_kind(&self) -> BufferPageKind {
         let value = self.page_kind.load(Ordering::Acquire);
         BufferPageKind::from(value)
     }
 
     /// Stores the logical page image kind for this frame.
     #[inline]
-    pub fn set_page_kind(&self, kind: BufferPageKind) {
+    pub(crate) fn set_page_kind(&self, kind: BufferPageKind) {
         self.page_kind.store(kind as u8, Ordering::Release);
     }
 
     #[inline]
-    pub fn compare_exchange_kind(&self, old_kind: FrameKind, new_kind: FrameKind) -> FrameKind {
+    pub(crate) fn compare_exchange_kind(
+        &self,
+        old_kind: FrameKind,
+        new_kind: FrameKind,
+    ) -> FrameKind {
         match self.frame_kind.compare_exchange(
             old_kind as u8,
             new_kind as u8,
@@ -87,36 +91,28 @@ impl BufferFrame {
     }
 
     #[inline]
-    pub fn is_dirty(&self) -> bool {
+    pub(crate) fn is_dirty(&self) -> bool {
         self.dirty.load(Ordering::Acquire)
     }
 
     #[inline]
-    pub fn generation(&self) -> u64 {
+    pub(crate) fn generation(&self) -> u64 {
         self.generation.load(Ordering::Acquire)
     }
 
     #[inline]
-    pub fn bump_generation(&self) -> u64 {
+    pub(crate) fn bump_generation(&self) -> u64 {
         self.generation.fetch_add(1, Ordering::AcqRel) + 1
     }
 
     #[inline]
-    pub fn versioned_page_id(&self) -> VersionedPageID {
-        VersionedPageID {
-            page_id: self.page_id,
-            generation: self.generation(),
-        }
-    }
-
-    #[inline]
-    pub fn set_dirty(&self, dirty: bool) {
+    pub(crate) fn set_dirty(&self, dirty: bool) {
         self.dirty.store(dirty, Ordering::Release);
     }
 
     /// Returns the persisted-block identity stored in this frame, if present.
     #[inline]
-    pub fn persisted_block_key(&self) -> Option<(FileID, BlockID)> {
+    pub(crate) fn persisted_block_key(&self) -> Option<(FileID, BlockID)> {
         if !self.has_persisted_block_key.load(Ordering::Acquire) {
             return None;
         }
@@ -127,7 +123,7 @@ impl BufferFrame {
 
     /// Updates persisted-block metadata for this frame.
     #[inline]
-    pub fn set_persisted_block_key(&self, file_id: FileID, block_id: BlockID) {
+    pub(crate) fn set_persisted_block_key(&self, file_id: FileID, block_id: BlockID) {
         self.persisted_file_id
             .store(file_id.into(), Ordering::Release);
         self.persisted_block_id
@@ -137,7 +133,7 @@ impl BufferFrame {
 
     /// Clears persisted-block metadata for this frame.
     #[inline]
-    pub fn clear_persisted_block_key(&self) {
+    pub(crate) fn clear_persisted_block_key(&self) {
         self.has_persisted_block_key.store(false, Ordering::Release);
         self.persisted_file_id.store(0, Ordering::Release);
         self.persisted_block_id
@@ -145,14 +141,15 @@ impl BufferFrame {
     }
 
     #[inline]
-    pub fn init_undo_map(&mut self, metadata: Arc<TableMetadata>, max_size: usize) {
+    pub(crate) fn init_undo_map(&mut self, column_layout: Arc<TableColumnLayout>, max_size: usize) {
         self.ctx = Some(Box::new(FrameContext::RowVerMap(RowVersionMap::new(
-            metadata, max_size,
+            column_layout,
+            max_size,
         ))));
     }
 
     #[inline]
-    pub fn init_recover_map(&mut self, create_cts: TrxID) {
+    pub(crate) fn init_recover_map(&mut self, create_cts: TrxID) {
         self.ctx = Some(Box::new(FrameContext::RecoverMap(RecoverMap::new(
             create_cts,
         ))));

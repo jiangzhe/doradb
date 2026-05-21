@@ -657,10 +657,12 @@ fn index_key_types(
     let mut types = Vec::with_capacity(index_spec.cols.len() + usize::from(append_row_id));
     for key in &index_spec.cols {
         let col_no = key.col_no as usize;
-        let ty =
-            metadata.col_types().get(col_no).copied().ok_or_else(|| {
-                invalid_index_spec(format!("index column {col_no} is out of range"))
-            })?;
+        let ty = metadata
+            .col
+            .col_types()
+            .get(col_no)
+            .copied()
+            .ok_or_else(|| invalid_index_spec(format!("index column {col_no} is out of range")))?;
         types.push(ty);
     }
     if append_row_id {
@@ -2200,7 +2202,7 @@ mod tests {
     macro_rules! unique_runtime {
         ($metadata:ident, $disk_pool:ident) => {
             UniqueDiskTreeRuntime::new(
-                &$metadata.index_specs[0],
+                &$metadata.idx.index_specs()[0],
                 $metadata.as_ref(),
                 $disk_pool.file_kind(),
                 Arc::clone($disk_pool.sparse_file()),
@@ -2213,7 +2215,7 @@ mod tests {
     macro_rules! non_unique_runtime {
         ($metadata:ident, $disk_pool:ident) => {
             NonUniqueDiskTreeRuntime::new(
-                &$metadata.index_specs[1],
+                &$metadata.idx.index_specs()[1],
                 $metadata.as_ref(),
                 $disk_pool.file_kind(),
                 Arc::clone($disk_pool.sparse_file()),

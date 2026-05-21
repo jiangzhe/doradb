@@ -1,8 +1,6 @@
 use clap::Parser;
 use doradb_storage::buffer::BufferPool;
-use doradb_storage::catalog::{
-    ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexSpec, TableMetadata,
-};
+use doradb_storage::catalog::{ColumnAttributes, ColumnSpec, TableColumnLayout};
 use doradb_storage::conf::{EngineConfig, EvictableBufferPoolConfig, TrxSysConfig};
 use doradb_storage::index::{RowLocation, RowPageIndex};
 use doradb_storage::value::ValKind;
@@ -35,14 +33,11 @@ fn main() {
             .await
             .unwrap();
         {
-            let metadata = Arc::new(TableMetadata::new(
-                vec![ColumnSpec {
-                    column_name: SemiStr::new("id"),
-                    column_type: ValKind::I32,
-                    column_attributes: ColumnAttributes::INDEX,
-                }],
-                vec![IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::PK)],
-            ));
+            let col_layout = Arc::new(TableColumnLayout::new(vec![ColumnSpec {
+                column_name: SemiStr::new("id"),
+                column_type: ValKind::I32,
+                column_attributes: ColumnAttributes::INDEX,
+            }]));
             let meta_guard = engine.meta_pool.pool_guard();
             let blk_idx = Arc::new(
                 RowPageIndex::new(engine.meta_pool.clone_inner(), &meta_guard, 0)
@@ -57,7 +52,7 @@ fn main() {
                         &meta_guard,
                         &*engine.mem_pool,
                         &mem_guard,
-                        &metadata,
+                        &col_layout,
                         args.rows_per_page,
                     )
                     .await;

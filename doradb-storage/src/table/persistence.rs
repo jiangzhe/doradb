@@ -269,6 +269,7 @@ struct SecondaryCheckpointSidecar {
 impl SecondaryCheckpointSidecar {
     fn new(metadata: &TableMetadata) -> Result<Self> {
         let indexes = metadata
+            .idx
             .active_indexes()
             .map(|(index_no, index_spec)| {
                 Ok(ActiveSecondaryIndexSidecar {
@@ -296,11 +297,13 @@ impl SecondaryCheckpointSidecar {
         // per row selected for persistence.
         for active in &mut self.indexes {
             let index_no = active.index_no;
-            let index_spec = metadata.require_index_spec(index_no)?;
+            let index_spec = metadata.idx.require_index_spec(index_no)?;
             let key = index_spec
                 .cols
                 .iter()
-                .map(|index_key| page.val(metadata, row_idx, index_key.col_no as usize))
+                .map(|index_key| {
+                    page.val(metadata.col.as_ref(), row_idx, index_key.col_no as usize)
+                })
                 .collect();
             active.sidecar.add_data(key, row_id);
         }
@@ -345,10 +348,12 @@ pub(crate) fn secondary_disk_tree_encoder(
     let mut types = Vec::with_capacity(index_spec.cols.len() + usize::from(append_row_id));
     for key in &index_spec.cols {
         let col_no = key.col_no as usize;
-        let ty =
-            metadata.col_types().get(col_no).copied().ok_or_else(|| {
-                invalid_index_spec(format!("index column {col_no} is out of range"))
-            })?;
+        let ty = metadata
+            .col
+            .col_types()
+            .get(col_no)
+            .copied()
+            .ok_or_else(|| invalid_index_spec(format!("index column {col_no} is out of range")))?;
         types.push(ty);
     }
     if append_row_id {
@@ -570,12 +575,12 @@ impl Table {
         }
 
         let metadata = layout.metadata();
-        if mutable_file.secondary_index_roots().len() != metadata.index_slot_count() {
+        if mutable_file.secondary_index_roots().len() != metadata.idx.index_slot_count() {
             return Err(Report::new(DataIntegrityError::InvalidRootInvariant)
                 .attach(format!(
                     "secondary root count mismatch: root_count={}, index_slot_count={}",
                     mutable_file.secondary_index_roots().len(),
-                    metadata.index_slot_count()
+                    metadata.idx.index_slot_count()
                 ))
                 .into());
         }
@@ -584,7 +589,7 @@ impl Table {
         let disk_pool_guard = disk_pool.pool_guard();
         for active in &mut sidecar.indexes {
             let index_no = active.index_no;
-            if metadata.index_spec(index_no).is_none() {
+            if metadata.idx.index_spec(index_no).is_none() {
                 return Err(Report::new(InternalError::IndexKeyMissing)
                     .attach(format!("index_no={index_no}"))
                     .into());
@@ -717,7 +722,7 @@ impl Table {
             .enumerate()
             .map(|(sidecar_pos, active)| {
                 let index_no = active.index_no;
-                let index_spec = metadata.require_index_spec(index_no)?;
+                let index_spec = metadata.idx.require_index_spec(index_no)?;
                 let read_set = index_spec
                     .cols
                     .iter()
@@ -771,7 +776,7 @@ impl Table {
                     .into());
             }
             for (sidecar_pos, index_no, read_set) in &index_read_sets {
-                let key = block.decode_row_values(metadata, row_idx, read_set)?;
+                let key = block.decode_row_values(metadata.col.as_ref(), row_idx, read_set)?;
                 secondary_sidecar.add_deleted_key_at(*sidecar_pos, *index_no, row_id, key)?;
             }
         }
@@ -872,7 +877,7 @@ impl TablePersistence for Table {
         let mut collect_secondary_row = |page: &crate::row::RowPage, row_idx, row_id| {
             secondary_sidecar.add_data_row(metadata, page, row_idx, row_id)
         };
-        let collect_visible_row = (!metadata.index_specs.is_empty()).then_some(
+        let collect_visible_row = (!metadata.idx.index_specs().is_empty()).then_some(
             &mut collect_secondary_row
                 as &mut dyn FnMut(&crate::row::RowPage, usize, RowID) -> Result<()>,
         );

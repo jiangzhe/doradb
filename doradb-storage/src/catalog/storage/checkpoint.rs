@@ -244,11 +244,11 @@ impl CatalogStorage {
         for kind in table_ops {
             match kind {
                 RowRedoKind::Insert(vals) => {
-                    if vals.len() != metadata.col_count() {
+                    if vals.len() != metadata.col.col_count() {
                         return Err(invalid_catalog_payload(format!(
                             "catalog checkpoint insert value count {} does not match column count {}",
                             vals.len(),
-                            metadata.col_count()
+                            metadata.col.col_count()
                         )));
                     }
                     pending_rows.push(PendingInsertRow {
@@ -614,7 +614,7 @@ impl CatalogStorage {
         }
         let mut rows = Vec::with_capacity(row_count);
         for (row_idx, row_id) in row_ids.into_iter().enumerate() {
-            let vals = lwc_block.decode_full_row_values(metadata, row_idx)?;
+            let vals = lwc_block.decode_full_row_values(&metadata.col, row_idx)?;
             rows.push(RowRecord { row_id, vals });
         }
         Ok(rows)
@@ -627,11 +627,11 @@ impl CatalogStorage {
         rows: &[RowRecord],
     ) -> Result<Vec<PendingLwcBlock>> {
         for row in rows {
-            if row.vals.len() != metadata.col_count() {
+            if row.vals.len() != metadata.col.col_count() {
                 return Err(invalid_catalog_payload(format!(
                     "catalog checkpoint row value count {} does not match column count {}",
                     row.vals.len(),
-                    metadata.col_count()
+                    metadata.col.col_count()
                 )));
             }
         }
@@ -640,7 +640,7 @@ impl CatalogStorage {
         }
 
         let mut lwc_blocks = Vec::new();
-        let mut builder = LwcBuilder::new(metadata);
+        let mut builder = LwcBuilder::new(&metadata.col);
         let mut builder_start = None;
         let mut builder_end = 0u64;
         let meta_guard = meta_pool.pool_guard();
@@ -668,7 +668,7 @@ impl CatalogStorage {
                 let buf = builder.build(shape.row_shape_fingerprint())?;
                 lwc_blocks.push(PendingLwcBlock { shape, buf });
 
-                builder = LwcBuilder::new(metadata);
+                builder = LwcBuilder::new(&metadata.col);
                 builder_start = Some(row.row_id);
                 if !append_single_row_to_builder(metadata, &mut temp_page, &mut builder, row)? {
                     return Err(invalid_catalog_payload(format!(
@@ -714,25 +714,25 @@ impl CatalogStorage {
             return Ok(None);
         }
         for row in existing_tail_rows {
-            if row.vals.len() != metadata.col_count() {
+            if row.vals.len() != metadata.col.col_count() {
                 return Err(invalid_catalog_payload(format!(
                     "catalog checkpoint existing row value count {} does not match column count {}",
                     row.vals.len(),
-                    metadata.col_count()
+                    metadata.col.col_count()
                 )));
             }
         }
         for row in inserts {
-            if row.vals.len() != metadata.col_count() {
+            if row.vals.len() != metadata.col.col_count() {
                 return Err(invalid_catalog_payload(format!(
                     "catalog checkpoint insert value count {} does not match column count {}",
                     row.vals.len(),
-                    metadata.col_count()
+                    metadata.col.col_count()
                 )));
             }
         }
 
-        let mut builder = LwcBuilder::new(metadata);
+        let mut builder = LwcBuilder::new(&metadata.col);
         let meta_guard = self.meta_pool.pool_guard();
         let mut temp_page = self.meta_pool.allocate_page::<RowPage>(&meta_guard).await?;
 
@@ -782,8 +782,8 @@ fn append_single_row_to_builder(
     {
         let page = temp_page.page_mut();
         page.zero();
-        page.init(row.row_id, 1, metadata);
-        let insert = page.insert(metadata, &row.vals);
+        page.init(row.row_id, 1, &metadata.col);
+        let insert = page.insert(&metadata.col, &row.vals);
         if !matches!(insert, InsertRow::Ok(_)) {
             return Err(invalid_catalog_payload(format!(
                 "catalog row cannot be staged for LWC build: row_id={}",
@@ -795,7 +795,7 @@ fn append_single_row_to_builder(
 }
 
 fn row_matches_key(metadata: &TableMetadata, row: &[Val], key: &SelectKey) -> bool {
-    let Some(index_spec) = metadata.index_spec(key.index_no) else {
+    let Some(index_spec) = metadata.idx.index_spec(key.index_no) else {
         return false;
     };
     if index_spec.cols.len() != key.vals.len() {

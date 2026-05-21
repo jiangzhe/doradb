@@ -71,11 +71,11 @@ impl TableRecover for Table {
     ) -> Result<()> {
         let layout = self.layout_snapshot();
         let metadata = layout.metadata();
-        debug_assert!(cols.len() == metadata.col_count());
+        debug_assert!(cols.len() == metadata.col.col_count());
         debug_assert!({
             cols.iter()
                 .enumerate()
-                .all(|(idx, val)| metadata.col_type_match(idx, val))
+                .all(|(idx, val)| metadata.col.col_type_match(idx, val))
         });
         // Since we always dispatch rows of one page to same thread,
         // we can just hold exclusive lock on this page and process all rows in it.
@@ -89,7 +89,7 @@ impl TableRecover for Table {
         page_guard.set_dirty(); // mark as dirty page.
 
         if !disable_index {
-            let keys = metadata.keys_for_insert(cols);
+            let keys = metadata.idx.keys_for_insert(cols);
             for key in keys {
                 match self
                     .recover_index_insert(&layout, guards, key, row_id, cts)
@@ -147,7 +147,7 @@ impl TableRecover for Table {
                 // There is index change, we need to update index.
                 let page_guard = self.mem.must_get_row_page_shared(guards, page_id).await?;
 
-                for (index_no, index_schema) in metadata.active_indexes() {
+                for (index_no, index_schema) in metadata.idx.active_indexes() {
                     let index = layout.secondary_index(index_no)?;
                     debug_assert_eq!(index.is_unique(), index_schema.unique());
                     if index_key_is_changed(index_schema, &index_change_cols) {
@@ -230,7 +230,7 @@ impl TableRecover for Table {
             );
             assert!(res.is_ok());
             page_guard.set_dirty(); // mark as dirty page.
-            for (index_no, index_schema) in metadata.active_indexes() {
+            for (index_no, index_schema) in metadata.idx.active_indexes() {
                 let index = layout.secondary_index(index_no)?;
                 debug_assert_eq!(index.is_unique(), index_schema.unique());
                 let vals: Vec<Val> = index_schema
@@ -261,7 +261,7 @@ impl TableRecover for Table {
         let metadata = layout.metadata();
         let index_pool_guard = self.mem.index_pool_guard(guards)?;
         let (ctx, page) = page_guard.ctx_and_page();
-        for (index_no, index_spec) in metadata.active_indexes() {
+        for (index_no, index_spec) in metadata.idx.active_indexes() {
             let sec_idx = layout.secondary_index(index_no)?;
             let read_set: Vec<_> = index_spec.cols.iter().map(|c| c.col_no as usize).collect();
             for row_access in ReadAllRows::new(page, ctx) {

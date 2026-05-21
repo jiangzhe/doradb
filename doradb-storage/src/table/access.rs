@@ -2,7 +2,7 @@ use super::missing_secondary_index;
 use crate::buffer::guard::{PageGuard, PageSharedGuard};
 use crate::buffer::page::{INVALID_PAGE_ID, VersionedPageID};
 use crate::buffer::{EvictableBufferPool, PageID, PoolGuards};
-use crate::catalog::{TableID, TableMetadata};
+use crate::catalog::{TableColumnLayout, TableID, TableMetadata};
 use crate::error::{DataIntegrityError, Error, FileKind, InternalError, OperationError, Result};
 use crate::file::BlockID;
 use crate::index::util::{Maskable, RowPageCreateRedoCtx};
@@ -632,7 +632,7 @@ impl UserTableAccessor<'_> {
                 "row shape fingerprint mismatch",
             ));
         }
-        block.decode_row_values(self.metadata(), row_idx, read_set)
+        block.decode_row_values(self.metadata().col.as_ref(), row_idx, read_set)
     }
 
     #[inline]
@@ -659,7 +659,7 @@ impl UserTableAccessor<'_> {
                 "row shape fingerprint mismatch",
             ));
         }
-        block.decode_full_row_values(self.metadata(), row_idx)
+        block.decode_full_row_values(self.metadata().col.as_ref(), row_idx)
     }
 
     #[inline]
@@ -683,6 +683,7 @@ impl UserTableAccessor<'_> {
             .zip(vals)
             .collect::<HashMap<_, _>>();
         self.metadata()
+            .idx
             .active_indexes()
             .map(|(index_no, index)| {
                 let vals = index
@@ -714,7 +715,8 @@ impl UserTableAccessor<'_> {
     ) -> Result<Vec<SelectKey>> {
         let mut read_set = self
             .metadata()
-            .index_cols
+            .idx
+            .index_columns()
             .iter()
             .copied()
             .collect::<Vec<_>>();
@@ -790,7 +792,7 @@ impl UserTableAccessor<'_> {
                 row_shape_fingerprint,
             )
             .await?;
-        if !self.metadata().match_key(key, &vals) {
+        if !self.metadata().idx.match_key(key, &vals) {
             return Ok(ColdRowUpdateRead::NotFound);
         }
         Ok(ColdRowUpdateRead::Ok(vals))
@@ -807,6 +809,7 @@ impl UserTableAccessor<'_> {
     ) -> Result<bool> {
         let read_set = self
             .metadata()
+            .idx
             .require_index_spec(key.index_no)?
             .cols
             .iter()
@@ -874,7 +877,12 @@ impl UserTableAccessor<'_> {
         page_guard: &PageSharedGuard<RowPage>,
         root_snapshot: &TableRootSnapshot<'_>,
     ) -> Result<InsertIndex> {
-        if self.metadata().require_index_spec(key.index_no)?.unique() {
+        if self
+            .metadata()
+            .idx
+            .require_index_spec(key.index_no)?
+            .unique()
+        {
             self.insert_unique_index(ctx, effects, key, row_id, page_guard, root_snapshot)
                 .await
         } else {
@@ -894,7 +902,7 @@ impl UserTableAccessor<'_> {
     ) -> Result<(RowID, PageSharedGuard<RowPage>)> {
         let metadata = self.metadata();
         let row_len = row_len(metadata, &insert);
-        let row_count = estimate_max_row_count(row_len, metadata.col_count());
+        let row_count = estimate_max_row_count(row_len, metadata.col.col_count());
         loop {
             let page_guard = self.get_insert_page(ctx, row_count).await?;
             match self.insert_row_to_page(
@@ -947,10 +955,10 @@ impl UserTableAccessor<'_> {
         if *state_guard != RowPageState::Active {
             return InsertRowIntoPage::NoSpaceOrFrozen(cols, undo_kind, index_branches);
         }
-        debug_assert!(metadata.col_count() == page.header.col_count as usize);
+        debug_assert!(metadata.col.col_count() == page.header.col_count as usize);
         debug_assert!(cols.len() == page.header.col_count as usize);
 
-        let var_len = var_len_for_insert(metadata, &cols);
+        let var_len = var_len_for_insert(metadata.col.as_ref(), &cols);
         let (row_idx, var_offset) =
             if let Some((row_idx, var_offset)) = page.request_row_idx_and_free_space(var_len) {
                 (row_idx, var_offset)
@@ -980,7 +988,7 @@ impl UserTableAccessor<'_> {
         // Apply insert
         let mut new_row = page.new_row(row_idx, var_offset);
         for v in &cols {
-            new_row.add_col(metadata, v);
+            new_row.add_col(metadata.col.as_ref(), v);
         }
         let new_row_id = new_row.finish();
         debug_assert!(new_row_id == row_id);
@@ -1073,7 +1081,7 @@ impl UserTableAccessor<'_> {
                 if access.row().is_deleted() {
                     return UpdateRowInplace::RowDeleted;
                 }
-                match access.update_row(metadata, &update, frozen) {
+                match access.update_row(metadata.col.as_ref(), &update, frozen) {
                     UpdateRow::NoFreeSpaceOrFrozen(old_row) => {
                         // The hot row cannot be updated in place because the
                         // page has no reusable space or has been frozen for
@@ -1111,16 +1119,16 @@ impl UserTableAccessor<'_> {
                         let (mut undo_cols, mut redo_cols) = (vec![], vec![]);
                         for uc in &mut update {
                             if let Some((old_val, var_offset)) =
-                                row.different(metadata, uc.idx, &uc.val)
+                                row.different(metadata.col.as_ref(), uc.idx, &uc.val)
                             {
                                 let new_val = mem::take(&mut uc.val);
                                 // we also check whether the value change is related to any index,
                                 // so we can update index later.
-                                if metadata.index_cols.contains(&uc.idx) {
+                                if metadata.idx.index_columns().contains(&uc.idx) {
                                     index_change_cols.insert(uc.idx, old_val.clone());
                                 }
                                 // actual update
-                                row.update_col(metadata, uc.idx, &new_val);
+                                row.update_col(metadata.col.as_ref(), uc.idx, &new_val);
                                 // record undo and redo
                                 undo_cols.push(UndoCol {
                                     idx: uc.idx,
@@ -1184,7 +1192,7 @@ impl UserTableAccessor<'_> {
             for mut uc in update {
                 let old_val = &mut row[uc.idx];
                 if old_val != &uc.val {
-                    if metadata.index_cols.contains(&uc.idx) {
+                    if metadata.idx.index_columns().contains(&uc.idx) {
                         index_change_cols.insert(uc.idx, old_val.clone());
                     }
                     // swap old value and new value
@@ -1220,6 +1228,7 @@ impl UserTableAccessor<'_> {
             let old_entry = old_access.first_undo_entry().expect("old undo entry");
             debug_assert!(matches!(old_entry.as_ref().kind, RowUndoKind::Delete));
             metadata
+                .idx
                 .active_indexes()
                 .filter(|(_, index)| index.unique())
                 .map(|(index_no, index)| {
@@ -1269,7 +1278,7 @@ impl UserTableAccessor<'_> {
         root_snapshot: &TableRootSnapshot<'_>,
     ) -> Result<UpdateIndex> {
         let metadata = self.metadata();
-        for (index_no, index_schema) in metadata.active_indexes() {
+        for (index_no, index_schema) in metadata.idx.active_indexes() {
             debug_assert_eq!(self.sec_idx_is_unique(index_no), index_schema.unique());
             if index_key_is_changed(index_schema, index_change_cols) {
                 let new_key = read_latest_index_key(metadata, index_no, page_guard, row_id);
@@ -1324,7 +1333,7 @@ impl UserTableAccessor<'_> {
     ) -> Result<UpdateIndex> {
         debug_assert!(old_row_id != new_row_id);
         let metadata = self.metadata();
-        for (index_no, index_schema) in metadata.active_indexes() {
+        for (index_no, index_schema) in metadata.idx.active_indexes() {
             debug_assert_eq!(self.sec_idx_is_unique(index_no), index_schema.unique());
             let key = read_latest_index_key(metadata, index_no, page_guard, new_row_id);
             if index_schema.unique() {
@@ -1368,7 +1377,7 @@ impl UserTableAccessor<'_> {
     ) -> Result<UpdateIndex> {
         debug_assert!(row_id_move.old != row_id_move.new);
         let metadata = self.metadata();
-        for (index_no, index_schema) in metadata.active_indexes() {
+        for (index_no, index_schema) in metadata.idx.active_indexes() {
             debug_assert_eq!(self.sec_idx_is_unique(index_no), index_schema.unique());
             let key = read_latest_index_key(metadata, index_no, page_guard, row_id_move.new);
             if index_key_is_changed(index_schema, index_change_cols) {
@@ -1505,6 +1514,7 @@ impl UserTableAccessor<'_> {
     ) -> Result<()> {
         let metadata = self.metadata();
         let keys = metadata
+            .idx
             .active_indexes()
             .map(|(index_no, _)| read_latest_index_key(metadata, index_no, page_guard, row_id))
             .collect();
@@ -1522,7 +1532,7 @@ impl UserTableAccessor<'_> {
         root_snapshot: &TableRootSnapshot<'_>,
     ) -> Result<()> {
         for key in keys {
-            let index_schema = self.metadata().require_index_spec(key.index_no)?;
+            let index_schema = self.metadata().idx.require_index_spec(key.index_no)?;
             debug_assert_eq!(self.sec_idx_is_unique(key.index_no), index_schema.unique());
             if index_schema.unique() {
                 self.defer_delete_unique_index(ctx, effects, row_id, key, root_snapshot)
@@ -1860,7 +1870,7 @@ impl UserTableAccessor<'_> {
             .await?;
         // The unique index entry may be stale while purge is catching up, so
         // verify the persisted row still owns the key before linking it.
-        if !self.metadata().match_key(key, &old_row) {
+        if !self.metadata().idx.match_key(key, &old_row) {
             return Ok(LinkForUniqueIndex::NotNeeded);
         }
         let Some(delete_cts) = delete_cts else {
@@ -1870,7 +1880,7 @@ impl UserTableAccessor<'_> {
         let (page_ctx, page) = new_guard.ctx_and_page();
         let mut new_access =
             RowWriteAccess::new(page, page_ctx, page.row_idx(new_id), Some(ctx.sts()), false);
-        let undo_vals = new_access.row().calc_delta(metadata, &old_row);
+        let undo_vals = new_access.row().calc_delta(metadata.col.as_ref(), &old_row);
         // The new hot row owns the key now. The terminal branch preserves the
         // old cold image for snapshots that still need to see it. The branch is
         // runtime-only; recovery restores only the latest committed mapping.
@@ -1966,7 +1976,7 @@ impl UserTableAccessor<'_> {
                     Some(ctx.sts()),
                     false,
                 );
-                let undo_vals = new_access.row().calc_delta(metadata, &old_row);
+                let undo_vals = new_access.row().calc_delta(metadata.col.as_ref(), &old_row);
                 new_access.link_for_unique_index(key.clone(), cts, old_entry, undo_vals);
                 Ok(LinkForUniqueIndex::Linked)
             }
@@ -2669,13 +2679,13 @@ impl UserTableAccessor<'_> {
         mut row_action: F,
     ) -> Result<()>
     where
-        F: for<'m, 'p> FnMut(&'m TableMetadata, Row<'p>) -> bool,
+        F: for<'m, 'p> FnMut(&'m TableColumnLayout, Row<'p>) -> bool,
     {
         self.mem_scan(guards, |page_guard| {
             let (ctx, page) = page_guard.ctx_and_page();
-            let metadata = &*ctx.row_ver().unwrap().metadata;
+            let col_layout = ctx.row_ver().unwrap().column_layout.as_ref();
             for row_access in ReadAllRows::new(page, ctx) {
-                if !row_action(metadata, row_access.row()) {
+                if !row_action(col_layout, row_access.row()) {
                     return false;
                 }
             }
@@ -2696,7 +2706,7 @@ impl UserTableAccessor<'_> {
         let guards = ctx.require_pool_guards("table scan MVCC")?;
         self.mem_scan(guards, |page_guard| {
             let (page_ctx, page) = page_guard.ctx_and_page();
-            let metadata = &*page_ctx.row_ver().unwrap().metadata;
+            let metadata = self.metadata();
             for row_access in ReadAllRows::new(page, page_ctx) {
                 match row_access.read_row_mvcc(ctx, metadata, read_set, None) {
                     ReadRow::InvalidIndex => unreachable!(),
@@ -2722,11 +2732,16 @@ impl UserTableAccessor<'_> {
         debug_assert!(key.index_no < self.sec_idx_len());
         debug_assert!(
             self.metadata()
+                .idx
                 .require_index_spec(key.index_no)
                 .unwrap()
                 .unique()
         );
-        debug_assert!(self.metadata().index_type_match(key.index_no, &key.vals));
+        debug_assert!(self.metadata().idx.index_type_match(
+            self.metadata().col.as_ref(),
+            key.index_no,
+            &key.vals
+        ));
         debug_assert!({
             !user_read_set.is_empty()
                 && user_read_set
@@ -2764,11 +2779,16 @@ impl UserTableAccessor<'_> {
         debug_assert!(
             !self
                 .metadata()
+                .idx
                 .require_index_spec(key.index_no)
                 .unwrap()
                 .unique()
         );
-        debug_assert!(self.metadata().index_type_match(key.index_no, &key.vals));
+        debug_assert!(self.metadata().idx.index_type_match(
+            self.metadata().col.as_ref(),
+            key.index_no,
+            &key.vals
+        ));
         debug_assert!({
             !user_read_set.is_empty()
                 && user_read_set
@@ -2809,13 +2829,13 @@ impl UserTableAccessor<'_> {
         cols: Vec<Val>,
     ) -> Result<RowID> {
         let metadata = self.metadata();
-        debug_assert!(cols.len() == metadata.col_count());
+        debug_assert!(cols.len() == metadata.col.col_count());
         debug_assert!({
             cols.iter()
                 .enumerate()
-                .all(|(idx, val)| self.metadata().col_type_match(idx, val))
+                .all(|(idx, val)| self.metadata().col.col_type_match(idx, val))
         });
-        let keys = self.metadata().keys_for_insert(&cols);
+        let keys = self.metadata().idx.keys_for_insert(&cols);
         let root_snapshot = self.root_snapshot(ctx)?;
         // Insert always creates a hot RowStore row. The insert undo head makes
         // the new row invisible to older snapshots and is also the rollback
@@ -2858,13 +2878,19 @@ impl UserTableAccessor<'_> {
         debug_assert!(key.index_no < self.sec_idx_len());
         debug_assert!(
             self.metadata()
+                .idx
                 .require_index_spec(key.index_no)
                 .unwrap()
                 .unique()
         );
-        debug_assert!(self.metadata().index_type_match(key.index_no, &key.vals));
+        debug_assert!(self.metadata().idx.index_type_match(
+            self.metadata().col.as_ref(),
+            key.index_no,
+            &key.vals
+        ));
         debug_assert!(update.iter().all(|uc| {
-            uc.idx < self.metadata().col_count() && self.metadata().col_type_match(uc.idx, &uc.val)
+            uc.idx < self.metadata().col.col_count()
+                && self.metadata().col.col_type_match(uc.idx, &uc.val)
         }));
         debug_assert!(
             update.is_empty()
@@ -2964,7 +2990,7 @@ impl UserTableAccessor<'_> {
                             // Unique indexes may also install runtime branches from
                             // the hot replacement to the old cold owner while the
                             // new row's index entries are inserted below.
-                            let old_index_keys = self.metadata().keys_for_insert(&old_vals);
+                            let old_index_keys = self.metadata().idx.keys_for_insert(&old_vals);
                             self.defer_delete_index_keys(
                                 ctx,
                                 effects,
@@ -2975,7 +3001,7 @@ impl UserTableAccessor<'_> {
                             .await?;
 
                             let new_row = self.build_cold_update_row(old_vals, update.clone());
-                            let new_index_keys = self.metadata().keys_for_insert(&new_row);
+                            let new_index_keys = self.metadata().idx.keys_for_insert(&new_row);
                             let (new_row_id, new_guard) = self
                                 .insert_row_internal(
                                     ctx,
@@ -3158,11 +3184,16 @@ impl UserTableAccessor<'_> {
         debug_assert!(key.index_no < self.sec_idx_len());
         debug_assert!(
             self.metadata()
+                .idx
                 .require_index_spec(key.index_no)
                 .unwrap()
                 .unique()
         );
-        debug_assert!(self.metadata().index_type_match(key.index_no, &key.vals));
+        debug_assert!(self.metadata().idx.index_type_match(
+            self.metadata().col.as_ref(),
+            key.index_no,
+            &key.vals
+        ));
         loop {
             let root_snapshot = self.root_snapshot(ctx)?;
             let lookup_root = self.snapshot_secondary_root(&root_snapshot, key.index_no)?;
@@ -3302,7 +3333,7 @@ impl UserTableAccessor<'_> {
     ) -> Result<bool> {
         // Undo can outlive the secondary index that produced it. Once the
         // index slot is inactive, row-level purge has no per-entry cleanup to do.
-        let Some(index_schema) = self.metadata().index_spec(key.index_no) else {
+        let Some(index_schema) = self.metadata().idx.index_spec(key.index_no) else {
             return Ok(false);
         };
         if !self.sec_idx_is_active(key.index_no) {
