@@ -274,10 +274,11 @@ checkpoint readiness, and cleanup proofs:
 - `heap_redo_start_ts`: heap redo replay floor from the captured root
 - `deletion_cutoff_ts`: cold-row deletion replay/cleanup boundary
 
-The snapshot intentionally excludes `slot_no`, `alloc_map`, `gc_block_list`, and
-`newly_allocated_ids`. Those are CoW file-publication and allocation internals,
-not runtime table-read contracts. Keeping them out prevents table access from
-depending on root mutation machinery. [C1], [C2], [U7]
+The snapshot intentionally excludes `slot_no` and `alloc_map`. Those are CoW
+file-publication internals, while mutable allocation ownership is tracked outside
+active roots by `MutableCowRoot::unpublished_blocks`; none are runtime
+table-read contracts. Keeping them out prevents table access from depending on
+root mutation machinery. [C1], [C2], [U7]
 
 Construction is proof-gated:
 

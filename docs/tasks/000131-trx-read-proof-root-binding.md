@@ -156,8 +156,9 @@ runtime-used fields:
 The broader planning-time inspection fields (`table_id`, `root_meta_block_id`,
 `metadata`, and `heap_redo_start_ts`) were intentionally dropped from the final
 runtime surface because they were only supporting test inspection, not runtime
-root-binding behavior. `slot_no`, `alloc_map`, `gc_block_list`, and
-`newly_allocated_ids` remain excluded publication/allocation internals.
+root-binding behavior. `slot_no` and `alloc_map` remain excluded publication
+internals, and mutable allocation ownership is tracked outside active roots by
+`MutableCowRoot::unpublished_blocks`.
 
 ### ActiveRoot Split
 

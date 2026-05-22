@@ -11,7 +11,8 @@ use crate::file::block_integrity::{
 };
 use crate::file::cow_file::{
     ActiveRoot as GenericActiveRoot, BlockID, COW_FILE_PAGE_SIZE, CowCodec, CowFile,
-    MutableCowFile, OldCowRoot, ParsedMeta, SUPER_BLOCK_ID, validate_active_meta_block_id,
+    MutableCowFile, MutableCowRoot, MutableWriterClaim, MutableWriterFile, OldCowRoot, ParsedMeta,
+    SUPER_BLOCK_ID, validate_active_meta_block_id,
 };
 use crate::file::fs::BackgroundWriteRequest;
 use crate::file::meta_block::{
@@ -360,56 +361,29 @@ impl MultiTableFile {
     }
 }
 
+impl MutableWriterFile for MultiTableFile {
+    #[inline]
+    fn claim_mutable_writer(&self) {
+        self.file.claim_mutable_writer();
+    }
+
+    #[inline]
+    fn release_mutable_writer(&self) {
+        self.file.release_mutable_writer();
+    }
+}
+
 /// Mutable wrapper for publishing one new multi-table checkpoint root.
 ///
 /// This mirrors `MutableTableFile` semantics for catalog file updates.
 pub struct MutableMultiTableFile {
-    file: Option<Arc<MultiTableFile>>,
-    new_root: Option<MultiTableActiveRoot>,
+    pub(super) file: Arc<MultiTableFile>,
+    pub(super) new_root: MutableCowRoot<MultiTableMetaBlock>,
     background_writes: IOClient<BackgroundWriteRequest>,
-    mutable_writer_claimed: bool,
+    writer_claim: MutableWriterClaim<MultiTableFile>,
 }
 
 impl MutableMultiTableFile {
-    #[inline]
-    fn file_ref(&self) -> &Arc<MultiTableFile> {
-        self.file
-            .as_ref()
-            .expect("mutable multi-table file has been consumed")
-    }
-
-    #[inline]
-    fn new_root_mut(&mut self) -> &mut MultiTableActiveRoot {
-        self.new_root
-            .as_mut()
-            .expect("mutable multi-table file has been consumed")
-    }
-
-    #[inline]
-    fn background_writes(&self) -> &IOClient<BackgroundWriteRequest> {
-        &self.background_writes
-    }
-
-    #[inline]
-    fn release_mutable_claim_with_file(&mut self, file: &Arc<MultiTableFile>) {
-        if self.mutable_writer_claimed {
-            file.file().release_mutable_writer();
-            self.mutable_writer_claimed = false;
-        }
-    }
-
-    #[inline]
-    fn release_mutable_claim(&mut self) {
-        if self.mutable_writer_claimed {
-            let file = self
-                .file
-                .as_ref()
-                .expect("mutable multi-table file has been consumed");
-            file.file().release_mutable_writer();
-            self.mutable_writer_claimed = false;
-        }
-    }
-
     /// Create mutable handle with caller-provided root.
     #[inline]
     pub(crate) fn new(
@@ -417,12 +391,12 @@ impl MutableMultiTableFile {
         new_root: MultiTableActiveRoot,
         background_writes: &IOClient<BackgroundWriteRequest>,
     ) -> Self {
-        table_file.file().claim_mutable_writer();
+        let writer_claim = MutableWriterClaim::new(&table_file);
         MutableMultiTableFile {
-            file: Some(table_file),
-            new_root: Some(new_root),
+            file: table_file,
+            new_root: MutableCowRoot::from_root(new_root),
             background_writes: background_writes.clone(),
-            mutable_writer_claimed: true,
+            writer_claim,
         }
     }
 
@@ -432,27 +406,25 @@ impl MutableMultiTableFile {
         table_file: &Arc<MultiTableFile>,
         background_writes: &IOClient<BackgroundWriteRequest>,
     ) -> Self {
-        table_file.file().claim_mutable_writer();
+        let writer_claim = MutableWriterClaim::new(table_file);
         MutableMultiTableFile {
-            file: Some(Arc::clone(table_file)),
-            new_root: Some(table_file.active_root_unchecked().flip()),
+            file: Arc::clone(table_file),
+            new_root: MutableCowRoot::fork(table_file.active_root_unchecked()),
             background_writes: background_writes.clone(),
-            mutable_writer_claimed: true,
+            writer_claim,
         }
     }
 
     /// Returns immutable reference to mutable root snapshot.
     #[inline]
     pub fn root(&self) -> &MultiTableActiveRoot {
-        self.new_root
-            .as_ref()
-            .expect("mutable multi-table file has been consumed")
+        &self.new_root.root
     }
 
     /// Allocate a new page id for copy-on-write updates.
     #[inline]
     pub fn allocate_block_id(&mut self) -> Result<BlockID> {
-        self.new_root_mut().try_allocate_block_id().ok_or_else(|| {
+        self.new_root.try_allocate_block_id().ok_or_else(|| {
             Report::new(ResourceError::StorageFileCapacityExceeded)
                 .attach("multi-table file could not allocate block")
                 .into()
@@ -462,26 +434,15 @@ impl MutableMultiTableFile {
     /// Roll back a block id allocated by this unpublished mutable root.
     #[inline]
     pub fn rollback_allocated_block_id(&mut self, block_id: BlockID) -> Result<()> {
-        self.new_root_mut().rollback_allocated_block_id(block_id)
+        self.new_root.rollback_allocated_block_id(block_id)
     }
 
     /// Write one page into the underlying multi-table file.
     #[inline]
     pub(crate) async fn write_block(&self, block_id: BlockID, buf: DirectBuf) -> Result<()> {
-        self.file_ref()
+        self.file
             .file()
-            .write_block(self.background_writes(), block_id, buf)
-            .await
-    }
-
-    #[inline]
-    async fn publish_root(
-        &self,
-        new_root: MultiTableActiveRoot,
-    ) -> Result<Option<OldMultiTableRoot>> {
-        self.file_ref()
-            .file()
-            .publish_root(self.background_writes(), new_root)
+            .write_block(&self.background_writes, block_id, buf)
             .await
     }
 
@@ -493,7 +454,7 @@ impl MutableMultiTableFile {
         next_user_obj_id: ObjID,
         table_roots: [CatalogTableRootDesc; CATALOG_TABLE_ROOT_DESC_COUNT],
     ) -> Result<()> {
-        let root = self.new_root_mut();
+        let root = &mut self.new_root.root;
         if catalog_replay_start_ts < root.trx_id {
             return Err(mutable_root_metadata_regression(format!(
                 "catalog replay start regressed: current={}, new={catalog_replay_start_ts}",
@@ -522,28 +483,17 @@ impl MutableMultiTableFile {
 
     /// Commit mutable root by writing meta block then ping-pong super block.
     #[inline]
-    pub(crate) async fn commit(
-        mut self,
-    ) -> Result<(Arc<MultiTableFile>, Option<OldMultiTableRoot>)> {
-        let new_root = self
-            .new_root
-            .take()
-            .expect("mutable multi-table file has been consumed");
-        let publish_res = self.publish_root(new_root).await;
-        let file = self
-            .file
-            .take()
-            .expect("mutable multi-table file has been consumed");
-        self.release_mutable_claim_with_file(&file);
+    pub(crate) async fn commit(self) -> Result<(Arc<MultiTableFile>, Option<OldMultiTableRoot>)> {
+        let MutableMultiTableFile {
+            file,
+            new_root,
+            background_writes,
+            writer_claim,
+        } = self;
+        let publish_res = file.file().publish_root(&background_writes, new_root).await;
+        drop(writer_claim);
         let old_root = publish_res?;
         Ok((file, old_root))
-    }
-}
-
-impl Drop for MutableMultiTableFile {
-    #[inline]
-    fn drop(&mut self) {
-        self.release_mutable_claim();
     }
 }
 

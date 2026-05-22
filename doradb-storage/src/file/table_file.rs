@@ -8,7 +8,8 @@ use crate::file::block_integrity::{
 };
 use crate::file::cow_file::{
     ActiveRoot as GenericActiveRoot, BlockID, COW_FILE_PAGE_SIZE, CowCodec, CowFile,
-    MutableCowFile, OldCowRoot, ParsedMeta, SUPER_BLOCK_ID, validate_active_meta_block_id,
+    MutableCowFile, MutableCowRoot, MutableWriterClaim, MutableWriterFile, OldCowRoot, ParsedMeta,
+    SUPER_BLOCK_ID, validate_active_meta_block_id,
 };
 use crate::file::fs::BackgroundWriteRequest;
 use crate::file::meta_block::{
@@ -354,16 +355,28 @@ impl TableFile {
     }
 }
 
+impl MutableWriterFile for TableFile {
+    #[inline]
+    fn claim_mutable_writer(&self) {
+        self.file.claim_mutable_writer();
+    }
+
+    #[inline]
+    fn release_mutable_writer(&self) {
+        self.file.release_mutable_writer();
+    }
+}
+
 /// MutableTableFile represents a table file being modified.
 /// It's safe to share the original table file with other threads
 /// because the modification is done in Copy-on-Write way.
 /// All changes will be committed once the new active root
 /// is persisted to disk.
 pub struct MutableTableFile {
-    file: Option<Arc<TableFile>>,
-    new_root: Option<ActiveRoot>,
+    pub(super) file: Arc<TableFile>,
+    pub(super) new_root: MutableCowRoot<TableMeta>,
     background_writes: IOClient<BackgroundWriteRequest>,
-    mutable_writer_claimed: bool,
+    writer_claim: MutableWriterClaim<TableFile>,
 }
 
 /// One LWC block payload that should be persisted into table-file blocks.
@@ -375,45 +388,6 @@ pub struct LwcBlockPersist {
 }
 
 impl MutableTableFile {
-    #[inline]
-    fn file_ref(&self) -> &Arc<TableFile> {
-        self.file
-            .as_ref()
-            .expect("mutable table file has been consumed")
-    }
-
-    #[inline]
-    fn new_root_mut(&mut self) -> &mut ActiveRoot {
-        self.new_root
-            .as_mut()
-            .expect("mutable table file has been consumed")
-    }
-
-    #[inline]
-    fn background_writes(&self) -> &IOClient<BackgroundWriteRequest> {
-        &self.background_writes
-    }
-
-    #[inline]
-    fn release_mutable_claim_with_file(&mut self, file: &Arc<TableFile>) {
-        if self.mutable_writer_claimed {
-            file.file().release_mutable_writer();
-            self.mutable_writer_claimed = false;
-        }
-    }
-
-    #[inline]
-    fn release_mutable_claim(&mut self) {
-        if self.mutable_writer_claimed {
-            let file = self
-                .file
-                .as_ref()
-                .expect("mutable table file has been consumed");
-            file.file().release_mutable_writer();
-            self.mutable_writer_claimed = false;
-        }
-    }
-
     /// Create new mutable table file.
     #[inline]
     pub(crate) fn new(
@@ -421,12 +395,12 @@ impl MutableTableFile {
         new_root: ActiveRoot,
         background_writes: &IOClient<BackgroundWriteRequest>,
     ) -> Self {
-        table_file.file().claim_mutable_writer();
+        let writer_claim = MutableWriterClaim::new(&table_file);
         MutableTableFile {
-            file: Some(table_file),
-            new_root: Some(new_root),
+            file: table_file,
+            new_root: MutableCowRoot::from_root(new_root),
             background_writes: background_writes.clone(),
-            mutable_writer_claimed: true,
+            writer_claim,
         }
     }
 
@@ -436,27 +410,25 @@ impl MutableTableFile {
         table_file: &Arc<TableFile>,
         background_writes: &IOClient<BackgroundWriteRequest>,
     ) -> Self {
-        table_file.file().claim_mutable_writer();
+        let writer_claim = MutableWriterClaim::new(table_file);
         MutableTableFile {
-            file: Some(Arc::clone(table_file)),
-            new_root: Some(table_file.active_root_unchecked().flip()),
+            file: Arc::clone(table_file),
+            new_root: MutableCowRoot::fork(table_file.active_root_unchecked()),
             background_writes: background_writes.clone(),
-            mutable_writer_claimed: true,
+            writer_claim,
         }
     }
 
     /// Returns immutable reference to mutable root snapshot.
     #[inline]
     pub fn root(&self) -> &ActiveRoot {
-        self.new_root
-            .as_ref()
-            .expect("mutable table file has been consumed")
+        &self.new_root.root
     }
 
     /// Updates mutable root column-index pointer.
     #[inline]
     pub fn set_column_block_index_root(&mut self, root_block_id: BlockID) {
-        self.new_root_mut().column_block_index_root = root_block_id;
+        self.new_root.root.column_block_index_root = root_block_id;
     }
 
     /// Returns mutable-root secondary DiskTree roots ordered by index number.
@@ -484,7 +456,7 @@ impl MutableTableFile {
         index_no: usize,
         root_block_id: BlockID,
     ) -> Result<()> {
-        let roots = &mut self.new_root_mut().secondary_index_roots;
+        let roots = &mut self.new_root.root.secondary_index_roots;
         let index_count = roots.len();
         let root = roots
             .get_mut(index_no)
@@ -502,7 +474,7 @@ impl MutableTableFile {
                 self.root().metadata.idx.index_slot_count(),
             ));
         }
-        self.new_root_mut().secondary_index_roots = roots;
+        self.new_root.root.secondary_index_roots = roots;
         Ok(())
     }
 
@@ -528,7 +500,7 @@ impl MutableTableFile {
                 return Err(secondary_index_root_inactive_slot_mismatch(index_no, root));
             }
         }
-        let root = self.new_root_mut();
+        let root = &mut self.new_root.root;
         root.metadata = metadata;
         root.secondary_index_roots = roots;
         Ok(())
@@ -541,7 +513,7 @@ impl MutableTableFile {
         pivot_row_id: RowID,
         heap_redo_start_ts: TrxID,
     ) -> Result<()> {
-        let root = self.new_root_mut();
+        let root = &mut self.new_root.root;
         if pivot_row_id < root.pivot_row_id {
             return Err(mutable_root_metadata_regression(format!(
                 "pivot_row_id regressed: current={}, new={pivot_row_id}",
@@ -556,7 +528,7 @@ impl MutableTableFile {
     /// Advances mutable root cold-delete replay watermark without regressing it.
     #[inline]
     pub fn advance_deletion_cutoff_ts(&mut self, deletion_cutoff_ts: TrxID) {
-        let root = self.new_root_mut();
+        let root = &mut self.new_root.root;
         if deletion_cutoff_ts > root.deletion_cutoff_ts {
             root.deletion_cutoff_ts = deletion_cutoff_ts;
         }
@@ -565,7 +537,7 @@ impl MutableTableFile {
     /// Allocate a new block id for copy-on-write updates.
     #[inline]
     pub fn allocate_block_id(&mut self) -> Result<BlockID> {
-        self.new_root_mut().try_allocate_block_id().ok_or_else(|| {
+        self.new_root.try_allocate_block_id().ok_or_else(|| {
             Report::new(ResourceError::StorageFileCapacityExceeded)
                 .attach("table file could not allocate block")
                 .into()
@@ -575,7 +547,7 @@ impl MutableTableFile {
     /// Roll back a block id allocated by this unpublished mutable root.
     #[inline]
     pub fn rollback_allocated_block_id(&mut self, block_id: BlockID) -> Result<()> {
-        self.new_root_mut().rollback_allocated_block_id(block_id)
+        self.new_root.rollback_allocated_block_id(block_id)
     }
 
     /// Rebuild the mutable root allocation map from root-reachable blocks.
@@ -586,24 +558,15 @@ impl MutableTableFile {
         &mut self,
         reachable: &BTreeSet<BlockID>,
     ) -> Result<usize> {
-        self.new_root_mut()
-            .rebuild_alloc_map_from_reachable(reachable)
+        self.new_root.rebuild_alloc_map_from_reachable(reachable)
     }
 
     /// Write one page into the underlying table file.
     #[inline]
     pub async fn write_block(&self, block_id: BlockID, buf: DirectBuf) -> Result<()> {
-        self.file_ref()
+        self.file
             .file()
-            .write_block(self.background_writes(), block_id, buf)
-            .await
-    }
-
-    #[inline]
-    async fn publish_root(&self, new_root: ActiveRoot) -> Result<Option<OldRoot>> {
-        self.file_ref()
-            .file()
-            .publish_root(self.background_writes(), new_root)
+            .write_block(&self.background_writes, block_id, buf)
             .await
     }
 
@@ -612,22 +575,23 @@ impl MutableTableFile {
     /// active root if exists.
     #[inline]
     pub async fn commit(
-        mut self,
+        self,
         trx_id: TrxID,
         try_delete_if_fail: bool,
     ) -> Result<(Arc<TableFile>, Option<OldRoot>)> {
-        let mut new_root = self
-            .new_root
-            .take()
-            .expect("mutable table file has been consumed");
-        debug_assert!(new_root.trx_id == 0 || new_root.trx_id < trx_id);
-        new_root.trx_id = trx_id;
-        let publish_res = self.publish_root(new_root).await;
-        let table_file = self
-            .file
-            .take()
-            .expect("mutable table file has been consumed");
-        self.release_mutable_claim_with_file(&table_file);
+        let MutableTableFile {
+            file: table_file,
+            mut new_root,
+            background_writes,
+            writer_claim,
+        } = self;
+        debug_assert!(new_root.root.trx_id == 0 || new_root.root.trx_id < trx_id);
+        new_root.root.trx_id = trx_id;
+        let publish_res = table_file
+            .file()
+            .publish_root(&background_writes, new_root)
+            .await;
+        drop(writer_claim);
 
         match publish_res {
             Ok(old_root) => Ok((table_file, old_root)),
@@ -648,7 +612,7 @@ impl MutableTableFile {
         ts: TrxID,
         disk_pool: &QuiescentGuard<ReadonlyBufferPool>,
     ) -> Result<()> {
-        let table_file = Arc::clone(self.file_ref());
+        let table_file = Arc::clone(&self.file);
         let background_writes = self.background_writes.clone();
         let disk_pool_guard = disk_pool.pool_guard();
         let mut max_row_id = self.root().pivot_row_id;
@@ -659,7 +623,7 @@ impl MutableTableFile {
         for block in lwc_blocks {
             let start_row_id = block.shape.start_row_id();
             let end_row_id = block.shape.end_row_id();
-            let block_id = self.new_root_mut().try_allocate_block_id().ok_or_else(|| {
+            let block_id = self.new_root.try_allocate_block_id().ok_or_else(|| {
                 Error::from(
                     Report::new(ResourceError::StorageFileCapacityExceeded)
                         .attach("table file could not allocate LWC block"),
@@ -696,7 +660,7 @@ impl MutableTableFile {
         let new_root = column_index
             .batch_insert(self, &new_entries, max_row_id, ts)
             .await?;
-        let root = self.new_root_mut();
+        let root = &mut self.new_root.root;
         root.column_block_index_root = new_root;
         root.pivot_row_id = max_row_id;
         root.heap_redo_start_ts = heap_redo_start_ts;
@@ -704,24 +668,18 @@ impl MutableTableFile {
     }
 
     #[inline]
-    pub fn try_delete(mut self) -> bool {
-        let table_file = self
-            .file
-            .take()
-            .expect("mutable table file has been consumed");
-        self.release_mutable_claim_with_file(&table_file);
+    pub fn try_delete(self) -> bool {
+        let MutableTableFile {
+            file: table_file,
+            writer_claim,
+            ..
+        } = self;
+        drop(writer_claim);
         if let Some(table_file) = Arc::into_inner(table_file) {
             table_file.file.delete();
             return true;
         }
         false
-    }
-}
-
-impl Drop for MutableTableFile {
-    #[inline]
-    fn drop(&mut self) {
-        self.release_mutable_claim();
     }
 }
 

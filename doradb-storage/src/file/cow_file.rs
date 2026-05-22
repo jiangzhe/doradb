@@ -42,6 +42,35 @@ pub(crate) trait MutableCowFile {
     ) -> impl Future<Output = Result<()>> + Send;
 }
 
+/// File wrapper that can own one mutable CoW writer claim.
+pub(crate) trait MutableWriterFile {
+    fn claim_mutable_writer(&self);
+    fn release_mutable_writer(&self);
+}
+
+/// RAII guard for exclusive mutable CoW file access.
+pub(crate) struct MutableWriterClaim<F: MutableWriterFile> {
+    file: Arc<F>,
+}
+
+impl<F: MutableWriterFile> MutableWriterClaim<F> {
+    /// Claim exclusive mutable access for the lifetime of this guard.
+    #[inline]
+    pub(crate) fn new(file: &Arc<F>) -> Self {
+        file.claim_mutable_writer();
+        Self {
+            file: Arc::clone(file),
+        }
+    }
+}
+
+impl<F: MutableWriterFile> Drop for MutableWriterClaim<F> {
+    #[inline]
+    fn drop(&mut self) {
+        self.file.release_mutable_writer();
+    }
+}
+
 /// Shared in-memory active root for copy-on-write files.
 ///
 /// `ActiveRoot<M>` stores generic CoW bookkeeping (`slot_no`, `meta_block_id`,
@@ -63,11 +92,6 @@ pub struct ActiveRoot<M> {
     /// the durable root timestamp, while newly published runtime roots install
     /// a post-publish fence after the active-root pointer swap.
     effective_ts: AtomicU64,
-    /// Blocks allocated by this unpublished mutable root.
-    ///
-    /// This set is intentionally not persisted. It prevents rollback from
-    /// clearing allocation bits inherited from the published root snapshot.
-    newly_allocated_ids: BTreeSet<BlockID>,
 }
 
 impl<M: Clone> Clone for ActiveRoot<M> {
@@ -80,7 +104,6 @@ impl<M: Clone> Clone for ActiveRoot<M> {
             alloc_map: self.alloc_map.clone(),
             meta: self.meta.clone(),
             effective_ts: AtomicU64::new(self.effective_ts()),
-            newly_allocated_ids: self.newly_allocated_ids.clone(),
         }
     }
 }
@@ -102,7 +125,6 @@ impl<M> ActiveRoot<M> {
             alloc_map,
             meta,
             effective_ts: AtomicU64::new(trx_id),
-            newly_allocated_ids: BTreeSet::new(),
         }
     }
 
@@ -115,7 +137,6 @@ impl<M> ActiveRoot<M> {
         let mut new = self.clone();
         new.slot_no = 1 - self.slot_no;
         new.effective_ts.store(MAX_SNAPSHOT_TS, Ordering::Relaxed);
-        new.newly_allocated_ids.clear();
         new
     }
 
@@ -137,6 +158,35 @@ impl<M> ActiveRoot<M> {
         debug_assert!(effective_ts < MAX_SNAPSHOT_TS);
         self.effective_ts.store(effective_ts, Ordering::Release);
     }
+}
+
+/// Mutable CoW root plus block ids allocated before the root is published.
+///
+/// `unpublished_blocks` is intentionally not persisted. It prevents rollback
+/// from clearing allocation bits inherited from the published root snapshot.
+pub(crate) struct MutableCowRoot<M> {
+    pub(super) root: ActiveRoot<M>,
+    pub(super) unpublished_blocks: BTreeSet<BlockID>,
+}
+
+impl<M> MutableCowRoot<M> {
+    /// Build a mutable CoW root from an already prepared root snapshot.
+    #[inline]
+    pub(crate) fn from_root(root: ActiveRoot<M>) -> Self {
+        Self {
+            root,
+            unpublished_blocks: BTreeSet::new(),
+        }
+    }
+
+    /// Fork a published active root into a mutable unpublished root.
+    #[inline]
+    pub(crate) fn fork(active_root: &ActiveRoot<M>) -> Self
+    where
+        M: Clone,
+    {
+        Self::from_root(active_root.flip())
+    }
 
     /// Replace the allocation map with one built from root-reachable blocks.
     ///
@@ -146,8 +196,8 @@ impl<M> ActiveRoot<M> {
         &mut self,
         reachable: &BTreeSet<BlockID>,
     ) -> Result<usize> {
-        let old_allocated = self.alloc_map.allocated();
-        let rebuilt = AllocMap::new(self.alloc_map.len());
+        let old_allocated = self.root.alloc_map.allocated();
+        let rebuilt = AllocMap::new(self.root.alloc_map.len());
         assert!(rebuilt.allocate_at(usize::from(SUPER_BLOCK_ID)));
         for block_id in reachable {
             let idx = usize::from(*block_id);
@@ -164,10 +214,22 @@ impl<M> ActiveRoot<M> {
                 debug_assert!(allocated);
             }
         }
+        let meta_block_idx = usize::from(self.root.meta_block_id);
+        if meta_block_idx >= rebuilt.len() {
+            return Err(Report::new(InternalError::CowFileAllocationInvariant)
+                .attach(format!(
+                    "meta block id exceeds allocation map: block_id={}, alloc_map_len={}",
+                    self.root.meta_block_id,
+                    rebuilt.len()
+                ))
+                .into());
+        }
+        let _ = rebuilt.allocate_at(meta_block_idx);
         let new_allocated = rebuilt.allocated();
-        self.alloc_map = rebuilt;
-        self.newly_allocated_ids
-            .retain(|block_id| reachable.contains(block_id));
+        self.root.alloc_map = rebuilt;
+        self.unpublished_blocks.retain(|block_id| {
+            *block_id == self.root.meta_block_id || reachable.contains(block_id)
+        });
         Ok(old_allocated.saturating_sub(new_allocated))
     }
 
@@ -175,9 +237,9 @@ impl<M> ActiveRoot<M> {
     ///
     /// Returns `None` when the allocation bitmap cannot provide a new page.
     #[inline]
-    pub fn try_allocate_block_id(&mut self) -> Option<BlockID> {
-        let block_id = self.alloc_map.try_allocate().map(BlockID::from)?;
-        self.newly_allocated_ids.insert(block_id);
+    pub(crate) fn try_allocate_block_id(&mut self) -> Option<BlockID> {
+        let block_id = self.root.alloc_map.try_allocate().map(BlockID::from)?;
+        self.unpublished_blocks.insert(block_id);
         Some(block_id)
     }
 
@@ -188,7 +250,7 @@ impl<M> ActiveRoot<M> {
     /// allocation bit keeps the future published root from marking an abandoned
     /// block as live.
     #[inline]
-    pub fn rollback_allocated_block_id(&mut self, block_id: BlockID) -> Result<()> {
+    pub(crate) fn rollback_allocated_block_id(&mut self, block_id: BlockID) -> Result<()> {
         if block_id == SUPER_BLOCK_ID {
             return Err(Report::new(InternalError::CowFileAllocationInvariant)
                 .attach(format!("cannot roll back super block id {block_id}"))
@@ -200,34 +262,28 @@ impl<M> ActiveRoot<M> {
                     .attach(format!("block_id={block_id}")),
             )
         })?;
-        if idx >= self.alloc_map.len() {
+        if idx >= self.root.alloc_map.len() {
             return Err(Report::new(InternalError::CowFileAllocationInvariant)
                 .attach(format!(
                     "block_id={block_id}, alloc_map_len={}",
-                    self.alloc_map.len()
+                    self.root.alloc_map.len()
                 ))
                 .into());
         }
-        if !self.newly_allocated_ids.contains(&block_id) {
+        if !self.unpublished_blocks.contains(&block_id) {
             return Err(Report::new(InternalError::CowFileAllocationInvariant)
                 .attach(format!(
                     "block_id={block_id} was not allocated by this mutable root"
                 ))
                 .into());
         }
-        if !self.alloc_map.deallocate(idx) {
+        if !self.root.alloc_map.deallocate(idx) {
             return Err(Report::new(InternalError::CowFileAllocationInvariant)
                 .attach(format!("block_id={block_id} allocation bit was not set"))
                 .into());
         }
-        self.newly_allocated_ids.remove(&block_id);
+        self.unpublished_blocks.remove(&block_id);
         Ok(())
-    }
-
-    /// Drop unpublished allocation ownership markers before publishing a root.
-    #[inline]
-    fn clear_newly_allocated_ids(&mut self) {
-        self.newly_allocated_ids.clear();
     }
 }
 
@@ -501,9 +557,11 @@ impl<M> CowFile<M> {
     pub(crate) async fn publish_root(
         &self,
         background_writes: &IOClient<BackgroundWriteRequest>,
-        mut new_root: ActiveRoot<M>,
+        mut new_root: MutableCowRoot<M>,
     ) -> Result<Option<OldCowRoot<M>>> {
-        new_root.block_reclamation_until_effective_ts_installed();
+        new_root
+            .root
+            .block_reclamation_until_effective_ts_installed();
         let new_meta_block_id = match new_root.try_allocate_block_id() {
             Some(block_id) => block_id,
             None => {
@@ -512,20 +570,19 @@ impl<M> CowFile<M> {
                     .into());
             }
         };
-        new_root.meta_block_id = new_meta_block_id;
+        new_root.root.meta_block_id = new_meta_block_id;
 
-        let meta_buf = (self.codec.build_meta_block)(&new_root)?;
+        let meta_buf = (self.codec.build_meta_block)(&new_root.root)?;
         self.write_block(background_writes, new_meta_block_id, meta_buf)
             .await?;
 
-        let super_buf = (self.codec.build_super_block)(&new_root)?;
-        let offset = new_root.slot_no as usize * super_buf.capacity();
+        let super_buf = (self.codec.build_super_block)(&new_root.root)?;
+        let offset = new_root.root.slot_no as usize * super_buf.capacity();
         self.write_at_offset(background_writes, offset, super_buf)
             .await?;
 
         self.fsync()?;
-        new_root.clear_newly_allocated_ids();
-        Ok(self.swap_active_root(new_root))
+        Ok(self.swap_active_root(new_root.root))
     }
 
     /// Force all pending writes to disk.
@@ -658,10 +715,73 @@ fn remove_file_by_fd(fd: RawFd) -> std::io::Result<()> {
 
 #[cfg(test)]
 pub(crate) mod tests {
+    use super::{ActiveRoot, BlockID, MutableCowRoot, SUPER_BLOCK_ID};
+    use crate::bitmap::AllocMap;
+    use crate::error::InternalError;
+    use std::collections::BTreeSet;
     use std::collections::HashMap;
     use std::sync::{Mutex, OnceLock};
 
     static OLD_ROOT_DROPS: OnceLock<Mutex<HashMap<usize, usize>>> = OnceLock::new();
+
+    #[test]
+    fn rebuild_alloc_map_keeps_current_meta_block_allocated() {
+        let alloc_map = AllocMap::new(16);
+        assert!(alloc_map.allocate_at(usize::from(SUPER_BLOCK_ID)));
+        assert!(alloc_map.allocate_at(usize::from(BlockID::new(2))));
+        assert!(alloc_map.allocate_at(usize::from(BlockID::new(3))));
+        assert!(alloc_map.allocate_at(usize::from(BlockID::new(7))));
+
+        let mut root =
+            MutableCowRoot::from_root(ActiveRoot::from_parts(0, 1, BlockID::new(7), alloc_map, ()));
+        root.unpublished_blocks.insert(BlockID::new(3));
+        root.unpublished_blocks.insert(BlockID::new(7));
+
+        let reachable = BTreeSet::from([BlockID::new(2)]);
+        let reclaimed = root.rebuild_alloc_map_from_reachable(&reachable).unwrap();
+
+        assert_eq!(reclaimed, 1);
+        assert!(
+            root.root
+                .alloc_map
+                .is_allocated(usize::from(SUPER_BLOCK_ID))
+        );
+        assert!(
+            root.root
+                .alloc_map
+                .is_allocated(usize::from(BlockID::new(2)))
+        );
+        assert!(
+            !root
+                .root
+                .alloc_map
+                .is_allocated(usize::from(BlockID::new(3)))
+        );
+        assert!(
+            root.root
+                .alloc_map
+                .is_allocated(usize::from(BlockID::new(7)))
+        );
+        assert!(!root.unpublished_blocks.contains(&BlockID::new(3)));
+        assert!(root.unpublished_blocks.contains(&BlockID::new(7)));
+    }
+
+    #[test]
+    fn rebuild_alloc_map_rejects_out_of_range_meta_block_id() {
+        let alloc_map = AllocMap::new(8);
+        assert!(alloc_map.allocate_at(usize::from(SUPER_BLOCK_ID)));
+
+        let mut root =
+            MutableCowRoot::from_root(ActiveRoot::from_parts(0, 1, BlockID::new(8), alloc_map, ()));
+        let err = root
+            .rebuild_alloc_map_from_reachable(&BTreeSet::new())
+            .unwrap_err();
+
+        assert_eq!(
+            err.report().downcast_ref::<InternalError>().copied(),
+            Some(InternalError::CowFileAllocationInvariant)
+        );
+    }
 
     #[inline]
     fn old_root_drops() -> &'static Mutex<HashMap<usize, usize>> {
