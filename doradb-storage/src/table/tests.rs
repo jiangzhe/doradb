@@ -5644,6 +5644,7 @@ fn test_checkpoint_cancelled_when_table_dropping() {
         let mut session = sys.try_new_session().unwrap();
         let root_before = sys.table.file().active_root_unchecked().clone();
 
+        wait_checkpoint_ready(&sys.table, &session).await;
         sys.table.begin_drop_lifecycle().await.unwrap();
         let outcome = sys.table.checkpoint(&mut session).await.unwrap();
         assert_eq!(
@@ -8485,6 +8486,8 @@ fn test_checkpoint_cancelled_while_table_metadata_change_active() {
     smol::block_on(async {
         let sys = TestSys::new_lightweight_evictable().await;
         let mut checkpoint_session = sys.engine.try_new_session().unwrap();
+
+        wait_checkpoint_ready(&sys.table, &checkpoint_session).await;
         let _metadata_lease = sys.table.begin_metadata_change().await.unwrap();
 
         let outcome = sys
