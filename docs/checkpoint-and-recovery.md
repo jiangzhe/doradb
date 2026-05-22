@@ -71,8 +71,8 @@ Instead:
 
 - checkpointed cold secondary-index state is loaded from the `DiskTree` roots in
   the table checkpoint
-- hot secondary-index state is rebuilt through normal redo replay of hot row
-  operations
+- hot secondary-index state is rebuilt after redo by scanning recovered hot
+  RowStore pages
 - stale cold entries are shadowed at runtime by `MemIndex` and deletion-buffer
   state until the next table checkpoint publishes updated `DiskTree` roots
 
@@ -242,8 +242,9 @@ For each redo record after the coarse replay floor:
 - Heap / hot RowStore:
   - replay if the row belongs to hot RowStore and
     `CTS >= Heap_Redo_Start_TS`
-  - row replay also rebuilds hot secondary-index `MemIndex` state through the
-    normal row/index update logic
+  - row replay reconstructs hot RowStore pages only; after log replay,
+    `recover_indexes_and_refresh_pages` scans those pages to rebuild hot
+    secondary-index `MemIndex` state
 - Cold-row deletions:
   - replay if `row_id < pivot_row_id` and
     `cts >= deletion_cutoff_ts`

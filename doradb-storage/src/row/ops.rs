@@ -337,23 +337,3 @@ impl DeleteMvcc {
         matches!(self, DeleteMvcc::NotFound)
     }
 }
-
-pub enum Recover {
-    Ok,
-    NoSpace,
-    NotFound,
-    AlreadyDeleted,
-}
-
-impl Recover {
-    #[inline]
-    pub fn is_ok(&self) -> bool {
-        matches!(self, Recover::Ok)
-    }
-}
-
-pub enum RecoverIndex {
-    Ok,
-    InsertOutdated,
-    DeleteOutdated,
-}

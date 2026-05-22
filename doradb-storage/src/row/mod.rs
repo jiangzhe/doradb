@@ -1580,19 +1580,17 @@ impl RowMutExclusive<'_> {
 
     /// Finish row replace.
     #[inline]
-    pub fn finish_insert(self) -> Recover {
+    pub fn finish_insert(self) {
         debug_assert!(self.var_offset == self.var_end);
         let res = self.page.set_deleted(self.row_idx, false);
         debug_assert!(res);
         // new row does not count to approx_deleted.
-        Recover::Ok
     }
 
     #[inline]
-    pub fn finish_update(self) -> Recover {
+    pub fn finish_update(self) {
         debug_assert!(self.var_offset == self.var_end);
         debug_assert!(!self.page.is_deleted(self.row_idx));
-        Recover::Ok
     }
 }
 
