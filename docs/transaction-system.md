@@ -321,9 +321,9 @@ Heap persistence relies on the **Tuple Mover** and the durability of the commit 
 4. **Replay Commit Log**:
    - **Heap Redo**: Start scanning from `Heap_Redo_Start_TS`. Reconstruct the in-memory RowStore pages by replaying insert/update logs.
    - **Deletion Buffer Redo**: Rebuild the **ColumnDeletionBuffer** from logs to restore post-checkpoint deletion states for columnar data.
-   - **Secondary Index Redo**: Hot row redo rebuilds the corresponding `MemIndex`
-     entries through the normal row/index update logic. No index-specific replay
-     watermark is needed.
+   - **Secondary Index Rebuild**: After redo reaches log end, scan recovered
+     hot RowStore pages to rebuild the corresponding `MemIndex` entries. No
+     index-specific replay watermark is needed.
 5. **Completion**: The system is open for service once memory structures are rebuilt. `DiskTree` already contains checkpointed cold index state and `MemIndex` contains post-checkpoint hot state.
 
 ### Garbage Collection (GC)

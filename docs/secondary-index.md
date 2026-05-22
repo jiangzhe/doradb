@@ -693,7 +693,8 @@ Recovery then replays redo as usual:
 - hot heap redo is replayed from `heap_redo_start_ts`
 - cold-row deletions with `row_id < pivot_row_id` and
   `cts >= deletion_cutoff_ts` are replayed into the in-memory deletion buffer
-- row replay rebuilds hot `MemIndex` state through the normal index update logic
+- after redo reaches log end, recovered hot RowStore pages are scanned to
+  rebuild hot `MemIndex` state
 
 There is no separate index replay start timestamp.
 

@@ -1,6 +1,7 @@
 use super::{DeleteInternal, FrozenPage, InsertRowIntoPage, UpdateRowInplace};
 use crate::buffer::BufferPool;
 use crate::buffer::frame::FrameKind;
+use crate::buffer::guard::PageGuard;
 use crate::buffer::page::{PAGE_SIZE, PageID};
 use crate::buffer::{EvictableBufferPool, PoolGuard, PoolGuards, PoolRole, test_frame_kind};
 use crate::catalog::tests::table4;
@@ -34,7 +35,7 @@ use crate::row::{RowID, RowPage, RowRead};
 use crate::session::Session;
 use crate::table::{
     CheckpointCancelReason, CheckpointOutcome, CheckpointReadiness, DeleteMarker, Table,
-    TableLifecycleState, TablePersistence, TableRecover, TableRuntimeLayout,
+    TableLifecycleState, TablePersistence, TableRuntimeLayout,
 };
 use crate::trx::redo::DDLRedo;
 use crate::trx::row::LockRowForWrite;
@@ -43,7 +44,7 @@ use crate::trx::stmt::tests as stmt_tests;
 use crate::trx::tests as trx_tests;
 use crate::trx::undo::RowUndoKind;
 use crate::trx::ver_map::RowPageState;
-use crate::trx::{ActiveTrx, MAX_SNAPSHOT_TS, MIN_SNAPSHOT_TS, TrxID};
+use crate::trx::{ActiveTrx, MAX_SNAPSHOT_TS, TrxID};
 use crate::value::{Val, ValKind};
 use error_stack::Report;
 use std::cell::{Cell, RefCell};
@@ -579,30 +580,6 @@ fn test_find_row_returns_resolved_lwc_page_location() {
             RowLocation::NotFound => panic!("row should exist"),
         }
         trx.commit().await.unwrap();
-    });
-}
-
-#[test]
-fn test_find_recover_cts_for_lwc_row_returns_min_snapshot_ts() {
-    smol::block_on(async {
-        let sys = TestSys::new_evictable().await;
-        let mut session = sys.try_new_session().unwrap();
-        insert_rows(&sys, &mut session, 0, 10, "name").await;
-        sys.table.freeze(&session, usize::MAX).await.unwrap();
-        checkpoint_published(&sys.table, &mut session).await;
-
-        let key = single_key(1i32);
-        let trx = session.try_begin_trx().unwrap().unwrap();
-        let row_id = assert_row_in_lwc(&sys.table, session.pool_guards(), &key, trx.sts()).await;
-        trx.commit().await.unwrap();
-
-        assert_eq!(
-            sys.table
-                .find_recover_cts_for_row_id(session.pool_guards(), row_id)
-                .await
-                .unwrap(),
-            Some(MIN_SNAPSHOT_TS)
-        );
     });
 }
 
@@ -3737,29 +3714,129 @@ fn test_recover_cold_delete_rejects_already_deleted_with_different_cts() {
         assert!(row_id < active_root.pivot_row_id);
         let cts = active_root.deletion_cutoff_ts;
         sys.table
-            .recover_row_delete(session.pool_guards(), PageID::from(0u64), row_id, cts, true)
+            .recover_row_delete(session.pool_guards(), PageID::from(0u64), row_id, cts)
             .await
             .unwrap();
         sys.table
-            .recover_row_delete(session.pool_guards(), PageID::from(0u64), row_id, cts, true)
+            .recover_row_delete(session.pool_guards(), PageID::from(0u64), row_id, cts)
             .await
             .unwrap();
 
         let err = sys
             .table
-            .recover_row_delete(
-                session.pool_guards(),
-                PageID::from(0u64),
-                row_id,
-                cts + 1,
-                true,
-            )
+            .recover_row_delete(session.pool_guards(), PageID::from(0u64), row_id, cts + 1)
             .await
             .unwrap_err();
         assert_eq!(
             err.report().downcast_ref::<DataIntegrityError>().copied(),
             Some(DataIntegrityError::InvalidRootInvariant)
         );
+    });
+}
+
+#[test]
+fn test_recover_row_page_reports_invalid_replay_state() {
+    smol::block_on(async {
+        let sys = TestSys::new_evictable().await;
+        let session = sys.try_new_session().unwrap();
+        let metadata = sys.table.metadata();
+        let mut page_guard = sys
+            .table
+            .mem
+            .get_insert_page_exclusive(session.pool_guards(), 2, None)
+            .await
+            .unwrap();
+        let row_id = page_guard.page().header.start_row_id;
+        let assert_invalid_root = |err: Error, reason: &str| {
+            let report = format!("{err:?}");
+            assert_eq!(
+                err.data_integrity_error(),
+                Some(DataIntegrityError::InvalidRootInvariant),
+                "{report}"
+            );
+            assert!(report.contains(reason), "{report}");
+            assert!(report.contains("recover row"), "{report}");
+        };
+
+        let err = sys
+            .table
+            .recover_row_insert_to_page(
+                metadata.as_ref(),
+                &mut page_guard,
+                row_id,
+                &[Val::from(1i32), Val::from("name")],
+                10,
+            )
+            .unwrap_err();
+        assert_invalid_root(err, "missing recover map");
+
+        page_guard.bf_mut().init_recover_map(10);
+        let err = sys
+            .table
+            .recover_row_insert_to_page(
+                metadata.as_ref(),
+                &mut page_guard,
+                row_id,
+                &[Val::from(1i32), Val::from(vec![b'x'; PAGE_SIZE - 1])],
+                11,
+            )
+            .unwrap_err();
+        assert_invalid_root(err, "insufficient row page space");
+
+        sys.table
+            .recover_row_insert_to_page(
+                metadata.as_ref(),
+                &mut page_guard,
+                row_id,
+                &[Val::from(1i32), Val::from("name")],
+                12,
+            )
+            .unwrap();
+        assert_eq!(page_guard.page().header.approx_non_deleted(), 1);
+
+        let err = sys
+            .table
+            .recover_row_insert_to_page(
+                metadata.as_ref(),
+                &mut page_guard,
+                row_id,
+                &[Val::from(2i32), Val::from("other")],
+                13,
+            )
+            .unwrap_err();
+        assert_invalid_root(err, "row slot is not vacant");
+
+        let err = sys
+            .table
+            .recover_row_update_to_page(
+                metadata.as_ref(),
+                &mut page_guard,
+                row_id + 1,
+                &[UpdateCol {
+                    idx: 1,
+                    val: Val::from("new"),
+                }],
+                14,
+            )
+            .unwrap_err();
+        assert_invalid_root(err, "row is deleted");
+
+        sys.table
+            .recover_row_delete_to_page(&mut page_guard, row_id, 15)
+            .unwrap();
+        assert_eq!(page_guard.page().header.approx_non_deleted(), 0);
+
+        let err = sys
+            .table
+            .recover_row_delete_to_page(&mut page_guard, row_id, 16)
+            .unwrap_err();
+        assert_invalid_root(err, "row is already deleted");
+
+        let err = sys
+            .table
+            .recover_row_delete_to_page(&mut page_guard, row_id + 2, 17)
+            .unwrap_err();
+        assert_invalid_root(err, "row id outside page range");
     });
 }
 
@@ -5567,6 +5644,7 @@ fn test_checkpoint_cancelled_when_table_dropping() {
         let mut session = sys.try_new_session().unwrap();
         let root_before = sys.table.file().active_root_unchecked().clone();
 
+        wait_checkpoint_ready(&sys.table, &session).await;
         sys.table.begin_drop_lifecycle().await.unwrap();
         let outcome = sys.table.checkpoint(&mut session).await.unwrap();
         assert_eq!(
@@ -6316,6 +6394,7 @@ fn test_checkpoint_publish_write_failure_poisons_storage() {
         let sys = TestSys::new_lightweight_evictable().await;
         let mut session = sys.try_new_session().unwrap();
         let root_before = sys.table.file().active_root_unchecked().clone();
+        wait_checkpoint_ready(&sys.table, &session).await;
         let hook = Arc::new(FailingFirstWriteHook::new());
         let _install = install_storage_backend_test_hook(hook.clone());
 
@@ -6333,6 +6412,7 @@ fn test_checkpoint_post_publication_failure_poisons_storage() {
         let sys = TestSys::new_lightweight_evictable().await;
         let mut session = sys.try_new_session().unwrap();
         let root_before = sys.table.file().active_root_unchecked().clone();
+        wait_checkpoint_ready(&sys.table, &session).await;
 
         set_test_force_post_publish_checkpoint_error(true);
         let res = sys.table.checkpoint(&mut session).await;
@@ -8073,6 +8153,23 @@ async fn wait_gc_cutoff_after(session: &Session, ts: TrxID) {
     panic!("GC cutoff did not advance past {ts}");
 }
 
+async fn wait_checkpoint_ready(table: &Table, session: &Session) {
+    let mut last_delay = None;
+    for _ in 0..50 {
+        match table.checkpoint_readiness(session) {
+            CheckpointReadiness::Ready => return,
+            CheckpointReadiness::Delayed { reason } => {
+                last_delay = Some(reason);
+                smol::Timer::after(Duration::from_millis(20)).await;
+            }
+        }
+    }
+    panic!(
+        "checkpoint readiness stayed delayed after retries by {:?}",
+        last_delay.unwrap()
+    );
+}
+
 async fn wait_path_exists(path: &str, expected: bool) {
     for _ in 0..250 {
         if std::path::Path::new(path).exists() == expected {
@@ -8389,6 +8486,8 @@ fn test_checkpoint_cancelled_while_table_metadata_change_active() {
     smol::block_on(async {
         let sys = TestSys::new_lightweight_evictable().await;
         let mut checkpoint_session = sys.engine.try_new_session().unwrap();
+
+        wait_checkpoint_ready(&sys.table, &checkpoint_session).await;
         let _metadata_lease = sys.table.begin_metadata_change().await.unwrap();
 
         let outcome = sys

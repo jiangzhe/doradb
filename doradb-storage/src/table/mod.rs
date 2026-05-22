@@ -26,7 +26,6 @@ pub(crate) use mem_table::GenericMemTable;
 #[cfg(test)]
 pub(crate) use mem_table::build_in_memory_secondary_indexes;
 pub use persistence::*;
-pub use recover::*;
 pub(crate) use rollback::IndexRollback;
 pub use storage::ColumnStorage;
 #[cfg(test)]
@@ -36,26 +35,22 @@ use crate::buffer::guard::{PageExclusiveGuard, PageGuard, PageSharedGuard};
 use crate::buffer::page::PageID;
 use crate::buffer::{EvictableBufferPool, PoolGuard, PoolGuards, PoolRole, ReadonlyBufferPool};
 use crate::catalog::{IndexSpec, TableID, TableMetadata};
-use crate::error::{Error, InternalError, Result};
+use crate::error::{DataIntegrityError, Error, InternalError, Result};
 use crate::file::BlockID;
 use crate::file::table_file::{ActiveRoot, LwcBlockPersist, TableFile};
-use crate::index::util::Maskable;
 use crate::index::{
-    BlockIndex, ColumnBlockEntryShape, IndexCompareExchange, IndexInsert, NonUniqueIndex,
-    NonUniqueMemIndex, RowLocation, SecondaryDiskTreeRuntime, SecondaryIndex, UniqueIndex,
-    UniqueMemIndex,
+    BlockIndex, ColumnBlockEntryShape, NonUniqueMemIndex, RowLocation, SecondaryDiskTreeRuntime,
+    SecondaryIndex, UniqueMemIndex,
 };
 use crate::lwc::LwcBuilder;
 use crate::quiescent::QuiescentGuard;
-use crate::row::ops::{Recover, RecoverIndex, SelectKey, UpdateCol};
+use crate::row::ops::{SelectKey, UpdateCol};
 use crate::row::{RowID, RowPage, RowRead, var_len_for_insert};
 use crate::trx::row::RowReadAccess;
 use crate::trx::sys::TransactionSystem;
 use crate::trx::undo::{IndexBranch, RowUndoKind, UndoStatus};
 use crate::trx::ver_map::RowPageState;
-use crate::trx::{
-    MAX_SNAPSHOT_TS, MIN_SNAPSHOT_TS, TrxContext, TrxID, TrxReadProof, trx_is_committed,
-};
+use crate::trx::{MAX_SNAPSHOT_TS, TrxContext, TrxID, TrxReadProof, trx_is_committed};
 use crate::value::{PAGE_VAR_LEN_INLINE, Val};
 use error_stack::Report;
 use parking_lot::Mutex;
@@ -809,79 +804,72 @@ impl Table {
         row_id: RowID,
         cols: &[Val],
         cts: TrxID,
-    ) -> Recover {
+    ) -> Result<()> {
+        let page_id = page_guard.page_id();
         let (ctx, page) = page_guard.ctx_and_page_mut();
         debug_assert!(metadata.col.col_count() == page.header.col_count as usize);
         debug_assert!(cols.len() == page.header.col_count as usize);
+        if !page.row_id_in_valid_range(row_id) {
+            return Err(recovery_page_invariant_error(
+                "insert",
+                page_id,
+                row_id,
+                cts,
+                "row id outside page range",
+            ));
+        }
         let row_idx = page.row_idx(row_id);
-        // Insert log should always be located to an empty slot.
-        debug_assert!(ctx.recover().unwrap().is_vacant(row_idx));
+        if !ctx
+            .recover()
+            .ok_or_else(|| {
+                recovery_page_invariant_error("insert", page_id, row_id, cts, "missing recover map")
+            })?
+            .is_vacant(row_idx)
+        {
+            return Err(recovery_page_invariant_error(
+                "insert",
+                page_id,
+                row_id,
+                cts,
+                "row slot is not vacant",
+            ));
+        }
         let var_len = var_len_for_insert(metadata.col.as_ref(), cols);
         let (var_offset, var_end) = if let Some(var_offset) = page.request_free_space(var_len) {
             (var_offset, var_offset + var_len)
         } else {
-            return Recover::NoSpace;
+            return Err(recovery_page_invariant_error(
+                "insert",
+                page_id,
+                row_id,
+                cts,
+                "insufficient row page space",
+            ));
         };
         // update count field to include current row id.
         page.update_count_to_include_row_id(row_id);
         // insert CTS.
-        ctx.recover_mut().unwrap().insert_at(row_idx, cts);
+        ctx.recover_mut()
+            .ok_or_else(|| {
+                recovery_page_invariant_error("insert", page_id, row_id, cts, "missing recover map")
+            })?
+            .insert_at(row_idx, cts);
         let row_idx = page.row_idx(row_id);
         let mut row = page.row_mut_exclusive(row_idx, var_offset, var_end);
-        debug_assert!(row.is_deleted()); // before recovery, this row should be initialized as deleted.
+        if !row.is_deleted() {
+            return Err(recovery_page_invariant_error(
+                "insert",
+                page_id,
+                row_id,
+                cts,
+                "row slot is not deleted",
+            ));
+        }
         for (user_col_idx, user_col) in cols.iter().enumerate() {
             row.update_col(metadata.col.as_ref(), user_col_idx, user_col, false);
         }
-        row.finish_insert()
-    }
-
-    #[inline]
-    async fn recover_index_insert(
-        &self,
-        layout: &TableRuntimeLayout,
-        guards: &PoolGuards,
-        key: SelectKey,
-        row_id: RowID,
-        cts: TrxID,
-    ) -> Result<RecoverIndex> {
-        let index = layout.secondary_index(key.index_no)?;
-        let index_unique = layout
-            .metadata()
-            .idx
-            .require_index_spec(key.index_no)?
-            .unique();
-        debug_assert_eq!(index.is_unique(), index_unique);
-        if index_unique {
-            self.recover_unique_index_insert(index.unique_mem()?, guards, key, row_id, cts)
-                .await
-        } else {
-            self.recover_non_unique_index_insert(index.non_unique_mem()?, guards, key, row_id)
-                .await
-        }
-    }
-
-    #[inline]
-    async fn recover_index_delete(
-        &self,
-        layout: &TableRuntimeLayout,
-        guards: &PoolGuards,
-        key: SelectKey,
-        row_id: RowID,
-    ) -> Result<RecoverIndex> {
-        let index = layout.secondary_index(key.index_no)?;
-        let index_unique = layout
-            .metadata()
-            .idx
-            .require_index_spec(key.index_no)?
-            .unique();
-        debug_assert_eq!(index.is_unique(), index_unique);
-        if index_unique {
-            self.recover_unique_index_delete(index.unique_mem()?, guards, key, row_id)
-                .await
-        } else {
-            self.recover_non_unique_index_delete(index.non_unique_mem()?, guards, key, row_id)
-                .await
-        }
+        row.finish_insert();
+        Ok(())
     }
 
     #[inline]
@@ -892,8 +880,8 @@ impl Table {
         row_id: RowID,
         cols: &[UpdateCol],
         cts: TrxID,
-        index_change_cols: Option<&mut HashMap<usize, Val>>,
-    ) -> Recover {
+    ) -> Result<()> {
+        let page_id = page_guard.page_id();
         let (ctx, page) = page_guard.ctx_and_page_mut();
         // column indexes must be in range
         debug_assert!(
@@ -915,217 +903,123 @@ impl Table {
             "update columns should be in order"
         );
         if !page.row_id_in_valid_range(row_id) {
-            return Recover::NotFound;
+            return Err(recovery_page_invariant_error(
+                "update",
+                page_id,
+                row_id,
+                cts,
+                "row id outside page range",
+            ));
         }
         let row_idx = page.row_idx(row_id);
         if page.row(row_idx).is_deleted() {
-            return Recover::AlreadyDeleted;
+            return Err(recovery_page_invariant_error(
+                "update",
+                page_id,
+                row_id,
+                cts,
+                "row is deleted",
+            ));
         }
         let var_len = page.var_len_for_update(row_idx, cols);
         let (var_offset, var_end) = if let Some(var_offset) = page.request_free_space(var_len) {
             (var_offset, var_offset + var_len)
         } else {
-            return Recover::NoSpace;
+            return Err(recovery_page_invariant_error(
+                "update",
+                page_id,
+                row_id,
+                cts,
+                "insufficient row page space",
+            ));
         };
+        if ctx
+            .recover()
+            .ok_or_else(|| {
+                recovery_page_invariant_error("update", page_id, row_id, cts, "missing recover map")
+            })?
+            .at(row_idx)
+            .is_none()
+        {
+            return Err(recovery_page_invariant_error(
+                "update",
+                page_id,
+                row_id,
+                cts,
+                "missing recover CTS",
+            ));
+        }
         // update CTS.
-        ctx.recover_mut().unwrap().update_at(row_idx, cts);
+        ctx.recover_mut()
+            .ok_or_else(|| {
+                recovery_page_invariant_error("update", page_id, row_id, cts, "missing recover map")
+            })?
+            .update_at(row_idx, cts);
         let mut row = page.row_mut_exclusive(row_idx, var_offset, var_end);
         debug_assert_eq!(row_id, row.row_id());
 
-        let disable_index = index_change_cols.is_none();
-        if disable_index {
-            for uc in cols {
-                row.update_col(metadata.col.as_ref(), uc.idx, &uc.val, true);
-            }
-            row.finish_update()
-        } else {
-            // collect index change columns.
-            let index_change_cols = index_change_cols.unwrap();
-            for uc in cols {
-                if let Some((old_val, _)) = row.different(metadata.col.as_ref(), uc.idx, &uc.val) {
-                    // we also check whether the value change is related to any index,
-                    // so we can update index later.
-                    if metadata.idx.index_columns().contains(&uc.idx) {
-                        index_change_cols.insert(uc.idx, old_val);
-                    }
-                    // actual update
-                    row.update_col(metadata.col.as_ref(), uc.idx, &uc.val, true);
-                }
-            }
-            row.finish_update()
+        for uc in cols {
+            row.update_col(metadata.col.as_ref(), uc.idx, &uc.val, true);
         }
+        row.finish_update();
+        Ok(())
     }
 
     #[inline]
     fn recover_row_delete_to_page(
         &self,
-        metadata: &TableMetadata,
         page_guard: &mut PageExclusiveGuard<RowPage>,
         row_id: RowID,
         cts: TrxID,
-        cols: Option<&mut HashMap<usize, Val>>,
-    ) -> Recover {
+    ) -> Result<()> {
+        let page_id = page_guard.page_id();
         let (ctx, page) = page_guard.ctx_and_page_mut();
         if !page.row_id_in_valid_range(row_id) {
-            return Recover::NotFound;
+            return Err(recovery_page_invariant_error(
+                "delete",
+                page_id,
+                row_id,
+                cts,
+                "row id outside page range",
+            ));
         }
         let row_idx = page.row_idx(row_id);
-        if page.row(row_idx).is_deleted() {
-            return Recover::AlreadyDeleted;
+        let was_deleted = page.is_deleted(row_idx);
+        if was_deleted {
+            return Err(recovery_page_invariant_error(
+                "delete",
+                page_id,
+                row_id,
+                cts,
+                "row is already deleted",
+            ));
         }
-        ctx.recover_mut().unwrap().update_at(row_idx, cts);
+        if ctx
+            .recover()
+            .ok_or_else(|| {
+                recovery_page_invariant_error("delete", page_id, row_id, cts, "missing recover map")
+            })?
+            .at(row_idx)
+            .is_none()
+        {
+            return Err(recovery_page_invariant_error(
+                "delete",
+                page_id,
+                row_id,
+                cts,
+                "missing recover CTS",
+            ));
+        }
+        ctx.recover_mut()
+            .ok_or_else(|| {
+                recovery_page_invariant_error("delete", page_id, row_id, cts, "missing recover map")
+            })?
+            .update_at(row_idx, cts);
         page.set_deleted_exclusive(row_idx, true);
-        if let Some(index_cols) = cols {
-            // save index columns for index update.
-            let row = page.row(row_idx);
-            for idx_col_no in metadata.idx.index_columns() {
-                let val = row.val(metadata.col.as_ref(), *idx_col_no);
-                index_cols.insert(*idx_col_no, val);
-            }
+        if !was_deleted {
+            page.inc_approx_deleted();
         }
-        Recover::Ok
-    }
-
-    #[inline]
-    async fn recover_unique_index_insert(
-        &self,
-        index: &UniqueMemIndex<EvictableBufferPool>,
-        guards: &PoolGuards,
-        key: SelectKey,
-        row_id: RowID,
-        cts: TrxID,
-    ) -> Result<RecoverIndex> {
-        let index_pool_guard = self.mem.index_pool_guard(guards)?;
-        loop {
-            match index
-                .insert_if_not_exists(index_pool_guard, &key.vals, row_id, true, MIN_SNAPSHOT_TS)
-                .await?
-            {
-                IndexInsert::Ok(_) => {
-                    // insert index success.
-                    return Ok(RecoverIndex::Ok);
-                }
-                IndexInsert::DuplicateKey(old_row_id, deleted) => {
-                    debug_assert!(old_row_id != row_id);
-                    // Find CTS of old row.
-                    match self.find_recover_cts_for_row_id(guards, old_row_id).await? {
-                        Some(old_cts) => {
-                            if cts < old_cts {
-                                // Current row has smaller CTS, that means this insert
-                                // can be skipped, and probably there is a followed DELETE
-                                // operation on it.
-                                return Ok(RecoverIndex::InsertOutdated);
-                            }
-                            // Current row is newer, we should update the index entry.
-                            let old_row_id = if deleted {
-                                old_row_id.deleted()
-                            } else {
-                                old_row_id
-                            };
-                            match index
-                                .compare_exchange(
-                                    index_pool_guard,
-                                    &key.vals,
-                                    old_row_id,
-                                    row_id,
-                                    MIN_SNAPSHOT_TS,
-                                )
-                                .await?
-                            {
-                                IndexCompareExchange::Ok => {
-                                    return Ok(RecoverIndex::Ok);
-                                }
-                                // retry the insert.
-                                IndexCompareExchange::Mismatch
-                                | IndexCompareExchange::NotExists => {}
-                            }
-                        }
-                        None => {
-                            unreachable!()
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    #[inline]
-    async fn recover_non_unique_index_insert(
-        &self,
-        index: &NonUniqueMemIndex<EvictableBufferPool>,
-        guards: &PoolGuards,
-        key: SelectKey,
-        row_id: RowID,
-    ) -> Result<RecoverIndex> {
-        let index_pool_guard = self.mem.index_pool_guard(guards)?;
-        let res = index
-            .insert_if_not_exists(index_pool_guard, &key.vals, row_id, true, MIN_SNAPSHOT_TS)
-            .await?;
-        recover::ensure_recovery_index_insert(key.index_no, res)?;
-        Ok(RecoverIndex::Ok)
-    }
-
-    #[inline]
-    async fn recover_unique_index_delete(
-        &self,
-        index: &UniqueMemIndex<EvictableBufferPool>,
-        guards: &PoolGuards,
-        key: SelectKey,
-        row_id: RowID,
-    ) -> Result<RecoverIndex> {
-        let index_pool_guard = self.mem.index_pool_guard(guards)?;
-        if !index
-            .compare_delete(index_pool_guard, &key.vals, row_id, true, MIN_SNAPSHOT_TS)
-            .await?
-        {
-            // Another recover thread concurrently insert index entry with same key, probably with greater CTS.
-            // We just skip this deletion.
-            return Ok(RecoverIndex::DeleteOutdated);
-        }
-        Ok(RecoverIndex::Ok)
-    }
-
-    #[inline]
-    async fn recover_non_unique_index_delete(
-        &self,
-        index: &NonUniqueMemIndex<EvictableBufferPool>,
-        guards: &PoolGuards,
-        key: SelectKey,
-        row_id: RowID,
-    ) -> Result<RecoverIndex> {
-        let index_pool_guard = self.mem.index_pool_guard(guards)?;
-        if !index
-            .compare_delete(index_pool_guard, &key.vals, row_id, true, MIN_SNAPSHOT_TS)
-            .await?
-        {
-            return Ok(RecoverIndex::DeleteOutdated);
-        }
-        Ok(RecoverIndex::Ok)
-    }
-
-    #[inline]
-    async fn find_recover_cts_for_row_id(
-        &self,
-        guards: &PoolGuards,
-        row_id: RowID,
-    ) -> Result<Option<TrxID>> {
-        Ok(match self.find_row(guards, row_id).await? {
-            RowLocation::NotFound => None,
-            RowLocation::LwcBlock { .. } => {
-                // Recovery replay applies only in-memory rows. A row resolved
-                // to LWC is below the pivot and has no row-page recover CTS, so
-                // use the minimum CTS for duplicate ordering.
-                Some(MIN_SNAPSHOT_TS)
-            }
-            RowLocation::RowPage(page_id) => {
-                let page_guard = self.mem.must_get_row_page_shared(guards, page_id).await?;
-                debug_assert!(validate_page_row_range(&page_guard, page_id, row_id));
-                let (ctx, page) = page_guard.ctx_and_page();
-                let row_idx = page.row_idx(row_id);
-                let access = RowReadAccess::new(page, ctx, row_idx);
-                access.ts()
-            }
-        })
+        Ok(())
     }
 }
 
@@ -1317,6 +1211,21 @@ fn validate_page_row_range(
         return false;
     }
     page_guard.page().row_id_in_valid_range(row_id)
+}
+
+#[inline]
+fn recovery_page_invariant_error(
+    op: &str,
+    page_id: PageID,
+    row_id: RowID,
+    cts: TrxID,
+    reason: &str,
+) -> Error {
+    Report::new(DataIntegrityError::InvalidRootInvariant)
+        .attach(format!(
+            "recover row {op}: page_id={page_id}, row_id={row_id}, cts={cts}, reason={reason}"
+        ))
+        .into()
 }
 
 #[inline]

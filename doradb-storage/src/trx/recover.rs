@@ -26,7 +26,7 @@ use crate::file::fs::FileSystem;
 use crate::latch::LatchFallbackMode;
 use crate::quiescent::QuiescentGuard;
 use crate::row::{RowID, RowPage};
-use crate::table::{Table, TableRecover};
+use crate::table::Table;
 use crate::trx::log::{LogPartition, LogPartitionInitializer};
 use crate::trx::log_replay::{LogMerger, LogPartitionStream, TrxLog};
 use crate::trx::purge::{DroppedTableFileDeleteItem, GC};
@@ -310,13 +310,15 @@ impl<'a> LogRecovery<'a> {
         Vec<DroppedTableFileDeleteItem>,
     )> {
         self.bootstrap_checkpointed_user_tables().await?;
-        // 1. replay all DDLs and DMLs.
+        // 1. replay DDL and DML into catalog metadata, hot RowStore pages, and
+        //    cold delete markers.
         while let Some(log) = self.log_merger.try_next()? {
             self.replay_log(log).await?;
         }
         // 2. Ensure catalog metadata caught up with table-file roots.
         self.validate_loaded_table_metadata().await?;
-        // 3. Rebuild all indexes and refresh pages to enable undo map.
+        // 3. Rebuild hot secondary-index state from recovered RowStore pages
+        //    and refresh pages to enable undo maps.
         self.recover_indexes_and_refresh_pages().await?;
 
         Ok((
@@ -516,8 +518,8 @@ impl<'a> LogRecovery<'a> {
         }
 
         if let Some(ddl) = ddl {
-            // Execute DDL after all previous DML is done.
-            // We treat every DDL as pipeline breaker.
+            // DDL is a pipeline breaker: all previously dispatched DML must
+            // finish before metadata replay mutates catalog/table state.
             self.wait_for_dml_done().await?;
             self.replay_ddl(ddl, dml, header.cts).await?;
         } else {
@@ -815,22 +817,23 @@ impl<'a> LogRecovery<'a> {
     }
 
     async fn dispatch_dml(&mut self, dml: BTreeMap<TableID, TableDML>, cts: TrxID) -> Result<()> {
-        self.replay_dml(dml, cts, true).await
+        // Sequential today; kept as the DML dispatch boundary for future
+        // parallel recovery.
+        self.replay_dml(dml, cts).await
     }
 
     async fn wait_for_dml_done(&mut self) -> Result<()> {
-        // todo: add synchronization if dispatch recover tasks to multiple threads.
+        // Sequential replay has no outstanding DML. Future parallel dispatch
+        // must synchronize here before replaying a DDL pipeline breaker.
         Ok(())
     }
 
     /// Replay DML log.
-    /// Version chain is not maintained because this is recovery process.
-    async fn replay_dml(
-        &mut self,
-        dml: BTreeMap<TableID, TableDML>,
-        cts: TrxID,
-        disable_index: bool,
-    ) -> Result<()> {
+    ///
+    /// Catalog rows are replayed logically into catalog runtimes. User-table
+    /// rows replay only heap and cold-delete state; hot secondary indexes are
+    /// rebuilt after log replay from recovered RowStore pages.
+    async fn replay_dml(&mut self, dml: BTreeMap<TableID, TableDML>, cts: TrxID) -> Result<()> {
         for (table_id, table_dml) in dml {
             if is_catalog_obj_id(table_id) {
                 if !self.should_replay_catalog(cts) {
@@ -861,7 +864,7 @@ impl<'a> LogRecovery<'a> {
                         .attach(format!("replay user table DML: table_id={table_id}")),
                 )
             })?;
-            self.replay_table_dml(table_id, &table, &table_dml.rows, cts, disable_index)
+            self.replay_table_dml(table_id, &table, &table_dml.rows, cts)
                 .await?;
         }
         Ok(())
@@ -913,7 +916,6 @@ impl<'a> LogRecovery<'a> {
         table: &Table,
         rows: &BTreeMap<RowID, RowRedo>,
         cts: TrxID,
-        disable_index: bool,
     ) -> Result<()> {
         let heap_redo_start_ts = self.table_heap_redo_start_ts(table_id)?;
         let deletion_cutoff_ts = self.table_deletion_cutoff_ts(table_id)?;
@@ -925,14 +927,7 @@ impl<'a> LogRecovery<'a> {
                         continue;
                     }
                     table
-                        .recover_row_insert(
-                            &self.pool_guards,
-                            row.page_id,
-                            row.row_id,
-                            vals,
-                            cts,
-                            disable_index,
-                        )
+                        .recover_row_insert(&self.pool_guards, row.page_id, row.row_id, vals, cts)
                         .await?;
                 }
                 RowRedoKind::Update(vals) => {
@@ -940,14 +935,7 @@ impl<'a> LogRecovery<'a> {
                         continue;
                     }
                     table
-                        .recover_row_update(
-                            &self.pool_guards,
-                            row.page_id,
-                            row.row_id,
-                            vals,
-                            cts,
-                            disable_index,
-                        )
+                        .recover_row_update(&self.pool_guards, row.page_id, row.row_id, vals, cts)
                         .await?;
                 }
                 RowRedoKind::Delete => {
@@ -959,13 +947,7 @@ impl<'a> LogRecovery<'a> {
                         continue;
                     }
                     table
-                        .recover_row_delete(
-                            &self.pool_guards,
-                            row.page_id,
-                            row.row_id,
-                            cts,
-                            disable_index,
-                        )
+                        .recover_row_delete(&self.pool_guards, row.page_id, row.row_id, cts)
                         .await?;
                 }
                 RowRedoKind::DeleteByUniqueKey(_) => {
