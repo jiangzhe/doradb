@@ -684,14 +684,6 @@ impl<'a> LwcPrimitiveSer<'a> {
         }
     }
 
-    /// Creates flat little-endian `u64` serialization storage from an owned vector.
-    #[inline]
-    pub(crate) fn new_u64_flat_owned(input: Vec<u64>) -> Self {
-        LwcPrimitiveSer::FlatU64(Cow::Owned(
-            input.into_iter().map(|v| v.to_le_bytes()).collect(),
-        ))
-    }
-
     #[inline]
     pub fn new_i16(input: &'a [i16]) -> Self {
         match ForBitpackingSer::new(input) {

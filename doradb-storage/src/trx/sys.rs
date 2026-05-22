@@ -4,6 +4,7 @@ use crate::component::{Component, ComponentRegistry, IndexPool, MemPool, MetaPoo
 use crate::conf::TrxSysConfig;
 use crate::error::{Error, FatalError, FatalResult, InternalError, Result};
 use crate::file::fs::FileSystem;
+use crate::file::table_file::{OldRoot, TableFile};
 use crate::quiescent::{QuiescentBox, QuiescentGuard, SyncQuiescentGuard};
 use crate::session::SessionState;
 use crate::thread;
@@ -197,6 +198,32 @@ impl TransactionSystem {
         self.storage_poison_error().unwrap_or_else(|| {
             Report::new(FatalError::Poisoned).attach(format!("poisoned_by={reason}"))
         })
+    }
+
+    /// Mark a user-table root publication effective and retain the swapped root.
+    ///
+    /// The fence timestamp is allocated after the active-root pointer has
+    /// already been swapped. It is installed on the new active root as the
+    /// runtime-only reclamation boundary and also attached to the replaced root
+    /// guard. Any transaction that could have observed the old root must have
+    /// started before this fence, so purge can release the root once the global
+    /// active-snapshot horizon crosses it.
+    #[inline]
+    pub(crate) fn mark_published_table_root(
+        &self,
+        table_file: &Arc<TableFile>,
+        old_root: Option<OldRoot>,
+    ) -> TrxID {
+        let effective_ts = self.ts.fetch_add(1, Ordering::SeqCst);
+        debug_assert!(effective_ts < MAX_SNAPSHOT_TS);
+        table_file.install_active_root_effective_ts(effective_ts);
+        if let Some(old_root) = old_root {
+            self.table_roots
+                .lock()
+                .push_retained(effective_ts, old_root);
+            self.request_table_root_retention_purge();
+        }
+        effective_ts
     }
 
     /// Create a new transaction.

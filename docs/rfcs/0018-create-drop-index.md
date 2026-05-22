@@ -554,9 +554,9 @@ Resolved during implementation:
 - Runtime layout updates use safe `parking_lot::Mutex<Arc<TableRuntimeLayout>>`
   snapshots and generation-checked layout installation.
 - Dropped-index persistent page reclamation stays out of foreground
-  `DROP INDEX`; active-root detachment is implemented, while broader
-  root-reachability reclamation remains tracked by
-  `docs/backlogs/000094-table-file-root-reachability-gc.md`.
+  `DROP INDEX`; active-root detachment is implemented, and user-table
+  root-reachability reclamation is implemented by
+  `docs/tasks/000154-table-root-reachability-block-reclamation.md`.
 
 ## Future Work
 
@@ -565,8 +565,9 @@ Resolved during implementation:
 - Online index DDL with multi-version metadata.
 - Higher-level index naming and name-to-`index_no` mapping.
 - Rename index and richer catalog index introspection.
-- Dedicated physical reclamation improvements for dropped index pages
-  (`docs/backlogs/000094-table-file-root-reachability-gc.md`).
+- Catalog-file reclamation and recovery-time allocation-map rebuild follow-ups
+  remain tracked by `docs/backlogs/000106-catalog-file-block-reclamation.md`
+  and `docs/backlogs/000108-recovery-table-file-alloc-map-rebuild.md`.
 - Recovery fallback that rebuilds an index if the durable root is found
   corrupt or incomplete.
 

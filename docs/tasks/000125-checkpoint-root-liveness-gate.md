@@ -143,7 +143,7 @@ node code, keep the unsafe boundary private, document each invariant with a
    - Define a caller-facing readiness type in or near
      `doradb-storage/src/table/persistence.rs`.
    - Include enough data for scheduling and diagnostics, for example
-     `root_cts`, `min_active_sts`, and a delay reason.
+     `effective_ts`, `min_active_sts`, and a delay reason.
    - Define a checkpoint execution outcome, for example:
 
      ```rust
@@ -162,7 +162,7 @@ node code, keep the unsafe boundary private, document each invariant with a
    - Compute `min_active_sts` with
      `TransactionSystem::calc_min_active_sts_for_gc()`.
    - Bind one local `active_root` reference before reading root fields.
-   - Return delayed when `active_root.trx_id >= min_active_sts`.
+   - Return delayed when `active_root.effective_ts() >= min_active_sts`.
    - Do not require a mutable `Session` for the preflight check unless local
      API style makes that unavoidable.
 
@@ -232,8 +232,8 @@ Implemented in branch `root-live-gate` and PR #573 for issue #572.
   distinguish `Published` from normal `Delayed` scheduling pressure without
   treating root-liveness delay as a storage error.
 - Changed `Table::checkpoint` to check
-  `active_root.trx_id < trx_sys.calc_min_active_sts_for_gc()` before
-  checkpoint mutation. Delayed checkpoints return root/horizon diagnostics
+  `active_root.effective_ts() < trx_sys.calc_min_active_sts_for_gc()` before
+  checkpoint mutation. Delayed checkpoints return effective timestamp and horizon diagnostics
   before `MutableTableFile::fork`, frozen-page transition, deletion checkpoint
   application, secondary DiskTree publication, or table-file root publication.
 - Kept the refreshed `cutoff_ts` after frozen-page stabilization for transition
@@ -315,10 +315,11 @@ Checklist outcome:
 
 ## Test Cases
 
-1. `checkpoint_readiness` returns ready when the active root CTS is below
+1. `checkpoint_readiness` returns ready when the active root effective timestamp is below
    `min_active_sts`.
-2. `checkpoint_readiness` returns delayed with `root_cts` and `min_active_sts`
-   when the active root CTS is equal to or newer than `min_active_sts`.
+2. `checkpoint_readiness` returns delayed with `effective_ts` and
+   `min_active_sts` when the active root effective timestamp is equal to or
+   newer than `min_active_sts`.
 3. `Table::checkpoint` returns `CheckpointOutcome::Delayed` without publishing a
    new root while a long-running transaction pins the horizon.
 4. A delayed checkpoint leaves `active_root.trx_id`, `meta_block_id`,
@@ -359,9 +360,8 @@ Checklist outcome:
    and persistent format cleanup, it should be designed as an RFC rather than a
    single task. Follow-up is tracked by
    `docs/backlogs/000094-table-file-root-reachability-gc.md`.
-2. Physical removal of `gc_block_list` from metadata is intentionally deferred.
-   A later compatibility or format-cleanup task should decide whether to remove
-   the field, keep it reserved, or replace it with root-reachability GC metadata;
+2. Physical removal of `gc_block_list` from metadata was deferred by this task
+   and is handled by the later root-reachability format cleanup in task 000154;
    that decision is included in
    `docs/backlogs/000094-table-file-root-reachability-gc.md`.
 3. Catalog `MultiTableFile` uses the same CoW helper but has different runtime

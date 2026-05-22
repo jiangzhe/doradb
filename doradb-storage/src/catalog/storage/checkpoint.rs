@@ -333,7 +333,6 @@ impl CatalogStorage {
                 mutable
                     .write_block(new_tail_page_id, merged_tail_buf)
                     .await?;
-                mutable.record_gc_block(last_entry.block_id());
                 let merged_end_row_id = live_inserts
                     .get(consumed.saturating_sub(1))
                     .map(|row| row.row_id.saturating_add(1))

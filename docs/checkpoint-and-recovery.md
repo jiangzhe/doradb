@@ -177,16 +177,25 @@ row values undecodable before that publication.
 If no delete bitmap changes are selected, checkpoint can still publish a
 metadata-only root to advance `deletion_cutoff_ts` to the checkpoint cutoff.
 
-Before any user-table checkpoint publication, the active table-file root must
-be older than the GC horizon:
+Before any user-table checkpoint publication, the active table-file root's
+runtime effective timestamp must be older than the GC horizon:
 
-$$ \text{active\_root.trx\_id} < \text{Global\_Min\_Active\_STS} $$
+$$ \text{active\_root.effective\_ts} < \text{Global\_Min\_Active\_STS} $$
 
-If a long-running transaction pins the horizon at or below the active root CTS,
-checkpoint returns a normal delayed outcome. A delayed checkpoint does not move
-frozen pages into transition, apply cold-delete checkpoint state, publish
-secondary `DiskTree` roots, or swap the table-file root. Schedulers should treat
-this as backoff pressure rather than storage failure.
+The effective timestamp is allocated after the table-root pointer swap, so it
+captures the moment the newly published root can be observed by later
+transactions. If a long-running transaction pins the horizon at or below the
+active root effective timestamp, checkpoint returns a normal delayed outcome. A
+delayed checkpoint does not move frozen pages into transition, apply cold-delete
+checkpoint state, publish secondary `DiskTree` roots, rebuild allocation state,
+or swap the table-file root. Schedulers should treat this as backoff pressure
+rather than storage failure.
+
+When the effective-timestamp gate passes, checkpoint may rebuild the mutable
+root's allocation map from the current active root and the mutable root that
+will be published. The reachability walk covers table metadata,
+`ColumnBlockIndex` nodes, LWC data blocks, external deletion blob pages, and
+active secondary-index `DiskTree` nodes.
 
 ### 4.3 No Independent Index Checkpoint
 

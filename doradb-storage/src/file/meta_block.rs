@@ -6,7 +6,6 @@ use crate::file::cow_file::{BlockID, SUPER_BLOCK_ID};
 use crate::file::multi_table_file::{
     CATALOG_TABLE_ROOT_DESC_COUNT, CatalogTableRootDesc, MultiTableMetaBlock,
 };
-use crate::lwc::{LwcPrimitiveDeser, LwcPrimitiveSer};
 use crate::row::RowID;
 use crate::serde::{Deser, Ser, Serde};
 use crate::trx::TrxID;
@@ -18,13 +17,23 @@ use std::num::NonZeroU64;
 pub(crate) const TABLE_META_BLOCK_MAGIC_WORD: [u8; 8] =
     [b'T', b'B', b'L', b'M', b'E', b'T', b'A', 0];
 /// Table meta-block envelope version.
-pub(crate) const TABLE_META_BLOCK_VERSION: u64 = 5;
+pub(crate) const TABLE_META_BLOCK_VERSION: u64 = 6;
 
 #[inline]
 fn invalid_payload(message: impl Into<String>) -> Error {
     Report::new(DataIntegrityError::InvalidPayload)
         .attach(message.into())
         .into()
+}
+
+#[inline]
+fn validate_alloc_map(alloc_map: &AllocMap) -> Result<()> {
+    if alloc_map.len() == 0 || !alloc_map.is_allocated(usize::from(SUPER_BLOCK_ID)) {
+        return Err(invalid_payload(
+            "allocation map must include allocated super block",
+        ));
+    }
+    Ok(())
 }
 
 #[inline]
@@ -82,8 +91,6 @@ pub struct MetaBlock {
     pub secondary_index_roots: Vec<BlockID>,
     /// Page allocation bitmap.
     pub alloc_map: AllocMap,
-    /// Obsolete page ids pending reclamation.
-    pub gc_block_list: Vec<BlockID>,
 }
 
 impl Deser for MetaBlock {
@@ -92,7 +99,8 @@ impl Deser for MetaBlock {
         let (idx, pivot_row_id) = input.deser_u64(start_idx)?;
         let (idx, heap_redo_start_ts) = input.deser_u64(idx)?;
         let (idx, deletion_cutoff_ts) = input.deser_u64(idx)?;
-        let (idx, space) = AllocMapGcList::deser(input, idx)?;
+        let (idx, alloc_map) = AllocMap::deser(input, idx)?;
+        validate_alloc_map(&alloc_map)?;
         let (idx, meta) = TableBriefMetadata::deser(input, idx)?;
         let (idx, column_block_index_root) = input.deser_u64(idx)?;
         let (idx, secondary_index_roots) = <Vec<BlockID>>::deser(input, idx)?;
@@ -113,8 +121,7 @@ impl Deser for MetaBlock {
                 schema,
                 column_block_index_root: BlockID::from(column_block_index_root),
                 secondary_index_roots,
-                alloc_map: space.alloc_map,
-                gc_block_list: space.gc_block_list,
+                alloc_map,
             },
         ))
     }
@@ -137,8 +144,8 @@ pub struct MetaBlockSerView<'a> {
     pub column_block_index_root: BlockID,
     /// Root block ids of secondary DiskTrees, ordered by index number.
     pub secondary_index_roots: &'a [BlockID],
-    /// Shared allocation-map + GC-list serialization view.
-    pub space: AllocMapGcListSerView<'a>,
+    /// Page allocation bitmap.
+    pub alloc_map: &'a AllocMap,
 }
 
 impl<'a> MetaBlockSerView<'a> {
@@ -149,7 +156,7 @@ impl<'a> MetaBlockSerView<'a> {
         schema: TableBriefMetadataSerView<'a>,
         column_block_index_root: BlockID,
         secondary_index_roots: &'a [BlockID],
-        space: AllocMapGcListSerView<'a>,
+        alloc_map: &'a AllocMap,
         pivot_row_id: RowID,
         heap_redo_start_ts: TrxID,
         deletion_cutoff_ts: TrxID,
@@ -169,7 +176,7 @@ impl<'a> MetaBlockSerView<'a> {
             schema,
             column_block_index_root,
             secondary_index_roots,
-            space,
+            alloc_map,
         })
     }
 }
@@ -180,7 +187,7 @@ impl<'a> Ser<'a> for MetaBlockSerView<'a> {
         mem::size_of::<RowID>()
             + mem::size_of::<TrxID>()
             + mem::size_of::<TrxID>()
-            + self.space.ser_len()
+            + self.alloc_map.ser_len()
             + self.schema.ser_len()
             + mem::size_of::<BlockID>()
             + self.secondary_index_roots.ser_len()
@@ -191,87 +198,10 @@ impl<'a> Ser<'a> for MetaBlockSerView<'a> {
         let idx = out.ser_u64(start_idx, self.pivot_row_id);
         let idx = out.ser_u64(idx, self.heap_redo_start_ts);
         let idx = out.ser_u64(idx, self.deletion_cutoff_ts);
-        let idx = self.space.ser(out, idx);
+        let idx = self.alloc_map.ser(out, idx);
         let idx = self.schema.ser(out, idx);
         let idx = out.ser_u64(idx, self.column_block_index_root.into());
         self.secondary_index_roots.ser(out, idx)
-    }
-}
-
-/// Parsed shared payload containing allocation bitmap and GC page ids.
-///
-/// The GC list uses `LwcPrimitive<u64>` encoding so both table and multi-table
-/// formats can share one serializer/deserializer implementation.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AllocMapGcList {
-    /// Page allocation bitmap.
-    pub alloc_map: AllocMap,
-    /// Obsolete page ids pending reclamation.
-    pub gc_block_list: Vec<BlockID>,
-}
-
-impl Deser for AllocMapGcList {
-    #[inline]
-    fn deser<S: Serde + ?Sized>(input: &S, start_idx: usize) -> Result<(usize, Self)> {
-        let (idx, alloc_map) = AllocMap::deser(input, start_idx)?;
-        if alloc_map.len() == 0 || !alloc_map.is_allocated(usize::from(SUPER_BLOCK_ID)) {
-            return Err(invalid_payload(
-                "allocation map must include allocated super block",
-            ));
-        }
-
-        let (idx, gc_block_list) = LwcPrimitiveDeser::<BlockID>::deser(input, idx)?;
-        for page_id in &gc_block_list.0 {
-            let raw_block_id = usize::from(*page_id);
-            if raw_block_id == usize::from(SUPER_BLOCK_ID) || raw_block_id >= alloc_map.len() {
-                return Err(invalid_payload(format!("invalid gc block id {page_id}")));
-            }
-        }
-
-        Ok((
-            idx,
-            AllocMapGcList {
-                alloc_map,
-                gc_block_list: gc_block_list.0,
-            },
-        ))
-    }
-}
-
-/// Borrowed serialization view for [`AllocMapGcList`].
-pub struct AllocMapGcListSerView<'a> {
-    /// Page allocation bitmap.
-    pub alloc_map: &'a AllocMap,
-    /// LWC serialization view of obsolete page ids pending reclamation.
-    pub gc_block_list: LwcPrimitiveSer<'a>,
-}
-
-impl<'a> AllocMapGcListSerView<'a> {
-    /// Constructs a serialization view of allocation bitmap and GC list.
-    #[inline]
-    pub fn new(alloc_map: &'a AllocMap, gc_block_list: &'a [BlockID]) -> Self {
-        AllocMapGcListSerView {
-            alloc_map,
-            gc_block_list: LwcPrimitiveSer::new_u64_flat_owned(
-                gc_block_list
-                    .iter()
-                    .map(|block_id| block_id.as_u64())
-                    .collect(),
-            ),
-        }
-    }
-}
-
-impl<'a> Ser<'a> for AllocMapGcListSerView<'a> {
-    #[inline]
-    fn ser_len(&self) -> usize {
-        self.alloc_map.ser_len() + self.gc_block_list.ser_len()
-    }
-
-    #[inline]
-    fn ser<S: Serde + ?Sized>(&self, out: &mut S, start_idx: usize) -> usize {
-        let idx = self.alloc_map.ser(out, start_idx);
-        self.gc_block_list.ser(out, idx)
     }
 }
 
@@ -296,8 +226,6 @@ pub struct MultiTableMetaBlockData {
     pub table_roots: [CatalogTableRootDesc; CATALOG_TABLE_ROOT_DESC_COUNT],
     /// Page allocation bitmap.
     pub alloc_map: AllocMap,
-    /// Obsolete page ids pending reclamation.
-    pub gc_block_list: Vec<BlockID>,
 }
 
 impl Deser for MultiTableMetaBlockData {
@@ -338,15 +266,15 @@ impl Deser for MultiTableMetaBlockData {
             idx = next_idx;
         }
 
-        let (idx, space) = AllocMapGcList::deser(input, idx)?;
+        let (idx, alloc_map) = AllocMap::deser(input, idx)?;
+        validate_alloc_map(&alloc_map)?;
 
         Ok((
             idx,
             MultiTableMetaBlockData {
                 next_user_obj_id,
                 table_roots,
-                alloc_map: space.alloc_map,
-                gc_block_list: space.gc_block_list,
+                alloc_map,
             },
         ))
     }
@@ -361,23 +289,19 @@ pub struct MultiTableMetaBlockSerView<'a> {
     pub next_user_obj_id: ObjID,
     /// Reserved root descriptors of catalog logical tables.
     pub table_roots: &'a [CatalogTableRootDesc; CATALOG_TABLE_ROOT_DESC_COUNT],
-    /// Shared allocation-map + GC-list serialization view.
-    pub space: AllocMapGcListSerView<'a>,
+    /// Page allocation bitmap.
+    pub alloc_map: &'a AllocMap,
 }
 
 impl<'a> MultiTableMetaBlockSerView<'a> {
     /// Constructs a `catalog.mtb` meta-block serialization view from active
     /// multi-table root state and space-management data.
     #[inline]
-    pub fn new(
-        meta: &'a MultiTableMetaBlock,
-        alloc_map: &'a AllocMap,
-        gc_block_list: &'a [BlockID],
-    ) -> Self {
+    pub fn new(meta: &'a MultiTableMetaBlock, alloc_map: &'a AllocMap) -> Self {
         MultiTableMetaBlockSerView {
             next_user_obj_id: meta.next_user_obj_id,
             table_roots: &meta.table_roots,
-            space: AllocMapGcListSerView::new(alloc_map, gc_block_list),
+            alloc_map,
         }
     }
 }
@@ -390,7 +314,7 @@ impl<'a> Ser<'a> for MultiTableMetaBlockSerView<'a> {
             + mem::size_of::<u32>() // reserved
             + CATALOG_TABLE_ROOT_DESC_COUNT
                 * (mem::size_of::<u64>() + mem::size_of::<u64>() + mem::size_of::<u64>())
-            + self.space.ser_len()
+            + self.alloc_map.ser_len()
     }
 
     #[inline]
@@ -407,7 +331,7 @@ impl<'a> Ser<'a> for MultiTableMetaBlockSerView<'a> {
             );
             idx = out.ser_u64(idx, root.pivot_row_id);
         }
-        self.space.ser(out, idx)
+        self.alloc_map.ser(out, idx)
     }
 }
 
@@ -451,11 +375,10 @@ mod tests {
         secondary_index_roots: &[BlockID],
     ) -> Vec<u8> {
         let schema = active_root.metadata.ser_view();
-        let space = AllocMapGcListSerView::new(&active_root.alloc_map, &active_root.gc_block_list);
         let ser_len = mem::size_of::<RowID>()
             + mem::size_of::<TrxID>()
             + mem::size_of::<TrxID>()
-            + space.ser_len()
+            + active_root.alloc_map.ser_len()
             + schema.ser_len()
             + mem::size_of::<BlockID>()
             + secondary_index_roots.ser_len();
@@ -463,7 +386,7 @@ mod tests {
         let mut idx = data.ser_u64(0, active_root.pivot_row_id);
         idx = data.ser_u64(idx, active_root.heap_redo_start_ts);
         idx = data.ser_u64(idx, active_root.deletion_cutoff_ts);
-        idx = space.ser(&mut data[..], idx);
+        idx = active_root.alloc_map.ser(&mut data[..], idx);
         idx = schema.ser(&mut data[..], idx);
         idx = data.ser_u64(idx, active_root.column_block_index_root.into());
         idx = secondary_index_roots.ser(&mut data[..], idx);
@@ -499,7 +422,6 @@ mod tests {
             active_root.secondary_index_roots
         );
         assert_eq!(meta_block.alloc_map, active_root.alloc_map);
-        assert_eq!(meta_block.gc_block_list, active_root.gc_block_list);
         assert_eq!(meta_block.pivot_row_id, active_root.pivot_row_id);
         assert_eq!(
             meta_block.heap_redo_start_ts,
@@ -605,7 +527,7 @@ mod tests {
             active_root.metadata.ser_view(),
             active_root.column_block_index_root,
             &secondary_index_roots,
-            AllocMapGcListSerView::new(&active_root.alloc_map, &active_root.gc_block_list),
+            &active_root.alloc_map,
             active_root.pivot_row_id,
             active_root.heap_redo_start_ts,
             active_root.deletion_cutoff_ts,
@@ -630,12 +552,11 @@ mod tests {
         ));
         let active_root = ActiveRoot::new(7, 1024, Arc::clone(&metadata));
         let schema = active_root.metadata.ser_view();
-        let space = AllocMapGcListSerView::new(&active_root.alloc_map, &active_root.gc_block_list);
 
         let ser_len = mem::size_of::<RowID>()
             + mem::size_of::<TrxID>()
             + mem::size_of::<TrxID>()
-            + space.ser_len()
+            + active_root.alloc_map.ser_len()
             + schema.ser_len()
             + mem::size_of::<BlockID>()
             + Vec::<BlockID>::new().ser_len();
@@ -643,7 +564,7 @@ mod tests {
         let mut idx = data.ser_u64(0, active_root.pivot_row_id);
         idx = data.ser_u64(idx, active_root.heap_redo_start_ts);
         idx = data.ser_u64(idx, active_root.deletion_cutoff_ts);
-        idx = space.ser(&mut data[..], idx);
+        idx = active_root.alloc_map.ser(&mut data[..], idx);
         idx = schema.ser(&mut data[..], idx);
         idx = data.ser_u64(idx, active_root.column_block_index_root.into());
         idx = Vec::<BlockID>::new().ser(&mut data[..], idx);
@@ -671,7 +592,7 @@ mod tests {
             active_root.metadata.ser_view(),
             active_root.column_block_index_root,
             &[],
-            AllocMapGcListSerView::new(&active_root.alloc_map, &active_root.gc_block_list),
+            &active_root.alloc_map,
             active_root.pivot_row_id,
             active_root.heap_redo_start_ts,
             active_root.deletion_cutoff_ts,
@@ -694,8 +615,7 @@ mod tests {
 
         let alloc_map = AllocMap::new(128);
         assert!(alloc_map.allocate_at(usize::from(SUPER_BLOCK_ID)));
-        let gc_block_list = vec![];
-        let ser_view = MultiTableMetaBlockSerView::new(&meta, &alloc_map, &gc_block_list);
+        let ser_view = MultiTableMetaBlockSerView::new(&meta, &alloc_map);
         let ser_len = ser_view.ser_len();
         let mut data = vec![0u8; ser_len];
         let res_idx = ser_view.ser(&mut data[..], 0);
@@ -709,23 +629,5 @@ mod tests {
         assert_eq!(decoded.table_roots[1].root_block_id, NonZeroU64::new(42));
         assert_eq!(decoded.table_roots[1].pivot_row_id, 128);
         assert_eq!(decoded.table_roots.len(), CATALOG_TABLE_ROOT_DESC_COUNT);
-    }
-
-    #[test]
-    fn test_alloc_map_gc_list_deser_rejects_super_block_gc_entry() {
-        let alloc_map = AllocMap::new(128);
-        assert!(alloc_map.allocate_at(usize::from(SUPER_BLOCK_ID)));
-        let gc_block_list = vec![SUPER_BLOCK_ID];
-        let ser_view = AllocMapGcListSerView::new(&alloc_map, &gc_block_list);
-        let ser_len = ser_view.ser_len();
-        let mut data = vec![0u8; ser_len];
-        let res_idx = ser_view.ser(&mut data[..], 0);
-        assert_eq!(res_idx, ser_len);
-
-        let err = AllocMapGcList::deser(&data[..], 0).unwrap_err();
-        assert_eq!(
-            err.data_integrity_error(),
-            Some(DataIntegrityError::InvalidPayload)
-        );
     }
 }

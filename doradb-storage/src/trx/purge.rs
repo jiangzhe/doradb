@@ -107,8 +107,11 @@ pub(crate) struct TableRootQueue {
 
 impl TableRootQueue {
     #[inline]
-    fn push(&mut self, item: RetainedTableRoot) {
-        self.roots.push_back(item);
+    pub(crate) fn push_retained(&mut self, fence_ts: TrxID, old_root: OldRoot) {
+        self.roots.push_back(RetainedTableRoot {
+            fence_ts,
+            _old_root: old_root,
+        });
     }
 
     #[inline]
@@ -154,26 +157,6 @@ impl DroppedTableQueue {
 }
 
 impl TransactionSystem {
-    /// Retain a swapped user-table root until post-publish readers are gone.
-    ///
-    /// The fence timestamp is allocated after the active-root pointer has been
-    /// swapped. Any transaction that could have observed the old root must have
-    /// started before this fence, so purge can release the root once the global
-    /// active-snapshot horizon crosses it.
-    #[inline]
-    pub(crate) fn retain_published_table_root(&self, old_root: Option<OldRoot>) {
-        let Some(old_root) = old_root else {
-            return;
-        };
-        let fence_ts = self.ts.fetch_add(1, Ordering::SeqCst);
-        debug_assert!(fence_ts < MAX_SNAPSHOT_TS);
-        self.table_roots.lock().push(RetainedTableRoot {
-            fence_ts,
-            _old_root: old_root,
-        });
-        self.request_table_root_retention_purge();
-    }
-
     /// Enqueue a logically dropped table runtime for purge-horizon destruction.
     ///
     /// The wake requests only dropped-table cleanup, so foreground DROP TABLE

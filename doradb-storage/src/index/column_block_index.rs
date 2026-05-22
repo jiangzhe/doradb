@@ -15,6 +15,7 @@ use crate::layout;
 use crate::quiescent::QuiescentGuard;
 use crate::row::RowID;
 use error_stack::{Report, ResultExt};
+use std::collections::BTreeSet;
 use std::future::Future;
 use std::mem;
 use std::pin::Pin;
@@ -1307,13 +1308,8 @@ struct ValidatedColumnBlockNode {
 
 impl ValidatedColumnBlockNode {
     #[inline]
-    fn try_from_guard(
-        guard: ReadonlyBlockGuard,
-        file_kind: FileKind,
-        page_id: BlockID,
-    ) -> Result<Self> {
-        validate_node_payload(guard.page(), file_kind, page_id)?;
-        Ok(ValidatedColumnBlockNode { guard })
+    fn from_validated_guard(guard: ReadonlyBlockGuard) -> Self {
+        ValidatedColumnBlockNode { guard }
     }
 
     fn leaf_header_ext(
@@ -1374,6 +1370,16 @@ impl ValidatedColumnBlockNode {
         page_id: BlockID,
     ) -> Result<LeafEntryView<'_>> {
         let prefixes = self.leaf_prefix_plane(file_kind, page_id)?;
+        self.leaf_entry_view_with_prefixes(&prefixes, idx, file_kind, page_id)
+    }
+
+    fn leaf_entry_view_with_prefixes<'n>(
+        &'n self,
+        prefixes: &LeafPrefixPlane<'_>,
+        idx: usize,
+        file_kind: FileKind,
+        page_id: BlockID,
+    ) -> Result<LeafEntryView<'n>> {
         let prefix = prefixes
             .prefix(idx)
             .map_err(|_| invalid_node_payload(file_kind, page_id))?;
@@ -1477,7 +1483,7 @@ impl<'a> ColumnBlockIndex<'a> {
                 validate_persisted_column_block_index_page,
             )
             .await?;
-        ValidatedColumnBlockNode::try_from_guard(g, self.file_kind(), page_id)
+        Ok(ValidatedColumnBlockNode::from_validated_guard(g))
     }
 
     #[inline]
@@ -1720,7 +1726,12 @@ impl<'a> ColumnBlockIndex<'a> {
             if node.is_leaf() {
                 let prefixes = node.leaf_prefix_plane(self.file_kind(), page_id)?;
                 for idx in 0..prefixes.count() {
-                    let view = node.leaf_entry_view(idx, self.file_kind(), page_id)?;
+                    let view = node.leaf_entry_view_with_prefixes(
+                        &prefixes,
+                        idx,
+                        self.file_kind(),
+                        page_id,
+                    )?;
                     let entry = build_leaf_entry(page_id, &view, self.file_kind())?;
                     if let Some(prev_end) = last_end
                         && entry.start_row_id < prev_end
@@ -1742,6 +1753,62 @@ impl<'a> ColumnBlockIndex<'a> {
             }
         }
         Ok(entries)
+    }
+
+    /// Collect all blocks reachable from this column block-index root.
+    ///
+    /// The traversal validates every visited index node, leaf payload metadata,
+    /// LWC block reference, and external delete blob page chain before adding
+    /// the block ids to `out`.
+    pub(crate) async fn collect_reachable_blocks(&self, out: &mut BTreeSet<BlockID>) -> Result<()> {
+        if self.root_block_id == SUPER_BLOCK_ID {
+            return Ok(());
+        }
+        let mut stack = vec![self.root_block_id];
+        let blob_reader = ColumnDeletionBlobReader::new(
+            self.file_kind,
+            self.file,
+            self.disk_pool,
+            self.disk_pool_guard,
+        );
+        while let Some(page_id) = stack.pop() {
+            out.insert(page_id);
+            let node = self.read_node(page_id).await?;
+            if node.is_leaf() {
+                let prefixes = node.leaf_prefix_plane(self.file_kind(), page_id)?;
+                for idx in 0..prefixes.count() {
+                    let view = node.leaf_entry_view_with_prefixes(
+                        &prefixes,
+                        idx,
+                        self.file_kind(),
+                        page_id,
+                    )?;
+                    out.insert(view.entry_header.block_id());
+                    let delete_meta =
+                        decode_delete_section_metadata_from_view(&view, self.file_kind(), page_id)?;
+                    if delete_meta.delete_codec == COLUMN_DELETE_CODEC_EXTERNAL_BLOB {
+                        let blob_ref = delete_meta
+                            .blob_ref
+                            .ok_or_else(|| invalid_node_payload(self.file_kind(), page_id))?;
+                        blob_reader
+                            .collect_referenced_pages_with(blob_ref, |blob_page_id| {
+                                out.insert(blob_page_id);
+                            })
+                            .await?;
+                    }
+                }
+                continue;
+            }
+            let branch_entries = node.branch_entries();
+            for entry in branch_entries.iter().rev() {
+                let child_page_id = entry.page_id();
+                if child_page_id == SUPER_BLOCK_ID {
+                    return Err(invalid_node_payload(self.file_kind(), page_id));
+                }
+                stack.push(child_page_id);
+            }
+        }
+        Ok(())
     }
 
     /// Replaces sorted delete-delta sets keyed by `start_row_id`.
@@ -1942,7 +2009,6 @@ impl<'a> ColumnBlockIndex<'a> {
         let new_entries = self
             .write_leaf_pages_from_logical_entries(mutable_file, &entries, create_ts)
             .await?;
-        self.record_obsolete_node(mutable_file, page_id)?;
         Ok(NodeRewriteResult {
             entries: new_entries,
             touched: true,
@@ -1952,7 +2018,7 @@ impl<'a> ColumnBlockIndex<'a> {
     async fn rewrite_branch_with_patches<M: MutableCowFile>(
         &self,
         mutable_file: &mut M,
-        page_id: BlockID,
+        _page_id: BlockID,
         node: &ValidatedColumnBlockNode,
         patches: &[ResolvedLeafPatch],
         create_ts: u64,
@@ -2010,7 +2076,6 @@ impl<'a> ColumnBlockIndex<'a> {
                 create_ts,
             )
             .await?;
-        self.record_obsolete_node(mutable_file, page_id)?;
         Ok(NodeRewriteResult {
             entries: new_entries,
             touched: true,
@@ -2068,7 +2133,6 @@ impl<'a> ColumnBlockIndex<'a> {
         let mut child_entries = self
             .write_leaf_pages_from_logical_entries(mutable_file, &combined, create_ts)
             .await?;
-        self.record_obsolete_node(mutable_file, leaf_page_id)?;
 
         for (branch_page_id, height) in path.into_iter().rev() {
             let branch_node = self.read_node(branch_page_id).await?;
@@ -2086,7 +2150,6 @@ impl<'a> ColumnBlockIndex<'a> {
             child_entries = self
                 .write_branch_pages(mutable_file, &combined_entries, height, create_ts)
                 .await?;
-            self.record_obsolete_node(mutable_file, branch_page_id)?;
         }
         Ok(child_entries)
     }
@@ -2238,25 +2301,6 @@ impl<'a> ColumnBlockIndex<'a> {
         let page_id = table_file.allocate_block_id()?;
         let node = ColumnBlockNode::new_boxed(height, start_row_id, create_ts);
         Ok((page_id, node))
-    }
-
-    /// Record an obsolete node page in the table file's legacy GC list.
-    ///
-    /// This preserves current metadata compatibility. Forward user-table block
-    /// reclaim should be based on checkpoint-root reachability.
-    #[inline]
-    pub(crate) fn record_obsolete_node<M: MutableCowFile>(
-        &self,
-        table_file: &mut M,
-        page_id: BlockID,
-    ) -> Result<()> {
-        if page_id == SUPER_BLOCK_ID {
-            return Err(Report::new(InternalError::ColumnIndexGcPageInvariant)
-                .attach("cannot record super block as obsolete column-index page")
-                .into());
-        }
-        table_file.record_gc_block(page_id);
-        Ok(())
     }
 
     async fn write_node<M: MutableCowFile>(
@@ -2555,8 +2599,7 @@ fn decode_logical_delete_set_base(
     file_kind: FileKind,
     page_id: BlockID,
 ) -> Result<LogicalDeleteSet> {
-    let delete_meta =
-        decode_delete_section_metadata(view.delete_section, view.row_header, file_kind, page_id)?;
+    let delete_meta = decode_delete_section_metadata_from_view(view, file_kind, page_id)?;
     match delete_meta.delete_codec {
         COLUMN_DELETE_CODEC_NONE => Ok(LogicalDeleteSet::None {
             domain: delete_meta.delete_domain,
@@ -2602,12 +2645,7 @@ fn build_leaf_entry(
         file_kind,
         leaf_page_id,
     )?;
-    let delete_meta = decode_delete_section_metadata(
-        view.delete_section,
-        view.row_header,
-        file_kind,
-        leaf_page_id,
-    )?;
+    let delete_meta = decode_delete_section_metadata_from_view(view, file_kind, leaf_page_id)?;
     Ok(ColumnLeafEntry {
         leaf_page_id,
         start_row_id: view.start_row_id,
@@ -2725,6 +2763,37 @@ fn decode_delete_section_metadata(
         &bytes[..COLUMN_DELETE_SECTION_HEADER_SIZE],
     )
     .map_err(|_| invalid_node_payload(file_kind, page_id))?;
+    decode_delete_section_metadata_with_header(bytes, header, default_domain, file_kind, page_id)
+}
+
+fn decode_delete_section_metadata_from_view(
+    view: &LeafEntryView<'_>,
+    file_kind: FileKind,
+    page_id: BlockID,
+) -> Result<DecodedDeleteSectionMetadata> {
+    let default_domain =
+        decode_default_delete_domain_from_row_header(view.row_header, file_kind, page_id)?;
+    let Some(bytes) = view.delete_section else {
+        return Ok(DecodedDeleteSectionMetadata {
+            delete_codec: COLUMN_DELETE_CODEC_NONE,
+            delete_domain: default_domain,
+            del_count: 0,
+            blob_ref: None,
+        });
+    };
+    let header = view
+        .delete_header
+        .ok_or_else(|| invalid_node_payload(file_kind, page_id))?;
+    decode_delete_section_metadata_with_header(bytes, header, default_domain, file_kind, page_id)
+}
+
+fn decode_delete_section_metadata_with_header(
+    bytes: &[u8],
+    header: &DeleteSectionHeader,
+    default_domain: ColumnDeleteDomain,
+    file_kind: FileKind,
+    page_id: BlockID,
+) -> Result<DecodedDeleteSectionMetadata> {
     if header.version != COLUMN_DELETE_SECTION_VERSION || header.reserved != [0; 2] {
         return Err(invalid_node_payload(file_kind, page_id));
     }
@@ -3935,6 +4004,63 @@ mod tests {
                 load_entry_deletion_deltas(&index, &entry).await.unwrap(),
                 BTreeSet::from([1u32, 3, 6])
             );
+        });
+    }
+
+    #[test]
+    fn test_collect_reachable_blocks_includes_external_delete_blob_pages() {
+        smol::block_on(async {
+            let (_temp_dir, fs) = build_test_fs();
+            let background_writes = fs.background_writes();
+            let metadata = metadata();
+            let table = fs
+                .create_table_file(test_user_table_id(1), metadata, false)
+                .unwrap();
+            let (table, old_root) = table.commit(1, false).await.unwrap();
+            drop(old_root);
+            let global = global_readonly_pool_scope(64 * 1024 * 1024);
+            let disk_pool = table_readonly_pool(&global, test_user_table_id(1), &table);
+            let disk_pool_guard = disk_pool.pool_guard();
+
+            let row_ids: Vec<RowID> = (0..96).collect();
+            let delete_deltas: Vec<u32> = (0..96).collect();
+            let entry = ColumnBlockEntryShape::new(0, 96, row_ids, delete_deltas)
+                .unwrap()
+                .with_block_id(test_block_id(1001));
+            let mut mutable = MutableTableFile::fork(&table, background_writes);
+            let root = ColumnBlockIndex::new(
+                SUPER_BLOCK_ID,
+                0,
+                disk_pool.file_kind(),
+                disk_pool.sparse_file(),
+                disk_pool.global_pool(),
+                &disk_pool_guard,
+            )
+            .batch_insert(&mut mutable, &[entry], 96, 2)
+            .await
+            .unwrap();
+            let (_table, _old_root) = mutable.commit(2, false).await.unwrap();
+
+            let index = ColumnBlockIndex::new(
+                root,
+                96,
+                disk_pool.file_kind(),
+                disk_pool.sparse_file(),
+                disk_pool.global_pool(),
+                &disk_pool_guard,
+            );
+            let entry = index.locate_block(0).await.unwrap().unwrap();
+            let blob_ref = entry
+                .deletion_blob_ref()
+                .expect("large delete set should be stored in external blob pages");
+            let mut reachable = BTreeSet::new();
+            index
+                .collect_reachable_blocks(&mut reachable)
+                .await
+                .unwrap();
+            assert!(reachable.contains(&root));
+            assert!(reachable.contains(&entry.block_id()));
+            assert!(reachable.contains(&blob_ref.start_page_id));
         });
     }
 

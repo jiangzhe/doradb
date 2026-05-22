@@ -321,7 +321,7 @@ cargo nextest run -p doradb-storage --no-default-features --features libaio
   the previous root readable.
 - Delete-heavy unique rewrites with sparse remaining keys compact adjacent
   underfilled siblings back to a single leaf when the remaining entries fit.
-- DiskTree rewrite rolls back newly allocated but abandoned intermediate blocks
+- DiskTree rewrite rolls back unpublished but abandoned intermediate blocks
   so allocation-map growth reflects only blocks reachable from the new root.
 - Non-unique batch insert stores exact `(logical_key, row_id)` entries and
   exact lookup reports presence.

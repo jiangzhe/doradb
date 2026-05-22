@@ -236,6 +236,30 @@ impl SecondaryDiskTreeRuntime {
             }
         }
     }
+
+    /// Collect all DiskTree node blocks reachable from one captured root.
+    #[inline]
+    pub(crate) async fn collect_reachable_blocks(
+        &self,
+        root_block_id: BlockID,
+        disk_pool_guard: &PoolGuard,
+        out: &mut std::collections::BTreeSet<BlockID>,
+    ) -> Result<()> {
+        match &self.kind {
+            SecondaryDiskTreeRuntimeKind::Unique(runtime) => {
+                runtime
+                    .open(root_block_id, disk_pool_guard)
+                    .collect_reachable_blocks(out)
+                    .await
+            }
+            SecondaryDiskTreeRuntimeKind::NonUnique(runtime) => {
+                runtime
+                    .open(root_block_id, disk_pool_guard)
+                    .collect_reachable_blocks(out)
+                    .await
+            }
+        }
+    }
 }
 
 /// Owned user-table secondary-index storage.
