@@ -788,6 +788,55 @@ mod tests {
     }
 
     #[test]
+    fn test_collect_referenced_pages_crosses_pages() {
+        smol::block_on(async {
+            let (_temp_dir, fs) = build_test_fs();
+            let metadata = Arc::new(TableMetadata::new(
+                vec![ColumnSpec::new(
+                    "c0",
+                    ValKind::U64,
+                    ColumnAttributes::empty(),
+                )],
+                vec![],
+            ));
+            let table = fs
+                .create_table_file(test_user_table_id(1), metadata, false)
+                .unwrap();
+            let (table, old_root) = table.commit(1, false).await.unwrap();
+            drop(old_root);
+            let global = global_readonly_pool_scope(64 * 1024 * 1024);
+            let disk_pool = table_readonly_pool(&global, test_user_table_id(1), &table);
+            let disk_pool_guard = disk_pool.pool_guard();
+
+            let mut mutable = MutableTableFile::fork(&table, fs.background_writes());
+            let blob = vec![7u8; COLUMN_DELETION_BLOB_PAGE_BODY_SIZE * 2 + 113];
+            let blob_ref = {
+                let mut writer = ColumnDeletionBlobWriter::new(&mut mutable);
+                let blob_ref = writer.append_delete_payload(&blob).await.unwrap();
+                writer.finish().await.unwrap();
+                blob_ref
+            };
+            let (_table, _old_root) = mutable.commit(2, false).await.unwrap();
+
+            let reader = ColumnDeletionBlobReader::new(
+                disk_pool.file_kind(),
+                disk_pool.sparse_file(),
+                disk_pool.global_pool(),
+                &disk_pool_guard,
+            );
+            let mut pages = Vec::new();
+            reader
+                .collect_referenced_pages_with(blob_ref, |page_id| pages.push(page_id))
+                .await
+                .unwrap();
+
+            assert_eq!(pages.len(), 3);
+            assert_eq!(pages[0], blob_ref.start_page_id);
+            assert!(pages.iter().all(|page_id| *page_id != SUPER_BLOCK_ID));
+        });
+    }
+
+    #[test]
     fn test_blob_writer_starts_next_blob_on_fresh_page_after_exact_fill() {
         smol::block_on(async {
             let (_temp_dir, fs) = build_test_fs();

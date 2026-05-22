@@ -42,3 +42,11 @@ When a backlog item is moved to `docs/backlogs/closed/`, append:
 - Reference: <task/issue/pr reference>
 - Closed At: <YYYY-MM-DD>
 ```
+
+## Close Reason
+
+- Type: implemented
+- Detail: Implemented user-table checkpoint root-reachability reclamation via docs/tasks/000154-table-root-reachability-block-reclamation.md. Recovery, catalog, and parallel traversal follow-ups were split into docs/backlogs/000108-recovery-table-file-alloc-map-rebuild.md, docs/backlogs/000106-catalog-file-block-reclamation.md, and docs/backlogs/000107-parallelize-root-reachability-block-reclamation.md.
+- Closed By: backlog close
+- Reference: docs/tasks/000154-table-root-reachability-block-reclamation.md
+- Closed At: 2026-05-22

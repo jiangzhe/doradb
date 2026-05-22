@@ -1,7 +1,7 @@
 ---
 id: 000154
 title: Table Root Reachability Block Reclamation
-status: proposal
+status: implemented
 created: 2026-05-22
 github_issue: 648
 ---
@@ -45,7 +45,7 @@ Issue Labels:
 - codex
 
 Source Backlogs:
-- docs/backlogs/000094-table-file-root-reachability-gc.md
+- docs/backlogs/closed/000094-table-file-root-reachability-gc.md
 
 Related Design:
 - docs/architecture.md
@@ -56,7 +56,7 @@ Related Design:
 - docs/garbage-collect.md
 - docs/tasks/000125-checkpoint-root-liveness-gate.md
 - docs/tasks/000150-implement-drop-index-storage-api.md
-- docs/rfcs/0018-create-drop-index.md
+- RFC-0018 create/drop index design
 - docs/process/unit-test.md
 - docs/process/coding-guidance.md
 
@@ -280,6 +280,67 @@ Also apply `docs/process/unsafe-review-checklist.md` before resolving this task.
 
 ## Implementation Notes
 
+Implemented on 2026-05-22.
+
+- Added runtime-only table-root `effective_ts` state, initialized from the
+  loaded durable `trx_id` and advanced only after a table-root publication
+  swaps the active root. `TransactionSystem::mark_published_table_root` now
+  installs that post-publish fence and retains replaced roots until the same
+  fence crosses the GC horizon.
+- Changed user-table checkpoint readiness to use `effective_ts` instead of the
+  checkpoint transaction start timestamp. Checkpoints delay normally before
+  mutation while old readers may still hold the previous root, then rebuild the
+  mutable allocation map from reachability once the fence is safe.
+- Implemented root reachability collection for user table roots, including
+  table meta blocks, `ColumnBlockIndex` nodes, LWC data blocks, external
+  deletion-blob page chains, and active secondary `DiskTree` nodes. Dropped
+  secondary index roots become reclaimable only after ordinary table-root
+  reachability no longer protects them.
+- Removed `gc_block_list` from runtime roots and persisted table/catalog
+  meta-block payloads, with format-version bumps and no compatibility path for
+  the removed list. The allocation map persisted in the new root is now the
+  durable file-space source of truth.
+- Kept recovery-time allocation-map rebuild out of this task as planned.
+  Follow-up backlog docs were added for recovery-time user-table rebuild,
+  catalog-file reclamation, and bounded parallel reachability traversal:
+  `docs/backlogs/000108-recovery-table-file-alloc-map-rebuild.md`,
+  `docs/backlogs/000106-catalog-file-block-reclamation.md`, and
+  `docs/backlogs/000107-parallelize-root-reachability-block-reclamation.md`.
+- During review, `newly_allocated_ids` was renamed to `unpublished_blocks` and
+  moved out of `ActiveRoot` into `MutableCowRoot`; mutable table and catalog
+  file writers now use a small RAII writer-claim guard and direct fields instead
+  of optional `file`/`new_root` state.
+- Checklist result: pass. Reliability, feature completeness, documentation,
+  performance, test-only code, and complexity were reviewed against
+  `docs/process/dev-checklist.md`. No unsafe code was added or modified, so the
+  unsafe-specific checklist items were not applicable.
+- A final checklist coverage gap in `column_deletion_blob.rs` was fixed with
+  `test_collect_referenced_pages_crosses_pages`, covering multi-page blob-chain
+  reachability collection.
+
+Validation passed:
+
+```bash
+cargo fmt
+cargo test -p doradb-storage index::column_deletion_blob::tests::test_collect_referenced_pages_crosses_pages
+cargo clippy -p doradb-storage --all-targets -- -D warnings
+cargo nextest run -p doradb-storage
+tools/coverage_focus.rs \
+  --path doradb-storage/src/file/cow_file.rs \
+  --path doradb-storage/src/file/table_file.rs \
+  --path doradb-storage/src/file/meta_block.rs \
+  --path doradb-storage/src/index/column_block_index.rs \
+  --path doradb-storage/src/index/column_deletion_blob.rs \
+  --path doradb-storage/src/index/disk_tree.rs \
+  --path doradb-storage/src/table/persistence.rs \
+  --path doradb-storage/src/table/tests.rs \
+  --path doradb-storage/src/trx/sys.rs \
+  --path doradb-storage/src/trx/purge.rs
+```
+
+Final validation results: `cargo nextest run -p doradb-storage` ran 806 tests
+with 806 passed. Focused coverage across the requested changed paths was
+16912/18072 lines, 93.58% overall; every requested file was above 80%.
 
 ## Impacts
 
@@ -408,8 +469,16 @@ tools/coverage_focus.rs --path doradb-storage/src/index
 1. Recovery-time unreachable-block cleanup is intentionally deferred. Future
    work should rebuild or validate the allocation map from the selected latest
    valid table root during recovery, when no active transactions or retained
-   roots exist.
+   roots exist. Tracked by
+   `docs/backlogs/000108-recovery-table-file-alloc-map-rebuild.md`.
 2. A future task may add reclamation thresholds or scheduling policy if always
    attempting the optional checkpoint step proves too expensive.
 3. Full file truncation or sparse-file hole punching remains separate from
    allocation-map reclamation.
+4. Catalog-file block reclamation remains a separate follow-up because
+   `MultiTableFile` and catalog checkpoint semantics are related but distinct
+   from user-table checkpoint reclamation. Tracked by
+   `docs/backlogs/000106-catalog-file-block-reclamation.md`.
+5. Bounded parallelism across high-level roots/indexes and lower-level tree
+   traversal remains a performance follow-up. Tracked by
+   `docs/backlogs/000107-parallelize-root-reachability-block-reclamation.md`.
