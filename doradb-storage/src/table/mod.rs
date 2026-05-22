@@ -984,7 +984,8 @@ impl Table {
             ));
         }
         let row_idx = page.row_idx(row_id);
-        if page.row(row_idx).is_deleted() {
+        let was_deleted = page.is_deleted(row_idx);
+        if was_deleted {
             return Err(recovery_page_invariant_error(
                 "delete",
                 page_id,
@@ -1015,6 +1016,9 @@ impl Table {
             })?
             .update_at(row_idx, cts);
         page.set_deleted_exclusive(row_idx, true);
+        if !was_deleted {
+            page.inc_approx_deleted();
+        }
         Ok(())
     }
 }

@@ -3792,6 +3792,7 @@ fn test_recover_row_page_reports_invalid_replay_state() {
                 12,
             )
             .unwrap();
+        assert_eq!(page_guard.page().header.approx_non_deleted(), 1);
 
         let err = sys
             .table
@@ -3820,9 +3821,20 @@ fn test_recover_row_page_reports_invalid_replay_state() {
             .unwrap_err();
         assert_invalid_root(err, "row is deleted");
 
+        sys.table
+            .recover_row_delete_to_page(&mut page_guard, row_id, 15)
+            .unwrap();
+        assert_eq!(page_guard.page().header.approx_non_deleted(), 0);
+
         let err = sys
             .table
-            .recover_row_delete_to_page(&mut page_guard, row_id + 2, 15)
+            .recover_row_delete_to_page(&mut page_guard, row_id, 16)
+            .unwrap_err();
+        assert_invalid_root(err, "row is already deleted");
+
+        let err = sys
+            .table
+            .recover_row_delete_to_page(&mut page_guard, row_id + 2, 17)
             .unwrap_err();
         assert_invalid_root(err, "row id outside page range");
     });
@@ -6381,6 +6393,7 @@ fn test_checkpoint_publish_write_failure_poisons_storage() {
         let sys = TestSys::new_lightweight_evictable().await;
         let mut session = sys.try_new_session().unwrap();
         let root_before = sys.table.file().active_root_unchecked().clone();
+        wait_checkpoint_ready(&sys.table, &session).await;
         let hook = Arc::new(FailingFirstWriteHook::new());
         let _install = install_storage_backend_test_hook(hook.clone());
 
@@ -6398,6 +6411,7 @@ fn test_checkpoint_post_publication_failure_poisons_storage() {
         let sys = TestSys::new_lightweight_evictable().await;
         let mut session = sys.try_new_session().unwrap();
         let root_before = sys.table.file().active_root_unchecked().clone();
+        wait_checkpoint_ready(&sys.table, &session).await;
 
         set_test_force_post_publish_checkpoint_error(true);
         let res = sys.table.checkpoint(&mut session).await;
@@ -8136,6 +8150,23 @@ async fn wait_gc_cutoff_after(session: &Session, ts: TrxID) {
         smol::Timer::after(Duration::from_millis(20)).await;
     }
     panic!("GC cutoff did not advance past {ts}");
+}
+
+async fn wait_checkpoint_ready(table: &Table, session: &Session) {
+    let mut last_delay = None;
+    for _ in 0..50 {
+        match table.checkpoint_readiness(session) {
+            CheckpointReadiness::Ready => return,
+            CheckpointReadiness::Delayed { reason } => {
+                last_delay = Some(reason);
+                smol::Timer::after(Duration::from_millis(20)).await;
+            }
+        }
+    }
+    panic!(
+        "checkpoint readiness stayed delayed after retries by {:?}",
+        last_delay.unwrap()
+    );
 }
 
 async fn wait_path_exists(path: &str, expected: bool) {
