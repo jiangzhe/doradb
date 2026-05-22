@@ -52,19 +52,21 @@ use std::fs::OpenOptions;
 use std::future::Future;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::pin::Pin;
+use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 use tempfile::TempDir;
 
-type CheckpointAfterReadinessHook =
-    Box<dyn FnOnce() -> Pin<Box<dyn Future<Output = ()> + 'static>> + 'static>;
+type CheckpointHook = Box<dyn FnOnce() -> Pin<Box<dyn Future<Output = ()> + 'static>> + 'static>;
 
 thread_local! {
     static TEST_FORCE_LWC_BUILD_ERROR: Cell<bool> = const { Cell::new(false) };
     static TEST_FORCE_SECONDARY_SIDECAR_ERROR: Cell<bool> = const { Cell::new(false) };
     static TEST_FORCE_POST_PUBLISH_CHECKPOINT_ERROR: Cell<bool> = const { Cell::new(false) };
-    static TEST_CHECKPOINT_AFTER_READINESS_HOOK: RefCell<Option<CheckpointAfterReadinessHook>> =
+    static TEST_CHECKPOINT_AFTER_READINESS_HOOK: RefCell<Option<CheckpointHook>> =
+        const { RefCell::new(None) };
+    static TEST_CHECKPOINT_AFTER_TRX_START_HOOK: RefCell<Option<CheckpointHook>> =
         const { RefCell::new(None) };
 }
 
@@ -116,8 +118,31 @@ where
     });
 }
 
+fn set_test_checkpoint_after_trx_start_hook<F, Fut>(hook: F)
+where
+    F: FnOnce() -> Fut + 'static,
+    Fut: Future<Output = ()> + 'static,
+{
+    TEST_CHECKPOINT_AFTER_TRX_START_HOOK.with(|slot| {
+        let old = slot
+            .borrow_mut()
+            .replace(Box::new(move || Box::pin(hook())));
+        assert!(
+            old.is_none(),
+            "checkpoint transaction-start hook already installed"
+        );
+    });
+}
+
 pub(super) async fn run_test_checkpoint_after_readiness_hook() {
     let hook = TEST_CHECKPOINT_AFTER_READINESS_HOOK.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook().await;
+    }
+}
+
+pub(super) async fn run_test_checkpoint_after_trx_start_hook() {
+    let hook = TEST_CHECKPOINT_AFTER_TRX_START_HOOK.with(|slot| slot.borrow_mut().take());
     if let Some(hook) = hook {
         hook().await;
     }
@@ -6430,9 +6455,12 @@ fn test_checkpoint_readiness_ready_when_root_crossed_gc_horizon() {
     smol::block_on(async {
         let sys = TestSys::new_evictable().await;
         let session = sys.try_new_session().unwrap();
-        let root_cts = sys.table.file().active_root_unchecked().trx_id;
+        let root = sys.table.file().active_root_unchecked();
+        let root_cts = root.trx_id;
+        let effective_ts = root.effective_ts();
         let min_active_sts = sys.engine.trx_sys.calc_min_active_sts_for_gc();
         assert!(root_cts < min_active_sts);
+        assert!(effective_ts < min_active_sts);
         assert!(matches!(
             sys.table.checkpoint_readiness(&session),
             CheckpointReadiness::Ready
@@ -6441,7 +6469,7 @@ fn test_checkpoint_readiness_ready_when_root_crossed_gc_horizon() {
 }
 
 #[test]
-fn test_checkpoint_readiness_delayed_reports_root_and_horizon() {
+fn test_checkpoint_readiness_delayed_reports_effective_ts_and_horizon() {
     smol::block_on(async {
         let sys = TestSys::new_evictable().await;
         let mut session = sys.try_new_session().unwrap();
@@ -6452,17 +6480,65 @@ fn test_checkpoint_readiness_delayed_reports_root_and_horizon() {
         let reader = reader_session.try_begin_trx().unwrap().unwrap();
         checkpoint_published(&sys.table, &mut session).await;
 
-        let active_root_cts = sys.table.file().active_root_unchecked().trx_id;
+        let active_root = sys.table.file().active_root_unchecked();
+        let active_root_effective_ts = active_root.effective_ts();
         let readiness = sys.table.checkpoint_readiness(&session);
         let CheckpointReadiness::Delayed { reason } = readiness else {
             panic!("expected delayed checkpoint readiness, got {readiness:?}");
         };
-        assert_eq!(reason.root_cts, active_root_cts);
+        assert_eq!(reason.effective_ts, active_root_effective_ts);
         assert_eq!(reason.min_active_sts, reader.sts());
-        assert!(reason.root_cts >= reason.min_active_sts);
+        assert!(reason.effective_ts >= reason.min_active_sts);
 
         reader.commit().await.unwrap();
-        wait_gc_cutoff_after(&session, active_root_cts).await;
+        wait_gc_cutoff_after(&session, active_root_effective_ts).await;
+        assert!(matches!(
+            sys.table.checkpoint_readiness(&session),
+            CheckpointReadiness::Ready
+        ));
+    });
+}
+
+#[test]
+fn test_checkpoint_readiness_uses_root_effective_ts_not_checkpoint_start_ts() {
+    smol::block_on(async {
+        let sys = TestSys::new_evictable().await;
+        let mut session = sys.try_new_session().unwrap();
+        insert_rows(&sys, &mut session, 0, 120, "effective-delay").await;
+
+        sys.table.freeze(&session, usize::MAX).await.unwrap();
+        let reader_holder: Rc<RefCell<Option<(Session, ActiveTrx)>>> = Rc::new(RefCell::new(None));
+        let reader_sts = Rc::new(Cell::new(0));
+        let hook_reader_holder = Rc::clone(&reader_holder);
+        let hook_reader_sts = Rc::clone(&reader_sts);
+        let hook_engine = sys.engine.new_ref().unwrap();
+        set_test_checkpoint_after_trx_start_hook(move || async move {
+            let mut reader_session = hook_engine.try_new_session().unwrap();
+            let reader = reader_session.try_begin_trx().unwrap().unwrap();
+            hook_reader_sts.set(reader.sts());
+            *hook_reader_holder.borrow_mut() = Some((reader_session, reader));
+        });
+
+        let checkpoint_ts = checkpoint_published(&sys.table, &mut session).await;
+        let active_root = sys.table.file().active_root_unchecked();
+        let effective_ts = active_root.effective_ts();
+        assert!(checkpoint_ts < reader_sts.get());
+        assert!(effective_ts > reader_sts.get());
+
+        let readiness = sys.table.checkpoint_readiness(&session);
+        let CheckpointReadiness::Delayed { reason } = readiness else {
+            panic!("expected effective timestamp delay, got {readiness:?}");
+        };
+        assert_eq!(reason.effective_ts, effective_ts);
+        assert!(reason.min_active_sts <= reader_sts.get());
+        assert!(reason.effective_ts >= reason.min_active_sts);
+
+        let (_, reader) = reader_holder
+            .borrow_mut()
+            .take()
+            .expect("reader hook should install an active transaction");
+        reader.commit().await.unwrap();
+        wait_gc_cutoff_after(&session, effective_ts).await;
         assert!(matches!(
             sys.table.checkpoint_readiness(&session),
             CheckpointReadiness::Ready
@@ -6515,7 +6591,8 @@ fn test_checkpoint_delayed_preserves_root_and_frozen_pages_until_ready() {
         let mut reader_session = sys.try_new_session().unwrap();
         let reader = reader_session.try_begin_trx().unwrap().unwrap();
         checkpoint_published(&sys.table, &mut session).await;
-        let root_protected_by_reader = sys.table.file().active_root_unchecked().trx_id;
+        let root_after_first = sys.table.file().active_root_unchecked();
+        let effective_ts_protected_by_reader = root_after_first.effective_ts();
 
         insert_rows(&sys, &mut session, 1_000, 80, "delayed-frozen").await;
         sys.table.freeze(&session, usize::MAX).await.unwrap();
@@ -6532,7 +6609,7 @@ fn test_checkpoint_delayed_preserves_root_and_frozen_pages_until_ready() {
         let CheckpointOutcome::Delayed { reason } = outcome else {
             panic!("expected delayed checkpoint, got {outcome:?}");
         };
-        assert_eq!(reason.root_cts, root_protected_by_reader);
+        assert_eq!(reason.effective_ts, effective_ts_protected_by_reader);
         assert_eq!(reason.min_active_sts, reader.sts());
         assert_root_metadata_unchanged(&root_before_delay, &sys.table);
 
@@ -6553,7 +6630,7 @@ fn test_checkpoint_delayed_preserves_root_and_frozen_pages_until_ready() {
         assert_eq!(still_frozen_pages[0].page_id, first_frozen_page);
 
         reader.commit().await.unwrap();
-        wait_gc_cutoff_after(&session, root_protected_by_reader).await;
+        wait_gc_cutoff_after(&session, effective_ts_protected_by_reader).await;
         let checkpoint_ts = checkpoint_published(&sys.table, &mut session).await;
         let root_after_publish = sys.table.file().active_root_unchecked();
         assert_eq!(root_after_publish.trx_id, checkpoint_ts);
@@ -6572,6 +6649,7 @@ fn test_second_checkpoint_waits_for_previous_root_horizon() {
         let mut reader_session = sys.try_new_session().unwrap();
         let reader = reader_session.try_begin_trx().unwrap().unwrap();
         let first_checkpoint_ts = checkpoint_published(&sys.table, &mut session).await;
+        let first_effective_ts = sys.table.file().active_root_unchecked().effective_ts();
         assert_eq!(
             sys.table.file().active_root_unchecked().trx_id,
             first_checkpoint_ts
@@ -6582,14 +6660,60 @@ fn test_second_checkpoint_waits_for_previous_root_horizon() {
         let CheckpointOutcome::Delayed { reason } = outcome else {
             panic!("expected second checkpoint to wait, got {outcome:?}");
         };
-        assert_eq!(reason.root_cts, first_checkpoint_ts);
+        assert_eq!(reason.effective_ts, first_effective_ts);
         assert_eq!(reason.min_active_sts, reader.sts());
         assert_root_metadata_unchanged(&root_before_second, &sys.table);
 
         reader.commit().await.unwrap();
-        wait_gc_cutoff_after(&session, first_checkpoint_ts).await;
+        wait_gc_cutoff_after(&session, first_effective_ts).await;
         let second_checkpoint_ts = checkpoint_published(&sys.table, &mut session).await;
         assert!(second_checkpoint_ts > first_checkpoint_ts);
+    });
+}
+
+#[test]
+fn test_checkpoint_reachability_reclaims_obsolete_column_index_root() {
+    smol::block_on(async {
+        let sys = TestSys::new_evictable().await;
+        let mut session = sys.try_new_session().unwrap();
+        insert_rows(&sys, &mut session, 0, 120, "reachability-first").await;
+        sys.table.freeze(&session, usize::MAX).await.unwrap();
+        checkpoint_published(&sys.table, &mut session).await;
+        let first_root = sys.table.file().active_root_unchecked().clone();
+        let first_column_root = first_root.column_block_index_root;
+        assert_ne!(first_column_root, SUPER_BLOCK_ID);
+
+        insert_rows(&sys, &mut session, 1_000, 120, "reachability-second").await;
+        sys.table.freeze(&session, usize::MAX).await.unwrap();
+        checkpoint_published(&sys.table, &mut session).await;
+        let second_root = sys.table.file().active_root_unchecked().clone();
+        assert_ne!(second_root.column_block_index_root, first_column_root);
+        assert!(
+            second_root
+                .alloc_map
+                .is_allocated(usize::from(first_column_root)),
+            "the old column-index root stays allocated while the displaced root is protected"
+        );
+
+        wait_gc_cutoff_after(&session, second_root.effective_ts()).await;
+        checkpoint_published(&sys.table, &mut session).await;
+        let reclaimed_root = sys.table.file().active_root_unchecked();
+        assert_ne!(reclaimed_root.column_block_index_root, first_column_root);
+        if reclaimed_root
+            .alloc_map
+            .is_allocated(usize::from(first_column_root))
+        {
+            assert_eq!(
+                reclaimed_root.meta_block_id, first_column_root,
+                "the freed obsolete column-index root may be immediately reused for the new meta block"
+            );
+        }
+        assert!(
+            reclaimed_root
+                .alloc_map
+                .is_allocated(usize::from(second_root.column_block_index_root)),
+            "current column-index root must remain allocated"
+        );
     });
 }
 
@@ -6599,7 +6723,7 @@ fn test_checkpoint_rechecks_readiness_after_root_mutation_lease() {
         let sys = TestSys::new_lightweight_evictable().await;
         let mut checkpoint_session = sys.try_new_session().unwrap();
         let root_before = sys.table.file().active_root_unchecked().clone();
-        wait_gc_cutoff_after(&checkpoint_session, root_before.trx_id).await;
+        wait_gc_cutoff_after(&checkpoint_session, root_before.effective_ts()).await;
 
         let mut reader_session = sys.try_new_session().unwrap();
         let reader = reader_session.try_begin_trx().unwrap().unwrap();
@@ -6623,7 +6747,7 @@ fn test_checkpoint_rechecks_readiness_after_root_mutation_lease() {
         };
         let root_after = sys.table.file().active_root_unchecked();
         assert!(root_after.trx_id > root_before.trx_id);
-        assert_eq!(reason.root_cts, root_after.trx_id);
+        assert_eq!(reason.effective_ts, root_after.effective_ts());
         assert_eq!(reason.min_active_sts, reader.sts());
 
         reader.commit().await.unwrap();
@@ -8617,6 +8741,45 @@ fn test_dropped_unique_index_purge_delete_is_noop() {
             .unwrap();
         assert!(!deleted);
         hold_trx.commit().await.unwrap();
+    })
+}
+
+#[test]
+fn test_checkpoint_reachability_reclaims_dropped_secondary_disk_tree_root() {
+    smol::block_on(async {
+        let sys = TestSys::new_lightweight_evictable().await;
+        let mut session = sys.try_new_session().unwrap();
+        insert_rows(&sys, &mut session, 0, 64, "drop-index-reclaim").await;
+        sys.table.freeze(&session, usize::MAX).await.unwrap();
+        checkpoint_published(&sys.table, &mut session).await;
+        let indexed_root = sys.table.file().active_root_unchecked().clone();
+        let dropped_disk_root = indexed_root.secondary_index_roots[0];
+        assert_ne!(dropped_disk_root, SUPER_BLOCK_ID);
+        assert!(
+            indexed_root
+                .alloc_map
+                .is_allocated(usize::from(dropped_disk_root))
+        );
+
+        session.drop_index(sys.table.table_id(), 0).await.unwrap();
+        let after_drop_root = sys.table.file().active_root_unchecked().clone();
+        assert_eq!(after_drop_root.secondary_index_roots[0], SUPER_BLOCK_ID);
+        assert!(
+            after_drop_root
+                .alloc_map
+                .is_allocated(usize::from(dropped_disk_root)),
+            "DROP INDEX detaches the root but leaves page reclamation to checkpoint reachability"
+        );
+
+        wait_gc_cutoff_after(&session, after_drop_root.effective_ts()).await;
+        checkpoint_published(&sys.table, &mut session).await;
+        let after_reclaim = sys.table.file().active_root_unchecked();
+        assert!(
+            !after_reclaim
+                .alloc_map
+                .is_allocated(usize::from(dropped_disk_root)),
+            "checkpoint reachability should reclaim detached DiskTree pages"
+        );
     })
 }
 

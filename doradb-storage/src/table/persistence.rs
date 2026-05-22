@@ -4,7 +4,7 @@ use crate::error::{
     ConfigError, DataIntegrityError, Error, ErrorKind, FatalError, InternalError, OperationError,
     Result,
 };
-use crate::file::cow_file::SUPER_BLOCK_ID;
+use crate::file::cow_file::{BlockID, SUPER_BLOCK_ID};
 use crate::file::table_file::{ActiveRoot, MutableTableFile};
 use crate::index::BTreeKeyEncoder;
 use crate::index::disk_tree::{
@@ -54,6 +54,23 @@ pub enum CheckpointReadiness {
     },
 }
 
+impl CheckpointReadiness {
+    #[inline]
+    fn for_root(active_root: &ActiveRoot, min_active_sts: TrxID) -> Self {
+        let effective_ts = active_root.effective_ts();
+        if effective_ts < min_active_sts {
+            Self::Ready
+        } else {
+            Self::Delayed {
+                reason: CheckpointDelayReason {
+                    effective_ts,
+                    min_active_sts,
+                },
+            }
+        }
+    }
+}
+
 /// User-table checkpoint execution result.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CheckpointOutcome {
@@ -77,26 +94,10 @@ pub enum CheckpointOutcome {
 /// Diagnostic payload for normal checkpoint scheduling delay.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CheckpointDelayReason {
-    /// Checkpoint timestamp of the active table-file root.
-    pub root_cts: TrxID,
+    /// Runtime post-publish root-observation boundary used by reclamation.
+    pub effective_ts: TrxID,
     /// Current global minimum active snapshot timestamp used by GC.
     pub min_active_sts: TrxID,
-}
-
-impl CheckpointReadiness {
-    #[inline]
-    fn for_root(active_root: &ActiveRoot, min_active_sts: TrxID) -> Self {
-        if active_root.trx_id < min_active_sts {
-            Self::Ready
-        } else {
-            Self::Delayed {
-                reason: CheckpointDelayReason {
-                    root_cts: active_root.trx_id,
-                    min_active_sts,
-                },
-            }
-        }
-    }
 }
 
 #[derive(Clone, Copy)]
@@ -362,7 +363,121 @@ pub(crate) fn secondary_disk_tree_encoder(
     Ok(BTreeKeyEncoder::new(types))
 }
 
+fn invalid_reachable_block(
+    root_cts: TrxID,
+    block_id: BlockID,
+    message: impl Into<String>,
+) -> Error {
+    Report::new(DataIntegrityError::InvalidRootInvariant)
+        .attach(format!(
+            "invalid table-root reachable block: root_cts={root_cts}, block_id={block_id}, {}",
+            message.into()
+        ))
+        .into()
+}
+
+fn validate_reachable_block(root: &ActiveRoot, block_id: BlockID) -> Result<()> {
+    let idx = usize::from(block_id);
+    if idx >= root.alloc_map.len() {
+        return Err(invalid_reachable_block(
+            root.trx_id,
+            block_id,
+            format!("alloc_map_len={}", root.alloc_map.len()),
+        ));
+    }
+    if !root.alloc_map.is_allocated(idx) {
+        return Err(invalid_reachable_block(
+            root.trx_id,
+            block_id,
+            "allocation bit is not set",
+        ));
+    }
+    Ok(())
+}
+
 impl Table {
+    async fn collect_root_reachable_blocks(
+        &self,
+        root: &ActiveRoot,
+        layout: &TableRuntimeLayout,
+        reachable: &mut BTreeSet<BlockID>,
+    ) -> Result<()> {
+        if root.secondary_index_roots.len() != layout.index_slot_count() {
+            return Err(Report::new(DataIntegrityError::InvalidRootInvariant)
+                .attach(format!(
+                    "secondary root count mismatch: root_count={}, index_slot_count={}",
+                    root.secondary_index_roots.len(),
+                    layout.index_slot_count()
+                ))
+                .into());
+        }
+
+        let mut root_reachable = BTreeSet::new();
+        root_reachable.insert(SUPER_BLOCK_ID);
+        root_reachable.insert(root.meta_block_id);
+
+        if root.column_block_index_root != SUPER_BLOCK_ID {
+            let disk_pool = self.disk_pool();
+            let disk_pool_guard = disk_pool.pool_guard();
+            let column_index = ColumnBlockIndex::new(
+                root.column_block_index_root,
+                root.pivot_row_id,
+                self.file().file_kind(),
+                self.file().sparse_file(),
+                disk_pool,
+                &disk_pool_guard,
+            );
+            column_index
+                .collect_reachable_blocks(&mut root_reachable)
+                .await?;
+        }
+
+        for (index_no, index_slot) in layout.secondary_indexes().iter().enumerate() {
+            let root_block_id = root.secondary_index_roots[index_no];
+            let Some(index) = index_slot.as_ref() else {
+                if root_block_id != SUPER_BLOCK_ID {
+                    return Err(Report::new(DataIntegrityError::InvalidRootInvariant)
+                        .attach(format!(
+                            "inactive secondary index slot has root: index_no={index_no}, root={root_block_id}"
+                        ))
+                        .into());
+                }
+                continue;
+            };
+            if root_block_id == SUPER_BLOCK_ID {
+                continue;
+            }
+            let runtime = index.disk_runtime();
+            let disk_pool_guard = runtime.disk_pool_guard();
+            runtime
+                .collect_reachable_blocks(root_block_id, &disk_pool_guard, &mut root_reachable)
+                .await?;
+        }
+
+        for block_id in root_reachable {
+            validate_reachable_block(root, block_id)?;
+            reachable.insert(block_id);
+        }
+        Ok(())
+    }
+
+    async fn rebuild_reachable_alloc_map(
+        &self,
+        mutable_file: &mut MutableTableFile,
+        layout: &TableRuntimeLayout,
+    ) -> Result<usize> {
+        let mut reachable = BTreeSet::new();
+        self.collect_root_reachable_blocks(
+            self.file().active_root_unchecked(),
+            layout,
+            &mut reachable,
+        )
+        .await?;
+        self.collect_root_reachable_blocks(mutable_file.root(), layout, &mut reachable)
+            .await?;
+        mutable_file.rebuild_alloc_map_from_reachable(&reachable)
+    }
+
     async fn apply_deletion_checkpoint(
         &self,
         mutable_file: &mut MutableTableFile,
@@ -862,6 +977,8 @@ impl TablePersistence for Table {
             )
         })?;
         let checkpoint_ts = trx.sts();
+        #[cfg(test)]
+        super::tests::run_test_checkpoint_after_trx_start_hook().await;
         if !frozen_pages.is_empty() {
             self.set_frozen_pages_to_transition(&pool_guards, &frozen_pages, cutoff_ts)
                 .await?;
@@ -963,7 +1080,18 @@ impl TablePersistence for Table {
             return Err(err);
         }
 
-        // Step 9: enter the no-cancel publication section, publish a new
+        // Step 9: after all checkpoint CoW writes are represented in the
+        // mutable root, rebuild its allocation map from the current active root
+        // and the mutable root that will be published.
+        if let Err(err) = self
+            .rebuild_reachable_alloc_map(&mut mutable_file, &layout)
+            .await
+        {
+            trx_sys.rollback(trx).await?;
+            return Err(err);
+        }
+
+        // Step 10: enter the no-cancel publication section, publish a new
         // table-file root, and then commit the checkpoint transaction. This
         // intentionally happens even when no row data, deletion payload, or
         // secondary index root changed: the root trx_id acts as a checkpoint
@@ -978,7 +1106,7 @@ impl TablePersistence for Table {
         let published_root = mutable_file.root();
         let published_pivot_row_id = published_root.pivot_row_id;
         let published_column_root = published_root.column_block_index_root;
-        let (_table_file, old_root) = match mutable_file.commit(checkpoint_ts, false).await {
+        let (table_file, old_root) = match mutable_file.commit(checkpoint_ts, false).await {
             Ok(res) => res,
             Err(err) if err.kind() == ErrorKind::Io => {
                 let _ = trx_sys.rollback(trx).await;
@@ -990,7 +1118,7 @@ impl TablePersistence for Table {
                 return Err(err);
             }
         };
-        trx_sys.retain_published_table_root(old_root);
+        trx_sys.mark_published_table_root(&table_file, old_root);
         self.mem
             .blk_idx()
             .update_column_root(published_pivot_row_id, published_column_root)

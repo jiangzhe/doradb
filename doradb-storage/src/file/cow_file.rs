@@ -7,7 +7,7 @@ use crate::file::super_block::{SUPER_BLOCK_SIZE, SuperBlock};
 use crate::file::{BlockKey, FileID, SparseFile, write_direct};
 use crate::io::{DirectBuf, IOClient};
 use crate::quiescent::QuiescentGuard;
-use crate::trx::TrxID;
+use crate::trx::{MAX_SNAPSHOT_TS, TrxID};
 use error_stack::Report;
 use std::collections::BTreeSet;
 use std::fs;
@@ -16,7 +16,7 @@ use std::ops::{Deref, DerefMut};
 use std::os::fd::{AsRawFd, RawFd};
 use std::ptr::NonNull;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
 
 pub use crate::file::BlockID;
 
@@ -35,7 +35,6 @@ pub const INVALID_BLOCK_ID: BlockID = BlockID::new(u64::MAX);
 pub(crate) trait MutableCowFile {
     fn allocate_block_id(&mut self) -> Result<BlockID>;
     fn rollback_allocated_block_id(&mut self, block_id: BlockID) -> Result<()>;
-    fn record_gc_block(&mut self, block_id: BlockID);
     fn write_block(
         &self,
         block_id: BlockID,
@@ -46,8 +45,7 @@ pub(crate) trait MutableCowFile {
 /// Shared in-memory active root for copy-on-write files.
 ///
 /// `ActiveRoot<M>` stores generic CoW bookkeeping (`slot_no`, `meta_block_id`,
-/// allocation map, legacy GC list) plus a file-specific payload `M`.
-#[derive(Clone)]
+/// allocation map) plus a file-specific payload `M`.
 pub struct ActiveRoot<M> {
     /// Active ping-pong super-block slot (0/1).
     pub slot_no: u64,
@@ -57,19 +55,34 @@ pub struct ActiveRoot<M> {
     pub meta_block_id: BlockID,
     /// Allocation map used for page-id assignment.
     pub alloc_map: AllocMap,
-    /// Legacy persisted list of obsolete blocks.
-    ///
-    /// Current formats still serialize this list for compatibility. Future
-    /// user-table block reclaim should be driven by root reachability rather
-    /// than treating this list as the durable reclaim contract.
-    pub gc_block_list: Vec<BlockID>,
     /// File-specific in-memory metadata payload.
     pub meta: M,
+    /// Runtime-only timestamp proving when this root became effective.
+    ///
+    /// This is deliberately not serialized. Loaded roots initialize it from
+    /// the durable root timestamp, while newly published runtime roots install
+    /// a post-publish fence after the active-root pointer swap.
+    effective_ts: AtomicU64,
     /// Blocks allocated by this unpublished mutable root.
     ///
     /// This set is intentionally not persisted. It prevents rollback from
     /// clearing allocation bits inherited from the published root snapshot.
     newly_allocated_ids: BTreeSet<BlockID>,
+}
+
+impl<M: Clone> Clone for ActiveRoot<M> {
+    #[inline]
+    fn clone(&self) -> Self {
+        ActiveRoot {
+            slot_no: self.slot_no,
+            trx_id: self.trx_id,
+            meta_block_id: self.meta_block_id,
+            alloc_map: self.alloc_map.clone(),
+            meta: self.meta.clone(),
+            effective_ts: AtomicU64::new(self.effective_ts()),
+            newly_allocated_ids: self.newly_allocated_ids.clone(),
+        }
+    }
 }
 
 impl<M> ActiveRoot<M> {
@@ -80,7 +93,6 @@ impl<M> ActiveRoot<M> {
         trx_id: TrxID,
         meta_block_id: BlockID,
         alloc_map: AllocMap,
-        gc_block_list: Vec<BlockID>,
         meta: M,
     ) -> Self {
         ActiveRoot {
@@ -88,8 +100,8 @@ impl<M> ActiveRoot<M> {
             trx_id,
             meta_block_id,
             alloc_map,
-            gc_block_list,
             meta,
+            effective_ts: AtomicU64::new(trx_id),
             newly_allocated_ids: BTreeSet::new(),
         }
     }
@@ -102,17 +114,61 @@ impl<M> ActiveRoot<M> {
     {
         let mut new = self.clone();
         new.slot_no = 1 - self.slot_no;
+        new.effective_ts.store(MAX_SNAPSHOT_TS, Ordering::Relaxed);
         new.newly_allocated_ids.clear();
         new
     }
 
-    /// Record one obsolete meta-block id in the legacy GC list.
-    ///
-    /// This is used during publish so the next root keeps a reclaim list
-    /// for historical meta blocks.
+    /// Return the runtime-only timestamp when this root became observable.
     #[inline]
-    pub fn push_gc_meta_block(&mut self, block_id: BlockID) {
-        self.gc_block_list.push(block_id);
+    pub fn effective_ts(&self) -> TrxID {
+        self.effective_ts.load(Ordering::Acquire)
+    }
+
+    /// Block reclamation decisions until an unpublished root becomes effective.
+    #[inline]
+    fn block_reclamation_until_effective_ts_installed(&self) {
+        self.effective_ts.store(MAX_SNAPSHOT_TS, Ordering::Release);
+    }
+
+    /// Install the post-publish effective timestamp for the current active root.
+    #[inline]
+    pub(crate) fn install_effective_ts(&self, effective_ts: TrxID) {
+        debug_assert!(effective_ts < MAX_SNAPSHOT_TS);
+        self.effective_ts.store(effective_ts, Ordering::Release);
+    }
+
+    /// Replace the allocation map with one built from root-reachable blocks.
+    ///
+    /// `SUPER_BLOCK_ID` is always kept allocated.
+    #[inline]
+    pub(crate) fn rebuild_alloc_map_from_reachable(
+        &mut self,
+        reachable: &BTreeSet<BlockID>,
+    ) -> Result<usize> {
+        let old_allocated = self.alloc_map.allocated();
+        let rebuilt = AllocMap::new(self.alloc_map.len());
+        assert!(rebuilt.allocate_at(usize::from(SUPER_BLOCK_ID)));
+        for block_id in reachable {
+            let idx = usize::from(*block_id);
+            if idx >= rebuilt.len() {
+                return Err(Report::new(InternalError::CowFileAllocationInvariant)
+                    .attach(format!(
+                        "reachable block id exceeds allocation map: block_id={block_id}, alloc_map_len={}",
+                        rebuilt.len()
+                    ))
+                    .into());
+            }
+            if *block_id != SUPER_BLOCK_ID {
+                let allocated = rebuilt.allocate_at(idx);
+                debug_assert!(allocated);
+            }
+        }
+        let new_allocated = rebuilt.allocated();
+        self.alloc_map = rebuilt;
+        self.newly_allocated_ids
+            .retain(|block_id| reachable.contains(block_id));
+        Ok(old_allocated.saturating_sub(new_allocated))
     }
 
     /// Allocate one new page id for copy-on-write publish.
@@ -200,8 +256,6 @@ pub struct ParsedMeta<M> {
     pub meta: M,
     /// Decoded allocation bitmap for the file.
     pub alloc_map: AllocMap,
-    /// Decoded legacy obsolete page list.
-    pub gc_block_list: Vec<BlockID>,
 }
 
 /// Serialization and parsing callbacks for one concrete CoW file type.
@@ -433,7 +487,6 @@ impl<M> CowFile<M> {
             super_block.header.checkpoint_cts,
             super_block.body.meta_block_id,
             parsed_meta.alloc_map,
-            parsed_meta.gc_block_list,
             parsed_meta.meta,
         ))
     }
@@ -441,21 +494,16 @@ impl<M> CowFile<M> {
     /// Publish a new active root via copy-on-write: meta block then super block.
     ///
     /// The sequence is:
-    /// 1. add previous meta block to the legacy GC list,
-    /// 2. allocate + write new meta block,
-    /// 3. write next super block slot,
-    /// 4. fsync and atomically swap active root pointer.
+    /// 1. allocate + write new meta block,
+    /// 2. write next super block slot,
+    /// 3. fsync and atomically swap active root pointer.
     #[inline]
     pub(crate) async fn publish_root(
         &self,
         background_writes: &IOClient<BackgroundWriteRequest>,
         mut new_root: ActiveRoot<M>,
     ) -> Result<Option<OldCowRoot<M>>> {
-        let old_meta_block_id = new_root.meta_block_id;
-        if old_meta_block_id != SUPER_BLOCK_ID {
-            new_root.push_gc_meta_block(old_meta_block_id);
-        }
-
+        new_root.block_reclamation_until_effective_ts_installed();
         let new_meta_block_id = match new_root.try_allocate_block_id() {
             Some(block_id) => block_id,
             None => {

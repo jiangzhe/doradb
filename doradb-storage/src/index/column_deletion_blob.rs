@@ -462,6 +462,85 @@ impl<'a> ColumnDeletionBlobReader<'a> {
         Ok((header, payload))
     }
 
+    /// Visit the validated blob pages needed to read one referenced byte range.
+    pub(crate) async fn collect_referenced_pages_with(
+        &self,
+        blob_ref: BlobRef,
+        mut visit: impl FnMut(BlockID),
+    ) -> Result<()> {
+        if blob_ref.start_page_id == SUPER_BLOCK_ID || blob_ref.byte_len == 0 {
+            return Err(invalid_payload(format!(
+                "invalid column deletion blob reference: start_page_id={}, byte_len={}",
+                blob_ref.start_page_id, blob_ref.byte_len
+            )));
+        }
+        let file_kind = self.file_kind;
+        let start_offset = blob_ref.start_offset as usize;
+        let byte_len = blob_ref.byte_len as usize;
+        if start_offset
+            .checked_add(byte_len)
+            .is_some_and(|end| end <= COLUMN_DELETION_BLOB_PAGE_BODY_SIZE)
+        {
+            visit(blob_ref.start_page_id);
+            return Ok(());
+        }
+        let mut remaining = blob_ref.byte_len as usize;
+        let mut page_id = blob_ref.start_page_id;
+        let mut offset = start_offset;
+
+        while remaining > 0 {
+            let guard = self
+                .disk_pool
+                .read_validated_block(
+                    self.file_kind,
+                    self.file,
+                    self.disk_pool_guard,
+                    page_id,
+                    validate_persisted_blob_page,
+                )
+                .await?;
+            visit(page_id);
+            let payload = validated_blob_page_payload(guard.page());
+            let header = decode_blob_page_header(payload).map_err(|err| {
+                if err.data_integrity_error().is_some() {
+                    invalid_blob_payload(file_kind, page_id, "invalid blob page header")
+                } else {
+                    err
+                }
+            })?;
+            let used_size = header.used_size as usize;
+            if offset > used_size {
+                return Err(invalid_blob_payload(
+                    file_kind,
+                    page_id,
+                    format!("blob offset {offset} exceeds used size {used_size}"),
+                ));
+            }
+            let available = used_size - offset;
+            if available == 0 && remaining > 0 {
+                return Err(invalid_blob_payload(
+                    file_kind,
+                    page_id,
+                    "blob reference reaches empty page before reading all bytes",
+                ));
+            }
+            remaining -= remaining.min(available);
+            if remaining == 0 {
+                break;
+            }
+            if header.next_page_id == SUPER_BLOCK_ID {
+                return Err(invalid_blob_payload(
+                    file_kind,
+                    page_id,
+                    "blob chain ended before reading all bytes",
+                ));
+            }
+            page_id = header.next_page_id;
+            offset = 0;
+        }
+        Ok(())
+    }
+
     async fn read_raw(&self, blob_ref: BlobRef) -> Result<Vec<u8>> {
         if blob_ref.start_page_id == SUPER_BLOCK_ID || blob_ref.byte_len == 0 {
             return Err(invalid_payload(format!(
@@ -607,6 +686,58 @@ mod tests {
                 ColumnAuxBlobHeader::delete_payload(blob.len()).unwrap()
             );
             assert_eq!(payload, blob);
+        });
+    }
+
+    #[test]
+    fn test_collect_referenced_pages_skips_single_page_read() {
+        smol::block_on(async {
+            let (_temp_dir, fs) = build_test_fs();
+            let metadata = Arc::new(TableMetadata::new(
+                vec![ColumnSpec::new(
+                    "c0",
+                    ValKind::U64,
+                    ColumnAttributes::empty(),
+                )],
+                vec![],
+            ));
+            let table = fs
+                .create_table_file(test_user_table_id(1), metadata, false)
+                .unwrap();
+            let (table, old_root) = table.commit(1, false).await.unwrap();
+            drop(old_root);
+            let global = global_readonly_pool_scope(64 * 1024 * 1024);
+            let disk_pool = table_readonly_pool(&global, test_user_table_id(1), &table);
+            let disk_pool_guard = disk_pool.pool_guard();
+
+            let mut mutable = MutableTableFile::fork(&table, fs.background_writes());
+            let blob = vec![9u8; 513];
+            let blob_ref = {
+                let mut writer = ColumnDeletionBlobWriter::new(&mut mutable);
+                let blob_ref = writer.append_delete_payload(&blob).await.unwrap();
+                writer.finish().await.unwrap();
+                blob_ref
+            };
+            let (_table, _old_root) = mutable.commit(2, false).await.unwrap();
+
+            let reader = ColumnDeletionBlobReader::new(
+                disk_pool.file_kind(),
+                disk_pool.sparse_file(),
+                disk_pool.global_pool(),
+                &disk_pool_guard,
+            );
+            let before = disk_pool.global_stats();
+            let mut pages = Vec::new();
+            reader
+                .collect_referenced_pages_with(blob_ref, |page_id| pages.push(page_id))
+                .await
+                .unwrap();
+            let delta = disk_pool.global_stats().delta_since(before);
+
+            assert_eq!(pages, vec![blob_ref.start_page_id]);
+            assert_eq!(delta.cache_hits, 0);
+            assert_eq!(delta.cache_misses, 0);
+            assert_eq!(delta.queued_reads, 0);
         });
     }
 

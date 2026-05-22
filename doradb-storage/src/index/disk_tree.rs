@@ -943,6 +943,51 @@ impl<'a, F: DiskTreeSpec> DiskTree<'a, F> {
         Ok(entries)
     }
 
+    /// Collect every node block reachable from this root snapshot.
+    pub(crate) async fn collect_reachable_blocks(&self, out: &mut BTreeSet<BlockID>) -> Result<()> {
+        if self.root_block_id == SUPER_BLOCK_ID {
+            return Ok(());
+        }
+        let mut stack = vec![self.root_block_id];
+        while let Some(block_id) = stack.pop() {
+            out.insert(block_id);
+            let guard = self.read_node(block_id).await?;
+            let node = guard.node();
+            if node.is_leaf() {
+                continue;
+            }
+            let child_height = branch_child_height(node, self.file_kind(), block_id)?;
+            if child_height == 0 {
+                for idx in (0..node.count()).rev() {
+                    let child_block_id = BlockID::from(node.value::<BTreeU64>(idx).to_u64());
+                    if child_block_id == SUPER_BLOCK_ID {
+                        return Err(invalid_node_payload(self.file_kind(), block_id));
+                    }
+                    out.insert(child_block_id);
+                }
+                let child_block_id = BlockID::from(node.lower_fence_value().to_u64());
+                if child_block_id == SUPER_BLOCK_ID {
+                    return Err(invalid_node_payload(self.file_kind(), block_id));
+                }
+                out.insert(child_block_id);
+            } else {
+                for idx in (0..node.count()).rev() {
+                    let child_block_id = BlockID::from(node.value::<BTreeU64>(idx).to_u64());
+                    if child_block_id == SUPER_BLOCK_ID {
+                        return Err(invalid_node_payload(self.file_kind(), block_id));
+                    }
+                    stack.push(child_block_id);
+                }
+                let child_block_id = BlockID::from(node.lower_fence_value().to_u64());
+                if child_block_id == SUPER_BLOCK_ID {
+                    return Err(invalid_node_payload(self.file_kind(), block_id));
+                }
+                stack.push(child_block_id);
+            }
+        }
+        Ok(())
+    }
+
     /// Visit logical entries from the first key greater than or equal to
     /// `start_key`, stopping when the visitor returns `false`.
     async fn scan_entries_from<V>(&self, start_key: &[u8], mut visitor: V) -> Result<()>
@@ -1753,6 +1798,15 @@ impl<'a, F: DiskTreeSpec> DiskTree<'a, F> {
     }
 }
 
+#[inline]
+fn branch_child_height(node: &BTreeNode, file_kind: FileKind, block_id: BlockID) -> Result<u16> {
+    let child_height = node
+        .height()
+        .checked_sub(1)
+        .ok_or_else(|| invalid_node_payload(file_kind, block_id))?;
+    u16::try_from(child_height).map_err(|_| invalid_node_payload(file_kind, block_id))
+}
+
 /// Calculate a branch height from a homogeneous rewrite child-entry run.
 fn parent_height_from_rewrite_children(entries: &[RewriteEntry]) -> Result<u16> {
     let first = entries
@@ -1853,12 +1907,7 @@ fn branch_entries_from_node(
     file_kind: FileKind,
     block_id: BlockID,
 ) -> Result<Vec<BranchEntry>> {
-    let child_height = node
-        .height()
-        .checked_sub(1)
-        .ok_or_else(|| invalid_node_payload(file_kind, block_id))?;
-    let child_height =
-        u16::try_from(child_height).map_err(|_| invalid_node_payload(file_kind, block_id))?;
+    let child_height = branch_child_height(node, file_kind, block_id)?;
     let mut entries = Vec::with_capacity(node.count() + 1);
     entries.push(BranchEntry::persisted(
         node.lower_fence_key().as_bytes().to_vec(),
@@ -2414,10 +2463,6 @@ mod tests {
             self.inner.rollback_allocated_block_id(block_id)
         }
 
-        fn record_gc_block(&mut self, block_id: BlockID) {
-            self.inner.record_gc_block(block_id)
-        }
-
         fn write_block(
             &self,
             block_id: BlockID,
@@ -2643,7 +2688,6 @@ mod tests {
             assert_eq!(new_tree.lookup(&key1).await.unwrap(), Some(10));
             assert_eq!(new_tree.lookup(&key2).await.unwrap(), None);
             assert_eq!(tree.lookup(&key2).await.unwrap(), Some(20));
-            assert!(mutable.root().gc_block_list.is_empty());
         });
     }
 
@@ -2716,7 +2760,6 @@ mod tests {
             assert_eq!(rewritten_tree.lookup(&keys[8192]).await.unwrap(), None);
             assert_eq!(tree.lookup(&keys[4096]).await.unwrap(), Some(4196));
             assert_eq!(tree.lookup(&keys[8192]).await.unwrap(), Some(8292));
-            assert!(mutable.root().gc_block_list.is_empty());
         });
     }
 
@@ -2878,7 +2921,6 @@ mod tests {
             assert_eq!(new_tree.prefix_scan(&key1).await.unwrap(), vec![11, 12]);
             assert!(!new_tree.contains_exact(&key1, 10).await.unwrap());
             assert_eq!(tree.prefix_scan(&key1).await.unwrap(), vec![10, 11]);
-            assert!(mutable.root().gc_block_list.is_empty());
         });
     }
 
@@ -3273,7 +3315,6 @@ mod tests {
                 .map(|(_, row_id)| row_id)
                 .collect::<Vec<_>>();
             assert_eq!(rows, vec![10, 20, 30]);
-            assert!(mutable.root().gc_block_list.is_empty());
         });
     }
 
@@ -3350,7 +3391,6 @@ mod tests {
 
             assert_eq!(tree.prefix_scan(&key1).await.unwrap(), vec![10, 11]);
             assert_eq!(tree.prefix_scan(&key2).await.unwrap(), vec![20]);
-            assert!(mutable.root().gc_block_list.is_empty());
         });
     }
 
@@ -3439,7 +3479,80 @@ mod tests {
                 tree.scan_entries().await.unwrap().len(),
                 ENTRY_COUNT as usize
             );
-            assert!(mutable.root().gc_block_list.is_empty());
+        });
+    }
+
+    #[test]
+    fn test_collect_reachable_blocks_skips_secondary_leaf_reads() {
+        smol::block_on(async {
+            let (_temp_dir, fs) = build_test_fs();
+            let metadata = metadata_with_indexes();
+            let table = fs
+                .create_table_file(test_user_table_id(309), Arc::clone(&metadata), false)
+                .unwrap();
+            let (table, old_root) = table.commit(1, false).await.unwrap();
+            drop(old_root);
+            let write_global = global_readonly_pool_scope(64 * 1024 * 1024);
+            let write_disk_pool =
+                table_readonly_pool(&write_global, test_user_table_id(309), &table);
+            let write_guard = write_disk_pool.pool_guard();
+            let mut mutable =
+                crate::file::table_file::MutableTableFile::fork(&table, fs.background_writes());
+            let write_runtime = unique_runtime!(metadata, write_disk_pool);
+            let tree = write_runtime.open(SUPER_BLOCK_ID, &write_guard);
+
+            const ENTRY_COUNT: u32 = 10_000;
+            let keys = (0..ENTRY_COUNT)
+                .map(|idx| [Val::from(idx)])
+                .collect::<Vec<_>>();
+            let puts = keys
+                .iter()
+                .enumerate()
+                .map(|(idx, key)| UniqueDiskTreePut {
+                    key,
+                    row_id: idx as RowID + 100,
+                })
+                .collect::<Vec<_>>();
+            let mut writer = tree.batch_writer(&mut mutable, 2);
+            writer.batch_put(&puts).unwrap();
+            let root = writer.finish().await.unwrap();
+
+            let inspect_global = global_readonly_pool_scope(64 * 1024 * 1024);
+            let inspect_disk_pool =
+                table_readonly_pool(&inspect_global, test_user_table_id(309), &table);
+            let inspect_guard = inspect_disk_pool.pool_guard();
+            let inspect_runtime = unique_runtime!(metadata, inspect_disk_pool);
+            let inspect_tree = inspect_runtime.open(root, &inspect_guard);
+            let root_guard = inspect_tree.read_node(root).await.unwrap();
+            assert_eq!(root_guard.node().height(), 1);
+            let leaf_entries =
+                branch_entries_from_node(root_guard.node(), inspect_tree.file_kind(), root)
+                    .unwrap();
+            assert!(leaf_entries.iter().all(|entry| entry.height == 0));
+            drop(root_guard);
+
+            let collect_global = global_readonly_pool_scope(64 * 1024 * 1024);
+            let collect_disk_pool =
+                table_readonly_pool(&collect_global, test_user_table_id(309), &table);
+            let collect_guard = collect_disk_pool.pool_guard();
+            let collect_runtime = unique_runtime!(metadata, collect_disk_pool);
+            let collect_tree = collect_runtime.open(root, &collect_guard);
+            let start_stats = collect_disk_pool.global_stats();
+            let mut reachable = BTreeSet::new();
+            collect_tree
+                .collect_reachable_blocks(&mut reachable)
+                .await
+                .unwrap();
+            let delta = collect_disk_pool.global_stats().delta_since(start_stats);
+
+            assert_eq!(delta.cache_misses, 1);
+            assert_eq!(delta.queued_reads, 1);
+            assert_eq!(delta.completed_reads, 1);
+            assert_eq!(reachable.len(), leaf_entries.len() + 1);
+            assert!(reachable.contains(&root));
+            for entry in leaf_entries {
+                assert!(reachable.contains(&entry.block_id));
+            }
         });
     }
 

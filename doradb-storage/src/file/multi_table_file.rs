@@ -49,7 +49,7 @@ fn catalog_root_descriptor_invariant(message: impl Into<String>) -> Error {
 }
 
 /// On-disk format version of `catalog.mtb`.
-pub const CATALOG_MTB_VERSION: u64 = 2;
+pub const CATALOG_MTB_VERSION: u64 = 3;
 /// Reserved number of catalog logical-table root descriptors.
 pub const CATALOG_TABLE_ROOT_DESC_COUNT: usize = 4;
 /// Initial sparse-file size for `catalog.mtb`.
@@ -85,8 +85,8 @@ impl CatalogTableRootDesc {
 
 /// File-specific payload persisted in `catalog.mtb` meta blocks.
 ///
-/// Generic CoW bookkeeping fields (`alloc_map`, `gc_block_list`, `meta_block_id`)
-/// are stored on the shared active root, not in this payload struct.
+/// Generic CoW bookkeeping fields (`alloc_map`, `meta_block_id`) are stored on
+/// the shared active root, not in this payload struct.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MultiTableMetaBlock {
     /// Global next user object-id allocator watermark.
@@ -127,14 +127,13 @@ impl MultiTableActiveRoot {
             MIN_SNAPSHOT_TS,
             SUPER_BLOCK_ID,
             alloc_map,
-            vec![],
             MultiTableMetaBlock::new(USER_OBJ_ID_START),
         )
     }
 
     #[inline]
     pub fn meta_block_ser_view(&self) -> MultiTableMetaBlockSerView<'_> {
-        MultiTableMetaBlockSerView::new(&self.meta, &self.alloc_map, &self.gc_block_list)
+        MultiTableMetaBlockSerView::new(&self.meta, &self.alloc_map)
     }
 }
 
@@ -203,7 +202,6 @@ fn parse_multi_table_meta_block(
             table_roots: meta_block.table_roots,
         },
         alloc_map: meta_block.alloc_map,
-        gc_block_list: meta_block.gc_block_list,
     })
 }
 
@@ -224,14 +222,11 @@ fn validate_multi_table_root(
 fn build_multi_table_meta_block(root: &MultiTableActiveRoot) -> Result<DirectBuf> {
     let meta_block = root.meta_block_ser_view();
     let meta_len = meta_block.ser_len();
-    if meta_len > max_payload_len(COW_FILE_PAGE_SIZE)
-        || root.gc_block_list.len() > u32::MAX as usize
-    {
+    if meta_len > max_payload_len(COW_FILE_PAGE_SIZE) {
         return Err(Report::new(ResourceError::StorageFileCapacityExceeded)
             .attach(format!(
-                "multi-table meta block payload too large: actual_bytes={meta_len}, max_bytes={}, gc_blocks={}",
-                max_payload_len(COW_FILE_PAGE_SIZE),
-                root.gc_block_list.len()
+                "multi-table meta block payload too large: actual_bytes={meta_len}, max_bytes={}",
+                max_payload_len(COW_FILE_PAGE_SIZE)
             ))
             .into());
     }
@@ -470,12 +465,6 @@ impl MutableMultiTableFile {
         self.new_root_mut().rollback_allocated_block_id(block_id)
     }
 
-    /// Record an obsolete page id to be reclaimed after commit.
-    #[inline]
-    pub fn record_gc_block(&mut self, block_id: BlockID) {
-        self.new_root_mut().gc_block_list.push(block_id);
-    }
-
     /// Write one page into the underlying multi-table file.
     #[inline]
     pub(crate) async fn write_block(&self, block_id: BlockID, buf: DirectBuf) -> Result<()> {
@@ -567,11 +556,6 @@ impl MutableCowFile for MutableMultiTableFile {
     #[inline]
     fn rollback_allocated_block_id(&mut self, block_id: BlockID) -> Result<()> {
         MutableMultiTableFile::rollback_allocated_block_id(self, block_id)
-    }
-
-    #[inline]
-    fn record_gc_block(&mut self, block_id: BlockID) {
-        MutableMultiTableFile::record_gc_block(self, block_id)
     }
 
     #[inline]
@@ -736,16 +720,6 @@ mod tests {
 
             assert_ne!(meta_block_id_0, meta_block_id_1);
             assert_ne!(meta_block_id_1, meta_block_id_2);
-            assert!(
-                mtb.active_root_unchecked()
-                    .gc_block_list
-                    .contains(&meta_block_id_0)
-            );
-            assert!(
-                mtb.active_root_unchecked()
-                    .gc_block_list
-                    .contains(&meta_block_id_1)
-            );
         });
     }
 
@@ -978,7 +952,6 @@ mod tests {
                 0,
                 active_meta_block_id,
                 parsed_meta.alloc_map,
-                parsed_meta.gc_block_list,
                 parsed_meta.meta,
             );
             let invalid_meta_buf = build_multi_table_meta_block(&invalid_root).unwrap();

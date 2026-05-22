@@ -230,7 +230,7 @@ pub(crate) async fn create_index_for_session(
     // 8. Publish the table root that proves the new index metadata durable.
     // Failure after catalog commit poisons storage per the RFC 0018 policy.
     let root_publish = mutable_file.commit(create_cts, false).await;
-    let (_table_file, old_root) = match root_publish {
+    let (table_file, old_root) = match root_publish {
         Ok(res) => res,
         Err(err) => {
             return builder
@@ -238,7 +238,9 @@ pub(crate) async fn create_index_for_session(
                 .await;
         }
     };
-    engine.trx_sys.retain_published_table_root(old_root);
+    engine
+        .trx_sys
+        .mark_published_table_root(&table_file, old_root);
 
     // 9. Install the new runtime layout last. Existing snapshots keep their old
     // layout Arcs, while later foreground work observes the new index.
@@ -329,7 +331,7 @@ pub(crate) async fn drop_index_for_session(
     let drop_cts = builder.commit_catalog().await?;
 
     let root_publish = mutable_file.commit(drop_cts, false).await;
-    let (_table_file, old_root) = match root_publish {
+    let (table_file, old_root) = match root_publish {
         Ok(res) => res,
         Err(err) => {
             return builder
@@ -337,7 +339,9 @@ pub(crate) async fn drop_index_for_session(
                 .await;
         }
     };
-    engine.trx_sys.retain_published_table_root(old_root);
+    engine
+        .trx_sys
+        .mark_published_table_root(&table_file, old_root);
 
     let new_layout = match builder.take_layout_for_install() {
         Ok(layout) => layout,

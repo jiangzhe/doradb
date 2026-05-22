@@ -241,8 +241,6 @@ pub(crate) enum InternalError {
     ColumnIndexPathInvariant,
     #[error("column index search type missing")]
     ColumnIndexSearchTypeMissing,
-    #[error("column index gc page invariant violated")]
-    ColumnIndexGcPageInvariant,
     #[error("column index out of bounds")]
     ColumnIndexOutOfBounds,
     #[error("secondary index out of bounds")]

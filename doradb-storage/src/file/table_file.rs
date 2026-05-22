@@ -12,8 +12,7 @@ use crate::file::cow_file::{
 };
 use crate::file::fs::BackgroundWriteRequest;
 use crate::file::meta_block::{
-    AllocMapGcListSerView, MetaBlock, MetaBlockSerView, TABLE_META_BLOCK_MAGIC_WORD,
-    TABLE_META_BLOCK_VERSION,
+    MetaBlock, MetaBlockSerView, TABLE_META_BLOCK_MAGIC_WORD, TABLE_META_BLOCK_VERSION,
 };
 use crate::file::super_block::{
     SUPER_BLOCK_FOOTER_OFFSET, SUPER_BLOCK_SIZE, SUPER_BLOCK_VERSION, SuperBlock, SuperBlockBody,
@@ -28,6 +27,7 @@ use crate::serde::{Deser, Ser};
 use crate::trx::{MIN_SNAPSHOT_TS, TrxID};
 use error_stack::{Report, ResultExt};
 use futures::future::try_join_all;
+use std::collections::BTreeSet;
 use std::mem;
 use std::sync::Arc;
 
@@ -124,7 +124,6 @@ impl ActiveRoot {
             trx_id,
             SUPER_BLOCK_ID,
             alloc_map,
-            vec![],
             TableMeta {
                 metadata,
                 column_block_index_root: SUPER_BLOCK_ID,
@@ -159,7 +158,7 @@ impl ActiveRoot {
             self.metadata.ser_view(),
             self.column_block_index_root,
             &self.secondary_index_roots,
-            AllocMapGcListSerView::new(&self.alloc_map, &self.gc_block_list),
+            &self.alloc_map,
             self.pivot_row_id,
             self.heap_redo_start_ts,
             self.deletion_cutoff_ts,
@@ -204,7 +203,6 @@ fn parse_table_meta_block(page_id: BlockID, buf: &[u8]) -> Result<ParsedMeta<Tab
             deletion_cutoff_ts: meta_block.deletion_cutoff_ts,
         },
         alloc_map: meta_block.alloc_map,
-        gc_block_list: meta_block.gc_block_list,
     })
 }
 
@@ -339,6 +337,13 @@ impl TableFile {
     #[inline]
     pub(super) fn install_loaded_root(&self, active_root: ActiveRoot) -> Option<OldRoot> {
         self.file.swap_active_root(active_root)
+    }
+
+    /// Install the post-publish effective timestamp for the current active root.
+    #[inline]
+    pub(crate) fn install_active_root_effective_ts(&self, effective_ts: TrxID) {
+        self.active_root_unchecked()
+            .install_effective_ts(effective_ts);
     }
 }
 
@@ -573,13 +578,16 @@ impl MutableTableFile {
         self.new_root_mut().rollback_allocated_block_id(block_id)
     }
 
-    /// Record an obsolete block id in the legacy compatibility GC list.
+    /// Rebuild the mutable root allocation map from root-reachable blocks.
     ///
-    /// User-table block reclamation should move to root reachability instead
-    /// of using this list as the forward reclaim mechanism.
+    /// Returns the number of allocation bits cleared by the rebuild.
     #[inline]
-    pub fn record_gc_block(&mut self, block_id: BlockID) {
-        self.new_root_mut().gc_block_list.push(block_id);
+    pub(crate) fn rebuild_alloc_map_from_reachable(
+        &mut self,
+        reachable: &BTreeSet<BlockID>,
+    ) -> Result<usize> {
+        self.new_root_mut()
+            .rebuild_alloc_map_from_reachable(reachable)
     }
 
     /// Write one page into the underlying table file.
@@ -726,11 +734,6 @@ impl MutableCowFile for MutableTableFile {
     #[inline]
     fn rollback_allocated_block_id(&mut self, block_id: BlockID) -> Result<()> {
         MutableTableFile::rollback_allocated_block_id(self, block_id)
-    }
-
-    #[inline]
-    fn record_gc_block(&mut self, block_id: BlockID) {
-        MutableTableFile::record_gc_block(self, block_id)
     }
 
     #[inline]

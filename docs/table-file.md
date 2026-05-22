@@ -73,23 +73,22 @@ The active `MetaBlock` stores:
 - `heap_redo_start_ts`
 - `deletion_cutoff_ts`
 - checkpoint transaction id / publication timestamp
-- legacy GC list of obsolete pages
 
 Notably, the table file does **not** need `index_rec_cts`.
 
 Persistent secondary-index state is recovered by loading the checkpointed
 `DiskTree` roots directly. Hot post-checkpoint index state is rebuilt from redo.
-The serialized GC list is compatibility metadata, not the forward block
-reclamation design for user tables. Future table-file cleanup should derive
-reclaimable blocks from checkpoint-root reachability.
+The current table-file format does not persist an obsolete-page side list.
+Table-file cleanup derives reclaimable blocks from checkpoint-root
+reachability.
 
 ### 4.2 Lifecycle
 
 - a new `MetaBlock` is created for each successful table checkpoint publication
 - the new `MetaBlock` copies unchanged roots from the previous one
 - changed roots are overwritten with new CoW page ids
-- the previous `MetaBlock` id and other obsolete pages are appended to the new
-  GC list
+- obsolete CoW blocks become reclaimable only after the root-reachability gate
+  proves no active transaction can still observe the displaced root
 
 ### 4.3 Runtime Root Access
 
@@ -119,9 +118,10 @@ Long-running readers are protected by root indirection:
 
 - old `MetaBlock` snapshots remain valid until no active reader needs them
 - page reclamation only happens after that retention condition is satisfied
-- transition from `GC_Wait` to `Free` is future root-reachability GC work,
-  covering table metadata, `ColumnBlockIndex` nodes, LWC replacement blocks,
-  and secondary-index `DiskTree` blocks
+- transition from `GC_Wait` to `Free` is checkpoint-integrated
+  root-reachability work, covering table metadata, `ColumnBlockIndex` nodes,
+  LWC replacement blocks, external deletion blob pages, and secondary-index
+  `DiskTree` blocks
 
 Whole-table deletion is outside table-file page GC. After a committed
 `DROP TABLE`, transaction GC first destroys the removed runtime after
@@ -194,30 +194,35 @@ If no cold-delete payload changes are selected, checkpoint can still publish a
 metadata-only root that advances `deletion_cutoff_ts` to the checkpoint
 `cutoff_ts`.
 
-### 7.3 Checkpoint Readiness
+### 7.3 Checkpoint Readiness And Reclamation
 
-User-table checkpoint publication is gated by the active root's liveness:
+User-table checkpoint publication is gated by the active root's runtime
+effective timestamp:
 
 ```text
-active_root.trx_id < Global_Min_Active_STS
+active_root.effective_ts < Global_Min_Active_STS
 ```
 
-If the active root checkpoint timestamp is equal to or newer than the GC
-horizon, checkpoint returns a normal delayed outcome and does not move frozen
-pages into transition, publish DiskTree roots, advance delete metadata, or swap
-the table-file root.
+`effective_ts` is allocated after a table-root pointer swap. It is not
+persisted. Loaded roots initialize it from the selected durable root's `trx_id`,
+because no active pre-crash reader can still hold an older root. If the active
+root effective timestamp is equal to or newer than the GC horizon, checkpoint
+returns a normal delayed outcome and does not move frozen pages into transition,
+publish DiskTree roots, advance delete metadata, rebuild allocation state, or
+swap the table-file root.
 
 The check is repeated against the mutable root snapshot that will be published
 from, so a scheduler preflight cannot race with the root actually displaced by
-the A/B super-block swap. Once the active root crosses the horizon, overwriting
-the inactive slot is safe: no active transaction still needs the root that would
-be displaced by that swap, and the old root from the successful publication is
-retained in the table-root retention queue.
+the A/B super-block swap. Once the active root crosses the horizon, checkpoint
+may rebuild the mutable root's allocation map from only two protected roots:
+the current active root and the mutable root about to be published. This
+reclaims obsolete CoW blocks and dropped secondary-index `DiskTree` pages
+without a foreground vacuum command.
 
-Root retention uses a post-publish fence timestamp allocated immediately after
-the active-root pointer swap. The old root is released only after
-`fence_ts < Global_Min_Active_STS`, which covers both checkpoint publication
-and metadata-changing DDL such as `CREATE INDEX`.
+Root retention uses the same post-publish effective timestamp. The old root is
+released only after `effective_ts < Global_Min_Active_STS`, which covers both
+checkpoint publication and metadata-changing DDL such as `CREATE INDEX` and
+`DROP INDEX`.
 
 ### 7.4 Generic Publish Flow
 

@@ -107,11 +107,16 @@ deletion checkpoint. Old `DiskTree` pages become reclaimable only after the
 table-file CoW root that references them is no longer reachable by active
 readers. Root reachability GC is separate from `MemIndex` cleanup.
 
-The same root-reachability proof should be the forward reclaim mechanism for
+The same root-reachability proof is the forward reclaim mechanism for
 user-table metadata blocks, `ColumnBlockIndex` nodes, replacement LWC blocks,
-and secondary-index `DiskTree` pages. The persisted `gc_block_list` remains
-compatibility metadata and should not be extended as the future user-table block
-reclaim contract.
+external deletion blob pages, and secondary-index `DiskTree` pages. Checkpoint
+uses a runtime root `effective_ts`, allocated after table-root publication, to
+prove that no active transaction can still have observed a root displaced before
+that publication. Once `effective_ts < Global_Min_Active_STS`, checkpoint can
+rebuild the mutable root's allocation map from the current active root and the
+mutable root about to be published. The current meta-block format does not
+persist an obsolete-block side list; root reachability and the rebuilt
+allocation map are the reclaim contract.
 
 Recovery can apply a simpler reachability rule: after restart there are no
 active transactions, so blocks unreachable from the selected latest valid root

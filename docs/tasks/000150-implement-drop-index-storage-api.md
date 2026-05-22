@@ -261,8 +261,8 @@ pub(crate) fn try_without_index(&self, index_no: IndexNo) -> Result<TableMetadat
 9. Publish the table-file root.
    - Fork the mutable table file after the table metadata-change lease is held.
    - Commit the root with the DDL commit timestamp.
-   - Retain the displaced old root with
-     `TransactionSystem::retain_published_table_root`.
+   - Mark the published root and retain the displaced old root with
+     `TransactionSystem::mark_published_table_root`.
    - If root publication fails after catalog commit, mark storage unhealthy
      using the existing fatal index-DDL failure pattern.
 

@@ -246,6 +246,9 @@ impl Session {
         // 7. commit file with cts.
         let (table_file, old_root) = uninit_table_file.commit(cts, true).await?;
         debug_assert!(old_root.is_none());
+        engine
+            .trx_sys
+            .mark_published_table_root(&table_file, old_root);
 
         // 8. Prepare in-memory representation of new table
         let meta_pool_guard = self.pool_guards().meta_guard();
