@@ -1,7 +1,7 @@
 ---
 id: 000152
 title: Split Table Metadata Column and Index Layouts
-status: proposal
+status: implemented
 created: 2026-05-21
 github_issue: 644
 ---
@@ -278,6 +278,75 @@ cargo nextest run -p doradb-storage --no-default-features --features libaio
 
 ## Implementation Notes
 
+Implemented the metadata split and converted the row-byte call paths to use the
+precise layout they need:
+
+- Added `TableColumnLayout` and `TableIndexLayout` in `catalog/table.rs`.
+  `TableMetadata` now composes `Arc<TableColumnLayout>` plus
+  `TableIndexLayout` as crate-private `col` and `idx` fields. No
+  `Deref<Target = TableColumnLayout>` was added; call sites use explicit
+  `metadata.col` or `metadata.idx` access.
+- Moved row-page, row-read, vector-scan, LWC build/decode, undo, and recovery
+  byte interpretation APIs onto `&TableColumnLayout`. `RowVersionMap` now owns
+  only `Arc<TableColumnLayout>`, and table scans use the page-local
+  row-version column layout rather than active table metadata.
+- Kept active secondary-index decisions on the current runtime metadata/index
+  layout. Index key generation, sparse slot validation, create/drop transforms,
+  checkpoint sidecars, recovery reconciliation, and purge cleanup now reference
+  `TableIndexLayout` explicitly.
+- Preserved table-file, catalog, redo, row-page, and LWC persisted formats.
+  Metadata serialization still emits the same logical column metadata,
+  `next_index_no`, and active sparse index specs.
+- Tightened implementation-detail exposure where this task touched it:
+  `BufferFrame` methods are crate-private, `init_undo_map` takes
+  `Arc<TableColumnLayout>`, row/block page allocation APIs take column layout
+  directly, and `RowWriteAccess::update_row` no longer takes full table
+  metadata.
+- Updated examples and tests to construct/use column layout explicitly where
+  required. Broader cleanup for example-only public internals is deferred to
+  `docs/backlogs/000105-gate-storage-internals-behind-bench-internals.md`.
+- Closed source backlog
+  `docs/backlogs/closed/000102-split-table-metadata-column-index-layouts.md`
+  as implemented by this task.
+- Added focused coverage for component layout construction, index-only metadata
+  changes sharing column layout, row/LWC decode stability, `RowVersionMap`
+  column-layout ownership, row/block page allocation, and update paths.
+- No unsafe code was added or modified.
+
+Task checklist result before resolve: pass. No required fixes remain.
+
+## Validation
+
+Run during resolve:
+
+```bash
+cargo fmt --all --check
+cargo check -p doradb-storage --tests --examples
+cargo clippy -p doradb-storage --all-targets -- -D warnings
+cargo nextest run -p doradb-storage
+tools/coverage_focus.rs \
+  --path doradb-storage/src/catalog/table.rs \
+  --path doradb-storage/src/buffer/frame.rs \
+  --path doradb-storage/src/index/row_page_index.rs \
+  --path doradb-storage/src/index/block_index.rs \
+  --path doradb-storage/src/trx/recover.rs \
+  --path doradb-storage/src/trx/row.rs \
+  --path doradb-storage/src/trx/ver_map.rs \
+  --path doradb-storage/src/row \
+  --path doradb-storage/src/lwc \
+  --path doradb-storage/src/table
+```
+
+Results:
+
+- Formatting, check, and clippy passed.
+- `cargo nextest run -p doradb-storage`: 798 tests passed.
+- Focused coverage: 22254/24502 lines, 90.83% deduplicated total.
+- Focused coverage targets all met the 80% bar:
+  `catalog/table.rs` 94.94%, `buffer/frame.rs` 94.69%,
+  `index/row_page_index.rs` 91.40%, `index/block_index.rs` 81.68%,
+  `trx/recover.rs` 96.00%, `trx/row.rs` 84.96%, `trx/ver_map.rs` 100.00%,
+  `row` 91.42%, `lwc` 92.64%, and `table` 89.65%.
 
 ## Impacts
 
@@ -373,6 +442,12 @@ cargo nextest run -p doradb-storage --no-default-features --features libaio
 ## Open Questions
 
 No open design questions are left for this task.
+
+Deferred follow-up:
+
+- `docs/backlogs/000105-gate-storage-internals-behind-bench-internals.md`
+  tracks adding a `bench-internals` feature and centralized re-export facade so
+  example/benchmark-only internals do not force normal library API visibility.
 
 Future column DDL remains intentionally out of scope. If a later feature needs
 column additions, drops, or type changes, it should start from an RFC that
