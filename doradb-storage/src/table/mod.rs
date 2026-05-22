@@ -89,7 +89,7 @@ impl Table {
         // root to seed metadata and hot/cold secondary-index state.
         let active_root = file.active_root_unchecked();
         let metadata = Arc::clone(&active_root.metadata);
-        let secondary_index_count = metadata.index_slot_count();
+        let secondary_index_count = metadata.idx.index_slot_count();
         let sec_idx = build_dual_tree_secondary_indexes(
             index_pool,
             index_pool_guard,
@@ -593,7 +593,7 @@ impl Table {
         }
         let mut lwc_blocks = Vec::new();
         if !frozen_pages.is_empty() {
-            let mut builder = LwcBuilder::new(metadata);
+            let mut builder = LwcBuilder::new(metadata.col.as_ref());
             let mut current_start: RowID = 0;
             let mut current_end: RowID = 0;
             for page_info in frozen_pages {
@@ -602,7 +602,12 @@ impl Table {
                     .must_get_row_page_shared(guards, page_info.page_id)
                     .await?;
                 let (ctx, page) = page_guard.ctx_and_page();
-                let view = page.vector_view_in_transition(metadata, ctx, cutoff_ts, cutoff_ts);
+                let view = page.vector_view_in_transition(
+                    metadata.col.as_ref(),
+                    ctx,
+                    cutoff_ts,
+                    cutoff_ts,
+                );
                 if view.rows_non_deleted() == 0 {
                     continue;
                 }
@@ -626,10 +631,15 @@ impl Table {
                     )?;
                     let buf = builder.build(shape.row_shape_fingerprint())?;
                     lwc_blocks.push(LwcBlockPersist { shape, buf });
-                    builder = LwcBuilder::new(metadata);
+                    builder = LwcBuilder::new(metadata.col.as_ref());
                     current_start = page_info.start_row_id;
                     current_end = page_info.end_row_id;
-                    let view = page.vector_view_in_transition(metadata, ctx, cutoff_ts, cutoff_ts);
+                    let view = page.vector_view_in_transition(
+                        metadata.col.as_ref(),
+                        ctx,
+                        cutoff_ts,
+                        cutoff_ts,
+                    );
                     if !builder.append_view(page, view)? {
                         return Err(Report::new(InternalError::LwcBuilderMisuse)
                             .attach(format!(
@@ -801,12 +811,12 @@ impl Table {
         cts: TrxID,
     ) -> Recover {
         let (ctx, page) = page_guard.ctx_and_page_mut();
-        debug_assert!(metadata.col_count() == page.header.col_count as usize);
+        debug_assert!(metadata.col.col_count() == page.header.col_count as usize);
         debug_assert!(cols.len() == page.header.col_count as usize);
         let row_idx = page.row_idx(row_id);
         // Insert log should always be located to an empty slot.
         debug_assert!(ctx.recover().unwrap().is_vacant(row_idx));
-        let var_len = var_len_for_insert(metadata, cols);
+        let var_len = var_len_for_insert(metadata.col.as_ref(), cols);
         let (var_offset, var_end) = if let Some(var_offset) = page.request_free_space(var_len) {
             (var_offset, var_offset + var_len)
         } else {
@@ -820,7 +830,7 @@ impl Table {
         let mut row = page.row_mut_exclusive(row_idx, var_offset, var_end);
         debug_assert!(row.is_deleted()); // before recovery, this row should be initialized as deleted.
         for (user_col_idx, user_col) in cols.iter().enumerate() {
-            row.update_col(metadata, user_col_idx, user_col, false);
+            row.update_col(metadata.col.as_ref(), user_col_idx, user_col, false);
         }
         row.finish_insert()
     }
@@ -835,7 +845,11 @@ impl Table {
         cts: TrxID,
     ) -> Result<RecoverIndex> {
         let index = layout.secondary_index(key.index_no)?;
-        let index_unique = layout.metadata().require_index_spec(key.index_no)?.unique();
+        let index_unique = layout
+            .metadata()
+            .idx
+            .require_index_spec(key.index_no)?
+            .unique();
         debug_assert_eq!(index.is_unique(), index_unique);
         if index_unique {
             self.recover_unique_index_insert(index.unique_mem()?, guards, key, row_id, cts)
@@ -855,7 +869,11 @@ impl Table {
         row_id: RowID,
     ) -> Result<RecoverIndex> {
         let index = layout.secondary_index(key.index_no)?;
-        let index_unique = layout.metadata().require_index_spec(key.index_no)?.unique();
+        let index_unique = layout
+            .metadata()
+            .idx
+            .require_index_spec(key.index_no)?
+            .unique();
         debug_assert_eq!(index.is_unique(), index_unique);
         if index_unique {
             self.recover_unique_index_delete(index.unique_mem()?, guards, key, row_id)
@@ -917,21 +935,21 @@ impl Table {
         let disable_index = index_change_cols.is_none();
         if disable_index {
             for uc in cols {
-                row.update_col(metadata, uc.idx, &uc.val, true);
+                row.update_col(metadata.col.as_ref(), uc.idx, &uc.val, true);
             }
             row.finish_update()
         } else {
             // collect index change columns.
             let index_change_cols = index_change_cols.unwrap();
             for uc in cols {
-                if let Some((old_val, _)) = row.different(metadata, uc.idx, &uc.val) {
+                if let Some((old_val, _)) = row.different(metadata.col.as_ref(), uc.idx, &uc.val) {
                     // we also check whether the value change is related to any index,
                     // so we can update index later.
-                    if metadata.index_cols.contains(&uc.idx) {
+                    if metadata.idx.index_columns().contains(&uc.idx) {
                         index_change_cols.insert(uc.idx, old_val);
                     }
                     // actual update
-                    row.update_col(metadata, uc.idx, &uc.val, true);
+                    row.update_col(metadata.col.as_ref(), uc.idx, &uc.val, true);
                 }
             }
             row.finish_update()
@@ -960,8 +978,8 @@ impl Table {
         if let Some(index_cols) = cols {
             // save index columns for index update.
             let row = page.row(row_idx);
-            for idx_col_no in &metadata.index_cols {
-                let val = row.val(metadata, *idx_col_no);
+            for idx_col_no in metadata.idx.index_columns() {
+                let val = row.val(metadata.col.as_ref(), *idx_col_no);
                 index_cols.insert(*idx_col_no, val);
             }
         }
@@ -1234,8 +1252,8 @@ pub(crate) async fn build_dual_tree_secondary_indexes(
     disk_pool: QuiescentGuard<ReadonlyBufferPool>,
     index_ts: TrxID,
 ) -> Result<Box<[Option<Arc<SecondaryIndex<EvictableBufferPool>>>]>> {
-    let mut builder = SecondaryIndexScopedBuilder::new(metadata.index_slot_count());
-    for (index_no, index_spec) in metadata.active_indexes() {
+    let mut builder = SecondaryIndexScopedBuilder::new(metadata.idx.index_slot_count());
+    for (index_no, index_spec) in metadata.idx.active_indexes() {
         let runtime = match SecondaryDiskTreeRuntime::new(
             index_no,
             Arc::clone(&metadata),
@@ -1248,7 +1266,7 @@ pub(crate) async fn build_dual_tree_secondary_indexes(
                 return Err(err);
             }
         };
-        let ty_infer = |col_no: usize| metadata.col_type(col_no);
+        let ty_infer = |col_no: usize| metadata.col.col_type(col_no);
         let index = if index_spec.unique() {
             let mem = match UniqueMemIndex::new(
                 index_pool.clone(),
@@ -1304,7 +1322,8 @@ fn validate_page_row_range(
 #[inline]
 fn row_len(metadata: &TableMetadata, cols: &[Val]) -> usize {
     let var_len = metadata
-        .var_cols
+        .col
+        .var_cols()
         .iter()
         .map(|idx| {
             let val = &cols[*idx];
@@ -1321,7 +1340,7 @@ fn row_len(metadata: &TableMetadata, cols: &[Val]) -> usize {
             }
         })
         .sum::<usize>();
-    metadata.fix_len + var_len
+    metadata.col.fix_len() + var_len
 }
 
 enum InsertRowIntoPage {
@@ -1389,13 +1408,14 @@ fn read_latest_index_key(
     row_id: RowID,
 ) -> SelectKey {
     let index_spec = metadata
+        .idx
         .index_spec(index_no)
         .expect("active index spec must exist for latest key read");
     let mut new_key = SelectKey::null(index_no, index_spec.cols.len());
     for (pos, key) in index_spec.cols.iter().enumerate() {
         let (ctx, page) = page_guard.ctx_and_page();
         let access = RowReadAccess::new(page, ctx, page.row_idx(row_id));
-        let val = access.row().val(metadata, key.col_no as usize);
+        let val = access.row().val(metadata.col.as_ref(), key.col_no as usize);
         new_key.vals[pos] = val;
     }
     new_key

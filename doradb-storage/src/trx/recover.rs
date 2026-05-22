@@ -18,7 +18,7 @@ use crate::buffer::{
     BufferPool, EvictableBufferPool, FixedBufferPool, PoolGuards, PoolRole, ReadonlyBufferPool,
 };
 use crate::catalog::{
-    Catalog, CatalogTable, IndexDdlKind, IndexDdlRootProof, TableID, TableMetadata,
+    Catalog, CatalogTable, IndexDdlKind, IndexDdlRootProof, TableColumnLayout, TableID,
     classify_index_ddl_root, is_catalog_obj_id, is_user_obj_id,
 };
 use crate::error::{DataIntegrityError, Error, OperationError, Result};
@@ -538,7 +538,8 @@ impl<'a> LogRecovery<'a> {
                     table
                         .populate_index_via_row_page(&self.pool_guards, *page_id)
                         .await?;
-                    self.refresh_page(Arc::clone(&metadata), *page_id).await?;
+                    self.refresh_page(Arc::clone(&metadata.col), *page_id)
+                        .await?;
                 }
             }
         }
@@ -565,8 +566,8 @@ impl<'a> LogRecovery<'a> {
                         "recovered user table metadata mismatch after redo replay: table_id={table_id}, root_trx_id={}, catalog_replay_start_ts={}, pending_index_ddl_reconciliation={pending}, catalog_next_index_no={}, root_next_index_no={}",
                         active_root.trx_id,
                         self.catalog_replay_start_ts,
-                        catalog_metadata.next_index_no(),
-                        active_root.metadata.next_index_no()
+                        catalog_metadata.idx.next_index_no(),
+                        active_root.metadata.idx.next_index_no()
                     ))
                     .into());
             }
@@ -587,7 +588,11 @@ impl<'a> LogRecovery<'a> {
         Ok(())
     }
 
-    async fn refresh_page(&self, metadata: Arc<TableMetadata>, page_id: PageID) -> Result<()> {
+    async fn refresh_page(
+        &self,
+        col_layout: Arc<TableColumnLayout>,
+        page_id: PageID,
+    ) -> Result<()> {
         let mut page_guard = self
             .mem_pool
             .get_page::<RowPage>(
@@ -608,7 +613,7 @@ impl<'a> LogRecovery<'a> {
             .map(|rec| rec.create_cts())
             .unwrap_or(0);
         let max_row_count = page_guard.page().header.max_row_count as usize;
-        page_guard.bf_mut().init_undo_map(metadata, max_row_count);
+        page_guard.bf_mut().init_undo_map(col_layout, max_row_count);
         if let Some(row_ver) = page_guard.bf().ctx.as_ref().and_then(|ctx| ctx.row_ver()) {
             row_ver.set_create_cts(create_cts);
         }
@@ -1387,9 +1392,9 @@ mod tests {
             .active_root_unchecked()
             .secondary_index_roots
             .clone();
-        roots.resize(metadata.index_slot_count(), SUPER_BLOCK_ID);
+        roots.resize(metadata.idx.index_slot_count(), SUPER_BLOCK_ID);
         for (index_no, root) in roots.iter_mut().enumerate() {
-            if metadata.index_spec(index_no).is_none() {
+            if metadata.idx.index_spec(index_no).is_none() {
                 *root = SUPER_BLOCK_ID;
             }
         }
@@ -1410,8 +1415,8 @@ mod tests {
     ) {
         let table = engine.catalog().get_table(table_id).await.unwrap();
         let metadata = table.metadata();
-        assert_eq!(metadata.next_index_no(), next_index_no);
-        assert_eq!(metadata.index_spec(1).is_some(), index_one_active);
+        assert_eq!(metadata.idx.next_index_no(), next_index_no);
+        assert_eq!(metadata.idx.index_spec(1).is_some(), index_one_active);
 
         let session = engine.try_new_session().unwrap();
         let table_obj = engine

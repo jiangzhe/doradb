@@ -99,10 +99,10 @@ pub(crate) async fn create_index_for_session(
     let (index_no, new_metadata_value) = old_metadata.try_with_created_index(index_spec)?;
     let new_metadata = Arc::new(new_metadata_value);
     let index_no_usize = usize::from(index_no);
-    let new_index_spec = new_metadata.require_index_spec(index_no_usize)?.clone();
+    let new_index_spec = new_metadata.idx.require_index_spec(index_no_usize)?.clone();
 
     let mut secondary_index_roots = active_root.secondary_index_roots.clone();
-    secondary_index_roots.resize(new_metadata.index_slot_count(), SUPER_BLOCK_ID);
+    secondary_index_roots.resize(new_metadata.idx.index_slot_count(), SUPER_BLOCK_ID);
     let disk_runtime = SecondaryDiskTreeRuntime::new(
         index_no_usize,
         Arc::clone(&new_metadata),
@@ -292,6 +292,7 @@ pub(crate) async fn drop_index_for_session(
     let old_metadata = old_layout.metadata();
     let index_no_usize = usize::from(index_no);
     let old_index_spec = old_metadata
+        .idx
         .index_spec(index_no_usize)
         .ok_or_else(|| drop_index_not_found(table_id, index_no, "inactive metadata slot"))?
         .clone();
@@ -860,7 +861,7 @@ fn validate_create_index_root_shape(
             ))
             .into());
     }
-    let expected_slots = metadata.index_slot_count();
+    let expected_slots = metadata.idx.index_slot_count();
     let actual_slots = active_root.secondary_index_roots.len();
     if actual_slots != expected_slots {
         return Err(Report::new(DataIntegrityError::InvalidRootInvariant)
@@ -875,7 +876,7 @@ fn validate_create_index_root_shape(
         .copied()
         .enumerate()
     {
-        if metadata.index_spec(index_no).is_none() && root != SUPER_BLOCK_ID {
+        if metadata.idx.index_spec(index_no).is_none() && root != SUPER_BLOCK_ID {
             return Err(Report::new(DataIntegrityError::InvalidRootInvariant)
                 .attach(format!(
                     "create index inactive secondary-root slot is non-empty before sparse slot reuse: table_id={table_id}, index_no={index_no}, root_block_id={root}, expected_root_block_id={SUPER_BLOCK_ID}"
@@ -900,7 +901,7 @@ fn validate_drop_index_root_shape(
             ))
             .into());
     }
-    let expected_slots = metadata.index_slot_count();
+    let expected_slots = metadata.idx.index_slot_count();
     let actual_slots = active_root.secondary_index_roots.len();
     if actual_slots != expected_slots {
         return Err(Report::new(DataIntegrityError::InvalidRootInvariant)
@@ -909,7 +910,7 @@ fn validate_drop_index_root_shape(
             ))
             .into());
     }
-    if metadata.index_spec(index_no).is_none() {
+    if metadata.idx.index_spec(index_no).is_none() {
         return Err(drop_index_not_found(
             table_id,
             index_no as IndexNo,
@@ -922,7 +923,7 @@ fn validate_drop_index_root_shape(
         .copied()
         .enumerate()
     {
-        if metadata.index_spec(slot_no).is_none() && root != SUPER_BLOCK_ID {
+        if metadata.idx.index_spec(slot_no).is_none() && root != SUPER_BLOCK_ID {
             return Err(Report::new(DataIntegrityError::InvalidRootInvariant)
                 .attach(format!(
                     "drop index inactive secondary-root slot is non-empty: table_id={table_id}, index_no={slot_no}, root_block_id={root}, expected_root_block_id={SUPER_BLOCK_ID}"
@@ -1020,7 +1021,7 @@ async fn collect_create_index_cold_rows(
             if create_index_cold_row_deleted_by_buffer(table, row_id)? {
                 continue;
             }
-            let key = block.decode_row_values(metadata, row_idx, &read_set)?;
+            let key = block.decode_row_values(&metadata.col, row_idx, &read_set)?;
             rows.push(CreateIndexRowEntry { key, row_id });
         }
     }
@@ -1131,14 +1132,14 @@ async fn collect_create_index_hot_rows(
     let mut rows = Vec::new();
     table
         .accessor_with_layout(layout.as_ref())
-        .table_scan_uncommitted(guards, |metadata, row| {
+        .table_scan_uncommitted(guards, |col_layout, row| {
             if row.is_deleted() {
                 return true;
             }
             let key = index_spec
                 .cols
                 .iter()
-                .map(|index_key| row.val(metadata, index_key.col_no as usize))
+                .map(|index_key| row.val(col_layout, index_key.col_no as usize))
                 .collect();
             rows.push(CreateIndexRowEntry {
                 key,
@@ -1165,7 +1166,7 @@ async fn build_create_index_runtime_index(
     } = build;
     let index_pool = engine.index_pool.clone_inner();
     let index_guard = guards.index_guard();
-    let ty_infer = |col_no| metadata.col_type(col_no);
+    let ty_infer = |col_no| metadata.col.col_type(col_no);
     if index_spec.unique() {
         validate_create_index_hot_unique_keys(
             metadata.as_ref(),
@@ -1284,7 +1285,7 @@ fn build_created_index_runtime_layout(
         .checked_add(1)
         .ok_or_else(|| create_index_internal("table runtime layout generation overflow"))?;
     let mut slots = old_layout.secondary_indexes().to_vec();
-    slots.resize_with(new_metadata.index_slot_count(), || None);
+    slots.resize_with(new_metadata.idx.index_slot_count(), || None);
     if slots.get(index_no).and_then(Option::as_ref).is_some() {
         return Err(create_index_internal(format!(
             "create index runtime slot is already occupied: index_no={index_no}"
@@ -1410,7 +1411,7 @@ async fn execute_create_index_catalog_update(
                 stmt,
                 &TableObject {
                     table_id,
-                    next_index_no: metadata.next_index_no(),
+                    next_index_no: metadata.idx.next_index_no(),
                 },
             )
             .await;
@@ -1528,7 +1529,7 @@ pub(crate) fn classify_index_ddl_root(
 
     let metadata = &active_root.metadata;
     let root_count = active_root.secondary_index_roots.len();
-    let slot_count = metadata.index_slot_count();
+    let slot_count = metadata.idx.index_slot_count();
     // Metadata and sparse secondary-root slots describe the same index-number
     // space. A mismatch means the active root itself is malformed, not merely
     // inconclusive for this DDL marker.
@@ -1542,7 +1543,7 @@ pub(crate) fn classify_index_ddl_root(
     // `next_index_no` is the allocation boundary. If the DDL's index number is
     // still outside that boundary, the root cannot prove even allocation of the
     // index number, regardless of create/drop kind.
-    if metadata.next_index_no() <= index_no {
+    if metadata.idx.next_index_no() <= index_no {
         return Ok(IndexDdlRootProof::Provisional);
     }
 
@@ -1560,7 +1561,7 @@ pub(crate) fn classify_index_ddl_root(
     // From here the root is new enough and the index number has been allocated.
     // The active metadata decides whether the final durable state keeps the
     // index active or has made the slot inactive again.
-    let active = metadata.index_spec(index_no as usize).is_some();
+    let active = metadata.idx.index_spec(index_no as usize).is_some();
     match (kind, active) {
         // CREATE INDEX is fully durable when the later/equal root still exposes
         // the created index as an active metadata entry.
@@ -1787,8 +1788,8 @@ mod tests {
                 .unwrap();
 
             assert_eq!(index_no, 1);
-            assert_eq!(sys.table.metadata().next_index_no(), 2);
-            assert!(sys.table.metadata().index_spec(1).is_some());
+            assert_eq!(sys.table.metadata().idx.next_index_no(), 2);
+            assert!(sys.table.metadata().idx.index_spec(1).is_some());
             assert_eq!(sys.table.layout_snapshot().generation(), old_generation + 1);
             assert_eq!(active_secondary_root(&sys.table, 1), SUPER_BLOCK_ID);
             let table_object = sys
@@ -1939,8 +1940,8 @@ mod tests {
             assert_eq!(err.operation_error(), Some(OperationError::DuplicateKey));
             assert_root_metadata_unchanged(&root_before, &sys.table);
             assert_eq!(sys.table.layout_snapshot().generation(), old_generation);
-            assert_eq!(sys.table.metadata().next_index_no(), 1);
-            assert!(sys.table.metadata().index_spec(1).is_none());
+            assert_eq!(sys.table.metadata().idx.next_index_no(), 1);
+            assert!(sys.table.metadata().idx.index_spec(1).is_none());
         });
     }
 
@@ -2045,8 +2046,8 @@ mod tests {
                 .await
                 .unwrap();
             let table = engine.catalog().get_table(table_id).await.unwrap();
-            assert_eq!(table.metadata().next_index_no(), 2);
-            assert!(table.metadata().index_spec(1).is_some());
+            assert_eq!(table.metadata().idx.next_index_no(), 2);
+            assert!(table.metadata().idx.index_spec(1).is_some());
             let session = engine.try_new_session().unwrap();
             assert_eq!(
                 non_unique_disk_tree_prefix_scan(
@@ -2089,9 +2090,9 @@ mod tests {
             session.drop_index(table_id, 1).await.unwrap();
 
             let metadata = table.metadata();
-            assert_eq!(metadata.next_index_no(), 2);
-            assert!(metadata.index_spec(0).is_some());
-            assert!(metadata.index_spec(1).is_none());
+            assert_eq!(metadata.idx.next_index_no(), 2);
+            assert!(metadata.idx.index_spec(0).is_some());
+            assert!(metadata.idx.index_spec(1).is_none());
             let root = table.file().active_root_unchecked();
             assert_eq!(root.secondary_index_roots.len(), 2);
             assert_eq!(root.secondary_index_roots[1], SUPER_BLOCK_ID);
@@ -2118,8 +2119,8 @@ mod tests {
                 .await
                 .unwrap();
             let table = engine.catalog().get_table(table_id).await.unwrap();
-            assert_eq!(table.metadata().next_index_no(), 2);
-            assert!(table.metadata().index_spec(1).is_none());
+            assert_eq!(table.metadata().idx.next_index_no(), 2);
+            assert!(table.metadata().idx.index_spec(1).is_none());
             assert_eq!(
                 table.file().active_root_unchecked().secondary_index_roots[1],
                 SUPER_BLOCK_ID

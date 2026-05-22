@@ -5,7 +5,7 @@ use super::{
 use crate::buffer::guard::{PageExclusiveGuard, PageGuard, PageSharedGuard};
 use crate::buffer::page::{PageID, VersionedPageID};
 use crate::buffer::{BufferPool, FixedBufferPool, PoolGuard, PoolGuards, PoolRole, RowPoolRole};
-use crate::catalog::{TableID, TableMetadata};
+use crate::catalog::{TableColumnLayout, TableID, TableMetadata};
 use crate::error::{Error, InternalError, OperationError, Result};
 use crate::index::util::{Maskable, RowPageCreateRedoCtx};
 use crate::index::{
@@ -120,9 +120,9 @@ pub(crate) async fn build_in_memory_secondary_indexes<I: BufferPool + 'static>(
     metadata: &TableMetadata,
     index_ts: TrxID,
 ) -> Result<Box<[Option<InMemorySecondaryIndex<I>>]>> {
-    let mut builder = InMemorySecondaryIndexScopedBuilder::new(metadata.index_slot_count());
-    for (index_no, index_spec) in metadata.active_indexes() {
-        let ty_infer = |col_no: usize| metadata.col_type(col_no);
+    let mut builder = InMemorySecondaryIndexScopedBuilder::new(metadata.idx.index_slot_count());
+    for (index_no, index_spec) in metadata.idx.active_indexes() {
+        let ty_infer = |col_no: usize| metadata.col.col_type(col_no);
         builder
             .push_or_rollback(
                 index_no,
@@ -531,7 +531,7 @@ impl<D: BufferPool, I: BufferPool> GenericMemTable<D, I> {
             return Ok(());
         };
         let (ctx, page) = page_guard.ctx_and_page();
-        let metadata = &*ctx.row_ver().unwrap().metadata;
+        let metadata = self.metadata();
         // TODO: we should retry or wait for notification if rollback happens on a page
         // in transition state. This will be handled in a future task.
         let row_idx = page.row_idx(entry.row_id);
@@ -606,7 +606,7 @@ impl<D: BufferPool, I: BufferPool> GenericMemTable<D, I> {
                 meta_pool_guard,
                 self.mem_pool(),
                 row_pool_guard,
-                &self.metadata,
+                &self.metadata.col,
                 count,
                 redo_ctx,
             )
@@ -627,7 +627,7 @@ impl<D: BufferPool, I: BufferPool> GenericMemTable<D, I> {
                 meta_pool_guard,
                 self.mem_pool(),
                 row_pool_guard,
-                &self.metadata,
+                &self.metadata.col,
                 count,
                 redo_ctx,
             )
@@ -648,7 +648,7 @@ impl<D: BufferPool, I: BufferPool> GenericMemTable<D, I> {
                 meta_pool_guard,
                 self.mem_pool(),
                 row_pool_guard,
-                &self.metadata,
+                &self.metadata.col,
                 count,
                 page_id,
             )
@@ -780,7 +780,12 @@ impl GenericMemTable<FixedBufferPool, FixedBufferPool> {
         key: SelectKey,
         row_id: RowID,
     ) -> Result<()> {
-        if self.metadata().require_index_spec(key.index_no)?.unique() {
+        if self
+            .metadata()
+            .idx
+            .require_index_spec(key.index_no)?
+            .unique()
+        {
             let res = self
                 .unique_insert_if_not_exists(
                     guards,
@@ -813,8 +818,8 @@ impl GenericMemTable<FixedBufferPool, FixedBufferPool> {
         key: &SelectKey,
         row_id: RowID,
     ) -> Result<bool> {
-        let index_schema = self.metadata().require_index_spec(key.index_no)?;
-        if index_schema.unique() {
+        let spec = self.metadata().idx.require_index_spec(key.index_no)?;
+        if spec.unique() {
             self.unique_compare_delete(guards, key, row_id, true, crate::trx::MIN_SNAPSHOT_TS)
                 .await
         } else {
@@ -832,7 +837,12 @@ impl GenericMemTable<FixedBufferPool, FixedBufferPool> {
         row_id: RowID,
         page_guard: &PageSharedGuard<RowPage>,
     ) -> Result<InsertIndex> {
-        if self.metadata().require_index_spec(key.index_no)?.unique() {
+        if self
+            .metadata()
+            .idx
+            .require_index_spec(key.index_no)?
+            .unique()
+        {
             self.insert_unique_index(ctx, effects, key, row_id, page_guard)
                 .await
         } else {
@@ -852,7 +862,7 @@ impl GenericMemTable<FixedBufferPool, FixedBufferPool> {
     ) -> Result<(RowID, PageSharedGuard<RowPage>)> {
         let metadata = self.metadata();
         let row_len = row_len(metadata, &insert);
-        let row_count = estimate_max_row_count(row_len, metadata.col_count());
+        let row_count = estimate_max_row_count(row_len, metadata.col.col_count());
         loop {
             let page_guard = self.get_insert_page(ctx, row_count).await?;
             match self.insert_row_to_page(
@@ -900,10 +910,10 @@ impl GenericMemTable<FixedBufferPool, FixedBufferPool> {
         if *state_guard != RowPageState::Active {
             return InsertRowIntoPage::NoSpaceOrFrozen(cols, undo_kind, index_branches);
         }
-        debug_assert!(metadata.col_count() == page.header.col_count as usize);
+        debug_assert!(metadata.col.col_count() == page.header.col_count as usize);
         debug_assert!(cols.len() == page.header.col_count as usize);
 
-        let var_len = var_len_for_insert(metadata, &cols);
+        let var_len = var_len_for_insert(metadata.col.as_ref(), &cols);
         let (row_idx, var_offset) =
             if let Some((row_idx, var_offset)) = page.request_row_idx_and_free_space(var_len) {
                 (row_idx, var_offset)
@@ -931,7 +941,7 @@ impl GenericMemTable<FixedBufferPool, FixedBufferPool> {
         debug_assert!(res.is_ok());
         let mut new_row = page.new_row(row_idx, var_offset);
         for v in &cols {
-            new_row.add_col(metadata, v);
+            new_row.add_col(metadata.col.as_ref(), v);
         }
         let new_row_id = new_row.finish();
         debug_assert!(new_row_id == row_id);
@@ -1072,7 +1082,7 @@ impl GenericMemTable<FixedBufferPool, FixedBufferPool> {
                     Some(ctx.sts()),
                     false,
                 );
-                let undo_vals = new_access.row().calc_delta(metadata, &old_row);
+                let undo_vals = new_access.row().calc_delta(metadata.col.as_ref(), &old_row);
                 new_access.link_for_unique_index(key.clone(), cts, old_entry, undo_vals);
                 Ok(LinkForUniqueIndex::Linked)
             }
@@ -1224,6 +1234,7 @@ impl GenericMemTable<FixedBufferPool, FixedBufferPool> {
     ) -> Result<()> {
         let metadata = self.metadata();
         let keys = metadata
+            .idx
             .active_indexes()
             .map(|(index_no, _)| read_latest_index_key(metadata, index_no, page_guard, row_id))
             .collect();
@@ -1240,9 +1251,9 @@ impl GenericMemTable<FixedBufferPool, FixedBufferPool> {
         keys: Vec<SelectKey>,
     ) -> Result<()> {
         for key in keys {
-            let index_schema = self.metadata().require_index_spec(key.index_no)?;
-            debug_assert_eq!(self.sec_idx_is_unique(key.index_no), index_schema.unique());
-            if index_schema.unique() {
+            let spec = self.metadata().idx.require_index_spec(key.index_no)?;
+            debug_assert_eq!(self.sec_idx_is_unique(key.index_no), spec.unique());
+            if spec.unique() {
                 self.defer_delete_unique_index(ctx, effects, row_id, key)
                     .await?;
             } else {
@@ -1418,24 +1429,24 @@ impl GenericMemTable<FixedBufferPool, FixedBufferPool> {
 
     #[inline]
     pub(crate) async fn insert_no_trx(&self, guards: &PoolGuards, cols: &[Val]) -> Result<()> {
-        debug_assert!(cols.len() == self.metadata().col_count());
+        debug_assert!(cols.len() == self.metadata().col.col_count());
         debug_assert!({
             cols.iter()
                 .enumerate()
-                .all(|(idx, val)| self.metadata().col_type_match(idx, val))
+                .all(|(idx, val)| self.metadata().col.col_type_match(idx, val))
         });
         let metadata = self.metadata();
-        let keys = metadata.keys_for_insert(cols);
+        let keys = metadata.idx.keys_for_insert(cols);
         let row_len = row_len(metadata, cols);
-        let row_count = estimate_max_row_count(row_len, metadata.col_count());
+        let row_count = estimate_max_row_count(row_len, metadata.col.col_count());
         loop {
             let mut page_guard = self
                 .get_insert_page_exclusive(guards, row_count, None)
                 .await?;
             let page = page_guard.page_mut();
-            debug_assert!(metadata.col_count() == page.header.col_count as usize);
+            debug_assert!(metadata.col.col_count() == page.header.col_count as usize);
             debug_assert!(cols.len() == page.header.col_count as usize);
-            let var_len = var_len_for_insert(metadata, cols);
+            let var_len = var_len_for_insert(metadata.col.as_ref(), cols);
             let (row_idx, var_offset) =
                 if let Some((row_idx, var_offset)) = page.request_row_idx_and_free_space(var_len) {
                     (row_idx, var_offset)
@@ -1446,7 +1457,7 @@ impl GenericMemTable<FixedBufferPool, FixedBufferPool> {
             let mut row = page.row_mut_exclusive(row_idx, var_offset, var_offset + var_len);
             debug_assert!(row.is_deleted());
             for (col_idx, user_col) in cols.iter().enumerate() {
-                row.update_col(metadata, col_idx, user_col, false);
+                row.update_col(metadata.col.as_ref(), col_idx, user_col, false);
             }
             for key in keys {
                 self.insert_index_no_trx(guards, key, row_id).await?;
@@ -1466,11 +1477,16 @@ impl GenericMemTable<FixedBufferPool, FixedBufferPool> {
         debug_assert!(key.index_no < self.sec_idx_len());
         debug_assert!(
             self.metadata()
+                .idx
                 .require_index_spec(key.index_no)
                 .unwrap()
                 .unique()
         );
-        debug_assert!(self.metadata().index_type_match(key.index_no, &key.vals));
+        debug_assert!(self.metadata().idx.index_type_match(
+            self.metadata().col.as_ref(),
+            key.index_no,
+            &key.vals
+        ));
         let sts = crate::trx::MIN_SNAPSHOT_TS;
         let (mut page_guard, row_id) = match self.unique_lookup(guards, key, sts).await? {
             None => unreachable!(),
@@ -1493,7 +1509,10 @@ impl GenericMemTable<FixedBufferPool, FixedBufferPool> {
         let row_idx = page.row_idx(row_id);
         debug_assert!(!page.is_deleted(row_idx));
         let row = page.row(row_idx);
-        let keys = self.metadata().keys_for_delete(row);
+        let keys = self
+            .metadata()
+            .idx
+            .keys_for_delete(self.metadata().col.as_ref(), row);
         for key in keys {
             let res = self.delete_index_directly(guards, &key, row_id).await?;
             assert!(res);
@@ -1517,13 +1536,13 @@ impl GenericMemTable<FixedBufferPool, FixedBufferPool> {
         mut row_action: F,
     ) -> Result<()>
     where
-        F: for<'m, 'p> FnMut(&'m TableMetadata, Row<'p>) -> bool,
+        F: for<'m, 'p> FnMut(&'m TableColumnLayout, Row<'p>) -> bool,
     {
         self.mem_scan(guards, |page_guard| {
             let (ctx, page) = page_guard.ctx_and_page();
-            let metadata = &*ctx.row_ver().unwrap().metadata;
+            let col_layout = ctx.row_ver().unwrap().column_layout.as_ref();
             for row_access in ReadAllRows::new(page, ctx) {
-                if !row_action(metadata, row_access.row()) {
+                if !row_action(col_layout, row_access.row()) {
                     return false;
                 }
             }
@@ -1541,16 +1560,21 @@ impl GenericMemTable<FixedBufferPool, FixedBufferPool> {
         row_action: F,
     ) -> Result<Option<R>>
     where
-        for<'m, 'p> F: FnOnce(&'m TableMetadata, Row<'p>) -> R,
+        for<'m, 'p> F: FnOnce(&'m TableColumnLayout, Row<'p>) -> R,
     {
         debug_assert!(key.index_no < self.sec_idx_len());
         debug_assert!(
             self.metadata()
+                .idx
                 .require_index_spec(key.index_no)
                 .unwrap()
                 .unique()
         );
-        debug_assert!(self.metadata().index_type_match(key.index_no, &key.vals));
+        debug_assert!(self.metadata().idx.index_type_match(
+            self.metadata().col.as_ref(),
+            key.index_no,
+            &key.vals
+        ));
         let sts = crate::trx::MIN_SNAPSHOT_TS;
         let (page_guard, row_id) = match self.unique_lookup(guards, key, sts).await? {
             None => return Ok(None),
@@ -1569,16 +1593,20 @@ impl GenericMemTable<FixedBufferPool, FixedBufferPool> {
         if !page.row_id_in_valid_range(row_id) {
             return Ok(None);
         }
-        let metadata = &*ctx.row_ver().unwrap().metadata;
+        let row_layout = ctx.row_ver().unwrap().column_layout.as_ref();
         let access = RowReadAccess::new(page, ctx, page.row_idx(row_id));
         let row = access.row();
         if row.is_deleted() {
             return Ok(None);
         }
-        if row.is_key_different(self.metadata(), key) {
+        let metadata = self.metadata();
+        let Some(index_spec) = metadata.idx.index_spec(key.index_no) else {
+            return Ok(None);
+        };
+        if row.is_key_different(row_layout, index_spec, key) {
             return Ok(None);
         }
-        Ok(Some(row_action(metadata, row)))
+        Ok(Some(row_action(row_layout, row)))
     }
 
     /// Insert row in transaction.
@@ -1590,13 +1618,13 @@ impl GenericMemTable<FixedBufferPool, FixedBufferPool> {
         cols: Vec<Val>,
     ) -> Result<RowID> {
         let metadata = self.metadata();
-        debug_assert!(cols.len() == metadata.col_count());
+        debug_assert!(cols.len() == metadata.col.col_count());
         debug_assert!({
             cols.iter()
                 .enumerate()
-                .all(|(idx, val)| self.metadata().col_type_match(idx, val))
+                .all(|(idx, val)| self.metadata().col.col_type_match(idx, val))
         });
-        let keys = self.metadata().keys_for_insert(&cols);
+        let keys = self.metadata().idx.keys_for_insert(&cols);
         let (row_id, page_guard) = self
             .insert_row_internal(ctx, effects, cols, RowUndoKind::Insert, Vec::new())
             .await?;
@@ -1638,11 +1666,16 @@ impl GenericMemTable<FixedBufferPool, FixedBufferPool> {
         debug_assert!(key.index_no < self.sec_idx_len());
         debug_assert!(
             self.metadata()
+                .idx
                 .require_index_spec(key.index_no)
                 .unwrap()
                 .unique()
         );
-        debug_assert!(self.metadata().index_type_match(key.index_no, &key.vals));
+        debug_assert!(self.metadata().idx.index_type_match(
+            self.metadata().col.as_ref(),
+            key.index_no,
+            &key.vals
+        ));
         let guards = ctx.require_pool_guards("catalog delete unique MVCC")?;
         loop {
             let lookup_sts = ctx.sts();
@@ -1695,7 +1728,7 @@ impl GenericMemTable<FixedBufferPool, FixedBufferPool> {
         unique: bool,
         min_active_sts: TrxID,
     ) -> Result<bool> {
-        let Some(index_schema) = self.metadata().index_spec(key.index_no) else {
+        let Some(index_schema) = self.metadata().idx.index_spec(key.index_no) else {
             return Ok(false);
         };
         if !self.sec_idx_is_active(key.index_no) {

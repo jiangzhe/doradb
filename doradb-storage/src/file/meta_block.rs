@@ -573,8 +573,8 @@ mod tests {
         assert_eq!(res_idx, ser_len);
 
         let (_, meta_block) = MetaBlock::deser(&data[..], 0).unwrap();
-        assert_eq!(meta_block.schema.next_index_no(), 3);
-        assert!(meta_block.schema.index_spec(1).is_none());
+        assert_eq!(meta_block.schema.idx.next_index_no(), 3);
+        assert!(meta_block.schema.idx.index_spec(1).is_none());
         assert_eq!(
             meta_block.secondary_index_roots,
             active_root.secondary_index_roots

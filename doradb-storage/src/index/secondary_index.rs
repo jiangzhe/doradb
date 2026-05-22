@@ -157,11 +157,11 @@ impl SecondaryDiskTreeRuntime {
         table_file: Arc<TableFile>,
         disk_pool: QuiescentGuard<ReadonlyBufferPool>,
     ) -> Result<Self> {
-        let index_spec = metadata.index_spec(index_no).ok_or_else(|| {
+        let index_spec = metadata.idx.index_spec(index_no).ok_or_else(|| {
             Error::from(
                 Report::new(InternalError::SecondaryIndexOutOfBounds).attach(format!(
                     "index_no={index_no}, index_slot_count={}",
-                    metadata.index_slot_count()
+                    metadata.idx.index_slot_count()
                 )),
             )
         })?;
@@ -872,7 +872,7 @@ mod tests {
     macro_rules! unique_runtime {
         ($metadata:ident, $disk_pool:ident) => {
             UniqueDiskTreeRuntime::new(
-                &$metadata.index_specs[0],
+                &$metadata.idx.index_specs()[0],
                 $metadata.as_ref(),
                 $disk_pool.file_kind(),
                 Arc::clone($disk_pool.sparse_file()),
@@ -885,7 +885,7 @@ mod tests {
     macro_rules! non_unique_runtime {
         ($metadata:ident, $disk_pool:ident) => {
             NonUniqueDiskTreeRuntime::new(
-                &$metadata.index_specs[1],
+                &$metadata.idx.index_specs()[1],
                 $metadata.as_ref(),
                 $disk_pool.file_kind(),
                 Arc::clone($disk_pool.sparse_file()),

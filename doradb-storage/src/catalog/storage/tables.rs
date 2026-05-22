@@ -2,7 +2,7 @@ use crate::buffer::PoolGuards;
 use crate::catalog::CatalogTable;
 use crate::catalog::storage::CatalogDefinition;
 use crate::catalog::storage::object::TableObject;
-use crate::catalog::table::TableMetadata;
+use crate::catalog::table::{TableColumnLayout, TableMetadata};
 use crate::catalog::{ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexSpec, TableID};
 use crate::error::Result;
 use crate::row::ops::{DeleteMvcc, SelectKey};
@@ -51,10 +51,13 @@ pub fn catalog_definition_of_tables() -> &'static CatalogDefinition {
 }
 
 #[inline]
-fn row_to_table_object(metadata: &TableMetadata, row: Row<'_>) -> TableObject {
-    let table_id = row.val(metadata, COL_NO_TABLES_TABLE_ID).as_u64().unwrap();
+fn row_to_table_object(col_layout: &TableColumnLayout, row: Row<'_>) -> TableObject {
+    let table_id = row
+        .val(col_layout, COL_NO_TABLES_TABLE_ID)
+        .as_u64()
+        .unwrap();
     let next_index_no = row
-        .val(metadata, COL_NO_TABLES_NEXT_INDEX_NO)
+        .val(col_layout, COL_NO_TABLES_NEXT_INDEX_NO)
         .as_u16()
         .unwrap();
     TableObject {
@@ -73,11 +76,11 @@ impl Tables<'_> {
     pub async fn list_uncommitted(&self, guards: &PoolGuards) -> Result<Vec<TableObject>> {
         let mut res = vec![];
         self.table
-            .table_scan_uncommitted(guards, |metadata, row| {
+            .table_scan_uncommitted(guards, |col_layout, row| {
                 if row.is_deleted() {
                     return true;
                 }
-                res.push(row_to_table_object(metadata, row));
+                res.push(row_to_table_object(col_layout, row));
                 true
             })
             .await?;

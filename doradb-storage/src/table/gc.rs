@@ -96,7 +96,7 @@ impl MemIndexCleanupSnapshot<'_> {
 
     #[inline]
     fn root_index_is_active(&self, index_no: usize) -> bool {
-        self.root_metadata.index_spec(index_no).is_some()
+        self.root_metadata.idx.index_spec(index_no).is_some()
     }
 
     #[inline]
@@ -251,7 +251,7 @@ impl Table {
             disk_pool_guard,
         };
         let mut stats = SecondaryMemIndexCleanupStats {
-            indexes: Vec::with_capacity(metadata.active_index_count()),
+            indexes: Vec::with_capacity(metadata.idx.active_index_count()),
         };
 
         for (_, index) in layout.active_secondary_indexes() {
@@ -546,7 +546,7 @@ impl Table {
         row: ResolvedColumnRow,
     ) -> Result<Vec<Val>> {
         let metadata = cleanup_context.metadata;
-        let index_spec = metadata.index_spec(index_no).ok_or_else(|| {
+        let index_spec = metadata.idx.index_spec(index_no).ok_or_else(|| {
             Error::from(
                 Report::new(InternalError::IndexKeyMissing).attach(format!("index_no={index_no}")),
             )
@@ -571,7 +571,7 @@ impl Table {
                 "row shape fingerprint mismatch",
             ));
         }
-        block.decode_row_values(metadata, row.row_idx(), &read_set)
+        block.decode_row_values(metadata.col.as_ref(), row.row_idx(), &read_set)
     }
 }
 

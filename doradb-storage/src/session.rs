@@ -129,7 +129,7 @@ impl Session {
         // 2. Prepare catalog related object
         let table_object = TableObject {
             table_id,
-            next_index_no: metadata.next_index_no(),
+            next_index_no: metadata.idx.next_index_no(),
         };
 
         let column_objects: Vec<_> = table_spec
@@ -148,7 +148,7 @@ impl Session {
         let mut index_objects = vec![];
         let mut index_column_objects = vec![];
 
-        for (index_no, index_spec) in metadata.active_indexes() {
+        for (index_no, index_spec) in metadata.idx.active_indexes() {
             index_objects.push(IndexObject {
                 table_id,
                 index_no: index_no as u16,
@@ -558,11 +558,12 @@ fn validate_drop_catalog_delete_counts(
     index_columns_deleted: usize,
 ) -> Result<()> {
     let expected_index_columns = metadata
+        .idx
         .active_indexes()
         .map(|(_, spec)| spec.cols.len())
         .sum::<usize>();
-    if columns_deleted == metadata.col_count()
-        && indexes_deleted == metadata.active_index_count()
+    if columns_deleted == metadata.col.col_count()
+        && indexes_deleted == metadata.idx.active_index_count()
         && index_columns_deleted == expected_index_columns
     {
         return Ok(());
@@ -570,8 +571,8 @@ fn validate_drop_catalog_delete_counts(
     Err(Report::new(InternalError::Generic)
         .attach(format!(
             "drop table catalog cascade count mismatch: table_id={table_id}, columns_deleted={columns_deleted}, expected_columns={}, indexes_deleted={indexes_deleted}, expected_indexes={}, index_columns_deleted={index_columns_deleted}, expected_index_columns={expected_index_columns}",
-            metadata.col_count(),
-            metadata.active_index_count(),
+            metadata.col.col_count(),
+            metadata.idx.active_index_count(),
         ))
         .into())
 }

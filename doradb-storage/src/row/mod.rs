@@ -6,7 +6,7 @@ pub use vector_scan::*;
 
 use crate::bitmap::bitmap_required_units;
 use crate::buffer::page::{BufferPage, BufferPageKind, PAGE_SIZE, assert_buffer_page, sealed};
-use crate::catalog::TableMetadata;
+use crate::catalog::{IndexSpec, TableColumnLayout};
 use crate::layout;
 use crate::value::*;
 use ordered_float::OrderedFloat;
@@ -125,13 +125,18 @@ impl RowPage {
     /// Initialize row page.
     /// | header | del_bitmap | null_bitmap_1 | ... | null_bitmap_n |
     #[inline]
-    pub fn init(&mut self, start_row_id: u64, max_row_count: usize, metadata: &TableMetadata) {
+    pub fn init(
+        &mut self,
+        start_row_id: u64,
+        max_row_count: usize,
+        col_layout: &TableColumnLayout,
+    ) {
         debug_assert!(max_row_count <= 0xffff);
         self.header.start_row_id = start_row_id;
         self.header.max_row_count = max_row_count as u16;
         self.header
             .store_row_count_and_var_field_offset(0, PAGE_SIZE - mem::size_of::<RowPageHeader>());
-        self.header.col_count = metadata.col_count() as u16;
+        self.header.col_count = col_layout.col_count() as u16;
         // initialize offset fields.
         self.header.del_bitmap_offset = 0; // always starts at data_ptr().
         debug_assert!(self.header.del_bitmap_offset.is_multiple_of(8));
@@ -141,14 +146,14 @@ impl RowPage {
         debug_assert!(self.header.null_bitmap_list_offset.is_multiple_of(8));
 
         self.header.col_offset_list_offset = self.header.null_bitmap_list_offset
-            + align8(bitmap_len(max_row_count) * metadata.nullable_cols) as u16;
+            + align8(bitmap_len(max_row_count) * col_layout.nullable_col_count()) as u16;
         debug_assert!(self.header.col_offset_list_offset.is_multiple_of(8));
 
         self.header.fix_field_offset =
-            self.header.col_offset_list_offset + col_offset_list_len(metadata.col_count()) as u16;
+            self.header.col_offset_list_offset + col_offset_list_len(col_layout.col_count()) as u16;
         debug_assert!(self.header.fix_field_offset.is_multiple_of(8));
 
-        self.init_col_offset_list_and_fix_field_end(metadata, max_row_count as u16);
+        self.init_col_offset_list_and_fix_field_end(col_layout, max_row_count as u16);
         self.init_bitmaps();
 
         debug_assert!({
@@ -161,19 +166,23 @@ impl RowPage {
     }
 
     #[inline]
-    fn init_col_offset_list_and_fix_field_end(&mut self, schema: &TableMetadata, row_count: u16) {
-        debug_assert!(schema.col_count() >= 1); // at least one user column.
+    fn init_col_offset_list_and_fix_field_end(
+        &mut self,
+        col_layout: &TableColumnLayout,
+        row_count: u16,
+    ) {
+        debug_assert!(col_layout.col_count() >= 1); // at least one user column.
         debug_assert!(self.header.col_offset_list_offset != 0);
         debug_assert!(self.header.fix_field_offset != 0);
         let mut col_offset = self.header.fix_field_offset;
         let col_offsets = self.col_offsets_mut();
-        for (i, ty) in schema.col_types().iter().enumerate() {
+        for (i, ty) in col_layout.col_types().iter().enumerate() {
             col_offsets[i].set(col_offset);
             col_offset += col_inline_len(ty.kind, row_count as usize) as u16;
         }
         self.header.fix_field_end = col_offset;
         debug_assert!({
-            (0..schema.col_count()).all(|col_idx| self.col_offset(col_idx).is_multiple_of(8))
+            (0..col_layout.col_count()).all(|col_idx| self.col_offset(col_idx).is_multiple_of(8))
         });
     }
 
@@ -280,12 +289,12 @@ impl RowPage {
 
     /// Insert a new row in page.
     #[inline]
-    pub fn insert(&self, metadata: &TableMetadata, user_cols: &[Val]) -> InsertRow {
-        debug_assert!(metadata.col_count() == self.header.col_count as usize);
+    pub fn insert(&self, col_layout: &TableColumnLayout, user_cols: &[Val]) -> InsertRow {
+        debug_assert!(col_layout.col_count() == self.header.col_count as usize);
         // insert row does not include RowID, as RowID is auto-generated.
         debug_assert!(user_cols.len() == self.header.col_count as usize);
 
-        let var_len = var_len_for_insert(metadata, user_cols);
+        let var_len = var_len_for_insert(col_layout, user_cols);
         let (row_idx, var_offset) =
             if let Some((row_idx, var_offset)) = self.request_row_idx_and_free_space(var_len) {
                 (row_idx, var_offset)
@@ -294,7 +303,7 @@ impl RowPage {
             };
         let mut new_row = self.new_row(row_idx, var_offset);
         for v in user_cols {
-            new_row.add_col(metadata, v);
+            new_row.add_col(col_layout, v);
         }
         InsertRow::Ok(new_row.finish())
     }
@@ -320,7 +329,7 @@ impl RowPage {
     #[inline]
     pub fn update(
         &mut self,
-        metadata: &TableMetadata,
+        col_layout: &TableColumnLayout,
         row_id: RowID,
         cols: &[UpdateCol],
     ) -> Update {
@@ -355,12 +364,12 @@ impl RowPage {
             var_offset
         } else {
             let row = self.row(row_idx);
-            let vals = row.clone_vals(metadata);
+            let vals = row.clone_vals(col_layout);
             return Update::NoFreeSpace(vals);
         };
         let mut row = self.row_mut(row_idx, var_offset, var_offset + var_len);
         for uc in cols {
-            row.update_col(metadata, uc.idx, &uc.val);
+            row.update_col(col_layout, uc.idx, &uc.val);
         }
         row.finish();
         Update::Ok(row_id)
@@ -454,22 +463,25 @@ impl RowPage {
     /// Create a vectorized view on current page.
     /// The view provides vectorized access to columns.
     #[inline]
-    pub fn vector_view<'a, 'b>(&'a self, metadata: &'b TableMetadata) -> PageVectorView<'a, 'b> {
-        PageVectorView::new(self, metadata)
+    pub fn vector_view<'a, 'b>(
+        &'a self,
+        col_layout: &'b TableColumnLayout,
+    ) -> PageVectorView<'a, 'b> {
+        PageVectorView::new(self, col_layout)
     }
 
     /// Returns value at given row and given column.
     #[inline]
-    pub fn val(&self, metadata: &TableMetadata, row_idx: usize, col_idx: usize) -> Val {
-        if self.is_null(metadata, row_idx, col_idx) {
+    pub fn val(&self, col_layout: &TableColumnLayout, row_idx: usize, col_idx: usize) -> Val {
+        if self.is_null(col_layout, row_idx, col_idx) {
             return Val::Null;
         }
-        self.non_null_val(metadata, row_idx, col_idx)
+        self.non_null_val(col_layout, row_idx, col_idx)
     }
 
     #[inline]
-    fn non_null_val(&self, metadata: &TableMetadata, row_idx: usize, col_idx: usize) -> Val {
-        let kind = metadata.val_kind(col_idx);
+    fn non_null_val(&self, col_layout: &TableColumnLayout, row_idx: usize, col_idx: usize) -> Val {
+        let kind = col_layout.val_kind(col_idx);
         let offset = self.val_offset(row_idx, col_idx, kind.inline_len());
         self.val_by_offset(kind, offset)
     }
@@ -478,17 +490,17 @@ impl RowPage {
     #[inline]
     pub fn vals(
         &self,
-        metadata: &TableMetadata,
+        col_layout: &TableColumnLayout,
         col_idx: usize,
         row_count: usize,
     ) -> (Option<RowPageNullBitmap<'_>>, ValArrayRef<'_>) {
         debug_assert!(row_count <= self.header.row_count());
-        let null_bitmap = self.null_bitmap(metadata, col_idx, row_count);
+        let null_bitmap = self.null_bitmap(col_layout, col_idx, row_count);
         let offset = self.col_offset(col_idx) as usize;
-        let kind = metadata.val_kind(col_idx);
+        let kind = col_layout.val_kind(col_idx);
         let inline_len = kind.inline_len();
         let raw_bytes = &self.data()[offset..offset + inline_len * row_count];
-        let val_array = match metadata.val_kind(col_idx) {
+        let val_array = match col_layout.val_kind(col_idx) {
             ValKind::I8 => {
                 let va = layout::slice_from_bytes::<i8>(raw_bytes);
                 ValArrayRef::I8(va)
@@ -598,7 +610,7 @@ impl RowPage {
     #[inline]
     pub fn update_col(
         &self,
-        metadata: &TableMetadata,
+        col_layout: &TableColumnLayout,
         row_idx: usize,
         col_idx: usize,
         value: &Val,
@@ -607,8 +619,8 @@ impl RowPage {
     ) -> usize {
         match value {
             Val::Null => {
-                debug_assert!(metadata.nullable(col_idx));
-                self.set_null(metadata, row_idx, col_idx, true);
+                debug_assert!(col_layout.nullable(col_idx));
+                self.set_null(col_layout, row_idx, col_idx, true);
                 return var_offset;
             }
             Val::I8(v) => {
@@ -649,14 +661,14 @@ impl RowPage {
                 }
             }
         }
-        self.set_null(metadata, row_idx, col_idx, false);
+        self.set_null(col_layout, row_idx, col_idx, false);
         var_offset
     }
 
     #[inline]
     pub fn update_col_exclusive(
         &mut self,
-        metadata: &TableMetadata,
+        col_layout: &TableColumnLayout,
         row_idx: usize,
         col_idx: usize,
         value: &Val,
@@ -665,8 +677,8 @@ impl RowPage {
     ) -> usize {
         match value {
             Val::Null => {
-                debug_assert!(metadata.nullable(col_idx));
-                self.set_null_exclusive(metadata, row_idx, col_idx, true);
+                debug_assert!(col_layout.nullable(col_idx));
+                self.set_null_exclusive(col_layout, row_idx, col_idx, true);
                 return var_offset;
             }
             Val::I8(v) => {
@@ -707,7 +719,7 @@ impl RowPage {
                 }
             }
         }
-        self.set_null_exclusive(metadata, row_idx, col_idx, false);
+        self.set_null_exclusive(col_layout, row_idx, col_idx, false);
         var_offset
     }
 
@@ -897,11 +909,11 @@ impl RowPage {
     #[inline]
     pub fn null_bitmap(
         &self,
-        metadata: &TableMetadata,
+        col_layout: &TableColumnLayout,
         col_idx: usize,
         row_count: usize,
     ) -> Option<RowPageNullBitmap<'_>> {
-        match self.header.null_bitmap_range(metadata, col_idx) {
+        match self.header.null_bitmap_range(col_layout, col_idx) {
             None => None,
             Some((start_idx, _)) => {
                 let bitmap_len = bitmap_len(row_count);
@@ -912,8 +924,8 @@ impl RowPage {
     }
 
     #[inline]
-    fn is_null(&self, metadata: &TableMetadata, row_idx: usize, col_idx: usize) -> bool {
-        match self.header.null_bit_offset(metadata, row_idx, col_idx) {
+    fn is_null(&self, col_layout: &TableColumnLayout, row_idx: usize, col_idx: usize) -> bool {
+        match self.header.null_bit_offset(col_layout, row_idx, col_idx) {
             Some(offset) => {
                 let v = self.data()[offset];
                 let bit_mask = 1 << (row_idx % 8);
@@ -927,18 +939,18 @@ impl RowPage {
     #[inline]
     pub(crate) fn set_null(
         &self,
-        metadata: &TableMetadata,
+        col_layout: &TableColumnLayout,
         row_idx: usize,
         col_idx: usize,
         null: bool,
     ) {
-        if !metadata.nullable(col_idx) {
+        if !col_layout.nullable(col_idx) {
             // set null bit only if the column is nullable.
             return;
         }
         let offset = self
             .header
-            .null_bit_offset(metadata, row_idx, col_idx)
+            .null_bit_offset(col_layout, row_idx, col_idx)
             .unwrap();
         // SAFETY:
         //
@@ -969,17 +981,17 @@ impl RowPage {
     #[inline]
     pub(crate) fn set_null_exclusive(
         &mut self,
-        metadata: &TableMetadata,
+        col_layout: &TableColumnLayout,
         row_idx: usize,
         col_idx: usize,
         null: bool,
     ) {
-        if !metadata.nullable(col_idx) {
+        if !col_layout.nullable(col_idx) {
             return;
         }
         let offset = self
             .header
-            .null_bit_offset(metadata, row_idx, col_idx)
+            .null_bit_offset(col_layout, row_idx, col_idx)
             .unwrap();
         let ptr = &mut self.data_mut()[offset];
         let current = *ptr;
@@ -1134,22 +1146,22 @@ impl RowPageHeader {
     }
 
     /// Returns offset of null bits.
-    /// Table metadata is required because we need to skip
+    /// Column layout is required because we need to skip
     /// non-nullable columns as they do not reserve space for
     /// null bitmap.
     #[inline]
     pub fn null_bit_offset(
         &self,
-        metadata: &TableMetadata,
+        col_layout: &TableColumnLayout,
         row_idx: usize,
         col_idx: usize,
     ) -> Option<usize> {
-        if !metadata.nullable(col_idx) {
+        if !col_layout.nullable(col_idx) {
             return None;
         }
         let bitmap_len = bitmap_len(self.max_row_count as usize);
         let offset = self.null_bitmap_list_offset as usize
-            + bitmap_len * metadata.null_offset(col_idx)
+            + bitmap_len * col_layout.null_offset(col_idx)
             + row_idx / 8;
         Some(offset)
     }
@@ -1158,15 +1170,15 @@ impl RowPageHeader {
     #[inline]
     pub fn null_bitmap_range(
         &self,
-        metadata: &TableMetadata,
+        col_layout: &TableColumnLayout,
         col_idx: usize,
     ) -> Option<(usize, usize)> {
-        if !metadata.nullable(col_idx) {
+        if !col_layout.nullable(col_idx) {
             return None;
         }
         let bitmap_len = bitmap_len(self.max_row_count as usize);
         let start_idx =
-            self.null_bitmap_list_offset as usize + bitmap_len * metadata.null_offset(col_idx);
+            self.null_bitmap_list_offset as usize + bitmap_len * col_layout.null_offset(col_idx);
         Some((start_idx, start_idx + bitmap_len))
     }
 
@@ -1217,56 +1229,56 @@ pub struct NewRow<'a> {
 impl NewRow<'_> {
     /// add one value to current row.
     #[inline]
-    pub(crate) fn add_val<V: Value>(&mut self, metadata: &TableMetadata, val: V) {
+    pub(crate) fn add_val<V: Value>(&mut self, col_layout: &TableColumnLayout, val: V) {
         debug_assert!(self.col_idx < self.page.header.col_count as usize);
         self.page.update_val(self.row_idx, self.col_idx, val);
         self.page
-            .set_null(metadata, self.row_idx, self.col_idx, false);
+            .set_null(col_layout, self.row_idx, self.col_idx, false);
         self.col_idx += 1;
     }
 
     /// Add variable-length value to current row.
     #[inline]
-    pub fn add_var(&mut self, metadata: &TableMetadata, input: &[u8]) {
+    pub fn add_var(&mut self, col_layout: &TableColumnLayout, input: &[u8]) {
         debug_assert!(self.col_idx < self.page.header.col_count as usize);
         let (var, offset) = self.page.add_var(input, self.var_offset);
         self.page.update_var(self.row_idx, self.col_idx, var);
         self.page
-            .set_null(metadata, self.row_idx, self.col_idx, false);
+            .set_null(col_layout, self.row_idx, self.col_idx, false);
         self.var_offset = offset;
         self.col_idx += 1;
     }
 
     #[inline]
-    pub fn add_col(&mut self, metadata: &TableMetadata, val: &Val) {
+    pub fn add_col(&mut self, col_layout: &TableColumnLayout, val: &Val) {
         match val {
-            Val::Null => self.add_null(metadata),
-            Val::I8(v) => self.add_val(metadata, *v),
-            Val::U8(v) => self.add_val(metadata, *v),
-            Val::I16(v) => self.add_val(metadata, *v),
-            Val::U16(v) => self.add_val(metadata, *v),
-            Val::I32(v) => self.add_val(metadata, *v),
-            Val::U32(v) => self.add_val(metadata, *v),
-            Val::F32(v) => self.add_val(metadata, v.0),
-            Val::I64(v) => self.add_val(metadata, *v),
-            Val::U64(v) => self.add_val(metadata, *v),
-            Val::F64(v) => self.add_val(metadata, v.0),
-            Val::VarByte(var) => self.add_var(metadata, var.as_bytes()),
+            Val::Null => self.add_null(col_layout),
+            Val::I8(v) => self.add_val(col_layout, *v),
+            Val::U8(v) => self.add_val(col_layout, *v),
+            Val::I16(v) => self.add_val(col_layout, *v),
+            Val::U16(v) => self.add_val(col_layout, *v),
+            Val::I32(v) => self.add_val(col_layout, *v),
+            Val::U32(v) => self.add_val(col_layout, *v),
+            Val::F32(v) => self.add_val(col_layout, v.0),
+            Val::I64(v) => self.add_val(col_layout, *v),
+            Val::U64(v) => self.add_val(col_layout, *v),
+            Val::F64(v) => self.add_val(col_layout, v.0),
+            Val::VarByte(var) => self.add_var(col_layout, var.as_bytes()),
         }
     }
 
     /// Add string value to current row, same as add_var().
     #[inline]
-    pub fn add_str_atomic(&mut self, metadata: &TableMetadata, input: &str) {
-        self.add_var(metadata, input.as_bytes())
+    pub fn add_str_atomic(&mut self, col_layout: &TableColumnLayout, input: &str) {
+        self.add_var(col_layout, input.as_bytes())
     }
 
     /// Add null value to current row.
     #[inline]
-    pub fn add_null(&mut self, metadata: &TableMetadata) {
+    pub fn add_null(&mut self, col_layout: &TableColumnLayout) {
         debug_assert!(self.col_idx < self.page.header.col_count as usize);
         self.page
-            .set_null(metadata, self.row_idx, self.col_idx, true);
+            .set_null(col_layout, self.row_idx, self.col_idx, true);
         self.col_idx += 1;
     }
 
@@ -1291,8 +1303,8 @@ pub(crate) trait RowRead {
 
     /// Returns value by given column index.
     #[inline]
-    fn val(&self, metadata: &TableMetadata, col_idx: usize) -> Val {
-        self.page().val(metadata, self.row_idx(), col_idx)
+    fn val(&self, col_layout: &TableColumnLayout, col_idx: usize) -> Val {
+        self.page().val(col_layout, self.row_idx(), col_idx)
     }
 
     /// Returns variable-length value by given column index.
@@ -1328,8 +1340,8 @@ pub(crate) trait RowRead {
 
     /// /// Returns whether column by given index is null.
     #[inline]
-    fn is_null(&self, metadata: &TableMetadata, col_idx: usize) -> bool {
-        self.page().is_null(metadata, self.row_idx(), col_idx)
+    fn is_null(&self, col_layout: &TableColumnLayout, col_idx: usize) -> bool {
+        self.page().is_null(col_layout, self.row_idx(), col_idx)
     }
 
     /// Returns additional variable length space required for this update.
@@ -1340,53 +1352,59 @@ pub(crate) trait RowRead {
 
     /// Returns value with optional intra-page offset if stored in page.
     #[inline]
-    fn val_with_var_offset(&self, metadata: &TableMetadata, col_idx: usize) -> (Val, Option<u16>) {
-        if self.is_null(metadata, col_idx) {
+    fn val_with_var_offset(
+        &self,
+        col_layout: &TableColumnLayout,
+        col_idx: usize,
+    ) -> (Val, Option<u16>) {
+        if self.is_null(col_layout, col_idx) {
             return (Val::Null, None);
         }
         let page = self.page();
         let row_idx = self.row_idx();
-        if let ValKind::VarByte = metadata.val_kind(col_idx) {
+        if let ValKind::VarByte = col_layout.val_kind(col_idx) {
             let pv = page.var(row_idx, col_idx);
             let v = pv.as_bytes(page.data());
             let offset = pv.offset().map(|os| os as u16);
             return (Val::VarByte(MemVar::from(v)), offset);
         }
-        (page.non_null_val(metadata, row_idx, col_idx), None)
+        (page.non_null_val(col_layout, row_idx, col_idx), None)
     }
 
     /// Clone all values.
     #[inline]
-    fn clone_vals(&self, metadata: &TableMetadata) -> Vec<Val> {
-        (0..metadata.col_count())
-            .map(|col_idx| self.val(metadata, col_idx))
+    fn clone_vals(&self, col_layout: &TableColumnLayout) -> Vec<Val> {
+        (0..col_layout.col_count())
+            .map(|col_idx| self.val(col_layout, col_idx))
             .collect()
     }
 
     /// Clone all values with var-len offset.
     #[inline]
-    fn vals_with_var_offsets(&self, metadata: &TableMetadata) -> Vec<(Val, Option<u16>)> {
-        (0..metadata.col_count())
-            .map(|col_idx| self.val_with_var_offset(metadata, col_idx))
+    fn vals_with_var_offsets(&self, col_layout: &TableColumnLayout) -> Vec<(Val, Option<u16>)> {
+        (0..col_layout.col_count())
+            .map(|col_idx| self.val_with_var_offset(col_layout, col_idx))
             .collect()
     }
 
     /// Clone values for given read set. (row id is excluded)
     #[inline]
-    fn vals_for_read_set(&self, metadata: &TableMetadata, read_set: &[usize]) -> Vec<Val> {
+    fn vals_for_read_set(&self, col_layout: &TableColumnLayout, read_set: &[usize]) -> Vec<Val> {
         read_set
             .iter()
-            .map(|col_idx| self.val(metadata, *col_idx))
+            .map(|col_idx| self.val(col_layout, *col_idx))
             .collect()
     }
 
     /// Returns whether the key of current row is different from given value.
     #[inline]
-    fn is_key_different(&self, metadata: &TableMetadata, key: &SelectKey) -> bool {
+    fn is_key_different(
+        &self,
+        col_layout: &TableColumnLayout,
+        index_spec: &IndexSpec,
+        key: &SelectKey,
+    ) -> bool {
         debug_assert!(!key.vals.is_empty());
-        let Some(index_spec) = metadata.index_spec(key.index_no) else {
-            return true;
-        };
         if index_spec.cols.len() != key.vals.len() {
             return true;
         }
@@ -1394,13 +1412,13 @@ pub(crate) trait RowRead {
             .cols
             .iter()
             .zip(&key.vals)
-            .any(|(key, val)| self.is_different(metadata, key.col_no as usize, val))
+            .any(|(key, val)| self.is_different(col_layout, key.col_no as usize, val))
     }
 
     /// Returns whether the value of current row at given column index is different from given value.
     #[inline]
-    fn is_different(&self, metadata: &TableMetadata, col_idx: usize, value: &Val) -> bool {
-        match (value, &self.val(metadata, col_idx)) {
+    fn is_different(&self, col_layout: &TableColumnLayout, col_idx: usize, value: &Val) -> bool {
+        match (value, &self.val(col_layout, col_idx)) {
             (Val::Null, Val::Null) => false,
             (Val::Null, _) => true,
             (_, Val::Null) => true,
@@ -1415,7 +1433,7 @@ pub(crate) trait RowRead {
             (Val::U64(new), Val::U64(old)) => old != new,
             (Val::F64(new), Val::F64(old)) => old != new,
             (Val::VarByte(new), Val::VarByte(old)) => old.as_bytes() != new.as_bytes(),
-            _ => panic!("table metadata and input column mismatch"),
+            _ => panic!("table column layout and input column mismatch"),
         }
     }
 
@@ -1423,25 +1441,25 @@ pub(crate) trait RowRead {
     #[inline]
     fn different(
         &self,
-        metadata: &TableMetadata,
+        col_layout: &TableColumnLayout,
         col_idx: usize,
         value: &Val,
     ) -> Option<(Val, Option<u16>)> {
-        if !self.is_different(metadata, col_idx, value) {
+        if !self.is_different(col_layout, col_idx, value) {
             return None;
         }
-        Some(self.val_with_var_offset(metadata, col_idx))
+        Some(self.val_with_var_offset(col_layout, col_idx))
     }
 
     /// Calculate delta between given values and current row.
     #[inline]
-    fn calc_delta(&self, metadata: &TableMetadata, vals: &[Val]) -> Vec<UpdateCol> {
-        let col_types = metadata.col_types();
+    fn calc_delta(&self, col_layout: &TableColumnLayout, vals: &[Val]) -> Vec<UpdateCol> {
+        let col_types = col_layout.col_types();
         debug_assert!(col_types.len() == vals.len());
         vals.iter()
             .enumerate()
             .filter_map(|(col_idx, val)| {
-                if self.is_different(metadata, col_idx, val) {
+                if self.is_different(col_layout, col_idx, val) {
                     Some(UpdateCol {
                         idx: col_idx,
                         val: val.clone(),
@@ -1496,10 +1514,10 @@ impl RowRead for RowMut<'_> {
 impl RowMut<'_> {
     /// Update column by given index and value.
     #[inline]
-    pub fn update_col(&mut self, metadata: &TableMetadata, col_idx: usize, value: &Val) {
-        debug_assert!(metadata.nullable(col_idx) || !value.is_null());
+    pub fn update_col(&mut self, col_layout: &TableColumnLayout, col_idx: usize, value: &Val) {
+        debug_assert!(col_layout.nullable(col_idx) || !value.is_null());
         self.var_offset = self.page.update_col(
-            metadata,
+            col_layout,
             self.row_idx,
             col_idx,
             value,
@@ -1510,8 +1528,8 @@ impl RowMut<'_> {
 
     /// Set null bit by given column index.
     #[inline]
-    pub fn set_null(&mut self, metadata: &TableMetadata, col_idx: usize, null: bool) {
-        self.page.set_null(metadata, self.row_idx, col_idx, null);
+    pub fn set_null(&mut self, col_layout: &TableColumnLayout, col_idx: usize, null: bool) {
+        self.page.set_null(col_layout, self.row_idx, col_idx, null);
     }
 
     #[inline]
@@ -1545,13 +1563,13 @@ impl RowMutExclusive<'_> {
     #[inline]
     pub fn update_col(
         &mut self,
-        metadata: &TableMetadata,
+        col_layout: &TableColumnLayout,
         col_idx: usize,
         value: &Val,
         old_exists: bool,
     ) {
         self.var_offset = self.page.update_col_exclusive(
-            metadata,
+            col_layout,
             self.row_idx,
             col_idx,
             value,
@@ -1638,9 +1656,9 @@ pub const fn align8(value: usize) -> usize {
 
 /// Returns additional space of var-len data of the new row to be inserted.
 #[inline]
-pub fn var_len_for_insert(schema: &TableMetadata, cols: &[Val]) -> usize {
+pub fn var_len_for_insert(schema: &TableColumnLayout, cols: &[Val]) -> usize {
     schema
-        .var_cols
+        .var_cols()
         .iter()
         .map(|idx| match &cols[*idx] {
             Val::VarByte(var) if var.len() > PAGE_VAR_LEN_INLINE => var.len(),
@@ -1655,6 +1673,7 @@ mod tests {
 
     use crate::catalog::{
         ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexOrder, IndexSpec,
+        TableMetadata,
     };
     use crate::value::ValKind;
     use semistr::SemiStr;
@@ -1712,7 +1731,7 @@ mod tests {
             }],
         );
         let mut page = create_row_page();
-        page.init(100, 105, &metadata);
+        page.init(100, 105, metadata.col.as_ref());
         println!("page header={:?}", page.header);
         assert!(page.header.start_row_id == 100);
         assert!(page.header.max_row_count == 105);
@@ -1740,14 +1759,14 @@ mod tests {
             }],
         );
         let mut page = create_row_page();
-        page.init(100, 200, &metadata);
+        page.init(100, 200, metadata.col.as_ref());
         assert!(page.header.row_count() == 0);
         assert!(page.header.col_count == 1);
         let insert = vec![Val::U64(1u64)];
-        assert!(page.insert(&metadata, &insert).is_ok());
+        assert!(page.insert(metadata.col.as_ref(), &insert).is_ok());
         assert!(page.header.row_count() == 1);
         let insert = vec![Val::U64(2u64)];
-        assert!(page.insert(&metadata, &insert).is_ok());
+        assert!(page.insert(metadata.col.as_ref(), &insert).is_ok());
         assert!(page.header.row_count() == 2);
     }
 
@@ -1771,28 +1790,28 @@ mod tests {
                 attributes: IndexAttributes::PK,
             }],
         );
-        assert!(metadata.nullable(0));
-        assert!(!metadata.nullable(1));
+        assert!(metadata.col.nullable(0));
+        assert!(!metadata.col.nullable(1));
         let mut page = create_row_page();
-        page.init(100, 200, &metadata);
+        page.init(100, 200, metadata.col.as_ref());
 
         let insert = vec![Val::from(1_000_000i32), Val::from("hello")];
-        assert!(page.insert(&metadata, &insert).is_ok());
+        assert!(page.insert(metadata.col.as_ref(), &insert).is_ok());
 
         let row1 = page.row(0);
         assert!(row1.row_id() == 100);
-        assert!(row1.val(&metadata, 0).as_i32().unwrap() == 1_000_000i32);
+        assert!(row1.val(metadata.col.as_ref(), 0).as_i32().unwrap() == 1_000_000i32);
         assert!(row1.var(1) == b"hello");
 
         let insert = vec![
             Val::from(2_000_000i32),
             Val::from("this value is not inline"),
         ];
-        assert!(page.insert(&metadata, &insert).is_ok());
+        assert!(page.insert(metadata.col.as_ref(), &insert).is_ok());
 
         let row2 = page.row(1);
         assert!(row2.row_id() == 101);
-        assert!(row2.val(&metadata, 0).as_i32().unwrap() == 2_000_000i32);
+        assert!(row2.val(metadata.col.as_ref(), 0).as_i32().unwrap() == 2_000_000i32);
         let s = row2.var(1);
         println!("len={:?}, s={:?}", s.len(), str::from_utf8(&s[..24]));
         assert!(row2.var(1) == b"this value is not inline");
@@ -1808,7 +1827,32 @@ mod tests {
                 val: Val::from("update to non-inline value"),
             },
         ];
-        assert!(page.update(&metadata, row_id, &update).is_ok());
+        assert!(page.update(metadata.col.as_ref(), row_id, &update).is_ok());
+    }
+
+    #[test]
+    fn test_row_page_decode_stable_across_index_only_metadata_changes() {
+        let metadata = TableMetadata::new(
+            vec![
+                ColumnSpec::new("id", ValKind::U32, ColumnAttributes::empty()),
+                ColumnSpec::new("name", ValKind::VarByte, ColumnAttributes::NULLABLE),
+            ],
+            vec![],
+        );
+        let mut page = create_row_page();
+        page.init(100, 8, metadata.col.as_ref());
+        let expected = vec![Val::U32(7), Val::from("row-value")];
+        assert!(page.insert(metadata.col.as_ref(), &expected).is_ok());
+
+        let (index_no, indexed_metadata) = metadata
+            .try_with_created_index(IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::UK))
+            .unwrap();
+        let dropped_metadata = indexed_metadata.try_without_index(index_no).unwrap();
+
+        let row = page.row(0);
+        assert_eq!(row.clone_vals(metadata.col.as_ref()), expected);
+        assert_eq!(row.clone_vals(indexed_metadata.col.as_ref()), expected);
+        assert_eq!(row.clone_vals(dropped_metadata.col.as_ref()), expected);
     }
 
     #[test]
@@ -1847,7 +1891,7 @@ mod tests {
             }],
         );
         let mut page = create_row_page();
-        page.init(100, 200, &schema);
+        page.init(100, 200, schema.col.as_ref());
         let short = b"short";
         let long = b"very loooooooooooooooooong";
 
@@ -1858,7 +1902,7 @@ mod tests {
             Val::U64(1 << 35),
             Val::from(&short[..]),
         ];
-        let res = page.insert(&schema, &insert);
+        let res = page.insert(schema.col.as_ref(), &insert);
         assert!(matches!(res, InsertRow::Ok(100)));
         assert!(!page.row(0).is_deleted());
 
@@ -1885,7 +1929,7 @@ mod tests {
                 val: Val::VarByte(MemVar::from(&long[..])),
             },
         ];
-        let res = page.update(&schema, row_id, &update);
+        let res = page.update(schema.col.as_ref(), row_id, &update);
         assert!(res.is_ok());
 
         let res = page.delete(row_id);

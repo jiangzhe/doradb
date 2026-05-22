@@ -1,7 +1,7 @@
 use crate::buffer::PageID;
 use crate::buffer::guard::{PageExclusiveGuard, PageSharedGuard};
 use crate::buffer::{BufferPool, FixedBufferPool, PoolGuard};
-use crate::catalog::TableMetadata;
+use crate::catalog::TableColumnLayout;
 use crate::error::{Error, InternalError, Result};
 use crate::file::cow_file::{BlockID, SUPER_BLOCK_ID};
 use crate::index::block_index_root::{BlockIndexRoot, BlockIndexRoute};
@@ -108,14 +108,14 @@ impl<P: BufferPool> GenericBlockIndex<P> {
         meta_pool_guard: &PoolGuard,
         mem_pool: &B,
         mem_pool_guard: &PoolGuard,
-        metadata: &Arc<TableMetadata>,
+        col_layout: &Arc<TableColumnLayout>,
         count: usize,
     ) -> Result<PageSharedGuard<RowPage>> {
         self.try_get_insert_page_with_redo(
             meta_pool_guard,
             mem_pool,
             mem_pool_guard,
-            metadata,
+            col_layout,
             count,
             None,
         )
@@ -128,7 +128,7 @@ impl<P: BufferPool> GenericBlockIndex<P> {
         meta_pool_guard: &PoolGuard,
         mem_pool: &B,
         mem_pool_guard: &PoolGuard,
-        metadata: &Arc<TableMetadata>,
+        col_layout: &Arc<TableColumnLayout>,
         count: usize,
         redo_ctx: Option<RowPageCreateRedoCtx<'_>>,
     ) -> Result<PageSharedGuard<RowPage>> {
@@ -137,7 +137,7 @@ impl<P: BufferPool> GenericBlockIndex<P> {
                 meta_pool_guard,
                 mem_pool,
                 mem_pool_guard,
-                metadata,
+                col_layout,
                 count,
                 redo_ctx,
             )
@@ -151,14 +151,14 @@ impl<P: BufferPool> GenericBlockIndex<P> {
         meta_pool_guard: &PoolGuard,
         mem_pool: &B,
         mem_pool_guard: &PoolGuard,
-        metadata: &Arc<TableMetadata>,
+        col_layout: &Arc<TableColumnLayout>,
         count: usize,
     ) -> Result<PageExclusiveGuard<RowPage>> {
         self.get_insert_page_exclusive_with_redo(
             meta_pool_guard,
             mem_pool,
             mem_pool_guard,
-            metadata,
+            col_layout,
             count,
             None,
         )
@@ -171,7 +171,7 @@ impl<P: BufferPool> GenericBlockIndex<P> {
         meta_pool_guard: &PoolGuard,
         mem_pool: &B,
         mem_pool_guard: &PoolGuard,
-        metadata: &Arc<TableMetadata>,
+        col_layout: &Arc<TableColumnLayout>,
         count: usize,
         redo_ctx: Option<RowPageCreateRedoCtx<'_>>,
     ) -> Result<PageExclusiveGuard<RowPage>> {
@@ -180,7 +180,7 @@ impl<P: BufferPool> GenericBlockIndex<P> {
                 meta_pool_guard,
                 mem_pool,
                 mem_pool_guard,
-                metadata,
+                col_layout,
                 count,
                 redo_ctx,
             )
@@ -196,7 +196,7 @@ impl<P: BufferPool> GenericBlockIndex<P> {
         meta_pool_guard: &PoolGuard,
         mem_pool: &B,
         mem_pool_guard: &PoolGuard,
-        metadata: &Arc<TableMetadata>,
+        col_layout: &Arc<TableColumnLayout>,
         count: usize,
         page_id: PageID,
     ) -> Result<PageExclusiveGuard<RowPage>> {
@@ -205,7 +205,7 @@ impl<P: BufferPool> GenericBlockIndex<P> {
                 meta_pool_guard,
                 mem_pool,
                 mem_pool_guard,
-                metadata,
+                col_layout,
                 count,
                 page_id,
             )
@@ -329,7 +329,9 @@ mod tests {
     use crate::buffer::guard::{FacadePageGuard, PageExclusiveGuard};
     use crate::buffer::page::{BufferPage, INVALID_PAGE_ID, VersionedPageID};
     use crate::buffer::{BufferPool, FixedBufferPool, PoolGuard};
-    use crate::catalog::{ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexSpec};
+    use crate::catalog::{
+        ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexSpec, TableMetadata,
+    };
     use crate::error::{IoError, Validation};
     use crate::file::test_block_id;
     use crate::latch::LatchFallbackMode;
@@ -552,6 +554,30 @@ mod tests {
         )
     }
 
+    #[test]
+    fn test_block_index_root_accessors_and_update() {
+        smol::block_on(async {
+            let meta_pool = owned_index_pool(64 * 1024 * 1024);
+            let meta_guard = (*meta_pool).pool_guard();
+            let blk_idx = BlockIndex::new(meta_pool.guard(), &meta_guard, 7, test_block_id(11))
+                .await
+                .expect("test block-index construction should succeed");
+
+            assert_eq!(blk_idx.height(), 0);
+            assert_eq!(blk_idx.root_snapshot(), (7, test_block_id(11)));
+            assert_eq!(blk_idx.pivot_row_id(), 7);
+            assert_eq!(blk_idx.column_root_block_id(), test_block_id(11));
+
+            blk_idx.update_column_root(9, test_block_id(12)).await;
+            assert_eq!(blk_idx.root_snapshot(), (9, test_block_id(12)));
+
+            let catalog_idx = BlockIndex::new_catalog(meta_pool.guard(), &meta_guard)
+                .await
+                .expect("test catalog block-index construction should succeed");
+            assert_eq!(catalog_idx.root_snapshot(), (0, SUPER_BLOCK_ID));
+        });
+    }
+
     fn make_test_metadata() -> Arc<TableMetadata> {
         Arc::new(TableMetadata::new(
             vec![ColumnSpec {
@@ -652,7 +678,7 @@ mod tests {
                 .expect("test block-index construction should succeed");
 
             let page_guard = blk_idx
-                .get_insert_page_exclusive(&meta_guard, &*mem_pool, &mem_guard, &metadata, 100)
+                .get_insert_page_exclusive(&meta_guard, &*mem_pool, &mem_guard, &metadata.col, 100)
                 .await
                 .expect("test insert-page allocation should succeed");
             let page_id = page_guard.page_id();
@@ -660,7 +686,7 @@ mod tests {
 
             let failing_pool = FailingInsertPagePool::new(mem_pool.guard(), page_id);
             let res = blk_idx
-                .get_insert_page(&meta_guard, &failing_pool, &mem_guard, &metadata, 100)
+                .get_insert_page(&meta_guard, &failing_pool, &mem_guard, &metadata.col, 100)
                 .await;
             let err = match res {
                 Ok(_) => panic!("expected cached insert-page reload failure"),

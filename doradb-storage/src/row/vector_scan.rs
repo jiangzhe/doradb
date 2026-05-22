@@ -7,7 +7,7 @@
 
 use crate::bitmap::{Bitmap, BitmapRangeFilter};
 use crate::buffer::frame::FrameContext;
-use crate::catalog::TableMetadata;
+use crate::catalog::TableColumnLayout;
 use crate::error::{Error, InternalError, Result};
 use crate::row::{RowPage, RowPageNullBitmap};
 use crate::trx::undo::RowUndoKind;
@@ -55,10 +55,10 @@ pub enum ScanColumnValues<'a> {
 impl ScanBuffer {
     /// Create a new scan buffer.
     #[inline]
-    pub fn new(metadata: &TableMetadata, scan_set: &[usize]) -> Self {
+    pub fn new(col_layout: &TableColumnLayout, scan_set: &[usize]) -> Self {
         let cols: Vec<_> = scan_set
             .iter()
-            .map(|&col_idx| ColBuffer::new(col_idx, metadata.col_type(col_idx)))
+            .map(|&col_idx| ColBuffer::new(col_idx, col_layout.col_type(col_idx)))
             .collect();
         ScanBuffer { cols, len: 0 }
     }
@@ -290,7 +290,7 @@ impl ColBuffer {
 /// Vectorized view on row page.
 pub struct PageVectorView<'p, 'm> {
     page: &'p RowPage,
-    metadata: &'m TableMetadata,
+    col_layout: &'m TableColumnLayout,
     // row count should be freezed when creating this view.
     // to allow concurrent insert when query this page.
     row_count: usize,
@@ -306,17 +306,17 @@ impl RowPage {
     #[inline]
     pub fn vector_view_in_transition<'p, 'm>(
         &'p self,
-        metadata: &'m TableMetadata,
+        col_layout: &'m TableColumnLayout,
         ctx: &FrameContext,
         cutoff_ts: TrxID,
         global_min_active_sts: TrxID,
     ) -> PageVectorView<'p, 'm> {
         let Some(map) = ctx.row_ver() else {
-            return self.vector_view(metadata);
+            return self.vector_view(col_layout);
         };
         let initial_mod_counter = map.mod_counter();
         if map.max_sts() < global_min_active_sts {
-            let view = self.vector_view(metadata);
+            let view = self.vector_view(col_layout);
             if map.mod_counter() == initial_mod_counter {
                 return view;
             }
@@ -360,7 +360,7 @@ impl RowPage {
         }
         PageVectorView {
             page: self,
-            metadata,
+            col_layout,
             row_count,
             del_bitmap,
         }
@@ -370,12 +370,12 @@ impl RowPage {
 impl<'p, 'm> PageVectorView<'p, 'm> {
     /// Create a page vector view.
     #[inline]
-    pub fn new(page: &'p RowPage, metadata: &'m TableMetadata) -> Self {
+    pub fn new(page: &'p RowPage, col_layout: &'m TableColumnLayout) -> Self {
         let row_count = page.header.row_count();
         let del_bitmap = page.del_bitmap(row_count);
         PageVectorView {
             page,
-            metadata,
+            col_layout,
             row_count,
             del_bitmap,
         }
@@ -399,7 +399,7 @@ impl<'p, 'm> PageVectorView<'p, 'm> {
     /// Returns null bitmap and value data of given column.
     #[inline]
     pub fn col(&self, col_idx: usize) -> (Option<RowPageNullBitmap<'p>>, ValArrayRef<'p>) {
-        self.page.vals(self.metadata, col_idx, self.row_count)
+        self.page.vals(self.col_layout, col_idx, self.row_count)
     }
 }
 
@@ -505,7 +505,7 @@ mod tests {
             vec![],
         );
         let mut page = create_row_page();
-        page.init(100, 200, &metadata);
+        page.init(100, 200, metadata.col.as_ref());
         let short = b"short";
         let long = b"very loooooooooooooooooong";
 
@@ -524,7 +524,7 @@ mod tests {
             Val::from(&long[..]),
         ];
         for row_id in 100u64..200 {
-            let res = page.insert(&metadata, &insert);
+            let res = page.insert(metadata.col.as_ref(), &insert);
             if let InsertRow::Ok(rid) = res {
                 assert!(rid == row_id);
             } else {
@@ -537,8 +537,11 @@ mod tests {
         let res = page.delete(180);
         assert!(matches!(res, Delete::Ok));
         // try vector scan
-        let mut scanner = ScanBuffer::new(&metadata, &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]);
-        let view = page.vector_view(&metadata);
+        let mut scanner = ScanBuffer::new(
+            metadata.col.as_ref(),
+            &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11],
+        );
+        let view = page.vector_view(metadata.col.as_ref());
         let res = scanner.scan(view);
         assert!(res.is_ok());
         assert!(scanner.len() == 98);
@@ -556,17 +559,17 @@ mod tests {
             vec![],
         );
         let mut page = create_row_page();
-        page.init(0, 8, &metadata);
+        page.init(0, 8, metadata.col.as_ref());
         assert!(matches!(
-            page.insert(&metadata, &[Val::Null, Val::U8(1)]),
+            page.insert(metadata.col.as_ref(), &[Val::Null, Val::U8(1)]),
             InsertRow::Ok(0)
         ));
         assert!(matches!(
-            page.insert(&metadata, &[Val::U64(42), Val::U8(2)]),
+            page.insert(metadata.col.as_ref(), &[Val::U64(42), Val::U8(2)]),
             InsertRow::Ok(1)
         ));
 
-        let view = page.vector_view(&metadata);
+        let view = page.vector_view(metadata.col.as_ref());
         let (null_bitmap, _) = view.col(0);
         let null_bitmap = null_bitmap.expect("nullable column has null bitmap");
         let bits = null_bitmap.as_ref();
@@ -593,20 +596,22 @@ mod tests {
             vec![],
         );
         let mut page = create_row_page();
-        page.init(0, 8, &metadata);
+        page.init(0, 8, metadata.col.as_ref());
         for (row_id, value) in [Val::U8(10), Val::Null, Val::U8(12), Val::Null, Val::U8(14)]
             .into_iter()
             .enumerate()
         {
             assert!(matches!(
-                page.insert(&metadata, &[value]),
+                page.insert(metadata.col.as_ref(), &[value]),
                 InsertRow::Ok(inserted) if inserted == row_id as u64
             ));
         }
         assert!(matches!(page.delete(2), Delete::Ok));
 
-        let mut scanner = ScanBuffer::new(&metadata, &[0]);
-        scanner.scan(page.vector_view(&metadata)).unwrap();
+        let mut scanner = ScanBuffer::new(metadata.col.as_ref(), &[0]);
+        scanner
+            .scan(page.vector_view(metadata.col.as_ref()))
+            .unwrap();
 
         assert_eq!(scanner.len(), 4);
         let col = scanner.column(0).unwrap();
@@ -680,7 +685,7 @@ mod tests {
             vec![],
         );
         let mut page = create_row_page();
-        page.init(0, 5, &metadata);
+        page.init(0, 5, metadata.col.as_ref());
         for row_id in 0u64..5 {
             let row_idx = row_id as usize;
             let row_bytes = format!("row-{row_id}");
@@ -717,15 +722,16 @@ mod tests {
                 },
                 Val::from(row_bytes.as_bytes()),
             ];
-            let res = page.insert(&metadata, &insert);
+            let res = page.insert(metadata.col.as_ref(), &insert);
             if let InsertRow::Ok(rid) = res {
                 assert_eq!(rid, row_id);
             } else {
                 panic!("insert failed");
             }
         }
-        let mut scanner = ScanBuffer::new(&metadata, &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
-        let view = page.vector_view(&metadata);
+        let mut scanner =
+            ScanBuffer::new(metadata.col.as_ref(), &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+        let view = page.vector_view(metadata.col.as_ref());
         scanner.scan(view).unwrap();
         assert_eq!(scanner.len(), 5);
 
@@ -850,13 +856,13 @@ mod tests {
             vec![],
         );
         let mut page = create_row_page();
-        page.init(0, 1, &metadata);
+        page.init(0, 1, metadata.col.as_ref());
         let insert = vec![Val::I8(1)];
-        let res = page.insert(&metadata, &insert);
+        let res = page.insert(metadata.col.as_ref(), &insert);
         assert!(matches!(res, InsertRow::Ok(0)));
         assert!(matches!(page.delete(0), Delete::Ok));
 
-        let mut map = RowVersionMap::new(Arc::new(metadata.clone()), 1);
+        let mut map = RowVersionMap::new(Arc::clone(&metadata.col), 1);
         let undo = OwnedRowUndo::new(
             0,
             Some(VersionedPageID {
@@ -880,7 +886,7 @@ mod tests {
         *map.write_exclusive(0) = Some(Box::new(head));
         let ctx = FrameContext::RowVerMap(map);
 
-        let view = page.vector_view_in_transition(&metadata, &ctx, 100, 0);
+        let view = page.vector_view_in_transition(metadata.col.as_ref(), &ctx, 100, 0);
         assert_eq!(view.rows_non_deleted(), 1);
         let _keep_undo = undo;
     }
@@ -896,17 +902,23 @@ mod tests {
             vec![],
         );
         let mut page = create_row_page();
-        page.init(0, 2, &metadata);
+        page.init(0, 2, metadata.col.as_ref());
         let insert = vec![Val::I8(1)];
-        assert!(matches!(page.insert(&metadata, &insert), InsertRow::Ok(0)));
-        assert!(matches!(page.insert(&metadata, &insert), InsertRow::Ok(1)));
+        assert!(matches!(
+            page.insert(metadata.col.as_ref(), &insert),
+            InsertRow::Ok(0)
+        ));
+        assert!(matches!(
+            page.insert(metadata.col.as_ref(), &insert),
+            InsertRow::Ok(1)
+        ));
         assert!(matches!(page.delete(1), Delete::Ok));
 
-        let map = RowVersionMap::new(Arc::new(metadata.clone()), 2);
+        let map = RowVersionMap::new(Arc::clone(&metadata.col), 2);
         let ctx = FrameContext::RowVerMap(map);
 
-        let expected = page.vector_view(&metadata);
-        let view = page.vector_view_in_transition(&metadata, &ctx, 100, 1);
+        let expected = page.vector_view(metadata.col.as_ref());
+        let view = page.vector_view_in_transition(metadata.col.as_ref(), &ctx, 100, 1);
         assert_eq!(view.rows_non_deleted(), expected.rows_non_deleted());
     }
 
@@ -922,11 +934,14 @@ mod tests {
             vec![],
         );
         let mut page = create_row_page();
-        page.init(0, 1, &metadata);
+        page.init(0, 1, metadata.col.as_ref());
         let insert = vec![Val::I8(1)];
-        assert!(matches!(page.insert(&metadata, &insert), InsertRow::Ok(0)));
+        assert!(matches!(
+            page.insert(metadata.col.as_ref(), &insert),
+            InsertRow::Ok(0)
+        ));
 
-        let mut map = RowVersionMap::new(Arc::new(metadata.clone()), 1);
+        let mut map = RowVersionMap::new(Arc::clone(&metadata.col), 1);
         let uncommitted_ts = MIN_ACTIVE_TRX_ID + 1;
         let undo = OwnedRowUndo::new(
             0,
@@ -951,7 +966,7 @@ mod tests {
         *map.write_exclusive(0) = Some(Box::new(head));
         let ctx = FrameContext::RowVerMap(map);
 
-        let _view = page.vector_view_in_transition(&metadata, &ctx, 100, 0);
+        let _view = page.vector_view_in_transition(metadata.col.as_ref(), &ctx, 100, 0);
         let _keep_undo = undo;
     }
 }

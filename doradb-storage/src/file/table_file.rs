@@ -117,7 +117,7 @@ impl ActiveRoot {
         let alloc_map = AllocMap::new(max_pages);
         let super_block_allocated = alloc_map.allocate_at(usize::from(SUPER_BLOCK_ID));
         assert!(super_block_allocated);
-        let secondary_index_roots = vec![SUPER_BLOCK_ID; metadata.index_slot_count()];
+        let secondary_index_roots = vec![SUPER_BLOCK_ID; metadata.idx.index_slot_count()];
 
         ActiveRoot::from_parts(
             0,
@@ -491,10 +491,10 @@ impl MutableTableFile {
     /// Replaces all mutable-root secondary DiskTree roots.
     #[inline]
     pub fn set_secondary_index_roots(&mut self, roots: Vec<BlockID>) -> Result<()> {
-        if roots.len() != self.root().metadata.index_slot_count() {
+        if roots.len() != self.root().metadata.idx.index_slot_count() {
             return Err(secondary_index_root_count_mismatch(
                 roots.len(),
-                self.root().metadata.index_slot_count(),
+                self.root().metadata.idx.index_slot_count(),
             ));
         }
         self.new_root_mut().secondary_index_roots = roots;
@@ -512,14 +512,14 @@ impl MutableTableFile {
         metadata: Arc<TableMetadata>,
         roots: Vec<BlockID>,
     ) -> Result<()> {
-        if roots.len() != metadata.index_slot_count() {
+        if roots.len() != metadata.idx.index_slot_count() {
             return Err(secondary_index_root_count_mismatch(
                 roots.len(),
-                metadata.index_slot_count(),
+                metadata.idx.index_slot_count(),
             ));
         }
         for (index_no, root) in roots.iter().copied().enumerate() {
-            if metadata.index_spec(index_no).is_none() && root != SUPER_BLOCK_ID {
+            if metadata.idx.index_spec(index_no).is_none() && root != SUPER_BLOCK_ID {
                 return Err(secondary_index_root_inactive_slot_mismatch(index_no, root));
             }
         }
