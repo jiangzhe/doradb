@@ -1,7 +1,7 @@
 ---
 id: 000153
 title: Remove Inline Index Recovery Branch
-status: proposal
+status: implemented
 created: 2026-05-22
 github_issue: 646
 ---
@@ -202,6 +202,68 @@ behavior. If implementation unexpectedly touches unsafe code, apply
 
 ## Implementation Notes
 
+Implemented deferred user-table index recovery as the only supported redo path:
+
+- Removed the `disable_index` plumbing from `LogRecovery::dispatch_dml`,
+  `replay_dml`, `replay_table_dml`, and user-table recovery calls. Catalog DML
+  replay remains a separate logical catalog path.
+- Removed the `TableRecover` trait wrapper and made the recovery entrypoints
+  inherent `Table` methods. User-table row replay now reconstructs hot RowStore
+  pages and cold delete-buffer markers only; hot `MemIndex` state is rebuilt
+  after redo by scanning recovered pages through `populate_index_via_row_page`.
+- Deleted the obsolete inline index recovery helpers and `RecoverIndex` type.
+  A post-implementation search confirms no `disable_index`, `TableRecover`,
+  `RecoverIndex`, `recover_index_insert`, or `recover_index_delete` symbols
+  remain under `doradb-storage/src`.
+- Converted recovery row-page helpers to return `Result<()>` with
+  `InvalidRootInvariant` errors for invalid recovery state instead of returning
+  local recovery enums. Added regression coverage for invalid replay state and
+  fixed recovered hot-row delete accounting so the row page's approximate
+  tombstone count is updated.
+- Preserved the DDL pipeline-breaker hooks in `dispatch_dml` and
+  `wait_for_dml_done`; comments now document the current sequential behavior
+  and future parallel-recovery boundary.
+- Updated checkpoint/recovery and secondary-index documentation to describe
+  deferred hot `MemIndex` rebuild from recovered hot RowStore pages, while
+  preserving checkpointed cold `DiskTree` root semantics.
+- Closed source backlog
+  `docs/backlogs/closed/000103-remove-inline-index-recovery-branch.md` as
+  implemented by this task.
+- Stabilized checkpoint failure/cancellation tests that expected a checkpoint
+  to reach fault-injection or lifecycle-cancellation branches by waiting for
+  checkpoint readiness first. This matches the production ordering where
+  checkpoint root-liveness delay is checked before cancellation or write
+  publication.
+- No unsafe code was added or modified. `docs/unsafe-usage-baseline.md` was
+  refreshed to remove the obsolete `RecoverIndex` entry.
+
+Task checklist result before resolve: pass. No required fixes or deferred
+follow-ups remain.
+
+## Validation
+
+Run during implementation and resolve:
+
+```bash
+cargo check -p doradb-storage --all-targets
+cargo clippy -p doradb-storage --all-targets -- -D warnings
+cargo nextest run -p doradb-storage
+tools/coverage_focus.rs \
+  --path doradb-storage/src/trx/recover.rs \
+  --path doradb-storage/src/table/recover.rs \
+  --path doradb-storage/src/table/mod.rs \
+  --path doradb-storage/src/row
+```
+
+Results:
+
+- `cargo check` and clippy passed.
+- `cargo nextest run -p doradb-storage`: 798 tests passed.
+- Focused coverage passed the 80% bar: deduplicated total 5240/5692
+  (92.06%); `trx/recover.rs` 95.88%, `table/recover.rs` 90.58%,
+  `table/mod.rs` 82.33%, and `row` 91.70%.
+- Focused regression checks for the CI-timing fixes passed, including repeated
+  local runs of the reported checkpoint cancellation/write-failure cases.
 
 ## Impacts
 
