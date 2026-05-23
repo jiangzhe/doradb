@@ -99,25 +99,29 @@ pub(crate) fn begin_write_barrier(
     block_id: BlockID,
 ) -> Result<ReadonlyWriteLease> {
     let key = BlockKey::new(file_id, block_id);
-    match pool.inflights.entry(key) {
-        Entry::Vacant(vac) => {
-            vac.insert(InflightBlockState::WriteBlocked);
+    {
+        // Keep the inflight entry guard scoped to this block; invalidation below
+        // touches the resident mapping table and must not nest DashMap locks.
+        match pool.inflights.entry(key) {
+            Entry::Vacant(vac) => {
+                vac.insert(InflightBlockState::WriteBlocked);
+            }
+            Entry::Occupied(mut occ) => match occ.get() {
+                InflightBlockState::Loading(inflight) if inflight.completed_result().is_none() => {
+                    return Err(Report::new(InternalError::ReadonlyWriteInflight)
+                        .attach(format!("key={key:?}"))
+                        .into());
+                }
+                InflightBlockState::Loading(_) => {
+                    occ.insert(InflightBlockState::WriteBlocked);
+                }
+                InflightBlockState::WriteBlocked => {
+                    return Err(Report::new(InternalError::ReadonlyWriteBlocked)
+                        .attach(format!("key={key:?}"))
+                        .into());
+                }
+            },
         }
-        Entry::Occupied(mut occ) => match occ.get() {
-            InflightBlockState::Loading(inflight) if inflight.completed_result().is_none() => {
-                return Err(Report::new(InternalError::ReadonlyWriteInflight)
-                    .attach(format!("key={key:?}"))
-                    .into());
-            }
-            InflightBlockState::Loading(_) => {
-                occ.insert(InflightBlockState::WriteBlocked);
-            }
-            InflightBlockState::WriteBlocked => {
-                return Err(Report::new(InternalError::ReadonlyWriteBlocked)
-                    .attach(format!("key={key:?}"))
-                    .into());
-            }
-        },
     }
     let _ = pool.invalidate_key(&key);
     Ok(ReadonlyWriteLease::new(pool, key))
@@ -572,60 +576,71 @@ impl QuiescentGuard<ReadonlyBufferPool> {
         validation: Option<InflightLoadValidation>,
     ) -> Result<Arc<PageIOCompletion>> {
         self.stats.record_cache_miss();
-        match self.inflights.entry(key) {
+        let inflight = match self.inflights.entry(key) {
             Entry::Vacant(vac) => {
                 let inflight = Arc::new(PageIOCompletion::new());
                 vac.insert(InflightBlockState::Loading(Arc::clone(&inflight)));
-                let task_arena = self.arena.arena_guard(self.pool_guard());
-                match ReadonlyPageReservation::reserve_page(self, key, task_arena).await {
-                    Ok((frame_id, page_guard)) => {
-                        let reservation = ReadonlyPageReservation::from_reserved_page(
-                            self.clone(),
-                            key,
-                            frame_id,
-                            page_guard,
-                        );
-                        let req = ReadSubmission::new(
-                            Arc::clone(file),
-                            self.clone(),
-                            key,
-                            Arc::clone(&inflight),
-                            validation,
-                            reservation,
-                        );
-                        if let Err(err) = self.send_read_async(req).await {
-                            err.into_inner().fail(CompletionErrorKind::report_send(
-                                "send readonly pool read request",
-                            ));
-                        }
-                    }
-                    Err(err) => {
-                        self.complete_inflight_load(
-                            key,
-                            &inflight,
-                            Err(CompletionErrorKind::report_error(
-                                err,
-                                format!("reserve readonly block load frame: key={key:?}"),
-                            )),
-                        );
-                    }
-                }
-                Ok(inflight)
+                inflight
             }
             Entry::Occupied(occ) => match occ.get() {
                 InflightBlockState::Loading(inflight) => {
                     self.stats.record_miss_join();
-                    Ok(Arc::clone(inflight))
+                    return Ok(Arc::clone(inflight));
                 }
                 InflightBlockState::WriteBlocked => {
-                    Err(Report::new(InternalError::ReadonlyWriteBlocked)
+                    return Err(Report::new(InternalError::ReadonlyWriteBlocked)
                         .attach(format!(
                             "readonly miss blocked by table-file write barrier: key={key:?}"
                         ))
-                        .into())
+                        .into());
                 }
             },
+        };
+        // The entry guard above is dropped before we reserve a frame or inspect
+        // resident mappings, avoiding nested locks across the two DashMaps.
+        let task_arena = self.arena.arena_guard(self.pool_guard());
+        match ReadonlyPageReservation::reserve_page(self, key, task_arena).await {
+            Ok((frame_id, page_guard)) => {
+                let reservation = ReadonlyPageReservation::from_reserved_page(
+                    self.clone(),
+                    key,
+                    frame_id,
+                    page_guard,
+                );
+                if let Some(existing_frame_id) = self.try_get_frame_id(&key) {
+                    // Another miss published the block after our initial miss
+                    // check. Roll back this reservation and complete waiters
+                    // with the resident frame instead of issuing duplicate IO.
+                    drop(reservation);
+                    self.complete_inflight_load(key, &inflight, Ok(existing_frame_id));
+                } else {
+                    let req = ReadSubmission::new(
+                        Arc::clone(file),
+                        self.clone(),
+                        key,
+                        Arc::clone(&inflight),
+                        validation,
+                        reservation,
+                    );
+                    if let Err(err) = self.send_read_async(req).await {
+                        err.into_inner().fail(CompletionErrorKind::report_send(
+                            "send readonly pool read request",
+                        ));
+                    }
+                }
+            }
+            Err(err) => {
+                self.complete_inflight_load(
+                    key,
+                    &inflight,
+                    Err(CompletionErrorKind::report_error(
+                        err,
+                        format!("reserve readonly block load frame: key={key:?}"),
+                    )),
+                );
+            }
         }
+        Ok(inflight)
     }
 
     #[inline]
@@ -2407,6 +2422,70 @@ pub(crate) mod tests {
             assert_eq!(&page.page()[..5], b"hello");
             assert_eq!(global.allocated(), 1);
             drop(page);
+            drop(table_file);
+            drop(fs);
+        });
+    }
+
+    #[test]
+    fn test_readonly_pool_aborts_duplicate_load_after_reservation_when_mapping_exists() {
+        smol::block_on(async {
+            let (_temp_dir, fs) = build_test_fs();
+            let table_file = fs
+                .create_table_file(test_user_table_id(124), make_metadata(), false)
+                .unwrap();
+            let table_file = commit_table_file(&fs, table_file).await;
+            let block_id = test_block_id(7);
+            write_payload(&fs, &table_file, block_id, b"resident").await;
+
+            let global = owned_global_pool(frame_page_bytes(4));
+            let pool = owned_readonly_pool(
+                table_file.sparse_file().file_id(),
+                FileKind::TableFile,
+                Arc::clone(table_file.sparse_file()),
+                &global,
+            );
+            let pool_guard = pool.pool_guard();
+            let key = BlockKey::new(table_file.sparse_file().file_id(), block_id);
+
+            let page = pool
+                .read_block(&pool_guard, block_id)
+                .await
+                .expect("buffer-pool read failed in test");
+            assert_eq!(&page.page()[..8], b"resident");
+            drop(page);
+
+            let resident_frame_id = global
+                .try_get_frame_id(&key)
+                .expect("first read must publish resident mapping");
+            let free_before = global.residency.free.lock().len();
+            let stats_before = global.stats();
+
+            let global_guard = global.guard();
+            let inflight = global_guard
+                .join_or_start_inflight_load(table_file.sparse_file(), key, None)
+                .await
+                .expect("duplicate load abort should not fail");
+
+            assert_eq!(
+                inflight
+                    .completed_result()
+                    .expect("duplicate load abort must complete inflight")
+                    .unwrap(),
+                resident_frame_id
+            );
+            assert!(!global.inflights.contains_key(&key));
+            assert_eq!(global.try_get_frame_id(&key), Some(resident_frame_id));
+            assert_eq!(global.allocated(), 1);
+            assert_eq!(global.residency.free.lock().len(), free_before);
+
+            let stats_delta = global.stats().delta_since(stats_before);
+            assert_eq!(stats_delta.cache_misses, 1);
+            assert_eq!(stats_delta.queued_reads, 0);
+            assert_eq!(stats_delta.running_reads, 0);
+            assert_eq!(stats_delta.completed_reads, 0);
+            assert_eq!(stats_delta.read_errors, 0);
+
             drop(table_file);
             drop(fs);
         });
