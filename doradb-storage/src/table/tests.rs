@@ -4646,7 +4646,7 @@ fn test_evict_pool_insert_full() {
 }
 
 #[test]
-fn test_table_scan_uncommitted() {
+fn test_mem_scan_uncommitted() {
     smol::block_on(async {
         const SIZE: i32 = 10000;
 
@@ -4667,7 +4667,7 @@ fn test_table_scan_uncommitted() {
             let layout = sys.table.layout_snapshot();
             sys.table
                 .accessor_with_layout(&layout)
-                .table_scan_uncommitted(session.pool_guards(), |_metadata, _row| {
+                .mem_scan_uncommitted(session.pool_guards(), |_metadata, _row| {
                     res_len += 1;
                     true
                 })
@@ -4680,7 +4680,7 @@ fn test_table_scan_uncommitted() {
 }
 
 #[test]
-fn test_table_scan_uncommitted_returns_error_without_meta_guard() {
+fn test_mem_scan_uncommitted_returns_error_without_meta_guard() {
     smol::block_on(async {
         let sys = TestSys::new_evictable().await;
         let layout = sys.table.layout_snapshot();
@@ -4689,7 +4689,7 @@ fn test_table_scan_uncommitted_returns_error_without_meta_guard() {
         let err = sys
             .table
             .accessor_with_layout(&layout)
-            .table_scan_uncommitted(&empty_guards, |_metadata, _row| true)
+            .mem_scan_uncommitted(&empty_guards, |_metadata, _row| true)
             .await
             .unwrap_err();
 
@@ -5390,6 +5390,252 @@ fn test_table_scan_mvcc() {
             assert!(res_len == (SIZE * 2) as usize);
             trx.commit().await.unwrap();
         }
+    });
+}
+
+#[test]
+fn test_table_scan_mvcc_includes_cold_and_hot_rows() {
+    smol::block_on(async {
+        let sys = TestSys::new_evictable().await;
+        let mut session = sys.try_new_session().unwrap();
+        insert_rows(&sys, &mut session, 0, 5, "cold").await;
+        sys.table.freeze(&session, usize::MAX).await.unwrap();
+        checkpoint_published(&sys.table, &mut session).await;
+
+        let mut trx = session.try_begin_trx().unwrap().unwrap();
+        assert_eq!(
+            scan_table_i32s(&mut trx, &sys.table).await,
+            vec![0, 1, 2, 3, 4]
+        );
+        trx.commit().await.unwrap();
+
+        insert_rows(&sys, &mut session, 100, 3, "hot").await;
+
+        let mut trx = session.try_begin_trx().unwrap().unwrap();
+        assert_eq!(
+            scan_table_i32s(&mut trx, &sys.table).await,
+            vec![0, 1, 2, 3, 4, 100, 101, 102]
+        );
+        trx.commit().await.unwrap();
+    });
+}
+
+#[test]
+fn test_table_scan_mvcc_cold_delete_buffer_visibility() {
+    smol::block_on(async {
+        let sys = TestSys::new_evictable().await;
+        let mut session = sys.try_new_session().unwrap();
+        insert_rows(&sys, &mut session, 0, 5, "name").await;
+        sys.table.freeze(&session, usize::MAX).await.unwrap();
+        checkpoint_published(&sys.table, &mut session).await;
+
+        let mut old_reader_session = sys.try_new_session().unwrap();
+        let mut old_reader = old_reader_session.try_begin_trx().unwrap().unwrap();
+
+        let key = single_key(2i32);
+        sys.new_trx_delete(&mut session, &key).await;
+
+        assert_eq!(
+            scan_table_i32s(&mut old_reader, &sys.table).await,
+            vec![0, 1, 2, 3, 4]
+        );
+        old_reader.commit().await.unwrap();
+
+        let mut new_reader = session.try_begin_trx().unwrap().unwrap();
+        assert_eq!(
+            scan_table_i32s(&mut new_reader, &sys.table).await,
+            vec![0, 1, 3, 4]
+        );
+        new_reader.commit().await.unwrap();
+    });
+}
+
+#[test]
+fn test_table_scan_mvcc_cold_update_visibility() {
+    smol::block_on(async {
+        let sys = TestSys::new_evictable().await;
+        let mut session = sys.try_new_session().unwrap();
+        insert_rows(&sys, &mut session, 0, 3, "name").await;
+        sys.table.freeze(&session, usize::MAX).await.unwrap();
+        checkpoint_published(&sys.table, &mut session).await;
+
+        let mut old_reader_session = sys.try_new_session().unwrap();
+        let mut old_reader = old_reader_session.try_begin_trx().unwrap().unwrap();
+
+        sys.new_trx_update(
+            &mut session,
+            &single_key(1i32),
+            vec![UpdateCol {
+                idx: 1,
+                val: Val::from("updated"),
+            }],
+        )
+        .await;
+
+        assert_eq!(
+            scan_table_pairs(&mut old_reader, &sys.table).await,
+            vec![
+                (0, "name".to_string()),
+                (1, "name".to_string()),
+                (2, "name".to_string()),
+            ]
+        );
+        old_reader.commit().await.unwrap();
+
+        let mut new_reader = session.try_begin_trx().unwrap().unwrap();
+        assert_eq!(
+            scan_table_pairs(&mut new_reader, &sys.table).await,
+            vec![
+                (0, "name".to_string()),
+                (1, "updated".to_string()),
+                (2, "name".to_string()),
+            ]
+        );
+        new_reader.commit().await.unwrap();
+    });
+}
+
+#[test]
+fn test_table_scan_mvcc_uncommitted_cold_delete_visibility() {
+    smol::block_on(async {
+        let sys = TestSys::new_evictable().await;
+        let mut session = sys.try_new_session().unwrap();
+        insert_rows(&sys, &mut session, 0, 4, "name").await;
+        sys.table.freeze(&session, usize::MAX).await.unwrap();
+        checkpoint_published(&sys.table, &mut session).await;
+
+        let mut writer = session.try_begin_trx().unwrap().unwrap();
+        let res = trx_delete_row(&mut writer, &sys.table, &single_key(1i32)).await;
+        assert!(matches!(res, Ok(DeleteMvcc::Deleted)));
+
+        assert_eq!(
+            scan_table_i32s(&mut writer, &sys.table).await,
+            vec![0, 2, 3]
+        );
+
+        let mut other_session = sys.try_new_session().unwrap();
+        let mut other_reader = other_session.try_begin_trx().unwrap().unwrap();
+        assert_eq!(
+            scan_table_i32s(&mut other_reader, &sys.table).await,
+            vec![0, 1, 2, 3]
+        );
+        other_reader.commit().await.unwrap();
+        writer.rollback().await.unwrap();
+    });
+}
+
+#[test]
+fn test_table_scan_mvcc_skips_persisted_delete_delta() {
+    smol::block_on(async {
+        let sys = TestSys::new_evictable().await;
+        let mut session = sys.try_new_session().unwrap();
+        insert_rows(&sys, &mut session, 0, 6, "name").await;
+        sys.table.freeze(&session, usize::MAX).await.unwrap();
+        checkpoint_published(&sys.table, &mut session).await;
+
+        let key = single_key(4i32);
+        let reader = session.try_begin_trx().unwrap().unwrap();
+        let row_id = assert_row_in_lwc(&sys.table, session.pool_guards(), &key, reader.sts()).await;
+        reader.commit().await.unwrap();
+
+        sys.new_trx_delete(&mut session, &key).await;
+        let marker_ts = delete_marker_ts(sys.table.deletion_buffer().get(row_id).unwrap());
+        wait_gc_cutoff_after(&session, marker_ts).await;
+        checkpoint_published(&sys.table, &mut session).await;
+
+        let active_root = sys.table.file().active_root_unchecked();
+        let index = ColumnBlockIndex::new(
+            active_root.column_block_index_root,
+            active_root.pivot_row_id,
+            sys.table.file().file_kind(),
+            sys.table.file().sparse_file(),
+            sys.table.disk_pool(),
+            session.pool_guards().disk_guard(),
+        );
+        let entry = index.locate_block(row_id).await.unwrap().unwrap();
+        let deltas = load_entry_deletion_deltas(&index, &entry).await.unwrap();
+        assert!(deltas.contains(&((row_id - entry.start_row_id) as u32)));
+
+        let mut trx = session.try_begin_trx().unwrap().unwrap();
+        assert_eq!(
+            scan_table_i32s(&mut trx, &sys.table).await,
+            vec![0, 1, 2, 3, 5]
+        );
+        trx.commit().await.unwrap();
+    });
+}
+
+#[test]
+fn test_table_scan_mvcc_early_stop_before_hot_phase() {
+    smol::block_on(async {
+        let sys = TestSys::new_evictable().await;
+        let mut session = sys.try_new_session().unwrap();
+        insert_rows(&sys, &mut session, 0, 5, "cold").await;
+        sys.table.freeze(&session, usize::MAX).await.unwrap();
+        checkpoint_published(&sys.table, &mut session).await;
+        insert_rows(&sys, &mut session, 100, 2, "hot").await;
+
+        let mut trx = session.try_begin_trx().unwrap().unwrap();
+        let mut rows = Vec::new();
+        trx.exec(async |stmt| {
+            stmt.table_scan_mvcc(&sys.table, &[0], |vals| {
+                rows.push(vals[0].as_i32().unwrap());
+                rows.len() < 3
+            })
+            .await?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+        assert_eq!(rows, vec![0, 1, 2]);
+        trx.commit().await.unwrap();
+    });
+}
+
+#[test]
+fn test_mem_scan_from_uses_explicit_lower_bound() {
+    smol::block_on(async {
+        let sys = TestSys::new_evictable().await;
+        let mut session = sys.try_new_session().unwrap();
+        insert_rows(&sys, &mut session, 0, 4, "first").await;
+        sys.table.freeze(&session, usize::MAX).await.unwrap();
+        checkpoint_published(&sys.table, &mut session).await;
+        let captured_pivot = sys.table.file().active_root_unchecked().pivot_row_id;
+
+        insert_rows(&sys, &mut session, 100, 4, "second").await;
+        let later_pivot = captured_pivot + 4;
+        // Keep the second batch's row pages allocated while advancing only the
+        // memory-scan pivot. A real later checkpoint may reclaim pages once no
+        // transaction root protects them, which is outside this helper's direct
+        // contract.
+        sys.table
+            .mem
+            .blk_idx()
+            .update_column_root(later_pivot, SUPER_BLOCK_ID)
+            .await;
+        assert_eq!(sys.table.mem.pivot_row_id(), later_pivot);
+
+        let mut explicit_count = 0usize;
+        sys.table
+            .mem
+            .mem_scan_from(session.pool_guards(), captured_pivot, |page_guard| {
+                explicit_count += page_guard.page().header.approx_non_deleted();
+                true
+            })
+            .await
+            .unwrap();
+        assert_eq!(explicit_count, 4);
+
+        let mut current_hot_count = 0usize;
+        sys.table
+            .mem
+            .mem_scan(session.pool_guards(), |page_guard| {
+                current_hot_count += page_guard.page().header.approx_non_deleted();
+                true
+            })
+            .await
+            .unwrap();
+        assert_eq!(current_hot_count, 0);
     });
 }
 
@@ -7599,7 +7845,7 @@ fn test_user_secondary_indexes_evict_and_continue_serving_lookups() {
         let layout = table.layout_snapshot();
         table
             .accessor_with_layout(&layout)
-            .table_scan_uncommitted(session.pool_guards(), |_metadata, row| {
+            .mem_scan_uncommitted(session.pool_guards(), |_metadata, row| {
                 if !row.is_deleted() {
                     visible_rows += 1;
                 }
@@ -7871,6 +8117,41 @@ fn single_key<V: Into<Val>>(value: V) -> SelectKey {
         index_no: 0,
         vals: vec![value.into()],
     }
+}
+
+async fn scan_table_i32s(trx: &mut ActiveTrx, table: &Table) -> Vec<i32> {
+    let mut rows = Vec::new();
+    trx.exec(async |stmt| {
+        stmt.table_scan_mvcc(table, &[0], |vals| {
+            rows.push(vals[0].as_i32().unwrap());
+            true
+        })
+        .await?;
+        Ok(())
+    })
+    .await
+    .unwrap();
+    rows.sort_unstable();
+    rows
+}
+
+async fn scan_table_pairs(trx: &mut ActiveTrx, table: &Table) -> Vec<(i32, String)> {
+    let mut rows = Vec::new();
+    trx.exec(async |stmt| {
+        stmt.table_scan_mvcc(table, &[0, 1], |vals| {
+            rows.push((
+                vals[0].as_i32().unwrap(),
+                vals[1].as_str().unwrap().to_string(),
+            ));
+            true
+        })
+        .await?;
+        Ok(())
+    })
+    .await
+    .unwrap();
+    rows.sort_unstable();
+    rows
 }
 
 fn drop_table_test_spec() -> (TableSpec, Vec<IndexSpec>) {

@@ -1142,7 +1142,7 @@ async fn collect_create_index_hot_rows(
     let mut rows = Vec::new();
     table
         .accessor_with_layout(layout.as_ref())
-        .table_scan_uncommitted(guards, |col_layout, row| {
+        .mem_scan_uncommitted(guards, |col_layout, row| {
             if row.is_deleted() {
                 return true;
             }

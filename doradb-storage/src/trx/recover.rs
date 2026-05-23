@@ -2129,7 +2129,7 @@ mod tests {
                 let layout = table.layout_snapshot();
                 table
                     .accessor_with_layout(&layout)
-                    .table_scan_uncommitted(session.pool_guards(), |_metadata, row| {
+                    .mem_scan_uncommitted(session.pool_guards(), |_metadata, row| {
                         assert!(row.row_id() as usize <= DML_SIZE);
                         rows += if row.is_deleted() { 0 } else { 1 };
                         true
