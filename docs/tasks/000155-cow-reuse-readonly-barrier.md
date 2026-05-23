@@ -1,7 +1,7 @@
 ---
 id: 000155
 title: CoW Reuse Readonly Barrier
-status: proposal
+status: implemented
 created: 2026-05-22
 github_issue: 651
 ---
@@ -27,7 +27,7 @@ Issue Labels:
 - codex
 
 Source Backlogs:
-- docs/backlogs/000021-readonly-page-reuse-invalidation-trigger-placement.md
+- docs/backlogs/closed/000021-readonly-page-reuse-invalidation-trigger-placement.md
 
 Readonly pages are cached by physical identity in
 `ReadonlyBufferPool::{mappings, inflight_loads}` using `BlockKey { file_id,
@@ -184,6 +184,54 @@ lifetime contract, it must:
 
 ## Implementation Notes
 
+Implemented on 2026-05-23.
+
+The final design uses a write barrier instead of a one-shot allocation-time
+invalidation helper. `ReadonlyBufferPool` now tracks physical block activity in
+`InflightBlockState::{Loading, WriteBlocked}` entries keyed by `BlockKey`.
+`begin_write_barrier` installs `WriteBlocked`, invalidates any resident mapping
+with `invalidate_block`, and returns a `ReadonlyWriteLease`; same-key readonly
+misses fail with typed internal errors while the write is blocked. The lease is
+carried by backend-owned write submissions and released by the IO completion
+path, so cancelling a caller future cannot unblock readonly reads before the
+write driver completes the write.
+
+User-table CoW writes now carry the barrier through `MutableTableWriteBarrier`
+and `CowWriteBarrier::{ReadonlyPool, Disabled}`. Production user-table forks use
+the readonly-pool barrier, while new-file, bootstrap, and catalog mechanical CoW
+paths use the explicit disabled variant. `MutableCowFile` allocation and
+rollback helpers were renamed to block-oriented APIs, and CoW allocation was
+centralized so LWC block writes, column block index nodes, deletion blob blocks,
+secondary disk-tree nodes, and root meta-block publication use the same write
+barrier path.
+
+Readonly duplicate-load behavior was hardened during review. After reserving a
+frame for a miss, the readonly load path re-checks `mappings` before submitting
+IO and rolls back the reservation if another path already published the same
+key. DashMap guard scopes around `mappings` and `inflights` are explicit and
+documented so the code does not hold nested shard locks across the two maps.
+
+The readonly invalidation surface was reduced to `invalidate_block`; the
+file-wide invalidation helper was removed. `WriteSubmission::prepare` now
+returns a concrete submission/completion pair, with error mapping kept at the
+single call site. Related docs were updated in `docs/buffer-pool.md` and
+`docs/table-file.md`, and block-id naming was cleaned up in disk-block contexts.
+
+Post-implementation checklist result: pass. No unsafe blocks, unsafe impls, or
+raw-pointer lifetime contracts were added or changed.
+
+Validation completed:
+- `cargo fmt`
+- `cargo clippy -p doradb-storage --all-targets -- -D warnings`
+- `cargo nextest run -p doradb-storage` (813 passed)
+- `cargo nextest run -p doradb-storage --no-default-features --features libaio`
+  (811 passed)
+- `tools/coverage_focus.rs --path doradb-storage/src/buffer/readonly.rs --path doradb-storage/src/file/cow_file.rs --path doradb-storage/src/file/table_file.rs --path doradb-storage/src/file/mod.rs --path doradb-storage/src/index/column_block_index.rs --path doradb-storage/src/index/column_deletion_blob.rs --path doradb-storage/src/index/disk_tree.rs --path doradb-storage/src/table/tests.rs`
+  (deduplicated 17357/18384, 94.41%)
+- `git diff --check`
+- `tools/task.rs resolve-task-next-id --task docs/tasks/000155-cow-reuse-readonly-barrier.md`
+- `tools/task.rs resolve-task-rfc --task docs/tasks/000155-cow-reuse-readonly-barrier.md`
+
 ## Impacts
 
 - `ReadonlyBufferPool`
@@ -256,9 +304,12 @@ lifetime contract, it must:
 
 ## Open Questions
 
-1. The exact API shape for carrying the readonly barrier into `MutableTableFile`
-   is left to implementation. Prefer the narrowest shape that makes production
-   bypasses hard to introduce and test/bootstrap bypasses explicit by name.
-2. If implementation finds that catalog `MutableMultiTableFile` must share the
-   same helper mechanically, keep the catalog path documented as a mechanical
-   CoW reuse consumer rather than a runtime readonly-cache correctness driver.
+No unresolved open questions remain.
+
+The `MutableTableFile` API now carries the barrier as
+`MutableTableWriteBarrier`, backed by `CowWriteBarrier`. Production user-table
+forks receive `CowWriteBarrier::ReadonlyPool`; new-file, bootstrap, and catalog
+mechanical CoW paths use `CowWriteBarrier::Disabled`.
+
+`MutableMultiTableFile` remains a mechanical CoW consumer and is documented as
+outside the runtime readonly-cache correctness path.
