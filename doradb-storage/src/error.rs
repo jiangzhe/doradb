@@ -215,8 +215,10 @@ pub(crate) enum InternalError {
     CompletionDropped,
     #[error("readonly buffer mapping conflict")]
     ReadonlyMappingConflict,
-    #[error("readonly reuse encountered an in-flight load")]
-    ReadonlyReuseInflight,
+    #[error("readonly write barrier encountered an in-flight load")]
+    ReadonlyWriteInflight,
+    #[error("readonly block is blocked by a write barrier")]
+    ReadonlyWriteBlocked,
     #[error("readonly frame lock missing")]
     ReadonlyFrameLockMissing,
     #[error("row page missing")]

@@ -11,7 +11,7 @@ use crate::file::block_integrity::{
 };
 use crate::file::cow_file::{
     ActiveRoot as GenericActiveRoot, BlockID, COW_FILE_PAGE_SIZE, CowCodec, CowFile,
-    CowReuseBarrier, MutableCowFile, MutableCowRoot, MutableWriterClaim, MutableWriterFile,
+    CowWriteBarrier, MutableCowFile, MutableCowRoot, MutableWriterClaim, MutableWriterFile,
     OldCowRoot, ParsedMeta, SUPER_BLOCK_ID, allocate_cow_block, validate_active_meta_block_id,
 };
 use crate::file::fs::BackgroundWriteRequest;
@@ -426,8 +426,6 @@ impl MutableMultiTableFile {
     pub fn allocate_block(&mut self) -> Result<BlockID> {
         allocate_cow_block(
             &mut self.new_root,
-            CATALOG_MTB_FILE_ID,
-            CowReuseBarrier::disabled_for_catalog_multi_table_file(),
             "multi-table file could not allocate block",
         )
     }
@@ -493,11 +491,7 @@ impl MutableMultiTableFile {
         } = self;
         let publish_res = file
             .file()
-            .publish_root(
-                &background_writes,
-                new_root,
-                CowReuseBarrier::disabled_for_catalog_multi_table_file(),
-            )
+            .publish_root(&background_writes, new_root, CowWriteBarrier::Disabled)
             .await;
         drop(writer_claim);
         let old_root = publish_res?;

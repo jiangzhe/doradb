@@ -14,7 +14,7 @@ pub(crate) use self::tests::{
     FileSyncOp, FileSyncTestHook, set_file_sync_test_hook, test_block_id, test_file_id,
 };
 
-use crate::buffer::ReadSubmission;
+use crate::buffer::{ReadSubmission, ReadonlyWriteLease};
 use crate::catalog::USER_OBJ_ID_START;
 use crate::compression::BitPackable;
 use crate::error::{
@@ -37,7 +37,6 @@ use parking_lot::lock_api::RawMutex as RawMutexAPI;
 use scopeguard::defer;
 use std::ffi::CString;
 use std::fmt;
-use std::future::Future;
 use std::io;
 use std::mem::MaybeUninit;
 use std::ops::Deref;
@@ -699,6 +698,7 @@ pub struct WriteSubmission {
     file: Arc<SparseFile>,
     offset: usize,
     buf: DirectBuf,
+    write_lease: Option<ReadonlyWriteLease>,
     completion: Arc<Completion<()>>,
 }
 
@@ -709,24 +709,18 @@ impl WriteSubmission {
         file: Arc<SparseFile>,
         offset: usize,
         buf: DirectBuf,
-    ) -> (Self, impl Future<Output = Result<()>> + Send) {
+        write_lease: Option<ReadonlyWriteLease>,
+    ) -> (Self, Arc<Completion<()>>) {
         let completion = Arc::new(Completion::new());
-        let waiter = Arc::clone(&completion);
         let fio = WriteSubmission {
             key,
             file,
             offset,
             buf,
-            completion,
+            write_lease,
+            completion: Arc::clone(&completion),
         };
-        (fio, async move {
-            waiter.wait_result().await.map_err(|report| {
-                Error::from_completion_report(
-                    report,
-                    format!("wait for table file background write: key={key:?}, offset={offset}"),
-                )
-            })
-        })
+        (fio, completion)
     }
 
     #[inline]
@@ -736,6 +730,7 @@ impl WriteSubmission {
             file,
             offset,
             buf,
+            write_lease,
             completion,
         } = self;
         let operation = Operation::pwrite_owned(file.as_raw_fd(), offset, buf);
@@ -743,6 +738,7 @@ impl WriteSubmission {
             key,
             _file: file,
             operation,
+            write_lease,
             completion,
         }
     }
@@ -752,7 +748,15 @@ pub(crate) struct PreparedWriteSubmission {
     key: BlockKey,
     _file: Arc<SparseFile>,
     operation: Operation,
+    write_lease: Option<ReadonlyWriteLease>,
     completion: Arc<Completion<()>>,
+}
+
+impl PreparedWriteSubmission {
+    #[inline]
+    fn release_write_lease(&mut self) {
+        drop(self.write_lease.take());
+    }
 }
 
 impl IOSubmission for PreparedWriteSubmission {
@@ -790,7 +794,21 @@ pub(crate) async fn write_direct(
     buf: DirectBuf,
     background_writes: &IOClient<BackgroundWriteRequest>,
 ) -> Result<()> {
-    let (submission, result) = WriteSubmission::prepare(key, file, offset, buf);
+    write_direct_with_lease(key, file, offset, buf, background_writes, None).await
+}
+
+/// Write one direct buffer while carrying an optional write barrier lease in
+/// the backend-owned submission.
+#[inline]
+pub(crate) async fn write_direct_with_lease(
+    key: BlockKey,
+    file: Arc<SparseFile>,
+    offset: usize,
+    buf: DirectBuf,
+    background_writes: &IOClient<BackgroundWriteRequest>,
+    write_lease: Option<ReadonlyWriteLease>,
+) -> Result<()> {
+    let (submission, completion) = WriteSubmission::prepare(key, file, offset, buf, write_lease);
     if let Err(err) = background_writes
         .send_async(BackgroundWriteRequest::Table(submission))
         .await
@@ -800,7 +818,12 @@ pub(crate) async fn write_direct(
         };
         return Err(IoError::report_send("send background table write request").into());
     }
-    result.await
+    completion.wait_result().await.map_err(|report| {
+        Error::from_completion_report(
+            report,
+            format!("wait for table file background write: key={key:?}, offset={offset}"),
+        )
+    })
 }
 
 pub(crate) struct TableFsStateMachine;
@@ -867,6 +890,7 @@ impl TableFsStateMachine {
                 match res {
                     Ok(len) => {
                         drop(buf);
+                        sub.release_write_lease();
                         let result = if len == expected_len {
                             Ok(())
                         } else {
@@ -880,6 +904,7 @@ impl TableFsStateMachine {
                     }
                     Err(err) => {
                         drop(buf);
+                        sub.release_write_lease();
                         sub.completion.complete(Err(CompletionErrorKind::report_io(
                             err,
                             format!("complete table file write: key={:?}", sub.key),
@@ -1033,12 +1058,13 @@ mod tests {
     fn prepare_table_write_submission(
         table_file: Arc<TableFile>,
         block_id: BlockID,
-    ) -> (WriteSubmission, impl Future<Output = Result<()>> + Send) {
+    ) -> (WriteSubmission, Arc<Completion<()>>) {
         WriteSubmission::prepare(
             BlockKey::new(table_file.sparse_file().file_id(), block_id),
             Arc::clone(table_file.sparse_file()),
             usize::from(block_id) * STORAGE_SECTOR_SIZE,
             DirectBuf::zeroed(STORAGE_SECTOR_SIZE),
+            None,
         )
     }
 
@@ -1368,7 +1394,7 @@ mod tests {
                 state_machine.on_complete(TableFsSubmission::Write(submission), Ok(expected_len));
 
             assert_eq!(kind, IOKind::Write);
-            assert!(waiter.await.is_ok());
+            assert!(waiter.wait_result().await.is_ok());
             drop(table_file);
             drop(fs);
         });
@@ -1398,7 +1424,10 @@ mod tests {
                 .on_complete(TableFsSubmission::Write(submission), Ok(expected_len - 1));
 
             assert_eq!(kind, IOKind::Write);
-            assert!(waiter.await.as_ref().is_err_and(|err| {
+            let wait_result = waiter.wait_result().await.map_err(|report| {
+                Error::from_completion_report(report, "wait for table file background write")
+            });
+            assert!(wait_result.as_ref().is_err_and(|err| {
                 err.completion_error() == Some(CompletionErrorKind::Io(IoErrorKind::UnexpectedEof))
                     && format!("{err:?}").contains("propagate from other threads")
                     && format!("{err:?}").contains("wait for table file background write")

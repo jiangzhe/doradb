@@ -8,7 +8,7 @@ use crate::file::block_integrity::{
 };
 use crate::file::cow_file::{
     ActiveRoot as GenericActiveRoot, BlockID, COW_FILE_PAGE_SIZE, CowCodec, CowFile,
-    CowReuseBarrier, MutableCowFile, MutableCowRoot, MutableWriterClaim, MutableWriterFile,
+    CowWriteBarrier, MutableCowFile, MutableCowRoot, MutableWriterClaim, MutableWriterFile,
     OldCowRoot, ParsedMeta, SUPER_BLOCK_ID, allocate_cow_block, validate_active_meta_block_id,
 };
 use crate::file::fs::BackgroundWriteRequest;
@@ -376,14 +376,14 @@ pub struct MutableTableFile {
     pub(super) file: Arc<TableFile>,
     pub(super) new_root: MutableCowRoot<TableMeta>,
     background_writes: IOClient<BackgroundWriteRequest>,
-    reuse_barrier: MutableTableReuseBarrier,
+    write_barrier: MutableTableWriteBarrier,
     writer_claim: MutableWriterClaim<TableFile>,
 }
 
 impl MutableTableFile {
     /// Create a mutable handle for first publication of a brand-new table file.
     ///
-    /// The readonly reuse barrier is intentionally bypassed here because no
+    /// The readonly write barrier is intentionally bypassed here because no
     /// previous physical block mapping can exist for this newly created file.
     #[inline]
     pub(crate) fn new_without_barrier(
@@ -396,12 +396,12 @@ impl MutableTableFile {
             file: table_file,
             new_root: MutableCowRoot::from_root(new_root),
             background_writes: background_writes.clone(),
-            reuse_barrier: MutableTableReuseBarrier::NewUserTableFile,
+            write_barrier: MutableTableWriteBarrier::Disabled,
             writer_claim,
         }
     }
 
-    /// Fork the whole table file with readonly-cache reuse invalidation enabled.
+    /// Fork the whole table file with readonly-cache write barriers enabled.
     #[inline]
     pub(crate) fn fork(
         table_file: &Arc<TableFile>,
@@ -413,7 +413,7 @@ impl MutableTableFile {
             file: Arc::clone(table_file),
             new_root: MutableCowRoot::fork(table_file.active_root_unchecked()),
             background_writes: background_writes.clone(),
-            reuse_barrier: MutableTableReuseBarrier::ReadonlyPool(disk_pool),
+            write_barrier: MutableTableWriteBarrier::ReadonlyPool(disk_pool),
             writer_claim,
         }
     }
@@ -536,12 +536,7 @@ impl MutableTableFile {
     /// Allocate a new block id for copy-on-write updates.
     #[inline]
     pub fn allocate_block(&mut self) -> Result<BlockID> {
-        allocate_cow_block(
-            &mut self.new_root,
-            self.file.sparse_file().file_id(),
-            self.reuse_barrier.as_cow_reuse_barrier(),
-            "table file could not allocate block",
-        )
+        allocate_cow_block(&mut self.new_root, "table file could not allocate block")
     }
 
     /// Roll back a block id allocated by this unpublished mutable root.
@@ -564,9 +559,13 @@ impl MutableTableFile {
     /// Write one page into the underlying table file.
     #[inline]
     pub async fn write_block(&self, block_id: BlockID, buf: DirectBuf) -> Result<()> {
+        let write_lease = self
+            .write_barrier
+            .as_cow_write_barrier()
+            .begin_write(self.file.sparse_file().file_id(), block_id)?;
         self.file
             .file()
-            .write_block(&self.background_writes, block_id, buf)
+            .write_block_with_lease(&self.background_writes, block_id, buf, write_lease)
             .await
     }
 
@@ -583,7 +582,7 @@ impl MutableTableFile {
             file: table_file,
             mut new_root,
             background_writes,
-            reuse_barrier,
+            write_barrier,
             writer_claim,
         } = self;
         debug_assert!(new_root.root.trx_id == 0 || new_root.root.trx_id < trx_id);
@@ -593,7 +592,7 @@ impl MutableTableFile {
             .publish_root(
                 &background_writes,
                 new_root,
-                reuse_barrier.as_cow_reuse_barrier(),
+                write_barrier.as_cow_write_barrier(),
             )
             .await;
         drop(writer_claim);
@@ -630,8 +629,6 @@ impl MutableTableFile {
             let end_row_id = block.shape.end_row_id();
             let block_id = allocate_cow_block(
                 &mut self.new_root,
-                self.file.sparse_file().file_id(),
-                self.reuse_barrier.as_cow_reuse_barrier(),
                 "table file could not allocate LWC block",
             )?;
             max_row_id = max_row_id.max(end_row_id);
@@ -642,11 +639,15 @@ impl MutableTableFile {
             }
             last_end = end_row_id;
             new_entries.push(block.shape.with_block_id(block_id));
+            let write_lease = self
+                .write_barrier
+                .as_cow_write_barrier()
+                .begin_write(self.file.sparse_file().file_id(), block_id)?;
             let background_writes = background_writes.clone();
             let file = Arc::clone(&table_file);
             writes.push(async move {
                 file.file()
-                    .write_block(&background_writes, block_id, block.buf)
+                    .write_block_with_lease(&background_writes, block_id, block.buf, write_lease)
                     .await
             });
         }
@@ -676,7 +677,7 @@ impl MutableTableFile {
     pub fn try_delete(self) -> bool {
         let MutableTableFile {
             file: table_file,
-            reuse_barrier: _reuse_barrier,
+            write_barrier: _write_barrier,
             writer_claim,
             ..
         } = self;
@@ -710,19 +711,17 @@ impl MutableCowFile for MutableTableFile {
     }
 }
 
-enum MutableTableReuseBarrier {
+enum MutableTableWriteBarrier {
     ReadonlyPool(QuiescentGuard<ReadonlyBufferPool>),
-    NewUserTableFile,
+    Disabled,
 }
 
-impl MutableTableReuseBarrier {
+impl MutableTableWriteBarrier {
     #[inline]
-    fn as_cow_reuse_barrier(&self) -> CowReuseBarrier<'_> {
+    fn as_cow_write_barrier(&self) -> CowWriteBarrier<'_> {
         match self {
-            MutableTableReuseBarrier::ReadonlyPool(pool) => CowReuseBarrier::readonly_pool(pool),
-            MutableTableReuseBarrier::NewUserTableFile => {
-                CowReuseBarrier::disabled_for_new_user_table_file()
-            }
+            MutableTableWriteBarrier::ReadonlyPool(pool) => CowWriteBarrier::readonly_pool(pool),
+            MutableTableWriteBarrier::Disabled => CowWriteBarrier::Disabled,
         }
     }
 }
@@ -927,7 +926,7 @@ mod tests {
     }
 
     #[test]
-    fn test_mutable_table_file_allocate_block_invalidates_readonly_reuse() {
+    fn test_mutable_table_file_write_block_invalidates_readonly_mapping() {
         smol::block_on(async {
             let (_temp_dir, fs) = build_test_fs();
             let background_writes = fs.background_writes();
@@ -958,6 +957,11 @@ mod tests {
             );
             let allocated = mutable.allocate_block().unwrap();
             assert_eq!(allocated, block_id);
+            assert!(global.try_get_frame_id(&key).is_some());
+            mutable
+                .write_block(block_id, page_buf(b"write-barrier"))
+                .await
+                .unwrap();
             assert_eq!(global.try_get_frame_id(&key), None);
 
             drop(mutable);
@@ -1010,7 +1014,7 @@ mod tests {
     }
 
     #[test]
-    fn test_mutable_table_file_lwc_and_column_index_allocations_invalidate_reuse() {
+    fn test_mutable_table_file_lwc_and_column_index_writes_invalidate_readonly_mapping() {
         smol::block_on(async {
             let (_temp_dir, fs) = build_test_fs();
             let background_writes = fs.background_writes();
