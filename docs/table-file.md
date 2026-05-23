@@ -224,6 +224,14 @@ released only after `effective_ts < Global_Min_Active_STS`, which covers both
 checkpoint publication and metadata-changing DDL such as `CREATE INDEX` and
 `DROP INDEX`.
 
+When a user-table CoW write replaces bytes at a physical `(file_id, block_id)`,
+the write path installs a readonly-cache write barrier until the backend write
+finishes. Any resident readonly mapping is retired before the write is
+submitted. Same-key readonly misses that are already in flight when the barrier
+starts, or that arrive while the key is write-blocked, are internal invariant
+violations returned to the owning operation; the barrier itself does not poison
+storage and does not depend on `TransactionSystem`.
+
 ### 7.4 Generic Publish Flow
 
 1. read the active `MetaBlock`

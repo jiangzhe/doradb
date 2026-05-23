@@ -121,8 +121,11 @@ pub(crate) async fn create_index_for_session(
         CreateIndexBuilder::new(&engine, session.pool_guards(), table_id, index_no, trx);
     let build_ts = builder.build_ts();
 
-    let mut mutable_file =
-        MutableTableFile::fork(table.file(), engine.table_fs.background_writes());
+    let mut mutable_file = MutableTableFile::fork(
+        table.file(),
+        engine.table_fs.background_writes(),
+        table.disk_pool().clone(),
+    );
 
     // 5. Build the cold DiskTree from the currently persisted live rows and
     // stage the resulting root in the forked table file.
@@ -306,8 +309,11 @@ pub(crate) async fn drop_index_for_session(
 
     let mut secondary_index_roots = active_root.secondary_index_roots.clone();
     secondary_index_roots[index_no_usize] = SUPER_BLOCK_ID;
-    let mut mutable_file =
-        MutableTableFile::fork(table.file(), engine.table_fs.background_writes());
+    let mut mutable_file = MutableTableFile::fork(
+        table.file(),
+        engine.table_fs.background_writes(),
+        table.disk_pool().clone(),
+    );
     mutable_file.replace_metadata_and_secondary_index_roots(
         Arc::clone(&new_metadata),
         secondary_index_roots,

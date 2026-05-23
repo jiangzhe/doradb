@@ -252,8 +252,8 @@ impl<'a, M: MutableCowFile> RewriteAllocationGuard<'a, M> {
     }
 
     #[inline]
-    fn allocate_block_id(&mut self) -> Result<BlockID> {
-        let block_id = self.mutable_file.allocate_block_id()?;
+    fn allocate_block(&mut self) -> Result<BlockID> {
+        let block_id = self.mutable_file.allocate_block()?;
         self.block_ids.push(block_id);
         Ok(block_id)
     }
@@ -268,7 +268,7 @@ impl<M: MutableCowFile> Drop for RewriteAllocationGuard<'_, M> {
     #[inline]
     fn drop(&mut self) {
         for block_id in self.block_ids.drain(..).rev() {
-            let res = self.mutable_file.rollback_allocated_block_id(block_id);
+            let res = self.mutable_file.rollback_allocated_block(block_id);
             debug_assert!(
                 res.is_ok(),
                 "DiskTree rewrite allocation rollback failed for block_id={block_id}"
@@ -1452,7 +1452,7 @@ impl<'a, F: DiskTreeSpec> DiskTree<'a, F> {
         entry: &BranchEntry,
     ) -> Result<()> {
         if entry.rewrite_allocated {
-            mutable_file.rollback_allocated_block_id(entry.block_id)?;
+            mutable_file.rollback_allocated_block(entry.block_id)?;
         }
         Ok(())
     }
@@ -1712,7 +1712,7 @@ impl<'a, F: DiskTreeSpec> DiskTree<'a, F> {
             )?
             .effective_space
         };
-        let block_id = allocations.allocate_block_id()?;
+        let block_id = allocations.allocate_block()?;
         self.write_node_block(allocations.file(), block_id, buf)
             .await?;
         Ok(BranchEntry::rewritten_leaf(
@@ -1772,7 +1772,7 @@ impl<'a, F: DiskTreeSpec> DiskTree<'a, F> {
             )?
             .effective_space
         };
-        let block_id = allocations.allocate_block_id()?;
+        let block_id = allocations.allocate_block()?;
         self.write_node_block(allocations.file(), block_id, buf)
             .await?;
         Ok(BranchEntry::rewritten_branch(
@@ -2455,12 +2455,12 @@ mod tests {
     }
 
     impl MutableCowFile for FailingDiskTreeWriteFile {
-        fn allocate_block_id(&mut self) -> Result<BlockID> {
-            self.inner.allocate_block_id()
+        fn allocate_block(&mut self) -> Result<BlockID> {
+            self.inner.allocate_block()
         }
 
-        fn rollback_allocated_block_id(&mut self, block_id: BlockID) -> Result<()> {
-            self.inner.rollback_allocated_block_id(block_id)
+        fn rollback_allocated_block(&mut self, block_id: BlockID) -> Result<()> {
+            self.inner.rollback_allocated_block(block_id)
         }
 
         fn write_block(
@@ -2632,8 +2632,11 @@ mod tests {
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
             let disk_pool = table_readonly_pool(&global, test_user_table_id(303), &table);
             let guard = disk_pool.pool_guard();
-            let mut mutable =
-                crate::file::table_file::MutableTableFile::fork(&table, fs.background_writes());
+            let mut mutable = crate::file::table_file::MutableTableFile::fork(
+                &table,
+                fs.background_writes(),
+                disk_pool.global_pool().clone(),
+            );
             let runtime = unique_runtime!(metadata, disk_pool);
             let tree = runtime.open(SUPER_BLOCK_ID, &guard);
             let key1 = [Val::from(1u32)];
@@ -2704,8 +2707,11 @@ mod tests {
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
             let disk_pool = table_readonly_pool(&global, test_user_table_id(310), &table);
             let guard = disk_pool.pool_guard();
-            let mut mutable =
-                crate::file::table_file::MutableTableFile::fork(&table, fs.background_writes());
+            let mut mutable = crate::file::table_file::MutableTableFile::fork(
+                &table,
+                fs.background_writes(),
+                disk_pool.global_pool().clone(),
+            );
             let runtime = unique_runtime!(metadata, disk_pool);
             let tree = runtime.open(SUPER_BLOCK_ID, &guard);
 
@@ -2776,8 +2782,11 @@ mod tests {
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
             let disk_pool = table_readonly_pool(&global, test_user_table_id(311), &table);
             let guard = disk_pool.pool_guard();
-            let mut mutable =
-                crate::file::table_file::MutableTableFile::fork(&table, fs.background_writes());
+            let mut mutable = crate::file::table_file::MutableTableFile::fork(
+                &table,
+                fs.background_writes(),
+                disk_pool.global_pool().clone(),
+            );
             let runtime = non_unique_runtime!(metadata, disk_pool);
             let tree = runtime.open(SUPER_BLOCK_ID, &guard);
 
@@ -2819,8 +2828,11 @@ mod tests {
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
             let disk_pool = table_readonly_pool(&global, test_user_table_id(312), &table);
             let guard = disk_pool.pool_guard();
-            let mut mutable =
-                crate::file::table_file::MutableTableFile::fork(&table, fs.background_writes());
+            let mut mutable = crate::file::table_file::MutableTableFile::fork(
+                &table,
+                fs.background_writes(),
+                disk_pool.global_pool().clone(),
+            );
             let runtime = unique_runtime!(metadata, disk_pool);
             let tree = runtime.open(SUPER_BLOCK_ID, &guard);
 
@@ -2869,8 +2881,11 @@ mod tests {
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
             let disk_pool = table_readonly_pool(&global, test_user_table_id(304), &table);
             let guard = disk_pool.pool_guard();
-            let mut mutable =
-                crate::file::table_file::MutableTableFile::fork(&table, fs.background_writes());
+            let mut mutable = crate::file::table_file::MutableTableFile::fork(
+                &table,
+                fs.background_writes(),
+                disk_pool.global_pool().clone(),
+            );
             let runtime = non_unique_runtime!(metadata, disk_pool);
             let tree = runtime.open(SUPER_BLOCK_ID, &guard);
             let key1 = [Val::from(1u32)];
@@ -2937,8 +2952,11 @@ mod tests {
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
             let disk_pool = table_readonly_pool(&global, test_user_table_id(309), &table);
             let guard = disk_pool.pool_guard();
-            let mut mutable =
-                crate::file::table_file::MutableTableFile::fork(&table, fs.background_writes());
+            let mut mutable = crate::file::table_file::MutableTableFile::fork(
+                &table,
+                fs.background_writes(),
+                disk_pool.global_pool().clone(),
+            );
             let runtime = non_unique_runtime!(metadata, disk_pool);
             let tree = runtime.open(SUPER_BLOCK_ID, &guard);
 
@@ -2989,7 +3007,11 @@ mod tests {
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
             let disk_pool = table_readonly_pool(&global, test_user_table_id(310), &table);
             let guard = disk_pool.pool_guard();
-            let inner = MutableTableFile::fork(&table, fs.background_writes());
+            let inner = MutableTableFile::fork(
+                &table,
+                fs.background_writes(),
+                disk_pool.global_pool().clone(),
+            );
             let allocated_before = inner.root().alloc_map.allocated();
             let mut mutable = FailingDiskTreeWriteFile::new(inner, Some(1), None);
             let runtime = unique_runtime!(metadata, disk_pool);
@@ -3034,7 +3056,11 @@ mod tests {
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
             let disk_pool = table_readonly_pool(&global, test_user_table_id(311), &table);
             let guard = disk_pool.pool_guard();
-            let inner = MutableTableFile::fork(&table, fs.background_writes());
+            let inner = MutableTableFile::fork(
+                &table,
+                fs.background_writes(),
+                disk_pool.global_pool().clone(),
+            );
             let allocated_before = inner.root().alloc_map.allocated();
             let mut mutable = FailingDiskTreeWriteFile::new(inner, None, Some(0));
             let runtime = unique_runtime!(metadata, disk_pool);
@@ -3082,8 +3108,11 @@ mod tests {
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
             let disk_pool = table_readonly_pool(&global, test_user_table_id(305), &table);
             let guard = disk_pool.pool_guard();
-            let mut mutable =
-                crate::file::table_file::MutableTableFile::fork(&table, fs.background_writes());
+            let mut mutable = crate::file::table_file::MutableTableFile::fork(
+                &table,
+                fs.background_writes(),
+                disk_pool.global_pool().clone(),
+            );
 
             let unique_runtime = unique_runtime!(metadata, disk_pool);
             let unique_tree = unique_runtime.open(SUPER_BLOCK_ID, &guard);
@@ -3244,8 +3273,11 @@ mod tests {
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
             let disk_pool = table_readonly_pool(&global, test_user_table_id(306), &table);
             let guard = disk_pool.pool_guard();
-            let mut mutable =
-                crate::file::table_file::MutableTableFile::fork(&table, fs.background_writes());
+            let mut mutable = crate::file::table_file::MutableTableFile::fork(
+                &table,
+                fs.background_writes(),
+                disk_pool.global_pool().clone(),
+            );
             let runtime = unique_runtime!(metadata, disk_pool);
             let tree = runtime.open(SUPER_BLOCK_ID, &guard);
             let key1 = [Val::from(1u32)];
@@ -3331,8 +3363,11 @@ mod tests {
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
             let disk_pool = table_readonly_pool(&global, test_user_table_id(307), &table);
             let guard = disk_pool.pool_guard();
-            let mut mutable =
-                crate::file::table_file::MutableTableFile::fork(&table, fs.background_writes());
+            let mut mutable = crate::file::table_file::MutableTableFile::fork(
+                &table,
+                fs.background_writes(),
+                disk_pool.global_pool().clone(),
+            );
             let runtime = non_unique_runtime!(metadata, disk_pool);
             let tree = runtime.open(SUPER_BLOCK_ID, &guard);
             let key1 = [Val::from(1u32)];
@@ -3407,8 +3442,11 @@ mod tests {
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
             let disk_pool = table_readonly_pool(&global, test_user_table_id(308), &table);
             let guard = disk_pool.pool_guard();
-            let mut mutable =
-                crate::file::table_file::MutableTableFile::fork(&table, fs.background_writes());
+            let mut mutable = crate::file::table_file::MutableTableFile::fork(
+                &table,
+                fs.background_writes(),
+                disk_pool.global_pool().clone(),
+            );
             let runtime = unique_runtime!(metadata, disk_pool);
             let tree = runtime.open(SUPER_BLOCK_ID, &guard);
 
@@ -3496,8 +3534,11 @@ mod tests {
             let write_disk_pool =
                 table_readonly_pool(&write_global, test_user_table_id(309), &table);
             let write_guard = write_disk_pool.pool_guard();
-            let mut mutable =
-                crate::file::table_file::MutableTableFile::fork(&table, fs.background_writes());
+            let mut mutable = crate::file::table_file::MutableTableFile::fork(
+                &table,
+                fs.background_writes(),
+                write_disk_pool.global_pool().clone(),
+            );
             let write_runtime = unique_runtime!(metadata, write_disk_pool);
             let tree = write_runtime.open(SUPER_BLOCK_ID, &write_guard);
 
@@ -3569,8 +3610,11 @@ mod tests {
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
             let disk_pool = table_readonly_pool(&global, test_user_table_id(313), &table);
             let guard = disk_pool.pool_guard();
-            let mut mutable =
-                crate::file::table_file::MutableTableFile::fork(&table, fs.background_writes());
+            let mut mutable = crate::file::table_file::MutableTableFile::fork(
+                &table,
+                fs.background_writes(),
+                disk_pool.global_pool().clone(),
+            );
             let runtime = unique_runtime!(metadata, disk_pool);
             let tree = runtime.open(SUPER_BLOCK_ID, &guard);
 
@@ -3680,8 +3724,11 @@ mod tests {
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
             let disk_pool = table_readonly_pool(&global, test_user_table_id(314), &table);
             let guard = disk_pool.pool_guard();
-            let mut mutable =
-                crate::file::table_file::MutableTableFile::fork(&table, fs.background_writes());
+            let mut mutable = crate::file::table_file::MutableTableFile::fork(
+                &table,
+                fs.background_writes(),
+                disk_pool.global_pool().clone(),
+            );
             let runtime = unique_runtime!(metadata, disk_pool);
             let tree = runtime.open(SUPER_BLOCK_ID, &guard);
 
@@ -3771,8 +3818,11 @@ mod tests {
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
             let disk_pool = table_readonly_pool(&global, test_user_table_id(305), &table);
             let guard = disk_pool.pool_guard();
-            let mut mutable =
-                crate::file::table_file::MutableTableFile::fork(&table, fs.background_writes());
+            let mut mutable = crate::file::table_file::MutableTableFile::fork(
+                &table,
+                fs.background_writes(),
+                disk_pool.global_pool().clone(),
+            );
             let runtime = unique_runtime!(metadata, disk_pool);
             let tree = runtime.open(SUPER_BLOCK_ID, &guard);
             let key1 = [Val::from(1u32)];

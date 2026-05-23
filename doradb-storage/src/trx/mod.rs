@@ -1580,7 +1580,11 @@ pub(crate) mod tests {
         assert!(old_root.is_none());
 
         let old_root_ptr = table_file.active_root_unchecked() as *const _ as usize;
-        let mutable = MutableTableFile::fork(&table_file, engine.table_fs.background_writes());
+        let mutable = MutableTableFile::fork(
+            &table_file,
+            engine.table_fs.background_writes(),
+            engine.disk_pool.clone_inner(),
+        );
         let (table_file, old_root) = mutable.commit(2, false).await.unwrap();
         (old_root_ptr, table_file, old_root.unwrap())
     }

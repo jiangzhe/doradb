@@ -30,6 +30,7 @@ use error_stack::Report;
 use event_listener::{Event, EventListener, listener};
 use parking_lot::Mutex;
 use std::collections::BTreeSet;
+use std::fmt;
 use std::mem;
 use std::os::fd::AsRawFd;
 use std::sync::Arc;
@@ -41,6 +42,91 @@ use zerocopy::FromZeros;
 /// Very small pools provide little practical value and can stall eviction/load flow.
 const MIN_READONLY_POOL_PAGES: usize = 256;
 
+enum InflightBlockState {
+    Loading(Arc<PageIOCompletion>),
+    WriteBlocked,
+}
+
+/// Lease that keeps one physical readonly-cache key blocked while a CoW write
+/// is queued or in flight.
+///
+/// Unlike the evictable pool writeback path, this readonly CoW path does not
+/// queue reads behind writes. A production readonly read should reach only
+/// blocks published through an active root, so a miss against a write-blocked
+/// physical key is surfaced as an internal protocol error instead of waiting.
+pub(crate) struct ReadonlyWriteLease {
+    pool: QuiescentGuard<ReadonlyBufferPool>,
+    key: BlockKey,
+}
+
+impl ReadonlyWriteLease {
+    #[inline]
+    fn new(pool: QuiescentGuard<ReadonlyBufferPool>, key: BlockKey) -> Self {
+        Self { pool, key }
+    }
+}
+
+impl fmt::Debug for ReadonlyWriteLease {
+    #[inline]
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ReadonlyWriteLease")
+            .field("key", &self.key)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Drop for ReadonlyWriteLease {
+    #[inline]
+    fn drop(&mut self) {
+        if let Entry::Occupied(occ) = self.pool.inflights.entry(self.key)
+            && matches!(occ.get(), InflightBlockState::WriteBlocked)
+        {
+            occ.remove();
+        }
+    }
+}
+
+/// Blocks same-key readonly misses while a CoW block write is pending.
+///
+/// The write barrier is allowed only when no same-key miss is still in flight.
+/// It installs a per-key write-blocked state before invalidating resident
+/// mappings, so new misses cannot load old disk bytes while the physical block
+/// write is queued or in flight.
+#[inline]
+pub(crate) fn begin_write_barrier(
+    pool: QuiescentGuard<ReadonlyBufferPool>,
+    file_id: FileID,
+    block_id: BlockID,
+) -> Result<ReadonlyWriteLease> {
+    let key = BlockKey::new(file_id, block_id);
+    {
+        // Keep the inflight entry guard scoped to this block; invalidation below
+        // touches the resident mapping table and must not nest DashMap locks.
+        match pool.inflights.entry(key) {
+            Entry::Vacant(vac) => {
+                vac.insert(InflightBlockState::WriteBlocked);
+            }
+            Entry::Occupied(mut occ) => match occ.get() {
+                InflightBlockState::Loading(inflight) if inflight.completed_result().is_none() => {
+                    return Err(Report::new(InternalError::ReadonlyWriteInflight)
+                        .attach(format!("key={key:?}"))
+                        .into());
+                }
+                InflightBlockState::Loading(_) => {
+                    occ.insert(InflightBlockState::WriteBlocked);
+                }
+                InflightBlockState::WriteBlocked => {
+                    return Err(Report::new(InternalError::ReadonlyWriteBlocked)
+                        .attach(format!("key={key:?}"))
+                        .into());
+                }
+            },
+        }
+    }
+    let _ = pool.invalidate_key(&key);
+    Ok(ReadonlyWriteLease::new(pool, key))
+}
+
 /// Global readonly cache owner shared across files.
 ///
 /// This type owns the frame/page arena and maintains a forward mapping
@@ -50,7 +136,7 @@ const MIN_READONLY_POOL_PAGES: usize = 256;
 pub struct ReadonlyBufferPool {
     size: usize,
     mappings: DashMap<BlockKey, PageID>,
-    inflight_loads: DashMap<BlockKey, Arc<PageIOCompletion>>,
+    inflights: DashMap<BlockKey, InflightBlockState>,
     residency: ReadonlyResidency,
     eviction_arbiter: EvictionArbiter,
     fs: QuiescentGuard<FileSystem>,
@@ -100,7 +186,7 @@ impl ReadonlyBufferPool {
         let pool = ReadonlyBufferPool {
             size,
             mappings: DashMap::new(),
-            inflight_loads: DashMap::new(),
+            inflights: DashMap::new(),
             residency: ReadonlyResidency::new(size, eviction_arbiter),
             eviction_arbiter,
             fs,
@@ -164,6 +250,11 @@ impl ReadonlyBufferPool {
     }
 
     #[inline]
+    fn block_key(&self, file: &Arc<SparseFile>, block_id: BlockID) -> BlockKey {
+        BlockKey::new(file.file_id(), block_id)
+    }
+
+    #[inline]
     async fn reserve_frame_id_for_load(&self) -> Result<PageID> {
         loop {
             if self.shutdown_flag.load(Ordering::Acquire) {
@@ -203,11 +294,11 @@ impl ReadonlyBufferPool {
         result: CompletionResult<PageID>,
     ) {
         inflight.complete(result);
-        match self.inflight_loads.entry(key) {
-            Entry::Occupied(occ) if Arc::ptr_eq(occ.get(), inflight) => {
-                occ.remove();
-            }
-            _ => {}
+        if let Entry::Occupied(occ) = self.inflights.entry(key)
+            && let InflightBlockState::Loading(current) = occ.get()
+            && Arc::ptr_eq(current, inflight)
+        {
+            occ.remove();
         }
     }
 
@@ -307,7 +398,7 @@ impl ReadonlyBufferPool {
 
     /// Invalidates a specific cache key and returns its old frame id.
     #[inline]
-    pub fn invalidate_key(&self, key: &BlockKey) -> Option<PageID> {
+    fn invalidate_key(&self, key: &BlockKey) -> Option<PageID> {
         let frame_id = match self.mappings.remove(key) {
             Some((_, frame_id)) => frame_id,
             None => return None,
@@ -316,84 +407,10 @@ impl ReadonlyBufferPool {
         Some(frame_id)
     }
 
-    /// Invalidates a specific cache key using strict GC-ordering preconditions.
-    ///
-    /// This method expects no holder on the target frame latch. If exclusive
-    /// lock cannot be acquired immediately, it panics to surface protocol bugs.
-    #[inline]
-    pub fn invalidate_key_strict(&self, key: &BlockKey) -> Option<PageID> {
-        let frame_id = match self.mappings.remove(key) {
-            Some((_, frame_id)) => frame_id,
-            None => return None,
-        };
-        self.invalidate_frame_strict(frame_id, Some(*key));
-        Some(frame_id)
-    }
-
     /// Invalidates one physical block from one file.
     #[inline]
-    pub fn invalidate_file_block(&self, file_id: FileID, block_id: BlockID) -> Option<PageID> {
+    pub(crate) fn invalidate_block(&self, file_id: FileID, block_id: BlockID) -> Option<PageID> {
         self.invalidate_key(&BlockKey::new(file_id, block_id))
-    }
-
-    /// Invalidates one physical block from one file using strict GC ordering.
-    #[inline]
-    pub fn invalidate_file_block_strict(
-        &self,
-        file_id: FileID,
-        block_id: BlockID,
-    ) -> Option<PageID> {
-        self.invalidate_key_strict(&BlockKey::new(file_id, block_id))
-    }
-
-    /// Invalidates all cache entries belonging to one file.
-    ///
-    /// Returns the number of invalidated mappings.
-    #[inline]
-    pub fn invalidate_file(&self, file_id: FileID) -> usize {
-        let keys = self
-            .mappings
-            .iter()
-            .filter_map(|entry| {
-                if entry.key().file_id == file_id {
-                    Some(*entry.key())
-                } else {
-                    None
-                }
-            })
-            .collect::<Vec<_>>();
-        let mut count = 0usize;
-        for key in keys {
-            if self.invalidate_key(&key).is_some() {
-                count += 1;
-            }
-        }
-        count
-    }
-
-    /// Invalidates all cache entries of one file using strict GC ordering.
-    ///
-    /// This method panics if any target frame is still latch-held.
-    #[inline]
-    pub fn invalidate_file_strict(&self, file_id: FileID) -> usize {
-        let keys = self
-            .mappings
-            .iter()
-            .filter_map(|entry| {
-                if entry.key().file_id == file_id {
-                    Some(*entry.key())
-                } else {
-                    None
-                }
-            })
-            .collect::<Vec<_>>();
-        let mut count = 0usize;
-        for key in keys {
-            if self.invalidate_key_strict(&key).is_some() {
-                count += 1;
-            }
-        }
-        count
     }
 
     #[inline]
@@ -468,21 +485,6 @@ impl ReadonlyBufferPool {
     }
 
     #[inline]
-    fn invalidate_frame_strict(&self, frame_id: PageID, expected_key: Option<BlockKey>) {
-        let guard = self.pool_guard();
-        let page_guard = self
-            .try_lock_page_exclusive(&guard, frame_id)
-            .unwrap_or_else(|| {
-                panic!(
-                    "strict invalidation lock acquisition failed: frame_id={}",
-                    frame_id
-                )
-            });
-        self.invalidate_frame_with_guard(page_guard, expected_key);
-        let _ = self.residency.move_resident_to_free(frame_id);
-    }
-
-    #[inline]
     async fn get_page_internal<T: 'static>(
         &self,
         guard: &PoolGuard,
@@ -527,6 +529,235 @@ impl ReadonlyBufferPool {
     }
 }
 
+impl QuiescentGuard<ReadonlyBufferPool> {
+    /// Reads one persisted block through the shared readonly cache.
+    ///
+    /// Add future callers with caution. This API does not provide the
+    /// pre-publication validation contract of [`Self::read_validated_block`],
+    /// so pages that require page-kind validation should use the validated
+    /// entrypoint instead. If a new raw-read caller could overlap with a
+    /// validated read for the same page, revisit the inflight-load semantics
+    /// before expanding this API's usage.
+    #[inline]
+    pub(crate) async fn read_block(
+        &self,
+        file_kind: FileKind,
+        file: &Arc<SparseFile>,
+        guard: &PoolGuard,
+        block_id: BlockID,
+    ) -> Result<ReadonlyBlockGuard> {
+        self.read_shared_block(file_kind, file, guard, block_id, None)
+            .await
+    }
+
+    /// Reads and validates one persisted block before returning immutable bytes.
+    ///
+    /// On cache miss, validation runs before the new frame becomes resident.
+    /// On cache hit, validation is re-run against the resident bytes and a
+    /// failed validation invalidates the mapping before returning the error.
+    #[inline]
+    pub(crate) async fn read_validated_block(
+        &self,
+        file_kind: FileKind,
+        file: &Arc<SparseFile>,
+        guard: &PoolGuard,
+        block_id: BlockID,
+        validator: ReadonlyBlockValidator,
+    ) -> Result<ReadonlyBlockGuard> {
+        self.read_shared_block(file_kind, file, guard, block_id, Some(validator))
+            .await
+    }
+
+    #[inline]
+    async fn join_or_start_inflight_load(
+        &self,
+        file: &Arc<SparseFile>,
+        key: BlockKey,
+        validation: Option<InflightLoadValidation>,
+    ) -> Result<Arc<PageIOCompletion>> {
+        self.stats.record_cache_miss();
+        let inflight = match self.inflights.entry(key) {
+            Entry::Vacant(vac) => {
+                let inflight = Arc::new(PageIOCompletion::new());
+                vac.insert(InflightBlockState::Loading(Arc::clone(&inflight)));
+                inflight
+            }
+            Entry::Occupied(occ) => match occ.get() {
+                InflightBlockState::Loading(inflight) => {
+                    self.stats.record_miss_join();
+                    return Ok(Arc::clone(inflight));
+                }
+                InflightBlockState::WriteBlocked => {
+                    return Err(Report::new(InternalError::ReadonlyWriteBlocked)
+                        .attach(format!(
+                            "readonly miss blocked by table-file write barrier: key={key:?}"
+                        ))
+                        .into());
+                }
+            },
+        };
+        // The entry guard above is dropped before we reserve a frame or inspect
+        // resident mappings, avoiding nested locks across the two DashMaps.
+        let task_arena = self.arena.arena_guard(self.pool_guard());
+        match ReadonlyPageReservation::reserve_page(self, key, task_arena).await {
+            Ok((frame_id, page_guard)) => {
+                let reservation = ReadonlyPageReservation::from_reserved_page(
+                    self.clone(),
+                    key,
+                    frame_id,
+                    page_guard,
+                );
+                if let Some(existing_frame_id) = self.try_get_frame_id(&key) {
+                    // Another miss published the block after our initial miss
+                    // check. Roll back this reservation and complete waiters
+                    // with the resident frame instead of issuing duplicate IO.
+                    drop(reservation);
+                    self.complete_inflight_load(key, &inflight, Ok(existing_frame_id));
+                } else {
+                    let req = ReadSubmission::new(
+                        Arc::clone(file),
+                        self.clone(),
+                        key,
+                        Arc::clone(&inflight),
+                        validation,
+                        reservation,
+                    );
+                    if let Err(err) = self.send_read_async(req).await {
+                        err.into_inner().fail(CompletionErrorKind::report_send(
+                            "send readonly pool read request",
+                        ));
+                    }
+                }
+            }
+            Err(err) => {
+                self.complete_inflight_load(
+                    key,
+                    &inflight,
+                    Err(CompletionErrorKind::report_error(
+                        err,
+                        format!("reserve readonly block load frame: key={key:?}"),
+                    )),
+                );
+            }
+        }
+        Ok(inflight)
+    }
+
+    #[inline]
+    async fn get_or_load_frame_id(
+        &self,
+        file: &Arc<SparseFile>,
+        key: BlockKey,
+    ) -> Result<(PageID, bool)> {
+        if let Some(frame_id) = self.try_get_frame_id(&key) {
+            return Ok((frame_id, true));
+        }
+        let inflight = self.join_or_start_inflight_load(file, key, None).await?;
+        if let Some(frame_id) = self.try_get_frame_id(&key) {
+            return Ok((frame_id, false));
+        }
+        inflight
+            .wait_result()
+            .await
+            .map_err(|report| {
+                Error::from_completion_report(
+                    report,
+                    format!("wait for readonly block load: key={key:?}"),
+                )
+            })
+            .map(|frame_id| (frame_id, false))
+    }
+
+    #[inline]
+    async fn get_or_load_frame_id_validated(
+        &self,
+        file_kind: FileKind,
+        file: &Arc<SparseFile>,
+        key: BlockKey,
+        validator: ReadonlyBlockValidator,
+    ) -> Result<(PageID, bool)> {
+        if let Some(frame_id) = self.try_get_frame_id(&key) {
+            return Ok((frame_id, true));
+        }
+        let inflight = self
+            .join_or_start_inflight_load(
+                file,
+                key,
+                Some(InflightLoadValidation {
+                    file_kind,
+                    validator,
+                }),
+            )
+            .await?;
+        if let Some(frame_id) = self.try_get_frame_id(&key) {
+            return Ok((frame_id, false));
+        }
+        inflight
+            .wait_result()
+            .await
+            .map_err(|report| {
+                Error::from_completion_report(
+                    report,
+                    format!(
+                        "wait for validated readonly block load: file={file_kind}, key={key:?}"
+                    ),
+                )
+            })
+            .map(|frame_id| (frame_id, false))
+    }
+
+    #[inline]
+    async fn read_shared_block(
+        &self,
+        file_kind: FileKind,
+        file: &Arc<SparseFile>,
+        guard: &PoolGuard,
+        block_id: BlockID,
+        validation: Option<ReadonlyBlockValidator>,
+    ) -> Result<ReadonlyBlockGuard> {
+        let key = self.block_key(file, block_id);
+        self.validate_guard(guard);
+        loop {
+            let (frame_id, resident_hit) = match validation {
+                Some(validator) => {
+                    self.get_or_load_frame_id_validated(file_kind, file, key, validator)
+                        .await?
+                }
+                None => self.get_or_load_frame_id(file, key).await?,
+            };
+            let guard = self
+                .get_page_internal::<Page>(guard, frame_id, LatchFallbackMode::Shared)
+                .await?;
+            if !self.validate_guarded_frame_key(&guard, key) {
+                self.invalidate_stale_mapping_if_same_frame(key, frame_id);
+                continue;
+            }
+            if let Some(shared) = guard.lock_shared_async().await {
+                let block = ReadonlyBlockGuard::new(block_id, shared);
+                if let Some(validator) = validation
+                    && let Err(err) = validator(block.page(), file_kind, block_id)
+                {
+                    drop(block);
+                    // This resident-hit cleanup is only expected when a page
+                    // became resident without miss-time validation. In current
+                    // runtime usage that raw-read path is limited to CowFile
+                    // super/meta-block loading, which does not overlap with the
+                    // validated page kinds that reach this branch. Drop the
+                    // shared guard before invalidation so the retry loop does
+                    // not contend with our own latch; revisit this synchronous
+                    // path if raw readonly usage expands in the future.
+                    let _ = self.invalidate_block(file.file_id(), block_id);
+                    return Err(err);
+                }
+                if resident_hit {
+                    self.stats.record_cache_hit();
+                }
+                return Ok(block);
+            }
+        }
+    }
+}
+
 impl Drop for ReadonlyBufferPool {
     #[inline]
     fn drop(&mut self) {
@@ -562,10 +793,10 @@ pub(crate) struct ReadonlyPageReservation {
 }
 
 impl ReadonlyPageReservation {
-    #[inline]
     /// Reserves one free readonly frame and locks it exclusively for one load.
     ///
     /// The returned guard is not yet visible through the persisted-block map.
+    #[inline]
     async fn reserve_page(
         pool: &ReadonlyBufferPool,
         _key: BlockKey,
@@ -590,8 +821,8 @@ impl ReadonlyPageReservation {
         Ok((frame_id, page_guard))
     }
 
-    #[inline]
     /// Wraps one reserved frame in the shared reservation guard.
+    #[inline]
     fn from_reserved_page(
         pool: QuiescentGuard<ReadonlyBufferPool>,
         key: BlockKey,
@@ -651,8 +882,8 @@ impl PageReservation for ReadonlyPageReservation {
         Ok(frame_id)
     }
 
-    #[inline]
     /// Returns the frame to the free list and clears all persisted-block state.
+    #[inline]
     fn rollback(self) {
         let ReadonlyPageReservation {
             pool,
@@ -690,8 +921,8 @@ pub(crate) struct ReadSubmission {
 }
 
 impl ReadSubmission {
-    #[inline]
     /// Builds one readonly miss-load submission from an already reserved frame.
+    #[inline]
     fn new(
         file: Arc<SparseFile>,
         pool: QuiescentGuard<ReadonlyBufferPool>,
@@ -719,12 +950,12 @@ impl ReadSubmission {
         }
     }
 
-    #[inline]
     /// Publishes the terminal miss result at most once.
     ///
     /// `ReadSubmission` also completes in `Drop` as a last-resort rollback
     /// path, so every explicit terminal path must mark the submission as
     /// completed to avoid a redundant second completion and inflight-map check.
+    #[inline]
     fn complete_inflight_once(&mut self, result: CompletionResult<PageID>) {
         if self.completed {
             return;
@@ -734,8 +965,8 @@ impl ReadSubmission {
         self.completed = true;
     }
 
-    #[inline]
     /// Fails the miss before worker completion and wakes all joined waiters.
+    #[inline]
     pub(crate) fn fail(mut self, err: Report<CompletionErrorKind>) {
         drop(self.reservation.take());
         self.pool.stats.add_completed_reads(1);
@@ -748,11 +979,11 @@ impl ReadSubmission {
         self.pool.stats.add_running_reads(1);
     }
 
-    #[inline]
     /// Finalizes one worker-side readonly read completion.
     ///
     /// Exact-page reads publish the reserved frame; short reads and IO errors
     /// drop the reservation so rollback returns the frame to the free list.
+    #[inline]
     pub(crate) fn complete(mut self, res: StdIoResult<usize>) -> IOKind {
         let result = match res {
             Ok(len) if len == PAGE_SIZE => {
@@ -1080,228 +1311,6 @@ impl ReadonlyBlockGuard {
     }
 }
 
-impl ReadonlyBufferPool {
-    #[inline]
-    /// Invalidates one block for the provided file id from the shared readonly cache.
-    pub(crate) fn invalidate_block_id(&self, file_id: FileID, block_id: BlockID) -> Option<PageID> {
-        self.invalidate_file_block(file_id, block_id)
-    }
-
-    #[inline]
-    fn block_key(&self, file: &Arc<SparseFile>, block_id: BlockID) -> BlockKey {
-        BlockKey::new(file.file_id(), block_id)
-    }
-}
-
-impl QuiescentGuard<ReadonlyBufferPool> {
-    #[inline]
-    /// Reads one persisted block through the shared readonly cache.
-    ///
-    /// Add future callers with caution. This API does not provide the
-    /// pre-publication validation contract of [`Self::read_validated_block`],
-    /// so pages that require page-kind validation should use the validated
-    /// entrypoint instead. If a new raw-read caller could overlap with a
-    /// validated read for the same page, revisit the inflight-load semantics
-    /// before expanding this API's usage.
-    pub(crate) async fn read_block(
-        &self,
-        file_kind: FileKind,
-        file: &Arc<SparseFile>,
-        guard: &PoolGuard,
-        block_id: BlockID,
-    ) -> Result<ReadonlyBlockGuard> {
-        self.read_shared_block(file_kind, file, guard, block_id, None)
-            .await
-    }
-
-    #[inline]
-    /// Reads and validates one persisted block before returning immutable bytes.
-    ///
-    /// On cache miss, validation runs before the new frame becomes resident.
-    /// On cache hit, validation is re-run against the resident bytes and a
-    /// failed validation invalidates the mapping before returning the error.
-    pub(crate) async fn read_validated_block(
-        &self,
-        file_kind: FileKind,
-        file: &Arc<SparseFile>,
-        guard: &PoolGuard,
-        block_id: BlockID,
-        validator: ReadonlyBlockValidator,
-    ) -> Result<ReadonlyBlockGuard> {
-        self.read_shared_block(file_kind, file, guard, block_id, Some(validator))
-            .await
-    }
-
-    #[inline]
-    async fn join_or_start_inflight_load(
-        &self,
-        file: &Arc<SparseFile>,
-        key: BlockKey,
-        validation: Option<InflightLoadValidation>,
-    ) -> Arc<PageIOCompletion> {
-        self.stats.record_cache_miss();
-        match self.inflight_loads.entry(key) {
-            Entry::Vacant(vac) => {
-                let inflight = Arc::new(PageIOCompletion::new());
-                vac.insert(Arc::clone(&inflight));
-                let task_arena = self.arena.arena_guard(self.pool_guard());
-                match ReadonlyPageReservation::reserve_page(self, key, task_arena).await {
-                    Ok((frame_id, page_guard)) => {
-                        let reservation = ReadonlyPageReservation::from_reserved_page(
-                            self.clone(),
-                            key,
-                            frame_id,
-                            page_guard,
-                        );
-                        let req = ReadSubmission::new(
-                            Arc::clone(file),
-                            self.clone(),
-                            key,
-                            Arc::clone(&inflight),
-                            validation,
-                            reservation,
-                        );
-                        if let Err(err) = self.send_read_async(req).await {
-                            err.into_inner().fail(CompletionErrorKind::report_send(
-                                "send readonly pool read request",
-                            ));
-                        }
-                    }
-                    Err(err) => {
-                        self.complete_inflight_load(
-                            key,
-                            &inflight,
-                            Err(CompletionErrorKind::report_error(
-                                err,
-                                format!("reserve readonly block load frame: key={key:?}"),
-                            )),
-                        );
-                    }
-                }
-                inflight
-            }
-            Entry::Occupied(occ) => {
-                self.stats.record_miss_join();
-                Arc::clone(occ.get())
-            }
-        }
-    }
-
-    #[inline]
-    async fn get_or_load_frame_id(
-        &self,
-        file: &Arc<SparseFile>,
-        key: BlockKey,
-    ) -> Result<(PageID, bool)> {
-        if let Some(frame_id) = self.try_get_frame_id(&key) {
-            return Ok((frame_id, true));
-        }
-        let inflight = self.join_or_start_inflight_load(file, key, None).await;
-        if let Some(frame_id) = self.try_get_frame_id(&key) {
-            return Ok((frame_id, false));
-        }
-        inflight
-            .wait_result()
-            .await
-            .map_err(|report| {
-                Error::from_completion_report(
-                    report,
-                    format!("wait for readonly block load: key={key:?}"),
-                )
-            })
-            .map(|frame_id| (frame_id, false))
-    }
-
-    #[inline]
-    async fn get_or_load_frame_id_validated(
-        &self,
-        file_kind: FileKind,
-        file: &Arc<SparseFile>,
-        key: BlockKey,
-        validator: ReadonlyBlockValidator,
-    ) -> Result<(PageID, bool)> {
-        if let Some(frame_id) = self.try_get_frame_id(&key) {
-            return Ok((frame_id, true));
-        }
-        let inflight = self
-            .join_or_start_inflight_load(
-                file,
-                key,
-                Some(InflightLoadValidation {
-                    file_kind,
-                    validator,
-                }),
-            )
-            .await;
-        if let Some(frame_id) = self.try_get_frame_id(&key) {
-            return Ok((frame_id, false));
-        }
-        inflight
-            .wait_result()
-            .await
-            .map_err(|report| {
-                Error::from_completion_report(
-                    report,
-                    format!(
-                        "wait for validated readonly block load: file={file_kind}, key={key:?}"
-                    ),
-                )
-            })
-            .map(|frame_id| (frame_id, false))
-    }
-
-    #[inline]
-    async fn read_shared_block(
-        &self,
-        file_kind: FileKind,
-        file: &Arc<SparseFile>,
-        guard: &PoolGuard,
-        block_id: BlockID,
-        validation: Option<ReadonlyBlockValidator>,
-    ) -> Result<ReadonlyBlockGuard> {
-        let key = self.block_key(file, block_id);
-        self.validate_guard(guard);
-        loop {
-            let (frame_id, resident_hit) = match validation {
-                Some(validator) => {
-                    self.get_or_load_frame_id_validated(file_kind, file, key, validator)
-                        .await?
-                }
-                None => self.get_or_load_frame_id(file, key).await?,
-            };
-            let guard = self
-                .get_page_internal::<Page>(guard, frame_id, LatchFallbackMode::Shared)
-                .await?;
-            if !self.validate_guarded_frame_key(&guard, key) {
-                self.invalidate_stale_mapping_if_same_frame(key, frame_id);
-                continue;
-            }
-            if let Some(shared) = guard.lock_shared_async().await {
-                let block = ReadonlyBlockGuard::new(block_id, shared);
-                if let Some(validator) = validation
-                    && let Err(err) = validator(block.page(), file_kind, block_id)
-                {
-                    drop(block);
-                    // This resident-hit cleanup is only expected when a page
-                    // became resident without miss-time validation. In current
-                    // runtime usage that raw-read path is limited to CowFile
-                    // super/meta-block loading, which does not overlap with the
-                    // validated page kinds that reach this branch. Drop the
-                    // shared guard before invalidation so the retry loop does
-                    // not contend with our own latch; revisit this synchronous
-                    // path if raw readonly usage expands in the future.
-                    let _ = self.invalidate_block_id(file.file_id(), block_id);
-                    return Err(err);
-                }
-                if resident_hit {
-                    self.stats.record_cache_hit();
-                }
-                return Ok(block);
-            }
-        }
-    }
-}
-
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -1366,6 +1375,18 @@ pub(crate) mod tests {
     #[inline]
     fn test_user_file_id(offset: TableID) -> FileID {
         FileID::from(test_user_table_id(offset))
+    }
+
+    fn key_state_is_loading(pool: &ReadonlyBufferPool, key: &BlockKey) -> bool {
+        pool.inflights
+            .get(key)
+            .is_some_and(|state| matches!(&*state, InflightBlockState::Loading(_)))
+    }
+
+    fn key_state_is_write_blocked(pool: &ReadonlyBufferPool, key: &BlockKey) -> bool {
+        pool.inflights
+            .get(key)
+            .is_some_and(|state| matches!(&*state, InflightBlockState::WriteBlocked))
     }
 
     fn assert_completion_data_integrity(err: Error) {
@@ -1553,7 +1574,13 @@ pub(crate) mod tests {
         let mut buf = DirectBuf::zeroed(COW_FILE_PAGE_SIZE);
         let bytes = buf.as_bytes_mut();
         bytes[..payload.len()].copy_from_slice(payload);
-        let mutable = MutableTableFile::fork(table_file, fs.background_writes());
+        let global = global_readonly_pool_scope(frame_page_bytes(2));
+        let disk_pool = table_readonly_pool(&global, test_user_table_id(0), table_file);
+        let mutable = MutableTableFile::fork(
+            table_file,
+            fs.background_writes(),
+            disk_pool.global_pool().clone(),
+        );
         mutable.write_block(page_id, buf).await.unwrap();
         drop(mutable);
     }
@@ -1566,7 +1593,13 @@ pub(crate) mod tests {
     ) {
         let mut buf = DirectBuf::zeroed(COW_FILE_PAGE_SIZE);
         buf.as_bytes_mut().copy_from_slice(bytes);
-        let mutable = MutableTableFile::fork(table_file, fs.background_writes());
+        let global = global_readonly_pool_scope(frame_page_bytes(2));
+        let disk_pool = table_readonly_pool(&global, test_user_table_id(0), table_file);
+        let mutable = MutableTableFile::fork(
+            table_file,
+            fs.background_writes(),
+            disk_pool.global_pool().clone(),
+        );
         mutable.write_block(page_id, buf).await.unwrap();
         drop(mutable);
     }
@@ -1814,6 +1847,88 @@ pub(crate) mod tests {
         }
     }
 
+    #[derive(Clone)]
+    struct ControlledWriteHook {
+        inner: Arc<ControlledWriteHookInner>,
+    }
+
+    struct ControlledWriteHookInner {
+        fd: RawFd,
+        offset: usize,
+        calls: AtomicUsize,
+        start_ev: Event,
+        released: AtomicBool,
+        release_ev: Event,
+    }
+
+    impl ControlledWriteHook {
+        fn for_page(fd: RawFd, block_id: BlockID) -> Self {
+            ControlledWriteHook {
+                inner: Arc::new(ControlledWriteHookInner {
+                    fd,
+                    offset: usize::from(block_id) * PAGE_SIZE,
+                    calls: AtomicUsize::new(0),
+                    start_ev: Event::new(),
+                    released: AtomicBool::new(false),
+                    release_ev: Event::new(),
+                }),
+            }
+        }
+
+        fn call_count(&self) -> usize {
+            self.inner.calls.load(Ordering::SeqCst)
+        }
+
+        fn release(&self) {
+            self.inner.released.store(true, Ordering::SeqCst);
+            self.inner.release_ev.notify(usize::MAX);
+        }
+
+        async fn wait_started(&self, expected_calls: usize) {
+            loop {
+                if self.call_count() >= expected_calls {
+                    return;
+                }
+                listener!(self.inner.start_ev => listener);
+                if self.call_count() >= expected_calls {
+                    return;
+                }
+                listener.await;
+            }
+        }
+
+        fn matches(&self, op: StorageBackendOp) -> bool {
+            op.kind() == IOKind::Write
+                && op.fd() == self.inner.fd
+                && op.offset() == self.inner.offset
+        }
+    }
+
+    impl StorageBackendTestHook for ControlledWriteHook {
+        fn on_submit(&self, op: StorageBackendOp) {
+            if self.matches(op) {
+                self.inner.calls.fetch_add(1, Ordering::SeqCst);
+                self.inner.start_ev.notify(usize::MAX);
+            }
+        }
+
+        fn on_complete(&self, op: StorageBackendOp, _res: &mut StdIoResult<usize>) {
+            if !self.matches(op) {
+                return;
+            }
+            loop {
+                if self.inner.released.load(Ordering::SeqCst) {
+                    break;
+                }
+                listener!(self.inner.release_ev => listener);
+                if self.inner.released.load(Ordering::SeqCst) {
+                    break;
+                }
+                smol::block_on(listener);
+            }
+        }
+    }
+
     #[test]
     fn test_global_readonly_mapping_and_invalidation() {
         let global = owned_global_pool(64 * 1024 * 1024);
@@ -1840,8 +1955,205 @@ pub(crate) mod tests {
         );
 
         drop(g3);
-        assert_eq!(global.invalidate_key(&key), Some(test_page_id(3)));
+        assert_eq!(
+            global.invalidate_block(key.file_id, key.block_id),
+            Some(test_page_id(3))
+        );
         assert_eq!(global.allocated(), 0);
+    }
+
+    #[test]
+    fn test_readonly_write_barrier_invalidates_resident_mapping() {
+        let global = owned_global_pool(64 * 1024 * 1024);
+        let global_guard = (*global).pool_guard();
+        let key = BlockKey::new(test_file_id(70), test_block_id(11));
+
+        let mut frame = global
+            .try_lock_page_exclusive(&global_guard, test_page_id(4))
+            .unwrap();
+        global.bind_frame(key, &mut frame).unwrap();
+        drop(frame);
+        assert_eq!(global.try_get_frame_id(&key), Some(test_page_id(4)));
+
+        let lease = begin_write_barrier(global.guard(), key.file_id, key.block_id).unwrap();
+        assert_eq!(global.try_get_frame_id(&key), None);
+        assert_eq!(global.try_get_block_key(test_page_id(4)), None);
+        assert_eq!(global.allocated(), 0);
+        assert!(key_state_is_write_blocked(&global, &key));
+        drop(lease);
+        assert!(!global.inflights.contains_key(&key));
+
+        let miss = begin_write_barrier(global.guard(), key.file_id, key.block_id).unwrap();
+        assert!(key_state_is_write_blocked(&global, &key));
+        drop(miss);
+    }
+
+    #[test]
+    fn test_readonly_write_barrier_rejects_same_key_inflight_load() {
+        let global = owned_global_pool(64 * 1024 * 1024);
+        let key = BlockKey::new(test_file_id(71), test_block_id(12));
+        global.inflights.insert(
+            key,
+            InflightBlockState::Loading(Arc::new(PageIOCompletion::new())),
+        );
+
+        let err = begin_write_barrier(global.guard(), key.file_id, key.block_id).unwrap_err();
+        assert_eq!(
+            err.report().downcast_ref::<InternalError>().copied(),
+            Some(InternalError::ReadonlyWriteInflight)
+        );
+        assert!(key_state_is_loading(&global, &key));
+        global.inflights.remove(&key);
+    }
+
+    #[test]
+    fn test_readonly_write_barrier_replaces_completed_same_key_load() {
+        let global = owned_global_pool(64 * 1024 * 1024);
+        let key = BlockKey::new(test_file_id(72), test_block_id(12));
+        let inflight = Arc::new(PageIOCompletion::new());
+        inflight.complete(Ok(test_page_id(2)));
+        global
+            .inflights
+            .insert(key, InflightBlockState::Loading(inflight));
+
+        let lease = begin_write_barrier(global.guard(), key.file_id, key.block_id).unwrap();
+        assert!(key_state_is_write_blocked(&global, &key));
+        drop(lease);
+        assert!(!global.inflights.contains_key(&key));
+    }
+
+    #[test]
+    fn test_readonly_write_barrier_prevents_stale_physical_key_alias() {
+        smol::block_on(async {
+            let (_temp_dir, fs) = build_test_fs();
+            let table_file = fs
+                .create_table_file(test_user_table_id(119), make_metadata(), false)
+                .unwrap();
+            let table_file = commit_table_file(&fs, table_file).await;
+            let block_id = test_block_id(17);
+            write_payload(&fs, &table_file, block_id, b"old-reuse-bytes").await;
+
+            let global = owned_global_pool(frame_page_bytes(2));
+            let pool = owned_readonly_pool(
+                test_user_file_id(119),
+                FileKind::TableFile,
+                Arc::clone(table_file.sparse_file()),
+                &global,
+            );
+            let pool_guard = pool.pool_guard();
+            let key = BlockKey::new(test_user_file_id(119), block_id);
+
+            let old = pool.read_block(&pool_guard, block_id).await.unwrap();
+            assert_eq!(&old.page()[..15], b"old-reuse-bytes");
+            drop(old);
+            assert!(global.try_get_frame_id(&key).is_some());
+
+            let lease = begin_write_barrier(global.guard(), key.file_id, key.block_id).unwrap();
+            assert_eq!(global.try_get_frame_id(&key), None);
+            assert!(key_state_is_write_blocked(&global, &key));
+            write_payload(&fs, &table_file, block_id, b"new-reuse-bytes").await;
+            drop(lease);
+
+            let new = pool.read_block(&pool_guard, block_id).await.unwrap();
+            assert_eq!(&new.page()[..15], b"new-reuse-bytes");
+            drop(table_file);
+            drop(fs);
+        });
+    }
+
+    #[test]
+    fn test_readonly_read_returns_error_while_write_blocked() {
+        smol::block_on(async {
+            let (_temp_dir, fs) = build_test_fs();
+            let table_file = fs
+                .create_table_file(test_user_table_id(120), make_metadata(), false)
+                .unwrap();
+            let table_file = commit_table_file(&fs, table_file).await;
+            let block_id = test_block_id(18);
+            write_payload(&fs, &table_file, block_id, b"write-blocked").await;
+
+            let global = owned_global_pool(frame_page_bytes(2));
+            let pool = owned_readonly_pool(
+                test_user_file_id(120),
+                FileKind::TableFile,
+                Arc::clone(table_file.sparse_file()),
+                &global,
+            );
+            let pool_guard = pool.pool_guard();
+            let key = BlockKey::new(test_user_file_id(120), block_id);
+            let lease = begin_write_barrier(global.guard(), key.file_id, key.block_id).unwrap();
+            assert!(key_state_is_write_blocked(&global, &key));
+
+            let err = match pool.read_block(&pool_guard, block_id).await {
+                Ok(_) => panic!("expected readonly write-blocked error"),
+                Err(err) => err,
+            };
+            assert_eq!(
+                err.report().downcast_ref::<InternalError>().copied(),
+                Some(InternalError::ReadonlyWriteBlocked)
+            );
+            assert_eq!(global.stats().queued_reads, 0);
+
+            drop(lease);
+            let block = pool.read_block(&pool_guard, block_id).await.unwrap();
+            assert_eq!(&block.page()[..13], b"write-blocked");
+            drop(table_file);
+            drop(fs);
+        });
+    }
+
+    #[test]
+    fn test_readonly_write_barrier_survives_cancelled_write_waiter() {
+        smol::block_on(async {
+            let (_temp_dir, fs) = build_test_fs();
+            let table_file = fs
+                .create_table_file(test_user_table_id(121), make_metadata(), false)
+                .unwrap();
+            let table_file = commit_table_file(&fs, table_file).await;
+            let block_id = test_block_id(19);
+            write_payload(&fs, &table_file, block_id, b"old-write").await;
+
+            let global = global_readonly_pool_scope(frame_page_bytes(2));
+            let disk_pool = table_readonly_pool(&global, test_user_table_id(121), &table_file);
+            let pool_guard = disk_pool.pool_guard();
+            let key = BlockKey::new(test_user_file_id(121), block_id);
+            let write_hook = Arc::new(ControlledWriteHook::for_page(
+                table_file.sparse_file().as_raw_fd(),
+                block_id,
+            ));
+            let _hook = install_storage_backend_test_hook(write_hook.clone());
+
+            let mut buf = DirectBuf::zeroed(COW_FILE_PAGE_SIZE);
+            buf.as_bytes_mut()[..9].copy_from_slice(b"new-write");
+            let mutable = MutableTableFile::fork(
+                &table_file,
+                fs.background_writes(),
+                disk_pool.global_pool().clone(),
+            );
+            let writer = smol::spawn(async move { mutable.write_block(block_id, buf).await });
+            write_hook.wait_started(1).await;
+            assert!(key_state_is_write_blocked(&global, &key));
+
+            drop(writer);
+            smol::future::yield_now().await;
+            assert!(key_state_is_write_blocked(&global, &key));
+
+            let err = match disk_pool.read_block(&pool_guard, block_id).await {
+                Ok(_) => panic!("expected readonly write-blocked error"),
+                Err(err) => err,
+            };
+            assert_eq!(
+                err.report().downcast_ref::<InternalError>().copied(),
+                Some(InternalError::ReadonlyWriteBlocked)
+            );
+
+            write_hook.release();
+            wait_for(|| !global.inflights.contains_key(&key)).await;
+            let new = disk_pool.read_block(&pool_guard, block_id).await.unwrap();
+            assert_eq!(&new.page()[..9], b"new-write");
+            drop(table_file);
+            drop(fs);
+        });
     }
 
     #[test]
@@ -1914,36 +2226,6 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn test_global_invalidate_file() {
-        let global = owned_global_pool(64 * 1024 * 1024);
-        let global_guard = (*global).pool_guard();
-        let k1 = BlockKey::new(test_file_id(1), test_block_id(10));
-        let k2 = BlockKey::new(test_file_id(1), test_block_id(11));
-        let k3 = BlockKey::new(test_file_id(2), test_block_id(20));
-
-        let mut g1 = global
-            .try_lock_page_exclusive(&global_guard, test_page_id(1))
-            .unwrap();
-        let mut g2 = global
-            .try_lock_page_exclusive(&global_guard, test_page_id(2))
-            .unwrap();
-        let mut g3 = global
-            .try_lock_page_exclusive(&global_guard, test_page_id(3))
-            .unwrap();
-        global.bind_frame(k1, &mut g1).unwrap();
-        global.bind_frame(k2, &mut g2).unwrap();
-        global.bind_frame(k3, &mut g3).unwrap();
-        drop(g1);
-        drop(g2);
-        drop(g3);
-
-        assert_eq!(global.invalidate_file(test_file_id(1)), 2);
-        assert_eq!(global.try_get_frame_id(&k1), None);
-        assert_eq!(global.try_get_frame_id(&k2), None);
-        assert_eq!(global.try_get_frame_id(&k3), Some(test_page_id(3)));
-    }
-
-    #[test]
     fn test_readonly_cache_file_ids_keep_catalog_and_user_pages_isolated() {
         let global = owned_global_pool(64 * 1024 * 1024);
         let global_guard = (*global).pool_guard();
@@ -1963,40 +2245,6 @@ pub(crate) mod tests {
 
         assert_eq!(global.try_get_frame_id(&catalog_key), Some(test_page_id(1)));
         assert_eq!(global.try_get_frame_id(&user_key), Some(test_page_id(2)));
-    }
-
-    #[test]
-    fn test_global_invalidate_key_strict() {
-        let global = owned_global_pool(64 * 1024 * 1024);
-        let global_guard = (*global).pool_guard();
-        let key = BlockKey::new(test_file_id(9), test_block_id(77));
-
-        let mut g = global
-            .try_lock_page_exclusive(&global_guard, test_page_id(5))
-            .unwrap();
-        global.bind_frame(key, &mut g).unwrap();
-        drop(g);
-
-        assert_eq!(global.invalidate_key_strict(&key), Some(test_page_id(5)));
-        assert_eq!(global.try_get_frame_id(&key), None);
-    }
-
-    #[test]
-    #[should_panic(expected = "strict invalidation lock acquisition failed")]
-    fn test_global_invalidate_key_strict_panics_when_latch_held() {
-        smol::block_on(async {
-            let global = owned_global_pool(64 * 1024 * 1024);
-            let global_guard = (*global).pool_guard();
-            let key = BlockKey::new(test_file_id(10), test_block_id(99));
-
-            let mut g = global
-                .try_lock_page_exclusive(&global_guard, test_page_id(6))
-                .unwrap();
-            global.bind_frame(key, &mut g).unwrap();
-            let shared = g.downgrade_shared();
-            let _ = global.invalidate_key_strict(&key);
-            drop(shared);
-        });
     }
 
     #[test]
@@ -2180,6 +2428,70 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn test_readonly_pool_aborts_duplicate_load_after_reservation_when_mapping_exists() {
+        smol::block_on(async {
+            let (_temp_dir, fs) = build_test_fs();
+            let table_file = fs
+                .create_table_file(test_user_table_id(124), make_metadata(), false)
+                .unwrap();
+            let table_file = commit_table_file(&fs, table_file).await;
+            let block_id = test_block_id(7);
+            write_payload(&fs, &table_file, block_id, b"resident").await;
+
+            let global = owned_global_pool(frame_page_bytes(4));
+            let pool = owned_readonly_pool(
+                table_file.sparse_file().file_id(),
+                FileKind::TableFile,
+                Arc::clone(table_file.sparse_file()),
+                &global,
+            );
+            let pool_guard = pool.pool_guard();
+            let key = BlockKey::new(table_file.sparse_file().file_id(), block_id);
+
+            let page = pool
+                .read_block(&pool_guard, block_id)
+                .await
+                .expect("buffer-pool read failed in test");
+            assert_eq!(&page.page()[..8], b"resident");
+            drop(page);
+
+            let resident_frame_id = global
+                .try_get_frame_id(&key)
+                .expect("first read must publish resident mapping");
+            let free_before = global.residency.free.lock().len();
+            let stats_before = global.stats();
+
+            let global_guard = global.guard();
+            let inflight = global_guard
+                .join_or_start_inflight_load(table_file.sparse_file(), key, None)
+                .await
+                .expect("duplicate load abort should not fail");
+
+            assert_eq!(
+                inflight
+                    .completed_result()
+                    .expect("duplicate load abort must complete inflight")
+                    .unwrap(),
+                resident_frame_id
+            );
+            assert!(!global.inflights.contains_key(&key));
+            assert_eq!(global.try_get_frame_id(&key), Some(resident_frame_id));
+            assert_eq!(global.allocated(), 1);
+            assert_eq!(global.residency.free.lock().len(), free_before);
+
+            let stats_delta = global.stats().delta_since(stats_before);
+            assert_eq!(stats_delta.cache_misses, 1);
+            assert_eq!(stats_delta.queued_reads, 0);
+            assert_eq!(stats_delta.running_reads, 0);
+            assert_eq!(stats_delta.completed_reads, 0);
+            assert_eq!(stats_delta.read_errors, 0);
+
+            drop(table_file);
+            drop(fs);
+        });
+    }
+
+    #[test]
     fn test_readonly_pool_dedup_concurrent_miss() {
         smol::block_on(async {
             let (_temp_dir, fs) = build_test_fs();
@@ -2253,7 +2565,7 @@ pub(crate) mod tests {
                     .unwrap();
             });
             read_hook.wait_started(1).await;
-            assert!(global.inflight_loads.contains_key(&key));
+            assert!(key_state_is_loading(&global, &key));
 
             drop(loader);
 
@@ -2271,7 +2583,7 @@ pub(crate) mod tests {
             read_hook.release();
 
             assert_eq!(waiter.await, b"hello");
-            wait_for(|| !global.inflight_loads.contains_key(&key)).await;
+            wait_for(|| !global.inflights.contains_key(&key)).await;
             assert_eq!(read_hook.call_count(), 1);
             assert_eq!(global.allocated(), 1);
             assert!(global.try_get_frame_id(&key).is_some());
@@ -2314,13 +2626,13 @@ pub(crate) mod tests {
                     .unwrap();
             });
             read_hook.wait_started(1).await;
-            assert!(global.inflight_loads.contains_key(&key));
+            assert!(key_state_is_loading(&global, &key));
 
             drop(loader);
             read_hook.release();
 
             wait_for(|| {
-                !global.inflight_loads.contains_key(&key) && global.try_get_frame_id(&key).is_some()
+                !global.inflights.contains_key(&key) && global.try_get_frame_id(&key).is_some()
             })
             .await;
 
@@ -2371,7 +2683,7 @@ pub(crate) mod tests {
                     .unwrap();
             });
             read_hook.wait_started(1).await;
-            assert!(observe.inflight_loads.contains_key(&key));
+            assert!(key_state_is_loading(&observe, &key));
             drop(loader);
             drop(pool_guard);
 
@@ -2388,7 +2700,7 @@ pub(crate) mod tests {
 
             read_hook.release();
             wait_for(|| {
-                !observe.inflight_loads.contains_key(&key) && observe.mappings.contains_key(&key)
+                !observe.inflights.contains_key(&key) && observe.mappings.contains_key(&key)
             })
             .await;
             assert!(observe.mappings.contains_key(&key));
@@ -2413,7 +2725,9 @@ pub(crate) mod tests {
             }
 
             let inflight = Arc::new(PageIOCompletion::new());
-            global.inflight_loads.insert(key, Arc::clone(&inflight));
+            global
+                .inflights
+                .insert(key, InflightBlockState::Loading(Arc::clone(&inflight)));
             let global_guard = global.guard();
             let task_arena = global_guard.arena.arena_guard(global_guard.pool_guard());
             let inflight_for_waiter = Arc::clone(&inflight);
@@ -2438,7 +2752,7 @@ pub(crate) mod tests {
                 evict_listener.await;
                 reserve_waiter
             };
-            assert!(global.inflight_loads.contains_key(&key));
+            assert!(key_state_is_loading(&global, &key));
             assert!(global.residency.alloc_failure_rate() > 0.0);
 
             let dropped = Arc::new(AtomicBool::new(false));
@@ -2515,7 +2829,7 @@ pub(crate) mod tests {
             assert_eq!(read_hook.call_count(), 1);
             assert_eq!(global.allocated(), 0);
             assert_eq!(global.try_get_frame_id(&key), None);
-            wait_for(|| !global.inflight_loads.contains_key(&key)).await;
+            wait_for(|| !global.inflights.contains_key(&key)).await;
             drop(table_file);
             drop(fs);
         });
@@ -2589,7 +2903,7 @@ pub(crate) mod tests {
             assert_eq!(read_hook.call_count(), 1);
             assert_eq!(global.allocated(), 0);
             assert_eq!(global.try_get_frame_id(&key), None);
-            wait_for(|| !global.inflight_loads.contains_key(&key)).await;
+            wait_for(|| !global.inflights.contains_key(&key)).await;
             drop(table_file);
             drop(fs);
         });

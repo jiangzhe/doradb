@@ -8,8 +8,8 @@ use crate::file::block_integrity::{
 };
 use crate::file::cow_file::{
     ActiveRoot as GenericActiveRoot, BlockID, COW_FILE_PAGE_SIZE, CowCodec, CowFile,
-    MutableCowFile, MutableCowRoot, MutableWriterClaim, MutableWriterFile, OldCowRoot, ParsedMeta,
-    SUPER_BLOCK_ID, validate_active_meta_block_id,
+    CowWriteBarrier, MutableCowFile, MutableCowRoot, MutableWriterClaim, MutableWriterFile,
+    OldCowRoot, ParsedMeta, SUPER_BLOCK_ID, allocate_cow_block, validate_active_meta_block_id,
 };
 use crate::file::fs::BackgroundWriteRequest;
 use crate::file::meta_block::{
@@ -376,21 +376,17 @@ pub struct MutableTableFile {
     pub(super) file: Arc<TableFile>,
     pub(super) new_root: MutableCowRoot<TableMeta>,
     background_writes: IOClient<BackgroundWriteRequest>,
+    write_barrier: MutableTableWriteBarrier,
     writer_claim: MutableWriterClaim<TableFile>,
 }
 
-/// One LWC block payload that should be persisted into table-file blocks.
-pub struct LwcBlockPersist {
-    /// Phase-1 logical index-entry shape for this block before block-id assignment.
-    pub shape: ColumnBlockEntryShape,
-    /// Serialized LWC block bytes.
-    pub buf: DirectBuf,
-}
-
 impl MutableTableFile {
-    /// Create new mutable table file.
+    /// Create a mutable handle for first publication of a brand-new table file.
+    ///
+    /// The readonly write barrier is intentionally bypassed here because no
+    /// previous physical block mapping can exist for this newly created file.
     #[inline]
-    pub(crate) fn new(
+    pub(crate) fn new_without_barrier(
         table_file: Arc<TableFile>,
         new_root: ActiveRoot,
         background_writes: &IOClient<BackgroundWriteRequest>,
@@ -400,21 +396,24 @@ impl MutableTableFile {
             file: table_file,
             new_root: MutableCowRoot::from_root(new_root),
             background_writes: background_writes.clone(),
+            write_barrier: MutableTableWriteBarrier::Disabled,
             writer_claim,
         }
     }
 
-    /// Fork the whole table file with a new root.
+    /// Fork the whole table file with readonly-cache write barriers enabled.
     #[inline]
     pub(crate) fn fork(
         table_file: &Arc<TableFile>,
         background_writes: &IOClient<BackgroundWriteRequest>,
+        disk_pool: QuiescentGuard<ReadonlyBufferPool>,
     ) -> Self {
         let writer_claim = MutableWriterClaim::new(table_file);
         MutableTableFile {
             file: Arc::clone(table_file),
             new_root: MutableCowRoot::fork(table_file.active_root_unchecked()),
             background_writes: background_writes.clone(),
+            write_barrier: MutableTableWriteBarrier::ReadonlyPool(disk_pool),
             writer_claim,
         }
     }
@@ -536,18 +535,14 @@ impl MutableTableFile {
 
     /// Allocate a new block id for copy-on-write updates.
     #[inline]
-    pub fn allocate_block_id(&mut self) -> Result<BlockID> {
-        self.new_root.try_allocate_block_id().ok_or_else(|| {
-            Report::new(ResourceError::StorageFileCapacityExceeded)
-                .attach("table file could not allocate block")
-                .into()
-        })
+    pub fn allocate_block(&mut self) -> Result<BlockID> {
+        allocate_cow_block(&mut self.new_root, "table file could not allocate block")
     }
 
     /// Roll back a block id allocated by this unpublished mutable root.
     #[inline]
-    pub fn rollback_allocated_block_id(&mut self, block_id: BlockID) -> Result<()> {
-        self.new_root.rollback_allocated_block_id(block_id)
+    pub fn rollback_allocated_block(&mut self, block_id: BlockID) -> Result<()> {
+        self.new_root.rollback_allocated_block(block_id)
     }
 
     /// Rebuild the mutable root allocation map from root-reachable blocks.
@@ -564,9 +559,13 @@ impl MutableTableFile {
     /// Write one page into the underlying table file.
     #[inline]
     pub async fn write_block(&self, block_id: BlockID, buf: DirectBuf) -> Result<()> {
+        let write_lease = self
+            .write_barrier
+            .as_cow_write_barrier()
+            .begin_write(self.file.sparse_file().file_id(), block_id)?;
         self.file
             .file()
-            .write_block(&self.background_writes, block_id, buf)
+            .write_block_with_lease(&self.background_writes, block_id, buf, write_lease)
             .await
     }
 
@@ -583,13 +582,18 @@ impl MutableTableFile {
             file: table_file,
             mut new_root,
             background_writes,
+            write_barrier,
             writer_claim,
         } = self;
         debug_assert!(new_root.root.trx_id == 0 || new_root.root.trx_id < trx_id);
         new_root.root.trx_id = trx_id;
         let publish_res = table_file
             .file()
-            .publish_root(&background_writes, new_root)
+            .publish_root(
+                &background_writes,
+                new_root,
+                write_barrier.as_cow_write_barrier(),
+            )
             .await;
         drop(writer_claim);
 
@@ -623,12 +627,10 @@ impl MutableTableFile {
         for block in lwc_blocks {
             let start_row_id = block.shape.start_row_id();
             let end_row_id = block.shape.end_row_id();
-            let block_id = self.new_root.try_allocate_block_id().ok_or_else(|| {
-                Error::from(
-                    Report::new(ResourceError::StorageFileCapacityExceeded)
-                        .attach("table file could not allocate LWC block"),
-                )
-            })?;
+            let block_id = allocate_cow_block(
+                &mut self.new_root,
+                "table file could not allocate LWC block",
+            )?;
             max_row_id = max_row_id.max(end_row_id);
             if start_row_id < last_end {
                 return Err(column_block_index_invariant(format!(
@@ -637,11 +639,15 @@ impl MutableTableFile {
             }
             last_end = end_row_id;
             new_entries.push(block.shape.with_block_id(block_id));
+            let write_lease = self
+                .write_barrier
+                .as_cow_write_barrier()
+                .begin_write(self.file.sparse_file().file_id(), block_id)?;
             let background_writes = background_writes.clone();
             let file = Arc::clone(&table_file);
             writes.push(async move {
                 file.file()
-                    .write_block(&background_writes, block_id, block.buf)
+                    .write_block_with_lease(&background_writes, block_id, block.buf, write_lease)
                     .await
             });
         }
@@ -671,6 +677,7 @@ impl MutableTableFile {
     pub fn try_delete(self) -> bool {
         let MutableTableFile {
             file: table_file,
+            write_barrier: _write_barrier,
             writer_claim,
             ..
         } = self;
@@ -685,13 +692,13 @@ impl MutableTableFile {
 
 impl MutableCowFile for MutableTableFile {
     #[inline]
-    fn allocate_block_id(&mut self) -> Result<BlockID> {
-        MutableTableFile::allocate_block_id(self)
+    fn allocate_block(&mut self) -> Result<BlockID> {
+        MutableTableFile::allocate_block(self)
     }
 
     #[inline]
-    fn rollback_allocated_block_id(&mut self, block_id: BlockID) -> Result<()> {
-        MutableTableFile::rollback_allocated_block_id(self, block_id)
+    fn rollback_allocated_block(&mut self, block_id: BlockID) -> Result<()> {
+        MutableTableFile::rollback_allocated_block(self, block_id)
     }
 
     #[inline]
@@ -702,6 +709,29 @@ impl MutableCowFile for MutableTableFile {
     ) -> impl std::future::Future<Output = Result<()>> + Send {
         MutableTableFile::write_block(self, block_id, buf)
     }
+}
+
+enum MutableTableWriteBarrier {
+    ReadonlyPool(QuiescentGuard<ReadonlyBufferPool>),
+    Disabled,
+}
+
+impl MutableTableWriteBarrier {
+    #[inline]
+    fn as_cow_write_barrier(&self) -> CowWriteBarrier<'_> {
+        match self {
+            MutableTableWriteBarrier::ReadonlyPool(pool) => CowWriteBarrier::readonly_pool(pool),
+            MutableTableWriteBarrier::Disabled => CowWriteBarrier::Disabled,
+        }
+    }
+}
+
+/// One LWC block payload that should be persisted into table-file blocks.
+pub struct LwcBlockPersist {
+    /// Phase-1 logical index-entry shape for this block before block-id assignment.
+    pub shape: ColumnBlockEntryShape,
+    /// Serialized LWC block bytes.
+    pub buf: DirectBuf,
 }
 
 /// Guard object of swapped table-file roots.
@@ -719,7 +749,7 @@ mod tests {
     use crate::error::InternalError;
     use crate::error::{DataIntegrityError, Error, FileKind};
     use crate::file::block_integrity::BLOCK_INTEGRITY_TRAILER_SIZE;
-    use crate::file::{build_test_fs, build_test_fs_in, test_block_id};
+    use crate::file::{BlockKey, build_test_fs, build_test_fs_in, test_block_id};
     use crate::io::IOBuf;
     use crate::quiescent::QuiescentBox;
     use crate::table::test_user_table_id;
@@ -786,7 +816,13 @@ mod tests {
             let mut buf = DirectBuf::zeroed(COW_FILE_PAGE_SIZE);
             buf.reset();
             buf.extend_from_slice(b"hello, world");
-            let mutable = MutableTableFile::fork(&table_file, background_writes);
+            let global = global_readonly_pool_scope(64 * 1024 * 1024);
+            let test_disk_pool = table_readonly_pool(&global, table_id, &table_file);
+            let mutable = MutableTableFile::fork(
+                &table_file,
+                background_writes,
+                test_disk_pool.global_pool().clone(),
+            );
             let res = mutable.write_block(test_block_id(3), buf).await;
             assert!(res.is_ok());
             drop(mutable);
@@ -798,13 +834,13 @@ mod tests {
 
             drop(table_file);
 
-            let global = global_readonly_pool_scope(64 * 1024 * 1024);
             let table_file2 = fs.open_table_file(table_id, global.guard()).await.unwrap();
             let disk_pool = global.guard();
             assert_eq!(table_file2.active_root_unchecked().trx_id, 1);
 
-            let mut mutable = MutableTableFile::fork(&table_file2, background_writes);
-            let secondary_root = mutable.allocate_block_id().unwrap();
+            let mut mutable =
+                MutableTableFile::fork(&table_file2, background_writes, disk_pool.clone());
+            let secondary_root = mutable.allocate_block().unwrap();
             mutable.set_secondary_index_root(0, secondary_root).unwrap();
             assert_eq!(mutable.secondary_index_root(0).unwrap(), secondary_root);
             let err = mutable
@@ -843,17 +879,28 @@ mod tests {
             let table_file = fs.create_table_file(table_id, metadata, false).unwrap();
             let (table_file, old_root) = table_file.commit(1, false).await.unwrap();
             drop(old_root);
+            let global = global_readonly_pool_scope(64 * 1024 * 1024);
+            let disk_pool = table_readonly_pool(&global, table_id, &table_file);
 
-            let mut mutable = MutableTableFile::fork(&table_file, background_writes);
-            let inherited_root = mutable.allocate_block_id().unwrap();
+            let mut mutable = MutableTableFile::fork(
+                &table_file,
+                background_writes,
+                disk_pool.global_pool().clone(),
+            );
+            let inherited_root = mutable.allocate_block().unwrap();
             mutable.set_secondary_index_root(0, inherited_root).unwrap();
             let (table_file, old_root) = mutable.commit(2, false).await.unwrap();
             drop(old_root);
 
-            let mut mutable = MutableTableFile::fork(&table_file, background_writes);
+            let disk_pool = table_readonly_pool(&global, table_id, &table_file);
+            let mut mutable = MutableTableFile::fork(
+                &table_file,
+                background_writes,
+                disk_pool.global_pool().clone(),
+            );
             let allocated_before = mutable.root().alloc_map.allocated();
             let err = mutable
-                .rollback_allocated_block_id(inherited_root)
+                .rollback_allocated_block(inherited_root)
                 .unwrap_err();
             assert_eq!(
                 err.report().downcast_ref::<InternalError>().copied(),
@@ -861,18 +908,177 @@ mod tests {
             );
             assert_eq!(mutable.root().alloc_map.allocated(), allocated_before);
 
-            let fresh_block = mutable.allocate_block_id().unwrap();
+            let fresh_block = mutable.allocate_block().unwrap();
             assert_eq!(mutable.root().alloc_map.allocated(), allocated_before + 1);
-            mutable.rollback_allocated_block_id(fresh_block).unwrap();
+            mutable.rollback_allocated_block(fresh_block).unwrap();
             assert_eq!(mutable.root().alloc_map.allocated(), allocated_before);
 
-            let err = mutable
-                .rollback_allocated_block_id(fresh_block)
-                .unwrap_err();
+            let err = mutable.rollback_allocated_block(fresh_block).unwrap_err();
             assert_eq!(
                 err.report().downcast_ref::<InternalError>().copied(),
                 Some(InternalError::CowFileAllocationInvariant)
             );
+
+            drop(mutable);
+            drop(table_file);
+            drop(fs);
+        });
+    }
+
+    #[test]
+    fn test_mutable_table_file_write_block_invalidates_readonly_mapping() {
+        smol::block_on(async {
+            let (_temp_dir, fs) = build_test_fs();
+            let background_writes = fs.background_writes();
+            let metadata = build_test_metadata();
+            let table_id = test_user_table_id(147);
+            let table_file = fs.create_table_file(table_id, metadata, false).unwrap();
+            let (table_file, old_root) = table_file.commit(1, false).await.unwrap();
+            drop(old_root);
+
+            let global = global_readonly_pool_scope(64 * 1024 * 1024);
+            let disk_pool = table_readonly_pool(&global, table_id, &table_file);
+            let disk_pool_guard = disk_pool.pool_guard();
+            let block_id = first_unallocated_blocks(table_file.active_root_unchecked(), 1)
+                .pop()
+                .unwrap();
+            let key = BlockKey::new(FileID::from(table_id), block_id);
+            let cached = disk_pool
+                .read_block(&disk_pool_guard, block_id)
+                .await
+                .unwrap();
+            drop(cached);
+            assert!(global.try_get_frame_id(&key).is_some());
+
+            let mut mutable = MutableTableFile::fork(
+                &table_file,
+                background_writes,
+                disk_pool.global_pool().clone(),
+            );
+            let allocated = mutable.allocate_block().unwrap();
+            assert_eq!(allocated, block_id);
+            assert!(global.try_get_frame_id(&key).is_some());
+            mutable
+                .write_block(block_id, page_buf(b"write-barrier"))
+                .await
+                .unwrap();
+            assert_eq!(global.try_get_frame_id(&key), None);
+
+            drop(mutable);
+            drop(table_file);
+            drop(fs);
+        });
+    }
+
+    #[test]
+    fn test_mutable_table_file_commit_invalidates_reused_meta_block() {
+        smol::block_on(async {
+            let (_temp_dir, fs) = build_test_fs();
+            let background_writes = fs.background_writes();
+            let metadata = build_test_metadata();
+            let table_id = test_user_table_id(148);
+            let table_file = fs.create_table_file(table_id, metadata, false).unwrap();
+            let (table_file, old_root) = table_file.commit(1, false).await.unwrap();
+            drop(old_root);
+
+            let global = global_readonly_pool_scope(64 * 1024 * 1024);
+            let disk_pool = table_readonly_pool(&global, table_id, &table_file);
+            let disk_pool_guard = disk_pool.pool_guard();
+            let meta_block_id = first_unallocated_blocks(table_file.active_root_unchecked(), 1)
+                .pop()
+                .unwrap();
+            let key = BlockKey::new(FileID::from(table_id), meta_block_id);
+            let cached = disk_pool
+                .read_block(&disk_pool_guard, meta_block_id)
+                .await
+                .unwrap();
+            drop(cached);
+            assert!(global.try_get_frame_id(&key).is_some());
+
+            let mutable = MutableTableFile::fork(
+                &table_file,
+                background_writes,
+                disk_pool.global_pool().clone(),
+            );
+            let (table_file, old_root) = mutable.commit(2, false).await.unwrap();
+            drop(old_root);
+            assert_eq!(
+                table_file.active_root_unchecked().meta_block_id,
+                meta_block_id
+            );
+            assert_eq!(global.try_get_frame_id(&key), None);
+
+            drop(table_file);
+            drop(fs);
+        });
+    }
+
+    #[test]
+    fn test_mutable_table_file_lwc_and_column_index_writes_invalidate_readonly_mapping() {
+        smol::block_on(async {
+            let (_temp_dir, fs) = build_test_fs();
+            let background_writes = fs.background_writes();
+            let metadata = build_test_metadata();
+            let table_id = test_user_table_id(149);
+            let table_file = fs.create_table_file(table_id, metadata, false).unwrap();
+            let (table_file, old_root) = table_file.commit(1, false).await.unwrap();
+            drop(old_root);
+
+            let global = global_readonly_pool_scope(64 * 1024 * 1024);
+            let disk_pool = table_readonly_pool(&global, table_id, &table_file);
+            let disk_pool_guard = disk_pool.pool_guard();
+            let before_root = table_file.active_root_unchecked().clone();
+            let cached_blocks = first_unallocated_blocks(&before_root, 8);
+            for block_id in &cached_blocks {
+                let cached = disk_pool
+                    .read_block(&disk_pool_guard, *block_id)
+                    .await
+                    .unwrap();
+                drop(cached);
+                assert!(
+                    global
+                        .try_get_frame_id(&BlockKey::new(FileID::from(table_id), *block_id))
+                        .is_some()
+                );
+            }
+
+            let lwc_blocks = vec![
+                LwcBlockPersist {
+                    shape: ColumnBlockEntryShape::new(0, 10, (0..10).collect(), Vec::new())
+                        .unwrap(),
+                    buf: page_buf(b"reuse-lwc-1"),
+                },
+                LwcBlockPersist {
+                    shape: ColumnBlockEntryShape::new(10, 20, (10..20).collect(), Vec::new())
+                        .unwrap(),
+                    buf: page_buf(b"reuse-lwc-2"),
+                },
+            ];
+            let mut mutable = MutableTableFile::fork(
+                &table_file,
+                background_writes,
+                disk_pool.global_pool().clone(),
+            );
+            mutable
+                .apply_lwc_blocks(lwc_blocks, 7, 2, disk_pool.global_pool())
+                .await
+                .unwrap();
+
+            let invalidated_blocks = cached_blocks
+                .into_iter()
+                .filter(|block_id| {
+                    mutable
+                        .root()
+                        .alloc_map
+                        .is_allocated(usize::from(*block_id))
+                        && !before_root.alloc_map.is_allocated(usize::from(*block_id))
+                })
+                .collect::<Vec<_>>();
+            assert!(invalidated_blocks.len() >= 3);
+            for block_id in invalidated_blocks {
+                let key = BlockKey::new(FileID::from(table_id), block_id);
+                assert_eq!(global.try_get_frame_id(&key), None);
+            }
 
             drop(mutable);
             drop(table_file);
@@ -967,6 +1173,14 @@ mod tests {
         let mut buf = DirectBuf::zeroed(COW_FILE_PAGE_SIZE);
         buf.data_mut()[..payload.len()].copy_from_slice(payload);
         buf
+    }
+
+    fn first_unallocated_blocks(root: &ActiveRoot, count: usize) -> Vec<BlockID> {
+        (1..root.alloc_map.len())
+            .filter(|idx| !root.alloc_map.is_allocated(*idx))
+            .take(count)
+            .map(BlockID::from)
+            .collect()
     }
 
     fn overwrite_file_bytes(path: &str, offset: u64, bytes: &[u8]) {
@@ -1085,7 +1299,11 @@ mod tests {
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
             let disk_pool = table_readonly_pool(&global, table_id, &table_file);
             let (table_file, old_root) = persist_lwc_blocks_for_test(
-                MutableTableFile::fork(&table_file, background_writes),
+                MutableTableFile::fork(
+                    &table_file,
+                    background_writes,
+                    disk_pool.global_pool().clone(),
+                ),
                 lwc_blocks,
                 7,
                 2,
@@ -1155,7 +1373,11 @@ mod tests {
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
             let disk_pool = table_readonly_pool(&global, table_id, &table_file);
             let result = persist_lwc_blocks_for_test(
-                MutableTableFile::fork(&table_file, background_writes),
+                MutableTableFile::fork(
+                    &table_file,
+                    background_writes,
+                    disk_pool.global_pool().clone(),
+                ),
                 lwc_blocks,
                 7,
                 2,
@@ -1192,9 +1414,19 @@ mod tests {
             let table_file = fs.create_table_file(table_id, metadata, false).unwrap();
             let (table_file, old_root) = table_file.commit(1, false).await.unwrap();
             drop(old_root);
+            let global = global_readonly_pool_scope(64 * 1024 * 1024);
+            let disk_pool = table_readonly_pool(&global, table_id, &table_file);
 
-            let _first = MutableTableFile::fork(&table_file, background_writes);
-            let _second = MutableTableFile::fork(&table_file, background_writes);
+            let _first = MutableTableFile::fork(
+                &table_file,
+                background_writes,
+                disk_pool.global_pool().clone(),
+            );
+            let _second = MutableTableFile::fork(
+                &table_file,
+                background_writes,
+                disk_pool.global_pool().clone(),
+            );
         });
     }
 
@@ -1208,11 +1440,21 @@ mod tests {
             let table_file = fs.create_table_file(table_id, metadata, false).unwrap();
             let (table_file, old_root) = table_file.commit(1, false).await.unwrap();
             drop(old_root);
+            let global = global_readonly_pool_scope(64 * 1024 * 1024);
+            let disk_pool = table_readonly_pool(&global, table_id, &table_file);
 
-            let first = MutableTableFile::fork(&table_file, background_writes);
+            let first = MutableTableFile::fork(
+                &table_file,
+                background_writes,
+                disk_pool.global_pool().clone(),
+            );
             drop(first);
 
-            let _second = MutableTableFile::fork(&table_file, background_writes);
+            let _second = MutableTableFile::fork(
+                &table_file,
+                background_writes,
+                disk_pool.global_pool().clone(),
+            );
         });
     }
 }

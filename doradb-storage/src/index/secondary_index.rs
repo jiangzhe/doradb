@@ -932,7 +932,11 @@ mod tests {
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
             let disk_pool = table_readonly_pool(&global, test_user_table_id(611), &table);
             let disk_guard = disk_pool.pool_guard();
-            let mut mutable = MutableTableFile::fork(&table, fs.background_writes());
+            let mut mutable = MutableTableFile::fork(
+                &table,
+                fs.background_writes(),
+                disk_pool.global_pool().clone(),
+            );
             let disk_runtime = unique_runtime!(metadata, disk_pool);
             let disk = disk_runtime.open(SUPER_BLOCK_ID, &disk_guard);
             let key1 = [Val::from(1u32)];
@@ -1103,7 +1107,11 @@ mod tests {
             let key1 = [Val::from(1u32)];
             let key2 = [Val::from(2u32)];
 
-            let mut mutable = MutableTableFile::fork(&table, fs.background_writes());
+            let mut mutable = MutableTableFile::fork(
+                &table,
+                fs.background_writes(),
+                disk_pool.global_pool().clone(),
+            );
             let disk_runtime = unique_runtime!(metadata, disk_pool);
             let disk = disk_runtime.open(SUPER_BLOCK_ID, &disk_guard);
             let root_a = {
@@ -1131,7 +1139,11 @@ mod tests {
             assert_eq!(opened_a.lookup(&key1).await.unwrap(), Some(10));
             assert_eq!(opened_a.lookup(&key2).await.unwrap(), None);
 
-            let mut mutable = MutableTableFile::fork(&table, fs.background_writes());
+            let mut mutable = MutableTableFile::fork(
+                &table,
+                fs.background_writes(),
+                disk_pool.global_pool().clone(),
+            );
             let disk = disk_runtime.open(root_a, &disk_guard);
             let root_b = {
                 let mut writer = disk.batch_writer(&mut mutable, 3);
@@ -1175,7 +1187,11 @@ mod tests {
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
             let disk_pool = table_readonly_pool(&global, test_user_table_id(612), &table);
             let disk_guard = disk_pool.pool_guard();
-            let mut mutable = MutableTableFile::fork(&table, fs.background_writes());
+            let mut mutable = MutableTableFile::fork(
+                &table,
+                fs.background_writes(),
+                disk_pool.global_pool().clone(),
+            );
             let disk_runtime = non_unique_runtime!(metadata, disk_pool);
             let disk = disk_runtime.open(SUPER_BLOCK_ID, &disk_guard);
             let key1 = [Val::from(1u32)];

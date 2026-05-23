@@ -1401,7 +1401,7 @@ pub mod tests {
 
             corrupt_leaf_delete_codec(
                 main_dir.join("catalog.mtb"),
-                u64::from(entry.leaf_page_id),
+                u64::from(entry.leaf_block_id),
                 0,
             );
 

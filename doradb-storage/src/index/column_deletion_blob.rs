@@ -13,7 +13,7 @@ use futures::future::try_join_all;
 use std::mem;
 use std::sync::Arc;
 
-const COLUMN_DELETION_BLOB_NEXT_PAGE_OFFSET: usize = 0;
+const COLUMN_DELETION_BLOB_NEXT_BLOCK_ID_OFFSET: usize = 0;
 const COLUMN_DELETION_BLOB_USED_SIZE_OFFSET: usize = mem::size_of::<BlockID>();
 const COLUMN_AUX_BLOB_PAYLOAD_LEN_OFFSET: usize = 4;
 const RAW_U32_CODEC_VERSION: u8 = 1;
@@ -44,16 +44,16 @@ fn invalid_payload(message: impl Into<String>) -> Error {
 }
 
 /// Reference to one offloaded delete-payload byte range in linked immutable
-/// blob pages.
+/// blob blocks.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct BlobRef {
-    pub start_page_id: BlockID,
+    pub start_block_id: BlockID,
     pub start_offset: u16,
     pub byte_len: u32,
 }
 
 struct BlobPageHeader {
-    next_page_id: BlockID,
+    next_block_id: BlockID,
     used_size: u16,
 }
 
@@ -158,8 +158,9 @@ impl ColumnAuxBlobHeader {
 }
 
 fn decode_blob_page_header(page: &[u8]) -> Result<BlobPageHeader> {
-    let next_page_id = u64::from_le_bytes(
-        page[COLUMN_DELETION_BLOB_NEXT_PAGE_OFFSET..COLUMN_DELETION_BLOB_NEXT_PAGE_OFFSET + 8]
+    let next_block_id = u64::from_le_bytes(
+        page[COLUMN_DELETION_BLOB_NEXT_BLOCK_ID_OFFSET
+            ..COLUMN_DELETION_BLOB_NEXT_BLOCK_ID_OFFSET + 8]
             .try_into()?,
     );
     let used_size = u16::from_le_bytes(
@@ -173,7 +174,7 @@ fn decode_blob_page_header(page: &[u8]) -> Result<BlobPageHeader> {
         )));
     }
     Ok(BlobPageHeader {
-        next_page_id: BlockID::from(next_page_id),
+        next_block_id: BlockID::from(next_block_id),
         used_size,
     })
 }
@@ -181,21 +182,23 @@ fn decode_blob_page_header(page: &[u8]) -> Result<BlobPageHeader> {
 #[inline]
 fn invalid_blob_payload(
     file_kind: FileKind,
-    page_id: BlockID,
+    block_id: BlockID,
     message: impl Into<String>,
 ) -> Error {
     let message = message.into();
     Report::new(DataIntegrityError::InvalidPayload)
         .attach(format!(
-            "file={file_kind}, block=column-deletion-blob, block_id={page_id}, {message}"
+            "file={file_kind}, block=column-deletion-blob, block_id={block_id}, {message}"
         ))
         .into()
 }
 
 #[inline]
-fn validate_blob_page(page: &[u8], file_kind: FileKind, page_id: BlockID) -> Result<&[u8]> {
+fn validate_blob_page(page: &[u8], file_kind: FileKind, block_id: BlockID) -> Result<&[u8]> {
     validate_block(page, COLUMN_DELETION_BLOB_BLOCK_SPEC)
-        .attach_with(|| format!("file={file_kind}, block=column-deletion-blob, block_id={page_id}"))
+        .attach_with(|| {
+            format!("file={file_kind}, block=column-deletion-blob, block_id={block_id}")
+        })
         .map_err(Error::from)
 }
 
@@ -203,12 +206,12 @@ fn validate_blob_page(page: &[u8], file_kind: FileKind, page_id: BlockID) -> Res
 pub(crate) fn validate_persisted_blob_page(
     page: &[u8],
     file_kind: FileKind,
-    page_id: BlockID,
+    block_id: BlockID,
 ) -> Result<()> {
-    let payload = validate_blob_page(page, file_kind, page_id)?;
+    let payload = validate_blob_page(page, file_kind, block_id)?;
     decode_blob_page_header(payload).map_err(|err| {
         if err.data_integrity_error().is_some() {
-            invalid_blob_payload(file_kind, page_id, "invalid blob page header")
+            invalid_blob_payload(file_kind, block_id, "invalid blob page header")
         } else {
             err
         }
@@ -223,32 +226,32 @@ fn validated_blob_page_payload(page: &[u8]) -> &[u8] {
     &page[payload_start..payload_end]
 }
 
-fn encode_blob_page_header(buf: &mut [u8], next_page_id: BlockID, used_size: usize) -> Result<()> {
+fn encode_blob_page_header(buf: &mut [u8], next_block_id: BlockID, used_size: usize) -> Result<()> {
     if used_size > COLUMN_DELETION_BLOB_PAGE_BODY_SIZE {
         return Err(column_deletion_blob_invariant());
     }
     buf[..COLUMN_DELETION_BLOB_PAGE_HEADER_SIZE].fill(0);
-    buf[COLUMN_DELETION_BLOB_NEXT_PAGE_OFFSET..COLUMN_DELETION_BLOB_NEXT_PAGE_OFFSET + 8]
-        .copy_from_slice(&next_page_id.to_le_bytes());
+    buf[COLUMN_DELETION_BLOB_NEXT_BLOCK_ID_OFFSET..COLUMN_DELETION_BLOB_NEXT_BLOCK_ID_OFFSET + 8]
+        .copy_from_slice(&next_block_id.to_le_bytes());
     buf[COLUMN_DELETION_BLOB_USED_SIZE_OFFSET..COLUMN_DELETION_BLOB_USED_SIZE_OFFSET + 2]
         .copy_from_slice(&(used_size as u16).to_le_bytes());
     Ok(())
 }
 
 struct PendingBlobPage {
-    page_id: BlockID,
+    block_id: BlockID,
     used_size: usize,
     buf: DirectBuf,
 }
 
 impl PendingBlobPage {
     #[inline]
-    fn new(page_id: BlockID) -> Self {
+    fn new(block_id: BlockID) -> Self {
         let mut buf = DirectBuf::zeroed(COW_FILE_PAGE_SIZE);
         let payload_start = write_block_header(buf.data_mut(), COLUMN_DELETION_BLOB_BLOCK_SPEC);
         debug_assert_eq!(payload_start, BLOCK_INTEGRITY_HEADER_SIZE);
         PendingBlobPage {
-            page_id,
+            block_id,
             used_size: 0,
             buf,
         }
@@ -272,7 +275,7 @@ impl PendingBlobPage {
 
 struct SealedBlobPage {
     page: PendingBlobPage,
-    next_page_id: BlockID,
+    next_block_id: BlockID,
 }
 
 /// Append-only writer for immutable shared delete payload blobs.
@@ -308,21 +311,21 @@ impl<'a, M: MutableCowFile> ColumnDeletionBlobWriter<'a, M> {
         if framed_len > u32::MAX as usize {
             return Err(column_deletion_blob_invariant());
         }
-        self.ensure_current_page()?;
-        let (start_page_id, start_offset) = {
+        self.ensure_current_block()?;
+        let (start_block_id, start_offset) = {
             let current = self.current_page.as_ref().ok_or_else(|| {
                 Error::from(
                     Report::new(InternalError::ColumnDeletionBlobWriterStateMismatch)
-                        .attach("current page missing after ensure_current_page"),
+                        .attach("current block missing after ensure_current_block"),
                 )
             })?;
-            (current.page_id, current.used_size)
+            (current.block_id, current.used_size)
         };
         let header_bytes = header.encode();
         self.write_stream(&header_bytes)?;
         self.write_stream(bytes)?;
         Ok(BlobRef {
-            start_page_id,
+            start_block_id,
             start_offset: start_offset as u16,
             byte_len: framed_len as u32,
         })
@@ -335,7 +338,7 @@ impl<'a, M: MutableCowFile> ColumnDeletionBlobWriter<'a, M> {
         {
             self.sealed_pages.push(SealedBlobPage {
                 page,
-                next_page_id: SUPER_BLOCK_ID,
+                next_block_id: SUPER_BLOCK_ID,
             });
         }
         let sealed_pages = std::mem::take(&mut self.sealed_pages);
@@ -344,13 +347,13 @@ impl<'a, M: MutableCowFile> ColumnDeletionBlobWriter<'a, M> {
             let payload_end = BLOCK_INTEGRITY_HEADER_SIZE + max_payload_len(COW_FILE_PAGE_SIZE);
             encode_blob_page_header(
                 &mut sealed.page.buf.data_mut()[BLOCK_INTEGRITY_HEADER_SIZE..payload_end],
-                sealed.next_page_id,
+                sealed.next_block_id,
                 sealed.page.used_size,
             )?;
             write_block_checksum(sealed.page.buf.data_mut());
             writes.push(
                 self.mutable_file
-                    .write_block(sealed.page.page_id, sealed.page.buf),
+                    .write_block(sealed.page.block_id, sealed.page.buf),
             );
         }
         try_join_all(writes).await?;
@@ -358,13 +361,13 @@ impl<'a, M: MutableCowFile> ColumnDeletionBlobWriter<'a, M> {
     }
 
     #[inline]
-    fn ensure_current_page(&mut self) -> Result<()> {
+    fn ensure_current_block(&mut self) -> Result<()> {
         match self.current_page.as_ref() {
-            Some(current) if current.free_space() == 0 => self.roll_to_next_page()?,
+            Some(current) if current.free_space() == 0 => self.roll_to_next_block()?,
             Some(_) => {}
             None => {
-                let page_id = self.mutable_file.allocate_block_id()?;
-                self.current_page = Some(PendingBlobPage::new(page_id));
+                let block_id = self.mutable_file.allocate_block()?;
+                self.current_page = Some(PendingBlobPage::new(block_id));
             }
         }
         Ok(())
@@ -383,7 +386,7 @@ impl<'a, M: MutableCowFile> ColumnDeletionBlobWriter<'a, M> {
                 })?
                 .free_space();
             if free_space == 0 {
-                self.roll_to_next_page()?;
+                self.roll_to_next_block()?;
                 continue;
             }
             let take = bytes.len().min(free_space);
@@ -399,17 +402,19 @@ impl<'a, M: MutableCowFile> ColumnDeletionBlobWriter<'a, M> {
         Ok(())
     }
 
-    fn roll_to_next_page(&mut self) -> Result<()> {
-        let next_page_id = self.mutable_file.allocate_block_id()?;
+    fn roll_to_next_block(&mut self) -> Result<()> {
+        let next_block_id = self.mutable_file.allocate_block()?;
         let page = self.current_page.take().ok_or_else(|| {
             Error::from(
                 Report::new(InternalError::ColumnDeletionBlobWriterStateMismatch)
-                    .attach("current page missing during page roll"),
+                    .attach("current block missing during block roll"),
             )
         })?;
-        self.sealed_pages
-            .push(SealedBlobPage { page, next_page_id });
-        self.current_page = Some(PendingBlobPage::new(next_page_id));
+        self.sealed_pages.push(SealedBlobPage {
+            page,
+            next_block_id,
+        });
+        self.current_page = Some(PendingBlobPage::new(next_block_id));
         Ok(())
     }
 }
@@ -446,8 +451,8 @@ impl<'a> ColumnDeletionBlobReader<'a> {
         let mut bytes = self.read_raw(blob_ref).await?;
         if bytes.len() < COLUMN_AUX_BLOB_HEADER_SIZE {
             return Err(invalid_payload(format!(
-                "framed column deletion blob is too short: start_page_id={}, start_offset={}, byte_len={}",
-                blob_ref.start_page_id, blob_ref.start_offset, blob_ref.byte_len
+                "framed column deletion blob is too short: start_block_id={}, start_offset={}, byte_len={}",
+                blob_ref.start_block_id, blob_ref.start_offset, blob_ref.byte_len
             )));
         }
         let header = ColumnAuxBlobHeader::decode(&bytes[..COLUMN_AUX_BLOB_HEADER_SIZE])?;
@@ -462,16 +467,16 @@ impl<'a> ColumnDeletionBlobReader<'a> {
         Ok((header, payload))
     }
 
-    /// Visit the validated blob pages needed to read one referenced byte range.
-    pub(crate) async fn collect_referenced_pages_with(
+    /// Visit the validated blob blocks needed to read one referenced byte range.
+    pub(crate) async fn collect_referenced_blocks_with(
         &self,
         blob_ref: BlobRef,
         mut visit: impl FnMut(BlockID),
     ) -> Result<()> {
-        if blob_ref.start_page_id == SUPER_BLOCK_ID || blob_ref.byte_len == 0 {
+        if blob_ref.start_block_id == SUPER_BLOCK_ID || blob_ref.byte_len == 0 {
             return Err(invalid_payload(format!(
-                "invalid column deletion blob reference: start_page_id={}, byte_len={}",
-                blob_ref.start_page_id, blob_ref.byte_len
+                "invalid column deletion blob reference: start_block_id={}, byte_len={}",
+                blob_ref.start_block_id, blob_ref.byte_len
             )));
         }
         let file_kind = self.file_kind;
@@ -481,11 +486,11 @@ impl<'a> ColumnDeletionBlobReader<'a> {
             .checked_add(byte_len)
             .is_some_and(|end| end <= COLUMN_DELETION_BLOB_PAGE_BODY_SIZE)
         {
-            visit(blob_ref.start_page_id);
+            visit(blob_ref.start_block_id);
             return Ok(());
         }
         let mut remaining = blob_ref.byte_len as usize;
-        let mut page_id = blob_ref.start_page_id;
+        let mut block_id = blob_ref.start_block_id;
         let mut offset = start_offset;
 
         while remaining > 0 {
@@ -495,15 +500,15 @@ impl<'a> ColumnDeletionBlobReader<'a> {
                     self.file_kind,
                     self.file,
                     self.disk_pool_guard,
-                    page_id,
+                    block_id,
                     validate_persisted_blob_page,
                 )
                 .await?;
-            visit(page_id);
+            visit(block_id);
             let payload = validated_blob_page_payload(guard.page());
             let header = decode_blob_page_header(payload).map_err(|err| {
                 if err.data_integrity_error().is_some() {
-                    invalid_blob_payload(file_kind, page_id, "invalid blob page header")
+                    invalid_blob_payload(file_kind, block_id, "invalid blob page header")
                 } else {
                     err
                 }
@@ -512,7 +517,7 @@ impl<'a> ColumnDeletionBlobReader<'a> {
             if offset > used_size {
                 return Err(invalid_blob_payload(
                     file_kind,
-                    page_id,
+                    block_id,
                     format!("blob offset {offset} exceeds used size {used_size}"),
                 ));
             }
@@ -520,7 +525,7 @@ impl<'a> ColumnDeletionBlobReader<'a> {
             if available == 0 && remaining > 0 {
                 return Err(invalid_blob_payload(
                     file_kind,
-                    page_id,
+                    block_id,
                     "blob reference reaches empty page before reading all bytes",
                 ));
             }
@@ -528,30 +533,30 @@ impl<'a> ColumnDeletionBlobReader<'a> {
             if remaining == 0 {
                 break;
             }
-            if header.next_page_id == SUPER_BLOCK_ID {
+            if header.next_block_id == SUPER_BLOCK_ID {
                 return Err(invalid_blob_payload(
                     file_kind,
-                    page_id,
+                    block_id,
                     "blob chain ended before reading all bytes",
                 ));
             }
-            page_id = header.next_page_id;
+            block_id = header.next_block_id;
             offset = 0;
         }
         Ok(())
     }
 
     async fn read_raw(&self, blob_ref: BlobRef) -> Result<Vec<u8>> {
-        if blob_ref.start_page_id == SUPER_BLOCK_ID || blob_ref.byte_len == 0 {
+        if blob_ref.start_block_id == SUPER_BLOCK_ID || blob_ref.byte_len == 0 {
             return Err(invalid_payload(format!(
-                "invalid column deletion blob reference: start_page_id={}, byte_len={}",
-                blob_ref.start_page_id, blob_ref.byte_len
+                "invalid column deletion blob reference: start_block_id={}, byte_len={}",
+                blob_ref.start_block_id, blob_ref.byte_len
             )));
         }
         let file_kind = self.file_kind;
         let mut out = Vec::with_capacity(blob_ref.byte_len as usize);
         let mut remaining = blob_ref.byte_len as usize;
-        let mut page_id = blob_ref.start_page_id;
+        let mut block_id = blob_ref.start_block_id;
         let mut offset = blob_ref.start_offset as usize;
 
         while remaining > 0 {
@@ -561,14 +566,14 @@ impl<'a> ColumnDeletionBlobReader<'a> {
                     self.file_kind,
                     self.file,
                     self.disk_pool_guard,
-                    page_id,
+                    block_id,
                     validate_persisted_blob_page,
                 )
                 .await?;
             let payload = validated_blob_page_payload(guard.page());
             let header = decode_blob_page_header(payload).map_err(|err| {
                 if err.data_integrity_error().is_some() {
-                    invalid_blob_payload(file_kind, page_id, "invalid blob page header")
+                    invalid_blob_payload(file_kind, block_id, "invalid blob page header")
                 } else {
                     err
                 }
@@ -577,7 +582,7 @@ impl<'a> ColumnDeletionBlobReader<'a> {
             if offset > used_size {
                 return Err(invalid_blob_payload(
                     file_kind,
-                    page_id,
+                    block_id,
                     format!("blob offset {offset} exceeds used size {used_size}"),
                 ));
             }
@@ -585,7 +590,7 @@ impl<'a> ColumnDeletionBlobReader<'a> {
             if available == 0 && remaining > 0 {
                 return Err(invalid_blob_payload(
                     file_kind,
-                    page_id,
+                    block_id,
                     "blob reference reaches empty page before reading all bytes",
                 ));
             }
@@ -597,14 +602,14 @@ impl<'a> ColumnDeletionBlobReader<'a> {
             if remaining == 0 {
                 break;
             }
-            if header.next_page_id == SUPER_BLOCK_ID {
+            if header.next_block_id == SUPER_BLOCK_ID {
                 return Err(invalid_blob_payload(
                     file_kind,
-                    page_id,
+                    block_id,
                     "blob chain ended before reading all bytes",
                 ));
             }
-            page_id = header.next_page_id;
+            block_id = header.next_block_id;
             offset = 0;
         }
         Ok(out)
@@ -664,7 +669,11 @@ mod tests {
             let disk_pool = table_readonly_pool(&global, test_user_table_id(1), &table);
             let disk_pool_guard = disk_pool.pool_guard();
 
-            let mut mutable = MutableTableFile::fork(&table, fs.background_writes());
+            let mut mutable = MutableTableFile::fork(
+                &table,
+                fs.background_writes(),
+                disk_pool.global_pool().clone(),
+            );
             let blob = vec![9u8; 513];
             let blob_ref = {
                 let mut writer = ColumnDeletionBlobWriter::new(&mut mutable);
@@ -690,7 +699,7 @@ mod tests {
     }
 
     #[test]
-    fn test_collect_referenced_pages_skips_single_page_read() {
+    fn test_collect_referenced_blocks_skips_single_block_read() {
         smol::block_on(async {
             let (_temp_dir, fs) = build_test_fs();
             let metadata = Arc::new(TableMetadata::new(
@@ -710,7 +719,11 @@ mod tests {
             let disk_pool = table_readonly_pool(&global, test_user_table_id(1), &table);
             let disk_pool_guard = disk_pool.pool_guard();
 
-            let mut mutable = MutableTableFile::fork(&table, fs.background_writes());
+            let mut mutable = MutableTableFile::fork(
+                &table,
+                fs.background_writes(),
+                disk_pool.global_pool().clone(),
+            );
             let blob = vec![9u8; 513];
             let blob_ref = {
                 let mut writer = ColumnDeletionBlobWriter::new(&mut mutable);
@@ -727,14 +740,14 @@ mod tests {
                 &disk_pool_guard,
             );
             let before = disk_pool.global_stats();
-            let mut pages = Vec::new();
+            let mut blocks = Vec::new();
             reader
-                .collect_referenced_pages_with(blob_ref, |page_id| pages.push(page_id))
+                .collect_referenced_blocks_with(blob_ref, |block_id| blocks.push(block_id))
                 .await
                 .unwrap();
             let delta = disk_pool.global_stats().delta_since(before);
 
-            assert_eq!(pages, vec![blob_ref.start_page_id]);
+            assert_eq!(blocks, vec![blob_ref.start_block_id]);
             assert_eq!(delta.cache_hits, 0);
             assert_eq!(delta.cache_misses, 0);
             assert_eq!(delta.queued_reads, 0);
@@ -762,7 +775,11 @@ mod tests {
             let disk_pool = table_readonly_pool(&global, test_user_table_id(1), &table);
             let disk_pool_guard = disk_pool.pool_guard();
 
-            let mut mutable = MutableTableFile::fork(&table, fs.background_writes());
+            let mut mutable = MutableTableFile::fork(
+                &table,
+                fs.background_writes(),
+                disk_pool.global_pool().clone(),
+            );
             let blob = vec![7u8; COLUMN_DELETION_BLOB_PAGE_BODY_SIZE * 2 + 113];
             let blob_ref = {
                 let mut writer = ColumnDeletionBlobWriter::new(&mut mutable);
@@ -788,7 +805,7 @@ mod tests {
     }
 
     #[test]
-    fn test_collect_referenced_pages_crosses_pages() {
+    fn test_collect_referenced_blocks_crosses_blocks() {
         smol::block_on(async {
             let (_temp_dir, fs) = build_test_fs();
             let metadata = Arc::new(TableMetadata::new(
@@ -808,7 +825,11 @@ mod tests {
             let disk_pool = table_readonly_pool(&global, test_user_table_id(1), &table);
             let disk_pool_guard = disk_pool.pool_guard();
 
-            let mut mutable = MutableTableFile::fork(&table, fs.background_writes());
+            let mut mutable = MutableTableFile::fork(
+                &table,
+                fs.background_writes(),
+                disk_pool.global_pool().clone(),
+            );
             let blob = vec![7u8; COLUMN_DELETION_BLOB_PAGE_BODY_SIZE * 2 + 113];
             let blob_ref = {
                 let mut writer = ColumnDeletionBlobWriter::new(&mut mutable);
@@ -824,15 +845,15 @@ mod tests {
                 disk_pool.global_pool(),
                 &disk_pool_guard,
             );
-            let mut pages = Vec::new();
+            let mut blocks = Vec::new();
             reader
-                .collect_referenced_pages_with(blob_ref, |page_id| pages.push(page_id))
+                .collect_referenced_blocks_with(blob_ref, |block_id| blocks.push(block_id))
                 .await
                 .unwrap();
 
-            assert_eq!(pages.len(), 3);
-            assert_eq!(pages[0], blob_ref.start_page_id);
-            assert!(pages.iter().all(|page_id| *page_id != SUPER_BLOCK_ID));
+            assert_eq!(blocks.len(), 3);
+            assert_eq!(blocks[0], blob_ref.start_block_id);
+            assert!(blocks.iter().all(|block_id| *block_id != SUPER_BLOCK_ID));
         });
     }
 
@@ -857,7 +878,11 @@ mod tests {
             let disk_pool = table_readonly_pool(&global, test_user_table_id(1), &table);
             let disk_pool_guard = disk_pool.pool_guard();
 
-            let mut mutable = MutableTableFile::fork(&table, fs.background_writes());
+            let mut mutable = MutableTableFile::fork(
+                &table,
+                fs.background_writes(),
+                disk_pool.global_pool().clone(),
+            );
             let first_blob =
                 vec![3u8; COLUMN_DELETION_BLOB_PAGE_BODY_SIZE - COLUMN_AUX_BLOB_HEADER_SIZE];
             let second_blob = vec![5u8; 17];
@@ -870,9 +895,9 @@ mod tests {
             };
             let (_table, _old_root) = mutable.commit(2, false).await.unwrap();
 
-            assert_ne!(first_ref.start_page_id, SUPER_BLOCK_ID);
+            assert_ne!(first_ref.start_block_id, SUPER_BLOCK_ID);
             assert_eq!(first_ref.start_offset, 0);
-            assert_ne!(second_ref.start_page_id, first_ref.start_page_id);
+            assert_ne!(second_ref.start_block_id, first_ref.start_block_id);
             assert_eq!(second_ref.start_offset, 0);
 
             let reader = ColumnDeletionBlobReader::new(

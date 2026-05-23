@@ -1380,7 +1380,11 @@ mod tests {
                 *root = SUPER_BLOCK_ID;
             }
         }
-        let mut mutable = MutableTableFile::fork(&table_file, engine.table_fs.background_writes());
+        let mut mutable = MutableTableFile::fork(
+            &table_file,
+            engine.table_fs.background_writes(),
+            table.disk_pool().clone(),
+        );
         mutable
             .replace_metadata_and_secondary_index_roots(metadata, roots)
             .unwrap();
@@ -3291,7 +3295,7 @@ mod tests {
 
             corrupt_blob_header_kind(
                 table_file_path,
-                blob_ref.start_page_id,
+                blob_ref.start_block_id,
                 blob_ref.start_offset,
             );
 
@@ -3331,7 +3335,7 @@ mod tests {
             assert_table_data_integrity(
                 err,
                 "column-deletion-blob",
-                blob_ref.start_page_id,
+                blob_ref.start_block_id,
                 DataIntegrityError::InvalidPayload,
             );
 

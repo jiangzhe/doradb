@@ -952,8 +952,11 @@ impl TablePersistence for Table {
         // Step 1: claim one mutable root snapshot and initialize checkpoint
         // boundaries. This is checkpoint-internal current-root access after the
         // post-lease liveness check above.
-        let mut mutable_file =
-            MutableTableFile::fork(table_file, session.engine().table_fs.background_writes());
+        let mut mutable_file = MutableTableFile::fork(
+            table_file,
+            session.engine().table_fs.background_writes(),
+            disk_pool.clone(),
+        );
         let pivot_row_id = mutable_file.root().pivot_row_id;
         let mut secondary_sidecar = SecondaryCheckpointSidecar::new(metadata)?;
 

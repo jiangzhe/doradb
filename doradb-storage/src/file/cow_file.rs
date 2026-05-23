@@ -1,10 +1,10 @@
 use crate::bitmap::AllocMap;
-use crate::buffer::ReadonlyBufferPool;
 use crate::buffer::page::PAGE_SIZE;
+use crate::buffer::{ReadonlyBufferPool, ReadonlyWriteLease, begin_write_barrier};
 use crate::error::{DataIntegrityError, Error, FileKind, InternalError, ResourceError, Result};
 use crate::file::fs::BackgroundWriteRequest;
 use crate::file::super_block::{SUPER_BLOCK_SIZE, SuperBlock};
-use crate::file::{BlockKey, FileID, SparseFile, write_direct};
+use crate::file::{BlockKey, FileID, SparseFile, write_direct, write_direct_with_lease};
 use crate::io::{DirectBuf, IOClient};
 use crate::quiescent::QuiescentGuard;
 use crate::trx::{MAX_SNAPSHOT_TS, TrxID};
@@ -33,8 +33,8 @@ pub const INVALID_BLOCK_ID: BlockID = BlockID::new(u64::MAX);
 
 /// Minimal mutable operations required by CoW index/checkpoint writers.
 pub(crate) trait MutableCowFile {
-    fn allocate_block_id(&mut self) -> Result<BlockID>;
-    fn rollback_allocated_block_id(&mut self, block_id: BlockID) -> Result<()>;
+    fn allocate_block(&mut self) -> Result<BlockID>;
+    fn rollback_allocated_block(&mut self, block_id: BlockID) -> Result<()>;
     fn write_block(
         &self,
         block_id: BlockID,
@@ -46,6 +46,37 @@ pub(crate) trait MutableCowFile {
 pub(crate) trait MutableWriterFile {
     fn claim_mutable_writer(&self);
     fn release_mutable_writer(&self);
+}
+
+/// Readonly-cache write barrier used by CoW block writes.
+#[derive(Clone, Copy)]
+pub(crate) enum CowWriteBarrier<'a> {
+    /// Block same-key readonly misses while the physical block is written.
+    ReadonlyPool(&'a QuiescentGuard<ReadonlyBufferPool>),
+    /// Bypass readonly-cache write blocking when the caller has no relevant readonly path.
+    Disabled,
+}
+
+impl<'a> CowWriteBarrier<'a> {
+    /// Builds a user-table write barrier backed by the shared readonly pool.
+    #[inline]
+    pub(crate) fn readonly_pool(pool: &'a QuiescentGuard<ReadonlyBufferPool>) -> Self {
+        Self::ReadonlyPool(pool)
+    }
+
+    #[inline]
+    pub(crate) fn begin_write(
+        self,
+        file_id: FileID,
+        block_id: BlockID,
+    ) -> Result<Option<ReadonlyWriteLease>> {
+        match self {
+            CowWriteBarrier::ReadonlyPool(pool) => {
+                begin_write_barrier(pool.clone(), file_id, block_id).map(Some)
+            }
+            CowWriteBarrier::Disabled => Ok(None),
+        }
+    }
 }
 
 /// RAII guard for exclusive mutable CoW file access.
@@ -233,11 +264,11 @@ impl<M> MutableCowRoot<M> {
         Ok(old_allocated.saturating_sub(new_allocated))
     }
 
-    /// Allocate one new page id for copy-on-write publish.
+    /// Allocate one new block for copy-on-write publish.
     ///
-    /// Returns `None` when the allocation bitmap cannot provide a new page.
+    /// Returns `None` when the allocation bitmap cannot provide a new block.
     #[inline]
-    pub(crate) fn try_allocate_block_id(&mut self) -> Option<BlockID> {
+    pub(crate) fn try_allocate_block(&mut self) -> Option<BlockID> {
         let block_id = self.root.alloc_map.try_allocate().map(BlockID::from)?;
         self.unpublished_blocks.insert(block_id);
         Some(block_id)
@@ -250,7 +281,7 @@ impl<M> MutableCowRoot<M> {
     /// allocation bit keeps the future published root from marking an abandoned
     /// block as live.
     #[inline]
-    pub(crate) fn rollback_allocated_block_id(&mut self, block_id: BlockID) -> Result<()> {
+    pub(crate) fn rollback_allocated_block(&mut self, block_id: BlockID) -> Result<()> {
         if block_id == SUPER_BLOCK_ID {
             return Err(Report::new(InternalError::CowFileAllocationInvariant)
                 .attach(format!("cannot roll back super block id {block_id}"))
@@ -285,6 +316,19 @@ impl<M> MutableCowRoot<M> {
         self.unpublished_blocks.remove(&block_id);
         Ok(())
     }
+}
+
+/// Allocates one CoW block id.
+#[inline]
+pub(crate) fn allocate_cow_block<M>(
+    root: &mut MutableCowRoot<M>,
+    capacity_context: &'static str,
+) -> Result<BlockID> {
+    root.try_allocate_block().ok_or_else(|| {
+        Error::from(
+            Report::new(ResourceError::StorageFileCapacityExceeded).attach(capacity_context),
+        )
+    })
 }
 
 impl<M> Deref for ActiveRoot<M> {
@@ -451,9 +495,31 @@ impl<M> CowFile<M> {
         block_id: BlockID,
         buf: DirectBuf,
     ) -> Result<()> {
+        self.write_block_with_lease(background_writes, block_id, buf, None)
+            .await
+    }
+
+    /// Write one block using async direct IO while carrying a readonly write
+    /// barrier lease in the backend-owned submission.
+    #[inline]
+    pub(crate) async fn write_block_with_lease(
+        &self,
+        background_writes: &IOClient<BackgroundWriteRequest>,
+        block_id: BlockID,
+        buf: DirectBuf,
+        write_lease: Option<ReadonlyWriteLease>,
+    ) -> Result<()> {
         debug_assert!(buf.capacity() == COW_FILE_PAGE_SIZE);
         let offset = usize::from(block_id) * COW_FILE_PAGE_SIZE;
-        self.write_at_offset(background_writes, offset, buf).await
+        write_direct_with_lease(
+            self.block_key(offset),
+            Arc::clone(&self.file),
+            offset,
+            buf,
+            background_writes,
+            write_lease,
+        )
+        .await
     }
 
     #[inline]
@@ -515,7 +581,7 @@ impl<M> CowFile<M> {
         file_kind: FileKind,
         disk_pool: &QuiescentGuard<ReadonlyBufferPool>,
     ) -> Result<ActiveRoot<M>> {
-        let _ = disk_pool.invalidate_block_id(self.file.file_id(), SUPER_BLOCK_ID);
+        let _ = disk_pool.invalidate_block(self.file.file_id(), SUPER_BLOCK_ID);
         let pool_guard = disk_pool.pool_guard();
         let super_block_guard = disk_pool
             .read_block(file_kind, &self.file, &pool_guard, SUPER_BLOCK_ID)
@@ -524,7 +590,7 @@ impl<M> CowFile<M> {
             Self::pick_super_block(super_block_guard.page(), self.codec.parse_super_block)?;
         drop(super_block_guard);
 
-        let _ = disk_pool.invalidate_block_id(self.file.file_id(), super_block.body.meta_block_id);
+        let _ = disk_pool.invalidate_block(self.file.file_id(), super_block.body.meta_block_id);
         let meta_block_guard = disk_pool
             .read_block(
                 file_kind,
@@ -558,22 +624,18 @@ impl<M> CowFile<M> {
         &self,
         background_writes: &IOClient<BackgroundWriteRequest>,
         mut new_root: MutableCowRoot<M>,
+        write_barrier: CowWriteBarrier<'_>,
     ) -> Result<Option<OldCowRoot<M>>> {
         new_root
             .root
             .block_reclamation_until_effective_ts_installed();
-        let new_meta_block_id = match new_root.try_allocate_block_id() {
-            Some(block_id) => block_id,
-            None => {
-                return Err(Report::new(ResourceError::StorageFileCapacityExceeded)
-                    .attach("publish root could not allocate meta block")
-                    .into());
-            }
-        };
+        let new_meta_block_id =
+            allocate_cow_block(&mut new_root, "publish root could not allocate meta block")?;
         new_root.root.meta_block_id = new_meta_block_id;
 
         let meta_buf = (self.codec.build_meta_block)(&new_root.root)?;
-        self.write_block(background_writes, new_meta_block_id, meta_buf)
+        let write_lease = write_barrier.begin_write(self.file.file_id(), new_meta_block_id)?;
+        self.write_block_with_lease(background_writes, new_meta_block_id, meta_buf, write_lease)
             .await?;
 
         let super_buf = (self.codec.build_super_block)(&new_root.root)?;

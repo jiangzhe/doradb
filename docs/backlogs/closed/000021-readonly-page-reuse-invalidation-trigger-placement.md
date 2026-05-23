@@ -19,3 +19,10 @@ Finalize invalidation trigger placement for reused page IDs in readonly cache wo
 
 Trigger placement is chosen and validated with race/regression tests.
 
+## Close Reason
+
+- Type: implemented
+- Detail: Implemented via docs/tasks/000155-cow-reuse-readonly-barrier.md
+- Closed By: backlog close
+- Reference: User decision
+- Closed At: 2026-05-23

@@ -1472,7 +1472,7 @@ impl FileSystem {
         let table_file = TableFile::create(&file_path, TABLE_FILE_INITIAL_SIZE, table_id, trunc)?;
         let initial_pages = TABLE_FILE_INITIAL_SIZE / COW_FILE_PAGE_SIZE;
         let active_root = ActiveRoot::new(0, initial_pages, metadata);
-        Ok(MutableTableFile::new(
+        Ok(MutableTableFile::new_without_barrier(
             Arc::new(table_file),
             active_root,
             self.background_writes(),
@@ -1665,8 +1665,8 @@ pub(crate) mod tests {
     use crate::buffer::guard::PageGuard;
     use crate::buffer::page::Page;
     use crate::buffer::{
-        BufferPool, PoolRole, SharedPoolEvictorWorkers, test_dispatch_dirty_pages,
-        test_persist_and_evict_page,
+        BufferPool, PoolRole, SharedPoolEvictorWorkers, global_readonly_pool_scope,
+        table_readonly_pool, test_dispatch_dirty_pages, test_persist_and_evict_page,
     };
     use crate::catalog::{
         ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexSpec, USER_OBJ_ID_START,
@@ -1683,6 +1683,7 @@ pub(crate) mod tests {
         StorageBackendTestHook, install_storage_backend_test_hook,
     };
     use crate::latch::LatchFallbackMode;
+    use crate::table::test_user_table_id;
     use crate::value::ValKind;
     use crate::{DiskPool, IndexPool, MemPool, MetaPool};
     use std::ops::Deref;
@@ -1868,7 +1869,13 @@ pub(crate) mod tests {
     ) {
         let mut buf = DirectBuf::zeroed(COW_FILE_PAGE_SIZE);
         buf.as_bytes_mut()[..payload.len()].copy_from_slice(payload);
-        let mutable = MutableTableFile::fork(table_file, fs.background_writes());
+        let global = global_readonly_pool_scope(64 * 1024 * 1024);
+        let disk_pool = table_readonly_pool(&global, test_user_table_id(0), table_file);
+        let mutable = MutableTableFile::fork(
+            table_file,
+            fs.background_writes(),
+            disk_pool.global_pool().clone(),
+        );
         mutable.write_block(block_id, buf).await.unwrap();
         drop(mutable);
     }

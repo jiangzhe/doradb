@@ -32,7 +32,7 @@ pub use fixed::FixedBufferPool;
 pub use identity::PoolRole;
 pub(crate) use identity::{PoolIdentity, RowPoolRole};
 pub use pool_guard::{PoolGuard, PoolGuards, PoolGuardsBuilder};
-pub(crate) use readonly::ReadSubmission;
+pub(crate) use readonly::{ReadSubmission, ReadonlyWriteLease, begin_write_barrier};
 pub use readonly::{ReadonlyBlockGuard, ReadonlyBufferPool};
 
 use crate::DiskPool;
