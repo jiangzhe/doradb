@@ -111,6 +111,23 @@ Readonly key is physical identity:
 
 This preserves cache hits across root swaps when physical blocks are unchanged.
 
+### CoW Block Reuse Barrier
+
+User-table CoW allocation retires readonly-cache state for the physical
+`(file_id, block_id)` before reusing that block id for new bytes. The barrier
+removes any resident readonly mapping synchronously, so the next readonly read
+must miss and reload the newly written page.
+
+If a readonly miss for the same physical key is still in flight when the block
+id is reallocated, the barrier returns an internal invariant error to the
+owning operation. The readonly pool does not poison storage or consult the
+transaction system; checkpoint, DDL, and tests own rollback, retry, or fatal
+handling policy at their respective call sites.
+
+This is intentionally not a generation-key design. Catalog `catalog.mtb`
+publication may mechanically use the shared CoW allocator, but normal
+foreground user-table readonly-cache correctness is the driver for the barrier.
+
 ### Miss/Load and Error Flow
 
 1. miss -> reserve free frame -> read table file page into frame memory

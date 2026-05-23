@@ -329,9 +329,9 @@ impl CatalogStorage {
                     )
                     .await?
             {
-                let new_tail_page_id = mutable.allocate_block_id()?;
+                let new_tail_block_id = mutable.allocate_block()?;
                 mutable
-                    .write_block(new_tail_page_id, merged_tail_buf)
+                    .write_block(new_tail_block_id, merged_tail_buf)
                     .await?;
                 let merged_end_row_id = live_inserts
                     .get(consumed.saturating_sub(1))
@@ -345,7 +345,7 @@ impl CatalogStorage {
                     existing_deletes.into_iter().collect(),
                 )?
                 .with_delete_domain(ColumnDeleteDomain::Ordinal)
-                .with_block_id(new_tail_page_id);
+                .with_block_id(new_tail_block_id);
                 let patches = [ColumnBlockEntryPatch {
                     start_row_id: last_entry.start_row_id,
                     entry: replacement,
@@ -376,9 +376,9 @@ impl CatalogStorage {
                 .await?;
             let mut new_entries = Vec::with_capacity(new_pages.len());
             for page in new_pages {
-                let page_id = mutable.allocate_block_id()?;
-                mutable.write_block(page_id, page.buf).await?;
-                new_entries.push(page.shape.with_block_id(page_id));
+                let block_id = mutable.allocate_block()?;
+                mutable.write_block(block_id, page.buf).await?;
+                new_entries.push(page.shape.with_block_id(block_id));
             }
             if !new_entries.is_empty() {
                 let new_end_row_id = next_row_id.max(root.pivot_row_id);

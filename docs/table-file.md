@@ -224,6 +224,14 @@ released only after `effective_ts < Global_Min_Active_STS`, which covers both
 checkpoint publication and metadata-changing DDL such as `CREATE INDEX` and
 `DROP INDEX`.
 
+When the rebuilt allocation map makes a user-table CoW block id available for
+reuse, allocation first applies the readonly-cache reuse barrier for that
+physical `(file_id, block_id)`. Any resident readonly mapping is retired before
+the caller writes or publishes the new block contents. A same-key readonly miss
+that is still in flight at allocation time is an internal invariant violation
+returned to the owning checkpoint or DDL operation; the barrier itself does not
+poison storage and does not depend on `TransactionSystem`.
+
 ### 7.4 Generic Publish Flow
 
 1. read the active `MetaBlock`

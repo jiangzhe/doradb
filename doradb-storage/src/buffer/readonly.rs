@@ -41,6 +41,26 @@ use zerocopy::FromZeros;
 /// Very small pools provide little practical value and can stall eviction/load flow.
 const MIN_READONLY_POOL_PAGES: usize = 256;
 
+/// Result of retiring readonly resident state before reusing a CoW block id.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ReadonlyReuseInvalidation {
+    /// Retired resident frame id, when a resident mapping existed.
+    pub(crate) frame_id: Option<PageID>,
+}
+
+impl ReadonlyReuseInvalidation {
+    #[inline]
+    fn new(frame_id: Option<PageID>) -> Self {
+        Self { frame_id }
+    }
+
+    /// Returns the number of retired readonly resident mappings.
+    #[inline]
+    pub(crate) fn invalidated_count(self) -> usize {
+        usize::from(self.frame_id.is_some())
+    }
+}
+
 /// Global readonly cache owner shared across files.
 ///
 /// This type owns the frame/page arena and maintains a forward mapping
@@ -334,6 +354,30 @@ impl ReadonlyBufferPool {
     #[inline]
     pub fn invalidate_file_block(&self, file_id: FileID, block_id: BlockID) -> Option<PageID> {
         self.invalidate_key(&BlockKey::new(file_id, block_id))
+    }
+
+    /// Retires readonly resident state before a CoW block id is reused.
+    ///
+    /// Reuse is allowed only when no miss for the same physical key is still
+    /// in flight. A resident mapping is synchronously invalidated so a later
+    /// readonly read must reload the newly written block bytes.
+    #[inline]
+    pub(crate) fn invalidate_for_reuse(
+        &self,
+        file_id: FileID,
+        block_id: BlockID,
+    ) -> Result<ReadonlyReuseInvalidation> {
+        let key = BlockKey::new(file_id, block_id);
+        if let Some(inflight) = self.inflight_loads.get(&key)
+            && inflight.completed_result().is_none()
+        {
+            return Err(Report::new(InternalError::ReadonlyReuseInflight)
+                .attach(format!("file_id={file_id}, block_id={block_id}"))
+                .into());
+        }
+        self.inflight_loads
+            .remove_if(&key, |_, inflight| inflight.completed_result().is_some());
+        Ok(ReadonlyReuseInvalidation::new(self.invalidate_key(&key)))
     }
 
     /// Invalidates one physical block from one file using strict GC ordering.
@@ -1553,7 +1597,13 @@ pub(crate) mod tests {
         let mut buf = DirectBuf::zeroed(COW_FILE_PAGE_SIZE);
         let bytes = buf.as_bytes_mut();
         bytes[..payload.len()].copy_from_slice(payload);
-        let mutable = MutableTableFile::fork(table_file, fs.background_writes());
+        let global = global_readonly_pool_scope(frame_page_bytes(2));
+        let disk_pool = table_readonly_pool(&global, test_user_table_id(0), table_file);
+        let mutable = MutableTableFile::fork(
+            table_file,
+            fs.background_writes(),
+            disk_pool.global_pool().clone(),
+        );
         mutable.write_block(page_id, buf).await.unwrap();
         drop(mutable);
     }
@@ -1566,7 +1616,13 @@ pub(crate) mod tests {
     ) {
         let mut buf = DirectBuf::zeroed(COW_FILE_PAGE_SIZE);
         buf.as_bytes_mut().copy_from_slice(bytes);
-        let mutable = MutableTableFile::fork(table_file, fs.background_writes());
+        let global = global_readonly_pool_scope(frame_page_bytes(2));
+        let disk_pool = table_readonly_pool(&global, test_user_table_id(0), table_file);
+        let mutable = MutableTableFile::fork(
+            table_file,
+            fs.background_writes(),
+            disk_pool.global_pool().clone(),
+        );
         mutable.write_block(page_id, buf).await.unwrap();
         drop(mutable);
     }
@@ -1842,6 +1898,93 @@ pub(crate) mod tests {
         drop(g3);
         assert_eq!(global.invalidate_key(&key), Some(test_page_id(3)));
         assert_eq!(global.allocated(), 0);
+    }
+
+    #[test]
+    fn test_readonly_reuse_invalidation_invalidates_resident_mapping() {
+        let global = owned_global_pool(64 * 1024 * 1024);
+        let global_guard = (*global).pool_guard();
+        let key = BlockKey::new(test_file_id(70), test_block_id(11));
+
+        let mut frame = global
+            .try_lock_page_exclusive(&global_guard, test_page_id(4))
+            .unwrap();
+        global.bind_frame(key, &mut frame).unwrap();
+        drop(frame);
+        assert_eq!(global.try_get_frame_id(&key), Some(test_page_id(4)));
+
+        let invalidation = global
+            .invalidate_for_reuse(key.file_id, key.block_id)
+            .unwrap();
+        assert_eq!(invalidation.frame_id, Some(test_page_id(4)));
+        assert_eq!(invalidation.invalidated_count(), 1);
+        assert_eq!(global.try_get_frame_id(&key), None);
+        assert_eq!(global.try_get_block_key(test_page_id(4)), None);
+        assert_eq!(global.allocated(), 0);
+
+        let miss = global
+            .invalidate_for_reuse(key.file_id, key.block_id)
+            .unwrap();
+        assert_eq!(miss.frame_id, None);
+        assert_eq!(miss.invalidated_count(), 0);
+    }
+
+    #[test]
+    fn test_readonly_reuse_invalidation_rejects_same_key_inflight_load() {
+        let global = owned_global_pool(64 * 1024 * 1024);
+        let key = BlockKey::new(test_file_id(71), test_block_id(12));
+        global
+            .inflight_loads
+            .insert(key, Arc::new(PageIOCompletion::new()));
+
+        let err = global
+            .invalidate_for_reuse(key.file_id, key.block_id)
+            .unwrap_err();
+        assert_eq!(
+            err.report().downcast_ref::<InternalError>().copied(),
+            Some(InternalError::ReadonlyReuseInflight)
+        );
+        assert!(global.inflight_loads.contains_key(&key));
+        global.inflight_loads.remove(&key);
+    }
+
+    #[test]
+    fn test_readonly_reuse_invalidation_prevents_stale_physical_key_alias() {
+        smol::block_on(async {
+            let (_temp_dir, fs) = build_test_fs();
+            let table_file = fs
+                .create_table_file(test_user_table_id(119), make_metadata(), false)
+                .unwrap();
+            let table_file = commit_table_file(&fs, table_file).await;
+            let block_id = test_block_id(17);
+            write_payload(&fs, &table_file, block_id, b"old-reuse-bytes").await;
+
+            let global = owned_global_pool(frame_page_bytes(2));
+            let pool = owned_readonly_pool(
+                test_user_file_id(119),
+                FileKind::TableFile,
+                Arc::clone(table_file.sparse_file()),
+                &global,
+            );
+            let pool_guard = pool.pool_guard();
+            let key = BlockKey::new(test_user_file_id(119), block_id);
+
+            let old = pool.read_block(&pool_guard, block_id).await.unwrap();
+            assert_eq!(&old.page()[..15], b"old-reuse-bytes");
+            drop(old);
+            assert!(global.try_get_frame_id(&key).is_some());
+
+            let invalidation = global
+                .invalidate_for_reuse(key.file_id, key.block_id)
+                .unwrap();
+            assert_eq!(invalidation.invalidated_count(), 1);
+            write_payload(&fs, &table_file, block_id, b"new-reuse-bytes").await;
+
+            let new = pool.read_block(&pool_guard, block_id).await.unwrap();
+            assert_eq!(&new.page()[..15], b"new-reuse-bytes");
+            drop(table_file);
+            drop(fs);
+        });
     }
 
     #[test]

@@ -11,8 +11,8 @@ use crate::file::block_integrity::{
 };
 use crate::file::cow_file::{
     ActiveRoot as GenericActiveRoot, BlockID, COW_FILE_PAGE_SIZE, CowCodec, CowFile,
-    MutableCowFile, MutableCowRoot, MutableWriterClaim, MutableWriterFile, OldCowRoot, ParsedMeta,
-    SUPER_BLOCK_ID, validate_active_meta_block_id,
+    CowReuseBarrier, MutableCowFile, MutableCowRoot, MutableWriterClaim, MutableWriterFile,
+    OldCowRoot, ParsedMeta, SUPER_BLOCK_ID, allocate_cow_block, validate_active_meta_block_id,
 };
 use crate::file::fs::BackgroundWriteRequest;
 use crate::file::meta_block::{
@@ -421,20 +421,21 @@ impl MutableMultiTableFile {
         &self.new_root.root
     }
 
-    /// Allocate a new page id for copy-on-write updates.
+    /// Allocate a new block for copy-on-write updates.
     #[inline]
-    pub fn allocate_block_id(&mut self) -> Result<BlockID> {
-        self.new_root.try_allocate_block_id().ok_or_else(|| {
-            Report::new(ResourceError::StorageFileCapacityExceeded)
-                .attach("multi-table file could not allocate block")
-                .into()
-        })
+    pub fn allocate_block(&mut self) -> Result<BlockID> {
+        allocate_cow_block(
+            &mut self.new_root,
+            CATALOG_MTB_FILE_ID,
+            CowReuseBarrier::disabled_for_catalog_multi_table_file(),
+            "multi-table file could not allocate block",
+        )
     }
 
     /// Roll back a block id allocated by this unpublished mutable root.
     #[inline]
-    pub fn rollback_allocated_block_id(&mut self, block_id: BlockID) -> Result<()> {
-        self.new_root.rollback_allocated_block_id(block_id)
+    pub fn rollback_allocated_block(&mut self, block_id: BlockID) -> Result<()> {
+        self.new_root.rollback_allocated_block(block_id)
     }
 
     /// Write one page into the underlying multi-table file.
@@ -490,7 +491,14 @@ impl MutableMultiTableFile {
             background_writes,
             writer_claim,
         } = self;
-        let publish_res = file.file().publish_root(&background_writes, new_root).await;
+        let publish_res = file
+            .file()
+            .publish_root(
+                &background_writes,
+                new_root,
+                CowReuseBarrier::disabled_for_catalog_multi_table_file(),
+            )
+            .await;
         drop(writer_claim);
         let old_root = publish_res?;
         Ok((file, old_root))
@@ -499,13 +507,13 @@ impl MutableMultiTableFile {
 
 impl MutableCowFile for MutableMultiTableFile {
     #[inline]
-    fn allocate_block_id(&mut self) -> Result<BlockID> {
-        MutableMultiTableFile::allocate_block_id(self)
+    fn allocate_block(&mut self) -> Result<BlockID> {
+        MutableMultiTableFile::allocate_block(self)
     }
 
     #[inline]
-    fn rollback_allocated_block_id(&mut self, block_id: BlockID) -> Result<()> {
-        MutableMultiTableFile::rollback_allocated_block_id(self, block_id)
+    fn rollback_allocated_block(&mut self, block_id: BlockID) -> Result<()> {
+        MutableMultiTableFile::rollback_allocated_block(self, block_id)
     }
 
     #[inline]

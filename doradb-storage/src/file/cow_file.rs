@@ -33,8 +33,8 @@ pub const INVALID_BLOCK_ID: BlockID = BlockID::new(u64::MAX);
 
 /// Minimal mutable operations required by CoW index/checkpoint writers.
 pub(crate) trait MutableCowFile {
-    fn allocate_block_id(&mut self) -> Result<BlockID>;
-    fn rollback_allocated_block_id(&mut self, block_id: BlockID) -> Result<()>;
+    fn allocate_block(&mut self) -> Result<BlockID>;
+    fn rollback_allocated_block(&mut self, block_id: BlockID) -> Result<()>;
     fn write_block(
         &self,
         block_id: BlockID,
@@ -46,6 +46,49 @@ pub(crate) trait MutableCowFile {
 pub(crate) trait MutableWriterFile {
     fn claim_mutable_writer(&self);
     fn release_mutable_writer(&self);
+}
+
+/// Readonly-cache reuse barrier used by CoW block allocation.
+#[derive(Clone, Copy)]
+pub(crate) enum CowReuseBarrier<'a> {
+    /// Retire same-key resident readonly state before the block id is reused.
+    ReadonlyPool(&'a ReadonlyBufferPool),
+    /// No previous readonly mapping can exist for a newly created user file.
+    DisabledForNewUserTableFile,
+    /// Catalog foreground reads are not driven by the user-table readonly cache contract.
+    DisabledForCatalogMultiTableFile,
+}
+
+impl<'a> CowReuseBarrier<'a> {
+    /// Builds a user-table reuse barrier backed by the shared readonly pool.
+    #[inline]
+    pub(crate) fn readonly_pool(pool: &'a ReadonlyBufferPool) -> Self {
+        Self::ReadonlyPool(pool)
+    }
+
+    /// Builds an explicit bypass for first publication of a brand-new user table file.
+    #[inline]
+    pub(crate) fn disabled_for_new_user_table_file() -> Self {
+        Self::DisabledForNewUserTableFile
+    }
+
+    /// Builds an explicit bypass for catalog multi-table CoW allocation.
+    #[inline]
+    pub(crate) fn disabled_for_catalog_multi_table_file() -> Self {
+        Self::DisabledForCatalogMultiTableFile
+    }
+
+    #[inline]
+    fn invalidate_for_reuse(self, file_id: FileID, block_id: BlockID) -> Result<usize> {
+        match self {
+            CowReuseBarrier::ReadonlyPool(pool) => {
+                let invalidation = pool.invalidate_for_reuse(file_id, block_id)?;
+                Ok(invalidation.invalidated_count())
+            }
+            CowReuseBarrier::DisabledForNewUserTableFile
+            | CowReuseBarrier::DisabledForCatalogMultiTableFile => Ok(0),
+        }
+    }
 }
 
 /// RAII guard for exclusive mutable CoW file access.
@@ -233,11 +276,11 @@ impl<M> MutableCowRoot<M> {
         Ok(old_allocated.saturating_sub(new_allocated))
     }
 
-    /// Allocate one new page id for copy-on-write publish.
+    /// Allocate one new block for copy-on-write publish.
     ///
-    /// Returns `None` when the allocation bitmap cannot provide a new page.
+    /// Returns `None` when the allocation bitmap cannot provide a new block.
     #[inline]
-    pub(crate) fn try_allocate_block_id(&mut self) -> Option<BlockID> {
+    pub(crate) fn try_allocate_block(&mut self) -> Option<BlockID> {
         let block_id = self.root.alloc_map.try_allocate().map(BlockID::from)?;
         self.unpublished_blocks.insert(block_id);
         Some(block_id)
@@ -250,7 +293,7 @@ impl<M> MutableCowRoot<M> {
     /// allocation bit keeps the future published root from marking an abandoned
     /// block as live.
     #[inline]
-    pub(crate) fn rollback_allocated_block_id(&mut self, block_id: BlockID) -> Result<()> {
+    pub(crate) fn rollback_allocated_block(&mut self, block_id: BlockID) -> Result<()> {
         if block_id == SUPER_BLOCK_ID {
             return Err(Report::new(InternalError::CowFileAllocationInvariant)
                 .attach(format!("cannot roll back super block id {block_id}"))
@@ -285,6 +328,26 @@ impl<M> MutableCowRoot<M> {
         self.unpublished_blocks.remove(&block_id);
         Ok(())
     }
+}
+
+/// Allocates one CoW block id and applies the configured readonly reuse barrier.
+#[inline]
+pub(crate) fn allocate_cow_block<M>(
+    root: &mut MutableCowRoot<M>,
+    file_id: FileID,
+    reuse_barrier: CowReuseBarrier<'_>,
+    capacity_context: &'static str,
+) -> Result<BlockID> {
+    let block_id = root.try_allocate_block().ok_or_else(|| {
+        Error::from(
+            Report::new(ResourceError::StorageFileCapacityExceeded).attach(capacity_context),
+        )
+    })?;
+    if let Err(err) = reuse_barrier.invalidate_for_reuse(file_id, block_id) {
+        root.rollback_allocated_block(block_id)?;
+        return Err(err);
+    }
+    Ok(block_id)
 }
 
 impl<M> Deref for ActiveRoot<M> {
@@ -558,18 +621,17 @@ impl<M> CowFile<M> {
         &self,
         background_writes: &IOClient<BackgroundWriteRequest>,
         mut new_root: MutableCowRoot<M>,
+        reuse_barrier: CowReuseBarrier<'_>,
     ) -> Result<Option<OldCowRoot<M>>> {
         new_root
             .root
             .block_reclamation_until_effective_ts_installed();
-        let new_meta_block_id = match new_root.try_allocate_block_id() {
-            Some(block_id) => block_id,
-            None => {
-                return Err(Report::new(ResourceError::StorageFileCapacityExceeded)
-                    .attach("publish root could not allocate meta block")
-                    .into());
-            }
-        };
+        let new_meta_block_id = allocate_cow_block(
+            &mut new_root,
+            self.file.file_id(),
+            reuse_barrier,
+            "publish root could not allocate meta block",
+        )?;
         new_root.root.meta_block_id = new_meta_block_id;
 
         let meta_buf = (self.codec.build_meta_block)(&new_root.root)?;

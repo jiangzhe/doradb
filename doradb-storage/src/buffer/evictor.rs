@@ -955,7 +955,10 @@ mod tests {
     use crate::buffer::BufferPool;
     use crate::buffer::frame::BufferFrame;
     use crate::buffer::page::Page;
-    use crate::buffer::{EvictableBufferPool, PoolRole, ReadonlyBufferPool};
+    use crate::buffer::{
+        EvictableBufferPool, PoolRole, ReadonlyBufferPool, global_readonly_pool_scope,
+        table_readonly_pool,
+    };
     use crate::catalog::{
         ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexSpec, TableMetadata,
     };
@@ -1181,7 +1184,13 @@ mod tests {
     ) {
         let mut buf = DirectBuf::zeroed(COW_FILE_PAGE_SIZE);
         buf.as_bytes_mut()[..payload.len()].copy_from_slice(payload);
-        let mutable = MutableTableFile::fork(table_file, fs.background_writes());
+        let global = global_readonly_pool_scope(64 * 1024 * 1024);
+        let disk_pool = table_readonly_pool(&global, test_user_table_id(0), table_file);
+        let mutable = MutableTableFile::fork(
+            table_file,
+            fs.background_writes(),
+            disk_pool.global_pool().clone(),
+        );
         mutable.write_block(block_id, buf).await.unwrap();
         drop(mutable);
     }
