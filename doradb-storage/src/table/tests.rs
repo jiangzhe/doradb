@@ -12,8 +12,8 @@ use crate::catalog::{
 use crate::conf::{EngineConfig, EvictableBufferPoolConfig, FileSystemConfig, TrxSysConfig};
 use crate::engine::Engine;
 use crate::error::{
-    CompletionErrorKind, DataIntegrityError, Error, FatalError, InternalError, OperationError,
-    ResourceError, Result,
+    CompletionErrorKind, DataIntegrityError, Error, ErrorKind, FatalError, InternalError,
+    OperationError, ResourceError, Result,
 };
 use crate::file::block_integrity::{BLOCK_INTEGRITY_HEADER_SIZE, write_block_checksum};
 use crate::file::cow_file::{
@@ -5593,7 +5593,7 @@ fn test_table_scan_mvcc_early_stop_before_hot_phase() {
 }
 
 #[test]
-fn test_mem_scan_from_uses_explicit_lower_bound() {
+fn test_mem_scan_from_requires_row_page_boundary() {
     smol::block_on(async {
         let sys = TestSys::new_evictable().await;
         let mut session = sys.try_new_session().unwrap();
@@ -5603,11 +5603,34 @@ fn test_mem_scan_from_uses_explicit_lower_bound() {
         let captured_pivot = sys.table.file().active_root_unchecked().pivot_row_id;
 
         insert_rows(&sys, &mut session, 100, 4, "second").await;
-        let later_pivot = captured_pivot + 4;
-        // Keep the second batch's row pages allocated while advancing only the
-        // memory-scan pivot. A real later checkpoint may reclaim pages once no
-        // transaction root protects them, which is outside this helper's direct
-        // contract.
+        let mut later_pivot = captured_pivot;
+        let mut explicit_count = 0usize;
+        sys.table
+            .mem
+            .mem_scan_from(session.pool_guards(), captured_pivot, |page_guard| {
+                let page = page_guard.page();
+                explicit_count += page.header.approx_non_deleted();
+                later_pivot = page.header.start_row_id + page.header.max_row_count as RowID;
+                true
+            })
+            .await
+            .unwrap();
+        assert_eq!(explicit_count, 4);
+        assert!(later_pivot > captured_pivot);
+
+        let interior_start = captured_pivot + 2;
+        let err = sys
+            .table
+            .mem
+            .mem_scan_from(session.pool_guards(), interior_start, |_| true)
+            .await
+            .unwrap_err();
+        assert!(err.kind() == ErrorKind::Internal);
+
+        // Keep the second batch's row page allocated while advancing only the
+        // memory-scan pivot to that page's exclusive row-id boundary. A real
+        // later checkpoint may reclaim pages once no transaction root protects
+        // them, which is outside this helper's direct contract.
         sys.table
             .mem
             .blk_idx()
@@ -5615,27 +5638,16 @@ fn test_mem_scan_from_uses_explicit_lower_bound() {
             .await;
         assert_eq!(sys.table.mem.pivot_row_id(), later_pivot);
 
-        let mut explicit_count = 0usize;
+        let mut current_hot_pages = 0usize;
         sys.table
             .mem
-            .mem_scan_from(session.pool_guards(), captured_pivot, |page_guard| {
-                explicit_count += page_guard.page().header.approx_non_deleted();
+            .mem_scan(session.pool_guards(), |_| {
+                current_hot_pages += 1;
                 true
             })
             .await
             .unwrap();
-        assert_eq!(explicit_count, 4);
-
-        let mut current_hot_count = 0usize;
-        sys.table
-            .mem
-            .mem_scan(session.pool_guards(), |page_guard| {
-                current_hot_count += page_guard.page().header.approx_non_deleted();
-                true
-            })
-            .await
-            .unwrap();
-        assert_eq!(current_hot_count, 0);
+        assert_eq!(current_hot_pages, 0);
     });
 }
 
