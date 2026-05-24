@@ -1,7 +1,7 @@
 ---
 id: 000156
 title: Full Table Scan MVCC
-status: proposal
+status: implemented
 created: 2026-05-23
 github_issue: 653
 ---
@@ -32,7 +32,7 @@ Issue Labels:
 - codex
 
 Source Backlogs:
-- docs/backlogs/000048-table-scan-should-include-column-store-rows-for-user-tables.md
+- docs/backlogs/closed/000048-table-scan-should-include-column-store-rows-for-user-tables.md
 
 Doradb user tables have a hot/cold split:
 - row ids below `pivot_row_id` are persisted in LWC blocks through the
@@ -85,8 +85,8 @@ Relevant references:
    pages.
 2. Bind the scan to one `TableRootSnapshot` so cold root, cold pivot, and hot
    lower bound come from the same proof-gated table-root observation.
-3. Add a bounded hot-row scan helper that scans row-page entries at or above an
-   explicit row-id lower bound instead of the current pivot.
+3. Add a bounded hot-row scan helper that scans row-page entries from an
+   explicit row-page start boundary instead of the current pivot.
 4. Add a cold LWC scan helper that visits persisted rows below the captured
    pivot, decodes only the requested `read_set`, validates row shape/count
    invariants, honors persisted delete deltas, and applies deletion-buffer MVCC
@@ -150,6 +150,11 @@ comment, and add targeted tests for the changed invariant.
    - uncommitted marker owned by the reader transaction hides the row;
    - uncommitted marker owned by another active transaction does not hide the
      row for a plain MVCC scan.
+6. The explicit hot-row scan helper is page-oriented, not an arbitrary row-id
+   range scan. Its `start_row_id` must match a row-page start boundary, except
+   that the current row-page-index end is accepted as an empty scan. This keeps
+   callers scanning whole row pages and surfaces invalid interior pivots as
+   internal invariant errors.
 
 ## Rejected Alternatives
 
@@ -178,11 +183,15 @@ comment, and add targeted tests for the changed invariant.
      `table_scan_uncommitted` unchanged, except optional comment clarification
      that it is valid as a table scan for memory-only catalog tables.
 
-2. Add an explicit-lower-bound hot scan helper.
+2. Add an explicit row-page-boundary hot scan helper.
    - Add a helper on `GenericMemTable` or `UserTableAccessor` such as
      `mem_scan_from(guards, start_row_id, page_action)`.
-   - The helper should use the row-page-index cursor to seek `start_row_id` and
-     scan row-page entries with `page_entry.row_id >= start_row_id`.
+   - The helper should use the row-page-index cursor to seek `start_row_id`,
+     require the first visited row-page entry to start exactly at
+     `start_row_id`, and scan whole row pages from that entry onward.
+   - Treat `start_row_id == row_page_index_end` as a successful empty scan.
+   - Return an internal error when `start_row_id` falls inside a row page or
+     otherwise does not match a row-page start boundary.
    - It must not filter against the current `pivot_row_id`.
    - It should use the same row-page guard acquisition and stale leaf error
      behavior as the current `mem_scan`.
@@ -262,6 +271,62 @@ comment, and add targeted tests for the changed invariant.
 
 ## Implementation Notes
 
+Implemented in branch `scan-mvcc` and validated after review refinements.
+
+Primary outcomes:
+- `UserTableAccessor::table_scan_mvcc` now captures one `TableRootSnapshot`,
+  scans persisted LWC rows below the captured pivot, then scans hot row pages
+  from the same captured pivot.
+- Cold scan logic validates column-block leaf entry shape, persisted row-id
+  metadata, row counts, and row-shape fingerprints before decoding projected
+  values with the caller `read_set`.
+- Cold MVCC visibility uses `cold_row_visible_for_scan`, including persisted
+  delete deltas, committed deletion-buffer markers relative to the reader STS,
+  own uncommitted cold deletes, and other active transaction markers.
+- User-table raw current-state scan was renamed to `mem_scan_uncommitted`.
+  CREATE INDEX hot-row collection now uses that helper; catalog table
+  `table_scan_uncommitted` remains unchanged.
+- `GenericMemTable::mem_scan_from` was added for captured-pivot hot scans and
+  now enforces exact row-page start boundaries. Interior row ids return an
+  internal error instead of silently skipping or partially scanning a page.
+- Recovery production logic was intentionally not changed. Only a recovery
+  test call site was updated for the user-table helper rename.
+
+Review and validation:
+- Ran targeted MVCC and helper tests:
+  `cargo nextest run -p doradb-storage test_mem_scan_from_requires_row_page_boundary test_table_scan_mvcc --no-fail-fast`.
+- Ran full validation:
+  `cargo nextest run -p doradb-storage --no-fail-fast`.
+- Ran strict lint:
+  `cargo clippy -p doradb-storage --all-targets -- -D warnings`.
+- Ran formatting check:
+  `cargo fmt -p doradb-storage -- --check`.
+- Ran focused coverage:
+  `tools/coverage_focus.rs --path doradb-storage/src/table/access.rs --path doradb-storage/src/table/mem_table.rs --path doradb-storage/src/catalog/index.rs --top-uncovered 10`.
+  Deduplicated focused coverage was 4732/5766 lines, or 82.07%.
+  `access.rs` and `catalog/index.rs` were above 80%. `mem_table.rs` was
+  79.25%, with the uncovered hotspot in pre-existing secondary-index helper
+  paths rather than the new scan-boundary logic.
+
+Checklist outcome:
+- Reliability: pass. Task-required scan, visibility, persisted delete, early
+  stop, captured-pivot, and helper rename behaviors are covered by tests.
+- Security: pass. No unsafe code was added or modified.
+- Performance: pass for current scope. Known future optimizations are tracked
+  separately in backlog docs for hot-row scan unification and cold-row
+  visibility prefiltering.
+- Feature completeness: pass. The foreground user-table MVCC table scan is now
+  complete across cold and hot storage, and catalog scan semantics remain
+  unchanged.
+- Documentation: pass. New crate-visible helper docs and core comments explain
+  the hot-row-only and row-page-boundary scan contracts.
+- Test-only code: pass. Regression coverage uses production paths and existing
+  test helpers.
+- Complexity: pass. Cold scan logic was factored into focused helpers, with
+  validation and visibility decisions separated from decode/emit flow.
+- Source backlog `docs/backlogs/000048-table-scan-should-include-column-store-rows-for-user-tables.md`
+  was closed as implemented and archived under `docs/backlogs/closed/`.
+
 ## Impacts
 
 Primary files:
@@ -340,11 +405,13 @@ Behavioral impacts:
    - assert the scan stops immediately and does not continue into later cold
      entries or hot pages.
 
-8. Captured-pivot hot lower bound:
+8. Captured-pivot hot row-page boundary:
    - cover the new bounded hot scan helper directly or through a deterministic
      checkpoint overlap scenario;
    - assert rows in `[captured_pivot, later_current_pivot)` are not skipped by a
-     scan that captured the older root.
+     scan that captured the older root;
+   - assert interior row-id bounds are rejected because the helper scans whole
+     row pages from exact page boundaries.
 
 9. Rename/rescope compile coverage:
    - update direct user-table raw scan tests to call `mem_scan_uncommitted`;
@@ -360,3 +427,8 @@ Behavioral impacts:
    framework. That is intentionally outside this task.
 2. Future work may add predicate pushdown or vectorized batch callbacks for LWC
    full scans. This task keeps the existing row-by-row `Vec<Val>` callback.
+3. Hot-row scan unification for CREATE INDEX and recovery remains deferred in
+   `docs/backlogs/000110-unify-hot-row-mem-scan-index-build-recovery.md`.
+4. Cold-row MVCC visibility prefiltering and persisted delete-set scan
+   optimization remains deferred in
+   `docs/backlogs/000111-optimize-cold-row-visibility-filtering-mvcc-scans.md`.
