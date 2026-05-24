@@ -7,4 +7,3 @@ exclude_paths:
     - "legacy/**"
     - "target/**"
     - "tools/**"
-    - "Cargo.lock"
