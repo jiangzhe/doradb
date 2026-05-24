@@ -2,6 +2,7 @@
 
 ![build](https://github.com/jiangzhe/doradb/actions/workflows/build.yml/badge.svg)
 ![codecov](https://codecov.io/gh/jiangzhe/doradb/branch/main/graph/badge.svg?token=T3RMZE2998)
+[![Codacy Badge](https://app.codacy.com/project/badge/Grade/26b91ce46f944686a9a200af04d3920b)](https://app.codacy.com/gh/jiangzhe/doradb/dashboard?utm_source=gh&utm_medium=referral&utm_content=&utm_campaign=Badge_grade)
 
 DoraDB is an attempt to build a modern and fast storage engine in Rust from scratch.
 It is work in progress.
@@ -39,6 +40,7 @@ I'm glad to have discussions if someone is interested in details.
 - [index](./doradb-storage/src/index): Block index and B+Tree index.
 - [io](./doradb-storage/src/io): Async direct IO system with compile-time-selected `libaio` and `io_uring` backends, by default `io_uring`.
 - [latch](./doradb-storage/src/latch): Async latch primitives including Mutex, RWLock and HybridLatch(enhanced RWLock with optimistic mode).
+- [lock](./doradb-storage/src/lock): Metadata lock and table-level lock.
 - [lwc](./doradb-storage/src/lwc): LightWeight Columnar format for on-disk warm data.
 - [row](./doradb-storage/src/row): In-memory row store and operations.
 - [table](./doradb-storage/src/table): Table of data, composite of block index, secondary index, buffer pool and table file. Support operations like index lookup, index scan, table scan, insert, delete, update, etc.

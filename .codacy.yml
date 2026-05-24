@@ -1,0 +1,9 @@
+---
+exclude_paths:
+    - ".codex/**"
+    - ".config/**"
+    - ".githooks/**"
+    - "docs/**"
+    - "legacy/**"
+    - "target/**"
+    - "tools/**"
