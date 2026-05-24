@@ -23,3 +23,11 @@ For normal user tables, table-scan APIs must return logically complete results a
 ## Notes (Optional)
 
 Catalog tables are pure in-memory runtime tables and are not blocked by this limitation.
+
+## Close Reason
+
+- Type: implemented
+- Detail: Implemented via docs/tasks/000156-full-table-scan-mvcc.md.
+- Closed By: backlog close
+- Reference: docs/tasks/000156-full-table-scan-mvcc.md
+- Closed At: 2026-05-24

@@ -5,10 +5,11 @@ use crate::buffer::{EvictableBufferPool, PageID, PoolGuards};
 use crate::catalog::{TableColumnLayout, TableID, TableMetadata};
 use crate::error::{DataIntegrityError, Error, FileKind, InternalError, OperationError, Result};
 use crate::file::BlockID;
+use crate::file::cow_file::SUPER_BLOCK_ID;
 use crate::index::util::{Maskable, RowPageCreateRedoCtx};
 use crate::index::{
-    IndexCompareExchange, IndexInsert, NonUniqueIndex, NonUniqueSecondaryIndex, RowLocation,
-    SecondaryIndex, UniqueIndex, UniqueSecondaryIndex,
+    ColumnBlockIndex, ColumnLeafEntry, IndexCompareExchange, IndexInsert, NonUniqueIndex,
+    NonUniqueSecondaryIndex, RowLocation, SecondaryIndex, UniqueIndex, UniqueSecondaryIndex,
 };
 use crate::lwc::PersistedLwcBlock;
 use crate::row::ops::{
@@ -29,10 +30,10 @@ use crate::trx::row::{
 use crate::trx::stmt::StmtEffects;
 use crate::trx::undo::{IndexBranch, IndexBranchTarget, OwnedRowUndo, RowUndoKind};
 use crate::trx::ver_map::RowPageState;
-use crate::trx::{MIN_SNAPSHOT_TS, TrxContext, TrxID, trx_is_committed};
+use crate::trx::{MIN_SNAPSHOT_TS, SharedTrxStatus, TrxContext, TrxID, trx_is_committed};
 use crate::value::Val;
 use error_stack::Report;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::mem;
 use std::sync::Arc;
 
@@ -48,6 +49,33 @@ fn invalid_lwc_payload(
             "file={file_kind}, block=lwc-block, block_id={block_id}, {message}"
         ))
         .into()
+}
+
+#[inline]
+fn cold_row_visible_for_scan(
+    deletion_buffer: &ColumnDeletionBuffer,
+    reader_sts: TrxID,
+    reader_status: &SharedTrxStatus,
+    row_id: RowID,
+    persisted_deleted: bool,
+) -> bool {
+    if persisted_deleted {
+        return false;
+    }
+    let Some(marker) = deletion_buffer.get(row_id) else {
+        return true;
+    };
+    match marker {
+        DeleteMarker::Committed(ts) => ts > reader_sts,
+        DeleteMarker::Ref(status) => {
+            let ts = status.ts();
+            if trx_is_committed(ts) {
+                ts > reader_sts
+            } else {
+                !std::ptr::addr_eq(status.as_ref(), reader_status)
+            }
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -445,6 +473,21 @@ impl UserTableAccessor<'_> {
     }
 
     #[inline]
+    async fn mem_scan_from<F>(
+        &self,
+        guards: &PoolGuards,
+        start_row_id: RowID,
+        page_action: F,
+    ) -> Result<()>
+    where
+        F: FnMut(PageSharedGuard<RowPage>) -> bool,
+    {
+        self.mem()
+            .mem_scan_from(guards, start_row_id, page_action)
+            .await
+    }
+
+    #[inline]
     async fn get_row_page_shared(
         &self,
         guards: &PoolGuards,
@@ -660,6 +703,152 @@ impl UserTableAccessor<'_> {
             ));
         }
         block.decode_full_row_values(self.metadata().col.as_ref(), row_idx)
+    }
+
+    fn persisted_delete_set_for_scan(
+        file_kind: FileKind,
+        entry: &ColumnLeafEntry,
+        delete_deltas: Vec<u32>,
+    ) -> Result<BTreeSet<RowID>> {
+        let mut deleted = BTreeSet::new();
+        for delta in delete_deltas {
+            let row_id = entry
+                .start_row_id
+                .checked_add(RowID::from(delta))
+                .ok_or_else(|| {
+                    invalid_lwc_payload(
+                        file_kind,
+                        entry.block_id(),
+                        format!(
+                            "delete delta overflows row id: start_row_id={}, delta={delta}",
+                            entry.start_row_id
+                        ),
+                    )
+                })?;
+            if row_id >= entry.end_row_id() {
+                return Err(invalid_lwc_payload(
+                    file_kind,
+                    entry.block_id(),
+                    format!(
+                        "delete delta outside entry range: row_id={row_id}, start_row_id={}, end_row_id={}",
+                        entry.start_row_id,
+                        entry.end_row_id()
+                    ),
+                ));
+            }
+            deleted.insert(row_id);
+        }
+        Ok(deleted)
+    }
+
+    fn validate_cold_scan_entry(
+        file_kind: FileKind,
+        entry: &ColumnLeafEntry,
+        block: &PersistedLwcBlock,
+        row_ids: &[RowID],
+    ) -> Result<()> {
+        if usize::from(entry.row_count()) != row_ids.len() || block.row_count() != row_ids.len() {
+            return Err(invalid_lwc_payload(
+                file_kind,
+                entry.block_id(),
+                format!(
+                    "LWC row count mismatch: entry_rows={}, block_rows={}, row_ids={}",
+                    entry.row_count(),
+                    block.row_count(),
+                    row_ids.len()
+                ),
+            ));
+        }
+        if block.row_shape_fingerprint() != entry.row_shape_fingerprint() {
+            return Err(invalid_lwc_payload(
+                file_kind,
+                entry.block_id(),
+                "row shape fingerprint mismatch",
+            ));
+        }
+        if row_ids.windows(2).any(|window| window[0] >= window[1])
+            || row_ids
+                .iter()
+                .any(|row_id| *row_id < entry.start_row_id || *row_id >= entry.end_row_id())
+        {
+            return Err(invalid_lwc_payload(
+                file_kind,
+                entry.block_id(),
+                format!(
+                    "invalid persisted row id set: start_row_id={}, end_row_id={}, row_ids={}",
+                    entry.start_row_id,
+                    entry.end_row_id(),
+                    row_ids.len()
+                ),
+            ));
+        }
+        Ok(())
+    }
+
+    async fn scan_cold_lwc_mvcc<F>(
+        &self,
+        guards: &PoolGuards,
+        ctx: &TrxContext,
+        read_set: &[usize],
+        root_snapshot: &TableRootSnapshot<'_>,
+        row_action: &mut F,
+    ) -> Result<bool>
+    where
+        F: FnMut(Vec<Val>) -> bool,
+    {
+        let column_root = root_snapshot.column_block_index_root();
+        let pivot_row_id = root_snapshot.pivot_row_id();
+        if column_root == SUPER_BLOCK_ID || pivot_row_id == 0 {
+            return Ok(true);
+        }
+
+        let storage = self.column_storage()?;
+        let deletion_buffer = self.lwc_deletion_buffer()?;
+        let column_layout = self.metadata().col.as_ref();
+        let reader_sts = ctx.sts();
+        let reader_status = ctx.status();
+        let file_kind = storage.file().file_kind();
+        let disk_guard = guards.disk_guard();
+        let column_index = ColumnBlockIndex::new(
+            column_root,
+            pivot_row_id,
+            file_kind,
+            storage.file().sparse_file(),
+            storage.disk_pool(),
+            disk_guard,
+        );
+        for entry in column_index.collect_leaf_entries().await? {
+            let (delete_deltas, row_ids) =
+                column_index.load_delete_deltas_and_row_ids(&entry).await?;
+            let block = PersistedLwcBlock::load(
+                file_kind,
+                storage.file().sparse_file(),
+                storage.disk_pool(),
+                disk_guard,
+                entry.block_id(),
+            )
+            .await?;
+            Self::validate_cold_scan_entry(file_kind, &entry, &block, &row_ids)?;
+            let persisted_deleted =
+                Self::persisted_delete_set_for_scan(file_kind, &entry, delete_deltas)?;
+            let has_persisted_deletes = !persisted_deleted.is_empty();
+            for (row_idx, row_id) in row_ids.into_iter().enumerate() {
+                if !cold_row_visible_for_scan(
+                    deletion_buffer,
+                    reader_sts,
+                    reader_status.as_ref(),
+                    row_id,
+                    has_persisted_deletes && persisted_deleted.contains(&row_id),
+                ) {
+                    continue;
+                }
+                let vals = block.decode_row_values(column_layout, row_idx, read_set)?;
+                if !row_action(vals) {
+                    return Ok(false);
+                }
+            }
+        }
+        Ok(true)
     }
 
     #[inline]
@@ -2673,7 +2862,20 @@ impl UserTableAccessor<'_> {
             IndexInsert::DuplicateKey(..) => unreachable!(),
         }
     }
-    pub(crate) async fn table_scan_uncommitted<F>(
+
+    /// Scans raw latest row versions from in-memory row-store pages only.
+    ///
+    /// This helper is for current-state internal users that already account
+    /// for the cold/hot split elsewhere. For example, CREATE INDEX builds the
+    /// cold DiskTree from a captured active root, then uses this helper to
+    /// collect the current hot rows for the new MemIndex while DDL locks and
+    /// the table metadata-change lease prevent DML and checkpoint root
+    /// movement.
+    ///
+    /// It includes rows marked deleted and intentionally does not visit
+    /// persisted column-store rows. Foreground logical reads must use
+    /// `table_scan_mvcc`, which binds cold and hot phases to one root snapshot.
+    pub(crate) async fn mem_scan_uncommitted<F>(
         &self,
         guards: &PoolGuards,
         mut row_action: F,
@@ -2704,9 +2906,16 @@ impl UserTableAccessor<'_> {
         F: FnMut(Vec<Val>) -> bool,
     {
         let guards = ctx.require_pool_guards("table scan MVCC")?;
-        self.mem_scan(guards, |page_guard| {
+        let root_snapshot = self.root_snapshot(ctx)?;
+        if !self
+            .scan_cold_lwc_mvcc(guards, ctx, read_set, &root_snapshot, &mut row_action)
+            .await?
+        {
+            return Ok(());
+        }
+        let metadata = self.metadata();
+        self.mem_scan_from(guards, root_snapshot.pivot_row_id(), |page_guard| {
             let (page_ctx, page) = page_guard.ctx_and_page();
-            let metadata = self.metadata();
             for row_access in ReadAllRows::new(page, page_ctx) {
                 match row_access.read_row_mvcc(ctx, metadata, read_set, None) {
                     ReadRow::InvalidIndex => unreachable!(),

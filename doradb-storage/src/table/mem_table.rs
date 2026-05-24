@@ -660,26 +660,101 @@ impl<D: BufferPool, I: BufferPool> GenericMemTable<D, I> {
         self.blk_idx.cache_exclusive_insert_page(guard)
     }
 
-    pub(crate) async fn mem_scan<F>(&self, guards: &PoolGuards, mut page_action: F) -> Result<()>
+    /// Scans in-memory row pages at or above the current table pivot.
+    ///
+    /// The pivot must be an exact row-page start boundary, unless it equals
+    /// the current row-page-index end and there are no pages left to scan.
+    pub(crate) async fn mem_scan<F>(&self, guards: &PoolGuards, page_action: F) -> Result<()>
     where
         F: FnMut(PageSharedGuard<RowPage>) -> bool,
     {
         let meta_pool_guard = self.meta_pool_guard(guards, "mem scan")?;
+        let start_row_id = self.pivot_row_id();
+        self.mem_scan_from_with_meta_guard(
+            guards,
+            meta_pool_guard,
+            start_row_id,
+            "mem scan",
+            page_action,
+        )
+        .await
+    }
+
+    /// Scans in-memory row pages at or above an explicit row-page start boundary.
+    ///
+    /// This intentionally does not consult the current pivot. Callers use it
+    /// when a previously captured table-root snapshot defines the hot-row
+    /// boundary for the scan. The boundary must be an exact row-page start,
+    /// unless it equals the current row-page-index end and there are no pages
+    /// left to scan.
+    pub(crate) async fn mem_scan_from<F>(
+        &self,
+        guards: &PoolGuards,
+        start_row_id: RowID,
+        page_action: F,
+    ) -> Result<()>
+    where
+        F: FnMut(PageSharedGuard<RowPage>) -> bool,
+    {
+        let meta_pool_guard = self.meta_pool_guard(guards, "mem scan from")?;
+        self.mem_scan_from_with_meta_guard(
+            guards,
+            meta_pool_guard,
+            start_row_id,
+            "mem scan from",
+            page_action,
+        )
+        .await
+    }
+
+    #[inline]
+    fn invalid_mem_scan_start(&self, operation: &'static str, start_row_id: RowID) -> Error {
+        Report::new(InternalError::Generic)
+            .attach(format!(
+                "operation={operation}, table_id={}, row-page scan start is not a row-page boundary: start_row_id={start_row_id}",
+                self.table_id()
+            ))
+            .into()
+    }
+
+    async fn mem_scan_from_with_meta_guard<F>(
+        &self,
+        guards: &PoolGuards,
+        meta_pool_guard: &PoolGuard,
+        start_row_id: RowID,
+        operation: &'static str,
+        mut page_action: F,
+    ) -> Result<()>
+    where
+        F: FnMut(PageSharedGuard<RowPage>) -> bool,
+    {
         let mut cursor = self.blk_idx.mem_cursor(meta_pool_guard);
-        cursor.seek(0).await;
+        cursor.seek(start_row_id).await;
+        let mut first_leaf = true;
         while let Some(leaf) = cursor.next().await {
             let Some(g) = leaf.lock_shared_async().await else {
-                return Err(self.stale_block_index_leaf("mem scan"));
+                return Err(self.stale_block_index_leaf(operation));
             };
             debug_assert!(g.page().is_leaf());
-            let entries = g.page().leaf_entries();
-            let pivot_row_id = self.pivot_row_id();
-            for page_entry in entries {
-                // Row-page index entries below the pivot have already moved to
-                // column storage; their row-page frames may be deallocated.
-                if page_entry.row_id < pivot_row_id {
-                    continue;
+            let page = g.page();
+            let entries = page.leaf_entries();
+            let start_idx = if first_leaf {
+                first_leaf = false;
+                if entries.is_empty() {
+                    if page.header.start_row_id == start_row_id {
+                        return Ok(());
+                    }
+                    return Err(self.invalid_mem_scan_start(operation, start_row_id));
                 }
+                match entries.binary_search_by_key(&start_row_id, |entry| entry.row_id) {
+                    Ok(idx) => idx,
+                    Err(_) if page.header.end_row_id == start_row_id => return Ok(()),
+                    Err(_) => return Err(self.invalid_mem_scan_start(operation, start_row_id)),
+                }
+            } else {
+                0
+            };
+            for page_entry in &entries[start_idx..] {
                 let page_guard = self
                     .must_get_row_page_shared(guards, page_entry.page_id)
                     .await?;
