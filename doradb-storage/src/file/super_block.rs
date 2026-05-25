@@ -6,21 +6,21 @@ use crate::trx::TrxID;
 use error_stack::Report;
 use std::mem;
 
-pub const SUPER_BLOCK_VERSION: u64 = 1;
-pub const SUPER_BLOCK_SIZE: usize = PAGE_SIZE / 2;
-pub const SUPER_BLOCK_FOOTER_SIZE: usize = mem::size_of::<SuperBlockFooter>();
-pub const SUPER_BLOCK_FOOTER_OFFSET: usize = SUPER_BLOCK_SIZE - SUPER_BLOCK_FOOTER_SIZE;
+pub(crate) const SUPER_BLOCK_VERSION: u64 = 1;
+pub(crate) const SUPER_BLOCK_SIZE: usize = PAGE_SIZE / 2;
+pub(crate) const SUPER_BLOCK_FOOTER_SIZE: usize = mem::size_of::<SuperBlockFooter>();
+pub(crate) const SUPER_BLOCK_FOOTER_OFFSET: usize = SUPER_BLOCK_SIZE - SUPER_BLOCK_FOOTER_SIZE;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SuperBlockHeader {
+pub(crate) struct SuperBlockHeader {
     /// Magic word of table file, by default 'DORA\0\0\0\0'
-    pub magic_word: [u8; 8],
+    pub(crate) magic_word: [u8; 8],
     /// Version of super block format.
-    pub version: u64,
+    pub(crate) version: u64,
     /// Slot number of this super block.
-    pub slot_no: u64,
+    pub(crate) slot_no: u64,
     /// checkpoint timestamp of this super block.
-    pub checkpoint_cts: TrxID,
+    pub(crate) checkpoint_cts: TrxID,
 }
 
 impl Ser<'_> for SuperBlockHeader {
@@ -59,8 +59,8 @@ impl Deser for SuperBlockHeader {
 }
 
 #[derive(PartialEq, Eq)]
-pub struct SuperBlockBody {
-    pub meta_block_id: BlockID,
+pub(crate) struct SuperBlockBody {
+    pub(crate) meta_block_id: BlockID,
 }
 
 impl Ser<'_> for SuperBlockBody {
@@ -89,9 +89,9 @@ impl Deser for SuperBlockBody {
 }
 
 #[derive(Default, PartialEq, Eq)]
-pub struct SuperBlockFooter {
-    pub b3sum: [u8; 32],
-    pub checkpoint_cts: TrxID,
+pub(crate) struct SuperBlockFooter {
+    pub(crate) b3sum: [u8; 32],
+    pub(crate) checkpoint_cts: TrxID,
 }
 
 impl Deser for SuperBlockFooter {
@@ -123,15 +123,15 @@ impl Ser<'_> for SuperBlockFooter {
 }
 
 #[derive(PartialEq, Eq)]
-pub struct SuperBlock {
-    pub header: SuperBlockHeader,
-    pub body: SuperBlockBody,
-    pub footer: SuperBlockFooter,
+pub(crate) struct SuperBlock {
+    pub(crate) header: SuperBlockHeader,
+    pub(crate) body: SuperBlockBody,
+    pub(crate) footer: SuperBlockFooter,
 }
 
-pub struct SuperBlockSerView {
-    pub header: SuperBlockHeader,
-    pub body: SuperBlockBody,
+pub(crate) struct SuperBlockSerView {
+    pub(crate) header: SuperBlockHeader,
+    pub(crate) body: SuperBlockBody,
 }
 
 impl Ser<'_> for SuperBlockSerView {
@@ -148,7 +148,7 @@ impl Ser<'_> for SuperBlockSerView {
 }
 
 #[inline]
-pub fn parse_super_block(
+pub(crate) fn parse_super_block(
     buf: &[u8],
     expected_magic_word: [u8; 8],
     expected_version: u64,

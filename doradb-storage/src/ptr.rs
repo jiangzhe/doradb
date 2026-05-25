@@ -1,6 +1,6 @@
 /// Type to allow send raw pointer across multiple threads.
 #[repr(transparent)]
-pub struct UnsafePtr<T>(pub(crate) *mut T);
+pub(crate) struct UnsafePtr<T>(pub(crate) *mut T);
 
 impl<T> Clone for UnsafePtr<T> {
     #[inline]

@@ -7,7 +7,7 @@ use std::mem::{self, ManuallyDrop, MaybeUninit};
 use std::ops::{Deref, DerefMut};
 
 /// Extendable byte container.
-pub trait BytesExtendable {
+pub(crate) trait BytesExtendable {
     /// Push single byte into the container.
     fn push_byte(&mut self, value: u8);
 
@@ -62,7 +62,7 @@ impl BytesExtendable for Vec<u8> {
 ///    a) if original length is less than 15, use original length as the value.
 ///    b) if original length is equal to 15 but it's not last segment, use 0xFF as the value.
 ///    c) if original length is equal to 15 but it's last segment, use 15 as the value.
-pub trait MemCmpFormat {
+pub(crate) trait MemCmpFormat {
     /// Returns estimated length of the type.
     /// This may return None if the length can only be determined by the runtime value.
     fn est_mcf_len() -> Option<usize>;
@@ -78,15 +78,15 @@ pub trait MemCmpFormat {
     fn copy_mcf_to(&self, buf: &mut [u8], start_idx: usize) -> usize;
 }
 
-pub const NULL_FLAG: u8 = 0x01;
-pub const NON_NULL_FLAG: u8 = 0x02;
+pub(crate) const NULL_FLAG: u8 = 0x01;
+pub(crate) const NON_NULL_FLAG: u8 = 0x02;
 const FIX_SEG_FLAG: u8 = 0xff;
 const SEG_LEN: usize = 15;
-pub const MIN_VAR_MCF_LEN: usize = SEG_LEN + 1;
-pub const MIN_VAR_NMCF_LEN: usize = MIN_VAR_MCF_LEN + 1;
+pub(crate) const MIN_VAR_MCF_LEN: usize = SEG_LEN + 1;
+pub(crate) const MIN_VAR_NMCF_LEN: usize = MIN_VAR_MCF_LEN + 1;
 
 /// Nullable memory comparable format.
-pub trait NullableMemCmpFormat {
+pub(crate) trait NullableMemCmpFormat {
     /// Returns estimated length of the type.
     /// Should prepend 1-byte nullable flag, followed by
     /// memory comparable format.
@@ -103,7 +103,7 @@ pub trait NullableMemCmpFormat {
     fn copy_nmcf_to(&self, buf: &mut [u8], start_idx: usize) -> usize;
 }
 
-pub struct Null;
+pub(crate) struct Null;
 
 impl NullableMemCmpFormat for Null {
     #[inline]
@@ -283,7 +283,7 @@ impl_nmcf_for!(f64);
 
 #[repr(transparent)]
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct SegmentedBytes<'a>(pub &'a [u8]);
+pub(crate) struct SegmentedBytes<'a>(pub &'a [u8]);
 
 impl MemCmpFormat for SegmentedBytes<'_> {
     #[inline]
@@ -291,7 +291,7 @@ impl MemCmpFormat for SegmentedBytes<'_> {
         None
     }
 
-    #[allow(clippy::manual_div_ceil)]
+    #[expect(clippy::manual_div_ceil, reason = "code style")]
     #[inline]
     fn enc_mcf_len(&self) -> usize {
         let n_segs = (self.0.len().max(1) + SEG_LEN - 1) / SEG_LEN;
@@ -373,7 +373,7 @@ fn copy_segmented_bytes(bs: &[u8], mut buf: &mut [u8]) -> usize {
 
 #[repr(transparent)]
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct NormalBytes<'a>(pub &'a [u8]);
+pub(crate) struct NormalBytes<'a>(pub &'a [u8]);
 
 impl MemCmpFormat for NormalBytes<'_> {
     #[inline]
@@ -401,9 +401,9 @@ impl MemCmpFormat for NormalBytes<'_> {
 
 impl_nmcf_for!(NormalBytes<'_>);
 
-pub const MEM_CMP_KEY_LEN: usize = 32;
-pub const MEM_CMP_KEY_INLINE: usize = MEM_CMP_KEY_LEN - mem::size_of::<usize>();
-pub const MEM_CMP_KEY_HEAP_PREFIX: usize =
+pub(crate) const MEM_CMP_KEY_LEN: usize = 32;
+pub(crate) const MEM_CMP_KEY_INLINE: usize = MEM_CMP_KEY_LEN - mem::size_of::<usize>();
+pub(crate) const MEM_CMP_KEY_HEAP_PREFIX: usize =
     MEM_CMP_KEY_LEN - mem::size_of::<usize>() - mem::size_of::<Box<[u8]>>();
 
 /// MemCmpKey is a key which can be directly memory compared.
@@ -420,12 +420,12 @@ pub const MEM_CMP_KEY_HEAP_PREFIX: usize =
 /// The restriction of comparision is two keys must be of same source type.
 /// e.g. Key::from(u32) can not be compared to Key::from(u64).
 #[repr(transparent)]
-pub struct MemCmpKey(Inner);
+pub(crate) struct MemCmpKey(Inner);
 
 impl MemCmpKey {
     /// Get byte slice of the key.
     #[inline]
-    pub fn as_bytes(&self) -> &[u8] {
+    pub(crate) fn as_bytes(&self) -> &[u8] {
         if self.0.len <= MEM_CMP_KEY_INLINE {
             // SAFETY: the inline representation stores `len` bytes in `u.i`.
             unsafe { &self.0.u.i[..self.0.len] }
@@ -438,13 +438,13 @@ impl MemCmpKey {
 
     /// Create a guard for in-place modification.
     #[inline]
-    pub fn modify_inplace(&mut self) -> ModifyInplaceGuard<'_> {
+    pub(crate) fn modify_inplace(&mut self) -> ModifyInplaceGuard<'_> {
         ModifyInplaceGuard(self)
     }
 
     /// Returns a new key with all zeroed bytes.
     #[inline]
-    pub fn zeroed(len: usize) -> Self {
+    pub(crate) fn zeroed(len: usize) -> Self {
         if len <= MEM_CMP_KEY_INLINE {
             return MemCmpKey(Inner::inline_zeroed(len));
         }
@@ -452,7 +452,7 @@ impl MemCmpKey {
     }
 
     #[inline]
-    pub fn arbitrary(len: usize) -> Self {
+    pub(crate) fn arbitrary(len: usize) -> Self {
         if len <= MEM_CMP_KEY_INLINE {
             return MemCmpKey(Inner::inline_zeroed(len));
         }
@@ -461,7 +461,7 @@ impl MemCmpKey {
 
     /// Create a empty key.
     #[inline]
-    pub fn empty() -> Self {
+    pub(crate) fn empty() -> Self {
         MemCmpKey(Inner::inline_zeroed(0))
     }
 
@@ -550,7 +550,7 @@ impl_mem_cmp_key_from_non_nullable!(f32);
 impl_mem_cmp_key_from_non_nullable!(f64);
 
 #[repr(transparent)]
-pub struct Nullable<T>(pub T);
+pub(crate) struct Nullable<T>(pub T);
 
 macro_rules! impl_mem_cmp_key_from_nullable {
     ($ty:ty) => {
@@ -639,7 +639,7 @@ impl fmt::Debug for MemCmpKey {
     }
 }
 
-pub struct ModifyInplaceGuard<'a>(&'a mut MemCmpKey);
+pub(crate) struct ModifyInplaceGuard<'a>(&'a mut MemCmpKey);
 
 impl Deref for ModifyInplaceGuard<'_> {
     type Target = [u8];

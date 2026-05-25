@@ -1,8 +1,8 @@
-pub mod ops;
-pub mod vector_scan;
+pub(crate) mod ops;
+pub(crate) mod vector_scan;
 
 pub use ops::*;
-pub use vector_scan::*;
+pub(crate) use vector_scan::*;
 
 use crate::bitmap::bitmap_required_units;
 use crate::buffer::page::{BufferPage, BufferPageKind, PAGE_SIZE, assert_buffer_page, sealed};
@@ -22,8 +22,8 @@ use zerocopy_derive::{FromBytes, IntoBytes, KnownLayout};
 
 pub type RowID = u64;
 /// Borrowed or owned row-page null bitmap words.
-pub type RowPageNullBitmap<'a> = Cow<'a, [u64]>;
-pub const INVALID_ROW_ID: RowID = !0;
+pub(crate) type RowPageNullBitmap<'a> = Cow<'a, [u64]>;
+pub(crate) const INVALID_ROW_ID: RowID = !0;
 
 const _: () = assert!(
     { std::mem::size_of::<RowPageHeader>().is_multiple_of(8) },
@@ -74,7 +74,7 @@ const _: () = assert!(
 /// ```
 #[repr(C)]
 #[derive(FromBytes, IntoBytes, KnownLayout)]
-pub struct RowPage {
+pub(crate) struct RowPage {
     pub header: RowPageHeader,
     pub data: [u8; PAGE_SIZE - mem::size_of::<RowPageHeader>()],
 }
@@ -125,7 +125,7 @@ impl RowPage {
     /// Initialize row page.
     /// | header | del_bitmap | null_bitmap_1 | ... | null_bitmap_n |
     #[inline]
-    pub fn init(
+    pub(crate) fn init(
         &mut self,
         start_row_id: u64,
         max_row_count: usize,
@@ -204,44 +204,37 @@ impl RowPage {
 
     /// Returns index of the row within page.
     #[inline]
-    pub fn row_idx(&self, row_id: RowID) -> usize {
+    pub(crate) fn row_idx(&self, row_id: RowID) -> usize {
         debug_assert!(self.row_id_in_valid_range(row_id));
         (row_id - self.header.start_row_id) as usize
     }
 
     /// Returns row id for given index.
     #[inline]
-    pub fn row_id(&self, row_idx: usize) -> RowID {
+    pub(crate) fn row_id(&self, row_idx: usize) -> RowID {
         debug_assert!(row_idx < self.header.row_count());
         self.header.start_row_id + row_idx as u64
     }
 
     /// Returns whether row id is in valid range.
     #[inline]
-    pub fn row_id_in_valid_range(&self, row_id: RowID) -> bool {
+    pub(crate) fn row_id_in_valid_range(&self, row_id: RowID) -> bool {
         row_id >= self.header.start_row_id
             && row_id < self.header.start_row_id + self.header.max_row_count as u64
-    }
-
-    #[inline]
-    pub fn row_by_id(&self, row_id: RowID) -> Option<Row<'_>> {
-        if !self.row_id_in_valid_range(row_id) {
-            return None;
-        }
-        Some(self.row(self.row_idx(row_id)))
     }
 
     /// Returns free space of current page.
     /// The free space is used to hold data of var-len columns.
     #[inline]
-    pub fn free_space(&self) -> u16 {
+    #[expect(dead_code, reason = "reserved free_space")]
+    pub(crate) fn free_space(&self) -> u16 {
         self.header.var_field_offset() as u16 - self.header.fix_field_end
     }
 
     /// Request one new row id and addtional space for var-len data.
     /// This method uses atomic operation to update both fields.
     #[inline]
-    pub fn request_row_idx_and_free_space(&self, var_len: usize) -> Option<(usize, usize)> {
+    pub(crate) fn request_row_idx_and_free_space(&self, var_len: usize) -> Option<(usize, usize)> {
         loop {
             let (row_count, var_field_offset) = self.header.row_count_and_var_field_offset();
             if row_count == self.header.max_row_count as usize {
@@ -261,7 +254,7 @@ impl RowPage {
 
     /// Request addtitional space for var-len data.
     #[inline]
-    pub fn request_free_space(&self, var_len: usize) -> Option<usize> {
+    pub(crate) fn request_free_space(&self, var_len: usize) -> Option<usize> {
         loop {
             let (row_count, var_field_offset) = self.header.row_count_and_var_field_offset();
             if self.header.fix_field_end as usize + var_len > var_field_offset {
@@ -277,7 +270,7 @@ impl RowPage {
     }
 
     #[inline]
-    pub fn update_count_to_include_row_id(&mut self, row_id: RowID) {
+    pub(crate) fn update_count_to_include_row_id(&mut self, row_id: RowID) {
         debug_assert!(row_id >= self.header.start_row_id);
         debug_assert!(row_id < self.header.start_row_id + self.header.max_row_count as u64);
         let row_count = self.header.row_count();
@@ -289,7 +282,7 @@ impl RowPage {
 
     /// Insert a new row in page.
     #[inline]
-    pub fn insert(&self, col_layout: &TableColumnLayout, user_cols: &[Val]) -> InsertRow {
+    pub(crate) fn insert(&self, col_layout: &TableColumnLayout, user_cols: &[Val]) -> InsertRow {
         debug_assert!(col_layout.col_count() == self.header.col_count as usize);
         // insert row does not include RowID, as RowID is auto-generated.
         debug_assert!(user_cols.len() == self.header.col_count as usize);
@@ -311,7 +304,8 @@ impl RowPage {
     /// delete row in page.
     /// This method will only mark the row as deleted.
     #[inline]
-    pub fn delete(&self, row_id: RowID) -> Delete {
+    #[cfg_attr(not(test), expect(dead_code, reason = "reserved delete"))]
+    pub(crate) fn delete(&self, row_id: RowID) -> Delete {
         if !self.row_id_in_valid_range(row_id) {
             return Delete::NotFound;
         }
@@ -327,7 +321,8 @@ impl RowPage {
 
     /// Update in-place in current page.
     #[inline]
-    pub fn update(
+    #[cfg_attr(not(test), expect(dead_code, reason = "reserved update"))]
+    pub(crate) fn update(
         &mut self,
         col_layout: &TableColumnLayout,
         row_id: RowID,
@@ -377,7 +372,8 @@ impl RowPage {
 
     /// Select single row by row id.
     #[inline]
-    pub fn select(&self, row_id: RowID) -> Select<'_> {
+    #[cfg_attr(not(test), expect(dead_code, reason = "reserved select"))]
+    pub(crate) fn select(&self, row_id: RowID) -> Select<'_> {
         if !self.row_id_in_valid_range(row_id) {
             return Select::NotFound;
         }
@@ -390,7 +386,7 @@ impl RowPage {
     }
 
     #[inline]
-    pub fn var_len_for_update(&self, row_idx: usize, user_cols: &[UpdateCol]) -> usize {
+    pub(crate) fn var_len_for_update(&self, row_idx: usize, user_cols: &[UpdateCol]) -> usize {
         let row = self.row(row_idx);
         user_cols
             .iter()
@@ -463,7 +459,7 @@ impl RowPage {
     /// Create a vectorized view on current page.
     /// The view provides vectorized access to columns.
     #[inline]
-    pub fn vector_view<'a, 'b>(
+    pub(crate) fn vector_view<'a, 'b>(
         &'a self,
         col_layout: &'b TableColumnLayout,
     ) -> PageVectorView<'a, 'b> {
@@ -472,7 +468,12 @@ impl RowPage {
 
     /// Returns value at given row and given column.
     #[inline]
-    pub fn val(&self, col_layout: &TableColumnLayout, row_idx: usize, col_idx: usize) -> Val {
+    pub(crate) fn val(
+        &self,
+        col_layout: &TableColumnLayout,
+        row_idx: usize,
+        col_idx: usize,
+    ) -> Val {
         if self.is_null(col_layout, row_idx, col_idx) {
             return Val::Null;
         }
@@ -488,7 +489,7 @@ impl RowPage {
 
     /// Returns null bitmap and val array of given column.
     #[inline]
-    pub fn vals(
+    pub(crate) fn vals(
         &self,
         col_layout: &TableColumnLayout,
         col_idx: usize,
@@ -608,7 +609,7 @@ impl RowPage {
     }
 
     #[inline]
-    pub fn update_col(
+    pub(crate) fn update_col(
         &self,
         col_layout: &TableColumnLayout,
         row_idx: usize,
@@ -666,7 +667,7 @@ impl RowPage {
     }
 
     #[inline]
-    pub fn update_col_exclusive(
+    pub(crate) fn update_col_exclusive(
         &mut self,
         col_layout: &TableColumnLayout,
         row_idx: usize,
@@ -727,7 +728,7 @@ impl RowPage {
     /// If old value exists, we will try to reuse space occupied by old value.
     /// Returns the updated var length offset.
     #[inline]
-    pub fn modify_var(
+    pub(crate) fn modify_var(
         &self,
         row_idx: usize,
         col_idx: usize,
@@ -813,19 +814,19 @@ impl RowPage {
 
     /// Returns the data slice of current page.
     #[inline]
-    pub fn data(&self) -> &[u8] {
+    pub(crate) fn data(&self) -> &[u8] {
         &self.data
     }
 
     /// Returns mutable data slice.
     #[inline]
-    pub fn data_mut(&mut self) -> &mut [u8] {
+    pub(crate) fn data_mut(&mut self) -> &mut [u8] {
         &mut self.data
     }
 
     /// Returns delete bitmap on page.
     #[inline]
-    pub fn del_bitmap(&self, row_count: usize) -> Vec<u64> {
+    pub(crate) fn del_bitmap(&self, row_count: usize) -> Vec<u64> {
         let bitmap_len = bitmap_len(row_count);
         let offset = self.header.del_bitmap_offset as usize;
         le_u64_words(&self.data()[offset..offset + bitmap_len])
@@ -833,7 +834,7 @@ impl RowPage {
 
     /// Returns whether given row is deleted.
     #[inline]
-    pub fn is_deleted(&self, row_idx: usize) -> bool {
+    pub(crate) fn is_deleted(&self, row_idx: usize) -> bool {
         let offset = self.header.del_bit_offset(row_idx);
         let v = self.data()[offset];
         let bit_mask = 1 << (row_idx % 8);
@@ -907,7 +908,7 @@ impl RowPage {
     /// Returns null bitmap of given column.
     /// If column is non-nullable, returns None.
     #[inline]
-    pub fn null_bitmap(
+    pub(crate) fn null_bitmap(
         &self,
         col_layout: &TableColumnLayout,
         col_idx: usize,
@@ -1072,7 +1073,7 @@ const _: () = assert_buffer_page::<RowPage>();
 /// Native header stored at the front of every in-memory row page.
 #[repr(C)]
 #[derive(FromBytes, IntoBytes, KnownLayout)]
-pub struct RowPageHeader {
+pub(crate) struct RowPageHeader {
     pub start_row_id: u64,
     // higher two bytes is row count.
     // lower two bytes is var field offset.
@@ -1093,14 +1094,14 @@ pub struct RowPageHeader {
 impl RowPageHeader {
     /// Returns row count of this page.
     #[inline]
-    pub fn row_count(&self) -> usize {
+    pub(crate) fn row_count(&self) -> usize {
         let value = self.row_count_and_var_field_offset.load(Ordering::Relaxed);
         ((value >> 16) & 0xffff) as usize
     }
 
     /// Update row count of this page.
     #[inline]
-    pub fn update_row_count(&mut self, row_count: usize) {
+    pub(crate) fn update_row_count(&mut self, row_count: usize) {
         debug_assert!(row_count <= self.max_row_count as usize);
         let value = self.row_count_and_var_field_offset.load(Ordering::Relaxed);
         let new_value = ((row_count as u32) << 16) | (value & 0xffff);
@@ -1110,14 +1111,14 @@ impl RowPageHeader {
 
     /// Returns var-length field offset of this page.
     #[inline]
-    pub fn var_field_offset(&self) -> usize {
+    pub(crate) fn var_field_offset(&self) -> usize {
         let value = self.row_count_and_var_field_offset.load(Ordering::Relaxed);
         (value & 0xffff) as usize
     }
 
     /// Returns row count and var-length field offset of this page.
     #[inline]
-    pub fn row_count_and_var_field_offset(&self) -> (usize, usize) {
+    pub(crate) fn row_count_and_var_field_offset(&self) -> (usize, usize) {
         let value = self.row_count_and_var_field_offset.load(Ordering::Relaxed);
         (((value >> 16) & 0xffff) as usize, (value & 0xffff) as usize)
     }
@@ -1125,7 +1126,7 @@ impl RowPageHeader {
     /// Atomically update(CAS) row count and var-length field offset.
     /// This is required when multiple threads are inserting/updating on the same page.
     #[inline]
-    pub fn compare_exchange_row_count_and_var_field_offset(
+    pub(crate) fn compare_exchange_row_count_and_var_field_offset(
         &self,
         (old_row_count, old_var_field_offset): (usize, usize),
         (row_count, var_field_offset): (usize, usize),
@@ -1139,7 +1140,11 @@ impl RowPageHeader {
 
     /// Store row count and var-length field offset.
     #[inline]
-    pub fn store_row_count_and_var_field_offset(&self, row_count: usize, var_field_offset: usize) {
+    pub(crate) fn store_row_count_and_var_field_offset(
+        &self,
+        row_count: usize,
+        var_field_offset: usize,
+    ) {
         let new = ((row_count & 0xffff) << 16) as u32 | (var_field_offset & 0xffff) as u32;
         self.row_count_and_var_field_offset
             .store(new, Ordering::Relaxed);
@@ -1150,7 +1155,7 @@ impl RowPageHeader {
     /// non-nullable columns as they do not reserve space for
     /// null bitmap.
     #[inline]
-    pub fn null_bit_offset(
+    pub(crate) fn null_bit_offset(
         &self,
         col_layout: &TableColumnLayout,
         row_idx: usize,
@@ -1168,7 +1173,7 @@ impl RowPageHeader {
 
     /// Returns null bitmap range of given column.
     #[inline]
-    pub fn null_bitmap_range(
+    pub(crate) fn null_bitmap_range(
         &self,
         col_layout: &TableColumnLayout,
         col_idx: usize,
@@ -1184,13 +1189,13 @@ impl RowPageHeader {
 
     /// Returns offset of delete bits.
     #[inline]
-    pub fn del_bit_offset(&self, row_idx: usize) -> usize {
+    pub(crate) fn del_bit_offset(&self, row_idx: usize) -> usize {
         self.del_bitmap_offset as usize + row_idx / 8
     }
 
     /// Returns approximate non-deleted row count.
     #[inline]
-    pub fn approx_non_deleted(&self) -> usize {
+    pub(crate) fn approx_non_deleted(&self) -> usize {
         let approx_deleted = self.approx_deleted.load(Ordering::Relaxed);
         let row_count = self.row_count();
         row_count.wrapping_sub(approx_deleted as usize)
@@ -1218,7 +1223,7 @@ impl fmt::Debug for RowPageHeader {
 
 /// NewRow wraps the page to provide convenient method
 /// to add values to new row.
-pub struct NewRow<'a> {
+pub(crate) struct NewRow<'a> {
     page: &'a RowPage,
     row_idx: usize,
     col_idx: usize,
@@ -1239,7 +1244,7 @@ impl NewRow<'_> {
 
     /// Add variable-length value to current row.
     #[inline]
-    pub fn add_var(&mut self, col_layout: &TableColumnLayout, input: &[u8]) {
+    pub(crate) fn add_var(&mut self, col_layout: &TableColumnLayout, input: &[u8]) {
         debug_assert!(self.col_idx < self.page.header.col_count as usize);
         let (var, offset) = self.page.add_var(input, self.var_offset);
         self.page.update_var(self.row_idx, self.col_idx, var);
@@ -1250,7 +1255,7 @@ impl NewRow<'_> {
     }
 
     #[inline]
-    pub fn add_col(&mut self, col_layout: &TableColumnLayout, val: &Val) {
+    pub(crate) fn add_col(&mut self, col_layout: &TableColumnLayout, val: &Val) {
         match val {
             Val::Null => self.add_null(col_layout),
             Val::I8(v) => self.add_val(col_layout, *v),
@@ -1269,13 +1274,14 @@ impl NewRow<'_> {
 
     /// Add string value to current row, same as add_var().
     #[inline]
-    pub fn add_str_atomic(&mut self, col_layout: &TableColumnLayout, input: &str) {
+    #[expect(dead_code, reason = "reserved add_str_atomic")]
+    pub(crate) fn add_str_atomic(&mut self, col_layout: &TableColumnLayout, input: &str) {
         self.add_var(col_layout, input.as_bytes())
     }
 
     /// Add null value to current row.
     #[inline]
-    pub fn add_null(&mut self, col_layout: &TableColumnLayout) {
+    pub(crate) fn add_null(&mut self, col_layout: &TableColumnLayout) {
         debug_assert!(self.col_idx < self.page.header.col_count as usize);
         self.page
             .set_null(col_layout, self.row_idx, self.col_idx, true);
@@ -1284,7 +1290,7 @@ impl NewRow<'_> {
 
     /// Finish current row.
     #[inline]
-    pub fn finish(self) -> RowID {
+    pub(crate) fn finish(self) -> RowID {
         debug_assert!(self.col_idx == self.page.header.col_count as usize);
         let res = self.page.set_deleted(self.row_idx, false);
         debug_assert!(res);
@@ -1474,7 +1480,7 @@ pub(crate) trait RowRead {
 
 /// Row abstract a logical row in the page.
 #[derive(Clone)]
-pub struct Row<'a> {
+pub(crate) struct Row<'a> {
     page: &'a RowPage,
     row_idx: usize,
 }
@@ -1492,7 +1498,7 @@ impl RowRead for Row<'_> {
 }
 
 /// RowMut is mutable row in the page.
-pub struct RowMut<'a> {
+pub(crate) struct RowMut<'a> {
     page: &'a RowPage,
     row_idx: usize,
     var_offset: usize,
@@ -1514,7 +1520,12 @@ impl RowRead for RowMut<'_> {
 impl RowMut<'_> {
     /// Update column by given index and value.
     #[inline]
-    pub fn update_col(&mut self, col_layout: &TableColumnLayout, col_idx: usize, value: &Val) {
+    pub(crate) fn update_col(
+        &mut self,
+        col_layout: &TableColumnLayout,
+        col_idx: usize,
+        value: &Val,
+    ) {
         debug_assert!(col_layout.nullable(col_idx) || !value.is_null());
         self.var_offset = self.page.update_col(
             col_layout,
@@ -1528,18 +1539,19 @@ impl RowMut<'_> {
 
     /// Set null bit by given column index.
     #[inline]
-    pub fn set_null(&mut self, col_layout: &TableColumnLayout, col_idx: usize, null: bool) {
+    #[expect(dead_code, reason = "reserved set_null")]
+    pub(crate) fn set_null(&mut self, col_layout: &TableColumnLayout, col_idx: usize, null: bool) {
         self.page.set_null(col_layout, self.row_idx, col_idx, null);
     }
 
     #[inline]
-    pub fn finish(self) {
+    pub(crate) fn finish(self) {
         debug_assert!(self.var_offset == self.var_end);
     }
 }
 
 /// RowRecover is the row to recover in this page.
-pub struct RowMutExclusive<'a> {
+pub(crate) struct RowMutExclusive<'a> {
     page: &'a mut RowPage,
     row_idx: usize,
     var_offset: usize,
@@ -1561,7 +1573,7 @@ impl RowRead for RowMutExclusive<'_> {
 impl RowMutExclusive<'_> {
     /// Update column by given index and value.
     #[inline]
-    pub fn update_col(
+    pub(crate) fn update_col(
         &mut self,
         col_layout: &TableColumnLayout,
         col_idx: usize,
@@ -1580,7 +1592,7 @@ impl RowMutExclusive<'_> {
 
     /// Finish row replace.
     #[inline]
-    pub fn finish_insert(self) {
+    pub(crate) fn finish_insert(self) {
         debug_assert!(self.var_offset == self.var_end);
         let res = self.page.set_deleted(self.row_idx, false);
         debug_assert!(res);
@@ -1588,7 +1600,7 @@ impl RowMutExclusive<'_> {
     }
 
     #[inline]
-    pub fn finish_update(self) {
+    pub(crate) fn finish_update(self) {
         debug_assert!(self.var_offset == self.var_end);
         debug_assert!(!self.page.is_deleted(self.row_idx));
     }
@@ -1637,7 +1649,7 @@ const fn col_inline_len(kind: ValKind, row_count: usize) -> usize {
 /// Returns estimation of maximum row count of a new page with average row length
 /// equal to given row length.
 #[inline]
-pub const fn estimate_max_row_count(row_len: usize, col_count: usize) -> usize {
+pub(crate) const fn estimate_max_row_count(row_len: usize, col_count: usize) -> usize {
     let body_len = PAGE_SIZE
         .wrapping_sub(mem::size_of::<RowPageHeader>()) // header
         .wrapping_sub(col_count * 2); // col offset (approx)
@@ -1648,13 +1660,13 @@ pub const fn estimate_max_row_count(row_len: usize, col_count: usize) -> usize {
 }
 
 #[inline]
-pub const fn align8(value: usize) -> usize {
+pub(crate) const fn align8(value: usize) -> usize {
     value.div_ceil(8) * 8
 }
 
 /// Returns additional space of var-len data of the new row to be inserted.
 #[inline]
-pub fn var_len_for_insert(schema: &TableColumnLayout, cols: &[Val]) -> usize {
+pub(crate) fn var_len_for_insert(schema: &TableColumnLayout, cols: &[Val]) -> usize {
     schema
         .var_cols()
         .iter()
@@ -1714,7 +1726,7 @@ mod tests {
 
     #[test]
     fn test_row_page_init() {
-        let metadata = TableMetadata::new(
+        let metadata = TableMetadata::try_new(
             vec![ColumnSpec {
                 column_name: SemiStr::new("id"),
                 column_type: ValKind::I32,
@@ -1727,7 +1739,8 @@ mod tests {
                 }],
                 attributes: IndexAttributes::PK,
             }],
-        );
+        )
+        .expect("valid table metadata");
         let mut page = create_row_page();
         page.init(100, 105, metadata.col.as_ref());
         println!("page header={:?}", page.header);
@@ -1745,7 +1758,7 @@ mod tests {
 
     #[test]
     fn test_row_page_new_row() {
-        let metadata = TableMetadata::new(
+        let metadata = TableMetadata::try_new(
             vec![ColumnSpec {
                 column_name: SemiStr::new("id"),
                 column_type: ValKind::I32,
@@ -1755,7 +1768,8 @@ mod tests {
                 cols: vec![IndexKey::new(0)],
                 attributes: IndexAttributes::PK,
             }],
-        );
+        )
+        .expect("valid table metadata");
         let mut page = create_row_page();
         page.init(100, 200, metadata.col.as_ref());
         assert!(page.header.row_count() == 0);
@@ -1770,7 +1784,7 @@ mod tests {
 
     #[test]
     fn test_row_page_read_write_row() {
-        let metadata = TableMetadata::new(
+        let metadata = TableMetadata::try_new(
             vec![
                 ColumnSpec {
                     column_name: SemiStr::new("id"),
@@ -1787,7 +1801,8 @@ mod tests {
                 cols: vec![IndexKey::new(0)],
                 attributes: IndexAttributes::PK,
             }],
-        );
+        )
+        .expect("valid table metadata");
         assert!(metadata.col.nullable(0));
         assert!(!metadata.col.nullable(1));
         let mut page = create_row_page();
@@ -1830,13 +1845,14 @@ mod tests {
 
     #[test]
     fn test_row_page_decode_stable_across_index_only_metadata_changes() {
-        let metadata = TableMetadata::new(
+        let metadata = TableMetadata::try_new(
             vec![
                 ColumnSpec::new("id", ValKind::U32, ColumnAttributes::empty()),
                 ColumnSpec::new("name", ValKind::VarByte, ColumnAttributes::NULLABLE),
             ],
             vec![],
-        );
+        )
+        .expect("valid table metadata");
         let mut page = create_row_page();
         page.init(100, 8, metadata.col.as_ref());
         let expected = vec![Val::U32(7), Val::from("row-value")];
@@ -1855,7 +1871,7 @@ mod tests {
 
     #[test]
     fn test_row_page_crud() {
-        let schema = TableMetadata::new(
+        let schema = TableMetadata::try_new(
             vec![
                 ColumnSpec {
                     column_name: SemiStr::new("col1"),
@@ -1887,7 +1903,8 @@ mod tests {
                 cols: vec![IndexKey::new(2)],
                 attributes: IndexAttributes::PK,
             }],
-        );
+        )
+        .expect("valid table metadata");
         let mut page = create_row_page();
         page.init(100, 200, schema.col.as_ref());
         let short = b"short";

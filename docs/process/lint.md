@@ -52,6 +52,10 @@ cargo clippy -p doradb-storage --all-targets -- -D warnings
 
 This keeps local and CI lint behavior aligned.
 
+Do not use `--all-features` for `doradb-storage`: the `iouring` and `libaio`
+backend features are mutually exclusive. Validate the alternate backend with a
+separate explicit feature command when needed.
+
 The undocumented-unsafe-block policy is enabled in the active production crate
 root with `#![warn(clippy::undocumented_unsafe_blocks)]`, and `-D warnings`
 turns any violation there into a hard failure. New production target crates

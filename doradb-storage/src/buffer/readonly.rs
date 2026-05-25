@@ -133,7 +133,7 @@ pub(crate) fn begin_write_barrier(
 /// from physical on-disk identity to in-memory frame id.
 ///
 /// Reverse lookup is stored inline in `BufferFrame` as persisted-block metadata.
-pub struct ReadonlyBufferPool {
+pub(crate) struct ReadonlyBufferPool {
     size: usize,
     mappings: DashMap<BlockKey, PageID>,
     inflights: DashMap<BlockKey, InflightBlockState>,
@@ -153,7 +153,7 @@ impl ReadonlyBufferPool {
     /// Callers must first place the pool into a stable owner such as
     /// [`QuiescentBox`] before starting guarded worker threads.
     #[inline]
-    pub fn with_capacity(
+    pub(crate) fn with_capacity(
         role: PoolRole,
         pool_size: usize,
         fs: QuiescentGuard<FileSystem>,
@@ -165,7 +165,7 @@ impl ReadonlyBufferPool {
     ///
     /// This constructor intentionally does not start the eviction worker.
     #[inline]
-    pub fn with_capacity_and_arbiter_builder(
+    pub(crate) fn with_capacity_and_arbiter_builder(
         role: PoolRole,
         pool_size: usize,
         fs: QuiescentGuard<FileSystem>,
@@ -208,24 +208,27 @@ impl ReadonlyBufferPool {
 
     /// Returns total number of frame slots in this pool.
     #[inline]
-    pub fn capacity(&self) -> usize {
+    #[cfg_attr(not(test), expect(dead_code, reason = "pending dead-code audit"))]
+    pub(crate) fn capacity(&self) -> usize {
         self.size
     }
 
     /// Returns number of currently mapped cache entries.
     #[inline]
-    pub fn allocated(&self) -> usize {
+    #[cfg_attr(not(test), expect(dead_code, reason = "pending dead-code audit"))]
+    pub(crate) fn allocated(&self) -> usize {
         self.mappings.len()
     }
 
     /// Returns one snapshot of shared readonly-pool access and load counters.
     #[inline]
-    pub fn stats(&self) -> BufferPoolStats {
+    #[cfg_attr(not(test), expect(dead_code, reason = "internal buffer pool stats"))]
+    pub(crate) fn stats(&self) -> BufferPoolStats {
         self.stats.snapshot()
     }
 
     #[inline]
-    pub fn pool_guard(&self) -> PoolGuard {
+    pub(crate) fn pool_guard(&self) -> PoolGuard {
         debug_assert!(!matches!(self.role, PoolRole::Invalid));
         self.arena.guard()
     }
@@ -304,13 +307,14 @@ impl ReadonlyBufferPool {
 
     /// Looks up mapped frame id for a given physical cache key.
     #[inline]
-    pub fn try_get_frame_id(&self, key: &BlockKey) -> Option<PageID> {
+    pub(crate) fn try_get_frame_id(&self, key: &BlockKey) -> Option<PageID> {
         self.mappings.get(key).map(|v| *v)
     }
 
     /// Looks up persisted-block identity by frame id.
     #[inline]
-    pub fn try_get_block_key(&self, frame_id: PageID) -> Option<BlockKey> {
+    #[cfg_attr(not(test), expect(dead_code, reason = "pending dead-code audit"))]
+    pub(crate) fn try_get_block_key(&self, frame_id: PageID) -> Option<BlockKey> {
         if usize::from(frame_id) >= self.size {
             return None;
         }
@@ -325,7 +329,8 @@ impl ReadonlyBufferPool {
     /// Binding is idempotent for the same key/frame pair and returns
     /// Returns an internal mapping-conflict error for conflicting mapping attempts.
     #[inline]
-    pub fn bind_frame(
+    #[cfg_attr(not(test), expect(dead_code, reason = "pending dead-code audit"))]
+    pub(crate) fn bind_frame(
         &self,
         key: BlockKey,
         frame_guard: &mut PageExclusiveGuard<Page>,
@@ -1287,7 +1292,7 @@ impl EvictionRuntime for ReadonlyRuntime {
 ///
 /// The guard retains the readonly-cache residency/lifetime of one loaded block
 /// without exposing pool guards or latch types to callers.
-pub struct ReadonlyBlockGuard {
+pub(crate) struct ReadonlyBlockGuard {
     block_id: BlockID,
     guard: PageSharedGuard<Page>,
 }
@@ -1300,13 +1305,14 @@ impl ReadonlyBlockGuard {
 
     /// Returns the persisted bytes of the loaded block.
     #[inline]
-    pub fn page(&self) -> &Page {
+    pub(crate) fn page(&self) -> &Page {
         self.guard.page()
     }
 
     /// Returns the physical block id in the backing file.
     #[inline]
-    pub fn block_id(&self) -> BlockID {
+    #[cfg_attr(not(test), expect(dead_code, reason = "pending dead-code audit"))]
+    pub(crate) fn block_id(&self) -> BlockID {
         self.block_id
     }
 }
@@ -1327,7 +1333,7 @@ pub(crate) mod tests {
     };
     use crate::file::build_test_fs;
     use crate::file::build_test_fs_in;
-    use crate::file::cow_file::{COW_FILE_PAGE_SIZE, SUPER_BLOCK_ID};
+    use crate::file::cow_file::{COW_FILE_PAGE_SIZE, MutableCowFile, SUPER_BLOCK_ID};
     use crate::file::fs::FileSystem;
     use crate::file::fs::tests::{TestFileSystem, build_test_fs_owner_in};
     use crate::file::table_file::{MutableTableFile, TableFile};
@@ -1549,14 +1555,17 @@ pub(crate) mod tests {
     }
 
     fn make_metadata() -> Arc<TableMetadata> {
-        Arc::new(TableMetadata::new(
-            vec![ColumnSpec::new(
-                "c0",
-                ValKind::U32,
-                ColumnAttributes::empty(),
-            )],
-            vec![],
-        ))
+        Arc::new(
+            TableMetadata::try_new(
+                vec![ColumnSpec::new(
+                    "c0",
+                    ValKind::U32,
+                    ColumnAttributes::empty(),
+                )],
+                vec![],
+            )
+            .expect("valid table metadata"),
+        )
     }
 
     async fn commit_table_file(_fs: &FileSystem, table_file: MutableTableFile) -> Arc<TableFile> {

@@ -52,7 +52,7 @@ const MIN_IN_MEM_PAGES: usize = 128;
 /// The pool owns page/frame state, while all actual file IO is routed through
 /// the shared storage worker exposed by [`FileSystem`] and eviction scheduling
 /// runs under the shared pool evictor.
-pub struct EvictableBufferPool {
+pub(crate) struct EvictableBufferPool {
     // Takes care of page allocation and deallocation.
     alloc_map: AllocMap,
     // Event to notify allocating new page is available.
@@ -102,13 +102,15 @@ impl EvictableBufferPool {
 
     /// Returns one snapshot of evictable-pool access and IO lifecycle counters.
     #[inline]
-    pub fn stats(&self) -> BufferPoolStats {
+    #[cfg_attr(not(test), expect(dead_code, reason = "internal buffer pool stats"))]
+    pub(crate) fn stats(&self) -> BufferPoolStats {
         self.stats.snapshot()
     }
 
     /// Returns one snapshot of backend-owned submit/wait activity for this pool.
     #[inline]
-    pub fn io_backend_stats(&self) -> IOBackendStats {
+    #[cfg_attr(not(test), expect(dead_code, reason = "internal buffer pool stats"))]
+    pub(crate) fn io_backend_stats(&self) -> IOBackendStats {
         self.fs.io_backend_stats()
     }
 
@@ -1411,7 +1413,7 @@ impl Default for InflightIO {
 }
 
 impl InflightIO {
-    #[allow(clippy::await_holding_lock)]
+    #[expect(clippy::await_holding_lock, reason = "clippy false positive")]
     #[inline]
     async fn wait_for_write(&self, page_id: PageID, frame: &BufferFrame) -> Result<()> {
         let mut g = self.map.lock();

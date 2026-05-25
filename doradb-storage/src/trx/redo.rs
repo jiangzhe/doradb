@@ -14,7 +14,7 @@ use std::mem;
 /// Defines the code of redo operation on a row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u8)]
-pub enum RowRedoCode {
+pub(crate) enum RowRedoCode {
     Insert = 1,
     Delete = 2,
     Update = 3,
@@ -38,7 +38,7 @@ impl TryFrom<u8> for RowRedoCode {
 
 /// Defines the kind of redo operation on a row.
 #[derive(Debug)]
-pub enum RowRedoKind {
+pub(crate) enum RowRedoKind {
     Insert(Vec<Val>),
     Delete,
     Update(Vec<UpdateCol>),
@@ -49,7 +49,7 @@ pub enum RowRedoKind {
 impl RowRedoKind {
     /// Get the code of the redo operation on a row.
     #[inline]
-    pub fn code(&self) -> RowRedoCode {
+    pub(crate) fn code(&self) -> RowRedoCode {
         match self {
             RowRedoKind::Insert(..) => RowRedoCode::Insert,
             RowRedoKind::Delete => RowRedoCode::Delete,
@@ -120,10 +120,10 @@ impl Deser for RowRedoKind {
 
 /// Represents a redo operation on a row.
 #[derive(Debug)]
-pub struct RowRedo {
-    pub page_id: PageID,
-    pub row_id: RowID,
-    pub kind: RowRedoKind,
+pub(crate) struct RowRedo {
+    pub(crate) page_id: PageID,
+    pub(crate) row_id: RowID,
+    pub(crate) kind: RowRedoKind,
 }
 
 impl Ser<'_> for RowRedo {
@@ -160,7 +160,7 @@ impl Deser for RowRedo {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u8)]
-pub enum DDLRedoCode {
+pub(crate) enum DDLRedoCode {
     CreateTable = 129,
     DropTable = 130,
     CreateIndex = 131,
@@ -188,7 +188,7 @@ impl TryFrom<u8> for DDLRedoCode {
 
 /// Represents a redo record of any DDL operation.
 #[derive(Debug)]
-pub enum DDLRedo {
+pub(crate) enum DDLRedo {
     // Create a new table with given table id.
     // Actual metadata change is recorded in DML logs.
     CreateTable(TableID),
@@ -217,7 +217,7 @@ pub enum DDLRedo {
 impl DDLRedo {
     /// Get the code of the redo operation on a row.
     #[inline]
-    pub fn code(&self) -> DDLRedoCode {
+    pub(crate) fn code(&self) -> DDLRedoCode {
         match self {
             DDLRedo::CreateTable(..) => DDLRedoCode::CreateTable,
             DDLRedo::DropTable(..) => DDLRedoCode::DropTable,
@@ -357,36 +357,36 @@ impl Deser for DDLRedo {
 
 /// Represents the redo logs of a transaction.
 #[derive(Default, Debug)]
-pub struct RedoLogs {
+pub(crate) struct RedoLogs {
     // Currently only one DDL per transaction is supported.
-    pub ddl: Option<Box<DDLRedo>>,
-    pub dml: BTreeMap<TableID, TableDML>,
+    pub(crate) ddl: Option<Box<DDLRedo>>,
+    pub(crate) dml: BTreeMap<TableID, TableDML>,
 }
 
 impl RedoLogs {
     /// Returns true if the redo logs are empty.
     #[inline]
-    pub fn is_empty(&self) -> bool {
+    pub(crate) fn is_empty(&self) -> bool {
         self.ddl.is_none() && self.dml.is_empty()
     }
 
     /// Clear all redo logs.
     #[inline]
-    pub fn clear(&mut self) {
+    pub(crate) fn clear(&mut self) {
         self.ddl.take();
         self.dml.clear();
     }
 
     /// Insert a redo entry into the redo logs.
     #[inline]
-    pub fn insert_dml(&mut self, table_id: TableID, entry: RowRedo) {
+    pub(crate) fn insert_dml(&mut self, table_id: TableID, entry: RowRedo) {
         let table = self.dml.entry(table_id).or_default();
         table.insert(entry);
     }
 
     /// Merge redo logs from other.
     #[inline]
-    pub fn merge(&mut self, other: RedoLogs) {
+    pub(crate) fn merge(&mut self, other: RedoLogs) {
         if self.is_empty() {
             *self = other;
             return;
@@ -442,7 +442,7 @@ impl Deser for RedoLogs {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u8)]
-pub enum RedoTrxKind {
+pub(crate) enum RedoTrxKind {
     User = 0,
     System = 1,
 }
@@ -462,9 +462,9 @@ impl TryFrom<u8> for RedoTrxKind {
 
 /// Redo header of a transaction.
 #[derive(Debug)]
-pub struct RedoHeader {
-    pub cts: TrxID,
-    pub trx_kind: RedoTrxKind,
+pub(crate) struct RedoHeader {
+    pub(crate) cts: TrxID,
+    pub(crate) trx_kind: RedoTrxKind,
 }
 
 impl Ser<'_> for RedoHeader {
@@ -498,14 +498,14 @@ impl Deser for RedoHeader {
 
 /// Represents the redo logs of a table.
 #[derive(Default, Debug)]
-pub struct TableDML {
-    pub rows: BTreeMap<RowID, RowRedo>,
+pub(crate) struct TableDML {
+    pub(crate) rows: BTreeMap<RowID, RowRedo>,
 }
 
 impl TableDML {
     /// Insert a redo entry into the table redo logs.
     #[inline]
-    pub fn insert(&mut self, entry: RowRedo) {
+    pub(crate) fn insert(&mut self, entry: RowRedo) {
         match self.rows.entry(entry.row_id) {
             Entry::Vacant(vac) => {
                 vac.insert(entry);
@@ -579,7 +579,7 @@ impl TableDML {
 
     /// Merge redo logs from other.
     #[inline]
-    pub fn merge(&mut self, other: TableDML) {
+    pub(crate) fn merge(&mut self, other: TableDML) {
         for entry in other.rows.into_values() {
             self.insert(entry);
         }

@@ -163,25 +163,31 @@ mod tests {
     use crate::value::ValKind;
 
     fn metadata_without_indexes() -> Arc<TableMetadata> {
-        Arc::new(TableMetadata::new(
-            vec![ColumnSpec::new(
-                "id",
-                ValKind::I32,
-                ColumnAttributes::empty(),
-            )],
-            vec![],
-        ))
+        Arc::new(
+            TableMetadata::try_new(
+                vec![ColumnSpec::new(
+                    "id",
+                    ValKind::I32,
+                    ColumnAttributes::empty(),
+                )],
+                vec![],
+            )
+            .expect("valid table metadata"),
+        )
     }
 
     fn metadata_with_primary_index() -> Arc<TableMetadata> {
-        Arc::new(TableMetadata::new(
-            vec![ColumnSpec::new(
-                "id",
-                ValKind::I32,
-                ColumnAttributes::empty(),
-            )],
-            vec![IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::PK)],
-        ))
+        Arc::new(
+            TableMetadata::try_new(
+                vec![ColumnSpec::new(
+                    "id",
+                    ValKind::I32,
+                    ColumnAttributes::empty(),
+                )],
+                vec![IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::PK)],
+            )
+            .expect("valid table metadata"),
+        )
     }
 
     #[test]

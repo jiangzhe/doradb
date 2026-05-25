@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// old versions of rows in row page.
 /// It also contains modification counter and max STS
 /// to speed up table scan with MVCC.
-pub struct RowVersionMap {
+pub(crate) struct RowVersionMap {
     // Fixed size array to store undo chains.
     // It wastes 16 bytes(one lock and one pointer)
     // for each row if no undo associated.
@@ -52,7 +52,7 @@ pub struct RowVersionMap {
 
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RowPageState {
+pub(crate) enum RowPageState {
     Active = 0,
     Frozen = 1,
     Transition = 2,
@@ -61,7 +61,7 @@ pub enum RowPageState {
 impl RowVersionMap {
     /// Create a new version map.
     #[inline]
-    pub fn new(column_layout: Arc<TableColumnLayout>, max_size: usize) -> Self {
+    pub(crate) fn new(column_layout: Arc<TableColumnLayout>, max_size: usize) -> Self {
         let vec: Vec<_> = (0..max_size).map(|_| RwLock::new(None)).collect();
         RowVersionMap {
             entries: vec.into_boxed_slice(),
@@ -76,19 +76,19 @@ impl RowVersionMap {
 
     /// Returns current row page state.
     #[inline]
-    pub fn state(&self) -> RowPageState {
+    pub(crate) fn state(&self) -> RowPageState {
         *self.state.read()
     }
 
     /// Acquire shared lock of page state.
     #[inline]
-    pub fn read_state(&self) -> RwLockReadGuard<'_, RowPageState> {
+    pub(crate) fn read_state(&self) -> RwLockReadGuard<'_, RowPageState> {
         self.state.read()
     }
 
     /// Returns whether this page is frozen.
     #[inline]
-    pub fn is_frozen(&self) -> bool {
+    pub(crate) fn is_frozen(&self) -> bool {
         matches!(
             self.state(),
             RowPageState::Frozen | RowPageState::Transition
@@ -97,13 +97,14 @@ impl RowVersionMap {
 
     /// Returns whether this page is in transition.
     #[inline]
-    pub fn is_transition(&self) -> bool {
+    #[cfg_attr(not(test), expect(dead_code, reason = "pending dead-code audit"))]
+    pub(crate) fn is_transition(&self) -> bool {
         self.state() == RowPageState::Transition
     }
 
     /// Freeze current row page.
     #[inline]
-    pub fn set_frozen(&self) {
+    pub(crate) fn set_frozen(&self) {
         let mut state = self.state.write();
         if *state == RowPageState::Active {
             *state = RowPageState::Frozen;
@@ -112,7 +113,7 @@ impl RowVersionMap {
 
     /// Set current row page to transition.
     #[inline]
-    pub fn set_transition(&self) {
+    pub(crate) fn set_transition(&self) {
         let mut state = self.state.write();
         if *state == RowPageState::Frozen {
             *state = RowPageState::Transition;
@@ -121,44 +122,44 @@ impl RowVersionMap {
 
     /// Set commit timestamp of page creation.
     #[inline]
-    pub fn set_create_cts(&self, cts: TrxID) {
+    pub(crate) fn set_create_cts(&self, cts: TrxID) {
         self.create_cts.store(cts, Ordering::Release);
     }
 
     /// Returns commit timestamp of page creation.
     #[inline]
-    pub fn create_cts(&self) -> TrxID {
+    pub(crate) fn create_cts(&self) -> TrxID {
         self.create_cts.load(Ordering::Acquire)
     }
 
     /// Returns modification counter.
     #[inline]
-    pub fn mod_counter(&self) -> u64 {
+    pub(crate) fn mod_counter(&self) -> u64 {
         self.mod_counter.load(Ordering::Acquire)
     }
 
     /// Returns maximum STS recorded in this map.
     #[inline]
-    pub fn max_sts(&self) -> TrxID {
+    pub(crate) fn max_sts(&self) -> TrxID {
         self.max_sts.load(Ordering::Acquire)
     }
 
     /// Returns maximum STS of insert or update on this page.
     #[inline]
-    pub fn max_ins_sts(&self) -> TrxID {
+    pub(crate) fn max_ins_sts(&self) -> TrxID {
         self.max_ins_sts.load(Ordering::Acquire)
     }
 
     /// Acquire a read latch on given row.
     #[inline]
-    pub fn read_latch(&self, row_idx: usize) -> RowVersionReadGuard<'_> {
+    pub(crate) fn read_latch(&self, row_idx: usize) -> RowVersionReadGuard<'_> {
         let g = self.entries[row_idx].read();
         RowVersionReadGuard { g }
     }
 
     /// Acquire a write latch on given row.
     #[inline]
-    pub fn write_latch(
+    pub(crate) fn write_latch(
         &self,
         row_idx: usize,
         sts: Option<TrxID>,
@@ -181,12 +182,13 @@ impl RowVersionMap {
 
     /// Acquire exclusive latch as self is exclusive.
     #[inline]
-    pub fn write_exclusive(&mut self, row_idx: usize) -> &mut Option<Box<RowUndoHead>> {
+    #[cfg_attr(not(test), expect(dead_code, reason = "pending dead-code audit"))]
+    pub(crate) fn write_exclusive(&mut self, row_idx: usize) -> &mut Option<Box<RowUndoHead>> {
         self.entries[row_idx].get_mut()
     }
 }
 
-pub struct RowVersionReadGuard<'a> {
+pub(crate) struct RowVersionReadGuard<'a> {
     g: RwLockReadGuard<'a, Option<Box<RowUndoHead>>>,
 }
 
@@ -198,7 +200,7 @@ impl<'a> Deref for RowVersionReadGuard<'a> {
     }
 }
 
-pub struct RowVersionWriteGuard<'a> {
+pub(crate) struct RowVersionWriteGuard<'a> {
     m: &'a RowVersionMap,
     g: RwLockWriteGuard<'a, Option<Box<RowUndoHead>>>,
     sts: Option<TrxID>,
@@ -207,7 +209,7 @@ pub struct RowVersionWriteGuard<'a> {
 
 impl RowVersionWriteGuard<'_> {
     #[inline]
-    pub fn enable_ins_or_update(&mut self) {
+    pub(crate) fn enable_ins_or_update(&mut self) {
         self.ins_or_update = true;
     }
 }
@@ -254,14 +256,15 @@ mod tests {
 
     #[test]
     fn test_row_version_map_create_cts() {
-        let metadata = TableMetadata::new(
+        let metadata = TableMetadata::try_new(
             vec![ColumnSpec::new(
                 "id",
                 ValKind::I64,
                 ColumnAttributes::empty(),
             )],
             Vec::<IndexSpec>::new(),
-        );
+        )
+        .expect("valid table metadata");
         let map = RowVersionMap::new(Arc::clone(&metadata.col), 1);
         assert_eq!(map.create_cts(), 0);
         map.set_create_cts(42);
@@ -270,14 +273,15 @@ mod tests {
 
     #[test]
     fn test_row_version_map_state_transitions() {
-        let metadata = TableMetadata::new(
+        let metadata = TableMetadata::try_new(
             vec![ColumnSpec::new(
                 "id",
                 ValKind::I64,
                 ColumnAttributes::empty(),
             )],
             Vec::<IndexSpec>::new(),
-        );
+        )
+        .expect("valid table metadata");
         let map = RowVersionMap::new(Arc::clone(&metadata.col), 1);
         assert_eq!(map.state(), RowPageState::Active);
         assert!(!map.is_frozen());
@@ -296,14 +300,15 @@ mod tests {
 
     #[test]
     fn test_row_version_map_stores_column_layout_arc_only() {
-        let metadata = TableMetadata::new(
+        let metadata = TableMetadata::try_new(
             vec![ColumnSpec::new(
                 "id",
                 ValKind::I64,
                 ColumnAttributes::empty(),
             )],
             Vec::<IndexSpec>::new(),
-        );
+        )
+        .expect("valid table metadata");
         let (index_no, indexed_metadata) = metadata
             .try_with_created_index(IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::UK))
             .unwrap();

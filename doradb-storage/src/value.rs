@@ -16,14 +16,15 @@ use std::result::Result as StdResult;
 use std::sync::atomic::*;
 use zerocopy_derive::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
-pub const PAGE_VAR_HEADER: usize = 8;
-pub const PAGE_VAR_LEN_INLINE: usize = 6;
-pub const PAGE_VAR_LEN_PREFIX: usize = 4;
+pub(crate) const PAGE_VAR_HEADER: usize = 8;
+pub(crate) const PAGE_VAR_LEN_INLINE: usize = 6;
+pub(crate) const PAGE_VAR_LEN_PREFIX: usize = 4;
 const _: () = assert!(mem::size_of::<PageVar>() == 8);
 
-pub const MEM_VAR_HEADER: usize = 16;
-pub const MEM_VAR_LEN_INLINE: usize = 14;
-pub const MEM_VAR_LEN_PREFIX: usize = 6;
+#[cfg_attr(not(test), expect(dead_code, reason = "reserved MEM_VAR_HEADER"))]
+pub(crate) const MEM_VAR_HEADER: usize = 16;
+pub(crate) const MEM_VAR_LEN_INLINE: usize = 14;
+pub(crate) const MEM_VAR_LEN_PREFIX: usize = 6;
 const _: () = assert!(mem::size_of::<MemVar>() == 16);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -776,10 +777,10 @@ impl Value for f64 {
     }
 }
 
-/// ValBuffer represents a temporary b uffer to hold
+/// ValBuffer represents a temporary buffer to hold
 /// continuous values.
 /// Null bitmap is separated from this buffer.
-pub enum ValBuffer {
+pub(crate) enum ValBuffer {
     I8(Vec<i8>),
     U8(Vec<u8>),
     I16(Vec<i16>),
@@ -799,7 +800,7 @@ pub enum ValBuffer {
 impl ValBuffer {
     /// Create a new value buffer.
     #[inline]
-    pub fn new(kind: ValKind) -> Self {
+    pub(crate) fn new(kind: ValKind) -> Self {
         match kind {
             ValKind::I8 => ValBuffer::I8(vec![]),
             ValKind::U8 => ValBuffer::U8(vec![]),
@@ -819,7 +820,7 @@ impl ValBuffer {
     }
 
     #[inline]
-    pub fn clear(&mut self) {
+    pub(crate) fn clear(&mut self) {
         match self {
             ValBuffer::I8(vec) => vec.clear(),
             ValBuffer::U8(vec) => vec.clear(),
@@ -847,7 +848,7 @@ impl ValBuffer {
 /// tail of page.
 #[derive(Clone, Copy, FromBytes, IntoBytes, KnownLayout, Immutable)]
 #[repr(C, align(8))]
-pub struct PageVar {
+pub(crate) struct PageVar {
     b: [u8; 8],
 }
 
@@ -855,7 +856,7 @@ impl PageVar {
     /// Create a new PageVar with inline data.
     /// The data length must be no more than 6 bytes.
     #[inline]
-    pub fn inline(data: &[u8]) -> Self {
+    pub(crate) fn inline(data: &[u8]) -> Self {
         debug_assert!(data.len() <= PAGE_VAR_LEN_INLINE);
         let mut b = [0u8; PAGE_VAR_HEADER];
         b[..2].copy_from_slice(&(data.len() as u16).to_le_bytes());
@@ -866,7 +867,7 @@ impl PageVar {
     /// Create a new PageVar with pointer info.
     /// The prefix length must be 4 bytes.
     #[inline]
-    pub fn outline(len: u16, offset: u16, prefix: &[u8]) -> Self {
+    pub(crate) fn outline(len: u16, offset: u16, prefix: &[u8]) -> Self {
         debug_assert!(prefix.len() == PAGE_VAR_LEN_PREFIX);
         let mut b = [0u8; PAGE_VAR_HEADER];
         b[..2].copy_from_slice(&len.to_le_bytes());
@@ -876,15 +877,14 @@ impl PageVar {
     }
 
     /// Returns length of the value.
-    #[allow(clippy::len_without_is_empty)]
     #[inline]
-    pub fn len(&self) -> usize {
+    pub(crate) fn len(&self) -> usize {
         u16::from_le_bytes([self.b[0], self.b[1]]) as usize
     }
 
     /// Returns offset if outlined.
     #[inline]
-    pub fn offset(&self) -> Option<usize> {
+    pub(crate) fn offset(&self) -> Option<usize> {
         if self.is_inlined() {
             return None;
         }
@@ -893,14 +893,14 @@ impl PageVar {
 
     /// Returns whether the value is inlined.
     #[inline]
-    pub fn is_inlined(&self) -> bool {
+    pub(crate) fn is_inlined(&self) -> bool {
         self.len() <= PAGE_VAR_LEN_INLINE
     }
 
     /// Returns inpage length of given value.
     /// If the value can be inlined, returns 0.
     #[inline]
-    pub fn outline_len(data: &[u8]) -> usize {
+    pub(crate) fn outline_len(data: &[u8]) -> usize {
         if data.len() > PAGE_VAR_LEN_INLINE {
             data.len()
         } else {
@@ -917,7 +917,8 @@ impl PageVar {
     /// `ptr.add(self.offset().unwrap())..ptr.add(self.offset().unwrap() + self.len())`
     /// must be valid for reads.
     #[inline]
-    pub unsafe fn as_bytes_unchecked(&self, ptr: *const u8) -> &[u8] {
+    #[cfg_attr(not(test), expect(dead_code, reason = "reserved as_bytes_unchecked"))]
+    pub(crate) unsafe fn as_bytes_unchecked(&self, ptr: *const u8) -> &[u8] {
         // SAFETY: the function contract guarantees `ptr` covers the outlined
         // payload when needed, and the inline/outline tag is derived from `len`.
         unsafe {
@@ -934,7 +935,7 @@ impl PageVar {
 
     /// Returns bytes on given page.
     #[inline]
-    pub fn as_bytes<'a>(&'a self, page_data: &'a [u8]) -> &'a [u8] {
+    pub(crate) fn as_bytes<'a>(&'a self, page_data: &'a [u8]) -> &'a [u8] {
         let len = self.len();
         if len <= PAGE_VAR_LEN_INLINE {
             &self.b[2..2 + len]
@@ -954,7 +955,8 @@ impl PageVar {
     /// must be valid for writes. The caller must also ensure `val` fits within
     /// the currently reserved inline or outlined storage.
     #[inline]
-    pub unsafe fn update_in_place(&mut self, ptr: *mut u8, val: &[u8]) {
+    #[cfg_attr(not(test), expect(dead_code, reason = "reserved update_in_place"))]
+    pub(crate) unsafe fn update_in_place(&mut self, ptr: *mut u8, val: &[u8]) {
         // SAFETY: the function contract guarantees `ptr` covers the current
         // outlined payload, and this helper only writes within the existing
         // inline bytes or reserved outlined storage.
@@ -979,14 +981,15 @@ impl PageVar {
     }
 
     #[inline]
-    pub fn from_u64(raw: u64) -> Self {
+    #[expect(dead_code, reason = "reserved from_u64")]
+    pub(crate) fn from_u64(raw: u64) -> Self {
         PageVar {
             b: raw.to_le_bytes(),
         }
     }
 
     #[inline]
-    pub fn into_u64(self) -> u64 {
+    pub(crate) fn into_u64(self) -> u64 {
         u64::from_le_bytes(self.b)
     }
 
@@ -1055,7 +1058,7 @@ impl MemVar {
     }
 
     /// Returns length of the value.
-    #[allow(clippy::len_without_is_empty)]
+    #[expect(clippy::len_without_is_empty, reason = "code style")]
     #[inline]
     pub fn len(&self) -> usize {
         // SAFETY: both `MemVar` union variants store `len` in the same leading

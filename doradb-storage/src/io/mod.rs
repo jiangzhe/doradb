@@ -14,36 +14,28 @@ mod libaio_abi;
 mod libaio_backend;
 
 use crate::thread;
-use flume::{Receiver, SendError, Sender, TryRecvError, TrySendError};
+use flume::{Receiver, SendError, Sender, TryRecvError};
 use std::collections::VecDeque;
 use std::os::unix::io::RawFd;
 use std::result::Result as StdResult;
 use std::thread::JoinHandle;
 
-pub(crate) use backend::IOBackendStatsHandle;
-pub use backend::*;
-pub use buf::*;
+pub(crate) use backend::*;
+pub(crate) use buf::*;
 pub(crate) use completion::Completion;
-#[cfg(feature = "iouring")]
-pub use iouring_backend::IouringBackend;
-#[cfg(feature = "libaio")]
-pub use libaio_abi::*;
-#[cfg(feature = "libaio")]
-pub use libaio_backend::{IORequest, IocbRawPtr, LibaioBackend, UnsafeIORequest, pread, pwrite};
 
 #[cfg(feature = "iouring")]
 /// Canonical storage backend selected by cargo features.
-pub use iouring_backend::IouringBackend as StorageBackend;
+pub(crate) use iouring_backend::IouringBackend as StorageBackend;
 #[cfg(feature = "libaio")]
 /// Canonical storage backend selected by cargo features.
-pub use libaio_backend::LibaioBackend as StorageBackend;
+pub(crate) use libaio_backend::LibaioBackend as StorageBackend;
 
-pub const MIN_PAGE_SIZE: usize = 4096;
-pub const STORAGE_SECTOR_SIZE: usize = 4096;
+pub(crate) const STORAGE_SECTOR_SIZE: usize = 4096;
 
 /// Align given input length to storage sector size.
 #[inline]
-pub fn align_to_sector_size(len: usize) -> usize {
+pub(crate) fn align_to_sector_size(len: usize) -> usize {
     len.max(STORAGE_SECTOR_SIZE).div_ceil(STORAGE_SECTOR_SIZE) * STORAGE_SECTOR_SIZE
 }
 
@@ -58,14 +50,14 @@ pub(crate) use self::tests::{
 /// Higher layers either transfer an owned direct buffer to the worker or
 /// provide a borrowed page-aligned pointer whose lifetime they keep valid until
 /// completion.
-pub enum IOMemory {
+enum IOMemory {
     Owned(DirectBuf),
     Borrowed { ptr: *mut u8, len: usize },
 }
 
 // SAFETY: borrowed pointers are only used for buffer/page memory that higher
-// layers guarantee remains valid until completion, matching the old
-// `UnsafeIORequest` contract.
+// layers guarantee remains valid until completion, matching the borrowed
+// `Operation` constructor contract.
 unsafe impl Send for IOMemory {}
 
 /// Backend-agnostic description of one submitted kernel IO operation.
@@ -73,7 +65,7 @@ unsafe impl Send for IOMemory {}
 /// This type is backend-agnostic: it describes one read/write operation and
 /// owns or borrows the memory that the backend will bind into its prepared
 /// submission shape.
-pub struct Operation {
+pub(crate) struct Operation {
     kind: IOKind,
     fd: RawFd,
     offset: usize,
@@ -83,7 +75,11 @@ pub struct Operation {
 impl Operation {
     /// Build one owned-buffer read operation.
     #[inline]
-    pub fn pread_owned(fd: RawFd, offset: usize, buf: DirectBuf) -> Self {
+    #[cfg_attr(
+        any(not(test), feature = "iouring"),
+        expect(dead_code, reason = "reserved pread_owned")
+    )]
+    pub(crate) fn pread_owned(fd: RawFd, offset: usize, buf: DirectBuf) -> Self {
         Operation {
             kind: IOKind::Read,
             fd,
@@ -94,7 +90,7 @@ impl Operation {
 
     /// Build one owned-buffer write operation.
     #[inline]
-    pub fn pwrite_owned(fd: RawFd, offset: usize, buf: DirectBuf) -> Self {
+    pub(crate) fn pwrite_owned(fd: RawFd, offset: usize, buf: DirectBuf) -> Self {
         Operation {
             kind: IOKind::Write,
             fd,
@@ -109,7 +105,12 @@ impl Operation {
     /// the submitted IO and correctly aligned for the storage backend.
     /// The worker may move this completion between threads before submission.
     #[inline]
-    pub unsafe fn pread_borrowed(fd: RawFd, offset: usize, ptr: *mut u8, len: usize) -> Self {
+    pub(crate) unsafe fn pread_borrowed(
+        fd: RawFd,
+        offset: usize,
+        ptr: *mut u8,
+        len: usize,
+    ) -> Self {
         Operation {
             kind: IOKind::Read,
             fd,
@@ -124,7 +125,12 @@ impl Operation {
     /// the submitted IO and correctly aligned for the storage backend.
     /// The worker may move this completion between threads before submission.
     #[inline]
-    pub unsafe fn pwrite_borrowed(fd: RawFd, offset: usize, ptr: *mut u8, len: usize) -> Self {
+    pub(crate) unsafe fn pwrite_borrowed(
+        fd: RawFd,
+        offset: usize,
+        ptr: *mut u8,
+        len: usize,
+    ) -> Self {
         Operation {
             kind: IOKind::Write,
             fd,
@@ -135,40 +141,34 @@ impl Operation {
 
     /// Returns whether this operation is a read or a write.
     #[inline]
-    pub fn kind(&self) -> IOKind {
+    pub(crate) fn kind(&self) -> IOKind {
         self.kind
     }
 
     /// Returns the raw file descriptor targeted by this operation.
     #[inline]
-    pub fn fd(&self) -> RawFd {
+    pub(crate) fn fd(&self) -> RawFd {
         self.fd
     }
 
     /// Returns the byte offset used for this operation.
     #[inline]
-    pub fn offset(&self) -> usize {
+    pub(crate) fn offset(&self) -> usize {
         self.offset
     }
 
     /// Returns the byte length of the bound buffer or pointer.
     #[inline]
-    pub fn len(&self) -> usize {
+    pub(crate) fn len(&self) -> usize {
         match &self.memory {
             IOMemory::Owned(buf) => buf.capacity(),
             IOMemory::Borrowed { len, .. } => *len,
         }
     }
 
-    /// Returns whether this operation targets an empty buffer.
-    #[inline]
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
-
     /// Takes ownership of the direct buffer if this completion owns one.
     #[inline]
-    pub fn take_buf(&mut self) -> Option<DirectBuf> {
+    pub(crate) fn take_buf(&mut self) -> Option<DirectBuf> {
         match std::mem::replace(
             &mut self.memory,
             IOMemory::Borrowed {
@@ -186,7 +186,11 @@ impl Operation {
 
     /// Returns a shared reference to the owned direct buffer, if present.
     #[inline]
-    pub fn buf(&self) -> Option<&DirectBuf> {
+    #[cfg_attr(
+        any(not(test), feature = "iouring"),
+        expect(dead_code, reason = "reserved buf")
+    )]
+    pub(crate) fn buf(&self) -> Option<&DirectBuf> {
         match &self.memory {
             IOMemory::Owned(buf) => Some(buf),
             IOMemory::Borrowed { .. } => None,
@@ -203,19 +207,19 @@ impl Operation {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum IOKind {
+pub(crate) enum IOKind {
     Read,
     Write,
 }
 
-pub enum IOMessage<T> {
+pub(crate) enum IOMessage<T> {
     Shutdown,
     Req(T),
 }
 
 impl<T> IOMessage<T> {
     #[inline]
-    pub fn req(self) -> Option<T> {
+    fn req(self) -> Option<T> {
         match self {
             IOMessage::Req(r) => Some(r),
             IOMessage::Shutdown => None,
@@ -223,14 +227,14 @@ impl<T> IOMessage<T> {
     }
 }
 
-pub struct IOQueue<T> {
+pub(crate) struct IOQueue<T> {
     reqs: VecDeque<T>,
 }
 
 impl<T> IOQueue<T> {
     /// Create a new IO queue with given capacity.
     #[inline]
-    pub fn with_capacity(capacity: usize) -> Self {
+    pub(crate) fn with_capacity(capacity: usize) -> Self {
         IOQueue {
             reqs: VecDeque::with_capacity(capacity),
         }
@@ -238,30 +242,30 @@ impl<T> IOQueue<T> {
 
     /// Returns length of the queue.
     #[inline]
-    pub fn len(&self) -> usize {
+    pub(crate) fn len(&self) -> usize {
         self.reqs.len()
     }
 
     /// Returns whether the queue is empty.
     #[inline]
-    pub fn is_empty(&self) -> bool {
+    pub(crate) fn is_empty(&self) -> bool {
         self.len() == 0
     }
 
     #[inline]
-    pub fn drain_to(&mut self, n: usize) -> Vec<T> {
+    pub(crate) fn drain_to(&mut self, n: usize) -> Vec<T> {
         let count = n.min(self.reqs.len());
         self.reqs.drain(0..count).collect()
     }
 
     /// Checks consistency of this queue.
     #[inline]
-    pub fn consistent(&self) -> bool {
+    pub(crate) fn consistent(&self) -> bool {
         true
     }
 
     #[inline]
-    pub fn push(&mut self, req: T) {
+    pub(crate) fn push(&mut self, req: T) {
         self.reqs.push_back(req);
     }
 
@@ -276,13 +280,10 @@ impl<T> IOQueue<T> {
 /// The generic worker only prepares and submits the backend operation. Any
 /// domain identity or higher-level bookkeeping lives in the concrete
 /// submission and its owning state machine.
-pub trait IOSubmission {
+pub(crate) trait IOSubmission {
     /// Returns the backend-agnostic IO operation to prepare and submit.
     fn operation(&mut self) -> &mut Operation;
 }
-
-/// IOKey represents the unique key of any worker-owned IO request.
-pub type IOKey = u64;
 
 const INVALID_SLOT: u32 = u32::MAX;
 const DEFAULT_IO_EVENT_LOOP_BACKLOG: usize = 10;
@@ -396,7 +397,7 @@ struct InflightEntry<S, P> {
 
 /// IOStateMachine defines how one worker maps requests to submissions and
 /// applies completion-side state transitions.
-pub trait IOStateMachine {
+pub(crate) trait IOStateMachine {
     type Request;
     type Submission: IOSubmission;
 
@@ -429,7 +430,7 @@ pub trait IOStateMachine {
 ///
 /// The client only transports state-machine requests. It does not own any
 /// backend-specific submission state.
-pub struct IOClient<T>(Sender<IOMessage<T>>);
+pub(crate) struct IOClient<T>(Sender<IOMessage<T>>);
 
 impl<T> IOClient<T> {
     #[inline]
@@ -444,7 +445,7 @@ impl<T> IOClient<T> {
     /// workers stop once every lane has shut down and all queued, deferred,
     /// staged, and inflight work has drained.
     #[inline]
-    pub fn shutdown(&self) {
+    pub(crate) fn shutdown(&self) {
         // Someone might already sent shutdown message via the channel,
         // so we ignore send error.
         let _ = self.0.send(IOMessage::Shutdown);
@@ -452,24 +453,15 @@ impl<T> IOClient<T> {
 
     /// Send IO request to the IO worker.
     #[inline]
-    pub fn send(&self, req: T) -> StdResult<(), SendError<T>> {
+    pub(crate) fn send(&self, req: T) -> StdResult<(), SendError<T>> {
         self.0
             .send(IOMessage::Req(req))
             .map_err(|e| SendError(e.0.req().unwrap()))
     }
 
-    /// Try send IO request to the IO worker.
-    #[inline]
-    pub fn try_send(&self, req: T) -> StdResult<(), TrySendError<T>> {
-        self.0.try_send(IOMessage::Req(req)).map_err(|e| match e {
-            TrySendError::Full(v) => TrySendError::Full(v.req().unwrap()),
-            TrySendError::Disconnected(v) => TrySendError::Disconnected(v.req().unwrap()),
-        })
-    }
-
     /// Send IO request to the IO worker in async way.
     #[inline]
-    pub async fn send_async(&self, req: T) -> StdResult<(), SendError<T>> {
+    pub(crate) async fn send_async(&self, req: T) -> StdResult<(), SendError<T>> {
         self.0
             .send_async(IOMessage::Req(req))
             .await
@@ -488,7 +480,7 @@ impl<T> Clone for IOClient<T> {
 ///
 /// The builder fixes the backend and request channel first, then binds one
 /// concrete [`IOStateMachine`] later.
-pub struct IOWorkerBuilder<T, B = StorageBackend> {
+pub(crate) struct IOWorkerBuilder<T, B = StorageBackend> {
     backend: B,
     rx: Receiver<IOMessage<T>>,
 }
@@ -499,7 +491,7 @@ where
 {
     /// Attaches one state machine to this backend-bound worker builder.
     #[inline]
-    pub fn bind<S>(self, state_machine: S) -> IOWorker<T, S, B>
+    pub(crate) fn bind<S>(self, state_machine: S) -> IOWorker<T, S, B>
     where
         S: IOStateMachine<Request = T>,
     {
@@ -529,7 +521,7 @@ where
 ///
 /// Domain-level dedupe and same-key conflict policy remain inside the state
 /// machine and its owning subsystem.
-pub struct IOWorker<T, S: IOStateMachine<Request = T>, B: IOBackend = StorageBackend> {
+pub(crate) struct IOWorker<T, S: IOStateMachine<Request = T>, B: IOBackend = StorageBackend> {
     backend: B,
     rx: Receiver<IOMessage<T>>,
     deferred_req: Option<T>,
@@ -551,7 +543,7 @@ where
     B::SubmitBatch: Send + 'static,
 {
     /// Starts a dedicated thread that runs this worker until shutdown and drain.
-    pub fn start_thread(self) -> JoinHandle<()>
+    pub(crate) fn start_thread(self) -> JoinHandle<()>
     where
         S: Send + 'static,
         B: Send + 'static,

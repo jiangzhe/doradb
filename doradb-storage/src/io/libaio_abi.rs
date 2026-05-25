@@ -1,6 +1,7 @@
 use libc::{c_int, c_long, timespec};
 
-#[allow(non_camel_case_types)]
+#[expect(non_camel_case_types, reason = "ffi")]
+#[expect(dead_code, reason = "ffi")]
 pub enum io_iocb_cmd {
     IO_CMD_PREAD = 0,
     IO_CMD_PWRITE = 1,
@@ -14,7 +15,7 @@ pub enum io_iocb_cmd {
 }
 
 #[repr(C)]
-#[allow(non_camel_case_types)]
+#[cfg_attr(feature = "libaio", expect(dead_code, reason = "ffi"))]
 pub struct iovec {
     pub iov_base: *mut u8,
     pub iov_len: usize,
@@ -24,7 +25,6 @@ mod linux {
     use super::*;
 
     #[repr(C)]
-    #[allow(non_camel_case_types)]
     pub struct iocb {
         pub data: u64,
         pub key: u32,
@@ -91,7 +91,6 @@ mod linux {
 
     #[derive(Clone)]
     #[repr(C)]
-    #[allow(non_camel_case_types)]
     pub struct io_event {
         pub data: u64,
         pub obj: *mut iocb,
@@ -111,12 +110,13 @@ mod linux {
         }
     }
 
-    #[allow(non_camel_case_types)]
+    #[expect(non_camel_case_types, reason = "ffi")]
     pub enum io_context {}
 
-    #[allow(non_camel_case_types)]
+    #[expect(non_camel_case_types, reason = "ffi")]
     pub type io_context_t = *mut io_context;
 
+    #[expect(dead_code, reason = "ffi")]
     #[link(name = "aio")]
     unsafe extern "C" {
         pub fn io_queue_init(maxevents: c_int, ctxp: *mut io_context_t) -> c_int;

@@ -29,10 +29,9 @@ use crate::trx::{MIN_SNAPSHOT_TS, TrxID};
 use error_stack::{Report, ResultExt};
 use futures::future::try_join_all;
 use std::collections::BTreeSet;
-use std::mem;
 use std::sync::Arc;
 
-pub const TABLE_FILE_MAGIC_WORD: [u8; 8] = [b'D', b'O', b'R', b'A', 0, 0, 0, 0];
+pub(crate) const TABLE_FILE_MAGIC_WORD: [u8; 8] = [b'D', b'O', b'R', b'A', 0, 0, 0, 0];
 const TABLE_META_BLOCK_SPEC: BlockIntegritySpec =
     BlockIntegritySpec::new(TABLE_META_BLOCK_MAGIC_WORD, TABLE_META_BLOCK_VERSION);
 
@@ -76,45 +75,38 @@ fn column_block_index_invariant(message: impl Into<String>) -> Error {
 }
 
 /// Initial size of new table file.
-pub const TABLE_FILE_INITIAL_SIZE: usize = 16 * 1024 * 1024;
-/// Super block size of the table file is 32KB.
-pub const TABLE_FILE_SUPER_BLOCK_SIZE: usize = SUPER_BLOCK_SIZE;
-/// Super block header size.
-pub const TABLE_FILE_SUPER_BLOCK_HEADER_SIZE: usize = mem::size_of::<[u8; 8]>()
-    + mem::size_of::<u64>()
-    + mem::size_of::<BlockID>()
-    + mem::size_of::<TrxID>();
+pub(crate) const TABLE_FILE_INITIAL_SIZE: usize = 16 * 1024 * 1024;
 
 /// Table-specific metadata payload embedded in shared active root.
 ///
 /// These fields are persisted in table meta blocks and kept in memory through
 /// `ActiveRoot` for fast access on hot paths.
 #[derive(Clone)]
-pub struct TableMeta {
+pub(crate) struct TableMeta {
     /// Metadata of this table.
-    pub metadata: Arc<TableMetadata>,
+    pub(crate) metadata: Arc<TableMetadata>,
     /// Root block id of column block index.
-    pub column_block_index_root: BlockID,
+    pub(crate) column_block_index_root: BlockID,
     /// Root block ids of secondary DiskTrees, ordered by index number.
-    pub secondary_index_roots: Vec<BlockID>,
+    pub(crate) secondary_index_roots: Vec<BlockID>,
     /// Upper bound of row id in this file.
-    pub pivot_row_id: RowID,
+    pub(crate) pivot_row_id: RowID,
     /// Redo log start point for in-memory heap.
-    pub heap_redo_start_ts: TrxID,
+    pub(crate) heap_redo_start_ts: TrxID,
     /// Redo log start point for cold-row deletions.
-    pub deletion_cutoff_ts: TrxID,
+    pub(crate) deletion_cutoff_ts: TrxID,
 }
 
 /// Active root type of table files.
 ///
 /// This combines generic CoW root state with [`TableMeta`].
-pub type ActiveRoot = GenericActiveRoot<TableMeta>;
+pub(crate) type ActiveRoot = GenericActiveRoot<TableMeta>;
 
 impl ActiveRoot {
     /// Create a new active root.
     /// Slot number is set to zero (the first super-block slot of this file).
     #[inline]
-    pub fn new(trx_id: TrxID, max_pages: usize, metadata: Arc<TableMetadata>) -> Self {
+    pub(crate) fn new(trx_id: TrxID, max_pages: usize, metadata: Arc<TableMetadata>) -> Self {
         let alloc_map = AllocMap::new(max_pages);
         let super_block_allocated = alloc_map.allocate_at(usize::from(SUPER_BLOCK_ID));
         assert!(super_block_allocated);
@@ -138,7 +130,7 @@ impl ActiveRoot {
 
     /// Build super-block serialization view for the current active root.
     #[inline]
-    pub fn super_block_ser_view(&self) -> SuperBlockSerView {
+    pub(crate) fn super_block_ser_view(&self) -> SuperBlockSerView {
         SuperBlockSerView {
             header: SuperBlockHeader {
                 magic_word: TABLE_FILE_MAGIC_WORD,
@@ -154,7 +146,7 @@ impl ActiveRoot {
 
     /// Build meta-block serialization view for the current active root.
     #[inline]
-    pub fn meta_block_ser_view(&self) -> Result<MetaBlockSerView<'_>> {
+    pub(crate) fn meta_block_ser_view(&self) -> Result<MetaBlockSerView<'_>> {
         MetaBlockSerView::new(
             self.metadata.ser_view(),
             self.column_block_index_root,
@@ -271,7 +263,7 @@ fn table_codec() -> CowCodec<TableMeta> {
 }
 
 /// Table-file facade over generic copy-on-write file mechanics.
-pub struct TableFile {
+pub(crate) struct TableFile {
     file: CowFile<TableMeta>,
 }
 
@@ -303,7 +295,7 @@ impl TableFile {
 
     /// Load the active root after validating the selected table meta block through readonly cache.
     #[inline]
-    pub async fn load_active_root_from_pool(
+    pub(crate) async fn load_active_root_from_pool(
         &self,
         disk_pool: &QuiescentGuard<ReadonlyBufferPool>,
     ) -> Result<ActiveRoot> {
@@ -321,7 +313,7 @@ impl TableFile {
     /// related fields from one logical checkpoint root must bind one local
     /// reference and reuse it.
     #[inline]
-    pub fn active_root_unchecked(&self) -> &ActiveRoot {
+    pub(crate) fn active_root_unchecked(&self) -> &ActiveRoot {
         self.file.active_root_unchecked()
     }
 
@@ -372,7 +364,7 @@ impl MutableWriterFile for TableFile {
 /// because the modification is done in Copy-on-Write way.
 /// All changes will be committed once the new active root
 /// is persisted to disk.
-pub struct MutableTableFile {
+pub(crate) struct MutableTableFile {
     pub(super) file: Arc<TableFile>,
     pub(super) new_root: MutableCowRoot<TableMeta>,
     background_writes: IOClient<BackgroundWriteRequest>,
@@ -420,25 +412,25 @@ impl MutableTableFile {
 
     /// Returns immutable reference to mutable root snapshot.
     #[inline]
-    pub fn root(&self) -> &ActiveRoot {
+    pub(crate) fn root(&self) -> &ActiveRoot {
         &self.new_root.root
     }
 
     /// Updates mutable root column-index pointer.
     #[inline]
-    pub fn set_column_block_index_root(&mut self, root_block_id: BlockID) {
+    pub(crate) fn set_column_block_index_root(&mut self, root_block_id: BlockID) {
         self.new_root.root.column_block_index_root = root_block_id;
     }
 
     /// Returns mutable-root secondary DiskTree roots ordered by index number.
     #[inline]
-    pub fn secondary_index_roots(&self) -> &[BlockID] {
+    pub(crate) fn secondary_index_roots(&self) -> &[BlockID] {
         &self.root().secondary_index_roots
     }
 
     /// Returns one mutable-root secondary DiskTree root by index number.
     #[inline]
-    pub fn secondary_index_root(&self, index_no: usize) -> Result<BlockID> {
+    pub(crate) fn secondary_index_root(&self, index_no: usize) -> Result<BlockID> {
         self.root()
             .secondary_index_roots
             .get(index_no)
@@ -450,7 +442,7 @@ impl MutableTableFile {
 
     /// Updates one mutable-root secondary DiskTree root by index number.
     #[inline]
-    pub fn set_secondary_index_root(
+    pub(crate) fn set_secondary_index_root(
         &mut self,
         index_no: usize,
         root_block_id: BlockID,
@@ -464,25 +456,8 @@ impl MutableTableFile {
         Ok(())
     }
 
-    /// Replaces all mutable-root secondary DiskTree roots.
-    #[inline]
-    pub fn set_secondary_index_roots(&mut self, roots: Vec<BlockID>) -> Result<()> {
-        if roots.len() != self.root().metadata.idx.index_slot_count() {
-            return Err(secondary_index_root_count_mismatch(
-                roots.len(),
-                self.root().metadata.idx.index_slot_count(),
-            ));
-        }
-        self.new_root.root.secondary_index_roots = roots;
-        Ok(())
-    }
-
     /// Replaces table metadata and the matching sparse secondary-root slots.
     #[inline]
-    #[allow(
-        dead_code,
-        reason = "future index DDL uses this root-metadata mutation boundary"
-    )]
     pub(crate) fn replace_metadata_and_secondary_index_roots(
         &mut self,
         metadata: Arc<TableMetadata>,
@@ -507,7 +482,7 @@ impl MutableTableFile {
 
     /// Updates mutable root checkpoint metadata.
     #[inline]
-    pub fn apply_checkpoint_metadata(
+    pub(crate) fn apply_checkpoint_metadata(
         &mut self,
         pivot_row_id: RowID,
         heap_redo_start_ts: TrxID,
@@ -526,23 +501,11 @@ impl MutableTableFile {
 
     /// Advances mutable root cold-delete replay watermark without regressing it.
     #[inline]
-    pub fn advance_deletion_cutoff_ts(&mut self, deletion_cutoff_ts: TrxID) {
+    pub(crate) fn advance_deletion_cutoff_ts(&mut self, deletion_cutoff_ts: TrxID) {
         let root = &mut self.new_root.root;
         if deletion_cutoff_ts > root.deletion_cutoff_ts {
             root.deletion_cutoff_ts = deletion_cutoff_ts;
         }
-    }
-
-    /// Allocate a new block id for copy-on-write updates.
-    #[inline]
-    pub fn allocate_block(&mut self) -> Result<BlockID> {
-        allocate_cow_block(&mut self.new_root, "table file could not allocate block")
-    }
-
-    /// Roll back a block id allocated by this unpublished mutable root.
-    #[inline]
-    pub fn rollback_allocated_block(&mut self, block_id: BlockID) -> Result<()> {
-        self.new_root.rollback_allocated_block(block_id)
     }
 
     /// Rebuild the mutable root allocation map from root-reachable blocks.
@@ -556,24 +519,11 @@ impl MutableTableFile {
         self.new_root.rebuild_alloc_map_from_reachable(reachable)
     }
 
-    /// Write one page into the underlying table file.
-    #[inline]
-    pub async fn write_block(&self, block_id: BlockID, buf: DirectBuf) -> Result<()> {
-        let write_lease = self
-            .write_barrier
-            .as_cow_write_barrier()
-            .begin_write(self.file.sparse_file().file_id(), block_id)?;
-        self.file
-            .file()
-            .write_block_with_lease(&self.background_writes, block_id, buf, write_lease)
-            .await
-    }
-
     /// Commit the modification of table file.
     /// Returns the new table file and previous
     /// active root if exists.
     #[inline]
-    pub async fn commit(
+    pub(crate) async fn commit(
         self,
         trx_id: TrxID,
         try_delete_if_fail: bool,
@@ -674,7 +624,7 @@ impl MutableTableFile {
     }
 
     #[inline]
-    pub fn try_delete(self) -> bool {
+    pub(crate) fn try_delete(self) -> bool {
         let MutableTableFile {
             file: table_file,
             write_barrier: _write_barrier,
@@ -693,21 +643,24 @@ impl MutableTableFile {
 impl MutableCowFile for MutableTableFile {
     #[inline]
     fn allocate_block(&mut self) -> Result<BlockID> {
-        MutableTableFile::allocate_block(self)
+        allocate_cow_block(&mut self.new_root, "table file could not allocate block")
     }
 
     #[inline]
     fn rollback_allocated_block(&mut self, block_id: BlockID) -> Result<()> {
-        MutableTableFile::rollback_allocated_block(self, block_id)
+        self.new_root.rollback_allocated_block(block_id)
     }
 
     #[inline]
-    fn write_block(
-        &self,
-        block_id: BlockID,
-        buf: DirectBuf,
-    ) -> impl std::future::Future<Output = Result<()>> + Send {
-        MutableTableFile::write_block(self, block_id, buf)
+    async fn write_block(&self, block_id: BlockID, buf: DirectBuf) -> Result<()> {
+        let write_lease = self
+            .write_barrier
+            .as_cow_write_barrier()
+            .begin_write(self.file.sparse_file().file_id(), block_id)?;
+        self.file
+            .file()
+            .write_block_with_lease(&self.background_writes, block_id, buf, write_lease)
+            .await
     }
 }
 
@@ -727,7 +680,7 @@ impl MutableTableWriteBarrier {
 }
 
 /// One LWC block payload that should be persisted into table-file blocks.
-pub struct LwcBlockPersist {
+pub(crate) struct LwcBlockPersist {
     /// Phase-1 logical index-entry shape for this block before block-id assignment.
     pub shape: ColumnBlockEntryShape,
     /// Serialized LWC block bytes.
@@ -737,7 +690,7 @@ pub struct LwcBlockPersist {
 /// Guard object of swapped table-file roots.
 ///
 /// Dropping this guard reclaims the replaced active-root pointer.
-pub type OldRoot = OldCowRoot<TableMeta>;
+pub(crate) type OldRoot = OldCowRoot<TableMeta>;
 
 #[cfg(test)]
 mod tests {
@@ -794,13 +747,16 @@ mod tests {
         smol::block_on(async {
             let (_temp_dir, fs) = build_test_fs();
             let background_writes = fs.background_writes();
-            let metadata = Arc::new(TableMetadata::new(
-                vec![
-                    ColumnSpec::new("c0", ValKind::U32, ColumnAttributes::empty()),
-                    ColumnSpec::new("c1", ValKind::U64, ColumnAttributes::NULLABLE),
-                ],
-                vec![IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::PK)],
-            ));
+            let metadata = Arc::new(
+                TableMetadata::try_new(
+                    vec![
+                        ColumnSpec::new("c0", ValKind::U32, ColumnAttributes::empty()),
+                        ColumnSpec::new("c1", ValKind::U64, ColumnAttributes::NULLABLE),
+                    ],
+                    vec![IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::PK)],
+                )
+                .expect("valid table metadata"),
+            );
             let table_id = test_user_table_id(41);
             let table_file = fs.create_table_file(table_id, metadata, false).unwrap();
             let (table_file, old_root) = table_file.commit(1, false).await.unwrap();
@@ -815,7 +771,9 @@ mod tests {
             // write
             let mut buf = DirectBuf::zeroed(COW_FILE_PAGE_SIZE);
             buf.reset();
-            buf.extend_from_slice(b"hello, world");
+            let data = b"hello, world";
+            buf.truncate(data.len());
+            buf.data_mut().copy_from_slice(data);
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
             let test_disk_pool = table_readonly_pool(&global, table_id, &table_file);
             let mutable = MutableTableFile::fork(
@@ -843,8 +801,12 @@ mod tests {
             let secondary_root = mutable.allocate_block().unwrap();
             mutable.set_secondary_index_root(0, secondary_root).unwrap();
             assert_eq!(mutable.secondary_index_root(0).unwrap(), secondary_root);
+            let metadata = Arc::clone(&mutable.root().metadata);
             let err = mutable
-                .set_secondary_index_roots(vec![SUPER_BLOCK_ID, secondary_root])
+                .replace_metadata_and_secondary_index_roots(
+                    metadata,
+                    vec![SUPER_BLOCK_ID, secondary_root],
+                )
                 .unwrap_err();
             assert!(err.is_kind(crate::error::ErrorKind::Internal));
             assert_eq!(
@@ -1115,13 +1077,16 @@ mod tests {
     fn test_table_file_system() {
         smol::block_on(async {
             let (_temp_dir, fs) = build_test_fs();
-            let metadata = Arc::new(TableMetadata::new(
-                vec![
-                    ColumnSpec::new("c0", ValKind::U32, ColumnAttributes::empty()),
-                    ColumnSpec::new("c1", ValKind::U64, ColumnAttributes::NULLABLE),
-                ],
-                vec![IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::PK)],
-            ));
+            let metadata = Arc::new(
+                TableMetadata::try_new(
+                    vec![
+                        ColumnSpec::new("c0", ValKind::U32, ColumnAttributes::empty()),
+                        ColumnSpec::new("c1", ValKind::U64, ColumnAttributes::NULLABLE),
+                    ],
+                    vec![IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::PK)],
+                )
+                .expect("valid table metadata"),
+            );
             let table_id = test_user_table_id(42);
             let table_file = fs.create_table_file(table_id, metadata, false).unwrap();
             let (table_file, old_root) = table_file.commit(1, false).await.unwrap();
@@ -1160,13 +1125,16 @@ mod tests {
     }
 
     fn build_test_metadata() -> Arc<TableMetadata> {
-        Arc::new(TableMetadata::new(
-            vec![
-                ColumnSpec::new("c0", ValKind::U32, ColumnAttributes::empty()),
-                ColumnSpec::new("c1", ValKind::U64, ColumnAttributes::NULLABLE),
-            ],
-            vec![IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::PK)],
-        ))
+        Arc::new(
+            TableMetadata::try_new(
+                vec![
+                    ColumnSpec::new("c0", ValKind::U32, ColumnAttributes::empty()),
+                    ColumnSpec::new("c1", ValKind::U64, ColumnAttributes::NULLABLE),
+                ],
+                vec![IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::PK)],
+            )
+            .expect("valid table metadata"),
+        )
     }
 
     fn page_buf(payload: &[u8]) -> DirectBuf {

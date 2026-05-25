@@ -20,7 +20,7 @@ pub(super) struct MutexGroupCommit {
 impl MutexGroupCommit {
     /// Create a new group commit with mutex and condition variable.
     #[inline]
-    pub fn new(group_commit: GroupCommit) -> Self {
+    pub(super) fn new(group_commit: GroupCommit) -> Self {
         MutexGroupCommit {
             mu: Mutex::new(group_commit),
             cv: Condvar::new(),
@@ -30,19 +30,19 @@ impl MutexGroupCommit {
     /// Acquire lock.
     /// Return lock guard of group commit.
     #[inline]
-    pub fn lock(&self) -> MutexGuard<'_, GroupCommit> {
+    pub(super) fn lock(&self) -> MutexGuard<'_, GroupCommit> {
         self.mu.lock()
     }
 
     /// Notify one waiter.
     #[inline]
-    pub fn notify_one(&self) -> bool {
+    pub(super) fn notify_one(&self) -> bool {
         self.cv.notify_one()
     }
 
     /// Wait on conditional variable with timeout.
     #[inline]
-    pub fn wait_for(
+    pub(super) fn wait_for(
         &self,
         g: &mut MutexGuard<GroupCommit>,
         timeout: Duration,

@@ -3,11 +3,11 @@ use std::ops::Deref;
 
 /// Wrapper on event to notify all waiters when being dropped.
 #[repr(transparent)]
-pub struct EventNotifyOnDrop(Event);
+pub(crate) struct EventNotifyOnDrop(Event);
 
 impl EventNotifyOnDrop {
     #[inline]
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         EventNotifyOnDrop(Event::new())
     }
 }

@@ -8,30 +8,31 @@ use crate::trx::TrxID;
 
 /// Buffer of index undo entries accumulated for rollback and GC handoff.
 #[derive(Default)]
-pub struct IndexUndoLogs(Vec<IndexUndo>);
+pub(crate) struct IndexUndoLogs(Vec<IndexUndo>);
 
 impl IndexUndoLogs {
     /// Create an empty index undo buffer.
     #[inline]
-    pub fn empty() -> Self {
+    pub(crate) fn empty() -> Self {
         IndexUndoLogs(vec![])
     }
 
     /// Returns whether the index undo buffer is empty.
     #[inline]
-    pub fn is_empty(&self) -> bool {
+    pub(crate) fn is_empty(&self) -> bool {
         self.0.is_empty()
     }
 
     /// Returns count of index undo logs.
     #[inline]
-    pub fn len(&self) -> usize {
+    #[cfg_attr(not(test), expect(dead_code, reason = "reserved len"))]
+    pub(crate) fn len(&self) -> usize {
         self.0.len()
     }
 
     /// Add a new index undo log at end of the buffer.
     #[inline]
-    pub fn push(&mut self, value: IndexUndo) {
+    pub(crate) fn push(&mut self, value: IndexUndo) {
         self.0.push(value);
     }
 
@@ -41,7 +42,7 @@ impl IndexUndoLogs {
     /// because other transaction can not update the same index entry
     /// concurrently.
     #[inline]
-    pub async fn rollback(
+    pub(crate) async fn rollback(
         &mut self,
         table_cache: &mut TableCache<'_>,
         guards: &PoolGuards,
@@ -63,7 +64,7 @@ impl IndexUndoLogs {
     /// This is used when a statement succeeds, and statement-level index undo buffer
     /// should be merged into transaction-level index undo buffer.
     #[inline]
-    pub fn merge(&mut self, other: &mut Self) {
+    pub(crate) fn merge(&mut self, other: &mut Self) {
         self.0.append(&mut other.0);
     }
 
@@ -72,7 +73,7 @@ impl IndexUndoLogs {
     /// And to support MVCC, index deletion is delayed to GC phase.
     /// So here we should only keep potential index deletions.
     #[inline]
-    pub fn commit_for_gc(&mut self) -> Vec<IndexPurgeEntry> {
+    pub(in crate::trx) fn commit_for_gc(&mut self) -> Vec<IndexPurgeEntry> {
         self.0
             .drain(..)
             .filter_map(|entry| match entry.kind {
@@ -91,15 +92,15 @@ impl IndexUndoLogs {
 }
 
 /// One reversible index change recorded for rollback.
-pub struct IndexUndo {
-    pub table_id: TableID,
+pub(crate) struct IndexUndo {
+    pub(crate) table_id: TableID,
     // The new row id of index change.
-    pub row_id: RowID,
-    pub kind: IndexUndoKind,
+    pub(crate) row_id: RowID,
+    pub(crate) kind: IndexUndoKind,
 }
 
 /// Kinds of index changes that can be rolled back.
-pub enum IndexUndoKind {
+pub(crate) enum IndexUndoKind {
     /// Insert unique key, merge flag(if overwrite delete flag)
     InsertUnique(SelectKey, bool),
     /// Insert non-unique key, merge flag(if overwrite delete flag).
@@ -116,11 +117,11 @@ pub enum IndexUndoKind {
 }
 
 /// Index entry scheduled for deferred GC-time deletion.
-pub struct IndexPurgeEntry {
-    pub table_id: TableID,
-    pub row_id: RowID,
-    pub key: SelectKey,
-    pub unique: bool,
+pub(in crate::trx) struct IndexPurgeEntry {
+    pub(in crate::trx) table_id: TableID,
+    pub(in crate::trx) row_id: RowID,
+    pub(in crate::trx) key: SelectKey,
+    pub(in crate::trx) unique: bool,
 }
 
 #[cfg(test)]

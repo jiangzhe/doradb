@@ -3,7 +3,7 @@ use crate::error::{ConfigError, Error, InternalError, OperationError, Result};
 use crate::lock::{
     FreshLockGuard, LockGrant, LockManager, LockMode, LockOwner, LockOwnerGroup, LockResource,
 };
-use crate::row::ops::{SelectKey, UpdateCol};
+use crate::row::ops::SelectKey;
 use crate::row::{Row, RowRead};
 use crate::serde::{Deser, Ser, Serde};
 use crate::value::{Val, ValKind, ValType};
@@ -158,7 +158,7 @@ impl Drop for ScopedTableDdlLocks<'_> {
 
 /// Sparse secondary-index metadata slots keyed by stable table-local index number.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct IndexSpecs {
+pub(crate) struct IndexSpecs {
     slots: Vec<Option<IndexSpec>>,
     active_count: usize,
 }
@@ -196,25 +196,25 @@ impl IndexSpecs {
 
     /// Returns the sparse slot count, equal to table metadata `next_index_no`.
     #[inline]
-    pub fn len(&self) -> usize {
+    pub(crate) fn len(&self) -> usize {
         self.slots.len()
     }
 
     /// Returns whether there are no active secondary indexes.
     #[inline]
-    pub fn is_empty(&self) -> bool {
+    pub(crate) fn is_empty(&self) -> bool {
         self.active_count == 0
     }
 
     /// Returns the number of active secondary indexes.
     #[inline]
-    pub fn active_count(&self) -> usize {
+    pub(crate) fn active_count(&self) -> usize {
         self.active_count
     }
 
     /// Returns active secondary indexes with their stable slot numbers.
     #[inline]
-    pub fn active_indexes(&self) -> impl Iterator<Item = (usize, &IndexSpec)> {
+    pub(crate) fn active_indexes(&self) -> impl Iterator<Item = (usize, &IndexSpec)> {
         self.slots
             .iter()
             .enumerate()
@@ -223,13 +223,13 @@ impl IndexSpecs {
 
     /// Returns active secondary-index specs only.
     #[inline]
-    pub fn values(&self) -> impl Iterator<Item = &IndexSpec> {
+    pub(crate) fn values(&self) -> impl Iterator<Item = &IndexSpec> {
         self.slots.iter().filter_map(Option::as_ref)
     }
 
     /// Returns one active secondary-index spec by stable slot number.
     #[inline]
-    pub fn get(&self, index_no: usize) -> Option<&IndexSpec> {
+    pub(crate) fn get(&self, index_no: usize) -> Option<&IndexSpec> {
         self.slots.get(index_no).and_then(Option::as_ref)
     }
 }
@@ -251,7 +251,7 @@ impl Index<usize> for IndexSpecs {
 /// Immutable physical column layout used to interpret row pages, LWC blocks,
 /// and undo row bytes.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TableColumnLayout {
+pub(crate) struct TableColumnLayout {
     pub(crate) col_names: Vec<SemiStr>,
     pub(crate) col_types: Vec<ValType>,
     pub(crate) col_attrs: Vec<ColumnAttributes>,
@@ -267,15 +267,9 @@ pub struct TableColumnLayout {
 }
 
 impl TableColumnLayout {
-    /// Create a physical column layout from column specifications.
-    #[inline]
-    pub fn new(column_specs: Vec<ColumnSpec>) -> Self {
-        Self::try_new(column_specs).expect("valid table column layout")
-    }
-
     /// Try to create a physical column layout from column specifications.
     #[inline]
-    pub fn try_new(column_specs: Vec<ColumnSpec>) -> Result<Self> {
+    pub(crate) fn try_new(column_specs: Vec<ColumnSpec>) -> Result<Self> {
         if column_specs.is_empty() {
             return Err(invalid_table_metadata(
                 "table column layout requires columns",
@@ -350,80 +344,80 @@ impl TableColumnLayout {
 
     /// Returns column count of this layout.
     #[inline]
-    pub fn col_count(&self) -> usize {
+    pub(crate) fn col_count(&self) -> usize {
         self.col_types.len()
     }
 
     /// Returns layouts of all columns.
     #[inline]
-    pub fn col_types(&self) -> &[ValType] {
+    pub(crate) fn col_types(&self) -> &[ValType] {
         &self.col_types
     }
 
     /// Returns column type of given position.
     #[inline]
-    pub fn col_type(&self, col_idx: usize) -> ValType {
+    pub(crate) fn col_type(&self, col_idx: usize) -> ValType {
         self.col_types[col_idx]
     }
 
     /// Returns value kind of given column.
     #[inline]
-    pub fn val_kind(&self, col_idx: usize) -> ValKind {
+    pub(crate) fn val_kind(&self, col_idx: usize) -> ValKind {
         self.col_type(col_idx).kind
     }
 
     /// Returns whether the given column is nullable.
     #[inline]
-    pub fn nullable(&self, col_idx: usize) -> bool {
+    pub(crate) fn nullable(&self, col_idx: usize) -> bool {
         self.col_type(col_idx).nullable
     }
 
     /// Returns whether the type is matched at given column index.
     #[inline]
-    pub fn col_type_match(&self, col_idx: usize, val: &Val) -> bool {
+    pub(crate) fn col_type_match(&self, col_idx: usize, val: &Val) -> bool {
         val.matches_kind(self.col_type(col_idx).kind)
     }
 
     /// Returns current column offset, compared to all nullable columns.
     #[inline]
-    pub fn null_offset(&self, col_idx: usize) -> usize {
+    pub(crate) fn null_offset(&self, col_idx: usize) -> usize {
         self.null_scan_sums[col_idx]
     }
 
     /// Returns column names in physical order.
     #[inline]
-    pub fn col_names(&self) -> &[SemiStr] {
+    pub(crate) fn col_names(&self) -> &[SemiStr] {
         &self.col_names
     }
 
     /// Returns column attributes in physical order.
     #[inline]
-    pub fn col_attrs(&self) -> &[ColumnAttributes] {
+    pub(crate) fn col_attrs(&self) -> &[ColumnAttributes] {
         &self.col_attrs
     }
 
     /// Returns variable-length column positions.
     #[inline]
-    pub fn var_cols(&self) -> &[usize] {
+    pub(crate) fn var_cols(&self) -> &[usize] {
         &self.var_cols
     }
 
     /// Returns the total inline length of one logical row.
     #[inline]
-    pub fn fix_len(&self) -> usize {
+    pub(crate) fn fix_len(&self) -> usize {
         self.fix_len
     }
 
     /// Returns the number of nullable columns.
     #[inline]
-    pub fn nullable_col_count(&self) -> usize {
+    pub(crate) fn nullable_col_count(&self) -> usize {
         self.nullable_cols
     }
 }
 
 /// Immutable sparse secondary-index layout for one table metadata envelope.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TableIndexLayout {
+pub(crate) struct TableIndexLayout {
     // next table-local index number to allocate.
     next_index_no: IndexNo,
     // secondary index slots keyed by stable table-local index number.
@@ -456,7 +450,7 @@ impl TableIndexLayout {
 
     /// Returns the next table-local index number to allocate.
     #[inline]
-    pub fn next_index_no(&self) -> IndexNo {
+    pub(crate) fn next_index_no(&self) -> IndexNo {
         self.next_index_no
     }
 
@@ -515,31 +509,31 @@ impl TableIndexLayout {
 
     /// Returns the sparse secondary-index slot count.
     #[inline]
-    pub fn index_slot_count(&self) -> usize {
+    pub(crate) fn index_slot_count(&self) -> usize {
         self.next_index_no as usize
     }
 
     /// Returns the active secondary-index count.
     #[inline]
-    pub fn active_index_count(&self) -> usize {
+    pub(crate) fn active_index_count(&self) -> usize {
         self.index_specs.active_count()
     }
 
     /// Returns active secondary indexes with their stable slot numbers.
     #[inline]
-    pub fn active_indexes(&self) -> impl Iterator<Item = (usize, &IndexSpec)> {
+    pub(crate) fn active_indexes(&self) -> impl Iterator<Item = (usize, &IndexSpec)> {
         self.index_specs.active_indexes()
     }
 
     /// Returns one active secondary-index spec by stable index number.
     #[inline]
-    pub fn index_spec(&self, index_no: usize) -> Option<&IndexSpec> {
+    pub(crate) fn index_spec(&self, index_no: usize) -> Option<&IndexSpec> {
         self.index_specs.get(index_no)
     }
 
     /// Requires one active secondary-index spec by stable index number.
     #[inline]
-    pub fn require_index_spec(&self, index_no: usize) -> Result<&IndexSpec> {
+    pub(crate) fn require_index_spec(&self, index_no: usize) -> Result<&IndexSpec> {
         self.index_spec(index_no).ok_or_else(|| {
             Report::new(InternalError::SecondaryIndexOutOfBounds)
                 .attach(format!(
@@ -552,19 +546,19 @@ impl TableIndexLayout {
 
     /// Returns the sparse secondary-index specs.
     #[inline]
-    pub fn index_specs(&self) -> &IndexSpecs {
+    pub(crate) fn index_specs(&self) -> &IndexSpecs {
         &self.index_specs
     }
 
     /// Returns columns included in any active secondary index.
     #[inline]
-    pub fn index_columns(&self) -> &HashSet<usize> {
+    pub(crate) fn index_columns(&self) -> &HashSet<usize> {
         &self.index_cols
     }
 
     /// Returns whether input values matches given index.
     #[inline]
-    pub fn index_type_match(
+    pub(crate) fn index_type_match(
         &self,
         column_layout: &TableColumnLayout,
         index_no: usize,
@@ -586,7 +580,7 @@ impl TableIndexLayout {
 
     /// Returns index keys of a new row.
     #[inline]
-    pub fn keys_for_insert(&self, row: &[Val]) -> Vec<SelectKey> {
+    pub(crate) fn keys_for_insert(&self, row: &[Val]) -> Vec<SelectKey> {
         self.active_indexes()
             .map(|(index_no, is)| {
                 let vals: Vec<Val> = is
@@ -601,7 +595,7 @@ impl TableIndexLayout {
 
     /// Returns index keys of deletion of a row.
     #[inline]
-    pub fn keys_for_delete(
+    pub(crate) fn keys_for_delete(
         &self,
         column_layout: &TableColumnLayout,
         row: Row<'_>,
@@ -618,15 +612,9 @@ impl TableIndexLayout {
             .collect()
     }
 
-    /// Returns whether index may change according to given update columns.
-    #[inline]
-    pub fn index_may_change(&self, update: &[UpdateCol]) -> bool {
-        update.iter().any(|uc| self.index_cols.contains(&uc.idx))
-    }
-
     /// Returns whether key matches given row.
     #[inline]
-    pub fn match_key(&self, key: &SelectKey, row: &[Val]) -> bool {
+    pub(crate) fn match_key(&self, key: &SelectKey, row: &[Val]) -> bool {
         let Some(keys) = self.index_spec(key.index_no).map(|spec| &spec.cols) else {
             return false;
         };
@@ -640,22 +628,18 @@ impl TableIndexLayout {
 /// Table metadata including column layout and index layout.
 /// Constraints and other advanced configurations are not implemented.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TableMetadata {
+pub(crate) struct TableMetadata {
     pub(crate) col: Arc<TableColumnLayout>,
     pub(crate) idx: TableIndexLayout,
 }
 
 impl TableMetadata {
-    /// Create metadata of a new table.
-    /// RowID is not included.
-    #[inline]
-    pub fn new(column_specs: Vec<ColumnSpec>, index_specs: Vec<IndexSpec>) -> Self {
-        Self::try_new(column_specs, index_specs).expect("valid table metadata")
-    }
-
     /// Try to create metadata of a new table.
     #[inline]
-    pub fn try_new(column_specs: Vec<ColumnSpec>, index_specs: Vec<IndexSpec>) -> Result<Self> {
+    pub(crate) fn try_new(
+        column_specs: Vec<ColumnSpec>,
+        index_specs: Vec<IndexSpec>,
+    ) -> Result<Self> {
         let next_index_no = IndexNo::try_from(index_specs.len()).map_err(|_| {
             invalid_table_metadata("next_index_no overflow while deriving table metadata")
         })?;
@@ -675,7 +659,7 @@ impl TableMetadata {
 
     /// Try to create metadata with an explicit durable next index number.
     #[inline]
-    pub fn try_new_with_next_index_no(
+    pub(crate) fn try_new_with_next_index_no(
         column_specs: Vec<ColumnSpec>,
         index_specs: Vec<ActiveIndexSpec>,
         next_index_no: IndexNo,
@@ -711,7 +695,7 @@ impl TableMetadata {
     /// Allocates the next table-local index number and returns metadata with
     /// the new active index appended in the corresponding sparse slot.
     #[inline]
-    pub fn try_with_created_index(&self, index_spec: IndexSpec) -> Result<(IndexNo, Self)> {
+    pub(crate) fn try_with_created_index(&self, index_spec: IndexSpec) -> Result<(IndexNo, Self)> {
         let (index_no, index_layout) = self.idx.try_with_created_index(&self.col, index_spec)?;
         let metadata = Self {
             col: Arc::clone(&self.col),
@@ -746,7 +730,7 @@ impl TableMetadata {
 
     /// Create a view for serialization.
     #[inline]
-    pub fn ser_view(&self) -> TableBriefMetadataSerView<'_> {
+    pub(crate) fn ser_view(&self) -> TableBriefMetadataSerView<'_> {
         TableBriefMetadataSerView {
             col_names: self.col.col_names(),
             col_types: self.col.col_types(),
@@ -775,12 +759,12 @@ impl TryFrom<TableBriefMetadata> for TableMetadata {
 /// View of necessary information to recover table
 /// metadata.
 /// It's used for serialization.
-pub struct TableBriefMetadataSerView<'a> {
-    pub col_names: &'a [SemiStr],
-    pub col_types: &'a [ValType],
-    pub col_attrs: &'a [ColumnAttributes],
-    pub next_index_no: IndexNo,
-    pub index_specs: &'a IndexSpecs,
+pub(crate) struct TableBriefMetadataSerView<'a> {
+    pub(crate) col_names: &'a [SemiStr],
+    pub(crate) col_types: &'a [ValType],
+    pub(crate) col_attrs: &'a [ColumnAttributes],
+    pub(crate) next_index_no: IndexNo,
+    pub(crate) index_specs: &'a IndexSpecs,
 }
 
 impl<'a> Ser<'a> for TableBriefMetadataSerView<'a> {
@@ -816,12 +800,12 @@ impl<'a> Ser<'a> for TableBriefMetadataSerView<'a> {
 /// Brief metadata of a table.
 /// It's used as a deserialization container.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TableBriefMetadata {
-    pub col_names: Vec<SemiStr>,
-    pub col_types: Vec<ValType>,
-    pub col_attrs: Vec<ColumnAttributes>,
-    pub next_index_no: IndexNo,
-    pub index_specs: Vec<ActiveIndexSpec>,
+pub(crate) struct TableBriefMetadata {
+    pub(crate) col_names: Vec<SemiStr>,
+    pub(crate) col_types: Vec<ValType>,
+    pub(crate) col_attrs: Vec<ColumnAttributes>,
+    pub(crate) next_index_no: IndexNo,
+    pub(crate) index_specs: Vec<ActiveIndexSpec>,
 }
 
 impl Deser for TableBriefMetadata {
@@ -861,13 +845,14 @@ mod tests {
 
     #[test]
     fn test_table_metadata_serde() {
-        let metadata = TableMetadata::new(
+        let metadata = TableMetadata::try_new(
             vec![
                 ColumnSpec::new("c0", ValKind::U32, ColumnAttributes::empty()),
                 ColumnSpec::new("c1", ValKind::U64, ColumnAttributes::NULLABLE),
             ],
             vec![IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::PK)],
-        );
+        )
+        .expect("valid table metadata");
 
         let ser_view = metadata.ser_view();
 
@@ -893,7 +878,7 @@ mod tests {
 
     #[test]
     fn test_table_metadata_dense_indexes_derive_next_index_no() {
-        let metadata = TableMetadata::new(
+        let metadata = TableMetadata::try_new(
             vec![
                 ColumnSpec::new("c0", ValKind::U32, ColumnAttributes::empty()),
                 ColumnSpec::new("c1", ValKind::U64, ColumnAttributes::empty()),
@@ -902,7 +887,8 @@ mod tests {
                 IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::PK),
                 IndexSpec::new(vec![IndexKey::new(1)], IndexAttributes::empty()),
             ],
-        );
+        )
+        .expect("valid table metadata");
         assert_eq!(metadata.idx.next_index_no(), 2);
         assert_eq!(metadata.idx.index_slot_count(), 2);
         assert_eq!(metadata.idx.active_index_count(), 2);
@@ -910,13 +896,14 @@ mod tests {
 
     #[test]
     fn test_table_metadata_index_only_changes_share_column_layout() {
-        let metadata = TableMetadata::new(
+        let metadata = TableMetadata::try_new(
             vec![
                 ColumnSpec::new("c0", ValKind::U32, ColumnAttributes::empty()),
                 ColumnSpec::new("c1", ValKind::VarByte, ColumnAttributes::NULLABLE),
             ],
             vec![],
-        );
+        )
+        .expect("valid table metadata");
         assert_eq!(metadata.col.col_count(), 2);
         assert_eq!(
             metadata.col.fix_len(),
@@ -1111,14 +1098,15 @@ mod tests {
 
     #[test]
     fn test_table_metadata_create_index_rejects_invalid_spec() {
-        let metadata = TableMetadata::new(
+        let metadata = TableMetadata::try_new(
             vec![ColumnSpec::new(
                 "c0",
                 ValKind::U32,
                 ColumnAttributes::empty(),
             )],
             vec![],
-        );
+        )
+        .expect("valid table metadata");
 
         assert!(
             metadata

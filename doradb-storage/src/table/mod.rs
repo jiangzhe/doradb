@@ -12,8 +12,7 @@ mod storage;
 mod tests;
 
 pub(crate) use access::*;
-pub use deletion_buffer::*;
-pub use gc::{SecondaryMemIndexCleanupIndexStats, SecondaryMemIndexCleanupStats};
+pub(crate) use deletion_buffer::*;
 pub(crate) use layout::{RetiredSecondaryIndex, TableRuntimeLayout};
 pub use lifecycle::CheckpointCancelReason;
 #[cfg(test)]
@@ -22,12 +21,10 @@ pub(crate) use lifecycle::{
     CheckpointPublishLease, TableCheckpointRootMutationLease, TableLifecycle,
     TableMetadataChangeLease,
 };
-pub(crate) use mem_table::GenericMemTable;
-#[cfg(test)]
-pub(crate) use mem_table::build_in_memory_secondary_indexes;
+pub(crate) use mem_table::MemTable;
 pub use persistence::*;
 pub(crate) use rollback::IndexRollback;
-pub use storage::ColumnStorage;
+pub(crate) use storage::ColumnStorage;
 #[cfg(test)]
 pub(crate) use tests::test_user_table_id;
 
@@ -61,7 +58,7 @@ use std::time::Duration;
 
 /// Runtime handle for a user table, combining in-memory and persisted storage.
 pub struct Table {
-    pub(crate) mem: GenericMemTable<EvictableBufferPool, EvictableBufferPool>,
+    pub(crate) mem: MemTable<EvictableBufferPool, EvictableBufferPool>,
     pub(crate) storage: ColumnStorage,
     layout: Mutex<Arc<TableRuntimeLayout>>,
     retired_secondary_indexes: Mutex<Vec<RetiredSecondaryIndex>>,
@@ -94,7 +91,7 @@ impl Table {
             active_root.trx_id,
         )
         .await?;
-        let mem = GenericMemTable {
+        let mem = MemTable {
             table_id,
             metadata: Arc::clone(&metadata),
             mem_pool: mem_pool.clone(),
@@ -142,10 +139,6 @@ impl Table {
 
     /// Acquires the reversible metadata-change gate for future index DDL.
     #[inline]
-    #[allow(
-        dead_code,
-        reason = "future index DDL uses this checkpoint exclusion gate"
-    )]
     pub(crate) async fn begin_metadata_change(&self) -> Result<TableMetadataChangeLease<'_>> {
         self.lifecycle.begin_metadata_change(self.table_id()).await
     }
@@ -251,7 +244,7 @@ impl Table {
 
     /// Returns a current-layout metadata owner for this table.
     #[inline]
-    pub fn metadata(&self) -> Arc<TableMetadata> {
+    pub(crate) fn metadata(&self) -> Arc<TableMetadata> {
         Arc::clone(self.layout_snapshot().metadata_arc())
     }
 
@@ -266,9 +259,12 @@ impl Table {
 
     /// Capture an owned table-root snapshot for this table.
     #[inline]
-    #[allow(
-        dead_code,
-        reason = "proof-bound root snapshot tests and future read paths use this helper"
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "proof-bound root snapshot tests and future read paths use this helper"
+        )
     )]
     pub(crate) fn root_snapshot<'ctx>(
         &self,
@@ -281,15 +277,18 @@ impl Table {
 
     /// Returns the deletion buffer tracking persisted-row tombstones.
     #[inline]
-    pub fn deletion_buffer(&self) -> &ColumnDeletionBuffer {
+    pub(crate) fn deletion_buffer(&self) -> &ColumnDeletionBuffer {
         self.storage.deletion_buffer()
     }
 
     /// Returns whether any retired secondary-index runtimes are queued.
     #[inline]
-    #[allow(
-        dead_code,
-        reason = "future index DDL tests and maintenance use this helper"
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "future index DDL tests and maintenance use this helper"
+        )
     )]
     pub(crate) fn has_retired_secondary_indexes(&self) -> bool {
         !self.retired_secondary_indexes.lock().is_empty()
@@ -297,10 +296,6 @@ impl Table {
 
     /// Installs a new user-table runtime layout for future index DDL paths.
     #[inline]
-    #[allow(
-        dead_code,
-        reason = "future index DDL uses this runtime install boundary"
-    )]
     pub(crate) fn install_runtime_layout(
         &self,
         expected_generation: u64,
@@ -368,10 +363,6 @@ impl Table {
     }
 
     /// Destroys retired secondary-index runtimes whose old layout snapshots drained.
-    #[allow(
-        dead_code,
-        reason = "future index DDL and maintenance use this cleanup primitive"
-    )]
     pub(crate) async fn cleanup_retired_secondary_indexes(
         &self,
         guards: &PoolGuards,
@@ -679,7 +670,7 @@ impl Table {
             let mut ts = head.next.main.status.ts();
             let mut status = match &head.next.main.status {
                 UndoStatus::Ref(status) => Some(status.clone()),
-                UndoStatus::CTS(_) => None,
+                UndoStatus::Committed(_) => None,
             };
             let mut entry = head.next.main.entry.clone();
             loop {
@@ -729,7 +720,7 @@ impl Table {
                     let ts = next.main.status.ts();
                     let status = match &next.main.status {
                         UndoStatus::Ref(status) => Some(status.clone()),
-                        UndoStatus::CTS(_) => None,
+                        UndoStatus::Committed(_) => None,
                     };
                     (ts, status, next.main.entry.clone())
                 });

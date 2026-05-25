@@ -21,24 +21,23 @@ const DEFAULT_HYSTERESIS_RATIO: f64 = 0.30;
 
 /// Snapshot of shared-evictor wake and domain-execution activity.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct SharedPoolEvictorStats {
     /// Number of wakeups observed after the evictor blocked for work.
-    pub wake_count: usize,
+    pub(crate) wake_count: usize,
     /// Number of times the evictor blocked waiting for work.
-    pub wait_count: usize,
+    pub(crate) wait_count: usize,
     /// Number of readonly-domain runs completed by the shared evictor.
-    pub readonly_runs: usize,
+    pub(crate) readonly_runs: usize,
     /// Number of mem-pool-domain runs completed by the shared evictor.
-    pub mem_runs: usize,
+    pub(crate) mem_runs: usize,
     /// Number of index-pool-domain runs completed by the shared evictor.
-    pub index_runs: usize,
+    pub(crate) index_runs: usize,
 }
 
 impl SharedPoolEvictorStats {
     /// Returns the saturating delta from one earlier snapshot.
     #[inline]
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg_attr(not(test), expect(dead_code, reason = "internal buffer pool stats"))]
     pub(crate) fn delta_since(self, earlier: SharedPoolEvictorStats) -> SharedPoolEvictorStats {
         SharedPoolEvictorStats {
             wake_count: self.wake_count.saturating_sub(earlier.wake_count),
@@ -64,7 +63,7 @@ pub(crate) struct SharedPoolEvictorStatsHandle(Arc<SharedPoolEvictorStatsCounter
 
 impl SharedPoolEvictorStatsHandle {
     #[inline]
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg_attr(not(test), expect(dead_code, reason = "internal buffer pool stats"))]
     pub(crate) fn snapshot(&self) -> SharedPoolEvictorStats {
         SharedPoolEvictorStats {
             wake_count: self.0.wake_count.load(Ordering::Relaxed),
@@ -269,7 +268,7 @@ pub(super) fn clock_sweep_candidate(
 /// - stop when `free_frames >= target_free + hysteresis` AND failure-rate recovers;
 /// - choose dynamic batch size within `[min_batch, max_batch]`.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
-pub struct EvictionArbiter {
+pub(crate) struct EvictionArbiter {
     target_free: usize,
     hysteresis: usize,
     failure_rate_threshold: f64,
@@ -280,28 +279,36 @@ pub struct EvictionArbiter {
 
 impl EvictionArbiter {
     #[inline]
-    pub fn builder() -> EvictionArbiterBuilder {
+    pub(crate) fn builder() -> EvictionArbiterBuilder {
         EvictionArbiterBuilder::default()
     }
 
     #[inline]
-    pub fn failure_window(&self) -> usize {
+    pub(crate) fn failure_window(&self) -> usize {
         self.failure_window
     }
 
     #[inline]
-    pub fn target_free(&self) -> usize {
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "test-only eviction policy inspection")
+    )]
+    pub(crate) fn target_free(&self) -> usize {
         self.target_free
     }
 
     #[inline]
-    pub fn hysteresis(&self) -> usize {
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "test-only eviction policy inspection")
+    )]
+    pub(crate) fn hysteresis(&self) -> usize {
         self.hysteresis
     }
 
     /// Shared pressure-delta + hysteresis eviction decision.
     #[inline]
-    pub fn decide(
+    pub(crate) fn decide(
         &self,
         resident: usize,
         capacity: usize,
@@ -362,7 +369,7 @@ impl EvictionArbiter {
 /// If `target_free`/`hysteresis` are not explicitly set, they are derived from
 /// ratio fields and the runtime capacity passed to `build(capacity)`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct EvictionArbiterBuilder {
+pub(crate) struct EvictionArbiterBuilder {
     target_free: Option<usize>,
     target_free_ratio: f64,
     hysteresis: Option<usize>,
@@ -392,7 +399,11 @@ impl Default for EvictionArbiterBuilder {
 impl EvictionArbiterBuilder {
     /// Creates a builder with default eviction settings.
     #[inline]
-    pub fn new() -> Self {
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "test-only eviction policy construction")
+    )]
+    pub(crate) fn new() -> Self {
         Self::default()
     }
 
@@ -400,7 +411,7 @@ impl EvictionArbiterBuilder {
     ///
     /// If not set, `build()` derives it from `target_free_ratio * capacity`.
     #[inline]
-    pub fn target_free(mut self, target_free: usize) -> Self {
+    pub(crate) fn target_free(mut self, target_free: usize) -> Self {
         self.target_free = Some(target_free);
         self
     }
@@ -409,7 +420,11 @@ impl EvictionArbiterBuilder {
     ///
     /// Values are normalized to `[0.0, 1.0]` during `build()`.
     #[inline]
-    pub fn target_free_ratio(mut self, ratio: f64) -> Self {
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "test-only eviction policy construction")
+    )]
+    pub(crate) fn target_free_ratio(mut self, ratio: f64) -> Self {
         self.target_free_ratio = ratio;
         self
     }
@@ -418,7 +433,7 @@ impl EvictionArbiterBuilder {
     ///
     /// If not set, `build()` derives it from `hysteresis_ratio * target_free`.
     #[inline]
-    pub fn hysteresis(mut self, hysteresis: usize) -> Self {
+    pub(crate) fn hysteresis(mut self, hysteresis: usize) -> Self {
         self.hysteresis = Some(hysteresis);
         self
     }
@@ -427,7 +442,11 @@ impl EvictionArbiterBuilder {
     ///
     /// Values are normalized to `[0.0, 1.0]` during `build()`.
     #[inline]
-    pub fn hysteresis_ratio(mut self, ratio: f64) -> Self {
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "test-only eviction policy construction")
+    )]
+    pub(crate) fn hysteresis_ratio(mut self, ratio: f64) -> Self {
         self.hysteresis_ratio = ratio;
         self
     }
@@ -436,21 +455,21 @@ impl EvictionArbiterBuilder {
     ///
     /// Values are normalized to `[0.0, 1.0]` during `build()`.
     #[inline]
-    pub fn failure_rate_threshold(mut self, threshold: f64) -> Self {
+    pub(crate) fn failure_rate_threshold(mut self, threshold: f64) -> Self {
         self.failure_rate_threshold = threshold;
         self
     }
 
     /// Sets sliding-window sample size for failure-rate tracking.
     #[inline]
-    pub fn failure_window(mut self, window: usize) -> Self {
+    pub(crate) fn failure_window(mut self, window: usize) -> Self {
         self.failure_window = window;
         self
     }
 
     /// Sets minimum and maximum eviction batch size bounds.
     #[inline]
-    pub fn dynamic_batch_bounds(mut self, min_batch: usize, max_batch: usize) -> Self {
+    pub(crate) fn dynamic_batch_bounds(mut self, min_batch: usize, max_batch: usize) -> Self {
         self.min_batch = min_batch;
         self.max_batch = max_batch;
         self
@@ -460,7 +479,7 @@ impl EvictionArbiterBuilder {
     ///
     /// This method clamps invalid values and fills unset fields from ratio-based defaults.
     #[inline]
-    pub fn build(self, capacity: usize) -> EvictionArbiter {
+    pub(crate) fn build(self, capacity: usize) -> EvictionArbiter {
         let capacity = capacity.max(1);
         let target_free_ratio = if self.target_free_ratio.is_finite() {
             self.target_free_ratio.clamp(0.0, 1.0)
@@ -511,8 +530,8 @@ impl EvictionArbiterBuilder {
 /// `batch_size` is the number of resident pages the runtime should try to
 /// evict in the current pass.
 #[derive(Debug, Clone, Copy)]
-pub struct EvictionDecision {
-    pub batch_size: usize,
+pub(crate) struct EvictionDecision {
+    pub(crate) batch_size: usize,
 }
 
 struct FailureWindowState {
@@ -566,32 +585,32 @@ impl FailureWindowState {
 }
 
 /// Sliding-window allocation failure-rate tracker shared by buffer pools.
-pub struct FailureRateTracker {
+pub(super) struct FailureRateTracker {
     state: Mutex<FailureWindowState>,
 }
 
 impl FailureRateTracker {
     #[inline]
-    pub fn new(window: usize) -> Self {
+    pub(super) fn new(window: usize) -> Self {
         FailureRateTracker {
             state: Mutex::new(FailureWindowState::with_window(window)),
         }
     }
 
     #[inline]
-    pub fn record_success(&self) {
+    pub(super) fn record_success(&self) {
         let mut g = self.state.lock();
         g.record(false);
     }
 
     #[inline]
-    pub fn record_failure(&self) {
+    pub(super) fn record_failure(&self) {
         let mut g = self.state.lock();
         g.record(true);
     }
 
     #[inline]
-    pub fn failure_rate(&self) -> f64 {
+    pub(super) fn failure_rate(&self) -> f64 {
         let g = self.state.lock();
         g.failure_rate()
     }
@@ -966,7 +985,7 @@ mod tests {
     use crate::conf::{EvictableBufferPoolConfig, FileSystemConfig};
     use crate::error::FileKind;
     use crate::file::BlockID;
-    use crate::file::cow_file::COW_FILE_PAGE_SIZE;
+    use crate::file::cow_file::{COW_FILE_PAGE_SIZE, MutableCowFile};
     use crate::file::fs::{FileSystem, FileSystemWorkers};
     use crate::file::table_file::{MutableTableFile, TableFile};
     use crate::io::{DirectBuf, IOBuf};
@@ -1166,14 +1185,17 @@ mod tests {
     }
 
     fn make_metadata() -> Arc<TableMetadata> {
-        Arc::new(TableMetadata::new(
-            vec![ColumnSpec::new(
-                "c0",
-                ValKind::U32,
-                ColumnAttributes::empty(),
-            )],
-            vec![IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::PK)],
-        ))
+        Arc::new(
+            TableMetadata::try_new(
+                vec![ColumnSpec::new(
+                    "c0",
+                    ValKind::U32,
+                    ColumnAttributes::empty(),
+                )],
+                vec![IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::PK)],
+            )
+            .expect("valid table metadata"),
+        )
     }
 
     async fn write_payload(

@@ -1,6 +1,6 @@
 use crate::buffer::PoolGuards;
 
-use crate::catalog::{CatalogTable, TableCache, TableID, TableSpec};
+use crate::catalog::{CatalogTable, TableCache, TableID};
 use crate::error::{FatalError, InternalError, Result};
 use crate::lock::{LockManager, LockMode, LockOwner, LockResource};
 use crate::quiescent::QuiescentGuard;
@@ -15,12 +15,6 @@ use crate::trx::{OwnerLockState, TrxContext, TrxEffects};
 use crate::value::Val;
 use error_stack::Report;
 use std::mem;
-
-/// Kind-specific payload for statements with deferred catalog-side effects.
-pub enum StmtKind {
-    /// Create-table statement payload used to record table metadata changes.
-    CreateTable(TableSpec),
-}
 
 #[inline]
 fn active_transaction_discarded_err(operation: &'static str) -> crate::error::Error {
@@ -257,7 +251,7 @@ impl<'stmt> Statement<'stmt> {
 
     /// Returns this statement's immutable transaction context.
     #[inline]
-    pub fn ctx(&self) -> &TrxContext {
+    pub(crate) fn ctx(&self) -> &TrxContext {
         self.ctx
     }
 

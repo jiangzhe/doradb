@@ -3,7 +3,7 @@ use event_listener::{Listener, listener};
 use parking_lot::Mutex;
 
 /// Simple FreeList backed by linked list.
-pub struct FreeList<T> {
+pub(crate) struct FreeList<T> {
     data: Mutex<(Vec<T>, usize)>,
     max_size: usize,
     factory: Box<dyn Fn() -> T + Send + Sync + 'static>,
@@ -14,7 +14,7 @@ impl<T> FreeList<T> {
     /// Create a new free list with initial size, maximum size
     /// and factory function.
     #[inline]
-    pub fn new<F: Fn() -> T + Send + Sync + 'static>(
+    pub(crate) fn new<F: Fn() -> T + Send + Sync + 'static>(
         init_size: usize,
         max_size: usize,
         factory: F,
@@ -32,7 +32,7 @@ impl<T> FreeList<T> {
     }
     /// Push data into free list.
     #[inline]
-    pub fn push(&self, data: T) {
+    pub(crate) fn push(&self, data: T) {
         let mut g = self.data.lock();
         if g.0.len() >= self.max_size {
             // drop element if full
@@ -46,7 +46,7 @@ impl<T> FreeList<T> {
 
     /// Try pop data from free list.
     #[inline]
-    pub fn try_pop(&self, create_if_not_exists: bool) -> Option<T> {
+    pub(crate) fn try_pop(&self, create_if_not_exists: bool) -> Option<T> {
         let mut g = self.data.lock();
         if !g.0.is_empty() {
             return g.0.pop();
@@ -66,7 +66,8 @@ impl<T> FreeList<T> {
 
     /// Pop an element from free list, block if there is no element.
     #[inline]
-    pub fn pop(&self, create_if_not_exists: bool) -> T {
+    #[cfg_attr(not(test), expect(dead_code, reason = "reserved pop"))]
+    pub(crate) fn pop(&self, create_if_not_exists: bool) -> T {
         loop {
             let mut g = self.data.lock();
             if !g.0.is_empty() {
@@ -86,9 +87,10 @@ impl<T> FreeList<T> {
     }
 
     /// Pop an element from free list in async way.
-    #[allow(clippy::await_holding_lock)]
+    #[expect(clippy::await_holding_lock, reason = "clippy false positive")]
     #[inline]
-    pub async fn pop_async(&self, create_if_not_exists: bool) -> T {
+    #[cfg_attr(not(test), expect(dead_code, reason = "reserved pop_async"))]
+    pub(crate) async fn pop_async(&self, create_if_not_exists: bool) -> T {
         loop {
             let mut g = self.data.lock();
             if !g.0.is_empty() {

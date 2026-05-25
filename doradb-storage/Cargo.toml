@@ -48,12 +48,4 @@ io-uring = { version = "0.7.11", optional = true }
 rand = "0.9"
 rand_chacha = "0.9"
 rand_distr = "0.5"
-clap = { version = "4.5", features = ["derive"] }
-easy-parallel = "3.3"
-humantime = "2.1"
-criterion = { version = "0.5", features = ["html_reports"] }
 tempfile = "3"
-
-fastrand = "2"
-tikv-jemallocator = "0.6"
-bplustree = "0.1.0"

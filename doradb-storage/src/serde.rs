@@ -311,7 +311,7 @@ pub trait Ser<'a> {
 /// This trait is designed to read a serialized object from a byte slice,
 /// and the result is owned by the caller so that it can be passed to
 /// different threads.
-pub trait Deser: Sized {
+pub(crate) trait Deser: Sized {
     /// Deserialize objects from input.
     fn deser<S: Serde + ?Sized>(input: &S, start_idx: usize) -> Result<(usize, Self)>;
 }
@@ -803,7 +803,7 @@ impl Deser for ActiveIndexSpec {
 /// This struct is used to serialize a length-prefixed object.
 /// The length is serialized as a u64 value.
 /// The data is serialized using the Ser trait.
-pub struct LenPrefixSerView<'a, H, P> {
+pub(crate) struct LenPrefixSerView<'a, H, P> {
     data_len: usize,
     header: &'a H,
     payload: &'a P,
@@ -813,7 +813,8 @@ pub struct LenPrefixSerView<'a, H, P> {
 impl<'a, H: Ser<'a>, P: Ser<'a>> LenPrefixSerView<'a, H, P> {
     /// Create a new LenPrefixStruct.
     #[inline]
-    pub fn new(header: &'a H, payload: &'a P) -> Self {
+    #[cfg_attr(not(test), expect(dead_code, reason = "reserved new"))]
+    pub(crate) fn new(header: &'a H, payload: &'a P) -> Self {
         let header_len = header.ser_len();
         let payload_len = payload.ser_len();
         let data_len = header_len + payload_len;
@@ -823,25 +824,6 @@ impl<'a, H: Ser<'a>, P: Ser<'a>> LenPrefixSerView<'a, H, P> {
             payload,
             _marker: PhantomData,
         }
-    }
-}
-
-impl<H, P> LenPrefixSerView<'_, H, P> {
-    /// Get the length of the data.
-    #[inline]
-    pub fn data_len(&self) -> usize {
-        self.data_len
-    }
-
-    #[inline]
-    pub fn header(&self) -> &H {
-        self.header
-    }
-
-    /// Get the data.
-    #[inline]
-    pub fn payload(&self) -> &P {
-        self.payload
     }
 }
 
@@ -860,13 +842,6 @@ impl<'a, H: Ser<'a>, P: Ser<'a>> Ser<'a> for LenPrefixSerView<'a, H, P> {
         self.payload.ser(out, idx)
     }
 }
-
-// #[inline]
-// pub fn len_prefix_pod_size(data: &[u8]) -> usize {
-//     debug_assert!(data.len() >= mem::size_of::<u32>() * 2);
-//     let len = u32::from_le_bytes(data[..mem::size_of::<u32>()].try_into().unwrap());
-//     len as usize + mem::size_of::<u32>() * 2
-// }
 
 pub struct LenPrefixPod<H, P> {
     data_len: usize,
@@ -971,14 +946,14 @@ impl Deser for () {
 /// 2. input should not be packed, as no space can be saved,
 ///    no serializer willbe returned. User should use other method.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ForBitpackingSer<'a, T> {
+pub(crate) struct ForBitpackingSer<'a, T> {
     data: &'a [T],
     info: (usize, T),
 }
 
 impl<'a, T: BitPackable + Ord> ForBitpackingSer<'a, T> {
     #[inline]
-    pub fn new(data: &'a [T]) -> Option<Self> {
+    pub(crate) fn new(data: &'a [T]) -> Option<Self> {
         prepare_for_bitpacking(data).map(|info| ForBitpackingSer { data, info })
     }
 }
@@ -1024,7 +999,8 @@ impl<'a, T: BitPackable + Ord + Ser<'a>> Ser<'a> for ForBitpackingSer<'a, T> {
 }
 
 /// FOR+bitpacking decompression.
-pub struct ForBitpackingDeser<T>(pub Vec<T>);
+#[cfg_attr(not(test), expect(dead_code, reason = "reserved ForBitpackingDeser"))]
+pub(crate) struct ForBitpackingDeser<T>(pub Vec<T>);
 
 impl<T: BitPackable + Deser> Deser for ForBitpackingDeser<T> {
     #[inline]

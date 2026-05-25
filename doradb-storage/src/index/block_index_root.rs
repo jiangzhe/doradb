@@ -4,7 +4,7 @@ use crate::row::RowID;
 use std::cell::UnsafeCell;
 
 /// Route returned by `BlockIndexRoot::guide`.
-pub enum BlockIndexRoute {
+pub(super) enum BlockIndexRoute {
     /// Lookup should continue in persisted column-store index.
     Column {
         /// First row id stored in in-memory row store.
@@ -24,7 +24,7 @@ pub enum BlockIndexRoute {
 ///
 /// Both values are protected by a `HybridLatch` so readers can do optimistic
 /// lock-free routing while checkpoint updates can atomically swap both values.
-pub struct BlockIndexRoot {
+pub(super) struct BlockIndexRoot {
     // Latch protecting pivot and column-root updates.
     latch: HybridLatch,
     // Minimum row id of row-store pages.
@@ -36,7 +36,7 @@ pub struct BlockIndexRoot {
 impl BlockIndexRoot {
     /// Creates a new root router with initial pivot and column root page id.
     #[inline]
-    pub fn new(pivot_row_id: RowID, column_root_block_id: BlockID) -> Self {
+    pub(super) fn new(pivot_row_id: RowID, column_root_block_id: BlockID) -> Self {
         BlockIndexRoot {
             latch: HybridLatch::new(),
             pivot_row_id: UnsafeCell::new(pivot_row_id),
@@ -46,7 +46,7 @@ impl BlockIndexRoot {
 
     /// Guides one row-id lookup to row-store or column-store path.
     #[inline]
-    pub fn guide(&self, row_id: RowID) -> BlockIndexRoute {
+    pub(super) fn guide(&self, row_id: RowID) -> BlockIndexRoute {
         let (pivot_row_id, root_block_id) = self.snapshot();
         if row_id < pivot_row_id {
             BlockIndexRoute::Column {
@@ -62,7 +62,7 @@ impl BlockIndexRoot {
     ///
     /// This is used as a fallback path when row-store lookup misses.
     #[inline]
-    pub fn try_column(&self, row_id: RowID) -> Option<(RowID, BlockID)> {
+    pub(super) fn try_column(&self, row_id: RowID) -> Option<(RowID, BlockID)> {
         let (pivot_row_id, root_block_id) = self.snapshot();
         (row_id < pivot_row_id).then_some((pivot_row_id, root_block_id))
     }
@@ -71,7 +71,11 @@ impl BlockIndexRoot {
     ///
     /// Called after checkpoint/persist updates on-disk column index state.
     #[inline]
-    pub async fn update_column_root(&self, pivot_row_id: RowID, column_root_block_id: BlockID) {
+    pub(super) async fn update_column_root(
+        &self,
+        pivot_row_id: RowID,
+        column_root_block_id: BlockID,
+    ) {
         let _g = self.latch.exclusive_async().await;
         // SAFETY: protected by exclusive latch.
         unsafe {
@@ -81,7 +85,7 @@ impl BlockIndexRoot {
     }
 
     #[inline]
-    pub fn snapshot(&self) -> (RowID, BlockID) {
+    pub(super) fn snapshot(&self) -> (RowID, BlockID) {
         self.latch.optimistic_read(|| {
             // SAFETY: values are read under optimistic latch and validated
             // before being returned from `optimistic_read`.
@@ -90,13 +94,8 @@ impl BlockIndexRoot {
     }
 
     #[inline]
-    pub fn pivot_row_id(&self) -> RowID {
+    pub(super) fn pivot_row_id(&self) -> RowID {
         self.snapshot().0
-    }
-
-    #[inline]
-    pub fn column_root_block_id(&self) -> BlockID {
-        self.snapshot().1
     }
 }
 

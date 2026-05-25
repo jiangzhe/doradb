@@ -183,7 +183,10 @@ impl TrxSysConfig {
     }
 
     #[inline]
-    pub fn log_partition_initializer(&self, log_no: usize) -> Result<LogPartitionInitializer> {
+    pub(crate) fn log_partition_initializer(
+        &self,
+        log_no: usize,
+    ) -> Result<LogPartitionInitializer> {
         debug_assert!(validate_log_file_stem(&self.log_file_stem));
         let ctx = StorageBackend::new(self.io_depth_per_log)?;
         let file_prefix = self.file_prefix().map_err(Error::from)?;

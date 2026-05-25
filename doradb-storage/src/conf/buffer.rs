@@ -79,7 +79,11 @@ impl EvictableBufferPoolConfig {
     }
 
     #[inline]
-    pub fn eviction_arbiter_builder(
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "reserved eviction arbiter builder")
+    )]
+    pub(crate) fn eviction_arbiter_builder(
         mut self,
         eviction_arbiter_builder: EvictionArbiterBuilder,
     ) -> Self {

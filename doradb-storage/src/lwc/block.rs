@@ -19,7 +19,7 @@ use std::sync::Arc;
 use zerocopy_derive::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 /// Size in bytes of one validated persisted LWC payload, excluding the shared block envelope.
-pub const LWC_BLOCK_PAYLOAD_SIZE: usize = max_payload_len(COW_FILE_PAGE_SIZE);
+pub(crate) const LWC_BLOCK_PAYLOAD_SIZE: usize = max_payload_len(COW_FILE_PAGE_SIZE);
 
 #[inline]
 fn invalid_lwc_payload(message: impl Into<String>) -> Error {
@@ -89,7 +89,7 @@ fn persisted_lwc_payload_error(
 ///
 #[repr(C)]
 #[derive(Clone, FromBytes, IntoBytes, KnownLayout, Immutable)]
-pub struct LwcBlock {
+pub(crate) struct LwcBlock {
     // The conversion from raw bytes to payload view is not endianness-safe for
     // arbitrary external input. Persisted callers must validate the outer page
     // envelope first and only then cast the fixed-size payload bytes.
@@ -98,10 +98,8 @@ pub struct LwcBlock {
 }
 
 impl LwcBlock {
-    pub const BODY_SIZE: usize = LWC_BLOCK_PAYLOAD_SIZE - mem::size_of::<LwcBlockHeader>();
-
     #[inline]
-    pub fn try_from_bytes(input: &[u8]) -> Result<&Self> {
+    pub(crate) fn try_from_bytes(input: &[u8]) -> Result<&Self> {
         let block = layout::try_ref_from_bytes::<Self>(input).map_err(|_| {
             invalid_lwc_payload(format!(
                 "LWC block payload has invalid length {}, expected {}",
@@ -114,7 +112,7 @@ impl LwcBlock {
     }
 
     #[inline]
-    pub fn try_from_bytes_mut(input: &mut [u8]) -> Result<&mut Self> {
+    pub(crate) fn try_from_bytes_mut(input: &mut [u8]) -> Result<&mut Self> {
         let input_len = input.len();
         layout::try_mut_from_bytes::<Self>(input).map_err(|_| {
             invalid_lwc_payload(format!(
@@ -125,7 +123,7 @@ impl LwcBlock {
 
     /// Validates a full persisted LWC block image and returns its payload view.
     #[inline]
-    pub fn try_from_persisted_bytes(
+    pub(crate) fn try_from_persisted_bytes(
         input: &[u8],
         file_kind: FileKind,
         block_id: BlockID,
@@ -138,7 +136,7 @@ impl LwcBlock {
     }
 
     #[inline]
-    pub fn row_shape_fingerprint(&self) -> u128 {
+    pub(crate) fn row_shape_fingerprint(&self) -> u128 {
         self.header.row_shape_fingerprint()
     }
 
@@ -168,7 +166,7 @@ impl LwcBlock {
 
     /// Returns column data for given column index based on column layout.
     #[inline]
-    pub fn column<'a>(
+    pub(crate) fn column<'a>(
         &'a self,
         col_layout: &'a TableColumnLayout,
         col_idx: usize,
@@ -224,7 +222,7 @@ impl LwcBlock {
     /// column order and maps payload failures to contextual persisted-block
     /// corruption.
     #[inline]
-    pub fn decode_persisted_row_values(
+    pub(crate) fn decode_persisted_row_values(
         &self,
         col_layout: &TableColumnLayout,
         row_idx: usize,
@@ -245,7 +243,7 @@ impl LwcBlock {
     /// Decodes all values from one persisted block row and maps payload
     /// failures to contextual persisted-block corruption.
     #[inline]
-    pub fn decode_persisted_full_row_values(
+    pub(crate) fn decode_persisted_full_row_values(
         &self,
         col_layout: &TableColumnLayout,
         row_idx: usize,
@@ -325,7 +323,7 @@ pub(crate) struct PersistedLwcBlock {
 impl PersistedLwcBlock {
     /// Loads one persisted LWC block through the validated readonly-cache path.
     #[inline]
-    pub async fn load(
+    pub(crate) async fn load(
         file_kind: FileKind,
         file: &Arc<SparseFile>,
         disk_pool: &QuiescentGuard<ReadonlyBufferPool>,
@@ -357,17 +355,17 @@ impl PersistedLwcBlock {
     }
 
     #[inline]
-    pub fn row_count(&self) -> usize {
+    pub(crate) fn row_count(&self) -> usize {
         self.block().header.row_count() as usize
     }
 
     #[inline]
-    pub fn row_shape_fingerprint(&self) -> u128 {
+    pub(crate) fn row_shape_fingerprint(&self) -> u128 {
         self.block().row_shape_fingerprint()
     }
 
     #[inline]
-    pub fn decode_row_values(
+    pub(crate) fn decode_row_values(
         &self,
         col_layout: &TableColumnLayout,
         row_idx: usize,
@@ -383,7 +381,7 @@ impl PersistedLwcBlock {
     }
 
     #[inline]
-    pub fn decode_full_row_values(
+    pub(crate) fn decode_full_row_values(
         &self,
         col_layout: &TableColumnLayout,
         row_idx: usize,
@@ -398,7 +396,7 @@ impl PersistedLwcBlock {
 }
 
 #[derive(Debug)]
-pub struct LwcColumn<'a> {
+pub(crate) struct LwcColumn<'a> {
     kind: ValKind,
     row_count: usize,
     null_bitmap: Option<LwcNullBitmap<'a>>,
@@ -407,7 +405,7 @@ pub struct LwcColumn<'a> {
 
 impl<'a> LwcColumn<'a> {
     #[inline]
-    pub fn is_null(&self, row_idx: usize) -> bool {
+    pub(crate) fn is_null(&self, row_idx: usize) -> bool {
         if row_idx >= self.row_count {
             return false;
         }
@@ -418,24 +416,25 @@ impl<'a> LwcColumn<'a> {
     }
 
     #[inline]
-    pub fn data(&self) -> Result<LwcData<'a>> {
+    pub(crate) fn data(&self) -> Result<LwcData<'a>> {
         LwcData::from_bytes(self.kind, self.values)
     }
 
     #[inline]
-    pub fn row_count(&self) -> usize {
+    #[cfg_attr(not(test), expect(dead_code, reason = "reserved row_count"))]
+    pub(crate) fn row_count(&self) -> usize {
         self.row_count
     }
 }
 
-pub struct ColOffsets<'a> {
+pub(crate) struct ColOffsets<'a> {
     data_start: usize,
     offsets: &'a [[u8; 2]],
 }
 
 impl ColOffsets<'_> {
     #[inline]
-    pub fn validate(&self, body_len: usize) -> Result<()> {
+    pub(crate) fn validate(&self, body_len: usize) -> Result<()> {
         let mut start_idx = self.data_start;
         if start_idx > body_len {
             return Err(invalid_lwc_payload(format!(
@@ -456,7 +455,7 @@ impl ColOffsets<'_> {
 
     /// Get the data range for given column.
     #[inline]
-    pub fn get(&self, idx: usize) -> Option<(usize, usize)> {
+    pub(crate) fn get(&self, idx: usize) -> Option<(usize, usize)> {
         if idx >= self.offsets.len() {
             return None;
         }
@@ -479,7 +478,7 @@ const _: () = assert!(mem::size_of::<LwcBlock>() == LWC_BLOCK_PAYLOAD_SIZE);
 /// to avoid endianess mistakes in serialization and deserialization.
 #[repr(C)]
 #[derive(Clone, FromBytes, IntoBytes, KnownLayout, Immutable)]
-pub struct LwcBlockHeader {
+pub(crate) struct LwcBlockHeader {
     /// Canonical row-shape fingerprint sourced from column-block index shape.
     row_shape_fingerprint: [u8; 16],
     /// Row count in this page.
@@ -494,7 +493,12 @@ pub struct LwcBlockHeader {
 
 impl LwcBlockHeader {
     #[inline]
-    pub fn new(row_shape_fingerprint: u128, row_count: u16, col_count: u16, flags: u16) -> Self {
+    pub(crate) fn new(
+        row_shape_fingerprint: u128,
+        row_count: u16,
+        col_count: u16,
+        flags: u16,
+    ) -> Self {
         LwcBlockHeader {
             row_shape_fingerprint: row_shape_fingerprint.to_le_bytes(),
             row_count: row_count.to_le_bytes(),
@@ -505,17 +509,17 @@ impl LwcBlockHeader {
     }
 
     #[inline]
-    pub fn row_shape_fingerprint(&self) -> u128 {
+    pub(crate) fn row_shape_fingerprint(&self) -> u128 {
         u128::from_le_bytes(self.row_shape_fingerprint)
     }
 
     #[inline]
-    pub fn row_count(&self) -> u16 {
+    pub(crate) fn row_count(&self) -> u16 {
         u16::from_le_bytes(self.row_count)
     }
 
     #[inline]
-    pub fn col_count(&self) -> u16 {
+    pub(crate) fn col_count(&self) -> u16 {
         u16::from_le_bytes(self.col_count)
     }
 }
@@ -597,13 +601,14 @@ mod tests {
     }
 
     fn build_valid_persisted_lwc_block() -> (TableMetadata, DirectBuf) {
-        let metadata = TableMetadata::new(
+        let metadata = TableMetadata::try_new(
             vec![
                 ColumnSpec::new("c0", ValKind::U8, ColumnAttributes::empty()),
                 ColumnSpec::new("c1", ValKind::I16, ColumnAttributes::NULLABLE),
             ],
             vec![],
-        );
+        )
+        .expect("valid table metadata");
         let mut page = RowPage::new_test_page();
         page.init(100, 8, metadata.col.as_ref());
         assert!(matches!(
@@ -643,14 +648,15 @@ mod tests {
 
     #[test]
     fn test_lwc_block_nullable_column() {
-        let metadata = TableMetadata::new(
+        let metadata = TableMetadata::try_new(
             vec![ColumnSpec::new(
                 "c0",
                 ValKind::U8,
                 ColumnAttributes::NULLABLE,
             )],
             vec![],
-        );
+        )
+        .expect("valid table metadata");
         let values = [10u8, 20, 30, 40];
         let lwc_ser = LwcPrimitiveSer::new_u8(&values);
         let mut values_bytes = vec![0u8; lwc_ser.ser_len()];
@@ -688,14 +694,15 @@ mod tests {
 
     #[test]
     fn test_lwc_block_column_metadata_mismatch() {
-        let metadata = TableMetadata::new(
+        let metadata = TableMetadata::try_new(
             vec![ColumnSpec::new(
                 "c0",
                 ValKind::U8,
                 ColumnAttributes::empty(),
             )],
             vec![],
-        );
+        )
+        .expect("valid table metadata");
         let mut buf = DirectBuf::zeroed(LWC_BLOCK_PAYLOAD_SIZE);
         let page = LwcBlock::try_from_bytes_mut(buf.data_mut()).unwrap();
         let col_offsets_len = mem::size_of::<u16>() * 2;

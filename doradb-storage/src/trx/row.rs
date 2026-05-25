@@ -19,7 +19,7 @@ use std::mem;
 use std::sync::Arc;
 
 /// Read row with latest or visible version.
-pub struct RowReadAccess<'a> {
+pub(crate) struct RowReadAccess<'a> {
     page: &'a RowPage,
     row_idx: usize,
     state: RowReadState<'a>,
@@ -28,7 +28,7 @@ pub struct RowReadAccess<'a> {
 impl<'a> RowReadAccess<'a> {
     /// Acquire read latch for single row with offset.
     #[inline]
-    pub fn new(page: &'a RowPage, ctx: &'a FrameContext, row_idx: usize) -> Self {
+    pub(crate) fn new(page: &'a RowPage, ctx: &'a FrameContext, row_idx: usize) -> Self {
         let state = RowReadState::from_ctx(ctx, row_idx);
         RowReadAccess {
             page,
@@ -38,38 +38,30 @@ impl<'a> RowReadAccess<'a> {
     }
 
     #[inline]
-    pub fn row(&self) -> Row<'_> {
+    pub(crate) fn row(&self) -> Row<'_> {
         self.page.row(self.row_idx)
     }
 
     #[inline]
-    pub fn any_old_version_exists(&self) -> bool {
-        match &self.state {
-            RowReadState::RowVer(g) => g.is_some(),
-            RowReadState::Recover(_) => false,
-        }
-    }
-
-    #[inline]
-    pub fn ts(&self) -> Option<TrxID> {
+    #[cfg_attr(not(test), expect(dead_code, reason = "reserved ts"))]
+    pub(crate) fn ts(&self) -> Option<TrxID> {
         match &self.state {
             RowReadState::RowVer(head) => head.as_ref().map(|h| h.ts()),
             RowReadState::Recover(rec) => rec.at(self.row_idx),
         }
     }
 
-    #[allow(clippy::borrowed_box)]
     #[inline]
-    pub fn undo_head(&self) -> Option<&Box<RowUndoHead>> {
+    pub(crate) fn undo_head(&self) -> Option<&RowUndoHead> {
         match &self.state {
-            RowReadState::RowVer(guard) => guard.as_ref(),
+            RowReadState::RowVer(guard) => guard.as_ref().map(|h| h.as_ref()),
             RowReadState::Recover(_) => None,
         }
     }
 
     /// Returns first undo entry on main branch of the chain.
     #[inline]
-    pub fn first_undo_entry(&self) -> Option<RowUndoRef> {
+    pub(crate) fn first_undo_entry(&self) -> Option<RowUndoRef> {
         match &self.state {
             RowReadState::RowVer(guard) => guard.as_ref().map(|head| head.next.main.entry.clone()),
             RowReadState::Recover(_) => None,
@@ -77,7 +69,7 @@ impl<'a> RowReadAccess<'a> {
     }
 
     #[inline]
-    pub fn read_row_latest(
+    pub(crate) fn read_row_latest(
         &self,
         metadata: &TableMetadata,
         read_set: &[usize],
@@ -101,7 +93,7 @@ impl<'a> RowReadAccess<'a> {
     }
 
     #[inline]
-    pub fn read_row_mvcc(
+    pub(crate) fn read_row_mvcc(
         &self,
         ctx: &TrxContext,
         metadata: &TableMetadata,
@@ -302,7 +294,7 @@ impl<'a> RowReadAccess<'a> {
     /// 5. The old row does not match key but one old version with same key found.
     ///    Add record modifications and then link new row to that specific entry.
     #[inline]
-    pub fn find_old_version_for_unique_key(
+    pub(crate) fn find_old_version_for_unique_key(
         &self,
         metadata: &TableMetadata,
         key: &SelectKey,
@@ -415,7 +407,11 @@ impl<'a> RowReadAccess<'a> {
     ///
     /// This method is used by purge threads to correctly remove unnecessary index entry.
     #[inline]
-    pub fn any_version_matches_key(&self, metadata: &TableMetadata, key: &SelectKey) -> bool {
+    pub(crate) fn any_version_matches_key(
+        &self,
+        metadata: &TableMetadata,
+        key: &SelectKey,
+    ) -> bool {
         let Some(index_spec) = metadata.idx.index_spec(key.index_no) else {
             return false;
         };
@@ -490,7 +486,7 @@ impl<'a> RowReadAccess<'a> {
     }
 }
 
-pub enum RowReadState<'a> {
+pub(crate) enum RowReadState<'a> {
     RowVer(RowVersionReadGuard<'a>),
     Recover(&'a RecoverMap),
 }
@@ -505,7 +501,7 @@ impl<'a> RowReadState<'a> {
     }
 }
 
-pub struct ReadAllRows<'a> {
+pub(crate) struct ReadAllRows<'a> {
     ctx: &'a FrameContext,
     page: &'a RowPage,
     start_idx: usize,
@@ -514,7 +510,7 @@ pub struct ReadAllRows<'a> {
 
 impl<'a> ReadAllRows<'a> {
     #[inline]
-    pub fn new(page: &'a RowPage, ctx: &'a FrameContext) -> Self {
+    pub(crate) fn new(page: &'a RowPage, ctx: &'a FrameContext) -> Self {
         let end_idx = page.header.row_count();
         ReadAllRows {
             ctx,
@@ -522,11 +518,6 @@ impl<'a> ReadAllRows<'a> {
             start_idx: 0,
             end_idx,
         }
-    }
-
-    #[inline]
-    pub fn col_layout(&self) -> Option<&TableColumnLayout> {
-        self.ctx.row_ver().map(|m| &*m.column_layout)
     }
 }
 
@@ -646,7 +637,7 @@ impl KeyVersion {
     }
 }
 
-pub struct RowWriteAccess<'a> {
+pub(crate) struct RowWriteAccess<'a> {
     page: &'a RowPage,
     row_idx: usize,
     guard: RowVersionWriteGuard<'a>,
@@ -655,7 +646,7 @@ pub struct RowWriteAccess<'a> {
 
 impl<'a> RowWriteAccess<'a> {
     #[inline]
-    pub fn new(
+    pub(crate) fn new(
         page: &'a RowPage,
         ctx: &'a FrameContext,
         row_idx: usize,
@@ -670,7 +661,7 @@ impl<'a> RowWriteAccess<'a> {
     }
 
     #[inline]
-    pub fn new_with_state_guard(
+    pub(crate) fn new_with_state_guard(
         page: &'a RowPage,
         ctx: &'a FrameContext,
         row_idx: usize,
@@ -691,35 +682,29 @@ impl<'a> RowWriteAccess<'a> {
     }
 
     #[inline]
-    pub fn row(&self) -> Row<'a> {
+    pub(crate) fn row(&self) -> Row<'a> {
         self.page.row(self.row_idx)
     }
 
     #[inline]
-    pub fn row_mut(&self, var_offset: usize, var_end: usize) -> RowMut<'_> {
+    pub(crate) fn row_mut(&self, var_offset: usize, var_end: usize) -> RowMut<'_> {
         self.page.row_mut(self.row_idx, var_offset, var_end)
     }
 
     #[inline]
-    pub fn page_state(&self) -> RowPageState {
+    pub(crate) fn page_state(&self) -> RowPageState {
         *self._state_guard
     }
 
     #[inline]
-    pub fn delete_row(&mut self) {
+    pub(crate) fn delete_row(&mut self) {
         let res = self.page.set_deleted(self.row_idx, true);
         debug_assert!(res);
         self.page.inc_approx_deleted();
     }
 
     #[inline]
-    pub fn row_and_undo_mut(&mut self) -> (Row<'_>, &mut Option<Box<RowUndoHead>>) {
-        let row = self.page.row(self.row_idx);
-        (row, &mut *self.guard)
-    }
-
-    #[inline]
-    pub fn update_row(
+    pub(crate) fn update_row(
         &self,
         col_layout: &TableColumnLayout,
         cols: &[UpdateCol],
@@ -761,7 +746,7 @@ impl<'a> RowWriteAccess<'a> {
     }
 
     /// Add a Lock undo entry as a transaction-level logical row lock.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments, reason = "code style")]
     #[inline]
     pub(crate) fn lock_undo(
         &mut self,
@@ -882,7 +867,7 @@ impl<'a> RowWriteAccess<'a> {
     }
 
     #[inline]
-    pub fn link_for_unique_index(
+    pub(crate) fn link_for_unique_index(
         &mut self,
         key: SelectKey,
         cts: TrxID,
@@ -902,7 +887,7 @@ impl<'a> RowWriteAccess<'a> {
     }
 
     #[inline]
-    pub fn link_for_unique_index_cold_terminal(
+    pub(crate) fn link_for_unique_index_cold_terminal(
         &mut self,
         key: SelectKey,
         delete_cts: Option<TrxID>,
@@ -924,7 +909,7 @@ impl<'a> RowWriteAccess<'a> {
     /// This method removes out-of-date versions from the next list.
     /// The real deletion of undo logs is performed later.
     #[inline]
-    pub fn purge_undo_chain(&mut self, min_active_sts: TrxID) {
+    pub(crate) fn purge_undo_chain(&mut self, min_active_sts: TrxID) {
         match &mut *self.guard {
             None => (),
             Some(undo_head) => {
@@ -985,7 +970,11 @@ impl<'a> RowWriteAccess<'a> {
 
     /// Rollback first undo log in the chain.
     #[inline]
-    pub fn rollback_first_undo(&mut self, metadata: &TableMetadata, mut owned_entry: OwnedRowUndo) {
+    pub(crate) fn rollback_first_undo(
+        &mut self,
+        metadata: &TableMetadata,
+        mut owned_entry: OwnedRowUndo,
+    ) {
         let head = self.guard.as_mut().expect("undo head");
         let entry = &mut head.next.main.entry;
         debug_assert!({
@@ -1028,8 +1017,7 @@ impl<'a> RowWriteAccess<'a> {
         match owned_entry.next.take() {
             None => {
                 // The entry to rollback is the only undo entry of this row.
-                // So data in row page is globally visible now, we can
-                // update undo status to CTS=GLOBAL_VISIBLE_CTS.
+                // The restored row-page image no longer needs an undo status.
                 self.remove_undo_head();
             }
             Some(next) => {
@@ -1039,19 +1027,12 @@ impl<'a> RowWriteAccess<'a> {
     }
 
     #[inline]
-    pub fn enable_ins_or_update(&mut self) {
+    pub(crate) fn enable_ins_or_update(&mut self) {
         self.guard.enable_ins_or_update();
     }
 }
 
-#[derive(Debug, Clone)]
-pub enum RowLatestStatus {
-    NotFound,
-    Committed(TrxID, bool),
-    Uncommitted,
-}
-
-pub enum LockUndo {
+pub(crate) enum LockUndo {
     Ok,
     WriteConflict,
     InvalidIndex,
@@ -1061,12 +1042,12 @@ pub enum LockUndo {
 
 impl LockUndo {
     #[inline]
-    pub fn is_ok(&self) -> bool {
+    pub(crate) fn is_ok(&self) -> bool {
         matches!(self, LockUndo::Ok)
     }
 }
 
-pub enum LockRowForWrite<'a> {
+pub(crate) enum LockRowForWrite<'a> {
     // lock success, returns optional last commit timestamp.
     Ok(Option<RowWriteAccess<'a>>),
     // lock fail, there is another transaction modifying this row.
@@ -1079,17 +1060,7 @@ pub enum LockRowForWrite<'a> {
     RetryInTransition,
 }
 
-impl<'a> LockRowForWrite<'a> {
-    #[inline]
-    pub fn ok(self) -> Option<RowWriteAccess<'a>> {
-        match self {
-            LockRowForWrite::Ok(access) => access,
-            _ => None,
-        }
-    }
-}
-
-pub enum FindOldVersion {
+pub(crate) enum FindOldVersion {
     Ok(Vec<Val>, TrxID, RowUndoRef),
     WriteConflict,
     DuplicateKey,
@@ -1146,7 +1117,7 @@ mod tests {
     fn test_read_row_latest_inactive_index_returns_invalid_index() {
         let metadata = sparse_metadata();
         let page = row_page(&metadata);
-        let frame_ctx = FrameContext::RecoverMap(RecoverMap::empty());
+        let frame_ctx = FrameContext::RecoverMap(RecoverMap::new(0));
         let access = RowReadAccess::new(&page, &frame_ctx, 0);
         let key = SelectKey::new(1, vec![Val::from(10i32)]);
 
@@ -1188,7 +1159,7 @@ mod tests {
     fn test_any_version_matches_key_inactive_index_returns_false() {
         let metadata = sparse_metadata();
         let page = row_page(&metadata);
-        let frame_ctx = FrameContext::RecoverMap(RecoverMap::empty());
+        let frame_ctx = FrameContext::RecoverMap(RecoverMap::new(0));
         let access = RowReadAccess::new(&page, &frame_ctx, 0);
         let key = SelectKey::new(1, vec![Val::from(10i32)]);
 

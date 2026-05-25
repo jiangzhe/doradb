@@ -10,7 +10,7 @@ use std::ops::{Deref, DerefMut};
 /// logic inside the callback.
 /// This callback is guaranteed to be applied on valid
 /// slot data.
-pub trait BTreeSlotCallback {
+pub(crate) trait BTreeSlotCallback {
     /// Process a slot.
     /// Note: this method is invoked within a read lock on leaf node,
     /// so it's not suitable to perform blocking operations here and
@@ -33,7 +33,7 @@ where
 }
 
 /// Scan on B-tree with specific prefix.
-pub struct BTreePrefixScan<'a, C, P: 'static> {
+pub(crate) struct BTreePrefixScan<'a, C, P: 'static> {
     cursor: BTreeNodeCursor<'a, P>,
     callback: C,
 }
@@ -53,14 +53,6 @@ impl<C, P: BufferPool> DerefMut for BTreePrefixScan<'_, C, P> {
     }
 }
 
-impl<C, P: BufferPool> BTreePrefixScan<'_, C, P> {
-    /// Consume the scanner and return the callback state.
-    #[inline]
-    pub fn into_callback(self) -> C {
-        self.callback
-    }
-}
-
 impl<'a, C: BTreeSlotCallback, P: BufferPool> BTreePrefixScan<'a, C, P> {
     #[inline]
     pub(super) fn new(tree: &'a GenericBTree<P>, pool_guard: &'a PoolGuard, callback: C) -> Self {
@@ -71,7 +63,7 @@ impl<'a, C: BTreeSlotCallback, P: BufferPool> BTreePrefixScan<'a, C, P> {
     }
 
     #[inline]
-    pub async fn scan_prefix(&mut self, key: &[u8]) -> Result<()> {
+    pub(crate) async fn scan_prefix(&mut self, key: &[u8]) -> Result<()> {
         // find first leaf node of prefix key.
         self.cursor.seek(key).await?;
         let Some(first_g) = self.cursor.next().await? else {
@@ -150,6 +142,7 @@ mod tests {
     use crate::error::InternalError;
     use crate::index::btree::BTree;
     use crate::index::btree::BTreeU64;
+    use crate::index::util::Maskable;
     use crate::quiescent::QuiescentBox;
     use error_stack::Report;
 
@@ -193,7 +186,13 @@ mod tests {
                 assert!(scanner.count() == 2);
 
                 let res = tree
-                    .mark_as_deleted(&pool_guard, b"a", BTreeU64::from(0u64), 101)
+                    .update(
+                        &pool_guard,
+                        b"a",
+                        BTreeU64::from(0u64),
+                        BTreeU64::from(0u64).deleted(),
+                        101,
+                    )
                     .await;
                 assert!(res.is_ok());
                 scanner.reset();

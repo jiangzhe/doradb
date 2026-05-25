@@ -1,20 +1,23 @@
 mod checkpoint;
 mod index;
-pub mod runtime;
-pub mod spec;
-pub mod storage;
-pub mod table;
+pub(crate) mod spec;
+pub(crate) mod storage;
+pub(crate) mod table;
 
-pub use checkpoint::*;
+pub(crate) use checkpoint::*;
 pub(crate) use index::*;
-pub use runtime::*;
-pub use spec::*;
-pub use storage::*;
-pub use table::*;
+pub(crate) use spec::ActiveIndexSpec;
+pub use spec::{
+    ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexNo, IndexOrder, IndexSpec,
+    TableSpec,
+};
+pub(crate) use storage::*;
+pub(crate) use table::*;
 
 use crate::DiskPool;
 use crate::buffer::{
-    BufferPool, EvictableBufferPool, FixedBufferPool, PoolGuards, PoolRole, ReadonlyBufferPool,
+    BufferPool, EvictableBufferPool, FixedBufferPool, PoolGuard, PoolGuards, PoolRole,
+    ReadonlyBufferPool,
 };
 use crate::component::{Component, ComponentRegistry, MetaPool, ShelfScope};
 use crate::error::{DataIntegrityError, Error, OperationError, Result};
@@ -23,39 +26,78 @@ use crate::index::BlockIndex;
 use crate::quiescent::{QuiescentBox, QuiescentGuard};
 use crate::row::RowID;
 use crate::row::ops::SelectKey;
-use crate::table::{Table, TableRuntimeLayout};
-use crate::trx::TrxID;
+use crate::table::{MemTable, Table, TableRuntimeLayout};
 use crate::trx::undo::IndexUndo;
+use crate::trx::{MIN_SNAPSHOT_TS, TrxID};
 use dashmap::DashMap;
 use error_stack::Report;
 use std::collections::hash_map::Entry;
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::ops::Deref;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-pub const ROW_ID_COL_NAME: &str = "__row_id";
-
-pub type ObjID = u64;
-pub type TableID = ObjID;
-pub const USER_OBJ_ID_START: ObjID = 0x0001_0000_0000_0000;
+pub type TableID = u64;
+pub(crate) type ObjID = TableID;
+pub(crate) const USER_OBJ_ID_START: ObjID = 0x0001_0000_0000_0000;
 
 /// Return whether an object id belongs to user-managed catalog space.
 #[inline]
-pub const fn is_user_obj_id(obj_id: ObjID) -> bool {
+pub(crate) const fn is_user_obj_id(obj_id: ObjID) -> bool {
     obj_id >= USER_OBJ_ID_START
 }
 
 /// Return whether an object id belongs to built-in catalog table space.
 #[inline]
-pub const fn is_catalog_obj_id(obj_id: ObjID) -> bool {
+pub(crate) const fn is_catalog_obj_id(obj_id: ObjID) -> bool {
     !is_user_obj_id(obj_id)
 }
 
+/// Dedicated runtime wrapper for catalog logical tables.
+pub(crate) struct CatalogTable {
+    pub(crate) mem: MemTable<FixedBufferPool, FixedBufferPool>,
+}
+
+impl CatalogTable {
+    /// Build a catalog table runtime from catalog-specific construction inputs.
+    #[inline]
+    pub(crate) async fn new(
+        mem_pool: QuiescentGuard<FixedBufferPool>,
+        meta_pool_guard: &PoolGuard,
+        table_id: TableID,
+        blk_idx: BlockIndex,
+        metadata: Arc<TableMetadata>,
+    ) -> Result<Self> {
+        let mem = MemTable::new(
+            mem_pool.clone(),
+            mem_pool.row_pool_role(),
+            mem_pool,
+            PoolRole::Meta,
+            meta_pool_guard,
+            table_id,
+            metadata,
+            blk_idx,
+            MIN_SNAPSHOT_TS,
+        )
+        .await?;
+        Ok(CatalogTable { mem })
+    }
+}
+
+impl Deref for CatalogTable {
+    type Target = MemTable<FixedBufferPool, FixedBufferPool>;
+
+    #[inline]
+    fn deref(&self) -> &Self::Target {
+        &self.mem
+    }
+}
+
 /// Catalog contains metadata of user tables.
-pub struct Catalog {
+pub(crate) struct Catalog {
     next_user_obj_id: AtomicU64,
     user_tables: DashMap<TableID, Arc<Table>>,
-    pub storage: CatalogStorage,
+    pub(crate) storage: CatalogStorage,
     checkpoint_gate: CatalogCheckpointGate,
 }
 
@@ -96,7 +138,7 @@ impl Component for Catalog {
 impl Catalog {
     /// Create a catalog runtime from persisted catalog storage.
     #[inline]
-    pub async fn new(storage: CatalogStorage) -> Result<Self> {
+    pub(crate) async fn new(storage: CatalogStorage) -> Result<Self> {
         let pool_guards = PoolGuards::builder()
             .push(PoolRole::Meta, storage.meta_pool.pool_guard())
             .push(PoolRole::Disk, storage.disk_pool.pool_guard())
@@ -116,7 +158,7 @@ impl Catalog {
 
     /// Allocate and return the next user object id.
     #[inline]
-    pub fn next_user_obj_id(&self) -> ObjID {
+    pub(crate) fn next_user_obj_id(&self) -> ObjID {
         self.next_user_obj_id.fetch_add(1, Ordering::SeqCst)
     }
 
@@ -128,7 +170,7 @@ impl Catalog {
 
     /// Return the current next user object id without allocating one.
     #[inline]
-    pub fn curr_next_user_obj_id(&self) -> ObjID {
+    pub(crate) fn curr_next_user_obj_id(&self) -> ObjID {
         self.next_user_obj_id.load(Ordering::Acquire)
     }
 
@@ -142,7 +184,7 @@ impl Catalog {
     /// are responsible for ensuring mutual exclusion at a higher level (e.g.,
     /// a single background checkpoint task).
     #[inline]
-    pub async fn apply_checkpoint_batch(&self, batch: CatalogCheckpointBatch) -> Result<()> {
+    pub(crate) async fn apply_checkpoint_batch(&self, batch: CatalogCheckpointBatch) -> Result<()> {
         self.storage
             .apply_checkpoint_batch(batch, self.curr_next_user_obj_id())
             .await
@@ -150,7 +192,7 @@ impl Catalog {
 
     /// Returns whether a table is user table.
     #[inline]
-    pub fn is_user_table(&self, table_id: TableID) -> bool {
+    pub(crate) fn is_user_table(&self, table_id: TableID) -> bool {
         is_user_obj_id(table_id)
     }
 
@@ -337,7 +379,7 @@ impl Catalog {
 
     /// Get a user-table runtime handle by table id.
     #[inline]
-    pub async fn get_table(&self, table_id: TableID) -> Option<Arc<Table>> {
+    pub(crate) async fn get_table(&self, table_id: TableID) -> Option<Arc<Table>> {
         self.get_table_now(table_id)
     }
 
@@ -354,10 +396,6 @@ impl Catalog {
 
     /// Acquires the catalog metadata-change gate for future index DDL.
     #[inline]
-    #[allow(
-        dead_code,
-        reason = "future index DDL uses this checkpoint exclusion gate"
-    )]
     pub(crate) async fn begin_metadata_change(&self) -> CatalogMetadataChangeLease<'_> {
         self.checkpoint_gate.begin_metadata_change().await
     }
@@ -380,13 +418,13 @@ impl Catalog {
 
     /// Get a catalog-table runtime handle by table id.
     #[inline]
-    pub fn get_catalog_table(&self, table_id: TableID) -> Option<Arc<CatalogTable>> {
+    pub(crate) fn get_catalog_table(&self, table_id: TableID) -> Option<Arc<CatalogTable>> {
         self.storage.get_catalog_table(table_id)
     }
 
     /// Insert a user table runtime into the in-memory cache.
     #[inline]
-    pub fn insert_user_table(&self, table: Arc<Table>) {
+    pub(crate) fn insert_user_table(&self, table: Arc<Table>) {
         let table_id = table.table_id();
         let old = self.user_tables.insert(table_id, table);
         debug_assert!(old.is_none());
@@ -394,14 +432,8 @@ impl Catalog {
 
     /// Remove a user table runtime from the in-memory cache.
     #[inline]
-    pub fn remove_user_table(&self, table_id: TableID) -> Option<Arc<Table>> {
+    pub(crate) fn remove_user_table(&self, table_id: TableID) -> Option<Arc<Table>> {
         self.user_tables.remove(&table_id).map(|(_, table)| table)
-    }
-
-    /// Return the metadata buffer pool used by catalog/index metadata pages.
-    #[inline]
-    pub fn meta_pool(&self) -> &FixedBufferPool {
-        &self.storage.meta_pool
     }
 }
 
@@ -512,7 +544,7 @@ impl UserTableCacheEntry {
 }
 
 /// Per-operation table cache used by rollback/recovery paths.
-pub struct TableCache<'a> {
+pub(crate) struct TableCache<'a> {
     catalog: &'a Catalog,
     user_tables: HashMap<TableID, UserTableCacheEntry>,
     catalog_tables: HashMap<TableID, Arc<CatalogTable>>,
@@ -522,7 +554,7 @@ pub struct TableCache<'a> {
 impl<'a> TableCache<'a> {
     /// Create an empty table cache bound to one catalog instance.
     #[inline]
-    pub fn new(catalog: &'a Catalog) -> Self {
+    pub(crate) fn new(catalog: &'a Catalog) -> Self {
         TableCache {
             catalog,
             user_tables: HashMap::new(),
@@ -536,7 +568,7 @@ impl<'a> TableCache<'a> {
     /// If table is not cached, this method loads it from catalog and caches
     /// positive/negative lookup result.
     #[inline]
-    pub async fn get_user_table(&mut self, table_id: TableID) -> Option<&Table> {
+    pub(crate) async fn get_user_table(&mut self, table_id: TableID) -> Option<&Table> {
         self.get_user_entry_mut(table_id)
             .await
             .map(|binding| binding.table())
@@ -547,7 +579,7 @@ impl<'a> TableCache<'a> {
     /// If table is not cached, this method loads it from catalog and caches
     /// positive/negative lookup result.
     #[inline]
-    pub fn get_catalog_table(&mut self, table_id: TableID) -> Option<&CatalogTable> {
+    pub(crate) fn get_catalog_table(&mut self, table_id: TableID) -> Option<&CatalogTable> {
         if !is_catalog_obj_id(table_id) {
             return None;
         }
@@ -608,7 +640,7 @@ impl<'a> TableCache<'a> {
     /// This method is intended for rollback paths where table id in undo log
     /// must always map to an existing table.
     #[inline]
-    pub async fn must_get_user_table(&mut self, table_id: TableID) -> &Table {
+    pub(crate) async fn must_get_user_table(&mut self, table_id: TableID) -> &Table {
         match self.get_user_table(table_id).await {
             Some(table) => table,
             None => panic!("table {table_id} not found in catalog"),
@@ -620,7 +652,7 @@ impl<'a> TableCache<'a> {
     /// This method is intended for rollback paths where table id in undo log
     /// must always map to an existing table.
     #[inline]
-    pub fn must_get_catalog_table(&mut self, table_id: TableID) -> &CatalogTable {
+    pub(crate) fn must_get_catalog_table(&mut self, table_id: TableID) -> &CatalogTable {
         match self.get_catalog_table(table_id) {
             Some(table) => table,
             None => panic!("table {table_id} not found in catalog"),
@@ -644,8 +676,9 @@ impl<'a> TableCache<'a> {
 }
 
 #[cfg(test)]
-pub mod tests {
+pub(crate) mod tests {
     use super::*;
+    use crate::catalog::CatalogCheckpointScanStopReason;
     use crate::catalog::{ColumnAttributes, IndexAttributes, IndexKey, IndexSpec, TableSpec};
     use crate::conf::{EngineConfig, TrxSysConfig};
     use crate::engine::Engine;
@@ -656,7 +689,6 @@ pub mod tests {
     use crate::index::{COLUMN_BLOCK_HEADER_SIZE, COLUMN_BLOCK_LEAF_HEADER_SIZE, ColumnBlockIndex};
     use crate::table::TablePersistence;
     use crate::trx::redo::DDLRedo;
-    use crate::trx::sys::CatalogCheckpointScanStopReason;
     use crate::trx::{ActiveTrx, MIN_SNAPSHOT_TS};
     use crate::value::{Val, ValKind};
     use semistr::SemiStr;
@@ -667,7 +699,7 @@ pub mod tests {
     /// Table1 has single i32 column, with unique index of this column.
     #[inline]
     pub(crate) async fn table1(engine: &Engine) -> TableID {
-        let mut session = engine.try_new_session().unwrap();
+        let mut session = engine.new_session().unwrap();
         let table_id = session
             .create_table(
                 TableSpec {
@@ -689,7 +721,7 @@ pub mod tests {
     /// Table2 has i32(unique key) and string column.
     #[inline]
     pub(crate) async fn table2(engine: &Engine) -> TableID {
-        let mut session = engine.try_new_session().unwrap();
+        let mut session = engine.new_session().unwrap();
         let table_id = session
             .create_table(
                 TableSpec {
@@ -718,7 +750,7 @@ pub mod tests {
     /// Table3 has single string key column.
     #[inline]
     pub(crate) async fn table3(engine: &Engine) -> TableID {
-        let mut session = engine.try_new_session().unwrap();
+        let mut session = engine.new_session().unwrap();
 
         let table_id = session
             .create_table(
@@ -743,7 +775,7 @@ pub mod tests {
     /// Second is non-unique index.
     #[inline]
     pub(crate) async fn table4(engine: &Engine) -> TableID {
-        let mut session = engine.try_new_session().unwrap();
+        let mut session = engine.new_session().unwrap();
 
         let table_id = session
             .create_table(
@@ -880,18 +912,20 @@ pub mod tests {
 
     #[test]
     fn test_index_ddl_metadata_reconcilable_rejects_column_attribute_mismatch() {
-        let catalog_metadata = TableMetadata::new(
+        let catalog_metadata = TableMetadata::try_new(
             vec![ColumnSpec::new(
                 "id",
                 ValKind::I32,
                 ColumnAttributes::empty(),
             )],
             vec![IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::PK)],
-        );
-        let file_metadata = TableMetadata::new(
+        )
+        .expect("valid table metadata");
+        let file_metadata = TableMetadata::try_new(
             vec![ColumnSpec::new("id", ValKind::I32, ColumnAttributes::INDEX)],
             vec![IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::PK)],
-        );
+        )
+        .expect("valid table metadata");
         assert_eq!(catalog_metadata.col.col_names, file_metadata.col.col_names);
         assert_eq!(catalog_metadata.col.col_types, file_metadata.col.col_types);
         assert_ne!(catalog_metadata.col.col_attrs, file_metadata.col.col_attrs);
@@ -909,8 +943,11 @@ pub mod tests {
         let primary_index = || IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::PK);
         let secondary_index = || IndexSpec::new(vec![IndexKey::new(1)], IndexAttributes::empty());
 
-        let catalog_metadata = TableMetadata::new(columns(), vec![primary_index()]);
-        let file_metadata = TableMetadata::new(columns(), vec![primary_index(), secondary_index()]);
+        let catalog_metadata =
+            TableMetadata::try_new(columns(), vec![primary_index()]).expect("valid table metadata");
+        let file_metadata =
+            TableMetadata::try_new(columns(), vec![primary_index(), secondary_index()])
+                .expect("valid table metadata");
 
         assert!(file_metadata.idx.next_index_no() > catalog_metadata.idx.next_index_no());
         assert!(index_ddl_metadata_reconcilable(42, &catalog_metadata, &file_metadata).unwrap());
@@ -928,8 +965,10 @@ pub mod tests {
         let secondary_index = || IndexSpec::new(vec![IndexKey::new(1)], IndexAttributes::empty());
 
         let catalog_metadata =
-            TableMetadata::new(columns(), vec![primary_index(), secondary_index()]);
-        let file_metadata = TableMetadata::new(columns(), vec![primary_index()]);
+            TableMetadata::try_new(columns(), vec![primary_index(), secondary_index()])
+                .expect("valid table metadata");
+        let file_metadata =
+            TableMetadata::try_new(columns(), vec![primary_index()]).expect("valid table metadata");
 
         assert!(catalog_metadata.idx.next_index_no() > file_metadata.idx.next_index_no());
         let err =
@@ -954,7 +993,7 @@ pub mod tests {
                 .build()
                 .await
                 .unwrap();
-            let mut session = engine.try_new_session().unwrap();
+            let mut session = engine.new_session().unwrap();
             let table_id = session
                 .create_table(
                     TableSpec {
@@ -970,7 +1009,7 @@ pub mod tests {
                 .unwrap();
             let orphan_index_no = 7;
 
-            let mut trx = session.try_begin_trx().unwrap().unwrap();
+            let mut trx = session.begin_trx().unwrap();
             trx.exec(async |stmt| {
                 assert!(
                     engine
@@ -1058,7 +1097,7 @@ pub mod tests {
                 .await
                 .unwrap();
             assert_eq!(engine.catalog().curr_next_user_obj_id(), USER_OBJ_ID_START);
-            let mut session = engine.try_new_session().unwrap();
+            let mut session = engine.new_session().unwrap();
             let table_spec = TableSpec {
                 columns: vec![
                     ColumnSpec {
@@ -1117,7 +1156,7 @@ pub mod tests {
                 .build()
                 .await
                 .unwrap();
-            let mut session = engine.try_new_session().unwrap();
+            let mut session = engine.new_session().unwrap();
             let table_id = session
                 .create_table(
                     TableSpec {
@@ -1445,8 +1484,8 @@ pub mod tests {
             let roots_before = snap1.meta.table_roots;
 
             let table = engine.catalog().get_table(table_id).await.unwrap();
-            let mut session = engine.try_new_session().unwrap();
-            let mut trx = session.try_begin_trx().unwrap().unwrap();
+            let mut session = engine.new_session().unwrap();
+            let mut trx = session.begin_trx().unwrap();
             trx.exec(async |stmt| {
                 stmt.table_insert_mvcc(&table, vec![Val::I32(7)]).await?;
                 Ok(())
@@ -1553,9 +1592,9 @@ pub mod tests {
                 .await
                 .unwrap();
 
-            let mut session = engine.try_new_session().unwrap();
+            let mut session = engine.new_session().unwrap();
 
-            let mut trx = session.try_begin_trx().unwrap().unwrap();
+            let mut trx = session.begin_trx().unwrap();
             trx.exec(async |stmt| {
                 stmt.table_insert_mvcc(&checkpointed_table, vec![Val::I32(7)])
                     .await?;
@@ -1565,7 +1604,7 @@ pub mod tests {
             .unwrap();
             trx.commit().await.unwrap();
 
-            let mut trx = session.try_begin_trx().unwrap().unwrap();
+            let mut trx = session.begin_trx().unwrap();
             trx.exec(async |stmt| {
                 stmt.table_insert_mvcc(
                     &replay_only_table,
@@ -1582,7 +1621,7 @@ pub mod tests {
                 .freeze(&session, usize::MAX)
                 .await
                 .unwrap();
-            let mut checkpoint_session = engine.try_new_session().unwrap();
+            let mut checkpoint_session = engine.new_session().unwrap();
             let checkpoint_outcome = checkpointed_table
                 .checkpoint(&mut checkpoint_session)
                 .await

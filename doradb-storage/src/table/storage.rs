@@ -9,7 +9,7 @@ use error_stack::Report;
 use std::sync::Arc;
 
 /// Persisted column-store attachments associated with a user table runtime.
-pub struct ColumnStorage {
+pub(crate) struct ColumnStorage {
     pub(crate) file: Arc<TableFile>,
     pub(crate) disk_pool: QuiescentGuard<ReadonlyBufferPool>,
     pub(crate) deletion_buffer: ColumnDeletionBuffer,
@@ -72,13 +72,13 @@ impl ColumnStorage {
 
     /// Returns the read-only buffer pool used for persisted blocks.
     #[inline]
-    pub fn disk_pool(&self) -> &QuiescentGuard<ReadonlyBufferPool> {
+    pub(crate) fn disk_pool(&self) -> &QuiescentGuard<ReadonlyBufferPool> {
         &self.disk_pool
     }
 
     /// Returns the deletion buffer tracking persisted-row tombstones.
     #[inline]
-    pub fn deletion_buffer(&self) -> &ColumnDeletionBuffer {
+    pub(crate) fn deletion_buffer(&self) -> &ColumnDeletionBuffer {
         &self.deletion_buffer
     }
 

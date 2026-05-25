@@ -19,17 +19,17 @@ const COLUMN_AUX_BLOB_PAYLOAD_LEN_OFFSET: usize = 4;
 const RAW_U32_CODEC_VERSION: u8 = 1;
 
 /// Shared page-local header for one immutable auxiliary-blob page.
-pub const COLUMN_DELETION_BLOB_PAGE_HEADER_SIZE: usize =
+pub(crate) const COLUMN_DELETION_BLOB_PAGE_HEADER_SIZE: usize =
     mem::size_of::<BlockID>() + mem::size_of::<u16>();
 /// Remaining bytes available for framed blob payload data on one page.
-pub const COLUMN_DELETION_BLOB_PAGE_BODY_SIZE: usize =
+pub(super) const COLUMN_DELETION_BLOB_PAGE_BODY_SIZE: usize =
     max_payload_len(COW_FILE_PAGE_SIZE) - COLUMN_DELETION_BLOB_PAGE_HEADER_SIZE;
 /// Stable per-blob framing header length for v2 column auxiliary blobs.
-pub const COLUMN_AUX_BLOB_HEADER_SIZE: usize = 8;
+pub(super) const COLUMN_AUX_BLOB_HEADER_SIZE: usize = 8;
 /// Blob kind for persisted row-id-delta delete payloads.
-pub const COLUMN_AUX_BLOB_KIND_DELETE_DELTAS: u8 = 1;
+pub(super) const COLUMN_AUX_BLOB_KIND_DELETE_DELTAS: u8 = 1;
 /// Codec kind for little-endian `u32` delete-delta payload bytes.
-pub const COLUMN_AUX_BLOB_CODEC_U32_DELTA_LIST: u8 = 1;
+pub(super) const COLUMN_AUX_BLOB_CODEC_U32_DELTA_LIST: u8 = 1;
 
 #[inline]
 fn column_deletion_blob_invariant() -> Error {
@@ -46,7 +46,7 @@ fn invalid_payload(message: impl Into<String>) -> Error {
 /// Reference to one offloaded delete-payload byte range in linked immutable
 /// blob blocks.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct BlobRef {
+pub(crate) struct BlobRef {
     pub start_block_id: BlockID,
     pub start_offset: u16,
     pub byte_len: u32,
@@ -297,7 +297,7 @@ impl<'a, M: MutableCowFile> ColumnDeletionBlobWriter<'a, M> {
 
     /// Appends one framed delete payload and returns the persisted blob
     /// reference.
-    pub async fn append_delete_payload(&mut self, bytes: &[u8]) -> Result<BlobRef> {
+    pub(super) async fn append_delete_payload(&mut self, bytes: &[u8]) -> Result<BlobRef> {
         let header = ColumnAuxBlobHeader::delete_payload(bytes.len())?;
         self.append_framed_blob(header, bytes).await
     }
@@ -332,7 +332,7 @@ impl<'a, M: MutableCowFile> ColumnDeletionBlobWriter<'a, M> {
     }
 
     /// Flushes every pending blob page into the mutable CoW file.
-    pub async fn finish(&mut self) -> Result<()> {
+    pub(super) async fn finish(&mut self) -> Result<()> {
         if let Some(page) = self.current_page.take()
             && page.used_size > 0
         {
@@ -628,6 +628,20 @@ mod tests {
     use crate::value::ValKind;
     use std::sync::Arc;
 
+    fn metadata() -> Arc<TableMetadata> {
+        Arc::new(
+            TableMetadata::try_new(
+                vec![ColumnSpec::new(
+                    "c0",
+                    ValKind::U64,
+                    ColumnAttributes::empty(),
+                )],
+                vec![],
+            )
+            .expect("valid table metadata"),
+        )
+    }
+
     #[test]
     fn test_blob_header_roundtrip() {
         let header = ColumnAuxBlobHeader::delete_payload(27).unwrap();
@@ -652,16 +666,8 @@ mod tests {
     fn test_blob_writer_reader_roundtrip() {
         smol::block_on(async {
             let (_temp_dir, fs) = build_test_fs();
-            let metadata = Arc::new(TableMetadata::new(
-                vec![ColumnSpec::new(
-                    "c0",
-                    ValKind::U64,
-                    ColumnAttributes::empty(),
-                )],
-                vec![],
-            ));
             let table = fs
-                .create_table_file(test_user_table_id(1), metadata, false)
+                .create_table_file(test_user_table_id(1), metadata(), false)
                 .unwrap();
             let (table, old_root) = table.commit(1, false).await.unwrap();
             drop(old_root);
@@ -702,16 +708,8 @@ mod tests {
     fn test_collect_referenced_blocks_skips_single_block_read() {
         smol::block_on(async {
             let (_temp_dir, fs) = build_test_fs();
-            let metadata = Arc::new(TableMetadata::new(
-                vec![ColumnSpec::new(
-                    "c0",
-                    ValKind::U64,
-                    ColumnAttributes::empty(),
-                )],
-                vec![],
-            ));
             let table = fs
-                .create_table_file(test_user_table_id(1), metadata, false)
+                .create_table_file(test_user_table_id(1), metadata(), false)
                 .unwrap();
             let (table, old_root) = table.commit(1, false).await.unwrap();
             drop(old_root);
@@ -758,16 +756,8 @@ mod tests {
     fn test_blob_writer_reader_crosses_pages() {
         smol::block_on(async {
             let (_temp_dir, fs) = build_test_fs();
-            let metadata = Arc::new(TableMetadata::new(
-                vec![ColumnSpec::new(
-                    "c0",
-                    ValKind::U64,
-                    ColumnAttributes::empty(),
-                )],
-                vec![],
-            ));
             let table = fs
-                .create_table_file(test_user_table_id(1), metadata, false)
+                .create_table_file(test_user_table_id(1), metadata(), false)
                 .unwrap();
             let (table, old_root) = table.commit(1, false).await.unwrap();
             drop(old_root);
@@ -808,16 +798,8 @@ mod tests {
     fn test_collect_referenced_blocks_crosses_blocks() {
         smol::block_on(async {
             let (_temp_dir, fs) = build_test_fs();
-            let metadata = Arc::new(TableMetadata::new(
-                vec![ColumnSpec::new(
-                    "c0",
-                    ValKind::U64,
-                    ColumnAttributes::empty(),
-                )],
-                vec![],
-            ));
             let table = fs
-                .create_table_file(test_user_table_id(1), metadata, false)
+                .create_table_file(test_user_table_id(1), metadata(), false)
                 .unwrap();
             let (table, old_root) = table.commit(1, false).await.unwrap();
             drop(old_root);
@@ -861,16 +843,8 @@ mod tests {
     fn test_blob_writer_starts_next_blob_on_fresh_page_after_exact_fill() {
         smol::block_on(async {
             let (_temp_dir, fs) = build_test_fs();
-            let metadata = Arc::new(TableMetadata::new(
-                vec![ColumnSpec::new(
-                    "c0",
-                    ValKind::U64,
-                    ColumnAttributes::empty(),
-                )],
-                vec![],
-            ));
             let table = fs
-                .create_table_file(test_user_table_id(1), metadata, false)
+                .create_table_file(test_user_table_id(1), metadata(), false)
                 .unwrap();
             let (table, old_root) = table.commit(1, false).await.unwrap();
             drop(old_root);

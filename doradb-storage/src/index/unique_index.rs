@@ -17,7 +17,7 @@ use futures::FutureExt;
 use std::future::Future;
 
 /// Abstraction of unique index.
-pub trait UniqueIndex: Send + Sync {
+pub(crate) trait UniqueIndex: Send + Sync {
     /// Lookup unique key in this index.
     /// Return associated value and delete flag.
     fn lookup(
@@ -89,6 +89,7 @@ pub trait UniqueIndex: Send + Sync {
     ) -> impl Future<Output = Result<IndexCompareExchange>>;
 
     /// Scan values into given collection.
+    #[cfg_attr(not(test), expect(dead_code, reason = "reserved scan_values"))]
     fn scan_values(
         &self,
         pool_guard: &PoolGuard,
@@ -98,7 +99,7 @@ pub trait UniqueIndex: Send + Sync {
 }
 
 /// Generic unique-index implementation backed by a generic B-Tree.
-pub struct UniqueMemIndex<P: 'static> {
+pub(crate) struct UniqueMemIndex<P: 'static> {
     tree: GenericBTree<P>,
     encoder: BTreeKeyEncoder,
 }
@@ -217,7 +218,7 @@ impl<P: BufferPool> UniqueMemIndex<P> {
 
     /// Wrap an already-created BTree with a key encoder.
     #[inline]
-    pub fn with_encoder(tree: GenericBTree<P>, encoder: BTreeKeyEncoder) -> Self {
+    pub(crate) fn with_encoder(tree: GenericBTree<P>, encoder: BTreeKeyEncoder) -> Self {
         UniqueMemIndex { tree, encoder }
     }
 
@@ -1038,7 +1039,7 @@ mod tests {
             .await
             .unwrap();
         assert!(inserted.is_ok());
-        assert!(inserted.is_merged());
+        assert!(matches!(inserted, IndexInsert::Ok(true)));
         assert_eq!(
             index.lookup(pool_guard, &key4, 100).await.unwrap(),
             Some((row_id4, false))

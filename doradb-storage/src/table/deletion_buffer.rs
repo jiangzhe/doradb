@@ -19,7 +19,7 @@ use std::sync::Arc;
 
 /// Result of attempting to claim or seed a cold-row delete marker.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DeletionError {
+pub(crate) enum DeletionError {
     /// The row is owned by another active transaction, or by a committed delete
     /// newer than the caller's snapshot.
     WriteConflict,
@@ -34,7 +34,7 @@ pub enum DeletionError {
 /// still read from disk when the marker is absent or newer than a reader's
 /// snapshot.
 #[derive(Clone)]
-pub enum DeleteMarker {
+pub(crate) enum DeleteMarker {
     /// Marker backed by a shared transaction status.
     ///
     /// While uncommitted, this is the cold-row write ownership record for a
@@ -53,15 +53,14 @@ pub enum DeleteMarker {
 /// delete bitmaps are the durable base state; this buffer keeps active and
 /// recent committed markers needed by transactions, rollback, purge,
 /// checkpoint, and recovery replay.
-pub struct ColumnDeletionBuffer {
+pub(crate) struct ColumnDeletionBuffer {
     entries: DashMap<RowID, DeleteMarker>,
 }
 
 impl ColumnDeletionBuffer {
     /// Creates an empty column deletion buffer.
-    #[allow(clippy::new_without_default)]
     #[inline]
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         ColumnDeletionBuffer {
             entries: DashMap::new(),
         }
@@ -77,7 +76,7 @@ impl ColumnDeletionBuffer {
     /// is treated as a write conflict because the caller is racing with a newer
     /// version state it cannot safely overwrite.
     #[inline]
-    pub fn put_ref(
+    pub(crate) fn put_ref(
         &self,
         row_id: RowID,
         status: Arc<SharedTrxStatus>,
@@ -126,7 +125,7 @@ impl ColumnDeletionBuffer {
     /// [`DeletionError::AlreadyDeleted`] because the row is already represented
     /// by a different committed delete.
     #[inline]
-    pub fn put_committed(&self, row_id: RowID, cts: TrxID) -> Result<(), DeletionError> {
+    pub(crate) fn put_committed(&self, row_id: RowID, cts: TrxID) -> Result<(), DeletionError> {
         match self.entries.entry(row_id) {
             Entry::Occupied(mut entry) => match entry.get() {
                 DeleteMarker::Ref(status) => {
@@ -164,7 +163,7 @@ impl ColumnDeletionBuffer {
     /// Returns `true` only when a conversion happened. Missing markers,
     /// uncommitted refs, and already compact markers return `false`.
     #[inline]
-    pub fn promote_delete_marker_if_committed(&self, row_id: RowID) -> bool {
+    pub(crate) fn promote_delete_marker_if_committed(&self, row_id: RowID) -> bool {
         match self.entries.entry(row_id) {
             Entry::Occupied(mut entry) => match entry.get() {
                 DeleteMarker::Ref(status) => {
@@ -186,7 +185,7 @@ impl ColumnDeletionBuffer {
     /// Callers are responsible for applying read or write visibility rules with
     /// their own transaction snapshot.
     #[inline]
-    pub fn get(&self, row_id: RowID) -> Option<DeleteMarker> {
+    pub(crate) fn get(&self, row_id: RowID) -> Option<DeleteMarker> {
         self.entries.get(&row_id).map(|entry| entry.value().clone())
     }
 
@@ -197,7 +196,7 @@ impl ColumnDeletionBuffer {
     /// older than `min_active_sts`. This proves every active or future
     /// transaction sees the cold row as deleted.
     #[inline]
-    pub fn delete_marker_is_globally_purgeable(
+    pub(crate) fn delete_marker_is_globally_purgeable(
         &self,
         row_id: RowID,
         min_active_sts: TrxID,
@@ -210,7 +209,7 @@ impl ColumnDeletionBuffer {
     /// The `min_active_sts` closure is called only after the marker exists and
     /// has a committed delete timestamp.
     #[inline]
-    pub fn delete_marker_is_globally_purgeable_with<F>(
+    pub(crate) fn delete_marker_is_globally_purgeable_with<F>(
         &self,
         row_id: RowID,
         min_active_sts: F,
@@ -242,7 +241,7 @@ impl ColumnDeletionBuffer {
     /// Deletion checkpoint uses this to select the replay range not yet covered
     /// by the durable delete bitmap. Uncommitted refs are skipped; committed
     /// refs are included by reading the shared transaction status.
-    pub fn collect_committed_in_range(
+    pub(crate) fn collect_committed_in_range(
         &self,
         previous_cutoff: TrxID,
         current_cutoff: TrxID,
@@ -273,7 +272,7 @@ impl ColumnDeletionBuffer {
     /// belongs to the transaction being undone. It is not a general committed
     /// marker GC policy.
     #[inline]
-    pub fn remove(&self, row_id: RowID) {
+    pub(crate) fn remove(&self, row_id: RowID) {
         self.entries.remove(&row_id);
     }
 }

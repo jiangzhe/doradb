@@ -546,14 +546,14 @@ impl ActiveStsList {
     /// Insert a new snapshot timestamp.
     /// The value should be larger than any one stored in the list.
     #[inline]
-    pub fn insert(&mut self, value: TrxID) {
+    pub(super) fn insert(&mut self, value: TrxID) {
         debug_assert!(self.active.is_empty() || self.active.back().unwrap() < &value);
         self.active.push_back(value);
     }
 
     /// Returns length of this list.
     #[inline]
-    pub fn len(&self) -> usize {
+    pub(super) fn len(&self) -> usize {
         self.active.len()
     }
 
@@ -563,7 +563,7 @@ impl ActiveStsList {
     /// If it's not the smallest one, cache it in deleted set.
     /// This is an optimization to speed up retrieval of smallest snapshot timestamp.
     #[inline]
-    pub fn remove(&mut self, value: TrxID) -> TrxID {
+    pub(super) fn remove(&mut self, value: TrxID) -> TrxID {
         debug_assert!(!self.active.is_empty());
         let first = self.active.front().cloned().unwrap();
         if first == value {
@@ -589,7 +589,7 @@ impl LogPartition {
     /// Execute GC analysis in loop.
     /// This method is used for a separate GC analyzer thread for each log partition.
     #[inline]
-    pub fn gc_loop(&self, gc_rx: Receiver<GC>, purge_chan: Sender<Purge>) {
+    pub(crate) fn gc_loop(&self, gc_rx: Receiver<GC>, purge_chan: Sender<Purge>) {
         while let Ok(msg) = gc_rx.recv() {
             match msg {
                 GC::Stop => return,
@@ -661,7 +661,7 @@ impl GCBucket {
 
     /// Analyze rollbacked transactions for GC.
     #[inline]
-    pub fn gc_analyze_rollback(&self, sts: TrxID) -> bool {
+    pub(super) fn gc_analyze_rollback(&self, sts: TrxID) -> bool {
         debug_assert!(self.min_active_sts.load(Ordering::Relaxed) != MAX_SNAPSHOT_TS);
         let mut active_sts_list = self.active_sts_list.lock();
         let min_sts = active_sts_list.remove(sts);
@@ -670,7 +670,7 @@ impl GCBucket {
 
     /// Analyze committed transactions for GC.
     #[inline]
-    pub fn gc_analyze_commit(&self, trx_list: Vec<CommittedTrx>) -> bool {
+    pub(super) fn gc_analyze_commit(&self, trx_list: Vec<CommittedTrx>) -> bool {
         // Update both active sts list and committed transaction list
         let mut active_sts_list = self.active_sts_list.lock();
         let mut min_sts = MAX_SNAPSHOT_TS;
@@ -713,14 +713,14 @@ impl GCBucket {
 }
 
 /// Messages sent from commit processing to GC analyzers.
-pub enum GC {
+pub(crate) enum GC {
     Stop,
     // transaction list per gc bucket.
     Commit(HashMap<usize, Vec<CommittedTrx>>),
 }
 
 /// Commands sent to purge workers.
-pub enum Purge {
+pub(crate) enum Purge {
     /// Stop the purge coordinator and let worker shutdown join the thread.
     Stop,
     /// Run a full transaction/index/row-page purge cycle.
@@ -818,7 +818,7 @@ trait PurgeLoop {
 
 /// Single-threaded purge-loop implementation.
 #[derive(Default)]
-pub struct PurgeSingleThreaded;
+pub(crate) struct PurgeSingleThreaded;
 
 impl PurgeLoop for PurgeSingleThreaded {
     #[inline]
@@ -893,7 +893,7 @@ impl PurgeLoop for PurgeSingleThreaded {
 }
 
 /// Dispatcher that fans purge tasks out to executor threads.
-pub struct PurgeDispatcher(Vec<Sender<PurgeTask>>);
+pub(crate) struct PurgeDispatcher(Vec<Sender<PurgeTask>>);
 
 impl PurgeLoop for PurgeDispatcher {
     #[inline]
@@ -991,7 +991,7 @@ impl PurgeLoop for PurgeDispatcher {
 
 /// Worker that executes dispatched purge tasks.
 #[derive(Default)]
-pub struct PurgeExecutor;
+pub(crate) struct PurgeExecutor;
 
 impl PurgeExecutor {
     #[inline]
@@ -1396,8 +1396,8 @@ mod tests {
 
             let table_id = table1(&engine).await;
             let table = engine.catalog().get_table(table_id).await.unwrap();
-            let mut session = engine.try_new_session().unwrap();
-            let mut trx = session.try_begin_trx().unwrap().unwrap();
+            let mut session = engine.new_session().unwrap();
+            let mut trx = session.begin_trx().unwrap();
             trx.exec(async |stmt| {
                 stmt_insert_row(stmt, &table, vec![Val::from(1001i32)]).await?;
                 Ok(())
@@ -1415,7 +1415,7 @@ mod tests {
             else {
                 panic!("row should exist");
             };
-            let status = Arc::new(SharedTrxStatus::global_visible());
+            let status = Arc::new(SharedTrxStatus::new(100));
             table
                 .deletion_buffer()
                 .put_ref(row_id, status.clone(), MAX_SNAPSHOT_TS)
@@ -1485,8 +1485,8 @@ mod tests {
 
             let table_id = table1(&engine).await;
             let table = engine.catalog().get_table(table_id).await.unwrap();
-            let mut session = engine.try_new_session().unwrap();
-            let mut trx = session.try_begin_trx().unwrap().unwrap();
+            let mut session = engine.new_session().unwrap();
+            let mut trx = session.begin_trx().unwrap();
             trx.exec(async |stmt| {
                 stmt_insert_row(stmt, &table, vec![Val::from(1002i32)]).await?;
                 Ok(())
@@ -1578,8 +1578,8 @@ mod tests {
 
             let table_id = table1(&engine).await;
             let table = engine.catalog().get_table(table_id).await.unwrap();
-            let mut session = engine.try_new_session().unwrap();
-            let mut trx = session.try_begin_trx().unwrap().unwrap();
+            let mut session = engine.new_session().unwrap();
+            let mut trx = session.begin_trx().unwrap();
             trx.exec(async |stmt| {
                 stmt_insert_row(stmt, &table, vec![Val::from(1003i32)]).await?;
                 Ok(())
@@ -1620,7 +1620,7 @@ mod tests {
                 generation: page_guard.bf().generation().saturating_add(1),
             };
             drop(page_guard);
-            let status = Arc::new(SharedTrxStatus::global_visible());
+            let status = Arc::new(SharedTrxStatus::new(100));
             table
                 .deletion_buffer()
                 .put_ref(row_id, status.clone(), MAX_SNAPSHOT_TS)
@@ -1690,8 +1690,8 @@ mod tests {
 
             let table_id = table1(&engine).await;
             let table = engine.catalog().get_table(table_id).await.unwrap();
-            let mut session = engine.try_new_session().unwrap();
-            let mut trx = session.try_begin_trx().unwrap().unwrap();
+            let mut session = engine.new_session().unwrap();
+            let mut trx = session.begin_trx().unwrap();
             trx.exec(async |stmt| {
                 stmt_insert_row(stmt, &table, vec![Val::from(1004i32)]).await?;
                 Ok(())
@@ -1815,10 +1815,10 @@ mod tests {
             smol::Timer::after(Duration::from_millis(1000)).await;
             let init_stats = engine.trx_sys.trx_sys_stats();
 
-            let mut session = engine.try_new_session().unwrap();
+            let mut session = engine.new_session().unwrap();
             // insert
             for i in 0..PURGE_SIZE {
-                let mut trx = session.try_begin_trx().unwrap().unwrap();
+                let mut trx = session.begin_trx().unwrap();
                 let res = trx
                     .exec(async |stmt| {
                         stmt_insert_row(stmt, &table, vec![Val::from(i as i32)]).await?;
@@ -1831,7 +1831,7 @@ mod tests {
             }
             // delete
             for i in 0..PURGE_SIZE {
-                let mut trx = session.try_begin_trx().unwrap().unwrap();
+                let mut trx = session.begin_trx().unwrap();
                 let key = SelectKey::new(0, vec![Val::from(i as i32)]);
                 let res = trx
                     .exec(async |stmt| {
@@ -1904,10 +1904,10 @@ mod tests {
             smol::Timer::after(Duration::from_millis(100)).await;
             let init_stats = engine.trx_sys.trx_sys_stats();
 
-            let mut session = engine.try_new_session().unwrap();
+            let mut session = engine.new_session().unwrap();
             // insert
             for i in 0..PURGE_SIZE {
-                let mut trx = session.try_begin_trx().unwrap().unwrap();
+                let mut trx = session.begin_trx().unwrap();
                 let res = trx
                     .exec(async |stmt| {
                         stmt_insert_row(stmt, &table, vec![Val::from(i as i32)]).await?;
@@ -1920,7 +1920,7 @@ mod tests {
             }
             // delete
             for i in 0..PURGE_SIZE {
-                let mut trx = session.try_begin_trx().unwrap().unwrap();
+                let mut trx = session.begin_trx().unwrap();
                 let key = SelectKey::new(0, vec![Val::from(i as i32)]);
                 let res = trx
                     .exec(async |stmt| {

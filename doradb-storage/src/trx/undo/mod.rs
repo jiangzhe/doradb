@@ -1,5 +1,6 @@
 mod index;
 mod row;
 
-pub use index::*;
-pub use row::*;
+pub(in crate::trx) use index::IndexPurgeEntry;
+pub(crate) use index::{IndexUndo, IndexUndoKind, IndexUndoLogs};
+pub(crate) use row::*;

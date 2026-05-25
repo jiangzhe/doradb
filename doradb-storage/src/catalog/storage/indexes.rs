@@ -17,7 +17,7 @@ use std::sync::OnceLock;
 
 /* Indexes table */
 
-pub const TABLE_ID_INDEXES: TableID = 2;
+pub(super) const TABLE_ID_INDEXES: TableID = 2;
 const COL_NO_INDEXES_TABLE_ID: usize = 0;
 const COL_NAME_INDEXES_TABLE_ID: &str = "table_id";
 const COL_NO_INDEXES_INDEX_NO: usize = 1;
@@ -27,12 +27,12 @@ const COL_NAME_INDEXES_INDEX_ATTRIBUTES: &str = "index_attributes";
 const PK_NO_INDEXES: usize = 0;
 
 /// Return static table definition of `catalog.indexes`.
-pub fn catalog_definition_of_indexes() -> &'static CatalogDefinition {
+pub(super) fn catalog_definition_of_indexes() -> &'static CatalogDefinition {
     static DEF: OnceLock<CatalogDefinition> = OnceLock::new();
     DEF.get_or_init(|| {
         CatalogDefinition {
             table_id: TABLE_ID_INDEXES,
-            metadata: TableMetadata::new(
+            metadata: TableMetadata::try_new(
                 vec![
                     // table_id unsgined bigint not null
                     ColumnSpec {
@@ -60,7 +60,8 @@ pub fn catalog_definition_of_indexes() -> &'static CatalogDefinition {
                         IndexAttributes::PK,
                     ),
                 ],
-            ),
+            )
+            .expect("valid table metadata"),
         }
     })
 }
@@ -87,13 +88,13 @@ fn row_to_index_object(col_layout: &TableColumnLayout, row: Row<'_>) -> IndexObj
 }
 
 /// Runtime accessor for `catalog.indexes`.
-pub struct Indexes<'a> {
+pub(crate) struct Indexes<'a> {
     pub(super) table: &'a CatalogTable,
 }
 
 impl Indexes<'_> {
     /// Insert an index.
-    pub async fn insert(&self, stmt: &mut Statement<'_>, obj: &IndexObject) -> bool {
+    pub(crate) async fn insert(&self, stmt: &mut Statement<'_>, obj: &IndexObject) -> bool {
         let cols = vec![
             Val::from(obj.table_id),
             Val::from(obj.index_no),
@@ -103,7 +104,7 @@ impl Indexes<'_> {
     }
 
     /// Delete an index by (table_id, index_no).
-    pub async fn delete_by_id(
+    pub(crate) async fn delete_by_id(
         &self,
         stmt: &mut Statement<'_>,
         table_id: TableID,
@@ -119,7 +120,7 @@ impl Indexes<'_> {
     }
 
     /// Delete all indexes for one table and return the number of deleted rows.
-    pub async fn delete_by_table_id(
+    pub(crate) async fn delete_by_table_id(
         &self,
         stmt: &mut Statement<'_>,
         table_id: TableID,
@@ -138,7 +139,7 @@ impl Indexes<'_> {
     }
 
     /// List all indexes by given table id.
-    pub async fn list_uncommitted_by_table_id(
+    pub(crate) async fn list_uncommitted_by_table_id(
         &self,
         guards: &PoolGuards,
         table_id: TableID,
@@ -167,7 +168,7 @@ impl Indexes<'_> {
 
 /* Index columns table */
 
-pub const TABLE_ID_INDEX_COLUMNS: TableID = 3;
+pub(super) const TABLE_ID_INDEX_COLUMNS: TableID = 3;
 const COL_NO_INDEX_COLUMNS_TABLE_ID: usize = 0;
 const COL_NAME_INDEX_COLUMNS_TABLE_ID: &str = "table_id";
 const COL_NO_INDEX_COLUMNS_INDEX_NO: usize = 1;
@@ -182,12 +183,12 @@ const COL_NAME_INDEX_COLUMNS_INDEX_ORDER: &str = "index_order";
 const PK_NO_INDEX_COLUMNS: usize = 0;
 
 /// Return static table definition of `catalog.index_columns`.
-pub fn catalog_definition_of_index_columns() -> &'static CatalogDefinition {
+pub(super) fn catalog_definition_of_index_columns() -> &'static CatalogDefinition {
     static DEF: OnceLock<CatalogDefinition> = OnceLock::new();
     DEF.get_or_init(|| {
         CatalogDefinition {
             table_id: TABLE_ID_INDEX_COLUMNS,
-            metadata: TableMetadata::new(
+            metadata: TableMetadata::try_new(
                 vec![
                     // table_id unsigned bigint not null
                     ColumnSpec {
@@ -228,7 +229,8 @@ pub fn catalog_definition_of_index_columns() -> &'static CatalogDefinition {
                         IndexAttributes::PK,
                     ),
                 ],
-            ),
+            )
+            .expect("valid table metadata"),
         }
     })
 }
@@ -265,13 +267,13 @@ fn row_to_index_column_object(col_layout: &TableColumnLayout, row: Row<'_>) -> I
 }
 
 /// Runtime accessor for `catalog.index_columns`.
-pub struct IndexColumns<'a> {
+pub(crate) struct IndexColumns<'a> {
     pub(super) table: &'a CatalogTable,
 }
 
 impl IndexColumns<'_> {
     /// Insert one index-column mapping row.
-    pub async fn insert(&self, stmt: &mut Statement<'_>, obj: &IndexColumnObject) -> bool {
+    pub(crate) async fn insert(&self, stmt: &mut Statement<'_>, obj: &IndexColumnObject) -> bool {
         let cols = vec![
             Val::from(obj.table_id),
             Val::from(obj.index_no),
@@ -303,7 +305,7 @@ impl IndexColumns<'_> {
     }
 
     /// Delete all index-column rows by `(table_id, index_no)`.
-    pub async fn delete_by_index(
+    pub(crate) async fn delete_by_index(
         &self,
         stmt: &mut Statement<'_>,
         table_id: TableID,
@@ -329,7 +331,7 @@ impl IndexColumns<'_> {
     }
 
     /// Delete all index-column rows for one table and return the number of deleted rows.
-    pub async fn delete_by_table_id(
+    pub(crate) async fn delete_by_table_id(
         &self,
         stmt: &mut Statement<'_>,
         table_id: TableID,
@@ -356,7 +358,7 @@ impl IndexColumns<'_> {
     }
 
     /// List all index-column rows of one table from uncommitted-visible rows.
-    pub async fn list_uncommitted_by_table_id(
+    pub(crate) async fn list_uncommitted_by_table_id(
         &self,
         guards: &PoolGuards,
         table_id: TableID,
@@ -406,7 +408,7 @@ mod tests {
                 .build()
                 .await
                 .unwrap();
-            let mut session = engine.try_new_session().unwrap();
+            let mut session = engine.new_session().unwrap();
 
             let idx_42_0 = IndexObject {
                 table_id: 42,
@@ -424,7 +426,7 @@ mod tests {
                 index_attributes: IndexAttributes::PK,
             };
 
-            let mut trx = session.try_begin_trx().unwrap().unwrap();
+            let mut trx = session.begin_trx().unwrap();
             trx.exec(async |stmt| {
                 assert!(
                     engine
@@ -457,7 +459,7 @@ mod tests {
             mark_catalog_ddl(&mut trx, DDLRedo::CreateTable(42));
             trx.commit().await.unwrap();
 
-            let mut trx = session.try_begin_trx().unwrap().unwrap();
+            let mut trx = session.begin_trx().unwrap();
             trx.exec(async |stmt| {
                 assert!(
                     engine
@@ -502,7 +504,7 @@ mod tests {
             assert_eq!(idx_43.len(), 1);
             assert_eq!(idx_43[0].index_no, 0);
 
-            let mut trx = session.try_begin_trx().unwrap().unwrap();
+            let mut trx = session.begin_trx().unwrap();
             trx.exec(async |stmt| {
                 assert!(
                     !engine
@@ -572,7 +574,7 @@ mod tests {
                 .build()
                 .await
                 .unwrap();
-            let mut session = engine.try_new_session().unwrap();
+            let mut session = engine.new_session().unwrap();
 
             let indexes = [
                 IndexObject {
@@ -592,7 +594,7 @@ mod tests {
                 },
             ];
 
-            let mut trx = session.try_begin_trx().unwrap().unwrap();
+            let mut trx = session.begin_trx().unwrap();
             trx.exec(async |stmt| {
                 for index in &indexes {
                     assert!(engine.catalog().storage.indexes().insert(stmt, index).await);
@@ -604,7 +606,7 @@ mod tests {
             mark_catalog_ddl(&mut trx, DDLRedo::CreateTable(42));
             trx.commit().await.unwrap();
 
-            let mut trx = session.try_begin_trx().unwrap().unwrap();
+            let mut trx = session.begin_trx().unwrap();
             trx.exec(async |stmt| {
                 assert_eq!(
                     engine
@@ -669,7 +671,7 @@ mod tests {
                 .build()
                 .await
                 .unwrap();
-            let mut session = engine.try_new_session().unwrap();
+            let mut session = engine.new_session().unwrap();
 
             let index_columns = [
                 IndexColumnObject {
@@ -702,7 +704,7 @@ mod tests {
                 },
             ];
 
-            let mut trx = session.try_begin_trx().unwrap().unwrap();
+            let mut trx = session.begin_trx().unwrap();
             trx.exec(async |stmt| {
                 for index_column in &index_columns {
                     assert!(
@@ -721,7 +723,7 @@ mod tests {
             mark_catalog_ddl(&mut trx, DDLRedo::CreateTable(42));
             trx.commit().await.unwrap();
 
-            let mut trx = session.try_begin_trx().unwrap().unwrap();
+            let mut trx = session.begin_trx().unwrap();
             trx.exec(async |stmt| {
                 assert_eq!(
                     engine
@@ -760,7 +762,7 @@ mod tests {
             assert_eq!(remaining_42.len(), 1);
             assert_eq!(remaining_42[0].index_no, 0);
 
-            let mut trx = session.try_begin_trx().unwrap().unwrap();
+            let mut trx = session.begin_trx().unwrap();
             trx.exec(async |stmt| {
                 assert_eq!(
                     engine

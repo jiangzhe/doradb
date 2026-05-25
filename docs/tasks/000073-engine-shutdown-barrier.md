@@ -21,9 +21,8 @@ engine lifecycle semantics:
 3. Worker-backed components move stop/join logic into explicit idempotent
    shutdown hooks instead of relying only on `Drop`.
 4. `TransactionSystemShutdown` is renamed to `StorageEngineShutdown`.
-5. The old infallible compatibility entry points `new_session()` and
-   `begin_trx()` are removed in favor of fallible `try_new_session()` and
-   `try_begin_trx()`.
+5. The old infallible compatibility entry points are removed in favor of
+   fallible `new_session()` and `try_begin_trx()`.
 
 `drop(engine)` remains a fail-fast cleanup path only for the trivial
 no-extra-ref case. Coordinated teardown is expected to use explicit shutdown.
@@ -83,7 +82,7 @@ Source Backlogs:
    - later shutdown calls either complete teardown or observe that shutdown is
      already complete.
 4. Reject new work after shutdown begins:
-   - add `Engine::try_new_session()` and `EngineRef::try_new_session()`;
+   - make `Engine::new_session()` and `EngineRef::new_session()` fallible;
    - add `Session::try_begin_trx()`;
    - remove `new_session()` and `begin_trx()`.
 5. Rename `Error::TransactionSystemShutdown` to
@@ -158,8 +157,7 @@ Reference:
    - once only the root engine remains, execute explicit worker shutdown hooks
      before allowing owner teardown to continue.
 2. Update public engine/session entry points:
-   - remove `Engine::new_session()` and `EngineRef::new_session()`;
-   - add `try_new_session()` on both `Engine` and `EngineRef`;
+   - make `Engine::new_session()` and `EngineRef::new_session()` fallible;
    - remove `Session::begin_trx()`;
    - add `Session::try_begin_trx() -> Result<Option<ActiveTrx>>`;
    - update session helper methods that currently do `begin_trx().unwrap()` to
@@ -210,8 +208,8 @@ RFC-0009.
      `EngineRef`/`Session` holders are still alive;
    - runs explicit worker shutdown hooks before owner teardown proceeds.
 2. Engine and session admission now use only fallible entry points:
-   - `Engine::try_new_session()`
-   - `EngineRef::try_new_session()`
+   - `Engine::new_session()`
+   - `EngineRef::new_session()`
    - `Session::try_begin_trx()`
    The old `new_session()` and `begin_trx()` compatibility entry points were
    removed.
@@ -259,9 +257,9 @@ RFC-0009.
 ## Test Cases
 
 1. `Engine::shutdown()` is idempotent when no extra engine references exist.
-2. `Engine::try_new_session()` returns `Err(Error::StorageEngineShutdown)` once
+2. `Engine::new_session()` returns `Err(Error::StorageEngineShutdown)` once
    shutdown begins.
-3. `EngineRef::try_new_session()` returns
+3. `EngineRef::new_session()` returns
    `Err(Error::StorageEngineShutdown)` once shutdown begins.
 4. `Session::try_begin_trx()` returns
    `Err(Error::StorageEngineShutdown)` once shutdown begins.

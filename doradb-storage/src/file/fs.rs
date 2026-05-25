@@ -44,25 +44,26 @@ const INVALID_SLOT: u32 = u32::MAX;
 
 /// Snapshot of shared-storage service ingress and scheduler activity.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct StorageServiceStats {
+pub(crate) struct StorageServiceStats {
     /// Number of admitted table-file or readonly-cache read requests.
-    pub table_read_requests: usize,
+    pub(crate) table_read_requests: usize,
     /// Number of admitted evictable-pool page-in read requests.
-    pub pool_read_requests: usize,
+    pub(crate) pool_read_requests: usize,
     /// Number of admitted shared background-write requests.
-    pub background_write_requests: usize,
+    pub(crate) background_write_requests: usize,
     /// Number of scheduler turns consumed by the table-read lane.
-    pub table_read_turns: usize,
+    pub(crate) table_read_turns: usize,
     /// Number of scheduler turns consumed by the pool-read lane.
-    pub pool_read_turns: usize,
+    pub(crate) pool_read_turns: usize,
     /// Number of scheduler turns consumed by the background-write lane.
-    pub background_write_turns: usize,
+    pub(crate) background_write_turns: usize,
 }
 
 impl StorageServiceStats {
     /// Returns the saturating delta from one earlier snapshot.
     #[inline]
-    pub fn delta_since(self, earlier: StorageServiceStats) -> StorageServiceStats {
+    #[cfg_attr(not(test), expect(dead_code, reason = "pending dead-code audit"))]
+    pub(crate) fn delta_since(self, earlier: StorageServiceStats) -> StorageServiceStats {
         StorageServiceStats {
             table_read_requests: self
                 .table_read_requests
@@ -1358,7 +1359,7 @@ impl Component for FileSystemWorkers {
 ///
 /// `FileSystem` owns the three ingress lane clients plus the shared backend
 /// stats handle. The backend itself remains owned by `fs_workers`.
-pub struct FileSystem {
+pub(crate) struct FileSystem {
     table_reads: IOClient<ReadSubmission>,
     pool_reads: IOClient<PoolReadRequest>,
     background_writes: IOClient<BackgroundWriteRequest>,
@@ -1462,7 +1463,7 @@ impl FileSystem {
     /// If trunc is set to true, old file will be overwritten.
     /// Otherwise, an error will be returned if file already exists.
     #[inline]
-    pub fn create_table_file(
+    pub(crate) fn create_table_file(
         &self,
         table_id: TableID,
         metadata: Arc<TableMetadata>,
@@ -1481,7 +1482,7 @@ impl FileSystem {
 
     /// Open an existing user table file.
     #[inline]
-    pub async fn open_table_file(
+    pub(crate) async fn open_table_file(
         &self,
         table_id: TableID,
         disk_pool: QuiescentGuard<ReadonlyBufferPool>,
@@ -1496,7 +1497,7 @@ impl FileSystem {
 
     /// Build file path for a deterministic user-table file.
     #[inline]
-    pub fn user_table_file_path(&self, table_id: TableID) -> String {
+    pub(crate) fn user_table_file_path(&self, table_id: TableID) -> String {
         let file_name = user_table_file_name(table_id);
         path_to_string(&self.data_dir.join(file_name), "user table file path")
     }
@@ -1547,7 +1548,7 @@ impl FileSystem {
 
     /// Build absolute path for the unified catalog file (`*.mtb`).
     #[inline]
-    pub fn catalog_mtb_file_path(&self) -> String {
+    pub(crate) fn catalog_mtb_file_path(&self) -> String {
         path_to_string(
             &self.data_dir.join(&self.catalog_file_name),
             "catalog multi-table file path",
@@ -1556,25 +1557,27 @@ impl FileSystem {
 
     /// Returns one snapshot of backend-owned submit/wait activity.
     #[inline]
-    pub fn io_backend_stats(&self) -> IOBackendStats {
+    pub(crate) fn io_backend_stats(&self) -> IOBackendStats {
         self.io_backend_stats.snapshot()
     }
 
     /// Returns one snapshot of shared-storage ingress and scheduler activity.
     #[inline]
-    pub fn storage_service_stats(&self) -> StorageServiceStats {
+    #[cfg_attr(not(test), expect(dead_code, reason = "pending dead-code audit"))]
+    pub(crate) fn storage_service_stats(&self) -> StorageServiceStats {
         self.storage_service_stats.snapshot()
     }
 
     /// Returns the configured shared-storage worker IO depth.
     #[inline]
-    pub fn configured_io_depth(&self) -> usize {
+    #[cfg_attr(not(test), expect(dead_code, reason = "pending dead-code audit"))]
+    pub(crate) fn configured_io_depth(&self) -> usize {
         self.configured_io_depth
     }
 
     /// Open existing catalog multi-table file or create a new one.
     #[inline]
-    pub async fn open_or_create_multi_table_file(
+    pub(crate) async fn open_or_create_multi_table_file(
         &self,
         disk_pool: QuiescentGuard<ReadonlyBufferPool>,
     ) -> Result<Arc<MultiTableFile>> {
@@ -1676,7 +1679,7 @@ pub(crate) mod tests {
     use crate::engine::Engine;
     use crate::error::{ConfigError, ErrorKind};
     use crate::file::BlockID;
-    use crate::file::cow_file::COW_FILE_PAGE_SIZE;
+    use crate::file::cow_file::{COW_FILE_PAGE_SIZE, MutableCowFile};
     use crate::file::table_file::TableFile;
     use crate::io::{
         DirectBuf, IOBuf, IOKind, StorageBackendFileIdentity, StorageBackendOp,
@@ -1851,14 +1854,17 @@ pub(crate) mod tests {
     }
 
     fn make_metadata() -> Arc<TableMetadata> {
-        Arc::new(TableMetadata::new(
-            vec![ColumnSpec::new(
-                "c0",
-                ValKind::U32,
-                ColumnAttributes::empty(),
-            )],
-            vec![IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::PK)],
-        ))
+        Arc::new(
+            TableMetadata::try_new(
+                vec![ColumnSpec::new(
+                    "c0",
+                    ValKind::U32,
+                    ColumnAttributes::empty(),
+                )],
+                vec![IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::PK)],
+            )
+            .expect("valid table metadata"),
+        )
     }
 
     async fn write_payload(
@@ -2206,14 +2212,17 @@ pub(crate) mod tests {
         smol::block_on(async {
             let (_temp_dir, fs) = build_test_fs();
 
-            let metadata = Arc::new(TableMetadata::new(
-                vec![ColumnSpec::new(
-                    "c0",
-                    ValKind::U32,
-                    ColumnAttributes::empty(),
-                )],
-                vec![IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::PK)],
-            ));
+            let metadata = Arc::new(
+                TableMetadata::try_new(
+                    vec![ColumnSpec::new(
+                        "c0",
+                        ValKind::U32,
+                        ColumnAttributes::empty(),
+                    )],
+                    vec![IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::PK)],
+                )
+                .expect("valid table metadata"),
+            );
             let mutable = fs
                 .create_table_file(USER_OBJ_ID_START, Arc::clone(&metadata), false)
                 .unwrap();
@@ -2237,14 +2246,17 @@ pub(crate) mod tests {
         smol::block_on(async {
             let (_temp_dir, fs) = build_test_fs();
             let table_id = USER_OBJ_ID_START + 9;
-            let metadata = Arc::new(TableMetadata::new(
-                vec![ColumnSpec::new(
-                    "c0",
-                    ValKind::U32,
-                    ColumnAttributes::empty(),
-                )],
-                vec![IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::PK)],
-            ));
+            let metadata = Arc::new(
+                TableMetadata::try_new(
+                    vec![ColumnSpec::new(
+                        "c0",
+                        ValKind::U32,
+                        ColumnAttributes::empty(),
+                    )],
+                    vec![IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::PK)],
+                )
+                .expect("valid table metadata"),
+            );
             let mutable = fs
                 .create_table_file(table_id, Arc::clone(&metadata), false)
                 .unwrap();

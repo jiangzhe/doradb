@@ -39,21 +39,15 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
 /// Per-row recovery map used while rebuilding one row page from redo.
-pub struct RecoverMap {
+pub(crate) struct RecoverMap {
     create_cts: TrxID,
     entries: Vec<Option<TrxID>>,
 }
 
 impl RecoverMap {
-    /// Returns an empty recover map.
-    #[inline]
-    pub fn empty() -> Self {
-        RecoverMap::new(0)
-    }
-
     /// Returns a recover map with given create CTS.
     #[inline]
-    pub fn new(create_cts: TrxID) -> Self {
+    pub(crate) fn new(create_cts: TrxID) -> Self {
         RecoverMap {
             create_cts,
             entries: vec![],
@@ -62,19 +56,19 @@ impl RecoverMap {
 
     /// Returns CTS when this page is created.
     #[inline]
-    pub fn create_cts(&self) -> TrxID {
+    pub(crate) fn create_cts(&self) -> TrxID {
         self.create_cts
     }
 
     /// Returns whether entry of given row position is vacant.
     #[inline]
-    pub fn is_vacant(&self, row_idx: usize) -> bool {
+    pub(crate) fn is_vacant(&self, row_idx: usize) -> bool {
         row_idx >= self.entries.len() || self.entries[row_idx].is_none()
     }
 
     /// Insert CTS at given row position.
     #[inline]
-    pub fn insert_at(&mut self, row_idx: usize, cts: TrxID) {
+    pub(crate) fn insert_at(&mut self, row_idx: usize, cts: TrxID) {
         while self.entries.len() <= row_idx {
             self.entries.push(None);
         }
@@ -83,7 +77,7 @@ impl RecoverMap {
 
     /// Update CTS at given row position.
     #[inline]
-    pub fn update_at(&mut self, row_idx: usize, cts: TrxID) {
+    pub(crate) fn update_at(&mut self, row_idx: usize, cts: TrxID) {
         debug_assert!(row_idx < self.entries.len());
         debug_assert!(self.at(row_idx).unwrap() <= cts);
         self.entries[row_idx].replace(cts);
@@ -91,7 +85,7 @@ impl RecoverMap {
 
     /// Returns CTS at given row position.
     #[inline]
-    pub fn at(&self, row_idx: usize) -> Option<TrxID> {
+    pub(crate) fn at(&self, row_idx: usize) -> Option<TrxID> {
         self.entries.get(row_idx).and_then(|v| *v)
     }
 }
@@ -162,7 +156,7 @@ pub(crate) struct RecoveryDeps {
 }
 
 /// Redo-log recovery coordinator for catalog metadata and user tables.
-pub struct LogRecovery<'a> {
+pub(crate) struct LogRecovery<'a> {
     /// Mutable secondary-index buffer pool used while rebuilding hot MemIndex state.
     index_pool: QuiescentGuard<EvictableBufferPool>,
     /// Mutable row-page buffer pool used for recovered heap pages.
@@ -976,10 +970,7 @@ mod tests {
     use crate::file::block_integrity::{BLOCK_INTEGRITY_HEADER_SIZE, write_block_checksum};
     use crate::file::cow_file::{COW_FILE_PAGE_SIZE, SUPER_BLOCK_ID};
     use crate::file::table_file::MutableTableFile;
-    use crate::index::{
-        COLUMN_DELETION_BLOB_PAGE_HEADER_SIZE, ColumnBlockIndex, UniqueIndex,
-        load_entry_deletion_deltas,
-    };
+    use crate::index::{COLUMN_DELETION_BLOB_PAGE_HEADER_SIZE, ColumnBlockIndex, UniqueIndex};
     use crate::row::ops::{DeleteMvcc, SelectKey, SelectMvcc, UpdateCol, UpdateMvcc};
     use crate::row::{RowID, RowRead};
     use crate::table::{CheckpointOutcome, DeleteMarker, Table, TablePersistence};
@@ -1240,7 +1231,7 @@ mod tests {
         engine: &crate::engine::Engine,
         indexes: Vec<IndexSpec>,
     ) -> TableID {
-        let mut session = engine.try_new_session().unwrap();
+        let mut session = engine.new_session().unwrap();
         let table_id = session
             .create_table(TableSpec::new(index_ddl_columns()), indexes)
             .await
@@ -1253,8 +1244,8 @@ mod tests {
         engine: &crate::engine::Engine,
         table_id: TableID,
     ) -> TrxID {
-        let mut session = engine.try_new_session().unwrap();
-        let mut trx = session.try_begin_trx().unwrap().unwrap();
+        let mut session = engine.new_session().unwrap();
+        let mut trx = session.begin_trx().unwrap();
         trx.exec(async |stmt| {
             assert!(
                 engine
@@ -1328,8 +1319,8 @@ mod tests {
         engine: &crate::engine::Engine,
         table_id: TableID,
     ) -> TrxID {
-        let mut session = engine.try_new_session().unwrap();
-        let mut trx = session.try_begin_trx().unwrap().unwrap();
+        let mut session = engine.new_session().unwrap();
+        let mut trx = session.begin_trx().unwrap();
         trx.exec(async |stmt| {
             assert_eq!(
                 engine
@@ -1404,7 +1395,7 @@ mod tests {
         assert_eq!(metadata.idx.next_index_no(), next_index_no);
         assert_eq!(metadata.idx.index_spec(1).is_some(), index_one_active);
 
-        let session = engine.try_new_session().unwrap();
+        let session = engine.new_session().unwrap();
         let table_obj = engine
             .catalog()
             .storage
@@ -1973,7 +1964,7 @@ mod tests {
                 .await
                 .unwrap();
 
-            let mut session = engine.try_new_session().unwrap();
+            let mut session = engine.new_session().unwrap();
             let table_spec = TableSpec::new(vec![
                 ColumnSpec::new("c0", ValKind::U32, ColumnAttributes::empty()),
                 ColumnSpec::new("c1", ValKind::U64, ColumnAttributes::empty()),
@@ -1993,7 +1984,8 @@ mod tests {
                 ),
             ];
             let expected_metadata =
-                TableMetadata::new(table_spec.columns.clone(), index_specs.clone());
+                TableMetadata::try_new(table_spec.columns.clone(), index_specs.clone())
+                    .expect("valid table metadata");
 
             let table_id = session.create_table(table_spec, index_specs).await.unwrap();
 
@@ -2046,7 +2038,7 @@ mod tests {
                 .await
                 .unwrap();
 
-            let mut session = engine.try_new_session().unwrap();
+            let mut session = engine.new_session().unwrap();
             let table_spec = TableSpec::new(vec![
                 ColumnSpec::new("c0", ValKind::U32, ColumnAttributes::empty()),
                 ColumnSpec::new("c1", ValKind::VarByte, ColumnAttributes::empty()),
@@ -2070,7 +2062,7 @@ mod tests {
             let s: String = std::iter::repeat_n('0', 100).collect();
             // insert
             for i in (0..DML_SIZE).step_by(INS_STEP) {
-                let mut trx = session.try_begin_trx().unwrap().unwrap();
+                let mut trx = session.begin_trx().unwrap();
                 for j in i..i + INS_STEP {
                     let res = trx_insert_row(
                         &mut trx,
@@ -2085,7 +2077,7 @@ mod tests {
             // update
             let s2: String = std::iter::repeat_n('2', 100).collect();
             for i in (0..DML_SIZE).step_by(UPD_STEP) {
-                let mut trx = session.try_begin_trx().unwrap().unwrap();
+                let mut trx = session.begin_trx().unwrap();
                 let key = SelectKey::new(0, vec![Val::from(i as u32)]);
                 let uc = UpdateCol {
                     idx: 1,
@@ -2097,7 +2089,7 @@ mod tests {
             }
             // delete
             for i in (0..DML_SIZE).step_by(DEL_STEP) {
-                let mut trx = session.try_begin_trx().unwrap().unwrap();
+                let mut trx = session.begin_trx().unwrap();
                 let key = SelectKey::new(0, vec![Val::from(i as u32)]);
                 let res = trx_delete_row(&mut trx, &table, &key).await;
                 assert!(matches!(res, Ok(DeleteMvcc::Deleted)));
@@ -2123,7 +2115,7 @@ mod tests {
                 .unwrap();
 
             let table = engine.catalog().get_table(table_id).await.unwrap();
-            let session = engine.try_new_session().unwrap();
+            let session = engine.new_session().unwrap();
             let mut rows = 0usize;
             {
                 let layout = table.layout_snapshot();
@@ -2163,7 +2155,7 @@ mod tests {
                 .await
                 .unwrap();
 
-            let mut session = engine.try_new_session().unwrap();
+            let mut session = engine.new_session().unwrap();
             let table_id = session
                 .create_table(
                     TableSpec::new(vec![ColumnSpec::new(
@@ -2222,7 +2214,7 @@ mod tests {
                 .await
                 .unwrap();
 
-            let mut session = engine.try_new_session().unwrap();
+            let mut session = engine.new_session().unwrap();
             let table_id = session
                 .create_table(
                     TableSpec::new(vec![
@@ -2247,7 +2239,7 @@ mod tests {
                 .catalog_replay_start_ts;
 
             let table = engine.catalog().get_table(table_id).await.unwrap();
-            let mut trx = session.try_begin_trx().unwrap().unwrap();
+            let mut trx = session.begin_trx().unwrap();
             let insert = trx_insert_row(
                 &mut trx,
                 &table,
@@ -2261,7 +2253,7 @@ mod tests {
             trx.commit().await.unwrap();
 
             table.freeze(&session, usize::MAX).await.unwrap();
-            let mut checkpoint_session = engine.try_new_session().unwrap();
+            let mut checkpoint_session = engine.new_session().unwrap();
             checkpoint_published(&table, &mut checkpoint_session).await;
             let root_after_checkpoint = table.file().active_root_unchecked();
             assert!(root_after_checkpoint.heap_redo_start_ts > catalog_replay_start_ts);
@@ -2285,7 +2277,7 @@ mod tests {
                 .unwrap();
 
             let table = engine.catalog().get_table(table_id).await.unwrap();
-            let mut session = engine.try_new_session().unwrap();
+            let mut session = engine.new_session().unwrap();
             assert_eq!(table.total_row_pages(session.pool_guards()).await, 0);
 
             let key = SelectKey::new(0, vec![Val::from(7u32)]);
@@ -2312,7 +2304,7 @@ mod tests {
                     .unwrap(),
                 Some((cold_row_id, false))
             );
-            let mut trx = session.try_begin_trx().unwrap().unwrap();
+            let mut trx = session.begin_trx().unwrap();
             let row = trx_select_row_mvcc(&mut trx, &table, &key, &[0, 1]).await;
             assert_eq!(
                 row.unwrap().unwrap_found(),
@@ -2345,7 +2337,7 @@ mod tests {
                 .await
                 .unwrap();
 
-            let mut session = engine.try_new_session().unwrap();
+            let mut session = engine.new_session().unwrap();
             let table_id = session
                 .create_table(
                     TableSpec::new(vec![
@@ -2364,7 +2356,7 @@ mod tests {
                 .unwrap();
 
             let table = engine.catalog().get_table(table_id).await.unwrap();
-            let mut trx = session.try_begin_trx().unwrap().unwrap();
+            let mut trx = session.begin_trx().unwrap();
             let insert = trx_insert_row(
                 &mut trx,
                 &table,
@@ -2377,17 +2369,17 @@ mod tests {
             trx.commit().await.unwrap();
 
             table.freeze(&session, usize::MAX).await.unwrap();
-            let mut checkpoint_session = engine.try_new_session().unwrap();
+            let mut checkpoint_session = engine.new_session().unwrap();
             checkpoint_published(&table, &mut checkpoint_session).await;
             assert!(table.file().active_root_unchecked().pivot_row_id > cold_row_id);
 
             let key = SelectKey::new(0, vec![Val::from(7u32)]);
-            let mut trx = session.try_begin_trx().unwrap().unwrap();
+            let mut trx = session.begin_trx().unwrap();
             let delete = trx_delete_row(&mut trx, &table, &key).await;
             assert!(matches!(delete, Ok(DeleteMvcc::Deleted)));
             trx.commit().await.unwrap();
 
-            let mut trx = session.try_begin_trx().unwrap().unwrap();
+            let mut trx = session.begin_trx().unwrap();
             let insert = trx_insert_row(
                 &mut trx,
                 &table,
@@ -2419,7 +2411,7 @@ mod tests {
                 .unwrap();
 
             let table = engine.catalog().get_table(table_id).await.unwrap();
-            let mut session = engine.try_new_session().unwrap();
+            let mut session = engine.new_session().unwrap();
             assert!(table.total_row_pages(session.pool_guards()).await > 0);
 
             let layout = table.layout_snapshot();
@@ -2446,7 +2438,7 @@ mod tests {
                 Some((hot_row_id, false))
             );
 
-            let mut trx = session.try_begin_trx().unwrap().unwrap();
+            let mut trx = session.begin_trx().unwrap();
             let row = trx_select_row_mvcc(&mut trx, &table, &key, &[0, 1]).await;
             assert_eq!(
                 row.unwrap().unwrap_found(),
@@ -2471,7 +2463,7 @@ mod tests {
                 .await
                 .unwrap();
 
-            let mut session = engine.try_new_session().unwrap();
+            let mut session = engine.new_session().unwrap();
             let table_id = session
                 .create_table(
                     TableSpec::new(vec![
@@ -2494,7 +2486,7 @@ mod tests {
 
             let table = engine.catalog().get_table(table_id).await.unwrap();
             let mut same_row_ids = Vec::new();
-            let mut trx = session.try_begin_trx().unwrap().unwrap();
+            let mut trx = session.begin_trx().unwrap();
             for id in [1u32, 2, 3] {
                 let insert = trx_insert_row(
                     &mut trx,
@@ -2510,7 +2502,7 @@ mod tests {
             trx.commit().await.unwrap();
 
             table.freeze(&session, usize::MAX).await.unwrap();
-            let mut checkpoint_session = engine.try_new_session().unwrap();
+            let mut checkpoint_session = engine.new_session().unwrap();
             checkpoint_published(&table, &mut checkpoint_session).await;
             assert!(
                 same_row_ids
@@ -2519,7 +2511,7 @@ mod tests {
             );
 
             let delete_key = SelectKey::new(0, vec![Val::from(2u32)]);
-            let mut trx = session.try_begin_trx().unwrap().unwrap();
+            let mut trx = session.begin_trx().unwrap();
             let delete = trx_delete_row(&mut trx, &table, &delete_key).await;
             assert!(matches!(delete, Ok(DeleteMvcc::Deleted)));
             trx.commit().await.unwrap();
@@ -2535,7 +2527,7 @@ mod tests {
                 .unwrap();
 
             let table = engine.catalog().get_table(table_id).await.unwrap();
-            let mut session = engine.try_new_session().unwrap();
+            let mut session = engine.new_session().unwrap();
             assert_eq!(table.total_row_pages(session.pool_guards()).await, 0);
 
             let name_key = SelectKey::new(1, vec![Val::from("same-name")]);
@@ -2562,7 +2554,7 @@ mod tests {
                 DeleteMarker::Ref(_) => panic!("recovered cold delete should be committed"),
             }
 
-            let mut trx = session.try_begin_trx().unwrap().unwrap();
+            let mut trx = session.begin_trx().unwrap();
             let rows = trx
                 .exec(async |stmt| {
                     Ok(stmt
@@ -2607,7 +2599,7 @@ mod tests {
                 .await
                 .unwrap();
 
-            let mut session = engine.try_new_session().unwrap();
+            let mut session = engine.new_session().unwrap();
             let table_id = session
                 .create_table(
                     TableSpec::new(vec![
@@ -2634,7 +2626,7 @@ mod tests {
 
             let table = engine.catalog().get_table(table_id).await.unwrap();
 
-            let mut trx = session.try_begin_trx().unwrap().unwrap();
+            let mut trx = session.begin_trx().unwrap();
             let insert = trx_insert_row(
                 &mut trx,
                 &table,
@@ -2645,12 +2637,12 @@ mod tests {
             trx.commit().await.unwrap();
 
             table.freeze(&session, usize::MAX).await.unwrap();
-            let mut checkpoint_session = engine.try_new_session().unwrap();
+            let mut checkpoint_session = engine.new_session().unwrap();
             checkpoint_published(&table, &mut checkpoint_session).await;
             let root_after_checkpoint = table.file().active_root_unchecked();
             assert!(root_after_checkpoint.heap_redo_start_ts > catalog_replay_start_ts);
 
-            let mut trx = session.try_begin_trx().unwrap().unwrap();
+            let mut trx = session.begin_trx().unwrap();
             let insert = trx_insert_row(
                 &mut trx,
                 &table,
@@ -2679,10 +2671,10 @@ mod tests {
                 .unwrap();
 
             let table = engine.catalog().get_table(table_id).await.unwrap();
-            let mut session = engine.try_new_session().unwrap();
+            let mut session = engine.new_session().unwrap();
             assert!(table.total_row_pages(session.pool_guards()).await > 0);
 
-            let mut trx = session.try_begin_trx().unwrap().unwrap();
+            let mut trx = session.begin_trx().unwrap();
 
             let cold_key = SelectKey::new(0, vec![Val::from(7u32)]);
             let cold_row = trx_select_row_mvcc(&mut trx, &table, &cold_key, &[0, 1]).await;
@@ -2724,7 +2716,7 @@ mod tests {
                 .await
                 .unwrap();
 
-            let mut session = engine.try_new_session().unwrap();
+            let mut session = engine.new_session().unwrap();
             let table_id = session
                 .create_table(
                     TableSpec::new(vec![ColumnSpec::new(
@@ -2744,7 +2736,7 @@ mod tests {
                 .unwrap();
 
             let table = engine.catalog().get_table(table_id).await.unwrap();
-            let mut trx = session.try_begin_trx().unwrap().unwrap();
+            let mut trx = session.begin_trx().unwrap();
             for i in 0..10u32 {
                 let insert = trx_insert_row(&mut trx, &table, vec![Val::from(i)]).await;
                 assert!(insert.is_ok());
@@ -2752,10 +2744,10 @@ mod tests {
             trx.commit().await.unwrap();
 
             table.freeze(&session, usize::MAX).await.unwrap();
-            let mut checkpoint_session = engine.try_new_session().unwrap();
+            let mut checkpoint_session = engine.new_session().unwrap();
             checkpoint_published(&table, &mut checkpoint_session).await;
 
-            let mut trx = session.try_begin_trx().unwrap().unwrap();
+            let mut trx = session.begin_trx().unwrap();
             let key0 = SelectKey::new(0, vec![Val::from(0u32)]);
             let delete = trx_delete_row(&mut trx, &table, &key0).await;
             assert!(matches!(delete, Ok(DeleteMvcc::Deleted)));
@@ -2783,7 +2775,7 @@ mod tests {
             let checkpointed_cutoff = table.file().active_root_unchecked().deletion_cutoff_ts;
             assert!(checkpointed_cutoff > marker0_ts);
 
-            let mut trx = session.try_begin_trx().unwrap().unwrap();
+            let mut trx = session.begin_trx().unwrap();
             let key1 = SelectKey::new(0, vec![Val::from(1u32)]);
             let delete = trx_delete_row(&mut trx, &table, &key1).await;
             assert!(matches!(delete, Ok(DeleteMvcc::Deleted)));
@@ -2794,7 +2786,7 @@ mod tests {
             };
             assert!(marker1_ts >= checkpointed_cutoff);
 
-            let mut trx = session.try_begin_trx().unwrap().unwrap();
+            let mut trx = session.begin_trx().unwrap();
             let insert = trx_insert_row(&mut trx, &table, vec![Val::from(100u32)]).await;
             assert!(insert.is_ok());
             trx.commit().await.unwrap();
@@ -2829,8 +2821,8 @@ mod tests {
                 DeleteMarker::Ref(_) => panic!("recovered cold delete should be committed"),
             }
 
-            let mut session = engine.try_new_session().unwrap();
-            let mut trx = session.try_begin_trx().unwrap().unwrap();
+            let mut session = engine.new_session().unwrap();
+            let mut trx = session.begin_trx().unwrap();
 
             let row0 = trx_select_row_mvcc(
                 &mut trx,
@@ -2884,7 +2876,7 @@ mod tests {
                 .await
                 .unwrap();
 
-            let mut session = engine.try_new_session().unwrap();
+            let mut session = engine.new_session().unwrap();
             let checkpointed_table_id = session
                 .create_table(
                     TableSpec::new(vec![
@@ -2930,7 +2922,7 @@ mod tests {
                 .await
                 .unwrap();
 
-            let mut trx = session.try_begin_trx().unwrap().unwrap();
+            let mut trx = session.begin_trx().unwrap();
             let insert = trx_insert_row(
                 &mut trx,
                 &checkpointed_table,
@@ -2944,10 +2936,10 @@ mod tests {
                 .freeze(&session, usize::MAX)
                 .await
                 .unwrap();
-            let mut checkpoint_session = engine.try_new_session().unwrap();
+            let mut checkpoint_session = engine.new_session().unwrap();
             checkpoint_published(&checkpointed_table, &mut checkpoint_session).await;
 
-            let mut trx = session.try_begin_trx().unwrap().unwrap();
+            let mut trx = session.begin_trx().unwrap();
             let insert = trx_insert_row(
                 &mut trx,
                 &replay_only_table,
@@ -3022,7 +3014,7 @@ mod tests {
                 .await
                 .unwrap();
 
-            let mut session = engine.try_new_session().unwrap();
+            let mut session = engine.new_session().unwrap();
             assert_eq!(
                 checkpointed_table
                     .total_row_pages(session.pool_guards())
@@ -3036,7 +3028,7 @@ mod tests {
                     > 0
             );
 
-            let mut trx = session.try_begin_trx().unwrap().unwrap();
+            let mut trx = session.begin_trx().unwrap();
 
             let checkpointed_key = SelectKey::new(0, vec![Val::from(7u32)]);
             let checkpointed_row =
@@ -3082,7 +3074,7 @@ mod tests {
                 .await
                 .unwrap();
 
-            let mut session = engine.try_new_session().unwrap();
+            let mut session = engine.new_session().unwrap();
             let table_id = session
                 .create_table(
                     TableSpec::new(vec![
@@ -3101,7 +3093,7 @@ mod tests {
                 .unwrap();
 
             let table = engine.catalog().get_table(table_id).await.unwrap();
-            let mut trx = session.try_begin_trx().unwrap().unwrap();
+            let mut trx = session.begin_trx().unwrap();
             let insert = trx_insert_row(
                 &mut trx,
                 &table,
@@ -3112,7 +3104,7 @@ mod tests {
             trx.commit().await.unwrap();
 
             table.freeze(&session, usize::MAX).await.unwrap();
-            let mut checkpoint_session = engine.try_new_session().unwrap();
+            let mut checkpoint_session = engine.new_session().unwrap();
             checkpoint_published(&table, &mut checkpoint_session).await;
 
             let active_root = table.file().active_root_unchecked();
@@ -3158,8 +3150,8 @@ mod tests {
                 .unwrap();
 
             let table = engine.catalog().get_table(table_id).await.unwrap();
-            let mut session = engine.try_new_session().unwrap();
-            let mut trx = session.try_begin_trx().unwrap().unwrap();
+            let mut session = engine.new_session().unwrap();
+            let mut trx = session.begin_trx().unwrap();
             let key = SelectKey::new(0, vec![Val::from(7u32)]);
             let res = trx_select_row_mvcc(&mut trx, &table, &key, &[0, 1]).await;
             let err = match res {
@@ -3198,7 +3190,7 @@ mod tests {
                 .await
                 .unwrap();
 
-            let mut session = engine.try_new_session().unwrap();
+            let mut session = engine.new_session().unwrap();
             let table_id = session
                 .create_table(
                     TableSpec::new(vec![ColumnSpec::new(
@@ -3218,7 +3210,7 @@ mod tests {
                 .unwrap();
 
             let table = engine.catalog().get_table(table_id).await.unwrap();
-            let mut trx = session.try_begin_trx().unwrap().unwrap();
+            let mut trx = session.begin_trx().unwrap();
             for i in 0..80u32 {
                 let insert = trx_insert_row(&mut trx, &table, vec![Val::from(i)]).await;
                 assert!(insert.is_ok());
@@ -3226,10 +3218,10 @@ mod tests {
             trx.commit().await.unwrap();
 
             table.freeze(&session, usize::MAX).await.unwrap();
-            let mut checkpoint_session = engine.try_new_session().unwrap();
+            let mut checkpoint_session = engine.new_session().unwrap();
             checkpoint_published(&table, &mut checkpoint_session).await;
 
-            let mut trx = session.try_begin_trx().unwrap().unwrap();
+            let mut trx = session.begin_trx().unwrap();
             for i in 0..64u32 {
                 let key = SelectKey::new(0, vec![Val::from(i)]);
                 let delete = trx_delete_row(&mut trx, &table, &key).await;
@@ -3257,7 +3249,7 @@ mod tests {
                 marker_ts
             );
 
-            let mut trx = session.try_begin_trx().unwrap().unwrap();
+            let mut trx = session.begin_trx().unwrap();
             let insert = trx_insert_row(&mut trx, &table, vec![Val::from(1000u32)]).await;
             assert!(insert.is_ok());
             trx.commit().await.unwrap();
@@ -3313,7 +3305,7 @@ mod tests {
                 .unwrap();
 
             let table = engine.catalog().get_table(table_id).await.unwrap();
-            let session = engine.try_new_session().unwrap();
+            let session = engine.new_session().unwrap();
             let active_root = table.file().active_root_unchecked();
             let index = ColumnBlockIndex::new(
                 active_root.column_block_index_root,
@@ -3328,7 +3320,7 @@ mod tests {
                 .await
                 .unwrap()
                 .expect("deleted row should still have a checkpoint entry");
-            let err = match load_entry_deletion_deltas(&index, &entry).await {
+            let err = match index.load_delete_deltas(&entry).await {
                 Ok(_) => panic!("expected invalid delete blob on delta load"),
                 Err(err) => err,
             };

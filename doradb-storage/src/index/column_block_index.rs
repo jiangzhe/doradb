@@ -24,17 +24,19 @@ use zerocopy::byteorder::little_endian::{U32 as LeU32, U64 as LeU64};
 use zerocopy_derive::{FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned};
 
 /// Physical size of one persisted column block-index page.
-pub const COLUMN_BLOCK_PAGE_SIZE: usize = COW_FILE_PAGE_SIZE;
+pub(crate) const COLUMN_BLOCK_PAGE_SIZE: usize = COW_FILE_PAGE_SIZE;
 /// Validated payload bytes available inside one column block-index page.
-pub const COLUMN_BLOCK_NODE_PAYLOAD_SIZE: usize = max_payload_len(COLUMN_BLOCK_PAGE_SIZE);
+pub(crate) const COLUMN_BLOCK_NODE_PAYLOAD_SIZE: usize = max_payload_len(COLUMN_BLOCK_PAGE_SIZE);
 /// Serialized byte width of [`ColumnBlockNodeHeader`].
-pub const COLUMN_BLOCK_HEADER_SIZE: usize = mem::size_of::<ColumnBlockNodeHeader>();
+pub(crate) const COLUMN_BLOCK_HEADER_SIZE: usize = mem::size_of::<ColumnBlockNodeHeader>();
 /// Bytes available for either branch entries or leaf payload after the node header.
-pub const COLUMN_BLOCK_DATA_SIZE: usize = COLUMN_BLOCK_NODE_PAYLOAD_SIZE - COLUMN_BLOCK_HEADER_SIZE;
+pub(crate) const COLUMN_BLOCK_DATA_SIZE: usize =
+    COLUMN_BLOCK_NODE_PAYLOAD_SIZE - COLUMN_BLOCK_HEADER_SIZE;
 /// Serialized byte width of one [`ColumnBlockBranchEntry`].
-pub const COLUMN_BRANCH_ENTRY_SIZE: usize = mem::size_of::<ColumnBlockBranchEntry>();
+pub(crate) const COLUMN_BRANCH_ENTRY_SIZE: usize = mem::size_of::<ColumnBlockBranchEntry>();
 /// Bytes occupied by the shared node header plus the leaf-only header extension.
-pub const COLUMN_BLOCK_LEAF_HEADER_SIZE: usize =
+#[cfg_attr(not(test), expect(dead_code, reason = "pending dead-code audit"))]
+pub(crate) const COLUMN_BLOCK_LEAF_HEADER_SIZE: usize =
     COLUMN_BLOCK_HEADER_SIZE + mem::size_of::<ColumnBlockLeafHeaderExt>();
 
 const COLUMN_BLOCK_LEAF_HEADER_EXT_SIZE: usize = mem::size_of::<ColumnBlockLeafHeaderExt>();
@@ -145,13 +147,11 @@ impl ColumnBlockLeafSearchType {
     }
 }
 
-/// Worst-case bytes reserved per leaf search prefix.
-pub const COLUMN_BLOCK_LEAF_PREFIX_SIZE: usize = COLUMN_BLOCK_LEAF_PREFIX_PLAIN_SIZE;
 /// Maximum number of logical entries that can fit in one leaf node.
-pub const COLUMN_BLOCK_MAX_ENTRIES: usize =
+pub(crate) const COLUMN_BLOCK_MAX_ENTRIES: usize =
     COLUMN_BLOCK_LEAF_DATA_SIZE / COLUMN_BLOCK_MIN_LEAF_ENTRY_SIZE;
 /// Maximum number of children that can fit in one branch node.
-pub const COLUMN_BLOCK_MAX_BRANCH_ENTRIES: usize =
+pub(crate) const COLUMN_BLOCK_MAX_BRANCH_ENTRIES: usize =
     COLUMN_BLOCK_DATA_SIZE / COLUMN_BRANCH_ENTRY_SIZE;
 
 const _: () = assert!(mem::size_of::<ColumnBlockLeafHeaderExt>() == 8);
@@ -161,7 +161,7 @@ const _: () = assert!(mem::size_of::<ColumnBlockNode>() == COLUMN_BLOCK_NODE_PAY
 
 /// Persisted delete-domain tag stored in v2 leaf prefixes.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ColumnDeleteDomain {
+pub(crate) enum ColumnDeleteDomain {
     /// Delete payload units are `start_row_id`-relative row-id deltas.
     RowIdDelta,
     /// Delete payload units are row ordinals inside the authoritative row set.
@@ -290,7 +290,7 @@ impl DeleteSectionHeader {
 #[repr(C)]
 /// Header stored at the beginning of each on-disk column block-index node.
 #[derive(Clone, Debug, Default, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned)]
-pub struct ColumnBlockNodeHeader {
+pub(crate) struct ColumnBlockNodeHeader {
     /// Tree height of this node. `0` denotes a leaf.
     height: LeU32,
     /// Number of encoded entries stored in the node payload.
@@ -306,7 +306,7 @@ pub struct ColumnBlockNodeHeader {
 #[derive(
     Clone, Copy, Debug, Eq, PartialEq, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned,
 )]
-pub struct ColumnBlockBranchEntry {
+pub(crate) struct ColumnBlockBranchEntry {
     /// Inclusive lower row-id bound routed to the child subtree.
     start_row_id: LeU64,
     /// Block id of the child node.
@@ -372,9 +372,9 @@ impl ColumnBlockBranchEntry {
 /// Leaves store a leaf-only header extension at the front of `data`, while
 /// branch nodes interpret the same region entirely as branch entries.
 #[derive(Clone)]
-pub struct ColumnBlockNode {
+pub(crate) struct ColumnBlockNode {
     /// Fixed-size persisted header shared by branch and leaf nodes.
-    pub header: ColumnBlockNodeHeader,
+    pub(crate) header: ColumnBlockNodeHeader,
     data: [u8; COLUMN_BLOCK_DATA_SIZE],
 }
 
@@ -416,7 +416,7 @@ impl ColumnBlockNode {
 /// Validated row-shape metadata for one logical leaf entry before the backing
 /// LWC block id is assigned in the table file.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ColumnBlockEntryShape {
+pub(crate) struct ColumnBlockEntryShape {
     start_row_id: RowID,
     end_row_id: RowID,
     row_ids: Vec<RowID>,
@@ -497,7 +497,7 @@ impl ColumnBlockEntryShape {
 /// Fully materialized logical leaf entry used by v2 builders and rewrite flows
 /// after the backing LWC block id is known.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ColumnBlockEntryInput {
+pub(crate) struct ColumnBlockEntryInput {
     start_row_id: RowID,
     end_row_id: RowID,
     block_id: BlockID,
@@ -516,20 +516,20 @@ impl ColumnBlockEntryInput {
 
 /// One full logical-entry replacement keyed by leaf `start_row_id`.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ColumnBlockEntryPatch {
+pub(crate) struct ColumnBlockEntryPatch {
     /// Existing leaf-entry key to replace.
-    pub start_row_id: RowID,
+    pub(crate) start_row_id: RowID,
     /// Replacement logical entry for that leaf slot.
-    pub entry: ColumnBlockEntryInput,
+    pub(crate) entry: ColumnBlockEntryInput,
 }
 
 /// One resolved leaf entry from the persisted column block-index tree.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct ColumnLeafEntry {
+pub(crate) struct ColumnLeafEntry {
     /// Block id of the leaf node that owns this entry.
-    pub leaf_block_id: BlockID,
+    pub(crate) leaf_block_id: BlockID,
     /// Inclusive lower row-id bound of the entry.
-    pub start_row_id: RowID,
+    pub(crate) start_row_id: RowID,
     block_id: BlockID,
     end_row_id: RowID,
     row_count: u16,
@@ -544,64 +544,61 @@ pub struct ColumnLeafEntry {
 impl ColumnLeafEntry {
     /// Returns the persisted LWC block id.
     #[inline]
-    pub fn block_id(&self) -> BlockID {
+    pub(crate) fn block_id(&self) -> BlockID {
         self.block_id
     }
 
     /// Returns the exclusive coverage upper bound of this persisted entry.
     #[inline]
-    pub fn end_row_id(&self) -> RowID {
+    pub(crate) fn end_row_id(&self) -> RowID {
         self.end_row_id
     }
 
     /// Returns the decoded persisted row count.
     #[inline]
-    pub fn row_count(&self) -> u16 {
+    pub(crate) fn row_count(&self) -> u16 {
         self.row_count
     }
 
     /// Returns the decoded persisted delete count.
     #[inline]
-    pub fn del_count(&self) -> u16 {
+    #[cfg_attr(not(test), expect(dead_code, reason = "pending dead-code audit"))]
+    pub(crate) fn del_count(&self) -> u16 {
         self.del_count
     }
 
     /// Returns the persisted row-id coverage span.
     #[inline]
-    pub fn row_id_span(&self) -> u32 {
+    pub(crate) fn row_id_span(&self) -> u32 {
         self.row_id_span
-    }
-
-    /// Returns the delta from `start_row_id` to the first present persisted row.
-    #[inline]
-    pub fn first_present_delta(&self) -> u32 {
-        self.first_present_delta
     }
 
     /// Returns the persisted delete domain used for this leaf entry.
     #[inline]
-    pub fn delete_domain(&self) -> ColumnDeleteDomain {
+    #[cfg_attr(not(test), expect(dead_code, reason = "reserved deletion info"))]
+    pub(crate) fn delete_domain(&self) -> ColumnDeleteDomain {
         self.delete_domain
     }
 
     /// Returns the referenced delete blob when this entry uses external delete
     /// storage.
     #[inline]
-    pub fn deletion_blob_ref(&self) -> Option<BlobRef> {
+    #[cfg_attr(not(test), expect(dead_code, reason = "reserved deletion info"))]
+    pub(crate) fn deletion_blob_ref(&self) -> Option<BlobRef> {
         self.delete_blob_ref
     }
 
     /// Returns the canonical row-shape fingerprint bound to this persisted
     /// block-index leaf entry.
     #[inline]
-    pub fn row_shape_fingerprint(&self) -> u128 {
+    pub(crate) fn row_shape_fingerprint(&self) -> u128 {
         self.row_shape_fingerprint
     }
 }
 
 /// Runtime row resolution result for one persisted columnar row lookup.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct ResolvedColumnRow {
+pub(crate) struct ResolvedColumnRow {
     leaf_block_id: BlockID,
     block_id: BlockID,
     row_idx: usize,
@@ -611,37 +608,38 @@ pub struct ResolvedColumnRow {
 impl ResolvedColumnRow {
     /// Returns the leaf block that produced this resolution result.
     #[inline]
-    pub fn leaf_block_id(&self) -> BlockID {
+    #[cfg_attr(not(test), expect(dead_code, reason = "reserved leaf_block_id"))]
+    pub(crate) fn leaf_block_id(&self) -> BlockID {
         self.leaf_block_id
     }
 
     /// Returns the persisted LWC block id that stores the row values.
     #[inline]
-    pub fn block_id(&self) -> BlockID {
+    pub(crate) fn block_id(&self) -> BlockID {
         self.block_id
     }
 
     /// Returns the resolved ordinal inside the persisted LWC block.
     #[inline]
-    pub fn row_idx(&self) -> usize {
+    pub(crate) fn row_idx(&self) -> usize {
         self.row_idx
     }
 
     /// Returns the expected canonical row-shape fingerprint for the resolved
     /// persisted LWC block.
     #[inline]
-    pub fn row_shape_fingerprint(&self) -> u128 {
+    pub(crate) fn row_shape_fingerprint(&self) -> u128 {
         self.row_shape_fingerprint
     }
 }
 
 /// One authoritative delete-delta rewrite keyed by leaf `start_row_id`.
 #[derive(Clone, Copy, Debug)]
-pub struct ColumnDeleteDeltaPatch<'a> {
+pub(crate) struct ColumnDeleteDeltaPatch<'a> {
     /// Existing leaf-entry key to rewrite.
-    pub start_row_id: RowID,
+    pub(crate) start_row_id: RowID,
     /// Replacement delete deltas in ascending row-id-delta order.
-    pub delete_deltas: &'a [u32],
+    pub(crate) delete_deltas: &'a [u32],
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1500,7 +1498,7 @@ impl<'a> ColumnBlockIndex<'a> {
     }
 
     /// Finds the persisted leaf entry whose coverage contains `row_id`.
-    pub async fn locate_block(&self, row_id: RowID) -> Result<Option<ColumnLeafEntry>> {
+    pub(crate) async fn locate_block(&self, row_id: RowID) -> Result<Option<ColumnLeafEntry>> {
         if self.root_block_id == SUPER_BLOCK_ID || row_id >= self.end_row_id {
             return Ok(None);
         }
@@ -1529,7 +1527,10 @@ impl<'a> ColumnBlockIndex<'a> {
     }
 
     /// Locates and resolves one persisted row id in a single tree descent.
-    pub async fn locate_and_resolve_row(&self, row_id: RowID) -> Result<Option<ResolvedColumnRow>> {
+    pub(crate) async fn locate_and_resolve_row(
+        &self,
+        row_id: RowID,
+    ) -> Result<Option<ResolvedColumnRow>> {
         if self.root_block_id == SUPER_BLOCK_ID || row_id >= self.end_row_id {
             return Ok(None);
         }
@@ -1577,7 +1578,7 @@ impl<'a> ColumnBlockIndex<'a> {
 
     /// Loads the authoritative persisted row-id set for one validated leaf
     /// entry.
-    pub async fn load_entry_row_ids(&self, entry: &ColumnLeafEntry) -> Result<Vec<RowID>> {
+    pub(crate) async fn load_entry_row_ids(&self, entry: &ColumnLeafEntry) -> Result<Vec<RowID>> {
         let node = self.read_node(entry.leaf_block_id).await?;
         let view = self.read_entry_view(&node, entry)?;
         let row_set = decode_logical_row_set(&view, self.file_kind(), entry.leaf_block_id)?;
@@ -1714,7 +1715,7 @@ impl<'a> ColumnBlockIndex<'a> {
     }
 
     /// Collects all leaf entries in ascending `start_row_id` order.
-    pub async fn collect_leaf_entries(&self) -> Result<Vec<ColumnLeafEntry>> {
+    pub(crate) async fn collect_leaf_entries(&self) -> Result<Vec<ColumnLeafEntry>> {
         if self.root_block_id == SUPER_BLOCK_ID {
             return Ok(Vec::new());
         }
@@ -3346,21 +3347,23 @@ mod tests {
     use crate::file::build_test_fs;
     use crate::file::table_file::MutableTableFile;
     use crate::file::test_block_id;
-    use crate::index::load_entry_deletion_deltas;
     use crate::table::test_user_table_id;
     use crate::value::ValKind;
     use std::collections::BTreeSet;
     use std::sync::Arc;
 
     fn metadata() -> Arc<TableMetadata> {
-        Arc::new(TableMetadata::new(
-            vec![ColumnSpec::new(
-                "c0",
-                ValKind::U64,
-                ColumnAttributes::empty(),
-            )],
-            vec![IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::PK)],
-        ))
+        Arc::new(
+            TableMetadata::try_new(
+                vec![ColumnSpec::new(
+                    "c0",
+                    ValKind::U64,
+                    ColumnAttributes::empty(),
+                )],
+                vec![IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::PK)],
+            )
+            .expect("valid table metadata"),
+        )
     }
 
     fn dense_entry(
@@ -3938,7 +3941,12 @@ mod tests {
             assert_eq!(entry.row_count(), 8);
             assert_eq!(entry.del_count(), 3);
             assert!(entry.deletion_blob_ref().is_none());
-            let loaded = load_entry_deletion_deltas(&index, &entry).await.unwrap();
+            let loaded: BTreeSet<_> = index
+                .load_delete_deltas(&entry)
+                .await
+                .unwrap()
+                .into_iter()
+                .collect();
             assert_eq!(loaded, BTreeSet::from([1u32, 3, 6]));
         });
     }
@@ -4014,7 +4022,12 @@ mod tests {
             let entry = index.locate_block(0).await.unwrap().unwrap();
             assert_eq!(entry.delete_domain(), ColumnDeleteDomain::Ordinal);
             assert_eq!(
-                load_entry_deletion_deltas(&index, &entry).await.unwrap(),
+                index
+                    .load_delete_deltas(&entry)
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .collect::<BTreeSet<_>>(),
                 BTreeSet::from([1u32, 3, 6])
             );
         });
@@ -4145,7 +4158,12 @@ mod tests {
             let entry = index.locate_block(0).await.unwrap().unwrap();
             assert_eq!(entry.delete_domain(), ColumnDeleteDomain::Ordinal);
             assert_eq!(
-                load_entry_deletion_deltas(&index, &entry).await.unwrap(),
+                index
+                    .load_delete_deltas(&entry)
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .collect::<BTreeSet<_>>(),
                 BTreeSet::from([1u32, 3, 6])
             );
         });

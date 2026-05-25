@@ -31,7 +31,7 @@ use std::sync::Arc;
 
 /// Shared in-memory table core used by both catalog and user tables.
 ///
-/// `GenericMemTable` owns only hot row-store state: row pages in a buffer pool,
+/// `MemTable` owns only hot row-store state: row pages in a buffer pool,
 /// the row-id-to-page block index, and optional in-memory secondary indexes.
 /// It intentionally has no column-store, table-file, disk-cache, or runtime
 /// layout ownership. User tables embed it inside [`Table`] and layer persisted
@@ -52,7 +52,7 @@ use std::sync::Arc;
 ///
 /// 4. `sec_idx` plus `index_pool_role` own the in-memory secondary-index slots
 ///    for indexes that currently participate in hot-row access.
-pub struct GenericMemTable<D: 'static, I: 'static> {
+pub(crate) struct MemTable<D: 'static, I: 'static> {
     pub(crate) table_id: TableID,
     pub(crate) metadata: Arc<TableMetadata>,
     pub(crate) mem_pool: QuiescentGuard<D>,
@@ -141,9 +141,9 @@ pub(crate) async fn build_in_memory_secondary_indexes<I: BufferPool + 'static>(
     Ok(builder.publish())
 }
 
-impl<D: BufferPool, I: BufferPool> GenericMemTable<D, I> {
+impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
     #[inline]
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments, reason = "code style")]
     pub(crate) async fn new(
         mem_pool: QuiescentGuard<D>,
         row_pool_role: RowPoolRole,
@@ -158,7 +158,7 @@ impl<D: BufferPool, I: BufferPool> GenericMemTable<D, I> {
         let sec_idx =
             build_in_memory_secondary_indexes(index_pool, index_pool_guard, &metadata, index_ts)
                 .await?;
-        Ok(GenericMemTable {
+        Ok(MemTable {
             table_id,
             metadata: Arc::clone(&metadata),
             mem_pool,
@@ -171,25 +171,25 @@ impl<D: BufferPool, I: BufferPool> GenericMemTable<D, I> {
 
     /// Returns the logical table id of this runtime.
     #[inline]
-    pub fn table_id(&self) -> TableID {
+    pub(crate) fn table_id(&self) -> TableID {
         self.table_id
     }
 
     /// Returns the immutable metadata for this table.
     #[inline]
-    pub fn metadata(&self) -> &TableMetadata {
+    pub(crate) fn metadata(&self) -> &TableMetadata {
         &self.metadata
     }
 
     /// Returns the buffer pool used for in-memory row pages.
     #[inline]
-    pub fn mem_pool(&self) -> &D {
+    pub(crate) fn mem_pool(&self) -> &D {
         &self.mem_pool
     }
 
     /// Returns the row page index used by this table.
     #[inline]
-    pub fn blk_idx(&self) -> &BlockIndex {
+    pub(crate) fn blk_idx(&self) -> &BlockIndex {
         &self.blk_idx
     }
 
@@ -397,7 +397,7 @@ impl<D: BufferPool, I: BufferPool> GenericMemTable<D, I> {
 
     /// Returns the row-id boundary between persisted and in-memory rows.
     #[inline]
-    pub fn pivot_row_id(&self) -> RowID {
+    pub(crate) fn pivot_row_id(&self) -> RowID {
         self.blk_idx.pivot_row_id()
     }
 
@@ -456,7 +456,7 @@ impl<D: BufferPool, I: BufferPool> GenericMemTable<D, I> {
         let row_pool_guard = self.row_pool_guard(guards, "destroy mem table")?;
         let index_pool_guard = self.index_pool_guard(guards)?;
         let meta_pool_guard = self.meta_pool_guard(guards, "destroy mem table")?;
-        let GenericMemTable {
+        let MemTable {
             mem_pool,
             blk_idx,
             sec_idx,
@@ -773,7 +773,7 @@ impl<D: BufferPool, I: BufferPool> GenericMemTable<D, I> {
     }
 }
 
-impl GenericMemTable<FixedBufferPool, FixedBufferPool> {
+impl MemTable<FixedBufferPool, FixedBufferPool> {
     #[inline]
     fn catalog_lwc_error<T>(&self, operation: &'static str, row_id: RowID) -> Result<T> {
         Err(Report::new(InternalError::Generic)
@@ -1064,7 +1064,7 @@ impl GenericMemTable<FixedBufferPool, FixedBufferPool> {
         self.try_get_insert_page(guards, row_count, None).await
     }
 
-    #[allow(clippy::await_holding_lock)]
+    #[expect(clippy::await_holding_lock, reason = "clippy false positive")]
     #[inline]
     async fn lock_row_for_write<'b>(
         &self,

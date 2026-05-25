@@ -4,6 +4,6 @@
 //! Currently lightweight columnar compression is supposed to be
 //! enough, e.g. FOR+bitpacking, dict, FSST.
 
-pub mod bitpacking;
+pub(crate) mod bitpacking;
 
-pub use bitpacking::*;
+pub(crate) use bitpacking::*;

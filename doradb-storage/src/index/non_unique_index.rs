@@ -19,7 +19,7 @@ use std::future::Future;
 use std::mem;
 
 /// Abstraction of non-unique index.
-pub trait NonUniqueIndex: Send + Sync {
+pub(crate) trait NonUniqueIndex: Send + Sync {
     /// Lookup key and put associated values into given collection.
     fn lookup(
         &self,
@@ -81,6 +81,7 @@ pub trait NonUniqueIndex: Send + Sync {
     ) -> impl Future<Output = Result<bool>>;
 
     /// Scan values into given collection.
+    #[cfg_attr(not(test), expect(dead_code, reason = "reserved scan_values"))]
     fn scan_values(
         &self,
         pool_guard: &PoolGuard,
@@ -90,7 +91,7 @@ pub trait NonUniqueIndex: Send + Sync {
 }
 
 /// Generic non-unique-index implementation backed by a generic B-Tree.
-pub struct NonUniqueMemIndex<P: 'static> {
+pub(crate) struct NonUniqueMemIndex<P: 'static> {
     tree: GenericBTree<P>,
     encoder: BTreeKeyEncoder,
 }
@@ -219,7 +220,7 @@ impl<P: BufferPool> NonUniqueMemIndex<P> {
 
     /// Wrap an already-created BTree with a key encoder.
     #[inline]
-    pub fn with_encoder(tree: GenericBTree<P>, encoder: BTreeKeyEncoder) -> Self {
+    pub(crate) fn with_encoder(tree: GenericBTree<P>, encoder: BTreeKeyEncoder) -> Self {
         NonUniqueMemIndex { tree, encoder }
     }
 
@@ -986,7 +987,7 @@ mod tests {
             .await
             .unwrap();
         assert!(inserted.is_ok());
-        assert!(inserted.is_merged());
+        assert!(matches!(inserted, IndexInsert::Ok(true)));
         res.clear();
         index
             .lookup(pool_guard, &key4, &mut res, 100)

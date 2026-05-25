@@ -19,8 +19,8 @@ use crate::row::ops::{
 use crate::row::{Row, RowID, RowPage, RowRead, estimate_max_row_count, var_len_for_insert};
 use crate::table::{
     ColumnDeletionBuffer, ColumnStorage, DeleteInternal, DeleteMarker, DeletionError,
-    GenericMemTable, InsertRowIntoPage, Table, TableRootSnapshot, TableRuntimeLayout,
-    UpdateRowInplace, index_key_is_changed, index_key_replace, read_latest_index_key, row_len,
+    InsertRowIntoPage, MemTable, Table, TableRootSnapshot, TableRuntimeLayout, UpdateRowInplace,
+    index_key_is_changed, index_key_replace, read_latest_index_key, row_len,
     validate_page_row_range,
 };
 use crate::trx::redo::{RowRedo, RowRedoKind};
@@ -140,7 +140,7 @@ impl<'a> UserTableAccessor<'a> {
 
 impl UserTableAccessor<'_> {
     #[inline]
-    fn mem(&self) -> &GenericMemTable<EvictableBufferPool, EvictableBufferPool> {
+    fn mem(&self) -> &MemTable<EvictableBufferPool, EvictableBufferPool> {
         &self.table.mem
     }
 
@@ -1913,7 +1913,7 @@ impl UserTableAccessor<'_> {
     // the row's undo head. That entry is the row-level write lock and the
     // rollback anchor that is later rewritten to Insert/Update/Delete.
     // clippy cannot find the guard is actually dropped before await point.
-    #[allow(clippy::await_holding_lock)]
+    #[expect(clippy::await_holding_lock, reason = "clippy false positive")]
     #[inline]
     pub(super) async fn lock_row_for_write<'b>(
         &self,
@@ -2001,7 +2001,7 @@ impl UserTableAccessor<'_> {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments, reason = "code style")]
     #[inline]
     async fn link_for_unique_index_lwc(
         &self,
@@ -2347,7 +2347,7 @@ impl UserTableAccessor<'_> {
         Ok(())
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments, reason = "code style")]
     #[inline]
     async fn update_unique_index_key_and_row_id_change(
         &self,
@@ -2579,7 +2579,7 @@ impl UserTableAccessor<'_> {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments, reason = "code style")]
     #[inline]
     async fn update_non_unique_index_key_and_row_id_change(
         &self,
@@ -2699,7 +2699,7 @@ impl UserTableAccessor<'_> {
     /// Update unique index due to key change.
     /// In this scenario, we only need to insert pair of new key and row id
     /// into index. Keep old index entry as is.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments, reason = "code style")]
     #[inline]
     async fn update_unique_index_only_key_change(
         &self,

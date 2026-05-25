@@ -21,12 +21,12 @@ const COL_NAME_TABLES_NEXT_INDEX_NO: &str = "next_index_no";
 const PK_NO_TABLES: usize = 0;
 
 /// Return static table definition of `catalog.tables`.
-pub fn catalog_definition_of_tables() -> &'static CatalogDefinition {
+pub(crate) fn catalog_definition_of_tables() -> &'static CatalogDefinition {
     static DEF: OnceLock<CatalogDefinition> = OnceLock::new();
     DEF.get_or_init(|| {
         CatalogDefinition {
             table_id: TABLE_ID_TABLES,
-            metadata: TableMetadata::new(
+            metadata: TableMetadata::try_new(
                 vec![
                     // table_id unsigned bigint primary key not null
                     ColumnSpec {
@@ -45,7 +45,8 @@ pub fn catalog_definition_of_tables() -> &'static CatalogDefinition {
                     // primary key (table_id)
                     IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::PK),
                 ],
-            ),
+            )
+            .expect("valid table metadata"),
         }
     })
 }
@@ -67,13 +68,13 @@ fn row_to_table_object(col_layout: &TableColumnLayout, row: Row<'_>) -> TableObj
 }
 
 /// Runtime accessor for `catalog.tables`.
-pub struct Tables<'a> {
+pub(crate) struct Tables<'a> {
     pub(super) table: &'a CatalogTable,
 }
 
 impl Tables<'_> {
     /// List all table rows from uncommitted-visible catalog state.
-    pub async fn list_uncommitted(&self, guards: &PoolGuards) -> Result<Vec<TableObject>> {
+    pub(crate) async fn list_uncommitted(&self, guards: &PoolGuards) -> Result<Vec<TableObject>> {
         let mut res = vec![];
         self.table
             .table_scan_uncommitted(guards, |col_layout, row| {
@@ -89,7 +90,7 @@ impl Tables<'_> {
 
     /// Find a table by id.
     #[inline]
-    pub async fn find_uncommitted_by_id(
+    pub(crate) async fn find_uncommitted_by_id(
         &self,
         guards: &PoolGuards,
         table_id: TableID,
@@ -101,13 +102,13 @@ impl Tables<'_> {
     }
 
     /// Insert a table.
-    pub async fn insert(&self, stmt: &mut Statement<'_>, obj: &TableObject) -> bool {
+    pub(crate) async fn insert(&self, stmt: &mut Statement<'_>, obj: &TableObject) -> bool {
         let cols = vec![Val::from(obj.table_id), Val::from(obj.next_index_no)];
         stmt.catalog_insert_mvcc(self.table, cols).await.is_ok()
     }
 
     /// Delete a table by id.
-    pub async fn delete_by_id(&self, stmt: &mut Statement<'_>, id: TableID) -> bool {
+    pub(crate) async fn delete_by_id(&self, stmt: &mut Statement<'_>, id: TableID) -> bool {
         let key = SelectKey::new(PK_NO_TABLES, vec![Val::from(id)]);
         stmt.catalog_delete_unique_mvcc(self.table, &key, true)
             .await
@@ -141,7 +142,7 @@ mod tests {
                 .build()
                 .await
                 .unwrap();
-            let mut session = engine.try_new_session().unwrap();
+            let mut session = engine.new_session().unwrap();
 
             let table100 = TableObject {
                 table_id: 100,
@@ -151,7 +152,7 @@ mod tests {
                 table_id: 101,
                 next_index_no: 0,
             };
-            let mut trx = session.try_begin_trx().unwrap().unwrap();
+            let mut trx = session.begin_trx().unwrap();
             trx.exec(async |stmt| {
                 assert!(
                     engine
@@ -176,7 +177,7 @@ mod tests {
             mark_catalog_ddl(&mut trx, DDLRedo::CreateTable(table100.table_id));
             trx.commit().await.unwrap();
 
-            let mut trx = session.try_begin_trx().unwrap().unwrap();
+            let mut trx = session.begin_trx().unwrap();
             trx.exec(async |stmt| {
                 assert!(
                     engine

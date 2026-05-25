@@ -124,7 +124,7 @@ cargo clippy -p doradb-storage --all-targets -- -D warnings
      concrete shapes are `Vec<Option<IndexSpec>>` or a private slot wrapper that
      exposes the same behavior.
    - Provide constructors:
-     - `TableMetadata::new(column_specs, active_index_specs)` for normal
+     - `TableMetadata::try_new(column_specs, active_index_specs)` for normal
        create-table dense initialization, deriving `next_index_no` as
        `max(index_no) + 1` or `0` when there are no active indexes;
      - a constructor used by catalog/table-file reload that takes explicit
@@ -324,7 +324,7 @@ cargo nextest run -p doradb-storage --no-default-features --features libaio
 
 1. `IndexSpec` serde round-trips `index_no`, columns, order, and attributes,
    and no longer serializes index names.
-2. `TableMetadata::new` accepts dense active specs `[0, 1, ...]` and derives
+2. `TableMetadata::try_new` accepts dense active specs `[0, 1, ...]` and derives
    the expected `next_index_no`.
 3. Explicit sparse metadata construction accepts active specs such as
    `index_no = 0` and `index_no = 2` with `next_index_no = 3`, and active

@@ -974,11 +974,7 @@ impl TablePersistence for Table {
 
         // Step 3: open a checkpoint transaction, then move frozen pages into
         // transition state under the refreshed cutoff timestamp.
-        let mut trx = session.try_begin_trx()?.ok_or_else(|| {
-            Error::from(
-                Report::new(OperationError::NotSupported).attach(CHECKPOINT_REQUIRES_IDLE_SESSION),
-            )
-        })?;
+        let mut trx = session.begin_trx()?;
         let checkpoint_ts = trx.sts();
         #[cfg(test)]
         super::tests::run_test_checkpoint_after_trx_start_hook().await;

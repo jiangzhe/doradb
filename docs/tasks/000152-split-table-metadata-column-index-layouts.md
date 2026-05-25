@@ -165,7 +165,7 @@ task.
    - Store `column_layout: Arc<TableColumnLayout>` and
      `index_layout: TableIndexLayout`, or an equivalent shape that lets
      `RowVersionMap` cheaply clone only the column layout.
-   - Preserve `TableMetadata::new`, `try_new`, `try_new_with_next_index_no`,
+   - Preserve `TableMetadata::try_new`, `try_new_with_next_index_no`,
      `try_with_created_index`, `try_without_index`, `ser_view`, and
      `TryFrom<TableBriefMetadata>` behavior.
    - Add explicit accessors:

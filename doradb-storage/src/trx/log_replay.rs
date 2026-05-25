@@ -13,12 +13,12 @@ use std::ops::{Deref, DerefMut};
 use std::path::Path;
 
 /// Log buffer to hold logs of one or more transaction(s).
-pub struct LogBuf(DirectBuf);
+pub(crate) struct LogBuf(DirectBuf);
 
 impl LogBuf {
     /// Create a new log buffer.
     #[inline]
-    pub fn new(len: usize) -> Self {
+    pub(crate) fn new(len: usize) -> Self {
         let mut buf = DirectBuf::zeroed(len);
         // reserve 8-byte for length.
         buf.truncate(mem::size_of::<u64>());
@@ -27,14 +27,14 @@ impl LogBuf {
 
     /// Create a log buffer with given DirectBuf.
     #[inline]
-    pub fn with_buffer(mut buf: DirectBuf) -> Self {
+    pub(crate) fn with_buffer(mut buf: DirectBuf) -> Self {
         buf.truncate(mem::size_of::<u64>());
         LogBuf(buf)
     }
 
     /// Serialize data at the end of the log buffer.
     #[inline]
-    pub fn ser<'a, T: Ser<'a>>(&mut self, data: &T) {
+    pub(crate) fn ser<'a, T: Ser<'a>>(&mut self, data: &T) {
         let offset = self.0.len();
         let ser_len = data.ser_len();
         debug_assert!(offset + ser_len <= self.0.capacity());
@@ -44,7 +44,7 @@ impl LogBuf {
 
     /// Complete the serialization and return the underlying direct IO buffer.
     #[inline]
-    pub fn finish(mut self) -> DirectBuf {
+    pub(crate) fn finish(mut self) -> DirectBuf {
         let len = self.0.len();
         debug_assert!(len >= mem::size_of::<u64>());
         let data_len = len - mem::size_of::<u64>();
@@ -55,33 +55,33 @@ impl LogBuf {
 
     /// Returns actual length of given data.
     #[inline]
-    pub fn actual_len(data_len: usize) -> usize {
+    pub(crate) fn actual_len(data_len: usize) -> usize {
         mem::size_of::<u64>() + data_len
     }
 
     /// Returns capacity of log buffer.
     #[inline]
-    pub fn capacity(&self) -> usize {
+    pub(crate) fn capacity(&self) -> usize {
         self.0.capacity()
     }
 
     /// Returns whether the buffer is capable for additional data.
     #[inline]
-    pub fn capable_for(&self, len: usize) -> bool {
+    pub(crate) fn capable_for(&self, len: usize) -> bool {
         self.0.len() + len <= self.0.capacity()
     }
 }
 
-pub struct TrxLog(LenPrefixPod<RedoHeader, RedoLogs>);
+pub(crate) struct TrxLog(LenPrefixPod<RedoHeader, RedoLogs>);
 
 impl TrxLog {
     #[inline]
-    pub fn new(header: RedoHeader, payload: RedoLogs) -> Self {
+    pub(crate) fn new(header: RedoHeader, payload: RedoLogs) -> Self {
         TrxLog(LenPrefixPod::new(header, payload))
     }
 
     #[inline]
-    pub fn into_inner(self) -> (RedoHeader, RedoLogs) {
+    pub(crate) fn into_inner(self) -> (RedoHeader, RedoLogs) {
         (self.0.header, self.0.payload)
     }
 }
@@ -122,7 +122,7 @@ impl Ser<'_> for TrxLog {
 }
 
 /// Result of log read.
-pub enum ReadLog<'a> {
+pub(crate) enum ReadLog<'a> {
     /// Log is ended with empty page.
     DataEnd,
     /// File reach maximum size limit.
@@ -133,18 +133,19 @@ pub enum ReadLog<'a> {
     Some(LogGroup<'a>),
 }
 
-pub struct LogGroup<'a> {
+pub(crate) struct LogGroup<'a> {
     data: &'a [u8],
 }
 
 impl LogGroup<'_> {
     #[inline]
-    pub fn data(&self) -> &[u8] {
+    #[cfg(test)]
+    pub(crate) fn data(&self) -> &[u8] {
         self.data
     }
 
     #[inline]
-    pub fn try_next(&mut self) -> Result<Option<TrxLog>> {
+    pub(crate) fn try_next(&mut self) -> Result<Option<TrxLog>> {
         if self.data.is_empty() {
             return Ok(None);
         }
@@ -154,7 +155,7 @@ impl LogGroup<'_> {
     }
 }
 
-pub struct LogPartitionStream {
+pub(crate) struct LogPartitionStream {
     pub(super) initializer: LogPartitionInitializer,
     pub(super) reader: Option<MmapLogReader>,
     pub(super) buffer: VecDeque<TrxLog>,
@@ -170,7 +171,7 @@ impl Deref for LogPartitionStream {
 
 impl LogPartitionStream {
     #[inline]
-    pub fn fill_buffer(&mut self) -> Result<()> {
+    pub(crate) fn fill_buffer(&mut self) -> Result<()> {
         loop {
             // fill buffer by reading current log file.
             if let Some(reader) = self.reader.as_mut() {
@@ -200,7 +201,7 @@ impl LogPartitionStream {
     }
 
     #[inline]
-    pub fn fill_if_empty(&mut self) -> Result<bool> {
+    pub(crate) fn fill_if_empty(&mut self) -> Result<bool> {
         if !self.is_empty() {
             return Ok(true);
         }
@@ -209,7 +210,7 @@ impl LogPartitionStream {
     }
 
     #[inline]
-    pub fn pop(&mut self) -> Result<Option<TrxLog>> {
+    pub(crate) fn pop(&mut self) -> Result<Option<TrxLog>> {
         match self.buffer.pop_front() {
             res @ Some(_) => Ok(res),
             None => {
@@ -257,14 +258,14 @@ impl PartialOrd for LogPartitionStream {
 }
 
 #[derive(Default)]
-pub struct LogMerger {
+pub(crate) struct LogMerger {
     heap: BinaryHeap<LogPartitionStream>,
     finished: Vec<LogPartitionStream>,
 }
 
 impl LogMerger {
     #[inline]
-    pub fn add_stream(&mut self, mut stream: LogPartitionStream) -> Result<()> {
+    pub(crate) fn add_stream(&mut self, mut stream: LogPartitionStream) -> Result<()> {
         // before put the stream into priority queue, make sure there is
         // at least one log entry.
         if stream.fill_if_empty()? {
@@ -277,7 +278,7 @@ impl LogMerger {
     }
 
     #[inline]
-    pub fn try_next(&mut self) -> Result<Option<TrxLog>> {
+    pub(crate) fn try_next(&mut self) -> Result<Option<TrxLog>> {
         match self.heap.pop() {
             Some(mut stream) => {
                 let res = stream.pop()?;
@@ -295,12 +296,12 @@ impl LogMerger {
     }
 
     #[inline]
-    pub fn finished_streams(self) -> Vec<LogPartitionStream> {
+    pub(crate) fn finished_streams(self) -> Vec<LogPartitionStream> {
         self.finished
     }
 }
 
-pub struct MmapLogReader {
+pub(crate) struct MmapLogReader {
     m: Mmap,
     page_size: usize,
     max_file_size: usize,
@@ -309,7 +310,7 @@ pub struct MmapLogReader {
 
 impl MmapLogReader {
     #[inline]
-    pub fn new(
+    pub(crate) fn new(
         log_file_path: impl AsRef<Path>,
         page_size: usize,
         max_file_size: usize,
@@ -328,7 +329,7 @@ impl MmapLogReader {
     }
 
     #[inline]
-    pub fn read(&mut self) -> ReadLog<'_> {
+    pub(crate) fn read(&mut self) -> ReadLog<'_> {
         if self.offset >= self.max_file_size {
             return ReadLog::SizeLimit; // file is exhausted.
         }

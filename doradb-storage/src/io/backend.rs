@@ -2,7 +2,7 @@ use std::result::Result as StdResult;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-pub type StdIoResult<T> = StdResult<T, std::io::Error>;
+pub(crate) type StdIoResult<T> = StdResult<T, std::io::Error>;
 
 /// Worker-owned completion token stored in backend user-data fields.
 ///
@@ -10,65 +10,69 @@ pub type StdIoResult<T> = StdResult<T, std::io::Error>;
 /// slot index into the low 32 bits. The worker validates the generation on
 /// completion to reject ABA reuse of an old slot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct BackendToken(u64);
+pub(crate) struct BackendToken(u64);
 
 impl BackendToken {
     /// Builds one token from an inflight-slot generation and slot index.
     #[inline]
-    pub const fn new(generation: u32, slot_index: u32) -> Self {
+    pub(crate) const fn new(generation: u32, slot_index: u32) -> Self {
         BackendToken(((generation as u64) << 32) | slot_index as u64)
     }
 
     /// Wraps one raw backend user-data value as a typed token.
     #[inline]
-    pub const fn from_raw(raw: u64) -> Self {
+    pub(crate) const fn from_raw(raw: u64) -> Self {
         BackendToken(raw)
     }
 
     /// Returns the raw `u64` value stored in the backend user-data field.
     #[inline]
-    pub const fn raw(self) -> u64 {
+    pub(crate) const fn raw(self) -> u64 {
         self.0
     }
 
     /// Returns the packed inflight-slot generation.
     #[inline]
-    pub const fn generation(self) -> u32 {
+    pub(crate) const fn generation(self) -> u32 {
         (self.0 >> 32) as u32
     }
 
     /// Returns the packed inflight-slot index.
     #[inline]
-    pub const fn slot_index(self) -> u32 {
+    pub(crate) const fn slot_index(self) -> u32 {
         self.0 as u32
     }
 }
 
 /// Snapshot of backend-owned submit/wait activity.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct IOBackendStats {
+pub(crate) struct IOBackendStats {
     /// Number of backend kernel-entry calls spent submitting work or waiting.
     ///
     /// On `libaio`, one logical IO commonly contributes one submit call and
     /// one wait call, so this count can be roughly doubled compared with
     /// `io_uring` for serialized workloads.
-    pub submit_and_wait_calls: usize,
+    pub(crate) submit_and_wait_calls: usize,
     /// Number of operations accepted by the backend submit path.
-    pub submitted_ops: usize,
+    pub(crate) submitted_ops: usize,
     /// Total nanoseconds spent in backend submit-or-wait calls.
     ///
     /// This is a non-overlapping total. `libaio` contributes separate submit
     /// and wait syscall time, while `io_uring` contributes fused
     /// `submit_and_wait()` time once.
-    pub submit_and_wait_nanos: usize,
+    pub(crate) submit_and_wait_nanos: usize,
     /// Number of completions observed by the backend wait path.
-    pub wait_completions: usize,
+    pub(crate) wait_completions: usize,
 }
 
 impl IOBackendStats {
     /// Returns the saturating delta from one earlier snapshot.
     #[inline]
-    pub fn delta_since(self, earlier: IOBackendStats) -> IOBackendStats {
+    #[cfg_attr(
+        any(not(test), feature = "iouring"),
+        expect(dead_code, reason = "internal io backend stats")
+    )]
+    pub(crate) fn delta_since(self, earlier: IOBackendStats) -> IOBackendStats {
         IOBackendStats {
             submit_and_wait_calls: self
                 .submit_and_wait_calls
@@ -154,7 +158,7 @@ impl IOBackendStatsHandle {
 ///
 /// This keeps libaio-specific `*mut *mut iocb` layout and future io_uring
 /// submission queue layout out of the generic worker.
-pub trait IOBackend {
+pub(crate) trait IOBackend {
     type Prepared;
     type SubmitBatch;
     type Events;

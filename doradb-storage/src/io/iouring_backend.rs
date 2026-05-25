@@ -10,8 +10,6 @@ use std::collections::VecDeque;
 use std::io;
 use std::time::Instant;
 
-const DEFAULT_IO_MAX_EVENTS: usize = 32;
-
 #[inline]
 fn invalid_io_depth(max_events: usize) -> Error {
     Report::new(ConfigError::InvalidIoDepth)
@@ -20,7 +18,7 @@ fn invalid_io_depth(max_events: usize) -> Error {
 }
 
 /// Concrete io_uring context used by the storage-engine backend.
-pub struct IouringBackend {
+pub(crate) struct IouringBackend {
     ring: IoUring,
     max_events: usize,
     stats: IOBackendStatsHandle,
@@ -29,7 +27,7 @@ pub struct IouringBackend {
 impl IouringBackend {
     /// Creates a new io_uring backend with the requested maximum concurrent IO depth.
     #[inline]
-    pub fn new(max_events: usize) -> Result<Self> {
+    pub(crate) fn new(max_events: usize) -> Result<Self> {
         if max_events == 0 {
             return Err(invalid_io_depth(max_events));
         }
@@ -46,21 +44,16 @@ impl IouringBackend {
         })
     }
 
-    /// Creates a default io_uring backend.
-    #[inline]
-    pub fn try_default() -> Result<Self> {
-        Self::new(DEFAULT_IO_MAX_EVENTS)
-    }
-
     /// Returns maximum concurrent events exposed to the generic worker.
     #[inline]
-    pub fn max_events(&self) -> usize {
+    fn max_events(&self) -> usize {
         self.max_events
     }
 
     /// Returns one snapshot of backend-owned submit/wait activity.
     #[inline]
-    pub fn stats(&self) -> IOBackendStats {
+    #[expect(dead_code, reason = "internal io backend stats")]
+    fn stats(&self) -> IOBackendStats {
         self.stats.snapshot()
     }
 
@@ -71,7 +64,7 @@ impl IouringBackend {
 
     /// Builds an IO worker builder.
     #[inline]
-    pub fn io_worker<T>(self) -> (IOWorkerBuilder<T>, IOClient<T>) {
+    pub(crate) fn io_worker<T>(self) -> (IOWorkerBuilder<T>, IOClient<T>) {
         build_io_worker(self)
     }
 }
@@ -81,7 +74,7 @@ impl IouringBackend {
 /// `staged` keeps prepared SQEs in submission order until the kernel accepts
 /// them. `pending_sqes` tracks the prefix already pushed into the ring's SQ but
 /// not yet confirmed by a successful `submit()` call.
-pub struct IouringSubmitBatch {
+pub(crate) struct IouringSubmitBatch {
     staged: VecDeque<squeue::Entry>,
     pending_sqes: usize,
 }

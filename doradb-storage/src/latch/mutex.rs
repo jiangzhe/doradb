@@ -6,7 +6,7 @@ use std::fmt;
 use std::marker::PhantomData;
 use std::ops::{Deref, DerefMut};
 
-pub struct Mutex<T> {
+pub(super) struct Mutex<T> {
     raw: RawMutex,
     data: UnsafeCell<T>,
 }
@@ -21,7 +21,8 @@ unsafe impl<T: Send> Sync for Mutex<T> {}
 impl<T> Mutex<T> {
     /// Create a new mutex.
     #[inline]
-    pub const fn new(val: T) -> Mutex<T> {
+    #[cfg_attr(not(test), expect(dead_code, reason = "reserved new"))]
+    pub(super) const fn new(val: T) -> Mutex<T> {
         Mutex {
             raw: RawMutex::new(),
             data: UnsafeCell::new(val),
@@ -30,12 +31,14 @@ impl<T> Mutex<T> {
 
     /// Returns underlying data.
     #[inline]
-    pub fn into_inner(self) -> T {
+    #[cfg_attr(not(test), expect(dead_code, reason = "reserved into_inner"))]
+    pub(super) fn into_inner(self) -> T {
         self.data.into_inner()
     }
 
     #[inline]
-    pub fn lock(&self) -> MutexGuard<'_, T> {
+    #[cfg_attr(not(test), expect(dead_code, reason = "reserved lock"))]
+    pub(super) fn lock(&self) -> MutexGuard<'_, T> {
         self.raw.lock();
         MutexGuard {
             mutex: self,
@@ -44,7 +47,7 @@ impl<T> Mutex<T> {
     }
 
     #[inline]
-    pub fn try_lock(&self) -> Option<MutexGuard<'_, T>> {
+    pub(super) fn try_lock(&self) -> Option<MutexGuard<'_, T>> {
         if self.raw.try_lock() {
             Some(MutexGuard {
                 mutex: self,
@@ -56,7 +59,8 @@ impl<T> Mutex<T> {
     }
 
     #[inline]
-    pub async fn lock_async(&self) -> MutexGuard<'_, T> {
+    #[expect(dead_code, reason = "reserved lock_async")]
+    pub(super) async fn lock_async(&self) -> MutexGuard<'_, T> {
         if let Some(g) = self.try_lock() {
             return g;
         }
@@ -72,7 +76,8 @@ impl<T> Mutex<T> {
     }
 
     #[inline]
-    pub fn is_locked(&self) -> bool {
+    #[cfg_attr(not(test), expect(dead_code, reason = "reserved is_locked"))]
+    pub(super) fn is_locked(&self) -> bool {
         self.raw.is_locked()
     }
 }
@@ -80,7 +85,7 @@ impl<T> Mutex<T> {
 /// A simple RawMutex with additional async lock method.
 /// The caller should guarantee lock/unlock calls are paired
 /// even in async environment.
-pub struct RawMutex {
+pub(super) struct RawMutex {
     inner: ParkingLotRawMutex,
     event: Event,
 }
@@ -88,7 +93,7 @@ pub struct RawMutex {
 impl RawMutex {
     /// Create a new async RawMutex.
     #[inline]
-    pub const fn new() -> RawMutex {
+    pub(super) const fn new() -> RawMutex {
         RawMutex {
             inner: ParkingLotRawMutex::INIT,
             event: Event::new(),
@@ -97,19 +102,19 @@ impl RawMutex {
 
     /// Lock this mutex in sync way.
     #[inline]
-    pub fn lock(&self) {
+    pub(super) fn lock(&self) {
         self.inner.lock();
     }
 
     #[inline]
-    pub fn is_locked(&self) -> bool {
+    pub(super) fn is_locked(&self) -> bool {
         self.inner.is_locked()
     }
 
     /// Try lock this mutex in non-blocking way.
     /// Returns false if lock can not be acquired.
     #[inline]
-    pub fn try_lock(&self) -> bool {
+    pub(super) fn try_lock(&self) -> bool {
         self.inner.try_lock()
     }
 
@@ -120,7 +125,7 @@ impl RawMutex {
     /// Callers must have acquired this mutex and must pair each unlock with a
     /// previous successful lock operation.
     #[inline]
-    pub unsafe fn unlock(&self) {
+    pub(super) unsafe fn unlock(&self) {
         // SAFETY: the caller upholds the lock/unlock pairing contract, and the
         // event notification happens only after releasing the raw mutex.
         unsafe {
@@ -149,7 +154,7 @@ impl RawMutex {
 }
 
 #[must_use = "if unused the Mutex will immediately unlock"]
-pub struct MutexGuard<'a, T> {
+pub(super) struct MutexGuard<'a, T> {
     mutex: &'a Mutex<T>,
     marker: PhantomData<&'a mut T>,
 }

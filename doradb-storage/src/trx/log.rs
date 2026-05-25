@@ -35,10 +35,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
-pub const LOG_HEADER_PAGES: usize = 2;
+pub(crate) const LOG_HEADER_PAGES: usize = 2;
 type EnqueuedCommit = (TrxID, Option<Arc<SessionState>>, Option<CommitWaiter>);
 
-pub struct LogPartitionInitializer {
+pub(crate) struct LogPartitionInitializer {
     pub(crate) ctx: StorageBackend,
     pub(crate) mode: LogPartitionMode,
     pub(crate) file_prefix: String,
@@ -75,7 +75,7 @@ impl LogPartitionInitializer {
     }
 
     #[inline]
-    pub fn stream(self) -> LogPartitionStream {
+    pub(crate) fn stream(self) -> LogPartitionStream {
         LogPartitionStream {
             initializer: self,
             reader: None,
@@ -84,7 +84,7 @@ impl LogPartitionInitializer {
     }
 
     #[inline]
-    pub fn next_reader(&mut self) -> Result<Option<MmapLogReader>> {
+    pub(crate) fn next_reader(&mut self) -> Result<Option<MmapLogReader>> {
         match &mut self.mode {
             LogPartitionMode::Done => Ok(None),
             LogPartitionMode::Recovery(logs) => {
@@ -156,7 +156,7 @@ impl LogPartitionInitializer {
     }
 }
 
-pub enum LogPartitionMode {
+pub(crate) enum LogPartitionMode {
     /// Previous log should be analyzed and replayed
     /// for data recovery.
     Recovery(VecDeque<PathBuf>),
@@ -302,7 +302,7 @@ pub(crate) struct LogPartition {
 impl LogPartition {
     /// Returns next GC number.
     /// It is used to evenly dispatch transactions to all GC buckets.
-    pub fn next_gc_no(&self) -> usize {
+    pub(crate) fn next_gc_no(&self) -> usize {
         self.rr_gc_no.fetch_add(1, Ordering::Relaxed) % GC_BUCKETS
     }
 
@@ -484,8 +484,6 @@ impl LogPartition {
         Ok(cts)
     }
 
-    // disable clippy lint due to false positive.
-    #[allow(clippy::await_holding_lock)]
     #[inline]
     pub(super) async fn commit(
         &self,
@@ -614,7 +612,7 @@ impl LogPartition {
 
     #[inline]
     #[cfg(test)]
-    pub fn logs(&self, desc: bool) -> Result<Vec<PathBuf>> {
+    pub(crate) fn logs(&self, desc: bool) -> Result<Vec<PathBuf>> {
         list_log_files(&self.file_prefix, self.log_no, desc)
     }
 }
@@ -670,15 +668,15 @@ impl SyncGroup {
 }
 
 #[derive(Default)]
-pub struct LogPartitionStats {
-    pub commit_count: AtomicUsize,
-    pub trx_count: AtomicUsize,
-    pub log_bytes: AtomicUsize,
-    pub sync_count: AtomicUsize,
-    pub sync_nanos: AtomicUsize,
-    pub purge_trx_count: AtomicUsize,
-    pub purge_row_count: AtomicUsize,
-    pub purge_index_count: AtomicUsize,
+pub(crate) struct LogPartitionStats {
+    pub(crate) commit_count: AtomicUsize,
+    pub(crate) trx_count: AtomicUsize,
+    pub(crate) log_bytes: AtomicUsize,
+    pub(crate) sync_count: AtomicUsize,
+    pub(crate) sync_nanos: AtomicUsize,
+    pub(crate) purge_trx_count: AtomicUsize,
+    pub(crate) purge_row_count: AtomicUsize,
+    pub(crate) purge_index_count: AtomicUsize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -1091,7 +1089,7 @@ pub(super) fn create_log_file(
 }
 
 #[inline]
-pub fn list_log_files(file_prefix: &str, log_no: usize, desc: bool) -> Result<Vec<PathBuf>> {
+pub(crate) fn list_log_files(file_prefix: &str, log_no: usize, desc: bool) -> Result<Vec<PathBuf>> {
     let pattern = format!("{}.{log_no}.*", Pattern::escape(file_prefix));
     let mut res = vec![];
     for entry in glob(&pattern).unwrap() {
@@ -1107,7 +1105,7 @@ pub fn list_log_files(file_prefix: &str, log_no: usize, desc: bool) -> Result<Ve
 }
 
 #[inline]
-pub fn parse_file_seq(file_path: &Path) -> Result<u32> {
+pub(crate) fn parse_file_seq(file_path: &Path) -> Result<u32> {
     let file_name = file_path
         .file_name()
         .ok_or_else(|| {
@@ -1517,10 +1515,10 @@ mod tests {
             let table_id = table2(&engine).await;
             let table = engine.catalog().get_table(table_id).await.unwrap();
 
-            let mut session = engine.try_new_session().unwrap();
+            let mut session = engine.new_session().unwrap();
             {
                 for i in 0..SIZE {
-                    let mut trx = session.try_begin_trx().unwrap().unwrap();
+                    let mut trx = session.begin_trx().unwrap();
                     trx.exec(async |stmt| {
                         let s = format!("{}", i);
                         let insert = vec![Val::from(i), Val::from(&s[..])];
@@ -1591,10 +1589,10 @@ mod tests {
             let table_id = table2(&engine).await;
             let table = engine.catalog().get_table(table_id).await.unwrap();
 
-            let mut session = engine.try_new_session().unwrap();
+            let mut session = engine.new_session().unwrap();
             {
                 for i in 0..SIZE {
-                    let mut trx = session.try_begin_trx().unwrap().unwrap();
+                    let mut trx = session.begin_trx().unwrap();
                     trx.exec(async |stmt| {
                         let s = format!("{}", i);
                         let insert = vec![Val::from(i), Val::from(&s[..])];

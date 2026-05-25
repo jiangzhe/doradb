@@ -366,16 +366,17 @@ impl Drop for ComponentRegistry {
 macro_rules! pool_access_newtype {
     ($name:ident, $inner:ty) => {
         #[derive(Clone)]
-        pub struct $name(QuiescentGuard<$inner>);
+        pub(crate) struct $name(QuiescentGuard<$inner>);
 
         impl $name {
             #[inline]
-            pub fn clone_inner(&self) -> QuiescentGuard<$inner> {
+            pub(crate) fn clone_inner(&self) -> QuiescentGuard<$inner> {
                 self.0.clone()
             }
 
             #[inline]
-            pub fn into_inner(self) -> QuiescentGuard<$inner> {
+            #[expect(dead_code, reason = "reserved into_inner")]
+            pub(crate) fn into_inner(self) -> QuiescentGuard<$inner> {
                 self.0
             }
         }

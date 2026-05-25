@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// Trait to extend u64 slice with bitmap functionalities.
 /// To avoid naming conflicts, all methods are prefixed with "bitmap_".
-pub trait Bitmap {
+pub(crate) trait Bitmap {
     /// Returns bool value at given bit.
     fn bitmap_get(&self, idx: usize) -> bool;
 
@@ -75,6 +75,7 @@ pub trait Bitmap {
     }
 
     #[inline]
+    #[expect(dead_code, reason = "reserved bitmap_count")]
     fn bitmap_count(&self, len: usize, flag: bool) -> usize {
         self.bitmap_range_iter(len)
             .map(|(f, n)| if f == flag { n } else { 0 })
@@ -83,6 +84,10 @@ pub trait Bitmap {
 
     /// Create index iterator with all true bits, stop at len.
     #[inline]
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "reserved bitmap_true_index_iter")
+    )]
     fn bitmap_true_index_iter(&self, len: usize) -> BitmapTrueIndexIter<'_> {
         let range_iter = self.bitmap_range_iter(len);
         BitmapTrueIndexIter {
@@ -151,7 +156,8 @@ impl Bitmap for [u64] {
     }
 }
 
-pub trait ExtendBitmap {
+#[cfg_attr(not(test), expect(dead_code, reason = "reserved ExtendBitmap"))]
+pub(crate) trait ExtendBitmap {
     /// Extend existing bitmap with new bitmap.
     fn bitmap_extend<B: Bitmap + ?Sized>(&mut self, offset: usize, bm: &B, len: usize);
 }
@@ -193,19 +199,19 @@ impl ExtendBitmap for Vec<u64> {
 
 /// Create a new bitmap with all zeros.
 #[inline]
-pub fn new_bitmap(nbr_of_bits: usize) -> Box<[u64]> {
+pub(crate) fn new_bitmap(nbr_of_bits: usize) -> Box<[u64]> {
     let units = bitmap_required_units(nbr_of_bits);
     vec![0u64; units].into_boxed_slice()
 }
 
 /// Returns required units of bitmap for given number of values.
 #[inline]
-pub const fn bitmap_required_units(count: usize) -> usize {
+pub(crate) const fn bitmap_required_units(count: usize) -> usize {
     count.div_ceil(64)
 }
 
 #[derive(Debug, Clone)]
-pub struct BitmapRangeIter<'a> {
+pub(crate) struct BitmapRangeIter<'a> {
     u64s: &'a [u64],      // slice of u64
     last_word_len: usize, // length of last word
     word: u64,            // current u64 word to scan
@@ -373,7 +379,7 @@ impl Iterator for BitmapRangeIter<'_> {
 }
 
 #[derive(Debug, Clone)]
-pub struct BitmapRangeFilter<'a> {
+pub(crate) struct BitmapRangeFilter<'a> {
     range_iter: BitmapRangeIter<'a>,
     flag: bool,
     offset: usize,
@@ -401,7 +407,7 @@ impl Iterator for BitmapRangeFilter<'_> {
     }
 }
 
-pub struct BitmapTrueIndexIter<'a> {
+pub(crate) struct BitmapTrueIndexIter<'a> {
     range_iter: BitmapRangeIter<'a>,
     start: usize,
     end: usize,
@@ -434,14 +440,14 @@ impl Iterator for BitmapTrueIndexIter<'_> {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FreeBitmap {
+pub(crate) struct FreeBitmap {
     free_unit_idx: usize,
     bitmap: Box<[u64]>,
 }
 
 /// AllocMap is an allocation controller backed by bitmap.
 #[derive(Debug)]
-pub struct AllocMap {
+pub(crate) struct AllocMap {
     len: usize,
     allocated: AtomicUsize,
     inner: Mutex<FreeBitmap>,
@@ -450,7 +456,7 @@ pub struct AllocMap {
 impl AllocMap {
     /// Create a new AllocMap.
     #[inline]
-    pub fn new(len: usize) -> Self {
+    pub(crate) fn new(len: usize) -> Self {
         AllocMap {
             inner: Mutex::new(FreeBitmap {
                 free_unit_idx: 0,
@@ -462,22 +468,21 @@ impl AllocMap {
     }
 
     /// Returns number of maximum allocations.
-    #[allow(clippy::len_without_is_empty)]
     #[inline]
-    pub fn len(&self) -> usize {
+    pub(crate) fn len(&self) -> usize {
         self.len
     }
 
     /// Returns number of allocated objects.
     #[inline]
-    pub fn allocated(&self) -> usize {
+    pub(crate) fn allocated(&self) -> usize {
         self.allocated.load(Ordering::Relaxed)
     }
 
     /// Try to allocate a new object, returns index of object.
-    #[allow(clippy::manual_div_ceil)]
+    #[expect(clippy::manual_div_ceil, reason = "code style")]
     #[inline]
-    pub fn try_allocate(&self) -> Option<usize> {
+    pub(crate) fn try_allocate(&self) -> Option<usize> {
         let unit_end_idx = (self.len + 63) / 64;
         let mut g = self.inner.lock();
         let unit_start_idx = g.free_unit_idx;
@@ -500,7 +505,7 @@ impl AllocMap {
 
     /// Deallocate a object with its index.
     #[inline]
-    pub fn deallocate(&self, idx: usize) -> bool {
+    pub(crate) fn deallocate(&self, idx: usize) -> bool {
         debug_assert!(idx < self.len);
         let unit_idx = idx / 64;
 
@@ -517,7 +522,7 @@ impl AllocMap {
 
     /// Allocate a new object at given index.
     #[inline]
-    pub fn allocate_at(&self, idx: usize) -> bool {
+    pub(crate) fn allocate_at(&self, idx: usize) -> bool {
         if idx >= self.len {
             return false;
         }
@@ -532,14 +537,15 @@ impl AllocMap {
 
     /// Returns whether the object at given position is allocated.
     #[inline]
-    pub fn is_allocated(&self, idx: usize) -> bool {
+    pub(crate) fn is_allocated(&self, idx: usize) -> bool {
         let g = self.inner.lock();
         g.bitmap.bitmap_get(idx)
     }
 
     /// Returns allocated ranges.
     #[inline]
-    pub fn allocated_ranges(&self) -> Vec<Range<usize>> {
+    #[expect(dead_code, reason = "reserved allocated_ranges")]
+    pub(crate) fn allocated_ranges(&self) -> Vec<Range<usize>> {
         let mut res = vec![];
         let g = self.inner.lock();
         let mut idx = 0usize;

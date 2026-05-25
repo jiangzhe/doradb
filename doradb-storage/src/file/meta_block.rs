@@ -76,21 +76,21 @@ fn validate_secondary_index_roots(
 /// The surrounding magic/version/checksum envelope is validated by the file
 /// layer before this payload is deserialized during startup or recovery.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MetaBlock {
+pub(crate) struct MetaBlock {
     /// Row-store/column-store boundary row id.
-    pub pivot_row_id: RowID,
+    pub(crate) pivot_row_id: RowID,
     /// Earliest redo timestamp required to recover in-memory heap.
-    pub heap_redo_start_ts: TrxID,
+    pub(crate) heap_redo_start_ts: TrxID,
     /// Earliest redo timestamp required to recover cold-row deletions.
-    pub deletion_cutoff_ts: TrxID,
+    pub(crate) deletion_cutoff_ts: TrxID,
     /// Table schema metadata.
-    pub schema: TableMetadata,
+    pub(crate) schema: TableMetadata,
     /// Root block id of column block index.
-    pub column_block_index_root: BlockID,
+    pub(crate) column_block_index_root: BlockID,
     /// Root block ids of secondary DiskTrees, ordered by index number.
-    pub secondary_index_roots: Vec<BlockID>,
+    pub(crate) secondary_index_roots: Vec<BlockID>,
     /// Page allocation bitmap.
-    pub alloc_map: AllocMap,
+    pub(crate) alloc_map: AllocMap,
 }
 
 impl Deser for MetaBlock {
@@ -131,28 +131,28 @@ impl Deser for MetaBlock {
 ///
 /// This avoids building an owned [`MetaBlock`] when only page encoding is
 /// needed for checkpoint writes.
-pub struct MetaBlockSerView<'a> {
+pub(crate) struct MetaBlockSerView<'a> {
     /// Row-store/column-store boundary row id.
-    pub pivot_row_id: RowID,
+    pivot_row_id: RowID,
     /// Earliest redo timestamp required to recover in-memory heap.
-    pub heap_redo_start_ts: TrxID,
+    heap_redo_start_ts: TrxID,
     /// Earliest redo timestamp required to recover cold-row deletions.
-    pub deletion_cutoff_ts: TrxID,
+    deletion_cutoff_ts: TrxID,
     /// Compact schema serialization view.
-    pub schema: TableBriefMetadataSerView<'a>,
+    schema: TableBriefMetadataSerView<'a>,
     /// Root block id of column block index.
-    pub column_block_index_root: BlockID,
+    column_block_index_root: BlockID,
     /// Root block ids of secondary DiskTrees, ordered by index number.
-    pub secondary_index_roots: &'a [BlockID],
+    secondary_index_roots: &'a [BlockID],
     /// Page allocation bitmap.
-    pub alloc_map: &'a AllocMap,
+    alloc_map: &'a AllocMap,
 }
 
 impl<'a> MetaBlockSerView<'a> {
     /// Constructs a table meta-block serialization view from active in-memory
     /// table state.
     #[inline]
-    pub fn new(
+    pub(crate) fn new(
         schema: TableBriefMetadataSerView<'a>,
         column_block_index_root: BlockID,
         secondary_index_roots: &'a [BlockID],
@@ -219,13 +219,13 @@ const NO_ROOT_BLOCK_ID: u64 = 0;
 /// The shared block-integrity envelope is validated before this payload is
 /// deserialized into catalog root state.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MultiTableMetaBlockData {
+pub(crate) struct MultiTableMetaBlockData {
     /// Global next user object-id allocator watermark.
-    pub next_user_obj_id: ObjID,
+    pub(crate) next_user_obj_id: ObjID,
     /// Reserved root descriptors of catalog logical tables.
-    pub table_roots: [CatalogTableRootDesc; CATALOG_TABLE_ROOT_DESC_COUNT],
+    pub(crate) table_roots: [CatalogTableRootDesc; CATALOG_TABLE_ROOT_DESC_COUNT],
     /// Page allocation bitmap.
-    pub alloc_map: AllocMap,
+    pub(crate) alloc_map: AllocMap,
 }
 
 impl Deser for MultiTableMetaBlockData {
@@ -284,20 +284,20 @@ impl Deser for MultiTableMetaBlockData {
 ///
 /// The file layer wraps this payload with the shared integrity envelope when a
 /// new catalog root is published.
-pub struct MultiTableMetaBlockSerView<'a> {
+pub(crate) struct MultiTableMetaBlockSerView<'a> {
     /// Global next user object-id allocator watermark.
-    pub next_user_obj_id: ObjID,
+    next_user_obj_id: ObjID,
     /// Reserved root descriptors of catalog logical tables.
-    pub table_roots: &'a [CatalogTableRootDesc; CATALOG_TABLE_ROOT_DESC_COUNT],
+    table_roots: &'a [CatalogTableRootDesc; CATALOG_TABLE_ROOT_DESC_COUNT],
     /// Page allocation bitmap.
-    pub alloc_map: &'a AllocMap,
+    alloc_map: &'a AllocMap,
 }
 
 impl<'a> MultiTableMetaBlockSerView<'a> {
     /// Constructs a `catalog.mtb` meta-block serialization view from active
     /// multi-table root state and space-management data.
     #[inline]
-    pub fn new(meta: &'a MultiTableMetaBlock, alloc_map: &'a AllocMap) -> Self {
+    pub(crate) fn new(meta: &'a MultiTableMetaBlock, alloc_map: &'a AllocMap) -> Self {
         MultiTableMetaBlockSerView {
             next_user_obj_id: meta.next_user_obj_id,
             table_roots: &meta.table_roots,
@@ -396,13 +396,16 @@ mod tests {
 
     #[test]
     fn test_meta_block_serde() {
-        let metadata = Arc::new(TableMetadata::new(
-            vec![
-                ColumnSpec::new("c0", ValKind::U32, ColumnAttributes::empty()),
-                ColumnSpec::new("c1", ValKind::U64, ColumnAttributes::NULLABLE),
-            ],
-            vec![IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::PK)],
-        ));
+        let metadata = Arc::new(
+            TableMetadata::try_new(
+                vec![
+                    ColumnSpec::new("c0", ValKind::U32, ColumnAttributes::empty()),
+                    ColumnSpec::new("c1", ValKind::U64, ColumnAttributes::NULLABLE),
+                ],
+                vec![IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::PK)],
+            )
+            .expect("valid table metadata"),
+        );
         let mut active_root = ActiveRoot::new(7, 1024, Arc::clone(&metadata));
         active_root.secondary_index_roots = vec![BlockID::new(11)];
         let ser_view = active_root.meta_block_ser_view().unwrap();
@@ -435,14 +438,17 @@ mod tests {
 
     #[test]
     fn test_meta_block_serde_without_secondary_indexes() {
-        let metadata = Arc::new(TableMetadata::new(
-            vec![ColumnSpec::new(
-                "c0",
-                ValKind::U32,
-                ColumnAttributes::empty(),
-            )],
-            vec![],
-        ));
+        let metadata = Arc::new(
+            TableMetadata::try_new(
+                vec![ColumnSpec::new(
+                    "c0",
+                    ValKind::U32,
+                    ColumnAttributes::empty(),
+                )],
+                vec![],
+            )
+            .expect("valid table metadata"),
+        );
         let active_root = ActiveRoot::new(7, 1024, Arc::clone(&metadata));
         let ser_view = active_root.meta_block_ser_view().unwrap();
         let ser_len = ser_view.ser_len();
@@ -457,16 +463,19 @@ mod tests {
 
     #[test]
     fn test_meta_block_serde_multiple_secondary_roots() {
-        let metadata = Arc::new(TableMetadata::new(
-            vec![
-                ColumnSpec::new("c0", ValKind::U32, ColumnAttributes::empty()),
-                ColumnSpec::new("c1", ValKind::U64, ColumnAttributes::NULLABLE),
-            ],
-            vec![
-                IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::PK),
-                IndexSpec::new(vec![IndexKey::new(1)], IndexAttributes::empty()),
-            ],
-        ));
+        let metadata = Arc::new(
+            TableMetadata::try_new(
+                vec![
+                    ColumnSpec::new("c0", ValKind::U32, ColumnAttributes::empty()),
+                    ColumnSpec::new("c1", ValKind::U64, ColumnAttributes::NULLABLE),
+                ],
+                vec![
+                    IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::PK),
+                    IndexSpec::new(vec![IndexKey::new(1)], IndexAttributes::empty()),
+                ],
+            )
+            .expect("valid table metadata"),
+        );
         let mut active_root = ActiveRoot::new(7, 1024, Arc::clone(&metadata));
         active_root.secondary_index_roots = vec![BlockID::new(11), BlockID::new(12)];
         let ser_view = active_root.meta_block_ser_view().unwrap();
@@ -542,14 +551,17 @@ mod tests {
 
     #[test]
     fn test_meta_block_deser_rejects_secondary_root_count_mismatch() {
-        let metadata = Arc::new(TableMetadata::new(
-            vec![ColumnSpec::new(
-                "c0",
-                ValKind::U32,
-                ColumnAttributes::empty(),
-            )],
-            vec![IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::PK)],
-        ));
+        let metadata = Arc::new(
+            TableMetadata::try_new(
+                vec![ColumnSpec::new(
+                    "c0",
+                    ValKind::U32,
+                    ColumnAttributes::empty(),
+                )],
+                vec![IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::PK)],
+            )
+            .expect("valid table metadata"),
+        );
         let active_root = ActiveRoot::new(7, 1024, Arc::clone(&metadata));
         let schema = active_root.metadata.ser_view();
 
@@ -579,14 +591,17 @@ mod tests {
 
     #[test]
     fn test_meta_block_ser_view_rejects_secondary_root_count_mismatch() {
-        let metadata = Arc::new(TableMetadata::new(
-            vec![ColumnSpec::new(
-                "c0",
-                ValKind::U32,
-                ColumnAttributes::empty(),
-            )],
-            vec![IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::PK)],
-        ));
+        let metadata = Arc::new(
+            TableMetadata::try_new(
+                vec![ColumnSpec::new(
+                    "c0",
+                    ValKind::U32,
+                    ColumnAttributes::empty(),
+                )],
+                vec![IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::PK)],
+            )
+            .expect("valid table metadata"),
+        );
         let active_root = ActiveRoot::new(7, 1024, Arc::clone(&metadata));
         let err = MetaBlockSerView::new(
             active_root.metadata.ser_view(),
