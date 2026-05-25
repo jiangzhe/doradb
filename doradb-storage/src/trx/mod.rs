@@ -46,7 +46,6 @@ use crate::trx::redo::{DDLRedo, RedoHeader, RedoLogs, RedoTrxKind};
 use crate::trx::undo::{IndexPurgeEntry, IndexUndoLogs, RowUndoHead, RowUndoLogs, UndoStatus};
 use error_stack::Report;
 use event_listener::{Event, EventListener};
-use flume::{Receiver, Sender};
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::marker::PhantomData;
@@ -65,15 +64,6 @@ pub(crate) const MAX_COMMIT_TS: TrxID = 1 << 63;
 // As active transaction id is always greater than STS, that means
 // visibility check can be simplified to "STS is larger".
 pub(crate) const MIN_ACTIVE_TRX_ID: TrxID = (1 << 63) + 1;
-
-#[cfg_attr(not(test), expect(dead_code, reason = "pending dead-code audit"))]
-#[cfg_attr(test, expect(dead_code, reason = "pending dead-code audit"))]
-pub(crate) enum TrxStatus {
-    // OCC, write-write conflict will abort .
-    Uncommitted(TrxID),
-    Committed(TrxID),
-    Preparing(Sender<()>, Receiver<()>),
-}
 
 pub(crate) struct SharedTrxStatus {
     ts: AtomicU64,

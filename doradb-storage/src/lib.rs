@@ -40,7 +40,8 @@ pub use conf::{EngineConfig, EvictableBufferPoolConfig, FileSystemConfig, TrxSys
 pub use engine::{Engine, EngineRef};
 pub use error::{Error, ErrorKind, Result};
 pub use lock::LockMode;
-pub use row::{DeleteMvcc, RowID, ScanMvcc, SelectKey, SelectMvcc, UpdateCol, UpdateMvcc};
+pub use row::RowID;
+pub use row::ops::{DeleteMvcc, ScanMvcc, SelectKey, SelectMvcc, UpdateCol, UpdateMvcc};
 pub use session::{Session, SessionID};
 pub use table::{
     CheckpointCancelReason, CheckpointDelayReason, CheckpointOutcome, CheckpointReadiness, Table,

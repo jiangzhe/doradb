@@ -141,20 +141,6 @@ impl Engine {
         self.inner().lock_manager()
     }
 
-    /// Get a user-table runtime handle by table id.
-    #[inline]
-    pub async fn get_table(&self, table_id: crate::TableID) -> Result<Arc<crate::Table>> {
-        self.inner()
-            .catalog()
-            .get_table(table_id)
-            .await
-            .ok_or_else(|| {
-                error_stack::Report::new(OperationError::TableNotFound)
-                    .attach(format!("get table: table_id={table_id}"))
-                    .into()
-            })
-    }
-
     /// Try to clone the shared runtime handle while the engine is still
     /// running.
     #[inline]
@@ -290,11 +276,13 @@ impl EngineRef {
     /// Get a user-table runtime handle by table id.
     #[inline]
     pub async fn get_table(&self, table_id: crate::TableID) -> Result<Arc<crate::Table>> {
-        self.0.catalog().get_table(table_id).await.ok_or_else(|| {
-            error_stack::Report::new(OperationError::TableNotFound)
-                .attach(format!("get table: table_id={table_id}"))
-                .into()
-        })
+        self.0
+            .with_running_admission(|| self.0.catalog().get_table_now(table_id))?
+            .ok_or_else(|| {
+                error_stack::Report::new(OperationError::TableNotFound)
+                    .attach(format!("get table: table_id={table_id}"))
+                    .into()
+            })
     }
 
     /// Return the shared logical lock manager.
@@ -928,6 +916,7 @@ mod tests {
         smol::block_on(async {
             let root = TempDir::new().unwrap();
             let engine = test_engine_config_for(root.path()).build().await.unwrap();
+            let table_id = table1(&engine).await;
             let engine_ref = engine.new_ref().unwrap();
 
             let err = match engine.shutdown() {
@@ -939,6 +928,13 @@ mod tests {
             assert_eq!(err.downcast_ref::<usize>().copied(), Some(1));
 
             let err = match engine_ref.new_session() {
+                Ok(_) => panic!("expected shutdown error"),
+                Err(err) => err,
+            };
+            assert_eq!(err.kind(), ErrorKind::Lifecycle);
+            assert_eq!(err.lifecycle_error(), Some(LifecycleError::Shutdown));
+
+            let err = match engine_ref.get_table(table_id).await {
                 Ok(_) => panic!("expected shutdown error"),
                 Err(err) => err,
             };

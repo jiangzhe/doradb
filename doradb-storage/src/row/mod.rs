@@ -1,7 +1,7 @@
 pub(crate) mod ops;
 pub(crate) mod vector_scan;
 
-pub use ops::*;
+pub(crate) use ops::*;
 pub(crate) use vector_scan::*;
 
 use crate::bitmap::bitmap_required_units;
