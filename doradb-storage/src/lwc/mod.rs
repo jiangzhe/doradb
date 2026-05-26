@@ -39,6 +39,12 @@ fn column_scan_shape_mismatch() -> Error {
 }
 
 #[inline]
+fn lwc_payload_len_from_u64(len: u64, payload: &str) -> Result<usize> {
+    usize::try_from(len)
+        .map_err(|_| invalid_compressed_payload(format!("{payload} length exceeds usize::MAX")))
+}
+
+#[inline]
 fn checked_lwc_payload_len(len: usize, unit_len: usize, payload: &str) -> Result<usize> {
     len.checked_mul(unit_len)
         .ok_or_else(|| invalid_compressed_payload(format!("{payload} length overflows usize")))
@@ -96,7 +102,7 @@ impl<'a> LwcData<'a> {
         let res = match c {
             LwcCode::Flat => {
                 let (len, input) = read_le_u64(input)?;
-                let len = len as usize;
+                let len = lwc_payload_len_from_u64(len, "LWC flat payload")?;
                 match kind {
                     ValKind::I8 => {
                         let input = flat_lwc_payload(input, len, 1, "LWC flat i8 payload")?;
@@ -172,7 +178,7 @@ impl<'a> LwcData<'a> {
                 // see `ForBitpackingDeser` for reference.
                 let (n_bits, input) = read_u8(input)?;
                 let (len, input) = read_le_u64(input)?;
-                let len = len as usize;
+                let len = lwc_payload_len_from_u64(len, "LWC FOR bitpacking payload")?;
                 let n_bits = n_bits as usize;
                 let p = match kind {
                     ValKind::I8 => {
@@ -2117,6 +2123,14 @@ mod tests {
     }
 
     #[test]
+    fn test_lwc_data_from_bytes_rejects_flat_oversized_len() {
+        let mut payload = vec![LwcCode::Flat as u8];
+        payload.extend_from_slice(&(1u64 << 32).to_le_bytes());
+
+        assert_invalid_payload(LwcData::from_bytes(ValKind::U8, &payload));
+    }
+
+    #[test]
     fn test_lwc_data_from_bytes_rejects_flat_typed_partial_element() {
         let mut payload = vec![LwcCode::Flat as u8];
         payload.extend_from_slice(&1u64.to_le_bytes());
@@ -2130,6 +2144,16 @@ mod tests {
         let mut payload = vec![LwcCode::ForBitpacking as u8];
         payload.push(1);
         payload.extend_from_slice(&1u64.to_le_bytes());
+        payload.push(0);
+
+        assert_invalid_payload(LwcData::from_bytes(ValKind::U8, &payload));
+    }
+
+    #[test]
+    fn test_lwc_data_from_bytes_rejects_for_bitpacking_oversized_len() {
+        let mut payload = vec![LwcCode::ForBitpacking as u8];
+        payload.push(1);
+        payload.extend_from_slice(&(1u64 << 32).to_le_bytes());
         payload.push(0);
 
         assert_invalid_payload(LwcData::from_bytes(ValKind::U8, &payload));
