@@ -329,22 +329,7 @@ impl<T: 'static> FacadePageGuard<T> {
     #[inline]
     pub(crate) async fn lock_exclusive_async(self) -> Option<PageExclusiveGuard<T>> {
         match self.raw.state() {
-            GuardState::Optimistic => {
-                let raw = self.raw;
-                let bf = self.bf;
-                let captured_generation = self.captured_generation;
-                let raw = raw.exclusive_async().await;
-                if frame_ref(&bf).generation() != captured_generation {
-                    raw.rollback_exclusive_bit();
-                    return None;
-                }
-                Some(PageExclusiveGuard {
-                    raw,
-                    bf,
-                    captured_generation,
-                    _marker: PhantomData,
-                })
-            }
+            GuardState::Optimistic => self.downgrade().lock_exclusive_async().await,
             GuardState::Shared => panic!("block until exclusive by shared lock is not allowed"),
             GuardState::Exclusive => {
                 if !self.generation_matches() {
@@ -427,21 +412,7 @@ impl<T: 'static> FacadePageGuard<T> {
     #[inline]
     pub(crate) async fn lock_shared_async(self) -> Option<PageSharedGuard<T>> {
         match self.raw.state() {
-            GuardState::Optimistic => {
-                let raw = self.raw;
-                let bf = self.bf;
-                let captured_generation = self.captured_generation;
-                let raw = raw.shared_async().await;
-                if frame_ref(&bf).generation() != captured_generation {
-                    return None;
-                }
-                Some(PageSharedGuard {
-                    raw,
-                    bf,
-                    captured_generation,
-                    _marker: PhantomData,
-                })
-            }
+            GuardState::Optimistic => self.downgrade().lock_shared_async().await,
             GuardState::Shared => {
                 if !self.generation_matches() {
                     return None;

@@ -8,7 +8,7 @@ mod value;
 use crate::buffer::PageID;
 use crate::buffer::guard::{
     ExclusiveLockStrategy, FacadePageGuard, LockStrategy, OptimisticLockStrategy,
-    PageExclusiveGuard, PageGuard, PageSharedGuard, SharedLockStrategy,
+    PageExclusiveGuard, PageGuard, PageOptimisticGuard, PageSharedGuard, SharedLockStrategy,
 };
 use crate::buffer::{BufferPool, FixedBufferPool, PoolGuard};
 use crate::error::Validation;
@@ -658,21 +658,13 @@ impl<P: BufferPool> GenericBTree<P> {
                             .await?;
                         return Ok(Either::Right(BTreeSplit::Ok));
                     }
-                    // Re-lock child in exclusive mode.
-                    let Some(new_c_guard) = c_optimistic_guard.lock_exclusive_async().await else {
+                    let Some(new_c_guard) =
+                        revalidate_child_separator_for_split(c_optimistic_guard, sep_idx, sep_key)
+                            .await
+                    else {
                         return Ok(Either::Right(BTreeSplit::Inconsistent));
                     };
                     c_guard = new_c_guard;
-                    // Check if separator key changes
-                    let c_node = c_guard.page();
-                    let new_sep_idx = c_node.find_separator();
-                    if new_sep_idx != sep_idx {
-                        return Ok(Either::Right(BTreeSplit::Inconsistent));
-                    }
-                    let new_sep_key = c_node.create_sep_key(new_sep_idx, true);
-                    if &new_sep_key[..] != sep_key {
-                        return Ok(Either::Right(BTreeSplit::Inconsistent));
-                    }
                     return Ok(Either::Left((p_guard, c_guard)));
                 }
                 Ok(Either::Right(BTreeSplit::Inconsistent))
@@ -1230,6 +1222,25 @@ impl<P: BufferPool> GenericBTree<P> {
         self.pool.deallocate_page::<BTreeNode>(g);
         Ok(())
     }
+}
+
+#[inline]
+async fn revalidate_child_separator_for_split(
+    c_guard: PageOptimisticGuard<BTreeNode>,
+    sep_idx: usize,
+    sep_key: &[u8],
+) -> Option<PageExclusiveGuard<BTreeNode>> {
+    let c_guard = c_guard.lock_exclusive_async().await?;
+    let c_node = c_guard.page();
+    let new_sep_idx = c_node.find_separator();
+    if new_sep_idx != sep_idx {
+        return None;
+    }
+    let new_sep_key = c_node.create_sep_key(new_sep_idx, true);
+    if &new_sep_key[..] != sep_key {
+        return None;
+    }
+    Some(c_guard)
 }
 
 /// Controls how to access B-Tree nodes with coupling way.
