@@ -994,6 +994,7 @@ impl<T: BitPackable> Iterator for ForBitpacking32Iter<'_, T> {
     fn next(&mut self) -> Option<T> {
         if self.idx < self.data.len() {
             let delta = u32::from_le_bytes(self.data[self.idx]);
+            self.idx += 1;
             Some(self.min.add_from_u32(delta))
         } else {
             None
@@ -1385,6 +1386,20 @@ mod tests {
             for_b32_unpack(&compressed, min, &mut decompressed);
             assert_eq!(input, decompressed);
         }
+    }
+
+    #[test]
+    fn test_for_bitpacking32_iter_advances() {
+        let data = [1u32.to_le_bytes(), 5u32.to_le_bytes()];
+        let mut iter = ForBitpacking32Iter {
+            min: 10u64,
+            data: &data,
+            idx: 0,
+        };
+
+        assert_eq!(iter.next(), Some(11));
+        assert_eq!(iter.next(), Some(15));
+        assert_eq!(iter.next(), None);
     }
 
     #[test]

@@ -38,6 +38,46 @@ fn column_scan_shape_mismatch() -> Error {
     Report::new(InternalError::ColumnScanShapeMismatch).into()
 }
 
+#[inline]
+fn checked_lwc_payload_len(len: usize, unit_len: usize, payload: &str) -> Result<usize> {
+    len.checked_mul(unit_len)
+        .ok_or_else(|| invalid_compressed_payload(format!("{payload} length overflows usize")))
+}
+
+#[inline]
+fn expect_exact_lwc_payload_len(
+    actual_len: usize,
+    expected_len: usize,
+    payload: &str,
+) -> Result<()> {
+    if actual_len != expected_len {
+        return Err(invalid_compressed_payload(format!(
+            "{payload} length mismatch: expected {expected_len}, actual {actual_len}"
+        )));
+    }
+    Ok(())
+}
+
+#[inline]
+fn flat_lwc_payload<'a>(
+    input: &'a [u8],
+    len: usize,
+    unit_len: usize,
+    payload: &str,
+) -> Result<&'a [u8]> {
+    let expected_len = checked_lwc_payload_len(len, unit_len, payload)?;
+    expect_exact_lwc_payload_len(input.len(), expected_len, payload)?;
+    Ok(input)
+}
+
+#[inline]
+fn for_bitpacking_lwc_payload(data: &[u8], len: usize, n_bits: usize) -> Result<&[u8]> {
+    let expected_bits = checked_lwc_payload_len(len, n_bits, "LWC FOR bitpacking payload")?;
+    let expected_len = expected_bits.div_ceil(8);
+    expect_exact_lwc_payload_len(data.len(), expected_len, "LWC FOR bitpacking payload")?;
+    Ok(data)
+}
+
 /// Lightweight compressed data.
 pub(crate) enum LwcData<'a> {
     Primitive(LwcPrimitive<'a>),
@@ -51,70 +91,79 @@ impl<'a> LwcData<'a> {
     /// compression type of the data.
     #[inline]
     pub(crate) fn from_bytes(kind: ValKind, input: &'a [u8]) -> Result<Self> {
-        let c = LwcCode::try_from(input[0])?;
-        let input = &input[1..];
+        let (code, input) = read_u8(input)?;
+        let c = LwcCode::try_from(code)?;
         let res = match c {
             LwcCode::Flat => {
                 let (len, input) = read_le_u64(input)?;
+                let len = len as usize;
                 match kind {
                     ValKind::I8 => {
-                        debug_assert_eq!(input.len(), len as usize);
+                        let input = flat_lwc_payload(input, len, 1, "LWC flat i8 payload")?;
                         LwcData::Primitive(LwcPrimitive::FlatI8(FlatI8(input)))
                     }
                     ValKind::U8 => {
-                        debug_assert_eq!(input.len(), len as usize);
+                        let input = flat_lwc_payload(input, len, 1, "LWC flat u8 payload")?;
                         LwcData::Primitive(LwcPrimitive::FlatU8(FlatU8(input)))
                     }
                     ValKind::I16 => {
-                        let input = layout::slice_from_bytes::<[u8; 2]>(input);
-                        debug_assert_eq!(input.len(), len as usize);
+                        let input = flat_lwc_payload(input, len, 2, "LWC flat i16 payload")?;
+                        let input = layout::try_slice_from_bytes::<[u8; 2]>(input)?;
                         LwcData::Primitive(LwcPrimitive::FlatI16(FlatI16(input)))
                     }
                     ValKind::U16 => {
-                        let input = layout::slice_from_bytes::<[u8; 2]>(input);
-                        debug_assert_eq!(input.len(), len as usize);
+                        let input = flat_lwc_payload(input, len, 2, "LWC flat u16 payload")?;
+                        let input = layout::try_slice_from_bytes::<[u8; 2]>(input)?;
                         LwcData::Primitive(LwcPrimitive::FlatU16(FlatU16(input)))
                     }
                     ValKind::I32 => {
-                        let input = layout::slice_from_bytes::<[u8; 4]>(input);
-                        debug_assert_eq!(input.len(), len as usize);
+                        let input = flat_lwc_payload(input, len, 4, "LWC flat i32 payload")?;
+                        let input = layout::try_slice_from_bytes::<[u8; 4]>(input)?;
                         LwcData::Primitive(LwcPrimitive::FlatI32(FlatI32(input)))
                     }
                     ValKind::U32 => {
-                        let input = layout::slice_from_bytes::<[u8; 4]>(input);
-                        debug_assert_eq!(input.len(), len as usize);
+                        let input = flat_lwc_payload(input, len, 4, "LWC flat u32 payload")?;
+                        let input = layout::try_slice_from_bytes::<[u8; 4]>(input)?;
                         LwcData::Primitive(LwcPrimitive::FlatU32(FlatU32(input)))
                     }
                     ValKind::F32 => {
-                        let input = layout::slice_from_bytes::<[u8; 4]>(input);
-                        debug_assert_eq!(input.len(), len as usize);
+                        let input = flat_lwc_payload(input, len, 4, "LWC flat f32 payload")?;
+                        let input = layout::try_slice_from_bytes::<[u8; 4]>(input)?;
                         LwcData::Primitive(LwcPrimitive::FlatF32(FlatF32(input)))
                     }
                     ValKind::I64 => {
-                        let input = layout::slice_from_bytes::<[u8; 8]>(input);
-                        debug_assert_eq!(input.len(), len as usize);
+                        let input = flat_lwc_payload(input, len, 8, "LWC flat i64 payload")?;
+                        let input = layout::try_slice_from_bytes::<[u8; 8]>(input)?;
                         LwcData::Primitive(LwcPrimitive::FlatI64(FlatI64(input)))
                     }
                     ValKind::U64 => {
-                        let input = layout::slice_from_bytes::<[u8; 8]>(input);
-                        debug_assert_eq!(input.len(), len as usize);
+                        let input = flat_lwc_payload(input, len, 8, "LWC flat u64 payload")?;
+                        let input = layout::try_slice_from_bytes::<[u8; 8]>(input)?;
                         LwcData::Primitive(LwcPrimitive::FlatU64(FlatU64(input)))
                     }
                     ValKind::F64 => {
-                        let input = layout::slice_from_bytes::<[u8; 8]>(input);
-                        debug_assert_eq!(input.len(), len as usize);
+                        let input = flat_lwc_payload(input, len, 8, "LWC flat f64 payload")?;
+                        let input = layout::try_slice_from_bytes::<[u8; 8]>(input)?;
                         LwcData::Primitive(LwcPrimitive::FlatF64(FlatF64(input)))
                     }
                     ValKind::VarByte => {
-                        let len = len as usize;
-                        if input.len() < (len + 1) * mem::size_of::<u32>() {
+                        let offset_count = len.checked_add(1).ok_or_else(|| {
+                            invalid_compressed_payload(
+                                "LWC varbyte offset table length overflows usize",
+                            )
+                        })?;
+                        let offset_bytes_len = checked_lwc_payload_len(
+                            offset_count,
+                            mem::size_of::<u32>(),
+                            "LWC varbyte offset table",
+                        )?;
+                        if input.len() < offset_bytes_len {
                             return Err(invalid_compressed_payload(
                                 "LWC varbyte payload is shorter than its offset table",
                             ));
                         }
-                        let (offset_bytes, data) =
-                            input.split_at((len + 1) * mem::size_of::<u32>());
-                        let offsets = layout::slice_from_bytes::<[u8; 4]>(offset_bytes);
+                        let (offset_bytes, data) = input.split_at(offset_bytes_len);
+                        let offsets = layout::try_slice_from_bytes::<[u8; 4]>(offset_bytes)?;
                         LwcData::Bytes(LwcBytes { offsets, data })
                     }
                 }
@@ -128,7 +177,7 @@ impl<'a> LwcData<'a> {
                 let p = match kind {
                     ValKind::I8 => {
                         let (min, data) = read_i8(input)?;
-                        debug_assert!(data.len() == (len * n_bits).div_ceil(8));
+                        let data = for_bitpacking_lwc_payload(data, len, n_bits)?;
                         match n_bits {
                             1 => LwcPrimitive::ForBp1I8(ForBitpacking1 { len, min, data }),
                             2 => LwcPrimitive::ForBp2I8(ForBitpacking2 { len, min, data }),
@@ -144,7 +193,7 @@ impl<'a> LwcData<'a> {
                     }
                     ValKind::U8 => {
                         let (min, data) = read_u8(input)?;
-                        debug_assert!(data.len() == (len * n_bits).div_ceil(8));
+                        let data = for_bitpacking_lwc_payload(data, len, n_bits)?;
                         match n_bits {
                             1 => LwcPrimitive::ForBp1U8(ForBitpacking1 { len, min, data }),
                             2 => LwcPrimitive::ForBp2U8(ForBitpacking2 { len, min, data }),
@@ -160,7 +209,7 @@ impl<'a> LwcData<'a> {
                     }
                     ValKind::I16 => {
                         let (min, data) = read_le_i16(input)?;
-                        debug_assert!(data.len() == (len * n_bits).div_ceil(8));
+                        let data = for_bitpacking_lwc_payload(data, len, n_bits)?;
                         match n_bits {
                             1 => LwcPrimitive::ForBp1I16(ForBitpacking1 { len, min, data }),
                             2 => LwcPrimitive::ForBp2I16(ForBitpacking2 { len, min, data }),
@@ -177,7 +226,7 @@ impl<'a> LwcData<'a> {
                     }
                     ValKind::U16 => {
                         let (min, data) = read_le_u16(input)?;
-                        debug_assert!(data.len() == (len * n_bits).div_ceil(8));
+                        let data = for_bitpacking_lwc_payload(data, len, n_bits)?;
                         match n_bits {
                             1 => LwcPrimitive::ForBp1U16(ForBitpacking1 { len, min, data }),
                             2 => LwcPrimitive::ForBp2U16(ForBitpacking2 { len, min, data }),
@@ -194,14 +243,14 @@ impl<'a> LwcData<'a> {
                     }
                     ValKind::I32 => {
                         let (min, data) = read_le_i32(input)?;
-                        debug_assert!(data.len() == (len * n_bits).div_ceil(8));
+                        let data = for_bitpacking_lwc_payload(data, len, n_bits)?;
                         match n_bits {
                             1 => LwcPrimitive::ForBp1I32(ForBitpacking1 { len, min, data }),
                             2 => LwcPrimitive::ForBp2I32(ForBitpacking2 { len, min, data }),
                             4 => LwcPrimitive::ForBp4I32(ForBitpacking4 { len, min, data }),
                             8 => LwcPrimitive::ForBp8I32(ForBitpacking8 { min, data }),
                             16 => {
-                                let data = layout::slice_from_bytes::<[u8; 2]>(data);
+                                let data = layout::try_slice_from_bytes::<[u8; 2]>(data)?;
                                 LwcPrimitive::ForBp16I32(ForBitpacking16 { min, data })
                             }
                             _ => {
@@ -215,14 +264,14 @@ impl<'a> LwcData<'a> {
                     }
                     ValKind::U32 => {
                         let (min, data) = read_le_u32(input)?;
-                        debug_assert!(data.len() == (len * n_bits).div_ceil(8));
+                        let data = for_bitpacking_lwc_payload(data, len, n_bits)?;
                         match n_bits {
                             1 => LwcPrimitive::ForBp1U32(ForBitpacking1 { len, min, data }),
                             2 => LwcPrimitive::ForBp2U32(ForBitpacking2 { len, min, data }),
                             4 => LwcPrimitive::ForBp4U32(ForBitpacking4 { len, min, data }),
                             8 => LwcPrimitive::ForBp8U32(ForBitpacking8 { min, data }),
                             16 => {
-                                let data = layout::slice_from_bytes::<[u8; 2]>(data);
+                                let data = layout::try_slice_from_bytes::<[u8; 2]>(data)?;
                                 LwcPrimitive::ForBp16U32(ForBitpacking16 { min, data })
                             }
                             _ => {
@@ -236,18 +285,18 @@ impl<'a> LwcData<'a> {
                     }
                     ValKind::I64 => {
                         let (min, data) = read_le_i64(input)?;
-                        debug_assert!(data.len() == (len * n_bits).div_ceil(8));
+                        let data = for_bitpacking_lwc_payload(data, len, n_bits)?;
                         match n_bits {
                             1 => LwcPrimitive::ForBp1I64(ForBitpacking1 { len, min, data }),
                             2 => LwcPrimitive::ForBp2I64(ForBitpacking2 { len, min, data }),
                             4 => LwcPrimitive::ForBp4I64(ForBitpacking4 { len, min, data }),
                             8 => LwcPrimitive::ForBp8I64(ForBitpacking8 { min, data }),
                             16 => {
-                                let data = layout::slice_from_bytes::<[u8; 2]>(data);
+                                let data = layout::try_slice_from_bytes::<[u8; 2]>(data)?;
                                 LwcPrimitive::ForBp16I64(ForBitpacking16 { min, data })
                             }
                             32 => {
-                                let data = layout::slice_from_bytes::<[u8; 4]>(data);
+                                let data = layout::try_slice_from_bytes::<[u8; 4]>(data)?;
                                 LwcPrimitive::ForBp32I64(ForBitpacking32 { min, data })
                             }
                             _ => {
@@ -261,18 +310,18 @@ impl<'a> LwcData<'a> {
                     }
                     ValKind::U64 => {
                         let (min, data) = read_le_u64(input)?;
-                        debug_assert!(data.len() == (len * n_bits).div_ceil(8));
+                        let data = for_bitpacking_lwc_payload(data, len, n_bits)?;
                         match n_bits {
                             1 => LwcPrimitive::ForBp1U64(ForBitpacking1 { len, min, data }),
                             2 => LwcPrimitive::ForBp2U64(ForBitpacking2 { len, min, data }),
                             4 => LwcPrimitive::ForBp4U64(ForBitpacking4 { len, min, data }),
                             8 => LwcPrimitive::ForBp8U64(ForBitpacking8 { min, data }),
                             16 => {
-                                let data = layout::slice_from_bytes::<[u8; 2]>(data);
+                                let data = layout::try_slice_from_bytes::<[u8; 2]>(data)?;
                                 LwcPrimitive::ForBp16U64(ForBitpacking16 { min, data })
                             }
                             32 => {
-                                let data = layout::slice_from_bytes::<[u8; 4]>(data);
+                                let data = layout::try_slice_from_bytes::<[u8; 4]>(data)?;
                                 LwcPrimitive::ForBp32U64(ForBitpacking32 { min, data })
                             }
                             _ => {
@@ -969,6 +1018,20 @@ impl<'a> LwcBuilder<'a> {
         view: PageVectorView<'_, '_>,
     ) -> Result<bool> {
         let snapshot = self.snapshot_state();
+        match self.append_view_inner(page, view) {
+            Ok(true) => Ok(true),
+            Ok(false) => {
+                self.rollback(snapshot);
+                Ok(false)
+            }
+            Err(err) => {
+                self.rollback(snapshot);
+                Err(err)
+            }
+        }
+    }
+
+    fn append_view_inner(&mut self, page: &RowPage, view: PageVectorView<'_, '_>) -> Result<bool> {
         let mut new_row_ids = Vec::with_capacity(view.rows_non_deleted());
         for (start_idx, end_idx) in view.range_non_deleted() {
             for idx in start_idx..end_idx {
@@ -979,7 +1042,6 @@ impl<'a> LwcBuilder<'a> {
         self.buffer.scan(view)?;
         self.row_ids.extend(new_row_ids);
         if self.estimate_size()? > LWC_BLOCK_PAYLOAD_SIZE {
-            self.rollback(snapshot);
             return Ok(false);
         }
         Ok(true)
@@ -2030,6 +2092,49 @@ mod tests {
         }
     }
 
+    fn assert_invalid_payload<T>(result: Result<T>) {
+        assert!(result.as_ref().is_err_and(
+            |err| err.data_integrity_error() == Some(DataIntegrityError::InvalidPayload)
+        ));
+    }
+
+    #[test]
+    fn test_lwc_data_from_bytes_rejects_empty_payload() {
+        assert_invalid_payload(LwcData::from_bytes(ValKind::U8, &[]));
+    }
+
+    #[test]
+    fn test_lwc_data_from_bytes_rejects_flat_payload_length_mismatch() {
+        let mut short_payload = vec![LwcCode::Flat as u8];
+        short_payload.extend_from_slice(&2u64.to_le_bytes());
+        short_payload.push(7);
+        assert_invalid_payload(LwcData::from_bytes(ValKind::U8, &short_payload));
+
+        let mut long_payload = vec![LwcCode::Flat as u8];
+        long_payload.extend_from_slice(&1u64.to_le_bytes());
+        long_payload.extend_from_slice(&[7, 8]);
+        assert_invalid_payload(LwcData::from_bytes(ValKind::U8, &long_payload));
+    }
+
+    #[test]
+    fn test_lwc_data_from_bytes_rejects_flat_typed_partial_element() {
+        let mut payload = vec![LwcCode::Flat as u8];
+        payload.extend_from_slice(&1u64.to_le_bytes());
+        payload.push(7);
+
+        assert_invalid_payload(LwcData::from_bytes(ValKind::I16, &payload));
+    }
+
+    #[test]
+    fn test_lwc_data_from_bytes_rejects_for_bitpacking_payload_length_mismatch() {
+        let mut payload = vec![LwcCode::ForBitpacking as u8];
+        payload.push(1);
+        payload.extend_from_slice(&1u64.to_le_bytes());
+        payload.push(0);
+
+        assert_invalid_payload(LwcData::from_bytes(ValKind::U8, &payload));
+    }
+
     #[test]
     fn test_lwc_bytes_invalid() {
         let err = LwcPrimitiveSer::new_bytes(&[], &[]);
@@ -2290,6 +2395,44 @@ mod tests {
             })
             .collect();
         assert_eq!(restored_stats, expected_stats);
+    }
+
+    #[test]
+    fn test_lwc_builder_append_view_rolls_back_on_estimate_error() {
+        let metadata = TableMetadata::try_new(
+            vec![
+                ColumnSpec::new("c0", ValKind::U8, ColumnAttributes::empty()),
+                ColumnSpec::new("c1", ValKind::I16, ColumnAttributes::empty()),
+            ],
+            vec![],
+        )
+        .expect("valid table metadata");
+        let mut page = RowPage::new_test_page();
+        page.init(1, 4, metadata.col.as_ref());
+
+        for offset in 0..2u64 {
+            let c0 = Val::U8((10 + offset) as u8);
+            let c1 = Val::I16((20 + offset) as i16);
+            assert!(matches!(
+                page.insert(metadata.col.as_ref(), &[c0, c1]),
+                InsertRow::Ok(_)
+            ));
+        }
+
+        let mut builder = LwcBuilder::new(metadata.col.as_ref());
+        builder.buffer = ScanBuffer::new(metadata.col.as_ref(), &[0]);
+
+        let res = builder.append_row_page(&page);
+
+        assert!(res.is_err());
+        assert_eq!(builder.row_count(), 0);
+        assert!(builder.row_ids().is_empty());
+        assert!(
+            builder
+                .stats
+                .iter()
+                .all(|stat| !stat.snapshot().initialized)
+        );
     }
 
     #[test]

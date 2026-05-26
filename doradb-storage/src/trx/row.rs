@@ -419,7 +419,7 @@ impl<'a> RowReadAccess<'a> {
         let row = self.row();
         let deleted = row.is_deleted();
         if !row.is_key_different(metadata.col.as_ref(), index_spec, key) && !deleted {
-            return false; // matched key found in page.
+            return true; // matched key found in page.
         }
         // Page data does not match, check version chain.
         match &self.state {
@@ -1164,6 +1164,17 @@ mod tests {
         let key = SelectKey::new(1, vec![Val::from(10i32)]);
 
         assert!(!access.any_version_matches_key(&metadata, &key));
+    }
+
+    #[test]
+    fn test_any_version_matches_key_latest_page_row_returns_true() {
+        let metadata = sparse_metadata();
+        let page = row_page(&metadata);
+        let frame_ctx = FrameContext::RecoverMap(RecoverMap::new(0));
+        let access = RowReadAccess::new(&page, &frame_ctx, 0);
+        let key = SelectKey::new(0, vec![Val::from(10i32)]);
+
+        assert!(access.any_version_matches_key(&metadata, &key));
     }
 
     #[test]
