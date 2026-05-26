@@ -728,6 +728,143 @@ mod tests {
     }
 
     #[test]
+    fn test_facade_page_guard_try_upgrades_reject_generation_mismatch() {
+        smol::block_on(async {
+            let pool = test_pool();
+            let pool_guard = FixedBufferPool::pool_guard(&pool);
+            let g = pool
+                .allocate_page::<RowPageIndexNode>(&pool_guard)
+                .await
+                .expect("test page allocation should succeed");
+            let page_id = g.page_id();
+            drop(g);
+
+            let mut g = pool
+                .get_page::<RowPageIndexNode>(&pool_guard, page_id, LatchFallbackMode::Spin)
+                .await
+                .expect("buffer-pool read failed in test");
+            let frame = pool.arena.frame(page_id);
+            frame.bump_generation();
+            assert!(g.try_shared().is_invalid());
+            drop(g);
+
+            let mut g = pool
+                .get_page::<RowPageIndexNode>(&pool_guard, page_id, LatchFallbackMode::Spin)
+                .await
+                .expect("buffer-pool read failed in test");
+            let frame = pool.arena.frame(page_id);
+            let held_version = frame.latch.version_acq();
+            frame.bump_generation();
+            assert!(g.try_exclusive().is_invalid());
+            assert_eq!(frame.latch.version_acq(), held_version);
+            drop(g);
+
+            let g = pool
+                .get_page::<RowPageIndexNode>(&pool_guard, page_id, LatchFallbackMode::Spin)
+                .await
+                .expect("buffer-pool read failed in test");
+            let frame = pool.arena.frame(page_id);
+            frame.bump_generation();
+            assert!(g.try_shared_either().is_invalid());
+        })
+    }
+
+    #[test]
+    fn test_facade_page_guard_verify_upgrades_reject_generation_mismatch() {
+        smol::block_on(async {
+            let pool = test_pool();
+            let pool_guard = FixedBufferPool::pool_guard(&pool);
+            let g = pool
+                .allocate_page::<RowPageIndexNode>(&pool_guard)
+                .await
+                .expect("test page allocation should succeed");
+            let page_id = g.page_id();
+            drop(g);
+
+            let g = pool
+                .get_page::<RowPageIndexNode>(&pool_guard, page_id, LatchFallbackMode::Spin)
+                .await
+                .expect("buffer-pool read failed in test");
+            let frame = pool.arena.frame(page_id);
+            frame.bump_generation();
+            assert!(g.verify_shared_async::<false>().await.is_invalid());
+
+            let g = pool
+                .get_page::<RowPageIndexNode>(&pool_guard, page_id, LatchFallbackMode::Spin)
+                .await
+                .expect("buffer-pool read failed in test");
+            let frame = pool.arena.frame(page_id);
+            let held_version = frame.latch.version_acq();
+            frame.bump_generation();
+            assert!(g.verify_exclusive_async::<false>().await.is_invalid());
+            assert_eq!(frame.latch.version_acq(), held_version);
+        })
+    }
+
+    #[test]
+    fn test_page_optimistic_guard_checked_upgrades_reject_generation_mismatch() {
+        smol::block_on(async {
+            let pool = test_pool();
+            let pool_guard = FixedBufferPool::pool_guard(&pool);
+            let g = pool
+                .allocate_page::<RowPageIndexNode>(&pool_guard)
+                .await
+                .expect("test page allocation should succeed");
+            let page_id = g.page_id();
+            drop(g);
+
+            let g = pool
+                .get_page::<RowPageIndexNode>(&pool_guard, page_id, LatchFallbackMode::Spin)
+                .await
+                .expect("buffer-pool read failed in test")
+                .downgrade()
+                .lock_shared_async()
+                .await;
+            assert!(g.is_some());
+            drop(g);
+
+            let g = pool
+                .get_page::<RowPageIndexNode>(&pool_guard, page_id, LatchFallbackMode::Spin)
+                .await
+                .expect("buffer-pool read failed in test")
+                .downgrade();
+            pool.arena.frame(page_id).bump_generation();
+            assert!(g.lock_shared_async().await.is_none());
+
+            let g = pool
+                .get_page::<RowPageIndexNode>(&pool_guard, page_id, LatchFallbackMode::Spin)
+                .await
+                .expect("buffer-pool read failed in test")
+                .downgrade()
+                .try_exclusive();
+            assert!(g.is_valid());
+            drop(g);
+
+            let g = pool
+                .get_page::<RowPageIndexNode>(&pool_guard, page_id, LatchFallbackMode::Spin)
+                .await
+                .expect("buffer-pool read failed in test")
+                .downgrade();
+            let frame = pool.arena.frame(page_id);
+            let held_version = frame.latch.version_acq();
+            frame.bump_generation();
+            assert!(g.try_exclusive().is_invalid());
+            assert_eq!(frame.latch.version_acq(), held_version);
+
+            let g = pool
+                .get_page::<RowPageIndexNode>(&pool_guard, page_id, LatchFallbackMode::Spin)
+                .await
+                .expect("buffer-pool read failed in test")
+                .downgrade();
+            let frame = pool.arena.frame(page_id);
+            let held_version = frame.latch.version_acq();
+            frame.bump_generation();
+            assert!(g.lock_exclusive_async().await.is_none());
+            assert_eq!(frame.latch.version_acq(), held_version);
+        })
+    }
+
+    #[test]
     #[should_panic(expected = "block until exclusive by shared lock is not allowed")]
     fn test_facade_page_guard_lock_exclusive_async_panics_on_shared_state() {
         smol::block_on(async {

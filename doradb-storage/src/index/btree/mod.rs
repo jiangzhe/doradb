@@ -659,7 +659,10 @@ impl<P: BufferPool> GenericBTree<P> {
                         return Ok(Either::Right(BTreeSplit::Ok));
                     }
                     // Re-lock child in exclusive mode.
-                    c_guard = c_optimistic_guard.exclusive_async().await;
+                    let Some(new_c_guard) = c_optimistic_guard.lock_exclusive_async().await else {
+                        return Ok(Either::Right(BTreeSplit::Inconsistent));
+                    };
+                    c_guard = new_c_guard;
                     // Check if separator key changes
                     let c_node = c_guard.page();
                     let new_sep_idx = c_node.find_separator();
