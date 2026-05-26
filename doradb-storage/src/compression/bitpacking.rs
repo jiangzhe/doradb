@@ -3,13 +3,13 @@
 //! Current implementation only support bits=1, 2, 4, 8, 16, 32.
 
 use crate::layout;
-use crate::lwc::{LwcPrimitiveData, SortedPosition};
+use crate::lwc::LwcPrimitiveData;
 use std::mem;
 use zerocopy::IntoBytes;
 
 /// Data type that supports bitpacking.
 /// constant ZERO is used to unify both bitpacking and FOR+bitpacking.
-pub trait BitPackable: Copy {
+pub(crate) trait BitPackable: Copy {
     const ZERO: Self;
 
     fn sub_to_u64(self, min: Self) -> u64;
@@ -77,7 +77,7 @@ impl_bit_packable!(i8, u8, i16, u16, i32, u32, i64, u64, isize, usize);
 /// Returns number of bits and minimum value on input data.
 /// Returns None if not available.
 #[inline]
-pub fn prepare_for_bitpacking<T: BitPackable + Ord>(input: &[T]) -> Option<(usize, T)> {
+pub(crate) fn prepare_for_bitpacking<T: BitPackable + Ord>(input: &[T]) -> Option<(usize, T)> {
     if input.is_empty() {
         return None;
     }
@@ -119,15 +119,16 @@ pub fn prepare_for_bitpacking<T: BitPackable + Ord>(input: &[T]) -> Option<(usiz
 /// Pack (bits=1).
 /// User has to guarantee all values are not out of range.
 #[inline]
-pub fn b1_pack<T: BitPackable>(input: &[T], res: &mut [u8]) {
+#[cfg_attr(not(test), expect(dead_code, reason = "reserved b1_pack"))]
+pub(crate) fn b1_pack<T: BitPackable>(input: &[T], res: &mut [u8]) {
     for_b1_pack(input, T::ZERO, res)
 }
 
 /// Pack with FrameOfReference (bits=1).
 /// Improve performance with Superword-Level Parallelism.
-#[allow(clippy::needless_range_loop)]
+#[expect(clippy::needless_range_loop, reason = "code style")]
 #[inline]
-pub fn for_b1_pack<T: BitPackable>(input: &[T], min: T, res: &mut [u8]) {
+pub(crate) fn for_b1_pack<T: BitPackable>(input: &[T], min: T, res: &mut [u8]) {
     debug_assert!(input.len() <= res.len() * 8);
     // layer 1: batch 64
     let chunks = input.chunks_exact(64);
@@ -179,15 +180,16 @@ pub fn for_b1_pack<T: BitPackable>(input: &[T], min: T, res: &mut [u8]) {
 /// Unpack (bits=1).
 /// Compressed element count is supposed to be greater or equal to result count.
 #[inline]
-pub fn b1_unpack<T: BitPackable>(input: &[u8], res: &mut [T]) {
+#[cfg_attr(not(test), expect(dead_code, reason = "reserved b1_unpack"))]
+pub(crate) fn b1_unpack<T: BitPackable>(input: &[u8], res: &mut [T]) {
     for_b1_unpack(input, T::ZERO, res)
 }
 
 /// FOR unpack (bits=1).
 /// Compressed element count is supposed to be greater or equal to result count.
-#[allow(clippy::needless_range_loop)]
+#[expect(clippy::needless_range_loop, reason = "code style")]
 #[inline]
-pub fn for_b1_unpack<T: BitPackable>(input: &[u8], min: T, res: &mut [T]) {
+pub(crate) fn for_b1_unpack<T: BitPackable>(input: &[u8], min: T, res: &mut [T]) {
     debug_assert!(input.len() * 8 >= res.len());
     // layer 1: batch 64
     let chunks = input.chunks_exact(8);
@@ -227,9 +229,9 @@ pub fn for_b1_unpack<T: BitPackable>(input: &[u8], min: T, res: &mut [T]) {
     }
 }
 
-#[allow(clippy::needless_range_loop)]
+#[expect(clippy::needless_range_loop, reason = "code style")]
 #[inline]
-pub fn for_b1_unpack_extend<T: BitPackable, E: Extend<T>>(
+pub(crate) fn for_b1_unpack_extend<T: BitPackable, E: Extend<T>>(
     input: &[u8],
     len: usize,
     min: T,
@@ -276,15 +278,16 @@ pub fn for_b1_unpack_extend<T: BitPackable, E: Extend<T>>(
 /// Pack (bits=2).
 /// User has to guarantee all values are not out of range.
 #[inline]
-pub fn b2_pack<T: BitPackable>(input: &[T], res: &mut [u8]) {
+#[cfg_attr(not(test), expect(dead_code, reason = "reserved b2_pack"))]
+pub(crate) fn b2_pack<T: BitPackable>(input: &[T], res: &mut [u8]) {
     for_b2_pack(input, T::ZERO, res)
 }
 
 /// Pack with FrameOfReference (bits=2).
 /// Improve performance with Superword-Level Parallelism.
-#[allow(clippy::needless_range_loop)]
+#[expect(clippy::needless_range_loop, reason = "code style")]
 #[inline]
-pub fn for_b2_pack<T: BitPackable>(input: &[T], min: T, res: &mut [u8]) {
+pub(crate) fn for_b2_pack<T: BitPackable>(input: &[T], min: T, res: &mut [u8]) {
     debug_assert!(input.len() <= res.len() * 4);
     // layer 1: batch 32
     let chunks = input.chunks_exact(32);
@@ -335,15 +338,16 @@ pub fn for_b2_pack<T: BitPackable>(input: &[T], min: T, res: &mut [u8]) {
 /// Unpack (bits=2).
 /// Compressed element count is supposed to be greater or equal to result count.
 #[inline]
-pub fn b2_unpack<T: BitPackable>(input: &[u8], res: &mut [T]) {
+#[cfg_attr(not(test), expect(dead_code, reason = "reserved b2_unpack"))]
+pub(crate) fn b2_unpack<T: BitPackable>(input: &[u8], res: &mut [T]) {
     for_b2_unpack(input, T::ZERO, res)
 }
 
 /// FOR unpack (bits=2).
 /// Compressed element count is supposed to be greater or equal to result count.
-#[allow(clippy::needless_range_loop)]
+#[expect(clippy::needless_range_loop, reason = "code style")]
 #[inline]
-pub fn for_b2_unpack<T: BitPackable>(input: &[u8], min: T, res: &mut [T]) {
+pub(crate) fn for_b2_unpack<T: BitPackable>(input: &[u8], min: T, res: &mut [T]) {
     debug_assert!(input.len() * 4 >= res.len());
     // layer 1: batch 32
     let chunks = input.chunks_exact(8);
@@ -383,9 +387,9 @@ pub fn for_b2_unpack<T: BitPackable>(input: &[u8], min: T, res: &mut [T]) {
     }
 }
 
-#[allow(clippy::needless_range_loop)]
+#[expect(clippy::needless_range_loop, reason = "code style")]
 #[inline]
-pub fn for_b2_unpack_extend<T: BitPackable, E: Extend<T>>(
+pub(crate) fn for_b2_unpack_extend<T: BitPackable, E: Extend<T>>(
     input: &[u8],
     len: usize,
     min: T,
@@ -435,15 +439,16 @@ pub fn for_b2_unpack_extend<T: BitPackable, E: Extend<T>>(
 /// Pack (bits=4).
 /// User has to guarantee all values are not out of range.
 #[inline]
-pub fn b4_pack<T: BitPackable>(input: &[T], res: &mut [u8]) {
+#[cfg_attr(not(test), expect(dead_code, reason = "reserved b4_pack"))]
+pub(crate) fn b4_pack<T: BitPackable>(input: &[T], res: &mut [u8]) {
     for_b4_pack(input, T::ZERO, res)
 }
 
 /// Pack with FrameOfReference (bits=4).
 /// Improve performance with Superword-Level Parallelism.
-#[allow(clippy::needless_range_loop)]
+#[expect(clippy::needless_range_loop, reason = "code style")]
 #[inline]
-pub fn for_b4_pack<T: BitPackable>(input: &[T], min: T, res: &mut [u8]) {
+pub(crate) fn for_b4_pack<T: BitPackable>(input: &[T], min: T, res: &mut [u8]) {
     debug_assert!(input.len() <= res.len() * 2);
     // layer 1: batch 16
     let chunks = input.chunks_exact(16);
@@ -490,15 +495,16 @@ pub fn for_b4_pack<T: BitPackable>(input: &[T], min: T, res: &mut [u8]) {
 /// Unpack (bits=4).
 /// Compressed element count is supposed to be greater or equal to result count.
 #[inline]
-pub fn b4_unpack<T: BitPackable>(input: &[u8], res: &mut [T]) {
+#[cfg_attr(not(test), expect(dead_code, reason = "reserved b4_unpack"))]
+pub(crate) fn b4_unpack<T: BitPackable>(input: &[u8], res: &mut [T]) {
     for_b4_unpack(input, T::ZERO, res)
 }
 
 /// FOR unpack (bits=4).
 /// Compressed element count is supposed to be greater or equal to result count.
-#[allow(clippy::needless_range_loop)]
+#[expect(clippy::needless_range_loop, reason = "code style")]
 #[inline]
-pub fn for_b4_unpack<T: BitPackable>(input: &[u8], min: T, res: &mut [T]) {
+pub(crate) fn for_b4_unpack<T: BitPackable>(input: &[u8], min: T, res: &mut [T]) {
     debug_assert!(input.len() * 2 >= res.len());
     // layer 1: batch 16
     let chunks = input.chunks_exact(8);
@@ -536,9 +542,9 @@ pub fn for_b4_unpack<T: BitPackable>(input: &[u8], min: T, res: &mut [T]) {
     }
 }
 
-#[allow(clippy::needless_range_loop)]
+#[expect(clippy::needless_range_loop, reason = "code style")]
 #[inline]
-pub fn for_b4_unpack_extend<T: BitPackable, E: Extend<T>>(
+pub(crate) fn for_b4_unpack_extend<T: BitPackable, E: Extend<T>>(
     input: &[u8],
     len: usize,
     min: T,
@@ -585,13 +591,14 @@ pub fn for_b4_unpack_extend<T: BitPackable, E: Extend<T>>(
 /// Pack (bits=8).
 /// User has to guarantee all values are not out of range.
 #[inline]
-pub fn b8_pack<T: BitPackable>(input: &[T], res: &mut [u8]) {
+#[cfg_attr(not(test), expect(dead_code, reason = "reserved b8_pack"))]
+pub(crate) fn b8_pack<T: BitPackable>(input: &[T], res: &mut [u8]) {
     for_b8_pack(input, T::ZERO, res)
 }
 
 /// Pack with FrameOfReference (bits=8).
 #[inline]
-pub fn for_b8_pack<T: BitPackable>(input: &[T], min: T, res: &mut [u8]) {
+pub(crate) fn for_b8_pack<T: BitPackable>(input: &[T], min: T, res: &mut [u8]) {
     debug_assert!(res.len() >= input.len());
     input.iter().zip(res).for_each(|(src, tgt)| {
         *tgt = src.sub_to_u8(min);
@@ -601,14 +608,15 @@ pub fn for_b8_pack<T: BitPackable>(input: &[T], min: T, res: &mut [u8]) {
 /// Unpack (bits=8).
 /// Compressed element count is supposed to be greater or equal to result count.
 #[inline]
-pub fn b8_unpack<T: BitPackable>(input: &[u8], res: &mut [T]) {
+#[cfg_attr(not(test), expect(dead_code, reason = "reserved b8_unpack"))]
+pub(crate) fn b8_unpack<T: BitPackable>(input: &[u8], res: &mut [T]) {
     for_b8_unpack(input, T::ZERO, res)
 }
 
 /// FOR unpack (bits=8).
 /// Compressed element count is supposed to be greater or equal to result count.
 #[inline]
-pub fn for_b8_unpack<T: BitPackable>(input: &[u8], min: T, res: &mut [T]) {
+pub(crate) fn for_b8_unpack<T: BitPackable>(input: &[u8], min: T, res: &mut [T]) {
     debug_assert!(input.len() >= res.len());
     input.iter().zip(res).for_each(|(src, tgt)| {
         *tgt = min.add_from_u8(*src);
@@ -616,21 +624,26 @@ pub fn for_b8_unpack<T: BitPackable>(input: &[u8], min: T, res: &mut [T]) {
 }
 
 #[inline]
-pub fn for_b8_unpack_extend<T: BitPackable, E: Extend<T>>(input: &[u8], min: T, res: &mut E) {
+pub(crate) fn for_b8_unpack_extend<T: BitPackable, E: Extend<T>>(
+    input: &[u8],
+    min: T,
+    res: &mut E,
+) {
     res.extend(input.iter().map(|&delta| min.add_from_u8(delta)));
 }
 
 /// Pack (bits=16).
 /// User has to guarantee all values are not out of range.
 #[inline]
-pub fn b16_pack<T: BitPackable>(input: &[T], res: &mut [u8]) {
+#[cfg_attr(not(test), expect(dead_code, reason = "reserved b16_pack"))]
+pub(crate) fn b16_pack<T: BitPackable>(input: &[T], res: &mut [u8]) {
     for_b16_pack(input, T::ZERO, res)
 }
 
 /// Pack with FrameOfReference (bits=16).
 /// u16::to_le_bytes() to enable more efficient SIMD instruction.
 #[inline]
-pub fn for_b16_pack<T: BitPackable>(input: &[T], min: T, res: &mut [u8]) {
+pub(crate) fn for_b16_pack<T: BitPackable>(input: &[T], min: T, res: &mut [u8]) {
     debug_assert!(res.len() >= input.len() * 2);
     // convert slice of u8 to slice of u16(unaligned) for better auto-vectorization.
     let res = layout::slice_from_bytes_mut::<[u8; 2]>(&mut res[..input.len() * 2]);
@@ -643,14 +656,15 @@ pub fn for_b16_pack<T: BitPackable>(input: &[T], min: T, res: &mut [u8]) {
 /// Unpack (bits=16).
 /// Compressed element count is supposed to be greater or equal to result count.
 #[inline]
-pub fn b16_unpack<T: BitPackable>(input: &[u8], res: &mut [T]) {
+#[cfg_attr(not(test), expect(dead_code, reason = "reserved b16_unpack"))]
+pub(crate) fn b16_unpack<T: BitPackable>(input: &[u8], res: &mut [T]) {
     for_b16_unpack(input, T::ZERO, res)
 }
 
 /// FOR unpack (bits=16).
 /// Compressed element count is supposed to be greater or equal to result count.
 #[inline]
-pub fn for_b16_unpack<T: BitPackable>(input: &[u8], min: T, res: &mut [T]) {
+pub(crate) fn for_b16_unpack<T: BitPackable>(input: &[u8], min: T, res: &mut [T]) {
     debug_assert!(input.len() >= res.len() * 2);
     let input = layout::slice_from_bytes::<[u8; 2]>(&input[..res.len() * 2]);
     input.iter().zip(res).for_each(|(src, tgt)| {
@@ -660,7 +674,11 @@ pub fn for_b16_unpack<T: BitPackable>(input: &[u8], min: T, res: &mut [T]) {
 }
 
 #[inline]
-pub fn for_b16_unpack_extend<T: BitPackable, E: Extend<T>>(input: &[u8], min: T, res: &mut E) {
+pub(crate) fn for_b16_unpack_extend<T: BitPackable, E: Extend<T>>(
+    input: &[u8],
+    min: T,
+    res: &mut E,
+) {
     debug_assert!(input.len().is_multiple_of(2));
     let input = layout::slice_from_bytes::<[u8; 2]>(input);
     res.extend(input.iter().map(|src| {
@@ -672,14 +690,15 @@ pub fn for_b16_unpack_extend<T: BitPackable, E: Extend<T>>(input: &[u8], min: T,
 /// Pack (bits=32).
 /// User has to guarantee all values are not out of range.
 #[inline]
-pub fn b32_pack<T: BitPackable>(input: &[T], res: &mut [u8]) {
+#[cfg_attr(not(test), expect(dead_code, reason = "reserved b32_pack"))]
+pub(crate) fn b32_pack<T: BitPackable>(input: &[T], res: &mut [u8]) {
     for_b32_pack(input, T::ZERO, res)
 }
 
 /// Pack with FrameOfReference (bits=32).
 /// u32::to_le_bytes() to enable more efficient SIMD instruction.
 #[inline]
-pub fn for_b32_pack<T: BitPackable>(input: &[T], min: T, res: &mut [u8]) {
+pub(crate) fn for_b32_pack<T: BitPackable>(input: &[T], min: T, res: &mut [u8]) {
     debug_assert!(res.len() >= input.len() * 4);
     let res = layout::slice_from_bytes_mut::<[u8; 4]>(&mut res[..input.len() * 4]);
     input.iter().zip(res).for_each(|(src, tgt)| {
@@ -691,14 +710,15 @@ pub fn for_b32_pack<T: BitPackable>(input: &[T], min: T, res: &mut [u8]) {
 /// Unpack (bits=32).
 /// Compressed element count is supposed to be greater or equal to result count.
 #[inline]
-pub fn b32_unpack<T: BitPackable>(input: &[u8], res: &mut [T]) {
+#[cfg_attr(not(test), expect(dead_code, reason = "reserved b32_unpack"))]
+pub(crate) fn b32_unpack<T: BitPackable>(input: &[u8], res: &mut [T]) {
     for_b32_unpack(input, T::ZERO, res)
 }
 
 /// FOR unpack (bits=32).
 /// Compressed element count is supposed to be greater or equal to result count.
 #[inline]
-pub fn for_b32_unpack<T: BitPackable>(input: &[u8], min: T, res: &mut [T]) {
+pub(crate) fn for_b32_unpack<T: BitPackable>(input: &[u8], min: T, res: &mut [T]) {
     debug_assert!(input.len() >= res.len() * 4);
     let input = layout::slice_from_bytes::<[u8; 4]>(&input[..res.len() * 4]);
     input.iter().zip(res).for_each(|(src, tgt)| {
@@ -708,7 +728,11 @@ pub fn for_b32_unpack<T: BitPackable>(input: &[u8], min: T, res: &mut [T]) {
 }
 
 #[inline]
-pub fn for_b32_unpack_extend<T: BitPackable, E: Extend<T>>(input: &[u8], min: T, res: &mut E) {
+pub(crate) fn for_b32_unpack_extend<T: BitPackable, E: Extend<T>>(
+    input: &[u8],
+    min: T,
+    res: &mut E,
+) {
     debug_assert!(input.len().is_multiple_of(4));
     let input = layout::slice_from_bytes::<[u8; 4]>(input);
     res.extend(input.iter().map(|src| {
@@ -719,7 +743,7 @@ pub fn for_b32_unpack_extend<T: BitPackable, E: Extend<T>>(input: &[u8], min: T,
 
 macro_rules! impl_lwc_bitpackable_data {
     ($t:ident, $nbits:literal, $extendf:ident, $it:ident) => {
-        pub struct $t<'a, T> {
+        pub(crate) struct $t<'a, T> {
             pub(crate) len: usize,
             pub(crate) min: T,
             pub(crate) data: &'a [u8],
@@ -762,7 +786,7 @@ macro_rules! impl_lwc_bitpackable_data {
             }
         }
 
-        pub struct $it<'a, T> {
+        pub(crate) struct $it<'a, T> {
             len: usize,
             min: T,
             data: &'a [u8],
@@ -797,7 +821,7 @@ impl_lwc_bitpackable_data!(ForBitpacking1, 1, for_b1_unpack_extend, ForBitpackin
 impl_lwc_bitpackable_data!(ForBitpacking2, 2, for_b2_unpack_extend, ForBitpacking2Iter);
 impl_lwc_bitpackable_data!(ForBitpacking4, 4, for_b4_unpack_extend, ForBitpacking4Iter);
 
-pub struct ForBitpacking8<'a, T> {
+pub(crate) struct ForBitpacking8<'a, T> {
     pub(crate) min: T,
     pub(crate) data: &'a [u8],
 }
@@ -836,20 +860,7 @@ impl<'a, T: BitPackable> LwcPrimitiveData for ForBitpacking8<'a, T> {
     }
 }
 
-impl<T: BitPackable + Ord> SortedPosition for ForBitpacking8<'_, T> {
-    type Value = T;
-
-    #[inline]
-    fn sorted_position(&self, value: T) -> Option<usize> {
-        if value < self.min {
-            return None;
-        }
-        let delta = value.sub_to_u8(self.min);
-        self.data.binary_search(&delta).ok()
-    }
-}
-
-pub struct ForBitpacking8Iter<'a, T> {
+pub(crate) struct ForBitpacking8Iter<'a, T> {
     min: T,
     data: &'a [u8],
     idx: usize,
@@ -869,24 +880,9 @@ impl<T: BitPackable> Iterator for ForBitpacking8Iter<'_, T> {
     }
 }
 
-pub struct ForBitpacking16<'a, T> {
+pub(crate) struct ForBitpacking16<'a, T> {
     pub(crate) min: T,
     pub(crate) data: &'a [[u8; 2]],
-}
-
-impl<T: BitPackable + Ord> SortedPosition for ForBitpacking16<'_, T> {
-    type Value = T;
-
-    #[inline]
-    fn sorted_position(&self, value: T) -> Option<usize> {
-        if value < self.min {
-            return None;
-        }
-        let delta = value.sub_to_u16(self.min);
-        self.data
-            .binary_search_by_key(&delta, |&v| u16::from_le_bytes(v))
-            .ok()
-    }
 }
 
 impl<'a, T: BitPackable> LwcPrimitiveData for ForBitpacking16<'a, T> {
@@ -925,7 +921,7 @@ impl<'a, T: BitPackable> LwcPrimitiveData for ForBitpacking16<'a, T> {
     }
 }
 
-pub struct ForBitpacking16Iter<'a, T> {
+pub(crate) struct ForBitpacking16Iter<'a, T> {
     min: T,
     data: &'a [[u8; 2]],
     idx: usize,
@@ -945,24 +941,9 @@ impl<T: BitPackable> Iterator for ForBitpacking16Iter<'_, T> {
     }
 }
 
-pub struct ForBitpacking32<'a, T> {
+pub(crate) struct ForBitpacking32<'a, T> {
     pub(crate) min: T,
     pub(crate) data: &'a [[u8; 4]],
-}
-
-impl<T: BitPackable + Ord> SortedPosition for ForBitpacking32<'_, T> {
-    type Value = T;
-
-    #[inline]
-    fn sorted_position(&self, value: T) -> Option<usize> {
-        if value < self.min {
-            return None;
-        }
-        let delta = value.sub_to_u32(self.min);
-        self.data
-            .binary_search_by_key(&delta, |&v| u32::from_le_bytes(v))
-            .ok()
-    }
 }
 
 impl<'a, T: BitPackable> LwcPrimitiveData for ForBitpacking32<'a, T> {
@@ -1001,7 +982,7 @@ impl<'a, T: BitPackable> LwcPrimitiveData for ForBitpacking32<'a, T> {
     }
 }
 
-pub struct ForBitpacking32Iter<'a, T> {
+pub(crate) struct ForBitpacking32Iter<'a, T> {
     min: T,
     data: &'a [[u8; 4]],
     idx: usize,
@@ -1013,6 +994,7 @@ impl<T: BitPackable> Iterator for ForBitpacking32Iter<'_, T> {
     fn next(&mut self) -> Option<T> {
         if self.idx < self.data.len() {
             let delta = u32::from_le_bytes(self.data[self.idx]);
+            self.idx += 1;
             Some(self.min.add_from_u32(delta))
         } else {
             None
@@ -1404,6 +1386,20 @@ mod tests {
             for_b32_unpack(&compressed, min, &mut decompressed);
             assert_eq!(input, decompressed);
         }
+    }
+
+    #[test]
+    fn test_for_bitpacking32_iter_advances() {
+        let data = [1u32.to_le_bytes(), 5u32.to_le_bytes()];
+        let mut iter = ForBitpacking32Iter {
+            min: 10u64,
+            data: &data,
+            idx: 0,
+        };
+
+        assert_eq!(iter.next(), Some(11));
+        assert_eq!(iter.next(), Some(15));
+        assert_eq!(iter.next(), None);
     }
 
     #[test]

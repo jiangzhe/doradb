@@ -26,7 +26,7 @@ use zerocopy_derive::{FromBytes, Immutable, IntoBytes, KnownLayout};
 ///    If we want to retrieve value, we can always
 ///    extract last 8 byte from key and convert it
 ///    to RowID.
-pub trait BTreeValue: Maskable {
+pub(crate) trait BTreeValue: Maskable {
     const ENCODED_LEN: usize;
 
     fn encode_le(self, dst: &mut [u8]);
@@ -34,10 +34,10 @@ pub trait BTreeValue: Maskable {
     fn decode_le(src: &[u8]) -> Self;
 }
 
-pub const BTREE_VALUE_PACK_MAX_LEN: usize = 8;
+pub(crate) const BTREE_VALUE_PACK_MAX_LEN: usize = 8;
 
 /// Defines how to unpack a value from key.
-pub trait BTreeValuePackable: BTreeValue {
+pub(crate) trait BTreeValuePackable: BTreeValue {
     /// Unpack the value from collection.
     fn unpack(src: &[u8]) -> Self;
 }
@@ -165,10 +165,10 @@ impl BTreeValuePackable for BTreeU64 {
     Immutable,
 )]
 #[repr(transparent)]
-pub struct BTreeByte(u8);
+pub(crate) struct BTreeByte(u8);
 
 const BTREE_VALUE_BYTE_DELETE_BIT: u8 = 1;
-pub const BTREE_BYTE_ZERO: BTreeByte = BTreeByte(0);
+pub(crate) const BTREE_BYTE_ZERO: BTreeByte = BTreeByte(0);
 
 impl Maskable for BTreeByte {
     const INVALID_VALUE: Self = BTreeByte(!0);
@@ -211,7 +211,7 @@ impl BTreeValue for BTreeByte {
 /// durable delete mask or value payload, so the value width is intentionally
 /// zero.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct BTreeNil;
+pub(crate) struct BTreeNil;
 
 impl Maskable for BTreeNil {
     const INVALID_VALUE: Self = BTreeNil;

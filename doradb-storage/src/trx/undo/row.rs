@@ -17,7 +17,7 @@ use std::sync::Arc;
 /// becomes invisible to older readers, a `Delete` restores the previous
 /// visible row image, and an `Update` carries the before-images needed to
 /// reconstruct the older version.
-pub enum RowUndoKind {
+pub(crate) enum RowUndoKind {
     /// Provisional row-page write lock.
     ///
     /// Hot updates and deletes first install a `Lock` entry at the undo head.
@@ -99,31 +99,26 @@ impl fmt::Debug for RowUndoKind {
 /// RowUndoLogs is a collection of row undo logs.
 /// It owns the logs until GC clean them all at transaction level.
 #[derive(Default)]
-pub struct RowUndoLogs(Vec<OwnedRowUndo>);
+pub(crate) struct RowUndoLogs(Vec<OwnedRowUndo>);
 
 impl RowUndoLogs {
     #[inline]
-    pub fn empty() -> Self {
+    pub(crate) fn empty() -> Self {
         RowUndoLogs(vec![])
     }
 
     #[inline]
-    pub fn push(&mut self, value: OwnedRowUndo) {
+    pub(crate) fn push(&mut self, value: OwnedRowUndo) {
         self.0.push(value)
     }
 
     #[inline]
-    pub fn pop(&mut self) -> Option<OwnedRowUndo> {
-        self.0.pop()
-    }
-
-    #[inline]
-    pub fn merge(&mut self, other: &mut Self) {
+    pub(crate) fn merge(&mut self, other: &mut Self) {
         self.0.append(&mut other.0);
     }
 
     #[inline]
-    pub async fn rollback(
+    pub(crate) async fn rollback(
         &mut self,
         table_cache: &mut TableCache<'_>,
         guards: &PoolGuards,
@@ -172,7 +167,7 @@ impl DerefMut for RowUndoLogs {
 /// Garbage collector will make sure the deletion of entries is
 /// safe, because no transaction will access entries that is
 /// supposed to be deleted.
-pub struct OwnedRowUndo(Box<RowUndo>);
+pub(crate) struct OwnedRowUndo(Box<RowUndo>);
 
 impl Deref for OwnedRowUndo {
     type Target = RowUndo;
@@ -191,7 +186,7 @@ impl DerefMut for OwnedRowUndo {
 
 impl OwnedRowUndo {
     #[inline]
-    pub fn new(
+    pub(crate) fn new(
         table_id: TableID,
         page_id: Option<VersionedPageID>,
         row_id: RowID,
@@ -208,7 +203,7 @@ impl OwnedRowUndo {
     }
 
     #[inline]
-    pub fn leak(&self) -> RowUndoRef {
+    pub(crate) fn leak(&self) -> RowUndoRef {
         RowUndoRef(NonNull::from(self.0.as_ref()))
     }
 }
@@ -222,7 +217,7 @@ impl OwnedRowUndo {
 /// And the non-locking consistent read will not access
 /// log entries that are deleted(GCed).
 #[repr(transparent)]
-pub struct RowUndoRef(NonNull<RowUndo>);
+pub(crate) struct RowUndoRef(NonNull<RowUndo>);
 
 // SAFETY: version-chain lifetime and row-lock/GC rules guarantee the pointed
 // undo entry remains valid while a `RowUndoRef` is reachable.
@@ -265,18 +260,18 @@ impl Clone for RowUndoRef {
     }
 }
 
-pub struct RowUndo {
+pub(crate) struct RowUndo {
     /// Table containing the hot row or cold deletion marker.
-    pub table_id: TableID,
+    pub(crate) table_id: TableID,
     /// Row page for hot-row undo. `None` is reserved for cold-row deletion
     /// buffer undo, which has no row page to latch during rollback.
-    pub page_id: Option<VersionedPageID>,
+    pub(crate) page_id: Option<VersionedPageID>,
     /// Physical row version affected by this undo entry.
-    pub row_id: RowID,
+    pub(crate) row_id: RowID,
     /// Operation whose inverse reconstructs the previous MVCC state.
-    pub kind: RowUndoKind,
+    pub(crate) kind: RowUndoKind,
     /// Older version state reachable from this entry.
-    pub next: Option<NextRowUndo>,
+    pub(crate) next: Option<NextRowUndo>,
 }
 
 /// NextRowUndo stores status and reference of next undo log.
@@ -293,15 +288,15 @@ pub struct RowUndo {
 /// reach an older visible owner of the same logical key. The branch target may
 /// be a hot row undo chain or a terminal cold row image reconstructed from the
 /// branch's undo values.
-pub struct NextRowUndo {
-    pub main: MainBranch,
-    pub indexes: Vec<IndexBranch>,
+pub(crate) struct NextRowUndo {
+    pub(crate) main: MainBranch,
+    pub(crate) indexes: Vec<IndexBranch>,
 }
 
 impl NextRowUndo {
     /// Create a new next undo with only main branch.
     #[inline]
-    pub fn new(main: MainBranch) -> Self {
+    pub(crate) fn new(main: MainBranch) -> Self {
         NextRowUndo {
             main,
             indexes: vec![],
@@ -310,7 +305,7 @@ impl NextRowUndo {
 
     /// Returns next index branch.
     #[inline]
-    pub fn index_branch(&self, key: Option<&SelectKey>) -> Option<&IndexBranch> {
+    pub(crate) fn index_branch(&self, key: Option<&SelectKey>) -> Option<&IndexBranch> {
         key.and_then(|k| self.indexes.iter().find(|&ib| &ib.key == k))
     }
 }
@@ -320,33 +315,33 @@ impl NextRowUndo {
 /// It is the normal path for table scans and point reads that already routed
 /// to the row. Unique-index branches are separate because a latest unique-key
 /// mapping may need to reach an older owner with a different RowID.
-pub struct MainBranch {
-    pub entry: RowUndoRef,
-    pub status: UndoStatus,
+pub(crate) struct MainBranch {
+    pub(crate) entry: RowUndoRef,
+    pub(crate) status: UndoStatus,
 }
 
 /// UndoStatus represents status of any undo log,
 /// including uncommitted transactions.
-pub enum UndoStatus {
+pub(crate) enum UndoStatus {
     /// Shared transaction status while the owning transaction is active or has
     /// not yet been compacted to a plain commit timestamp.
     Ref(Arc<SharedTrxStatus>),
     /// Stable committed timestamp kept after the shared status is no longer
     /// needed for visibility.
-    CTS(TrxID),
+    Committed(TrxID),
 }
 
 impl UndoStatus {
     #[inline]
-    pub fn ts(&self) -> TrxID {
+    pub(crate) fn ts(&self) -> TrxID {
         match self {
             UndoStatus::Ref(status) => status.ts(),
-            UndoStatus::CTS(cts) => *cts,
+            UndoStatus::Committed(cts) => *cts,
         }
     }
 
     #[inline]
-    pub fn can_purge(&mut self, min_active_sts: TrxID) -> bool {
+    pub(crate) fn can_purge(&mut self, min_active_sts: TrxID) -> bool {
         match self {
             UndoStatus::Ref(status) => {
                 let ts = status.ts();
@@ -355,12 +350,12 @@ impl UndoStatus {
                 }
                 if trx_is_committed(ts) {
                     // convert from reference to integer.
-                    *self = UndoStatus::CTS(ts);
+                    *self = UndoStatus::Committed(ts);
                     return false;
                 }
                 false
             }
-            UndoStatus::CTS(ts) => *ts < min_active_sts,
+            UndoStatus::Committed(ts) => *ts < min_active_sts,
         }
     }
 }
@@ -446,14 +441,14 @@ impl UndoStatus {
 ///   └───────────┘   └─────►│rowid=200,k=3,v=4├──►│k=1,v=2├───────────────┘          
 ///                          └─────────────────┘   └───────┘                          
 /// ```
-pub struct IndexBranch {
-    pub key: SelectKey,
-    pub target: IndexBranchTarget,
-    pub undo_vals: Vec<UpdateCol>,
+pub(crate) struct IndexBranch {
+    pub(crate) key: SelectKey,
+    pub(crate) target: IndexBranchTarget,
+    pub(crate) undo_vals: Vec<UpdateCol>,
 }
 
 /// Target of a runtime unique-index branch.
-pub enum IndexBranchTarget {
+pub(crate) enum IndexBranchTarget {
     /// Branch to another hot row's undo chain.
     ///
     /// `cts` is the delete/update timestamp at which the old hot owner stopped
@@ -481,17 +476,17 @@ impl IndexBranchTarget {
     }
 }
 
-pub struct RowUndoHead {
-    pub next: NextRowUndo,
+pub(crate) struct RowUndoHead {
+    pub(crate) next: NextRowUndo,
     // If a purge thread purge some logs from this chain,
     // it will increase this field, so another thread may
     // skip if it has been already processed.
-    pub purge_ts: TrxID,
+    pub(crate) purge_ts: TrxID,
 }
 
 impl RowUndoHead {
     #[inline]
-    pub fn new(status: Arc<SharedTrxStatus>, entry: RowUndoRef) -> Self {
+    pub(crate) fn new(status: Arc<SharedTrxStatus>, entry: RowUndoRef) -> Self {
         RowUndoHead {
             next: NextRowUndo {
                 main: MainBranch {
@@ -506,12 +501,12 @@ impl RowUndoHead {
 
     /// Returns timestamp of undo head.
     #[inline]
-    pub fn ts(&self) -> TrxID {
+    pub(crate) fn ts(&self) -> TrxID {
         self.next.main.status.ts()
     }
 
     #[inline]
-    pub fn preparing(&self) -> bool {
+    pub(crate) fn preparing(&self) -> bool {
         match &self.next.main.status {
             UndoStatus::Ref(status) => status.preparing(),
             _ => false,
@@ -519,7 +514,7 @@ impl RowUndoHead {
     }
 
     #[inline]
-    pub fn prepare_listener(&self) -> Option<EventListener> {
+    pub(crate) fn prepare_listener(&self) -> Option<EventListener> {
         match &self.next.main.status {
             UndoStatus::Ref(status) => status.prepare_listener(),
             _ => None,

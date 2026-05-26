@@ -18,18 +18,18 @@ use std::ptr::NonNull;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
 
-pub use crate::file::BlockID;
+pub(crate) use crate::file::BlockID;
 
 /// Shared page size of CoW table files and multi-table files.
-pub const COW_FILE_PAGE_SIZE: usize = PAGE_SIZE;
+pub(crate) const COW_FILE_PAGE_SIZE: usize = PAGE_SIZE;
 /// Reserved persisted block id that stores the colocated ping-pong super-block
 /// pair for every CoW file.
 ///
 /// Because block `0` is occupied by that super block, no other persisted
 /// meta/data/blob/index block may legally use this id.
-pub const SUPER_BLOCK_ID: BlockID = BlockID::new(0);
+pub(crate) const SUPER_BLOCK_ID: BlockID = BlockID::new(0);
 /// Sentinel persisted block id used only for cleared in-memory metadata.
-pub const INVALID_BLOCK_ID: BlockID = BlockID::new(u64::MAX);
+pub(crate) const INVALID_BLOCK_ID: BlockID = BlockID::new(u64::MAX);
 
 /// Minimal mutable operations required by CoW index/checkpoint writers.
 pub(crate) trait MutableCowFile {
@@ -106,17 +106,17 @@ impl<F: MutableWriterFile> Drop for MutableWriterClaim<F> {
 ///
 /// `ActiveRoot<M>` stores generic CoW bookkeeping (`slot_no`, `meta_block_id`,
 /// allocation map) plus a file-specific payload `M`.
-pub struct ActiveRoot<M> {
+pub(crate) struct ActiveRoot<M> {
     /// Active ping-pong super-block slot (0/1).
-    pub slot_no: u64,
+    pub(crate) slot_no: u64,
     /// Transaction/checkpoint id persisted in current super block.
-    pub trx_id: TrxID,
+    pub(crate) trx_id: TrxID,
     /// Active meta-block id referenced by the super block.
-    pub meta_block_id: BlockID,
+    pub(crate) meta_block_id: BlockID,
     /// Allocation map used for page-id assignment.
-    pub alloc_map: AllocMap,
+    pub(crate) alloc_map: AllocMap,
     /// File-specific in-memory metadata payload.
-    pub meta: M,
+    pub(crate) meta: M,
     /// Runtime-only timestamp proving when this root became effective.
     ///
     /// This is deliberately not serialized. Loaded roots initialize it from
@@ -142,7 +142,7 @@ impl<M: Clone> Clone for ActiveRoot<M> {
 impl<M> ActiveRoot<M> {
     /// Build one active root from already-parsed super/meta payload parts.
     #[inline]
-    pub fn from_parts(
+    pub(crate) fn from_parts(
         slot_no: u64,
         trx_id: TrxID,
         meta_block_id: BlockID,
@@ -161,7 +161,7 @@ impl<M> ActiveRoot<M> {
 
     /// Clone current root and flip to the opposite ping-pong super-block slot.
     #[inline]
-    pub fn flip(&self) -> Self
+    pub(crate) fn flip(&self) -> Self
     where
         M: Clone,
     {
@@ -173,7 +173,7 @@ impl<M> ActiveRoot<M> {
 
     /// Return the runtime-only timestamp when this root became observable.
     #[inline]
-    pub fn effective_ts(&self) -> TrxID {
+    pub(crate) fn effective_ts(&self) -> TrxID {
         self.effective_ts.load(Ordering::Acquire)
     }
 
@@ -351,11 +351,11 @@ impl<M> DerefMut for ActiveRoot<M> {
 ///
 /// `parse_meta_block` returns this value so `CowFile` can reconstruct one
 /// full [`ActiveRoot`] without trait-based root logic.
-pub struct ParsedMeta<M> {
+pub(crate) struct ParsedMeta<M> {
     /// File-specific metadata payload.
-    pub meta: M,
+    pub(crate) meta: M,
     /// Decoded allocation bitmap for the file.
-    pub alloc_map: AllocMap,
+    pub(crate) alloc_map: AllocMap,
 }
 
 /// Serialization and parsing callbacks for one concrete CoW file type.
@@ -363,17 +363,17 @@ pub struct ParsedMeta<M> {
 /// This keeps file-type-specific super/meta codecs explicit without introducing
 /// extra trait hierarchies.
 #[derive(Clone, Copy)]
-pub struct CowCodec<M> {
+pub(crate) struct CowCodec<M> {
     /// Parse one super-block image.
-    pub parse_super_block: fn(&[u8]) -> Result<SuperBlock>,
+    pub(crate) parse_super_block: fn(&[u8]) -> Result<SuperBlock>,
     /// Parse one meta-block image.
-    pub parse_meta_block: fn(BlockID, &[u8]) -> Result<ParsedMeta<M>>,
+    pub(crate) parse_meta_block: fn(BlockID, &[u8]) -> Result<ParsedMeta<M>>,
     /// Validate root invariants after parsing one meta block.
-    pub validate_root: fn(BlockID, &ParsedMeta<M>) -> Result<()>,
+    pub(crate) validate_root: fn(BlockID, &ParsedMeta<M>) -> Result<()>,
     /// Build one meta-block image from active root.
-    pub build_meta_block: fn(&ActiveRoot<M>) -> Result<DirectBuf>,
+    pub(crate) build_meta_block: fn(&ActiveRoot<M>) -> Result<DirectBuf>,
     /// Build one super-block image from active root.
-    pub build_super_block: fn(&ActiveRoot<M>) -> Result<DirectBuf>,
+    pub(crate) build_super_block: fn(&ActiveRoot<M>) -> Result<DirectBuf>,
 }
 
 /// Generic copy-on-write file abstraction shared by table and multi-table files.
@@ -381,7 +381,7 @@ pub struct CowCodec<M> {
 /// `CowFile` owns file IO, active-root pointer management, and generic CoW
 /// publish/load flow. Concrete file types provide format-specific behavior via
 /// [`CowCodec`].
-pub struct CowFile<M> {
+pub(crate) struct CowFile<M> {
     file: Arc<SparseFile>,
     active_root: AtomicPtr<ActiveRoot<M>>,
     mutable_inflight: AtomicBool,
@@ -442,16 +442,8 @@ impl<M> CowFile<M> {
     /// Callers that need multiple fields from one logical root snapshot must
     /// bind one local reference and reuse it.
     #[inline]
-    pub fn active_root_unchecked(&self) -> &ActiveRoot<M> {
+    pub(crate) fn active_root_unchecked(&self) -> &ActiveRoot<M> {
         Self::active_root_from_raw(self.load_active_root_raw())
-    }
-
-    /// Return a copy of the active-root atomic pointer.
-    ///
-    /// This is used by components that need lock-free pointer observation.
-    #[inline]
-    pub fn active_root_ptr(&self) -> AtomicPtr<ActiveRoot<M>> {
-        AtomicPtr::new(self.load_active_root_raw())
     }
 
     /// Claim exclusive mutable access to this CoW file.
@@ -555,7 +547,7 @@ impl<M> CowFile<M> {
 
     /// Replace active root with new root, returning previous-root guard if present.
     #[inline]
-    pub fn swap_active_root(&self, active_root: ActiveRoot<M>) -> Option<OldCowRoot<M>> {
+    pub(crate) fn swap_active_root(&self, active_root: ActiveRoot<M>) -> Option<OldCowRoot<M>> {
         let new = Self::allocate_active_root(active_root);
         let old = self.active_root.swap(new, Ordering::SeqCst);
         NonNull::new(old).map(OldCowRoot)
@@ -649,7 +641,7 @@ impl<M> CowFile<M> {
 
     /// Force all pending writes to disk.
     #[inline]
-    pub fn fsync(&self) -> Result<()> {
+    pub(crate) fn fsync(&self) -> Result<()> {
         self.file.syncer().fsync()
     }
 
@@ -745,7 +737,7 @@ impl<M> Drop for CowFile<M> {
 ///
 /// Returned from active-root swap to defer pointer reclamation until callers
 /// finish using the old root snapshot.
-pub struct OldCowRoot<M>(NonNull<ActiveRoot<M>>);
+pub(crate) struct OldCowRoot<M>(NonNull<ActiveRoot<M>>);
 
 impl<M> Drop for OldCowRoot<M> {
     #[inline]

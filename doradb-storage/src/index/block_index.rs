@@ -6,9 +6,7 @@ use crate::error::{Error, InternalError, Result};
 use crate::file::cow_file::{BlockID, SUPER_BLOCK_ID};
 use crate::index::block_index_root::{BlockIndexRoot, BlockIndexRoute};
 use crate::index::column_block_index::ColumnBlockIndex;
-use crate::index::row_page_index::{
-    GenericRowPageIndex, GenericRowPageIndexMemCursor, RowLocation,
-};
+use crate::index::row_page_index::{RowLocation, RowPageIndex, RowPageIndexMemCursor};
 use crate::index::util::{Maskable, RowPageCreateRedoCtx};
 use crate::quiescent::QuiescentGuard;
 use crate::row::{RowID, RowPage};
@@ -23,40 +21,41 @@ use std::sync::Arc;
 /// - the on-disk column-store index (`ColumnBlockIndex`)
 ///
 /// Routing decisions are made by `BlockIndexRoot`.
-pub struct GenericBlockIndex<P: 'static> {
+pub(crate) struct BlockIndex<P: 'static = FixedBufferPool> {
     root: BlockIndexRoot,
-    row: GenericRowPageIndex<P>,
+    row: RowPageIndex<P>,
 }
 
-/// Compatibility alias for runtime block index backed by `FixedBufferPool`.
-pub type BlockIndex = GenericBlockIndex<FixedBufferPool>;
-
-impl<P: BufferPool> GenericBlockIndex<P> {
+impl<P: BufferPool> BlockIndex<P> {
     /// Creates a block-index facade for one table.
     ///
     /// `pivot_row_id` and `column_root_block_id` define the boundary and root of
     /// persisted columnar data at startup.
     #[inline]
-    pub async fn new(
+    pub(crate) async fn new(
         pool: QuiescentGuard<P>,
         meta_pool_guard: &PoolGuard,
         pivot_row_id: RowID,
         column_root_block_id: BlockID,
     ) -> Result<Self> {
-        let row = GenericRowPageIndex::new(pool, meta_pool_guard, pivot_row_id).await?;
+        let row = RowPageIndex::new(pool, meta_pool_guard, pivot_row_id).await?;
         let root = BlockIndexRoot::new(pivot_row_id, column_root_block_id);
-        Ok(GenericBlockIndex { root, row })
+        Ok(BlockIndex { root, row })
     }
 
     /// Creates block index for catalog-table runtime without table-file backing.
     #[inline]
-    pub async fn new_catalog(pool: QuiescentGuard<P>, meta_pool_guard: &PoolGuard) -> Result<Self> {
+    pub(crate) async fn new_catalog(
+        pool: QuiescentGuard<P>,
+        meta_pool_guard: &PoolGuard,
+    ) -> Result<Self> {
         Self::new(pool, meta_pool_guard, 0, SUPER_BLOCK_ID).await
     }
 
     /// Returns the in-memory row index height.
     #[inline]
-    pub fn height(&self) -> usize {
+    #[cfg_attr(not(test), expect(dead_code, reason = "reserved index height"))]
+    pub(crate) fn height(&self) -> usize {
         self.row.height()
     }
 
@@ -64,28 +63,20 @@ impl<P: BufferPool> GenericBlockIndex<P> {
     ///
     /// Called after checkpoint/persist updates the column block index.
     #[inline]
-    pub async fn update_column_root(&self, pivot_row_id: RowID, column_root_block_id: BlockID) {
+    pub(crate) async fn update_column_root(
+        &self,
+        pivot_row_id: RowID,
+        column_root_block_id: BlockID,
+    ) {
         self.root
             .update_column_root(pivot_row_id, column_root_block_id)
             .await;
     }
 
-    /// Returns current row/column route boundary metadata.
-    #[inline]
-    pub fn root_snapshot(&self) -> (RowID, BlockID) {
-        self.root.snapshot()
-    }
-
     /// Returns current pivot row id.
     #[inline]
-    pub fn pivot_row_id(&self) -> RowID {
+    pub(crate) fn pivot_row_id(&self) -> RowID {
         self.root.pivot_row_id()
-    }
-
-    /// Returns current column-root block id.
-    #[inline]
-    pub fn column_root_block_id(&self) -> BlockID {
-        self.root.column_root_block_id()
     }
 
     /// Destroy the in-memory row-page index owned by this facade.
@@ -101,27 +92,6 @@ impl<P: BufferPool> GenericBlockIndex<P> {
             .await
     }
 
-    /// Returns a shared row page suitable for insert operations.
-    #[inline]
-    pub async fn get_insert_page<B: BufferPool>(
-        &self,
-        meta_pool_guard: &PoolGuard,
-        mem_pool: &B,
-        mem_pool_guard: &PoolGuard,
-        col_layout: &Arc<TableColumnLayout>,
-        count: usize,
-    ) -> Result<PageSharedGuard<RowPage>> {
-        self.try_get_insert_page_with_redo(
-            meta_pool_guard,
-            mem_pool,
-            mem_pool_guard,
-            col_layout,
-            count,
-            None,
-        )
-        .await
-    }
-
     #[inline]
     pub(crate) async fn try_get_insert_page_with_redo<B: BufferPool>(
         &self,
@@ -133,7 +103,7 @@ impl<P: BufferPool> GenericBlockIndex<P> {
         redo_ctx: Option<RowPageCreateRedoCtx<'_>>,
     ) -> Result<PageSharedGuard<RowPage>> {
         self.row
-            .try_get_insert_page_with_redo(
+            .get_insert_page(
                 meta_pool_guard,
                 mem_pool,
                 mem_pool_guard,
@@ -142,27 +112,6 @@ impl<P: BufferPool> GenericBlockIndex<P> {
                 redo_ctx,
             )
             .await
-    }
-
-    /// Returns an exclusive row page suitable for insert operations.
-    #[inline]
-    pub async fn get_insert_page_exclusive<B: BufferPool>(
-        &self,
-        meta_pool_guard: &PoolGuard,
-        mem_pool: &B,
-        mem_pool_guard: &PoolGuard,
-        col_layout: &Arc<TableColumnLayout>,
-        count: usize,
-    ) -> Result<PageExclusiveGuard<RowPage>> {
-        self.get_insert_page_exclusive_with_redo(
-            meta_pool_guard,
-            mem_pool,
-            mem_pool_guard,
-            col_layout,
-            count,
-            None,
-        )
-        .await
     }
 
     #[inline]
@@ -176,7 +125,7 @@ impl<P: BufferPool> GenericBlockIndex<P> {
         redo_ctx: Option<RowPageCreateRedoCtx<'_>>,
     ) -> Result<PageExclusiveGuard<RowPage>> {
         self.row
-            .get_insert_page_exclusive_with_redo(
+            .get_insert_page_exclusive(
                 meta_pool_guard,
                 mem_pool,
                 mem_pool_guard,
@@ -191,7 +140,7 @@ impl<P: BufferPool> GenericBlockIndex<P> {
     ///
     /// This is primarily used by recovery replay.
     #[inline]
-    pub async fn allocate_row_page_at<B: BufferPool>(
+    pub(crate) async fn allocate_row_page_at<B: BufferPool>(
         &self,
         meta_pool_guard: &PoolGuard,
         mem_pool: &B,
@@ -214,16 +163,16 @@ impl<P: BufferPool> GenericBlockIndex<P> {
 
     /// Returns an exclusive insert page back to the in-memory free list cache.
     #[inline]
-    pub fn cache_exclusive_insert_page(&self, guard: PageExclusiveGuard<RowPage>) {
+    pub(crate) fn cache_exclusive_insert_page(&self, guard: PageExclusiveGuard<RowPage>) {
         self.row.cache_exclusive_insert_page(guard)
     }
 
     /// Creates a cursor to scan in-memory row-page-index leaves.
     #[inline]
-    pub fn mem_cursor<'a>(
+    pub(crate) fn mem_cursor<'a>(
         &'a self,
         meta_pool_guard: &'a PoolGuard,
-    ) -> GenericRowPageIndexMemCursor<'a, P> {
+    ) -> RowPageIndexMemCursor<'a, P> {
         self.row.mem_cursor(meta_pool_guard)
     }
 
@@ -564,29 +513,30 @@ mod tests {
                 .expect("test block-index construction should succeed");
 
             assert_eq!(blk_idx.height(), 0);
-            assert_eq!(blk_idx.root_snapshot(), (7, test_block_id(11)));
             assert_eq!(blk_idx.pivot_row_id(), 7);
-            assert_eq!(blk_idx.column_root_block_id(), test_block_id(11));
 
             blk_idx.update_column_root(9, test_block_id(12)).await;
-            assert_eq!(blk_idx.root_snapshot(), (9, test_block_id(12)));
+            assert_eq!(blk_idx.pivot_row_id(), 9);
 
             let catalog_idx = BlockIndex::new_catalog(meta_pool.guard(), &meta_guard)
                 .await
                 .expect("test catalog block-index construction should succeed");
-            assert_eq!(catalog_idx.root_snapshot(), (0, SUPER_BLOCK_ID));
+            assert_eq!(catalog_idx.pivot_row_id(), 0);
         });
     }
 
     fn make_test_metadata() -> Arc<TableMetadata> {
-        Arc::new(TableMetadata::new(
-            vec![ColumnSpec {
-                column_name: SemiStr::new("id"),
-                column_type: ValKind::I32,
-                column_attributes: ColumnAttributes::empty(),
-            }],
-            vec![IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::UK)],
-        ))
+        Arc::new(
+            TableMetadata::try_new(
+                vec![ColumnSpec {
+                    column_name: SemiStr::new("id"),
+                    column_type: ValKind::I32,
+                    column_attributes: ColumnAttributes::empty(),
+                }],
+                vec![IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::UK)],
+            )
+            .expect("valid table metadata"),
+        )
     }
 
     #[test]
@@ -630,7 +580,7 @@ mod tests {
             Arc::clone(&release),
         ));
         let meta_guard = (*pool).pool_guard();
-        let blk_idx = smol::block_on(GenericBlockIndex::new(
+        let blk_idx = smol::block_on(BlockIndex::new(
             pool.guard(),
             &meta_guard,
             10,
@@ -678,7 +628,14 @@ mod tests {
                 .expect("test block-index construction should succeed");
 
             let page_guard = blk_idx
-                .get_insert_page_exclusive(&meta_guard, &*mem_pool, &mem_guard, &metadata.col, 100)
+                .get_insert_page_exclusive_with_redo(
+                    &meta_guard,
+                    &*mem_pool,
+                    &mem_guard,
+                    &metadata.col,
+                    100,
+                    None,
+                )
                 .await
                 .expect("test insert-page allocation should succeed");
             let page_id = page_guard.page_id();
@@ -686,7 +643,14 @@ mod tests {
 
             let failing_pool = FailingInsertPagePool::new(mem_pool.guard(), page_id);
             let res = blk_idx
-                .get_insert_page(&meta_guard, &failing_pool, &mem_guard, &metadata.col, 100)
+                .try_get_insert_page_with_redo(
+                    &meta_guard,
+                    &failing_pool,
+                    &mem_guard,
+                    &metadata.col,
+                    100,
+                    None,
+                )
                 .await;
             let err = match res {
                 Ok(_) => panic!("expected cached insert-page reload failure"),

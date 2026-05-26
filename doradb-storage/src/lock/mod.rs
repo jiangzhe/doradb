@@ -19,7 +19,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
 
 /// Statement number for statement-owned logical locks.
-pub type StmtNo = u64;
+pub(crate) type StmtNo = u64;
 
 /// Logical resource protected by the lock manager.
 ///
@@ -37,7 +37,7 @@ pub type StmtNo = u64;
 /// order. Row ownership is outside this logical lock manager and must be
 /// acquired only after the relevant `TableData` lock.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub enum LockResource {
+pub(crate) enum LockResource {
     /// Catalog-wide table identity or namespace invariants.
     CatalogNamespace,
     /// Table definition and metadata for one table.
@@ -60,24 +60,10 @@ pub enum LockMode {
 }
 
 impl LockMode {
-    /// Returns whether this mode is valid for `resource`.
-    #[inline]
-    pub fn is_valid_for(self, resource: LockResource) -> bool {
-        mode_is_valid(resource, self)
-    }
-
     /// Validates that this mode can be used for `resource`.
     #[inline]
-    pub fn validate_for(self, resource: LockResource) -> Result<()> {
+    pub(crate) fn validate_for(self, resource: LockResource) -> Result<()> {
         validate_mode(resource, self)
-    }
-
-    /// Returns whether this mode is compatible with `other` on `resource`.
-    #[inline]
-    pub fn compatible_with(self, resource: LockResource, other: Self) -> Result<bool> {
-        validate_mode(resource, self)?;
-        validate_mode(resource, other)?;
-        Ok(modes_are_compatible(resource, self, other))
     }
 
     /// Returns whether this mode covers a request for `requested` on `resource`.
@@ -86,7 +72,7 @@ impl LockMode {
     /// decisions. `TableData(S)` and `TableData(IX)` are intentionally
     /// incomparable because the first phase does not introduce `SIX`.
     #[inline]
-    pub fn covers(self, resource: LockResource, requested: Self) -> Result<bool> {
+    pub(crate) fn covers(self, resource: LockResource, requested: Self) -> Result<bool> {
         validate_mode(resource, self)?;
         validate_mode(resource, requested)?;
         Ok(mode_covers(resource, self, requested))
@@ -106,7 +92,7 @@ impl LockMode {
 
 /// Logical lock owner independent from Rust object lifetimes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub enum LockOwner {
+pub(crate) enum LockOwner {
     /// Lock held for a session lifetime.
     Session(SessionID),
     /// Lock held for a transaction lifetime.
@@ -177,26 +163,15 @@ impl Drop for FreshLockGuard<'_> {
     }
 }
 
-/// Intended lifetime category for a logical lock.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum LockLifetime {
-    /// Statement-scoped lock lifetime.
-    Statement,
-    /// Transaction-scoped lock lifetime.
-    Transaction,
-    /// Session-scoped lock lifetime.
-    Session,
-}
-
 /// Standalone logical lock manager.
-pub struct LockManager {
+pub(crate) struct LockManager {
     resources: Arc<DashMap<LockResource, ResourceState>>,
 }
 
 impl LockManager {
     /// Creates an empty lock manager.
     #[inline]
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         LockManager {
             resources: Arc::new(DashMap::new()),
         }
@@ -208,7 +183,7 @@ impl LockManager {
     /// incomparable or non-immediate weaker mode, this method returns the same
     /// explicit operation error as the non-blocking acquisition path.
     #[inline]
-    pub async fn acquire(
+    pub(crate) async fn acquire(
         &self,
         resource: LockResource,
         mode: LockMode,
@@ -324,7 +299,7 @@ impl LockManager {
     /// The return value is the number of granted locks and queued requests
     /// removed. Waiters removed by this call wake with `LockWaiterReleased`.
     #[inline]
-    pub fn release(&self, resource: LockResource, owner: LockOwner) -> usize {
+    pub(crate) fn release(&self, resource: LockResource, owner: LockOwner) -> usize {
         let mut notify = Vec::new();
         let mut removed = 0;
         let remove_resource = {
@@ -391,7 +366,7 @@ impl LockManager {
     /// This is the authoritative cleanup path for later statement, transaction,
     /// session, rollback, and fatal cleanup integration.
     #[inline]
-    pub fn release_owner(&self, owner: LockOwner) -> usize {
+    pub(crate) fn release_owner(&self, owner: LockOwner) -> usize {
         let mut notify = Vec::new();
         let mut removed = 0;
         let mut resources: Vec<_> = self
@@ -1325,7 +1300,7 @@ pub(crate) mod tests {
         for (left_idx, left) in modes.iter().copied().enumerate() {
             for (right_idx, right) in modes.iter().copied().enumerate() {
                 assert_eq!(
-                    left.compatible_with(resource, right).unwrap(),
+                    modes_are_compatible(resource, left, right),
                     expected[left_idx][right_idx],
                     "left={left:?}, right={right:?}"
                 );
@@ -1346,21 +1321,21 @@ pub(crate) mod tests {
                 LockMode::IntentExclusive.validate_for(resource),
                 OperationError::InvalidLockMode,
             );
-            assert!(
+            assert!(modes_are_compatible(
+                resource,
+                LockMode::Shared,
                 LockMode::Shared
-                    .compatible_with(resource, LockMode::Shared)
-                    .unwrap()
-            );
-            assert!(
-                !LockMode::Shared
-                    .compatible_with(resource, LockMode::Exclusive)
-                    .unwrap()
-            );
-            assert!(
-                !LockMode::Exclusive
-                    .compatible_with(resource, LockMode::Shared)
-                    .unwrap()
-            );
+            ));
+            assert!(!modes_are_compatible(
+                resource,
+                LockMode::Shared,
+                LockMode::Exclusive
+            ));
+            assert!(!modes_are_compatible(
+                resource,
+                LockMode::Exclusive,
+                LockMode::Shared
+            ));
         }
     }
 

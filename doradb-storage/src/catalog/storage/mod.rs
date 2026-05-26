@@ -5,27 +5,21 @@ mod object;
 pub(crate) mod tables;
 
 use crate::buffer::{BufferPool, FixedBufferPool, ReadonlyBufferPool};
-use crate::catalog::runtime::CatalogTable;
 use crate::catalog::storage::columns::*;
 use crate::catalog::storage::indexes::*;
-pub use crate::catalog::storage::object::*;
+pub(crate) use crate::catalog::storage::object::*;
 use crate::catalog::storage::tables::*;
 use crate::catalog::table::TableMetadata;
-use crate::catalog::{ObjID, TableID};
+use crate::catalog::{CatalogTable, ObjID, TableID};
 use crate::error::Result;
 use crate::file::fs::FileSystem;
-use crate::file::multi_table_file::{
-    CATALOG_TABLE_ROOT_DESC_COUNT, CatalogTableRootDesc, MultiTableFile, MultiTableFileSnapshot,
-    MutableMultiTableFile,
-};
+use crate::file::multi_table_file::{MultiTableFile, MultiTableFileSnapshot};
 use crate::index::BlockIndex;
 use crate::quiescent::QuiescentGuard;
-use crate::trx::TrxID;
-use std::num::NonZeroU64;
 use std::sync::Arc;
 
 /// Runtime storage container for all catalog logical tables.
-pub struct CatalogStorage {
+pub(crate) struct CatalogStorage {
     pub(super) meta_pool: QuiescentGuard<FixedBufferPool>,
     pub(super) table_fs: QuiescentGuard<FileSystem>,
     tables: Box<[Arc<CatalogTable>]>,
@@ -84,7 +78,7 @@ impl CatalogStorage {
 
     /// Accessor of `catalog.tables`.
     #[inline]
-    pub fn tables(&self) -> Tables<'_> {
+    pub(crate) fn tables(&self) -> Tables<'_> {
         Tables {
             table: &self.tables[TABLE_ID_TABLES as usize],
         }
@@ -92,7 +86,7 @@ impl CatalogStorage {
 
     /// Accessor of `catalog.columns`.
     #[inline]
-    pub fn columns(&self) -> Columns<'_> {
+    pub(crate) fn columns(&self) -> Columns<'_> {
         Columns {
             table: &self.tables[TABLE_ID_COLUMNS as usize],
         }
@@ -100,7 +94,7 @@ impl CatalogStorage {
 
     /// Accessor of `catalog.indexes`.
     #[inline]
-    pub fn indexes(&self) -> Indexes<'_> {
+    pub(crate) fn indexes(&self) -> Indexes<'_> {
         Indexes {
             table: &self.tables[TABLE_ID_INDEXES as usize],
         }
@@ -108,7 +102,7 @@ impl CatalogStorage {
 
     /// Accessor of `catalog.index_columns`.
     #[inline]
-    pub fn index_columns(&self) -> IndexColumns<'_> {
+    pub(crate) fn index_columns(&self) -> IndexColumns<'_> {
         IndexColumns {
             table: &self.tables[TABLE_ID_INDEX_COLUMNS as usize],
         }
@@ -116,73 +110,25 @@ impl CatalogStorage {
 
     /// Return one catalog table runtime by table id.
     #[inline]
-    pub fn get_catalog_table(&self, table_id: TableID) -> Option<Arc<CatalogTable>> {
+    pub(crate) fn get_catalog_table(&self, table_id: TableID) -> Option<Arc<CatalogTable>> {
         self.tables.get(table_id as usize).map(Arc::clone)
-    }
-
-    /// Return number of catalog logical tables.
-    #[allow(clippy::len_without_is_empty)]
-    #[inline]
-    pub fn len(&self) -> usize {
-        self.tables.len()
     }
 
     /// Return current next user object id persisted in catalog snapshot.
     #[inline]
-    pub fn next_user_obj_id(&self) -> ObjID {
+    pub(crate) fn next_user_obj_id(&self) -> ObjID {
         self.next_user_obj_id
     }
 
     /// Returns current persisted catalog checkpoint snapshot from `catalog.mtb`.
     #[inline]
-    pub fn checkpoint_snapshot(&self) -> Result<MultiTableFileSnapshot> {
+    pub(crate) fn checkpoint_snapshot(&self) -> Result<MultiTableFileSnapshot> {
         self.mtb.load_snapshot()
-    }
-
-    /// Publish one catalog metadata snapshot into `catalog.mtb`.
-    ///
-    /// This method is temporary in RFC 0006 and is expected to change in phase 3,
-    /// where a dedicated catalog checkpointer will replay catalog redo logs and
-    /// merge checkpoint deltas into `catalog.mtb`.
-    #[inline]
-    pub async fn publish_checkpoint(
-        &self,
-        catalog_replay_start_ts: TrxID,
-        next_user_obj_id: ObjID,
-    ) -> Result<()> {
-        let background_writes = self.table_fs.background_writes();
-        let mut mutable = MutableMultiTableFile::fork(&self.mtb, background_writes);
-        mutable.apply_checkpoint_metadata(
-            catalog_replay_start_ts,
-            next_user_obj_id,
-            self.catalog_table_roots(),
-        )?;
-        let (_, old_root) = mutable.commit().await?;
-        drop(old_root);
-        Ok(())
-    }
-
-    #[inline]
-    fn catalog_table_roots(&self) -> [CatalogTableRootDesc; CATALOG_TABLE_ROOT_DESC_COUNT] {
-        let mut roots = [CatalogTableRootDesc::default(); CATALOG_TABLE_ROOT_DESC_COUNT];
-        for table in &self.tables {
-            let table_id = table.table_id() as usize;
-            if table_id >= roots.len() {
-                continue;
-            }
-            let (pivot_row_id, root_block_id) = table.blk_idx.root_snapshot();
-            roots[table_id] = CatalogTableRootDesc {
-                table_id: table_id as u64,
-                root_block_id: NonZeroU64::new(root_block_id.into()),
-                pivot_row_id,
-            };
-        }
-        roots
     }
 }
 
 /// Static definition used to bootstrap one catalog logical table.
-pub struct CatalogDefinition {
-    pub table_id: TableID,
-    pub metadata: TableMetadata,
+pub(crate) struct CatalogDefinition {
+    pub(crate) table_id: TableID,
+    pub(crate) metadata: TableMetadata,
 }

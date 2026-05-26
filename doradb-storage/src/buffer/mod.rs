@@ -2,11 +2,11 @@ mod arena;
 mod evict;
 mod evictor;
 mod fixed;
-pub mod frame;
-pub mod guard;
+pub(crate) mod frame;
+pub(crate) mod guard;
 mod identity;
 mod load;
-pub mod page;
+pub(crate) mod page;
 mod pool_guard;
 mod readonly;
 mod util;
@@ -21,19 +21,19 @@ pub(crate) use self::evict::tests::{
 pub(crate) use self::readonly::tests::{global_readonly_pool_scope, table_readonly_pool};
 #[cfg(test)]
 pub(crate) use self::tests::test_page_id;
-pub use evict::EvictableBufferPool;
+pub(crate) use evict::EvictableBufferPool;
 pub(crate) use evict::{
     EvictReadSubmission, EvictSubmission, EvictablePoolStateMachine, PoolRequest,
     build_pool_with_swap_file_field,
 };
 pub(crate) use evictor::SharedPoolEvictorWorkers;
-pub use evictor::{EvictionArbiter, EvictionArbiterBuilder};
-pub use fixed::FixedBufferPool;
-pub use identity::PoolRole;
+pub(crate) use evictor::{EvictionArbiter, EvictionArbiterBuilder};
+pub(crate) use fixed::FixedBufferPool;
+pub(crate) use identity::PoolRole;
 pub(crate) use identity::{PoolIdentity, RowPoolRole};
-pub use pool_guard::{PoolGuard, PoolGuards, PoolGuardsBuilder};
+pub(crate) use pool_guard::{PoolGuard, PoolGuards};
 pub(crate) use readonly::{ReadSubmission, ReadonlyWriteLease, begin_write_barrier};
-pub use readonly::{ReadonlyBlockGuard, ReadonlyBufferPool};
+pub(crate) use readonly::{ReadonlyBlockGuard, ReadonlyBufferPool};
 
 use crate::DiskPool;
 use crate::buffer::guard::{FacadePageGuard, PageExclusiveGuard};
@@ -280,7 +280,7 @@ impl BitPackable for PageID {
     }
 }
 
-pub const INVALID_PAGE_ID: PageID = PageID::new(u64::MAX);
+pub(crate) const INVALID_PAGE_ID: PageID = PageID::new(u64::MAX);
 
 /// Shared terminal-status cell for one page-sized buffer-pool IO operation.
 ///
@@ -294,35 +294,36 @@ pub(crate) type ReadonlyBlockValidator = fn(&[u8], FileKind, BlockID) -> Result<
 
 /// Snapshot of buffer-pool access and IO lifecycle counters.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct BufferPoolStats {
+pub(crate) struct BufferPoolStats {
     /// Number of resident-page accesses satisfied without a miss load.
-    pub cache_hits: usize,
+    pub(crate) cache_hits: usize,
     /// Number of logical accesses that missed the resident set.
-    pub cache_misses: usize,
+    pub(crate) cache_misses: usize,
     /// Number of miss accesses that joined an existing inflight load.
-    pub miss_joins: usize,
+    pub(crate) miss_joins: usize,
     /// Number of read operations queued by the pool.
-    pub queued_reads: usize,
+    pub(crate) queued_reads: usize,
     /// Number of read operations accepted into the backend running state.
-    pub running_reads: usize,
+    pub(crate) running_reads: usize,
     /// Number of read operations that reached a terminal state.
-    pub completed_reads: usize,
+    pub(crate) completed_reads: usize,
     /// Number of read operations that completed with an error.
-    pub read_errors: usize,
+    pub(crate) read_errors: usize,
     /// Number of write operations queued by the pool.
-    pub queued_writes: usize,
+    pub(crate) queued_writes: usize,
     /// Number of write operations accepted into the backend running state.
-    pub running_writes: usize,
+    pub(crate) running_writes: usize,
     /// Number of write operations that reached a terminal state.
-    pub completed_writes: usize,
+    pub(crate) completed_writes: usize,
     /// Number of write operations that completed with an error.
-    pub write_errors: usize,
+    pub(crate) write_errors: usize,
 }
 
 impl BufferPoolStats {
     /// Returns the saturating delta from one earlier snapshot.
     #[inline]
-    pub fn delta_since(self, earlier: BufferPoolStats) -> BufferPoolStats {
+    #[cfg_attr(not(test), expect(dead_code, reason = "internal buffer pool stats"))]
+    pub(crate) fn delta_since(self, earlier: BufferPoolStats) -> BufferPoolStats {
         BufferPoolStats {
             cache_hits: self.cache_hits.saturating_sub(earlier.cache_hits),
             cache_misses: self.cache_misses.saturating_sub(earlier.cache_misses),
@@ -450,11 +451,13 @@ impl BufferPoolStatsHandle {
 }
 
 /// Abstraction of buffer pool.
-pub trait BufferPool: Send + Sync {
+pub(crate) trait BufferPool: Send + Sync {
     /// Returns the maximum number of pages that can be allocated.
+    #[cfg_attr(not(test), expect(dead_code, reason = "pending dead-code audit"))]
     fn capacity(&self) -> usize;
 
     /// Returns the number of allocated pages.
+    #[cfg_attr(not(test), expect(dead_code, reason = "pending dead-code audit"))]
     fn allocated(&self) -> usize;
 
     /// Returns a cloneable keepalive guard for this pool.

@@ -15,7 +15,7 @@ use std::mem;
 
 /// A simple buffer pool with fixed size pre-allocated using mmap() and
 /// does not support swap/evict.
-pub struct FixedBufferPool {
+pub(crate) struct FixedBufferPool {
     size: usize,
     // free_list: Mutex<PageID>,
     alloc_map: AllocMap,
@@ -32,7 +32,7 @@ impl FixedBufferPool {
     /// We separate pages and frames so that pages are always aligned
     /// to the unit of direct IO and can be flushed via libaio.
     #[inline]
-    pub fn with_capacity(role: PoolRole, pool_size: usize) -> Result<Self> {
+    pub(crate) fn with_capacity(role: PoolRole, pool_size: usize) -> Result<Self> {
         role.assert_valid("fixed buffer pool");
         let size = pool_size / (mem::size_of::<BufferFrame>() + mem::size_of::<Page>());
         let arena = QuiescentArena::new(size)?;
@@ -43,12 +43,6 @@ impl FixedBufferPool {
             stats: BufferPoolStatsHandle::default(),
             arena,
         })
-    }
-
-    /// Returns the maximum page number of this pool.
-    #[inline]
-    pub fn size(&self) -> usize {
-        self.size
     }
 
     #[inline]
@@ -63,7 +57,8 @@ impl FixedBufferPool {
 
     /// Returns one snapshot of fixed-pool access counters.
     #[inline]
-    pub fn stats(&self) -> BufferPoolStats {
+    #[cfg_attr(not(test), expect(dead_code, reason = "internal buffer pool stats"))]
+    pub(crate) fn stats(&self) -> BufferPoolStats {
         self.stats.snapshot()
     }
 
@@ -97,37 +92,6 @@ impl FixedBufferPool {
             return Err(err);
         }
         Ok(guard)
-    }
-
-    /// Since all pages are kept in memory, we can use spin mode to eliminate
-    /// the cost of async/await calls.
-    #[inline]
-    pub fn get_page_spin<T: BufferPage>(
-        &self,
-        guard: &PoolGuard,
-        page_id: PageID,
-    ) -> Result<FacadePageGuard<T>> {
-        debug_assert!(
-            self.alloc_map.is_allocated(usize::from(page_id)),
-            "page not allocated"
-        );
-        let guard = self.get_page_spin_internal(guard, page_id);
-        validate_frame_page_kind::<T>(guard.bf())?;
-        self.stats.record_cache_hit();
-        Ok(guard)
-    }
-
-    #[inline]
-    fn get_page_spin_internal<T: 'static>(
-        &self,
-        guard: &PoolGuard,
-        page_id: PageID,
-    ) -> FacadePageGuard<T> {
-        guard.assert_matches(self.identity(), "fixed buffer pool");
-        let keepalive = guard.clone();
-        let bf = self.arena.frame_ptr(page_id);
-        let g = self.arena.frame(page_id).latch.optimistic_spin_raw();
-        FacadePageGuard::new(PageLatchGuard::new(keepalive, g), bf)
     }
 }
 
@@ -309,7 +273,7 @@ mod tests {
 
     fn assert_exclusive_fallback_rolled_back(frame: &BufferFrame, held_version: u64) {
         assert_eq!(held_version & 1, 1, "test must hold the exclusive latch");
-        assert_eq!(frame.latch.version_seqcst(), held_version + 1);
+        assert_eq!(frame.latch.version_acq(), held_version + 1);
     }
 
     #[test]
@@ -357,7 +321,8 @@ mod tests {
                 let page_id = g.page_id();
                 drop(g);
                 let g = pool
-                    .get_page_spin::<RowPageIndexNode>(&pool_guard, page_id)
+                    .get_page::<RowPageIndexNode>(&pool_guard, page_id, LatchFallbackMode::Spin)
+                    .await
                     .expect("buffer-pool read failed in test");
                 assert!(g.page_id() == page_id);
                 drop(g);
@@ -514,7 +479,10 @@ mod tests {
                 )
                 .await,
             );
-            assert_internal_error(pool.get_page_spin::<BTreeNode>(&pool_guard, page_id));
+            assert_internal_error(
+                pool.get_page::<BTreeNode>(&pool_guard, page_id, LatchFallbackMode::Spin)
+                    .await,
+            );
 
             let parent = pool
                 .allocate_page::<BTreeNode>(&pool_guard)
@@ -546,7 +514,7 @@ mod tests {
                     .expect("test page allocation should succeed");
                 let page_id = page.page_id();
                 let frame = pool.arena.frame(page_id);
-                let held_version = frame.latch.version_seqcst();
+                let held_version = frame.latch.version_acq();
                 let mut get_page = Box::pin(pool.get_page::<BTreeNode>(
                     &pool_guard,
                     page_id,
@@ -567,7 +535,7 @@ mod tests {
                 let page_id = page.page_id();
                 let versioned = page.versioned_page_id();
                 let frame = pool.arena.frame(page_id);
-                let held_version = frame.latch.version_seqcst();
+                let held_version = frame.latch.version_acq();
                 let mut get_page_versioned = Box::pin(pool.get_page_versioned::<BTreeNode>(
                     &pool_guard,
                     versioned,
@@ -593,7 +561,7 @@ mod tests {
                     .expect("test page allocation should succeed");
                 let child_page_id = child.page_id();
                 let frame = pool.arena.frame(child_page_id);
-                let held_version = frame.latch.version_seqcst();
+                let held_version = frame.latch.version_acq();
                 let mut get_child_page = Box::pin(pool.get_child_page::<BTreeNode>(
                     &pool_guard,
                     &parent,

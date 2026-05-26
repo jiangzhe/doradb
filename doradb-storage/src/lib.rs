@@ -1,33 +1,51 @@
 #![warn(clippy::all)]
 #![warn(clippy::undocumented_unsafe_blocks)]
 
-pub mod bitmap;
-pub mod io;
+mod bitmap;
+mod io;
 #[macro_use]
 pub mod error;
-pub mod buffer;
-pub mod catalog;
+mod buffer;
+mod catalog;
 mod component;
-pub mod compression;
+mod compression;
 pub mod conf;
-pub mod engine;
-pub mod file;
-pub mod free_list;
-pub mod index;
-pub mod latch;
+mod engine;
+mod file;
+mod free_list;
+mod index;
+mod latch;
 mod layout;
-pub mod lock;
-pub mod lwc;
-pub mod memcmp;
-pub mod notify;
-pub mod ptr;
-pub mod quiescent;
-pub mod row;
-pub mod serde;
-pub mod session;
-pub mod table;
-pub mod thread;
-pub mod trx;
-pub mod value;
+mod lock;
+mod lwc;
+mod memcmp;
+mod notify;
+mod ptr;
+mod quiescent;
+mod row;
+mod serde;
+mod session;
+mod table;
+mod thread;
+mod trx;
+mod value;
 
-pub use component::{DiskPool, IndexPool, MemPool, MetaPool};
+pub(crate) use component::{DiskPool, IndexPool, MemPool, MetaPool};
+
+pub use catalog::{
+    ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexNo, IndexOrder, IndexSpec,
+    TableID, TableSpec,
+};
+pub use conf::{EngineConfig, EvictableBufferPoolConfig, FileSystemConfig, TrxSysConfig};
+pub use engine::{Engine, EngineRef};
+pub use error::{Error, ErrorKind, Result};
+pub use lock::LockMode;
+pub use row::RowID;
+pub use row::ops::{DeleteMvcc, ScanMvcc, SelectKey, SelectMvcc, UpdateCol, UpdateMvcc};
+pub use session::{Session, SessionID};
+pub use table::{
+    CheckpointCancelReason, CheckpointDelayReason, CheckpointOutcome, CheckpointReadiness, Table,
+    TablePersistence,
+};
+pub use trx::{ActiveTrx, Statement, Transaction};
+pub use value::{MemVar, Val, ValKind, ValType};

@@ -68,15 +68,15 @@ impl IndexSpec {
 /// One active index definition paired with its allocated stable table-local
 /// index number.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ActiveIndexSpec {
-    pub index_no: IndexNo,
-    pub spec: IndexSpec,
+pub(crate) struct ActiveIndexSpec {
+    pub(crate) index_no: IndexNo,
+    pub(crate) spec: IndexSpec,
 }
 
 impl ActiveIndexSpec {
     /// Create one active index specification.
     #[inline]
-    pub fn new(index_no: IndexNo, spec: IndexSpec) -> Self {
+    pub(crate) fn new(index_no: IndexNo, spec: IndexSpec) -> Self {
         Self { index_no, spec }
     }
 }

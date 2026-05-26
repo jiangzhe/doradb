@@ -1,10 +1,10 @@
-pub mod block_integrity;
-pub mod cow_file;
-pub mod fs;
-pub mod meta_block;
-pub mod multi_table_file;
-pub mod super_block;
-pub mod table_file;
+pub(crate) mod block_integrity;
+pub(crate) mod cow_file;
+pub(crate) mod fs;
+pub(crate) mod meta_block;
+pub(crate) mod multi_table_file;
+pub(crate) mod super_block;
+pub(crate) mod table_file;
 
 use self::fs::BackgroundWriteRequest;
 #[cfg(test)]
@@ -63,34 +63,19 @@ use zerocopy_derive::{FromBytes, Immutable, IntoBytes, KnownLayout};
     KnownLayout,
     Immutable,
 )]
-pub struct FileID(u64);
+pub(crate) struct FileID(u64);
 
 impl FileID {
-    pub const MAX: Self = Self(u64::MAX);
+    pub(crate) const MAX: Self = Self(u64::MAX);
 
     #[inline]
-    pub const fn new(raw: u64) -> Self {
+    pub(crate) const fn new(raw: u64) -> Self {
         Self(raw)
     }
 
     #[inline]
-    pub const fn as_u64(self) -> u64 {
-        self.0
-    }
-
-    #[inline]
-    pub const fn as_usize(self) -> usize {
+    pub(crate) const fn as_usize(self) -> usize {
         self.0 as usize
-    }
-
-    #[inline]
-    pub const fn to_le_bytes(self) -> [u8; std::mem::size_of::<u64>()] {
-        self.0.to_le_bytes()
-    }
-
-    #[inline]
-    pub const fn from_le_bytes(bytes: [u8; std::mem::size_of::<u64>()]) -> Self {
-        Self(u64::from_le_bytes(bytes))
     }
 }
 
@@ -226,16 +211,16 @@ impl BitPackable for FileID {
 
 /// Sentinel persisted-file identity used by files that never participate in
 /// persisted-block cache identity or shared-storage worker routing.
-pub const UNTRACKED_FILE_ID: FileID = FileID::MAX;
+pub(crate) const UNTRACKED_FILE_ID: FileID = FileID::MAX;
 
 /// Reserved persisted-file identity of the shared index-pool swap file.
-pub const INDEX_POOL_SWAP_FILE_ID: FileID = FileID::new(USER_OBJ_ID_START - 3);
+pub(crate) const INDEX_POOL_SWAP_FILE_ID: FileID = FileID::new(USER_OBJ_ID_START - 3);
 
 /// Reserved persisted-file identity of the shared mem-pool swap file.
-pub const MEM_POOL_SWAP_FILE_ID: FileID = FileID::new(USER_OBJ_ID_START - 2);
+pub(crate) const MEM_POOL_SWAP_FILE_ID: FileID = FileID::new(USER_OBJ_ID_START - 2);
 
 /// Reserved persisted-file identity of `catalog.mtb`.
-pub const CATALOG_MTB_FILE_ID: FileID = FileID::new(USER_OBJ_ID_START - 1);
+pub(crate) const CATALOG_MTB_FILE_ID: FileID = FileID::new(USER_OBJ_ID_START - 1);
 
 /// Persisted fixed-size file block identity.
 ///
@@ -258,32 +243,27 @@ pub const CATALOG_MTB_FILE_ID: FileID = FileID::new(USER_OBJ_ID_START - 1);
     KnownLayout,
     Immutable,
 )]
-pub struct BlockID(u64);
+pub(crate) struct BlockID(u64);
 
 impl BlockID {
     #[inline]
-    pub const fn new(raw: u64) -> Self {
+    pub(crate) const fn new(raw: u64) -> Self {
         Self(raw)
     }
 
     #[inline]
-    pub const fn as_u64(self) -> u64 {
+    pub(crate) const fn as_u64(self) -> u64 {
         self.0
     }
 
     #[inline]
-    pub const fn as_usize(self) -> usize {
+    pub(crate) const fn as_usize(self) -> usize {
         self.0 as usize
     }
 
     #[inline]
-    pub const fn to_le_bytes(self) -> [u8; std::mem::size_of::<u64>()] {
+    pub(crate) const fn to_le_bytes(self) -> [u8; std::mem::size_of::<u64>()] {
         self.0.to_le_bytes()
-    }
-
-    #[inline]
-    pub const fn from_le_bytes(bytes: [u8; std::mem::size_of::<u64>()]) -> Self {
-        Self(u64::from_le_bytes(bytes))
     }
 }
 
@@ -440,17 +420,17 @@ impl BitPackable for BlockID {
 /// This intentionally excludes root version so unchanged physical blocks keep
 /// the same identity across root swaps.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct BlockKey {
+pub(crate) struct BlockKey {
     /// Persisted file identity owning the block.
-    pub file_id: FileID,
+    pub(crate) file_id: FileID,
     /// Physical page/block id in the backing file.
-    pub block_id: BlockID,
+    pub(crate) block_id: BlockID,
 }
 
 impl BlockKey {
     /// Builds a key from file id and physical block id.
     #[inline]
-    pub fn new(file_id: FileID, block_id: BlockID) -> Self {
+    pub(crate) fn new(file_id: FileID, block_id: BlockID) -> Self {
         BlockKey { file_id, block_id }
     }
 }
@@ -459,7 +439,7 @@ impl BlockKey {
 /// instead of writing them.
 /// The logical size of sparse file can be very large, but the
 /// real allocated blocks can be only a few.
-pub struct SparseFile {
+pub(crate) struct SparseFile {
     file_id: FileID,
     fd: RawFd,
     offset: AtomicUsize,
@@ -479,7 +459,7 @@ impl SparseFile {
     /// Create a sparse file and truncate if file already exists.
     /// Note that space is allocated only when data is written to this file.
     #[inline]
-    pub fn create_or_trunc(
+    pub(crate) fn create_or_trunc(
         file_path: impl AsRef<str>,
         max_size: usize,
         file_id: FileID,
@@ -513,7 +493,7 @@ impl SparseFile {
     /// Create a sparse file and fail if file already exists.
     /// Note that space is allocated only when data is written to this file.
     #[inline]
-    pub fn create_or_fail(
+    pub(crate) fn create_or_fail(
         file_path: impl AsRef<str>,
         max_size: usize,
         file_id: FileID,
@@ -547,7 +527,7 @@ impl SparseFile {
 
     /// Open an existing sparse file with given maximum length.
     #[inline]
-    pub fn open(file_path: impl AsRef<str>, file_id: FileID) -> Result<SparseFile> {
+    pub(crate) fn open(file_path: impl AsRef<str>, file_id: FileID) -> Result<SparseFile> {
         // SAFETY: `open` is called with a validated C string, and the returned
         // fd is checked before it is used or wrapped.
         unsafe {
@@ -585,14 +565,14 @@ impl SparseFile {
 
     /// Returns the immutable persisted-file identity attached to this file handle.
     #[inline]
-    pub fn file_id(&self) -> FileID {
+    pub(crate) fn file_id(&self) -> FileID {
         self.file_id
     }
 
     /// Allocate enough space for data of given length to persist
     /// at end of the file.
     #[inline]
-    pub fn alloc(&self, len: usize) -> Result<(usize, usize)> {
+    pub(crate) fn alloc(&self, len: usize) -> Result<(usize, usize)> {
         let size = align_to_sector_size(len);
         loop {
             let offset = self.offset.load(Ordering::Relaxed);
@@ -617,13 +597,18 @@ impl SparseFile {
 
     /// Returns the file syncer.
     #[inline]
-    pub fn syncer(&self) -> FileSyncer {
+    pub(crate) fn syncer(&self) -> FileSyncer {
         FileSyncer(self.fd)
     }
 
     /// Grow the file to given size.
     #[inline]
-    pub fn extend_to(&self, max_len: usize) -> io::Result<()> {
+    #[cfg_attr(not(test), expect(dead_code, reason = "pending dead-code audit"))]
+    #[cfg_attr(
+        all(feature = "iouring", test),
+        expect(dead_code, reason = "pending dead-code audit")
+    )]
+    pub(crate) fn extend_to(&self, max_len: usize) -> io::Result<()> {
         self.size_lock.lock();
         defer! {
             // SAFETY: this path holds `size_lock`, so the matching unlock is
@@ -646,7 +631,12 @@ impl SparseFile {
 
     /// Get the logical size and allocated size of this file.
     #[inline]
-    pub fn size(&self) -> io::Result<(usize, usize)> {
+    #[cfg_attr(not(test), expect(dead_code, reason = "pending dead-code audit"))]
+    #[cfg_attr(
+        all(feature = "iouring", test),
+        expect(dead_code, reason = "pending dead-code audit")
+    )]
+    pub(crate) fn size(&self) -> io::Result<(usize, usize)> {
         sparse_file_size(self.fd)
     }
 }
@@ -662,7 +652,7 @@ impl Drop for SparseFile {
 }
 
 #[inline]
-pub fn sparse_file_size(fd: RawFd) -> io::Result<(usize, usize)> {
+pub(crate) fn sparse_file_size(fd: RawFd) -> io::Result<(usize, usize)> {
     // SAFETY: `fstat` fully initializes `stat` on success; `assume_init_ref` is used only
     // when return code is 0.
     unsafe {
@@ -693,7 +683,7 @@ fn c_string_from_path(file_path: &str) -> Result<CString> {
 /// The request keeps the file owner alive while it is deferred or queued on the
 /// shared background-write lane. `TableFsStateMachine` materializes the backend
 /// `Operation` only when this request is admitted to the IO queue.
-pub struct WriteSubmission {
+pub(crate) struct WriteSubmission {
     key: BlockKey,
     file: Arc<SparseFile>,
     offset: usize,
@@ -831,7 +821,7 @@ pub(crate) struct TableFsStateMachine;
 impl TableFsStateMachine {
     /// Creates one state machine for the shared table-filesystem IO worker.
     #[inline]
-    pub fn new() -> TableFsStateMachine {
+    pub(crate) fn new() -> TableFsStateMachine {
         TableFsStateMachine
     }
 
@@ -920,7 +910,7 @@ impl TableFsStateMachine {
 
 /// FileSyncer is a simple wrapper to provide functionality
 /// of fsync() and fdatasync().
-pub struct FileSyncer(RawFd);
+pub(crate) struct FileSyncer(RawFd);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum FileSyncKind {
@@ -930,12 +920,12 @@ pub(crate) enum FileSyncKind {
 
 impl FileSyncer {
     #[inline]
-    pub fn fsync(&self) -> Result<()> {
+    pub(crate) fn fsync(&self) -> Result<()> {
         self.sync(FileSyncKind::Fsync)
     }
 
     #[inline]
-    pub fn fdatasync(&self) -> Result<()> {
+    pub(crate) fn fdatasync(&self) -> Result<()> {
         self.sync(FileSyncKind::Fdatasync)
     }
 
@@ -974,13 +964,18 @@ impl FileSyncer {
 /// buffer pages.
 /// It's used to reuse pages in heavy IO environment.
 #[derive(Clone)]
-pub struct FixedSizeBufferFreeList(Arc<FreeList<DirectBuf>>);
+pub(crate) struct FixedSizeBufferFreeList(Arc<FreeList<DirectBuf>>);
 
 impl FixedSizeBufferFreeList {
     /// Create a new buffer free list with given number of
     /// pre-allocated buffer pages.
     #[inline]
-    pub fn new(page_size: usize, init_pages: usize, max_pages: usize) -> Self {
+    #[cfg_attr(not(test), expect(dead_code, reason = "pending dead-code audit"))]
+    #[cfg_attr(
+        all(feature = "iouring", test),
+        expect(dead_code, reason = "pending dead-code audit")
+    )]
+    pub(crate) fn new(page_size: usize, init_pages: usize, max_pages: usize) -> Self {
         debug_assert!(page_size.is_multiple_of(STORAGE_SECTOR_SIZE));
         let free_list: FreeList<_> = FreeList::new(init_pages, max_pages, move || {
             let mut buf = DirectBuf::zeroed(page_size);
@@ -992,7 +987,9 @@ impl FixedSizeBufferFreeList {
 
     /// Recycle the buffer for future use.
     #[inline]
-    pub fn recycle(&self, mut buf: DirectBuf) {
+    #[cfg_attr(not(test), expect(dead_code, reason = "pending dead-code audit"))]
+    #[cfg_attr(test, expect(dead_code, reason = "pending dead-code audit"))]
+    pub(crate) fn recycle(&self, mut buf: DirectBuf) {
         buf.reset();
         buf.truncate(0);
         self.push(buf);
@@ -1035,14 +1032,17 @@ mod tests {
     }
 
     fn build_test_metadata() -> Arc<TableMetadata> {
-        Arc::new(TableMetadata::new(
-            vec![ColumnSpec::new(
-                "c0",
-                ValKind::U32,
-                ColumnAttributes::empty(),
-            )],
-            vec![IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::PK)],
-        ))
+        Arc::new(
+            TableMetadata::try_new(
+                vec![ColumnSpec::new(
+                    "c0",
+                    ValKind::U32,
+                    ColumnAttributes::empty(),
+                )],
+                vec![IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::PK)],
+            )
+            .expect("valid table metadata"),
+        )
     }
 
     async fn committed_test_table_file() -> (TempDir, TestFileSystem, Arc<TableFile>) {
@@ -1127,7 +1127,6 @@ mod tests {
         let block_id = BlockID::new(0xfedc_ba98_7654_3210);
         let bytes = block_id.to_le_bytes();
         assert_eq!(bytes, 0xfedc_ba98_7654_3210u64.to_le_bytes());
-        assert_eq!(BlockID::from_le_bytes(bytes), block_id);
     }
 
     #[test]
@@ -1193,21 +1192,12 @@ mod tests {
     #[test]
     fn test_file_id_accessors_and_conversions() {
         let file_id = FileID::new(42);
-        assert_eq!(file_id.as_u64(), 42);
         assert_eq!(file_id.as_usize(), 42);
         assert_eq!(FileID::from(42u64), file_id);
         assert_eq!(FileID::from(42u32), file_id);
         assert_eq!(FileID::from(42usize), file_id);
         assert_eq!(u64::from(file_id), 42);
         assert_eq!(usize::from(file_id), 42);
-    }
-
-    #[test]
-    fn test_file_id_bytes_roundtrip() {
-        let file_id = FileID::new(0x0123_4567_89ab_cdef);
-        let bytes = file_id.to_le_bytes();
-        assert_eq!(bytes, 0x0123_4567_89ab_cdefu64.to_le_bytes());
-        assert_eq!(FileID::from_le_bytes(bytes), file_id);
     }
 
     #[test]

@@ -2208,16 +2208,19 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn metadata_with_indexes() -> Arc<TableMetadata> {
-        Arc::new(TableMetadata::new(
-            vec![
-                ColumnSpec::new("c0", ValKind::U32, ColumnAttributes::empty()),
-                ColumnSpec::new("c1", ValKind::U64, ColumnAttributes::empty()),
-            ],
-            vec![
-                IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::UK),
-                IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::empty()),
-            ],
-        ))
+        Arc::new(
+            TableMetadata::try_new(
+                vec![
+                    ColumnSpec::new("c0", ValKind::U32, ColumnAttributes::empty()),
+                    ColumnSpec::new("c1", ValKind::U64, ColumnAttributes::empty()),
+                ],
+                vec![
+                    IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::UK),
+                    IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::empty()),
+                ],
+            )
+            .expect("valid table metadata"),
+        )
     }
 
     fn assert_disk_tree_corruption(err: Error, expected: DataIntegrityError) {
@@ -2228,14 +2231,17 @@ mod tests {
     }
 
     fn metadata_with_varbyte_unique_index() -> Arc<TableMetadata> {
-        Arc::new(TableMetadata::new(
-            vec![ColumnSpec::new(
-                "c0",
-                ValKind::VarByte,
-                ColumnAttributes::empty(),
-            )],
-            vec![IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::UK)],
-        ))
+        Arc::new(
+            TableMetadata::try_new(
+                vec![ColumnSpec::new(
+                    "c0",
+                    ValKind::VarByte,
+                    ColumnAttributes::empty(),
+                )],
+                vec![IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::UK)],
+            )
+            .expect("valid table metadata"),
+        )
     }
 
     fn long_varbyte_key(idx: u32) -> Vec<u8> {

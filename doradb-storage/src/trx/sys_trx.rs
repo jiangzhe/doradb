@@ -9,13 +9,13 @@ use std::mem;
 /// SysTrx is a special kind of transaction only used for system
 /// operations. Its effect is immediately visible for other
 /// transactions and it can not rollback.
-pub struct SysTrx {
-    pub(crate) redo: RedoLogs,
+pub(crate) struct SysTrx {
+    pub(super) redo: RedoLogs,
 }
 
 impl SysTrx {
     #[inline]
-    pub fn create_row_page(
+    pub(crate) fn create_row_page(
         &mut self,
         table_id: TableID,
         page_id: PageID,
@@ -35,7 +35,7 @@ impl SysTrx {
 
     /// Prepare this transaction for commit.
     #[inline]
-    pub fn prepare(mut self) -> PreparedTrx {
+    pub(super) fn prepare(mut self) -> PreparedTrx {
         let redo_bin = if self.redo.is_empty() {
             None
         } else {

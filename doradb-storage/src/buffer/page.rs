@@ -8,10 +8,10 @@ use std::mem;
 use std::sync::Arc;
 use zerocopy::{FromBytes, IntoBytes, KnownLayout};
 
-pub use super::{INVALID_PAGE_ID, PageID};
+pub(crate) use super::{INVALID_PAGE_ID, PageID};
 
-pub const PAGE_SIZE: usize = 64 * 1024;
-pub type Page = [u8; PAGE_SIZE];
+pub(crate) const PAGE_SIZE: usize = 64 * 1024;
+pub(crate) type Page = [u8; PAGE_SIZE];
 
 const _: () = assert!(
     { mem::size_of::<Page>() == PAGE_SIZE },
@@ -27,7 +27,7 @@ pub struct VersionedPageID {
 /// Logical identity of bytes stored in one buffer frame.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
-pub enum BufferPageKind {
+pub(crate) enum BufferPageKind {
     /// The frame has no initialized logical page.
     Uninitialized = 0,
     /// Raw page bytes used only by low-level IO and raw-page tests.
@@ -43,7 +43,7 @@ pub enum BufferPageKind {
 impl BufferPageKind {
     /// Returns a stable human-readable kind name for diagnostics.
     #[inline]
-    pub const fn as_str(self) -> &'static str {
+    const fn as_str(self) -> &'static str {
         match self {
             BufferPageKind::Uninitialized => "uninitialized",
             BufferPageKind::RawBytes => "raw page bytes",
@@ -71,7 +71,7 @@ impl From<u8> for BufferPageKind {
 /// Seals [`BufferPage`] implementations to page image types audited in this crate.
 pub(crate) mod sealed {
     /// Private supertrait for crate-owned buffer page image implementations.
-    pub trait Sealed {}
+    pub(crate) trait Sealed {}
 }
 
 /// A page image type that can be stored in the buffer-pool arena.
@@ -82,7 +82,7 @@ pub(crate) mod sealed {
 /// every byte pattern including all-zero bytes must be a valid value. The type
 /// layout must remain stable for native in-process page images, and all
 /// interior mutation must be safe under the buffer-pool latch protocol.
-pub unsafe trait BufferPage:
+pub(crate) unsafe trait BufferPage:
     sealed::Sealed + FromBytes + IntoBytes + KnownLayout + Sized + Send + Sync + 'static
 {
     /// Logical kind recorded in the owning buffer frame.
@@ -125,7 +125,7 @@ pub(crate) fn validate_frame_page_kind<T: BufferPage>(frame: &BufferFrame) -> Re
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum IOKind {
+pub(crate) enum IOKind {
     Read,
     Write,
     // Because we gather write requests into batch.
@@ -139,7 +139,7 @@ pub enum IOKind {
 /// One evictable-pool writeback submission owned by the generic IO worker.
 ///
 /// Read-miss loads now use the shared generic read-load core in `buffer/load.rs`.
-pub struct PageIO {
+pub(crate) struct PageIO {
     pub(crate) block_key: BlockKey,
     pub(crate) operation: Operation,
     pub(crate) page_guard: PageExclusiveGuard<Page>,
@@ -151,7 +151,7 @@ pub struct PageIO {
 impl PageIO {
     /// Returns the evictable page id targeted by this submission.
     #[inline]
-    pub fn page_id(&self) -> PageID {
+    pub(crate) fn page_id(&self) -> PageID {
         self.page_guard.page_id()
     }
 }

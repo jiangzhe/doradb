@@ -1,24 +1,22 @@
+use super::libaio_abi::{
+    io_context_t, io_destroy, io_event, io_getevents, io_iocb_cmd, io_setup, io_submit, iocb,
+};
 use super::{
-    BackendToken, IOBackend, IOBackendStats, IOBackendStatsHandle, IOBuf, IOClient, IOKey, IOKind,
-    IOWorkerBuilder, Operation, StdIoResult, build_io_worker, io_context_t, io_destroy, io_event,
-    io_getevents, io_iocb_cmd, io_setup, io_submit, iocb,
+    BackendToken, IOBackend, IOBackendStatsHandle, IOClient, IOKind, IOWorkerBuilder, Operation,
+    StdIoResult, build_io_worker,
 };
 use crate::error::{ConfigError, IoError, Result, StorageOp};
 use error_stack::Report;
 use libc::{EAGAIN, EINTR, c_long};
 use std::collections::VecDeque;
 use std::io;
-use std::os::unix::io::RawFd;
 use std::time::Instant;
-
-const DEFAULT_IO_MAX_EVENTS: usize = 32;
 
 /// Concrete libaio context used by the current storage-engine backend.
 ///
-/// This type still exposes the legacy raw submit/wait helpers for redo-log
-/// code, and also implements the generic [`IOBackend`] contract used by
+/// This type implements the generic [`IOBackend`] contract used by
 /// [`super::IOWorker`].
-pub struct LibaioBackend {
+pub(crate) struct LibaioBackend {
     ctx: io_context_t,
     max_events: usize,
     stats: IOBackendStatsHandle,
@@ -33,113 +31,10 @@ unsafe impl Sync for LibaioBackend {}
 // threads does not invalidate any Rust-side aliasing or ownership invariants.
 unsafe impl Send for LibaioBackend {}
 
-pub type IocbRawPtr = *mut iocb;
-
-/// Raw libaio request backed by an owned aligned buffer.
-pub struct IORequest<T> {
-    iocb: Box<iocb>,
-    // libaio keeps the raw buffer pointer until completion, so the owned
-    // buffer must stay attached to the request object for the full inflight
-    // lifetime.
-    buf: Option<T>,
-    pub key: IOKey,
-}
-
-impl<T: IOBuf> IORequest<T> {
-    #[inline]
-    pub fn new(
-        key: IOKey,
-        fd: RawFd,
-        offset: usize,
-        mut buf: T,
-        priority: u16,
-        flags: u32,
-        opcode: io_iocb_cmd,
-    ) -> Self {
-        let mut iocb = iocb::boxed();
-        iocb.aio_fildes = fd as u32;
-        iocb.aio_lio_opcode = opcode as u16;
-        iocb.aio_reqprio = priority;
-        iocb.buf = buf.as_bytes_mut().as_mut_ptr();
-        iocb.count = buf.as_bytes().len() as u64;
-        iocb.offset = offset as u64;
-        iocb.flags = flags;
-        iocb.data = key;
-        IORequest {
-            key,
-            buf: Some(buf),
-            iocb,
-        }
-    }
-
-    #[inline]
-    pub fn iocb_raw(&self) -> IocbRawPtr {
-        self.iocb.as_mut_ptr()
-    }
-
-    #[inline]
-    pub fn take_buf(&mut self) -> Option<T> {
-        self.buf.take()
-    }
-
-    #[inline]
-    pub fn buf(&self) -> Option<&T> {
-        self.buf.as_ref()
-    }
-}
-
-/// Raw libaio request backed by a borrowed page-aligned pointer.
-///
-/// The pointer must outlive the kernel request. This compatibility wrapper is
-/// still used for buffer-pool page memory that remains allocated for the whole
-/// async submission lifetime.
-pub struct UnsafeIORequest {
-    iocb: Box<iocb>,
-    pub key: IOKey,
-}
-
-impl UnsafeIORequest {
-    /// Creates one libaio request from a borrowed aligned pointer.
-    ///
-    /// # Safety
-    ///
-    /// Caller must guarantee the pointer remains valid until the kernel
-    /// reports completion and that the pointer plus length satisfy direct-I/O
-    /// alignment rules.
-    #[allow(clippy::too_many_arguments)]
-    #[inline]
-    pub unsafe fn new(
-        key: IOKey,
-        fd: RawFd,
-        offset: usize,
-        ptr: *mut u8,
-        len: usize,
-        priority: u16,
-        flags: u32,
-        opcode: io_iocb_cmd,
-    ) -> Self {
-        let mut iocb = iocb::boxed();
-        iocb.aio_fildes = fd as u32;
-        iocb.aio_lio_opcode = opcode as u16;
-        iocb.aio_reqprio = priority;
-        iocb.buf = ptr;
-        iocb.count = len as u64;
-        iocb.offset = offset as u64;
-        iocb.flags = flags;
-        iocb.data = key;
-        UnsafeIORequest { iocb, key }
-    }
-
-    #[inline]
-    pub fn iocb_raw(&self) -> IocbRawPtr {
-        self.iocb.as_mut_ptr()
-    }
-}
-
 impl LibaioBackend {
     /// Create a new libaio context with max events(io depth).
     #[inline]
-    pub fn new(max_events: usize) -> Result<Self> {
+    pub(crate) fn new(max_events: usize) -> Result<Self> {
         if max_events == 0 || max_events > i32::MAX as usize {
             return Err(Report::new(ConfigError::InvalidIoDepth)
                 .attach(format!("max_events={max_events}"))
@@ -164,40 +59,16 @@ impl LibaioBackend {
         }
     }
 
-    /// Create a default libaio context.
-    #[inline]
-    pub fn try_default() -> Result<Self> {
-        LibaioBackend::new(DEFAULT_IO_MAX_EVENTS)
-    }
-
-    /// Returns maximum events.
-    #[inline]
-    pub fn max_events(&self) -> usize {
-        self.max_events
-    }
-
-    /// Returns one snapshot of backend-owned submit/wait activity.
-    #[inline]
-    pub fn stats(&self) -> IOBackendStats {
-        self.stats.snapshot()
-    }
-
     #[inline]
     pub(crate) fn stats_handle(&self) -> IOBackendStatsHandle {
         self.stats.clone()
-    }
-
-    /// Create a heap-allocated event array for IO submit and wait.
-    #[inline]
-    pub fn events(&self) -> Box<[io_event]> {
-        vec![io_event::default(); self.max_events].into_boxed_slice()
     }
 
     /// Submit IO requests with limit.
     /// Submit count will be returned, and caller need to take
     /// care of cleaning the input slice.
     #[inline]
-    pub fn submit_limit(&self, reqs: &[*mut iocb], limit: usize) -> usize {
+    fn submit_limit(&self, reqs: &[*mut iocb], limit: usize) -> usize {
         if reqs.is_empty() || limit == 0 {
             return 0;
         }
@@ -216,33 +87,13 @@ impl LibaioBackend {
         ret as usize
     }
 
-    /// Wait until given number of IO finishes, and execute callback for each.
-    /// Returns number of finished events.
+    /// Wait until at least the requested number of IO operations finish.
     #[inline]
-    pub fn wait_at_least<F>(
+    fn wait_at_least_with_attempts(
         &self,
         events: &mut [io_event],
         min_nr: usize,
-        callback: F,
-    ) -> (usize, usize)
-    where
-        F: FnMut(IOKey, StdIoResult<usize>) -> IOKind,
-    {
-        let (_, read_count, write_count) =
-            self.wait_at_least_with_attempts(events, min_nr, callback);
-        (read_count, write_count)
-    }
-
-    #[inline]
-    fn wait_at_least_with_attempts<F>(
-        &self,
-        events: &mut [io_event],
-        min_nr: usize,
-        mut callback: F,
-    ) -> (usize, usize, usize)
-    where
-        F: FnMut(IOKey, StdIoResult<usize>) -> IOKind,
-    {
+    ) -> (usize, Vec<(BackendToken, StdIoResult<usize>)>) {
         let max_nwait = events.len();
         let mut wait_calls = 0;
         let count = loop {
@@ -266,59 +117,24 @@ impl LibaioBackend {
             count != 0,
             "io_getevents with min_nr=1 and timeout=None should not return 0"
         );
-        let mut read_count = 0;
-        let mut write_count = 0;
+        let mut completed = Vec::with_capacity(count);
         for ev in &mut events[..count] {
-            let key = ev.data;
             let res = if ev.res >= 0 {
                 Ok(ev.res as usize)
             } else {
                 let err = io::Error::from_raw_os_error(-ev.res as i32);
                 Err(err)
             };
-            match callback(key, res) {
-                IOKind::Read => read_count += 1,
-                IOKind::Write => write_count += 1,
-            }
+            completed.push((BackendToken::from_raw(ev.data), res));
         }
-        (wait_calls, read_count, write_count)
+        (wait_calls, completed)
     }
 
     /// Build an IO worker builder.
     #[inline]
-    pub fn io_worker<T>(self) -> (IOWorkerBuilder<T>, IOClient<T>) {
+    pub(crate) fn io_worker<T>(self) -> (IOWorkerBuilder<T>, IOClient<T>) {
         build_io_worker(self)
     }
-}
-
-#[inline]
-pub fn pread<T: IOBuf>(key: IOKey, fd: RawFd, offset: usize, buf: T) -> IORequest<T> {
-    const PRIORITY: u16 = 0;
-    const FLAGS: u32 = 0;
-    IORequest::new(
-        key,
-        fd,
-        offset,
-        buf,
-        PRIORITY,
-        FLAGS,
-        io_iocb_cmd::IO_CMD_PREAD,
-    )
-}
-
-#[inline]
-pub fn pwrite<T: IOBuf>(key: IOKey, fd: RawFd, offset: usize, buf: T) -> IORequest<T> {
-    const PRIORITY: u16 = 0;
-    const FLAGS: u32 = 0;
-    IORequest::new(
-        key,
-        fd,
-        offset,
-        buf,
-        PRIORITY,
-        FLAGS,
-        io_iocb_cmd::IO_CMD_PWRITE,
-    )
 }
 
 #[inline]
@@ -362,7 +178,7 @@ impl Drop for LibaioBackend {
 ///
 /// This stores the pointer-array layout required by `io_submit` while keeping
 /// that ABI detail out of the generic worker contract.
-pub struct LibaioSubmitBatch {
+pub(crate) struct LibaioSubmitBatch {
     staged: VecDeque<*mut iocb>,
     prefix: Vec<*mut iocb>,
 }
@@ -379,20 +195,20 @@ impl IOBackend for LibaioBackend {
 
     #[inline]
     fn max_events(&self) -> usize {
-        self.max_events()
+        self.max_events
     }
 
     #[inline]
     fn new_submit_batch(&self) -> Self::SubmitBatch {
         LibaioSubmitBatch {
-            staged: VecDeque::with_capacity(self.max_events()),
-            prefix: Vec::with_capacity(self.max_events()),
+            staged: VecDeque::with_capacity(self.max_events),
+            prefix: Vec::with_capacity(self.max_events),
         }
     }
 
     #[inline]
     fn new_events(&self) -> Self::Events {
-        self.events()
+        vec![io_event::default(); self.max_events].into_boxed_slice()
     }
 
     #[inline]
@@ -444,12 +260,7 @@ impl IOBackend for LibaioBackend {
         min_nr: usize,
     ) -> Vec<(BackendToken, StdIoResult<usize>)> {
         let start = Instant::now();
-        let mut completed = Vec::new();
-        let (wait_calls, _read_count, _write_count) =
-            self.wait_at_least_with_attempts(events, min_nr, |token, res| {
-                completed.push((BackendToken::from_raw(token), res));
-                IOKind::Read
-            });
+        let (wait_calls, completed) = self.wait_at_least_with_attempts(events, min_nr);
         self.stats
             .record_submit_and_wait(wait_calls, start.elapsed().as_nanos() as usize);
         self.stats.record_wait_completions(completed.len());
@@ -530,7 +341,9 @@ pub(crate) mod tests {
 
         let mut buf = buf_free_list.pop(false);
         buf.reset();
-        buf.extend_from_slice(b"hello, world");
+        let data = b"hello, world";
+        buf.truncate(data.len());
+        buf.data_mut().copy_from_slice(data);
 
         client
             .send(Request {
@@ -555,7 +368,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_submit_limit_eagain_no_panic() {
-        let ctx = LibaioBackend::try_default().unwrap();
+        let ctx = LibaioBackend::new(32).unwrap();
         let previous = set_io_submit_hook(Some(|_, _, _| -EAGAIN));
         let iocb = iocb::boxed();
         let reqs = vec![iocb.as_mut_ptr()];
@@ -605,13 +418,13 @@ pub(crate) mod tests {
             1
         }
 
-        let mut backend = LibaioBackend::try_default().unwrap();
-        let mut events = backend.events();
+        let mut backend = LibaioBackend::new(32).unwrap();
+        let mut events = backend.new_events();
         let token = BackendToken::new(7, 3);
 
         IO_GETEVENTS_CALLS.store(0, Ordering::SeqCst);
         let previous = set_io_getevents_hook(Some(eintr_then_one_completion));
-        let baseline = backend.stats();
+        let baseline = backend.stats_handle().snapshot();
         let completions = <LibaioBackend as IOBackend>::wait_at_least(&mut backend, &mut events, 1);
         set_io_getevents_hook(previous);
 
@@ -623,7 +436,7 @@ pub(crate) mod tests {
             Err(err) => panic!("expected successful completion, got error: {err}"),
         }
 
-        let delta = backend.stats().delta_since(baseline);
+        let delta = backend.stats_handle().snapshot().delta_since(baseline);
         assert_eq!(delta.submit_and_wait_calls, 2);
         assert_eq!(delta.wait_completions, 1);
     }

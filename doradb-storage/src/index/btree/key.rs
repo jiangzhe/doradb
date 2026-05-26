@@ -4,7 +4,7 @@ use crate::memcmp::{
 use crate::value::{Val, ValKind, ValType};
 use std::borrow::Borrow;
 
-pub type BTreeKey = MemCmpKey;
+pub(crate) type BTreeKey = MemCmpKey;
 
 trait KeyEncoder {
     /// Returns estimated encoded length.
@@ -19,7 +19,7 @@ trait KeyEncoder {
     fn encode_copy(&self, key: &Val, buf: &mut [u8], start_idx: usize) -> usize;
 }
 
-pub struct SingleKeyEncoder(ValType);
+pub(crate) struct SingleKeyEncoder(ValType);
 
 impl SingleKeyEncoder {
     /// Create a new key from single value.
@@ -145,7 +145,7 @@ impl KeyEncoder for SingleKeyEncoder {
 
 /// A Special encoder for variable-length string/bytes to be memory comparable
 /// if it is followed by other keys.
-pub struct SegmentedBytesEncoder {
+pub(crate) struct SegmentedBytesEncoder {
     nullable: bool,
 }
 
@@ -179,7 +179,7 @@ impl KeyEncoder for SegmentedBytesEncoder {
     }
 }
 
-pub enum PrefixKeyEncoder {
+pub(crate) enum PrefixKeyEncoder {
     Single(SingleKeyEncoder),
     Segmented(SegmentedBytesEncoder),
 }
@@ -210,7 +210,7 @@ impl KeyEncoder for PrefixKeyEncoder {
     }
 }
 
-pub enum BTreeKeyEncoder {
+pub(crate) enum BTreeKeyEncoder {
     Single(SingleKeyEncoder),
     Multi {
         prefix: Box<[PrefixKeyEncoder]>,
@@ -222,7 +222,7 @@ pub enum BTreeKeyEncoder {
 impl BTreeKeyEncoder {
     /// Create a B-tree key encoder based on types of keys.
     #[inline]
-    pub fn new(mut val_types: Vec<ValType>) -> Self {
+    pub(crate) fn new(mut val_types: Vec<ValType>) -> Self {
         debug_assert!(!val_types.is_empty());
         if val_types.len() == 1 {
             let ty = val_types.pop().unwrap();
@@ -257,20 +257,9 @@ impl BTreeKeyEncoder {
         }
     }
 
-    /// Returns number of internal encoders.
-    /// This is also total key number of this encoder.
-    #[allow(clippy::len_without_is_empty)]
-    #[inline]
-    pub fn len(&self) -> usize {
-        match self {
-            BTreeKeyEncoder::Single(_) => 1,
-            BTreeKeyEncoder::Multi { prefix, .. } => prefix.len() + 1,
-        }
-    }
-
     /// Encode keys into a memory-comparable b-tree key.
     #[inline]
-    pub fn encode<V: Borrow<Val>>(&self, keys: &[V]) -> BTreeKey {
+    pub(crate) fn encode<V: Borrow<Val>>(&self, keys: &[V]) -> BTreeKey {
         match self {
             BTreeKeyEncoder::Single(e) => {
                 debug_assert!(keys.len() == 1);
@@ -303,7 +292,11 @@ impl BTreeKeyEncoder {
     /// If we have known suffix length, we can canculate prefix length
     /// accordingly.
     #[inline]
-    pub fn encode_prefix<V: Borrow<Val>>(&self, key: &[V], suffix_len: Option<usize>) -> BTreeKey {
+    pub(crate) fn encode_prefix<V: Borrow<Val>>(
+        &self,
+        key: &[V],
+        suffix_len: Option<usize>,
+    ) -> BTreeKey {
         match self {
             BTreeKeyEncoder::Single(_) => {
                 panic!("unexpected single key encoder")
@@ -330,7 +323,7 @@ impl BTreeKeyEncoder {
 
     /// Encode a pair of keys into a memory-comparable b-tree key.
     #[inline]
-    pub fn encode_pair<P: Borrow<Val>, S: Borrow<Val>>(
+    pub(crate) fn encode_pair<P: Borrow<Val>, S: Borrow<Val>>(
         &self,
         prefix_key: &[P],
         suffix_key: S,

@@ -43,7 +43,7 @@ We rely on tooling to enforce style.
 *   **Use `crate::io`**: All file I/O must go through the `crate::io` module.
     *   **Do not** use `std::fs` or `tokio::fs` for data path operations.
 *   **Compile-Time Backends**: `crate::io` supports compile-time-selected `io_uring` and `libaio` backends. `io_uring` is the repository default, and `libaio` remains the explicitly supported alternate path for older kernels that cannot run `io_uring`.
-*   **Alignment**: Respect `crate::io::MIN_PAGE_SIZE` (4096 bytes) for Direct I/O buffers.
+*   **Alignment**: Respect `crate::io::STORAGE_SECTOR_SIZE` (4096 bytes) for Direct I/O buffers.
 
 ## 4. Testing
 

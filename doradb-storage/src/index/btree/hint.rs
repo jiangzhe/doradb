@@ -1,7 +1,7 @@
 use crate::index::btree::KeyHeadInt;
 use zerocopy_derive::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
-pub const BTREE_HINTS_LEN: usize = 8;
+pub(crate) const BTREE_HINTS_LEN: usize = 8;
 
 /// BTreeHint is a search hint on each BTreeNode.
 ///
@@ -20,7 +20,7 @@ pub const BTREE_HINTS_LEN: usize = 8;
 /// If key is 1800, hint[1] is picked.
 #[derive(Debug, Clone, FromBytes, IntoBytes, KnownLayout, Immutable)]
 #[repr(C, align(32))]
-pub struct BTreeHints([[u8; 4]; BTREE_HINTS_LEN]);
+pub(crate) struct BTreeHints([[u8; 4]; BTREE_HINTS_LEN]);
 
 impl BTreeHints {
     /// Search interface of hints.
@@ -28,7 +28,7 @@ impl BTreeHints {
     /// Use conditional compilation to choose suitable one.
     /// Maybe avx512f is better. Leave for future improvement.
     #[inline]
-    pub fn search(&self, key: KeyHeadInt) -> (usize, usize) {
+    pub(crate) fn search(&self, key: KeyHeadInt) -> (usize, usize) {
         let hints = self.heads();
         #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
         {
@@ -41,7 +41,7 @@ impl BTreeHints {
     }
 
     #[inline]
-    pub fn update(&mut self, idx: usize, key: KeyHeadInt) {
+    pub(crate) fn update(&mut self, idx: usize, key: KeyHeadInt) {
         self.0[idx] = key.to_le_bytes();
     }
 

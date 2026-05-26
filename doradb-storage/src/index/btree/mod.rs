@@ -28,14 +28,14 @@ use std::marker::PhantomData;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 pub(crate) use hint::*;
-pub use key::*;
-pub use node::*;
-pub use scan::*;
-pub use value::*;
+pub(crate) use key::*;
+pub(crate) use node::*;
+pub(crate) use scan::*;
+pub(crate) use value::*;
 
-pub type SharedStrategy = SharedLockStrategy<BTreeNode>;
-pub type ExclusiveStrategy = ExclusiveLockStrategy<BTreeNode>;
-pub type OptimisticStrategy = OptimisticLockStrategy<BTreeNode>;
+pub(crate) type SharedStrategy = SharedLockStrategy<BTreeNode>;
+pub(crate) type ExclusiveStrategy = ExclusiveLockStrategy<BTreeNode>;
+pub(crate) type OptimisticStrategy = OptimisticLockStrategy<BTreeNode>;
 
 macro_rules! verify_result {
     ($expr:expr) => {
@@ -47,25 +47,21 @@ macro_rules! verify_result {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum BTreeInsert<V: BTreeValue> {
+pub(crate) enum BTreeInsert<V: BTreeValue> {
     Ok(bool),
     DuplicateKey(V),
 }
 
 impl<V: BTreeValue> BTreeInsert<V> {
     #[inline]
-    pub fn is_ok(&self) -> bool {
+    #[cfg_attr(not(test), expect(dead_code, reason = "reserved is_ok"))]
+    pub(crate) fn is_ok(&self) -> bool {
         matches!(self, BTreeInsert::Ok(false))
-    }
-
-    #[inline]
-    pub fn is_merged(&self) -> bool {
-        matches!(self, BTreeInsert::Ok(true))
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum BTreeDelete {
+pub(crate) enum BTreeDelete {
     Ok,
     NotFound,
     ValueMismatch,
@@ -73,13 +69,13 @@ pub enum BTreeDelete {
 
 impl BTreeDelete {
     #[inline]
-    pub fn is_ok(&self) -> bool {
+    pub(crate) fn is_ok(&self) -> bool {
         matches!(self, BTreeDelete::Ok)
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum BTreeUpdate<V: BTreeValue> {
+pub(crate) enum BTreeUpdate<V: BTreeValue> {
     Ok(V),
     NotFound,
     ValueMismatch(V),
@@ -87,13 +83,13 @@ pub enum BTreeUpdate<V: BTreeValue> {
 
 impl<V: BTreeValue> BTreeUpdate<V> {
     #[inline]
-    pub fn is_ok(&self) -> bool {
+    pub(crate) fn is_ok(&self) -> bool {
         matches!(self, BTreeUpdate::Ok(_))
     }
 }
 
 /// Generic B-Tree storage wrapper over a buffer-pool implementation.
-pub struct GenericBTree<P: 'static> {
+pub(crate) struct GenericBTree<P: 'static> {
     root: PageID,
     /// Height of this btree.
     height: AtomicUsize,
@@ -104,12 +100,13 @@ pub struct GenericBTree<P: 'static> {
 }
 
 /// Compatibility alias for runtime B-Tree backed by `FixedBufferPool`.
-pub type BTree = GenericBTree<FixedBufferPool>;
+#[cfg_attr(not(test), expect(dead_code, reason = "pending dead-code audit"))]
+pub(crate) type BTree = GenericBTree<FixedBufferPool>;
 
 impl<P: BufferPool> GenericBTree<P> {
     /// Create a new B-Tree index.
     #[inline]
-    pub async fn new(
+    pub(crate) async fn new(
         pool: QuiescentGuard<P>,
         pool_guard: &PoolGuard,
         hints_enabled: bool,
@@ -146,7 +143,7 @@ impl<P: BufferPool> GenericBTree<P> {
     /// Destroy the tree.
     /// This method will traverse the tree and deallocate all the nodes recursively.
     #[inline]
-    pub async fn destory(self, pool_guard: &PoolGuard) -> Result<()> {
+    pub(crate) async fn destory(self, pool_guard: &PoolGuard) -> Result<()> {
         let g = self
             .get_node(pool_guard, self.root, LatchFallbackMode::Exclusive)
             .await?
@@ -203,7 +200,7 @@ impl<P: BufferPool> GenericBTree<P> {
 
     /// Returns height of this btree.
     #[inline]
-    pub fn height(&self) -> usize {
+    pub(crate) fn height(&self) -> usize {
         self.height.load(Ordering::Relaxed)
     }
 
@@ -212,7 +209,7 @@ impl<P: BufferPool> GenericBTree<P> {
     /// This method does not care about delete bit, so a marked deleted value
     /// can also be returned and caller need to take care of it.
     #[inline]
-    pub async fn lookup_optimistic<V: BTreeValue>(
+    pub(crate) async fn lookup_optimistic<V: BTreeValue>(
         &self,
         pool_guard: &PoolGuard,
         key: &[u8],
@@ -227,7 +224,7 @@ impl<P: BufferPool> GenericBTree<P> {
     /// Insert a new key value pair into the tree.
     /// Returns old value if same key exists.
     #[inline]
-    pub async fn insert<V: BTreeValue>(
+    pub(crate) async fn insert<V: BTreeValue>(
         &self,
         pool_guard: &PoolGuard,
         key: &[u8],
@@ -302,26 +299,6 @@ impl<P: BufferPool> GenericBTree<P> {
         }
     }
 
-    /// Mark an existing key value pair as deleted.
-    #[inline]
-    pub async fn mark_as_deleted<V: BTreeValue>(
-        &self,
-        pool_guard: &PoolGuard,
-        key: &[u8],
-        value: V,
-        ts: TrxID,
-    ) -> Result<BTreeUpdate<V>> {
-        debug_assert!(!value.is_deleted());
-        let mut g = self.find_leaf::<ExclusiveStrategy>(pool_guard, key).await?;
-        debug_assert!(g.page().is_leaf());
-        let node = g.page_mut();
-        let res = node.mark_as_deleted(key, value);
-        if res.is_ok() {
-            node.update_ts(ts);
-        }
-        Ok(res)
-    }
-
     /// Delete an existing key value pair from this tree.
     /// This method will remove matched key value pair no matter
     /// it is marked as deleted or not.
@@ -330,7 +307,7 @@ impl<P: BufferPool> GenericBTree<P> {
     /// Instead a tree-level compact() method can be used periodically
     /// to make the tree balanced.
     #[inline]
-    pub async fn delete<V: BTreeValue>(
+    pub(crate) async fn delete<V: BTreeValue>(
         &self,
         pool_guard: &PoolGuard,
         key: &[u8],
@@ -378,7 +355,7 @@ impl<P: BufferPool> GenericBTree<P> {
 
     /// Update an existing key value pair with new value.
     #[inline]
-    pub async fn update<V: BTreeValue>(
+    pub(crate) async fn update<V: BTreeValue>(
         &self,
         pool_guard: &PoolGuard,
         key: &[u8],
@@ -399,7 +376,7 @@ impl<P: BufferPool> GenericBTree<P> {
     /// Create a cursor to iterator over nodes at given height.
     /// Height equals to 0 means iterating over all leaf nodes.
     #[inline]
-    pub fn cursor<'a>(
+    pub(crate) fn cursor<'a>(
         &'a self,
         pool_guard: &'a PoolGuard,
         height: usize,
@@ -409,7 +386,7 @@ impl<P: BufferPool> GenericBTree<P> {
 
     /// Create a prefix scanner to scan keys.
     #[inline]
-    pub fn prefix_scanner<'a, C: BTreeSlotCallback>(
+    pub(crate) fn prefix_scanner<'a, C: BTreeSlotCallback>(
         &'a self,
         pool_guard: &'a PoolGuard,
         callback: C,
@@ -419,7 +396,7 @@ impl<P: BufferPool> GenericBTree<P> {
 
     /// Collect space statistics at given height.
     #[inline]
-    pub async fn collect_space_statistics_at(
+    pub(crate) async fn collect_space_statistics_at(
         &self,
         pool_guard: &PoolGuard,
         height: usize,
@@ -439,7 +416,8 @@ impl<P: BufferPool> GenericBTree<P> {
 
     /// Collect space statistics of the whole tree.
     #[inline]
-    pub async fn collect_space_statistics(
+    #[cfg_attr(not(test), expect(dead_code, reason = "internal btree stats"))]
+    pub(crate) async fn collect_space_statistics(
         &self,
         pool_guard: &PoolGuard,
     ) -> Result<SpaceStatistics> {
@@ -457,7 +435,7 @@ impl<P: BufferPool> GenericBTree<P> {
 
     /// Create a compactor for all nodes at given height.
     #[inline]
-    pub fn compact<'a, V: BTreeValue>(
+    pub(crate) fn compact<'a, V: BTreeValue>(
         &'a self,
         pool_guard: &'a PoolGuard,
         height: usize,
@@ -468,7 +446,8 @@ impl<P: BufferPool> GenericBTree<P> {
 
     /// Compact the whole tree.
     #[inline]
-    pub async fn compact_all<V: BTreeValue>(
+    #[cfg_attr(not(test), expect(dead_code, reason = "internal btree compaction"))]
+    pub(crate) async fn compact_all<V: BTreeValue>(
         &self,
         pool_guard: &PoolGuard,
         config: BTreeCompactConfig,
@@ -493,7 +472,7 @@ impl<P: BufferPool> GenericBTree<P> {
 
     /// Try to shrink the tree height if root node has only one child.
     #[inline]
-    pub async fn shrink(
+    pub(crate) async fn shrink(
         &self,
         pool_guard: &PoolGuard,
         purge_list: &mut Vec<PageExclusiveGuard<BTreeNode>>,
@@ -920,7 +899,7 @@ impl<P: BufferPool> GenericBTree<P> {
     }
 
     /// Merge right node into left node, and update separtor key in parent node accordingly.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments, reason = "code style")]
     #[inline]
     fn merge_node<V: BTreeValue>(
         &self,
@@ -979,7 +958,7 @@ impl<P: BufferPool> GenericBTree<P> {
     }
 
     /// Merge partial right node into left node.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments, reason = "code style")]
     #[inline]
     fn merge_partial<V: BTreeValue>(
         &self,
@@ -1251,7 +1230,7 @@ impl<P: BufferPool> GenericBTree<P> {
 }
 
 /// Controls how to access B-Tree nodes with coupling way.
-pub struct BTreeCoupling<S: LockStrategy> {
+pub(crate) struct BTreeCoupling<S: LockStrategy> {
     // Parent position to locate target node.
     // can be optional.
     pub(super) parent: Option<ParentPosition<S::Guard>>,
@@ -1262,9 +1241,8 @@ impl<S: LockStrategy<Page = BTreeNode>> BTreeCoupling<S>
 where
     S::Guard: PageGuard<BTreeNode>,
 {
-    #[allow(clippy::new_without_default)]
     #[inline]
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         BTreeCoupling {
             parent: None,
             node: None,
@@ -1273,7 +1251,7 @@ where
 
     /// Seek given key and lock the node at given height with its parent.
     #[inline]
-    pub async fn seek_and_lock<P: BufferPool>(
+    pub(crate) async fn seek_and_lock<P: BufferPool>(
         &mut self,
         tree: &GenericBTree<P>,
         pool_guard: &PoolGuard,
@@ -1297,7 +1275,7 @@ where
 
     /// Release both locks
     #[inline]
-    pub fn reset(&mut self) {
+    pub(crate) fn reset(&mut self) {
         self.parent.take();
         self.node.take();
     }
@@ -1412,26 +1390,6 @@ impl SplitNode {
     }
 }
 
-/// NodePurgeList contains all nodes that have been removed from
-/// B-tree.
-/// It's possible other thread still want to access the node even
-/// when the node has been already removed from the tree.
-/// From normal path(root to leaf), others can not see them.
-/// But sometimes, we cache optimistic guard of node and access it
-/// later.
-/// To make such operation safe, we cannot just deallocate the node
-/// when removing it from tree.
-/// But we put it in a purge list and let background thread to remove
-/// when the time is safe.
-/// Safe time mean no other thread can access them.
-/// This is very similar to transactional GC: all active transactions
-/// has larger timestamp than the removal timestamp.
-pub struct NodePurgeList {
-    /// The timestamp when nodes are removed from the tree.
-    pub ts: TrxID,
-    pub nodes: Vec<PageExclusiveGuard<BTreeNode>>,
-}
-
 #[inline]
 fn build_exhausted_parent_seek_key(node: &BTreeNode, key_buffer: &mut Vec<u8>) {
     key_buffer.clear();
@@ -1453,7 +1411,7 @@ fn make_strict_successor(key_buffer: &mut Vec<u8>) {
 /// the tree nodes.
 /// But it guarantees if a value(node) does not change during the traverse,
 /// it will be always visited.
-pub struct BTreeNodeCursor<'a, P: 'static> {
+pub(crate) struct BTreeNodeCursor<'a, P: 'static> {
     tree: &'a GenericBTree<P>,
     pool_guard: &'a PoolGuard,
     height: usize,
@@ -1473,7 +1431,7 @@ impl<'a, P: BufferPool> BTreeNodeCursor<'a, P> {
 
     /// Create a new cursor.
     #[inline]
-    pub fn new(tree: &'a GenericBTree<P>, pool_guard: &'a PoolGuard, height: usize) -> Self {
+    pub(crate) fn new(tree: &'a GenericBTree<P>, pool_guard: &'a PoolGuard, height: usize) -> Self {
         BTreeNodeCursor {
             tree,
             pool_guard,
@@ -1484,7 +1442,7 @@ impl<'a, P: BufferPool> BTreeNodeCursor<'a, P> {
     }
 
     #[inline]
-    pub async fn seek(&mut self, key: &[u8]) -> Result<()> {
+    pub(crate) async fn seek(&mut self, key: &[u8]) -> Result<()> {
         self.coupling
             .seek_and_lock(self.tree, self.pool_guard, self.height, key)
             .await
@@ -1492,7 +1450,7 @@ impl<'a, P: BufferPool> BTreeNodeCursor<'a, P> {
 
     /// Fetch next node.
     #[inline]
-    pub async fn next(&mut self) -> Result<Option<PageSharedGuard<BTreeNode>>> {
+    pub(crate) async fn next(&mut self) -> Result<Option<PageSharedGuard<BTreeNode>>> {
         if let Some(g) = self.coupling.node.take() {
             return Ok(Some(g));
         }
@@ -1562,14 +1520,15 @@ impl<'a, P: BufferPool> BTreeNodeCursor<'a, P> {
 /// 1.0 and 1.0. So every node will be compacted and merged
 /// if possible.
 #[derive(Debug, Clone, Copy)]
-pub struct BTreeCompactConfig {
+pub(crate) struct BTreeCompactConfig {
     low_ratio: f64,
     high_ratio: f64,
 }
 
 impl BTreeCompactConfig {
     #[inline]
-    pub fn new(low_ratio: f64, high_ratio: f64) -> Result<Self> {
+    #[cfg_attr(not(test), expect(dead_code, reason = "internal btree compaction"))]
+    pub(crate) fn new(low_ratio: f64, high_ratio: f64) -> Result<Self> {
         if !(0.0..=1.0).contains(&low_ratio)
             || !(0.0..=1.0).contains(&high_ratio)
             || high_ratio < low_ratio
@@ -1599,7 +1558,7 @@ impl Default for BTreeCompactConfig {
 /// It behaves like a cursor.
 /// It can lock three nodes at the same time(one parent and two children).
 /// It will try to merge right node into left.
-pub struct BTreeCompactor<'a, V: BTreeValue, P: 'static> {
+pub(crate) struct BTreeCompactor<'a, V: BTreeValue, P: 'static> {
     tree: &'a GenericBTree<P>,
     pool_guard: &'a PoolGuard,
     // height of nodes to be compacted.
@@ -1622,7 +1581,7 @@ impl<'a, V: BTreeValue, P: BufferPool> BTreeCompactor<'a, V, P> {
     }
 
     #[inline]
-    pub fn new(
+    pub(crate) fn new(
         tree: &'a GenericBTree<P>,
         pool_guard: &'a PoolGuard,
         height: usize,
@@ -1644,14 +1603,14 @@ impl<'a, V: BTreeValue, P: BufferPool> BTreeCompactor<'a, V, P> {
     }
 
     #[inline]
-    pub async fn seek(&mut self, key: &[u8]) -> Result<()> {
+    pub(crate) async fn seek(&mut self, key: &[u8]) -> Result<()> {
         self.coupling
             .seek_and_lock(self.tree, self.pool_guard, self.height, key)
             .await
     }
 
     #[inline]
-    pub async fn run_to_end(
+    pub(crate) async fn run_to_end(
         mut self,
         purge_list: &mut Vec<PageExclusiveGuard<BTreeNode>>,
     ) -> Result<()> {
@@ -2293,9 +2252,15 @@ mod tests {
                 Some(BTreeU64::from(7))
             );
 
-            tree.mark_as_deleted::<BTreeU64>(&pool_guard, b"k", BTreeU64::from(7), 102)
-                .await
-                .expect("mark_as_deleted should read the leaf");
+            tree.update(
+                &pool_guard,
+                b"k",
+                BTreeU64::from(7),
+                BTreeU64::from(7).deleted(),
+                102,
+            )
+            .await
+            .expect("update should read the leaf");
             assert_eq!(
                 tree.delete_exact(&pool_guard, b"k", BTreeU64::from(7), false, 103)
                     .await
@@ -2528,15 +2493,27 @@ mod tests {
                 assert!(res.is_none());
                 // mark as deleted
                 let res = tree
-                    .mark_as_deleted(&pool_guard, &3u64.to_be_bytes(), three, 230)
+                    .update(
+                        &pool_guard,
+                        &3u64.to_be_bytes(),
+                        three,
+                        three.deleted(),
+                        230,
+                    )
                     .await;
                 assert!(res.is_ok());
                 let res = tree
-                    .mark_as_deleted(&pool_guard, &5u64.to_be_bytes(), five, 230)
+                    .update(&pool_guard, &5u64.to_be_bytes(), five, five.deleted(), 230)
                     .await;
                 assert!(res.is_ok());
                 let res = tree
-                    .mark_as_deleted(&pool_guard, &7u64.to_be_bytes(), seven, 235)
+                    .update(
+                        &pool_guard,
+                        &7u64.to_be_bytes(),
+                        seven,
+                        seven.deleted(),
+                        235,
+                    )
                     .await
                     .unwrap();
                 assert_eq!(res, BTreeUpdate::NotFound);

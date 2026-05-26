@@ -5,14 +5,14 @@ use crate::catalog::table::TableMetadata;
 use crate::catalog::{CatalogCheckpointBatch, CatalogRedoEntry};
 use crate::catalog::{ObjID, TableID, USER_OBJ_ID_START};
 use crate::error::{DataIntegrityError, Error, FileKind, Result};
-use crate::file::cow_file::{BlockID, SUPER_BLOCK_ID};
+use crate::file::cow_file::{BlockID, MutableCowFile, SUPER_BLOCK_ID};
 use crate::file::multi_table_file::{
     CATALOG_TABLE_ROOT_DESC_COUNT, CatalogTableRootDesc, MultiTableFileSnapshot,
     MutableMultiTableFile,
 };
 use crate::index::{
     ColumnBlockEntryPatch, ColumnBlockEntryShape, ColumnBlockIndex, ColumnDeleteDeltaPatch,
-    ColumnDeleteDomain, ColumnLeafEntry, load_entry_deletion_deltas,
+    ColumnDeleteDomain, ColumnLeafEntry,
 };
 use crate::io::DirectBuf;
 use crate::lwc::{LwcBuilder, PersistedLwcBlock};
@@ -106,7 +106,7 @@ impl CatalogStorage {
         Ok(())
     }
 
-    pub async fn apply_checkpoint_batch(
+    pub(crate) async fn apply_checkpoint_batch(
         &self,
         batch: CatalogCheckpointBatch,
         next_user_obj_id: ObjID,
@@ -337,12 +337,12 @@ impl CatalogStorage {
                     .get(consumed.saturating_sub(1))
                     .map(|row| row.row_id.saturating_add(1))
                     .unwrap_or(current_end_row_id);
-                let existing_deletes = load_entry_deletion_deltas(&base_index, &last_entry).await?;
+                let existing_deletes = base_index.load_delete_deltas(&last_entry).await?;
                 let replacement = ColumnBlockEntryShape::new(
                     last_entry.start_row_id,
                     merged_end_row_id,
                     merged_row_ids,
-                    existing_deletes.into_iter().collect(),
+                    existing_deletes,
                 )?
                 .with_delete_domain(ColumnDeleteDomain::Ordinal)
                 .with_block_id(new_tail_block_id);
@@ -409,7 +409,11 @@ impl CatalogStorage {
                     ))
                 })?;
             let entry = entries[idx];
-            let mut base = load_entry_deletion_deltas(&base_index, &entry).await?;
+            let mut base: BTreeSet<u32> = base_index
+                .load_delete_deltas(&entry)
+                .await?
+                .into_iter()
+                .collect();
             let old_len = base.len();
             base.extend(pending.iter().copied());
             if base.len() == old_len {
@@ -518,7 +522,11 @@ impl CatalogStorage {
         );
         let mut rows = Vec::new();
         for entry in entries {
-            let deleted = load_entry_deletion_deltas(&column_index, &entry).await?;
+            let deleted: BTreeSet<u32> = column_index
+                .load_delete_deltas(&entry)
+                .await?
+                .into_iter()
+                .collect();
             let page_rows = self
                 .decode_lwc_page_rows(metadata, disk_pool_guard, &column_index, &entry)
                 .await?;
@@ -553,7 +561,11 @@ impl CatalogStorage {
     ) -> Result<Vec<ExistingVisibleRow>> {
         let mut rows = Vec::new();
         for entry in entries {
-            let deleted = load_entry_deletion_deltas(column_index, entry).await?;
+            let deleted: BTreeSet<u32> = column_index
+                .load_delete_deltas(entry)
+                .await?
+                .into_iter()
+                .collect();
             let page_rows = self
                 .decode_lwc_page_rows(metadata, disk_pool_guard, column_index, entry)
                 .await?;
@@ -817,7 +829,7 @@ mod tests {
     use crate::conf::{EngineConfig, TrxSysConfig};
     use crate::file::multi_table_file::{CATALOG_MTB_FILE_ID, MutableMultiTableFile};
     use crate::file::{BlockID, BlockKey};
-    use crate::index::{ColumnBlockIndex, ColumnDeleteDomain, load_entry_deletion_deltas};
+    use crate::index::{ColumnBlockIndex, ColumnDeleteDomain};
     use crate::row::ops::SelectKey;
     use crate::trx::redo::RowRedoKind;
     use crate::value::Val;
@@ -1039,10 +1051,19 @@ mod tests {
             assert_eq!(last2.start_row_id, last1.start_row_id);
             assert_ne!(last2.block_id(), last1.block_id());
             assert_eq!(last2.delete_domain(), ColumnDeleteDomain::Ordinal);
-            assert_eq!(
-                load_entry_deletion_deltas(&index2, &last2).await.unwrap(),
-                load_entry_deletion_deltas(&index1, &last1).await.unwrap()
-            );
+            let deletes2: BTreeSet<_> = index2
+                .load_delete_deltas(&last2)
+                .await
+                .unwrap()
+                .into_iter()
+                .collect();
+            let deletes1: BTreeSet<_> = index1
+                .load_delete_deltas(&last1)
+                .await
+                .unwrap()
+                .into_iter()
+                .collect();
+            assert_eq!(deletes2, deletes1);
         });
     }
 }

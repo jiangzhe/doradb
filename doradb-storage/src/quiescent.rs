@@ -126,14 +126,14 @@ fn guard_count_underflow() -> ! {
 /// release stays on a single-atomic hot path. Callers must therefore avoid
 /// dropping the owner while still holding guards themselves, or teardown will
 /// block forever.
-pub struct QuiescentBox<T> {
+pub(crate) struct QuiescentBox<T> {
     inner: Pin<Box<QuiescentInner<T>>>,
 }
 
 impl<T> QuiescentBox<T> {
     /// Creates a new quiescent owner around `value`.
     #[inline]
-    pub fn new(value: T) -> Self {
+    pub(crate) fn new(value: T) -> Self {
         Self {
             inner: Box::pin(QuiescentInner::new(value)),
         }
@@ -154,7 +154,7 @@ impl<T> QuiescentBox<T> {
     /// Guard creation is intentionally cheap: it increments one keepalive
     /// counter and stores raw pointers back to the owner allocation.
     #[inline]
-    pub fn guard(&self) -> QuiescentGuard<T> {
+    pub(crate) fn guard(&self) -> QuiescentGuard<T> {
         QuiescentGuard::new(self.inner_ptr())
     }
 }
@@ -179,7 +179,7 @@ impl<T> Drop for QuiescentBox<T> {
 ///
 /// Each guard keeps the owner allocation alive until the guard is dropped.
 /// Guards only provide shared access and dereference to `&T`.
-pub struct QuiescentGuard<T> {
+pub(crate) struct QuiescentGuard<T> {
     ptr: NonNull<T>,
     inner: NonNull<QuiescentInner<T>>,
 }
@@ -217,7 +217,8 @@ impl<T> QuiescentGuard<T> {
 
     /// Returns the raw pointer to the guarded value.
     #[inline]
-    pub fn as_ptr(&self) -> *const T {
+    #[cfg_attr(not(test), expect(dead_code, reason = "reserved as_ptr"))]
+    pub(crate) fn as_ptr(&self) -> *const T {
         self.ptr.as_ptr() as *const T
     }
 }
@@ -256,7 +257,7 @@ unsafe impl<T: Sync> Send for QuiescentGuard<T> {}
 unsafe impl<T: Sync> Sync for QuiescentGuard<T> {}
 
 /// Clone-cheap cross-thread wrapper for one acquired [`QuiescentGuard`].
-pub struct SyncQuiescentGuard<T> {
+pub(crate) struct SyncQuiescentGuard<T> {
     guard: Arc<QuiescentGuard<T>>,
 }
 

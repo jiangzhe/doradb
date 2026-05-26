@@ -27,11 +27,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::thread::JoinHandle;
 
-pub use crate::catalog::{
-    CatalogCheckpointBatch, CatalogCheckpointBlockingDDL, CatalogCheckpointScanStopReason,
-    CatalogRedoEntry,
-};
-pub const GC_BUCKETS: usize = 64;
+pub(crate) const GC_BUCKETS: usize = 64;
 
 /// TransactionSystem controls lifecycle of all transactions.
 ///
@@ -53,7 +49,7 @@ pub const GC_BUCKETS: usize = 64;
 /// and move it to committed list. This can improve performance because it does not wait
 /// log writer to fsync. But final-commit step must wait for additional transaction dependencies,
 /// to ensure any previous dependent transaction's log are already persisted.
-/// Currently, we do NOT apply this optimization.  
+/// Currently, we do NOT apply this optimization.
 ///
 /// 3. Transaction group-commit:
 ///
@@ -68,7 +64,7 @@ pub const GC_BUCKETS: usize = 64;
 /// group ordering without publishing a recovery-visible timestamp carrier.
 /// As undo logs are maintained purely in memory, we can use shared pointer with atomic variable
 /// to perform very fast CTS backfill.
-pub struct TransactionSystem {
+pub(crate) struct TransactionSystem {
     /// A sequence to generate snapshot timestamp(abbr. sts) and commit timestamp(abbr. cts).
     /// They share the same sequence and start from 1.
     /// The two timestamps are used to identify which version of data a transaction should see.
@@ -228,7 +224,7 @@ impl TransactionSystem {
 
     /// Create a new transaction.
     #[inline]
-    pub fn begin_trx(&self, session_state: Arc<SessionState>) -> ActiveTrx {
+    pub(crate) fn begin_trx(&self, session_state: Arc<SessionState>) -> ActiveTrx {
         // Assign log partition index so current transaction will stick
         // to certain log partition for commit.
         let log_no = self.next_log_no();
@@ -265,7 +261,7 @@ impl TransactionSystem {
     }
 
     #[inline]
-    pub fn begin_sys_trx(&self) -> SysTrx {
+    pub(crate) fn begin_sys_trx(&self) -> SysTrx {
         SysTrx {
             redo: RedoLogs::default(),
         }
@@ -278,7 +274,7 @@ impl TransactionSystem {
     /// leader to persist log and backfill CTS.
     /// This strategy can largely reduce logging IO, therefore improve throughput.
     #[inline]
-    pub async fn commit(&self, trx: ActiveTrx) -> Result<TrxID> {
+    pub(crate) async fn commit(&self, trx: ActiveTrx) -> Result<TrxID> {
         if let Err(err) = self.ensure_runtime_healthy() {
             self.rollback(trx).await?;
             return Err(err.into());
@@ -300,7 +296,7 @@ impl TransactionSystem {
     }
 
     #[inline]
-    pub fn commit_sys(&self, trx: SysTrx) -> Result<TrxID> {
+    pub(crate) fn commit_sys(&self, trx: SysTrx) -> Result<TrxID> {
         self.ensure_runtime_healthy()?;
         if trx.redo.is_empty() {
             // System transaction does not hold any active start timestamp
@@ -320,7 +316,7 @@ impl TransactionSystem {
 
     /// Rollback active transaction.
     #[inline]
-    pub async fn rollback(&self, mut trx: ActiveTrx) -> Result<()> {
+    pub(crate) async fn rollback(&self, mut trx: ActiveTrx) -> Result<()> {
         let sts = trx.sts();
         let log_no = trx.log_no();
         let gc_no = trx.gc_no();
@@ -379,7 +375,8 @@ impl TransactionSystem {
 
     /// Returns statistics of group commit.
     #[inline]
-    pub fn trx_sys_stats(&self) -> TrxSysStats {
+    #[cfg_attr(not(test), expect(dead_code, reason = "internal trx sys stats"))]
+    pub(crate) fn trx_sys_stats(&self) -> TrxSysStats {
         let mut stats = TrxSysStats::default();
         for partition in &*self.log_partitions {
             stats.trx_count += partition.stats.trx_count.load(Ordering::Relaxed);
@@ -399,13 +396,13 @@ impl TransactionSystem {
 
     /// Returns global visible snapshot timestamp.
     #[inline]
-    pub fn global_visible_sts(&self) -> TrxID {
+    pub(crate) fn global_visible_sts(&self) -> TrxID {
         self.global_visible_sts.load(Ordering::Relaxed)
     }
 
     /// Update global visible snapshot timestamp.
     #[inline]
-    pub fn update_global_visible_sts(&self, sts: TrxID) {
+    pub(crate) fn update_global_visible_sts(&self, sts: TrxID) {
         debug_assert!({
             let curr_sts = self.global_visible_sts.load(Ordering::Relaxed);
             sts >= curr_sts
@@ -453,7 +450,8 @@ impl TransactionSystem {
     }
 
     #[inline]
-    pub fn log_reader(&self, log_file_path: impl AsRef<Path>) -> Result<MmapLogReader> {
+    #[cfg_attr(not(test), expect(dead_code, reason = "reserved log_reader"))]
+    pub(crate) fn log_reader(&self, log_file_path: impl AsRef<Path>) -> Result<MmapLogReader> {
         MmapLogReader::new(
             log_file_path,
             self.config.max_io_size.as_u64() as usize,
@@ -469,7 +467,7 @@ impl TransactionSystem {
     /// seeds future timestamps only from checkpoint metadata, table roots, and
     /// real redo headers.
     #[inline]
-    pub fn persisted_watermark_cts(&self) -> TrxID {
+    pub(crate) fn persisted_watermark_cts(&self) -> TrxID {
         self.log_partitions
             .iter()
             .map(|partition| partition.persisted_cts.load(Ordering::Acquire))
@@ -490,23 +488,23 @@ impl TransactionSystem {
 }
 
 #[derive(Default)]
-pub struct TrxSysStats {
-    pub commit_count: usize,
-    pub trx_count: usize,
-    pub log_bytes: usize,
-    pub sync_count: usize,
-    pub sync_nanos: usize,
+pub(crate) struct TrxSysStats {
+    pub(crate) commit_count: usize,
+    pub(crate) trx_count: usize,
+    pub(crate) log_bytes: usize,
+    pub(crate) sync_count: usize,
+    pub(crate) sync_nanos: usize,
     /// Number of backend submit-or-wait calls observed across redo workers.
     ///
     /// On `libaio`, one logical IO commonly contributes separate submit and
     /// wait syscalls, so this count can be roughly doubled compared with
     /// `io_uring` for serialized workloads.
-    pub io_submit_and_wait_count: usize,
+    pub(crate) io_submit_and_wait_count: usize,
     /// Total non-overlapping nanoseconds spent in backend submit-or-wait calls.
-    pub io_submit_and_wait_nanos: usize,
-    pub purge_trx_count: usize,
-    pub purge_row_count: usize,
-    pub purge_index_count: usize,
+    pub(crate) io_submit_and_wait_nanos: usize,
+    pub(crate) purge_trx_count: usize,
+    pub(crate) purge_row_count: usize,
+    pub(crate) purge_index_count: usize,
 }
 
 impl Component for TransactionSystem {
@@ -655,16 +653,16 @@ mod tests {
                 .build()
                 .await
                 .unwrap();
-            let mut session = engine.try_new_session().unwrap();
+            let mut session = engine.new_session().unwrap();
             {
-                let trx = session.try_begin_trx().unwrap().unwrap();
+                let trx = session.begin_trx().unwrap();
                 let _ = smol::block_on(trx.commit());
             }
             {
                 let engine = engine.new_ref().unwrap();
                 std::thread::spawn(move || {
-                    let mut session = engine.try_new_session().unwrap();
-                    let trx = session.try_begin_trx().unwrap().unwrap();
+                    let mut session = engine.new_session().unwrap();
+                    let trx = session.begin_trx().unwrap();
                     let _ = smol::block_on(trx.commit());
                 })
                 .join()
@@ -841,10 +839,10 @@ mod tests {
             let table_id = table2(&engine).await;
             let table = engine.catalog().get_table(table_id).await.unwrap();
 
-            let mut session = engine.try_new_session().unwrap();
+            let mut session = engine.new_session().unwrap();
             let s = [1u8; 196];
             for i in 0..COUNT {
-                let mut trx = session.try_begin_trx().unwrap().unwrap();
+                let mut trx = session.begin_trx().unwrap();
                 trx.exec(async |stmt| {
                     let insert = vec![Val::from(i as i32), Val::from(&s[..])];
                     stmt.table_insert_mvcc(&table, insert).await?;

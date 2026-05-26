@@ -28,7 +28,7 @@ use std::sync::Arc;
 /// Result of attempting to insert a secondary-index entry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
-pub enum IndexInsert {
+pub(crate) enum IndexInsert {
     /// Insert succeeded. `true` means a delete-marked entry was merged.
     Ok(bool),
     /// Insert found an existing owner, carrying row id and delete flag.
@@ -38,21 +38,15 @@ pub enum IndexInsert {
 impl IndexInsert {
     /// Returns whether the insert attempt succeeded.
     #[inline]
-    pub fn is_ok(&self) -> bool {
+    pub(crate) fn is_ok(&self) -> bool {
         matches!(self, IndexInsert::Ok(_))
-    }
-
-    /// Returns whether the insert succeeded by merging a delete-marked entry.
-    #[inline]
-    pub fn is_merged(&self) -> bool {
-        matches!(self, IndexInsert::Ok(true))
     }
 }
 
 /// Result of a secondary-index compare-exchange operation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
-pub enum IndexCompareExchange {
+pub(crate) enum IndexCompareExchange {
     /// The expected owner matched and the value was updated.
     Ok,
     /// The key existed but did not carry the expected owner.
@@ -64,7 +58,7 @@ pub enum IndexCompareExchange {
 impl IndexCompareExchange {
     /// Returns whether the compare-exchange updated the entry.
     #[inline]
-    pub fn is_ok(self) -> bool {
+    pub(crate) fn is_ok(self) -> bool {
         matches!(self, IndexCompareExchange::Ok)
     }
 }
@@ -771,17 +765,20 @@ mod tests {
     use crate::value::{ValKind, ValType};
 
     fn metadata_with_indexes() -> Arc<TableMetadata> {
-        Arc::new(TableMetadata::new(
-            vec![ColumnSpec::new(
-                "c0",
-                ValKind::U32,
-                ColumnAttributes::empty(),
-            )],
-            vec![
-                IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::UK),
-                IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::empty()),
-            ],
-        ))
+        Arc::new(
+            TableMetadata::try_new(
+                vec![ColumnSpec::new(
+                    "c0",
+                    ValKind::U32,
+                    ColumnAttributes::empty(),
+                )],
+                vec![
+                    IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::UK),
+                    IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::empty()),
+                ],
+            )
+            .expect("valid table metadata"),
+        )
     }
 
     async fn unique_mem_index(

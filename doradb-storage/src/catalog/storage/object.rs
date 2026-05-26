@@ -4,37 +4,37 @@ use semistr::SemiStr;
 
 /// One row object in `catalog.tables`.
 #[derive(Debug)]
-pub struct TableObject {
-    pub table_id: TableID,
-    pub next_index_no: u16,
+pub(crate) struct TableObject {
+    pub(crate) table_id: TableID,
+    pub(crate) next_index_no: u16,
 }
 
 /// One row object in `catalog.columns`.
 #[derive(Debug)]
-pub struct ColumnObject {
-    pub table_id: TableID,
-    pub column_no: u16,
-    pub column_name: SemiStr,
-    pub column_type: ValKind,
-    pub column_attributes: ColumnAttributes,
+pub(crate) struct ColumnObject {
+    pub(crate) table_id: TableID,
+    pub(crate) column_no: u16,
+    pub(crate) column_name: SemiStr,
+    pub(crate) column_type: ValKind,
+    pub(crate) column_attributes: ColumnAttributes,
 }
 
 /// One row object in `catalog.indexes`.
 #[derive(Debug)]
-pub struct IndexObject {
-    pub table_id: TableID,
-    pub index_no: u16,
-    pub index_attributes: IndexAttributes,
+pub(crate) struct IndexObject {
+    pub(crate) table_id: TableID,
+    pub(crate) index_no: u16,
+    pub(crate) index_attributes: IndexAttributes,
 }
 
 /// One row object in `catalog.index_columns`.
 #[derive(Debug)]
-pub struct IndexColumnObject {
-    pub table_id: TableID,
-    pub index_no: u16,
+pub(crate) struct IndexColumnObject {
+    pub(crate) table_id: TableID,
+    pub(crate) index_no: u16,
     // column position in index.
-    pub index_column_no: u16,
+    pub(crate) index_column_no: u16,
     // column position in table.
-    pub column_no: u16,
-    pub index_order: IndexOrder,
+    pub(crate) column_no: u16,
+    pub(crate) index_order: IndexOrder,
 }

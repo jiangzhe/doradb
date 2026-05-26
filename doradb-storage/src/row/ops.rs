@@ -48,51 +48,12 @@ impl Deser for SelectKey {
     }
 }
 
-pub enum Select<'a> {
+pub(crate) enum Select<'a> {
+    #[expect(dead_code, reason = "reserved Select::Ok")]
     Ok(Row<'a>),
+    #[expect(dead_code, reason = "reserved Select::RowDeleted")]
     RowDeleted(Row<'a>),
     NotFound,
-}
-
-impl Select<'_> {
-    /// Returns if select succeeds.
-    #[inline]
-    pub fn is_ok(&self) -> bool {
-        matches!(self, Select::Ok(_))
-    }
-}
-
-pub trait SelectResult {
-    const NOT_FOUND: Self;
-}
-
-pub enum SelectUncommitted {
-    Ok(Vec<Val>),
-    NotFound,
-}
-
-impl SelectUncommitted {
-    #[inline]
-    pub fn is_ok(&self) -> bool {
-        matches!(self, SelectUncommitted::Ok(_))
-    }
-
-    #[inline]
-    pub fn not_found(&self) -> bool {
-        matches!(self, SelectUncommitted::NotFound)
-    }
-
-    #[inline]
-    pub fn unwrap(self) -> Vec<Val> {
-        match self {
-            SelectUncommitted::Ok(vals) => vals,
-            SelectUncommitted::NotFound => panic!("empty select result"),
-        }
-    }
-}
-
-impl SelectResult for SelectUncommitted {
-    const NOT_FOUND: SelectUncommitted = SelectUncommitted::NotFound;
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -121,10 +82,6 @@ impl SelectMvcc {
     }
 }
 
-impl SelectResult for SelectMvcc {
-    const NOT_FOUND: SelectMvcc = SelectMvcc::NotFound;
-}
-
 #[derive(Debug, PartialEq, Eq)]
 pub enum ScanMvcc {
     Rows(Vec<Vec<Val>>),
@@ -144,18 +101,14 @@ impl ScanMvcc {
     }
 }
 
-pub enum ReadRow {
+pub(crate) enum ReadRow {
     Ok(Vec<Val>),
     NotFound,
     InvalidIndex,
 }
 
-pub enum ReadKey {
-    Ok(SelectKey),
-    Deleted,
-}
-
-pub enum InsertRow {
+#[cfg_attr(not(test), expect(dead_code, reason = "reserved InsertRow"))]
+pub(crate) enum InsertRow {
     Ok(RowID),
     NoFreeSpaceOrRowID,
 }
@@ -163,34 +116,38 @@ pub enum InsertRow {
 impl InsertRow {
     /// Returns if insert succeeds.
     #[inline]
-    pub fn is_ok(&self) -> bool {
+    #[cfg_attr(not(test), expect(dead_code, reason = "reserved is_ok"))]
+    pub(crate) fn is_ok(&self) -> bool {
         matches!(self, InsertRow::Ok(_))
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum LinkForUniqueIndex {
+pub(crate) enum LinkForUniqueIndex {
     Linked,
     NotNeeded,
     WriteConflict,
     DuplicateKey,
 }
 
-pub enum Update {
+pub(crate) enum Update {
     // RowID may change if the update is out-of-place.
+    #[expect(dead_code, reason = "reserved Update::Ok")]
     Ok(RowID),
     NotFound,
     Deleted,
     // if space is not enough, we perform a logical deletion+insert to
     // achieve the update sematics. The returned values are user columns
     // of original row.
+    #[expect(dead_code, reason = "reserved Update::NoFreeSpace")]
     NoFreeSpace(Vec<Val>),
 }
 
 impl Update {
     /// Returns if update succeeds.
     #[inline]
-    pub fn is_ok(&self) -> bool {
+    #[cfg_attr(not(test), expect(dead_code, reason = "reserved is_ok"))]
+    pub(crate) fn is_ok(&self) -> bool {
         matches!(self, Update::Ok(..))
     }
 }
@@ -210,7 +167,7 @@ impl UpdateMvcc {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum UpdateIndex {
+pub(crate) enum UpdateIndex {
     // sometimes we may get back page guard to update next index.
     Updated,
     WriteConflict,
@@ -219,19 +176,19 @@ pub enum UpdateIndex {
 
 impl UpdateIndex {
     #[inline]
-    pub fn is_updated(&self) -> bool {
+    pub(crate) fn is_updated(&self) -> bool {
         matches!(self, UpdateIndex::Updated)
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum InsertIndex {
+pub(crate) enum InsertIndex {
     Inserted,
     WriteConflict,
     DuplicateKey,
 }
 
-pub trait UndoVal {
+pub(crate) trait UndoVal {
     /// Returns column index.
     fn idx(&self) -> usize;
 
@@ -308,12 +265,12 @@ impl UndoVal for UndoCol {
     }
 }
 
-pub enum UpdateRow<'a> {
+pub(crate) enum UpdateRow<'a> {
     Ok(RowMut<'a>),
     NoFreeSpaceOrFrozen(Vec<(Val, Option<u16>)>),
 }
 
-pub enum Delete {
+pub(crate) enum Delete {
     Ok,
     NotFound,
     AlreadyDeleted,

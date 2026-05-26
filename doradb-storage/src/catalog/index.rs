@@ -112,11 +112,7 @@ pub(crate) async fn create_index_for_session(
 
     // 4. Start the implicit DDL transaction and let the builder own all
     // rollback/destroy transitions from this point onward.
-    let trx = match session.try_begin_trx() {
-        Ok(Some(trx)) => trx,
-        Ok(None) => unreachable!("create_index requires idle session"),
-        Err(err) => return Err(err),
-    };
+    let trx = session.begin_trx()?;
     let mut builder =
         CreateIndexBuilder::new(&engine, session.pool_guards(), table_id, index_no, trx);
     let build_ts = builder.build_ts();
@@ -326,11 +322,7 @@ pub(crate) async fn drop_index_for_session(
         index_no_usize,
     )?;
 
-    let trx = match session.try_begin_trx() {
-        Ok(Some(trx)) => trx,
-        Ok(None) => unreachable!("drop_index requires idle session"),
-        Err(err) => return Err(err),
-    };
+    let trx = session.begin_trx()?;
     let mut builder = DropIndexBuilder::new(&engine, table_id, index_no, trx);
     builder.stage_layout(new_layout);
     builder.execute_catalog_update(&old_index_spec).await?;
@@ -1768,7 +1760,7 @@ mod tests {
         smol::block_on(async {
             let sys = CreateIndexTestSys::new_lightweight_evictable().await;
             let table_id = sys.table.table_id();
-            let mut session = sys.try_new_session().unwrap();
+            let mut session = sys.new_session().unwrap();
             let row1 = insert_one_row(
                 &sys.table,
                 &mut session,
@@ -1850,7 +1842,7 @@ mod tests {
         smol::block_on(async {
             let sys = CreateIndexTestSys::new_lightweight_evictable().await;
             let table_id = sys.table.table_id();
-            let mut session = sys.try_new_session().unwrap();
+            let mut session = sys.new_session().unwrap();
             insert_rows(&sys, &mut session, 10, 8, "cold").await;
             sys.table.freeze(&session, usize::MAX).await.unwrap();
             checkpoint_published(&sys.table, &mut session).await;
@@ -1884,10 +1876,10 @@ mod tests {
             let retained_root_ptr = sys.table.file().active_root_unchecked() as *const _ as usize;
             let drop_count_before = old_root_drop_count(retained_root_ptr);
 
-            let mut read_session = sys.try_new_session().unwrap();
-            let read_trx = read_session.try_begin_trx().unwrap().unwrap();
+            let mut read_session = sys.new_session().unwrap();
+            let read_trx = read_session.begin_trx().unwrap();
 
-            let mut session = sys.try_new_session().unwrap();
+            let mut session = sys.new_session().unwrap();
             session
                 .create_index(
                     table_id,
@@ -1923,7 +1915,7 @@ mod tests {
         smol::block_on(async {
             let sys = CreateIndexTestSys::new_lightweight_evictable().await;
             let table_id = sys.table.table_id();
-            let mut session = sys.try_new_session().unwrap();
+            let mut session = sys.new_session().unwrap();
             insert_one_row(
                 &sys.table,
                 &mut session,
@@ -1960,7 +1952,7 @@ mod tests {
         smol::block_on(async {
             let sys = CreateIndexTestSys::new_lightweight_evictable().await;
             let table_id = sys.table.table_id();
-            let mut session = sys.try_new_session().unwrap();
+            let mut session = sys.new_session().unwrap();
             let row1 = insert_one_row(
                 &sys.table,
                 &mut session,
@@ -1999,8 +1991,8 @@ mod tests {
         smol::block_on(async {
             let sys = CreateIndexTestSys::new_lightweight_evictable().await;
             let table_id = sys.table.table_id();
-            let mut session = sys.try_new_session().unwrap();
-            let trx = session.try_begin_trx().unwrap().unwrap();
+            let mut session = sys.new_session().unwrap();
+            let trx = session.begin_trx().unwrap();
 
             let err = session
                 .create_index(
@@ -2028,7 +2020,7 @@ mod tests {
                 .unwrap();
             let table_id = table2(&engine).await;
             let table = engine.catalog().get_table(table_id).await.unwrap();
-            let mut session = engine.try_new_session().unwrap();
+            let mut session = engine.new_session().unwrap();
             let row_id = insert_one_row(
                 &table,
                 &mut session,
@@ -2058,7 +2050,7 @@ mod tests {
             let table = engine.catalog().get_table(table_id).await.unwrap();
             assert_eq!(table.metadata().idx.next_index_no(), 2);
             assert!(table.metadata().idx.index_spec(1).is_some());
-            let session = engine.try_new_session().unwrap();
+            let session = engine.new_session().unwrap();
             assert_eq!(
                 non_unique_disk_tree_prefix_scan(
                     &table,
@@ -2085,7 +2077,7 @@ mod tests {
                 .unwrap();
             let table_id = table2(&engine).await;
             let table = engine.catalog().get_table(table_id).await.unwrap();
-            let mut session = engine.try_new_session().unwrap();
+            let mut session = engine.new_session().unwrap();
 
             assert_eq!(
                 session
@@ -2136,7 +2128,7 @@ mod tests {
                 SUPER_BLOCK_ID
             );
 
-            let mut session = engine.try_new_session().unwrap();
+            let mut session = engine.new_session().unwrap();
             assert_eq!(
                 session
                     .create_index(
@@ -2155,7 +2147,7 @@ mod tests {
         smol::block_on(async {
             let sys = CreateIndexTestSys::new_lightweight_evictable().await;
             let table_id = sys.table.table_id();
-            let mut session = sys.try_new_session().unwrap();
+            let mut session = sys.new_session().unwrap();
             insert_one_row(
                 &sys.table,
                 &mut session,
@@ -2196,9 +2188,9 @@ mod tests {
         smol::block_on(async {
             let sys = CreateIndexTestSys::new_lightweight_evictable().await;
             let table_id = sys.table.table_id();
-            let mut session = sys.try_new_session().unwrap();
+            let mut session = sys.new_session().unwrap();
 
-            let trx = session.try_begin_trx().unwrap().unwrap();
+            let trx = session.begin_trx().unwrap();
             let err = session.drop_index(table_id, 0).await.unwrap_err();
             assert_eq!(err.operation_error(), Some(OperationError::NotSupported));
             trx.rollback().await.unwrap();
@@ -2225,7 +2217,7 @@ mod tests {
         smol::block_on(async {
             let sys = CreateIndexTestSys::new_lightweight_evictable().await;
             let table_id = sys.table.table_id();
-            let mut session = sys.try_new_session().unwrap();
+            let mut session = sys.new_session().unwrap();
             assert_eq!(
                 session
                     .create_index(
@@ -2294,12 +2286,12 @@ mod tests {
             }
         }
 
-        fn try_new_session(&self) -> Result<Session> {
-            self.engine.try_new_session()
+        fn new_session(&self) -> Result<Session> {
+            self.engine.new_session()
         }
 
         async fn new_trx_delete(&self, session: &mut Session, key: &SelectKey) {
-            let mut trx = session.try_begin_trx().unwrap().unwrap();
+            let mut trx = session.begin_trx().unwrap();
             let delete = trx
                 .exec(async |stmt| stmt.table_delete_unique_mvcc(&self.table, key, false).await)
                 .await;
@@ -2345,7 +2337,7 @@ mod tests {
     }
 
     async fn insert_one_row(table: &Table, session: &mut Session, values: Vec<Val>) -> RowID {
-        let mut trx = session.try_begin_trx().unwrap().unwrap();
+        let mut trx = session.begin_trx().unwrap();
         let insert = trx_insert_row(&mut trx, table, values).await;
         let Ok(row_id) = insert else {
             panic!("insert should succeed: {insert:?}");
@@ -2361,7 +2353,7 @@ mod tests {
         count: i32,
         name: &str,
     ) {
-        let mut trx = session.try_begin_trx().unwrap().unwrap();
+        let mut trx = session.begin_trx().unwrap();
         for i in 0..count {
             let insert = vec![Val::from(start + i), Val::from(name)];
             let res = trx_insert_row(&mut trx, &sys.table, insert).await;

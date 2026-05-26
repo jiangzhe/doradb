@@ -11,7 +11,7 @@ const WRITER_BIT: usize = 1;
 const ONE_READER: usize = 2;
 
 /// A simple RWLock with additional async methods.
-pub struct RawRwLock {
+pub(super) struct RawRwLock {
     /// Acquired by the writer
     mu: RawMutex,
     /// Event triggered when last reader is dropped.
@@ -31,7 +31,7 @@ pub struct RawRwLock {
 impl RawRwLock {
     /// Create a new RawRWLock.
     #[inline]
-    pub const fn new() -> Self {
+    pub(super) const fn new() -> Self {
         RawRwLock {
             mu: RawMutex::INIT,
             no_readers: Event::new(),
@@ -61,7 +61,7 @@ impl RawRwLock {
 
     /// Get a read latch in async way.
     #[inline]
-    pub async fn lock_shared_async(&self) {
+    pub(super) async fn lock_shared_async(&self) {
         if self.try_lock_shared() {
             return;
         }
@@ -78,7 +78,7 @@ impl RawRwLock {
 
     /// Get a write latch in async way.
     #[inline]
-    pub async fn lock_exclusive_async(&self) {
+    pub(super) async fn lock_exclusive_async(&self) {
         if self.mu.try_lock() {
             let new_state = self.state.fetch_or(WRITER_BIT, Ordering::SeqCst);
             if new_state & !WRITER_BIT == 0 {
@@ -151,7 +151,6 @@ impl Drop for WriteGuardRollback<'_> {
 // SAFETY: `RawRwLock` maintains the `parking_lot` raw-mutex contract and its
 // reader/writer state transitions with atomics plus event ordering.
 unsafe impl RawRwLockApi for RawRwLock {
-    #[allow(clippy::declare_interior_mutable_const)]
     const INIT: RawRwLock = RawRwLock::new();
 
     type GuardMarker = GuardSend;

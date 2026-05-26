@@ -145,6 +145,8 @@ pub(crate) enum OperationError {
     TableAlreadyExists,
     #[error("index not found")]
     IndexNotFound,
+    #[error("existing transaction")]
+    ExistingTransaction,
     #[error("not supported")]
     NotSupported,
     #[error("duplicate key")]
@@ -231,8 +233,6 @@ pub(crate) enum InternalError {
     IndexKeyMissing,
     #[error("lwc builder misuse")]
     LwcBuilderMisuse,
-    #[error("latch guard state mismatch")]
-    LatchGuardStateMismatch,
     #[error("mem index key malformed")]
     MemIndexKeyMalformed,
     #[error("column deletion blob writer state mismatch")]

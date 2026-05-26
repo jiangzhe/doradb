@@ -1,4 +1,4 @@
-use super::{GenericMemTable, Table, TableRuntimeLayout};
+use super::{MemTable, Table, TableRuntimeLayout};
 use crate::buffer::{BufferPool, EvictableBufferPool, FixedBufferPool, PoolGuard, PoolGuards};
 use crate::catalog::CatalogTable;
 use crate::error::{Error, InternalError, Result};
@@ -31,7 +31,7 @@ pub(crate) trait IndexRollback {
     type IndexPool: BufferPool + 'static;
 
     /// Returns the shared MemTable metadata and index-pool binding.
-    fn mem_table(&self) -> &GenericMemTable<Self::RowPool, Self::IndexPool>;
+    fn mem_table(&self) -> &MemTable<Self::RowPool, Self::IndexPool>;
 
     /// Marks an existing unique entry as deleted.
     async fn unique_mask_as_deleted(
@@ -218,7 +218,7 @@ impl IndexRollback for UserTableRollback<'_> {
     type IndexPool = EvictableBufferPool;
 
     #[inline]
-    fn mem_table(&self) -> &GenericMemTable<Self::RowPool, Self::IndexPool> {
+    fn mem_table(&self) -> &MemTable<Self::RowPool, Self::IndexPool> {
         &self.table.mem
     }
 
@@ -321,7 +321,7 @@ impl IndexRollback for CatalogTable {
     type IndexPool = FixedBufferPool;
 
     #[inline]
-    fn mem_table(&self) -> &GenericMemTable<Self::RowPool, Self::IndexPool> {
+    fn mem_table(&self) -> &MemTable<Self::RowPool, Self::IndexPool> {
         &self.mem
     }
 

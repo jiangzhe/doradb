@@ -14,20 +14,20 @@ use parking_lot::Mutex;
 use std::collections::BTreeMap;
 
 /// One catalog-row redo operation extracted from persisted logs.
-pub struct CatalogRedoEntry {
-    pub table_id: TableID,
-    pub kind: RowRedoKind,
+pub(crate) struct CatalogRedoEntry {
+    pub(crate) table_id: TableID,
+    pub(crate) kind: RowRedoKind,
 }
 
 /// Table DDL kinds that can block catalog checkpoint scan on ordering safety.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CatalogCheckpointBlockingDDL {
+pub(crate) enum CatalogCheckpointBlockingDDL {
     DropTable,
 }
 
 /// Stop reason for one catalog checkpoint scan batch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CatalogCheckpointScanStopReason {
+pub(crate) enum CatalogCheckpointScanStopReason {
     ReachedDurableUpper,
     BlockedByTableDDL {
         table_id: TableID,
@@ -36,13 +36,15 @@ pub enum CatalogCheckpointScanStopReason {
 }
 
 /// Catalog checkpoint scan result consumed by apply phase.
-pub struct CatalogCheckpointBatch {
-    pub replay_start_ts: TrxID,
-    pub durable_upper_cts: TrxID,
-    pub safe_cts: TrxID,
-    pub catalog_ops: Vec<CatalogRedoEntry>,
-    pub catalog_ddl_txn_count: usize,
-    pub stop_reason: CatalogCheckpointScanStopReason,
+pub(crate) struct CatalogCheckpointBatch {
+    pub(crate) replay_start_ts: TrxID,
+    #[cfg_attr(not(test), expect(dead_code, reason = "pending dead-code audit"))]
+    #[cfg_attr(test, expect(dead_code, reason = "pending dead-code audit"))]
+    pub(crate) durable_upper_cts: TrxID,
+    pub(crate) safe_cts: TrxID,
+    pub(crate) catalog_ops: Vec<CatalogRedoEntry>,
+    pub(crate) catalog_ddl_txn_count: usize,
+    pub(crate) stop_reason: CatalogCheckpointScanStopReason,
 }
 
 #[derive(Clone)]
@@ -256,7 +258,11 @@ impl Catalog {
     /// [`crate::file::cow_file::CowFile`] enforces a single mutable writer via
     /// an atomic claim and will panic on violation.
     #[inline]
-    pub async fn checkpoint_now(&self, trx_sys: &TransactionSystem) -> Result<()> {
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "missing catalog checkpoint invocation")
+    )]
+    pub(crate) async fn checkpoint_now(&self, trx_sys: &TransactionSystem) -> Result<()> {
         let _checkpoint_lease = self.checkpoint_gate.begin_checkpoint().await;
         let batch = self.scan_checkpoint_batch(trx_sys)?;
         match self.apply_checkpoint_batch(batch).await {
@@ -279,7 +285,7 @@ impl Catalog {
     /// Scanned batches are intended for single-flight publish flow and must not
     /// be raced with other catalog checkpoint publishes against the same shared
     /// `CatalogStorage`/`MultiTableFile` writer.
-    pub fn scan_checkpoint_batch(
+    pub(crate) fn scan_checkpoint_batch(
         &self,
         trx_sys: &TransactionSystem,
     ) -> Result<CatalogCheckpointBatch> {

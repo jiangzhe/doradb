@@ -44,6 +44,12 @@ impl Session {
         &self.state.engine_ref
     }
 
+    /// Get a user-table runtime handle through this session's engine.
+    #[inline]
+    pub async fn get_table(&self, table_id: TableID) -> Result<Arc<Table>> {
+        self.state.engine_ref.get_table(table_id).await
+    }
+
     /// Returns the reusable pool guards owned by this session.
     #[inline]
     pub fn pool_guards(&self) -> &PoolGuards {
@@ -79,18 +85,19 @@ impl Session {
 
     /// Begin a new transaction if the session is currently idle.
     #[inline]
-    pub fn try_begin_trx(&mut self) -> Result<Option<ActiveTrx>> {
+    pub fn begin_trx(&mut self) -> Result<ActiveTrx> {
         self.state.engine_ref.with_running_admission(|| {
             if !self.state.try_enter_trx() {
-                return None;
+                return Err(Report::new(OperationError::ExistingTransaction)
+                    .attach(format!("session_id={}", self.id()))
+                    .into());
             }
-            Some(
-                self.state
-                    .engine_ref
-                    .trx_sys
-                    .begin_trx(Arc::clone(&self.state)),
-            )
-        })
+            Ok(self
+                .state
+                .engine_ref
+                .trx_sys
+                .begin_trx(Arc::clone(&self.state)))
+        })?
     }
 
     /// Create a new table.
@@ -117,10 +124,10 @@ impl Session {
         //    User table file name is <table-id:016x>.tbl
         let table_id = engine.catalog().next_user_obj_id();
 
-        let metadata = Arc::new(TableMetadata::new(
+        let metadata = Arc::new(TableMetadata::try_new(
             table_spec.columns.clone(),
             index_specs.clone(),
-        ));
+        )?);
         let uninit_table_file =
             engine
                 .table_fs
@@ -166,9 +173,8 @@ impl Session {
         }
 
         // 3. begin transaction
-        let mut trx = match self.try_begin_trx() {
-            Ok(Some(trx)) => trx,
-            Ok(None) => unreachable!("create_table requires idle session"),
+        let mut trx = match self.begin_trx() {
+            Ok(trx) => trx,
             Err(err) => {
                 uninit_table_file.try_delete();
                 return Err(err);
@@ -331,11 +337,7 @@ impl Session {
         .await?;
         engine.trx_sys.ensure_runtime_healthy()?;
 
-        let mut trx = match self.try_begin_trx() {
-            Ok(Some(trx)) => trx,
-            Ok(None) => unreachable!("drop_table requires idle session"),
-            Err(err) => return Err(err),
-        };
+        let mut trx = self.begin_trx()?;
 
         if let Err(err) = table.begin_drop_lifecycle().await {
             trx.rollback().await?;
@@ -678,16 +680,6 @@ impl SessionState {
     #[inline]
     pub fn pool_guards(&self) -> &PoolGuards {
         &self.pool_guards
-    }
-
-    /// Returns the last committed transaction timestamp observed by this session.
-    #[inline]
-    pub fn last_cts(&self) -> Option<TrxID> {
-        let trx_id = self.last_cts.load(Ordering::Relaxed);
-        if trx_id == 0 {
-            return None;
-        }
-        Some(trx_id)
     }
 
     #[inline]

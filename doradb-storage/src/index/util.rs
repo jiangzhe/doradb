@@ -5,7 +5,7 @@ use crate::trx::TrxID;
 use crate::trx::sys::TransactionSystem;
 
 /// Value that can be masked as deleted.
-pub trait Maskable: Copy + PartialEq + Eq {
+pub(crate) trait Maskable: Copy + PartialEq + Eq {
     const INVALID_VALUE: Self;
 
     /// Mask given value as deleted.
@@ -41,11 +41,11 @@ impl Maskable for RowID {
 
 /// Statistics of space used by nodes.
 #[derive(Debug, Default)]
-pub struct SpaceStatistics {
-    pub nodes: usize,
-    pub total_space: usize,
-    pub used_space: usize,
-    pub effective_space: usize,
+pub(crate) struct SpaceStatistics {
+    pub(crate) nodes: usize,
+    pub(crate) total_space: usize,
+    pub(crate) used_space: usize,
+    pub(crate) effective_space: usize,
 }
 
 pub(super) struct ParentPosition<G> {
@@ -62,12 +62,15 @@ pub(crate) struct RowPageCreateRedoCtx<'a> {
 
 impl RowPageCreateRedoCtx<'_> {
     #[inline]
-    pub fn new<'a>(trx_sys: &'a TransactionSystem, table_id: TableID) -> RowPageCreateRedoCtx<'a> {
+    pub(crate) fn new<'a>(
+        trx_sys: &'a TransactionSystem,
+        table_id: TableID,
+    ) -> RowPageCreateRedoCtx<'a> {
         RowPageCreateRedoCtx { trx_sys, table_id }
     }
 
     #[inline]
-    pub fn commit_row_page(
+    pub(crate) fn commit_row_page(
         &self,
         page_id: PageID,
         start_row_id: RowID,

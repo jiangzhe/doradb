@@ -1,0 +1,141 @@
+use doradb_storage::{
+    ColumnAttributes, ColumnSpec, DeleteMvcc, EngineConfig, IndexAttributes, IndexKey, IndexSpec,
+    ScanMvcc, SelectKey, SelectMvcc, TableSpec, UpdateCol, UpdateMvcc, Val, ValKind,
+};
+use tempfile::TempDir;
+
+#[test]
+fn public_facade_supports_table_lookup_and_mvcc_dml() {
+    smol::block_on(async {
+        let root = TempDir::new().unwrap();
+        let engine = EngineConfig::default()
+            .storage_root(root.path().to_path_buf())
+            .build()
+            .await
+            .unwrap();
+        let mut session = engine.new_session().unwrap();
+
+        let table_id = session
+            .create_table(
+                TableSpec::new(vec![
+                    ColumnSpec::new("id", ValKind::I32, ColumnAttributes::INDEX),
+                    ColumnSpec::new("name", ValKind::VarByte, ColumnAttributes::INDEX),
+                ]),
+                vec![
+                    IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::PK),
+                    IndexSpec::new(vec![IndexKey::new(1)], IndexAttributes::empty()),
+                ],
+            )
+            .await
+            .unwrap();
+        let table = session.get_table(table_id).await.unwrap();
+
+        let mut trx = session.begin_trx().unwrap();
+        let _inserted = trx
+            .exec(async |stmt| {
+                stmt.table_insert_mvcc(&table, vec![Val::I32(1), Val::from("alice")])
+                    .await
+            })
+            .await
+            .unwrap();
+        trx.commit().await.unwrap();
+
+        let mut trx = session.begin_trx().unwrap();
+        let selected = trx
+            .exec(async |stmt| {
+                stmt.table_lookup_unique_mvcc(
+                    &table,
+                    &SelectKey::new(0, vec![Val::I32(1)]),
+                    &[0, 1],
+                )
+                .await
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            selected,
+            SelectMvcc::Found(vec![Val::I32(1), Val::from("alice")])
+        );
+        trx.commit().await.unwrap();
+
+        let mut trx = session.begin_trx().unwrap();
+        let updated = trx
+            .exec(async |stmt| {
+                stmt.table_update_unique_mvcc(
+                    &table,
+                    &SelectKey::new(0, vec![Val::I32(1)]),
+                    vec![UpdateCol {
+                        idx: 1,
+                        val: Val::from("bob"),
+                    }],
+                )
+                .await
+            })
+            .await
+            .unwrap();
+        assert!(matches!(updated, UpdateMvcc::Updated(_)));
+        trx.commit().await.unwrap();
+
+        let mut trx = session.begin_trx().unwrap();
+        let rows = trx
+            .exec(async |stmt| {
+                let mut rows = Vec::new();
+                stmt.table_scan_mvcc(&table, &[0, 1], |row| {
+                    rows.push(row);
+                    true
+                })
+                .await?;
+                Ok(rows)
+            })
+            .await
+            .unwrap();
+        assert_eq!(rows, vec![vec![Val::I32(1), Val::from("bob")]]);
+
+        let scanned = trx
+            .exec(async |stmt| {
+                stmt.table_index_scan_mvcc(
+                    &table,
+                    &SelectKey::new(1, vec![Val::from("bob")]),
+                    &[0, 1],
+                )
+                .await
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            scanned,
+            ScanMvcc::Rows(vec![vec![Val::I32(1), Val::from("bob")]])
+        );
+        trx.commit().await.unwrap();
+
+        let mut trx = session.begin_trx().unwrap();
+        let deleted = trx
+            .exec(async |stmt| {
+                stmt.table_delete_unique_mvcc(&table, &SelectKey::new(0, vec![Val::I32(1)]), false)
+                    .await
+            })
+            .await
+            .unwrap();
+        assert_eq!(deleted, DeleteMvcc::Deleted);
+        trx.commit().await.unwrap();
+
+        let mut trx = session.begin_trx().unwrap();
+        let selected = trx
+            .exec(async |stmt| {
+                stmt.table_lookup_unique_mvcc(
+                    &table,
+                    &SelectKey::new(0, vec![Val::I32(1)]),
+                    &[0, 1],
+                )
+                .await
+            })
+            .await
+            .unwrap();
+        assert_eq!(selected, SelectMvcc::NotFound);
+        trx.commit().await.unwrap();
+
+        drop(table);
+        drop(session);
+        engine.shutdown().unwrap();
+    });
+}

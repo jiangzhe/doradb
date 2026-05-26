@@ -33,7 +33,7 @@ use std::io::ErrorKind as IoErrorKind;
 use std::num::NonZeroU64;
 use std::sync::Arc;
 
-pub use crate::file::CATALOG_MTB_FILE_ID;
+pub(crate) use crate::file::CATALOG_MTB_FILE_ID;
 
 #[inline]
 fn mutable_root_metadata_regression(message: impl Into<String>) -> Error {
@@ -50,11 +50,11 @@ fn catalog_root_descriptor_invariant(message: impl Into<String>) -> Error {
 }
 
 /// On-disk format version of `catalog.mtb`.
-pub const CATALOG_MTB_VERSION: u64 = 3;
+pub(crate) const CATALOG_MTB_VERSION: u64 = 3;
 /// Reserved number of catalog logical-table root descriptors.
-pub const CATALOG_TABLE_ROOT_DESC_COUNT: usize = 4;
+pub(crate) const CATALOG_TABLE_ROOT_DESC_COUNT: usize = 4;
 /// Initial sparse-file size for `catalog.mtb`.
-pub const MULTI_TABLE_FILE_INITIAL_SIZE: usize = TABLE_FILE_INITIAL_SIZE;
+pub(crate) const MULTI_TABLE_FILE_INITIAL_SIZE: usize = TABLE_FILE_INITIAL_SIZE;
 
 const MULTI_TABLE_FILE_MAGIC_WORD: [u8; 8] = [b'D', b'O', b'R', b'A', b'M', b'T', b'B', 0];
 const MULTI_TABLE_META_BLOCK_SPEC: BlockIntegritySpec =
@@ -62,7 +62,7 @@ const MULTI_TABLE_META_BLOCK_SPEC: BlockIntegritySpec =
 
 /// Root descriptor reserved for one catalog logical table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct CatalogTableRootDesc {
+pub(crate) struct CatalogTableRootDesc {
     /// Catalog table id.
     pub table_id: TableID,
     /// Checkpointed persisted root block id for one catalog logical table.
@@ -78,7 +78,7 @@ pub struct CatalogTableRootDesc {
 impl CatalogTableRootDesc {
     /// Returns the checkpointed persisted root block id, if one exists.
     #[inline]
-    pub fn checkpoint_root_block_id(&self) -> Option<BlockID> {
+    pub(crate) fn checkpoint_root_block_id(&self) -> Option<BlockID> {
         self.root_block_id
             .map(|block_id| BlockID::from(block_id.get()))
     }
@@ -89,17 +89,17 @@ impl CatalogTableRootDesc {
 /// Generic CoW bookkeeping fields (`alloc_map`, `meta_block_id`) are stored on
 /// the shared active root, not in this payload struct.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MultiTableMetaBlock {
+pub(crate) struct MultiTableMetaBlock {
     /// Global next user object-id allocator watermark.
-    pub next_user_obj_id: ObjID,
+    pub(crate) next_user_obj_id: ObjID,
     /// Reserved root descriptors for catalog logical tables.
-    pub table_roots: [CatalogTableRootDesc; CATALOG_TABLE_ROOT_DESC_COUNT],
+    pub(crate) table_roots: [CatalogTableRootDesc; CATALOG_TABLE_ROOT_DESC_COUNT],
 }
 
 impl MultiTableMetaBlock {
     /// Create a meta payload initialized with allocator lower bound.
     #[inline]
-    pub fn new(next_user_obj_id: ObjID) -> Self {
+    pub(crate) fn new(next_user_obj_id: ObjID) -> Self {
         let mut table_roots = [CatalogTableRootDesc::default(); CATALOG_TABLE_ROOT_DESC_COUNT];
         for (idx, root) in table_roots.iter_mut().enumerate() {
             root.table_id = idx as TableID;
@@ -112,12 +112,12 @@ impl MultiTableMetaBlock {
 }
 
 /// Active-root type for `catalog.mtb`.
-pub type MultiTableActiveRoot = GenericActiveRoot<MultiTableMetaBlock>;
+pub(crate) type MultiTableActiveRoot = GenericActiveRoot<MultiTableMetaBlock>;
 
 impl MultiTableActiveRoot {
     /// Create default active root for a newly created `catalog.mtb` file.
     #[inline]
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let max_pages = MULTI_TABLE_FILE_INITIAL_SIZE / COW_FILE_PAGE_SIZE;
         let alloc_map = AllocMap::new(max_pages);
         let allocated = alloc_map.allocate_at(usize::from(SUPER_BLOCK_ID));
@@ -133,7 +133,7 @@ impl MultiTableActiveRoot {
     }
 
     #[inline]
-    pub fn meta_block_ser_view(&self) -> MultiTableMetaBlockSerView<'_> {
+    pub(crate) fn meta_block_ser_view(&self) -> MultiTableMetaBlockSerView<'_> {
         MultiTableMetaBlockSerView::new(&self.meta, &self.alloc_map)
     }
 }
@@ -150,11 +150,11 @@ impl Default for MultiTableActiveRoot {
 /// This is a lightweight clone used by catalog storage layer when publishing
 /// or reading checkpoint metadata.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MultiTableFileSnapshot {
+pub(crate) struct MultiTableFileSnapshot {
     /// Inclusive lower replay bound for catalog redo persisted in `catalog.mtb`.
-    pub catalog_replay_start_ts: TrxID,
+    pub(crate) catalog_replay_start_ts: TrxID,
     /// Active meta-block payload.
-    pub meta: MultiTableMetaBlock,
+    pub(crate) meta: MultiTableMetaBlock,
 }
 
 #[inline]
@@ -256,7 +256,7 @@ fn multi_table_codec() -> CowCodec<MultiTableMetaBlock> {
 /// - page 0 contains two ping-pong super blocks,
 /// - meta blocks are CoW-allocated and super blocks point to active meta block,
 /// - updates are published by writing new meta block then swapping active super block.
-pub struct MultiTableFile {
+pub(crate) struct MultiTableFile {
     file: CowFile<MultiTableMetaBlock>,
 }
 
@@ -306,7 +306,7 @@ impl MultiTableFile {
 
     /// Load the active root after validating the selected `catalog.mtb` meta block.
     #[inline]
-    pub async fn load_active_root_from_pool(
+    pub(crate) async fn load_active_root_from_pool(
         &self,
         disk_pool: &QuiescentGuard<ReadonlyBufferPool>,
     ) -> Result<MultiTableActiveRoot> {
@@ -321,13 +321,13 @@ impl MultiTableFile {
     /// contract. Callers that need multiple catalog-root fields must still bind
     /// one local root reference and reuse it.
     #[inline]
-    pub fn active_root_unchecked(&self) -> &MultiTableActiveRoot {
+    pub(crate) fn active_root_unchecked(&self) -> &MultiTableActiveRoot {
         self.file.active_root_unchecked()
     }
 
     /// Returns active-root snapshot from in-memory pointer without additional IO.
     #[inline]
-    pub fn load_snapshot(&self) -> Result<MultiTableFileSnapshot> {
+    pub(crate) fn load_snapshot(&self) -> Result<MultiTableFileSnapshot> {
         let active_root = self.active_root_unchecked();
         Ok(MultiTableFileSnapshot {
             catalog_replay_start_ts: active_root.trx_id,
@@ -376,7 +376,7 @@ impl MutableWriterFile for MultiTableFile {
 /// Mutable wrapper for publishing one new multi-table checkpoint root.
 ///
 /// This mirrors `MutableTableFile` semantics for catalog file updates.
-pub struct MutableMultiTableFile {
+pub(crate) struct MutableMultiTableFile {
     pub(super) file: Arc<MultiTableFile>,
     pub(super) new_root: MutableCowRoot<MultiTableMetaBlock>,
     background_writes: IOClient<BackgroundWriteRequest>,
@@ -415,39 +415,9 @@ impl MutableMultiTableFile {
         }
     }
 
-    /// Returns immutable reference to mutable root snapshot.
-    #[inline]
-    pub fn root(&self) -> &MultiTableActiveRoot {
-        &self.new_root.root
-    }
-
-    /// Allocate a new block for copy-on-write updates.
-    #[inline]
-    pub fn allocate_block(&mut self) -> Result<BlockID> {
-        allocate_cow_block(
-            &mut self.new_root,
-            "multi-table file could not allocate block",
-        )
-    }
-
-    /// Roll back a block id allocated by this unpublished mutable root.
-    #[inline]
-    pub fn rollback_allocated_block(&mut self, block_id: BlockID) -> Result<()> {
-        self.new_root.rollback_allocated_block(block_id)
-    }
-
-    /// Write one page into the underlying multi-table file.
-    #[inline]
-    pub(crate) async fn write_block(&self, block_id: BlockID, buf: DirectBuf) -> Result<()> {
-        self.file
-            .file()
-            .write_block(&self.background_writes, block_id, buf)
-            .await
-    }
-
     /// Apply checkpoint metadata to mutable root.
     #[inline]
-    pub fn apply_checkpoint_metadata(
+    pub(crate) fn apply_checkpoint_metadata(
         &mut self,
         catalog_replay_start_ts: TrxID,
         next_user_obj_id: ObjID,
@@ -502,26 +472,28 @@ impl MutableMultiTableFile {
 impl MutableCowFile for MutableMultiTableFile {
     #[inline]
     fn allocate_block(&mut self) -> Result<BlockID> {
-        MutableMultiTableFile::allocate_block(self)
+        allocate_cow_block(
+            &mut self.new_root,
+            "multi-table file could not allocate block",
+        )
     }
 
     #[inline]
     fn rollback_allocated_block(&mut self, block_id: BlockID) -> Result<()> {
-        MutableMultiTableFile::rollback_allocated_block(self, block_id)
+        self.new_root.rollback_allocated_block(block_id)
     }
 
     #[inline]
-    fn write_block(
-        &self,
-        block_id: BlockID,
-        buf: DirectBuf,
-    ) -> impl std::future::Future<Output = Result<()>> + Send {
-        MutableMultiTableFile::write_block(self, block_id, buf)
+    async fn write_block(&self, block_id: BlockID, buf: DirectBuf) -> Result<()> {
+        self.file
+            .file()
+            .write_block(&self.background_writes, block_id, buf)
+            .await
     }
 }
 
 /// Guard object for reclaimed replaced roots of `catalog.mtb`.
-pub type OldMultiTableRoot = OldCowRoot<MultiTableMetaBlock>;
+pub(crate) type OldMultiTableRoot = OldCowRoot<MultiTableMetaBlock>;
 
 #[inline]
 fn build_super_block(slot_no: u64, checkpoint_cts: TrxID, meta_block_id: BlockID) -> DirectBuf {

@@ -24,18 +24,19 @@ fn column_scan_shape_mismatch() -> Error {
     Report::new(InternalError::ColumnScanShapeMismatch).into()
 }
 
-pub struct ScanBuffer {
+pub(crate) struct ScanBuffer {
     cols: Vec<ColBuffer>,
     len: usize,
 }
 
-pub struct ScanColumn<'a> {
+pub(crate) struct ScanColumn<'a> {
+    #[expect(dead_code, reason = "reserved col_idx")]
     pub col_idx: usize,
     pub null_bitmap: Option<&'a [u64]>,
     pub values: ScanColumnValues<'a>,
 }
 
-pub enum ScanColumnValues<'a> {
+pub(crate) enum ScanColumnValues<'a> {
     I8(&'a [i8]),
     U8(&'a [u8]),
     I16(&'a [i16]),
@@ -55,7 +56,7 @@ pub enum ScanColumnValues<'a> {
 impl ScanBuffer {
     /// Create a new scan buffer.
     #[inline]
-    pub fn new(col_layout: &TableColumnLayout, scan_set: &[usize]) -> Self {
+    pub(crate) fn new(col_layout: &TableColumnLayout, scan_set: &[usize]) -> Self {
         let cols: Vec<_> = scan_set
             .iter()
             .map(|&col_idx| ColBuffer::new(col_idx, col_layout.col_type(col_idx)))
@@ -65,25 +66,26 @@ impl ScanBuffer {
 
     /// Returns number of rows added to this buffer.
     #[inline]
-    pub fn len(&self) -> usize {
+    pub(crate) fn len(&self) -> usize {
         self.len
     }
 
     /// Returns whether the buffer is empty.
     #[inline]
-    pub fn is_empty(&self) -> bool {
+    pub(crate) fn is_empty(&self) -> bool {
         self.len == 0
     }
 
     /// Returns number of columns stored in this buffer.
     #[inline]
-    pub fn column_count(&self) -> usize {
+    #[expect(dead_code, reason = "reserved column_count")]
+    pub(crate) fn column_count(&self) -> usize {
         self.cols.len()
     }
 
     /// Returns scan column data by position.
     #[inline]
-    pub fn column(&self, idx: usize) -> Option<ScanColumn<'_>> {
+    pub(crate) fn column(&self, idx: usize) -> Option<ScanColumn<'_>> {
         self.cols.get(idx).map(|col| {
             let values = match &col.vals {
                 ValBuffer::I8(vals) => ScanColumnValues::I8(vals),
@@ -109,7 +111,7 @@ impl ScanBuffer {
     /// Scan given page and extend all rows into buffer.
     /// Note: If error is returned, the state of this buffer might be invalid.
     #[inline]
-    pub fn scan<'p, 'm>(&mut self, view: PageVectorView<'p, 'm>) -> Result<()> {
+    pub(crate) fn scan<'p, 'm>(&mut self, view: PageVectorView<'p, 'm>) -> Result<()> {
         let new_len = self.len + view.rows_non_deleted();
         for buf in &mut self.cols {
             let (null_bitmap, vals) = view.col(buf.col_idx);
@@ -209,7 +211,8 @@ impl ScanBuffer {
 
     /// Clear the buffer.
     #[inline]
-    pub fn clear(&mut self) {
+    #[cfg_attr(not(test), expect(dead_code, reason = "reserved clear"))]
+    pub(crate) fn clear(&mut self) {
         for col in &mut self.cols {
             col.clear();
         }
@@ -218,7 +221,7 @@ impl ScanBuffer {
 
     /// Truncate the buffer to given length.
     #[inline]
-    pub fn truncate(&mut self, len: usize) {
+    pub(crate) fn truncate(&mut self, len: usize) {
         if len >= self.len {
             return;
         }
@@ -258,7 +261,7 @@ impl ScanBuffer {
     }
 }
 
-pub struct ColBuffer {
+pub(crate) struct ColBuffer {
     col_idx: usize,
     null_bitmap: Option<Vec<u64>>,
     vals: ValBuffer,
@@ -267,7 +270,7 @@ pub struct ColBuffer {
 impl ColBuffer {
     /// Create a new column buffer.
     #[inline]
-    pub fn new(col_idx: usize, ty: ValType) -> Self {
+    pub(crate) fn new(col_idx: usize, ty: ValType) -> Self {
         let null_bitmap = if ty.nullable { Some(vec![]) } else { None };
         let vals = ValBuffer::new(ty.kind);
         ColBuffer {
@@ -279,7 +282,7 @@ impl ColBuffer {
 
     /// Clear current buffer.
     #[inline]
-    pub fn clear(&mut self) {
+    pub(crate) fn clear(&mut self) {
         if let Some(null_bitmap) = self.null_bitmap.as_mut() {
             null_bitmap.clear();
         }
@@ -288,7 +291,7 @@ impl ColBuffer {
 }
 
 /// Vectorized view on row page.
-pub struct PageVectorView<'p, 'm> {
+pub(crate) struct PageVectorView<'p, 'm> {
     page: &'p RowPage,
     col_layout: &'m TableColumnLayout,
     // row count should be freezed when creating this view.
@@ -304,7 +307,7 @@ impl RowPage {
     /// Create a vectorized view on row page in transition state.
     /// This view reflects MVCC visibility at given snapshot timestamp.
     #[inline]
-    pub fn vector_view_in_transition<'p, 'm>(
+    pub(crate) fn vector_view_in_transition<'p, 'm>(
         &'p self,
         col_layout: &'m TableColumnLayout,
         ctx: &FrameContext,
@@ -370,7 +373,7 @@ impl RowPage {
 impl<'p, 'm> PageVectorView<'p, 'm> {
     /// Create a page vector view.
     #[inline]
-    pub fn new(page: &'p RowPage, col_layout: &'m TableColumnLayout) -> Self {
+    pub(crate) fn new(page: &'p RowPage, col_layout: &'m TableColumnLayout) -> Self {
         let row_count = page.header.row_count();
         let del_bitmap = page.del_bitmap(row_count);
         PageVectorView {
@@ -383,7 +386,7 @@ impl<'p, 'm> PageVectorView<'p, 'm> {
 
     /// Count rows not deleted.
     #[inline]
-    pub fn rows_non_deleted(&self) -> usize {
+    pub(crate) fn rows_non_deleted(&self) -> usize {
         self.del_bitmap
             .bitmap_range_iter(self.row_count)
             .map(|(f, n)| if f { 0 } else { n })
@@ -392,19 +395,19 @@ impl<'p, 'm> PageVectorView<'p, 'm> {
 
     /// Returns range of non-deleted rows.
     #[inline]
-    pub fn range_non_deleted(&self) -> BitmapRangeFilter<'_> {
+    pub(crate) fn range_non_deleted(&self) -> BitmapRangeFilter<'_> {
         self.del_bitmap.bitmap_range_filter(self.row_count, false)
     }
 
     /// Returns null bitmap and value data of given column.
     #[inline]
-    pub fn col(&self, col_idx: usize) -> (Option<RowPageNullBitmap<'p>>, ValArrayRef<'p>) {
+    pub(crate) fn col(&self, col_idx: usize) -> (Option<RowPageNullBitmap<'p>>, ValArrayRef<'p>) {
         self.page.vals(self.col_layout, col_idx, self.row_count)
     }
 }
 
 /// Represents the safe typed value array in row page.
-pub enum ValArrayRef<'a> {
+pub(crate) enum ValArrayRef<'a> {
     I8(&'a [i8]),
     U8(&'a [u8]),
     I16(&'a [LeI16]),
@@ -439,7 +442,7 @@ mod tests {
 
     #[test]
     fn test_row_page_vector_scan() {
-        let metadata = TableMetadata::new(
+        let metadata = TableMetadata::try_new(
             vec![
                 ColumnSpec {
                     column_name: SemiStr::new("c1"),
@@ -503,7 +506,8 @@ mod tests {
                 },
             ],
             vec![],
-        );
+        )
+        .expect("valid table metadata");
         let mut page = create_row_page();
         page.init(100, 200, metadata.col.as_ref());
         let short = b"short";
@@ -551,13 +555,14 @@ mod tests {
 
     #[test]
     fn test_page_vector_view_col_borrows_nullable_null_bitmap() {
-        let metadata = TableMetadata::new(
+        let metadata = TableMetadata::try_new(
             vec![
                 ColumnSpec::new("nullable_u64", ValKind::U64, ColumnAttributes::NULLABLE),
                 ColumnSpec::new("plain_u8", ValKind::U8, ColumnAttributes::empty()),
             ],
             vec![],
-        );
+        )
+        .expect("valid table metadata");
         let mut page = create_row_page();
         page.init(0, 8, metadata.col.as_ref());
         assert!(matches!(
@@ -587,14 +592,15 @@ mod tests {
 
     #[test]
     fn test_nullable_vector_scan_null_bitmap_compacts_deleted_rows() {
-        let metadata = TableMetadata::new(
+        let metadata = TableMetadata::try_new(
             vec![ColumnSpec::new(
                 "nullable_u8",
                 ValKind::U8,
                 ColumnAttributes::NULLABLE,
             )],
             vec![],
-        );
+        )
+        .expect("valid table metadata");
         let mut page = create_row_page();
         page.init(0, 8, metadata.col.as_ref());
         for (row_id, value) in [Val::U8(10), Val::Null, Val::U8(12), Val::Null, Val::U8(14)]
@@ -624,7 +630,7 @@ mod tests {
 
     #[test]
     fn test_scan_buffer_truncate_all_types() {
-        let metadata = TableMetadata::new(
+        let metadata = TableMetadata::try_new(
             vec![
                 ColumnSpec {
                     column_name: SemiStr::new("c1"),
@@ -683,7 +689,8 @@ mod tests {
                 },
             ],
             vec![],
-        );
+        )
+        .expect("valid table metadata");
         let mut page = create_row_page();
         page.init(0, 5, metadata.col.as_ref());
         for row_id in 0u64..5 {
@@ -847,14 +854,15 @@ mod tests {
 
     #[test]
     fn test_vector_view_in_transition_revive_deleted_row() {
-        let metadata = TableMetadata::new(
+        let metadata = TableMetadata::try_new(
             vec![ColumnSpec {
                 column_name: SemiStr::new("c1"),
                 column_type: ValKind::I8,
                 column_attributes: ColumnAttributes::empty(),
             }],
             vec![],
-        );
+        )
+        .expect("valid table metadata");
         let mut page = create_row_page();
         page.init(0, 1, metadata.col.as_ref());
         let insert = vec![Val::I8(1)];
@@ -877,7 +885,7 @@ mod tests {
             next: NextRowUndo {
                 main: MainBranch {
                     entry: undo_ref,
-                    status: UndoStatus::CTS(200),
+                    status: UndoStatus::Committed(200),
                 },
                 indexes: vec![],
             },
@@ -893,14 +901,15 @@ mod tests {
 
     #[test]
     fn test_vector_view_in_transition_fast_path() {
-        let metadata = TableMetadata::new(
+        let metadata = TableMetadata::try_new(
             vec![ColumnSpec {
                 column_name: SemiStr::new("c1"),
                 column_type: ValKind::I8,
                 column_attributes: ColumnAttributes::empty(),
             }],
             vec![],
-        );
+        )
+        .expect("valid table metadata");
         let mut page = create_row_page();
         page.init(0, 2, metadata.col.as_ref());
         let insert = vec![Val::I8(1)];
@@ -925,14 +934,15 @@ mod tests {
     #[test]
     #[should_panic(expected = "Uncommitted/Future Insert/Update found in Checkpoint")]
     fn test_vector_view_in_transition_uncommitted_insert_panics() {
-        let metadata = TableMetadata::new(
+        let metadata = TableMetadata::try_new(
             vec![ColumnSpec {
                 column_name: SemiStr::new("c1"),
                 column_type: ValKind::I8,
                 column_attributes: ColumnAttributes::empty(),
             }],
             vec![],
-        );
+        )
+        .expect("valid table metadata");
         let mut page = create_row_page();
         page.init(0, 1, metadata.col.as_ref());
         let insert = vec![Val::I8(1)];
@@ -957,7 +967,7 @@ mod tests {
             next: NextRowUndo {
                 main: MainBranch {
                     entry: undo_ref,
-                    status: UndoStatus::CTS(uncommitted_ts),
+                    status: UndoStatus::Committed(uncommitted_ts),
                 },
                 indexes: vec![],
             },

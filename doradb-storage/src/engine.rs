@@ -11,7 +11,7 @@ use crate::component::{
     ComponentRegistry, DiskPoolConfig, IndexPoolConfig, MetaPoolConfig, RegistryBuilder,
 };
 use crate::conf::EngineConfig;
-use crate::error::{LifecycleError, LifecycleResult, Result};
+use crate::error::{LifecycleError, LifecycleResult, OperationError, Result};
 use crate::file::fs::{FileSystem, FileSystemWorkers};
 use crate::lock::LockManager;
 use crate::quiescent::QuiescentGuard;
@@ -89,15 +89,6 @@ pub struct Engine {
     components: Option<ComponentRegistry>,
 }
 
-impl Deref for Engine {
-    type Target = EngineInner;
-
-    #[inline]
-    fn deref(&self) -> &EngineInner {
-        self.inner().as_ref()
-    }
-}
-
 impl Engine {
     #[inline]
     fn inner(&self) -> &Arc<EngineInner> {
@@ -126,9 +117,9 @@ impl Engine {
         (inner, components)
     }
 
-    /// Try to create a new session while the engine is still running.
+    /// Create a new session while the engine is still running.
     #[inline]
-    pub fn try_new_session(&self) -> Result<Session> {
+    pub fn new_session(&self) -> Result<Session> {
         let inner = self.inner();
         inner.with_running_admission(|| {
             let id = inner.next_session_id();
@@ -138,8 +129,16 @@ impl Engine {
 
     /// Return the shared catalog handle.
     #[inline]
-    pub fn catalog(&self) -> &Catalog {
-        &self.catalog
+    #[cfg_attr(not(test), expect(dead_code, reason = "test-only catalog"))]
+    pub(crate) fn catalog(&self) -> &Catalog {
+        self.inner().catalog()
+    }
+
+    /// Return the shared logical lock manager.
+    #[inline]
+    #[cfg_attr(not(test), expect(dead_code, reason = "test-only lock_manager"))]
+    pub(crate) fn lock_manager(&self) -> &QuiescentGuard<LockManager> {
+        self.inner().lock_manager()
     }
 
     /// Try to clone the shared runtime handle while the engine is still
@@ -204,6 +203,15 @@ impl Engine {
     }
 }
 
+impl Deref for Engine {
+    type Target = EngineInner;
+
+    #[inline]
+    fn deref(&self) -> &EngineInner {
+        self.inner().as_ref()
+    }
+}
+
 impl Drop for Engine {
     #[inline]
     fn drop(&mut self) {
@@ -242,6 +250,7 @@ pub struct EngineRef(Arc<EngineInner>);
 
 impl Deref for EngineRef {
     type Target = EngineInner;
+
     #[inline]
     fn deref(&self) -> &EngineInner {
         &self.0
@@ -249,19 +258,31 @@ impl Deref for EngineRef {
 }
 
 impl EngineRef {
-    /// Try to create a new session while the engine is still running.
+    /// Create a new session while the engine is still running.
     #[inline]
-    pub fn try_new_session(&self) -> Result<Session> {
+    pub fn new_session(&self) -> Result<Session> {
         self.0.with_running_admission(|| {
-            let id = self.next_session_id();
+            let id = self.0.next_session_id();
             Session::new(self.clone(), id)
         })
     }
 
     /// Return the shared catalog handle.
     #[inline]
-    pub fn catalog(&self) -> &Catalog {
-        &self.catalog
+    pub(crate) fn catalog(&self) -> &Catalog {
+        &self.0.catalog
+    }
+
+    /// Get a user-table runtime handle by table id.
+    #[inline]
+    pub async fn get_table(&self, table_id: crate::TableID) -> Result<Arc<crate::Table>> {
+        self.0
+            .with_running_admission(|| self.0.catalog().get_table_now(table_id))?
+            .ok_or_else(|| {
+                error_stack::Report::new(OperationError::TableNotFound)
+                    .attach(format!("get table: table_id={table_id}"))
+                    .into()
+            })
     }
 
     /// Return the shared logical lock manager.
@@ -272,6 +293,7 @@ impl EngineRef {
 
     /// Returns the next engine-local session identity.
     #[inline]
+    #[cfg_attr(not(test), expect(dead_code, reason = "pending dead-code audit"))]
     pub(crate) fn next_session_id(&self) -> SessionID {
         self.0.next_session_id()
     }
@@ -283,19 +305,19 @@ impl EngineRef {
 /// objects may retain. Owner-only teardown state lives on [`Engine`] itself.
 pub struct EngineInner {
     /// Shared catalog handle.
-    pub catalog: QuiescentGuard<Catalog>,
+    pub(crate) catalog: QuiescentGuard<Catalog>,
     /// Shared transaction-system handle.
-    pub trx_sys: QuiescentGuard<TransactionSystem>,
+    pub(crate) trx_sys: QuiescentGuard<TransactionSystem>,
     /// Metadata pool used for block-index and catalog tables.
-    pub meta_pool: MetaPool,
+    pub(crate) meta_pool: MetaPool,
     /// Secondary-index pool.
-    pub index_pool: IndexPool,
+    pub(crate) index_pool: IndexPool,
     /// In-memory row-page pool for table data.
-    pub mem_pool: MemPool,
+    pub(crate) mem_pool: MemPool,
     /// Table-file subsystem that runs persistent page IO.
-    pub table_fs: QuiescentGuard<FileSystem>,
+    pub(crate) table_fs: QuiescentGuard<FileSystem>,
     /// Global readonly pool for persisted table-file reads.
-    pub disk_pool: DiskPool,
+    pub(crate) disk_pool: DiskPool,
     /// Shared logical metadata and table-data lock manager.
     lock_manager: QuiescentGuard<LockManager>,
     /// Monotonically increasing engine-local session identity source.
@@ -304,6 +326,12 @@ pub struct EngineInner {
 }
 
 impl EngineInner {
+    /// Return the shared catalog handle.
+    #[inline]
+    pub(crate) fn catalog(&self) -> &Catalog {
+        &self.catalog
+    }
+
     /// Return the shared logical lock manager.
     #[inline]
     pub(crate) fn lock_manager(&self) -> &QuiescentGuard<LockManager> {
@@ -458,9 +486,9 @@ mod tests {
             let engine = test_engine_config_for(root.path()).build().await.unwrap();
             let engine_ref = engine.new_ref().unwrap();
 
-            let session1 = engine.try_new_session().unwrap();
-            let session2 = engine_ref.try_new_session().unwrap();
-            let session3 = engine.try_new_session().unwrap();
+            let session1 = engine.new_session().unwrap();
+            let session2 = engine_ref.new_session().unwrap();
+            let session3 = engine.new_session().unwrap();
 
             assert_eq!(session1.id(), FIRST_SESSION_ID);
             assert_eq!(session2.id(), session1.id() + 1);
@@ -507,7 +535,7 @@ mod tests {
         smol::block_on(async {
             let root = TempDir::new().unwrap();
             let engine = test_engine_config_for(root.path()).build().await.unwrap();
-            let session = engine.try_new_session().unwrap();
+            let session = engine.new_session().unwrap();
             let resource = LockResource::TableData(91_200);
 
             assert!(
@@ -550,7 +578,7 @@ mod tests {
                 .unwrap()
             );
 
-            let session = engine.try_new_session().unwrap();
+            let session = engine.new_session().unwrap();
             let waiting_owner = LockOwner::Session(session.id());
             let manager = engine.lock_manager().clone();
             let wait_task = smol::spawn(async move {
@@ -867,7 +895,7 @@ mod tests {
             engine.shutdown().unwrap();
             engine.shutdown().unwrap();
 
-            let err = match engine.try_new_session() {
+            let err = match engine.new_session() {
                 Ok(_) => panic!("expected shutdown error"),
                 Err(err) => err,
             };
@@ -888,6 +916,7 @@ mod tests {
         smol::block_on(async {
             let root = TempDir::new().unwrap();
             let engine = test_engine_config_for(root.path()).build().await.unwrap();
+            let table_id = table1(&engine).await;
             let engine_ref = engine.new_ref().unwrap();
 
             let err = match engine.shutdown() {
@@ -898,7 +927,14 @@ mod tests {
             assert_eq!(err.lifecycle_error(), Some(LifecycleError::ShutdownBusy));
             assert_eq!(err.downcast_ref::<usize>().copied(), Some(1));
 
-            let err = match engine_ref.try_new_session() {
+            let err = match engine_ref.new_session() {
+                Ok(_) => panic!("expected shutdown error"),
+                Err(err) => err,
+            };
+            assert_eq!(err.kind(), ErrorKind::Lifecycle);
+            assert_eq!(err.lifecycle_error(), Some(LifecycleError::Shutdown));
+
+            let err = match engine_ref.get_table(table_id).await {
                 Ok(_) => panic!("expected shutdown error"),
                 Err(err) => err,
             };
@@ -922,7 +958,7 @@ mod tests {
         smol::block_on(async {
             let root = TempDir::new().unwrap();
             let engine = test_engine_config_for(root.path()).build().await.unwrap();
-            let mut session = engine.try_new_session().unwrap();
+            let mut session = engine.new_session().unwrap();
 
             let err = match engine.shutdown() {
                 Ok(_) => panic!("expected busy shutdown error"),
@@ -932,14 +968,14 @@ mod tests {
             assert_eq!(err.lifecycle_error(), Some(LifecycleError::ShutdownBusy));
             assert_eq!(err.downcast_ref::<usize>().copied(), Some(1));
 
-            let err = match engine.try_new_session() {
+            let err = match engine.new_session() {
                 Ok(_) => panic!("expected shutdown error"),
                 Err(err) => err,
             };
             assert_eq!(err.kind(), ErrorKind::Lifecycle);
             assert_eq!(err.lifecycle_error(), Some(LifecycleError::Shutdown));
 
-            let err = match session.try_begin_trx() {
+            let err = match session.begin_trx() {
                 Ok(_) => panic!("expected shutdown error"),
                 Err(err) => err,
             };
@@ -957,14 +993,21 @@ mod tests {
         smol::block_on(async {
             let root = TempDir::new().unwrap();
             let engine = test_engine_config_for(root.path()).build().await.unwrap();
-            let mut session = engine.try_new_session().unwrap();
+            let mut session = engine.new_session().unwrap();
 
-            let trx = session.try_begin_trx().unwrap().unwrap();
+            let trx = session.begin_trx().unwrap();
             assert!(session.in_trx());
-            assert!(session.try_begin_trx().unwrap().is_none());
+            let err = match session.begin_trx() {
+                Ok(_) => panic!("expected existing transaction error"),
+                Err(err) => err,
+            };
+            let kind = err.kind();
+            let operation_error = err.operation_error();
 
             trx.rollback().await.unwrap();
             assert!(!session.in_trx());
+            assert_eq!(kind, ErrorKind::Operation);
+            assert_eq!(operation_error, Some(OperationError::ExistingTransaction));
         });
     }
 
@@ -973,15 +1016,15 @@ mod tests {
         smol::block_on(async {
             let root = TempDir::new().unwrap();
             let engine = test_engine_config_for(root.path()).build().await.unwrap();
-            let mut session = engine.try_new_session().unwrap();
+            let mut session = engine.new_session().unwrap();
 
-            let mut trx = session.try_begin_trx().unwrap().unwrap();
+            let mut trx = session.begin_trx().unwrap();
             trx.add_pseudo_redo_log_entry();
             let cts = trx.commit().await.unwrap();
             assert!(cts > 0);
             assert!(!session.in_trx());
 
-            let trx = session.try_begin_trx().unwrap().unwrap();
+            let trx = session.begin_trx().unwrap();
             trx.rollback().await.unwrap();
         });
     }
@@ -991,13 +1034,13 @@ mod tests {
         smol::block_on(async {
             let root = TempDir::new().unwrap();
             let engine = test_engine_config_for(root.path()).build().await.unwrap();
-            let mut session = engine.try_new_session().unwrap();
+            let mut session = engine.new_session().unwrap();
 
-            let trx = session.try_begin_trx().unwrap().unwrap();
+            let trx = session.begin_trx().unwrap();
             trx.rollback().await.unwrap();
             assert!(!session.in_trx());
 
-            let trx = session.try_begin_trx().unwrap().unwrap();
+            let trx = session.begin_trx().unwrap();
             trx.rollback().await.unwrap();
         });
     }
@@ -1007,14 +1050,14 @@ mod tests {
         smol::block_on(async {
             let root = TempDir::new().unwrap();
             let engine = test_engine_config_for(root.path()).build().await.unwrap();
-            let mut session = engine.try_new_session().unwrap();
+            let mut session = engine.new_session().unwrap();
 
-            let trx = session.try_begin_trx().unwrap().unwrap();
+            let trx = session.begin_trx().unwrap();
             let cts = trx.commit().await.unwrap();
             assert_eq!(cts, 0);
             assert!(!session.in_trx());
 
-            let trx = session.try_begin_trx().unwrap().unwrap();
+            let trx = session.begin_trx().unwrap();
             trx.rollback().await.unwrap();
         });
     }
@@ -1024,11 +1067,11 @@ mod tests {
         smol::block_on(async {
             let root = TempDir::new().unwrap();
             let engine = test_engine_config_for(root.path()).build().await.unwrap();
-            let mut session1 = engine.try_new_session().unwrap();
-            let mut session2 = engine.try_new_session().unwrap();
+            let mut session1 = engine.new_session().unwrap();
+            let mut session2 = engine.new_session().unwrap();
 
-            let trx1 = session1.try_begin_trx().unwrap().unwrap();
-            let trx2 = session2.try_begin_trx().unwrap().unwrap();
+            let trx1 = session1.begin_trx().unwrap();
+            let trx2 = session2.begin_trx().unwrap();
 
             assert!(session1.in_trx());
             assert!(session2.in_trx());

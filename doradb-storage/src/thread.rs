@@ -1,7 +1,7 @@
 use std::thread::{self, JoinHandle};
 
 #[inline]
-pub fn spawn_named<S, F>(name: S, f: F) -> JoinHandle<()>
+pub(crate) fn spawn_named<S, F>(name: S, f: F) -> JoinHandle<()>
 where
     String: From<S>,
     F: FnOnce() + Send + 'static,

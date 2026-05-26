@@ -31,10 +31,10 @@ const _: () = assert!(
 ///   change the size and reduce effective buffer-pool capacity.
 /// - update the layout deliberately and keep the const asserts below green.
 #[repr(C, align(128))]
-pub struct BufferFrame {
+pub(crate) struct BufferFrame {
     /* header part */
-    pub latch: HybridLatch, // lock proctects free list and page.
-    pub page_id: PageID,
+    pub(super) latch: HybridLatch, // lock proctects free list and page.
+    pub(super) page_id: PageID,
     generation: AtomicU64,
     frame_kind: AtomicU8,
     page_kind: AtomicU8,
@@ -44,8 +44,8 @@ pub struct BufferFrame {
     persisted_block_id: AtomicU64,
     /// Context of this buffer frame. It can store additinal contextual information
     /// about the page, e.g. undo map of row page.
-    pub ctx: Option<Box<FrameContext>>,
-    pub page: *mut Page,
+    pub(crate) ctx: Option<Box<FrameContext>>,
+    pub(super) page: *mut Page,
 }
 
 impl BufferFrame {
@@ -186,7 +186,7 @@ unsafe impl Sync for BufferFrame {}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
-pub enum FrameKind {
+pub(crate) enum FrameKind {
     /// Uninitialized means this page is only allocated, but not used for any purpose.
     Uninitialized = 0,
     /// Fixed means this page must be fixed in memory. Evict thread will ignore such page.
@@ -216,14 +216,14 @@ impl From<u8> for FrameKind {
     }
 }
 
-pub enum FrameContext {
+pub(crate) enum FrameContext {
     RowVerMap(RowVersionMap),
     RecoverMap(RecoverMap),
 }
 
 impl FrameContext {
     #[inline]
-    pub fn row_ver(&self) -> Option<&RowVersionMap> {
+    pub(crate) fn row_ver(&self) -> Option<&RowVersionMap> {
         match self {
             FrameContext::RowVerMap(ver) => Some(ver),
             FrameContext::RecoverMap(_) => None,
@@ -231,7 +231,7 @@ impl FrameContext {
     }
 
     #[inline]
-    pub fn recover(&self) -> Option<&RecoverMap> {
+    pub(crate) fn recover(&self) -> Option<&RecoverMap> {
         match self {
             FrameContext::RecoverMap(rec) => Some(rec),
             FrameContext::RowVerMap(_) => None,
@@ -239,7 +239,7 @@ impl FrameContext {
     }
 
     #[inline]
-    pub fn recover_mut(&mut self) -> Option<&mut RecoverMap> {
+    pub(crate) fn recover_mut(&mut self) -> Option<&mut RecoverMap> {
         match self {
             FrameContext::RecoverMap(rec) => Some(rec),
             FrameContext::RowVerMap(_) => None,

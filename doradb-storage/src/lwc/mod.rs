@@ -1,8 +1,8 @@
 //! This module contains definition and functions of LWC(Lightweight Compression) Block.
 
-pub mod block;
+pub(crate) mod block;
 
-pub use block::*;
+pub(crate) use block::*;
 
 use crate::bitmap::Bitmap;
 use crate::catalog::TableColumnLayout;
@@ -14,7 +14,7 @@ use crate::io::DirectBuf;
 use crate::layout;
 use crate::row::vector_scan::{PageVectorView, ScanBuffer, ScanColumnValues};
 use crate::row::{RowID, RowPage};
-use crate::serde::{Deser, ForBitpackingDeser, ForBitpackingSer, Ser, Serde};
+use crate::serde::{ForBitpackingSer, Ser, Serde};
 use crate::value::{MemVar, Val, ValKind};
 use error_stack::Report;
 use std::borrow::Cow;
@@ -38,8 +38,54 @@ fn column_scan_shape_mismatch() -> Error {
     Report::new(InternalError::ColumnScanShapeMismatch).into()
 }
 
+#[inline]
+fn lwc_payload_len_from_u64(len: u64, payload: &str) -> Result<usize> {
+    usize::try_from(len)
+        .map_err(|_| invalid_compressed_payload(format!("{payload} length exceeds usize::MAX")))
+}
+
+#[inline]
+fn checked_lwc_payload_len(len: usize, unit_len: usize, payload: &str) -> Result<usize> {
+    len.checked_mul(unit_len)
+        .ok_or_else(|| invalid_compressed_payload(format!("{payload} length overflows usize")))
+}
+
+#[inline]
+fn expect_exact_lwc_payload_len(
+    actual_len: usize,
+    expected_len: usize,
+    payload: &str,
+) -> Result<()> {
+    if actual_len != expected_len {
+        return Err(invalid_compressed_payload(format!(
+            "{payload} length mismatch: expected {expected_len}, actual {actual_len}"
+        )));
+    }
+    Ok(())
+}
+
+#[inline]
+fn flat_lwc_payload<'a>(
+    input: &'a [u8],
+    len: usize,
+    unit_len: usize,
+    payload: &str,
+) -> Result<&'a [u8]> {
+    let expected_len = checked_lwc_payload_len(len, unit_len, payload)?;
+    expect_exact_lwc_payload_len(input.len(), expected_len, payload)?;
+    Ok(input)
+}
+
+#[inline]
+fn for_bitpacking_lwc_payload(data: &[u8], len: usize, n_bits: usize) -> Result<&[u8]> {
+    let expected_bits = checked_lwc_payload_len(len, n_bits, "LWC FOR bitpacking payload")?;
+    let expected_len = expected_bits.div_ceil(8);
+    expect_exact_lwc_payload_len(data.len(), expected_len, "LWC FOR bitpacking payload")?;
+    Ok(data)
+}
+
 /// Lightweight compressed data.
-pub enum LwcData<'a> {
+pub(crate) enum LwcData<'a> {
     Primitive(LwcPrimitive<'a>),
     Bytes(LwcBytes<'a>),
 }
@@ -50,71 +96,80 @@ impl<'a> LwcData<'a> {
     /// First byte must be compression code which indicates the
     /// compression type of the data.
     #[inline]
-    pub fn from_bytes(kind: ValKind, input: &'a [u8]) -> Result<Self> {
-        let c = LwcCode::try_from(input[0])?;
-        let input = &input[1..];
+    pub(crate) fn from_bytes(kind: ValKind, input: &'a [u8]) -> Result<Self> {
+        let (code, input) = read_u8(input)?;
+        let c = LwcCode::try_from(code)?;
         let res = match c {
             LwcCode::Flat => {
                 let (len, input) = read_le_u64(input)?;
+                let len = lwc_payload_len_from_u64(len, "LWC flat payload")?;
                 match kind {
                     ValKind::I8 => {
-                        debug_assert_eq!(input.len(), len as usize);
+                        let input = flat_lwc_payload(input, len, 1, "LWC flat i8 payload")?;
                         LwcData::Primitive(LwcPrimitive::FlatI8(FlatI8(input)))
                     }
                     ValKind::U8 => {
-                        debug_assert_eq!(input.len(), len as usize);
+                        let input = flat_lwc_payload(input, len, 1, "LWC flat u8 payload")?;
                         LwcData::Primitive(LwcPrimitive::FlatU8(FlatU8(input)))
                     }
                     ValKind::I16 => {
-                        let input = layout::slice_from_bytes::<[u8; 2]>(input);
-                        debug_assert_eq!(input.len(), len as usize);
+                        let input = flat_lwc_payload(input, len, 2, "LWC flat i16 payload")?;
+                        let input = layout::try_slice_from_bytes::<[u8; 2]>(input)?;
                         LwcData::Primitive(LwcPrimitive::FlatI16(FlatI16(input)))
                     }
                     ValKind::U16 => {
-                        let input = layout::slice_from_bytes::<[u8; 2]>(input);
-                        debug_assert_eq!(input.len(), len as usize);
+                        let input = flat_lwc_payload(input, len, 2, "LWC flat u16 payload")?;
+                        let input = layout::try_slice_from_bytes::<[u8; 2]>(input)?;
                         LwcData::Primitive(LwcPrimitive::FlatU16(FlatU16(input)))
                     }
                     ValKind::I32 => {
-                        let input = layout::slice_from_bytes::<[u8; 4]>(input);
-                        debug_assert_eq!(input.len(), len as usize);
+                        let input = flat_lwc_payload(input, len, 4, "LWC flat i32 payload")?;
+                        let input = layout::try_slice_from_bytes::<[u8; 4]>(input)?;
                         LwcData::Primitive(LwcPrimitive::FlatI32(FlatI32(input)))
                     }
                     ValKind::U32 => {
-                        let input = layout::slice_from_bytes::<[u8; 4]>(input);
-                        debug_assert_eq!(input.len(), len as usize);
+                        let input = flat_lwc_payload(input, len, 4, "LWC flat u32 payload")?;
+                        let input = layout::try_slice_from_bytes::<[u8; 4]>(input)?;
                         LwcData::Primitive(LwcPrimitive::FlatU32(FlatU32(input)))
                     }
                     ValKind::F32 => {
-                        let input = layout::slice_from_bytes::<[u8; 4]>(input);
-                        debug_assert_eq!(input.len(), len as usize);
+                        let input = flat_lwc_payload(input, len, 4, "LWC flat f32 payload")?;
+                        let input = layout::try_slice_from_bytes::<[u8; 4]>(input)?;
                         LwcData::Primitive(LwcPrimitive::FlatF32(FlatF32(input)))
                     }
                     ValKind::I64 => {
-                        let input = layout::slice_from_bytes::<[u8; 8]>(input);
-                        debug_assert_eq!(input.len(), len as usize);
+                        let input = flat_lwc_payload(input, len, 8, "LWC flat i64 payload")?;
+                        let input = layout::try_slice_from_bytes::<[u8; 8]>(input)?;
                         LwcData::Primitive(LwcPrimitive::FlatI64(FlatI64(input)))
                     }
                     ValKind::U64 => {
-                        let input = layout::slice_from_bytes::<[u8; 8]>(input);
-                        debug_assert_eq!(input.len(), len as usize);
+                        let input = flat_lwc_payload(input, len, 8, "LWC flat u64 payload")?;
+                        let input = layout::try_slice_from_bytes::<[u8; 8]>(input)?;
                         LwcData::Primitive(LwcPrimitive::FlatU64(FlatU64(input)))
                     }
                     ValKind::F64 => {
-                        let input = layout::slice_from_bytes::<[u8; 8]>(input);
-                        debug_assert_eq!(input.len(), len as usize);
+                        let input = flat_lwc_payload(input, len, 8, "LWC flat f64 payload")?;
+                        let input = layout::try_slice_from_bytes::<[u8; 8]>(input)?;
                         LwcData::Primitive(LwcPrimitive::FlatF64(FlatF64(input)))
                     }
                     ValKind::VarByte => {
-                        let len = len as usize;
-                        if input.len() < (len + 1) * mem::size_of::<u32>() {
+                        let offset_count = len.checked_add(1).ok_or_else(|| {
+                            invalid_compressed_payload(
+                                "LWC varbyte offset table length overflows usize",
+                            )
+                        })?;
+                        let offset_bytes_len = checked_lwc_payload_len(
+                            offset_count,
+                            mem::size_of::<u32>(),
+                            "LWC varbyte offset table",
+                        )?;
+                        if input.len() < offset_bytes_len {
                             return Err(invalid_compressed_payload(
                                 "LWC varbyte payload is shorter than its offset table",
                             ));
                         }
-                        let (offset_bytes, data) =
-                            input.split_at((len + 1) * mem::size_of::<u32>());
-                        let offsets = layout::slice_from_bytes::<[u8; 4]>(offset_bytes);
+                        let (offset_bytes, data) = input.split_at(offset_bytes_len);
+                        let offsets = layout::try_slice_from_bytes::<[u8; 4]>(offset_bytes)?;
                         LwcData::Bytes(LwcBytes { offsets, data })
                     }
                 }
@@ -123,12 +178,12 @@ impl<'a> LwcData<'a> {
                 // see `ForBitpackingDeser` for reference.
                 let (n_bits, input) = read_u8(input)?;
                 let (len, input) = read_le_u64(input)?;
-                let len = len as usize;
+                let len = lwc_payload_len_from_u64(len, "LWC FOR bitpacking payload")?;
                 let n_bits = n_bits as usize;
                 let p = match kind {
                     ValKind::I8 => {
                         let (min, data) = read_i8(input)?;
-                        debug_assert!(data.len() == (len * n_bits).div_ceil(8));
+                        let data = for_bitpacking_lwc_payload(data, len, n_bits)?;
                         match n_bits {
                             1 => LwcPrimitive::ForBp1I8(ForBitpacking1 { len, min, data }),
                             2 => LwcPrimitive::ForBp2I8(ForBitpacking2 { len, min, data }),
@@ -144,7 +199,7 @@ impl<'a> LwcData<'a> {
                     }
                     ValKind::U8 => {
                         let (min, data) = read_u8(input)?;
-                        debug_assert!(data.len() == (len * n_bits).div_ceil(8));
+                        let data = for_bitpacking_lwc_payload(data, len, n_bits)?;
                         match n_bits {
                             1 => LwcPrimitive::ForBp1U8(ForBitpacking1 { len, min, data }),
                             2 => LwcPrimitive::ForBp2U8(ForBitpacking2 { len, min, data }),
@@ -160,7 +215,7 @@ impl<'a> LwcData<'a> {
                     }
                     ValKind::I16 => {
                         let (min, data) = read_le_i16(input)?;
-                        debug_assert!(data.len() == (len * n_bits).div_ceil(8));
+                        let data = for_bitpacking_lwc_payload(data, len, n_bits)?;
                         match n_bits {
                             1 => LwcPrimitive::ForBp1I16(ForBitpacking1 { len, min, data }),
                             2 => LwcPrimitive::ForBp2I16(ForBitpacking2 { len, min, data }),
@@ -177,7 +232,7 @@ impl<'a> LwcData<'a> {
                     }
                     ValKind::U16 => {
                         let (min, data) = read_le_u16(input)?;
-                        debug_assert!(data.len() == (len * n_bits).div_ceil(8));
+                        let data = for_bitpacking_lwc_payload(data, len, n_bits)?;
                         match n_bits {
                             1 => LwcPrimitive::ForBp1U16(ForBitpacking1 { len, min, data }),
                             2 => LwcPrimitive::ForBp2U16(ForBitpacking2 { len, min, data }),
@@ -194,14 +249,14 @@ impl<'a> LwcData<'a> {
                     }
                     ValKind::I32 => {
                         let (min, data) = read_le_i32(input)?;
-                        debug_assert!(data.len() == (len * n_bits).div_ceil(8));
+                        let data = for_bitpacking_lwc_payload(data, len, n_bits)?;
                         match n_bits {
                             1 => LwcPrimitive::ForBp1I32(ForBitpacking1 { len, min, data }),
                             2 => LwcPrimitive::ForBp2I32(ForBitpacking2 { len, min, data }),
                             4 => LwcPrimitive::ForBp4I32(ForBitpacking4 { len, min, data }),
                             8 => LwcPrimitive::ForBp8I32(ForBitpacking8 { min, data }),
                             16 => {
-                                let data = layout::slice_from_bytes::<[u8; 2]>(data);
+                                let data = layout::try_slice_from_bytes::<[u8; 2]>(data)?;
                                 LwcPrimitive::ForBp16I32(ForBitpacking16 { min, data })
                             }
                             _ => {
@@ -215,14 +270,14 @@ impl<'a> LwcData<'a> {
                     }
                     ValKind::U32 => {
                         let (min, data) = read_le_u32(input)?;
-                        debug_assert!(data.len() == (len * n_bits).div_ceil(8));
+                        let data = for_bitpacking_lwc_payload(data, len, n_bits)?;
                         match n_bits {
                             1 => LwcPrimitive::ForBp1U32(ForBitpacking1 { len, min, data }),
                             2 => LwcPrimitive::ForBp2U32(ForBitpacking2 { len, min, data }),
                             4 => LwcPrimitive::ForBp4U32(ForBitpacking4 { len, min, data }),
                             8 => LwcPrimitive::ForBp8U32(ForBitpacking8 { min, data }),
                             16 => {
-                                let data = layout::slice_from_bytes::<[u8; 2]>(data);
+                                let data = layout::try_slice_from_bytes::<[u8; 2]>(data)?;
                                 LwcPrimitive::ForBp16U32(ForBitpacking16 { min, data })
                             }
                             _ => {
@@ -236,18 +291,18 @@ impl<'a> LwcData<'a> {
                     }
                     ValKind::I64 => {
                         let (min, data) = read_le_i64(input)?;
-                        debug_assert!(data.len() == (len * n_bits).div_ceil(8));
+                        let data = for_bitpacking_lwc_payload(data, len, n_bits)?;
                         match n_bits {
                             1 => LwcPrimitive::ForBp1I64(ForBitpacking1 { len, min, data }),
                             2 => LwcPrimitive::ForBp2I64(ForBitpacking2 { len, min, data }),
                             4 => LwcPrimitive::ForBp4I64(ForBitpacking4 { len, min, data }),
                             8 => LwcPrimitive::ForBp8I64(ForBitpacking8 { min, data }),
                             16 => {
-                                let data = layout::slice_from_bytes::<[u8; 2]>(data);
+                                let data = layout::try_slice_from_bytes::<[u8; 2]>(data)?;
                                 LwcPrimitive::ForBp16I64(ForBitpacking16 { min, data })
                             }
                             32 => {
-                                let data = layout::slice_from_bytes::<[u8; 4]>(data);
+                                let data = layout::try_slice_from_bytes::<[u8; 4]>(data)?;
                                 LwcPrimitive::ForBp32I64(ForBitpacking32 { min, data })
                             }
                             _ => {
@@ -261,18 +316,18 @@ impl<'a> LwcData<'a> {
                     }
                     ValKind::U64 => {
                         let (min, data) = read_le_u64(input)?;
-                        debug_assert!(data.len() == (len * n_bits).div_ceil(8));
+                        let data = for_bitpacking_lwc_payload(data, len, n_bits)?;
                         match n_bits {
                             1 => LwcPrimitive::ForBp1U64(ForBitpacking1 { len, min, data }),
                             2 => LwcPrimitive::ForBp2U64(ForBitpacking2 { len, min, data }),
                             4 => LwcPrimitive::ForBp4U64(ForBitpacking4 { len, min, data }),
                             8 => LwcPrimitive::ForBp8U64(ForBitpacking8 { min, data }),
                             16 => {
-                                let data = layout::slice_from_bytes::<[u8; 2]>(data);
+                                let data = layout::try_slice_from_bytes::<[u8; 2]>(data)?;
                                 LwcPrimitive::ForBp16U64(ForBitpacking16 { min, data })
                             }
                             32 => {
-                                let data = layout::slice_from_bytes::<[u8; 4]>(data);
+                                let data = layout::try_slice_from_bytes::<[u8; 4]>(data)?;
                                 LwcPrimitive::ForBp32U64(ForBitpacking32 { min, data })
                             }
                             _ => {
@@ -298,9 +353,9 @@ impl<'a> LwcData<'a> {
     }
 
     /// Returns the length of Lwc Data.
-    #[allow(clippy::len_without_is_empty)]
     #[inline]
-    pub fn len(&self) -> usize {
+    #[cfg_attr(not(test), expect(dead_code, reason = "reserved len"))]
+    pub(crate) fn len(&self) -> usize {
         match self {
             LwcData::Primitive(p) => match p {
                 LwcPrimitive::FlatI8(f) => f.len(),
@@ -357,7 +412,7 @@ impl<'a> LwcData<'a> {
 
     /// Returns value at given position.
     #[inline]
-    pub fn value(&self, idx: usize) -> Option<Val> {
+    pub(crate) fn value(&self, idx: usize) -> Option<Val> {
         match self {
             LwcData::Primitive(p) => p.value(idx),
             LwcData::Bytes(b) => b.value(idx).map(Val::VarByte),
@@ -367,7 +422,7 @@ impl<'a> LwcData<'a> {
 
 /// Abstract of primitive data which are lightweight compressed.
 /// Provides methods for random access and batch access.
-pub trait LwcPrimitiveData {
+pub(crate) trait LwcPrimitiveData {
     type Value;
     type Iter: Iterator<Item = Self::Value>;
 
@@ -376,6 +431,7 @@ pub trait LwcPrimitiveData {
 
     /// Returns whether this data is empty.
     #[inline]
+    #[expect(dead_code, reason = "reserved is_empty")]
     fn is_empty(&self) -> bool {
         self.len() == 0
     }
@@ -385,6 +441,7 @@ pub trait LwcPrimitiveData {
     fn value(&self, idx: usize) -> Option<Self::Value>;
 
     /// Extend all values to target collection.
+    #[expect(dead_code, reason = "reserved extend_to")]
     fn extend_to<E: Extend<Self::Value>>(&self, target: &mut E);
 
     /// Returns the iterator over all values.
@@ -393,7 +450,7 @@ pub trait LwcPrimitiveData {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
-pub enum LwcCode {
+pub(crate) enum LwcCode {
     Flat = 1,
     // Bitpacking = 2,
     /// See `ForBitpackingSer` for serialization details.
@@ -418,7 +475,7 @@ impl TryFrom<u8> for LwcCode {
     }
 }
 
-pub enum LwcPrimitive<'a> {
+pub(crate) enum LwcPrimitive<'a> {
     FlatI8(FlatI8<'a>),
     FlatU8(FlatU8<'a>),
     FlatI16(FlatI16<'a>),
@@ -465,12 +522,13 @@ pub enum LwcPrimitive<'a> {
     ForBp8U64(ForBitpacking8<'a, u64>),
     ForBp16U64(ForBitpacking16<'a, u64>),
     ForBp32U64(ForBitpacking32<'a, u64>),
+    #[expect(dead_code, reason = "reserved Bytes")]
     Bytes(LwcBytes<'a>),
 }
 
 impl LwcPrimitive<'_> {
     #[inline]
-    pub fn value(&self, idx: usize) -> Option<Val> {
+    pub(crate) fn value(&self, idx: usize) -> Option<Val> {
         match self {
             LwcPrimitive::FlatI8(f) => f.value(idx).map(Val::I8),
             LwcPrimitive::FlatU8(f) => f.value(idx).map(Val::U8),
@@ -628,7 +686,7 @@ fn flat_f64_bytes(input: &[f64]) -> Cow<'_, [[u8; 8]]> {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum LwcPrimitiveSer<'a> {
+pub(crate) enum LwcPrimitiveSer<'a> {
     FlatI8(&'a [i8]),
     FlatU8(&'a [u8]),
     FlatI16(Cow<'a, [[u8; 2]]>),
@@ -652,7 +710,7 @@ pub enum LwcPrimitiveSer<'a> {
 
 impl<'a> LwcPrimitiveSer<'a> {
     #[inline]
-    pub fn new_i8(input: &'a [i8]) -> Self {
+    pub(crate) fn new_i8(input: &'a [i8]) -> Self {
         if input.is_empty() {
             return LwcPrimitiveSer::FlatI8(input);
         }
@@ -663,7 +721,7 @@ impl<'a> LwcPrimitiveSer<'a> {
     }
 
     #[inline]
-    pub fn new_u8(input: &'a [u8]) -> Self {
+    pub(crate) fn new_u8(input: &'a [u8]) -> Self {
         if input.is_empty() {
             return LwcPrimitiveSer::FlatU8(input);
         }
@@ -674,7 +732,7 @@ impl<'a> LwcPrimitiveSer<'a> {
     }
 
     #[inline]
-    pub fn new_u64(input: &'a [u64]) -> Self {
+    pub(crate) fn new_u64(input: &'a [u64]) -> Self {
         if input.is_empty() {
             return LwcPrimitiveSer::FlatU64(flat_u64_bytes(input));
         }
@@ -685,7 +743,7 @@ impl<'a> LwcPrimitiveSer<'a> {
     }
 
     #[inline]
-    pub fn new_i16(input: &'a [i16]) -> Self {
+    pub(crate) fn new_i16(input: &'a [i16]) -> Self {
         match ForBitpackingSer::new(input) {
             Some(fbp) => LwcPrimitiveSer::ForBpI16(fbp),
             None => LwcPrimitiveSer::FlatI16(flat_i16_bytes(input)),
@@ -693,7 +751,7 @@ impl<'a> LwcPrimitiveSer<'a> {
     }
 
     #[inline]
-    pub fn new_u16(input: &'a [u16]) -> Self {
+    pub(crate) fn new_u16(input: &'a [u16]) -> Self {
         match ForBitpackingSer::new(input) {
             Some(fbp) => LwcPrimitiveSer::ForBpU16(fbp),
             None => LwcPrimitiveSer::FlatU16(flat_u16_bytes(input)),
@@ -701,7 +759,7 @@ impl<'a> LwcPrimitiveSer<'a> {
     }
 
     #[inline]
-    pub fn new_i32(input: &'a [i32]) -> Self {
+    pub(crate) fn new_i32(input: &'a [i32]) -> Self {
         match ForBitpackingSer::new(input) {
             Some(fbp) => LwcPrimitiveSer::ForBpI32(fbp),
             None => LwcPrimitiveSer::FlatI32(flat_i32_bytes(input)),
@@ -709,7 +767,7 @@ impl<'a> LwcPrimitiveSer<'a> {
     }
 
     #[inline]
-    pub fn new_u32(input: &'a [u32]) -> Self {
+    pub(crate) fn new_u32(input: &'a [u32]) -> Self {
         match ForBitpackingSer::new(input) {
             Some(fbp) => LwcPrimitiveSer::ForBpU32(fbp),
             None => LwcPrimitiveSer::FlatU32(flat_u32_bytes(input)),
@@ -717,7 +775,7 @@ impl<'a> LwcPrimitiveSer<'a> {
     }
 
     #[inline]
-    pub fn new_i64(input: &'a [i64]) -> Self {
+    pub(crate) fn new_i64(input: &'a [i64]) -> Self {
         match ForBitpackingSer::new(input) {
             Some(fbp) => LwcPrimitiveSer::ForBpI64(fbp),
             None => LwcPrimitiveSer::FlatI64(flat_i64_bytes(input)),
@@ -725,17 +783,18 @@ impl<'a> LwcPrimitiveSer<'a> {
     }
 
     #[inline]
-    pub fn new_f32(input: &'a [f32]) -> Self {
+    pub(crate) fn new_f32(input: &'a [f32]) -> Self {
         LwcPrimitiveSer::FlatF32(flat_f32_bytes(input))
     }
 
     #[inline]
-    pub fn new_f64(input: &'a [f64]) -> Self {
+    pub(crate) fn new_f64(input: &'a [f64]) -> Self {
         LwcPrimitiveSer::FlatF64(flat_f64_bytes(input))
     }
 
     #[inline]
-    pub fn new_bytes(offsets: &[u32], data: &[u8]) -> Result<Self> {
+    #[cfg_attr(not(test), expect(dead_code, reason = "reserved new_bytes"))]
+    pub(crate) fn new_bytes(offsets: &[u32], data: &[u8]) -> Result<Self> {
         if offsets.is_empty() || offsets[0] != 0 {
             return Err(invalid_compressed_payload(
                 "LWC bytes offsets must be non-empty and start at zero",
@@ -748,7 +807,7 @@ impl<'a> LwcPrimitiveSer<'a> {
     }
 
     #[inline]
-    pub fn new_bytes_owned(offsets: Vec<u32>, data: Vec<u8>) -> Result<Self> {
+    pub(crate) fn new_bytes_owned(offsets: Vec<u32>, data: Vec<u8>) -> Result<Self> {
         if offsets.is_empty() || offsets[0] != 0 {
             return Err(invalid_compressed_payload(
                 "LWC bytes offsets must be non-empty and start at zero",
@@ -758,7 +817,7 @@ impl<'a> LwcPrimitiveSer<'a> {
     }
 
     #[inline]
-    pub fn code(&self) -> LwcCode {
+    pub(crate) fn code(&self) -> LwcCode {
         match self {
             LwcPrimitiveSer::FlatI8(_)
             | LwcPrimitiveSer::FlatU8(_)
@@ -916,7 +975,7 @@ struct LwcSnapshot {
     stats: Vec<LwcColumnSnapshot>,
 }
 
-pub struct LwcBuilder<'a> {
+pub(crate) struct LwcBuilder<'a> {
     col_layout: &'a TableColumnLayout,
     buffer: ScanBuffer,
     row_ids: Vec<RowID>,
@@ -924,7 +983,7 @@ pub struct LwcBuilder<'a> {
 }
 
 impl<'a> LwcBuilder<'a> {
-    pub fn new(col_layout: &'a TableColumnLayout) -> Self {
+    pub(crate) fn new(col_layout: &'a TableColumnLayout) -> Self {
         let scan_set: Vec<_> = (0..col_layout.col_count()).collect();
         let stats = (0..col_layout.col_count())
             .map(|_| LwcColumnStats::new())
@@ -939,12 +998,13 @@ impl<'a> LwcBuilder<'a> {
     }
 
     #[inline]
-    pub fn is_empty(&self) -> bool {
+    pub(crate) fn is_empty(&self) -> bool {
         self.buffer.is_empty()
     }
 
     #[inline]
-    pub fn row_count(&self) -> usize {
+    #[cfg_attr(not(test), expect(dead_code, reason = "reserved row_count"))]
+    pub(crate) fn row_count(&self) -> usize {
         self.buffer.len()
     }
 
@@ -953,13 +1013,31 @@ impl<'a> LwcBuilder<'a> {
         &self.row_ids
     }
 
-    pub fn append_row_page(&mut self, page: &RowPage) -> Result<bool> {
+    pub(crate) fn append_row_page(&mut self, page: &RowPage) -> Result<bool> {
         let view = page.vector_view(self.col_layout);
         self.append_view(page, view)
     }
 
-    pub fn append_view(&mut self, page: &RowPage, view: PageVectorView<'_, '_>) -> Result<bool> {
+    pub(crate) fn append_view(
+        &mut self,
+        page: &RowPage,
+        view: PageVectorView<'_, '_>,
+    ) -> Result<bool> {
         let snapshot = self.snapshot_state();
+        match self.append_view_inner(page, view) {
+            Ok(true) => Ok(true),
+            Ok(false) => {
+                self.rollback(snapshot);
+                Ok(false)
+            }
+            Err(err) => {
+                self.rollback(snapshot);
+                Err(err)
+            }
+        }
+    }
+
+    fn append_view_inner(&mut self, page: &RowPage, view: PageVectorView<'_, '_>) -> Result<bool> {
         let mut new_row_ids = Vec::with_capacity(view.rows_non_deleted());
         for (start_idx, end_idx) in view.range_non_deleted() {
             for idx in start_idx..end_idx {
@@ -970,13 +1048,12 @@ impl<'a> LwcBuilder<'a> {
         self.buffer.scan(view)?;
         self.row_ids.extend(new_row_ids);
         if self.estimate_size()? > LWC_BLOCK_PAYLOAD_SIZE {
-            self.rollback(snapshot);
             return Ok(false);
         }
         Ok(true)
     }
 
-    pub fn build(&self, row_shape_fingerprint: u128) -> Result<DirectBuf> {
+    pub(crate) fn build(&self, row_shape_fingerprint: u128) -> Result<DirectBuf> {
         if self.buffer.is_empty() {
             return Err(Report::new(InternalError::LwcBuilderMisuse)
                 .attach("cannot build an empty LWC block")
@@ -1393,26 +1470,7 @@ fn estimate_bitpacked_size(range: u64, row_count: usize, unit: usize, flat: usiz
         + (row_count * bits).div_ceil(8)
 }
 
-pub struct LwcPrimitiveDeser<T>(pub Vec<T>);
-
-impl<T: Deser + BitPackable> Deser for LwcPrimitiveDeser<T> {
-    #[inline]
-    fn deser<S: Serde + ?Sized>(input: &S, start_idx: usize) -> Result<(usize, Self)> {
-        let (idx, code) = input.deser_u8(start_idx)?;
-        match LwcCode::try_from(code)? {
-            LwcCode::Flat => {
-                let (idx, data) = Vec::<T>::deser(input, idx)?;
-                Ok((idx, LwcPrimitiveDeser(data)))
-            }
-            LwcCode::ForBitpacking => {
-                let (idx, data) = ForBitpackingDeser::<T>::deser(input, idx)?;
-                Ok((idx, LwcPrimitiveDeser(data.0)))
-            }
-        }
-    }
-}
-
-pub struct FlatI8<'a>(&'a [u8]);
+pub(crate) struct FlatI8<'a>(&'a [u8]);
 
 impl<'a> LwcPrimitiveData for FlatI8<'a> {
     type Value = i8;
@@ -1444,7 +1502,7 @@ impl<'a> LwcPrimitiveData for FlatI8<'a> {
     }
 }
 
-pub struct FlatI8Iter<'a>(std::slice::Iter<'a, u8>);
+pub(crate) struct FlatI8Iter<'a>(std::slice::Iter<'a, u8>);
 
 impl<'a> Iterator for FlatI8Iter<'a> {
     type Item = i8;
@@ -1454,7 +1512,7 @@ impl<'a> Iterator for FlatI8Iter<'a> {
     }
 }
 
-pub struct FlatU8<'a>(&'a [u8]);
+pub(crate) struct FlatU8<'a>(&'a [u8]);
 
 impl<'a> LwcPrimitiveData for FlatU8<'a> {
     type Value = u8;
@@ -1486,7 +1544,7 @@ impl<'a> LwcPrimitiveData for FlatU8<'a> {
     }
 }
 
-pub struct FlatU8Iter<'a>(std::slice::Iter<'a, u8>);
+pub(crate) struct FlatU8Iter<'a>(std::slice::Iter<'a, u8>);
 
 impl<'a> Iterator for FlatU8Iter<'a> {
     type Item = u8;
@@ -1496,7 +1554,7 @@ impl<'a> Iterator for FlatU8Iter<'a> {
     }
 }
 
-pub struct LwcBytes<'a> {
+pub(crate) struct LwcBytes<'a> {
     offsets: &'a [[u8; 4]],
     data: &'a [u8],
 }
@@ -1516,12 +1574,12 @@ impl<'a> LwcBytes<'a> {
     }
 
     #[inline]
-    pub fn value_at(&self, idx: usize) -> Option<MemVar> {
+    pub(crate) fn value_at(&self, idx: usize) -> Option<MemVar> {
         self.slice(idx).map(MemVar::from)
     }
 }
 
-pub struct LwcBytesIter<'a> {
+pub(crate) struct LwcBytesIter<'a> {
     offsets: &'a [[u8; 4]],
     data: &'a [u8],
     idx: usize,
@@ -1572,7 +1630,7 @@ impl<'a> LwcPrimitiveData for LwcBytes<'a> {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LwcBytesSer {
+pub(crate) struct LwcBytesSer {
     offsets: Vec<u32>,
     data: Vec<u8>,
 }
@@ -1595,13 +1653,13 @@ impl Ser<'_> for LwcBytesSer {
 }
 
 #[derive(Debug)]
-pub struct LwcNullBitmap<'a> {
+pub(crate) struct LwcNullBitmap<'a> {
     bytes: &'a [u8],
 }
 
 impl<'a> LwcNullBitmap<'a> {
     #[inline]
-    pub fn from_bytes(input: &'a [u8]) -> Result<(Self, &'a [u8])> {
+    pub(crate) fn from_bytes(input: &'a [u8]) -> Result<(Self, &'a [u8])> {
         let (len, input) = read_le_u16(input)?;
         let len = len as usize;
         if input.len() < len {
@@ -1614,7 +1672,7 @@ impl<'a> LwcNullBitmap<'a> {
     }
 
     #[inline]
-    pub fn is_null(&self, row_idx: usize) -> bool {
+    pub(crate) fn is_null(&self, row_idx: usize) -> bool {
         let byte_idx = row_idx / 8;
         if byte_idx >= self.bytes.len() {
             return false;
@@ -1623,25 +1681,25 @@ impl<'a> LwcNullBitmap<'a> {
         self.bytes[byte_idx] & bit_mask != 0
     }
 
-    #[allow(clippy::len_without_is_empty)]
     #[inline]
-    pub fn len(&self) -> usize {
+    pub(crate) fn len(&self) -> usize {
         self.bytes.len()
     }
 
     #[inline]
-    pub fn as_bytes(&self) -> &'a [u8] {
+    #[cfg_attr(not(test), expect(dead_code, reason = "pending dead-code audit"))]
+    pub(crate) fn as_bytes(&self) -> &'a [u8] {
         self.bytes
     }
 }
 
-pub struct LwcNullBitmapSer<'a> {
+pub(crate) struct LwcNullBitmapSer<'a> {
     bytes: &'a [u8],
 }
 
 impl<'a> LwcNullBitmapSer<'a> {
     #[inline]
-    pub fn new(bytes: &'a [u8]) -> Result<Self> {
+    pub(crate) fn new(bytes: &'a [u8]) -> Result<Self> {
         if bytes.len() > u16::MAX as usize {
             return Err(invalid_compressed_payload(
                 "LWC null bitmap payload length exceeds u16::MAX",
@@ -1666,7 +1724,7 @@ impl Ser<'_> for LwcNullBitmapSer<'_> {
 
 macro_rules! impl_lwc_flat {
     ($t:ident, $v:ty, $unit:ty, $it:ident) => {
-        pub struct $t<'a>(&'a [$unit]);
+        pub(crate) struct $t<'a>(&'a [$unit]);
 
         impl<'a> LwcPrimitiveData for $t<'a> {
             type Value = $v;
@@ -1699,7 +1757,7 @@ macro_rules! impl_lwc_flat {
             }
         }
 
-        pub struct $it<'a>(std::slice::Iter<'a, $unit>);
+        pub(crate) struct $it<'a>(std::slice::Iter<'a, $unit>);
 
         impl<'a> Iterator for $it<'a> {
             type Item = $v;
@@ -1719,38 +1777,6 @@ impl_lwc_flat!(FlatI64, i64, [u8; 8], FlatI64Iter);
 impl_lwc_flat!(FlatU64, u64, [u8; 8], FlatU64Iter);
 impl_lwc_flat!(FlatF32, f32, [u8; 4], FlatF32Iter);
 impl_lwc_flat!(FlatF64, f64, [u8; 8], FlatF64Iter);
-
-pub trait SortedPosition {
-    type Value;
-    /// Search the given value and return its position if found.
-    /// The packed array should be sorted, otherwise the result
-    /// is meaningless.
-    /// Note single we don't store maximum value, there might be
-    /// overflow and lead to wrong result. So if we use this
-    /// function, we must make sure the given value is within
-    /// range.
-    fn sorted_position(&self, value: Self::Value) -> Option<usize>;
-}
-
-macro_rules! impl_sorted_position {
-    ($t:ident, $v:ty) => {
-        impl $t<'_> {
-            #[inline]
-            pub fn sorted_position(&self, val: $v) -> Option<usize> {
-                self.0
-                    .binary_search_by_key(&val, |&u| <$v>::from_le_bytes(u))
-                    .ok()
-            }
-        }
-    };
-}
-
-impl_sorted_position!(FlatI16, i16);
-impl_sorted_position!(FlatU16, u16);
-impl_sorted_position!(FlatI32, i32);
-impl_sorted_position!(FlatU32, u32);
-impl_sorted_position!(FlatI64, i64);
-impl_sorted_position!(FlatU64, u64);
 
 #[inline]
 fn read_le_u64(input: &[u8]) -> Result<(u64, &[u8])> {
@@ -2072,6 +2098,67 @@ mod tests {
         }
     }
 
+    fn assert_invalid_payload<T>(result: Result<T>) {
+        assert!(result.as_ref().is_err_and(
+            |err| err.data_integrity_error() == Some(DataIntegrityError::InvalidPayload)
+        ));
+    }
+
+    #[test]
+    fn test_lwc_data_from_bytes_rejects_empty_payload() {
+        assert_invalid_payload(LwcData::from_bytes(ValKind::U8, &[]));
+    }
+
+    #[test]
+    fn test_lwc_data_from_bytes_rejects_flat_payload_length_mismatch() {
+        let mut short_payload = vec![LwcCode::Flat as u8];
+        short_payload.extend_from_slice(&2u64.to_le_bytes());
+        short_payload.push(7);
+        assert_invalid_payload(LwcData::from_bytes(ValKind::U8, &short_payload));
+
+        let mut long_payload = vec![LwcCode::Flat as u8];
+        long_payload.extend_from_slice(&1u64.to_le_bytes());
+        long_payload.extend_from_slice(&[7, 8]);
+        assert_invalid_payload(LwcData::from_bytes(ValKind::U8, &long_payload));
+    }
+
+    #[test]
+    fn test_lwc_data_from_bytes_rejects_flat_oversized_len() {
+        let mut payload = vec![LwcCode::Flat as u8];
+        payload.extend_from_slice(&(1u64 << 32).to_le_bytes());
+
+        assert_invalid_payload(LwcData::from_bytes(ValKind::U8, &payload));
+    }
+
+    #[test]
+    fn test_lwc_data_from_bytes_rejects_flat_typed_partial_element() {
+        let mut payload = vec![LwcCode::Flat as u8];
+        payload.extend_from_slice(&1u64.to_le_bytes());
+        payload.push(7);
+
+        assert_invalid_payload(LwcData::from_bytes(ValKind::I16, &payload));
+    }
+
+    #[test]
+    fn test_lwc_data_from_bytes_rejects_for_bitpacking_payload_length_mismatch() {
+        let mut payload = vec![LwcCode::ForBitpacking as u8];
+        payload.push(1);
+        payload.extend_from_slice(&1u64.to_le_bytes());
+        payload.push(0);
+
+        assert_invalid_payload(LwcData::from_bytes(ValKind::U8, &payload));
+    }
+
+    #[test]
+    fn test_lwc_data_from_bytes_rejects_for_bitpacking_oversized_len() {
+        let mut payload = vec![LwcCode::ForBitpacking as u8];
+        payload.push(1);
+        payload.extend_from_slice(&(1u64 << 32).to_le_bytes());
+        payload.push(0);
+
+        assert_invalid_payload(LwcData::from_bytes(ValKind::U8, &payload));
+    }
+
     #[test]
     fn test_lwc_bytes_invalid() {
         let err = LwcPrimitiveSer::new_bytes(&[], &[]);
@@ -2147,13 +2234,14 @@ mod tests {
 
     #[test]
     fn test_lwc_builder_from_row_page() {
-        let metadata = TableMetadata::new(
+        let metadata = TableMetadata::try_new(
             vec![
                 ColumnSpec::new("c0", ValKind::U8, ColumnAttributes::empty()),
                 ColumnSpec::new("c1", ValKind::I16, ColumnAttributes::NULLABLE),
             ],
             vec![],
-        );
+        )
+        .expect("valid table metadata");
         let mut page = RowPage::new_test_page();
         page.init(100, 20, metadata.col.as_ref());
 
@@ -2220,14 +2308,15 @@ mod tests {
 
     #[test]
     fn test_lwc_builder_nullable_integer_stats_skip_nulls_and_deleted_rows() {
-        let metadata = TableMetadata::new(
+        let metadata = TableMetadata::try_new(
             vec![ColumnSpec::new(
                 "nullable_i16",
                 ValKind::I16,
                 ColumnAttributes::NULLABLE,
             )],
             vec![],
-        );
+        )
+        .expect("valid table metadata");
         let mut page = RowPage::new_test_page();
         page.init(0, 8, metadata.col.as_ref());
 
@@ -2260,13 +2349,14 @@ mod tests {
 
     #[test]
     fn test_lwc_builder_rollback() {
-        let metadata = TableMetadata::new(
+        let metadata = TableMetadata::try_new(
             vec![
                 ColumnSpec::new("c0", ValKind::U8, ColumnAttributes::empty()),
                 ColumnSpec::new("c1", ValKind::I16, ColumnAttributes::empty()),
             ],
             vec![],
-        );
+        )
+        .expect("valid table metadata");
         let mut page = RowPage::new_test_page();
         page.init(1, 4, metadata.col.as_ref());
 
@@ -2332,8 +2422,46 @@ mod tests {
     }
 
     #[test]
+    fn test_lwc_builder_append_view_rolls_back_on_estimate_error() {
+        let metadata = TableMetadata::try_new(
+            vec![
+                ColumnSpec::new("c0", ValKind::U8, ColumnAttributes::empty()),
+                ColumnSpec::new("c1", ValKind::I16, ColumnAttributes::empty()),
+            ],
+            vec![],
+        )
+        .expect("valid table metadata");
+        let mut page = RowPage::new_test_page();
+        page.init(1, 4, metadata.col.as_ref());
+
+        for offset in 0..2u64 {
+            let c0 = Val::U8((10 + offset) as u8);
+            let c1 = Val::I16((20 + offset) as i16);
+            assert!(matches!(
+                page.insert(metadata.col.as_ref(), &[c0, c1]),
+                InsertRow::Ok(_)
+            ));
+        }
+
+        let mut builder = LwcBuilder::new(metadata.col.as_ref());
+        builder.buffer = ScanBuffer::new(metadata.col.as_ref(), &[0]);
+
+        let res = builder.append_row_page(&page);
+
+        assert!(res.is_err());
+        assert_eq!(builder.row_count(), 0);
+        assert!(builder.row_ids().is_empty());
+        assert!(
+            builder
+                .stats
+                .iter()
+                .all(|stat| !stat.snapshot().initialized)
+        );
+    }
+
+    #[test]
     fn test_lwc_builder_all_column_types() {
-        let metadata = TableMetadata::new(
+        let metadata = TableMetadata::try_new(
             vec![
                 ColumnSpec::new("c_i8", ValKind::I8, ColumnAttributes::empty()),
                 ColumnSpec::new("c_u8", ValKind::U8, ColumnAttributes::empty()),
@@ -2348,7 +2476,8 @@ mod tests {
                 ColumnSpec::new("c_bytes", ValKind::VarByte, ColumnAttributes::empty()),
             ],
             vec![],
-        );
+        )
+        .expect("valid table metadata");
         let mut page = RowPage::new_test_page();
         page.init(10, 6, metadata.col.as_ref());
 
