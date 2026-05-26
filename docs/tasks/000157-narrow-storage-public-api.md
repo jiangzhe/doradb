@@ -1,7 +1,7 @@
 ---
 id: 000157
 title: Narrow Storage Public API
-status: proposal
+status: implemented
 created: 2026-05-24
 github_issue: 656
 ---
@@ -249,6 +249,56 @@ before resolving the task.
 
 ## Implementation Notes
 
+Implemented on branch `narrow-api` for GitHub issue #656.
+
+Public API and visibility outcomes:
+
+- Replaced the broad root module export surface with an explicit facade in
+  `doradb-storage/src/lib.rs`: engine/config/session/transaction/statement,
+  table/schema definitions, row operation request/result types, values, lock
+  mode, checkpoint admin types, and storage error/result types remain public.
+- Made implementation domains crate-private or private by default, including
+  buffer, catalog, file, index, IO, latch, LWC, serialization, table storage
+  internals, and transaction submodules.
+- Removed public catalog accessors from the engine facade. `EngineRef::get_table`
+  and `Session::get_table` now provide public table lookup through the running
+  admission gate; `Engine::get_table` was intentionally omitted to keep the
+  owner handle surface smaller.
+- Kept `Table` public, made `Table::metadata` crate-private, and kept
+  `Table::table_id` as the narrow public table identity accessor.
+- Added the public `Transaction` alias for `ActiveTrx` while retaining
+  `ActiveTrx` compatibility.
+- Kept insert, lookup, scan, update, and delete MVCC operation types public via
+  explicit facade exports while making row-page and vector-scan internals
+  crate-private.
+- Removed all `doradb-storage/examples/*` targets and pruned example-only dev
+  dependencies instead of adding a `bench-internals` feature.
+
+Review and hardening outcomes:
+
+- Narrowed additional transaction and row visibility after implementation
+  review, including removing unused transaction visibility helpers and recovery
+  map constructors.
+- Fixed still-valid review findings discovered during the API narrowing pass:
+  `EngineRef::get_table` admission gating, `ForBitpacking32Iter` advancement,
+  latest-row key matching in `trx::row`, rollback on `LwcBuilder::append_view`
+  fallible paths, and defensive `LwcData::from_bytes` payload validation.
+- No new unsafe code was added. Unsafe-sensitive documentation/baseline files
+  were synchronized for the visibility and lint-policy changes.
+
+Validation and review:
+
+- `cargo metadata --no-deps --format-version 1` with an example-target search
+  found no `doradb-storage` example targets.
+- `tools/coverage_focus.rs --path doradb-storage/src/engine.rs --path doradb-storage/tests/public_api_smoke.rs --top-uncovered 10`
+  passed with 96.62% combined focused line coverage; `engine.rs` was 96.11% and
+  `public_api_smoke.rs` was 100.00%.
+- `cargo fmt --check` passed.
+- `cargo check -p doradb-storage --all-targets` passed.
+- `cargo clippy -p doradb-storage --all-targets -- -D warnings` passed.
+- `cargo nextest run -p doradb-storage` passed with 825 tests.
+- Checklist outcome: pass. No unresolved checklist issues or deferred follow-up
+  work remain for this task.
 
 ## Impacts
 
@@ -310,9 +360,10 @@ before resolving the task.
 
 ## Open Questions
 
-1. Whether `Table::metadata` should remain public as a schema inspection helper
-   or be replaced by narrower table-schema accessors. The implementation should
-   choose the narrowest option that does not create unrelated churn.
-2. Whether to add a public `Transaction` alias immediately or keep `ActiveTrx`
-   as the public transaction type for this task. The implementation should
-   prefer minimal churn unless a small alias materially clarifies the facade.
+Resolved during implementation:
+
+1. `Table::metadata` was made crate-private; no broader public schema accessor
+   was added in this task.
+2. A public `Transaction` alias was added for `ActiveTrx`.
+
+No unresolved follow-ups remain for this task.
