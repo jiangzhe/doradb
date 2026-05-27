@@ -1,7 +1,7 @@
 ---
 id: 000158
 title: Validate Optimistic Guard Generation
-status: proposal
+status: implemented
 created: 2026-05-26
 github_issue: 658
 ---
@@ -187,6 +187,61 @@ the repository process.
    generation validation are both required.
 
 ## Implementation Notes
+
+Implemented on branch `guard-gen-check` for GitHub issue #658.
+
+Generation-safety outcomes:
+
+- Added frame-generation validation to all optimistic-to-shared/exclusive guard
+  upgrade paths before returning locked page guards.
+- Added rollback helpers in the raw hybrid latch wrapper path so stale shared
+  and exclusive upgrade attempts release the acquired shared latch or undo the
+  exclusive artificial bit before returning retry signals.
+- Replaced unchecked `PageOptimisticGuard` async upgrades with checked
+  `lock_shared_async` and `lock_exclusive_async` APIs returning `Option<_>`.
+- Strengthened facade guard validation helpers so latch-version validation and
+  frame-generation validation are both required before validated page access is
+  considered current.
+
+Production caller outcomes:
+
+- Updated BTree split child re-locking to treat stale generation as
+  `BTreeSplit::Inconsistent`, preserving the surrounding retry behavior.
+- Updated RowPageIndex cursor shared-lock fallback to return
+  `Validation::Invalid` when stale generation is detected, preserving traversal
+  retry semantics.
+- After review, extracted the BTree child re-lock/separator identity check into
+  a private module helper, delegated facade optimistic async lock arms through
+  `PageOptimisticGuard`, and consolidated repeated fixed-pool stale-generation
+  test setup helpers.
+
+Regression coverage:
+
+- Added fixed-buffer tests for stale generation across facade `try_*`,
+  `verify_*_async`, and optimistic checked async/try upgrade paths, including
+  exclusive rollback assertions.
+- Added evictable-buffer regression coverage for stale generation across shared
+  and exclusive upgrade paths.
+- Existing BTree and RowPageIndex tests continued to cover production traversal
+  behavior after the checked API migration.
+
+Validation and review:
+
+- `cargo fmt` passed.
+- `cargo check -p doradb-storage` passed.
+- `cargo nextest run -p doradb-storage generation_mismatch` passed with 4 tests.
+- `cargo nextest run -p doradb-storage` passed with 829 tests.
+- `cargo clippy -p doradb-storage --all-targets -- -D warnings` passed.
+- `git diff --check` passed.
+- `tools/coverage_focus.rs --path doradb-storage/src/buffer/guard.rs --path doradb-storage/src/buffer/fixed.rs --path doradb-storage/src/buffer/evict.rs --path doradb-storage/src/latch/hybrid.rs --path doradb-storage/src/index/btree/mod.rs --path doradb-storage/src/index/row_page_index.rs`
+  reported 92.85% deduplicated focused line coverage. Per-file coverage:
+  `buffer/guard.rs` 96.20%, `buffer/fixed.rs` 99.04%,
+  `buffer/evict.rs` 90.37%, `latch/hybrid.rs` 89.56%,
+  `index/btree/mod.rs` 93.06%, and `index/row_page_index.rs` 92.10%.
+- Checklist outcome: pass. No unresolved checklist issues or deferred follow-up
+  work remain for this task.
+- No new unsafe blocks were added. Existing unsafe-adjacent guard construction
+  paths were narrowed by additional generation checks rather than expanded.
 
 
 ## Impacts
