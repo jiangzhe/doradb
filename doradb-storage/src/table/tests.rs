@@ -14,8 +14,8 @@ use crate::catalog::{
 use crate::conf::{EngineConfig, EvictableBufferPoolConfig, FileSystemConfig, TrxSysConfig};
 use crate::engine::Engine;
 use crate::error::{
-    CompletionErrorKind, DataIntegrityError, Error, ErrorKind, FatalError, InternalError,
-    OperationError, ResourceError, Result,
+    CompletionErrorKind, ConfigError, DataIntegrityError, Error, ErrorKind, FatalError,
+    InternalError, OperationError, ResourceError, Result,
 };
 use crate::file::block_integrity::{BLOCK_INTEGRITY_HEADER_SIZE, write_block_checksum};
 use crate::file::cow_file::{
@@ -4837,6 +4837,41 @@ fn test_create_table_waits_on_catalog_namespace_lock() {
 }
 
 #[test]
+fn test_create_table_rejects_invalid_metadata_before_file_creation() {
+    smol::block_on(async {
+        let temp_dir = TempDir::new().unwrap();
+        let main_dir = temp_dir.path().to_path_buf();
+        let engine = lightweight_test_engine_config(main_dir, "create_invalid_metadata")
+            .build()
+            .await
+            .unwrap();
+        let mut session = engine.new_session().unwrap();
+        let table_id = engine.catalog().curr_next_user_obj_id();
+        let table_file_path = engine.table_fs.user_table_file_path(table_id);
+
+        let err = session
+            .create_table(
+                TableSpec::new(vec![ColumnSpec::new(
+                    "id",
+                    ValKind::I32,
+                    ColumnAttributes::empty(),
+                )]),
+                vec![IndexSpec::new(vec![], IndexAttributes::PK)],
+            )
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            err.report().downcast_ref::<ConfigError>().copied(),
+            Some(ConfigError::InvalidIndexSpec)
+        );
+        assert!(engine.catalog().get_table(table_id).await.is_none());
+        assert!(!session.in_trx());
+        wait_path_exists(&table_file_path, false).await;
+    });
+}
+
+#[test]
 fn test_create_table_catalog_staging_failure_rolls_back_and_deletes_file() {
     smol::block_on(async {
         let temp_dir = TempDir::new().unwrap();
@@ -4890,6 +4925,37 @@ fn test_create_table_file_publish_failure_rolls_back_catalog_and_deletes_file() 
 
         assert!(err.is_kind(ErrorKind::Io), "{err:?}");
         assert!(hook.call_count() > 0);
+        assert!(engine.catalog().get_table(table_id).await.is_none());
+        assert!(!session.in_trx());
+        wait_path_exists(&table_file_path, false).await;
+    });
+}
+
+#[test]
+fn test_create_table_after_file_published_failure_rolls_back_catalog_and_deletes_file() {
+    smol::block_on(async {
+        let temp_dir = TempDir::new().unwrap();
+        let main_dir = temp_dir.path().to_path_buf();
+        let engine = lightweight_test_engine_config(main_dir, "create_fail_after_file")
+            .build()
+            .await
+            .unwrap();
+        let mut session = engine.new_session().unwrap();
+        let table_id = engine.catalog().curr_next_user_obj_id();
+        let table_file_path = engine.table_fs.user_table_file_path(table_id);
+        let (table_spec, index_specs) = drop_table_test_spec();
+
+        catalog_table_tests::set_create_table_failure(Some(
+            CreateTableTestFailure::AfterFilePublished,
+        ));
+        let res = session.create_table(table_spec, index_specs).await;
+        catalog_table_tests::set_create_table_failure(None);
+
+        let err = res.unwrap_err();
+        assert_eq!(
+            err.report().downcast_ref::<InternalError>().copied(),
+            Some(InternalError::InjectedTestFailure)
+        );
         assert!(engine.catalog().get_table(table_id).await.is_none());
         assert!(!session.in_trx());
         wait_path_exists(&table_file_path, false).await;
@@ -6066,6 +6132,23 @@ fn test_checkpoint_cancelled_when_table_dropping() {
 }
 
 #[test]
+fn test_drop_table_rejects_already_dropping_lifecycle_without_poison() {
+    smol::block_on(async {
+        let sys = TestSys::new_lightweight_evictable().await;
+        let table_id = sys.table.table_id();
+        let mut session = sys.new_session().unwrap();
+
+        sys.table.begin_drop_lifecycle().await.unwrap();
+
+        let err = session.drop_table(table_id).await.unwrap_err();
+        assert_eq!(err.operation_error(), Some(OperationError::TableDropping));
+        assert_eq!(sys.table.lifecycle.state(), TableLifecycleState::Dropping);
+        assert!(!session.in_trx());
+        assert!(sys.engine.trx_sys.storage_poison_error().is_none());
+    });
+}
+
+#[test]
 fn test_drop_table_rejects_active_transaction() {
     smol::block_on(async {
         let sys = TestSys::new_lightweight_evictable().await;
@@ -6092,6 +6175,45 @@ fn test_drop_table_returns_not_found_for_missing_table() {
         let missing_user_table_id = sys.table.table_id() + 1000;
         let err = session.drop_table(missing_user_table_id).await.unwrap_err();
         assert_eq!(err.operation_error(), Some(OperationError::TableNotFound));
+    });
+}
+
+#[test]
+fn test_drop_table_rejects_runtime_missing_catalog_row_before_gate() {
+    smol::block_on(async {
+        let sys = TestSys::new_lightweight_evictable().await;
+        let table_id = sys.table.table_id();
+        let mut corrupt_session = sys.new_session().unwrap();
+        let mut corrupt_trx = corrupt_session.begin_trx().unwrap();
+
+        corrupt_trx
+            .exec(async |stmt| {
+                let deleted = sys
+                    .engine
+                    .catalog()
+                    .storage
+                    .tables()
+                    .delete_by_id(stmt, table_id)
+                    .await;
+                assert!(deleted);
+                let old = stmt
+                    .effects_mut()
+                    .set_ddl_redo(DDLRedo::DropTable(table_id));
+                debug_assert!(old.is_none());
+                Ok(())
+            })
+            .await
+            .unwrap();
+        corrupt_trx.commit().await.unwrap();
+
+        let mut drop_session = sys.new_session().unwrap();
+        let err = drop_session.drop_table(table_id).await.unwrap_err();
+
+        assert_eq!(err.operation_error(), Some(OperationError::TableNotFound));
+        assert_eq!(sys.table.lifecycle.state(), TableLifecycleState::Live);
+        assert!(!drop_session.in_trx());
+        assert!(sys.engine.trx_sys.storage_poison_error().is_none());
+        assert!(sys.engine.catalog().get_table(table_id).await.is_some());
     });
 }
 
@@ -6872,8 +6994,7 @@ fn test_checkpoint_readiness_ready_when_effective_ts_crossed_gc_horizon() {
         let session = sys.new_session().unwrap();
         let root = sys.table.file().active_root_unchecked();
         let effective_ts = root.effective_ts();
-        let min_active_sts = sys.engine.trx_sys.calc_min_active_sts_for_gc();
-        assert!(effective_ts < min_active_sts);
+        wait_gc_cutoff_after(&session, effective_ts).await;
         assert!(matches!(
             sys.table.checkpoint_readiness(&session),
             CheckpointReadiness::Ready
