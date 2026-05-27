@@ -4,7 +4,7 @@ use crate::component::{Component, ComponentRegistry, IndexPool, MemPool, MetaPoo
 use crate::conf::TrxSysConfig;
 use crate::error::{Error, FatalError, FatalResult, InternalError, Result};
 use crate::file::fs::FileSystem;
-use crate::file::table_file::{OldRoot, TableFile};
+use crate::file::table_file::{MutableTableFile, OldRoot, TableFile};
 use crate::quiescent::{QuiescentBox, QuiescentGuard, SyncQuiescentGuard};
 use crate::session::SessionState;
 use crate::thread;
@@ -205,7 +205,7 @@ impl TransactionSystem {
     /// started before this fence, so purge can release the root once the global
     /// active-snapshot horizon crosses it.
     #[inline]
-    pub(crate) fn mark_published_table_root(
+    fn mark_published_table_root(
         &self,
         table_file: &Arc<TableFile>,
         old_root: Option<OldRoot>,
@@ -220,6 +220,19 @@ impl TransactionSystem {
             self.request_table_root_retention_purge();
         }
         effective_ts
+    }
+
+    /// Publish one user-table file root and install its runtime effective fence.
+    #[inline]
+    pub(crate) async fn publish_table_file_root(
+        &self,
+        mutable_file: MutableTableFile,
+        root_ts: TrxID,
+        try_delete_if_fail: bool,
+    ) -> Result<Arc<TableFile>> {
+        let (table_file, old_root) = mutable_file.commit(root_ts, try_delete_if_fail).await?;
+        self.mark_published_table_root(&table_file, old_root);
+        Ok(table_file)
     }
 
     /// Create a new transaction.

@@ -104,9 +104,14 @@ pub(crate) type ActiveRoot = GenericActiveRoot<TableMeta>;
 
 impl ActiveRoot {
     /// Create a new active root.
+    ///
+    /// `root_ts` is the root timestamp persisted into the super block. For user
+    /// table files it is sourced from the publishing operation: create-table
+    /// and table checkpoint roots use the publishing transaction STS, while
+    /// index-DDL roots use the DDL commit CTS.
     /// Slot number is set to zero (the first super-block slot of this file).
     #[inline]
-    pub(crate) fn new(trx_id: TrxID, max_pages: usize, metadata: Arc<TableMetadata>) -> Self {
+    pub(crate) fn new(root_ts: TrxID, max_pages: usize, metadata: Arc<TableMetadata>) -> Self {
         let alloc_map = AllocMap::new(max_pages);
         let super_block_allocated = alloc_map.allocate_at(usize::from(SUPER_BLOCK_ID));
         assert!(super_block_allocated);
@@ -114,7 +119,7 @@ impl ActiveRoot {
 
         ActiveRoot::from_parts(
             0,
-            trx_id,
+            root_ts,
             SUPER_BLOCK_ID,
             alloc_map,
             TableMeta {
@@ -122,8 +127,8 @@ impl ActiveRoot {
                 column_block_index_root: SUPER_BLOCK_ID,
                 secondary_index_roots,
                 pivot_row_id: 0,
-                heap_redo_start_ts: trx_id,
-                deletion_cutoff_ts: trx_id.max(MIN_SNAPSHOT_TS),
+                heap_redo_start_ts: root_ts,
+                deletion_cutoff_ts: root_ts.max(MIN_SNAPSHOT_TS),
             },
         )
     }
@@ -136,7 +141,7 @@ impl ActiveRoot {
                 magic_word: TABLE_FILE_MAGIC_WORD,
                 version: SUPER_BLOCK_VERSION,
                 slot_no: self.slot_no,
-                checkpoint_cts: self.trx_id,
+                checkpoint_cts: self.root_ts,
             },
             body: SuperBlockBody {
                 meta_block_id: self.meta_block_id,
@@ -244,7 +249,7 @@ fn build_table_super_block(root: &ActiveRoot) -> Result<DirectBuf> {
     let b3sum = blake3::hash(&buf.as_bytes()[..SUPER_BLOCK_FOOTER_OFFSET]);
     let footer = SuperBlockFooter {
         b3sum: *b3sum.as_bytes(),
-        checkpoint_cts: root.trx_id,
+        checkpoint_cts: root.root_ts,
     };
     let ser_idx = footer.ser(buf.as_bytes_mut(), SUPER_BLOCK_FOOTER_OFFSET);
     debug_assert_eq!(ser_idx, SUPER_BLOCK_SIZE);
@@ -520,12 +525,18 @@ impl MutableTableFile {
     }
 
     /// Commit the modification of table file.
-    /// Returns the new table file and previous
-    /// active root if exists.
+    ///
+    /// Runtime user-table publishers should prefer
+    /// `TransactionSystem::publish_table_file_root`, which installs the
+    /// post-publish effective timestamp and retains the replaced root. This raw
+    /// file commit leaves the newly published root blocked from reclamation
+    /// until the caller installs that fence.
+    ///
+    /// Returns the new table file and previous active root if exists.
     #[inline]
     pub(crate) async fn commit(
         self,
-        trx_id: TrxID,
+        root_ts: TrxID,
         try_delete_if_fail: bool,
     ) -> Result<(Arc<TableFile>, Option<OldRoot>)> {
         let MutableTableFile {
@@ -535,8 +546,8 @@ impl MutableTableFile {
             write_barrier,
             writer_claim,
         } = self;
-        debug_assert!(new_root.root.trx_id == 0 || new_root.root.trx_id < trx_id);
-        new_root.root.trx_id = trx_id;
+        debug_assert!(new_root.root.root_ts == 0 || new_root.root.root_ts < root_ts);
+        new_root.root.root_ts = root_ts;
         let publish_res = table_file
             .file()
             .publish_root(
@@ -762,7 +773,7 @@ mod tests {
             let (table_file, old_root) = table_file.commit(1, false).await.unwrap();
             assert!(old_root.is_none());
             assert_eq!(table_file.active_root_unchecked().slot_no, 0);
-            assert_eq!(table_file.active_root_unchecked().trx_id, 1);
+            assert_eq!(table_file.active_root_unchecked().root_ts, 1);
             assert_eq!(
                 table_file.active_root_unchecked().secondary_index_roots,
                 vec![SUPER_BLOCK_ID]
@@ -794,7 +805,7 @@ mod tests {
 
             let table_file2 = fs.open_table_file(table_id, global.guard()).await.unwrap();
             let disk_pool = global.guard();
-            assert_eq!(table_file2.active_root_unchecked().trx_id, 1);
+            assert_eq!(table_file2.active_root_unchecked().root_ts, 1);
 
             let mut mutable =
                 MutableTableFile::fork(&table_file2, background_writes, disk_pool.clone());
@@ -822,7 +833,7 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(active_root.slot_no, 1);
-            assert_eq!(active_root.trx_id, 2);
+            assert_eq!(active_root.root_ts, 2);
             assert_eq!(active_root.secondary_index_roots, vec![secondary_root]);
             drop(table_file2);
             drop(table_file3);
@@ -1092,7 +1103,7 @@ mod tests {
             let (table_file, old_root) = table_file.commit(1, false).await.unwrap();
             assert!(old_root.is_none());
             assert_eq!(table_file.active_root_unchecked().slot_no, 0);
-            assert_eq!(table_file.active_root_unchecked().trx_id, 1);
+            assert_eq!(table_file.active_root_unchecked().root_ts, 1);
 
             let global = QuiescentBox::new(
                 ReadonlyBufferPool::with_capacity(PoolRole::Disk, 64 * 1024 * 1024, fs.guard())
@@ -1282,7 +1293,7 @@ mod tests {
             drop(old_root);
 
             let active_root = table_file.active_root_unchecked();
-            assert_eq!(active_root.trx_id, 2);
+            assert_eq!(active_root.root_ts, 2);
             assert_eq!(active_root.pivot_row_id, 20);
             assert_eq!(active_root.heap_redo_start_ts, 7);
             assert_eq!(active_root.deletion_cutoff_ts, 1);

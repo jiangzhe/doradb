@@ -88,7 +88,7 @@ impl Table {
             Arc::clone(&metadata),
             Arc::clone(&file),
             disk_pool.clone(),
-            active_root.trx_id,
+            active_root.root_ts,
         )
         .await?;
         let mem = MemTable {
@@ -1020,7 +1020,8 @@ impl Table {
 /// single active-root observation. Publication and allocation internals remain
 /// behind the table-file boundary.
 pub(crate) struct TableRootSnapshot<'ctx> {
-    root_trx_id: TrxID,
+    root_ts: TrxID,
+    effective_ts: TrxID,
     pivot_row_id: RowID,
     column_block_index_root: BlockID,
     secondary_index_roots: Vec<BlockID>,
@@ -1032,7 +1033,8 @@ impl<'ctx> TableRootSnapshot<'ctx> {
     #[inline]
     fn from_active_root(root: &ActiveRoot, _proof: &TrxReadProof<'ctx>) -> Self {
         Self {
-            root_trx_id: root.trx_id,
+            root_ts: root.root_ts,
+            effective_ts: root.effective_ts(),
             pivot_row_id: root.pivot_row_id,
             column_block_index_root: root.column_block_index_root,
             secondary_index_roots: root.secondary_index_roots.clone(),
@@ -1041,10 +1043,21 @@ impl<'ctx> TableRootSnapshot<'ctx> {
         }
     }
 
-    /// Returns the checkpoint timestamp carried by the captured root.
+    /// Returns the durable timestamp carried by the captured root.
+    ///
+    /// This is a root publication timestamp, not always a transaction commit
+    /// timestamp. Initial create-table roots and checkpoint roots use the
+    /// publishing transaction STS, while index-DDL roots use the DDL commit CTS.
     #[inline]
-    pub(crate) fn root_trx_id(&self) -> TrxID {
-        self.root_trx_id
+    pub(crate) fn root_ts(&self) -> TrxID {
+        self.root_ts
+    }
+
+    /// Returns the runtime timestamp proving when the captured root became
+    /// observable through the table-file active-root pointer.
+    #[inline]
+    pub(crate) fn effective_ts(&self) -> TrxID {
+        self.effective_ts
     }
 
     /// Returns the row-id boundary between persisted and in-memory rows.
@@ -1074,10 +1087,11 @@ impl<'ctx> TableRootSnapshot<'ctx> {
             .ok_or_else(|| missing_secondary_index(index_no, self.secondary_index_roots.len()))
     }
 
-    /// Returns whether the captured root predates the supplied snapshot time.
+    /// Returns whether the captured root was observable before the supplied
+    /// snapshot time.
     #[inline]
     pub(crate) fn root_is_visible_to(&self, sts: TrxID) -> bool {
-        self.root_trx_id < sts
+        self.effective_ts < sts
     }
 }
 

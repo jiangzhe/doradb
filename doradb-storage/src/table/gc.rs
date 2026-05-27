@@ -70,8 +70,13 @@ impl MemIndexCleanupSnapshot<'_> {
     }
 
     #[inline]
-    fn root_trx_id(&self) -> TrxID {
-        self.root.root_trx_id()
+    fn root_ts(&self) -> TrxID {
+        self.root.root_ts()
+    }
+
+    #[inline]
+    fn effective_ts(&self) -> TrxID {
+        self.root.effective_ts()
     }
 
     #[inline]
@@ -230,7 +235,7 @@ impl Table {
         snapshot: &MemIndexCleanupSnapshot<'_>,
         clean_live_entries: bool,
     ) -> Result<SecondaryMemIndexCleanupStats> {
-        debug_assert!(snapshot.deletion_cutoff_ts() <= snapshot.root_trx_id());
+        debug_assert!(snapshot.deletion_cutoff_ts() <= snapshot.root_ts());
 
         let layout = snapshot.layout();
         let metadata = layout.metadata();
@@ -437,7 +442,7 @@ impl Table {
         snapshot: &MemIndexCleanupSnapshot<'_>,
     ) -> Option<ColumnBlockIndex<'a>> {
         if snapshot.column_block_index_root() == SUPER_BLOCK_ID
-            || snapshot.root_trx_id() >= snapshot.min_active_sts
+            || snapshot.effective_ts() >= snapshot.min_active_sts
         {
             return None;
         }
@@ -518,7 +523,7 @@ impl Table {
         // mismatch only after it is older than every active snapshot. Otherwise
         // removing the overlay could expose this newer cold-root fact to a
         // transaction that still depends on the MemIndex delete marker.
-        if snapshot.root_trx_id() >= snapshot.min_active_sts {
+        if snapshot.effective_ts() >= snapshot.min_active_sts {
             return Ok(DeleteOverlayProof::NotProven);
         }
         let Some(column_index) = cleanup_context.column_index else {

@@ -1546,6 +1546,41 @@ impl FileSystem {
         Ok(())
     }
 
+    /// Delete post-redo user-table files absent from recovered catalog/runtime state.
+    #[inline]
+    pub(crate) fn cleanup_recovery_absent_user_table_files(
+        &self,
+        recovered_user_table_ids: &HashSet<TableID>,
+        deferred_drop_table_ids: &HashSet<TableID>,
+    ) -> Result<()> {
+        for entry in fs::read_dir(&self.data_dir)? {
+            let entry = entry?;
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if !file_type.is_file() {
+                continue;
+            }
+            let Some(table_id) = parse_user_table_file_name(&entry.file_name()) else {
+                continue;
+            };
+            if table_id < USER_OBJ_ID_START {
+                continue;
+            }
+            if recovered_user_table_ids.contains(&table_id)
+                || deferred_drop_table_ids.contains(&table_id)
+            {
+                continue;
+            }
+            match fs::remove_file(entry.path()) {
+                Ok(()) => {}
+                Err(err) if err.kind() == IoErrorKind::NotFound => {}
+                Err(err) => return Err(err.into()),
+            }
+        }
+        Ok(())
+    }
+
     /// Build absolute path for the unified catalog file (`*.mtb`).
     #[inline]
     pub(crate) fn catalog_mtb_file_path(&self) -> String {
@@ -2312,6 +2347,33 @@ pub(crate) mod tests {
 
         assert!(dir_path.is_dir());
         assert!(!absent_path.exists());
+    }
+
+    #[test]
+    fn test_cleanup_recovery_absent_user_table_files_keeps_recovered_and_deferred_drop_files() {
+        let (_temp_dir, fs) = build_test_fs();
+        let recovered_id = USER_OBJ_ID_START + 1;
+        let deferred_drop_id = USER_OBJ_ID_START + 2;
+        let orphan_id = USER_OBJ_ID_START + 7;
+        let catalog_path = fs.data_dir.join("2.tbl");
+        let recovered_path = fs.data_dir.join(user_table_file_name(recovered_id));
+        let deferred_drop_path = fs.data_dir.join(user_table_file_name(deferred_drop_id));
+        let orphan_path = fs.data_dir.join(user_table_file_name(orphan_id));
+        std::fs::write(&catalog_path, b"catalog").unwrap();
+        std::fs::write(&recovered_path, b"recovered").unwrap();
+        std::fs::write(&deferred_drop_path, b"deferred").unwrap();
+        std::fs::write(&orphan_path, b"orphan").unwrap();
+
+        fs.cleanup_recovery_absent_user_table_files(
+            &HashSet::from([recovered_id]),
+            &HashSet::from([deferred_drop_id]),
+        )
+        .unwrap();
+
+        assert!(catalog_path.exists());
+        assert!(recovered_path.exists());
+        assert!(deferred_drop_path.exists());
+        assert!(!orphan_path.exists());
     }
 
     #[test]

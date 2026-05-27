@@ -193,9 +193,6 @@ pub(crate) struct LogRecovery<'a> {
     /// Hot row pages touched by redo replay, grouped by table for post-replay
     /// index rebuild and undo-map refresh.
     recovered_tables: HashMap<TableID, BTreeSet<PageID>>,
-    /// Count of unknown user-table redo entries skipped because checkpointed
-    /// catalog absence proves they are older than the catalog replay boundary.
-    skipped_checkpoint_covered_unknown_table_redo: usize,
     /// Dropped user-table files whose runtime state was destroyed during replay.
     dropped_table_file_deletes: Vec<DroppedTableFileDeleteItem>,
     /// Stable pool guards shared by recovery operations.
@@ -205,7 +202,7 @@ pub(crate) struct LogRecovery<'a> {
 #[derive(Clone, Copy, Debug)]
 struct RecoveryTableState {
     /// Active table-root publication timestamp observed during recovery bootstrap.
-    root_trx_id: TrxID,
+    root_ts: TrxID,
     /// Lower bound for replaying heap row-page redo for this table.
     heap_redo_start_ts: TrxID,
     /// Lower bound for replaying persisted cold-delete metadata for this table.
@@ -220,32 +217,22 @@ impl RecoveryTableState {
 }
 
 #[inline]
-fn validate_create_table_reloaded_root_cts(
+fn validate_create_table_reloaded_root_ts(
     table_id: TableID,
     create_table_cts: TrxID,
     state: RecoveryTableState,
     pending_index_ddl_reconciliation: bool,
 ) -> Result<()> {
-    // Create-table redo reopens the latest table root, not a historical root
-    // pinned to the create-table CTS. The root is allowed to be newer, but it
-    // must at least include the create-table publication itself.
-    if state.root_trx_id < create_table_cts {
+    // Create-table redo reopens the latest table root. The initial create root
+    // is published before the catalog commit and therefore carries the create
+    // transaction STS, which can predate the create-table redo CTS. A metadata
+    // mismatch accepted by reload still requires a later root publication so
+    // recovery can prove pending index-DDL metadata has a durable table root.
+    if pending_index_ddl_reconciliation && state.root_ts <= create_table_cts {
         return Err(Report::new(DataIntegrityError::InvalidRootInvariant)
             .attach(format!(
-                "recovered create-table root predates create-table redo: table_id={table_id}, root_trx_id={}, create_table_cts={create_table_cts}",
-                state.root_trx_id
-            ))
-            .into());
-    }
-    // A metadata mismatch accepted by reload means the file root is ahead of
-    // the catalog rows via later index DDL. If the root CTS is exactly the
-    // create-table CTS, there is no later root publication to justify that
-    // temporary divergence.
-    if pending_index_ddl_reconciliation && state.root_trx_id <= create_table_cts {
-        return Err(Report::new(DataIntegrityError::InvalidRootInvariant)
-            .attach(format!(
-                "create-table pending index-DDL reconciliation requires later table root: table_id={table_id}, root_trx_id={}, create_table_cts={create_table_cts}",
-                state.root_trx_id
+                "create-table pending index-DDL reconciliation requires later table root: table_id={table_id}, root_ts={}, create_table_cts={create_table_cts}",
+                state.root_ts
             ))
             .into());
     }
@@ -288,7 +275,6 @@ impl<'a> LogRecovery<'a> {
             table_states: HashMap::new(),
             pending_index_ddl_reconciliations: HashSet::new(),
             recovered_tables: HashMap::new(),
-            skipped_checkpoint_covered_unknown_table_redo: 0,
             dropped_table_file_deletes: Vec::new(),
             pool_guards,
         }
@@ -311,7 +297,10 @@ impl<'a> LogRecovery<'a> {
         }
         // 2. Ensure catalog metadata caught up with table-file roots.
         self.validate_loaded_table_metadata().await?;
-        // 3. Rebuild hot secondary-index state from recovered RowStore pages
+        // 3. Remove create-table provisional files whose catalog redo never
+        //    became durable.
+        self.cleanup_post_replay_absent_user_table_files()?;
+        // 4. Rebuild hot secondary-index state from recovered RowStore pages
         //    and refresh pages to enable undo maps.
         self.recover_indexes_and_refresh_pages().await?;
 
@@ -403,19 +392,6 @@ impl<'a> LogRecovery<'a> {
             .into())
     }
 
-    #[inline]
-    fn record_skipped_checkpoint_covered_unknown_table_redo(&mut self, count: usize) {
-        self.skipped_checkpoint_covered_unknown_table_redo = self
-            .skipped_checkpoint_covered_unknown_table_redo
-            .saturating_add(count);
-    }
-
-    #[cfg(test)]
-    #[inline]
-    fn skipped_checkpoint_covered_unknown_table_redo(&self) -> usize {
-        self.skipped_checkpoint_covered_unknown_table_redo
-    }
-
     async fn track_loaded_table(&mut self, table_id: TableID) -> Result<RecoveryTableState> {
         let table = self.catalog.get_table(table_id).await.ok_or_else(|| {
             Error::from(
@@ -427,13 +403,13 @@ impl<'a> LogRecovery<'a> {
         // the table root loaded during restart, before normal transactions run.
         let active_root = table.file().active_root_unchecked();
         let state = RecoveryTableState {
-            root_trx_id: active_root.trx_id,
+            root_ts: active_root.root_ts,
             heap_redo_start_ts: active_root.heap_redo_start_ts,
             deletion_cutoff_ts: active_root.deletion_cutoff_ts,
         };
         self.max_recovered_cts = self
             .max_recovered_cts
-            .max(state.root_trx_id)
+            .max(state.root_ts)
             .max(state.heap_redo_start_ts)
             .max(state.deletion_cutoff_ts);
         let old = self.table_states.insert(table_id, state);
@@ -455,11 +431,11 @@ impl<'a> LogRecovery<'a> {
         // than the catalog checkpoint. The invalid state is the opposite case,
         // where a pre-cursor root would require catalog redo that checkpoint
         // bootstrap has already declared unnecessary.
-        if state.root_trx_id < self.catalog_replay_start_ts {
+        if state.root_ts < self.catalog_replay_start_ts {
             return Err(Report::new(DataIntegrityError::InvalidRootInvariant)
                 .attach(format!(
-                    "checkpointed table pending index-DDL reconciliation has root before catalog replay boundary: table_id={table_id}, root_trx_id={}, catalog_replay_start_ts={}",
-                    state.root_trx_id,
+                    "checkpointed table pending index-DDL reconciliation has root before catalog replay boundary: table_id={table_id}, root_ts={}, catalog_replay_start_ts={}",
+                    state.root_ts,
                     self.catalog_replay_start_ts
                 ))
                 .into());
@@ -559,8 +535,8 @@ impl<'a> LogRecovery<'a> {
                 let pending = self.pending_index_ddl_reconciliations.contains(&table_id);
                 return Err(Report::new(DataIntegrityError::InvalidRootInvariant)
                     .attach(format!(
-                        "recovered user table metadata mismatch after redo replay: table_id={table_id}, root_trx_id={}, catalog_replay_start_ts={}, pending_index_ddl_reconciliation={pending}, catalog_next_index_no={}, root_next_index_no={}",
-                        active_root.trx_id,
+                        "recovered user table metadata mismatch after redo replay: table_id={table_id}, root_ts={}, catalog_replay_start_ts={}, pending_index_ddl_reconciliation={pending}, catalog_next_index_no={}, root_next_index_no={}",
+                        active_root.root_ts,
                         self.catalog_replay_start_ts,
                         catalog_metadata.idx.next_index_no(),
                         active_root.metadata.idx.next_index_no()
@@ -582,6 +558,19 @@ impl<'a> LogRecovery<'a> {
                 .into());
         }
         Ok(())
+    }
+
+    fn cleanup_post_replay_absent_user_table_files(&self) -> Result<()> {
+        let recovered_user_table_ids = self.table_states.keys().copied().collect::<HashSet<_>>();
+        let deferred_drop_table_ids = self
+            .dropped_table_file_deletes
+            .iter()
+            .map(|item| item.table_id)
+            .collect::<HashSet<_>>();
+        self.table_fs.cleanup_recovery_absent_user_table_files(
+            &recovered_user_table_ids,
+            &deferred_drop_table_ids,
+        )
     }
 
     async fn refresh_page(
@@ -646,7 +635,7 @@ impl<'a> LogRecovery<'a> {
                 // Validate the root/create CTS relation before marking the table
                 // as pending, so impossible metadata divergence fails at the
                 // source instead of surfacing only in final equality validation.
-                validate_create_table_reloaded_root_cts(
+                validate_create_table_reloaded_root_ts(
                     *table_id,
                     cts,
                     state,
@@ -687,7 +676,6 @@ impl<'a> LogRecovery<'a> {
                 if self.classify_user_table_redo(*table_id, cts, "replay create index")?
                     == UserTableRedoAction::SkipCheckpointCoveredUnknownTable
                 {
-                    self.record_skipped_checkpoint_covered_unknown_table_redo(1);
                     return Ok(());
                 }
                 let proof =
@@ -710,7 +698,6 @@ impl<'a> LogRecovery<'a> {
                 if self.classify_user_table_redo(*table_id, cts, "replay drop index")?
                     == UserTableRedoAction::SkipCheckpointCoveredUnknownTable
                 {
-                    self.record_skipped_checkpoint_covered_unknown_table_redo(1);
                     return Ok(());
                 }
                 let proof =
@@ -736,7 +723,6 @@ impl<'a> LogRecovery<'a> {
                 if self.classify_user_table_redo(*table_id, cts, "replay create row page")?
                     == UserTableRedoAction::SkipCheckpointCoveredUnknownTable
                 {
-                    self.record_skipped_checkpoint_covered_unknown_table_redo(1);
                     return Ok(());
                 }
                 if cts < self.table_heap_redo_start_ts(*table_id)? {
@@ -779,7 +765,6 @@ impl<'a> LogRecovery<'a> {
                 if self.classify_user_table_redo(*table_id, cts, "replay data checkpoint")?
                     == UserTableRedoAction::SkipCheckpointCoveredUnknownTable
                 {
-                    self.record_skipped_checkpoint_covered_unknown_table_redo(1);
                     return Ok(());
                 }
                 if cts < self.table_heap_redo_start_ts(*table_id)? {
@@ -846,7 +831,6 @@ impl<'a> LogRecovery<'a> {
             if self.classify_user_table_redo(table_id, cts, "replay user table DML")?
                 == UserTableRedoAction::SkipCheckpointCoveredUnknownTable
             {
-                self.record_skipped_checkpoint_covered_unknown_table_redo(table_dml.rows.len());
                 continue;
             }
             if cts < self.table_replay_start_ts(table_id)? {
@@ -957,7 +941,7 @@ impl<'a> LogRecovery<'a> {
 #[cfg(test)]
 mod tests {
     use super::{
-        LogRecovery, RecoverMap, RecoveryTableState, validate_create_table_reloaded_root_cts,
+        LogRecovery, RecoverMap, RecoveryTableState, validate_create_table_reloaded_root_ts,
     };
     use crate::buffer::{PageID, PoolRole};
     use crate::catalog::{
@@ -1379,8 +1363,11 @@ mod tests {
         mutable
             .replace_metadata_and_secondary_index_roots(metadata, roots)
             .unwrap();
-        let (_table_file, old_root) = mutable.commit(cts, false).await.unwrap();
-        drop(old_root);
+        engine
+            .trx_sys
+            .publish_table_file_root(mutable, cts, false)
+            .await
+            .unwrap();
         drop(table);
     }
 
@@ -1440,14 +1427,14 @@ mod tests {
     #[test]
     fn test_recovery_table_state_replay_start_uses_heap_and_deletion_floor() {
         let heap_first = RecoveryTableState {
-            root_trx_id: 5,
+            root_ts: 5,
             heap_redo_start_ts: 7,
             deletion_cutoff_ts: 11,
         };
         assert_eq!(heap_first.replay_start_ts(), 7);
 
         let deletion_first = RecoveryTableState {
-            root_trx_id: 17,
+            root_ts: 17,
             heap_redo_start_ts: 19,
             deletion_cutoff_ts: 13,
         };
@@ -1455,32 +1442,21 @@ mod tests {
     }
 
     #[test]
-    fn test_create_table_root_cts_validation_rejects_impossible_states() {
+    fn test_create_table_root_ts_validation_accepts_initial_sts_root() {
         let root_before_create = RecoveryTableState {
-            root_trx_id: 9,
+            root_ts: 9,
             heap_redo_start_ts: 9,
             deletion_cutoff_ts: 9,
         };
-        let err = validate_create_table_reloaded_root_cts(
-            USER_OBJ_ID_START,
-            10,
-            root_before_create,
-            false,
-        )
-        .unwrap_err();
-        assert_eq!(
-            err.data_integrity_error(),
-            Some(DataIntegrityError::InvalidRootInvariant)
-        );
-        let report = format!("{err:?}");
-        assert!(report.contains("predates create-table redo"), "{report}");
+        validate_create_table_reloaded_root_ts(USER_OBJ_ID_START, 10, root_before_create, false)
+            .unwrap();
 
         let pending_without_later_root = RecoveryTableState {
-            root_trx_id: 10,
+            root_ts: 10,
             heap_redo_start_ts: 10,
             deletion_cutoff_ts: 10,
         };
-        let err = validate_create_table_reloaded_root_cts(
+        let err = validate_create_table_reloaded_root_ts(
             USER_OBJ_ID_START,
             10,
             pending_without_later_root,
@@ -1493,13 +1469,14 @@ mod tests {
         );
         let report = format!("{err:?}");
         assert!(report.contains("requires later table root"), "{report}");
+        assert!(report.contains("root_ts=10"), "{report}");
 
         let pending_with_later_root = RecoveryTableState {
-            root_trx_id: 11,
+            root_ts: 11,
             heap_redo_start_ts: 10,
             deletion_cutoff_ts: 10,
         };
-        validate_create_table_reloaded_root_cts(
+        validate_create_table_reloaded_root_ts(
             USER_OBJ_ID_START,
             10,
             pending_with_later_root,
@@ -1526,19 +1503,16 @@ mod tests {
                 .replay_log(unknown_table_dml_log(unknown_table_id, 9))
                 .await
                 .unwrap();
-            assert_eq!(recovery.skipped_checkpoint_covered_unknown_table_redo(), 1);
 
             recovery
                 .replay_log(unknown_table_create_row_page_log(unknown_table_id, 9))
                 .await
                 .unwrap();
-            assert_eq!(recovery.skipped_checkpoint_covered_unknown_table_redo(), 2);
 
             recovery
                 .replay_log(unknown_table_data_checkpoint_log(unknown_table_id, 9))
                 .await
                 .unwrap();
-            assert_eq!(recovery.skipped_checkpoint_covered_unknown_table_redo(), 3);
 
             drop(recovery);
             drop(engine);
@@ -1567,10 +1541,6 @@ mod tests {
             let report = format!("{err:?}");
             assert!(report.contains("invalid recovery ordering"), "{report}");
             assert!(report.contains("replay user table DML"), "{report}");
-            assert_eq!(
-                dml_recovery.skipped_checkpoint_covered_unknown_table_redo(),
-                0
-            );
 
             let mut ddl_recovery = log_recovery_for_engine(&engine, 10);
             let err = ddl_recovery
@@ -1581,10 +1551,6 @@ mod tests {
             let report = format!("{err:?}");
             assert!(report.contains("invalid recovery ordering"), "{report}");
             assert!(report.contains("replay create row page"), "{report}");
-            assert_eq!(
-                ddl_recovery.skipped_checkpoint_covered_unknown_table_redo(),
-                0
-            );
 
             drop(ddl_recovery);
             drop(dml_recovery);

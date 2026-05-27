@@ -1,11 +1,22 @@
+use crate::buffer::PoolGuards;
 use crate::catalog::spec::{ActiveIndexSpec, ColumnAttributes, ColumnSpec, IndexNo, IndexSpec};
-use crate::error::{ConfigError, Error, InternalError, OperationError, Result};
+use crate::catalog::{
+    ColumnObject, IndexColumnObject, IndexObject, TableID, TableObject, is_user_obj_id,
+};
+use crate::engine::EngineRef;
+use crate::error::{ConfigError, Error, FatalError, InternalError, OperationError, Result};
+use crate::file::table_file::{MutableTableFile, TableFile};
+use crate::index::BlockIndex;
 use crate::lock::{
     FreshLockGuard, LockGrant, LockManager, LockMode, LockOwner, LockOwnerGroup, LockResource,
 };
 use crate::row::ops::SelectKey;
 use crate::row::{Row, RowRead};
 use crate::serde::{Deser, Ser, Serde};
+use crate::session::{Session, SessionDdlContext};
+use crate::table::Table;
+use crate::trx::ActiveTrx;
+use crate::trx::redo::DDLRedo;
 use crate::value::{Val, ValKind, ValType};
 use error_stack::Report;
 use semistr::SemiStr;
@@ -33,6 +44,864 @@ fn index_not_found(message: impl Into<String>) -> Error {
     Report::new(OperationError::IndexNotFound)
         .attach(message.into())
         .into()
+}
+
+/// Create a new user table for a session-level DDL request.
+pub(crate) async fn create_table_for_session(
+    session: &mut Session,
+    table_spec: super::TableSpec,
+    index_specs: Vec<IndexSpec>,
+) -> Result<TableID> {
+    let ctx = SessionDdlContext::new(session)?;
+    let engine = ctx.engine.clone();
+    let _namespace_lock =
+        acquire_catalog_namespace_lock(engine.lock_manager(), ctx.owner, ctx.owner_group).await?;
+
+    let table_id = engine.catalog().next_user_obj_id();
+    let metadata = Arc::new(super::TableMetadata::try_new(
+        table_spec.columns.clone(),
+        index_specs.clone(),
+    )?);
+    let uninit_table_file =
+        engine
+            .table_fs
+            .create_table_file(table_id, Arc::clone(&metadata), false)?;
+
+    let table_object = TableObject {
+        table_id,
+        next_index_no: metadata.idx.next_index_no(),
+    };
+    let column_objects: Vec<_> = table_spec
+        .columns
+        .iter()
+        .enumerate()
+        .map(|(col_no, col_spec)| ColumnObject {
+            table_id,
+            column_no: col_no as u16,
+            column_name: col_spec.column_name.clone(),
+            column_type: col_spec.column_type,
+            column_attributes: col_spec.column_attributes,
+        })
+        .collect();
+
+    let mut index_objects = Vec::new();
+    let mut index_column_objects = Vec::new();
+    for (index_no, index_spec) in metadata.idx.active_indexes() {
+        index_objects.push(IndexObject {
+            table_id,
+            index_no: index_no as u16,
+            index_attributes: index_spec.attributes,
+        });
+        for (index_column_no, ik) in index_spec.cols.iter().enumerate() {
+            index_column_objects.push(IndexColumnObject {
+                table_id,
+                index_no: index_no as u16,
+                index_column_no: index_column_no as u16,
+                column_no: ik.col_no,
+                index_order: ik.order,
+            });
+        }
+    }
+
+    let mut progress = CreateTableProgress::new(table_id, uninit_table_file);
+    let mut trx = match session.begin_trx() {
+        Ok(trx) => trx,
+        Err(err) => {
+            let delete_res = progress.delete_provisional_file(&engine);
+            progress.phase = CreateTablePhase::Aborted;
+            delete_res?;
+            return Err(err);
+        }
+    };
+
+    let exec_res = execute_create_table_catalog_staging(
+        &engine,
+        &mut trx,
+        table_id,
+        table_object,
+        column_objects,
+        index_objects,
+        index_column_objects,
+    )
+    .await;
+    progress.set_catalog_transaction(trx);
+    if let Err(err) = exec_res {
+        return Err(progress
+            .abort_before_catalog_commit(&engine, session.pool_guards(), "catalog staging", err)
+            .await);
+    }
+    progress.mark_catalog_staged();
+
+    #[cfg(test)]
+    if let Err(err) =
+        test_hooks::maybe_fail_create_table(test_hooks::CreateTableTestFailure::AfterCatalogStaged)
+    {
+        return Err(progress
+            .abort_before_catalog_commit(
+                &engine,
+                session.pool_guards(),
+                "test after catalog staging",
+                err,
+            )
+            .await);
+    }
+
+    if let Err(err) = progress.publish_file(&engine).await {
+        return Err(progress
+            .abort_before_catalog_commit(&engine, session.pool_guards(), "file publish", err)
+            .await);
+    }
+
+    #[cfg(test)]
+    if let Err(err) =
+        test_hooks::maybe_fail_create_table(test_hooks::CreateTableTestFailure::AfterFilePublished)
+    {
+        return Err(progress
+            .abort_before_catalog_commit(
+                &engine,
+                session.pool_guards(),
+                "test after file publish",
+                err,
+            )
+            .await);
+    }
+
+    if let Err(err) = progress.build_runtime(session, &engine).await {
+        return Err(progress
+            .abort_before_catalog_commit(&engine, session.pool_guards(), "runtime build", err)
+            .await);
+    }
+
+    #[cfg(test)]
+    if let Err(err) =
+        test_hooks::maybe_fail_create_table(test_hooks::CreateTableTestFailure::AfterRuntimeBuilt)
+    {
+        return Err(progress
+            .abort_before_catalog_commit(
+                &engine,
+                session.pool_guards(),
+                "test after runtime build",
+                err,
+            )
+            .await);
+    }
+
+    #[cfg(test)]
+    test_hooks::maybe_poison_before_create_table_catalog_commit(&engine);
+
+    if let Err(err) = progress.commit_catalog().await {
+        return Err(progress
+            .abort_after_root_publish_commit_error(
+                &engine,
+                session.pool_guards(),
+                "catalog commit",
+                err,
+            )
+            .await);
+    }
+
+    if let Err(err) = progress.install_runtime(&engine) {
+        return Err(progress
+            .abort_after_root_publish_commit_error(
+                &engine,
+                session.pool_guards(),
+                "runtime install",
+                err,
+            )
+            .await);
+    }
+
+    Ok(table_id)
+}
+
+/// Logically drop an existing user table for a session-level DDL request.
+pub(crate) async fn drop_table_for_session(session: &mut Session, table_id: TableID) -> Result<()> {
+    let ctx = SessionDdlContext::new(session)?;
+    let engine = ctx.engine.clone();
+    let lock_manager = engine.lock_manager();
+    // Keep this guard alive until runtime removal is complete so table
+    // identity removal remains namespace-serialized.
+    let _namespace_lock =
+        acquire_catalog_namespace_lock(lock_manager, ctx.owner, ctx.owner_group).await?;
+
+    let table = validated_drop_table_target(session, &engine, table_id).await?;
+    reject_table_ddl_explicit_session_lock(lock_manager, table_id, ctx.owner, "drop table")?;
+    let mut table_locks =
+        acquire_table_ddl_locks(lock_manager, table_id, ctx.owner, ctx.owner_group).await?;
+    engine.trx_sys.ensure_runtime_healthy()?;
+
+    let mut trx = session.begin_trx()?;
+
+    if let Err(err) = table.begin_drop_lifecycle().await {
+        trx.rollback().await?;
+        return Err(err);
+    }
+
+    let metadata = table.metadata().clone();
+    let exec_res = execute_drop_table_catalog_cascade(&engine, &mut trx, table_id, &metadata).await;
+    if let Err(err) = exec_res {
+        // `trx.exec` may have already discarded the transaction after a fatal
+        // statement-rollback failure. In either case the drop gate has been
+        // crossed, so preserve the poison outcome below.
+        let _ = trx.rollback().await;
+        return Err(poison_drop_table_after_gate_with_source(
+            &engine,
+            table_id,
+            "catalog cascade",
+            err,
+        )
+        .into());
+    }
+
+    let drop_cts = match trx.commit().await {
+        Ok(drop_cts) => drop_cts,
+        Err(err) => {
+            return Err(
+                poison_drop_table_after_gate_with_source(&engine, table_id, "commit", err).into(),
+            );
+        }
+    };
+
+    let removed = finish_drop_table_runtime_removal(&engine, table_id, &table)?;
+    table_locks.fail_waiters_on_release(OperationError::TableNotFound);
+    drop(table);
+    // Foreground DROP TABLE stops at logical/runtime removal. Physical runtime
+    // destruction and file unlink are purge-owned so stale handles, active
+    // snapshots, and catalog checkpoint durability can be honored without
+    // blocking this DDL call on best-effort cleanup work.
+    engine
+        .trx_sys
+        .enqueue_dropped_table(table_id, drop_cts, removed);
+    Ok(())
+}
+
+#[inline]
+async fn acquire_catalog_namespace_lock<'a>(
+    lock_manager: &'a LockManager,
+    owner: LockOwner,
+    owner_group: LockOwnerGroup,
+) -> Result<ScopedCatalogNamespaceLock<'a>> {
+    let resource = LockResource::CatalogNamespace;
+    lock_manager
+        .acquire_grouped(resource, LockMode::Exclusive, owner, owner_group)
+        .await?;
+    Ok(ScopedCatalogNamespaceLock {
+        lock_manager,
+        resource,
+        owner,
+    })
+}
+
+struct ScopedCatalogNamespaceLock<'a> {
+    lock_manager: &'a LockManager,
+    resource: LockResource,
+    owner: LockOwner,
+}
+
+impl Drop for ScopedCatalogNamespaceLock<'_> {
+    #[inline]
+    fn drop(&mut self) {
+        self.lock_manager.release(self.resource, self.owner);
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CreateTablePhase {
+    Init,
+    CatalogStaged,
+    FilePublished,
+    RuntimeBuilt,
+    CatalogCommitted,
+    Installed,
+    Aborted,
+}
+
+impl CreateTablePhase {
+    #[inline]
+    fn is_terminal(self) -> bool {
+        matches!(self, Self::Installed | Self::Aborted)
+    }
+}
+
+struct CreateTableProgress {
+    table_id: TableID,
+    phase: CreateTablePhase,
+    mutable_file: Option<MutableTableFile>,
+    trx: Option<ActiveTrx>,
+    table_file: Option<Arc<TableFile>>,
+    staged_table: Option<Arc<Table>>,
+}
+
+impl CreateTableProgress {
+    #[inline]
+    fn new(table_id: TableID, mutable_file: MutableTableFile) -> Self {
+        Self {
+            table_id,
+            phase: CreateTablePhase::Init,
+            mutable_file: Some(mutable_file),
+            trx: None,
+            table_file: None,
+            staged_table: None,
+        }
+    }
+
+    #[inline]
+    fn set_catalog_transaction(&mut self, trx: ActiveTrx) {
+        debug_assert!(self.trx.is_none());
+        self.trx = Some(trx);
+    }
+
+    #[inline]
+    fn mark_catalog_staged(&mut self) {
+        debug_assert_eq!(self.phase, CreateTablePhase::Init);
+        self.phase = CreateTablePhase::CatalogStaged;
+    }
+
+    #[inline]
+    async fn publish_file(&mut self, engine: &EngineRef) -> Result<()> {
+        debug_assert_eq!(self.phase, CreateTablePhase::CatalogStaged);
+        let root_ts = self
+            .trx
+            .as_ref()
+            .expect("catalog transaction is staged before file publish")
+            .sts();
+        let mutable_file = self
+            .mutable_file
+            .take()
+            .expect("mutable create-table file is present before publish");
+        let table_file = engine
+            .trx_sys
+            .publish_table_file_root(mutable_file, root_ts, true)
+            .await?;
+        self.table_file = Some(table_file);
+        self.phase = CreateTablePhase::FilePublished;
+        Ok(())
+    }
+
+    #[inline]
+    async fn build_runtime(&mut self, session: &Session, engine: &EngineRef) -> Result<()> {
+        debug_assert_eq!(self.phase, CreateTablePhase::FilePublished);
+        let table_file = Arc::clone(
+            self.table_file
+                .as_ref()
+                .expect("published table file is present before runtime build"),
+        );
+        let active_root = table_file.active_root_unchecked();
+        let blk_idx = BlockIndex::new(
+            engine.meta_pool.clone_inner(),
+            session.pool_guards().meta_guard(),
+            active_root.pivot_row_id,
+            active_root.column_block_index_root,
+        )
+        .await?;
+        let table = Arc::new(
+            Table::new(
+                engine.mem_pool.clone_inner(),
+                engine.index_pool.clone_inner(),
+                session.pool_guards().index_guard(),
+                self.table_id,
+                blk_idx,
+                table_file,
+                engine.disk_pool.clone_inner(),
+            )
+            .await?,
+        );
+        self.staged_table = Some(table);
+        self.phase = CreateTablePhase::RuntimeBuilt;
+        Ok(())
+    }
+
+    #[inline]
+    async fn commit_catalog(&mut self) -> Result<()> {
+        debug_assert_eq!(self.phase, CreateTablePhase::RuntimeBuilt);
+        let trx = self
+            .trx
+            .take()
+            .expect("catalog transaction is present before commit");
+        trx.commit().await?;
+        self.phase = CreateTablePhase::CatalogCommitted;
+        Ok(())
+    }
+
+    #[inline]
+    fn install_runtime(&mut self, engine: &EngineRef) -> Result<()> {
+        debug_assert_eq!(self.phase, CreateTablePhase::CatalogCommitted);
+        let table = Arc::clone(
+            self.staged_table
+                .as_ref()
+                .expect("staged table runtime is present before install"),
+        );
+        engine.catalog().insert_user_table(table)?;
+        let _ = self.staged_table.take();
+        self.phase = CreateTablePhase::Installed;
+        Ok(())
+    }
+
+    #[inline]
+    fn delete_provisional_file(&mut self, engine: &EngineRef) -> Result<()> {
+        if let Some(mutable_file) = self.mutable_file.take() {
+            let _ = mutable_file.try_delete();
+        }
+        let _ = self.table_file.take();
+        engine.table_fs.delete_user_table_file(self.table_id)
+    }
+
+    async fn destroy_staged_runtime(&mut self, guards: &PoolGuards) -> Result<()> {
+        let Some(table) = self.staged_table.take() else {
+            return Ok(());
+        };
+        let table = Arc::try_unwrap(table).map_err(|table| {
+            Report::new(InternalError::Generic).attach(format!(
+                "staged create-table runtime still referenced during cleanup: table_id={}, strong_count={}",
+                self.table_id,
+                Arc::strong_count(&table)
+            ))
+        })?;
+        table.destroy_dropped_runtime(guards).await
+    }
+
+    async fn abort_before_catalog_commit(
+        &mut self,
+        engine: &EngineRef,
+        guards: &PoolGuards,
+        operation: &'static str,
+        source: Error,
+    ) -> Error {
+        let source_debug = format!("{source:?}");
+        let mut cleanup_error = None;
+        if let Err(err) = self.destroy_staged_runtime(guards).await {
+            cleanup_error = Some(
+                poison_create_table_cleanup_with_source(
+                    engine,
+                    self.table_id,
+                    operation,
+                    "runtime destroy",
+                    &source_debug,
+                    err,
+                )
+                .into(),
+            );
+        }
+        if let Some(trx) = self.trx.take()
+            && trx.engine().is_some()
+            && let Err(err) = trx.rollback().await
+            && cleanup_error.is_none()
+        {
+            cleanup_error = Some(
+                poison_create_table_rollback_with_source(
+                    engine,
+                    self.table_id,
+                    operation,
+                    &source_debug,
+                    err,
+                )
+                .into(),
+            );
+        }
+        if let Err(err) = self.delete_provisional_file(engine)
+            && cleanup_error.is_none()
+        {
+            cleanup_error = Some(err);
+        }
+        self.phase = CreateTablePhase::Aborted;
+        cleanup_error.unwrap_or(source)
+    }
+
+    async fn abort_after_root_publish_commit_error(
+        &mut self,
+        engine: &EngineRef,
+        guards: &PoolGuards,
+        operation: &'static str,
+        source: Error,
+    ) -> Error {
+        let source_debug = format!("{source:?}");
+        if let Err(err) = self.destroy_staged_runtime(guards).await {
+            self.phase = CreateTablePhase::Aborted;
+            return poison_create_table_cleanup_with_source(
+                engine,
+                self.table_id,
+                operation,
+                "runtime destroy after root publish",
+                &source_debug,
+                err,
+            )
+            .into();
+        }
+        self.phase = CreateTablePhase::Aborted;
+        poison_create_table_after_root_publish_with_source(engine, self.table_id, operation, source)
+            .into()
+    }
+}
+
+impl Drop for CreateTableProgress {
+    #[inline]
+    fn drop(&mut self) {
+        debug_assert!(
+            self.phase.is_terminal(),
+            "create-table progress dropped in non-terminal phase: table_id={}, phase={:?}",
+            self.table_id,
+            self.phase
+        );
+    }
+}
+
+#[inline]
+pub(crate) fn reject_non_user_table_id(table_id: TableID, operation: &'static str) -> Result<()> {
+    if is_user_obj_id(table_id) {
+        return Ok(());
+    }
+    Err(Report::new(OperationError::TableNotFound)
+        .attach(format!(
+            "{operation} requires user table id: table_id={table_id}"
+        ))
+        .into())
+}
+
+#[inline]
+pub(crate) async fn ensure_user_table_catalog_row(
+    session: &Session,
+    engine: &EngineRef,
+    table_id: TableID,
+    operation: &'static str,
+) -> Result<()> {
+    if engine
+        .catalog()
+        .storage
+        .tables()
+        .find_uncommitted_by_id(session.pool_guards(), table_id)
+        .await?
+        .is_some()
+    {
+        return Ok(());
+    }
+    Err(Report::new(OperationError::TableNotFound)
+        .attach(format!("{operation} catalog lookup: table_id={table_id}"))
+        .into())
+}
+
+pub(crate) async fn precheck_index_ddl_target(
+    session: &Session,
+    engine: &EngineRef,
+    table_id: TableID,
+    operation: &'static str,
+) -> Result<()> {
+    let _ = validated_index_ddl_target(session, engine, table_id, operation).await?;
+    Ok(())
+}
+
+pub(crate) async fn validated_index_ddl_target(
+    session: &Session,
+    engine: &EngineRef,
+    table_id: TableID,
+    operation: &'static str,
+) -> Result<Arc<Table>> {
+    reject_non_user_table_id(table_id, operation)?;
+    let table = engine
+        .catalog()
+        .validate_user_table_live(table_id, operation)
+        .await?;
+    ensure_user_table_catalog_row(session, engine, table_id, operation).await?;
+    Ok(table)
+}
+
+async fn validated_drop_table_target(
+    session: &Session,
+    engine: &EngineRef,
+    table_id: TableID,
+) -> Result<Arc<Table>> {
+    reject_non_user_table_id(table_id, "drop table")?;
+    let Some(table) = engine.catalog().get_table(table_id).await else {
+        return Err(Report::new(OperationError::TableNotFound)
+            .attach(format!("drop table runtime lookup: table_id={table_id}"))
+            .into());
+    };
+    ensure_user_table_catalog_row(session, engine, table_id, "drop table").await?;
+    Ok(table)
+}
+
+#[inline]
+async fn execute_create_table_catalog_staging(
+    engine: &EngineRef,
+    trx: &mut ActiveTrx,
+    table_id: TableID,
+    table_object: TableObject,
+    column_objects: Vec<ColumnObject>,
+    index_objects: Vec<IndexObject>,
+    index_column_objects: Vec<IndexColumnObject>,
+) -> Result<()> {
+    trx.exec(async |stmt| {
+        let inserted = engine
+            .catalog()
+            .storage
+            .tables()
+            .insert(stmt, &table_object)
+            .await;
+        if !inserted {
+            return Err(Report::new(OperationError::TableAlreadyExists)
+                .attach(format!("create table catalog object: table_id={table_id}"))
+                .into());
+        }
+
+        for column_object in column_objects {
+            let inserted = engine
+                .catalog()
+                .storage
+                .columns()
+                .insert(stmt, &column_object)
+                .await;
+            debug_assert!(inserted);
+        }
+        for index_object in index_objects {
+            let inserted = engine
+                .catalog()
+                .storage
+                .indexes()
+                .insert(stmt, &index_object)
+                .await;
+            debug_assert!(inserted);
+        }
+        for index_column_object in index_column_objects {
+            let inserted = engine
+                .catalog()
+                .storage
+                .index_columns()
+                .insert(stmt, &index_column_object)
+                .await;
+            debug_assert!(inserted);
+        }
+
+        let res = stmt
+            .effects_mut()
+            .set_ddl_redo(DDLRedo::CreateTable(table_id));
+        debug_assert!(res.is_none());
+        Ok(())
+    })
+    .await
+}
+
+#[inline]
+async fn execute_drop_table_catalog_cascade(
+    engine: &EngineRef,
+    trx: &mut ActiveTrx,
+    table_id: TableID,
+    metadata: &TableMetadata,
+) -> Result<()> {
+    trx.exec(async |stmt| {
+        let index_columns_deleted = engine
+            .catalog()
+            .storage
+            .index_columns()
+            .delete_by_table_id(stmt, table_id)
+            .await?;
+        let indexes_deleted = engine
+            .catalog()
+            .storage
+            .indexes()
+            .delete_by_table_id(stmt, table_id)
+            .await?;
+        let columns_deleted = engine
+            .catalog()
+            .storage
+            .columns()
+            .delete_by_table_id(stmt, table_id)
+            .await?;
+        let table_deleted = engine
+            .catalog()
+            .storage
+            .tables()
+            .delete_by_id(stmt, table_id)
+            .await;
+        if !table_deleted {
+            return Err(Report::new(OperationError::TableNotFound)
+                .attach(format!("drop table catalog row: table_id={table_id}"))
+                .into());
+        }
+
+        validate_drop_catalog_delete_counts(
+            table_id,
+            metadata,
+            columns_deleted,
+            indexes_deleted,
+            index_columns_deleted,
+        )?;
+
+        let res = stmt
+            .effects_mut()
+            .set_ddl_redo(DDLRedo::DropTable(table_id));
+        debug_assert!(res.is_none());
+        Ok(())
+    })
+    .await
+}
+
+#[inline]
+fn validate_drop_catalog_delete_counts(
+    table_id: TableID,
+    metadata: &TableMetadata,
+    columns_deleted: usize,
+    indexes_deleted: usize,
+    index_columns_deleted: usize,
+) -> Result<()> {
+    let expected_index_columns = metadata
+        .idx
+        .active_indexes()
+        .map(|(_, spec)| spec.cols.len())
+        .sum::<usize>();
+    if columns_deleted == metadata.col.col_count()
+        && indexes_deleted == metadata.idx.active_index_count()
+        && index_columns_deleted == expected_index_columns
+    {
+        return Ok(());
+    }
+    Err(Report::new(InternalError::Generic)
+        .attach(format!(
+            "drop table catalog cascade count mismatch: table_id={table_id}, columns_deleted={columns_deleted}, expected_columns={}, indexes_deleted={indexes_deleted}, expected_indexes={}, index_columns_deleted={index_columns_deleted}, expected_index_columns={expected_index_columns}",
+            metadata.col.col_count(),
+            metadata.idx.active_index_count(),
+        ))
+        .into())
+}
+
+#[inline]
+fn finish_drop_table_runtime_removal(
+    engine: &EngineRef,
+    table_id: TableID,
+    table: &Arc<Table>,
+) -> Result<Arc<Table>> {
+    if let Err(_err) = table.mark_dropped_lifecycle() {
+        return Err(poison_drop_table_after_gate(engine, table_id, "mark dropped").into());
+    }
+    match engine.catalog().remove_user_table(table_id) {
+        Some(removed) if Arc::ptr_eq(&removed, table) => Ok(removed),
+        Some(_) | None => {
+            Err(poison_drop_table_after_gate(engine, table_id, "runtime removal").into())
+        }
+    }
+}
+
+#[inline]
+fn poison_create_table_after_root_publish_with_source(
+    engine: &EngineRef,
+    table_id: TableID,
+    operation: &'static str,
+    source: Error,
+) -> Report<FatalError> {
+    let poison = engine.trx_sys.poison_storage(FatalError::Poisoned);
+    source
+        .into_report()
+        .change_context(*poison.current_context())
+        .attach(format!(
+            "create table failed after table-root publish: table_id={table_id}, operation={operation}"
+        ))
+}
+
+#[inline]
+fn poison_create_table_rollback_with_source(
+    engine: &EngineRef,
+    table_id: TableID,
+    operation: &'static str,
+    source_debug: &str,
+    rollback_err: Error,
+) -> Report<FatalError> {
+    let poison = engine.trx_sys.poison_storage(FatalError::RollbackAccess);
+    rollback_err
+        .into_report()
+        .change_context(*poison.current_context())
+        .attach(format!(
+            "create table rollback cleanup failed: table_id={table_id}, operation={operation}, source_error={source_debug}"
+        ))
+}
+
+#[inline]
+fn poison_create_table_cleanup_with_source(
+    engine: &EngineRef,
+    table_id: TableID,
+    operation: &'static str,
+    cleanup_operation: &'static str,
+    source_debug: &str,
+    cleanup_err: Error,
+) -> Report<FatalError> {
+    let poison = engine.trx_sys.poison_storage(FatalError::Poisoned);
+    cleanup_err
+        .into_report()
+        .change_context(*poison.current_context())
+        .attach(format!(
+            "create table cleanup failed: table_id={table_id}, operation={operation}, cleanup_operation={cleanup_operation}, source_error={source_debug}"
+        ))
+}
+
+#[inline]
+fn poison_drop_table_after_gate(
+    engine: &EngineRef,
+    table_id: TableID,
+    operation: &'static str,
+) -> Report<FatalError> {
+    // Once `begin_drop_lifecycle` succeeds, the table's checkpoint publish gate
+    // is closed and the operation cannot be safely retried as an ordinary DDL
+    // failure. Poison admission so future work sees the fatal state; explicit
+    // engine shutdown remains responsible for stopping background workers.
+    engine
+        .trx_sys
+        .poison_storage(FatalError::Poisoned)
+        .attach(drop_table_after_gate_message(table_id, operation))
+}
+
+#[inline]
+fn poison_drop_table_after_gate_with_source(
+    engine: &EngineRef,
+    table_id: TableID,
+    operation: &'static str,
+    source: Error,
+) -> Report<FatalError> {
+    let poison = poison_drop_table_after_gate(engine, table_id, operation);
+    source
+        .into_report()
+        .change_context(*poison.current_context())
+        .attach(drop_table_after_gate_message(table_id, operation))
+}
+
+#[inline]
+fn drop_table_after_gate_message(table_id: TableID, operation: &'static str) -> String {
+    format!("drop table failed after lifecycle gate: table_id={table_id}, operation={operation}")
+}
+
+#[cfg(test)]
+pub(crate) mod test_hooks {
+    use super::EngineRef;
+    use crate::error::{FatalError, InternalError, Result};
+    use error_stack::Report;
+    use std::cell::Cell;
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(crate) enum CreateTableTestFailure {
+        AfterCatalogStaged,
+        AfterFilePublished,
+        AfterRuntimeBuilt,
+        PoisonBeforeCatalogCommit,
+    }
+
+    thread_local! {
+        static CREATE_TABLE_FAILURE: Cell<Option<CreateTableTestFailure>> = const { Cell::new(None) };
+    }
+
+    pub(crate) fn set_create_table_failure(failure: Option<CreateTableTestFailure>) {
+        CREATE_TABLE_FAILURE.with(|slot| slot.set(failure));
+    }
+
+    pub(super) fn maybe_fail_create_table(failure: CreateTableTestFailure) -> Result<()> {
+        if CREATE_TABLE_FAILURE.with(|slot| slot.get()) == Some(failure) {
+            return Err(Report::new(InternalError::InjectedTestFailure).into());
+        }
+        Ok(())
+    }
+
+    pub(super) fn maybe_poison_before_create_table_catalog_commit(engine: &EngineRef) {
+        if CREATE_TABLE_FAILURE.with(|slot| slot.get())
+            == Some(CreateTableTestFailure::PoisonBeforeCatalogCommit)
+        {
+            let _ = engine.trx_sys.poison_storage(FatalError::Poisoned);
+        }
+    }
 }
 
 #[inline]

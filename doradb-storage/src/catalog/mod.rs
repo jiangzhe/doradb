@@ -424,10 +424,19 @@ impl Catalog {
 
     /// Insert a user table runtime into the in-memory cache.
     #[inline]
-    pub(crate) fn insert_user_table(&self, table: Arc<Table>) {
+    pub(crate) fn insert_user_table(&self, table: Arc<Table>) -> Result<()> {
         let table_id = table.table_id();
-        let old = self.user_tables.insert(table_id, table);
-        debug_assert!(old.is_none());
+        match self.user_tables.entry(table_id) {
+            dashmap::mapref::entry::Entry::Vacant(entry) => {
+                entry.insert(table);
+                Ok(())
+            }
+            dashmap::mapref::entry::Entry::Occupied(_) => {
+                Err(Report::new(OperationError::TableAlreadyExists)
+                    .attach(format!("insert user table runtime: table_id={table_id}"))
+                    .into())
+            }
+        }
     }
 
     /// Remove a user table runtime from the in-memory cache.
