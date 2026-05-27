@@ -1,8 +1,10 @@
-use super::table::{acquire_table_ddl_locks, reject_table_ddl_explicit_session_lock};
+use super::table::{
+    acquire_table_ddl_locks, precheck_index_ddl_target, reject_table_ddl_explicit_session_lock,
+    validated_index_ddl_target,
+};
 use crate::buffer::{EvictableBufferPool, PoolGuards};
 use crate::catalog::{
     IndexColumnObject, IndexNo, IndexObject, IndexSpec, TableID, TableMetadata, TableObject,
-    is_user_obj_id,
 };
 use crate::engine::EngineRef;
 use crate::error::{DataIntegrityError, Error, FatalError, InternalError, OperationError, Result};
@@ -14,10 +16,9 @@ use crate::index::{
     ColumnBlockIndex, IndexInsert, NonUniqueIndex, NonUniqueMemIndex, SecondaryDiskTreeRuntime,
     SecondaryIndex, UniqueIndex, UniqueMemIndex,
 };
-use crate::lock::{LockOwner, LockOwnerGroup};
 use crate::lwc::PersistedLwcBlock;
 use crate::row::{RowID, RowRead};
-use crate::session::Session;
+use crate::session::{Session, SessionDdlContext};
 use crate::table::{DeleteMarker, Table, TableRuntimeLayout, secondary_disk_tree_encoder};
 use crate::trx::redo::DDLRedo;
 use crate::trx::{ActiveTrx, TrxID, trx_is_committed};
@@ -61,25 +62,19 @@ pub(crate) async fn create_index_for_session(
     table_id: TableID,
     index_spec: IndexSpec,
 ) -> Result<IndexNo> {
-    if session.in_trx() {
-        return Err(Report::new(OperationError::NotSupported)
-            .attach("implicit commit due to DDL")
-            .into());
-    }
-
-    let engine = session.engine().clone();
-    let owner = LockOwner::Session(session.id());
-    let owner_group = LockOwnerGroup::Session(session.id());
+    let ctx = SessionDdlContext::new(session)?;
+    let engine = ctx.engine.clone();
     let lock_manager = engine.lock_manager();
 
     // 1. Validate the target and acquire table-local DDL exclusion before
     // deriving any new metadata or touching mutable table roots.
-    precheck_create_index_target(session, &engine, table_id).await?;
-    reject_table_ddl_explicit_session_lock(lock_manager, table_id, owner, "create index")?;
+    precheck_index_ddl_target(session, &engine, table_id, "create index").await?;
+    reject_table_ddl_explicit_session_lock(lock_manager, table_id, ctx.owner, "create index")?;
     // Keep these DDL locks alive through root publish and runtime layout
     // install so foreground readers/writers cannot observe a partial index.
-    let _table_locks = acquire_table_ddl_locks(lock_manager, table_id, owner, owner_group).await?;
-    let table = validated_create_index_target(session, &engine, table_id).await?;
+    let _table_locks =
+        acquire_table_ddl_locks(lock_manager, table_id, ctx.owner, ctx.owner_group).await?;
+    let table = validated_index_ddl_target(session, &engine, table_id, "create index").await?;
     engine.trx_sys.ensure_runtime_healthy()?;
     table.check_foreground_live("create index")?;
 
@@ -110,12 +105,12 @@ pub(crate) async fn create_index_for_session(
         table.disk_pool().clone(),
     )?;
 
-    // 4. Start the implicit DDL transaction and let the builder own all
+    // 4. Start the implicit DDL transaction and let the progress state own all
     // rollback/destroy transitions from this point onward.
     let trx = session.begin_trx()?;
-    let mut builder =
-        CreateIndexBuilder::new(&engine, session.pool_guards(), table_id, index_no, trx);
-    let build_ts = builder.build_ts();
+    let mut progress =
+        CreateIndexProgress::new(&engine, session.pool_guards(), table_id, index_no, trx);
+    let build_ts = progress.build_ts();
 
     let mut mutable_file = MutableTableFile::fork(
         table.file(),
@@ -137,7 +132,7 @@ pub(crate) async fn create_index_for_session(
     let cold_rows = match cold_rows {
         Ok(cold_rows) => cold_rows,
         Err(err) => {
-            return builder.rollback_before_catalog_commit(err).await;
+            return progress.rollback_before_catalog_commit(err).await;
         }
     };
 
@@ -154,7 +149,7 @@ pub(crate) async fn create_index_for_session(
     {
         Ok(res) => res,
         Err(err) => {
-            return builder.rollback_before_catalog_commit(err).await;
+            return progress.rollback_before_catalog_commit(err).await;
         }
     };
     secondary_index_roots[index_no_usize] = cold_root;
@@ -162,7 +157,7 @@ pub(crate) async fn create_index_for_session(
         Arc::clone(&new_metadata),
         secondary_index_roots,
     ) {
-        return builder.rollback_before_catalog_commit(err).await;
+        return progress.rollback_before_catalog_commit(err).await;
     }
 
     // 6. Build the hot MemIndex from row-store rows and assemble a runtime
@@ -177,7 +172,7 @@ pub(crate) async fn create_index_for_session(
     {
         Ok(hot_rows) => hot_rows,
         Err(err) => {
-            return builder.rollback_before_catalog_commit(err).await;
+            return progress.rollback_before_catalog_commit(err).await;
         }
     };
     match build_create_index_runtime_index(CreateIndexRuntimeBuild {
@@ -193,70 +188,70 @@ pub(crate) async fn create_index_for_session(
     .await
     {
         Ok(index) => {
-            builder.stage_runtime_index(index);
+            progress.stage_runtime_index(index);
         }
         Err(err) => {
-            return builder.rollback_before_catalog_commit(err).await;
+            return progress.rollback_before_catalog_commit(err).await;
         }
     };
     let new_layout = match build_created_index_runtime_layout(
         &old_layout,
         Arc::clone(&new_metadata),
         index_no_usize,
-        match builder.clone_staged_index_for_layout() {
+        match progress.clone_staged_index_for_layout() {
             Ok(index) => index,
             Err(err) => {
-                return builder.rollback_before_catalog_commit(err).await;
+                return progress.rollback_before_catalog_commit(err).await;
             }
         },
     ) {
         Ok(layout) => layout,
         Err(err) => {
-            return builder.rollback_before_catalog_commit(err).await;
+            return progress.rollback_before_catalog_commit(err).await;
         }
     };
-    builder.stage_layout(new_layout);
+    progress.stage_layout(new_layout);
 
     // 7. Persist catalog metadata and DDL redo in the implicit transaction.
     // Until the table root publishes below, recovery treats this redo as
     // provisional.
-    builder
+    progress
         .execute_catalog_update(new_metadata.as_ref(), &new_index_spec)
         .await?;
 
-    let create_cts = builder.commit_catalog().await?;
+    let create_cts = progress.commit_catalog().await?;
 
     // 8. Publish the table root that proves the new index metadata durable.
     // Failure after catalog commit poisons storage per the RFC 0018 policy.
-    let root_publish = mutable_file.commit(create_cts, false).await;
-    let (table_file, old_root) = match root_publish {
-        Ok(res) => res,
+    let root_publish = engine
+        .trx_sys
+        .publish_table_file_root(mutable_file, create_cts, false)
+        .await;
+    match root_publish {
+        Ok(_table_file) => {}
         Err(err) => {
-            return builder
+            return progress
                 .cleanup_after_catalog_commit_failure("table root publish", err)
                 .await;
         }
-    };
-    engine
-        .trx_sys
-        .mark_published_table_root(&table_file, old_root);
+    }
 
     // 9. Install the new runtime layout last. Existing snapshots keep their old
     // layout Arcs, while later foreground work observes the new index.
-    let new_layout = match builder.take_layout_for_install() {
+    let new_layout = match progress.take_layout_for_install() {
         Ok(layout) => layout,
         Err(err) => {
-            return builder
+            return progress
                 .cleanup_after_catalog_commit_failure("runtime layout install", err)
                 .await;
         }
     };
     if let Err(err) = table.install_runtime_layout(old_layout.generation(), new_layout) {
-        return builder
+        return progress
             .cleanup_after_catalog_commit_failure("runtime layout install", err)
             .await;
     }
-    builder.mark_installed();
+    progress.mark_installed();
 
     Ok(index_no)
 }
@@ -267,21 +262,15 @@ pub(crate) async fn drop_index_for_session(
     table_id: TableID,
     index_no: IndexNo,
 ) -> Result<()> {
-    if session.in_trx() {
-        return Err(Report::new(OperationError::NotSupported)
-            .attach("implicit commit due to DDL")
-            .into());
-    }
-
-    let engine = session.engine().clone();
-    let owner = LockOwner::Session(session.id());
-    let owner_group = LockOwnerGroup::Session(session.id());
+    let ctx = SessionDdlContext::new(session)?;
+    let engine = ctx.engine.clone();
     let lock_manager = engine.lock_manager();
 
-    precheck_drop_index_target(session, &engine, table_id).await?;
-    reject_table_ddl_explicit_session_lock(lock_manager, table_id, owner, "drop index")?;
-    let _table_locks = acquire_table_ddl_locks(lock_manager, table_id, owner, owner_group).await?;
-    let table = validated_drop_index_target(session, &engine, table_id).await?;
+    precheck_index_ddl_target(session, &engine, table_id, "drop index").await?;
+    reject_table_ddl_explicit_session_lock(lock_manager, table_id, ctx.owner, "drop index")?;
+    let _table_locks =
+        acquire_table_ddl_locks(lock_manager, table_id, ctx.owner, ctx.owner_group).await?;
+    let table = validated_index_ddl_target(session, &engine, table_id, "drop index").await?;
     engine.trx_sys.ensure_runtime_healthy()?;
     table.check_foreground_live("drop index")?;
 
@@ -323,46 +312,47 @@ pub(crate) async fn drop_index_for_session(
     )?;
 
     let trx = session.begin_trx()?;
-    let mut builder = DropIndexBuilder::new(&engine, table_id, index_no, trx);
-    builder.stage_layout(new_layout);
-    builder.execute_catalog_update(&old_index_spec).await?;
-    let drop_cts = builder.commit_catalog().await?;
+    let mut progress = DropIndexProgress::new(&engine, table_id, index_no, trx);
+    progress.stage_layout(new_layout);
+    progress.execute_catalog_update(&old_index_spec).await?;
+    let drop_cts = progress.commit_catalog().await?;
 
-    let root_publish = mutable_file.commit(drop_cts, false).await;
-    let (table_file, old_root) = match root_publish {
-        Ok(res) => res,
+    let root_publish = engine
+        .trx_sys
+        .publish_table_file_root(mutable_file, drop_cts, false)
+        .await;
+    match root_publish {
+        Ok(_table_file) => {}
         Err(err) => {
-            return builder
+            return progress
                 .cleanup_after_catalog_commit_failure("table root publish", err)
                 .await;
         }
-    };
-    engine
-        .trx_sys
-        .mark_published_table_root(&table_file, old_root);
+    }
 
-    let new_layout = match builder.take_layout_for_install() {
+    let new_layout = match progress.take_layout_for_install() {
         Ok(layout) => layout,
         Err(err) => {
-            return builder
+            return progress
                 .cleanup_after_catalog_commit_failure("runtime layout install", err)
                 .await;
         }
     };
     if let Err(err) = table.install_runtime_layout(old_generation, new_layout) {
-        return builder
+        return progress
             .cleanup_after_catalog_commit_failure("runtime layout install", err)
             .await;
     }
-    builder.mark_installed();
+    progress.mark_installed();
     drop(old_layout);
 
     if let Err(err) = table
         .cleanup_retired_secondary_indexes(session.pool_guards())
         .await
     {
-        return Err(poison_drop_index_after_catalog_commit_with_source(
+        return Err(poison_index_after_catalog_commit_with_source(
             &engine,
+            IndexDdlKind::Drop,
             table_id,
             index_no,
             "retired secondary-index cleanup",
@@ -372,86 +362,6 @@ pub(crate) async fn drop_index_for_session(
     }
 
     Ok(())
-}
-
-async fn precheck_create_index_target(
-    session: &Session,
-    engine: &EngineRef,
-    table_id: TableID,
-) -> Result<()> {
-    let _ = validated_create_index_target(session, engine, table_id).await?;
-    Ok(())
-}
-
-async fn validated_create_index_target(
-    session: &Session,
-    engine: &EngineRef,
-    table_id: TableID,
-) -> Result<Arc<Table>> {
-    if !is_user_obj_id(table_id) {
-        return Err(Report::new(OperationError::TableNotFound)
-            .attach(format!(
-                "create index requires user table id: table_id={table_id}"
-            ))
-            .into());
-    }
-    let table = engine
-        .catalog()
-        .validate_user_table_live(table_id, "create index")
-        .await?;
-    if engine
-        .catalog()
-        .storage
-        .tables()
-        .find_uncommitted_by_id(session.pool_guards(), table_id)
-        .await?
-        .is_none()
-    {
-        return Err(Report::new(OperationError::TableNotFound)
-            .attach(format!("create index catalog lookup: table_id={table_id}"))
-            .into());
-    }
-    Ok(table)
-}
-
-async fn precheck_drop_index_target(
-    session: &Session,
-    engine: &EngineRef,
-    table_id: TableID,
-) -> Result<()> {
-    let _ = validated_drop_index_target(session, engine, table_id).await?;
-    Ok(())
-}
-
-async fn validated_drop_index_target(
-    session: &Session,
-    engine: &EngineRef,
-    table_id: TableID,
-) -> Result<Arc<Table>> {
-    if !is_user_obj_id(table_id) {
-        return Err(Report::new(OperationError::TableNotFound)
-            .attach(format!(
-                "drop index requires user table id: table_id={table_id}"
-            ))
-            .into());
-    }
-    let table = engine
-        .catalog()
-        .validate_user_table_live(table_id, "drop index")
-        .await?;
-    if engine
-        .catalog()
-        .storage
-        .tables()
-        .find_uncommitted_by_id(session.pool_guards(), table_id)
-        .await?
-        .is_none()
-    {
-        return Err(Report::new(OperationError::TableNotFound)
-            .attach(format!("drop index catalog lookup: table_id={table_id}"))
-            .into());
-    }
-    Ok(table)
 }
 
 #[derive(Clone, Debug)]
@@ -487,7 +397,7 @@ enum CreateIndexBuildPhase {
     Aborted,
 }
 
-struct CreateIndexBuilder<'a> {
+struct CreateIndexProgress<'a> {
     engine: &'a EngineRef,
     guards: &'a PoolGuards,
     table_id: TableID,
@@ -499,7 +409,7 @@ struct CreateIndexBuilder<'a> {
     new_layout: Option<TableRuntimeLayout>,
 }
 
-impl<'a> CreateIndexBuilder<'a> {
+impl<'a> CreateIndexProgress<'a> {
     #[inline]
     fn new(
         engine: &'a EngineRef,
@@ -615,7 +525,7 @@ impl<'a> CreateIndexBuilder<'a> {
 
     async fn rollback_before_catalog_commit<T>(&mut self, err: Error) -> Result<T> {
         self.cleanup_staged_runtime().await;
-        let rollback_res = self.rollback_active().await;
+        let rollback_res = rollback_active_ddl_trx(&mut self.trx).await;
         self.phase = CreateIndexBuildPhase::Aborted;
         rollback_res?;
         Err(err)
@@ -628,8 +538,9 @@ impl<'a> CreateIndexBuilder<'a> {
     ) -> Result<T> {
         self.cleanup_staged_runtime().await;
         self.phase = CreateIndexBuildPhase::Aborted;
-        Err(poison_create_index_after_catalog_commit_with_source(
+        Err(poison_index_after_catalog_commit_with_source(
             self.engine,
+            IndexDdlKind::Create,
             self.table_id,
             self.index_no,
             operation,
@@ -644,19 +555,9 @@ impl<'a> CreateIndexBuilder<'a> {
             destroy_uninstalled_staged_index(index, self.guards).await;
         }
     }
-
-    async fn rollback_active(&mut self) -> Result<()> {
-        let Some(trx) = self.trx.take() else {
-            return Ok(());
-        };
-        if trx.engine().is_some() {
-            trx.rollback().await?;
-        }
-        Ok(())
-    }
 }
 
-impl Drop for CreateIndexBuilder<'_> {
+impl Drop for CreateIndexProgress<'_> {
     #[inline]
     fn drop(&mut self) {
         debug_assert!(
@@ -678,7 +579,7 @@ enum DropIndexBuildPhase {
     Aborted,
 }
 
-struct DropIndexBuilder<'a> {
+struct DropIndexProgress<'a> {
     engine: &'a EngineRef,
     table_id: TableID,
     index_no: IndexNo,
@@ -687,7 +588,7 @@ struct DropIndexBuilder<'a> {
     new_layout: Option<TableRuntimeLayout>,
 }
 
-impl<'a> DropIndexBuilder<'a> {
+impl<'a> DropIndexProgress<'a> {
     #[inline]
     fn new(engine: &'a EngineRef, table_id: TableID, index_no: IndexNo, trx: ActiveTrx) -> Self {
         Self {
@@ -765,7 +666,7 @@ impl<'a> DropIndexBuilder<'a> {
 
     async fn rollback_before_catalog_commit<T>(&mut self, err: Error) -> Result<T> {
         self.new_layout = None;
-        let rollback_res = self.rollback_active().await;
+        let rollback_res = rollback_active_ddl_trx(&mut self.trx).await;
         self.phase = DropIndexBuildPhase::Aborted;
         rollback_res?;
         Err(err)
@@ -778,8 +679,9 @@ impl<'a> DropIndexBuilder<'a> {
     ) -> Result<T> {
         self.new_layout = None;
         self.phase = DropIndexBuildPhase::Aborted;
-        Err(poison_drop_index_after_catalog_commit_with_source(
+        Err(poison_index_after_catalog_commit_with_source(
             self.engine,
+            IndexDdlKind::Drop,
             self.table_id,
             self.index_no,
             operation,
@@ -787,19 +689,19 @@ impl<'a> DropIndexBuilder<'a> {
         )
         .into())
     }
-
-    async fn rollback_active(&mut self) -> Result<()> {
-        let Some(trx) = self.trx.take() else {
-            return Ok(());
-        };
-        if trx.engine().is_some() {
-            trx.rollback().await?;
-        }
-        Ok(())
-    }
 }
 
-impl Drop for DropIndexBuilder<'_> {
+async fn rollback_active_ddl_trx(trx: &mut Option<ActiveTrx>) -> Result<()> {
+    let Some(trx) = trx.take() else {
+        return Ok(());
+    };
+    if trx.engine().is_some() {
+        trx.rollback().await?;
+    }
+    Ok(())
+}
+
+impl Drop for DropIndexProgress<'_> {
     #[inline]
     fn drop(&mut self) {
         debug_assert!(
@@ -1475,36 +1377,24 @@ async fn execute_create_index_catalog_update(
 }
 
 #[inline]
-fn poison_create_index_after_catalog_commit_with_source(
+fn poison_index_after_catalog_commit_with_source(
     engine: &EngineRef,
+    kind: IndexDdlKind,
     table_id: TableID,
     index_no: IndexNo,
     operation: &'static str,
     source: Error,
 ) -> Report<FatalError> {
+    let operation_name = match kind {
+        IndexDdlKind::Create => "create index",
+        IndexDdlKind::Drop => "drop index",
+    };
     let poison = engine.trx_sys.poison_storage(FatalError::Poisoned);
     source
         .into_report()
         .change_context(*poison.current_context())
         .attach(format!(
-            "create index failed after catalog commit: table_id={table_id}, index_no={index_no}, operation={operation}"
-        ))
-}
-
-#[inline]
-fn poison_drop_index_after_catalog_commit_with_source(
-    engine: &EngineRef,
-    table_id: TableID,
-    index_no: IndexNo,
-    operation: &'static str,
-    source: Error,
-) -> Report<FatalError> {
-    let poison = engine.trx_sys.poison_storage(FatalError::Poisoned);
-    source
-        .into_report()
-        .change_context(*poison.current_context())
-        .attach(format!(
-            "drop index failed after catalog commit: table_id={table_id}, index_no={index_no}, operation={operation}"
+            "{operation_name} failed after catalog commit: table_id={table_id}, index_no={index_no}, operation={operation}"
         ))
 }
 
@@ -1525,7 +1415,7 @@ pub(crate) fn classify_index_ddl_root(
     // A root older than the DDL commit timestamp cannot include the DDL's table
     // metadata/root changes. It may still be a valid root, but it is not proof
     // for this redo marker.
-    if active_root.trx_id < ddl_cts {
+    if active_root.root_ts < ddl_cts {
         return Ok(IndexDdlRootProof::Provisional);
     }
 
@@ -1537,8 +1427,8 @@ pub(crate) fn classify_index_ddl_root(
     // inconclusive for this DDL marker.
     if root_count != slot_count {
         return Err(invalid_index_ddl_root(format!(
-            "index DDL root proof found secondary-root count mismatch: table_id={table_id}, index_no={index_no}, root_count={root_count}, metadata_slots={slot_count}, root_trx_id={}, ddl_cts={ddl_cts}",
-            active_root.trx_id
+            "index DDL root proof found secondary-root count mismatch: table_id={table_id}, index_no={index_no}, root_count={root_count}, metadata_slots={slot_count}, root_ts={}, ddl_cts={ddl_cts}",
+            active_root.root_ts
         )));
     }
 
@@ -1555,8 +1445,8 @@ pub(crate) fn classify_index_ddl_root(
         .copied()
     else {
         return Err(invalid_index_ddl_root(format!(
-            "index DDL root proof missing secondary-root slot: table_id={table_id}, index_no={index_no}, root_count={root_count}, root_trx_id={}, ddl_cts={ddl_cts}",
-            active_root.trx_id
+            "index DDL root proof missing secondary-root slot: table_id={table_id}, index_no={index_no}, root_count={root_count}, root_ts={}, ddl_cts={ddl_cts}",
+            active_root.root_ts
         )));
     };
 
@@ -1574,8 +1464,8 @@ pub(crate) fn classify_index_ddl_root(
             // sparse root slot is empty, matching a subsequent durable drop.
             if root_block_id != SUPER_BLOCK_ID {
                 return Err(invalid_index_ddl_root(format!(
-                    "inactive created index slot has non-empty root: table_id={table_id}, index_no={index_no}, root_block_id={root_block_id}, root_trx_id={}, ddl_cts={ddl_cts}",
-                    active_root.trx_id
+                    "inactive created index slot has non-empty root: table_id={table_id}, index_no={index_no}, root_block_id={root_block_id}, root_ts={}, ddl_cts={ddl_cts}",
+                    active_root.root_ts
                 )));
             }
             Ok(IndexDdlRootProof::DurableAllocationOnly)
@@ -1590,8 +1480,8 @@ pub(crate) fn classify_index_ddl_root(
             // is inactive with no remaining secondary-root block.
             if root_block_id != SUPER_BLOCK_ID {
                 return Err(invalid_index_ddl_root(format!(
-                    "dropped index slot has non-empty root: table_id={table_id}, index_no={index_no}, root_block_id={root_block_id}, root_trx_id={}, ddl_cts={ddl_cts}",
-                    active_root.trx_id
+                    "dropped index slot has non-empty root: table_id={table_id}, index_no={index_no}, root_block_id={root_block_id}, root_ts={}, ddl_cts={ddl_cts}",
+                    active_root.root_ts
                 )));
             }
             Ok(IndexDdlRootProof::DurableFinalDrop)
@@ -1630,8 +1520,8 @@ mod tests {
         ]
     }
 
-    fn root_with_metadata(metadata: TableMetadata, trx_id: TrxID) -> ActiveRoot {
-        ActiveRoot::new(trx_id, 128, Arc::new(metadata))
+    fn root_with_metadata(metadata: TableMetadata, root_ts: TrxID) -> ActiveRoot {
+        ActiveRoot::new(root_ts, 128, Arc::new(metadata))
     }
 
     #[test]
@@ -2462,7 +2352,7 @@ mod tests {
 
     fn assert_root_metadata_unchanged(before: &ActiveRoot, table: &Table) {
         let after = table.file().active_root_unchecked();
-        assert_eq!(after.trx_id, before.trx_id);
+        assert_eq!(after.root_ts, before.root_ts);
         assert_eq!(after.meta_block_id, before.meta_block_id);
         assert_eq!(after.pivot_row_id, before.pivot_row_id);
         assert_eq!(after.heap_redo_start_ts, before.heap_redo_start_ts);

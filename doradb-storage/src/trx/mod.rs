@@ -1385,7 +1385,7 @@ pub(crate) mod tests {
     use crate::engine::Engine;
     use crate::error::OperationError;
     use crate::file::cow_file::tests::old_root_drop_count;
-    use crate::file::table_file::{MutableTableFile, OldRoot, TableFile};
+    use crate::file::table_file::{MutableTableFile, TableFile};
     use crate::lock::tests::{debug_snapshot, try_acquire, try_acquire_grouped};
     use crate::row::ops::SelectKey;
     use crate::table::test_user_table_id;
@@ -1497,10 +1497,7 @@ pub(crate) mod tests {
             .count()
     }
 
-    async fn swapped_old_root(
-        engine: &Engine,
-        table_id_offset: u64,
-    ) -> (usize, Arc<TableFile>, OldRoot) {
+    async fn publish_initial_test_root(engine: &Engine, table_id_offset: u64) -> Arc<TableFile> {
         let metadata = Arc::new(
             TableMetadata::try_new(
                 vec![ColumnSpec::new(
@@ -1517,17 +1514,11 @@ pub(crate) mod tests {
             .table_fs
             .create_table_file(table_id, metadata, false)
             .unwrap();
-        let (table_file, old_root) = mutable.commit(1, false).await.unwrap();
-        assert!(old_root.is_none());
-
-        let old_root_ptr = table_file.active_root_unchecked() as *const _ as usize;
-        let mutable = MutableTableFile::fork(
-            &table_file,
-            engine.table_fs.background_writes(),
-            engine.disk_pool.clone_inner(),
-        );
-        let (table_file, old_root) = mutable.commit(2, false).await.unwrap();
-        (old_root_ptr, table_file, old_root.unwrap())
+        engine
+            .trx_sys
+            .publish_table_file_root(mutable, 1, false)
+            .await
+            .unwrap()
     }
 
     #[test]
@@ -2036,14 +2027,23 @@ pub(crate) mod tests {
     fn test_published_table_root_retention_waits_for_fence_horizon() {
         smol::block_on(async {
             let (_temp_dir, engine) = test_engine("published_root_retention_fence").await;
-            let (old_root_ptr, table_file, old_root) = swapped_old_root(&engine, 91_001).await;
+            let table_file = publish_initial_test_root(&engine, 91_001).await;
+            let old_root_ptr = table_file.active_root_unchecked() as *const _ as usize;
             let drop_count_before = old_root_drop_count(old_root_ptr);
 
             let mut session = engine.new_session().unwrap();
             let read_trx = session.begin_trx().unwrap();
-            engine
+            let mutable = MutableTableFile::fork(
+                &table_file,
+                engine.table_fs.background_writes(),
+                engine.disk_pool.clone_inner(),
+            );
+            let table_file = engine
                 .trx_sys
-                .mark_published_table_root(&table_file, Some(old_root));
+                .publish_table_file_root(mutable, 2, false)
+                .await
+                .unwrap();
+            assert_eq!(table_file.active_root_unchecked().root_ts, 2);
 
             for _ in 0..10 {
                 smol::Timer::after(std::time::Duration::from_millis(10)).await;

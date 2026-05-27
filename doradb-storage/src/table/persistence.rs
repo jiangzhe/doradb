@@ -363,14 +363,10 @@ pub(crate) fn secondary_disk_tree_encoder(
     Ok(BTreeKeyEncoder::new(types))
 }
 
-fn invalid_reachable_block(
-    root_cts: TrxID,
-    block_id: BlockID,
-    message: impl Into<String>,
-) -> Error {
+fn invalid_reachable_block(root_ts: TrxID, block_id: BlockID, message: impl Into<String>) -> Error {
     Report::new(DataIntegrityError::InvalidRootInvariant)
         .attach(format!(
-            "invalid table-root reachable block: root_cts={root_cts}, block_id={block_id}, {}",
+            "invalid table-root reachable block: root_ts={root_ts}, block_id={block_id}, {}",
             message.into()
         ))
         .into()
@@ -380,14 +376,14 @@ fn validate_reachable_block(root: &ActiveRoot, block_id: BlockID) -> Result<()> 
     let idx = usize::from(block_id);
     if idx >= root.alloc_map.len() {
         return Err(invalid_reachable_block(
-            root.trx_id,
+            root.root_ts,
             block_id,
             format!("alloc_map_len={}", root.alloc_map.len()),
         ));
     }
     if !root.alloc_map.is_allocated(idx) {
         return Err(invalid_reachable_block(
-            root.trx_id,
+            root.root_ts,
             block_id,
             "allocation bit is not set",
         ));
@@ -1093,7 +1089,7 @@ impl TablePersistence for Table {
         // Step 10: enter the no-cancel publication section, publish a new
         // table-file root, and then commit the checkpoint transaction. This
         // intentionally happens even when no row data, deletion payload, or
-        // secondary index root changed: the root trx_id acts as a checkpoint
+        // secondary index root changed: the root timestamp acts as a checkpoint
         // heartbeat for future redo-log truncation.
         let publish_lease = match self.try_begin_checkpoint_publish() {
             Ok(lease) => lease,
@@ -1105,7 +1101,10 @@ impl TablePersistence for Table {
         let published_root = mutable_file.root();
         let published_pivot_row_id = published_root.pivot_row_id;
         let published_column_root = published_root.column_block_index_root;
-        let (table_file, old_root) = match mutable_file.commit(checkpoint_ts, false).await {
+        match trx_sys
+            .publish_table_file_root(mutable_file, checkpoint_ts, false)
+            .await
+        {
             Ok(res) => res,
             Err(err) if err.kind() == ErrorKind::Io => {
                 let _ = trx_sys.rollback(trx).await;
@@ -1117,7 +1116,6 @@ impl TablePersistence for Table {
                 return Err(err);
             }
         };
-        trx_sys.mark_published_table_root(&table_file, old_root);
         self.mem
             .blk_idx()
             .update_column_root(published_pivot_row_id, published_column_root)

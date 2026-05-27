@@ -175,9 +175,12 @@ secondary-index write undo. Repeated writes to the same table reuse the
 transaction lock cache rather than re-entering the lock manager.
 
 `CREATE TABLE` acquires a session-owned `CatalogNamespace(X)` before allocating
-the user table id and holds it through catalog-row writes, implicit DDL commit,
-table-file publication, runtime table construction, and catalog runtime
-publication. Recovery, checkpoint, purge, and no-transaction catalog replay
+the user table id and holds it through catalog-row writes, provisional
+table-file publication, runtime table construction, catalog DDL commit, and
+catalog runtime publication. The initial table-file root uses the create
+transaction STS as `root_ts`; catalog commit is held until file/runtime staging
+succeeds, and the runtime is inserted only after the durable catalog commit.
+Recovery, checkpoint, purge, and no-transaction catalog replay
 remain outside logical lock acquisition because they run at internal lifecycle
 boundaries rather than through foreground sessions and waiters.
 

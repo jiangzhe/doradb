@@ -4,6 +4,8 @@ use crate::buffer::frame::FrameKind;
 use crate::buffer::guard::PageGuard;
 use crate::buffer::page::{PAGE_SIZE, PageID};
 use crate::buffer::{EvictableBufferPool, PoolGuard, PoolGuards, PoolRole, test_frame_kind};
+use crate::catalog::table::test_hooks as catalog_table_tests;
+use crate::catalog::table::test_hooks::CreateTableTestFailure;
 use crate::catalog::tests::table4;
 use crate::catalog::{
     CatalogCheckpointScanStopReason, ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey,
@@ -1740,7 +1742,7 @@ fn test_trx_read_proof_root_snapshot_captures_active_root() {
             let snapshot = sys.table.root_snapshot(&proof).unwrap();
             let _effects_addr = effects as *mut _;
             sys.table.with_active_root(&proof, |active_root| {
-                assert_eq!(snapshot.root_trx_id(), active_root.trx_id);
+                assert_eq!(snapshot.root_ts(), active_root.root_ts);
                 assert_eq!(snapshot.pivot_row_id(), active_root.pivot_row_id);
                 assert_eq!(
                     snapshot.column_block_index_root(),
@@ -1756,7 +1758,7 @@ fn test_trx_read_proof_root_snapshot_captures_active_root() {
                 );
                 assert_eq!(
                     snapshot.root_is_visible_to(ctx.sts()),
-                    active_root.trx_id < ctx.sts()
+                    active_root.effective_ts() < ctx.sts()
                 );
             });
             Ok(())
@@ -2904,7 +2906,7 @@ fn test_unique_checkpoint_overlap_keeps_new_disk_tree_owner() {
         .await;
 
         sys.table.freeze(&session, usize::MAX).await.unwrap();
-        let readiness_ts = delete_ts.max(sys.table.file().active_root_unchecked().trx_id);
+        let readiness_ts = delete_ts.max(sys.table.file().active_root_unchecked().root_ts);
         wait_gc_cutoff_after(&session, readiness_ts).await;
         checkpoint_published(&sys.table, &mut session).await;
 
@@ -4835,6 +4837,135 @@ fn test_create_table_waits_on_catalog_namespace_lock() {
 }
 
 #[test]
+fn test_create_table_catalog_staging_failure_rolls_back_and_deletes_file() {
+    smol::block_on(async {
+        let temp_dir = TempDir::new().unwrap();
+        let main_dir = temp_dir.path().to_path_buf();
+        let engine = lightweight_test_engine_config(main_dir, "create_fail_catalog")
+            .build()
+            .await
+            .unwrap();
+        let mut session = engine.new_session().unwrap();
+        let table_id = engine.catalog().curr_next_user_obj_id();
+        let table_file_path = engine.table_fs.user_table_file_path(table_id);
+        let (table_spec, index_specs) = drop_table_test_spec();
+
+        catalog_table_tests::set_create_table_failure(Some(
+            CreateTableTestFailure::AfterCatalogStaged,
+        ));
+        let res = session.create_table(table_spec, index_specs).await;
+        catalog_table_tests::set_create_table_failure(None);
+
+        let err = res.unwrap_err();
+        assert_eq!(
+            err.report().downcast_ref::<InternalError>().copied(),
+            Some(InternalError::InjectedTestFailure)
+        );
+        assert!(engine.catalog().get_table(table_id).await.is_none());
+        assert!(!session.in_trx());
+        wait_path_exists(&table_file_path, false).await;
+    });
+}
+
+#[test]
+fn test_create_table_file_publish_failure_rolls_back_catalog_and_deletes_file() {
+    smol::block_on(async {
+        let temp_dir = TempDir::new().unwrap();
+        let main_dir = temp_dir.path().to_path_buf();
+        let engine = lightweight_test_engine_config(main_dir, "create_fail_publish")
+            .build()
+            .await
+            .unwrap();
+        let mut session = engine.new_session().unwrap();
+        let table_id = engine.catalog().curr_next_user_obj_id();
+        let table_file_path = engine.table_fs.user_table_file_path(table_id);
+        let hook = Arc::new(FailingFirstWriteHook::new());
+        let _install = install_storage_backend_test_hook(hook.clone());
+        let (table_spec, index_specs) = drop_table_test_spec();
+
+        let err = session
+            .create_table(table_spec, index_specs)
+            .await
+            .unwrap_err();
+
+        assert!(err.is_kind(ErrorKind::Io), "{err:?}");
+        assert!(hook.call_count() > 0);
+        assert!(engine.catalog().get_table(table_id).await.is_none());
+        assert!(!session.in_trx());
+        wait_path_exists(&table_file_path, false).await;
+    });
+}
+
+#[test]
+fn test_create_table_runtime_failure_after_file_publish_rolls_back_and_deletes_file() {
+    smol::block_on(async {
+        let temp_dir = TempDir::new().unwrap();
+        let main_dir = temp_dir.path().to_path_buf();
+        let engine = lightweight_test_engine_config(main_dir, "create_fail_runtime")
+            .build()
+            .await
+            .unwrap();
+        let mut session = engine.new_session().unwrap();
+        let table_id = engine.catalog().curr_next_user_obj_id();
+        let table_file_path = engine.table_fs.user_table_file_path(table_id);
+        let (table_spec, index_specs) = drop_table_test_spec();
+
+        catalog_table_tests::set_create_table_failure(Some(
+            CreateTableTestFailure::AfterRuntimeBuilt,
+        ));
+        let res = session.create_table(table_spec, index_specs).await;
+        catalog_table_tests::set_create_table_failure(None);
+
+        let err = res.unwrap_err();
+        assert_eq!(
+            err.report().downcast_ref::<InternalError>().copied(),
+            Some(InternalError::InjectedTestFailure)
+        );
+        assert!(engine.catalog().get_table(table_id).await.is_none());
+        assert!(!session.in_trx());
+        wait_path_exists(&table_file_path, false).await;
+    });
+}
+
+#[test]
+fn test_create_table_catalog_commit_error_after_file_publish_poisons_and_keeps_file() {
+    smol::block_on(async {
+        let temp_dir = TempDir::new().unwrap();
+        let main_dir = temp_dir.path().to_path_buf();
+        let engine = lightweight_test_engine_config(main_dir, "create_fail_commit")
+            .build()
+            .await
+            .unwrap();
+        let mut session = engine.new_session().unwrap();
+        let table_id = engine.catalog().curr_next_user_obj_id();
+        let table_file_path = engine.table_fs.user_table_file_path(table_id);
+        let (table_spec, index_specs) = drop_table_test_spec();
+
+        catalog_table_tests::set_create_table_failure(Some(
+            CreateTableTestFailure::PoisonBeforeCatalogCommit,
+        ));
+        let res = session.create_table(table_spec, index_specs).await;
+        catalog_table_tests::set_create_table_failure(None);
+
+        let err = res.unwrap_err();
+        assert_eq!(
+            err.report().downcast_ref::<FatalError>().copied(),
+            Some(FatalError::Poisoned)
+        );
+        assert!(
+            engine
+                .trx_sys
+                .storage_poison_error()
+                .as_ref()
+                .is_some_and(|err| *err.current_context() == FatalError::Poisoned)
+        );
+        assert!(engine.catalog().get_table(table_id).await.is_none());
+        assert!(!session.in_trx());
+        assert!(std::path::Path::new(&table_file_path).exists());
+    });
+}
+
+#[test]
 fn test_explicit_table_locks_reject_intent_modes() {
     smol::block_on(async {
         let sys = TestSys::new_lightweight_evictable().await;
@@ -6665,6 +6796,39 @@ fn test_drop_table_catalog_checkpoint_cleans_absent_leftover_file_on_startup() {
 }
 
 #[test]
+fn test_recovery_cleans_post_replay_create_table_provisional_file() {
+    smol::block_on(async {
+        let temp_dir = TempDir::new().unwrap();
+        let main_dir = temp_dir.path().to_path_buf();
+        let engine = lightweight_test_engine_config(main_dir.clone(), "create_orphan_recover")
+            .build()
+            .await
+            .unwrap();
+        let table_id = USER_OBJ_ID_START + 99;
+        let table_file_path = engine.table_fs.user_table_file_path(table_id);
+        let (table_spec, index_specs) = drop_table_test_spec();
+        let metadata = Arc::new(TableMetadata::try_new(table_spec.columns, index_specs).unwrap());
+        let mutable = engine
+            .table_fs
+            .create_table_file(table_id, metadata, false)
+            .unwrap();
+        let (table_file, old_root) = mutable.commit(1, false).await.unwrap();
+        drop(old_root);
+        drop(table_file);
+        assert!(std::path::Path::new(&table_file_path).exists());
+
+        drop(engine);
+
+        let engine = lightweight_test_engine_config(main_dir, "create_orphan_recover")
+            .build()
+            .await
+            .unwrap();
+        assert!(engine.catalog().get_table(table_id).await.is_none());
+        wait_path_exists(&table_file_path, false).await;
+    });
+}
+
+#[test]
 fn test_checkpoint_publish_write_failure_poisons_storage() {
     smol::block_on(async {
         let sys = TestSys::new_lightweight_evictable().await;
@@ -6696,21 +6860,19 @@ fn test_checkpoint_post_publication_failure_poisons_storage() {
 
         let err = res.unwrap_err();
         assert_checkpoint_write_poisoned(&err, &sys);
-        assert!(sys.table.file().active_root_unchecked().trx_id > root_before.trx_id);
+        assert!(sys.table.file().active_root_unchecked().root_ts > root_before.root_ts);
         assert!(!session.in_trx());
     });
 }
 
 #[test]
-fn test_checkpoint_readiness_ready_when_root_crossed_gc_horizon() {
+fn test_checkpoint_readiness_ready_when_effective_ts_crossed_gc_horizon() {
     smol::block_on(async {
         let sys = TestSys::new_evictable().await;
         let session = sys.new_session().unwrap();
         let root = sys.table.file().active_root_unchecked();
-        let root_cts = root.trx_id;
         let effective_ts = root.effective_ts();
         let min_active_sts = sys.engine.trx_sys.calc_min_active_sts_for_gc();
-        assert!(root_cts < min_active_sts);
         assert!(effective_ts < min_active_sts);
         assert!(matches!(
             sys.table.checkpoint_readiness(&session),
@@ -6784,10 +6946,23 @@ fn test_checkpoint_readiness_uses_root_effective_ts_not_checkpoint_start_ts() {
         assert!(reason.min_active_sts <= reader_sts.get());
         assert!(reason.effective_ts >= reason.min_active_sts);
 
-        let (_, reader) = reader_holder
+        let (_, mut reader) = reader_holder
             .borrow_mut()
             .take()
             .expect("reader hook should install an active transaction");
+        reader
+            .exec(async |stmt| {
+                let (ctx, effects) = stmt_tests::ctx_and_effects_mut(stmt);
+                let proof = ctx.read_proof();
+                let snapshot = sys.table.root_snapshot(&proof).unwrap();
+                let _effects_addr = effects as *mut _;
+                assert!(snapshot.root_ts() < ctx.sts());
+                assert_eq!(snapshot.effective_ts(), effective_ts);
+                assert!(!snapshot.root_is_visible_to(ctx.sts()));
+                Ok(())
+            })
+            .await
+            .unwrap();
         reader.commit().await.unwrap();
         wait_gc_cutoff_after(&session, effective_ts).await;
         assert!(matches!(
@@ -6809,7 +6984,7 @@ fn test_checkpoint_requires_idle_session_before_delayed_outcome() {
         let reader = reader_session.begin_trx().unwrap();
         let first_checkpoint_ts = checkpoint_published(&sys.table, &mut session).await;
         assert_eq!(
-            sys.table.file().active_root_unchecked().trx_id,
+            sys.table.file().active_root_unchecked().root_ts,
             first_checkpoint_ts
         );
 
@@ -6884,7 +7059,7 @@ fn test_checkpoint_delayed_preserves_root_and_frozen_pages_until_ready() {
         wait_gc_cutoff_after(&session, effective_ts_protected_by_reader).await;
         let checkpoint_ts = checkpoint_published(&sys.table, &mut session).await;
         let root_after_publish = sys.table.file().active_root_unchecked();
-        assert_eq!(root_after_publish.trx_id, checkpoint_ts);
+        assert_eq!(root_after_publish.root_ts, checkpoint_ts);
         assert!(root_after_publish.pivot_row_id > root_before_delay.pivot_row_id);
     });
 }
@@ -6902,7 +7077,7 @@ fn test_second_checkpoint_waits_for_previous_root_horizon() {
         let first_checkpoint_ts = checkpoint_published(&sys.table, &mut session).await;
         let first_effective_ts = sys.table.file().active_root_unchecked().effective_ts();
         assert_eq!(
-            sys.table.file().active_root_unchecked().trx_id,
+            sys.table.file().active_root_unchecked().root_ts,
             first_checkpoint_ts
         );
 
@@ -6985,7 +7160,7 @@ fn test_checkpoint_rechecks_readiness_after_root_mutation_lease() {
 
         let hook_table = Arc::clone(&sys.table);
         let hook_engine = sys.engine.new_ref().unwrap();
-        let root_before_trx = root_before.trx_id;
+        let root_before_trx = root_before.root_ts;
         set_test_checkpoint_after_readiness_hook(move || async move {
             let mut competing_session = hook_engine.new_session().unwrap();
             let checkpoint_ts = checkpoint_published(&hook_table, &mut competing_session).await;
@@ -6997,7 +7172,7 @@ fn test_checkpoint_rechecks_readiness_after_root_mutation_lease() {
             panic!("expected post-lease readiness delay, got {outcome:?}");
         };
         let root_after = sys.table.file().active_root_unchecked();
-        assert!(root_after.trx_id > root_before.trx_id);
+        assert!(root_after.root_ts > root_before.root_ts);
         assert_eq!(reason.effective_ts, root_after.effective_ts());
         assert_eq!(reason.min_active_sts, reader.sts());
 
@@ -8629,7 +8804,7 @@ async fn checkpoint_published(table: &Table, session: &mut Session) -> TrxID {
 
 fn assert_root_metadata_unchanged(before: &crate::file::table_file::ActiveRoot, table: &Table) {
     let after = table.file().active_root_unchecked();
-    assert_eq!(after.trx_id, before.trx_id);
+    assert_eq!(after.root_ts, before.root_ts);
     assert_eq!(after.meta_block_id, before.meta_block_id);
     assert_eq!(after.pivot_row_id, before.pivot_row_id);
     assert_eq!(after.heap_redo_start_ts, before.heap_redo_start_ts);

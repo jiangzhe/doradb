@@ -166,7 +166,7 @@ fn parse_multi_table_super_block(buf: &[u8]) -> Result<SuperBlock> {
 fn build_multi_table_super_block(root: &MultiTableActiveRoot) -> Result<DirectBuf> {
     Ok(build_super_block(
         root.slot_no,
-        root.trx_id,
+        root.root_ts,
         root.meta_block_id,
     ))
 }
@@ -330,7 +330,7 @@ impl MultiTableFile {
     pub(crate) fn load_snapshot(&self) -> Result<MultiTableFileSnapshot> {
         let active_root = self.active_root_unchecked();
         Ok(MultiTableFileSnapshot {
-            catalog_replay_start_ts: active_root.trx_id,
+            catalog_replay_start_ts: active_root.root_ts,
             meta: active_root.meta.clone(),
         })
     }
@@ -424,10 +424,10 @@ impl MutableMultiTableFile {
         table_roots: [CatalogTableRootDesc; CATALOG_TABLE_ROOT_DESC_COUNT],
     ) -> Result<()> {
         let root = &mut self.new_root.root;
-        if catalog_replay_start_ts < root.trx_id {
+        if catalog_replay_start_ts < root.root_ts {
             return Err(mutable_root_metadata_regression(format!(
                 "catalog replay start regressed: current={}, new={catalog_replay_start_ts}",
-                root.trx_id
+                root.root_ts
             )));
         }
         if next_user_obj_id < USER_OBJ_ID_START {
@@ -444,7 +444,7 @@ impl MutableMultiTableFile {
             }
         }
 
-        root.trx_id = catalog_replay_start_ts;
+        root.root_ts = catalog_replay_start_ts;
         root.next_user_obj_id = next_user_obj_id;
         root.table_roots = table_roots;
         Ok(())

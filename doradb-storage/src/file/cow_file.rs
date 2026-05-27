@@ -109,8 +109,11 @@ impl<F: MutableWriterFile> Drop for MutableWriterClaim<F> {
 pub(crate) struct ActiveRoot<M> {
     /// Active ping-pong super-block slot (0/1).
     pub(crate) slot_no: u64,
-    /// Transaction/checkpoint id persisted in current super block.
-    pub(crate) trx_id: TrxID,
+    /// Root publication timestamp persisted in the current super block.
+    ///
+    /// This value can be a transaction STS or CTS depending on the publishing
+    /// path.
+    pub(crate) root_ts: TrxID,
     /// Active meta-block id referenced by the super block.
     pub(crate) meta_block_id: BlockID,
     /// Allocation map used for page-id assignment.
@@ -130,7 +133,7 @@ impl<M: Clone> Clone for ActiveRoot<M> {
     fn clone(&self) -> Self {
         ActiveRoot {
             slot_no: self.slot_no,
-            trx_id: self.trx_id,
+            root_ts: self.root_ts,
             meta_block_id: self.meta_block_id,
             alloc_map: self.alloc_map.clone(),
             meta: self.meta.clone(),
@@ -144,18 +147,18 @@ impl<M> ActiveRoot<M> {
     #[inline]
     pub(crate) fn from_parts(
         slot_no: u64,
-        trx_id: TrxID,
+        root_ts: TrxID,
         meta_block_id: BlockID,
         alloc_map: AllocMap,
         meta: M,
     ) -> Self {
         ActiveRoot {
             slot_no,
-            trx_id,
+            root_ts,
             meta_block_id,
             alloc_map,
             meta,
-            effective_ts: AtomicU64::new(trx_id),
+            effective_ts: AtomicU64::new(root_ts),
         }
     }
 

@@ -242,6 +242,16 @@ conditions are true:
 This cleanup is safe because catalog absence is already durable in
 `catalog.mtb`.
 
+`CREATE TABLE` uses a catalog-commit-last durability gate. Foreground create
+stages catalog rows and `DDLRedo::CreateTable`, publishes the initial table
+file root with the create transaction STS as `root_ts`, builds the runtime, and
+only then commits the catalog transaction. A crash before that final catalog
+commit may leave a deterministic provisional table file without durable catalog
+redo. After redo replay converges, recovery performs a second absent-file
+cleanup pass that deletes user-table files not present in recovered
+catalog/runtime state, while keeping files queued for committed drop-table
+deletion.
+
 ### 5.3 Log Replay
 
 For each redo record after the coarse replay floor:
@@ -269,6 +279,12 @@ For replayed `DropTable` DDL, recovery removes the user-table runtime and
 destroys its in-memory state immediately. It does not unlink the table file at
 replay time. File deletion is deferred until a later catalog checkpoint advances
 `catalog_replay_start_ts` past the drop CTS.
+
+For replayed `CreateTable` DDL, recovery accepts an initial table-file
+`root_ts` that predates the create redo CTS because the root was published
+before catalog commit. If the loaded root metadata only matches after pending
+index-DDL reconciliation, recovery still requires a later root timestamp that
+proves the index DDL metadata could have reached durable table state.
 
 ### 5.4 Why Index Recovery Works Without `Index_Rec_CTS`
 

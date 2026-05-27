@@ -46,7 +46,7 @@ The super block is the fixed entry point of the table file.
 Each slot stores:
 
 - magic/version
-- checkpoint transaction id
+- root timestamp
 - pointer to the active `MetaBlock`
 - checksum/footer redundancy
 
@@ -72,7 +72,15 @@ The active `MetaBlock` stores:
 - `pivot_row_id`
 - `heap_redo_start_ts`
 - `deletion_cutoff_ts`
-- checkpoint transaction id / publication timestamp
+- `root_ts`, the timestamp carried by the published root
+
+`root_ts` is a publication timestamp, not always a transaction commit
+timestamp. Initial `CREATE TABLE` roots use the create transaction STS because
+the table file is staged before catalog commit. Table checkpoint roots use the
+checkpoint transaction STS. Index-DDL roots use the index DDL commit CTS because
+recovery uses the root as proof that the DDL metadata change reached durable
+table state. Catalog multi-table roots use the catalog checkpoint replay
+boundary/safe timestamp.
 
 Notably, the table file does **not** need `index_rec_cts`.
 
@@ -204,7 +212,7 @@ active_root.effective_ts < Global_Min_Active_STS
 ```
 
 `effective_ts` is allocated after a table-root pointer swap. It is not
-persisted. Loaded roots initialize it from the selected durable root's `trx_id`,
+persisted. Loaded roots initialize it from the selected durable `root_ts`,
 because no active pre-crash reader can still hold an older root. If the active
 root effective timestamp is equal to or newer than the GC horizon, checkpoint
 returns a normal delayed outcome and does not move frozen pages into transition,
