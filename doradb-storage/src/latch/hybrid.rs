@@ -393,6 +393,30 @@ impl RawHybridGuard {
     }
 
     #[inline]
+    pub(crate) fn rollback_shared_lock_in_place(&mut self) {
+        assert!(
+            self.state == GuardState::Shared,
+            "rollback_shared_lock_in_place requires shared guard"
+        );
+        self.unlock_shared_raw();
+        self.state = GuardState::Optimistic;
+    }
+
+    #[inline]
+    pub(crate) fn rollback_exclusive_bit_in_place(&mut self) {
+        assert!(
+            self.state == GuardState::Exclusive,
+            "rollback_exclusive_bit_in_place requires exclusive guard"
+        );
+        self.lock_ref()
+            .version
+            .fetch_sub(LATCH_EXCLUSIVE_BIT, Ordering::AcqRel);
+        self.unlock_exclusive_raw();
+        self.version -= LATCH_EXCLUSIVE_BIT;
+        self.state = GuardState::Optimistic;
+    }
+
+    #[inline]
     pub(crate) async fn exclusive_async(self) -> Self {
         debug_assert!(self.state == GuardState::Optimistic);
         self.lock_ref().exclusive_async_raw().await

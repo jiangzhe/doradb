@@ -1909,6 +1909,82 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn test_evictable_buffer_pool_guard_upgrades_reject_generation_mismatch() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let pool = StartedEvictPool::new(
+                EvictableBufferPoolConfig::default()
+                    .role(PoolRole::Mem)
+                    .data_swap_file(temp_dir.path().join("data.swp"))
+                    .max_mem_size(1024u64 * 1024 * 128)
+                    .max_file_size(1024u64 * 1024 * 256),
+            );
+            let pool_guard = pool.pool_guard();
+            let g = pool
+                .allocate_page::<RowPage>(&pool_guard)
+                .await
+                .expect("test page allocation should succeed");
+            let page_id = g.page_id();
+            drop(g);
+
+            let mut g = pool
+                .get_page::<RowPage>(&pool_guard, page_id, LatchFallbackMode::Spin)
+                .await
+                .expect("buffer-pool read failed in test");
+            pool.arena.frame(page_id).bump_generation();
+            assert!(g.try_shared().is_invalid());
+            drop(g);
+
+            let mut g = pool
+                .get_page::<RowPage>(&pool_guard, page_id, LatchFallbackMode::Spin)
+                .await
+                .expect("buffer-pool read failed in test");
+            let frame = pool.arena.frame(page_id);
+            let held_version = frame.latch.version_acq();
+            frame.bump_generation();
+            assert!(g.try_exclusive().is_invalid());
+            assert_eq!(frame.latch.version_acq(), held_version);
+            drop(g);
+
+            let g = pool
+                .get_page::<RowPage>(&pool_guard, page_id, LatchFallbackMode::Spin)
+                .await
+                .expect("buffer-pool read failed in test");
+            pool.arena.frame(page_id).bump_generation();
+            assert!(g.verify_shared_async::<false>().await.is_invalid());
+
+            let g = pool
+                .get_page::<RowPage>(&pool_guard, page_id, LatchFallbackMode::Spin)
+                .await
+                .expect("buffer-pool read failed in test");
+            let frame = pool.arena.frame(page_id);
+            let held_version = frame.latch.version_acq();
+            frame.bump_generation();
+            assert!(g.verify_exclusive_async::<false>().await.is_invalid());
+            assert_eq!(frame.latch.version_acq(), held_version);
+
+            let g = pool
+                .get_page::<RowPage>(&pool_guard, page_id, LatchFallbackMode::Spin)
+                .await
+                .expect("buffer-pool read failed in test")
+                .downgrade();
+            pool.arena.frame(page_id).bump_generation();
+            assert!(g.lock_shared_async().await.is_none());
+
+            let g = pool
+                .get_page::<RowPage>(&pool_guard, page_id, LatchFallbackMode::Spin)
+                .await
+                .expect("buffer-pool read failed in test")
+                .downgrade();
+            let frame = pool.arena.frame(page_id);
+            let held_version = frame.latch.version_acq();
+            frame.bump_generation();
+            assert!(g.lock_exclusive_async().await.is_none());
+            assert_eq!(frame.latch.version_acq(), held_version);
+        })
+    }
+
+    #[test]
     fn test_evict_page_reservation_rollback_reclaims_page_memory() {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();

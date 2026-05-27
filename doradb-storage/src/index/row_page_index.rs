@@ -1119,7 +1119,7 @@ impl<P: BufferPool> RowPageIndexMemCursor<'_, P> {
                 if let Some(parent) = self.parent.take() {
                     self.parent = Some(parent);
                 }
-                match g.try_shared_either() {
+                match verify!(g.try_shared_either()) {
                     Left(c) => {
                         // share lock on child succeeds
                         self.child = Some(c);
@@ -1131,7 +1131,10 @@ impl<P: BufferPool> RowPageIndexMemCursor<'_, P> {
                         // so we can just wait for other thread finish its modification.
                         // NOTE: at this time, the parent is locked. That means SMO
                         // must acquire lock from top down, otherwise, deadlock will happen.
-                        g = new_g.shared_async().await.facade(false);
+                        let Some(new_g) = new_g.lock_shared_async().await else {
+                            return Invalid;
+                        };
+                        g = new_g.facade(false);
                         continue 'SEARCH;
                     }
                 }
@@ -1354,7 +1357,7 @@ mod tests {
                     .await
                     .expect("test insert-page allocation should succeed");
                 let pid1 = p1.page_id();
-                let p1 = p1.downgrade().exclusive_async().await;
+                let p1 = p1.downgrade().lock_exclusive_async().await.unwrap();
                 blk_idx.cache_exclusive_insert_page(p1);
                 assert_eq!(blk_idx.insert_free_list.lock().len(), 1);
                 let p2 = blk_idx
@@ -1958,7 +1961,7 @@ mod tests {
                 assert!(create_cts > 0);
 
                 let page_id = page_guard.page_id();
-                let page_guard = page_guard.downgrade().exclusive_async().await;
+                let page_guard = page_guard.downgrade().lock_exclusive_async().await.unwrap();
                 blk_idx.cache_exclusive_insert_page(page_guard);
 
                 let reused_page = blk_idx
