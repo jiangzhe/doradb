@@ -1,7 +1,7 @@
 ---
 id: 000159
 title: Create Table Catalog Commit Last
-status: proposal
+status: implemented
 created: 2026-05-27
 github_issue: 660
 ---
@@ -31,7 +31,7 @@ Issue Labels:
 - codex
 
 Source Backlogs:
-- docs/backlogs/000082-handle-post-commit-create-table-runtime-load-failure-compensation.md
+- docs/backlogs/closed/000082-handle-post-commit-create-table-runtime-load-failure-compensation.md
 
 Current `Session::create_table(...)` commits catalog rows and
 `DDLRedo::CreateTable`, then publishes the table file, builds `BlockIndex` /
@@ -135,11 +135,12 @@ task resolution.
    - Catalog multi-table root: catalog checkpoint replay boundary / safe
      timestamp.
    - Loaded roots initialize runtime `effective_ts` from durable `root_ts`;
-     newly published roots still install a post-publish runtime fence via
-     `TransactionSystem::mark_published_table_root(...)`.
+     newly published user-table roots install a post-publish runtime fence via
+     `TransactionSystem::publish_table_file_root(...)`.
 
-3. Introduce a scoped create-table builder in `doradb-storage/src/session.rs`.
-   - The builder should own the mutable table file until publication, the active
+3. Introduce a scoped create-table progress helper in
+   `doradb-storage/src/catalog/table.rs`.
+   - The progress helper should own the mutable table file until publication, the active
      transaction until commit/rollback, and any staged runtime resources until
      install.
    - It must have explicit phases, for example:
@@ -147,10 +148,12 @@ task resolution.
      `CatalogCommitted`, `Installed`, `Aborted`.
    - Its drop guard should assert in tests/debug builds if a non-terminal phase
      is dropped without cleanup.
-   - Keep the implementation local to create-table; do not refactor the index
-     DDL builders unless a tiny shared helper clearly removes duplication.
+   - Keep `session.rs` as a thin wrapper that derives session DDL context and
+     forwards to catalog helpers.
+   - Apply the same progress-helper naming and module ownership pattern to
+     create/drop index and drop table where it clarifies DDL cleanup flow.
 
-4. Reorder `Session::create_table(...)`.
+4. Reorder the create-table catalog helper called by `Session::create_table(...)`.
    - Keep the active-transaction rejection and `CatalogNamespace(X)` lock.
    - Allocate `table_id`, metadata, and catalog row objects as today.
    - Create the mutable table file before beginning the DDL transaction, as
@@ -161,8 +164,8 @@ task resolution.
    - Capture `create_root_ts = trx.sts()`.
    - Publish the table file with
      `uninit_table_file.commit(create_root_ts, true).await`.
-   - Call `TransactionSystem::mark_published_table_root(...)` after successful
-     root publication.
+   - Publish through `TransactionSystem::publish_table_file_root(...)` so root
+     publication and effective-fence installation stay paired.
    - Build `BlockIndex` and `Table` runtime from the just-published root.
    - Commit the catalog transaction last.
    - Insert the runtime into `Catalog.user_tables` only after catalog commit
@@ -239,8 +242,8 @@ task resolution.
     - `docs/transaction-system.md`: update the `CREATE TABLE` lifecycle
       paragraph to say catalog commit is held until file/runtime staging
       succeeds, and catalog runtime publication follows durable commit.
-    - If code terminology changes touch RFC-0018/root-proof wording, update
-      `docs/rfcs/0018-create-drop-index.md` narrowly to use `root_ts`.
+   - If code terminology changes touch RFC-0018 root-proof wording, update
+     that RFC narrowly to use `root_ts`.
 
 11. Validate.
     - Run `cargo fmt --all`.
@@ -254,13 +257,66 @@ task resolution.
 
 ## Implementation Notes
 
+Implemented in two commits:
+
+- `a90181d` moves create-table durability to a catalog-commit-last flow and
+  refactors table DDL orchestration out of `session.rs` into
+  `catalog/table.rs`. `session.rs` now remains a thin wrapper around catalog
+  DDL helpers.
+- `623121a` adds focused coverage for the new `catalog/table.rs` failure and
+  guard paths, and stabilizes checkpoint-readiness testing around the runtime
+  root effective timestamp.
+
+Main outcomes:
+
+- `CREATE TABLE` now stages catalog rows, publishes the initial table-file root
+  with the create transaction STS as `root_ts`, builds runtime state, commits
+  catalog metadata last, and only then installs the user-table runtime.
+- Pre-catalog-commit failures roll back the DDL transaction, destroy staged
+  runtime state when present, and remove provisional table files. Ambiguous
+  post-root-publish failures poison storage and preserve the source error
+  context rather than deleting a file that may already be catalog-durable.
+- `DROP TABLE`, `CREATE INDEX`, and `DROP INDEX` now follow the same catalog
+  module ownership pattern: `session.rs` forwards to catalog helpers, while
+  progress/cleanup and catalog mutation logic live in `catalog/table.rs` or
+  `catalog/index.rs`.
+- Root timestamp terminology was normalized to `root_ts`, including
+  `ActiveRoot::root_ts`, recovery state/diagnostics, table root snapshots, and
+  index-DDL root proof comments. Runtime root visibility and cleanup decisions
+  now use runtime `effective_ts` where comparing against other transactions'
+  STS would otherwise be incorrect.
+- `TransactionSystem::publish_table_file_root(...)` centralizes table-file root
+  publication plus effective-fence installation. The raw
+  `mark_published_table_root(...)` helper is private.
+- Recovery accepts an initial create-table root whose `root_ts` can predate the
+  create redo CTS while keeping stricter later-root proof requirements for
+  index-DDL reconciliation. Startup cleanup removes post-replay provisional
+  user-table files absent from recovered catalog state.
+- The test-only skipped-checkpoint unknown-table redo counter was removed from
+  recovery to keep the production replay path cleaner.
+
+Validation performed:
+
+- `cargo fmt --all`
+- `cargo nextest run -p doradb-storage`: 839 passed
+- `cargo nextest run -p doradb-storage --no-default-features --features libaio`:
+  837 passed
+- `cargo clippy -p doradb-storage --all-targets -- -D warnings`
+- Focused coverage:
+  `tools/coverage_focus.rs --path doradb-storage/src/catalog/table.rs --path doradb-storage/src/catalog/index.rs --path doradb-storage/src/session.rs --path doradb-storage/src/trx/recover.rs --path doradb-storage/src/table --top-uncovered 10`
+  reported deduplicated coverage `19121/21011 (91.00%)`. Key changed targets:
+  `catalog/table.rs` `91.45%`, `catalog/index.rs` `82.43%`, `session.rs`
+  `100.00%`, `trx/recover.rs` `95.93%`, and `table/` `91.01%`.
+
+Checklist review found no unresolved required fixes. The one low-effort
+coverage follow-up identified during review was implemented in `623121a`.
 
 ## Impacts
 
 - `doradb-storage/src/session.rs`
-  - `Session::create_table(...)` ordering and failure handling.
-  - New create-table scoped builder/cleanup helper.
-  - Create-table-specific poison helper preserving source error context.
+  - Session DDL methods remain thin wrappers around catalog-owned helpers.
+- `doradb-storage/src/catalog/table.rs`
+  - Create/drop table ordering, progress helpers, cleanup, and poison helpers.
 - `doradb-storage/src/catalog/mod.rs`
   - Runtime insertion should become checked/fallible or otherwise fail closed
     after catalog commit.
@@ -285,7 +341,7 @@ task resolution.
 - `docs/table-file.md`
 - `docs/checkpoint-and-recovery.md`
 - `docs/transaction-system.md`
-- `docs/rfcs/0018-create-drop-index.md` if root-proof wording is touched.
+- RFC-0018 if root-proof wording is touched.
 
 ## Test Cases
 
@@ -330,8 +386,5 @@ task resolution.
 
 ## Open Questions
 
-1. Should the generic CoW `ActiveRoot::trx_id` field be mechanically renamed to
-   `root_ts` in this task, or should this task limit the rename to public table
-   runtime/recovery APIs and add comments around the lower-level generic field?
-   The preferred implementation is the full rename if it stays mechanical and
-   does not obscure unrelated catalog multi-table semantics.
+None. The `ActiveRoot::trx_id` naming question was resolved by mechanically
+renaming the field to `root_ts`.

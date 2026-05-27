@@ -46,3 +46,11 @@ When a backlog item is moved to `docs/backlogs/closed/`, append:
 - Reference: <task/issue/pr reference>
 - Closed At: <YYYY-MM-DD>
 ```
+
+## Close Reason
+
+- Type: implemented
+- Detail: Implemented by docs/tasks/000159-create-table-catalog-commit-last.md. CREATE TABLE now uses catalog commit as the final durable visibility gate, with rollback cleanup before commit, poison semantics after ambiguous post-root publication failures, recovery support for initial root_ts before create CTS, and startup cleanup for provisional files.
+- Closed By: backlog close
+- Reference: docs/tasks/000159-create-table-catalog-commit-last.md
+- Closed At: 2026-05-27
