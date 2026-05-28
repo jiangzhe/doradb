@@ -12,26 +12,26 @@
 //! We separate all transactions into two kinds:
 //! 1. DDL involved transactions
 //! 2. DML-only transactions
-use crate::buffer::PageID;
 use crate::buffer::guard::PageGuard;
 use crate::buffer::{
     BufferPool, EvictableBufferPool, FixedBufferPool, PoolGuards, PoolRole, ReadonlyBufferPool,
 };
 use crate::catalog::{
-    Catalog, CatalogTable, IndexDdlKind, IndexDdlRootProof, TableColumnLayout, TableID,
+    Catalog, CatalogTable, IndexDdlKind, IndexDdlRootProof, TableColumnLayout,
     classify_index_ddl_root, is_catalog_obj_id, is_user_obj_id,
 };
 use crate::error::{DataIntegrityError, Error, OperationError, Result};
 use crate::file::fs::FileSystem;
+use crate::id::{PageID, RowID, TableID, TrxID};
 use crate::latch::LatchFallbackMode;
 use crate::quiescent::QuiescentGuard;
-use crate::row::{RowID, RowPage};
+use crate::row::RowPage;
 use crate::table::Table;
 use crate::trx::log::{LogPartition, LogPartitionInitializer};
 use crate::trx::log_replay::{LogMerger, LogPartitionStream, TrxLog};
 use crate::trx::purge::{DroppedTableFileDeleteItem, GC};
 use crate::trx::redo::{DDLRedo, RedoLogs, RowRedo, RowRedoKind, TableDML};
-use crate::trx::{MAX_SNAPSHOT_TS, MIN_SNAPSHOT_TS, TrxID};
+use crate::trx::{MAX_SNAPSHOT_TS, MIN_SNAPSHOT_TS};
 use crossbeam_utils::CachePadded;
 use error_stack::Report;
 use flume::Receiver;
@@ -596,7 +596,7 @@ impl<'a> LogRecovery<'a> {
             .as_ref()
             .and_then(|ctx| ctx.recover())
             .map(|rec| rec.create_cts())
-            .unwrap_or(0);
+            .unwrap_or(TrxID::new(0));
         let max_row_count = page_guard.page().header.max_row_count as usize;
         page_guard.bf_mut().init_undo_map(col_layout, max_row_count);
         if let Some(row_ver) = page_guard.bf().ctx.as_ref().and_then(|ctx| ctx.row_ver()) {
@@ -736,7 +736,7 @@ impl<'a> LogRecovery<'a> {
                             .attach(format!("replay create row page: table_id={table_id}")),
                     )
                 })?;
-                let count = end_row_id - start_row_id;
+                let count = *end_row_id - *start_row_id;
                 let mut page_guard = table
                     .mem
                     .allocate_row_page_at(&self.pool_guards, count as usize, *page_id)
@@ -943,25 +943,26 @@ mod tests {
     use super::{
         LogRecovery, RecoverMap, RecoveryTableState, validate_create_table_reloaded_root_ts,
     };
-    use crate::buffer::{PageID, PoolRole};
+    use crate::buffer::PoolRole;
     use crate::catalog::{
         ActiveIndexSpec, ColumnAttributes, ColumnSpec, IndexAttributes, IndexColumnObject,
-        IndexKey, IndexObject, IndexOrder, IndexSpec, TableID, TableMetadata, TableObject,
-        TableSpec, USER_OBJ_ID_START,
+        IndexKey, IndexObject, IndexOrder, IndexSpec, TableMetadata, TableObject, TableSpec,
+        USER_OBJ_ID_START,
     };
     use crate::conf::{EngineConfig, EvictableBufferPoolConfig, FileSystemConfig, TrxSysConfig};
     use crate::error::{CompletionErrorKind, DataIntegrityError, Error, OperationError};
     use crate::file::block_integrity::{BLOCK_INTEGRITY_HEADER_SIZE, write_block_checksum};
     use crate::file::cow_file::{COW_FILE_PAGE_SIZE, SUPER_BLOCK_ID};
     use crate::file::table_file::MutableTableFile;
+    use crate::id::{BlockID, PageID, RowID, TableID, TrxID};
     use crate::index::{COLUMN_DELETION_BLOB_PAGE_HEADER_SIZE, ColumnBlockIndex, UniqueIndex};
+    use crate::row::RowRead;
     use crate::row::ops::{DeleteMvcc, SelectKey, SelectMvcc, UpdateCol, UpdateMvcc};
-    use crate::row::{RowID, RowRead};
     use crate::table::{CheckpointOutcome, DeleteMarker, Table, TablePersistence};
     use crate::trx::log_replay::{LogMerger, TrxLog};
     use crate::trx::redo::{DDLRedo, RedoHeader, RedoLogs, RedoTrxKind, RowRedo, RowRedoKind};
     use crate::trx::stmt::Statement;
-    use crate::trx::{ActiveTrx, MIN_SNAPSHOT_TS, TrxID};
+    use crate::trx::{ActiveTrx, MIN_SNAPSHOT_TS};
     use crate::value::Val;
     use crate::value::ValKind;
     use std::fs::OpenOptions;
@@ -976,7 +977,7 @@ mod tests {
     fn assert_table_data_integrity(
         err: Error,
         block_kind: &str,
-        block_id: crate::file::BlockID,
+        block_id: BlockID,
         expected: DataIntegrityError,
     ) {
         let report = format!("{err:?}");
@@ -1044,41 +1045,41 @@ mod tests {
         }
     }
 
-    fn unknown_table_dml_log(table_id: u64, cts: TrxID) -> TrxLog {
+    fn unknown_table_dml_log(table_id: TableID, cts: TrxID) -> TrxLog {
         let mut redo = RedoLogs::default();
         redo.insert_dml(
             table_id,
             RowRedo {
                 page_id: PageID::new(1),
-                row_id: 0,
+                row_id: RowID::new(0),
                 kind: RowRedoKind::Insert(vec![Val::from(1u32)]),
             },
         );
         TrxLog::new(redo_header(cts), redo)
     }
 
-    fn unknown_table_create_row_page_log(table_id: u64, cts: TrxID) -> TrxLog {
+    fn unknown_table_create_row_page_log(table_id: TableID, cts: TrxID) -> TrxLog {
         TrxLog::new(
             redo_header(cts),
             RedoLogs {
                 ddl: Some(Box::new(DDLRedo::CreateRowPage {
                     table_id,
                     page_id: PageID::new(2),
-                    start_row_id: 0,
-                    end_row_id: 1,
+                    start_row_id: RowID::new(0),
+                    end_row_id: RowID::new(1),
                 })),
                 dml: Default::default(),
             },
         )
     }
 
-    fn unknown_table_data_checkpoint_log(table_id: u64, cts: TrxID) -> TrxLog {
+    fn unknown_table_data_checkpoint_log(table_id: TableID, cts: TrxID) -> TrxLog {
         TrxLog::new(
             redo_header(cts),
             RedoLogs {
                 ddl: Some(Box::new(DDLRedo::DataCheckpoint {
                     table_id,
-                    pivor_row_id: 0,
+                    pivor_row_id: RowID::new(0),
                     sts: cts,
                 })),
                 dml: Default::default(),
@@ -1409,56 +1410,61 @@ mod tests {
 
     #[test]
     fn test_recover_map_tracks_create_cts_and_entries() {
-        let mut map = RecoverMap::new(7);
-        assert_eq!(map.create_cts(), 7);
+        let mut map = RecoverMap::new(TrxID::new(7));
+        assert_eq!(map.create_cts(), TrxID::new(7));
         assert!(map.is_vacant(0));
 
-        map.insert_at(2, 11);
+        map.insert_at(2, TrxID::new(11));
         assert!(map.is_vacant(0));
         assert!(map.is_vacant(1));
         assert!(!map.is_vacant(2));
-        assert_eq!(map.at(2), Some(11));
+        assert_eq!(map.at(2), Some(TrxID::new(11)));
         assert_eq!(map.at(3), None);
 
-        map.update_at(2, 13);
-        assert_eq!(map.at(2), Some(13));
+        map.update_at(2, TrxID::new(13));
+        assert_eq!(map.at(2), Some(TrxID::new(13)));
     }
 
     #[test]
     fn test_recovery_table_state_replay_start_uses_heap_and_deletion_floor() {
         let heap_first = RecoveryTableState {
-            root_ts: 5,
-            heap_redo_start_ts: 7,
-            deletion_cutoff_ts: 11,
+            root_ts: TrxID::new(5),
+            heap_redo_start_ts: TrxID::new(7),
+            deletion_cutoff_ts: TrxID::new(11),
         };
-        assert_eq!(heap_first.replay_start_ts(), 7);
+        assert_eq!(heap_first.replay_start_ts(), TrxID::new(7));
 
         let deletion_first = RecoveryTableState {
-            root_ts: 17,
-            heap_redo_start_ts: 19,
-            deletion_cutoff_ts: 13,
+            root_ts: TrxID::new(17),
+            heap_redo_start_ts: TrxID::new(19),
+            deletion_cutoff_ts: TrxID::new(13),
         };
-        assert_eq!(deletion_first.replay_start_ts(), 13);
+        assert_eq!(deletion_first.replay_start_ts(), TrxID::new(13));
     }
 
     #[test]
     fn test_create_table_root_ts_validation_accepts_initial_sts_root() {
         let root_before_create = RecoveryTableState {
-            root_ts: 9,
-            heap_redo_start_ts: 9,
-            deletion_cutoff_ts: 9,
+            root_ts: TrxID::new(9),
+            heap_redo_start_ts: TrxID::new(9),
+            deletion_cutoff_ts: TrxID::new(9),
         };
-        validate_create_table_reloaded_root_ts(USER_OBJ_ID_START, 10, root_before_create, false)
-            .unwrap();
+        validate_create_table_reloaded_root_ts(
+            USER_OBJ_ID_START,
+            TrxID::new(10),
+            root_before_create,
+            false,
+        )
+        .unwrap();
 
         let pending_without_later_root = RecoveryTableState {
-            root_ts: 10,
-            heap_redo_start_ts: 10,
-            deletion_cutoff_ts: 10,
+            root_ts: TrxID::new(10),
+            heap_redo_start_ts: TrxID::new(10),
+            deletion_cutoff_ts: TrxID::new(10),
         };
         let err = validate_create_table_reloaded_root_ts(
             USER_OBJ_ID_START,
-            10,
+            TrxID::new(10),
             pending_without_later_root,
             true,
         )
@@ -1472,13 +1478,13 @@ mod tests {
         assert!(report.contains("root_ts=10"), "{report}");
 
         let pending_with_later_root = RecoveryTableState {
-            root_ts: 11,
-            heap_redo_start_ts: 10,
-            deletion_cutoff_ts: 10,
+            root_ts: TrxID::new(11),
+            heap_redo_start_ts: TrxID::new(10),
+            deletion_cutoff_ts: TrxID::new(10),
         };
         validate_create_table_reloaded_root_ts(
             USER_OBJ_ID_START,
-            10,
+            TrxID::new(10),
             pending_with_later_root,
             true,
         )
@@ -1497,20 +1503,26 @@ mod tests {
             .await
             .unwrap();
             let unknown_table_id = USER_OBJ_ID_START + 142;
-            let mut recovery = log_recovery_for_engine(&engine, 10);
+            let mut recovery = log_recovery_for_engine(&engine, TrxID::new(10));
 
             recovery
-                .replay_log(unknown_table_dml_log(unknown_table_id, 9))
+                .replay_log(unknown_table_dml_log(unknown_table_id, TrxID::new(9)))
                 .await
                 .unwrap();
 
             recovery
-                .replay_log(unknown_table_create_row_page_log(unknown_table_id, 9))
+                .replay_log(unknown_table_create_row_page_log(
+                    unknown_table_id,
+                    TrxID::new(9),
+                ))
                 .await
                 .unwrap();
 
             recovery
-                .replay_log(unknown_table_data_checkpoint_log(unknown_table_id, 9))
+                .replay_log(unknown_table_data_checkpoint_log(
+                    unknown_table_id,
+                    TrxID::new(9),
+                ))
                 .await
                 .unwrap();
 
@@ -1532,9 +1544,9 @@ mod tests {
             .unwrap();
             let unknown_table_id = USER_OBJ_ID_START + 143;
 
-            let mut dml_recovery = log_recovery_for_engine(&engine, 10);
+            let mut dml_recovery = log_recovery_for_engine(&engine, TrxID::new(10));
             let err = dml_recovery
-                .replay_log(unknown_table_dml_log(unknown_table_id, 10))
+                .replay_log(unknown_table_dml_log(unknown_table_id, TrxID::new(10)))
                 .await
                 .unwrap_err();
             assert_eq!(err.operation_error(), Some(OperationError::TableNotFound));
@@ -1542,9 +1554,12 @@ mod tests {
             assert!(report.contains("invalid recovery ordering"), "{report}");
             assert!(report.contains("replay user table DML"), "{report}");
 
-            let mut ddl_recovery = log_recovery_for_engine(&engine, 10);
+            let mut ddl_recovery = log_recovery_for_engine(&engine, TrxID::new(10));
             let err = ddl_recovery
-                .replay_log(unknown_table_create_row_page_log(unknown_table_id, 10))
+                .replay_log(unknown_table_create_row_page_log(
+                    unknown_table_id,
+                    TrxID::new(10),
+                ))
                 .await
                 .unwrap_err();
             assert_eq!(err.operation_error(), Some(OperationError::TableNotFound));
@@ -2088,7 +2103,7 @@ mod tests {
                 table
                     .accessor_with_layout(&layout)
                     .mem_scan_uncommitted(session.pool_guards(), |_metadata, row| {
-                        assert!(row.row_id() as usize <= DML_SIZE);
+                        assert!(row.row_id().as_usize() <= DML_SIZE);
                         rows += if row.is_deleted() { 0 } else { 1 };
                         true
                     })
@@ -2719,7 +2734,7 @@ mod tests {
             assert!(matches!(delete, Ok(DeleteMvcc::Deleted)));
             trx.commit().await.unwrap();
 
-            let marker0_ts = match table.deletion_buffer().get(0).unwrap() {
+            let marker0_ts = match table.deletion_buffer().get(RowID::new(0)).unwrap() {
                 DeleteMarker::Committed(ts) => ts,
                 DeleteMarker::Ref(status) => status.ts(),
             };
@@ -2746,7 +2761,7 @@ mod tests {
             let delete = trx_delete_row(&mut trx, &table, &key1).await;
             assert!(matches!(delete, Ok(DeleteMvcc::Deleted)));
             trx.commit().await.unwrap();
-            let marker1_ts = match table.deletion_buffer().get(1).unwrap() {
+            let marker1_ts = match table.deletion_buffer().get(RowID::new(1)).unwrap() {
                 DeleteMarker::Committed(ts) => ts,
                 DeleteMarker::Ref(status) => status.ts(),
             };
@@ -2781,8 +2796,8 @@ mod tests {
                 table.file().active_root_unchecked().deletion_cutoff_ts,
                 checkpointed_cutoff
             );
-            assert!(table.deletion_buffer().get(0).is_none());
-            match table.deletion_buffer().get(1).unwrap() {
+            assert!(table.deletion_buffer().get(RowID::new(0)).is_none());
+            match table.deletion_buffer().get(RowID::new(1)).unwrap() {
                 DeleteMarker::Committed(ts) => assert_eq!(ts, marker1_ts),
                 DeleteMarker::Ref(_) => panic!("recovered cold delete should be committed"),
             }
@@ -2920,14 +2935,14 @@ mod tests {
                     .file()
                     .active_root_unchecked()
                     .pivot_row_id
-                    > 0
+                    > RowID::new(0)
             );
             assert_eq!(
                 replay_only_table
                     .file()
                     .active_root_unchecked()
                     .pivot_row_id,
-                0
+                RowID::new(0)
             );
             assert!(
                 checkpointed_table
@@ -3195,7 +3210,7 @@ mod tests {
             }
             trx.commit().await.unwrap();
 
-            let marker = table.deletion_buffer().get(0).unwrap();
+            let marker = table.deletion_buffer().get(RowID::new(0)).unwrap();
             let marker_ts = match marker {
                 DeleteMarker::Committed(ts) => ts,
                 DeleteMarker::Ref(status) => status.ts(),
@@ -3235,7 +3250,7 @@ mod tests {
                     &disk_pool_guard,
                 );
                 let entry = index
-                    .locate_block(0)
+                    .locate_block(RowID::new(0))
                     .await
                     .unwrap()
                     .expect("checkpointed table should keep the deleted row's block entry");
@@ -3282,7 +3297,7 @@ mod tests {
                 session.pool_guards().disk_guard(),
             );
             let entry = index
-                .locate_block(0)
+                .locate_block(RowID::new(0))
                 .await
                 .unwrap()
                 .expect("deleted row should still have a checkpoint entry");

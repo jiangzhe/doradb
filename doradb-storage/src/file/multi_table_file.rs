@@ -1,6 +1,6 @@
 use crate::bitmap::AllocMap;
 use crate::buffer::ReadonlyBufferPool;
-use crate::catalog::{ObjID, TableID, USER_OBJ_ID_START};
+use crate::catalog::USER_OBJ_ID_START;
 use crate::error::{
     DataIntegrityError, Error, FileKind, InternalError, IoError, ResourceError, Result,
 };
@@ -10,9 +10,9 @@ use crate::file::block_integrity::{
     write_block_checksum, write_block_header,
 };
 use crate::file::cow_file::{
-    ActiveRoot as GenericActiveRoot, BlockID, COW_FILE_PAGE_SIZE, CowCodec, CowFile,
-    CowWriteBarrier, MutableCowFile, MutableCowRoot, MutableWriterClaim, MutableWriterFile,
-    OldCowRoot, ParsedMeta, SUPER_BLOCK_ID, allocate_cow_block, validate_active_meta_block_id,
+    ActiveRoot as GenericActiveRoot, COW_FILE_PAGE_SIZE, CowCodec, CowFile, CowWriteBarrier,
+    MutableCowFile, MutableCowRoot, MutableWriterClaim, MutableWriterFile, OldCowRoot, ParsedMeta,
+    SUPER_BLOCK_ID, allocate_cow_block, validate_active_meta_block_id,
 };
 use crate::file::fs::BackgroundWriteRequest;
 use crate::file::meta_block::{
@@ -23,11 +23,11 @@ use crate::file::super_block::{
     SuperBlockFooter, SuperBlockHeader, SuperBlockSerView, parse_super_block,
 };
 use crate::file::table_file::TABLE_FILE_INITIAL_SIZE;
+use crate::id::{BlockID, RowID, TableID, TrxID};
 use crate::io::{DirectBuf, IOBuf, IOClient};
 use crate::quiescent::QuiescentGuard;
-use crate::row::RowID;
 use crate::serde::{Deser, Ser};
-use crate::trx::{MIN_SNAPSHOT_TS, TrxID};
+use crate::trx::MIN_SNAPSHOT_TS;
 use error_stack::{Report, ResultExt};
 use std::io::ErrorKind as IoErrorKind;
 use std::num::NonZeroU64;
@@ -91,7 +91,7 @@ impl CatalogTableRootDesc {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct MultiTableMetaBlock {
     /// Global next user object-id allocator watermark.
-    pub(crate) next_user_obj_id: ObjID,
+    pub(crate) next_user_obj_id: TableID,
     /// Reserved root descriptors for catalog logical tables.
     pub(crate) table_roots: [CatalogTableRootDesc; CATALOG_TABLE_ROOT_DESC_COUNT],
 }
@@ -99,10 +99,10 @@ pub(crate) struct MultiTableMetaBlock {
 impl MultiTableMetaBlock {
     /// Create a meta payload initialized with allocator lower bound.
     #[inline]
-    pub(crate) fn new(next_user_obj_id: ObjID) -> Self {
+    pub(crate) fn new(next_user_obj_id: TableID) -> Self {
         let mut table_roots = [CatalogTableRootDesc::default(); CATALOG_TABLE_ROOT_DESC_COUNT];
         for (idx, root) in table_roots.iter_mut().enumerate() {
-            root.table_id = idx as TableID;
+            root.table_id = TableID::from(idx);
         }
         MultiTableMetaBlock {
             next_user_obj_id: next_user_obj_id.max(USER_OBJ_ID_START),
@@ -420,7 +420,7 @@ impl MutableMultiTableFile {
     pub(crate) fn apply_checkpoint_metadata(
         &mut self,
         catalog_replay_start_ts: TrxID,
-        next_user_obj_id: ObjID,
+        next_user_obj_id: TableID,
         table_roots: [CatalogTableRootDesc; CATALOG_TABLE_ROOT_DESC_COUNT],
     ) -> Result<()> {
         let root = &mut self.new_root.root;
@@ -436,7 +436,7 @@ impl MutableMultiTableFile {
             )));
         }
         for root in &table_roots {
-            if root.root_block_id.is_none() && root.pivot_row_id != 0 {
+            if root.root_block_id.is_none() && root.pivot_row_id != RowID::new(0) {
                 return Err(catalog_root_descriptor_invariant(format!(
                     "table_id={}, root block missing but pivot_row_id={}",
                     root.table_id, root.pivot_row_id
@@ -562,7 +562,7 @@ mod tests {
         mtb: &Arc<MultiTableFile>,
         background_writes: &IOClient<BackgroundWriteRequest>,
         catalog_replay_start_ts: TrxID,
-        next_user_obj_id: ObjID,
+        next_user_obj_id: TableID,
         table_roots: [CatalogTableRootDesc; CATALOG_TABLE_ROOT_DESC_COUNT],
     ) {
         let mut mutable = MutableMultiTableFile::fork(mtb, background_writes);
@@ -593,12 +593,18 @@ mod tests {
 
             let mut roots = [CatalogTableRootDesc::default(); CATALOG_TABLE_ROOT_DESC_COUNT];
             for (idx, root) in roots.iter_mut().enumerate() {
-                root.table_id = idx as u64;
+                root.table_id = TableID::new(idx as u64);
                 root.root_block_id = NonZeroU64::new((idx + 10) as u64);
-                root.pivot_row_id = (idx * 100) as u64;
+                root.pivot_row_id = RowID::new((idx * 100) as u64);
             }
-            publish_checkpoint_for_test(&mtb, background_writes, 7, USER_OBJ_ID_START + 16, roots)
-                .await;
+            publish_checkpoint_for_test(
+                &mtb,
+                background_writes,
+                TrxID::new(7),
+                USER_OBJ_ID_START + 16,
+                roots,
+            )
+            .await;
             let meta_block_id_1 = mtb.active_root_unchecked().meta_block_id;
             assert_ne!(meta_block_id_0, meta_block_id_1);
             drop(mtb);
@@ -608,7 +614,7 @@ mod tests {
                 .await
                 .unwrap();
             let s1 = mtb2.load_snapshot().unwrap();
-            assert_eq!(s1.catalog_replay_start_ts, 7);
+            assert_eq!(s1.catalog_replay_start_ts, TrxID::new(7));
             assert_eq!(s1.meta.next_user_obj_id, USER_OBJ_ID_START + 16);
             assert_eq!(s1.meta.table_roots, roots);
 
@@ -631,15 +637,27 @@ mod tests {
 
             let mut roots = [CatalogTableRootDesc::default(); CATALOG_TABLE_ROOT_DESC_COUNT];
             for (idx, root) in roots.iter_mut().enumerate() {
-                root.table_id = idx as u64;
+                root.table_id = TableID::new(idx as u64);
             }
 
             let meta_block_id_0 = mtb.active_root_unchecked().meta_block_id;
-            publish_checkpoint_for_test(&mtb, background_writes, 3, USER_OBJ_ID_START + 1, roots)
-                .await;
+            publish_checkpoint_for_test(
+                &mtb,
+                background_writes,
+                TrxID::new(3),
+                USER_OBJ_ID_START + 1,
+                roots,
+            )
+            .await;
             let meta_block_id_1 = mtb.active_root_unchecked().meta_block_id;
-            publish_checkpoint_for_test(&mtb, background_writes, 4, USER_OBJ_ID_START + 2, roots)
-                .await;
+            publish_checkpoint_for_test(
+                &mtb,
+                background_writes,
+                TrxID::new(4),
+                USER_OBJ_ID_START + 2,
+                roots,
+            )
+            .await;
             let meta_block_id_2 = mtb.active_root_unchecked().meta_block_id;
 
             assert_ne!(meta_block_id_0, meta_block_id_1);
@@ -769,14 +787,14 @@ mod tests {
 
             let mut roots_v1 = [CatalogTableRootDesc::default(); CATALOG_TABLE_ROOT_DESC_COUNT];
             for (idx, root) in roots_v1.iter_mut().enumerate() {
-                root.table_id = idx as u64;
+                root.table_id = TableID::new(idx as u64);
                 root.root_block_id = NonZeroU64::new((idx + 10) as u64);
-                root.pivot_row_id = (idx as u64) + 1;
+                root.pivot_row_id = RowID::new((idx as u64) + 1);
             }
             publish_checkpoint_for_test(
                 &mtb,
                 background_writes,
-                3,
+                TrxID::new(3),
                 USER_OBJ_ID_START + 1,
                 roots_v1,
             )
@@ -785,11 +803,11 @@ mod tests {
 
             let mut roots_v2 = roots_v1;
             roots_v2[0].root_block_id = NonZeroU64::new(99);
-            roots_v2[0].pivot_row_id = 100;
+            roots_v2[0].pivot_row_id = RowID::new(100);
             publish_checkpoint_for_test(
                 &mtb,
                 background_writes,
-                4,
+                TrxID::new(4),
                 USER_OBJ_ID_START + 2,
                 roots_v2,
             )
@@ -830,14 +848,14 @@ mod tests {
 
             let mut roots_v1 = [CatalogTableRootDesc::default(); CATALOG_TABLE_ROOT_DESC_COUNT];
             for (idx, root) in roots_v1.iter_mut().enumerate() {
-                root.table_id = idx as u64;
+                root.table_id = TableID::new(idx as u64);
                 root.root_block_id = NonZeroU64::new((idx + 20) as u64);
-                root.pivot_row_id = (idx as u64) + 10;
+                root.pivot_row_id = RowID::new((idx as u64) + 10);
             }
             publish_checkpoint_for_test(
                 &mtb,
                 background_writes,
-                5,
+                TrxID::new(5),
                 USER_OBJ_ID_START + 10,
                 roots_v1,
             )
@@ -845,11 +863,11 @@ mod tests {
 
             let mut roots_v2 = roots_v1;
             roots_v2[1].root_block_id = NonZeroU64::new(123);
-            roots_v2[1].pivot_row_id = 222;
+            roots_v2[1].pivot_row_id = RowID::new(222);
             publish_checkpoint_for_test(
                 &mtb,
                 background_writes,
-                6,
+                TrxID::new(6),
                 USER_OBJ_ID_START + 11,
                 roots_v2,
             )
@@ -873,7 +891,7 @@ mod tests {
             );
             let invalid_root = MultiTableActiveRoot::from_parts(
                 0,
-                0,
+                TrxID::new(0),
                 active_meta_block_id,
                 parsed_meta.alloc_map,
                 parsed_meta.meta,

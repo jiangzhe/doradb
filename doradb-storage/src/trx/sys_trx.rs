@@ -1,6 +1,4 @@
-use crate::buffer::PageID;
-use crate::catalog::TableID;
-use crate::row::RowID;
+use crate::id::{PageID, RowID, TableID, TrxID};
 use crate::trx::PreparedTrx;
 use crate::trx::log_replay::TrxLog;
 use crate::trx::redo::{DDLRedo, RedoHeader, RedoLogs, RedoTrxKind};
@@ -41,7 +39,7 @@ impl SysTrx {
         } else {
             Some(TrxLog::new(
                 RedoHeader {
-                    cts: 0,
+                    cts: TrxID::new(0),
                     trx_kind: RedoTrxKind::System,
                 },
                 mem::take(&mut self.redo),

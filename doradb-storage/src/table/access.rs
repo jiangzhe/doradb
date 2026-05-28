@@ -1,11 +1,11 @@
 use super::missing_secondary_index;
 use crate::buffer::guard::{PageGuard, PageSharedGuard};
 use crate::buffer::page::{INVALID_PAGE_ID, VersionedPageID};
-use crate::buffer::{EvictableBufferPool, PageID, PoolGuards};
-use crate::catalog::{TableColumnLayout, TableID, TableMetadata};
+use crate::buffer::{EvictableBufferPool, PoolGuards};
+use crate::catalog::{TableColumnLayout, TableMetadata};
 use crate::error::{DataIntegrityError, Error, FileKind, InternalError, OperationError, Result};
-use crate::file::BlockID;
 use crate::file::cow_file::SUPER_BLOCK_ID;
+use crate::id::{BlockID, PageID, RowID, TableID, TrxID};
 use crate::index::util::{Maskable, RowPageCreateRedoCtx};
 use crate::index::{
     ColumnBlockIndex, ColumnLeafEntry, IndexCompareExchange, IndexInsert, NonUniqueIndex,
@@ -16,7 +16,7 @@ use crate::row::ops::{
     DeleteMvcc, InsertIndex, LinkForUniqueIndex, ReadRow, ScanMvcc, SelectKey, SelectMvcc, UndoCol,
     UpdateCol, UpdateIndex, UpdateMvcc, UpdateRow,
 };
-use crate::row::{Row, RowID, RowPage, RowRead, estimate_max_row_count, var_len_for_insert};
+use crate::row::{Row, RowPage, RowRead, estimate_max_row_count, var_len_for_insert};
 use crate::table::{
     ColumnDeletionBuffer, ColumnStorage, DeleteInternal, DeleteMarker, DeletionError,
     InsertRowIntoPage, MemTable, Table, TableRootSnapshot, TableRuntimeLayout, UpdateRowInplace,
@@ -30,7 +30,7 @@ use crate::trx::row::{
 use crate::trx::stmt::StmtEffects;
 use crate::trx::undo::{IndexBranch, IndexBranchTarget, OwnedRowUndo, RowUndoKind};
 use crate::trx::ver_map::RowPageState;
-use crate::trx::{MIN_SNAPSHOT_TS, SharedTrxStatus, TrxContext, TrxID, trx_is_committed};
+use crate::trx::{MIN_SNAPSHOT_TS, SharedTrxStatus, TrxContext, trx_is_committed};
 use crate::value::Val;
 use error_stack::Report;
 use std::collections::{BTreeSet, HashMap};
@@ -714,7 +714,7 @@ impl UserTableAccessor<'_> {
         for delta in delete_deltas {
             let row_id = entry
                 .start_row_id
-                .checked_add(RowID::from(delta))
+                .checked_add(u64::from(delta))
                 .ok_or_else(|| {
                     invalid_lwc_payload(
                         file_kind,
@@ -798,7 +798,7 @@ impl UserTableAccessor<'_> {
     {
         let column_root = root_snapshot.column_block_index_root();
         let pivot_row_id = root_snapshot.pivot_row_id();
-        if column_root == SUPER_BLOCK_ID || pivot_row_id == 0 {
+        if column_root == SUPER_BLOCK_ID || pivot_row_id == RowID::new(0) {
             return Ok(true);
         }
 

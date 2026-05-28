@@ -2,13 +2,14 @@ use crate::buffer::frame::{BufferFrame, FrameKind};
 use crate::buffer::guard::PageExclusiveGuard;
 use crate::error::{Error, Result};
 use crate::file::BlockKey;
+use crate::id::PageID;
 use crate::io::{IOSubmission, Operation};
 use crate::notify::EventNotifyOnDrop;
 use std::mem;
 use std::sync::Arc;
 use zerocopy::{FromBytes, IntoBytes, KnownLayout};
 
-pub(crate) use super::{INVALID_PAGE_ID, PageID};
+pub(crate) use super::INVALID_PAGE_ID;
 
 pub(crate) const PAGE_SIZE: usize = 64 * 1024;
 pub(crate) type Page = [u8; PAGE_SIZE];

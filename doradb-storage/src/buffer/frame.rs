@@ -1,9 +1,8 @@
-use crate::buffer::page::{BufferPageKind, Page, PageID};
+use crate::buffer::page::{BufferPageKind, Page};
 use crate::catalog::TableColumnLayout;
-use crate::file::FileID;
-use crate::file::cow_file::{BlockID, INVALID_BLOCK_ID};
+use crate::file::cow_file::INVALID_BLOCK_ID;
+use crate::id::{BlockID, FileID, PageID, TrxID};
 use crate::latch::HybridLatch;
-use crate::trx::TrxID;
 use crate::trx::recover::RecoverMap;
 use crate::trx::ver_map::RowVersionMap;
 use std::sync::Arc;

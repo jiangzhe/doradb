@@ -5,6 +5,7 @@ use crate::error::{
 };
 use crate::file::{FileSyncer, SparseFile, UNTRACKED_FILE_ID};
 use crate::free_list::FreeList;
+use crate::id::TrxID;
 use crate::io::{
     Completion, DirectBuf, IOBackendStats, IOBackendStatsHandle, IOClient, IOKind, IOQueue,
     IOStateMachine, IOSubmission, IOWorkerBuilder, Operation, StdIoResult, StorageBackend,
@@ -19,7 +20,7 @@ use crate::trx::log_replay::{LogBuf, LogPartitionStream, MmapLogReader, TrxLog};
 use crate::trx::purge::{GC, GCBucket};
 use crate::trx::sys::GC_BUCKETS;
 use crate::trx::sys::TransactionSystem;
-use crate::trx::{CommittedTrx, MAX_COMMIT_TS, MAX_SNAPSHOT_TS, PrecommitTrx, PreparedTrx, TrxID};
+use crate::trx::{CommittedTrx, MAX_COMMIT_TS, MAX_SNAPSHOT_TS, PrecommitTrx, PreparedTrx};
 use crossbeam_utils::CachePadded;
 use error_stack::Report;
 use flume::{Receiver, Sender};
@@ -130,7 +131,7 @@ impl LogPartitionInitializer {
         Ok((
             LogPartition {
                 group_commit: CachePadded::new(MutexGroupCommit::new(group_commit)),
-                persisted_cts: CachePadded::new(AtomicU64::new(MIN_SNAPSHOT_TS)),
+                persisted_cts: CachePadded::new(AtomicU64::new(MIN_SNAPSHOT_TS.as_u64())),
                 rr_gc_no: CachePadded::new(AtomicUsize::new(0)),
                 stats: Arc::new(CachePadded::new(LogPartitionStats::default())),
                 gc_chan,
@@ -339,7 +340,7 @@ impl LogPartition {
     pub(super) fn min_active_sts(&self) -> TrxID {
         let mut min = MAX_SNAPSHOT_TS;
         for gc_bucket in &self.gc_buckets {
-            let ts = gc_bucket.min_active_sts.load(Ordering::Relaxed);
+            let ts = TrxID::new(gc_bucket.min_active_sts.load(Ordering::Relaxed));
             if ts < min {
                 min = ts;
             }
@@ -435,7 +436,7 @@ impl LogPartition {
         wait_sync: bool,
     ) -> Result<EnqueuedCommit> {
         let mut group_commit_g = self.group_commit.lock();
-        let cts = global_ts.fetch_add(1, Ordering::SeqCst);
+        let cts = TrxID::new(global_ts.fetch_add(1, Ordering::SeqCst));
         debug_assert!(cts < MAX_COMMIT_TS);
         let precommit_trx = trx.fill_cts(cts);
         if group_commit_g.queue.is_empty() {
@@ -512,7 +513,7 @@ impl LogPartition {
             }
             return Err(err);
         }
-        assert!(self.persisted_cts.load(Ordering::Relaxed) >= cts);
+        assert!(TrxID::new(self.persisted_cts.load(Ordering::Relaxed)) >= cts);
         if let Some(s) = session.as_mut() {
             s.commit(cts);
         }
@@ -933,7 +934,7 @@ impl<'a> FileProcessor<'a> {
 
             self.partition
                 .persisted_cts
-                .store(max_cts, Ordering::SeqCst);
+                .store(max_cts.as_u64(), Ordering::SeqCst);
 
             // Put IO buffer back into free list.
             let drained_written: Vec<_> = self.written.drain(..).collect();
@@ -1149,12 +1150,13 @@ pub(crate) fn parse_file_seq(file_path: &Path) -> Result<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::buffer::{PageID, PoolRole, test_page_id};
+    use crate::buffer::{PoolRole, test_page_id};
     use crate::catalog::tests::table2;
     use crate::conf::{EngineConfig, EvictableBufferPoolConfig, TrxSysConfig};
     use crate::engine::{Engine, EngineRef};
     use crate::error::{CompletionErrorKind, FatalError};
     use crate::file::{FileSyncKind, FileSyncOp, FileSyncTestHook, set_file_sync_test_hook};
+    use crate::id::{PageID, RowID, TableID};
     use crate::io::{
         IOKind, StorageBackendOp, StorageBackendTestHook, install_storage_backend_test_hook,
     };
@@ -1364,7 +1366,12 @@ mod tests {
         std::thread::spawn(move || {
             smol::block_on(async move {
                 let mut sys_trx = engine.trx_sys.begin_sys_trx();
-                sys_trx.create_row_page(marker as _, PageID::from(marker), 0, 1);
+                sys_trx.create_row_page(
+                    TableID::from(marker),
+                    PageID::from(marker),
+                    RowID::new(0),
+                    RowID::new(1),
+                );
                 let prepared = sys_trx.prepare();
                 engine.trx_sys.log_partitions[0]
                     .commit(prepared, &engine.trx_sys.ts, true)
@@ -1439,17 +1446,23 @@ mod tests {
         let mut inflight = BTreeMap::new();
         let mut written = Vec::new();
 
-        inflight.insert(10, sync_group_for_order_test(10, false, 4096));
-        inflight.insert(11, sync_group_for_order_test(11, true, 0));
+        inflight.insert(
+            TrxID::new(10),
+            sync_group_for_order_test(TrxID::new(10), false, 4096),
+        );
+        inflight.insert(
+            TrxID::new(11),
+            sync_group_for_order_test(TrxID::new(11), true, 0),
+        );
         assert_eq!(shrink_inflight(&mut inflight, &mut written), (0, 0, 0));
         assert!(written.is_empty());
         assert_eq!(inflight.len(), 2);
 
-        inflight.get_mut(&10).unwrap().finished = true;
+        inflight.get_mut(&TrxID::new(10)).unwrap().finished = true;
         assert_eq!(shrink_inflight(&mut inflight, &mut written), (2, 2, 4096));
         assert_eq!(written.len(), 2);
-        assert_eq!(written[0].max_cts, 10);
-        assert_eq!(written[1].max_cts, 11);
+        assert_eq!(written[0].max_cts, TrxID::new(10));
+        assert_eq!(written[1].max_cts, TrxID::new(11));
     }
 
     #[test]
@@ -1457,12 +1470,18 @@ mod tests {
         let mut inflight = BTreeMap::new();
         let mut written = Vec::new();
 
-        inflight.insert(20, sync_group_for_order_test(20, true, 0));
-        inflight.insert(21, sync_group_for_order_test(21, false, 4096));
+        inflight.insert(
+            TrxID::new(20),
+            sync_group_for_order_test(TrxID::new(20), true, 0),
+        );
+        inflight.insert(
+            TrxID::new(21),
+            sync_group_for_order_test(TrxID::new(21), false, 4096),
+        );
         assert_eq!(shrink_inflight(&mut inflight, &mut written), (1, 1, 0));
         assert_eq!(written.len(), 1);
-        assert_eq!(written[0].max_cts, 20);
-        assert!(inflight.contains_key(&21));
+        assert_eq!(written[0].max_cts, TrxID::new(20));
+        assert!(inflight.contains_key(&TrxID::new(21)));
     }
 
     #[test]
@@ -1773,7 +1792,12 @@ mod tests {
         smol::block_on(async {
             let (_temp_dir, engine) = build_redo_test_engine("redo_no_wait", LogSync::None).await;
             let mut sys_trx = engine.trx_sys.begin_sys_trx();
-            sys_trx.create_row_page(1, test_page_id(1), 0, 1);
+            sys_trx.create_row_page(
+                TableID::new(1),
+                test_page_id(1),
+                RowID::new(0),
+                RowID::new(1),
+            );
             let cts = engine.trx_sys.commit_sys(sys_trx).unwrap();
             assert!(cts >= MIN_SNAPSHOT_TS);
         });

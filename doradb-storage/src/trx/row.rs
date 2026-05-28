@@ -1,8 +1,9 @@
 use crate::buffer::frame::FrameContext;
 use crate::buffer::page::VersionedPageID;
-use crate::catalog::{TableColumnLayout, TableID, TableMetadata};
+use crate::catalog::{TableColumnLayout, TableMetadata};
+use crate::id::{RowID, TableID, TrxID};
 use crate::row::ops::{ReadRow, SelectKey, UndoCol, UndoVal, UpdateCol, UpdateRow};
-use crate::row::{Row, RowID, RowMut, RowPage, RowRead};
+use crate::row::{Row, RowMut, RowPage, RowRead};
 use crate::trx::recover::RecoverMap;
 use crate::trx::stmt::StmtEffects;
 use crate::trx::undo::{
@@ -10,7 +11,7 @@ use crate::trx::undo::{
     RowUndoKind, RowUndoRef, UndoStatus,
 };
 use crate::trx::ver_map::{RowPageState, RowVersionReadGuard, RowVersionWriteGuard};
-use crate::trx::{SharedTrxStatus, TrxContext, TrxID, trx_is_committed};
+use crate::trx::{SharedTrxStatus, TrxContext, trx_is_committed};
 use crate::value::Val;
 use event_listener::EventListener;
 use parking_lot::RwLockReadGuard;
@@ -1095,7 +1096,7 @@ mod tests {
 
     fn row_page(metadata: &TableMetadata) -> RowPage {
         let mut page = RowPage::new_test_page();
-        page.init(100, 4, metadata.col.as_ref());
+        page.init(RowID::new(100), 4, metadata.col.as_ref());
         assert!(
             page.insert(metadata.col.as_ref(), &[Val::from(10i32), Val::from(20i32)])
                 .is_ok()
@@ -1106,7 +1107,7 @@ mod tests {
     fn test_trx_context(sts: TrxID) -> TrxContext {
         TrxContext {
             session: None,
-            status: Arc::new(SharedTrxStatus::new(MIN_ACTIVE_TRX_ID + sts)),
+            status: Arc::new(SharedTrxStatus::new(MIN_ACTIVE_TRX_ID + sts.as_u64())),
             sts,
             log_no: 0,
             gc_no: 0,
@@ -1117,7 +1118,7 @@ mod tests {
     fn test_read_row_latest_inactive_index_returns_invalid_index() {
         let metadata = sparse_metadata();
         let page = row_page(&metadata);
-        let frame_ctx = FrameContext::RecoverMap(RecoverMap::new(0));
+        let frame_ctx = FrameContext::RecoverMap(RecoverMap::new(TrxID::new(0)));
         let access = RowReadAccess::new(&page, &frame_ctx, 0);
         let key = SelectKey::new(1, vec![Val::from(10i32)]);
 
@@ -1132,9 +1133,9 @@ mod tests {
         let page = row_page(&metadata);
         let mut row_ver = RowVersionMap::new(Arc::clone(&metadata.col), 4);
         let undo = OwnedRowUndo::new(
-            1,
+            TableID::new(1),
             None,
-            100,
+            RowID::new(100),
             RowUndoKind::Update(vec![UndoCol {
                 idx: 0,
                 val: Val::from(9i32),
@@ -1147,7 +1148,7 @@ mod tests {
         )));
         let frame_ctx = FrameContext::RowVerMap(row_ver);
         let access = RowReadAccess::new(&page, &frame_ctx, 0);
-        let trx_ctx = test_trx_context(1);
+        let trx_ctx = test_trx_context(TrxID::new(1));
         let key = SelectKey::new(1, vec![Val::from(10i32)]);
 
         let res = access.read_row_mvcc(&trx_ctx, &metadata, &[0], Some(&key));
@@ -1159,7 +1160,7 @@ mod tests {
     fn test_any_version_matches_key_inactive_index_returns_false() {
         let metadata = sparse_metadata();
         let page = row_page(&metadata);
-        let frame_ctx = FrameContext::RecoverMap(RecoverMap::new(0));
+        let frame_ctx = FrameContext::RecoverMap(RecoverMap::new(TrxID::new(0)));
         let access = RowReadAccess::new(&page, &frame_ctx, 0);
         let key = SelectKey::new(1, vec![Val::from(10i32)]);
 
@@ -1170,7 +1171,7 @@ mod tests {
     fn test_any_version_matches_key_latest_page_row_returns_true() {
         let metadata = sparse_metadata();
         let page = row_page(&metadata);
-        let frame_ctx = FrameContext::RecoverMap(RecoverMap::new(0));
+        let frame_ctx = FrameContext::RecoverMap(RecoverMap::new(TrxID::new(0)));
         let access = RowReadAccess::new(&page, &frame_ctx, 0);
         let key = SelectKey::new(0, vec![Val::from(10i32)]);
 
@@ -1202,7 +1203,7 @@ mod tests {
         let frame_ctx = FrameContext::RowVerMap(row_ver);
         let access = RowReadAccess::new(&page, &frame_ctx, 0);
         let key = SelectKey::new(1, vec![Val::from(10i32)]);
-        let trx_ctx = test_trx_context(1);
+        let trx_ctx = test_trx_context(TrxID::new(1));
 
         let res = access.find_old_version_for_unique_key(&metadata, &key, &trx_ctx);
 

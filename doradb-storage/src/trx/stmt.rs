@@ -1,10 +1,10 @@
 use crate::buffer::PoolGuards;
+use crate::id::{RowID, TableID, TrxID};
 
-use crate::catalog::{CatalogTable, TableCache, TableID};
+use crate::catalog::{CatalogTable, TableCache};
 use crate::error::{FatalError, InternalError, Result};
 use crate::lock::{LockManager, LockMode, LockOwner, LockResource};
 use crate::quiescent::QuiescentGuard;
-use crate::row::RowID;
 use crate::row::ops::{DeleteMvcc, ScanMvcc, SelectKey, SelectMvcc, UpdateCol, UpdateMvcc};
 use crate::table::Table;
 use crate::trx::redo::{DDLRedo, RedoLogs, RowRedo};
@@ -164,7 +164,7 @@ impl StmtEffects {
         &mut self,
         table_cache: &mut TableCache<'_>,
         pool_guards: &PoolGuards,
-        sts: crate::trx::TrxID,
+        sts: TrxID,
     ) -> Result<()> {
         self.row_undo.rollback(table_cache, pool_guards, sts).await
     }
@@ -175,7 +175,7 @@ impl StmtEffects {
         &mut self,
         table_cache: &mut TableCache<'_>,
         pool_guards: &PoolGuards,
-        sts: crate::trx::TrxID,
+        sts: TrxID,
     ) -> Result<()> {
         #[cfg(test)]
         if tests::test_force_stmt_index_rollback_error_enabled() {
@@ -492,10 +492,11 @@ pub(crate) mod tests {
     use crate::conf::{EngineConfig, EvictableBufferPoolConfig, TrxSysConfig};
     use crate::engine::Engine;
     use crate::error::{FatalError, InternalError, OperationError};
+    use crate::id::TrxID;
     use crate::lock::tests::{debug_snapshot, try_acquire, try_acquire_grouped};
     use crate::session::SessionState;
     use crate::trx::undo::{OwnedRowUndo, RowUndoKind};
-    use crate::trx::{ActiveTrx, MIN_ACTIVE_TRX_ID, TrxID};
+    use crate::trx::{ActiveTrx, MIN_ACTIVE_TRX_ID};
     use error_stack::Report;
     use std::cell::Cell;
     use std::sync::Arc;
@@ -614,7 +615,7 @@ pub(crate) mod tests {
         let engine_ref = engine.new_ref().unwrap();
         let session_id = engine_ref.next_session_id();
         let session_state = Arc::new(SessionState::new(engine_ref, session_id));
-        ActiveTrx::new(session_state, MIN_ACTIVE_TRX_ID + sts, sts, 0, 0)
+        ActiveTrx::new(session_state, MIN_ACTIVE_TRX_ID + sts.as_u64(), sts, 0, 0)
     }
 
     fn lock_entry_count(engine: &Engine, owner: LockOwner) -> usize {
@@ -638,7 +639,7 @@ pub(crate) mod tests {
     fn test_stmt_effects_drop_rejects_leaked_effects() {
         let res = std::panic::catch_unwind(|| {
             let mut effects = StmtEffects::empty();
-            effects.set_ddl_redo(DDLRedo::CreateTable(42));
+            effects.set_ddl_redo(DDLRedo::CreateTable(TableID::new(42)));
         });
 
         assert!(res.is_err());
@@ -648,11 +649,11 @@ pub(crate) mod tests {
     fn test_statement_index_rollback_failure_poisons_and_discards_transaction() {
         smol::block_on(async {
             let (_temp_dir, engine) = test_engine("redo_stmt_index_rollback_fail").await;
-            let mut trx = test_trx(&engine, 52);
+            let mut trx = test_trx(&engine, TrxID::new(52));
             let trx_owner = trx_lock_owner(&trx).unwrap();
             try_acquire_transaction_lock(
                 &mut trx,
-                LockResource::TableData(91_250),
+                LockResource::TableData(TableID::new(91_250)),
                 LockMode::IntentExclusive,
             )
             .unwrap();
@@ -663,7 +664,7 @@ pub(crate) mod tests {
                     stmt_owner.set(Some(lock_owner(stmt)));
                     try_acquire_statement_lock(
                         stmt,
-                        LockResource::TableMetadata(91_250),
+                        LockResource::TableMetadata(TableID::new(91_250)),
                         LockMode::Shared,
                     )?;
                     // This row undo references a table that does not exist. If
@@ -671,14 +672,14 @@ pub(crate) mod tests {
                     // rollback, this test fails before the injected index
                     // rollback error can discard the statement safely.
                     stmt.effects_mut().push_row_undo(OwnedRowUndo::new(
-                        99_999_999,
+                        TableID::new(99_999_999),
                         None,
-                        24,
+                        RowID::new(24),
                         RowUndoKind::Delete,
                     ));
                     stmt.effects_mut().push_delete_index_undo(
-                        12,
-                        23,
+                        TableID::new(12),
+                        RowID::new(23),
                         SelectKey::new(0, vec![]),
                         true,
                     );

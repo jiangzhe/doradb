@@ -15,7 +15,8 @@ use crate::catalog::{IndexSpec, TableMetadata};
 use crate::error::{ConfigError, DataIntegrityError, Error, FileKind, InternalError, Result};
 use crate::file::SparseFile;
 use crate::file::block_integrity::{validate_block_checksum, write_block_checksum};
-use crate::file::cow_file::{BlockID, COW_FILE_PAGE_SIZE, MutableCowFile, SUPER_BLOCK_ID};
+use crate::file::cow_file::{COW_FILE_PAGE_SIZE, MutableCowFile, SUPER_BLOCK_ID};
+use crate::id::{BlockID, RowID, TrxID};
 use crate::index::btree::BTreeKeyEncoder;
 use crate::index::btree::algo::{
     KnownFenceNodeParams, PackedNodeEntry, PackedNodePlanParams, pack_fixed_entries,
@@ -27,7 +28,6 @@ use crate::index::util::Maskable;
 use crate::io::DirectBuf;
 use crate::layout;
 use crate::quiescent::QuiescentGuard;
-use crate::row::RowID;
 use crate::value::{Val, ValKind, ValType};
 use error_stack::{Report, ResultExt};
 use std::collections::{BTreeMap, BTreeSet};
@@ -425,7 +425,7 @@ impl DiskTreeSpec for UniqueDiskTreeSpec {
         if row_id.is_deleted() {
             return Err(invalid_node_payload(file_kind, block_id));
         }
-        Ok(LogicalEntry::unique(key, row_id.to_u64()))
+        Ok(LogicalEntry::unique(key, row_id.to_row_id()))
     }
 
     fn apply_operations(
@@ -710,7 +710,7 @@ fn unpack_row_id_from_exact_key(key: &[u8]) -> Result<RowID> {
             key.len()
         )));
     }
-    Ok(BTreeU64::unpack(&key[key.len() - ROW_ID_SIZE..]).to_u64())
+    Ok(BTreeU64::unpack(&key[key.len() - ROW_ID_SIZE..]).to_row_id())
 }
 
 /// Validate already-encoded non-unique exact keys before staging them.
@@ -1040,7 +1040,7 @@ impl<'a, F: DiskTreeSpec> DiskTree<'a, F> {
         &'b self,
         mutable_file: &'b mut M,
         operations: &'b [DiskTreeOperation],
-        create_ts: u64,
+        create_ts: TrxID,
     ) -> Pin<Box<dyn Future<Output = Result<BlockID>> + 'b>> {
         Box::pin(async move {
             if operations.is_empty() {
@@ -1083,7 +1083,7 @@ impl<'a, F: DiskTreeSpec> DiskTree<'a, F> {
         mutable_file: &'b mut M,
         block_id: BlockID,
         operations: &'b [DiskTreeOperation],
-        create_ts: u64,
+        create_ts: TrxID,
         range_upper_fence: Option<&'b [u8]>,
     ) -> Pin<Box<dyn Future<Output = Result<NodeRewriteResult>> + 'b>> {
         Box::pin(async move {
@@ -1125,7 +1125,7 @@ impl<'a, F: DiskTreeSpec> DiskTree<'a, F> {
         old_entries: Vec<BranchEntry>,
         mutable_file: &mut M,
         operations: &[DiskTreeOperation],
-        create_ts: u64,
+        create_ts: TrxID,
         range_upper_fence: Option<&[u8]>,
     ) -> Result<NodeRewriteResult> {
         let mut combined = Vec::with_capacity(old_entries.len() + operations.len());
@@ -1199,7 +1199,7 @@ impl<'a, F: DiskTreeSpec> DiskTree<'a, F> {
         &self,
         mutable_file: &mut M,
         entries: &[LogicalEntry],
-        create_ts: u64,
+        create_ts: TrxID,
     ) -> Result<BlockID> {
         let leaf_entries = self.pack_leaf_rewrite_entries(entries, None)?;
         self.finalize_root_rewrite(mutable_file, leaf_entries, create_ts)
@@ -1214,7 +1214,7 @@ impl<'a, F: DiskTreeSpec> DiskTree<'a, F> {
         &self,
         mutable_file: &mut M,
         entries: Vec<RewriteEntry>,
-        create_ts: u64,
+        create_ts: TrxID,
     ) -> Result<BlockID> {
         if entries.is_empty() {
             // A rewrite that removes every logical entry returns the empty-root
@@ -1260,7 +1260,7 @@ impl<'a, F: DiskTreeSpec> DiskTree<'a, F> {
         &'b self,
         mutable_file: &'b mut M,
         mut entry: RewriteEntry,
-        create_ts: u64,
+        create_ts: TrxID,
     ) -> Pin<Box<dyn Future<Output = Result<BlockID>> + 'b>> {
         Box::pin(async move {
             loop {
@@ -1590,7 +1590,7 @@ impl<'a, F: DiskTreeSpec> DiskTree<'a, F> {
         &'b self,
         mutable_file: &'b mut M,
         entry: RewriteEntry,
-        create_ts: u64,
+        create_ts: TrxID,
     ) -> Pin<Box<dyn Future<Output = Result<BranchEntry>> + 'b>> {
         Box::pin(async move {
             let mut allocations = RewriteAllocationGuard::new(mutable_file);
@@ -1606,7 +1606,7 @@ impl<'a, F: DiskTreeSpec> DiskTree<'a, F> {
         &'b self,
         allocations: &'b mut RewriteAllocationGuard<'m, M>,
         entry: RewriteEntry,
-        create_ts: u64,
+        create_ts: TrxID,
     ) -> Pin<Box<dyn Future<Output = Result<BranchEntry>> + 'b>>
     where
         'm: 'b,
@@ -1659,7 +1659,7 @@ impl<'a, F: DiskTreeSpec> DiskTree<'a, F> {
         &self,
         allocations: &mut RewriteAllocationGuard<'m, M>,
         entries: Vec<RewriteEntry>,
-        create_ts: u64,
+        create_ts: TrxID,
     ) -> Result<Vec<BranchEntry>> {
         let mut materialized = Vec::with_capacity(entries.len());
         for entry in entries {
@@ -1679,7 +1679,7 @@ impl<'a, F: DiskTreeSpec> DiskTree<'a, F> {
         upper_fence: Option<Vec<u8>>,
         height: u16,
         entries: Vec<LogicalEntry>,
-        create_ts: u64,
+        create_ts: TrxID,
     ) -> Result<BranchEntry> {
         if entries.is_empty() || height != 0 || key.as_slice() != entries[0].key.as_slice() {
             return Err(disk_tree_rewrite_invariant(
@@ -1731,7 +1731,7 @@ impl<'a, F: DiskTreeSpec> DiskTree<'a, F> {
         upper_fence: Option<Vec<u8>>,
         height: u16,
         children: Vec<BranchEntry>,
-        create_ts: u64,
+        create_ts: TrxID,
     ) -> Result<BranchEntry> {
         if height == 0 || children.is_empty() || key.as_slice() != children[0].key.as_slice() {
             return Err(disk_tree_rewrite_invariant(
@@ -1982,7 +1982,7 @@ impl<'a> UniqueDiskTree<'a> {
     pub(crate) fn batch_writer<'w, M: MutableCowFile>(
         &'w self,
         mutable_file: &'w mut M,
-        create_ts: u64,
+        create_ts: TrxID,
     ) -> UniqueDiskTreeBatchWriter<'w, 'a, M> {
         UniqueDiskTreeBatchWriter {
             tree: self,
@@ -2054,7 +2054,7 @@ impl<'a> NonUniqueDiskTree<'a> {
     pub(crate) fn batch_writer<'w, M: MutableCowFile>(
         &'w self,
         mutable_file: &'w mut M,
-        create_ts: u64,
+        create_ts: TrxID,
     ) -> NonUniqueDiskTreeBatchWriter<'w, 'a, M> {
         NonUniqueDiskTreeBatchWriter {
             tree: self,
@@ -2073,7 +2073,7 @@ pub(crate) struct UniqueDiskTreeBatchWriter<'w, 'a, M: MutableCowFile> {
     tree: &'w UniqueDiskTree<'a>,
     mutable_file: &'w mut M,
     operations: BTreeMap<Vec<u8>, Vec<UniqueDiskTreeOp>>,
-    create_ts: u64,
+    create_ts: TrxID,
 }
 
 impl<M: MutableCowFile> UniqueDiskTreeBatchWriter<'_, '_, M> {
@@ -2142,7 +2142,7 @@ pub(crate) struct NonUniqueDiskTreeBatchWriter<'w, 'a, M: MutableCowFile> {
     tree: &'w NonUniqueDiskTree<'a>,
     mutable_file: &'w mut M,
     operations: BTreeMap<Vec<u8>, bool>,
-    create_ts: u64,
+    create_ts: TrxID,
 }
 
 impl<M: MutableCowFile> NonUniqueDiskTreeBatchWriter<'_, '_, M> {
@@ -2206,6 +2206,10 @@ mod tests {
     use std::pin::Pin;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn test_row_ids<const N: usize>(values: [u64; N]) -> Vec<RowID> {
+        values.into_iter().map(RowID::new).collect()
+    }
 
     fn metadata_with_indexes() -> Arc<TableMetadata> {
         Arc::new(
@@ -2583,7 +2587,7 @@ mod tests {
             let table = fs
                 .create_table_file(test_user_table_id(301), Arc::clone(&metadata), false)
                 .unwrap();
-            let (table, old_root) = table.commit(1, false).await.unwrap();
+            let (table, old_root) = table.commit(TrxID::new(1), false).await.unwrap();
             drop(old_root);
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
             let disk_pool = table_readonly_pool(&global, test_user_table_id(301), &table);
@@ -2605,14 +2609,19 @@ mod tests {
             let table = fs
                 .create_table_file(test_user_table_id(302), Arc::clone(&metadata), false)
                 .unwrap();
-            let (table, old_root) = table.commit(1, false).await.unwrap();
+            let (table, old_root) = table.commit(TrxID::new(1), false).await.unwrap();
             drop(old_root);
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
             let disk_pool = table_readonly_pool(&global, test_user_table_id(302), &table);
             let guard = disk_pool.pool_guard();
             let runtime = non_unique_runtime!(metadata, disk_pool);
             let tree = runtime.open(SUPER_BLOCK_ID, &guard);
-            assert!(!tree.contains_exact(&[Val::from(1u32)], 10).await.unwrap());
+            assert!(
+                !tree
+                    .contains_exact(&[Val::from(1u32)], RowID::new(10))
+                    .await
+                    .unwrap()
+            );
             assert!(
                 tree.prefix_scan(&[Val::from(1u32)])
                     .await
@@ -2633,7 +2642,7 @@ mod tests {
             let table = fs
                 .create_table_file(test_user_table_id(303), Arc::clone(&metadata), false)
                 .unwrap();
-            let (table, old_root) = table.commit(1, false).await.unwrap();
+            let (table, old_root) = table.commit(TrxID::new(1), false).await.unwrap();
             drop(old_root);
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
             let disk_pool = table_readonly_pool(&global, test_user_table_id(303), &table);
@@ -2648,20 +2657,20 @@ mod tests {
             let key1 = [Val::from(1u32)];
             let key2 = [Val::from(2u32)];
             let key3 = [Val::from(3u32)];
-            let mut writer = tree.batch_writer(&mut mutable, 2);
+            let mut writer = tree.batch_writer(&mut mutable, TrxID::new(2));
             writer
                 .batch_put(&[
                     UniqueDiskTreePut {
                         key: &key1,
-                        row_id: 10,
+                        row_id: RowID::new(10),
                     },
                     UniqueDiskTreePut {
                         key: &key2,
-                        row_id: 20,
+                        row_id: RowID::new(20),
                     },
                     UniqueDiskTreePut {
                         key: &key3,
-                        row_id: 30,
+                        row_id: RowID::new(30),
                     },
                 ])
                 .unwrap();
@@ -2669,7 +2678,7 @@ mod tests {
             assert_ne!(root, SUPER_BLOCK_ID);
 
             let tree = runtime.open(root, &guard);
-            assert_eq!(tree.lookup(&key2).await.unwrap(), Some(20));
+            assert_eq!(tree.lookup(&key2).await.unwrap(), Some(RowID::new(20)));
             let rows = tree
                 .scan_entries()
                 .await
@@ -2677,26 +2686,26 @@ mod tests {
                 .into_iter()
                 .map(|(_, row_id)| row_id)
                 .collect::<Vec<_>>();
-            assert_eq!(rows, vec![10, 20, 30]);
+            assert_eq!(rows, test_row_ids([10, 20, 30]));
 
-            let mut writer = tree.batch_writer(&mut mutable, 3);
+            let mut writer = tree.batch_writer(&mut mutable, TrxID::new(3));
             writer
                 .batch_conditional_delete(&[
                     UniqueDiskTreeDelete {
                         key: &key1,
-                        expected_old_row_id: 999,
+                        expected_old_row_id: RowID::new(999),
                     },
                     UniqueDiskTreeDelete {
                         key: &key2,
-                        expected_old_row_id: 20,
+                        expected_old_row_id: RowID::new(20),
                     },
                 ])
                 .unwrap();
             let new_root = writer.finish().await.unwrap();
             let new_tree = runtime.open(new_root, &guard);
-            assert_eq!(new_tree.lookup(&key1).await.unwrap(), Some(10));
+            assert_eq!(new_tree.lookup(&key1).await.unwrap(), Some(RowID::new(10)));
             assert_eq!(new_tree.lookup(&key2).await.unwrap(), None);
-            assert_eq!(tree.lookup(&key2).await.unwrap(), Some(20));
+            assert_eq!(tree.lookup(&key2).await.unwrap(), Some(RowID::new(20)));
         });
     }
 
@@ -2708,7 +2717,7 @@ mod tests {
             let table = fs
                 .create_table_file(test_user_table_id(310), Arc::clone(&metadata), false)
                 .unwrap();
-            let (table, old_root) = table.commit(1, false).await.unwrap();
+            let (table, old_root) = table.commit(TrxID::new(1), false).await.unwrap();
             drop(old_root);
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
             let disk_pool = table_readonly_pool(&global, test_user_table_id(310), &table);
@@ -2730,10 +2739,10 @@ mod tests {
                 .enumerate()
                 .map(|(idx, key)| UniqueDiskTreePut {
                     key,
-                    row_id: idx as RowID + 100,
+                    row_id: RowID::from(idx) + 100,
                 })
                 .collect::<Vec<_>>();
-            let mut writer = tree.batch_writer(&mut mutable, 2);
+            let mut writer = tree.batch_writer(&mut mutable, TrxID::new(2));
             writer.batch_put(&puts).unwrap();
             let root = writer.finish().await.unwrap();
             let tree = runtime.open(root, &guard);
@@ -2742,27 +2751,30 @@ mod tests {
             assert!(summaries.iter().any(|summary| {
                 summary.is_leaf && summary.has_upper_fence && summary.common_prefix_len > 0
             }));
-            assert_eq!(tree.lookup(&keys[0]).await.unwrap(), Some(100));
-            assert_eq!(tree.lookup(&keys[4096]).await.unwrap(), Some(4196));
+            assert_eq!(tree.lookup(&keys[0]).await.unwrap(), Some(RowID::new(100)));
+            assert_eq!(
+                tree.lookup(&keys[4096]).await.unwrap(),
+                Some(RowID::new(4196))
+            );
             assert_eq!(
                 tree.lookup(&keys[ENTRY_COUNT as usize - 1]).await.unwrap(),
-                Some(ENTRY_COUNT as RowID + 99)
+                Some(RowID::from(ENTRY_COUNT) + 99)
             );
 
             let scanned = tree.scan_entries().await.unwrap();
             assert_eq!(scanned.len(), ENTRY_COUNT as usize);
             assert!(scanned.windows(2).all(|pair| pair[0].0 < pair[1].0));
 
-            let mut writer = tree.batch_writer(&mut mutable, 3);
+            let mut writer = tree.batch_writer(&mut mutable, TrxID::new(3));
             writer
                 .batch_conditional_delete(&[
                     UniqueDiskTreeDelete {
                         key: &keys[4096],
-                        expected_old_row_id: 4196,
+                        expected_old_row_id: RowID::new(4196),
                     },
                     UniqueDiskTreeDelete {
                         key: &keys[8192],
-                        expected_old_row_id: 8292,
+                        expected_old_row_id: RowID::new(8292),
                     },
                 ])
                 .unwrap();
@@ -2770,8 +2782,14 @@ mod tests {
             let rewritten_tree = runtime.open(rewritten_root, &guard);
             assert_eq!(rewritten_tree.lookup(&keys[4096]).await.unwrap(), None);
             assert_eq!(rewritten_tree.lookup(&keys[8192]).await.unwrap(), None);
-            assert_eq!(tree.lookup(&keys[4096]).await.unwrap(), Some(4196));
-            assert_eq!(tree.lookup(&keys[8192]).await.unwrap(), Some(8292));
+            assert_eq!(
+                tree.lookup(&keys[4096]).await.unwrap(),
+                Some(RowID::new(4196))
+            );
+            assert_eq!(
+                tree.lookup(&keys[8192]).await.unwrap(),
+                Some(RowID::new(8292))
+            );
         });
     }
 
@@ -2783,7 +2801,7 @@ mod tests {
             let table = fs
                 .create_table_file(test_user_table_id(311), Arc::clone(&metadata), false)
                 .unwrap();
-            let (table, old_root) = table.commit(1, false).await.unwrap();
+            let (table, old_root) = table.commit(TrxID::new(1), false).await.unwrap();
             drop(old_root);
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
             let disk_pool = table_readonly_pool(&global, test_user_table_id(311), &table);
@@ -2801,10 +2819,10 @@ mod tests {
             let entries = (0..ENTRY_COUNT)
                 .map(|idx| NonUniqueDiskTreeExact {
                     key: &key,
-                    row_id: idx as RowID + 1_000,
+                    row_id: RowID::from(idx) + 1_000,
                 })
                 .collect::<Vec<_>>();
-            let mut writer = tree.batch_writer(&mut mutable, 2);
+            let mut writer = tree.batch_writer(&mut mutable, TrxID::new(2));
             writer.batch_insert(&entries).unwrap();
             let root = writer.finish().await.unwrap();
             let tree = runtime.open(root, &guard);
@@ -2815,8 +2833,8 @@ mod tests {
             }));
             let rows = tree.prefix_scan(&key).await.unwrap();
             assert_eq!(rows.len(), ENTRY_COUNT);
-            assert_eq!(rows.first().copied(), Some(1_000));
-            assert_eq!(rows.last().copied(), Some(ENTRY_COUNT as RowID + 999));
+            assert_eq!(rows.first().copied(), Some(RowID::new(1_000)));
+            assert_eq!(rows.last().copied(), Some(RowID::from(ENTRY_COUNT) + 999));
             assert!(rows.windows(2).all(|pair| pair[0] < pair[1]));
         });
     }
@@ -2829,7 +2847,7 @@ mod tests {
             let table = fs
                 .create_table_file(test_user_table_id(312), Arc::clone(&metadata), false)
                 .unwrap();
-            let (table, old_root) = table.commit(1, false).await.unwrap();
+            let (table, old_root) = table.commit(TrxID::new(1), false).await.unwrap();
             drop(old_root);
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
             let disk_pool = table_readonly_pool(&global, test_user_table_id(312), &table);
@@ -2849,10 +2867,10 @@ mod tests {
                 .enumerate()
                 .map(|(idx, key)| UniqueDiskTreeEncodedPut {
                     key,
-                    row_id: idx as RowID + 5_000,
+                    row_id: RowID::from(idx) + 5_000,
                 })
                 .collect::<Vec<_>>();
-            let mut writer = tree.batch_writer(&mut mutable, 2);
+            let mut writer = tree.batch_writer(&mut mutable, TrxID::new(2));
             writer.batch_put_encoded(&puts).unwrap();
             let root = writer.finish().await.unwrap();
             let tree = runtime.open(root, &guard);
@@ -2865,7 +2883,7 @@ mod tests {
             for idx in [0usize, 127, 255, 399] {
                 assert_eq!(
                     tree.lookup_encoded(&keys[idx]).await.unwrap(),
-                    Some(idx as RowID + 5_000)
+                    Some(RowID::from(idx) + 5_000)
                 );
             }
             let scanned = tree.scan_entries().await.unwrap();
@@ -2882,7 +2900,7 @@ mod tests {
             let table = fs
                 .create_table_file(test_user_table_id(304), Arc::clone(&metadata), false)
                 .unwrap();
-            let (table, old_root) = table.commit(1, false).await.unwrap();
+            let (table, old_root) = table.commit(TrxID::new(1), false).await.unwrap();
             drop(old_root);
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
             let disk_pool = table_readonly_pool(&global, test_user_table_id(304), &table);
@@ -2896,52 +2914,66 @@ mod tests {
             let tree = runtime.open(SUPER_BLOCK_ID, &guard);
             let key1 = [Val::from(1u32)];
             let key2 = [Val::from(2u32)];
-            let mut writer = tree.batch_writer(&mut mutable, 2);
+            let mut writer = tree.batch_writer(&mut mutable, TrxID::new(2));
             writer
                 .batch_insert(&[
                     NonUniqueDiskTreeExact {
                         key: &key1,
-                        row_id: 10,
+                        row_id: RowID::new(10),
                     },
                     NonUniqueDiskTreeExact {
                         key: &key1,
-                        row_id: 11,
+                        row_id: RowID::new(11),
                     },
                     NonUniqueDiskTreeExact {
                         key: &key2,
-                        row_id: 20,
+                        row_id: RowID::new(20),
                     },
                 ])
                 .unwrap();
             let root = writer.finish().await.unwrap();
             let tree = runtime.open(root, &guard);
-            assert!(tree.contains_exact(&key1, 10).await.unwrap());
-            assert_eq!(tree.prefix_scan(&key1).await.unwrap(), vec![10, 11]);
+            assert!(tree.contains_exact(&key1, RowID::new(10)).await.unwrap());
+            assert_eq!(
+                tree.prefix_scan(&key1).await.unwrap(),
+                test_row_ids([10, 11])
+            );
 
-            let mut writer = tree.batch_writer(&mut mutable, 3);
+            let mut writer = tree.batch_writer(&mut mutable, TrxID::new(3));
             writer
                 .batch_exact_delete(&[
                     NonUniqueDiskTreeExact {
                         key: &key1,
-                        row_id: 10,
+                        row_id: RowID::new(10),
                     },
                     NonUniqueDiskTreeExact {
                         key: &key1,
-                        row_id: 999,
+                        row_id: RowID::new(999),
                     },
                 ])
                 .unwrap();
             writer
                 .batch_insert(&[NonUniqueDiskTreeExact {
                     key: &key1,
-                    row_id: 12,
+                    row_id: RowID::new(12),
                 }])
                 .unwrap();
             let new_root = writer.finish().await.unwrap();
             let new_tree = runtime.open(new_root, &guard);
-            assert_eq!(new_tree.prefix_scan(&key1).await.unwrap(), vec![11, 12]);
-            assert!(!new_tree.contains_exact(&key1, 10).await.unwrap());
-            assert_eq!(tree.prefix_scan(&key1).await.unwrap(), vec![10, 11]);
+            assert_eq!(
+                new_tree.prefix_scan(&key1).await.unwrap(),
+                test_row_ids([11, 12])
+            );
+            assert!(
+                !new_tree
+                    .contains_exact(&key1, RowID::new(10))
+                    .await
+                    .unwrap()
+            );
+            assert_eq!(
+                tree.prefix_scan(&key1).await.unwrap(),
+                test_row_ids([10, 11])
+            );
         });
     }
 
@@ -2953,7 +2985,7 @@ mod tests {
             let table = fs
                 .create_table_file(test_user_table_id(309), Arc::clone(&metadata), false)
                 .unwrap();
-            let (table, old_root) = table.commit(1, false).await.unwrap();
+            let (table, old_root) = table.commit(TrxID::new(1), false).await.unwrap();
             drop(old_root);
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
             let disk_pool = table_readonly_pool(&global, test_user_table_id(309), &table);
@@ -2975,11 +3007,11 @@ mod tests {
                 .enumerate()
                 .map(|(idx, key)| NonUniqueDiskTreeExact {
                     key,
-                    row_id: idx as RowID + 1000,
+                    row_id: RowID::from(idx) + 1000,
                 })
                 .collect::<Vec<_>>();
             let allocated_before = mutable.root().alloc_map.allocated();
-            let mut writer = tree.batch_writer(&mut mutable, 2);
+            let mut writer = tree.batch_writer(&mut mutable, TrxID::new(2));
             writer.batch_insert(&entries).unwrap();
             let root = writer.finish().await.unwrap();
             assert_ne!(root, SUPER_BLOCK_ID);
@@ -2989,7 +3021,7 @@ mod tests {
             let tree = runtime.open(root, &guard);
             let key = [Val::from(7u32)];
             let stats_before = disk_pool.global_stats();
-            assert_eq!(tree.prefix_scan(&key).await.unwrap(), vec![1007]);
+            assert_eq!(tree.prefix_scan(&key).await.unwrap(), test_row_ids([1007]));
             let delta = disk_pool.global_stats().delta_since(stats_before);
             assert!(
                 delta.cache_misses < tree_blocks / 2,
@@ -3008,7 +3040,7 @@ mod tests {
             let table = fs
                 .create_table_file(test_user_table_id(310), Arc::clone(&metadata), false)
                 .unwrap();
-            let (table, old_root) = table.commit(1, false).await.unwrap();
+            let (table, old_root) = table.commit(TrxID::new(1), false).await.unwrap();
             drop(old_root);
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
             let disk_pool = table_readonly_pool(&global, test_user_table_id(310), &table);
@@ -3032,11 +3064,11 @@ mod tests {
                 .enumerate()
                 .map(|(idx, key)| UniqueDiskTreePut {
                     key,
-                    row_id: idx as RowID + 100,
+                    row_id: RowID::from(idx) + 100,
                 })
                 .collect::<Vec<_>>();
 
-            let mut writer = tree.batch_writer(&mut mutable, 2);
+            let mut writer = tree.batch_writer(&mut mutable, TrxID::new(2));
             writer.batch_put(&puts).unwrap();
             let err = writer.finish().await.unwrap_err();
             assert_eq!(
@@ -3057,7 +3089,7 @@ mod tests {
             let table = fs
                 .create_table_file(test_user_table_id(311), Arc::clone(&metadata), false)
                 .unwrap();
-            let (table, old_root) = table.commit(1, false).await.unwrap();
+            let (table, old_root) = table.commit(TrxID::new(1), false).await.unwrap();
             drop(old_root);
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
             let disk_pool = table_readonly_pool(&global, test_user_table_id(311), &table);
@@ -3081,11 +3113,11 @@ mod tests {
                 .enumerate()
                 .map(|(idx, key)| UniqueDiskTreePut {
                     key,
-                    row_id: idx as RowID + 100,
+                    row_id: RowID::from(idx) + 100,
                 })
                 .collect::<Vec<_>>();
 
-            let mut writer = tree.batch_writer(&mut mutable, 2);
+            let mut writer = tree.batch_writer(&mut mutable, TrxID::new(2));
             writer.batch_put(&puts).unwrap();
             let err = writer.finish().await.unwrap_err();
             assert_eq!(
@@ -3109,7 +3141,7 @@ mod tests {
             let table = fs
                 .create_table_file(test_user_table_id(305), Arc::clone(&metadata), false)
                 .unwrap();
-            let (table, old_root) = table.commit(1, false).await.unwrap();
+            let (table, old_root) = table.commit(TrxID::new(1), false).await.unwrap();
             drop(old_root);
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
             let disk_pool = table_readonly_pool(&global, test_user_table_id(305), &table);
@@ -3128,17 +3160,17 @@ mod tests {
             let encoded_unique2 = unique_tree.encoder().encode(&key2).as_bytes().to_vec();
 
             {
-                let mut writer = unique_tree.batch_writer(&mut mutable, 2);
+                let mut writer = unique_tree.batch_writer(&mut mutable, TrxID::new(2));
                 assert!(
                     writer
                         .batch_put_encoded(&[
                             UniqueDiskTreeEncodedPut {
                                 key: &encoded_unique2,
-                                row_id: 20,
+                                row_id: RowID::new(20),
                             },
                             UniqueDiskTreeEncodedPut {
                                 key: &encoded_unique1,
-                                row_id: 10,
+                                row_id: RowID::new(10),
                             },
                         ])
                         .as_ref()
@@ -3150,38 +3182,41 @@ mod tests {
                                 == Some(crate::error::InternalError::DiskTreeBatchOrderInvariant))
                 );
             }
-            let mut writer = unique_tree.batch_writer(&mut mutable, 2);
+            let mut writer = unique_tree.batch_writer(&mut mutable, TrxID::new(2));
             writer
                 .batch_put_encoded(&[
                     UniqueDiskTreeEncodedPut {
                         key: &encoded_unique1,
-                        row_id: 10,
+                        row_id: RowID::new(10),
                     },
                     UniqueDiskTreeEncodedPut {
                         key: &encoded_unique2,
-                        row_id: 20,
+                        row_id: RowID::new(20),
                     },
                 ])
                 .unwrap();
             let unique_root = writer.finish().await.unwrap();
             let unique_tree = unique_runtime.open(unique_root, &guard);
-            let mut writer = unique_tree.batch_writer(&mut mutable, 3);
+            let mut writer = unique_tree.batch_writer(&mut mutable, TrxID::new(3));
             writer
                 .batch_conditional_delete_encoded(&[
                     UniqueDiskTreeEncodedDelete {
                         key: &encoded_unique1,
-                        expected_old_row_id: 999,
+                        expected_old_row_id: RowID::new(999),
                     },
                     UniqueDiskTreeEncodedDelete {
                         key: &encoded_unique1,
-                        expected_old_row_id: 10,
+                        expected_old_row_id: RowID::new(10),
                     },
                 ])
                 .unwrap();
             let unique_root = writer.finish().await.unwrap();
             let unique_tree = unique_runtime.open(unique_root, &guard);
             assert_eq!(unique_tree.lookup(&key1).await.unwrap(), None);
-            assert_eq!(unique_tree.lookup(&key2).await.unwrap(), Some(20));
+            assert_eq!(
+                unique_tree.lookup(&key2).await.unwrap(),
+                Some(RowID::new(20))
+            );
 
             let non_unique_runtime = non_unique_runtime!(metadata, disk_pool);
             let non_unique_tree = non_unique_runtime.open(SUPER_BLOCK_ID, &guard);
@@ -3197,7 +3232,7 @@ mod tests {
                 .to_vec();
             let malformed_exact = [0u8; ROW_ID_SIZE - 1];
             {
-                let mut writer = non_unique_tree.batch_writer(&mut mutable, 4);
+                let mut writer = non_unique_tree.batch_writer(&mut mutable, TrxID::new(4));
                 assert!(
                     writer
                         .batch_insert_encoded(&[NonUniqueDiskTreeEncodedExact {
@@ -3209,7 +3244,7 @@ mod tests {
                 );
             }
             {
-                let mut writer = non_unique_tree.batch_writer(&mut mutable, 4);
+                let mut writer = non_unique_tree.batch_writer(&mut mutable, TrxID::new(4));
                 assert!(
                     writer
                         .batch_exact_delete_encoded(&[NonUniqueDiskTreeEncodedExact {
@@ -3221,7 +3256,7 @@ mod tests {
                 );
             }
             {
-                let mut writer = non_unique_tree.batch_writer(&mut mutable, 4);
+                let mut writer = non_unique_tree.batch_writer(&mut mutable, TrxID::new(4));
                 assert!(
                     writer
                         .batch_insert_encoded(&[
@@ -3241,7 +3276,7 @@ mod tests {
                                 == Some(crate::error::InternalError::DiskTreeBatchOrderInvariant))
                 );
             }
-            let mut writer = non_unique_tree.batch_writer(&mut mutable, 4);
+            let mut writer = non_unique_tree.batch_writer(&mut mutable, TrxID::new(4));
             writer
                 .batch_insert_encoded(&[
                     NonUniqueDiskTreeEncodedExact {
@@ -3254,7 +3289,7 @@ mod tests {
                 .unwrap();
             let non_unique_root = writer.finish().await.unwrap();
             let non_unique_tree = non_unique_runtime.open(non_unique_root, &guard);
-            let mut writer = non_unique_tree.batch_writer(&mut mutable, 5);
+            let mut writer = non_unique_tree.batch_writer(&mut mutable, TrxID::new(5));
             writer
                 .batch_exact_delete_encoded(&[NonUniqueDiskTreeEncodedExact {
                     key: &encoded_exact10,
@@ -3262,7 +3297,10 @@ mod tests {
                 .unwrap();
             let non_unique_root = writer.finish().await.unwrap();
             let non_unique_tree = non_unique_runtime.open(non_unique_root, &guard);
-            assert_eq!(non_unique_tree.prefix_scan(&key1).await.unwrap(), vec![11]);
+            assert_eq!(
+                non_unique_tree.prefix_scan(&key1).await.unwrap(),
+                test_row_ids([11])
+            );
         });
     }
 
@@ -3274,7 +3312,7 @@ mod tests {
             let table = fs
                 .create_table_file(test_user_table_id(306), Arc::clone(&metadata), false)
                 .unwrap();
-            let (table, old_root) = table.commit(1, false).await.unwrap();
+            let (table, old_root) = table.commit(TrxID::new(1), false).await.unwrap();
             drop(old_root);
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
             let disk_pool = table_readonly_pool(&global, test_user_table_id(306), &table);
@@ -3289,20 +3327,20 @@ mod tests {
             let key1 = [Val::from(1u32)];
             let key2 = [Val::from(2u32)];
             let key3 = [Val::from(3u32)];
-            let mut writer = tree.batch_writer(&mut mutable, 2);
+            let mut writer = tree.batch_writer(&mut mutable, TrxID::new(2));
             writer
                 .batch_put(&[
                     UniqueDiskTreePut {
                         key: &key1,
-                        row_id: 10,
+                        row_id: RowID::new(10),
                     },
                     UniqueDiskTreePut {
                         key: &key2,
-                        row_id: 20,
+                        row_id: RowID::new(20),
                     },
                     UniqueDiskTreePut {
                         key: &key3,
-                        row_id: 30,
+                        row_id: RowID::new(30),
                     },
                 ])
                 .unwrap();
@@ -3317,22 +3355,22 @@ mod tests {
                 .into_iter()
                 .map(|(_, row_id)| row_id)
                 .collect::<Vec<_>>();
-            assert_eq!(rows, vec![10, 20, 30]);
+            assert_eq!(rows, test_row_ids([10, 20, 30]));
 
-            let mut writer = tree.batch_writer(&mut mutable, 3);
+            let mut writer = tree.batch_writer(&mut mutable, TrxID::new(3));
             writer
                 .batch_conditional_delete(&[
                     UniqueDiskTreeDelete {
                         key: &key1,
-                        expected_old_row_id: 10,
+                        expected_old_row_id: RowID::new(10),
                     },
                     UniqueDiskTreeDelete {
                         key: &key2,
-                        expected_old_row_id: 20,
+                        expected_old_row_id: RowID::new(20),
                     },
                     UniqueDiskTreeDelete {
                         key: &key3,
-                        expected_old_row_id: 30,
+                        expected_old_row_id: RowID::new(30),
                     },
                 ])
                 .unwrap();
@@ -3352,7 +3390,7 @@ mod tests {
                 .into_iter()
                 .map(|(_, row_id)| row_id)
                 .collect::<Vec<_>>();
-            assert_eq!(rows, vec![10, 20, 30]);
+            assert_eq!(rows, test_row_ids([10, 20, 30]));
         });
     }
 
@@ -3364,7 +3402,7 @@ mod tests {
             let table = fs
                 .create_table_file(test_user_table_id(307), Arc::clone(&metadata), false)
                 .unwrap();
-            let (table, old_root) = table.commit(1, false).await.unwrap();
+            let (table, old_root) = table.commit(TrxID::new(1), false).await.unwrap();
             drop(old_root);
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
             let disk_pool = table_readonly_pool(&global, test_user_table_id(307), &table);
@@ -3378,20 +3416,20 @@ mod tests {
             let tree = runtime.open(SUPER_BLOCK_ID, &guard);
             let key1 = [Val::from(1u32)];
             let key2 = [Val::from(2u32)];
-            let mut writer = tree.batch_writer(&mut mutable, 2);
+            let mut writer = tree.batch_writer(&mut mutable, TrxID::new(2));
             writer
                 .batch_insert(&[
                     NonUniqueDiskTreeExact {
                         key: &key1,
-                        row_id: 10,
+                        row_id: RowID::new(10),
                     },
                     NonUniqueDiskTreeExact {
                         key: &key1,
-                        row_id: 11,
+                        row_id: RowID::new(11),
                     },
                     NonUniqueDiskTreeExact {
                         key: &key2,
-                        row_id: 20,
+                        row_id: RowID::new(20),
                     },
                 ])
                 .unwrap();
@@ -3399,23 +3437,26 @@ mod tests {
             assert_ne!(root, SUPER_BLOCK_ID);
 
             let tree = runtime.open(root, &guard);
-            assert_eq!(tree.prefix_scan(&key1).await.unwrap(), vec![10, 11]);
-            assert_eq!(tree.prefix_scan(&key2).await.unwrap(), vec![20]);
+            assert_eq!(
+                tree.prefix_scan(&key1).await.unwrap(),
+                test_row_ids([10, 11])
+            );
+            assert_eq!(tree.prefix_scan(&key2).await.unwrap(), test_row_ids([20]));
 
-            let mut writer = tree.batch_writer(&mut mutable, 3);
+            let mut writer = tree.batch_writer(&mut mutable, TrxID::new(3));
             writer
                 .batch_exact_delete(&[
                     NonUniqueDiskTreeExact {
                         key: &key1,
-                        row_id: 10,
+                        row_id: RowID::new(10),
                     },
                     NonUniqueDiskTreeExact {
                         key: &key1,
-                        row_id: 11,
+                        row_id: RowID::new(11),
                     },
                     NonUniqueDiskTreeExact {
                         key: &key2,
-                        row_id: 20,
+                        row_id: RowID::new(20),
                     },
                 ])
                 .unwrap();
@@ -3423,15 +3464,33 @@ mod tests {
             assert_eq!(empty_root, SUPER_BLOCK_ID);
 
             let empty_tree = runtime.open(empty_root, &guard);
-            assert!(!empty_tree.contains_exact(&key1, 10).await.unwrap());
-            assert!(!empty_tree.contains_exact(&key1, 11).await.unwrap());
-            assert!(!empty_tree.contains_exact(&key2, 20).await.unwrap());
+            assert!(
+                !empty_tree
+                    .contains_exact(&key1, RowID::new(10))
+                    .await
+                    .unwrap()
+            );
+            assert!(
+                !empty_tree
+                    .contains_exact(&key1, RowID::new(11))
+                    .await
+                    .unwrap()
+            );
+            assert!(
+                !empty_tree
+                    .contains_exact(&key2, RowID::new(20))
+                    .await
+                    .unwrap()
+            );
             assert!(empty_tree.prefix_scan(&key1).await.unwrap().is_empty());
             assert!(empty_tree.prefix_scan(&key2).await.unwrap().is_empty());
             assert!(empty_tree.scan_entries().await.unwrap().is_empty());
 
-            assert_eq!(tree.prefix_scan(&key1).await.unwrap(), vec![10, 11]);
-            assert_eq!(tree.prefix_scan(&key2).await.unwrap(), vec![20]);
+            assert_eq!(
+                tree.prefix_scan(&key1).await.unwrap(),
+                test_row_ids([10, 11])
+            );
+            assert_eq!(tree.prefix_scan(&key2).await.unwrap(), test_row_ids([20]));
         });
     }
 
@@ -3443,7 +3502,7 @@ mod tests {
             let table = fs
                 .create_table_file(test_user_table_id(308), Arc::clone(&metadata), false)
                 .unwrap();
-            let (table, old_root) = table.commit(1, false).await.unwrap();
+            let (table, old_root) = table.commit(TrxID::new(1), false).await.unwrap();
             drop(old_root);
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
             let disk_pool = table_readonly_pool(&global, test_user_table_id(308), &table);
@@ -3466,10 +3525,10 @@ mod tests {
                 .enumerate()
                 .map(|(idx, key)| UniqueDiskTreePut {
                     key,
-                    row_id: idx as RowID + 100,
+                    row_id: RowID::from(idx) + 100,
                 })
                 .collect::<Vec<_>>();
-            let mut writer = tree.batch_writer(&mut mutable, 2);
+            let mut writer = tree.batch_writer(&mut mutable, TrxID::new(2));
             writer.batch_put(&puts).unwrap();
             let root = writer.finish().await.unwrap();
             assert_ne!(root, SUPER_BLOCK_ID);
@@ -3486,15 +3545,15 @@ mod tests {
                 .filter(|(idx, _)| idx % KEEP_EVERY != 0)
                 .map(|(idx, key)| UniqueDiskTreeDelete {
                     key,
-                    expected_old_row_id: idx as RowID + 100,
+                    expected_old_row_id: RowID::from(idx) + 100,
                 })
                 .collect::<Vec<_>>();
             let expected_rows = (0..ENTRY_COUNT as usize)
                 .filter(|idx| idx % KEEP_EVERY == 0)
-                .map(|idx| idx as RowID + 100)
+                .map(|idx| RowID::from(idx) + 100)
                 .collect::<Vec<_>>();
 
-            let mut writer = tree.batch_writer(&mut mutable, 3);
+            let mut writer = tree.batch_writer(&mut mutable, TrxID::new(3));
             writer.batch_conditional_delete(&deletes).unwrap();
             let compacted_root = writer.finish().await.unwrap();
             assert_ne!(compacted_root, SUPER_BLOCK_ID);
@@ -3534,7 +3593,7 @@ mod tests {
             let table = fs
                 .create_table_file(test_user_table_id(309), Arc::clone(&metadata), false)
                 .unwrap();
-            let (table, old_root) = table.commit(1, false).await.unwrap();
+            let (table, old_root) = table.commit(TrxID::new(1), false).await.unwrap();
             drop(old_root);
             let write_global = global_readonly_pool_scope(64 * 1024 * 1024);
             let write_disk_pool =
@@ -3557,10 +3616,10 @@ mod tests {
                 .enumerate()
                 .map(|(idx, key)| UniqueDiskTreePut {
                     key,
-                    row_id: idx as RowID + 100,
+                    row_id: RowID::from(idx) + 100,
                 })
                 .collect::<Vec<_>>();
-            let mut writer = tree.batch_writer(&mut mutable, 2);
+            let mut writer = tree.batch_writer(&mut mutable, TrxID::new(2));
             writer.batch_put(&puts).unwrap();
             let root = writer.finish().await.unwrap();
 
@@ -3611,7 +3670,7 @@ mod tests {
             let table = fs
                 .create_table_file(test_user_table_id(313), Arc::clone(&metadata), false)
                 .unwrap();
-            let (table, old_root) = table.commit(1, false).await.unwrap();
+            let (table, old_root) = table.commit(TrxID::new(1), false).await.unwrap();
             drop(old_root);
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
             let disk_pool = table_readonly_pool(&global, test_user_table_id(313), &table);
@@ -3638,17 +3697,17 @@ mod tests {
             let row_by_key = encoded_keys
                 .iter()
                 .enumerate()
-                .map(|(idx, key)| (key.clone(), idx as RowID + 100))
+                .map(|(idx, key)| (key.clone(), RowID::from(idx) + 100))
                 .collect::<std::collections::BTreeMap<_, _>>();
             let puts = keys
                 .iter()
                 .enumerate()
                 .map(|(idx, key)| UniqueDiskTreePut {
                     key,
-                    row_id: idx as RowID + 100,
+                    row_id: RowID::from(idx) + 100,
                 })
                 .collect::<Vec<_>>();
-            let mut writer = tree.batch_writer(&mut mutable, 2);
+            let mut writer = tree.batch_writer(&mut mutable, TrxID::new(2));
             writer.batch_put(&puts).unwrap();
             let root = writer.finish().await.unwrap();
             let tree = runtime.open(root, &guard);
@@ -3678,7 +3737,7 @@ mod tests {
                 .collect::<Vec<_>>();
 
             let allocated_before = mutable.root().alloc_map.allocated();
-            let mut writer = tree.batch_writer(&mut mutable, 3);
+            let mut writer = tree.batch_writer(&mut mutable, TrxID::new(3));
             writer.batch_conditional_delete_encoded(&deletes).unwrap();
             let rewritten_root = writer.finish().await.unwrap();
             let allocated_delta = mutable.root().alloc_map.allocated() - allocated_before;
@@ -3725,7 +3784,7 @@ mod tests {
             let table = fs
                 .create_table_file(test_user_table_id(314), Arc::clone(&metadata), false)
                 .unwrap();
-            let (table, old_root) = table.commit(1, false).await.unwrap();
+            let (table, old_root) = table.commit(TrxID::new(1), false).await.unwrap();
             drop(old_root);
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
             let disk_pool = table_readonly_pool(&global, test_user_table_id(314), &table);
@@ -3749,17 +3808,17 @@ mod tests {
             let row_by_key = encoded_keys
                 .iter()
                 .enumerate()
-                .map(|(idx, key)| (key.clone(), idx as RowID + 100))
+                .map(|(idx, key)| (key.clone(), RowID::from(idx) + 100))
                 .collect::<std::collections::BTreeMap<_, _>>();
             let puts = keys
                 .iter()
                 .enumerate()
                 .map(|(idx, key)| UniqueDiskTreePut {
                     key,
-                    row_id: idx as RowID + 100,
+                    row_id: RowID::from(idx) + 100,
                 })
                 .collect::<Vec<_>>();
-            let mut writer = tree.batch_writer(&mut mutable, 2);
+            let mut writer = tree.batch_writer(&mut mutable, TrxID::new(2));
             writer.batch_put(&puts).unwrap();
             let root = writer.finish().await.unwrap();
             let tree = runtime.open(root, &guard);
@@ -3781,7 +3840,7 @@ mod tests {
             }];
 
             let allocated_before = mutable.root().alloc_map.allocated();
-            let mut writer = tree.batch_writer(&mut mutable, 3);
+            let mut writer = tree.batch_writer(&mut mutable, TrxID::new(3));
             writer.batch_conditional_delete_encoded(&deletes).unwrap();
             let rewritten_root = writer.finish().await.unwrap();
             let allocated_delta = mutable.root().alloc_map.allocated() - allocated_before;
@@ -3819,7 +3878,7 @@ mod tests {
             let table = fs
                 .create_table_file(test_user_table_id(305), Arc::clone(&metadata), false)
                 .unwrap();
-            let (table, old_root) = table.commit(1, false).await.unwrap();
+            let (table, old_root) = table.commit(TrxID::new(1), false).await.unwrap();
             drop(old_root);
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
             let disk_pool = table_readonly_pool(&global, test_user_table_id(305), &table);
@@ -3833,16 +3892,16 @@ mod tests {
             let tree = runtime.open(SUPER_BLOCK_ID, &guard);
             let key1 = [Val::from(1u32)];
             let key2 = [Val::from(2u32)];
-            let mut writer = tree.batch_writer(&mut mutable, 2);
+            let mut writer = tree.batch_writer(&mut mutable, TrxID::new(2));
             let err = writer
                 .batch_put(&[
                     UniqueDiskTreePut {
                         key: &key2,
-                        row_id: 20,
+                        row_id: RowID::new(20),
                     },
                     UniqueDiskTreePut {
                         key: &key1,
-                        row_id: 10,
+                        row_id: RowID::new(10),
                     },
                 ])
                 .unwrap_err();
@@ -3858,11 +3917,11 @@ mod tests {
                 .batch_put(&[
                     UniqueDiskTreePut {
                         key: &key1,
-                        row_id: 10,
+                        row_id: RowID::new(10),
                     },
                     UniqueDiskTreePut {
                         key: &key1,
-                        row_id: 11,
+                        row_id: RowID::new(11),
                     },
                 ])
                 .unwrap_err();
@@ -3881,7 +3940,7 @@ mod tests {
         let mut buf = DirectBuf::zeroed(DISK_TREE_BLOCK_SIZE);
         {
             let node = btree_node_from_block_mut(buf.data_mut()).unwrap();
-            node.init(0, 1, b"a", BTreeU64::INVALID_VALUE, &[], false);
+            node.init(0, TrxID::new(1), b"a", BTreeU64::INVALID_VALUE, &[], false);
             node.insert_at::<BTreeU64>(0, b"a", BTreeU64::from(7));
         }
         write_block_checksum(buf.data_mut());

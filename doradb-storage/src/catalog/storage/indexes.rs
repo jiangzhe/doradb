@@ -4,9 +4,10 @@ use crate::catalog::storage::CatalogDefinition;
 use crate::catalog::storage::object::{IndexColumnObject, IndexObject};
 use crate::catalog::table::{TableColumnLayout, TableMetadata};
 use crate::catalog::{
-    ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexOrder, IndexSpec, TableID,
+    ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexOrder, IndexSpec,
 };
 use crate::error::Result;
+use crate::id::TableID;
 use crate::row::ops::{DeleteMvcc, SelectKey};
 use crate::row::{Row, RowRead};
 use crate::trx::stmt::Statement;
@@ -17,7 +18,7 @@ use std::sync::OnceLock;
 
 /* Indexes table */
 
-pub(super) const TABLE_ID_INDEXES: TableID = 2;
+pub(super) const TABLE_ID_INDEXES: TableID = TableID::new(2);
 const COL_NO_INDEXES_TABLE_ID: usize = 0;
 const COL_NAME_INDEXES_TABLE_ID: &str = "table_id";
 const COL_NO_INDEXES_INDEX_NO: usize = 1;
@@ -68,10 +69,11 @@ pub(super) fn catalog_definition_of_indexes() -> &'static CatalogDefinition {
 
 #[inline]
 fn row_to_index_object(col_layout: &TableColumnLayout, row: Row<'_>) -> IndexObject {
-    let table_id = row
-        .val(col_layout, COL_NO_INDEXES_TABLE_ID)
-        .as_u64()
-        .unwrap();
+    let table_id = TableID::from(
+        row.val(col_layout, COL_NO_INDEXES_TABLE_ID)
+            .as_u64()
+            .unwrap(),
+    );
     let index_no = row
         .val(col_layout, COL_NO_INDEXES_INDEX_NO)
         .as_u16()
@@ -155,7 +157,7 @@ impl Indexes<'_> {
                     .val(col_layout, COL_NO_INDEXES_TABLE_ID)
                     .as_u64()
                     .unwrap();
-                if table_id_in_row == table_id {
+                if table_id_in_row == table_id.as_u64() {
                     let obj = row_to_index_object(col_layout, row);
                     res.push(obj);
                 }
@@ -168,7 +170,7 @@ impl Indexes<'_> {
 
 /* Index columns table */
 
-pub(super) const TABLE_ID_INDEX_COLUMNS: TableID = 3;
+pub(super) const TABLE_ID_INDEX_COLUMNS: TableID = TableID::new(3);
 const COL_NO_INDEX_COLUMNS_TABLE_ID: usize = 0;
 const COL_NAME_INDEX_COLUMNS_TABLE_ID: &str = "table_id";
 const COL_NO_INDEX_COLUMNS_INDEX_NO: usize = 1;
@@ -237,10 +239,11 @@ pub(super) fn catalog_definition_of_index_columns() -> &'static CatalogDefinitio
 
 #[inline]
 fn row_to_index_column_object(col_layout: &TableColumnLayout, row: Row<'_>) -> IndexColumnObject {
-    let table_id = row
-        .val(col_layout, COL_NO_INDEX_COLUMNS_TABLE_ID)
-        .as_u64()
-        .unwrap();
+    let table_id = TableID::from(
+        row.val(col_layout, COL_NO_INDEX_COLUMNS_TABLE_ID)
+            .as_u64()
+            .unwrap(),
+    );
     let index_no = row
         .val(col_layout, COL_NO_INDEX_COLUMNS_INDEX_NO)
         .as_u16()
@@ -373,7 +376,7 @@ impl IndexColumns<'_> {
                     .val(col_layout, COL_NO_INDEX_COLUMNS_TABLE_ID)
                     .as_u64()
                     .unwrap();
-                if table_id_in_row == table_id {
+                if table_id_in_row == table_id.as_u64() {
                     let obj = row_to_index_column_object(col_layout, row);
                     res.push(obj);
                 }
@@ -411,17 +414,17 @@ mod tests {
             let mut session = engine.new_session().unwrap();
 
             let idx_42_0 = IndexObject {
-                table_id: 42,
+                table_id: TableID::new(42),
                 index_no: 0,
                 index_attributes: IndexAttributes::PK,
             };
             let idx_42_1 = IndexObject {
-                table_id: 42,
+                table_id: TableID::new(42),
                 index_no: 1,
                 index_attributes: IndexAttributes::empty(),
             };
             let idx_43_0 = IndexObject {
-                table_id: 43,
+                table_id: TableID::new(43),
                 index_no: 0,
                 index_attributes: IndexAttributes::PK,
             };
@@ -456,7 +459,7 @@ mod tests {
             })
             .await
             .unwrap();
-            mark_catalog_ddl(&mut trx, DDLRedo::CreateTable(42));
+            mark_catalog_ddl(&mut trx, DDLRedo::CreateTable(TableID::new(42)));
             trx.commit().await.unwrap();
 
             let mut trx = session.begin_trx().unwrap();
@@ -466,7 +469,7 @@ mod tests {
                         .catalog()
                         .storage
                         .indexes()
-                        .delete_by_id(stmt, 42, 1)
+                        .delete_by_id(stmt, TableID::new(42), 1)
                         .await
                 );
                 assert!(
@@ -474,21 +477,21 @@ mod tests {
                         .catalog()
                         .storage
                         .indexes()
-                        .delete_by_id(stmt, 42, 9)
+                        .delete_by_id(stmt, TableID::new(42), 9)
                         .await
                 );
                 Ok(())
             })
             .await
             .unwrap();
-            mark_catalog_ddl(&mut trx, DDLRedo::DropTable(42));
+            mark_catalog_ddl(&mut trx, DDLRedo::DropTable(TableID::new(42)));
             trx.commit().await.unwrap();
 
             let idx_42 = engine
                 .catalog()
                 .storage
                 .indexes()
-                .list_uncommitted_by_table_id(session.pool_guards(), 42)
+                .list_uncommitted_by_table_id(session.pool_guards(), TableID::new(42))
                 .await
                 .unwrap();
             assert_eq!(idx_42.len(), 1);
@@ -498,7 +501,7 @@ mod tests {
                 .catalog()
                 .storage
                 .indexes()
-                .list_uncommitted_by_table_id(session.pool_guards(), 43)
+                .list_uncommitted_by_table_id(session.pool_guards(), TableID::new(43))
                 .await
                 .unwrap();
             assert_eq!(idx_43.len(), 1);
@@ -511,7 +514,7 @@ mod tests {
                         .catalog()
                         .storage
                         .indexes()
-                        .delete_by_id(stmt, 42, 1)
+                        .delete_by_id(stmt, TableID::new(42), 1)
                         .await
                 );
                 assert!(
@@ -519,7 +522,7 @@ mod tests {
                         .catalog()
                         .storage
                         .indexes()
-                        .delete_by_id(stmt, 42, 0)
+                        .delete_by_id(stmt, TableID::new(42), 0)
                         .await
                 );
                 assert!(
@@ -527,14 +530,14 @@ mod tests {
                         .catalog()
                         .storage
                         .indexes()
-                        .delete_by_id(stmt, 43, 0)
+                        .delete_by_id(stmt, TableID::new(43), 0)
                         .await
                 );
                 Ok(())
             })
             .await
             .unwrap();
-            mark_catalog_ddl(&mut trx, DDLRedo::DropTable(42));
+            mark_catalog_ddl(&mut trx, DDLRedo::DropTable(TableID::new(42)));
             trx.commit().await.unwrap();
 
             assert!(
@@ -542,7 +545,7 @@ mod tests {
                     .catalog()
                     .storage
                     .indexes()
-                    .list_uncommitted_by_table_id(session.pool_guards(), 42)
+                    .list_uncommitted_by_table_id(session.pool_guards(), TableID::new(42))
                     .await
                     .unwrap()
                     .is_empty()
@@ -552,7 +555,7 @@ mod tests {
                     .catalog()
                     .storage
                     .indexes()
-                    .list_uncommitted_by_table_id(session.pool_guards(), 43)
+                    .list_uncommitted_by_table_id(session.pool_guards(), TableID::new(43))
                     .await
                     .unwrap()
                     .is_empty()
@@ -578,17 +581,17 @@ mod tests {
 
             let indexes = [
                 IndexObject {
-                    table_id: 42,
+                    table_id: TableID::new(42),
                     index_no: 0,
                     index_attributes: IndexAttributes::PK,
                 },
                 IndexObject {
-                    table_id: 42,
+                    table_id: TableID::new(42),
                     index_no: 1,
                     index_attributes: IndexAttributes::empty(),
                 },
                 IndexObject {
-                    table_id: 43,
+                    table_id: TableID::new(43),
                     index_no: 0,
                     index_attributes: IndexAttributes::PK,
                 },
@@ -603,7 +606,7 @@ mod tests {
             })
             .await
             .unwrap();
-            mark_catalog_ddl(&mut trx, DDLRedo::CreateTable(42));
+            mark_catalog_ddl(&mut trx, DDLRedo::CreateTable(TableID::new(42)));
             trx.commit().await.unwrap();
 
             let mut trx = session.begin_trx().unwrap();
@@ -613,7 +616,7 @@ mod tests {
                         .catalog()
                         .storage
                         .indexes()
-                        .delete_by_table_id(stmt, 42)
+                        .delete_by_table_id(stmt, TableID::new(42))
                         .await
                         .unwrap(),
                     2
@@ -623,7 +626,7 @@ mod tests {
                         .catalog()
                         .storage
                         .indexes()
-                        .delete_by_table_id(stmt, 42)
+                        .delete_by_table_id(stmt, TableID::new(42))
                         .await
                         .unwrap(),
                     0
@@ -632,7 +635,7 @@ mod tests {
             })
             .await
             .unwrap();
-            mark_catalog_ddl(&mut trx, DDLRedo::DropTable(42));
+            mark_catalog_ddl(&mut trx, DDLRedo::DropTable(TableID::new(42)));
             trx.commit().await.unwrap();
 
             assert!(
@@ -640,7 +643,7 @@ mod tests {
                     .catalog()
                     .storage
                     .indexes()
-                    .list_uncommitted_by_table_id(session.pool_guards(), 42)
+                    .list_uncommitted_by_table_id(session.pool_guards(), TableID::new(42))
                     .await
                     .unwrap()
                     .is_empty()
@@ -649,7 +652,7 @@ mod tests {
                 .catalog()
                 .storage
                 .indexes()
-                .list_uncommitted_by_table_id(session.pool_guards(), 43)
+                .list_uncommitted_by_table_id(session.pool_guards(), TableID::new(43))
                 .await
                 .unwrap();
             assert_eq!(remaining.len(), 1);
@@ -675,28 +678,28 @@ mod tests {
 
             let index_columns = [
                 IndexColumnObject {
-                    table_id: 42,
+                    table_id: TableID::new(42),
                     index_no: 0,
                     index_column_no: 0,
                     column_no: 0,
                     index_order: IndexOrder::Asc,
                 },
                 IndexColumnObject {
-                    table_id: 42,
+                    table_id: TableID::new(42),
                     index_no: 1,
                     index_column_no: 0,
                     column_no: 1,
                     index_order: IndexOrder::Asc,
                 },
                 IndexColumnObject {
-                    table_id: 42,
+                    table_id: TableID::new(42),
                     index_no: 1,
                     index_column_no: 1,
                     column_no: 2,
                     index_order: IndexOrder::Desc,
                 },
                 IndexColumnObject {
-                    table_id: 43,
+                    table_id: TableID::new(43),
                     index_no: 1,
                     index_column_no: 0,
                     column_no: 0,
@@ -720,7 +723,7 @@ mod tests {
             })
             .await
             .unwrap();
-            mark_catalog_ddl(&mut trx, DDLRedo::CreateTable(42));
+            mark_catalog_ddl(&mut trx, DDLRedo::CreateTable(TableID::new(42)));
             trx.commit().await.unwrap();
 
             let mut trx = session.begin_trx().unwrap();
@@ -730,7 +733,7 @@ mod tests {
                         .catalog()
                         .storage
                         .index_columns()
-                        .delete_by_index(stmt, 42, 1)
+                        .delete_by_index(stmt, TableID::new(42), 1)
                         .await
                         .unwrap(),
                     2
@@ -740,7 +743,7 @@ mod tests {
                         .catalog()
                         .storage
                         .index_columns()
-                        .delete_by_index(stmt, 42, 1)
+                        .delete_by_index(stmt, TableID::new(42), 1)
                         .await
                         .unwrap(),
                     0
@@ -749,14 +752,14 @@ mod tests {
             })
             .await
             .unwrap();
-            mark_catalog_ddl(&mut trx, DDLRedo::DropTable(42));
+            mark_catalog_ddl(&mut trx, DDLRedo::DropTable(TableID::new(42)));
             trx.commit().await.unwrap();
 
             let remaining_42 = engine
                 .catalog()
                 .storage
                 .index_columns()
-                .list_uncommitted_by_table_id(session.pool_guards(), 42)
+                .list_uncommitted_by_table_id(session.pool_guards(), TableID::new(42))
                 .await
                 .unwrap();
             assert_eq!(remaining_42.len(), 1);
@@ -769,7 +772,7 @@ mod tests {
                         .catalog()
                         .storage
                         .index_columns()
-                        .delete_by_table_id(stmt, 42)
+                        .delete_by_table_id(stmt, TableID::new(42))
                         .await
                         .unwrap(),
                     1
@@ -779,7 +782,7 @@ mod tests {
                         .catalog()
                         .storage
                         .index_columns()
-                        .delete_by_table_id(stmt, 42)
+                        .delete_by_table_id(stmt, TableID::new(42))
                         .await
                         .unwrap(),
                     0
@@ -788,7 +791,7 @@ mod tests {
             })
             .await
             .unwrap();
-            mark_catalog_ddl(&mut trx, DDLRedo::DropTable(42));
+            mark_catalog_ddl(&mut trx, DDLRedo::DropTable(TableID::new(42)));
             trx.commit().await.unwrap();
 
             assert!(
@@ -796,7 +799,7 @@ mod tests {
                     .catalog()
                     .storage
                     .index_columns()
-                    .list_uncommitted_by_table_id(session.pool_guards(), 42)
+                    .list_uncommitted_by_table_id(session.pool_guards(), TableID::new(42))
                     .await
                     .unwrap()
                     .is_empty()
@@ -805,11 +808,11 @@ mod tests {
                 .catalog()
                 .storage
                 .index_columns()
-                .list_uncommitted_by_table_id(session.pool_guards(), 43)
+                .list_uncommitted_by_table_id(session.pool_guards(), TableID::new(43))
                 .await
                 .unwrap();
             assert_eq!(remaining_43.len(), 1);
-            assert_eq!(remaining_43[0].table_id, 43);
+            assert_eq!(remaining_43[0].table_id, TableID::new(43));
             assert_eq!(remaining_43[0].index_no, 1);
 
             drop(session);

@@ -4,12 +4,10 @@
 //! catalog, table metadata, and table data resources independently from the
 //! engine/session/transaction lifecycle wiring that later phases will add.
 
-use crate::catalog::TableID;
 use crate::component::{Component, ComponentRegistry, ShelfScope};
 use crate::error::{OperationError, Result};
+use crate::id::{SessionID, TableID, TrxID};
 use crate::quiescent::{QuiescentBox, QuiescentGuard};
-use crate::session::SessionID;
-use crate::trx::TrxID;
 use dashmap::DashMap;
 use error_stack::Report;
 use event_listener::Event;
@@ -1283,7 +1281,7 @@ pub(crate) mod tests {
 
     #[test]
     fn table_data_compatibility_matrix_matches_rfc() {
-        let resource = table_data(1);
+        let resource = table_data(TableID::new(1));
         let modes = [
             LockMode::IntentShared,
             LockMode::IntentExclusive,
@@ -1310,7 +1308,10 @@ pub(crate) mod tests {
 
     #[test]
     fn metadata_and_catalog_only_accept_shared_and_exclusive() {
-        for resource in [LockResource::CatalogNamespace, table_metadata(1)] {
+        for resource in [
+            LockResource::CatalogNamespace,
+            table_metadata(TableID::new(1)),
+        ] {
             assert!(LockMode::Shared.validate_for(resource).is_ok());
             assert!(LockMode::Exclusive.validate_for(resource).is_ok());
             assert_operation_err(
@@ -1342,10 +1343,34 @@ pub(crate) mod tests {
     #[test]
     fn multiple_compatible_holders_grant_together() {
         let manager = LockManager::new();
-        let resource = table_data(7);
-        assert!(try_acquire(&manager, resource, LockMode::IntentShared, trx(1)).unwrap());
-        assert!(try_acquire(&manager, resource, LockMode::IntentExclusive, trx(2)).unwrap());
-        assert!(try_acquire(&manager, resource, LockMode::IntentShared, trx(3)).unwrap());
+        let resource = table_data(TableID::new(7));
+        assert!(
+            try_acquire(
+                &manager,
+                resource,
+                LockMode::IntentShared,
+                trx(TrxID::new(1))
+            )
+            .unwrap()
+        );
+        assert!(
+            try_acquire(
+                &manager,
+                resource,
+                LockMode::IntentExclusive,
+                trx(TrxID::new(2))
+            )
+            .unwrap()
+        );
+        assert!(
+            try_acquire(
+                &manager,
+                resource,
+                LockMode::IntentShared,
+                trx(TrxID::new(3))
+            )
+            .unwrap()
+        );
         let snapshot = debug_snapshot(&manager);
         assert_eq!(
             count_entries(&snapshot, resource, LockDebugEntryState::Granted),
@@ -1357,24 +1382,26 @@ pub(crate) mod tests {
     fn newer_compatible_request_waits_behind_older_incompatible_waiter() {
         smol::block_on(async {
             let manager = Arc::new(LockManager::new());
-            let resource = table_metadata(9);
-            assert!(try_acquire(&manager, resource, LockMode::Shared, trx(1)).unwrap());
+            let resource = table_metadata(TableID::new(9));
+            assert!(try_acquire(&manager, resource, LockMode::Shared, trx(TrxID::new(1))).unwrap());
 
             let waiter_manager = Arc::clone(&manager);
             let waiter = smol::spawn(async move {
                 waiter_manager
-                    .acquire(resource, LockMode::Exclusive, trx(2))
+                    .acquire(resource, LockMode::Exclusive, trx(TrxID::new(2)))
                     .await
             });
             wait_for_waiters(&manager, resource, 1).await;
 
-            assert!(!try_acquire(&manager, resource, LockMode::Shared, trx(3)).unwrap());
+            assert!(
+                !try_acquire(&manager, resource, LockMode::Shared, trx(TrxID::new(3))).unwrap()
+            );
             let snapshot = debug_snapshot(&manager);
             assert_eq!(
                 count_entries(&snapshot, resource, LockDebugEntryState::Waiting),
                 1
             );
-            assert_eq!(manager.release(resource, trx(1)), 1);
+            assert_eq!(manager.release(resource, trx(TrxID::new(1))), 1);
             waiter.await.unwrap();
         });
     }
@@ -1383,20 +1410,24 @@ pub(crate) mod tests {
     fn release_grants_next_compatible_fifo_group() {
         smol::block_on(async {
             let manager = Arc::new(LockManager::new());
-            let resource = table_data(11);
-            assert!(try_acquire(&manager, resource, LockMode::Exclusive, trx(1)).unwrap());
+            let resource = table_data(TableID::new(11));
+            assert!(
+                try_acquire(&manager, resource, LockMode::Exclusive, trx(TrxID::new(1))).unwrap()
+            );
 
             let waiter_s = {
                 let manager = Arc::clone(&manager);
-                smol::spawn(
-                    async move { manager.acquire(resource, LockMode::Shared, trx(2)).await },
-                )
+                smol::spawn(async move {
+                    manager
+                        .acquire(resource, LockMode::Shared, trx(TrxID::new(2)))
+                        .await
+                })
             };
             let waiter_is = {
                 let manager = Arc::clone(&manager);
                 smol::spawn(async move {
                     manager
-                        .acquire(resource, LockMode::IntentShared, trx(3))
+                        .acquire(resource, LockMode::IntentShared, trx(TrxID::new(3)))
                         .await
                 })
             };
@@ -1404,13 +1435,13 @@ pub(crate) mod tests {
                 let manager = Arc::clone(&manager);
                 smol::spawn(async move {
                     manager
-                        .acquire(resource, LockMode::IntentExclusive, trx(4))
+                        .acquire(resource, LockMode::IntentExclusive, trx(TrxID::new(4)))
                         .await
                 })
             };
             wait_for_waiters(&manager, resource, 3).await;
 
-            assert_eq!(manager.release(resource, trx(1)), 1);
+            assert_eq!(manager.release(resource, trx(TrxID::new(1))), 1);
             waiter_s.await.unwrap();
             waiter_is.await.unwrap();
 
@@ -1422,13 +1453,13 @@ pub(crate) mod tests {
                     .filter(|entry| {
                         entry.resource == resource
                             && entry.state == LockDebugEntryState::Waiting
-                            && entry.owner == trx(4)
+                            && entry.owner == trx(TrxID::new(4))
                     })
                     .count(),
                 1
             );
-            assert_eq!(manager.release(resource, trx(2)), 1);
-            assert_eq!(manager.release(resource, trx(3)), 1);
+            assert_eq!(manager.release(resource, trx(TrxID::new(2))), 1);
+            assert_eq!(manager.release(resource, trx(TrxID::new(3))), 1);
             waiter_ix.await.unwrap();
         });
     }
@@ -1436,12 +1467,28 @@ pub(crate) mod tests {
     #[test]
     fn release_one_resource_does_not_release_other_resources() {
         let manager = LockManager::new();
-        let first = table_data(1);
-        let second = table_data(2);
-        assert!(try_acquire(&manager, first, LockMode::IntentExclusive, trx(10)).unwrap());
-        assert!(try_acquire(&manager, second, LockMode::IntentExclusive, trx(10)).unwrap());
+        let first = table_data(TableID::new(1));
+        let second = table_data(TableID::new(2));
+        assert!(
+            try_acquire(
+                &manager,
+                first,
+                LockMode::IntentExclusive,
+                trx(TrxID::new(10))
+            )
+            .unwrap()
+        );
+        assert!(
+            try_acquire(
+                &manager,
+                second,
+                LockMode::IntentExclusive,
+                trx(TrxID::new(10))
+            )
+            .unwrap()
+        );
 
-        assert_eq!(manager.release(first, trx(10)), 1);
+        assert_eq!(manager.release(first, trx(TrxID::new(10))), 1);
         let snapshot = debug_snapshot(&manager);
         assert_eq!(
             count_entries(&snapshot, first, LockDebugEntryState::Granted),
@@ -1457,25 +1504,35 @@ pub(crate) mod tests {
     fn release_and_fail_waiters_does_not_grant_queue() {
         smol::block_on(async {
             let manager = Arc::new(LockManager::new());
-            let resource = table_metadata(41);
-            assert!(try_acquire(&manager, resource, LockMode::Exclusive, trx(1)).unwrap());
+            let resource = table_metadata(TableID::new(41));
+            assert!(
+                try_acquire(&manager, resource, LockMode::Exclusive, trx(TrxID::new(1))).unwrap()
+            );
 
             let first_waiter = {
                 let manager = Arc::clone(&manager);
-                smol::spawn(
-                    async move { manager.acquire(resource, LockMode::Shared, trx(2)).await },
-                )
+                smol::spawn(async move {
+                    manager
+                        .acquire(resource, LockMode::Shared, trx(TrxID::new(2)))
+                        .await
+                })
             };
             let second_waiter = {
                 let manager = Arc::clone(&manager);
-                smol::spawn(
-                    async move { manager.acquire(resource, LockMode::Shared, trx(3)).await },
-                )
+                smol::spawn(async move {
+                    manager
+                        .acquire(resource, LockMode::Shared, trx(TrxID::new(3)))
+                        .await
+                })
             };
             wait_for_waiters(&manager, resource, 2).await;
 
             assert_eq!(
-                manager.release_and_fail_waiters(resource, trx(1), OperationError::TableNotFound,),
+                manager.release_and_fail_waiters(
+                    resource,
+                    trx(TrxID::new(1)),
+                    OperationError::TableNotFound,
+                ),
                 3
             );
             for waiter in [first_waiter, second_waiter] {
@@ -1505,12 +1562,12 @@ pub(crate) mod tests {
     fn release_owner_removes_granted_locks_and_queued_waiters() {
         smol::block_on(async {
             let manager = Arc::new(LockManager::new());
-            let first = table_data(1);
-            let second = table_data(2);
-            assert!(try_acquire(&manager, first, LockMode::Exclusive, trx(1)).unwrap());
-            assert!(try_acquire(&manager, second, LockMode::Shared, trx(2)).unwrap());
+            let first = table_data(TableID::new(1));
+            let second = table_data(TableID::new(2));
+            assert!(try_acquire(&manager, first, LockMode::Exclusive, trx(TrxID::new(1))).unwrap());
+            assert!(try_acquire(&manager, second, LockMode::Shared, trx(TrxID::new(2))).unwrap());
 
-            let waiting_owner = trx(3);
+            let waiting_owner = trx(TrxID::new(3));
             let waiter = {
                 let manager = Arc::clone(&manager);
                 smol::spawn(async move {
@@ -1528,7 +1585,7 @@ pub(crate) mod tests {
                 Some(OperationError::LockWaiterReleased)
             );
 
-            assert_eq!(manager.release_owner(trx(2)), 1);
+            assert_eq!(manager.release_owner(trx(TrxID::new(2))), 1);
             let snapshot = debug_snapshot(&manager);
             assert_eq!(
                 count_entries(&snapshot, second, LockDebugEntryState::Granted),
@@ -1544,19 +1601,34 @@ pub(crate) mod tests {
     #[test]
     fn statement_owner_cleanup_does_not_release_transaction_owner() {
         let manager = LockManager::new();
-        let resource = table_data(3);
-        assert!(try_acquire(&manager, resource, LockMode::IntentExclusive, trx(20)).unwrap());
-        assert!(try_acquire(&manager, resource, LockMode::IntentShared, stmt(20, 1)).unwrap());
+        let resource = table_data(TableID::new(3));
+        assert!(
+            try_acquire(
+                &manager,
+                resource,
+                LockMode::IntentExclusive,
+                trx(TrxID::new(20))
+            )
+            .unwrap()
+        );
+        assert!(
+            try_acquire(
+                &manager,
+                resource,
+                LockMode::IntentShared,
+                stmt(TrxID::new(20), 1)
+            )
+            .unwrap()
+        );
 
-        assert_eq!(manager.release_owner(stmt(20, 1)), 1);
+        assert_eq!(manager.release_owner(stmt(TrxID::new(20), 1)), 1);
         let snapshot = debug_snapshot(&manager);
         assert_eq!(
             snapshot
                 .entries
                 .iter()
-                .filter(
-                    |entry| entry.owner == trx(20) && entry.state == LockDebugEntryState::Granted
-                )
+                .filter(|entry| entry.owner == trx(TrxID::new(20))
+                    && entry.state == LockDebugEntryState::Granted)
                 .count(),
             1
         );
@@ -1565,18 +1637,50 @@ pub(crate) mod tests {
     #[test]
     fn try_acquire_returns_false_for_fresh_blocking_request() {
         let manager = LockManager::new();
-        let resource = table_data(4);
-        assert!(try_acquire(&manager, resource, LockMode::Exclusive, trx(1)).unwrap());
-        assert!(!try_acquire(&manager, resource, LockMode::IntentShared, trx(2)).unwrap());
+        let resource = table_data(TableID::new(4));
+        assert!(try_acquire(&manager, resource, LockMode::Exclusive, trx(TrxID::new(1))).unwrap());
+        assert!(
+            !try_acquire(
+                &manager,
+                resource,
+                LockMode::IntentShared,
+                trx(TrxID::new(2))
+            )
+            .unwrap()
+        );
     }
 
     #[test]
     fn same_owner_covered_requests_do_not_duplicate_entries() {
         let manager = LockManager::new();
-        let resource = table_data(5);
-        assert!(try_acquire(&manager, resource, LockMode::Exclusive, session(1)).unwrap());
-        assert!(try_acquire(&manager, resource, LockMode::Shared, session(1)).unwrap());
-        assert!(try_acquire(&manager, resource, LockMode::IntentExclusive, session(1)).unwrap());
+        let resource = table_data(TableID::new(5));
+        assert!(
+            try_acquire(
+                &manager,
+                resource,
+                LockMode::Exclusive,
+                session(SessionID::new(1))
+            )
+            .unwrap()
+        );
+        assert!(
+            try_acquire(
+                &manager,
+                resource,
+                LockMode::Shared,
+                session(SessionID::new(1))
+            )
+            .unwrap()
+        );
+        assert!(
+            try_acquire(
+                &manager,
+                resource,
+                LockMode::IntentExclusive,
+                session(SessionID::new(1))
+            )
+            .unwrap()
+        );
         let snapshot = debug_snapshot(&manager);
         assert_eq!(
             count_entries(&snapshot, resource, LockDebugEntryState::Granted),
@@ -1589,23 +1693,25 @@ pub(crate) mod tests {
     fn same_group_covered_request_grants_without_waiting() {
         smol::block_on(async {
             let manager = Arc::new(LockManager::new());
-            let resource = table_data(60);
+            let resource = table_data(TableID::new(60));
             assert!(
                 try_acquire_grouped(
                     &manager,
                     resource,
                     LockMode::Exclusive,
-                    session(1),
-                    group(1)
+                    session(SessionID::new(1)),
+                    group(SessionID::new(1))
                 )
                 .unwrap()
             );
 
             let external_waiter = {
                 let manager = Arc::clone(&manager);
-                smol::spawn(
-                    async move { manager.acquire(resource, LockMode::Shared, trx(2)).await },
-                )
+                smol::spawn(async move {
+                    manager
+                        .acquire(resource, LockMode::Shared, trx(TrxID::new(2)))
+                        .await
+                })
             };
             wait_for_waiters(&manager, resource, 1).await;
 
@@ -1614,25 +1720,25 @@ pub(crate) mod tests {
                     &manager,
                     resource,
                     LockMode::IntentExclusive,
-                    trx(3),
-                    group(1),
+                    trx(TrxID::new(3)),
+                    group(SessionID::new(1)),
                 )
                 .unwrap()
             );
 
             let snapshot = debug_snapshot(&manager);
             assert!(snapshot.entries.iter().any(|entry| {
-                entry.owner == trx(3)
-                    && entry.owner_group == Some(group(1))
+                entry.owner == trx(TrxID::new(3))
+                    && entry.owner_group == Some(group(SessionID::new(1)))
                     && entry.mode == LockMode::IntentExclusive
                     && entry.state == LockDebugEntryState::Granted
             }));
             assert!(snapshot.entries.iter().any(|entry| {
-                entry.owner == trx(2) && entry.state == LockDebugEntryState::Waiting
+                entry.owner == trx(TrxID::new(2)) && entry.state == LockDebugEntryState::Waiting
             }));
 
-            assert_eq!(manager.release(resource, trx(3)), 1);
-            assert_eq!(manager.release(resource, session(1)), 1);
+            assert_eq!(manager.release(resource, trx(TrxID::new(3))), 1);
+            assert_eq!(manager.release(resource, session(SessionID::new(1))), 1);
             external_waiter.await.unwrap();
         });
     }
@@ -1640,10 +1746,16 @@ pub(crate) mod tests {
     #[test]
     fn same_group_noncovered_request_errors_without_waiter() {
         let manager = LockManager::new();
-        let resource = table_data(61);
+        let resource = table_data(TableID::new(61));
         assert!(
-            try_acquire_grouped(&manager, resource, LockMode::Shared, session(1), group(1))
-                .unwrap()
+            try_acquire_grouped(
+                &manager,
+                resource,
+                LockMode::Shared,
+                session(SessionID::new(1)),
+                group(SessionID::new(1))
+            )
+            .unwrap()
         );
 
         assert_operation_err(
@@ -1651,8 +1763,8 @@ pub(crate) mod tests {
                 &manager,
                 resource,
                 LockMode::IntentExclusive,
-                trx(2),
-                group(1),
+                trx(TrxID::new(2)),
+                group(SessionID::new(1)),
             ),
             OperationError::LockOwnerGroupConflict,
         );
@@ -1662,21 +1774,33 @@ pub(crate) mod tests {
             count_entries(&snapshot, resource, LockDebugEntryState::Waiting),
             0
         );
-        assert!(!snapshot.entries.iter().any(|entry| entry.owner == trx(2)));
+        assert!(
+            !snapshot
+                .entries
+                .iter()
+                .any(|entry| entry.owner == trx(TrxID::new(2)))
+        );
     }
 
     #[test]
     fn same_group_noncovered_request_does_not_queue_behind_same_group_waiter() {
         smol::block_on(async {
             let manager = Arc::new(LockManager::new());
-            let resource = table_data(62);
-            assert!(try_acquire(&manager, resource, LockMode::Exclusive, trx(99)).unwrap());
+            let resource = table_data(TableID::new(62));
+            assert!(
+                try_acquire(&manager, resource, LockMode::Exclusive, trx(TrxID::new(99))).unwrap()
+            );
 
             let session_waiter = {
                 let manager = Arc::clone(&manager);
                 smol::spawn(async move {
                     manager
-                        .acquire_grouped(resource, LockMode::Shared, session(1), group(1))
+                        .acquire_grouped(
+                            resource,
+                            LockMode::Shared,
+                            session(SessionID::new(1)),
+                            group(SessionID::new(1)),
+                        )
                         .await
                 })
             };
@@ -1687,8 +1811,8 @@ pub(crate) mod tests {
                     &manager,
                     resource,
                     LockMode::IntentExclusive,
-                    trx(2),
-                    group(1),
+                    trx(TrxID::new(2)),
+                    group(SessionID::new(1)),
                 ),
                 OperationError::LockOwnerGroupConflict,
             );
@@ -1697,9 +1821,14 @@ pub(crate) mod tests {
                 count_entries(&snapshot, resource, LockDebugEntryState::Waiting),
                 1
             );
-            assert!(!snapshot.entries.iter().any(|entry| entry.owner == trx(2)));
+            assert!(
+                !snapshot
+                    .entries
+                    .iter()
+                    .any(|entry| entry.owner == trx(TrxID::new(2)))
+            );
 
-            assert_eq!(manager.release(resource, trx(99)), 1);
+            assert_eq!(manager.release(resource, trx(TrxID::new(99))), 1);
             session_waiter.await.unwrap();
         });
     }
@@ -1707,15 +1836,39 @@ pub(crate) mod tests {
     #[test]
     fn immediate_conversion_succeeds_only_when_it_will_not_wait() {
         let manager = LockManager::new();
-        let resource = table_data(6);
-        assert!(try_acquire(&manager, resource, LockMode::IntentShared, trx(1)).unwrap());
-        assert!(try_acquire(&manager, resource, LockMode::IntentExclusive, trx(1)).unwrap());
+        let resource = table_data(TableID::new(6));
+        assert!(
+            try_acquire(
+                &manager,
+                resource,
+                LockMode::IntentShared,
+                trx(TrxID::new(1))
+            )
+            .unwrap()
+        );
+        assert!(
+            try_acquire(
+                &manager,
+                resource,
+                LockMode::IntentExclusive,
+                trx(TrxID::new(1))
+            )
+            .unwrap()
+        );
         let snapshot = debug_snapshot(&manager);
         assert_eq!(snapshot.entries[0].mode, LockMode::IntentExclusive);
 
-        assert!(try_acquire(&manager, resource, LockMode::IntentShared, trx(2)).unwrap());
+        assert!(
+            try_acquire(
+                &manager,
+                resource,
+                LockMode::IntentShared,
+                trx(TrxID::new(2))
+            )
+            .unwrap()
+        );
         assert_operation_err(
-            try_acquire(&manager, resource, LockMode::Exclusive, trx(1)),
+            try_acquire(&manager, resource, LockMode::Exclusive, trx(TrxID::new(1))),
             OperationError::LockUpgradeWouldBlock,
         );
     }
@@ -1723,10 +1876,18 @@ pub(crate) mod tests {
     #[test]
     fn incomparable_same_owner_conversion_is_explicit_error() {
         let manager = LockManager::new();
-        let resource = table_data(8);
-        assert!(try_acquire(&manager, resource, LockMode::IntentExclusive, trx(1)).unwrap());
+        let resource = table_data(TableID::new(8));
+        assert!(
+            try_acquire(
+                &manager,
+                resource,
+                LockMode::IntentExclusive,
+                trx(TrxID::new(1))
+            )
+            .unwrap()
+        );
         assert_operation_err(
-            try_acquire(&manager, resource, LockMode::Shared, trx(1)),
+            try_acquire(&manager, resource, LockMode::Shared, trx(TrxID::new(1))),
             OperationError::LockConversionNotSupported,
         );
     }
@@ -1736,16 +1897,20 @@ pub(crate) mod tests {
         smol::block_on(async {
             let manager = Arc::new(LockManager::new());
             let resource = LockResource::CatalogNamespace;
-            assert!(try_acquire(&manager, resource, LockMode::Exclusive, trx(1)).unwrap());
+            assert!(
+                try_acquire(&manager, resource, LockMode::Exclusive, trx(TrxID::new(1))).unwrap()
+            );
 
             let waiter = {
                 let manager = Arc::clone(&manager);
-                smol::spawn(
-                    async move { manager.acquire(resource, LockMode::Shared, trx(2)).await },
-                )
+                smol::spawn(async move {
+                    manager
+                        .acquire(resource, LockMode::Shared, trx(TrxID::new(2)))
+                        .await
+                })
             };
             wait_for_waiters(&manager, resource, 1).await;
-            assert_eq!(manager.release(resource, trx(1)), 1);
+            assert_eq!(manager.release(resource, trx(TrxID::new(1))), 1);
             waiter.await.unwrap();
 
             let snapshot = debug_snapshot(&manager);
@@ -1753,7 +1918,7 @@ pub(crate) mod tests {
                 snapshot
                     .entries
                     .iter()
-                    .filter(|entry| entry.owner == trx(2)
+                    .filter(|entry| entry.owner == trx(TrxID::new(2))
                         && entry.state == LockDebugEntryState::Granted)
                     .count(),
                 1
@@ -1766,8 +1931,10 @@ pub(crate) mod tests {
         smol::block_on(async {
             let manager = Arc::new(LockManager::new());
             let resource = LockResource::CatalogNamespace;
-            let owner = trx(2);
-            assert!(try_acquire(&manager, resource, LockMode::Exclusive, trx(1)).unwrap());
+            let owner = trx(TrxID::new(2));
+            assert!(
+                try_acquire(&manager, resource, LockMode::Exclusive, trx(TrxID::new(1))).unwrap()
+            );
 
             let first_waiter = {
                 let manager = Arc::clone(&manager);
@@ -1786,7 +1953,7 @@ pub(crate) mod tests {
                 count_entries(&snapshot, resource, LockDebugEntryState::Waiting),
                 1
             );
-            assert_eq!(manager.release(resource, trx(1)), 1);
+            assert_eq!(manager.release(resource, trx(TrxID::new(1))), 1);
             first_waiter.await.unwrap();
             second_waiter.await.unwrap();
 
@@ -1808,9 +1975,11 @@ pub(crate) mod tests {
     fn try_acquire_returns_false_for_existing_same_owner_waiter() {
         smol::block_on(async {
             let manager = Arc::new(LockManager::new());
-            let resource = table_metadata(50);
-            let owner = trx(2);
-            assert!(try_acquire(&manager, resource, LockMode::Exclusive, trx(1)).unwrap());
+            let resource = table_metadata(TableID::new(50));
+            let owner = trx(TrxID::new(2));
+            assert!(
+                try_acquire(&manager, resource, LockMode::Exclusive, trx(TrxID::new(1))).unwrap()
+            );
 
             let waiter = {
                 let manager = Arc::clone(&manager);
@@ -1834,21 +2003,30 @@ pub(crate) mod tests {
         smol::block_on(async {
             let manager = Arc::new(LockManager::new());
             let resource = LockResource::CatalogNamespace;
-            assert!(try_acquire(&manager, resource, LockMode::Exclusive, trx(1)).unwrap());
+            assert!(
+                try_acquire(&manager, resource, LockMode::Exclusive, trx(TrxID::new(1))).unwrap()
+            );
 
             let waiter = {
                 let manager = Arc::clone(&manager);
-                smol::spawn(
-                    async move { manager.acquire(resource, LockMode::Shared, trx(2)).await },
-                )
+                smol::spawn(async move {
+                    manager
+                        .acquire(resource, LockMode::Shared, trx(TrxID::new(2)))
+                        .await
+                })
             };
             wait_for_waiters(&manager, resource, 1).await;
             assert!(waiter.cancel().await.is_none());
             wait_for_waiters(&manager, resource, 0).await;
 
-            assert_eq!(manager.release(resource, trx(1)), 1);
+            assert_eq!(manager.release(resource, trx(TrxID::new(1))), 1);
             let snapshot = debug_snapshot(&manager);
-            assert!(!snapshot.entries.iter().any(|entry| entry.owner == trx(2)));
+            assert!(
+                !snapshot
+                    .entries
+                    .iter()
+                    .any(|entry| entry.owner == trx(TrxID::new(2)))
+            );
         });
     }
 
@@ -1856,9 +2034,11 @@ pub(crate) mod tests {
     fn cancelling_duplicate_waiter_keeps_shared_waiter_queued() {
         smol::block_on(async {
             let manager = Arc::new(LockManager::new());
-            let resource = table_metadata(53);
-            let owner = trx(2);
-            assert!(try_acquire(&manager, resource, LockMode::Exclusive, trx(1)).unwrap());
+            let resource = table_metadata(TableID::new(53));
+            let owner = trx(TrxID::new(2));
+            assert!(
+                try_acquire(&manager, resource, LockMode::Exclusive, trx(TrxID::new(1))).unwrap()
+            );
 
             let first_waiter = {
                 let manager = Arc::clone(&manager);
@@ -1880,7 +2060,7 @@ pub(crate) mod tests {
                 1
             );
 
-            assert_eq!(manager.release(resource, trx(1)), 1);
+            assert_eq!(manager.release(resource, trx(TrxID::new(1))), 1);
             first_waiter.await.unwrap();
             let snapshot = debug_snapshot(&manager);
             assert!(snapshot.entries.iter().any(|entry| {
@@ -1893,22 +2073,26 @@ pub(crate) mod tests {
     fn cancelling_front_waiter_grants_later_compatible_waiter() {
         smol::block_on(async {
             let manager = Arc::new(LockManager::new());
-            let resource = table_metadata(51);
-            assert!(try_acquire(&manager, resource, LockMode::Shared, trx(1)).unwrap());
+            let resource = table_metadata(TableID::new(51));
+            assert!(try_acquire(&manager, resource, LockMode::Shared, trx(TrxID::new(1))).unwrap());
 
             let front_waiter = {
                 let manager = Arc::clone(&manager);
-                smol::spawn(
-                    async move { manager.acquire(resource, LockMode::Exclusive, trx(2)).await },
-                )
+                smol::spawn(async move {
+                    manager
+                        .acquire(resource, LockMode::Exclusive, trx(TrxID::new(2)))
+                        .await
+                })
             };
             wait_for_waiters(&manager, resource, 1).await;
 
             let compatible_waiter = {
                 let manager = Arc::clone(&manager);
-                smol::spawn(
-                    async move { manager.acquire(resource, LockMode::Shared, trx(3)).await },
-                )
+                smol::spawn(async move {
+                    manager
+                        .acquire(resource, LockMode::Shared, trx(TrxID::new(3)))
+                        .await
+                })
             };
             wait_for_waiters(&manager, resource, 2).await;
 
@@ -1918,7 +2102,7 @@ pub(crate) mod tests {
 
             let snapshot = debug_snapshot(&manager);
             assert!(snapshot.entries.iter().any(|entry| {
-                entry.owner == trx(3) && entry.state == LockDebugEntryState::Granted
+                entry.owner == trx(TrxID::new(3)) && entry.state == LockDebugEntryState::Granted
             }));
         });
     }
@@ -1926,8 +2110,8 @@ pub(crate) mod tests {
     #[test]
     fn active_waiter_guard_removes_unobserved_grant() {
         let manager = LockManager::new();
-        let resource = table_metadata(52);
-        let waiter = Arc::new(Waiter::new(trx(2), None, LockMode::Shared));
+        let resource = table_metadata(TableID::new(52));
+        let waiter = Arc::new(Waiter::new(trx(TrxID::new(2)), None, LockMode::Shared));
         {
             let mut resource_state = manager.resources.entry(resource).or_default();
             resource_state.waiters.push_back(Arc::clone(&waiter));
@@ -1941,20 +2125,33 @@ pub(crate) mod tests {
         drop(waiter_guard);
 
         let snapshot = debug_snapshot(&manager);
-        assert!(!snapshot.entries.iter().any(|entry| entry.owner == trx(2)));
+        assert!(
+            !snapshot
+                .entries
+                .iter()
+                .any(|entry| entry.owner == trx(TrxID::new(2)))
+        );
     }
 
     #[test]
     fn grant_waiters_deduplicates_existing_owner_grants() {
-        let resource = table_data(54);
+        let resource = table_data(TableID::new(54));
         let mut resource_state = ResourceState::default();
         resource_state.granted.push(GrantedLock {
-            owner: trx(2),
+            owner: trx(TrxID::new(2)),
             owner_group: None,
             mode: LockMode::IntentShared,
         });
-        let covered_waiter = Arc::new(Waiter::new(trx(2), None, LockMode::IntentShared));
-        let stronger_waiter = Arc::new(Waiter::new(trx(2), None, LockMode::IntentExclusive));
+        let covered_waiter = Arc::new(Waiter::new(
+            trx(TrxID::new(2)),
+            None,
+            LockMode::IntentShared,
+        ));
+        let stronger_waiter = Arc::new(Waiter::new(
+            trx(TrxID::new(2)),
+            None,
+            LockMode::IntentExclusive,
+        ));
         resource_state
             .waiters
             .push_back(Arc::clone(&covered_waiter));
@@ -1975,47 +2172,51 @@ pub(crate) mod tests {
     fn debug_snapshot_reports_granted_waiting_and_queue_order() {
         smol::block_on(async {
             let manager = Arc::new(LockManager::new());
-            let resource = table_metadata(42);
-            assert!(try_acquire(&manager, resource, LockMode::Shared, trx(1)).unwrap());
+            let resource = table_metadata(TableID::new(42));
+            assert!(try_acquire(&manager, resource, LockMode::Shared, trx(TrxID::new(1))).unwrap());
             let first_waiter = {
                 let manager = Arc::clone(&manager);
-                smol::spawn(
-                    async move { manager.acquire(resource, LockMode::Exclusive, trx(2)).await },
-                )
+                smol::spawn(async move {
+                    manager
+                        .acquire(resource, LockMode::Exclusive, trx(TrxID::new(2)))
+                        .await
+                })
             };
             let second_waiter = {
                 let manager = Arc::clone(&manager);
-                smol::spawn(
-                    async move { manager.acquire(resource, LockMode::Exclusive, trx(3)).await },
-                )
+                smol::spawn(async move {
+                    manager
+                        .acquire(resource, LockMode::Exclusive, trx(TrxID::new(3)))
+                        .await
+                })
             };
             wait_for_waiters(&manager, resource, 2).await;
 
             let snapshot = debug_snapshot(&manager);
             assert!(snapshot.entries.iter().any(|entry| {
                 entry.resource == resource
-                    && entry.owner == trx(1)
+                    && entry.owner == trx(TrxID::new(1))
                     && entry.mode == LockMode::Shared
                     && entry.state == LockDebugEntryState::Granted
                     && entry.queue_order.is_none()
             }));
             assert!(snapshot.entries.iter().any(|entry| {
                 entry.resource == resource
-                    && entry.owner == trx(2)
+                    && entry.owner == trx(TrxID::new(2))
                     && entry.mode == LockMode::Exclusive
                     && entry.state == LockDebugEntryState::Waiting
                     && entry.queue_order == Some(0)
             }));
             assert!(snapshot.entries.iter().any(|entry| {
                 entry.resource == resource
-                    && entry.owner == trx(3)
+                    && entry.owner == trx(TrxID::new(3))
                     && entry.mode == LockMode::Exclusive
                     && entry.state == LockDebugEntryState::Waiting
                     && entry.queue_order == Some(1)
             }));
 
-            assert_eq!(manager.release_owner(trx(2)), 1);
-            assert_eq!(manager.release_owner(trx(3)), 1);
+            assert_eq!(manager.release_owner(trx(TrxID::new(2))), 1);
+            assert_eq!(manager.release_owner(trx(TrxID::new(3))), 1);
             assert_eq!(
                 first_waiter.await.unwrap_err().operation_error(),
                 Some(OperationError::LockWaiterReleased)

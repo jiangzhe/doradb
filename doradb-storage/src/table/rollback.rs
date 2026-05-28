@@ -2,11 +2,10 @@ use super::{MemTable, Table, TableRuntimeLayout};
 use crate::buffer::{BufferPool, EvictableBufferPool, FixedBufferPool, PoolGuard, PoolGuards};
 use crate::catalog::CatalogTable;
 use crate::error::{Error, InternalError, Result};
+use crate::id::{RowID, TrxID};
 use crate::index::util::Maskable;
 use crate::index::{IndexCompareExchange, NonUniqueIndex, UniqueIndex};
-use crate::row::RowID;
 use crate::row::ops::SelectKey;
-use crate::trx::TrxID;
 use crate::trx::undo::{IndexUndo, IndexUndoKind};
 use error_stack::Report;
 

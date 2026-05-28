@@ -1,7 +1,5 @@
-use crate::buffer::PageID;
-use crate::catalog::TableID;
-use crate::row::{INVALID_ROW_ID, RowID};
-use crate::trx::TrxID;
+use crate::id::{PageID, RowID, TableID, TrxID};
+use crate::row::INVALID_ROW_ID;
 use crate::trx::sys::TransactionSystem;
 
 /// Value that can be masked as deleted.
@@ -25,17 +23,17 @@ impl Maskable for RowID {
 
     #[inline]
     fn deleted(self) -> Self {
-        self | U64_DELETE_BIT
+        RowID::new(self.as_u64() | U64_DELETE_BIT)
     }
 
     #[inline]
     fn value(self) -> Self {
-        self & !U64_DELETE_BIT
+        RowID::new(self.as_u64() & !U64_DELETE_BIT)
     }
 
     #[inline]
     fn is_deleted(self) -> bool {
-        self & U64_DELETE_BIT != 0
+        self.as_u64() & U64_DELETE_BIT != 0
     }
 }
 

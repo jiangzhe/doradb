@@ -8,7 +8,7 @@ use crate::buffer::frame::{BufferFrame, FrameKind};
 use crate::buffer::guard::{FacadePageGuard, PageExclusiveGuard, PageGuard, PageLatchGuard};
 use crate::buffer::load::{PageReservation, PageReservationGuard};
 use crate::buffer::page::{
-    BufferPage, IOKind, PAGE_SIZE, Page, PageID, PageIO, VersionedPageID, validate_frame_page_kind,
+    BufferPage, IOKind, PAGE_SIZE, Page, PageIO, VersionedPageID, validate_frame_page_kind,
 };
 use crate::buffer::util::{frame_total_bytes, madvise_dontneed};
 use crate::buffer::{
@@ -25,7 +25,8 @@ use crate::error::{
 };
 use crate::file::block_integrity::{validate_block_checksum, write_block_checksum};
 use crate::file::fs::{FileSystem, FileSystemWorkers};
-use crate::file::{BlockID, BlockKey, INDEX_POOL_SWAP_FILE_ID, MEM_POOL_SWAP_FILE_ID, SparseFile};
+use crate::file::{BlockKey, INDEX_POOL_SWAP_FILE_ID, MEM_POOL_SWAP_FILE_ID, SparseFile};
+use crate::id::{BlockID, PageID};
 use crate::io::{
     IOBackendStats, IOKind as StorageIOKind, IOQueue, IOStateMachine, IOSubmission, Operation,
     StdIoResult,

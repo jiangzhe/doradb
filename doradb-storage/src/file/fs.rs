@@ -4,8 +4,8 @@ use crate::buffer::{
     EvictReadSubmission, EvictSubmission, EvictableBufferPool, EvictablePoolStateMachine,
     PoolRequest, PoolRole, ReadSubmission, ReadonlyBufferPool,
 };
+use crate::catalog::USER_OBJ_ID_START;
 use crate::catalog::table::TableMetadata;
-use crate::catalog::{TableID, USER_OBJ_ID_START};
 use crate::component::{Component, ComponentRegistry, ShelfScope, Supplier};
 use crate::conf::FileSystemConfig;
 use crate::conf::path::path_to_utf8;
@@ -17,6 +17,7 @@ use crate::file::multi_table_file::{
 use crate::file::table_file::{ActiveRoot, TABLE_FILE_INITIAL_SIZE};
 use crate::file::table_file::{MutableTableFile, TableFile};
 use crate::file::{SparseFile, TableFsStateMachine, TableFsSubmission, WriteSubmission};
+use crate::id::{TableID, TrxID};
 use crate::io::{
     BackendToken, IOBackend, IOBackendStats, IOBackendStatsHandle, IOClient, IOKind, IOMessage,
     IOQueue, IOStateMachine, IOSubmission, Operation, StdIoResult, StorageBackend,
@@ -1472,7 +1473,7 @@ impl FileSystem {
         let file_path = self.user_table_file_path(table_id);
         let table_file = TableFile::create(&file_path, TABLE_FILE_INITIAL_SIZE, table_id, trunc)?;
         let initial_pages = TABLE_FILE_INITIAL_SIZE / COW_FILE_PAGE_SIZE;
-        let active_root = ActiveRoot::new(0, initial_pages, metadata);
+        let active_root = ActiveRoot::new(TrxID::new(0), initial_pages, metadata);
         Ok(MutableTableFile::new_without_barrier(
             Arc::new(table_file),
             active_root,
@@ -1713,9 +1714,9 @@ pub(crate) mod tests {
     use crate::conf::{EngineConfig, EvictableBufferPoolConfig, TrxSysConfig};
     use crate::engine::Engine;
     use crate::error::{ConfigError, ErrorKind};
-    use crate::file::BlockID;
     use crate::file::cow_file::{COW_FILE_PAGE_SIZE, MutableCowFile};
     use crate::file::table_file::TableFile;
+    use crate::id::BlockID;
     use crate::io::{
         DirectBuf, IOBuf, IOKind, StorageBackendFileIdentity, StorageBackendOp,
         StorageBackendTestHook, install_storage_backend_test_hook,
@@ -1929,6 +1930,7 @@ pub(crate) mod tests {
     struct ControlledStorageOpHookInner {
         blocked_kind: IOKind,
         blocked_file: StorageBackendFileIdentity,
+        recorded_files: Vec<StorageBackendFileIdentity>,
         submits: parking_lot::Mutex<Vec<StorageBackendOp>>,
         submit_count: AtomicUsize,
         submit_ev: event_listener::Event,
@@ -1939,11 +1941,19 @@ pub(crate) mod tests {
     }
 
     impl ControlledStorageOpHook {
-        fn new(blocked_kind: IOKind, blocked_file: StorageBackendFileIdentity) -> Self {
+        fn new(
+            blocked_kind: IOKind,
+            blocked_file: StorageBackendFileIdentity,
+            mut recorded_files: Vec<StorageBackendFileIdentity>,
+        ) -> Self {
+            if !recorded_files.contains(&blocked_file) {
+                recorded_files.push(blocked_file);
+            }
             Self {
                 inner: Arc::new(ControlledStorageOpHookInner {
                     blocked_kind,
                     blocked_file,
+                    recorded_files,
                     submits: parking_lot::Mutex::new(Vec::new()),
                     submit_count: AtomicUsize::new(0),
                     submit_ev: event_listener::Event::new(),
@@ -1958,6 +1968,13 @@ pub(crate) mod tests {
         fn matches_blocked(&self, op: StorageBackendOp) -> bool {
             op.kind() == self.inner.blocked_kind
                 && op.matches_file_identity(self.inner.blocked_file)
+        }
+
+        fn matches_recorded(&self, op: StorageBackendOp) -> bool {
+            self.inner
+                .recorded_files
+                .iter()
+                .any(|file| op.matches_file_identity(*file))
         }
 
         fn submits(&self) -> Vec<StorageBackendOp> {
@@ -1998,9 +2015,11 @@ pub(crate) mod tests {
 
     impl StorageBackendTestHook for ControlledStorageOpHook {
         fn on_submit(&self, op: StorageBackendOp) {
-            self.inner.submits.lock().push(op);
-            self.inner.submit_count.fetch_add(1, Ordering::SeqCst);
-            self.inner.submit_ev.notify(usize::MAX);
+            if self.matches_recorded(op) {
+                self.inner.submits.lock().push(op);
+                self.inner.submit_count.fetch_add(1, Ordering::SeqCst);
+                self.inner.submit_ev.notify(usize::MAX);
+            }
             if self.matches_blocked(op) {
                 self.inner.blocked_submits.fetch_add(1, Ordering::SeqCst);
                 self.inner.blocked_submit_ev.notify(usize::MAX);
@@ -2025,20 +2044,30 @@ pub(crate) mod tests {
     }
 
     struct FailingFirstWriteHook {
+        file_path: PathBuf,
         failed: AtomicBool,
     }
 
     impl FailingFirstWriteHook {
-        fn new() -> Self {
+        fn new(file_path: impl Into<PathBuf>) -> Self {
             Self {
+                file_path: file_path.into(),
                 failed: AtomicBool::new(false),
             }
+        }
+
+        fn matches(&self, op: StorageBackendOp) -> bool {
+            if op.kind() != IOKind::Write {
+                return false;
+            }
+            StorageBackendFileIdentity::from_path(&self.file_path)
+                .is_ok_and(|expected| op.matches_file_identity(expected))
         }
     }
 
     impl StorageBackendTestHook for FailingFirstWriteHook {
         fn on_complete(&self, op: StorageBackendOp, res: &mut StdIoResult<usize>) {
-            if op.kind() == IOKind::Write && !self.failed.swap(true, Ordering::SeqCst) {
+            if self.matches(op) && !self.failed.swap(true, Ordering::SeqCst) {
                 *res = Err(std::io::Error::from_raw_os_error(libc::EIO));
             }
         }
@@ -2070,8 +2099,9 @@ pub(crate) mod tests {
             let global = crate::buffer::global_readonly_pool_scope(64 * 1024 * 1024);
 
             {
-                let _hook =
-                    install_storage_backend_test_hook(Arc::new(FailingFirstWriteHook::new()));
+                let _hook = install_storage_backend_test_hook(Arc::new(
+                    FailingFirstWriteHook::new(path.clone()),
+                ));
                 let err = match fs.open_or_create_multi_table_file(global.guard()).await {
                     Ok(_) => panic!("expected initial catalog.mtb publish failure"),
                     Err(err) => err,
@@ -2112,7 +2142,7 @@ pub(crate) mod tests {
             let table_file = fs
                 .create_table_file(table_id, make_metadata(), false)
                 .unwrap();
-            let (table_file, old_root) = table_file.commit(1, false).await.unwrap();
+            let (table_file, old_root) = table_file.commit(TrxID::new(1), false).await.unwrap();
             drop(old_root);
             write_payload(&fs, &table_file, BlockID::from(7usize), b"table-read").await;
 
@@ -2125,9 +2155,15 @@ pub(crate) mod tests {
             let index_pool = fs.index_pool();
             let background_file =
                 StorageBackendFileIdentity::from_path(temp_dir.path().join("index.swp")).unwrap();
+            let table_file_identity =
+                StorageBackendFileIdentity::from_path(fs.user_table_file_path(table_id)).unwrap();
             let read_fd = reopened.sparse_file().as_raw_fd();
             let stats_start = fs.storage_service_stats();
-            let hook = Arc::new(ControlledStorageOpHook::new(IOKind::Write, background_file));
+            let hook = Arc::new(ControlledStorageOpHook::new(
+                IOKind::Write,
+                background_file,
+                vec![background_file, table_file_identity],
+            ));
             let _hook = install_storage_backend_test_hook(hook.clone());
 
             let writes_done = test_dispatch_dirty_pages(index_pool, 2).await;
@@ -2195,7 +2231,11 @@ pub(crate) mod tests {
             let mem_pool_file =
                 StorageBackendFileIdentity::from_path(temp_dir.path().join("data.swp")).unwrap();
             let stats_start = fs.storage_service_stats();
-            let hook = Arc::new(ControlledStorageOpHook::new(IOKind::Write, background_file));
+            let hook = Arc::new(ControlledStorageOpHook::new(
+                IOKind::Write,
+                background_file,
+                vec![background_file, mem_pool_file],
+            ));
             let _hook = install_storage_backend_test_hook(hook.clone());
 
             let writes_done = test_dispatch_dirty_pages(index_pool, 2).await;
@@ -2261,7 +2301,7 @@ pub(crate) mod tests {
             let mutable = fs
                 .create_table_file(USER_OBJ_ID_START, Arc::clone(&metadata), false)
                 .unwrap();
-            let (table_file, old_root) = mutable.commit(1, false).await.unwrap();
+            let (table_file, old_root) = mutable.commit(TrxID::new(1), false).await.unwrap();
             drop(old_root);
 
             let path = fs.user_table_file_path(USER_OBJ_ID_START);
@@ -2295,7 +2335,7 @@ pub(crate) mod tests {
             let mutable = fs
                 .create_table_file(table_id, Arc::clone(&metadata), false)
                 .unwrap();
-            let (table_file, old_root) = mutable.commit(1, false).await.unwrap();
+            let (table_file, old_root) = mutable.commit(TrxID::new(1), false).await.unwrap();
             drop(old_root);
             drop(table_file);
             let path = fs.user_table_file_path(table_id);

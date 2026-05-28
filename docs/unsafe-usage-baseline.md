@@ -12,11 +12,11 @@
 | latch | 4 | 40 | 0 | 0 | 0 | 36 |
 | row | 3 | 6 | 0 | 0 | 0 | 6 |
 | index | 18 | 13 | 0 | 0 | 3 | 7 |
-| io | 7 | 19 | 0 | 0 | 1 | 15 |
+| io | 7 | 20 | 0 | 0 | 1 | 17 |
 | trx | 15 | 5 | 0 | 0 | 0 | 5 |
 | lwc | 2 | 0 | 0 | 0 | 0 | 0 |
 | file | 8 | 13 | 0 | 0 | 2 | 13 |
-| **total** | **70** | **146** | **0** | **0** | **6** | **126** |
+| **total** | **70** | **147** | **0** | **0** | **6** | **128** |
 
 ## File Hotspots (top 40)
 
@@ -35,7 +35,7 @@
 | `doradb-storage/src/row/mod.rs` | row | 6 | 6 |
 | `doradb-storage/src/buffer/readonly.rs` | buffer | 5 | 5 |
 | `doradb-storage/src/file/cow_file.rs` | file | 5 | 5 |
-| `doradb-storage/src/io/buf.rs` | io | 4 | 3 |
+| `doradb-storage/src/io/buf.rs` | io | 5 | 5 |
 | `doradb-storage/src/io/mod.rs` | io | 4 | 2 |
 | `doradb-storage/src/trx/undo/row.rs` | trx | 4 | 4 |
 | `doradb-storage/src/index/block_index_root.rs` | index | 3 | 3 |

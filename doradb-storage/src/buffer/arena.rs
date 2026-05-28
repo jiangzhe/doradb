@@ -1,9 +1,10 @@
 use crate::buffer::frame::{BufferFrame, FrameKind};
 use crate::buffer::guard::{FacadePageGuard, PageExclusiveGuard, PageLatchGuard};
-use crate::buffer::page::{BufferPage, Page, PageID};
+use crate::buffer::page::{BufferPage, Page};
 use crate::buffer::util::{deallocate_frame_and_page_arrays, initialize_frame_and_page_arrays};
 use crate::buffer::{PoolGuard, PoolIdentity};
 use crate::error::Result;
+use crate::id::PageID;
 use crate::ptr::UnsafePtr;
 use crate::quiescent::{QuiescentBox, QuiescentGuard};
 

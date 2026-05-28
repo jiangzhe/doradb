@@ -1,15 +1,16 @@
 use crate::bitmap::AllocMap;
 use crate::buffer::ReadonlyBufferPool;
-use crate::catalog::{TableID, table::TableMetadata};
+use crate::catalog::table::TableMetadata;
 use crate::error::{DataIntegrityError, Error, FileKind, InternalError, ResourceError, Result};
+use crate::file::SparseFile;
 use crate::file::block_integrity::{
     BLOCK_INTEGRITY_HEADER_SIZE, BlockIntegritySpec, max_payload_len, validate_block,
     write_block_checksum, write_block_header,
 };
 use crate::file::cow_file::{
-    ActiveRoot as GenericActiveRoot, BlockID, COW_FILE_PAGE_SIZE, CowCodec, CowFile,
-    CowWriteBarrier, MutableCowFile, MutableCowRoot, MutableWriterClaim, MutableWriterFile,
-    OldCowRoot, ParsedMeta, SUPER_BLOCK_ID, allocate_cow_block, validate_active_meta_block_id,
+    ActiveRoot as GenericActiveRoot, COW_FILE_PAGE_SIZE, CowCodec, CowFile, CowWriteBarrier,
+    MutableCowFile, MutableCowRoot, MutableWriterClaim, MutableWriterFile, OldCowRoot, ParsedMeta,
+    SUPER_BLOCK_ID, allocate_cow_block, validate_active_meta_block_id,
 };
 use crate::file::fs::BackgroundWriteRequest;
 use crate::file::meta_block::{
@@ -19,13 +20,12 @@ use crate::file::super_block::{
     SUPER_BLOCK_FOOTER_OFFSET, SUPER_BLOCK_SIZE, SUPER_BLOCK_VERSION, SuperBlock, SuperBlockBody,
     SuperBlockFooter, SuperBlockHeader, SuperBlockSerView, parse_super_block,
 };
-use crate::file::{FileID, SparseFile};
+use crate::id::{BlockID, FileID, RowID, TableID, TrxID};
 use crate::index::{ColumnBlockEntryShape, ColumnBlockIndex};
 use crate::io::{DirectBuf, IOBuf, IOClient};
 use crate::quiescent::QuiescentGuard;
-use crate::row::RowID;
 use crate::serde::{Deser, Ser};
-use crate::trx::{MIN_SNAPSHOT_TS, TrxID};
+use crate::trx::MIN_SNAPSHOT_TS;
 use error_stack::{Report, ResultExt};
 use futures::future::try_join_all;
 use std::collections::BTreeSet;
@@ -126,7 +126,7 @@ impl ActiveRoot {
                 metadata,
                 column_block_index_root: SUPER_BLOCK_ID,
                 secondary_index_roots,
-                pivot_row_id: 0,
+                pivot_row_id: RowID::new(0),
                 heap_redo_start_ts: root_ts,
                 deletion_cutoff_ts: root_ts.max(MIN_SNAPSHOT_TS),
             },
@@ -285,7 +285,7 @@ impl TableFile {
         let file = CowFile::create(
             file_path,
             initial_size,
-            FileID::from(table_id),
+            FileID::from(table_id.as_u64()),
             table_codec(),
             trunc,
         )?;
@@ -294,7 +294,7 @@ impl TableFile {
 
     #[inline]
     pub(super) fn open(file_path: impl AsRef<str>, table_id: TableID) -> Result<Self> {
-        let file = CowFile::open(file_path, FileID::from(table_id), table_codec())?;
+        let file = CowFile::open(file_path, FileID::from(table_id.as_u64()), table_codec())?;
         Ok(TableFile { file })
     }
 
@@ -546,7 +546,7 @@ impl MutableTableFile {
             write_barrier,
             writer_claim,
         } = self;
-        debug_assert!(new_root.root.root_ts == 0 || new_root.root.root_ts < root_ts);
+        debug_assert!(new_root.root.root_ts == TrxID::new(0) || new_root.root.root_ts < root_ts);
         new_root.root.root_ts = root_ts;
         let publish_res = table_file
             .file()
@@ -770,10 +770,10 @@ mod tests {
             );
             let table_id = test_user_table_id(41);
             let table_file = fs.create_table_file(table_id, metadata, false).unwrap();
-            let (table_file, old_root) = table_file.commit(1, false).await.unwrap();
+            let (table_file, old_root) = table_file.commit(TrxID::new(1), false).await.unwrap();
             assert!(old_root.is_none());
             assert_eq!(table_file.active_root_unchecked().slot_no, 0);
-            assert_eq!(table_file.active_root_unchecked().root_ts, 1);
+            assert_eq!(table_file.active_root_unchecked().root_ts, TrxID::new(1));
             assert_eq!(
                 table_file.active_root_unchecked().secondary_index_roots,
                 vec![SUPER_BLOCK_ID]
@@ -805,7 +805,7 @@ mod tests {
 
             let table_file2 = fs.open_table_file(table_id, global.guard()).await.unwrap();
             let disk_pool = global.guard();
-            assert_eq!(table_file2.active_root_unchecked().root_ts, 1);
+            assert_eq!(table_file2.active_root_unchecked().root_ts, TrxID::new(1));
 
             let mut mutable =
                 MutableTableFile::fork(&table_file2, background_writes, disk_pool.clone());
@@ -826,14 +826,14 @@ mod tests {
                     .copied(),
                 Some(crate::error::InternalError::SecondaryIndexRootCountMismatch)
             );
-            let (table_file3, old_root) = mutable.commit(2, false).await.unwrap();
+            let (table_file3, old_root) = mutable.commit(TrxID::new(2), false).await.unwrap();
             drop(old_root);
             let active_root = table_file3
                 .load_active_root_from_pool(&disk_pool)
                 .await
                 .unwrap();
             assert_eq!(active_root.slot_no, 1);
-            assert_eq!(active_root.root_ts, 2);
+            assert_eq!(active_root.root_ts, TrxID::new(2));
             assert_eq!(active_root.secondary_index_roots, vec![secondary_root]);
             drop(table_file2);
             drop(table_file3);
@@ -850,7 +850,7 @@ mod tests {
             let metadata = build_test_metadata();
             let table_id = test_user_table_id(143);
             let table_file = fs.create_table_file(table_id, metadata, false).unwrap();
-            let (table_file, old_root) = table_file.commit(1, false).await.unwrap();
+            let (table_file, old_root) = table_file.commit(TrxID::new(1), false).await.unwrap();
             drop(old_root);
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
             let disk_pool = table_readonly_pool(&global, table_id, &table_file);
@@ -862,7 +862,7 @@ mod tests {
             );
             let inherited_root = mutable.allocate_block().unwrap();
             mutable.set_secondary_index_root(0, inherited_root).unwrap();
-            let (table_file, old_root) = mutable.commit(2, false).await.unwrap();
+            let (table_file, old_root) = mutable.commit(TrxID::new(2), false).await.unwrap();
             drop(old_root);
 
             let disk_pool = table_readonly_pool(&global, table_id, &table_file);
@@ -906,7 +906,7 @@ mod tests {
             let metadata = build_test_metadata();
             let table_id = test_user_table_id(147);
             let table_file = fs.create_table_file(table_id, metadata, false).unwrap();
-            let (table_file, old_root) = table_file.commit(1, false).await.unwrap();
+            let (table_file, old_root) = table_file.commit(TrxID::new(1), false).await.unwrap();
             drop(old_root);
 
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
@@ -951,7 +951,7 @@ mod tests {
             let metadata = build_test_metadata();
             let table_id = test_user_table_id(148);
             let table_file = fs.create_table_file(table_id, metadata, false).unwrap();
-            let (table_file, old_root) = table_file.commit(1, false).await.unwrap();
+            let (table_file, old_root) = table_file.commit(TrxID::new(1), false).await.unwrap();
             drop(old_root);
 
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
@@ -973,7 +973,7 @@ mod tests {
                 background_writes,
                 disk_pool.global_pool().clone(),
             );
-            let (table_file, old_root) = mutable.commit(2, false).await.unwrap();
+            let (table_file, old_root) = mutable.commit(TrxID::new(2), false).await.unwrap();
             drop(old_root);
             assert_eq!(
                 table_file.active_root_unchecked().meta_block_id,
@@ -994,7 +994,7 @@ mod tests {
             let metadata = build_test_metadata();
             let table_id = test_user_table_id(149);
             let table_file = fs.create_table_file(table_id, metadata, false).unwrap();
-            let (table_file, old_root) = table_file.commit(1, false).await.unwrap();
+            let (table_file, old_root) = table_file.commit(TrxID::new(1), false).await.unwrap();
             drop(old_root);
 
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
@@ -1017,13 +1017,23 @@ mod tests {
 
             let lwc_blocks = vec![
                 LwcBlockPersist {
-                    shape: ColumnBlockEntryShape::new(0, 10, (0..10).collect(), Vec::new())
-                        .unwrap(),
+                    shape: ColumnBlockEntryShape::new(
+                        RowID::new(0),
+                        RowID::new(10),
+                        (0..10).map(RowID::new).collect(),
+                        Vec::new(),
+                    )
+                    .unwrap(),
                     buf: page_buf(b"reuse-lwc-1"),
                 },
                 LwcBlockPersist {
-                    shape: ColumnBlockEntryShape::new(10, 20, (10..20).collect(), Vec::new())
-                        .unwrap(),
+                    shape: ColumnBlockEntryShape::new(
+                        RowID::new(10),
+                        RowID::new(20),
+                        (10..20).map(RowID::new).collect(),
+                        Vec::new(),
+                    )
+                    .unwrap(),
                     buf: page_buf(b"reuse-lwc-2"),
                 },
             ];
@@ -1033,7 +1043,12 @@ mod tests {
                 disk_pool.global_pool().clone(),
             );
             mutable
-                .apply_lwc_blocks(lwc_blocks, 7, 2, disk_pool.global_pool())
+                .apply_lwc_blocks(
+                    lwc_blocks,
+                    TrxID::new(7),
+                    TrxID::new(2),
+                    disk_pool.global_pool(),
+                )
                 .await
                 .unwrap();
 
@@ -1067,7 +1082,7 @@ mod tests {
             let table_file = fs
                 .create_table_file(table_id, build_test_metadata(), false)
                 .unwrap();
-            let (table_file, old_root) = table_file.commit(1, false).await.unwrap();
+            let (table_file, old_root) = table_file.commit(TrxID::new(1), false).await.unwrap();
             drop(old_root);
 
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
@@ -1100,10 +1115,10 @@ mod tests {
             );
             let table_id = test_user_table_id(42);
             let table_file = fs.create_table_file(table_id, metadata, false).unwrap();
-            let (table_file, old_root) = table_file.commit(1, false).await.unwrap();
+            let (table_file, old_root) = table_file.commit(TrxID::new(1), false).await.unwrap();
             assert!(old_root.is_none());
             assert_eq!(table_file.active_root_unchecked().slot_no, 0);
-            assert_eq!(table_file.active_root_unchecked().root_ts, 1);
+            assert_eq!(table_file.active_root_unchecked().root_ts, TrxID::new(1));
 
             let global = QuiescentBox::new(
                 ReadonlyBufferPool::with_capacity(PoolRole::Disk, 64 * 1024 * 1024, fs.guard())
@@ -1190,7 +1205,7 @@ mod tests {
             let table_file = fs
                 .create_table_file(table_id, build_test_metadata(), false)
                 .unwrap();
-            let (table_file, old_root) = table_file.commit(1, false).await.unwrap();
+            let (table_file, old_root) = table_file.commit(TrxID::new(1), false).await.unwrap();
             drop(old_root);
             let active_meta_block_id = table_file.active_root_unchecked().meta_block_id;
             drop(table_file);
@@ -1223,7 +1238,7 @@ mod tests {
             let table_file = fs
                 .create_table_file(table_id, build_test_metadata(), false)
                 .unwrap();
-            let (table_file, old_root) = table_file.commit(1, false).await.unwrap();
+            let (table_file, old_root) = table_file.commit(TrxID::new(1), false).await.unwrap();
             drop(old_root);
             let active_meta_block_id = table_file.active_root_unchecked().meta_block_id;
             drop(table_file);
@@ -1259,18 +1274,28 @@ mod tests {
             let metadata = build_test_metadata();
             let table_id = test_user_table_id(43);
             let table_file = fs.create_table_file(table_id, metadata, false).unwrap();
-            let (table_file, old_root) = table_file.commit(1, false).await.unwrap();
+            let (table_file, old_root) = table_file.commit(TrxID::new(1), false).await.unwrap();
             drop(old_root);
 
             let lwc_blocks = vec![
                 LwcBlockPersist {
-                    shape: ColumnBlockEntryShape::new(0, 10, (0..10).collect(), Vec::new())
-                        .unwrap(),
+                    shape: ColumnBlockEntryShape::new(
+                        RowID::new(0),
+                        RowID::new(10),
+                        (0..10).map(RowID::new).collect(),
+                        Vec::new(),
+                    )
+                    .unwrap(),
                     buf: page_buf(b"lwc-page-1"),
                 },
                 LwcBlockPersist {
-                    shape: ColumnBlockEntryShape::new(10, 20, (10..20).collect(), Vec::new())
-                        .unwrap(),
+                    shape: ColumnBlockEntryShape::new(
+                        RowID::new(10),
+                        RowID::new(20),
+                        (10..20).map(RowID::new).collect(),
+                        Vec::new(),
+                    )
+                    .unwrap(),
                     buf: page_buf(b"lwc-page-2"),
                 },
             ];
@@ -1284,8 +1309,8 @@ mod tests {
                     disk_pool.global_pool().clone(),
                 ),
                 lwc_blocks,
-                7,
-                2,
+                TrxID::new(7),
+                TrxID::new(2),
                 disk_pool.global_pool(),
             )
             .await
@@ -1293,10 +1318,10 @@ mod tests {
             drop(old_root);
 
             let active_root = table_file.active_root_unchecked();
-            assert_eq!(active_root.root_ts, 2);
-            assert_eq!(active_root.pivot_row_id, 20);
-            assert_eq!(active_root.heap_redo_start_ts, 7);
-            assert_eq!(active_root.deletion_cutoff_ts, 1);
+            assert_eq!(active_root.root_ts, TrxID::new(2));
+            assert_eq!(active_root.pivot_row_id, RowID::new(20));
+            assert_eq!(active_root.heap_redo_start_ts, TrxID::new(7));
+            assert_eq!(active_root.deletion_cutoff_ts, TrxID::new(1));
             assert_ne!(active_root.column_block_index_root, SUPER_BLOCK_ID);
             let disk_pool = table_readonly_pool(&global, table_id, &table_file);
             let disk_pool_guard = disk_pool.pool_guard();
@@ -1309,8 +1334,16 @@ mod tests {
                 disk_pool.global_pool(),
                 &disk_pool_guard,
             );
-            let entry1 = column_index.locate_block(0).await.unwrap().unwrap();
-            let entry2 = column_index.locate_block(15).await.unwrap().unwrap();
+            let entry1 = column_index
+                .locate_block(RowID::new(0))
+                .await
+                .unwrap()
+                .unwrap();
+            let entry2 = column_index
+                .locate_block(RowID::new(15))
+                .await
+                .unwrap()
+                .unwrap();
             let page1 = read_page_for_test(&table_file, entry1.block_id())
                 .await
                 .unwrap();
@@ -1333,18 +1366,28 @@ mod tests {
             let metadata = build_test_metadata();
             let table_id = test_user_table_id(44);
             let table_file = fs.create_table_file(table_id, metadata, false).unwrap();
-            let (table_file, old_root) = table_file.commit(1, false).await.unwrap();
+            let (table_file, old_root) = table_file.commit(TrxID::new(1), false).await.unwrap();
             drop(old_root);
 
             let lwc_blocks = vec![
                 LwcBlockPersist {
-                    shape: ColumnBlockEntryShape::new(0, 10, (0..10).collect(), Vec::new())
-                        .unwrap(),
+                    shape: ColumnBlockEntryShape::new(
+                        RowID::new(0),
+                        RowID::new(10),
+                        (0..10).map(RowID::new).collect(),
+                        Vec::new(),
+                    )
+                    .unwrap(),
                     buf: page_buf(b"lwc-overlap-1"),
                 },
                 LwcBlockPersist {
-                    shape: ColumnBlockEntryShape::new(5, 15, (5..15).collect(), Vec::new())
-                        .unwrap(),
+                    shape: ColumnBlockEntryShape::new(
+                        RowID::new(5),
+                        RowID::new(15),
+                        (5..15).map(RowID::new).collect(),
+                        Vec::new(),
+                    )
+                    .unwrap(),
                     buf: page_buf(b"lwc-overlap-2"),
                 },
             ];
@@ -1358,8 +1401,8 @@ mod tests {
                     disk_pool.global_pool().clone(),
                 ),
                 lwc_blocks,
-                7,
-                2,
+                TrxID::new(7),
+                TrxID::new(2),
                 disk_pool.global_pool(),
             )
             .await;
@@ -1373,9 +1416,9 @@ mod tests {
                         == Some(crate::error::InternalError::ColumnBlockIndexInvariant)
             }));
             let active_root = table_file.active_root_unchecked();
-            assert_eq!(active_root.pivot_row_id, 0);
+            assert_eq!(active_root.pivot_row_id, RowID::new(0));
             assert_eq!(active_root.column_block_index_root, SUPER_BLOCK_ID);
-            assert_eq!(active_root.deletion_cutoff_ts, 1);
+            assert_eq!(active_root.deletion_cutoff_ts, TrxID::new(1));
 
             drop(table_file);
             drop(fs);
@@ -1391,7 +1434,7 @@ mod tests {
             let metadata = build_test_metadata();
             let table_id = test_user_table_id(45);
             let table_file = fs.create_table_file(table_id, metadata, false).unwrap();
-            let (table_file, old_root) = table_file.commit(1, false).await.unwrap();
+            let (table_file, old_root) = table_file.commit(TrxID::new(1), false).await.unwrap();
             drop(old_root);
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
             let disk_pool = table_readonly_pool(&global, table_id, &table_file);
@@ -1417,7 +1460,7 @@ mod tests {
             let metadata = build_test_metadata();
             let table_id = test_user_table_id(46);
             let table_file = fs.create_table_file(table_id, metadata, false).unwrap();
-            let (table_file, old_root) = table_file.commit(1, false).await.unwrap();
+            let (table_file, old_root) = table_file.commit(TrxID::new(1), false).await.unwrap();
             drop(old_root);
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
             let disk_pool = table_readonly_pool(&global, table_id, &table_file);

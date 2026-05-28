@@ -7,7 +7,8 @@ use crate::file::SparseFile;
 use crate::file::block_integrity::{
     BLOCK_INTEGRITY_HEADER_SIZE, LWC_BLOCK_SPEC, max_payload_len, validate_block,
 };
-use crate::file::cow_file::{BlockID, COW_FILE_PAGE_SIZE};
+use crate::file::cow_file::COW_FILE_PAGE_SIZE;
+use crate::id::BlockID;
 use crate::layout;
 use crate::lwc::{LwcData, LwcNullBitmap};
 use crate::quiescent::QuiescentGuard;
@@ -562,25 +563,27 @@ mod tests {
         BLOCK_INTEGRITY_HEADER_SIZE, write_block_checksum, write_block_header,
     };
     use crate::file::test_block_id;
+    use crate::id::RowID;
     use crate::index::ColumnBlockEntryShape;
     use crate::io::DirectBuf;
     use crate::lwc::{LwcBuilder, LwcCode, LwcPrimitiveSer};
     use crate::row::{InsertRow, RowPage};
     use crate::value::Val;
 
-    fn row_shape_fingerprint_for(row_ids: &[u64]) -> u128 {
-        let start_row_id = *row_ids.first().unwrap();
-        let end_row_id = row_ids.last().unwrap().saturating_add(1);
-        ColumnBlockEntryShape::new(start_row_id, end_row_id, row_ids.to_vec(), Vec::new())
-            .unwrap()
-            .row_shape_fingerprint()
+    fn row_shape_fingerprint_for(row_ids: &[RowID]) -> u128 {
+        let start_row_id = row_ids.first().unwrap().as_u64();
+        let end_row_id = row_ids.last().unwrap().as_u64().saturating_add(1);
+        ColumnBlockEntryShape::new(
+            RowID::new(start_row_id),
+            RowID::new(end_row_id),
+            row_ids.to_vec(),
+            Vec::new(),
+        )
+        .unwrap()
+        .row_shape_fingerprint()
     }
 
-    fn assert_lwc_data_integrity(
-        err: Error,
-        block_id: crate::file::cow_file::BlockID,
-        expected: DataIntegrityError,
-    ) {
+    fn assert_lwc_data_integrity(err: Error, block_id: BlockID, expected: DataIntegrityError) {
         assert_eq!(err.data_integrity_error(), Some(expected));
         let report = format!("{err:?}");
         assert!(report.contains("table-file"), "{report}");
@@ -610,7 +613,7 @@ mod tests {
         )
         .expect("valid table metadata");
         let mut page = RowPage::new_test_page();
-        page.init(100, 8, metadata.col.as_ref());
+        page.init(RowID::new(100), 8, metadata.col.as_ref());
         assert!(matches!(
             page.insert(metadata.col.as_ref(), &[Val::U8(10), Val::I16(20)]),
             InsertRow::Ok(_)
@@ -783,7 +786,7 @@ mod tests {
         assert_eq!(vals, vec![Val::Null, Val::U8(11)]);
         assert_eq!(
             page.row_shape_fingerprint(),
-            row_shape_fingerprint_for(&[100, 101, 102])
+            row_shape_fingerprint_for(&[RowID::new(100), RowID::new(101), RowID::new(102)])
         );
     }
 

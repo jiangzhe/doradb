@@ -1,13 +1,12 @@
-use crate::buffer::PageID;
 use crate::buffer::PoolGuards;
 use crate::error::{DataIntegrityError, RecoveryDuplicateKey, Result};
+use crate::id::{PageID, RowID, TrxID};
 use crate::index::IndexInsert;
 use crate::index::{NonUniqueIndex, UniqueIndex};
+use crate::row::RowRead;
 use crate::row::ops::{ReadRow, UpdateCol};
-use crate::row::{RowID, RowRead};
 use crate::table::{DeletionError, Table};
 use crate::trx::MIN_SNAPSHOT_TS;
-use crate::trx::TrxID;
 use crate::trx::row::ReadAllRows;
 use crate::value::Val;
 use error_stack::Report;
@@ -172,6 +171,7 @@ pub(super) fn ensure_recovery_index_insert(index_no: usize, res: IndexInsert) ->
 #[cfg(test)]
 mod tests {
     use super::ensure_recovery_index_insert;
+    use crate::id::RowID;
     use crate::index::IndexInsert;
 
     #[test]
@@ -182,13 +182,13 @@ mod tests {
 
     #[test]
     fn test_ensure_recovery_index_insert_rejects_duplicate_key() {
-        let err =
-            ensure_recovery_index_insert(3, IndexInsert::DuplicateKey(42, false)).unwrap_err();
+        let err = ensure_recovery_index_insert(3, IndexInsert::DuplicateKey(RowID::new(42), false))
+            .unwrap_err();
         let duplicate = err
             .downcast_ref::<crate::error::RecoveryDuplicateKey>()
             .unwrap_or_else(|| panic!("unexpected error: {err:?}"));
         assert_eq!(duplicate.index_no, 3);
-        assert_eq!(duplicate.row_id, 42);
+        assert_eq!(duplicate.row_id, RowID::new(42));
         assert!(!duplicate.deleted);
     }
 }

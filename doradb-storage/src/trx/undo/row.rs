@@ -1,10 +1,10 @@
 use crate::buffer::PoolGuards;
 use crate::buffer::page::VersionedPageID;
-use crate::catalog::{TableCache, TableID, is_catalog_obj_id};
+use crate::catalog::{TableCache, is_catalog_obj_id};
 use crate::error::Result;
-use crate::row::RowID;
+use crate::id::{RowID, TableID, TrxID};
 use crate::row::ops::{SelectKey, UndoCol, UpdateCol};
-use crate::trx::{MIN_SNAPSHOT_TS, SharedTrxStatus, TrxID, trx_is_committed};
+use crate::trx::{MIN_SNAPSHOT_TS, SharedTrxStatus, trx_is_committed};
 use event_listener::EventListener;
 use std::fmt;
 use std::ops::{Deref, DerefMut};

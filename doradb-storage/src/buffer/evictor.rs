@@ -1,10 +1,11 @@
 use crate::buffer::arena::ArenaGuard;
 use crate::buffer::frame::FrameKind;
 use crate::buffer::guard::PageExclusiveGuard;
-use crate::buffer::page::{Page, PageID};
+use crate::buffer::page::Page;
 use crate::buffer::{EvictableBufferPool, ReadonlyBufferPool};
 use crate::component::{Component, ComponentRegistry, ShelfScope};
 use crate::error::Result;
+use crate::id::PageID;
 use crate::quiescent::{QuiescentBox, SyncQuiescentGuard};
 use crate::thread;
 use crate::{DiskPool, IndexPool, MemPool};
@@ -984,10 +985,10 @@ mod tests {
     use crate::component::{ComponentRegistry, DiskPoolConfig, IndexPoolConfig, RegistryBuilder};
     use crate::conf::{EvictableBufferPoolConfig, FileSystemConfig};
     use crate::error::FileKind;
-    use crate::file::BlockID;
     use crate::file::cow_file::{COW_FILE_PAGE_SIZE, MutableCowFile};
     use crate::file::fs::{FileSystem, FileSystemWorkers};
     use crate::file::table_file::{MutableTableFile, TableFile};
+    use crate::id::{BlockID, TableID, TrxID};
     use crate::io::{DirectBuf, IOBuf};
     use crate::quiescent::QuiescentGuard;
     use crate::table::test_user_table_id;
@@ -1317,12 +1318,12 @@ mod tests {
     async fn prepare_read_pressure(
         fs: &FileSystem,
         disk_pool: &DiskPool,
-        table_id: u64,
+        table_id: TableID,
     ) -> ReadonlyPressureFixture {
         let table_file = fs
             .create_table_file(table_id, make_metadata(), false)
             .unwrap();
-        let (table_file, old_root) = table_file.commit(1, false).await.unwrap();
+        let (table_file, old_root) = table_file.commit(TrxID::new(1), false).await.unwrap();
         drop(old_root);
 
         let capacity = disk_pool.capacity();

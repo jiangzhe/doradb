@@ -13,10 +13,10 @@ pub(crate) use self::fs::tests::{build_test_fs, build_test_fs_in};
 pub(crate) use self::tests::{
     FileSyncOp, FileSyncTestHook, set_file_sync_test_hook, test_block_id, test_file_id,
 };
+use crate::id::{BlockID, FileID};
 
 use crate::buffer::{ReadSubmission, ReadonlyWriteLease};
 use crate::catalog::USER_OBJ_ID_START;
-use crate::compression::BitPackable;
 use crate::error::{
     CompletionErrorKind, ConfigError, Error, IoError, ResourceError, Result, StorageOp,
 };
@@ -26,7 +26,6 @@ use crate::io::{
     Completion, IOClient, IOKind, IOQueue, IOSubmission, Operation, STORAGE_SECTOR_SIZE,
     StdIoResult, align_to_sector_size,
 };
-use crate::serde::{Deser, Ser, Serde};
 use error_stack::Report;
 use libc::{
     O_CREAT, O_DIRECT, O_EXCL, O_RDWR, O_TRUNC, close, fdatasync, fstat, fsync, ftruncate, open,
@@ -36,384 +35,25 @@ use parking_lot::RawMutex;
 use parking_lot::lock_api::RawMutex as RawMutexAPI;
 use scopeguard::defer;
 use std::ffi::CString;
-use std::fmt;
 use std::io;
 use std::mem::MaybeUninit;
 use std::ops::Deref;
-use std::ops::{Add, AddAssign, Sub, SubAssign};
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use zerocopy_derive::{FromBytes, Immutable, IntoBytes, KnownLayout};
-
-/// Physical file identity used by persisted-block mappings and shared-storage routing.
-#[repr(transparent)]
-#[derive(
-    Debug,
-    Default,
-    Clone,
-    Copy,
-    PartialEq,
-    Eq,
-    PartialOrd,
-    Ord,
-    Hash,
-    FromBytes,
-    IntoBytes,
-    KnownLayout,
-    Immutable,
-)]
-pub(crate) struct FileID(u64);
-
-impl FileID {
-    pub(crate) const MAX: Self = Self(u64::MAX);
-
-    #[inline]
-    pub(crate) const fn new(raw: u64) -> Self {
-        Self(raw)
-    }
-
-    #[inline]
-    pub(crate) const fn as_usize(self) -> usize {
-        self.0 as usize
-    }
-}
-
-impl From<u64> for FileID {
-    #[inline]
-    fn from(value: u64) -> Self {
-        Self(value)
-    }
-}
-
-impl From<u32> for FileID {
-    #[inline]
-    fn from(value: u32) -> Self {
-        Self(value as u64)
-    }
-}
-
-impl From<usize> for FileID {
-    #[inline]
-    fn from(value: usize) -> Self {
-        Self(value as u64)
-    }
-}
-
-impl From<FileID> for u64 {
-    #[inline]
-    fn from(value: FileID) -> Self {
-        value.0
-    }
-}
-
-impl From<FileID> for usize {
-    #[inline]
-    fn from(value: FileID) -> Self {
-        value.as_usize()
-    }
-}
-
-impl PartialEq<u64> for FileID {
-    #[inline]
-    fn eq(&self, other: &u64) -> bool {
-        self.0 == *other
-    }
-}
-
-impl PartialEq<i32> for FileID {
-    #[inline]
-    fn eq(&self, other: &i32) -> bool {
-        *other >= 0 && self.0 == *other as u64
-    }
-}
-
-impl PartialEq<FileID> for u64 {
-    #[inline]
-    fn eq(&self, other: &FileID) -> bool {
-        *self == other.0
-    }
-}
-
-impl PartialEq<FileID> for i32 {
-    #[inline]
-    fn eq(&self, other: &FileID) -> bool {
-        *self >= 0 && *self as u64 == other.0
-    }
-}
-
-impl fmt::Display for FileID {
-    #[inline]
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.0.fmt(f)
-    }
-}
-
-impl Ser<'_> for FileID {
-    #[inline]
-    fn ser_len(&self) -> usize {
-        std::mem::size_of::<u64>()
-    }
-
-    #[inline]
-    fn ser<S: Serde + ?Sized>(&self, out: &mut S, start_idx: usize) -> usize {
-        out.ser_u64(start_idx, self.0)
-    }
-}
-
-impl Deser for FileID {
-    #[inline]
-    fn deser<S: Serde + ?Sized>(input: &S, start_idx: usize) -> Result<(usize, Self)> {
-        input
-            .deser_u64(start_idx)
-            .map(|(idx, raw)| (idx, Self(raw)))
-    }
-}
-
-impl BitPackable for FileID {
-    const ZERO: Self = Self(0);
-
-    #[inline]
-    fn sub_to_u64(self, min: Self) -> u64 {
-        self.0.wrapping_sub(min.0)
-    }
-
-    #[inline]
-    fn sub_to_u32(self, min: Self) -> u32 {
-        self.0.wrapping_sub(min.0) as u32
-    }
-
-    #[inline]
-    fn add_from_u32(self, delta: u32) -> Self {
-        Self(self.0.wrapping_add(delta as u64))
-    }
-
-    #[inline]
-    fn sub_to_u16(self, min: Self) -> u16 {
-        self.0.wrapping_sub(min.0) as u16
-    }
-
-    #[inline]
-    fn add_from_u16(self, delta: u16) -> Self {
-        Self(self.0.wrapping_add(delta as u64))
-    }
-
-    #[inline]
-    fn sub_to_u8(self, min: Self) -> u8 {
-        self.0.wrapping_sub(min.0) as u8
-    }
-
-    #[inline]
-    fn add_from_u8(self, delta: u8) -> Self {
-        Self(self.0.wrapping_add(delta as u64))
-    }
-}
 
 /// Sentinel persisted-file identity used by files that never participate in
 /// persisted-block cache identity or shared-storage worker routing.
 pub(crate) const UNTRACKED_FILE_ID: FileID = FileID::MAX;
 
 /// Reserved persisted-file identity of the shared index-pool swap file.
-pub(crate) const INDEX_POOL_SWAP_FILE_ID: FileID = FileID::new(USER_OBJ_ID_START - 3);
+pub(crate) const INDEX_POOL_SWAP_FILE_ID: FileID = FileID::new(USER_OBJ_ID_START.as_u64() - 3);
 
 /// Reserved persisted-file identity of the shared mem-pool swap file.
-pub(crate) const MEM_POOL_SWAP_FILE_ID: FileID = FileID::new(USER_OBJ_ID_START - 2);
+pub(crate) const MEM_POOL_SWAP_FILE_ID: FileID = FileID::new(USER_OBJ_ID_START.as_u64() - 2);
 
 /// Reserved persisted-file identity of `catalog.mtb`.
-pub(crate) const CATALOG_MTB_FILE_ID: FileID = FileID::new(USER_OBJ_ID_START - 1);
-
-/// Persisted fixed-size file block identity.
-///
-/// This id is reserved for physical blocks stored in copy-on-write files and
-/// readonly-cache lookups. Runtime buffer-managed pages use
-/// `crate::buffer::PageID` instead.
-#[repr(transparent)]
-#[derive(
-    Debug,
-    Default,
-    Clone,
-    Copy,
-    PartialEq,
-    Eq,
-    PartialOrd,
-    Ord,
-    Hash,
-    FromBytes,
-    IntoBytes,
-    KnownLayout,
-    Immutable,
-)]
-pub(crate) struct BlockID(u64);
-
-impl BlockID {
-    #[inline]
-    pub(crate) const fn new(raw: u64) -> Self {
-        Self(raw)
-    }
-
-    #[inline]
-    pub(crate) const fn as_u64(self) -> u64 {
-        self.0
-    }
-
-    #[inline]
-    pub(crate) const fn as_usize(self) -> usize {
-        self.0 as usize
-    }
-
-    #[inline]
-    pub(crate) const fn to_le_bytes(self) -> [u8; std::mem::size_of::<u64>()] {
-        self.0.to_le_bytes()
-    }
-}
-
-impl From<u64> for BlockID {
-    #[inline]
-    fn from(value: u64) -> Self {
-        Self(value)
-    }
-}
-
-impl From<u32> for BlockID {
-    #[inline]
-    fn from(value: u32) -> Self {
-        Self(value as u64)
-    }
-}
-
-impl From<usize> for BlockID {
-    #[inline]
-    fn from(value: usize) -> Self {
-        Self(value as u64)
-    }
-}
-
-impl From<BlockID> for u64 {
-    #[inline]
-    fn from(value: BlockID) -> Self {
-        value.0
-    }
-}
-
-impl From<BlockID> for usize {
-    #[inline]
-    fn from(value: BlockID) -> Self {
-        value.as_usize()
-    }
-}
-
-impl Add<u64> for BlockID {
-    type Output = Self;
-
-    #[inline]
-    fn add(self, rhs: u64) -> Self::Output {
-        Self(self.0 + rhs)
-    }
-}
-
-impl AddAssign<u64> for BlockID {
-    #[inline]
-    fn add_assign(&mut self, rhs: u64) {
-        self.0 += rhs;
-    }
-}
-
-impl Sub<u64> for BlockID {
-    type Output = Self;
-
-    #[inline]
-    fn sub(self, rhs: u64) -> Self::Output {
-        Self(self.0 - rhs)
-    }
-}
-
-impl SubAssign<u64> for BlockID {
-    #[inline]
-    fn sub_assign(&mut self, rhs: u64) {
-        self.0 -= rhs;
-    }
-}
-
-impl fmt::Display for BlockID {
-    #[inline]
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.0.fmt(f)
-    }
-}
-
-impl PartialEq<i32> for BlockID {
-    #[inline]
-    fn eq(&self, other: &i32) -> bool {
-        *other >= 0 && self.0 == *other as u64
-    }
-}
-
-impl PartialEq<BlockID> for i32 {
-    #[inline]
-    fn eq(&self, other: &BlockID) -> bool {
-        *self >= 0 && *self as u64 == other.0
-    }
-}
-
-impl Ser<'_> for BlockID {
-    #[inline]
-    fn ser_len(&self) -> usize {
-        std::mem::size_of::<u64>()
-    }
-
-    #[inline]
-    fn ser<S: Serde + ?Sized>(&self, out: &mut S, start_idx: usize) -> usize {
-        out.ser_u64(start_idx, self.0)
-    }
-}
-
-impl Deser for BlockID {
-    #[inline]
-    fn deser<S: Serde + ?Sized>(input: &S, start_idx: usize) -> Result<(usize, Self)> {
-        input
-            .deser_u64(start_idx)
-            .map(|(idx, raw)| (idx, Self(raw)))
-    }
-}
-
-impl BitPackable for BlockID {
-    const ZERO: Self = Self(0);
-
-    #[inline]
-    fn sub_to_u64(self, min: Self) -> u64 {
-        self.0.wrapping_sub(min.0)
-    }
-
-    #[inline]
-    fn sub_to_u32(self, min: Self) -> u32 {
-        self.0.wrapping_sub(min.0) as u32
-    }
-
-    #[inline]
-    fn add_from_u32(self, delta: u32) -> Self {
-        Self(self.0.wrapping_add(delta as u64))
-    }
-
-    #[inline]
-    fn sub_to_u16(self, min: Self) -> u16 {
-        self.0.wrapping_sub(min.0) as u16
-    }
-
-    #[inline]
-    fn add_from_u16(self, delta: u16) -> Self {
-        Self(self.0.wrapping_add(delta as u64))
-    }
-
-    #[inline]
-    fn sub_to_u8(self, min: Self) -> u8 {
-        self.0.wrapping_sub(min.0) as u8
-    }
-
-    #[inline]
-    fn add_from_u8(self, delta: u8) -> Self {
-        Self(self.0.wrapping_add(delta as u64))
-    }
-}
+pub(crate) const CATALOG_MTB_FILE_ID: FileID = FileID::new(USER_OBJ_ID_START.as_u64() - 1);
 
 /// Physical persisted-block identity for cache lookup and shared-storage IO.
 ///
@@ -1014,6 +654,7 @@ mod tests {
     use crate::compression::BitPackable;
     use crate::file::fs::tests::{TestFileSystem, build_test_fs};
     use crate::file::table_file::TableFile;
+    use crate::id::TrxID;
     use crate::serde::{Deser, Ser};
     use crate::value::ValKind;
     use std::io::ErrorKind as IoErrorKind;
@@ -1050,7 +691,7 @@ mod tests {
         let mutable = fs
             .create_table_file(USER_OBJ_ID_START + 801, build_test_metadata(), false)
             .unwrap();
-        let (table_file, old_root) = mutable.commit(1, false).await.unwrap();
+        let (table_file, old_root) = mutable.commit(TrxID::new(1), false).await.unwrap();
         drop(old_root);
         (temp_dir, fs, table_file)
     }

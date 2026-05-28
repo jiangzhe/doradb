@@ -1,10 +1,10 @@
 use crate::catalog::storage::tables::TABLE_ID_TABLES;
 use crate::catalog::{
-    Catalog, IndexDdlKind, IndexDdlRootProof, TableID, classify_index_ddl_root, is_catalog_obj_id,
+    Catalog, IndexDdlKind, IndexDdlRootProof, classify_index_ddl_root, is_catalog_obj_id,
     is_user_obj_id,
 };
 use crate::error::{ErrorKind, FatalError, Result};
-use crate::trx::TrxID;
+use crate::id::{TableID, TrxID};
 use crate::trx::log::{LogPartitionInitializer, list_log_files};
 use crate::trx::log_replay::LogMerger;
 use crate::trx::redo::{DDLRedo, RowRedoKind, TableDML};
@@ -498,7 +498,9 @@ fn drop_table_has_catalog_table_delete(
         };
         key.index_no == 0
             && key.vals.len() == 1
-            && key.vals[0].as_u64().is_some_and(|id| id == table_id)
+            && key.vals[0]
+                .as_u64()
+                .is_some_and(|id| id == table_id.as_u64())
     })
 }
 

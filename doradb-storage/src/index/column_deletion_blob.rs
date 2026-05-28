@@ -5,7 +5,8 @@ use crate::file::block_integrity::{
     BLOCK_INTEGRITY_HEADER_SIZE, COLUMN_DELETION_BLOB_BLOCK_SPEC, max_payload_len, validate_block,
     write_block_checksum, write_block_header,
 };
-use crate::file::cow_file::{BlockID, COW_FILE_PAGE_SIZE, MutableCowFile, SUPER_BLOCK_ID};
+use crate::file::cow_file::{COW_FILE_PAGE_SIZE, MutableCowFile, SUPER_BLOCK_ID};
+use crate::id::BlockID;
 use crate::io::DirectBuf;
 use crate::quiescent::QuiescentGuard;
 use error_stack::{Report, ResultExt};
@@ -624,6 +625,7 @@ mod tests {
     use crate::error::DataIntegrityError;
     use crate::file::build_test_fs;
     use crate::file::table_file::MutableTableFile;
+    use crate::id::TrxID;
     use crate::table::test_user_table_id;
     use crate::value::ValKind;
     use std::sync::Arc;
@@ -669,7 +671,7 @@ mod tests {
             let table = fs
                 .create_table_file(test_user_table_id(1), metadata(), false)
                 .unwrap();
-            let (table, old_root) = table.commit(1, false).await.unwrap();
+            let (table, old_root) = table.commit(TrxID::new(1), false).await.unwrap();
             drop(old_root);
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
             let disk_pool = table_readonly_pool(&global, test_user_table_id(1), &table);
@@ -687,7 +689,7 @@ mod tests {
                 writer.finish().await.unwrap();
                 blob_ref
             };
-            let (_table, _old_root) = mutable.commit(2, false).await.unwrap();
+            let (_table, _old_root) = mutable.commit(TrxID::new(2), false).await.unwrap();
 
             let reader = ColumnDeletionBlobReader::new(
                 disk_pool.file_kind(),
@@ -711,7 +713,7 @@ mod tests {
             let table = fs
                 .create_table_file(test_user_table_id(1), metadata(), false)
                 .unwrap();
-            let (table, old_root) = table.commit(1, false).await.unwrap();
+            let (table, old_root) = table.commit(TrxID::new(1), false).await.unwrap();
             drop(old_root);
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
             let disk_pool = table_readonly_pool(&global, test_user_table_id(1), &table);
@@ -729,7 +731,7 @@ mod tests {
                 writer.finish().await.unwrap();
                 blob_ref
             };
-            let (_table, _old_root) = mutable.commit(2, false).await.unwrap();
+            let (_table, _old_root) = mutable.commit(TrxID::new(2), false).await.unwrap();
 
             let reader = ColumnDeletionBlobReader::new(
                 disk_pool.file_kind(),
@@ -759,7 +761,7 @@ mod tests {
             let table = fs
                 .create_table_file(test_user_table_id(1), metadata(), false)
                 .unwrap();
-            let (table, old_root) = table.commit(1, false).await.unwrap();
+            let (table, old_root) = table.commit(TrxID::new(1), false).await.unwrap();
             drop(old_root);
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
             let disk_pool = table_readonly_pool(&global, test_user_table_id(1), &table);
@@ -777,7 +779,7 @@ mod tests {
                 writer.finish().await.unwrap();
                 blob_ref
             };
-            let (_table, _old_root) = mutable.commit(2, false).await.unwrap();
+            let (_table, _old_root) = mutable.commit(TrxID::new(2), false).await.unwrap();
 
             let reader = ColumnDeletionBlobReader::new(
                 disk_pool.file_kind(),
@@ -801,7 +803,7 @@ mod tests {
             let table = fs
                 .create_table_file(test_user_table_id(1), metadata(), false)
                 .unwrap();
-            let (table, old_root) = table.commit(1, false).await.unwrap();
+            let (table, old_root) = table.commit(TrxID::new(1), false).await.unwrap();
             drop(old_root);
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
             let disk_pool = table_readonly_pool(&global, test_user_table_id(1), &table);
@@ -819,7 +821,7 @@ mod tests {
                 writer.finish().await.unwrap();
                 blob_ref
             };
-            let (_table, _old_root) = mutable.commit(2, false).await.unwrap();
+            let (_table, _old_root) = mutable.commit(TrxID::new(2), false).await.unwrap();
 
             let reader = ColumnDeletionBlobReader::new(
                 disk_pool.file_kind(),
@@ -846,7 +848,7 @@ mod tests {
             let table = fs
                 .create_table_file(test_user_table_id(1), metadata(), false)
                 .unwrap();
-            let (table, old_root) = table.commit(1, false).await.unwrap();
+            let (table, old_root) = table.commit(TrxID::new(1), false).await.unwrap();
             drop(old_root);
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
             let disk_pool = table_readonly_pool(&global, test_user_table_id(1), &table);
@@ -867,7 +869,7 @@ mod tests {
                 writer.finish().await.unwrap();
                 (first_ref, second_ref)
             };
-            let (_table, _old_root) = mutable.commit(2, false).await.unwrap();
+            let (_table, _old_root) = mutable.commit(TrxID::new(2), false).await.unwrap();
 
             assert_ne!(first_ref.start_block_id, SUPER_BLOCK_ID);
             assert_eq!(first_ref.start_offset, 0);

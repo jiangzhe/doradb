@@ -9,7 +9,7 @@ use crate::buffer::guard::{
     FacadePageGuard, PageExclusiveGuard, PageGuard, PageLatchGuard, PageSharedGuard,
 };
 use crate::buffer::load::{PageReservation, PageReservationGuard};
-use crate::buffer::page::{PAGE_SIZE, Page, PageID};
+use crate::buffer::page::{PAGE_SIZE, Page};
 use crate::buffer::util::madvise_dontneed;
 use crate::buffer::{
     BufferPoolStats, BufferPoolStatsHandle, PageIOCompletion, PoolGuard, PoolIdentity, PoolRole,
@@ -20,7 +20,8 @@ use crate::error::{
     ResourceError, Result,
 };
 use crate::file::fs::FileSystem;
-use crate::file::{BlockID, BlockKey, FileID, SparseFile};
+use crate::file::{BlockKey, SparseFile};
+use crate::id::{BlockID, FileID, PageID};
 use crate::io::{IOKind, IOSubmission, Operation, StdIoResult};
 use crate::latch::LatchFallbackMode;
 use crate::quiescent::{QuiescentGuard, SyncQuiescentGuard};
@@ -1322,7 +1323,6 @@ pub(crate) mod tests {
     use super::*;
     use crate::buffer::page::Page;
     use crate::buffer::test_page_id;
-    use crate::catalog::TableID;
     use crate::catalog::{ColumnAttributes, ColumnSpec, TableMetadata, USER_OBJ_ID_START};
     use crate::conf::{EngineConfig, EvictableBufferPoolConfig, FileSystemConfig, TrxSysConfig};
     use crate::error::{CompletionErrorKind, Error, FileKind, LifecycleError, ResourceError};
@@ -1338,6 +1338,7 @@ pub(crate) mod tests {
     use crate::file::fs::tests::{TestFileSystem, build_test_fs_owner_in};
     use crate::file::table_file::{MutableTableFile, TableFile};
     use crate::file::{CATALOG_MTB_FILE_ID, test_block_id, test_file_id};
+    use crate::id::{RowID, TableID, TrxID};
     use crate::index::{
         COLUMN_BLOCK_HEADER_SIZE, COLUMN_BLOCK_NODE_PAYLOAD_SIZE,
         COLUMN_DELETION_BLOB_PAGE_HEADER_SIZE, ColumnBlockNodeHeader, validate_persisted_blob_page,
@@ -1380,7 +1381,7 @@ pub(crate) mod tests {
 
     #[inline]
     fn test_user_file_id(offset: TableID) -> FileID {
-        FileID::from(test_user_table_id(offset))
+        FileID::from(test_user_table_id(offset.as_u64()))
     }
 
     fn key_state_is_loading(pool: &ReadonlyBufferPool, key: &BlockKey) -> bool {
@@ -1569,7 +1570,7 @@ pub(crate) mod tests {
     }
 
     async fn commit_table_file(_fs: &FileSystem, table_file: MutableTableFile) -> Arc<TableFile> {
-        let (table_file, old_root) = table_file.commit(1, false).await.unwrap();
+        let (table_file, old_root) = table_file.commit(TrxID::new(1), false).await.unwrap();
         drop(old_root);
         table_file
     }
@@ -1720,7 +1721,7 @@ pub(crate) mod tests {
         let mut buf = vec![0u8; COW_FILE_PAGE_SIZE];
         let payload_start = write_block_header(&mut buf, COLUMN_BLOCK_INDEX_BLOCK_SPEC);
         let payload_end = payload_start + COLUMN_BLOCK_NODE_PAYLOAD_SIZE;
-        let header = ColumnBlockNodeHeader::new(0, 0, 0, 1);
+        let header = ColumnBlockNodeHeader::new(0, 0, RowID::new(0), TrxID::new(1));
         let header_bytes = layout::bytes_of(&header);
         buf[payload_start..payload_start + COLUMN_BLOCK_HEADER_SIZE].copy_from_slice(header_bytes);
         buf[payload_start + COLUMN_BLOCK_HEADER_SIZE..payload_end].fill(0);
@@ -2044,13 +2045,13 @@ pub(crate) mod tests {
 
             let global = owned_global_pool(frame_page_bytes(2));
             let pool = owned_readonly_pool(
-                test_user_file_id(119),
+                test_user_file_id(TableID::new(119)),
                 FileKind::TableFile,
                 Arc::clone(table_file.sparse_file()),
                 &global,
             );
             let pool_guard = pool.pool_guard();
-            let key = BlockKey::new(test_user_file_id(119), block_id);
+            let key = BlockKey::new(test_user_file_id(TableID::new(119)), block_id);
 
             let old = pool.read_block(&pool_guard, block_id).await.unwrap();
             assert_eq!(&old.page()[..15], b"old-reuse-bytes");
@@ -2083,13 +2084,13 @@ pub(crate) mod tests {
 
             let global = owned_global_pool(frame_page_bytes(2));
             let pool = owned_readonly_pool(
-                test_user_file_id(120),
+                test_user_file_id(TableID::new(120)),
                 FileKind::TableFile,
                 Arc::clone(table_file.sparse_file()),
                 &global,
             );
             let pool_guard = pool.pool_guard();
-            let key = BlockKey::new(test_user_file_id(120), block_id);
+            let key = BlockKey::new(test_user_file_id(TableID::new(120)), block_id);
             let lease = begin_write_barrier(global.guard(), key.file_id, key.block_id).unwrap();
             assert!(key_state_is_write_blocked(&global, &key));
 
@@ -2125,7 +2126,7 @@ pub(crate) mod tests {
             let global = global_readonly_pool_scope(frame_page_bytes(2));
             let disk_pool = table_readonly_pool(&global, test_user_table_id(121), &table_file);
             let pool_guard = disk_pool.pool_guard();
-            let key = BlockKey::new(test_user_file_id(121), block_id);
+            let key = BlockKey::new(test_user_file_id(TableID::new(121)), block_id);
             let write_hook = Arc::new(ControlledWriteHook::for_page(
                 table_file.sparse_file().as_raw_fd(),
                 block_id,
@@ -2176,12 +2177,12 @@ pub(crate) mod tests {
 
             let global = owned_global_pool(frame_page_bytes(2));
             let pool = owned_readonly_pool(
-                test_user_file_id(118),
+                test_user_file_id(TableID::new(118)),
                 FileKind::TableFile,
                 Arc::clone(table_file.sparse_file()),
                 &global,
             );
-            let key = BlockKey::new(test_user_file_id(118), test_block_id(14));
+            let key = BlockKey::new(test_user_file_id(TableID::new(118)), test_block_id(14));
             let inflight = Arc::new(PageIOCompletion::new());
             let task_arena = global.arena.arena_guard(global.pool_guard());
             let (frame_id, page_guard) =
@@ -2239,7 +2240,7 @@ pub(crate) mod tests {
         let global = owned_global_pool(64 * 1024 * 1024);
         let global_guard = (*global).pool_guard();
         let catalog_key = BlockKey::new(CATALOG_MTB_FILE_ID, test_block_id(42));
-        let user_key = BlockKey::new(FileID::new(USER_OBJ_ID_START), test_block_id(42));
+        let user_key = BlockKey::new(FileID::from(USER_OBJ_ID_START), test_block_id(42));
 
         let mut catalog_frame = global
             .try_lock_page_exclusive(&global_guard, test_page_id(1))
@@ -2286,7 +2287,7 @@ pub(crate) mod tests {
 
             let global = owned_global_pool(frame_page_bytes(2));
             let global_guard = (*global).pool_guard();
-            let key = BlockKey::new(test_user_file_id(111), test_block_id(9));
+            let key = BlockKey::new(test_user_file_id(TableID::new(111)), test_block_id(9));
 
             let mut g0 = global
                 .try_lock_page_exclusive(&global_guard, test_page_id(0))
@@ -2300,7 +2301,7 @@ pub(crate) mod tests {
             drop(g0);
 
             let pool = owned_readonly_pool(
-                test_user_file_id(111),
+                test_user_file_id(TableID::new(111)),
                 FileKind::TableFile,
                 Arc::clone(table_file.sparse_file()),
                 &global,
@@ -2344,7 +2345,7 @@ pub(crate) mod tests {
 
             let global = owned_global_pool(frame_page_bytes(2));
             let global_guard = (*global).pool_guard();
-            let key = BlockKey::new(test_user_file_id(123), test_block_id(12));
+            let key = BlockKey::new(test_user_file_id(TableID::new(123)), test_block_id(12));
 
             let mut g0 = global
                 .try_lock_page_exclusive(&global_guard, test_page_id(0))
@@ -2358,7 +2359,7 @@ pub(crate) mod tests {
             drop(g0);
 
             let pool = owned_readonly_pool(
-                test_user_file_id(123),
+                test_user_file_id(TableID::new(123)),
                 FileKind::TableFile,
                 Arc::clone(table_file.sparse_file()),
                 &global,
@@ -2411,7 +2412,7 @@ pub(crate) mod tests {
 
             let global = owned_global_pool(frame_page_bytes(4));
             let pool = owned_readonly_pool(
-                test_user_file_id(101),
+                test_user_file_id(TableID::new(101)),
                 FileKind::TableFile,
                 Arc::clone(table_file.sparse_file()),
                 &global,
@@ -2512,7 +2513,7 @@ pub(crate) mod tests {
 
             let global = owned_global_pool(frame_page_bytes(8));
             let pool = owned_readonly_pool(
-                test_user_file_id(102),
+                test_user_file_id(TableID::new(102)),
                 FileKind::TableFile,
                 Arc::clone(table_file.sparse_file()),
                 &global,
@@ -2557,13 +2558,13 @@ pub(crate) mod tests {
 
             let global = owned_global_pool(frame_page_bytes(2));
             let pool = owned_readonly_pool(
-                test_user_file_id(112),
+                test_user_file_id(TableID::new(112)),
                 FileKind::TableFile,
                 Arc::clone(table_file.sparse_file()),
                 &global,
             );
             let pool_guard = pool.pool_guard();
-            let key = BlockKey::new(test_user_file_id(112), test_block_id(5));
+            let key = BlockKey::new(test_user_file_id(TableID::new(112)), test_block_id(5));
 
             let pool_for_loader = (*pool).clone();
             let loader_guard = pool_guard.clone();
@@ -2618,13 +2619,13 @@ pub(crate) mod tests {
 
             let global = owned_global_pool(frame_page_bytes(2));
             let pool = owned_readonly_pool(
-                test_user_file_id(113),
+                test_user_file_id(TableID::new(113)),
                 FileKind::TableFile,
                 Arc::clone(table_file.sparse_file()),
                 &global,
             );
             let pool_guard = pool.pool_guard();
-            let key = BlockKey::new(test_user_file_id(113), test_block_id(9));
+            let key = BlockKey::new(test_user_file_id(TableID::new(113)), test_block_id(9));
 
             let pool_for_loader = (*pool).clone();
             let loader_guard = pool_guard.clone();
@@ -2671,11 +2672,11 @@ pub(crate) mod tests {
                 test_block_id(12),
             ));
             let _hook = install_storage_backend_test_hook(read_hook.clone());
-            let key = BlockKey::new(test_user_file_id(116), test_block_id(12));
+            let key = BlockKey::new(test_user_file_id(TableID::new(116)), test_block_id(12));
 
             let global = owned_global_pool(frame_page_bytes(2));
             let pool = owned_readonly_pool(
-                test_user_file_id(116),
+                test_user_file_id(TableID::new(116)),
                 FileKind::TableFile,
                 Arc::clone(table_file.sparse_file()),
                 &global,
@@ -2802,13 +2803,13 @@ pub(crate) mod tests {
 
             let global = owned_global_pool(frame_page_bytes(2));
             let pool = owned_readonly_pool(
-                test_user_file_id(114),
+                test_user_file_id(TableID::new(114)),
                 FileKind::TableFile,
                 Arc::clone(table_file.sparse_file()),
                 &global,
             );
             let pool_guard = pool.pool_guard();
-            let key = BlockKey::new(test_user_file_id(114), test_block_id(7));
+            let key = BlockKey::new(test_user_file_id(TableID::new(114)), test_block_id(7));
 
             let pool_1 = (*pool).clone();
             let waiter1_guard = pool_guard.clone();
@@ -2864,13 +2865,13 @@ pub(crate) mod tests {
 
             let global = owned_global_pool(frame_page_bytes(2));
             let pool = owned_readonly_pool(
-                test_user_file_id(115),
+                test_user_file_id(TableID::new(115)),
                 FileKind::TableFile,
                 Arc::clone(table_file.sparse_file()),
                 &global,
             );
             let pool_guard = pool.pool_guard();
-            let key = BlockKey::new(test_user_file_id(115), test_block_id(8));
+            let key = BlockKey::new(test_user_file_id(TableID::new(115)), test_block_id(8));
 
             let pool_1 = (*pool).clone();
             let waiter1_guard = pool_guard.clone();
@@ -2934,13 +2935,13 @@ pub(crate) mod tests {
 
             let global = owned_global_pool(frame_page_bytes(4));
             let pool = owned_readonly_pool(
-                test_user_file_id(107),
+                test_user_file_id(TableID::new(107)),
                 FileKind::TableFile,
                 Arc::clone(table_file.sparse_file()),
                 &global,
             );
             let pool_guard = pool.pool_guard();
-            let key = BlockKey::new(test_user_file_id(107), test_block_id(9));
+            let key = BlockKey::new(test_user_file_id(TableID::new(107)), test_block_id(9));
 
             let err = match pool
                 .read_validated_block(&pool_guard, test_block_id(9), validate_persisted_lwc_block)
@@ -2979,13 +2980,13 @@ pub(crate) mod tests {
 
             let global = owned_global_pool(frame_page_bytes(4));
             let pool = owned_readonly_pool(
-                test_user_file_id(116),
+                test_user_file_id(TableID::new(116)),
                 FileKind::TableFile,
                 Arc::clone(table_file.sparse_file()),
                 &global,
             );
             let pool_guard = pool.pool_guard();
-            let key = BlockKey::new(test_user_file_id(116), test_block_id(10));
+            let key = BlockKey::new(test_user_file_id(TableID::new(116)), test_block_id(10));
 
             let err = match pool
                 .read_validated_block(&pool_guard, test_block_id(10), validate_persisted_lwc_block)
@@ -3016,13 +3017,13 @@ pub(crate) mod tests {
 
             let global = owned_global_pool(frame_page_bytes(4));
             let pool = owned_readonly_pool(
-                test_user_file_id(108),
+                test_user_file_id(TableID::new(108)),
                 FileKind::TableFile,
                 Arc::clone(table_file.sparse_file()),
                 &global,
             );
             let pool_guard = pool.pool_guard();
-            let key = BlockKey::new(test_user_file_id(108), test_block_id(10));
+            let key = BlockKey::new(test_user_file_id(TableID::new(108)), test_block_id(10));
 
             let err = match pool
                 .read_validated_block(
@@ -3057,13 +3058,13 @@ pub(crate) mod tests {
 
             let global = owned_global_pool(frame_page_bytes(4));
             let pool = owned_readonly_pool(
-                test_user_file_id(109),
+                test_user_file_id(TableID::new(109)),
                 FileKind::TableFile,
                 Arc::clone(table_file.sparse_file()),
                 &global,
             );
             let pool_guard = pool.pool_guard();
-            let key = BlockKey::new(test_user_file_id(109), test_block_id(11));
+            let key = BlockKey::new(test_user_file_id(TableID::new(109)), test_block_id(11));
 
             let err = match pool
                 .read_validated_block(&pool_guard, test_block_id(11), validate_persisted_blob_page)
@@ -3146,7 +3147,7 @@ pub(crate) mod tests {
             let mapped_count = (0..=capacity)
                 .filter(|i| {
                     let key = BlockKey::new(
-                        test_user_file_id(103),
+                        test_user_file_id(TableID::new(103)),
                         BlockID::from(base_page_id + *i as u64),
                     );
                     engine.disk_pool.try_get_frame_id(&key).is_some()
@@ -3185,7 +3186,7 @@ pub(crate) mod tests {
             write_payload(&fs, &table_file, test_block_id(9), b"drop-order").await;
 
             let pool = owned_readonly_pool(
-                test_user_file_id(105),
+                test_user_file_id(TableID::new(105)),
                 FileKind::TableFile,
                 Arc::clone(table_file.sparse_file()),
                 &global,
@@ -3214,7 +3215,7 @@ pub(crate) mod tests {
 
             let global = owned_global_pool(64 * 1024 * 1024);
             let pool = owned_readonly_pool(
-                test_user_file_id(104),
+                test_user_file_id(TableID::new(104)),
                 FileKind::TableFile,
                 Arc::clone(table_file.sparse_file()),
                 &global,

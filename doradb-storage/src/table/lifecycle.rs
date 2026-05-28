@@ -1,5 +1,5 @@
-use crate::catalog::TableID;
 use crate::error::{Error, InternalError, OperationError, Result};
+use crate::id::TableID;
 use error_stack::Report;
 use event_listener::{Event, listener};
 use parking_lot::Mutex;
@@ -598,7 +598,7 @@ fn begin_drop_metadata_active_err(table_id: TableID) -> Error {
 mod tests {
     use super::*;
 
-    const TABLE_ID: TableID = 42;
+    const TABLE_ID: TableID = TableID::new(42);
 
     #[test]
     fn test_lifecycle_foreground_errors_for_terminal_states() {

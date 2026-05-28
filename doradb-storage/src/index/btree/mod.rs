@@ -5,7 +5,6 @@ mod node;
 mod scan;
 mod value;
 
-use crate::buffer::PageID;
 use crate::buffer::guard::{
     ExclusiveLockStrategy, FacadePageGuard, LockStrategy, OptimisticLockStrategy,
     PageExclusiveGuard, PageGuard, PageOptimisticGuard, PageSharedGuard, SharedLockStrategy,
@@ -14,6 +13,7 @@ use crate::buffer::{BufferPool, FixedBufferPool, PoolGuard};
 use crate::error::Validation;
 use crate::error::Validation::{Invalid, Valid};
 use crate::error::{ConfigError, Result};
+use crate::id::{PageID, TrxID};
 use crate::index::btree::algo::{
     KnownFenceNodeParams, MemTreeSiblingMergePlan, NodeSlotRange, pack_node_range_box,
     pack_node_range_into, pack_node_ranges_box, plan_memtree_sibling_merge,
@@ -21,7 +21,6 @@ use crate::index::btree::algo::{
 use crate::index::util::{Maskable, ParentPosition, SpaceStatistics};
 use crate::latch::LatchFallbackMode;
 use crate::quiescent::QuiescentGuard;
-use crate::trx::TrxID;
 use either::Either;
 use error_stack::Report;
 use std::marker::PhantomData;
@@ -2026,7 +2025,7 @@ mod tests {
     async fn run_lookup_against_map(hints_enabled: bool) {
         let pool = owned_index_pool(64 * 1024 * 1024);
         let pool_guard = (*pool).pool_guard();
-        let tree = BTree::new(pool.guard(), &pool_guard, hints_enabled, 200)
+        let tree = BTree::new(pool.guard(), &pool_guard, hints_enabled, TrxID::new(200))
             .await
             .expect("test btree construction should succeed");
         let mut map = BTreeMap::new();
@@ -2041,7 +2040,7 @@ mod tests {
                     &k.to_be_bytes(),
                     BTreeU64::from(i as u64),
                     false,
-                    201,
+                    TrxID::new(201),
                 )
                 .await
                 .unwrap();
@@ -2064,7 +2063,7 @@ mod tests {
         pool: QuiescentGuard<FixedBufferPool>,
         pool_guard: &PoolGuard,
     ) -> ExactBoundaryResumeFixture {
-        let tree = BTree::new(pool, pool_guard, false, 200)
+        let tree = BTree::new(pool, pool_guard, false, TrxID::new(200))
             .await
             .expect("test btree construction should succeed");
 
@@ -2074,7 +2073,14 @@ mod tests {
             .expect("test node allocation should succeed");
         let left_leaf_page_id = left_leaf_guard.page_id();
         let left_leaf = left_leaf_guard.page_mut();
-        left_leaf.init(0, 200, &[], BTreeU64::INVALID_VALUE, b"ab", false);
+        left_leaf.init(
+            0,
+            TrxID::new(200),
+            &[],
+            BTreeU64::INVALID_VALUE,
+            b"ab",
+            false,
+        );
         left_leaf.insert(b"aa", BTreeU64::from(1));
         drop(left_leaf_guard);
 
@@ -2084,7 +2090,14 @@ mod tests {
             .expect("test node allocation should succeed");
         let first_right_leaf_page_id = first_right_leaf_guard.page_id();
         let first_right_leaf = first_right_leaf_guard.page_mut();
-        first_right_leaf.init(0, 200, b"ab", BTreeU64::INVALID_VALUE, b"ab\0", false);
+        first_right_leaf.init(
+            0,
+            TrxID::new(200),
+            b"ab",
+            BTreeU64::INVALID_VALUE,
+            b"ab\0",
+            false,
+        );
         first_right_leaf.insert(b"ab", BTreeU64::from(2));
         drop(first_right_leaf_guard);
 
@@ -2094,7 +2107,14 @@ mod tests {
             .expect("test node allocation should succeed");
         let second_right_leaf_page_id = second_right_leaf_guard.page_id();
         let second_right_leaf = second_right_leaf_guard.page_mut();
-        second_right_leaf.init(0, 200, b"ab\0", BTreeU64::INVALID_VALUE, &[], false);
+        second_right_leaf.init(
+            0,
+            TrxID::new(200),
+            b"ab\0",
+            BTreeU64::INVALID_VALUE,
+            &[],
+            false,
+        );
         second_right_leaf.insert(b"ab\0", BTreeU64::from(3));
         drop(second_right_leaf_guard);
 
@@ -2104,7 +2124,14 @@ mod tests {
             .expect("test node allocation should succeed");
         let left_branch_page_id = left_branch_guard.page_id();
         let left_branch = left_branch_guard.page_mut();
-        left_branch.init(1, 200, &[], BTreeU64::from(left_leaf_page_id), b"ab", false);
+        left_branch.init(
+            1,
+            TrxID::new(200),
+            &[],
+            BTreeU64::from(left_leaf_page_id),
+            b"ab",
+            false,
+        );
         drop(left_branch_guard);
 
         let mut right_branch_guard = tree
@@ -2113,7 +2140,14 @@ mod tests {
             .expect("test node allocation should succeed");
         let right_branch_page_id = right_branch_guard.page_id();
         let right_branch = right_branch_guard.page_mut();
-        right_branch.init(1, 200, b"ab", BTreeU64::INVALID_VALUE, &[], false);
+        right_branch.init(
+            1,
+            TrxID::new(200),
+            b"ab",
+            BTreeU64::INVALID_VALUE,
+            &[],
+            false,
+        );
         right_branch.insert(b"ab", BTreeU64::from(first_right_leaf_page_id));
         right_branch.insert(b"ab\0", BTreeU64::from(second_right_leaf_page_id));
         drop(right_branch_guard);
@@ -2126,7 +2160,14 @@ mod tests {
             .await
             .unwrap();
         let root = root_guard.page_mut();
-        root.init(2, 200, &[], BTreeU64::from(left_branch_page_id), &[], false);
+        root.init(
+            2,
+            TrxID::new(200),
+            &[],
+            BTreeU64::from(left_branch_page_id),
+            &[],
+            false,
+        );
         root.insert(b"ab", BTreeU64::from(right_branch_page_id));
         drop(root_guard);
 
@@ -2147,20 +2188,38 @@ mod tests {
         smol::block_on(async {
             let pool = owned_index_pool(64 * 1024 * 1024);
             let pool_guard = (*pool).pool_guard();
-            let tree = BTree::new(pool.guard(), &pool_guard, false, 200)
+            let tree = BTree::new(pool.guard(), &pool_guard, false, TrxID::new(200))
                 .await
                 .expect("test btree construction should succeed");
 
-            let mut p_node =
-                BTreeNodeBox::alloc(2, 100, b"aa00", BTreeU64::from(10), b"zzzz", false);
+            let mut p_node = BTreeNodeBox::alloc(
+                2,
+                TrxID::new(100),
+                b"aa00",
+                BTreeU64::from(10),
+                b"zzzz",
+                false,
+            );
             p_node.insert(b"mm00", BTreeU64::from(20));
 
-            let mut l_node =
-                BTreeNodeBox::alloc(1, 101, b"aa00", BTreeU64::from(100), b"mm00", false);
+            let mut l_node = BTreeNodeBox::alloc(
+                1,
+                TrxID::new(101),
+                b"aa00",
+                BTreeU64::from(100),
+                b"mm00",
+                false,
+            );
             l_node.insert(b"bb00", BTreeU64::from(101));
 
-            let mut r_node =
-                BTreeNodeBox::alloc(1, 102, b"mm00", BTreeU64::INVALID_VALUE, b"zzzz", false);
+            let mut r_node = BTreeNodeBox::alloc(
+                1,
+                TrxID::new(102),
+                b"mm00",
+                BTreeU64::INVALID_VALUE,
+                b"zzzz",
+                false,
+            );
             r_node.insert(b"mm00", BTreeU64::from(200));
             r_node.insert(b"nn00", BTreeU64::from(201));
             r_node.insert(b"oo00", BTreeU64::from(202));
@@ -2175,7 +2234,7 @@ mod tests {
                 &sep_key,
                 b"zzzz",
                 1,
-                103,
+                TrxID::new(103),
             );
 
             assert_eq!(r_node.lower_fence_key().as_bytes(), b"nn00");
@@ -2197,20 +2256,38 @@ mod tests {
         smol::block_on(async {
             let pool = owned_index_pool(64 * 1024 * 1024);
             let pool_guard = (*pool).pool_guard();
-            let tree = BTree::new(pool.guard(), &pool_guard, false, 200)
+            let tree = BTree::new(pool.guard(), &pool_guard, false, TrxID::new(200))
                 .await
                 .expect("test btree construction should succeed");
 
-            let mut p_node =
-                BTreeNodeBox::alloc(1, 100, b"aa00", BTreeU64::from(10), b"zzzz", false);
+            let mut p_node = BTreeNodeBox::alloc(
+                1,
+                TrxID::new(100),
+                b"aa00",
+                BTreeU64::from(10),
+                b"zzzz",
+                false,
+            );
             p_node.insert(b"mm00", BTreeU64::from(20));
 
-            let mut l_node =
-                BTreeNodeBox::alloc(0, 101, b"aa00", BTreeU64::INVALID_VALUE, b"mm00", false);
+            let mut l_node = BTreeNodeBox::alloc(
+                0,
+                TrxID::new(101),
+                b"aa00",
+                BTreeU64::INVALID_VALUE,
+                b"mm00",
+                false,
+            );
             l_node.insert(b"bb00", BTREE_BYTE_ZERO);
 
-            let mut r_node =
-                BTreeNodeBox::alloc(0, 102, b"mm00", BTreeU64::INVALID_VALUE, b"zzzz", false);
+            let mut r_node = BTreeNodeBox::alloc(
+                0,
+                TrxID::new(102),
+                b"mm00",
+                BTreeU64::INVALID_VALUE,
+                b"zzzz",
+                false,
+            );
             r_node.insert(b"nn00", BTREE_BYTE_ZERO);
             r_node.insert(b"oo00", BTREE_BYTE_ZERO);
 
@@ -2221,11 +2298,17 @@ mod tests {
                 &mut r_node,
                 b"aa00",
                 b"zzzz",
-                103,
+                TrxID::new(103),
             );
 
-            let expected_parent =
-                BTreeNodeBox::alloc(1, 103, b"aa00", BTreeU64::from(10), b"zzzz", false);
+            let expected_parent = BTreeNodeBox::alloc(
+                1,
+                TrxID::new(103),
+                b"aa00",
+                BTreeU64::from(10),
+                b"zzzz",
+                false,
+            );
             assert_eq!(p_node.count(), 0);
             assert_eq!(
                 p_node.lookup_child(b"bb00"),
@@ -2240,21 +2323,21 @@ mod tests {
         smol::block_on(async {
             let pool = owned_index_pool(64 * 1024 * 1024);
             let pool_guard = (*pool).pool_guard();
-            let tree = BTree::new(pool.guard(), &pool_guard, false, 100)
+            let tree = BTree::new(pool.guard(), &pool_guard, false, TrxID::new(100))
                 .await
                 .expect("test btree construction should succeed");
-            tree.insert::<BTreeU64>(&pool_guard, b"k", BTreeU64::from(7), false, 100)
+            tree.insert::<BTreeU64>(&pool_guard, b"k", BTreeU64::from(7), false, TrxID::new(100))
                 .await
                 .expect("test insert should succeed");
 
             assert_eq!(
-                tree.delete_exact(&pool_guard, b"k", BTreeU64::from(8), false, 101)
+                tree.delete_exact(&pool_guard, b"k", BTreeU64::from(8), false, TrxID::new(101))
                     .await
                     .expect("delete_exact should read the leaf"),
                 BTreeDelete::ValueMismatch
             );
             assert_eq!(
-                tree.delete_exact(&pool_guard, b"k", BTreeU64::from(7), true, 101)
+                tree.delete_exact(&pool_guard, b"k", BTreeU64::from(7), true, TrxID::new(101))
                     .await
                     .expect("delete_exact should read the leaf"),
                 BTreeDelete::ValueMismatch
@@ -2271,18 +2354,18 @@ mod tests {
                 b"k",
                 BTreeU64::from(7),
                 BTreeU64::from(7).deleted(),
-                102,
+                TrxID::new(102),
             )
             .await
             .expect("update should read the leaf");
             assert_eq!(
-                tree.delete_exact(&pool_guard, b"k", BTreeU64::from(7), false, 103)
+                tree.delete_exact(&pool_guard, b"k", BTreeU64::from(7), false, TrxID::new(103))
                     .await
                     .expect("delete_exact should read the leaf"),
                 BTreeDelete::ValueMismatch
             );
             assert_eq!(
-                tree.delete_exact(&pool_guard, b"k", BTreeU64::from(7), true, 104)
+                tree.delete_exact(&pool_guard, b"k", BTreeU64::from(7), true, TrxID::new(104))
                     .await
                     .expect("delete_exact should read the leaf"),
                 BTreeDelete::Ok
@@ -2308,7 +2391,7 @@ mod tests {
                 .unwrap(),
             );
             let pool_guard = (*pool).pool_guard();
-            let tree = BTree::new(pool.guard(), &pool_guard, false, 200)
+            let tree = BTree::new(pool.guard(), &pool_guard, false, TrxID::new(200))
                 .await
                 .expect("test btree construction should succeed");
             assert_eq!(pool.allocated(), 1);
@@ -2322,13 +2405,13 @@ mod tests {
                     .await
                     .unwrap();
                 let root = root_guard.page_mut();
-                root.init(0, 200, &[], BTreeU64::INVALID_VALUE, &[], false);
+                root.init(0, TrxID::new(200), &[], BTreeU64::INVALID_VALUE, &[], false);
                 root.insert(b"a", BTreeU64::from(1));
                 root.insert(b"b", BTreeU64::from(2));
                 root.insert(b"c", BTreeU64::from(3));
 
                 let err = tree
-                    .split_root::<BTreeU64>(&pool_guard, root, true, 210)
+                    .split_root::<BTreeU64>(&pool_guard, root, true, TrxID::new(210))
                     .await
                     .expect_err("second split-root allocation should fail");
                 assert_eq!(err.resource_error(), Some(ResourceError::BufferPoolFull));
@@ -2465,7 +2548,7 @@ mod tests {
             let pool = owned_index_pool(64 * 1024 * 1024);
             let pool_guard = (*pool).pool_guard();
             {
-                let tree = BTree::new(pool.guard(), &pool_guard, false, 200)
+                let tree = BTree::new(pool.guard(), &pool_guard, false, TrxID::new(200))
                     .await
                     .expect("test btree construction should succeed");
                 // insert 1, 2, 3.
@@ -2476,20 +2559,44 @@ mod tests {
                 let fifty = BTreeU64::from(50);
                 let seventy = BTreeU64::from(70);
                 let res = tree
-                    .insert(&pool_guard, &1u64.to_be_bytes(), one, false, 210)
+                    .insert(
+                        &pool_guard,
+                        &1u64.to_be_bytes(),
+                        one,
+                        false,
+                        TrxID::new(210),
+                    )
                     .await;
                 assert!(res.is_ok());
                 let res = tree
-                    .insert(&pool_guard, &3u64.to_be_bytes(), three, false, 220)
+                    .insert(
+                        &pool_guard,
+                        &3u64.to_be_bytes(),
+                        three,
+                        false,
+                        TrxID::new(220),
+                    )
                     .await;
                 assert!(res.is_ok());
                 let res = tree
-                    .insert(&pool_guard, &5u64.to_be_bytes(), five, false, 205)
+                    .insert(
+                        &pool_guard,
+                        &5u64.to_be_bytes(),
+                        five,
+                        false,
+                        TrxID::new(205),
+                    )
                     .await;
                 assert!(res.is_ok());
 
                 let res = tree
-                    .insert(&pool_guard, &5u64.to_be_bytes(), five, false, 230)
+                    .insert(
+                        &pool_guard,
+                        &5u64.to_be_bytes(),
+                        five,
+                        false,
+                        TrxID::new(230),
+                    )
                     .await
                     .unwrap();
                 assert!(res == BTreeInsert::DuplicateKey(five));
@@ -2512,12 +2619,18 @@ mod tests {
                         &3u64.to_be_bytes(),
                         three,
                         three.deleted(),
-                        230,
+                        TrxID::new(230),
                     )
                     .await;
                 assert!(res.is_ok());
                 let res = tree
-                    .update(&pool_guard, &5u64.to_be_bytes(), five, five.deleted(), 230)
+                    .update(
+                        &pool_guard,
+                        &5u64.to_be_bytes(),
+                        five,
+                        five.deleted(),
+                        TrxID::new(230),
+                    )
                     .await;
                 assert!(res.is_ok());
                 let res = tree
@@ -2526,7 +2639,7 @@ mod tests {
                         &7u64.to_be_bytes(),
                         seven,
                         seven.deleted(),
-                        235,
+                        TrxID::new(235),
                     )
                     .await
                     .unwrap();
@@ -2538,7 +2651,13 @@ mod tests {
                 assert_eq!(res, Some(five.deleted()));
                 // update
                 let res = tree
-                    .update(&pool_guard, &5u64.to_be_bytes(), five.deleted(), fifty, 240)
+                    .update(
+                        &pool_guard,
+                        &5u64.to_be_bytes(),
+                        five.deleted(),
+                        fifty,
+                        TrxID::new(240),
+                    )
                     .await;
                 assert!(res.is_ok());
                 let res = tree
@@ -2547,18 +2666,30 @@ mod tests {
                         &5u64.to_be_bytes(),
                         five.deleted(),
                         seventy,
-                        245,
+                        TrxID::new(245),
                     )
                     .await
                     .unwrap();
                 assert_eq!(res, BTreeUpdate::ValueMismatch(fifty));
                 // delete
                 let res = tree
-                    .delete(&pool_guard, &3u64.to_be_bytes(), three, true, 250)
+                    .delete(
+                        &pool_guard,
+                        &3u64.to_be_bytes(),
+                        three,
+                        true,
+                        TrxID::new(250),
+                    )
                     .await;
                 assert!(res.is_ok());
                 let res = tree
-                    .delete(&pool_guard, &5u64.to_be_bytes(), five, true, 255)
+                    .delete(
+                        &pool_guard,
+                        &5u64.to_be_bytes(),
+                        five,
+                        true,
+                        TrxID::new(255),
+                    )
                     .await
                     .unwrap();
                 assert_eq!(res, BTreeDelete::ValueMismatch);
@@ -2572,11 +2703,11 @@ mod tests {
             let pool = owned_index_pool(128 * 1024 * 1024);
             let pool_guard = (*pool).pool_guard();
             {
-                let tree = BTree::new(pool.guard(), &pool_guard, false, 200)
+                let tree = BTree::new(pool.guard(), &pool_guard, false, TrxID::new(200))
                     .await
                     .expect("test btree construction should succeed");
 
-                insert_wide_rows(&tree, &pool_guard, WIDE_HEIGHT2_ROWS, 201).await;
+                insert_wide_rows(&tree, &pool_guard, WIDE_HEIGHT2_ROWS, TrxID::new(201)).await;
                 assert_eq!(tree.height(), 2);
                 let map = collect_level_stats(&tree, &pool_guard).await;
                 assert_eq!(map[&0].keys as u64, WIDE_HEIGHT2_ROWS);
@@ -2591,13 +2722,13 @@ mod tests {
             let pool = owned_index_pool(128 * 1024 * 1024);
             let pool_guard = (*pool).pool_guard();
             {
-                let tree = BTree::new(pool.guard(), &pool_guard, false, 200)
+                let tree = BTree::new(pool.guard(), &pool_guard, false, TrxID::new(200))
                     .await
                     .expect("test btree construction should succeed");
 
-                insert_wide_rows(&tree, &pool_guard, WIDE_HEIGHT2_ROWS, 201).await;
+                insert_wide_rows(&tree, &pool_guard, WIDE_HEIGHT2_ROWS, TrxID::new(201)).await;
                 assert_eq!(tree.height(), 2);
-                delete_wide_rows(&tree, &pool_guard, WIDE_HEIGHT2_ROWS, 202).await;
+                delete_wide_rows(&tree, &pool_guard, WIDE_HEIGHT2_ROWS, TrxID::new(202)).await;
 
                 let map = collect_level_stats(&tree, &pool_guard).await;
                 assert_eq!(map[&0].keys, 0);
@@ -2612,13 +2743,13 @@ mod tests {
             let pool = owned_index_pool(128 * 1024 * 1024);
             let pool_guard = (*pool).pool_guard();
             {
-                let tree = BTree::new(pool.guard(), &pool_guard, false, 200)
+                let tree = BTree::new(pool.guard(), &pool_guard, false, TrxID::new(200))
                     .await
                     .expect("test btree construction should succeed");
 
-                insert_wide_rows(&tree, &pool_guard, WIDE_HEIGHT2_ROWS, 201).await;
+                insert_wide_rows(&tree, &pool_guard, WIDE_HEIGHT2_ROWS, TrxID::new(201)).await;
                 assert_eq!(tree.height(), 2);
-                delete_wide_rows(&tree, &pool_guard, WIDE_HEIGHT2_ROWS, 202).await;
+                delete_wide_rows(&tree, &pool_guard, WIDE_HEIGHT2_ROWS, TrxID::new(202)).await;
 
                 let config = BTreeCompactConfig::new(1.0, 1.0).unwrap();
                 let purge_list = tree
@@ -2659,7 +2790,7 @@ mod tests {
             let pool = owned_index_pool(20 * 1024 * 1024);
             let pool_guard = (*pool).pool_guard();
             {
-                let tree = BTree::new(pool.guard(), &pool_guard, false, 1)
+                let tree = BTree::new(pool.guard(), &pool_guard, false, TrxID::new(1))
                     .await
                     .expect("test btree construction should succeed");
 
@@ -2670,9 +2801,15 @@ mod tests {
                     let mut thd_rng = rand::rng();
                     for i in 0..ROWS {
                         let k = between.sample(&mut thd_rng);
-                        tree.insert(&pool_guard, &k.to_be_bytes(), BTreeU64::from(i), false, 100)
-                            .await
-                            .unwrap();
+                        tree.insert(
+                            &pool_guard,
+                            &k.to_be_bytes(),
+                            BTreeU64::from(i),
+                            false,
+                            TrxID::new(100),
+                        )
+                        .await
+                        .unwrap();
                     }
                 }
                 let dur = start.elapsed();
@@ -2695,9 +2832,15 @@ mod tests {
                     let mut thd_rng = rand::rng();
                     for i in 0..ROWS {
                         let k = between.sample(&mut thd_rng);
-                        tree.insert(&pool_guard, &k.to_be_bytes(), BTreeU64::from(i), false, 100)
-                            .await
-                            .unwrap();
+                        tree.insert(
+                            &pool_guard,
+                            &k.to_be_bytes(),
+                            BTreeU64::from(i),
+                            false,
+                            TrxID::new(100),
+                        )
+                        .await
+                        .unwrap();
                     }
                 }
 
@@ -2723,12 +2866,12 @@ mod tests {
             let pool_guard = (*pool).pool_guard();
             {
                 let tree = Arc::new(
-                    BTree::new(pool.guard(), &pool_guard, false, 200)
+                    BTree::new(pool.guard(), &pool_guard, false, TrxID::new(200))
                         .await
                         .expect("test btree construction should succeed"),
                 );
 
-                let insert_key_idx = next_wide_split_key(&tree, &pool_guard, 201).await;
+                let insert_key_idx = next_wide_split_key(&tree, &pool_guard, TrxID::new(201)).await;
                 let insert_key = wide_test_key(insert_key_idx);
                 let (parent_locked_tx, parent_locked_rx) = mpsc::channel();
                 let (insert_started_tx, insert_started_rx) = mpsc::channel();
@@ -2771,7 +2914,7 @@ mod tests {
                                 &insert_key,
                                 BTreeU64::from(insert_key_idx),
                                 false,
-                                202,
+                                TrxID::new(202),
                             );
                             futures::pin_mut!(insert_fut);
                             assert!(matches!(
@@ -2805,12 +2948,13 @@ mod tests {
             let pool_guard = (*pool).pool_guard();
             {
                 let tree = Arc::new(
-                    BTree::new(pool.guard(), &pool_guard, false, 200)
+                    BTree::new(pool.guard(), &pool_guard, false, TrxID::new(200))
                         .await
                         .expect("test btree construction should succeed"),
                 );
 
-                let first_insert_key = next_wide_split_key(&tree, &pool_guard, 201).await;
+                let first_insert_key =
+                    next_wide_split_key(&tree, &pool_guard, TrxID::new(201)).await;
                 let concurrent_inserts = 10u64;
                 let start = Arc::new(Barrier::new(concurrent_inserts as usize + 1));
                 let mut handles = Vec::with_capacity(10);
@@ -2823,7 +2967,13 @@ mod tests {
                         smol::block_on(async {
                             let key = wide_test_key(j);
                             let res = tree
-                                .insert(&pool_guard, &key, BTreeU64::from(j), false, 202)
+                                .insert(
+                                    &pool_guard,
+                                    &key,
+                                    BTreeU64::from(j),
+                                    false,
+                                    TrxID::new(202),
+                                )
                                 .await;
                             assert!(res.is_ok());
                         })
@@ -2853,10 +3003,10 @@ mod tests {
             let pool = owned_index_pool(128 * 1024 * 1024);
             let pool_guard = (*pool).pool_guard();
             {
-                let tree = BTree::new(pool.guard(), &pool_guard, false, 200)
+                let tree = BTree::new(pool.guard(), &pool_guard, false, TrxID::new(200))
                     .await
                     .expect("test btree construction should succeed");
-                insert_wide_rows(&tree, &pool_guard, WIDE_HEIGHT2_ROWS, 201).await;
+                insert_wide_rows(&tree, &pool_guard, WIDE_HEIGHT2_ROWS, TrxID::new(201)).await;
                 let before_space = tree.collect_space_statistics(&pool_guard).await.unwrap();
                 let before_levels = collect_level_stats(&tree, &pool_guard).await;
 
@@ -2888,30 +3038,30 @@ mod tests {
             assert!(pool.allocated() == 0);
             // height=0
             {
-                let tree = BTree::new(pool.guard(), &pool_guard, false, 200)
+                let tree = BTree::new(pool.guard(), &pool_guard, false, TrxID::new(200))
                     .await
                     .expect("test btree construction should succeed");
-                insert_wide_rows(&tree, &pool_guard, H0_ROWS, 201).await;
+                insert_wide_rows(&tree, &pool_guard, H0_ROWS, TrxID::new(201)).await;
                 assert_eq!(tree.height(), 0);
                 tree.destory(&pool_guard).await.unwrap();
                 assert!(pool.allocated() == 0);
             }
             // height=1
             {
-                let tree = BTree::new(pool.guard(), &pool_guard, false, 200)
+                let tree = BTree::new(pool.guard(), &pool_guard, false, TrxID::new(200))
                     .await
                     .expect("test btree construction should succeed");
-                insert_wide_rows(&tree, &pool_guard, H1_ROWS, 201).await;
+                insert_wide_rows(&tree, &pool_guard, H1_ROWS, TrxID::new(201)).await;
                 assert_eq!(tree.height(), 1);
                 tree.destory(&pool_guard).await.unwrap();
                 assert!(pool.allocated() == 0);
             }
             // height=2
             {
-                let tree = BTree::new(pool.guard(), &pool_guard, false, 200)
+                let tree = BTree::new(pool.guard(), &pool_guard, false, TrxID::new(200))
                     .await
                     .expect("test btree construction should succeed");
-                insert_wide_rows(&tree, &pool_guard, H2_ROWS, 201).await;
+                insert_wide_rows(&tree, &pool_guard, H2_ROWS, TrxID::new(201)).await;
                 assert_eq!(tree.height(), 2);
                 tree.destory(&pool_guard).await.unwrap();
                 assert!(pool.allocated() == 0);

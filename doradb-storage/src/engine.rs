@@ -13,9 +13,10 @@ use crate::component::{
 use crate::conf::EngineConfig;
 use crate::error::{LifecycleError, LifecycleResult, OperationError, Result};
 use crate::file::fs::{FileSystem, FileSystemWorkers};
+use crate::id::{SessionID, TableID};
 use crate::lock::LockManager;
 use crate::quiescent::QuiescentGuard;
-use crate::session::{Session, SessionID};
+use crate::session::Session;
 use crate::trx::sys::TransactionSystem;
 use crate::{DiskPool, IndexPool, MemPool, MetaPool};
 use error_stack::{Report, ensure};
@@ -24,7 +25,7 @@ use std::ops::Deref;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 
-const FIRST_SESSION_ID: SessionID = 1;
+const FIRST_SESSION_ID: SessionID = SessionID::new(1);
 
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -275,7 +276,7 @@ impl EngineRef {
 
     /// Get a user-table runtime handle by table id.
     #[inline]
-    pub async fn get_table(&self, table_id: crate::TableID) -> Result<Arc<crate::Table>> {
+    pub async fn get_table(&self, table_id: TableID) -> Result<Arc<crate::Table>> {
         self.0
             .with_running_admission(|| self.0.catalog().get_table_now(table_id))?
             .ok_or_else(|| {
@@ -341,7 +342,7 @@ impl EngineInner {
     /// Returns the next engine-local session identity.
     #[inline]
     pub(crate) fn next_session_id(&self) -> SessionID {
-        self.next_session_id.fetch_add(1, Ordering::Relaxed)
+        SessionID::new(self.next_session_id.fetch_add(1, Ordering::Relaxed))
     }
 
     #[inline]
@@ -422,7 +423,7 @@ impl EngineConfig {
             table_fs,
             disk_pool,
             lock_manager,
-            next_session_id: AtomicU64::new(FIRST_SESSION_ID),
+            next_session_id: AtomicU64::new(FIRST_SESSION_ID.as_u64()),
             lifecycle: EngineLifecycle::new(),
         };
         Ok(Engine {
@@ -441,6 +442,7 @@ mod tests {
     use crate::conf::{EngineConfig, EvictableBufferPoolConfig, FileSystemConfig, TrxSysConfig};
     use crate::error::{ConfigError, ErrorKind, LifecycleError, OperationError, ResourceError};
     use crate::file::fs::tests::io_backend_stats_handle_identity as fs_stats_handle_identity;
+    use crate::id::TrxID;
     use crate::lock::tests::{debug_snapshot, try_acquire};
     use crate::lock::{LockMode, LockOwner, LockResource};
     use std::fs;
@@ -491,8 +493,8 @@ mod tests {
             let session3 = engine.new_session().unwrap();
 
             assert_eq!(session1.id(), FIRST_SESSION_ID);
-            assert_eq!(session2.id(), session1.id() + 1);
-            assert_eq!(session3.id(), session2.id() + 1);
+            assert_eq!(session2.id(), SessionID::new(session1.id().as_u64() + 1));
+            assert_eq!(session3.id(), SessionID::new(session2.id().as_u64() + 1));
         });
     }
 
@@ -503,7 +505,7 @@ mod tests {
             let engine = test_engine_config_for(root.path()).build().await.unwrap();
             let engine_ref = engine.new_ref().unwrap();
             let resource = LockResource::CatalogNamespace;
-            let owner = LockOwner::Session(10);
+            let owner = LockOwner::Session(SessionID::new(10));
 
             assert!(
                 try_acquire(engine.lock_manager(), resource, LockMode::Exclusive, owner).unwrap()
@@ -513,7 +515,7 @@ mod tests {
                     engine_ref.lock_manager(),
                     resource,
                     LockMode::Shared,
-                    LockOwner::Session(11)
+                    LockOwner::Session(SessionID::new(11))
                 )
                 .unwrap()
             );
@@ -523,7 +525,7 @@ mod tests {
                     engine.lock_manager(),
                     resource,
                     LockMode::Shared,
-                    LockOwner::Session(11)
+                    LockOwner::Session(SessionID::new(11))
                 )
                 .unwrap()
             );
@@ -536,7 +538,7 @@ mod tests {
             let root = TempDir::new().unwrap();
             let engine = test_engine_config_for(root.path()).build().await.unwrap();
             let session = engine.new_session().unwrap();
-            let resource = LockResource::TableData(91_200);
+            let resource = LockResource::TableData(TableID::new(91_200));
 
             assert!(
                 try_acquire(
@@ -554,7 +556,7 @@ mod tests {
                     engine.lock_manager(),
                     resource,
                     LockMode::Shared,
-                    LockOwner::Session(91_201)
+                    LockOwner::Session(SessionID::new(91_201))
                 )
                 .unwrap()
             );
@@ -566,8 +568,8 @@ mod tests {
         smol::block_on(async {
             let root = TempDir::new().unwrap();
             let engine = test_engine_config_for(root.path()).build().await.unwrap();
-            let resource = LockResource::TableMetadata(91_202);
-            let blocking_owner = LockOwner::Session(91_203);
+            let resource = LockResource::TableMetadata(TableID::new(91_202));
+            let blocking_owner = LockOwner::Session(SessionID::new(91_203));
             assert!(
                 try_acquire(
                     engine.lock_manager(),
@@ -1021,7 +1023,7 @@ mod tests {
             let mut trx = session.begin_trx().unwrap();
             trx.add_pseudo_redo_log_entry();
             let cts = trx.commit().await.unwrap();
-            assert!(cts > 0);
+            assert!(cts > TrxID::new(0));
             assert!(!session.in_trx());
 
             let trx = session.begin_trx().unwrap();
@@ -1054,7 +1056,7 @@ mod tests {
 
             let trx = session.begin_trx().unwrap();
             let cts = trx.commit().await.unwrap();
-            assert_eq!(cts, 0);
+            assert_eq!(cts, TrxID::new(0));
             assert!(!session.in_trx());
 
             let trx = session.begin_trx().unwrap();

@@ -14,12 +14,10 @@ use super::unique_index::{UniqueIndex, UniqueMemIndex};
 use crate::buffer::{BufferPool, PoolGuard, ReadonlyBufferPool};
 use crate::catalog::{IndexSpec, TableMetadata};
 use crate::error::{Error, InternalError, Result};
-use crate::file::cow_file::BlockID;
 use crate::file::table_file::TableFile;
+use crate::id::{BlockID, RowID, TrxID};
 use crate::index::util::Maskable;
 use crate::quiescent::QuiescentGuard;
-use crate::row::RowID;
-use crate::trx::TrxID;
 use crate::value::{Val, ValType};
 use error_stack::Report;
 use std::cmp::Ordering;
@@ -764,6 +762,10 @@ mod tests {
     use crate::table::test_user_table_id;
     use crate::value::{ValKind, ValType};
 
+    fn test_row_ids<const N: usize>(values: [u64; N]) -> Vec<RowID> {
+        values.into_iter().map(RowID::new).collect()
+    }
+
     fn metadata_with_indexes() -> Arc<TableMetadata> {
         Arc::new(
             TableMetadata::try_new(
@@ -785,7 +787,7 @@ mod tests {
         pool: &QuiescentBox<FixedBufferPool>,
         pool_guard: &PoolGuard,
     ) -> UniqueMemIndex<FixedBufferPool> {
-        let tree = BTree::new(pool.guard(), pool_guard, true, 100)
+        let tree = BTree::new(pool.guard(), pool_guard, true, TrxID::new(100))
             .await
             .expect("unique MemIndex should be created");
         UniqueMemIndex::with_encoder(
@@ -798,7 +800,7 @@ mod tests {
         pool: &QuiescentBox<FixedBufferPool>,
         pool_guard: &PoolGuard,
     ) -> NonUniqueMemIndex<FixedBufferPool> {
-        let tree = BTree::new(pool.guard(), pool_guard, true, 100)
+        let tree = BTree::new(pool.guard(), pool_guard, true, TrxID::new(100))
             .await
             .expect("non-unique MemIndex should be created");
         NonUniqueMemIndex::with_encoder(
@@ -924,7 +926,7 @@ mod tests {
             let table = fs
                 .create_table_file(test_user_table_id(611), Arc::clone(&metadata), false)
                 .unwrap();
-            let (table, old_root) = table.commit(1, false).await.unwrap();
+            let (table, old_root) = table.commit(TrxID::new(1), false).await.unwrap();
             drop(old_root);
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
             let disk_pool = table_readonly_pool(&global, test_user_table_id(611), &table);
@@ -942,23 +944,23 @@ mod tests {
             let key4 = [Val::from(4u32)];
             let key5 = [Val::from(5u32)];
             let key6 = [Val::from(6u32)];
-            let mut writer = disk.batch_writer(&mut mutable, 2);
+            let mut writer = disk.batch_writer(&mut mutable, TrxID::new(2));
             let puts = [
                 UniqueDiskTreePut {
                     key: &key1,
-                    row_id: 10,
+                    row_id: RowID::new(10),
                 },
                 UniqueDiskTreePut {
                     key: &key2,
-                    row_id: 20,
+                    row_id: RowID::new(20),
                 },
                 UniqueDiskTreePut {
                     key: &key3,
-                    row_id: 30,
+                    row_id: RowID::new(30),
                 },
                 UniqueDiskTreePut {
                     key: &key4,
-                    row_id: 40,
+                    row_id: RowID::new(40),
                 },
             ];
             let encoded_puts = encode_unique_puts(&puts);
@@ -966,7 +968,7 @@ mod tests {
                 .batch_put_encoded(&unique_put_refs(&encoded_puts))
                 .unwrap();
             let root = writer.finish().await.unwrap();
-            let table = publish_secondary_root(mutable, 0, root, 2).await;
+            let table = publish_secondary_root(mutable, 0, root, TrxID::new(2)).await;
 
             let index_pool = QuiescentBox::new(
                 FixedBufferPool::with_capacity(PoolRole::Index, 64 * 1024 * 1024).unwrap(),
@@ -974,10 +976,16 @@ mod tests {
             let index_guard = (*index_pool).pool_guard();
             let mem = unique_mem_index(&index_pool, &index_guard).await;
             assert!(
-                mem.insert_if_not_exists(&index_guard, &key1, 100, false, 3)
-                    .await
-                    .unwrap()
-                    .is_ok()
+                mem.insert_if_not_exists(
+                    &index_guard,
+                    &key1,
+                    RowID::new(100),
+                    false,
+                    TrxID::new(3)
+                )
+                .await
+                .unwrap()
+                .is_ok()
             );
             let runtime = SecondaryDiskTreeRuntime::new(
                 0,
@@ -995,96 +1003,153 @@ mod tests {
                 index
                     .unique_mem()
                     .unwrap()
-                    .lookup(&index_guard, &key1, 3)
+                    .lookup(&index_guard, &key1, TrxID::new(3))
                     .await
                     .unwrap()
                     .is_some()
             );
             assert_eq!(
-                bound.lookup(&index_guard, &key1, 3).await.unwrap(),
-                Some((100, false))
+                bound
+                    .lookup(&index_guard, &key1, TrxID::new(3))
+                    .await
+                    .unwrap(),
+                Some((RowID::new(100), false))
             );
             assert_eq!(
-                bound.lookup(&index_guard, &key2, 3).await.unwrap(),
-                Some((20, false))
+                bound
+                    .lookup(&index_guard, &key2, TrxID::new(3))
+                    .await
+                    .unwrap(),
+                Some((RowID::new(20), false))
             );
 
             assert!(
                 bound
-                    .mask_as_deleted(&index_guard, &key3, 30, 4)
+                    .mask_as_deleted(&index_guard, &key3, RowID::new(30), TrxID::new(4))
                     .await
                     .unwrap()
             );
             assert_eq!(
-                bound.lookup(&index_guard, &key3, 4).await.unwrap(),
-                Some((30, true))
+                bound
+                    .lookup(&index_guard, &key3, TrxID::new(4))
+                    .await
+                    .unwrap(),
+                Some((RowID::new(30), true))
             );
             assert_eq!(
                 bound
-                    .insert_if_not_exists(&index_guard, &key4, 400, false, 5)
+                    .insert_if_not_exists(
+                        &index_guard,
+                        &key4,
+                        RowID::new(400),
+                        false,
+                        TrxID::new(5)
+                    )
                     .await
                     .unwrap(),
-                IndexInsert::DuplicateKey(40, false)
+                IndexInsert::DuplicateKey(RowID::new(40), false)
             );
             assert!(
                 bound
-                    .insert_if_not_exists(&index_guard, &key5, 50, false, 5)
+                    .insert_if_not_exists(&index_guard, &key5, RowID::new(50), false, TrxID::new(5))
                     .await
                     .unwrap()
                     .is_ok()
             );
             assert_eq!(
                 bound
-                    .compare_exchange(&index_guard, &key2, 20, 200, 6)
+                    .compare_exchange(
+                        &index_guard,
+                        &key2,
+                        RowID::new(20),
+                        RowID::new(200),
+                        TrxID::new(6)
+                    )
                     .await
                     .unwrap(),
                 IndexCompareExchange::Ok
             );
             assert_eq!(
                 bound
-                    .compare_exchange(&index_guard, &key4, 999, 9999, 6)
+                    .compare_exchange(
+                        &index_guard,
+                        &key4,
+                        RowID::new(999),
+                        RowID::new(9999),
+                        TrxID::new(6)
+                    )
                     .await
                     .unwrap(),
                 IndexCompareExchange::Mismatch
             );
             assert_eq!(
                 bound
-                    .compare_exchange(&index_guard, &key4, 40.deleted(), 400, 6)
+                    .compare_exchange(
+                        &index_guard,
+                        &key4,
+                        RowID::new(40).deleted(),
+                        RowID::new(400),
+                        TrxID::new(6)
+                    )
                     .await
                     .unwrap(),
                 IndexCompareExchange::NotExists
             );
             assert_eq!(
                 bound
-                    .compare_exchange(&index_guard, &key6, 60, 600, 6)
+                    .compare_exchange(
+                        &index_guard,
+                        &key6,
+                        RowID::new(60),
+                        RowID::new(600),
+                        TrxID::new(6)
+                    )
                     .await
                     .unwrap(),
                 IndexCompareExchange::NotExists
             );
             assert!(
                 bound
-                    .compare_delete(&index_guard, &key4, 40, false, 7)
+                    .compare_delete(&index_guard, &key4, RowID::new(40), false, TrxID::new(7))
                     .await
                     .unwrap()
             );
             assert!(
                 bound
-                    .compare_delete(&index_guard, &key4, 41, false, 7)
+                    .compare_delete(&index_guard, &key4, RowID::new(41), false, TrxID::new(7))
                     .await
                     .unwrap()
             );
 
             let mut values = Vec::new();
             bound
-                .scan_values(&index_guard, &mut values, 8)
+                .scan_values(&index_guard, &mut values, TrxID::new(8))
                 .await
                 .unwrap();
-            assert_eq!(values, vec![100, 200, 30u64.deleted(), 40, 50]);
+            assert_eq!(
+                values,
+                vec![
+                    RowID::new(100),
+                    RowID::new(200),
+                    RowID::new(30).deleted(),
+                    RowID::new(40),
+                    RowID::new(50)
+                ]
+            );
 
             let unchanged_disk = disk_runtime.open(root, &disk_guard);
-            assert_eq!(unchanged_disk.lookup(&key2).await.unwrap(), Some(20));
-            assert_eq!(unchanged_disk.lookup(&key3).await.unwrap(), Some(30));
-            assert_eq!(unchanged_disk.lookup(&key4).await.unwrap(), Some(40));
+            assert_eq!(
+                unchanged_disk.lookup(&key2).await.unwrap(),
+                Some(RowID::new(20))
+            );
+            assert_eq!(
+                unchanged_disk.lookup(&key3).await.unwrap(),
+                Some(RowID::new(30))
+            );
+            assert_eq!(
+                unchanged_disk.lookup(&key4).await.unwrap(),
+                Some(RowID::new(40))
+            );
         });
     }
 
@@ -1096,7 +1161,7 @@ mod tests {
             let table = fs
                 .create_table_file(test_user_table_id(614), Arc::clone(&metadata), false)
                 .unwrap();
-            let (table, old_root) = table.commit(1, false).await.unwrap();
+            let (table, old_root) = table.commit(TrxID::new(1), false).await.unwrap();
             drop(old_root);
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
             let disk_pool = table_readonly_pool(&global, test_user_table_id(614), &table);
@@ -1112,10 +1177,10 @@ mod tests {
             let disk_runtime = unique_runtime!(metadata, disk_pool);
             let disk = disk_runtime.open(SUPER_BLOCK_ID, &disk_guard);
             let root_a = {
-                let mut writer = disk.batch_writer(&mut mutable, 2);
+                let mut writer = disk.batch_writer(&mut mutable, TrxID::new(2));
                 let puts = [UniqueDiskTreePut {
                     key: &key1,
-                    row_id: 10,
+                    row_id: RowID::new(10),
                 }];
                 let encoded_puts = encode_unique_puts(&puts);
                 writer
@@ -1123,7 +1188,7 @@ mod tests {
                     .unwrap();
                 writer.finish().await.unwrap()
             };
-            let table = publish_secondary_root(mutable, 0, root_a, 2).await;
+            let table = publish_secondary_root(mutable, 0, root_a, TrxID::new(2)).await;
             let runtime = SecondaryDiskTreeRuntime::new(
                 0,
                 Arc::clone(&metadata),
@@ -1133,7 +1198,7 @@ mod tests {
             .unwrap();
             let opened_a_guard = runtime.disk_pool_guard();
             let opened_a = runtime.open_unique_at(root_a, &opened_a_guard).unwrap();
-            assert_eq!(opened_a.lookup(&key1).await.unwrap(), Some(10));
+            assert_eq!(opened_a.lookup(&key1).await.unwrap(), Some(RowID::new(10)));
             assert_eq!(opened_a.lookup(&key2).await.unwrap(), None);
 
             let mut mutable = MutableTableFile::fork(
@@ -1143,10 +1208,10 @@ mod tests {
             );
             let disk = disk_runtime.open(root_a, &disk_guard);
             let root_b = {
-                let mut writer = disk.batch_writer(&mut mutable, 3);
+                let mut writer = disk.batch_writer(&mut mutable, TrxID::new(3));
                 let puts = [UniqueDiskTreePut {
                     key: &key2,
-                    row_id: 20,
+                    row_id: RowID::new(20),
                 }];
                 let encoded_puts = encode_unique_puts(&puts);
                 writer
@@ -1155,19 +1220,19 @@ mod tests {
                 writer.finish().await.unwrap()
             };
             assert_ne!(root_a, root_b);
-            let table_after_b = publish_secondary_root(mutable, 0, root_b, 3).await;
+            let table_after_b = publish_secondary_root(mutable, 0, root_b, TrxID::new(3)).await;
             assert_eq!(
                 table_after_b.active_root_unchecked().secondary_index_roots[0],
                 root_b
             );
 
-            assert_eq!(opened_a.lookup(&key1).await.unwrap(), Some(10));
+            assert_eq!(opened_a.lookup(&key1).await.unwrap(), Some(RowID::new(10)));
             assert_eq!(opened_a.lookup(&key2).await.unwrap(), None);
 
             let opened_b_guard = runtime.disk_pool_guard();
             let opened_b = runtime.open_unique_at(root_b, &opened_b_guard).unwrap();
-            assert_eq!(opened_b.lookup(&key1).await.unwrap(), Some(10));
-            assert_eq!(opened_b.lookup(&key2).await.unwrap(), Some(20));
+            assert_eq!(opened_b.lookup(&key1).await.unwrap(), Some(RowID::new(10)));
+            assert_eq!(opened_b.lookup(&key2).await.unwrap(), Some(RowID::new(20)));
         });
     }
 
@@ -1179,7 +1244,7 @@ mod tests {
             let table = fs
                 .create_table_file(test_user_table_id(612), Arc::clone(&metadata), false)
                 .unwrap();
-            let (table, old_root) = table.commit(1, false).await.unwrap();
+            let (table, old_root) = table.commit(TrxID::new(1), false).await.unwrap();
             drop(old_root);
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
             let disk_pool = table_readonly_pool(&global, test_user_table_id(612), &table);
@@ -1194,23 +1259,23 @@ mod tests {
             let key1 = [Val::from(1u32)];
             let key2 = [Val::from(2u32)];
             let key3 = [Val::from(3u32)];
-            let mut writer = disk.batch_writer(&mut mutable, 2);
+            let mut writer = disk.batch_writer(&mut mutable, TrxID::new(2));
             let entries = [
                 NonUniqueDiskTreeExact {
                     key: &key1,
-                    row_id: 10,
+                    row_id: RowID::new(10),
                 },
                 NonUniqueDiskTreeExact {
                     key: &key1,
-                    row_id: 11,
+                    row_id: RowID::new(11),
                 },
                 NonUniqueDiskTreeExact {
                     key: &key2,
-                    row_id: 20,
+                    row_id: RowID::new(20),
                 },
                 NonUniqueDiskTreeExact {
                     key: &key3,
-                    row_id: 30,
+                    row_id: RowID::new(30),
                 },
             ];
             let encoded_entries = encode_non_unique_exact(&entries);
@@ -1218,7 +1283,7 @@ mod tests {
                 .batch_insert_encoded(&non_unique_exact_refs(&encoded_entries))
                 .unwrap();
             let root = writer.finish().await.unwrap();
-            let table = publish_secondary_root(mutable, 1, root, 2).await;
+            let table = publish_secondary_root(mutable, 1, root, TrxID::new(2)).await;
 
             let index_pool = QuiescentBox::new(
                 FixedBufferPool::with_capacity(PoolRole::Index, 64 * 1024 * 1024).unwrap(),
@@ -1226,7 +1291,7 @@ mod tests {
             let index_guard = (*index_pool).pool_guard();
             let mem = non_unique_mem_index(&index_pool, &index_guard).await;
             assert!(
-                mem.insert_if_not_exists(&index_guard, &key1, 12, false, 3)
+                mem.insert_if_not_exists(&index_guard, &key1, RowID::new(12), false, TrxID::new(3))
                     .await
                     .unwrap()
                     .is_ok()
@@ -1247,102 +1312,102 @@ mod tests {
                 index
                     .non_unique_mem()
                     .unwrap()
-                    .lookup_unique(&index_guard, &key1, 12, 3)
+                    .lookup_unique(&index_guard, &key1, RowID::new(12), TrxID::new(3))
                     .await
                     .unwrap()
                     .is_some()
             );
             assert!(
                 bound
-                    .mask_as_deleted(&index_guard, &key1, 10, 4)
+                    .mask_as_deleted(&index_guard, &key1, RowID::new(10), TrxID::new(4))
                     .await
                     .unwrap()
             );
             let mut rows = Vec::new();
             bound
-                .lookup(&index_guard, &key1, &mut rows, 4)
+                .lookup(&index_guard, &key1, &mut rows, TrxID::new(4))
                 .await
                 .unwrap();
-            assert_eq!(rows, vec![11, 12]);
+            assert_eq!(rows, test_row_ids([11, 12]));
             assert_eq!(
                 bound
-                    .lookup_unique(&index_guard, &key1, 10, 4)
+                    .lookup_unique(&index_guard, &key1, RowID::new(10), TrxID::new(4))
                     .await
                     .unwrap(),
                 Some(false)
             );
             assert_eq!(
                 bound
-                    .lookup_unique(&index_guard, &key1, 11, 4)
+                    .lookup_unique(&index_guard, &key1, RowID::new(11), TrxID::new(4))
                     .await
                     .unwrap(),
                 Some(true)
             );
             assert_eq!(
                 bound
-                    .lookup_unique(&index_guard, &key1, 99, 4)
+                    .lookup_unique(&index_guard, &key1, RowID::new(99), TrxID::new(4))
                     .await
                     .unwrap(),
                 None
             );
             assert_eq!(
                 bound
-                    .insert_if_not_exists(&index_guard, &key1, 11, false, 5)
+                    .insert_if_not_exists(&index_guard, &key1, RowID::new(11), false, TrxID::new(5))
                     .await
                     .unwrap(),
-                IndexInsert::DuplicateKey(11, false)
+                IndexInsert::DuplicateKey(RowID::new(11), false)
             );
             assert!(
                 bound
-                    .mask_as_active(&index_guard, &key1, 10, 5)
+                    .mask_as_active(&index_guard, &key1, RowID::new(10), TrxID::new(5))
                     .await
                     .unwrap()
             );
             rows.clear();
             bound
-                .lookup(&index_guard, &key1, &mut rows, 5)
+                .lookup(&index_guard, &key1, &mut rows, TrxID::new(5))
                 .await
                 .unwrap();
-            assert_eq!(rows, vec![10, 11, 12]);
+            assert_eq!(rows, test_row_ids([10, 11, 12]));
             assert!(
                 bound
-                    .insert_if_not_exists(&index_guard, &key1, 13, false, 6)
+                    .insert_if_not_exists(&index_guard, &key1, RowID::new(13), false, TrxID::new(6))
                     .await
                     .unwrap()
                     .is_ok()
             );
             assert!(
                 bound
-                    .mask_as_deleted(&index_guard, &key2, 20, 7)
+                    .mask_as_deleted(&index_guard, &key2, RowID::new(20), TrxID::new(7))
                     .await
                     .unwrap()
             );
             assert!(
                 bound
-                    .compare_delete(&index_guard, &key3, 30, false, 7)
+                    .compare_delete(&index_guard, &key3, RowID::new(30), false, TrxID::new(7))
                     .await
                     .unwrap()
             );
 
             let mut values = Vec::new();
             bound
-                .scan_values(&index_guard, &mut values, 8)
+                .scan_values(&index_guard, &mut values, TrxID::new(8))
                 .await
                 .unwrap();
-            assert_eq!(values, vec![10, 11, 12, 13, 30]);
+            assert_eq!(values, test_row_ids([10, 11, 12, 13, 30]));
 
             let unchanged_disk = disk_runtime.open(root, &disk_guard);
             assert_eq!(
                 non_unique_disk_tree_prefix_scan_rows(&unchanged_disk, &key1)
                     .await
                     .unwrap(),
-                vec![10, 11]
+                test_row_ids([10, 11])
             );
             assert_eq!(
                 non_unique_disk_tree_prefix_scan_rows(&unchanged_disk, &key2)
                     .await
                     .unwrap(),
-                vec![20]
+                test_row_ids([20])
             );
         });
     }
@@ -1355,7 +1420,7 @@ mod tests {
             let table = fs
                 .create_table_file(test_user_table_id(613), Arc::clone(&metadata), false)
                 .unwrap();
-            let (table, old_root) = table.commit(1, false).await.unwrap();
+            let (table, old_root) = table.commit(TrxID::new(1), false).await.unwrap();
             drop(old_root);
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
             let disk_pool = table_readonly_pool(&global, test_user_table_id(613), &table);
@@ -1366,9 +1431,14 @@ mod tests {
             let mem = unique_mem_index(&index_pool, &index_guard).await;
             let shadow_key = [Val::from(9u32)];
             assert!(
-                mem.insert_overlay_if_absent(&index_guard, &shadow_key, 90u64.deleted(), 2)
-                    .await
-                    .unwrap()
+                mem.insert_overlay_if_absent(
+                    &index_guard,
+                    &shadow_key,
+                    RowID::new(90).deleted(),
+                    TrxID::new(2)
+                )
+                .await
+                .unwrap()
             );
             let runtime = SecondaryDiskTreeRuntime::new(
                 0,

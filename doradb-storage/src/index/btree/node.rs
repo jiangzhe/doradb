@@ -1,10 +1,9 @@
 //! B+Tree index is the most commonly used data structure for database indexing.
 //! This module provide an implementation of B+Tree backed by buffer pool and hybrid latch.
 
-use crate::buffer::page::{
-    BufferPage, BufferPageKind, PAGE_SIZE, PageID, assert_buffer_page, sealed,
-};
+use crate::buffer::page::{BufferPage, BufferPageKind, PAGE_SIZE, assert_buffer_page, sealed};
 use crate::file::block_integrity::{BLOCK_INTEGRITY_TRAILER_SIZE, BlockIntegrityTrailer};
+use crate::id::{PageID, TrxID};
 use crate::index::btree::BTreeKey;
 use crate::index::btree::{BTREE_HINTS_LEN, BTreeHints};
 use crate::index::btree::{BTREE_VALUE_PACK_MAX_LEN, BTreeU64, BTreeValue, BTreeValuePackable};
@@ -12,7 +11,6 @@ use crate::index::btree::{BTreeDelete, BTreeUpdate};
 use crate::index::util::Maskable;
 use crate::layout;
 use crate::memcmp::BytesExtendable;
-use crate::trx::TrxID;
 use std::cmp;
 use std::cmp::Ordering;
 use std::mem;
@@ -2104,7 +2102,8 @@ mod tests {
 
     #[test]
     fn test_btree_node_footer_reserved_and_nil_values() {
-        let mut node = BTreeNodeBox::alloc(0, 7, &[], BTreeU64::INVALID_VALUE, &[], false);
+        let mut node =
+            BTreeNodeBox::alloc(0, TrxID::new(7), &[], BTreeU64::INVALID_VALUE, &[], false);
         assert_eq!(mem::size_of::<BTreeNode>(), PAGE_SIZE);
         assert_eq!(BTREE_NODE_USABLE_SIZE, PAGE_SIZE - BTREE_NODE_FOOTER_SIZE);
         assert_eq!(BTREE_NODE_FOOTER_SIZE, BLOCK_INTEGRITY_TRAILER_SIZE);
@@ -2131,7 +2130,8 @@ mod tests {
 
     #[test]
     fn test_btree_node_hinted_search_on_full_nil_leaf() {
-        let mut node = BTreeNodeBox::alloc(0, 7, &[], BTreeU64::INVALID_VALUE, &[], true);
+        let mut node =
+            BTreeNodeBox::alloc(0, TrxID::new(7), &[], BTreeU64::INVALID_VALUE, &[], true);
         for i in 0u32.. {
             let key = i.to_be_bytes();
             if !node.can_insert::<BTreeNil>(&key) {
@@ -2154,7 +2154,14 @@ mod tests {
 
     #[test]
     fn test_btree_node_lower_bound_slot_uses_common_prefix() {
-        let mut node = BTreeNodeBox::alloc(0, 7, b"abc0", BTreeU64::INVALID_VALUE, b"abcz", false);
+        let mut node = BTreeNodeBox::alloc(
+            0,
+            TrxID::new(7),
+            b"abc0",
+            BTreeU64::INVALID_VALUE,
+            b"abcz",
+            false,
+        );
         for key in [b"abc1".as_slice(), b"abc3".as_slice(), b"abc5".as_slice()] {
             let idx = node.count();
             node.insert_at::<BTreeNil>(idx, key, BTreeNil);
@@ -2170,7 +2177,14 @@ mod tests {
 
     #[test]
     fn test_btree_node_lower_bound_child_uses_common_prefix() {
-        let mut node = BTreeNodeBox::alloc(1, 7, b"abc0", BTreeU64::from(10), b"abcz", false);
+        let mut node = BTreeNodeBox::alloc(
+            1,
+            TrxID::new(7),
+            b"abc0",
+            BTreeU64::from(10),
+            b"abcz",
+            false,
+        );
         for (key, block_id) in [(b"abc3".as_slice(), 20), (b"abc5".as_slice(), 30)] {
             let idx = node.count();
             node.insert_at::<BTreeU64>(idx, key, BTreeU64::from(block_id));
@@ -2193,7 +2207,7 @@ mod tests {
         header.set_count(0x2345);
         header.set_start_offset(0x3456);
         header.set_end_offset(0x4567);
-        header.set_ts(0x0102_0304_0506_0708);
+        header.set_ts(TrxID::new(0x0102_0304_0506_0708));
         header.set_lower_fence_value(BTreeU64::from(0x1112_1314_1516_1718));
         header.set_effective_space(0x89ab_cdef);
         header.set_prefix_len(0x6789);
@@ -2214,7 +2228,7 @@ mod tests {
         assert_eq!(header.count(), 0x2345);
         assert_eq!(header.start_offset(), 0x3456);
         assert_eq!(header.end_offset(), 0x4567);
-        assert_eq!(header.ts(), 0x0102_0304_0506_0708);
+        assert_eq!(header.ts(), TrxID::new(0x0102_0304_0506_0708));
         assert_eq!(
             header.lower_fence_value(),
             BTreeU64::from(0x1112_1314_1516_1718)
@@ -2250,7 +2264,7 @@ mod tests {
                     .await
                     .expect("test page allocation should succeed");
                 let node = page_guard.page_mut();
-                node.init(0, 0, &[], BTreeU64::INVALID_VALUE, &[], false);
+                node.init(0, TrxID::new(0), &[], BTreeU64::INVALID_VALUE, &[], false);
                 for i in 0u64..10 {
                     let k = i.to_be_bytes();
                     let slot_idx = node.insert(&k, BTreeU64::from(i));
@@ -2281,7 +2295,7 @@ mod tests {
                     .await
                     .expect("test page allocation should succeed");
                 let node = page_guard.page_mut();
-                node.init(0, 0, &[], BTreeU64::INVALID_VALUE, &[], false);
+                node.init(0, TrxID::new(0), &[], BTreeU64::INVALID_VALUE, &[], false);
 
                 // Insert test data
                 for i in 0u64..10 {
@@ -2330,7 +2344,7 @@ mod tests {
                 .await
                 .expect("test page allocation should succeed");
             let node = page_guard.page_mut();
-            node.init(0, 0, &[], BTreeU64::INVALID_VALUE, &[], false);
+            node.init(0, TrxID::new(0), &[], BTreeU64::INVALID_VALUE, &[], false);
             node.insert(b"a", BTreeU64::from(1));
             assert_eq!(
                 node.delete_exact(b"a", BTreeU64::from(1), true),
@@ -2366,7 +2380,7 @@ mod tests {
                     .await
                     .expect("test page allocation should succeed");
                 let node = page_guard.page_mut();
-                node.init(0, 0, &[], BTreeU64::INVALID_VALUE, &[], false);
+                node.init(0, TrxID::new(0), &[], BTreeU64::INVALID_VALUE, &[], false);
 
                 // Insert test data
                 for i in 0u64..10 {
@@ -2432,7 +2446,7 @@ mod tests {
                     .await
                     .expect("test page allocation should succeed");
                 let src_node = src_guard.page_mut();
-                src_node.init(0, 1, &[], BTreeU64::INVALID_VALUE, &[], false);
+                src_node.init(0, TrxID::new(1), &[], BTreeU64::INVALID_VALUE, &[], false);
 
                 // Insert test data
                 for i in 0u64..10 {
@@ -2452,7 +2466,7 @@ mod tests {
 
                 // Verify compaction results
                 assert_eq!(dst_node.height(), 0);
-                assert_eq!(dst_node.ts(), 1);
+                assert_eq!(dst_node.ts(), TrxID::new(1));
                 assert_eq!(dst_node.count(), src_node.count());
                 assert_eq!(&dst_node.lower_fence_key()[..], &[0u8; 0][..]);
                 assert_eq!(&dst_node.upper_fence_key()[..], &[0u8; 0][..]);
@@ -2483,7 +2497,7 @@ mod tests {
                     .await
                     .expect("test page allocation should succeed");
                 let src_node = src_guard.page_mut();
-                src_node.init(0, 3, &[], BTreeU64::INVALID_VALUE, &[], false);
+                src_node.init(0, TrxID::new(3), &[], BTreeU64::INVALID_VALUE, &[], false);
 
                 // Create empty destination node
                 let mut dst_guard = buf_pool
@@ -2497,7 +2511,7 @@ mod tests {
 
                 // Verify compaction results
                 assert_eq!(dst_node.height(), 0);
-                assert_eq!(dst_node.ts(), 3);
+                assert_eq!(dst_node.ts(), TrxID::new(3));
                 assert_eq!(dst_node.count(), 0);
                 assert_eq!(dst_node.lower_fence_key().as_bytes(), &[0u8; 0][..]);
                 assert_eq!(dst_node.upper_fence_key().as_bytes(), &[0u8; 0][..]);
@@ -2533,7 +2547,7 @@ mod tests {
                 let node1 = page1_guard.page_mut();
                 node1.init(
                     1,
-                    1,
+                    TrxID::new(1),
                     &[],
                     BTreeU64::INVALID_VALUE,
                     &10u64.to_be_bytes(),
@@ -2558,7 +2572,7 @@ mod tests {
                 let node2 = page2_guard.page_mut();
                 node2.init(
                     1,
-                    2,
+                    TrxID::new(2),
                     &10u64.to_be_bytes(),
                     BTreeU64::INVALID_VALUE,
                     &20u64.to_be_bytes(),
@@ -2603,7 +2617,7 @@ mod tests {
                     .await
                     .expect("test page allocation should succeed");
                 let node = page_guard.page_mut();
-                node.init(0, 0, &[], BTreeU64::INVALID_VALUE, &[], false);
+                node.init(0, TrxID::new(0), &[], BTreeU64::INVALID_VALUE, &[], false);
 
                 // Insert test data with short keys (<= KEY_HEAD_LEN)
                 for i in 0u64..5 {
@@ -2691,7 +2705,7 @@ mod tests {
                     .await
                     .expect("test page allocation should succeed");
                 let node = page_guard.page_mut();
-                node.init(0, 0, &[], BTreeU64::INVALID_VALUE, &[], true);
+                node.init(0, TrxID::new(0), &[], BTreeU64::INVALID_VALUE, &[], true);
                 for i in 0u64..300 {
                     let k = i.to_be_bytes();
                     let slot_idx = node.insert(&k, BTreeU64::from(i));
@@ -2728,7 +2742,7 @@ mod tests {
                     .await
                     .expect("test page allocation should succeed");
                 let node = page_guard.page_mut();
-                node.init(0, 0, &[], BTreeU64::INVALID_VALUE, &[], true);
+                node.init(0, TrxID::new(0), &[], BTreeU64::INVALID_VALUE, &[], true);
                 for _ in 0..COUNT {
                     let n = uniform.sample(&mut rng);
                     let key = n.to_be_bytes();

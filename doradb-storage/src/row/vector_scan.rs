@@ -9,9 +9,10 @@ use crate::bitmap::{Bitmap, BitmapRangeFilter};
 use crate::buffer::frame::FrameContext;
 use crate::catalog::TableColumnLayout;
 use crate::error::{Error, InternalError, Result};
+use crate::id::TrxID;
 use crate::row::{RowPage, RowPageNullBitmap};
+use crate::trx::trx_is_committed;
 use crate::trx::undo::RowUndoKind;
-use crate::trx::{TrxID, trx_is_committed};
 use crate::value::{PageVar, ValBuffer, ValType};
 use error_stack::Report;
 use zerocopy::byteorder::little_endian::{
@@ -428,6 +429,7 @@ mod tests {
     use crate::buffer::page::VersionedPageID;
     use crate::buffer::test_page_id;
     use crate::catalog::{ColumnAttributes, ColumnSpec, TableMetadata};
+    use crate::id::{RowID, TableID};
     use crate::row::tests::create_row_page;
     use crate::row::{Delete, InsertRow};
     use crate::trx::undo::{
@@ -509,7 +511,7 @@ mod tests {
         )
         .expect("valid table metadata");
         let mut page = create_row_page();
-        page.init(100, 200, metadata.col.as_ref());
+        page.init(RowID::new(100), 200, metadata.col.as_ref());
         let short = b"short";
         let long = b"very loooooooooooooooooong";
 
@@ -530,15 +532,15 @@ mod tests {
         for row_id in 100u64..200 {
             let res = page.insert(metadata.col.as_ref(), &insert);
             if let InsertRow::Ok(rid) = res {
-                assert!(rid == row_id);
+                assert!(rid == RowID::new(row_id));
             } else {
                 panic!("insert failed");
             }
         }
         // try deleting 2 rows
-        let res = page.delete(101);
+        let res = page.delete(RowID::new(101));
         assert!(matches!(res, Delete::Ok));
-        let res = page.delete(180);
+        let res = page.delete(RowID::new(180));
         assert!(matches!(res, Delete::Ok));
         // try vector scan
         let mut scanner = ScanBuffer::new(
@@ -564,14 +566,14 @@ mod tests {
         )
         .expect("valid table metadata");
         let mut page = create_row_page();
-        page.init(0, 8, metadata.col.as_ref());
+        page.init(RowID::new(0), 8, metadata.col.as_ref());
         assert!(matches!(
             page.insert(metadata.col.as_ref(), &[Val::Null, Val::U8(1)]),
-            InsertRow::Ok(0)
+            InsertRow::Ok(id) if id == RowID::new(0)
         ));
         assert!(matches!(
             page.insert(metadata.col.as_ref(), &[Val::U64(42), Val::U8(2)]),
-            InsertRow::Ok(1)
+            InsertRow::Ok(id) if id == RowID::new(1)
         ));
 
         let view = page.vector_view(metadata.col.as_ref());
@@ -602,17 +604,17 @@ mod tests {
         )
         .expect("valid table metadata");
         let mut page = create_row_page();
-        page.init(0, 8, metadata.col.as_ref());
+        page.init(RowID::new(0), 8, metadata.col.as_ref());
         for (row_id, value) in [Val::U8(10), Val::Null, Val::U8(12), Val::Null, Val::U8(14)]
             .into_iter()
             .enumerate()
         {
             assert!(matches!(
                 page.insert(metadata.col.as_ref(), &[value]),
-                InsertRow::Ok(inserted) if inserted == row_id as u64
+                InsertRow::Ok(inserted) if inserted == RowID::new(row_id as u64)
             ));
         }
-        assert!(matches!(page.delete(2), Delete::Ok));
+        assert!(matches!(page.delete(RowID::new(2)), Delete::Ok));
 
         let mut scanner = ScanBuffer::new(metadata.col.as_ref(), &[0]);
         scanner
@@ -692,7 +694,7 @@ mod tests {
         )
         .expect("valid table metadata");
         let mut page = create_row_page();
-        page.init(0, 5, metadata.col.as_ref());
+        page.init(RowID::new(0), 5, metadata.col.as_ref());
         for row_id in 0u64..5 {
             let row_idx = row_id as usize;
             let row_bytes = format!("row-{row_id}");
@@ -731,7 +733,7 @@ mod tests {
             ];
             let res = page.insert(metadata.col.as_ref(), &insert);
             if let InsertRow::Ok(rid) = res {
-                assert_eq!(rid, row_id);
+                assert_eq!(rid, RowID::new(row_id));
             } else {
                 panic!("insert failed");
             }
@@ -864,15 +866,15 @@ mod tests {
         )
         .expect("valid table metadata");
         let mut page = create_row_page();
-        page.init(0, 1, metadata.col.as_ref());
+        page.init(RowID::new(0), 1, metadata.col.as_ref());
         let insert = vec![Val::I8(1)];
         let res = page.insert(metadata.col.as_ref(), &insert);
-        assert!(matches!(res, InsertRow::Ok(0)));
-        assert!(matches!(page.delete(0), Delete::Ok));
+        assert!(matches!(res, InsertRow::Ok(id) if id == RowID::new(0)));
+        assert!(matches!(page.delete(RowID::new(0)), Delete::Ok));
 
         let mut map = RowVersionMap::new(Arc::clone(&metadata.col), 1);
         let undo = OwnedRowUndo::new(
-            0,
+            TableID::new(0),
             Some(VersionedPageID {
                 page_id: test_page_id(0),
                 generation: 0,
@@ -885,7 +887,7 @@ mod tests {
             next: NextRowUndo {
                 main: MainBranch {
                     entry: undo_ref,
-                    status: UndoStatus::Committed(200),
+                    status: UndoStatus::Committed(TrxID::new(200)),
                 },
                 indexes: vec![],
             },
@@ -894,7 +896,12 @@ mod tests {
         *map.write_exclusive(0) = Some(Box::new(head));
         let ctx = FrameContext::RowVerMap(map);
 
-        let view = page.vector_view_in_transition(metadata.col.as_ref(), &ctx, 100, 0);
+        let view = page.vector_view_in_transition(
+            metadata.col.as_ref(),
+            &ctx,
+            TrxID::new(100),
+            TrxID::new(0),
+        );
         assert_eq!(view.rows_non_deleted(), 1);
         let _keep_undo = undo;
     }
@@ -911,23 +918,28 @@ mod tests {
         )
         .expect("valid table metadata");
         let mut page = create_row_page();
-        page.init(0, 2, metadata.col.as_ref());
+        page.init(RowID::new(0), 2, metadata.col.as_ref());
         let insert = vec![Val::I8(1)];
         assert!(matches!(
             page.insert(metadata.col.as_ref(), &insert),
-            InsertRow::Ok(0)
+            InsertRow::Ok(id) if id == RowID::new(0)
         ));
         assert!(matches!(
             page.insert(metadata.col.as_ref(), &insert),
-            InsertRow::Ok(1)
+            InsertRow::Ok(id) if id == RowID::new(1)
         ));
-        assert!(matches!(page.delete(1), Delete::Ok));
+        assert!(matches!(page.delete(RowID::new(1)), Delete::Ok));
 
         let map = RowVersionMap::new(Arc::clone(&metadata.col), 2);
         let ctx = FrameContext::RowVerMap(map);
 
         let expected = page.vector_view(metadata.col.as_ref());
-        let view = page.vector_view_in_transition(metadata.col.as_ref(), &ctx, 100, 1);
+        let view = page.vector_view_in_transition(
+            metadata.col.as_ref(),
+            &ctx,
+            TrxID::new(100),
+            TrxID::new(1),
+        );
         assert_eq!(view.rows_non_deleted(), expected.rows_non_deleted());
     }
 
@@ -944,17 +956,17 @@ mod tests {
         )
         .expect("valid table metadata");
         let mut page = create_row_page();
-        page.init(0, 1, metadata.col.as_ref());
+        page.init(RowID::new(0), 1, metadata.col.as_ref());
         let insert = vec![Val::I8(1)];
         assert!(matches!(
             page.insert(metadata.col.as_ref(), &insert),
-            InsertRow::Ok(0)
+            InsertRow::Ok(id) if id == RowID::new(0)
         ));
 
         let mut map = RowVersionMap::new(Arc::clone(&metadata.col), 1);
         let uncommitted_ts = MIN_ACTIVE_TRX_ID + 1;
         let undo = OwnedRowUndo::new(
-            0,
+            TableID::new(0),
             Some(VersionedPageID {
                 page_id: test_page_id(0),
                 generation: 0,
@@ -976,7 +988,12 @@ mod tests {
         *map.write_exclusive(0) = Some(Box::new(head));
         let ctx = FrameContext::RowVerMap(map);
 
-        let _view = page.vector_view_in_transition(metadata.col.as_ref(), &ctx, 100, 0);
+        let _view = page.vector_view_in_transition(
+            metadata.col.as_ref(),
+            &ctx,
+            TrxID::new(100),
+            TrxID::new(0),
+        );
         let _keep_undo = undo;
     }
 }

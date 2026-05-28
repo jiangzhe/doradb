@@ -1,15 +1,16 @@
 use crate::buffer::guard::{PageExclusiveGuard, PageGuard};
 use crate::buffer::{BufferPool, FixedBufferPool, PoolGuard, PoolGuards};
+use crate::catalog::USER_OBJ_ID_START;
 use crate::catalog::storage::CatalogStorage;
 use crate::catalog::table::TableMetadata;
 use crate::catalog::{CatalogCheckpointBatch, CatalogRedoEntry};
-use crate::catalog::{ObjID, TableID, USER_OBJ_ID_START};
 use crate::error::{DataIntegrityError, Error, FileKind, Result};
-use crate::file::cow_file::{BlockID, MutableCowFile, SUPER_BLOCK_ID};
+use crate::file::cow_file::{MutableCowFile, SUPER_BLOCK_ID};
 use crate::file::multi_table_file::{
     CATALOG_TABLE_ROOT_DESC_COUNT, CatalogTableRootDesc, MultiTableFileSnapshot,
     MutableMultiTableFile,
 };
+use crate::id::{BlockID, RowID, TableID, TrxID};
 use crate::index::{
     ColumnBlockEntryPatch, ColumnBlockEntryShape, ColumnBlockIndex, ColumnDeleteDeltaPatch,
     ColumnDeleteDomain, ColumnLeafEntry,
@@ -17,7 +18,7 @@ use crate::index::{
 use crate::io::DirectBuf;
 use crate::lwc::{LwcBuilder, PersistedLwcBlock};
 use crate::row::ops::SelectKey;
-use crate::row::{InsertRow, RowID, RowPage};
+use crate::row::{InsertRow, RowPage};
 use crate::trx::redo::RowRedoKind;
 use crate::value::Val;
 use error_stack::Report;
@@ -82,7 +83,7 @@ impl CatalogStorage {
                 break;
             }
             if root.root_block_id.is_none() {
-                if root.pivot_row_id != 0 {
+                if root.pivot_row_id != RowID::new(0) {
                     return Err(invalid_catalog_payload(format!(
                         "empty catalog root has nonzero pivot_row_id={}",
                         root.pivot_row_id
@@ -90,7 +91,7 @@ impl CatalogStorage {
                 }
                 continue;
             }
-            if root.table_id as usize != idx {
+            if root.table_id.as_usize() != idx {
                 return Err(invalid_catalog_payload(format!(
                     "catalog root table id mismatch: root_table_id={}, slot_idx={idx}",
                     root.table_id
@@ -109,7 +110,7 @@ impl CatalogStorage {
     pub(crate) async fn apply_checkpoint_batch(
         &self,
         batch: CatalogCheckpointBatch,
-        next_user_obj_id: ObjID,
+        next_user_obj_id: TableID,
     ) -> Result<()> {
         let CatalogCheckpointBatch {
             replay_start_ts,
@@ -148,7 +149,7 @@ impl CatalogStorage {
         let mut ops_by_table: Vec<Vec<RowRedoKind>> =
             (0..self.tables.len()).map(|_| Vec::new()).collect();
         for CatalogRedoEntry { table_id, kind } in catalog_ops {
-            let table_idx = table_id as usize;
+            let table_idx = table_id.as_usize();
             if table_idx >= ops_by_table.len() {
                 continue;
             }
@@ -168,7 +169,7 @@ impl CatalogStorage {
             let new_root = self
                 .apply_table_ops(
                     &mut mutable,
-                    idx as TableID,
+                    TableID::from(idx),
                     table.metadata(),
                     current_root,
                     &ops_by_table[idx],
@@ -195,11 +196,11 @@ impl CatalogStorage {
         metadata: &TableMetadata,
         root: CatalogTableRootDesc,
         table_ops: &[RowRedoKind],
-        checkpoint_cts: u64,
+        checkpoint_cts: TrxID,
     ) -> Result<CatalogTableRootDesc> {
         let disk_pool_guard = self.disk_pool.pool_guard();
         // Step 1: Validate root invariants and construct a base index snapshot for reads.
-        if root.root_block_id.is_none() && root.pivot_row_id != 0 {
+        if root.root_block_id.is_none() && root.pivot_row_id != RowID::new(0) {
             return Err(invalid_catalog_payload(format!(
                 "empty catalog table root has nonzero pivot_row_id={}",
                 root.pivot_row_id
@@ -498,7 +499,7 @@ impl CatalogStorage {
         root: CatalogTableRootDesc,
     ) -> Result<Vec<RowRecord>> {
         if root.root_block_id.is_none() {
-            if root.pivot_row_id != 0 {
+            if root.pivot_row_id != RowID::new(0) {
                 return Err(invalid_catalog_payload(format!(
                     "empty catalog root has nonzero pivot_row_id={}",
                     root.pivot_row_id
@@ -653,7 +654,7 @@ impl CatalogStorage {
         let mut lwc_blocks = Vec::new();
         let mut builder = LwcBuilder::new(&metadata.col);
         let mut builder_start = None;
-        let mut builder_end = 0u64;
+        let mut builder_end = RowID::new(0);
         let meta_guard = meta_pool.pool_guard();
         let mut temp_page = meta_pool.allocate_page::<RowPage>(&meta_guard).await?;
 
@@ -827,8 +828,9 @@ mod tests {
     use crate::catalog::USER_OBJ_ID_START;
     use crate::catalog::tests::{table1, table2};
     use crate::conf::{EngineConfig, TrxSysConfig};
+    use crate::file::BlockKey;
     use crate::file::multi_table_file::{CATALOG_MTB_FILE_ID, MutableMultiTableFile};
-    use crate::file::{BlockID, BlockKey};
+    use crate::id::BlockID;
     use crate::index::{ColumnBlockIndex, ColumnDeleteDomain};
     use crate::row::ops::SelectKey;
     use crate::trx::redo::RowRedoKind;
@@ -850,11 +852,11 @@ mod tests {
                 .unwrap();
 
             let storage = &engine.catalog().storage;
-            let table = storage.get_catalog_table(0).unwrap();
+            let table = storage.get_catalog_table(TableID::new(0)).unwrap();
             let root = CatalogTableRootDesc {
-                table_id: 0,
+                table_id: TableID::new(0),
                 root_block_id: None,
-                pivot_row_id: 0,
+                pivot_row_id: RowID::new(0),
             };
             let table_id = USER_OBJ_ID_START + 42;
             let table_ops = vec![
@@ -865,12 +867,19 @@ mod tests {
                 MutableMultiTableFile::fork(&storage.mtb, storage.table_fs.background_writes());
 
             let next_root = storage
-                .apply_table_ops(&mut mutable, 0, table.metadata(), root, &table_ops, 7)
+                .apply_table_ops(
+                    &mut mutable,
+                    TableID::new(0),
+                    table.metadata(),
+                    root,
+                    &table_ops,
+                    TrxID::new(7),
+                )
                 .await
                 .unwrap();
 
             assert_eq!(next_root.root_block_id, None);
-            assert_eq!(next_root.pivot_row_id, 0);
+            assert_eq!(next_root.pivot_row_id, RowID::new(0));
         });
     }
 
@@ -897,7 +906,7 @@ mod tests {
                 .unwrap();
 
             let storage = &engine.catalog().storage;
-            let table = storage.get_catalog_table(0).unwrap();
+            let table = storage.get_catalog_table(TableID::new(0)).unwrap();
             let root = storage.checkpoint_snapshot().unwrap().meta.table_roots[0];
             assert!(root.root_block_id.is_some());
 
@@ -910,7 +919,14 @@ mod tests {
                 MutableMultiTableFile::fork(&storage.mtb, storage.table_fs.background_writes());
 
             let next_root = storage
-                .apply_table_ops(&mut mutable, 0, table.metadata(), root, &table_ops, 8)
+                .apply_table_ops(
+                    &mut mutable,
+                    TableID::new(0),
+                    table.metadata(),
+                    root,
+                    &table_ops,
+                    TrxID::new(8),
+                )
                 .await
                 .unwrap();
 

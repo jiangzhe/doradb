@@ -2,13 +2,14 @@ use crate::bitmap::AllocMap;
 use crate::buffer::arena::QuiescentArena;
 use crate::buffer::frame::{BufferFrame, FrameKind};
 use crate::buffer::guard::{FacadePageGuard, PageExclusiveGuard, PageLatchGuard};
-use crate::buffer::page::{BufferPage, Page, PageID, VersionedPageID, validate_frame_page_kind};
+use crate::buffer::page::{BufferPage, Page, VersionedPageID, validate_frame_page_kind};
 use crate::buffer::{
     BufferPool, BufferPoolStats, BufferPoolStatsHandle, PoolGuard, PoolIdentity, PoolRole,
     RowPoolRole,
 };
 use crate::error::Validation::Valid;
 use crate::error::{Error, ResourceError, Result, Validation};
+use crate::id::PageID;
 use crate::latch::LatchFallbackMode;
 use error_stack::Report;
 use std::mem;

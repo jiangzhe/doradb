@@ -1,20 +1,17 @@
 use crate::buffer::page::VersionedPageID;
 use crate::buffer::{BufferPool, PoolGuards, PoolRole};
-use crate::catalog::{IndexNo, IndexSpec, TableID, TableSpec};
+use crate::catalog::{IndexNo, IndexSpec, TableSpec};
 use crate::engine::EngineRef;
 use crate::error::{OperationError, Result};
+use crate::id::{RowID, SessionID, TableID, TrxID};
 use crate::lock::{FreshLockGuard, LockMode, LockOwner, LockOwnerGroup, LockResource};
-use crate::row::RowID;
 use crate::table::Table;
-use crate::trx::{ActiveTrx, TrxID};
+use crate::trx::ActiveTrx;
 use error_stack::Report;
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-
-/// Engine-local session identity.
-pub type SessionID = u64;
 
 /// Shared session-level DDL admission context.
 pub(crate) struct SessionDdlContext {
@@ -262,7 +259,7 @@ impl SessionState {
     /// Mark the session transaction as committed at the given CTS.
     #[inline]
     pub fn commit(&self, cts: TrxID) {
-        self.last_cts.store(cts, Ordering::SeqCst);
+        self.last_cts.store(cts.as_u64(), Ordering::SeqCst);
         self.in_trx.store(false, Ordering::SeqCst);
     }
 
