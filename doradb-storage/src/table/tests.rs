@@ -7057,8 +7057,8 @@ fn test_checkpoint_readiness_delayed_reports_effective_ts_and_horizon() {
         let CheckpointReadiness::Delayed { reason } = readiness else {
             panic!("expected delayed checkpoint readiness, got {readiness:?}");
         };
-        assert_eq!(reason.effective_ts, active_root_effective_ts.as_u64());
-        assert_eq!(reason.min_active_sts, reader.sts().as_u64());
+        assert_eq!(reason.effective_ts, active_root_effective_ts);
+        assert_eq!(reason.min_active_sts, reader.sts());
         assert!(reason.effective_ts >= reason.min_active_sts);
 
         reader.commit().await.unwrap();
@@ -7100,8 +7100,8 @@ fn test_checkpoint_readiness_uses_root_effective_ts_not_checkpoint_start_ts() {
         let CheckpointReadiness::Delayed { reason } = readiness else {
             panic!("expected effective timestamp delay, got {readiness:?}");
         };
-        assert_eq!(reason.effective_ts, effective_ts.as_u64());
-        assert!(reason.min_active_sts <= reader_sts.get().as_u64());
+        assert_eq!(reason.effective_ts, effective_ts);
+        assert!(reason.min_active_sts <= reader_sts.get());
         assert!(reason.effective_ts >= reason.min_active_sts);
 
         let (_, mut reader) = reader_holder
@@ -7193,11 +7193,8 @@ fn test_checkpoint_delayed_preserves_root_and_frozen_pages_until_ready() {
         let CheckpointOutcome::Delayed { reason } = outcome else {
             panic!("expected delayed checkpoint, got {outcome:?}");
         };
-        assert_eq!(
-            reason.effective_ts,
-            effective_ts_protected_by_reader.as_u64()
-        );
-        assert_eq!(reason.min_active_sts, reader.sts().as_u64());
+        assert_eq!(reason.effective_ts, effective_ts_protected_by_reader);
+        assert_eq!(reason.min_active_sts, reader.sts());
         assert_root_metadata_unchanged(&root_before_delay, &sys.table);
 
         let page_guard = sys
@@ -7247,8 +7244,8 @@ fn test_second_checkpoint_waits_for_previous_root_horizon() {
         let CheckpointOutcome::Delayed { reason } = outcome else {
             panic!("expected second checkpoint to wait, got {outcome:?}");
         };
-        assert_eq!(reason.effective_ts, first_effective_ts.as_u64());
-        assert_eq!(reason.min_active_sts, reader.sts().as_u64());
+        assert_eq!(reason.effective_ts, first_effective_ts);
+        assert_eq!(reason.min_active_sts, reader.sts());
         assert_root_metadata_unchanged(&root_before_second, &sys.table);
 
         reader.commit().await.unwrap();
@@ -7334,8 +7331,8 @@ fn test_checkpoint_rechecks_readiness_after_root_mutation_lease() {
         };
         let root_after = sys.table.file().active_root_unchecked();
         assert!(root_after.root_ts > root_before.root_ts);
-        assert_eq!(reason.effective_ts, root_after.effective_ts().as_u64());
-        assert_eq!(reason.min_active_sts, reader.sts().as_u64());
+        assert_eq!(reason.effective_ts, root_after.effective_ts());
+        assert_eq!(reason.min_active_sts, reader.sts());
 
         reader.commit().await.unwrap();
     });
@@ -8953,7 +8950,7 @@ async fn checkpoint_published(table: &Table, session: &mut Session) -> TrxID {
     for _ in 0..50 {
         match table.checkpoint(session).await.unwrap() {
             CheckpointOutcome::Published { checkpoint_ts } => {
-                return TrxID::new(checkpoint_ts);
+                return checkpoint_ts;
             }
             CheckpointOutcome::Delayed { reason } => {
                 last_delay = Some(reason);

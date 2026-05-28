@@ -88,9 +88,77 @@ macro_rules! impl_id {
     };
 }
 
-use crate::compression::BitPackable;
-use crate::error::Result;
-use crate::serde::{Deser, Ser, Serde};
+macro_rules! impl_id_serde {
+    ($name:ident) => {
+        impl crate::serde::Ser<'_> for $name {
+            #[inline]
+            fn ser_len(&self) -> usize {
+                ::std::mem::size_of::<u64>()
+            }
+
+            #[inline]
+            fn ser<S: crate::serde::Serde + ?Sized>(&self, out: &mut S, start_idx: usize) -> usize {
+                out.ser_u64(start_idx, self.as_u64())
+            }
+        }
+
+        impl crate::serde::Deser for $name {
+            #[inline]
+            fn deser<S: crate::serde::Serde + ?Sized>(
+                input: &S,
+                start_idx: usize,
+            ) -> crate::error::Result<(usize, Self)> {
+                input
+                    .deser_u64(start_idx)
+                    .map(|(idx, raw)| (idx, Self::new(raw)))
+            }
+        }
+    };
+}
+
+macro_rules! impl_id_bitpackable {
+    ($name:ident) => {
+        impl crate::compression::BitPackable for $name {
+            const ZERO: Self = Self::new(0);
+
+            #[inline]
+            fn sub_to_u64(self, min: Self) -> u64 {
+                self.as_u64().wrapping_sub(min.as_u64())
+            }
+
+            #[inline]
+            fn sub_to_u32(self, min: Self) -> u32 {
+                self.as_u64().wrapping_sub(min.as_u64()) as u32
+            }
+
+            #[inline]
+            fn add_from_u32(self, delta: u32) -> Self {
+                Self::new(self.as_u64().wrapping_add(delta as u64))
+            }
+
+            #[inline]
+            fn sub_to_u16(self, min: Self) -> u16 {
+                self.as_u64().wrapping_sub(min.as_u64()) as u16
+            }
+
+            #[inline]
+            fn add_from_u16(self, delta: u16) -> Self {
+                Self::new(self.as_u64().wrapping_add(delta as u64))
+            }
+
+            #[inline]
+            fn sub_to_u8(self, min: Self) -> u8 {
+                self.as_u64().wrapping_sub(min.as_u64()) as u8
+            }
+
+            #[inline]
+            fn add_from_u8(self, delta: u8) -> Self {
+                Self::new(self.as_u64().wrapping_add(delta as u64))
+            }
+        }
+    };
+}
+
 use crate::value::Val;
 use std::mem;
 use std::ops::{Add, AddAssign, Sub, SubAssign};
@@ -155,65 +223,8 @@ impl From<RowID> for Val {
     }
 }
 
-impl Ser<'_> for RowID {
-    #[inline]
-    fn ser_len(&self) -> usize {
-        mem::size_of::<u64>()
-    }
-
-    #[inline]
-    fn ser<S: Serde + ?Sized>(&self, out: &mut S, start_idx: usize) -> usize {
-        out.ser_u64(start_idx, self.as_u64())
-    }
-}
-
-impl Deser for RowID {
-    #[inline]
-    fn deser<S: Serde + ?Sized>(input: &S, start_idx: usize) -> Result<(usize, Self)> {
-        input
-            .deser_u64(start_idx)
-            .map(|(idx, raw)| (idx, Self::new(raw)))
-    }
-}
-
-impl BitPackable for RowID {
-    const ZERO: Self = Self::new(0);
-
-    #[inline]
-    fn sub_to_u64(self, min: Self) -> u64 {
-        self.as_u64().wrapping_sub(min.as_u64())
-    }
-
-    #[inline]
-    fn sub_to_u32(self, min: Self) -> u32 {
-        self.as_u64().wrapping_sub(min.as_u64()) as u32
-    }
-
-    #[inline]
-    fn add_from_u32(self, delta: u32) -> Self {
-        Self::new(self.as_u64().wrapping_add(delta as u64))
-    }
-
-    #[inline]
-    fn sub_to_u16(self, min: Self) -> u16 {
-        self.as_u64().wrapping_sub(min.as_u64()) as u16
-    }
-
-    #[inline]
-    fn add_from_u16(self, delta: u16) -> Self {
-        Self::new(self.as_u64().wrapping_add(delta as u64))
-    }
-
-    #[inline]
-    fn sub_to_u8(self, min: Self) -> u8 {
-        self.as_u64().wrapping_sub(min.as_u64()) as u8
-    }
-
-    #[inline]
-    fn add_from_u8(self, delta: u8) -> Self {
-        Self::new(self.as_u64().wrapping_add(delta as u64))
-    }
-}
+impl_id_serde!(RowID);
+impl_id_bitpackable!(RowID);
 
 impl_id! {
     /// Stable logical table identity and deterministic user table file identity.
@@ -267,26 +278,7 @@ impl From<TableID> for Val {
     }
 }
 
-impl Ser<'_> for TableID {
-    #[inline]
-    fn ser_len(&self) -> usize {
-        mem::size_of::<u64>()
-    }
-
-    #[inline]
-    fn ser<S: Serde + ?Sized>(&self, out: &mut S, start_idx: usize) -> usize {
-        out.ser_u64(start_idx, self.as_u64())
-    }
-}
-
-impl Deser for TableID {
-    #[inline]
-    fn deser<S: Serde + ?Sized>(input: &S, start_idx: usize) -> Result<(usize, Self)> {
-        input
-            .deser_u64(start_idx)
-            .map(|(idx, raw)| (idx, Self::new(raw)))
-    }
-}
+impl_id_serde!(TableID);
 
 impl_id! {
     /// Transaction timestamp and active transaction identity.
@@ -335,26 +327,7 @@ impl Add<u64> for TrxID {
     }
 }
 
-impl Ser<'_> for TrxID {
-    #[inline]
-    fn ser_len(&self) -> usize {
-        mem::size_of::<u64>()
-    }
-
-    #[inline]
-    fn ser<S: Serde + ?Sized>(&self, out: &mut S, start_idx: usize) -> usize {
-        out.ser_u64(start_idx, self.as_u64())
-    }
-}
-
-impl Deser for TrxID {
-    #[inline]
-    fn deser<S: Serde + ?Sized>(input: &S, start_idx: usize) -> Result<(usize, Self)> {
-        input
-            .deser_u64(start_idx)
-            .map(|(idx, raw)| (idx, Self::new(raw)))
-    }
-}
+impl_id_serde!(TrxID);
 
 impl_id! {
     /// Engine-local session identity.
@@ -453,65 +426,8 @@ impl PartialEq<PageID> for i32 {
     }
 }
 
-impl Ser<'_> for PageID {
-    #[inline]
-    fn ser_len(&self) -> usize {
-        mem::size_of::<u64>()
-    }
-
-    #[inline]
-    fn ser<S: Serde + ?Sized>(&self, out: &mut S, start_idx: usize) -> usize {
-        out.ser_u64(start_idx, self.0)
-    }
-}
-
-impl Deser for PageID {
-    #[inline]
-    fn deser<S: Serde + ?Sized>(input: &S, start_idx: usize) -> Result<(usize, Self)> {
-        input
-            .deser_u64(start_idx)
-            .map(|(idx, raw)| (idx, Self(raw)))
-    }
-}
-
-impl BitPackable for PageID {
-    const ZERO: Self = Self(0);
-
-    #[inline]
-    fn sub_to_u64(self, min: Self) -> u64 {
-        self.0.wrapping_sub(min.0)
-    }
-
-    #[inline]
-    fn sub_to_u32(self, min: Self) -> u32 {
-        self.0.wrapping_sub(min.0) as u32
-    }
-
-    #[inline]
-    fn add_from_u32(self, delta: u32) -> Self {
-        Self(self.0.wrapping_add(delta as u64))
-    }
-
-    #[inline]
-    fn sub_to_u16(self, min: Self) -> u16 {
-        self.0.wrapping_sub(min.0) as u16
-    }
-
-    #[inline]
-    fn add_from_u16(self, delta: u16) -> Self {
-        Self(self.0.wrapping_add(delta as u64))
-    }
-
-    #[inline]
-    fn sub_to_u8(self, min: Self) -> u8 {
-        self.0.wrapping_sub(min.0) as u8
-    }
-
-    #[inline]
-    fn add_from_u8(self, delta: u8) -> Self {
-        Self(self.0.wrapping_add(delta as u64))
-    }
-}
+impl_id_serde!(PageID);
+impl_id_bitpackable!(PageID);
 
 impl_id! {
     /// Physical file identity used by persisted-block mappings and shared-storage routing.
@@ -558,65 +474,8 @@ impl PartialEq<FileID> for i32 {
     }
 }
 
-impl Ser<'_> for FileID {
-    #[inline]
-    fn ser_len(&self) -> usize {
-        mem::size_of::<u64>()
-    }
-
-    #[inline]
-    fn ser<S: Serde + ?Sized>(&self, out: &mut S, start_idx: usize) -> usize {
-        out.ser_u64(start_idx, self.0)
-    }
-}
-
-impl Deser for FileID {
-    #[inline]
-    fn deser<S: Serde + ?Sized>(input: &S, start_idx: usize) -> Result<(usize, Self)> {
-        input
-            .deser_u64(start_idx)
-            .map(|(idx, raw)| (idx, Self(raw)))
-    }
-}
-
-impl BitPackable for FileID {
-    const ZERO: Self = Self(0);
-
-    #[inline]
-    fn sub_to_u64(self, min: Self) -> u64 {
-        self.0.wrapping_sub(min.0)
-    }
-
-    #[inline]
-    fn sub_to_u32(self, min: Self) -> u32 {
-        self.0.wrapping_sub(min.0) as u32
-    }
-
-    #[inline]
-    fn add_from_u32(self, delta: u32) -> Self {
-        Self(self.0.wrapping_add(delta as u64))
-    }
-
-    #[inline]
-    fn sub_to_u16(self, min: Self) -> u16 {
-        self.0.wrapping_sub(min.0) as u16
-    }
-
-    #[inline]
-    fn add_from_u16(self, delta: u16) -> Self {
-        Self(self.0.wrapping_add(delta as u64))
-    }
-
-    #[inline]
-    fn sub_to_u8(self, min: Self) -> u8 {
-        self.0.wrapping_sub(min.0) as u8
-    }
-
-    #[inline]
-    fn add_from_u8(self, delta: u8) -> Self {
-        Self(self.0.wrapping_add(delta as u64))
-    }
-}
+impl_id_serde!(FileID);
+impl_id_bitpackable!(FileID);
 
 impl_id! {
     /// Persisted fixed-size file block identity.
@@ -682,62 +541,5 @@ impl PartialEq<BlockID> for i32 {
     }
 }
 
-impl Ser<'_> for BlockID {
-    #[inline]
-    fn ser_len(&self) -> usize {
-        mem::size_of::<u64>()
-    }
-
-    #[inline]
-    fn ser<S: Serde + ?Sized>(&self, out: &mut S, start_idx: usize) -> usize {
-        out.ser_u64(start_idx, self.0)
-    }
-}
-
-impl Deser for BlockID {
-    #[inline]
-    fn deser<S: Serde + ?Sized>(input: &S, start_idx: usize) -> Result<(usize, Self)> {
-        input
-            .deser_u64(start_idx)
-            .map(|(idx, raw)| (idx, Self(raw)))
-    }
-}
-
-impl BitPackable for BlockID {
-    const ZERO: Self = Self(0);
-
-    #[inline]
-    fn sub_to_u64(self, min: Self) -> u64 {
-        self.0.wrapping_sub(min.0)
-    }
-
-    #[inline]
-    fn sub_to_u32(self, min: Self) -> u32 {
-        self.0.wrapping_sub(min.0) as u32
-    }
-
-    #[inline]
-    fn add_from_u32(self, delta: u32) -> Self {
-        Self(self.0.wrapping_add(delta as u64))
-    }
-
-    #[inline]
-    fn sub_to_u16(self, min: Self) -> u16 {
-        self.0.wrapping_sub(min.0) as u16
-    }
-
-    #[inline]
-    fn add_from_u16(self, delta: u16) -> Self {
-        Self(self.0.wrapping_add(delta as u64))
-    }
-
-    #[inline]
-    fn sub_to_u8(self, min: Self) -> u8 {
-        self.0.wrapping_sub(min.0) as u8
-    }
-
-    #[inline]
-    fn add_from_u8(self, delta: u8) -> Self {
-        Self(self.0.wrapping_add(delta as u64))
-    }
-}
+impl_id_serde!(BlockID);
+impl_id_bitpackable!(BlockID);

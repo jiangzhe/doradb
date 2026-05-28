@@ -1089,7 +1089,7 @@ mod tests {
 
     async fn checkpoint_published(table: &Table, session: &mut crate::session::Session) -> TrxID {
         match table.checkpoint(session).await.unwrap() {
-            CheckpointOutcome::Published { checkpoint_ts } => TrxID::new(checkpoint_ts),
+            CheckpointOutcome::Published { checkpoint_ts } => checkpoint_ts,
             CheckpointOutcome::Delayed { reason } => {
                 panic!("checkpoint should publish, delayed by {reason:?}")
             }

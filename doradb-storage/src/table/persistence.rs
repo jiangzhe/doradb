@@ -61,8 +61,8 @@ impl CheckpointReadiness {
         } else {
             Self::Delayed {
                 reason: CheckpointDelayReason {
-                    effective_ts: effective_ts.as_u64(),
-                    min_active_sts: min_active_sts.as_u64(),
+                    effective_ts,
+                    min_active_sts,
                 },
             }
         }
@@ -75,7 +75,7 @@ pub enum CheckpointOutcome {
     /// A new checkpoint root was durably published.
     Published {
         /// Commit timestamp of the publishing checkpoint transaction.
-        checkpoint_ts: u64,
+        checkpoint_ts: TrxID,
     },
     /// No checkpoint work was published because the active root is still live.
     Delayed {
@@ -93,9 +93,9 @@ pub enum CheckpointOutcome {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CheckpointDelayReason {
     /// Runtime post-publish root-observation boundary used by reclamation.
-    pub effective_ts: u64,
+    pub effective_ts: TrxID,
     /// Current global minimum active snapshot timestamp used by GC.
-    pub min_active_sts: u64,
+    pub min_active_sts: TrxID,
 }
 
 #[derive(Clone, Copy)]
@@ -1131,9 +1131,7 @@ impl TablePersistence for Table {
         }
         drop(publish_lease);
         drop(root_mutation_lease);
-        Ok(CheckpointOutcome::Published {
-            checkpoint_ts: checkpoint_ts.as_u64(),
-        })
+        Ok(CheckpointOutcome::Published { checkpoint_ts })
     }
 }
 

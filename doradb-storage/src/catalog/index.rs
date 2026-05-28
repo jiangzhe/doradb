@@ -2377,7 +2377,7 @@ mod tests {
         for _ in 0..50 {
             match table.checkpoint(session).await.unwrap() {
                 CheckpointOutcome::Published { checkpoint_ts } => {
-                    return TrxID::new(checkpoint_ts);
+                    return checkpoint_ts;
                 }
                 CheckpointOutcome::Delayed { reason } => {
                     last_delay = Some(reason);
