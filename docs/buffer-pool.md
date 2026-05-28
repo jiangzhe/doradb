@@ -46,6 +46,7 @@ Characteristics:
 1. In-memory only.
 2. No spill/writeback lifecycle.
 3. Stable residency once allocated.
+4. No checksum load/persist hook; fixed pages do not cross an IO boundary.
 
 Typical usage:
 
@@ -60,6 +61,8 @@ Characteristics:
 1. Supports page allocation/deallocation.
 2. Supports read/write IO on backing sparse file.
 3. Supports dirty-page writeback and drop from memory.
+4. Stamps a BLAKE3 checksum trailer on dirty spill-file writeback and
+   validates that trailer before a full-page reload is published as resident.
 
 Key components:
 
@@ -80,6 +83,10 @@ Eviction behavior is controlled by shared `EvictionArbiter`:
 `EvictableBufferPool` and readonly pools use the same eviction policy and tuning
 fields, but have different runtime eviction behaviors. `EvictableBufferPool` may
 need writeback before dropping dirty pages.
+
+Dirty evictable pages reserve the shared checksum-trailer bytes in their runtime
+page layouts. Clean evictions remain drop-only and do not rewrite the swap file
+only to refresh a checksum.
 
 Decision rule:
 
@@ -133,8 +140,9 @@ foreground user-table readonly-cache correctness is the driver for the barrier.
 ### Miss/Load and Error Flow
 
 1. miss -> reserve free frame -> read table file page into frame memory
-2. publish mapping and frame metadata
-3. return guards from global frame arena
+2. validate the persisted block envelope/checksum for the expected page kind
+3. publish mapping and frame metadata
+4. return guards from global frame arena
 
 Readonly-specific accessors return `Result` for recoverable miss/load errors.  
 The generic `BufferPool` trait boundary still has deferred error policy and uses explicit `todo!()` for unresolved mapping decisions.

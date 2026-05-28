@@ -23,6 +23,7 @@ use crate::error::{
     CompletionErrorKind, CompletionResult, Error, InternalError, IoError, LifecycleError,
     LifecycleResult, ResourceError, Result, Validation,
 };
+use crate::file::block_integrity::{validate_block_checksum, write_block_checksum};
 use crate::file::fs::{FileSystem, FileSystemWorkers};
 use crate::file::{BlockID, BlockKey, INDEX_POOL_SWAP_FILE_ID, MEM_POOL_SWAP_FILE_ID, SparseFile};
 use crate::io::{
@@ -179,6 +180,7 @@ impl EvictableBufferPool {
                                         page_id,
                                         Arc::clone(&self.inflight_io),
                                         self.stats.clone(),
+                                        self.role,
                                         reservation,
                                     );
                                     DispatchAction::SendRead { req, completion }
@@ -198,6 +200,7 @@ impl EvictableBufferPool {
                                     page_id,
                                     Arc::clone(&self.inflight_io),
                                     self.stats.clone(),
+                                    self.role,
                                     reservation,
                                 );
                                 DispatchAction::SendRead { req, completion }
@@ -655,6 +658,26 @@ impl EvictablePoolStateMachine {
     }
 }
 
+#[inline]
+fn write_evictable_spill_checksum(page: &mut Page) {
+    write_block_checksum(page);
+}
+
+#[inline]
+fn validate_evictable_spill_checksum(
+    page: &Page,
+    role: PoolRole,
+    page_id: PageID,
+) -> CompletionResult<()> {
+    validate_block_checksum(page).map_err(|err| {
+        let reason = *err.current_context();
+        err.change_context(CompletionErrorKind::DataIntegrity(reason))
+            .attach(format!(
+                "validate evictable spill page checksum: role={role:?}, page_id={page_id}"
+            ))
+    })
+}
+
 /// Backend-facing pool submission emitted by `EvictablePoolStateMachine`.
 pub(crate) enum EvictSubmission {
     Read(PreparedEvictReadSubmission),
@@ -705,6 +728,7 @@ impl IOStateMachine for EvictablePoolStateMachine {
                     let page_id = page_guard.page_id();
                     debug_assert!(self.pool.inflight_io.contains(page_id));
                     debug_assert!(page_guard.bf().kind() == FrameKind::Evicting);
+                    write_evictable_spill_checksum(page_guard.page_mut());
                     // SAFETY: the borrowed page pointer refers to one live page-sized arena
                     // allocation, and the resulting `PageIO` owns `page_guard` until completion.
                     let operation = unsafe {
@@ -1145,6 +1169,7 @@ impl PageReservation for EvictPageReservation {
 /// an error.
 pub(crate) struct EvictReadSubmission {
     key: PageID,
+    role: PoolRole,
     inflight_io: Arc<InflightIO>,
     stats: BufferPoolStatsHandle,
     reservation: Option<Box<PageReservationGuard<EvictPageReservation>>>,
@@ -1158,11 +1183,13 @@ impl EvictReadSubmission {
         page_id: PageID,
         inflight_io: Arc<InflightIO>,
         stats: BufferPoolStatsHandle,
+        role: PoolRole,
         reservation: PageReservationGuard<EvictPageReservation>,
     ) -> Self {
         stats.add_queued_reads(1);
         EvictReadSubmission {
             key: page_id,
+            role,
             inflight_io,
             stats,
             reservation: Some(Box::new(reservation)),
@@ -1245,12 +1272,18 @@ impl EvictReadSubmission {
                 let reservation = self.reservation.take().expect(
                     "evict read submission must still own its page reservation before publish",
                 );
-                (*reservation).publish().map_err(|err| {
-                    CompletionErrorKind::report_error(
-                        err,
-                        format!("publish evict pool read: page_id={page_id}"),
-                    )
-                })
+                match validate_evictable_spill_checksum(reservation.page(), self.role, page_id) {
+                    Ok(()) => (*reservation).publish().map_err(|err| {
+                        CompletionErrorKind::report_error(
+                            err,
+                            format!("publish evict pool read: page_id={page_id}"),
+                        )
+                    }),
+                    Err(err) => {
+                        drop(reservation);
+                        Err(err)
+                    }
+                }
             }
             Ok(len) => {
                 drop(self.reservation.take());
@@ -1568,7 +1601,12 @@ pub(crate) mod tests {
     use crate::buffer::test_page_id;
     use crate::conf::{EngineConfig, FileSystemConfig, TrxSysConfig};
     use crate::engine::Engine;
-    use crate::error::{CompletionErrorKind, ConfigError, ErrorKind};
+    use crate::error::{CompletionErrorKind, ConfigError, DataIntegrityError, ErrorKind};
+    use crate::file::block_integrity::{
+        BLOCK_INTEGRITY_TRAILER_SIZE, checksum_offset as block_checksum_offset,
+        validate_block_checksum as validate_block_checksum_for_test,
+        write_block_checksum as write_block_checksum_for_test,
+    };
     use crate::file::fs::FileSystem;
     use crate::file::fs::tests::{
         build_test_fs_owner_in, io_backend_stats_handle_identity as fs_stats_handle_identity,
@@ -1662,6 +1700,41 @@ pub(crate) mod tests {
             Ok(_) => panic!("expected internal buffer-page kind mismatch"),
             Err(err) => assert!(err.is_kind(ErrorKind::Internal)),
         }
+    }
+
+    fn make_reload_submission_for_test(
+        owner: &QuiescentBox<EvictableBufferPool>,
+        pool_guard: &PoolGuard,
+        page_id: PageID,
+        fill_page: impl FnOnce(&mut Page),
+    ) -> (EvictReadSubmission, Arc<PageIOCompletion>) {
+        assert!(owner.in_mem.try_inc());
+        let mut page_guard = owner.try_lock_page_exclusive(pool_guard, page_id).unwrap();
+        fill_page(page_guard.page_mut());
+        let reservation = PageReservationGuard::new(EvictPageReservation::new(
+            page_guard,
+            Arc::clone(&owner.in_mem),
+        ));
+        let completion = Arc::new(PageIOCompletion::new());
+        {
+            let mut g = owner.inflight_io.map.lock();
+            g.insert(
+                page_id,
+                IOStatus {
+                    kind: IOKind::Read,
+                    completion: Some(Arc::clone(&completion)),
+                },
+            );
+        }
+        owner.inflight_io.reads.store(1, Ordering::Relaxed);
+        let req = EvictReadSubmission::new(
+            page_id,
+            Arc::clone(&owner.inflight_io),
+            owner.stats.clone(),
+            owner.role,
+            reservation,
+        );
+        (req, completion)
     }
 
     fn build_raw_pool_for_test(
@@ -2059,6 +2132,154 @@ pub(crate) mod tests {
             assert_eq!(delta.cache_misses, 0);
             assert_eq!(delta.queued_reads, 0);
             assert_eq!(pool.arena.frame(page_id).kind(), FrameKind::Evicted);
+        });
+    }
+
+    #[test]
+    fn test_evictable_writeback_preparation_stamps_checksum_trailer() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let (_fs_owner, pool, storage) = build_raw_pool_for_test(
+                EvictableBufferPoolConfig::default()
+                    .role(PoolRole::Mem)
+                    .data_swap_file(temp_dir.path().join("data.swp"))
+                    .max_mem_size(64u64 * 1024 * 1024)
+                    .max_file_size(128u64 * 1024 * 1024),
+            )
+            .unwrap();
+            let owner = QuiescentBox::new(pool);
+            let pool_guard = owner.pool_guard();
+            let mut state_machine = EvictablePoolStateMachine {
+                pool: owner.guard().into_sync(),
+                file: storage,
+            };
+            let mut page_guard = owner
+                .allocate_page::<Page>(&pool_guard)
+                .await
+                .expect("test page allocation should succeed");
+            let page_id = page_guard.page_id();
+            let checksum_start = block_checksum_offset(PAGE_SIZE);
+            page_guard.page_mut()[0] = 0xAB;
+            page_guard.page_mut()[checksum_start - 1] = 0xCD;
+            page_guard.page_mut()[checksum_start..].fill(0);
+            page_guard.bf_mut().set_dirty(true);
+            page_guard.bf_mut().set_kind(FrameKind::Evicting);
+
+            owner
+                .inflight_io
+                .batch_writes(std::slice::from_ref(&page_guard));
+            let mut queue = IOQueue::with_capacity(1);
+            let req = PoolRequest::BatchWrite(vec![page_guard], Arc::new(EventNotifyOnDrop::new()));
+            assert!(state_machine.prepare_request(req, 1, &mut queue).is_none());
+
+            let EvictSubmission::Write(sub) = queue.pop_front().unwrap() else {
+                panic!("expected write submission");
+            };
+            assert!(validate_block_checksum_for_test(sub.page_guard.page()).is_ok());
+            assert_eq!(sub.page_guard.page()[0], 0xAB);
+            assert_eq!(sub.page_guard.page()[checksum_start - 1], 0xCD);
+            assert_ne!(
+                &sub.page_guard.page()[checksum_start..],
+                &[0u8; BLOCK_INTEGRITY_TRAILER_SIZE]
+            );
+
+            let kind = state_machine.on_complete(
+                EvictSubmission::Write(sub),
+                Err(io::Error::from_raw_os_error(libc::EIO)),
+            );
+            assert_eq!(kind, StorageIOKind::Write);
+            assert_eq!(owner.arena.frame(page_id).kind(), FrameKind::Hot);
+        });
+    }
+
+    #[test]
+    fn test_evictable_reload_rejects_checksum_mismatch_before_publish_and_can_retry() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let (_fs_owner, pool, _storage) = build_raw_pool_for_test(
+                EvictableBufferPoolConfig::default()
+                    .role(PoolRole::Mem)
+                    .data_swap_file(temp_dir.path().join("data.swp"))
+                    .max_mem_size(64u64 * 1024 * 1024)
+                    .max_file_size(128u64 * 1024 * 1024),
+            )
+            .unwrap();
+            let owner = QuiescentBox::new(pool);
+            let pool_guard = owner.pool_guard();
+            let mut page_guard = owner
+                .allocate_page::<Page>(&pool_guard)
+                .await
+                .expect("test page allocation should succeed");
+            let page_id = page_guard.page_id();
+            page_guard.bf_mut().set_kind(FrameKind::Evicting);
+            owner.in_mem.evict_page(page_guard);
+            assert_eq!(owner.arena.frame(page_id).kind(), FrameKind::Evicted);
+            assert_eq!(owner.in_mem.count.load(Ordering::Acquire), 0);
+
+            let (bad_req, bad_completion) =
+                make_reload_submission_for_test(&owner, &pool_guard, page_id, |page| {
+                    page[0] = 0xAB;
+                    write_block_checksum_for_test(page);
+                    page[0] ^= 0xFF;
+                });
+            assert_eq!(bad_req.complete(Ok(PAGE_SIZE)), IOKind::Read);
+            let report = bad_completion.wait_result().await.unwrap_err();
+            assert_eq!(
+                *report.current_context(),
+                CompletionErrorKind::DataIntegrity(DataIntegrityError::ChecksumMismatch)
+            );
+            assert_eq!(owner.arena.frame(page_id).kind(), FrameKind::Evicted);
+            assert_eq!(owner.in_mem.count.load(Ordering::Acquire), 0);
+            assert_eq!(owner.inflight_io.reads.load(Ordering::Relaxed), 0);
+            assert!(!owner.inflight_io.map.lock().contains_key(&page_id));
+
+            let (retry_req, retry_completion) =
+                make_reload_submission_for_test(&owner, &pool_guard, page_id, |page| {
+                    page[0] = 0xCD;
+                    write_block_checksum_for_test(page);
+                });
+            assert_eq!(retry_req.complete(Ok(PAGE_SIZE)), IOKind::Read);
+            assert_eq!(retry_completion.wait_result().await.unwrap(), page_id);
+            assert_eq!(owner.arena.frame(page_id).kind(), FrameKind::Hot);
+            assert_eq!(owner.in_mem.count.load(Ordering::Acquire), 1);
+            let page_guard = owner.try_lock_page_exclusive(&pool_guard, page_id).unwrap();
+            assert_eq!(page_guard.page()[0], 0xCD);
+        });
+    }
+
+    #[test]
+    fn test_clean_evictable_eviction_drops_without_write_or_checksum_stamp() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let (_fs_owner, pool, _storage) = build_raw_pool_for_test(
+                EvictableBufferPoolConfig::default()
+                    .role(PoolRole::Mem)
+                    .data_swap_file(temp_dir.path().join("data.swp"))
+                    .max_mem_size(64u64 * 1024 * 1024)
+                    .max_file_size(128u64 * 1024 * 1024),
+            )
+            .unwrap();
+            let owner = QuiescentBox::new(pool);
+            let pool_guard = owner.pool_guard();
+            let mut page_guard = owner
+                .allocate_page::<Page>(&pool_guard)
+                .await
+                .expect("test page allocation should succeed");
+            let page_id = page_guard.page_id();
+            page_guard.page_mut()[block_checksum_offset(PAGE_SIZE)..].fill(0);
+            page_guard.bf_mut().set_dirty(false);
+            page_guard.bf_mut().set_kind(FrameKind::Evicting);
+            let baseline = owner.stats();
+            let runtime = EvictableRuntime {
+                arena: owner.arena.arena_guard(owner.pool_guard()),
+                pool: owner.guard().into_sync(),
+            };
+
+            assert!(runtime.execute(vec![page_guard]).is_none());
+            assert_eq!(owner.arena.frame(page_id).kind(), FrameKind::Evicted);
+            let delta = owner.stats().delta_since(baseline);
+            assert_eq!(delta.queued_writes, 0);
+            assert_eq!(owner.inflight_io.writes.load(Ordering::Relaxed), 0);
         });
     }
 

@@ -2108,6 +2108,7 @@ mod tests {
         assert_eq!(mem::size_of::<BTreeNode>(), PAGE_SIZE);
         assert_eq!(BTREE_NODE_USABLE_SIZE, PAGE_SIZE - BTREE_NODE_FOOTER_SIZE);
         assert_eq!(BTREE_NODE_FOOTER_SIZE, BLOCK_INTEGRITY_TRAILER_SIZE);
+        assert_eq!(mem::offset_of!(BTreeNode, footer), BTREE_NODE_USABLE_SIZE);
         assert_eq!(layout::bytes_of(&*node).len(), PAGE_SIZE);
         assert_eq!(
             &layout::bytes_of(&*node)[BTREE_NODE_USABLE_SIZE..],

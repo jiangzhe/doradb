@@ -9,6 +9,7 @@ use crate::error::{
     Validation::{Invalid, Valid},
 };
 use crate::file::BlockID;
+use crate::file::block_integrity::BLOCK_INTEGRITY_TRAILER_SIZE;
 use crate::index::util::{Maskable, ParentPosition, RowPageCreateRedoCtx};
 use crate::latch::LatchFallbackMode;
 use crate::layout;
@@ -23,11 +24,17 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use zerocopy_derive::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 pub(crate) const ROW_PAGE_INDEX_NODE_SIZE: usize = PAGE_SIZE;
+/// Bytes reserved at the end of every row-page-index node for spill checksums.
+pub(crate) const ROW_PAGE_INDEX_NODE_FOOTER_SIZE: usize = BLOCK_INTEGRITY_TRAILER_SIZE;
+/// Bytes available to row-page-index node entries before the checksum footer.
+pub(crate) const ROW_PAGE_INDEX_NODE_USABLE_SIZE: usize =
+    ROW_PAGE_INDEX_NODE_SIZE - ROW_PAGE_INDEX_NODE_FOOTER_SIZE;
 pub(crate) const ROW_PAGE_INDEX_NODE_HEADER_SIZE: usize = mem::size_of::<RowPageIndexNodeHeader>();
-pub(crate) const NBR_ENTRIES_IN_BRANCH: usize = 4093;
 pub(crate) const ENTRY_SIZE: usize = mem::size_of::<PageEntry>();
+pub(crate) const NBR_ENTRIES_IN_BRANCH: usize =
+    (ROW_PAGE_INDEX_NODE_USABLE_SIZE - ROW_PAGE_INDEX_NODE_HEADER_SIZE) / ENTRY_SIZE;
 pub(crate) const NBR_ROW_PAGE_ENTRIES_IN_LEAF: usize =
-    (ROW_PAGE_INDEX_NODE_SIZE - ROW_PAGE_INDEX_NODE_HEADER_SIZE) / ENTRY_SIZE;
+    (ROW_PAGE_INDEX_NODE_USABLE_SIZE - ROW_PAGE_INDEX_NODE_HEADER_SIZE) / ENTRY_SIZE;
 
 const _: () = assert!(
     { mem::size_of::<RowPageIndexNode>() == ROW_PAGE_INDEX_NODE_SIZE },
@@ -35,19 +42,29 @@ const _: () = assert!(
 );
 
 const _: () = assert!(
+    { mem::offset_of!(RowPageIndexNode, data) == ROW_PAGE_INDEX_NODE_HEADER_SIZE },
+    "RowPageIndexNode data offset should match RowPageIndexNodeHeader size"
+);
+
+const _: () = assert!(
+    { mem::offset_of!(RowPageIndexNode, footer) == ROW_PAGE_INDEX_NODE_USABLE_SIZE },
+    "RowPageIndexNode checksum footer must start after logical usable bytes"
+);
+
+const _: () = assert!(
     {
         ROW_PAGE_INDEX_NODE_HEADER_SIZE + NBR_ENTRIES_IN_BRANCH * ENTRY_SIZE
-            <= ROW_PAGE_INDEX_NODE_SIZE
+            <= ROW_PAGE_INDEX_NODE_USABLE_SIZE
     },
-    "Size of branch node of BlockIndex can be at most 64KB"
+    "Size of branch node of BlockIndex must not overlap checksum footer"
 );
 
 const _: () = assert!(
     {
         ROW_PAGE_INDEX_NODE_HEADER_SIZE + NBR_ROW_PAGE_ENTRIES_IN_LEAF * ENTRY_SIZE
-            <= ROW_PAGE_INDEX_NODE_SIZE
+            <= ROW_PAGE_INDEX_NODE_USABLE_SIZE
     },
-    "Size of leaf node of BlockIndex can be at most 64KB"
+    "Size of leaf node of BlockIndex must not overlap checksum footer"
 );
 
 const _: () = assert!(
@@ -78,7 +95,8 @@ enum InsertFreeListMiss {
 #[derive(Clone, FromBytes, IntoBytes, KnownLayout, Immutable)]
 pub(crate) struct RowPageIndexNode {
     pub header: RowPageIndexNodeHeader,
-    data: [u8; ROW_PAGE_INDEX_NODE_SIZE - ROW_PAGE_INDEX_NODE_HEADER_SIZE],
+    data: [u8; ROW_PAGE_INDEX_NODE_USABLE_SIZE - ROW_PAGE_INDEX_NODE_HEADER_SIZE],
+    footer: [u8; ROW_PAGE_INDEX_NODE_FOOTER_SIZE],
 }
 
 impl RowPageIndexNode {
@@ -1178,6 +1196,7 @@ mod tests {
     };
     use crate::conf::{EngineConfig, EvictableBufferPoolConfig, TrxSysConfig};
     use crate::error::{ErrorKind, IoError, ResourceError, Validation};
+    use crate::file::block_integrity::BLOCK_INTEGRITY_TRAILER_SIZE;
     use crate::latch::LatchFallbackMode;
     use crate::quiescent::{QuiescentBox, QuiescentGuard};
     use crate::trx::log::list_log_files;
@@ -1205,6 +1224,32 @@ mod tests {
         page_count
             * (std::mem::size_of::<crate::buffer::frame::BufferFrame>()
                 + std::mem::size_of::<crate::buffer::page::Page>())
+    }
+
+    #[test]
+    fn test_row_page_index_node_reserves_checksum_footer() {
+        assert_eq!(mem::size_of::<RowPageIndexNode>(), PAGE_SIZE);
+        assert_eq!(
+            ROW_PAGE_INDEX_NODE_FOOTER_SIZE,
+            BLOCK_INTEGRITY_TRAILER_SIZE
+        );
+        assert_eq!(
+            ROW_PAGE_INDEX_NODE_USABLE_SIZE,
+            PAGE_SIZE - ROW_PAGE_INDEX_NODE_FOOTER_SIZE
+        );
+        assert_eq!(
+            mem::offset_of!(RowPageIndexNode, data),
+            ROW_PAGE_INDEX_NODE_HEADER_SIZE
+        );
+        assert_eq!(
+            mem::offset_of!(RowPageIndexNode, footer),
+            ROW_PAGE_INDEX_NODE_USABLE_SIZE
+        );
+        assert_eq!(
+            NBR_ENTRIES_IN_BRANCH,
+            (ROW_PAGE_INDEX_NODE_USABLE_SIZE - ROW_PAGE_INDEX_NODE_HEADER_SIZE) / ENTRY_SIZE
+        );
+        assert_eq!(NBR_ROW_PAGE_ENTRIES_IN_LEAF, NBR_ENTRIES_IN_BRANCH);
     }
 
     async fn fill_root_leaf_full<P: BufferPool>(blk_idx: &RowPageIndex<P>, pool_guard: &PoolGuard) {

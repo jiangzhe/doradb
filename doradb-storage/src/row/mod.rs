@@ -7,6 +7,7 @@ pub(crate) use vector_scan::*;
 use crate::bitmap::bitmap_required_units;
 use crate::buffer::page::{BufferPage, BufferPageKind, PAGE_SIZE, assert_buffer_page, sealed};
 use crate::catalog::{IndexSpec, TableColumnLayout};
+use crate::file::block_integrity::BLOCK_INTEGRITY_TRAILER_SIZE;
 use crate::layout;
 use crate::value::*;
 use ordered_float::OrderedFloat;
@@ -70,16 +71,23 @@ const _: () = assert!(
 /// | c_n              | same as above                                 |
 /// | free_space       | free space                                    |
 /// | var_len_data     | data of var-len column                        |
+/// | checksum_trailer | reserved for buffer-pool spill-file checksum  |
 /// |------------------|-----------------------------------------------|
 /// ```
 #[repr(C)]
 #[derive(FromBytes, IntoBytes, KnownLayout)]
 pub(crate) struct RowPage {
     pub header: RowPageHeader,
-    pub data: [u8; PAGE_SIZE - mem::size_of::<RowPageHeader>()],
+    pub data: [u8; ROW_PAGE_DATA_SIZE],
+    footer: [u8; ROW_PAGE_FOOTER_SIZE],
 }
 
 const ROW_PAGE_HEADER_SIZE: usize = 32;
+/// Bytes reserved at the end of every row page for spill-file checksums.
+pub(crate) const ROW_PAGE_FOOTER_SIZE: usize = BLOCK_INTEGRITY_TRAILER_SIZE;
+/// Bytes available to row-page logical content before the checksum footer.
+pub(crate) const ROW_PAGE_USABLE_SIZE: usize = PAGE_SIZE - ROW_PAGE_FOOTER_SIZE;
+const ROW_PAGE_DATA_SIZE: usize = ROW_PAGE_USABLE_SIZE - ROW_PAGE_HEADER_SIZE;
 
 const _: () = assert!(
     { mem::size_of::<RowPageHeader>() == ROW_PAGE_HEADER_SIZE },
@@ -121,6 +129,11 @@ const _: () = assert!(
     "RowPage data offset should match RowPageHeader size"
 );
 
+const _: () = assert!(
+    { mem::offset_of!(RowPage, footer) == ROW_PAGE_USABLE_SIZE },
+    "RowPage checksum footer must start after logical usable bytes"
+);
+
 impl RowPage {
     /// Initialize row page.
     /// | header | del_bitmap | null_bitmap_1 | ... | null_bitmap_n |
@@ -135,7 +148,7 @@ impl RowPage {
         self.header.start_row_id = start_row_id;
         self.header.max_row_count = max_row_count as u16;
         self.header
-            .store_row_count_and_var_field_offset(0, PAGE_SIZE - mem::size_of::<RowPageHeader>());
+            .store_row_count_and_var_field_offset(0, ROW_PAGE_DATA_SIZE);
         self.header.col_count = col_layout.col_count() as u16;
         // initialize offset fields.
         self.header.del_bitmap_offset = 0; // always starts at data_ptr().
@@ -154,6 +167,13 @@ impl RowPage {
         debug_assert!(self.header.fix_field_offset.is_multiple_of(8));
 
         self.init_col_offset_list_and_fix_field_end(col_layout, max_row_count as u16);
+        assert!(
+            self.header.fix_field_end as usize <= ROW_PAGE_DATA_SIZE,
+            "RowPage fixed-field end overlaps checksum footer: max_row_count={}, fix_field_end={}, row_page_data_size={}",
+            max_row_count,
+            self.header.fix_field_end,
+            ROW_PAGE_DATA_SIZE
+        );
         self.init_bitmaps();
 
         debug_assert!({
@@ -1053,7 +1073,8 @@ impl RowPage {
                 approx_deleted: AtomicU16::new(0),
                 padding: [0; 4],
             },
-            data: [0; PAGE_SIZE - mem::size_of::<RowPageHeader>()],
+            data: [0; ROW_PAGE_DATA_SIZE],
+            footer: [0; ROW_PAGE_FOOTER_SIZE],
         }
     }
 }
@@ -1650,7 +1671,7 @@ const fn col_inline_len(kind: ValKind, row_count: usize) -> usize {
 /// equal to given row length.
 #[inline]
 pub(crate) const fn estimate_max_row_count(row_len: usize, col_count: usize) -> usize {
-    let body_len = PAGE_SIZE
+    let body_len = ROW_PAGE_USABLE_SIZE
         .wrapping_sub(mem::size_of::<RowPageHeader>()) // header
         .wrapping_sub(col_count * 2); // col offset (approx)
     let estimated_row_size = row_len
@@ -1694,6 +1715,12 @@ mod tests {
     fn test_row_page_layout_contract() {
         assert_eq!(mem::size_of::<RowPageHeader>(), 32);
         assert_eq!(mem::size_of::<RowPage>(), PAGE_SIZE);
+        assert_eq!(ROW_PAGE_FOOTER_SIZE, BLOCK_INTEGRITY_TRAILER_SIZE);
+        assert_eq!(ROW_PAGE_USABLE_SIZE, PAGE_SIZE - ROW_PAGE_FOOTER_SIZE);
+        assert_eq!(
+            ROW_PAGE_DATA_SIZE,
+            ROW_PAGE_USABLE_SIZE - ROW_PAGE_HEADER_SIZE
+        );
         assert_eq!(mem::offset_of!(RowPageHeader, start_row_id), 0);
         assert_eq!(
             mem::offset_of!(RowPageHeader, row_count_and_var_field_offset),
@@ -1709,6 +1736,7 @@ mod tests {
         assert_eq!(mem::offset_of!(RowPageHeader, approx_deleted), 26);
         assert_eq!(mem::offset_of!(RowPageHeader, padding), 28);
         assert_eq!(mem::offset_of!(RowPage, data), 32);
+        assert_eq!(mem::offset_of!(RowPage, footer), ROW_PAGE_USABLE_SIZE);
     }
 
     #[test]
@@ -1753,7 +1781,42 @@ mod tests {
         assert!(page.header.fix_field_offset.is_multiple_of(8));
         assert!(page.header.fix_field_end.is_multiple_of(8));
         assert!(page.header.var_field_offset().is_multiple_of(8));
-        assert_eq!(page.header.var_field_offset(), PAGE_SIZE - 32);
+        assert_eq!(page.header.var_field_offset(), ROW_PAGE_DATA_SIZE);
+        assert_eq!(page.data().len(), ROW_PAGE_DATA_SIZE);
+    }
+
+    #[test]
+    fn test_row_page_var_data_stops_before_checksum_footer() {
+        let metadata = TableMetadata::try_new(
+            vec![ColumnSpec::new(
+                "payload",
+                ValKind::VarByte,
+                ColumnAttributes::empty(),
+            )],
+            vec![IndexSpec {
+                cols: vec![IndexKey::new(0)],
+                attributes: IndexAttributes::PK,
+            }],
+        )
+        .expect("valid table metadata");
+        let mut page = create_row_page();
+        page.init(0, 1, metadata.col.as_ref());
+
+        let max_var_len = ROW_PAGE_DATA_SIZE - page.header.fix_field_end as usize;
+        let value = vec![0xAB; max_var_len];
+        assert!(matches!(
+            page.insert(
+                metadata.col.as_ref(),
+                &[Val::VarByte(MemVar::from(&value[..]))]
+            ),
+            InsertRow::Ok(0)
+        ));
+        assert_eq!(
+            page.header.var_field_offset(),
+            page.header.fix_field_end as usize
+        );
+        assert_eq!(page.row(0).var(0), &value[..]);
+        assert_eq!(page.footer, [0; ROW_PAGE_FOOTER_SIZE]);
     }
 
     #[test]
