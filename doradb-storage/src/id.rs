@@ -543,3 +543,103 @@ impl PartialEq<BlockID> for i32 {
 
 impl_id_serde!(BlockID);
 impl_id_bitpackable!(BlockID);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::serde::{Deser, Ser};
+    use std::num::IntErrorKind;
+
+    fn assert_id_serde_roundtrip<T>(id: T, raw: u64)
+    where
+        T: for<'a> Ser<'a> + Deser + Copy + Eq + std::fmt::Debug,
+    {
+        let start_idx = 3;
+        let end_idx = start_idx + mem::size_of::<u64>();
+        let mut out = vec![0xa5; end_idx + 2];
+
+        assert_eq!(id.ser_len(), mem::size_of::<u64>());
+        assert_eq!(id.ser(&mut out[..], start_idx), end_idx);
+        assert_eq!(&out[..start_idx], &[0xa5u8; 3]);
+        assert_eq!(&out[start_idx..end_idx], raw.to_le_bytes().as_slice());
+        assert_eq!(&out[end_idx..], &[0xa5u8; 2]);
+
+        let (deser_end, deser) = T::deser(&out[..], start_idx).unwrap();
+        assert_eq!(deser_end, end_idx);
+        assert_eq!(deser, id);
+    }
+
+    #[test]
+    fn test_row_id_checked_add() {
+        assert_eq!(RowID::new(40).checked_add(2), Some(RowID::new(42)));
+        assert_eq!(RowID::MAX.checked_add(1), None);
+    }
+
+    #[test]
+    fn test_row_id_checked_sub() {
+        assert_eq!(RowID::new(42).checked_sub(RowID::new(40)), Some(2));
+        assert_eq!(RowID::new(42).checked_sub(RowID::new(42)), Some(0));
+        assert_eq!(RowID::new(40).checked_sub(RowID::new(42)), None);
+    }
+
+    #[test]
+    fn test_row_id_saturating_add() {
+        assert_eq!(RowID::new(40).saturating_add(2), RowID::new(42));
+        assert_eq!(RowID::MAX.saturating_add(1), RowID::MAX);
+    }
+
+    #[test]
+    fn test_table_id_from_str_radix() {
+        assert_eq!(TableID::from_str_radix("42", 10), Ok(TableID::new(42)));
+        assert_eq!(TableID::from_str_radix("2a", 16), Ok(TableID::new(42)));
+        assert_eq!(TableID::from_str_radix("101010", 2), Ok(TableID::new(42)));
+        assert_eq!(
+            TableID::from_str_radix("18446744073709551615", 10),
+            Ok(TableID::new(u64::MAX))
+        );
+
+        let invalid_digit = TableID::from_str_radix("2", 2).unwrap_err();
+        assert_eq!(invalid_digit.kind(), &IntErrorKind::InvalidDigit);
+
+        let overflow = TableID::from_str_radix("18446744073709551616", 10).unwrap_err();
+        assert_eq!(overflow.kind(), &IntErrorKind::PosOverflow);
+    }
+
+    #[test]
+    fn test_table_id_lower_hex() {
+        let table_id = TableID::new(0xabcd);
+        assert_eq!(format!("{table_id:x}"), "abcd");
+        assert_eq!(format!("{table_id:#x}"), "0xabcd");
+        assert_eq!(format!("{table_id:08x}"), "0000abcd");
+    }
+
+    #[test]
+    fn test_row_id_serde_roundtrip() {
+        assert_id_serde_roundtrip(RowID::new(0x0123_4567_89ab_cdef), 0x0123_4567_89ab_cdef);
+    }
+
+    #[test]
+    fn test_table_id_serde_roundtrip() {
+        assert_id_serde_roundtrip(TableID::new(0x1234_5678_9abc_def0), 0x1234_5678_9abc_def0);
+    }
+
+    #[test]
+    fn test_trx_id_serde_roundtrip() {
+        assert_id_serde_roundtrip(TrxID::new(0x2345_6789_abcd_ef01), 0x2345_6789_abcd_ef01);
+    }
+
+    #[test]
+    fn test_page_id_serde_roundtrip() {
+        assert_id_serde_roundtrip(PageID::new(0x3456_789a_bcde_f012), 0x3456_789a_bcde_f012);
+    }
+
+    #[test]
+    fn test_file_id_serde_roundtrip() {
+        assert_id_serde_roundtrip(FileID::new(0x4567_89ab_cdef_0123), 0x4567_89ab_cdef_0123);
+    }
+
+    #[test]
+    fn test_block_id_serde_roundtrip() {
+        assert_id_serde_roundtrip(BlockID::new(0x5678_9abc_def0_1234), 0x5678_9abc_def0_1234);
+    }
+}
