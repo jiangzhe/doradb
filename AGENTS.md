@@ -5,7 +5,6 @@
 - `doradb-storage/src/` holds the storage engine (buffer, catalog, file, index, row, trx, etc.).
 - `docs/` contains design notes (architecture, transactions, index, recovery).
 - `doradb-storage/examples/` has runnable benchmarks and demos (e.g., `bench_btree.rs`).
-- `legacy/` contains deprecated modules and experiments; expect no changes here.
 - `target/` is the build output directory.
 
 ## Build, Test, and Development Commands
@@ -22,7 +21,6 @@
 
 ## Testing Guidelines
 - Tests live alongside code (`mod tests { ... }`) and in files like `doradb-storage/src/table/tests.rs`.
-- Legacy crates may include `tests/` directories (e.g., `legacy/doradb-sql/tests`).
 - Coverage targets at 80%; add tests for new behavior and regressions.
 
 ## Commit & Pull Request Guidelines

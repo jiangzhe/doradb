@@ -1,5 +1,0 @@
-SELECT
-    *
-FROM
-    t0
-    NATURAL JOIN t1

@@ -15,7 +15,7 @@ const TARGET_DIR: &str = "target/coverage-focus/cargo";
 const LLVM_COV_TARGET_DIR: &str = "target/coverage-focus/llvm-cov-target";
 const LCOV_OUT: &str = "target/coverage-focus/lcov.info";
 const COVERAGE_IGNORE_FILENAME_REGEX: &str =
-    r"(^|/)(target|legacy)(/|$)|/\.cargo/(registry|git)/|/rustlib/src/rust/";
+    r"(^|/)target(/|$)|/\.cargo/(registry|git)/|/rustlib/src/rust/";
 
 #[derive(Debug)]
 struct Args {
