@@ -5,11 +5,11 @@
 //! writes, checkpoint publication, or DiskTree batch semantics.
 
 use crate::error::{Error, InternalError, Result};
+use crate::id::TrxID;
 use crate::index::btree::{
     BTREE_NODE_USABLE_SIZE, BTreeNode, BTreeNodeBox, BTreeU64, BTreeValue, PackedNodeSpace,
     SpaceEstimation,
 };
-use crate::trx::TrxID;
 use error_stack::Report;
 use std::ops::Range;
 
@@ -509,7 +509,7 @@ mod tests {
         }
         let mut node = BTreeNodeBox::alloc(
             0,
-            1,
+            TrxID::new(1),
             lower_fence,
             BTreeU64::INVALID_VALUE,
             upper_fence,
@@ -718,13 +718,19 @@ mod tests {
         assert_eq!(result.packed, entries.len());
         assert_eq!(result.upper_fence, None);
 
-        let mut finite_node =
-            BTreeNodeBox::alloc(0, 9, b"prefix-0001", BTreeU64::INVALID_VALUE, &[], false);
+        let mut finite_node = BTreeNodeBox::alloc(
+            0,
+            TrxID::new(9),
+            b"prefix-0001",
+            BTreeU64::INVALID_VALUE,
+            &[],
+            false,
+        );
         let result = pack_fixed_entries(
             &mut finite_node,
             KnownFenceNodeParams {
                 height: 0,
-                ts: 9,
+                ts: TrxID::new(9),
                 lower_fence: b"prefix-0001",
                 lower_fence_value: BTreeU64::INVALID_VALUE,
                 upper_fence: Some(b"prefix-0004"),
@@ -795,7 +801,7 @@ mod tests {
     fn leaf_node(keys: &[&[u8]]) -> BTreeNodeBox {
         let mut node = BTreeNodeBox::alloc(
             0,
-            1,
+            TrxID::new(1),
             keys.first().copied().unwrap_or(&[]),
             BTreeU64::INVALID_VALUE,
             b"zzzz",
@@ -854,7 +860,7 @@ mod tests {
         let right = leaf_node(&[b"aa03", b"aa04"]);
         let params = KnownFenceNodeParams {
             height: 0,
-            ts: 7,
+            ts: TrxID::new(7),
             lower_fence: b"aa01",
             lower_fence_value: BTreeU64::INVALID_VALUE,
             upper_fence: Some(b"zzzz"),
@@ -874,8 +880,14 @@ mod tests {
             ],
         );
 
-        let mut manual =
-            BTreeNodeBox::alloc(0, 7, b"aa01", BTreeU64::INVALID_VALUE, b"zzzz", false);
+        let mut manual = BTreeNodeBox::alloc(
+            0,
+            TrxID::new(7),
+            b"aa01",
+            BTreeU64::INVALID_VALUE,
+            b"zzzz",
+            false,
+        );
         manual.extend_slots_from::<BTreeU64>(&left, 0, left.count());
         manual.extend_slots_from::<BTreeU64>(&right, 0, right.count());
         manual.update_hints();

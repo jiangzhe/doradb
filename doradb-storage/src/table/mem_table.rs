@@ -3,10 +3,11 @@ use super::{
     secondary_index_kind_mismatch, validate_page_row_range,
 };
 use crate::buffer::guard::{PageExclusiveGuard, PageGuard, PageSharedGuard};
-use crate::buffer::page::{PageID, VersionedPageID};
+use crate::buffer::page::VersionedPageID;
 use crate::buffer::{BufferPool, FixedBufferPool, PoolGuard, PoolGuards, PoolRole, RowPoolRole};
-use crate::catalog::{TableColumnLayout, TableID, TableMetadata};
+use crate::catalog::{TableColumnLayout, TableMetadata};
 use crate::error::{Error, InternalError, OperationError, Result};
+use crate::id::{PageID, RowID, TableID, TrxID};
 use crate::index::util::{Maskable, RowPageCreateRedoCtx};
 use crate::index::{
     BlockIndex, InMemorySecondaryIndex, IndexCompareExchange, IndexInsert, NonUniqueIndex,
@@ -15,9 +16,8 @@ use crate::index::{
 use crate::latch::LatchFallbackMode;
 use crate::quiescent::QuiescentGuard;
 use crate::row::ops::{DeleteMvcc, InsertIndex, LinkForUniqueIndex, SelectKey};
-use crate::row::{Row, RowID, RowPage, RowRead, estimate_max_row_count, var_len_for_insert};
+use crate::row::{Row, RowPage, RowRead, estimate_max_row_count, var_len_for_insert};
 use crate::trx::TrxContext;
-use crate::trx::TrxID;
 use crate::trx::redo::{RowRedo, RowRedoKind};
 use crate::trx::row::{
     FindOldVersion, LockRowForWrite, LockUndo, ReadAllRows, RowReadAccess, RowWriteAccess,
@@ -1528,7 +1528,7 @@ impl MemTable<FixedBufferPool, FixedBufferPool> {
                 } else {
                     continue;
                 };
-            let row_id = page.header.start_row_id + row_idx as RowID;
+            let row_id = page.header.start_row_id + row_idx as u64;
             let mut row = page.row_mut_exclusive(row_idx, var_offset, var_offset + var_len);
             debug_assert!(row.is_deleted());
             for (col_idx, user_col) in cols.iter().enumerate() {

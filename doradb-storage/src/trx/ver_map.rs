@@ -1,5 +1,5 @@
 use crate::catalog::TableColumnLayout;
-use crate::trx::TrxID;
+use crate::id::TrxID;
 use crate::trx::undo::RowUndoHead;
 use parking_lot::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::ops::{Deref, DerefMut};
@@ -123,13 +123,13 @@ impl RowVersionMap {
     /// Set commit timestamp of page creation.
     #[inline]
     pub(crate) fn set_create_cts(&self, cts: TrxID) {
-        self.create_cts.store(cts, Ordering::Release);
+        self.create_cts.store(cts.as_u64(), Ordering::Release);
     }
 
     /// Returns commit timestamp of page creation.
     #[inline]
     pub(crate) fn create_cts(&self) -> TrxID {
-        self.create_cts.load(Ordering::Acquire)
+        TrxID::new(self.create_cts.load(Ordering::Acquire))
     }
 
     /// Returns modification counter.
@@ -141,13 +141,13 @@ impl RowVersionMap {
     /// Returns maximum STS recorded in this map.
     #[inline]
     pub(crate) fn max_sts(&self) -> TrxID {
-        self.max_sts.load(Ordering::Acquire)
+        TrxID::new(self.max_sts.load(Ordering::Acquire))
     }
 
     /// Returns maximum STS of insert or update on this page.
     #[inline]
     pub(crate) fn max_ins_sts(&self) -> TrxID {
-        self.max_ins_sts.load(Ordering::Acquire)
+        TrxID::new(self.max_ins_sts.load(Ordering::Acquire))
     }
 
     /// Acquire a read latch on given row.
@@ -220,11 +220,13 @@ impl<'a> Drop for RowVersionWriteGuard<'a> {
         // Only update sts and counter for user transaction.
         if let Some(sts) = self.sts {
             // First we update max sts of this map.
-            self.m.max_sts.fetch_max(sts, Ordering::Relaxed);
+            self.m.max_sts.fetch_max(sts.as_u64(), Ordering::Relaxed);
             // Then we bump the modification counter.
             self.m.mod_counter.fetch_add(1, Ordering::AcqRel);
             if self.ins_or_update {
-                self.m.max_ins_sts.fetch_max(sts, Ordering::Relaxed);
+                self.m
+                    .max_ins_sts
+                    .fetch_max(sts.as_u64(), Ordering::Relaxed);
             }
         }
     }
@@ -266,9 +268,9 @@ mod tests {
         )
         .expect("valid table metadata");
         let map = RowVersionMap::new(Arc::clone(&metadata.col), 1);
-        assert_eq!(map.create_cts(), 0);
-        map.set_create_cts(42);
-        assert_eq!(map.create_cts(), 42);
+        assert_eq!(map.create_cts(), TrxID::new(0));
+        map.set_create_cts(TrxID::new(42));
+        assert_eq!(map.create_cts(), TrxID::new(42));
     }
 
     #[test]

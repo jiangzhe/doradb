@@ -8,6 +8,7 @@ use crate::bitmap::bitmap_required_units;
 use crate::buffer::page::{BufferPage, BufferPageKind, PAGE_SIZE, assert_buffer_page, sealed};
 use crate::catalog::{IndexSpec, TableColumnLayout};
 use crate::file::block_integrity::BLOCK_INTEGRITY_TRAILER_SIZE;
+use crate::id::RowID;
 use crate::layout;
 use crate::value::*;
 use ordered_float::OrderedFloat;
@@ -21,10 +22,9 @@ use zerocopy::byteorder::little_endian::{
 };
 use zerocopy_derive::{FromBytes, IntoBytes, KnownLayout};
 
-pub type RowID = u64;
 /// Borrowed or owned row-page null bitmap words.
 pub(crate) type RowPageNullBitmap<'a> = Cow<'a, [u64]>;
-pub(crate) const INVALID_ROW_ID: RowID = !0;
+pub(crate) const INVALID_ROW_ID: RowID = RowID::MAX;
 
 const _: () = assert!(
     { std::mem::size_of::<RowPageHeader>().is_multiple_of(8) },
@@ -140,7 +140,7 @@ impl RowPage {
     #[inline]
     pub(crate) fn init(
         &mut self,
-        start_row_id: u64,
+        start_row_id: RowID,
         max_row_count: usize,
         col_layout: &TableColumnLayout,
     ) {
@@ -1061,7 +1061,7 @@ impl RowPage {
     pub(crate) fn new_test_page() -> Self {
         RowPage {
             header: RowPageHeader {
-                start_row_id: 0,
+                start_row_id: RowID::new(0),
                 row_count_and_var_field_offset: AtomicU32::new(0),
                 max_row_count: 0,
                 col_count: 0,
@@ -1095,7 +1095,7 @@ const _: () = assert_buffer_page::<RowPage>();
 #[repr(C)]
 #[derive(FromBytes, IntoBytes, KnownLayout)]
 pub(crate) struct RowPageHeader {
-    pub start_row_id: u64,
+    pub start_row_id: RowID,
     // higher two bytes is row count.
     // lower two bytes is var field offset.
     row_count_and_var_field_offset: AtomicU32,
@@ -1354,7 +1354,7 @@ pub(crate) trait RowRead {
     /// Row id is always the first column of a row, with 8-byte width.
     #[inline]
     fn row_id(&self) -> RowID {
-        self.page().header.start_row_id + self.row_idx() as RowID
+        self.page().header.start_row_id + self.row_idx() as u64
     }
 
     /// Returns whether current row is deleted.
@@ -1770,9 +1770,9 @@ mod tests {
         )
         .expect("valid table metadata");
         let mut page = create_row_page();
-        page.init(100, 105, metadata.col.as_ref());
+        page.init(RowID::new(100), 105, metadata.col.as_ref());
         println!("page header={:?}", page.header);
-        assert!(page.header.start_row_id == 100);
+        assert!(page.header.start_row_id == RowID::new(100));
         assert!(page.header.max_row_count == 105);
         assert!(page.header.row_count() == 0);
         assert!(page.header.del_bitmap_offset == 0);
@@ -1800,7 +1800,7 @@ mod tests {
         )
         .expect("valid table metadata");
         let mut page = create_row_page();
-        page.init(0, 1, metadata.col.as_ref());
+        page.init(RowID::new(0), 1, metadata.col.as_ref());
 
         let max_var_len = ROW_PAGE_DATA_SIZE - page.header.fix_field_end as usize;
         let value = vec![0xAB; max_var_len];
@@ -1809,7 +1809,7 @@ mod tests {
                 metadata.col.as_ref(),
                 &[Val::VarByte(MemVar::from(&value[..]))]
             ),
-            InsertRow::Ok(0)
+            InsertRow::Ok(id) if id == RowID::new(0)
         ));
         assert_eq!(
             page.header.var_field_offset(),
@@ -1834,7 +1834,7 @@ mod tests {
         )
         .expect("valid table metadata");
         let mut page = create_row_page();
-        page.init(100, 200, metadata.col.as_ref());
+        page.init(RowID::new(100), 200, metadata.col.as_ref());
         assert!(page.header.row_count() == 0);
         assert!(page.header.col_count == 1);
         let insert = vec![Val::U64(1u64)];
@@ -1869,13 +1869,13 @@ mod tests {
         assert!(metadata.col.nullable(0));
         assert!(!metadata.col.nullable(1));
         let mut page = create_row_page();
-        page.init(100, 200, metadata.col.as_ref());
+        page.init(RowID::new(100), 200, metadata.col.as_ref());
 
         let insert = vec![Val::from(1_000_000i32), Val::from("hello")];
         assert!(page.insert(metadata.col.as_ref(), &insert).is_ok());
 
         let row1 = page.row(0);
-        assert!(row1.row_id() == 100);
+        assert!(row1.row_id() == RowID::new(100));
         assert!(row1.val(metadata.col.as_ref(), 0).as_i32().unwrap() == 1_000_000i32);
         assert!(row1.var(1) == b"hello");
 
@@ -1886,7 +1886,7 @@ mod tests {
         assert!(page.insert(metadata.col.as_ref(), &insert).is_ok());
 
         let row2 = page.row(1);
-        assert!(row2.row_id() == 101);
+        assert!(row2.row_id() == RowID::new(101));
         assert!(row2.val(metadata.col.as_ref(), 0).as_i32().unwrap() == 2_000_000i32);
         let s = row2.var(1);
         println!("len={:?}, s={:?}", s.len(), str::from_utf8(&s[..24]));
@@ -1917,7 +1917,7 @@ mod tests {
         )
         .expect("valid table metadata");
         let mut page = create_row_page();
-        page.init(100, 8, metadata.col.as_ref());
+        page.init(RowID::new(100), 8, metadata.col.as_ref());
         let expected = vec![Val::U32(7), Val::from("row-value")];
         assert!(page.insert(metadata.col.as_ref(), &expected).is_ok());
 
@@ -1969,7 +1969,7 @@ mod tests {
         )
         .expect("valid table metadata");
         let mut page = create_row_page();
-        page.init(100, 200, schema.col.as_ref());
+        page.init(RowID::new(100), 200, schema.col.as_ref());
         let short = b"short";
         let long = b"very loooooooooooooooooong";
 
@@ -1981,7 +1981,7 @@ mod tests {
             Val::from(&short[..]),
         ];
         let res = page.insert(schema.col.as_ref(), &insert);
-        assert!(matches!(res, InsertRow::Ok(100)));
+        assert!(matches!(res, InsertRow::Ok(id) if id == RowID::new(100)));
         assert!(!page.row(0).is_deleted());
 
         let row_id = 100;
@@ -2007,13 +2007,13 @@ mod tests {
                 val: Val::VarByte(MemVar::from(&long[..])),
             },
         ];
-        let res = page.update(schema.col.as_ref(), row_id, &update);
+        let res = page.update(schema.col.as_ref(), RowID::new(row_id), &update);
         assert!(res.is_ok());
 
-        let res = page.delete(row_id);
+        let res = page.delete(RowID::new(row_id));
         assert!(matches!(res, Delete::Ok));
 
-        let select = page.select(row_id);
+        let select = page.select(RowID::new(row_id));
         assert!(matches!(select, Select::RowDeleted(_)));
     }
 

@@ -10,10 +10,11 @@ use crate::compression::*;
 use crate::error::{DataIntegrityError, Error, InternalError, OperationError, Result};
 use crate::file::block_integrity::{LWC_BLOCK_SPEC, write_block_checksum, write_block_header};
 use crate::file::cow_file::COW_FILE_PAGE_SIZE;
+use crate::id::RowID;
 use crate::io::DirectBuf;
 use crate::layout;
+use crate::row::RowPage;
 use crate::row::vector_scan::{PageVectorView, ScanBuffer, ScanColumnValues};
-use crate::row::{RowID, RowPage};
 use crate::serde::{ForBitpackingSer, Ser, Serde};
 use crate::value::{MemVar, Val, ValKind};
 use error_stack::Report;
@@ -1857,16 +1858,22 @@ mod tests {
     use crate::catalog::{ColumnAttributes, ColumnSpec, TableMetadata};
     use crate::error::{DataIntegrityError, FileKind, OperationError};
     use crate::file::test_block_id;
+    use crate::id::RowID;
     use crate::index::ColumnBlockEntryShape;
     use crate::io::IOBuf;
     use crate::row::{Delete, InsertRow, RowPage};
     use crate::value::{MemVar, Val};
     use ordered_float::OrderedFloat;
 
-    fn row_shape_fingerprint_for(row_ids: &[u64], start_row_id: u64, end_row_id: u64) -> u128 {
-        ColumnBlockEntryShape::new(start_row_id, end_row_id, row_ids.to_vec(), Vec::new())
-            .unwrap()
-            .row_shape_fingerprint()
+    fn row_shape_fingerprint_for(row_ids: &[RowID], start_row_id: u64, end_row_id: u64) -> u128 {
+        ColumnBlockEntryShape::new(
+            RowID::new(start_row_id),
+            RowID::new(end_row_id),
+            row_ids.to_vec(),
+            Vec::new(),
+        )
+        .unwrap()
+        .row_shape_fingerprint()
     }
 
     #[test]
@@ -2243,7 +2250,7 @@ mod tests {
         )
         .expect("valid table metadata");
         let mut page = RowPage::new_test_page();
-        page.init(100, 20, metadata.col.as_ref());
+        page.init(RowID::new(100), 20, metadata.col.as_ref());
 
         let mut expected_rows = Vec::new();
         for offset in 0..10u64 {
@@ -2267,8 +2274,8 @@ mod tests {
             ));
         }
 
-        assert!(matches!(page.delete(102), Delete::Ok));
-        assert!(matches!(page.delete(105), Delete::Ok));
+        assert!(matches!(page.delete(RowID::new(102)), Delete::Ok));
+        assert!(matches!(page.delete(RowID::new(105)), Delete::Ok));
         expected_rows.retain(|(row_id, _, _)| *row_id != 102 && *row_id != 105);
 
         let mut builder = LwcBuilder::new(metadata.col.as_ref());
@@ -2318,7 +2325,7 @@ mod tests {
         )
         .expect("valid table metadata");
         let mut page = RowPage::new_test_page();
-        page.init(0, 8, metadata.col.as_ref());
+        page.init(RowID::new(0), 8, metadata.col.as_ref());
 
         for (row_id, value) in [
             Val::Null,
@@ -2333,10 +2340,10 @@ mod tests {
         {
             assert!(matches!(
                 page.insert(metadata.col.as_ref(), &[value]),
-                InsertRow::Ok(inserted) if inserted == row_id as u64
+                InsertRow::Ok(inserted) if inserted == RowID::new(row_id as u64)
             ));
         }
-        assert!(matches!(page.delete(4), Delete::Ok));
+        assert!(matches!(page.delete(RowID::new(4)), Delete::Ok));
 
         let mut builder = LwcBuilder::new(metadata.col.as_ref());
         assert!(builder.append_row_page(&page).unwrap());
@@ -2358,7 +2365,7 @@ mod tests {
         )
         .expect("valid table metadata");
         let mut page = RowPage::new_test_page();
-        page.init(1, 4, metadata.col.as_ref());
+        page.init(RowID::new(1), 4, metadata.col.as_ref());
 
         for offset in 0..2u64 {
             let c0 = Val::U8((10 + offset) as u8);
@@ -2432,7 +2439,7 @@ mod tests {
         )
         .expect("valid table metadata");
         let mut page = RowPage::new_test_page();
-        page.init(1, 4, metadata.col.as_ref());
+        page.init(RowID::new(1), 4, metadata.col.as_ref());
 
         for offset in 0..2u64 {
             let c0 = Val::U8((10 + offset) as u8);
@@ -2479,7 +2486,7 @@ mod tests {
         )
         .expect("valid table metadata");
         let mut page = RowPage::new_test_page();
-        page.init(10, 6, metadata.col.as_ref());
+        page.init(RowID::new(10), 6, metadata.col.as_ref());
 
         let rows = vec![
             vec![

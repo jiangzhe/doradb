@@ -28,18 +28,17 @@ mod sys_trx;
 pub(crate) mod undo;
 pub(crate) mod ver_map;
 
-use crate::buffer::PageID;
 use crate::buffer::PoolGuards;
 use crate::buffer::page::VersionedPageID;
-use crate::catalog::{TableID, is_catalog_obj_id};
+use crate::catalog::is_catalog_obj_id;
 use crate::engine::EngineRef;
 use crate::error::{InternalError, Result};
+use crate::id::{PageID, RowID, TableID, TrxID};
 use crate::lock::{
     FreshLockGuard, LockGrant, LockManager, LockMode, LockOwner, LockOwnerGroup, LockResource,
     StmtNo,
 };
 use crate::quiescent::QuiescentGuard;
-use crate::row::RowID;
 use crate::session::SessionState;
 use crate::trx::log_replay::TrxLog;
 use crate::trx::redo::{DDLRedo, RedoHeader, RedoLogs, RedoTrxKind};
@@ -54,16 +53,15 @@ use std::ops::AsyncFnOnce;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-pub(crate) type TrxID = u64;
 pub use stmt::Statement;
 /// Public alias for the active transaction lifecycle facade.
 pub type Transaction = ActiveTrx;
-pub(crate) const MIN_SNAPSHOT_TS: TrxID = 1;
-pub(crate) const MAX_SNAPSHOT_TS: TrxID = 1 << 63;
-pub(crate) const MAX_COMMIT_TS: TrxID = 1 << 63;
+pub(crate) const MIN_SNAPSHOT_TS: TrxID = TrxID::new(1);
+pub(crate) const MAX_SNAPSHOT_TS: TrxID = TrxID::new(1 << 63);
+pub(crate) const MAX_COMMIT_TS: TrxID = TrxID::new(1 << 63);
 // As active transaction id is always greater than STS, that means
 // visibility check can be simplified to "STS is larger".
-pub(crate) const MIN_ACTIVE_TRX_ID: TrxID = (1 << 63) + 1;
+pub(crate) const MIN_ACTIVE_TRX_ID: TrxID = TrxID::new((1 << 63) + 1);
 
 pub(crate) struct SharedTrxStatus {
     ts: AtomicU64,
@@ -76,7 +74,7 @@ impl SharedTrxStatus {
     #[inline]
     pub(crate) fn new(trx_id: TrxID) -> Self {
         SharedTrxStatus {
-            ts: AtomicU64::new(trx_id),
+            ts: AtomicU64::new(trx_id.as_u64()),
             preparing: AtomicBool::new(false),
             prepare_ev: Mutex::new(None),
         }
@@ -85,7 +83,7 @@ impl SharedTrxStatus {
     /// Returns the timestamp of current transaction.
     #[inline]
     pub(crate) fn ts(&self) -> TrxID {
-        self.ts.load(Ordering::Acquire)
+        TrxID::new(self.ts.load(Ordering::Acquire))
     }
 
     /// Returns whether this transaction is preparing.
@@ -392,7 +390,7 @@ impl TrxEffects {
         } else {
             Some(TrxLog::new(
                 RedoHeader {
-                    cts: 0,
+                    cts: TrxID::new(0),
                     trx_kind: RedoTrxKind::User,
                 },
                 mem::take(&mut self.redo),
@@ -1028,7 +1026,7 @@ impl ActiveTrx {
             USER_OBJ_ID_START,
             RowRedo {
                 page_id: PageID::new(0),
-                row_id: 0,
+                row_id: RowID::new(0),
                 kind: RowRedoKind::Insert(vec![
                     Val::U64(123),
                     Val::U32(1),
@@ -1265,7 +1263,7 @@ impl PrecommitTrx {
                 // and readers can continue their work.
                 {
                     // first update cts.
-                    status.ts.store(self.cts, Ordering::SeqCst);
+                    status.ts.store(self.cts.as_u64(), Ordering::SeqCst);
                     // then reset preparing.
                     status.preparing.store(false, Ordering::SeqCst);
                     // finally, drop event to notify all waiting transactions.
@@ -1386,6 +1384,7 @@ pub(crate) mod tests {
     use crate::error::OperationError;
     use crate::file::cow_file::tests::old_root_drop_count;
     use crate::file::table_file::{MutableTableFile, TableFile};
+    use crate::id::SessionID;
     use crate::lock::tests::{debug_snapshot, try_acquire, try_acquire_grouped};
     use crate::row::ops::SelectKey;
     use crate::table::test_user_table_id;
@@ -1516,7 +1515,7 @@ pub(crate) mod tests {
             .unwrap();
         engine
             .trx_sys
-            .publish_table_file_root(mutable, 1, false)
+            .publish_table_file_root(mutable, TrxID::new(1), false)
             .await
             .unwrap()
     }
@@ -1526,12 +1525,13 @@ pub(crate) mod tests {
         smol::block_on(async {
             let (_temp_dir, engine) = test_engine("redo_trx_context_new").await;
             let session_state = test_session_state(&engine);
-            let mut trx = ActiveTrx::new(session_state, MIN_ACTIVE_TRX_ID + 42, 42, 3, 5);
+            let mut trx =
+                ActiveTrx::new(session_state, MIN_ACTIVE_TRX_ID + 42, TrxID::new(42), 3, 5);
 
             assert!(trx.readonly());
             assert!(!trx.require_durability());
             assert!(!trx.require_ordered_commit());
-            assert_eq!(trx.sts(), 42);
+            assert_eq!(trx.sts(), TrxID::new(42));
             assert_eq!(trx.trx_id(), MIN_ACTIVE_TRX_ID + 42);
             assert_eq!(trx.log_no(), 3);
             assert_eq!(trx.gc_no(), 5);
@@ -1551,7 +1551,8 @@ pub(crate) mod tests {
         smol::block_on(async {
             let (_temp_dir, engine) = test_engine("redo_trx_require_pool_guards").await;
             let session_state = test_session_state(&engine);
-            let mut ctx = TrxContext::new(session_state, MIN_ACTIVE_TRX_ID + 43, 43, 1, 2);
+            let mut ctx =
+                TrxContext::new(session_state, MIN_ACTIVE_TRX_ID + 43, TrxID::new(43), 1, 2);
 
             assert!(ctx.require_pool_guards("attached test").is_ok());
             let _session = ctx.take_session().unwrap();
@@ -1571,7 +1572,7 @@ pub(crate) mod tests {
         smol::block_on(async {
             let (_temp_dir, engine) = test_engine("redo_trx_readonly_prepare").await;
             let session_state = test_session_state(&engine);
-            let trx = ActiveTrx::new(session_state, MIN_ACTIVE_TRX_ID + 43, 43, 1, 2);
+            let trx = ActiveTrx::new(session_state, MIN_ACTIVE_TRX_ID + 43, TrxID::new(43), 1, 2);
 
             let mut prepared = trx.prepare().unwrap();
             assert!(prepared.redo_bin.is_none());
@@ -1579,7 +1580,7 @@ pub(crate) mod tests {
             assert!(!prepared.require_ordered_commit());
             assert!(prepared.readonly());
             let payload = prepared.payload.as_ref().unwrap();
-            assert_eq!(payload.sts, 43);
+            assert_eq!(payload.sts, TrxID::new(43));
             assert_eq!(payload.log_no, 1);
             assert_eq!(payload.gc_no, 2);
             assert!(payload.row_undo.is_empty());
@@ -1597,13 +1598,18 @@ pub(crate) mod tests {
         smol::block_on(async {
             let (_temp_dir, engine) = test_engine("redo_trx_effect_prepare").await;
             let session_state = test_session_state(&engine);
-            let mut trx = ActiveTrx::new(session_state, MIN_ACTIVE_TRX_ID + 44, 44, 2, 3);
+            let mut trx =
+                ActiveTrx::new(session_state, MIN_ACTIVE_TRX_ID + 44, TrxID::new(44), 2, 3);
             trx.add_pseudo_redo_log_entry();
-            trx.row_undo_mut()
-                .push(OwnedRowUndo::new(11, None, 22, RowUndoKind::Delete));
+            trx.row_undo_mut().push(OwnedRowUndo::new(
+                TableID::new(11),
+                None,
+                RowID::new(22),
+                RowUndoKind::Delete,
+            ));
             trx.index_undo_mut().push(IndexUndo {
-                table_id: 11,
-                row_id: 22,
+                table_id: TableID::new(11),
+                row_id: RowID::new(22),
                 kind: IndexUndoKind::DeferDelete(SelectKey::new(0, vec![]), true),
             });
 
@@ -1613,7 +1619,7 @@ pub(crate) mod tests {
             assert!(prepared.require_ordered_commit());
             assert!(!prepared.readonly());
             let payload = prepared.payload.as_ref().unwrap();
-            assert_eq!(payload.sts, 44);
+            assert_eq!(payload.sts, TrxID::new(44));
             assert_eq!(payload.log_no, 2);
             assert_eq!(payload.gc_no, 3);
             assert_eq!(payload.row_undo.len(), 1);
@@ -1632,16 +1638,27 @@ pub(crate) mod tests {
         smol::block_on(async {
             let (_temp_dir, engine) = test_engine("redo_stmt_effect_merge").await;
             let session_state = test_session_state(&engine);
-            let mut trx = ActiveTrx::new(session_state, MIN_ACTIVE_TRX_ID + 45, 45, 0, 0);
+            let mut trx =
+                ActiveTrx::new(session_state, MIN_ACTIVE_TRX_ID + 45, TrxID::new(45), 0, 0);
             trx.exec(async |stmt| {
                 let effects = stmt.effects_mut();
-                effects.push_row_undo(OwnedRowUndo::new(12, None, 23, RowUndoKind::Delete));
-                effects.push_delete_index_undo(12, 23, SelectKey::new(0, vec![]), true);
+                effects.push_row_undo(OwnedRowUndo::new(
+                    TableID::new(12),
+                    None,
+                    RowID::new(23),
+                    RowUndoKind::Delete,
+                ));
+                effects.push_delete_index_undo(
+                    TableID::new(12),
+                    RowID::new(23),
+                    SelectKey::new(0, vec![]),
+                    true,
+                );
                 effects.insert_row_redo(
-                    12,
+                    TableID::new(12),
                     RowRedo {
                         page_id: PageID::new(0),
-                        row_id: 23,
+                        row_id: RowID::new(23),
                         kind: RowRedoKind::Delete,
                     },
                 );
@@ -1668,7 +1685,7 @@ pub(crate) mod tests {
             TABLE_ID_TABLES,
             RowRedo {
                 page_id: PageID::new(0),
-                row_id: 0,
+                row_id: RowID::new(0),
                 kind: RowRedoKind::Insert(vec![Val::U64(1)]),
             },
         );
@@ -1680,14 +1697,15 @@ pub(crate) mod tests {
         smol::block_on(async {
             let (_temp_dir, engine) = test_engine("redo_stmt_error_rollback").await;
             let session_state = test_session_state(&engine);
-            let mut trx = ActiveTrx::new(session_state, MIN_ACTIVE_TRX_ID + 49, 49, 0, 0);
+            let mut trx =
+                ActiveTrx::new(session_state, MIN_ACTIVE_TRX_ID + 49, TrxID::new(49), 0, 0);
 
             trx.exec(async |stmt| {
                 stmt.effects_mut().insert_row_redo(
-                    12,
+                    TableID::new(12),
                     RowRedo {
                         page_id: PageID::new(0),
-                        row_id: 23,
+                        row_id: RowID::new(23),
                         kind: RowRedoKind::Delete,
                     },
                 );
@@ -1699,10 +1717,10 @@ pub(crate) mod tests {
             let res: Result<()> = trx
                 .exec(async |stmt| {
                     stmt.effects_mut().insert_row_redo(
-                        12,
+                        TableID::new(12),
                         RowRedo {
                             page_id: PageID::new(0),
-                            row_id: 24,
+                            row_id: RowID::new(24),
                             kind: RowRedoKind::Delete,
                         },
                     );
@@ -1712,9 +1730,9 @@ pub(crate) mod tests {
             let err = res.unwrap_err();
 
             assert_eq!(err.operation_error(), Some(OperationError::NotSupported));
-            let table_redo = trx.effects.redo.dml.get(&12).unwrap();
-            assert!(table_redo.rows.contains_key(&23));
-            assert!(!table_redo.rows.contains_key(&24));
+            let table_redo = trx.effects.redo.dml.get(&TableID::new(12)).unwrap();
+            assert!(table_redo.rows.contains_key(&RowID::new(23)));
+            assert!(!table_redo.rows.contains_key(&RowID::new(24)));
 
             trx.discard_after_fatal_rollback();
         });
@@ -1727,7 +1745,7 @@ pub(crate) mod tests {
             let mut session = engine.new_session().unwrap();
             let mut trx = session.begin_trx().unwrap();
             let trx_owner = lock_owner(&trx).unwrap();
-            let trx_resource = LockResource::TableData(91_210);
+            let trx_resource = LockResource::TableData(TableID::new(91_210));
             assert!(
                 try_acquire_transaction_lock(&mut trx, trx_resource, LockMode::IntentExclusive)
                     .unwrap()
@@ -1739,13 +1757,13 @@ pub(crate) mod tests {
                 first_owner.set(Some(owner));
                 stmt_tests::acquire_statement_lock(
                     stmt,
-                    LockResource::TableMetadata(91_210),
+                    LockResource::TableMetadata(TableID::new(91_210)),
                     LockMode::Shared,
                 )
                 .await?;
                 stmt_tests::acquire_statement_lock(
                     stmt,
-                    LockResource::TableMetadata(91_210),
+                    LockResource::TableMetadata(TableID::new(91_210)),
                     LockMode::Shared,
                 )
                 .await?;
@@ -1761,12 +1779,12 @@ pub(crate) mod tests {
                 second_owner.set(Some(owner));
                 assert!(stmt_tests::try_acquire_statement_lock(
                     stmt,
-                    LockResource::TableMetadata(91_211),
+                    LockResource::TableMetadata(TableID::new(91_211)),
                     LockMode::Shared,
                 )?);
                 assert!(stmt_tests::try_acquire_statement_lock(
                     stmt,
-                    LockResource::TableMetadata(91_211),
+                    LockResource::TableMetadata(TableID::new(91_211)),
                     LockMode::Shared,
                 )?);
                 assert_eq!(lock_entry_count(&engine, owner), 1);
@@ -1782,7 +1800,7 @@ pub(crate) mod tests {
                     error_owner.set(Some(owner));
                     stmt_tests::acquire_statement_lock(
                         stmt,
-                        LockResource::TableMetadata(91_212),
+                        LockResource::TableMetadata(TableID::new(91_212)),
                         LockMode::Shared,
                     )
                     .await?;
@@ -1818,7 +1836,7 @@ pub(crate) mod tests {
             let mut session = engine.new_session().unwrap();
             let mut trx = session.begin_trx().unwrap();
             let owner = lock_owner(&trx).unwrap();
-            let data = LockResource::TableData(91_220);
+            let data = LockResource::TableData(TableID::new(91_220));
 
             assert!(
                 try_acquire_transaction_lock(&mut trx, data, LockMode::IntentExclusive).unwrap()
@@ -1834,14 +1852,14 @@ pub(crate) mod tests {
             );
             assert_eq!(lock_entry_count(&engine, owner), 1);
 
-            let metadata = LockResource::TableMetadata(91_221);
+            let metadata = LockResource::TableMetadata(TableID::new(91_221));
             assert!(try_acquire_transaction_lock(&mut trx, metadata, LockMode::Shared).unwrap());
             assert!(
                 try_acquire(
                     engine.lock_manager(),
                     metadata,
                     LockMode::Shared,
-                    LockOwner::Session(91_221)
+                    LockOwner::Session(SessionID::new(91_221))
                 )
                 .unwrap()
             );
@@ -1853,7 +1871,7 @@ pub(crate) mod tests {
             );
             engine
                 .lock_manager()
-                .release_owner(LockOwner::Session(91_221));
+                .release_owner(LockOwner::Session(SessionID::new(91_221)));
 
             trx.rollback().await.unwrap();
             assert_eq!(lock_entry_count(&engine, owner), 0);
@@ -1870,20 +1888,20 @@ pub(crate) mod tests {
             let owner = lock_owner(&trx).unwrap();
             acquire_transaction_lock(
                 &mut trx,
-                LockResource::TableData(91_230),
+                LockResource::TableData(TableID::new(91_230)),
                 LockMode::IntentShared,
             )
             .await
             .unwrap();
             assert!(trx.readonly());
-            assert_eq!(trx.commit().await.unwrap(), 0);
+            assert_eq!(trx.commit().await.unwrap(), TrxID::new(0));
             assert_eq!(lock_entry_count(&engine, owner), 0);
 
             let mut trx = session.begin_trx().unwrap();
             let owner = lock_owner(&trx).unwrap();
             acquire_transaction_lock(
                 &mut trx,
-                LockResource::TableData(91_231),
+                LockResource::TableData(TableID::new(91_231)),
                 LockMode::IntentExclusive,
             )
             .await
@@ -1895,13 +1913,13 @@ pub(crate) mod tests {
             let owner = lock_owner(&trx).unwrap();
             acquire_transaction_lock(
                 &mut trx,
-                LockResource::TableData(91_232),
+                LockResource::TableData(TableID::new(91_232)),
                 LockMode::IntentExclusive,
             )
             .await
             .unwrap();
             trx.add_pseudo_redo_log_entry();
-            assert!(trx.commit().await.unwrap() > 0);
+            assert!(trx.commit().await.unwrap() > TrxID::new(0));
             assert_eq!(lock_entry_count(&engine, owner), 0);
         });
     }
@@ -1911,11 +1929,12 @@ pub(crate) mod tests {
         smol::block_on(async {
             let (_temp_dir, engine) = test_engine("redo_trx_lock_abort").await;
             let session_state = test_session_state(&engine);
-            let mut trx = ActiveTrx::new(session_state, MIN_ACTIVE_TRX_ID + 55, 55, 0, 0);
+            let mut trx =
+                ActiveTrx::new(session_state, MIN_ACTIVE_TRX_ID + 55, TrxID::new(55), 0, 0);
             let owner = lock_owner(&trx).unwrap();
             acquire_transaction_lock(
                 &mut trx,
-                LockResource::TableData(91_240),
+                LockResource::TableData(TableID::new(91_240)),
                 LockMode::IntentExclusive,
             )
             .await
@@ -1923,7 +1942,7 @@ pub(crate) mod tests {
             trx.add_pseudo_redo_log_entry();
 
             let prepared = trx.prepare().unwrap();
-            let precommit = prepared.fill_cts(91_241);
+            let precommit = prepared.fill_cts(TrxID::new(91_241));
             precommit.abort();
             assert_eq!(lock_entry_count(&engine, owner), 0);
         });
@@ -1978,7 +1997,8 @@ pub(crate) mod tests {
             let (_temp_dir, engine) = test_engine("redo_trx_effect_predicates").await;
 
             let session_state = test_session_state(&engine);
-            let mut trx = ActiveTrx::new(session_state, MIN_ACTIVE_TRX_ID + 46, 46, 0, 0);
+            let mut trx =
+                ActiveTrx::new(session_state, MIN_ACTIVE_TRX_ID + 46, TrxID::new(46), 0, 0);
             trx.extend_gc_row_pages(vec![PageID::new(46)]);
             assert!(!trx.require_durability());
             assert!(trx.require_ordered_commit());
@@ -1991,10 +2011,11 @@ pub(crate) mod tests {
             prepared.release_transaction_locks();
 
             let session_state = test_session_state(&engine);
-            let mut trx = ActiveTrx::new(session_state, MIN_ACTIVE_TRX_ID + 47, 47, 0, 0);
+            let mut trx =
+                ActiveTrx::new(session_state, MIN_ACTIVE_TRX_ID + 47, TrxID::new(47), 0, 0);
             trx.index_undo_mut().push(IndexUndo {
-                table_id: 47,
-                row_id: 1,
+                table_id: TableID::new(47),
+                row_id: RowID::new(1),
                 kind: IndexUndoKind::DeferDelete(SelectKey::new(0, vec![]), true),
             });
             assert!(!trx.require_durability());
@@ -2008,7 +2029,8 @@ pub(crate) mod tests {
             prepared.release_transaction_locks();
 
             let session_state = test_session_state(&engine);
-            let mut trx = ActiveTrx::new(session_state, MIN_ACTIVE_TRX_ID + 48, 48, 0, 0);
+            let mut trx =
+                ActiveTrx::new(session_state, MIN_ACTIVE_TRX_ID + 48, TrxID::new(48), 0, 0);
             trx.add_pseudo_redo_log_entry();
             assert!(trx.require_durability());
             assert!(trx.require_ordered_commit());
@@ -2040,10 +2062,10 @@ pub(crate) mod tests {
             );
             let table_file = engine
                 .trx_sys
-                .publish_table_file_root(mutable, 2, false)
+                .publish_table_file_root(mutable, TrxID::new(2), false)
                 .await
                 .unwrap();
-            assert_eq!(table_file.active_root_unchecked().root_ts, 2);
+            assert_eq!(table_file.active_root_unchecked().root_ts, TrxID::new(2));
 
             for _ in 0..10 {
                 smol::Timer::after(std::time::Duration::from_millis(10)).await;

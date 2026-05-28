@@ -29,12 +29,11 @@ pub(crate) use storage::ColumnStorage;
 pub(crate) use tests::test_user_table_id;
 
 use crate::buffer::guard::{PageExclusiveGuard, PageGuard, PageSharedGuard};
-use crate::buffer::page::PageID;
 use crate::buffer::{EvictableBufferPool, PoolGuard, PoolGuards, PoolRole, ReadonlyBufferPool};
-use crate::catalog::{IndexSpec, TableID, TableMetadata};
+use crate::catalog::{IndexSpec, TableMetadata};
 use crate::error::{DataIntegrityError, Error, InternalError, Result};
-use crate::file::BlockID;
 use crate::file::table_file::{ActiveRoot, LwcBlockPersist, TableFile};
+use crate::id::{BlockID, PageID, RowID, TableID, TrxID};
 use crate::index::{
     BlockIndex, ColumnBlockEntryShape, NonUniqueMemIndex, RowLocation, SecondaryDiskTreeRuntime,
     SecondaryIndex, UniqueMemIndex,
@@ -42,12 +41,12 @@ use crate::index::{
 use crate::lwc::LwcBuilder;
 use crate::quiescent::QuiescentGuard;
 use crate::row::ops::{SelectKey, UpdateCol};
-use crate::row::{RowID, RowPage, RowRead, var_len_for_insert};
+use crate::row::{RowPage, RowRead, var_len_for_insert};
 use crate::trx::row::RowReadAccess;
 use crate::trx::sys::TransactionSystem;
 use crate::trx::undo::{IndexBranch, RowUndoKind, UndoStatus};
 use crate::trx::ver_map::RowPageState;
-use crate::trx::{MAX_SNAPSHOT_TS, TrxContext, TrxID, TrxReadProof, trx_is_committed};
+use crate::trx::{MAX_SNAPSHOT_TS, TrxContext, TrxReadProof, trx_is_committed};
 use crate::value::{PAGE_VAR_LEN_INLINE, Val};
 use error_stack::Report;
 use parking_lot::Mutex;
@@ -580,8 +579,8 @@ impl Table {
         let mut lwc_blocks = Vec::new();
         if !frozen_pages.is_empty() {
             let mut builder = LwcBuilder::new(metadata.col.as_ref());
-            let mut current_start: RowID = 0;
-            let mut current_end: RowID = 0;
+            let mut current_start = RowID::new(0);
+            let mut current_end = RowID::new(0);
             for page_info in frozen_pages {
                 let page_guard = self
                     .mem

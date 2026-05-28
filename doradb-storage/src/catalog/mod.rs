@@ -22,13 +22,13 @@ use crate::buffer::{
 use crate::component::{Component, ComponentRegistry, MetaPool, ShelfScope};
 use crate::error::{DataIntegrityError, Error, OperationError, Result};
 use crate::file::fs::FileSystem;
+use crate::id::{RowID, TableID, TrxID};
 use crate::index::BlockIndex;
 use crate::quiescent::{QuiescentBox, QuiescentGuard};
-use crate::row::RowID;
 use crate::row::ops::SelectKey;
 use crate::table::{MemTable, Table, TableRuntimeLayout};
+use crate::trx::MIN_SNAPSHOT_TS;
 use crate::trx::undo::IndexUndo;
-use crate::trx::{MIN_SNAPSHOT_TS, TrxID};
 use dashmap::DashMap;
 use error_stack::Report;
 use std::collections::hash_map::Entry;
@@ -37,19 +37,17 @@ use std::ops::Deref;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-pub type TableID = u64;
-pub(crate) type ObjID = TableID;
-pub(crate) const USER_OBJ_ID_START: ObjID = 0x0001_0000_0000_0000;
+pub(crate) const USER_OBJ_ID_START: TableID = TableID::new(0x0001_0000_0000_0000);
 
 /// Return whether an object id belongs to user-managed catalog space.
 #[inline]
-pub(crate) const fn is_user_obj_id(obj_id: ObjID) -> bool {
-    obj_id >= USER_OBJ_ID_START
+pub(crate) const fn is_user_obj_id(obj_id: TableID) -> bool {
+    obj_id.as_u64() >= USER_OBJ_ID_START.as_u64()
 }
 
 /// Return whether an object id belongs to built-in catalog table space.
 #[inline]
-pub(crate) const fn is_catalog_obj_id(obj_id: ObjID) -> bool {
+pub(crate) const fn is_catalog_obj_id(obj_id: TableID) -> bool {
     !is_user_obj_id(obj_id)
 }
 
@@ -149,7 +147,7 @@ impl Catalog {
             .await?;
         let next_user_obj_id = storage.next_user_obj_id();
         Ok(Catalog {
-            next_user_obj_id: AtomicU64::new(next_user_obj_id),
+            next_user_obj_id: AtomicU64::new(next_user_obj_id.as_u64()),
             user_tables: DashMap::new(),
             storage,
             checkpoint_gate: CatalogCheckpointGate::new(),
@@ -158,20 +156,20 @@ impl Catalog {
 
     /// Allocate and return the next user object id.
     #[inline]
-    pub(crate) fn next_user_obj_id(&self) -> ObjID {
-        self.next_user_obj_id.fetch_add(1, Ordering::SeqCst)
+    pub(crate) fn next_user_obj_id(&self) -> TableID {
+        TableID::new(self.next_user_obj_id.fetch_add(1, Ordering::SeqCst))
     }
 
     #[inline]
-    fn try_update_next_user_obj_id(&self, next_user_obj_id: ObjID) {
+    fn try_update_next_user_obj_id(&self, next_user_obj_id: TableID) {
         self.next_user_obj_id
-            .fetch_max(next_user_obj_id, Ordering::SeqCst);
+            .fetch_max(next_user_obj_id.as_u64(), Ordering::SeqCst);
     }
 
     /// Return the current next user object id without allocating one.
     #[inline]
-    pub(crate) fn curr_next_user_obj_id(&self) -> ObjID {
-        self.next_user_obj_id.load(Ordering::Acquire)
+    pub(crate) fn curr_next_user_obj_id(&self) -> TableID {
+        TableID::new(self.next_user_obj_id.load(Ordering::Acquire))
     }
 
     /// Apply one scanned catalog checkpoint batch into `catalog.mtb`.
@@ -692,9 +690,9 @@ pub(crate) mod tests {
     use crate::conf::{EngineConfig, TrxSysConfig};
     use crate::engine::Engine;
     use crate::error::{CompletionErrorKind, DataIntegrityError, Error};
-    use crate::file::BlockID;
     use crate::file::block_integrity::{BLOCK_INTEGRITY_HEADER_SIZE, write_block_checksum};
     use crate::file::cow_file::COW_FILE_PAGE_SIZE;
+    use crate::id::BlockID;
     use crate::index::{COLUMN_BLOCK_HEADER_SIZE, COLUMN_BLOCK_LEAF_HEADER_SIZE, ColumnBlockIndex};
     use crate::table::TablePersistence;
     use crate::trx::redo::DDLRedo;
@@ -913,9 +911,10 @@ pub(crate) mod tests {
 
     #[test]
     fn test_catalog_user_obj_id_boundary_predicates() {
-        assert!(is_catalog_obj_id(USER_OBJ_ID_START - 1));
+        let before_user = TableID::new(USER_OBJ_ID_START.as_u64() - 1);
+        assert!(is_catalog_obj_id(before_user));
         assert!(!is_catalog_obj_id(USER_OBJ_ID_START));
-        assert!(!is_user_obj_id(USER_OBJ_ID_START - 1));
+        assert!(!is_user_obj_id(before_user));
         assert!(is_user_obj_id(USER_OBJ_ID_START));
     }
 
@@ -938,7 +937,10 @@ pub(crate) mod tests {
         assert_eq!(catalog_metadata.col.col_names, file_metadata.col.col_names);
         assert_eq!(catalog_metadata.col.col_types, file_metadata.col.col_types);
         assert_ne!(catalog_metadata.col.col_attrs, file_metadata.col.col_attrs);
-        assert!(!index_ddl_metadata_reconcilable(42, &catalog_metadata, &file_metadata).unwrap());
+        assert!(
+            !index_ddl_metadata_reconcilable(TableID::new(42), &catalog_metadata, &file_metadata)
+                .unwrap()
+        );
     }
 
     #[test]
@@ -959,7 +961,10 @@ pub(crate) mod tests {
                 .expect("valid table metadata");
 
         assert!(file_metadata.idx.next_index_no() > catalog_metadata.idx.next_index_no());
-        assert!(index_ddl_metadata_reconcilable(42, &catalog_metadata, &file_metadata).unwrap());
+        assert!(
+            index_ddl_metadata_reconcilable(TableID::new(42), &catalog_metadata, &file_metadata)
+                .unwrap()
+        );
     }
 
     #[test]
@@ -981,7 +986,8 @@ pub(crate) mod tests {
 
         assert!(catalog_metadata.idx.next_index_no() > file_metadata.idx.next_index_no());
         let err =
-            index_ddl_metadata_reconcilable(42, &catalog_metadata, &file_metadata).unwrap_err();
+            index_ddl_metadata_reconcilable(TableID::new(42), &catalog_metadata, &file_metadata)
+                .unwrap_err();
         assert_eq!(
             err.data_integrity_error(),
             Some(DataIntegrityError::InvalidRootInvariant)
@@ -1289,7 +1295,7 @@ pub(crate) mod tests {
                     .meta
                     .table_roots
                     .iter()
-                    .all(|root| root.root_block_id.is_none() && root.pivot_row_id == 0)
+                    .all(|root| root.root_block_id.is_none() && root.pivot_row_id == RowID::new(0))
             );
 
             let _ = table1(&engine).await;
@@ -1316,7 +1322,7 @@ pub(crate) mod tests {
                     .meta
                     .table_roots
                     .iter()
-                    .any(|root| root.pivot_row_id > 0)
+                    .any(|root| root.pivot_row_id > RowID::new(0))
             );
 
             engine
@@ -1645,14 +1651,14 @@ pub(crate) mod tests {
                     .file()
                     .active_root_unchecked()
                     .pivot_row_id
-                    > 0
+                    > RowID::new(0)
             );
             assert_eq!(
                 replay_only_table
                     .file()
                     .active_root_unchecked()
                     .pivot_row_id,
-                0
+                RowID::new(0)
             );
             assert!(
                 checkpointed_table

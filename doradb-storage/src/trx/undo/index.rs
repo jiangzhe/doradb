@@ -1,10 +1,9 @@
 use crate::buffer::PoolGuards;
-use crate::catalog::{TableCache, TableID, is_catalog_obj_id};
+use crate::catalog::{TableCache, is_catalog_obj_id};
 use crate::error::Result;
-use crate::row::RowID;
+use crate::id::{RowID, TableID, TrxID};
 use crate::row::ops::SelectKey;
 use crate::table::IndexRollback;
-use crate::trx::TrxID;
 
 /// Buffer of index undo entries accumulated for rollback and GC handoff.
 #[derive(Default)]
@@ -148,21 +147,21 @@ mod tests {
 
         // Add entries to log1
         log1.push(IndexUndo {
-            table_id: 1,
-            row_id: 1,
+            table_id: TableID::new(1),
+            row_id: RowID::new(1),
             kind: IndexUndoKind::InsertUnique(create_test_key(1), false),
         });
 
         // Add entries to log2
         log2.push(IndexUndo {
-            table_id: 2,
-            row_id: 2,
+            table_id: TableID::new(2),
+            row_id: RowID::new(2),
             kind: IndexUndoKind::DeferDelete(create_test_key(2), true),
         });
         log2.push(IndexUndo {
-            table_id: 3,
-            row_id: 3,
-            kind: IndexUndoKind::UpdateUnique(create_test_key(3), 4, false),
+            table_id: TableID::new(3),
+            row_id: RowID::new(3),
+            kind: IndexUndoKind::UpdateUnique(create_test_key(3), RowID::new(4), false),
         });
 
         // Merge and verify

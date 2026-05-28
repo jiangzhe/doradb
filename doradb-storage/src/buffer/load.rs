@@ -4,8 +4,9 @@
 //! submission state machine. Readonly and evictable pools each build their own
 //! worker submissions on top of the shared reserve/publish contract here.
 
-use crate::buffer::page::{Page, PageID};
+use crate::buffer::page::Page;
 use crate::error::Result;
+use crate::id::PageID;
 
 /// Pool-specific lifecycle for one reserved page-load destination.
 ///

@@ -140,6 +140,7 @@ mod tests {
     use super::*;
     use crate::buffer::FixedBufferPool;
     use crate::error::InternalError;
+    use crate::id::TrxID;
     use crate::index::btree::BTree;
     use crate::index::btree::BTreeU64;
     use crate::index::util::Maskable;
@@ -155,7 +156,7 @@ mod tests {
             );
             {
                 let pool_guard = (*pool).pool_guard();
-                let tree = BTree::new(pool.guard(), &pool_guard, true, 200)
+                let tree = BTree::new(pool.guard(), &pool_guard, true, TrxID::new(200))
                     .await
                     .expect("test btree construction should succeed");
                 let keys = vec![
@@ -168,7 +169,7 @@ mod tests {
                             k.as_bytes(),
                             BTreeU64::from(idx as u64),
                             false,
-                            100,
+                            TrxID::new(100),
                         )
                         .await;
                     assert!(res.is_ok());
@@ -191,7 +192,7 @@ mod tests {
                         b"a",
                         BTreeU64::from(0u64),
                         BTreeU64::from(0u64).deleted(),
-                        101,
+                        TrxID::new(101),
                     )
                     .await;
                 assert!(res.is_ok());
@@ -201,7 +202,13 @@ mod tests {
                 assert!(scanner.count() == 3);
 
                 let res = tree
-                    .delete(&pool_guard, b"a", BTreeU64::from(0u64), false, 102)
+                    .delete(
+                        &pool_guard,
+                        b"a",
+                        BTreeU64::from(0u64),
+                        false,
+                        TrxID::new(102),
+                    )
                     .await;
                 assert!(res.is_ok()); // actual deletion.
                 scanner.reset();
@@ -224,7 +231,7 @@ mod tests {
             );
             {
                 let pool_guard = (*pool).pool_guard();
-                let tree = BTree::new(pool.guard(), &pool_guard, true, 200)
+                let tree = BTree::new(pool.guard(), &pool_guard, true, TrxID::new(200))
                     .await
                     .expect("test btree construction should succeed");
 
@@ -238,7 +245,13 @@ mod tests {
                         elem[KEY_LEN - std::mem::size_of::<u32>()..]
                             .copy_from_slice(&(entry_idx as u32).to_be_bytes());
                         let res = tree
-                            .insert(&pool_guard, &elem, BTreeU64::from(idx as u64), false, 210)
+                            .insert(
+                                &pool_guard,
+                                &elem,
+                                BTreeU64::from(idx as u64),
+                                false,
+                                TrxID::new(210),
+                            )
                             .await;
                         assert!(res.is_ok());
                     }
@@ -296,10 +309,10 @@ mod tests {
                     .unwrap(),
             );
             let pool_guard = (*pool).pool_guard();
-            let tree = BTree::new(pool.guard(), &pool_guard, true, 200)
+            let tree = BTree::new(pool.guard(), &pool_guard, true, TrxID::new(200))
                 .await
                 .expect("test btree construction should succeed");
-            tree.insert(&pool_guard, b"a", BTreeU64::from(1), false, 100)
+            tree.insert(&pool_guard, b"a", BTreeU64::from(1), false, TrxID::new(100))
                 .await
                 .expect("test btree insert should succeed");
 

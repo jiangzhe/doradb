@@ -374,6 +374,7 @@ impl MmapLogReader {
 mod tests {
     use super::*;
     use crate::buffer::test_page_id;
+    use crate::id::{RowID, TableID, TrxID};
     use crate::io::IOBuf;
     use crate::trx::redo::{
         DDLRedo, RedoHeader, RedoLogs, RedoTrxKind, RowRedo, RowRedoKind, TableDML,
@@ -385,15 +386,15 @@ mod tests {
     fn test_log_reader_read_multi_trx_log_in_one_group() {
         let log1 = TrxLog::new(
             RedoHeader {
-                cts: 1,
+                cts: TrxID::new(1),
                 trx_kind: RedoTrxKind::System,
             },
             RedoLogs {
                 ddl: Some(Box::new(DDLRedo::CreateRowPage {
-                    table_id: 6,
+                    table_id: TableID::new(6),
                     page_id: test_page_id(5),
-                    start_row_id: 0,
-                    end_row_id: 574,
+                    start_row_id: RowID::new(0),
+                    end_row_id: RowID::new(574),
                 })),
                 dml: BTreeMap::new(),
             },
@@ -403,19 +404,19 @@ mod tests {
 
         let mut rows = BTreeMap::new();
         rows.insert(
-            100,
+            RowID::new(100),
             RowRedo {
                 page_id: test_page_id(5),
-                row_id: 100,
+                row_id: RowID::new(100),
                 kind: RowRedoKind::Delete,
             },
         );
         let mut dml = BTreeMap::new();
-        dml.insert(6, TableDML { rows });
+        dml.insert(TableID::new(6), TableDML { rows });
 
         let log2 = TrxLog::new(
             RedoHeader {
-                cts: 2,
+                cts: TrxID::new(2),
                 trx_kind: RedoTrxKind::User,
             },
             RedoLogs { ddl: None, dml },

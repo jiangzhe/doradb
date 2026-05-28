@@ -1,15 +1,15 @@
-use crate::buffer::PageID;
 use crate::buffer::guard::{PageExclusiveGuard, PageSharedGuard};
 use crate::buffer::{BufferPool, FixedBufferPool, PoolGuard};
 use crate::catalog::TableColumnLayout;
 use crate::error::{Error, InternalError, Result};
-use crate::file::cow_file::{BlockID, SUPER_BLOCK_ID};
+use crate::file::cow_file::SUPER_BLOCK_ID;
+use crate::id::{BlockID, PageID, RowID};
 use crate::index::block_index_root::{BlockIndexRoot, BlockIndexRoute};
 use crate::index::column_block_index::ColumnBlockIndex;
 use crate::index::row_page_index::{RowLocation, RowPageIndex, RowPageIndexMemCursor};
 use crate::index::util::{Maskable, RowPageCreateRedoCtx};
 use crate::quiescent::QuiescentGuard;
-use crate::row::{RowID, RowPage};
+use crate::row::RowPage;
 use crate::table::ColumnStorage;
 use error_stack::Report;
 use std::sync::Arc;
@@ -49,7 +49,7 @@ impl<P: BufferPool> BlockIndex<P> {
         pool: QuiescentGuard<P>,
         meta_pool_guard: &PoolGuard,
     ) -> Result<Self> {
-        Self::new(pool, meta_pool_guard, 0, SUPER_BLOCK_ID).await
+        Self::new(pool, meta_pool_guard, RowID::new(0), SUPER_BLOCK_ID).await
     }
 
     /// Returns the in-memory row index height.
@@ -508,20 +508,27 @@ mod tests {
         smol::block_on(async {
             let meta_pool = owned_index_pool(64 * 1024 * 1024);
             let meta_guard = (*meta_pool).pool_guard();
-            let blk_idx = BlockIndex::new(meta_pool.guard(), &meta_guard, 7, test_block_id(11))
-                .await
-                .expect("test block-index construction should succeed");
+            let blk_idx = BlockIndex::new(
+                meta_pool.guard(),
+                &meta_guard,
+                RowID::new(7),
+                test_block_id(11),
+            )
+            .await
+            .expect("test block-index construction should succeed");
 
             assert_eq!(blk_idx.height(), 0);
-            assert_eq!(blk_idx.pivot_row_id(), 7);
+            assert_eq!(blk_idx.pivot_row_id(), RowID::new(7));
 
-            blk_idx.update_column_root(9, test_block_id(12)).await;
-            assert_eq!(blk_idx.pivot_row_id(), 9);
+            blk_idx
+                .update_column_root(RowID::new(9), test_block_id(12))
+                .await;
+            assert_eq!(blk_idx.pivot_row_id(), RowID::new(9));
 
             let catalog_idx = BlockIndex::new_catalog(meta_pool.guard(), &meta_guard)
                 .await
                 .expect("test catalog block-index construction should succeed");
-            assert_eq!(catalog_idx.pivot_row_id(), 0);
+            assert_eq!(catalog_idx.pivot_row_id(), RowID::new(0));
         });
     }
 
@@ -549,14 +556,14 @@ mod tests {
         let blk_idx = smol::block_on(BlockIndex::new(
             pool.guard(),
             &meta_guard,
-            10,
+            RowID::new(10),
             test_block_id(77),
         ))
         .expect("test block-index construction should succeed");
 
         // Row id 9 is below the pivot, so lookup goes straight to the column path.
         // Without column storage this must surface as an error, not as "not found".
-        let err = match smol::block_on(blk_idx.find_row(&meta_guard, None, 9, None)) {
+        let err = match smol::block_on(blk_idx.find_row(&meta_guard, None, RowID::new(9), None)) {
             Ok(_location) => panic!("expected missing-column-storage error, got row location"),
             Err(err) => err,
         };
@@ -583,7 +590,7 @@ mod tests {
         let blk_idx = smol::block_on(BlockIndex::new(
             pool.guard(),
             &meta_guard,
-            10,
+            RowID::new(10),
             test_block_id(77),
         ))
         .expect("test block-index construction should succeed");
@@ -594,14 +601,18 @@ mod tests {
             let blk_idx = &blk_idx;
             let meta_guard = meta_guard.clone();
             let handle = s.spawn(move || {
-                smol::block_on(async { blk_idx.find_row(&meta_guard, None, 10, None).await })
+                smol::block_on(async {
+                    blk_idx
+                        .find_row(&meta_guard, None, RowID::new(10), None)
+                        .await
+                })
             });
 
             // Wait until the row-store root fetch is paused, then move the pivot past
             // row_id so the subsequent `try_column()` fallback becomes eligible.
             // This avoids relying on timing-sensitive races to exercise the fallback.
             entered.wait();
-            smol::block_on(blk_idx.update_column_root(11, test_block_id(88)));
+            smol::block_on(blk_idx.update_column_root(RowID::new(11), test_block_id(88)));
             release.wait();
 
             let res = handle.join().unwrap();
@@ -623,9 +634,14 @@ mod tests {
             let meta_guard = (*meta_pool).pool_guard();
             let mem_guard = (*mem_pool).pool_guard();
             let metadata = make_test_metadata();
-            let blk_idx = BlockIndex::new(meta_pool.guard(), &meta_guard, 0, test_block_id(77))
-                .await
-                .expect("test block-index construction should succeed");
+            let blk_idx = BlockIndex::new(
+                meta_pool.guard(),
+                &meta_guard,
+                RowID::new(0),
+                test_block_id(77),
+            )
+            .await
+            .expect("test block-index construction should succeed");
 
             let page_guard = blk_idx
                 .get_insert_page_exclusive_with_redo(

@@ -1,14 +1,13 @@
 use crate::bitmap::AllocMap;
+use crate::catalog::USER_OBJ_ID_START;
 use crate::catalog::table::{TableBriefMetadata, TableBriefMetadataSerView, TableMetadata};
-use crate::catalog::{ObjID, USER_OBJ_ID_START};
 use crate::error::{DataIntegrityError, Error, Result};
-use crate::file::cow_file::{BlockID, SUPER_BLOCK_ID};
+use crate::file::cow_file::SUPER_BLOCK_ID;
 use crate::file::multi_table_file::{
     CATALOG_TABLE_ROOT_DESC_COUNT, CatalogTableRootDesc, MultiTableMetaBlock,
 };
-use crate::row::RowID;
+use crate::id::{BlockID, RowID, TableID, TrxID};
 use crate::serde::{Deser, Ser, Serde};
-use crate::trx::TrxID;
 use error_stack::Report;
 use std::mem;
 use std::num::NonZeroU64;
@@ -96,9 +95,9 @@ pub(crate) struct MetaBlock {
 impl Deser for MetaBlock {
     #[inline]
     fn deser<S: Serde + ?Sized>(input: &S, start_idx: usize) -> Result<(usize, Self)> {
-        let (idx, pivot_row_id) = input.deser_u64(start_idx)?;
-        let (idx, heap_redo_start_ts) = input.deser_u64(idx)?;
-        let (idx, deletion_cutoff_ts) = input.deser_u64(idx)?;
+        let (idx, pivot_row_id) = RowID::deser(input, start_idx)?;
+        let (idx, heap_redo_start_ts) = TrxID::deser(input, idx)?;
+        let (idx, deletion_cutoff_ts) = TrxID::deser(input, idx)?;
         let (idx, alloc_map) = AllocMap::deser(input, idx)?;
         validate_alloc_map(&alloc_map)?;
         let (idx, meta) = TableBriefMetadata::deser(input, idx)?;
@@ -195,9 +194,9 @@ impl<'a> Ser<'a> for MetaBlockSerView<'a> {
 
     #[inline]
     fn ser<S: Serde + ?Sized>(&self, out: &mut S, start_idx: usize) -> usize {
-        let idx = out.ser_u64(start_idx, self.pivot_row_id);
-        let idx = out.ser_u64(idx, self.heap_redo_start_ts);
-        let idx = out.ser_u64(idx, self.deletion_cutoff_ts);
+        let idx = out.ser_u64(start_idx, self.pivot_row_id.as_u64());
+        let idx = out.ser_u64(idx, self.heap_redo_start_ts.as_u64());
+        let idx = out.ser_u64(idx, self.deletion_cutoff_ts.as_u64());
         let idx = self.alloc_map.ser(out, idx);
         let idx = self.schema.ser(out, idx);
         let idx = out.ser_u64(idx, self.column_block_index_root.into());
@@ -221,7 +220,7 @@ const NO_ROOT_BLOCK_ID: u64 = 0;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct MultiTableMetaBlockData {
     /// Global next user object-id allocator watermark.
-    pub(crate) next_user_obj_id: ObjID,
+    pub(crate) next_user_obj_id: TableID,
     /// Reserved root descriptors of catalog logical tables.
     pub(crate) table_roots: [CatalogTableRootDesc; CATALOG_TABLE_ROOT_DESC_COUNT],
     /// Page allocation bitmap.
@@ -231,7 +230,7 @@ pub(crate) struct MultiTableMetaBlockData {
 impl Deser for MultiTableMetaBlockData {
     #[inline]
     fn deser<S: Serde + ?Sized>(input: &S, start_idx: usize) -> Result<(usize, Self)> {
-        let (idx, next_user_obj_id) = input.deser_u64(start_idx)?;
+        let (idx, next_user_obj_id) = TableID::deser(input, start_idx)?;
         if next_user_obj_id < USER_OBJ_ID_START {
             return Err(invalid_payload(format!(
                 "next_user_obj_id {next_user_obj_id} is below user object id start {USER_OBJ_ID_START}"
@@ -247,13 +246,13 @@ impl Deser for MultiTableMetaBlockData {
 
         let mut table_roots = [CatalogTableRootDesc::default(); CATALOG_TABLE_ROOT_DESC_COUNT];
         for root in &mut table_roots {
-            let (next_idx, table_id) = input.deser_u64(idx)?;
+            let (next_idx, table_id) = TableID::deser(input, idx)?;
             let (next_idx, root_block_id_raw) = input.deser_u64(next_idx)?;
-            let (next_idx, pivot_row_id) = input.deser_u64(next_idx)?;
+            let (next_idx, pivot_row_id) = RowID::deser(input, next_idx)?;
             // `NO_ROOT_BLOCK_ID` decodes back to `None`; any nonzero raw value
             // is a checkpointed persisted root block id.
             let root_block_id = NonZeroU64::new(root_block_id_raw);
-            if root_block_id.is_none() && pivot_row_id != 0 {
+            if root_block_id.is_none() && pivot_row_id != RowID::new(0) {
                 return Err(invalid_payload(format!(
                     "catalog table root has no root block but pivot_row_id {pivot_row_id}"
                 )));
@@ -286,7 +285,7 @@ impl Deser for MultiTableMetaBlockData {
 /// new catalog root is published.
 pub(crate) struct MultiTableMetaBlockSerView<'a> {
     /// Global next user object-id allocator watermark.
-    next_user_obj_id: ObjID,
+    next_user_obj_id: TableID,
     /// Reserved root descriptors of catalog logical tables.
     table_roots: &'a [CatalogTableRootDesc; CATALOG_TABLE_ROOT_DESC_COUNT],
     /// Page allocation bitmap.
@@ -320,16 +319,16 @@ impl<'a> Ser<'a> for MultiTableMetaBlockSerView<'a> {
     #[inline]
     fn ser<S: Serde + ?Sized>(&self, out: &mut S, start_idx: usize) -> usize {
         let mut idx = start_idx;
-        idx = out.ser_u64(idx, self.next_user_obj_id);
+        idx = out.ser_u64(idx, self.next_user_obj_id.as_u64());
         idx = out.ser_u32(idx, CATALOG_TABLE_ROOT_DESC_COUNT as u32);
         idx = out.ser_u32(idx, 0); // reserved
         for root in self.table_roots {
-            idx = out.ser_u64(idx, root.table_id);
+            idx = out.ser_u64(idx, root.table_id.as_u64());
             idx = out.ser_u64(
                 idx,
                 root.root_block_id.map_or(NO_ROOT_BLOCK_ID, NonZeroU64::get),
             );
-            idx = out.ser_u64(idx, root.pivot_row_id);
+            idx = out.ser_u64(idx, root.pivot_row_id.as_u64());
         }
         self.alloc_map.ser(out, idx)
     }
@@ -383,9 +382,9 @@ mod tests {
             + mem::size_of::<BlockID>()
             + secondary_index_roots.ser_len();
         let mut data = vec![0u8; ser_len];
-        let mut idx = data.ser_u64(0, active_root.pivot_row_id);
-        idx = data.ser_u64(idx, active_root.heap_redo_start_ts);
-        idx = data.ser_u64(idx, active_root.deletion_cutoff_ts);
+        let mut idx = data.ser_u64(0, active_root.pivot_row_id.as_u64());
+        idx = data.ser_u64(idx, active_root.heap_redo_start_ts.as_u64());
+        idx = data.ser_u64(idx, active_root.deletion_cutoff_ts.as_u64());
         idx = active_root.alloc_map.ser(&mut data[..], idx);
         idx = schema.ser(&mut data[..], idx);
         idx = data.ser_u64(idx, active_root.column_block_index_root.into());
@@ -406,7 +405,7 @@ mod tests {
             )
             .expect("valid table metadata"),
         );
-        let mut active_root = ActiveRoot::new(7, 1024, Arc::clone(&metadata));
+        let mut active_root = ActiveRoot::new(TrxID::new(7), 1024, Arc::clone(&metadata));
         active_root.secondary_index_roots = vec![BlockID::new(11)];
         let ser_view = active_root.meta_block_ser_view().unwrap();
         let ser_len = ser_view.ser_len();
@@ -449,7 +448,7 @@ mod tests {
             )
             .expect("valid table metadata"),
         );
-        let active_root = ActiveRoot::new(7, 1024, Arc::clone(&metadata));
+        let active_root = ActiveRoot::new(TrxID::new(7), 1024, Arc::clone(&metadata));
         let ser_view = active_root.meta_block_ser_view().unwrap();
         let ser_len = ser_view.ser_len();
         let mut data = vec![0u8; ser_len];
@@ -476,7 +475,7 @@ mod tests {
             )
             .expect("valid table metadata"),
         );
-        let mut active_root = ActiveRoot::new(7, 1024, Arc::clone(&metadata));
+        let mut active_root = ActiveRoot::new(TrxID::new(7), 1024, Arc::clone(&metadata));
         active_root.secondary_index_roots = vec![BlockID::new(11), BlockID::new(12)];
         let ser_view = active_root.meta_block_ser_view().unwrap();
         let ser_len = ser_view.ser_len();
@@ -494,7 +493,7 @@ mod tests {
     #[test]
     fn test_meta_block_serde_sparse_secondary_roots() {
         let metadata = sparse_secondary_root_metadata();
-        let mut active_root = ActiveRoot::new(7, 1024, Arc::clone(&metadata));
+        let mut active_root = ActiveRoot::new(TrxID::new(7), 1024, Arc::clone(&metadata));
         active_root.secondary_index_roots =
             vec![BlockID::new(11), SUPER_BLOCK_ID, BlockID::new(12)];
         let ser_view = active_root.meta_block_ser_view().unwrap();
@@ -515,7 +514,7 @@ mod tests {
     #[test]
     fn test_meta_block_deser_rejects_inactive_secondary_root() {
         let metadata = sparse_secondary_root_metadata();
-        let active_root = ActiveRoot::new(7, 1024, Arc::clone(&metadata));
+        let active_root = ActiveRoot::new(TrxID::new(7), 1024, Arc::clone(&metadata));
         let secondary_index_roots = vec![BlockID::new(11), BlockID::new(13), BlockID::new(12)];
         let data = serialize_meta_block_with_secondary_roots(&active_root, &secondary_index_roots);
 
@@ -529,7 +528,7 @@ mod tests {
     #[test]
     fn test_meta_block_ser_view_rejects_inactive_secondary_root() {
         let metadata = sparse_secondary_root_metadata();
-        let active_root = ActiveRoot::new(7, 1024, Arc::clone(&metadata));
+        let active_root = ActiveRoot::new(TrxID::new(7), 1024, Arc::clone(&metadata));
         let secondary_index_roots = vec![BlockID::new(11), BlockID::new(13), BlockID::new(12)];
 
         let err = MetaBlockSerView::new(
@@ -562,7 +561,7 @@ mod tests {
             )
             .expect("valid table metadata"),
         );
-        let active_root = ActiveRoot::new(7, 1024, Arc::clone(&metadata));
+        let active_root = ActiveRoot::new(TrxID::new(7), 1024, Arc::clone(&metadata));
         let schema = active_root.metadata.ser_view();
 
         let ser_len = mem::size_of::<RowID>()
@@ -573,9 +572,9 @@ mod tests {
             + mem::size_of::<BlockID>()
             + Vec::<BlockID>::new().ser_len();
         let mut data = vec![0u8; ser_len];
-        let mut idx = data.ser_u64(0, active_root.pivot_row_id);
-        idx = data.ser_u64(idx, active_root.heap_redo_start_ts);
-        idx = data.ser_u64(idx, active_root.deletion_cutoff_ts);
+        let mut idx = data.ser_u64(0, active_root.pivot_row_id.as_u64());
+        idx = data.ser_u64(idx, active_root.heap_redo_start_ts.as_u64());
+        idx = data.ser_u64(idx, active_root.deletion_cutoff_ts.as_u64());
         idx = active_root.alloc_map.ser(&mut data[..], idx);
         idx = schema.ser(&mut data[..], idx);
         idx = data.ser_u64(idx, active_root.column_block_index_root.into());
@@ -602,7 +601,7 @@ mod tests {
             )
             .expect("valid table metadata"),
         );
-        let active_root = ActiveRoot::new(7, 1024, Arc::clone(&metadata));
+        let active_root = ActiveRoot::new(TrxID::new(7), 1024, Arc::clone(&metadata));
         let err = MetaBlockSerView::new(
             active_root.metadata.ser_view(),
             active_root.column_block_index_root,
@@ -624,9 +623,9 @@ mod tests {
     fn test_multi_table_meta_block_serde_none_root_block_id() {
         let mut meta = MultiTableMetaBlock::new(USER_OBJ_ID_START + 9);
         meta.table_roots[0].root_block_id = None;
-        meta.table_roots[0].pivot_row_id = 0;
+        meta.table_roots[0].pivot_row_id = RowID::new(0);
         meta.table_roots[1].root_block_id = NonZeroU64::new(42);
-        meta.table_roots[1].pivot_row_id = 128;
+        meta.table_roots[1].pivot_row_id = RowID::new(128);
 
         let alloc_map = AllocMap::new(128);
         assert!(alloc_map.allocate_at(usize::from(SUPER_BLOCK_ID)));
@@ -638,11 +637,11 @@ mod tests {
 
         let (_, decoded) = MultiTableMetaBlockData::deser(&data[..], 0).unwrap();
         assert_eq!(decoded.next_user_obj_id, meta.next_user_obj_id);
-        assert_eq!(decoded.table_roots[0].table_id, 0);
+        assert_eq!(decoded.table_roots[0].table_id, TableID::new(0));
         assert_eq!(decoded.table_roots[0].root_block_id, None);
-        assert_eq!(decoded.table_roots[0].pivot_row_id, 0);
+        assert_eq!(decoded.table_roots[0].pivot_row_id, RowID::new(0));
         assert_eq!(decoded.table_roots[1].root_block_id, NonZeroU64::new(42));
-        assert_eq!(decoded.table_roots[1].pivot_row_id, 128);
+        assert_eq!(decoded.table_roots[1].pivot_row_id, RowID::new(128));
         assert_eq!(decoded.table_roots.len(), CATALOG_TABLE_ROOT_DESC_COUNT);
     }
 }

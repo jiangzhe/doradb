@@ -1,9 +1,9 @@
-use crate::buffer::PageID;
 use crate::buffer::guard::PageSharedGuard;
 use crate::buffer::{BufferPool, EvictableBufferPool, PoolGuards};
-use crate::catalog::{Catalog, TableCache, TableID, is_catalog_obj_id};
+use crate::catalog::{Catalog, TableCache, is_catalog_obj_id};
 use crate::error::{FatalError, Result};
 use crate::file::table_file::OldRoot;
+use crate::id::{PageID, TableID, TrxID};
 use crate::latch::LatchFallbackMode;
 use crate::quiescent::{QuiescentGuard, SyncQuiescentGuard};
 use crate::row::RowPage;
@@ -13,7 +13,7 @@ use crate::trx::log::LogPartition;
 use crate::trx::row::RowWriteAccess;
 use crate::trx::sys::TransactionSystem;
 use crate::trx::undo::{OwnedRowUndo, RowUndoKind};
-use crate::trx::{CommittedTrx, MAX_SNAPSHOT_TS, TrxID};
+use crate::trx::{CommittedTrx, MAX_SNAPSHOT_TS};
 use async_executor::LocalExecutor;
 use crossbeam_utils::CachePadded;
 use flume::{Receiver, Sender};
@@ -252,7 +252,7 @@ impl TransactionSystem {
         // There might be case a transaction begins and commits
         // when we refresh min_active_sts, if we do not hold this
         // upperbound, we may clear the new transaction incorrectly.
-        let max_active_sts = self.ts.load(Ordering::SeqCst);
+        let max_active_sts = TrxID::new(self.ts.load(Ordering::SeqCst));
         // then, load actual minimum active STS from all GC buckets.
         let mut min_ts = MAX_SNAPSHOT_TS;
         for partition in &*self.log_partitions {
@@ -638,7 +638,7 @@ impl GCBucket {
         GCBucket {
             committed_trx_list: CachePadded::new(Mutex::new(VecDeque::new())),
             active_sts_list: CachePadded::new(Mutex::new(ActiveStsList::default())),
-            min_active_sts: CachePadded::new(AtomicU64::new(MAX_SNAPSHOT_TS)),
+            min_active_sts: CachePadded::new(AtomicU64::new(MAX_SNAPSHOT_TS.as_u64())),
         }
     }
 
@@ -662,7 +662,7 @@ impl GCBucket {
     /// Analyze rollbacked transactions for GC.
     #[inline]
     pub(super) fn gc_analyze_rollback(&self, sts: TrxID) -> bool {
-        debug_assert!(self.min_active_sts.load(Ordering::Relaxed) != MAX_SNAPSHOT_TS);
+        debug_assert!(TrxID::new(self.min_active_sts.load(Ordering::Relaxed)) != MAX_SNAPSHOT_TS);
         let mut active_sts_list = self.active_sts_list.lock();
         let min_sts = active_sts_list.remove(sts);
         self.update_min_active_sts(min_sts)
@@ -693,19 +693,21 @@ impl GCBucket {
     fn update_min_active_sts(&self, min_sts: TrxID) -> bool {
         // Because we just commit/rollback at least one transaction in this bucket, that means there must be
         // some transaction in the list before, so current value of min_active_sts must not be MAX.
-        debug_assert!(self.min_active_sts.load(Ordering::Relaxed) != MAX_SNAPSHOT_TS);
+        debug_assert!(TrxID::new(self.min_active_sts.load(Ordering::Relaxed)) != MAX_SNAPSHOT_TS);
 
         // There is no active transaction. We should update min_active_sts.
         if min_sts == MAX_SNAPSHOT_TS {
-            self.min_active_sts.store(min_sts, Ordering::Relaxed);
+            self.min_active_sts
+                .store(min_sts.as_u64(), Ordering::Relaxed);
             return true;
         }
 
         // There are active transactions. We should compare them and update only if
         // latest value is larger.
-        let curr_sts = self.min_active_sts.load(Ordering::Relaxed);
+        let curr_sts = TrxID::new(self.min_active_sts.load(Ordering::Relaxed));
         if min_sts > curr_sts {
-            self.min_active_sts.store(min_sts, Ordering::Relaxed);
+            self.min_active_sts
+                .store(min_sts.as_u64(), Ordering::Relaxed);
             return true;
         }
         false
@@ -1041,11 +1043,11 @@ mod tests {
     use crate::catalog::tests::table1;
     use crate::conf::{EngineConfig, EvictableBufferPoolConfig, TrxSysConfig};
     use crate::error::FatalError;
-    use crate::file::cow_file::BlockID;
+    use crate::id::{BlockID, RowID};
     use crate::index::{IndexCompareExchange, IndexInsert, RowLocation, UniqueIndex};
     use crate::latch::LatchFallbackMode;
+    use crate::row::RowPage;
     use crate::row::ops::{DeleteMvcc, SelectKey};
-    use crate::row::{RowID, RowPage};
     use crate::table::{DeleteMarker, Table};
     use crate::trx::row::RowReadAccess;
     use crate::trx::stmt::Statement;
@@ -1234,26 +1236,26 @@ mod tests {
     fn test_active_sts_list() {
         let mut active_sts_list = ActiveStsList::default();
         for (val, expected, delete) in vec![
-            (1, 1, false),
+            (1, TrxID::new(1), false),
             (1, MAX_SNAPSHOT_TS, true),
-            (2, 2, false),
-            (3, 2, false),
-            (4, 2, false),
-            (3, 2, true),
-            (2, 4, true),
-            (5, 4, false),
-            (6, 4, false),
-            (6, 4, true),
-            (5, 4, true),
+            (2, TrxID::new(2), false),
+            (3, TrxID::new(2), false),
+            (4, TrxID::new(2), false),
+            (3, TrxID::new(2), true),
+            (2, TrxID::new(4), true),
+            (5, TrxID::new(4), false),
+            (6, TrxID::new(4), false),
+            (6, TrxID::new(4), true),
+            (5, TrxID::new(4), true),
             (4, MAX_SNAPSHOT_TS, true),
         ] {
             let res = if delete {
-                active_sts_list.remove(val)
+                active_sts_list.remove(TrxID::new(val))
             } else {
-                active_sts_list.insert(val);
+                active_sts_list.insert(TrxID::new(val));
                 active_sts_list.active.front().cloned().unwrap()
             };
-            assert!(res == expected)
+            assert_eq!(res, expected);
         }
     }
 
@@ -1336,13 +1338,13 @@ mod tests {
                     page_id: PageID::from(0u64),
                     generation: 0,
                 }),
-                0,
+                RowID::new(0),
                 RowUndoKind::Delete,
             ));
             let trx = CommittedTrx {
-                cts: 100,
+                cts: TrxID::new(100),
                 payload: Some(CommittedTrxPayload {
-                    sts: 1,
+                    sts: TrxID::new(1),
                     gc_no: 0,
                     row_undo,
                     index_gc: vec![],
@@ -1415,7 +1417,7 @@ mod tests {
             else {
                 panic!("row should exist");
             };
-            let status = Arc::new(SharedTrxStatus::new(100));
+            let status = Arc::new(SharedTrxStatus::new(TrxID::new(100)));
             table
                 .deletion_buffer()
                 .put_ref(row_id, status.clone(), MAX_SNAPSHOT_TS)
@@ -1429,9 +1431,9 @@ mod tests {
                 RowUndoKind::Delete,
             ));
             let trx = CommittedTrx {
-                cts: 100,
+                cts: TrxID::new(100),
                 payload: Some(CommittedTrxPayload {
-                    sts: 1,
+                    sts: TrxID::new(1),
                     gc_no: 0,
                     row_undo,
                     index_gc: vec![],
@@ -1518,9 +1520,9 @@ mod tests {
                 RowUndoKind::Delete,
             ));
             let trx = CommittedTrx {
-                cts: 100,
+                cts: TrxID::new(100),
                 payload: Some(CommittedTrxPayload {
-                    sts: 1,
+                    sts: TrxID::new(1),
                     gc_no: 0,
                     row_undo,
                     index_gc: vec![],
@@ -1620,7 +1622,7 @@ mod tests {
                 generation: page_guard.bf().generation().saturating_add(1),
             };
             drop(page_guard);
-            let status = Arc::new(SharedTrxStatus::new(100));
+            let status = Arc::new(SharedTrxStatus::new(TrxID::new(100)));
             table
                 .deletion_buffer()
                 .put_ref(row_id, status.clone(), MAX_SNAPSHOT_TS)
@@ -1634,9 +1636,9 @@ mod tests {
                 RowUndoKind::Delete,
             ));
             let trx = CommittedTrx {
-                cts: 100,
+                cts: TrxID::new(100),
                 payload: Some(CommittedTrxPayload {
-                    sts: 1,
+                    sts: TrxID::new(1),
                     gc_no: 0,
                     row_undo,
                     index_gc: vec![],
@@ -1746,9 +1748,9 @@ mod tests {
                 RowUndoKind::Delete,
             ));
             let trx = CommittedTrx {
-                cts: 100,
+                cts: TrxID::new(100),
                 payload: Some(CommittedTrxPayload {
-                    sts: 1,
+                    sts: TrxID::new(1),
                     gc_no: 0,
                     row_undo,
                     index_gc: vec![],
@@ -1965,7 +1967,11 @@ mod tests {
                 let index = bound_unique_index_no(&table, 0);
                 let mut remained_row_ids = vec![];
                 index
-                    .scan_values(pool_guards.index_guard(), &mut remained_row_ids, 100)
+                    .scan_values(
+                        pool_guards.index_guard(),
+                        &mut remained_row_ids,
+                        TrxID::new(100),
+                    )
                     .await
                     .unwrap();
                 println!("gc timeout, remained_row_ids={:?}", remained_row_ids);

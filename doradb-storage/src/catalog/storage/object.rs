@@ -1,4 +1,5 @@
-use crate::catalog::{ColumnAttributes, IndexAttributes, IndexOrder, TableID};
+use crate::catalog::{ColumnAttributes, IndexAttributes, IndexOrder};
+use crate::id::TableID;
 use crate::value::ValKind;
 use semistr::SemiStr;
 

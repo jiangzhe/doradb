@@ -3,8 +3,9 @@ use crate::catalog::CatalogTable;
 use crate::catalog::storage::CatalogDefinition;
 use crate::catalog::storage::object::TableObject;
 use crate::catalog::table::{TableColumnLayout, TableMetadata};
-use crate::catalog::{ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexSpec, TableID};
+use crate::catalog::{ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexSpec};
 use crate::error::Result;
+use crate::id::TableID;
 use crate::row::ops::{DeleteMvcc, SelectKey};
 use crate::row::{Row, RowRead};
 use crate::trx::stmt::Statement;
@@ -13,7 +14,7 @@ use crate::value::ValKind;
 use semistr::SemiStr;
 use std::sync::OnceLock;
 
-pub(crate) const TABLE_ID_TABLES: TableID = 0;
+pub(crate) const TABLE_ID_TABLES: TableID = TableID::new(0);
 const COL_NO_TABLES_TABLE_ID: usize = 0;
 const COL_NAME_TABLES_TABLE_ID: &str = "table_id";
 const COL_NO_TABLES_NEXT_INDEX_NO: usize = 1;
@@ -53,10 +54,11 @@ pub(crate) fn catalog_definition_of_tables() -> &'static CatalogDefinition {
 
 #[inline]
 fn row_to_table_object(col_layout: &TableColumnLayout, row: Row<'_>) -> TableObject {
-    let table_id = row
-        .val(col_layout, COL_NO_TABLES_TABLE_ID)
-        .as_u64()
-        .unwrap();
+    let table_id = TableID::from(
+        row.val(col_layout, COL_NO_TABLES_TABLE_ID)
+            .as_u64()
+            .unwrap(),
+    );
     let next_index_no = row
         .val(col_layout, COL_NO_TABLES_NEXT_INDEX_NO)
         .as_u16()
@@ -145,11 +147,11 @@ mod tests {
             let mut session = engine.new_session().unwrap();
 
             let table100 = TableObject {
-                table_id: 100,
+                table_id: TableID::new(100),
                 next_index_no: 0,
             };
             let table101 = TableObject {
-                table_id: 101,
+                table_id: TableID::new(101),
                 next_index_no: 0,
             };
             let mut trx = session.begin_trx().unwrap();
@@ -192,7 +194,7 @@ mod tests {
                         .catalog()
                         .storage
                         .tables()
-                        .delete_by_id(stmt, 999)
+                        .delete_by_id(stmt, TableID::new(999))
                         .await
                 );
                 Ok(())

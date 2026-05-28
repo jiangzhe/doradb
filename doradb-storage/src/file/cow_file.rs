@@ -4,10 +4,11 @@ use crate::buffer::{ReadonlyBufferPool, ReadonlyWriteLease, begin_write_barrier}
 use crate::error::{DataIntegrityError, Error, FileKind, InternalError, ResourceError, Result};
 use crate::file::fs::BackgroundWriteRequest;
 use crate::file::super_block::{SUPER_BLOCK_SIZE, SuperBlock};
-use crate::file::{BlockKey, FileID, SparseFile, write_direct, write_direct_with_lease};
+use crate::file::{BlockKey, SparseFile, write_direct, write_direct_with_lease};
+use crate::id::{BlockID, FileID, TrxID};
 use crate::io::{DirectBuf, IOClient};
 use crate::quiescent::QuiescentGuard;
-use crate::trx::{MAX_SNAPSHOT_TS, TrxID};
+use crate::trx::MAX_SNAPSHOT_TS;
 use error_stack::Report;
 use std::collections::BTreeSet;
 use std::fs;
@@ -17,8 +18,6 @@ use std::os::fd::{AsRawFd, RawFd};
 use std::ptr::NonNull;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
-
-pub(crate) use crate::file::BlockID;
 
 /// Shared page size of CoW table files and multi-table files.
 pub(crate) const COW_FILE_PAGE_SIZE: usize = PAGE_SIZE;
@@ -137,7 +136,7 @@ impl<M: Clone> Clone for ActiveRoot<M> {
             meta_block_id: self.meta_block_id,
             alloc_map: self.alloc_map.clone(),
             meta: self.meta.clone(),
-            effective_ts: AtomicU64::new(self.effective_ts()),
+            effective_ts: AtomicU64::new(self.effective_ts().as_u64()),
         }
     }
 }
@@ -158,7 +157,7 @@ impl<M> ActiveRoot<M> {
             meta_block_id,
             alloc_map,
             meta,
-            effective_ts: AtomicU64::new(root_ts),
+            effective_ts: AtomicU64::new(root_ts.as_u64()),
         }
     }
 
@@ -170,27 +169,30 @@ impl<M> ActiveRoot<M> {
     {
         let mut new = self.clone();
         new.slot_no = 1 - self.slot_no;
-        new.effective_ts.store(MAX_SNAPSHOT_TS, Ordering::Relaxed);
+        new.effective_ts
+            .store(MAX_SNAPSHOT_TS.as_u64(), Ordering::Relaxed);
         new
     }
 
     /// Return the runtime-only timestamp when this root became observable.
     #[inline]
     pub(crate) fn effective_ts(&self) -> TrxID {
-        self.effective_ts.load(Ordering::Acquire)
+        TrxID::new(self.effective_ts.load(Ordering::Acquire))
     }
 
     /// Block reclamation decisions until an unpublished root becomes effective.
     #[inline]
     fn block_reclamation_until_effective_ts_installed(&self) {
-        self.effective_ts.store(MAX_SNAPSHOT_TS, Ordering::Release);
+        self.effective_ts
+            .store(MAX_SNAPSHOT_TS.as_u64(), Ordering::Release);
     }
 
     /// Install the post-publish effective timestamp for the current active root.
     #[inline]
     pub(crate) fn install_effective_ts(&self, effective_ts: TrxID) {
         debug_assert!(effective_ts < MAX_SNAPSHOT_TS);
-        self.effective_ts.store(effective_ts, Ordering::Release);
+        self.effective_ts
+            .store(effective_ts.as_u64(), Ordering::Release);
     }
 }
 
@@ -772,9 +774,10 @@ fn remove_file_by_fd(fd: RawFd) -> std::io::Result<()> {
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use super::{ActiveRoot, BlockID, MutableCowRoot, SUPER_BLOCK_ID};
+    use super::{ActiveRoot, MutableCowRoot, SUPER_BLOCK_ID};
     use crate::bitmap::AllocMap;
     use crate::error::InternalError;
+    use crate::id::{BlockID, TrxID};
     use std::collections::BTreeSet;
     use std::collections::HashMap;
     use std::sync::{Mutex, OnceLock};
@@ -789,8 +792,13 @@ pub(crate) mod tests {
         assert!(alloc_map.allocate_at(usize::from(BlockID::new(3))));
         assert!(alloc_map.allocate_at(usize::from(BlockID::new(7))));
 
-        let mut root =
-            MutableCowRoot::from_root(ActiveRoot::from_parts(0, 1, BlockID::new(7), alloc_map, ()));
+        let mut root = MutableCowRoot::from_root(ActiveRoot::from_parts(
+            0,
+            TrxID::new(1),
+            BlockID::new(7),
+            alloc_map,
+            (),
+        ));
         root.unpublished_blocks.insert(BlockID::new(3));
         root.unpublished_blocks.insert(BlockID::new(7));
 
@@ -828,8 +836,13 @@ pub(crate) mod tests {
         let alloc_map = AllocMap::new(8);
         assert!(alloc_map.allocate_at(usize::from(SUPER_BLOCK_ID)));
 
-        let mut root =
-            MutableCowRoot::from_root(ActiveRoot::from_parts(0, 1, BlockID::new(8), alloc_map, ()));
+        let mut root = MutableCowRoot::from_root(ActiveRoot::from_parts(
+            0,
+            TrxID::new(1),
+            BlockID::new(8),
+            alloc_map,
+            (),
+        ));
         let err = root
             .rebuild_alloc_map_from_reachable(&BTreeSet::new())
             .unwrap_err();

@@ -5,7 +5,8 @@ use crate::file::block_integrity::{
     BLOCK_INTEGRITY_HEADER_SIZE, COLUMN_BLOCK_INDEX_BLOCK_SPEC, max_payload_len, validate_block,
     write_block_checksum, write_block_header,
 };
-use crate::file::cow_file::{BlockID, COW_FILE_PAGE_SIZE, MutableCowFile, SUPER_BLOCK_ID};
+use crate::file::cow_file::{COW_FILE_PAGE_SIZE, MutableCowFile, SUPER_BLOCK_ID};
+use crate::id::{BlockID, RowID, TrxID};
 use crate::index::column_deletion_blob::{
     BlobRef, COLUMN_AUX_BLOB_CODEC_U32_DELTA_LIST, COLUMN_AUX_BLOB_KIND_DELETE_DELTAS,
     ColumnDeletionBlobReader, ColumnDeletionBlobWriter,
@@ -13,7 +14,6 @@ use crate::index::column_deletion_blob::{
 use crate::io::DirectBuf;
 use crate::layout;
 use crate::quiescent::QuiescentGuard;
-use crate::row::RowID;
 use error_stack::{Report, ResultExt};
 use std::collections::BTreeSet;
 use std::future::Future;
@@ -233,7 +233,7 @@ impl ColumnBlockLeafEntryHeader {
     #[inline]
     fn end_row_id(&self, start_row_id: RowID) -> Result<RowID> {
         start_row_id
-            .checked_add(self.row_id_span() as RowID)
+            .checked_add(u64::from(self.row_id_span()))
             .ok_or_else(|| invalid_payload("column block leaf row id span overflows"))
     }
 
@@ -316,12 +316,12 @@ pub(crate) struct ColumnBlockBranchEntry {
 impl ColumnBlockNodeHeader {
     /// Creates a persisted node header with host-order inputs encoded as little-endian fields.
     #[inline]
-    pub(crate) fn new(height: u32, count: u32, start_row_id: RowID, create_ts: u64) -> Self {
+    pub(crate) fn new(height: u32, count: u32, start_row_id: RowID, create_ts: TrxID) -> Self {
         ColumnBlockNodeHeader {
             height: LeU32::new(height),
             count: LeU32::new(count),
-            start_row_id: LeU64::new(start_row_id),
-            create_ts: LeU64::new(create_ts),
+            start_row_id: LeU64::new(start_row_id.as_u64()),
+            create_ts: LeU64::new(create_ts.as_u64()),
         }
     }
 
@@ -342,7 +342,7 @@ impl ColumnBlockNodeHeader {
 
     #[inline]
     fn start_row_id(&self) -> RowID {
-        self.start_row_id.get()
+        RowID::new(self.start_row_id.get())
     }
 }
 
@@ -350,14 +350,14 @@ impl ColumnBlockBranchEntry {
     #[inline]
     fn new(start_row_id: RowID, block_id: BlockID) -> Self {
         ColumnBlockBranchEntry {
-            start_row_id: LeU64::new(start_row_id),
+            start_row_id: LeU64::new(start_row_id.as_u64()),
             block_id: LeU64::new(block_id.as_u64()),
         }
     }
 
     #[inline]
     fn start_row_id(&self) -> RowID {
-        self.start_row_id.get()
+        RowID::new(self.start_row_id.get())
     }
 
     #[inline]
@@ -380,7 +380,7 @@ pub(crate) struct ColumnBlockNode {
 
 impl ColumnBlockNode {
     #[inline]
-    fn new_boxed(height: u32, start_row_id: RowID, create_ts: u64) -> Box<Self> {
+    fn new_boxed(height: u32, start_row_id: RowID, create_ts: TrxID) -> Box<Self> {
         // SAFETY: `ColumnBlockNode` contains only integer and byte-array fields,
         // so the all-zero bit pattern is valid for the whole value.
         let mut node = unsafe { Box::<ColumnBlockNode>::new_zeroed().assume_init() };
@@ -668,7 +668,7 @@ impl LogicalRowSet {
             && row_ids
                 .iter()
                 .enumerate()
-                .all(|(idx, row_id)| *row_id == start_row_id + idx as RowID);
+                .all(|(idx, row_id)| *row_id == start_row_id + idx as u64);
         if dense {
             return Ok(LogicalRowSet::Dense { row_id_span });
         }
@@ -966,7 +966,7 @@ struct ColumnBlockLeafPrefixPlain {
 impl ColumnBlockLeafPrefixPlain {
     #[inline]
     fn start_row_id(&self) -> RowID {
-        u64::from_le_bytes(self.start_row_id)
+        RowID::new(u64::from_le_bytes(self.start_row_id))
     }
 
     #[inline]
@@ -1091,7 +1091,7 @@ impl<'a> LeafPrefixPlane<'a> {
                 .get(idx)
                 .and_then(|prefix| {
                     header_start_row_id
-                        .checked_add(prefix.start_row_delta() as RowID)
+                        .checked_add(u64::from(prefix.start_row_delta()))
                         .map(|start_row_id| DecodedLeafPrefix {
                             start_row_id,
                             entry_offset: prefix.entry_offset(),
@@ -1105,7 +1105,7 @@ impl<'a> LeafPrefixPlane<'a> {
                 .get(idx)
                 .and_then(|prefix| {
                     header_start_row_id
-                        .checked_add(prefix.start_row_delta() as RowID)
+                        .checked_add(u64::from(prefix.start_row_delta()))
                         .map(|start_row_id| DecodedLeafPrefix {
                             start_row_id,
                             entry_offset: prefix.entry_offset(),
@@ -1820,7 +1820,7 @@ impl<'a> ColumnBlockIndex<'a> {
         &self,
         mutable_file: &mut M,
         patches: &[ColumnDeleteDeltaPatch<'_>],
-        create_ts: u64,
+        create_ts: TrxID,
     ) -> Result<BlockID> {
         if patches.is_empty() {
             return Ok(self.root_block_id);
@@ -1876,7 +1876,7 @@ impl<'a> ColumnBlockIndex<'a> {
         &self,
         mutable_file: &mut M,
         patches: &[ColumnBlockEntryPatch],
-        create_ts: u64,
+        create_ts: TrxID,
     ) -> Result<BlockID> {
         if patches.is_empty() {
             return Ok(self.root_block_id);
@@ -1926,7 +1926,7 @@ impl<'a> ColumnBlockIndex<'a> {
         mutable_file: &mut M,
         entries: &[ColumnBlockEntryInput],
         new_end_row_id: RowID,
-        create_ts: u64,
+        create_ts: TrxID,
     ) -> Result<BlockID> {
         if entries.is_empty() {
             return Ok(self.root_block_id);
@@ -1972,7 +1972,7 @@ impl<'a> ColumnBlockIndex<'a> {
         mutable_file: &'b mut M,
         block_id: BlockID,
         patches: &'b [ResolvedLeafPatch],
-        create_ts: u64,
+        create_ts: TrxID,
     ) -> Pin<Box<dyn Future<Output = Result<NodeRewriteResult>> + 'b>> {
         Box::pin(async move {
             if patches.is_empty() {
@@ -1998,7 +1998,7 @@ impl<'a> ColumnBlockIndex<'a> {
         block_id: BlockID,
         node: &ValidatedColumnBlockNode,
         patches: &[ResolvedLeafPatch],
-        create_ts: u64,
+        create_ts: TrxID,
     ) -> Result<NodeRewriteResult> {
         let mut entries = self.decode_logical_leaf_entries(node, block_id)?;
         let start_row_ids: Vec<RowID> = entries.iter().map(|entry| entry.start_row_id).collect();
@@ -2025,7 +2025,7 @@ impl<'a> ColumnBlockIndex<'a> {
         _block_id: BlockID,
         node: &ValidatedColumnBlockNode,
         patches: &[ResolvedLeafPatch],
-        create_ts: u64,
+        create_ts: TrxID,
     ) -> Result<NodeRewriteResult> {
         let old_entries = node.branch_entries();
         let mut combined = Vec::with_capacity(old_entries.len() + patches.len());
@@ -2090,7 +2090,7 @@ impl<'a> ColumnBlockIndex<'a> {
         &self,
         mutable_file: &mut M,
         entries: &[LogicalLeafEntry],
-        create_ts: u64,
+        create_ts: TrxID,
     ) -> Result<BlockID> {
         let leaf_entries = self
             .write_leaf_pages_from_logical_entries(mutable_file, entries, create_ts)
@@ -2103,7 +2103,7 @@ impl<'a> ColumnBlockIndex<'a> {
         &self,
         mutable_file: &mut M,
         entries: &[LogicalLeafEntry],
-        create_ts: u64,
+        create_ts: TrxID,
     ) -> Result<Vec<ColumnBlockBranchEntry>> {
         let mut path = Vec::new();
         let mut block_id = self.root_block_id;
@@ -2163,7 +2163,7 @@ impl<'a> ColumnBlockIndex<'a> {
         mutable_file: &mut M,
         old_root_height: u32,
         entries: Vec<ColumnBlockBranchEntry>,
-        create_ts: u64,
+        create_ts: TrxID,
     ) -> Result<BlockID> {
         if entries.is_empty() {
             return Err(Report::new(InternalError::ColumnIndexPathInvariant)
@@ -2206,7 +2206,7 @@ impl<'a> ColumnBlockIndex<'a> {
         &self,
         mutable_file: &mut M,
         entries: &[LogicalLeafEntry],
-        create_ts: u64,
+        create_ts: TrxID,
     ) -> Result<Vec<ColumnBlockBranchEntry>> {
         let encoded = entries
             .iter()
@@ -2258,7 +2258,7 @@ impl<'a> ColumnBlockIndex<'a> {
         mutable_file: &mut M,
         entries: &[ColumnBlockBranchEntry],
         height: u32,
-        create_ts: u64,
+        create_ts: TrxID,
     ) -> Result<Vec<ColumnBlockBranchEntry>> {
         let mut res = Vec::new();
         for chunk in entries.chunks(COLUMN_BLOCK_MAX_BRANCH_ENTRIES) {
@@ -2280,7 +2280,7 @@ impl<'a> ColumnBlockIndex<'a> {
         mutable_file: &mut M,
         mut entries: Vec<ColumnBlockBranchEntry>,
         mut height: u32,
-        create_ts: u64,
+        create_ts: TrxID,
     ) -> Result<BlockID> {
         loop {
             if entries.len() == 1 {
@@ -2300,7 +2300,7 @@ impl<'a> ColumnBlockIndex<'a> {
         table_file: &mut M,
         height: u32,
         start_row_id: RowID,
-        create_ts: u64,
+        create_ts: TrxID,
     ) -> Result<(BlockID, Box<ColumnBlockNode>)> {
         let block_id = table_file.allocate_block()?;
         let node = ColumnBlockNode::new_boxed(height, start_row_id, create_ts);
@@ -2579,7 +2579,7 @@ fn decode_row_ids_from_row_set(
             for delta in 0..*row_id_span {
                 row_ids.push(
                     start_row_id
-                        .checked_add(delta as RowID)
+                        .checked_add(u64::from(delta))
                         .ok_or_else(|| invalid_node_payload(file_kind, block_id))?,
                 );
             }
@@ -2588,7 +2588,7 @@ fn decode_row_ids_from_row_set(
             for delta in deltas {
                 row_ids.push(
                     start_row_id
-                        .checked_add(*delta as RowID)
+                        .checked_add(u64::from(*delta))
                         .ok_or_else(|| invalid_node_payload(file_kind, block_id))?,
                 );
             }
@@ -3352,6 +3352,14 @@ mod tests {
     use std::collections::BTreeSet;
     use std::sync::Arc;
 
+    fn test_row_ids<const N: usize>(values: [u64; N]) -> Vec<RowID> {
+        values.into_iter().map(RowID::new).collect()
+    }
+
+    fn test_row_id_range(start: u64, end: u64) -> Vec<RowID> {
+        (start..end).map(RowID::new).collect()
+    }
+
     fn metadata() -> Arc<TableMetadata> {
         Arc::new(
             TableMetadata::try_new(
@@ -3371,7 +3379,7 @@ mod tests {
         end: RowID,
         block_id: impl Into<BlockID>,
     ) -> ColumnBlockEntryInput {
-        let row_ids: Vec<RowID> = (start..end).collect();
+        let row_ids = test_row_id_range(start.as_u64(), end.as_u64());
         ColumnBlockEntryShape::new(start, end, row_ids, Vec::new())
             .unwrap()
             .with_block_id(block_id)
@@ -3399,7 +3407,7 @@ mod tests {
     #[test]
     fn test_leaf_entry_header_roundtrip_uses_u16_lengths() {
         let encoded = EncodedLeafEntry {
-            start_row_id: 10,
+            start_row_id: RowID::new(10),
             block_id: test_block_id(1001),
             row_id_span: 32,
             row_shape_fingerprint: 42,
@@ -3425,20 +3433,26 @@ mod tests {
 
     #[test]
     fn test_row_shape_fingerprint_is_deterministic_and_canonical() {
-        let dense_row_ids: Vec<RowID> = (10..20).collect();
-        let sparse_row_ids = vec![12, 15, 18];
+        let dense_row_ids = test_row_id_range(10, 20);
+        let sparse_row_ids = test_row_ids([12, 15, 18]);
 
-        let dense = row_shape_fingerprint_for_row_ids(10, 20, &dense_row_ids).unwrap();
+        let dense =
+            row_shape_fingerprint_for_row_ids(RowID::new(10), RowID::new(20), &dense_row_ids)
+                .unwrap();
         assert_eq!(
             dense,
-            row_shape_fingerprint_for_row_ids(10, 20, &dense_row_ids).unwrap()
+            row_shape_fingerprint_for_row_ids(RowID::new(10), RowID::new(20), &dense_row_ids)
+                .unwrap()
         );
 
-        let sparse = row_shape_fingerprint_for_row_ids(10, 20, &sparse_row_ids).unwrap();
+        let sparse =
+            row_shape_fingerprint_for_row_ids(RowID::new(10), RowID::new(20), &sparse_row_ids)
+                .unwrap();
         assert_ne!(dense, sparse);
         assert_eq!(
             sparse,
-            row_shape_fingerprint_for_row_ids(10, 99, &sparse_row_ids).unwrap()
+            row_shape_fingerprint_for_row_ids(RowID::new(10), RowID::new(99), &sparse_row_ids)
+                .unwrap()
         );
     }
 
@@ -3504,7 +3518,7 @@ mod tests {
             let table = fs
                 .create_table_file(test_user_table_id(1), metadata, false)
                 .unwrap();
-            let (table, old_root) = table.commit(1, false).await.unwrap();
+            let (table, old_root) = table.commit(TrxID::new(1), false).await.unwrap();
             drop(old_root);
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
             let disk_pool = table_readonly_pool(&global, test_user_table_id(1), &table);
@@ -3513,38 +3527,53 @@ mod tests {
                 MutableTableFile::fork(&table, background_writes, disk_pool.global_pool().clone());
             let index = ColumnBlockIndex::new(
                 SUPER_BLOCK_ID,
-                0,
+                RowID::new(0),
                 disk_pool.file_kind(),
                 disk_pool.sparse_file(),
                 disk_pool.global_pool(),
                 &disk_pool_guard,
             );
             let entries = vec![
-                sparse_entry(10, 20, vec![12, 15, 18], test_block_id(1001)),
-                dense_entry(20, 24, test_block_id(1002)),
+                sparse_entry(
+                    RowID::new(10),
+                    RowID::new(20),
+                    test_row_ids([12, 15, 18]),
+                    test_block_id(1001),
+                ),
+                dense_entry(RowID::new(20), RowID::new(24), test_block_id(1002)),
             ];
             let root_block_id = index
-                .batch_insert(&mut mutable, &entries, 24, 2)
+                .batch_insert(&mut mutable, &entries, RowID::new(24), TrxID::new(2))
                 .await
                 .unwrap();
-            let (_table, _old_root) = mutable.commit(2, false).await.unwrap();
+            let (_table, _old_root) = mutable.commit(TrxID::new(2), false).await.unwrap();
 
             let index = ColumnBlockIndex::new(
                 root_block_id,
-                24,
+                RowID::new(24),
                 disk_pool.file_kind(),
                 disk_pool.sparse_file(),
                 disk_pool.global_pool(),
                 &disk_pool_guard,
             );
-            assert!(index.locate_block(10).await.unwrap().is_none());
+            assert!(index.locate_block(RowID::new(10)).await.unwrap().is_none());
             assert_eq!(
-                index.locate_block(12).await.unwrap().unwrap().block_id(),
+                index
+                    .locate_block(RowID::new(12))
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .block_id(),
                 1001
             );
-            assert!(index.locate_block(19).await.unwrap().is_none());
+            assert!(index.locate_block(RowID::new(19)).await.unwrap().is_none());
             assert_eq!(
-                index.locate_block(22).await.unwrap().unwrap().block_id(),
+                index
+                    .locate_block(RowID::new(22))
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .block_id(),
                 1002
             );
         });
@@ -3563,7 +3592,7 @@ mod tests {
         let table = fs
             .create_table_file(test_user_table_id(1), metadata, false)
             .unwrap();
-        let (table, old_root) = table.commit(1, false).await.unwrap();
+        let (table, old_root) = table.commit(TrxID::new(1), false).await.unwrap();
         drop(old_root);
         let global = global_readonly_pool_scope(64 * 1024 * 1024);
         let disk_pool = table_readonly_pool(&global, test_user_table_id(1), &table);
@@ -3572,16 +3601,16 @@ mod tests {
             MutableTableFile::fork(&table, background_writes, disk_pool.global_pool().clone());
         let root_block_id = ColumnBlockIndex::new(
             SUPER_BLOCK_ID,
-            0,
+            RowID::new(0),
             disk_pool.file_kind(),
             disk_pool.sparse_file(),
             disk_pool.global_pool(),
             &disk_pool_guard,
         )
-        .batch_insert(&mut mutable, &entries, end_row_id, 2)
+        .batch_insert(&mut mutable, &entries, end_row_id, TrxID::new(2))
         .await
         .unwrap();
-        let (_table, _old_root) = mutable.commit(2, false).await.unwrap();
+        let (_table, _old_root) = mutable.commit(TrxID::new(2), false).await.unwrap();
 
         let index = ColumnBlockIndex::new(
             root_block_id,
@@ -3613,11 +3642,15 @@ mod tests {
             let delta_u16_start = 1_000u64 + u16::MAX as u64;
             assert_search_type_lookup(
                 vec![
-                    dense_entry(1_000, 1_001, test_block_id(1001)),
-                    dense_entry(delta_u16_start, delta_u16_start + 1, test_block_id(1002)),
+                    dense_entry(RowID::new(1_000), RowID::new(1_001), test_block_id(1001)),
+                    dense_entry(
+                        RowID::new(delta_u16_start),
+                        RowID::new(delta_u16_start + 1),
+                        test_block_id(1002),
+                    ),
                 ],
-                delta_u16_start + 1,
-                delta_u16_start,
+                RowID::new(delta_u16_start + 1),
+                RowID::new(delta_u16_start),
                 ColumnBlockLeafSearchType::DeltaU16,
                 test_block_id(1002),
             )
@@ -3626,11 +3659,15 @@ mod tests {
             let delta_u32_start = 1_000u64 + u16::MAX as u64 + 1;
             assert_search_type_lookup(
                 vec![
-                    dense_entry(1_000, 1_001, test_block_id(2001)),
-                    dense_entry(delta_u32_start, delta_u32_start + 1, test_block_id(2002)),
+                    dense_entry(RowID::new(1_000), RowID::new(1_001), test_block_id(2001)),
+                    dense_entry(
+                        RowID::new(delta_u32_start),
+                        RowID::new(delta_u32_start + 1),
+                        test_block_id(2002),
+                    ),
                 ],
-                delta_u32_start + 1,
-                delta_u32_start,
+                RowID::new(delta_u32_start + 1),
+                RowID::new(delta_u32_start),
                 ColumnBlockLeafSearchType::DeltaU32,
                 test_block_id(2002),
             )
@@ -3639,11 +3676,15 @@ mod tests {
             let plain_start = 1_000u64 + u32::MAX as u64 + 1;
             assert_search_type_lookup(
                 vec![
-                    dense_entry(1_000, 1_001, test_block_id(3001)),
-                    dense_entry(plain_start, plain_start + 1, test_block_id(3002)),
+                    dense_entry(RowID::new(1_000), RowID::new(1_001), test_block_id(3001)),
+                    dense_entry(
+                        RowID::new(plain_start),
+                        RowID::new(plain_start + 1),
+                        test_block_id(3002),
+                    ),
                 ],
-                plain_start + 1,
-                plain_start,
+                RowID::new(plain_start + 1),
+                RowID::new(plain_start),
                 ColumnBlockLeafSearchType::Plain,
                 test_block_id(3002),
             )
@@ -3660,7 +3701,7 @@ mod tests {
             let table = fs
                 .create_table_file(test_user_table_id(1), metadata, false)
                 .unwrap();
-            let (table, old_root) = table.commit(1, false).await.unwrap();
+            let (table, old_root) = table.commit(TrxID::new(1), false).await.unwrap();
             drop(old_root);
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
             let disk_pool = table_readonly_pool(&global, test_user_table_id(1), &table);
@@ -3669,7 +3710,7 @@ mod tests {
                 MutableTableFile::fork(&table, background_writes, disk_pool.global_pool().clone());
             let root_block_id = ColumnBlockIndex::new(
                 SUPER_BLOCK_ID,
-                0,
+                RowID::new(0),
                 disk_pool.file_kind(),
                 disk_pool.sparse_file(),
                 disk_pool.global_pool(),
@@ -3678,42 +3719,57 @@ mod tests {
             .batch_insert(
                 &mut mutable,
                 &[
-                    dense_entry(0, 4, test_block_id(1001)),
-                    sparse_entry(10, 20, vec![12, 15, 18], test_block_id(1002)),
+                    dense_entry(RowID::new(0), RowID::new(4), test_block_id(1001)),
+                    sparse_entry(
+                        RowID::new(10),
+                        RowID::new(20),
+                        test_row_ids([12, 15, 18]),
+                        test_block_id(1002),
+                    ),
                 ],
-                20,
-                2,
+                RowID::new(20),
+                TrxID::new(2),
             )
             .await
             .unwrap();
-            let (_table, _old_root) = mutable.commit(2, false).await.unwrap();
+            let (_table, _old_root) = mutable.commit(TrxID::new(2), false).await.unwrap();
 
             let index = ColumnBlockIndex::new(
                 root_block_id,
-                20,
+                RowID::new(20),
                 disk_pool.file_kind(),
                 disk_pool.sparse_file(),
                 disk_pool.global_pool(),
                 &disk_pool_guard,
             );
-            let dense = index.locate_block(2).await.unwrap().unwrap();
-            let sparse = index.locate_block(15).await.unwrap().unwrap();
+            let dense = index.locate_block(RowID::new(2)).await.unwrap().unwrap();
+            let sparse = index.locate_block(RowID::new(15)).await.unwrap().unwrap();
 
             assert_eq!(
                 index.load_entry_row_ids(&dense).await.unwrap(),
-                vec![0, 1, 2, 3]
+                test_row_ids([0, 1, 2, 3])
             );
             assert_eq!(
                 dense.row_shape_fingerprint(),
-                row_shape_fingerprint_for_row_ids(0, 4, &[0, 1, 2, 3]).unwrap()
+                row_shape_fingerprint_for_row_ids(
+                    RowID::new(0),
+                    RowID::new(4),
+                    &test_row_ids([0, 1, 2, 3])
+                )
+                .unwrap()
             );
             assert_eq!(
                 index.load_entry_row_ids(&sparse).await.unwrap(),
-                vec![12, 15, 18]
+                test_row_ids([12, 15, 18])
             );
             assert_eq!(
                 sparse.row_shape_fingerprint(),
-                row_shape_fingerprint_for_row_ids(10, 20, &[12, 15, 18]).unwrap()
+                row_shape_fingerprint_for_row_ids(
+                    RowID::new(10),
+                    RowID::new(20),
+                    &test_row_ids([12, 15, 18])
+                )
+                .unwrap()
             );
         });
     }
@@ -3727,7 +3783,7 @@ mod tests {
             let table = fs
                 .create_table_file(test_user_table_id(1), metadata, false)
                 .unwrap();
-            let (table, old_root) = table.commit(1, false).await.unwrap();
+            let (table, old_root) = table.commit(TrxID::new(1), false).await.unwrap();
             drop(old_root);
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
             let disk_pool = table_readonly_pool(&global, test_user_table_id(1), &table);
@@ -3735,32 +3791,41 @@ mod tests {
             let mut mutable =
                 MutableTableFile::fork(&table, background_writes, disk_pool.global_pool().clone());
             let entries = vec![
-                dense_entry(0, 4, test_block_id(1001)),
-                sparse_entry(10, 20, vec![12, 15, 18], test_block_id(1002)),
+                dense_entry(RowID::new(0), RowID::new(4), test_block_id(1001)),
+                sparse_entry(
+                    RowID::new(10),
+                    RowID::new(20),
+                    test_row_ids([12, 15, 18]),
+                    test_block_id(1002),
+                ),
             ];
             let root_block_id = ColumnBlockIndex::new(
                 SUPER_BLOCK_ID,
-                0,
+                RowID::new(0),
                 disk_pool.file_kind(),
                 disk_pool.sparse_file(),
                 disk_pool.global_pool(),
                 &disk_pool_guard,
             )
-            .batch_insert(&mut mutable, &entries, 20, 2)
+            .batch_insert(&mut mutable, &entries, RowID::new(20), TrxID::new(2))
             .await
             .unwrap();
-            let (_table, _old_root) = mutable.commit(2, false).await.unwrap();
+            let (_table, _old_root) = mutable.commit(TrxID::new(2), false).await.unwrap();
 
             let index = ColumnBlockIndex::new(
                 root_block_id,
-                20,
+                RowID::new(20),
                 disk_pool.file_kind(),
                 disk_pool.sparse_file(),
                 disk_pool.global_pool(),
                 &disk_pool_guard,
             );
-            let dense_entry = index.locate_block(2).await.unwrap().unwrap();
-            let dense_resolved = index.locate_and_resolve_row(2).await.unwrap().unwrap();
+            let dense_entry = index.locate_block(RowID::new(2)).await.unwrap().unwrap();
+            let dense_resolved = index
+                .locate_and_resolve_row(RowID::new(2))
+                .await
+                .unwrap()
+                .unwrap();
             assert_eq!(dense_resolved.block_id(), 1001);
             assert_eq!(dense_resolved.row_idx(), 2);
             assert_eq!(dense_resolved.leaf_block_id(), dense_entry.leaf_block_id);
@@ -3769,8 +3834,12 @@ mod tests {
                 dense_entry.row_shape_fingerprint()
             );
 
-            let sparse_entry = index.locate_block(15).await.unwrap().unwrap();
-            let sparse_resolved = index.locate_and_resolve_row(15).await.unwrap().unwrap();
+            let sparse_entry = index.locate_block(RowID::new(15)).await.unwrap().unwrap();
+            let sparse_resolved = index
+                .locate_and_resolve_row(RowID::new(15))
+                .await
+                .unwrap()
+                .unwrap();
             assert_eq!(sparse_resolved.block_id(), 1002);
             assert_eq!(sparse_resolved.row_idx(), 1);
             assert_eq!(sparse_resolved.leaf_block_id(), sparse_entry.leaf_block_id);
@@ -3778,9 +3847,19 @@ mod tests {
                 sparse_resolved.row_shape_fingerprint(),
                 sparse_entry.row_shape_fingerprint()
             );
-            assert!(index.locate_and_resolve_row(14).await.unwrap().is_none());
+            assert!(
+                index
+                    .locate_and_resolve_row(RowID::new(14))
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
 
-            let one_descent = index.locate_and_resolve_row(18).await.unwrap().unwrap();
+            let one_descent = index
+                .locate_and_resolve_row(RowID::new(18))
+                .await
+                .unwrap()
+                .unwrap();
             assert_eq!(one_descent.block_id(), 1002);
             assert_eq!(one_descent.row_idx(), 2);
             assert_eq!(
@@ -3799,7 +3878,7 @@ mod tests {
             let table = fs
                 .create_table_file(test_user_table_id(1), metadata, false)
                 .unwrap();
-            let (table, old_root) = table.commit(1, false).await.unwrap();
+            let (table, old_root) = table.commit(TrxID::new(1), false).await.unwrap();
             drop(old_root);
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
             let disk_pool = table_readonly_pool(&global, test_user_table_id(1), &table);
@@ -3808,7 +3887,7 @@ mod tests {
                 MutableTableFile::fork(&table, background_writes, disk_pool.global_pool().clone());
             let root_v1 = ColumnBlockIndex::new(
                 SUPER_BLOCK_ID,
-                0,
+                RowID::new(0),
                 disk_pool.file_kind(),
                 disk_pool.sparse_file(),
                 disk_pool.global_pool(),
@@ -3817,22 +3896,27 @@ mod tests {
             .batch_insert(
                 &mut mutable,
                 &[
-                    dense_entry(0, 4, test_block_id(1001)),
-                    dense_entry(4, 8, test_block_id(1002)),
+                    dense_entry(RowID::new(0), RowID::new(4), test_block_id(1001)),
+                    dense_entry(RowID::new(4), RowID::new(8), test_block_id(1002)),
                 ],
-                8,
-                2,
+                RowID::new(8),
+                TrxID::new(2),
             )
             .await
             .unwrap();
-            let (_table, _old_root) = mutable.commit(2, false).await.unwrap();
+            let (_table, _old_root) = mutable.commit(TrxID::new(2), false).await.unwrap();
 
             let mut mutable =
                 MutableTableFile::fork(&table, background_writes, disk_pool.global_pool().clone());
-            let replacement = sparse_entry(4, 10, vec![4, 5, 8, 9], test_block_id(2002));
+            let replacement = sparse_entry(
+                RowID::new(4),
+                RowID::new(10),
+                test_row_ids([4, 5, 8, 9]),
+                test_block_id(2002),
+            );
             let root_v2 = ColumnBlockIndex::new(
                 root_v1,
-                8,
+                RowID::new(8),
                 disk_pool.file_kind(),
                 disk_pool.sparse_file(),
                 disk_pool.global_pool(),
@@ -3841,18 +3925,18 @@ mod tests {
             .batch_replace_entries(
                 &mut mutable,
                 &[ColumnBlockEntryPatch {
-                    start_row_id: 4,
+                    start_row_id: RowID::new(4),
                     entry: replacement,
                 }],
-                3,
+                TrxID::new(3),
             )
             .await
             .unwrap();
-            let (_table, _old_root) = mutable.commit(3, false).await.unwrap();
+            let (_table, _old_root) = mutable.commit(TrxID::new(3), false).await.unwrap();
 
             let index = ColumnBlockIndex::new(
                 root_v2,
-                10,
+                RowID::new(10),
                 disk_pool.file_kind(),
                 disk_pool.sparse_file(),
                 disk_pool.global_pool(),
@@ -3861,12 +3945,17 @@ mod tests {
             let entries = index.collect_leaf_entries().await.unwrap();
             assert_eq!(entries.len(), 2);
             assert_eq!(entries[1].block_id(), 2002);
-            assert_eq!(entries[1].end_row_id(), 10);
+            assert_eq!(entries[1].end_row_id(), RowID::new(10));
             assert_eq!(entries[1].row_count(), 4);
             assert_eq!(entries[1].del_count(), 0);
-            assert!(index.locate_block(7).await.unwrap().is_none());
+            assert!(index.locate_block(RowID::new(7)).await.unwrap().is_none());
             assert_eq!(
-                index.locate_block(8).await.unwrap().unwrap().block_id(),
+                index
+                    .locate_block(RowID::new(8))
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .block_id(),
                 2002
             );
         });
@@ -3881,7 +3970,7 @@ mod tests {
             let table = fs
                 .create_table_file(test_user_table_id(1), metadata, false)
                 .unwrap();
-            let (table, old_root) = table.commit(1, false).await.unwrap();
+            let (table, old_root) = table.commit(TrxID::new(1), false).await.unwrap();
             drop(old_root);
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
             let disk_pool = table_readonly_pool(&global, test_user_table_id(1), &table);
@@ -3890,7 +3979,7 @@ mod tests {
                 MutableTableFile::fork(&table, background_writes, disk_pool.global_pool().clone());
             let root_v1 = ColumnBlockIndex::new(
                 SUPER_BLOCK_ID,
-                0,
+                RowID::new(0),
                 disk_pool.file_kind(),
                 disk_pool.sparse_file(),
                 disk_pool.global_pool(),
@@ -3898,19 +3987,23 @@ mod tests {
             )
             .batch_insert(
                 &mut mutable,
-                &[dense_entry(0, 8, test_block_id(1001))],
-                8,
-                2,
+                &[dense_entry(
+                    RowID::new(0),
+                    RowID::new(8),
+                    test_block_id(1001),
+                )],
+                RowID::new(8),
+                TrxID::new(2),
             )
             .await
             .unwrap();
-            let (_table, _old_root) = mutable.commit(2, false).await.unwrap();
+            let (_table, _old_root) = mutable.commit(TrxID::new(2), false).await.unwrap();
 
             let mut mutable =
                 MutableTableFile::fork(&table, background_writes, disk_pool.global_pool().clone());
             let root_v2 = ColumnBlockIndex::new(
                 root_v1,
-                8,
+                RowID::new(8),
                 disk_pool.file_kind(),
                 disk_pool.sparse_file(),
                 disk_pool.global_pool(),
@@ -3919,24 +4012,24 @@ mod tests {
             .batch_replace_delete_deltas(
                 &mut mutable,
                 &[ColumnDeleteDeltaPatch {
-                    start_row_id: 0,
+                    start_row_id: RowID::new(0),
                     delete_deltas: &[1, 3, 6],
                 }],
-                3,
+                TrxID::new(3),
             )
             .await
             .unwrap();
-            let (_table, _old_root) = mutable.commit(3, false).await.unwrap();
+            let (_table, _old_root) = mutable.commit(TrxID::new(3), false).await.unwrap();
 
             let index = ColumnBlockIndex::new(
                 root_v2,
-                8,
+                RowID::new(8),
                 disk_pool.file_kind(),
                 disk_pool.sparse_file(),
                 disk_pool.global_pool(),
                 &disk_pool_guard,
             );
-            let entry = index.locate_block(0).await.unwrap().unwrap();
+            let entry = index.locate_block(RowID::new(0)).await.unwrap().unwrap();
             assert_eq!(entry.block_id(), 1001);
             assert_eq!(entry.row_count(), 8);
             assert_eq!(entry.del_count(), 3);
@@ -3960,7 +4053,7 @@ mod tests {
             let table = fs
                 .create_table_file(test_user_table_id(1), metadata, false)
                 .unwrap();
-            let (table, old_root) = table.commit(1, false).await.unwrap();
+            let (table, old_root) = table.commit(TrxID::new(1), false).await.unwrap();
             drop(old_root);
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
             let disk_pool = table_readonly_pool(&global, test_user_table_id(1), &table);
@@ -3969,7 +4062,7 @@ mod tests {
                 MutableTableFile::fork(&table, background_writes, disk_pool.global_pool().clone());
             let root_v1 = ColumnBlockIndex::new(
                 SUPER_BLOCK_ID,
-                0,
+                RowID::new(0),
                 disk_pool.file_kind(),
                 disk_pool.sparse_file(),
                 disk_pool.global_pool(),
@@ -3977,23 +4070,32 @@ mod tests {
             )
             .batch_insert(
                 &mut mutable,
-                &[dense_entry(0, 8, test_block_id(1001))],
-                8,
-                2,
+                &[dense_entry(
+                    RowID::new(0),
+                    RowID::new(8),
+                    test_block_id(1001),
+                )],
+                RowID::new(8),
+                TrxID::new(2),
             )
             .await
             .unwrap();
-            let (_table, _old_root) = mutable.commit(2, false).await.unwrap();
+            let (_table, _old_root) = mutable.commit(TrxID::new(2), false).await.unwrap();
 
-            let replacement = ColumnBlockEntryShape::new(0, 8, (0..8).collect(), vec![1, 3, 6])
-                .unwrap()
-                .with_delete_domain(ColumnDeleteDomain::Ordinal)
-                .with_block_id(test_block_id(1001));
+            let replacement = ColumnBlockEntryShape::new(
+                RowID::new(0),
+                RowID::new(8),
+                test_row_id_range(0, 8),
+                vec![1, 3, 6],
+            )
+            .unwrap()
+            .with_delete_domain(ColumnDeleteDomain::Ordinal)
+            .with_block_id(test_block_id(1001));
             let mut mutable =
                 MutableTableFile::fork(&table, background_writes, disk_pool.global_pool().clone());
             let root_v2 = ColumnBlockIndex::new(
                 root_v1,
-                8,
+                RowID::new(8),
                 disk_pool.file_kind(),
                 disk_pool.sparse_file(),
                 disk_pool.global_pool(),
@@ -4002,24 +4104,24 @@ mod tests {
             .batch_replace_entries(
                 &mut mutable,
                 &[ColumnBlockEntryPatch {
-                    start_row_id: 0,
+                    start_row_id: RowID::new(0),
                     entry: replacement,
                 }],
-                3,
+                TrxID::new(3),
             )
             .await
             .unwrap();
-            let (_table, _old_root) = mutable.commit(3, false).await.unwrap();
+            let (_table, _old_root) = mutable.commit(TrxID::new(3), false).await.unwrap();
 
             let index = ColumnBlockIndex::new(
                 root_v2,
-                8,
+                RowID::new(8),
                 disk_pool.file_kind(),
                 disk_pool.sparse_file(),
                 disk_pool.global_pool(),
                 &disk_pool_guard,
             );
-            let entry = index.locate_block(0).await.unwrap().unwrap();
+            let entry = index.locate_block(RowID::new(0)).await.unwrap().unwrap();
             assert_eq!(entry.delete_domain(), ColumnDeleteDomain::Ordinal);
             assert_eq!(
                 index
@@ -4042,41 +4144,42 @@ mod tests {
             let table = fs
                 .create_table_file(test_user_table_id(1), metadata, false)
                 .unwrap();
-            let (table, old_root) = table.commit(1, false).await.unwrap();
+            let (table, old_root) = table.commit(TrxID::new(1), false).await.unwrap();
             drop(old_root);
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
             let disk_pool = table_readonly_pool(&global, test_user_table_id(1), &table);
             let disk_pool_guard = disk_pool.pool_guard();
 
-            let row_ids: Vec<RowID> = (0..96).collect();
+            let row_ids = test_row_id_range(0, 96);
             let delete_deltas: Vec<u32> = (0..96).collect();
-            let entry = ColumnBlockEntryShape::new(0, 96, row_ids, delete_deltas)
-                .unwrap()
-                .with_block_id(test_block_id(1001));
+            let entry =
+                ColumnBlockEntryShape::new(RowID::new(0), RowID::new(96), row_ids, delete_deltas)
+                    .unwrap()
+                    .with_block_id(test_block_id(1001));
             let mut mutable =
                 MutableTableFile::fork(&table, background_writes, disk_pool.global_pool().clone());
             let root = ColumnBlockIndex::new(
                 SUPER_BLOCK_ID,
-                0,
+                RowID::new(0),
                 disk_pool.file_kind(),
                 disk_pool.sparse_file(),
                 disk_pool.global_pool(),
                 &disk_pool_guard,
             )
-            .batch_insert(&mut mutable, &[entry], 96, 2)
+            .batch_insert(&mut mutable, &[entry], RowID::new(96), TrxID::new(2))
             .await
             .unwrap();
-            let (_table, _old_root) = mutable.commit(2, false).await.unwrap();
+            let (_table, _old_root) = mutable.commit(TrxID::new(2), false).await.unwrap();
 
             let index = ColumnBlockIndex::new(
                 root,
-                96,
+                RowID::new(96),
                 disk_pool.file_kind(),
                 disk_pool.sparse_file(),
                 disk_pool.global_pool(),
                 &disk_pool_guard,
             );
-            let entry = index.locate_block(0).await.unwrap().unwrap();
+            let entry = index.locate_block(RowID::new(0)).await.unwrap().unwrap();
             let blob_ref = entry
                 .deletion_blob_ref()
                 .expect("large delete set should be stored in external blob blocks");
@@ -4100,36 +4203,41 @@ mod tests {
             let table = fs
                 .create_table_file(test_user_table_id(1), metadata, false)
                 .unwrap();
-            let (table, old_root) = table.commit(1, false).await.unwrap();
+            let (table, old_root) = table.commit(TrxID::new(1), false).await.unwrap();
             drop(old_root);
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
             let disk_pool = table_readonly_pool(&global, test_user_table_id(1), &table);
             let disk_pool_guard = disk_pool.pool_guard();
 
-            let seed = ColumnBlockEntryShape::new(0, 8, (0..8).collect(), vec![1, 3])
-                .unwrap()
-                .with_delete_domain(ColumnDeleteDomain::Ordinal)
-                .with_block_id(test_block_id(1001));
+            let seed = ColumnBlockEntryShape::new(
+                RowID::new(0),
+                RowID::new(8),
+                test_row_id_range(0, 8),
+                vec![1, 3],
+            )
+            .unwrap()
+            .with_delete_domain(ColumnDeleteDomain::Ordinal)
+            .with_block_id(test_block_id(1001));
             let mut mutable =
                 MutableTableFile::fork(&table, background_writes, disk_pool.global_pool().clone());
             let root_v1 = ColumnBlockIndex::new(
                 SUPER_BLOCK_ID,
-                0,
+                RowID::new(0),
                 disk_pool.file_kind(),
                 disk_pool.sparse_file(),
                 disk_pool.global_pool(),
                 &disk_pool_guard,
             )
-            .batch_insert(&mut mutable, &[seed], 8, 2)
+            .batch_insert(&mut mutable, &[seed], RowID::new(8), TrxID::new(2))
             .await
             .unwrap();
-            let (_table, _old_root) = mutable.commit(2, false).await.unwrap();
+            let (_table, _old_root) = mutable.commit(TrxID::new(2), false).await.unwrap();
 
             let mut mutable =
                 MutableTableFile::fork(&table, background_writes, disk_pool.global_pool().clone());
             let root_v2 = ColumnBlockIndex::new(
                 root_v1,
-                8,
+                RowID::new(8),
                 disk_pool.file_kind(),
                 disk_pool.sparse_file(),
                 disk_pool.global_pool(),
@@ -4138,24 +4246,24 @@ mod tests {
             .batch_replace_delete_deltas(
                 &mut mutable,
                 &[ColumnDeleteDeltaPatch {
-                    start_row_id: 0,
+                    start_row_id: RowID::new(0),
                     delete_deltas: &[1, 3, 6],
                 }],
-                3,
+                TrxID::new(3),
             )
             .await
             .unwrap();
-            let (_table, _old_root) = mutable.commit(3, false).await.unwrap();
+            let (_table, _old_root) = mutable.commit(TrxID::new(3), false).await.unwrap();
 
             let index = ColumnBlockIndex::new(
                 root_v2,
-                8,
+                RowID::new(8),
                 disk_pool.file_kind(),
                 disk_pool.sparse_file(),
                 disk_pool.global_pool(),
                 &disk_pool_guard,
             );
-            let entry = index.locate_block(0).await.unwrap().unwrap();
+            let entry = index.locate_block(RowID::new(0)).await.unwrap().unwrap();
             assert_eq!(entry.delete_domain(), ColumnDeleteDomain::Ordinal);
             assert_eq!(
                 index
@@ -4178,7 +4286,7 @@ mod tests {
             let table = fs
                 .create_table_file(test_user_table_id(1), metadata, false)
                 .unwrap();
-            let (table, old_root) = table.commit(1, false).await.unwrap();
+            let (table, old_root) = table.commit(TrxID::new(1), false).await.unwrap();
             drop(old_root);
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
             let disk_pool = table_readonly_pool(&global, test_user_table_id(1), &table);
@@ -4187,11 +4295,15 @@ mod tests {
                 MutableTableFile::fork(&table, background_writes, disk_pool.global_pool().clone());
             let mut entries = Vec::new();
             for idx in 0..(COLUMN_BLOCK_MAX_ENTRIES + 32) as u64 {
-                entries.push(dense_entry(idx * 2, idx * 2 + 2, 10_000 + idx));
+                entries.push(dense_entry(
+                    RowID::new(idx * 2),
+                    RowID::new(idx * 2 + 2),
+                    10_000 + idx,
+                ));
             }
             let root = ColumnBlockIndex::new(
                 SUPER_BLOCK_ID,
-                0,
+                RowID::new(0),
                 disk_pool.file_kind(),
                 disk_pool.sparse_file(),
                 disk_pool.global_pool(),
@@ -4201,11 +4313,11 @@ mod tests {
                 &mut mutable,
                 &entries,
                 entries.last().unwrap().end_row_id,
-                2,
+                TrxID::new(2),
             )
             .await
             .unwrap();
-            let (_table, _old_root) = mutable.commit(2, false).await.unwrap();
+            let (_table, _old_root) = mutable.commit(TrxID::new(2), false).await.unwrap();
 
             let index = ColumnBlockIndex::new(
                 root,
@@ -4218,12 +4330,17 @@ mod tests {
             let collected = index.collect_leaf_entries().await.unwrap();
             assert_eq!(collected.len(), entries.len());
             assert_eq!(
-                index.locate_block(0).await.unwrap().unwrap().block_id(),
+                index
+                    .locate_block(RowID::new(0))
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .block_id(),
                 10_000
             );
             assert_eq!(
                 index
-                    .locate_block((COLUMN_BLOCK_MAX_ENTRIES as u64) * 2)
+                    .locate_block(RowID::new((COLUMN_BLOCK_MAX_ENTRIES as u64) * 2))
                     .await
                     .unwrap()
                     .unwrap()

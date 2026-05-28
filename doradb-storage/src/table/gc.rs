@@ -2,16 +2,15 @@ use super::{Table, TableRootSnapshot, TableRuntimeLayout};
 use crate::buffer::{BufferPool, EvictableBufferPool, PoolGuard, PoolGuards};
 use crate::catalog::TableMetadata;
 use crate::error::{DataIntegrityError, Error, FileKind, InternalError, Result};
-use crate::file::BlockID;
 use crate::file::cow_file::SUPER_BLOCK_ID;
+use crate::id::{BlockID, RowID, TrxID};
 use crate::index::{
     ColumnBlockIndex, NonUniqueMemIndex, NonUniqueMemIndexEntry, ResolvedColumnRow, SecondaryIndex,
     UniqueMemIndex, UniqueMemIndexEntry,
 };
 use crate::lwc::PersistedLwcBlock;
-use crate::row::RowID;
 use crate::session::Session;
-use crate::trx::{TrxID, TrxReadProof};
+use crate::trx::TrxReadProof;
 use crate::value::Val;
 use error_stack::Report;
 use std::sync::Arc;

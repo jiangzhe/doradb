@@ -1,21 +1,19 @@
-use crate::buffer::PageID;
 use crate::catalog::{IndexSpec, TableMetadata};
 use crate::error::{
     ConfigError, DataIntegrityError, Error, ErrorKind, FatalError, InternalError, OperationError,
     Result,
 };
-use crate::file::cow_file::{BlockID, SUPER_BLOCK_ID};
+use crate::file::cow_file::SUPER_BLOCK_ID;
 use crate::file::table_file::{ActiveRoot, MutableTableFile};
+use crate::id::{BlockID, PageID, RowID, TrxID};
 use crate::index::BTreeKeyEncoder;
 use crate::index::disk_tree::{
     NonUniqueDiskTreeEncodedExact, UniqueDiskTreeEncodedDelete, UniqueDiskTreeEncodedPut,
 };
 use crate::index::{ColumnBlockIndex, ColumnDeleteDeltaPatch, ColumnLeafEntry};
 use crate::lwc::PersistedLwcBlock;
-use crate::row::RowID;
 use crate::session::Session;
 use crate::table::{CheckpointCancelReason, Table, TableRuntimeLayout};
-use crate::trx::TrxID;
 use crate::trx::redo::DDLRedo;
 use crate::value::{Val, ValKind, ValType};
 use error_stack::Report;
@@ -63,8 +61,8 @@ impl CheckpointReadiness {
         } else {
             Self::Delayed {
                 reason: CheckpointDelayReason {
-                    effective_ts,
-                    min_active_sts,
+                    effective_ts: effective_ts.as_u64(),
+                    min_active_sts: min_active_sts.as_u64(),
                 },
             }
         }
@@ -77,7 +75,7 @@ pub enum CheckpointOutcome {
     /// A new checkpoint root was durably published.
     Published {
         /// Commit timestamp of the publishing checkpoint transaction.
-        checkpoint_ts: TrxID,
+        checkpoint_ts: u64,
     },
     /// No checkpoint work was published because the active root is still live.
     Delayed {
@@ -95,9 +93,9 @@ pub enum CheckpointOutcome {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CheckpointDelayReason {
     /// Runtime post-publish root-observation boundary used by reclamation.
-    pub effective_ts: TrxID,
+    pub effective_ts: u64,
     /// Current global minimum active snapshot timestamp used by GC.
-    pub min_active_sts: TrxID,
+    pub min_active_sts: u64,
 }
 
 #[derive(Clone, Copy)]
@@ -526,7 +524,7 @@ impl Table {
         // persisted column index needed to resolve them is absent. Advancing
         // deletion_cutoff_ts here would make recovery skip delete redo that was
         // never reflected in column payloads.
-        if column_block_index_root == SUPER_BLOCK_ID || pivot_row_id == 0 {
+        if column_block_index_root == SUPER_BLOCK_ID || pivot_row_id == RowID::new(0) {
             return Err(Report::new(DataIntegrityError::InvalidRootInvariant)
                 .attach(format!(
                     "eligible delete markers require column index: column_block_index_root={column_block_index_root}, pivot_row_id={pivot_row_id}"
@@ -613,7 +611,7 @@ impl Table {
         }
 
         // Step 4: load authoritative persisted deltas and merge pending row-id deltas.
-        let mut patch_storage: Vec<(u64, Vec<u32>)> = Vec::new();
+        let mut patch_storage: Vec<(RowID, Vec<u32>)> = Vec::new();
         for group in groups {
             let pending = &pending_deltas[group.pending_start..group.pending_end];
             let (base_deltas, row_ids) = column_index
@@ -798,7 +796,7 @@ impl Table {
             && row_ids
                 .iter()
                 .enumerate()
-                .all(|(idx, row_id)| *row_id == entry.start_row_id + idx as RowID);
+                .all(|(idx, row_id)| *row_id == entry.start_row_id + idx as u64);
 
         let disk_pool = self.disk_pool();
         let disk_pool_guard = disk_pool.pool_guard();
@@ -846,7 +844,7 @@ impl Table {
         for delta in delete_deltas {
             let row_id = entry
                 .start_row_id
-                .checked_add(RowID::from(*delta))
+                .checked_add(u64::from(*delta))
                 .ok_or_else(|| {
                     Error::from(
                         Report::new(DataIntegrityError::InvalidPayload).attach(format!(
@@ -1133,7 +1131,9 @@ impl TablePersistence for Table {
         }
         drop(publish_lease);
         drop(root_mutation_lease);
-        Ok(CheckpointOutcome::Published { checkpoint_ts })
+        Ok(CheckpointOutcome::Published {
+            checkpoint_ts: checkpoint_ts.as_u64(),
+        })
     }
 }
 
@@ -1146,29 +1146,29 @@ mod tests {
         let mut puts = vec![
             EncodedRowEntry {
                 key: b"b".to_vec(),
-                row_id: 20,
+                row_id: RowID::new(20),
             },
             EncodedRowEntry {
                 key: b"a".to_vec(),
-                row_id: 10,
+                row_id: RowID::new(10),
             },
             EncodedRowEntry {
                 key: b"a".to_vec(),
-                row_id: 11,
+                row_id: RowID::new(11),
             },
         ];
         let mut deletes = vec![
             EncodedRowEntry {
                 key: b"a".to_vec(),
-                row_id: 9,
+                row_id: RowID::new(9),
             },
             EncodedRowEntry {
                 key: b"c".to_vec(),
-                row_id: 30,
+                row_id: RowID::new(30),
             },
             EncodedRowEntry {
                 key: b"c".to_vec(),
-                row_id: 30,
+                row_id: RowID::new(30),
             },
         ];
 
@@ -1180,11 +1180,11 @@ mod tests {
             vec![
                 EncodedRowEntry {
                     key: b"a".to_vec(),
-                    row_id: 11,
+                    row_id: RowID::new(11),
                 },
                 EncodedRowEntry {
                     key: b"b".to_vec(),
-                    row_id: 20,
+                    row_id: RowID::new(20),
                 },
             ]
         );
@@ -1192,7 +1192,7 @@ mod tests {
             deletes,
             vec![EncodedRowEntry {
                 key: b"c".to_vec(),
-                row_id: 30,
+                row_id: RowID::new(30),
             }]
         );
     }

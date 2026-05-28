@@ -1,11 +1,10 @@
 use crate::buffer::PoolGuards;
 use crate::catalog::spec::{ActiveIndexSpec, ColumnAttributes, ColumnSpec, IndexNo, IndexSpec};
-use crate::catalog::{
-    ColumnObject, IndexColumnObject, IndexObject, TableID, TableObject, is_user_obj_id,
-};
+use crate::catalog::{ColumnObject, IndexColumnObject, IndexObject, TableObject, is_user_obj_id};
 use crate::engine::EngineRef;
 use crate::error::{ConfigError, Error, FatalError, InternalError, OperationError, Result};
 use crate::file::table_file::{MutableTableFile, TableFile};
+use crate::id::TableID;
 use crate::index::BlockIndex;
 use crate::lock::{
     FreshLockGuard, LockGrant, LockManager, LockMode, LockOwner, LockOwnerGroup, LockResource,
@@ -925,7 +924,7 @@ fn validate_index_spec(index_no: usize, spec: &IndexSpec, col_count: usize) -> R
 #[inline]
 pub(crate) async fn acquire_table_ddl_locks<'a>(
     lock_manager: &'a LockManager,
-    table_id: crate::catalog::TableID,
+    table_id: TableID,
     owner: LockOwner,
     owner_group: LockOwnerGroup,
 ) -> Result<ScopedTableDdlLocks<'a>> {
@@ -957,7 +956,7 @@ pub(crate) async fn acquire_table_ddl_locks<'a>(
 #[inline]
 pub(crate) fn reject_table_ddl_explicit_session_lock(
     lock_manager: &LockManager,
-    table_id: crate::catalog::TableID,
+    table_id: TableID,
     owner: LockOwner,
     operation: &'static str,
 ) -> Result<()> {
@@ -987,7 +986,7 @@ pub(crate) fn reject_table_ddl_explicit_session_lock(
 
 pub(crate) struct ScopedTableDdlLocks<'a> {
     lock_manager: &'a LockManager,
-    table_id: crate::catalog::TableID,
+    table_id: TableID,
     owner: LockOwner,
     metadata_fresh: bool,
     data_fresh: bool,

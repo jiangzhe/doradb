@@ -4,24 +4,24 @@ use super::table::{
 };
 use crate::buffer::{EvictableBufferPool, PoolGuards};
 use crate::catalog::{
-    IndexColumnObject, IndexNo, IndexObject, IndexSpec, TableID, TableMetadata, TableObject,
+    IndexColumnObject, IndexNo, IndexObject, IndexSpec, TableMetadata, TableObject,
 };
 use crate::engine::EngineRef;
 use crate::error::{DataIntegrityError, Error, FatalError, InternalError, OperationError, Result};
-use crate::file::BlockID;
 use crate::file::cow_file::SUPER_BLOCK_ID;
 use crate::file::table_file::{ActiveRoot, MutableTableFile};
+use crate::id::{BlockID, RowID, TableID, TrxID};
 use crate::index::disk_tree::{NonUniqueDiskTreeEncodedExact, UniqueDiskTreeEncodedPut};
 use crate::index::{
     ColumnBlockIndex, IndexInsert, NonUniqueIndex, NonUniqueMemIndex, SecondaryDiskTreeRuntime,
     SecondaryIndex, UniqueIndex, UniqueMemIndex,
 };
 use crate::lwc::PersistedLwcBlock;
-use crate::row::{RowID, RowRead};
+use crate::row::RowRead;
 use crate::session::{Session, SessionDdlContext};
 use crate::table::{DeleteMarker, Table, TableRuntimeLayout, secondary_disk_tree_encoder};
 use crate::trx::redo::DDLRedo;
-use crate::trx::{ActiveTrx, TrxID, trx_is_committed};
+use crate::trx::{ActiveTrx, trx_is_committed};
 use crate::value::Val;
 use error_stack::Report;
 use std::collections::BTreeSet;
@@ -844,7 +844,7 @@ fn create_index_cold_root_has_rows(column_block_index_root: BlockID, pivot_row_i
         return false;
     }
     assert!(
-        pivot_row_id != 0,
+        pivot_row_id != RowID::new(0),
         "create index found non-empty cold root with pivot_row_id == 0: column_block_index_root={column_block_index_root}, pivot_row_id={pivot_row_id}"
     );
     true
@@ -908,7 +908,7 @@ async fn collect_create_index_cold_rows(
         for delta in delete_deltas {
             let row_id = entry
                 .start_row_id
-                .checked_add(RowID::from(delta))
+                .checked_add(u64::from(delta))
                 .ok_or_else(|| {
                     create_index_invalid_payload(format!(
                         "create index delete delta overflows row id: start_row_id={}, delta={delta}",
@@ -1541,9 +1541,16 @@ mod tests {
             2,
         )
         .unwrap();
-        let active_root = root_with_metadata(active_metadata, 20);
+        let active_root = root_with_metadata(active_metadata, TrxID::new(20));
         assert_eq!(
-            classify_index_ddl_root(IndexDdlKind::Create, 42, 1, 19, Some(&active_root)).unwrap(),
+            classify_index_ddl_root(
+                IndexDdlKind::Create,
+                TableID::new(42),
+                1,
+                TrxID::new(19),
+                Some(&active_root)
+            )
+            .unwrap(),
             IndexDdlRootProof::DurableFinalCreate
         );
 
@@ -1556,14 +1563,28 @@ mod tests {
             2,
         )
         .unwrap();
-        let dropped_root = root_with_metadata(dropped_metadata, 30);
+        let dropped_root = root_with_metadata(dropped_metadata, TrxID::new(30));
         assert_eq!(
-            classify_index_ddl_root(IndexDdlKind::Create, 42, 1, 19, Some(&dropped_root)).unwrap(),
+            classify_index_ddl_root(
+                IndexDdlKind::Create,
+                TableID::new(42),
+                1,
+                TrxID::new(19),
+                Some(&dropped_root)
+            )
+            .unwrap(),
             IndexDdlRootProof::DurableAllocationOnly
         );
 
         assert_eq!(
-            classify_index_ddl_root(IndexDdlKind::Create, 42, 1, 31, Some(&dropped_root)).unwrap(),
+            classify_index_ddl_root(
+                IndexDdlKind::Create,
+                TableID::new(42),
+                1,
+                TrxID::new(31),
+                Some(&dropped_root)
+            )
+            .unwrap(),
             IndexDdlRootProof::Provisional
         );
     }
@@ -1585,9 +1606,16 @@ mod tests {
             2,
         )
         .unwrap();
-        let active_root = root_with_metadata(active_metadata, 20);
+        let active_root = root_with_metadata(active_metadata, TrxID::new(20));
         assert_eq!(
-            classify_index_ddl_root(IndexDdlKind::Drop, 42, 1, 19, Some(&active_root)).unwrap(),
+            classify_index_ddl_root(
+                IndexDdlKind::Drop,
+                TableID::new(42),
+                1,
+                TrxID::new(19),
+                Some(&active_root)
+            )
+            .unwrap(),
             IndexDdlRootProof::Provisional
         );
 
@@ -1600,9 +1628,16 @@ mod tests {
             2,
         )
         .unwrap();
-        let dropped_root = root_with_metadata(dropped_metadata, 20);
+        let dropped_root = root_with_metadata(dropped_metadata, TrxID::new(20));
         assert_eq!(
-            classify_index_ddl_root(IndexDdlKind::Drop, 42, 1, 19, Some(&dropped_root)).unwrap(),
+            classify_index_ddl_root(
+                IndexDdlKind::Drop,
+                TableID::new(42),
+                1,
+                TrxID::new(19),
+                Some(&dropped_root)
+            )
+            .unwrap(),
             IndexDdlRootProof::DurableFinalDrop
         );
     }
@@ -1618,10 +1653,11 @@ mod tests {
             2,
         )
         .unwrap();
-        let mut active_root = root_with_metadata(metadata.clone(), 20);
+        let mut active_root = root_with_metadata(metadata.clone(), TrxID::new(20));
         active_root.secondary_index_roots[1] = BlockID::new(99);
 
-        let err = validate_create_index_root_shape(42, &active_root, &metadata).unwrap_err();
+        let err = validate_create_index_root_shape(TableID::new(42), &active_root, &metadata)
+            .unwrap_err();
 
         assert_eq!(
             err.data_integrity_error(),
@@ -1635,14 +1671,20 @@ mod tests {
 
     #[test]
     fn create_index_cold_root_shape_accepts_empty_root() {
-        assert!(!create_index_cold_root_has_rows(SUPER_BLOCK_ID, 0));
-        assert!(!create_index_cold_root_has_rows(SUPER_BLOCK_ID, 10));
+        assert!(!create_index_cold_root_has_rows(
+            SUPER_BLOCK_ID,
+            RowID::new(0)
+        ));
+        assert!(!create_index_cold_root_has_rows(
+            SUPER_BLOCK_ID,
+            RowID::new(10)
+        ));
     }
 
     #[test]
     #[should_panic(expected = "non-empty cold root with pivot_row_id == 0")]
     fn create_index_cold_root_shape_panics_on_non_empty_root_without_pivot() {
-        let _ = create_index_cold_root_has_rows(BlockID::new(99), 0);
+        let _ = create_index_cold_root_has_rows(BlockID::new(99), RowID::new(0));
     }
 
     #[test]
@@ -2334,7 +2376,9 @@ mod tests {
         let mut last_delay = None;
         for _ in 0..50 {
             match table.checkpoint(session).await.unwrap() {
-                CheckpointOutcome::Published { checkpoint_ts } => return checkpoint_ts,
+                CheckpointOutcome::Published { checkpoint_ts } => {
+                    return TrxID::new(checkpoint_ts);
+                }
                 CheckpointOutcome::Delayed { reason } => {
                     last_delay = Some(reason);
                     smol::Timer::after(Duration::from_millis(20)).await;

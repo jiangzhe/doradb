@@ -1,8 +1,7 @@
 use crate::buffer::page::PAGE_SIZE;
 use crate::error::{DataIntegrityError, Error, Result};
-use crate::file::BlockID;
+use crate::id::{BlockID, TrxID};
 use crate::serde::{Deser, Ser, Serde};
-use crate::trx::TrxID;
 use error_stack::Report;
 use std::mem;
 
@@ -37,7 +36,7 @@ impl Ser<'_> for SuperBlockHeader {
         let idx = out.ser_byte_array(start_idx, &self.magic_word);
         let idx = out.ser_u64(idx, self.version);
         let idx = out.ser_u64(idx, self.slot_no);
-        out.ser_u64(idx, self.checkpoint_cts)
+        out.ser_u64(idx, self.checkpoint_cts.as_u64())
     }
 }
 
@@ -47,7 +46,7 @@ impl Deser for SuperBlockHeader {
         let (idx, magic_word) = input.deser_byte_array::<8>(start_idx)?;
         let (idx, version) = input.deser_u64(idx)?;
         let (idx, slot_no) = input.deser_u64(idx)?;
-        let (idx, checkpoint_cts) = input.deser_u64(idx)?;
+        let (idx, checkpoint_cts) = TrxID::deser(input, idx)?;
         let res = SuperBlockHeader {
             magic_word,
             version,
@@ -98,7 +97,7 @@ impl Deser for SuperBlockFooter {
     #[inline]
     fn deser<S: Serde + ?Sized>(input: &S, start_idx: usize) -> Result<(usize, Self)> {
         let (idx, b3sum) = input.deser_byte_array::<32>(start_idx)?;
-        let (idx, checkpoint_cts) = input.deser_u64(idx)?;
+        let (idx, checkpoint_cts) = TrxID::deser(input, idx)?;
         Ok((
             idx,
             SuperBlockFooter {
@@ -118,7 +117,7 @@ impl Ser<'_> for SuperBlockFooter {
     #[inline]
     fn ser<S: Serde + ?Sized>(&self, out: &mut S, start_idx: usize) -> usize {
         let idx = out.ser_byte_array(start_idx, &self.b3sum);
-        out.ser_u64(idx, self.checkpoint_cts)
+        out.ser_u64(idx, self.checkpoint_cts.as_u64())
     }
 }
 
@@ -220,7 +219,7 @@ mod tests {
             magic_word: TABLE_FILE_MAGIC_WORD,
             version: SUPER_BLOCK_VERSION,
             slot_no: 1,
-            checkpoint_cts: 12,
+            checkpoint_cts: TrxID::new(12),
         };
         let body = SuperBlockBody {
             meta_block_id: test_block_id(7),

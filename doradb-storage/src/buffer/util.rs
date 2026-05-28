@@ -1,6 +1,7 @@
 use crate::buffer::frame::BufferFrame;
-use crate::buffer::page::{Page, PageID};
+use crate::buffer::page::Page;
 use crate::error::{ResourceError, Result};
+use crate::id::PageID;
 use error_stack::Report;
 use libc::{
     MADV_DONTFORK, MADV_DONTNEED, MADV_HUGEPAGE, MAP_ANONYMOUS, MAP_FAILED, MAP_PRIVATE, PROT_READ,

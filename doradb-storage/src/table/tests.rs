@@ -2,14 +2,14 @@ use super::{DeleteInternal, FrozenPage, InsertRowIntoPage, UpdateRowInplace};
 use crate::buffer::BufferPool;
 use crate::buffer::frame::FrameKind;
 use crate::buffer::guard::PageGuard;
-use crate::buffer::page::{PAGE_SIZE, PageID};
+use crate::buffer::page::PAGE_SIZE;
 use crate::buffer::{EvictableBufferPool, PoolGuard, PoolGuards, PoolRole, test_frame_kind};
 use crate::catalog::table::test_hooks as catalog_table_tests;
 use crate::catalog::table::test_hooks::CreateTableTestFailure;
 use crate::catalog::tests::table4;
 use crate::catalog::{
     CatalogCheckpointScanStopReason, ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey,
-    IndexNo, IndexSpec, TableID, TableMetadata, TableSpec, USER_OBJ_ID_START,
+    IndexNo, IndexSpec, TableMetadata, TableSpec, USER_OBJ_ID_START,
 };
 use crate::conf::{EngineConfig, EvictableBufferPoolConfig, FileSystemConfig, TrxSysConfig};
 use crate::engine::Engine;
@@ -18,9 +18,8 @@ use crate::error::{
     InternalError, OperationError, ResourceError, Result,
 };
 use crate::file::block_integrity::{BLOCK_INTEGRITY_HEADER_SIZE, write_block_checksum};
-use crate::file::cow_file::{
-    BlockID, COW_FILE_PAGE_SIZE, SUPER_BLOCK_ID, tests::old_root_drop_count,
-};
+use crate::file::cow_file::{COW_FILE_PAGE_SIZE, SUPER_BLOCK_ID, tests::old_root_drop_count};
+use crate::id::{BlockID, PageID, RowID, SessionID, TableID, TrxID};
 use crate::index::{
     COLUMN_BLOCK_HEADER_SIZE, COLUMN_BLOCK_LEAF_HEADER_SIZE, ColumnBlockIndex, IndexInsert,
     NonUniqueIndex, RowLocation, SecondaryIndex, UniqueIndex,
@@ -33,7 +32,7 @@ use crate::latch::LatchFallbackMode;
 use crate::lock::tests::{LockDebugEntryState, debug_snapshot, try_acquire};
 use crate::lock::{LockMode, LockOwner, LockResource};
 use crate::row::ops::{DeleteMvcc, SelectKey, SelectMvcc, UpdateCol, UpdateMvcc};
-use crate::row::{RowID, RowPage, RowRead};
+use crate::row::{RowPage, RowRead};
 use crate::session::Session;
 use crate::table::{
     CheckpointCancelReason, CheckpointOutcome, CheckpointReadiness, DeleteMarker, Table,
@@ -46,13 +45,14 @@ use crate::trx::stmt::tests as stmt_tests;
 use crate::trx::tests as trx_tests;
 use crate::trx::undo::RowUndoKind;
 use crate::trx::ver_map::RowPageState;
-use crate::trx::{ActiveTrx, MAX_SNAPSHOT_TS, TrxID};
+use crate::trx::{ActiveTrx, MAX_SNAPSHOT_TS};
 use crate::value::{Val, ValKind};
 use error_stack::Report;
 use std::cell::{Cell, RefCell};
 use std::fs::OpenOptions;
 use std::future::Future;
 use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::path::PathBuf;
 use std::pin::Pin;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -77,7 +77,7 @@ const LIGHTWEIGHT_TEST_MAX_FILE_BYTES: usize = 32 * 1024 * 1024;
 const LIGHTWEIGHT_TEST_READONLY_BUFFER_BYTES: usize = 32 * 1024 * 1024;
 
 #[inline]
-pub(crate) fn test_user_table_id(offset: TableID) -> TableID {
+pub(crate) fn test_user_table_id(offset: u64) -> TableID {
     USER_OBJ_ID_START
         .checked_add(offset)
         .expect("test user table id offset overflow")
@@ -289,13 +289,15 @@ impl StorageBackendTestHook for FailingPageReadHook {
 }
 
 struct FailingFirstWriteHook {
+    file_path: PathBuf,
     calls: AtomicUsize,
 }
 
 impl FailingFirstWriteHook {
     #[inline]
-    fn new() -> Self {
+    fn new(file_path: impl Into<PathBuf>) -> Self {
         Self {
+            file_path: file_path.into(),
             calls: AtomicUsize::new(0),
         }
     }
@@ -304,11 +306,20 @@ impl FailingFirstWriteHook {
     fn call_count(&self) -> usize {
         self.calls.load(Ordering::SeqCst)
     }
+
+    #[inline]
+    fn matches(&self, op: StorageBackendOp) -> bool {
+        if op.kind() != IOKind::Write {
+            return false;
+        }
+        StorageBackendFileIdentity::from_path(&self.file_path)
+            .is_ok_and(|expected| op.matches_file_identity(expected))
+    }
 }
 
 impl StorageBackendTestHook for FailingFirstWriteHook {
     fn on_complete(&self, op: StorageBackendOp, res: &mut StdIoResult<usize>) {
-        if op.kind() == IOKind::Write && self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+        if self.matches(op) && self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
             *res = Err(io::Error::from_raw_os_error(libc::EIO));
         }
     }
@@ -1540,7 +1551,7 @@ fn test_lwc_update_unique_claim_rollback_drops_purgeable_deleted_cold_owner() {
                 .await
                 .unwrap()
         );
-        let delete_cts = 1;
+        let delete_cts = TrxID::new(1);
         sys.table
             .deletion_buffer()
             .put_committed(claimed_row_id, delete_cts)
@@ -2132,7 +2143,7 @@ fn test_secondary_mem_index_cleanup_removes_unique_delete_shadow_with_purgeable_
         );
         sys.table
             .deletion_buffer()
-            .put_committed(row_id, 1)
+            .put_committed(row_id, TrxID::new(1))
             .unwrap();
 
         let stats = sys
@@ -2200,7 +2211,7 @@ fn test_secondary_mem_index_cleanup_removes_delete_shadow_when_live_cleanup_disa
         );
         sys.table
             .deletion_buffer()
-            .put_committed(row_id, 1)
+            .put_committed(row_id, TrxID::new(1))
             .unwrap();
 
         let stats = sys
@@ -2288,7 +2299,7 @@ fn test_secondary_mem_index_cleanup_removes_unique_delete_shadow_with_matching_c
 
         sys.table
             .deletion_buffer()
-            .put_committed(row_id, 1)
+            .put_committed(row_id, TrxID::new(1))
             .unwrap();
         let stats = sys
             .table
@@ -2620,7 +2631,7 @@ fn test_secondary_mem_index_cleanup_removes_non_unique_delete_mark_with_purgeabl
         );
         sys.table
             .deletion_buffer()
-            .put_committed(row_id, 1)
+            .put_committed(row_id, TrxID::new(1))
             .unwrap();
 
         let stats = sys
@@ -2700,7 +2711,7 @@ fn test_secondary_mem_index_cleanup_removes_non_unique_delete_mark_with_matching
 
         sys.table
             .deletion_buffer()
-            .put_committed(row_id, 1)
+            .put_committed(row_id, TrxID::new(1))
             .unwrap();
         let stats = sys
             .table
@@ -3109,7 +3120,7 @@ fn test_lwc_unique_index_purge_uses_purgeable_delete_marker_fast_path() {
         );
         sys.table
             .deletion_buffer()
-            .put_committed(row_id, 10)
+            .put_committed(row_id, TrxID::new(10))
             .unwrap();
 
         let layout = sys.table.layout_snapshot();
@@ -3117,7 +3128,7 @@ fn test_lwc_unique_index_purge_uses_purgeable_delete_marker_fast_path() {
         let deleted = sys
             .table
             .accessor_with_layout(&layout)
-            .delete_index(session.pool_guards(), &key, row_id, true, 11)
+            .delete_index(session.pool_guards(), &key, row_id, true, TrxID::new(11))
             .await
             .unwrap();
         assert!(deleted);
@@ -3130,7 +3141,7 @@ fn test_lwc_unique_index_purge_uses_purgeable_delete_marker_fast_path() {
                     &key.vals,
                     row_id,
                     true,
-                    11,
+                    TrxID::new(11),
                 )
                 .await
                 .unwrap(),
@@ -3221,13 +3232,19 @@ fn test_lwc_unique_index_purge_compares_persisted_key_when_marker_is_not_purgeab
         );
         sys.table
             .deletion_buffer()
-            .put_committed(row_id, 100)
+            .put_committed(row_id, TrxID::new(100))
             .unwrap();
         let layout = sys.table.layout_snapshot();
         let deleted = sys
             .table
             .accessor_with_layout(&layout)
-            .delete_index(session.pool_guards(), &current_key, row_id, true, 100)
+            .delete_index(
+                session.pool_guards(),
+                &current_key,
+                row_id,
+                true,
+                TrxID::new(100),
+            )
             .await
             .unwrap();
         assert!(!deleted);
@@ -3323,13 +3340,19 @@ fn test_lwc_non_unique_index_purge_compares_persisted_key_when_marker_is_not_pur
         );
         sys.table
             .deletion_buffer()
-            .put_committed(row_id, 200)
+            .put_committed(row_id, TrxID::new(200))
             .unwrap();
         let layout = sys.table.layout_snapshot();
         let deleted = sys
             .table
             .accessor_with_layout(&layout)
-            .delete_index(session.pool_guards(), &current_key, row_id, false, 200)
+            .delete_index(
+                session.pool_guards(),
+                &current_key,
+                row_id,
+                false,
+                TrxID::new(200),
+            )
             .await
             .unwrap();
         assert!(!deleted);
@@ -3360,7 +3383,7 @@ fn test_index_purge_removes_delete_marked_unique_entry_when_row_is_not_found() {
             .insert_if_not_exists(
                 session.pool_guards().index_guard(),
                 &key.vals,
-                row_id,
+                RowID::new(row_id),
                 false,
                 MAX_SNAPSHOT_TS,
             )
@@ -3371,7 +3394,7 @@ fn test_index_purge_removes_delete_marked_unique_entry_when_row_is_not_found() {
                 .mask_as_deleted(
                     session.pool_guards().index_guard(),
                     &key.vals,
-                    row_id,
+                    RowID::new(row_id),
                     MAX_SNAPSHOT_TS,
                 )
                 .await
@@ -3383,7 +3406,13 @@ fn test_index_purge_removes_delete_marked_unique_entry_when_row_is_not_found() {
         let deleted = sys
             .table
             .accessor_with_layout(&layout)
-            .delete_index(session.pool_guards(), &key, row_id, true, MAX_SNAPSHOT_TS)
+            .delete_index(
+                session.pool_guards(),
+                &key,
+                RowID::new(row_id),
+                true,
+                MAX_SNAPSHOT_TS,
+            )
             .await
             .unwrap();
         assert!(deleted);
@@ -3411,7 +3440,7 @@ fn test_unique_insert_rollback_restores_deleted_owner_even_when_row_missing() {
 
         assert!(matches!(
             sys.table
-                .find_row(session.pool_guards(), stale_row_id)
+                .find_row(session.pool_guards(), RowID::new(stale_row_id))
                 .await
                 .unwrap(),
             RowLocation::NotFound
@@ -3423,7 +3452,7 @@ fn test_unique_insert_rollback_restores_deleted_owner_even_when_row_missing() {
                 .insert_if_not_exists(
                     session.pool_guards().index_guard(),
                     &key.vals,
-                    stale_row_id,
+                    RowID::new(stale_row_id),
                     false,
                     MAX_SNAPSHOT_TS,
                 )
@@ -3436,7 +3465,7 @@ fn test_unique_insert_rollback_restores_deleted_owner_even_when_row_missing() {
                 .mask_as_deleted(
                     session.pool_guards().index_guard(),
                     &key.vals,
-                    stale_row_id,
+                    RowID::new(stale_row_id),
                     MAX_SNAPSHOT_TS,
                 )
                 .await
@@ -3447,7 +3476,7 @@ fn test_unique_insert_rollback_restores_deleted_owner_even_when_row_missing() {
             session.pool_guards(),
             &key,
             MAX_SNAPSHOT_TS,
-            stale_row_id,
+            RowID::new(stale_row_id),
             true,
         )
         .await;
@@ -3463,7 +3492,7 @@ fn test_unique_insert_rollback_restores_deleted_owner_even_when_row_missing() {
                     )
                     .await,
                 );
-                assert_ne!(new_row_id, stale_row_id);
+                assert_ne!(new_row_id, RowID::new(stale_row_id));
                 assert_unique_index_entry(
                     &sys.table,
                     session.pool_guards(),
@@ -3487,7 +3516,7 @@ fn test_unique_insert_rollback_restores_deleted_owner_even_when_row_missing() {
             session.pool_guards(),
             &key,
             MAX_SNAPSHOT_TS,
-            stale_row_id,
+            RowID::new(stale_row_id),
             true,
         )
         .await;
@@ -3620,12 +3649,12 @@ fn test_checkpoint_fails_when_eligible_delete_marker_has_no_column_index() {
         checkpoint_published(&sys.table, &mut session).await;
 
         let root_before = sys.table.file().active_root_unchecked().clone();
-        assert!(root_before.pivot_row_id > 0);
+        assert!(root_before.pivot_row_id > RowID::new(0));
         assert_eq!(root_before.column_block_index_root, SUPER_BLOCK_ID);
         let marker_ts = root_before.deletion_cutoff_ts;
         sys.table
             .deletion_buffer()
-            .put_committed(0, marker_ts)
+            .put_committed(RowID::new(0), marker_ts)
             .unwrap();
         wait_gc_cutoff_after(&session, marker_ts).await;
 
@@ -3708,10 +3737,10 @@ fn test_checkpoint_ignores_missing_old_delete_marker_below_previous_cutoff() {
         reader.commit().await.unwrap();
 
         let root_before = sys.table.file().active_root_unchecked().clone();
-        assert!(root_before.deletion_cutoff_ts > 0);
+        assert!(root_before.deletion_cutoff_ts > TrxID::new(0));
         let missing_row_id = row_id + 1;
         assert!(missing_row_id < root_before.pivot_row_id);
-        let old_marker_ts = root_before.deletion_cutoff_ts - 1;
+        let old_marker_ts = root_before.deletion_cutoff_ts.saturating_sub(1);
         sys.table
             .deletion_buffer()
             .put_committed(missing_row_id, old_marker_ts)
@@ -3795,12 +3824,12 @@ fn test_recover_row_page_reports_invalid_replay_state() {
                 &mut page_guard,
                 row_id,
                 &[Val::from(1i32), Val::from("name")],
-                10,
+                TrxID::new(10),
             )
             .unwrap_err();
         assert_invalid_root(err, "missing recover map");
 
-        page_guard.bf_mut().init_recover_map(10);
+        page_guard.bf_mut().init_recover_map(TrxID::new(10));
         let err = sys
             .table
             .recover_row_insert_to_page(
@@ -3808,7 +3837,7 @@ fn test_recover_row_page_reports_invalid_replay_state() {
                 &mut page_guard,
                 row_id,
                 &[Val::from(1i32), Val::from(vec![b'x'; PAGE_SIZE - 1])],
-                11,
+                TrxID::new(11),
             )
             .unwrap_err();
         assert_invalid_root(err, "insufficient row page space");
@@ -3819,7 +3848,7 @@ fn test_recover_row_page_reports_invalid_replay_state() {
                 &mut page_guard,
                 row_id,
                 &[Val::from(1i32), Val::from("name")],
-                12,
+                TrxID::new(12),
             )
             .unwrap();
         assert_eq!(page_guard.page().header.approx_non_deleted(), 1);
@@ -3831,7 +3860,7 @@ fn test_recover_row_page_reports_invalid_replay_state() {
                 &mut page_guard,
                 row_id,
                 &[Val::from(2i32), Val::from("other")],
-                13,
+                TrxID::new(13),
             )
             .unwrap_err();
         assert_invalid_root(err, "row slot is not vacant");
@@ -3846,25 +3875,25 @@ fn test_recover_row_page_reports_invalid_replay_state() {
                     idx: 1,
                     val: Val::from("new"),
                 }],
-                14,
+                TrxID::new(14),
             )
             .unwrap_err();
         assert_invalid_root(err, "row is deleted");
 
         sys.table
-            .recover_row_delete_to_page(&mut page_guard, row_id, 15)
+            .recover_row_delete_to_page(&mut page_guard, row_id, TrxID::new(15))
             .unwrap();
         assert_eq!(page_guard.page().header.approx_non_deleted(), 0);
 
         let err = sys
             .table
-            .recover_row_delete_to_page(&mut page_guard, row_id, 16)
+            .recover_row_delete_to_page(&mut page_guard, row_id, TrxID::new(16))
             .unwrap_err();
         assert_invalid_root(err, "row is already deleted");
 
         let err = sys
             .table
-            .recover_row_delete_to_page(&mut page_guard, row_id + 2, 17)
+            .recover_row_delete_to_page(&mut page_guard, row_id + 2, TrxID::new(17))
             .unwrap_err();
         assert_invalid_root(err, "row id outside page range");
     });
@@ -4790,7 +4819,7 @@ fn test_statement_write_locks_are_transaction_owned_and_cached() {
 fn test_create_table_waits_on_catalog_namespace_lock() {
     smol::block_on(async {
         let sys = TestSys::new_evictable().await;
-        let blocker = LockOwner::Session(91_400);
+        let blocker = LockOwner::Session(SessionID::new(91_400));
         assert!(
             try_acquire(
                 sys.engine.lock_manager(),
@@ -4914,7 +4943,7 @@ fn test_create_table_file_publish_failure_rolls_back_catalog_and_deletes_file() 
         let mut session = engine.new_session().unwrap();
         let table_id = engine.catalog().curr_next_user_obj_id();
         let table_file_path = engine.table_fs.user_table_file_path(table_id);
-        let hook = Arc::new(FailingFirstWriteHook::new());
+        let hook = Arc::new(FailingFirstWriteHook::new(table_file_path.clone()));
         let _install = install_storage_backend_test_hook(hook.clone());
         let (table_spec, index_specs) = drop_table_test_spec();
 
@@ -5140,7 +5169,7 @@ fn test_transaction_exclusive_table_lock_uses_cache_and_releases_on_commit() {
             LockDebugEntryState::Granted,
         ));
 
-        assert_eq!(trx.commit().await.unwrap(), 0);
+        assert_eq!(trx.commit().await.unwrap(), TrxID::new(0));
         assert_eq!(lock_entry_count(&sys.engine, owner), 0);
     });
 }
@@ -5242,7 +5271,7 @@ fn test_session_table_lock_cancellation_releases_fresh_metadata() {
     smol::block_on(async {
         let sys = TestSys::new_lightweight_evictable().await;
         let table_id = sys.table.table_id();
-        let blocker = LockOwner::Transaction(91_301);
+        let blocker = LockOwner::Transaction(TrxID::new(91_301));
         assert!(
             try_acquire(
                 sys.engine.lock_manager(),
@@ -5348,7 +5377,7 @@ fn test_transaction_table_lock_cancellation_releases_fresh_metadata() {
     smol::block_on(async {
         let sys = TestSys::new_lightweight_evictable().await;
         let table_id = sys.table.table_id();
-        let blocker = LockOwner::Transaction(91_302);
+        let blocker = LockOwner::Transaction(TrxID::new(91_302));
         assert!(
             try_acquire(
                 sys.engine.lock_manager(),
@@ -5800,7 +5829,7 @@ fn test_mem_scan_from_requires_row_page_boundary() {
             .mem_scan_from(session.pool_guards(), captured_pivot, |page_guard| {
                 let page = page_guard.page();
                 explicit_count += page.header.approx_non_deleted();
-                later_pivot = page.header.start_row_id + page.header.max_row_count as RowID;
+                later_pivot = page.header.start_row_id + u64::from(page.header.max_row_count);
                 true
             })
             .await
@@ -6049,7 +6078,7 @@ fn test_foreground_lifecycle_rejects_dropping_and_dropped_handles() {
             .await
             .unwrap_err();
         assert_eq!(err.operation_error(), Some(OperationError::TableDropping));
-        assert_eq!(read_trx.commit().await.unwrap(), 0);
+        assert_eq!(read_trx.commit().await.unwrap(), TrxID::new(0));
 
         let mut write_trx = session.begin_trx().unwrap();
         let err = trx_insert_row(
@@ -6061,7 +6090,7 @@ fn test_foreground_lifecycle_rejects_dropping_and_dropped_handles() {
         .unwrap_err();
         assert_eq!(err.operation_error(), Some(OperationError::TableDropping));
         assert!(write_trx.readonly());
-        assert_eq!(write_trx.commit().await.unwrap(), 0);
+        assert_eq!(write_trx.commit().await.unwrap(), TrxID::new(0));
 
         sys.table.mark_dropped_lifecycle().unwrap();
 
@@ -6070,7 +6099,7 @@ fn test_foreground_lifecycle_rejects_dropping_and_dropped_handles() {
             .await
             .unwrap_err();
         assert_eq!(err.operation_error(), Some(OperationError::TableNotFound));
-        assert_eq!(dropped_read.commit().await.unwrap(), 0);
+        assert_eq!(dropped_read.commit().await.unwrap(), TrxID::new(0));
 
         let mut dropped_write = session.begin_trx().unwrap();
         let err = trx_insert_row(
@@ -6082,7 +6111,7 @@ fn test_foreground_lifecycle_rejects_dropping_and_dropped_handles() {
         .unwrap_err();
         assert_eq!(err.operation_error(), Some(OperationError::TableNotFound));
         assert!(dropped_write.readonly());
-        assert_eq!(dropped_write.commit().await.unwrap(), 0);
+        assert_eq!(dropped_write.commit().await.unwrap(), TrxID::new(0));
     });
 }
 
@@ -6169,7 +6198,7 @@ fn test_drop_table_returns_not_found_for_missing_table() {
         let sys = TestSys::new_lightweight_evictable().await;
         let mut session = sys.new_session().unwrap();
 
-        let err = session.drop_table(0).await.unwrap_err();
+        let err = session.drop_table(TableID::new(0)).await.unwrap_err();
         assert_eq!(err.operation_error(), Some(OperationError::TableNotFound));
 
         let missing_user_table_id = sys.table.table_id() + 1000;
@@ -6535,7 +6564,7 @@ fn test_drop_table_logical_cascade_and_stale_handles() {
             .await
             .unwrap_err();
         assert_eq!(err.operation_error(), Some(OperationError::TableNotFound));
-        assert_eq!(stale_read.commit().await.unwrap(), 0);
+        assert_eq!(stale_read.commit().await.unwrap(), TrxID::new(0));
 
         let mut stale_write = session.begin_trx().unwrap();
         let err = trx_insert_row(
@@ -6547,7 +6576,7 @@ fn test_drop_table_logical_cascade_and_stale_handles() {
         .unwrap_err();
         assert_eq!(err.operation_error(), Some(OperationError::TableNotFound));
         assert!(stale_write.readonly());
-        assert_eq!(stale_write.commit().await.unwrap(), 0);
+        assert_eq!(stale_write.commit().await.unwrap(), TrxID::new(0));
 
         let (later_spec, later_indexes) = drop_table_test_spec();
         let later_table_id = session
@@ -6670,7 +6699,11 @@ fn test_drop_table_commit_poison_preserves_source_error() {
     smol::block_on(async {
         let sys = TestSys::new_lightweight_evictable().await;
         let table_id = sys.table.table_id();
-        let hook = Arc::new(FailingFirstWriteHook::new());
+        let redo_file_path = sys
+            ._temp_dir
+            .path()
+            .join("redo_testsys_lightweight.0.00000000");
+        let hook = Arc::new(FailingFirstWriteHook::new(redo_file_path));
         let _install = install_storage_backend_test_hook(hook.clone());
         let mut session = sys.new_session().unwrap();
 
@@ -6746,7 +6779,7 @@ fn test_drop_table_waits_for_active_metadata_reader() {
 
         release_tx.send_async(()).await.unwrap();
         reader_fut.await.unwrap();
-        assert_eq!(reader_trx.commit().await.unwrap(), 0);
+        assert_eq!(reader_trx.commit().await.unwrap(), TrxID::new(0));
         drop_fut.await.unwrap();
     });
 }
@@ -6773,7 +6806,7 @@ fn test_drop_table_waits_for_active_table_writer() {
             std::task::Poll::Pending
         ));
 
-        assert!(writer_trx.commit().await.unwrap() > 0);
+        assert!(writer_trx.commit().await.unwrap() > TrxID::new(0));
         drop_fut.await.unwrap();
     });
 }
@@ -6900,7 +6933,7 @@ fn test_drop_table_catalog_checkpoint_cleans_absent_leftover_file_on_startup() {
                 .checkpoint_snapshot()
                 .unwrap()
                 .catalog_replay_start_ts
-                > 1
+                > TrxID::new(1)
         );
         assert!(std::path::Path::new(&table_file_path).exists());
 
@@ -6934,7 +6967,7 @@ fn test_recovery_cleans_post_replay_create_table_provisional_file() {
             .table_fs
             .create_table_file(table_id, metadata, false)
             .unwrap();
-        let (table_file, old_root) = mutable.commit(1, false).await.unwrap();
+        let (table_file, old_root) = mutable.commit(TrxID::new(1), false).await.unwrap();
         drop(old_root);
         drop(table_file);
         assert!(std::path::Path::new(&table_file_path).exists());
@@ -6957,7 +6990,11 @@ fn test_checkpoint_publish_write_failure_poisons_storage() {
         let mut session = sys.new_session().unwrap();
         let root_before = sys.table.file().active_root_unchecked().clone();
         wait_checkpoint_ready(&sys.table, &session).await;
-        let hook = Arc::new(FailingFirstWriteHook::new());
+        let table_file_path = sys
+            .engine
+            .table_fs
+            .user_table_file_path(sys.table.table_id());
+        let hook = Arc::new(FailingFirstWriteHook::new(table_file_path));
         let _install = install_storage_backend_test_hook(hook.clone());
 
         let err = sys.table.checkpoint(&mut session).await.unwrap_err();
@@ -7020,8 +7057,8 @@ fn test_checkpoint_readiness_delayed_reports_effective_ts_and_horizon() {
         let CheckpointReadiness::Delayed { reason } = readiness else {
             panic!("expected delayed checkpoint readiness, got {readiness:?}");
         };
-        assert_eq!(reason.effective_ts, active_root_effective_ts);
-        assert_eq!(reason.min_active_sts, reader.sts());
+        assert_eq!(reason.effective_ts, active_root_effective_ts.as_u64());
+        assert_eq!(reason.min_active_sts, reader.sts().as_u64());
         assert!(reason.effective_ts >= reason.min_active_sts);
 
         reader.commit().await.unwrap();
@@ -7042,7 +7079,7 @@ fn test_checkpoint_readiness_uses_root_effective_ts_not_checkpoint_start_ts() {
 
         sys.table.freeze(&session, usize::MAX).await.unwrap();
         let reader_holder: Rc<RefCell<Option<(Session, ActiveTrx)>>> = Rc::new(RefCell::new(None));
-        let reader_sts = Rc::new(Cell::new(0));
+        let reader_sts = Rc::new(Cell::new(TrxID::new(0)));
         let hook_reader_holder = Rc::clone(&reader_holder);
         let hook_reader_sts = Rc::clone(&reader_sts);
         let hook_engine = sys.engine.new_ref().unwrap();
@@ -7063,8 +7100,8 @@ fn test_checkpoint_readiness_uses_root_effective_ts_not_checkpoint_start_ts() {
         let CheckpointReadiness::Delayed { reason } = readiness else {
             panic!("expected effective timestamp delay, got {readiness:?}");
         };
-        assert_eq!(reason.effective_ts, effective_ts);
-        assert!(reason.min_active_sts <= reader_sts.get());
+        assert_eq!(reason.effective_ts, effective_ts.as_u64());
+        assert!(reason.min_active_sts <= reader_sts.get().as_u64());
         assert!(reason.effective_ts >= reason.min_active_sts);
 
         let (_, mut reader) = reader_holder
@@ -7156,8 +7193,11 @@ fn test_checkpoint_delayed_preserves_root_and_frozen_pages_until_ready() {
         let CheckpointOutcome::Delayed { reason } = outcome else {
             panic!("expected delayed checkpoint, got {outcome:?}");
         };
-        assert_eq!(reason.effective_ts, effective_ts_protected_by_reader);
-        assert_eq!(reason.min_active_sts, reader.sts());
+        assert_eq!(
+            reason.effective_ts,
+            effective_ts_protected_by_reader.as_u64()
+        );
+        assert_eq!(reason.min_active_sts, reader.sts().as_u64());
         assert_root_metadata_unchanged(&root_before_delay, &sys.table);
 
         let page_guard = sys
@@ -7207,8 +7247,8 @@ fn test_second_checkpoint_waits_for_previous_root_horizon() {
         let CheckpointOutcome::Delayed { reason } = outcome else {
             panic!("expected second checkpoint to wait, got {outcome:?}");
         };
-        assert_eq!(reason.effective_ts, first_effective_ts);
-        assert_eq!(reason.min_active_sts, reader.sts());
+        assert_eq!(reason.effective_ts, first_effective_ts.as_u64());
+        assert_eq!(reason.min_active_sts, reader.sts().as_u64());
         assert_root_metadata_unchanged(&root_before_second, &sys.table);
 
         reader.commit().await.unwrap();
@@ -7294,8 +7334,8 @@ fn test_checkpoint_rechecks_readiness_after_root_mutation_lease() {
         };
         let root_after = sys.table.file().active_root_unchecked();
         assert!(root_after.root_ts > root_before.root_ts);
-        assert_eq!(reason.effective_ts, root_after.effective_ts());
-        assert_eq!(reason.min_active_sts, reader.sts());
+        assert_eq!(reason.effective_ts, root_after.effective_ts().as_u64());
+        assert_eq!(reason.min_active_sts, reader.sts().as_u64());
 
         reader.commit().await.unwrap();
     });
@@ -8029,8 +8069,13 @@ fn test_build_in_memory_secondary_indexes_reclaims_staged_indexes_on_error() {
         )
         .expect("valid table metadata");
 
-        let err = match build_in_memory_secondary_indexes(pool.guard(), &pool_guard, &metadata, 100)
-            .await
+        let err = match build_in_memory_secondary_indexes(
+            pool.guard(),
+            &pool_guard,
+            &metadata,
+            TrxID::new(100),
+        )
+        .await
         {
             Ok(_) => panic!("second secondary-index construction should fail in one-page pool"),
             Err(err) => err,
@@ -8907,7 +8952,9 @@ async fn checkpoint_published(table: &Table, session: &mut Session) -> TrxID {
     let mut last_delay = None;
     for _ in 0..50 {
         match table.checkpoint(session).await.unwrap() {
-            CheckpointOutcome::Published { checkpoint_ts } => return checkpoint_ts,
+            CheckpointOutcome::Published { checkpoint_ts } => {
+                return TrxID::new(checkpoint_ts);
+            }
             CheckpointOutcome::Delayed { reason } => {
                 last_delay = Some(reason);
                 smol::Timer::after(Duration::from_millis(20)).await;
@@ -9095,7 +9142,7 @@ async fn delete_key_range_and_wait_gc_cutoff(
     start: i32,
     count: i32,
 ) {
-    let mut max_delete_cts = 0;
+    let mut max_delete_cts = TrxID::new(0);
     for i in 0..count {
         let mut trx = session.begin_trx().unwrap();
         trx = sys.trx_delete(trx, &single_key(start + i)).await;

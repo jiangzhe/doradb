@@ -5,6 +5,7 @@ use crate::conf::TrxSysConfig;
 use crate::error::{Error, FatalError, FatalResult, InternalError, Result};
 use crate::file::fs::FileSystem;
 use crate::file::table_file::{MutableTableFile, OldRoot, TableFile};
+use crate::id::TrxID;
 use crate::quiescent::{QuiescentBox, QuiescentGuard, SyncQuiescentGuard};
 use crate::session::SessionState;
 use crate::thread;
@@ -14,9 +15,7 @@ use crate::trx::log_replay::MmapLogReader;
 use crate::trx::purge::{DroppedTableFileDeleteItem, DroppedTableQueue, GC, Purge, TableRootQueue};
 use crate::trx::redo::RedoLogs;
 use crate::trx::sys_trx::SysTrx;
-use crate::trx::{
-    ActiveTrx, MAX_SNAPSHOT_TS, MIN_ACTIVE_TRX_ID, MIN_SNAPSHOT_TS, PreparedTrx, TrxID,
-};
+use crate::trx::{ActiveTrx, MAX_SNAPSHOT_TS, MIN_ACTIVE_TRX_ID, MIN_SNAPSHOT_TS, PreparedTrx};
 use crossbeam_utils::CachePadded;
 use error_stack::Report;
 use flume::{Receiver, Sender};
@@ -125,8 +124,8 @@ impl TransactionSystem {
     ) -> Self {
         debug_assert!((MIN_SNAPSHOT_TS..MAX_SNAPSHOT_TS).contains(&initial_ts));
         TransactionSystem {
-            ts: CachePadded::new(AtomicU64::new(initial_ts)),
-            global_visible_sts: CachePadded::new(AtomicU64::new(initial_ts)),
+            ts: CachePadded::new(AtomicU64::new(initial_ts.as_u64())),
+            global_visible_sts: CachePadded::new(AtomicU64::new(initial_ts.as_u64())),
             rr_partition_id: CachePadded::new(AtomicUsize::new(0)),
             log_partitions: CachePadded::new(log_partitions.into_boxed_slice()),
             config: CachePadded::new(config),
@@ -210,7 +209,7 @@ impl TransactionSystem {
         table_file: &Arc<TableFile>,
         old_root: Option<OldRoot>,
     ) -> TrxID {
-        let effective_ts = self.ts.fetch_add(1, Ordering::SeqCst);
+        let effective_ts = TrxID::new(self.ts.fetch_add(1, Ordering::SeqCst));
         debug_assert!(effective_ts < MAX_SNAPSHOT_TS);
         table_file.install_active_root_effective_ts(effective_ts);
         if let Some(old_root) = old_root {
@@ -247,8 +246,8 @@ impl TransactionSystem {
         // Add to active sts list.
         let mut g = gc_bucket.active_sts_list.lock();
         // With bucket lock, we can make sure all transactions are ordered by STS.
-        let sts = self.ts.fetch_add(1, Ordering::SeqCst);
-        let trx_id = sts | (1 << 63);
+        let sts = TrxID::new(self.ts.fetch_add(1, Ordering::SeqCst));
+        let trx_id = TrxID::new(sts.as_u64() | (1 << 63));
         debug_assert!(sts < MAX_SNAPSHOT_TS);
         debug_assert!(trx_id >= MIN_ACTIVE_TRX_ID);
         g.insert(sts);
@@ -256,8 +255,12 @@ impl TransactionSystem {
             // Only when the previous list is empty, we should update min_active_sts
             // as STS of current transaction.
             // In this case, current value of min_active_sts should be MAX.
-            debug_assert!(gc_bucket.min_active_sts.load(Ordering::Relaxed) == MAX_SNAPSHOT_TS);
-            gc_bucket.min_active_sts.store(sts, Ordering::Relaxed);
+            debug_assert!(
+                TrxID::new(gc_bucket.min_active_sts.load(Ordering::Relaxed)) == MAX_SNAPSHOT_TS
+            );
+            gc_bucket
+                .min_active_sts
+                .store(sts.as_u64(), Ordering::Relaxed);
         }
         drop(g); // release bucket lock.
         ActiveTrx::new(session_state, trx_id, sts, log_no, gc_no)
@@ -302,7 +305,7 @@ impl TransactionSystem {
             // order to preserve. Effects without redo still enter group commit
             // because readers, sessions, and GC depend on ordered CTS backfill.
             self.discard_unordered_prepared(prepared_trx);
-            return Ok(0);
+            return Ok(TrxID::new(0));
         }
         // start group commit
         partition.commit(prepared_trx, &self.ts, true).await
@@ -314,7 +317,7 @@ impl TransactionSystem {
         if trx.redo.is_empty() {
             // System transaction does not hold any active start timestamp
             // so we can just drop it if there is no change to replay.
-            return Ok(0);
+            return Ok(TrxID::new(0));
         }
         // System transactions are always submitted to first log partition and
         // use the no-wait piggyback flow intentionally. They publish internal
@@ -410,17 +413,18 @@ impl TransactionSystem {
     /// Returns global visible snapshot timestamp.
     #[inline]
     pub(crate) fn global_visible_sts(&self) -> TrxID {
-        self.global_visible_sts.load(Ordering::Relaxed)
+        TrxID::new(self.global_visible_sts.load(Ordering::Relaxed))
     }
 
     /// Update global visible snapshot timestamp.
     #[inline]
     pub(crate) fn update_global_visible_sts(&self, sts: TrxID) {
         debug_assert!({
-            let curr_sts = self.global_visible_sts.load(Ordering::Relaxed);
+            let curr_sts = TrxID::new(self.global_visible_sts.load(Ordering::Relaxed));
             sts >= curr_sts
         });
-        self.global_visible_sts.store(sts, Ordering::SeqCst)
+        self.global_visible_sts
+            .store(sts.as_u64(), Ordering::SeqCst)
     }
 
     /// Start background GC threads.
@@ -483,7 +487,7 @@ impl TransactionSystem {
     pub(crate) fn persisted_watermark_cts(&self) -> TrxID {
         self.log_partitions
             .iter()
-            .map(|partition| partition.persisted_cts.load(Ordering::Acquire))
+            .map(|partition| TrxID::new(partition.persisted_cts.load(Ordering::Acquire)))
             .min()
             .unwrap_or(MIN_SNAPSHOT_TS)
     }

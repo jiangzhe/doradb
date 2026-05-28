@@ -11,8 +11,8 @@
 //! checkpointing can flush committed markers to disk, but markers may remain
 //! here until they are no longer needed to make old snapshots visible.
 
-use crate::row::RowID;
-use crate::trx::{SharedTrxStatus, TrxID, trx_is_committed};
+use crate::id::{RowID, TrxID};
+use crate::trx::{SharedTrxStatus, trx_is_committed};
 use dashmap::DashMap;
 use dashmap::mapref::entry::Entry;
 use std::sync::Arc;
@@ -289,37 +289,45 @@ mod tests {
         let buffer = ColumnDeletionBuffer::new();
         let calls = AtomicUsize::new(0);
 
-        assert!(!buffer.delete_marker_is_globally_purgeable_with(1, || {
-            calls.fetch_add(1, Ordering::SeqCst);
-            100
-        }));
+        assert!(
+            !buffer.delete_marker_is_globally_purgeable_with(RowID::new(1), || {
+                calls.fetch_add(1, Ordering::SeqCst);
+                TrxID::new(100)
+            })
+        );
         assert_eq!(calls.load(Ordering::SeqCst), 0);
 
         buffer
             .put_ref(
-                1,
+                RowID::new(1),
                 Arc::new(SharedTrxStatus::new(MIN_ACTIVE_TRX_ID + 1)),
                 MAX_SNAPSHOT_TS,
             )
             .unwrap();
-        assert!(!buffer.delete_marker_is_globally_purgeable_with(1, || {
-            calls.fetch_add(1, Ordering::SeqCst);
-            100
-        }));
+        assert!(
+            !buffer.delete_marker_is_globally_purgeable_with(RowID::new(1), || {
+                calls.fetch_add(1, Ordering::SeqCst);
+                TrxID::new(100)
+            })
+        );
         assert_eq!(calls.load(Ordering::SeqCst), 0);
 
-        buffer.remove(1);
-        buffer.put_committed(1, 10).unwrap();
-        assert!(!buffer.delete_marker_is_globally_purgeable_with(1, || {
-            calls.fetch_add(1, Ordering::SeqCst);
-            10
-        }));
+        buffer.remove(RowID::new(1));
+        buffer.put_committed(RowID::new(1), TrxID::new(10)).unwrap();
+        assert!(
+            !buffer.delete_marker_is_globally_purgeable_with(RowID::new(1), || {
+                calls.fetch_add(1, Ordering::SeqCst);
+                TrxID::new(10)
+            })
+        );
         assert_eq!(calls.load(Ordering::SeqCst), 1);
 
-        assert!(buffer.delete_marker_is_globally_purgeable_with(1, || {
-            calls.fetch_add(1, Ordering::SeqCst);
-            11
-        }));
+        assert!(
+            buffer.delete_marker_is_globally_purgeable_with(RowID::new(1), || {
+                calls.fetch_add(1, Ordering::SeqCst);
+                TrxID::new(11)
+            })
+        );
         assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 
@@ -328,24 +336,26 @@ mod tests {
         let buffer = ColumnDeletionBuffer::new();
         let status = Arc::new(SharedTrxStatus::new(MIN_ACTIVE_TRX_ID + 1));
 
-        buffer.put_committed(1, 20).unwrap();
+        buffer.put_committed(RowID::new(1), TrxID::new(20)).unwrap();
         assert_eq!(
-            buffer.put_ref(1, status.clone(), 20),
+            buffer.put_ref(RowID::new(1), status.clone(), TrxID::new(20)),
             Err(DeletionError::AlreadyDeleted)
         );
         assert_eq!(
-            buffer.put_ref(1, status.clone(), 19),
+            buffer.put_ref(RowID::new(1), status.clone(), TrxID::new(19)),
             Err(DeletionError::WriteConflict)
         );
 
-        let committed_ref = Arc::new(SharedTrxStatus::new(30));
-        buffer.put_ref(2, committed_ref, MAX_SNAPSHOT_TS).unwrap();
+        let committed_ref = Arc::new(SharedTrxStatus::new(TrxID::new(30)));
+        buffer
+            .put_ref(RowID::new(2), committed_ref, MAX_SNAPSHOT_TS)
+            .unwrap();
         assert_eq!(
-            buffer.put_ref(2, status.clone(), 30),
+            buffer.put_ref(RowID::new(2), status.clone(), TrxID::new(30)),
             Err(DeletionError::AlreadyDeleted)
         );
         assert_eq!(
-            buffer.put_ref(2, status, 29),
+            buffer.put_ref(RowID::new(2), status, TrxID::new(29)),
             Err(DeletionError::WriteConflict)
         );
     }

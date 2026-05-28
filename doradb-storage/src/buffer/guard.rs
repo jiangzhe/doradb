@@ -1,10 +1,11 @@
 use crate::buffer::PoolGuard;
 use crate::buffer::frame::{BufferFrame, FrameContext};
-use crate::buffer::page::{PAGE_SIZE, PageID, VersionedPageID};
+use crate::buffer::page::{PAGE_SIZE, VersionedPageID};
 use crate::error::{
     Validation,
     Validation::{Invalid, Valid},
 };
+use crate::id::PageID;
 use crate::latch::{GuardState, LatchFallbackMode, RawHybridGuard};
 use crate::ptr::UnsafePtr;
 use either::Either;

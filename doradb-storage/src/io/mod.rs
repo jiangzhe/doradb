@@ -846,6 +846,20 @@ mod tests {
     static STORAGE_BACKEND_TEST_HOOK: std::sync::Mutex<Option<StorageBackendHook>> =
         std::sync::Mutex::new(None);
 
+    #[inline]
+    fn lock_storage_backend_test_hook_gate() -> MutexGuard<'static, ()> {
+        STORAGE_BACKEND_TEST_HOOK_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+    }
+
+    #[inline]
+    fn lock_storage_backend_test_hook_state() -> MutexGuard<'static, Option<StorageBackendHook>> {
+        STORAGE_BACKEND_TEST_HOOK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+    }
+
     pub(crate) struct InstalledStorageBackendTestHook {
         previous: Option<StorageBackendHook>,
         guard: Option<MutexGuard<'static, ()>>,
@@ -861,14 +875,14 @@ mod tests {
 
     #[inline]
     pub(crate) fn current_storage_backend_test_hook() -> Option<StorageBackendHook> {
-        STORAGE_BACKEND_TEST_HOOK.lock().unwrap().clone()
+        lock_storage_backend_test_hook_state().clone()
     }
 
     #[inline]
     pub(crate) fn set_storage_backend_test_hook(
         hook: Option<StorageBackendHook>,
     ) -> Option<StorageBackendHook> {
-        let mut guard = STORAGE_BACKEND_TEST_HOOK.lock().unwrap();
+        let mut guard = lock_storage_backend_test_hook_state();
         std::mem::replace(&mut *guard, hook)
     }
 
@@ -887,7 +901,7 @@ mod tests {
     pub(crate) fn install_storage_backend_test_hook(
         hook: StorageBackendHook,
     ) -> InstalledStorageBackendTestHook {
-        let guard = STORAGE_BACKEND_TEST_HOOK_LOCK.lock().unwrap();
+        let guard = lock_storage_backend_test_hook_gate();
         install_storage_backend_test_hook_locked(hook, guard)
     }
 
@@ -910,7 +924,7 @@ mod tests {
     fn test_installed_storage_backend_test_hook_restores_previous_on_drop() {
         let previous: StorageBackendHook = Arc::new(NoopStorageBackendTestHook);
         let next: StorageBackendHook = Arc::new(NoopStorageBackendTestHook);
-        let guard = STORAGE_BACKEND_TEST_HOOK_LOCK.lock().unwrap();
+        let guard = lock_storage_backend_test_hook_gate();
         let replaced = set_storage_backend_test_hook(Some(previous.clone()));
         assert!(replaced.is_none());
 

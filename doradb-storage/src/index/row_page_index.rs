@@ -2,19 +2,19 @@ use crate::buffer::guard::{
     FacadePageGuard, PageExclusiveGuard, PageGuard, PageOptimisticGuard, PageSharedGuard,
 };
 use crate::buffer::page::{BufferPage, BufferPageKind, PAGE_SIZE, assert_buffer_page, sealed};
-use crate::buffer::{BufferPool, PageID, PoolGuard};
+use crate::buffer::{BufferPool, PoolGuard};
 use crate::catalog::TableColumnLayout;
 use crate::error::{
     InternalError, Result, Validation,
     Validation::{Invalid, Valid},
 };
-use crate::file::BlockID;
 use crate::file::block_integrity::BLOCK_INTEGRITY_TRAILER_SIZE;
+use crate::id::{BlockID, PageID, RowID};
 use crate::index::util::{Maskable, ParentPosition, RowPageCreateRedoCtx};
 use crate::latch::LatchFallbackMode;
 use crate::layout;
 use crate::quiescent::QuiescentGuard;
-use crate::row::{INVALID_ROW_ID, RowID, RowPage};
+use crate::row::{INVALID_ROW_ID, RowPage};
 use either::Either::{Left, Right};
 use error_stack::Report;
 use parking_lot::Mutex;
@@ -1197,6 +1197,7 @@ mod tests {
     use crate::conf::{EngineConfig, EvictableBufferPoolConfig, TrxSysConfig};
     use crate::error::{ErrorKind, IoError, ResourceError, Validation};
     use crate::file::block_integrity::BLOCK_INTEGRITY_TRAILER_SIZE;
+    use crate::id::{TableID, TrxID};
     use crate::latch::LatchFallbackMode;
     use crate::quiescent::{QuiescentBox, QuiescentGuard};
     use crate::trx::log::list_log_files;
@@ -1266,9 +1267,9 @@ mod tests {
             .await
             .unwrap();
         let root = root.page_mut();
-        root.init_empty(0, 0);
+        root.init_empty(0, RowID::new(0));
         for i in 0..NBR_ROW_PAGE_ENTRIES_IN_LEAF {
-            root.leaf_add_entry(i as RowID, 1, test_page_id(i as i32));
+            root.leaf_add_entry(RowID::from(i), 1, test_page_id(i as i32));
         }
     }
 
@@ -1386,9 +1387,10 @@ mod tests {
             {
                 let metadata = make_test_metadata();
                 let meta_guard = engine.meta_pool.pool_guard();
-                let blk_idx = RowPageIndex::new(engine.meta_pool.clone_inner(), &meta_guard, 0)
-                    .await
-                    .expect("test row-page-index construction should succeed");
+                let blk_idx =
+                    RowPageIndex::new(engine.meta_pool.clone_inner(), &meta_guard, RowID::new(0))
+                        .await
+                        .expect("test row-page-index construction should succeed");
                 let mem_guard = engine.mem_pool.pool_guard();
                 let p1 = blk_idx
                     .get_insert_page(
@@ -1443,9 +1445,10 @@ mod tests {
             {
                 let metadata = make_test_metadata();
                 let meta_guard = engine.meta_pool.pool_guard();
-                let blk_idx = RowPageIndex::new(engine.meta_pool.clone_inner(), &meta_guard, 0)
-                    .await
-                    .expect("test row-page-index construction should succeed");
+                let blk_idx =
+                    RowPageIndex::new(engine.meta_pool.clone_inner(), &meta_guard, RowID::new(0))
+                        .await
+                        .expect("test row-page-index construction should succeed");
                 let mem_guard = engine.mem_pool.pool_guard();
                 let p1 = blk_idx
                     .get_insert_page_exclusive(
@@ -1487,7 +1490,7 @@ mod tests {
             let meta_guard = (*meta_pool).pool_guard();
             let mem_guard = (*mem_pool).pool_guard();
             let metadata = make_test_metadata();
-            let blk_idx = RowPageIndex::new(meta_pool.guard(), &meta_guard, 0)
+            let blk_idx = RowPageIndex::new(meta_pool.guard(), &meta_guard, RowID::new(0))
                 .await
                 .expect("test row-page-index construction should succeed");
 
@@ -1525,7 +1528,7 @@ mod tests {
             let meta_guard = (*meta_pool).pool_guard();
             let mem_guard = (*mem_pool).pool_guard();
             let metadata = make_test_metadata();
-            let blk_idx = RowPageIndex::new(meta_pool.guard(), &meta_guard, 0)
+            let blk_idx = RowPageIndex::new(meta_pool.guard(), &meta_guard, RowID::new(0))
                 .await
                 .expect("test row-page-index construction should succeed");
 
@@ -1570,7 +1573,7 @@ mod tests {
             let meta_guard = (*meta_pool).pool_guard();
             let mem_guard = (*mem_pool).pool_guard();
             let metadata = make_test_metadata();
-            let blk_idx = RowPageIndex::new(meta_pool.guard(), &meta_guard, 0)
+            let blk_idx = RowPageIndex::new(meta_pool.guard(), &meta_guard, RowID::new(0))
                 .await
                 .expect("test row-page-index construction should succeed");
 
@@ -1616,7 +1619,7 @@ mod tests {
             let meta_guard = (*meta_pool).pool_guard();
             let mem_guard = (*mem_pool).pool_guard();
             let metadata = make_test_metadata();
-            let blk_idx = RowPageIndex::new(meta_pool.guard(), &meta_guard, 0)
+            let blk_idx = RowPageIndex::new(meta_pool.guard(), &meta_guard, RowID::new(0))
                 .await
                 .expect("test row-page-index construction should succeed");
             fill_root_leaf_full(&blk_idx, &meta_guard).await;
@@ -1648,7 +1651,7 @@ mod tests {
             let meta_guard = (*meta_pool).pool_guard();
             let mem_guard = (*mem_pool).pool_guard();
             let metadata = make_test_metadata();
-            let blk_idx = RowPageIndex::new(meta_pool.guard(), &meta_guard, 0)
+            let blk_idx = RowPageIndex::new(meta_pool.guard(), &meta_guard, RowID::new(0))
                 .await
                 .expect("test row-page-index construction should succeed");
             fill_root_leaf_full(&blk_idx, &meta_guard).await;
@@ -1680,7 +1683,7 @@ mod tests {
             let meta_guard = (*meta_pool).pool_guard();
             let mem_guard = (*mem_pool).pool_guard();
             let metadata = make_test_metadata();
-            let blk_idx = RowPageIndex::new(meta_pool.guard(), &meta_guard, 0)
+            let blk_idx = RowPageIndex::new(meta_pool.guard(), &meta_guard, RowID::new(0))
                 .await
                 .expect("test row-page-index construction should succeed");
             fill_root_leaf_full(&blk_idx, &meta_guard).await;
@@ -1733,9 +1736,10 @@ mod tests {
             {
                 let metadata = make_test_metadata();
                 let meta_guard = engine.meta_pool.pool_guard();
-                let blk_idx = RowPageIndex::new(engine.meta_pool.clone_inner(), &meta_guard, 0)
-                    .await
-                    .expect("test row-page-index construction should succeed");
+                let blk_idx =
+                    RowPageIndex::new(engine.meta_pool.clone_inner(), &meta_guard, RowID::new(0))
+                        .await
+                        .expect("test row-page-index construction should succeed");
                 let mem_guard = engine.mem_pool.pool_guard();
                 for _ in 0..row_pages {
                     let _ = blk_idx
@@ -1752,7 +1756,7 @@ mod tests {
                 }
                 let mut count = 0usize;
                 let mut cursor = blk_idx.mem_cursor(&meta_guard);
-                cursor.seek(0).await;
+                cursor.seek(RowID::new(0)).await;
                 while let Some(res) = cursor.next().await {
                     count += 1;
                     let g = res.try_into_shared().unwrap();
@@ -1770,7 +1774,7 @@ mod tests {
         smol::block_on(async {
             let pool = owned_index_pool(1024usize * 1024 * 1024);
             let pool_guard = (*pool).pool_guard();
-            let blk_idx = RowPageIndex::new(pool.guard(), &pool_guard, 0)
+            let blk_idx = RowPageIndex::new(pool.guard(), &pool_guard, RowID::new(0))
                 .await
                 .expect("test row-page-index construction should succeed");
 
@@ -1811,7 +1815,7 @@ mod tests {
             let mut cursor_leaf_page_ids = vec![];
             let mut leaf_headers = vec![];
             let mut cursor = blk_idx.mem_cursor(&pool_guard);
-            cursor.seek(0).await;
+            cursor.seek(RowID::new(0)).await;
             while let Some(res) = cursor.next().await {
                 let g = res.try_into_shared().unwrap();
                 let node = g.page();
@@ -1825,10 +1829,10 @@ mod tests {
             }
 
             assert_eq!(leaf_headers.len(), 2);
-            assert_eq!(leaf_headers[0].0, 0);
+            assert_eq!(leaf_headers[0].0, RowID::new(0));
             assert_eq!(leaf_headers[0].2, NBR_ROW_PAGE_ENTRIES_IN_LEAF);
             assert_eq!(leaf_headers[1].0, leaf_headers[0].1);
-            assert_eq!(leaf_headers[1].1, row_pages as RowID);
+            assert_eq!(leaf_headers[1].1, RowID::from(row_pages));
             assert_eq!(leaf_headers[1].2, overflow_entries);
             assert_eq!(cursor_leaf_page_ids, root_leaf_page_ids);
             assert!(cursor.next().await.is_none());
@@ -1840,7 +1844,7 @@ mod tests {
         smol::block_on(async {
             let pool = owned_index_pool(512usize * 1024 * 1024);
             let pool_guard = (*pool).pool_guard();
-            let blk_idx = RowPageIndex::new(pool.guard(), &pool_guard, 0)
+            let blk_idx = RowPageIndex::new(pool.guard(), &pool_guard, RowID::new(0))
                 .await
                 .expect("test row-page-index construction should succeed");
             let row_pages = 5000usize;
@@ -1857,7 +1861,7 @@ mod tests {
                 }
             }
             for i in 0..row_pages {
-                let row_id = (i * rows_per_page + rows_per_page / 2) as RowID;
+                let row_id = RowID::from(i * rows_per_page + rows_per_page / 2);
                 match blk_idx
                     .find_row(&pool_guard, row_id)
                     .await
@@ -1869,7 +1873,7 @@ mod tests {
             }
             assert!(matches!(
                 blk_idx
-                    .find_row(&pool_guard, (row_pages * rows_per_page) as RowID)
+                    .find_row(&pool_guard, RowID::from(row_pages * rows_per_page))
                     .await
                     .expect("test row-page lookup should succeed"),
                 RowLocation::NotFound
@@ -1884,12 +1888,12 @@ mod tests {
             let pool =
                 QuiescentBox::new(FailingInsertPagePool::new(inner.guard(), INVALID_PAGE_ID));
             let pool_guard = (*pool).pool_guard();
-            let blk_idx = RowPageIndex::new(pool.guard(), &pool_guard, 0)
+            let blk_idx = RowPageIndex::new(pool.guard(), &pool_guard, RowID::new(0))
                 .await
                 .expect("test row-page-index construction should succeed");
             pool.set_fail_page_id(blk_idx.root_page_id());
 
-            let err = match blk_idx.find_row(&pool_guard, 0).await {
+            let err = match blk_idx.find_row(&pool_guard, RowID::new(0)).await {
                 Ok(_location) => panic!("expected lookup error"),
                 Err(err) => err,
             };
@@ -1902,7 +1906,7 @@ mod tests {
         smol::block_on(async {
             let pool = owned_index_pool(1024usize * 1024 * 1024);
             let pool_guard = (*pool).pool_guard();
-            let blk_idx = RowPageIndex::new(pool.guard(), &pool_guard, 0)
+            let blk_idx = RowPageIndex::new(pool.guard(), &pool_guard, RowID::new(0))
                 .await
                 .expect("test row-page-index construction should succeed");
             assert_eq!(blk_idx.height(), 0);
@@ -1939,11 +1943,12 @@ mod tests {
                 .allocate_page::<RowPageIndexNode>(&pool_guard)
                 .await
                 .expect("test page allocation should succeed");
-            r_g.page_mut().init(0, 50000, 10000, test_page_id(10001));
+            r_g.page_mut()
+                .init(0, RowID::new(50000), 10000, test_page_id(10001));
             r_g.page_mut().header.count = NBR_ROW_PAGE_ENTRIES_IN_LEAF as u32;
             let r_page_id = r_g.page_id();
             drop(r_g);
-            root.page_mut().branch_last_entry_mut().row_id = 50000;
+            root.page_mut().branch_last_entry_mut().row_id = RowID::new(50000);
             root.page_mut().branch_last_entry_mut().page_id = r_page_id;
             drop(root);
 
@@ -1980,11 +1985,12 @@ mod tests {
             {
                 let metadata = make_test_metadata();
                 let meta_guard = engine.meta_pool.pool_guard();
-                let blk_idx = RowPageIndex::new(engine.meta_pool.clone_inner(), &meta_guard, 0)
-                    .await
-                    .expect("test row-page-index construction should succeed");
+                let blk_idx =
+                    RowPageIndex::new(engine.meta_pool.clone_inner(), &meta_guard, RowID::new(0))
+                        .await
+                        .expect("test row-page-index construction should succeed");
                 let mem_guard = engine.mem_pool.pool_guard();
-                let redo_ctx = RowPageCreateRedoCtx::new(&engine.trx_sys, 104);
+                let redo_ctx = RowPageCreateRedoCtx::new(&engine.trx_sys, TableID::new(104));
                 let page_guard = blk_idx
                     .get_insert_page(
                         &meta_guard,
@@ -2003,7 +2009,7 @@ mod tests {
                     .and_then(|ctx| ctx.row_ver())
                     .map(|row_ver| row_ver.create_cts())
                     .unwrap();
-                assert!(create_cts > 0);
+                assert!(create_cts > TrxID::new(0));
 
                 let page_id = page_guard.page_id();
                 let page_guard = page_guard.downgrade().lock_exclusive_async().await.unwrap();
@@ -2037,7 +2043,11 @@ mod tests {
                         ReadLog::Some(mut group) => {
                             while let Some(log) = group.try_next().unwrap() {
                                 if let Some(ddl) = log.payload.ddl.as_deref()
-                                    && matches!(ddl, DDLRedo::CreateRowPage { table_id: 104, .. })
+                                    && matches!(
+                                        ddl,
+                                        DDLRedo::CreateRowPage { table_id, .. }
+                                            if *table_id == TableID::new(104)
+                                    )
                                 {
                                     create_row_page_logs += 1;
                                 }

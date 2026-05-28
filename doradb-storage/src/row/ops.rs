@@ -1,5 +1,6 @@
 use crate::error::Result;
-use crate::row::{Row, RowID, RowMut};
+use crate::id::RowID;
+use crate::row::{Row, RowMut};
 use crate::serde::{Deser, Ser, Serde};
 use crate::value::Val;
 use serde::{Deserialize, Serialize};

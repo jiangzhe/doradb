@@ -2,6 +2,7 @@
 #![warn(clippy::undocumented_unsafe_blocks)]
 
 mod bitmap;
+pub mod id;
 mod io;
 #[macro_use]
 pub mod error;
@@ -34,15 +35,14 @@ pub(crate) use component::{DiskPool, IndexPool, MemPool, MetaPool};
 
 pub use catalog::{
     ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexNo, IndexOrder, IndexSpec,
-    TableID, TableSpec,
+    TableSpec,
 };
 pub use conf::{EngineConfig, EvictableBufferPoolConfig, FileSystemConfig, TrxSysConfig};
 pub use engine::{Engine, EngineRef};
 pub use error::{Error, ErrorKind, Result};
 pub use lock::LockMode;
-pub use row::RowID;
 pub use row::ops::{DeleteMvcc, ScanMvcc, SelectKey, SelectMvcc, UpdateCol, UpdateMvcc};
-pub use session::{Session, SessionID};
+pub use session::Session;
 pub use table::{
     CheckpointCancelReason, CheckpointDelayReason, CheckpointOutcome, CheckpointReadiness, Table,
     TablePersistence,

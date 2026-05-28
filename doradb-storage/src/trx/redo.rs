@@ -1,10 +1,7 @@
-use crate::buffer::PageID;
-use crate::catalog::TableID;
 use crate::error::{DataIntegrityError, Error, Result};
-use crate::row::RowID;
+use crate::id::{PageID, RowID, TableID, TrxID};
 use crate::row::ops::{SelectKey, UpdateCol};
 use crate::serde::{Deser, Ser, Serde};
-use crate::trx::TrxID;
 use crate::value::Val;
 use error_stack::Report;
 use std::collections::BTreeMap;
@@ -136,7 +133,7 @@ impl Ser<'_> for RowRedo {
     fn ser<S: Serde + ?Sized>(&self, out: &mut S, start_idx: usize) -> usize {
         let mut idx = start_idx;
         idx = out.ser_u64(idx, self.page_id.into());
-        idx = out.ser_u64(idx, self.row_id);
+        idx = out.ser_u64(idx, self.row_id.as_u64());
         self.kind.ser(out, idx)
     }
 }
@@ -145,7 +142,7 @@ impl Deser for RowRedo {
     #[inline]
     fn deser<S: Serde + ?Sized>(input: &S, start_idx: usize) -> Result<(usize, Self)> {
         let (idx, page_id) = input.deser_u64(start_idx)?;
-        let (idx, row_id) = input.deser_u64(idx)?;
+        let (idx, row_id) = RowID::deser(input, idx)?;
         let (idx, kind) = RowRedoKind::deser(input, idx)?;
         Ok((
             idx,
@@ -256,17 +253,17 @@ impl Ser<'_> for DDLRedo {
         idx = out.ser_u8(idx, self.code() as u8);
         match self {
             DDLRedo::CreateTable(table_id) => {
-                idx = out.ser_u64(idx, *table_id);
+                idx = out.ser_u64(idx, table_id.as_u64());
             }
             DDLRedo::DropTable(table_id) => {
-                idx = out.ser_u64(idx, *table_id);
+                idx = out.ser_u64(idx, table_id.as_u64());
             }
             DDLRedo::CreateIndex { table_id, index_no } => {
-                idx = out.ser_u64(idx, *table_id);
+                idx = out.ser_u64(idx, table_id.as_u64());
                 idx = out.ser_u16(idx, *index_no);
             }
             DDLRedo::DropIndex { table_id, index_no } => {
-                idx = out.ser_u64(idx, *table_id);
+                idx = out.ser_u64(idx, table_id.as_u64());
                 idx = out.ser_u16(idx, *index_no);
             }
             DDLRedo::CreateRowPage {
@@ -275,19 +272,19 @@ impl Ser<'_> for DDLRedo {
                 start_row_id,
                 end_row_id,
             } => {
-                idx = out.ser_u64(idx, *table_id);
+                idx = out.ser_u64(idx, table_id.as_u64());
                 idx = out.ser_u64(idx, (*page_id).into());
-                idx = out.ser_u64(idx, *start_row_id);
-                idx = out.ser_u64(idx, *end_row_id);
+                idx = out.ser_u64(idx, start_row_id.as_u64());
+                idx = out.ser_u64(idx, end_row_id.as_u64());
             }
             DDLRedo::DataCheckpoint {
                 table_id,
                 pivor_row_id,
                 sts,
             } => {
-                idx = out.ser_u64(idx, *table_id);
-                idx = out.ser_u64(idx, *pivor_row_id);
-                idx = out.ser_u64(idx, *sts);
+                idx = out.ser_u64(idx, table_id.as_u64());
+                idx = out.ser_u64(idx, pivor_row_id.as_u64());
+                idx = out.ser_u64(idx, sts.as_u64());
             }
         }
         idx
@@ -306,28 +303,28 @@ impl Deser for DDLRedo {
         })?;
         match code {
             DDLRedoCode::CreateTable => {
-                let (idx, table_id) = input.deser_u64(idx)?;
+                let (idx, table_id) = TableID::deser(input, idx)?;
                 Ok((idx, DDLRedo::CreateTable(table_id)))
             }
             DDLRedoCode::DropTable => {
-                let (idx, table_id) = input.deser_u64(idx)?;
+                let (idx, table_id) = TableID::deser(input, idx)?;
                 Ok((idx, DDLRedo::DropTable(table_id)))
             }
             DDLRedoCode::CreateIndex => {
-                let (idx, table_id) = input.deser_u64(idx)?;
+                let (idx, table_id) = TableID::deser(input, idx)?;
                 let (idx, index_no) = input.deser_u16(idx)?;
                 Ok((idx, DDLRedo::CreateIndex { table_id, index_no }))
             }
             DDLRedoCode::DropIndex => {
-                let (idx, table_id) = input.deser_u64(idx)?;
+                let (idx, table_id) = TableID::deser(input, idx)?;
                 let (idx, index_no) = input.deser_u16(idx)?;
                 Ok((idx, DDLRedo::DropIndex { table_id, index_no }))
             }
             DDLRedoCode::CreateRowPage => {
-                let (idx, table_id) = input.deser_u64(idx)?;
+                let (idx, table_id) = TableID::deser(input, idx)?;
                 let (idx, page_id) = input.deser_u64(idx)?;
-                let (idx, start_row_id) = input.deser_u64(idx)?;
-                let (idx, end_row_id) = input.deser_u64(idx)?;
+                let (idx, start_row_id) = RowID::deser(input, idx)?;
+                let (idx, end_row_id) = RowID::deser(input, idx)?;
                 Ok((
                     idx,
                     DDLRedo::CreateRowPage {
@@ -339,9 +336,9 @@ impl Deser for DDLRedo {
                 ))
             }
             DDLRedoCode::DataCheckpoint => {
-                let (idx, table_id) = input.deser_u64(idx)?;
-                let (idx, pivor_row_id) = input.deser_u64(idx)?;
-                let (idx, sts) = input.deser_u64(idx)?;
+                let (idx, table_id) = TableID::deser(input, idx)?;
+                let (idx, pivor_row_id) = RowID::deser(input, idx)?;
+                let (idx, sts) = TrxID::deser(input, idx)?;
                 Ok((
                     idx,
                     DDLRedo::DataCheckpoint {
@@ -619,26 +616,26 @@ mod tests {
         // Test case 1: Simple insert
         let insert_entry = RowRedo {
             page_id: test_page_id(1),
-            row_id: 100,
+            row_id: RowID::new(100),
             kind: RowRedoKind::Insert(vec![Val::U64(42)]),
         };
-        redo_logs.insert_dml(1, insert_entry);
+        redo_logs.insert_dml(TableID::new(1), insert_entry);
         assert_eq!(redo_logs.dml.len(), 1);
-        let table = redo_logs.dml.get(&1).unwrap();
+        let table = redo_logs.dml.get(&TableID::new(1)).unwrap();
         assert_eq!(table.rows.len(), 1);
 
         // Test case 2: Update after insert
         let update_entry = RowRedo {
             page_id: test_page_id(1),
-            row_id: 100,
+            row_id: RowID::new(100),
             kind: RowRedoKind::Update(vec![UpdateCol {
                 idx: 0,
                 val: Val::U64(43),
             }]),
         };
-        redo_logs.insert_dml(1, update_entry);
-        let table = redo_logs.dml.get(&1).unwrap();
-        if let RowRedoKind::Insert(vals) = &table.rows.get(&100).unwrap().kind {
+        redo_logs.insert_dml(TableID::new(1), update_entry);
+        let table = redo_logs.dml.get(&TableID::new(1)).unwrap();
+        if let RowRedoKind::Insert(vals) = &table.rows.get(&RowID::new(100)).unwrap().kind {
             assert_eq!(vals[0], Val::U64(43));
         } else {
             panic!("Expected Insert kind");
@@ -647,43 +644,43 @@ mod tests {
         // Test case 3: Delete after update
         let delete_entry = RowRedo {
             page_id: test_page_id(1),
-            row_id: 100,
+            row_id: RowID::new(100),
             kind: RowRedoKind::Delete,
         };
-        redo_logs.insert_dml(1, delete_entry);
-        let table = redo_logs.dml.get(&1).unwrap();
+        redo_logs.insert_dml(TableID::new(1), delete_entry);
+        let table = redo_logs.dml.get(&TableID::new(1)).unwrap();
         assert_eq!(table.rows.len(), 0);
 
         // Test case 4: Multiple updates
         let insert_entry = RowRedo {
             page_id: test_page_id(1),
-            row_id: 200,
+            row_id: RowID::new(200),
             kind: RowRedoKind::Insert(vec![Val::U64(1), Val::U64(2)]),
         };
-        redo_logs.insert_dml(1, insert_entry);
+        redo_logs.insert_dml(TableID::new(1), insert_entry);
 
         let update1 = RowRedo {
             page_id: test_page_id(1),
-            row_id: 200,
+            row_id: RowID::new(200),
             kind: RowRedoKind::Update(vec![UpdateCol {
                 idx: 0,
                 val: Val::U64(3),
             }]),
         };
-        redo_logs.insert_dml(1, update1);
+        redo_logs.insert_dml(TableID::new(1), update1);
 
         let update2 = RowRedo {
             page_id: test_page_id(1),
-            row_id: 200,
+            row_id: RowID::new(200),
             kind: RowRedoKind::Update(vec![UpdateCol {
                 idx: 1,
                 val: Val::U64(4),
             }]),
         };
-        redo_logs.insert_dml(1, update2);
+        redo_logs.insert_dml(TableID::new(1), update2);
 
-        let table = redo_logs.dml.get(&1).unwrap();
-        if let RowRedoKind::Insert(vals) = &table.rows.get(&200).unwrap().kind {
+        let table = redo_logs.dml.get(&TableID::new(1)).unwrap();
+        if let RowRedoKind::Insert(vals) = &table.rows.get(&RowID::new(200)).unwrap().kind {
             assert_eq!(vals[0], Val::U64(3));
             assert_eq!(vals[1], Val::U64(4));
         } else {
@@ -693,10 +690,10 @@ mod tests {
         // Test case 5: Multiple tables
         let another_insert = RowRedo {
             page_id: test_page_id(2),
-            row_id: 300,
+            row_id: RowID::new(300),
             kind: RowRedoKind::Insert(vec![Val::U64(50)]),
         };
-        redo_logs.insert_dml(2, another_insert);
+        redo_logs.insert_dml(TableID::new(2), another_insert);
         assert_eq!(redo_logs.dml.len(), 2);
     }
 
@@ -711,39 +708,39 @@ mod tests {
         // 测试用例1：合并不同表的日志
         let insert1 = RowRedo {
             page_id: test_page_id(1),
-            row_id: 100,
+            row_id: RowID::new(100),
             kind: RowRedoKind::Insert(vec![Val::U64(42)]),
         };
-        redo_logs1.insert_dml(1, insert1);
+        redo_logs1.insert_dml(TableID::new(1), insert1);
 
         let insert2 = RowRedo {
             page_id: test_page_id(2),
-            row_id: 200,
+            row_id: RowID::new(200),
             kind: RowRedoKind::Insert(vec![Val::U64(43)]),
         };
-        redo_logs2.insert_dml(2, insert2);
+        redo_logs2.insert_dml(TableID::new(2), insert2);
 
         redo_logs1.merge(redo_logs2);
         assert_eq!(redo_logs1.dml.len(), 2);
-        assert!(redo_logs1.dml.contains_key(&1));
-        assert!(redo_logs1.dml.contains_key(&2));
+        assert!(redo_logs1.dml.contains_key(&TableID::new(1)));
+        assert!(redo_logs1.dml.contains_key(&TableID::new(2)));
 
         // 测试用例2：合并相同表中的不同行
         let mut redo_logs2 = RedoLogs::default();
         let insert3 = RowRedo {
             page_id: test_page_id(1),
-            row_id: 101,
+            row_id: RowID::new(101),
             kind: RowRedoKind::Insert(vec![Val::U64(44)]),
         };
-        redo_logs2.insert_dml(1, insert3);
+        redo_logs2.insert_dml(TableID::new(1), insert3);
 
         redo_logs1.merge(redo_logs2);
-        let table1 = redo_logs1.dml.get(&1).unwrap();
+        let table1 = redo_logs1.dml.get(&TableID::new(1)).unwrap();
         assert_eq!(table1.rows.len(), 2);
-        if let RowRedoKind::Insert(vals) = &table1.rows.get(&100).unwrap().kind {
+        if let RowRedoKind::Insert(vals) = &table1.rows.get(&RowID::new(100)).unwrap().kind {
             assert_eq!(vals[0], Val::U64(42));
         }
-        if let RowRedoKind::Insert(vals) = &table1.rows.get(&101).unwrap().kind {
+        if let RowRedoKind::Insert(vals) = &table1.rows.get(&RowID::new(101)).unwrap().kind {
             assert_eq!(vals[0], Val::U64(44));
         }
 
@@ -751,17 +748,17 @@ mod tests {
         let mut redo_logs2 = RedoLogs::default();
         let update1 = RowRedo {
             page_id: test_page_id(1),
-            row_id: 100,
+            row_id: RowID::new(100),
             kind: RowRedoKind::Update(vec![UpdateCol {
                 idx: 0,
                 val: Val::U64(45),
             }]),
         };
-        redo_logs2.insert_dml(1, update1);
+        redo_logs2.insert_dml(TableID::new(1), update1);
 
         redo_logs1.merge(redo_logs2);
-        let table1 = redo_logs1.dml.get(&1).unwrap();
-        if let RowRedoKind::Insert(vals) = &table1.rows.get(&100).unwrap().kind {
+        let table1 = redo_logs1.dml.get(&TableID::new(1)).unwrap();
+        if let RowRedoKind::Insert(vals) = &table1.rows.get(&RowID::new(100)).unwrap().kind {
             assert_eq!(vals[0], Val::U64(45));
         }
 
@@ -775,14 +772,14 @@ mod tests {
         let mut redo_logs2 = RedoLogs::default();
         let delete1 = RowRedo {
             page_id: test_page_id(1),
-            row_id: 101,
+            row_id: RowID::new(101),
             kind: RowRedoKind::Delete,
         };
-        redo_logs2.insert_dml(1, delete1);
+        redo_logs2.insert_dml(TableID::new(1), delete1);
 
         redo_logs1.merge(redo_logs2);
-        let table1 = redo_logs1.dml.get(&1).unwrap();
-        assert!(!table1.rows.contains_key(&101));
+        let table1 = redo_logs1.dml.get(&TableID::new(1)).unwrap();
+        assert!(!table1.rows.contains_key(&RowID::new(101)));
     }
 
     #[test]
@@ -793,7 +790,7 @@ mod tests {
         // 测试用例1：插入操作
         let insert_entry = RowRedo {
             page_id: test_page_id(1),
-            row_id: 100,
+            row_id: RowID::new(100),
             kind: RowRedoKind::Insert(vec![Val::U64(42)]),
         };
         table_dml.insert(insert_entry);
@@ -801,7 +798,7 @@ mod tests {
         // 测试用例2：更新操作
         let update_entry = RowRedo {
             page_id: test_page_id(1),
-            row_id: 200,
+            row_id: RowID::new(200),
             kind: RowRedoKind::Update(vec![UpdateCol {
                 idx: 0,
                 val: Val::U64(43),
@@ -812,7 +809,7 @@ mod tests {
         // 测试用例3：删除操作
         let delete_entry = RowRedo {
             page_id: test_page_id(1),
-            row_id: 300,
+            row_id: RowID::new(300),
             kind: RowRedoKind::Delete,
         };
         table_dml.insert(delete_entry);
@@ -828,9 +825,9 @@ mod tests {
         assert_eq!(deserialized.rows.len(), 3);
 
         // 验证插入操作
-        let insert_redo = deserialized.rows.get(&100).unwrap();
+        let insert_redo = deserialized.rows.get(&RowID::new(100)).unwrap();
         assert_eq!(insert_redo.page_id, 1);
-        assert_eq!(insert_redo.row_id, 100);
+        assert_eq!(insert_redo.row_id, RowID::new(100));
         match &insert_redo.kind {
             RowRedoKind::Insert(vals) => {
                 assert_eq!(vals.len(), 1);
@@ -840,9 +837,9 @@ mod tests {
         }
 
         // 验证更新操作
-        let update_redo = deserialized.rows.get(&200).unwrap();
+        let update_redo = deserialized.rows.get(&RowID::new(200)).unwrap();
         assert_eq!(update_redo.page_id, 1);
-        assert_eq!(update_redo.row_id, 200);
+        assert_eq!(update_redo.row_id, RowID::new(200));
         match &update_redo.kind {
             RowRedoKind::Update(cols) => {
                 assert_eq!(cols.len(), 1);
@@ -853,9 +850,9 @@ mod tests {
         }
 
         // 验证删除操作
-        let delete_redo = deserialized.rows.get(&300).unwrap();
+        let delete_redo = deserialized.rows.get(&RowID::new(300)).unwrap();
         assert_eq!(delete_redo.page_id, 1);
-        assert_eq!(delete_redo.row_id, 300);
+        assert_eq!(delete_redo.row_id, RowID::new(300));
         match &delete_redo.kind {
             RowRedoKind::Delete => (),
             _ => panic!("Expected Delete kind"),
@@ -881,7 +878,7 @@ mod tests {
     #[test]
     fn test_ddl_redo_serde() {
         // 测试用例1：CreateTable
-        let create_table = DDLRedo::CreateTable(1);
+        let create_table = DDLRedo::CreateTable(TableID::new(1));
         let mut buf = vec![0; create_table.ser_len()];
         create_table.ser(&mut buf[..], 0);
 
@@ -892,13 +889,13 @@ mod tests {
         let (_, deserialized) = DDLRedo::deser(&buf[..], 0).unwrap();
         match deserialized {
             DDLRedo::CreateTable(table_id) => {
-                assert_eq!(table_id, 1);
+                assert_eq!(table_id, TableID::new(1));
             }
             _ => panic!("Expected CreateTable"),
         }
 
         // 测试用例2：DropTable
-        let drop_table = DDLRedo::DropTable(2);
+        let drop_table = DDLRedo::DropTable(TableID::new(2));
         let mut buf = vec![0; drop_table.ser_len()];
         drop_table.ser(&mut buf[..], 0);
 
@@ -909,14 +906,14 @@ mod tests {
         let (_, deserialized) = DDLRedo::deser(&buf[..], 0).unwrap();
         match deserialized {
             DDLRedo::DropTable(table_id) => {
-                assert_eq!(table_id, 2);
+                assert_eq!(table_id, TableID::new(2));
             }
             _ => panic!("Expected DropTable"),
         }
 
         // 测试用例3：CreateIndex
         let create_index = DDLRedo::CreateIndex {
-            table_id: 11,
+            table_id: TableID::new(11),
             index_no: 1,
         };
         let mut buf = vec![0; create_index.ser_len()];
@@ -929,7 +926,7 @@ mod tests {
         let (_, deserialized) = DDLRedo::deser(&buf[..], 0).unwrap();
         match deserialized {
             DDLRedo::CreateIndex { table_id, index_no } => {
-                assert_eq!(table_id, 11);
+                assert_eq!(table_id, TableID::new(11));
                 assert_eq!(index_no, 1);
             }
             _ => panic!("Expected CreateIndex"),
@@ -937,7 +934,7 @@ mod tests {
 
         // 测试用例4：DropIndex
         let drop_index = DDLRedo::DropIndex {
-            table_id: 22,
+            table_id: TableID::new(22),
             index_no: 2,
         };
         let mut buf = vec![0; drop_index.ser_len()];
@@ -950,14 +947,14 @@ mod tests {
         let (_, deserialized) = DDLRedo::deser(&buf[..], 0).unwrap();
         match deserialized {
             DDLRedo::DropIndex { table_id, index_no } => {
-                assert_eq!(table_id, 22);
+                assert_eq!(table_id, TableID::new(22));
                 assert_eq!(index_no, 2);
             }
             _ => panic!("Expected DropIndex"),
         }
 
         // 测试用例5：测试序列化位置偏移
-        let drop_table = DDLRedo::DropTable(5);
+        let drop_table = DDLRedo::DropTable(TableID::new(5));
         let mut buf = vec![0; 4 + drop_table.ser_len()]; // 添加4字节前缀
         drop_table.ser(&mut buf[..], 4); // 从位置4开始序列化
 
@@ -968,16 +965,16 @@ mod tests {
         let (_, deserialized) = DDLRedo::deser(&buf[..], 4).unwrap();
         match deserialized {
             DDLRedo::DropTable(table_id) => {
-                assert_eq!(table_id, 5);
+                assert_eq!(table_id, TableID::new(5));
             }
             _ => panic!("Expected DropTable"),
         }
 
         // 测试用例6：DataCheckpoint
         let data_checkpoint = DDLRedo::DataCheckpoint {
-            table_id: 9,
-            pivor_row_id: 128,
-            sts: 42,
+            table_id: TableID::new(9),
+            pivor_row_id: RowID::new(128),
+            sts: TrxID::new(42),
         };
         let mut buf = vec![0; data_checkpoint.ser_len()];
         data_checkpoint.ser(&mut buf[..], 0);
@@ -990,9 +987,9 @@ mod tests {
                 pivor_row_id,
                 sts,
             } => {
-                assert_eq!(table_id, 9);
-                assert_eq!(pivor_row_id, 128);
-                assert_eq!(sts, 42);
+                assert_eq!(table_id, TableID::new(9));
+                assert_eq!(pivor_row_id, RowID::new(128));
+                assert_eq!(sts, TrxID::new(42));
             }
             _ => panic!("Expected DataCheckpoint"),
         }

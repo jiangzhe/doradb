@@ -1,10 +1,11 @@
 use crate::file::SparseFile;
+use crate::id::TrxID;
 use crate::io::Completion;
 use crate::serde::Ser;
 use crate::session::SessionState;
+use crate::trx::PrecommitTrx;
 use crate::trx::log::{LogWriteSubmission, SyncGroup};
 use crate::trx::log_replay::LogBuf;
-use crate::trx::{PrecommitTrx, TrxID};
 use parking_lot::{Condvar, Mutex, MutexGuard, WaitTimeoutResult};
 use std::collections::VecDeque;
 use std::os::fd::RawFd;
@@ -169,6 +170,7 @@ impl CommitGroup {
 mod tests {
     use super::*;
     use crate::buffer::test_page_id;
+    use crate::id::{RowID, TableID};
     use crate::io::Completion;
     use crate::trx::log_replay::TrxLog;
     use crate::trx::redo::{RedoHeader, RedoLogs, RedoTrxKind, RowRedo, RowRedoKind, TableDML};
@@ -190,15 +192,15 @@ mod tests {
         // 3000-bytes string.
         let s: String = std::iter::repeat_n('a', 3000).collect();
         rows.insert(
-            1u64,
+            RowID::new(1u64),
             RowRedo {
                 page_id: test_page_id(5),
-                row_id: 100,
+                row_id: RowID::new(100),
                 kind: RowRedoKind::Insert(vec![Val::from(1u32), Val::from(&s[..])]),
             },
         );
         let mut dml = BTreeMap::new();
-        dml.insert(5u64, TableDML { rows });
+        dml.insert(TableID::new(5u64), TableDML { rows });
         TrxLog::new(
             RedoHeader {
                 cts,
@@ -270,14 +272,14 @@ mod tests {
     #[test]
     fn test_commit_group_join_without_sync_listener() {
         let mut log_buf = LogBuf::new(64);
-        log_buf.ser(&redo_bin(1));
-        let mut group = log_group(1, log_buf);
+        log_buf.ser(&redo_bin(TrxID::new(1)));
+        let mut group = log_group(TrxID::new(1), log_buf);
 
-        let (session, listener) = group.join(precommit(2), false);
+        let (session, listener) = group.join(precommit(TrxID::new(2)), false);
         assert!(session.is_none());
         assert!(listener.is_none());
         assert_eq!(group.trx_list.len(), 2);
-        assert_eq!(group.max_cts, 2);
+        assert_eq!(group.max_cts, TrxID::new(2));
         for trx in &mut group.trx_list {
             clear_redo(trx);
         }
@@ -286,13 +288,13 @@ mod tests {
     #[test]
     fn test_commit_group_can_join_respects_capacity() {
         let mut log_buf = LogBuf::new(64);
-        log_buf.ser(&redo_bin(100));
-        let mut group = log_group(1, log_buf);
+        log_buf.ser(&redo_bin(TrxID::new(100)));
+        let mut group = log_group(TrxID::new(1), log_buf);
 
-        let candidate1 = precommit_large(2);
+        let candidate1 = precommit_large(TrxID::new(2));
         assert!(group.can_join(&candidate1));
         let _ = group.join(candidate1, false);
-        let mut candidate2 = precommit_large(3);
+        let mut candidate2 = precommit_large(TrxID::new(3));
         assert!(!group.can_join(&candidate2));
         clear_redo(&mut candidate2);
         for trx in &mut group.trx_list {
@@ -302,17 +304,17 @@ mod tests {
 
     #[test]
     fn test_commit_group_no_log_join_rules() {
-        let mut no_log_group = no_log_group(1);
-        assert!(no_log_group.can_join(&precommit_no_log(2)));
-        let mut durability_candidate = precommit(3);
+        let mut no_log_group = no_log_group(TrxID::new(1));
+        assert!(no_log_group.can_join(&precommit_no_log(TrxID::new(2))));
+        let mut durability_candidate = precommit(TrxID::new(3));
         assert!(!no_log_group.can_join(&durability_candidate));
         clear_redo(&mut durability_candidate);
 
-        let (session, listener) = no_log_group.join(precommit_no_log(2), true);
+        let (session, listener) = no_log_group.join(precommit_no_log(TrxID::new(2)), true);
         assert!(session.is_none());
         assert!(listener.is_some());
         assert_eq!(no_log_group.trx_list.len(), 2);
-        assert_eq!(no_log_group.max_cts, 2);
+        assert_eq!(no_log_group.max_cts, TrxID::new(2));
 
         let sync_group = no_log_group.into_sync_group();
         assert_eq!(sync_group.log_bytes, 0);
@@ -323,14 +325,14 @@ mod tests {
     #[test]
     fn test_commit_group_log_group_accepts_no_log_transaction() {
         let mut log_buf = LogBuf::new(64);
-        log_buf.ser(&redo_bin(10));
-        let mut group = log_group(10, log_buf);
+        log_buf.ser(&redo_bin(TrxID::new(10)));
+        let mut group = log_group(TrxID::new(10), log_buf);
 
         assert!(group.require_durability());
-        assert!(group.can_join(&precommit_no_log(11)));
-        let _ = group.join(precommit_no_log(11), false);
+        assert!(group.can_join(&precommit_no_log(TrxID::new(11))));
+        let _ = group.join(precommit_no_log(TrxID::new(11)), false);
         assert_eq!(group.trx_list.len(), 2);
-        assert_eq!(group.max_cts, 11);
+        assert_eq!(group.max_cts, TrxID::new(11));
 
         for trx in &mut group.trx_list {
             clear_redo(trx);

@@ -1,6 +1,5 @@
-use crate::file::BlockID;
+use crate::id::{BlockID, RowID};
 use crate::latch::HybridLatch;
-use crate::row::RowID;
 use std::cell::UnsafeCell;
 
 /// Route returned by `BlockIndexRoot::guide`.
@@ -111,64 +110,73 @@ mod tests {
 
     #[test]
     fn test_root_guide_and_try_column() {
-        let root = BlockIndexRoot::new(1000, test_block_id(77));
-        match root.guide(999) {
+        let root = BlockIndexRoot::new(RowID::new(1000), test_block_id(77));
+        match root.guide(RowID::new(999)) {
             BlockIndexRoute::Column {
                 pivot_row_id,
                 root_block_id,
             } => {
-                assert_eq!(pivot_row_id, 1000);
+                assert_eq!(pivot_row_id, RowID::new(1000));
                 assert_eq!(root_block_id, 77);
             }
             BlockIndexRoute::Row => panic!("unexpected row route"),
         }
-        match root.guide(1000) {
+        match root.guide(RowID::new(1000)) {
             BlockIndexRoute::Row => {}
             BlockIndexRoute::Column { .. } => panic!("unexpected column route"),
         }
-        assert_eq!(root.try_column(10), Some((1000, test_block_id(77))));
-        assert_eq!(root.try_column(1000), None);
+        assert_eq!(
+            root.try_column(RowID::new(10)),
+            Some((RowID::new(1000), test_block_id(77)))
+        );
+        assert_eq!(root.try_column(RowID::new(1000)), None);
     }
 
     #[test]
     fn test_root_update_column_root() {
         smol::block_on(async {
-            let root = BlockIndexRoot::new(1000, test_block_id(77));
-            root.update_column_root(2000, test_block_id(88)).await;
+            let root = BlockIndexRoot::new(RowID::new(1000), test_block_id(77));
+            root.update_column_root(RowID::new(2000), test_block_id(88))
+                .await;
 
-            match root.guide(1999) {
+            match root.guide(RowID::new(1999)) {
                 BlockIndexRoute::Column {
                     pivot_row_id,
                     root_block_id,
                 } => {
-                    assert_eq!(pivot_row_id, 2000);
+                    assert_eq!(pivot_row_id, RowID::new(2000));
                     assert_eq!(root_block_id, 88);
                 }
                 BlockIndexRoute::Row => panic!("unexpected row route"),
             }
-            assert_eq!(root.try_column(10), Some((2000, test_block_id(88))));
-            assert_eq!(root.try_column(2000), None);
+            assert_eq!(
+                root.try_column(RowID::new(10)),
+                Some((RowID::new(2000), test_block_id(88)))
+            );
+            assert_eq!(root.try_column(RowID::new(2000)), None);
         });
     }
 
     #[test]
     fn test_root_concurrent_guide_and_update() {
         smol::block_on(async {
-            let root = Arc::new(BlockIndexRoot::new(1000, test_block_id(77)));
+            let root = Arc::new(BlockIndexRoot::new(RowID::new(1000), test_block_id(77)));
             let reader_root = Arc::clone(&root);
             let writer_root = Arc::clone(&root);
 
             let reader = smol::spawn(async move {
                 for i in 0..20_000u64 {
                     let row_id = i % 2_000;
-                    match reader_root.guide(row_id) {
+                    match reader_root.guide(RowID::new(row_id)) {
                         BlockIndexRoute::Column {
                             pivot_row_id,
                             root_block_id: _,
-                        } => assert!(row_id < pivot_row_id),
+                        } => assert!(row_id < pivot_row_id.as_u64()),
                         BlockIndexRoute::Row => {
-                            if let Some((pivot_row_id, _)) = reader_root.try_column(row_id) {
-                                assert!(row_id < pivot_row_id);
+                            if let Some((pivot_row_id, _)) =
+                                reader_root.try_column(RowID::new(row_id))
+                            {
+                                assert!(row_id < pivot_row_id.as_u64());
                             }
                         }
                     }
@@ -180,10 +188,12 @@ mod tests {
                     let pivot_row_id = 600 + (i % 800);
                     let root_block_id = BlockID::from(80 + i);
                     writer_root
-                        .update_column_root(pivot_row_id, root_block_id)
+                        .update_column_root(RowID::new(pivot_row_id), root_block_id)
                         .await;
-                    let snapshot = writer_root.try_column(pivot_row_id - 1).unwrap();
-                    assert_eq!(snapshot.0, pivot_row_id);
+                    let snapshot = writer_root
+                        .try_column(RowID::new(pivot_row_id - 1))
+                        .unwrap();
+                    assert_eq!(snapshot.0, RowID::new(pivot_row_id));
                     assert_eq!(snapshot.1, root_block_id);
                 }
             });
