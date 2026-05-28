@@ -121,7 +121,7 @@ jobs:
         --lcov
         --output-path lcov.info
         --no-default-ignore-filename-regex
-        --ignore-filename-regex '(^|/)(target|legacy)(/|$)|/\.cargo/(registry|git)/|/rustlib/src/rust/'
+        --ignore-filename-regex '(^|/)target(/|$)|/\.cargo/(registry|git)/|/rustlib/src/rust/'
         -p doradb-storage
     - name: Upload to codecov.io
       uses: codecov/codecov-action@v5
