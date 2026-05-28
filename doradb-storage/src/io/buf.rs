@@ -1,7 +1,13 @@
-use crate::io::{STORAGE_SECTOR_SIZE, align_to_sector_size};
+use crate::io::STORAGE_SECTOR_SIZE;
 use std::alloc::{Layout, alloc_zeroed, dealloc, handle_alloc_error};
 use std::ptr::NonNull;
 use std::slice;
+
+const DIRECT_BUF_MAX_LEN: usize = if usize::BITS < u32::BITS {
+    usize::MAX
+} else {
+    u32::MAX as usize
+};
 
 /// IOBuf represents one aligned direct-I/O buffer shared by the supported
 /// storage backends.
@@ -32,16 +38,39 @@ impl DirectBuf {
     /// Create a new buffer for DirectIO with all data initialized to zero.
     #[inline]
     pub(crate) fn zeroed(len: usize) -> Self {
-        debug_assert!(len <= u32::MAX as usize);
-        let cap = align_to_sector_size(len);
-        let layout = Layout::from_size_align(cap, STORAGE_SECTOR_SIZE)
-            .expect("direct buffer layout should be valid");
-        // SAFETY: `layout` has non-zero size because `align_to_sector_size`
-        // returns at least `STORAGE_SECTOR_SIZE`, and the pointer is stored
-        // with the same layout for `Drop`.
+        let cap = Self::aligned_capacity(len);
+        let layout = match Layout::from_size_align(cap, STORAGE_SECTOR_SIZE) {
+            Ok(layout) => layout,
+            Err(_) => {
+                panic!("direct buffer layout is invalid: cap={cap}, align={STORAGE_SECTOR_SIZE}")
+            }
+        };
+        // SAFETY: `layout` was constructed from a checked non-zero capacity
+        // and the exact layout is stored with the pointer for `Drop`.
         let ptr = unsafe { alloc_zeroed(layout) };
         let ptr = NonNull::new(ptr).unwrap_or_else(|| handle_alloc_error(layout));
         DirectBuf { ptr, len, layout }
+    }
+
+    #[inline]
+    fn aligned_capacity(len: usize) -> usize {
+        assert!(
+            len <= DIRECT_BUF_MAX_LEN,
+            "direct buffer length {len} exceeds maximum {DIRECT_BUF_MAX_LEN}"
+        );
+        let len = len.max(STORAGE_SECTOR_SIZE);
+        let rounded = len
+            .checked_add(STORAGE_SECTOR_SIZE - 1)
+            .unwrap_or_else(|| panic!("direct buffer capacity overflow: len={len}"));
+        let sector_count = rounded / STORAGE_SECTOR_SIZE;
+        let cap = sector_count
+            .checked_mul(STORAGE_SECTOR_SIZE)
+            .unwrap_or_else(|| panic!("direct buffer capacity overflow: len={len}"));
+        assert!(
+            cap != 0 && cap <= isize::MAX as usize,
+            "direct buffer capacity is not a valid allocation size: len={len}, cap={cap}"
+        );
+        cap
     }
 
     #[inline]
@@ -147,6 +176,54 @@ impl IOBuf for DirectBuf {
 mod tests {
     use super::*;
     use crate::io::STORAGE_SECTOR_SIZE;
+
+    #[test]
+    fn test_direct_buf_aligned_capacity_boundaries() {
+        assert_eq!(DirectBuf::aligned_capacity(0), STORAGE_SECTOR_SIZE);
+        assert_eq!(DirectBuf::aligned_capacity(1), STORAGE_SECTOR_SIZE);
+        assert_eq!(
+            DirectBuf::aligned_capacity(STORAGE_SECTOR_SIZE - 1),
+            STORAGE_SECTOR_SIZE
+        );
+        assert_eq!(
+            DirectBuf::aligned_capacity(STORAGE_SECTOR_SIZE),
+            STORAGE_SECTOR_SIZE
+        );
+        assert_eq!(
+            DirectBuf::aligned_capacity(STORAGE_SECTOR_SIZE + 1),
+            STORAGE_SECTOR_SIZE * 2
+        );
+    }
+
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn test_direct_buf_aligned_capacity_accepts_u32_max_len() {
+        assert_eq!(
+            DirectBuf::aligned_capacity(u32::MAX as usize),
+            (u32::MAX as usize) + 1
+        );
+    }
+
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    #[should_panic(expected = "exceeds maximum")]
+    fn test_direct_buf_rejects_len_above_u32_max() {
+        let _buf = DirectBuf::zeroed((u32::MAX as usize) + 1);
+    }
+
+    #[cfg(target_pointer_width = "32")]
+    #[test]
+    #[should_panic(expected = "not a valid allocation size")]
+    fn test_direct_buf_aligned_capacity_rejects_32_bit_layout_overflow() {
+        let _cap = DirectBuf::aligned_capacity((isize::MAX as usize) + 1);
+    }
+
+    #[cfg(target_pointer_width = "32")]
+    #[test]
+    #[should_panic(expected = "capacity overflow")]
+    fn test_direct_buf_aligned_capacity_rejects_32_bit_rounding_overflow() {
+        let _cap = DirectBuf::aligned_capacity(usize::MAX);
+    }
 
     #[test]
     fn test_direct_buf_allocation_alignment() {
