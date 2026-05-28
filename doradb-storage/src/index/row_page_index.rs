@@ -42,6 +42,16 @@ const _: () = assert!(
 );
 
 const _: () = assert!(
+    { mem::offset_of!(RowPageIndexNode, data) == ROW_PAGE_INDEX_NODE_HEADER_SIZE },
+    "RowPageIndexNode data offset should match RowPageIndexNodeHeader size"
+);
+
+const _: () = assert!(
+    { mem::offset_of!(RowPageIndexNode, footer) == ROW_PAGE_INDEX_NODE_USABLE_SIZE },
+    "RowPageIndexNode checksum footer must start after logical usable bytes"
+);
+
+const _: () = assert!(
     {
         ROW_PAGE_INDEX_NODE_HEADER_SIZE + NBR_ENTRIES_IN_BRANCH * ENTRY_SIZE
             <= ROW_PAGE_INDEX_NODE_USABLE_SIZE

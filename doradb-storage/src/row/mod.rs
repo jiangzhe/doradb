@@ -167,7 +167,13 @@ impl RowPage {
         debug_assert!(self.header.fix_field_offset.is_multiple_of(8));
 
         self.init_col_offset_list_and_fix_field_end(col_layout, max_row_count as u16);
-        debug_assert!(self.header.fix_field_end as usize <= ROW_PAGE_DATA_SIZE);
+        assert!(
+            self.header.fix_field_end as usize <= ROW_PAGE_DATA_SIZE,
+            "RowPage fixed-field end overlaps checksum footer: max_row_count={}, fix_field_end={}, row_page_data_size={}",
+            max_row_count,
+            self.header.fix_field_end,
+            ROW_PAGE_DATA_SIZE
+        );
         self.init_bitmaps();
 
         debug_assert!({
