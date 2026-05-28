@@ -1,7 +1,7 @@
 ---
 id: 000160
 title: Evictable Buffer Pool Spill-File Checksums
-status: proposal  # proposal | implemented | superseded
+status: implemented  # proposal | implemented | superseded
 created: 2026-05-27
 github_issue: 662
 ---
@@ -54,7 +54,7 @@ Optional issue metadata for `tools/issue.rs create-issue-from-doc`:
 `- docs/backlogs/000069-unify-page-checksum-and-validation-for-all-buffer-pools.md`
 
 Related prior integrity work:
-- `docs/rfcs/0007-disk-page-integrity-for-cow-storage-files.md`
+- RFC-0007: Disk Page Integrity for CoW Storage Files
 - `docs/tasks/000059-file-integrity-foundation.md`
 - `docs/tasks/000060-checksum-rollout-for-data-pages.md`
 - `docs/tasks/000061-readonly-cache-validation-recovery-hardening-and-corruption-tests.md`
@@ -185,6 +185,41 @@ Reference:
      path established by prior page-integrity work.
 
 ## Implementation Notes
+
+Implemented the evictable spill-file checksum boundary without introducing a
+new all-pool checksum trait. Dirty evictable writeback now stamps the shared
+BLAKE3 block-integrity trailer while the write submission still owns the
+exclusive page guard, and evictable reload now validates the page image before
+publishing the reservation. Checksum mismatches are reported as
+`CompletionErrorKind::DataIntegrity(DataIntegrityError::ChecksumMismatch)`,
+release the in-memory reservation, leave the page evicted, and allow a later
+reload retry.
+
+Reserved checksum-footer bytes in runtime page layouts that can spill through
+the evictable pool. `RowPage` now derives logical capacity from
+`ROW_PAGE_USABLE_SIZE`, keeps variable data before the trailer, and performs an
+unconditional `fix_field_end <= ROW_PAGE_DATA_SIZE` check after
+`init_col_offset_list_and_fix_field_end()` so a bad runtime `max_row_count`
+cannot initialize offsets into the footer. `RowPageIndexNode` now derives entry
+capacity from `ROW_PAGE_INDEX_NODE_USABLE_SIZE` and has compile-time offset
+asserts for both `data` and `footer`, while the existing B-tree footer layout is
+covered by a layout test.
+
+Added focused tests for dirty writeback checksum stamping, checksum-mismatch
+reload rejection before publish with retryability, clean eviction staying
+drop-only, row-page variable data stopping before the footer, and row-page-index
+and B-tree checksum footer layout contracts. Updated `docs/buffer-pool.md` to
+document fixed, evictable, and readonly checksum behavior, and refreshed
+`docs/unsafe-usage-baseline.md`.
+
+Validation completed:
+- `cargo nextest run -p doradb-storage`: 844 passed.
+- `cargo nextest run -p doradb-storage --no-default-features --features libaio`:
+  842 passed.
+- `tools/coverage_focus.rs --path doradb-storage/src/buffer/evict.rs --path doradb-storage/src/row/mod.rs --path doradb-storage/src/index/row_page_index.rs --path doradb-storage/src/index/btree/node.rs --top-uncovered 10`:
+  92.62% focused coverage overall.
+- `cargo clippy -p doradb-storage --all-targets -- -D warnings`: passed.
+- `tools/unsafe_inventory.rs --write docs/unsafe-usage-baseline.md`: refreshed.
 
 ## Impacts
 
