@@ -329,7 +329,7 @@ impl<'a> LogRecovery<'a> {
             .map(|table| table.table_id)
             .collect::<HashSet<_>>();
         self.table_fs.cleanup_checkpoint_absent_user_table_files(
-            snapshot.meta.next_user_obj_id,
+            snapshot.meta.next_table_id,
             &checkpointed_user_table_ids,
         )?;
 

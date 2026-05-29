@@ -24,7 +24,7 @@ pub(crate) struct CatalogStorage {
     pub(super) meta_pool: QuiescentGuard<FixedBufferPool>,
     pub(super) table_fs: QuiescentGuard<FileSystem>,
     tables: Box<[Arc<CatalogTable>]>,
-    next_user_obj_id: TableID,
+    next_table_id: TableID,
     pub(super) mtb: Arc<MultiTableFile>,
     pub(super) disk_pool: QuiescentGuard<ReadonlyBufferPool>,
 }
@@ -70,7 +70,7 @@ impl CatalogStorage {
             meta_pool,
             table_fs,
             tables: cat.into_boxed_slice(),
-            next_user_obj_id: mtb_snapshot.meta.next_user_obj_id,
+            next_table_id: mtb_snapshot.meta.next_table_id,
             mtb,
             disk_pool,
         };
@@ -115,10 +115,10 @@ impl CatalogStorage {
         self.tables.get(table_id.as_usize()).map(Arc::clone)
     }
 
-    /// Return current next user object id persisted in catalog snapshot.
+    /// Return current next table id persisted in catalog snapshot.
     #[inline]
-    pub(crate) fn next_user_obj_id(&self) -> TableID {
-        self.next_user_obj_id
+    pub(crate) fn next_table_id(&self) -> TableID {
+        self.next_table_id
     }
 
     /// Returns current persisted catalog checkpoint snapshot from `catalog.mtb`.

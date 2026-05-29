@@ -122,8 +122,7 @@ impl Tables<'_> {
 mod tests {
     use super::*;
     use crate::buffer::{BufferPool, PoolGuards, PoolRole};
-    use crate::catalog::tests::table1;
-    use crate::conf::{EngineConfig, TrxSysConfig};
+    use crate::catalog::tests::{open_catalog_test_engine, table1};
     use crate::trx::ActiveTrx;
     use crate::trx::redo::DDLRedo;
     use tempfile::TempDir;
@@ -138,12 +137,7 @@ mod tests {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
             let main_dir = temp_dir.path().to_path_buf();
-            let engine = EngineConfig::default()
-                .storage_root(main_dir)
-                .trx(TrxSysConfig::default())
-                .build()
-                .await
-                .unwrap();
+            let engine = open_catalog_test_engine(main_dir, None).await;
             let mut session = engine.new_session().unwrap();
 
             let table100 = TableObject {
@@ -235,12 +229,7 @@ mod tests {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
             let main_dir = temp_dir.path().to_path_buf();
-            let engine = EngineConfig::default()
-                .storage_root(main_dir)
-                .trx(TrxSysConfig::default())
-                .build()
-                .await
-                .unwrap();
+            let engine = open_catalog_test_engine(main_dir, None).await;
 
             let table_id = table1(&engine).await;
             {

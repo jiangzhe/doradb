@@ -93,7 +93,7 @@ impl Deref for CatalogTable {
 
 /// Catalog contains metadata of user tables.
 pub(crate) struct Catalog {
-    next_user_obj_id: AtomicU64,
+    next_table_id: AtomicU64,
     user_tables: DashMap<TableID, Arc<Table>>,
     pub(crate) storage: CatalogStorage,
     checkpoint_gate: CatalogCheckpointGate,
@@ -145,31 +145,31 @@ impl Catalog {
         storage
             .bootstrap_from_checkpoint(&snapshot, &pool_guards)
             .await?;
-        let next_user_obj_id = storage.next_user_obj_id();
+        let next_table_id = storage.next_table_id();
         Ok(Catalog {
-            next_user_obj_id: AtomicU64::new(next_user_obj_id.as_u64()),
+            next_table_id: AtomicU64::new(next_table_id.as_u64()),
             user_tables: DashMap::new(),
             storage,
             checkpoint_gate: CatalogCheckpointGate::new(),
         })
     }
 
-    /// Allocate and return the next user object id.
+    /// Allocate and return the next table id.
     #[inline]
-    pub(crate) fn next_user_obj_id(&self) -> TableID {
-        TableID::new(self.next_user_obj_id.fetch_add(1, Ordering::SeqCst))
+    pub(crate) fn next_table_id(&self) -> TableID {
+        TableID::new(self.next_table_id.fetch_add(1, Ordering::SeqCst))
     }
 
     #[inline]
-    fn try_update_next_user_obj_id(&self, next_user_obj_id: TableID) {
-        self.next_user_obj_id
-            .fetch_max(next_user_obj_id.as_u64(), Ordering::SeqCst);
+    fn try_update_next_table_id(&self, next_table_id: TableID) {
+        self.next_table_id
+            .fetch_max(next_table_id.as_u64(), Ordering::SeqCst);
     }
 
-    /// Return the current next user object id without allocating one.
+    /// Return the current next table id without allocating one.
     #[inline]
-    pub(crate) fn curr_next_user_obj_id(&self) -> TableID {
-        TableID::new(self.next_user_obj_id.load(Ordering::Acquire))
+    pub(crate) fn curr_next_table_id(&self) -> TableID {
+        TableID::new(self.next_table_id.load(Ordering::Acquire))
     }
 
     /// Apply one scanned catalog checkpoint batch into `catalog.mtb`.
@@ -184,7 +184,7 @@ impl Catalog {
     #[inline]
     pub(crate) async fn apply_checkpoint_batch(&self, batch: CatalogCheckpointBatch) -> Result<()> {
         self.storage
-            .apply_checkpoint_batch(batch, self.curr_next_user_obj_id())
+            .apply_checkpoint_batch(batch, self.curr_next_table_id())
             .await
     }
 
@@ -222,8 +222,8 @@ impl Catalog {
             .user_table_metadata_from_catalog(&guards, table_id)
             .await?;
 
-        // Phase 2 allocator semantics: only table ids consume global user object ids.
-        self.try_update_next_user_obj_id(table.table_id.saturating_add(1).max(USER_OBJ_ID_START));
+        // Phase 2 allocator semantics: only table ids consume the global allocator.
+        self.try_update_next_table_id(table.table_id.saturating_add(1).max(USER_OBJ_ID_START));
 
         let table_file = table_fs
             .open_table_file(table.table_id, disk_pool.clone())
@@ -703,6 +703,44 @@ pub(crate) mod tests {
     use std::io::{Read, Seek, SeekFrom, Write};
     use tempfile::TempDir;
 
+    #[inline]
+    pub(crate) fn catalog_test_engine_config(
+        main_dir: impl Into<std::path::PathBuf>,
+        log_file_stem: Option<&str>,
+    ) -> EngineConfig {
+        let mut trx = TrxSysConfig::default();
+        if let Some(log_file_stem) = log_file_stem {
+            trx = trx.log_file_stem(log_file_stem);
+        }
+        EngineConfig::default().storage_root(main_dir).trx(trx)
+    }
+
+    #[inline]
+    pub(crate) async fn open_catalog_test_engine(
+        main_dir: impl Into<std::path::PathBuf>,
+        log_file_stem: Option<&str>,
+    ) -> Engine {
+        catalog_test_engine_config(main_dir, log_file_stem)
+            .build()
+            .await
+            .unwrap()
+    }
+
+    #[inline]
+    pub(crate) async fn expect_catalog_test_engine_error(
+        main_dir: impl Into<std::path::PathBuf>,
+        log_file_stem: Option<&str>,
+        expected_message: &str,
+    ) -> Error {
+        match catalog_test_engine_config(main_dir, log_file_stem)
+            .build()
+            .await
+        {
+            Ok(_) => panic!("{expected_message}"),
+            Err(err) => err,
+        }
+    }
+
     /// Table1 has single i32 column, with unique index of this column.
     #[inline]
     pub(crate) async fn table1(engine: &Engine) -> TableID {
@@ -1002,12 +1040,11 @@ pub(crate) mod tests {
     fn test_user_table_metadata_rejects_orphan_index_columns() {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
-            let engine = EngineConfig::default()
-                .storage_root(temp_dir.path().to_path_buf())
-                .trx(TrxSysConfig::default().log_file_stem("catalog-orphan-index-column"))
-                .build()
-                .await
-                .unwrap();
+            let engine = open_catalog_test_engine(
+                temp_dir.path().to_path_buf(),
+                Some("catalog-orphan-index-column"),
+            )
+            .await;
             let mut session = engine.new_session().unwrap();
             let table_id = session
                 .create_table(
@@ -1083,12 +1120,7 @@ pub(crate) mod tests {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
             let main_dir = temp_dir.path().to_path_buf();
-            let engine = EngineConfig::default()
-                .storage_root(main_dir.clone())
-                .trx(TrxSysConfig::default())
-                .build()
-                .await
-                .unwrap();
+            let engine = open_catalog_test_engine(main_dir.clone(), None).await;
             drop(engine);
 
             let data_dir = temp_dir.path();
@@ -1100,38 +1132,20 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn test_next_user_obj_id_monotonic_across_restart() {
+    fn test_next_table_id_monotonic_across_restart() {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
             let main_dir = temp_dir.path().to_path_buf();
 
-            let engine = EngineConfig::default()
-                .storage_root(main_dir.clone())
-                .trx(TrxSysConfig::default().log_file_stem("catalog-allocator"))
-                .build()
-                .await
-                .unwrap();
-            assert_eq!(engine.catalog().curr_next_user_obj_id(), USER_OBJ_ID_START);
+            let engine =
+                open_catalog_test_engine(main_dir.clone(), Some("catalog-allocator")).await;
+            assert_eq!(engine.catalog().curr_next_table_id(), USER_OBJ_ID_START);
             let mut session = engine.new_session().unwrap();
-            let table_spec = TableSpec {
-                columns: vec![
-                    ColumnSpec {
-                        column_name: SemiStr::new("id"),
-                        column_type: ValKind::I32,
-                        column_attributes: ColumnAttributes::empty(),
-                    },
-                    ColumnSpec {
-                        column_name: SemiStr::new("k1"),
-                        column_type: ValKind::I32,
-                        column_attributes: ColumnAttributes::empty(),
-                    },
-                    ColumnSpec {
-                        column_name: SemiStr::new("k2"),
-                        column_type: ValKind::I32,
-                        column_attributes: ColumnAttributes::empty(),
-                    },
-                ],
-            };
+            let table_spec = TableSpec::new(vec![
+                ColumnSpec::new("id", ValKind::I32, ColumnAttributes::empty()),
+                ColumnSpec::new("k1", ValKind::I32, ColumnAttributes::empty()),
+                ColumnSpec::new("k2", ValKind::I32, ColumnAttributes::empty()),
+            ]);
             let index_specs = vec![
                 IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::PK),
                 IndexSpec::new(
@@ -1140,17 +1154,12 @@ pub(crate) mod tests {
                 ),
             ];
             let table_id1 = session.create_table(table_spec, index_specs).await.unwrap();
-            assert_eq!(engine.catalog().curr_next_user_obj_id(), table_id1 + 1);
+            assert_eq!(engine.catalog().curr_next_table_id(), table_id1 + 1);
             drop(session);
             drop(engine);
 
-            let engine = EngineConfig::default()
-                .storage_root(main_dir)
-                .trx(TrxSysConfig::default().log_file_stem("catalog-allocator"))
-                .build()
-                .await
-                .unwrap();
-            assert_eq!(engine.catalog().curr_next_user_obj_id(), table_id1 + 1);
+            let engine = open_catalog_test_engine(main_dir, Some("catalog-allocator")).await;
+            assert_eq!(engine.catalog().curr_next_table_id(), table_id1 + 1);
             let table_id2 = table1(&engine).await;
             assert!(table_id1 >= USER_OBJ_ID_START);
             assert_eq!(table_id2, table_id1 + 1);
@@ -1165,12 +1174,7 @@ pub(crate) mod tests {
             let main_dir = temp_dir.path().to_path_buf();
             let log_stem = "stable-index-metadata";
 
-            let engine = EngineConfig::default()
-                .storage_root(main_dir.clone())
-                .trx(TrxSysConfig::default().log_file_stem(log_stem))
-                .build()
-                .await
-                .unwrap();
+            let engine = open_catalog_test_engine(main_dir.clone(), Some(log_stem)).await;
             let mut session = engine.new_session().unwrap();
             let table_id = session
                 .create_table(
@@ -1210,12 +1214,7 @@ pub(crate) mod tests {
             drop(session);
             drop(engine);
 
-            let engine = EngineConfig::default()
-                .storage_root(main_dir.clone())
-                .trx(TrxSysConfig::default().log_file_stem(log_stem))
-                .build()
-                .await
-                .unwrap();
+            let engine = open_catalog_test_engine(main_dir.clone(), Some(log_stem)).await;
             let table = engine.catalog().get_table(table_id).await.unwrap();
             assert_eq!(table.metadata().idx.next_index_no(), 2);
             assert_eq!(
@@ -1253,12 +1252,7 @@ pub(crate) mod tests {
                 .unwrap();
             drop(engine);
 
-            let engine = EngineConfig::default()
-                .storage_root(main_dir)
-                .trx(TrxSysConfig::default().log_file_stem(log_stem))
-                .build()
-                .await
-                .unwrap();
+            let engine = open_catalog_test_engine(main_dir, Some(log_stem)).await;
             let table = engine.catalog().get_table(table_id).await.unwrap();
             assert_eq!(table.metadata().idx.next_index_no(), 2);
             assert_eq!(table.metadata().idx.active_index_count(), 2);
@@ -1281,12 +1275,7 @@ pub(crate) mod tests {
             let temp_dir = TempDir::new().unwrap();
             let main_dir = temp_dir.path().to_path_buf();
 
-            let engine = EngineConfig::default()
-                .storage_root(main_dir)
-                .trx(TrxSysConfig::default().log_file_stem("catalog-checkpoint-now"))
-                .build()
-                .await
-                .unwrap();
+            let engine = open_catalog_test_engine(main_dir, Some("catalog-checkpoint-now")).await;
 
             let snap0 = engine.catalog().storage.checkpoint_snapshot().unwrap();
             assert_eq!(snap0.catalog_replay_start_ts, MIN_SNAPSHOT_TS);
@@ -1307,8 +1296,8 @@ pub(crate) mod tests {
             let snap1 = engine.catalog().storage.checkpoint_snapshot().unwrap();
             assert!(snap1.catalog_replay_start_ts > MIN_SNAPSHOT_TS);
             assert_eq!(
-                snap1.meta.next_user_obj_id,
-                engine.catalog().curr_next_user_obj_id()
+                snap1.meta.next_table_id,
+                engine.catalog().curr_next_table_id()
             );
             assert!(
                 snap1
@@ -1342,12 +1331,11 @@ pub(crate) mod tests {
             let temp_dir = TempDir::new().unwrap();
             let main_dir = temp_dir.path().to_path_buf();
 
-            let engine = EngineConfig::default()
-                .storage_root(main_dir.clone())
-                .trx(TrxSysConfig::default().log_file_stem("catalog-checkpoint-corrupt-bootstrap"))
-                .build()
-                .await
-                .unwrap();
+            let engine = open_catalog_test_engine(
+                main_dir.clone(),
+                Some("catalog-checkpoint-corrupt-bootstrap"),
+            )
+            .await;
 
             let _ = table1(&engine).await;
             engine
@@ -1388,15 +1376,12 @@ pub(crate) mod tests {
 
             corrupt_page_checksum(main_dir.join("catalog.mtb"), u64::from(block_id));
 
-            let err = match EngineConfig::default()
-                .storage_root(main_dir)
-                .trx(TrxSysConfig::default().log_file_stem("catalog-checkpoint-corrupt-bootstrap"))
-                .build()
-                .await
-            {
-                Ok(_) => panic!("expected catalog bootstrap corruption failure"),
-                Err(err) => err,
-            };
+            let err = expect_catalog_test_engine_error(
+                main_dir,
+                Some("catalog-checkpoint-corrupt-bootstrap"),
+                "expected catalog bootstrap corruption failure",
+            )
+            .await;
             assert_catalog_data_integrity(err);
         });
     }
@@ -1407,15 +1392,11 @@ pub(crate) mod tests {
             let temp_dir = TempDir::new().unwrap();
             let main_dir = temp_dir.path().to_path_buf();
 
-            let engine = EngineConfig::default()
-                .storage_root(main_dir.clone())
-                .trx(
-                    TrxSysConfig::default()
-                        .log_file_stem("catalog-checkpoint-invalid-delete-metadata"),
-                )
-                .build()
-                .await
-                .unwrap();
+            let engine = open_catalog_test_engine(
+                main_dir.clone(),
+                Some("catalog-checkpoint-invalid-delete-metadata"),
+            )
+            .await;
 
             let _ = table1(&engine).await;
             engine
@@ -1459,18 +1440,12 @@ pub(crate) mod tests {
                 0,
             );
 
-            let err = match EngineConfig::default()
-                .storage_root(main_dir)
-                .trx(
-                    TrxSysConfig::default()
-                        .log_file_stem("catalog-checkpoint-invalid-delete-metadata"),
-                )
-                .build()
-                .await
-            {
-                Ok(_) => panic!("expected catalog bootstrap invalid-metadata failure"),
-                Err(err) => err,
-            };
+            let err = expect_catalog_test_engine_error(
+                main_dir,
+                Some("catalog-checkpoint-invalid-delete-metadata"),
+                "expected catalog bootstrap invalid-metadata failure",
+            )
+            .await;
             assert_catalog_data_integrity(err);
         });
     }
@@ -1481,12 +1456,8 @@ pub(crate) mod tests {
             let temp_dir = TempDir::new().unwrap();
             let main_dir = temp_dir.path().to_path_buf();
 
-            let engine = EngineConfig::default()
-                .storage_root(main_dir)
-                .trx(TrxSysConfig::default().log_file_stem("catalog-checkpoint-heartbeat"))
-                .build()
-                .await
-                .unwrap();
+            let engine =
+                open_catalog_test_engine(main_dir, Some("catalog-checkpoint-heartbeat")).await;
 
             let table_id = table1(&engine).await;
             engine
@@ -1517,7 +1488,7 @@ pub(crate) mod tests {
             let snap2 = engine.catalog().storage.checkpoint_snapshot().unwrap();
             assert!(snap2.catalog_replay_start_ts > snap1.catalog_replay_start_ts);
             assert_eq!(snap2.meta.table_roots, roots_before);
-            assert_eq!(snap2.meta.next_user_obj_id, snap1.meta.next_user_obj_id);
+            assert_eq!(snap2.meta.next_table_id, snap1.meta.next_table_id);
         });
     }
 
@@ -1527,12 +1498,9 @@ pub(crate) mod tests {
             let temp_dir = TempDir::new().unwrap();
             let main_dir = temp_dir.path().to_path_buf();
 
-            let engine = EngineConfig::default()
-                .storage_root(main_dir)
-                .trx(TrxSysConfig::default().log_file_stem("catalog-checkpoint-batch-full-range"))
-                .build()
-                .await
-                .unwrap();
+            let engine =
+                open_catalog_test_engine(main_dir, Some("catalog-checkpoint-batch-full-range"))
+                    .await;
 
             let _ = table1(&engine).await;
             let _ = table2(&engine).await;
@@ -1577,12 +1545,9 @@ pub(crate) mod tests {
             let temp_dir = TempDir::new().unwrap();
             let main_dir = temp_dir.path().to_path_buf();
 
-            let engine = EngineConfig::default()
-                .storage_root(main_dir)
-                .trx(TrxSysConfig::default().log_file_stem("catalog-checkpoint-mixed-user-states"))
-                .build()
-                .await
-                .unwrap();
+            let engine =
+                open_catalog_test_engine(main_dir, Some("catalog-checkpoint-mixed-user-states"))
+                    .await;
 
             let checkpointed_table_id = table1(&engine).await;
             let replay_only_table_id = table2(&engine).await;
@@ -1676,7 +1641,7 @@ pub(crate) mod tests {
             let snap2 = engine.catalog().storage.checkpoint_snapshot().unwrap();
             assert!(snap2.catalog_replay_start_ts > snap1.catalog_replay_start_ts);
             assert_eq!(snap2.meta.table_roots, roots_before);
-            assert_eq!(snap2.meta.next_user_obj_id, snap1.meta.next_user_obj_id);
+            assert_eq!(snap2.meta.next_table_id, snap1.meta.next_table_id);
         });
     }
 }

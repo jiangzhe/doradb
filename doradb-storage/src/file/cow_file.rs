@@ -269,6 +269,23 @@ impl<M> MutableCowRoot<M> {
         Ok(old_allocated.saturating_sub(new_allocated))
     }
 
+    /// Reserve the meta block that will anchor this root publication.
+    ///
+    /// Most callers use [`CowFile::publish_root`], which reserves the meta
+    /// block immediately before serialization. Catalog checkpoint needs the
+    /// final meta block id earlier so it can rebuild the allocation map that is
+    /// serialized into that same meta block.
+    #[inline]
+    pub(crate) fn reserve_publish_meta_block(
+        &mut self,
+        capacity_context: &'static str,
+    ) -> Result<BlockID> {
+        self.root.block_reclamation_until_effective_ts_installed();
+        let meta_block_id = allocate_cow_block(self, capacity_context)?;
+        self.root.meta_block_id = meta_block_id;
+        Ok(meta_block_id)
+    }
+
     /// Allocate one new block for copy-on-write publish.
     ///
     /// Returns `None` when the allocation bitmap cannot provide a new block.
@@ -623,16 +640,28 @@ impl<M> CowFile<M> {
         mut new_root: MutableCowRoot<M>,
         write_barrier: CowWriteBarrier<'_>,
     ) -> Result<Option<OldCowRoot<M>>> {
-        new_root
-            .root
-            .block_reclamation_until_effective_ts_installed();
-        let new_meta_block_id =
-            allocate_cow_block(&mut new_root, "publish root could not allocate meta block")?;
-        new_root.root.meta_block_id = new_meta_block_id;
+        new_root.reserve_publish_meta_block("publish root could not allocate meta block")?;
+        self.publish_prepared_root(background_writes, new_root, write_barrier)
+            .await
+    }
 
+    /// Publish a root whose final meta block has already been reserved.
+    ///
+    /// This is used by catalog checkpoint after rebuilding the allocation map
+    /// from the to-be-published catalog root. The prepared meta block must be
+    /// an unpublished allocation owned by `new_root`.
+    #[inline]
+    pub(crate) async fn publish_prepared_root(
+        &self,
+        background_writes: &IOClient<BackgroundWriteRequest>,
+        new_root: MutableCowRoot<M>,
+        write_barrier: CowWriteBarrier<'_>,
+    ) -> Result<Option<OldCowRoot<M>>> {
+        self.validate_prepared_publish_root(&new_root)?;
+        let meta_block_id = new_root.root.meta_block_id;
         let meta_buf = (self.codec.build_meta_block)(&new_root.root)?;
-        let write_lease = write_barrier.begin_write(self.file.file_id(), new_meta_block_id)?;
-        self.write_block_with_lease(background_writes, new_meta_block_id, meta_buf, write_lease)
+        let write_lease = write_barrier.begin_write(self.file.file_id(), meta_block_id)?;
+        self.write_block_with_lease(background_writes, meta_block_id, meta_buf, write_lease)
             .await?;
 
         let super_buf = (self.codec.build_super_block)(&new_root.root)?;
@@ -642,6 +671,25 @@ impl<M> CowFile<M> {
 
         self.fsync()?;
         Ok(self.swap_active_root(new_root.root))
+    }
+
+    #[inline]
+    fn validate_prepared_publish_root(&self, new_root: &MutableCowRoot<M>) -> Result<()> {
+        let meta_block_id = new_root.root.meta_block_id;
+        let meta_idx = usize::from(meta_block_id);
+        if meta_block_id == SUPER_BLOCK_ID
+            || meta_idx >= new_root.root.alloc_map.len()
+            || !new_root.root.alloc_map.is_allocated(meta_idx)
+            || !new_root.unpublished_blocks.contains(&meta_block_id)
+        {
+            return Err(Report::new(InternalError::CowFileAllocationInvariant)
+                .attach(format!(
+                    "prepared publish meta block is not an unpublished allocation: block_id={meta_block_id}, alloc_map_len={}",
+                    new_root.root.alloc_map.len()
+                ))
+                .into());
+        }
+        Ok(())
     }
 
     /// Force all pending writes to disk.

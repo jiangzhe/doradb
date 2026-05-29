@@ -219,8 +219,8 @@ const NO_ROOT_BLOCK_ID: u64 = 0;
 /// deserialized into catalog root state.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct MultiTableMetaBlockData {
-    /// Global next user object-id allocator watermark.
-    pub(crate) next_user_obj_id: TableID,
+    /// Global next table-id allocator watermark.
+    pub(crate) next_table_id: TableID,
     /// Reserved root descriptors of catalog logical tables.
     pub(crate) table_roots: [CatalogTableRootDesc; CATALOG_TABLE_ROOT_DESC_COUNT],
     /// Page allocation bitmap.
@@ -230,10 +230,10 @@ pub(crate) struct MultiTableMetaBlockData {
 impl Deser for MultiTableMetaBlockData {
     #[inline]
     fn deser<S: Serde + ?Sized>(input: &S, start_idx: usize) -> Result<(usize, Self)> {
-        let (idx, next_user_obj_id) = TableID::deser(input, start_idx)?;
-        if next_user_obj_id < USER_OBJ_ID_START {
+        let (idx, next_table_id) = TableID::deser(input, start_idx)?;
+        if next_table_id < USER_OBJ_ID_START {
             return Err(invalid_payload(format!(
-                "next_user_obj_id {next_user_obj_id} is below user object id start {USER_OBJ_ID_START}"
+                "next_table_id {next_table_id} is below user table id start {USER_OBJ_ID_START}"
             )));
         }
         let (idx, table_count) = input.deser_u32(idx)?;
@@ -271,7 +271,7 @@ impl Deser for MultiTableMetaBlockData {
         Ok((
             idx,
             MultiTableMetaBlockData {
-                next_user_obj_id,
+                next_table_id,
                 table_roots,
                 alloc_map,
             },
@@ -284,8 +284,8 @@ impl Deser for MultiTableMetaBlockData {
 /// The file layer wraps this payload with the shared integrity envelope when a
 /// new catalog root is published.
 pub(crate) struct MultiTableMetaBlockSerView<'a> {
-    /// Global next user object-id allocator watermark.
-    next_user_obj_id: TableID,
+    /// Global next table-id allocator watermark.
+    next_table_id: TableID,
     /// Reserved root descriptors of catalog logical tables.
     table_roots: &'a [CatalogTableRootDesc; CATALOG_TABLE_ROOT_DESC_COUNT],
     /// Page allocation bitmap.
@@ -298,7 +298,7 @@ impl<'a> MultiTableMetaBlockSerView<'a> {
     #[inline]
     pub(crate) fn new(meta: &'a MultiTableMetaBlock, alloc_map: &'a AllocMap) -> Self {
         MultiTableMetaBlockSerView {
-            next_user_obj_id: meta.next_user_obj_id,
+            next_table_id: meta.next_table_id,
             table_roots: &meta.table_roots,
             alloc_map,
         }
@@ -308,7 +308,7 @@ impl<'a> MultiTableMetaBlockSerView<'a> {
 impl<'a> Ser<'a> for MultiTableMetaBlockSerView<'a> {
     #[inline]
     fn ser_len(&self) -> usize {
-        mem::size_of::<u64>() // next_user_obj_id
+        mem::size_of::<u64>() // next_table_id
             + mem::size_of::<u32>() // table_root_count
             + mem::size_of::<u32>() // reserved
             + CATALOG_TABLE_ROOT_DESC_COUNT
@@ -319,7 +319,7 @@ impl<'a> Ser<'a> for MultiTableMetaBlockSerView<'a> {
     #[inline]
     fn ser<S: Serde + ?Sized>(&self, out: &mut S, start_idx: usize) -> usize {
         let mut idx = start_idx;
-        idx = out.ser_u64(idx, self.next_user_obj_id.as_u64());
+        idx = out.ser_u64(idx, self.next_table_id.as_u64());
         idx = out.ser_u32(idx, CATALOG_TABLE_ROOT_DESC_COUNT as u32);
         idx = out.ser_u32(idx, 0); // reserved
         for root in self.table_roots {
@@ -636,7 +636,7 @@ mod tests {
         assert_eq!(res_idx, ser_len);
 
         let (_, decoded) = MultiTableMetaBlockData::deser(&data[..], 0).unwrap();
-        assert_eq!(decoded.next_user_obj_id, meta.next_user_obj_id);
+        assert_eq!(decoded.next_table_id, meta.next_table_id);
         assert_eq!(decoded.table_roots[0].table_id, TableID::new(0));
         assert_eq!(decoded.table_roots[0].root_block_id, None);
         assert_eq!(decoded.table_roots[0].pivot_row_id, RowID::new(0));
