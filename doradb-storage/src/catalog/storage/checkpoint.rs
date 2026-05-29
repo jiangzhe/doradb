@@ -7,8 +7,8 @@ use crate::catalog::{CatalogCheckpointBatch, CatalogRedoEntry};
 use crate::error::{DataIntegrityError, Error, FileKind, Result};
 use crate::file::cow_file::{MutableCowFile, SUPER_BLOCK_ID};
 use crate::file::multi_table_file::{
-    CATALOG_TABLE_ROOT_DESC_COUNT, CatalogTableRootDesc, MultiTableFileSnapshot,
-    MutableMultiTableFile,
+    CATALOG_TABLE_ROOT_DESC_COUNT, CatalogTableRootDesc, MultiTableActiveRoot,
+    MultiTableFileSnapshot, MutableMultiTableFile,
 };
 use crate::id::{BlockID, RowID, TableID, TrxID};
 use crate::index::{
@@ -45,6 +45,51 @@ fn invalid_lwc_payload(
             "file={file_kind}, block=lwc-block, block_id={block_id}, {message}"
         ))
         .into()
+}
+
+#[inline]
+fn invalid_catalog_root_invariant(root_ts: TrxID, message: impl Into<String>) -> Error {
+    Report::new(DataIntegrityError::InvalidRootInvariant)
+        .attach(format!(
+            "file={}, root_ts={root_ts}, {}",
+            FileKind::CatalogMultiTableFile,
+            message.into()
+        ))
+        .into()
+}
+
+#[inline]
+fn invalid_catalog_reachable_block(
+    root_ts: TrxID,
+    block_id: BlockID,
+    message: impl Into<String>,
+) -> Error {
+    Report::new(DataIntegrityError::InvalidRootInvariant)
+        .attach(format!(
+            "file={}, root_ts={root_ts}, block_id={block_id}, {}",
+            FileKind::CatalogMultiTableFile,
+            message.into()
+        ))
+        .into()
+}
+
+fn validate_catalog_reachable_block(root: &MultiTableActiveRoot, block_id: BlockID) -> Result<()> {
+    let idx = usize::from(block_id);
+    if idx >= root.alloc_map.len() {
+        return Err(invalid_catalog_reachable_block(
+            root.root_ts,
+            block_id,
+            format!("alloc_map_len={}", root.alloc_map.len()),
+        ));
+    }
+    if !root.alloc_map.is_allocated(idx) {
+        return Err(invalid_catalog_reachable_block(
+            root.root_ts,
+            block_id,
+            "allocation bit is not set",
+        ));
+    }
+    Ok(())
 }
 
 struct PendingLwcBlock {
@@ -110,7 +155,7 @@ impl CatalogStorage {
     pub(crate) async fn apply_checkpoint_batch(
         &self,
         batch: CatalogCheckpointBatch,
-        next_user_obj_id: TableID,
+        next_table_id: TableID,
     ) -> Result<()> {
         let CatalogCheckpointBatch {
             replay_start_ts,
@@ -134,59 +179,118 @@ impl CatalogStorage {
         }
         let background_writes = self.table_fs.background_writes();
 
-        if catalog_ops.is_empty() {
-            let mut mutable = MutableMultiTableFile::fork(&self.mtb, background_writes);
-            mutable.apply_checkpoint_metadata(
-                next_catalog_replay_start_ts,
-                next_user_obj_id.max(USER_OBJ_ID_START),
-                snapshot.meta.table_roots,
-            )?;
-            let (_, old_root) = mutable.commit().await?;
-            drop(old_root);
-            return Ok(());
-        }
-
-        let mut ops_by_table: Vec<Vec<RowRedoKind>> =
-            (0..self.tables.len()).map(|_| Vec::new()).collect();
-        for CatalogRedoEntry { table_id, kind } in catalog_ops {
-            let table_idx = table_id.as_usize();
-            if table_idx >= ops_by_table.len() {
-                continue;
-            }
-            ops_by_table[table_idx].push(kind);
-        }
-
         let mut mutable = MutableMultiTableFile::fork(&self.mtb, background_writes);
         let mut new_roots = snapshot.meta.table_roots;
-        for (idx, table) in self.tables.iter().enumerate() {
-            if idx >= CATALOG_TABLE_ROOT_DESC_COUNT {
-                break;
+        let mut catalog_blocks_changed = false;
+        if !catalog_ops.is_empty() {
+            let mut ops_by_table: Vec<Vec<RowRedoKind>> =
+                (0..self.tables.len()).map(|_| Vec::new()).collect();
+            for CatalogRedoEntry { table_id, kind } in catalog_ops {
+                let table_idx = table_id.as_usize();
+                if table_idx >= ops_by_table.len() {
+                    continue;
+                }
+                ops_by_table[table_idx].push(kind);
             }
-            if ops_by_table[idx].is_empty() {
-                continue;
+
+            for (idx, table) in self.tables.iter().enumerate() {
+                if idx >= CATALOG_TABLE_ROOT_DESC_COUNT {
+                    break;
+                }
+                if ops_by_table[idx].is_empty() {
+                    continue;
+                }
+                let current_root = new_roots[idx];
+                let (new_root, table_blocks_changed) = self
+                    .apply_table_ops(
+                        &mut mutable,
+                        TableID::from(idx),
+                        table.metadata(),
+                        current_root,
+                        &ops_by_table[idx],
+                        safe_cts,
+                    )
+                    .await?;
+                new_roots[idx] = new_root;
+                catalog_blocks_changed |= table_blocks_changed;
             }
-            let current_root = new_roots[idx];
-            let new_root = self
-                .apply_table_ops(
-                    &mut mutable,
-                    TableID::from(idx),
-                    table.metadata(),
-                    current_root,
-                    &ops_by_table[idx],
-                    safe_cts,
-                )
-                .await?;
-            new_roots[idx] = new_root;
         }
 
         mutable.apply_checkpoint_metadata(
             next_catalog_replay_start_ts,
-            next_user_obj_id.max(USER_OBJ_ID_START),
+            next_table_id.max(USER_OBJ_ID_START),
             new_roots,
         )?;
-        let (_, old_root) = mutable.commit().await?;
+        if catalog_blocks_changed {
+            self.rebuild_catalog_alloc_map(&mut mutable).await?;
+        } else {
+            mutable.reserve_publish_meta_block_reclaiming_displaced_meta(snapshot.meta_block_id)?;
+        }
+        let (_, old_root) = mutable.commit_prepared().await?;
         drop(old_root);
         Ok(())
+    }
+
+    async fn rebuild_catalog_alloc_map(
+        &self,
+        mutable: &mut MutableMultiTableFile,
+    ) -> Result<usize> {
+        mutable.reserve_publish_meta_block()?;
+        let reachable = self
+            .collect_catalog_reachable_blocks(mutable.root())
+            .await?;
+        mutable.rebuild_alloc_map_from_reachable(&reachable)
+    }
+
+    async fn collect_catalog_reachable_blocks(
+        &self,
+        root: &MultiTableActiveRoot,
+    ) -> Result<BTreeSet<BlockID>> {
+        let mut reachable = BTreeSet::new();
+        reachable.insert(SUPER_BLOCK_ID);
+        reachable.insert(root.meta_block_id);
+
+        let disk_pool_guard = self.disk_pool.pool_guard();
+        for (idx, table_root) in root.table_roots.iter().enumerate() {
+            if table_root.table_id.as_usize() != idx {
+                return Err(invalid_catalog_root_invariant(
+                    root.root_ts,
+                    format!(
+                        "catalog table root table-id mismatch: table_id={}, slot_idx={idx}",
+                        table_root.table_id
+                    ),
+                ));
+            }
+            let Some(root_block_id) = table_root.checkpoint_root_block_id() else {
+                if table_root.pivot_row_id != RowID::new(0) {
+                    return Err(invalid_catalog_root_invariant(
+                        root.root_ts,
+                        format!(
+                            "empty catalog root has nonzero pivot_row_id={}",
+                            table_root.pivot_row_id
+                        ),
+                    ));
+                }
+                continue;
+            };
+            validate_catalog_reachable_block(root, root_block_id)?;
+            let column_index = ColumnBlockIndex::new(
+                root_block_id,
+                table_root.pivot_row_id,
+                self.mtb.file_kind(),
+                self.mtb.sparse_file(),
+                &self.disk_pool,
+                &disk_pool_guard,
+            );
+            column_index
+                .collect_reachable_blocks(&mut reachable)
+                .await?;
+        }
+
+        for block_id in reachable.iter().copied() {
+            validate_catalog_reachable_block(root, block_id)?;
+        }
+        Ok(reachable)
     }
 
     async fn apply_table_ops(
@@ -197,7 +301,7 @@ impl CatalogStorage {
         root: CatalogTableRootDesc,
         table_ops: &[RowRedoKind],
         checkpoint_cts: TrxID,
-    ) -> Result<CatalogTableRootDesc> {
+    ) -> Result<(CatalogTableRootDesc, bool)> {
         let disk_pool_guard = self.disk_pool.pool_guard();
         // Step 1: Validate root invariants and construct a base index snapshot for reads.
         if root.root_block_id.is_none() && root.pivot_row_id != RowID::new(0) {
@@ -302,7 +406,7 @@ impl CatalogStorage {
         // Step 4: Build the live-insert batch after canceling same-batch insert+delete rows.
         let mut current_root_block_id = root_block_id.unwrap_or(SUPER_BLOCK_ID);
         let mut current_end_row_id = root.pivot_row_id;
-        let mut entries_changed = false;
+        let mut blocks_changed = false;
         let mut live_inserts = Vec::new();
         for row in pending_rows {
             if !row.deleted {
@@ -362,7 +466,7 @@ impl CatalogStorage {
                 current_root_block_id = column_index
                     .batch_replace_entries(mutable, &patches, checkpoint_cts)
                     .await?;
-                entries_changed = true;
+                blocks_changed = true;
                 live_inserts.drain(0..consumed);
                 if live_inserts.is_empty() {
                     current_end_row_id = next_row_id.max(root.pivot_row_id);
@@ -395,7 +499,7 @@ impl CatalogStorage {
                     .batch_insert(mutable, &new_entries, new_end_row_id, checkpoint_cts)
                     .await?;
                 current_end_row_id = new_end_row_id;
-                entries_changed = true;
+                blocks_changed = true;
             }
         }
 
@@ -443,7 +547,7 @@ impl CatalogStorage {
             current_root_block_id = column_index
                 .batch_replace_delete_deltas(mutable, &patches, checkpoint_cts)
                 .await?;
-            entries_changed = true;
+            blocks_changed = true;
         }
 
         // Step 9: Publish final per-table root descriptor for this checkpoint batch.
@@ -454,7 +558,7 @@ impl CatalogStorage {
             // descriptor empty instead of emitting `None` with a nonzero pivot.
             (root.root_block_id, root.pivot_row_id)
         } else {
-            let root_block_id = if entries_changed || next_pivot_row_id > root.pivot_row_id {
+            let root_block_id = if blocks_changed || next_pivot_row_id > root.pivot_row_id {
                 Some(
                     NonZeroU64::new(current_root_block_id.into()).ok_or_else(|| {
                         invalid_catalog_payload("catalog root block id resolved to zero")
@@ -465,11 +569,14 @@ impl CatalogStorage {
             };
             (root_block_id, next_pivot_row_id)
         };
-        Ok(CatalogTableRootDesc {
-            table_id,
-            root_block_id,
-            pivot_row_id,
-        })
+        Ok((
+            CatalogTableRootDesc {
+                table_id,
+                root_block_id,
+                pivot_row_id,
+            },
+            blocks_changed,
+        ))
     }
 
     async fn collect_index_entries(
@@ -827,7 +934,9 @@ mod tests {
     use super::*;
     use crate::catalog::USER_OBJ_ID_START;
     use crate::catalog::tests::{table1, table2};
+    use crate::catalog::{CatalogCheckpointBatch, CatalogCheckpointScanStopReason};
     use crate::conf::{EngineConfig, TrxSysConfig};
+    use crate::error::DataIntegrityError;
     use crate::file::BlockKey;
     use crate::file::multi_table_file::{CATALOG_MTB_FILE_ID, MutableMultiTableFile};
     use crate::id::BlockID;
@@ -836,6 +945,252 @@ mod tests {
     use crate::trx::redo::RowRedoKind;
     use crate::value::Val;
     use tempfile::TempDir;
+
+    fn metadata_only_batch(replay_start_ts: TrxID) -> CatalogCheckpointBatch {
+        CatalogCheckpointBatch {
+            replay_start_ts,
+            durable_upper_cts: replay_start_ts,
+            safe_cts: replay_start_ts,
+            catalog_ops: Vec::new(),
+            catalog_ddl_txn_count: 0,
+            stop_reason: CatalogCheckpointScanStopReason::ReachedDurableUpper,
+        }
+    }
+
+    async fn apply_metadata_only_checkpoint(
+        storage: &CatalogStorage,
+        next_table_id: TableID,
+    ) -> Result<()> {
+        let replay_start_ts = storage
+            .checkpoint_snapshot()
+            .unwrap()
+            .catalog_replay_start_ts;
+        storage
+            .apply_checkpoint_batch(metadata_only_batch(replay_start_ts), next_table_id)
+            .await
+    }
+
+    #[test]
+    fn test_catalog_metadata_only_checkpoint_reclaims_displaced_meta_block() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let main_dir = temp_dir.path().to_path_buf();
+            let engine = EngineConfig::default()
+                .storage_root(main_dir.clone())
+                .trx(TrxSysConfig::default().log_file_stem("catalog-meta-reclaim"))
+                .build()
+                .await
+                .unwrap();
+
+            let storage = &engine.catalog().storage;
+            let before_root = storage.mtb.active_root_unchecked();
+            let old_meta_block_id = before_root.meta_block_id;
+            let before_allocated = before_root.alloc_map.allocated();
+
+            apply_metadata_only_checkpoint(storage, engine.catalog().curr_next_table_id())
+                .await
+                .unwrap();
+
+            let after_root = storage.mtb.active_root_unchecked();
+            assert_ne!(after_root.meta_block_id, old_meta_block_id);
+            assert!(
+                after_root
+                    .alloc_map
+                    .is_allocated(usize::from(SUPER_BLOCK_ID))
+            );
+            assert!(
+                after_root
+                    .alloc_map
+                    .is_allocated(usize::from(after_root.meta_block_id))
+            );
+            assert!(
+                !after_root
+                    .alloc_map
+                    .is_allocated(usize::from(old_meta_block_id))
+            );
+            assert_eq!(after_root.alloc_map.allocated(), before_allocated);
+            let expected_replay_start_ts = after_root.root_ts;
+            drop(engine);
+
+            let engine = EngineConfig::default()
+                .storage_root(main_dir)
+                .trx(TrxSysConfig::default().log_file_stem("catalog-meta-reclaim"))
+                .build()
+                .await
+                .unwrap();
+            let snap = engine.catalog().storage.checkpoint_snapshot().unwrap();
+            assert_eq!(snap.catalog_replay_start_ts, expected_replay_start_ts);
+            assert_eq!(snap.meta.next_table_id, USER_OBJ_ID_START);
+        });
+    }
+
+    #[test]
+    fn test_catalog_metadata_only_checkpoint_skips_reachability_reads() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let main_dir = temp_dir.path().to_path_buf();
+            let engine = EngineConfig::default()
+                .storage_root(main_dir)
+                .trx(TrxSysConfig::default().log_file_stem("catalog-meta-fast-path"))
+                .build()
+                .await
+                .unwrap();
+
+            let _ = table1(&engine).await;
+            engine
+                .catalog()
+                .checkpoint_now(&engine.trx_sys)
+                .await
+                .unwrap();
+
+            let storage = &engine.catalog().storage;
+            let snap = storage.checkpoint_snapshot().unwrap();
+            let disk_pool_guard = storage.disk_pool.pool_guard();
+            let mut catalog_index_blocks = BTreeSet::new();
+            for root in snap.meta.table_roots {
+                let Some(root_block_id) = root.checkpoint_root_block_id() else {
+                    continue;
+                };
+                catalog_index_blocks.insert(root_block_id);
+                let entries = storage
+                    .collect_index_entries(&disk_pool_guard, root_block_id)
+                    .await
+                    .unwrap();
+                for entry in entries {
+                    catalog_index_blocks.insert(entry.leaf_block_id);
+                }
+            }
+            assert!(!catalog_index_blocks.is_empty());
+            for block_id in &catalog_index_blocks {
+                let _ = engine
+                    .disk_pool
+                    .invalidate_block(CATALOG_MTB_FILE_ID, *block_id);
+                let key = BlockKey::new(CATALOG_MTB_FILE_ID, *block_id);
+                assert!(engine.disk_pool.try_get_frame_id(&key).is_none());
+            }
+            let cached_before = engine.disk_pool.allocated();
+
+            apply_metadata_only_checkpoint(storage, engine.catalog().curr_next_table_id())
+                .await
+                .unwrap();
+
+            assert_eq!(engine.disk_pool.allocated(), cached_before);
+            for block_id in catalog_index_blocks {
+                let key = BlockKey::new(CATALOG_MTB_FILE_ID, block_id);
+                assert!(engine.disk_pool.try_get_frame_id(&key).is_none());
+            }
+        });
+    }
+
+    #[test]
+    fn test_catalog_checkpoint_canceled_ops_use_meta_only_reclamation() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let main_dir = temp_dir.path().to_path_buf();
+            let engine = EngineConfig::default()
+                .storage_root(main_dir)
+                .trx(TrxSysConfig::default().log_file_stem("catalog-canceled-fast-path"))
+                .build()
+                .await
+                .unwrap();
+
+            let storage = &engine.catalog().storage;
+            let before_root = storage.mtb.active_root_unchecked();
+            let old_meta_block_id = before_root.meta_block_id;
+            let before_allocated = before_root.alloc_map.allocated();
+            let replay_start_ts = storage
+                .checkpoint_snapshot()
+                .unwrap()
+                .catalog_replay_start_ts;
+            let table_id = USER_OBJ_ID_START + 4242;
+            let batch = CatalogCheckpointBatch {
+                replay_start_ts,
+                durable_upper_cts: replay_start_ts,
+                safe_cts: replay_start_ts,
+                catalog_ops: vec![
+                    CatalogRedoEntry {
+                        table_id: TableID::new(0),
+                        kind: RowRedoKind::Insert(vec![Val::from(table_id), Val::from(0u16)]),
+                    },
+                    CatalogRedoEntry {
+                        table_id: TableID::new(0),
+                        kind: RowRedoKind::DeleteByUniqueKey(SelectKey::new(
+                            0,
+                            vec![Val::from(table_id)],
+                        )),
+                    },
+                ],
+                catalog_ddl_txn_count: 0,
+                stop_reason: CatalogCheckpointScanStopReason::ReachedDurableUpper,
+            };
+
+            storage
+                .apply_checkpoint_batch(batch, engine.catalog().curr_next_table_id())
+                .await
+                .unwrap();
+
+            let after_root = storage.mtb.active_root_unchecked();
+            assert_ne!(after_root.meta_block_id, old_meta_block_id);
+            assert!(
+                !after_root
+                    .alloc_map
+                    .is_allocated(usize::from(old_meta_block_id))
+            );
+            assert_eq!(after_root.alloc_map.allocated(), before_allocated);
+            assert_eq!(after_root.table_roots[0].root_block_id, None);
+            assert_eq!(after_root.table_roots[0].pivot_row_id, RowID::new(0));
+        });
+    }
+
+    #[test]
+    fn test_catalog_reclamation_rejects_unallocated_root_descriptor_before_publish() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let main_dir = temp_dir.path().to_path_buf();
+            let engine = EngineConfig::default()
+                .storage_root(main_dir)
+                .trx(TrxSysConfig::default().log_file_stem("catalog-reclaim-invalid-root"))
+                .build()
+                .await
+                .unwrap();
+
+            let storage = &engine.catalog().storage;
+            let active_before = storage.mtb.active_root_unchecked();
+            let active_meta_before = active_before.meta_block_id;
+            let active_root_ts_before = active_before.root_ts;
+            let bogus_root_block_id = (1..active_before.alloc_map.len())
+                .rev()
+                .map(BlockID::from)
+                .find(|block_id| !active_before.alloc_map.is_allocated(usize::from(*block_id)))
+                .unwrap();
+
+            let mut roots = storage.checkpoint_snapshot().unwrap().meta.table_roots;
+            roots[0].root_block_id = NonZeroU64::new(u64::from(bogus_root_block_id));
+            roots[0].pivot_row_id = RowID::new(1);
+
+            let mut mutable =
+                MutableMultiTableFile::fork(&storage.mtb, storage.table_fs.background_writes());
+            mutable
+                .apply_checkpoint_metadata(
+                    active_root_ts_before.saturating_add(1),
+                    engine.catalog().curr_next_table_id(),
+                    roots,
+                )
+                .unwrap();
+            let err = storage
+                .rebuild_catalog_alloc_map(&mut mutable)
+                .await
+                .unwrap_err();
+
+            assert_eq!(
+                err.data_integrity_error(),
+                Some(DataIntegrityError::InvalidRootInvariant)
+            );
+            let active_after = storage.mtb.active_root_unchecked();
+            assert_eq!(active_after.meta_block_id, active_meta_before);
+            assert_eq!(active_after.root_ts, active_root_ts_before);
+        });
+    }
 
     #[test]
     fn test_catalog_checkpoint_apply_table_ops_keeps_empty_root_for_canceled_insert_batch() {
@@ -866,7 +1221,7 @@ mod tests {
             let mut mutable =
                 MutableMultiTableFile::fork(&storage.mtb, storage.table_fs.background_writes());
 
-            let next_root = storage
+            let (next_root, blocks_changed) = storage
                 .apply_table_ops(
                     &mut mutable,
                     TableID::new(0),
@@ -880,6 +1235,7 @@ mod tests {
 
             assert_eq!(next_root.root_block_id, None);
             assert_eq!(next_root.pivot_row_id, RowID::new(0));
+            assert!(!blocks_changed);
         });
     }
 
@@ -918,7 +1274,7 @@ mod tests {
             let mut mutable =
                 MutableMultiTableFile::fork(&storage.mtb, storage.table_fs.background_writes());
 
-            let next_root = storage
+            let (next_root, blocks_changed) = storage
                 .apply_table_ops(
                     &mut mutable,
                     TableID::new(0),
@@ -932,6 +1288,7 @@ mod tests {
 
             assert_eq!(next_root.root_block_id, root.root_block_id);
             assert_eq!(next_root.pivot_row_id, root.pivot_row_id + 1);
+            assert!(!blocks_changed);
         });
     }
 
@@ -959,7 +1316,7 @@ mod tests {
             let root_block_id = BlockID::from(tables_root.root_block_id.unwrap().get());
             let disk_pool_guard = engine.catalog().storage.disk_pool.pool_guard();
 
-            assert_eq!(engine.disk_pool.allocated(), 0);
+            let cached_before_first = engine.disk_pool.allocated();
 
             let entries1 = engine
                 .catalog()
@@ -970,7 +1327,7 @@ mod tests {
             assert!(!entries1.is_empty());
 
             let cached_after_first = engine.disk_pool.allocated();
-            assert!(cached_after_first >= 1);
+            assert!(cached_after_first >= cached_before_first);
             let root_key = BlockKey::new(CATALOG_MTB_FILE_ID, root_block_id);
             assert!(engine.disk_pool.try_get_frame_id(&root_key).is_some());
 
@@ -1067,6 +1424,29 @@ mod tests {
             assert_eq!(last2.start_row_id, last1.start_row_id);
             assert_ne!(last2.block_id(), last1.block_id());
             assert_eq!(last2.delete_domain(), ColumnDeleteDomain::Ordinal);
+            let active_root = engine.catalog().storage.mtb.active_root_unchecked();
+            let root_block_id1 = BlockID::from(tables_root1.root_block_id.unwrap().get());
+            let root_block_id2 = BlockID::from(tables_root2.root_block_id.unwrap().get());
+            assert!(
+                !active_root
+                    .alloc_map
+                    .is_allocated(usize::from(root_block_id1))
+            );
+            assert!(
+                !active_root
+                    .alloc_map
+                    .is_allocated(usize::from(last1.block_id()))
+            );
+            assert!(
+                active_root
+                    .alloc_map
+                    .is_allocated(usize::from(root_block_id2))
+            );
+            assert!(
+                active_root
+                    .alloc_map
+                    .is_allocated(usize::from(last2.block_id()))
+            );
             let deletes2: BTreeSet<_> = index2
                 .load_delete_deltas(&last2)
                 .await

@@ -29,6 +29,7 @@ use crate::quiescent::QuiescentGuard;
 use crate::serde::{Deser, Ser};
 use crate::trx::MIN_SNAPSHOT_TS;
 use error_stack::{Report, ResultExt};
+use std::collections::BTreeSet;
 use std::io::ErrorKind as IoErrorKind;
 use std::num::NonZeroU64;
 use std::sync::Arc;
@@ -90,8 +91,8 @@ impl CatalogTableRootDesc {
 /// the shared active root, not in this payload struct.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct MultiTableMetaBlock {
-    /// Global next user object-id allocator watermark.
-    pub(crate) next_user_obj_id: TableID,
+    /// Global next table-id allocator watermark.
+    pub(crate) next_table_id: TableID,
     /// Reserved root descriptors for catalog logical tables.
     pub(crate) table_roots: [CatalogTableRootDesc; CATALOG_TABLE_ROOT_DESC_COUNT],
 }
@@ -99,13 +100,13 @@ pub(crate) struct MultiTableMetaBlock {
 impl MultiTableMetaBlock {
     /// Create a meta payload initialized with allocator lower bound.
     #[inline]
-    pub(crate) fn new(next_user_obj_id: TableID) -> Self {
+    pub(crate) fn new(next_table_id: TableID) -> Self {
         let mut table_roots = [CatalogTableRootDesc::default(); CATALOG_TABLE_ROOT_DESC_COUNT];
         for (idx, root) in table_roots.iter_mut().enumerate() {
             root.table_id = TableID::from(idx);
         }
         MultiTableMetaBlock {
-            next_user_obj_id: next_user_obj_id.max(USER_OBJ_ID_START),
+            next_table_id: next_table_id.max(USER_OBJ_ID_START),
             table_roots,
         }
     }
@@ -153,6 +154,8 @@ impl Default for MultiTableActiveRoot {
 pub(crate) struct MultiTableFileSnapshot {
     /// Inclusive lower replay bound for catalog redo persisted in `catalog.mtb`.
     pub(crate) catalog_replay_start_ts: TrxID,
+    /// Active meta block id referenced by the loaded catalog root.
+    pub(crate) meta_block_id: BlockID,
     /// Active meta-block payload.
     pub(crate) meta: MultiTableMetaBlock,
 }
@@ -199,7 +202,7 @@ fn parse_multi_table_meta_block(
 
     Ok(ParsedMeta {
         meta: MultiTableMetaBlock {
-            next_user_obj_id: meta_block.next_user_obj_id,
+            next_table_id: meta_block.next_table_id,
             table_roots: meta_block.table_roots,
         },
         alloc_map: meta_block.alloc_map,
@@ -331,6 +334,7 @@ impl MultiTableFile {
         let active_root = self.active_root_unchecked();
         Ok(MultiTableFileSnapshot {
             catalog_replay_start_ts: active_root.root_ts,
+            meta_block_id: active_root.meta_block_id,
             meta: active_root.meta.clone(),
         })
     }
@@ -420,7 +424,7 @@ impl MutableMultiTableFile {
     pub(crate) fn apply_checkpoint_metadata(
         &mut self,
         catalog_replay_start_ts: TrxID,
-        next_user_obj_id: TableID,
+        next_table_id: TableID,
         table_roots: [CatalogTableRootDesc; CATALOG_TABLE_ROOT_DESC_COUNT],
     ) -> Result<()> {
         let root = &mut self.new_root.root;
@@ -430,9 +434,9 @@ impl MutableMultiTableFile {
                 root.root_ts
             )));
         }
-        if next_user_obj_id < USER_OBJ_ID_START {
+        if next_table_id < USER_OBJ_ID_START {
             return Err(catalog_root_descriptor_invariant(format!(
-                "next_user_obj_id={next_user_obj_id}, minimum={USER_OBJ_ID_START}"
+                "next_table_id={next_table_id}, minimum={USER_OBJ_ID_START}"
             )));
         }
         for root in &table_roots {
@@ -445,9 +449,69 @@ impl MutableMultiTableFile {
         }
 
         root.root_ts = catalog_replay_start_ts;
-        root.next_user_obj_id = next_user_obj_id;
+        root.next_table_id = next_table_id;
         root.table_roots = table_roots;
         Ok(())
+    }
+
+    /// Returns immutable reference to the mutable catalog root snapshot.
+    #[inline]
+    pub(crate) fn root(&self) -> &MultiTableActiveRoot {
+        &self.new_root.root
+    }
+
+    /// Reserve the final meta block for a catalog checkpoint publication.
+    #[inline]
+    pub(crate) fn reserve_publish_meta_block(&mut self) -> Result<BlockID> {
+        self.new_root
+            .reserve_publish_meta_block("multi-table publish root could not allocate meta block")
+    }
+
+    /// Reserve the final meta block and clear the displaced active meta block.
+    ///
+    /// This is the fast path for checkpoints that only advance catalog overlay
+    /// metadata. Catalog logical-table roots and their data blocks are kept
+    /// from the inherited allocation map; only the previous meta block becomes
+    /// unreachable once the new root is published.
+    #[inline]
+    pub(crate) fn reserve_publish_meta_block_reclaiming_displaced_meta(
+        &mut self,
+        displaced_meta_block_id: BlockID,
+    ) -> Result<BlockID> {
+        let meta_block_id = self.reserve_publish_meta_block()?;
+        if displaced_meta_block_id == SUPER_BLOCK_ID {
+            return Ok(meta_block_id);
+        }
+        if displaced_meta_block_id == meta_block_id {
+            return Err(Report::new(InternalError::CowFileAllocationInvariant)
+                .attach(format!(
+                    "displaced meta block matches publish meta block: block_id={meta_block_id}"
+                ))
+                .into());
+        }
+        let displaced_meta_idx = usize::from(displaced_meta_block_id);
+        if displaced_meta_idx >= self.new_root.root.alloc_map.len()
+            || !self.new_root.root.alloc_map.deallocate(displaced_meta_idx)
+        {
+            return Err(Report::new(InternalError::CowFileAllocationInvariant)
+                .attach(format!(
+                    "displaced meta block is not allocated: block_id={displaced_meta_block_id}, alloc_map_len={}",
+                    self.new_root.root.alloc_map.len()
+                ))
+                .into());
+        }
+        Ok(meta_block_id)
+    }
+
+    /// Rebuild the mutable root allocation map from root-reachable blocks.
+    ///
+    /// Returns the number of allocation bits cleared by the rebuild.
+    #[inline]
+    pub(crate) fn rebuild_alloc_map_from_reachable(
+        &mut self,
+        reachable: &BTreeSet<BlockID>,
+    ) -> Result<usize> {
+        self.new_root.rebuild_alloc_map_from_reachable(reachable)
     }
 
     /// Commit mutable root by writing meta block then ping-pong super block.
@@ -462,6 +526,26 @@ impl MutableMultiTableFile {
         let publish_res = file
             .file()
             .publish_root(&background_writes, new_root, CowWriteBarrier::Disabled)
+            .await;
+        drop(writer_claim);
+        let old_root = publish_res?;
+        Ok((file, old_root))
+    }
+
+    /// Commit a mutable root whose final meta block was already reserved.
+    #[inline]
+    pub(crate) async fn commit_prepared(
+        self,
+    ) -> Result<(Arc<MultiTableFile>, Option<OldMultiTableRoot>)> {
+        let MutableMultiTableFile {
+            file,
+            new_root,
+            background_writes,
+            writer_claim,
+        } = self;
+        let publish_res = file
+            .file()
+            .publish_prepared_root(&background_writes, new_root, CowWriteBarrier::Disabled)
             .await;
         drop(writer_claim);
         let old_root = publish_res?;
@@ -562,12 +646,12 @@ mod tests {
         mtb: &Arc<MultiTableFile>,
         background_writes: &IOClient<BackgroundWriteRequest>,
         catalog_replay_start_ts: TrxID,
-        next_user_obj_id: TableID,
+        next_table_id: TableID,
         table_roots: [CatalogTableRootDesc; CATALOG_TABLE_ROOT_DESC_COUNT],
     ) {
         let mut mutable = MutableMultiTableFile::fork(mtb, background_writes);
         mutable
-            .apply_checkpoint_metadata(catalog_replay_start_ts, next_user_obj_id, table_roots)
+            .apply_checkpoint_metadata(catalog_replay_start_ts, next_table_id, table_roots)
             .unwrap();
         let (_, old_root) = mutable.commit().await.unwrap();
         drop(old_root);
@@ -587,7 +671,7 @@ mod tests {
                 .unwrap();
             let s0 = mtb.load_snapshot().unwrap();
             assert_eq!(s0.catalog_replay_start_ts, MIN_SNAPSHOT_TS);
-            assert_eq!(s0.meta.next_user_obj_id, USER_OBJ_ID_START);
+            assert_eq!(s0.meta.next_table_id, USER_OBJ_ID_START);
             let meta_block_id_0 = mtb.active_root_unchecked().meta_block_id;
             assert!(meta_block_id_0 > test_block_id(0));
 
@@ -615,7 +699,7 @@ mod tests {
                 .unwrap();
             let s1 = mtb2.load_snapshot().unwrap();
             assert_eq!(s1.catalog_replay_start_ts, TrxID::new(7));
-            assert_eq!(s1.meta.next_user_obj_id, USER_OBJ_ID_START + 16);
+            assert_eq!(s1.meta.next_table_id, USER_OBJ_ID_START + 16);
             assert_eq!(s1.meta.table_roots, roots);
 
             drop(mtb2);

@@ -56,7 +56,7 @@ pub(crate) async fn create_table_for_session(
     let _namespace_lock =
         acquire_catalog_namespace_lock(engine.lock_manager(), ctx.owner, ctx.owner_group).await?;
 
-    let table_id = engine.catalog().next_user_obj_id();
+    let table_id = engine.catalog().next_table_id();
     let metadata = Arc::new(super::TableMetadata::try_new(
         table_spec.columns.clone(),
         index_specs.clone(),

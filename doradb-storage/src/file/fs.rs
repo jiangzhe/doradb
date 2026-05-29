@@ -1518,7 +1518,7 @@ impl FileSystem {
     #[inline]
     pub(crate) fn cleanup_checkpoint_absent_user_table_files(
         &self,
-        checkpointed_next_user_obj_id: TableID,
+        checkpointed_next_table_id: TableID,
         checkpointed_user_table_ids: &HashSet<TableID>,
     ) -> Result<()> {
         for entry in fs::read_dir(&self.data_dir)? {
@@ -1532,7 +1532,7 @@ impl FileSystem {
             let Some(table_id) = parse_user_table_file_name(&entry.file_name()) else {
                 continue;
             };
-            if table_id >= checkpointed_next_user_obj_id {
+            if table_id >= checkpointed_next_table_id {
                 continue;
             }
             if checkpointed_user_table_ids.contains(&table_id) {
@@ -2123,7 +2123,7 @@ pub(crate) mod tests {
                 snapshot.catalog_replay_start_ts,
                 crate::trx::MIN_SNAPSHOT_TS
             );
-            assert_eq!(snapshot.meta.next_user_obj_id, USER_OBJ_ID_START);
+            assert_eq!(snapshot.meta.next_table_id, USER_OBJ_ID_START);
             assert!(mtb.active_root_unchecked().meta_block_id > BlockID::new(0));
         });
     }

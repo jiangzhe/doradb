@@ -4875,7 +4875,7 @@ fn test_create_table_rejects_invalid_metadata_before_file_creation() {
             .await
             .unwrap();
         let mut session = engine.new_session().unwrap();
-        let table_id = engine.catalog().curr_next_user_obj_id();
+        let table_id = engine.catalog().curr_next_table_id();
         let table_file_path = engine.table_fs.user_table_file_path(table_id);
 
         let err = session
@@ -4910,7 +4910,7 @@ fn test_create_table_catalog_staging_failure_rolls_back_and_deletes_file() {
             .await
             .unwrap();
         let mut session = engine.new_session().unwrap();
-        let table_id = engine.catalog().curr_next_user_obj_id();
+        let table_id = engine.catalog().curr_next_table_id();
         let table_file_path = engine.table_fs.user_table_file_path(table_id);
         let (table_spec, index_specs) = drop_table_test_spec();
 
@@ -4941,7 +4941,7 @@ fn test_create_table_file_publish_failure_rolls_back_catalog_and_deletes_file() 
             .await
             .unwrap();
         let mut session = engine.new_session().unwrap();
-        let table_id = engine.catalog().curr_next_user_obj_id();
+        let table_id = engine.catalog().curr_next_table_id();
         let table_file_path = engine.table_fs.user_table_file_path(table_id);
         let hook = Arc::new(FailingFirstWriteHook::new(table_file_path.clone()));
         let _install = install_storage_backend_test_hook(hook.clone());
@@ -4970,7 +4970,7 @@ fn test_create_table_after_file_published_failure_rolls_back_catalog_and_deletes
             .await
             .unwrap();
         let mut session = engine.new_session().unwrap();
-        let table_id = engine.catalog().curr_next_user_obj_id();
+        let table_id = engine.catalog().curr_next_table_id();
         let table_file_path = engine.table_fs.user_table_file_path(table_id);
         let (table_spec, index_specs) = drop_table_test_spec();
 
@@ -5001,7 +5001,7 @@ fn test_create_table_runtime_failure_after_file_publish_rolls_back_and_deletes_f
             .await
             .unwrap();
         let mut session = engine.new_session().unwrap();
-        let table_id = engine.catalog().curr_next_user_obj_id();
+        let table_id = engine.catalog().curr_next_table_id();
         let table_file_path = engine.table_fs.user_table_file_path(table_id);
         let (table_spec, index_specs) = drop_table_test_spec();
 
@@ -5032,7 +5032,7 @@ fn test_create_table_catalog_commit_error_after_file_publish_poisons_and_keeps_f
             .await
             .unwrap();
         let mut session = engine.new_session().unwrap();
-        let table_id = engine.catalog().curr_next_user_obj_id();
+        let table_id = engine.catalog().curr_next_table_id();
         let table_file_path = engine.table_fs.user_table_file_path(table_id);
         let (table_spec, index_specs) = drop_table_test_spec();
 

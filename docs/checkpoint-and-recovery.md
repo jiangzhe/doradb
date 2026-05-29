@@ -197,6 +197,16 @@ will be published. The reachability walk covers table metadata,
 `ColumnBlockIndex` nodes, LWC data blocks, external deletion blob pages, and
 active secondary-index `DiskTree` nodes.
 
+Catalog checkpoint uses a separate one-root proof. After catalog table row
+changes and overlay metadata such as `catalog_replay_start_ts` and
+`next_table_id` are applied to the mutable `catalog.mtb` root, checkpoint
+reserves the final new meta block. If catalog file blocks were rewritten, it
+traces only that mutable root, validates every reachable block against its
+allocation map, rebuilds the map, and then publishes the meta/super-block pair.
+If only overlay metadata changed, it skips the trace and clears only the
+displaced meta block. The displaced active catalog root is not kept as a
+protected reader root.
+
 ### 4.3 No Independent Index Checkpoint
 
 The design explicitly does **not** do the following:
@@ -236,7 +246,7 @@ Startup also removes leftover deterministic user-table files when all of these
 conditions are true:
 
 - the file name decodes to a user table id
-- the id is below checkpointed `next_user_obj_id`
+- the id is below checkpointed `next_table_id`
 - the id is absent from the checkpointed catalog table list
 
 This cleanup is safe because catalog absence is already durable in

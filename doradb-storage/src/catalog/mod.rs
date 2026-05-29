@@ -93,7 +93,7 @@ impl Deref for CatalogTable {
 
 /// Catalog contains metadata of user tables.
 pub(crate) struct Catalog {
-    next_user_obj_id: AtomicU64,
+    next_table_id: AtomicU64,
     user_tables: DashMap<TableID, Arc<Table>>,
     pub(crate) storage: CatalogStorage,
     checkpoint_gate: CatalogCheckpointGate,
@@ -145,31 +145,31 @@ impl Catalog {
         storage
             .bootstrap_from_checkpoint(&snapshot, &pool_guards)
             .await?;
-        let next_user_obj_id = storage.next_user_obj_id();
+        let next_table_id = storage.next_table_id();
         Ok(Catalog {
-            next_user_obj_id: AtomicU64::new(next_user_obj_id.as_u64()),
+            next_table_id: AtomicU64::new(next_table_id.as_u64()),
             user_tables: DashMap::new(),
             storage,
             checkpoint_gate: CatalogCheckpointGate::new(),
         })
     }
 
-    /// Allocate and return the next user object id.
+    /// Allocate and return the next table id.
     #[inline]
-    pub(crate) fn next_user_obj_id(&self) -> TableID {
-        TableID::new(self.next_user_obj_id.fetch_add(1, Ordering::SeqCst))
+    pub(crate) fn next_table_id(&self) -> TableID {
+        TableID::new(self.next_table_id.fetch_add(1, Ordering::SeqCst))
     }
 
     #[inline]
-    fn try_update_next_user_obj_id(&self, next_user_obj_id: TableID) {
-        self.next_user_obj_id
-            .fetch_max(next_user_obj_id.as_u64(), Ordering::SeqCst);
+    fn try_update_next_table_id(&self, next_table_id: TableID) {
+        self.next_table_id
+            .fetch_max(next_table_id.as_u64(), Ordering::SeqCst);
     }
 
-    /// Return the current next user object id without allocating one.
+    /// Return the current next table id without allocating one.
     #[inline]
-    pub(crate) fn curr_next_user_obj_id(&self) -> TableID {
-        TableID::new(self.next_user_obj_id.load(Ordering::Acquire))
+    pub(crate) fn curr_next_table_id(&self) -> TableID {
+        TableID::new(self.next_table_id.load(Ordering::Acquire))
     }
 
     /// Apply one scanned catalog checkpoint batch into `catalog.mtb`.
@@ -184,7 +184,7 @@ impl Catalog {
     #[inline]
     pub(crate) async fn apply_checkpoint_batch(&self, batch: CatalogCheckpointBatch) -> Result<()> {
         self.storage
-            .apply_checkpoint_batch(batch, self.curr_next_user_obj_id())
+            .apply_checkpoint_batch(batch, self.curr_next_table_id())
             .await
     }
 
@@ -222,8 +222,8 @@ impl Catalog {
             .user_table_metadata_from_catalog(&guards, table_id)
             .await?;
 
-        // Phase 2 allocator semantics: only table ids consume global user object ids.
-        self.try_update_next_user_obj_id(table.table_id.saturating_add(1).max(USER_OBJ_ID_START));
+        // Phase 2 allocator semantics: only table ids consume the global allocator.
+        self.try_update_next_table_id(table.table_id.saturating_add(1).max(USER_OBJ_ID_START));
 
         let table_file = table_fs
             .open_table_file(table.table_id, disk_pool.clone())
@@ -1100,7 +1100,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn test_next_user_obj_id_monotonic_across_restart() {
+    fn test_next_table_id_monotonic_across_restart() {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
             let main_dir = temp_dir.path().to_path_buf();
@@ -1111,7 +1111,7 @@ pub(crate) mod tests {
                 .build()
                 .await
                 .unwrap();
-            assert_eq!(engine.catalog().curr_next_user_obj_id(), USER_OBJ_ID_START);
+            assert_eq!(engine.catalog().curr_next_table_id(), USER_OBJ_ID_START);
             let mut session = engine.new_session().unwrap();
             let table_spec = TableSpec {
                 columns: vec![
@@ -1140,7 +1140,7 @@ pub(crate) mod tests {
                 ),
             ];
             let table_id1 = session.create_table(table_spec, index_specs).await.unwrap();
-            assert_eq!(engine.catalog().curr_next_user_obj_id(), table_id1 + 1);
+            assert_eq!(engine.catalog().curr_next_table_id(), table_id1 + 1);
             drop(session);
             drop(engine);
 
@@ -1150,7 +1150,7 @@ pub(crate) mod tests {
                 .build()
                 .await
                 .unwrap();
-            assert_eq!(engine.catalog().curr_next_user_obj_id(), table_id1 + 1);
+            assert_eq!(engine.catalog().curr_next_table_id(), table_id1 + 1);
             let table_id2 = table1(&engine).await;
             assert!(table_id1 >= USER_OBJ_ID_START);
             assert_eq!(table_id2, table_id1 + 1);
@@ -1307,8 +1307,8 @@ pub(crate) mod tests {
             let snap1 = engine.catalog().storage.checkpoint_snapshot().unwrap();
             assert!(snap1.catalog_replay_start_ts > MIN_SNAPSHOT_TS);
             assert_eq!(
-                snap1.meta.next_user_obj_id,
-                engine.catalog().curr_next_user_obj_id()
+                snap1.meta.next_table_id,
+                engine.catalog().curr_next_table_id()
             );
             assert!(
                 snap1
@@ -1517,7 +1517,7 @@ pub(crate) mod tests {
             let snap2 = engine.catalog().storage.checkpoint_snapshot().unwrap();
             assert!(snap2.catalog_replay_start_ts > snap1.catalog_replay_start_ts);
             assert_eq!(snap2.meta.table_roots, roots_before);
-            assert_eq!(snap2.meta.next_user_obj_id, snap1.meta.next_user_obj_id);
+            assert_eq!(snap2.meta.next_table_id, snap1.meta.next_table_id);
         });
     }
 
@@ -1676,7 +1676,7 @@ pub(crate) mod tests {
             let snap2 = engine.catalog().storage.checkpoint_snapshot().unwrap();
             assert!(snap2.catalog_replay_start_ts > snap1.catalog_replay_start_ts);
             assert_eq!(snap2.meta.table_roots, roots_before);
-            assert_eq!(snap2.meta.next_user_obj_id, snap1.meta.next_user_obj_id);
+            assert_eq!(snap2.meta.next_table_id, snap1.meta.next_table_id);
         });
     }
 }

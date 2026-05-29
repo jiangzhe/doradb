@@ -88,12 +88,19 @@ Catalog metadata remains cache-first at runtime: foreground lookups and DDL/DML
 operate on the in-memory catalog tables, not on persisted catalog pages.
 Durability is provided by a dedicated multi-table file, `catalog.mtb`, which
 stores checkpointed roots for all logical catalog tables plus overlay metadata
-such as `next_user_obj_id` and `catalog_replay_start_ts`.
+such as `next_table_id` and `catalog_replay_start_ts`.
 
 User tables still persist to one file per table, but now use deterministic
 fixed-width hex file names. `catalog.mtb` is reserved for the catalog-wide
 checkpoint boundary and is published with the same CoW root-swap pattern used
 by user-table files.
+
+Catalog checkpoint rebuilds the `catalog.mtb` allocation map from the
+to-be-committed mutable catalog root when catalog file blocks are rewritten.
+Metadata-only checkpoints skip that reachability walk and only reclaim the
+displaced catalog meta block. Unlike user-table block reclamation, catalog
+reclamation does not retain the displaced active catalog root because
+foreground catalog access is served from in-memory catalog tables.
 
 ### Redo Log File
 

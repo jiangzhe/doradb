@@ -131,12 +131,23 @@ Long-running readers are protected by root indirection:
   LWC replacement blocks, external deletion blob pages, and secondary-index
   `DiskTree` blocks
 
+User-table reclamation traces two protected roots when the checkpoint gate
+allows reclamation: the current active root and the mutable root about to be
+published. Catalog reclamation is narrower. `catalog.mtb` is a cache-first
+checkpoint boundary, so catalog checkpoints that rewrite catalog file blocks
+trace only the to-be-committed mutable catalog root. The final new catalog
+meta-block id is reserved before the allocation map is rebuilt, allowing the
+newly serialized `catalog.mtb` root to free displaced catalog meta blocks,
+catalog `ColumnBlockIndex` nodes, LWC blocks, and external deletion blob pages
+that are no longer reachable from the committed catalog root. Metadata-only
+catalog checkpoints skip the trace and clear only the displaced meta block.
+
 Whole-table deletion is outside table-file page GC. After a committed
 `DROP TABLE`, transaction GC first destroys the removed runtime after
 `Global_Min_Active_STS > drop_cts`. The table file itself is unlinked only
 after the catalog checkpoint boundary proves the catalog absence is durable:
 `catalog_replay_start_ts > drop_cts`. Startup may delete leftover deterministic
-user-table files that are below checkpointed `next_user_obj_id` and absent from
+user-table files that are below checkpointed `next_table_id` and absent from
 the checkpointed catalog table list.
 
 ## 6. LWC Blocks
@@ -226,6 +237,13 @@ may rebuild the mutable root's allocation map from only two protected roots:
 the current active root and the mutable root about to be published. This
 reclaims obsolete CoW blocks and dropped secondary-index `DiskTree` pages
 without a foreground vacuum command.
+
+Catalog checkpoints do not use the user-table two-root retention rule.
+Foreground catalog reads use in-memory catalog tables, and `catalog.mtb` is
+decoded at bootstrap/recovery and checkpoint snapshot boundaries. Therefore a
+catalog checkpoint that rewrites catalog file blocks rebuilds allocation state
+from only the mutable `catalog.mtb` root that will be serialized and published;
+metadata-only catalog checkpoints only swap meta blocks.
 
 Root retention uses the same post-publish effective timestamp. The old root is
 released only after `effective_ts < Global_Min_Active_STS`, which covers both

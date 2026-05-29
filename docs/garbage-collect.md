@@ -118,6 +118,17 @@ mutable root about to be published. The current meta-block format does not
 persist an obsolete-block side list; root reachability and the rebuilt
 allocation map are the reclaim contract.
 
+`catalog.mtb` uses the same rebuilt allocation-map contract but a different
+proof boundary. Catalog runtime reads are cache-first, and checkpoint
+publication is serialized, so catalog block reclamation traces only the
+to-be-committed mutable catalog root when catalog file blocks were rewritten.
+That reachability set includes the super block, final catalog meta block,
+catalog logical-table `ColumnBlockIndex` nodes, referenced LWC blocks, and
+external deletion blob pages. Metadata-only catalog checkpoints skip the trace
+and reclaim only the displaced meta block. Catalog reclamation does not trace
+secondary `DiskTree` roots because catalog logical tables do not persist them
+in `catalog.mtb`.
+
 Recovery can apply a simpler reachability rule: after restart there are no
 active transactions, so blocks unreachable from the selected latest valid root
 are reclaimable once recovery has validated and installed that root.
