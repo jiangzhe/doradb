@@ -1,7 +1,7 @@
 ---
 id: 000162
 title: Catalog File Block Reclamation
-status: proposal
+status: implemented
 created: 2026-05-29
 github_issue: 668
 ---
@@ -293,6 +293,54 @@ task.
 
 ## Implementation Notes
 
+Implemented catalog checkpoint allocation-map reclamation around a prepared
+publish path. `CowFile::publish_root` now reserves the final meta block before
+delegating to `publish_prepared_root`, and `MutableMultiTableFile` can reserve
+that publish meta block, expose the mutable catalog root, rebuild the
+allocation map from a caller-provided reachable set, and commit the prepared
+root without allocating another meta block.
+
+Catalog checkpoint now applies catalog table changes and metadata to the
+mutable `catalog.mtb` root before publication. When logical catalog blocks
+changed, it collects reachability from only that to-be-committed root, validates
+each reachable block against the mutable root allocation map, rebuilds the
+allocation map, and then publishes the prepared root. Metadata-only checkpoints
+use a narrower fast path that reserves the new meta block and clears only the
+displaced active meta block from the inherited allocation map, avoiding
+unnecessary reads of catalog logical-table roots.
+
+The catalog reachable-set collector includes `SUPER_BLOCK_ID`, the final
+catalog meta block, every non-empty catalog logical-table root, all reachable
+`ColumnBlockIndex` nodes, LWC blocks, and external column-deletion blob blocks
+reported by the shared column-index reachability helper. It rejects invalid
+catalog table root descriptors and any reachable block that is out of range or
+not allocated before super-block publication.
+
+Renamed the active allocator surface from `next_user_obj_id` to
+`next_table_id` across catalog storage, multi-table metadata views, recovery,
+cleanup diagnostics, tests, and current concept docs. The serialized
+`catalog.mtb` payload remains the same `u64` field in the same order.
+
+Addressed review follow-ups during implementation:
+- added shared catalog test-engine setup helpers under the catalog test module
+  and reused them across catalog storage tests;
+- reduced the restart allocator test below the local quality limit while
+  preserving its staged restart coverage;
+- recorded broader property-based testing as a deferred backlog item at
+  `docs/backlogs/000112-proptest-critical-storage-invariants.md`.
+
+Checklist and validation completed:
+- `cargo fmt --all --check`: passed.
+- `cargo nextest run -p doradb-storage`: 863 passed.
+- `cargo clippy -p doradb-storage --all-targets -- -D warnings`: passed.
+- `tools/coverage_focus.rs` over the changed Rust files:
+  deduplicated line coverage 17863/18686 (95.60%); every requested file was
+  above 80%, including `doradb-storage/src/catalog/storage/checkpoint.rs` at
+  84.35%.
+- `cargo nextest run -p doradb-storage --no-default-features --features libaio`:
+  861 passed.
+- `git diff --check origin/main...HEAD`: passed.
+- Unsafe review: no unsafe code was added or modified.
 
 ## Impacts
 
@@ -422,3 +470,6 @@ cargo nextest run -p doradb-storage --no-default-features --features libaio
 3. If implementation discovers direct catalog-file readers that can overlap
    with catalog checkpoint root publication and require old-root block access,
    the one-root proof must be revisited before code changes proceed.
+4. Property-based testing for catalog checkpoint reachability, recovery, and
+   transaction behavior remains deferred to
+   `docs/backlogs/000112-proptest-critical-storage-invariants.md`.

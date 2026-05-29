@@ -6,11 +6,11 @@ Introduce proptest as a dev dependency and build reusable property-based test ut
 
 ## Reference
 
-User discussion on 2026-05-29 while considering property-based coverage for collect_catalog_reachable_blocks in doradb-storage/src/catalog/storage/checkpoint.rs. The scope was broadened from one catalog checkpoint test to a repository-level testing framework for catalog checkpoint, recovery, and transaction behavior.
+docs/tasks/000162-catalog-file-block-reclamation.md; user discussion on 2026-05-29 while considering property-based coverage for collect_catalog_reachable_blocks in doradb-storage/src/catalog/storage/checkpoint.rs. The scope was broadened from one catalog checkpoint test to a repository-level testing framework for catalog checkpoint, recovery, and transaction behavior.
 
 ## Deferred From (Optional)
 
-Current catalog checkpoint reachability follow-up discussion in worktree /home/jiangzhe/github/doradb/.worktrees/000162; no task or RFC document exists for this work yet.
+docs/tasks/000162-catalog-file-block-reclamation.md
 
 ## Deferral Context (Optional)
 
