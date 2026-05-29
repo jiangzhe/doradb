@@ -2707,7 +2707,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_evict_buffer_pool_multi_threads() {
-        use rand::{Rng, prelude::IndexedRandom};
+        use rand::{RngExt, prelude::IndexedRandom};
         // max pages 2k, max in-mem 1k
         let temp_dir = TempDir::new().unwrap();
         let pool = StartedEvictPool::new(

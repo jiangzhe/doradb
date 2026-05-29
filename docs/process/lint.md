@@ -39,6 +39,7 @@ Repository hook (`.githooks/pre-commit`) enforces:
 
 1. `cargo fmt`
 2. `cargo clippy -p doradb-storage --all-targets -- -D warnings`
+3. `cargo deny check`
 
 If staged paths touch unsafe-sensitive modules, the hook also refreshes unsafe baseline docs.
 

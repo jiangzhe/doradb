@@ -1017,7 +1017,7 @@ struct Heap {
 
 #[cfg(test)]
 mod tests {
-    use rand::Rng;
+    use rand::RngExt;
     use rand::rngs::ThreadRng;
     use rand_distr::{Distribution, StandardUniform};
 

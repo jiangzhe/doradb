@@ -1,7 +1,8 @@
 # DoraDB
 
-![build](https://github.com/jiangzhe/doradb/actions/workflows/build.yml/badge.svg)
-![codecov](https://codecov.io/gh/jiangzhe/doradb/branch/main/graph/badge.svg?token=T3RMZE2998)
+![Build](https://github.com/jiangzhe/doradb/actions/workflows/build.yml/badge.svg)
+![Cargo Deny Status](https://github.com/jiangzhe/doradb/actions/workflows/cargo-deny.yml/badge.svg)
+![Codecov](https://codecov.io/gh/jiangzhe/doradb/branch/main/graph/badge.svg?token=T3RMZE2998)
 [![Codacy Badge](https://app.codacy.com/project/badge/Grade/26b91ce46f944686a9a200af04d3920b)](https://app.codacy.com/gh/jiangzhe/doradb/dashboard?utm_source=gh&utm_medium=referral&utm_content=&utm_campaign=Badge_grade)
 
 DoraDB is an attempt to build a modern and fast storage engine in Rust from scratch.

@@ -15,9 +15,10 @@ tmp_before_fmt="$(mktemp)"
 tmp_after_fmt="$(mktemp)"
 tmp_fmt_log="$(mktemp)"
 tmp_clippy_log="$(mktemp)"
+tmp_deny_log="$(mktemp)"
 tmp_baseline_log="/tmp/unsafe-baseline-hook.log"
 cleanup() {
-  rm -f "${tmp_before_fmt}" "${tmp_after_fmt}" "${tmp_fmt_log}" "${tmp_clippy_log}"
+  rm -f "${tmp_before_fmt}" "${tmp_after_fmt}" "${tmp_fmt_log}" "${tmp_clippy_log}" "${tmp_deny_log}"
 }
 trap cleanup EXIT
 
@@ -39,6 +40,13 @@ echo "[pre-commit] Running cargo clippy -p doradb-storage --all-targets -- -D wa
 if ! cargo clippy -p doradb-storage --all-targets -- -D warnings >"${tmp_clippy_log}" 2>&1; then
   echo "[pre-commit] cargo clippy failed."
   cat "${tmp_clippy_log}"
+  exit 1
+fi
+
+echo "[pre-commit] Running cargo deny check"
+if ! cargo deny check >"${tmp_deny_log}" 2>&1; then
+  echo "[pre-commit] cargo deny check failed."
+  cat "${tmp_deny_log}"
   exit 1
 fi
 

@@ -83,6 +83,7 @@ impl ActiveIndexSpec {
 
 bitflags! {
     /// Column-level attributes for schema definition.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
     pub struct ColumnAttributes: u32 {
         // whether value can be null.
         const NULLABLE = 0x01;
@@ -93,6 +94,7 @@ bitflags! {
 
 bitflags! {
     /// Index-level attributes for schema definition.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
     pub struct IndexAttributes: u32 {
         const PK = 0x01;
         const UK = 0x02;
