@@ -703,6 +703,44 @@ pub(crate) mod tests {
     use std::io::{Read, Seek, SeekFrom, Write};
     use tempfile::TempDir;
 
+    #[inline]
+    pub(crate) fn catalog_test_engine_config(
+        main_dir: impl Into<std::path::PathBuf>,
+        log_file_stem: Option<&str>,
+    ) -> EngineConfig {
+        let mut trx = TrxSysConfig::default();
+        if let Some(log_file_stem) = log_file_stem {
+            trx = trx.log_file_stem(log_file_stem);
+        }
+        EngineConfig::default().storage_root(main_dir).trx(trx)
+    }
+
+    #[inline]
+    pub(crate) async fn open_catalog_test_engine(
+        main_dir: impl Into<std::path::PathBuf>,
+        log_file_stem: Option<&str>,
+    ) -> Engine {
+        catalog_test_engine_config(main_dir, log_file_stem)
+            .build()
+            .await
+            .unwrap()
+    }
+
+    #[inline]
+    pub(crate) async fn expect_catalog_test_engine_error(
+        main_dir: impl Into<std::path::PathBuf>,
+        log_file_stem: Option<&str>,
+        expected_message: &str,
+    ) -> Error {
+        match catalog_test_engine_config(main_dir, log_file_stem)
+            .build()
+            .await
+        {
+            Ok(_) => panic!("{expected_message}"),
+            Err(err) => err,
+        }
+    }
+
     /// Table1 has single i32 column, with unique index of this column.
     #[inline]
     pub(crate) async fn table1(engine: &Engine) -> TableID {
@@ -1002,12 +1040,11 @@ pub(crate) mod tests {
     fn test_user_table_metadata_rejects_orphan_index_columns() {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
-            let engine = EngineConfig::default()
-                .storage_root(temp_dir.path().to_path_buf())
-                .trx(TrxSysConfig::default().log_file_stem("catalog-orphan-index-column"))
-                .build()
-                .await
-                .unwrap();
+            let engine = open_catalog_test_engine(
+                temp_dir.path().to_path_buf(),
+                Some("catalog-orphan-index-column"),
+            )
+            .await;
             let mut session = engine.new_session().unwrap();
             let table_id = session
                 .create_table(
@@ -1083,12 +1120,7 @@ pub(crate) mod tests {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
             let main_dir = temp_dir.path().to_path_buf();
-            let engine = EngineConfig::default()
-                .storage_root(main_dir.clone())
-                .trx(TrxSysConfig::default())
-                .build()
-                .await
-                .unwrap();
+            let engine = open_catalog_test_engine(main_dir.clone(), None).await;
             drop(engine);
 
             let data_dir = temp_dir.path();
@@ -1105,33 +1137,15 @@ pub(crate) mod tests {
             let temp_dir = TempDir::new().unwrap();
             let main_dir = temp_dir.path().to_path_buf();
 
-            let engine = EngineConfig::default()
-                .storage_root(main_dir.clone())
-                .trx(TrxSysConfig::default().log_file_stem("catalog-allocator"))
-                .build()
-                .await
-                .unwrap();
+            let engine =
+                open_catalog_test_engine(main_dir.clone(), Some("catalog-allocator")).await;
             assert_eq!(engine.catalog().curr_next_table_id(), USER_OBJ_ID_START);
             let mut session = engine.new_session().unwrap();
-            let table_spec = TableSpec {
-                columns: vec![
-                    ColumnSpec {
-                        column_name: SemiStr::new("id"),
-                        column_type: ValKind::I32,
-                        column_attributes: ColumnAttributes::empty(),
-                    },
-                    ColumnSpec {
-                        column_name: SemiStr::new("k1"),
-                        column_type: ValKind::I32,
-                        column_attributes: ColumnAttributes::empty(),
-                    },
-                    ColumnSpec {
-                        column_name: SemiStr::new("k2"),
-                        column_type: ValKind::I32,
-                        column_attributes: ColumnAttributes::empty(),
-                    },
-                ],
-            };
+            let table_spec = TableSpec::new(vec![
+                ColumnSpec::new("id", ValKind::I32, ColumnAttributes::empty()),
+                ColumnSpec::new("k1", ValKind::I32, ColumnAttributes::empty()),
+                ColumnSpec::new("k2", ValKind::I32, ColumnAttributes::empty()),
+            ]);
             let index_specs = vec![
                 IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::PK),
                 IndexSpec::new(
@@ -1144,12 +1158,7 @@ pub(crate) mod tests {
             drop(session);
             drop(engine);
 
-            let engine = EngineConfig::default()
-                .storage_root(main_dir)
-                .trx(TrxSysConfig::default().log_file_stem("catalog-allocator"))
-                .build()
-                .await
-                .unwrap();
+            let engine = open_catalog_test_engine(main_dir, Some("catalog-allocator")).await;
             assert_eq!(engine.catalog().curr_next_table_id(), table_id1 + 1);
             let table_id2 = table1(&engine).await;
             assert!(table_id1 >= USER_OBJ_ID_START);
@@ -1165,12 +1174,7 @@ pub(crate) mod tests {
             let main_dir = temp_dir.path().to_path_buf();
             let log_stem = "stable-index-metadata";
 
-            let engine = EngineConfig::default()
-                .storage_root(main_dir.clone())
-                .trx(TrxSysConfig::default().log_file_stem(log_stem))
-                .build()
-                .await
-                .unwrap();
+            let engine = open_catalog_test_engine(main_dir.clone(), Some(log_stem)).await;
             let mut session = engine.new_session().unwrap();
             let table_id = session
                 .create_table(
@@ -1210,12 +1214,7 @@ pub(crate) mod tests {
             drop(session);
             drop(engine);
 
-            let engine = EngineConfig::default()
-                .storage_root(main_dir.clone())
-                .trx(TrxSysConfig::default().log_file_stem(log_stem))
-                .build()
-                .await
-                .unwrap();
+            let engine = open_catalog_test_engine(main_dir.clone(), Some(log_stem)).await;
             let table = engine.catalog().get_table(table_id).await.unwrap();
             assert_eq!(table.metadata().idx.next_index_no(), 2);
             assert_eq!(
@@ -1253,12 +1252,7 @@ pub(crate) mod tests {
                 .unwrap();
             drop(engine);
 
-            let engine = EngineConfig::default()
-                .storage_root(main_dir)
-                .trx(TrxSysConfig::default().log_file_stem(log_stem))
-                .build()
-                .await
-                .unwrap();
+            let engine = open_catalog_test_engine(main_dir, Some(log_stem)).await;
             let table = engine.catalog().get_table(table_id).await.unwrap();
             assert_eq!(table.metadata().idx.next_index_no(), 2);
             assert_eq!(table.metadata().idx.active_index_count(), 2);
@@ -1281,12 +1275,7 @@ pub(crate) mod tests {
             let temp_dir = TempDir::new().unwrap();
             let main_dir = temp_dir.path().to_path_buf();
 
-            let engine = EngineConfig::default()
-                .storage_root(main_dir)
-                .trx(TrxSysConfig::default().log_file_stem("catalog-checkpoint-now"))
-                .build()
-                .await
-                .unwrap();
+            let engine = open_catalog_test_engine(main_dir, Some("catalog-checkpoint-now")).await;
 
             let snap0 = engine.catalog().storage.checkpoint_snapshot().unwrap();
             assert_eq!(snap0.catalog_replay_start_ts, MIN_SNAPSHOT_TS);
@@ -1342,12 +1331,11 @@ pub(crate) mod tests {
             let temp_dir = TempDir::new().unwrap();
             let main_dir = temp_dir.path().to_path_buf();
 
-            let engine = EngineConfig::default()
-                .storage_root(main_dir.clone())
-                .trx(TrxSysConfig::default().log_file_stem("catalog-checkpoint-corrupt-bootstrap"))
-                .build()
-                .await
-                .unwrap();
+            let engine = open_catalog_test_engine(
+                main_dir.clone(),
+                Some("catalog-checkpoint-corrupt-bootstrap"),
+            )
+            .await;
 
             let _ = table1(&engine).await;
             engine
@@ -1388,15 +1376,12 @@ pub(crate) mod tests {
 
             corrupt_page_checksum(main_dir.join("catalog.mtb"), u64::from(block_id));
 
-            let err = match EngineConfig::default()
-                .storage_root(main_dir)
-                .trx(TrxSysConfig::default().log_file_stem("catalog-checkpoint-corrupt-bootstrap"))
-                .build()
-                .await
-            {
-                Ok(_) => panic!("expected catalog bootstrap corruption failure"),
-                Err(err) => err,
-            };
+            let err = expect_catalog_test_engine_error(
+                main_dir,
+                Some("catalog-checkpoint-corrupt-bootstrap"),
+                "expected catalog bootstrap corruption failure",
+            )
+            .await;
             assert_catalog_data_integrity(err);
         });
     }
@@ -1407,15 +1392,11 @@ pub(crate) mod tests {
             let temp_dir = TempDir::new().unwrap();
             let main_dir = temp_dir.path().to_path_buf();
 
-            let engine = EngineConfig::default()
-                .storage_root(main_dir.clone())
-                .trx(
-                    TrxSysConfig::default()
-                        .log_file_stem("catalog-checkpoint-invalid-delete-metadata"),
-                )
-                .build()
-                .await
-                .unwrap();
+            let engine = open_catalog_test_engine(
+                main_dir.clone(),
+                Some("catalog-checkpoint-invalid-delete-metadata"),
+            )
+            .await;
 
             let _ = table1(&engine).await;
             engine
@@ -1459,18 +1440,12 @@ pub(crate) mod tests {
                 0,
             );
 
-            let err = match EngineConfig::default()
-                .storage_root(main_dir)
-                .trx(
-                    TrxSysConfig::default()
-                        .log_file_stem("catalog-checkpoint-invalid-delete-metadata"),
-                )
-                .build()
-                .await
-            {
-                Ok(_) => panic!("expected catalog bootstrap invalid-metadata failure"),
-                Err(err) => err,
-            };
+            let err = expect_catalog_test_engine_error(
+                main_dir,
+                Some("catalog-checkpoint-invalid-delete-metadata"),
+                "expected catalog bootstrap invalid-metadata failure",
+            )
+            .await;
             assert_catalog_data_integrity(err);
         });
     }
@@ -1481,12 +1456,8 @@ pub(crate) mod tests {
             let temp_dir = TempDir::new().unwrap();
             let main_dir = temp_dir.path().to_path_buf();
 
-            let engine = EngineConfig::default()
-                .storage_root(main_dir)
-                .trx(TrxSysConfig::default().log_file_stem("catalog-checkpoint-heartbeat"))
-                .build()
-                .await
-                .unwrap();
+            let engine =
+                open_catalog_test_engine(main_dir, Some("catalog-checkpoint-heartbeat")).await;
 
             let table_id = table1(&engine).await;
             engine
@@ -1527,12 +1498,9 @@ pub(crate) mod tests {
             let temp_dir = TempDir::new().unwrap();
             let main_dir = temp_dir.path().to_path_buf();
 
-            let engine = EngineConfig::default()
-                .storage_root(main_dir)
-                .trx(TrxSysConfig::default().log_file_stem("catalog-checkpoint-batch-full-range"))
-                .build()
-                .await
-                .unwrap();
+            let engine =
+                open_catalog_test_engine(main_dir, Some("catalog-checkpoint-batch-full-range"))
+                    .await;
 
             let _ = table1(&engine).await;
             let _ = table2(&engine).await;
@@ -1577,12 +1545,9 @@ pub(crate) mod tests {
             let temp_dir = TempDir::new().unwrap();
             let main_dir = temp_dir.path().to_path_buf();
 
-            let engine = EngineConfig::default()
-                .storage_root(main_dir)
-                .trx(TrxSysConfig::default().log_file_stem("catalog-checkpoint-mixed-user-states"))
-                .build()
-                .await
-                .unwrap();
+            let engine =
+                open_catalog_test_engine(main_dir, Some("catalog-checkpoint-mixed-user-states"))
+                    .await;
 
             let checkpointed_table_id = table1(&engine).await;
             let replay_only_table_id = table2(&engine).await;

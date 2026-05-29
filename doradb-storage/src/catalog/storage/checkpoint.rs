@@ -933,9 +933,8 @@ fn row_matches_key(metadata: &TableMetadata, row: &[Val], key: &SelectKey) -> bo
 mod tests {
     use super::*;
     use crate::catalog::USER_OBJ_ID_START;
-    use crate::catalog::tests::{table1, table2};
+    use crate::catalog::tests::{open_catalog_test_engine, table1, table2};
     use crate::catalog::{CatalogCheckpointBatch, CatalogCheckpointScanStopReason};
-    use crate::conf::{EngineConfig, TrxSysConfig};
     use crate::error::DataIntegrityError;
     use crate::file::BlockKey;
     use crate::file::multi_table_file::{CATALOG_MTB_FILE_ID, MutableMultiTableFile};
@@ -975,12 +974,8 @@ mod tests {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
             let main_dir = temp_dir.path().to_path_buf();
-            let engine = EngineConfig::default()
-                .storage_root(main_dir.clone())
-                .trx(TrxSysConfig::default().log_file_stem("catalog-meta-reclaim"))
-                .build()
-                .await
-                .unwrap();
+            let engine =
+                open_catalog_test_engine(main_dir.clone(), Some("catalog-meta-reclaim")).await;
 
             let storage = &engine.catalog().storage;
             let before_root = storage.mtb.active_root_unchecked();
@@ -1012,12 +1007,7 @@ mod tests {
             let expected_replay_start_ts = after_root.root_ts;
             drop(engine);
 
-            let engine = EngineConfig::default()
-                .storage_root(main_dir)
-                .trx(TrxSysConfig::default().log_file_stem("catalog-meta-reclaim"))
-                .build()
-                .await
-                .unwrap();
+            let engine = open_catalog_test_engine(main_dir, Some("catalog-meta-reclaim")).await;
             let snap = engine.catalog().storage.checkpoint_snapshot().unwrap();
             assert_eq!(snap.catalog_replay_start_ts, expected_replay_start_ts);
             assert_eq!(snap.meta.next_table_id, USER_OBJ_ID_START);
@@ -1029,12 +1019,7 @@ mod tests {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
             let main_dir = temp_dir.path().to_path_buf();
-            let engine = EngineConfig::default()
-                .storage_root(main_dir)
-                .trx(TrxSysConfig::default().log_file_stem("catalog-meta-fast-path"))
-                .build()
-                .await
-                .unwrap();
+            let engine = open_catalog_test_engine(main_dir, Some("catalog-meta-fast-path")).await;
 
             let _ = table1(&engine).await;
             engine
@@ -1087,12 +1072,8 @@ mod tests {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
             let main_dir = temp_dir.path().to_path_buf();
-            let engine = EngineConfig::default()
-                .storage_root(main_dir)
-                .trx(TrxSysConfig::default().log_file_stem("catalog-canceled-fast-path"))
-                .build()
-                .await
-                .unwrap();
+            let engine =
+                open_catalog_test_engine(main_dir, Some("catalog-canceled-fast-path")).await;
 
             let storage = &engine.catalog().storage;
             let before_root = storage.mtb.active_root_unchecked();
@@ -1147,12 +1128,8 @@ mod tests {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
             let main_dir = temp_dir.path().to_path_buf();
-            let engine = EngineConfig::default()
-                .storage_root(main_dir)
-                .trx(TrxSysConfig::default().log_file_stem("catalog-reclaim-invalid-root"))
-                .build()
-                .await
-                .unwrap();
+            let engine =
+                open_catalog_test_engine(main_dir, Some("catalog-reclaim-invalid-root")).await;
 
             let storage = &engine.catalog().storage;
             let active_before = storage.mtb.active_root_unchecked();
@@ -1197,14 +1174,9 @@ mod tests {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
             let main_dir = temp_dir.path().to_path_buf();
-            let engine = EngineConfig::default()
-                .storage_root(main_dir)
-                .trx(
-                    TrxSysConfig::default().log_file_stem("catalog-checkpoint-canceled-empty-root"),
-                )
-                .build()
-                .await
-                .unwrap();
+            let engine =
+                open_catalog_test_engine(main_dir, Some("catalog-checkpoint-canceled-empty-root"))
+                    .await;
 
             let storage = &engine.catalog().storage;
             let table = storage.get_catalog_table(TableID::new(0)).unwrap();
@@ -1244,15 +1216,11 @@ mod tests {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
             let main_dir = temp_dir.path().to_path_buf();
-            let engine = EngineConfig::default()
-                .storage_root(main_dir)
-                .trx(
-                    TrxSysConfig::default()
-                        .log_file_stem("catalog-checkpoint-canceled-existing-root"),
-                )
-                .build()
-                .await
-                .unwrap();
+            let engine = open_catalog_test_engine(
+                main_dir,
+                Some("catalog-checkpoint-canceled-existing-root"),
+            )
+            .await;
 
             let _ = table1(&engine).await;
             engine
@@ -1297,12 +1265,8 @@ mod tests {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
             let main_dir = temp_dir.path().to_path_buf();
-            let engine = EngineConfig::default()
-                .storage_root(main_dir)
-                .trx(TrxSysConfig::default().log_file_stem("catalog-checkpoint-readonly-cache"))
-                .build()
-                .await
-                .unwrap();
+            let engine =
+                open_catalog_test_engine(main_dir, Some("catalog-checkpoint-readonly-cache")).await;
 
             let _ = table1(&engine).await;
             engine
@@ -1347,12 +1311,8 @@ mod tests {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
             let main_dir = temp_dir.path().to_path_buf();
-            let engine = EngineConfig::default()
-                .storage_root(main_dir)
-                .trx(TrxSysConfig::default().log_file_stem("catalog-checkpoint-tail-merge"))
-                .build()
-                .await
-                .unwrap();
+            let engine =
+                open_catalog_test_engine(main_dir, Some("catalog-checkpoint-tail-merge")).await;
 
             let _ = table1(&engine).await;
             engine
