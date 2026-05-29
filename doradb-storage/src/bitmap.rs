@@ -641,7 +641,7 @@ impl Eq for AllocMap {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rand::RngCore;
+    use rand::Rng;
     use std::sync::Arc;
     use std::thread;
 

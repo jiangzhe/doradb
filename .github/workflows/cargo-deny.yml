@@ -1,0 +1,21 @@
+name: Cargo Deny
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+jobs:
+  cargo-deny:
+    name: License & Vulnerability Check
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Run cargo-deny
+        uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          # Optional: Defaults to 'check' which runs all checks (advisories, bans, licenses, sources)
+          command: check
