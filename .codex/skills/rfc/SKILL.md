@@ -91,6 +91,10 @@ tools/rfc.rs create-rfc-doc \
    - `Task Doc: docs/tasks/TBD.md`
    - `Task Issue: #0`
    These placeholders must be replaced later when concrete task docs/issues are created.
+5. For each non-trivial phase, include concise phase-design bullets when useful:
+   - `Prerequisites`: only the conditions that must be true before this phase can safely start.
+   - `Phase-local Choices`: decisions intentionally left to that phase's task design.
+   Do not restate previous phase summaries. Keep these bullets focused on what the current phase needs or may decide locally.
 
 If backlog docs are provided as source context, include them under `Design Inputs` -> `Source Backlogs`.
 
@@ -103,6 +107,11 @@ Revise the draft with user feedback and finalize:
 - implementation phases
 - alternatives considered (with rejection rationale)
 - risks and test strategy
+
+For phased RFCs, revise each phase so its prerequisites and phase-local choices
+are actionable for downstream task creation. Use these bullets only when they add
+signal; they should be concise, current-phase-specific, and should not duplicate
+the preceding phase's `After This Phase` text.
 
 When test strategy includes enforced timeouts or hang detection:
 - do not assume plain `cargo test` can provide it;
@@ -166,7 +175,8 @@ Ensure every RFC is:
 2. Explicit about goal, scope, and change direction.
 3. Grounded in docs/code/conversation references.
 4. Explicit about alternatives and rejection rationale.
-5. Phase-structured for downstream task/issue tracking.
+5. Phase-structured for downstream task/issue tracking, including concise
+   prerequisites and phase-local choices for phases that need them.
 6. Based on proposal rounds that compare meaningfully different strategic directions, not just effort tiers.
 
 ## Reference
