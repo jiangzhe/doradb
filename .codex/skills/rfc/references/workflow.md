@@ -35,6 +35,10 @@ Complete all items:
 9. Include source references (docs/code/conversation/backlog as applicable).
 10. Ask user feedback.
 
+When proposals include phased implementation, identify any phase prerequisites
+or phase-local choices that materially affect the recommended direction. Keep
+them concise and avoid repeating the previous phase's outcome as a prerequisite.
+
 ## Test Strategy Constraint
 
 If an RFC proposes enforced test timeouts or automated hang detection:
@@ -54,6 +58,8 @@ Draft RFC must include:
 3. `## Decision` section with explicit references.
 4. `## Alternatives Considered` section.
 5. `## Implementation Phases` section.
+6. For non-trivial phases, concise `Prerequisites` and `Phase-local Choices`
+   bullets when they are needed to guide downstream tasks.
 
 ## Formal Requirements (`status: proposal|accepted|implemented|superseded`)
 
@@ -67,7 +73,11 @@ Formal RFC must satisfy all draft requirements plus:
    - `Phase Status`
    - `Implementation Summary`
    - optional `Related Backlogs`
-4. For newly created RFC docs, initialize phase task linkage with placeholders until task planning is complete:
+4. Each phase that depends on prior work or leaves design details to its task
+   includes concise `Prerequisites` and `Phase-local Choices` bullets. These
+   bullets must focus on the current phase and must not merely restate previous
+   phase summaries.
+5. For newly created RFC docs, initialize phase task linkage with placeholders until task planning is complete:
    - `Task Doc: docs/tasks/TBD.md`
    - `Task Issue: #0`
    Replace these placeholders with concrete values when corresponding tasks/issues are created.

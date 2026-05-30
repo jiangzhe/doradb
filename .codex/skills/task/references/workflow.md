@@ -24,25 +24,33 @@ Complete all items:
 1. Capture feature/bug statement and success criteria.
 2. Read relevant architecture/process docs in `docs/`.
 3. Inspect impacted code paths and related modules.
-4. Produce at least three explicitly labeled proposals:
+4. If the task is linked to an RFC phase, read the parent RFC phase plus the
+   immediately following phase when present. Extract target phase
+   `Prerequisites`, `Phase-local Choices`, `After This Phase`, and `Non-goals`,
+   and treat following-phase prerequisites as constraints the task should
+   preserve or intentionally update.
+5. Produce at least three explicitly labeled proposals:
    - `First-Principles Proposal`
    - `Long-Term Evolution Proposal`
    - `Original-Requirement-Fit Proposal`
    Additional proposals are optional when they add real strategic value.
-5. For each proposal, explain scope, rationale, tradeoffs/drawbacks, and alignment/conflict with the original request.
-6. If the `Long-Term Evolution Proposal` broadens to RFC scope and becomes the recommended best-overall direction, fail the task gate, recommend RFC escalation, and include one limited prerequisite task suggestion.
-7. Include a `Source References` block with at least:
+6. For each proposal, explain scope, rationale, tradeoffs/drawbacks, and alignment/conflict with the original request.
+7. For RFC-linked tasks, each proposal and the recommendation must state how the
+   target phase prerequisites are satisfied, which phase-local choices are
+   resolved, and whether following-phase prerequisites or assumptions change.
+8. If the `Long-Term Evolution Proposal` broadens to RFC scope and becomes the recommended best-overall direction, fail the task gate, recommend RFC escalation, and include one limited prerequisite task suggestion.
+9. Include a `Source References` block with at least:
    - 2 concrete repo references total,
    - 1 docs/backlog/process reference (`[D#]` or `[B#]`),
    - 1 code/tool/skill reference (`[C#]`),
    - source backlog reference (`[B#]`) when task creation starts from backlog input,
    - optional conversation references (`[U#]`) only when user constraints materially affect scope.
-8. Cite at least one relevant reference token in each proposal and in the recommendation.
-9. Avoid low-value citation padding; references must be materially used in analysis or rationale.
-10. Recommend the best overall direction for correctness and project evolution; do not default to the original request.
-11. If the recommendation conflicts with the original request, explain the findings that make the original direction weaker.
-12. Treat effort-tier-only proposal sets (for example `easy / medium / hard`) as weak by default; use them only when each option maps to a materially different strategic direction and say what that difference is.
-13. Ask for user feedback on the recommendation.
+10. Cite at least one relevant reference token in each proposal and in the recommendation.
+11. Avoid low-value citation padding; references must be materially used in analysis or rationale.
+12. Recommend the best overall direction for correctness and project evolution; do not default to the original request.
+13. If the recommendation conflicts with the original request, explain the findings that make the original direction weaker.
+14. Treat effort-tier-only proposal sets (for example `easy / medium / hard`) as weak by default; use them only when each option maps to a materially different strategic direction and say what that difference is.
+15. Ask for user feedback on the recommendation.
 
 ## `task create` Round 2 Checklist
 
@@ -55,8 +63,11 @@ Complete all items:
 5. Follow `docs/process/unit-test.md` for current test-runner constraints.
 6. Do not assume plain `cargo test` can enforce timeouts; if timeout policy or hang detection is required, scope explicit runner/tooling work instead of inventing unsupported flags.
 7. Treat `docs/backlogs/000060-evaluate-cargo-nextest-adoption-for-unit-test-timeout-enforcement.md` as the current follow-up for `cargo-nextest` timeout evaluation unless the task itself is changing test tooling.
-8. List unresolved open questions, if any.
-9. Ask for explicit approval to write the task document.
+8. For RFC-linked tasks, finalize target phase prerequisites relied on,
+   phase-local choices resolved, following-phase prerequisites preserved or
+   enabled, and any RFC phase-plan edits required by the design.
+9. List unresolved open questions, if any.
+10. Ask for explicit approval to write the task document.
 
 ## Strict RFC Escalation Gate
 
@@ -88,6 +99,11 @@ Follow `docs/tasks/000000-template.md` and fill:
 6. Impacts
 7. Test Cases
 8. Open Questions
+
+For RFC-linked tasks, record the parent RFC and phase in Context or Plan. Include
+the phase prerequisites, resolved phase-local choices, following-phase
+constraints, and any planned RFC phase-plan update that the implementation must
+preserve.
 
 Ensure content is decision-complete and ready for direct implementation. The
 task doc must contain enough goals, non-goals, plan detail, impacted
@@ -153,6 +169,8 @@ Complete all items:
    - Ask for the task doc path if the task remains ambiguous.
 2. Read `docs/process/dev-checklist.md`.
 3. Read the task doc's Goals, Non-Goals, Plan, Test Cases, and Open Questions.
+   If the task is RFC-linked, also read the parent RFC target phase and the
+   following phase prerequisites referenced by the task.
 4. Inspect implementation scope with:
 ```bash
 git status --short
@@ -172,7 +190,9 @@ git diff
      algorithmic complexity, allocations/copies, recomputation, and data
      reduction opportunities.
    - Feature completeness: compare implementation to task goals, non-goals,
-     acceptance criteria, and protected unchanged behavior.
+     acceptance criteria, protected unchanged behavior, and, for RFC-linked
+     tasks, the target phase prerequisites, phase-local choices, and
+     following-phase prerequisites.
    - Documentation: verify public and crate-public docs, trait docs, core logic
      comments, and related concept-level documentation updates.
    - Test-only code: confirm helpers stay inside `#[cfg(test)] mod tests`
@@ -226,6 +246,9 @@ tools/task.rs resolve-task-next-id --task docs/tasks/000042-example.md
 tools/task.rs resolve-task-rfc --task docs/tasks/000042-example.md
 ```
    - Use `--summary-file` when the sync summary is longer than a short phrase or includes markdown/backticks.
+   - If the task proposal or implementation changes phase prerequisites,
+     phase-local choices, `After This Phase`, non-goals, or following-phase
+     assumptions, update the RFC phase plan before or with the resolve sync.
 13. Do not run `git commit` or `git push` during `task resolve`.
 14. Limit resolve actions to task-doc synchronization plus required backlog/RFC updates; leave version-control publication to an explicit separate request.
 

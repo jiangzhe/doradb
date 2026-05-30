@@ -36,6 +36,12 @@ Read project background documents before suggesting designs:
 Read only the relevant docs for the request, then inspect related code modules and call paths.
 Ground design decisions in concrete file-level impacts.
 
+If the task is linked to an RFC phase, also read the parent RFC's
+`Implementation Phases` section before proposals. Extract the target phase's
+`Prerequisites`, `Phase-local Choices`, `After This Phase`, and `Non-goals`, and
+read the immediately following phase when it exists so the current task does not
+break its prerequisites. Treat those phase statements as design inputs.
+
 ## Step 2: Apply Strict Complexity Gate
 
 Escalate to RFC instead of task when any condition is true:
@@ -78,6 +84,12 @@ If the recommended direction conflicts with the original request, explicitly des
 If the `Long-Term Evolution Proposal` broadens to RFC scope, state that scope change explicitly and, when recommending it, include one limited prerequisite task suggestion for the RFC.
 Proposal sets that differ only by effort level (for example `easy / medium / hard`) are weak by default. They are acceptable only when each option represents a materially different strategic direction, and that difference is stated explicitly.
 
+For RFC-linked tasks, each proposal and the recommendation must state how it
+satisfies the target phase prerequisites, which phase-local choices it resolves,
+and whether it changes assumptions for the following phase. If the best proposal
+requires changing the RFC phased plan, call out the proposed RFC update instead
+of hiding it in the task scope.
+
 The labeled proposal taxonomy is required in proposal rounds only; the final task doc should capture the chosen direction and materially relevant rejected alternatives without needing to preserve the labels verbatim.
 
 Then request user feedback.
@@ -92,6 +104,11 @@ Resolve disagreements, tighten scope, and finalize:
 - implementation plan
 - test scenarios
 - open questions (if any)
+
+For RFC-linked tasks, Round 2 must finalize the phase contract: target phase
+prerequisites this task relies on, phase-local choices this task resolves,
+following-phase prerequisites it intentionally preserves or enables, and any RFC
+phase-plan edits required by the chosen design.
 
 Round 2 must complete before any write to `.worktrees/<task-id>/docs/tasks/`.
 
@@ -150,6 +167,11 @@ tools/task.rs create-task-doc \
    - Manual backlog create/close workflow is owned by `$backlog` skill (`tools/backlog.rs`), not by this skill.
 8. Fill the file according to `docs/tasks/000000-template.md` in the task worktree.
 
+For RFC-linked tasks, include the parent RFC and phase in the task context or
+plan. Record the relevant phase prerequisites, resolved phase-local choices, and
+any planned RFC phase-plan update so the implementation agent treats them as
+acceptance constraints.
+
 The finished task doc is the implementation source of truth. It must contain
 enough goals, non-goals, plan detail, impacted interfaces, test cases, risks,
 and resolved decisions for an implementation agent to start coding directly
@@ -175,6 +197,8 @@ chooses to defer actionable follow-ups, use the `$backlog` workflow separately.
 2. Gather review context:
    - Read `docs/process/dev-checklist.md`.
    - Read the task doc's Goals, Non-Goals, Plan, Test Cases, and Open Questions.
+   - If the task is RFC-linked, read the parent RFC phase and following phase
+     prerequisites referenced by the task.
    - Inspect the implementation scope with `git status --short`,
      `git diff --stat`, and relevant diffs.
 3. Walk every checklist category in `docs/process/dev-checklist.md`:
@@ -190,7 +214,9 @@ chooses to defer actionable follow-ups, use the `$backlog` workflow separately.
      reduction opportunities.
    - Feature completeness: compare implementation against task goals,
      non-goals, acceptance criteria, and explicitly protected unchanged
-     behavior.
+     behavior. For RFC-linked tasks, also verify the implementation satisfies
+     target phase prerequisites, resolves documented phase-local choices, and
+     preserves or updates following-phase prerequisites.
    - Documentation: verify public and crate-public item docs, trait docs, core
      logic comments, and related concept-level documentation updates.
    - Test-only code: confirm helpers stay inside `#[cfg(test)] mod tests`
@@ -243,6 +269,10 @@ This command fetches `origin/main` and updates the local `docs/tasks/next-id` to
 ```bash
 tools/task.rs resolve-task-rfc --task docs/tasks/000042-example.md
 ```
+   - If the proposal or implementation changed the phase's prerequisites,
+     phase-local choices, `After This Phase`, non-goals, or the following
+     phase's assumptions, update that RFC phase text as part of resolve, then
+     run the sync command.
 10. `task resolve` must not run `git commit` or `git push`.
    - Resolve updates are limited to document synchronization and related backlog/RFC tooling.
    - Leave commit/push decisions to an explicit user request or a separate workflow.
