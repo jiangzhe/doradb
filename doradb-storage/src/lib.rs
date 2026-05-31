@@ -38,7 +38,7 @@ pub use catalog::{
     TableSpec,
 };
 pub use conf::{EngineConfig, EvictableBufferPoolConfig, FileSystemConfig, TrxSysConfig};
-pub use engine::{Engine, EngineRef};
+pub use engine::Engine;
 pub use error::{Error, ErrorKind, Result};
 pub use lock::LockMode;
 pub use row::ops::{DeleteMvcc, ScanMvcc, SelectKey, SelectMvcc, UpdateCol, UpdateMvcc};

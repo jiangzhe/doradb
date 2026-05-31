@@ -55,9 +55,9 @@ impl Session {
         self.state.id()
     }
 
-    /// Returns the engine handle bound to this session.
+    /// Returns the crate-private engine runtime handle bound to this session.
     #[inline]
-    pub fn engine(&self) -> &EngineRef {
+    pub(crate) fn engine(&self) -> &EngineRef {
         &self.state.engine_ref
     }
 
@@ -202,7 +202,7 @@ impl Session {
 }
 
 /// Shared mutable state referenced by transactions started from one [`Session`].
-pub struct SessionState {
+pub(crate) struct SessionState {
     id: SessionID,
     engine_ref: EngineRef,
     pool_guards: PoolGuards,
@@ -214,7 +214,7 @@ pub struct SessionState {
 impl SessionState {
     /// Create a new session state and populate its default pool guards.
     #[inline]
-    pub fn new(engine_ref: EngineRef, id: SessionID) -> Self {
+    pub(crate) fn new(engine_ref: EngineRef, id: SessionID) -> Self {
         let pool_guards = PoolGuards::builder()
             .push(PoolRole::Meta, engine_ref.meta_pool.pool_guard())
             .push(PoolRole::Index, engine_ref.index_pool.pool_guard())
@@ -237,9 +237,9 @@ impl SessionState {
         self.id
     }
 
-    /// Returns the engine handle for this session state.
+    /// Returns the crate-private engine runtime handle for this session state.
     #[inline]
-    pub fn engine(&self) -> &EngineRef {
+    pub(crate) fn engine(&self) -> &EngineRef {
         &self.engine_ref
     }
 
