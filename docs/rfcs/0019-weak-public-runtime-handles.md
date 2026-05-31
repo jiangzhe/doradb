@@ -4,6 +4,7 @@ title: Weak Public Runtime Handles
 status: proposal
 tags: [storage-engine, lifecycle, public-api, weak-handles, shutdown]
 created: 2026-05-29
+github_issue: 675
 ---
 
 # RFC-0019: Weak Public Runtime Handles
