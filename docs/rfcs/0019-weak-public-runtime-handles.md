@@ -578,8 +578,8 @@ code is visible.
   - Non-goals: Do not migrate public session, transaction, or table APIs yet. Do
     not redesign transaction semantics, table DDL, checkpoint, recovery, or
     buffer-pool internals beyond what the foundation needs.
-  - Task Doc: `docs/tasks/TBD.md`
-  - Task Issue: `#0`
+  - Task Doc: `docs/tasks/000163-weak-handle-foundation.md`
+  - Task Issue: `#671`
   - Phase Status: `pending`
   - Implementation Summary: `pending`
   - Related Backlogs:
