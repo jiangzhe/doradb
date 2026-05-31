@@ -1,9 +1,3 @@
 ---
-exclude_paths:
-    - ".codex/**"
-    - ".config/**"
-    - ".githooks/**"
-    - "docs/**"
-    - "legacy/**"
-    - "target/**"
-    - "tools/**"
+include_paths:
+  - "doradb-storage/**"
