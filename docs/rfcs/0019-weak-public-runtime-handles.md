@@ -578,10 +578,10 @@ code is visible.
   - Non-goals: Do not migrate public session, transaction, or table APIs yet. Do
     not redesign transaction semantics, table DDL, checkpoint, recovery, or
     buffer-pool internals beyond what the foundation needs.
-  - Task Doc: `docs/tasks/TBD.md`
-  - Task Issue: `#0`
-  - Phase Status: `pending`
-  - Implementation Summary: `pending`
+  - Task Doc: `docs/tasks/000163-weak-handle-foundation.md`
+  - Task Issue: `#671`
+  - Phase Status: done
+  - Implementation Summary: Implemented packed-atomic admission, Event-based shutdown drain, lifecycle tests, and baseline example. [Task Resolve Sync: docs/tasks/000163-weak-handle-foundation.md @ 2026-05-31]
   - Related Backlogs:
     - `docs/backlogs/000066-engine-scoped-weak-runtime-handles.md`
 

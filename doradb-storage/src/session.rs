@@ -103,7 +103,7 @@ impl Session {
     /// Begin a new transaction if the session is currently idle.
     #[inline]
     pub fn begin_trx(&mut self) -> Result<ActiveTrx> {
-        self.state.engine_ref.with_running_admission(|| {
+        self.state.engine_ref.with_admitted_operation(|| {
             if !self.state.try_enter_trx() {
                 return Err(Report::new(OperationError::ExistingTransaction)
                     .attach(format!("session_id={}", self.id()))

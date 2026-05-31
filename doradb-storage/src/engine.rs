@@ -20,14 +20,23 @@ use crate::session::Session;
 use crate::trx::sys::TransactionSystem;
 use crate::{DiskPool, IndexPool, MemPool, MetaPool};
 use error_stack::{Report, ensure};
-use parking_lot::{Mutex, RwLock};
+use event_listener::{Event, Listener, listener};
+use parking_lot::Mutex;
+use std::marker::PhantomData;
 use std::ops::Deref;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 const FIRST_SESSION_ID: SessionID = SessionID::new(1);
+// Engine lifecycle admission uses one packed atomic word so admission and
+// shutdown closure live in a single CAS domain. The low bits encode
+// `EngineLifecycleState`; the remaining high bits count active admissions.
+const LIFECYCLE_STATE_BITS: usize = 2;
+const LIFECYCLE_STATE_MASK: usize = (1 << LIFECYCLE_STATE_BITS) - 1;
+const ONE_ACTIVE_ADMISSION: usize = 1 << LIFECYCLE_STATE_BITS;
+const MAX_ACTIVE_ADMISSIONS: usize = usize::MAX >> LIFECYCLE_STATE_BITS;
 
-#[repr(u8)]
+#[repr(usize)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum EngineLifecycleState {
     Running = 0,
@@ -35,9 +44,40 @@ enum EngineLifecycleState {
     Shutdown = 2,
 }
 
+impl EngineLifecycleState {
+    #[inline]
+    const fn as_usize(self) -> usize {
+        self as usize
+    }
+}
+
+impl TryFrom<usize> for EngineLifecycleState {
+    type Error = usize;
+
+    #[inline]
+    fn try_from(value: usize) -> std::result::Result<Self, Self::Error> {
+        match value {
+            x if x == EngineLifecycleState::Running.as_usize() => Ok(EngineLifecycleState::Running),
+            x if x == EngineLifecycleState::ShuttingDown.as_usize() => {
+                Ok(EngineLifecycleState::ShuttingDown)
+            }
+            x if x == EngineLifecycleState::Shutdown.as_usize() => {
+                Ok(EngineLifecycleState::Shutdown)
+            }
+            x => Err(x),
+        }
+    }
+}
+
 struct EngineLifecycle {
-    state: AtomicU8,
-    admission_gate: RwLock<()>,
+    /// Packed lifecycle state and active admission count.
+    ///
+    /// Bits `[0, LIFECYCLE_STATE_BITS)` store [`EngineLifecycleState`]. The
+    /// upper bits store the number of live [`EngineAdmission`] tokens. Keeping
+    /// both in one atomic prevents the shutdown close-admission transition from
+    /// racing independently with new admission increments.
+    state: AtomicUsize,
+    admission_released: Event,
     finalize_lock: Mutex<()>,
 }
 
@@ -45,36 +85,126 @@ impl EngineLifecycle {
     #[inline]
     fn new() -> Self {
         Self {
-            state: AtomicU8::new(EngineLifecycleState::Running as u8),
-            admission_gate: RwLock::new(()),
+            state: AtomicUsize::new(EngineLifecycleState::Running.as_usize()),
+            admission_released: Event::new(),
             finalize_lock: Mutex::new(()),
         }
     }
 
     #[inline]
+    const fn active_admissions_from_word(word: usize) -> usize {
+        word >> LIFECYCLE_STATE_BITS
+    }
+
+    #[inline]
     fn state(&self) -> EngineLifecycleState {
-        match self.state.load(Ordering::Acquire) {
-            x if x == EngineLifecycleState::Running as u8 => EngineLifecycleState::Running,
-            x if x == EngineLifecycleState::ShuttingDown as u8 => {
-                EngineLifecycleState::ShuttingDown
+        let state = self.state.load(Ordering::Acquire) & LIFECYCLE_STATE_MASK;
+        EngineLifecycleState::try_from(state)
+            .unwrap_or_else(|state| panic!("invalid engine lifecycle state: {state}"))
+    }
+
+    #[inline]
+    fn admit(&self) -> LifecycleResult<EngineAdmission<'_>> {
+        loop {
+            let word = self.state.load(Ordering::Acquire);
+            let state = EngineLifecycleState::try_from(word & LIFECYCLE_STATE_MASK)
+                .unwrap_or_else(|state| panic!("invalid engine lifecycle state: {state}"));
+            ensure!(
+                state == EngineLifecycleState::Running,
+                LifecycleError::Shutdown
+            );
+            assert!(
+                Self::active_admissions_from_word(word) < MAX_ACTIVE_ADMISSIONS,
+                "engine admission count overflow"
+            );
+            let next = word + ONE_ACTIVE_ADMISSION;
+            if self
+                .state
+                .compare_exchange_weak(word, next, Ordering::AcqRel, Ordering::Relaxed)
+                .is_ok()
+            {
+                return Ok(EngineAdmission {
+                    lifecycle: self,
+                    _not_send: PhantomData,
+                });
             }
-            x if x == EngineLifecycleState::Shutdown as u8 => EngineLifecycleState::Shutdown,
-            x => panic!("invalid engine lifecycle state: {x}"),
         }
     }
 
     #[inline]
-    fn set_state(&self, state: EngineLifecycleState) {
-        self.state.store(state as u8, Ordering::Release);
+    fn close_admission(&self) {
+        loop {
+            let word = self.state.load(Ordering::Acquire);
+            let state = EngineLifecycleState::try_from(word & LIFECYCLE_STATE_MASK)
+                .unwrap_or_else(|state| panic!("invalid engine lifecycle state: {state}"));
+            match state {
+                EngineLifecycleState::Running => {
+                    let next = (word & !LIFECYCLE_STATE_MASK)
+                        | EngineLifecycleState::ShuttingDown.as_usize();
+                    if self
+                        .state
+                        .compare_exchange_weak(word, next, Ordering::AcqRel, Ordering::Relaxed)
+                        .is_ok()
+                    {
+                        return;
+                    }
+                }
+                EngineLifecycleState::ShuttingDown | EngineLifecycleState::Shutdown => return,
+            }
+        }
     }
 
     #[inline]
-    fn ensure_running(&self) -> LifecycleResult<()> {
-        ensure!(
-            self.state() == EngineLifecycleState::Running,
-            LifecycleError::Shutdown
-        );
-        Ok(())
+    fn wait_for_admissions_drained(&self) {
+        loop {
+            if Self::active_admissions_from_word(self.state.load(Ordering::Acquire)) == 0 {
+                return;
+            }
+            listener!(self.admission_released => admission_released);
+            if Self::active_admissions_from_word(self.state.load(Ordering::Acquire)) == 0 {
+                return;
+            }
+            admission_released.wait();
+        }
+    }
+
+    #[inline]
+    fn mark_shutdown(&self) {
+        let word = self.state.load(Ordering::Acquire);
+        let state = EngineLifecycleState::try_from(word & LIFECYCLE_STATE_MASK)
+            .unwrap_or_else(|state| panic!("invalid engine lifecycle state: {state}"));
+        debug_assert_eq!(state, EngineLifecycleState::ShuttingDown);
+        debug_assert_eq!(Self::active_admissions_from_word(word), 0);
+        self.state
+            .store(EngineLifecycleState::Shutdown.as_usize(), Ordering::Release);
+    }
+
+    #[inline]
+    fn release_admission(&self) {
+        let word = self.state.fetch_sub(ONE_ACTIVE_ADMISSION, Ordering::AcqRel);
+        let active_admissions = Self::active_admissions_from_word(word);
+        assert!(active_admissions > 0, "engine admission count underflow");
+        if active_admissions == 1 {
+            self.admission_released.notify(usize::MAX);
+        }
+    }
+}
+
+/// Short-lived proof that an operation entered while the engine was running.
+///
+/// The token keeps the engine's active-admission count nonzero until immediate
+/// lifecycle validation, local runtime lookup, or strong pinning is complete.
+/// Callers must not hold it across user callbacks, statement execution,
+/// blocking I/O, registry guard retention, or `.await` points.
+pub(crate) struct EngineAdmission<'a> {
+    lifecycle: &'a EngineLifecycle,
+    _not_send: PhantomData<*mut ()>,
+}
+
+impl Drop for EngineAdmission<'_> {
+    #[inline]
+    fn drop(&mut self) {
+        self.lifecycle.release_admission();
     }
 }
 
@@ -122,7 +252,7 @@ impl Engine {
     #[inline]
     pub fn new_session(&self) -> Result<Session> {
         let inner = self.inner();
-        inner.with_running_admission(|| {
+        inner.with_admitted_operation(|| {
             let id = inner.next_session_id();
             Session::new(EngineRef(Arc::clone(inner)), id)
         })
@@ -147,7 +277,7 @@ impl Engine {
     #[inline]
     pub fn new_ref(&self) -> Result<EngineRef> {
         let inner = self.inner();
-        inner.with_running_admission(|| EngineRef(Arc::clone(inner)))
+        inner.with_admitted_operation(|| EngineRef(Arc::clone(inner)))
     }
 
     /// Start idempotent engine shutdown.
@@ -172,23 +302,17 @@ impl Engine {
             return Ok(());
         }
 
-        {
-            let _gate = inner.lifecycle.admission_gate.write();
-            if inner.lifecycle.state() == EngineLifecycleState::Running {
-                inner
-                    .lifecycle
-                    .set_state(EngineLifecycleState::ShuttingDown);
-            }
-        }
+        inner.lifecycle.close_admission();
+        inner.lifecycle.wait_for_admissions_drained();
 
         // Any live session/transaction/statement keeps an `EngineRef` alive
         // through `SessionState`. Owner-side `EngineRef` creation and session
-        // admission also hold the read side of `admission_gate`, so once the
-        // Running -> ShuttingDown transition completes under the write lock no
+        // admission increment `active_admissions`, so once the Running ->
+        // ShuttingDown transition completes and the admission count drains, no
         // new owner-created runtime handles can appear before this snapshot.
         // Requiring the last strong reference here gives transaction-system
-        // shutdown a clean point where user-originated work has already
-        // drained before we start disabling runtime state. This requirement is
+        // shutdown a clean point where user-originated work has already drained
+        // before we start disabling runtime state. This requirement is
         // unchanged for poisoned engines: poison does not drain sessions or old
         // table handles for us.
         let strong_count = Arc::strong_count(inner);
@@ -199,7 +323,7 @@ impl Engine {
         }
 
         self.components().shutdown_all();
-        inner.lifecycle.set_state(EngineLifecycleState::Shutdown);
+        inner.lifecycle.mark_shutdown();
         Ok(())
     }
 }
@@ -262,7 +386,7 @@ impl EngineRef {
     /// Create a new session while the engine is still running.
     #[inline]
     pub fn new_session(&self) -> Result<Session> {
-        self.0.with_running_admission(|| {
+        self.0.with_admitted_operation(|| {
             let id = self.0.next_session_id();
             Session::new(self.clone(), id)
         })
@@ -278,7 +402,7 @@ impl EngineRef {
     #[inline]
     pub async fn get_table(&self, table_id: TableID) -> Result<Arc<crate::Table>> {
         self.0
-            .with_running_admission(|| self.0.catalog().get_table_now(table_id))?
+            .with_admitted_operation(|| self.0.catalog().get_table_now(table_id))?
             .ok_or_else(|| {
                 error_stack::Report::new(OperationError::TableNotFound)
                     .attach(format!("get table: table_id={table_id}"))
@@ -345,11 +469,26 @@ impl EngineInner {
         SessionID::new(self.next_session_id.fetch_add(1, Ordering::Relaxed))
     }
 
+    /// Enter one short engine operation while runtime admission is open.
+    ///
+    /// The returned token is a scoped admission proof only. Drop it before any
+    /// user callback, statement execution, blocking I/O, registry guard
+    /// retention, or `.await` point.
     #[inline]
-    pub(crate) fn with_running_admission<T>(&self, f: impl FnOnce() -> T) -> Result<T> {
-        let _gate = self.lifecycle.admission_gate.read();
-        self.lifecycle.ensure_running()?;
+    pub(crate) fn acquire_admission(&self) -> Result<EngineAdmission<'_>> {
+        let admission = self.lifecycle.admit()?;
         self.trx_sys.ensure_runtime_healthy()?;
+        Ok(admission)
+    }
+
+    /// Run immediate synchronous work under engine admission.
+    ///
+    /// Use this helper for lifecycle validation plus local runtime lookup or
+    /// strong pinning. The closure must not perform user callbacks, statement
+    /// execution, blocking I/O, or async waits.
+    #[inline]
+    pub(crate) fn with_admitted_operation<T>(&self, f: impl FnOnce() -> T) -> Result<T> {
+        let _admission = self.acquire_admission()?;
         Ok(f())
     }
 }
@@ -447,7 +586,7 @@ mod tests {
     use crate::lock::{LockMode, LockOwner, LockResource};
     use std::fs;
     use std::panic::{AssertUnwindSafe, catch_unwind};
-    use std::sync::{Arc as StdArc, Barrier};
+    use std::sync::{Barrier, mpsc};
     use std::time::Duration;
     use tempfile::TempDir;
 
@@ -991,6 +1130,39 @@ mod tests {
     }
 
     #[test]
+    fn test_admitted_operation_token_releases_before_shutdown_completes() {
+        smol::block_on(async {
+            let root = TempDir::new().unwrap();
+            let engine = test_engine_config_for(root.path()).build().await.unwrap();
+            let admission = engine.inner().acquire_admission().unwrap();
+            let (started_tx, started_rx) = mpsc::channel();
+            let (done_tx, done_rx) = mpsc::channel();
+
+            std::thread::scope(|scope| {
+                let shutdown_handle = scope.spawn(|| {
+                    started_tx.send(()).unwrap();
+                    engine.shutdown().unwrap();
+                    done_tx.send(()).unwrap();
+                });
+
+                started_rx
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("shutdown thread should start");
+                assert!(
+                    done_rx.recv_timeout(Duration::from_millis(20)).is_err(),
+                    "shutdown must wait while an admitted operation is active"
+                );
+
+                drop(admission);
+                done_rx
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("shutdown should complete after admission is released");
+                shutdown_handle.join().unwrap();
+            });
+        });
+    }
+
+    #[test]
     fn test_same_session_rejects_overlapping_transactions() {
         smol::block_on(async {
             let root = TempDir::new().unwrap();
@@ -1117,17 +1289,17 @@ mod tests {
         smol::block_on(async {
             let root = TempDir::new().unwrap();
             let engine = test_engine_config_for(root.path()).build().await.unwrap();
-            let barrier = StdArc::new(Barrier::new(3));
+            let barrier = Arc::new(Barrier::new(3));
             let engine = &engine;
 
             std::thread::scope(|scope| {
-                let shutdown_barrier = StdArc::clone(&barrier);
+                let shutdown_barrier = Arc::clone(&barrier);
                 let shutdown_handle = scope.spawn(move || {
                     shutdown_barrier.wait();
                     engine.shutdown()
                 });
 
-                let ref_barrier = StdArc::clone(&barrier);
+                let ref_barrier = Arc::clone(&barrier);
                 let ref_handle = scope.spawn(move || {
                     ref_barrier.wait();
                     engine.new_ref()
