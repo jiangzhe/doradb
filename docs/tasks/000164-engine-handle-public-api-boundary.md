@@ -1,7 +1,7 @@
 ---
 id: 000164
 title: Engine Handle Public API Boundary
-status: proposal
+status: implemented
 created: 2026-05-31
 github_issue: 673
 ---
@@ -248,6 +248,77 @@ Reference:
 
 ## Implementation Notes
 
+Implemented RFC-0019 Phase 2 with an owner-only public engine boundary:
+
+- `doradb-storage/src/lib.rs` now re-exports `Engine` without re-exporting
+  `EngineRef`.
+- `doradb-storage/src/engine.rs` keeps `EngineRef`, `Engine::new_ref()`,
+  `EngineRef::new_session()`, and `EngineRef::get_table()` as crate-private
+  transitional runtime access.
+- `doradb-storage/src/session.rs` hides `Session::engine()` and `SessionState`
+  from external callers while preserving public `Session::get_table()`,
+  transaction, DDL, and statement DML workflows.
+- Public engine shutdown remains synchronous as
+  `pub fn shutdown(&self) -> Result<()>`; owner-side finalization is shared
+  with `Drop` through `finalize_shutdown()`.
+- `doradb-storage/examples/weak_handle_baseline.rs` now measures
+  `table_lookup` through a reusable public `Session` instead of public
+  `EngineRef`.
+- `doradb-storage/tests/public_api_smoke.rs` now exercises the supported public
+  facade without importing or naming `EngineRef`.
+
+Lifecycle coverage was updated so shutdown closes public session admission,
+`Session::get_table()` reports `LifecycleError::Shutdown` after admission is
+closed, shutdown remains busy while transitional strong runtime references are
+alive, and owner drop without explicit shutdown succeeds when no extra runtime
+references remain.
+
+Validation completed:
+
+```bash
+cargo fmt
+cargo check -p doradb-storage --all-targets
+cargo clippy -p doradb-storage --all-targets -- -D warnings
+cargo nextest run -p doradb-storage
+tools/coverage_focus.rs --path doradb-storage/src/engine.rs --path doradb-storage/src/session.rs
+git diff --check
+```
+
+Results:
+- `cargo nextest run -p doradb-storage`: 865 tests passed.
+- Focused coverage:
+  - combined: 1049/1084 lines, 96.77%
+  - `doradb-storage/src/engine.rs`: 867/902 lines, 96.12%
+  - `doradb-storage/src/session.rs`: 182/182 lines, 100.00%
+- No unsafe code was added or modified.
+
+The Phase 1 baseline harness was run before and after the public boundary
+change:
+
+```bash
+cargo run -p doradb-storage --example weak_handle_baseline -- --iterations 10 --scan-rows 10 --out-dir target/weak-handle-baseline-before
+cargo run -p doradb-storage --example weak_handle_baseline -- --iterations 10 --scan-rows 10 --out-dir target/weak-handle-baseline-after
+```
+
+Observed after-change sample:
+- `session_begin`: 408 ns average
+- `statement_exec`: 412 ns average
+- `table_lookup`: 399 ns average
+- `point_lookup`: 8924 ns average
+- `insert`: 23325 ns average
+- `update`: 9716 ns average
+- `delete`: 11804 ns average
+- `table_scan`: 24087 ns average
+
+The before-change `table_lookup` sample was 396 ns average, so the public
+boundary change did not show a material table lookup regression in this smoke
+run.
+
+Created follow-up backlog:
+- `docs/backlogs/000114-evaluate-async-engine-shutdown-api.md` tracks whether
+  later weak-handle phases need an async engine shutdown API or explicit async
+  variant once there is real nonblocking cleanup work to wait for.
+
 ## Impacts
 
 - `doradb-storage/src/lib.rs`
@@ -331,3 +402,5 @@ Known follow-up boundaries:
    operation state.
 3. Phase 5 owns removing public `Arc<Table>` exposure and selecting the final
    table access shape.
+4. Async engine shutdown policy is deferred to
+   `docs/backlogs/000114-evaluate-async-engine-shutdown-api.md`.

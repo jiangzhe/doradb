@@ -599,21 +599,22 @@ code is visible.
   - Prerequisites: Phase 1 admission, weak reachability, cleanup-hint, and
     lifecycle error contracts are implementation-ready. Any public entry point
     changed in this phase must have a measured boundary-cost baseline.
-  - Phase-local Choices: Choose whether an engine-scoped public weak capability
-    remains at all; decide how much of `EngineRef` becomes crate-private versus
-    removed; define the concrete owner-drop behavior when admitted operations are
-    still possible; and choose the transitional compatibility surface needed by
-    later session, transaction, and table phases.
+  - Phase-local Choices: Resolved by choosing no engine-scoped public weak
+    capability for this phase; making `EngineRef`, `Engine::new_ref()`,
+    `EngineRef::new_session()`, and `EngineRef::get_table()` crate-private
+    transitional access; keeping `Engine` as the public owner/session factory;
+    and keeping `engine.shutdown()` synchronous while later phases define any
+    real async cleanup waits.
   - After This Phase: External users can no longer obtain a fresh cloneable
     public `EngineRef` equivalent, but legacy session, transaction, or table
     paths may still retain strong runtime reachability until their phases land.
     Full weak-handle shutdown completeness is not guaranteed until Phase 6.
   - Non-goals: Do not migrate session, transaction, or table handle semantics
     except where required to remove public strong `EngineRef` reachability.
-  - Task Doc: `docs/tasks/TBD.md`
-  - Task Issue: `#0`
-  - Phase Status: `pending`
-  - Implementation Summary: `pending`
+  - Task Doc: `docs/tasks/000164-engine-handle-public-api-boundary.md`
+  - Task Issue: `#673`
+  - Phase Status: done
+  - Implementation Summary: Removed the public cloneable EngineRef boundary, kept transitional EngineRef access crate-private, preserved synchronous Engine shutdown, updated public smoke tests and weak handle baseline, and deferred async shutdown policy to backlog 000114. [Task Resolve Sync: docs/tasks/000164-engine-handle-public-api-boundary.md @ 2026-05-31]
   - Related Backlogs:
     - `docs/backlogs/000114-evaluate-async-engine-shutdown-api.md`
 
