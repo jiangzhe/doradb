@@ -1,7 +1,7 @@
 ---
 id: 000163
 title: Weak Handle Foundation
-status: proposal
+status: implemented
 created: 2026-05-30
 github_issue: 671
 ---
@@ -28,13 +28,13 @@ ownership: `EngineRef` is a cloneable `Arc<EngineInner>`, `Session` owns an
 `Arc<SessionState>` that stores a strong `EngineRef`, transactions keep strong
 session reachability, and table lookup returns `Arc<Table>`.
 
-The current engine already has a useful starting point. `EngineLifecycle` stores
-the lifecycle state, an admission `RwLock`, and a finalize lock; public session
-and runtime-handle creation enter through `EngineInner::with_running_admission`.
-Shutdown closes admission and then requires `Arc::strong_count(inner) == 1`
-before component shutdown proceeds. Phase 1 should make the admission boundary
-clearer and reusable for later weak-handle phases without changing the current
-strong public handles.
+Before this task, `EngineLifecycle` stored the lifecycle state, an admission
+`RwLock`, and a finalize lock; public session and runtime-handle creation
+entered through `EngineInner::with_running_admission`. Shutdown closed
+admission and then required `Arc::strong_count(inner) == 1` before component
+shutdown proceeded. Phase 1 should make the admission boundary clearer and
+reusable for later weak-handle phases without changing the current strong
+public handles.
 
 `Statement` already provides the right operation boundary for later table weak
 handles. `ActiveTrx::exec` creates a borrowed `Statement`, and statement table
@@ -112,8 +112,7 @@ Related Backlogs:
 7. Do not redesign transaction commit, rollback, statement cancellation,
    session close, table DDL, checkpoint, recovery, purge, or buffer-pool
    internals.
-8. Do not reintroduce example binaries or widen the public API only to support
-   measurement.
+8. Do not widen the public API only to support measurement.
 9. Do not add a CI performance gate or hard regression threshold in this task.
 
 ## Unsafe Considerations (If Applicable)
@@ -227,6 +226,48 @@ Reference:
 
 ## Implementation Notes
 
+Implemented the Phase 1 admission foundation without changing public handle
+ownership or public signatures. `doradb-storage/src/engine.rs` now stores
+lifecycle state and active admission count in one packed `AtomicUsize`: low bits
+encode `EngineLifecycleState`, high bits count active `EngineAdmission` tokens.
+`EngineLifecycleState` exposes `as_usize` and `TryFrom<usize>`, with comments
+documenting the packed-word encoding. Shutdown closes admission with a single
+compare-and-swap, waits for admissions to drain through `event_listener::Event`,
+then preserves the existing strong-count busy check before component shutdown.
+
+Added the crate-private, non-cloneable, non-`Send` `EngineAdmission` RAII token
+and renamed the entry point to `EngineInner::acquire_admission`. The synchronous
+`with_admitted_operation` helper is used by `Engine::new_session`,
+`Engine::new_ref`, `EngineRef::new_session`, `EngineRef::get_table`, and
+`Session::begin_trx`. The token is documented as a short lifecycle/admission
+proof that must be dropped before `.await`, user callbacks, statement
+execution, blocking I/O, or retained registry guards.
+
+No weak public handle migration, weak engine wrapper, generation framework,
+cleanup worker, or generic operation-lease production type was added. The
+identity/generation, cleanup-hint, and operation-lease decisions remain scoped
+to later handle-migration phases as intended by this task and RFC-0019.
+
+Added reusable performance baseline support at
+`doradb-storage/examples/weak_handle_baseline.rs`. The example measures session
+begin, empty statement execution, table lookup, unique point lookup, insert,
+update, delete, and table scan against a temporary engine, writes
+`baseline.csv` under `target/`, defaults to `--iterations 1000` and
+`--scan-rows 10000`, and includes an inline comment requiring relevant
+RFC-0019 tasks to run it before and after performance-sensitive changes.
+
+Added and updated engine tests covering shutdown rejection, shutdown-busy
+preservation, idempotent shutdown, admission release before shutdown completes,
+external table-reference validity after shutdown, and shutdown/admission races.
+The baseline example was smoke-tested with reduced counts.
+
+Validation completed:
+- `cargo fmt`
+- `cargo clippy -p doradb-storage --all-targets -- -D warnings`
+- `cargo nextest run -p doradb-storage`: 864 passed
+- `tools/coverage_focus.rs --path doradb-storage/src/engine.rs --path doradb-storage/src/session.rs --top-uncovered 15 --write target/coverage/weak-handle-foundation.md`: combined 1033/1071 lines, 96.45%; `engine.rs` 95.73%, `session.rs` 100.00%
+- `cargo run -p doradb-storage --example weak_handle_baseline -- --iterations 2 --scan-rows 2 --out-dir target/weak-handle-baseline-smoke`
+- `git diff --check`
 
 ## Impacts
 

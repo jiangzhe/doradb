@@ -580,8 +580,8 @@ code is visible.
     buffer-pool internals beyond what the foundation needs.
   - Task Doc: `docs/tasks/000163-weak-handle-foundation.md`
   - Task Issue: `#671`
-  - Phase Status: `pending`
-  - Implementation Summary: `pending`
+  - Phase Status: done
+  - Implementation Summary: Implemented packed-atomic admission, Event-based shutdown drain, lifecycle tests, and baseline example. [Task Resolve Sync: docs/tasks/000163-weak-handle-foundation.md @ 2026-05-31]
   - Related Backlogs:
     - `docs/backlogs/000066-engine-scoped-weak-runtime-handles.md`
 
