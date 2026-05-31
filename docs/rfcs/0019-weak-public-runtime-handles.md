@@ -18,8 +18,8 @@ strongly owned by the catalog. Public session, transaction, and table handles
 carry only identity plus weak engine reachability; each public operation upgrades
 internally under engine admission, pins the needed strong objects for one
 closure-scoped operation, and then releases them before returning.
-Explicit async teardown methods (`session.close().await`, `trx.commit().await`,
-`trx.rollback().await`, and `engine.shutdown().await`) are the graceful cleanup
+Explicit teardown methods (`engine.shutdown()`, `session.close().await`,
+`trx.commit().await`, and `trx.rollback().await`) are the graceful cleanup
 contract. Dropping public handles without explicit teardown never performs async
 work inline from `Drop`; it only records abandoned identity for engine-owned
 cleanup, and operations fail once the engine is shutting down or gone.
@@ -139,8 +139,8 @@ Issue Labels:
   internally to a strong capability inside a closure-based interface.
 - [U3] Public weak handles should not implement `Clone`. `Drop` on a weak handle
   may hand identity to an engine-owned cleanup thread, but real resource cleanup
-  must use explicit async teardown methods such as `session.close().await`,
-  `trx.commit().await`, `trx.rollback().await`, and `engine.shutdown().await`.
+  must use explicit teardown methods such as `engine.shutdown()`,
+  `session.close().await`, `trx.commit().await`, and `trx.rollback().await`.
 - [U4] The engine should be stoppable or droppable even while weak public handles
   remain alive. Weak handles must acquire an engine gate before operations and
   fail when the engine is dropped or shutting down.
@@ -356,9 +356,13 @@ invariants:
 
 ### Explicit Teardown And Drop Contract
 
-Graceful cleanup is explicit and async:
+Graceful cleanup is explicit. Session and transaction terminal paths remain
+async because they own async transaction work; engine shutdown is synchronous in
+Phase 2 because owner-side finalization currently performs no async teardown.
+Async engine shutdown is deferred to
+`docs/backlogs/000114-evaluate-async-engine-shutdown-api.md`.
 
-1. `engine.shutdown().await` closes admission, drains or rejects engine-owned
+1. `engine.shutdown()` closes admission, drains or rejects engine-owned
    runtime objects according to the phase-defined policy, stops workers, and
    drops component owners in registry order.
 2. `session.close().await` closes the session to new transactions and releases
@@ -381,7 +385,7 @@ latency optimization: shutdown and registry-owned cleanup must remain correct if
 
 ### Edge-Case Contract
 
-Dropping `Engine` without calling `shutdown().await` is allowed but non-graceful.
+Dropping `Engine` without calling `shutdown()` is allowed but non-graceful.
 It must not wait for weak public handles and must not treat weak handles as owner
 references. The owner drop path closes admission first and then runs the
 strongest synchronous emergency teardown that the implementation phase defines
@@ -390,7 +394,7 @@ pinned runtime objects can still exist, the phase must define whether drop
 drains them, returns/panics with a busy diagnostic, or intentionally detaches or
 leaks the remaining runtime state to preserve memory safety. Users who need
 deterministic completion, ordered session close, transaction rollback/commit
-outcomes, or clean shutdown diagnostics must call `engine.shutdown().await`.
+outcomes, or clean shutdown diagnostics must call `engine.shutdown()`.
 [D2] [C2] [C7] [U4] [U7]
 
 Dropping `SessionHandle` without `close().await` abandons the public capability.
@@ -413,7 +417,7 @@ account for it. If the engine is already shutting down or dropped, the
 phase-defined shutdown path owns the final transaction outcome. [D3] [C5] [C6]
 [U3] [U7] [U9]
 
-Normal `engine.shutdown().await` must never implicitly commit an active
+Normal `engine.shutdown()` must never implicitly commit an active
 transaction. Before the session and transaction phases complete, they must define
 the concrete shutdown policy for active, abandoned, committing, and rolling-back
 transactions, including whether shutdown waits, returns a retryable busy or
@@ -590,8 +594,8 @@ code is visible.
     strong runtime handle. Keep `Engine` as the owner and keep internal
     component dependency handles strong where they remain crate-private.
   - Goals: Ensure weak public handles do not keep `EngineInner` or component
-    guards alive; make `engine.shutdown().await` the graceful shutdown API; define
-    and test engine drop without shutdown while weak handles survive.
+    guards alive; make `engine.shutdown()` the graceful shutdown API; define and
+    test engine drop without shutdown while weak handles survive.
   - Prerequisites: Phase 1 admission, weak reachability, cleanup-hint, and
     lifecycle error contracts are implementation-ready. Any public entry point
     changed in this phase must have a measured boundary-cost baseline.
@@ -610,6 +614,8 @@ code is visible.
   - Task Issue: `#0`
   - Phase Status: `pending`
   - Implementation Summary: `pending`
+  - Related Backlogs:
+    - `docs/backlogs/000114-evaluate-async-engine-shutdown-api.md`
 
 - **Phase 3: Session Handle Registry Ownership**
   - Scope: Move public session API to a non-cloneable weak `SessionHandle` backed

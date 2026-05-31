@@ -211,10 +211,10 @@ impl Drop for EngineAdmission<'_> {
 /// Storage engine owner.
 ///
 /// `Engine` owns teardown-only state such as the top-level
-/// [`ComponentRegistry`], while [`EngineRef`] and [`Session`] hold only the
-/// shared runtime handle in [`EngineInner`]. Explicit shutdown and final owner
-/// drop therefore stay with the owner object instead of the cloneable runtime
-/// access path.
+/// [`ComponentRegistry`], while crate-private [`EngineRef`] and public
+/// [`Session`] values hold transitional shared runtime access in
+/// [`EngineInner`]. Explicit shutdown and final owner drop therefore stay with
+/// the owner object instead of the cloneable runtime access path.
 pub struct Engine {
     inner: Option<Arc<EngineInner>>,
     components: Option<ComponentRegistry>,
@@ -272,10 +272,14 @@ impl Engine {
         self.inner().lock_manager()
     }
 
-    /// Try to clone the shared runtime handle while the engine is still
-    /// running.
+    /// Try to clone the crate-private shared runtime handle while the engine is
+    /// still running.
     #[inline]
-    pub fn new_ref(&self) -> Result<EngineRef> {
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "transitional internal runtime handle")
+    )]
+    pub(crate) fn new_ref(&self) -> Result<EngineRef> {
         let inner = self.inner();
         inner.with_admitted_operation(|| EngineRef(Arc::clone(inner)))
     }
@@ -283,8 +287,8 @@ impl Engine {
     /// Start idempotent engine shutdown.
     ///
     /// Shutdown rejects new work immediately, waits for user-owned
-    /// [`EngineRef`]s and sessions to drain, then dispatches component shutdown
-    /// in reverse registration order.
+    /// crate-private [`EngineRef`]s and sessions to drain, then dispatches
+    /// component shutdown in reverse registration order.
     ///
     /// This path is valid after storage poison. Poison only blocks admission; it
     /// does not replace the owner-side responsibility to stop background workers
@@ -366,12 +370,13 @@ impl Drop for Engine {
     }
 }
 
-/// Cloneable shared runtime handle for the storage engine.
+/// Crate-private cloneable shared runtime handle for the storage engine.
 ///
 /// `EngineRef` intentionally does not own shutdown orchestration. It only
-/// exposes the runtime state needed by sessions and internal subsystems.
+/// exposes transitional runtime state needed by sessions and internal
+/// subsystems while RFC-0019 migrates public handles.
 #[derive(Clone)]
-pub struct EngineRef(Arc<EngineInner>);
+pub(crate) struct EngineRef(Arc<EngineInner>);
 
 impl Deref for EngineRef {
     type Target = EngineInner;
@@ -385,7 +390,11 @@ impl Deref for EngineRef {
 impl EngineRef {
     /// Create a new session while the engine is still running.
     #[inline]
-    pub fn new_session(&self) -> Result<Session> {
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "transitional internal runtime handle")
+    )]
+    pub(crate) fn new_session(&self) -> Result<Session> {
         self.0.with_admitted_operation(|| {
             let id = self.0.next_session_id();
             Session::new(self.clone(), id)
@@ -400,7 +409,7 @@ impl EngineRef {
 
     /// Get a user-table runtime handle by table id.
     #[inline]
-    pub async fn get_table(&self, table_id: TableID) -> Result<Arc<crate::Table>> {
+    pub(crate) async fn get_table(&self, table_id: TableID) -> Result<Arc<crate::Table>> {
         self.0
             .with_admitted_operation(|| self.0.catalog().get_table_now(table_id))?
             .ok_or_else(|| {
@@ -1124,6 +1133,13 @@ mod tests {
             assert_eq!(err.lifecycle_error(), Some(LifecycleError::Shutdown));
             assert!(!session.in_trx());
 
+            let err = match session.get_table(TableID::new(91_300)).await {
+                Ok(_) => panic!("expected shutdown error"),
+                Err(err) => err,
+            };
+            assert_eq!(err.kind(), ErrorKind::Lifecycle);
+            assert_eq!(err.lifecycle_error(), Some(LifecycleError::Shutdown));
+
             drop(session);
             engine.shutdown().unwrap();
         });
@@ -1267,6 +1283,17 @@ mod tests {
 
             assert_eq!(table.table_id(), table_id);
             assert!(engine.catalog().get_table(table_id).await.is_some());
+        });
+    }
+
+    #[test]
+    fn test_drop_engine_without_explicit_shutdown_succeeds_without_extra_refs() {
+        smol::block_on(async {
+            let root = TempDir::new().unwrap();
+            let engine = test_engine_config_for(root.path()).build().await.unwrap();
+
+            let res = catch_unwind(AssertUnwindSafe(|| drop(engine)));
+            assert!(res.is_ok());
         });
     }
 

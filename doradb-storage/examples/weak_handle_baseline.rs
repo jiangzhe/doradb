@@ -229,15 +229,14 @@ async fn measure_table_lookup(
     table_id: doradb_storage::id::TableID,
     iterations: usize,
 ) -> StorageResult<BenchRow> {
-    let engine_ref = engine.new_ref()?;
+    let session = engine.new_session()?;
     let mut elapsed = Duration::ZERO;
     for _ in 0..iterations {
         let start = Instant::now();
-        let table = engine_ref.get_table(table_id).await?;
+        let table = session.get_table(table_id).await?;
         elapsed += start.elapsed();
         drop(table);
     }
-    drop(engine_ref);
     Ok(BenchRow {
         operation: "table_lookup",
         iterations,

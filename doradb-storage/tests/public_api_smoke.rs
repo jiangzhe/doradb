@@ -1,6 +1,6 @@
 use doradb_storage::{
-    ColumnAttributes, ColumnSpec, DeleteMvcc, EngineConfig, IndexAttributes, IndexKey, IndexSpec,
-    ScanMvcc, SelectKey, SelectMvcc, TableSpec, UpdateCol, UpdateMvcc, Val, ValKind,
+    ColumnAttributes, ColumnSpec, DeleteMvcc, Engine, EngineConfig, IndexAttributes, IndexKey,
+    IndexSpec, ScanMvcc, SelectKey, SelectMvcc, TableSpec, UpdateCol, UpdateMvcc, Val, ValKind,
 };
 use tempfile::TempDir;
 
@@ -8,7 +8,7 @@ use tempfile::TempDir;
 fn public_facade_supports_table_lookup_and_mvcc_dml() {
     smol::block_on(async {
         let root = TempDir::new().unwrap();
-        let engine = EngineConfig::default()
+        let engine: Engine = EngineConfig::default()
             .storage_root(root.path().to_path_buf())
             .build()
             .await
