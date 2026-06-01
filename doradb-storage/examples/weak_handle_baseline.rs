@@ -119,6 +119,7 @@ async fn run_baseline(args: &Args) -> StorageResult<Vec<BenchRow>> {
         insert_range(&mut session, &table, 0, setup_rows).await?;
         insert_range(&mut session, &table, 20_000_000, args.iterations).await?;
         insert_range(&mut session, &table, 30_000_000, args.iterations).await?;
+        session.close().await?;
     }
 
     let mut rows = Vec::new();
@@ -162,7 +163,9 @@ async fn create_baseline_table(engine: &doradb_storage::Engine) -> StorageResult
             vec![IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::PK)],
         )
         .await?;
-    session.get_table(table_id).await
+    let table = session.get_table(table_id).await?;
+    session.close().await?;
+    Ok(table)
 }
 
 async fn insert_range(
@@ -197,6 +200,7 @@ async fn measure_session_begin(
         elapsed += start.elapsed();
         trx.rollback().await?;
     }
+    session.close().await?;
     Ok(BenchRow {
         operation: "session_begin",
         iterations,
@@ -217,6 +221,7 @@ async fn measure_statement_exec(
         elapsed += start.elapsed();
     }
     trx.rollback().await?;
+    session.close().await?;
     Ok(BenchRow {
         operation: "statement_exec",
         iterations,
@@ -229,7 +234,7 @@ async fn measure_table_lookup(
     table_id: doradb_storage::id::TableID,
     iterations: usize,
 ) -> StorageResult<BenchRow> {
-    let session = engine.new_session()?;
+    let mut session = engine.new_session()?;
     let mut elapsed = Duration::ZERO;
     for _ in 0..iterations {
         let start = Instant::now();
@@ -237,6 +242,7 @@ async fn measure_table_lookup(
         elapsed += start.elapsed();
         drop(table);
     }
+    session.close().await?;
     Ok(BenchRow {
         operation: "table_lookup",
         iterations,
@@ -262,6 +268,7 @@ async fn measure_point_lookup(
         assert!(res.is_found(), "baseline point lookup key must exist");
     }
     trx.rollback().await?;
+    session.close().await?;
     Ok(BenchRow {
         operation: "point_lookup",
         iterations,
@@ -288,6 +295,7 @@ async fn measure_insert(
         elapsed += start.elapsed();
     }
     trx.commit().await?;
+    session.close().await?;
     Ok(BenchRow {
         operation: "insert",
         iterations,
@@ -318,6 +326,7 @@ async fn measure_update(
         assert!(res.is_updated(), "baseline update key must exist");
     }
     trx.commit().await?;
+    session.close().await?;
     Ok(BenchRow {
         operation: "update",
         iterations,
@@ -342,6 +351,7 @@ async fn measure_delete(
         elapsed += start.elapsed();
     }
     trx.commit().await?;
+    session.close().await?;
     Ok(BenchRow {
         operation: "delete",
         iterations,
@@ -376,6 +386,7 @@ async fn measure_table_scan(
         );
     }
     trx.rollback().await?;
+    session.close().await?;
     Ok(BenchRow {
         operation: "table_scan",
         iterations,

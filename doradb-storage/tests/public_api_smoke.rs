@@ -134,8 +134,8 @@ fn public_facade_supports_table_lookup_and_mvcc_dml() {
         assert_eq!(selected, SelectMvcc::NotFound);
         trx.commit().await.unwrap();
 
+        session.close().await.unwrap();
         drop(table);
-        drop(session);
         engine.shutdown().unwrap();
     });
 }

@@ -2,7 +2,7 @@ use crate::file::SparseFile;
 use crate::id::TrxID;
 use crate::io::Completion;
 use crate::serde::Ser;
-use crate::session::SessionState;
+use crate::session::TrxSessionRef;
 use crate::trx::PrecommitTrx;
 use crate::trx::log::{LogWriteSubmission, SyncGroup};
 use crate::trx::log_replay::LogBuf;
@@ -71,7 +71,7 @@ pub(super) enum Commit {
 }
 
 pub(super) type CommitWaiter = Arc<Completion<()>>;
-pub(super) type CommitJoin = (Option<Arc<SessionState>>, Option<CommitWaiter>);
+pub(super) type CommitJoin = (Option<TrxSessionRef>, Option<CommitWaiter>);
 
 /// CommitGroup groups multiple transactions with only
 /// one logical log IO and at most one fsync() call.

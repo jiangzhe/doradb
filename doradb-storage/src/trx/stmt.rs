@@ -494,7 +494,7 @@ pub(crate) mod tests {
     use crate::error::{FatalError, InternalError, OperationError};
     use crate::id::TrxID;
     use crate::lock::tests::{debug_snapshot, try_acquire, try_acquire_grouped};
-    use crate::session::SessionState;
+    use crate::session::{SessionState, TrxSessionRef};
     use crate::trx::undo::{OwnedRowUndo, RowUndoKind};
     use crate::trx::{ActiveTrx, MIN_ACTIVE_TRX_ID};
     use error_stack::Report;
@@ -614,8 +614,10 @@ pub(crate) mod tests {
     fn test_trx(engine: &Engine, sts: TrxID) -> ActiveTrx {
         let engine_ref = engine.new_ref().unwrap();
         let session_id = engine_ref.next_session_id();
-        let session_state = Arc::new(SessionState::new(engine_ref, session_id));
-        ActiveTrx::new(session_state, MIN_ACTIVE_TRX_ID + sts.as_u64(), sts, 0, 0)
+        let session_state = Arc::new(SessionState::new(engine_ref.clone(), session_id));
+        let session =
+            TrxSessionRef::new(engine_ref, &session_state, MIN_ACTIVE_TRX_ID + sts.as_u64());
+        ActiveTrx::new(session, MIN_ACTIVE_TRX_ID + sts.as_u64(), sts, 0, 0)
     }
 
     fn lock_entry_count(engine: &Engine, owner: LockOwner) -> usize {

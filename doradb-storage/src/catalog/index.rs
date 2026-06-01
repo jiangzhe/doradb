@@ -64,17 +64,18 @@ pub(crate) async fn create_index_for_session(
 ) -> Result<IndexNo> {
     let ctx = SessionDdlContext::new(session)?;
     let engine = ctx.engine.clone();
+    let guards = ctx.pool_guards.clone();
     let lock_manager = engine.lock_manager();
 
     // 1. Validate the target and acquire table-local DDL exclusion before
     // deriving any new metadata or touching mutable table roots.
-    precheck_index_ddl_target(session, &engine, table_id, "create index").await?;
+    precheck_index_ddl_target(&guards, &engine, table_id, "create index").await?;
     reject_table_ddl_explicit_session_lock(lock_manager, table_id, ctx.owner, "create index")?;
     // Keep these DDL locks alive through root publish and runtime layout
     // install so foreground readers/writers cannot observe a partial index.
     let _table_locks =
         acquire_table_ddl_locks(lock_manager, table_id, ctx.owner, ctx.owner_group).await?;
-    let table = validated_index_ddl_target(session, &engine, table_id, "create index").await?;
+    let table = validated_index_ddl_target(&guards, &engine, table_id, "create index").await?;
     engine.trx_sys.ensure_runtime_healthy()?;
     table.check_foreground_live("create index")?;
 
@@ -108,8 +109,7 @@ pub(crate) async fn create_index_for_session(
     // 4. Start the implicit DDL transaction and let the progress state own all
     // rollback/destroy transitions from this point onward.
     let trx = session.begin_trx()?;
-    let mut progress =
-        CreateIndexProgress::new(&engine, session.pool_guards(), table_id, index_no, trx);
+    let mut progress = CreateIndexProgress::new(&engine, &guards, table_id, index_no, trx);
     let build_ts = progress.build_ts();
 
     let mut mutable_file = MutableTableFile::fork(
@@ -122,7 +122,7 @@ pub(crate) async fn create_index_for_session(
     // stage the resulting root in the forked table file.
     let cold_rows = collect_create_index_cold_rows(
         &table,
-        session.pool_guards(),
+        &guards,
         old_metadata,
         &new_index_spec,
         active_root.column_block_index_root,
@@ -139,7 +139,7 @@ pub(crate) async fn create_index_for_session(
     let (cold_root, cold_unique_keys) = match build_create_index_disk_tree(
         &mut mutable_file,
         &disk_runtime,
-        session.pool_guards(),
+        &guards,
         new_metadata.as_ref(),
         &new_index_spec,
         &cold_rows,
@@ -162,22 +162,16 @@ pub(crate) async fn create_index_for_session(
 
     // 6. Build the hot MemIndex from row-store rows and assemble a runtime
     // layout that future readers can install atomically.
-    let hot_rows = match collect_create_index_hot_rows(
-        &table,
-        &old_layout,
-        session.pool_guards(),
-        &new_index_spec,
-    )
-    .await
-    {
-        Ok(hot_rows) => hot_rows,
-        Err(err) => {
-            return progress.rollback_before_catalog_commit(err).await;
-        }
-    };
+    let hot_rows =
+        match collect_create_index_hot_rows(&table, &old_layout, &guards, &new_index_spec).await {
+            Ok(hot_rows) => hot_rows,
+            Err(err) => {
+                return progress.rollback_before_catalog_commit(err).await;
+            }
+        };
     match build_create_index_runtime_index(CreateIndexRuntimeBuild {
         engine: &engine,
-        guards: session.pool_guards(),
+        guards: &guards,
         metadata: Arc::clone(&new_metadata),
         index_spec: &new_index_spec,
         disk_runtime,
@@ -264,13 +258,14 @@ pub(crate) async fn drop_index_for_session(
 ) -> Result<()> {
     let ctx = SessionDdlContext::new(session)?;
     let engine = ctx.engine.clone();
+    let guards = ctx.pool_guards.clone();
     let lock_manager = engine.lock_manager();
 
-    precheck_index_ddl_target(session, &engine, table_id, "drop index").await?;
+    precheck_index_ddl_target(&guards, &engine, table_id, "drop index").await?;
     reject_table_ddl_explicit_session_lock(lock_manager, table_id, ctx.owner, "drop index")?;
     let _table_locks =
         acquire_table_ddl_locks(lock_manager, table_id, ctx.owner, ctx.owner_group).await?;
-    let table = validated_index_ddl_target(session, &engine, table_id, "drop index").await?;
+    let table = validated_index_ddl_target(&guards, &engine, table_id, "drop index").await?;
     engine.trx_sys.ensure_runtime_healthy()?;
     table.check_foreground_live("drop index")?;
 
@@ -346,10 +341,7 @@ pub(crate) async fn drop_index_for_session(
     progress.mark_installed();
     drop(old_layout);
 
-    if let Err(err) = table
-        .cleanup_retired_secondary_indexes(session.pool_guards())
-        .await
-    {
+    if let Err(err) = table.cleanup_retired_secondary_indexes(&guards).await {
         return Err(poison_index_after_catalog_commit_with_source(
             &engine,
             IndexDdlKind::Drop,
@@ -1502,6 +1494,7 @@ mod tests {
     use crate::file::cow_file::tests::old_root_drop_count;
     use crate::file::table_file::ActiveRoot;
     use crate::row::ops::{DeleteMvcc, SelectKey};
+    use crate::session::tests::SessionTestExt;
     use crate::table::{CheckpointOutcome, TablePersistence};
     use crate::trx::{ActiveTrx, MAX_SNAPSHOT_TS};
     use crate::value::{Val, ValKind};
@@ -1731,7 +1724,7 @@ mod tests {
                 .catalog()
                 .storage
                 .tables()
-                .find_uncommitted_by_id(session.pool_guards(), table_id)
+                .find_uncommitted_by_id(&session.pool_guards(), table_id)
                 .await
                 .unwrap()
                 .unwrap();
@@ -1742,7 +1735,7 @@ mod tests {
             let mut rows = non_unique_runtime_lookup(
                 &layout,
                 root,
-                session.pool_guards(),
+                &session.pool_guards(),
                 1,
                 &[Val::from("alpha")],
             )
@@ -1759,7 +1752,7 @@ mod tests {
             let mut rows = non_unique_runtime_lookup(
                 &layout,
                 root,
-                session.pool_guards(),
+                &session.pool_guards(),
                 1,
                 &[Val::from("alpha")],
             )
@@ -1791,7 +1784,7 @@ mod tests {
             assert_ne!(active_secondary_root(&sys.table, 1), SUPER_BLOCK_ID);
             let mut rows = non_unique_disk_tree_prefix_scan(
                 &sys.table,
-                session.pool_guards(),
+                &session.pool_guards(),
                 &name_key("cold"),
             )
             .await;
@@ -1911,7 +1904,7 @@ mod tests {
 
             assert_eq!(index_no, 1);
             assert_eq!(
-                unique_runtime_lookup(&sys.table, 1, session.pool_guards(), &[Val::from("dup")])
+                unique_runtime_lookup(&sys.table, 1, &session.pool_guards(), &[Val::from("dup")])
                     .await,
                 Some((row1, false))
             );
@@ -1986,7 +1979,7 @@ mod tests {
             assert_eq!(
                 non_unique_disk_tree_prefix_scan(
                     &table,
-                    session.pool_guards(),
+                    &session.pool_guards(),
                     &SelectKey::new(1, vec![Val::from("persisted")]),
                 )
                 .await,
@@ -2034,7 +2027,7 @@ mod tests {
                 .catalog()
                 .storage
                 .indexes()
-                .list_uncommitted_by_table_id(session.pool_guards(), table_id)
+                .list_uncommitted_by_table_id(&session.pool_guards(), table_id)
                 .await
                 .unwrap();
             assert_eq!(catalog_indexes.len(), 1);
@@ -2176,7 +2169,7 @@ mod tests {
             assert!(sys.table.has_retired_secondary_indexes());
             assert_eq!(
                 sys.table
-                    .cleanup_retired_secondary_indexes(session.pool_guards())
+                    .cleanup_retired_secondary_indexes(&session.pool_guards())
                     .await
                     .unwrap(),
                 0
@@ -2184,7 +2177,7 @@ mod tests {
             drop(old_layout);
             assert_eq!(
                 sys.table
-                    .cleanup_retired_secondary_indexes(session.pool_guards())
+                    .cleanup_retired_secondary_indexes(&session.pool_guards())
                     .await
                     .unwrap(),
                 1

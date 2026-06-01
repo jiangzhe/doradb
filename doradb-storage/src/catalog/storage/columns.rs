@@ -193,6 +193,7 @@ impl Columns<'_> {
 mod tests {
     use super::*;
     use crate::catalog::tests::open_catalog_test_engine;
+    use crate::session::tests::SessionTestExt;
     use crate::trx::ActiveTrx;
     use crate::trx::redo::DDLRedo;
     use tempfile::TempDir;
@@ -294,7 +295,7 @@ mod tests {
                 .catalog()
                 .storage
                 .columns()
-                .list_uncommitted_by_table_id(session.pool_guards(), TableID::new(42))
+                .list_uncommitted_by_table_id(&session.pool_guards(), TableID::new(42))
                 .await
                 .unwrap();
             assert_eq!(cols_42.len(), 1);
@@ -304,7 +305,7 @@ mod tests {
                 .catalog()
                 .storage
                 .columns()
-                .list_uncommitted_by_table_id(session.pool_guards(), TableID::new(43))
+                .list_uncommitted_by_table_id(&session.pool_guards(), TableID::new(43))
                 .await
                 .unwrap();
             assert_eq!(cols_43.len(), 1);
@@ -348,7 +349,7 @@ mod tests {
                     .catalog()
                     .storage
                     .columns()
-                    .list_uncommitted_by_table_id(session.pool_guards(), TableID::new(42))
+                    .list_uncommitted_by_table_id(&session.pool_guards(), TableID::new(42))
                     .await
                     .unwrap()
                     .is_empty()
@@ -358,7 +359,7 @@ mod tests {
                     .catalog()
                     .storage
                     .columns()
-                    .list_uncommitted_by_table_id(session.pool_guards(), TableID::new(43))
+                    .list_uncommitted_by_table_id(&session.pool_guards(), TableID::new(43))
                     .await
                     .unwrap()
                     .is_empty()
@@ -454,7 +455,7 @@ mod tests {
                     .catalog()
                     .storage
                     .columns()
-                    .list_uncommitted_by_table_id(session.pool_guards(), TableID::new(42))
+                    .list_uncommitted_by_table_id(&session.pool_guards(), TableID::new(42))
                     .await
                     .unwrap()
                     .is_empty()
@@ -463,7 +464,7 @@ mod tests {
                 .catalog()
                 .storage
                 .columns()
-                .list_uncommitted_by_table_id(session.pool_guards(), TableID::new(43))
+                .list_uncommitted_by_table_id(&session.pool_guards(), TableID::new(43))
                 .await
                 .unwrap();
             assert_eq!(remaining.len(), 1);
