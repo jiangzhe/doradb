@@ -53,6 +53,7 @@ pub(crate) async fn create_table_for_session(
 ) -> Result<TableID> {
     let ctx = SessionDdlContext::new(session)?;
     let engine = ctx.engine.clone();
+    let guards = ctx.pool_guards.clone();
     let _namespace_lock =
         acquire_catalog_namespace_lock(engine.lock_manager(), ctx.owner, ctx.owner_group).await?;
 
@@ -126,7 +127,7 @@ pub(crate) async fn create_table_for_session(
     progress.set_catalog_transaction(trx);
     if let Err(err) = exec_res {
         return Err(progress
-            .abort_before_catalog_commit(&engine, session.pool_guards(), "catalog staging", err)
+            .abort_before_catalog_commit(&engine, &guards, "catalog staging", err)
             .await);
     }
     progress.mark_catalog_staged();
@@ -136,18 +137,13 @@ pub(crate) async fn create_table_for_session(
         test_hooks::maybe_fail_create_table(test_hooks::CreateTableTestFailure::AfterCatalogStaged)
     {
         return Err(progress
-            .abort_before_catalog_commit(
-                &engine,
-                session.pool_guards(),
-                "test after catalog staging",
-                err,
-            )
+            .abort_before_catalog_commit(&engine, &guards, "test after catalog staging", err)
             .await);
     }
 
     if let Err(err) = progress.publish_file(&engine).await {
         return Err(progress
-            .abort_before_catalog_commit(&engine, session.pool_guards(), "file publish", err)
+            .abort_before_catalog_commit(&engine, &guards, "file publish", err)
             .await);
     }
 
@@ -156,18 +152,13 @@ pub(crate) async fn create_table_for_session(
         test_hooks::maybe_fail_create_table(test_hooks::CreateTableTestFailure::AfterFilePublished)
     {
         return Err(progress
-            .abort_before_catalog_commit(
-                &engine,
-                session.pool_guards(),
-                "test after file publish",
-                err,
-            )
+            .abort_before_catalog_commit(&engine, &guards, "test after file publish", err)
             .await);
     }
 
-    if let Err(err) = progress.build_runtime(session, &engine).await {
+    if let Err(err) = progress.build_runtime(&guards, &engine).await {
         return Err(progress
-            .abort_before_catalog_commit(&engine, session.pool_guards(), "runtime build", err)
+            .abort_before_catalog_commit(&engine, &guards, "runtime build", err)
             .await);
     }
 
@@ -176,12 +167,7 @@ pub(crate) async fn create_table_for_session(
         test_hooks::maybe_fail_create_table(test_hooks::CreateTableTestFailure::AfterRuntimeBuilt)
     {
         return Err(progress
-            .abort_before_catalog_commit(
-                &engine,
-                session.pool_guards(),
-                "test after runtime build",
-                err,
-            )
+            .abort_before_catalog_commit(&engine, &guards, "test after runtime build", err)
             .await);
     }
 
@@ -190,23 +176,13 @@ pub(crate) async fn create_table_for_session(
 
     if let Err(err) = progress.commit_catalog().await {
         return Err(progress
-            .abort_after_root_publish_commit_error(
-                &engine,
-                session.pool_guards(),
-                "catalog commit",
-                err,
-            )
+            .abort_after_root_publish_commit_error(&engine, &guards, "catalog commit", err)
             .await);
     }
 
     if let Err(err) = progress.install_runtime(&engine) {
         return Err(progress
-            .abort_after_root_publish_commit_error(
-                &engine,
-                session.pool_guards(),
-                "runtime install",
-                err,
-            )
+            .abort_after_root_publish_commit_error(&engine, &guards, "runtime install", err)
             .await);
     }
 
@@ -223,7 +199,7 @@ pub(crate) async fn drop_table_for_session(session: &mut Session, table_id: Tabl
     let _namespace_lock =
         acquire_catalog_namespace_lock(lock_manager, ctx.owner, ctx.owner_group).await?;
 
-    let table = validated_drop_table_target(session, &engine, table_id).await?;
+    let table = validated_drop_table_target(&ctx.pool_guards, &engine, table_id).await?;
     reject_table_ddl_explicit_session_lock(lock_manager, table_id, ctx.owner, "drop table")?;
     let mut table_locks =
         acquire_table_ddl_locks(lock_manager, table_id, ctx.owner, ctx.owner_group).await?;
@@ -378,7 +354,7 @@ impl CreateTableProgress {
     }
 
     #[inline]
-    async fn build_runtime(&mut self, session: &Session, engine: &EngineRef) -> Result<()> {
+    async fn build_runtime(&mut self, guards: &PoolGuards, engine: &EngineRef) -> Result<()> {
         debug_assert_eq!(self.phase, CreateTablePhase::FilePublished);
         let table_file = Arc::clone(
             self.table_file
@@ -388,7 +364,7 @@ impl CreateTableProgress {
         let active_root = table_file.active_root_unchecked();
         let blk_idx = BlockIndex::new(
             engine.meta_pool.clone_inner(),
-            session.pool_guards().meta_guard(),
+            guards.meta_guard(),
             active_root.pivot_row_id,
             active_root.column_block_index_root,
         )
@@ -397,7 +373,7 @@ impl CreateTableProgress {
             Table::new(
                 engine.mem_pool.clone_inner(),
                 engine.index_pool.clone_inner(),
-                session.pool_guards().index_guard(),
+                guards.index_guard(),
                 self.table_id,
                 blk_idx,
                 table_file,
@@ -558,7 +534,7 @@ pub(crate) fn reject_non_user_table_id(table_id: TableID, operation: &'static st
 
 #[inline]
 pub(crate) async fn ensure_user_table_catalog_row(
-    session: &Session,
+    guards: &PoolGuards,
     engine: &EngineRef,
     table_id: TableID,
     operation: &'static str,
@@ -567,7 +543,7 @@ pub(crate) async fn ensure_user_table_catalog_row(
         .catalog()
         .storage
         .tables()
-        .find_uncommitted_by_id(session.pool_guards(), table_id)
+        .find_uncommitted_by_id(guards, table_id)
         .await?
         .is_some()
     {
@@ -579,17 +555,17 @@ pub(crate) async fn ensure_user_table_catalog_row(
 }
 
 pub(crate) async fn precheck_index_ddl_target(
-    session: &Session,
+    guards: &PoolGuards,
     engine: &EngineRef,
     table_id: TableID,
     operation: &'static str,
 ) -> Result<()> {
-    let _ = validated_index_ddl_target(session, engine, table_id, operation).await?;
+    let _ = validated_index_ddl_target(guards, engine, table_id, operation).await?;
     Ok(())
 }
 
 pub(crate) async fn validated_index_ddl_target(
-    session: &Session,
+    guards: &PoolGuards,
     engine: &EngineRef,
     table_id: TableID,
     operation: &'static str,
@@ -599,12 +575,12 @@ pub(crate) async fn validated_index_ddl_target(
         .catalog()
         .validate_user_table_live(table_id, operation)
         .await?;
-    ensure_user_table_catalog_row(session, engine, table_id, operation).await?;
+    ensure_user_table_catalog_row(guards, engine, table_id, operation).await?;
     Ok(table)
 }
 
 async fn validated_drop_table_target(
-    session: &Session,
+    guards: &PoolGuards,
     engine: &EngineRef,
     table_id: TableID,
 ) -> Result<Arc<Table>> {
@@ -614,7 +590,7 @@ async fn validated_drop_table_target(
             .attach(format!("drop table runtime lookup: table_id={table_id}"))
             .into());
     };
-    ensure_user_table_catalog_row(session, engine, table_id, "drop table").await?;
+    ensure_user_table_catalog_row(guards, engine, table_id, "drop table").await?;
     Ok(table)
 }
 

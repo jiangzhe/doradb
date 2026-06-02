@@ -34,7 +34,7 @@ pub trait TablePersistence {
     fn freeze(&self, session: &Session, max_rows: usize) -> impl Future<Output = Result<usize>>;
 
     /// Report whether a user-table checkpoint can safely publish now.
-    fn checkpoint_readiness(&self, session: &Session) -> CheckpointReadiness;
+    fn checkpoint_readiness(&self, session: &Session) -> Result<CheckpointReadiness>;
 
     /// Persist eligible row-store and cold-delete state in one checkpoint run.
     fn checkpoint(&self, session: &mut Session) -> impl Future<Output = Result<CheckpointOutcome>>;
@@ -893,10 +893,27 @@ impl Table {
     }
 }
 
+impl Table {
+    #[inline]
+    fn try_checkpoint_readiness_for_session(
+        &self,
+        session: &Session,
+    ) -> Result<CheckpointReadiness> {
+        let pin = session.pin("check checkpoint readiness")?;
+        let trx_sys = pin.engine.trx_sys.clone();
+        let active_root = self.file().active_root_unchecked();
+        Ok(CheckpointReadiness::for_root(
+            active_root,
+            trx_sys.calc_min_active_sts_for_gc(),
+        ))
+    }
+}
+
 impl TablePersistence for Table {
     async fn freeze(&self, session: &Session, max_rows: usize) -> Result<usize> {
+        let guards = session.pin("freeze table")?.pool_guards();
         let mut rows = 0usize;
-        self.mem_scan(session.pool_guards(), |page_guard| {
+        self.mem_scan(&guards, |page_guard| {
             let (ctx, page) = page_guard.ctx_and_page();
             let vmap = ctx.row_ver().unwrap();
             rows += page.header.approx_non_deleted();
@@ -910,16 +927,12 @@ impl TablePersistence for Table {
         Ok(rows)
     }
 
-    fn checkpoint_readiness(&self, session: &Session) -> CheckpointReadiness {
-        let trx_sys = session.engine().trx_sys.clone();
-        // `checkpoint_internal`: readiness checks the current root liveness
-        // before this path forks and later displaces that root.
-        let active_root = self.file().active_root_unchecked();
-        CheckpointReadiness::for_root(active_root, trx_sys.calc_min_active_sts_for_gc())
+    fn checkpoint_readiness(&self, session: &Session) -> Result<CheckpointReadiness> {
+        self.try_checkpoint_readiness_for_session(session)
     }
 
     async fn checkpoint(&self, session: &mut Session) -> Result<CheckpointOutcome> {
-        if session.in_trx() {
+        if session.checked_in_trx(CHECKPOINT_REQUIRES_IDLE_SESSION)? {
             return Err(Report::new(OperationError::NotSupported)
                 .attach(CHECKPOINT_REQUIRES_IDLE_SESSION)
                 .into());
@@ -927,8 +940,14 @@ impl TablePersistence for Table {
 
         let table_file = self.file();
         let disk_pool = self.disk_pool();
-        let trx_sys = session.engine().trx_sys.clone();
-        if let CheckpointReadiness::Delayed { reason } = self.checkpoint_readiness(session) {
+        let pin = session.pin("checkpoint table")?;
+        let trx_sys = pin.engine.trx_sys.clone();
+        let table_writes = pin.engine.table_fs.background_writes().clone();
+        let pool_guards = pin.pool_guards();
+        drop(pin);
+        if let CheckpointReadiness::Delayed { reason } =
+            self.try_checkpoint_readiness_for_session(session)?
+        {
             return Ok(CheckpointOutcome::Delayed { reason });
         }
         #[cfg(test)]
@@ -937,7 +956,9 @@ impl TablePersistence for Table {
             Ok(lease) => lease,
             Err(reason) => return Ok(CheckpointOutcome::Cancelled { reason }),
         };
-        if let CheckpointReadiness::Delayed { reason } = self.checkpoint_readiness(session) {
+        if let CheckpointReadiness::Delayed { reason } =
+            self.try_checkpoint_readiness_for_session(session)?
+        {
             return Ok(CheckpointOutcome::Delayed { reason });
         }
         let layout = self.layout_snapshot();
@@ -946,18 +967,13 @@ impl TablePersistence for Table {
         // Step 1: claim one mutable root snapshot and initialize checkpoint
         // boundaries. This is checkpoint-internal current-root access after the
         // post-lease liveness check above.
-        let mut mutable_file = MutableTableFile::fork(
-            table_file,
-            session.engine().table_fs.background_writes(),
-            disk_pool.clone(),
-        );
+        let mut mutable_file = MutableTableFile::fork(table_file, &table_writes, disk_pool.clone());
         let pivot_row_id = mutable_file.root().pivot_row_id;
         let mut secondary_sidecar = SecondaryCheckpointSidecar::new(metadata)?;
 
         // Step 2: collect frozen pages and refresh checkpoint cutoff after any
         // stabilization wait. The post-lease readiness check is enough for root
         // liveness because the GC horizon used by the check only moves forward.
-        let pool_guards = session.pool_guards().clone();
         let (frozen_pages, next_heap_redo_start_ts) =
             self.collect_frozen_pages(&pool_guards).await?;
         if !frozen_pages.is_empty() {
@@ -994,7 +1010,7 @@ impl TablePersistence for Table {
         let (mut lwc_blocks, heap_redo_start_ts) = match self
             .build_lwc_blocks(
                 metadata,
-                session.pool_guards(),
+                &pool_guards,
                 cutoff_ts,
                 &frozen_pages,
                 collect_visible_row,

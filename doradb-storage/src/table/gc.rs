@@ -178,7 +178,10 @@ impl Table {
         session: &mut Session,
         clean_live_entries: bool,
     ) -> Result<SecondaryMemIndexCleanupStats> {
-        let trx_sys = session.engine().trx_sys.clone();
+        let pin = session.pin("cleanup secondary mem indexes")?;
+        let trx_sys = pin.engine.trx_sys.clone();
+        let pool_guards = pin.pool_guards();
+        drop(pin);
         loop {
             let trx = session.begin_trx()?;
             let cleanup_sts = trx.sts();
@@ -192,7 +195,7 @@ impl Table {
 
             let cleanup_res = self
                 .cleanup_secondary_mem_indexes_at_snapshot(
-                    session.pool_guards(),
+                    &pool_guards,
                     &snapshot,
                     clean_live_entries,
                 )

@@ -98,20 +98,26 @@ The engine lifecycle has three states:
 2. `ShuttingDown`
 3. `Shutdown`
 
-Session drain is not implemented. Shutdown closes admission for new work and
-then requires live external `EngineRef`/session holders to have already
-released the runtime handle before owner-side component shutdown can proceed.
+Shutdown closes admission for new work and then requires live runtime
+`EngineRef` holders to drain before owner-side component shutdown can proceed.
+`Engine::try_shutdown()` performs that check once and returns `ShutdownBusy` if
+runtime refs remain. `Engine::shutdown()` waits for runtime refs to drain and
+then completes final teardown.
 
 Normal shutdown is:
 
-1. acquire the owner-side finalize lock
-2. close the admission gate and flip `Running -> ShuttingDown`
-3. require `Arc::strong_count(inner) == 1`
-4. call `ComponentRegistry::shutdown_all()` in reverse registration order
-5. mark lifecycle state as `Shutdown`
+1. close the admission gate and flip `Running -> ShuttingDown`
+2. wait for active admission tokens to drain
+3. wait for runtime `EngineRef` holders, or return `ShutdownBusy` from
+   `try_shutdown()`
+4. acquire the owner-side shutdown lock
+5. require `Arc::strong_count(inner) == 1`
+6. remove idle registry-owned sessions
+7. call `ComponentRegistry::shutdown_all()` in reverse registration order
+8. mark lifecycle state as `Shutdown`
 
-After shutdown succeeds, `Engine::drop` makes the final owner-drop sequence
-explicit:
+After shutdown succeeds, `Engine` field order makes the final owner-drop
+sequence deterministic:
 
 1. drop `Arc<EngineInner>`
 2. drop `ComponentRegistry`

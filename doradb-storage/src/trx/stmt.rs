@@ -494,7 +494,7 @@ pub(crate) mod tests {
     use crate::error::{FatalError, InternalError, OperationError};
     use crate::id::TrxID;
     use crate::lock::tests::{debug_snapshot, try_acquire, try_acquire_grouped};
-    use crate::session::SessionState;
+    use crate::session::{SessionState, TrxSessionRef};
     use crate::trx::undo::{OwnedRowUndo, RowUndoKind};
     use crate::trx::{ActiveTrx, MIN_ACTIVE_TRX_ID};
     use error_stack::Report;
@@ -611,11 +611,16 @@ pub(crate) mod tests {
         (temp_dir, engine)
     }
 
-    fn test_trx(engine: &Engine, sts: TrxID) -> ActiveTrx {
+    fn test_trx(engine: &Engine, sts: TrxID) -> (ActiveTrx, Arc<SessionState>) {
         let engine_ref = engine.new_ref().unwrap();
         let session_id = engine_ref.next_session_id();
-        let session_state = Arc::new(SessionState::new(engine_ref, session_id));
-        ActiveTrx::new(session_state, MIN_ACTIVE_TRX_ID + sts.as_u64(), sts, 0, 0)
+        let session_state = Arc::new(SessionState::new(engine_ref.clone(), session_id));
+        let session =
+            TrxSessionRef::new(engine_ref, &session_state, MIN_ACTIVE_TRX_ID + sts.as_u64());
+        (
+            ActiveTrx::new(session, MIN_ACTIVE_TRX_ID + sts.as_u64(), sts, 0, 0),
+            session_state,
+        )
     }
 
     fn lock_entry_count(engine: &Engine, owner: LockOwner) -> usize {
@@ -649,7 +654,7 @@ pub(crate) mod tests {
     fn test_statement_index_rollback_failure_poisons_and_discards_transaction() {
         smol::block_on(async {
             let (_temp_dir, engine) = test_engine("redo_stmt_index_rollback_fail").await;
-            let mut trx = test_trx(&engine, TrxID::new(52));
+            let (mut trx, _session_state) = test_trx(&engine, TrxID::new(52));
             let trx_owner = trx_lock_owner(&trx).unwrap();
             try_acquire_transaction_lock(
                 &mut trx,

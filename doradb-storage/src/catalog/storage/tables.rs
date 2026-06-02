@@ -123,6 +123,7 @@ mod tests {
     use super::*;
     use crate::buffer::{BufferPool, PoolGuards, PoolRole};
     use crate::catalog::tests::{open_catalog_test_engine, table1};
+    use crate::session::tests::SessionTestExt;
     use crate::trx::ActiveTrx;
     use crate::trx::redo::DDLRedo;
     use tempfile::TempDir;
@@ -203,7 +204,7 @@ mod tests {
                     .catalog()
                     .storage
                     .tables()
-                    .find_uncommitted_by_id(session.pool_guards(), table100.table_id)
+                    .find_uncommitted_by_id(&session.pool_guards(), table100.table_id)
                     .await
                     .unwrap()
                     .is_none()
@@ -213,7 +214,7 @@ mod tests {
                     .catalog()
                     .storage
                     .tables()
-                    .find_uncommitted_by_id(session.pool_guards(), table101.table_id)
+                    .find_uncommitted_by_id(&session.pool_guards(), table101.table_id)
                     .await
                     .unwrap()
                     .is_some()

@@ -958,6 +958,7 @@ mod tests {
     use crate::index::{COLUMN_DELETION_BLOB_PAGE_HEADER_SIZE, ColumnBlockIndex, UniqueIndex};
     use crate::row::RowRead;
     use crate::row::ops::{DeleteMvcc, SelectKey, SelectMvcc, UpdateCol, UpdateMvcc};
+    use crate::session::tests::SessionTestExt;
     use crate::table::{CheckpointOutcome, DeleteMarker, Table, TablePersistence};
     use crate::trx::log_replay::{LogMerger, TrxLog};
     use crate::trx::redo::{DDLRedo, RedoHeader, RedoLogs, RedoTrxKind, RowRedo, RowRedoKind};
@@ -1388,7 +1389,7 @@ mod tests {
             .catalog()
             .storage
             .tables()
-            .find_uncommitted_by_id(session.pool_guards(), table_id)
+            .find_uncommitted_by_id(&session.pool_guards(), table_id)
             .await
             .unwrap()
             .unwrap();
@@ -1397,7 +1398,7 @@ mod tests {
             .catalog()
             .storage
             .indexes()
-            .list_uncommitted_by_table_id(session.pool_guards(), table_id)
+            .list_uncommitted_by_table_id(&session.pool_guards(), table_id)
             .await
             .unwrap();
         assert_eq!(
@@ -2102,7 +2103,7 @@ mod tests {
                 let layout = table.layout_snapshot();
                 table
                     .accessor_with_layout(&layout)
-                    .mem_scan_uncommitted(session.pool_guards(), |_metadata, row| {
+                    .mem_scan_uncommitted(&session.pool_guards(), |_metadata, row| {
                         assert!(row.row_id().as_usize() <= DML_SIZE);
                         rows += if row.is_deleted() { 0 } else { 1 };
                         true
@@ -2259,16 +2260,17 @@ mod tests {
 
             let table = engine.catalog().get_table(table_id).await.unwrap();
             let mut session = engine.new_session().unwrap();
-            assert_eq!(table.total_row_pages(session.pool_guards()).await, 0);
+            assert_eq!(table.total_row_pages(&session.pool_guards()).await, 0);
 
             let key = SelectKey::new(0, vec![Val::from(7u32)]);
             let layout = table.layout_snapshot();
             let index = layout.secondary_index(key.index_no).unwrap();
             let root = table.file().active_root_unchecked().secondary_index_roots[key.index_no];
             {
+                let pool_guards = session.pool_guards();
                 let disk = index
                     .disk_runtime()
-                    .open_unique_at(root, session.pool_guards().disk_guard())
+                    .open_unique_at(root, pool_guards.disk_guard())
                     .unwrap();
                 assert_eq!(disk.lookup(&key.vals).await.unwrap(), Some(cold_row_id));
             }
@@ -2393,15 +2395,16 @@ mod tests {
 
             let table = engine.catalog().get_table(table_id).await.unwrap();
             let mut session = engine.new_session().unwrap();
-            assert!(table.total_row_pages(session.pool_guards()).await > 0);
+            assert!(table.total_row_pages(&session.pool_guards()).await > 0);
 
             let layout = table.layout_snapshot();
             let index = layout.secondary_index(key.index_no).unwrap();
             let root = table.file().active_root_unchecked().secondary_index_roots[key.index_no];
             {
+                let pool_guards = session.pool_guards();
                 let disk = index
                     .disk_runtime()
-                    .open_unique_at(root, session.pool_guards().disk_guard())
+                    .open_unique_at(root, pool_guards.disk_guard())
                     .unwrap();
                 assert_eq!(disk.lookup(&key.vals).await.unwrap(), Some(cold_row_id));
             }
@@ -2509,7 +2512,7 @@ mod tests {
 
             let table = engine.catalog().get_table(table_id).await.unwrap();
             let mut session = engine.new_session().unwrap();
-            assert_eq!(table.total_row_pages(session.pool_guards()).await, 0);
+            assert_eq!(table.total_row_pages(&session.pool_guards()).await, 0);
 
             let name_key = SelectKey::new(1, vec![Val::from("same-name")]);
             let layout = table.layout_snapshot();
@@ -2517,9 +2520,10 @@ mod tests {
             let root =
                 table.file().active_root_unchecked().secondary_index_roots[name_key.index_no];
             let disk_rows = {
+                let pool_guards = session.pool_guards();
                 let disk = non_unique
                     .disk_runtime()
-                    .open_non_unique_at(root, session.pool_guards().disk_guard())
+                    .open_non_unique_at(root, pool_guards.disk_guard())
                     .unwrap();
                 disk.prefix_scan_entries(&name_key.vals)
                     .await
@@ -2653,7 +2657,7 @@ mod tests {
 
             let table = engine.catalog().get_table(table_id).await.unwrap();
             let mut session = engine.new_session().unwrap();
-            assert!(table.total_row_pages(session.pool_guards()).await > 0);
+            assert!(table.total_row_pages(&session.pool_guards()).await > 0);
 
             let mut trx = session.begin_trx().unwrap();
 
@@ -2998,13 +3002,13 @@ mod tests {
             let mut session = engine.new_session().unwrap();
             assert_eq!(
                 checkpointed_table
-                    .total_row_pages(session.pool_guards())
+                    .total_row_pages(&session.pool_guards())
                     .await,
                 0
             );
             assert!(
                 replay_only_table
-                    .total_row_pages(session.pool_guards())
+                    .total_row_pages(&session.pool_guards())
                     .await
                     > 0
             );
@@ -3288,29 +3292,32 @@ mod tests {
             let table = engine.catalog().get_table(table_id).await.unwrap();
             let session = engine.new_session().unwrap();
             let active_root = table.file().active_root_unchecked();
-            let index = ColumnBlockIndex::new(
-                active_root.column_block_index_root,
-                active_root.pivot_row_id,
-                table.file().file_kind(),
-                table.file().sparse_file(),
-                table.disk_pool(),
-                session.pool_guards().disk_guard(),
-            );
-            let entry = index
-                .locate_block(RowID::new(0))
-                .await
-                .unwrap()
-                .expect("deleted row should still have a checkpoint entry");
-            let err = match index.load_delete_deltas(&entry).await {
-                Ok(_) => panic!("expected invalid delete blob on delta load"),
-                Err(err) => err,
-            };
-            assert_table_data_integrity(
-                err,
-                "column-deletion-blob",
-                blob_ref.start_block_id,
-                DataIntegrityError::InvalidPayload,
-            );
+            {
+                let pool_guards = session.pool_guards();
+                let index = ColumnBlockIndex::new(
+                    active_root.column_block_index_root,
+                    active_root.pivot_row_id,
+                    table.file().file_kind(),
+                    table.file().sparse_file(),
+                    table.disk_pool(),
+                    pool_guards.disk_guard(),
+                );
+                let entry = index
+                    .locate_block(RowID::new(0))
+                    .await
+                    .unwrap()
+                    .expect("deleted row should still have a checkpoint entry");
+                let err = match index.load_delete_deltas(&entry).await {
+                    Ok(_) => panic!("expected invalid delete blob on delta load"),
+                    Err(err) => err,
+                };
+                assert_table_data_integrity(
+                    err,
+                    "column-deletion-blob",
+                    blob_ref.start_block_id,
+                    DataIntegrityError::InvalidPayload,
+                );
+            }
 
             drop(table);
             drop(session);

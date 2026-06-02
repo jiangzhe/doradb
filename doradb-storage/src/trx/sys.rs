@@ -2,12 +2,13 @@ use crate::DiskPool;
 use crate::catalog::{Catalog, CatalogCheckpointScanConfig, TableCache};
 use crate::component::{Component, ComponentRegistry, IndexPool, MemPool, MetaPool, ShelfScope};
 use crate::conf::TrxSysConfig;
+use crate::engine::EngineRef;
 use crate::error::{Error, FatalError, FatalResult, InternalError, Result};
 use crate::file::fs::FileSystem;
 use crate::file::table_file::{MutableTableFile, OldRoot, TableFile};
 use crate::id::TrxID;
 use crate::quiescent::{QuiescentBox, QuiescentGuard, SyncQuiescentGuard};
-use crate::session::SessionState;
+use crate::session::{SessionState, TrxSessionRef};
 use crate::thread;
 use crate::trx::group::Commit;
 use crate::trx::log::{LOG_HEADER_PAGES, LogPartition};
@@ -236,7 +237,11 @@ impl TransactionSystem {
 
     /// Create a new transaction.
     #[inline]
-    pub(crate) fn begin_trx(&self, session_state: Arc<SessionState>) -> ActiveTrx {
+    pub(crate) fn begin_trx(
+        &self,
+        engine: EngineRef,
+        session_state: &Arc<SessionState>,
+    ) -> ActiveTrx {
         // Assign log partition index so current transaction will stick
         // to certain log partition for commit.
         let log_no = self.next_log_no();
@@ -263,7 +268,8 @@ impl TransactionSystem {
                 .store(sts.as_u64(), Ordering::Relaxed);
         }
         drop(g); // release bucket lock.
-        ActiveTrx::new(session_state, trx_id, sts, log_no, gc_no)
+        let session = TrxSessionRef::new(engine, session_state, trx_id);
+        ActiveTrx::new(session, trx_id, sts, log_no, gc_no)
     }
 
     /// Returns next log(partition) number.

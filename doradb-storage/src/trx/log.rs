@@ -11,7 +11,7 @@ use crate::io::{
     IOStateMachine, IOSubmission, IOWorkerBuilder, Operation, StdIoResult, StorageBackend,
 };
 use crate::serde::Ser;
-use crate::session::SessionState;
+use crate::session::TrxSessionRef;
 use crate::trx::MIN_SNAPSHOT_TS;
 use crate::trx::group::{
     Commit, CommitGroup, CommitGroupLog, CommitJoin, CommitWaiter, GroupCommit, MutexGroupCommit,
@@ -37,7 +37,7 @@ use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 pub(crate) const LOG_HEADER_PAGES: usize = 2;
-type EnqueuedCommit = (TrxID, Option<Arc<SessionState>>, Option<CommitWaiter>);
+type EnqueuedCommit = (TrxID, Option<TrxSessionRef>, Option<CommitWaiter>);
 
 pub(crate) struct LogPartitionInitializer {
     pub(crate) ctx: StorageBackend,
