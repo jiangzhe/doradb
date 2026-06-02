@@ -1,7 +1,7 @@
 ---
 id: 000165
 title: Session Handle Registry Ownership
-status: proposal
+status: implemented
 created: 2026-05-31
 github_issue: 677
 ---
@@ -36,6 +36,8 @@ RFC Phase:
 Related Backlogs:
 - docs/backlogs/000066-engine-scoped-weak-runtime-handles.md
 - docs/backlogs/000113-transaction-cancellation-safety.md
+- docs/backlogs/000115-explicit-session-lock-cache.md
+- docs/backlogs/000116-general-session-runtime-pin-ownership.md
 
 ## Context
 
@@ -383,6 +385,89 @@ Reference:
 
 ## Implementation Notes
 
+Implemented RFC-0019 Phase 3 session registry ownership in the storage crate.
+Public `Session` is now a weak, non-cloneable capability with `SessionID`,
+`WeakEngineRef`, and a local closed flag. `EngineInner` owns a `SessionRegistry`
+that stores strong `Arc<SessionState>` entries, and `Engine::new_session()`
+creates registry-owned session state rather than returning public strong state.
+
+Session lifecycle is now represented by one `SessionLifecycle` enum covering
+running idle, running active with `TrxID`, abandoned idle, abandoned active with
+`TrxID`, and closed states. `Session::pin()` upgrades weak engine reachability,
+acquires admission, looks up registry-owned state, validates lifecycle, and
+returns a crate-private `SessionPin`. `Session::close().await`, session `Drop`,
+registry abandonment, transaction terminal cleanup, and shutdown idle cleanup
+all route through this lifecycle. `Session::in_trx()` returns `Result<bool>` so
+closed, stale, and shutdown sessions are reported as errors instead of panics.
+
+Transaction integration uses transitional `TrxSessionRef`: active transactions
+keep strong `EngineRef` runtime liveness for Phase 3, but only weakly reference
+`SessionState` while retaining cached `PoolGuards`. Commit and rollback terminal
+cleanup calls back into `SessionRegistry`; `finish_trx_commit` updates
+`last_cts` only when the completing `TrxID` still owns the session. Test helpers
+that construct `TrxSessionRef` now keep their backing `Arc<SessionState>` alive
+for the transaction scope.
+
+Engine shutdown now closes admission, drains admissions/runtime refs, waits for
+transitional runtime pins in `shutdown()`, keeps nonblocking `try_shutdown()`,
+and removes idle/abandoned-idle registry sessions before component shutdown.
+Weak public sessions no longer keep `EngineInner`, component guards, session
+state, or pool guards alive. `EngineLifecycle` uses a `shutdown_lock` to ensure
+only one shutdown caller performs final teardown.
+
+Session lock and table/persistence paths were updated to use operation pins and
+short-lived guard bundles. `LockManager::acquire_grouped_table_locks` centralizes
+metadata/data table lock acquisition. `TablePersistence::checkpoint_readiness`
+now returns `Result<CheckpointReadiness>` and propagates `Session::pin` failures
+instead of panicking. Test-only session accessors were moved under
+`#[cfg(test)]` extension helpers instead of production methods.
+
+Post-implementation review findings were fixed before resolve:
+- stale/late transaction commit completion can no longer mutate `last_cts`;
+- checkpoint readiness on closed sessions now returns an operation error;
+- transaction test helpers no longer create detached weak session references.
+
+Deferred follow-ups created during implementation:
+- `docs/backlogs/000115-explicit-session-lock-cache.md` for a session-local
+  explicit table lock cache, avoiding broad `LockManager::release_owner` scans;
+- `docs/backlogs/000116-general-session-runtime-pin-ownership.md` for a general
+  session runtime pin model that keeps engine runtime liveness across long
+  async operation boundaries and future transaction refactors.
+
+Validation completed:
+- `cargo fmt --check`
+- `git diff --check`
+- `cargo check -p doradb-storage --all-targets`
+- `cargo clippy -p doradb-storage --all-targets -- -D warnings`
+- `cargo nextest run -p doradb-storage` (876 tests passed)
+- `tools/coverage_focus.rs --path doradb-storage/src/session.rs --path doradb-storage/src/engine.rs --path doradb-storage/src/table/persistence.rs --path doradb-storage/src/trx/mod.rs --path doradb-storage/src/trx/stmt.rs --path doradb-storage/src/lock/mod.rs`
+  produced 95.09% deduplicated focused coverage. Per-file coverage was:
+  `session.rs` 95.44%, `engine.rs` 96.05%, `table/persistence.rs` 84.27%,
+  `trx/mod.rs` 96.89%, `trx/stmt.rs` 98.36%, and `lock/mod.rs` 97.83%.
+- `cargo run -p doradb-storage --release --example weak_handle_baseline`
+  completed with the example's default parameters and wrote
+  `target/weak-handle-baseline/baseline.csv`. Default release averages were:
+  session begin 79 ns, statement exec 36 ns, table lookup 49 ns, point lookup
+  501 ns, insert 1065 ns, update 696 ns, delete 1101 ns, and table scan
+  213657 ns.
+
+Checklist outcome:
+- Reliability: pass. Task-required lifecycle, shutdown, close/drop, transaction
+  reuse, stale-session, and regression paths are covered; validation and
+  focused coverage passed.
+- Security: n/a. No unsafe code was added or modified.
+- Performance: pass with deferred follow-ups. Registry lookup is paid at public
+  operation boundaries; session-lock cache and long-lived session runtime pin
+  design are tracked separately.
+- Feature completeness: pass. Phase 3 goals are implemented while Phase 4/5
+  transaction/table public-handle migrations remain non-goals.
+- Documentation: pass. Public/crate-public API comments and core lifecycle
+  comments were updated where behavior changed.
+- Test-only code: pass. New test helpers remain in `#[cfg(test)]` modules.
+- Complexity: pass. Shared registry and lock-manager helpers reduce repeated
+  boilerplate; larger existing checkpoint logic remains outside this task's
+  refactor scope.
+
 ## Impacts
 
 - `doradb-storage/src/engine.rs`
@@ -476,6 +561,11 @@ Deferred follow-ups:
   machine remain tracked by
   `docs/backlogs/000113-transaction-cancellation-safety.md` and RFC-0019
   Phase 4.
+- Session-level explicit lock cache optimization remains tracked by
+  `docs/backlogs/000115-explicit-session-lock-cache.md`.
+- A general session runtime pin ownership model for long-running async
+  operations and future transaction refactors remains tracked by
+  `docs/backlogs/000116-general-session-runtime-pin-ownership.md`.
 - Public table handle migration and removal of public `Arc<Table>` exposure
   remain RFC-0019 Phase 5 work.
 - Final public strong-handle cleanup and documentation sync remain RFC-0019

@@ -646,10 +646,14 @@ code is visible.
   - Non-goals: Do not convert transaction handles beyond the minimum needed for
     session-owned active transaction storage. Do not implement broad forced
     shutdown policy beyond the RFC contract.
-  - Task Doc: `docs/tasks/TBD.md`
-  - Task Issue: `#0`
-  - Phase Status: `pending`
-  - Implementation Summary: `pending`
+  - Task Doc: `docs/tasks/000165-session-handle-registry-ownership.md`
+  - Task Issue: `#677`
+  - Phase Status: done
+  - Implementation Summary: Implemented RFC-0019 Phase 3 session registry ownership in the storage crate. [Task Resolve Sync: docs/tasks/000165-session-handle-registry-ownership.md @ 2026-06-02]
+  - Related Backlogs:
+    - `docs/backlogs/000113-transaction-cancellation-safety.md`
+    - `docs/backlogs/000115-explicit-session-lock-cache.md`
+    - `docs/backlogs/000116-general-session-runtime-pin-ownership.md`
 
 - **Phase 4: Transaction Handle Session Ownership**
   - Scope: Replace public `ActiveTrx`/`Transaction` ownership with a
