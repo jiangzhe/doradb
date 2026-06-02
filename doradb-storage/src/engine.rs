@@ -727,6 +727,7 @@ mod tests {
     use crate::id::TrxID;
     use crate::lock::tests::{debug_snapshot, try_acquire};
     use crate::lock::{LockMode, LockOwner, LockResource};
+    use crate::session::tests::SessionTestExt;
     use std::fs;
     use std::panic::{AssertUnwindSafe, catch_unwind};
     use std::sync::{Barrier, mpsc};
@@ -1444,14 +1445,47 @@ mod tests {
                 err.operation_error(),
                 Some(OperationError::ExistingTransaction)
             );
-            assert!(session.in_trx());
+            assert!(session.in_trx().unwrap());
 
             trx.rollback().await.unwrap();
-            assert!(!session.in_trx());
+            assert!(!session.in_trx().unwrap());
             session.close().await.unwrap();
             session.close().await.unwrap();
             assert_eq!(engine.inner().session_registry.len(), 0);
             engine.shutdown().unwrap();
+        });
+    }
+
+    #[test]
+    fn test_session_in_trx_returns_error_after_session_close() {
+        smol::block_on(async {
+            let root = TempDir::new().unwrap();
+            let engine = test_engine_config_for(root.path()).build().await.unwrap();
+            let mut session = engine.new_session().unwrap();
+
+            assert!(!session.in_trx().unwrap());
+            session.close().await.unwrap();
+
+            let err = session.in_trx().unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::Operation);
+            assert_eq!(err.operation_error(), Some(OperationError::NotSupported));
+            engine.shutdown().unwrap();
+        });
+    }
+
+    #[test]
+    fn test_session_in_trx_returns_error_after_engine_shutdown() {
+        smol::block_on(async {
+            let root = TempDir::new().unwrap();
+            let engine = test_engine_config_for(root.path()).build().await.unwrap();
+            let session = engine.new_session().unwrap();
+
+            assert!(!session.in_trx().unwrap());
+            engine.shutdown().unwrap();
+
+            let err = session.in_trx().unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::Lifecycle);
+            assert_eq!(err.lifecycle_error(), Some(LifecycleError::Shutdown));
         });
     }
 
@@ -1513,7 +1547,7 @@ mod tests {
             let mut session = engine.new_session().unwrap();
 
             let trx = session.begin_trx().unwrap();
-            assert!(session.in_trx());
+            assert!(session.in_trx().unwrap());
             let err = match session.begin_trx() {
                 Ok(_) => panic!("expected existing transaction error"),
                 Err(err) => err,
@@ -1522,7 +1556,7 @@ mod tests {
             let operation_error = err.operation_error();
 
             trx.rollback().await.unwrap();
-            assert!(!session.in_trx());
+            assert!(!session.in_trx().unwrap());
             assert_eq!(kind, ErrorKind::Operation);
             assert_eq!(operation_error, Some(OperationError::ExistingTransaction));
         });
@@ -1539,7 +1573,7 @@ mod tests {
             trx.add_pseudo_redo_log_entry();
             let cts = trx.commit().await.unwrap();
             assert!(cts > TrxID::new(0));
-            assert!(!session.in_trx());
+            assert!(!session.in_trx().unwrap());
 
             let trx = session.begin_trx().unwrap();
             trx.rollback().await.unwrap();
@@ -1555,10 +1589,37 @@ mod tests {
 
             let trx = session.begin_trx().unwrap();
             trx.rollback().await.unwrap();
-            assert!(!session.in_trx());
+            assert!(!session.in_trx().unwrap());
 
             let trx = session.begin_trx().unwrap();
             trx.rollback().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn test_stale_transaction_commit_does_not_update_session_state() {
+        smol::block_on(async {
+            let root = TempDir::new().unwrap();
+            let engine = test_engine_config_for(root.path()).build().await.unwrap();
+            let mut session = engine.new_session().unwrap();
+
+            let trx = session.begin_trx().unwrap();
+            let stale_trx_id = trx.trx_id();
+            trx.rollback().await.unwrap();
+            assert_eq!(session.last_cts(), TrxID::new(0));
+
+            let replacement = session.begin_trx().unwrap();
+            engine.inner().session_registry.finish_trx_commit(
+                session.id(),
+                stale_trx_id,
+                TrxID::new(91_241),
+            );
+
+            assert!(session.in_trx().unwrap());
+            assert_eq!(session.last_cts(), TrxID::new(0));
+
+            replacement.rollback().await.unwrap();
+            engine.shutdown().unwrap();
         });
     }
 
@@ -1572,7 +1633,7 @@ mod tests {
             let trx = session.begin_trx().unwrap();
             let cts = trx.commit().await.unwrap();
             assert_eq!(cts, TrxID::new(0));
-            assert!(!session.in_trx());
+            assert!(!session.in_trx().unwrap());
 
             let trx = session.begin_trx().unwrap();
             trx.rollback().await.unwrap();
@@ -1590,8 +1651,8 @@ mod tests {
             let trx1 = session1.begin_trx().unwrap();
             let trx2 = session2.begin_trx().unwrap();
 
-            assert!(session1.in_trx());
-            assert!(session2.in_trx());
+            assert!(session1.in_trx().unwrap());
+            assert!(session2.in_trx().unwrap());
 
             trx1.rollback().await.unwrap();
             trx2.rollback().await.unwrap();

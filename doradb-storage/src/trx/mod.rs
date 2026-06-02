@@ -1417,11 +1417,12 @@ pub(crate) mod tests {
         (temp_dir, engine)
     }
 
-    fn test_session_ref(engine: &Engine, trx_id: TrxID) -> TrxSessionRef {
+    fn test_session_ref(engine: &Engine, trx_id: TrxID) -> (TrxSessionRef, Arc<SessionState>) {
         let engine_ref = engine.new_ref().unwrap();
         let session_id = engine_ref.next_session_id();
         let session_state = Arc::new(SessionState::new(engine_ref.clone(), session_id));
-        TrxSessionRef::new(engine_ref, &session_state, trx_id)
+        let session = TrxSessionRef::new(engine_ref, &session_state, trx_id);
+        (session, session_state)
     }
 
     #[inline]
@@ -1526,9 +1527,19 @@ pub(crate) mod tests {
     fn test_active_trx_new_splits_context_and_empty_effects() {
         smol::block_on(async {
             let (_temp_dir, engine) = test_engine("redo_trx_context_new").await;
-            let session = test_session_ref(&engine, MIN_ACTIVE_TRX_ID + 42);
+            let (session, _session_state) = test_session_ref(&engine, MIN_ACTIVE_TRX_ID + 42);
             let mut trx = ActiveTrx::new(session, MIN_ACTIVE_TRX_ID + 42, TrxID::new(42), 3, 5);
 
+            let page_id = VersionedPageID {
+                page_id: PageID::new(7),
+                generation: 11,
+            };
+            trx.ctx()
+                .save_active_insert_page(TableID::new(19), page_id, RowID::new(23));
+            assert_eq!(
+                trx.ctx().load_active_insert_page(TableID::new(19)),
+                Some((page_id, RowID::new(23)))
+            );
             assert!(trx.readonly());
             assert!(!trx.require_durability());
             assert!(!trx.require_ordered_commit());
@@ -1551,7 +1562,7 @@ pub(crate) mod tests {
     fn test_trx_context_require_pool_guards_returns_error_after_detach() {
         smol::block_on(async {
             let (_temp_dir, engine) = test_engine("redo_trx_require_pool_guards").await;
-            let session = test_session_ref(&engine, MIN_ACTIVE_TRX_ID + 43);
+            let (session, _session_state) = test_session_ref(&engine, MIN_ACTIVE_TRX_ID + 43);
             let mut ctx = TrxContext::new(session, MIN_ACTIVE_TRX_ID + 43, TrxID::new(43), 1, 2);
 
             assert!(ctx.require_pool_guards("attached test").is_ok());
@@ -1571,7 +1582,7 @@ pub(crate) mod tests {
     fn test_active_trx_readonly_prepare_keeps_empty_effect_payload() {
         smol::block_on(async {
             let (_temp_dir, engine) = test_engine("redo_trx_readonly_prepare").await;
-            let session = test_session_ref(&engine, MIN_ACTIVE_TRX_ID + 43);
+            let (session, _session_state) = test_session_ref(&engine, MIN_ACTIVE_TRX_ID + 43);
             let trx = ActiveTrx::new(session, MIN_ACTIVE_TRX_ID + 43, TrxID::new(43), 1, 2);
 
             let mut prepared = trx.prepare().unwrap();
@@ -1597,7 +1608,7 @@ pub(crate) mod tests {
     fn test_active_trx_prepare_moves_effect_payload() {
         smol::block_on(async {
             let (_temp_dir, engine) = test_engine("redo_trx_effect_prepare").await;
-            let session = test_session_ref(&engine, MIN_ACTIVE_TRX_ID + 44);
+            let (session, _session_state) = test_session_ref(&engine, MIN_ACTIVE_TRX_ID + 44);
             let mut trx = ActiveTrx::new(session, MIN_ACTIVE_TRX_ID + 44, TrxID::new(44), 2, 3);
             trx.add_pseudo_redo_log_entry();
             trx.row_undo_mut().push(OwnedRowUndo::new(
@@ -1636,7 +1647,7 @@ pub(crate) mod tests {
     fn test_statement_success_merges_statement_effects_into_transaction_effects() {
         smol::block_on(async {
             let (_temp_dir, engine) = test_engine("redo_stmt_effect_merge").await;
-            let session = test_session_ref(&engine, MIN_ACTIVE_TRX_ID + 45);
+            let (session, _session_state) = test_session_ref(&engine, MIN_ACTIVE_TRX_ID + 45);
             let mut trx = ActiveTrx::new(session, MIN_ACTIVE_TRX_ID + 45, TrxID::new(45), 0, 0);
             trx.exec(async |stmt| {
                 let effects = stmt.effects_mut();
@@ -1694,7 +1705,7 @@ pub(crate) mod tests {
     fn test_statement_error_rolls_back_only_statement_effects() {
         smol::block_on(async {
             let (_temp_dir, engine) = test_engine("redo_stmt_error_rollback").await;
-            let session = test_session_ref(&engine, MIN_ACTIVE_TRX_ID + 49);
+            let (session, _session_state) = test_session_ref(&engine, MIN_ACTIVE_TRX_ID + 49);
             let mut trx = ActiveTrx::new(session, MIN_ACTIVE_TRX_ID + 49, TrxID::new(49), 0, 0);
 
             trx.exec(async |stmt| {
@@ -1925,7 +1936,7 @@ pub(crate) mod tests {
     fn test_transaction_locks_release_on_precommit_abort() {
         smol::block_on(async {
             let (_temp_dir, engine) = test_engine("redo_trx_lock_abort").await;
-            let session = test_session_ref(&engine, MIN_ACTIVE_TRX_ID + 55);
+            let (session, _session_state) = test_session_ref(&engine, MIN_ACTIVE_TRX_ID + 55);
             let mut trx = ActiveTrx::new(session, MIN_ACTIVE_TRX_ID + 55, TrxID::new(55), 0, 0);
             let owner = lock_owner(&trx).unwrap();
             acquire_transaction_lock(
@@ -1992,7 +2003,7 @@ pub(crate) mod tests {
         smol::block_on(async {
             let (_temp_dir, engine) = test_engine("redo_trx_effect_predicates").await;
 
-            let session = test_session_ref(&engine, MIN_ACTIVE_TRX_ID + 46);
+            let (session, _session_state) = test_session_ref(&engine, MIN_ACTIVE_TRX_ID + 46);
             let mut trx = ActiveTrx::new(session, MIN_ACTIVE_TRX_ID + 46, TrxID::new(46), 0, 0);
             trx.extend_gc_row_pages(vec![PageID::new(46)]);
             assert!(!trx.require_durability());
@@ -2005,7 +2016,7 @@ pub(crate) mod tests {
             prepared.session.take();
             prepared.release_transaction_locks();
 
-            let session = test_session_ref(&engine, MIN_ACTIVE_TRX_ID + 47);
+            let (session, _session_state) = test_session_ref(&engine, MIN_ACTIVE_TRX_ID + 47);
             let mut trx = ActiveTrx::new(session, MIN_ACTIVE_TRX_ID + 47, TrxID::new(47), 0, 0);
             trx.index_undo_mut().push(IndexUndo {
                 table_id: TableID::new(47),
@@ -2022,7 +2033,7 @@ pub(crate) mod tests {
             prepared.session.take();
             prepared.release_transaction_locks();
 
-            let session = test_session_ref(&engine, MIN_ACTIVE_TRX_ID + 48);
+            let (session, _session_state) = test_session_ref(&engine, MIN_ACTIVE_TRX_ID + 48);
             let mut trx = ActiveTrx::new(session, MIN_ACTIVE_TRX_ID + 48, TrxID::new(48), 0, 0);
             trx.add_pseudo_redo_log_entry();
             assert!(trx.require_durability());

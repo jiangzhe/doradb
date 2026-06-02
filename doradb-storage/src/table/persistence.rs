@@ -34,7 +34,7 @@ pub trait TablePersistence {
     fn freeze(&self, session: &Session, max_rows: usize) -> impl Future<Output = Result<usize>>;
 
     /// Report whether a user-table checkpoint can safely publish now.
-    fn checkpoint_readiness(&self, session: &Session) -> CheckpointReadiness;
+    fn checkpoint_readiness(&self, session: &Session) -> Result<CheckpointReadiness>;
 
     /// Persist eligible row-store and cold-delete state in one checkpoint run.
     fn checkpoint(&self, session: &mut Session) -> impl Future<Output = Result<CheckpointOutcome>>;
@@ -927,9 +927,8 @@ impl TablePersistence for Table {
         Ok(rows)
     }
 
-    fn checkpoint_readiness(&self, session: &Session) -> CheckpointReadiness {
+    fn checkpoint_readiness(&self, session: &Session) -> Result<CheckpointReadiness> {
         self.try_checkpoint_readiness_for_session(session)
-            .expect("checkpoint readiness requires a live running session")
     }
 
     async fn checkpoint(&self, session: &mut Session) -> Result<CheckpointOutcome> {

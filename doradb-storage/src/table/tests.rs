@@ -1853,7 +1853,7 @@ fn test_secondary_mem_index_cleanup_removes_redundant_live_unique_entries() {
             .cleanup_secondary_mem_indexes(&mut session, true)
             .await
             .unwrap();
-        assert!(!session.in_trx());
+        assert!(!session.in_trx().unwrap());
         assert_eq!(stats.indexes.len(), 1);
         assert_eq!(stats.indexes[0].index_no, 0);
         assert!(stats.indexes[0].unique);
@@ -1896,12 +1896,12 @@ fn test_secondary_mem_index_cleanup_requires_idle_session() {
             .await
             .unwrap_err();
         let operation_error = err.operation_error();
-        let was_in_trx = session.in_trx();
+        let was_in_trx = session.in_trx().unwrap();
 
         trx.rollback().await.unwrap();
         assert_eq!(operation_error, Some(OperationError::ExistingTransaction));
         assert!(was_in_trx);
-        assert!(!session.in_trx());
+        assert!(!session.in_trx().unwrap());
     });
 }
 
@@ -4918,7 +4918,7 @@ fn test_create_table_rejects_invalid_metadata_before_file_creation() {
             Some(ConfigError::InvalidIndexSpec)
         );
         assert!(engine.catalog().get_table(table_id).await.is_none());
-        assert!(!session.in_trx());
+        assert!(!session.in_trx().unwrap());
         wait_path_exists(&table_file_path, false).await;
     });
 }
@@ -4949,7 +4949,7 @@ fn test_create_table_catalog_staging_failure_rolls_back_and_deletes_file() {
             Some(InternalError::InjectedTestFailure)
         );
         assert!(engine.catalog().get_table(table_id).await.is_none());
-        assert!(!session.in_trx());
+        assert!(!session.in_trx().unwrap());
         wait_path_exists(&table_file_path, false).await;
     });
 }
@@ -4978,7 +4978,7 @@ fn test_create_table_file_publish_failure_rolls_back_catalog_and_deletes_file() 
         assert!(err.is_kind(ErrorKind::Io), "{err:?}");
         assert!(hook.call_count() > 0);
         assert!(engine.catalog().get_table(table_id).await.is_none());
-        assert!(!session.in_trx());
+        assert!(!session.in_trx().unwrap());
         wait_path_exists(&table_file_path, false).await;
     });
 }
@@ -5009,7 +5009,7 @@ fn test_create_table_after_file_published_failure_rolls_back_catalog_and_deletes
             Some(InternalError::InjectedTestFailure)
         );
         assert!(engine.catalog().get_table(table_id).await.is_none());
-        assert!(!session.in_trx());
+        assert!(!session.in_trx().unwrap());
         wait_path_exists(&table_file_path, false).await;
     });
 }
@@ -5040,7 +5040,7 @@ fn test_create_table_runtime_failure_after_file_publish_rolls_back_and_deletes_f
             Some(InternalError::InjectedTestFailure)
         );
         assert!(engine.catalog().get_table(table_id).await.is_none());
-        assert!(!session.in_trx());
+        assert!(!session.in_trx().unwrap());
         wait_path_exists(&table_file_path, false).await;
     });
 }
@@ -5078,7 +5078,7 @@ fn test_create_table_catalog_commit_error_after_file_publish_poisons_and_keeps_f
                 .is_some_and(|err| *err.current_context() == FatalError::Poisoned)
         );
         assert!(engine.catalog().get_table(table_id).await.is_none());
-        assert!(!session.in_trx());
+        assert!(!session.in_trx().unwrap());
         assert!(std::path::Path::new(&table_file_path).exists());
     });
 }
@@ -6181,7 +6181,7 @@ fn test_checkpoint_cancelled_when_table_dropping() {
             }
         );
         assert_root_metadata_unchanged(&root_before, &sys.table);
-        assert!(!session.in_trx());
+        assert!(!session.in_trx().unwrap());
     });
 }
 
@@ -6197,7 +6197,7 @@ fn test_drop_table_rejects_already_dropping_lifecycle_without_poison() {
         let err = session.drop_table(table_id).await.unwrap_err();
         assert_eq!(err.operation_error(), Some(OperationError::TableDropping));
         assert_eq!(sys.table.lifecycle.state(), TableLifecycleState::Dropping);
-        assert!(!session.in_trx());
+        assert!(!session.in_trx().unwrap());
         assert!(sys.engine.trx_sys.storage_poison_error().is_none());
     });
 }
@@ -6265,7 +6265,7 @@ fn test_drop_table_rejects_runtime_missing_catalog_row_before_gate() {
 
         assert_eq!(err.operation_error(), Some(OperationError::TableNotFound));
         assert_eq!(sys.table.lifecycle.state(), TableLifecycleState::Live);
-        assert!(!drop_session.in_trx());
+        assert!(!drop_session.in_trx().unwrap());
         assert!(sys.engine.trx_sys.storage_poison_error().is_none());
         assert!(sys.engine.catalog().get_table(table_id).await.is_some());
     });
@@ -6715,7 +6715,7 @@ fn test_drop_table_catalog_cascade_poison_preserves_source_error() {
                 .as_ref()
                 .is_some_and(|err| *err.current_context() == FatalError::Poisoned)
         );
-        assert!(!drop_session.in_trx());
+        assert!(!drop_session.in_trx().unwrap());
     });
 }
 
@@ -6760,7 +6760,7 @@ fn test_drop_table_commit_poison_preserves_source_error() {
                 .as_ref()
                 .is_some_and(|err| *err.current_context() == FatalError::RedoWrite)
         );
-        assert!(!session.in_trx());
+        assert!(!session.in_trx().unwrap());
     });
 }
 
@@ -7026,7 +7026,7 @@ fn test_checkpoint_publish_write_failure_poisons_storage() {
         assert_checkpoint_write_poisoned(&err, &sys);
         assert!(hook.call_count() > 0);
         assert_root_metadata_unchanged(&root_before, &sys.table);
-        assert!(!session.in_trx());
+        assert!(!session.in_trx().unwrap());
     });
 }
 
@@ -7045,7 +7045,7 @@ fn test_checkpoint_post_publication_failure_poisons_storage() {
         let err = res.unwrap_err();
         assert_checkpoint_write_poisoned(&err, &sys);
         assert!(sys.table.file().active_root_unchecked().root_ts > root_before.root_ts);
-        assert!(!session.in_trx());
+        assert!(!session.in_trx().unwrap());
     });
 }
 
@@ -7058,9 +7058,23 @@ fn test_checkpoint_readiness_ready_when_effective_ts_crossed_gc_horizon() {
         let effective_ts = root.effective_ts();
         wait_gc_cutoff_after(&session, effective_ts).await;
         assert!(matches!(
-            sys.table.checkpoint_readiness(&session),
+            sys.table.checkpoint_readiness(&session).unwrap(),
             CheckpointReadiness::Ready
         ));
+    });
+}
+
+#[test]
+fn test_checkpoint_readiness_returns_error_after_session_close() {
+    smol::block_on(async {
+        let sys = TestSys::new_evictable().await;
+        let mut session = sys.new_session().unwrap();
+
+        session.close().await.unwrap();
+
+        let err = sys.table.checkpoint_readiness(&session).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::Operation);
+        assert_eq!(err.operation_error(), Some(OperationError::NotSupported));
     });
 }
 
@@ -7078,7 +7092,7 @@ fn test_checkpoint_readiness_delayed_reports_effective_ts_and_horizon() {
 
         let active_root = sys.table.file().active_root_unchecked();
         let active_root_effective_ts = active_root.effective_ts();
-        let readiness = sys.table.checkpoint_readiness(&session);
+        let readiness = sys.table.checkpoint_readiness(&session).unwrap();
         let CheckpointReadiness::Delayed { reason } = readiness else {
             panic!("expected delayed checkpoint readiness, got {readiness:?}");
         };
@@ -7089,7 +7103,7 @@ fn test_checkpoint_readiness_delayed_reports_effective_ts_and_horizon() {
         reader.commit().await.unwrap();
         wait_gc_cutoff_after(&session, active_root_effective_ts).await;
         assert!(matches!(
-            sys.table.checkpoint_readiness(&session),
+            sys.table.checkpoint_readiness(&session).unwrap(),
             CheckpointReadiness::Ready
         ));
     });
@@ -7121,7 +7135,7 @@ fn test_checkpoint_readiness_uses_root_effective_ts_not_checkpoint_start_ts() {
         assert!(checkpoint_ts < reader_sts.get());
         assert!(effective_ts > reader_sts.get());
 
-        let readiness = sys.table.checkpoint_readiness(&session);
+        let readiness = sys.table.checkpoint_readiness(&session).unwrap();
         let CheckpointReadiness::Delayed { reason } = readiness else {
             panic!("expected effective timestamp delay, got {readiness:?}");
         };
@@ -7149,7 +7163,7 @@ fn test_checkpoint_readiness_uses_root_effective_ts_not_checkpoint_start_ts() {
         reader.commit().await.unwrap();
         wait_gc_cutoff_after(&session, effective_ts).await;
         assert!(matches!(
-            sys.table.checkpoint_readiness(&session),
+            sys.table.checkpoint_readiness(&session).unwrap(),
             CheckpointReadiness::Ready
         ));
     });
@@ -7172,19 +7186,19 @@ fn test_checkpoint_requires_idle_session_before_delayed_outcome() {
         );
 
         let checkpoint_trx = session.begin_trx().unwrap();
-        assert!(session.in_trx());
+        assert!(session.in_trx().unwrap());
         assert!(matches!(
-            sys.table.checkpoint_readiness(&session),
+            sys.table.checkpoint_readiness(&session).unwrap(),
             CheckpointReadiness::Delayed { .. }
         ));
 
         let err = sys.table.checkpoint(&mut session).await.unwrap_err();
         assert_eq!(err.operation_error(), Some(OperationError::NotSupported));
         assert!(format!("{err:?}").contains("checkpoint requires idle session"));
-        assert!(session.in_trx());
+        assert!(session.in_trx().unwrap());
 
         checkpoint_trx.rollback().await.unwrap();
-        assert!(!session.in_trx());
+        assert!(!session.in_trx().unwrap());
         reader.commit().await.unwrap();
     });
 }
@@ -7337,7 +7351,7 @@ fn test_checkpoint_rechecks_readiness_after_root_mutation_lease() {
         let mut reader_session = sys.new_session().unwrap();
         let reader = reader_session.begin_trx().unwrap();
         assert!(matches!(
-            sys.table.checkpoint_readiness(&checkpoint_session),
+            sys.table.checkpoint_readiness(&checkpoint_session).unwrap(),
             CheckpointReadiness::Ready
         ));
 
@@ -7927,7 +7941,7 @@ fn test_mvcc_rollback_poisons_runtime_on_row_page_reload_error() {
                 .as_ref()
                 .is_err_and(|err| *err.current_context() == FatalError::RollbackAccess)
         );
-        assert!(!session.in_trx());
+        assert!(!session.in_trx().unwrap());
     });
 }
 
@@ -8017,7 +8031,7 @@ fn test_statement_rollback_poisons_runtime_on_row_page_reload_error() {
                 .as_ref()
                 .is_some_and(|err| *err.current_context() == FatalError::RollbackAccess)
         );
-        assert!(!session.in_trx());
+        assert!(!session.in_trx().unwrap());
 
         let err = trx.rollback().await.unwrap_err();
         assert_eq!(
@@ -8930,7 +8944,7 @@ async fn wait_gc_cutoff_after(session: &Session, ts: TrxID) {
 async fn wait_checkpoint_ready(table: &Table, session: &Session) {
     let mut last_delay = None;
     for _ in 0..50 {
-        match table.checkpoint_readiness(session) {
+        match table.checkpoint_readiness(session).unwrap() {
             CheckpointReadiness::Ready => return,
             CheckpointReadiness::Delayed { reason } => {
                 last_delay = Some(reason);

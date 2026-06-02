@@ -230,6 +230,30 @@ impl LockManager {
             .await
     }
 
+    /// Acquires the ordered metadata/data locks for a grouped table operation.
+    #[inline]
+    pub(crate) async fn acquire_grouped_table_locks<'a>(
+        &'a self,
+        table_id: TableID,
+        data_mode: LockMode,
+        owner: LockOwner,
+        owner_group: LockOwnerGroup,
+    ) -> Result<(Option<FreshLockGuard<'a>>, Option<FreshLockGuard<'a>>)> {
+        let metadata_resource = LockResource::TableMetadata(table_id);
+        let metadata_grant = self
+            .acquire_grouped_with_grant(metadata_resource, LockMode::Shared, owner, owner_group)
+            .await?;
+        let metadata_guard = FreshLockGuard::new(self, metadata_resource, owner, metadata_grant);
+
+        let data_resource = LockResource::TableData(table_id);
+        let data_grant = self
+            .acquire_grouped_with_grant(data_resource, data_mode, owner, owner_group)
+            .await?;
+        let data_guard = FreshLockGuard::new(self, data_resource, owner, data_grant);
+
+        Ok((metadata_guard, data_guard))
+    }
+
     #[inline]
     async fn acquire_with_group(
         &self,
