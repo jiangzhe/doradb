@@ -181,7 +181,6 @@ impl Table {
         let pin = session.pin("cleanup secondary mem indexes")?;
         let trx_sys = pin.engine.trx_sys.clone();
         let pool_guards = pin.pool_guards();
-        drop(pin);
         loop {
             let trx = session.begin_trx()?;
             let cleanup_sts = trx.sts();
@@ -192,6 +191,8 @@ impl Table {
                 trx_sys.rollback(trx).await?;
                 continue;
             }
+            #[cfg(test)]
+            super::tests::run_test_secondary_cleanup_before_scan_hook().await;
 
             let cleanup_res = self
                 .cleanup_secondary_mem_indexes_at_snapshot(

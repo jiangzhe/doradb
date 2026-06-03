@@ -158,7 +158,7 @@ Issue Labels:
 - [U9] Follow-up RFC refinement: transaction cancellation safety is
   correctness-critical, but RFC-0019 should state only weak-handle abandonment
   invariants and leave the detailed transaction state machine to a dedicated
-  follow-up before Phase 4.
+  follow-up before weak transaction handle migration.
 - [U10] Follow-up RFC refinement: the table API shape should remain flexible
   if existing statement methods can be adapted without exposing public
   `Arc<Table>` handles or adding hot-loop lookup overhead.
@@ -167,12 +167,27 @@ Issue Labels:
   handles as exclusive use of the public capability, but actual mutable access to
   engine-owned runtime state must be obtained through an internal operation
   lease over a stable registry entry.
+- [U12] Phase 4 task planning found that automatic rollback of abandoned
+  transactions is not just a transaction-handle `Drop` hook. It requires
+  explicit cleanup ownership, an async execution path or worker, runtime pin
+  handoff, shutdown integration, and failure handling before the public
+  transaction handle can become weak.
+- [U13] Phase 4 should therefore split into a preparation phase for explicit
+  transaction terminal ownership and a later weak-transaction-handle phase that
+  owns abandoned rollback cleanup. Following phases should be renumbered.
+- [U14] Follow-up refinement after Phase 4 implementation: the transaction
+  phase should split again so session-owned stable transaction entries and
+  operation leases land before public weak transaction handles and abandoned
+  rollback cleanup. The implementation should preserve state-specific ownership
+  types such as active, prepared, and precommit transactions instead of
+  flattening all transaction fields into one large enum.
 
 ### Source Backlogs (Optional)
 
 - [B1] `docs/backlogs/000061-block-engine-shutdown-while-external-table-handles-are-alive.md`
 - [B2] `docs/backlogs/000066-engine-scoped-weak-runtime-handles.md`
 - [B3] `docs/backlogs/000113-transaction-cancellation-safety.md`
+- [B4] `docs/backlogs/000116-general-session-runtime-pin-ownership.md`
 
 ## Decision
 
@@ -554,7 +569,7 @@ the shared weak-handle contract stable while allowing generation policy,
 cleanup-executor placement, transaction-cancellation follow-up integration,
 table API shape, and performance thresholds to be selected where the affected
 code is visible.
-[D7] [D8] [U5] [U8] [U9] [U10] [U11] [B3]
+[D7] [D8] [U5] [U8] [U9] [U10] [U11] [U12] [U13] [B3] [B4]
 
 - **Phase 1: Weak Handle Foundation And Performance Baselines**
   - Scope: Define shared weak-handle identity, generation/non-reuse policy,
@@ -609,7 +624,7 @@ code is visible.
   - After This Phase: External users can no longer obtain a fresh cloneable
     public `EngineRef` equivalent, but legacy session, transaction, or table
     paths may still retain strong runtime reachability until their phases land.
-    Full weak-handle shutdown completeness is not guaranteed until Phase 6.
+    Full weak-handle shutdown completeness is not guaranteed until Phase 8.
   - Non-goals: Do not migrate session, transaction, or table handle semantics
     except where required to remove public strong `EngineRef` reachability.
   - Task Doc: `docs/tasks/000164-engine-handle-public-api-boundary.md`
@@ -631,7 +646,7 @@ code is visible.
     place. Session operations can acquire engine admission without exposing a
     strong public engine runtime handle. If active-transaction behavior is not
     fully migrated yet, the task must define a transitional policy that does not
-    conflict with Phase 4.
+    conflict with Phase 4 or Phase 5.
   - Phase-local Choices: Decide session identity format, including generation
     versus documented monotonic/non-reusable session ids; select the session
     registry layout and cleanup trigger; choose short interior-mutability
@@ -655,45 +670,129 @@ code is visible.
     - `docs/backlogs/000115-explicit-session-lock-cache.md`
     - `docs/backlogs/000116-general-session-runtime-pin-ownership.md`
 
-- **Phase 4: Transaction Handle Session Ownership**
-  - Scope: Replace public `ActiveTrx`/`Transaction` ownership with a
-    non-cloneable weak `TransactionHandle` whose strong transaction state is held
-    by the owning session. Preserve closure-based statement execution.
-  - Goals: Keep `commit().await` and `rollback().await` as explicit terminal
-    paths; make transaction handle drop enqueue rollback-equivalent cleanup; make
-    session-dropped-before-transaction behavior explicit and tested; define
-    idempotent transaction cleanup and integrate with the terminal-operation
-    cancellation contract produced by the dedicated cancellation-safety
-    follow-up.
-  - Prerequisites: Phase 1 through Phase 3 are in place, and the session registry
-    can strongly own a stable transaction entry without a strong engine cycle.
-    Before public transaction ownership changes, the transaction cancellation
-    safety follow-up must be resolved or explicitly incorporated by the Phase 4
-    task so cancelled `commit().await` and `rollback().await` have a concrete
-    terminal-operation state machine. [B3]
-  - Phase-local Choices: Decide transaction handle identity, including generation
-    versus transaction-id non-reuse; split the transaction entry from the
-    mutable transaction core; define active, checked-out, abandoned, committing,
-    committed, rolling-back, rolled-back, and failed cleanup states; apply the
-    completion-ownership contract defined by the cancellation follow-up; decide
-    the cleanup executor path; and define shutdown behavior for active,
-    checked-out, abandoned, committing, and rolling-back transactions.
-  - After This Phase: Active transaction state is owned strongly by the session,
-    public transaction handles are weak capabilities, mutable transaction work
-    uses operation leases over stable entries, abandoned cleanup cannot override
-    committing or committed transactions, and shutdown has concrete behavior for
-    active, checked-out, abandoned, committing, and rolling-back transactions.
-  - Non-goals: Do not redesign MVCC, redo, group commit, rollback, or logical
-    lock semantics except to route ownership through session-held strong state
-    and apply the already-resolved cancellation contract. Do not define detailed
-    async transaction cancellation semantics inside RFC-0019; that work is
-    tracked separately. [B3]
+- **Phase 4: Transaction Terminal Ownership Preparation**
+  - Scope: Prepare transaction lifecycle ownership for the future weak
+    transaction handle while preserving the current public `ActiveTrx`/
+    `Transaction` ownership boundary. Define the explicit terminal-operation
+    state machine, operation checkout rules, runtime pin ownership, and shutdown
+    interaction needed before abandoned transaction cleanup can be automated.
+  - Goals: Keep `commit().await` and `rollback().await` as the only
+    user-visible graceful transaction terminal paths; make completion ownership
+    explicit for `exec`, `commit`, `rollback`, and shutdown races; preserve
+    closure-based statement execution; resolve or incorporate the minimum
+    terminal-operation cancellation contract needed by weak transaction handles;
+    and address the session runtime pin ownership gaps that would otherwise let
+    long-running async session or transaction work outlive required engine-owned
+    runtime components. [B3] [B4] [U12] [U13]
+  - Prerequisites: Phase 1 through Phase 3 are in place. The Phase 3
+    transitional transaction path can still keep a strong runtime pin while this
+    phase designs and implements the safer terminal-operation and runtime-pin
+    contract for the next phase.
+  - Phase-local Choices: Define the logical transaction-operation states needed
+    for explicit operations, such as active, checked-out, committing,
+    rolling-back, terminal, and failed; decide which terminal states are stored
+    versus immediately removed; define the RAII lease or equivalent checkout
+    contract for mutable transaction work; define how shutdown observes and
+    waits for checked-out, committing, and rolling-back transactions; and decide
+    how `SessionPin` or a successor runtime pin is held across the production
+    long-running session paths identified in backlog `000116`.
+  - After This Phase: Explicit transaction terminal operations have concrete
+    completion ownership, shutdown behavior, and runtime pin safety. The public
+    transaction handle may still be the existing strong owner, and abandoned
+    transaction rollback is still not automated unless this phase explicitly
+    proves a bounded synchronous cleanup path.
+  - Non-goals: Do not replace public `ActiveTrx`/`Transaction` with a weak
+    transaction handle. Do not add a background abandoned-rollback queue,
+    cleanup worker, async cleanup executor, or public-handle-drop rollback
+    handoff. Do not redesign MVCC, redo, group commit, rollback, or logical lock
+    semantics beyond the terminal-operation ownership and runtime-pin contracts
+    needed by the next phase. [B3] [B4] [U12]
+  - Task Doc: `docs/tasks/000166-transaction-terminal-ownership-preparation.md`
+  - Task Issue: `#679`
+  - Phase Status: done
+  - Implementation Summary: Implemented RFC-0019 Phase 4 transaction terminal ownership preparation: commit handoff completion is owned by queued precommit/group commit state, runtime pins now survive freeze/checkpoint/secondary cleanup awaited sections, regression coverage and lifecycle documentation were added, and future transaction work was split into stable-entry and weak-handle cleanup phases. [Task Resolve Sync: docs/tasks/000166-transaction-terminal-ownership-preparation.md @ 2026-06-03]
+
+- **Phase 5: Transaction Stable Entry And Operation Lease**
+  - Scope: Move strong active transaction state into session-owned stable
+    transaction entries while preserving the current public `ActiveTrx`/
+    `Transaction` facade and explicit `commit().await`/`rollback().await`
+    terminal APIs. Add operation leases for checked-out mutable transaction work
+    and make transaction lifecycle visible to session cleanup and shutdown.
+  - Goals: Store active transaction cores in stable session-owned entries
+    without a strong engine cycle; represent registry-visible lifecycle with a
+    small entry state such as active, checked-out, committing, rolling-back,
+    terminal, or failed; keep state-specific owned transaction structs for
+    active, prepared, precommit, and committed work; protect checked-out mutable
+    cores with an RAII lease across `.await`; and preserve the Phase 4 commit
+    handoff contract without adding abandoned rollback cleanup. [B3] [U11]
+    [U12] [U14]
+  - Prerequisites: Phase 4 has defined and tested explicit terminal-operation
+    completion ownership, commit handoff, shutdown observation, and runtime pin
+    safety. The session registry can host a stable transaction entry without
+    creating a session-to-engine strong cycle.
+  - Phase-local Choices: Choose the stable transaction entry layout and mutable
+    core field split; decide whether the public `ActiveTrx` facade keeps a
+    transitional runtime pin or resolves through the owning session entry per
+    operation; define lease drop behavior for active, checked-out, preparing,
+    committing, rolling-back, terminal, and failed states; define how shutdown
+    observes checked-out and terminal states; and decide whether terminal entries
+    are retained briefly for diagnostics or removed immediately after session
+    completion.
+  - After This Phase: Active transaction state is session-owned and visible
+    through stable entries. Mutable transaction work uses operation leases over
+    those entries. Public transaction handles may still use the existing facade
+    and drop contract, and abandoned rollback cleanup is still not automated.
+  - Non-goals: Do not replace the public transaction facade with a weak
+    `TransactionHandle`. Do not make transaction handle drop an abandonment
+    signal. Do not add a cleanup queue, cleanup worker, or automatic abandoned
+    rollback executor. Do not redesign MVCC, redo, group commit, rollback, or
+    logical lock semantics beyond routing ownership through stable entries and
+    applying the Phase 4 terminal-operation contract.
   - Task Doc: `docs/tasks/TBD.md`
   - Task Issue: `#0`
   - Phase Status: `pending`
   - Implementation Summary: `pending`
 
-- **Phase 5: Table Handle Catalog Ownership**
+- **Phase 6: Weak Transaction Handle And Abandoned Cleanup**
+  - Scope: Replace the public transaction facade's strong ownership with a
+    non-cloneable weak `TransactionHandle` over the Phase 5 session-owned stable
+    entry. Add abandoned transaction handoff and rollback-equivalent cleanup
+    ownership for transaction handle drop, abandoned sessions, and engine
+    shutdown.
+  - Goals: Make transaction handle drop an idempotent abandonment signal rather
+    than inline rollback; keep `commit().await` and `rollback().await` as the
+    only user-visible graceful terminal paths; make
+    session-dropped-before-transaction behavior explicit and tested; ensure
+    abandoned cleanup cannot override checked-out rollback, committing, or
+    committed transactions; and define cleanup error handling, diagnostics,
+    storage-poison interaction, and shutdown draining or busy behavior. [B3]
+    [U12] [U13] [U14]
+  - Prerequisites: Phase 5 has moved active transaction state into stable
+    session-owned entries with operation leases and observable lifecycle states.
+    A cleanup owner can acquire rollback-eligible abandoned entries without
+    holding registry guards across `.await`.
+  - Phase-local Choices: Decide transaction handle identity, including
+    generation versus transaction-id non-reuse; define abandoned,
+    cleanup-claimed, cleanup-running, rolled-back, committed, and failed-cleanup
+    states; decide whether abandoned rollback runs on a dedicated cleanup worker,
+    an existing transaction-system worker, or an engine/session-registry-owned
+    async executor; define cleanup failure diagnostics and storage-poison
+    interaction; and define shutdown behavior for active, checked-out,
+    abandoned, committing, cleanup-running, and rolling-back transactions.
+  - After This Phase: Public transaction handles are weak capabilities, active
+    transaction state remains session-owned, abandoned cleanup has a concrete
+    owner, cleanup errors are handled explicitly, and shutdown has concrete
+    behavior for active, checked-out, abandoned, committing, cleanup-running, and
+    rolling-back transactions.
+  - Non-goals: Do not redesign MVCC, redo, group commit, rollback, or logical
+    lock semantics except to execute rollback cleanup safely through the Phase 5
+    stable-entry model. Do not migrate public table APIs.
+  - Task Doc: `docs/tasks/TBD.md`
+  - Task Issue: `#0`
+  - Phase Status: `pending`
+  - Implementation Summary: `pending`
+
+- **Phase 7: Table Handle Catalog Ownership**
   - Scope: Replace public `Arc<Table>` exposure with a non-cloneable weak
     `TableHandle` or table-id/statement binding API. Strong user table runtimes
     stay in `Catalog`; table operations upgrade internally and pin `&Table` only
@@ -728,14 +827,14 @@ code is visible.
     - `docs/backlogs/000061-block-engine-shutdown-while-external-table-handles-are-alive.md`
     - `docs/backlogs/000066-engine-scoped-weak-runtime-handles.md`
 
-- **Phase 6: Public Strong Handle Removal And Documentation Sync**
+- **Phase 8: Public Strong Handle Removal And Documentation Sync**
   - Scope: Remove transitional public strong APIs and update docs/examples/tests
     to the final weak-handle model. Resolve source backlogs when acceptance is
     met.
   - Goals: Ensure `doradb-storage/src/lib.rs` no longer exports public strong
     runtime handles that can extend engine lifecycle; document final edge-case
     behavior and performance invariants in public rustdoc and design docs.
-  - Prerequisites: Phases 2 through 5 have either migrated their public handle
+  - Prerequisites: Phases 2 through 7 have either migrated their public handle
     type or documented an explicit deferral. All remaining public exports,
     examples, tests, and docs that mention strong runtime handles are known.
   - Phase-local Choices: Decide whether any deprecated compatibility aliases are
@@ -784,18 +883,18 @@ code is visible.
 
 ## Open Questions
 
-- In Phase 5, what is the least disruptive final public table API shape:
+- In Phase 7, what is the least disruptive final public table API shape:
   explicit `TableHandle`, table-id-based statement methods, statement-local
   binding, preserving existing borrowed-`&Table` statement methods behind an
   internal binding boundary, or a hybrid where each pays one operation-boundary
   lookup?
-- Should abandoned transaction cleanup run on a dedicated cleanup worker, an
-  existing transaction-system worker, or an async task owned by the engine
-  shutdown/session registry?
+- In Phase 6, should abandoned transaction cleanup run on a dedicated cleanup
+  worker, an existing transaction-system worker, or an async task owned by the
+  engine shutdown/session registry?
 - What exact engine shutdown policy should apply to active abandoned
   transactions: wait for rollback cleanup, return retryable busy, or provide a
   forced shutdown mode? This RFC requires the behavior to be explicit; the final
-  policy can be selected in the session/transaction phases.
+  policy can be selected in Phase 6.
 - What benchmark threshold should be used for "obvious" performance regression
   per phase? The RFC requires focused comparison and no new hot-path global
   synchronization; each phase should choose the concrete benchmark set and
@@ -806,9 +905,11 @@ code is visible.
 - Session-drain and forced-shutdown policy beyond what is required to make weak
   handles correct may remain a separate shutdown-lifecycle task if it grows past
   this RFC's API-lifecycle scope.
-- Detailed async transaction cancellation semantics are out of scope for
-  RFC-0019 and tracked by [B3]. RFC-0019 only requires that weak-handle
-  abandonment never overrides an irreversible transaction terminal path.
+- Detailed statement cancellation and broader async transaction cancellation
+  semantics remain tracked by [B3] unless the Phase 4 task explicitly resolves
+  them. RFC-0019 requires Phase 4 to define the minimum terminal-operation
+  ownership needed before Phase 5 moves transaction state into stable entries
+  and Phase 6 exposes weak transaction handles.
 - Generation-aware table-id reuse remains out of scope. If table ids become
   reusable in the future, weak handle identity must include generation and the
   table-id reuse RFC must update this contract.
@@ -823,3 +924,4 @@ code is visible.
 - `docs/backlogs/000061-block-engine-shutdown-while-external-table-handles-are-alive.md`
 - `docs/backlogs/000066-engine-scoped-weak-runtime-handles.md`
 - `docs/backlogs/000113-transaction-cancellation-safety.md`
+- `docs/backlogs/000116-general-session-runtime-pin-ownership.md`

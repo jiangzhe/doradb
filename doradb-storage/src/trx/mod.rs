@@ -599,8 +599,17 @@ impl OwnerLockState {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ActiveTrxState {
+    // `Active` covers the Phase 4 logical Active state. StatementRunning is a
+    // borrowed sub-state represented by ActiveTrx::exec constructing a
+    // Statement facade from `&mut ActiveTrx`; it is not a terminal owner.
     Active,
+    // Explicit rollback has already completed session cleanup. This consumed
+    // rollback path represents the logical RolledBack terminal state until the
+    // ActiveTrx value is dropped.
     RollbackFinished,
+    // Fatal rollback/access cleanup discarded the transaction. Later public
+    // commit/rollback attempts return ActiveTransactionDiscarded instead of
+    // reusing partially cleared state.
     Discarded,
 }
 
@@ -1086,7 +1095,11 @@ impl PreparedTrxPayload {
     }
 }
 
-/// PrecommitTrx has been assigned commit timestamp and already prepared redo log binary.
+/// Transaction in the logical PreparingCommit state.
+///
+/// `PreparedTrx` owns all transaction effects, locks, and session completion
+/// state before the irreversible group-commit handoff. Dropping it is only
+/// valid after a caller has consumed or explicitly cleared those fields.
 struct PreparedTrx {
     redo_bin: Option<TrxLog>,
     payload: Option<PreparedTrxPayload>,
@@ -1210,11 +1223,16 @@ struct PrecommitTrxPayload {
     gc_row_pages: Vec<PageID>,
 }
 
-/// PrecommitTrx has been assigned commit timestamp and already prepared redo log binary.
-/// There are two kinds of PrecommitTrx.
-/// One is user transaction which will contains payload such as undo logs and index GC records
-/// and session info.
-/// The other is system transaction which will be directly dropped and has no other info.
+/// Transaction in the logical Committing state.
+///
+/// Once a `PrecommitTrx` is queued in a commit group, the redo worker owns the
+/// terminal outcome. User waiters may observe success or failure, but they no
+/// longer own session commit/rollback cleanup and cannot convert this state
+/// back into an explicit rollback.
+///
+/// There are two kinds of PrecommitTrx. One is a user transaction containing
+/// undo, index GC, lock, and session info. The other is a sessionless system
+/// transaction, which is directly dropped after ordered completion.
 struct PrecommitTrx {
     cts: TrxID,
     redo_bin: Option<TrxLog>,
@@ -1236,11 +1254,6 @@ impl PrecommitTrx {
     #[inline]
     fn take_log(&mut self) -> Option<TrxLog> {
         self.redo_bin.take()
-    }
-
-    #[inline]
-    fn take_session(&mut self) -> Option<TrxSessionRef> {
-        self.session.take()
     }
 
     /// Commit this transaction.

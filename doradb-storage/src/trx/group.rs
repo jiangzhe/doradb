@@ -2,7 +2,6 @@ use crate::file::SparseFile;
 use crate::id::TrxID;
 use crate::io::Completion;
 use crate::serde::Ser;
-use crate::session::TrxSessionRef;
 use crate::trx::PrecommitTrx;
 use crate::trx::log::{LogWriteSubmission, SyncGroup};
 use crate::trx::log_replay::LogBuf;
@@ -71,7 +70,7 @@ pub(super) enum Commit {
 }
 
 pub(super) type CommitWaiter = Arc<Completion<()>>;
-pub(super) type CommitJoin = (Option<TrxSessionRef>, Option<CommitWaiter>);
+pub(super) type CommitJoin = Option<CommitWaiter>;
 
 /// CommitGroup groups multiple transactions with only
 /// one logical log IO and at most one fsync() call.
@@ -123,13 +122,11 @@ impl CommitGroup {
                 .ser(&redo_bin);
         }
         self.max_cts = trx.cts;
-        // Match LogPartition::create_new_group(): synchronous user commits hand
-        // session ownership back to the caller, while the no-wait path is only
-        // intended for sessionless system transactions.
-        let session = trx.take_session();
+        // Session completion ownership stays with the queued PrecommitTrx. The
+        // waiter only observes ordered completion, so dropping the user commit
+        // future after joining this group cannot strand the owning session.
         self.trx_list.push(trx);
-        let waiter = wait_sync.then(|| Arc::clone(&self.completion));
-        (session, waiter)
+        wait_sync.then(|| Arc::clone(&self.completion))
     }
 
     #[inline]
@@ -275,8 +272,7 @@ mod tests {
         log_buf.ser(&redo_bin(TrxID::new(1)));
         let mut group = log_group(TrxID::new(1), log_buf);
 
-        let (session, listener) = group.join(precommit(TrxID::new(2)), false);
-        assert!(session.is_none());
+        let listener = group.join(precommit(TrxID::new(2)), false);
         assert!(listener.is_none());
         assert_eq!(group.trx_list.len(), 2);
         assert_eq!(group.max_cts, TrxID::new(2));
@@ -310,8 +306,7 @@ mod tests {
         assert!(!no_log_group.can_join(&durability_candidate));
         clear_redo(&mut durability_candidate);
 
-        let (session, listener) = no_log_group.join(precommit_no_log(TrxID::new(2)), true);
-        assert!(session.is_none());
+        let listener = no_log_group.join(precommit_no_log(TrxID::new(2)), true);
         assert!(listener.is_some());
         assert_eq!(no_log_group.trx_list.len(), 2);
         assert_eq!(no_log_group.max_cts, TrxID::new(2));

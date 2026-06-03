@@ -15,7 +15,7 @@ use crate::conf::{EngineConfig, EvictableBufferPoolConfig, FileSystemConfig, Trx
 use crate::engine::Engine;
 use crate::error::{
     CompletionErrorKind, ConfigError, DataIntegrityError, Error, ErrorKind, FatalError,
-    InternalError, OperationError, ResourceError, Result,
+    InternalError, LifecycleError, OperationError, ResourceError, Result,
 };
 use crate::file::block_integrity::{BLOCK_INTEGRITY_HEADER_SIZE, write_block_checksum};
 use crate::file::cow_file::{COW_FILE_PAGE_SIZE, SUPER_BLOCK_ID, tests::old_root_drop_count};
@@ -55,21 +55,44 @@ use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::rc::Rc;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, mpsc};
+use std::thread::LocalKey;
 use std::time::Duration;
 use tempfile::TempDir;
 
-type CheckpointHook = Box<dyn FnOnce() -> Pin<Box<dyn Future<Output = ()> + 'static>> + 'static>;
+type TableHook = Box<dyn FnOnce() -> Pin<Box<dyn Future<Output = ()> + 'static>> + 'static>;
 
 thread_local! {
+    static TEST_FREEZE_AFTER_PIN_HOOK: RefCell<Option<TableHook>> =
+        const { RefCell::new(None) };
     static TEST_FORCE_LWC_BUILD_ERROR: Cell<bool> = const { Cell::new(false) };
     static TEST_FORCE_SECONDARY_SIDECAR_ERROR: Cell<bool> = const { Cell::new(false) };
     static TEST_FORCE_POST_PUBLISH_CHECKPOINT_ERROR: Cell<bool> = const { Cell::new(false) };
-    static TEST_CHECKPOINT_AFTER_READINESS_HOOK: RefCell<Option<CheckpointHook>> =
+    static TEST_CHECKPOINT_AFTER_READINESS_HOOK: RefCell<Option<TableHook>> =
         const { RefCell::new(None) };
-    static TEST_CHECKPOINT_AFTER_TRX_START_HOOK: RefCell<Option<CheckpointHook>> =
+    static TEST_CHECKPOINT_AFTER_TRX_START_HOOK: RefCell<Option<TableHook>> =
         const { RefCell::new(None) };
+    static TEST_SECONDARY_CLEANUP_BEFORE_SCAN_HOOK: RefCell<Option<TableHook>> =
+        const { RefCell::new(None) };
+}
+
+struct ResetTableHook(&'static LocalKey<RefCell<Option<TableHook>>>);
+
+impl ResetTableHook {
+    #[inline]
+    fn new(slot: &'static LocalKey<RefCell<Option<TableHook>>>) -> Self {
+        Self(slot)
+    }
+}
+
+impl Drop for ResetTableHook {
+    #[inline]
+    fn drop(&mut self) {
+        self.0.with(|slot| {
+            slot.borrow_mut().take();
+        });
+    }
 }
 
 const LIGHTWEIGHT_TEST_BUFFER_BYTES: usize = 16 * 1024 * 1024;
@@ -107,6 +130,19 @@ pub(super) fn test_force_post_publish_checkpoint_error_enabled() -> bool {
     TEST_FORCE_POST_PUBLISH_CHECKPOINT_ERROR.with(|flag| flag.get())
 }
 
+fn set_test_freeze_after_pin_hook<F, Fut>(hook: F)
+where
+    F: FnOnce() -> Fut + 'static,
+    Fut: Future<Output = ()> + 'static,
+{
+    TEST_FREEZE_AFTER_PIN_HOOK.with(|slot| {
+        let old = slot
+            .borrow_mut()
+            .replace(Box::new(move || Box::pin(hook())));
+        assert!(old.is_none(), "freeze after-pin hook already installed");
+    });
+}
+
 fn set_test_checkpoint_after_readiness_hook<F, Fut>(hook: F)
 where
     F: FnOnce() -> Fut + 'static,
@@ -136,6 +172,29 @@ where
     });
 }
 
+fn set_test_secondary_cleanup_before_scan_hook<F, Fut>(hook: F)
+where
+    F: FnOnce() -> Fut + 'static,
+    Fut: Future<Output = ()> + 'static,
+{
+    TEST_SECONDARY_CLEANUP_BEFORE_SCAN_HOOK.with(|slot| {
+        let old = slot
+            .borrow_mut()
+            .replace(Box::new(move || Box::pin(hook())));
+        assert!(
+            old.is_none(),
+            "secondary cleanup before-scan hook already installed"
+        );
+    });
+}
+
+pub(super) async fn run_test_freeze_after_pin_hook() {
+    let hook = TEST_FREEZE_AFTER_PIN_HOOK.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook().await;
+    }
+}
+
 pub(super) async fn run_test_checkpoint_after_readiness_hook() {
     let hook = TEST_CHECKPOINT_AFTER_READINESS_HOOK.with(|slot| slot.borrow_mut().take());
     if let Some(hook) = hook {
@@ -145,6 +204,13 @@ pub(super) async fn run_test_checkpoint_after_readiness_hook() {
 
 pub(super) async fn run_test_checkpoint_after_trx_start_hook() {
     let hook = TEST_CHECKPOINT_AFTER_TRX_START_HOOK.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook().await;
+    }
+}
+
+pub(super) async fn run_test_secondary_cleanup_before_scan_hook() {
+    let hook = TEST_SECONDARY_CLEANUP_BEFORE_SCAN_HOOK.with(|slot| slot.borrow_mut().take());
     if let Some(hook) = hook {
         hook().await;
     }
@@ -5962,6 +6028,108 @@ fn test_table_freeze() {
 }
 
 #[test]
+fn test_freeze_holds_session_pin_until_scan_finishes() {
+    smol::block_on(async {
+        let (_temp_dir, engine, table) = new_lightweight_arc_table("freeze_pin").await;
+        let mut session = engine.new_session().unwrap();
+        for i in 0..4 {
+            insert_one_row(&table, &mut session, vec![Val::from(i), Val::from("pin")]).await;
+        }
+
+        let result_rx = Rc::new(RefCell::new(None));
+        let hook_result_rx = Rc::clone(&result_rx);
+        let hook_engine = Arc::clone(&engine);
+        set_test_freeze_after_pin_hook(move || async move {
+            let probe = spawn_shutdown_probe(hook_engine);
+            assert_shutdown_probe_waiting(probe.started_rx, &probe.done);
+            *hook_result_rx.borrow_mut() = Some(probe.result_rx);
+        });
+        let _reset = ResetTableHook::new(&TEST_FREEZE_AFTER_PIN_HOOK);
+
+        table.freeze(&session, usize::MAX).await.unwrap();
+        let rx = result_rx
+            .borrow_mut()
+            .take()
+            .expect("freeze hook should start shutdown probe");
+        assert_shutdown_probe_finished(rx);
+    });
+}
+
+#[test]
+fn test_checkpoint_holds_session_pin_until_publish_finishes() {
+    smol::block_on(async {
+        let (_temp_dir, engine, table) = new_lightweight_arc_table("checkpoint_pin").await;
+        let mut session = engine.new_session().unwrap();
+        for i in 0..8 {
+            insert_one_row(
+                &table,
+                &mut session,
+                vec![Val::from(i), Val::from("checkpoint-pin")],
+            )
+            .await;
+        }
+        table.freeze(&session, usize::MAX).await.unwrap();
+        wait_checkpoint_ready(&table, &session).await;
+
+        let result_rx = Rc::new(RefCell::new(None));
+        let hook_result_rx = Rc::clone(&result_rx);
+        let hook_engine = Arc::clone(&engine);
+        set_test_checkpoint_after_trx_start_hook(move || async move {
+            let probe = spawn_shutdown_probe(hook_engine);
+            assert_shutdown_probe_waiting(probe.started_rx, &probe.done);
+            *hook_result_rx.borrow_mut() = Some(probe.result_rx);
+        });
+        let _reset = ResetTableHook::new(&TEST_CHECKPOINT_AFTER_TRX_START_HOOK);
+
+        let outcome = table.checkpoint(&mut session).await.unwrap();
+        assert!(matches!(outcome, CheckpointOutcome::Published { .. }));
+        let rx = result_rx
+            .borrow_mut()
+            .take()
+            .expect("checkpoint hook should start shutdown probe");
+        assert_shutdown_probe_finished(rx);
+    });
+}
+
+#[test]
+fn test_secondary_cleanup_holds_session_pin_until_scan_finishes() {
+    smol::block_on(async {
+        let (_temp_dir, engine, table) =
+            new_lightweight_arc_table_with_non_unique_name_index("secondary_cleanup_pin").await;
+        let mut session = engine.new_session().unwrap();
+        for i in 0..4 {
+            insert_one_row(
+                &table,
+                &mut session,
+                vec![Val::from(i), Val::from("cleanup-pin")],
+            )
+            .await;
+        }
+
+        let result_rx = Rc::new(RefCell::new(None));
+        let hook_result_rx = Rc::clone(&result_rx);
+        let hook_engine = Arc::clone(&engine);
+        set_test_secondary_cleanup_before_scan_hook(move || async move {
+            let probe = spawn_shutdown_probe(hook_engine);
+            assert_shutdown_probe_waiting(probe.started_rx, &probe.done);
+            *hook_result_rx.borrow_mut() = Some(probe.result_rx);
+        });
+        let _reset = ResetTableHook::new(&TEST_SECONDARY_CLEANUP_BEFORE_SCAN_HOOK);
+
+        let stats = table
+            .cleanup_secondary_mem_indexes(&mut session, true)
+            .await
+            .unwrap();
+        assert!(!stats.indexes.is_empty());
+        let rx = result_rx
+            .borrow_mut()
+            .take()
+            .expect("secondary cleanup hook should start shutdown probe");
+        assert_shutdown_probe_finished(rx);
+    });
+}
+
+#[test]
 fn test_transition_captures_uncommitted_lock_into_deletion_buffer() {
     smol::block_on(async {
         let sys = TestSys::new_evictable().await;
@@ -8384,6 +8552,50 @@ fn lightweight_test_engine_config(
         )
 }
 
+async fn new_lightweight_arc_table(log_file_stem: &str) -> (TempDir, Arc<Engine>, Arc<Table>) {
+    use crate::catalog::tests::table2;
+
+    let temp_dir = TempDir::new().unwrap();
+    let engine = Arc::new(
+        lightweight_test_engine_config(temp_dir.path().to_path_buf(), log_file_stem)
+            .build()
+            .await
+            .unwrap(),
+    );
+    let table_id = table2(engine.as_ref()).await;
+    let table = engine.catalog().get_table(table_id).await.unwrap();
+    (temp_dir, engine, table)
+}
+
+async fn new_lightweight_arc_table_with_non_unique_name_index(
+    log_file_stem: &str,
+) -> (TempDir, Arc<Engine>, Arc<Table>) {
+    let temp_dir = TempDir::new().unwrap();
+    let engine = Arc::new(
+        lightweight_test_engine_config(temp_dir.path().to_path_buf(), log_file_stem)
+            .build()
+            .await
+            .unwrap(),
+    );
+    let mut ddl_session = engine.new_session().unwrap();
+    let table_id = ddl_session
+        .create_table(
+            TableSpec::new(vec![
+                ColumnSpec::new("id", ValKind::I32, ColumnAttributes::empty()),
+                ColumnSpec::new("name", ValKind::VarByte, ColumnAttributes::empty()),
+            ]),
+            vec![
+                IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::PK),
+                IndexSpec::new(vec![IndexKey::new(1)], IndexAttributes::empty()),
+            ],
+        )
+        .await
+        .unwrap();
+    drop(ddl_session);
+    let table = engine.catalog().get_table(table_id).await.unwrap();
+    (temp_dir, engine, table)
+}
+
 impl TestSys {
     #[inline]
     async fn new_trx_insert(&self, session: &mut Session, insert: Vec<Val>) {
@@ -8966,6 +9178,49 @@ async fn wait_path_exists(path: &str, expected: bool) {
         smol::Timer::after(Duration::from_millis(50)).await;
     }
     panic!("path existence did not become {expected}: {path}");
+}
+
+struct ShutdownProbe {
+    started_rx: mpsc::Receiver<()>,
+    done: Arc<AtomicBool>,
+    result_rx: mpsc::Receiver<std::result::Result<(), Option<LifecycleError>>>,
+}
+
+fn spawn_shutdown_probe(engine: Arc<Engine>) -> ShutdownProbe {
+    let (started_tx, started_rx) = mpsc::channel();
+    let (result_tx, result_rx) = mpsc::channel();
+    let done = Arc::new(AtomicBool::new(false));
+    let thread_done = Arc::clone(&done);
+    std::thread::spawn(move || {
+        let _ = started_tx.send(());
+        let result = engine.shutdown().map_err(|err| err.lifecycle_error());
+        thread_done.store(true, Ordering::SeqCst);
+        let _ = result_tx.send(result);
+    });
+    ShutdownProbe {
+        started_rx,
+        done,
+        result_rx,
+    }
+}
+
+fn assert_shutdown_probe_waiting(started_rx: mpsc::Receiver<()>, done: &AtomicBool) {
+    started_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("shutdown probe thread should start before waiting assertion");
+    assert!(
+        !done.load(Ordering::SeqCst),
+        "shutdown completed while the operation runtime pin was still held"
+    );
+}
+
+fn assert_shutdown_probe_finished(
+    result_rx: mpsc::Receiver<std::result::Result<(), Option<LifecycleError>>>,
+) {
+    let result = result_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("shutdown should complete after the operation pin is released");
+    assert_eq!(result, Ok(()));
 }
 
 async fn assert_path_remains_after_dropped_table_purge(

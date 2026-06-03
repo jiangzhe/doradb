@@ -245,6 +245,12 @@ runtime execution.
      manufacturing empty redo records.
    - Transactions with no effects are discarded through the readonly/no-op path
      and do not receive a CTS.
+   - Once a user transaction is prepared, assigned a CTS, and enqueued into a
+     commit group, it is in the irreversible committing state. The queued
+     precommit transaction, not the user's still-polled future, owns session
+     commit/rollback completion after this handoff; dropping the user commit
+     future may stop observing the result but must not roll the transaction back
+     or leave the session permanently active.
 3. **State Update**
    - Instead of updating a global transaction table or traversing the MemIndex, the transaction simply backfills the **Commit Timestamp (CTS)** into its Undo Log records.
    - For the **ColumnDeletionBuffer**, the CTS is attached to the delete/update markers.
