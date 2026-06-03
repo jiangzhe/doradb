@@ -11,7 +11,6 @@ use crate::io::{
     IOStateMachine, IOSubmission, IOWorkerBuilder, Operation, StdIoResult, StorageBackend,
 };
 use crate::serde::Ser;
-use crate::session::TrxSessionRef;
 use crate::trx::MIN_SNAPSHOT_TS;
 use crate::trx::group::{
     Commit, CommitGroup, CommitGroupLog, CommitJoin, CommitWaiter, GroupCommit, MutexGroupCommit,
@@ -37,7 +36,7 @@ use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 pub(crate) const LOG_HEADER_PAGES: usize = 2;
-type EnqueuedCommit = (TrxID, Option<TrxSessionRef>, Option<CommitWaiter>);
+type EnqueuedCommit = (TrxID, Option<CommitWaiter>);
 
 pub(crate) struct LogPartitionInitializer {
     pub(crate) ctx: StorageBackend,
@@ -407,15 +406,11 @@ impl LogPartition {
         } else {
             None
         };
-        // Session ownership is detached here for the normal user-transaction path.
-        // The caller keeps the returned session handle and is responsible for
-        // calling SessionState::commit()/rollback() after the durability wait.
-        //
-        // The no-wait path is intentionally reserved for sessionless system
-        // transactions submitted via TransactionSystem::commit_sys(). Those
-        // transactions piggyback on the redo scheduler and are not expected to
-        // support later rollback through a session-bound transaction handle.
-        let session = trx.take_session();
+        // This is the commit handoff boundary for user transactions. Once the
+        // precommit transaction is queued, the redo worker owns session
+        // commit/rollback completion through PrecommitTrx::commit/abort. The
+        // user future may wait for the result, but dropping it must not make
+        // rollback a competing terminal outcome or leave the session active.
         let completion = Arc::new(Completion::new());
         let waiter = wait_sync.then(|| Arc::clone(&completion));
         let new_group = CommitGroup {
@@ -425,7 +420,7 @@ impl LogPartition {
             completion,
         };
         group_commit_g.queue.push_back(Commit::Group(new_group));
-        (session, waiter)
+        waiter
     }
 
     #[inline]
@@ -440,14 +435,16 @@ impl LogPartition {
         debug_assert!(cts < MAX_COMMIT_TS);
         let precommit_trx = trx.fill_cts(cts);
         if group_commit_g.queue.is_empty() {
-            let (session, waiter) =
-                self.create_new_group(precommit_trx, &mut group_commit_g, wait_sync);
+            let waiter = self.create_new_group(precommit_trx, &mut group_commit_g, wait_sync);
             self.group_commit.notify_one(); // notify sync thread to work.
             drop(group_commit_g);
-            return Ok((cts, session, waiter));
+            return Ok((cts, waiter));
         }
         let last_group = match group_commit_g.queue.back_mut().unwrap() {
-            Commit::Shutdown => return Err(Report::new(LifecycleError::Shutdown).into()),
+            Commit::Shutdown => {
+                precommit_trx.abort();
+                return Err(Report::new(LifecycleError::Shutdown).into());
+            }
             Commit::Group(group) => group,
             Commit::Switch(_) => {
                 // Impossible, switch always has one group followed.
@@ -455,19 +452,19 @@ impl LogPartition {
             }
         };
         if last_group.can_join(&precommit_trx) {
-            let (session, waiter) = last_group.join(precommit_trx, wait_sync);
+            let waiter = last_group.join(precommit_trx, wait_sync);
             drop(group_commit_g); // unlock to let other transactions to enter commit phase.
-            return Ok((cts, session, waiter));
+            return Ok((cts, waiter));
         }
-        let (session, waiter) =
-            self.create_new_group(precommit_trx, &mut group_commit_g, wait_sync);
+        let waiter = self.create_new_group(precommit_trx, &mut group_commit_g, wait_sync);
         self.group_commit.notify_one(); // notify sync thread to work.
         drop(group_commit_g);
-        Ok((cts, session, waiter))
+        Ok((cts, waiter))
     }
 
     #[inline]
     pub(super) fn commit_no_wait(&self, trx: PreparedTrx, global_ts: &AtomicU64) -> Result<TrxID> {
+        debug_assert!(trx.session.is_none());
         // This API is for sessionless system transactions only.
         //
         // System transactions are used to durably piggyback internal state
@@ -479,8 +476,7 @@ impl LogPartition {
         // Do not route a session-bound user transaction here. The user path must
         // wait for durability so the caller can commit/rollback the session
         // explicitly.
-        let (cts, session, listener) = self.enqueue_commit(trx, global_ts, false)?;
-        debug_assert!(session.is_none());
+        let (cts, listener) = self.enqueue_commit(trx, global_ts, false)?;
         debug_assert!(listener.is_none());
         Ok(cts)
     }
@@ -492,31 +488,21 @@ impl LogPartition {
         global_ts: &AtomicU64,
         wait_sync: bool,
     ) -> Result<TrxID> {
-        let (cts, mut session, waiter) = self.enqueue_commit(trx, global_ts, wait_sync)?;
+        let (cts, waiter) = self.enqueue_commit(trx, global_ts, wait_sync)?;
         if !wait_sync {
             // Non-waiting commit is the same contract as commit_no_wait(): it is
             // only for sessionless/system callers. Sessionful user transactions
-            // must use wait_sync = true so the caller can finish session state
-            // after durability succeeds or fails.
-            debug_assert!(session.is_none());
+            // must use wait_sync = true so the caller can observe completion.
             return Ok(cts);
         }
         let waiter = waiter.expect("waiter should exist when wait_sync");
-        if let Err(err) = waiter.wait_result().await.map_err(|report| {
+        waiter.wait_result().await.map_err(|report| {
             Error::from_completion_report(
                 report,
                 format!("wait for redo group commit: commit_ts={cts}"),
             )
-        }) {
-            if let Some(s) = session.take() {
-                s.rollback();
-            }
-            return Err(err);
-        }
+        })?;
         assert!(TrxID::new(self.persisted_cts.load(Ordering::Relaxed)) >= cts);
-        if let Some(s) = session.as_mut() {
-            s.commit(cts);
-        }
         Ok(cts)
     }
 
@@ -1162,10 +1148,13 @@ mod tests {
     };
     use crate::trx::log_replay::{LogMerger, ReadLog};
     use crate::value::Val;
+    use futures::task::noop_waker;
     use std::fs::{self, File};
+    use std::future::Future;
     use std::os::fd::AsRawFd;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
+    use std::task::{Context, Poll};
     use std::thread::JoinHandle;
     use std::time::Duration;
     use tempfile::TempDir;
@@ -1216,7 +1205,7 @@ mod tests {
 
     struct ControlledRedoWriteHookInner {
         fd: std::os::fd::RawFd,
-        errno: i32,
+        errno: Option<i32>,
         calls: AtomicUsize,
         started: event_listener::Event,
         released: AtomicBool,
@@ -1225,6 +1214,14 @@ mod tests {
 
     impl ControlledRedoWriteHook {
         fn new(fd: std::os::fd::RawFd, errno: i32) -> Self {
+            Self::with_error(fd, Some(errno))
+        }
+
+        fn success(fd: std::os::fd::RawFd) -> Self {
+            Self::with_error(fd, None)
+        }
+
+        fn with_error(fd: std::os::fd::RawFd, errno: Option<i32>) -> Self {
             Self {
                 inner: Arc::new(ControlledRedoWriteHookInner {
                     fd,
@@ -1282,7 +1279,9 @@ mod tests {
                 }
                 smol::block_on(listener);
             }
-            *res = Err(std::io::Error::from_raw_os_error(self.inner.errno));
+            if let Some(errno) = self.inner.errno {
+                *res = Err(std::io::Error::from_raw_os_error(errno));
+            }
         }
     }
 
@@ -1419,6 +1418,57 @@ mod tests {
             .await
             .unwrap();
         (temp_dir, engine)
+    }
+
+    #[test]
+    fn test_dropped_user_commit_future_after_handoff_finishes_session() {
+        smol::block_on(async {
+            let (_temp_dir, engine) =
+                build_redo_test_engine("commit_handoff_drop", LogSync::None).await;
+            let table_id = table2(&engine).await;
+            let table = engine.catalog().get_table(table_id).await.unwrap();
+            let redo_fd = {
+                engine.trx_sys.log_partitions[0]
+                    .group_commit
+                    .lock()
+                    .log_file
+                    .as_ref()
+                    .unwrap()
+                    .as_raw_fd()
+            };
+            let hook = ControlledRedoWriteHook::success(redo_fd);
+            let _install = install_storage_backend_test_hook(Arc::new(hook.clone()));
+
+            let mut session = engine.new_session().unwrap();
+            let mut trx = session.begin_trx().unwrap();
+            trx.exec(async |stmt| {
+                stmt.table_insert_mvcc(&table, vec![Val::from(1), Val::from("handoff")])
+                    .await?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+            assert!(session.in_trx().unwrap());
+
+            let mut commit_fut = Box::pin(trx.commit());
+            let waker = noop_waker();
+            let mut cx = Context::from_waker(&waker);
+            match commit_fut.as_mut().poll(&mut cx) {
+                Poll::Pending => {}
+                Poll::Ready(res) => panic!("commit should wait after handoff, got {res:?}"),
+            }
+
+            hook.wait_started(1).await;
+            assert!(session.in_trx().unwrap());
+            drop(commit_fut);
+
+            hook.release();
+            wait_for(|| session.in_trx().is_ok_and(|active| !active)).await;
+
+            drop(session);
+            drop(table);
+            engine.shutdown().unwrap();
+        });
     }
 
     fn sync_group_for_order_test(cts: TrxID, finished: bool, log_bytes: usize) -> SyncGroup {

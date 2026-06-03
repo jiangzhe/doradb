@@ -911,8 +911,11 @@ impl Table {
 
 impl TablePersistence for Table {
     async fn freeze(&self, session: &Session, max_rows: usize) -> Result<usize> {
-        let guards = session.pin("freeze table")?.pool_guards();
+        let pin = session.pin("freeze table")?;
+        let guards = pin.pool_guards();
         let mut rows = 0usize;
+        #[cfg(test)]
+        super::tests::run_test_freeze_after_pin_hook().await;
         self.mem_scan(&guards, |page_guard| {
             let (ctx, page) = page_guard.ctx_and_page();
             let vmap = ctx.row_ver().unwrap();
@@ -944,7 +947,6 @@ impl TablePersistence for Table {
         let trx_sys = pin.engine.trx_sys.clone();
         let table_writes = pin.engine.table_fs.background_writes().clone();
         let pool_guards = pin.pool_guards();
-        drop(pin);
         if let CheckpointReadiness::Delayed { reason } =
             self.try_checkpoint_readiness_for_session(session)?
         {
