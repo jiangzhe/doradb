@@ -707,10 +707,10 @@ code is visible.
     handoff. Do not redesign MVCC, redo, group commit, rollback, or logical lock
     semantics beyond the terminal-operation ownership and runtime-pin contracts
     needed by the next phase. [B3] [B4] [U12]
-  - Task Doc: `docs/tasks/TBD.md`
-  - Task Issue: `#0`
-  - Phase Status: `pending`
-  - Implementation Summary: `pending`
+  - Task Doc: `docs/tasks/000166-transaction-terminal-ownership-preparation.md`
+  - Task Issue: `#679`
+  - Phase Status: done
+  - Implementation Summary: Implemented RFC-0019 Phase 4 transaction terminal ownership preparation: commit handoff completion is owned by queued precommit/group commit state, runtime pins now survive freeze/checkpoint/secondary cleanup awaited sections, regression coverage and lifecycle documentation were added, and future transaction work was split into stable-entry and weak-handle cleanup phases. [Task Resolve Sync: docs/tasks/000166-transaction-terminal-ownership-preparation.md @ 2026-06-03]
 
 - **Phase 5: Transaction Stable Entry And Operation Lease**
   - Scope: Move strong active transaction state into session-owned stable

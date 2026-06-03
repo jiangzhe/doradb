@@ -1,7 +1,7 @@
 ---
 id: 000166
 title: Transaction Terminal Ownership Preparation
-status: proposal
+status: implemented
 created: 2026-06-02
 github_issue: 679
 ---
@@ -344,6 +344,73 @@ Reference:
 
 ## Implementation Notes
 
+Implemented RFC-0019 Phase 4 transaction terminal ownership preparation.
+
+- Mapped Phase 4 logical transaction states onto existing Rust ownership
+  boundaries instead of introducing a large state enum: `ActiveTrx` represents
+  active statement-capable ownership, `PreparedTrx` represents pre-handoff
+  commit preparation, and queued `PrecommitTrx` represents irreversible
+  committing ownership.
+- Moved post-handoff commit completion ownership into queued precommit/group
+  commit state. A dropped user commit future after enqueue can stop observing
+  the result, but it no longer owns session commit/rollback cleanup and cannot
+  convert the transaction back to rollback.
+- Preserved rollback as an explicit consumed-`ActiveTrx` terminal path and kept
+  abandonment/automatic rollback cleanup out of Phase 4.
+- Kept `SessionPin`/runtime liveness alive across the three production
+  long-running paths from backlog `000116`: table freeze scan, checkpoint
+  publication, and secondary mem-index cleanup scan.
+- Added regression coverage for dropped commit futures after commit handoff and
+  for shutdown waiting while freeze, checkpoint, and secondary cleanup hold
+  operation runtime pins. The shutdown-probe test helper now uses a deterministic
+  started signal and RAII hook reset guards so thread-local hooks do not leak on
+  panic.
+- Updated `docs/transaction-system.md` with the commit handoff contract and
+  updated RFC-0019 phase planning to split the future transaction work into
+  Phase 5 stable entries/operation leases and Phase 6 weak transaction handles
+  with abandoned cleanup.
+
+Validation completed:
+
+- `cargo fmt --check`
+- `git diff --check`
+- `cargo clippy -p doradb-storage --all-targets -- -D warnings`
+- `cargo nextest run -p doradb-storage` - 880 tests passed, 0 skipped.
+- `tools/coverage_focus.rs --path doradb-storage/src/trx --path doradb-storage/src/session.rs --path doradb-storage/src/engine.rs --path doradb-storage/src/table/persistence.rs --path doradb-storage/src/table/gc.rs`
+  - Deduplicated total: 11795/12571 lines, 93.83%.
+  - `doradb-storage/src/trx`: 9126/9677 lines, 94.31%.
+  - `doradb-storage/src/session.rs`: 440/461 lines, 95.44%.
+  - `doradb-storage/src/engine.rs`: 1115/1165 lines, 95.71%.
+  - `doradb-storage/src/table/persistence.rs`: 724/859 lines, 84.28%.
+  - `doradb-storage/src/table/gc.rs`: 390/409 lines, 95.35%.
+
+Post-implementation checklist outcome:
+
+- Reliability: pass. Required regression tests, full nextest, clippy, and
+  focused coverage passed above the 80% target.
+- Security: pass/not applicable. No unsafe code was added or modified.
+- Performance: pass. Commit handoff changes retain existing group-commit
+  batching, and runtime pin fixes extend existing operation pins without adding
+  hot-loop registry lookup or new global synchronization.
+- Feature completeness: pass. Phase 4 terminal ownership, shutdown behavior,
+  and the three concrete runtime-pin gaps are implemented while weak transaction
+  handles and abandoned cleanup remain out of scope.
+- Documentation: pass. Transaction lifecycle documentation and adjacent
+  ownership comments were updated where behavior would otherwise be ambiguous.
+- Test-only code: pass. New hooks and shutdown-probe helpers remain inside
+  table tests and exercise production freeze/checkpoint/cleanup paths.
+- Complexity: pass. New helper types are narrow, and no broad transaction-state
+  enum or public API migration was introduced.
+
+Backlog resolution:
+
+- `docs/backlogs/000113-transaction-cancellation-safety.md` remains open because
+  broader statement/rollback async cancellation safety is not fully resolved by
+  this Phase 4 preparation task.
+- `docs/backlogs/000116-general-session-runtime-pin-ownership.md` remains open
+  because this task fixed the three known production early-release paths but did
+  not prove every possible future session runtime pin pattern is exhausted.
+
 ## Impacts
 
 - `doradb-storage/src/trx/mod.rs`
@@ -433,3 +500,5 @@ Reference:
   cleanup-claimed, cleanup-running, rolled-back, and failed-cleanup.
 - Broader statement async cancellation safety remains related to backlog
   `000113` unless this task's implementation fully resolves it.
+- Broader session runtime pin ownership remains related to backlog `000116`;
+  this task fixed the concrete freeze, checkpoint, and secondary cleanup paths.
