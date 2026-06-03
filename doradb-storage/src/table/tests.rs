@@ -57,6 +57,7 @@ use std::pin::Pin;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, mpsc};
+use std::thread::LocalKey;
 use std::time::Duration;
 use tempfile::TempDir;
 
@@ -74,6 +75,24 @@ thread_local! {
         const { RefCell::new(None) };
     static TEST_SECONDARY_CLEANUP_BEFORE_SCAN_HOOK: RefCell<Option<TableHook>> =
         const { RefCell::new(None) };
+}
+
+struct ResetTableHook(&'static LocalKey<RefCell<Option<TableHook>>>);
+
+impl ResetTableHook {
+    #[inline]
+    fn new(slot: &'static LocalKey<RefCell<Option<TableHook>>>) -> Self {
+        Self(slot)
+    }
+}
+
+impl Drop for ResetTableHook {
+    #[inline]
+    fn drop(&mut self) {
+        self.0.with(|slot| {
+            slot.borrow_mut().take();
+        });
+    }
 }
 
 const LIGHTWEIGHT_TEST_BUFFER_BYTES: usize = 16 * 1024 * 1024;
@@ -6021,10 +6040,11 @@ fn test_freeze_holds_session_pin_until_scan_finishes() {
         let hook_result_rx = Rc::clone(&result_rx);
         let hook_engine = Arc::clone(&engine);
         set_test_freeze_after_pin_hook(move || async move {
-            let (done, rx) = spawn_shutdown_probe(hook_engine);
-            *hook_result_rx.borrow_mut() = Some(rx);
-            assert_shutdown_probe_waiting(&done).await;
+            let probe = spawn_shutdown_probe(hook_engine);
+            assert_shutdown_probe_waiting(probe.started_rx, &probe.done);
+            *hook_result_rx.borrow_mut() = Some(probe.result_rx);
         });
+        let _reset = ResetTableHook::new(&TEST_FREEZE_AFTER_PIN_HOOK);
 
         table.freeze(&session, usize::MAX).await.unwrap();
         let rx = result_rx
@@ -6055,10 +6075,11 @@ fn test_checkpoint_holds_session_pin_until_publish_finishes() {
         let hook_result_rx = Rc::clone(&result_rx);
         let hook_engine = Arc::clone(&engine);
         set_test_checkpoint_after_trx_start_hook(move || async move {
-            let (done, rx) = spawn_shutdown_probe(hook_engine);
-            *hook_result_rx.borrow_mut() = Some(rx);
-            assert_shutdown_probe_waiting(&done).await;
+            let probe = spawn_shutdown_probe(hook_engine);
+            assert_shutdown_probe_waiting(probe.started_rx, &probe.done);
+            *hook_result_rx.borrow_mut() = Some(probe.result_rx);
         });
+        let _reset = ResetTableHook::new(&TEST_CHECKPOINT_AFTER_TRX_START_HOOK);
 
         let outcome = table.checkpoint(&mut session).await.unwrap();
         assert!(matches!(outcome, CheckpointOutcome::Published { .. }));
@@ -6089,10 +6110,11 @@ fn test_secondary_cleanup_holds_session_pin_until_scan_finishes() {
         let hook_result_rx = Rc::clone(&result_rx);
         let hook_engine = Arc::clone(&engine);
         set_test_secondary_cleanup_before_scan_hook(move || async move {
-            let (done, rx) = spawn_shutdown_probe(hook_engine);
-            *hook_result_rx.borrow_mut() = Some(rx);
-            assert_shutdown_probe_waiting(&done).await;
+            let probe = spawn_shutdown_probe(hook_engine);
+            assert_shutdown_probe_waiting(probe.started_rx, &probe.done);
+            *hook_result_rx.borrow_mut() = Some(probe.result_rx);
         });
+        let _reset = ResetTableHook::new(&TEST_SECONDARY_CLEANUP_BEFORE_SCAN_HOOK);
 
         let stats = table
             .cleanup_secondary_mem_indexes(&mut session, true)
@@ -9158,25 +9180,34 @@ async fn wait_path_exists(path: &str, expected: bool) {
     panic!("path existence did not become {expected}: {path}");
 }
 
-fn spawn_shutdown_probe(
-    engine: Arc<Engine>,
-) -> (
-    Arc<AtomicBool>,
-    mpsc::Receiver<std::result::Result<(), Option<LifecycleError>>>,
-) {
+struct ShutdownProbe {
+    started_rx: mpsc::Receiver<()>,
+    done: Arc<AtomicBool>,
+    result_rx: mpsc::Receiver<std::result::Result<(), Option<LifecycleError>>>,
+}
+
+fn spawn_shutdown_probe(engine: Arc<Engine>) -> ShutdownProbe {
+    let (started_tx, started_rx) = mpsc::channel();
     let (result_tx, result_rx) = mpsc::channel();
     let done = Arc::new(AtomicBool::new(false));
     let thread_done = Arc::clone(&done);
     std::thread::spawn(move || {
+        let _ = started_tx.send(());
         let result = engine.shutdown().map_err(|err| err.lifecycle_error());
         thread_done.store(true, Ordering::SeqCst);
         let _ = result_tx.send(result);
     });
-    (done, result_rx)
+    ShutdownProbe {
+        started_rx,
+        done,
+        result_rx,
+    }
 }
 
-async fn assert_shutdown_probe_waiting(done: &AtomicBool) {
-    smol::Timer::after(Duration::from_millis(20)).await;
+fn assert_shutdown_probe_waiting(started_rx: mpsc::Receiver<()>, done: &AtomicBool) {
+    started_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("shutdown probe thread should start before waiting assertion");
     assert!(
         !done.load(Ordering::SeqCst),
         "shutdown completed while the operation runtime pin was still held"
