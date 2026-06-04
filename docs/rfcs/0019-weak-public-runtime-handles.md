@@ -750,8 +750,8 @@ code is visible.
     applying the Phase 4 terminal-operation contract.
   - Task Doc: `docs/tasks/000167-transaction-stable-entry-operation-lease.md`
   - Task Issue: `#681`
-  - Phase Status: `pending`
-  - Implementation Summary: `pending`
+  - Phase Status: done
+  - Implementation Summary: Implemented RFC-0019 Phase 5 transaction stable entries: Transaction is the canonical public facade, mutable state lives in session-owned TrxEntry/TrxInner, private TrxCheckout returns checked-out cores for non-terminal operations, Statement owns operation checkout, terminal commit and rollback consume Transaction directly, lock state moved to lock/state.rs, and regression coverage validates entry states, checkout cleanup, lock handling, and terminal ownership. [Task Resolve Sync: docs/tasks/000167-transaction-stable-entry-operation-lease.md @ 2026-06-04]
 
 - **Phase 6: Weak Transaction Handle And Abandoned Cleanup**
   - Scope: Replace the public transaction facade's strong ownership with a

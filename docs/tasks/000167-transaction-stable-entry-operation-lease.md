@@ -1,7 +1,7 @@
 ---
 id: 000167
 title: Transaction Stable Entry And Operation Lease
-status: proposal
+status: implemented
 created: 2026-06-03
 github_issue: 681
 ---
@@ -11,13 +11,15 @@ github_issue: 681
 ## Summary
 
 Implement RFC-0019 Phase 5 by moving active transaction mutable state into a
-session-owned stable transaction entry, adding an RAII operation execution handle for
+session-owned stable transaction entry, adding RAII checkout plumbing for
 checked-out mutable transaction work, and making transaction lifecycle state
 visible to session cleanup and engine shutdown.
 
 This task also renames the canonical public active transaction facade from
-`ActiveTrx` to `Transaction`. The checked-out mutable core must be named
-`TrxInner`, and the RAII checkout object must be named `TrxExec`.
+`ActiveTrx` to `Transaction`. The checked-out mutable core is named
+`TrxInner`. The implementation uses private `TrxCheckout` ownership plumbing
+for non-terminal operations, with `Statement` as the user-visible operation
+facade and commit/rollback consuming `Transaction` directly.
 
 Issue Labels:
 - type:task
@@ -43,12 +45,12 @@ graceful terminal operations, queued `PrecommitTrx` owns commit completion after
 the group-commit handoff, and cancellation or drop after that handoff must not
 convert commit into rollback or leave a session permanently active.
 
-The current storage crate still keeps active transaction mutable state directly
-inside the public `ActiveTrx` facade. `SessionState` records only that a session
-is active with a `trx_id`; it does not own the transaction core. The current
-`TrxSessionRef` keeps a strong runtime pin and weakly references `SessionState`
-so transaction terminal paths can reach engine runtime, release locks, and call
-session completion callbacks.
+Before this task, the storage crate kept active transaction mutable state
+directly inside the public `ActiveTrx` facade. `SessionState` recorded only
+that a session was active with a `trx_id`; it did not own the transaction core.
+The transitional `TrxSessionRef` kept a strong runtime pin and weakly
+referenced `SessionState` so transaction terminal paths could reach engine
+runtime, release locks, and call session completion callbacks.
 
 Phase 5 changes that ownership boundary:
 
@@ -77,9 +79,10 @@ Phase Contract:
   - Keep a transitional runtime pin reachable from the facade or entry until
     terminal completion, unless implementation proves an equivalent shutdown
     blocker that does not create a strong cycle.
-  - Use an RAII `TrxExec` to return checked-out mutable state on
-    ordinary drop and to publish terminal/in-progress state when commit,
-    rollback, or fatal cleanup consumes ownership.
+  - Use private RAII checkout plumbing to return checked-out mutable state on
+    ordinary drop. The final implementation names this `TrxCheckout`, folds
+    statement operation ownership into `Statement`, and lets commit/rollback
+    consume `Transaction` directly for terminal extraction.
   - Remove terminal entries immediately after session completion unless a narrow
     diagnostic need is found during implementation.
 - After this phase:
@@ -123,11 +126,14 @@ Phase Contract:
    - `RollingBack`;
    - `Terminal`;
    - `Failed`.
-5. Add an RAII `TrxExec` for checked-out mutable work.
-   - The lease must restore `TrxInner` to the stable entry on ordinary
+5. Add private RAII checkout plumbing for checked-out mutable work.
+   - The checkout must restore `TrxInner` to the stable entry on ordinary
      drop.
-   - Commit, rollback, and fatal cleanup paths must consume or explicitly clear
-     the lease so it does not restore a terminally owned inner.
+   - Statement execution may own that checkout through `Statement`.
+   - Commit and rollback should consume `Transaction` directly and extract
+     terminal `TrxInner` ownership instead of using a non-terminal checkout.
+   - Fatal cleanup paths must consume or explicitly clear the checkout so it
+     does not restore a terminally unusable inner.
    - No registry guard, session lifecycle guard, DashMap guard, or global guard
      may be held across user callbacks or `.await`.
 6. Preserve closure-based statement execution as `Transaction::exec(...)`.
@@ -233,8 +239,8 @@ Reference:
      entry and should not become a second lifecycle source of truth.
 
 4. Implement entry checkout and return.
-   - Add `TrxExec` as the only normal way to obtain
-     `&mut TrxInner` across async transaction operations.
+   - Add private `TrxCheckout` as the normal way to obtain
+     `&mut TrxInner` across non-terminal async transaction operations.
    - Checkout must:
      - validate session/transaction identity;
      - reject terminal, failed, committing, rolling-back, or already checked-out
@@ -244,13 +250,13 @@ Reference:
        await points.
    - Ordinary lease drop must restore the inner core and mark the entry
      `Active`.
-   - Explicit consume methods must allow commit, rollback, or fatal cleanup to
-     take ownership and publish the correct entry state without double-return.
+   - Terminal extraction methods must allow commit and rollback to take
+     ownership and publish the correct entry state without double-return.
 
 5. Route statement and lock operations through leases.
-   - Update `Transaction::exec(...)` to check out a `TrxExec`,
-     construct the `Statement` from leased `TrxInner`, and return the
-     inner to the entry after success or ordinary statement rollback.
+   - Update `Transaction::exec(...)` to check out a `TrxCheckout`, construct
+     the `Statement` around that checkout, and return the inner to the entry
+     after success or ordinary statement rollback.
    - Preserve the current statement behavior:
      - successful statement effects merge into transaction effects;
      - ordinary statement errors roll back statement-local effects and return
@@ -262,10 +268,9 @@ Reference:
      transaction lock/effect state to use leases.
 
 6. Route commit through terminal extraction.
-   - `Transaction::commit(self).await` must acquire or consume a lease, publish
+   - `Transaction::commit(self).await` must consume `Transaction`, publish
      `Committing` before or as part of terminal extraction, and pass the
-     extracted `TrxInner` through the existing prepare/group-commit
-     flow.
+     extracted `TrxInner` through the existing prepare/group-commit flow.
    - Preserve the readonly/no-op commit discard path and transaction-lock
      release behavior.
    - Preserve ordered no-log commit behavior.
@@ -275,8 +280,8 @@ Reference:
    - Ensure stale completion cannot mutate a replacement transaction entry.
 
 7. Route rollback through terminal extraction.
-   - `Transaction::rollback(self).await` must acquire or consume a lease,
-     publish `RollingBack`, and run the existing rollback logic on the extracted
+   - `Transaction::rollback(self).await` must consume `Transaction`, publish
+     `RollingBack`, and run the existing rollback logic on the extracted
      `TrxInner`.
    - Successful rollback must:
      - roll back index undo then row undo;
@@ -315,7 +320,8 @@ Reference:
     - Update `docs/transaction-system.md` to describe:
       - `Transaction` as the public facade;
       - session-owned stable transaction entries;
-      - `TrxInner` checked out through `TrxExec`;
+      - `TrxInner` checked out through `TrxCheckout`, with `Statement` owning
+        operation-scoped statement execution;
       - lifecycle-visible entry states;
       - unchanged commit handoff and rollback behavior.
     - Update RFC-0019 references if implementation changes the Phase 5 public
@@ -350,6 +356,86 @@ Reference:
 
 ## Implementation Notes
 
+Implemented RFC-0019 Phase 5 transaction stable entries and operation checkout.
+
+- `Transaction` is now the canonical public active transaction facade exported
+  from `doradb-storage/src/lib.rs`; no public `ActiveTrx` compatibility alias
+  remains.
+- Active mutable transaction state moved into `TrxInner`, including
+  `TrxContext`, `TrxEffects`, transaction-owned `OwnerLockState`, next
+  statement number, and active/discarded state.
+- `SessionState` owns a stable `TrxEntry` for the active transaction. The
+  entry carries identity, an `AtomicU8`-backed `TrxEntryState`, and checked-in
+  `Option<TrxInner>` storage protected by a mutex. Lock-order and memory-order
+  comments document that state is published with `Release` and inspected with
+  `Acquire`.
+- The originally planned `TrxExec` type was intentionally not landed. The final
+  shape uses private `TrxCheckout` as mechanical RAII ownership plumbing for
+  non-terminal operations. `Statement` owns the checkout for
+  `Transaction::exec(...)`, while `Transaction::commit(self)` and
+  `Transaction::rollback(self)` consume `Transaction` and extract terminal
+  `TrxInner` ownership directly.
+- `TrxEntry::inspect_state()` replaced the earlier `state()` wording to make
+  call sites treat state reads as lock-free snapshots, not TOCTOU guards.
+- `TrxInnerState` was removed in favor of `TrxInner { active: bool }`, and the
+  former `TrxEntryCore`/`TrxEntryInner` wrapper was unfolded into `TrxEntry`
+  with `state: AtomicU8` and `inner: Mutex<Option<TrxInner>>`.
+- `OwnerLockState` moved to `doradb-storage/src/lock/state.rs`, and
+  transaction/table-lock checkout paths were refactored into smaller helpers.
+- `TransactionSystem::commit_transaction` and `rollback_transaction` now take
+  owned `Transaction` values, so terminal paths no longer clone the stable
+  entry or session reference merely to work around `Drop`.
+- Session lifecycle operations now inspect the stable entry state for
+  in-transaction decisions, active-transaction diagnostics, idle close, and
+  abandoned-session terminal cleanup.
+- Updated transaction lifecycle documentation and RFC-0019 Phase 5 wording to
+  match the implemented `Transaction`/`TrxInner`/`TrxEntry`/`TrxCheckout` shape.
+
+Validation completed:
+
+- `cargo fmt --check`
+- `cargo check -p doradb-storage --all-targets`
+- `cargo nextest run -p doradb-storage` - 889 tests passed, 0 skipped.
+- `cargo clippy -p doradb-storage --all-targets -- -D warnings`
+- `tools/coverage_focus.rs --verbose --path doradb-storage/src/lock/state.rs --path doradb-storage/src/trx/mod.rs`
+  - Deduplicated total: 1925/1994 lines, 96.54%.
+  - `doradb-storage/src/lock/state.rs`: 259/261 lines, 99.23%.
+  - `doradb-storage/src/trx/mod.rs`: 1666/1733 lines, 96.13%.
+
+Post-implementation checklist outcome:
+
+- Reliability: pass. The full nextest pass and focused coverage pass above the
+  80% target. Regression tests cover stable entry state, checkout/drop return,
+  fatal discard, terminal commit/rollback, transaction lock release, explicit
+  table-lock cache/guard behavior, and session/shutdown visibility.
+- Security: pass/not applicable. No unsafe code was added or modified.
+- Performance: pass. The refactor removes unnecessary session/entry clones on
+  terminal paths, keeps registry/entry locks out of awaited user work, and uses
+  lock-free entry state inspection for session diagnostics.
+- Feature completeness: pass. Phase 5 stable entries, checked-out mutable core,
+  lifecycle-visible states, public `Transaction` naming, and consuming
+  terminal APIs are implemented. Weak public transaction handles and abandoned
+  cleanup remain out of scope for Phase 6.
+- Documentation: pass. The task doc, transaction lifecycle documentation, and
+  RFC phase summary were synchronized with the implemented naming and ownership
+  shape.
+- Test-only code: pass. New helper functions and coverage-oriented assertions
+  stay inside `#[cfg(test)]` modules and exercise production transaction and
+  lock-manager paths.
+- Complexity: pass. The high-complexity explicit table-lock acquisition path
+  was split into small private helpers while preserving metadata-before-data
+  acquisition, cache publication, and fresh-lock guard cleanup semantics.
+
+Backlog resolution:
+
+- `docs/backlogs/000113-transaction-cancellation-safety.md` remains open.
+  Phase 5 preserves checkout return and irreversible terminal handoff
+  invariants, but it does not fully define broad async cancellation semantics.
+- `docs/backlogs/000116-general-session-runtime-pin-ownership.md` remains open.
+  Phase 5 keeps transaction runtime reachability via `TrxSessionRef` and
+  operation checkout, but it does not complete a general session runtime pin
+  ownership redesign.
+
 ## Impacts
 
 - `doradb-storage/src/lib.rs`
@@ -368,7 +454,7 @@ Reference:
   - new `TrxInner`;
   - new `TrxEntry`;
   - new `TrxEntryState`;
-  - new `TrxExec`;
+  - new private `TrxCheckout`;
   - `TrxContext`;
   - `TrxEffects`;
   - `OwnerLockState`;
@@ -473,17 +559,16 @@ Reference:
 
 ## Open Questions
 
-1. Should a deprecated `ActiveTrx` compatibility alias remain for one release or
-   be removed immediately?
-   - Task acceptance makes `Transaction` canonical either way.
-   - If a compatibility alias remains, it must be documented as transitional and
-     not used by crate tests, examples, or new docs.
-2. Should terminal entries be retained briefly for diagnostics?
-   - Default answer for this task is no: remove or clear terminal entries after
-     session completion.
-   - Retain only if implementation finds a concrete diagnostic need that does
-     not complicate Phase 6 cleanup ownership.
-3. Should broader async cancellation semantics be planned before Phase 6?
+Resolved during implementation:
+
+1. No deprecated `ActiveTrx` compatibility alias remains. `Transaction` is the
+   canonical public transaction facade.
+2. Terminal entries are not retained for diagnostics beyond the current
+   completion/cleanup path.
+
+Remaining follow-ups:
+
+1. Should broader async cancellation semantics be planned before Phase 6?
    - This remains tracked by
      `docs/backlogs/000113-transaction-cancellation-safety.md`.
    - Phase 5 should preserve the minimum invariant that lease drop cannot

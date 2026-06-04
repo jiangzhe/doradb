@@ -147,8 +147,10 @@ exceptions outside this runtime transaction contract.
 Each user statement runs through `Transaction::exec(async |stmt| { ... })`.
 The public `Transaction` is a facade over a session-owned stable transaction
 entry. The mutable transaction core lives in `TrxInner` and is checked out
-for one operation through `TrxExec`; ordinary `TrxExec` drop returns the core to
-the entry, while commit, rollback, and fatal cleanup consume or clear it instead.
+for one non-terminal operation through private `TrxCheckout` plumbing; ordinary
+`TrxCheckout` drop returns the core to the entry. `Statement` owns this checkout
+for statement execution, while commit, rollback, and fatal cleanup consume or
+clear terminal ownership directly.
 The entry remains visible to session cleanup and shutdown while it is `Active`,
 `CheckedOut`, `Committing`, `RollingBack`, `Terminal`, or `Failed`, without
 keeping a strong engine backreference inside the session-owned entry.

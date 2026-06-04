@@ -927,6 +927,35 @@ impl Drop for TrxCheckout<'_> {
     }
 }
 
+#[derive(Clone, Copy)]
+struct TrxTableLockResources {
+    metadata: LockResource,
+    data: LockResource,
+}
+
+#[derive(Clone, Copy)]
+struct TrxTableLockCache {
+    metadata_cached: bool,
+    data_cached: bool,
+}
+
+struct TrxTableLockGuards<'lock> {
+    metadata: Option<FreshLockGuard<'lock>>,
+    data: Option<FreshLockGuard<'lock>>,
+}
+
+impl TrxTableLockGuards<'_> {
+    #[inline]
+    fn disarm_all(&mut self) {
+        if let Some(guard) = self.data.as_mut() {
+            guard.disarm();
+        }
+        if let Some(guard) = self.metadata.as_mut() {
+            guard.disarm();
+        }
+    }
+}
+
 /// Checked-out mutable transaction core.
 pub(crate) struct TrxInner {
     ctx: TrxContext,
@@ -1026,6 +1055,76 @@ impl TrxInner {
     }
 
     #[inline]
+    fn table_lock_resources(table_id: TableID) -> TrxTableLockResources {
+        TrxTableLockResources {
+            metadata: LockResource::TableMetadata(table_id),
+            data: LockResource::TableData(table_id),
+        }
+    }
+
+    #[inline]
+    fn explicit_table_lock_owner(&self, operation: &'static str) -> Result<LockOwner> {
+        Ok(self.checked_lock_state(operation)?.owner())
+    }
+
+    #[inline]
+    fn inspect_explicit_table_lock_cache(
+        &self,
+        resources: TrxTableLockResources,
+        data_mode: LockMode,
+        operation: &'static str,
+    ) -> Result<TrxTableLockCache> {
+        let lock_state = self.checked_lock_state(operation)?;
+        Ok(TrxTableLockCache {
+            metadata_cached: lock_state.cached_covers(resources.metadata, LockMode::Shared)?,
+            data_cached: lock_state.cached_covers(resources.data, data_mode)?,
+        })
+    }
+
+    #[inline]
+    async fn acquire_explicit_table_lock_guards<'lock>(
+        &self,
+        lock_manager: &'lock LockManager,
+        resources: TrxTableLockResources,
+        data_mode: LockMode,
+        owner: LockOwner,
+        operation: &'static str,
+    ) -> Result<TrxTableLockGuards<'lock>> {
+        let metadata_grant = self
+            .checked_lock_state(operation)?
+            .acquire_uncached(lock_manager, resources.metadata, LockMode::Shared)
+            .await?;
+        let metadata = FreshLockGuard::new(lock_manager, resources.metadata, owner, metadata_grant);
+
+        let data_grant = self
+            .checked_lock_state(operation)?
+            .acquire_uncached(lock_manager, resources.data, data_mode)
+            .await?;
+        let data = FreshLockGuard::new(lock_manager, resources.data, owner, data_grant);
+
+        Ok(TrxTableLockGuards { metadata, data })
+    }
+
+    #[inline]
+    fn cache_explicit_table_lock_grants(
+        &mut self,
+        resources: TrxTableLockResources,
+        data_mode: LockMode,
+        cache: TrxTableLockCache,
+        operation: &'static str,
+    ) -> Result<()> {
+        if !cache.data_cached {
+            self.checked_lock_state_mut(operation)?
+                .cache_granted(resources.data, data_mode);
+        }
+        if !cache.metadata_cached {
+            self.checked_lock_state_mut(operation)?
+                .cache_granted(resources.metadata, LockMode::Shared);
+        }
+        Ok(())
+    }
+
+    #[inline]
     fn next_stmt_no(&mut self) -> Result<StmtNo> {
         let stmt_no = self.next_stmt_no;
         self.next_stmt_no = self.next_stmt_no.checked_add(1).ok_or_else(|| {
@@ -1098,51 +1197,29 @@ impl TrxInner {
     /// Acquires an explicit transaction-lifetime table lock.
     #[inline]
     async fn lock_table(&mut self, table_id: TableID, mode: LockMode) -> Result<()> {
+        let operation = "lock explicit table";
         mode.validate_explicit_table_lock()?;
-        let engine = self.checked_engine("lock explicit table")?;
+        let engine = self.checked_engine(operation)?;
         engine
             .catalog()
-            .validate_user_table_live(table_id, "lock explicit table")
+            .validate_user_table_live(table_id, operation)
             .await?;
-        let lock_manager = self.checked_lock_manager("lock explicit table")?;
-        let metadata_resource = LockResource::TableMetadata(table_id);
-        let data_resource = LockResource::TableData(table_id);
-        let owner = self.checked_lock_state("lock explicit table")?.owner();
-        let metadata_cached = self
-            .checked_lock_state("lock explicit table")?
-            .cached_covers(metadata_resource, LockMode::Shared)?;
-        let data_cached = self
-            .checked_lock_state("lock explicit table")?
-            .cached_covers(data_resource, mode)?;
-        let metadata_grant = self
-            .checked_lock_state("lock explicit table")?
-            .acquire_uncached(&lock_manager, metadata_resource, LockMode::Shared)
+
+        let lock_manager = self.checked_lock_manager(operation)?;
+        let resources = Self::table_lock_resources(table_id);
+        let owner = self.explicit_table_lock_owner(operation)?;
+        let cache = self.inspect_explicit_table_lock_cache(resources, mode, operation)?;
+        let mut guards = self
+            .acquire_explicit_table_lock_guards(&lock_manager, resources, mode, owner, operation)
             .await?;
-        let mut metadata_guard =
-            FreshLockGuard::new(&lock_manager, metadata_resource, owner, metadata_grant);
-        let data_grant = self
-            .checked_lock_state("lock explicit table")?
-            .acquire_uncached(&lock_manager, data_resource, mode)
-            .await?;
-        let mut data_guard = FreshLockGuard::new(&lock_manager, data_resource, owner, data_grant);
+
         engine
             .catalog()
-            .validate_user_table_live(table_id, "lock explicit table")
+            .validate_user_table_live(table_id, operation)
             .await?;
-        if !data_cached {
-            self.checked_lock_state_mut("lock explicit table")?
-                .cache_granted(data_resource, mode);
-        }
-        if !metadata_cached {
-            self.checked_lock_state_mut("lock explicit table")?
-                .cache_granted(metadata_resource, LockMode::Shared);
-        }
-        if let Some(guard) = data_guard.as_mut() {
-            guard.disarm();
-        }
-        if let Some(guard) = metadata_guard.as_mut() {
-            guard.disarm();
-        }
+
+        self.cache_explicit_table_lock_grants(resources, mode, cache, operation)?;
+        guards.disarm_all();
         Ok(())
     }
 
@@ -1627,6 +1704,7 @@ pub(crate) mod tests {
     use super::*;
     use crate::buffer::PoolRole;
     use crate::catalog::storage::tables::TABLE_ID_TABLES;
+    use crate::catalog::tests as catalog_tests;
     use crate::catalog::{ColumnAttributes, ColumnSpec, TableMetadata};
     use crate::conf::{EngineConfig, EvictableBufferPoolConfig, TrxSysConfig};
     use crate::engine::Engine;
@@ -1634,7 +1712,9 @@ pub(crate) mod tests {
     use crate::file::cow_file::tests::old_root_drop_count;
     use crate::file::table_file::{MutableTableFile, TableFile};
     use crate::id::SessionID;
-    use crate::lock::tests::{debug_snapshot, try_acquire, try_acquire_grouped};
+    use crate::lock::tests::{
+        LockDebugEntryState, debug_snapshot, try_acquire, try_acquire_grouped,
+    };
     use crate::row::ops::SelectKey;
     use crate::session::SessionState;
     use crate::table::test_user_table_id;
@@ -1874,6 +1954,31 @@ pub(crate) mod tests {
             .iter()
             .filter(|entry| entry.owner == owner)
             .count()
+    }
+
+    fn has_lock_entry(
+        engine: &Engine,
+        owner: LockOwner,
+        resource: LockResource,
+        mode: LockMode,
+        state: LockDebugEntryState,
+    ) -> bool {
+        debug_snapshot(engine.lock_manager())
+            .entries
+            .iter()
+            .any(|entry| {
+                entry.owner == owner
+                    && entry.resource == resource
+                    && entry.mode == mode
+                    && entry.state == state
+            })
+    }
+
+    fn has_lock_resource(engine: &Engine, owner: LockOwner, resource: LockResource) -> bool {
+        debug_snapshot(engine.lock_manager())
+            .entries
+            .iter()
+            .any(|entry| entry.owner == owner && entry.resource == resource)
     }
 
     async fn publish_initial_test_root(engine: &Engine, table_id_offset: u64) -> Arc<TableFile> {
@@ -2271,6 +2376,163 @@ pub(crate) mod tests {
             engine
                 .lock_manager()
                 .release_owner(LockOwner::Session(SessionID::new(91_221)));
+
+            trx.rollback().await.unwrap();
+            assert_eq!(lock_entry_count(&engine, owner), 0);
+        });
+    }
+
+    #[test]
+    fn test_lock_table_caches_explicit_locks_and_restores_entry_state() {
+        smol::block_on(async {
+            let (_temp_dir, engine) = test_engine("trx_lock_table_cache").await;
+            let table_id = catalog_tests::table2(&engine).await;
+            let mut session = engine.new_session().unwrap();
+            let mut trx = session.begin_trx().unwrap();
+            let entry = trx.entry();
+            let owner = lock_owner(&trx).unwrap();
+            let metadata = LockResource::TableMetadata(table_id);
+            let data = LockResource::TableData(table_id);
+
+            assert_eq!(entry.inspect_state(), TrxEntryState::Active);
+            trx.lock_table(table_id, LockMode::Exclusive).await.unwrap();
+            assert_eq!(entry.inspect_state(), TrxEntryState::Active);
+            assert!(cached_transaction_lock_covers(&trx, metadata, LockMode::Shared).unwrap());
+            assert!(cached_transaction_lock_covers(&trx, data, LockMode::Exclusive).unwrap());
+
+            trx.lock_table(table_id, LockMode::Shared).await.unwrap();
+            trx.lock_table(table_id, LockMode::Exclusive).await.unwrap();
+
+            assert_eq!(entry.inspect_state(), TrxEntryState::Active);
+            assert_eq!(lock_entry_count(&engine, owner), 2);
+            assert!(has_lock_entry(
+                &engine,
+                owner,
+                metadata,
+                LockMode::Shared,
+                LockDebugEntryState::Granted,
+            ));
+            assert!(has_lock_entry(
+                &engine,
+                owner,
+                data,
+                LockMode::Exclusive,
+                LockDebugEntryState::Granted,
+            ));
+
+            trx.rollback().await.unwrap();
+            assert_eq!(entry.inspect_state(), TrxEntryState::Terminal);
+            assert_eq!(lock_entry_count(&engine, owner), 0);
+        });
+    }
+
+    #[test]
+    fn test_pending_lock_table_checkout_restores_active_on_drop() {
+        smol::block_on(async {
+            let (_temp_dir, engine) = test_engine("trx_lock_table_cancel_state").await;
+            let table_id = catalog_tests::table2(&engine).await;
+            let blocker = LockOwner::Transaction(TrxID::new(91_401));
+            let data = LockResource::TableData(table_id);
+            assert!(
+                try_acquire(engine.lock_manager(), data, LockMode::Exclusive, blocker).unwrap()
+            );
+
+            let mut session = engine.new_session().unwrap();
+            let mut trx = session.begin_trx().unwrap();
+            let entry = trx.entry();
+            let owner = lock_owner(&trx).unwrap();
+            let metadata = LockResource::TableMetadata(table_id);
+            let mut lock_fut = Box::pin(trx.lock_table(table_id, LockMode::Shared));
+
+            assert!(matches!(
+                futures::poll!(lock_fut.as_mut()),
+                std::task::Poll::Pending
+            ));
+            assert_eq!(entry.inspect_state(), TrxEntryState::CheckedOut);
+            assert!(has_lock_entry(
+                &engine,
+                owner,
+                metadata,
+                LockMode::Shared,
+                LockDebugEntryState::Granted,
+            ));
+            assert!(has_lock_entry(
+                &engine,
+                owner,
+                data,
+                LockMode::Shared,
+                LockDebugEntryState::Waiting,
+            ));
+
+            drop(lock_fut);
+
+            assert_eq!(entry.inspect_state(), TrxEntryState::Active);
+            assert!(!has_lock_resource(&engine, owner, metadata));
+            assert!(!has_lock_resource(&engine, owner, data));
+            assert!(!cached_transaction_lock_covers(&trx, metadata, LockMode::Shared).unwrap());
+            assert_eq!(engine.lock_manager().release(data, blocker), 1);
+
+            trx.rollback().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn test_lock_table_cancel_preserves_cached_metadata_only() {
+        smol::block_on(async {
+            let (_temp_dir, engine) = test_engine("trx_lock_table_cached_metadata_cancel").await;
+            let table_id = catalog_tests::table2(&engine).await;
+            let mut session = engine.new_session().unwrap();
+            let mut trx = session.begin_trx().unwrap();
+            let entry = trx.entry();
+            let owner = lock_owner(&trx).unwrap();
+            let metadata = LockResource::TableMetadata(table_id);
+            let data = LockResource::TableData(table_id);
+
+            acquire_transaction_lock(&mut trx, metadata, LockMode::Shared)
+                .await
+                .unwrap();
+            assert!(cached_transaction_lock_covers(&trx, metadata, LockMode::Shared).unwrap());
+
+            let blocker = LockOwner::Transaction(TrxID::new(91_402));
+            assert!(
+                try_acquire(engine.lock_manager(), data, LockMode::Exclusive, blocker).unwrap()
+            );
+
+            let mut lock_fut = Box::pin(trx.lock_table(table_id, LockMode::Shared));
+            assert!(matches!(
+                futures::poll!(lock_fut.as_mut()),
+                std::task::Poll::Pending
+            ));
+            assert_eq!(entry.inspect_state(), TrxEntryState::CheckedOut);
+            assert!(has_lock_entry(
+                &engine,
+                owner,
+                metadata,
+                LockMode::Shared,
+                LockDebugEntryState::Granted,
+            ));
+            assert!(has_lock_entry(
+                &engine,
+                owner,
+                data,
+                LockMode::Shared,
+                LockDebugEntryState::Waiting,
+            ));
+
+            drop(lock_fut);
+
+            assert_eq!(entry.inspect_state(), TrxEntryState::Active);
+            assert!(has_lock_entry(
+                &engine,
+                owner,
+                metadata,
+                LockMode::Shared,
+                LockDebugEntryState::Granted,
+            ));
+            assert!(!has_lock_resource(&engine, owner, data));
+            assert!(cached_transaction_lock_covers(&trx, metadata, LockMode::Shared).unwrap());
+            assert!(!cached_transaction_lock_covers(&trx, data, LockMode::Shared).unwrap());
+            assert_eq!(engine.lock_manager().release(data, blocker), 1);
 
             trx.rollback().await.unwrap();
             assert_eq!(lock_entry_count(&engine, owner), 0);
