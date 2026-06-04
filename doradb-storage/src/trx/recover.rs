@@ -963,7 +963,7 @@ mod tests {
     use crate::trx::log_replay::{LogMerger, TrxLog};
     use crate::trx::redo::{DDLRedo, RedoHeader, RedoLogs, RedoTrxKind, RowRedo, RowRedoKind};
     use crate::trx::stmt::Statement;
-    use crate::trx::{ActiveTrx, MIN_SNAPSHOT_TS};
+    use crate::trx::{MIN_SNAPSHOT_TS, Transaction};
     use crate::value::Val;
     use crate::value::ValKind;
     use std::fs::OpenOptions;
@@ -1136,7 +1136,7 @@ mod tests {
     }
 
     async fn trx_insert_row(
-        trx: &mut ActiveTrx,
+        trx: &mut Transaction,
         table: &Table,
         cols: Vec<Val>,
     ) -> crate::error::Result<RowID> {
@@ -1145,7 +1145,7 @@ mod tests {
     }
 
     async fn trx_delete_row(
-        trx: &mut ActiveTrx,
+        trx: &mut Transaction,
         table: &Table,
         key: &SelectKey,
     ) -> crate::error::Result<DeleteMvcc> {
@@ -1154,7 +1154,7 @@ mod tests {
     }
 
     async fn trx_update_row(
-        trx: &mut ActiveTrx,
+        trx: &mut Transaction,
         table: &Table,
         key: &SelectKey,
         update: Vec<UpdateCol>,
@@ -1164,7 +1164,7 @@ mod tests {
     }
 
     async fn trx_select_row_mvcc(
-        trx: &mut ActiveTrx,
+        trx: &mut Transaction,
         table: &Table,
         key: &SelectKey,
         user_read_set: &[usize],

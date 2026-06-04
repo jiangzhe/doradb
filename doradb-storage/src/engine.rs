@@ -1570,7 +1570,7 @@ mod tests {
             let mut session = engine.new_session().unwrap();
 
             let mut trx = session.begin_trx().unwrap();
-            trx.add_pseudo_redo_log_entry();
+            crate::trx::tests::add_pseudo_redo_log_entry(&mut trx);
             let cts = trx.commit().await.unwrap();
             assert!(cts > TrxID::new(0));
             assert!(!session.in_trx().unwrap());

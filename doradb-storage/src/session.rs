@@ -7,7 +7,7 @@ use crate::id::{RowID, SessionID, TableID, TrxID};
 use crate::lock::{LockManager, LockMode, LockOwner, LockOwnerGroup, LockResource};
 use crate::quiescent::QuiescentGuard;
 use crate::table::Table;
-use crate::trx::ActiveTrx;
+use crate::trx::{Transaction, TrxEntry, TrxEntryState};
 use dashmap::DashMap;
 use error_stack::Report;
 use parking_lot::Mutex;
@@ -28,13 +28,13 @@ impl SessionDdlContext {
     #[inline]
     pub(crate) fn new(session: &Session) -> Result<Self> {
         let pin = session.pin("session DDL")?;
-        if pin.in_trx()? {
+        if pin.in_trx("session DDL")? {
             return Err(Report::new(OperationError::NotSupported)
                 .attach("implicit commit due to DDL")
                 .into());
         }
         let id = pin.id();
-        let pool_guards = pin.state.pool_guards().clone();
+        let pool_guards = pin.pool_guards();
         Ok(Self {
             engine: pin.engine,
             pool_guards,
@@ -108,14 +108,14 @@ impl Session {
     /// Checked session transaction state query for internal operation paths.
     #[inline]
     pub(crate) fn checked_in_trx(&self, operation: &'static str) -> Result<bool> {
-        self.pin(operation)?.in_trx()
+        self.pin(operation)?.in_trx(operation)
     }
 
     /// Begin a new transaction if the session is currently idle.
     #[inline]
-    pub fn begin_trx(&mut self) -> Result<ActiveTrx> {
+    pub fn begin_trx(&mut self) -> Result<Transaction> {
         let pin = self.pin("begin transaction")?;
-        let engine = pin.engine.clone();
+        let engine = &pin.engine;
         pin.state
             .begin_trx(|| engine.trx_sys.begin_trx(engine.clone(), &pin.state))
     }
@@ -170,14 +170,15 @@ impl Session {
     pub async fn lock_table(&self, table_id: TableID, mode: LockMode) -> Result<()> {
         mode.validate_explicit_table_lock()?;
         let pin = self.pin("lock explicit table")?;
+        let session_id = pin.id();
         let engine = pin.engine;
         engine
             .catalog()
             .validate_user_table_live(table_id, "lock explicit table")
             .await?;
         let lock_manager = engine.lock_manager();
-        let owner = LockOwner::Session(self.id());
-        let owner_group = LockOwnerGroup::Session(self.id());
+        let owner = LockOwner::Session(session_id);
+        let owner_group = LockOwnerGroup::Session(session_id);
         let (mut metadata_guard, mut data_guard) = lock_manager
             .acquire_grouped_table_locks(table_id, mode, owner, owner_group)
             .await?;
@@ -198,12 +199,12 @@ impl Session {
     #[inline]
     pub fn unlock_table(&self, table_id: TableID) -> Result<()> {
         let pin = self.pin("unlock explicit table")?;
-        if pin.in_trx()? {
+        if pin.in_trx("unlock explicit table")? {
             return Err(Report::new(OperationError::NotSupported)
                 .attach("unlock table while session has an active transaction")
                 .into());
         }
-        let owner = LockOwner::Session(self.id());
+        let owner = LockOwner::Session(pin.id());
         let lock_manager = pin.engine.lock_manager();
         lock_manager.release(LockResource::TableData(table_id), owner);
         lock_manager.release(LockResource::TableMetadata(table_id), owner);
@@ -315,8 +316,8 @@ impl SessionPin {
 
     /// Returns whether the pinned session is in an active transaction.
     #[inline]
-    pub(crate) fn in_trx(&self) -> Result<bool> {
-        self.state.in_trx("query pinned session transaction state")
+    pub(crate) fn in_trx(&self, operation: &'static str) -> Result<bool> {
+        self.state.in_trx(operation)
     }
 }
 
@@ -502,7 +503,7 @@ impl SessionState {
 
     #[inline]
     fn ensure_running(&self, operation: &'static str) -> Result<()> {
-        match *self.lifecycle.lock() {
+        match &*self.lifecycle.lock() {
             SessionLifecycle::RunningIdle | SessionLifecycle::RunningActive { .. } => Ok(()),
             SessionLifecycle::AbandonedIdle
             | SessionLifecycle::AbandonedActive { .. }
@@ -512,9 +513,9 @@ impl SessionState {
 
     #[inline]
     fn in_trx(&self, operation: &'static str) -> Result<bool> {
-        match *self.lifecycle.lock() {
+        match &*self.lifecycle.lock() {
             SessionLifecycle::RunningIdle => Ok(false),
-            SessionLifecycle::RunningActive { .. } => Ok(true),
+            SessionLifecycle::RunningActive { entry } => Ok(entry.in_trx()),
             SessionLifecycle::AbandonedIdle
             | SessionLifecycle::AbandonedActive { .. }
             | SessionLifecycle::Closed => Err(closed_session_error(self.id, operation)),
@@ -522,72 +523,78 @@ impl SessionState {
     }
 
     #[inline]
-    fn begin_trx(&self, begin: impl FnOnce() -> ActiveTrx) -> Result<ActiveTrx> {
+    fn active_transaction_err(
+        &self,
+        operation: &'static str,
+        entry: &TrxEntry,
+    ) -> crate::error::Error {
+        Report::new(OperationError::ExistingTransaction)
+            .attach(format!(
+                "{operation}: session_id={}, trx_id={}, state={:?}",
+                self.id,
+                entry.trx_id(),
+                entry.inspect_state()
+            ))
+            .into()
+    }
+
+    #[inline]
+    fn begin_trx(&self, begin: impl FnOnce() -> Transaction) -> Result<Transaction> {
         let mut lifecycle = self.lifecycle.lock();
-        match *lifecycle {
-            SessionLifecycle::RunningIdle => {
-                let trx = begin();
-                *lifecycle = SessionLifecycle::RunningActive {
-                    trx_id: trx.trx_id(),
-                };
-                Ok(trx)
-            }
-            SessionLifecycle::RunningActive { trx_id } => {
-                Err(Report::new(OperationError::ExistingTransaction)
-                    .attach(format!("session_id={}, trx_id={trx_id}", self.id))
-                    .into())
+        match &*lifecycle {
+            SessionLifecycle::RunningIdle => {}
+            SessionLifecycle::RunningActive { entry } => {
+                return Err(self.active_transaction_err("begin transaction", entry));
             }
             SessionLifecycle::AbandonedIdle
             | SessionLifecycle::AbandonedActive { .. }
-            | SessionLifecycle::Closed => Err(closed_session_error(self.id, "begin transaction")),
+            | SessionLifecycle::Closed => {
+                return Err(closed_session_error(self.id, "begin transaction"));
+            }
         }
+        let trx = begin();
+        *lifecycle = SessionLifecycle::RunningActive { entry: trx.entry() };
+        Ok(trx)
     }
 
     #[inline]
     fn close_idle(&self) -> Result<SessionRemoval> {
         let mut lifecycle = self.lifecycle.lock();
-        match *lifecycle {
-            SessionLifecycle::RunningIdle | SessionLifecycle::AbandonedIdle => {
-                *lifecycle = SessionLifecycle::Closed;
-                self.release_session_locks();
-                Ok(SessionRemoval::Remove)
+        match &*lifecycle {
+            SessionLifecycle::RunningIdle | SessionLifecycle::AbandonedIdle => {}
+            SessionLifecycle::RunningActive { entry } => {
+                return Err(
+                    self.active_transaction_err("close session with active transaction", entry)
+                );
             }
-            SessionLifecycle::RunningActive { trx_id } => {
-                Err(Report::new(OperationError::ExistingTransaction)
-                    .attach(format!(
-                        "close session with active transaction: session_id={}, trx_id={trx_id}",
-                        self.id
-                    ))
-                    .into())
+            SessionLifecycle::AbandonedActive { entry } => {
+                return Err(self.active_transaction_err(
+                    "close abandoned session with active transaction",
+                    entry,
+                ));
             }
-            SessionLifecycle::AbandonedActive { trx_id } => Err(Report::new(
-                OperationError::ExistingTransaction,
-            )
-            .attach(format!(
-                "close abandoned session with active transaction: session_id={}, trx_id={trx_id}",
-                self.id
-            ))
-            .into()),
-            SessionLifecycle::Closed => Ok(SessionRemoval::Remove),
+            SessionLifecycle::Closed => return Ok(SessionRemoval::Remove),
         }
+        *lifecycle = SessionLifecycle::Closed;
+        self.release_session_locks();
+        Ok(SessionRemoval::Remove)
     }
 
     #[inline]
     fn abandon(&self) -> SessionRemoval {
         let mut lifecycle = self.lifecycle.lock();
-        match *lifecycle {
+        let entry = match &*lifecycle {
             SessionLifecycle::RunningIdle | SessionLifecycle::AbandonedIdle => {
                 *lifecycle = SessionLifecycle::AbandonedIdle;
                 self.release_session_locks();
-                SessionRemoval::Remove
+                return SessionRemoval::Remove;
             }
-            SessionLifecycle::RunningActive { trx_id }
-            | SessionLifecycle::AbandonedActive { trx_id } => {
-                *lifecycle = SessionLifecycle::AbandonedActive { trx_id };
-                SessionRemoval::Keep
-            }
-            SessionLifecycle::Closed => SessionRemoval::Remove,
-        }
+            SessionLifecycle::RunningActive { entry }
+            | SessionLifecycle::AbandonedActive { entry } => Arc::clone(entry),
+            SessionLifecycle::Closed => return SessionRemoval::Remove,
+        };
+        *lifecycle = SessionLifecycle::AbandonedActive { entry };
+        SessionRemoval::Keep
     }
 
     /// Finish this session's active-transaction lifecycle after commit.
@@ -607,30 +614,46 @@ impl SessionState {
     #[inline]
     fn finish_trx(&self, trx_id: TrxID, mut on_finish: impl FnMut()) -> SessionRemoval {
         let mut lifecycle = self.lifecycle.lock();
-        match *lifecycle {
-            SessionLifecycle::RunningActive { trx_id: active } if active == trx_id => {
-                on_finish();
-                *lifecycle = SessionLifecycle::RunningIdle;
-                SessionRemoval::Keep
+        enum Finish {
+            Running(Arc<TrxEntry>),
+            Abandoned(Arc<TrxEntry>),
+            Stale,
+        }
+        let finish = match &*lifecycle {
+            SessionLifecycle::RunningActive { entry } if entry.trx_id() == trx_id => {
+                Finish::Running(Arc::clone(entry))
             }
-            SessionLifecycle::AbandonedActive { trx_id: active } if active == trx_id => {
-                on_finish();
-                *lifecycle = SessionLifecycle::Closed;
-                self.release_session_locks();
-                SessionRemoval::Remove
+            SessionLifecycle::AbandonedActive { entry } if entry.trx_id() == trx_id => {
+                Finish::Abandoned(Arc::clone(entry))
             }
             SessionLifecycle::RunningIdle
             | SessionLifecycle::AbandonedIdle
             | SessionLifecycle::Closed
             | SessionLifecycle::RunningActive { .. }
-            | SessionLifecycle::AbandonedActive { .. } => SessionRemoval::Keep,
+            | SessionLifecycle::AbandonedActive { .. } => Finish::Stale,
+        };
+        match finish {
+            Finish::Running(entry) => {
+                on_finish();
+                entry.finish(TrxEntryState::Terminal);
+                *lifecycle = SessionLifecycle::RunningIdle;
+                SessionRemoval::Keep
+            }
+            Finish::Abandoned(entry) => {
+                on_finish();
+                entry.finish(TrxEntryState::Terminal);
+                *lifecycle = SessionLifecycle::Closed;
+                self.release_session_locks();
+                SessionRemoval::Remove
+            }
+            Finish::Stale => SessionRemoval::Keep,
         }
     }
 
     #[inline]
     fn shutdown_removal(&self) -> bool {
         let mut lifecycle = self.lifecycle.lock();
-        match *lifecycle {
+        match &*lifecycle {
             SessionLifecycle::RunningIdle | SessionLifecycle::AbandonedIdle => {
                 *lifecycle = SessionLifecycle::Closed;
                 self.release_session_locks();
@@ -676,12 +699,11 @@ impl Drop for SessionState {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SessionLifecycle {
     RunningIdle,
-    RunningActive { trx_id: TrxID },
+    RunningActive { entry: Arc<TrxEntry> },
     AbandonedIdle,
-    AbandonedActive { trx_id: TrxID },
+    AbandonedActive { entry: Arc<TrxEntry> },
     Closed,
 }
 

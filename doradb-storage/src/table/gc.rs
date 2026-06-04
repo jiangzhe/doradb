@@ -182,26 +182,34 @@ impl Table {
         let trx_sys = pin.engine.trx_sys.clone();
         let pool_guards = pin.pool_guards();
         loop {
-            let trx = session.begin_trx()?;
+            let mut trx = session.begin_trx()?;
             let cleanup_sts = trx.sts();
             let min_active_sts = trx_sys.calc_min_active_sts_for_gc();
-            let proof = trx.ctx().read_proof();
-            let snapshot = self.capture_mem_index_cleanup_snapshot(min_active_sts, &proof)?;
-            if !snapshot.is_visible_to(cleanup_sts) {
-                trx_sys.rollback(trx).await?;
-                continue;
-            }
-            #[cfg(test)]
-            super::tests::run_test_secondary_cleanup_before_scan_hook().await;
+            let cleanup_res = {
+                let checkout = trx.checkout("cleanup secondary mem indexes")?;
+                let proof = checkout.inner().ctx().read_proof();
+                let snapshot = self.capture_mem_index_cleanup_snapshot(min_active_sts, &proof)?;
+                if !snapshot.is_visible_to(cleanup_sts) {
+                    drop(snapshot);
+                    drop(checkout);
+                    trx.rollback().await?;
+                    continue;
+                }
+                #[cfg(test)]
+                super::tests::run_test_secondary_cleanup_before_scan_hook().await;
 
-            let cleanup_res = self
-                .cleanup_secondary_mem_indexes_at_snapshot(
-                    &pool_guards,
-                    &snapshot,
-                    clean_live_entries,
-                )
-                .await;
-            let rollback_res = trx_sys.rollback(trx).await;
+                let cleanup_res = self
+                    .cleanup_secondary_mem_indexes_at_snapshot(
+                        &pool_guards,
+                        &snapshot,
+                        clean_live_entries,
+                    )
+                    .await;
+                drop(snapshot);
+                drop(checkout);
+                cleanup_res
+            };
+            let rollback_res = trx.rollback().await;
             return match (cleanup_res, rollback_res) {
                 (Ok(stats), Ok(())) => Ok(stats),
                 (Err(err), Ok(())) => Err(err),

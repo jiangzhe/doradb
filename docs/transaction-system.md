@@ -144,7 +144,17 @@ owned `TableRootSnapshot` for broader MVCC and GC work. Checkpoint, recovery,
 catalog load, and file-internal root reads remain explicit unchecked
 exceptions outside this runtime transaction contract.
 
-Each user statement runs through `ActiveTrx::exec(async |stmt| { ... })`.
+Each user statement runs through `Transaction::exec(async |stmt| { ... })`.
+The public `Transaction` is a facade over a session-owned stable transaction
+entry. The mutable transaction core lives in `TrxInner` and is checked out
+for one non-terminal operation through private `TrxCheckout` plumbing; ordinary
+`TrxCheckout` drop returns the core to the entry. `Statement` owns this checkout
+for statement execution, while commit, rollback, and fatal cleanup consume or
+clear terminal ownership directly.
+The entry remains visible to session cleanup and shutdown while it is `Active`,
+`CheckedOut`, `Committing`, `RollingBack`, `Terminal`, or `Failed`, without
+keeping a strong engine backreference inside the session-owned entry.
+
 `Statement` is a borrowed facade over immutable `TrxContext` and owned
 statement-local `StmtEffects`; callers cannot construct or finish it directly.
 When the callback succeeds, statement row undo, index undo, and redo effects
@@ -152,10 +162,10 @@ merge into the active transaction. When the callback returns an ordinary error,
 only the current statement effects are rolled back and the original error is
 returned. If that rollback cannot access required storage, the rollback failure
 is fatal: storage is poisoned, the session is marked out of transaction, and the
-active transaction is marked discarded so later commit or rollback attempts
-return an error.
+transaction entry is marked failed so later commit or rollback attempts return an
+error.
 
-Logical lock ownership is tracked outside `TrxContext`. `ActiveTrx` owns an
+Logical lock ownership is tracked outside `TrxContext`. `Transaction` owns an
 `OwnerLockState` for the transaction owner that caches the strongest granted
 mode per logical resource. `Statement` owns its statement-owner
 `OwnerLockState` and releases statement-owned locks from its drop guard after

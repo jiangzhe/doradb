@@ -1021,7 +1021,7 @@ impl TablePersistence for Table {
         {
             Ok(pages) => (pages, next_heap_redo_start_ts.unwrap_or(checkpoint_ts)),
             Err(err) => {
-                trx_sys.rollback(trx).await?;
+                trx.rollback().await?;
                 return Err(err);
             }
         };
@@ -1033,14 +1033,15 @@ impl TablePersistence for Table {
         }
 
         let gc_pages: Vec<PageID> = frozen_pages.iter().map(|page| page.page_id).collect();
-        trx.extend_gc_row_pages(gc_pages);
+        trx.extend_gc_row_pages(gc_pages)?;
 
         // Step 5: emit one checkpoint redo marker for recovery.
-        trx.redo_mut().ddl = Some(Box::new(DDLRedo::DataCheckpoint {
+        let old = trx.set_ddl_redo(DDLRedo::DataCheckpoint {
             table_id: self.table_id(),
             pivor_row_id: new_pivot_row_id,
             sts: checkpoint_ts,
-        }));
+        })?;
+        debug_assert!(old.is_none());
 
         // Step 6: apply checkpoint changes to the already-checked mutable root.
         if !lwc_blocks.is_empty() {
@@ -1048,13 +1049,13 @@ impl TablePersistence for Table {
                 .apply_lwc_blocks(lwc_blocks, heap_redo_start_ts, checkpoint_ts, disk_pool)
                 .await
             {
-                trx_sys.rollback(trx).await?;
+                trx.rollback().await?;
                 return Err(err);
             }
         } else if let Err(err) =
             mutable_file.apply_checkpoint_metadata(new_pivot_row_id, heap_redo_start_ts)
         {
-            trx_sys.rollback(trx).await?;
+            trx.rollback().await?;
             return Err(err);
         }
 
@@ -1071,7 +1072,7 @@ impl TablePersistence for Table {
             )
             .await
         {
-            trx_sys.rollback(trx).await?;
+            trx.rollback().await?;
             return Err(err);
         }
 
@@ -1087,7 +1088,7 @@ impl TablePersistence for Table {
             )
             .await
         {
-            trx_sys.rollback(trx).await?;
+            trx.rollback().await?;
             return Err(err);
         }
 
@@ -1098,7 +1099,7 @@ impl TablePersistence for Table {
             .rebuild_reachable_alloc_map(&mut mutable_file, &layout)
             .await
         {
-            trx_sys.rollback(trx).await?;
+            trx.rollback().await?;
             return Err(err);
         }
 
@@ -1110,7 +1111,7 @@ impl TablePersistence for Table {
         let publish_lease = match self.try_begin_checkpoint_publish() {
             Ok(lease) => lease,
             Err(reason) => {
-                trx_sys.rollback(trx).await?;
+                trx.rollback().await?;
                 return Ok(CheckpointOutcome::Cancelled { reason });
             }
         };
@@ -1123,12 +1124,12 @@ impl TablePersistence for Table {
         {
             Ok(res) => res,
             Err(err) if err.kind() == ErrorKind::Io => {
-                let _ = trx_sys.rollback(trx).await;
+                let _ = trx.rollback().await;
                 let poison = trx_sys.poison_storage(FatalError::CheckpointWrite);
                 return Err(poison.into());
             }
             Err(err) => {
-                trx_sys.rollback(trx).await?;
+                trx.rollback().await?;
                 return Err(err);
             }
         };
@@ -1139,11 +1140,11 @@ impl TablePersistence for Table {
         #[cfg(test)]
         if super::tests::test_force_post_publish_checkpoint_error_enabled() {
             let poison = trx_sys.poison_storage(FatalError::CheckpointWrite);
-            trx.discard_after_fatal_rollback();
+            crate::trx::tests::discard_transaction_after_fatal_rollback(&mut trx);
             return Err(poison.into());
         }
 
-        if trx_sys.commit(trx).await.is_err() {
+        if trx.commit().await.is_err() {
             let poison = trx_sys.poison_storage(FatalError::CheckpointWrite);
             return Err(poison.into());
         }

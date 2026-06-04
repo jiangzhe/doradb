@@ -3,7 +3,7 @@ use crate::id::{RowID, TableID, TrxID};
 
 use crate::catalog::{CatalogTable, TableCache};
 use crate::error::{FatalError, InternalError, Result};
-use crate::lock::{LockManager, LockMode, LockOwner, LockResource};
+use crate::lock::{LockManager, LockMode, LockOwner, LockResource, OwnerLockState};
 use crate::quiescent::QuiescentGuard;
 use crate::row::ops::{DeleteMvcc, ScanMvcc, SelectKey, SelectMvcc, UpdateCol, UpdateMvcc};
 use crate::table::Table;
@@ -11,7 +11,7 @@ use crate::trx::redo::{DDLRedo, RedoLogs, RowRedo};
 use crate::trx::undo::{
     IndexUndo, IndexUndoKind, IndexUndoLogs, OwnedRowUndo, RowUndoKind, RowUndoLogs,
 };
-use crate::trx::{OwnerLockState, TrxContext, TrxEffects};
+use crate::trx::{TrxCheckout, TrxContext, TrxEffects};
 use crate::value::Val;
 use error_stack::Report;
 use std::mem;
@@ -215,50 +215,55 @@ impl Drop for StmtEffects {
 
 /// Statement-scoped facade for one operation inside an active transaction.
 ///
-/// `ActiveTrx::exec` owns the statement lifecycle. It passes this facade to the
+/// `Transaction::exec` owns the statement lifecycle. It passes this facade to the
 /// callback with transaction context, statement-local effects, and
 /// statement-owned logical locks. Dropping this value releases every
 /// statement-owned lock, so success and rollback paths cannot forget cleanup.
 pub struct Statement<'stmt> {
-    ctx: &'stmt TrxContext,
     effects: StmtEffects,
     lock_manager: QuiescentGuard<LockManager>,
-    trx_locks: &'stmt mut OwnerLockState,
     stmt_locks: OwnerLockState,
+    checkout: TrxCheckout<'stmt>,
 }
 
 impl<'stmt> Statement<'stmt> {
     /// Create a new statement.
     #[inline]
     pub(crate) fn new(
-        ctx: &'stmt TrxContext,
+        checkout: TrxCheckout<'stmt>,
         owner: LockOwner,
         lock_manager: QuiescentGuard<LockManager>,
-        trx_locks: &'stmt mut OwnerLockState,
-    ) -> Self {
-        let owner_group = trx_locks.owner_group();
-        Statement {
-            ctx,
+    ) -> Result<Self> {
+        let owner_group = checkout
+            .inner()
+            .checked_lock_state("execute statement")?
+            .owner_group();
+        Ok(Statement {
             effects: StmtEffects::empty(),
             lock_manager,
-            trx_locks,
             stmt_locks: match owner_group {
                 Some(owner_group) => OwnerLockState::new_grouped(owner, owner_group),
                 None => OwnerLockState::new(owner),
             },
-        }
+            checkout,
+        })
     }
 
     /// Returns this statement's immutable transaction context.
     #[inline]
     pub(crate) fn ctx(&self) -> &TrxContext {
-        self.ctx
+        self.checkout.inner().ctx()
     }
 
     /// Returns mutable access to this statement's effect accumulator.
     #[inline]
     pub(crate) fn effects_mut(&mut self) -> &mut StmtEffects {
         &mut self.effects
+    }
+
+    #[inline]
+    fn ctx_and_effects_mut(&mut self) -> (&TrxContext, &mut StmtEffects) {
+        (self.checkout.inner().ctx(), &mut self.effects)
     }
 
     /// Acquires a statement-owned logical lock.
@@ -283,16 +288,21 @@ impl<'stmt> Statement<'stmt> {
     /// Acquires transaction-lifetime metadata and table-data intent for a write.
     #[inline]
     pub(crate) async fn acquire_table_write_locks(&mut self, table_id: TableID) -> Result<()> {
-        self.trx_locks
+        let lock_manager = &self.lock_manager;
+        self.checkout
+            .inner_mut()
+            .checked_lock_state_mut("acquire table write locks")?
             .acquire(
-                &self.lock_manager,
+                lock_manager,
                 LockResource::TableMetadata(table_id),
                 LockMode::Shared,
             )
             .await?;
-        self.trx_locks
+        self.checkout
+            .inner_mut()
+            .checked_lock_state_mut("acquire table write locks")?
             .acquire(
-                &self.lock_manager,
+                lock_manager,
                 LockResource::TableData(table_id),
                 LockMode::IntentExclusive,
             )
@@ -315,7 +325,7 @@ impl<'stmt> Statement<'stmt> {
         let layout = table.layout_snapshot();
         table
             .accessor_with_layout(&layout)
-            .table_scan_mvcc(self.ctx, read_set, row_action)
+            .table_scan_mvcc(self.ctx(), read_set, row_action)
             .await
     }
 
@@ -332,7 +342,7 @@ impl<'stmt> Statement<'stmt> {
         let layout = table.layout_snapshot();
         table
             .accessor_with_layout(&layout)
-            .index_lookup_unique_mvcc(self.ctx, key, user_read_set)
+            .index_lookup_unique_mvcc(self.ctx(), key, user_read_set)
             .await
     }
 
@@ -349,7 +359,7 @@ impl<'stmt> Statement<'stmt> {
         let layout = table.layout_snapshot();
         table
             .accessor_with_layout(&layout)
-            .index_scan_mvcc(self.ctx, key, user_read_set)
+            .index_scan_mvcc(self.ctx(), key, user_read_set)
             .await
     }
 
@@ -359,9 +369,10 @@ impl<'stmt> Statement<'stmt> {
         self.acquire_table_write_locks(table.table_id()).await?;
         table.check_foreground_live("table_insert_mvcc")?;
         let layout = table.layout_snapshot();
+        let (ctx, effects) = self.ctx_and_effects_mut();
         table
             .accessor_with_layout(&layout)
-            .insert_mvcc(self.ctx, &mut self.effects, cols)
+            .insert_mvcc(ctx, effects, cols)
             .await
     }
 
@@ -376,9 +387,10 @@ impl<'stmt> Statement<'stmt> {
         self.acquire_table_write_locks(table.table_id()).await?;
         table.check_foreground_live("table_update_unique_mvcc")?;
         let layout = table.layout_snapshot();
+        let (ctx, effects) = self.ctx_and_effects_mut();
         table
             .accessor_with_layout(&layout)
-            .update_unique_mvcc(self.ctx, &mut self.effects, key, update)
+            .update_unique_mvcc(ctx, effects, key, update)
             .await
     }
 
@@ -393,9 +405,10 @@ impl<'stmt> Statement<'stmt> {
         self.acquire_table_write_locks(table.table_id()).await?;
         table.check_foreground_live("table_delete_unique_mvcc")?;
         let layout = table.layout_snapshot();
+        let (ctx, effects) = self.ctx_and_effects_mut();
         table
             .accessor_with_layout(&layout)
-            .delete_unique_mvcc(self.ctx, &mut self.effects, key, log_by_key)
+            .delete_unique_mvcc(ctx, effects, key, log_by_key)
             .await
     }
 
@@ -407,7 +420,8 @@ impl<'stmt> Statement<'stmt> {
         cols: Vec<Val>,
     ) -> Result<RowID> {
         self.acquire_table_write_locks(table.table_id()).await?;
-        table.insert_mvcc(self.ctx, &mut self.effects, cols).await
+        let (ctx, effects) = self.ctx_and_effects_mut();
+        table.insert_mvcc(ctx, effects, cols).await
     }
 
     /// Deletes one catalog-table row through the foreground lock-aware path.
@@ -419,15 +433,17 @@ impl<'stmt> Statement<'stmt> {
         log_by_key: bool,
     ) -> Result<DeleteMvcc> {
         self.acquire_table_write_locks(table.table_id()).await?;
+        let (ctx, effects) = self.ctx_and_effects_mut();
         table
-            .delete_unique_mvcc(self.ctx, &mut self.effects, key, log_by_key)
+            .delete_unique_mvcc(ctx, effects, key, log_by_key)
             .await
     }
 
     /// Moves successful statement effects into transaction effects.
     #[inline]
-    pub(crate) fn merge_effects_into(&mut self, trx_effects: &mut TrxEffects) {
-        self.effects.merge_into_trx_effects(trx_effects);
+    pub(crate) fn merge_effects(&mut self) {
+        self.effects
+            .merge_into_trx_effects(self.checkout.inner_mut().effects_mut());
     }
 
     /// Rolls back statement-local effects after an ordinary callback error.
@@ -438,17 +454,17 @@ impl<'stmt> Statement<'stmt> {
     #[inline]
     pub(crate) async fn rollback_effects(&mut self) -> Result<()> {
         let engine = self
-            .ctx
+            .ctx()
             .engine()
             .cloned()
             .ok_or_else(|| active_transaction_discarded_err("rollback statement effects"))?;
         let pool_guards = self
-            .ctx
+            .ctx()
             .pool_guards()
             .cloned()
             .ok_or_else(|| active_transaction_discarded_err("rollback statement effects"))?;
         let mut table_cache = TableCache::new(engine.catalog());
-        let sts = self.ctx.sts();
+        let sts = self.ctx().sts();
         if self
             .effects
             .rollback_index(&mut table_cache, &pool_guards, sts)
@@ -476,6 +492,13 @@ impl<'stmt> Statement<'stmt> {
         self.effects.clear_redo();
         Ok(())
     }
+
+    /// Clear fatal transaction state after statement rollback itself failed.
+    #[inline]
+    pub(crate) fn discard_after_fatal_rollback(&mut self) {
+        self.effects.clear_for_discard();
+        self.checkout.discard_after_fatal_rollback();
+    }
 }
 
 impl Drop for Statement<'_> {
@@ -496,7 +519,7 @@ pub(crate) mod tests {
     use crate::lock::tests::{debug_snapshot, try_acquire, try_acquire_grouped};
     use crate::session::{SessionState, TrxSessionRef};
     use crate::trx::undo::{OwnedRowUndo, RowUndoKind};
-    use crate::trx::{ActiveTrx, MIN_ACTIVE_TRX_ID};
+    use crate::trx::{MIN_ACTIVE_TRX_ID, Transaction};
     use error_stack::Report;
     use std::cell::Cell;
     use std::sync::Arc;
@@ -542,26 +565,30 @@ pub(crate) mod tests {
     #[inline]
     pub(crate) fn ctx_and_effects_mut<'stmt, 'borrow>(
         stmt: &'borrow mut Statement<'stmt>,
-    ) -> (&'stmt TrxContext, &'borrow mut StmtEffects) {
-        (stmt.ctx, &mut stmt.effects)
+    ) -> (&'borrow TrxContext, &'borrow mut StmtEffects) {
+        stmt.ctx_and_effects_mut()
     }
 
     #[inline]
-    fn trx_lock_owner(trx: &ActiveTrx) -> Result<LockOwner> {
-        Ok(trx
+    fn trx_lock_owner(trx: &mut Transaction) -> Result<LockOwner> {
+        let checkout = trx.checkout("read transaction lock owner")?;
+        Ok(checkout
+            .inner()
             .checked_lock_state("read transaction lock owner")?
             .owner())
     }
 
     #[inline]
     fn try_acquire_transaction_lock(
-        trx: &mut ActiveTrx,
+        trx: &mut Transaction,
         resource: LockResource,
         mode: LockMode,
     ) -> Result<bool> {
-        let lock_manager = trx.checked_lock_manager("try acquire transaction lock")?;
+        let mut checkout = trx.checkout("try acquire transaction lock")?;
+        let inner = checkout.inner_mut();
+        let lock_manager = inner.checked_lock_manager("try acquire transaction lock")?;
         try_acquire_owner_lock_state(
-            trx.checked_lock_state_mut("try acquire transaction lock")?,
+            inner.checked_lock_state_mut("try acquire transaction lock")?,
             &lock_manager,
             resource,
             mode,
@@ -578,11 +605,12 @@ pub(crate) mod tests {
         if lock_state.cached_covers(resource, mode)? {
             return Ok(true);
         }
-        let acquired = match lock_state.owner_group {
+        let owner = lock_state.owner();
+        let acquired = match lock_state.owner_group() {
             Some(owner_group) => {
-                try_acquire_grouped(lock_manager, resource, mode, lock_state.owner, owner_group)?
+                try_acquire_grouped(lock_manager, resource, mode, owner, owner_group)?
             }
-            None => try_acquire(lock_manager, resource, mode, lock_state.owner)?,
+            None => try_acquire(lock_manager, resource, mode, owner)?,
         };
         if acquired {
             lock_state.cache_granted(resource, mode);
@@ -611,14 +639,14 @@ pub(crate) mod tests {
         (temp_dir, engine)
     }
 
-    fn test_trx(engine: &Engine, sts: TrxID) -> (ActiveTrx, Arc<SessionState>) {
+    fn test_trx(engine: &Engine, sts: TrxID) -> (Transaction, Arc<SessionState>) {
         let engine_ref = engine.new_ref().unwrap();
         let session_id = engine_ref.next_session_id();
         let session_state = Arc::new(SessionState::new(engine_ref.clone(), session_id));
         let session =
             TrxSessionRef::new(engine_ref, &session_state, MIN_ACTIVE_TRX_ID + sts.as_u64());
         (
-            ActiveTrx::new(session, MIN_ACTIVE_TRX_ID + sts.as_u64(), sts, 0, 0),
+            Transaction::new(session, MIN_ACTIVE_TRX_ID + sts.as_u64(), sts, 0, 0),
             session_state,
         )
     }
@@ -655,7 +683,7 @@ pub(crate) mod tests {
         smol::block_on(async {
             let (_temp_dir, engine) = test_engine("redo_stmt_index_rollback_fail").await;
             let (mut trx, _session_state) = test_trx(&engine, TrxID::new(52));
-            let trx_owner = trx_lock_owner(&trx).unwrap();
+            let trx_owner = trx_lock_owner(&mut trx).unwrap();
             try_acquire_transaction_lock(
                 &mut trx,
                 LockResource::TableData(TableID::new(91_250)),
