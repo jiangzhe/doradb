@@ -21,7 +21,7 @@ use crate::row::RowRead;
 use crate::session::{Session, SessionDdlContext};
 use crate::table::{DeleteMarker, Table, TableRuntimeLayout, secondary_disk_tree_encoder};
 use crate::trx::redo::DDLRedo;
-use crate::trx::{ActiveTrx, trx_is_committed};
+use crate::trx::{Transaction, trx_is_committed};
 use crate::value::Val;
 use error_stack::Report;
 use std::collections::BTreeSet;
@@ -396,7 +396,7 @@ struct CreateIndexProgress<'a> {
     index_no: IndexNo,
     build_ts: TrxID,
     phase: CreateIndexBuildPhase,
-    trx: Option<ActiveTrx>,
+    trx: Option<Transaction>,
     staged_index: Option<Arc<SecondaryIndex<EvictableBufferPool>>>,
     new_layout: Option<TableRuntimeLayout>,
 }
@@ -408,7 +408,7 @@ impl<'a> CreateIndexProgress<'a> {
         guards: &'a PoolGuards,
         table_id: TableID,
         index_no: IndexNo,
-        trx: ActiveTrx,
+        trx: Transaction,
     ) -> Self {
         let build_ts = trx.sts();
         Self {
@@ -576,13 +576,13 @@ struct DropIndexProgress<'a> {
     table_id: TableID,
     index_no: IndexNo,
     phase: DropIndexBuildPhase,
-    trx: Option<ActiveTrx>,
+    trx: Option<Transaction>,
     new_layout: Option<TableRuntimeLayout>,
 }
 
 impl<'a> DropIndexProgress<'a> {
     #[inline]
-    fn new(engine: &'a EngineRef, table_id: TableID, index_no: IndexNo, trx: ActiveTrx) -> Self {
+    fn new(engine: &'a EngineRef, table_id: TableID, index_no: IndexNo, trx: Transaction) -> Self {
         Self {
             engine,
             table_id,
@@ -683,7 +683,7 @@ impl<'a> DropIndexProgress<'a> {
     }
 }
 
-async fn rollback_active_ddl_trx(trx: &mut Option<ActiveTrx>) -> Result<()> {
+async fn rollback_active_ddl_trx(trx: &mut Option<Transaction>) -> Result<()> {
     let Some(trx) = trx.take() else {
         return Ok(());
     };
@@ -1233,7 +1233,7 @@ async fn destroy_uninstalled_staged_index(
 #[inline]
 async fn execute_drop_index_catalog_update(
     engine: &EngineRef,
-    trx: &mut ActiveTrx,
+    trx: &mut Transaction,
     table_id: TableID,
     index_no: IndexNo,
     old_index_spec: &IndexSpec,
@@ -1280,7 +1280,7 @@ async fn execute_drop_index_catalog_update(
 #[inline]
 async fn execute_create_index_catalog_update(
     engine: &EngineRef,
-    trx: &mut ActiveTrx,
+    trx: &mut Transaction,
     table_id: TableID,
     index_no: IndexNo,
     metadata: &TableMetadata,
@@ -1496,7 +1496,7 @@ mod tests {
     use crate::row::ops::{DeleteMvcc, SelectKey};
     use crate::session::tests::SessionTestExt;
     use crate::table::{CheckpointOutcome, TablePersistence};
-    use crate::trx::{ActiveTrx, MAX_SNAPSHOT_TS};
+    use crate::trx::{MAX_SNAPSHOT_TS, Transaction};
     use crate::value::{Val, ValKind};
     use std::sync::Arc;
     use std::time::Duration;
@@ -2256,7 +2256,7 @@ mod tests {
             )
     }
 
-    async fn trx_insert_row(trx: &mut ActiveTrx, table: &Table, cols: Vec<Val>) -> Result<RowID> {
+    async fn trx_insert_row(trx: &mut Transaction, table: &Table, cols: Vec<Val>) -> Result<RowID> {
         trx.exec(async |stmt| stmt.table_insert_mvcc(table, cols).await)
             .await
     }

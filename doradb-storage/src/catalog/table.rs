@@ -14,7 +14,7 @@ use crate::row::{Row, RowRead};
 use crate::serde::{Deser, Ser, Serde};
 use crate::session::{Session, SessionDdlContext};
 use crate::table::Table;
-use crate::trx::ActiveTrx;
+use crate::trx::Transaction;
 use crate::trx::redo::DDLRedo;
 use crate::value::{Val, ValKind, ValType};
 use error_stack::Report;
@@ -302,7 +302,7 @@ struct CreateTableProgress {
     table_id: TableID,
     phase: CreateTablePhase,
     mutable_file: Option<MutableTableFile>,
-    trx: Option<ActiveTrx>,
+    trx: Option<Transaction>,
     table_file: Option<Arc<TableFile>>,
     staged_table: Option<Arc<Table>>,
 }
@@ -321,7 +321,7 @@ impl CreateTableProgress {
     }
 
     #[inline]
-    fn set_catalog_transaction(&mut self, trx: ActiveTrx) {
+    fn set_catalog_transaction(&mut self, trx: Transaction) {
         debug_assert!(self.trx.is_none());
         self.trx = Some(trx);
     }
@@ -597,7 +597,7 @@ async fn validated_drop_table_target(
 #[inline]
 async fn execute_create_table_catalog_staging(
     engine: &EngineRef,
-    trx: &mut ActiveTrx,
+    trx: &mut Transaction,
     table_id: TableID,
     table_object: TableObject,
     column_objects: Vec<ColumnObject>,
@@ -657,7 +657,7 @@ async fn execute_create_table_catalog_staging(
 #[inline]
 async fn execute_drop_table_catalog_cascade(
     engine: &EngineRef,
-    trx: &mut ActiveTrx,
+    trx: &mut Transaction,
     table_id: TableID,
     metadata: &TableMetadata,
 ) -> Result<()> {

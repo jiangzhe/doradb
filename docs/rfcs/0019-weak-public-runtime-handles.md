@@ -48,8 +48,8 @@ This RFC is also an opportunity to make the external lifecycle contract explicit
 The storage engine is async by design, so `Drop` on a public handle must not be
 the primary mechanism for closing sessions, committing or rolling back
 transactions, destroying tables, or shutting down the engine. Existing transaction
-code already follows this principle: `ActiveTrx::commit(self).await` and
-`ActiveTrx::rollback(self).await` are explicit async terminal paths, while `Drop`
+code already follows this principle: `Transaction::commit(self).await` and
+`Transaction::rollback(self).await` are explicit async terminal paths, while `Drop`
 asserts that effects and locks have already been cleared. The new public handle
 model generalizes that explicit-teardown rule across sessions, transactions, and
 tables. [D3] [C5] [U1]
@@ -71,7 +71,7 @@ Issue Labels:
   requirement that live external `EngineRef`/session holders drain before owner
   shutdown.
 - [D3] `docs/transaction-system.md` - transaction lifecycle, closure-based
-  `ActiveTrx::exec`, explicit commit/rollback, logical lock ownership, and
+  `Transaction::exec`, explicit commit/rollback, logical lock ownership, and
   ordered commit semantics.
 - [D4] `docs/table-file.md` - proof-gated runtime root access and the
   distinction between runtime foreground access and unchecked internal
@@ -98,24 +98,24 @@ Issue Labels:
 ### Code References
 
 - [C1] `doradb-storage/src/lib.rs` - current public exports include
-  `EngineRef`, `Session`, `Table`, `ActiveTrx`, and `Transaction`.
+  `Engine`, `EngineRef`, `Session`, `Table`, and `Transaction`.
 - [C2] `doradb-storage/src/engine.rs` - `Engine`, cloneable `EngineRef`,
   `EngineInner`, lifecycle admission, shutdown-busy strong-count check, and
   public `new_ref`, `new_session`, and `get_table` entry points.
 - [C3] `doradb-storage/src/session.rs` - `Session` owns `Arc<SessionState>`,
   `SessionState` stores a strong `EngineRef`, session methods return strong
-  `ActiveTrx`/`Arc<Table>` handles, and current mutating session APIs such as
+  `Transaction`/`Arc<Table>` handles, and current mutating session APIs such as
   `begin_trx(&mut self)` rely on public session receiver mutability.
 - [C4] `doradb-storage/src/catalog/mod.rs` - `Catalog` owns `Arc<Table>`
   runtimes in `user_tables`, clones those arcs for lookup, validates foreground
   table liveness, and caches strong table references in internal rollback/purge
   helpers.
-- [C5] `doradb-storage/src/trx/mod.rs` - `ActiveTrx` stores session-backed
+- [C5] `doradb-storage/src/trx/mod.rs` - `Transaction` stores session-backed
   strong runtime reachability, owns mutable transaction effects and locks,
   exposes `exec(&mut self)`, uses explicit consuming async `commit`/`rollback`,
   and only asserts terminal cleanup in `Drop`.
 - [C6] `doradb-storage/src/trx/stmt.rs` - `Statement` is already
-  closure-scoped by `ActiveTrx::exec`, borrows transaction lock state and
+  closure-scoped by `Transaction::exec`, borrows transaction lock state and
   statement effects for the callback, accepts borrowed `&Table` today, and
   releases statement-owned locks from `Drop`.
 - [C7] `doradb-storage/src/component.rs` - `ComponentRegistry` owns components,
@@ -511,7 +511,7 @@ the RFC should still reference that outcome during resolve. [B1] [B2]
 ### Alternative D: Keep Public Strong Handles But Add Explicit Close APIs
 
 - Summary: Add `close`, `commit`, `rollback`, and `shutdown` expectations while
-  keeping `EngineRef`, `Session`, `ActiveTrx`, and `Arc<Table>` strong.
+  keeping `EngineRef`, `Session`, `Transaction`, and `Arc<Table>` strong.
 - Analysis: This improves API documentation but does not solve lifecycle
   ownership. Users could still clone or retain strong handles that keep engine
   runtime objects alive, forcing shutdown/drop to handle public strong owners.
@@ -530,7 +530,7 @@ the RFC should still reference that outcome during resolve. [B1] [B2]
   it weakens the current useful API contract that prevents overlapping
   transaction operations through the same handle. It also risks adding avoidable
   scheduling, queueing, or synchronization overhead to foreground paths that are
-  already structured around closure-scoped `ActiveTrx::exec` and borrowed
+  already structured around closure-scoped `Transaction::exec` and borrowed
   `Statement` access. [D3] [D6] [C5] [C6] [U6] [U11]
 - Why Not Chosen: The RFC preserves `&mut self` where it expresses exclusive
   use of the public capability and recovers real mutable runtime access through
@@ -672,8 +672,8 @@ code is visible.
 
 - **Phase 4: Transaction Terminal Ownership Preparation**
   - Scope: Prepare transaction lifecycle ownership for the future weak
-    transaction handle while preserving the current public `ActiveTrx`/
-    `Transaction` ownership boundary. Define the explicit terminal-operation
+    transaction handle while preserving the current public `Transaction` facade
+    and explicit ownership boundary. Define the explicit terminal-operation
     state machine, operation checkout rules, runtime pin ownership, and shutdown
     interaction needed before abandoned transaction cleanup can be automated.
   - Goals: Keep `commit().await` and `rollback().await` as the only
@@ -701,7 +701,7 @@ code is visible.
     transaction handle may still be the existing strong owner, and abandoned
     transaction rollback is still not automated unless this phase explicitly
     proves a bounded synchronous cleanup path.
-  - Non-goals: Do not replace public `ActiveTrx`/`Transaction` with a weak
+  - Non-goals: Do not replace the public `Transaction` facade with a weak
     transaction handle. Do not add a background abandoned-rollback queue,
     cleanup worker, async cleanup executor, or public-handle-drop rollback
     handoff. Do not redesign MVCC, redo, group commit, rollback, or logical lock
@@ -714,8 +714,8 @@ code is visible.
 
 - **Phase 5: Transaction Stable Entry And Operation Lease**
   - Scope: Move strong active transaction state into session-owned stable
-    transaction entries while preserving the current public `ActiveTrx`/
-    `Transaction` facade and explicit `commit().await`/`rollback().await`
+    transaction entries while preserving the current public `Transaction` facade
+    and explicit `commit().await`/`rollback().await`
     terminal APIs. Add operation leases for checked-out mutable transaction work
     and make transaction lifecycle visible to session cleanup and shutdown.
   - Goals: Store active transaction cores in stable session-owned entries
@@ -731,7 +731,7 @@ code is visible.
     safety. The session registry can host a stable transaction entry without
     creating a session-to-engine strong cycle.
   - Phase-local Choices: Choose the stable transaction entry layout and mutable
-    core field split; decide whether the public `ActiveTrx` facade keeps a
+    core field split; decide whether the public `Transaction` facade keeps a
     transitional runtime pin or resolves through the owning session entry per
     operation; define lease drop behavior for active, checked-out, preparing,
     committing, rolling-back, terminal, and failed states; define how shutdown
@@ -748,8 +748,8 @@ code is visible.
     rollback executor. Do not redesign MVCC, redo, group commit, rollback, or
     logical lock semantics beyond routing ownership through stable entries and
     applying the Phase 4 terminal-operation contract.
-  - Task Doc: `docs/tasks/TBD.md`
-  - Task Issue: `#0`
+  - Task Doc: `docs/tasks/000167-transaction-stable-entry-operation-lease.md`
+  - Task Issue: `#681`
   - Phase Status: `pending`
   - Implementation Summary: `pending`
 

@@ -4,6 +4,8 @@
 //! catalog, table metadata, and table data resources independently from the
 //! engine/session/transaction lifecycle wiring that later phases will add.
 
+mod state;
+
 use crate::component::{Component, ComponentRegistry, ShelfScope};
 use crate::error::{OperationError, Result};
 use crate::id::{SessionID, TableID, TrxID};
@@ -15,6 +17,8 @@ use parking_lot::Mutex;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
+
+pub(crate) use state::OwnerLockState;
 
 /// Statement number for statement-owned logical locks.
 pub(crate) type StmtNo = u64;

@@ -45,7 +45,7 @@ use crate::trx::stmt::tests as stmt_tests;
 use crate::trx::tests as trx_tests;
 use crate::trx::undo::RowUndoKind;
 use crate::trx::ver_map::RowPageState;
-use crate::trx::{ActiveTrx, MAX_SNAPSHOT_TS};
+use crate::trx::{MAX_SNAPSHOT_TS, Transaction};
 use crate::value::{Val, ValKind};
 use error_stack::Report;
 use std::cell::{Cell, RefCell};
@@ -279,18 +279,22 @@ async fn stmt_select_row_mvcc(
         .await
 }
 
-async fn trx_insert_row(trx: &mut ActiveTrx, table: &Table, cols: Vec<Val>) -> Result<RowID> {
+async fn trx_insert_row(trx: &mut Transaction, table: &Table, cols: Vec<Val>) -> Result<RowID> {
     trx.exec(async |stmt| stmt_insert_row(stmt, table, cols).await)
         .await
 }
 
-async fn trx_delete_row(trx: &mut ActiveTrx, table: &Table, key: &SelectKey) -> Result<DeleteMvcc> {
+async fn trx_delete_row(
+    trx: &mut Transaction,
+    table: &Table,
+    key: &SelectKey,
+) -> Result<DeleteMvcc> {
     trx.exec(async |stmt| stmt_delete_row(stmt, table, key).await)
         .await
 }
 
 async fn trx_update_row(
-    trx: &mut ActiveTrx,
+    trx: &mut Transaction,
     table: &Table,
     key: &SelectKey,
     update: Vec<UpdateCol>,
@@ -300,7 +304,7 @@ async fn trx_update_row(
 }
 
 async fn trx_select_row_mvcc(
-    trx: &mut ActiveTrx,
+    trx: &mut Transaction,
     table: &Table,
     key: &SelectKey,
     user_read_set: &[usize],
@@ -7285,7 +7289,8 @@ fn test_checkpoint_readiness_uses_root_effective_ts_not_checkpoint_start_ts() {
         insert_rows(&sys, &mut session, 0, 120, "effective-delay").await;
 
         sys.table.freeze(&session, usize::MAX).await.unwrap();
-        let reader_holder: Rc<RefCell<Option<(Session, ActiveTrx)>>> = Rc::new(RefCell::new(None));
+        let reader_holder: Rc<RefCell<Option<(Session, Transaction)>>> =
+            Rc::new(RefCell::new(None));
         let reader_sts = Rc::new(Cell::new(TrxID::new(0)));
         let hook_reader_holder = Rc::clone(&reader_holder);
         let hook_reader_sts = Rc::clone(&reader_sts);
@@ -8605,7 +8610,7 @@ impl TestSys {
     }
 
     #[inline]
-    async fn trx_insert(&self, mut trx: ActiveTrx, insert: Vec<Val>) -> ActiveTrx {
+    async fn trx_insert(&self, mut trx: Transaction, insert: Vec<Val>) -> Transaction {
         let res = trx_insert_row(&mut trx, &self.table, insert).await;
         if res.is_err() {
             panic!("res={:?}", res);
@@ -8621,7 +8626,7 @@ impl TestSys {
     }
 
     #[inline]
-    async fn trx_delete(&self, mut trx: ActiveTrx, key: &SelectKey) -> ActiveTrx {
+    async fn trx_delete(&self, mut trx: Transaction, key: &SelectKey) -> Transaction {
         let res = trx_delete_row(&mut trx, &self.table, key).await;
         if !matches!(res, Ok(DeleteMvcc::Deleted)) {
             panic!("res={:?}", res);
@@ -8639,10 +8644,10 @@ impl TestSys {
     #[inline]
     async fn trx_update(
         &self,
-        mut trx: ActiveTrx,
+        mut trx: Transaction,
         key: &SelectKey,
         update: Vec<UpdateCol>,
-    ) -> ActiveTrx {
+    ) -> Transaction {
         let res = trx_update_row(&mut trx, &self.table, key, update).await;
         if !matches!(res, Ok(UpdateMvcc::Updated(_))) {
             panic!("res={:?}", res);
@@ -8670,7 +8675,7 @@ impl TestSys {
     }
 
     #[inline]
-    async fn trx_select_not_found(&self, mut trx: ActiveTrx, key: &SelectKey) -> ActiveTrx {
+    async fn trx_select_not_found(&self, mut trx: Transaction, key: &SelectKey) -> Transaction {
         let res = trx_select_row_mvcc(&mut trx, &self.table, key, &[0, 1]).await;
         assert!(matches!(res, Ok(SelectMvcc::NotFound)));
         trx
@@ -8679,10 +8684,10 @@ impl TestSys {
     #[inline]
     async fn trx_select<F: FnOnce(Vec<Val>)>(
         &self,
-        mut trx: ActiveTrx,
+        mut trx: Transaction,
         key: &SelectKey,
         action: F,
-    ) -> ActiveTrx {
+    ) -> Transaction {
         let res = trx_select_row_mvcc(&mut trx, &self.table, key, &[0, 1]).await;
         if !matches!(res, Ok(SelectMvcc::Found(_))) {
             panic!("res={:?}", res);
@@ -8714,7 +8719,7 @@ fn single_key<V: Into<Val>>(value: V) -> SelectKey {
     }
 }
 
-async fn scan_table_i32s(trx: &mut ActiveTrx, table: &Table) -> Vec<i32> {
+async fn scan_table_i32s(trx: &mut Transaction, table: &Table) -> Vec<i32> {
     let mut rows = Vec::new();
     trx.exec(async |stmt| {
         stmt.table_scan_mvcc(table, &[0], |vals| {
@@ -8730,7 +8735,7 @@ async fn scan_table_i32s(trx: &mut ActiveTrx, table: &Table) -> Vec<i32> {
     rows
 }
 
-async fn scan_table_pairs(trx: &mut ActiveTrx, table: &Table) -> Vec<(i32, String)> {
+async fn scan_table_pairs(trx: &mut Transaction, table: &Table) -> Vec<(i32, String)> {
     let mut rows = Vec::new();
     trx.exec(async |stmt| {
         stmt.table_scan_mvcc(table, &[0, 1], |vals| {

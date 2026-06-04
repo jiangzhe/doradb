@@ -124,12 +124,12 @@ mod tests {
     use crate::buffer::{BufferPool, PoolGuards, PoolRole};
     use crate::catalog::tests::{open_catalog_test_engine, table1};
     use crate::session::tests::SessionTestExt;
-    use crate::trx::ActiveTrx;
+    use crate::trx::Transaction;
     use crate::trx::redo::DDLRedo;
     use tempfile::TempDir;
 
-    fn mark_catalog_ddl(trx: &mut ActiveTrx, ddl: DDLRedo) {
-        let old = trx.effects_mut().redo_mut().ddl.replace(Box::new(ddl));
+    fn mark_catalog_ddl(trx: &mut Transaction, ddl: DDLRedo) {
+        let old = trx.set_ddl_redo(ddl).unwrap();
         debug_assert!(old.is_none());
     }
 

@@ -16,7 +16,9 @@ use crate::trx::log_replay::MmapLogReader;
 use crate::trx::purge::{DroppedTableFileDeleteItem, DroppedTableQueue, GC, Purge, TableRootQueue};
 use crate::trx::redo::RedoLogs;
 use crate::trx::sys_trx::SysTrx;
-use crate::trx::{ActiveTrx, MAX_SNAPSHOT_TS, MIN_ACTIVE_TRX_ID, MIN_SNAPSHOT_TS, PreparedTrx};
+use crate::trx::{
+    MAX_SNAPSHOT_TS, MIN_ACTIVE_TRX_ID, MIN_SNAPSHOT_TS, PreparedTrx, Transaction, TrxEntryState,
+};
 use crossbeam_utils::CachePadded;
 use error_stack::Report;
 use flume::{Receiver, Sender};
@@ -241,7 +243,7 @@ impl TransactionSystem {
         &self,
         engine: EngineRef,
         session_state: &Arc<SessionState>,
-    ) -> ActiveTrx {
+    ) -> Transaction {
         // Assign log partition index so current transaction will stick
         // to certain log partition for commit.
         let log_no = self.next_log_no();
@@ -269,7 +271,7 @@ impl TransactionSystem {
         }
         drop(g); // release bucket lock.
         let session = TrxSessionRef::new(engine, session_state, trx_id);
-        ActiveTrx::new(session, trx_id, sts, log_no, gc_no)
+        Transaction::new(session, trx_id, sts, log_no, gc_no)
     }
 
     /// Returns next log(partition) number.
@@ -296,16 +298,18 @@ impl TransactionSystem {
     /// leader to persist log and backfill CTS.
     /// This strategy can largely reduce logging IO, therefore improve throughput.
     #[inline]
-    pub(crate) async fn commit(&self, trx: ActiveTrx) -> Result<TrxID> {
+    pub(crate) async fn commit_transaction(&self, mut trx: Transaction) -> Result<TrxID> {
         if let Err(err) = self.ensure_runtime_healthy() {
-            self.rollback(trx).await?;
+            self.rollback_transaction(trx).await?;
             return Err(err.into());
         }
         // Prepare redo log first, this may take some time,
         // so keep it out of lock scope, and we can fill cts after the lock is held.
-        trx.debug_assert_redo_invariants();
-        let partition = &*self.log_partitions[trx.log_no()];
-        let prepared_trx = trx.prepare()?;
+        let inner =
+            trx.take_inner_for_terminal(TrxEntryState::Committing, "commit active transaction")?;
+        inner.debug_assert_redo_invariants();
+        let partition = &*self.log_partitions[inner.log_no()];
+        let prepared_trx = inner.prepare()?;
         if !prepared_trx.require_ordered_commit() {
             // No runtime effects means there is no CTS to publish and no commit
             // order to preserve. Effects without redo still enter group commit
@@ -338,11 +342,13 @@ impl TransactionSystem {
 
     /// Rollback active transaction.
     #[inline]
-    pub(crate) async fn rollback(&self, mut trx: ActiveTrx) -> Result<()> {
-        let sts = trx.sts();
-        let log_no = trx.log_no();
-        let gc_no = trx.gc_no();
-        let pool_guards = trx
+    pub(crate) async fn rollback_transaction(&self, mut trx: Transaction) -> Result<()> {
+        let mut inner =
+            trx.take_inner_for_terminal(TrxEntryState::RollingBack, "rollback active transaction")?;
+        let sts = inner.sts();
+        let log_no = inner.log_no();
+        let gc_no = inner.gc_no();
+        let pool_guards = inner
             .pool_guards()
             .ok_or_else(|| {
                 Report::new(InternalError::ActiveTransactionDiscarded)
@@ -350,28 +356,33 @@ impl TransactionSystem {
             })?
             .clone();
         let mut table_cache = TableCache::new(&self.catalog);
-        if trx
+        if inner
             .index_undo_mut()
             .rollback(&mut table_cache, &pool_guards, sts)
             .await
             .is_err()
         {
-            trx.discard_after_fatal_rollback();
+            trx.entry.publish_state(TrxEntryState::Failed);
+            inner.discard_after_fatal_rollback();
+            trx.entry.finish(TrxEntryState::Failed);
             return Err(self.poison_storage(FatalError::RollbackAccess).into());
         }
-        if trx
+        if inner
             .row_undo_mut()
             .rollback(&mut table_cache, &pool_guards, sts)
             .await
             .is_err()
         {
-            trx.discard_after_fatal_rollback();
+            trx.entry.publish_state(TrxEntryState::Failed);
+            inner.discard_after_fatal_rollback();
+            trx.entry.finish(TrxEntryState::Failed);
             return Err(self.poison_storage(FatalError::RollbackAccess).into());
         }
-        trx.effects_mut().clear_for_rollback();
+        inner.effects_mut().clear_for_rollback();
         self.log_partitions[log_no].gc_buckets[gc_no].gc_analyze_rollback(sts);
-        trx.release_transaction_locks();
-        trx.finish_session_rollback();
+        inner.release_transaction_locks();
+        inner.finish_session_rollback();
+        trx.entry.finish(TrxEntryState::Terminal);
         Ok(())
     }
 

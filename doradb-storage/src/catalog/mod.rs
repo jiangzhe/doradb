@@ -696,7 +696,7 @@ pub(crate) mod tests {
     use crate::index::{COLUMN_BLOCK_HEADER_SIZE, COLUMN_BLOCK_LEAF_HEADER_SIZE, ColumnBlockIndex};
     use crate::table::TablePersistence;
     use crate::trx::redo::DDLRedo;
-    use crate::trx::{ActiveTrx, MIN_SNAPSHOT_TS};
+    use crate::trx::{MIN_SNAPSHOT_TS, Transaction};
     use crate::value::{Val, ValKind};
     use semistr::SemiStr;
     use std::fs::OpenOptions;
@@ -942,8 +942,8 @@ pub(crate) mod tests {
         }
     }
 
-    fn mark_catalog_ddl(trx: &mut ActiveTrx, ddl: DDLRedo) {
-        let old = trx.effects_mut().redo_mut().ddl.replace(Box::new(ddl));
+    fn mark_catalog_ddl(trx: &mut Transaction, ddl: DDLRedo) {
+        let old = trx.set_ddl_redo(ddl).unwrap();
         debug_assert!(old.is_none());
     }
 

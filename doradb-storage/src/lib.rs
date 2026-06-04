@@ -47,5 +47,5 @@ pub use table::{
     CheckpointCancelReason, CheckpointDelayReason, CheckpointOutcome, CheckpointReadiness, Table,
     TablePersistence,
 };
-pub use trx::{ActiveTrx, Statement, Transaction};
+pub use trx::{Statement, Transaction};
 pub use value::{MemVar, Val, ValKind, ValType};
