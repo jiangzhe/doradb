@@ -17,7 +17,7 @@ use crate::latch::LatchFallbackMode;
 use crate::quiescent::QuiescentGuard;
 use crate::row::ops::{DeleteMvcc, InsertIndex, LinkForUniqueIndex, SelectKey};
 use crate::row::{Row, RowPage, RowRead, estimate_max_row_count, var_len_for_insert};
-use crate::trx::TrxContext;
+use crate::trx::TrxRuntime;
 use crate::trx::redo::{RowRedo, RowRedoKind};
 use crate::trx::row::{
     FindOldVersion, LockRowForWrite, LockUndo, ReadAllRows, RowReadAccess, RowWriteAccess,
@@ -785,60 +785,60 @@ impl MemTable<FixedBufferPool, FixedBufferPool> {
     }
 
     #[inline]
-    fn debug_assert_table_write_lock_held(&self, ctx: &TrxContext) {
-        ctx.debug_assert_table_write_lock_held(self.table_id());
+    fn debug_assert_table_write_lock_held(&self, rt: TrxRuntime<'_>) {
+        rt.debug_assert_table_write_lock_held(self.table_id());
     }
 
     #[inline]
     fn push_insert_unique_index_undo(
         &self,
-        ctx: &TrxContext,
+        rt: TrxRuntime<'_>,
         effects: &mut StmtEffects,
         row_id: RowID,
         key: SelectKey,
         merge_old_deleted: bool,
     ) {
-        self.debug_assert_table_write_lock_held(ctx);
+        self.debug_assert_table_write_lock_held(rt);
         effects.push_insert_unique_index_undo(self.table_id(), row_id, key, merge_old_deleted);
     }
 
     #[inline]
     fn push_insert_non_unique_index_undo(
         &self,
-        ctx: &TrxContext,
+        rt: TrxRuntime<'_>,
         effects: &mut StmtEffects,
         row_id: RowID,
         key: SelectKey,
         merge_old_deleted: bool,
     ) {
-        self.debug_assert_table_write_lock_held(ctx);
+        self.debug_assert_table_write_lock_held(rt);
         effects.push_insert_non_unique_index_undo(self.table_id(), row_id, key, merge_old_deleted);
     }
 
     #[inline]
     fn push_delete_index_undo(
         &self,
-        ctx: &TrxContext,
+        rt: TrxRuntime<'_>,
         effects: &mut StmtEffects,
         row_id: RowID,
         key: SelectKey,
         unique: bool,
     ) {
-        self.debug_assert_table_write_lock_held(ctx);
+        self.debug_assert_table_write_lock_held(rt);
         effects.push_delete_index_undo(self.table_id(), row_id, key, unique);
     }
 
     #[inline]
     fn push_update_unique_index_undo(
         &self,
-        ctx: &TrxContext,
+        rt: TrxRuntime<'_>,
         effects: &mut StmtEffects,
         old_row_id: RowID,
         new_row_id: RowID,
         key: SelectKey,
         old_deleted: bool,
     ) {
-        self.debug_assert_table_write_lock_held(ctx);
+        self.debug_assert_table_write_lock_held(rt);
         effects.push_update_unique_index_undo(
             self.table_id(),
             old_row_id,
@@ -906,7 +906,7 @@ impl MemTable<FixedBufferPool, FixedBufferPool> {
     #[inline]
     async fn insert_index(
         &self,
-        ctx: &TrxContext,
+        rt: TrxRuntime<'_>,
         effects: &mut StmtEffects,
         key: SelectKey,
         row_id: RowID,
@@ -918,18 +918,17 @@ impl MemTable<FixedBufferPool, FixedBufferPool> {
             .require_index_spec(key.index_no)?
             .unique()
         {
-            self.insert_unique_index(ctx, effects, key, row_id, page_guard)
+            self.insert_unique_index(rt, effects, key, row_id, page_guard)
                 .await
         } else {
-            self.insert_non_unique_index(ctx, effects, key, row_id)
-                .await
+            self.insert_non_unique_index(rt, effects, key, row_id).await
         }
     }
 
     #[inline]
     async fn insert_row_internal(
         &self,
-        ctx: &TrxContext,
+        rt: TrxRuntime<'_>,
         effects: &mut StmtEffects,
         mut insert: Vec<Val>,
         mut undo_kind: RowUndoKind,
@@ -939,9 +938,9 @@ impl MemTable<FixedBufferPool, FixedBufferPool> {
         let row_len = row_len(metadata, &insert);
         let row_count = estimate_max_row_count(row_len, metadata.col.col_count());
         loop {
-            let page_guard = self.get_insert_page(ctx, row_count).await?;
+            let page_guard = self.get_insert_page(rt, row_count).await?;
             match self.insert_row_to_page(
-                ctx,
+                rt,
                 effects,
                 page_guard,
                 insert,
@@ -949,7 +948,7 @@ impl MemTable<FixedBufferPool, FixedBufferPool> {
                 index_branches,
             ) {
                 InsertRowIntoPage::Ok(row_id, page_guard) => {
-                    ctx.save_active_insert_page(
+                    rt.save_active_insert_page(
                         self.table_id(),
                         page_guard.versioned_page_id(),
                         row_id,
@@ -968,7 +967,7 @@ impl MemTable<FixedBufferPool, FixedBufferPool> {
     #[inline]
     fn insert_row_to_page(
         &self,
-        ctx: &TrxContext,
+        rt: TrxRuntime<'_>,
         effects: &mut StmtEffects,
         page_guard: PageSharedGuard<RowPage>,
         cols: Vec<Val>,
@@ -1000,12 +999,12 @@ impl MemTable<FixedBufferPool, FixedBufferPool> {
             page,
             page_ctx,
             row_idx,
-            Some(ctx.sts()),
+            Some(rt.sts()),
             true,
             state_guard,
         );
         let res = access.lock_undo(
-            ctx,
+            rt,
             effects,
             metadata,
             self.table_id(),
@@ -1049,11 +1048,11 @@ impl MemTable<FixedBufferPool, FixedBufferPool> {
     #[inline]
     async fn get_insert_page(
         &self,
-        ctx: &TrxContext,
+        rt: TrxRuntime<'_>,
         row_count: usize,
     ) -> Result<PageSharedGuard<RowPage>> {
-        let guards = ctx.require_pool_guards("catalog get insert page")?;
-        if let Some((page_id, row_id)) = ctx.load_active_insert_page(self.table_id()) {
+        let guards = rt.pool_guards();
+        if let Some((page_id, row_id)) = rt.load_active_insert_page(self.table_id()) {
             let page_guard = self.get_row_page_versioned_shared(guards, page_id).await?;
             if let Some(page_guard) = page_guard
                 && validate_page_row_range(&page_guard, page_id.page_id, row_id)
@@ -1068,7 +1067,7 @@ impl MemTable<FixedBufferPool, FixedBufferPool> {
     #[inline]
     async fn lock_row_for_write<'b>(
         &self,
-        ctx: &TrxContext,
+        rt: TrxRuntime<'_>,
         effects: &mut StmtEffects,
         page_guard: &'b PageSharedGuard<RowPage>,
         row_id: RowID,
@@ -1085,12 +1084,12 @@ impl MemTable<FixedBufferPool, FixedBufferPool> {
                 page,
                 page_ctx,
                 page.row_idx(row_id),
-                Some(ctx.sts()),
+                Some(rt.sts()),
                 false,
                 state_guard,
             );
             let lock_undo = access.lock_undo(
-                ctx,
+                rt,
                 effects,
                 self.metadata(),
                 self.table_id(),
@@ -1115,14 +1114,14 @@ impl MemTable<FixedBufferPool, FixedBufferPool> {
     #[inline]
     async fn link_for_unique_index(
         &self,
-        ctx: &TrxContext,
+        rt: TrxRuntime<'_>,
         old_id: RowID,
         key: &SelectKey,
         new_id: RowID,
         new_guard: &PageSharedGuard<RowPage>,
     ) -> Result<LinkForUniqueIndex> {
         debug_assert!(old_id != new_id);
-        let guards = ctx.require_pool_guards("catalog link unique index")?;
+        let guards = rt.pool_guards();
         let (old_guard, old_id) = loop {
             match self.find_row(guards, old_id).await {
                 Ok(RowLocation::NotFound) => return Ok(LinkForUniqueIndex::NotNeeded),
@@ -1144,7 +1143,7 @@ impl MemTable<FixedBufferPool, FixedBufferPool> {
         let metadata = self.metadata();
         let (page_ctx, page) = old_guard.ctx_and_page();
         let old_access = RowReadAccess::new(page, page_ctx, page.row_idx(old_id));
-        match old_access.find_old_version_for_unique_key(metadata, key, ctx) {
+        match old_access.find_old_version_for_unique_key(metadata, key, rt.ctx()) {
             FindOldVersion::None => Ok(LinkForUniqueIndex::NotNeeded),
             FindOldVersion::DuplicateKey => Ok(LinkForUniqueIndex::DuplicateKey),
             FindOldVersion::WriteConflict => Ok(LinkForUniqueIndex::WriteConflict),
@@ -1154,7 +1153,7 @@ impl MemTable<FixedBufferPool, FixedBufferPool> {
                     page,
                     page_ctx,
                     page.row_idx(new_id),
-                    Some(ctx.sts()),
+                    Some(rt.sts()),
                     false,
                 );
                 let undo_vals = new_access.row().calc_delta(metadata.col.as_ref(), &old_row);
@@ -1167,21 +1166,21 @@ impl MemTable<FixedBufferPool, FixedBufferPool> {
     #[inline]
     async fn insert_unique_index(
         &self,
-        ctx: &TrxContext,
+        rt: TrxRuntime<'_>,
         effects: &mut StmtEffects,
         key: SelectKey,
         row_id: RowID,
         page_guard: &PageSharedGuard<RowPage>,
     ) -> Result<InsertIndex> {
-        let sts = ctx.sts();
-        let guards = ctx.require_pool_guards("catalog insert unique index")?;
+        let sts = rt.sts();
+        let guards = rt.pool_guards();
         loop {
             match self
                 .unique_insert_if_not_exists(guards, &key, row_id, false, sts)
                 .await?
             {
                 IndexInsert::Ok(merged) => {
-                    self.push_insert_unique_index_undo(ctx, effects, row_id, key, merged);
+                    self.push_insert_unique_index_undo(rt, effects, row_id, key, merged);
                     return Ok(InsertIndex::Inserted);
                 }
                 IndexInsert::DuplicateKey(old_row_id, deleted) => {
@@ -1190,7 +1189,7 @@ impl MemTable<FixedBufferPool, FixedBufferPool> {
                         return Ok(InsertIndex::DuplicateKey);
                     }
                     match self
-                        .link_for_unique_index(ctx, old_row_id, &key, row_id, page_guard)
+                        .link_for_unique_index(rt, old_row_id, &key, row_id, page_guard)
                         .await?
                     {
                         LinkForUniqueIndex::DuplicateKey => return Ok(InsertIndex::DuplicateKey),
@@ -1215,7 +1214,7 @@ impl MemTable<FixedBufferPool, FixedBufferPool> {
                             {
                                 IndexCompareExchange::Ok => {
                                     self.push_update_unique_index_undo(
-                                        ctx, effects, old_row_id, row_id, key, deleted,
+                                        rt, effects, old_row_id, row_id, key, deleted,
                                     );
                                     return Ok(InsertIndex::Inserted);
                                 }
@@ -1234,19 +1233,19 @@ impl MemTable<FixedBufferPool, FixedBufferPool> {
     #[inline]
     async fn insert_non_unique_index(
         &self,
-        ctx: &TrxContext,
+        rt: TrxRuntime<'_>,
         effects: &mut StmtEffects,
         key: SelectKey,
         row_id: RowID,
     ) -> Result<InsertIndex> {
-        let sts = ctx.sts();
-        let guards = ctx.require_pool_guards("catalog insert non-unique index")?;
+        let sts = rt.sts();
+        let guards = rt.pool_guards();
         match self
             .non_unique_insert_if_not_exists(guards, &key, row_id, false, sts)
             .await?
         {
             IndexInsert::Ok(merged) => {
-                self.push_insert_non_unique_index_undo(ctx, effects, row_id, key, merged);
+                self.push_insert_non_unique_index_undo(rt, effects, row_id, key, merged);
                 Ok(InsertIndex::Inserted)
             }
             IndexInsert::DuplicateKey(..) => unreachable!(),
@@ -1256,7 +1255,7 @@ impl MemTable<FixedBufferPool, FixedBufferPool> {
     #[inline]
     async fn delete_row_internal(
         &self,
-        ctx: &TrxContext,
+        rt: TrxRuntime<'_>,
         effects: &mut StmtEffects,
         page_guard: PageSharedGuard<RowPage>,
         row_id: RowID,
@@ -1269,7 +1268,7 @@ impl MemTable<FixedBufferPool, FixedBufferPool> {
             return DeleteInternal::NotFound;
         }
         let mut lock_row = self
-            .lock_row_for_write(ctx, effects, &page_guard, row_id, Some(key))
+            .lock_row_for_write(rt, effects, &page_guard, row_id, Some(key))
             .await;
         match &mut lock_row {
             LockRowForWrite::InvalidIndex => DeleteInternal::NotFound,
@@ -1302,7 +1301,7 @@ impl MemTable<FixedBufferPool, FixedBufferPool> {
     #[inline]
     async fn defer_delete_indexes(
         &self,
-        ctx: &TrxContext,
+        rt: TrxRuntime<'_>,
         effects: &mut StmtEffects,
         row_id: RowID,
         page_guard: &PageSharedGuard<RowPage>,
@@ -1313,14 +1312,14 @@ impl MemTable<FixedBufferPool, FixedBufferPool> {
             .active_indexes()
             .map(|(index_no, _)| read_latest_index_key(metadata, index_no, page_guard, row_id))
             .collect();
-        self.defer_delete_index_keys(ctx, effects, row_id, keys)
+        self.defer_delete_index_keys(rt, effects, row_id, keys)
             .await
     }
 
     #[inline]
     async fn defer_delete_index_keys(
         &self,
-        ctx: &TrxContext,
+        rt: TrxRuntime<'_>,
         effects: &mut StmtEffects,
         row_id: RowID,
         keys: Vec<SelectKey>,
@@ -1329,10 +1328,10 @@ impl MemTable<FixedBufferPool, FixedBufferPool> {
             let spec = self.metadata().idx.require_index_spec(key.index_no)?;
             debug_assert_eq!(self.sec_idx_is_unique(key.index_no), spec.unique());
             if spec.unique() {
-                self.defer_delete_unique_index(ctx, effects, row_id, key)
+                self.defer_delete_unique_index(rt, effects, row_id, key)
                     .await?;
             } else {
-                self.defer_delete_non_unique_index(ctx, effects, row_id, key)
+                self.defer_delete_non_unique_index(rt, effects, row_id, key)
                     .await?;
             }
         }
@@ -1342,36 +1341,36 @@ impl MemTable<FixedBufferPool, FixedBufferPool> {
     #[inline]
     async fn defer_delete_unique_index(
         &self,
-        ctx: &TrxContext,
+        rt: TrxRuntime<'_>,
         effects: &mut StmtEffects,
         row_id: RowID,
         key: SelectKey,
     ) -> Result<()> {
-        let sts = ctx.sts();
-        let guards = ctx.require_pool_guards("catalog defer delete unique index")?;
+        let sts = rt.sts();
+        let guards = rt.pool_guards();
         let res = self
             .unique_mask_as_deleted(guards, &key, row_id, sts)
             .await?;
         debug_assert!(res);
-        self.push_delete_index_undo(ctx, effects, row_id, key, true);
+        self.push_delete_index_undo(rt, effects, row_id, key, true);
         Ok(())
     }
 
     #[inline]
     async fn defer_delete_non_unique_index(
         &self,
-        ctx: &TrxContext,
+        rt: TrxRuntime<'_>,
         effects: &mut StmtEffects,
         row_id: RowID,
         key: SelectKey,
     ) -> Result<()> {
-        let sts = ctx.sts();
-        let guards = ctx.require_pool_guards("catalog defer delete non-unique index")?;
+        let sts = rt.sts();
+        let guards = rt.pool_guards();
         let res = self
             .non_unique_mask_as_deleted(guards, &key, row_id, sts)
             .await?;
         debug_assert!(res);
-        self.push_delete_index_undo(ctx, effects, row_id, key, false);
+        self.push_delete_index_undo(rt, effects, row_id, key, false);
         Ok(())
     }
 
@@ -1688,7 +1687,7 @@ impl MemTable<FixedBufferPool, FixedBufferPool> {
     #[inline]
     pub(crate) async fn insert_mvcc(
         &self,
-        ctx: &TrxContext,
+        rt: TrxRuntime<'_>,
         effects: &mut StmtEffects,
         cols: Vec<Val>,
     ) -> Result<RowID> {
@@ -1701,11 +1700,11 @@ impl MemTable<FixedBufferPool, FixedBufferPool> {
         });
         let keys = self.metadata().idx.keys_for_insert(&cols);
         let (row_id, page_guard) = self
-            .insert_row_internal(ctx, effects, cols, RowUndoKind::Insert, Vec::new())
+            .insert_row_internal(rt, effects, cols, RowUndoKind::Insert, Vec::new())
             .await?;
         for key in keys {
             match self
-                .insert_index(ctx, effects, key, row_id, &page_guard)
+                .insert_index(rt, effects, key, row_id, &page_guard)
                 .await?
             {
                 InsertIndex::Inserted => (),
@@ -1733,7 +1732,7 @@ impl MemTable<FixedBufferPool, FixedBufferPool> {
     #[inline]
     pub(crate) async fn delete_unique_mvcc(
         &self,
-        ctx: &TrxContext,
+        rt: TrxRuntime<'_>,
         effects: &mut StmtEffects,
         key: &SelectKey,
         log_by_key: bool,
@@ -1751,9 +1750,9 @@ impl MemTable<FixedBufferPool, FixedBufferPool> {
             key.index_no,
             &key.vals
         ));
-        let guards = ctx.require_pool_guards("catalog delete unique MVCC")?;
+        let guards = rt.pool_guards();
         loop {
-            let lookup_sts = ctx.sts();
+            let lookup_sts = rt.sts();
             let (page_guard, row_id) = match self.unique_lookup(guards, key, lookup_sts).await? {
                 None => return Ok(DeleteMvcc::NotFound),
                 Some((row_id, _)) => match self.find_row(guards, row_id).await {
@@ -1774,7 +1773,7 @@ impl MemTable<FixedBufferPool, FixedBufferPool> {
                 },
             };
             match self
-                .delete_row_internal(ctx, effects, page_guard, row_id, key, log_by_key)
+                .delete_row_internal(rt, effects, page_guard, row_id, key, log_by_key)
                 .await
             {
                 DeleteInternal::NotFound => return Ok(DeleteMvcc::NotFound),
@@ -1784,7 +1783,7 @@ impl MemTable<FixedBufferPool, FixedBufferPool> {
                     continue;
                 }
                 DeleteInternal::Ok(page_guard) => {
-                    self.defer_delete_indexes(ctx, effects, row_id, &page_guard)
+                    self.defer_delete_indexes(rt, effects, row_id, &page_guard)
                         .await?;
                     page_guard.set_dirty();
                     return Ok(DeleteMvcc::Deleted);

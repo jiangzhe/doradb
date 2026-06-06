@@ -136,34 +136,60 @@ For the detailed index design, see [`secondary-index.md`](./secondary-index.md).
 
 #### Execution Phase
 
-Runtime user-table root reads are bound through `TrxContext::read_proof()`.
-The proof is a typed witness minted from the reader transaction context and is
-used only to bind one synchronous observation of the current table-file root.
-Runtime helpers may then copy a single secondary `DiskTree` root id or build an
-owned `TableRootSnapshot` for broader MVCC and GC work. Checkpoint, recovery,
-catalog load, and file-internal root reads remain explicit unchecked
-exceptions outside this runtime transaction contract.
+Runtime user-table root reads are bound through the immutable
+`TrxContext::read_proof()` carried by `TrxRuntime`. The proof is a typed witness
+minted from the reader transaction context and is used only to bind one
+synchronous observation of the current table-file root. Runtime helpers may
+then copy a single secondary `DiskTree` root id or build an owned
+`TableRootSnapshot` for broader MVCC and GC work. Checkpoint, recovery, catalog
+load, and file-internal root reads remain explicit unchecked exceptions outside
+this runtime transaction contract.
 
 Each user statement runs through `Transaction::exec(async |stmt| { ... })`.
-The public `Transaction` is a facade over a session-owned stable transaction
-entry. The mutable transaction core lives in `TrxInner` and is checked out
-for one non-terminal operation through private `TrxCheckout` plumbing; ordinary
-`TrxCheckout` drop returns the core to the entry. `Statement` owns this checkout
-for statement execution, while commit, rollback, and fatal cleanup consume or
-clear terminal ownership directly.
-The entry remains visible to session cleanup and shutdown while it is `Active`,
-`CheckedOut`, `Committing`, `RollingBack`, `Terminal`, or `Failed`, without
-keeping a strong engine backreference inside the session-owned entry.
+The public `Transaction` is a weak, non-cloneable capability containing weak
+engine reachability plus `(SessionID, TrxID)`. It does not own `EngineRef`,
+`SessionState`, or the stable transaction entry. Public operations upgrade weak
+engine reachability internally, resolve the active entry through the session
+registry by `(SessionID, TrxID)`, and build an operation-local runtime
+attachment from the registry-owned session state before callbacks or `.await`
+points.
 
-`Statement` is a borrowed facade over immutable `TrxContext` and owned
+The mutable transaction core lives in `TrxInner` and is checked out for one
+non-terminal operation through private `TrxCheckout` plumbing; ordinary
+`TrxCheckout` drop returns the core to the entry. `TrxCheckout` owns the
+operation-local `TrxAttachment` and exposes a copyable `TrxRuntime` value that
+pairs the immutable `TrxContext` with runtime access to the engine, pool
+guards, and session-local insert-page cache. `TrxContext` never stores the
+attachment.
+`Statement` owns this checkout for statement execution. Explicit commit and
+rollback consume the public handle, suppress drop abandonment, and claim
+terminal ownership through private completion claims. Dropping a public
+transaction handle never rolls back inline; it marks the matching active entry
+abandoned and queues transaction-system cleanup when the engine is still
+reachable.
+
+The entry remains visible to session cleanup and shutdown while it is `Active`,
+`CheckedOut`, `CheckedOutAbandoned`, `Committing`, `RollingBack`, `Abandoned`,
+`CleanupRunning`, `Terminal`, or `Failed`, without keeping a strong engine
+backreference inside the session-owned entry. `CheckedOutAbandoned` records a
+handle or session abandonment that happened while foreground work owned the
+mutable core; returning the checkout publishes `Abandoned`. Abandoned cleanup
+uses completion claims only for `Abandoned` entries and performs
+rollback-equivalent undo, lock release, active-STS/GC bookkeeping, and matching
+session cleanup. Duplicate cleanup jobs are harmless because entry state, not
+queue uniqueness, authorizes cleanup.
+
+`Statement` is a borrowed facade over operation-local runtime access and owned
 statement-local `StmtEffects`; callers cannot construct or finish it directly.
-When the callback succeeds, statement row undo, index undo, and redo effects
-merge into the active transaction. When the callback returns an ordinary error,
-only the current statement effects are rolled back and the original error is
-returned. If that rollback cannot access required storage, the rollback failure
-is fatal: storage is poisoned, the session is marked out of transaction, and the
-transaction entry is marked failed so later commit or rollback attempts return an
-error.
+Foreground table APIs receive `TrxRuntime` by value when they need pool guards,
+insert-page cache access, or runtime lock assertions, while pure row MVCC
+helpers continue to receive `&TrxContext`. When the callback succeeds,
+statement row undo, index undo, and redo effects merge into the active
+transaction. When the callback returns an ordinary error, only the current
+statement effects are rolled back and the original error is returned. If that
+rollback cannot access required storage, the rollback failure is fatal: storage
+is poisoned, the session is marked out of transaction, and the transaction entry
+is marked failed so later commit or rollback attempts return an error.
 
 Logical lock ownership is tracked outside `TrxContext`. `Transaction` owns an
 `OwnerLockState` for the transaction owner that caches the strongest granted
@@ -274,6 +300,15 @@ Transaction-owned logical locks are not redo, undo, durability, or ordered
 commit effects by themselves. A transaction that only acquired logical locks
 still uses the readonly/no-op commit discard path, which releases those locks
 without assigning a commit timestamp.
+
+During engine shutdown, foreground admission closes first. Blocking shutdown
+then inspects session-owned transaction entries instead of relying on public
+transaction strong references. Live active entries keep shutdown waiting until
+the handle commits, rolls back, or is abandoned. Abandoned entries and active
+entries in abandoned sessions are queued for rollback-equivalent cleanup before
+component teardown. `try_shutdown()` remains nonblocking and returns
+`ShutdownBusy` while active, checked-out, checked-out-abandoned, committing,
+rolling-back, cleanup-running, or queued cleanup work remains.
 
 Recovery only treats checkpoint metadata, table roots, and real redo headers as
 stable timestamp carriers. A no-log ordered commit has a volatile CTS that is

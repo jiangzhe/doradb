@@ -48,7 +48,7 @@ impl SysTrx {
         PreparedTrx {
             redo_bin,
             payload: None,
-            session: None,
+            attachment: None,
             lock_manager: None,
             lock_state: None,
         }

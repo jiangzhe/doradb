@@ -1118,6 +1118,8 @@ impl TablePersistence for Table {
         let published_root = mutable_file.root();
         let published_pivot_row_id = published_root.pivot_row_id;
         let published_column_root = published_root.column_block_index_root;
+        #[cfg(test)]
+        super::tests::run_test_checkpoint_before_publish_hook().await;
         match trx_sys
             .publish_table_file_root(mutable_file, checkpoint_ts, false)
             .await

@@ -7,13 +7,16 @@ use crate::id::{RowID, SessionID, TableID, TrxID};
 use crate::lock::{LockManager, LockMode, LockOwner, LockOwnerGroup, LockResource};
 use crate::quiescent::QuiescentGuard;
 use crate::table::Table;
-use crate::trx::{Transaction, TrxEntry, TrxEntryState};
+use crate::trx::{
+    StartedTransaction, Transaction, TrxCleanupReason, TrxEntry, TrxEntryState,
+    transaction_discarded_err,
+};
 use dashmap::DashMap;
 use error_stack::Report;
+use event_listener::{Event, Listener, listener};
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::Weak;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 /// Shared session-level DDL admission context.
@@ -224,77 +227,6 @@ impl Drop for Session {
     }
 }
 
-#[cfg(test)]
-pub(crate) mod tests {
-    use super::*;
-
-    pub(crate) trait SessionTestExt {
-        fn pool_guards(&self) -> PoolGuards;
-        fn engine(&self) -> EngineRef;
-        fn last_cts(&self) -> TrxID;
-        fn load_active_insert_page(
-            &mut self,
-            table_id: TableID,
-        ) -> Option<(VersionedPageID, RowID)>;
-        fn save_active_insert_page(
-            &mut self,
-            table_id: TableID,
-            page_id: VersionedPageID,
-            row_id: RowID,
-        );
-    }
-
-    impl SessionTestExt for Session {
-        #[inline]
-        fn pool_guards(&self) -> PoolGuards {
-            self.pin("test session pool guards")
-                .expect("test session must be running")
-                .state
-                .pool_guards()
-                .clone()
-        }
-
-        #[inline]
-        fn engine(&self) -> EngineRef {
-            self.pin("test session engine")
-                .expect("test session must be running")
-                .engine
-        }
-
-        #[inline]
-        fn last_cts(&self) -> TrxID {
-            let pin = self
-                .pin("test session last commit timestamp")
-                .expect("test session must be running");
-            TrxID::new(pin.state.last_cts.load(Ordering::SeqCst))
-        }
-
-        #[inline]
-        fn load_active_insert_page(
-            &mut self,
-            table_id: TableID,
-        ) -> Option<(VersionedPageID, RowID)> {
-            self.pin("load active insert page")
-                .expect("test session must be running")
-                .state
-                .load_active_insert_page(table_id)
-        }
-
-        #[inline]
-        fn save_active_insert_page(
-            &mut self,
-            table_id: TableID,
-            page_id: VersionedPageID,
-            row_id: RowID,
-        ) {
-            self.pin("save active insert page")
-                .expect("test session must be running")
-                .state
-                .save_active_insert_page(table_id, page_id, row_id);
-        }
-    }
-}
-
 /// One operation-scoped strong pin of a registry-owned session.
 pub(crate) struct SessionPin {
     pub(crate) engine: EngineRef,
@@ -324,6 +256,8 @@ impl SessionPin {
 /// Engine-owned registry for strong session state.
 pub(crate) struct SessionRegistry {
     entries: DashMap<SessionID, Arc<SessionState>>,
+    trx_changed: Event,
+    trx_change_epoch: AtomicU64,
 }
 
 impl SessionRegistry {
@@ -332,6 +266,8 @@ impl SessionRegistry {
     pub(crate) fn new() -> Self {
         Self {
             entries: DashMap::new(),
+            trx_changed: Event::new(),
+            trx_change_epoch: AtomicU64::new(0),
         }
     }
 
@@ -379,18 +315,100 @@ impl SessionRegistry {
     #[inline]
     pub(crate) fn abandon(&self, id: SessionID) {
         self.modify_session(id, SessionState::abandon);
+        self.notify_trx_changed();
     }
 
     /// Apply session cleanup after a transaction commits.
     #[inline]
     pub(crate) fn finish_trx_commit(&self, id: SessionID, trx_id: TrxID, cts: TrxID) {
         self.modify_session(id, |state| state.finish_trx_commit(trx_id, cts));
+        self.notify_trx_changed();
     }
 
     /// Apply session cleanup after a transaction rolls back.
     #[inline]
     pub(crate) fn finish_trx_rollback(&self, id: SessionID, trx_id: TrxID) {
         self.modify_session(id, |state| state.finish_trx_rollback(trx_id));
+        self.notify_trx_changed();
+    }
+
+    /// Resolve an active transaction by session and transaction id.
+    #[inline]
+    pub(crate) fn resolve_trx(
+        &self,
+        session_id: SessionID,
+        trx_id: TrxID,
+        operation: &'static str,
+    ) -> Result<(Arc<TrxEntry>, Arc<SessionState>)> {
+        let session = self
+            .session_state(session_id)
+            .ok_or_else(|| stale_session_error(session_id, operation))?;
+        let entry = session.resolve_trx(trx_id, operation)?;
+        Ok((entry, session))
+    }
+
+    /// Mark a public transaction handle abandoned if it still names the active entry.
+    #[inline]
+    pub(crate) fn abandon_trx_handle(&self, session_id: SessionID, trx_id: TrxID) -> bool {
+        let Some(session) = self.session_state(session_id) else {
+            return false;
+        };
+        let abandoned = session.abandon_trx_handle(trx_id);
+        if abandoned {
+            self.notify_trx_changed();
+        }
+        abandoned
+    }
+
+    /// Queue cleanup for abandoned transactions found during shutdown scanning.
+    #[inline]
+    pub(crate) fn collect_shutdown_cleanup(&self) -> Vec<(SessionID, TrxID, TrxCleanupReason)> {
+        let sessions = self
+            .entries
+            .iter()
+            .map(|entry| (*entry.key(), Arc::clone(entry.value())))
+            .collect::<Vec<_>>();
+        let mut cleanup = Vec::new();
+        for (session_id, session) in sessions {
+            if let Some(trx_id) = session.shutdown_cleanup_candidate() {
+                cleanup.push((session_id, trx_id, TrxCleanupReason::ShutdownDrain));
+            }
+        }
+        if !cleanup.is_empty() {
+            self.notify_trx_changed();
+        }
+        cleanup
+    }
+
+    /// Count registry-owned transactions that still block owner shutdown.
+    #[inline]
+    pub(crate) fn active_transaction_count(&self) -> usize {
+        self.entries
+            .iter()
+            .map(|entry| Arc::clone(entry.value()))
+            .filter(|session| session.has_active_transaction())
+            .count()
+    }
+
+    /// Returns the current transaction lifecycle change epoch.
+    #[inline]
+    pub(crate) fn trx_change_epoch(&self) -> u64 {
+        self.trx_change_epoch.load(Ordering::Acquire)
+    }
+
+    /// Wait for any transaction lifecycle change after the observed epoch.
+    #[inline]
+    pub(crate) fn wait_for_trx_change_since(&self, observed_epoch: u64) {
+        loop {
+            if self.trx_change_epoch() != observed_epoch {
+                return;
+            }
+            listener!(self.trx_changed => trx_changed);
+            if self.trx_change_epoch() != observed_epoch {
+                return;
+            }
+            trx_changed.wait();
+        }
     }
 
     /// Remove idle and abandoned-idle sessions during engine shutdown.
@@ -411,13 +429,6 @@ impl SessionRegistry {
             })
             .collect::<Vec<_>>();
         drop(removed);
-    }
-
-    /// Returns the number of registry-owned sessions.
-    #[inline]
-    #[cfg(test)]
-    pub(crate) fn len(&self) -> usize {
-        self.entries.len()
     }
 
     #[inline]
@@ -455,6 +466,12 @@ impl SessionRegistry {
             SessionRemoval::Keep => None,
         };
         drop(removed);
+    }
+
+    #[inline]
+    pub(crate) fn notify_trx_changed(&self) {
+        self.trx_change_epoch.fetch_add(1, Ordering::AcqRel);
+        self.trx_changed.notify(usize::MAX);
     }
 }
 
@@ -539,7 +556,7 @@ impl SessionState {
     }
 
     #[inline]
-    fn begin_trx(&self, begin: impl FnOnce() -> Transaction) -> Result<Transaction> {
+    fn begin_trx(&self, begin: impl FnOnce() -> StartedTransaction) -> Result<Transaction> {
         let mut lifecycle = self.lifecycle.lock();
         match &*lifecycle {
             SessionLifecycle::RunningIdle => {}
@@ -553,8 +570,10 @@ impl SessionState {
             }
         }
         let trx = begin();
-        *lifecycle = SessionLifecycle::RunningActive { entry: trx.entry() };
-        Ok(trx)
+        *lifecycle = SessionLifecycle::RunningActive {
+            entry: Arc::clone(&trx.entry),
+        };
+        Ok(trx.handle)
     }
 
     #[inline]
@@ -651,6 +670,70 @@ impl SessionState {
     }
 
     #[inline]
+    fn resolve_trx(&self, trx_id: TrxID, operation: &'static str) -> Result<Arc<TrxEntry>> {
+        let lifecycle = self.lifecycle.lock();
+        match &*lifecycle {
+            SessionLifecycle::RunningActive { entry }
+            | SessionLifecycle::AbandonedActive { entry }
+                if entry.trx_id() == trx_id =>
+            {
+                Ok(Arc::clone(entry))
+            }
+            SessionLifecycle::RunningActive { .. } | SessionLifecycle::AbandonedActive { .. } => {
+                Err(transaction_discarded_err(operation))
+            }
+            SessionLifecycle::RunningIdle
+            | SessionLifecycle::AbandonedIdle
+            | SessionLifecycle::Closed => Err(transaction_discarded_err(operation)),
+        }
+    }
+
+    #[inline]
+    fn abandon_trx_handle(&self, trx_id: TrxID) -> bool {
+        let lifecycle = self.lifecycle.lock();
+        match &*lifecycle {
+            SessionLifecycle::RunningActive { entry }
+            | SessionLifecycle::AbandonedActive { entry }
+                if entry.trx_id() == trx_id =>
+            {
+                entry.abandon()
+            }
+            SessionLifecycle::RunningIdle
+            | SessionLifecycle::AbandonedIdle
+            | SessionLifecycle::Closed
+            | SessionLifecycle::RunningActive { .. }
+            | SessionLifecycle::AbandonedActive { .. } => false,
+        }
+    }
+
+    #[inline]
+    fn shutdown_cleanup_candidate(&self) -> Option<TrxID> {
+        let lifecycle = self.lifecycle.lock();
+        match &*lifecycle {
+            SessionLifecycle::RunningActive { entry } => matches!(
+                entry.inspect_state(),
+                TrxEntryState::Abandoned | TrxEntryState::CheckedOutAbandoned
+            )
+            .then(|| entry.trx_id()),
+            SessionLifecycle::AbandonedActive { entry } => entry.abandon().then(|| entry.trx_id()),
+            SessionLifecycle::RunningIdle
+            | SessionLifecycle::AbandonedIdle
+            | SessionLifecycle::Closed => None,
+        }
+    }
+
+    #[inline]
+    fn has_active_transaction(&self) -> bool {
+        match &*self.lifecycle.lock() {
+            SessionLifecycle::RunningActive { entry }
+            | SessionLifecycle::AbandonedActive { entry } => entry.in_trx(),
+            SessionLifecycle::RunningIdle
+            | SessionLifecycle::AbandonedIdle
+            | SessionLifecycle::Closed => false,
+        }
+    }
+
+    #[inline]
     fn shutdown_removal(&self) -> bool {
         let mut lifecycle = self.lifecycle.lock();
         match &*lifecycle {
@@ -713,46 +796,36 @@ enum SessionRemoval {
     Remove,
 }
 
-/// Transitional session reference retained by public transaction handles.
+/// Private transaction runtime attachment retained by checked-out transaction work.
 ///
-/// This handle deliberately owns engine runtime liveness but not session
-/// lifecycle ownership. An active transaction must keep a strong [`EngineRef`]
-/// so commit, rollback, logging, lock cleanup, and registry completion can still
-/// reach engine runtime state, and so explicit shutdown waits for active
-/// transactions to finish. The session state itself stays registry-owned: the
-/// weak session reference prevents a transaction from extending public session
-/// lifetime, allowing a dropped public session to become abandoned and be
-/// removed when this transaction reaches commit or rollback.
-pub(crate) struct TrxSessionRef {
+/// This handle owns engine runtime liveness and session-state reachability for
+/// one operation, terminal path, prepared commit handoff, or cleanup path. The
+/// public transaction facade never stores it.
+pub(crate) struct TrxAttachment {
     /// Strong runtime handle kept until the transaction reaches a terminal path.
     engine: EngineRef,
     /// Registry lookup key for terminal session cleanup.
     session_id: SessionID,
     /// Active transaction id used to avoid finishing a replaced session state.
     trx_id: TrxID,
-    /// Optional reachability for session-local caches, not lifecycle ownership.
-    session: Weak<SessionState>,
+    /// Claim-local reachability for session-local caches.
+    session: Arc<SessionState>,
     /// Cached guards needed by transaction work even if session state is gone.
     pool_guards: PoolGuards,
 }
 
-impl TrxSessionRef {
-    /// Create a transaction session reference without strongly owning session state.
+impl TrxAttachment {
+    /// Create a transaction runtime attachment without public handle ownership.
     #[inline]
-    pub(crate) fn new(engine: EngineRef, session: &Arc<SessionState>, trx_id: TrxID) -> Self {
+    pub(crate) fn new(engine: EngineRef, session: Arc<SessionState>, trx_id: TrxID) -> Self {
+        let pool_guards = session.pool_guards().clone();
         Self {
             engine,
             session_id: session.id(),
             trx_id,
-            session: Arc::downgrade(session),
-            pool_guards: session.pool_guards().clone(),
+            session,
+            pool_guards,
         }
-    }
-
-    /// Returns the engine-local session identity.
-    #[inline]
-    pub(crate) fn session_id(&self) -> SessionID {
-        self.session_id
     }
 
     /// Returns the crate-private engine runtime handle.
@@ -773,9 +846,7 @@ impl TrxSessionRef {
         &self,
         table_id: TableID,
     ) -> Option<(VersionedPageID, RowID)> {
-        self.session
-            .upgrade()
-            .and_then(|session| session.load_active_insert_page(table_id))
+        self.session.load_active_insert_page(table_id)
     }
 
     /// Cache the active insert page if session state remains.
@@ -786,9 +857,8 @@ impl TrxSessionRef {
         page_id: VersionedPageID,
         row_id: RowID,
     ) {
-        if let Some(session) = self.session.upgrade() {
-            session.save_active_insert_page(table_id, page_id, row_id);
-        }
+        self.session
+            .save_active_insert_page(table_id, page_id, row_id);
     }
 
     /// Mark the owning session committed.
@@ -806,6 +876,17 @@ impl TrxSessionRef {
             .session_registry
             .finish_trx_rollback(self.session_id, self.trx_id);
     }
+
+    /// Queue rollback cleanup for an abandoned transaction.
+    #[inline]
+    pub(crate) fn request_abandoned_cleanup(&self, reason: TrxCleanupReason) {
+        self.engine.trx_sys.request_abandoned_trx_cleanup(
+            self.engine.clone(),
+            self.session_id,
+            self.trx_id,
+            reason,
+        );
+    }
 }
 
 #[inline]
@@ -822,4 +903,204 @@ fn stale_session_error(id: SessionID, operation: &'static str) -> crate::error::
     Report::new(LifecycleError::Shutdown)
         .attach(format!("{operation}: session is missing: session_id={id}"))
         .into()
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use super::*;
+    use crate::conf::EngineConfig;
+    use crate::trx::{MIN_ACTIVE_TRX_ID, MIN_SNAPSHOT_TS, TrxInner};
+    use std::sync::mpsc;
+    use std::time::Duration;
+    use tempfile::TempDir;
+
+    /// Returns the number of registry-owned sessions for tests.
+    #[inline]
+    pub(crate) fn session_registry_len(registry: &SessionRegistry) -> usize {
+        registry.entries.len()
+    }
+
+    /// Create one registry-owned transaction with test-controlled ids.
+    #[inline]
+    pub(crate) fn create_test_transaction(
+        registry: &SessionRegistry,
+        engine: EngineRef,
+        session_id: SessionID,
+        trx_id: TrxID,
+        sts: TrxID,
+        log_no: usize,
+        gc_no: usize,
+    ) -> (Transaction, Arc<SessionState>) {
+        let state = Arc::new(SessionState::new(engine.clone(), session_id));
+        let inner = crate::trx::TrxInner::new(trx_id, sts, log_no, gc_no, session_id);
+        let entry = TrxEntry::new(inner);
+        {
+            let mut lifecycle = state.lifecycle.lock();
+            *lifecycle = SessionLifecycle::RunningActive { entry };
+        }
+        registry.insert(Arc::clone(&state));
+        (
+            Transaction::new(engine.downgrade(), session_id, trx_id, sts),
+            state,
+        )
+    }
+
+    pub(crate) trait SessionTestExt {
+        fn pool_guards(&self) -> PoolGuards;
+        fn engine(&self) -> EngineRef;
+        fn last_cts(&self) -> TrxID;
+        fn load_active_insert_page(
+            &mut self,
+            table_id: TableID,
+        ) -> Option<(VersionedPageID, RowID)>;
+        fn save_active_insert_page(
+            &mut self,
+            table_id: TableID,
+            page_id: VersionedPageID,
+            row_id: RowID,
+        );
+    }
+
+    impl SessionTestExt for Session {
+        #[inline]
+        fn pool_guards(&self) -> PoolGuards {
+            self.pin("test session pool guards")
+                .expect("test session must be running")
+                .state
+                .pool_guards()
+                .clone()
+        }
+
+        #[inline]
+        fn engine(&self) -> EngineRef {
+            self.pin("test session engine")
+                .expect("test session must be running")
+                .engine
+        }
+
+        #[inline]
+        fn last_cts(&self) -> TrxID {
+            let pin = self
+                .pin("test session last commit timestamp")
+                .expect("test session must be running");
+            TrxID::new(pin.state.last_cts.load(Ordering::SeqCst))
+        }
+
+        #[inline]
+        fn load_active_insert_page(
+            &mut self,
+            table_id: TableID,
+        ) -> Option<(VersionedPageID, RowID)> {
+            self.pin("load active insert page")
+                .expect("test session must be running")
+                .state
+                .load_active_insert_page(table_id)
+        }
+
+        #[inline]
+        fn save_active_insert_page(
+            &mut self,
+            table_id: TableID,
+            page_id: VersionedPageID,
+            row_id: RowID,
+        ) {
+            self.pin("save active insert page")
+                .expect("test session must be running")
+                .state
+                .save_active_insert_page(table_id, page_id, row_id);
+        }
+    }
+
+    #[test]
+    fn test_shutdown_cleanup_candidate_claims_abandoned_active() {
+        smol::block_on(async {
+            let root = TempDir::new().unwrap();
+            let engine = EngineConfig::default()
+                .storage_root(root.path())
+                .build()
+                .await
+                .unwrap();
+            let session_id = SessionID::new(1);
+            let trx_id = MIN_ACTIVE_TRX_ID;
+            let state = SessionState::new(engine.new_ref().unwrap(), session_id);
+            let entry = TrxEntry::new(TrxInner::new(trx_id, MIN_SNAPSHOT_TS, 0, 0, session_id));
+            {
+                let mut lifecycle = state.lifecycle.lock();
+                *lifecycle = SessionLifecycle::AbandonedActive {
+                    entry: Arc::clone(&entry),
+                };
+            }
+
+            assert_eq!(state.shutdown_cleanup_candidate(), Some(trx_id));
+            assert_eq!(entry.inspect_state(), TrxEntryState::Abandoned);
+        });
+    }
+
+    #[test]
+    fn test_shutdown_cleanup_candidate_skips_unclaimable_abandoned_active() {
+        smol::block_on(async {
+            let root = TempDir::new().unwrap();
+            let engine = EngineConfig::default()
+                .storage_root(root.path())
+                .build()
+                .await
+                .unwrap();
+            let session_id = SessionID::new(1);
+            let trx_id = MIN_ACTIVE_TRX_ID;
+            let state = SessionState::new(engine.new_ref().unwrap(), session_id);
+            let entry = TrxEntry::new(TrxInner::new(trx_id, MIN_SNAPSHOT_TS, 0, 0, session_id));
+            entry.finish(TrxEntryState::Failed);
+            {
+                let mut lifecycle = state.lifecycle.lock();
+                *lifecycle = SessionLifecycle::AbandonedActive {
+                    entry: Arc::clone(&entry),
+                };
+            }
+
+            assert_eq!(state.shutdown_cleanup_candidate(), None);
+            assert_eq!(entry.inspect_state(), TrxEntryState::Failed);
+        });
+    }
+
+    #[test]
+    fn test_wait_for_trx_change_since_returns_after_prior_change() {
+        let registry = SessionRegistry::new();
+        let observed_epoch = registry.trx_change_epoch();
+
+        registry.notify_trx_changed();
+        registry.wait_for_trx_change_since(observed_epoch);
+
+        assert_ne!(registry.trx_change_epoch(), observed_epoch);
+    }
+
+    #[test]
+    fn test_wait_for_trx_change_since_wakes_on_change() {
+        let registry = Arc::new(SessionRegistry::new());
+        let observed_epoch = registry.trx_change_epoch();
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+
+        let waiter = {
+            let registry = Arc::clone(&registry);
+            std::thread::spawn(move || {
+                ready_tx.send(()).expect("waiter should report ready");
+                registry.wait_for_trx_change_since(observed_epoch);
+                done_tx.send(()).expect("waiter should report completion");
+            })
+        };
+
+        ready_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("waiter should start");
+        assert!(
+            done_rx.recv_timeout(Duration::from_millis(20)).is_err(),
+            "waiter should block before a transaction change"
+        );
+
+        registry.notify_trx_changed();
+        done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("waiter should wake after a transaction change");
+        waiter.join().expect("waiter thread should finish");
+    }
 }

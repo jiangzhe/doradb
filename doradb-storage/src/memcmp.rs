@@ -1,9 +1,9 @@
-use std::alloc::{Layout, alloc, alloc_zeroed};
+use std::alloc::{Layout, alloc};
 use std::cmp::Ordering;
 use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::mem::size_of;
-use std::mem::{self, ManuallyDrop, MaybeUninit};
+use std::mem::{self, ManuallyDrop};
 use std::ops::{Deref, DerefMut};
 
 /// Extendable byte container.
@@ -448,7 +448,7 @@ impl MemCmpKey {
         if len <= MEM_CMP_KEY_INLINE {
             return MemCmpKey(Inner::inline_zeroed(len));
         }
-        MemCmpKey(Inner::heap_alloc(len, true))
+        MemCmpKey(Inner::heap_alloc(len))
     }
 
     #[inline]
@@ -456,7 +456,7 @@ impl MemCmpKey {
         if len <= MEM_CMP_KEY_INLINE {
             return MemCmpKey(Inner::inline_zeroed(len));
         }
-        MemCmpKey(Inner::heap_alloc(len, false))
+        MemCmpKey(Inner::heap_alloc(len))
     }
 
     /// Create a empty key.
@@ -707,55 +707,34 @@ impl Inner {
     #[inline]
     fn heap(value: &[u8]) -> Inner {
         debug_assert!(value.len() > MEM_CMP_KEY_INLINE);
+        let prefix = heap_prefix(value);
         // SAFETY: this allocates `value.len()` bytes, copies exactly that many
-        // initialized bytes into the allocation, then initializes the heap
-        // variant before assuming `Inner` is initialized.
+        // initialized bytes into the allocation, then transfers ownership into
+        // the heap variant.
         unsafe {
             let ptr = alloc(Layout::from_size_align_unchecked(value.len(), 1));
             std::ptr::copy_nonoverlapping(value.as_ptr(), ptr, value.len());
             let data = Vec::from_raw_parts(ptr, value.len(), value.len()).into_boxed_slice();
-            let mut res = MaybeUninit::<Inner>::uninit();
-            let inner = &mut res.assume_init_mut();
-            inner.len = value.len();
-            inner
-                .u
-                .update_heap_prefix(&value[..MEM_CMP_KEY_HEAP_PREFIX]);
-            inner.u.init_heap_data(data);
-            res.assume_init()
+            Inner::heap_inner(value.len(), prefix, data)
         }
     }
 
     #[inline]
-    fn heap_alloc(len: usize, zeroed: bool) -> Inner {
+    fn heap_alloc(len: usize) -> Inner {
         debug_assert!(len > MEM_CMP_KEY_INLINE);
-        // SAFETY: this allocates a heap buffer of `len` bytes and immediately
-        // transfers ownership of that allocation into the heap variant.
-        unsafe {
-            let layout = Layout::from_size_align_unchecked(len, 1);
-            let ptr = if zeroed {
-                alloc_zeroed(layout)
-            } else {
-                alloc(layout)
-            };
-            let data = Vec::from_raw_parts(ptr, len, len).into_boxed_slice();
-            Inner {
-                len,
-                u: InlineOrHeap {
-                    h: ManuallyDrop::new(Heap {
-                        data,
-                        prefix: [0u8; MEM_CMP_KEY_HEAP_PREFIX],
-                    }),
-                },
-            }
-        }
+        let data = vec![0u8; len].into_boxed_slice();
+        Inner::heap_inner(len, [0u8; MEM_CMP_KEY_HEAP_PREFIX], data)
     }
 
     #[inline]
     fn heap_with_nullable_byte(value: &[u8], b: u8) -> Inner {
         let len = value.len() + 1;
         debug_assert!(len > MEM_CMP_KEY_INLINE);
+        let mut prefix = [0u8; MEM_CMP_KEY_HEAP_PREFIX];
+        prefix[0] = b;
+        prefix[1..].copy_from_slice(&value[..MEM_CMP_KEY_HEAP_PREFIX - 1]);
         // SAFETY: this allocates `len` bytes, writes the nullable flag plus the
-        // copied payload bytes, and initializes the heap variant before use.
+        // copied payload bytes, and transfers ownership into the heap variant.
         unsafe {
             let ptr = alloc(Layout::from_size_align_unchecked(len, 1));
             // update first byte.
@@ -763,13 +742,17 @@ impl Inner {
             // copy data.
             std::ptr::copy_nonoverlapping(value.as_ptr(), ptr.add(1), value.len());
             let data = Vec::from_raw_parts(ptr, len, len).into_boxed_slice();
-            let mut res = MaybeUninit::<Inner>::uninit();
-            let inner = &mut res.assume_init_mut();
-            inner.len = len;
-            (*inner.u.h).prefix[0] = b;
-            (*inner.u.h).prefix[1..].copy_from_slice(&value[..MEM_CMP_KEY_HEAP_PREFIX - 1]);
-            inner.u.init_heap_data(data);
-            res.assume_init()
+            Inner::heap_inner(len, prefix, data)
+        }
+    }
+
+    #[inline]
+    fn heap_inner(len: usize, prefix: [u8; MEM_CMP_KEY_HEAP_PREFIX], data: Box<[u8]>) -> Inner {
+        Inner {
+            len,
+            u: InlineOrHeap {
+                h: ManuallyDrop::new(Heap { prefix, data }),
+            },
         }
     }
 
@@ -785,6 +768,34 @@ impl Inner {
             }
         }
     }
+}
+
+/// Builds a boxed byte slice whose length is used as heap capacity.
+///
+/// # Safety
+///
+/// `ptr` must be allocated for `cap` bytes with alignment 1 and uniquely owned
+/// by the caller. The first `initialized_len` bytes must already be
+/// initialized, and `initialized_len` must not exceed `cap`.
+#[inline]
+unsafe fn boxed_slice_with_capacity(ptr: *mut u8, initialized_len: usize, cap: usize) -> Box<[u8]> {
+    debug_assert!(initialized_len <= cap);
+    if initialized_len < cap {
+        // SAFETY: the caller guarantees `ptr` is valid for `cap` bytes, and
+        // the range starts after the already initialized prefix.
+        unsafe { std::ptr::write_bytes(ptr.add(initialized_len), 0, cap - initialized_len) };
+    }
+    // SAFETY: the full `cap` byte range is initialized before ownership is
+    // transferred into the Vec.
+    unsafe { Vec::from_raw_parts(ptr, cap, cap).into_boxed_slice() }
+}
+
+#[inline]
+fn heap_prefix(data: &[u8]) -> [u8; MEM_CMP_KEY_HEAP_PREFIX] {
+    debug_assert!(data.len() >= MEM_CMP_KEY_HEAP_PREFIX);
+    let mut prefix = [0u8; MEM_CMP_KEY_HEAP_PREFIX];
+    prefix.copy_from_slice(&data[..MEM_CMP_KEY_HEAP_PREFIX]);
+    prefix
 }
 
 impl BytesExtendable for Inner {
@@ -803,35 +814,37 @@ impl BytesExtendable for Inner {
                 // SAFETY: the inline variant is active, and this path allocates
                 // a fresh heap buffer before initializing the heap variant.
                 unsafe {
-                    let ptr = alloc(Layout::from_size_align_unchecked(self.len * 2, 1));
-                    std::ptr::copy_nonoverlapping(self.u.i.as_ptr(), ptr, self.len);
-                    *ptr.add(self.len) = value;
-                    let data = Vec::from_raw_parts(ptr, self.len, self.len).into_boxed_slice();
-                    self.len += 1;
-                    self.u.init_heap_data(data);
-                    // it's ok to not update prefix, because prefix has same layout as inline bytes.
+                    let old_len = self.len;
+                    let new_len = old_len + 1;
+                    let new_cap = old_len * 2;
+                    let ptr = alloc(Layout::from_size_align_unchecked(new_cap, 1));
+                    std::ptr::copy_nonoverlapping(self.u.i.as_ptr(), ptr, old_len);
+                    *ptr.add(old_len) = value;
+                    let data = boxed_slice_with_capacity(ptr, new_len, new_cap);
+                    let prefix = heap_prefix(&data);
+                    self.u.init_heap(prefix, data);
+                    self.len = new_len;
                 }
             }
             Ordering::Greater => {
                 // SAFETY: the heap variant is active in this branch, and all raw
                 // copies stay within the old and newly allocated heap buffers.
                 unsafe {
-                    let len = self.len;
+                    let old_len = self.len;
+                    let new_len = old_len + 1;
                     let data = &mut (*self.u.h).data;
-                    if data.len() > len {
+                    if data.len() >= new_len {
                         // sufficient capacity.
-                        data[len] = value;
-                        self.len += 1;
+                        data[old_len] = value;
+                        self.len = new_len;
                     } else {
-                        let new_len = len * 2;
-                        let ptr = alloc(Layout::from_size_align_unchecked(new_len, 1));
-                        std::ptr::copy_nonoverlapping(data.as_ptr(), ptr, len);
-                        *ptr.add(len) = value;
-                        self.len += 1;
-                        let old_box = std::mem::replace(
-                            data,
-                            Vec::from_raw_parts(ptr, new_len, new_len).into_boxed_slice(),
-                        );
+                        let new_cap = old_len * 2;
+                        let ptr = alloc(Layout::from_size_align_unchecked(new_cap, 1));
+                        std::ptr::copy_nonoverlapping(data.as_ptr(), ptr, old_len);
+                        *ptr.add(old_len) = value;
+                        let new_data = boxed_slice_with_capacity(ptr, new_len, new_cap);
+                        self.len = new_len;
+                        let old_box = std::mem::replace(data, new_data);
                         drop(old_box); // explicitly drop the old box.
                         // prefix not changed.
                     }
@@ -854,13 +867,10 @@ impl BytesExtendable for Inner {
                     let ptr = alloc(Layout::from_size_align_unchecked(new_len, 1));
                     std::ptr::copy_nonoverlapping(self.u.i.as_ptr(), ptr, old_len);
                     std::ptr::copy_nonoverlapping(values.as_ptr(), ptr.add(old_len), values.len());
+                    let data = Vec::from_raw_parts(ptr, new_len, new_len).into_boxed_slice();
+                    let prefix = heap_prefix(&data);
                     self.len = new_len;
-                    // need to discard old value in data
-                    std::ptr::write(
-                        &mut (*self.u.h).data,
-                        Vec::from_raw_parts(ptr, new_len, new_len).into_boxed_slice(),
-                    );
-                    self.update_prefix_if_on_heap();
+                    self.u.init_heap(prefix, data);
                     return;
                 }
                 // new collection is still inline.
@@ -882,7 +892,7 @@ impl BytesExtendable for Inner {
             let ptr = alloc(Layout::from_size_align_unchecked(new_cap, 1));
             std::ptr::copy_nonoverlapping(data.as_ptr(), ptr, old_len);
             std::ptr::copy_nonoverlapping(values.as_ptr(), ptr.add(old_len), values.len());
-            let data = Vec::from_raw_parts(ptr, new_cap, new_cap).into_boxed_slice();
+            let data = boxed_slice_with_capacity(ptr, new_len, new_cap);
             self.len = new_len;
             self.u.replace_heap_data(data);
             // prefix not changed.
@@ -903,13 +913,10 @@ impl BytesExtendable for Inner {
                     let ptr = alloc(Layout::from_size_align_unchecked(new_len, 1));
                     std::ptr::copy_nonoverlapping(self.u.i.as_ptr(), ptr, old_len);
                     std::ptr::write_bytes(ptr.add(old_len), val, n);
+                    let data = Vec::from_raw_parts(ptr, new_len, new_len).into_boxed_slice();
+                    let prefix = heap_prefix(&data);
                     self.len = new_len;
-                    // need to discard old value in data
-                    std::ptr::write(
-                        &mut (*self.u.h).data,
-                        Vec::from_raw_parts(ptr, new_len, new_len).into_boxed_slice(),
-                    );
-                    self.update_prefix_if_on_heap();
+                    self.u.init_heap(prefix, data);
                     return;
                 }
                 // new collection is still inline.
@@ -931,7 +938,7 @@ impl BytesExtendable for Inner {
             let ptr = alloc(Layout::from_size_align_unchecked(new_cap, 1));
             std::ptr::copy_nonoverlapping(data.as_ptr(), ptr, old_len);
             std::ptr::write_bytes(ptr.add(old_len), val, n);
-            let data = Vec::from_raw_parts(ptr, new_cap, new_cap).into_boxed_slice();
+            let data = boxed_slice_with_capacity(ptr, new_len, new_cap);
             self.len = new_len;
             self.u.replace_heap_data(data);
             // prefix not changed.
@@ -975,21 +982,11 @@ union InlineOrHeap {
 impl InlineOrHeap {
     /// # Safety
     ///
-    /// Caller must guarantee the heap data is uninitialized.
-    /// This method will not read or drop old value in data field.
+    /// Caller must guarantee the active representation has no initialized heap
+    /// allocation to drop.
     #[inline]
-    unsafe fn init_heap_data(&mut self, data: Box<[u8]>) {
-        // SAFETY: the caller guarantees `h.data` is currently uninitialized, so
-        // this writes the first initialized heap payload into that field.
-        unsafe { std::ptr::write(&mut (*self.h).data, data) };
-    }
-
-    #[inline]
-    fn update_heap_prefix(&mut self, prefix: &[u8]) {
-        debug_assert!(prefix.len() == MEM_CMP_KEY_HEAP_PREFIX);
-        // SAFETY: callers invoke this only when the heap variant is active, and
-        // `prefix` has the exact fixed prefix length.
-        unsafe { (*self.h).prefix.copy_from_slice(prefix) };
+    unsafe fn init_heap(&mut self, prefix: [u8; MEM_CMP_KEY_HEAP_PREFIX], data: Box<[u8]>) {
+        self.h = ManuallyDrop::new(Heap { prefix, data });
     }
 
     /// # Safety
@@ -1022,6 +1019,25 @@ mod tests {
     use rand_distr::{Distribution, StandardUniform};
 
     use super::*;
+
+    fn heap_capacity(key: &MemCmpKey) -> usize {
+        assert!(key.0.len > MEM_CMP_KEY_INLINE);
+        // SAFETY: the assertion above proves the heap representation is active.
+        unsafe { key.0.u.h.data.len() }
+    }
+
+    fn heap_spare_bytes(key: &MemCmpKey) -> &[u8] {
+        assert!(key.0.len > MEM_CMP_KEY_INLINE);
+        // SAFETY: the assertion above proves the heap representation is active,
+        // and `Inner::len` is the logical prefix of the capacity slice.
+        unsafe { &key.0.u.h.data[key.0.len..] }
+    }
+
+    fn heap_prefix_bytes(key: &MemCmpKey) -> &[u8; MEM_CMP_KEY_HEAP_PREFIX] {
+        assert!(key.0.len > MEM_CMP_KEY_INLINE);
+        // SAFETY: the assertion above proves the heap representation is active.
+        unsafe { &key.0.u.h.prefix }
+    }
 
     #[test]
     fn test_mcf_sized() {
@@ -1416,6 +1432,118 @@ mod tests {
         }
         assert!(k17.len() == 64);
         assert!(k17.as_bytes().iter().all(|b| *b == 0x01));
+    }
+
+    #[test]
+    fn test_mem_cmp_key_push_inline_to_heap_transition() {
+        let mut key = MemCmpKey::empty();
+        let mut expected = Vec::with_capacity(MEM_CMP_KEY_INLINE + 2);
+
+        for idx in 0..MEM_CMP_KEY_INLINE {
+            let value = (idx as u8).wrapping_add(1);
+            key.push_byte(value);
+            expected.push(value);
+        }
+
+        assert_eq!(key.0.len, MEM_CMP_KEY_INLINE);
+        assert_eq!(key.as_bytes(), expected);
+
+        key.push_byte(0xaa);
+        expected.push(0xaa);
+
+        assert_eq!(key.0.len, MEM_CMP_KEY_INLINE + 1);
+        assert_eq!(key.as_bytes(), expected);
+        assert_eq!(heap_capacity(&key), MEM_CMP_KEY_INLINE * 2);
+        assert_eq!(
+            heap_prefix_bytes(&key).as_slice(),
+            &expected[..MEM_CMP_KEY_HEAP_PREFIX]
+        );
+        assert!(heap_spare_bytes(&key).iter().all(|b| *b == 0));
+        assert_eq!(key, MemCmpKey::from(&expected[..]));
+
+        key.push_byte(0xbb);
+        expected.push(0xbb);
+        assert_eq!(key.as_bytes(), expected);
+        assert_eq!(heap_capacity(&key), MEM_CMP_KEY_INLINE * 2);
+    }
+
+    #[test]
+    fn test_mem_cmp_key_extend_short_inline_to_heap_initializes_prefix() {
+        let mut key = MemCmpKey::from(&[0x11, 0x22][..]);
+        let mut expected = vec![0x11, 0x22];
+        expected.extend_from_slice(&[0x33; MEM_CMP_KEY_INLINE]);
+
+        key.extend_from_byte_slice(&[0x33; MEM_CMP_KEY_INLINE]);
+
+        assert_eq!(key.as_bytes(), expected);
+        assert_eq!(
+            heap_prefix_bytes(&key).as_slice(),
+            &expected[..MEM_CMP_KEY_HEAP_PREFIX]
+        );
+
+        let mut repeated = MemCmpKey::from(&[0x44, 0x55][..]);
+        let mut expected = vec![0x44, 0x55];
+        expected.extend(std::iter::repeat_n(0x66, MEM_CMP_KEY_INLINE));
+
+        repeated.extend_repeat_n(0x66, MEM_CMP_KEY_INLINE);
+
+        assert_eq!(repeated.as_bytes(), expected);
+        assert_eq!(
+            heap_prefix_bytes(&repeated).as_slice(),
+            &expected[..MEM_CMP_KEY_HEAP_PREFIX]
+        );
+    }
+
+    #[test]
+    fn test_mem_cmp_key_arbitrary_heap_is_initialized_and_updates_prefix() {
+        let mut key = MemCmpKey::arbitrary(MEM_CMP_KEY_INLINE + 1);
+        assert!(key.as_bytes().iter().all(|b| *b == 0));
+        assert!(heap_prefix_bytes(&key).iter().all(|b| *b == 0));
+
+        let expected: Vec<u8> = (0..key.len()).map(|idx| idx as u8 + 1).collect();
+        {
+            let mut guard = key.modify_inplace();
+            guard.copy_from_slice(&expected);
+        }
+
+        assert_eq!(key.as_bytes(), expected);
+        assert_eq!(
+            heap_prefix_bytes(&key).as_slice(),
+            &expected[..MEM_CMP_KEY_HEAP_PREFIX]
+        );
+    }
+
+    #[test]
+    fn test_mem_cmp_key_heap_growth_initializes_spare_capacity() {
+        let base = vec![0x11; MEM_CMP_KEY_INLINE + 1];
+
+        let mut key = MemCmpKey::from(&base[..]);
+        let mut expected = base.clone();
+        assert_eq!(heap_capacity(&key), expected.len());
+
+        key.extend_from_byte_slice(&[0x22]);
+        expected.push(0x22);
+        assert_eq!(key.as_bytes(), expected);
+        assert!(heap_capacity(&key) > key.0.len);
+        assert!(heap_spare_bytes(&key).iter().all(|b| *b == 0));
+
+        key.push_byte(0x33);
+        expected.push(0x33);
+        assert_eq!(key.as_bytes(), expected);
+
+        let mut repeated = MemCmpKey::from(&base[..]);
+        let mut expected = base;
+        assert_eq!(heap_capacity(&repeated), expected.len());
+
+        repeated.extend_repeat_n(0x44, 1);
+        expected.push(0x44);
+        assert_eq!(repeated.as_bytes(), expected);
+        assert!(heap_capacity(&repeated) > repeated.0.len);
+        assert!(heap_spare_bytes(&repeated).iter().all(|b| *b == 0));
+
+        repeated.push_byte(0x55);
+        expected.push(0x55);
+        assert_eq!(repeated.as_bytes(), expected);
     }
 
     #[test]
