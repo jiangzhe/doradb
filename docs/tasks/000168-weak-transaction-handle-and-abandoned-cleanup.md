@@ -1,7 +1,7 @@
 ---
 id: 000168
 title: Weak Transaction Handle And Abandoned Cleanup
-status: proposal
+status: implemented
 created: 2026-06-04
 github_issue: 683
 ---
@@ -445,6 +445,54 @@ Reference:
 
 ## Implementation Notes
 
+Implemented RFC-0019 Phase 6 by making public `Transaction` a weak
+`(SessionID, TrxID)` handle, moving strong runtime capability into
+operation-local `TrxAttachment`/`TrxRuntime`, and adding registry-driven
+abandoned cleanup plus shutdown draining.
+
+- Replaced facade-owned `Arc<TrxEntry>`, `TrxSessionRef`, and strong
+  `EngineRef` retention with weak engine reachability and
+  registry-authoritative `SessionRegistry::resolve_trx`.
+- Added operation-local `TrxAttachment`, copyable `TrxRuntime<'r>`,
+  non-terminal `TrxCheckout`, and terminal/cleanup `TrxCompletionClaim`
+  ownership. `Statement` now borrows the operational capability instead of
+  owning checkout state or cloning the lock manager.
+- Moved transaction runtime attachment out of immutable `TrxContext`; active
+  runtime capability now lives in checked-out/claimed operation state.
+- Merged abandoned transaction tracking into `TrxEntryState`, added abandoned
+  and checked-out-abandoned cleanup transitions, and made cleanup duplicate-safe
+  for handle drop, abandoned session scans, shutdown scans, and checkout return.
+- Added transaction lifecycle epochs and notifications so shutdown waiters do
+  not miss session-registry transaction changes.
+- Added a transaction-system cleanup queue/worker and shutdown drain behavior
+  so abandoned rollback-equivalent cleanup is owned by engine runtime rather
+  than public-handle `Drop`.
+- Gated non-terminal transaction work on engine admission while preserving
+  explicit commit/rollback behavior during shutdown.
+- Updated table, catalog, row, checkpoint, and transaction call sites to pass
+  `TrxRuntime` by value and use `stmt.ctx()`/`stmt.runtime()` consistently.
+- Updated `docs/transaction-system.md`, RFC-0019 Phase 6 sync text, and related
+  backlog notes for the weak transaction lifecycle and cleanup model.
+- During final validation, full-suite `nextest` exposed a heap-corruption abort
+  rooted in `MemCmpKey` heap representation initialization. Fixed `memcmp.rs` to
+  initialize heap union variants as complete `Heap { prefix, data }` values,
+  removed uninitialized heap ownership from `MemCmpKey::arbitrary`, and added
+  regression coverage for inline-to-heap transitions and prefix updates.
+
+Validation completed:
+
+```bash
+cargo fmt --all --check
+cargo clippy -p doradb-storage --all-targets -- -D warnings
+cargo nextest run -p doradb-storage
+cargo test -p doradb-storage memcmp::tests:: -- --nocapture
+tools/coverage_focus.rs --path doradb-storage/src/session.rs --path doradb-storage/src/trx --path doradb-storage/src/engine.rs --path doradb-storage/src/table/persistence.rs --path doradb-storage/src/memcmp.rs --top-uncovered 10
+tools/unsafe_inventory.rs --write docs/unsafe-usage-baseline.md
+```
+
+Final focused coverage was 13,368/14,178 lines, or 94.29% overall, with
+`memcmp.rs` at 98.61%. Full `cargo nextest run -p doradb-storage` passed 906
+tests.
 
 ## Impacts
 
