@@ -380,10 +380,15 @@ impl Engine {
             }
             drop(_shutdown);
 
-            if active_transactions != 0
-                && queued_cleanup == 0
-                && inner.lifecycle.runtime_refs() == 0
-            {
+            let runtime_refs = inner.lifecycle.runtime_refs();
+            if queued_cleanup != 0 && runtime_refs == 0 {
+                inner
+                    .session_registry
+                    .wait_for_trx_change_since(trx_change_epoch);
+                continue;
+            }
+
+            if active_transactions != 0 && queued_cleanup == 0 && runtime_refs == 0 {
                 inner
                     .session_registry
                     .wait_for_trx_change_since(trx_change_epoch);
@@ -393,7 +398,7 @@ impl Engine {
             // A weak public handle can briefly upgrade to an `Arc<EngineInner>`
             // while it discovers admission is already closed. That raw Arc is
             // intentionally not a runtime ref, so there is no event to wait on.
-            if inner.lifecycle.runtime_refs() == 0 {
+            if runtime_refs == 0 {
                 std::thread::yield_now();
             }
         }
@@ -1545,6 +1550,44 @@ mod tests {
             let result = done_rx
                 .recv_timeout(Duration::from_secs(5))
                 .expect("shutdown should complete after transaction rollback");
+            assert_eq!(result, Ok(()));
+            shutdown_handle.join().unwrap();
+        });
+    }
+
+    #[test]
+    fn test_engine_shutdown_waits_for_checked_out_abandoned_transaction_to_return() {
+        let root = TempDir::new().unwrap();
+        let engine = smol::block_on(test_engine_config_for(root.path()).build()).unwrap();
+        let mut session = engine.new_session().unwrap();
+        let mut trx = session.begin_trx().unwrap();
+        let checkout = trx
+            .checkout("test engine shutdown waits for checked-out abandoned transaction")
+            .unwrap();
+        let (done_tx, done_rx) = mpsc::channel();
+
+        drop(trx);
+        assert!(session.in_trx().unwrap());
+
+        std::thread::scope(|scope| {
+            let shutdown_engine = &engine;
+            let shutdown_handle = scope.spawn(move || {
+                let result = shutdown_engine
+                    .shutdown()
+                    .map_err(|err| err.lifecycle_error());
+                done_tx.send(result).unwrap();
+            });
+
+            wait_until_shutdown_begins(&engine);
+            assert!(
+                done_rx.recv_timeout(Duration::from_millis(20)).is_err(),
+                "shutdown must wait until checked-out abandoned transaction returns"
+            );
+
+            drop(checkout);
+            let result = done_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("shutdown should complete after checkout returns");
             assert_eq!(result, Ok(()));
             shutdown_handle.join().unwrap();
         });
