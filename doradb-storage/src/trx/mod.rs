@@ -91,8 +91,14 @@ impl Transaction {
     #[inline]
     fn resolve_active(&self, operation: &'static str) -> Result<(Arc<TrxEntry>, TrxAttachment)> {
         let engine = self.engine.upgrade(operation)?;
-        engine.trx_sys.ensure_runtime_healthy()?;
-        self.resolve_with_engine(engine, operation)
+        let admission = engine.acquire_admission()?;
+        let (entry, session) =
+            engine
+                .session_registry
+                .resolve_trx(self.session_id, self.trx_id, operation)?;
+        drop(admission);
+        let attachment = TrxAttachment::new(engine, session, self.trx_id);
+        Ok((entry, attachment))
     }
 
     /// Resolve this handle for terminal or cleanup paths.
@@ -452,12 +458,6 @@ impl<'r> TrxRuntime<'r> {
         self.ctx.is_same_trx(undo_head)
     }
 
-    /// Returns this transaction's current status timestamp.
-    #[inline]
-    pub(crate) fn trx_id(&self) -> TrxID {
-        self.ctx.trx_id()
-    }
-
     /// Returns the transaction snapshot timestamp.
     #[inline]
     pub(crate) fn sts(&self) -> TrxID {
@@ -480,7 +480,7 @@ impl<'r> TrxRuntime<'r> {
         #[cfg(debug_assertions)]
         {
             let resource = LockResource::TableData(table_id);
-            let owner = LockOwner::Transaction(self.trx_id());
+            let owner = LockOwner::Transaction(self.ctx.trx_id());
             let held = self.engine().lock_manager().owner_holds(
                 resource,
                 owner,
@@ -727,7 +727,7 @@ impl TrxEntryState {
     /// Returns whether this state still blocks the owning session as in-transaction.
     #[inline]
     pub(crate) fn in_trx(self) -> bool {
-        !matches!(self, TrxEntryState::Terminal)
+        !matches!(self, TrxEntryState::Terminal | TrxEntryState::Failed)
     }
 
     #[inline]
@@ -867,7 +867,7 @@ impl TrxEntry {
     }
 
     #[inline]
-    fn return_inner(&self, inner: TrxInner) {
+    fn return_inner(&self, inner: TrxInner) -> TrxEntryState {
         let mut inner_slot = self.inner.lock();
         let state = self.inspect_state();
         debug_assert!(matches!(
@@ -885,6 +885,7 @@ impl TrxEntry {
             _ => unreachable!("checked above"),
         };
         self.store_state(next_state);
+        next_state
     }
 
     /// Mark this transaction as abandoned by a dropped public handle.
@@ -1021,7 +1022,15 @@ impl Drop for TrxCheckout {
         let Some(inner) = self.inner.take() else {
             return;
         };
-        self.entry.return_inner(inner);
+        let state = self.entry.return_inner(inner);
+        if state == TrxEntryState::Abandoned {
+            self.attachment
+                .engine()
+                .session_registry
+                .notify_trx_changed();
+            self.attachment
+                .request_abandoned_cleanup(TrxCleanupReason::HandleDrop);
+        }
     }
 }
 
@@ -1847,7 +1856,8 @@ pub(crate) mod tests {
     use crate::trx::stmt::tests as stmt_tests;
     use crate::trx::undo::{IndexUndo, IndexUndoKind, OwnedRowUndo, RowUndoKind};
     use crate::value::{Val, ValKind};
-    use std::sync::Arc;
+    use std::sync::{Arc, mpsc};
+    use std::time::Duration;
     use tempfile::TempDir;
 
     async fn test_engine(log_file_stem: &str) -> (TempDir, Engine) {
@@ -1930,9 +1940,101 @@ pub(crate) mod tests {
         assert!(entry.abandon());
         assert_eq!(entry.inspect_state(), TrxEntryState::CheckedOutAbandoned);
 
-        entry.return_inner(inner);
-
+        assert_eq!(entry.return_inner(inner), TrxEntryState::Abandoned);
         assert_eq!(entry.inspect_state(), TrxEntryState::Abandoned);
+    }
+
+    #[test]
+    fn test_failed_entry_state_is_not_in_transaction() {
+        assert!(TrxEntryState::Active.in_trx());
+        assert!(TrxEntryState::CheckedOut.in_trx());
+        assert!(TrxEntryState::CheckedOutAbandoned.in_trx());
+        assert!(TrxEntryState::Committing.in_trx());
+        assert!(TrxEntryState::RollingBack.in_trx());
+        assert!(TrxEntryState::Abandoned.in_trx());
+        assert!(TrxEntryState::CleanupRunning.in_trx());
+        assert!(!TrxEntryState::Terminal.in_trx());
+        assert!(!TrxEntryState::Failed.in_trx());
+    }
+
+    #[test]
+    fn test_failed_entry_does_not_count_as_active_transaction() {
+        smol::block_on(async {
+            let (_temp_dir, engine) =
+                test_engine("failed_entry_does_not_count_as_active_transaction").await;
+            let trx = test_transaction_with_parts(
+                &engine,
+                MIN_ACTIVE_TRX_ID + 102,
+                TrxID::new(102),
+                0,
+                0,
+            );
+            let entry = transaction_entry(&trx);
+
+            assert_eq!(engine.session_registry.active_transaction_count(), 1);
+            entry.finish(TrxEntryState::Failed);
+            assert_eq!(entry.inspect_state(), TrxEntryState::Failed);
+            assert_eq!(engine.session_registry.active_transaction_count(), 0);
+
+            engine
+                .session_registry
+                .finish_trx_rollback(trx.session_id, trx.trx_id);
+            drop(trx);
+            engine.shutdown().unwrap();
+        });
+    }
+
+    #[test]
+    fn test_checked_out_abandoned_return_notifies_session_registry() {
+        smol::block_on(async {
+            let (_temp_dir, engine) =
+                test_engine("checked_out_abandoned_return_notifies_session_registry").await;
+            let mut session = engine.new_session().unwrap();
+            let mut trx = session.begin_trx().unwrap();
+            let entry = transaction_entry(&trx);
+            let checkout = trx
+                .checkout("test checked-out abandoned return notification")
+                .expect("test transaction can be checked out");
+
+            assert_eq!(entry.inspect_state(), TrxEntryState::CheckedOut);
+            assert!(entry.abandon());
+            assert_eq!(entry.inspect_state(), TrxEntryState::CheckedOutAbandoned);
+
+            let observed_epoch = engine.session_registry.trx_change_epoch();
+            let engine_ref = engine.new_ref().unwrap();
+            let (ready_tx, ready_rx) = mpsc::channel();
+            let (done_tx, done_rx) = mpsc::channel();
+            let waiter = std::thread::spawn(move || {
+                ready_tx.send(()).expect("waiter should report ready");
+                engine_ref
+                    .session_registry
+                    .wait_for_trx_change_since(observed_epoch);
+                done_tx.send(()).expect("waiter should report completion");
+            });
+
+            ready_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("waiter should start");
+            assert!(
+                done_rx.recv_timeout(Duration::from_millis(20)).is_err(),
+                "waiter should block before checkout returns the abandoned inner"
+            );
+
+            drop(checkout);
+
+            done_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("waiter should wake after checkout returns the abandoned inner");
+            waiter.join().expect("waiter thread should finish");
+            assert!(matches!(
+                entry.inspect_state(),
+                TrxEntryState::Abandoned | TrxEntryState::CleanupRunning | TrxEntryState::Terminal
+            ));
+
+            drop(trx);
+            drop(session);
+            engine.shutdown().unwrap();
+        });
     }
 
     #[inline]

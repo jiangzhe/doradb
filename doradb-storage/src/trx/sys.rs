@@ -644,13 +644,9 @@ fn run_trx_cleanup_job(job: TrxCleanupJob) {
             };
             let _ = smol::block_on(trx_sys.cleanup_abandoned_transaction(claim));
         }
-        TrxEntryState::CheckedOutAbandoned => {
-            std::thread::sleep(std::time::Duration::from_millis(1));
-            let trx_sys = engine.trx_sys.clone();
-            trx_sys.request_abandoned_trx_cleanup(engine, session_id, trx_id, reason);
-        }
         TrxEntryState::Active
         | TrxEntryState::CheckedOut
+        | TrxEntryState::CheckedOutAbandoned
         | TrxEntryState::Committing
         | TrxEntryState::RollingBack
         | TrxEntryState::CleanupRunning

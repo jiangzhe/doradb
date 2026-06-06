@@ -469,7 +469,7 @@ impl SessionRegistry {
     }
 
     #[inline]
-    fn notify_trx_changed(&self) {
+    pub(crate) fn notify_trx_changed(&self) {
         self.trx_change_epoch.fetch_add(1, Ordering::AcqRel);
         self.trx_changed.notify(usize::MAX);
     }
@@ -715,10 +715,7 @@ impl SessionState {
                 TrxEntryState::Abandoned | TrxEntryState::CheckedOutAbandoned
             )
             .then(|| entry.trx_id()),
-            SessionLifecycle::AbandonedActive { entry } => {
-                entry.abandon();
-                Some(entry.trx_id())
-            }
+            SessionLifecycle::AbandonedActive { entry } => entry.abandon().then(|| entry.trx_id()),
             SessionLifecycle::RunningIdle
             | SessionLifecycle::AbandonedIdle
             | SessionLifecycle::Closed => None,
@@ -879,6 +876,17 @@ impl TrxAttachment {
             .session_registry
             .finish_trx_rollback(self.session_id, self.trx_id);
     }
+
+    /// Queue rollback cleanup for an abandoned transaction.
+    #[inline]
+    pub(crate) fn request_abandoned_cleanup(&self, reason: TrxCleanupReason) {
+        self.engine.trx_sys.request_abandoned_trx_cleanup(
+            self.engine.clone(),
+            self.session_id,
+            self.trx_id,
+            reason,
+        );
+    }
 }
 
 #[inline]
@@ -900,8 +908,11 @@ fn stale_session_error(id: SessionID, operation: &'static str) -> crate::error::
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use crate::conf::EngineConfig;
+    use crate::trx::{MIN_ACTIVE_TRX_ID, MIN_SNAPSHOT_TS, TrxInner};
     use std::sync::mpsc;
     use std::time::Duration;
+    use tempfile::TempDir;
 
     /// Returns the number of registry-owned sessions for tests.
     #[inline]
@@ -998,6 +1009,57 @@ pub(crate) mod tests {
                 .state
                 .save_active_insert_page(table_id, page_id, row_id);
         }
+    }
+
+    #[test]
+    fn test_shutdown_cleanup_candidate_claims_abandoned_active() {
+        smol::block_on(async {
+            let root = TempDir::new().unwrap();
+            let engine = EngineConfig::default()
+                .storage_root(root.path())
+                .build()
+                .await
+                .unwrap();
+            let session_id = SessionID::new(1);
+            let trx_id = MIN_ACTIVE_TRX_ID;
+            let state = SessionState::new(engine.new_ref().unwrap(), session_id);
+            let entry = TrxEntry::new(TrxInner::new(trx_id, MIN_SNAPSHOT_TS, 0, 0, session_id));
+            {
+                let mut lifecycle = state.lifecycle.lock();
+                *lifecycle = SessionLifecycle::AbandonedActive {
+                    entry: Arc::clone(&entry),
+                };
+            }
+
+            assert_eq!(state.shutdown_cleanup_candidate(), Some(trx_id));
+            assert_eq!(entry.inspect_state(), TrxEntryState::Abandoned);
+        });
+    }
+
+    #[test]
+    fn test_shutdown_cleanup_candidate_skips_unclaimable_abandoned_active() {
+        smol::block_on(async {
+            let root = TempDir::new().unwrap();
+            let engine = EngineConfig::default()
+                .storage_root(root.path())
+                .build()
+                .await
+                .unwrap();
+            let session_id = SessionID::new(1);
+            let trx_id = MIN_ACTIVE_TRX_ID;
+            let state = SessionState::new(engine.new_ref().unwrap(), session_id);
+            let entry = TrxEntry::new(TrxInner::new(trx_id, MIN_SNAPSHOT_TS, 0, 0, session_id));
+            entry.finish(TrxEntryState::Failed);
+            {
+                let mut lifecycle = state.lifecycle.lock();
+                *lifecycle = SessionLifecycle::AbandonedActive {
+                    entry: Arc::clone(&entry),
+                };
+            }
+
+            assert_eq!(state.shutdown_cleanup_candidate(), None);
+            assert_eq!(entry.inspect_state(), TrxEntryState::Failed);
+        });
     }
 
     #[test]

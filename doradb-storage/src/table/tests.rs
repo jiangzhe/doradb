@@ -73,6 +73,8 @@ thread_local! {
         const { RefCell::new(None) };
     static TEST_CHECKPOINT_AFTER_TRX_START_HOOK: RefCell<Option<TableHook>> =
         const { RefCell::new(None) };
+    static TEST_CHECKPOINT_BEFORE_PUBLISH_HOOK: RefCell<Option<TableHook>> =
+        const { RefCell::new(None) };
     static TEST_SECONDARY_CLEANUP_BEFORE_SCAN_HOOK: RefCell<Option<TableHook>> =
         const { RefCell::new(None) };
 }
@@ -172,6 +174,22 @@ where
     });
 }
 
+fn set_test_checkpoint_before_publish_hook<F, Fut>(hook: F)
+where
+    F: FnOnce() -> Fut + 'static,
+    Fut: Future<Output = ()> + 'static,
+{
+    TEST_CHECKPOINT_BEFORE_PUBLISH_HOOK.with(|slot| {
+        let old = slot
+            .borrow_mut()
+            .replace(Box::new(move || Box::pin(hook())));
+        assert!(
+            old.is_none(),
+            "checkpoint before-publish hook already installed"
+        );
+    });
+}
+
 fn set_test_secondary_cleanup_before_scan_hook<F, Fut>(hook: F)
 where
     F: FnOnce() -> Fut + 'static,
@@ -204,6 +222,13 @@ pub(super) async fn run_test_checkpoint_after_readiness_hook() {
 
 pub(super) async fn run_test_checkpoint_after_trx_start_hook() {
     let hook = TEST_CHECKPOINT_AFTER_TRX_START_HOOK.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook().await;
+    }
+}
+
+pub(super) async fn run_test_checkpoint_before_publish_hook() {
+    let hook = TEST_CHECKPOINT_BEFORE_PUBLISH_HOOK.with(|slot| slot.borrow_mut().take());
     if let Some(hook) = hook {
         hook().await;
     }
@@ -6078,12 +6103,12 @@ fn test_checkpoint_holds_session_pin_until_publish_finishes() {
         let result_rx = Rc::new(RefCell::new(None));
         let hook_result_rx = Rc::clone(&result_rx);
         let hook_engine = Arc::clone(&engine);
-        set_test_checkpoint_after_trx_start_hook(move || async move {
+        set_test_checkpoint_before_publish_hook(move || async move {
             let probe = spawn_shutdown_probe(hook_engine);
             assert_shutdown_probe_waiting(probe.started_rx, &probe.done);
             *hook_result_rx.borrow_mut() = Some(probe.result_rx);
         });
-        let _reset = ResetTableHook::new(&TEST_CHECKPOINT_AFTER_TRX_START_HOOK);
+        let _reset = ResetTableHook::new(&TEST_CHECKPOINT_BEFORE_PUBLISH_HOOK);
 
         let outcome = table.checkpoint(&mut session).await.unwrap();
         assert!(matches!(outcome, CheckpointOutcome::Published { .. }));

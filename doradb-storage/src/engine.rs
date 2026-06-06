@@ -773,7 +773,7 @@ mod tests {
     use crate::conf::{EngineConfig, EvictableBufferPoolConfig, FileSystemConfig, TrxSysConfig};
     use crate::error::{ConfigError, ErrorKind, LifecycleError, OperationError, ResourceError};
     use crate::file::fs::tests::io_backend_stats_handle_identity as fs_stats_handle_identity;
-    use crate::id::TrxID;
+    use crate::id::{PageID, TrxID};
     use crate::lock::tests::{debug_snapshot, try_acquire};
     use crate::lock::{LockMode, LockOwner, LockResource};
     use crate::session::tests::{SessionTestExt, session_registry_len};
@@ -1398,6 +1398,40 @@ mod tests {
     }
 
     #[test]
+    fn test_engine_shutdown_rejects_non_terminal_transaction_work() {
+        smol::block_on(async {
+            let root = TempDir::new().unwrap();
+            let engine = test_engine_config_for(root.path()).build().await.unwrap();
+            let table_id = table1(&engine).await;
+            let mut session = engine.new_session().unwrap();
+            let mut trx = session.begin_trx().unwrap();
+
+            let err = match engine.try_shutdown() {
+                Ok(_) => panic!("expected busy shutdown error"),
+                Err(err) => err,
+            };
+            assert_eq!(err.kind(), ErrorKind::Lifecycle);
+            assert_eq!(err.lifecycle_error(), Some(LifecycleError::ShutdownBusy));
+            assert_eq!(err.downcast_ref::<usize>().copied(), Some(1));
+
+            let err = trx
+                .lock_table(table_id, LockMode::Shared)
+                .await
+                .unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::Lifecycle);
+            assert_eq!(err.lifecycle_error(), Some(LifecycleError::Shutdown));
+
+            let err = trx.extend_gc_row_pages(vec![PageID::new(46)]).unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::Lifecycle);
+            assert_eq!(err.lifecycle_error(), Some(LifecycleError::Shutdown));
+
+            trx.rollback().await.unwrap();
+            drop(session);
+            engine.shutdown().unwrap();
+        });
+    }
+
+    #[test]
     fn test_transaction_handle_does_not_retain_runtime_ref() {
         smol::block_on(async {
             let root = TempDir::new().unwrap();
@@ -1608,6 +1642,39 @@ mod tests {
             wait_until(
                 || session.in_trx().is_ok_and(|in_trx| !in_trx),
                 "abandoned transaction cleanup did not return the session to idle",
+            );
+            assert_eq!(lock_entry_count(&engine, owner), 0);
+
+            let replacement = session.begin_trx().unwrap();
+            replacement.rollback().await.unwrap();
+            engine.shutdown().unwrap();
+        });
+    }
+
+    #[test]
+    fn test_checked_out_abandoned_cleanup_runs_after_checkout_return() {
+        smol::block_on(async {
+            let root = TempDir::new().unwrap();
+            let engine = test_engine_config_for(root.path()).build().await.unwrap();
+            let table_id = table1(&engine).await;
+            let mut session = engine.new_session().unwrap();
+            let mut trx = session.begin_trx().unwrap();
+            let owner = LockOwner::Transaction(trx.trx_id());
+
+            trx.lock_table(table_id, LockMode::Shared).await.unwrap();
+            assert!(lock_entry_count(&engine, owner) > 0);
+
+            let checkout = trx
+                .checkout("test checked-out abandoned cleanup after checkout return")
+                .unwrap();
+            drop(trx);
+            assert!(session.in_trx().unwrap());
+            assert!(lock_entry_count(&engine, owner) > 0);
+
+            drop(checkout);
+            wait_until(
+                || session.in_trx().is_ok_and(|in_trx| !in_trx),
+                "checkout return did not schedule abandoned transaction cleanup",
             );
             assert_eq!(lock_entry_count(&engine, owner), 0);
 
