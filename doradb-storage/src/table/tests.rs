@@ -921,7 +921,7 @@ fn test_column_delete_rollback() {
                 &sys.table,
                 &session.pool_guards(),
                 &key,
-                stmt.ctx().sts(),
+                stmt.runtime().sts(),
                 old_row_id,
                 true,
             )
@@ -1127,7 +1127,7 @@ fn test_lwc_update_unique_same_key_reinserts_hot_and_preserves_old_snapshot() {
                     &sys.table,
                     &session.pool_guards(),
                     &key,
-                    stmt.ctx().sts(),
+                    stmt.runtime().sts(),
                     new_row_id,
                     false,
                 )
@@ -1141,7 +1141,7 @@ fn test_lwc_update_unique_same_key_reinserts_hot_and_preserves_old_snapshot() {
                 ));
                 match sys.table.deletion_buffer().get(old_row_id).unwrap() {
                     DeleteMarker::Ref(status) => {
-                        assert!(Arc::ptr_eq(&status, &stmt.ctx().status()));
+                        assert!(Arc::ptr_eq(&status, &stmt.runtime().status()));
                     }
                     DeleteMarker::Committed(_) => {
                         panic!("update should hold an in-flight delete marker")
@@ -1271,7 +1271,7 @@ fn test_lwc_update_unique_key_change_preserves_old_and_new_key_visibility() {
                     &sys.table,
                     &session.pool_guards(),
                     &old_key,
-                    stmt.ctx().sts(),
+                    stmt.runtime().sts(),
                     old_row_id,
                     true,
                 )
@@ -1280,7 +1280,7 @@ fn test_lwc_update_unique_key_change_preserves_old_and_new_key_visibility() {
                     &sys.table,
                     &session.pool_guards(),
                     &new_key,
-                    stmt.ctx().sts(),
+                    stmt.runtime().sts(),
                     new_row_id,
                     false,
                 )
@@ -1547,7 +1547,7 @@ fn test_lwc_update_unique_claim_rollback_restores_deleted_cold_owner() {
                     &sys.table,
                     &session.pool_guards(),
                     &claimed_key,
-                    stmt.ctx().sts(),
+                    stmt.runtime().sts(),
                     new_row_id,
                     false,
                 )
@@ -1667,7 +1667,7 @@ fn test_lwc_update_unique_claim_rollback_drops_purgeable_deleted_cold_owner() {
                     &sys.table,
                     &session.pool_guards(),
                     &claimed_key,
-                    stmt.ctx().sts(),
+                    stmt.runtime().sts(),
                     new_row_id,
                     false,
                 )
@@ -1826,8 +1826,8 @@ fn test_trx_read_proof_root_snapshot_captures_active_root() {
 
         let mut trx = session.begin_trx().unwrap();
         trx.exec(async |stmt| {
-            let (ctx, effects) = stmt_tests::ctx_and_effects_mut(stmt);
-            let proof = ctx.read_proof();
+            let (rt, effects) = stmt_tests::runtime_and_effects_mut(stmt);
+            let proof = rt.read_proof();
             let snapshot = sys.table.root_snapshot(&proof).unwrap();
             let _effects_addr = effects as *mut _;
             sys.table.with_active_root(&proof, |active_root| {
@@ -1846,8 +1846,8 @@ fn test_trx_read_proof_root_snapshot_captures_active_root() {
                     active_root.secondary_index_roots[0]
                 );
                 assert_eq!(
-                    snapshot.root_is_visible_to(ctx.sts()),
-                    active_root.effective_ts() < ctx.sts()
+                    snapshot.root_is_visible_to(rt.sts()),
+                    active_root.effective_ts() < rt.sts()
                 );
             });
             Ok(())
@@ -3582,7 +3582,7 @@ fn test_unique_insert_rollback_restores_deleted_owner_even_when_row_missing() {
                     &sys.table,
                     &session.pool_guards(),
                     &key,
-                    stmt.ctx().sts(),
+                    stmt.runtime().sts(),
                     new_row_id,
                     false,
                 )
@@ -3686,7 +3686,7 @@ fn test_unique_insert_rollback_restores_delete_marked_stale_hot_owner() {
                     &sys.table,
                     &session.pool_guards(),
                     &stale_key,
-                    stmt.ctx().sts(),
+                    stmt.runtime().sts(),
                     new_row_id,
                     false,
                 )
@@ -4268,10 +4268,10 @@ fn test_row_page_transition_retries_update_delete() {
         let res: Result<()> = trx
             .exec(async |stmt| {
                 stmt.acquire_table_write_locks(sys.table.table_id()).await?;
-                let (ctx, effects) = stmt_tests::ctx_and_effects_mut(stmt);
+                let (rt, effects) = stmt_tests::runtime_and_effects_mut(stmt);
                 let layout = sys.table.layout_snapshot();
                 let insert_res = sys.table.accessor_with_layout(&layout).insert_row_to_page(
-                    ctx,
+                    rt,
                     effects,
                     insert_page_guard,
                     insert,
@@ -4291,7 +4291,7 @@ fn test_row_page_transition_retries_update_delete() {
                 let res = sys
                     .table
                     .accessor_with_layout(&layout)
-                    .update_row_inplace(ctx, effects, page_guard, &key, row_id, update)
+                    .update_row_inplace(rt, effects, page_guard, &key, row_id, update)
                     .await;
                 assert!(matches!(res, UpdateRowInplace::RetryInTransition));
                 Err(Report::new(OperationError::NotSupported).into())
@@ -4320,12 +4320,12 @@ fn test_row_page_transition_retries_update_delete() {
         let res: Result<()> = trx
             .exec(async |stmt| {
                 stmt.acquire_table_write_locks(sys.table.table_id()).await?;
-                let (ctx, effects) = stmt_tests::ctx_and_effects_mut(stmt);
+                let (rt, effects) = stmt_tests::runtime_and_effects_mut(stmt);
                 let layout = sys.table.layout_snapshot();
                 let res = sys
                     .table
                     .accessor_with_layout(&layout)
-                    .delete_row_internal(ctx, effects, page_guard, row_id, &key, false)
+                    .delete_row_internal(rt, effects, page_guard, row_id, &key, false)
                     .await;
                 assert!(matches!(res, DeleteInternal::RetryInTransition));
                 Err(Report::new(OperationError::NotSupported).into())
@@ -6175,12 +6175,12 @@ fn test_transition_captures_uncommitted_lock_into_deletion_buffer() {
                     .await
                     .unwrap();
                 stmt.acquire_table_write_locks(sys.table.table_id()).await?;
-                let (ctx, effects) = stmt_tests::ctx_and_effects_mut(stmt);
+                let (rt, effects) = stmt_tests::runtime_and_effects_mut(stmt);
                 let layout = sys.table.layout_snapshot();
                 let mut lock_row = sys
                     .table
                     .accessor_with_layout(&layout)
-                    .lock_row_for_write(ctx, effects, &page_guard, row_id, Some(&key))
+                    .lock_row_for_write(rt, effects, &page_guard, row_id, Some(&key))
                     .await;
                 match &mut lock_row {
                     LockRowForWrite::Ok(access) => {
@@ -6203,7 +6203,7 @@ fn test_transition_captures_uncommitted_lock_into_deletion_buffer() {
                     .set_frozen_pages_to_transition(
                         &session.pool_guards(),
                         &[frozen_page],
-                        stmt.ctx().sts(),
+                        stmt.runtime().sts(),
                     )
                     .await
                     .unwrap();
@@ -6211,7 +6211,7 @@ fn test_transition_captures_uncommitted_lock_into_deletion_buffer() {
                 let marker = sys.table.deletion_buffer().get(row_id).unwrap();
                 match marker {
                     DeleteMarker::Ref(status) => {
-                        assert!(std::sync::Arc::ptr_eq(&status, &stmt.ctx().status()));
+                        assert!(std::sync::Arc::ptr_eq(&status, &stmt.runtime().status()));
                     }
                     DeleteMarker::Committed(_) => {
                         panic!("uncommitted lock should remain as marker ref")
@@ -6286,7 +6286,6 @@ fn test_foreground_lifecycle_rejects_dropping_and_dropped_handles() {
         .await
         .unwrap_err();
         assert_eq!(err.operation_error(), Some(OperationError::TableDropping));
-        assert!(write_trx.readonly());
         assert_eq!(write_trx.commit().await.unwrap(), TrxID::new(0));
 
         sys.table.mark_dropped_lifecycle().unwrap();
@@ -6307,7 +6306,6 @@ fn test_foreground_lifecycle_rejects_dropping_and_dropped_handles() {
         .await
         .unwrap_err();
         assert_eq!(err.operation_error(), Some(OperationError::TableNotFound));
-        assert!(dropped_write.readonly());
         assert_eq!(dropped_write.commit().await.unwrap(), TrxID::new(0));
     });
 }
@@ -6772,7 +6770,6 @@ fn test_drop_table_logical_cascade_and_stale_handles() {
         .await
         .unwrap_err();
         assert_eq!(err.operation_error(), Some(OperationError::TableNotFound));
-        assert!(stale_write.readonly());
         assert_eq!(stale_write.commit().await.unwrap(), TrxID::new(0));
 
         let (later_spec, later_indexes) = drop_table_test_spec();
@@ -7322,13 +7319,13 @@ fn test_checkpoint_readiness_uses_root_effective_ts_not_checkpoint_start_ts() {
             .expect("reader hook should install an active transaction");
         reader
             .exec(async |stmt| {
-                let (ctx, effects) = stmt_tests::ctx_and_effects_mut(stmt);
-                let proof = ctx.read_proof();
+                let (rt, effects) = stmt_tests::runtime_and_effects_mut(stmt);
+                let proof = rt.read_proof();
                 let snapshot = sys.table.root_snapshot(&proof).unwrap();
                 let _effects_addr = effects as *mut _;
-                assert!(snapshot.root_ts() < ctx.sts());
+                assert!(snapshot.root_ts() < rt.sts());
                 assert_eq!(snapshot.effective_ts(), effective_ts);
-                assert!(!snapshot.root_is_visible_to(ctx.sts()));
+                assert!(!snapshot.root_is_visible_to(rt.sts()));
                 Ok(())
             })
             .await

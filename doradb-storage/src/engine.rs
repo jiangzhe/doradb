@@ -335,10 +335,15 @@ impl Engine {
             return Ok(());
         }
 
+        let queued_cleanup = self.queue_shutdown_trx_cleanup(inner);
+        let active_transactions = inner.session_registry.active_transaction_count();
         let strong_count = Arc::strong_count(inner);
-        if strong_count != 1 {
+        if strong_count != 1 || active_transactions != 0 || queued_cleanup != 0 {
+            let busy = (strong_count - 1)
+                .max(active_transactions)
+                .max(queued_cleanup);
             return Err(Report::new(LifecycleError::ShutdownBusy)
-                .attach(strong_count - 1)
+                .attach(busy)
                 .into());
         }
         self.finish_shutdown_locked(inner);
@@ -365,17 +370,25 @@ impl Engine {
                 return Ok(());
             }
 
-            // Transitional active transactions still keep an `EngineRef` alive.
-            // Operation pins do too. Weak public sessions do not block shutdown.
-            // Requiring the last strong reference here gives transaction-system
-            // shutdown a clean point where user-originated runtime pins have
-            // drained before we close idle registry-owned session states.
+            let trx_change_epoch = inner.session_registry.trx_change_epoch();
+            let queued_cleanup = self.queue_shutdown_trx_cleanup(inner);
+            let active_transactions = inner.session_registry.active_transaction_count();
             let strong_count = Arc::strong_count(inner);
-            if strong_count == 1 {
+            if strong_count == 1 && active_transactions == 0 && queued_cleanup == 0 {
                 self.finish_shutdown_locked(inner);
                 return Ok(());
             }
             drop(_shutdown);
+
+            if active_transactions != 0
+                && queued_cleanup == 0
+                && inner.lifecycle.runtime_refs() == 0
+            {
+                inner
+                    .session_registry
+                    .wait_for_trx_change_since(trx_change_epoch);
+                continue;
+            }
 
             // A weak public handle can briefly upgrade to an `Arc<EngineInner>`
             // while it discovers admission is already closed. That raw Arc is
@@ -395,6 +408,25 @@ impl Engine {
 
         self.components().shutdown_all();
         inner.lifecycle.mark_shutdown();
+    }
+
+    #[inline]
+    fn queue_shutdown_trx_cleanup(&self, inner: &Arc<EngineInner>) -> usize {
+        let cleanup = inner.session_registry.collect_shutdown_cleanup();
+        if cleanup.is_empty() {
+            return 0;
+        }
+        let engine_ref = EngineRef::new(Arc::clone(inner));
+        let len = cleanup.len();
+        for (session_id, trx_id, reason) in cleanup {
+            inner.trx_sys.request_abandoned_trx_cleanup(
+                engine_ref.clone(),
+                session_id,
+                trx_id,
+                reason,
+            );
+        }
+        len
     }
 }
 
@@ -445,6 +477,12 @@ impl EngineRef {
     fn new(inner: Arc<EngineInner>) -> Self {
         inner.lifecycle.retain_runtime_ref();
         Self(inner)
+    }
+
+    /// Downgrade this private runtime pin into weak engine reachability.
+    #[inline]
+    pub(crate) fn downgrade(&self) -> WeakEngineRef {
+        WeakEngineRef(Arc::downgrade(&self.0))
     }
 }
 
@@ -522,6 +560,7 @@ impl EngineRef {
 }
 
 /// Crate-private weak reachability handle used by public runtime handles.
+#[derive(Clone)]
 pub(crate) struct WeakEngineRef(Weak<EngineInner>);
 
 impl WeakEngineRef {
@@ -539,6 +578,16 @@ impl WeakEngineRef {
                 .attach(format!("{operation}: engine is no longer reachable"))
                 .into()
         })
+    }
+
+    /// Upgrade weak reachability for explicit terminal cleanup.
+    ///
+    /// This path does not acquire foreground admission: an already-active
+    /// transaction must be able to commit or roll back while owner shutdown is
+    /// waiting for active transactions to finish before component teardown.
+    #[inline]
+    pub(crate) fn upgrade_for_terminal(&self, operation: &'static str) -> Result<EngineRef> {
+        self.upgrade(operation)
     }
 
     /// Best-effort upgrade for nonblocking cleanup hints from `Drop`.
@@ -727,7 +776,7 @@ mod tests {
     use crate::id::TrxID;
     use crate::lock::tests::{debug_snapshot, try_acquire};
     use crate::lock::{LockMode, LockOwner, LockResource};
-    use crate::session::tests::SessionTestExt;
+    use crate::session::tests::{SessionTestExt, session_registry_len};
     use std::fs;
     use std::panic::{AssertUnwindSafe, catch_unwind};
     use std::sync::{Barrier, mpsc};
@@ -761,6 +810,22 @@ mod tests {
             );
             std::thread::yield_now();
         }
+    }
+
+    fn wait_until(mut done: impl FnMut() -> bool, message: &'static str) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !done() {
+            assert!(Instant::now() < deadline, "{message}");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    fn lock_entry_count(engine: &Engine, owner: LockOwner) -> usize {
+        debug_snapshot(engine.lock_manager())
+            .entries
+            .iter()
+            .filter(|entry| entry.owner == owner)
+            .count()
     }
 
     #[test]
@@ -1255,10 +1320,10 @@ mod tests {
             let root = TempDir::new().unwrap();
             let engine = test_engine_config_for(root.path()).build().await.unwrap();
             let mut session = engine.new_session().unwrap();
-            assert_eq!(engine.inner().session_registry.len(), 1);
+            assert_eq!(session_registry_len(&engine.inner().session_registry), 1);
 
             engine.shutdown().unwrap();
-            assert_eq!(engine.inner().session_registry.len(), 0);
+            assert_eq!(session_registry_len(&engine.inner().session_registry), 0);
 
             let err = match engine.new_session() {
                 Ok(_) => panic!("expected shutdown error"),
@@ -1293,7 +1358,7 @@ mod tests {
             let engine = test_engine_config_for(root.path()).build().await.unwrap();
             let session = engine.new_session().unwrap();
             let pin = session.pin("test pinned idle session").unwrap();
-            assert_eq!(engine.inner().session_registry.len(), 1);
+            assert_eq!(session_registry_len(&engine.inner().session_registry), 1);
 
             let err = match engine.try_shutdown() {
                 Ok(_) => panic!("expected busy shutdown error"),
@@ -1302,11 +1367,11 @@ mod tests {
             assert_eq!(err.kind(), ErrorKind::Lifecycle);
             assert_eq!(err.lifecycle_error(), Some(LifecycleError::ShutdownBusy));
             assert_eq!(err.downcast_ref::<usize>().copied(), Some(1));
-            assert_eq!(engine.inner().session_registry.len(), 1);
+            assert_eq!(session_registry_len(&engine.inner().session_registry), 1);
 
             drop(pin);
             engine.shutdown().unwrap();
-            assert_eq!(engine.inner().session_registry.len(), 0);
+            assert_eq!(session_registry_len(&engine.inner().session_registry), 0);
         });
     }
 
@@ -1328,6 +1393,26 @@ mod tests {
 
             trx.rollback().await.unwrap();
             drop(session);
+            engine.shutdown().unwrap();
+        });
+    }
+
+    #[test]
+    fn test_transaction_handle_does_not_retain_runtime_ref() {
+        smol::block_on(async {
+            let root = TempDir::new().unwrap();
+            let engine = test_engine_config_for(root.path()).build().await.unwrap();
+            let mut session = engine.new_session().unwrap();
+            assert_eq!(engine.inner().lifecycle.runtime_refs(), 0);
+
+            let trx = session.begin_trx().unwrap();
+            assert_eq!(
+                engine.inner().lifecycle.runtime_refs(),
+                0,
+                "idle public transaction handles must not retain EngineRef"
+            );
+
+            trx.rollback().await.unwrap();
             engine.shutdown().unwrap();
         });
     }
@@ -1370,7 +1455,7 @@ mod tests {
         let session = engine.new_session().unwrap();
         let pin = session.pin("test pinned idle session").unwrap();
         let (done_tx, done_rx) = mpsc::channel();
-        assert_eq!(engine.inner().session_registry.len(), 1);
+        assert_eq!(session_registry_len(&engine.inner().session_registry), 1);
 
         std::thread::scope(|scope| {
             let shutdown_engine = &engine;
@@ -1386,14 +1471,14 @@ mod tests {
                 done_rx.recv_timeout(Duration::from_millis(20)).is_err(),
                 "shutdown must wait while a SessionPin is alive"
             );
-            assert_eq!(engine.inner().session_registry.len(), 1);
+            assert_eq!(session_registry_len(&engine.inner().session_registry), 1);
 
             drop(pin);
             let result = done_rx
                 .recv_timeout(Duration::from_secs(5))
                 .expect("shutdown should complete after SessionPin drops");
             assert_eq!(result, Ok(()));
-            assert_eq!(engine.inner().session_registry.len(), 0);
+            assert_eq!(session_registry_len(&engine.inner().session_registry), 0);
             shutdown_handle.join().unwrap();
         });
     }
@@ -1451,7 +1536,7 @@ mod tests {
             assert!(!session.in_trx().unwrap());
             session.close().await.unwrap();
             session.close().await.unwrap();
-            assert_eq!(engine.inner().session_registry.len(), 0);
+            assert_eq!(session_registry_len(&engine.inner().session_registry), 0);
             engine.shutdown().unwrap();
         });
     }
@@ -1496,12 +1581,78 @@ mod tests {
             let engine = test_engine_config_for(root.path()).build().await.unwrap();
             let mut session = engine.new_session().unwrap();
             let trx = session.begin_trx().unwrap();
-            assert_eq!(engine.inner().session_registry.len(), 1);
+            assert_eq!(session_registry_len(&engine.inner().session_registry), 1);
 
             drop(session);
-            assert_eq!(engine.inner().session_registry.len(), 1);
+            assert_eq!(session_registry_len(&engine.inner().session_registry), 1);
             trx.rollback().await.unwrap();
-            assert_eq!(engine.inner().session_registry.len(), 0);
+            assert_eq!(session_registry_len(&engine.inner().session_registry), 0);
+            engine.shutdown().unwrap();
+        });
+    }
+
+    #[test]
+    fn test_dropped_transaction_handle_cleanup_releases_locks_and_reuses_session() {
+        smol::block_on(async {
+            let root = TempDir::new().unwrap();
+            let engine = test_engine_config_for(root.path()).build().await.unwrap();
+            let table_id = table1(&engine).await;
+            let mut session = engine.new_session().unwrap();
+            let mut trx = session.begin_trx().unwrap();
+            let owner = LockOwner::Transaction(trx.trx_id());
+
+            trx.lock_table(table_id, LockMode::Shared).await.unwrap();
+            assert!(lock_entry_count(&engine, owner) > 0);
+
+            drop(trx);
+            wait_until(
+                || session.in_trx().is_ok_and(|in_trx| !in_trx),
+                "abandoned transaction cleanup did not return the session to idle",
+            );
+            assert_eq!(lock_entry_count(&engine, owner), 0);
+
+            let replacement = session.begin_trx().unwrap();
+            replacement.rollback().await.unwrap();
+            engine.shutdown().unwrap();
+        });
+    }
+
+    #[test]
+    fn test_dropped_session_live_transaction_can_commit() {
+        smol::block_on(async {
+            let root = TempDir::new().unwrap();
+            let engine = test_engine_config_for(root.path()).build().await.unwrap();
+            let mut session = engine.new_session().unwrap();
+            let mut trx = session.begin_trx().unwrap();
+            crate::trx::tests::add_pseudo_redo_log_entry(&mut trx);
+            assert_eq!(session_registry_len(&engine.inner().session_registry), 1);
+
+            drop(session);
+            assert_eq!(session_registry_len(&engine.inner().session_registry), 1);
+            assert!(trx.commit().await.unwrap() > TrxID::new(0));
+            assert_eq!(session_registry_len(&engine.inner().session_registry), 0);
+
+            engine.shutdown().unwrap();
+        });
+    }
+
+    #[test]
+    fn test_dropping_session_then_transaction_removes_abandoned_session() {
+        smol::block_on(async {
+            let root = TempDir::new().unwrap();
+            let engine = test_engine_config_for(root.path()).build().await.unwrap();
+            let mut session = engine.new_session().unwrap();
+            let trx = session.begin_trx().unwrap();
+            assert_eq!(session_registry_len(&engine.inner().session_registry), 1);
+
+            drop(session);
+            assert_eq!(session_registry_len(&engine.inner().session_registry), 1);
+            drop(trx);
+            wait_until(
+                || session_registry_len(&engine.inner().session_registry) == 0,
+                "abandoned session was not removed after transaction cleanup",
+            );
+
             engine.shutdown().unwrap();
         });
     }

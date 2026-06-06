@@ -10,7 +10,10 @@ use crate::quiescent::QuiescentGuard;
 use crate::trx::log::{LOG_HEADER_PAGES, LogPartitionInitializer, LogPartitionMode, LogSync};
 use crate::trx::purge::{GC, Purge};
 use crate::trx::recover::{RecoveryDeps, log_recover};
-use crate::trx::sys::{TransactionSystem, TransactionSystemWorkers, TransactionSystemWorkersOwned};
+use crate::trx::sys::{
+    TransactionSystem, TransactionSystemQueues, TransactionSystemWorkers,
+    TransactionSystemWorkersOwned, TrxCleanupMessage,
+};
 use byte_unit::Byte;
 use error_stack::ResultExt;
 use flume::{Receiver, Sender};
@@ -61,6 +64,8 @@ pub(crate) struct PendingTransactionSystemStartup {
     gc_rxs: Vec<Receiver<GC>>,
     purge_tx: Sender<Purge>,
     purge_rx: Receiver<Purge>,
+    cleanup_tx: Sender<TrxCleanupMessage>,
+    cleanup_rx: Receiver<TrxCleanupMessage>,
     mem_pool: QuiescentGuard<EvictableBufferPool>,
     pool_guards: PoolGuards,
 }
@@ -83,12 +88,15 @@ impl PendingTransactionSystemStartup {
             self.pool_guards,
             self.purge_rx,
         );
+        let cleanup_thread = TransactionSystem::start_cleanup_thread(self.cleanup_rx);
         TransactionSystemWorkersOwned {
             trx_sys: trx_sys.into_sync(),
             purge_tx: self.purge_tx,
+            cleanup_tx: self.cleanup_tx,
             io_threads: parking_lot::Mutex::new(io_threads),
             gc_threads: parking_lot::Mutex::new(gc_threads),
             purge_threads: parking_lot::Mutex::new(purge_threads),
+            cleanup_thread: parking_lot::Mutex::new(Some(cleanup_thread)),
             shutdown_started: std::sync::atomic::AtomicBool::new(false),
         }
     }
@@ -233,6 +241,7 @@ impl TrxSysConfig {
             .build();
 
         let (purge_tx, purge_rx) = flume::unbounded();
+        let (cleanup_tx, cleanup_rx) = flume::unbounded();
         let (log_partitions, gc_rxs, initial_trx_ts, initial_file_deletes) = log_recover(
             &meta_pool,
             RecoveryDeps {
@@ -252,7 +261,10 @@ impl TrxSysConfig {
             table_fs,
             log_partitions,
             initial_trx_ts,
-            purge_tx.clone(),
+            TransactionSystemQueues {
+                purge_tx: purge_tx.clone(),
+                cleanup_tx: cleanup_tx.clone(),
+            },
             initial_file_deletes,
         );
         Ok((
@@ -261,6 +273,8 @@ impl TrxSysConfig {
                 gc_rxs,
                 purge_tx,
                 purge_rx,
+                cleanup_tx,
+                cleanup_rx,
                 mem_pool,
                 pool_guards,
             },

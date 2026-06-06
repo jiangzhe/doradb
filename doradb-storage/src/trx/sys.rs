@@ -8,7 +8,7 @@ use crate::file::fs::FileSystem;
 use crate::file::table_file::{MutableTableFile, OldRoot, TableFile};
 use crate::id::TrxID;
 use crate::quiescent::{QuiescentBox, QuiescentGuard, SyncQuiescentGuard};
-use crate::session::{SessionState, TrxSessionRef};
+use crate::session::{SessionState, TrxAttachment};
 use crate::thread;
 use crate::trx::group::Commit;
 use crate::trx::log::{LOG_HEADER_PAGES, LogPartition};
@@ -17,7 +17,9 @@ use crate::trx::purge::{DroppedTableFileDeleteItem, DroppedTableQueue, GC, Purge
 use crate::trx::redo::RedoLogs;
 use crate::trx::sys_trx::SysTrx;
 use crate::trx::{
-    MAX_SNAPSHOT_TS, MIN_ACTIVE_TRX_ID, MIN_SNAPSHOT_TS, PreparedTrx, Transaction, TrxEntryState,
+    MAX_SNAPSHOT_TS, MIN_ACTIVE_TRX_ID, MIN_SNAPSHOT_TS, PreparedTrx, StartedTransaction,
+    Transaction, TrxCleanupJob, TrxCleanupReason, TrxCompletionClaim, TrxEntry, TrxEntryState,
+    TrxInner,
 };
 use crossbeam_utils::CachePadded;
 use error_stack::Report;
@@ -93,6 +95,8 @@ pub(crate) struct TransactionSystem {
     pub(super) table_fs: CachePadded<QuiescentGuard<FileSystem>>,
     /// Wakeup channel for purge coordination.
     pub(super) purge_tx: CachePadded<Sender<Purge>>,
+    /// Best-effort abandoned transaction cleanup queue.
+    cleanup_tx: CachePadded<Sender<TrxCleanupMessage>>,
     /// Swapped table roots retained until post-publish readers drain.
     pub(super) table_roots: CachePadded<Mutex<TableRootQueue>>,
     /// Dropped table runtime and file cleanup queues.
@@ -108,10 +112,22 @@ pub(crate) struct TransactionSystemWorkers;
 pub(crate) struct TransactionSystemWorkersOwned {
     pub(crate) trx_sys: SyncQuiescentGuard<TransactionSystem>,
     pub(crate) purge_tx: Sender<Purge>,
+    pub(crate) cleanup_tx: Sender<TrxCleanupMessage>,
     pub(crate) io_threads: Mutex<Vec<JoinHandle<()>>>,
     pub(crate) gc_threads: Mutex<Vec<JoinHandle<()>>>,
     pub(crate) purge_threads: Mutex<Vec<JoinHandle<()>>>,
+    pub(crate) cleanup_thread: Mutex<Option<JoinHandle<()>>>,
     pub(crate) shutdown_started: AtomicBool,
+}
+
+pub(crate) enum TrxCleanupMessage {
+    Job(TrxCleanupJob),
+    Stop,
+}
+
+pub(crate) struct TransactionSystemQueues {
+    pub(crate) purge_tx: Sender<Purge>,
+    pub(crate) cleanup_tx: Sender<TrxCleanupMessage>,
 }
 
 impl TransactionSystem {
@@ -122,7 +138,7 @@ impl TransactionSystem {
         table_fs: QuiescentGuard<FileSystem>,
         log_partitions: Vec<CachePadded<LogPartition>>,
         initial_ts: TrxID,
-        purge_tx: Sender<Purge>,
+        queues: TransactionSystemQueues,
         initial_file_deletes: Vec<DroppedTableFileDeleteItem>,
     ) -> Self {
         debug_assert!((MIN_SNAPSHOT_TS..MAX_SNAPSHOT_TS).contains(&initial_ts));
@@ -134,7 +150,8 @@ impl TransactionSystem {
             config: CachePadded::new(config),
             catalog: CachePadded::new(catalog),
             table_fs: CachePadded::new(table_fs),
-            purge_tx: CachePadded::new(purge_tx),
+            purge_tx: CachePadded::new(queues.purge_tx),
+            cleanup_tx: CachePadded::new(queues.cleanup_tx),
             table_roots: CachePadded::new(Mutex::new(TableRootQueue::default())),
             dropped_tables: CachePadded::new(Mutex::new(DroppedTableQueue::from_file_deletes(
                 initial_file_deletes,
@@ -243,7 +260,7 @@ impl TransactionSystem {
         &self,
         engine: EngineRef,
         session_state: &Arc<SessionState>,
-    ) -> Transaction {
+    ) -> StartedTransaction {
         // Assign log partition index so current transaction will stick
         // to certain log partition for commit.
         let log_no = self.next_log_no();
@@ -270,8 +287,10 @@ impl TransactionSystem {
                 .store(sts.as_u64(), Ordering::Relaxed);
         }
         drop(g); // release bucket lock.
-        let session = TrxSessionRef::new(engine, session_state, trx_id);
-        Transaction::new(session, trx_id, sts, log_no, gc_no)
+        let inner = TrxInner::new(trx_id, sts, log_no, gc_no, session_state.id());
+        let entry = TrxEntry::new(inner);
+        let handle = Transaction::new(engine.downgrade(), session_state.id(), trx_id, sts);
+        StartedTransaction { handle, entry }
     }
 
     /// Returns next log(partition) number.
@@ -298,18 +317,18 @@ impl TransactionSystem {
     /// leader to persist log and backfill CTS.
     /// This strategy can largely reduce logging IO, therefore improve throughput.
     #[inline]
-    pub(crate) async fn commit_transaction(&self, mut trx: Transaction) -> Result<TrxID> {
+    pub(crate) async fn commit_transaction(&self, claim: TrxCompletionClaim) -> Result<TrxID> {
         if let Err(err) = self.ensure_runtime_healthy() {
-            self.rollback_transaction(trx).await?;
+            self.rollback_claim(claim, "rollback poisoned commit")
+                .await?;
             return Err(err.into());
         }
         // Prepare redo log first, this may take some time,
         // so keep it out of lock scope, and we can fill cts after the lock is held.
-        let inner =
-            trx.take_inner_for_terminal(TrxEntryState::Committing, "commit active transaction")?;
+        let (_entry, inner, attachment) = claim.into_parts();
         inner.debug_assert_redo_invariants();
         let partition = &*self.log_partitions[inner.log_no()];
-        let prepared_trx = inner.prepare()?;
+        let prepared_trx = inner.prepare(attachment)?;
         if !prepared_trx.require_ordered_commit() {
             // No runtime effects means there is no CTS to publish and no commit
             // order to preserve. Effects without redo still enter group commit
@@ -342,19 +361,44 @@ impl TransactionSystem {
 
     /// Rollback active transaction.
     #[inline]
-    pub(crate) async fn rollback_transaction(&self, mut trx: Transaction) -> Result<()> {
-        let mut inner =
-            trx.take_inner_for_terminal(TrxEntryState::RollingBack, "rollback active transaction")?;
+    pub(crate) async fn rollback_transaction(&self, claim: TrxCompletionClaim) -> Result<()> {
+        self.rollback_claim(claim, "rollback active transaction")
+            .await
+    }
+
+    /// Rollback an abandoned transaction claimed by cleanup.
+    #[inline]
+    pub(crate) async fn cleanup_abandoned_transaction(
+        &self,
+        claim: TrxCompletionClaim,
+    ) -> Result<()> {
+        self.rollback_claim(claim, "cleanup abandoned transaction")
+            .await
+    }
+
+    #[inline]
+    async fn rollback_claim(
+        &self,
+        claim: TrxCompletionClaim,
+        operation: &'static str,
+    ) -> Result<()> {
+        let (entry, mut inner, attachment) = claim.into_parts();
+        self.rollback_inner(entry.as_ref(), &mut inner, &attachment, operation)
+            .await
+    }
+
+    #[inline]
+    async fn rollback_inner(
+        &self,
+        entry: &TrxEntry,
+        inner: &mut TrxInner,
+        attachment: &TrxAttachment,
+        _operation: &'static str,
+    ) -> Result<()> {
         let sts = inner.sts();
         let log_no = inner.log_no();
         let gc_no = inner.gc_no();
-        let pool_guards = inner
-            .pool_guards()
-            .ok_or_else(|| {
-                Report::new(InternalError::ActiveTransactionDiscarded)
-                    .attach("operation=rollback active transaction")
-            })?
-            .clone();
+        let pool_guards = attachment.pool_guards().clone();
         let mut table_cache = TableCache::new(&self.catalog);
         if inner
             .index_undo_mut()
@@ -362,9 +406,9 @@ impl TransactionSystem {
             .await
             .is_err()
         {
-            trx.entry.publish_state(TrxEntryState::Failed);
-            inner.discard_after_fatal_rollback();
-            trx.entry.finish(TrxEntryState::Failed);
+            entry.publish_state(TrxEntryState::Failed);
+            inner.discard_after_fatal_rollback(attachment);
+            entry.finish(TrxEntryState::Failed);
             return Err(self.poison_storage(FatalError::RollbackAccess).into());
         }
         if inner
@@ -373,16 +417,16 @@ impl TransactionSystem {
             .await
             .is_err()
         {
-            trx.entry.publish_state(TrxEntryState::Failed);
-            inner.discard_after_fatal_rollback();
-            trx.entry.finish(TrxEntryState::Failed);
+            entry.publish_state(TrxEntryState::Failed);
+            inner.discard_after_fatal_rollback(attachment);
+            entry.finish(TrxEntryState::Failed);
             return Err(self.poison_storage(FatalError::RollbackAccess).into());
         }
         inner.effects_mut().clear_for_rollback();
         self.log_partitions[log_no].gc_buckets[gc_no].gc_analyze_rollback(sts);
-        inner.release_transaction_locks();
-        inner.finish_session_rollback();
-        trx.entry.finish(TrxEntryState::Terminal);
+        inner.release_transaction_locks(attachment);
+        inner.finish_session_rollback(attachment);
+        entry.finish(TrxEntryState::Terminal);
         Ok(())
     }
 
@@ -400,7 +444,7 @@ impl TransactionSystem {
             .expect("prepared no-op cleanup requires user transaction payload");
         self.log_partitions[payload.log_no].gc_buckets[payload.gc_no]
             .gc_analyze_rollback(payload.sts);
-        if let Some(s) = trx.session.take() {
+        if let Some(s) = trx.attachment.take() {
             s.rollback();
         }
         trx.release_transaction_locks();
@@ -483,6 +527,36 @@ impl TransactionSystem {
         handles
     }
 
+    /// Start the abandoned transaction cleanup worker.
+    #[inline]
+    pub(crate) fn start_cleanup_thread(cleanup_rx: Receiver<TrxCleanupMessage>) -> JoinHandle<()> {
+        thread::spawn_named("Trx-Cleanup-Thread", move || {
+            while let Ok(message) = cleanup_rx.recv() {
+                match message {
+                    TrxCleanupMessage::Job(job) => run_trx_cleanup_job(job),
+                    TrxCleanupMessage::Stop => return,
+                }
+            }
+        })
+    }
+
+    /// Queue abandoned transaction rollback cleanup.
+    #[inline]
+    pub(crate) fn request_abandoned_trx_cleanup(
+        &self,
+        engine: EngineRef,
+        session_id: crate::id::SessionID,
+        trx_id: TrxID,
+        reason: TrxCleanupReason,
+    ) {
+        let _ = self.cleanup_tx.send(TrxCleanupMessage::Job(TrxCleanupJob {
+            engine,
+            session_id,
+            trx_id,
+            reason,
+        }));
+    }
+
     #[inline]
     #[cfg_attr(not(test), expect(dead_code, reason = "reserved log_reader"))]
     pub(crate) fn log_reader(&self, log_file_path: impl AsRef<Path>) -> Result<MmapLogReader> {
@@ -539,6 +613,50 @@ pub(crate) struct TrxSysStats {
     pub(crate) purge_trx_count: usize,
     pub(crate) purge_row_count: usize,
     pub(crate) purge_index_count: usize,
+}
+
+#[inline]
+fn run_trx_cleanup_job(job: TrxCleanupJob) {
+    let TrxCleanupJob {
+        engine,
+        session_id,
+        trx_id,
+        reason,
+    } = job;
+    let operation = match reason {
+        TrxCleanupReason::HandleDrop => "cleanup dropped transaction handle",
+        TrxCleanupReason::ShutdownDrain => "cleanup shutdown abandoned transaction",
+    };
+    let (entry, session) = match engine
+        .session_registry
+        .resolve_trx(session_id, trx_id, operation)
+    {
+        Ok(parts) => parts,
+        Err(_) => return,
+    };
+    match entry.inspect_state() {
+        TrxEntryState::Abandoned => {
+            let trx_sys = engine.trx_sys.clone();
+            let attachment = TrxAttachment::new(engine, session, trx_id);
+            let claim = match TrxCompletionClaim::cleanup(entry, attachment, operation) {
+                Ok(claim) => claim,
+                Err(_) => return,
+            };
+            let _ = smol::block_on(trx_sys.cleanup_abandoned_transaction(claim));
+        }
+        TrxEntryState::CheckedOutAbandoned => {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+            let trx_sys = engine.trx_sys.clone();
+            trx_sys.request_abandoned_trx_cleanup(engine, session_id, trx_id, reason);
+        }
+        TrxEntryState::Active
+        | TrxEntryState::CheckedOut
+        | TrxEntryState::Committing
+        | TrxEntryState::RollingBack
+        | TrxEntryState::CleanupRunning
+        | TrxEntryState::Terminal
+        | TrxEntryState::Failed => {}
+    }
 }
 
 impl Component for TransactionSystem {
@@ -639,6 +757,12 @@ impl Component for TransactionSystemWorkers {
         }
         let gc_threads = { mem::take(&mut *component.gc_threads.lock()) };
         for handle in gc_threads {
+            handle.join().unwrap();
+        }
+
+        let _ = component.cleanup_tx.send(TrxCleanupMessage::Stop);
+        let cleanup_thread = { component.cleanup_thread.lock().take() };
+        if let Some(handle) = cleanup_thread {
             handle.join().unwrap();
         }
 

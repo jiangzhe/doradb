@@ -127,10 +127,9 @@ impl Indexes<'_> {
         stmt: &mut Statement<'_>,
         table_id: TableID,
     ) -> Result<usize> {
-        let Some(guards) = stmt.ctx().pool_guards().cloned() else {
-            return Ok(0);
-        };
-        let indexes = self.list_uncommitted_by_table_id(&guards, table_id).await?;
+        let indexes = self
+            .list_uncommitted_by_table_id(stmt.runtime().pool_guards(), table_id)
+            .await?;
         let mut deleted = 0;
         for index in indexes {
             if self.delete_by_id(stmt, table_id, index.index_no).await {
@@ -314,10 +313,9 @@ impl IndexColumns<'_> {
         table_id: TableID,
         index_no: u16,
     ) -> Result<usize> {
-        let Some(guards) = stmt.ctx().pool_guards().cloned() else {
-            return Ok(0);
-        };
-        let index_columns = self.list_uncommitted_by_table_id(&guards, table_id).await?;
+        let index_columns = self
+            .list_uncommitted_by_table_id(stmt.runtime().pool_guards(), table_id)
+            .await?;
         let mut deleted = 0;
         for index_column in index_columns
             .into_iter()
@@ -339,10 +337,9 @@ impl IndexColumns<'_> {
         stmt: &mut Statement<'_>,
         table_id: TableID,
     ) -> Result<usize> {
-        let Some(guards) = stmt.ctx().pool_guards().cloned() else {
-            return Ok(0);
-        };
-        let index_columns = self.list_uncommitted_by_table_id(&guards, table_id).await?;
+        let index_columns = self
+            .list_uncommitted_by_table_id(stmt.runtime().pool_guards(), table_id)
+            .await?;
         let mut deleted = 0;
         for index_column in index_columns {
             if self

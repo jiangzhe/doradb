@@ -175,10 +175,9 @@ impl Columns<'_> {
         stmt: &mut Statement<'_>,
         table_id: TableID,
     ) -> Result<usize> {
-        let Some(guards) = stmt.ctx().pool_guards().cloned() else {
-            return Ok(0);
-        };
-        let columns = self.list_uncommitted_by_table_id(&guards, table_id).await?;
+        let columns = self
+            .list_uncommitted_by_table_id(stmt.runtime().pool_guards(), table_id)
+            .await?;
         let mut deleted = 0;
         for column in columns {
             if self.delete_by_id(stmt, table_id, column.column_no).await {

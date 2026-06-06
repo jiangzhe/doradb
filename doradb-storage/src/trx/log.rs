@@ -464,14 +464,14 @@ impl LogPartition {
 
     #[inline]
     pub(super) fn commit_no_wait(&self, trx: PreparedTrx, global_ts: &AtomicU64) -> Result<TrxID> {
-        debug_assert!(trx.session.is_none());
+        debug_assert!(trx.attachment.is_none());
         // This API is for sessionless system transactions only.
         //
         // System transactions are used to durably piggyback internal state
         // changes that become globally visible once the redo group commits. They
         // do not participate in user-session rollback semantics, so this path
         // intentionally returns immediately without a waiter or a detached
-        // session handle.
+        // transaction attachment.
         //
         // Do not route a session-bound user transaction here. The user path must
         // wait for durability so the caller can commit/rollback the session
@@ -1477,7 +1477,7 @@ mod tests {
                 cts,
                 redo_bin: None,
                 payload: None,
-                session: None,
+                attachment: None,
                 lock_manager: None,
                 lock_state: None,
             }],

@@ -11,7 +11,7 @@ use crate::trx::undo::{
     RowUndoKind, RowUndoRef, UndoStatus,
 };
 use crate::trx::ver_map::{RowPageState, RowVersionReadGuard, RowVersionWriteGuard};
-use crate::trx::{SharedTrxStatus, TrxContext, trx_is_committed};
+use crate::trx::{SharedTrxStatus, TrxContext, TrxRuntime, trx_is_committed};
 use crate::value::Val;
 use event_listener::EventListener;
 use parking_lot::RwLockReadGuard;
@@ -751,7 +751,7 @@ impl<'a> RowWriteAccess<'a> {
     #[inline]
     pub(crate) fn lock_undo(
         &mut self,
-        ctx: &TrxContext,
+        rt: TrxRuntime<'_>,
         effects: &mut StmtEffects,
         metadata: &TableMetadata,
         table_id: TableID,
@@ -759,7 +759,8 @@ impl<'a> RowWriteAccess<'a> {
         row_id: RowID,
         key: Option<&SelectKey>,
     ) -> LockUndo {
-        ctx.debug_assert_table_write_lock_held(table_id);
+        rt.debug_assert_table_write_lock_held(table_id);
+        let ctx = rt.ctx();
         let row = self.page.row(self.row_idx);
         match &mut *self.guard {
             None => {
@@ -1106,7 +1107,6 @@ mod tests {
 
     fn test_trx_context(sts: TrxID) -> TrxContext {
         TrxContext {
-            session: None,
             status: Arc::new(SharedTrxStatus::new(MIN_ACTIVE_TRX_ID + sts.as_u64())),
             sts,
             log_no: 0,

@@ -787,10 +787,10 @@ code is visible.
   - Non-goals: Do not redesign MVCC, redo, group commit, rollback, or logical
     lock semantics except to execute rollback cleanup safely through the Phase 5
     stable-entry model. Do not migrate public table APIs.
-  - Task Doc: `docs/tasks/TBD.md`
-  - Task Issue: `#0`
-  - Phase Status: `pending`
-  - Implementation Summary: `pending`
+  - Task Doc: `docs/tasks/000168-weak-transaction-handle-and-abandoned-cleanup.md`
+  - Task Issue: `#683`
+  - Phase Status: done
+  - Implementation Summary: Implemented RFC-0019 Phase 6 weak transaction handles: public `Transaction` now stores weak engine reachability plus `(SessionID, TrxID)` instead of `Arc<TrxEntry>`, `TrxAttachment`, or strong `EngineRef`; public operations resolve through `SessionRegistry`; private checkout and completion claims own strong runtime pins only for their operation; `TrxRuntime` borrows immutable `TrxContext` plus the operation attachment for table APIs without storing runtime reachability in checked-in transaction state; transaction drop marks matching active entries abandoned and queues transaction-system cleanup; abandoned cleanup performs rollback-equivalent cleanup through a dedicated cleanup worker; and shutdown now scans session-owned transaction state, waits for live active handles, and drains abandoned cleanup before component teardown. [Task Resolve Sync: docs/tasks/000168-weak-transaction-handle-and-abandoned-cleanup.md @ 2026-06-04]
 
 - **Phase 7: Table Handle Catalog Ownership**
   - Scope: Replace public `Arc<Table>` exposure with a non-cloneable weak
