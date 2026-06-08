@@ -6959,6 +6959,40 @@ fn test_drop_table_commit_poison_preserves_source_error() {
 }
 
 #[test]
+fn test_user_insert_commit_poison_rolls_back_session_before_return() {
+    smol::block_on(async {
+        let sys = TestSys::new_lightweight_evictable().await;
+        let mut session = sys.new_session().unwrap();
+        sys.new_trx_insert(&mut session, vec![Val::from(1), Val::from("seed")])
+            .await;
+        let redo_file_path = sys
+            ._temp_dir
+            .path()
+            .join("redo_testsys_lightweight.0.00000000");
+        let hook = Arc::new(FailingFirstWriteHook::new(redo_file_path));
+        let _install = install_storage_backend_test_hook(hook.clone());
+
+        let mut trx = session.begin_trx().unwrap();
+        trx = sys
+            .trx_insert(trx, vec![Val::from(169), Val::from("redo-fail")])
+            .await;
+        let err = trx.commit().await.unwrap_err();
+        let report = format!("{err:?}");
+
+        assert!(hook.call_count() > 0);
+        assert!(report.contains("redo write failed"), "{report}");
+        assert!(
+            sys.engine
+                .trx_sys
+                .storage_poison_error()
+                .as_ref()
+                .is_some_and(|err| *err.current_context() == FatalError::RedoWrite)
+        );
+        assert_eq!(sys.engine.session_registry.active_transaction_count(), 0);
+    });
+}
+
+#[test]
 fn test_drop_table_waits_for_active_metadata_reader() {
     smol::block_on(async {
         let sys = TestSys::new_lightweight_evictable().await;
@@ -8129,6 +8163,7 @@ fn test_mvcc_rollback_poisons_runtime_on_row_page_reload_error() {
                 .as_ref()
                 .is_some_and(|err| *err.current_context() == FatalError::RollbackAccess)
         );
+        assert_eq!(sys.engine.trx_sys.fatal_rollback_retention_len(), 1);
         assert!(
             sys.engine
                 .trx_sys
@@ -8226,6 +8261,7 @@ fn test_statement_rollback_poisons_runtime_on_row_page_reload_error() {
                 .as_ref()
                 .is_some_and(|err| *err.current_context() == FatalError::RollbackAccess)
         );
+        assert_eq!(sys.engine.trx_sys.fatal_rollback_retention_len(), 1);
         assert!(!session.in_trx().unwrap());
 
         let err = trx.rollback().await.unwrap_err();

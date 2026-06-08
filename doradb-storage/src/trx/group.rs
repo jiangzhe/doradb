@@ -2,9 +2,9 @@ use crate::file::SparseFile;
 use crate::id::TrxID;
 use crate::io::Completion;
 use crate::serde::Ser;
-use crate::trx::PrecommitTrx;
 use crate::trx::log::{LogWriteSubmission, SyncGroup};
 use crate::trx::log_replay::LogBuf;
+use crate::trx::{FailedPrecommitReason, PrecommitTrx};
 use parking_lot::{Condvar, Mutex, MutexGuard, WaitTimeoutResult};
 use std::collections::VecDeque;
 use std::os::fd::RawFd;
@@ -58,8 +58,20 @@ pub(super) struct GroupCommit {
     // Each of them submits one redo write into the backend-neutral worker and
     // then waits for write completion plus the configured sync step.
     pub(super) queue: VecDeque<Commit>,
+    // Closed admission reason. Shutdown messages only wake the worker; this
+    // flag is the source of truth for rejecting new precommit handoffs.
+    pub(super) closed: Option<FailedPrecommitReason>,
     // Current log file.
     pub(super) log_file: Option<SparseFile>,
+}
+
+impl GroupCommit {
+    #[inline]
+    pub(super) fn close(&mut self, reason: FailedPrecommitReason) {
+        if self.closed.is_none() {
+            self.closed = Some(reason);
+        }
+    }
 }
 
 pub(super) enum Commit {

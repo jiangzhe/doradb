@@ -17,9 +17,9 @@ use crate::trx::purge::{DroppedTableFileDeleteItem, DroppedTableQueue, GC, Purge
 use crate::trx::redo::RedoLogs;
 use crate::trx::sys_trx::SysTrx;
 use crate::trx::{
-    MAX_SNAPSHOT_TS, MIN_ACTIVE_TRX_ID, MIN_SNAPSHOT_TS, PreparedTrx, StartedTransaction,
-    Transaction, TrxCleanupJob, TrxCleanupReason, TrxCompletionClaim, TrxEntry, TrxEntryState,
-    TrxInner,
+    FailedPrecommitCleanupJob, FailedPrecommitReason, FatalRollbackRetention, MAX_SNAPSHOT_TS,
+    MIN_ACTIVE_TRX_ID, MIN_SNAPSHOT_TS, PreparedTrx, StartedTransaction, Transaction,
+    TrxCleanupJob, TrxCleanupReason, TrxCompletionClaim, TrxEntry, TrxEntryState, TrxInner,
 };
 use crossbeam_utils::CachePadded;
 use error_stack::Report;
@@ -105,6 +105,13 @@ pub(crate) struct TransactionSystem {
     storage_poisoned: CachePadded<AtomicBool>,
     /// First fatal storage reason that poisoned runtime admission.
     storage_poison_err: CachePadded<Mutex<Option<FatalError>>>,
+    /// Rollback payloads retained after fatal rollback cleanup failure.
+    ///
+    /// Poisoning stops future admitted work, but row-version maps can already
+    /// contain raw references into row undo owned by a transaction payload.
+    /// Fatal rollback failures move those payloads here so reachable
+    /// `RowUndoRef`s remain valid until component teardown drops the engine.
+    fatal_rollback_retention: CachePadded<Mutex<Vec<FatalRollbackRetention>>>,
 }
 
 pub(crate) struct TransactionSystemWorkers;
@@ -120,8 +127,18 @@ pub(crate) struct TransactionSystemWorkersOwned {
     pub(crate) shutdown_started: AtomicBool,
 }
 
+/// Message consumed by the single transaction cleanup worker.
+///
+/// The worker serializes cleanup that cannot be performed from `Drop` or the
+/// redo worker. `Stop` is a drain barrier, not an immediate cancellation: after
+/// it is received, the worker runs any messages already pending behind the
+/// marker before exiting.
 pub(crate) enum TrxCleanupMessage {
+    /// Best-effort rollback for a dropped or shutdown-discovered active transaction.
     Job(TrxCleanupJob),
+    /// Mandatory rollback for transactions that reached precommit but cannot commit.
+    FailedPrecommit(FailedPrecommitCleanupJob),
+    /// Shutdown marker consumed after redo workers can no longer enqueue cleanup.
     Stop,
 }
 
@@ -158,6 +175,7 @@ impl TransactionSystem {
             ))),
             storage_poisoned: CachePadded::new(AtomicBool::new(false)),
             storage_poison_err: CachePadded::new(Mutex::new(None)),
+            fatal_rollback_retention: CachePadded::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -213,6 +231,26 @@ impl TransactionSystem {
         self.storage_poison_error().unwrap_or_else(|| {
             Report::new(FatalError::Poisoned).attach(format!("poisoned_by={reason}"))
         })
+    }
+
+    /// Retain undo/effect ownership after rollback can no longer finish safely.
+    ///
+    /// This is only for fatal rollback access failures after storage has been
+    /// poisoned. It is not a retry queue: retention is the memory-lifetime
+    /// guarantee for raw row-undo pointers that may still be reachable from
+    /// in-memory row-version chains.
+    #[inline]
+    pub(in crate::trx) fn retain_fatal_rollback(&self, retention: FatalRollbackRetention) {
+        if retention.is_empty() {
+            return;
+        }
+        self.fatal_rollback_retention.lock().push(retention);
+    }
+
+    #[inline]
+    #[cfg(test)]
+    pub(crate) fn fatal_rollback_retention_len(&self) -> usize {
+        self.fatal_rollback_retention.lock().len()
     }
 
     /// Mark a user-table root publication effective and retain the swapped root.
@@ -337,7 +375,7 @@ impl TransactionSystem {
             return Ok(TrxID::new(0));
         }
         // start group commit
-        partition.commit(prepared_trx, &self.ts, true).await
+        partition.commit(prepared_trx, self, &self.ts).await
     }
 
     #[inline]
@@ -356,7 +394,7 @@ impl TransactionSystem {
         const LOG_NO: usize = 0;
         let partition = &*self.log_partitions[LOG_NO];
         let prepared_trx = trx.prepare();
-        partition.commit_no_wait(prepared_trx, &self.ts)
+        partition.commit_no_wait(prepared_trx, self, &self.ts)
     }
 
     /// Rollback active transaction.
@@ -407,7 +445,8 @@ impl TransactionSystem {
             .is_err()
         {
             entry.publish_state(TrxEntryState::Failed);
-            inner.discard_after_fatal_rollback(attachment);
+            let retention = inner.retain_and_discard_after_fatal_rollback(attachment);
+            self.retain_fatal_rollback(retention);
             entry.finish(TrxEntryState::Failed);
             return Err(self.poison_storage(FatalError::RollbackAccess).into());
         }
@@ -418,7 +457,8 @@ impl TransactionSystem {
             .is_err()
         {
             entry.publish_state(TrxEntryState::Failed);
-            inner.discard_after_fatal_rollback(attachment);
+            let retention = inner.retain_and_discard_after_fatal_rollback(attachment);
+            self.retain_fatal_rollback(retention);
             entry.finish(TrxEntryState::Failed);
             return Err(self.poison_storage(FatalError::RollbackAccess).into());
         }
@@ -527,20 +567,37 @@ impl TransactionSystem {
         handles
     }
 
-    /// Start the abandoned transaction cleanup worker.
+    /// Start the transaction cleanup worker.
+    ///
+    /// The thread blocks once at the top level, then handles cleanup messages
+    /// through async rollback code. It exits only when the sender side is gone
+    /// or when it receives `Stop`; in the `Stop` case it drains any messages
+    /// already queued behind the marker. Worker shutdown relies on this drain
+    /// behavior to let failed-precommit handoffs finish before lower-level
+    /// table, pool, and file components are torn down.
     #[inline]
     pub(crate) fn start_cleanup_thread(cleanup_rx: Receiver<TrxCleanupMessage>) -> JoinHandle<()> {
         thread::spawn_named("Trx-Cleanup-Thread", move || {
-            while let Ok(message) = cleanup_rx.recv() {
-                match message {
-                    TrxCleanupMessage::Job(job) => run_trx_cleanup_job(job),
-                    TrxCleanupMessage::Stop => return,
+            smol::block_on(async move {
+                while let Ok(message) = cleanup_rx.recv_async().await {
+                    if run_trx_cleanup_message(message).await {
+                        continue;
+                    }
+                    while let Ok(message) = cleanup_rx.try_recv() {
+                        let _ = run_trx_cleanup_message(message).await;
+                    }
+                    return;
                 }
-            }
+            })
         })
     }
 
     /// Queue abandoned transaction rollback cleanup.
+    ///
+    /// This is a best-effort signal from public-handle drop or owner shutdown
+    /// scanning. During normal operation the receiver is alive; during owner
+    /// shutdown, the engine keeps scanning and waiting for active transaction
+    /// state to become terminal before component teardown starts.
     #[inline]
     pub(crate) fn request_abandoned_trx_cleanup(
         &self,
@@ -555,6 +612,32 @@ impl TransactionSystem {
             trx_id,
             reason,
         }));
+    }
+
+    /// Queue failed-precommit rollback cleanup.
+    ///
+    /// Unlike abandoned cleanup, this is not best effort. A user precommit
+    /// transaction owns undo memory that in-memory MVCC structures can still
+    /// reference until rollback runs. Therefore every failed-precommit producer
+    /// must enqueue cleanup before waiters are completed.
+    ///
+    /// Send failure means the cleanup receiver is gone. That should be
+    /// unreachable for normal shutdown: transaction-system worker shutdown
+    /// first closes group-commit admission, wakes and joins all redo workers,
+    /// and only then sends cleanup `Stop` and joins the cleanup worker.
+    #[inline]
+    pub(crate) fn request_failed_precommit_cleanup(&self, job: FailedPrecommitCleanupJob) {
+        if let Err(err) = self
+            .cleanup_tx
+            .send(TrxCleanupMessage::FailedPrecommit(job))
+        {
+            // The returned job may own rollback-capable `PrecommitTrx` payloads.
+            // Do not drop, discard, or run it from this synchronous caller. The
+            // closed receiver means the worker-lifetime invariant is already
+            // broken, so leak the payload and fail at the invariant boundary.
+            std::mem::forget(err.0);
+            panic!("failed-precommit cleanup receiver closed before redo workers stopped");
+        }
     }
 
     #[inline]
@@ -616,7 +699,7 @@ pub(crate) struct TrxSysStats {
 }
 
 #[inline]
-fn run_trx_cleanup_job(job: TrxCleanupJob) {
+async fn run_trx_cleanup_job(job: TrxCleanupJob) {
     let TrxCleanupJob {
         engine,
         session_id,
@@ -642,7 +725,7 @@ fn run_trx_cleanup_job(job: TrxCleanupJob) {
                 Ok(claim) => claim,
                 Err(_) => return,
             };
-            let _ = smol::block_on(trx_sys.cleanup_abandoned_transaction(claim));
+            let _ = trx_sys.cleanup_abandoned_transaction(claim).await;
         }
         TrxEntryState::Active
         | TrxEntryState::CheckedOut
@@ -652,6 +735,21 @@ fn run_trx_cleanup_job(job: TrxCleanupJob) {
         | TrxEntryState::CleanupRunning
         | TrxEntryState::Terminal
         | TrxEntryState::Failed => {}
+    }
+}
+
+#[inline]
+async fn run_trx_cleanup_message(message: TrxCleanupMessage) -> bool {
+    match message {
+        TrxCleanupMessage::Job(job) => {
+            run_trx_cleanup_job(job).await;
+            true
+        }
+        TrxCleanupMessage::FailedPrecommit(job) => {
+            job.run().await;
+            true
+        }
+        TrxCleanupMessage::Stop => false,
     }
 }
 
@@ -735,14 +833,25 @@ impl Component for TransactionSystemWorkers {
         // Shutdown is independent from storage poison. A poisoned runtime may
         // have already caused one worker to exit early, but owner-side teardown
         // still has to signal every channel and join every worker handle.
+        //
+        // Cleanup lifetime invariant:
+        // 1. Close group-commit admission and wake redo workers.
+        // 2. Join redo workers, so all queued/inflight failed-precommit groups
+        //    have either committed or handed rollback jobs to cleanup.
+        // 3. Join GC workers that can receive committed transaction payloads.
+        // 4. Send cleanup Stop; the cleanup worker drains already queued
+        //    abandoned and failed-precommit jobs before it exits.
+        //
+        // This keeps rollback-capable precommit payloads alive until cleanup
+        // resolves them, and keeps cleanup ahead of Catalog/pool/file teardown
+        // because TransactionSystemWorkers shuts down before those components.
         let log_partitions = &*component.trx_sys.log_partitions;
         for partition in log_partitions {
             {
                 let mut group_commit_g = partition.group_commit.lock();
+                group_commit_g.close(FailedPrecommitReason::Shutdown);
                 group_commit_g.queue.push_back(Commit::Shutdown);
-                if group_commit_g.queue.len() == 1 {
-                    partition.group_commit.notify_one();
-                }
+                partition.group_commit.notify_one();
             }
             let _ = partition.gc_chan.send(GC::Stop);
         }

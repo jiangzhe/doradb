@@ -515,7 +515,7 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
         guards: &PoolGuards,
         rollback_sts: TrxID,
         on_cold_row_rollback: F,
-    ) -> Result<()>
+    ) -> std::result::Result<(), (Error, OwnedRowUndo)>
     where
         F: FnOnce(RowID),
     {
@@ -527,7 +527,11 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
             on_cold_row_rollback(entry.row_id);
             return Ok(());
         }
-        let Some(page_guard) = self.get_row_page_versioned_shared(guards, page_id).await? else {
+        let page_guard = match self.get_row_page_versioned_shared(guards, page_id).await {
+            Ok(page_guard) => page_guard,
+            Err(err) => return Err((err, entry)),
+        };
+        let Some(page_guard) = page_guard else {
             return Ok(());
         };
         let (ctx, page) = page_guard.ctx_and_page();
