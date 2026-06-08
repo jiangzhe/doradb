@@ -1,7 +1,7 @@
 ---
 id: 000169
 title: Fix Failed Precommit Redo Cleanup
-status: proposal
+status: implemented
 created: 2026-06-07
 github_issue: 685
 ---
@@ -174,6 +174,52 @@ inventory according to the repository process.
 
 ## Implementation Notes
 
+Implemented in branch `precommit-cleanup`.
+
+- Reworked precommit payload ownership so CTS assignment no longer converts
+  `IndexUndoLogs` into committed index GC. `PrecommitTrx::commit` now performs
+  the successful-commit conversion, while failed precommit retains
+  rollback-capable row and index undo until cleanup finishes or fatal retention
+  takes ownership.
+- Added failed-precommit cleanup handoff through the transaction cleanup worker.
+  Cleanup runs rollback in reverse precommit order, releases locks/session
+  state before completing redo waiters, preserves the original redo poison
+  source, and retains rollback payloads on fatal rollback access failure so
+  reachable row-version undo pointers remain valid until engine teardown.
+- Removed caller-side blocking rollback fallback for failed cleanup-send
+  failures. The cleanup receiver lifetime is now treated as a worker-shutdown
+  invariant; send failure leaks the returned job and panics rather than dropping
+  rollback-capable payloads.
+- Hardened redo group commit failure handling: group-commit admission uses the
+  closed-state flag rather than relying on a queued shutdown message, redo
+  workers drain cleanup before shutdown, and failed inflight redo groups form a
+  sequential durability boundary so failed groups cannot contribute to fsync
+  bytes or advance `persisted_cts`.
+- Added engine-owned fatal rollback retention for active, statement, and
+  precommit effects. Row rollback now returns failed `OwnedRowUndo` ownership
+  to callers so fatal retention keeps the exact undo entries referenced by row
+  version chains.
+- Simplified no-wait system commit by removing the unused `trx_sys` argument
+  from `LogPartition::commit_no_wait`; rejected no-wait system commits remain
+  sessionless discard-only and do not use failed-precommit retention.
+- Documented the failed-precommit and fatal retention invariants near the code
+  that enforces them, including the sequential redo failure boundary.
+- Created follow-up backlog
+  `docs/backlogs/000120-simplify-redo-single-log-stream.md` for the broader
+  logging topology simplification discovered during implementation.
+
+Validation completed during resolve:
+
+- `cargo nextest run -p doradb-storage`: 914 passed.
+- `tools/coverage_focus.rs --path doradb-storage/src/trx --path doradb-storage/src/table --top-uncovered 15 --write target/coverage/task-000169-focus.md`:
+  `trx` 94.31%, `table` 91.11%, combined 92.44%. Whole-file
+  `table/mem_table.rs` reported 79.35%, but the changed rollback ownership
+  return path is covered by the fatal rollback reload tests and the directory
+  target is above the 80% checklist threshold.
+- `cargo fmt --check`
+- `cargo check -p doradb-storage`
+- `cargo clippy -p doradb-storage --all-targets -- -D warnings`
+- `git diff --check`
 
 ## Impacts
 
@@ -250,14 +296,16 @@ inventory according to the repository process.
 
 ## Open Questions
 
-1. If failed-precommit rollback access fails after redo has already poisoned
-   storage, should the implementation only preserve the first redo poison
-   source, or should it also retain secondary rollback-cleanup diagnostics in a
-   structured way? The task should preserve the current first-poison behavior
-   unless implementation finds an existing diagnostics channel for secondary
-   fatal cleanup context.
+None for the implemented scope.
 
-2. Public reads after redo poison may be rejected by runtime admission, so some
-   row/index rollback assertions may need to be internal tests that inspect the
-   cleanup path directly rather than public session queries after the engine is
-   poisoned.
+Resolved decisions:
+
+1. The implementation preserves the current first-poison behavior. Rollback
+   access failure after a redo poison can retain rollback payloads and attempts
+   to poison with `FatalError::RollbackAccess`, but the original redo poison
+   remains the canonical storage poison source.
+2. Some assertions are intentionally internal tests because public reads after
+   storage poison are rejected by runtime admission. Tests inspect cleanup
+   effects, retained payloads, and session/lock terminal state directly.
+3. Broader removal of partitioned redo logging is deferred to
+   `docs/backlogs/000120-simplify-redo-single-log-stream.md`.

@@ -42,3 +42,11 @@ When a backlog item is moved to `docs/backlogs/closed/`, append:
 - Reference: <task/issue/pr reference>
 - Closed At: <YYYY-MM-DD>
 ```
+
+## Close Reason
+
+- Type: implemented
+- Detail: Implemented via docs/tasks/000169-fix-failed-precommit-redo-cleanup.md
+- Closed By: backlog close
+- Reference: User decision
+- Closed At: 2026-06-08
