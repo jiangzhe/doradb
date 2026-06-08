@@ -127,18 +127,26 @@ impl RowUndoLogs {
         while let Some(entry) = self.0.pop() {
             if is_catalog_obj_id(entry.table_id) {
                 let table = table_cache.must_get_catalog_table(entry.table_id);
-                table
+                if let Err((err, entry)) = table
                     .mem
                     .rollback_row_undo(entry, guards, sts, |_| {})
-                    .await?;
+                    .await
+                {
+                    self.0.push(entry);
+                    return Err(err);
+                }
             } else {
                 let table = table_cache.must_get_user_table(entry.table_id).await;
-                table
+                if let Err((err, entry)) = table
                     .mem
                     .rollback_row_undo(entry, guards, sts, |row_id| {
                         table.deletion_buffer().remove(row_id);
                     })
-                    .await?;
+                    .await
+                {
+                    self.0.push(entry);
+                    return Err(err);
+                }
             }
         }
         Ok(())

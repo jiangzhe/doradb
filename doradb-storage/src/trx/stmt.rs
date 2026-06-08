@@ -11,7 +11,7 @@ use crate::trx::redo::{DDLRedo, RedoLogs, RowRedo};
 use crate::trx::undo::{
     IndexUndo, IndexUndoKind, IndexUndoLogs, OwnedRowUndo, RowUndoKind, RowUndoLogs,
 };
-use crate::trx::{TrxEffects, TrxInner, TrxRuntime};
+use crate::trx::{FatalRollbackRetention, TrxEffects, TrxInner, TrxRuntime};
 use crate::value::Val;
 use std::mem;
 
@@ -188,10 +188,12 @@ impl StmtEffects {
 
     /// Discards every statement-local effect after fatal transaction cleanup.
     #[inline]
-    pub(crate) fn clear_for_discard(&mut self) {
-        self.row_undo = RowUndoLogs::empty();
-        self.index_undo = IndexUndoLogs::empty();
+    fn take_for_fatal_retention(&mut self) -> FatalRollbackRetention {
         self.redo.clear();
+        FatalRollbackRetention::Statement {
+            row_undo: mem::take(&mut self.row_undo),
+            index_undo: mem::take(&mut self.index_undo),
+        }
     }
 }
 
@@ -454,7 +456,8 @@ impl<'stmt> Statement<'stmt> {
             .await
             .is_err()
         {
-            self.effects.clear_for_discard();
+            let retention = self.effects.take_for_fatal_retention();
+            engine.trx_sys.retain_fatal_rollback(retention);
             return Err(engine
                 .trx_sys
                 .poison_storage(FatalError::RollbackAccess)
@@ -466,7 +469,8 @@ impl<'stmt> Statement<'stmt> {
             .await
             .is_err()
         {
-            self.effects.clear_for_discard();
+            let retention = self.effects.take_for_fatal_retention();
+            engine.trx_sys.retain_fatal_rollback(retention);
             return Err(engine
                 .trx_sys
                 .poison_storage(FatalError::RollbackAccess)
@@ -496,6 +500,7 @@ pub(crate) mod tests {
     use crate::lock::LockManager;
     use crate::lock::tests::{debug_snapshot, try_acquire, try_acquire_grouped};
     use crate::session::{SessionState, tests as session_tests};
+    use crate::trx::sys::tests as sys_tests;
     use crate::trx::undo::{OwnedRowUndo, RowUndoKind};
     use crate::trx::{MIN_ACTIVE_TRX_ID, Transaction};
     use error_stack::Report;
@@ -712,6 +717,11 @@ pub(crate) mod tests {
                 err.report().downcast_ref::<FatalError>().copied(),
                 Some(FatalError::RollbackAccess)
             );
+            assert!(sys_tests::retains_statement_row_undo(
+                &engine.trx_sys,
+                TableID::new(99_999_999),
+                RowID::new(24)
+            ));
             assert_eq!(lock_entry_count(&engine, stmt_owner.get().unwrap()), 0);
             assert_eq!(lock_entry_count(&engine, trx_owner), 0);
             assert!(

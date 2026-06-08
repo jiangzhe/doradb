@@ -30,10 +30,13 @@ pub(crate) mod ver_map;
 
 use crate::buffer::PoolGuards;
 use crate::buffer::page::VersionedPageID;
-use crate::catalog::is_catalog_obj_id;
+use crate::catalog::{TableCache, is_catalog_obj_id};
 use crate::engine::{EngineRef, WeakEngineRef};
-use crate::error::{InternalError, OperationError, Result};
+use crate::error::{
+    CompletionErrorKind, Error, FatalError, InternalError, LifecycleError, OperationError, Result,
+};
 use crate::id::{PageID, RowID, SessionID, TableID, TrxID};
+use crate::io::Completion;
 use crate::lock::{
     FreshLockGuard, LockManager, LockMode, LockOwner, LockOwnerGroup, LockResource, OwnerLockState,
     StmtNo,
@@ -650,6 +653,17 @@ impl TrxEffects {
         self.gc_row_pages.clear();
     }
 
+    /// Move remaining rollback-owned effects into fatal retention.
+    #[inline]
+    fn take_for_fatal_retention(&mut self) -> FatalRollbackRetention {
+        self.redo.clear();
+        FatalRollbackRetention::Active {
+            row_undo: mem::take(&mut self.row_undo),
+            index_undo: mem::take(&mut self.index_undo),
+            gc_row_pages: mem::take(&mut self.gc_row_pages),
+        }
+    }
+
     /// Asserts that all transaction effects have been consumed or cleared.
     #[inline]
     fn assert_cleared(&self) {
@@ -1010,7 +1024,11 @@ impl TrxCheckout {
     pub(crate) fn discard_after_fatal_rollback(&mut self) {
         self.entry.publish_state(TrxEntryState::Failed);
         if let Some(mut inner) = self.inner.take() {
-            inner.discard_after_fatal_rollback(&self.attachment);
+            let retention = inner.retain_and_discard_after_fatal_rollback(&self.attachment);
+            self.attachment
+                .engine()
+                .trx_sys
+                .retain_fatal_rollback(retention);
         }
         self.entry.finish(TrxEntryState::Failed);
     }
@@ -1079,6 +1097,12 @@ impl TrxCompletionClaim {
 }
 
 /// Reason an abandoned transaction cleanup job was queued.
+///
+/// Abandoned cleanup is the recovery path for a transaction whose public handle
+/// disappeared before an explicit terminal operation completed. It is not the
+/// durability-critical precommit path: cleanup claims the still-checked-in
+/// mutable transaction core and rolls it back as an ordinary active
+/// transaction.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum TrxCleanupReason {
     /// The public transaction handle was dropped.
@@ -1088,11 +1112,143 @@ pub(crate) enum TrxCleanupReason {
 }
 
 /// Abandoned transaction cleanup job.
+///
+/// The job carries an `EngineRef`, so queued cleanup pins the runtime until the
+/// worker has either claimed and rolled back the abandoned transaction or found
+/// that the session/transaction is no longer claimable. Engine shutdown keeps
+/// scanning abandoned sessions and waits for active transaction state to reach a
+/// terminal state before component teardown begins.
 pub(crate) struct TrxCleanupJob {
     pub(crate) engine: EngineRef,
     pub(crate) session_id: SessionID,
     pub(crate) trx_id: TrxID,
     pub(crate) reason: TrxCleanupReason,
+}
+
+/// Reason a precommit transaction has to rollback instead of commit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FailedPrecommitReason {
+    /// Redo write, submit, or sync failed after precommit handoff.
+    Fatal(FatalError),
+    /// Group commit admission closed for engine shutdown.
+    Shutdown,
+}
+
+impl FailedPrecommitReason {
+    #[inline]
+    pub(crate) fn into_error(self, message: impl Into<String>) -> Error {
+        match self {
+            FailedPrecommitReason::Fatal(reason) => {
+                Report::new(reason).attach(message.into()).into()
+            }
+            FailedPrecommitReason::Shutdown => Report::new(LifecycleError::Shutdown)
+                .attach(message.into())
+                .into(),
+        }
+    }
+
+    #[inline]
+    fn completion_report(self, message: impl Into<String>) -> Report<CompletionErrorKind> {
+        match self {
+            FailedPrecommitReason::Fatal(reason) => {
+                CompletionErrorKind::report_fatal(reason, message)
+            }
+            FailedPrecommitReason::Shutdown => Report::new(LifecycleError::Shutdown)
+                .change_context(CompletionErrorKind::Lifecycle(LifecycleError::Shutdown))
+                .attach(message.into()),
+        }
+    }
+}
+
+/// Failed-precommit rollback job owned by the transaction cleanup worker.
+///
+/// This path is mandatory for user transactions. Once a transaction enters
+/// precommit, row/index changes may already be installed in in-memory MVCC
+/// structures, while redo durability can still fail. Dropping the precommit
+/// payload without rollback can leave row-version links pointing at
+/// transaction-owned undo memory, so failed-precommit cleanup must run before
+/// the shared completion wakes commit waiters.
+///
+/// The cleanup worker owns these jobs instead of the redo worker so redo
+/// failure handling can hand over rollback work and continue draining/shutting
+/// down its own queues. Transaction-system worker shutdown joins all redo
+/// workers before sending cleanup `Stop`, which keeps the cleanup receiver
+/// alive for every failed-precommit job that a redo worker can produce.
+pub(crate) struct FailedPrecommitCleanupJob {
+    trx_list: Vec<PrecommitTrx>,
+    completion: Arc<Completion<()>>,
+    reason: FailedPrecommitReason,
+}
+
+impl FailedPrecommitCleanupJob {
+    #[inline]
+    fn new(
+        trx_list: Vec<PrecommitTrx>,
+        completion: Arc<Completion<()>>,
+        reason: FailedPrecommitReason,
+    ) -> Self {
+        Self {
+            trx_list,
+            completion,
+            reason,
+        }
+    }
+
+    #[inline]
+    async fn run(mut self) {
+        while let Some(trx) = self.trx_list.pop() {
+            if trx.rollback_failed_precommit().await {
+                continue;
+            }
+            while let Some(trx) = self.trx_list.pop() {
+                trx.fail_failed_precommit_without_rollback();
+            }
+            break;
+        }
+        // Waiters must observe the original redo/shutdown failure only after
+        // rollback has released MVCC undo ownership, transaction locks, session
+        // state, and prepare waiters.
+        self.completion.complete(Err(self.reason.completion_report(
+            "fail redo group commit waiters after failed precommit rollback",
+        )));
+    }
+}
+
+/// Undo/effect ownership retained after rollback access failed fatally.
+///
+/// Retention is separate from storage poison. Poison prevents future admitted
+/// work from entering storage paths, while this value keeps row undo memory
+/// alive for any `RowUndoRef` already reachable from row-version chains. These
+/// values must not own engine/session attachments, waiters, or logical locks.
+pub(in crate::trx) enum FatalRollbackRetention {
+    Active {
+        row_undo: RowUndoLogs,
+        index_undo: IndexUndoLogs,
+        gc_row_pages: Vec<PageID>,
+    },
+    Statement {
+        row_undo: RowUndoLogs,
+        index_undo: IndexUndoLogs,
+    },
+    Precommit(PrecommitTrxPayload),
+}
+
+impl FatalRollbackRetention {
+    #[inline]
+    fn is_empty(&self) -> bool {
+        match self {
+            FatalRollbackRetention::Active {
+                row_undo,
+                index_undo,
+                gc_row_pages,
+            } => row_undo.is_empty() && index_undo.is_empty() && gc_row_pages.is_empty(),
+            FatalRollbackRetention::Statement {
+                row_undo,
+                index_undo,
+            } => row_undo.is_empty() && index_undo.is_empty(),
+            FatalRollbackRetention::Precommit(payload) => payload.is_empty(),
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -1406,12 +1562,16 @@ impl TrxInner {
         self.active = false;
     }
 
-    /// Clears effects and rolls back the attached session after rollback failure.
+    /// Retain remaining effects and roll back the attached session after rollback failure.
     #[inline]
-    pub(crate) fn discard_after_fatal_rollback(&mut self, attachment: &TrxAttachment) {
-        self.effects.clear_for_rollback();
+    pub(in crate::trx) fn retain_and_discard_after_fatal_rollback(
+        &mut self,
+        attachment: &TrxAttachment,
+    ) -> FatalRollbackRetention {
+        let retention = self.effects.take_for_fatal_retention();
         self.release_transaction_locks(attachment);
         self.finish_session_rollback(attachment);
+        retention
     }
 
     /// Prepare current transaction for committing.
@@ -1600,25 +1760,25 @@ impl PreparedTrx {
             Some(PreparedTrxPayload {
                 status,
                 sts,
-                log_no: _,
+                log_no,
                 gc_no,
                 row_undo,
-                mut index_undo,
+                index_undo,
                 gc_row_pages,
             }) => {
-                // Once we get a concrete CTS, we won't rollback this transaction.
-                // So we convert IndexUndo to IndexGC, and let purge threads to
-                // remove unused index entries.
-                let index_gc = index_undo.commit_for_gc();
+                // CTS assignment is only an ordering reservation. Redo durability
+                // can still fail after this point, so precommit must retain
+                // rollback-capable index undo until successful commit.
                 PrecommitTrx {
                     cts,
                     redo_bin,
                     payload: Some(PrecommitTrxPayload {
                         status,
                         sts,
+                        log_no,
                         gc_no,
                         row_undo,
-                        index_gc,
+                        index_undo,
                         gc_row_pages,
                     }),
                     attachment: self.attachment.take(),
@@ -1661,13 +1821,52 @@ impl Drop for PreparedTrx {
     }
 }
 
-struct PrecommitTrxPayload {
+pub(in crate::trx) struct PrecommitTrxPayload {
     status: Arc<SharedTrxStatus>,
     sts: TrxID,
+    log_no: usize,
     gc_no: usize,
     row_undo: RowUndoLogs,
-    index_gc: Vec<IndexPurgeEntry>,
+    /// Rollback-capable index undo retained until redo durability succeeds.
+    ///
+    /// A precommit CTS is not a durability proof: failed redo write/sync must
+    /// still rollback secondary-index effects before dropping transaction
+    /// payload ownership.
+    index_undo: IndexUndoLogs,
     gc_row_pages: Vec<PageID>,
+}
+
+impl PrecommitTrxPayload {
+    #[inline]
+    fn is_empty(&self) -> bool {
+        self.row_undo.is_empty() && self.index_undo.is_empty() && self.gc_row_pages.is_empty()
+    }
+
+    #[inline]
+    async fn rollback(&mut self, attachment: &TrxAttachment) -> Result<()> {
+        let trx_sys = &attachment.engine().trx_sys;
+        let pool_guards = attachment.pool_guards().clone();
+        let mut table_cache = TableCache::new(&trx_sys.catalog);
+        self.index_undo
+            .rollback(&mut table_cache, &pool_guards, self.sts)
+            .await?;
+        self.row_undo
+            .rollback(&mut table_cache, &pool_guards, self.sts)
+            .await
+    }
+
+    #[inline]
+    fn gc_analyze_rollback(&self, attachment: &TrxAttachment) {
+        let trx_sys = &attachment.engine().trx_sys;
+        trx_sys.log_partitions[self.log_no].gc_buckets[self.gc_no].gc_analyze_rollback(self.sts);
+    }
+
+    #[inline]
+    fn release_prepare_waiters(&self) {
+        self.status.preparing.store(false, Ordering::SeqCst);
+        let mut g = self.status.prepare_ev.lock();
+        drop(g.take());
+    }
 }
 
 /// Transaction in the logical Committing state.
@@ -1678,8 +1877,9 @@ struct PrecommitTrxPayload {
 /// back into an explicit rollback.
 ///
 /// There are two kinds of PrecommitTrx. One is a user transaction containing
-/// undo, index GC, lock, and terminal attachment. The other is an attachmentless
-/// system transaction, which is directly dropped after ordered completion.
+/// rollback-capable undo, locks, and terminal attachment. The other is an
+/// attachmentless system transaction, which is directly dropped after ordered
+/// completion.
 struct PrecommitTrx {
     cts: TrxID,
     redo_bin: Option<TrxLog>,
@@ -1714,11 +1914,13 @@ impl PrecommitTrx {
             Some(PrecommitTrxPayload {
                 status,
                 sts,
+                log_no: _,
                 gc_no,
                 row_undo,
-                index_gc,
+                mut index_undo,
                 gc_row_pages,
             }) => {
+                let index_gc = index_undo.commit_for_gc();
                 // For user transaction, we need to notify readers that this transaction is committed,
                 // and readers can continue their work.
                 {
@@ -1757,18 +1959,81 @@ impl PrecommitTrx {
         committed
     }
 
-    /// Abort this transaction after it entered prepare but before redo durability succeeded.
+    /// Rollback this transaction after it entered prepare but before redo durability succeeded.
+    ///
+    /// Failed precommit must perform rollback-equivalent cleanup before waking
+    /// redo waiters. Row-version heads can point into transaction-owned row
+    /// undo, so dropping the payload before rollback would leave dangling raw
+    /// undo references.
     #[inline]
-    fn abort(mut self) {
+    async fn rollback_failed_precommit(mut self) -> bool {
         self.redo_bin.take();
-        if let Some(PrecommitTrxPayload { status, .. }) = self.payload.take() {
-            status.preparing.store(false, Ordering::SeqCst);
-            let mut g = status.prepare_ev.lock();
-            drop(g.take());
+        let engine = self
+            .attachment
+            .as_ref()
+            .map(|attachment| attachment.engine().clone());
+        if let (Some(payload), Some(attachment)) = (self.payload.as_mut(), self.attachment.as_ref())
+        {
+            let res = payload.rollback(attachment).await;
+            if res.is_err() {
+                let _ = attachment
+                    .engine()
+                    .trx_sys
+                    .poison_storage(FatalError::RollbackAccess);
+                self.finish_failed_precommit_with_retention(engine);
+                return false;
+            }
+            payload.gc_analyze_rollback(attachment);
         }
+        self.release_transaction_locks();
         if let Some(s) = self.attachment.take() {
             s.rollback();
         }
+        if let Some(payload) = self.payload.take() {
+            payload.release_prepare_waiters();
+        }
+        true
+    }
+
+    /// Fail this transaction without touching row/index undo after rollback became unsafe.
+    #[inline]
+    fn fail_failed_precommit_without_rollback(mut self) {
+        self.redo_bin.take();
+        let engine = self
+            .attachment
+            .as_ref()
+            .map(|attachment| attachment.engine().clone());
+        self.finish_failed_precommit_with_retention(engine);
+    }
+
+    #[inline]
+    fn finish_failed_precommit_with_retention(&mut self, engine: Option<EngineRef>) {
+        self.release_transaction_locks();
+        if let Some(s) = self.attachment.take() {
+            s.rollback();
+        }
+        if let Some(payload) = self.payload.take() {
+            payload.release_prepare_waiters();
+            if let Some(engine) = engine {
+                engine
+                    .trx_sys
+                    .retain_fatal_rollback(FatalRollbackRetention::Precommit(payload));
+            } else {
+                debug_assert!(
+                    false,
+                    "precommit payload requires an attachment for fatal retention"
+                );
+                mem::forget(payload);
+            }
+        }
+    }
+
+    /// Discard an attachmentless rejected precommit transaction.
+    #[inline]
+    fn discard_rejected(mut self) {
+        debug_assert!(self.payload.is_none());
+        debug_assert!(self.attachment.is_none());
+        self.redo_bin.take();
         self.release_transaction_locks();
     }
 
@@ -1837,6 +2102,9 @@ impl CommittedTrx {
 pub(crate) mod tests {
     use super::*;
     use crate::buffer::PoolRole;
+    use crate::buffer::frame::FrameKind;
+    use crate::buffer::page::PAGE_SIZE;
+    use crate::buffer::test_frame_kind;
     use crate::catalog::storage::tables::TABLE_ID_TABLES;
     use crate::catalog::tests as catalog_tests;
     use crate::catalog::{ColumnAttributes, ColumnSpec, TableMetadata};
@@ -1846,28 +2114,42 @@ pub(crate) mod tests {
     use crate::file::cow_file::tests::old_root_drop_count;
     use crate::file::table_file::{MutableTableFile, TableFile};
     use crate::id::SessionID;
+    use crate::io::{
+        IOKind, StdIoResult, StorageBackendFileIdentity, StorageBackendOp, StorageBackendTestHook,
+        install_storage_backend_test_hook,
+    };
     use crate::lock::tests::{
         LockDebugEntryState, debug_snapshot, try_acquire, try_acquire_grouped,
     };
     use crate::row::ops::SelectKey;
     use crate::session::tests as session_tests;
+    use crate::session::tests::SessionTestExt;
     use crate::table::test_user_table_id;
     use crate::trx::redo::{RowRedo, RowRedoKind};
     use crate::trx::stmt::tests as stmt_tests;
     use crate::trx::undo::{IndexUndo, IndexUndoKind, OwnedRowUndo, RowUndoKind};
     use crate::value::{Val, ValKind};
+    use std::io;
+    use std::sync::atomic::AtomicUsize;
     use std::sync::{Arc, mpsc};
     use std::time::Duration;
     use tempfile::TempDir;
 
     async fn test_engine(log_file_stem: &str) -> (TempDir, Engine) {
+        test_engine_with_mem_size(log_file_stem, 64usize * 1024 * 1024).await
+    }
+
+    async fn test_engine_with_mem_size(
+        log_file_stem: &str,
+        max_mem_size: usize,
+    ) -> (TempDir, Engine) {
         let temp_dir = TempDir::new().unwrap();
         let engine = EngineConfig::default()
             .storage_root(temp_dir.path().to_path_buf())
             .data_buffer(
                 EvictableBufferPoolConfig::default()
                     .role(PoolRole::Mem)
-                    .max_mem_size(64usize * 1024 * 1024)
+                    .max_mem_size(max_mem_size)
                     .max_file_size(128usize * 1024 * 1024),
             )
             .trx(
@@ -1879,6 +2161,51 @@ pub(crate) mod tests {
             .await
             .unwrap();
         (temp_dir, engine)
+    }
+
+    struct FailingPageReadHook {
+        file: StorageBackendFileIdentity,
+        offset: usize,
+        errno: i32,
+        calls: AtomicUsize,
+    }
+
+    impl FailingPageReadHook {
+        #[inline]
+        fn for_page(file: StorageBackendFileIdentity, page_id: PageID, errno: i32) -> Self {
+            Self {
+                file,
+                offset: usize::from(page_id) * PAGE_SIZE,
+                errno,
+                calls: AtomicUsize::new(0),
+            }
+        }
+
+        #[inline]
+        fn call_count(&self) -> usize {
+            self.calls.load(Ordering::SeqCst)
+        }
+
+        #[inline]
+        fn matches(&self, op: StorageBackendOp) -> bool {
+            op.kind() == IOKind::Read
+                && op.matches_file_identity(self.file)
+                && op.offset() == self.offset
+        }
+    }
+
+    impl StorageBackendTestHook for FailingPageReadHook {
+        fn on_submit(&self, op: StorageBackendOp) {
+            if self.matches(op) {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        fn on_complete(&self, op: StorageBackendOp, res: &mut StdIoResult<usize>) {
+            if self.matches(op) {
+                *res = Err(io::Error::from_raw_os_error(self.errno));
+            }
+        }
     }
 
     fn test_transaction_with_parts(
@@ -2414,6 +2741,35 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn test_precommit_retains_index_undo_until_successful_commit() {
+        smol::block_on(async {
+            let (_temp_dir, engine) = test_engine("redo_trx_precommit_index_undo").await;
+            let mut trx =
+                test_transaction_with_parts(&engine, MIN_ACTIVE_TRX_ID + 47, TrxID::new(47), 0, 0);
+            with_transaction_inner_mut(&mut trx, "test precommit index undo", |inner| {
+                inner.index_undo_mut().push(IndexUndo {
+                    table_id: TableID::new(11),
+                    row_id: RowID::new(22),
+                    kind: IndexUndoKind::DeferDelete(SelectKey::new(0, vec![]), true),
+                });
+            })
+            .unwrap();
+
+            let precommit = prepare_transaction(trx)
+                .unwrap()
+                .fill_cts(TrxID::new(91_247));
+            let payload = precommit.payload.as_ref().unwrap();
+            assert_eq!(payload.index_undo.len(), 1);
+
+            let committed = precommit.commit();
+            let index_gc = committed.index_gc().unwrap();
+            assert_eq!(index_gc.len(), 1);
+            assert_eq!(index_gc[0].table_id, TableID::new(11));
+            assert_eq!(index_gc[0].row_id, RowID::new(22));
+        });
+    }
+
+    #[test]
     fn test_statement_success_merges_statement_effects_into_transaction_effects() {
         smol::block_on(async {
             let (_temp_dir, engine) = test_engine("redo_stmt_effect_merge").await;
@@ -2867,8 +3223,8 @@ pub(crate) mod tests {
     fn test_transaction_locks_release_on_precommit_abort() {
         smol::block_on(async {
             let (_temp_dir, engine) = test_engine("redo_trx_lock_abort").await;
-            let mut trx =
-                test_transaction_with_parts(&engine, MIN_ACTIVE_TRX_ID + 55, TrxID::new(55), 0, 0);
+            let mut session = engine.new_session().unwrap();
+            let mut trx = session.begin_trx().unwrap();
             let owner = lock_owner(&trx).unwrap();
             acquire_transaction_lock(
                 &mut trx,
@@ -2881,8 +3237,152 @@ pub(crate) mod tests {
 
             let prepared = prepare_transaction(trx).unwrap();
             let precommit = prepared.fill_cts(TrxID::new(91_241));
-            precommit.abort();
+            assert!(precommit.rollback_failed_precommit().await);
             assert_eq!(lock_entry_count(&engine, owner), 0);
+            assert!(!session.in_trx().unwrap());
+        });
+    }
+
+    #[test]
+    fn test_failed_precommit_cleanup_stops_reverse_after_rollback_failure() {
+        smol::block_on(async {
+            let (temp_dir, engine) = test_engine_with_mem_size(
+                "redo_failed_precommit_reverse_quarantine",
+                9 * 1024 * 1024,
+            )
+            .await;
+            let table_id = catalog_tests::table2(&engine).await;
+            let table = engine.catalog().get_table(table_id).await.unwrap();
+            let large = "r".repeat(48 * 1024);
+
+            fn precommit_with_cold_row_undo(
+                session: &mut crate::session::Session,
+                table_id: TableID,
+                cts: TrxID,
+            ) -> PrecommitTrx {
+                let mut trx = session.begin_trx().unwrap();
+                with_transaction_inner_mut(
+                    &mut trx,
+                    "test failed precommit retained cold row undo",
+                    |inner| {
+                        inner.row_undo_mut().push(OwnedRowUndo::new(
+                            table_id,
+                            None,
+                            RowID::new(cts.as_u64()),
+                            RowUndoKind::Delete,
+                        ));
+                    },
+                )
+                .unwrap();
+                prepare_transaction(trx).unwrap().fill_cts(cts)
+            }
+
+            let mut session1 = engine.new_session().unwrap();
+            let mut session2 = engine.new_session().unwrap();
+            let mut session3 = engine.new_session().unwrap();
+            let precommit1 =
+                precommit_with_cold_row_undo(&mut session1, table_id, TrxID::new(91_261));
+            let precommit2 =
+                precommit_with_cold_row_undo(&mut session2, table_id, TrxID::new(91_262));
+
+            let mut trx3 = session3.begin_trx().unwrap();
+            let row_id = trx3
+                .exec(async |stmt| {
+                    stmt.table_insert_mvcc(
+                        &table,
+                        vec![Val::from(91_263i32), Val::from(&large[..])],
+                    )
+                    .await
+                })
+                .await
+                .unwrap();
+            let (cached_page, cached_row_id) = session3.load_active_insert_page(table_id).unwrap();
+            assert_eq!(cached_row_id, row_id);
+            let precommit3 = prepare_transaction(trx3)
+                .unwrap()
+                .fill_cts(TrxID::new(91_263));
+
+            let mut writer = engine.new_session().unwrap();
+            for i in 0..258 {
+                let mut trx = writer.begin_trx().unwrap();
+                trx.exec(async |stmt| {
+                    stmt.table_insert_mvcc(
+                        &table,
+                        vec![Val::from(92_000i32 + i), Val::from(&large[..])],
+                    )
+                    .await?;
+                    Ok(())
+                })
+                .await
+                .unwrap();
+                trx.commit().await.unwrap();
+                if test_frame_kind(&table.mem.mem_pool, cached_page.page_id) == FrameKind::Evicted {
+                    break;
+                }
+            }
+            let mut evicted = false;
+            for _ in 0..20 {
+                if test_frame_kind(&table.mem.mem_pool, cached_page.page_id) == FrameKind::Evicted {
+                    evicted = true;
+                    break;
+                }
+                smol::Timer::after(Duration::from_millis(50)).await;
+            }
+            assert!(evicted, "failed-precommit rollback page should be evicted");
+
+            let mem_pool_file =
+                StorageBackendFileIdentity::from_path(temp_dir.path().join("data.swp")).unwrap();
+            let read_hook = Arc::new(FailingPageReadHook::for_page(
+                mem_pool_file,
+                cached_page.page_id,
+                libc::EIO,
+            ));
+            let _hook = install_storage_backend_test_hook(read_hook.clone());
+
+            let _ = engine.trx_sys.poison_storage(FatalError::RedoWrite);
+            let completion = Arc::new(Completion::new());
+            let job = FailedPrecommitCleanupJob::new(
+                vec![precommit1, precommit2, precommit3],
+                Arc::clone(&completion),
+                FailedPrecommitReason::Fatal(FatalError::RedoWrite),
+            );
+
+            job.run().await;
+
+            assert!(
+                read_hook.call_count() > 0,
+                "latest precommit rollback should reload the evicted row page"
+            );
+            assert_eq!(
+                engine.trx_sys.fatal_rollback_retention_len(),
+                3,
+                "reverse cleanup should fail on the newest transaction first and retain older unprocessed payloads"
+            );
+            assert!(!session1.in_trx().unwrap());
+            assert!(!session2.in_trx().unwrap());
+            assert!(!session3.in_trx().unwrap());
+            assert!(
+                completion
+                    .wait_result()
+                    .await
+                    .is_err_and(|err| *err.current_context()
+                        == CompletionErrorKind::Fatal(FatalError::RedoWrite))
+            );
+            assert!(
+                engine
+                    .trx_sys
+                    .storage_poison_error()
+                    .is_some_and(|err| *err.current_context() == FatalError::RedoWrite)
+            );
+
+            let err = match session1.begin_trx() {
+                Ok(_) => panic!("poisoned storage must reject new transactions"),
+                Err(err) => err,
+            };
+            assert_eq!(
+                err.downcast_ref::<FatalError>().copied(),
+                Some(FatalError::RedoWrite)
+            );
         });
     }
 

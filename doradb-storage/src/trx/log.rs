@@ -1,8 +1,5 @@
 use crate::conf::TrxSysConfig;
-use crate::error::{
-    CompletionErrorKind, ConfigError, DataIntegrityError, Error, FatalError, LifecycleError,
-    ResourceError, Result,
-};
+use crate::error::{ConfigError, DataIntegrityError, Error, FatalError, ResourceError, Result};
 use crate::file::{FileSyncer, SparseFile, UNTRACKED_FILE_ID};
 use crate::free_list::FreeList;
 use crate::id::TrxID;
@@ -19,7 +16,10 @@ use crate::trx::log_replay::{LogBuf, LogPartitionStream, MmapLogReader, TrxLog};
 use crate::trx::purge::{GC, GCBucket};
 use crate::trx::sys::GC_BUCKETS;
 use crate::trx::sys::TransactionSystem;
-use crate::trx::{CommittedTrx, MAX_COMMIT_TS, MAX_SNAPSHOT_TS, PrecommitTrx, PreparedTrx};
+use crate::trx::{
+    CommittedTrx, FailedPrecommitCleanupJob, FailedPrecommitReason, MAX_COMMIT_TS, MAX_SNAPSHOT_TS,
+    PrecommitTrx, PreparedTrx,
+};
 use crossbeam_utils::CachePadded;
 use error_stack::Report;
 use flume::{Receiver, Sender};
@@ -36,7 +36,17 @@ use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 pub(crate) const LOG_HEADER_PAGES: usize = 2;
-type EnqueuedCommit = (TrxID, Option<CommitWaiter>);
+enum EnqueuedCommit {
+    Queued {
+        cts: TrxID,
+        waiter: Option<CommitWaiter>,
+    },
+    Rejected {
+        cts: TrxID,
+        trx: Box<PrecommitTrx>,
+        reason: FailedPrecommitReason,
+    },
+}
 
 pub(crate) struct LogPartitionInitializer {
     pub(crate) ctx: StorageBackend,
@@ -120,6 +130,7 @@ impl LogPartitionInitializer {
 
         let group_commit = GroupCommit {
             queue: VecDeque::new(),
+            closed: None,
             log_file: Some(log_file),
         };
         let gc_info: Vec<_> = (0..GC_BUCKETS).map(|_| GCBucket::new()).collect();
@@ -408,7 +419,8 @@ impl LogPartition {
         };
         // This is the commit handoff boundary for user transactions. Once the
         // precommit transaction is queued, the redo worker owns session
-        // commit/rollback completion through PrecommitTrx::commit/abort. The
+        // commit/rollback completion through PrecommitTrx::commit or failed
+        // precommit cleanup. The
         // user future may wait for the result, but dropping it must not make
         // rollback a competing terminal outcome or leave the session active.
         let completion = Arc::new(Completion::new());
@@ -429,22 +441,27 @@ impl LogPartition {
         trx: PreparedTrx,
         global_ts: &AtomicU64,
         wait_sync: bool,
-    ) -> Result<EnqueuedCommit> {
+    ) -> EnqueuedCommit {
         let mut group_commit_g = self.group_commit.lock();
         let cts = TrxID::new(global_ts.fetch_add(1, Ordering::SeqCst));
         debug_assert!(cts < MAX_COMMIT_TS);
         let precommit_trx = trx.fill_cts(cts);
+        if let Some(reason) = group_commit_g.closed {
+            drop(group_commit_g);
+            return EnqueuedCommit::Rejected {
+                cts,
+                trx: Box::new(precommit_trx),
+                reason,
+            };
+        }
         if group_commit_g.queue.is_empty() {
             let waiter = self.create_new_group(precommit_trx, &mut group_commit_g, wait_sync);
             self.group_commit.notify_one(); // notify sync thread to work.
             drop(group_commit_g);
-            return Ok((cts, waiter));
+            return EnqueuedCommit::Queued { cts, waiter };
         }
         let last_group = match group_commit_g.queue.back_mut().unwrap() {
-            Commit::Shutdown => {
-                precommit_trx.abort();
-                return Err(Report::new(LifecycleError::Shutdown).into());
-            }
+            Commit::Shutdown => unreachable!("shutdown queue tail requires closed admission"),
             Commit::Group(group) => group,
             Commit::Switch(_) => {
                 // Impossible, switch always has one group followed.
@@ -454,12 +471,12 @@ impl LogPartition {
         if last_group.can_join(&precommit_trx) {
             let waiter = last_group.join(precommit_trx, wait_sync);
             drop(group_commit_g); // unlock to let other transactions to enter commit phase.
-            return Ok((cts, waiter));
+            return EnqueuedCommit::Queued { cts, waiter };
         }
         let waiter = self.create_new_group(precommit_trx, &mut group_commit_g, wait_sync);
         self.group_commit.notify_one(); // notify sync thread to work.
         drop(group_commit_g);
-        Ok((cts, waiter))
+        EnqueuedCommit::Queued { cts, waiter }
     }
 
     #[inline]
@@ -476,26 +493,41 @@ impl LogPartition {
         // Do not route a session-bound user transaction here. The user path must
         // wait for durability so the caller can commit/rollback the session
         // explicitly.
-        let (cts, listener) = self.enqueue_commit(trx, global_ts, false)?;
-        debug_assert!(listener.is_none());
-        Ok(cts)
+        match self.enqueue_commit(trx, global_ts, false) {
+            EnqueuedCommit::Queued { cts, waiter } => {
+                debug_assert!(waiter.is_none());
+                Ok(cts)
+            }
+            EnqueuedCommit::Rejected { cts, trx, reason } => {
+                (*trx).discard_rejected();
+                Err(reason.into_error(format!("redo group commit is closed: commit_ts={cts}")))
+            }
+        }
     }
 
     #[inline]
     pub(super) async fn commit(
         &self,
         trx: PreparedTrx,
+        trx_sys: &TransactionSystem,
         global_ts: &AtomicU64,
-        wait_sync: bool,
     ) -> Result<TrxID> {
-        let (cts, waiter) = self.enqueue_commit(trx, global_ts, wait_sync)?;
-        if !wait_sync {
-            // Non-waiting commit is the same contract as commit_no_wait(): it is
-            // only for sessionless/system callers. Sessionful user transactions
-            // must use wait_sync = true so the caller can observe completion.
-            return Ok(cts);
-        }
-        let waiter = waiter.expect("waiter should exist when wait_sync");
+        let (cts, waiter) = match self.enqueue_commit(trx, global_ts, true) {
+            EnqueuedCommit::Queued { cts, waiter } => (cts, waiter),
+            EnqueuedCommit::Rejected { cts, trx, reason } => {
+                let completion = Arc::new(Completion::new());
+                let waiter = Arc::clone(&completion);
+                trx_sys.request_failed_precommit_cleanup(FailedPrecommitCleanupJob::new(
+                    vec![*trx],
+                    completion,
+                    reason,
+                ));
+                (cts, Some(waiter))
+            }
+        };
+        let Some(waiter) = waiter else {
+            unreachable!("async commit must enqueue a completion waiter");
+        };
         waiter.wait_result().await.map_err(|report| {
             Error::from_completion_report(
                 report,
@@ -612,7 +644,10 @@ pub(super) struct SyncGroup {
     pub(super) returned_buf: Option<DirectBuf>,
     pub(super) completion: Arc<Completion<()>>,
     pub(super) finished: bool,
-    pub(super) failed: bool,
+    // Redo logging is sequential: once one group fails, this group and every
+    // later group cannot be part of the durable prefix. Submitted IO may still
+    // complete later, but completion only returns buffers for recycling.
+    pub(super) failure_reason: Option<FailedPrecommitReason>,
 }
 
 impl SyncGroup {
@@ -638,19 +673,16 @@ impl SyncGroup {
     }
 
     #[inline]
-    fn fail_waiters(&mut self, err: &Report<FatalError>) {
-        if self.failed {
+    fn fail_waiters(&mut self, trx_sys: &TransactionSystem, reason: FailedPrecommitReason) {
+        if self.failure_reason.is_some() {
             return;
         }
-        self.failed = true;
-        self.completion
-            .complete(Err(CompletionErrorKind::report_fatal(
-                *err.current_context(),
-                "fail redo group commit waiters",
-            )));
-        for trx in mem::take(&mut self.trx_list) {
-            trx.abort();
-        }
+        self.failure_reason = Some(reason);
+        let trx_list = mem::take(&mut self.trx_list);
+        let completion = Arc::clone(&self.completion);
+        trx_sys.request_failed_precommit_cleanup(FailedPrecommitCleanupJob::new(
+            trx_list, completion, reason,
+        ));
     }
 }
 
@@ -706,6 +738,7 @@ struct FileProcessor<'a> {
     in_progress: usize,
     sync_groups: VecDeque<SyncGroup>,
     written: Vec<SyncGroup>,
+    failed_written: Vec<SyncGroup>,
     syncer: FileSyncer,
     log_sync: LogSync,
     shutdown: bool,
@@ -730,6 +763,7 @@ impl<'a> FileProcessor<'a> {
             in_progress: 0,
             sync_groups: VecDeque::new(),
             written: vec![],
+            failed_written: vec![],
             syncer,
             log_sync: config.log_sync,
             shutdown: false,
@@ -745,8 +779,8 @@ impl<'a> FileProcessor<'a> {
     }
 
     #[inline]
-    fn fail_sync_group(&self, sync_group: &mut SyncGroup, err: &Report<FatalError>) {
-        sync_group.fail_waiters(err);
+    fn fail_sync_group(&self, sync_group: &mut SyncGroup, reason: FailedPrecommitReason) {
+        sync_group.fail_waiters(self.trx_sys, reason);
         if let Some(buf) = sync_group.take_any_buf() {
             self.recycle_buf(buf);
         }
@@ -755,14 +789,16 @@ impl<'a> FileProcessor<'a> {
     #[inline]
     fn fail_pending(&mut self, err: Report<FatalError>) {
         self.shutdown = true;
+        let reason = FailedPrecommitReason::Fatal(*err.current_context());
         let drained_sync_groups: Vec<_> = self.sync_groups.drain(..).collect();
         for mut sync_group in drained_sync_groups {
-            self.fail_sync_group(&mut sync_group, &err);
+            self.fail_sync_group(&mut sync_group, reason);
         }
 
         let mut queued = Vec::new();
         {
             let mut group_commit_g = self.partition.group_commit.lock();
+            group_commit_g.close(reason);
             while let Some(commit) = group_commit_g.queue.pop_front() {
                 match commit {
                     Commit::Group(group) => queued.push(group),
@@ -773,11 +809,11 @@ impl<'a> FileProcessor<'a> {
         }
         for group in queued {
             let mut sync_group = group.into_sync_group();
-            self.fail_sync_group(&mut sync_group, &err);
+            self.fail_sync_group(&mut sync_group, reason);
         }
 
         for sync_group in self.inflight.values_mut() {
-            sync_group.fail_waiters(&err);
+            sync_group.fail_waiters(self.trx_sys, reason);
         }
     }
 
@@ -892,8 +928,27 @@ impl<'a> FileProcessor<'a> {
     #[inline]
     fn sync_io(&mut self) {
         self.written.clear();
-        let (trx_count, commit_count, log_bytes) =
-            shrink_inflight(&mut self.inflight, &mut self.written);
+        self.failed_written.clear();
+        let (trx_count, commit_count, log_bytes, failure_reason) = shrink_inflight(
+            &mut self.inflight,
+            &mut self.written,
+            &mut self.failed_written,
+        );
+
+        if let Some(reason) = failure_reason {
+            // The first failed group ends the sequential redo prefix. Any
+            // later inflight group that has not finished yet must be failed
+            // now; it stays in `inflight` only until its IO completion returns
+            // the backend-owned buffer.
+            for sync_group in self.inflight.values_mut() {
+                sync_group.fail_waiters(self.trx_sys, reason);
+            }
+            let drained_failed: Vec<_> = self.failed_written.drain(..).collect();
+            for mut sync_group in drained_failed {
+                self.fail_sync_group(&mut sync_group, reason);
+            }
+        }
+
         if !self.written.is_empty() {
             let max_cts = self.written.last().unwrap().max_cts;
 
@@ -910,9 +965,10 @@ impl<'a> FileProcessor<'a> {
             let sync_dur = start.elapsed();
             if sync_res.is_err() {
                 let err = self.trx_sys.poison_storage(FatalError::RedoSync);
+                let reason = FailedPrecommitReason::Fatal(*err.current_context());
                 let drained_written: Vec<_> = self.written.drain(..).collect();
                 for mut sync_group in drained_written {
-                    self.fail_sync_group(&mut sync_group, &err);
+                    self.fail_sync_group(&mut sync_group, reason);
                 }
                 self.fail_pending(err);
                 return;
@@ -925,6 +981,7 @@ impl<'a> FileProcessor<'a> {
             // Put IO buffer back into free list.
             let drained_written: Vec<_> = self.written.drain(..).collect();
             for mut sync_group in drained_written {
+                debug_assert!(sync_group.failure_reason.is_none());
                 if let Some(buf) = sync_group.take_any_buf() {
                     self.recycle_buf(buf);
                 }
@@ -988,7 +1045,8 @@ impl<'a> FileProcessor<'a> {
                 let LogIORequest::Write(submission) = err.0;
                 sync_group.write = Some(submission);
                 let poison = self.trx_sys.poison_storage(FatalError::RedoSubmit);
-                self.fail_sync_group(&mut sync_group, &poison);
+                let reason = FailedPrecommitReason::Fatal(*poison.current_context());
+                self.fail_sync_group(&mut sync_group, reason);
                 self.fail_pending(poison);
                 return;
             }
@@ -1019,7 +1077,8 @@ impl<'a> FileProcessor<'a> {
                     .expect("redo completion must match one inflight sync group");
                 failed_group.finish_write(completion.buf);
                 let err = self.trx_sys.poison_storage(source);
-                self.fail_sync_group(&mut failed_group, &err);
+                let reason = FailedPrecommitReason::Fatal(*err.current_context());
+                self.fail_sync_group(&mut failed_group, reason);
                 self.fail_pending(err);
                 return;
             }
@@ -1036,22 +1095,31 @@ impl<'a> FileProcessor<'a> {
 fn shrink_inflight(
     tree: &mut BTreeMap<TrxID, SyncGroup>,
     buffer: &mut Vec<SyncGroup>,
-) -> (usize, usize, usize) {
+    failed_buffer: &mut Vec<SyncGroup>,
+) -> (usize, usize, usize, Option<FailedPrecommitReason>) {
     let mut trx_count = 0;
     let mut commit_count = 0;
     let mut log_bytes = 0;
+    let mut failure_reason = None;
     while let Some(entry) = tree.first_entry() {
         let task = entry.get();
-        if task.finished {
-            trx_count += task.trx_list.len();
-            commit_count += 1;
-            log_bytes += task.log_bytes;
-            buffer.push(entry.remove());
-        } else {
+        if !task.finished {
             break; // stop at the transaction which is not persisted.
         }
+        if let Some(reason) = failure_reason.or(task.failure_reason) {
+            // Redo records are sequential. The first failed group ends the
+            // durable prefix, so every finished group after it is cleanup-only
+            // even if its individual write completed successfully.
+            failure_reason = Some(reason);
+            failed_buffer.push(entry.remove());
+            continue;
+        }
+        trx_count += task.trx_list.len();
+        commit_count += 1;
+        log_bytes += task.log_bytes;
+        buffer.push(entry.remove());
     }
-    (trx_count, commit_count, log_bytes)
+    (trx_count, commit_count, log_bytes, failure_reason)
 }
 
 #[inline]
@@ -1140,7 +1208,7 @@ mod tests {
     use crate::catalog::tests::table2;
     use crate::conf::{EngineConfig, EvictableBufferPoolConfig, TrxSysConfig};
     use crate::engine::{Engine, EngineRef};
-    use crate::error::{CompletionErrorKind, FatalError};
+    use crate::error::{CompletionErrorKind, FatalError, LifecycleError};
     use crate::file::{FileSyncKind, FileSyncOp, FileSyncTestHook, set_file_sync_test_hook};
     use crate::id::{PageID, RowID, TableID};
     use crate::io::{
@@ -1373,7 +1441,7 @@ mod tests {
                 );
                 let prepared = sys_trx.prepare();
                 engine.trx_sys.log_partitions[0]
-                    .commit(prepared, &engine.trx_sys.ts, true)
+                    .commit(prepared, &engine.trx_sys, &engine.trx_sys.ts)
                     .await
             })
         })
@@ -1471,6 +1539,107 @@ mod tests {
         });
     }
 
+    #[test]
+    fn test_closed_group_commit_rejects_after_shutdown_message_consumed() {
+        smol::block_on(async {
+            let (_temp_dir, engine) =
+                build_redo_test_engine("commit_closed_after_shutdown_consumed", LogSync::None)
+                    .await;
+            let table_id = table2(&engine).await;
+            let table = engine.catalog().get_table(table_id).await.unwrap();
+            let mut session = engine.new_session().unwrap();
+            let mut trx = session.begin_trx().unwrap();
+            trx.exec(async |stmt| {
+                stmt.table_insert_mvcc(&table, vec![Val::from(1), Val::from("closed")])
+                    .await?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+            {
+                let mut group_commit_g = engine.trx_sys.log_partitions[0].group_commit.lock();
+                // Simulate the state after the redo worker has consumed any
+                // shutdown wakeup message: admission is closed, but rejection
+                // must not depend on a `Commit::Shutdown` queue tail.
+                group_commit_g.close(FailedPrecommitReason::Shutdown);
+            }
+
+            let err = trx.commit().await.unwrap_err();
+            assert_eq!(
+                err.completion_error(),
+                Some(CompletionErrorKind::Lifecycle(LifecycleError::Shutdown)),
+                "{err:?}"
+            );
+            assert!(!session.in_trx().unwrap());
+
+            drop(session);
+            drop(table);
+            engine.shutdown().unwrap();
+        });
+    }
+
+    #[test]
+    fn test_user_redo_fsync_failure_rolls_back_session_before_return() {
+        smol::block_on(async {
+            let (_temp_dir, engine) =
+                build_redo_test_engine("user_redo_fsync_failure", LogSync::Fsync).await;
+            let table_id = table2(&engine).await;
+            let table = engine.catalog().get_table(table_id).await.unwrap();
+            let redo_fd = {
+                engine.trx_sys.log_partitions[0]
+                    .group_commit
+                    .lock()
+                    .log_file
+                    .as_ref()
+                    .unwrap()
+                    .as_raw_fd()
+            };
+            let hook = ControlledFileSyncHook::new(redo_fd, FileSyncKind::Fsync, libc::EIO);
+            let _install = install_file_sync_test_hook(Arc::new(hook.clone()));
+
+            let mut session = engine.new_session().unwrap();
+            let mut trx = session.begin_trx().unwrap();
+            trx.exec(async |stmt| {
+                stmt.table_insert_mvcc(&table, vec![Val::from(1), Val::from("sync-fail")])
+                    .await?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+            let mut commit_fut = Box::pin(trx.commit());
+            let waker = noop_waker();
+            let mut cx = Context::from_waker(&waker);
+            match commit_fut.as_mut().poll(&mut cx) {
+                Poll::Pending => {}
+                Poll::Ready(res) => panic!("commit should wait for blocked fsync, got {res:?}"),
+            }
+
+            hook.wait_started(1).await;
+            assert!(session.in_trx().unwrap());
+            hook.release();
+
+            let err = commit_fut.await.unwrap_err();
+            assert_eq!(
+                err.completion_error(),
+                Some(CompletionErrorKind::Fatal(FatalError::RedoSync)),
+                "{err:?}"
+            );
+            assert!(!session.in_trx().unwrap());
+            assert!(
+                engine
+                    .trx_sys
+                    .storage_poison_error()
+                    .as_ref()
+                    .is_some_and(|err| *err.current_context() == FatalError::RedoSync)
+            );
+
+            drop(session);
+            drop(table);
+        });
+    }
+
     fn sync_group_for_order_test(cts: TrxID, finished: bool, log_bytes: usize) -> SyncGroup {
         SyncGroup {
             trx_list: vec![PrecommitTrx {
@@ -1487,7 +1656,7 @@ mod tests {
             returned_buf: None,
             completion: Arc::new(Completion::new()),
             finished,
-            failed: false,
+            failure_reason: None,
         }
     }
 
@@ -1495,6 +1664,7 @@ mod tests {
     fn test_shrink_inflight_preserves_order_with_no_log_groups() {
         let mut inflight = BTreeMap::new();
         let mut written = Vec::new();
+        let mut failed_written = Vec::new();
 
         inflight.insert(
             TrxID::new(10),
@@ -1504,21 +1674,30 @@ mod tests {
             TrxID::new(11),
             sync_group_for_order_test(TrxID::new(11), true, 0),
         );
-        assert_eq!(shrink_inflight(&mut inflight, &mut written), (0, 0, 0));
+        assert_eq!(
+            shrink_inflight(&mut inflight, &mut written, &mut failed_written),
+            (0, 0, 0, None)
+        );
         assert!(written.is_empty());
+        assert!(failed_written.is_empty());
         assert_eq!(inflight.len(), 2);
 
         inflight.get_mut(&TrxID::new(10)).unwrap().finished = true;
-        assert_eq!(shrink_inflight(&mut inflight, &mut written), (2, 2, 4096));
+        assert_eq!(
+            shrink_inflight(&mut inflight, &mut written, &mut failed_written),
+            (2, 2, 4096, None)
+        );
         assert_eq!(written.len(), 2);
         assert_eq!(written[0].max_cts, TrxID::new(10));
         assert_eq!(written[1].max_cts, TrxID::new(11));
+        assert!(failed_written.is_empty());
     }
 
     #[test]
     fn test_shrink_inflight_releases_no_log_prefix_without_later_log() {
         let mut inflight = BTreeMap::new();
         let mut written = Vec::new();
+        let mut failed_written = Vec::new();
 
         inflight.insert(
             TrxID::new(20),
@@ -1528,10 +1707,74 @@ mod tests {
             TrxID::new(21),
             sync_group_for_order_test(TrxID::new(21), false, 4096),
         );
-        assert_eq!(shrink_inflight(&mut inflight, &mut written), (1, 1, 0));
+        assert_eq!(
+            shrink_inflight(&mut inflight, &mut written, &mut failed_written),
+            (1, 1, 0, None)
+        );
         assert_eq!(written.len(), 1);
         assert_eq!(written[0].max_cts, TrxID::new(20));
+        assert!(failed_written.is_empty());
         assert!(inflight.contains_key(&TrxID::new(21)));
+    }
+
+    #[test]
+    fn test_shrink_inflight_stops_at_failed_redo_boundary() {
+        let mut inflight = BTreeMap::new();
+        let mut written = Vec::new();
+        let mut failed_written = Vec::new();
+        let reason = FailedPrecommitReason::Fatal(FatalError::RedoWrite);
+
+        inflight.insert(
+            TrxID::new(30),
+            sync_group_for_order_test(TrxID::new(30), true, 1024),
+        );
+        inflight.insert(
+            TrxID::new(31),
+            sync_group_for_order_test(TrxID::new(31), true, 2048),
+        );
+        inflight.insert(
+            TrxID::new(32),
+            sync_group_for_order_test(TrxID::new(32), true, 4096),
+        );
+        inflight.get_mut(&TrxID::new(31)).unwrap().failure_reason = Some(reason);
+
+        assert_eq!(
+            shrink_inflight(&mut inflight, &mut written, &mut failed_written),
+            (1, 1, 1024, Some(reason))
+        );
+        assert!(inflight.is_empty());
+        assert_eq!(written.len(), 1);
+        assert_eq!(written[0].max_cts, TrxID::new(30));
+        assert_eq!(failed_written.len(), 2);
+        assert_eq!(failed_written[0].max_cts, TrxID::new(31));
+        assert_eq!(failed_written[1].max_cts, TrxID::new(32));
+    }
+
+    #[test]
+    fn test_shrink_inflight_keeps_unfinished_groups_after_failed_boundary() {
+        let mut inflight = BTreeMap::new();
+        let mut written = Vec::new();
+        let mut failed_written = Vec::new();
+        let reason = FailedPrecommitReason::Fatal(FatalError::RedoWrite);
+
+        inflight.insert(
+            TrxID::new(40),
+            sync_group_for_order_test(TrxID::new(40), true, 1024),
+        );
+        inflight.insert(
+            TrxID::new(41),
+            sync_group_for_order_test(TrxID::new(41), false, 2048),
+        );
+        inflight.get_mut(&TrxID::new(40)).unwrap().failure_reason = Some(reason);
+
+        assert_eq!(
+            shrink_inflight(&mut inflight, &mut written, &mut failed_written),
+            (0, 0, 0, Some(reason))
+        );
+        assert!(written.is_empty());
+        assert_eq!(failed_written.len(), 1);
+        assert_eq!(failed_written[0].max_cts, TrxID::new(40));
+        assert!(inflight.contains_key(&TrxID::new(41)));
     }
 
     #[test]
