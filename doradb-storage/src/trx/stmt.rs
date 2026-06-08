@@ -500,6 +500,7 @@ pub(crate) mod tests {
     use crate::lock::LockManager;
     use crate::lock::tests::{debug_snapshot, try_acquire, try_acquire_grouped};
     use crate::session::{SessionState, tests as session_tests};
+    use crate::trx::sys::tests as sys_tests;
     use crate::trx::undo::{OwnedRowUndo, RowUndoKind};
     use crate::trx::{MIN_ACTIVE_TRX_ID, Transaction};
     use error_stack::Report;
@@ -716,6 +717,11 @@ pub(crate) mod tests {
                 err.report().downcast_ref::<FatalError>().copied(),
                 Some(FatalError::RollbackAccess)
             );
+            assert!(sys_tests::retains_statement_row_undo(
+                &engine.trx_sys,
+                TableID::new(99_999_999),
+                RowID::new(24)
+            ));
             assert_eq!(lock_entry_count(&engine, stmt_owner.get().unwrap()), 0);
             assert_eq!(lock_entry_count(&engine, trx_owner), 0);
             assert!(

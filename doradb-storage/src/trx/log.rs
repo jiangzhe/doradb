@@ -480,12 +480,7 @@ impl LogPartition {
     }
 
     #[inline]
-    pub(super) fn commit_no_wait(
-        &self,
-        trx: PreparedTrx,
-        _trx_sys: &TransactionSystem,
-        global_ts: &AtomicU64,
-    ) -> Result<TrxID> {
+    pub(super) fn commit_no_wait(&self, trx: PreparedTrx, global_ts: &AtomicU64) -> Result<TrxID> {
         debug_assert!(trx.attachment.is_none());
         // This API is for sessionless system transactions only.
         //
@@ -649,7 +644,10 @@ pub(super) struct SyncGroup {
     pub(super) returned_buf: Option<DirectBuf>,
     pub(super) completion: Arc<Completion<()>>,
     pub(super) finished: bool,
-    pub(super) failed: bool,
+    // Redo logging is sequential: once one group fails, this group and every
+    // later group cannot be part of the durable prefix. Submitted IO may still
+    // complete later, but completion only returns buffers for recycling.
+    pub(super) failure_reason: Option<FailedPrecommitReason>,
 }
 
 impl SyncGroup {
@@ -676,10 +674,10 @@ impl SyncGroup {
 
     #[inline]
     fn fail_waiters(&mut self, trx_sys: &TransactionSystem, reason: FailedPrecommitReason) {
-        if self.failed {
+        if self.failure_reason.is_some() {
             return;
         }
-        self.failed = true;
+        self.failure_reason = Some(reason);
         let trx_list = mem::take(&mut self.trx_list);
         let completion = Arc::clone(&self.completion);
         trx_sys.request_failed_precommit_cleanup(FailedPrecommitCleanupJob::new(
@@ -740,6 +738,7 @@ struct FileProcessor<'a> {
     in_progress: usize,
     sync_groups: VecDeque<SyncGroup>,
     written: Vec<SyncGroup>,
+    failed_written: Vec<SyncGroup>,
     syncer: FileSyncer,
     log_sync: LogSync,
     shutdown: bool,
@@ -764,6 +763,7 @@ impl<'a> FileProcessor<'a> {
             in_progress: 0,
             sync_groups: VecDeque::new(),
             written: vec![],
+            failed_written: vec![],
             syncer,
             log_sync: config.log_sync,
             shutdown: false,
@@ -928,8 +928,27 @@ impl<'a> FileProcessor<'a> {
     #[inline]
     fn sync_io(&mut self) {
         self.written.clear();
-        let (trx_count, commit_count, log_bytes) =
-            shrink_inflight(&mut self.inflight, &mut self.written);
+        self.failed_written.clear();
+        let (trx_count, commit_count, log_bytes, failure_reason) = shrink_inflight(
+            &mut self.inflight,
+            &mut self.written,
+            &mut self.failed_written,
+        );
+
+        if let Some(reason) = failure_reason {
+            // The first failed group ends the sequential redo prefix. Any
+            // later inflight group that has not finished yet must be failed
+            // now; it stays in `inflight` only until its IO completion returns
+            // the backend-owned buffer.
+            for sync_group in self.inflight.values_mut() {
+                sync_group.fail_waiters(self.trx_sys, reason);
+            }
+            let drained_failed: Vec<_> = self.failed_written.drain(..).collect();
+            for mut sync_group in drained_failed {
+                self.fail_sync_group(&mut sync_group, reason);
+            }
+        }
+
         if !self.written.is_empty() {
             let max_cts = self.written.last().unwrap().max_cts;
 
@@ -962,11 +981,9 @@ impl<'a> FileProcessor<'a> {
             // Put IO buffer back into free list.
             let drained_written: Vec<_> = self.written.drain(..).collect();
             for mut sync_group in drained_written {
+                debug_assert!(sync_group.failure_reason.is_none());
                 if let Some(buf) = sync_group.take_any_buf() {
                     self.recycle_buf(buf);
-                }
-                if sync_group.failed {
-                    continue;
                 }
                 // commit transactions to let waiting read operations to continue
                 let mut committed_trx_list: HashMap<usize, Vec<CommittedTrx>> = HashMap::new();
@@ -1078,22 +1095,31 @@ impl<'a> FileProcessor<'a> {
 fn shrink_inflight(
     tree: &mut BTreeMap<TrxID, SyncGroup>,
     buffer: &mut Vec<SyncGroup>,
-) -> (usize, usize, usize) {
+    failed_buffer: &mut Vec<SyncGroup>,
+) -> (usize, usize, usize, Option<FailedPrecommitReason>) {
     let mut trx_count = 0;
     let mut commit_count = 0;
     let mut log_bytes = 0;
+    let mut failure_reason = None;
     while let Some(entry) = tree.first_entry() {
         let task = entry.get();
-        if task.finished {
-            trx_count += task.trx_list.len();
-            commit_count += 1;
-            log_bytes += task.log_bytes;
-            buffer.push(entry.remove());
-        } else {
+        if !task.finished {
             break; // stop at the transaction which is not persisted.
         }
+        if let Some(reason) = failure_reason.or(task.failure_reason) {
+            // Redo records are sequential. The first failed group ends the
+            // durable prefix, so every finished group after it is cleanup-only
+            // even if its individual write completed successfully.
+            failure_reason = Some(reason);
+            failed_buffer.push(entry.remove());
+            continue;
+        }
+        trx_count += task.trx_list.len();
+        commit_count += 1;
+        log_bytes += task.log_bytes;
+        buffer.push(entry.remove());
     }
-    (trx_count, commit_count, log_bytes)
+    (trx_count, commit_count, log_bytes, failure_reason)
 }
 
 #[inline]
@@ -1630,7 +1656,7 @@ mod tests {
             returned_buf: None,
             completion: Arc::new(Completion::new()),
             finished,
-            failed: false,
+            failure_reason: None,
         }
     }
 
@@ -1638,6 +1664,7 @@ mod tests {
     fn test_shrink_inflight_preserves_order_with_no_log_groups() {
         let mut inflight = BTreeMap::new();
         let mut written = Vec::new();
+        let mut failed_written = Vec::new();
 
         inflight.insert(
             TrxID::new(10),
@@ -1647,21 +1674,30 @@ mod tests {
             TrxID::new(11),
             sync_group_for_order_test(TrxID::new(11), true, 0),
         );
-        assert_eq!(shrink_inflight(&mut inflight, &mut written), (0, 0, 0));
+        assert_eq!(
+            shrink_inflight(&mut inflight, &mut written, &mut failed_written),
+            (0, 0, 0, None)
+        );
         assert!(written.is_empty());
+        assert!(failed_written.is_empty());
         assert_eq!(inflight.len(), 2);
 
         inflight.get_mut(&TrxID::new(10)).unwrap().finished = true;
-        assert_eq!(shrink_inflight(&mut inflight, &mut written), (2, 2, 4096));
+        assert_eq!(
+            shrink_inflight(&mut inflight, &mut written, &mut failed_written),
+            (2, 2, 4096, None)
+        );
         assert_eq!(written.len(), 2);
         assert_eq!(written[0].max_cts, TrxID::new(10));
         assert_eq!(written[1].max_cts, TrxID::new(11));
+        assert!(failed_written.is_empty());
     }
 
     #[test]
     fn test_shrink_inflight_releases_no_log_prefix_without_later_log() {
         let mut inflight = BTreeMap::new();
         let mut written = Vec::new();
+        let mut failed_written = Vec::new();
 
         inflight.insert(
             TrxID::new(20),
@@ -1671,10 +1707,74 @@ mod tests {
             TrxID::new(21),
             sync_group_for_order_test(TrxID::new(21), false, 4096),
         );
-        assert_eq!(shrink_inflight(&mut inflight, &mut written), (1, 1, 0));
+        assert_eq!(
+            shrink_inflight(&mut inflight, &mut written, &mut failed_written),
+            (1, 1, 0, None)
+        );
         assert_eq!(written.len(), 1);
         assert_eq!(written[0].max_cts, TrxID::new(20));
+        assert!(failed_written.is_empty());
         assert!(inflight.contains_key(&TrxID::new(21)));
+    }
+
+    #[test]
+    fn test_shrink_inflight_stops_at_failed_redo_boundary() {
+        let mut inflight = BTreeMap::new();
+        let mut written = Vec::new();
+        let mut failed_written = Vec::new();
+        let reason = FailedPrecommitReason::Fatal(FatalError::RedoWrite);
+
+        inflight.insert(
+            TrxID::new(30),
+            sync_group_for_order_test(TrxID::new(30), true, 1024),
+        );
+        inflight.insert(
+            TrxID::new(31),
+            sync_group_for_order_test(TrxID::new(31), true, 2048),
+        );
+        inflight.insert(
+            TrxID::new(32),
+            sync_group_for_order_test(TrxID::new(32), true, 4096),
+        );
+        inflight.get_mut(&TrxID::new(31)).unwrap().failure_reason = Some(reason);
+
+        assert_eq!(
+            shrink_inflight(&mut inflight, &mut written, &mut failed_written),
+            (1, 1, 1024, Some(reason))
+        );
+        assert!(inflight.is_empty());
+        assert_eq!(written.len(), 1);
+        assert_eq!(written[0].max_cts, TrxID::new(30));
+        assert_eq!(failed_written.len(), 2);
+        assert_eq!(failed_written[0].max_cts, TrxID::new(31));
+        assert_eq!(failed_written[1].max_cts, TrxID::new(32));
+    }
+
+    #[test]
+    fn test_shrink_inflight_keeps_unfinished_groups_after_failed_boundary() {
+        let mut inflight = BTreeMap::new();
+        let mut written = Vec::new();
+        let mut failed_written = Vec::new();
+        let reason = FailedPrecommitReason::Fatal(FatalError::RedoWrite);
+
+        inflight.insert(
+            TrxID::new(40),
+            sync_group_for_order_test(TrxID::new(40), true, 1024),
+        );
+        inflight.insert(
+            TrxID::new(41),
+            sync_group_for_order_test(TrxID::new(41), false, 2048),
+        );
+        inflight.get_mut(&TrxID::new(40)).unwrap().failure_reason = Some(reason);
+
+        assert_eq!(
+            shrink_inflight(&mut inflight, &mut written, &mut failed_written),
+            (0, 0, 0, Some(reason))
+        );
+        assert!(written.is_empty());
+        assert_eq!(failed_written.len(), 1);
+        assert_eq!(failed_written[0].max_cts, TrxID::new(40));
+        assert!(inflight.contains_key(&TrxID::new(41)));
     }
 
     #[test]

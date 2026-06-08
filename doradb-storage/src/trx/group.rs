@@ -170,7 +170,7 @@ impl CommitGroup {
             returned_buf: None,
             completion: self.completion,
             finished,
-            failed: false,
+            failure_reason: None,
         }
     }
 }

@@ -394,7 +394,7 @@ impl TransactionSystem {
         const LOG_NO: usize = 0;
         let partition = &*self.log_partitions[LOG_NO];
         let prepared_trx = trx.prepare();
-        partition.commit_no_wait(prepared_trx, self, &self.ts)
+        partition.commit_no_wait(prepared_trx, &self.ts)
     }
 
     /// Rollback active transaction.
@@ -888,16 +888,34 @@ impl Component for TransactionSystemWorkers {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::buffer::PoolRole;
     use crate::catalog::tests::table2;
     use crate::conf::{EngineConfig, EvictableBufferPoolConfig};
+    use crate::id::{RowID, TableID};
     use crate::value::Val;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Barrier};
     use std::time::Duration;
     use tempfile::TempDir;
+
+    pub(crate) fn retains_statement_row_undo(
+        trx_sys: &TransactionSystem,
+        table_id: TableID,
+        row_id: RowID,
+    ) -> bool {
+        trx_sys
+            .fatal_rollback_retention
+            .lock()
+            .iter()
+            .any(|retention| match retention {
+                FatalRollbackRetention::Statement { row_undo, .. } => row_undo
+                    .iter()
+                    .any(|undo| undo.table_id == table_id && undo.row_id == row_id),
+                _ => false,
+            })
+    }
 
     #[test]
     fn test_transaction_system() {

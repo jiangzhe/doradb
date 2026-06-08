@@ -3237,7 +3237,7 @@ pub(crate) mod tests {
 
             let prepared = prepare_transaction(trx).unwrap();
             let precommit = prepared.fill_cts(TrxID::new(91_241));
-            precommit.rollback_failed_precommit().await;
+            assert!(precommit.rollback_failed_precommit().await);
             assert_eq!(lock_entry_count(&engine, owner), 0);
             assert!(!session.in_trx().unwrap());
         });
