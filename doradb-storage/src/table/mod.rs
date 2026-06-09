@@ -13,6 +13,7 @@ mod tests;
 
 pub(crate) use access::*;
 pub(crate) use deletion_buffer::*;
+pub use gc::{SecondaryMemIndexCleanupIndexStats, SecondaryMemIndexCleanupStats};
 pub(crate) use layout::{RetiredSecondaryIndex, TableRuntimeLayout};
 pub use lifecycle::CheckpointCancelReason;
 #[cfg(test)]
@@ -56,7 +57,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 /// Runtime handle for a user table, combining in-memory and persisted storage.
-pub struct Table {
+pub(crate) struct Table {
     pub(crate) mem: MemTable<EvictableBufferPool, EvictableBufferPool>,
     pub(crate) storage: ColumnStorage,
     layout: Mutex<Arc<TableRuntimeLayout>>,
@@ -735,7 +736,7 @@ impl Table {
 
     /// Returns total number of row pages.
     #[inline]
-    pub async fn total_row_pages(&self, guards: &PoolGuards) -> usize {
+    pub(crate) async fn total_row_pages(&self, guards: &PoolGuards) -> usize {
         let mut res = 0usize;
         let pivot_row_id = self.mem.pivot_row_id();
         let meta_pool_guard = guards.meta_guard();

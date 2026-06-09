@@ -44,8 +44,8 @@ pub use lock::LockMode;
 pub use row::ops::{DeleteMvcc, ScanMvcc, SelectKey, SelectMvcc, UpdateCol, UpdateMvcc};
 pub use session::Session;
 pub use table::{
-    CheckpointCancelReason, CheckpointDelayReason, CheckpointOutcome, CheckpointReadiness, Table,
-    TablePersistence,
+    CheckpointCancelReason, CheckpointDelayReason, CheckpointOutcome, CheckpointReadiness,
+    SecondaryMemIndexCleanupIndexStats, SecondaryMemIndexCleanupStats,
 };
 pub use trx::{Statement, Transaction};
 pub use value::{MemVar, Val, ValKind, ValType};

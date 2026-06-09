@@ -1,8 +1,8 @@
 use crate::buffer::PoolGuards;
 use crate::id::{RowID, TableID, TrxID};
 
-use crate::catalog::{CatalogTable, TableCache};
-use crate::error::{FatalError, Result};
+use crate::catalog::{CatalogTable, TableCache, is_catalog_obj_id};
+use crate::error::{FatalError, OperationError, Result};
 use crate::lock::{LockMode, LockOwner, LockResource, OwnerLockState};
 use crate::row::ops::{DeleteMvcc, ScanMvcc, SelectKey, SelectMvcc, UpdateCol, UpdateMvcc};
 use crate::session::TrxAttachment;
@@ -13,7 +13,9 @@ use crate::trx::undo::{
 };
 use crate::trx::{FatalRollbackRetention, TrxEffects, TrxInner, TrxRuntime};
 use crate::value::Val;
+use error_stack::Report;
 use std::mem;
+use std::sync::Arc;
 
 /// Mutable effects accumulated by one statement before success or rollback.
 ///
@@ -301,18 +303,55 @@ impl<'stmt> Statement<'stmt> {
             .await
     }
 
-    /// Scans the table's row store under statement-lifetime metadata protection.
+    #[inline]
+    fn table_not_found(table_id: TableID, operation: &'static str) -> crate::error::Error {
+        Report::new(OperationError::TableNotFound)
+            .attach(format!("operation={operation}, table_id={table_id}"))
+            .into()
+    }
+
+    #[inline]
+    fn resolve_user_table(
+        &mut self,
+        table_id: TableID,
+        operation: &'static str,
+    ) -> Result<Arc<Table>> {
+        if is_catalog_obj_id(table_id) {
+            return Err(Self::table_not_found(table_id, operation));
+        }
+        if let Some(table) = self.inner.cached_user_table(table_id) {
+            return Ok(table);
+        }
+        if let Some(table) = self.attachment.cached_user_table(table_id) {
+            self.inner.cache_user_table(&table);
+            return Ok(table);
+        }
+        let engine = self.attachment.engine();
+        let Some(table) = engine.catalog().get_table_now(table_id) else {
+            return Err(Self::table_not_found(table_id, operation));
+        };
+        self.attachment.cache_user_table(&table);
+        self.inner.cache_user_table(&table);
+        Ok(table)
+    }
+
+    /// Scans the catalog-owned user table's row store by table id.
+    ///
+    /// The table runtime is resolved and strongly pinned only for this statement
+    /// method. The public caller supplies the stable [`TableID`], not a table
+    /// runtime handle.
     #[inline]
     pub async fn table_scan_mvcc<F>(
         &mut self,
-        table: &Table,
+        table_id: TableID,
         read_set: &[usize],
         row_action: F,
     ) -> Result<()>
     where
         F: FnMut(Vec<Val>) -> bool,
     {
-        self.acquire_table_read_lock(table.table_id()).await?;
+        let table = self.resolve_user_table(table_id, "table_scan_mvcc")?;
+        self.acquire_table_read_lock(table_id).await?;
         table.check_foreground_live("table_scan_mvcc")?;
         let layout = table.layout_snapshot();
         let rt = self.runtime();
@@ -322,15 +361,18 @@ impl<'stmt> Statement<'stmt> {
             .await
     }
 
-    /// Looks up one unique-key row under statement-lifetime metadata protection.
+    /// Looks up one unique-key row in a catalog-owned user table by table id.
+    ///
+    /// Strong table-runtime access is internal and operation-local.
     #[inline]
     pub async fn table_lookup_unique_mvcc(
         &mut self,
-        table: &Table,
+        table_id: TableID,
         key: &SelectKey,
         user_read_set: &[usize],
     ) -> Result<SelectMvcc> {
-        self.acquire_table_read_lock(table.table_id()).await?;
+        let table = self.resolve_user_table(table_id, "table_lookup_unique_mvcc")?;
+        self.acquire_table_read_lock(table_id).await?;
         table.check_foreground_live("table_lookup_unique_mvcc")?;
         let layout = table.layout_snapshot();
         let rt = self.runtime();
@@ -340,15 +382,18 @@ impl<'stmt> Statement<'stmt> {
             .await
     }
 
-    /// Scans one secondary-index key under statement-lifetime metadata protection.
+    /// Scans one secondary-index key in a catalog-owned user table by table id.
+    ///
+    /// Strong table-runtime access is internal and operation-local.
     #[inline]
     pub async fn table_index_scan_mvcc(
         &mut self,
-        table: &Table,
+        table_id: TableID,
         key: &SelectKey,
         user_read_set: &[usize],
     ) -> Result<ScanMvcc> {
-        self.acquire_table_read_lock(table.table_id()).await?;
+        let table = self.resolve_user_table(table_id, "table_index_scan_mvcc")?;
+        self.acquire_table_read_lock(table_id).await?;
         table.check_foreground_live("table_index_scan_mvcc")?;
         let layout = table.layout_snapshot();
         let rt = self.runtime();
@@ -358,10 +403,13 @@ impl<'stmt> Statement<'stmt> {
             .await
     }
 
-    /// Inserts one user-table row after acquiring transaction-lifetime write locks.
+    /// Inserts one row into a catalog-owned user table by table id.
+    ///
+    /// Strong table-runtime access is internal and operation-local.
     #[inline]
-    pub async fn table_insert_mvcc(&mut self, table: &Table, cols: Vec<Val>) -> Result<RowID> {
-        self.acquire_table_write_locks(table.table_id()).await?;
+    pub async fn table_insert_mvcc(&mut self, table_id: TableID, cols: Vec<Val>) -> Result<RowID> {
+        let table = self.resolve_user_table(table_id, "table_insert_mvcc")?;
+        self.acquire_table_write_locks(table_id).await?;
         table.check_foreground_live("table_insert_mvcc")?;
         let layout = table.layout_snapshot();
         let (rt, effects) = self.runtime_and_effects_mut();
@@ -371,15 +419,18 @@ impl<'stmt> Statement<'stmt> {
             .await
     }
 
-    /// Updates one user-table row by unique key after acquiring write locks.
+    /// Updates one catalog-owned user-table row by table id and unique key.
+    ///
+    /// Strong table-runtime access is internal and operation-local.
     #[inline]
     pub async fn table_update_unique_mvcc(
         &mut self,
-        table: &Table,
+        table_id: TableID,
         key: &SelectKey,
         update: Vec<UpdateCol>,
     ) -> Result<UpdateMvcc> {
-        self.acquire_table_write_locks(table.table_id()).await?;
+        let table = self.resolve_user_table(table_id, "table_update_unique_mvcc")?;
+        self.acquire_table_write_locks(table_id).await?;
         table.check_foreground_live("table_update_unique_mvcc")?;
         let layout = table.layout_snapshot();
         let (rt, effects) = self.runtime_and_effects_mut();
@@ -389,15 +440,18 @@ impl<'stmt> Statement<'stmt> {
             .await
     }
 
-    /// Deletes one user-table row by unique key after acquiring write locks.
+    /// Deletes one catalog-owned user-table row by table id and unique key.
+    ///
+    /// Strong table-runtime access is internal and operation-local.
     #[inline]
     pub async fn table_delete_unique_mvcc(
         &mut self,
-        table: &Table,
+        table_id: TableID,
         key: &SelectKey,
         log_by_key: bool,
     ) -> Result<DeleteMvcc> {
-        self.acquire_table_write_locks(table.table_id()).await?;
+        let table = self.resolve_user_table(table_id, "table_delete_unique_mvcc")?;
+        self.acquire_table_write_locks(table_id).await?;
         table.check_foreground_live("table_delete_unique_mvcc")?;
         let layout = table.layout_snapshot();
         let (rt, effects) = self.runtime_and_effects_mut();

@@ -296,7 +296,7 @@ impl TransactionSystem {
     #[inline]
     pub(crate) fn begin_trx(
         &self,
-        engine: EngineRef,
+        engine: &EngineRef,
         session_state: &Arc<SessionState>,
     ) -> StartedTransaction {
         // Assign log partition index so current transaction will stick
@@ -1118,7 +1118,6 @@ pub(crate) mod tests {
                 .await
                 .unwrap();
             let table_id = table2(&engine).await;
-            let table = engine.catalog().get_table(table_id).await.unwrap();
 
             let mut session = engine.new_session().unwrap();
             let s = [1u8; 196];
@@ -1126,7 +1125,7 @@ pub(crate) mod tests {
                 let mut trx = session.begin_trx().unwrap();
                 trx.exec(async |stmt| {
                     let insert = vec![Val::from(i as i32), Val::from(&s[..])];
-                    stmt.table_insert_mvcc(&table, insert).await?;
+                    stmt.table_insert_mvcc(table_id, insert).await?;
                     Ok(())
                 })
                 .await
@@ -1134,7 +1133,6 @@ pub(crate) mod tests {
                 trx.commit().await.unwrap();
             }
             drop(session);
-            drop(table);
             drop(engine);
         });
     }

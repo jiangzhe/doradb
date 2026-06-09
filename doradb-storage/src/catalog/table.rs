@@ -12,7 +12,7 @@ use crate::lock::{
 use crate::row::ops::SelectKey;
 use crate::row::{Row, RowRead};
 use crate::serde::{Deser, Ser, Serde};
-use crate::session::{Session, SessionDdlContext};
+use crate::session::{SessionDdlContext, SessionPin};
 use crate::table::Table;
 use crate::trx::Transaction;
 use crate::trx::redo::DDLRedo;
@@ -47,11 +47,11 @@ fn index_not_found(message: impl Into<String>) -> Error {
 
 /// Create a new user table for a session-level DDL request.
 pub(crate) async fn create_table_for_session(
-    session: &mut Session,
+    session: SessionPin,
     table_spec: super::TableSpec,
     index_specs: Vec<IndexSpec>,
 ) -> Result<TableID> {
-    let ctx = SessionDdlContext::new(session)?;
+    let ctx = SessionDdlContext::new(&session)?;
     let engine = ctx.engine.clone();
     let guards = ctx.pool_guards.clone();
     let _namespace_lock =
@@ -104,7 +104,7 @@ pub(crate) async fn create_table_for_session(
     }
 
     let mut progress = CreateTableProgress::new(table_id, uninit_table_file);
-    let mut trx = match session.begin_trx() {
+    let mut trx = match session.begin_trx("begin transaction") {
         Ok(trx) => trx,
         Err(err) => {
             let delete_res = progress.delete_provisional_file(&engine);
@@ -190,8 +190,8 @@ pub(crate) async fn create_table_for_session(
 }
 
 /// Logically drop an existing user table for a session-level DDL request.
-pub(crate) async fn drop_table_for_session(session: &mut Session, table_id: TableID) -> Result<()> {
-    let ctx = SessionDdlContext::new(session)?;
+pub(crate) async fn drop_table_for_session(session: SessionPin, table_id: TableID) -> Result<()> {
+    let ctx = SessionDdlContext::new(&session)?;
     let engine = ctx.engine.clone();
     let lock_manager = engine.lock_manager();
     // Keep this guard alive until runtime removal is complete so table
@@ -205,7 +205,7 @@ pub(crate) async fn drop_table_for_session(session: &mut Session, table_id: Tabl
         acquire_table_ddl_locks(lock_manager, table_id, ctx.owner, ctx.owner_group).await?;
     engine.trx_sys.ensure_runtime_healthy()?;
 
-    let mut trx = session.begin_trx()?;
+    let mut trx = session.begin_trx("begin transaction")?;
 
     if let Err(err) = table.begin_drop_lifecycle().await {
         trx.rollback().await?;

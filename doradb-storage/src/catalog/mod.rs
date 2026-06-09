@@ -694,7 +694,6 @@ pub(crate) mod tests {
     use crate::file::cow_file::COW_FILE_PAGE_SIZE;
     use crate::id::BlockID;
     use crate::index::{COLUMN_BLOCK_HEADER_SIZE, COLUMN_BLOCK_LEAF_HEADER_SIZE, ColumnBlockIndex};
-    use crate::table::TablePersistence;
     use crate::trx::redo::DDLRedo;
     use crate::trx::{MIN_SNAPSHOT_TS, Transaction};
     use crate::value::{Val, ValKind};
@@ -1469,11 +1468,10 @@ pub(crate) mod tests {
             assert!(snap1.catalog_replay_start_ts > MIN_SNAPSHOT_TS);
             let roots_before = snap1.meta.table_roots;
 
-            let table = engine.catalog().get_table(table_id).await.unwrap();
             let mut session = engine.new_session().unwrap();
             let mut trx = session.begin_trx().unwrap();
             trx.exec(async |stmt| {
-                stmt.table_insert_mvcc(&table, vec![Val::I32(7)]).await?;
+                stmt.table_insert_mvcc(table_id, vec![Val::I32(7)]).await?;
                 Ok(())
             })
             .await
@@ -1561,22 +1559,11 @@ pub(crate) mod tests {
             assert!(snap1.catalog_replay_start_ts > MIN_SNAPSHOT_TS);
             let roots_before = snap1.meta.table_roots;
 
-            let checkpointed_table = engine
-                .catalog()
-                .get_table(checkpointed_table_id)
-                .await
-                .unwrap();
-            let replay_only_table = engine
-                .catalog()
-                .get_table(replay_only_table_id)
-                .await
-                .unwrap();
-
             let mut session = engine.new_session().unwrap();
 
             let mut trx = session.begin_trx().unwrap();
             trx.exec(async |stmt| {
-                stmt.table_insert_mvcc(&checkpointed_table, vec![Val::I32(7)])
+                stmt.table_insert_mvcc(checkpointed_table_id, vec![Val::I32(7)])
                     .await?;
                 Ok(())
             })
@@ -1587,7 +1574,7 @@ pub(crate) mod tests {
             let mut trx = session.begin_trx().unwrap();
             trx.exec(async |stmt| {
                 stmt.table_insert_mvcc(
-                    &replay_only_table,
+                    replay_only_table_id,
                     vec![Val::I32(9), Val::from("replay-backed")],
                 )
                 .await?;
@@ -1597,13 +1584,23 @@ pub(crate) mod tests {
             .unwrap();
             trx.commit().await.unwrap();
 
-            checkpointed_table
-                .freeze(&session, usize::MAX)
+            let checkpointed_table = engine
+                .catalog()
+                .get_table(checkpointed_table_id)
+                .await
+                .unwrap();
+            let replay_only_table = engine
+                .catalog()
+                .get_table(replay_only_table_id)
+                .await
+                .unwrap();
+            session
+                .freeze_table(checkpointed_table.table_id(), usize::MAX)
                 .await
                 .unwrap();
             let mut checkpoint_session = engine.new_session().unwrap();
-            let checkpoint_outcome = checkpointed_table
-                .checkpoint(&mut checkpoint_session)
+            let checkpoint_outcome = checkpoint_session
+                .checkpoint_table(checkpointed_table.table_id())
                 .await
                 .unwrap();
             assert!(matches!(

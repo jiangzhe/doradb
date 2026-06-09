@@ -5,13 +5,12 @@
 
 use doradb_storage::{
     ColumnAttributes, ColumnSpec, EngineConfig, EvictableBufferPoolConfig, FileSystemConfig,
-    IndexAttributes, IndexKey, IndexSpec, Result as StorageResult, SelectKey, Table, TableSpec,
+    IndexAttributes, IndexKey, IndexSpec, Result as StorageResult, SelectKey, TableSpec,
     TrxSysConfig, UpdateCol, Val, ValKind,
 };
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
 
@@ -26,6 +25,65 @@ struct Args {
     iterations: usize,
     scan_rows: usize,
     out_dir: PathBuf,
+    only: Option<BenchOperation>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BenchOperation {
+    SessionBegin,
+    StatementExec,
+    FirstResolutionEmptyScan,
+    CachedResolutionEmptyScan,
+    PointLookup,
+    Insert,
+    Update,
+    Delete,
+    TableScan,
+}
+
+impl BenchOperation {
+    const ALL: [BenchOperation; 9] = [
+        BenchOperation::SessionBegin,
+        BenchOperation::StatementExec,
+        BenchOperation::FirstResolutionEmptyScan,
+        BenchOperation::CachedResolutionEmptyScan,
+        BenchOperation::PointLookup,
+        BenchOperation::Insert,
+        BenchOperation::Update,
+        BenchOperation::Delete,
+        BenchOperation::TableScan,
+    ];
+
+    #[inline]
+    fn name(self) -> &'static str {
+        match self {
+            BenchOperation::SessionBegin => "session_begin",
+            BenchOperation::StatementExec => "statement_exec",
+            BenchOperation::FirstResolutionEmptyScan => "first_resolution_empty_scan",
+            BenchOperation::CachedResolutionEmptyScan => "cached_resolution_empty_scan",
+            BenchOperation::PointLookup => "point_lookup",
+            BenchOperation::Insert => "insert",
+            BenchOperation::Update => "update",
+            BenchOperation::Delete => "delete",
+            BenchOperation::TableScan => "table_scan",
+        }
+    }
+
+    #[inline]
+    fn parse(value: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|operation| operation.name() == value)
+    }
+
+    #[inline]
+    fn valid_names() -> String {
+        Self::ALL
+            .into_iter()
+            .map(BenchOperation::name)
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
 }
 
 struct BenchRow {
@@ -42,7 +100,7 @@ impl BenchRow {
 }
 
 fn usage() -> &'static str {
-    "Usage: cargo run -p doradb-storage --example weak_handle_baseline -- [--iterations <n>] [--scan-rows <n>] [--out-dir <path>]\n\
+    "Usage: cargo run -p doradb-storage --example weak_handle_baseline -- [--iterations <n>] [--scan-rows <n>] [--out-dir <path>] [--only <operation>]\n\
 \n\
 Measures current public operation boundaries that RFC-0019 weak-handle phases may affect.\n\
 Defaults: --iterations 1000 --scan-rows 10000 --out-dir target/weak-handle-baseline\n\
@@ -68,6 +126,7 @@ fn parse_args() -> ToolResult<Args> {
     let mut iterations = DEFAULT_ITERATIONS;
     let mut scan_rows = DEFAULT_SCAN_ROWS;
     let mut out_dir = PathBuf::from(DEFAULT_OUT_DIR);
+    let mut only = None;
     let mut args = env::args().skip(1);
 
     while let Some(arg) = args.next() {
@@ -84,8 +143,18 @@ fn parse_args() -> ToolResult<Args> {
                 let value = args.next().ok_or("missing value for --out-dir")?;
                 out_dir = PathBuf::from(value);
             }
+            "--only" => {
+                let value = args.next().ok_or("missing value for --only")?;
+                only = Some(BenchOperation::parse(&value).ok_or_else(|| {
+                    format!(
+                        "unknown --only operation: {value}\nvalid operations: {}",
+                        BenchOperation::valid_names()
+                    )
+                })?);
+            }
             "--help" | "-h" => {
                 println!("{}", usage());
+                println!("Valid --only operations: {}", BenchOperation::valid_names());
                 std::process::exit(0);
             }
             _ => return Err(format!("unknown argument: {arg}\n{}", usage()).into()),
@@ -96,6 +165,7 @@ fn parse_args() -> ToolResult<Args> {
         iterations,
         scan_rows,
         out_dir,
+        only,
     })
 }
 
@@ -110,31 +180,138 @@ fn parse_positive_usize(flag: &'static str, value: &str) -> ToolResult<usize> {
 async fn run_baseline(args: &Args) -> StorageResult<Vec<BenchRow>> {
     let temp_dir = TempDir::new()?;
     let engine = baseline_engine_config(temp_dir.path()).build().await?;
-    let table = create_baseline_table(&engine).await?;
-    let table_id = table.table_id();
     let setup_rows = args.scan_rows.max(args.iterations);
-
+    let resolution_table_id = if should_run(args, BenchOperation::FirstResolutionEmptyScan)
+        || should_run(args, BenchOperation::CachedResolutionEmptyScan)
     {
+        Some(create_baseline_table(&engine).await?)
+    } else {
+        None
+    };
+    let data_table_id = if needs_data_table(args) {
+        Some(create_baseline_table(&engine).await?)
+    } else {
+        None
+    };
+
+    if let Some(table_id) = data_table_id {
         let mut session = engine.new_session()?;
-        insert_range(&mut session, &table, 0, setup_rows).await?;
-        insert_range(&mut session, &table, 20_000_000, args.iterations).await?;
-        insert_range(&mut session, &table, 30_000_000, args.iterations).await?;
+        if should_run(args, BenchOperation::PointLookup)
+            || should_run(args, BenchOperation::TableScan)
+        {
+            let count = if should_run(args, BenchOperation::TableScan) {
+                setup_rows
+            } else {
+                1
+            };
+            insert_range(&mut session, table_id, 0, count).await?;
+        }
+        if should_run(args, BenchOperation::Update) {
+            insert_range(&mut session, table_id, 20_000_000, args.iterations).await?;
+        }
+        if should_run(args, BenchOperation::Delete) {
+            insert_range(&mut session, table_id, 30_000_000, args.iterations).await?;
+        }
         session.close().await?;
     }
 
     let mut rows = Vec::new();
-    rows.push(measure_session_begin(&engine, args.iterations).await?);
-    rows.push(measure_statement_exec(&engine, args.iterations).await?);
-    rows.push(measure_table_lookup(&engine, table_id, args.iterations).await?);
-    rows.push(measure_point_lookup(&engine, &table, args.iterations).await?);
-    rows.push(measure_insert(&engine, &table, args.iterations).await?);
-    rows.push(measure_update(&engine, &table, args.iterations).await?);
-    rows.push(measure_delete(&engine, &table, args.iterations).await?);
-    rows.push(measure_table_scan(&engine, &table, args.iterations, setup_rows).await?);
+    if should_run(args, BenchOperation::SessionBegin) {
+        rows.push(measure_session_begin(&engine, args.iterations).await?);
+    }
+    if should_run(args, BenchOperation::StatementExec) {
+        rows.push(measure_statement_exec(&engine, args.iterations).await?);
+    }
+    if should_run(args, BenchOperation::FirstResolutionEmptyScan) {
+        rows.push(
+            measure_first_resolution_empty_scan(
+                &engine,
+                resolution_table_id.expect("resolution table required"),
+                args.iterations,
+            )
+            .await?,
+        );
+    }
+    if should_run(args, BenchOperation::CachedResolutionEmptyScan) {
+        rows.push(
+            measure_cached_resolution_empty_scan(
+                &engine,
+                resolution_table_id.expect("resolution table required"),
+                args.iterations,
+            )
+            .await?,
+        );
+    }
+    if should_run(args, BenchOperation::PointLookup) {
+        rows.push(
+            measure_point_lookup(
+                &engine,
+                data_table_id.expect("data table required"),
+                args.iterations,
+            )
+            .await?,
+        );
+    }
+    if should_run(args, BenchOperation::Insert) {
+        rows.push(
+            measure_insert(
+                &engine,
+                data_table_id.expect("data table required"),
+                args.iterations,
+            )
+            .await?,
+        );
+    }
+    if should_run(args, BenchOperation::Update) {
+        rows.push(
+            measure_update(
+                &engine,
+                data_table_id.expect("data table required"),
+                args.iterations,
+            )
+            .await?,
+        );
+    }
+    if should_run(args, BenchOperation::Delete) {
+        rows.push(
+            measure_delete(
+                &engine,
+                data_table_id.expect("data table required"),
+                args.iterations,
+            )
+            .await?,
+        );
+    }
+    if should_run(args, BenchOperation::TableScan) {
+        rows.push(
+            measure_table_scan(
+                &engine,
+                data_table_id.expect("data table required"),
+                args.iterations,
+                setup_rows,
+            )
+            .await?,
+        );
+    }
 
-    drop(table);
     engine.shutdown()?;
     Ok(rows)
+}
+
+fn should_run(args: &Args, operation: BenchOperation) -> bool {
+    args.only.is_none_or(|only| only == operation)
+}
+
+fn needs_data_table(args: &Args) -> bool {
+    [
+        BenchOperation::PointLookup,
+        BenchOperation::Insert,
+        BenchOperation::Update,
+        BenchOperation::Delete,
+        BenchOperation::TableScan,
+    ]
+    .into_iter()
+    .any(|operation| should_run(args, operation))
 }
 
 fn baseline_engine_config(root: &Path) -> EngineConfig {
@@ -152,7 +329,9 @@ fn baseline_engine_config(root: &Path) -> EngineConfig {
         .trx(TrxSysConfig::default())
 }
 
-async fn create_baseline_table(engine: &doradb_storage::Engine) -> StorageResult<Arc<Table>> {
+async fn create_baseline_table(
+    engine: &doradb_storage::Engine,
+) -> StorageResult<doradb_storage::id::TableID> {
     let mut session = engine.new_session()?;
     let table_id = session
         .create_table(
@@ -163,14 +342,13 @@ async fn create_baseline_table(engine: &doradb_storage::Engine) -> StorageResult
             vec![IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::PK)],
         )
         .await?;
-    let table = session.get_table(table_id).await?;
     session.close().await?;
-    Ok(table)
+    Ok(table_id)
 }
 
 async fn insert_range(
     session: &mut doradb_storage::Session,
-    table: &Table,
+    table_id: doradb_storage::id::TableID,
     start: i32,
     count: usize,
 ) -> StorageResult<()> {
@@ -178,7 +356,7 @@ async fn insert_range(
     for offset in 0..count {
         let id = start + offset as i32;
         trx.exec(async |stmt| {
-            stmt.table_insert_mvcc(table, vec![Val::from(id), Val::from(id)])
+            stmt.table_insert_mvcc(table_id, vec![Val::from(id), Val::from(id)])
                 .await
                 .map(|_| ())
         })
@@ -229,22 +407,60 @@ async fn measure_statement_exec(
     })
 }
 
-async fn measure_table_lookup(
+/// Measures first table-id resolution through an otherwise empty read statement.
+///
+/// The timed window excludes session/transaction creation, but includes the
+/// public statement boundary, statement read lock, table lifecycle/layout checks,
+/// and empty MVCC scan scaffolding.
+async fn measure_first_resolution_empty_scan(
+    engine: &doradb_storage::Engine,
+    table_id: doradb_storage::id::TableID,
+    iterations: usize,
+) -> StorageResult<BenchRow> {
+    let read_set = [];
+    let mut elapsed = Duration::ZERO;
+    for _ in 0..iterations {
+        let mut session = engine.new_session()?;
+        let mut trx = session.begin_trx()?;
+        let start = Instant::now();
+        trx.exec(async |stmt| stmt.table_scan_mvcc(table_id, &read_set, |_| true).await)
+            .await?;
+        elapsed += start.elapsed();
+        trx.rollback().await?;
+        session.close().await?;
+    }
+    Ok(BenchRow {
+        operation: "first_resolution_empty_scan",
+        iterations,
+        elapsed,
+    })
+}
+
+/// Measures cached table-id resolution through an otherwise empty read statement.
+///
+/// This row is not raw table-cache lookup cost. It keeps the same transaction
+/// warm so the table cache is hot, then times the full read-statement path.
+async fn measure_cached_resolution_empty_scan(
     engine: &doradb_storage::Engine,
     table_id: doradb_storage::id::TableID,
     iterations: usize,
 ) -> StorageResult<BenchRow> {
     let mut session = engine.new_session()?;
+    let mut trx = session.begin_trx()?;
+    let read_set = [];
+    trx.exec(async |stmt| stmt.table_scan_mvcc(table_id, &read_set, |_| true).await)
+        .await?;
     let mut elapsed = Duration::ZERO;
     for _ in 0..iterations {
         let start = Instant::now();
-        let table = session.get_table(table_id).await?;
+        trx.exec(async |stmt| stmt.table_scan_mvcc(table_id, &read_set, |_| true).await)
+            .await?;
         elapsed += start.elapsed();
-        drop(table);
     }
+    trx.rollback().await?;
     session.close().await?;
     Ok(BenchRow {
-        operation: "table_lookup",
+        operation: "cached_resolution_empty_scan",
         iterations,
         elapsed,
     })
@@ -252,7 +468,7 @@ async fn measure_table_lookup(
 
 async fn measure_point_lookup(
     engine: &doradb_storage::Engine,
-    table: &Table,
+    table_id: doradb_storage::id::TableID,
     iterations: usize,
 ) -> StorageResult<BenchRow> {
     let mut session = engine.new_session()?;
@@ -262,7 +478,7 @@ async fn measure_point_lookup(
     for _ in 0..iterations {
         let start = Instant::now();
         let res = trx
-            .exec(async |stmt| stmt.table_lookup_unique_mvcc(table, &key, &[0, 1]).await)
+            .exec(async |stmt| stmt.table_lookup_unique_mvcc(table_id, &key, &[0, 1]).await)
             .await?;
         elapsed += start.elapsed();
         assert!(res.is_found(), "baseline point lookup key must exist");
@@ -278,7 +494,7 @@ async fn measure_point_lookup(
 
 async fn measure_insert(
     engine: &doradb_storage::Engine,
-    table: &Table,
+    table_id: doradb_storage::id::TableID,
     iterations: usize,
 ) -> StorageResult<BenchRow> {
     let mut session = engine.new_session()?;
@@ -288,7 +504,7 @@ async fn measure_insert(
         let id = 10_000_000 + offset as i32;
         let start = Instant::now();
         trx.exec(async |stmt| {
-            stmt.table_insert_mvcc(table, vec![Val::from(id), Val::from(id)])
+            stmt.table_insert_mvcc(table_id, vec![Val::from(id), Val::from(id)])
                 .await
         })
         .await?;
@@ -305,7 +521,7 @@ async fn measure_insert(
 
 async fn measure_update(
     engine: &doradb_storage::Engine,
-    table: &Table,
+    table_id: doradb_storage::id::TableID,
     iterations: usize,
 ) -> StorageResult<BenchRow> {
     let mut session = engine.new_session()?;
@@ -320,7 +536,7 @@ async fn measure_update(
         }];
         let start = Instant::now();
         let res = trx
-            .exec(async |stmt| stmt.table_update_unique_mvcc(table, &key, update).await)
+            .exec(async |stmt| stmt.table_update_unique_mvcc(table_id, &key, update).await)
             .await?;
         elapsed += start.elapsed();
         assert!(res.is_updated(), "baseline update key must exist");
@@ -336,7 +552,7 @@ async fn measure_update(
 
 async fn measure_delete(
     engine: &doradb_storage::Engine,
-    table: &Table,
+    table_id: doradb_storage::id::TableID,
     iterations: usize,
 ) -> StorageResult<BenchRow> {
     let mut session = engine.new_session()?;
@@ -346,7 +562,7 @@ async fn measure_delete(
         let id = 30_000_000 + offset as i32;
         let key = SelectKey::new(0, vec![Val::from(id)]);
         let start = Instant::now();
-        trx.exec(async |stmt| stmt.table_delete_unique_mvcc(table, &key, false).await)
+        trx.exec(async |stmt| stmt.table_delete_unique_mvcc(table_id, &key, false).await)
             .await?;
         elapsed += start.elapsed();
     }
@@ -361,7 +577,7 @@ async fn measure_delete(
 
 async fn measure_table_scan(
     engine: &doradb_storage::Engine,
-    table: &Table,
+    table_id: doradb_storage::id::TableID,
     iterations: usize,
     expected_rows: usize,
 ) -> StorageResult<BenchRow> {
@@ -372,7 +588,7 @@ async fn measure_table_scan(
         let mut seen = 0usize;
         let start = Instant::now();
         trx.exec(async |stmt| {
-            stmt.table_scan_mvcc(table, &[0, 1], |_| {
+            stmt.table_scan_mvcc(table_id, &[0, 1], |_| {
                 seen += 1;
                 true
             })
@@ -422,5 +638,45 @@ fn print_report(rows: &[BenchRow], report_path: &Path) {
             row.avg_ns()
         );
     }
+    print_derived_report(rows);
     println!("wrote {}", report_path.display());
+}
+
+fn print_derived_report(rows: &[BenchRow]) {
+    let Some(statement_exec) = avg_ns_for(rows, "statement_exec") else {
+        return;
+    };
+    let Some(first_empty_scan) = avg_ns_for(rows, "first_resolution_empty_scan") else {
+        return;
+    };
+    let Some(cached_empty_scan) = avg_ns_for(rows, "cached_resolution_empty_scan") else {
+        return;
+    };
+    let Some(point_lookup) = avg_ns_for(rows, "point_lookup") else {
+        return;
+    };
+
+    println!("derived_metric,delta_avg_ns");
+    println!(
+        "first_resolution_miss_delta,{}",
+        delta_ns(first_empty_scan, cached_empty_scan)
+    );
+    println!(
+        "cached_empty_scan_over_statement_exec,{}",
+        delta_ns(cached_empty_scan, statement_exec)
+    );
+    println!(
+        "point_lookup_over_cached_empty_scan,{}",
+        delta_ns(point_lookup, cached_empty_scan)
+    );
+}
+
+fn avg_ns_for(rows: &[BenchRow], operation: &'static str) -> Option<u128> {
+    rows.iter()
+        .find(|row| row.operation == operation)
+        .map(BenchRow::avg_ns)
+}
+
+fn delta_ns(left: u128, right: u128) -> i128 {
+    left as i128 - right as i128
 }

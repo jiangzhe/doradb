@@ -125,13 +125,10 @@ impl OwnerLockState {
     /// Releases every cached lock and clears the cache.
     #[inline]
     pub(crate) fn release_all(&mut self, lock_manager: &LockManager) -> usize {
-        let mut resources: Vec<_> = self.held.keys().copied().collect();
-        resources.sort_unstable();
         let mut removed = 0;
-        for resource in resources {
+        for (resource, _mode) in self.held.drain() {
             removed += lock_manager.release(resource, self.owner);
         }
-        self.held.clear();
         removed
     }
 

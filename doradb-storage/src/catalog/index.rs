@@ -18,7 +18,9 @@ use crate::index::{
 };
 use crate::lwc::PersistedLwcBlock;
 use crate::row::RowRead;
-use crate::session::{Session, SessionDdlContext};
+#[cfg(test)]
+use crate::session::Session;
+use crate::session::{SessionDdlContext, SessionPin};
 use crate::table::{DeleteMarker, Table, TableRuntimeLayout, secondary_disk_tree_encoder};
 use crate::trx::redo::DDLRedo;
 use crate::trx::{Transaction, trx_is_committed};
@@ -58,11 +60,11 @@ fn invalid_index_ddl_root(message: impl Into<String>) -> Error {
 
 /// Build and publish a new secondary index for a user-table session request.
 pub(crate) async fn create_index_for_session(
-    session: &mut Session,
+    session: SessionPin,
     table_id: TableID,
     index_spec: IndexSpec,
 ) -> Result<IndexNo> {
-    let ctx = SessionDdlContext::new(session)?;
+    let ctx = SessionDdlContext::new(&session)?;
     let engine = ctx.engine.clone();
     let guards = ctx.pool_guards.clone();
     let lock_manager = engine.lock_manager();
@@ -108,7 +110,7 @@ pub(crate) async fn create_index_for_session(
 
     // 4. Start the implicit DDL transaction and let the progress state own all
     // rollback/destroy transitions from this point onward.
-    let trx = session.begin_trx()?;
+    let trx = session.begin_trx("begin transaction")?;
     let mut progress = CreateIndexProgress::new(&engine, &guards, table_id, index_no, trx);
     let build_ts = progress.build_ts();
 
@@ -252,11 +254,11 @@ pub(crate) async fn create_index_for_session(
 
 /// Drop an active secondary index for a user-table session request.
 pub(crate) async fn drop_index_for_session(
-    session: &mut Session,
+    session: SessionPin,
     table_id: TableID,
     index_no: IndexNo,
 ) -> Result<()> {
-    let ctx = SessionDdlContext::new(session)?;
+    let ctx = SessionDdlContext::new(&session)?;
     let engine = ctx.engine.clone();
     let guards = ctx.pool_guards.clone();
     let lock_manager = engine.lock_manager();
@@ -306,7 +308,7 @@ pub(crate) async fn drop_index_for_session(
         index_no_usize,
     )?;
 
-    let trx = session.begin_trx()?;
+    let trx = session.begin_trx("begin transaction")?;
     let mut progress = DropIndexProgress::new(&engine, table_id, index_no, trx);
     progress.stage_layout(new_layout);
     progress.execute_catalog_update(&old_index_spec).await?;
@@ -1495,7 +1497,7 @@ mod tests {
     use crate::file::table_file::ActiveRoot;
     use crate::row::ops::{DeleteMvcc, SelectKey};
     use crate::session::tests::SessionTestExt;
-    use crate::table::{CheckpointOutcome, TablePersistence};
+    use crate::table::CheckpointOutcome;
     use crate::trx::{MAX_SNAPSHOT_TS, Transaction};
     use crate::value::{Val, ValKind};
     use std::sync::Arc;
@@ -1769,7 +1771,10 @@ mod tests {
             let table_id = sys.table.table_id();
             let mut session = sys.new_session().unwrap();
             insert_rows(&sys, &mut session, 10, 8, "cold").await;
-            sys.table.freeze(&session, usize::MAX).await.unwrap();
+            session
+                .freeze_table(sys.table.table_id(), usize::MAX)
+                .await
+                .unwrap();
             checkpoint_published(&sys.table, &mut session).await;
 
             let index_no = session
@@ -1890,7 +1895,10 @@ mod tests {
                 vec![Val::from(2), Val::from("dup")],
             )
             .await;
-            sys.table.freeze(&session, usize::MAX).await.unwrap();
+            session
+                .freeze_table(sys.table.table_id(), usize::MAX)
+                .await
+                .unwrap();
             checkpoint_published(&sys.table, &mut session).await;
             sys.new_trx_delete(&mut session, &single_key(2)).await;
 
@@ -1952,7 +1960,10 @@ mod tests {
                 vec![Val::from(1), Val::from("persisted")],
             )
             .await;
-            table.freeze(&session, usize::MAX).await.unwrap();
+            session
+                .freeze_table(table.table_id(), usize::MAX)
+                .await
+                .unwrap();
             checkpoint_published(&table, &mut session).await;
             assert_eq!(
                 session
@@ -2218,7 +2229,10 @@ mod tests {
         async fn new_trx_delete(&self, session: &mut Session, key: &SelectKey) {
             let mut trx = session.begin_trx().unwrap();
             let delete = trx
-                .exec(async |stmt| stmt.table_delete_unique_mvcc(&self.table, key, false).await)
+                .exec(async |stmt| {
+                    stmt.table_delete_unique_mvcc(self.table.table_id(), key, false)
+                        .await
+                })
                 .await;
             if !matches!(delete, Ok(DeleteMvcc::Deleted)) {
                 panic!("delete should succeed: {delete:?}");
@@ -2257,7 +2271,7 @@ mod tests {
     }
 
     async fn trx_insert_row(trx: &mut Transaction, table: &Table, cols: Vec<Val>) -> Result<RowID> {
-        trx.exec(async |stmt| stmt.table_insert_mvcc(table, cols).await)
+        trx.exec(async |stmt| stmt.table_insert_mvcc(table.table_id(), cols).await)
             .await
     }
 
@@ -2368,7 +2382,7 @@ mod tests {
     async fn checkpoint_published(table: &Table, session: &mut Session) -> TrxID {
         let mut last_delay = None;
         for _ in 0..50 {
-            match table.checkpoint(session).await.unwrap() {
+            match session.checkpoint_table(table.table_id()).await.unwrap() {
                 CheckpointOutcome::Published { checkpoint_ts } => {
                     return checkpoint_ts;
                 }

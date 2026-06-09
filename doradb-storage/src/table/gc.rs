@@ -9,7 +9,7 @@ use crate::index::{
     UniqueMemIndex, UniqueMemIndexEntry,
 };
 use crate::lwc::PersistedLwcBlock;
-use crate::session::Session;
+use crate::session::SessionPin;
 use crate::trx::TrxReadProof;
 use crate::value::Val;
 use error_stack::Report;
@@ -173,16 +173,15 @@ impl Table {
     /// When `clean_live_entries` is `true`, redundant live MemIndex entries are
     /// removed as part of the pass. When `false`, live MemIndex cache entries
     /// are retained and only obsolete delete overlays are cleaned.
-    pub async fn cleanup_secondary_mem_indexes(
+    pub(crate) async fn cleanup_secondary_mem_indexes(
         &self,
-        session: &mut Session,
+        session: SessionPin,
         clean_live_entries: bool,
     ) -> Result<SecondaryMemIndexCleanupStats> {
-        let pin = session.pin("cleanup secondary mem indexes")?;
-        let trx_sys = pin.engine.trx_sys.clone();
-        let pool_guards = pin.pool_guards();
+        let trx_sys = session.engine.trx_sys.clone();
+        let pool_guards = session.pool_guards();
         loop {
-            let mut trx = session.begin_trx()?;
+            let mut trx = session.begin_trx("cleanup secondary mem indexes")?;
             let cleanup_sts = trx.sts();
             let min_active_sts = trx_sys.calc_min_active_sts_for_gc();
             let cleanup_res = {
@@ -195,9 +194,6 @@ impl Table {
                     trx.rollback().await?;
                     continue;
                 }
-                #[cfg(test)]
-                super::tests::run_test_secondary_cleanup_before_scan_hook().await;
-
                 let cleanup_res = self
                     .cleanup_secondary_mem_indexes_at_snapshot(
                         &pool_guards,

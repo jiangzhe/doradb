@@ -11,9 +11,9 @@ use crate::component::{
     ComponentRegistry, DiskPoolConfig, IndexPoolConfig, MetaPoolConfig, RegistryBuilder,
 };
 use crate::conf::EngineConfig;
-use crate::error::{LifecycleError, LifecycleResult, OperationError, Result};
+use crate::error::{LifecycleError, LifecycleResult, Result};
 use crate::file::fs::{FileSystem, FileSystemWorkers};
-use crate::id::{SessionID, TableID};
+use crate::id::SessionID;
 use crate::lock::LockManager;
 use crate::quiescent::QuiescentGuard;
 use crate::session::{Session, SessionRegistry};
@@ -538,18 +538,6 @@ impl EngineRef {
         &self.0.catalog
     }
 
-    /// Get a user-table runtime handle by table id.
-    #[inline]
-    pub(crate) async fn get_table(&self, table_id: TableID) -> Result<Arc<crate::Table>> {
-        self.0
-            .with_admitted_operation(|| self.0.catalog().get_table_now(table_id))?
-            .ok_or_else(|| {
-                error_stack::Report::new(OperationError::TableNotFound)
-                    .attach(format!("get table: table_id={table_id}"))
-                    .into()
-            })
-    }
-
     /// Return the shared logical lock manager.
     #[inline]
     pub(crate) fn lock_manager(&self) -> &QuiescentGuard<LockManager> {
@@ -778,7 +766,7 @@ mod tests {
     use crate::conf::{EngineConfig, EvictableBufferPoolConfig, FileSystemConfig, TrxSysConfig};
     use crate::error::{ConfigError, ErrorKind, LifecycleError, OperationError, ResourceError};
     use crate::file::fs::tests::io_backend_stats_handle_identity as fs_stats_handle_identity;
-    use crate::id::{PageID, TrxID};
+    use crate::id::{PageID, TableID, TrxID};
     use crate::lock::tests::{debug_snapshot, try_acquire};
     use crate::lock::{LockMode, LockOwner, LockResource};
     use crate::session::tests::{SessionTestExt, session_registry_len};
@@ -1282,7 +1270,6 @@ mod tests {
         smol::block_on(async {
             let root = TempDir::new().unwrap();
             let engine = test_engine_config_for(root.path()).build().await.unwrap();
-            let table_id = table1(&engine).await;
             let engine_ref = engine.new_ref().unwrap();
 
             let err = match engine.try_shutdown() {
@@ -1294,13 +1281,6 @@ mod tests {
             assert_eq!(err.downcast_ref::<usize>().copied(), Some(1));
 
             let err = match engine_ref.new_session() {
-                Ok(_) => panic!("expected shutdown error"),
-                Err(err) => err,
-            };
-            assert_eq!(err.kind(), ErrorKind::Lifecycle);
-            assert_eq!(err.lifecycle_error(), Some(LifecycleError::Shutdown));
-
-            let err = match engine_ref.get_table(table_id).await {
                 Ok(_) => panic!("expected shutdown error"),
                 Err(err) => err,
             };
@@ -1344,7 +1324,10 @@ mod tests {
             assert_eq!(err.kind(), ErrorKind::Lifecycle);
             assert_eq!(err.lifecycle_error(), Some(LifecycleError::Shutdown));
 
-            let err = match session.get_table(TableID::new(91_300)).await {
+            let err = match session
+                .lock_table(TableID::new(91_300), LockMode::Shared)
+                .await
+            {
                 Ok(_) => panic!("expected shutdown error"),
                 Err(err) => err,
             };
@@ -1361,8 +1344,8 @@ mod tests {
         smol::block_on(async {
             let root = TempDir::new().unwrap();
             let engine = test_engine_config_for(root.path()).build().await.unwrap();
-            let session = engine.new_session().unwrap();
-            let pin = session.pin("test pinned idle session").unwrap();
+            let session_handle = engine.new_session().unwrap();
+            let session = session_handle.pin("test pinned idle session").unwrap();
             assert_eq!(session_registry_len(&engine.inner().session_registry), 1);
 
             let err = match engine.try_shutdown() {
@@ -1374,7 +1357,7 @@ mod tests {
             assert_eq!(err.downcast_ref::<usize>().copied(), Some(1));
             assert_eq!(session_registry_len(&engine.inner().session_registry), 1);
 
-            drop(pin);
+            drop(session);
             engine.shutdown().unwrap();
             assert_eq!(session_registry_len(&engine.inner().session_registry), 0);
         });
@@ -1491,8 +1474,8 @@ mod tests {
     fn test_engine_shutdown_waits_for_pinned_idle_session() {
         let root = TempDir::new().unwrap();
         let engine = smol::block_on(test_engine_config_for(root.path()).build()).unwrap();
-        let session = engine.new_session().unwrap();
-        let pin = session.pin("test pinned idle session").unwrap();
+        let session_handle = engine.new_session().unwrap();
+        let session = session_handle.pin("test pinned idle session").unwrap();
         let (done_tx, done_rx) = mpsc::channel();
         assert_eq!(session_registry_len(&engine.inner().session_registry), 1);
 
@@ -1512,7 +1495,7 @@ mod tests {
             );
             assert_eq!(session_registry_len(&engine.inner().session_registry), 1);
 
-            drop(pin);
+            drop(session);
             let result = done_rx
                 .recv_timeout(Duration::from_secs(5))
                 .expect("shutdown should complete after SessionPin drops");
@@ -1917,21 +1900,6 @@ mod tests {
 
             trx1.rollback().await.unwrap();
             trx2.rollback().await.unwrap();
-        });
-    }
-
-    #[test]
-    fn test_engine_shutdown_keeps_external_table_refs_valid() {
-        smol::block_on(async {
-            let root = TempDir::new().unwrap();
-            let engine = test_engine_config_for(root.path()).build().await.unwrap();
-            let table_id = table1(&engine).await;
-            let table = engine.catalog().get_table(table_id).await.unwrap();
-
-            engine.shutdown().unwrap();
-
-            assert_eq!(table.table_id(), table_id);
-            assert!(engine.catalog().get_table(table_id).await.is_some());
         });
     }
 
