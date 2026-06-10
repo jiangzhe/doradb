@@ -1,7 +1,7 @@
 ---
 id: 000170
 title: Table Handle Catalog Ownership
-status: proposal
+status: implemented
 created: 2026-06-08
 github_issue: 687
 ---
@@ -325,6 +325,45 @@ Reference:
 
 ## Implementation Notes
 
+Implemented in branch `table-id-access` and issue #687.
+
+- Public table-runtime ownership was removed from the storage facade: `Table`
+  is no longer re-exported publicly, and public DML paths now use `TableID`
+  statement methods instead of caller-held `Arc<Table>`/`&Table`.
+- Statement execution resolves catalog-owned table runtimes internally at the
+  statement boundary, validates table lifecycle after resolution, snapshots
+  layout per operation, and then releases the operation-local strong table pin
+  before returning.
+- Added weak table-runtime caches at transaction and session scope. The caches
+  store only `Weak<Table>`, refresh successful user-table resolutions, evict
+  dead entries, avoid negative caching, and do not keep dropped table runtimes
+  alive.
+- Updated internal call sites, public smoke coverage, recovery/catalog/table
+  tests, and `weak_handle_baseline` for the table-id API. Table storage internals
+  still use crate-private `Table` access where they are lifecycle, checkpoint,
+  purge, or recovery boundaries.
+- Preserved drop and lifecycle semantics: stale cached weak entries observe
+  `TableDropping`/`TableNotFound` consistently, dropped-table purge is not
+  blocked by public caches, checkpoint readiness validates lifecycle, and a
+  concurrent checkpoint on one table now returns
+  `CheckpointCancelReason::CheckpointInProgress` instead of panicking.
+- Performance follow-ups discovered during `weak_handle_baseline` and
+  flamegraph review were intentionally deferred to backlog items
+  `docs/backlogs/000121-crate-local-fast-hash-map-aliases.md` and
+  `docs/backlogs/000122-allocation-deallocation-performance-hot-paths.md`.
+- No new unsafe code was introduced. The unsafe baseline date was refreshed
+  without changing the unsafe inventory entries.
+
+Validation and checklist evidence:
+
+- `cargo fmt -p doradb-storage`
+- `cargo clippy -p doradb-storage --all-targets -- -D warnings`
+- `cargo nextest run -p doradb-storage table::tests` passed: 176 tests.
+- `cargo nextest run -p doradb-storage` passed: 915 tests.
+- `tools/coverage_focus.rs --path doradb-storage/src/trx --path doradb-storage/src/session.rs --path doradb-storage/src/trx/stmt.rs --top-uncovered 15`
+  passed the focused coverage bar: deduplicated 94.47%, `trx` 94.27%,
+  `session.rs` 97.21%, and `trx/stmt.rs` 99.25%.
+
 ## Impacts
 
 - `doradb-storage/src/lib.rs`
@@ -425,3 +464,8 @@ Reference:
    ambiguity, stop and propose an RFC-0019 phase-plan edit for table generation.
    Current design assumes persisted user table ids remain monotonic and
    non-reused.
+4. Performance tuning beyond the weak-cache implementation remains deferred:
+   `docs/backlogs/000121-crate-local-fast-hash-map-aliases.md` tracks crate-local
+   fast hash-map aliases, and
+   `docs/backlogs/000122-allocation-deallocation-performance-hot-paths.md`
+   tracks allocator and hot-path allocation/deallocation investigation.

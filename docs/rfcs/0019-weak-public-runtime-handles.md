@@ -819,10 +819,10 @@ code is visible.
     pinning is internal and operation-scoped.
   - Non-goals: Do not redesign table DDL, table-file root retention, table GC, or
     index DDL except for public API call-site migration.
-  - Task Doc: `docs/tasks/TBD.md`
-  - Task Issue: `#0`
-  - Phase Status: `pending`
-  - Implementation Summary: `pending`
+  - Task Doc: `docs/tasks/000170-table-handle-catalog-ownership.md`
+  - Task Issue: `#687`
+  - Phase Status: done
+  - Implementation Summary: Implemented RFC-0019 Phase 7 with table-id public statement access. Public API no longer exposes Table or public Arc<Table> lookup; statement methods resolve catalog-owned table runtimes internally, validate lifecycle at operation boundaries, and use transaction/session weak caches so repeated table-id operations avoid repeated catalog lookup without retaining dropped runtimes. Public smoke tests, internal table/recovery/catalog call sites, weak_handle_baseline, checkpoint lifecycle readiness, and concurrent checkpoint admission regressions were updated and validated. [Task Resolve Sync: docs/tasks/000170-table-handle-catalog-ownership.md @ 2026-06-10]
   - Related Backlogs:
     - `docs/backlogs/000061-block-engine-shutdown-while-external-table-handles-are-alive.md`
     - `docs/backlogs/000066-engine-scoped-weak-runtime-handles.md`
