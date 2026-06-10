@@ -6,10 +6,14 @@ component-registry migration work.
 
 ## Terminology
 
-- `Engine`: owner of top-level teardown state.
-- `EngineInner`: shared runtime state exposed through `Arc`.
-- `EngineRef`: cloneable runtime handle used by sessions and internal
-  subsystems.
+- `Engine`: public owner of top-level teardown state and session creation.
+- `EngineInner`: crate-private shared runtime state held behind the engine
+  owner and internal runtime pins.
+- `EngineRef`: crate-private cloneable runtime pin used by sessions,
+  transactions, cleanup jobs, and internal subsystems.
+- Public session and transaction handles: weak, non-cloneable capabilities that
+  identify engine-local state and acquire internal runtime pins only for one
+  operation.
 - `ComponentRegistry`: ordered owner registry for top-level components.
 - `QuiescentBox<T>`: stable owner allocation for a runtime value.
 - `QuiescentGuard<T>`: cloneable keepalive handle into a `QuiescentBox<T>`.
@@ -21,7 +25,8 @@ The runtime uses an explicit owner/runtime split:
 - `Engine` owns:
   - `inner: Arc<EngineInner>`
   - `components: ComponentRegistry`
-- `EngineInner` owns only shared runtime handles and the lifecycle gate:
+- `EngineInner` owns only crate-private shared runtime handles and the
+  lifecycle gate:
   - catalog
   - transaction system
   - logical lock manager
@@ -32,8 +37,8 @@ The runtime uses an explicit owner/runtime split:
 
 `ComponentRegistry` is intentionally not part of `EngineInner`. The registry is
 needed only for explicit reverse-order shutdown and final owner drop. Keeping
-it on `Engine` prevents cloneable runtime handles from gaining indirect access
-to teardown-only owner state.
+it on `Engine` prevents crate-private cloneable runtime pins from gaining
+indirect access to teardown-only owner state.
 
 ## Build Sequence
 
@@ -98,18 +103,19 @@ The engine lifecycle has three states:
 2. `ShuttingDown`
 3. `Shutdown`
 
-Shutdown closes admission for new work and then requires live runtime
-`EngineRef` holders to drain before owner-side component shutdown can proceed.
+Shutdown closes admission for new work and then requires active operations,
+active transactions, abandoned transaction cleanup, and internal `EngineRef`
+runtime pins to drain before owner-side component shutdown can proceed.
 `Engine::try_shutdown()` performs that check once and returns `ShutdownBusy` if
-runtime refs remain. `Engine::shutdown()` waits for runtime refs to drain and
-then completes final teardown.
+work remains. `Engine::shutdown()` waits for the same work to drain and then
+completes final teardown.
 
 Normal shutdown is:
 
 1. close the admission gate and flip `Running -> ShuttingDown`
 2. wait for active admission tokens to drain
-3. wait for runtime `EngineRef` holders, or return `ShutdownBusy` from
-   `try_shutdown()`
+3. wait for internal runtime pins and transaction cleanup, or return
+   `ShutdownBusy` from `try_shutdown()`
 4. acquire the owner-side shutdown lock
 5. require `Arc::strong_count(inner) == 1`
 6. remove idle registry-owned sessions
@@ -193,13 +199,13 @@ quiescent waits do not deadlock under normal teardown.
 
 Use this split when adding or reviewing engine fields:
 
-- put it on `EngineInner` if sessions, `EngineRef`, or other runtime handles
-  must retain it after engine construction
+- put it on `EngineInner` if sessions, transactions, cleanup jobs, or other
+  crate-private runtime pins must retain it after engine construction
 - put it on `Engine` if it is only needed for explicit shutdown, final owner
   drop, or teardown orchestration
 
-That distinction keeps runtime access small and cloneable while preserving one
-clear owner for shutdown ordering.
+That distinction keeps public runtime handles weak while preserving one clear
+owner for shutdown ordering.
 
 For the current storage runtime, `FileSystem` is the runtime-facing access path
 for shared-storage IO clients and stats snapshots, while the shared evictor's

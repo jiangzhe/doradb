@@ -1024,7 +1024,7 @@ mod tests {
             let _ = table1(&engine).await;
             engine
                 .catalog()
-                .checkpoint_now(&engine.trx_sys)
+                .checkpoint_now(&engine.inner().trx_sys)
                 .await
                 .unwrap();
 
@@ -1048,21 +1048,22 @@ mod tests {
             assert!(!catalog_index_blocks.is_empty());
             for block_id in &catalog_index_blocks {
                 let _ = engine
+                    .inner()
                     .disk_pool
                     .invalidate_block(CATALOG_MTB_FILE_ID, *block_id);
                 let key = BlockKey::new(CATALOG_MTB_FILE_ID, *block_id);
-                assert!(engine.disk_pool.try_get_frame_id(&key).is_none());
+                assert!(engine.inner().disk_pool.try_get_frame_id(&key).is_none());
             }
-            let cached_before = engine.disk_pool.allocated();
+            let cached_before = engine.inner().disk_pool.allocated();
 
             apply_metadata_only_checkpoint(storage, engine.catalog().curr_next_table_id())
                 .await
                 .unwrap();
 
-            assert_eq!(engine.disk_pool.allocated(), cached_before);
+            assert_eq!(engine.inner().disk_pool.allocated(), cached_before);
             for block_id in catalog_index_blocks {
                 let key = BlockKey::new(CATALOG_MTB_FILE_ID, block_id);
-                assert!(engine.disk_pool.try_get_frame_id(&key).is_none());
+                assert!(engine.inner().disk_pool.try_get_frame_id(&key).is_none());
             }
         });
     }
@@ -1225,7 +1226,7 @@ mod tests {
             let _ = table1(&engine).await;
             engine
                 .catalog()
-                .checkpoint_now(&engine.trx_sys)
+                .checkpoint_now(&engine.inner().trx_sys)
                 .await
                 .unwrap();
 
@@ -1271,7 +1272,7 @@ mod tests {
             let _ = table1(&engine).await;
             engine
                 .catalog()
-                .checkpoint_now(&engine.trx_sys)
+                .checkpoint_now(&engine.inner().trx_sys)
                 .await
                 .unwrap();
 
@@ -1280,7 +1281,7 @@ mod tests {
             let root_block_id = BlockID::from(tables_root.root_block_id.unwrap().get());
             let disk_pool_guard = engine.catalog().storage.disk_pool.pool_guard();
 
-            let cached_before_first = engine.disk_pool.allocated();
+            let cached_before_first = engine.inner().disk_pool.allocated();
 
             let entries1 = engine
                 .catalog()
@@ -1290,10 +1291,16 @@ mod tests {
                 .unwrap();
             assert!(!entries1.is_empty());
 
-            let cached_after_first = engine.disk_pool.allocated();
+            let cached_after_first = engine.inner().disk_pool.allocated();
             assert!(cached_after_first >= cached_before_first);
             let root_key = BlockKey::new(CATALOG_MTB_FILE_ID, root_block_id);
-            assert!(engine.disk_pool.try_get_frame_id(&root_key).is_some());
+            assert!(
+                engine
+                    .inner()
+                    .disk_pool
+                    .try_get_frame_id(&root_key)
+                    .is_some()
+            );
 
             let entries2 = engine
                 .catalog()
@@ -1302,7 +1309,7 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(entries2.len(), entries1.len());
-            assert_eq!(engine.disk_pool.allocated(), cached_after_first);
+            assert_eq!(engine.inner().disk_pool.allocated(), cached_after_first);
         });
     }
 
@@ -1317,7 +1324,7 @@ mod tests {
             let _ = table1(&engine).await;
             engine
                 .catalog()
-                .checkpoint_now(&engine.trx_sys)
+                .checkpoint_now(&engine.inner().trx_sys)
                 .await
                 .unwrap();
 
@@ -1339,7 +1346,7 @@ mod tests {
             let _ = table2(&engine).await;
             engine
                 .catalog()
-                .checkpoint_now(&engine.trx_sys)
+                .checkpoint_now(&engine.inner().trx_sys)
                 .await
                 .unwrap();
 

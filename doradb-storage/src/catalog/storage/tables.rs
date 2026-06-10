@@ -235,7 +235,7 @@ mod tests {
             let table_id = table1(&engine).await;
             {
                 let guards = PoolGuards::builder()
-                    .push(PoolRole::Meta, engine.meta_pool.pool_guard())
+                    .push(PoolRole::Meta, engine.inner().meta_pool.pool_guard())
                     .build();
                 assert!(
                     engine

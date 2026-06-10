@@ -147,12 +147,12 @@ this runtime transaction contract.
 
 Each user statement runs through `Transaction::exec(async |stmt| { ... })`.
 The public `Transaction` is a weak, non-cloneable capability containing weak
-engine reachability plus `(SessionID, TrxID)`. It does not own `EngineRef`,
-`SessionState`, or the stable transaction entry. Public operations upgrade weak
-engine reachability internally, resolve the active entry through the session
-registry by `(SessionID, TrxID)`, and build an operation-local runtime
-attachment from the registry-owned session state before callbacks or `.await`
-points.
+engine reachability plus `(SessionID, TrxID)`. It does not own the
+crate-private `EngineRef`, `SessionState`, or the stable transaction entry.
+Public operations upgrade weak engine reachability internally, resolve the
+active entry through the session registry by `(SessionID, TrxID)`, and build an
+operation-local runtime attachment from the registry-owned session state before
+callbacks or `.await` points.
 
 The mutable transaction core lives in `TrxInner` and is checked out for one
 non-terminal operation through private `TrxCheckout` plumbing; ordinary

@@ -3103,28 +3103,39 @@ pub(crate) mod tests {
                 .unwrap();
 
             let table_file = engine
+                .inner()
                 .table_fs
                 .create_table_file(test_user_table_id(103), make_metadata(), false)
                 .unwrap();
-            let table_file = commit_table_file(&engine.table_fs, table_file).await;
+            let table_file = commit_table_file(&engine.inner().table_fs, table_file).await;
 
-            let capacity = engine.disk_pool.capacity();
+            let capacity = engine.inner().disk_pool.capacity();
             let base_page_id = 7u64;
 
             // Prepare one more block than cache capacity to force drop-only eviction.
             for i in 0..=capacity {
                 let block_id = BlockID::from(base_page_id + i as u64);
                 let payload = format!("page-{i}");
-                write_payload(&engine.table_fs, &table_file, block_id, payload.as_bytes()).await;
+                write_payload(
+                    &engine.inner().table_fs,
+                    &table_file,
+                    block_id,
+                    payload.as_bytes(),
+                )
+                .await;
             }
             drop(table_file);
 
             let table_file = engine
+                .inner()
                 .table_fs
-                .open_table_file(test_user_table_id(103), engine.disk_pool.clone_inner())
+                .open_table_file(
+                    test_user_table_id(103),
+                    engine.inner().disk_pool.clone_inner(),
+                )
                 .await
                 .unwrap();
-            let pool = engine.disk_pool.clone_inner();
+            let pool = engine.inner().disk_pool.clone_inner();
             let pool_guard = pool.pool_guard();
 
             for i in 0..=capacity {
@@ -3150,7 +3161,7 @@ pub(crate) mod tests {
                         test_user_file_id(TableID::new(103)),
                         BlockID::from(base_page_id + *i as u64),
                     );
-                    engine.disk_pool.try_get_frame_id(&key).is_some()
+                    engine.inner().disk_pool.try_get_frame_id(&key).is_some()
                 })
                 .count();
             assert!(mapped_count < loaded_count);

@@ -2242,7 +2242,7 @@ pub(crate) mod tests {
         let engine_ref = engine.new_ref().unwrap();
         let session_id = engine_ref.next_session_id();
         let (trx, _state) = session_tests::create_test_transaction(
-            &engine.session_registry,
+            &engine.inner().session_registry,
             engine_ref,
             session_id,
             trx_id,
@@ -2322,12 +2322,19 @@ pub(crate) mod tests {
             );
             let entry = transaction_entry(&trx);
 
-            assert_eq!(engine.session_registry.active_transaction_count(), 1);
+            assert_eq!(
+                engine.inner().session_registry.active_transaction_count(),
+                1
+            );
             entry.finish(TrxEntryState::Failed);
             assert_eq!(entry.inspect_state(), TrxEntryState::Failed);
-            assert_eq!(engine.session_registry.active_transaction_count(), 0);
+            assert_eq!(
+                engine.inner().session_registry.active_transaction_count(),
+                0
+            );
 
             engine
+                .inner()
                 .session_registry
                 .finish_trx_rollback(trx.session_id, trx.trx_id);
             drop(trx);
@@ -2351,7 +2358,7 @@ pub(crate) mod tests {
             assert!(entry.abandon());
             assert_eq!(entry.inspect_state(), TrxEntryState::CheckedOutAbandoned);
 
-            let observed_epoch = engine.session_registry.trx_change_epoch();
+            let observed_epoch = engine.inner().session_registry.trx_change_epoch();
             let engine_ref = engine.new_ref().unwrap();
             let (ready_tx, ready_rx) = mpsc::channel();
             let (done_tx, done_rx) = mpsc::channel();
@@ -2643,10 +2650,12 @@ pub(crate) mod tests {
         );
         let table_id = test_user_table_id(table_id_offset);
         let mutable = engine
+            .inner()
             .table_fs
             .create_table_file(table_id, metadata, false)
             .unwrap();
         engine
+            .inner()
             .trx_sys
             .publish_table_file_root(mutable, TrxID::new(1), false)
             .await
@@ -3363,7 +3372,7 @@ pub(crate) mod tests {
             ));
             let _hook = install_storage_backend_test_hook(read_hook.clone());
 
-            let _ = engine.trx_sys.poison_storage(FatalError::RedoWrite);
+            let _ = engine.inner().trx_sys.poison_storage(FatalError::RedoWrite);
             let completion = Arc::new(Completion::new());
             let job = FailedPrecommitCleanupJob::new(
                 vec![precommit1, precommit2, precommit3],
@@ -3378,7 +3387,7 @@ pub(crate) mod tests {
                 "latest precommit rollback should reload the evicted row page"
             );
             assert_eq!(
-                engine.trx_sys.fatal_rollback_retention_len(),
+                engine.inner().trx_sys.fatal_rollback_retention_len(),
                 3,
                 "reverse cleanup should fail on the newest transaction first and retain older unprocessed payloads"
             );
@@ -3394,6 +3403,7 @@ pub(crate) mod tests {
             );
             assert!(
                 engine
+                    .inner()
                     .trx_sys
                     .storage_poison_error()
                     .is_some_and(|err| *err.current_context() == FatalError::RedoWrite)
@@ -3525,10 +3535,11 @@ pub(crate) mod tests {
             let read_trx = session.begin_trx().unwrap();
             let mutable = MutableTableFile::fork(
                 &table_file,
-                engine.table_fs.background_writes(),
-                engine.disk_pool.clone_inner(),
+                engine.inner().table_fs.background_writes(),
+                engine.inner().disk_pool.clone_inner(),
             );
             let table_file = engine
+                .inner()
                 .trx_sys
                 .publish_table_file_root(mutable, TrxID::new(2), false)
                 .await
@@ -3544,7 +3555,7 @@ pub(crate) mod tests {
                 );
             }
             read_trx.commit().await.unwrap();
-            engine.trx_sys.request_table_root_retention_purge();
+            engine.inner().trx_sys.request_table_root_retention_purge();
             for _ in 0..100 {
                 if old_root_drop_count(old_root_ptr) > drop_count_before {
                     return;

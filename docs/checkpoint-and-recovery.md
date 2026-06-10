@@ -352,8 +352,10 @@ handle from the catalog cache. The removed runtime is handed to transaction GC.
 Cleanup proceeds in two gates:
 
 1. In-memory runtime state is destroyed only after
-   `Global_Min_Active_STS > drop_cts`. If stale `Arc<Table>` handles still
-   exist, the item remains queued for a later GC cycle.
+   `Global_Min_Active_STS > drop_cts`. Public code no longer owns table runtime
+   handles; if crate-private operation, session, transaction, or cleanup pins
+   still retain the removed table runtime, the item remains queued for a later
+   GC cycle.
 2. The deterministic table file is deleted only after
    `catalog_replay_start_ts > drop_cts`, proving the catalog absence is durable.
 

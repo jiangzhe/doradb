@@ -15,7 +15,7 @@ use super::consts::{
     DEFAULT_EVICTABLE_BUFFER_POOL_MAX_MEM_SIZE,
 };
 
-/// Builder-style configuration for [`crate::buffer::EvictableBufferPool`].
+/// Builder-style configuration for an evictable buffer pool.
 ///
 /// Besides file and memory sizing, this type carries eviction-arbiter tuning
 /// used to build the background evictor policy.

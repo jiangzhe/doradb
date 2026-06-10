@@ -1025,11 +1025,11 @@ mod tests {
         catalog_replay_start_ts: TrxID,
     ) -> LogRecovery<'a> {
         let mut recovery = LogRecovery::new(
-            &engine.meta_pool,
-            engine.index_pool.clone_inner(),
-            engine.mem_pool.clone_inner(),
-            engine.table_fs.clone(),
-            engine.disk_pool.clone_inner(),
+            &engine.inner().meta_pool,
+            engine.inner().index_pool.clone_inner(),
+            engine.inner().mem_pool.clone_inner(),
+            engine.inner().table_fs.clone(),
+            engine.inner().disk_pool.clone_inner(),
             engine.catalog(),
             LogMerger::default(),
         );
@@ -1342,13 +1342,14 @@ mod tests {
         }
         let mut mutable = MutableTableFile::fork(
             &table_file,
-            engine.table_fs.background_writes(),
+            engine.inner().table_fs.background_writes(),
             table.disk_pool().clone(),
         );
         mutable
             .replace_metadata_and_secondary_index_roots(metadata, roots)
             .unwrap();
         engine
+            .inner()
             .trx_sys
             .publish_table_file_root(mutable, cts, false)
             .await
@@ -1572,7 +1573,7 @@ mod tests {
             let table_id = create_index_ddl_base_table(&engine, vec![primary_index_spec()]).await;
             engine
                 .catalog()
-                .checkpoint_now(&engine.trx_sys)
+                .checkpoint_now(&engine.inner().trx_sys)
                 .await
                 .unwrap();
 
@@ -1602,7 +1603,7 @@ mod tests {
             let table_id = create_index_ddl_base_table(&engine, vec![primary_index_spec()]).await;
             engine
                 .catalog()
-                .checkpoint_now(&engine.trx_sys)
+                .checkpoint_now(&engine.inner().trx_sys)
                 .await
                 .unwrap();
 
@@ -1635,7 +1636,7 @@ mod tests {
             .await;
             engine
                 .catalog()
-                .checkpoint_now(&engine.trx_sys)
+                .checkpoint_now(&engine.inner().trx_sys)
                 .await
                 .unwrap();
 
@@ -1665,7 +1666,7 @@ mod tests {
             let table_id = create_index_ddl_base_table(&engine, vec![primary_index_spec()]).await;
             engine
                 .catalog()
-                .checkpoint_now(&engine.trx_sys)
+                .checkpoint_now(&engine.inner().trx_sys)
                 .await
                 .unwrap();
 
@@ -1701,7 +1702,7 @@ mod tests {
             .unwrap();
             engine
                 .catalog()
-                .checkpoint_now(&engine.trx_sys)
+                .checkpoint_now(&engine.inner().trx_sys)
                 .await
                 .unwrap();
 
@@ -1735,7 +1736,7 @@ mod tests {
             .unwrap();
             engine
                 .catalog()
-                .checkpoint_now(&engine.trx_sys)
+                .checkpoint_now(&engine.inner().trx_sys)
                 .await
                 .unwrap();
 
@@ -1773,14 +1774,14 @@ mod tests {
             let table_id = create_index_ddl_base_table(&engine, vec![primary_index_spec()]).await;
             engine
                 .catalog()
-                .checkpoint_now(&engine.trx_sys)
+                .checkpoint_now(&engine.inner().trx_sys)
                 .await
                 .unwrap();
 
             let ddl_cts = commit_create_index_catalog_ddl(&engine, table_id).await;
             engine
                 .catalog()
-                .checkpoint_now(&engine.trx_sys)
+                .checkpoint_now(&engine.inner().trx_sys)
                 .await
                 .unwrap();
             let snapshot = engine.catalog().storage.checkpoint_snapshot().unwrap();
@@ -1812,7 +1813,7 @@ mod tests {
             let table_id = create_index_ddl_base_table(&engine, vec![primary_index_spec()]).await;
             engine
                 .catalog()
-                .checkpoint_now(&engine.trx_sys)
+                .checkpoint_now(&engine.inner().trx_sys)
                 .await
                 .unwrap();
 
@@ -1820,7 +1821,7 @@ mod tests {
             publish_index_metadata_root(&engine, table_id, created_index_metadata(), ddl_cts).await;
             engine
                 .catalog()
-                .checkpoint_now(&engine.trx_sys)
+                .checkpoint_now(&engine.inner().trx_sys)
                 .await
                 .unwrap();
             let snapshot = engine.catalog().storage.checkpoint_snapshot().unwrap();
@@ -2126,7 +2127,7 @@ mod tests {
                 .unwrap();
             engine
                 .catalog()
-                .checkpoint_now(&engine.trx_sys)
+                .checkpoint_now(&engine.inner().trx_sys)
                 .await
                 .unwrap();
             let snap = engine.catalog().storage.checkpoint_snapshot().unwrap();
@@ -2185,7 +2186,7 @@ mod tests {
 
             engine
                 .catalog()
-                .checkpoint_now(&engine.trx_sys)
+                .checkpoint_now(&engine.inner().trx_sys)
                 .await
                 .unwrap();
             let catalog_replay_start_ts = engine
@@ -2312,7 +2313,7 @@ mod tests {
 
             engine
                 .catalog()
-                .checkpoint_now(&engine.trx_sys)
+                .checkpoint_now(&engine.inner().trx_sys)
                 .await
                 .unwrap();
 
@@ -2445,7 +2446,7 @@ mod tests {
 
             engine
                 .catalog()
-                .checkpoint_now(&engine.trx_sys)
+                .checkpoint_now(&engine.inner().trx_sys)
                 .await
                 .unwrap();
 
@@ -2582,7 +2583,7 @@ mod tests {
 
             engine
                 .catalog()
-                .checkpoint_now(&engine.trx_sys)
+                .checkpoint_now(&engine.inner().trx_sys)
                 .await
                 .unwrap();
             let catalog_replay_start_ts = engine
@@ -2703,7 +2704,7 @@ mod tests {
 
             engine
                 .catalog()
-                .checkpoint_now(&engine.trx_sys)
+                .checkpoint_now(&engine.inner().trx_sys)
                 .await
                 .unwrap();
 
@@ -2875,7 +2876,7 @@ mod tests {
 
             engine
                 .catalog()
-                .checkpoint_now(&engine.trx_sys)
+                .checkpoint_now(&engine.inner().trx_sys)
                 .await
                 .unwrap();
             let baseline_catalog_replay_start_ts = engine
@@ -2948,7 +2949,7 @@ mod tests {
 
             engine
                 .catalog()
-                .checkpoint_now(&engine.trx_sys)
+                .checkpoint_now(&engine.inner().trx_sys)
                 .await
                 .unwrap();
             let final_catalog_replay_start_ts = engine
@@ -3065,7 +3066,7 @@ mod tests {
 
             engine
                 .catalog()
-                .checkpoint_now(&engine.trx_sys)
+                .checkpoint_now(&engine.inner().trx_sys)
                 .await
                 .unwrap();
 
@@ -3108,7 +3109,7 @@ mod tests {
                 entry.block_id()
             };
 
-            let table_file_path = engine.table_fs.user_table_file_path(table_id);
+            let table_file_path = engine.inner().table_fs.user_table_file_path(table_id);
             drop(checkpoint_session);
             drop(table);
             drop(session);
@@ -3185,7 +3186,7 @@ mod tests {
 
             engine
                 .catalog()
-                .checkpoint_now(&engine.trx_sys)
+                .checkpoint_now(&engine.inner().trx_sys)
                 .await
                 .unwrap();
 
@@ -3264,7 +3265,7 @@ mod tests {
                     .expect("delete checkpoint should offload large delete sets")
             };
 
-            let table_file_path = engine.table_fs.user_table_file_path(table_id);
+            let table_file_path = engine.inner().table_fs.user_table_file_path(table_id);
             drop(trx_sys);
             drop(checkpoint_session);
             drop(table);

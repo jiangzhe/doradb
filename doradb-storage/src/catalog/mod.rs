@@ -1093,7 +1093,7 @@ pub(crate) mod tests {
             trx.commit().await.unwrap();
 
             let guards = PoolGuards::builder()
-                .push(PoolRole::Meta, engine.meta_pool.pool_guard())
+                .push(PoolRole::Meta, engine.inner().meta_pool.pool_guard())
                 .build();
             let err = engine
                 .catalog()
@@ -1230,7 +1230,7 @@ pub(crate) mod tests {
                 .indexes()
                 .list_uncommitted_by_table_id(
                     &PoolGuards::builder()
-                        .push(PoolRole::Meta, engine.meta_pool.pool_guard())
+                        .push(PoolRole::Meta, engine.inner().meta_pool.pool_guard())
                         .build(),
                     table_id,
                 )
@@ -1246,7 +1246,7 @@ pub(crate) mod tests {
             drop(table);
             engine
                 .catalog()
-                .checkpoint_now(&engine.trx_sys)
+                .checkpoint_now(&engine.inner().trx_sys)
                 .await
                 .unwrap();
             drop(engine);
@@ -1289,7 +1289,7 @@ pub(crate) mod tests {
             let _ = table1(&engine).await;
             engine
                 .catalog()
-                .checkpoint_now(&engine.trx_sys)
+                .checkpoint_now(&engine.inner().trx_sys)
                 .await
                 .unwrap();
             let snap1 = engine.catalog().storage.checkpoint_snapshot().unwrap();
@@ -1315,7 +1315,7 @@ pub(crate) mod tests {
 
             engine
                 .catalog()
-                .checkpoint_now(&engine.trx_sys)
+                .checkpoint_now(&engine.inner().trx_sys)
                 .await
                 .unwrap();
             let snap2 = engine.catalog().storage.checkpoint_snapshot().unwrap();
@@ -1339,7 +1339,7 @@ pub(crate) mod tests {
             let _ = table1(&engine).await;
             engine
                 .catalog()
-                .checkpoint_now(&engine.trx_sys)
+                .checkpoint_now(&engine.inner().trx_sys)
                 .await
                 .unwrap();
 
@@ -1400,7 +1400,7 @@ pub(crate) mod tests {
             let _ = table1(&engine).await;
             engine
                 .catalog()
-                .checkpoint_now(&engine.trx_sys)
+                .checkpoint_now(&engine.inner().trx_sys)
                 .await
                 .unwrap();
 
@@ -1461,7 +1461,7 @@ pub(crate) mod tests {
             let table_id = table1(&engine).await;
             engine
                 .catalog()
-                .checkpoint_now(&engine.trx_sys)
+                .checkpoint_now(&engine.inner().trx_sys)
                 .await
                 .unwrap();
             let snap1 = engine.catalog().storage.checkpoint_snapshot().unwrap();
@@ -1480,7 +1480,7 @@ pub(crate) mod tests {
 
             engine
                 .catalog()
-                .checkpoint_now(&engine.trx_sys)
+                .checkpoint_now(&engine.inner().trx_sys)
                 .await
                 .unwrap();
             let snap2 = engine.catalog().storage.checkpoint_snapshot().unwrap();
@@ -1505,7 +1505,7 @@ pub(crate) mod tests {
 
             let batch1 = engine
                 .catalog()
-                .scan_checkpoint_batch(&engine.trx_sys)
+                .scan_checkpoint_batch(&engine.inner().trx_sys)
                 .unwrap();
             assert_eq!(batch1.catalog_ddl_txn_count, 2);
             assert_eq!(
@@ -1523,7 +1523,7 @@ pub(crate) mod tests {
 
             let batch2 = engine
                 .catalog()
-                .scan_checkpoint_batch(&engine.trx_sys)
+                .scan_checkpoint_batch(&engine.inner().trx_sys)
                 .unwrap();
             assert_eq!(batch2.catalog_ddl_txn_count, 0);
             assert_eq!(batch2.safe_cts, safe_cts_1);
@@ -1552,7 +1552,7 @@ pub(crate) mod tests {
 
             engine
                 .catalog()
-                .checkpoint_now(&engine.trx_sys)
+                .checkpoint_now(&engine.inner().trx_sys)
                 .await
                 .unwrap();
             let snap1 = engine.catalog().storage.checkpoint_snapshot().unwrap();
@@ -1632,7 +1632,7 @@ pub(crate) mod tests {
 
             engine
                 .catalog()
-                .checkpoint_now(&engine.trx_sys)
+                .checkpoint_now(&engine.inner().trx_sys)
                 .await
                 .unwrap();
             let snap2 = engine.catalog().storage.checkpoint_snapshot().unwrap();

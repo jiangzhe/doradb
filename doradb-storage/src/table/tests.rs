@@ -181,6 +181,7 @@ fn assert_checkpoint_write_poisoned(err: &Error, engine: &Engine) {
     );
     assert!(
         engine
+            .inner()
             .trx_sys
             .storage_poison_error()
             .as_ref()
@@ -585,7 +586,7 @@ fn test_lwc_read_uses_readonly_buffer_pool() {
         .await;
         trx.commit().await.unwrap();
 
-        let allocated_after_route = engine.disk_pool.allocated();
+        let allocated_after_route = engine.inner().disk_pool.allocated();
         assert!(allocated_after_route >= 1);
 
         expect_select_committed(table_id, &mut session, &key, |vals| {
@@ -593,7 +594,7 @@ fn test_lwc_read_uses_readonly_buffer_pool() {
             assert_eq!(vals[1], Val::from("name"));
         })
         .await;
-        let allocated_after_first = engine.disk_pool.allocated();
+        let allocated_after_first = engine.inner().disk_pool.allocated();
         assert!(allocated_after_first >= allocated_after_route);
 
         expect_select_committed(table_id, &mut session, &key, |vals| {
@@ -601,7 +602,7 @@ fn test_lwc_read_uses_readonly_buffer_pool() {
             assert_eq!(vals[1], Val::from("name"));
         })
         .await;
-        assert_eq!(engine.disk_pool.allocated(), allocated_after_first);
+        assert_eq!(engine.inner().disk_pool.allocated(), allocated_after_first);
     });
 }
 
@@ -679,7 +680,7 @@ fn test_lwc_select_surfaces_persisted_corruption() {
         let entry = index.locate_block(row_id).await.unwrap().unwrap();
         let block_id = entry.block_id();
 
-        let table_file_path = engine.table_fs.user_table_file_path(table_id);
+        let table_file_path = engine.inner().table_fs.user_table_file_path(table_id);
         corrupt_page_checksum(table_file_path, block_id);
 
         let mut trx = session.begin_trx().unwrap();
@@ -720,7 +721,7 @@ fn test_lwc_select_surfaces_column_block_index_row_metadata_corruption() {
         let index = snapshot.index(pool_guards.disk_guard());
         let entry = index.locate_block(row_id).await.unwrap().unwrap();
 
-        let table_file_path = engine.table_fs.user_table_file_path(table_id);
+        let table_file_path = engine.inner().table_fs.user_table_file_path(table_id);
         corrupt_leaf_row_codec(table_file_path, entry.leaf_block_id, 0);
         let _ = table
             .disk_pool()
@@ -764,7 +765,7 @@ fn test_lwc_select_surfaces_column_block_index_zero_block_id_corruption() {
         let index = snapshot.index(pool_guards.disk_guard());
         let entry = index.locate_block(row_id).await.unwrap().unwrap();
 
-        let table_file_path = engine.table_fs.user_table_file_path(table_id);
+        let table_file_path = engine.inner().table_fs.user_table_file_path(table_id);
         corrupt_leaf_block_id(table_file_path, entry.leaf_block_id, 0);
         let _ = table
             .disk_pool()
@@ -808,7 +809,7 @@ fn test_lwc_select_surfaces_row_shape_fingerprint_mismatch_corruption() {
         let index = snapshot.index(pool_guards.disk_guard());
         let entry = index.locate_block(row_id).await.unwrap().unwrap();
 
-        let table_file_path = engine.table_fs.user_table_file_path(table_id);
+        let table_file_path = engine.inner().table_fs.user_table_file_path(table_id);
         corrupt_lwc_row_shape_fingerprint(table_file_path, entry.block_id());
         let _ = table
             .disk_pool()
@@ -2629,7 +2630,7 @@ fn test_secondary_mem_index_cleanup_propagates_cold_delete_overlay_proof_error()
                 .unwrap()
         );
 
-        let table_file_path = engine.table_fs.user_table_file_path(table_id);
+        let table_file_path = engine.inner().table_fs.user_table_file_path(table_id);
         corrupt_lwc_row_shape_fingerprint(table_file_path, block_id);
         let _ = table
             .disk_pool()
@@ -4299,7 +4300,7 @@ fn test_checkpoint_fails_on_invalid_v2_delete_metadata() {
         let marker2_ts = delete_marker_ts(marker2);
         wait_gc_cutoff_after(&session, marker2_ts).await;
 
-        let table_file_path = engine.table_fs.user_table_file_path(table_id);
+        let table_file_path = engine.inner().table_fs.user_table_file_path(table_id);
         corrupt_leaf_delete_codec(table_file_path, entry.leaf_block_id, 0);
         let _ = table
             .disk_pool()
@@ -4366,7 +4367,7 @@ fn test_checkpoint_fails_on_short_v2_delete_section_header() {
         let marker2_ts = delete_marker_ts(marker2);
         wait_gc_cutoff_after(&session, marker2_ts).await;
 
-        let table_file_path = engine.table_fs.user_table_file_path(table_id);
+        let table_file_path = engine.inner().table_fs.user_table_file_path(table_id);
         corrupt_leaf_short_delete_section_header(table_file_path, entry.leaf_block_id, 0);
         let _ = table
             .disk_pool()
@@ -4416,6 +4417,7 @@ fn test_row_page_transition_retries_update_delete() {
             RowLocation::LwcBlock { .. } => unreachable!("lwc block"),
         };
         let page_guard = engine
+            .inner()
             .mem_pool
             .get_page::<RowPage>(
                 session.pool_guards().mem_guard(),
@@ -4433,6 +4435,7 @@ fn test_row_page_transition_retries_update_delete() {
         row_ver.set_transition();
 
         let insert_page_guard = engine
+            .inner()
             .mem_pool
             .get_page::<RowPage>(
                 session.pool_guards().mem_guard(),
@@ -4486,6 +4489,7 @@ fn test_row_page_transition_retries_update_delete() {
 
         let mut trx = session.begin_trx().unwrap();
         let page_guard = engine
+            .inner()
             .mem_pool
             .get_page::<RowPage>(
                 session.pool_guards().mem_guard(),
@@ -5166,7 +5170,7 @@ fn test_create_table_rejects_invalid_metadata_before_file_creation() {
             .unwrap();
         let mut session = engine.new_session().unwrap();
         let table_id = engine.catalog().curr_next_table_id();
-        let table_file_path = engine.table_fs.user_table_file_path(table_id);
+        let table_file_path = engine.inner().table_fs.user_table_file_path(table_id);
 
         let err = session
             .create_table(
@@ -5201,7 +5205,7 @@ fn test_create_table_catalog_staging_failure_rolls_back_and_deletes_file() {
             .unwrap();
         let mut session = engine.new_session().unwrap();
         let table_id = engine.catalog().curr_next_table_id();
-        let table_file_path = engine.table_fs.user_table_file_path(table_id);
+        let table_file_path = engine.inner().table_fs.user_table_file_path(table_id);
         let (table_spec, index_specs) = drop_table_test_spec();
 
         catalog_table_tests::set_create_table_failure(Some(
@@ -5232,7 +5236,7 @@ fn test_create_table_file_publish_failure_rolls_back_catalog_and_deletes_file() 
             .unwrap();
         let mut session = engine.new_session().unwrap();
         let table_id = engine.catalog().curr_next_table_id();
-        let table_file_path = engine.table_fs.user_table_file_path(table_id);
+        let table_file_path = engine.inner().table_fs.user_table_file_path(table_id);
         let hook = Arc::new(FailingFirstWriteHook::new(table_file_path.clone()));
         let _install = install_storage_backend_test_hook(hook.clone());
         let (table_spec, index_specs) = drop_table_test_spec();
@@ -5261,7 +5265,7 @@ fn test_create_table_after_file_published_failure_rolls_back_catalog_and_deletes
             .unwrap();
         let mut session = engine.new_session().unwrap();
         let table_id = engine.catalog().curr_next_table_id();
-        let table_file_path = engine.table_fs.user_table_file_path(table_id);
+        let table_file_path = engine.inner().table_fs.user_table_file_path(table_id);
         let (table_spec, index_specs) = drop_table_test_spec();
 
         catalog_table_tests::set_create_table_failure(Some(
@@ -5292,7 +5296,7 @@ fn test_create_table_runtime_failure_after_file_publish_rolls_back_and_deletes_f
             .unwrap();
         let mut session = engine.new_session().unwrap();
         let table_id = engine.catalog().curr_next_table_id();
-        let table_file_path = engine.table_fs.user_table_file_path(table_id);
+        let table_file_path = engine.inner().table_fs.user_table_file_path(table_id);
         let (table_spec, index_specs) = drop_table_test_spec();
 
         catalog_table_tests::set_create_table_failure(Some(
@@ -5323,7 +5327,7 @@ fn test_create_table_catalog_commit_error_after_file_publish_poisons_and_keeps_f
             .unwrap();
         let mut session = engine.new_session().unwrap();
         let table_id = engine.catalog().curr_next_table_id();
-        let table_file_path = engine.table_fs.user_table_file_path(table_id);
+        let table_file_path = engine.inner().table_fs.user_table_file_path(table_id);
         let (table_spec, index_specs) = drop_table_test_spec();
 
         catalog_table_tests::set_create_table_failure(Some(
@@ -5339,6 +5343,7 @@ fn test_create_table_catalog_commit_error_after_file_publish_poisons_and_keeps_f
         );
         assert!(
             engine
+                .inner()
                 .trx_sys
                 .storage_poison_error()
                 .as_ref()
@@ -6275,6 +6280,7 @@ fn test_transition_captures_uncommitted_lock_into_deletion_buffer() {
         let res: Result<()> = trx
             .exec(async |stmt| {
                 let page_guard = engine
+                    .inner()
                     .mem_pool
                     .get_page::<RowPage>(
                         session.pool_guards().mem_guard(),
@@ -6569,7 +6575,7 @@ fn test_drop_table_rejects_already_dropping_lifecycle_without_poison() {
             TableLifecycleState::Dropping
         );
         assert!(!session.in_trx().unwrap());
-        assert!(engine.trx_sys.storage_poison_error().is_none());
+        assert!(engine.inner().trx_sys.storage_poison_error().is_none());
     });
 }
 
@@ -6645,7 +6651,7 @@ fn test_drop_table_rejects_runtime_missing_catalog_row_before_gate() {
             TableLifecycleState::Live
         );
         assert!(!drop_session.in_trx().unwrap());
-        assert!(engine.trx_sys.storage_poison_error().is_none());
+        assert!(engine.inner().trx_sys.storage_poison_error().is_none());
         assert!(engine.catalog().get_table(table_id).await.is_some());
     });
 }
@@ -6875,7 +6881,7 @@ fn test_drop_table_logical_cascade() {
         let engine =
             evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys_non_unique").await;
         let table_id = create_non_unique_name_table_for_test(&engine).await;
-        let table_file_path = engine.table_fs.user_table_file_path(table_id);
+        let table_file_path = engine.inner().table_fs.user_table_file_path(table_id);
         let mut session = engine.new_session().unwrap();
         insert_one_row(
             table_id,
@@ -7020,13 +7026,13 @@ fn test_drop_table_gc_deletes_file_after_catalog_checkpoint() {
             vec![Val::from(11), Val::from("gc-delete")],
         )
         .await;
-        let table_file_path = engine.table_fs.user_table_file_path(table_id);
+        let table_file_path = engine.inner().table_fs.user_table_file_path(table_id);
 
         session.drop_table(table_id).await.unwrap();
-        engine.trx_sys.request_dropped_table_purge();
+        engine.inner().trx_sys.request_dropped_table_purge();
         engine
             .catalog()
-            .checkpoint_now(&engine.trx_sys)
+            .checkpoint_now(&engine.inner().trx_sys)
             .await
             .unwrap();
         wait_path_exists(&table_file_path, false).await;
@@ -7099,6 +7105,7 @@ fn test_drop_table_catalog_cascade_poison_preserves_source_error() {
         );
         assert!(
             engine
+                .inner()
                 .trx_sys
                 .storage_poison_error()
                 .as_ref()
@@ -7142,6 +7149,7 @@ fn test_drop_table_commit_poison_preserves_source_error() {
         assert!(report.contains("propagate from other threads"), "{report}");
         assert!(
             engine
+                .inner()
                 .trx_sys
                 .storage_poison_error()
                 .as_ref()
@@ -7177,12 +7185,16 @@ fn test_user_insert_commit_poison_rolls_back_session_before_return() {
         assert!(report.contains("redo write failed"), "{report}");
         assert!(
             engine
+                .inner()
                 .trx_sys
                 .storage_poison_error()
                 .as_ref()
                 .is_some_and(|err| *err.current_context() == FatalError::RedoWrite)
         );
-        assert_eq!(engine.session_registry.active_transaction_count(), 0);
+        assert_eq!(
+            engine.inner().session_registry.active_transaction_count(),
+            0
+        );
     });
 }
 
@@ -7271,7 +7283,7 @@ fn test_catalog_checkpoint_scan_allows_runtime_removed_drop_table() {
         session.drop_table(table_id).await.unwrap();
         let batch = engine
             .catalog()
-            .scan_checkpoint_batch(&engine.trx_sys)
+            .scan_checkpoint_batch(&engine.inner().trx_sys)
             .unwrap();
 
         assert_eq!(
@@ -7328,7 +7340,7 @@ fn test_drop_table_recovery_replays_committed_drop_before_catalog_checkpoint() {
         let mut session = engine.new_session().unwrap();
         let (table_spec, index_specs) = drop_table_test_spec();
         let table_id = session.create_table(table_spec, index_specs).await.unwrap();
-        let table_file_path = engine.table_fs.user_table_file_path(table_id);
+        let table_file_path = engine.inner().table_fs.user_table_file_path(table_id);
 
         session.drop_table(table_id).await.unwrap();
         assert!(std::path::Path::new(&table_file_path).exists());
@@ -7347,7 +7359,7 @@ fn test_drop_table_recovery_replays_committed_drop_before_catalog_checkpoint() {
         let _ = session.create_table(table_spec, index_specs).await.unwrap();
         engine
             .catalog()
-            .checkpoint_now(&engine.trx_sys)
+            .checkpoint_now(&engine.inner().trx_sys)
             .await
             .unwrap();
         wait_path_exists(&table_file_path, false).await;
@@ -7377,12 +7389,12 @@ fn test_drop_table_catalog_checkpoint_cleans_absent_leftover_file() {
             panic!("insert should succeed: {insert:?}");
         };
         trx.commit().await.unwrap();
-        let table_file_path = engine.table_fs.user_table_file_path(table_id);
+        let table_file_path = engine.inner().table_fs.user_table_file_path(table_id);
 
         session.drop_table(table_id).await.unwrap();
         engine
             .catalog()
-            .checkpoint_now(&engine.trx_sys)
+            .checkpoint_now(&engine.inner().trx_sys)
             .await
             .unwrap();
         assert!(
@@ -7418,10 +7430,11 @@ fn test_recovery_cleans_post_replay_create_table_provisional_file() {
             .await
             .unwrap();
         let table_id = USER_OBJ_ID_START + 99;
-        let table_file_path = engine.table_fs.user_table_file_path(table_id);
+        let table_file_path = engine.inner().table_fs.user_table_file_path(table_id);
         let (table_spec, index_specs) = drop_table_test_spec();
         let metadata = Arc::new(TableMetadata::try_new(table_spec.columns, index_specs).unwrap());
         let mutable = engine
+            .inner()
             .table_fs
             .create_table_file(table_id, metadata, false)
             .unwrap();
@@ -7451,7 +7464,7 @@ fn test_checkpoint_publish_write_failure_poisons_storage() {
         let table = table_for_internal_assertion(&engine, table_id);
         let root_before = table.file().active_root_unchecked().clone();
         wait_checkpoint_ready(table_id, &session).await;
-        let table_file_path = engine.table_fs.user_table_file_path(table_id);
+        let table_file_path = engine.inner().table_fs.user_table_file_path(table_id);
         let hook = Arc::new(FailingFirstWriteHook::new(table_file_path));
         let _install = install_storage_backend_test_hook(hook.clone());
 
@@ -8082,8 +8095,9 @@ fn test_checkpoint_persistence_recovery() {
         drop(table);
 
         let table_file = engine
+            .inner()
             .table_fs
-            .open_table_file(table_id, engine.disk_pool.clone_inner())
+            .open_table_file(table_id, engine.inner().disk_pool.clone_inner())
             .await
             .unwrap();
         let root_after = table_file.active_root_unchecked();
@@ -8139,14 +8153,14 @@ fn test_checkpoint_gc_verification() {
         let name = "g".repeat(1024);
         insert_rows(table_id, &mut session, 0, 200, &name).await;
 
-        let allocated_before = engine.mem_pool.allocated();
+        let allocated_before = engine.inner().mem_pool.allocated();
         session.freeze_table(table_id, usize::MAX).await.unwrap();
         checkpoint_published(table_id, &mut session).await;
-        let allocated_after = engine.mem_pool.allocated();
+        let allocated_after = engine.inner().mem_pool.allocated();
         let mut reclaimed = allocated_after < allocated_before;
         for _ in 0..20 {
             smol::Timer::after(Duration::from_millis(200)).await;
-            let allocated_now = engine.mem_pool.allocated();
+            let allocated_now = engine.inner().mem_pool.allocated();
             if allocated_now < allocated_before {
                 reclaimed = true;
                 break;
@@ -8556,14 +8570,16 @@ fn test_mvcc_rollback_poisons_runtime_on_row_page_reload_error() {
         );
         assert!(
             engine
+                .inner()
                 .trx_sys
                 .storage_poison_error()
                 .as_ref()
                 .is_some_and(|err| *err.current_context() == FatalError::RollbackAccess)
         );
-        assert_eq!(engine.trx_sys.fatal_rollback_retention_len(), 1);
+        assert_eq!(engine.inner().trx_sys.fatal_rollback_retention_len(), 1);
         assert!(
             engine
+                .inner()
                 .trx_sys
                 .ensure_runtime_healthy()
                 .as_ref()
@@ -8663,12 +8679,13 @@ fn test_statement_rollback_poisons_runtime_on_row_page_reload_error() {
         );
         assert!(
             engine
+                .inner()
                 .trx_sys
                 .storage_poison_error()
                 .as_ref()
                 .is_some_and(|err| *err.current_context() == FatalError::RollbackAccess)
         );
-        assert_eq!(engine.trx_sys.fatal_rollback_retention_len(), 1);
+        assert_eq!(engine.inner().trx_sys.fatal_rollback_retention_len(), 1);
         assert!(!session.in_trx().unwrap());
 
         let err = trx.rollback().await.unwrap_err();
@@ -8830,21 +8847,21 @@ fn test_user_secondary_indexes_evict_and_continue_serving_lookups() {
                 inserted.push((row_id, key));
             }
             trx.commit().await.unwrap();
-            let stats = engine.index_pool.stats();
+            let stats = engine.inner().index_pool.stats();
             if stats.completed_writes > 0 && stats.write_errors == 0 {
                 break;
             }
         }
 
         for _ in 0..20 {
-            let stats = engine.index_pool.stats();
+            let stats = engine.inner().index_pool.stats();
             if stats.completed_writes > 0 && stats.write_errors == 0 {
                 break;
             }
             smol::Timer::after(Duration::from_millis(50)).await;
         }
 
-        let stats = engine.index_pool.stats();
+        let stats = engine.inner().index_pool.stats();
         assert!(
             stats.completed_writes > 0 && stats.write_errors == 0,
             "user secondary-index pool should evict with a small index buffer"
@@ -9969,7 +9986,7 @@ fn test_runtime_layout_install_retires_removed_index_after_old_snapshot_drops() 
         assert!(table_for_internal_assertion(&engine, table_id).has_retired_secondary_indexes());
 
         let guards = PoolGuards::builder()
-            .push(PoolRole::Index, engine.index_pool.pool_guard())
+            .push(PoolRole::Index, engine.inner().index_pool.pool_guard())
             .build();
         assert_eq!(
             table_for_internal_assertion(&engine, table_id)

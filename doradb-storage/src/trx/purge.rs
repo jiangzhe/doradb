@@ -66,8 +66,8 @@ fn handle_gc_row_page_deallocation_result(trx_sys: &TransactionSystem, res: Resu
 /// Runtime table handle waiting for purge-horizon destruction after DROP TABLE.
 ///
 /// The catalog no longer exposes this table once foreground DROP TABLE commits,
-/// but stale `Arc<Table>` handles may still exist in old sessions or other
-/// runtime holders. Purge owns the final runtime destroy step so it can wait
+/// but crate-private operation, session, transaction, or cleanup pins may still
+/// retain the runtime. Purge owns the final runtime destroy step so it can wait
 /// until the drop commit is older than every active snapshot.
 pub(crate) struct DroppedTableGcItem {
     pub(crate) table_id: TableID,
@@ -1061,10 +1061,10 @@ mod tests {
     #[inline]
     fn full_pool_guards(engine: &crate::engine::Engine) -> PoolGuards {
         PoolGuards::builder()
-            .push(PoolRole::Meta, engine.meta_pool.pool_guard())
-            .push(PoolRole::Index, engine.index_pool.pool_guard())
-            .push(PoolRole::Mem, engine.mem_pool.pool_guard())
-            .push(PoolRole::Disk, engine.disk_pool.pool_guard())
+            .push(PoolRole::Meta, engine.inner().meta_pool.pool_guard())
+            .push(PoolRole::Index, engine.inner().index_pool.pool_guard())
+            .push(PoolRole::Mem, engine.inner().mem_pool.pool_guard())
+            .push(PoolRole::Disk, engine.inner().disk_pool.pool_guard())
             .build()
     }
 
@@ -1282,17 +1282,18 @@ mod tests {
                 .unwrap();
 
             assert!(handle_gc_row_page_deallocation_result(
-                &engine.trx_sys,
+                &engine.inner().trx_sys,
                 Ok(())
             ));
-            assert!(engine.trx_sys.storage_poison_error().is_none());
+            assert!(engine.inner().trx_sys.storage_poison_error().is_none());
 
             assert!(!handle_gc_row_page_deallocation_result(
-                &engine.trx_sys,
+                &engine.inner().trx_sys,
                 Err(std::io::Error::from_raw_os_error(libc::EIO).into())
             ));
             assert!(
                 engine
+                    .inner()
                     .trx_sys
                     .storage_poison_error()
                     .as_ref()
@@ -1300,6 +1301,7 @@ mod tests {
             );
             assert!(
                 engine
+                    .inner()
                     .trx_sys
                     .ensure_runtime_healthy()
                     .as_ref()
@@ -1352,10 +1354,11 @@ mod tests {
                 }),
             };
             let guards = PoolGuards::builder()
-                .push(PoolRole::Index, engine.index_pool.pool_guard())
+                .push(PoolRole::Index, engine.inner().index_pool.pool_guard())
                 .build();
 
             let err = engine
+                .inner()
                 .trx_sys
                 .purge_trx_list(engine.catalog(), &guards, 0, vec![trx], MAX_SNAPSHOT_TS)
                 .await
@@ -1366,6 +1369,7 @@ mod tests {
             );
             assert!(
                 engine
+                    .inner()
                     .trx_sys
                     .storage_poison_error()
                     .as_ref()
@@ -1443,6 +1447,7 @@ mod tests {
             {
                 let pool_guards = full_pool_guards(&engine);
                 engine
+                    .inner()
                     .trx_sys
                     .purge_trx_list(
                         engine.catalog(),
@@ -1532,6 +1537,7 @@ mod tests {
             {
                 let pool_guards = full_pool_guards(&engine);
                 engine
+                    .inner()
                     .trx_sys
                     .purge_trx_list(
                         engine.catalog(),
@@ -1648,6 +1654,7 @@ mod tests {
             {
                 let pool_guards = full_pool_guards(&engine);
                 engine
+                    .inner()
                     .trx_sys
                     .purge_trx_list(
                         engine.catalog(),
@@ -1760,6 +1767,7 @@ mod tests {
             {
                 let pool_guards = full_pool_guards(&engine);
                 engine
+                    .inner()
                     .trx_sys
                     .purge_trx_list(
                         engine.catalog(),
@@ -1814,7 +1822,7 @@ mod tests {
             // Since we populate metadata table, we need to count those purge transactions and rows.
             // 100ms should be enough.
             smol::Timer::after(Duration::from_millis(1000)).await;
-            let init_stats = engine.trx_sys.trx_sys_stats();
+            let init_stats = engine.inner().trx_sys.trx_sys_stats();
 
             let mut session = engine.new_session().unwrap();
             // insert
@@ -1848,7 +1856,7 @@ mod tests {
             // wait for GC.
             let start = Instant::now();
             loop {
-                let stats = engine.trx_sys.trx_sys_stats();
+                let stats = engine.inner().trx_sys.trx_sys_stats();
                 assert!(stats.purge_trx_count <= init_stats.purge_trx_count + PURGE_SIZE * 2);
                 assert!(stats.purge_row_count <= init_stats.purge_row_count + PURGE_SIZE * 2);
                 assert!(stats.purge_index_count <= init_stats.purge_index_count + PURGE_SIZE);
@@ -1902,7 +1910,7 @@ mod tests {
             // Since we populate metadata table, we need to count those purge transactions and rows.
             // 100ms should be enough.
             smol::Timer::after(Duration::from_millis(100)).await;
-            let init_stats = engine.trx_sys.trx_sys_stats();
+            let init_stats = engine.inner().trx_sys.trx_sys_stats();
 
             let mut session = engine.new_session().unwrap();
             // insert
@@ -1937,7 +1945,7 @@ mod tests {
             let start = Instant::now();
             let mut gc_timeout = false;
             loop {
-                let stats = engine.trx_sys.trx_sys_stats();
+                let stats = engine.inner().trx_sys.trx_sys_stats();
                 assert!(stats.purge_trx_count <= init_stats.purge_trx_count + PURGE_SIZE * 2);
                 assert!(stats.purge_row_count <= init_stats.purge_row_count + PURGE_SIZE * 2);
                 assert!(stats.purge_index_count <= init_stats.purge_index_count + PURGE_SIZE);
@@ -1983,8 +1991,9 @@ mod tests {
                     RowLocation::RowPage(page_id) => page_id,
                     _ => unreachable!(),
                 };
-                let mem_guard = engine.mem_pool.pool_guard();
+                let mem_guard = engine.inner().mem_pool.pool_guard();
                 let page_guard: PageSharedGuard<RowPage> = engine
+                    .inner()
                     .mem_pool
                     .get_page(&mem_guard, page_id, LatchFallbackMode::Shared)
                     .await
@@ -1999,7 +2008,7 @@ mod tests {
             }
             println!(
                 "final min_active_sts={}",
-                engine.trx_sys.global_visible_sts()
+                engine.inner().trx_sys.global_visible_sts()
             );
             drop(session);
         });

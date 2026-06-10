@@ -3,7 +3,7 @@
 //! This module provides the main entry point of the storage engine,
 //! including start, stop, recover, and execute commands. See
 //! `docs/engine-component-lifetime.md` for the runtime-versus-owner lifetime
-//! model that this module and [`crate::component::ComponentRegistry`] enforce.
+//! model that this module enforces with the component registry.
 use crate::buffer::PoolRole;
 use crate::buffer::SharedPoolEvictorWorkers;
 use crate::catalog::Catalog;
@@ -249,14 +249,12 @@ impl Drop for EngineAdmission<'_> {
     }
 }
 
-/// Storage engine owner.
+/// `Engine` is the public owner and session factory for one storage runtime.
 ///
-/// `Engine` owns teardown-only state such as the top-level
-/// [`ComponentRegistry`] and the owner-side runtime reference used to coordinate
-/// explicit shutdown. Crate-private [`EngineRef`] values are cloneable strong
-/// runtime handles, while public [`Session`] values keep only weak reachability
-/// plus identity. Explicit shutdown and final owner drop therefore stay with the
-/// owner object instead of the cloneable runtime access path.
+/// The owner coordinates explicit shutdown and final component teardown. Public
+/// [`Session`] values keep weak reachability plus engine-local identity, and
+/// operations acquire strong runtime access internally only for the duration of
+/// the operation. Runtime internals are not exposed through the public facade.
 pub struct Engine {
     // Field order is part of owner teardown: after `Drop::drop` returns, the
     // owner runtime ref is released before component owners are dropped.
@@ -266,7 +264,7 @@ pub struct Engine {
 
 impl Engine {
     #[inline]
-    fn inner(&self) -> &Arc<EngineInner> {
+    pub(crate) fn inner(&self) -> &Arc<EngineInner> {
         &self.inner
     }
 
@@ -315,11 +313,12 @@ impl Engine {
         inner.with_admitted_operation(|| EngineRef::new(Arc::clone(inner)))
     }
 
-    /// Try to complete idempotent engine shutdown without waiting for runtime refs.
+    /// Try to complete idempotent engine shutdown without waiting for active work.
     ///
     /// `try_shutdown` rejects new work immediately, drains in-flight admission,
-    /// and returns [`LifecycleError::ShutdownBusy`] if user-owned crate-private
-    /// [`EngineRef`]s or active transactional pins are still alive.
+    /// and returns an error with shutdown-busy context if active operations,
+    /// active transactions, abandoned transaction cleanup, or internal runtime
+    /// pins are still alive.
     ///
     /// This path is valid after storage poison. Poison only blocks admission; it
     /// does not replace the owner-side responsibility to stop background workers
@@ -350,12 +349,12 @@ impl Engine {
         Ok(())
     }
 
-    /// Complete idempotent engine shutdown, waiting for runtime refs to drain.
+    /// Complete idempotent engine shutdown, waiting for active work to drain.
     ///
-    /// Shutdown rejects new work immediately, waits for user-owned
-    /// crate-private [`EngineRef`]s and active transactional pins to drain,
-    /// removes idle registry-owned sessions, then dispatches component shutdown
-    /// in reverse registration order.
+    /// Shutdown rejects new work immediately, waits for active operations,
+    /// active transactions, abandoned transaction cleanup, and internal runtime
+    /// pins to drain, removes idle registry-owned sessions, then dispatches
+    /// component shutdown in reverse registration order.
     #[inline]
     pub fn shutdown(&self) -> Result<()> {
         let inner = self.inner();
@@ -432,15 +431,6 @@ impl Engine {
             );
         }
         len
-    }
-}
-
-impl Deref for Engine {
-    type Target = EngineInner;
-
-    #[inline]
-    fn deref(&self) -> &EngineInner {
-        self.inner().as_ref()
     }
 }
 
@@ -590,11 +580,11 @@ impl WeakEngineRef {
     }
 }
 
-/// Shared runtime state for an [`Engine`].
+/// Shared crate-private runtime state for an [`Engine`].
 ///
 /// The fields here are the cloneable handles that sessions and other runtime
 /// objects may retain. Owner-only teardown state lives on [`Engine`] itself.
-pub struct EngineInner {
+pub(crate) struct EngineInner {
     /// Shared catalog handle.
     pub(crate) catalog: QuiescentGuard<Catalog>,
     /// Shared transaction-system handle.
@@ -1009,9 +999,9 @@ mod tests {
                 .await
                 .unwrap();
 
-            let table_stats = fs_stats_handle_identity(&engine.table_fs);
-            let mem_stats = pool_stats_handle_identity(&engine.mem_pool);
-            let index_stats = pool_stats_handle_identity(&engine.index_pool);
+            let table_stats = fs_stats_handle_identity(&engine.inner().table_fs);
+            let mem_stats = pool_stats_handle_identity(&engine.inner().mem_pool);
+            let index_stats = pool_stats_handle_identity(&engine.inner().index_pool);
 
             assert_eq!(table_stats, mem_stats);
             assert_eq!(table_stats, index_stats);
@@ -1038,14 +1028,14 @@ mod tests {
                 .await
                 .unwrap();
 
-            assert_eq!(engine.table_fs.configured_io_depth(), 7);
+            assert_eq!(engine.inner().table_fs.configured_io_depth(), 7);
             assert_eq!(
-                engine.mem_pool.io_backend_stats(),
-                engine.table_fs.io_backend_stats()
+                engine.inner().mem_pool.io_backend_stats(),
+                engine.inner().table_fs.io_backend_stats()
             );
             assert_eq!(
-                engine.index_pool.io_backend_stats(),
-                engine.table_fs.io_backend_stats()
+                engine.inner().index_pool.io_backend_stats(),
+                engine.inner().table_fs.io_backend_stats()
             );
         });
     }
@@ -2007,12 +1997,12 @@ mod tests {
                 .log_dir(&log_dir)
                 .log_file_stem("pending-startup-cleanup")
                 .prepare(
-                    engine.meta_pool.clone_inner(),
-                    engine.index_pool.clone_inner(),
-                    engine.mem_pool.clone_inner(),
-                    engine.table_fs.clone(),
-                    engine.disk_pool.clone_inner(),
-                    engine.catalog.clone(),
+                    engine.inner().meta_pool.clone_inner(),
+                    engine.inner().index_pool.clone_inner(),
+                    engine.inner().mem_pool.clone_inner(),
+                    engine.inner().table_fs.clone(),
+                    engine.inner().disk_pool.clone_inner(),
+                    engine.inner().catalog.clone(),
                 )
                 .await
                 .unwrap();

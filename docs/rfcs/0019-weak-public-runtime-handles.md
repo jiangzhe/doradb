@@ -184,8 +184,8 @@ Issue Labels:
 
 ### Source Backlogs (Optional)
 
-- [B1] `docs/backlogs/000061-block-engine-shutdown-while-external-table-handles-are-alive.md`
-- [B2] `docs/backlogs/000066-engine-scoped-weak-runtime-handles.md`
+- [B1] `docs/backlogs/closed/000061-block-engine-shutdown-while-external-table-handles-are-alive.md`
+- [B2] `docs/backlogs/closed/000066-engine-scoped-weak-runtime-handles.md`
 - [B3] `docs/backlogs/000113-transaction-cancellation-safety.md`
 - [B4] `docs/backlogs/000116-general-session-runtime-pin-ownership.md`
 
@@ -603,7 +603,7 @@ code is visible.
   - Phase Status: done
   - Implementation Summary: Implemented packed-atomic admission, Event-based shutdown drain, lifecycle tests, and baseline example. [Task Resolve Sync: docs/tasks/000163-weak-handle-foundation.md @ 2026-05-31]
   - Related Backlogs:
-    - `docs/backlogs/000066-engine-scoped-weak-runtime-handles.md`
+    - `docs/backlogs/closed/000066-engine-scoped-weak-runtime-handles.md`
 
 - **Phase 2: Engine Handle Public API Boundary**
   - Scope: Retire or weaken public `EngineRef` so library users cannot clone a
@@ -824,8 +824,8 @@ code is visible.
   - Phase Status: done
   - Implementation Summary: Implemented RFC-0019 Phase 7 with table-id public statement access. Public API no longer exposes Table or public Arc<Table> lookup; statement methods resolve catalog-owned table runtimes internally, validate lifecycle at operation boundaries, and use transaction/session weak caches so repeated table-id operations avoid repeated catalog lookup without retaining dropped runtimes. Public smoke tests, internal table/recovery/catalog call sites, weak_handle_baseline, checkpoint lifecycle readiness, and concurrent checkpoint admission regressions were updated and validated. [Task Resolve Sync: docs/tasks/000170-table-handle-catalog-ownership.md @ 2026-06-10]
   - Related Backlogs:
-    - `docs/backlogs/000061-block-engine-shutdown-while-external-table-handles-are-alive.md`
-    - `docs/backlogs/000066-engine-scoped-weak-runtime-handles.md`
+    - `docs/backlogs/closed/000061-block-engine-shutdown-while-external-table-handles-are-alive.md`
+    - `docs/backlogs/closed/000066-engine-scoped-weak-runtime-handles.md`
 
 - **Phase 8: Public Strong Handle Removal And Documentation Sync**
   - Scope: Remove transitional public strong APIs and update docs/examples/tests
@@ -847,13 +847,13 @@ code is visible.
     outcomes can be resolved or explicitly deferred.
   - Non-goals: Do not perform unrelated storage refactors or compatibility
     adapter work after final API migration.
-  - Task Doc: `docs/tasks/TBD.md`
-  - Task Issue: `#0`
-  - Phase Status: `pending`
-  - Implementation Summary: `pending`
+  - Task Doc: `docs/tasks/000171-public-strong-handle-removal-documentation-sync.md`
+  - Task Issue: `#689`
+  - Phase Status: done
+  - Implementation Summary: Implemented RFC-0019 Phase 8 by removing the public Engine Deref runtime-shape exposure, keeping EngineRef and EngineInner crate-private, migrating internal and test call sites to explicit Engine::inner() access, cleaning public rustdoc/private links, syncing weak-handle lifecycle design docs, and validating public table-id DML through smoke tests, rustdoc, nextest, focused coverage, and the weak_handle_baseline example. Related backlogs 000061 and 000066 were closed because public strong table and runtime handles no longer escape. [Task Resolve Sync: docs/tasks/000171-public-strong-handle-removal-documentation-sync.md @ 2026-06-10]
   - Related Backlogs:
-    - `docs/backlogs/000061-block-engine-shutdown-while-external-table-handles-are-alive.md`
-    - `docs/backlogs/000066-engine-scoped-weak-runtime-handles.md`
+    - `docs/backlogs/closed/000061-block-engine-shutdown-while-external-table-handles-are-alive.md`
+    - `docs/backlogs/closed/000066-engine-scoped-weak-runtime-handles.md`
 
 ## Consequences
 
@@ -921,7 +921,7 @@ code is visible.
 - `docs/engine-component-lifetime.md`
 - `docs/rfcs/0009-remove-static-lifetime-from-engine-components.md`
 - `docs/rfcs/0017-drop-table-lifecycle-recovery.md`
-- `docs/backlogs/000061-block-engine-shutdown-while-external-table-handles-are-alive.md`
-- `docs/backlogs/000066-engine-scoped-weak-runtime-handles.md`
+- `docs/backlogs/closed/000061-block-engine-shutdown-while-external-table-handles-are-alive.md`
+- `docs/backlogs/closed/000066-engine-scoped-weak-runtime-handles.md`
 - `docs/backlogs/000113-transaction-cancellation-safety.md`
 - `docs/backlogs/000116-general-session-runtime-pin-ownership.md`

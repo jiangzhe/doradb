@@ -1495,7 +1495,7 @@ mod tests {
                 build_redo_test_engine("commit_handoff_drop", LogSync::None).await;
             let table_id = table2(&engine).await;
             let redo_fd = {
-                engine.trx_sys.log_partitions[0]
+                engine.inner().trx_sys.log_partitions[0]
                     .group_commit
                     .lock()
                     .log_file
@@ -1555,7 +1555,8 @@ mod tests {
             .unwrap();
 
             {
-                let mut group_commit_g = engine.trx_sys.log_partitions[0].group_commit.lock();
+                let mut group_commit_g =
+                    engine.inner().trx_sys.log_partitions[0].group_commit.lock();
                 // Simulate the state after the redo worker has consumed any
                 // shutdown wakeup message: admission is closed, but rejection
                 // must not depend on a `Commit::Shutdown` queue tail.
@@ -1582,7 +1583,7 @@ mod tests {
                 build_redo_test_engine("user_redo_fsync_failure", LogSync::Fsync).await;
             let table_id = table2(&engine).await;
             let redo_fd = {
-                engine.trx_sys.log_partitions[0]
+                engine.inner().trx_sys.log_partitions[0]
                     .group_commit
                     .lock()
                     .log_file
@@ -1624,6 +1625,7 @@ mod tests {
             assert!(!session.in_trx().unwrap());
             assert!(
                 engine
+                    .inner()
                     .trx_sys
                     .storage_poison_error()
                     .as_ref()
@@ -1838,10 +1840,12 @@ mod tests {
             drop(session);
 
             let mut log_recs = 0usize;
-            let logs = engine.trx_sys.log_partitions[0].logs(false).unwrap();
+            let logs = engine.inner().trx_sys.log_partitions[0]
+                .logs(false)
+                .unwrap();
             for log in logs {
                 println!("log file {:?}", log.file_name());
-                let mut reader = engine.trx_sys.log_reader(&log).unwrap();
+                let mut reader = engine.inner().trx_sys.log_reader(&log).unwrap();
                 loop {
                     match reader.read() {
                         ReadLog::SizeLimit => unreachable!(),
@@ -1910,10 +1914,12 @@ mod tests {
             drop(session);
 
             let mut log_recs = 0usize;
-            let logs = engine.trx_sys.log_partitions[0].logs(false).unwrap();
+            let logs = engine.inner().trx_sys.log_partitions[0]
+                .logs(false)
+                .unwrap();
             for log in logs {
                 println!("log file {:?}", log.file_name());
-                let mut reader = engine.trx_sys.log_reader(&log).unwrap();
+                let mut reader = engine.inner().trx_sys.log_reader(&log).unwrap();
                 loop {
                     match reader.read() {
                         ReadLog::SizeLimit => unreachable!(),
@@ -1960,7 +1966,7 @@ mod tests {
             let (_temp_dir, engine) =
                 build_redo_test_engine("redo_write_failure", LogSync::None).await;
             let redo_fd = {
-                engine.trx_sys.log_partitions[0]
+                engine.inner().trx_sys.log_partitions[0]
                     .group_commit
                     .lock()
                     .log_file
@@ -1976,7 +1982,7 @@ mod tests {
 
             let commit2 = spawn_sys_commit_wait(engine.new_ref().unwrap(), 2);
             wait_for(|| {
-                !engine.trx_sys.log_partitions[0]
+                !engine.inner().trx_sys.log_partitions[0]
                     .group_commit
                     .lock()
                     .queue
@@ -1992,6 +1998,7 @@ mod tests {
             assert_propagated_completion_fatal(&res2, FatalError::RedoWrite);
             assert!(
                 engine
+                    .inner()
                     .trx_sys
                     .ensure_runtime_healthy()
                     .as_ref()
@@ -2007,7 +2014,7 @@ mod tests {
     ) {
         let (_temp_dir, engine) = build_redo_test_engine(log_file_stem, log_sync).await;
         let redo_fd = {
-            engine.trx_sys.log_partitions[0]
+            engine.inner().trx_sys.log_partitions[0]
                 .group_commit
                 .lock()
                 .log_file
@@ -2023,7 +2030,7 @@ mod tests {
 
         let commit2 = spawn_sys_commit_wait(engine.new_ref().unwrap(), 11);
         wait_for(|| {
-            !engine.trx_sys.log_partitions[0]
+            !engine.inner().trx_sys.log_partitions[0]
                 .group_commit
                 .lock()
                 .queue
@@ -2039,6 +2046,7 @@ mod tests {
         assert_propagated_completion_fatal(&res2, FatalError::RedoSync);
         assert!(
             engine
+                .inner()
                 .trx_sys
                 .ensure_runtime_healthy()
                 .as_ref()
@@ -2074,14 +2082,14 @@ mod tests {
     fn test_commit_sys_returns_cts() {
         smol::block_on(async {
             let (_temp_dir, engine) = build_redo_test_engine("redo_no_wait", LogSync::None).await;
-            let mut sys_trx = engine.trx_sys.begin_sys_trx();
+            let mut sys_trx = engine.inner().trx_sys.begin_sys_trx();
             sys_trx.create_row_page(
                 TableID::new(1),
                 test_page_id(1),
                 RowID::new(0),
                 RowID::new(1),
             );
-            let cts = engine.trx_sys.commit_sys(sys_trx).unwrap();
+            let cts = engine.inner().trx_sys.commit_sys(sys_trx).unwrap();
             assert!(cts >= MIN_SNAPSHOT_TS);
         });
     }
