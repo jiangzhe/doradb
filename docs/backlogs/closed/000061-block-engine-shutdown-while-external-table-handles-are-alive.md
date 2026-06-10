@@ -32,3 +32,11 @@ When a backlog item is moved to `docs/backlogs/closed/`, append:
 - Reference: <task/issue/pr reference>
 - Closed At: <YYYY-MM-DD>
 ```
+
+## Close Reason
+
+- Type: implemented
+- Detail: Implemented by eliminating public table and catalog runtime handles as part of RFC-0019 Phase 8. External code can no longer hold Arc<Table> or Arc<CatalogTable>; remaining table runtime pins are crate-private and scoped to operation, session, transaction, catalog, recovery, or cleanup internals.
+- Closed By: backlog close
+- Reference: docs/tasks/000171-public-strong-handle-removal-documentation-sync.md; docs/rfcs/0019-weak-public-runtime-handles.md Phase 8
+- Closed At: 2026-06-10

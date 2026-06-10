@@ -1,7 +1,7 @@
 ---
 id: 000171
 title: Public Strong Handle Removal And Documentation Sync
-status: proposal
+status: implemented
 created: 2026-06-10
 github_issue: 689
 ---
@@ -29,8 +29,8 @@ RFC Phase:
 - Phase 8: Public Strong Handle Removal And Documentation Sync
 
 Related Backlogs:
-- docs/backlogs/000061-block-engine-shutdown-while-external-table-handles-are-alive.md
-- docs/backlogs/000066-engine-scoped-weak-runtime-handles.md
+- docs/backlogs/closed/000061-block-engine-shutdown-while-external-table-handles-are-alive.md
+- docs/backlogs/closed/000066-engine-scoped-weak-runtime-handles.md
 
 ## Context
 
@@ -226,6 +226,42 @@ inventory as required by the repository process, and include the reason in
 
 ## Implementation Notes
 
+- Removed the public `Engine::Deref<Target = EngineInner>` implementation,
+  made `Engine::inner()` crate-private explicit access, and narrowed
+  `EngineInner` to `pub(crate)`. Internal and test call sites now use explicit
+  runtime access instead of relying on public `Engine` deref.
+- Audited the public facade so `EngineRef`, `EngineInner`, `Table`,
+  `TableHandle`, `Arc<Table>`, and cloneable public runtime-owner handles do
+  not escape through `doradb-storage/src/lib.rs` or public table DML APIs.
+  Public table operations continue through `TableID` statement methods.
+- Updated public rustdoc and design docs for the final weak-handle model,
+  including owner shutdown, abandoned handles, operation-local runtime pinning,
+  table-id DML, dropped-table cleanup, checkpoint/recovery wording, and
+  transaction lifecycle wording. `RUSTDOCFLAGS="-D warnings"` rustdoc passes.
+- Kept examples and public smoke coverage aligned with the final API. The
+  `weak_handle_baseline` example completed successfully with the Phase 8
+  command-line parameters from this task.
+- Refactored the remaining catalog test fixture pattern after implementation:
+  `catalog::index::tests` no longer has a `CreateIndexTestSys` aggregate
+  fixture that stores a full engine/table runtime bundle. The test setup now
+  uses explicit local setup values and focused helper functions.
+- Resolved related backlogs 000061 and 000066 because public strong table and
+  runtime handles no longer escape the engine owner scope. Remaining
+  `Arc<Table>` and `EngineRef` uses are crate-private operation, session,
+  transaction, catalog, recovery, or cleanup pins.
+- Checklist outcome: no required fixes were found before resolve. Reliability,
+  security, performance, feature completeness, documentation, test-only code,
+  and complexity checks passed. No unsafe code was added or modified.
+- Validation:
+  - `cargo fmt -p doradb-storage --check`
+  - `cargo check -p doradb-storage --all-targets`
+  - `cargo clippy -p doradb-storage --all-targets -- -D warnings`
+  - `cargo nextest run -p doradb-storage` passed with 915 tests.
+  - `RUSTDOCFLAGS="-D warnings" cargo doc -p doradb-storage --no-deps`
+  - `cargo run -p doradb-storage --example weak_handle_baseline -- --iterations 100 --scan-rows 1000 --out-dir target/weak-handle-baseline-phase8`
+  - `tools/coverage_focus.rs --path doradb-storage/src/engine.rs --path doradb-storage/src/catalog/index.rs --top-uncovered 15 --write target/coverage/000171-resolve-focus.md`
+    reported 88.12% focused coverage, with `engine.rs` at 95.74% and
+    `catalog/index.rs` at 82.38%.
 
 ## Impacts
 

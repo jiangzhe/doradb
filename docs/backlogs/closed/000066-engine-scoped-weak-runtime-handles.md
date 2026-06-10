@@ -33,3 +33,11 @@ When a backlog item is moved to `docs/backlogs/closed/`, append:
 - Reference: <task/issue/pr reference>
 - Closed At: <YYYY-MM-DD>
 ```
+
+## Close Reason
+
+- Type: implemented
+- Detail: Implemented through the RFC-0019 weak public runtime handle program through Phase 8. Public Engine, Session, Transaction, and Statement facade no longer expose cloneable strong runtime or table owners; operations acquire crate-private runtime pins only for operation scope.
+- Closed By: backlog close
+- Reference: docs/tasks/000171-public-strong-handle-removal-documentation-sync.md; docs/rfcs/0019-weak-public-runtime-handles.md Phase 8
+- Closed At: 2026-06-10
