@@ -13,6 +13,8 @@ pub enum CheckpointCancelReason {
     TableDropped,
     /// Checkpoint was excluded by an active table metadata change.
     TableMetadataChanging,
+    /// Checkpoint was excluded because another checkpoint is already active.
+    CheckpointInProgress,
 }
 
 /// Volatile runtime lifecycle state for a user-table handle.
@@ -430,10 +432,9 @@ impl TableLifecycle {
             if state.metadata_change != MetadataChangePhase::Open {
                 return Err(CheckpointCancelReason::TableMetadataChanging);
             }
-            assert!(
-                !state.root_mutation_active,
-                "concurrent table checkpoint root mutation is not supported"
-            );
+            if state.root_mutation_active {
+                return Err(CheckpointCancelReason::CheckpointInProgress);
+            }
 
             let mut next = state;
             next.root_mutation_active = true;
@@ -840,6 +841,20 @@ mod tests {
             drop(metadata_lease);
             let _root_lease = lifecycle.try_begin_checkpoint_root_mutation().unwrap();
         });
+    }
+
+    #[test]
+    fn test_active_checkpoint_root_mutation_blocks_concurrent_checkpoint() {
+        let lifecycle = TableLifecycle::new();
+        let root_lease = lifecycle.try_begin_checkpoint_root_mutation().unwrap();
+
+        match lifecycle.try_begin_checkpoint_root_mutation() {
+            Ok(_lease) => panic!("concurrent checkpoint root mutation should be cancelled"),
+            Err(reason) => assert_eq!(reason, CheckpointCancelReason::CheckpointInProgress),
+        }
+
+        drop(root_lease);
+        let _root_lease = lifecycle.try_begin_checkpoint_root_mutation().unwrap();
     }
 
     #[test]

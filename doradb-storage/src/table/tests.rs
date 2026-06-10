@@ -53,6 +53,7 @@ use crate::trx::ver_map::RowPageState;
 use crate::trx::{MAX_SNAPSHOT_TS, Transaction};
 use crate::value::{Val, ValKind};
 use error_stack::Report;
+use futures::FutureExt;
 use std::cell::{Cell, RefCell};
 use std::fs::OpenOptions;
 use std::future::Future;
@@ -7913,6 +7914,57 @@ fn test_checkpoint_rechecks_readiness_after_root_mutation_lease() {
         assert_eq!(reason.min_active_sts, reader.sts());
 
         reader.commit().await.unwrap();
+    });
+}
+
+#[test]
+fn test_concurrent_checkpoint_table_returns_in_progress_cancellation() {
+    smol::block_on(async {
+        let temp_dir = TempDir::new().unwrap();
+        let engine = lightweight_test_engine(&temp_dir, "redo_testsys_lightweight").await;
+        let table_id = create_table2_for_test(&engine).await;
+        let mut first_session = engine.new_session().unwrap();
+        wait_checkpoint_ready(table_id, &first_session).await;
+
+        let (entered_tx, entered_rx) = flume::bounded(1);
+        let (release_tx, release_rx) = flume::bounded(1);
+        set_test_checkpoint_after_trx_start_hook(move || async move {
+            entered_tx.send_async(()).await.unwrap();
+            release_rx.recv_async().await.unwrap();
+        });
+
+        let first_outcome = {
+            let first_checkpoint = first_session.checkpoint_table(table_id).fuse();
+            futures::pin_mut!(first_checkpoint);
+            let checkpoint_entered = entered_rx.recv_async().fuse();
+            futures::pin_mut!(checkpoint_entered);
+            futures::select! {
+                res = first_checkpoint => {
+                    panic!("first checkpoint completed before the concurrency hook: {res:?}");
+                }
+                res = checkpoint_entered => {
+                    res.unwrap();
+                }
+            }
+
+            let mut second_session = engine.new_session().unwrap();
+            let outcome = second_session.checkpoint_table(table_id).await.unwrap();
+            assert_eq!(
+                outcome,
+                CheckpointOutcome::Cancelled {
+                    reason: CheckpointCancelReason::CheckpointInProgress,
+                }
+            );
+            assert!(!second_session.in_trx().unwrap());
+
+            release_tx.send_async(()).await.unwrap();
+            first_checkpoint.await.unwrap()
+        };
+        assert!(
+            matches!(first_outcome, CheckpointOutcome::Published { .. }),
+            "first checkpoint should publish after the competing checkpoint cancels: {first_outcome:?}"
+        );
+        assert!(!first_session.in_trx().unwrap());
     });
 }
 
