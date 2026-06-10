@@ -1,7 +1,7 @@
 ---
 id: 0019
 title: Weak Public Runtime Handles
-status: proposal
+status: implemented
 tags: [storage-engine, lifecycle, public-api, weak-handles, shutdown]
 created: 2026-05-29
 github_issue: 675
@@ -631,8 +631,10 @@ code is visible.
   - Task Issue: `#673`
   - Phase Status: done
   - Implementation Summary: Removed the public cloneable EngineRef boundary, kept transitional EngineRef access crate-private, preserved synchronous Engine shutdown, updated public smoke tests and weak handle baseline, and deferred async shutdown policy to backlog 000114. [Task Resolve Sync: docs/tasks/000164-engine-handle-public-api-boundary.md @ 2026-05-31]
-  - Related Backlogs:
-    - `docs/backlogs/000114-evaluate-async-engine-shutdown-api.md`
+  - Deferred Follow-ups:
+    - `docs/backlogs/000114-evaluate-async-engine-shutdown-api.md` remains open
+      for a broader async shutdown API evaluation; RFC-0019 completed with
+      synchronous `shutdown()` plus weak-handle-aware runtime drain behavior.
 
 - **Phase 3: Session Handle Registry Ownership**
   - Scope: Move public session API to a non-cloneable weak `SessionHandle` backed
@@ -665,10 +667,16 @@ code is visible.
   - Task Issue: `#677`
   - Phase Status: done
   - Implementation Summary: Implemented RFC-0019 Phase 3 session registry ownership in the storage crate. [Task Resolve Sync: docs/tasks/000165-session-handle-registry-ownership.md @ 2026-06-02]
-  - Related Backlogs:
-    - `docs/backlogs/000113-transaction-cancellation-safety.md`
-    - `docs/backlogs/000115-explicit-session-lock-cache.md`
-    - `docs/backlogs/000116-general-session-runtime-pin-ownership.md`
+  - Deferred Follow-ups:
+    - `docs/backlogs/000113-transaction-cancellation-safety.md` remains open
+      for broader async statement and terminal-operation cancellation semantics
+      beyond the weak-handle abandonment invariants implemented by this RFC.
+    - `docs/backlogs/000115-explicit-session-lock-cache.md` remains open as a
+      session-lock cleanup optimization outside the weak public handle program.
+    - `docs/backlogs/000116-general-session-runtime-pin-ownership.md` remains
+      open for a broader reusable runtime-pin ownership model; RFC-0019 fixed
+      the concrete production pin gaps required for weak sessions and
+      transactions.
 
 - **Phase 4: Transaction Terminal Ownership Preparation**
   - Scope: Prepare transaction lifecycle ownership for the future weak
@@ -883,33 +891,38 @@ code is visible.
 
 ## Open Questions
 
-- In Phase 7, what is the least disruptive final public table API shape:
-  explicit `TableHandle`, table-id-based statement methods, statement-local
-  binding, preserving existing borrowed-`&Table` statement methods behind an
-  internal binding boundary, or a hybrid where each pays one operation-boundary
-  lookup?
-- In Phase 6, should abandoned transaction cleanup run on a dedicated cleanup
-  worker, an existing transaction-system worker, or an async task owned by the
-  engine shutdown/session registry?
-- What exact engine shutdown policy should apply to active abandoned
-  transactions: wait for rollback cleanup, return retryable busy, or provide a
-  forced shutdown mode? This RFC requires the behavior to be explicit; the final
-  policy can be selected in Phase 6.
-- What benchmark threshold should be used for "obvious" performance regression
-  per phase? The RFC requires focused comparison and no new hot-path global
-  synchronization; each phase should choose the concrete benchmark set and
-  acceptance threshold for its touched paths.
+No blocking open questions remain for RFC-0019 implementation.
+
+- Phase 7 selected table-id public statement access with internal catalog-owned
+  table resolution and weak per-session/per-transaction table caches.
+- Phase 6 selected registry-driven abandoned transaction cleanup backed by the
+  transaction-system cleanup queue/worker.
+- Engine shutdown behavior is synchronous: `try_shutdown()` reports busy while
+  live runtime work remains, and blocking `shutdown()` waits for active handles
+  to commit, roll back, or abandon, then drains abandoned cleanup before
+  component teardown.
+- Performance validation remained phase-local. Implemented phases used focused
+  weak-handle baseline/example runs, full validation, and coverage checks while
+  preserving the RFC-wide rule that registry/admission work is paid at public
+  operation boundaries rather than row/index/buffer hot loops.
 
 ## Future Work
 
 - Session-drain and forced-shutdown policy beyond what is required to make weak
   handles correct may remain a separate shutdown-lifecycle task if it grows past
   this RFC's API-lifecycle scope.
+- Async engine shutdown API evaluation remains tracked by
+  `docs/backlogs/000114-evaluate-async-engine-shutdown-api.md`.
+- Session-local explicit lock-cache optimization remains tracked by
+  `docs/backlogs/000115-explicit-session-lock-cache.md`.
 - Detailed statement cancellation and broader async transaction cancellation
   semantics remain tracked by [B3] unless the Phase 4 task explicitly resolves
   them. RFC-0019 requires Phase 4 to define the minimum terminal-operation
   ownership needed before Phase 5 moves transaction state into stable entries
   and Phase 6 exposes weak transaction handles.
+- A broader reusable session runtime-pin ownership model remains tracked by
+  [B4]. RFC-0019 fixed the concrete runtime-pin gaps required for the weak
+  session and transaction handle migration.
 - Generation-aware table-id reuse remains out of scope. If table ids become
   reusable in the future, weak handle identity must include generation and the
   table-id reuse RFC must update this contract.
