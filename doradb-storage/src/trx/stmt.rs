@@ -685,7 +685,7 @@ pub(crate) mod tests {
         let engine_ref = engine.new_ref().unwrap();
         let session_id = engine_ref.next_session_id();
         session_tests::create_test_transaction(
-            &engine.session_registry,
+            &engine.inner().session_registry,
             engine_ref,
             session_id,
             MIN_ACTIVE_TRX_ID + sts.as_u64(),
@@ -772,7 +772,7 @@ pub(crate) mod tests {
                 Some(FatalError::RollbackAccess)
             );
             assert!(sys_tests::retains_statement_row_undo(
-                &engine.trx_sys,
+                &engine.inner().trx_sys,
                 TableID::new(99_999_999),
                 RowID::new(24)
             ));
@@ -780,6 +780,7 @@ pub(crate) mod tests {
             assert_eq!(lock_entry_count(&engine, trx_owner), 0);
             assert!(
                 engine
+                    .inner()
                     .trx_sys
                     .storage_poison_error()
                     .as_ref()

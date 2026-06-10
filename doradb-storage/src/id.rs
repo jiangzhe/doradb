@@ -339,7 +339,7 @@ impl_id! {
     /// Runtime buffer-managed page identity.
     ///
     /// This id is reserved for mutable or cached pages owned by the buffer layer.
-    /// Persisted fixed-size file units use [`BlockID`] instead.
+    /// Persisted fixed-size file units use `BlockID` instead.
     pub struct PageID;
     methods pub
 }

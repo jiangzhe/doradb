@@ -2486,6 +2486,7 @@ pub(crate) mod tests {
         .unwrap();
         assert!(
             engine
+                .inner()
                 .table_fs
                 .catalog_mtb_file_path()
                 .starts_with(temp_dir.path().to_str().unwrap())

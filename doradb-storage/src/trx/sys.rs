@@ -973,7 +973,7 @@ pub(crate) mod tests {
                 .await
                 .unwrap();
 
-            let trx_sys = engine.trx_sys.clone();
+            let trx_sys = engine.inner().trx_sys.clone();
             let blocked = trx_sys.storage_poison_err.lock();
             let started = Arc::new(AtomicBool::new(false));
             let finished = Arc::new(AtomicBool::new(false));
@@ -1045,7 +1045,7 @@ pub(crate) mod tests {
                 .await
                 .unwrap();
 
-            let trx_sys = engine.trx_sys.clone();
+            let trx_sys = engine.inner().trx_sys.clone();
             let barrier = Arc::new(Barrier::new(3));
 
             let worker_a_barrier = Arc::clone(&barrier);

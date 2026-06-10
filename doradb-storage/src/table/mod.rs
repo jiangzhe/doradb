@@ -166,7 +166,7 @@ impl Table {
     /// Consume and destroy all in-memory runtime state for a dropped table.
     ///
     /// At runtime this is called by purge after the table has been logically
-    /// removed from catalog and no stale `Arc<Table>` handles remain. Recovery
+    /// removed from catalog and no crate-private runtime pins remain. Recovery
     /// can also use it before normal admission opens. Any runtime error means
     /// purge may have partially traversed owned memory/index structures, so the
     /// purge caller treats failure as fatal storage poison rather than retrying

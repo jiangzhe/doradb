@@ -1489,7 +1489,7 @@ mod tests {
     use crate::buffer::PoolRole;
     use crate::catalog::{
         ActiveIndexSpec, ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexSpec,
-        TableMetadata,
+        TableMetadata, tests::table2,
     };
     use crate::conf::{EngineConfig, EvictableBufferPoolConfig, FileSystemConfig, TrxSysConfig};
     use crate::engine::Engine;
@@ -1685,28 +1685,18 @@ mod tests {
     #[test]
     fn test_create_index_builds_non_unique_hot_runtime() {
         smol::block_on(async {
-            let sys = CreateIndexTestSys::new_lightweight_evictable().await;
-            let table_id = sys.table.table_id();
-            let mut session = sys.new_session().unwrap();
-            let row1 = insert_one_row(
-                &sys.table,
-                &mut session,
-                vec![Val::from(1), Val::from("alpha")],
-            )
-            .await;
-            let _row2 = insert_one_row(
-                &sys.table,
-                &mut session,
-                vec![Val::from(2), Val::from("beta")],
-            )
-            .await;
-            let row3 = insert_one_row(
-                &sys.table,
-                &mut session,
-                vec![Val::from(3), Val::from("alpha")],
-            )
-            .await;
-            let old_generation = sys.table.layout_snapshot().generation();
+            let temp_dir = TempDir::new().unwrap();
+            let engine = lightweight_test_engine(&temp_dir, "create_index_lightweight").await;
+            let table_id = table2(&engine).await;
+            let table = table_for_internal_assertion(&engine, table_id);
+            let mut session = engine.new_session().unwrap();
+            let row1 =
+                insert_one_row(&table, &mut session, vec![Val::from(1), Val::from("alpha")]).await;
+            let _row2 =
+                insert_one_row(&table, &mut session, vec![Val::from(2), Val::from("beta")]).await;
+            let row3 =
+                insert_one_row(&table, &mut session, vec![Val::from(3), Val::from("alpha")]).await;
+            let old_generation = table.layout_snapshot().generation();
 
             let index_no = session
                 .create_index(
@@ -1717,12 +1707,11 @@ mod tests {
                 .unwrap();
 
             assert_eq!(index_no, 1);
-            assert_eq!(sys.table.metadata().idx.next_index_no(), 2);
-            assert!(sys.table.metadata().idx.index_spec(1).is_some());
-            assert_eq!(sys.table.layout_snapshot().generation(), old_generation + 1);
-            assert_eq!(active_secondary_root(&sys.table, 1), SUPER_BLOCK_ID);
-            let table_object = sys
-                .engine
+            assert_eq!(table.metadata().idx.next_index_no(), 2);
+            assert!(table.metadata().idx.index_spec(1).is_some());
+            assert_eq!(table.layout_snapshot().generation(), old_generation + 1);
+            assert_eq!(active_secondary_root(&table, 1), SUPER_BLOCK_ID);
+            let table_object = engine
                 .catalog()
                 .storage
                 .tables()
@@ -1732,8 +1721,8 @@ mod tests {
                 .unwrap();
             assert_eq!(table_object.next_index_no, 2);
 
-            let layout = sys.table.layout_snapshot();
-            let root = active_secondary_root(&sys.table, 1);
+            let layout = table.layout_snapshot();
+            let root = active_secondary_root(&table, 1);
             let mut rows = non_unique_runtime_lookup(
                 &layout,
                 root,
@@ -1745,12 +1734,8 @@ mod tests {
             rows.sort_unstable();
             assert_eq!(rows, vec![row1, row3]);
 
-            let row4 = insert_one_row(
-                &sys.table,
-                &mut session,
-                vec![Val::from(4), Val::from("alpha")],
-            )
-            .await;
+            let row4 =
+                insert_one_row(&table, &mut session, vec![Val::from(4), Val::from("alpha")]).await;
             let mut rows = non_unique_runtime_lookup(
                 &layout,
                 root,
@@ -1767,15 +1752,17 @@ mod tests {
     #[test]
     fn test_create_index_builds_non_unique_cold_disk_tree() {
         smol::block_on(async {
-            let sys = CreateIndexTestSys::new_lightweight_evictable().await;
-            let table_id = sys.table.table_id();
-            let mut session = sys.new_session().unwrap();
-            insert_rows(&sys, &mut session, 10, 8, "cold").await;
+            let temp_dir = TempDir::new().unwrap();
+            let engine = lightweight_test_engine(&temp_dir, "create_index_lightweight").await;
+            let table_id = table2(&engine).await;
+            let table = table_for_internal_assertion(&engine, table_id);
+            let mut session = engine.new_session().unwrap();
+            insert_rows(&table, &mut session, 10, 8, "cold").await;
             session
-                .freeze_table(sys.table.table_id(), usize::MAX)
+                .freeze_table(table.table_id(), usize::MAX)
                 .await
                 .unwrap();
-            checkpoint_published(&sys.table, &mut session).await;
+            checkpoint_published(&table, &mut session).await;
 
             let index_no = session
                 .create_index(
@@ -1786,13 +1773,10 @@ mod tests {
                 .unwrap();
 
             assert_eq!(index_no, 1);
-            assert_ne!(active_secondary_root(&sys.table, 1), SUPER_BLOCK_ID);
-            let mut rows = non_unique_disk_tree_prefix_scan(
-                &sys.table,
-                &session.pool_guards(),
-                &name_key("cold"),
-            )
-            .await;
+            assert_ne!(active_secondary_root(&table, 1), SUPER_BLOCK_ID);
+            let mut rows =
+                non_unique_disk_tree_prefix_scan(&table, &session.pool_guards(), &name_key("cold"))
+                    .await;
             rows.sort_unstable();
             assert_eq!(rows.len(), 8);
         });
@@ -1801,15 +1785,17 @@ mod tests {
     #[test]
     fn test_create_index_retains_old_root_until_purge_horizon() {
         smol::block_on(async {
-            let sys = CreateIndexTestSys::new_lightweight_evictable().await;
-            let table_id = sys.table.table_id();
-            let retained_root_ptr = sys.table.file().active_root_unchecked() as *const _ as usize;
+            let temp_dir = TempDir::new().unwrap();
+            let engine = lightweight_test_engine(&temp_dir, "create_index_lightweight").await;
+            let table_id = table2(&engine).await;
+            let table = table_for_internal_assertion(&engine, table_id);
+            let retained_root_ptr = table.file().active_root_unchecked() as *const _ as usize;
             let drop_count_before = old_root_drop_count(retained_root_ptr);
 
-            let mut read_session = sys.new_session().unwrap();
+            let mut read_session = engine.new_session().unwrap();
             let read_trx = read_session.begin_trx().unwrap();
 
-            let mut session = sys.new_session().unwrap();
+            let mut session = engine.new_session().unwrap();
             session
                 .create_index(
                     table_id,
@@ -1817,7 +1803,7 @@ mod tests {
                 )
                 .await
                 .unwrap();
-            sys.engine.trx_sys.request_table_root_retention_purge();
+            engine.inner().trx_sys.request_table_root_retention_purge();
 
             for _ in 0..10 {
                 smol::Timer::after(Duration::from_millis(10)).await;
@@ -1829,7 +1815,7 @@ mod tests {
             }
 
             read_trx.commit().await.unwrap();
-            sys.engine.trx_sys.request_table_root_retention_purge();
+            engine.inner().trx_sys.request_table_root_retention_purge();
             for _ in 0..100 {
                 if old_root_drop_count(retained_root_ptr) > drop_count_before {
                     return;
@@ -1843,23 +1829,15 @@ mod tests {
     #[test]
     fn test_create_unique_index_rejects_duplicate_hot_rows_without_publish() {
         smol::block_on(async {
-            let sys = CreateIndexTestSys::new_lightweight_evictable().await;
-            let table_id = sys.table.table_id();
-            let mut session = sys.new_session().unwrap();
-            insert_one_row(
-                &sys.table,
-                &mut session,
-                vec![Val::from(1), Val::from("dup")],
-            )
-            .await;
-            insert_one_row(
-                &sys.table,
-                &mut session,
-                vec![Val::from(2), Val::from("dup")],
-            )
-            .await;
-            let root_before = sys.table.file().active_root_unchecked().clone();
-            let old_generation = sys.table.layout_snapshot().generation();
+            let temp_dir = TempDir::new().unwrap();
+            let engine = lightweight_test_engine(&temp_dir, "create_index_lightweight").await;
+            let table_id = table2(&engine).await;
+            let table = table_for_internal_assertion(&engine, table_id);
+            let mut session = engine.new_session().unwrap();
+            insert_one_row(&table, &mut session, vec![Val::from(1), Val::from("dup")]).await;
+            insert_one_row(&table, &mut session, vec![Val::from(2), Val::from("dup")]).await;
+            let root_before = table.file().active_root_unchecked().clone();
+            let old_generation = table.layout_snapshot().generation();
 
             let err = session
                 .create_index(
@@ -1870,37 +1848,30 @@ mod tests {
                 .unwrap_err();
 
             assert_eq!(err.operation_error(), Some(OperationError::DuplicateKey));
-            assert_root_metadata_unchanged(&root_before, &sys.table);
-            assert_eq!(sys.table.layout_snapshot().generation(), old_generation);
-            assert_eq!(sys.table.metadata().idx.next_index_no(), 1);
-            assert!(sys.table.metadata().idx.index_spec(1).is_none());
+            assert_root_metadata_unchanged(&root_before, &table);
+            assert_eq!(table.layout_snapshot().generation(), old_generation);
+            assert_eq!(table.metadata().idx.next_index_no(), 1);
+            assert!(table.metadata().idx.index_spec(1).is_none());
         });
     }
 
     #[test]
     fn test_create_unique_index_skips_committed_cold_delete_marker() {
         smol::block_on(async {
-            let sys = CreateIndexTestSys::new_lightweight_evictable().await;
-            let table_id = sys.table.table_id();
-            let mut session = sys.new_session().unwrap();
-            let row1 = insert_one_row(
-                &sys.table,
-                &mut session,
-                vec![Val::from(1), Val::from("dup")],
-            )
-            .await;
-            insert_one_row(
-                &sys.table,
-                &mut session,
-                vec![Val::from(2), Val::from("dup")],
-            )
-            .await;
+            let temp_dir = TempDir::new().unwrap();
+            let engine = lightweight_test_engine(&temp_dir, "create_index_lightweight").await;
+            let table_id = table2(&engine).await;
+            let table = table_for_internal_assertion(&engine, table_id);
+            let mut session = engine.new_session().unwrap();
+            let row1 =
+                insert_one_row(&table, &mut session, vec![Val::from(1), Val::from("dup")]).await;
+            insert_one_row(&table, &mut session, vec![Val::from(2), Val::from("dup")]).await;
             session
-                .freeze_table(sys.table.table_id(), usize::MAX)
+                .freeze_table(table.table_id(), usize::MAX)
                 .await
                 .unwrap();
-            checkpoint_published(&sys.table, &mut session).await;
-            sys.new_trx_delete(&mut session, &single_key(2)).await;
+            checkpoint_published(&table, &mut session).await;
+            delete_one_row(&table, &mut session, &single_key(2)).await;
 
             let index_no = session
                 .create_index(
@@ -1912,8 +1883,7 @@ mod tests {
 
             assert_eq!(index_no, 1);
             assert_eq!(
-                unique_runtime_lookup(&sys.table, 1, &session.pool_guards(), &[Val::from("dup")])
-                    .await,
+                unique_runtime_lookup(&table, 1, &session.pool_guards(), &[Val::from("dup")]).await,
                 Some((row1, false))
             );
         });
@@ -1922,9 +1892,10 @@ mod tests {
     #[test]
     fn test_create_index_rejects_active_transaction() {
         smol::block_on(async {
-            let sys = CreateIndexTestSys::new_lightweight_evictable().await;
-            let table_id = sys.table.table_id();
-            let mut session = sys.new_session().unwrap();
+            let temp_dir = TempDir::new().unwrap();
+            let engine = lightweight_test_engine(&temp_dir, "create_index_lightweight").await;
+            let table_id = table2(&engine).await;
+            let mut session = engine.new_session().unwrap();
             let trx = session.begin_trx().unwrap();
 
             let err = session
@@ -2045,7 +2016,7 @@ mod tests {
             assert_eq!(catalog_indexes[0].index_no, 0);
             engine
                 .catalog()
-                .checkpoint_now(&engine.trx_sys)
+                .checkpoint_now(&engine.inner().trx_sys)
                 .await
                 .unwrap();
             drop(session);
@@ -2081,15 +2052,12 @@ mod tests {
     #[test]
     fn test_drop_unique_and_primary_indexes_remove_uniqueness_enforcement() {
         smol::block_on(async {
-            let sys = CreateIndexTestSys::new_lightweight_evictable().await;
-            let table_id = sys.table.table_id();
-            let mut session = sys.new_session().unwrap();
-            insert_one_row(
-                &sys.table,
-                &mut session,
-                vec![Val::from(1), Val::from("same")],
-            )
-            .await;
+            let temp_dir = TempDir::new().unwrap();
+            let engine = lightweight_test_engine(&temp_dir, "create_index_lightweight").await;
+            let table_id = table2(&engine).await;
+            let table = table_for_internal_assertion(&engine, table_id);
+            let mut session = engine.new_session().unwrap();
+            insert_one_row(&table, &mut session, vec![Val::from(1), Val::from("same")]).await;
 
             assert_eq!(
                 session
@@ -2102,16 +2070,11 @@ mod tests {
                 1
             );
             session.drop_index(table_id, 1).await.unwrap();
-            insert_one_row(
-                &sys.table,
-                &mut session,
-                vec![Val::from(2), Val::from("same")],
-            )
-            .await;
+            insert_one_row(&table, &mut session, vec![Val::from(2), Val::from("same")]).await;
 
             session.drop_index(table_id, 0).await.unwrap();
             insert_one_row(
-                &sys.table,
+                &table,
                 &mut session,
                 vec![Val::from(1), Val::from("different")],
             )
@@ -2122,38 +2085,42 @@ mod tests {
     #[test]
     fn test_drop_index_rejects_active_transaction_and_missing_slots() {
         smol::block_on(async {
-            let sys = CreateIndexTestSys::new_lightweight_evictable().await;
-            let table_id = sys.table.table_id();
-            let mut session = sys.new_session().unwrap();
+            let temp_dir = TempDir::new().unwrap();
+            let engine = lightweight_test_engine(&temp_dir, "create_index_lightweight").await;
+            let table_id = table2(&engine).await;
+            let table = table_for_internal_assertion(&engine, table_id);
+            let mut session = engine.new_session().unwrap();
 
             let trx = session.begin_trx().unwrap();
             let err = session.drop_index(table_id, 0).await.unwrap_err();
             assert_eq!(err.operation_error(), Some(OperationError::NotSupported));
             trx.rollback().await.unwrap();
 
-            let root_before = sys.table.file().active_root_unchecked().clone();
-            let old_generation = sys.table.layout_snapshot().generation();
+            let root_before = table.file().active_root_unchecked().clone();
+            let old_generation = table.layout_snapshot().generation();
             let err = session.drop_index(table_id, 1).await.unwrap_err();
             assert_eq!(err.operation_error(), Some(OperationError::IndexNotFound));
-            assert_root_metadata_unchanged(&root_before, &sys.table);
-            assert_eq!(sys.table.layout_snapshot().generation(), old_generation);
+            assert_root_metadata_unchanged(&root_before, &table);
+            assert_eq!(table.layout_snapshot().generation(), old_generation);
 
             session.drop_index(table_id, 0).await.unwrap();
-            let root_before = sys.table.file().active_root_unchecked().clone();
-            let old_generation = sys.table.layout_snapshot().generation();
+            let root_before = table.file().active_root_unchecked().clone();
+            let old_generation = table.layout_snapshot().generation();
             let err = session.drop_index(table_id, 0).await.unwrap_err();
             assert_eq!(err.operation_error(), Some(OperationError::IndexNotFound));
-            assert_root_metadata_unchanged(&root_before, &sys.table);
-            assert_eq!(sys.table.layout_snapshot().generation(), old_generation);
+            assert_root_metadata_unchanged(&root_before, &table);
+            assert_eq!(table.layout_snapshot().generation(), old_generation);
         });
     }
 
     #[test]
     fn test_drop_index_runtime_install_retires_removed_runtime() {
         smol::block_on(async {
-            let sys = CreateIndexTestSys::new_lightweight_evictable().await;
-            let table_id = sys.table.table_id();
-            let mut session = sys.new_session().unwrap();
+            let temp_dir = TempDir::new().unwrap();
+            let engine = lightweight_test_engine(&temp_dir, "create_index_lightweight").await;
+            let table_id = table2(&engine).await;
+            let table = table_for_internal_assertion(&engine, table_id);
+            let mut session = engine.new_session().unwrap();
             assert_eq!(
                 session
                     .create_index(
@@ -2164,22 +2131,22 @@ mod tests {
                     .unwrap(),
                 1
             );
-            let old_layout = sys.table.layout_snapshot();
+            let old_layout = table.layout_snapshot();
             let old_generation = old_layout.generation();
             let old_pk = Arc::clone(old_layout.secondary_indexes()[0].as_ref().unwrap());
 
             session.drop_index(table_id, 1).await.unwrap();
 
-            let installed = sys.table.layout_snapshot();
+            let installed = table.layout_snapshot();
             assert_eq!(installed.generation(), old_generation + 1);
             assert!(installed.secondary_indexes()[1].is_none());
             assert!(Arc::ptr_eq(
                 installed.secondary_indexes()[0].as_ref().unwrap(),
                 &old_pk
             ));
-            assert!(sys.table.has_retired_secondary_indexes());
+            assert!(table.has_retired_secondary_indexes());
             assert_eq!(
-                sys.table
+                table
                     .cleanup_retired_secondary_indexes(&session.pool_guards())
                     .await
                     .unwrap(),
@@ -2187,58 +2154,28 @@ mod tests {
             );
             drop(old_layout);
             assert_eq!(
-                sys.table
+                table
                     .cleanup_retired_secondary_indexes(&session.pool_guards())
                     .await
                     .unwrap(),
                 1
             );
-            assert!(!sys.table.has_retired_secondary_indexes());
+            assert!(!table.has_retired_secondary_indexes());
         });
     }
 
-    struct CreateIndexTestSys {
-        table: Arc<Table>,
-        engine: Engine,
-        _temp_dir: TempDir,
+    async fn lightweight_test_engine(temp_dir: &TempDir, log_file_stem: &str) -> Engine {
+        lightweight_test_engine_config(temp_dir.path().to_path_buf(), log_file_stem)
+            .build()
+            .await
+            .unwrap()
     }
 
-    impl CreateIndexTestSys {
-        async fn new_lightweight_evictable() -> Self {
-            use crate::catalog::tests::table2;
-
-            let temp_dir = TempDir::new().unwrap();
-            let main_dir = temp_dir.path().to_path_buf();
-            let engine = lightweight_test_engine_config(main_dir, "create_index_lightweight")
-                .build()
-                .await
-                .unwrap();
-            let table_id = table2(&engine).await;
-            let table = engine.catalog().get_table(table_id).await.unwrap();
-            Self {
-                engine,
-                table,
-                _temp_dir: temp_dir,
-            }
-        }
-
-        fn new_session(&self) -> Result<Session> {
-            self.engine.new_session()
-        }
-
-        async fn new_trx_delete(&self, session: &mut Session, key: &SelectKey) {
-            let mut trx = session.begin_trx().unwrap();
-            let delete = trx
-                .exec(async |stmt| {
-                    stmt.table_delete_unique_mvcc(self.table.table_id(), key, false)
-                        .await
-                })
-                .await;
-            if !matches!(delete, Ok(DeleteMvcc::Deleted)) {
-                panic!("delete should succeed: {delete:?}");
-            }
-            trx.commit().await.unwrap();
-        }
+    fn table_for_internal_assertion(engine: &Engine, table_id: TableID) -> Arc<Table> {
+        engine
+            .catalog()
+            .get_table_now(table_id)
+            .expect("test table should exist")
     }
 
     fn lightweight_test_engine_config(
@@ -2285,18 +2222,26 @@ mod tests {
         row_id
     }
 
-    async fn insert_rows(
-        sys: &CreateIndexTestSys,
-        session: &mut Session,
-        start: i32,
-        count: i32,
-        name: &str,
-    ) {
+    async fn insert_rows(table: &Table, session: &mut Session, start: i32, count: i32, name: &str) {
         let mut trx = session.begin_trx().unwrap();
         for i in 0..count {
             let insert = vec![Val::from(start + i), Val::from(name)];
-            let res = trx_insert_row(&mut trx, &sys.table, insert).await;
+            let res = trx_insert_row(&mut trx, table, insert).await;
             assert!(res.is_ok());
+        }
+        trx.commit().await.unwrap();
+    }
+
+    async fn delete_one_row(table: &Table, session: &mut Session, key: &SelectKey) {
+        let mut trx = session.begin_trx().unwrap();
+        let delete = trx
+            .exec(async |stmt| {
+                stmt.table_delete_unique_mvcc(table.table_id(), key, false)
+                    .await
+            })
+            .await;
+        if !matches!(delete, Ok(DeleteMvcc::Deleted)) {
+            panic!("delete should succeed: {delete:?}");
         }
         trx.commit().await.unwrap();
     }
