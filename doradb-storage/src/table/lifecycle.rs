@@ -2,7 +2,7 @@ use crate::error::{Error, InternalError, OperationError, Result};
 use crate::id::TableID;
 use error_stack::Report;
 use event_listener::{Event, listener};
-use parking_lot::Mutex;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 /// Normal checkpoint cancellation reasons for user-table checkpoint.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -27,17 +27,26 @@ pub(crate) enum TableLifecycleState {
     Dropped = 2,
 }
 
+#[repr(u8)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PublishGateState {
-    Open,
-    Publishing,
-    ClosingPublishing,
-    Closed,
+    Open = 0,
+    Publishing = 1,
+    ClosingPublishing = 2,
+    Closed = 3,
+}
+
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MetadataChangePhase {
+    Open = 0,
+    Pending = 1,
+    Active = 2,
 }
 
 /// Volatile lifecycle, checkpoint, and metadata-change gates for one user table.
 ///
-/// This is one mutex-protected state machine with three domains that must stay
+/// This is one atomically packed state machine with three domains that must stay
 /// coherent:
 ///
 /// * table liveness: `Live -> Dropping -> Dropped`. This is terminal and never
@@ -76,11 +85,23 @@ enum PublishGateState {
 ///   drop must drain an active publish lease. Runtime removal completes with
 ///   `Dropping/Closed -> Dropped/Closed`.
 pub(crate) struct TableLifecycle {
-    state: Mutex<TableLifecycleInner>,
+    state: AtomicU32,
     changed: Event,
 }
 
-#[derive(Debug)]
+const TERMINAL_MASK: u32 = 0b11;
+const PUBLISH_SHIFT: u32 = 2;
+const PUBLISH_MASK: u32 = 0b11 << PUBLISH_SHIFT;
+const METADATA_CHANGE_SHIFT: u32 = 4;
+const METADATA_CHANGE_MASK: u32 = 0b11 << METADATA_CHANGE_SHIFT;
+const ROOT_MUTATION_ACTIVE_BIT: u32 = 1 << 6;
+const STATE_MASK: u32 =
+    TERMINAL_MASK | PUBLISH_MASK | METADATA_CHANGE_MASK | ROOT_MUTATION_ACTIVE_BIT;
+const INITIAL_STATE: u32 = (TableLifecycleState::Live as u32)
+    | ((PublishGateState::Open as u32) << PUBLISH_SHIFT)
+    | ((MetadataChangePhase::Open as u32) << METADATA_CHANGE_SHIFT);
+
+#[derive(Clone, Copy, Debug)]
 struct TableLifecycleInner {
     /// Terminal liveness visible to foreground operations and DDL.
     terminal: TableLifecycleState,
@@ -92,19 +113,54 @@ struct TableLifecycleInner {
     root_mutation_active: bool,
 }
 
-impl Default for TableLifecycleInner {
+impl TableLifecycleInner {
     #[inline]
-    fn default() -> Self {
+    fn decode(raw: u32) -> Self {
+        debug_assert_eq!(
+            raw & !STATE_MASK,
+            0,
+            "table lifecycle atomic state contains unknown bits: {raw:#x}"
+        );
+        let terminal = match raw & TERMINAL_MASK {
+            0 => TableLifecycleState::Live,
+            1 => TableLifecycleState::Dropping,
+            2 => TableLifecycleState::Dropped,
+            _ => unreachable!("invalid table lifecycle terminal bits"),
+        };
+        let publish = match (raw & PUBLISH_MASK) >> PUBLISH_SHIFT {
+            0 => PublishGateState::Open,
+            1 => PublishGateState::Publishing,
+            2 => PublishGateState::ClosingPublishing,
+            3 => PublishGateState::Closed,
+            _ => unreachable!("invalid table lifecycle publish bits"),
+        };
+        let metadata_change = match (raw & METADATA_CHANGE_MASK) >> METADATA_CHANGE_SHIFT {
+            0 => MetadataChangePhase::Open,
+            1 => MetadataChangePhase::Pending,
+            2 => MetadataChangePhase::Active,
+            _ => unreachable!("invalid table lifecycle metadata-change bits"),
+        };
+        let root_mutation_active = raw & ROOT_MUTATION_ACTIVE_BIT != 0;
         Self {
-            terminal: TableLifecycleState::Live,
-            publish: PublishGateState::Open,
-            metadata_change: MetadataChangePhase::Open,
-            root_mutation_active: false,
+            terminal,
+            publish,
+            metadata_change,
+            root_mutation_active,
         }
     }
-}
 
-impl TableLifecycleInner {
+    #[inline]
+    fn encode(self) -> u32 {
+        (self.terminal as u32)
+            | ((self.publish as u32) << PUBLISH_SHIFT)
+            | ((self.metadata_change as u32) << METADATA_CHANGE_SHIFT)
+            | if self.root_mutation_active {
+                ROOT_MUTATION_ACTIVE_BIT
+            } else {
+                0
+            }
+    }
+
     #[inline]
     fn debug_assert_valid(&self, operation: &'static str) {
         debug_assert!(
@@ -145,16 +201,30 @@ impl TableLifecycle {
     #[inline]
     pub(crate) fn new() -> Self {
         Self {
-            state: Mutex::new(TableLifecycleInner::default()),
+            state: AtomicU32::new(INITIAL_STATE),
             changed: Event::new(),
         }
+    }
+
+    #[inline]
+    fn load_state(&self, operation: &'static str) -> (u32, TableLifecycleInner) {
+        let raw = self.state.load(Ordering::Acquire);
+        let state = TableLifecycleInner::decode(raw);
+        state.debug_assert_valid(operation);
+        (raw, state)
+    }
+
+    #[inline]
+    fn compare_exchange_state(&self, current: u32, next: TableLifecycleInner) -> bool {
+        self.state
+            .compare_exchange(current, next.encode(), Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
     }
 
     /// Returns the current externally visible lifecycle state.
     #[inline]
     pub(crate) fn state(&self) -> TableLifecycleState {
-        let state = self.state.lock();
-        state.debug_assert_valid("read state");
+        let (_, state) = self.load_state("read state");
         state.terminal
     }
 
@@ -176,87 +246,98 @@ impl TableLifecycle {
     /// This marks the handle as dropping, closes new checkpoint publication
     /// admission, and waits for any already-held publish lease to drain.
     pub(crate) async fn begin_drop(&self, table_id: TableID) -> Result<()> {
-        {
-            let mut state = self.state.lock();
-            state.debug_assert_valid("begin drop enter");
+        loop {
+            let (raw, state) = self.load_state("begin drop enter");
             if state.terminal != TableLifecycleState::Live {
                 return Err(drop_not_live_err(table_id, "begin drop", state.terminal));
             }
             if state.metadata_change == MetadataChangePhase::Active {
                 return Err(begin_drop_metadata_active_err(table_id));
             }
-            state.terminal = TableLifecycleState::Dropping;
-            match state.publish {
+
+            let mut next = state;
+            next.terminal = TableLifecycleState::Dropping;
+            let wait_for_publish = match state.publish {
                 PublishGateState::Open => {
-                    state.publish = PublishGateState::Closed;
-                    state.debug_assert_valid("begin drop close open publish gate");
-                    drop(state);
-                    self.changed.notify(usize::MAX);
-                    return Ok(());
+                    next.publish = PublishGateState::Closed;
+                    next.debug_assert_valid("begin drop close open publish gate");
+                    false
                 }
                 PublishGateState::Publishing => {
-                    state.publish = PublishGateState::ClosingPublishing;
-                    state.debug_assert_valid("begin drop wait for active publish lease");
+                    next.publish = PublishGateState::ClosingPublishing;
+                    next.debug_assert_valid("begin drop wait for active publish lease");
+                    true
                 }
                 PublishGateState::ClosingPublishing | PublishGateState::Closed => {
-                    state.publish = PublishGateState::Closed;
-                    state.debug_assert_valid("begin drop close already closing publish gate");
-                    drop(state);
-                    self.changed.notify(usize::MAX);
-                    return Ok(());
+                    next.publish = PublishGateState::Closed;
+                    next.debug_assert_valid("begin drop close already closing publish gate");
+                    false
                 }
+            };
+
+            if self.compare_exchange_state(raw, next) {
+                self.changed.notify(usize::MAX);
+                if wait_for_publish {
+                    self.wait_for_publish_gate_closed().await;
+                }
+                return Ok(());
             }
         }
-        self.changed.notify(usize::MAX);
-        self.wait_for_publish_gate_closed().await;
-        Ok(())
     }
 
     /// Marks a dropping table handle as fully dropped.
     #[inline]
     pub(crate) fn mark_dropped(&self, table_id: TableID) -> Result<()> {
-        let mut state = self.state.lock();
-        state.debug_assert_valid("mark dropped enter");
-        if state.terminal != TableLifecycleState::Dropping {
-            return Err(mark_dropped_err(table_id, state.terminal));
+        loop {
+            let (raw, state) = self.load_state("mark dropped enter");
+            if state.terminal != TableLifecycleState::Dropping {
+                return Err(mark_dropped_err(table_id, state.terminal));
+            }
+            if state.publish != PublishGateState::Closed {
+                return Err(mark_dropped_publish_err(table_id, state.publish));
+            }
+
+            let mut next = state;
+            next.terminal = TableLifecycleState::Dropped;
+            next.debug_assert_valid("mark dropped exit");
+            if self.compare_exchange_state(raw, next) {
+                self.changed.notify(usize::MAX);
+                return Ok(());
+            }
         }
-        if state.publish != PublishGateState::Closed {
-            return Err(mark_dropped_publish_err(table_id, state.publish));
-        }
-        state.terminal = TableLifecycleState::Dropped;
-        state.debug_assert_valid("mark dropped exit");
-        drop(state);
-        self.changed.notify(usize::MAX);
-        Ok(())
     }
 
     /// Attempts to enter the no-cancel checkpoint publish section.
     pub(crate) fn try_begin_checkpoint_publish(
         &self,
     ) -> std::result::Result<CheckpointPublishLease<'_>, CheckpointCancelReason> {
-        let mut state = self.state.lock();
-        state.debug_assert_valid("begin checkpoint publish enter");
-        check_terminal_for_checkpoint(state.terminal)?;
-        assert!(
-            state.root_mutation_active,
-            "checkpoint publish requires active root mutation lease"
-        );
-        match state.publish {
-            PublishGateState::Open => {
-                state.publish = PublishGateState::Publishing;
-                state.debug_assert_valid("begin checkpoint publish exit");
-                Ok(CheckpointPublishLease { lifecycle: self })
-            }
-            PublishGateState::Publishing => {
-                debug_assert_ne!(
-                    state.publish,
-                    PublishGateState::Publishing,
-                    "concurrent checkpoint publish lease is not expected"
-                );
-                Err(CheckpointCancelReason::TableDropping)
-            }
-            PublishGateState::ClosingPublishing | PublishGateState::Closed => {
-                Err(CheckpointCancelReason::TableDropping)
+        loop {
+            let (raw, state) = self.load_state("begin checkpoint publish enter");
+            check_terminal_for_checkpoint(state.terminal)?;
+            assert!(
+                state.root_mutation_active,
+                "checkpoint publish requires active root mutation lease"
+            );
+            match state.publish {
+                PublishGateState::Open => {
+                    let mut next = state;
+                    next.publish = PublishGateState::Publishing;
+                    next.debug_assert_valid("begin checkpoint publish exit");
+                    if self.compare_exchange_state(raw, next) {
+                        return Ok(CheckpointPublishLease { lifecycle: self });
+                    }
+                }
+                PublishGateState::Publishing => {
+                    debug_assert_ne!(
+                        state.publish,
+                        PublishGateState::Publishing,
+                        "concurrent checkpoint publish lease is not expected"
+                    );
+                    return Err(CheckpointCancelReason::TableDropping);
+                }
+                PublishGateState::ClosingPublishing | PublishGateState::Closed => {
+                    return Err(CheckpointCancelReason::TableDropping);
+                }
             }
         }
     }
@@ -269,9 +350,9 @@ impl TableLifecycle {
     ) -> Result<TableMetadataChangeLease<'_>> {
         let mut pending = None;
         loop {
+            let mut should_wait = true;
             {
-                let mut state = self.state.lock();
-                state.debug_assert_valid("begin metadata change enter");
+                let (raw, state) = self.load_state("begin metadata change enter");
                 if state.terminal != TableLifecycleState::Live {
                     return Err(drop_not_live_err(
                         table_id,
@@ -279,40 +360,57 @@ impl TableLifecycle {
                         state.terminal,
                     ));
                 }
+
                 match state.metadata_change {
                     MetadataChangePhase::Open if !state.root_mutation_active => {
-                        state.metadata_change = MetadataChangePhase::Active;
-                        state.debug_assert_valid("begin metadata change active");
-                        return Ok(TableMetadataChangeLease { lifecycle: self });
+                        let mut next = state;
+                        next.metadata_change = MetadataChangePhase::Active;
+                        next.debug_assert_valid("begin metadata change active");
+                        if self.compare_exchange_state(raw, next) {
+                            return Ok(TableMetadataChangeLease { lifecycle: self });
+                        }
+                        should_wait = false;
                     }
-                    MetadataChangePhase::Open => {
-                        state.metadata_change = MetadataChangePhase::Pending;
-                        state.debug_assert_valid("begin metadata change pending");
-                        pending = Some(PendingMetadataChange::new(self));
+                    MetadataChangePhase::Open if pending.is_none() => {
+                        let mut next = state;
+                        next.metadata_change = MetadataChangePhase::Pending;
+                        next.debug_assert_valid("begin metadata change pending");
+                        if self.compare_exchange_state(raw, next) {
+                            pending = Some(PendingMetadataChange::new(self));
+                        }
+                        should_wait = false;
                     }
+                    MetadataChangePhase::Open => {}
                     MetadataChangePhase::Pending
                         if pending.is_some() && !state.root_mutation_active =>
                     {
-                        state.metadata_change = MetadataChangePhase::Active;
-                        state.debug_assert_valid("begin pending metadata change active");
-                        if let Some(pending) = &mut pending {
-                            pending.disarm();
+                        let mut next = state;
+                        next.metadata_change = MetadataChangePhase::Active;
+                        next.debug_assert_valid("begin pending metadata change active");
+                        if self.compare_exchange_state(raw, next) {
+                            if let Some(pending) = &mut pending {
+                                pending.disarm();
+                            }
+                            return Ok(TableMetadataChangeLease { lifecycle: self });
                         }
-                        return Ok(TableMetadataChangeLease { lifecycle: self });
+                        should_wait = false;
                     }
                     MetadataChangePhase::Pending | MetadataChangePhase::Active => {}
                 }
             }
+
+            if !should_wait {
+                continue;
+            }
+
             listener!(self.changed => listener);
             {
-                let state = self.state.lock();
-                state.debug_assert_valid("begin metadata change wait");
-                if state.terminal != TableLifecycleState::Live {
-                    continue;
-                }
-                if state.metadata_change == MetadataChangePhase::Pending
-                    && pending.is_some()
-                    && !state.root_mutation_active
+                let (_, state) = self.load_state("begin metadata change wait");
+                if state.terminal != TableLifecycleState::Live
+                    || state.metadata_change == MetadataChangePhase::Open
+                    || (state.metadata_change == MetadataChangePhase::Pending
+                        && pending.is_some()
+                        && !state.root_mutation_active)
                 {
                     continue;
                 }
@@ -326,34 +424,37 @@ impl TableLifecycle {
     pub(crate) fn try_begin_checkpoint_root_mutation(
         &self,
     ) -> std::result::Result<TableCheckpointRootMutationLease<'_>, CheckpointCancelReason> {
-        let mut state = self.state.lock();
-        state.debug_assert_valid("begin checkpoint root mutation enter");
-        check_terminal_for_checkpoint(state.terminal)?;
-        if state.metadata_change != MetadataChangePhase::Open {
-            return Err(CheckpointCancelReason::TableMetadataChanging);
+        loop {
+            let (raw, state) = self.load_state("begin checkpoint root mutation enter");
+            check_terminal_for_checkpoint(state.terminal)?;
+            if state.metadata_change != MetadataChangePhase::Open {
+                return Err(CheckpointCancelReason::TableMetadataChanging);
+            }
+            assert!(
+                !state.root_mutation_active,
+                "concurrent table checkpoint root mutation is not supported"
+            );
+
+            let mut next = state;
+            next.root_mutation_active = true;
+            next.debug_assert_valid("begin checkpoint root mutation exit");
+            if self.compare_exchange_state(raw, next) {
+                return Ok(TableCheckpointRootMutationLease { lifecycle: self });
+            }
         }
-        assert!(
-            !state.root_mutation_active,
-            "concurrent table checkpoint root mutation is not supported"
-        );
-        state.root_mutation_active = true;
-        state.debug_assert_valid("begin checkpoint root mutation exit");
-        Ok(TableCheckpointRootMutationLease { lifecycle: self })
     }
 
     async fn wait_for_publish_gate_closed(&self) {
         loop {
             {
-                let state = self.state.lock();
-                state.debug_assert_valid("wait for publish gate closed check");
+                let (_, state) = self.load_state("wait for publish gate closed check");
                 if state.publish == PublishGateState::Closed {
                     break;
                 }
             }
             listener!(self.changed => listener);
             {
-                let state = self.state.lock();
-                state.debug_assert_valid("wait for publish gate closed listen check");
+                let (_, state) = self.load_state("wait for publish gate closed listen check");
                 if state.publish == PublishGateState::Closed {
                     break;
                 }
@@ -364,71 +465,87 @@ impl TableLifecycle {
 
     #[inline]
     fn release_publish_lease(&self) {
-        let mut state = self.state.lock();
-        state.debug_assert_valid("release checkpoint publish lease enter");
-        // Normal checkpoint publication reopens the gate. If drop observed this
-        // lease and moved the gate to ClosingPublishing, this release is the
-        // handoff point that permanently closes the gate and wakes the dropper.
-        match state.publish {
-            PublishGateState::Publishing => state.publish = PublishGateState::Open,
-            PublishGateState::ClosingPublishing => state.publish = PublishGateState::Closed,
-            publish => {
-                debug_assert!(
-                    matches!(
-                        publish,
-                        PublishGateState::Publishing | PublishGateState::ClosingPublishing
-                    ),
-                    "publish lease release in unexpected gate state: {:?}",
-                    publish
-                );
+        loop {
+            let (raw, state) = self.load_state("release checkpoint publish lease enter");
+            // Normal checkpoint publication reopens the gate. If drop observed this
+            // lease and moved the gate to ClosingPublishing, this release is the
+            // handoff point that permanently closes the gate and wakes the dropper.
+            let mut next = state;
+            match state.publish {
+                PublishGateState::Publishing => next.publish = PublishGateState::Open,
+                PublishGateState::ClosingPublishing => next.publish = PublishGateState::Closed,
+                publish => {
+                    debug_assert!(
+                        matches!(
+                            publish,
+                            PublishGateState::Publishing | PublishGateState::ClosingPublishing
+                        ),
+                        "publish lease release in unexpected gate state: {:?}",
+                        publish
+                    );
+                    return;
+                }
+            }
+            next.debug_assert_valid("release checkpoint publish lease exit");
+            if self.compare_exchange_state(raw, next) {
+                self.changed.notify(usize::MAX);
+                return;
             }
         }
-        state.debug_assert_valid("release checkpoint publish lease exit");
-        drop(state);
-        self.changed.notify(usize::MAX);
     }
 
     #[inline]
     fn release_metadata_change(&self) {
-        let mut state = self.state.lock();
-        state.debug_assert_valid("release metadata change enter");
-        debug_assert_eq!(state.metadata_change, MetadataChangePhase::Active);
-        state.metadata_change = MetadataChangePhase::Open;
-        state.debug_assert_valid("release metadata change exit");
-        drop(state);
-        self.changed.notify(usize::MAX);
+        loop {
+            let (raw, state) = self.load_state("release metadata change enter");
+            debug_assert_eq!(state.metadata_change, MetadataChangePhase::Active);
+            if state.metadata_change != MetadataChangePhase::Active {
+                return;
+            }
+            let mut next = state;
+            next.metadata_change = MetadataChangePhase::Open;
+            next.debug_assert_valid("release metadata change exit");
+            if self.compare_exchange_state(raw, next) {
+                self.changed.notify(usize::MAX);
+                return;
+            }
+        }
     }
 
     #[inline]
     fn release_checkpoint_root_mutation(&self) {
-        let mut state = self.state.lock();
-        state.debug_assert_valid("release checkpoint root mutation enter");
-        debug_assert!(state.root_mutation_active);
-        state.root_mutation_active = false;
-        state.debug_assert_valid("release checkpoint root mutation exit");
-        drop(state);
-        self.changed.notify(usize::MAX);
+        loop {
+            let (raw, state) = self.load_state("release checkpoint root mutation enter");
+            debug_assert!(state.root_mutation_active);
+            if !state.root_mutation_active {
+                return;
+            }
+            let mut next = state;
+            next.root_mutation_active = false;
+            next.debug_assert_valid("release checkpoint root mutation exit");
+            if self.compare_exchange_state(raw, next) {
+                self.changed.notify(usize::MAX);
+                return;
+            }
+        }
     }
 
     #[inline]
     fn release_pending_metadata_change(&self) {
-        let mut state = self.state.lock();
-        state.debug_assert_valid("release pending metadata change enter");
-        if state.metadata_change == MetadataChangePhase::Pending {
-            state.metadata_change = MetadataChangePhase::Open;
-            state.debug_assert_valid("release pending metadata change exit");
-            drop(state);
-            self.changed.notify(usize::MAX);
+        loop {
+            let (raw, state) = self.load_state("release pending metadata change enter");
+            if state.metadata_change != MetadataChangePhase::Pending {
+                return;
+            }
+            let mut next = state;
+            next.metadata_change = MetadataChangePhase::Open;
+            next.debug_assert_valid("release pending metadata change exit");
+            if self.compare_exchange_state(raw, next) {
+                self.changed.notify(usize::MAX);
+                return;
+            }
         }
     }
-}
-
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-enum MetadataChangePhase {
-    #[default]
-    Open,
-    Pending,
-    Active,
 }
 
 struct PendingMetadataChange<'a> {

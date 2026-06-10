@@ -1,3 +1,4 @@
+use super::lifecycle::TableLifecycleState;
 use crate::catalog::{IndexSpec, TableMetadata};
 use crate::error::{
     ConfigError, DataIntegrityError, Error, ErrorKind, FatalError, InternalError, OperationError,
@@ -38,6 +39,10 @@ pub enum CheckpointReadiness {
         /// Diagnostic details explaining why checkpoint should wait.
         reason: CheckpointDelayReason,
     },
+    /// The table is already in its drop lifecycle and should not be checkpointed.
+    TableDropping,
+    /// The table runtime is absent or already dropped.
+    TableNotFound,
 }
 
 impl CheckpointReadiness {
@@ -75,6 +80,20 @@ pub enum CheckpointOutcome {
         /// Diagnostic details explaining why checkpoint publication was cancelled.
         reason: CheckpointCancelReason,
     },
+}
+
+#[inline]
+fn checkpoint_outcome_from_readiness(readiness: CheckpointReadiness) -> Option<CheckpointOutcome> {
+    match readiness {
+        CheckpointReadiness::Ready => None,
+        CheckpointReadiness::Delayed { reason } => Some(CheckpointOutcome::Delayed { reason }),
+        CheckpointReadiness::TableDropping => Some(CheckpointOutcome::Cancelled {
+            reason: CheckpointCancelReason::TableDropping,
+        }),
+        CheckpointReadiness::TableNotFound => Some(CheckpointOutcome::Cancelled {
+            reason: CheckpointCancelReason::TableDropped,
+        }),
+    }
 }
 
 /// Diagnostic payload for normal checkpoint scheduling delay.
@@ -887,11 +906,10 @@ impl Table {
         &self,
         session: &SessionPin,
     ) -> Result<CheckpointReadiness> {
-        let trx_sys = session.engine.trx_sys.clone();
         let active_root = self.file().active_root_unchecked();
         Ok(CheckpointReadiness::for_root(
             active_root,
-            trx_sys.calc_min_active_sts_for_gc(),
+            session.engine.trx_sys.calc_min_active_sts_for_gc(),
         ))
     }
 }
@@ -915,7 +933,11 @@ impl Table {
     }
 
     pub(crate) fn checkpoint_readiness(&self, session: &SessionPin) -> Result<CheckpointReadiness> {
-        self.try_checkpoint_readiness_for_session(session)
+        match self.lifecycle.state() {
+            TableLifecycleState::Live => self.try_checkpoint_readiness_for_session(session),
+            TableLifecycleState::Dropping => Ok(CheckpointReadiness::TableDropping),
+            TableLifecycleState::Dropped => Ok(CheckpointReadiness::TableNotFound),
+        }
     }
 
     pub(crate) async fn checkpoint(&self, session: SessionPin) -> Result<CheckpointOutcome> {
@@ -925,26 +947,27 @@ impl Table {
                 .into());
         }
 
+        if let Some(outcome) =
+            checkpoint_outcome_from_readiness(self.checkpoint_readiness(&session)?)
+        {
+            return Ok(outcome);
+        }
+
         let table_file = self.file();
         let disk_pool = self.disk_pool();
         let trx_sys = session.engine.trx_sys.clone();
         let table_writes = session.engine.table_fs.background_writes().clone();
         let pool_guards = session.pool_guards();
-        if let CheckpointReadiness::Delayed { reason } =
-            self.try_checkpoint_readiness_for_session(&session)?
-        {
-            return Ok(CheckpointOutcome::Delayed { reason });
-        }
         #[cfg(test)]
         super::tests::run_test_checkpoint_after_readiness_hook().await;
         let root_mutation_lease = match self.try_begin_checkpoint_root_mutation() {
             Ok(lease) => lease,
             Err(reason) => return Ok(CheckpointOutcome::Cancelled { reason }),
         };
-        if let CheckpointReadiness::Delayed { reason } =
-            self.try_checkpoint_readiness_for_session(&session)?
+        if let Some(outcome) =
+            checkpoint_outcome_from_readiness(self.checkpoint_readiness(&session)?)
         {
-            return Ok(CheckpointOutcome::Delayed { reason });
+            return Ok(outcome);
         }
         let layout = self.layout_snapshot();
         let metadata = layout.metadata();

@@ -168,8 +168,9 @@ impl Session {
     #[inline]
     pub fn table_checkpoint_readiness(&self, table_id: TableID) -> Result<CheckpointReadiness> {
         let session = self.pin("check checkpoint readiness")?;
-        let table =
-            session.resolve_existing_user_table_now(table_id, "check checkpoint readiness")?;
+        let Some(table) = session.find_existing_user_table_now(table_id) else {
+            return Ok(CheckpointReadiness::TableNotFound);
+        };
         table.checkpoint_readiness(&session)
     }
 
@@ -317,21 +318,13 @@ impl SessionPin {
     }
 
     #[inline]
-    pub(crate) fn resolve_existing_user_table_now(
-        &self,
-        table_id: TableID,
-        operation: &'static str,
-    ) -> Result<Arc<Table>> {
+    pub(crate) fn find_existing_user_table_now(&self, table_id: TableID) -> Option<Arc<Table>> {
         if let Some(table) = self.state.cached_user_table(table_id) {
-            return Ok(table);
+            return Some(table);
         }
-        let table = self
-            .engine
-            .catalog()
-            .get_table_now(table_id)
-            .ok_or_else(|| table_not_found_error(table_id, operation))?;
+        let table = self.engine.catalog().get_table_now(table_id)?;
         self.state.cache_user_table(&table);
-        Ok(table)
+        Some(table)
     }
 
     /// Acquires an explicit session-lifetime table lock from this pinned session.
