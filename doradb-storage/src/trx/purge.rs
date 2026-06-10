@@ -1173,18 +1173,18 @@ mod tests {
 
     async fn stmt_insert_row(
         stmt: &mut Statement<'_>,
-        table: &Table,
+        table_id: TableID,
         cols: Vec<Val>,
     ) -> crate::error::Result<RowID> {
-        stmt.table_insert_mvcc(table, cols).await
+        stmt.table_insert_mvcc(table_id, cols).await
     }
 
     async fn stmt_delete_row(
         stmt: &mut Statement<'_>,
-        table: &Table,
+        table_id: TableID,
         key: &SelectKey,
     ) -> crate::error::Result<DeleteMvcc> {
-        stmt.table_delete_unique_mvcc(table, key, false).await
+        stmt.table_delete_unique_mvcc(table_id, key, false).await
     }
 
     #[test]
@@ -1401,7 +1401,7 @@ mod tests {
             let mut session = engine.new_session().unwrap();
             let mut trx = session.begin_trx().unwrap();
             trx.exec(async |stmt| {
-                stmt_insert_row(stmt, &table, vec![Val::from(1001i32)]).await?;
+                stmt_insert_row(stmt, table_id, vec![Val::from(1001i32)]).await?;
                 Ok(())
             })
             .await
@@ -1490,7 +1490,7 @@ mod tests {
             let mut session = engine.new_session().unwrap();
             let mut trx = session.begin_trx().unwrap();
             trx.exec(async |stmt| {
-                stmt_insert_row(stmt, &table, vec![Val::from(1002i32)]).await?;
+                stmt_insert_row(stmt, table_id, vec![Val::from(1002i32)]).await?;
                 Ok(())
             })
             .await
@@ -1583,7 +1583,7 @@ mod tests {
             let mut session = engine.new_session().unwrap();
             let mut trx = session.begin_trx().unwrap();
             trx.exec(async |stmt| {
-                stmt_insert_row(stmt, &table, vec![Val::from(1003i32)]).await?;
+                stmt_insert_row(stmt, table_id, vec![Val::from(1003i32)]).await?;
                 Ok(())
             })
             .await
@@ -1695,7 +1695,7 @@ mod tests {
             let mut session = engine.new_session().unwrap();
             let mut trx = session.begin_trx().unwrap();
             trx.exec(async |stmt| {
-                stmt_insert_row(stmt, &table, vec![Val::from(1004i32)]).await?;
+                stmt_insert_row(stmt, table_id, vec![Val::from(1004i32)]).await?;
                 Ok(())
             })
             .await
@@ -1810,7 +1810,6 @@ mod tests {
                 .unwrap();
 
             let table_id = table1(&engine).await;
-            let table = engine.catalog().get_table(table_id).await.unwrap();
 
             // Since we populate metadata table, we need to count those purge transactions and rows.
             // 100ms should be enough.
@@ -1823,7 +1822,7 @@ mod tests {
                 let mut trx = session.begin_trx().unwrap();
                 let res = trx
                     .exec(async |stmt| {
-                        stmt_insert_row(stmt, &table, vec![Val::from(i as i32)]).await?;
+                        stmt_insert_row(stmt, table_id, vec![Val::from(i as i32)]).await?;
                         Ok(())
                     })
                     .await;
@@ -1837,7 +1836,7 @@ mod tests {
                 let key = SelectKey::new(0, vec![Val::from(i as i32)]);
                 let res = trx
                     .exec(async |stmt| {
-                        stmt_delete_row(stmt, &table, &key).await?;
+                        stmt_delete_row(stmt, table_id, &key).await?;
                         Ok(())
                     })
                     .await;
@@ -1899,7 +1898,6 @@ mod tests {
                 .unwrap();
 
             let table_id = table1(&engine).await;
-            let table = engine.catalog().get_table(table_id).await.unwrap();
 
             // Since we populate metadata table, we need to count those purge transactions and rows.
             // 100ms should be enough.
@@ -1912,7 +1910,7 @@ mod tests {
                 let mut trx = session.begin_trx().unwrap();
                 let res = trx
                     .exec(async |stmt| {
-                        stmt_insert_row(stmt, &table, vec![Val::from(i as i32)]).await?;
+                        stmt_insert_row(stmt, table_id, vec![Val::from(i as i32)]).await?;
                         Ok(())
                     })
                     .await;
@@ -1926,7 +1924,7 @@ mod tests {
                 let key = SelectKey::new(0, vec![Val::from(i as i32)]);
                 let res = trx
                     .exec(async |stmt| {
-                        stmt_delete_row(stmt, &table, &key).await?;
+                        stmt_delete_row(stmt, table_id, &key).await?;
                         Ok(())
                     })
                     .await;
@@ -1963,6 +1961,7 @@ mod tests {
             }
             if gc_timeout {
                 // see which one is not purged, and its cts.
+                let table = engine.catalog().get_table(table_id).await.unwrap();
                 let pool_guards = full_pool_guards(&engine);
                 let index = bound_unique_index_no(&table, 0);
                 let mut remained_row_ids = vec![];

@@ -1,3 +1,4 @@
+use super::lifecycle::TableLifecycleState;
 use crate::catalog::{IndexSpec, TableMetadata};
 use crate::error::{
     ConfigError, DataIntegrityError, Error, ErrorKind, FatalError, InternalError, OperationError,
@@ -12,13 +13,12 @@ use crate::index::disk_tree::{
 };
 use crate::index::{ColumnBlockIndex, ColumnDeleteDeltaPatch, ColumnLeafEntry};
 use crate::lwc::PersistedLwcBlock;
-use crate::session::Session;
+use crate::session::SessionPin;
 use crate::table::{CheckpointCancelReason, Table, TableRuntimeLayout};
 use crate::trx::redo::DDLRedo;
 use crate::value::{Val, ValKind, ValType};
 use error_stack::Report;
 use std::collections::BTreeSet;
-use std::future::Future;
 
 const CHECKPOINT_REQUIRES_IDLE_SESSION: &str = "checkpoint requires idle session";
 
@@ -27,17 +27,6 @@ fn invalid_index_spec(message: impl Into<String>) -> Error {
     Report::new(ConfigError::InvalidIndexSpec)
         .attach(message.into())
         .into()
-}
-
-pub trait TablePersistence {
-    /// Freeze row pages and return approximate non-deleted rows visited.
-    fn freeze(&self, session: &Session, max_rows: usize) -> impl Future<Output = Result<usize>>;
-
-    /// Report whether a user-table checkpoint can safely publish now.
-    fn checkpoint_readiness(&self, session: &Session) -> Result<CheckpointReadiness>;
-
-    /// Persist eligible row-store and cold-delete state in one checkpoint run.
-    fn checkpoint(&self, session: &mut Session) -> impl Future<Output = Result<CheckpointOutcome>>;
 }
 
 /// Cheap checkpoint scheduling decision for one user-table root snapshot.
@@ -50,6 +39,10 @@ pub enum CheckpointReadiness {
         /// Diagnostic details explaining why checkpoint should wait.
         reason: CheckpointDelayReason,
     },
+    /// The table is already in its drop lifecycle and should not be checkpointed.
+    TableDropping,
+    /// The table runtime is absent or already dropped.
+    TableNotFound,
 }
 
 impl CheckpointReadiness {
@@ -87,6 +80,20 @@ pub enum CheckpointOutcome {
         /// Diagnostic details explaining why checkpoint publication was cancelled.
         reason: CheckpointCancelReason,
     },
+}
+
+#[inline]
+fn checkpoint_outcome_from_readiness(readiness: CheckpointReadiness) -> Option<CheckpointOutcome> {
+    match readiness {
+        CheckpointReadiness::Ready => None,
+        CheckpointReadiness::Delayed { reason } => Some(CheckpointOutcome::Delayed { reason }),
+        CheckpointReadiness::TableDropping => Some(CheckpointOutcome::Cancelled {
+            reason: CheckpointCancelReason::TableDropping,
+        }),
+        CheckpointReadiness::TableNotFound => Some(CheckpointOutcome::Cancelled {
+            reason: CheckpointCancelReason::TableDropped,
+        }),
+    }
 }
 
 /// Diagnostic payload for normal checkpoint scheduling delay.
@@ -897,25 +904,20 @@ impl Table {
     #[inline]
     fn try_checkpoint_readiness_for_session(
         &self,
-        session: &Session,
+        session: &SessionPin,
     ) -> Result<CheckpointReadiness> {
-        let pin = session.pin("check checkpoint readiness")?;
-        let trx_sys = pin.engine.trx_sys.clone();
         let active_root = self.file().active_root_unchecked();
         Ok(CheckpointReadiness::for_root(
             active_root,
-            trx_sys.calc_min_active_sts_for_gc(),
+            session.engine.trx_sys.calc_min_active_sts_for_gc(),
         ))
     }
 }
 
-impl TablePersistence for Table {
-    async fn freeze(&self, session: &Session, max_rows: usize) -> Result<usize> {
-        let pin = session.pin("freeze table")?;
-        let guards = pin.pool_guards();
+impl Table {
+    pub(crate) async fn freeze(&self, session: SessionPin, max_rows: usize) -> Result<usize> {
+        let guards = session.pool_guards();
         let mut rows = 0usize;
-        #[cfg(test)]
-        super::tests::run_test_freeze_after_pin_hook().await;
         self.mem_scan(&guards, |page_guard| {
             let (ctx, page) = page_guard.ctx_and_page();
             let vmap = ctx.row_ver().unwrap();
@@ -930,38 +932,42 @@ impl TablePersistence for Table {
         Ok(rows)
     }
 
-    fn checkpoint_readiness(&self, session: &Session) -> Result<CheckpointReadiness> {
-        self.try_checkpoint_readiness_for_session(session)
+    pub(crate) fn checkpoint_readiness(&self, session: &SessionPin) -> Result<CheckpointReadiness> {
+        match self.lifecycle.state() {
+            TableLifecycleState::Live => self.try_checkpoint_readiness_for_session(session),
+            TableLifecycleState::Dropping => Ok(CheckpointReadiness::TableDropping),
+            TableLifecycleState::Dropped => Ok(CheckpointReadiness::TableNotFound),
+        }
     }
 
-    async fn checkpoint(&self, session: &mut Session) -> Result<CheckpointOutcome> {
-        if session.checked_in_trx(CHECKPOINT_REQUIRES_IDLE_SESSION)? {
+    pub(crate) async fn checkpoint(&self, session: SessionPin) -> Result<CheckpointOutcome> {
+        if session.in_trx(CHECKPOINT_REQUIRES_IDLE_SESSION)? {
             return Err(Report::new(OperationError::NotSupported)
                 .attach(CHECKPOINT_REQUIRES_IDLE_SESSION)
                 .into());
         }
 
+        if let Some(outcome) =
+            checkpoint_outcome_from_readiness(self.checkpoint_readiness(&session)?)
+        {
+            return Ok(outcome);
+        }
+
         let table_file = self.file();
         let disk_pool = self.disk_pool();
-        let pin = session.pin("checkpoint table")?;
-        let trx_sys = pin.engine.trx_sys.clone();
-        let table_writes = pin.engine.table_fs.background_writes().clone();
-        let pool_guards = pin.pool_guards();
-        if let CheckpointReadiness::Delayed { reason } =
-            self.try_checkpoint_readiness_for_session(session)?
-        {
-            return Ok(CheckpointOutcome::Delayed { reason });
-        }
+        let trx_sys = session.engine.trx_sys.clone();
+        let table_writes = session.engine.table_fs.background_writes().clone();
+        let pool_guards = session.pool_guards();
         #[cfg(test)]
         super::tests::run_test_checkpoint_after_readiness_hook().await;
         let root_mutation_lease = match self.try_begin_checkpoint_root_mutation() {
             Ok(lease) => lease,
             Err(reason) => return Ok(CheckpointOutcome::Cancelled { reason }),
         };
-        if let CheckpointReadiness::Delayed { reason } =
-            self.try_checkpoint_readiness_for_session(session)?
+        if let Some(outcome) =
+            checkpoint_outcome_from_readiness(self.checkpoint_readiness(&session)?)
         {
-            return Ok(CheckpointOutcome::Delayed { reason });
+            return Ok(outcome);
         }
         let layout = self.layout_snapshot();
         let metadata = layout.metadata();
@@ -986,7 +992,7 @@ impl TablePersistence for Table {
 
         // Step 3: open a checkpoint transaction, then move frozen pages into
         // transition state under the refreshed cutoff timestamp.
-        let mut trx = session.begin_trx()?;
+        let mut trx = session.begin_trx("checkpoint table")?;
         let checkpoint_ts = trx.sts();
         #[cfg(test)]
         super::tests::run_test_checkpoint_after_trx_start_hook().await;
@@ -1118,8 +1124,6 @@ impl TablePersistence for Table {
         let published_root = mutable_file.root();
         let published_pivot_row_id = published_root.pivot_row_id;
         let published_column_root = published_root.column_block_index_root;
-        #[cfg(test)]
-        super::tests::run_test_checkpoint_before_publish_hook().await;
         match trx_sys
             .publish_table_file_root(mutable_file, checkpoint_ts, false)
             .await

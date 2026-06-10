@@ -1494,7 +1494,6 @@ mod tests {
             let (_temp_dir, engine) =
                 build_redo_test_engine("commit_handoff_drop", LogSync::None).await;
             let table_id = table2(&engine).await;
-            let table = engine.catalog().get_table(table_id).await.unwrap();
             let redo_fd = {
                 engine.trx_sys.log_partitions[0]
                     .group_commit
@@ -1510,7 +1509,7 @@ mod tests {
             let mut session = engine.new_session().unwrap();
             let mut trx = session.begin_trx().unwrap();
             trx.exec(async |stmt| {
-                stmt.table_insert_mvcc(&table, vec![Val::from(1), Val::from("handoff")])
+                stmt.table_insert_mvcc(table_id, vec![Val::from(1), Val::from("handoff")])
                     .await?;
                 Ok(())
             })
@@ -1534,7 +1533,6 @@ mod tests {
             wait_for(|| session.in_trx().is_ok_and(|active| !active)).await;
 
             drop(session);
-            drop(table);
             engine.shutdown().unwrap();
         });
     }
@@ -1546,11 +1544,10 @@ mod tests {
                 build_redo_test_engine("commit_closed_after_shutdown_consumed", LogSync::None)
                     .await;
             let table_id = table2(&engine).await;
-            let table = engine.catalog().get_table(table_id).await.unwrap();
             let mut session = engine.new_session().unwrap();
             let mut trx = session.begin_trx().unwrap();
             trx.exec(async |stmt| {
-                stmt.table_insert_mvcc(&table, vec![Val::from(1), Val::from("closed")])
+                stmt.table_insert_mvcc(table_id, vec![Val::from(1), Val::from("closed")])
                     .await?;
                 Ok(())
             })
@@ -1574,7 +1571,6 @@ mod tests {
             assert!(!session.in_trx().unwrap());
 
             drop(session);
-            drop(table);
             engine.shutdown().unwrap();
         });
     }
@@ -1585,7 +1581,6 @@ mod tests {
             let (_temp_dir, engine) =
                 build_redo_test_engine("user_redo_fsync_failure", LogSync::Fsync).await;
             let table_id = table2(&engine).await;
-            let table = engine.catalog().get_table(table_id).await.unwrap();
             let redo_fd = {
                 engine.trx_sys.log_partitions[0]
                     .group_commit
@@ -1601,7 +1596,7 @@ mod tests {
             let mut session = engine.new_session().unwrap();
             let mut trx = session.begin_trx().unwrap();
             trx.exec(async |stmt| {
-                stmt.table_insert_mvcc(&table, vec![Val::from(1), Val::from("sync-fail")])
+                stmt.table_insert_mvcc(table_id, vec![Val::from(1), Val::from("sync-fail")])
                     .await?;
                 Ok(())
             })
@@ -1636,7 +1631,6 @@ mod tests {
             );
 
             drop(session);
-            drop(table);
         });
     }
 
@@ -1825,7 +1819,6 @@ mod tests {
                 .await
                 .unwrap();
             let table_id = table2(&engine).await;
-            let table = engine.catalog().get_table(table_id).await.unwrap();
 
             let mut session = engine.new_session().unwrap();
             {
@@ -1834,7 +1827,7 @@ mod tests {
                     trx.exec(async |stmt| {
                         let s = format!("{}", i);
                         let insert = vec![Val::from(i), Val::from(&s[..])];
-                        stmt.table_insert_mvcc(&table, insert).await?;
+                        stmt.table_insert_mvcc(table_id, insert).await?;
                         Ok(())
                     })
                     .await
@@ -1869,7 +1862,6 @@ mod tests {
             }
             println!("total log records {}", log_recs);
 
-            drop(table);
             drop(engine);
         });
     }
@@ -1899,7 +1891,6 @@ mod tests {
                 .await
                 .unwrap();
             let table_id = table2(&engine).await;
-            let table = engine.catalog().get_table(table_id).await.unwrap();
 
             let mut session = engine.new_session().unwrap();
             {
@@ -1908,7 +1899,7 @@ mod tests {
                     trx.exec(async |stmt| {
                         let s = format!("{}", i);
                         let insert = vec![Val::from(i), Val::from(&s[..])];
-                        stmt.table_insert_mvcc(&table, insert).await?;
+                        stmt.table_insert_mvcc(table_id, insert).await?;
                         Ok(())
                     })
                     .await
@@ -1939,7 +1930,6 @@ mod tests {
             }
             println!("total log records {}", log_recs);
 
-            drop(table);
             drop(engine);
 
             // after the first engine is done, we reopen log files to test log merger.

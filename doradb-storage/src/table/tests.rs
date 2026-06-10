@@ -3,7 +3,9 @@ use crate::buffer::BufferPool;
 use crate::buffer::frame::FrameKind;
 use crate::buffer::guard::PageGuard;
 use crate::buffer::page::PAGE_SIZE;
-use crate::buffer::{EvictableBufferPool, PoolGuard, PoolGuards, PoolRole, test_frame_kind};
+use crate::buffer::{
+    EvictableBufferPool, PoolGuard, PoolGuards, PoolRole, ReadonlyBufferPool, test_frame_kind,
+};
 use crate::catalog::table::test_hooks as catalog_table_tests;
 use crate::catalog::table::test_hooks::CreateTableTestFailure;
 use crate::catalog::tests::table4;
@@ -14,11 +16,13 @@ use crate::catalog::{
 use crate::conf::{EngineConfig, EvictableBufferPoolConfig, FileSystemConfig, TrxSysConfig};
 use crate::engine::Engine;
 use crate::error::{
-    CompletionErrorKind, ConfigError, DataIntegrityError, Error, ErrorKind, FatalError,
-    InternalError, LifecycleError, OperationError, ResourceError, Result,
+    CompletionErrorKind, ConfigError, DataIntegrityError, Error, ErrorKind, FatalError, FileKind,
+    InternalError, OperationError, ResourceError, Result,
 };
+use crate::file::SparseFile;
 use crate::file::block_integrity::{BLOCK_INTEGRITY_HEADER_SIZE, write_block_checksum};
 use crate::file::cow_file::{COW_FILE_PAGE_SIZE, SUPER_BLOCK_ID, tests::old_root_drop_count};
+use crate::file::table_file::ActiveRoot;
 use crate::id::{BlockID, PageID, RowID, SessionID, TableID, TrxID};
 use crate::index::{
     COLUMN_BLOCK_HEADER_SIZE, COLUMN_BLOCK_LEAF_HEADER_SIZE, ColumnBlockIndex, IndexInsert,
@@ -31,12 +35,13 @@ use crate::io::{
 use crate::latch::LatchFallbackMode;
 use crate::lock::tests::{LockDebugEntryState, debug_snapshot, try_acquire};
 use crate::lock::{LockMode, LockOwner, LockResource};
+use crate::quiescent::QuiescentGuard;
+use crate::row::RowPage;
 use crate::row::ops::{DeleteMvcc, SelectKey, SelectMvcc, UpdateCol, UpdateMvcc};
-use crate::row::{RowPage, RowRead};
 use crate::session::{Session, tests::SessionTestExt};
 use crate::table::{
     CheckpointCancelReason, CheckpointOutcome, CheckpointReadiness, DeleteMarker, Table,
-    TableLifecycleState, TablePersistence, TableRuntimeLayout,
+    TableLifecycleState, TableRuntimeLayout,
 };
 use crate::trx::redo::DDLRedo;
 use crate::trx::row::LockRowForWrite;
@@ -48,6 +53,7 @@ use crate::trx::ver_map::RowPageState;
 use crate::trx::{MAX_SNAPSHOT_TS, Transaction};
 use crate::value::{Val, ValKind};
 use error_stack::Report;
+use futures::FutureExt;
 use std::cell::{Cell, RefCell};
 use std::fs::OpenOptions;
 use std::future::Future;
@@ -55,17 +61,14 @@ use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, mpsc};
-use std::thread::LocalKey;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 use tempfile::TempDir;
 
 type TableHook = Box<dyn FnOnce() -> Pin<Box<dyn Future<Output = ()> + 'static>> + 'static>;
 
 thread_local! {
-    static TEST_FREEZE_AFTER_PIN_HOOK: RefCell<Option<TableHook>> =
-        const { RefCell::new(None) };
     static TEST_FORCE_LWC_BUILD_ERROR: Cell<bool> = const { Cell::new(false) };
     static TEST_FORCE_SECONDARY_SIDECAR_ERROR: Cell<bool> = const { Cell::new(false) };
     static TEST_FORCE_POST_PUBLISH_CHECKPOINT_ERROR: Cell<bool> = const { Cell::new(false) };
@@ -73,28 +76,6 @@ thread_local! {
         const { RefCell::new(None) };
     static TEST_CHECKPOINT_AFTER_TRX_START_HOOK: RefCell<Option<TableHook>> =
         const { RefCell::new(None) };
-    static TEST_CHECKPOINT_BEFORE_PUBLISH_HOOK: RefCell<Option<TableHook>> =
-        const { RefCell::new(None) };
-    static TEST_SECONDARY_CLEANUP_BEFORE_SCAN_HOOK: RefCell<Option<TableHook>> =
-        const { RefCell::new(None) };
-}
-
-struct ResetTableHook(&'static LocalKey<RefCell<Option<TableHook>>>);
-
-impl ResetTableHook {
-    #[inline]
-    fn new(slot: &'static LocalKey<RefCell<Option<TableHook>>>) -> Self {
-        Self(slot)
-    }
-}
-
-impl Drop for ResetTableHook {
-    #[inline]
-    fn drop(&mut self) {
-        self.0.with(|slot| {
-            slot.borrow_mut().take();
-        });
-    }
 }
 
 const LIGHTWEIGHT_TEST_BUFFER_BYTES: usize = 16 * 1024 * 1024;
@@ -132,19 +113,6 @@ pub(super) fn test_force_post_publish_checkpoint_error_enabled() -> bool {
     TEST_FORCE_POST_PUBLISH_CHECKPOINT_ERROR.with(|flag| flag.get())
 }
 
-fn set_test_freeze_after_pin_hook<F, Fut>(hook: F)
-where
-    F: FnOnce() -> Fut + 'static,
-    Fut: Future<Output = ()> + 'static,
-{
-    TEST_FREEZE_AFTER_PIN_HOOK.with(|slot| {
-        let old = slot
-            .borrow_mut()
-            .replace(Box::new(move || Box::pin(hook())));
-        assert!(old.is_none(), "freeze after-pin hook already installed");
-    });
-}
-
 fn set_test_checkpoint_after_readiness_hook<F, Fut>(hook: F)
 where
     F: FnOnce() -> Fut + 'static,
@@ -174,45 +142,6 @@ where
     });
 }
 
-fn set_test_checkpoint_before_publish_hook<F, Fut>(hook: F)
-where
-    F: FnOnce() -> Fut + 'static,
-    Fut: Future<Output = ()> + 'static,
-{
-    TEST_CHECKPOINT_BEFORE_PUBLISH_HOOK.with(|slot| {
-        let old = slot
-            .borrow_mut()
-            .replace(Box::new(move || Box::pin(hook())));
-        assert!(
-            old.is_none(),
-            "checkpoint before-publish hook already installed"
-        );
-    });
-}
-
-fn set_test_secondary_cleanup_before_scan_hook<F, Fut>(hook: F)
-where
-    F: FnOnce() -> Fut + 'static,
-    Fut: Future<Output = ()> + 'static,
-{
-    TEST_SECONDARY_CLEANUP_BEFORE_SCAN_HOOK.with(|slot| {
-        let old = slot
-            .borrow_mut()
-            .replace(Box::new(move || Box::pin(hook())));
-        assert!(
-            old.is_none(),
-            "secondary cleanup before-scan hook already installed"
-        );
-    });
-}
-
-pub(super) async fn run_test_freeze_after_pin_hook() {
-    let hook = TEST_FREEZE_AFTER_PIN_HOOK.with(|slot| slot.borrow_mut().take());
-    if let Some(hook) = hook {
-        hook().await;
-    }
-}
-
 pub(super) async fn run_test_checkpoint_after_readiness_hook() {
     let hook = TEST_CHECKPOINT_AFTER_READINESS_HOOK.with(|slot| slot.borrow_mut().take());
     if let Some(hook) = hook {
@@ -222,20 +151,6 @@ pub(super) async fn run_test_checkpoint_after_readiness_hook() {
 
 pub(super) async fn run_test_checkpoint_after_trx_start_hook() {
     let hook = TEST_CHECKPOINT_AFTER_TRX_START_HOOK.with(|slot| slot.borrow_mut().take());
-    if let Some(hook) = hook {
-        hook().await;
-    }
-}
-
-pub(super) async fn run_test_checkpoint_before_publish_hook() {
-    let hook = TEST_CHECKPOINT_BEFORE_PUBLISH_HOOK.with(|slot| slot.borrow_mut().take());
-    if let Some(hook) = hook {
-        hook().await;
-    }
-}
-
-pub(super) async fn run_test_secondary_cleanup_before_scan_hook() {
-    let hook = TEST_SECONDARY_CLEANUP_BEFORE_SCAN_HOOK.with(|slot| slot.borrow_mut().take());
     if let Some(hook) = hook {
         hook().await;
     }
@@ -259,13 +174,13 @@ fn assert_table_data_integrity(
     assert!(report.contains(&format!("block_id={block_id}")), "{report}");
 }
 
-fn assert_checkpoint_write_poisoned(err: &Error, sys: &TestSys) {
+fn assert_checkpoint_write_poisoned(err: &Error, engine: &Engine) {
     assert_eq!(
         err.report().downcast_ref::<FatalError>().copied(),
         Some(FatalError::CheckpointWrite)
     );
     assert!(
-        sys.engine
+        engine
             .trx_sys
             .storage_poison_error()
             .as_ref()
@@ -273,68 +188,76 @@ fn assert_checkpoint_write_poisoned(err: &Error, sys: &TestSys) {
     );
 }
 
-async fn stmt_insert_row(stmt: &mut Statement<'_>, table: &Table, cols: Vec<Val>) -> Result<RowID> {
-    stmt.table_insert_mvcc(table, cols).await
+async fn stmt_insert_row_by_id(
+    stmt: &mut Statement<'_>,
+    table_id: TableID,
+    cols: Vec<Val>,
+) -> Result<RowID> {
+    stmt.table_insert_mvcc(table_id, cols).await
 }
 
-async fn stmt_delete_row(
+async fn stmt_delete_row_by_id(
     stmt: &mut Statement<'_>,
-    table: &Table,
+    table_id: TableID,
     key: &SelectKey,
 ) -> Result<DeleteMvcc> {
-    stmt.table_delete_unique_mvcc(table, key, false).await
+    stmt.table_delete_unique_mvcc(table_id, key, false).await
 }
 
-async fn stmt_update_row(
+async fn stmt_update_row_by_id(
     stmt: &mut Statement<'_>,
-    table: &Table,
+    table_id: TableID,
     key: &SelectKey,
     update: Vec<UpdateCol>,
 ) -> Result<UpdateMvcc> {
-    stmt.table_update_unique_mvcc(table, key, update).await
+    stmt.table_update_unique_mvcc(table_id, key, update).await
 }
 
-async fn stmt_select_row_mvcc(
+async fn stmt_select_row_mvcc_by_id(
     stmt: &mut Statement<'_>,
-    table: &Table,
+    table_id: TableID,
     key: &SelectKey,
     user_read_set: &[usize],
 ) -> Result<SelectMvcc> {
-    stmt.table_lookup_unique_mvcc(table, key, user_read_set)
+    stmt.table_lookup_unique_mvcc(table_id, key, user_read_set)
         .await
 }
 
-async fn trx_insert_row(trx: &mut Transaction, table: &Table, cols: Vec<Val>) -> Result<RowID> {
-    trx.exec(async |stmt| stmt_insert_row(stmt, table, cols).await)
-        .await
-}
-
-async fn trx_delete_row(
+async fn trx_insert_row_by_id(
     trx: &mut Transaction,
-    table: &Table,
+    table_id: TableID,
+    cols: Vec<Val>,
+) -> Result<RowID> {
+    trx.exec(async |stmt| stmt_insert_row_by_id(stmt, table_id, cols).await)
+        .await
+}
+
+async fn trx_delete_row_by_id(
+    trx: &mut Transaction,
+    table_id: TableID,
     key: &SelectKey,
 ) -> Result<DeleteMvcc> {
-    trx.exec(async |stmt| stmt_delete_row(stmt, table, key).await)
+    trx.exec(async |stmt| stmt_delete_row_by_id(stmt, table_id, key).await)
         .await
 }
 
-async fn trx_update_row(
+async fn trx_update_row_by_id(
     trx: &mut Transaction,
-    table: &Table,
+    table_id: TableID,
     key: &SelectKey,
     update: Vec<UpdateCol>,
 ) -> Result<UpdateMvcc> {
-    trx.exec(async |stmt| stmt_update_row(stmt, table, key, update).await)
+    trx.exec(async |stmt| stmt_update_row_by_id(stmt, table_id, key, update).await)
         .await
 }
 
-async fn trx_select_row_mvcc(
+async fn trx_select_row_mvcc_by_id(
     trx: &mut Transaction,
-    table: &Table,
+    table_id: TableID,
     key: &SelectKey,
     user_read_set: &[usize],
 ) -> Result<SelectMvcc> {
-    trx.exec(async |stmt| stmt_select_row_mvcc(stmt, table, key, user_read_set).await)
+    trx.exec(async |stmt| stmt_select_row_mvcc_by_id(stmt, table_id, key, user_read_set).await)
         .await
 }
 
@@ -425,15 +348,17 @@ fn test_mvcc_insert_normal() {
     smol::block_on(async {
         const SIZE: i32 = 10000;
 
-        let sys = TestSys::new_evictable().await;
+        let temp_dir = TempDir::new().unwrap();
+        let engine = evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys").await;
+        let table_id = create_table2_for_test(&engine).await;
 
-        let mut session = sys.new_session().unwrap();
+        let mut session = engine.new_session().unwrap();
         {
             let mut trx = session.begin_trx().unwrap();
             for i in 0..SIZE {
                 let s = format!("{}", i);
                 let insert = vec![Val::from(i), Val::from(&s[..])];
-                trx = sys.trx_insert(trx, insert).await;
+                trx = expect_trx_insert(table_id, trx, insert).await;
             }
             trx.commit().await.unwrap();
         }
@@ -441,14 +366,13 @@ fn test_mvcc_insert_normal() {
             let mut trx = session.begin_trx().unwrap();
             for i in 16..SIZE {
                 let key = SelectKey::new(0, vec![Val::from(i)]);
-                trx = sys
-                    .trx_select(trx, &key, |vals| {
-                        assert!(vals.len() == 2);
-                        assert!(vals[0] == Val::from(i));
-                        let s = format!("{}", i);
-                        assert!(vals[1] == Val::from(&s[..]));
-                    })
-                    .await;
+                trx = expect_trx_select(table_id, trx, &key, |vals| {
+                    assert!(vals.len() == 2);
+                    assert!(vals[0] == Val::from(i));
+                    let s = format!("{}", i);
+                    assert!(vals[1] == Val::from(&s[..]));
+                })
+                .await;
             }
             let _ = trx.commit().await.unwrap();
         }
@@ -458,20 +382,22 @@ fn test_mvcc_insert_normal() {
 #[test]
 fn test_mvcc_insert_dup_key() {
     smol::block_on(async {
-        let sys = TestSys::new_evictable().await;
-        let mut session = sys.new_session().unwrap();
+        let temp_dir = TempDir::new().unwrap();
+        let engine = evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys").await;
+        let table_id = create_table2_for_test(&engine).await;
+        let mut session = engine.new_session().unwrap();
         // dup key
         {
             // insert [1, "hello"]
             let insert = vec![Val::from(1i32), Val::from("hello")];
             let mut trx = session.begin_trx().unwrap();
-            trx = sys.trx_insert(trx, insert).await;
+            trx = expect_trx_insert(table_id, trx, insert).await;
             trx.commit().await.unwrap();
 
             // insert [1, "world"]
             let insert = vec![Val::from(1i32), Val::from("world")];
             let mut trx = session.begin_trx().unwrap();
-            let res = trx_insert_row(&mut trx, &sys.table, insert).await;
+            let res = trx_insert_row_by_id(&mut trx, table_id, insert).await;
             let err = res.unwrap_err();
             assert_eq!(err.operation_error(), Some(OperationError::DuplicateKey));
             trx.rollback().await.unwrap();
@@ -481,14 +407,14 @@ fn test_mvcc_insert_dup_key() {
             // insert [2, "hello"], but not commit
             let insert1 = vec![Val::from(2i32), Val::from("hello")];
             let mut trx1 = session.begin_trx().unwrap();
-            let res = trx_insert_row(&mut trx1, &sys.table, insert1).await;
+            let res = trx_insert_row_by_id(&mut trx1, table_id, insert1).await;
             assert!(res.is_ok());
 
             // begin concurrent transaction and insert [2, "world"]
-            let mut session2 = sys.new_session().unwrap();
+            let mut session2 = engine.new_session().unwrap();
             let insert2 = vec![Val::from(2i32), Val::from("world")];
             let mut trx2 = session2.begin_trx().unwrap();
-            let res = trx_insert_row(&mut trx2, &sys.table, insert2).await;
+            let res = trx_insert_row_by_id(&mut trx2, table_id, insert2).await;
             // still dup key because circuit breaker on index search.
             let err = res.unwrap_err();
             assert_eq!(err.operation_error(), Some(OperationError::DuplicateKey));
@@ -505,15 +431,17 @@ fn test_mvcc_update_normal() {
     smol::block_on(async {
         const SIZE: i32 = 1000;
 
-        let sys = TestSys::new_evictable().await;
+        let temp_dir = TempDir::new().unwrap();
+        let engine = evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys").await;
+        let table_id = create_table2_for_test(&engine).await;
         {
-            let mut session = sys.new_session().unwrap();
+            let mut session = engine.new_session().unwrap();
             // insert 1000 rows
             let mut trx = session.begin_trx().unwrap();
             for i in 0..SIZE {
                 let s = format!("{}", i);
                 let insert = vec![Val::from(i), Val::from(&s[..])];
-                trx = sys.trx_insert(trx, insert).await;
+                trx = expect_trx_insert(table_id, trx, insert).await;
             }
             trx.commit().await.unwrap();
 
@@ -525,7 +453,7 @@ fn test_mvcc_update_normal() {
                 idx: 1,
                 val: Val::from(s1),
             }];
-            trx = sys.trx_update(trx, &k1, update1).await;
+            trx = expect_trx_update(table_id, trx, &k1, update1).await;
             trx.commit().await.unwrap();
 
             // update 1 row with long value
@@ -536,28 +464,26 @@ fn test_mvcc_update_normal() {
                 idx: 1,
                 val: Val::from(&s2[..]),
             }];
-            trx = sys.trx_update(trx, &k2, update2).await;
+            trx = expect_trx_update(table_id, trx, &k2, update2).await;
 
             // lookup this updated value inside same transaction
-            trx = sys
-                .trx_select(trx, &k2, |row| {
-                    assert!(row.len() == 2);
-                    assert!(row[0] == k2.vals[0]);
-                    assert!(row[1] == Val::from(&s2[..]));
-                })
-                .await;
+            trx = expect_trx_select(table_id, trx, &k2, |row| {
+                assert!(row.len() == 2);
+                assert!(row[0] == k2.vals[0]);
+                assert!(row[1] == Val::from(&s2[..]));
+            })
+            .await;
 
             trx.commit().await.unwrap();
 
             // lookup with a new transaction
             let mut trx = session.begin_trx().unwrap();
-            trx = sys
-                .trx_select(trx, &k2, |row| {
-                    assert!(row.len() == 2);
-                    assert!(row[0] == k2.vals[0]);
-                    assert!(row[1] == Val::from(&s2[..]));
-                })
-                .await;
+            trx = expect_trx_select(table_id, trx, &k2, |row| {
+                assert!(row.len() == 2);
+                assert!(row[0] == k2.vals[0]);
+                assert!(row[1] == Val::from(&s2[..]));
+            })
+            .await;
 
             let _ = trx.commit().await.unwrap();
         }
@@ -569,32 +495,34 @@ fn test_mvcc_delete_normal() {
     smol::block_on(async {
         const SIZE: i32 = 1000;
 
-        let sys = TestSys::new_evictable().await;
+        let temp_dir = TempDir::new().unwrap();
+        let engine = evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys").await;
+        let table_id = create_table2_for_test(&engine).await;
         {
-            let mut session = sys.new_session().unwrap();
+            let mut session = engine.new_session().unwrap();
             // insert 1000 rows
             // let mut trx = session.begin_trx(trx_sys);
             let mut trx = session.begin_trx().unwrap();
             for i in 0..SIZE {
                 let s = format!("{}", i);
                 let insert = vec![Val::from(i), Val::from(&s[..])];
-                trx = sys.trx_insert(trx, insert).await;
+                trx = expect_trx_insert(table_id, trx, insert).await;
             }
             trx.commit().await.unwrap();
 
             // delete 1 row
             let mut trx = session.begin_trx().unwrap();
             let k1 = single_key(1i32);
-            trx = sys.trx_delete(trx, &k1).await;
+            trx = expect_trx_delete(table_id, trx, &k1).await;
 
             // lookup row in same transaction
-            trx = sys.trx_select_not_found(trx, &k1).await;
+            trx = expect_trx_select_not_found(table_id, trx, &k1).await;
             trx.commit().await.unwrap();
 
             // lookup row in new transaction
             let mut trx = session.begin_trx().unwrap();
             let k1 = single_key(1i32);
-            trx = sys.trx_select_not_found(trx, &k1).await;
+            trx = expect_trx_select_not_found(table_id, trx, &k1).await;
             let _ = trx.commit().await.unwrap();
         }
     });
@@ -603,25 +531,33 @@ fn test_mvcc_delete_normal() {
 #[test]
 fn test_column_delete_basic() {
     smol::block_on(async {
-        let sys = TestSys::new_evictable().await;
-        let mut session = sys.new_session().unwrap();
-        insert_rows(&sys, &mut session, 0, 10, "name").await;
-        sys.table.freeze(&session, usize::MAX).await.unwrap();
-        checkpoint_published(&sys.table, &mut session).await;
+        let temp_dir = TempDir::new().unwrap();
+        let engine = evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys").await;
+        let table_id = create_table2_for_test(&engine).await;
+        let mut session = engine.new_session().unwrap();
+        insert_rows(table_id, &mut session, 0, 10, "name").await;
+        session.freeze_table(table_id, usize::MAX).await.unwrap();
+        checkpoint_published(table_id, &mut session).await;
 
         let key = single_key(1i32);
-        let mut reader_session = sys.new_session().unwrap();
+        let mut reader_session = engine.new_session().unwrap();
         let trx = reader_session.begin_trx().unwrap();
-        let _ = assert_row_in_lwc(&sys.table, &reader_session.pool_guards(), &key, trx.sts()).await;
+        let _ = assert_row_in_lwc(
+            &table_for_internal_assertion(&engine, table_id),
+            &reader_session.pool_guards(),
+            &key,
+            trx.sts(),
+        )
+        .await;
         trx.commit().await.unwrap();
 
         let mut trx = session.begin_trx().unwrap();
-        let res = trx_delete_row(&mut trx, &sys.table, &key).await;
+        let res = trx_delete_row_by_id(&mut trx, table_id, &key).await;
         assert!(matches!(res, Ok(DeleteMvcc::Deleted)));
         trx.commit().await.unwrap();
 
         let mut trx = session.begin_trx().unwrap();
-        trx = sys.trx_select_not_found(trx, &key).await;
+        trx = expect_trx_select_not_found(table_id, trx, &key).await;
         trx.commit().await.unwrap();
     });
 }
@@ -629,50 +565,61 @@ fn test_column_delete_basic() {
 #[test]
 fn test_lwc_read_uses_readonly_buffer_pool() {
     smol::block_on(async {
-        let sys = TestSys::new_evictable().await;
-        let mut session = sys.new_session().unwrap();
-        insert_rows(&sys, &mut session, 0, 10, "name").await;
-        sys.table.freeze(&session, usize::MAX).await.unwrap();
-        checkpoint_published(&sys.table, &mut session).await;
+        let temp_dir = TempDir::new().unwrap();
+        let engine = evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys").await;
+        let table_id = create_table2_for_test(&engine).await;
+        let mut session = engine.new_session().unwrap();
+        insert_rows(table_id, &mut session, 0, 10, "name").await;
+        session.freeze_table(table_id, usize::MAX).await.unwrap();
+        checkpoint_published(table_id, &mut session).await;
 
         let key = single_key(1i32);
-        let mut reader_session = sys.new_session().unwrap();
+        let mut reader_session = engine.new_session().unwrap();
         let trx = reader_session.begin_trx().unwrap();
-        let _ = assert_row_in_lwc(&sys.table, &reader_session.pool_guards(), &key, trx.sts()).await;
+        let _ = assert_row_in_lwc(
+            &table_for_internal_assertion(&engine, table_id),
+            &reader_session.pool_guards(),
+            &key,
+            trx.sts(),
+        )
+        .await;
         trx.commit().await.unwrap();
 
-        let allocated_after_route = sys.engine.disk_pool.allocated();
+        let allocated_after_route = engine.disk_pool.allocated();
         assert!(allocated_after_route >= 1);
 
-        sys.new_trx_select(&mut session, &key, |vals| {
+        expect_select_committed(table_id, &mut session, &key, |vals| {
             assert_eq!(vals[0], Val::from(1i32));
             assert_eq!(vals[1], Val::from("name"));
         })
         .await;
-        let allocated_after_first = sys.engine.disk_pool.allocated();
+        let allocated_after_first = engine.disk_pool.allocated();
         assert!(allocated_after_first >= allocated_after_route);
 
-        sys.new_trx_select(&mut session, &key, |vals| {
+        expect_select_committed(table_id, &mut session, &key, |vals| {
             assert_eq!(vals[0], Val::from(1i32));
             assert_eq!(vals[1], Val::from("name"));
         })
         .await;
-        assert_eq!(sys.engine.disk_pool.allocated(), allocated_after_first);
+        assert_eq!(engine.disk_pool.allocated(), allocated_after_first);
     });
 }
 
 #[test]
 fn test_find_row_returns_resolved_lwc_page_location() {
     smol::block_on(async {
-        let sys = TestSys::new_evictable().await;
-        let mut session = sys.new_session().unwrap();
-        insert_rows(&sys, &mut session, 0, 10, "name").await;
-        sys.table.freeze(&session, usize::MAX).await.unwrap();
-        checkpoint_published(&sys.table, &mut session).await;
+        let temp_dir = TempDir::new().unwrap();
+        let engine = evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys").await;
+        let table_id = create_table2_for_test(&engine).await;
+        let mut session = engine.new_session().unwrap();
+        insert_rows(table_id, &mut session, 0, 10, "name").await;
+        session.freeze_table(table_id, usize::MAX).await.unwrap();
+        checkpoint_published(table_id, &mut session).await;
 
         let key = single_key(1i32);
         let trx = session.begin_trx().unwrap();
-        let index = bound_unique_index_no(&sys.table, key.index_no);
+        let table = table_for_internal_assertion(&engine, table_id);
+        let index = bound_unique_index_no(&table, key.index_no);
         let (row_id, _) = index
             .lookup(session.pool_guards().index_guard(), &key.vals, trx.sts())
             .await
@@ -680,23 +627,15 @@ fn test_find_row_returns_resolved_lwc_page_location() {
             .unwrap();
 
         let pool_guards = session.pool_guards();
-        let active_root = sys.table.file().active_root_unchecked();
-        let column_index = ColumnBlockIndex::new(
-            active_root.column_block_index_root,
-            active_root.pivot_row_id,
-            sys.table.file().file_kind(),
-            sys.table.file().sparse_file(),
-            sys.table.disk_pool(),
-            pool_guards.disk_guard(),
-        );
+        let snapshot = column_block_index_snapshot(&engine, table_id);
+        let column_index = snapshot.index(pool_guards.disk_guard());
         let resolved = column_index
             .locate_and_resolve_row(row_id)
             .await
             .unwrap()
             .unwrap();
 
-        match sys
-            .table
+        match table
             .find_row(&session.pool_guards(), row_id)
             .await
             .unwrap()
@@ -720,38 +659,31 @@ fn test_find_row_returns_resolved_lwc_page_location() {
 #[test]
 fn test_lwc_select_surfaces_persisted_corruption() {
     smol::block_on(async {
-        let sys = TestSys::new_evictable().await;
-        let mut session = sys.new_session().unwrap();
-        insert_rows(&sys, &mut session, 0, 10, "name").await;
-        sys.table.freeze(&session, usize::MAX).await.unwrap();
-        checkpoint_published(&sys.table, &mut session).await;
+        let temp_dir = TempDir::new().unwrap();
+        let engine = evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys").await;
+        let table_id = create_table2_for_test(&engine).await;
+        let mut session = engine.new_session().unwrap();
+        insert_rows(table_id, &mut session, 0, 10, "name").await;
+        session.freeze_table(table_id, usize::MAX).await.unwrap();
+        checkpoint_published(table_id, &mut session).await;
 
         let key = single_key(1i32);
         let trx = session.begin_trx().unwrap();
-        let row_id = assert_row_in_lwc(&sys.table, &session.pool_guards(), &key, trx.sts()).await;
+        let table = table_for_internal_assertion(&engine, table_id);
+        let row_id = assert_row_in_lwc(&table, &session.pool_guards(), &key, trx.sts()).await;
         trx.commit().await.unwrap();
 
         let pool_guards = session.pool_guards();
-        let active_root = sys.table.file().active_root_unchecked();
-        let index = ColumnBlockIndex::new(
-            active_root.column_block_index_root,
-            active_root.pivot_row_id,
-            sys.table.file().file_kind(),
-            sys.table.file().sparse_file(),
-            sys.table.disk_pool(),
-            pool_guards.disk_guard(),
-        );
+        let snapshot = column_block_index_snapshot(&engine, table_id);
+        let index = snapshot.index(pool_guards.disk_guard());
         let entry = index.locate_block(row_id).await.unwrap().unwrap();
         let block_id = entry.block_id();
 
-        let table_file_path = sys
-            .engine
-            .table_fs
-            .user_table_file_path(sys.table.table_id());
+        let table_file_path = engine.table_fs.user_table_file_path(table_id);
         corrupt_page_checksum(table_file_path, block_id);
 
         let mut trx = session.begin_trx().unwrap();
-        let res = trx_select_row_mvcc(&mut trx, &sys.table, &key, &[0, 1]).await;
+        let res = trx_select_row_mvcc_by_id(&mut trx, table_id, &key, &[0, 1]).await;
         let err = match res {
             Err(err) => err,
             other => panic!("expected persisted LWC corruption, got {other:?}"),
@@ -769,41 +701,33 @@ fn test_lwc_select_surfaces_persisted_corruption() {
 #[test]
 fn test_lwc_select_surfaces_column_block_index_row_metadata_corruption() {
     smol::block_on(async {
-        let sys = TestSys::new_evictable().await;
-        let mut session = sys.new_session().unwrap();
-        insert_rows(&sys, &mut session, 0, 4, "name").await;
-        sys.table.freeze(&session, usize::MAX).await.unwrap();
-        checkpoint_published(&sys.table, &mut session).await;
+        let temp_dir = TempDir::new().unwrap();
+        let engine = evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys").await;
+        let table_id = create_table2_for_test(&engine).await;
+        let mut session = engine.new_session().unwrap();
+        insert_rows(table_id, &mut session, 0, 4, "name").await;
+        session.freeze_table(table_id, usize::MAX).await.unwrap();
+        checkpoint_published(table_id, &mut session).await;
 
         let key = single_key(1i32);
         let trx = session.begin_trx().unwrap();
-        let row_id = assert_row_in_lwc(&sys.table, &session.pool_guards(), &key, trx.sts()).await;
+        let table = table_for_internal_assertion(&engine, table_id);
+        let row_id = assert_row_in_lwc(&table, &session.pool_guards(), &key, trx.sts()).await;
         trx.commit().await.unwrap();
 
         let pool_guards = session.pool_guards();
-        let active_root = sys.table.file().active_root_unchecked();
-        let index = ColumnBlockIndex::new(
-            active_root.column_block_index_root,
-            active_root.pivot_row_id,
-            sys.table.file().file_kind(),
-            sys.table.file().sparse_file(),
-            sys.table.disk_pool(),
-            pool_guards.disk_guard(),
-        );
+        let snapshot = column_block_index_snapshot(&engine, table_id);
+        let index = snapshot.index(pool_guards.disk_guard());
         let entry = index.locate_block(row_id).await.unwrap().unwrap();
 
-        let table_file_path = sys
-            .engine
-            .table_fs
-            .user_table_file_path(sys.table.table_id());
+        let table_file_path = engine.table_fs.user_table_file_path(table_id);
         corrupt_leaf_row_codec(table_file_path, entry.leaf_block_id, 0);
-        let _ = sys.table.disk_pool().invalidate_block(
-            sys.table.file().sparse_file().file_id(),
-            entry.leaf_block_id,
-        );
+        let _ = table
+            .disk_pool()
+            .invalidate_block(table.file().sparse_file().file_id(), entry.leaf_block_id);
 
         let mut trx = session.begin_trx().unwrap();
-        let res = trx_select_row_mvcc(&mut trx, &sys.table, &key, &[0, 1]).await;
+        let res = trx_select_row_mvcc_by_id(&mut trx, table_id, &key, &[0, 1]).await;
         let err = match res {
             Err(err) => err,
             other => panic!("expected persisted column-block-index corruption, got {other:?}"),
@@ -821,41 +745,33 @@ fn test_lwc_select_surfaces_column_block_index_row_metadata_corruption() {
 #[test]
 fn test_lwc_select_surfaces_column_block_index_zero_block_id_corruption() {
     smol::block_on(async {
-        let sys = TestSys::new_evictable().await;
-        let mut session = sys.new_session().unwrap();
-        insert_rows(&sys, &mut session, 0, 4, "name").await;
-        sys.table.freeze(&session, usize::MAX).await.unwrap();
-        checkpoint_published(&sys.table, &mut session).await;
+        let temp_dir = TempDir::new().unwrap();
+        let engine = evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys").await;
+        let table_id = create_table2_for_test(&engine).await;
+        let mut session = engine.new_session().unwrap();
+        insert_rows(table_id, &mut session, 0, 4, "name").await;
+        session.freeze_table(table_id, usize::MAX).await.unwrap();
+        checkpoint_published(table_id, &mut session).await;
 
         let key = single_key(1i32);
         let trx = session.begin_trx().unwrap();
-        let row_id = assert_row_in_lwc(&sys.table, &session.pool_guards(), &key, trx.sts()).await;
+        let table = table_for_internal_assertion(&engine, table_id);
+        let row_id = assert_row_in_lwc(&table, &session.pool_guards(), &key, trx.sts()).await;
         trx.commit().await.unwrap();
 
         let pool_guards = session.pool_guards();
-        let active_root = sys.table.file().active_root_unchecked();
-        let index = ColumnBlockIndex::new(
-            active_root.column_block_index_root,
-            active_root.pivot_row_id,
-            sys.table.file().file_kind(),
-            sys.table.file().sparse_file(),
-            sys.table.disk_pool(),
-            pool_guards.disk_guard(),
-        );
+        let snapshot = column_block_index_snapshot(&engine, table_id);
+        let index = snapshot.index(pool_guards.disk_guard());
         let entry = index.locate_block(row_id).await.unwrap().unwrap();
 
-        let table_file_path = sys
-            .engine
-            .table_fs
-            .user_table_file_path(sys.table.table_id());
+        let table_file_path = engine.table_fs.user_table_file_path(table_id);
         corrupt_leaf_block_id(table_file_path, entry.leaf_block_id, 0);
-        let _ = sys.table.disk_pool().invalidate_block(
-            sys.table.file().sparse_file().file_id(),
-            entry.leaf_block_id,
-        );
+        let _ = table
+            .disk_pool()
+            .invalidate_block(table.file().sparse_file().file_id(), entry.leaf_block_id);
 
         let mut trx = session.begin_trx().unwrap();
-        let res = trx_select_row_mvcc(&mut trx, &sys.table, &key, &[0, 1]).await;
+        let res = trx_select_row_mvcc_by_id(&mut trx, table_id, &key, &[0, 1]).await;
         let err = match res {
             Err(err) => err,
             other => panic!("expected persisted column-block-index corruption, got {other:?}"),
@@ -873,41 +789,33 @@ fn test_lwc_select_surfaces_column_block_index_zero_block_id_corruption() {
 #[test]
 fn test_lwc_select_surfaces_row_shape_fingerprint_mismatch_corruption() {
     smol::block_on(async {
-        let sys = TestSys::new_evictable().await;
-        let mut session = sys.new_session().unwrap();
-        insert_rows(&sys, &mut session, 0, 4, "name").await;
-        sys.table.freeze(&session, usize::MAX).await.unwrap();
-        checkpoint_published(&sys.table, &mut session).await;
+        let temp_dir = TempDir::new().unwrap();
+        let engine = evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys").await;
+        let table_id = create_table2_for_test(&engine).await;
+        let mut session = engine.new_session().unwrap();
+        insert_rows(table_id, &mut session, 0, 4, "name").await;
+        session.freeze_table(table_id, usize::MAX).await.unwrap();
+        checkpoint_published(table_id, &mut session).await;
 
         let key = single_key(1i32);
         let trx = session.begin_trx().unwrap();
-        let row_id = assert_row_in_lwc(&sys.table, &session.pool_guards(), &key, trx.sts()).await;
+        let table = table_for_internal_assertion(&engine, table_id);
+        let row_id = assert_row_in_lwc(&table, &session.pool_guards(), &key, trx.sts()).await;
         trx.commit().await.unwrap();
 
         let pool_guards = session.pool_guards();
-        let active_root = sys.table.file().active_root_unchecked();
-        let index = ColumnBlockIndex::new(
-            active_root.column_block_index_root,
-            active_root.pivot_row_id,
-            sys.table.file().file_kind(),
-            sys.table.file().sparse_file(),
-            sys.table.disk_pool(),
-            pool_guards.disk_guard(),
-        );
+        let snapshot = column_block_index_snapshot(&engine, table_id);
+        let index = snapshot.index(pool_guards.disk_guard());
         let entry = index.locate_block(row_id).await.unwrap().unwrap();
 
-        let table_file_path = sys
-            .engine
-            .table_fs
-            .user_table_file_path(sys.table.table_id());
+        let table_file_path = engine.table_fs.user_table_file_path(table_id);
         corrupt_lwc_row_shape_fingerprint(table_file_path, entry.block_id());
-        let _ = sys
-            .table
+        let _ = table
             .disk_pool()
-            .invalidate_block(sys.table.file().sparse_file().file_id(), entry.block_id());
+            .invalidate_block(table.file().sparse_file().file_id(), entry.block_id());
 
         let mut trx = session.begin_trx().unwrap();
-        let res = trx_select_row_mvcc(&mut trx, &sys.table, &key, &[0, 1]).await;
+        let res = trx_select_row_mvcc_by_id(&mut trx, table_id, &key, &[0, 1]).await;
         let err = match res {
             Err(err) => err,
             other => panic!("expected persisted LWC invalid-payload corruption, got {other:?}"),
@@ -925,25 +833,32 @@ fn test_lwc_select_surfaces_row_shape_fingerprint_mismatch_corruption() {
 #[test]
 fn test_column_delete_rollback() {
     smol::block_on(async {
-        let sys = TestSys::new_evictable().await;
-        let mut session = sys.new_session().unwrap();
-        insert_rows(&sys, &mut session, 0, 10, "name").await;
-        sys.table.freeze(&session, usize::MAX).await.unwrap();
-        checkpoint_published(&sys.table, &mut session).await;
+        let temp_dir = TempDir::new().unwrap();
+        let engine = evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys").await;
+        let table_id = create_table2_for_test(&engine).await;
+        let mut session = engine.new_session().unwrap();
+        insert_rows(table_id, &mut session, 0, 10, "name").await;
+        session.freeze_table(table_id, usize::MAX).await.unwrap();
+        checkpoint_published(table_id, &mut session).await;
 
         let key = single_key(2i32);
-        let mut reader_session = sys.new_session().unwrap();
+        let mut reader_session = engine.new_session().unwrap();
         let trx = reader_session.begin_trx().unwrap();
-        let old_row_id =
-            assert_row_in_lwc(&sys.table, &reader_session.pool_guards(), &key, trx.sts()).await;
+        let old_row_id = assert_row_in_lwc(
+            &table_for_internal_assertion(&engine, table_id),
+            &reader_session.pool_guards(),
+            &key,
+            trx.sts(),
+        )
+        .await;
         trx.commit().await.unwrap();
 
         let mut trx = session.begin_trx().unwrap();
         trx.exec(async |stmt| {
-            let res = stmt_delete_row(stmt, &sys.table, &key).await;
+            let res = stmt_delete_row_by_id(stmt, table_id, &key).await;
             assert!(matches!(res, Ok(DeleteMvcc::Deleted)));
             assert_unique_index_entry(
-                &sys.table,
+                &table_for_internal_assertion(&engine, table_id),
                 &session.pool_guards(),
                 &key,
                 stmt.runtime().sts(),
@@ -957,7 +872,7 @@ fn test_column_delete_rollback() {
         .unwrap();
         trx.rollback().await.unwrap();
         assert_unique_index_entry(
-            &sys.table,
+            &table_for_internal_assertion(&engine, table_id),
             &session.pool_guards(),
             &key,
             MAX_SNAPSHOT_TS,
@@ -967,11 +882,10 @@ fn test_column_delete_rollback() {
         .await;
 
         let mut trx = session.begin_trx().unwrap();
-        trx = sys
-            .trx_select(trx, &key, |row| {
-                assert_eq!(row[0], Val::from(2i32));
-            })
-            .await;
+        trx = expect_trx_select(table_id, trx, &key, |row| {
+            assert_eq!(row[0], Val::from(2i32));
+        })
+        .await;
         trx.commit().await.unwrap();
     });
 }
@@ -979,34 +893,41 @@ fn test_column_delete_rollback() {
 #[test]
 fn test_column_delete_rollback_after_checkpoint() {
     smol::block_on(async {
-        let sys = TestSys::new_evictable().await;
-        let mut session = sys.new_session().unwrap();
-        insert_rows(&sys, &mut session, 0, 10, "name").await;
+        let temp_dir = TempDir::new().unwrap();
+        let engine = evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys").await;
+        let table_id = create_table2_for_test(&engine).await;
+        let mut session = engine.new_session().unwrap();
+        insert_rows(table_id, &mut session, 0, 10, "name").await;
 
         let key = single_key(3i32);
         let mut trx_delete = session.begin_trx().unwrap();
-        let res = trx_delete_row(&mut trx_delete, &sys.table, &key).await;
+        let res = trx_delete_row_by_id(&mut trx_delete, table_id, &key).await;
         assert!(matches!(res, Ok(DeleteMvcc::Deleted)));
 
-        sys.table.freeze(&session, usize::MAX).await.unwrap();
-        let mut checkpoint_session = sys.new_session().unwrap();
-        checkpoint_published(&sys.table, &mut checkpoint_session).await;
+        session.freeze_table(table_id, usize::MAX).await.unwrap();
+        let mut checkpoint_session = engine.new_session().unwrap();
+        checkpoint_published(table_id, &mut checkpoint_session).await;
 
-        let mut reader_session = sys.new_session().unwrap();
+        let mut reader_session = engine.new_session().unwrap();
         let trx = reader_session.begin_trx().unwrap();
-        let _ = assert_row_in_lwc(&sys.table, &reader_session.pool_guards(), &key, trx.sts()).await;
+        let _ = assert_row_in_lwc(
+            &table_for_internal_assertion(&engine, table_id),
+            &reader_session.pool_guards(),
+            &key,
+            trx.sts(),
+        )
+        .await;
         trx.commit().await.unwrap();
 
-        let res = trx_select_row_mvcc(&mut trx_delete, &sys.table, &key, &[0, 1]).await;
+        let res = trx_select_row_mvcc_by_id(&mut trx_delete, table_id, &key, &[0, 1]).await;
         assert!(matches!(res, Ok(SelectMvcc::NotFound)));
         trx_delete.rollback().await.unwrap();
 
         let mut trx = session.begin_trx().unwrap();
-        trx = sys
-            .trx_select(trx, &key, |row| {
-                assert_eq!(row[0], Val::from(3i32));
-            })
-            .await;
+        trx = expect_trx_select(table_id, trx, &key, |row| {
+            assert_eq!(row[0], Val::from(3i32));
+        })
+        .await;
         trx.commit().await.unwrap();
     });
 }
@@ -1014,24 +935,32 @@ fn test_column_delete_rollback_after_checkpoint() {
 #[test]
 fn test_column_delete_write_conflict() {
     smol::block_on(async {
-        let sys = TestSys::new_evictable().await;
-        let mut session = sys.new_session().unwrap();
-        insert_rows(&sys, &mut session, 0, 10, "name").await;
-        sys.table.freeze(&session, usize::MAX).await.unwrap();
-        checkpoint_published(&sys.table, &mut session).await;
+        let temp_dir = TempDir::new().unwrap();
+        let engine = evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys").await;
+        let table_id = create_table2_for_test(&engine).await;
+        let mut session = engine.new_session().unwrap();
+        insert_rows(table_id, &mut session, 0, 10, "name").await;
+        session.freeze_table(table_id, usize::MAX).await.unwrap();
+        checkpoint_published(table_id, &mut session).await;
 
         let key = single_key(4i32);
         let trx = session.begin_trx().unwrap();
-        let _ = assert_row_in_lwc(&sys.table, &session.pool_guards(), &key, trx.sts()).await;
+        let _ = assert_row_in_lwc(
+            &table_for_internal_assertion(&engine, table_id),
+            &session.pool_guards(),
+            &key,
+            trx.sts(),
+        )
+        .await;
         trx.commit().await.unwrap();
 
         let mut trx1 = session.begin_trx().unwrap();
-        let res1 = trx_delete_row(&mut trx1, &sys.table, &key).await;
+        let res1 = trx_delete_row_by_id(&mut trx1, table_id, &key).await;
         assert!(matches!(res1, Ok(DeleteMvcc::Deleted)));
 
-        let mut session2 = sys.new_session().unwrap();
+        let mut session2 = engine.new_session().unwrap();
         let mut trx2 = session2.begin_trx().unwrap();
-        let res2 = trx_delete_row(&mut trx2, &sys.table, &key).await;
+        let res2 = trx_delete_row_by_id(&mut trx2, table_id, &key).await;
         assert!(matches!(res2, Ok(DeleteMvcc::WriteConflict)));
         trx2.rollback().await.unwrap();
         drop(session2);
@@ -1043,35 +972,42 @@ fn test_column_delete_write_conflict() {
 #[test]
 fn test_column_delete_mvcc_visibility() {
     smol::block_on(async {
-        let sys = TestSys::new_evictable().await;
-        let mut session = sys.new_session().unwrap();
-        insert_rows(&sys, &mut session, 0, 10, "name").await;
-        sys.table.freeze(&session, usize::MAX).await.unwrap();
-        checkpoint_published(&sys.table, &mut session).await;
+        let temp_dir = TempDir::new().unwrap();
+        let engine = evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys").await;
+        let table_id = create_table2_for_test(&engine).await;
+        let mut session = engine.new_session().unwrap();
+        insert_rows(table_id, &mut session, 0, 10, "name").await;
+        session.freeze_table(table_id, usize::MAX).await.unwrap();
+        checkpoint_published(table_id, &mut session).await;
 
         let key = single_key(5i32);
         let trx = session.begin_trx().unwrap();
-        let _ = assert_row_in_lwc(&sys.table, &session.pool_guards(), &key, trx.sts()).await;
+        let _ = assert_row_in_lwc(
+            &table_for_internal_assertion(&engine, table_id),
+            &session.pool_guards(),
+            &key,
+            trx.sts(),
+        )
+        .await;
         trx.commit().await.unwrap();
 
-        let mut reader_session = sys.new_session().unwrap();
+        let mut reader_session = engine.new_session().unwrap();
         let mut trx_reader = reader_session.begin_trx().unwrap();
 
-        let mut delete_session = sys.new_session().unwrap();
+        let mut delete_session = engine.new_session().unwrap();
         let mut trx_delete = delete_session.begin_trx().unwrap();
-        let res = trx_delete_row(&mut trx_delete, &sys.table, &key).await;
+        let res = trx_delete_row_by_id(&mut trx_delete, table_id, &key).await;
         assert!(matches!(res, Ok(DeleteMvcc::Deleted)));
         trx_delete.commit().await.unwrap();
 
-        trx_reader = sys
-            .trx_select(trx_reader, &key, |row| {
-                assert_eq!(row[0], Val::from(5i32));
-            })
-            .await;
+        trx_reader = expect_trx_select(table_id, trx_reader, &key, |row| {
+            assert_eq!(row[0], Val::from(5i32));
+        })
+        .await;
         trx_reader.commit().await.unwrap();
 
         let mut trx_new = session.begin_trx().unwrap();
-        trx_new = sys.trx_select_not_found(trx_new, &key).await;
+        trx_new = expect_trx_select_not_found(table_id, trx_new, &key).await;
         trx_new.commit().await.unwrap();
     });
 }
@@ -1079,51 +1015,64 @@ fn test_column_delete_mvcc_visibility() {
 #[test]
 fn test_lwc_delete_unique_conflicts_when_delete_committed_after_snapshot() {
     smol::block_on(async {
-        let sys = TestSys::new_evictable().await;
-        let mut session = sys.new_session().unwrap();
-        insert_rows(&sys, &mut session, 0, 10, "name").await;
-        sys.table.freeze(&session, usize::MAX).await.unwrap();
-        checkpoint_published(&sys.table, &mut session).await;
+        let temp_dir = TempDir::new().unwrap();
+        let engine = evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys").await;
+        let table_id = create_table2_for_test(&engine).await;
+        let mut session = engine.new_session().unwrap();
+        insert_rows(table_id, &mut session, 0, 10, "name").await;
+        session.freeze_table(table_id, usize::MAX).await.unwrap();
+        checkpoint_published(table_id, &mut session).await;
 
         let key = single_key(5i32);
-        let mut writer_session = sys.new_session().unwrap();
+        let mut writer_session = engine.new_session().unwrap();
         let mut writer = writer_session.begin_trx().unwrap();
         let writer_sts = writer.sts();
-        let row_id =
-            assert_row_in_lwc(&sys.table, &writer_session.pool_guards(), &key, writer_sts).await;
+        let row_id = assert_row_in_lwc(
+            &table_for_internal_assertion(&engine, table_id),
+            &writer_session.pool_guards(),
+            &key,
+            writer_sts,
+        )
+        .await;
 
-        sys.new_trx_delete(&mut session, &key).await;
-        let delete_cts = delete_marker_ts(sys.table.deletion_buffer().get(row_id).unwrap());
+        expect_delete_committed(table_id, &mut session, &key).await;
+        let delete_cts = delete_marker_ts(
+            table_for_internal_assertion(&engine, table_id)
+                .deletion_buffer()
+                .get(row_id)
+                .unwrap(),
+        );
         assert!(delete_cts > writer_sts);
 
-        writer = sys
-            .trx_select(writer, &key, |row| {
-                assert_eq!(row, vec![Val::from(5i32), Val::from("name")]);
-            })
-            .await;
+        writer = expect_trx_select(table_id, writer, &key, |row| {
+            assert_eq!(row, vec![Val::from(5i32), Val::from("name")]);
+        })
+        .await;
 
-        let res = trx_delete_row(&mut writer, &sys.table, &key).await;
+        let res = trx_delete_row_by_id(&mut writer, table_id, &key).await;
         assert!(matches!(res, Ok(DeleteMvcc::WriteConflict)));
         writer.rollback().await.unwrap();
 
-        sys.new_trx_select_not_found(&mut session, &key).await;
+        expect_select_not_found_committed(table_id, &mut session, &key).await;
     });
 }
 
 #[test]
 fn test_lwc_update_unique_same_key_reinserts_hot_and_preserves_old_snapshot() {
     smol::block_on(async {
-        let sys = TestSys::new_evictable().await;
-        let mut session = sys.new_session().unwrap();
-        insert_rows(&sys, &mut session, 0, 4, "name").await;
-        sys.table.freeze(&session, usize::MAX).await.unwrap();
-        checkpoint_published(&sys.table, &mut session).await;
+        let temp_dir = TempDir::new().unwrap();
+        let engine = evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys").await;
+        let table_id = create_table2_for_test(&engine).await;
+        let mut session = engine.new_session().unwrap();
+        insert_rows(table_id, &mut session, 0, 4, "name").await;
+        session.freeze_table(table_id, usize::MAX).await.unwrap();
+        checkpoint_published(table_id, &mut session).await;
 
         let key = single_key(1i32);
-        let mut old_reader_session = sys.new_session().unwrap();
+        let mut old_reader_session = engine.new_session().unwrap();
         let mut old_reader = old_reader_session.begin_trx().unwrap();
         let old_row_id = assert_row_in_lwc(
-            &sys.table,
+            &table_for_internal_assertion(&engine, table_id),
             &old_reader_session.pool_guards(),
             &key,
             old_reader.sts(),
@@ -1133,9 +1082,9 @@ fn test_lwc_update_unique_same_key_reinserts_hot_and_preserves_old_snapshot() {
         let mut writer = session.begin_trx().unwrap();
         writer
             .exec(async |stmt| {
-                let res = stmt_update_row(
+                let res = stmt_update_row_by_id(
                     stmt,
-                    &sys.table,
+                    table_id,
                     &key,
                     vec![UpdateCol {
                         idx: 1,
@@ -1149,7 +1098,7 @@ fn test_lwc_update_unique_same_key_reinserts_hot_and_preserves_old_snapshot() {
                 };
                 assert_ne!(old_row_id, new_row_id);
                 assert_unique_index_entry(
-                    &sys.table,
+                    &table_for_internal_assertion(&engine, table_id),
                     &session.pool_guards(),
                     &key,
                     stmt.runtime().sts(),
@@ -1158,13 +1107,17 @@ fn test_lwc_update_unique_same_key_reinserts_hot_and_preserves_old_snapshot() {
                 )
                 .await;
                 assert!(matches!(
-                    sys.table
+                    table_for_internal_assertion(&engine, table_id)
                         .find_row(&session.pool_guards(), new_row_id)
                         .await
                         .unwrap(),
                     RowLocation::RowPage(_)
                 ));
-                match sys.table.deletion_buffer().get(old_row_id).unwrap() {
+                match table_for_internal_assertion(&engine, table_id)
+                    .deletion_buffer()
+                    .get(old_row_id)
+                    .unwrap()
+                {
                     DeleteMarker::Ref(status) => {
                         assert!(Arc::ptr_eq(&status, &stmt.runtime().status()));
                     }
@@ -1173,7 +1126,7 @@ fn test_lwc_update_unique_same_key_reinserts_hot_and_preserves_old_snapshot() {
                     }
                 }
 
-                let res = stmt_select_row_mvcc(stmt, &sys.table, &key, &[0, 1]).await;
+                let res = stmt_select_row_mvcc_by_id(stmt, table_id, &key, &[0, 1]).await;
                 assert!(matches!(
                     res,
                     Ok(SelectMvcc::Found(vals))
@@ -1183,23 +1136,21 @@ fn test_lwc_update_unique_same_key_reinserts_hot_and_preserves_old_snapshot() {
             })
             .await
             .unwrap();
-        old_reader = sys
-            .trx_select(old_reader, &key, |vals| {
-                assert_eq!(vals, vec![Val::from(1i32), Val::from("name")]);
-            })
-            .await;
+        old_reader = expect_trx_select(table_id, old_reader, &key, |vals| {
+            assert_eq!(vals, vec![Val::from(1i32), Val::from("name")]);
+        })
+        .await;
 
         writer.commit().await.unwrap();
 
-        sys.new_trx_select(&mut session, &key, |vals| {
+        expect_select_committed(table_id, &mut session, &key, |vals| {
             assert_eq!(vals, vec![Val::from(1i32), Val::from("updated")]);
         })
         .await;
-        old_reader = sys
-            .trx_select(old_reader, &key, |vals| {
-                assert_eq!(vals, vec![Val::from(1i32), Val::from("name")]);
-            })
-            .await;
+        old_reader = expect_trx_select(table_id, old_reader, &key, |vals| {
+            assert_eq!(vals, vec![Val::from(1i32), Val::from("name")]);
+        })
+        .await;
         old_reader.commit().await.unwrap();
     });
 }
@@ -1207,32 +1158,43 @@ fn test_lwc_update_unique_same_key_reinserts_hot_and_preserves_old_snapshot() {
 #[test]
 fn test_lwc_update_unique_conflicts_when_delete_committed_after_snapshot() {
     smol::block_on(async {
-        let sys = TestSys::new_evictable().await;
-        let mut session = sys.new_session().unwrap();
-        insert_rows(&sys, &mut session, 0, 10, "name").await;
-        sys.table.freeze(&session, usize::MAX).await.unwrap();
-        checkpoint_published(&sys.table, &mut session).await;
+        let temp_dir = TempDir::new().unwrap();
+        let engine = evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys").await;
+        let table_id = create_table2_for_test(&engine).await;
+        let mut session = engine.new_session().unwrap();
+        insert_rows(table_id, &mut session, 0, 10, "name").await;
+        session.freeze_table(table_id, usize::MAX).await.unwrap();
+        checkpoint_published(table_id, &mut session).await;
 
         let key = single_key(5i32);
-        let mut writer_session = sys.new_session().unwrap();
+        let mut writer_session = engine.new_session().unwrap();
         let mut writer = writer_session.begin_trx().unwrap();
         let writer_sts = writer.sts();
-        let row_id =
-            assert_row_in_lwc(&sys.table, &writer_session.pool_guards(), &key, writer_sts).await;
+        let row_id = assert_row_in_lwc(
+            &table_for_internal_assertion(&engine, table_id),
+            &writer_session.pool_guards(),
+            &key,
+            writer_sts,
+        )
+        .await;
 
-        sys.new_trx_delete(&mut session, &key).await;
-        let delete_cts = delete_marker_ts(sys.table.deletion_buffer().get(row_id).unwrap());
+        expect_delete_committed(table_id, &mut session, &key).await;
+        let delete_cts = delete_marker_ts(
+            table_for_internal_assertion(&engine, table_id)
+                .deletion_buffer()
+                .get(row_id)
+                .unwrap(),
+        );
         assert!(delete_cts > writer_sts);
 
-        writer = sys
-            .trx_select(writer, &key, |row| {
-                assert_eq!(row, vec![Val::from(5i32), Val::from("name")]);
-            })
-            .await;
+        writer = expect_trx_select(table_id, writer, &key, |row| {
+            assert_eq!(row, vec![Val::from(5i32), Val::from("name")]);
+        })
+        .await;
 
-        let res = trx_update_row(
+        let res = trx_update_row_by_id(
             &mut writer,
-            &sys.table,
+            table_id,
             &key,
             vec![UpdateCol {
                 idx: 1,
@@ -1244,25 +1206,27 @@ fn test_lwc_update_unique_conflicts_when_delete_committed_after_snapshot() {
         assert_eq!(err.operation_error(), Some(OperationError::WriteConflict));
         writer.rollback().await.unwrap();
 
-        sys.new_trx_select_not_found(&mut session, &key).await;
+        expect_select_not_found_committed(table_id, &mut session, &key).await;
     });
 }
 
 #[test]
 fn test_lwc_update_unique_key_change_preserves_old_and_new_key_visibility() {
     smol::block_on(async {
-        let sys = TestSys::new_evictable().await;
-        let mut session = sys.new_session().unwrap();
-        insert_rows(&sys, &mut session, 0, 4, "name").await;
-        sys.table.freeze(&session, usize::MAX).await.unwrap();
-        checkpoint_published(&sys.table, &mut session).await;
+        let temp_dir = TempDir::new().unwrap();
+        let engine = evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys").await;
+        let table_id = create_table2_for_test(&engine).await;
+        let mut session = engine.new_session().unwrap();
+        insert_rows(table_id, &mut session, 0, 4, "name").await;
+        session.freeze_table(table_id, usize::MAX).await.unwrap();
+        checkpoint_published(table_id, &mut session).await;
 
         let old_key = single_key(2i32);
         let new_key = single_key(20i32);
-        let mut old_reader_session = sys.new_session().unwrap();
+        let mut old_reader_session = engine.new_session().unwrap();
         let mut old_reader = old_reader_session.begin_trx().unwrap();
         let old_row_id = assert_row_in_lwc(
-            &sys.table,
+            &table_for_internal_assertion(&engine, table_id),
             &old_reader_session.pool_guards(),
             &old_key,
             old_reader.sts(),
@@ -1272,9 +1236,9 @@ fn test_lwc_update_unique_key_change_preserves_old_and_new_key_visibility() {
         let mut writer = session.begin_trx().unwrap();
         writer
             .exec(async |stmt| {
-                let res = stmt_update_row(
+                let res = stmt_update_row_by_id(
                     stmt,
-                    &sys.table,
+                    table_id,
                     &old_key,
                     vec![
                         UpdateCol {
@@ -1293,7 +1257,7 @@ fn test_lwc_update_unique_key_change_preserves_old_and_new_key_visibility() {
                     other => panic!("expected update success, got {other:?}"),
                 };
                 assert_unique_index_entry(
-                    &sys.table,
+                    &table_for_internal_assertion(&engine, table_id),
                     &session.pool_guards(),
                     &old_key,
                     stmt.runtime().sts(),
@@ -1302,7 +1266,7 @@ fn test_lwc_update_unique_key_change_preserves_old_and_new_key_visibility() {
                 )
                 .await;
                 assert_unique_index_entry(
-                    &sys.table,
+                    &table_for_internal_assertion(&engine, table_id),
                     &session.pool_guards(),
                     &new_key,
                     stmt.runtime().sts(),
@@ -1316,18 +1280,17 @@ fn test_lwc_update_unique_key_change_preserves_old_and_new_key_visibility() {
             .unwrap();
         writer.commit().await.unwrap();
 
-        sys.new_trx_select_not_found(&mut session, &old_key).await;
-        sys.new_trx_select(&mut session, &new_key, |vals| {
+        expect_select_not_found_committed(table_id, &mut session, &old_key).await;
+        expect_select_committed(table_id, &mut session, &new_key, |vals| {
             assert_eq!(vals, vec![Val::from(20i32), Val::from("moved")]);
         })
         .await;
 
-        old_reader = sys
-            .trx_select(old_reader, &old_key, |vals| {
-                assert_eq!(vals, vec![Val::from(2i32), Val::from("name")]);
-            })
-            .await;
-        old_reader = sys.trx_select_not_found(old_reader, &new_key).await;
+        old_reader = expect_trx_select(table_id, old_reader, &old_key, |vals| {
+            assert_eq!(vals, vec![Val::from(2i32), Val::from("name")]);
+        })
+        .await;
+        old_reader = expect_trx_select_not_found(table_id, old_reader, &new_key).await;
         old_reader.commit().await.unwrap();
     });
 }
@@ -1335,23 +1298,30 @@ fn test_lwc_update_unique_key_change_preserves_old_and_new_key_visibility() {
 #[test]
 fn test_lwc_update_unique_duplicate_rolls_back_cold_marker_and_hot_insert() {
     smol::block_on(async {
-        let sys = TestSys::new_evictable().await;
-        let mut session = sys.new_session().unwrap();
-        insert_rows(&sys, &mut session, 0, 4, "name").await;
-        sys.table.freeze(&session, usize::MAX).await.unwrap();
-        checkpoint_published(&sys.table, &mut session).await;
+        let temp_dir = TempDir::new().unwrap();
+        let engine = evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys").await;
+        let table_id = create_table2_for_test(&engine).await;
+        let mut session = engine.new_session().unwrap();
+        insert_rows(table_id, &mut session, 0, 4, "name").await;
+        session.freeze_table(table_id, usize::MAX).await.unwrap();
+        checkpoint_published(table_id, &mut session).await;
 
         let key = single_key(1i32);
         let duplicate_key = single_key(2i32);
         let trx = session.begin_trx().unwrap();
-        let old_row_id =
-            assert_row_in_lwc(&sys.table, &session.pool_guards(), &key, trx.sts()).await;
+        let old_row_id = assert_row_in_lwc(
+            &table_for_internal_assertion(&engine, table_id),
+            &session.pool_guards(),
+            &key,
+            trx.sts(),
+        )
+        .await;
         trx.commit().await.unwrap();
 
         let mut trx = session.begin_trx().unwrap();
-        let res = trx_update_row(
+        let res = trx_update_row_by_id(
             &mut trx,
-            &sys.table,
+            table_id,
             &key,
             vec![UpdateCol {
                 idx: 0,
@@ -1363,12 +1333,17 @@ fn test_lwc_update_unique_duplicate_rolls_back_cold_marker_and_hot_insert() {
         assert_eq!(err.operation_error(), Some(OperationError::DuplicateKey));
         trx.rollback().await.unwrap();
 
-        assert!(sys.table.deletion_buffer().get(old_row_id).is_none());
-        sys.new_trx_select(&mut session, &key, |vals| {
+        assert!(
+            table_for_internal_assertion(&engine, table_id)
+                .deletion_buffer()
+                .get(old_row_id)
+                .is_none()
+        );
+        expect_select_committed(table_id, &mut session, &key, |vals| {
             assert_eq!(vals, vec![Val::from(1i32), Val::from("name")]);
         })
         .await;
-        sys.new_trx_select(&mut session, &duplicate_key, |vals| {
+        expect_select_committed(table_id, &mut session, &duplicate_key, |vals| {
             assert_eq!(vals, vec![Val::from(2i32), Val::from("name")]);
         })
         .await;
@@ -1378,30 +1353,33 @@ fn test_lwc_update_unique_duplicate_rolls_back_cold_marker_and_hot_insert() {
 #[test]
 fn test_lwc_update_unique_claims_committed_deleted_cold_owner_with_visibility_bridge() {
     smol::block_on(async {
-        let sys = TestSys::new_evictable().await;
-        let mut session = sys.new_session().unwrap();
-        insert_rows(&sys, &mut session, 1, 2, "name").await;
-        sys.table.freeze(&session, usize::MAX).await.unwrap();
-        checkpoint_published(&sys.table, &mut session).await;
+        let temp_dir = TempDir::new().unwrap();
+        let engine = evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys").await;
+        let table_id = create_table2_for_test(&engine).await;
+        let mut session = engine.new_session().unwrap();
+        insert_rows(table_id, &mut session, 1, 2, "name").await;
+        session.freeze_table(table_id, usize::MAX).await.unwrap();
+        checkpoint_published(table_id, &mut session).await;
 
         let old_key = single_key(1i32);
         let claimed_key = single_key(2i32);
-        let mut old_reader_session = sys.new_session().unwrap();
+        let mut old_reader_session = engine.new_session().unwrap();
         let mut old_reader = old_reader_session.begin_trx().unwrap();
         let _ = assert_row_in_lwc(
-            &sys.table,
+            &table_for_internal_assertion(&engine, table_id),
             &old_reader_session.pool_guards(),
             &claimed_key,
             old_reader.sts(),
         )
         .await;
 
-        sys.new_trx_delete(&mut session, &claimed_key).await;
+        expect_delete_committed(table_id, &mut session, &claimed_key).await;
 
-        let mut gap_reader_session = sys.new_session().unwrap();
+        let mut gap_reader_session = engine.new_session().unwrap();
         let mut gap_reader = gap_reader_session.begin_trx().unwrap();
 
-        sys.new_trx_update(
+        expect_update_committed(
+            table_id,
             &mut session,
             &old_key,
             vec![
@@ -1417,16 +1395,15 @@ fn test_lwc_update_unique_claims_committed_deleted_cold_owner_with_visibility_br
         )
         .await;
 
-        sys.new_trx_select(&mut session, &claimed_key, |vals| {
+        expect_select_committed(table_id, &mut session, &claimed_key, |vals| {
             assert_eq!(vals, vec![Val::from(2i32), Val::from("claimed")]);
         })
         .await;
-        old_reader = sys
-            .trx_select(old_reader, &claimed_key, |vals| {
-                assert_eq!(vals, vec![Val::from(2i32), Val::from("name")]);
-            })
-            .await;
-        gap_reader = sys.trx_select_not_found(gap_reader, &claimed_key).await;
+        old_reader = expect_trx_select(table_id, old_reader, &claimed_key, |vals| {
+            assert_eq!(vals, vec![Val::from(2i32), Val::from("name")]);
+        })
+        .await;
+        gap_reader = expect_trx_select_not_found(table_id, gap_reader, &claimed_key).await;
 
         old_reader.commit().await.unwrap();
         gap_reader.commit().await.unwrap();
@@ -1436,30 +1413,37 @@ fn test_lwc_update_unique_claims_committed_deleted_cold_owner_with_visibility_br
 #[test]
 fn test_lwc_update_unique_rejects_cold_owner_deleted_after_snapshot() {
     smol::block_on(async {
-        let sys = TestSys::new_evictable().await;
-        let mut session = sys.new_session().unwrap();
-        insert_rows(&sys, &mut session, 1, 2, "name").await;
-        sys.table.freeze(&session, usize::MAX).await.unwrap();
-        checkpoint_published(&sys.table, &mut session).await;
+        let temp_dir = TempDir::new().unwrap();
+        let engine = evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys").await;
+        let table_id = create_table2_for_test(&engine).await;
+        let mut session = engine.new_session().unwrap();
+        insert_rows(table_id, &mut session, 1, 2, "name").await;
+        session.freeze_table(table_id, usize::MAX).await.unwrap();
+        checkpoint_published(table_id, &mut session).await;
 
         let old_key = single_key(1i32);
         let claimed_key = single_key(2i32);
-        let mut writer_session = sys.new_session().unwrap();
+        let mut writer_session = engine.new_session().unwrap();
         let mut writer = writer_session.begin_trx().unwrap();
         let writer_sts = writer.sts();
         let claimed_row_id = assert_row_in_lwc(
-            &sys.table,
+            &table_for_internal_assertion(&engine, table_id),
             &writer_session.pool_guards(),
             &claimed_key,
             writer_sts,
         )
         .await;
 
-        sys.new_trx_delete(&mut session, &claimed_key).await;
-        let delete_cts = delete_marker_ts(sys.table.deletion_buffer().get(claimed_row_id).unwrap());
+        expect_delete_committed(table_id, &mut session, &claimed_key).await;
+        let delete_cts = delete_marker_ts(
+            table_for_internal_assertion(&engine, table_id)
+                .deletion_buffer()
+                .get(claimed_row_id)
+                .unwrap(),
+        );
         assert!(delete_cts > writer_sts);
         assert_unique_index_entry(
-            &sys.table,
+            &table_for_internal_assertion(&engine, table_id),
             &writer_session.pool_guards(),
             &claimed_key,
             MAX_SNAPSHOT_TS,
@@ -1468,15 +1452,14 @@ fn test_lwc_update_unique_rejects_cold_owner_deleted_after_snapshot() {
         )
         .await;
 
-        writer = sys
-            .trx_select(writer, &claimed_key, |vals| {
-                assert_eq!(vals, vec![Val::from(2i32), Val::from("name")]);
-            })
-            .await;
+        writer = expect_trx_select(table_id, writer, &claimed_key, |vals| {
+            assert_eq!(vals, vec![Val::from(2i32), Val::from("name")]);
+        })
+        .await;
 
-        let res = trx_update_row(
+        let res = trx_update_row_by_id(
             &mut writer,
-            &sys.table,
+            table_id,
             &old_key,
             vec![
                 UpdateCol {
@@ -1495,7 +1478,7 @@ fn test_lwc_update_unique_rejects_cold_owner_deleted_after_snapshot() {
         writer.rollback().await.unwrap();
 
         assert_unique_index_entry(
-            &sys.table,
+            &table_for_internal_assertion(&engine, table_id),
             &session.pool_guards(),
             &claimed_key,
             MAX_SNAPSHOT_TS,
@@ -1503,39 +1486,40 @@ fn test_lwc_update_unique_rejects_cold_owner_deleted_after_snapshot() {
             true,
         )
         .await;
-        sys.new_trx_select(&mut session, &old_key, |vals| {
+        expect_select_committed(table_id, &mut session, &old_key, |vals| {
             assert_eq!(vals, vec![Val::from(1i32), Val::from("name")]);
         })
         .await;
-        sys.new_trx_select_not_found(&mut session, &claimed_key)
-            .await;
+        expect_select_not_found_committed(table_id, &mut session, &claimed_key).await;
     });
 }
 
 #[test]
 fn test_lwc_update_unique_claim_rollback_restores_deleted_cold_owner() {
     smol::block_on(async {
-        let sys = TestSys::new_evictable().await;
-        let mut session = sys.new_session().unwrap();
-        insert_rows(&sys, &mut session, 1, 2, "name").await;
-        sys.table.freeze(&session, usize::MAX).await.unwrap();
-        checkpoint_published(&sys.table, &mut session).await;
+        let temp_dir = TempDir::new().unwrap();
+        let engine = evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys").await;
+        let table_id = create_table2_for_test(&engine).await;
+        let mut session = engine.new_session().unwrap();
+        insert_rows(table_id, &mut session, 1, 2, "name").await;
+        session.freeze_table(table_id, usize::MAX).await.unwrap();
+        checkpoint_published(table_id, &mut session).await;
 
         let old_key = single_key(1i32);
         let claimed_key = single_key(2i32);
-        let mut old_reader_session = sys.new_session().unwrap();
+        let mut old_reader_session = engine.new_session().unwrap();
         let mut old_reader = old_reader_session.begin_trx().unwrap();
         let claimed_row_id = assert_row_in_lwc(
-            &sys.table,
+            &table_for_internal_assertion(&engine, table_id),
             &old_reader_session.pool_guards(),
             &claimed_key,
             old_reader.sts(),
         )
         .await;
 
-        sys.new_trx_delete(&mut session, &claimed_key).await;
+        expect_delete_committed(table_id, &mut session, &claimed_key).await;
         assert_unique_index_entry(
-            &sys.table,
+            &table_for_internal_assertion(&engine, table_id),
             &session.pool_guards(),
             &claimed_key,
             MAX_SNAPSHOT_TS,
@@ -1547,9 +1531,9 @@ fn test_lwc_update_unique_claim_rollback_restores_deleted_cold_owner() {
         let mut writer = session.begin_trx().unwrap();
         writer
             .exec(async |stmt| {
-                let res = stmt_update_row(
+                let res = stmt_update_row_by_id(
                     stmt,
-                    &sys.table,
+                    table_id,
                     &old_key,
                     vec![
                         UpdateCol {
@@ -1569,7 +1553,7 @@ fn test_lwc_update_unique_claim_rollback_restores_deleted_cold_owner() {
                 };
                 assert_ne!(claimed_row_id, new_row_id);
                 assert_unique_index_entry(
-                    &sys.table,
+                    &table_for_internal_assertion(&engine, table_id),
                     &session.pool_guards(),
                     &claimed_key,
                     stmt.runtime().sts(),
@@ -1578,7 +1562,7 @@ fn test_lwc_update_unique_claim_rollback_restores_deleted_cold_owner() {
                 )
                 .await;
                 assert!(matches!(
-                    sys.table
+                    table_for_internal_assertion(&engine, table_id)
                         .find_row(&session.pool_guards(), claimed_row_id)
                         .await
                         .unwrap(),
@@ -1595,7 +1579,7 @@ fn test_lwc_update_unique_claim_rollback_restores_deleted_cold_owner() {
         writer.rollback().await.unwrap();
 
         assert_unique_index_entry(
-            &sys.table,
+            &table_for_internal_assertion(&engine, table_id),
             &session.pool_guards(),
             &claimed_key,
             MAX_SNAPSHOT_TS,
@@ -1603,17 +1587,15 @@ fn test_lwc_update_unique_claim_rollback_restores_deleted_cold_owner() {
             true,
         )
         .await;
-        sys.new_trx_select(&mut session, &old_key, |vals| {
+        expect_select_committed(table_id, &mut session, &old_key, |vals| {
             assert_eq!(vals, vec![Val::from(1i32), Val::from("name")]);
         })
         .await;
-        sys.new_trx_select_not_found(&mut session, &claimed_key)
-            .await;
-        old_reader = sys
-            .trx_select(old_reader, &claimed_key, |vals| {
-                assert_eq!(vals, vec![Val::from(2i32), Val::from("name")]);
-            })
-            .await;
+        expect_select_not_found_committed(table_id, &mut session, &claimed_key).await;
+        old_reader = expect_trx_select(table_id, old_reader, &claimed_key, |vals| {
+            assert_eq!(vals, vec![Val::from(2i32), Val::from("name")]);
+        })
+        .await;
         old_reader.commit().await.unwrap();
     });
 }
@@ -1621,17 +1603,19 @@ fn test_lwc_update_unique_claim_rollback_restores_deleted_cold_owner() {
 #[test]
 fn test_lwc_update_unique_claim_rollback_drops_purgeable_deleted_cold_owner() {
     smol::block_on(async {
-        let sys = TestSys::new_evictable().await;
-        let mut session = sys.new_session().unwrap();
-        insert_rows(&sys, &mut session, 1, 2, "name").await;
-        sys.table.freeze(&session, usize::MAX).await.unwrap();
-        checkpoint_published(&sys.table, &mut session).await;
+        let temp_dir = TempDir::new().unwrap();
+        let engine = evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys").await;
+        let table_id = create_table2_for_test(&engine).await;
+        let mut session = engine.new_session().unwrap();
+        insert_rows(table_id, &mut session, 1, 2, "name").await;
+        session.freeze_table(table_id, usize::MAX).await.unwrap();
+        checkpoint_published(table_id, &mut session).await;
 
         let old_key = single_key(1i32);
         let claimed_key = single_key(2i32);
         let reader = session.begin_trx().unwrap();
         let claimed_row_id = assert_row_in_lwc(
-            &sys.table,
+            &table_for_internal_assertion(&engine, table_id),
             &session.pool_guards(),
             &claimed_key,
             reader.sts(),
@@ -1639,7 +1623,10 @@ fn test_lwc_update_unique_claim_rollback_drops_purgeable_deleted_cold_owner() {
         .await;
         reader.commit().await.unwrap();
 
-        let index = bound_unique_index_no(&sys.table, claimed_key.index_no);
+        let index = bound_unique_index_no(
+            &table_for_internal_assertion(&engine, table_id),
+            claimed_key.index_no,
+        );
         assert!(
             index
                 .mask_as_deleted(
@@ -1652,25 +1639,24 @@ fn test_lwc_update_unique_claim_rollback_drops_purgeable_deleted_cold_owner() {
                 .unwrap()
         );
         let delete_cts = TrxID::new(1);
-        sys.table
+        table_for_internal_assertion(&engine, table_id)
             .deletion_buffer()
             .put_committed(claimed_row_id, delete_cts)
             .unwrap();
-        sys.new_trx_select_not_found(&mut session, &claimed_key)
-            .await;
+        expect_select_not_found_committed(table_id, &mut session, &claimed_key).await;
 
         let mut writer = session.begin_trx().unwrap();
         assert!(delete_cts < writer.sts());
         assert!(
-            sys.table
+            table_for_internal_assertion(&engine, table_id)
                 .deletion_buffer()
                 .delete_marker_is_globally_purgeable(claimed_row_id, writer.sts())
         );
         writer
             .exec(async |stmt| {
-                let res = stmt_update_row(
+                let res = stmt_update_row_by_id(
                     stmt,
-                    &sys.table,
+                    table_id,
                     &old_key,
                     vec![
                         UpdateCol {
@@ -1689,7 +1675,7 @@ fn test_lwc_update_unique_claim_rollback_drops_purgeable_deleted_cold_owner() {
                     other => panic!("expected update success, got {other:?}"),
                 };
                 assert_unique_index_entry(
-                    &sys.table,
+                    &table_for_internal_assertion(&engine, table_id),
                     &session.pool_guards(),
                     &claimed_key,
                     stmt.runtime().sts(),
@@ -1698,7 +1684,7 @@ fn test_lwc_update_unique_claim_rollback_drops_purgeable_deleted_cold_owner() {
                 )
                 .await;
                 assert!(matches!(
-                    sys.table
+                    table_for_internal_assertion(&engine, table_id)
                         .find_row(&session.pool_guards(), claimed_row_id)
                         .await
                         .unwrap(),
@@ -1713,9 +1699,8 @@ fn test_lwc_update_unique_claim_rollback_drops_purgeable_deleted_cold_owner() {
         // replacement claim owns the unique key, GC observes a row-id mismatch
         // and skips the entry, so rollback must not recreate that skipped
         // delete-masked owner.
-        let layout = sys.table.layout_snapshot();
-        let deleted = sys
-            .table
+        let layout = table_for_internal_assertion(&engine, table_id).layout_snapshot();
+        let deleted = table_for_internal_assertion(&engine, table_id)
             .accessor_with_layout(&layout)
             .delete_index(
                 &session.pool_guards(),
@@ -1733,62 +1718,50 @@ fn test_lwc_update_unique_claim_rollback_drops_purgeable_deleted_cold_owner() {
         // The composite index may still fall through to the checkpointed cold
         // root; MVCC reads filter that stale cold owner through the committed
         // deletion marker.
-        sys.new_trx_select(&mut session, &old_key, |vals| {
+        expect_select_committed(table_id, &mut session, &old_key, |vals| {
             assert_eq!(vals, vec![Val::from(1i32), Val::from("name")]);
         })
         .await;
-        sys.new_trx_select_not_found(&mut session, &claimed_key)
-            .await;
+        expect_select_not_found_committed(table_id, &mut session, &claimed_key).await;
     });
 }
 
 #[test]
 fn test_checkpoint_persists_committed_cold_delete_markers() {
     smol::block_on(async {
-        let sys = TestSys::new_evictable().await;
-        let mut session = sys.new_session().unwrap();
-        insert_rows(&sys, &mut session, 0, 10, "name").await;
-        sys.table.freeze(&session, usize::MAX).await.unwrap();
-        checkpoint_published(&sys.table, &mut session).await;
+        let temp_dir = TempDir::new().unwrap();
+        let engine = evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys").await;
+        let table_id = create_table2_for_test(&engine).await;
+        let mut session = engine.new_session().unwrap();
+        insert_rows(table_id, &mut session, 0, 10, "name").await;
+        session.freeze_table(table_id, usize::MAX).await.unwrap();
+        checkpoint_published(table_id, &mut session).await;
 
         let key = single_key(6i32);
         let reader = session.begin_trx().unwrap();
-        let row_id =
-            assert_row_in_lwc(&sys.table, &session.pool_guards(), &key, reader.sts()).await;
+        let table = table_for_internal_assertion(&engine, table_id);
+        let row_id = assert_row_in_lwc(&table, &session.pool_guards(), &key, reader.sts()).await;
         reader.commit().await.unwrap();
 
-        sys.new_trx_delete(&mut session, &key).await;
-        let marker = sys.table.deletion_buffer().get(row_id).unwrap();
+        expect_delete_committed(table_id, &mut session, &key).await;
+        let marker = table.deletion_buffer().get(row_id).unwrap();
         let marker_ts = delete_marker_ts(marker);
         wait_gc_cutoff_after(&session, marker_ts).await;
         let pool_guards = session.pool_guards();
-        let active_root = sys.table.file().active_root_unchecked();
-        let index_before = ColumnBlockIndex::new(
-            active_root.column_block_index_root,
-            active_root.pivot_row_id,
-            sys.table.file().file_kind(),
-            sys.table.file().sparse_file(),
-            sys.table.disk_pool(),
-            pool_guards.disk_guard(),
-        );
+        let snapshot_before = column_block_index_snapshot(&engine, table_id);
+        let index_before = snapshot_before.index(pool_guards.disk_guard());
         let entry_before = index_before
             .locate_block(row_id)
             .await
             .unwrap()
             .expect("persisted entry should exist before delete checkpoint");
 
-        checkpoint_published(&sys.table, &mut session).await;
+        checkpoint_published(table_id, &mut session).await;
 
         let pool_guards = session.pool_guards();
-        let active_root = sys.table.file().active_root_unchecked();
-        let index = ColumnBlockIndex::new(
-            active_root.column_block_index_root,
-            active_root.pivot_row_id,
-            sys.table.file().file_kind(),
-            sys.table.file().sparse_file(),
-            sys.table.disk_pool(),
-            pool_guards.disk_guard(),
-        );
+        let snapshot = column_block_index_snapshot(&engine, table_id);
+        let active_root = &snapshot.active_root;
+        let index = snapshot.index(pool_guards.disk_guard());
         let entry = index
             .locate_block(row_id)
             .await
@@ -1808,22 +1781,37 @@ fn test_checkpoint_persists_committed_cold_delete_markers() {
 #[test]
 fn test_checkpoint_publishes_unique_secondary_disk_tree_root() {
     smol::block_on(async {
-        let sys = TestSys::new_evictable().await;
-        let mut session = sys.new_session().unwrap();
-        insert_rows(&sys, &mut session, 0, 3, "name").await;
+        let temp_dir = TempDir::new().unwrap();
+        let engine = evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys").await;
+        let table_id = create_table2_for_test(&engine).await;
+        let mut session = engine.new_session().unwrap();
+        insert_rows(table_id, &mut session, 0, 3, "name").await;
 
-        sys.table.freeze(&session, usize::MAX).await.unwrap();
-        checkpoint_published(&sys.table, &mut session).await;
+        session.freeze_table(table_id, usize::MAX).await.unwrap();
+        checkpoint_published(table_id, &mut session).await;
 
-        let active_root = sys.table.file().active_root_unchecked();
+        let active_root = table_for_internal_assertion(&engine, table_id)
+            .file()
+            .active_root_unchecked()
+            .clone();
         assert_ne!(active_root.secondary_index_roots[0], SUPER_BLOCK_ID);
         let reader = session.begin_trx().unwrap();
         for key_value in 0..3 {
             let key = single_key(key_value);
-            let row_id =
-                assert_row_in_lwc(&sys.table, &session.pool_guards(), &key, reader.sts()).await;
+            let row_id = assert_row_in_lwc(
+                &table_for_internal_assertion(&engine, table_id),
+                &session.pool_guards(),
+                &key,
+                reader.sts(),
+            )
+            .await;
             assert_eq!(
-                unique_disk_tree_lookup(&sys.table, &session.pool_guards(), &key).await,
+                unique_disk_tree_lookup(
+                    &table_for_internal_assertion(&engine, table_id),
+                    &session.pool_guards(),
+                    &key
+                )
+                .await,
                 Some(row_id)
             );
         }
@@ -1834,47 +1822,54 @@ fn test_checkpoint_publishes_unique_secondary_disk_tree_root() {
 #[test]
 fn test_trx_read_proof_root_snapshot_captures_active_root() {
     smol::block_on(async {
-        let sys = TestSys::new_evictable().await;
-        let mut session = sys.new_session().unwrap();
+        let temp_dir = TempDir::new().unwrap();
+        let engine = evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys").await;
+        let table_id = create_table2_for_test(&engine).await;
+        let mut session = engine.new_session().unwrap();
 
         let mut trx = session.begin_trx().unwrap();
         for id in 0..8 {
-            trx = sys
-                .trx_insert(
-                    trx,
-                    vec![Val::from(id), Val::from(format!("v{id}").as_str())],
-                )
-                .await;
+            trx = expect_trx_insert(
+                table_id,
+                trx,
+                vec![Val::from(id), Val::from(format!("v{id}").as_str())],
+            )
+            .await;
         }
         trx.commit().await.unwrap();
-        checkpoint_published(&sys.table, &mut session).await;
+        checkpoint_published(table_id, &mut session).await;
 
         let mut trx = session.begin_trx().unwrap();
         trx.exec(async |stmt| {
             let (rt, effects) = stmt_tests::runtime_and_effects_mut(stmt);
             let proof = rt.read_proof();
-            let snapshot = sys.table.root_snapshot(&proof).unwrap();
+            let snapshot = table_for_internal_assertion(&engine, table_id)
+                .root_snapshot(&proof)
+                .unwrap();
             let _effects_addr = effects as *mut _;
-            sys.table.with_active_root(&proof, |active_root| {
-                assert_eq!(snapshot.root_ts(), active_root.root_ts);
-                assert_eq!(snapshot.pivot_row_id(), active_root.pivot_row_id);
-                assert_eq!(
-                    snapshot.column_block_index_root(),
-                    active_root.column_block_index_root
-                );
-                assert_eq!(
-                    snapshot.deletion_cutoff_ts(),
-                    active_root.deletion_cutoff_ts
-                );
-                assert_eq!(
-                    snapshot.secondary_index_root(0).unwrap(),
-                    active_root.secondary_index_roots[0]
-                );
-                assert_eq!(
-                    snapshot.root_is_visible_to(rt.sts()),
-                    active_root.effective_ts() < rt.sts()
-                );
-            });
+            table_for_internal_assertion(&engine, table_id).with_active_root(
+                &proof,
+                |active_root| {
+                    assert_eq!(snapshot.root_ts(), active_root.root_ts);
+                    assert_eq!(snapshot.pivot_row_id(), active_root.pivot_row_id);
+                    assert_eq!(
+                        snapshot.column_block_index_root(),
+                        active_root.column_block_index_root
+                    );
+                    assert_eq!(
+                        snapshot.deletion_cutoff_ts(),
+                        active_root.deletion_cutoff_ts
+                    );
+                    assert_eq!(
+                        snapshot.secondary_index_root(0).unwrap(),
+                        active_root.secondary_index_roots[0]
+                    );
+                    assert_eq!(
+                        snapshot.root_is_visible_to(rt.sts()),
+                        active_root.effective_ts() < rt.sts()
+                    );
+                },
+            );
             Ok(())
         })
         .await
@@ -1886,38 +1881,35 @@ fn test_trx_read_proof_root_snapshot_captures_active_root() {
 #[test]
 fn test_checkpoint_publishes_non_unique_secondary_disk_tree_entries_across_lwc_splits() {
     smol::block_on(async {
-        let sys = TestSys::new_evictable_with_non_unique_name_index().await;
-        let mut session = sys.new_session().unwrap();
+        let temp_dir = TempDir::new().unwrap();
+        let engine =
+            evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys_non_unique").await;
+        let table_id = create_non_unique_name_table_for_test(&engine).await;
+        let mut session = engine.new_session().unwrap();
         let name = "split-name-".repeat(120);
         let row_count = 80;
-        insert_rows(&sys, &mut session, 0, row_count, &name).await;
+        insert_rows(table_id, &mut session, 0, row_count, &name).await;
 
-        sys.table.freeze(&session, usize::MAX).await.unwrap();
-        checkpoint_published(&sys.table, &mut session).await;
+        session.freeze_table(table_id, usize::MAX).await.unwrap();
+        checkpoint_published(table_id, &mut session).await;
 
         let name_key = name_key(&name);
+        let table = table_for_internal_assertion(&engine, table_id);
         let row_ids =
-            non_unique_disk_tree_prefix_scan(&sys.table, &session.pool_guards(), &name_key).await;
+            non_unique_disk_tree_prefix_scan(&table, &session.pool_guards(), &name_key).await;
         assert_eq!(row_ids.len(), row_count as usize);
 
         let first_key = single_key(0i32);
         let last_key = single_key(row_count - 1);
-        let first_row_id = unique_disk_tree_lookup(&sys.table, &session.pool_guards(), &first_key)
+        let first_row_id = unique_disk_tree_lookup(&table, &session.pool_guards(), &first_key)
             .await
             .unwrap();
-        let last_row_id = unique_disk_tree_lookup(&sys.table, &session.pool_guards(), &last_key)
+        let last_row_id = unique_disk_tree_lookup(&table, &session.pool_guards(), &last_key)
             .await
             .unwrap();
         let pool_guards = session.pool_guards();
-        let active_root = sys.table.file().active_root_unchecked();
-        let column_index = ColumnBlockIndex::new(
-            active_root.column_block_index_root,
-            active_root.pivot_row_id,
-            sys.table.file().file_kind(),
-            sys.table.file().sparse_file(),
-            sys.table.disk_pool(),
-            pool_guards.disk_guard(),
-        );
+        let snapshot = column_block_index_snapshot(&engine, table_id);
+        let column_index = snapshot.index(pool_guards.disk_guard());
         let first_entry = column_index
             .locate_block(first_row_id)
             .await
@@ -1935,17 +1927,18 @@ fn test_checkpoint_publishes_non_unique_secondary_disk_tree_entries_across_lwc_s
 #[test]
 fn test_secondary_mem_index_cleanup_removes_redundant_live_unique_entries() {
     smol::block_on(async {
-        let sys = TestSys::new_evictable().await;
-        let mut session = sys.new_session().unwrap();
+        let temp_dir = TempDir::new().unwrap();
+        let engine = evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys").await;
+        let table_id = create_table2_for_test(&engine).await;
+        let mut session = engine.new_session().unwrap();
         let row_count = 4;
-        insert_rows(&sys, &mut session, 0, row_count, "name").await;
-        sys.table.freeze(&session, usize::MAX).await.unwrap();
-        checkpoint_published(&sys.table, &mut session).await;
+        insert_rows(table_id, &mut session, 0, row_count, "name").await;
+        session.freeze_table(table_id, usize::MAX).await.unwrap();
+        checkpoint_published(table_id, &mut session).await;
 
-        let index = bound_unique_index_no(&sys.table, 0);
-        let stats = sys
-            .table
-            .cleanup_secondary_mem_indexes(&mut session, true)
+        let index = bound_unique_index_no(&table_for_internal_assertion(&engine, table_id), 0);
+        let stats = session
+            .cleanup_secondary_mem_indexes(table_id, true)
             .await
             .unwrap();
         assert!(!session.in_trx().unwrap());
@@ -1960,9 +1953,13 @@ fn test_secondary_mem_index_cleanup_removes_redundant_live_unique_entries() {
 
         for key_value in 0..row_count {
             let key = single_key(key_value);
-            let disk_row_id = unique_disk_tree_lookup(&sys.table, &session.pool_guards(), &key)
-                .await
-                .unwrap();
+            let disk_row_id = unique_disk_tree_lookup(
+                &table_for_internal_assertion(&engine, table_id),
+                &session.pool_guards(),
+                &key,
+            )
+            .await
+            .unwrap();
             assert_eq!(
                 index
                     .lookup(
@@ -1981,13 +1978,14 @@ fn test_secondary_mem_index_cleanup_removes_redundant_live_unique_entries() {
 #[test]
 fn test_secondary_mem_index_cleanup_requires_idle_session() {
     smol::block_on(async {
-        let sys = TestSys::new_evictable().await;
-        let mut session = sys.new_session().unwrap();
+        let temp_dir = TempDir::new().unwrap();
+        let engine = evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys").await;
+        let table_id = create_table2_for_test(&engine).await;
+        let mut session = engine.new_session().unwrap();
         let trx = session.begin_trx().unwrap();
 
-        let err = sys
-            .table
-            .cleanup_secondary_mem_indexes(&mut session, true)
+        let err = session
+            .cleanup_secondary_mem_indexes(table_id, true)
             .await
             .unwrap_err();
         let operation_error = err.operation_error();
@@ -2003,17 +2001,19 @@ fn test_secondary_mem_index_cleanup_requires_idle_session() {
 #[test]
 fn test_secondary_mem_index_cleanup_removes_redundant_live_non_unique_entries() {
     smol::block_on(async {
-        let sys = TestSys::new_evictable_with_non_unique_name_index().await;
-        let mut session = sys.new_session().unwrap();
+        let temp_dir = TempDir::new().unwrap();
+        let engine =
+            evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys_non_unique").await;
+        let table_id = create_non_unique_name_table_for_test(&engine).await;
+        let mut session = engine.new_session().unwrap();
         let row_count = 5;
-        insert_rows(&sys, &mut session, 0, row_count, "same-name").await;
-        sys.table.freeze(&session, usize::MAX).await.unwrap();
-        checkpoint_published(&sys.table, &mut session).await;
+        insert_rows(table_id, &mut session, 0, row_count, "same-name").await;
+        session.freeze_table(table_id, usize::MAX).await.unwrap();
+        checkpoint_published(table_id, &mut session).await;
 
-        let index = bound_non_unique_index_no(&sys.table, 1);
-        let stats = sys
-            .table
-            .cleanup_secondary_mem_indexes(&mut session, true)
+        let index = bound_non_unique_index_no(&table_for_internal_assertion(&engine, table_id), 1);
+        let stats = session
+            .cleanup_secondary_mem_indexes(table_id, true)
             .await
             .unwrap();
         assert_eq!(stats.indexes.len(), 2);
@@ -2026,8 +2026,12 @@ fn test_secondary_mem_index_cleanup_removes_redundant_live_non_unique_entries() 
         assert_eq!(stats.indexes[1].skipped_hot_deleted, 0);
 
         let key = name_key("same-name");
-        let disk_rows =
-            non_unique_disk_tree_prefix_scan(&sys.table, &session.pool_guards(), &key).await;
+        let disk_rows = non_unique_disk_tree_prefix_scan(
+            &table_for_internal_assertion(&engine, table_id),
+            &session.pool_guards(),
+            &key,
+        )
+        .await;
         assert_eq!(disk_rows.len(), row_count as usize);
         let mut lookup_rows = Vec::new();
         index
@@ -2046,17 +2050,19 @@ fn test_secondary_mem_index_cleanup_removes_redundant_live_non_unique_entries() 
 #[test]
 fn test_secondary_mem_index_cleanup_aggregates_bounded_batches() {
     smol::block_on(async {
-        let sys = TestSys::new_evictable_with_non_unique_name_index().await;
-        let mut session = sys.new_session().unwrap();
+        let temp_dir = TempDir::new().unwrap();
+        let engine =
+            evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys_non_unique").await;
+        let table_id = create_non_unique_name_table_for_test(&engine).await;
+        let mut session = engine.new_session().unwrap();
         let name = "batch-name-".repeat(120);
         let row_count = 80;
-        insert_rows(&sys, &mut session, 0, row_count, &name).await;
-        sys.table.freeze(&session, usize::MAX).await.unwrap();
-        checkpoint_published(&sys.table, &mut session).await;
+        insert_rows(table_id, &mut session, 0, row_count, &name).await;
+        session.freeze_table(table_id, usize::MAX).await.unwrap();
+        checkpoint_published(table_id, &mut session).await;
 
-        let stats = sys
-            .table
-            .cleanup_secondary_mem_indexes(&mut session, true)
+        let stats = session
+            .cleanup_secondary_mem_indexes(table_id, true)
             .await
             .unwrap();
         assert_eq!(stats.indexes[1].scanned, row_count as usize);
@@ -2070,18 +2076,22 @@ fn test_secondary_mem_index_cleanup_aggregates_bounded_batches() {
 #[test]
 fn test_secondary_mem_index_cleanup_can_retain_live_cache_entries() {
     smol::block_on(async {
-        let sys = TestSys::new_evictable_with_non_unique_name_index().await;
-        let mut session = sys.new_session().unwrap();
+        let temp_dir = TempDir::new().unwrap();
+        let engine =
+            evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys_non_unique").await;
+        let table_id = create_non_unique_name_table_for_test(&engine).await;
+        let mut session = engine.new_session().unwrap();
         let row_count = 4;
-        insert_rows(&sys, &mut session, 0, row_count, "same-name").await;
-        sys.table.freeze(&session, usize::MAX).await.unwrap();
-        checkpoint_published(&sys.table, &mut session).await;
+        insert_rows(table_id, &mut session, 0, row_count, "same-name").await;
+        session.freeze_table(table_id, usize::MAX).await.unwrap();
+        checkpoint_published(table_id, &mut session).await;
 
-        let unique_index = bound_unique_index_no(&sys.table, 0);
-        let non_unique_index = bound_non_unique_index_no(&sys.table, 1);
-        let stats = sys
-            .table
-            .cleanup_secondary_mem_indexes(&mut session, false)
+        let unique_index =
+            bound_unique_index_no(&table_for_internal_assertion(&engine, table_id), 0);
+        let non_unique_index =
+            bound_non_unique_index_no(&table_for_internal_assertion(&engine, table_id), 1);
+        let stats = session
+            .cleanup_secondary_mem_indexes(table_id, false)
             .await
             .unwrap();
         assert_eq!(stats.indexes.len(), 2);
@@ -2094,10 +2104,13 @@ fn test_secondary_mem_index_cleanup_can_retain_live_cache_entries() {
         }
 
         let unique_key = single_key(0i32);
-        let unique_row_id =
-            unique_disk_tree_lookup(&sys.table, &session.pool_guards(), &unique_key)
-                .await
-                .unwrap();
+        let unique_row_id = unique_disk_tree_lookup(
+            &table_for_internal_assertion(&engine, table_id),
+            &session.pool_guards(),
+            &unique_key,
+        )
+        .await
+        .unwrap();
         assert_eq!(
             unique_index
                 .lookup(
@@ -2111,8 +2124,12 @@ fn test_secondary_mem_index_cleanup_can_retain_live_cache_entries() {
         );
 
         let name_key = name_key("same-name");
-        let disk_rows =
-            non_unique_disk_tree_prefix_scan(&sys.table, &session.pool_guards(), &name_key).await;
+        let disk_rows = non_unique_disk_tree_prefix_scan(
+            &table_for_internal_assertion(&engine, table_id),
+            &session.pool_guards(),
+            &name_key,
+        )
+        .await;
         let mut lookup_rows = Vec::new();
         non_unique_index
             .lookup(
@@ -2130,13 +2147,15 @@ fn test_secondary_mem_index_cleanup_can_retain_live_cache_entries() {
 #[test]
 fn test_secondary_mem_index_cleanup_retains_unique_delete_shadow_without_delete_proof() {
     smol::block_on(async {
-        let sys = TestSys::new_evictable().await;
-        let mut session = sys.new_session().unwrap();
-        insert_rows(&sys, &mut session, 0, 1, "name").await;
+        let temp_dir = TempDir::new().unwrap();
+        let engine = evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys").await;
+        let table_id = create_table2_for_test(&engine).await;
+        let mut session = engine.new_session().unwrap();
+        insert_rows(table_id, &mut session, 0, 1, "name").await;
 
         let current_key = single_key(0i32);
         let stale_key = single_key(-1i32);
-        let index = bound_unique_index_no(&sys.table, 0);
+        let index = bound_unique_index_no(&table_for_internal_assertion(&engine, table_id), 0);
         let row_id = index
             .lookup(
                 session.pool_guards().index_guard(),
@@ -2172,9 +2191,8 @@ fn test_secondary_mem_index_cleanup_retains_unique_delete_shadow_without_delete_
                 .unwrap()
         );
 
-        let stats = sys
-            .table
-            .cleanup_secondary_mem_indexes(&mut session, true)
+        let stats = session
+            .cleanup_secondary_mem_indexes(table_id, true)
             .await
             .unwrap();
         assert_eq!(stats.indexes[0].scanned, 0);
@@ -2210,18 +2228,24 @@ fn test_secondary_mem_index_cleanup_retains_unique_delete_shadow_without_delete_
 #[test]
 fn test_secondary_mem_index_cleanup_removes_unique_delete_shadow_with_purgeable_marker() {
     smol::block_on(async {
-        let sys = TestSys::new_evictable().await;
-        let mut session = sys.new_session().unwrap();
-        insert_rows(&sys, &mut session, 0, 1, "name").await;
-        sys.table.freeze(&session, usize::MAX).await.unwrap();
-        checkpoint_published(&sys.table, &mut session).await;
+        let temp_dir = TempDir::new().unwrap();
+        let engine = evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys").await;
+        let table_id = create_table2_for_test(&engine).await;
+        let mut session = engine.new_session().unwrap();
+        insert_rows(table_id, &mut session, 0, 1, "name").await;
+        session.freeze_table(table_id, usize::MAX).await.unwrap();
+        checkpoint_published(table_id, &mut session).await;
 
         let current_key = single_key(0i32);
         let stale_key = single_key(-1i32);
-        let row_id = unique_disk_tree_lookup(&sys.table, &session.pool_guards(), &current_key)
-            .await
-            .unwrap();
-        let index = bound_unique_index_no(&sys.table, 0);
+        let row_id = unique_disk_tree_lookup(
+            &table_for_internal_assertion(&engine, table_id),
+            &session.pool_guards(),
+            &current_key,
+        )
+        .await
+        .unwrap();
+        let index = bound_unique_index_no(&table_for_internal_assertion(&engine, table_id), 0);
         assert!(
             index
                 .insert_if_not_exists(
@@ -2246,14 +2270,13 @@ fn test_secondary_mem_index_cleanup_removes_unique_delete_shadow_with_purgeable_
                 .await
                 .unwrap()
         );
-        sys.table
+        table_for_internal_assertion(&engine, table_id)
             .deletion_buffer()
             .put_committed(row_id, TrxID::new(1))
             .unwrap();
 
-        let stats = sys
-            .table
-            .cleanup_secondary_mem_indexes(&mut session, true)
+        let stats = session
+            .cleanup_secondary_mem_indexes(table_id, true)
             .await
             .unwrap();
         assert_eq!(stats.indexes[0].scanned, 2);
@@ -2278,18 +2301,24 @@ fn test_secondary_mem_index_cleanup_removes_unique_delete_shadow_with_purgeable_
 #[test]
 fn test_secondary_mem_index_cleanup_removes_delete_shadow_when_live_cleanup_disabled() {
     smol::block_on(async {
-        let sys = TestSys::new_evictable().await;
-        let mut session = sys.new_session().unwrap();
-        insert_rows(&sys, &mut session, 0, 1, "name").await;
-        sys.table.freeze(&session, usize::MAX).await.unwrap();
-        checkpoint_published(&sys.table, &mut session).await;
+        let temp_dir = TempDir::new().unwrap();
+        let engine = evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys").await;
+        let table_id = create_table2_for_test(&engine).await;
+        let mut session = engine.new_session().unwrap();
+        insert_rows(table_id, &mut session, 0, 1, "name").await;
+        session.freeze_table(table_id, usize::MAX).await.unwrap();
+        checkpoint_published(table_id, &mut session).await;
 
         let current_key = single_key(0i32);
         let stale_key = single_key(-1i32);
-        let row_id = unique_disk_tree_lookup(&sys.table, &session.pool_guards(), &current_key)
-            .await
-            .unwrap();
-        let index = bound_unique_index_no(&sys.table, 0);
+        let row_id = unique_disk_tree_lookup(
+            &table_for_internal_assertion(&engine, table_id),
+            &session.pool_guards(),
+            &current_key,
+        )
+        .await
+        .unwrap();
+        let index = bound_unique_index_no(&table_for_internal_assertion(&engine, table_id), 0);
         assert!(
             index
                 .insert_if_not_exists(
@@ -2314,14 +2343,13 @@ fn test_secondary_mem_index_cleanup_removes_delete_shadow_when_live_cleanup_disa
                 .await
                 .unwrap()
         );
-        sys.table
+        table_for_internal_assertion(&engine, table_id)
             .deletion_buffer()
             .put_committed(row_id, TrxID::new(1))
             .unwrap();
 
-        let stats = sys
-            .table
-            .cleanup_secondary_mem_indexes(&mut session, false)
+        let stats = session
+            .cleanup_secondary_mem_indexes(table_id, false)
             .await
             .unwrap();
         assert_eq!(stats.indexes[0].scanned, 1);
@@ -2357,17 +2385,23 @@ fn test_secondary_mem_index_cleanup_removes_delete_shadow_when_live_cleanup_disa
 #[test]
 fn test_secondary_mem_index_cleanup_removes_unique_delete_shadow_with_matching_cold_entry() {
     smol::block_on(async {
-        let sys = TestSys::new_evictable().await;
-        let mut session = sys.new_session().unwrap();
-        insert_rows(&sys, &mut session, 0, 1, "name").await;
-        sys.table.freeze(&session, usize::MAX).await.unwrap();
-        checkpoint_published(&sys.table, &mut session).await;
+        let temp_dir = TempDir::new().unwrap();
+        let engine = evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys").await;
+        let table_id = create_table2_for_test(&engine).await;
+        let mut session = engine.new_session().unwrap();
+        insert_rows(table_id, &mut session, 0, 1, "name").await;
+        session.freeze_table(table_id, usize::MAX).await.unwrap();
+        checkpoint_published(table_id, &mut session).await;
 
         let current_key = single_key(0i32);
-        let row_id = unique_disk_tree_lookup(&sys.table, &session.pool_guards(), &current_key)
-            .await
-            .unwrap();
-        let index = bound_unique_index_no(&sys.table, 0);
+        let row_id = unique_disk_tree_lookup(
+            &table_for_internal_assertion(&engine, table_id),
+            &session.pool_guards(),
+            &current_key,
+        )
+        .await
+        .unwrap();
+        let index = bound_unique_index_no(&table_for_internal_assertion(&engine, table_id), 0);
         assert!(
             index
                 .mask_as_deleted(
@@ -2380,9 +2414,8 @@ fn test_secondary_mem_index_cleanup_removes_unique_delete_shadow_with_matching_c
                 .unwrap()
         );
 
-        let stats = sys
-            .table
-            .cleanup_secondary_mem_indexes(&mut session, true)
+        let stats = session
+            .cleanup_secondary_mem_indexes(table_id, true)
             .await
             .unwrap();
         assert_eq!(stats.indexes[0].scanned, 1);
@@ -2402,13 +2435,12 @@ fn test_secondary_mem_index_cleanup_removes_unique_delete_shadow_with_matching_c
             Some((row_id, true))
         );
 
-        sys.table
+        table_for_internal_assertion(&engine, table_id)
             .deletion_buffer()
             .put_committed(row_id, TrxID::new(1))
             .unwrap();
-        let stats = sys
-            .table
-            .cleanup_secondary_mem_indexes(&mut session, true)
+        let stats = session
+            .cleanup_secondary_mem_indexes(table_id, true)
             .await
             .unwrap();
         assert_eq!(stats.indexes[0].scanned, 1);
@@ -2433,23 +2465,34 @@ fn test_secondary_mem_index_cleanup_removes_unique_delete_shadow_with_matching_c
 #[test]
 fn test_secondary_mem_index_cleanup_removes_unique_delete_shadow_when_cold_row_key_differs() {
     smol::block_on(async {
-        let sys = TestSys::new_evictable().await;
-        let mut session = sys.new_session().unwrap();
-        insert_rows(&sys, &mut session, 0, 1, "name").await;
-        sys.table.freeze(&session, usize::MAX).await.unwrap();
-        let checkpoint_ts = checkpoint_published(&sys.table, &mut session).await;
+        let temp_dir = TempDir::new().unwrap();
+        let engine = evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys").await;
+        let table_id = create_table2_for_test(&engine).await;
+        let mut session = engine.new_session().unwrap();
+        insert_rows(table_id, &mut session, 0, 1, "name").await;
+        session.freeze_table(table_id, usize::MAX).await.unwrap();
+        let checkpoint_ts = checkpoint_published(table_id, &mut session).await;
         wait_gc_cutoff_after(&session, checkpoint_ts).await;
 
         let current_key = single_key(0i32);
         let stale_key = single_key(-1i32);
-        let row_id = unique_disk_tree_lookup(&sys.table, &session.pool_guards(), &current_key)
-            .await
-            .unwrap();
+        let row_id = unique_disk_tree_lookup(
+            &table_for_internal_assertion(&engine, table_id),
+            &session.pool_guards(),
+            &current_key,
+        )
+        .await
+        .unwrap();
         assert_eq!(
-            unique_disk_tree_lookup(&sys.table, &session.pool_guards(), &stale_key).await,
+            unique_disk_tree_lookup(
+                &table_for_internal_assertion(&engine, table_id),
+                &session.pool_guards(),
+                &stale_key
+            )
+            .await,
             None
         );
-        let index = bound_unique_index_no(&sys.table, 0);
+        let index = bound_unique_index_no(&table_for_internal_assertion(&engine, table_id), 0);
         assert!(
             index
                 .insert_if_not_exists(
@@ -2497,9 +2540,8 @@ fn test_secondary_mem_index_cleanup_removes_unique_delete_shadow_when_cold_row_k
             Some((row_id, false))
         );
 
-        let stats = sys
-            .table
-            .cleanup_secondary_mem_indexes(&mut session, true)
+        let stats = session
+            .cleanup_secondary_mem_indexes(table_id, true)
             .await
             .unwrap();
         assert_eq!(stats.indexes[0].scanned, 2);
@@ -2535,29 +2577,25 @@ fn test_secondary_mem_index_cleanup_removes_unique_delete_shadow_when_cold_row_k
 #[test]
 fn test_secondary_mem_index_cleanup_propagates_cold_delete_overlay_proof_error() {
     smol::block_on(async {
-        let sys = TestSys::new_evictable().await;
-        let mut session = sys.new_session().unwrap();
-        insert_rows(&sys, &mut session, 0, 1, "name").await;
-        sys.table.freeze(&session, usize::MAX).await.unwrap();
-        let checkpoint_ts = checkpoint_published(&sys.table, &mut session).await;
+        let temp_dir = TempDir::new().unwrap();
+        let engine = evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys").await;
+        let table_id = create_table2_for_test(&engine).await;
+        let mut session = engine.new_session().unwrap();
+        insert_rows(table_id, &mut session, 0, 1, "name").await;
+        session.freeze_table(table_id, usize::MAX).await.unwrap();
+        let checkpoint_ts = checkpoint_published(table_id, &mut session).await;
         wait_gc_cutoff_after(&session, checkpoint_ts).await;
 
         let current_key = single_key(0i32);
         let stale_key = single_key(-1i32);
-        let row_id = unique_disk_tree_lookup(&sys.table, &session.pool_guards(), &current_key)
+        let table = table_for_internal_assertion(&engine, table_id);
+        let row_id = unique_disk_tree_lookup(&table, &session.pool_guards(), &current_key)
             .await
             .unwrap();
         let block_id = {
-            let active_root = sys.table.file().active_root_unchecked();
             let pool_guards = session.pool_guards();
-            let column_index = ColumnBlockIndex::new(
-                active_root.column_block_index_root,
-                active_root.pivot_row_id,
-                sys.table.file().file_kind(),
-                sys.table.file().sparse_file(),
-                sys.table.disk_pool(),
-                pool_guards.disk_guard(),
-            );
+            let snapshot = column_block_index_snapshot(&engine, table_id);
+            let column_index = snapshot.index(pool_guards.disk_guard());
             column_index
                 .locate_block(row_id)
                 .await
@@ -2565,7 +2603,7 @@ fn test_secondary_mem_index_cleanup_propagates_cold_delete_overlay_proof_error()
                 .unwrap()
                 .block_id()
         };
-        let index = bound_unique_index_no(&sys.table, 0);
+        let index = bound_unique_index_no(&table, 0);
         assert!(
             index
                 .insert_if_not_exists(
@@ -2591,19 +2629,14 @@ fn test_secondary_mem_index_cleanup_propagates_cold_delete_overlay_proof_error()
                 .unwrap()
         );
 
-        let table_file_path = sys
-            .engine
-            .table_fs
-            .user_table_file_path(sys.table.table_id());
+        let table_file_path = engine.table_fs.user_table_file_path(table_id);
         corrupt_lwc_row_shape_fingerprint(table_file_path, block_id);
-        let _ = sys
-            .table
+        let _ = table
             .disk_pool()
-            .invalidate_block(sys.table.file().sparse_file().file_id(), block_id);
+            .invalidate_block(table.file().sparse_file().file_id(), block_id);
 
-        let err = sys
-            .table
-            .cleanup_secondary_mem_indexes(&mut session, true)
+        let err = session
+            .cleanup_secondary_mem_indexes(table_id, true)
             .await
             .unwrap_err();
         assert_table_data_integrity(
@@ -2629,12 +2662,15 @@ fn test_secondary_mem_index_cleanup_propagates_cold_delete_overlay_proof_error()
 #[test]
 fn test_secondary_mem_index_cleanup_retains_non_unique_delete_mark_without_delete_proof() {
     smol::block_on(async {
-        let sys = TestSys::new_evictable_with_non_unique_name_index().await;
-        let mut session = sys.new_session().unwrap();
-        insert_rows(&sys, &mut session, 0, 1, "current").await;
+        let temp_dir = TempDir::new().unwrap();
+        let engine =
+            evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys_non_unique").await;
+        let table_id = create_non_unique_name_table_for_test(&engine).await;
+        let mut session = engine.new_session().unwrap();
+        insert_rows(table_id, &mut session, 0, 1, "current").await;
 
         let pk = single_key(0i32);
-        let row_id = bound_unique_index_no(&sys.table, 0)
+        let row_id = bound_unique_index_no(&table_for_internal_assertion(&engine, table_id), 0)
             .lookup(
                 session.pool_guards().index_guard(),
                 &pk.vals,
@@ -2645,7 +2681,10 @@ fn test_secondary_mem_index_cleanup_retains_non_unique_delete_mark_without_delet
             .unwrap()
             .0;
         let stale_key = name_key("stale");
-        let index = bound_non_unique_index_no(&sys.table, stale_key.index_no);
+        let index = bound_non_unique_index_no(
+            &table_for_internal_assertion(&engine, table_id),
+            stale_key.index_no,
+        );
         assert!(
             index
                 .insert_if_not_exists(
@@ -2671,9 +2710,8 @@ fn test_secondary_mem_index_cleanup_retains_non_unique_delete_mark_without_delet
                 .unwrap()
         );
 
-        let stats = sys
-            .table
-            .cleanup_secondary_mem_indexes(&mut session, true)
+        let stats = session
+            .cleanup_secondary_mem_indexes(table_id, true)
             .await
             .unwrap();
         assert_eq!(stats.indexes[1].scanned, 0);
@@ -2699,18 +2737,28 @@ fn test_secondary_mem_index_cleanup_retains_non_unique_delete_mark_without_delet
 #[test]
 fn test_secondary_mem_index_cleanup_removes_non_unique_delete_mark_with_purgeable_marker() {
     smol::block_on(async {
-        let sys = TestSys::new_evictable_with_non_unique_name_index().await;
-        let mut session = sys.new_session().unwrap();
-        insert_rows(&sys, &mut session, 0, 1, "current").await;
-        sys.table.freeze(&session, usize::MAX).await.unwrap();
-        checkpoint_published(&sys.table, &mut session).await;
+        let temp_dir = TempDir::new().unwrap();
+        let engine =
+            evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys_non_unique").await;
+        let table_id = create_non_unique_name_table_for_test(&engine).await;
+        let mut session = engine.new_session().unwrap();
+        insert_rows(table_id, &mut session, 0, 1, "current").await;
+        session.freeze_table(table_id, usize::MAX).await.unwrap();
+        checkpoint_published(table_id, &mut session).await;
 
         let pk = single_key(0i32);
-        let row_id = unique_disk_tree_lookup(&sys.table, &session.pool_guards(), &pk)
-            .await
-            .unwrap();
+        let row_id = unique_disk_tree_lookup(
+            &table_for_internal_assertion(&engine, table_id),
+            &session.pool_guards(),
+            &pk,
+        )
+        .await
+        .unwrap();
         let stale_key = name_key("stale");
-        let index = bound_non_unique_index_no(&sys.table, stale_key.index_no);
+        let index = bound_non_unique_index_no(
+            &table_for_internal_assertion(&engine, table_id),
+            stale_key.index_no,
+        );
         assert!(
             index
                 .insert_if_not_exists(
@@ -2735,14 +2783,13 @@ fn test_secondary_mem_index_cleanup_removes_non_unique_delete_mark_with_purgeabl
                 .await
                 .unwrap()
         );
-        sys.table
+        table_for_internal_assertion(&engine, table_id)
             .deletion_buffer()
             .put_committed(row_id, TrxID::new(1))
             .unwrap();
 
-        let stats = sys
-            .table
-            .cleanup_secondary_mem_indexes(&mut session, true)
+        let stats = session
+            .cleanup_secondary_mem_indexes(table_id, true)
             .await
             .unwrap();
         assert_eq!(stats.indexes[1].scanned, 2);
@@ -2768,18 +2815,28 @@ fn test_secondary_mem_index_cleanup_removes_non_unique_delete_mark_with_purgeabl
 #[test]
 fn test_secondary_mem_index_cleanup_removes_non_unique_delete_mark_with_matching_cold_entry() {
     smol::block_on(async {
-        let sys = TestSys::new_evictable_with_non_unique_name_index().await;
-        let mut session = sys.new_session().unwrap();
-        insert_rows(&sys, &mut session, 0, 1, "current").await;
-        sys.table.freeze(&session, usize::MAX).await.unwrap();
-        checkpoint_published(&sys.table, &mut session).await;
+        let temp_dir = TempDir::new().unwrap();
+        let engine =
+            evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys_non_unique").await;
+        let table_id = create_non_unique_name_table_for_test(&engine).await;
+        let mut session = engine.new_session().unwrap();
+        insert_rows(table_id, &mut session, 0, 1, "current").await;
+        session.freeze_table(table_id, usize::MAX).await.unwrap();
+        checkpoint_published(table_id, &mut session).await;
 
         let pk = single_key(0i32);
-        let row_id = unique_disk_tree_lookup(&sys.table, &session.pool_guards(), &pk)
-            .await
-            .unwrap();
+        let row_id = unique_disk_tree_lookup(
+            &table_for_internal_assertion(&engine, table_id),
+            &session.pool_guards(),
+            &pk,
+        )
+        .await
+        .unwrap();
         let current_key = name_key("current");
-        let index = bound_non_unique_index_no(&sys.table, current_key.index_no);
+        let index = bound_non_unique_index_no(
+            &table_for_internal_assertion(&engine, table_id),
+            current_key.index_no,
+        );
         assert!(
             index
                 .mask_as_deleted(
@@ -2792,9 +2849,8 @@ fn test_secondary_mem_index_cleanup_removes_non_unique_delete_mark_with_matching
                 .unwrap()
         );
 
-        let stats = sys
-            .table
-            .cleanup_secondary_mem_indexes(&mut session, true)
+        let stats = session
+            .cleanup_secondary_mem_indexes(table_id, true)
             .await
             .unwrap();
         assert_eq!(stats.indexes[1].scanned, 1);
@@ -2815,13 +2871,12 @@ fn test_secondary_mem_index_cleanup_removes_non_unique_delete_mark_with_matching
             Some(false)
         );
 
-        sys.table
+        table_for_internal_assertion(&engine, table_id)
             .deletion_buffer()
             .put_committed(row_id, TrxID::new(1))
             .unwrap();
-        let stats = sys
-            .table
-            .cleanup_secondary_mem_indexes(&mut session, true)
+        let stats = session
+            .cleanup_secondary_mem_indexes(table_id, true)
             .await
             .unwrap();
         assert_eq!(stats.indexes[1].scanned, 1);
@@ -2847,30 +2902,48 @@ fn test_secondary_mem_index_cleanup_removes_non_unique_delete_mark_with_matching
 #[test]
 fn test_secondary_mem_index_cleanup_removes_non_unique_delete_mark_when_cold_row_key_differs() {
     smol::block_on(async {
-        let sys = TestSys::new_evictable_with_non_unique_name_index().await;
-        let mut session = sys.new_session().unwrap();
-        insert_rows(&sys, &mut session, 0, 1, "current").await;
-        sys.table.freeze(&session, usize::MAX).await.unwrap();
-        let checkpoint_ts = checkpoint_published(&sys.table, &mut session).await;
+        let temp_dir = TempDir::new().unwrap();
+        let engine =
+            evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys_non_unique").await;
+        let table_id = create_non_unique_name_table_for_test(&engine).await;
+        let mut session = engine.new_session().unwrap();
+        insert_rows(table_id, &mut session, 0, 1, "current").await;
+        session.freeze_table(table_id, usize::MAX).await.unwrap();
+        let checkpoint_ts = checkpoint_published(table_id, &mut session).await;
         wait_gc_cutoff_after(&session, checkpoint_ts).await;
 
         let pk = single_key(0i32);
         let current_key = name_key("current");
         let stale_key = name_key("stale");
-        let row_id = unique_disk_tree_lookup(&sys.table, &session.pool_guards(), &pk)
-            .await
-            .unwrap();
+        let row_id = unique_disk_tree_lookup(
+            &table_for_internal_assertion(&engine, table_id),
+            &session.pool_guards(),
+            &pk,
+        )
+        .await
+        .unwrap();
         assert!(
-            non_unique_disk_tree_prefix_scan(&sys.table, &session.pool_guards(), &stale_key)
-                .await
-                .is_empty()
+            non_unique_disk_tree_prefix_scan(
+                &table_for_internal_assertion(&engine, table_id),
+                &session.pool_guards(),
+                &stale_key
+            )
+            .await
+            .is_empty()
         );
         assert_eq!(
-            non_unique_disk_tree_prefix_scan(&sys.table, &session.pool_guards(), &current_key)
-                .await,
+            non_unique_disk_tree_prefix_scan(
+                &table_for_internal_assertion(&engine, table_id),
+                &session.pool_guards(),
+                &current_key
+            )
+            .await,
             vec![row_id]
         );
-        let index = bound_non_unique_index_no(&sys.table, stale_key.index_no);
+        let index = bound_non_unique_index_no(
+            &table_for_internal_assertion(&engine, table_id),
+            stale_key.index_no,
+        );
         assert!(
             index
                 .insert_if_not_exists(
@@ -2920,9 +2993,8 @@ fn test_secondary_mem_index_cleanup_removes_non_unique_delete_mark_when_cold_row
             Some(true)
         );
 
-        let stats = sys
-            .table
-            .cleanup_secondary_mem_indexes(&mut session, true)
+        let stats = session
+            .cleanup_secondary_mem_indexes(table_id, true)
             .await
             .unwrap();
         assert_eq!(stats.indexes[1].scanned, 2);
@@ -2960,37 +3032,62 @@ fn test_secondary_mem_index_cleanup_removes_non_unique_delete_mark_when_cold_row
 #[test]
 fn test_deletion_checkpoint_updates_secondary_disk_tree_roots() {
     smol::block_on(async {
-        let sys = TestSys::new_evictable_with_non_unique_name_index().await;
-        let mut session = sys.new_session().unwrap();
-        insert_rows(&sys, &mut session, 0, 2, "same-name").await;
-        sys.table.freeze(&session, usize::MAX).await.unwrap();
-        checkpoint_published(&sys.table, &mut session).await;
+        let temp_dir = TempDir::new().unwrap();
+        let engine =
+            evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys_non_unique").await;
+        let table_id = create_non_unique_name_table_for_test(&engine).await;
+        let mut session = engine.new_session().unwrap();
+        insert_rows(table_id, &mut session, 0, 2, "same-name").await;
+        session.freeze_table(table_id, usize::MAX).await.unwrap();
+        checkpoint_published(table_id, &mut session).await;
 
         let delete_key = single_key(0i32);
         let keep_key = single_key(1i32);
-        let deleted_row_id =
-            unique_disk_tree_lookup(&sys.table, &session.pool_guards(), &delete_key)
-                .await
-                .unwrap();
-        let kept_row_id = unique_disk_tree_lookup(&sys.table, &session.pool_guards(), &keep_key)
-            .await
-            .unwrap();
+        let deleted_row_id = unique_disk_tree_lookup(
+            &table_for_internal_assertion(&engine, table_id),
+            &session.pool_guards(),
+            &delete_key,
+        )
+        .await
+        .unwrap();
+        let kept_row_id = unique_disk_tree_lookup(
+            &table_for_internal_assertion(&engine, table_id),
+            &session.pool_guards(),
+            &keep_key,
+        )
+        .await
+        .unwrap();
 
-        sys.new_trx_delete(&mut session, &delete_key).await;
-        let marker_ts = delete_marker_ts(sys.table.deletion_buffer().get(deleted_row_id).unwrap());
+        expect_delete_committed(table_id, &mut session, &delete_key).await;
+        let marker_ts = delete_marker_ts(
+            table_for_internal_assertion(&engine, table_id)
+                .deletion_buffer()
+                .get(deleted_row_id)
+                .unwrap(),
+        );
         wait_gc_cutoff_after(&session, marker_ts).await;
-        checkpoint_published(&sys.table, &mut session).await;
+        checkpoint_published(table_id, &mut session).await;
 
         assert_eq!(
-            unique_disk_tree_lookup(&sys.table, &session.pool_guards(), &delete_key).await,
+            unique_disk_tree_lookup(
+                &table_for_internal_assertion(&engine, table_id),
+                &session.pool_guards(),
+                &delete_key
+            )
+            .await,
             None
         );
         assert_eq!(
-            unique_disk_tree_lookup(&sys.table, &session.pool_guards(), &keep_key).await,
+            unique_disk_tree_lookup(
+                &table_for_internal_assertion(&engine, table_id),
+                &session.pool_guards(),
+                &keep_key
+            )
+            .await,
             Some(kept_row_id)
         );
         let exact_rows = non_unique_disk_tree_prefix_scan(
-            &sys.table,
+            &table_for_internal_assertion(&engine, table_id),
             &session.pool_guards(),
             &name_key("same-name"),
         )
@@ -3002,34 +3099,51 @@ fn test_deletion_checkpoint_updates_secondary_disk_tree_roots() {
 #[test]
 fn test_unique_checkpoint_overlap_keeps_new_disk_tree_owner() {
     smol::block_on(async {
-        let sys = TestSys::new_lightweight_evictable().await;
-        let mut session = sys.new_session().unwrap();
+        let temp_dir = TempDir::new().unwrap();
+        let engine = lightweight_test_engine(&temp_dir, "redo_testsys_lightweight").await;
+        let table_id = create_table2_for_test(&engine).await;
+        let mut session = engine.new_session().unwrap();
         let old_row_id = insert_one_row(
-            &sys.table,
+            table_id,
             &mut session,
             vec![Val::from(1i32), Val::from("old")],
         )
         .await;
-        sys.table.freeze(&session, usize::MAX).await.unwrap();
-        checkpoint_published(&sys.table, &mut session).await;
+        session.freeze_table(table_id, usize::MAX).await.unwrap();
+        checkpoint_published(table_id, &mut session).await;
 
         let key = single_key(1i32);
-        sys.new_trx_delete(&mut session, &key).await;
-        let delete_ts = delete_marker_ts(sys.table.deletion_buffer().get(old_row_id).unwrap());
+        expect_delete_committed(table_id, &mut session, &key).await;
+        let delete_ts = delete_marker_ts(
+            table_for_internal_assertion(&engine, table_id)
+                .deletion_buffer()
+                .get(old_row_id)
+                .unwrap(),
+        );
         let new_row_id = insert_one_row(
-            &sys.table,
+            table_id,
             &mut session,
             vec![Val::from(1i32), Val::from("new")],
         )
         .await;
 
-        sys.table.freeze(&session, usize::MAX).await.unwrap();
-        let readiness_ts = delete_ts.max(sys.table.file().active_root_unchecked().root_ts);
+        session.freeze_table(table_id, usize::MAX).await.unwrap();
+        let readiness_ts = delete_ts.max(
+            table_for_internal_assertion(&engine, table_id)
+                .file()
+                .active_root_unchecked()
+                .root_ts,
+        );
         wait_gc_cutoff_after(&session, readiness_ts).await;
-        checkpoint_published(&sys.table, &mut session).await;
+        checkpoint_published(table_id, &mut session).await;
 
         assert_eq!(
-            unique_disk_tree_lookup(&sys.table, &session.pool_guards(), &key).await,
+            unique_disk_tree_lookup(
+                &table_for_internal_assertion(&engine, table_id),
+                &session.pool_guards(),
+                &key
+            )
+            .await,
             Some(new_row_id)
         );
     });
@@ -3046,30 +3160,47 @@ fn test_secondary_sidecar_failure_keeps_checkpoint_root_atomic() {
     }
 
     smol::block_on(async {
-        let sys = TestSys::new_evictable().await;
-        let mut session = sys.new_session().unwrap();
-        insert_rows(&sys, &mut session, 0, 2, "name").await;
-        sys.table.freeze(&session, usize::MAX).await.unwrap();
-        checkpoint_published(&sys.table, &mut session).await;
+        let temp_dir = TempDir::new().unwrap();
+        let engine = evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys").await;
+        let table_id = create_table2_for_test(&engine).await;
+        let mut session = engine.new_session().unwrap();
+        insert_rows(table_id, &mut session, 0, 2, "name").await;
+        session.freeze_table(table_id, usize::MAX).await.unwrap();
+        checkpoint_published(table_id, &mut session).await;
 
         let key = single_key(0i32);
-        let row_id = unique_disk_tree_lookup(&sys.table, &session.pool_guards(), &key)
-            .await
-            .unwrap();
-        sys.new_trx_delete(&mut session, &key).await;
-        let marker_ts = delete_marker_ts(sys.table.deletion_buffer().get(row_id).unwrap());
+        let row_id = unique_disk_tree_lookup(
+            &table_for_internal_assertion(&engine, table_id),
+            &session.pool_guards(),
+            &key,
+        )
+        .await
+        .unwrap();
+        expect_delete_committed(table_id, &mut session, &key).await;
+        let marker_ts = delete_marker_ts(
+            table_for_internal_assertion(&engine, table_id)
+                .deletion_buffer()
+                .get(row_id)
+                .unwrap(),
+        );
         wait_gc_cutoff_after(&session, marker_ts).await;
-        let root_before = sys.table.file().active_root_unchecked().clone();
+        let root_before = table_for_internal_assertion(&engine, table_id)
+            .file()
+            .active_root_unchecked()
+            .clone();
 
         set_test_force_secondary_sidecar_error(true);
         let _reset = ResetSidecarHook;
-        let err = sys.table.checkpoint(&mut session).await.unwrap_err();
+        let err = session.checkpoint_table(table_id).await.unwrap_err();
         assert_eq!(
             err.report().downcast_ref::<InternalError>().copied(),
             Some(InternalError::InjectedTestFailure)
         );
 
-        let root_after = sys.table.file().active_root_unchecked();
+        let root_after = table_for_internal_assertion(&engine, table_id)
+            .file()
+            .active_root_unchecked()
+            .clone();
         assert_eq!(
             root_after.deletion_cutoff_ts,
             root_before.deletion_cutoff_ts
@@ -3088,22 +3219,29 @@ fn test_secondary_sidecar_failure_keeps_checkpoint_root_atomic() {
 #[test]
 fn test_checkpoint_all_deleted_row_page_advances_without_column_index() {
     smol::block_on(async {
-        let sys = TestSys::new_evictable().await;
-        let mut session = sys.new_session().unwrap();
-        insert_rows(&sys, &mut session, 0, 10, "name").await;
-        delete_key_range_and_wait_gc_cutoff(&sys, &mut session, 0, 10).await;
+        let temp_dir = TempDir::new().unwrap();
+        let engine = evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys").await;
+        let table_id = create_table2_for_test(&engine).await;
+        let mut session = engine.new_session().unwrap();
+        insert_rows(table_id, &mut session, 0, 10, "name").await;
+        delete_key_range_and_wait_gc_cutoff(table_id, &mut session, 0, 10).await;
 
-        let root_before = sys.table.file().active_root_unchecked().clone();
-        sys.table.freeze(&session, usize::MAX).await.unwrap();
-        checkpoint_published(&sys.table, &mut session).await;
+        let root_before = table_for_internal_assertion(&engine, table_id)
+            .file()
+            .active_root_unchecked()
+            .clone();
+        session.freeze_table(table_id, usize::MAX).await.unwrap();
+        checkpoint_published(table_id, &mut session).await;
 
-        let root_after = sys.table.file().active_root_unchecked();
+        let root_after = table_for_internal_assertion(&engine, table_id)
+            .file()
+            .active_root_unchecked()
+            .clone();
         assert!(root_after.pivot_row_id > root_before.pivot_row_id);
         assert_eq!(root_after.column_block_index_root, SUPER_BLOCK_ID);
         assert!(root_after.deletion_cutoff_ts > root_before.deletion_cutoff_ts);
         for i in 0..10 {
-            sys.new_trx_select_not_found(&mut session, &single_key(i))
-                .await;
+            expect_select_not_found_committed(table_id, &mut session, &single_key(i)).await;
         }
     });
 }
@@ -3111,20 +3249,23 @@ fn test_checkpoint_all_deleted_row_page_advances_without_column_index() {
 #[test]
 fn test_checkpoint_transition_delete_marker_waits_for_next_cutoff_range() {
     smol::block_on(async {
-        let sys = TestSys::new_evictable().await;
-        let mut session = sys.new_session().unwrap();
-        insert_rows(&sys, &mut session, 0, 1, "name").await;
+        let temp_dir = TempDir::new().unwrap();
+        let engine = evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys").await;
+        let table_id = create_table2_for_test(&engine).await;
+        let mut session = engine.new_session().unwrap();
+        insert_rows(table_id, &mut session, 0, 1, "name").await;
 
         let key = single_key(0i32);
         let reader = session.begin_trx().unwrap();
-        let index = bound_unique_index_no(&sys.table, key.index_no);
+        let table = table_for_internal_assertion(&engine, table_id);
+        let index = bound_unique_index_no(&table, key.index_no);
         let (row_id, _) = index
             .lookup(session.pool_guards().index_guard(), &key.vals, reader.sts())
             .await
             .unwrap()
             .expect("row should exist before delete");
         assert!(matches!(
-            sys.table
+            table
                 .find_row(&session.pool_guards(), row_id)
                 .await
                 .unwrap(),
@@ -3132,32 +3273,26 @@ fn test_checkpoint_transition_delete_marker_waits_for_next_cutoff_range() {
         ));
         reader.commit().await.unwrap();
 
-        let mut hold_session = sys.new_session().unwrap();
+        let mut hold_session = engine.new_session().unwrap();
         let hold_trx = hold_session.begin_trx().unwrap();
         let hold_sts = hold_trx.sts();
 
-        let mut writer_session = sys.new_session().unwrap();
-        sys.new_trx_delete(&mut writer_session, &key).await;
-        assert!(sys.table.deletion_buffer().get(row_id).is_none());
+        let mut writer_session = engine.new_session().unwrap();
+        expect_delete_committed(table_id, &mut writer_session, &key).await;
+        assert!(table.deletion_buffer().get(row_id).is_none());
 
-        sys.table.freeze(&session, usize::MAX).await.unwrap();
-        let mut checkpoint_session = sys.new_session().unwrap();
-        checkpoint_published(&sys.table, &mut checkpoint_session).await;
+        session.freeze_table(table_id, usize::MAX).await.unwrap();
+        let mut checkpoint_session = engine.new_session().unwrap();
+        checkpoint_published(table_id, &mut checkpoint_session).await;
 
-        let marker = sys.table.deletion_buffer().get(row_id).unwrap();
+        let marker = table.deletion_buffer().get(row_id).unwrap();
         let delete_cts = delete_marker_ts(marker);
         assert!(delete_cts >= hold_sts);
 
-        let root_after_first = sys.table.file().active_root_unchecked().clone();
+        let snapshot_after_first = column_block_index_snapshot(&engine, table_id);
+        let root_after_first = &snapshot_after_first.active_root;
         let pool_guards = session.pool_guards();
-        let index_after_first = ColumnBlockIndex::new(
-            root_after_first.column_block_index_root,
-            root_after_first.pivot_row_id,
-            sys.table.file().file_kind(),
-            sys.table.file().sparse_file(),
-            sys.table.disk_pool(),
-            pool_guards.disk_guard(),
-        );
+        let index_after_first = snapshot_after_first.index(pool_guards.disk_guard());
         let entry_after_first = index_after_first
             .locate_block(row_id)
             .await
@@ -3174,18 +3309,12 @@ fn test_checkpoint_transition_delete_marker_waits_for_next_cutoff_range() {
 
         hold_trx.rollback().await.unwrap();
         wait_gc_cutoff_after(&checkpoint_session, delete_cts).await;
-        checkpoint_published(&sys.table, &mut checkpoint_session).await;
+        checkpoint_published(table_id, &mut checkpoint_session).await;
 
-        let root_after_second = sys.table.file().active_root_unchecked();
+        let snapshot_after_second = column_block_index_snapshot(&engine, table_id);
+        let root_after_second = &snapshot_after_second.active_root;
         let pool_guards = session.pool_guards();
-        let index_after_second = ColumnBlockIndex::new(
-            root_after_second.column_block_index_root,
-            root_after_second.pivot_row_id,
-            sys.table.file().file_kind(),
-            sys.table.file().sparse_file(),
-            sys.table.disk_pool(),
-            pool_guards.disk_guard(),
-        );
+        let index_after_second = snapshot_after_second.index(pool_guards.disk_guard());
         let entry_after_second = index_after_second
             .locate_block(row_id)
             .await
@@ -3204,19 +3333,29 @@ fn test_checkpoint_transition_delete_marker_waits_for_next_cutoff_range() {
 #[test]
 fn test_lwc_unique_index_purge_uses_purgeable_delete_marker_fast_path() {
     smol::block_on(async {
-        let sys = TestSys::new_evictable().await;
-        let mut session = sys.new_session().unwrap();
-        insert_rows(&sys, &mut session, 0, 1, "name").await;
-        sys.table.freeze(&session, usize::MAX).await.unwrap();
-        checkpoint_published(&sys.table, &mut session).await;
+        let temp_dir = TempDir::new().unwrap();
+        let engine = evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys").await;
+        let table_id = create_table2_for_test(&engine).await;
+        let mut session = engine.new_session().unwrap();
+        insert_rows(table_id, &mut session, 0, 1, "name").await;
+        session.freeze_table(table_id, usize::MAX).await.unwrap();
+        checkpoint_published(table_id, &mut session).await;
 
         let key = single_key(0i32);
         let reader = session.begin_trx().unwrap();
-        let row_id =
-            assert_row_in_lwc(&sys.table, &session.pool_guards(), &key, reader.sts()).await;
+        let row_id = assert_row_in_lwc(
+            &table_for_internal_assertion(&engine, table_id),
+            &session.pool_guards(),
+            &key,
+            reader.sts(),
+        )
+        .await;
         reader.commit().await.unwrap();
 
-        let index = bound_unique_index_no(&sys.table, key.index_no);
+        let index = bound_unique_index_no(
+            &table_for_internal_assertion(&engine, table_id),
+            key.index_no,
+        );
         assert!(
             index
                 .mask_as_deleted(
@@ -3228,15 +3367,14 @@ fn test_lwc_unique_index_purge_uses_purgeable_delete_marker_fast_path() {
                 .await
                 .unwrap()
         );
-        sys.table
+        table_for_internal_assertion(&engine, table_id)
             .deletion_buffer()
             .put_committed(row_id, TrxID::new(10))
             .unwrap();
 
-        let layout = sys.table.layout_snapshot();
+        let layout = table_for_internal_assertion(&engine, table_id).layout_snapshot();
 
-        let deleted = sys
-            .table
+        let deleted = table_for_internal_assertion(&engine, table_id)
             .accessor_with_layout(&layout)
             .delete_index(&session.pool_guards(), &key, row_id, true, TrxID::new(11))
             .await
@@ -3263,17 +3401,19 @@ fn test_lwc_unique_index_purge_uses_purgeable_delete_marker_fast_path() {
 #[test]
 fn test_lwc_unique_index_purge_compares_persisted_key_when_marker_is_not_purgeable() {
     smol::block_on(async {
-        let sys = TestSys::new_evictable().await;
-        let mut session = sys.new_session().unwrap();
-        insert_rows(&sys, &mut session, 0, 1, "name").await;
-        sys.table.freeze(&session, usize::MAX).await.unwrap();
-        checkpoint_published(&sys.table, &mut session).await;
+        let temp_dir = TempDir::new().unwrap();
+        let engine = evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys").await;
+        let table_id = create_table2_for_test(&engine).await;
+        let mut session = engine.new_session().unwrap();
+        insert_rows(table_id, &mut session, 0, 1, "name").await;
+        session.freeze_table(table_id, usize::MAX).await.unwrap();
+        checkpoint_published(table_id, &mut session).await;
 
         let current_key = single_key(0i32);
         let stale_key = single_key(-1i32);
         let reader = session.begin_trx().unwrap();
         let row_id = assert_row_in_lwc(
-            &sys.table,
+            &table_for_internal_assertion(&engine, table_id),
             &session.pool_guards(),
             &current_key,
             reader.sts(),
@@ -3281,7 +3421,10 @@ fn test_lwc_unique_index_purge_compares_persisted_key_when_marker_is_not_purgeab
         .await;
         reader.commit().await.unwrap();
 
-        let index = bound_unique_index_no(&sys.table, current_key.index_no);
+        let index = bound_unique_index_no(
+            &table_for_internal_assertion(&engine, table_id),
+            current_key.index_no,
+        );
         let _ = index
             .insert_if_not_exists(
                 session.pool_guards().index_guard(),
@@ -3303,9 +3446,8 @@ fn test_lwc_unique_index_purge_compares_persisted_key_when_marker_is_not_purgeab
                 .await
                 .unwrap()
         );
-        let layout = sys.table.layout_snapshot();
-        let deleted = sys
-            .table
+        let layout = table_for_internal_assertion(&engine, table_id).layout_snapshot();
+        let deleted = table_for_internal_assertion(&engine, table_id)
             .accessor_with_layout(&layout)
             .delete_index(
                 &session.pool_guards(),
@@ -3340,13 +3482,12 @@ fn test_lwc_unique_index_purge_compares_persisted_key_when_marker_is_not_purgeab
                 .await
                 .unwrap()
         );
-        sys.table
+        table_for_internal_assertion(&engine, table_id)
             .deletion_buffer()
             .put_committed(row_id, TrxID::new(100))
             .unwrap();
-        let layout = sys.table.layout_snapshot();
-        let deleted = sys
-            .table
+        let layout = table_for_internal_assertion(&engine, table_id).layout_snapshot();
+        let deleted = table_for_internal_assertion(&engine, table_id)
             .accessor_with_layout(&layout)
             .delete_index(
                 &session.pool_guards(),
@@ -3375,20 +3516,32 @@ fn test_lwc_unique_index_purge_compares_persisted_key_when_marker_is_not_purgeab
 #[test]
 fn test_lwc_non_unique_index_purge_compares_persisted_key_when_marker_is_not_purgeable() {
     smol::block_on(async {
-        let sys = TestSys::new_evictable_with_non_unique_name_index().await;
-        let mut session = sys.new_session().unwrap();
-        insert_rows(&sys, &mut session, 0, 1, "current").await;
-        sys.table.freeze(&session, usize::MAX).await.unwrap();
-        checkpoint_published(&sys.table, &mut session).await;
+        let temp_dir = TempDir::new().unwrap();
+        let engine =
+            evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys_non_unique").await;
+        let table_id = create_non_unique_name_table_for_test(&engine).await;
+        let mut session = engine.new_session().unwrap();
+        insert_rows(table_id, &mut session, 0, 1, "current").await;
+        session.freeze_table(table_id, usize::MAX).await.unwrap();
+        checkpoint_published(table_id, &mut session).await;
 
         let pk = single_key(0i32);
         let current_key = name_key("current");
         let stale_key = name_key("stale");
         let reader = session.begin_trx().unwrap();
-        let row_id = assert_row_in_lwc(&sys.table, &session.pool_guards(), &pk, reader.sts()).await;
+        let row_id = assert_row_in_lwc(
+            &table_for_internal_assertion(&engine, table_id),
+            &session.pool_guards(),
+            &pk,
+            reader.sts(),
+        )
+        .await;
         reader.commit().await.unwrap();
 
-        let index = bound_non_unique_index_no(&sys.table, current_key.index_no);
+        let index = bound_non_unique_index_no(
+            &table_for_internal_assertion(&engine, table_id),
+            current_key.index_no,
+        );
         let _ = index
             .insert_if_not_exists(
                 session.pool_guards().index_guard(),
@@ -3410,9 +3563,8 @@ fn test_lwc_non_unique_index_purge_compares_persisted_key_when_marker_is_not_pur
                 .await
                 .unwrap()
         );
-        let layout = sys.table.layout_snapshot();
-        let deleted = sys
-            .table
+        let layout = table_for_internal_assertion(&engine, table_id).layout_snapshot();
+        let deleted = table_for_internal_assertion(&engine, table_id)
             .accessor_with_layout(&layout)
             .delete_index(
                 &session.pool_guards(),
@@ -3448,13 +3600,12 @@ fn test_lwc_non_unique_index_purge_compares_persisted_key_when_marker_is_not_pur
                 .await
                 .unwrap()
         );
-        sys.table
+        table_for_internal_assertion(&engine, table_id)
             .deletion_buffer()
             .put_committed(row_id, TrxID::new(200))
             .unwrap();
-        let layout = sys.table.layout_snapshot();
-        let deleted = sys
-            .table
+        let layout = table_for_internal_assertion(&engine, table_id).layout_snapshot();
+        let deleted = table_for_internal_assertion(&engine, table_id)
             .accessor_with_layout(&layout)
             .delete_index(
                 &session.pool_guards(),
@@ -3484,11 +3635,16 @@ fn test_lwc_non_unique_index_purge_compares_persisted_key_when_marker_is_not_pur
 #[test]
 fn test_index_purge_removes_delete_marked_unique_entry_when_row_is_not_found() {
     smol::block_on(async {
-        let sys = TestSys::new_evictable().await;
-        let session = sys.new_session().unwrap();
+        let temp_dir = TempDir::new().unwrap();
+        let engine = evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys").await;
+        let table_id = create_table2_for_test(&engine).await;
+        let session = engine.new_session().unwrap();
         let key = single_key(9999i32);
         let row_id = 9999;
-        let index = bound_unique_index_no(&sys.table, key.index_no);
+        let index = bound_unique_index_no(
+            &table_for_internal_assertion(&engine, table_id),
+            key.index_no,
+        );
         let _ = index
             .insert_if_not_exists(
                 session.pool_guards().index_guard(),
@@ -3511,10 +3667,9 @@ fn test_index_purge_removes_delete_marked_unique_entry_when_row_is_not_found() {
                 .unwrap()
         );
 
-        let layout = sys.table.layout_snapshot();
+        let layout = table_for_internal_assertion(&engine, table_id).layout_snapshot();
 
-        let deleted = sys
-            .table
+        let deleted = table_for_internal_assertion(&engine, table_id)
             .accessor_with_layout(&layout)
             .delete_index(
                 &session.pool_guards(),
@@ -3543,20 +3698,25 @@ fn test_index_purge_removes_delete_marked_unique_entry_when_row_is_not_found() {
 #[test]
 fn test_unique_insert_rollback_restores_deleted_owner_even_when_row_missing() {
     smol::block_on(async {
-        let sys = TestSys::new_evictable().await;
-        let mut session = sys.new_session().unwrap();
+        let temp_dir = TempDir::new().unwrap();
+        let engine = evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys").await;
+        let table_id = create_table2_for_test(&engine).await;
+        let mut session = engine.new_session().unwrap();
         let key = single_key(10_001i32);
         let stale_row_id = 10_001;
 
         assert!(matches!(
-            sys.table
+            table_for_internal_assertion(&engine, table_id)
                 .find_row(&session.pool_guards(), RowID::new(stale_row_id))
                 .await
                 .unwrap(),
             RowLocation::NotFound
         ));
 
-        let index = bound_unique_index_no(&sys.table, key.index_no);
+        let index = bound_unique_index_no(
+            &table_for_internal_assertion(&engine, table_id),
+            key.index_no,
+        );
         assert!(
             index
                 .insert_if_not_exists(
@@ -3582,7 +3742,7 @@ fn test_unique_insert_rollback_restores_deleted_owner_even_when_row_missing() {
                 .unwrap()
         );
         assert_unique_index_entry(
-            &sys.table,
+            &table_for_internal_assertion(&engine, table_id),
             &session.pool_guards(),
             &key,
             MAX_SNAPSHOT_TS,
@@ -3595,16 +3755,16 @@ fn test_unique_insert_rollback_restores_deleted_owner_even_when_row_missing() {
         let res: Result<()> = trx
             .exec(async |stmt| {
                 let new_row_id = unwrap_insert_result(
-                    stmt_insert_row(
+                    stmt_insert_row_by_id(
                         stmt,
-                        &sys.table,
+                        table_id,
                         vec![Val::from(10_001i32), Val::from("reborn")],
                     )
                     .await,
                 );
                 assert_ne!(new_row_id, RowID::new(stale_row_id));
                 assert_unique_index_entry(
-                    &sys.table,
+                    &table_for_internal_assertion(&engine, table_id),
                     &session.pool_guards(),
                     &key,
                     stmt.runtime().sts(),
@@ -3622,7 +3782,7 @@ fn test_unique_insert_rollback_restores_deleted_owner_even_when_row_missing() {
         trx.rollback().await.unwrap();
 
         assert_unique_index_entry(
-            &sys.table,
+            &table_for_internal_assertion(&engine, table_id),
             &session.pool_guards(),
             &key,
             MAX_SNAPSHOT_TS,
@@ -3630,13 +3790,14 @@ fn test_unique_insert_rollback_restores_deleted_owner_even_when_row_missing() {
             true,
         )
         .await;
-        sys.new_trx_select_not_found(&mut session, &key).await;
-        sys.new_trx_insert(
+        expect_select_not_found_committed(table_id, &mut session, &key).await;
+        expect_insert_committed(
+            table_id,
             &mut session,
             vec![Val::from(10_001i32), Val::from("reclaimed")],
         )
         .await;
-        sys.new_trx_select(&mut session, &key, |vals| {
+        expect_select_committed(table_id, &mut session, &key, |vals| {
             assert_eq!(vals, vec![Val::from(10_001i32), Val::from("reclaimed")]);
         })
         .await;
@@ -3646,34 +3807,46 @@ fn test_unique_insert_rollback_restores_deleted_owner_even_when_row_missing() {
 #[test]
 fn test_unique_insert_rollback_restores_delete_marked_stale_hot_owner() {
     smol::block_on(async {
-        let sys = TestSys::new_evictable().await;
-        let mut session = sys.new_session().unwrap();
+        let temp_dir = TempDir::new().unwrap();
+        let engine = evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys").await;
+        let table_id = create_table2_for_test(&engine).await;
+        let mut session = engine.new_session().unwrap();
         let live_key = single_key(1i32);
         let stale_key = single_key(2i32);
-        sys.new_trx_insert(&mut session, vec![Val::from(1i32), Val::from("one")])
-            .await;
+        expect_insert_committed(
+            table_id,
+            &mut session,
+            vec![Val::from(1i32), Val::from("one")],
+        )
+        .await;
 
         let reader = session.begin_trx().unwrap();
-        let old_row_id = bound_unique_index_no(&sys.table, live_key.index_no)
-            .lookup(
-                session.pool_guards().index_guard(),
-                &live_key.vals,
-                reader.sts(),
-            )
-            .await
-            .unwrap()
-            .unwrap()
-            .0;
+        let old_row_id = bound_unique_index_no(
+            &table_for_internal_assertion(&engine, table_id),
+            live_key.index_no,
+        )
+        .lookup(
+            session.pool_guards().index_guard(),
+            &live_key.vals,
+            reader.sts(),
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .0;
         reader.commit().await.unwrap();
         assert!(matches!(
-            sys.table
+            table_for_internal_assertion(&engine, table_id)
                 .find_row(&session.pool_guards(), old_row_id)
                 .await
                 .unwrap(),
             RowLocation::RowPage(_)
         ));
 
-        let index = bound_unique_index_no(&sys.table, stale_key.index_no);
+        let index = bound_unique_index_no(
+            &table_for_internal_assertion(&engine, table_id),
+            stale_key.index_no,
+        );
         assert!(
             index
                 .insert_if_not_exists(
@@ -3703,12 +3876,12 @@ fn test_unique_insert_rollback_restores_delete_marked_stale_hot_owner() {
         let res: Result<()> = trx
             .exec(async |stmt| {
                 let new_row_id = unwrap_insert_result(
-                    stmt_insert_row(stmt, &sys.table, vec![Val::from(2i32), Val::from("two")])
+                    stmt_insert_row_by_id(stmt, table_id, vec![Val::from(2i32), Val::from("two")])
                         .await,
                 );
                 assert_ne!(new_row_id, old_row_id);
                 assert_unique_index_entry(
-                    &sys.table,
+                    &table_for_internal_assertion(&engine, table_id),
                     &session.pool_guards(),
                     &stale_key,
                     stmt.runtime().sts(),
@@ -3726,7 +3899,7 @@ fn test_unique_insert_rollback_restores_delete_marked_stale_hot_owner() {
         trx.rollback().await.unwrap();
 
         assert_unique_index_entry(
-            &sys.table,
+            &table_for_internal_assertion(&engine, table_id),
             &session.pool_guards(),
             &stale_key,
             MAX_SNAPSHOT_TS,
@@ -3734,14 +3907,18 @@ fn test_unique_insert_rollback_restores_delete_marked_stale_hot_owner() {
             true,
         )
         .await;
-        sys.new_trx_select(&mut session, &live_key, |vals| {
+        expect_select_committed(table_id, &mut session, &live_key, |vals| {
             assert_eq!(vals, vec![Val::from(1i32), Val::from("one")]);
         })
         .await;
-        sys.new_trx_select_not_found(&mut session, &stale_key).await;
-        sys.new_trx_insert(&mut session, vec![Val::from(2i32), Val::from("two-final")])
-            .await;
-        sys.new_trx_select(&mut session, &stale_key, |vals| {
+        expect_select_not_found_committed(table_id, &mut session, &stale_key).await;
+        expect_insert_committed(
+            table_id,
+            &mut session,
+            vec![Val::from(2i32), Val::from("two-final")],
+        )
+        .await;
+        expect_select_committed(table_id, &mut session, &stale_key, |vals| {
             assert_eq!(vals, vec![Val::from(2i32), Val::from("two-final")]);
         })
         .await;
@@ -3751,29 +3928,37 @@ fn test_unique_insert_rollback_restores_delete_marked_stale_hot_owner() {
 #[test]
 fn test_checkpoint_fails_when_eligible_delete_marker_has_no_column_index() {
     smol::block_on(async {
-        let sys = TestSys::new_evictable().await;
-        let mut session = sys.new_session().unwrap();
-        insert_rows(&sys, &mut session, 0, 4, "name").await;
-        delete_key_range_and_wait_gc_cutoff(&sys, &mut session, 0, 4).await;
-        sys.table.freeze(&session, usize::MAX).await.unwrap();
-        checkpoint_published(&sys.table, &mut session).await;
+        let temp_dir = TempDir::new().unwrap();
+        let engine = evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys").await;
+        let table_id = create_table2_for_test(&engine).await;
+        let mut session = engine.new_session().unwrap();
+        insert_rows(table_id, &mut session, 0, 4, "name").await;
+        delete_key_range_and_wait_gc_cutoff(table_id, &mut session, 0, 4).await;
+        session.freeze_table(table_id, usize::MAX).await.unwrap();
+        checkpoint_published(table_id, &mut session).await;
 
-        let root_before = sys.table.file().active_root_unchecked().clone();
+        let root_before = table_for_internal_assertion(&engine, table_id)
+            .file()
+            .active_root_unchecked()
+            .clone();
         assert!(root_before.pivot_row_id > RowID::new(0));
         assert_eq!(root_before.column_block_index_root, SUPER_BLOCK_ID);
         let marker_ts = root_before.deletion_cutoff_ts;
-        sys.table
+        table_for_internal_assertion(&engine, table_id)
             .deletion_buffer()
             .put_committed(RowID::new(0), marker_ts)
             .unwrap();
         wait_gc_cutoff_after(&session, marker_ts).await;
 
-        let err = sys.table.checkpoint(&mut session).await.unwrap_err();
+        let err = session.checkpoint_table(table_id).await.unwrap_err();
         assert_eq!(
             err.report().downcast_ref::<DataIntegrityError>().copied(),
             Some(DataIntegrityError::InvalidRootInvariant)
         );
-        let root_after = sys.table.file().active_root_unchecked();
+        let root_after = table_for_internal_assertion(&engine, table_id)
+            .file()
+            .active_root_unchecked()
+            .clone();
         assert_eq!(
             root_after.deletion_cutoff_ts,
             root_before.deletion_cutoff_ts
@@ -3788,47 +3973,43 @@ fn test_checkpoint_fails_when_eligible_delete_marker_has_no_column_index() {
 #[test]
 fn test_checkpoint_fails_when_eligible_delete_marker_cannot_be_located() {
     smol::block_on(async {
-        let sys = TestSys::new_evictable().await;
-        let mut session = sys.new_session().unwrap();
-        insert_rows(&sys, &mut session, 0, 1, "name").await;
-        sys.table.freeze(&session, usize::MAX).await.unwrap();
-        checkpoint_published(&sys.table, &mut session).await;
+        let temp_dir = TempDir::new().unwrap();
+        let engine = evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys").await;
+        let table_id = create_table2_for_test(&engine).await;
+        let mut session = engine.new_session().unwrap();
+        insert_rows(table_id, &mut session, 0, 1, "name").await;
+        session.freeze_table(table_id, usize::MAX).await.unwrap();
+        checkpoint_published(table_id, &mut session).await;
 
         let key = single_key(0i32);
         let reader = session.begin_trx().unwrap();
-        let row_id =
-            assert_row_in_lwc(&sys.table, &session.pool_guards(), &key, reader.sts()).await;
+        let table = table_for_internal_assertion(&engine, table_id);
+        let row_id = assert_row_in_lwc(&table, &session.pool_guards(), &key, reader.sts()).await;
         reader.commit().await.unwrap();
 
-        let root_before = sys.table.file().active_root_unchecked().clone();
+        let snapshot_before = column_block_index_snapshot(&engine, table_id);
+        let root_before = &snapshot_before.active_root;
         assert_ne!(root_before.column_block_index_root, SUPER_BLOCK_ID);
         let missing_row_id = row_id + 1;
         assert!(missing_row_id < root_before.pivot_row_id);
         let pool_guards = session.pool_guards();
-        let index = ColumnBlockIndex::new(
-            root_before.column_block_index_root,
-            root_before.pivot_row_id,
-            sys.table.file().file_kind(),
-            sys.table.file().sparse_file(),
-            sys.table.disk_pool(),
-            pool_guards.disk_guard(),
-        );
+        let index = snapshot_before.index(pool_guards.disk_guard());
         assert!(index.locate_block(missing_row_id).await.unwrap().is_none());
 
         let marker_ts = root_before.deletion_cutoff_ts;
-        sys.table
+        table
             .deletion_buffer()
             .put_committed(missing_row_id, marker_ts)
             .unwrap();
         wait_gc_cutoff_after(&session, marker_ts).await;
 
-        let err = sys.table.checkpoint(&mut session).await.unwrap_err();
+        let err = session.checkpoint_table(table_id).await.unwrap_err();
         assert_eq!(
             err.report().downcast_ref::<DataIntegrityError>().copied(),
             Some(DataIntegrityError::InvalidRootInvariant)
         );
         assert_eq!(
-            sys.table.file().active_root_unchecked().deletion_cutoff_ts,
+            table.file().active_root_unchecked().deletion_cutoff_ts,
             root_before.deletion_cutoff_ts
         );
     });
@@ -3837,32 +4018,34 @@ fn test_checkpoint_fails_when_eligible_delete_marker_cannot_be_located() {
 #[test]
 fn test_checkpoint_ignores_missing_old_delete_marker_below_previous_cutoff() {
     smol::block_on(async {
-        let sys = TestSys::new_evictable().await;
-        let mut session = sys.new_session().unwrap();
-        insert_rows(&sys, &mut session, 0, 1, "name").await;
-        sys.table.freeze(&session, usize::MAX).await.unwrap();
-        checkpoint_published(&sys.table, &mut session).await;
+        let temp_dir = TempDir::new().unwrap();
+        let engine = evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys").await;
+        let table_id = create_table2_for_test(&engine).await;
+        let mut session = engine.new_session().unwrap();
+        insert_rows(table_id, &mut session, 0, 1, "name").await;
+        session.freeze_table(table_id, usize::MAX).await.unwrap();
+        checkpoint_published(table_id, &mut session).await;
 
         let key = single_key(0i32);
         let reader = session.begin_trx().unwrap();
-        let row_id =
-            assert_row_in_lwc(&sys.table, &session.pool_guards(), &key, reader.sts()).await;
+        let table = table_for_internal_assertion(&engine, table_id);
+        let row_id = assert_row_in_lwc(&table, &session.pool_guards(), &key, reader.sts()).await;
         reader.commit().await.unwrap();
 
-        let root_before = sys.table.file().active_root_unchecked().clone();
+        let root_before = table.file().active_root_unchecked().clone();
         assert!(root_before.deletion_cutoff_ts > TrxID::new(0));
         let missing_row_id = row_id + 1;
         assert!(missing_row_id < root_before.pivot_row_id);
         let old_marker_ts = root_before.deletion_cutoff_ts.saturating_sub(1);
-        sys.table
+        table
             .deletion_buffer()
             .put_committed(missing_row_id, old_marker_ts)
             .unwrap();
         wait_gc_cutoff_after(&session, root_before.deletion_cutoff_ts).await;
 
-        checkpoint_published(&sys.table, &mut session).await;
+        checkpoint_published(table_id, &mut session).await;
         assert!(
-            sys.table.file().active_root_unchecked().deletion_cutoff_ts
+            table.file().active_root_unchecked().deletion_cutoff_ts
                 > root_before.deletion_cutoff_ts
         );
     });
@@ -3871,32 +4054,33 @@ fn test_checkpoint_ignores_missing_old_delete_marker_below_previous_cutoff() {
 #[test]
 fn test_recover_cold_delete_rejects_already_deleted_with_different_cts() {
     smol::block_on(async {
-        let sys = TestSys::new_evictable().await;
-        let mut session = sys.new_session().unwrap();
-        insert_rows(&sys, &mut session, 0, 10, "name").await;
-        sys.table.freeze(&session, usize::MAX).await.unwrap();
-        checkpoint_published(&sys.table, &mut session).await;
+        let temp_dir = TempDir::new().unwrap();
+        let engine = evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys").await;
+        let table_id = create_table2_for_test(&engine).await;
+        let mut session = engine.new_session().unwrap();
+        insert_rows(table_id, &mut session, 0, 10, "name").await;
+        session.freeze_table(table_id, usize::MAX).await.unwrap();
+        checkpoint_published(table_id, &mut session).await;
 
         let key = single_key(6i32);
         let reader = session.begin_trx().unwrap();
-        let row_id =
-            assert_row_in_lwc(&sys.table, &session.pool_guards(), &key, reader.sts()).await;
+        let table = table_for_internal_assertion(&engine, table_id);
+        let row_id = assert_row_in_lwc(&table, &session.pool_guards(), &key, reader.sts()).await;
         reader.commit().await.unwrap();
 
-        let active_root = sys.table.file().active_root_unchecked();
+        let active_root = table.file().active_root_unchecked().clone();
         assert!(row_id < active_root.pivot_row_id);
         let cts = active_root.deletion_cutoff_ts;
-        sys.table
+        table
             .recover_row_delete(&session.pool_guards(), PageID::from(0u64), row_id, cts)
             .await
             .unwrap();
-        sys.table
+        table
             .recover_row_delete(&session.pool_guards(), PageID::from(0u64), row_id, cts)
             .await
             .unwrap();
 
-        let err = sys
-            .table
+        let err = table
             .recover_row_delete(&session.pool_guards(), PageID::from(0u64), row_id, cts + 1)
             .await
             .unwrap_err();
@@ -3910,11 +4094,12 @@ fn test_recover_cold_delete_rejects_already_deleted_with_different_cts() {
 #[test]
 fn test_recover_row_page_reports_invalid_replay_state() {
     smol::block_on(async {
-        let sys = TestSys::new_evictable().await;
-        let session = sys.new_session().unwrap();
-        let metadata = sys.table.metadata();
-        let mut page_guard = sys
-            .table
+        let temp_dir = TempDir::new().unwrap();
+        let engine = evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys").await;
+        let table_id = create_table2_for_test(&engine).await;
+        let session = engine.new_session().unwrap();
+        let metadata = table_for_internal_assertion(&engine, table_id).metadata();
+        let mut page_guard = table_for_internal_assertion(&engine, table_id)
             .mem
             .get_insert_page_exclusive(&session.pool_guards(), 2, None)
             .await
@@ -3931,8 +4116,7 @@ fn test_recover_row_page_reports_invalid_replay_state() {
             assert!(report.contains("recover row"), "{report}");
         };
 
-        let err = sys
-            .table
+        let err = table_for_internal_assertion(&engine, table_id)
             .recover_row_insert_to_page(
                 metadata.as_ref(),
                 &mut page_guard,
@@ -3944,8 +4128,7 @@ fn test_recover_row_page_reports_invalid_replay_state() {
         assert_invalid_root(err, "missing recover map");
 
         page_guard.bf_mut().init_recover_map(TrxID::new(10));
-        let err = sys
-            .table
+        let err = table_for_internal_assertion(&engine, table_id)
             .recover_row_insert_to_page(
                 metadata.as_ref(),
                 &mut page_guard,
@@ -3956,7 +4139,7 @@ fn test_recover_row_page_reports_invalid_replay_state() {
             .unwrap_err();
         assert_invalid_root(err, "insufficient row page space");
 
-        sys.table
+        table_for_internal_assertion(&engine, table_id)
             .recover_row_insert_to_page(
                 metadata.as_ref(),
                 &mut page_guard,
@@ -3967,8 +4150,7 @@ fn test_recover_row_page_reports_invalid_replay_state() {
             .unwrap();
         assert_eq!(page_guard.page().header.approx_non_deleted(), 1);
 
-        let err = sys
-            .table
+        let err = table_for_internal_assertion(&engine, table_id)
             .recover_row_insert_to_page(
                 metadata.as_ref(),
                 &mut page_guard,
@@ -3979,8 +4161,7 @@ fn test_recover_row_page_reports_invalid_replay_state() {
             .unwrap_err();
         assert_invalid_root(err, "row slot is not vacant");
 
-        let err = sys
-            .table
+        let err = table_for_internal_assertion(&engine, table_id)
             .recover_row_update_to_page(
                 metadata.as_ref(),
                 &mut page_guard,
@@ -3994,19 +4175,17 @@ fn test_recover_row_page_reports_invalid_replay_state() {
             .unwrap_err();
         assert_invalid_root(err, "row is deleted");
 
-        sys.table
+        table_for_internal_assertion(&engine, table_id)
             .recover_row_delete_to_page(&mut page_guard, row_id, TrxID::new(15))
             .unwrap();
         assert_eq!(page_guard.page().header.approx_non_deleted(), 0);
 
-        let err = sys
-            .table
+        let err = table_for_internal_assertion(&engine, table_id)
             .recover_row_delete_to_page(&mut page_guard, row_id, TrxID::new(16))
             .unwrap_err();
         assert_invalid_root(err, "row is already deleted");
 
-        let err = sys
-            .table
+        let err = table_for_internal_assertion(&engine, table_id)
             .recover_row_delete_to_page(&mut page_guard, row_id + 2, TrxID::new(17))
             .unwrap_err();
         assert_invalid_root(err, "row id outside page range");
@@ -4016,45 +4195,47 @@ fn test_recover_row_page_reports_invalid_replay_state() {
 #[test]
 fn test_checkpoint_skips_cold_delete_markers_at_or_after_cutoff() {
     smol::block_on(async {
-        let sys = TestSys::new_evictable().await;
-        let mut session = sys.new_session().unwrap();
-        insert_rows(&sys, &mut session, 0, 10, "name").await;
-        sys.table.freeze(&session, usize::MAX).await.unwrap();
-        checkpoint_published(&sys.table, &mut session).await;
+        let temp_dir = TempDir::new().unwrap();
+        let engine = evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys").await;
+        let table_id = create_table2_for_test(&engine).await;
+        let mut session = engine.new_session().unwrap();
+        insert_rows(table_id, &mut session, 0, 10, "name").await;
+        session.freeze_table(table_id, usize::MAX).await.unwrap();
+        checkpoint_published(table_id, &mut session).await;
 
         let key = single_key(7i32);
         let reader = session.begin_trx().unwrap();
-        let row_id =
-            assert_row_in_lwc(&sys.table, &session.pool_guards(), &key, reader.sts()).await;
+        let row_id = assert_row_in_lwc(
+            &table_for_internal_assertion(&engine, table_id),
+            &session.pool_guards(),
+            &key,
+            reader.sts(),
+        )
+        .await;
         reader.commit().await.unwrap();
 
-        let mut hold_session = sys.new_session().unwrap();
+        let mut hold_session = engine.new_session().unwrap();
         let hold_trx = hold_session.begin_trx().unwrap();
         let hold_sts = hold_trx.sts();
 
-        let mut writer_session = sys.new_session().unwrap();
-        sys.new_trx_delete(&mut writer_session, &key).await;
+        let mut writer_session = engine.new_session().unwrap();
+        expect_delete_committed(table_id, &mut writer_session, &key).await;
 
-        let marker = sys.table.deletion_buffer().get(row_id).unwrap();
+        let table = table_for_internal_assertion(&engine, table_id);
+        let marker = table.deletion_buffer().get(row_id).unwrap();
         let delete_cts = match marker {
             DeleteMarker::Committed(ts) => ts,
             DeleteMarker::Ref(status) => status.ts(),
         };
         assert!(delete_cts >= hold_sts);
 
-        let mut checkpoint_session = sys.new_session().unwrap();
-        checkpoint_published(&sys.table, &mut checkpoint_session).await;
+        let mut checkpoint_session = engine.new_session().unwrap();
+        checkpoint_published(table_id, &mut checkpoint_session).await;
 
-        let active_root = sys.table.file().active_root_unchecked();
+        let snapshot = column_block_index_snapshot(&engine, table_id);
+        let active_root = &snapshot.active_root;
         let pool_guards = session.pool_guards();
-        let index = ColumnBlockIndex::new(
-            active_root.column_block_index_root,
-            active_root.pivot_row_id,
-            sys.table.file().file_kind(),
-            sys.table.file().sparse_file(),
-            sys.table.disk_pool(),
-            pool_guards.disk_guard(),
-        );
+        let index = snapshot.index(pool_guards.disk_guard());
         let entry = index
             .locate_block(row_id)
             .await
@@ -4070,34 +4251,29 @@ fn test_checkpoint_skips_cold_delete_markers_at_or_after_cutoff() {
 #[test]
 fn test_checkpoint_fails_on_invalid_v2_delete_metadata() {
     smol::block_on(async {
-        let sys = TestSys::new_evictable().await;
-        let mut session = sys.new_session().unwrap();
-        insert_rows(&sys, &mut session, 0, 10, "name").await;
-        sys.table.freeze(&session, usize::MAX).await.unwrap();
-        checkpoint_published(&sys.table, &mut session).await;
+        let temp_dir = TempDir::new().unwrap();
+        let engine = evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys").await;
+        let table_id = create_table2_for_test(&engine).await;
+        let mut session = engine.new_session().unwrap();
+        insert_rows(table_id, &mut session, 0, 10, "name").await;
+        session.freeze_table(table_id, usize::MAX).await.unwrap();
+        checkpoint_published(table_id, &mut session).await;
 
         let key1 = single_key(6i32);
         let reader = session.begin_trx().unwrap();
-        let row_id1 =
-            assert_row_in_lwc(&sys.table, &session.pool_guards(), &key1, reader.sts()).await;
+        let table = table_for_internal_assertion(&engine, table_id);
+        let row_id1 = assert_row_in_lwc(&table, &session.pool_guards(), &key1, reader.sts()).await;
         reader.commit().await.unwrap();
 
-        sys.new_trx_delete(&mut session, &key1).await;
-        let marker1 = sys.table.deletion_buffer().get(row_id1).unwrap();
+        expect_delete_committed(table_id, &mut session, &key1).await;
+        let marker1 = table.deletion_buffer().get(row_id1).unwrap();
         let marker1_ts = delete_marker_ts(marker1);
         wait_gc_cutoff_after(&session, marker1_ts).await;
-        checkpoint_published(&sys.table, &mut session).await;
+        checkpoint_published(table_id, &mut session).await;
 
-        let active_root = sys.table.file().active_root_unchecked();
         let pool_guards = session.pool_guards();
-        let index = ColumnBlockIndex::new(
-            active_root.column_block_index_root,
-            active_root.pivot_row_id,
-            sys.table.file().file_kind(),
-            sys.table.file().sparse_file(),
-            sys.table.disk_pool(),
-            pool_guards.disk_guard(),
-        );
+        let snapshot = column_block_index_snapshot(&engine, table_id);
+        let index = snapshot.index(pool_guards.disk_guard());
         let entry = index
             .locate_block(row_id1)
             .await
@@ -4105,15 +4281,10 @@ fn test_checkpoint_fails_on_invalid_v2_delete_metadata() {
             .expect("persisted entry should exist");
 
         let key2 = single_key(7i32);
-        let mut reader_session = sys.new_session().unwrap();
+        let mut reader_session = engine.new_session().unwrap();
         let reader = reader_session.begin_trx().unwrap();
-        let row_id2 = assert_row_in_lwc(
-            &sys.table,
-            &reader_session.pool_guards(),
-            &key2,
-            reader.sts(),
-        )
-        .await;
+        let row_id2 =
+            assert_row_in_lwc(&table, &reader_session.pool_guards(), &key2, reader.sts()).await;
         reader.commit().await.unwrap();
         let entry2 = index
             .locate_block(row_id2)
@@ -4123,22 +4294,18 @@ fn test_checkpoint_fails_on_invalid_v2_delete_metadata() {
         assert_eq!(entry2.leaf_block_id, entry.leaf_block_id);
         drop(reader_session);
 
-        sys.new_trx_delete(&mut session, &key2).await;
-        let marker2 = sys.table.deletion_buffer().get(row_id2).unwrap();
+        expect_delete_committed(table_id, &mut session, &key2).await;
+        let marker2 = table.deletion_buffer().get(row_id2).unwrap();
         let marker2_ts = delete_marker_ts(marker2);
         wait_gc_cutoff_after(&session, marker2_ts).await;
 
-        let table_file_path = sys
-            .engine
-            .table_fs
-            .user_table_file_path(sys.table.table_id());
+        let table_file_path = engine.table_fs.user_table_file_path(table_id);
         corrupt_leaf_delete_codec(table_file_path, entry.leaf_block_id, 0);
-        let _ = sys.table.disk_pool().invalidate_block(
-            sys.table.file().sparse_file().file_id(),
-            entry.leaf_block_id,
-        );
+        let _ = table
+            .disk_pool()
+            .invalidate_block(table.file().sparse_file().file_id(), entry.leaf_block_id);
 
-        let err = sys.table.checkpoint(&mut session).await.unwrap_err();
+        let err = session.checkpoint_table(table_id).await.unwrap_err();
         assert_table_data_integrity(
             err,
             "column-block-index",
@@ -4151,34 +4318,29 @@ fn test_checkpoint_fails_on_invalid_v2_delete_metadata() {
 #[test]
 fn test_checkpoint_fails_on_short_v2_delete_section_header() {
     smol::block_on(async {
-        let sys = TestSys::new_evictable().await;
-        let mut session = sys.new_session().unwrap();
-        insert_rows(&sys, &mut session, 0, 10, "name").await;
-        sys.table.freeze(&session, usize::MAX).await.unwrap();
-        checkpoint_published(&sys.table, &mut session).await;
+        let temp_dir = TempDir::new().unwrap();
+        let engine = evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys").await;
+        let table_id = create_table2_for_test(&engine).await;
+        let mut session = engine.new_session().unwrap();
+        insert_rows(table_id, &mut session, 0, 10, "name").await;
+        session.freeze_table(table_id, usize::MAX).await.unwrap();
+        checkpoint_published(table_id, &mut session).await;
 
         let key1 = single_key(6i32);
         let reader = session.begin_trx().unwrap();
-        let row_id1 =
-            assert_row_in_lwc(&sys.table, &session.pool_guards(), &key1, reader.sts()).await;
+        let table = table_for_internal_assertion(&engine, table_id);
+        let row_id1 = assert_row_in_lwc(&table, &session.pool_guards(), &key1, reader.sts()).await;
         reader.commit().await.unwrap();
 
-        sys.new_trx_delete(&mut session, &key1).await;
-        let marker1 = sys.table.deletion_buffer().get(row_id1).unwrap();
+        expect_delete_committed(table_id, &mut session, &key1).await;
+        let marker1 = table.deletion_buffer().get(row_id1).unwrap();
         let marker1_ts = delete_marker_ts(marker1);
         wait_gc_cutoff_after(&session, marker1_ts).await;
-        checkpoint_published(&sys.table, &mut session).await;
+        checkpoint_published(table_id, &mut session).await;
 
-        let active_root = sys.table.file().active_root_unchecked();
         let pool_guards = session.pool_guards();
-        let index = ColumnBlockIndex::new(
-            active_root.column_block_index_root,
-            active_root.pivot_row_id,
-            sys.table.file().file_kind(),
-            sys.table.file().sparse_file(),
-            sys.table.disk_pool(),
-            pool_guards.disk_guard(),
-        );
+        let snapshot = column_block_index_snapshot(&engine, table_id);
+        let index = snapshot.index(pool_guards.disk_guard());
         let entry = index
             .locate_block(row_id1)
             .await
@@ -4186,15 +4348,10 @@ fn test_checkpoint_fails_on_short_v2_delete_section_header() {
             .expect("persisted entry should exist");
 
         let key2 = single_key(7i32);
-        let mut reader_session = sys.new_session().unwrap();
+        let mut reader_session = engine.new_session().unwrap();
         let reader = reader_session.begin_trx().unwrap();
-        let row_id2 = assert_row_in_lwc(
-            &sys.table,
-            &reader_session.pool_guards(),
-            &key2,
-            reader.sts(),
-        )
-        .await;
+        let row_id2 =
+            assert_row_in_lwc(&table, &reader_session.pool_guards(), &key2, reader.sts()).await;
         reader.commit().await.unwrap();
         let entry2 = index
             .locate_block(row_id2)
@@ -4204,22 +4361,18 @@ fn test_checkpoint_fails_on_short_v2_delete_section_header() {
         assert_eq!(entry2.leaf_block_id, entry.leaf_block_id);
         drop(reader_session);
 
-        sys.new_trx_delete(&mut session, &key2).await;
-        let marker2 = sys.table.deletion_buffer().get(row_id2).unwrap();
+        expect_delete_committed(table_id, &mut session, &key2).await;
+        let marker2 = table.deletion_buffer().get(row_id2).unwrap();
         let marker2_ts = delete_marker_ts(marker2);
         wait_gc_cutoff_after(&session, marker2_ts).await;
 
-        let table_file_path = sys
-            .engine
-            .table_fs
-            .user_table_file_path(sys.table.table_id());
+        let table_file_path = engine.table_fs.user_table_file_path(table_id);
         corrupt_leaf_short_delete_section_header(table_file_path, entry.leaf_block_id, 0);
-        let _ = sys.table.disk_pool().invalidate_block(
-            sys.table.file().sparse_file().file_id(),
-            entry.leaf_block_id,
-        );
+        let _ = table
+            .disk_pool()
+            .invalidate_block(table.file().sparse_file().file_id(), entry.leaf_block_id);
 
-        let err = sys.table.checkpoint(&mut session).await.unwrap_err();
+        let err = session.checkpoint_table(table_id).await.unwrap_err();
         assert_table_data_integrity(
             err,
             "column-block-index",
@@ -4232,24 +4385,28 @@ fn test_checkpoint_fails_on_short_v2_delete_section_header() {
 #[test]
 fn test_row_page_transition_retries_update_delete() {
     smol::block_on(async {
-        let sys = TestSys::new_evictable().await;
-        let mut session = sys.new_session().unwrap();
+        let temp_dir = TempDir::new().unwrap();
+        let engine = evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys").await;
+        let table_id = create_table2_for_test(&engine).await;
+        let mut session = engine.new_session().unwrap();
         {
             let insert = vec![Val::from(1i32), Val::from("hello")];
             let mut trx = session.begin_trx().unwrap();
-            trx = sys.trx_insert(trx, insert).await;
+            trx = expect_trx_insert(table_id, trx, insert).await;
             trx.commit().await.unwrap();
         }
         let key = single_key(1i32);
         let mut trx = session.begin_trx().unwrap();
-        let index = bound_unique_index_no(&sys.table, key.index_no);
+        let index = bound_unique_index_no(
+            &table_for_internal_assertion(&engine, table_id),
+            key.index_no,
+        );
         let (row_id, _) = index
             .lookup(session.pool_guards().index_guard(), &key.vals, trx.sts())
             .await
             .unwrap()
             .unwrap();
-        let page_id = match sys
-            .table
+        let page_id = match table_for_internal_assertion(&engine, table_id)
             .find_row(&session.pool_guards(), row_id)
             .await
             .unwrap()
@@ -4258,8 +4415,7 @@ fn test_row_page_transition_retries_update_delete() {
             RowLocation::NotFound => panic!("row should exist"),
             RowLocation::LwcBlock { .. } => unreachable!("lwc block"),
         };
-        let page_guard = sys
-            .engine
+        let page_guard = engine
             .mem_pool
             .get_page::<RowPage>(
                 session.pool_guards().mem_guard(),
@@ -4276,8 +4432,7 @@ fn test_row_page_transition_retries_update_delete() {
         row_ver.set_frozen();
         row_ver.set_transition();
 
-        let insert_page_guard = sys
-            .engine
+        let insert_page_guard = engine
             .mem_pool
             .get_page::<RowPage>(
                 session.pool_guards().mem_guard(),
@@ -4292,17 +4447,19 @@ fn test_row_page_transition_retries_update_delete() {
         let insert = vec![Val::from(2i32), Val::from("insert")];
         let res: Result<()> = trx
             .exec(async |stmt| {
-                stmt.acquire_table_write_locks(sys.table.table_id()).await?;
+                stmt.acquire_table_write_locks(table_id).await?;
                 let (rt, effects) = stmt_tests::runtime_and_effects_mut(stmt);
-                let layout = sys.table.layout_snapshot();
-                let insert_res = sys.table.accessor_with_layout(&layout).insert_row_to_page(
-                    rt,
-                    effects,
-                    insert_page_guard,
-                    insert,
-                    RowUndoKind::Insert,
-                    vec![],
-                );
+                let layout = table_for_internal_assertion(&engine, table_id).layout_snapshot();
+                let insert_res = table_for_internal_assertion(&engine, table_id)
+                    .accessor_with_layout(&layout)
+                    .insert_row_to_page(
+                        rt,
+                        effects,
+                        insert_page_guard,
+                        insert,
+                        RowUndoKind::Insert,
+                        vec![],
+                    );
                 assert!(matches!(
                     insert_res,
                     InsertRowIntoPage::NoSpaceOrFrozen(_, _, _)
@@ -4312,9 +4469,8 @@ fn test_row_page_transition_retries_update_delete() {
                     idx: 1,
                     val: Val::from("world"),
                 }];
-                let layout = sys.table.layout_snapshot();
-                let res = sys
-                    .table
+                let layout = table_for_internal_assertion(&engine, table_id).layout_snapshot();
+                let res = table_for_internal_assertion(&engine, table_id)
                     .accessor_with_layout(&layout)
                     .update_row_inplace(rt, effects, page_guard, &key, row_id, update)
                     .await;
@@ -4329,8 +4485,7 @@ fn test_row_page_transition_retries_update_delete() {
         trx.rollback().await.unwrap();
 
         let mut trx = session.begin_trx().unwrap();
-        let page_guard = sys
-            .engine
+        let page_guard = engine
             .mem_pool
             .get_page::<RowPage>(
                 session.pool_guards().mem_guard(),
@@ -4344,11 +4499,10 @@ fn test_row_page_transition_retries_update_delete() {
             .unwrap();
         let res: Result<()> = trx
             .exec(async |stmt| {
-                stmt.acquire_table_write_locks(sys.table.table_id()).await?;
+                stmt.acquire_table_write_locks(table_id).await?;
                 let (rt, effects) = stmt_tests::runtime_and_effects_mut(stmt);
-                let layout = sys.table.layout_snapshot();
-                let res = sys
-                    .table
+                let layout = table_for_internal_assertion(&engine, table_id).layout_snapshot();
+                let res = table_for_internal_assertion(&engine, table_id)
                     .accessor_with_layout(&layout)
                     .delete_row_internal(rt, effects, page_guard, row_id, &key, false)
                     .await;
@@ -4367,19 +4521,21 @@ fn test_row_page_transition_retries_update_delete() {
 #[test]
 fn test_mvcc_rollback_insert_normal() {
     smol::block_on(async {
-        let sys = TestSys::new_evictable().await;
+        let temp_dir = TempDir::new().unwrap();
+        let engine = evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys").await;
+        let table_id = create_table2_for_test(&engine).await;
         {
-            let mut session = sys.new_session().unwrap();
+            let mut session = engine.new_session().unwrap();
             // insert 1 row
             let mut trx = session.begin_trx().unwrap();
             let insert = vec![Val::from(1i32), Val::from("hello")];
-            trx = sys.trx_insert(trx, insert).await;
+            trx = expect_trx_insert(table_id, trx, insert).await;
             // explicit rollback
             trx.rollback().await.unwrap();
 
             // select 1 row
             let key = single_key(1i32);
-            _ = sys.new_trx_select_not_found(&mut session, &key).await;
+            _ = expect_select_not_found_committed(table_id, &mut session, &key).await;
         }
     });
 }
@@ -4387,34 +4543,35 @@ fn test_mvcc_rollback_insert_normal() {
 #[test]
 fn test_mvcc_insert_link_unique_index() {
     smol::block_on(async {
-        let sys = TestSys::new_evictable().await;
+        let temp_dir = TempDir::new().unwrap();
+        let engine = evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys").await;
+        let table_id = create_table2_for_test(&engine).await;
         {
-            let mut session = sys.new_session().unwrap();
+            let mut session = engine.new_session().unwrap();
             // insert 1 row
             let insert = vec![Val::from(1i32), Val::from("hello")];
-            sys.new_trx_insert(&mut session, insert).await;
+            expect_insert_committed(table_id, &mut session, insert).await;
 
             // we must hold a transaction before the deletion,
             // to prevent index GC.
-            let trx_to_prevent_gc = sys.new_session().unwrap().begin_trx().unwrap();
+            let trx_to_prevent_gc = engine.new_session().unwrap().begin_trx().unwrap();
             // delete it
             let key = single_key(1i32);
-            sys.new_trx_delete(&mut session, &key).await;
+            expect_delete_committed(table_id, &mut session, &key).await;
 
             // insert again, trigger insert+link
             let insert = vec![Val::from(1i32), Val::from("world")];
-            sys.new_trx_insert(&mut session, insert).await;
+            expect_insert_committed(table_id, &mut session, insert).await;
 
             trx_to_prevent_gc.rollback().await.unwrap();
 
             // select 1 row
             let key = single_key(1i32);
-            _ = sys
-                .new_trx_select(&mut session, &key, |vals| {
-                    assert!(vals[0] == Val::from(1i32));
-                    assert!(vals[1] == Val::from("world"));
-                })
-                .await;
+            _ = expect_select_committed(table_id, &mut session, &key, |vals| {
+                assert!(vals[0] == Val::from(1i32));
+                assert!(vals[1] == Val::from("world"));
+            })
+            .await;
         }
     });
 }
@@ -4422,27 +4579,29 @@ fn test_mvcc_insert_link_unique_index() {
 #[test]
 fn test_mvcc_rollback_insert_link_unique_index() {
     smol::block_on(async {
-        let sys = TestSys::new_evictable().await;
+        let temp_dir = TempDir::new().unwrap();
+        let engine = evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys").await;
+        let table_id = create_table2_for_test(&engine).await;
         {
-            let mut session = sys.new_session().unwrap();
+            let mut session = engine.new_session().unwrap();
             // insert 1 row
             let insert = vec![Val::from(1i32), Val::from("hello")];
-            sys.new_trx_insert(&mut session, insert).await;
+            expect_insert_committed(table_id, &mut session, insert).await;
 
             // delete it
             let key = single_key(1i32);
-            sys.new_trx_delete(&mut session, &key).await;
+            expect_delete_committed(table_id, &mut session, &key).await;
 
             // insert again, trigger insert+link
             let insert = vec![Val::from(1i32), Val::from("world")];
             let mut trx = session.begin_trx().unwrap();
-            trx = sys.trx_insert(trx, insert).await;
+            trx = expect_trx_insert(table_id, trx, insert).await;
             // explicit rollback
             trx.rollback().await.unwrap();
 
             // select 1 row
             let key = single_key(1i32);
-            _ = sys.new_trx_select_not_found(&mut session, &key).await;
+            _ = expect_select_not_found_committed(table_id, &mut session, &key).await;
         }
     });
 }
@@ -4450,15 +4609,17 @@ fn test_mvcc_rollback_insert_link_unique_index() {
 #[test]
 fn test_mvcc_insert_link_update() {
     smol::block_on(async {
-        let sys = TestSys::new_evictable().await;
+        let temp_dir = TempDir::new().unwrap();
+        let engine = evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys").await;
+        let table_id = create_table2_for_test(&engine).await;
         {
-            let mut session = sys.new_session().unwrap();
+            let mut session = engine.new_session().unwrap();
             // insert 1 row: v1=1, v2=hello
             let insert = vec![Val::from(1i32), Val::from("hello")];
-            sys.new_trx_insert(&mut session, insert).await;
+            expect_insert_committed(table_id, &mut session, insert).await;
 
             // open one session and trnasaction to see this row
-            let mut sess1 = sys.new_session().unwrap();
+            let mut sess1 = engine.new_session().unwrap();
             let mut trx1 = sess1.begin_trx().unwrap();
 
             // update it: v1=2, v2=world
@@ -4473,44 +4634,41 @@ fn test_mvcc_insert_link_update() {
                     val: Val::from("world"),
                 },
             ];
-            sys.new_trx_update(&mut session, &key, update).await;
+            expect_update_committed(table_id, &mut session, &key, update).await;
 
             // open session and transaction to see row 2
-            let mut sess2 = sys.new_session().unwrap();
+            let mut sess2 = engine.new_session().unwrap();
             let mut trx2 = sess2.begin_trx().unwrap();
 
             // insert again, trigger insert+link
             let insert = vec![Val::from(1i32), Val::from("rust")];
-            sys.new_trx_insert(&mut session, insert).await;
+            expect_insert_committed(table_id, &mut session, insert).await;
 
             // use transaction 1 to see version 1.
             let key = single_key(1i32);
-            trx1 = sys
-                .trx_select(trx1, &key, |vals| {
-                    assert!(vals[0] == Val::from(1i32));
-                    assert!(vals[1] == Val::from("hello"));
-                })
-                .await;
+            trx1 = expect_trx_select(table_id, trx1, &key, |vals| {
+                assert!(vals[0] == Val::from(1i32));
+                assert!(vals[1] == Val::from("hello"));
+            })
+            .await;
             _ = trx1.commit().await.unwrap();
 
             // use transaction 2 to see version 2.
             let key = single_key(2i32);
-            trx2 = sys
-                .trx_select(trx2, &key, |vals| {
-                    assert!(vals[0] == Val::from(2i32));
-                    assert!(vals[1] == Val::from("world"));
-                })
-                .await;
+            trx2 = expect_trx_select(table_id, trx2, &key, |vals| {
+                assert!(vals[0] == Val::from(2i32));
+                assert!(vals[1] == Val::from("world"));
+            })
+            .await;
             _ = trx2.commit().await.unwrap();
 
             // use new transaction to see version 3.
             let key = single_key(1i32);
-            _ = sys
-                .new_trx_select(&mut session, &key, |vals| {
-                    assert!(vals[0] == Val::from(1i32));
-                    assert!(vals[1] == Val::from("rust"));
-                })
-                .await;
+            _ = expect_select_committed(table_id, &mut session, &key, |vals| {
+                assert!(vals[0] == Val::from(1i32));
+                assert!(vals[1] == Val::from("rust"));
+            })
+            .await;
         }
     });
 }
@@ -4518,16 +4676,18 @@ fn test_mvcc_insert_link_update() {
 #[test]
 fn test_mvcc_update_link_insert() {
     smol::block_on(async {
-        let sys = TestSys::new_evictable().await;
+        let temp_dir = TempDir::new().unwrap();
+        let engine = evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys").await;
+        let table_id = create_table2_for_test(&engine).await;
         {
-            let mut session = sys.new_session().unwrap();
+            let mut session = engine.new_session().unwrap();
             // insert 1 row: v1=1, v2=hello
             let insert = vec![Val::from(1i32), Val::from("hello")];
-            sys.new_trx_insert(&mut session, insert).await;
+            expect_insert_committed(table_id, &mut session, insert).await;
             println!("debug-only insert finish");
 
             // open one session and trnasaction to see this row
-            let mut sess1 = sys.new_session().unwrap();
+            let mut sess1 = engine.new_session().unwrap();
             let mut trx1 = sess1.begin_trx().unwrap();
 
             // update it: v1=2, v2=world
@@ -4542,16 +4702,16 @@ fn test_mvcc_update_link_insert() {
                     val: Val::from("world"),
                 },
             ];
-            sys.new_trx_update(&mut session, &key, update).await;
+            expect_update_committed(table_id, &mut session, &key, update).await;
             println!("debug-only update finish");
 
             // open session and transaction to see row 2
-            let mut sess2 = sys.new_session().unwrap();
+            let mut sess2 = engine.new_session().unwrap();
             let mut trx2 = sess2.begin_trx().unwrap();
 
             // insert v1=5, v2=rust
             let insert = vec![Val::from(5i32), Val::from("rust")];
-            sys.new_trx_insert(&mut session, insert).await;
+            expect_insert_committed(table_id, &mut session, insert).await;
             println!("debug-only insert2 finish");
 
             // update it: v1=1, v2=c++, trigger update+link
@@ -4566,32 +4726,30 @@ fn test_mvcc_update_link_insert() {
                     val: Val::from("c++"),
                 },
             ];
-            sys.new_trx_update(&mut session, &key, update).await;
+            expect_update_committed(table_id, &mut session, &key, update).await;
             println!("debug-only update2 finish");
 
             // use transaction 1 to see version 1.
             let key = single_key(1i32);
-            trx1 = sys
-                .trx_select(trx1, &key, |vals| {
-                    assert!(vals[0] == Val::from(1i32));
-                    assert!(vals[1] == Val::from("hello"));
-                })
-                .await;
+            trx1 = expect_trx_select(table_id, trx1, &key, |vals| {
+                assert!(vals[0] == Val::from(1i32));
+                assert!(vals[1] == Val::from("hello"));
+            })
+            .await;
             _ = trx1.commit().await;
 
             // use transaction 2 to see version 2.
             let key = single_key(2i32);
-            trx2 = sys
-                .trx_select(trx2, &key, |vals| {
-                    assert!(vals[0] == Val::from(2i32));
-                    assert!(vals[1] == Val::from("world"));
-                })
-                .await;
+            trx2 = expect_trx_select(table_id, trx2, &key, |vals| {
+                assert!(vals[0] == Val::from(2i32));
+                assert!(vals[1] == Val::from("world"));
+            })
+            .await;
             _ = trx2.commit().await;
 
             // use new transaction to see version 3.
             let key = single_key(1i32);
-            _ = sys.new_trx_select(&mut session, &key, |vals| {
+            _ = expect_select_committed(table_id, &mut session, &key, |vals| {
                 assert!(vals[0] == Val::from(1i32));
                 assert!(vals[1] == Val::from("c++"));
             })
@@ -4602,15 +4760,17 @@ fn test_mvcc_update_link_insert() {
 #[test]
 fn test_mvcc_multi_update() {
     smol::block_on(async {
-        let sys = TestSys::new_evictable().await;
+        let temp_dir = TempDir::new().unwrap();
+        let engine = evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys").await;
+        let table_id = create_table2_for_test(&engine).await;
         {
-            let mut session = sys.new_session().unwrap();
+            let mut session = engine.new_session().unwrap();
             // insert: v1
             let insert = vec![Val::from(1i32), Val::from("hello")];
-            sys.new_trx_insert(&mut session, insert).await;
+            expect_insert_committed(table_id, &mut session, insert).await;
 
             // transaction to see version 1
-            let mut sess1 = sys.new_session().unwrap();
+            let mut sess1 = engine.new_session().unwrap();
             let mut trx1 = sess1.begin_trx().unwrap();
 
             let mut trx = session.begin_trx().unwrap();
@@ -4620,7 +4780,7 @@ fn test_mvcc_multi_update() {
                 idx: 1,
                 val: Val::from("rust"),
             }];
-            trx = sys.trx_update(trx, &key, update).await;
+            trx = expect_trx_update(table_id, trx, &key, update).await;
             // update 2: v3
             let key = single_key(1i32);
             let update = vec![
@@ -4633,29 +4793,27 @@ fn test_mvcc_multi_update() {
                     val: Val::from("world"),
                 },
             ];
-            trx = sys.trx_update(trx, &key, update).await;
+            trx = expect_trx_update(table_id, trx, &key, update).await;
             // within transaction, query row
             // v2 not found
             let key = single_key(1i32);
-            trx = sys.trx_select_not_found(trx, &key).await;
+            trx = expect_trx_select_not_found(table_id, trx, &key).await;
             // v3 found
             let key = single_key(2i32);
-            trx = sys
-                .trx_select(trx, &key, |vals| {
-                    assert!(vals[0] == Val::from(2i32));
-                    assert!(vals[1] == Val::from("world"));
-                })
-                .await;
+            trx = expect_trx_select(table_id, trx, &key, |vals| {
+                assert!(vals[0] == Val::from(2i32));
+                assert!(vals[1] == Val::from("world"));
+            })
+            .await;
             trx.commit().await.unwrap();
 
             //v1 found
             let key = single_key(1i32);
-            trx1 = sys
-                .trx_select(trx1, &key, |vals| {
-                    assert!(vals[0] == Val::from(1i32));
-                    assert!(vals[1] == Val::from("hello"));
-                })
-                .await;
+            trx1 = expect_trx_select(table_id, trx1, &key, |vals| {
+                assert!(vals[0] == Val::from(1i32));
+                assert!(vals[1] == Val::from("hello"));
+            })
+            .await;
             trx1.commit().await.unwrap();
         }
     });
@@ -4666,15 +4824,18 @@ fn test_string_non_index_updates() {
     smol::block_on(async {
         const COUNT: usize = 100;
         const SIZE: usize = 500;
-        let sys = TestSys::new_evictable().await;
+        let temp_dir = TempDir::new().unwrap();
+        let engine = evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys").await;
+        let table_id = create_table2_for_test(&engine).await;
         {
-            let mut session = sys.new_session().unwrap();
+            let mut session = engine.new_session().unwrap();
             let value = vec![1u8; SIZE];
             let insert = vec![Val::from(1i32), Val::from(&[])];
-            sys.new_trx_insert(&mut session, insert).await;
+            expect_insert_committed(table_id, &mut session, insert).await;
             let key = SelectKey::new(0, vec![Val::from(1i32)]);
             for i in SIZE - COUNT..SIZE {
-                sys.new_trx_update(
+                expect_update_committed(
+                    table_id,
                     &mut session,
                     &key,
                     vec![UpdateCol {
@@ -4694,17 +4855,18 @@ fn test_string_index_updates() {
     smol::block_on(async {
         const COUNT: usize = 100;
         const SIZE: usize = 500;
-        let sys = TestSys::new_evictable().await;
+        let temp_dir = TempDir::new().unwrap();
+        let engine = evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys").await;
+        let _ = create_table2_for_test(&engine).await;
         {
-            let table_id = table3(&sys.engine).await;
-            let table = sys.engine.catalog().get_table(table_id).await.unwrap();
-            let mut session = sys.new_session().unwrap();
+            let table_id = table3(&engine).await;
+            let mut session = engine.new_session().unwrap();
             let s: String = std::iter::repeat_n('0', SIZE).collect();
             // insert single row.
             {
                 let insert = vec![Val::from(&s[..0])];
                 let mut trx = session.begin_trx().unwrap();
-                let res = trx_insert_row(&mut trx, &table, insert).await;
+                let res = trx_insert_row_by_id(&mut trx, table_id, insert).await;
                 assert!(res.is_ok());
                 trx.commit().await.unwrap();
             }
@@ -4716,7 +4878,7 @@ fn test_string_index_updates() {
                     val: Val::from(&s[..i + 1]),
                 }];
                 let mut trx = session.begin_trx().unwrap();
-                let res = trx_update_row(&mut trx, &table, &key, update).await;
+                let res = trx_update_row_by_id(&mut trx, table_id, &key, update).await;
                 assert!(matches!(res, Ok(UpdateMvcc::Updated(_))));
                 trx.commit().await.unwrap();
             }
@@ -4732,17 +4894,18 @@ fn test_mvcc_out_of_place_update() {
         const DELTA: usize = 5;
         const BASE: usize = 1000;
         const SIZE: usize = 2000;
-        let sys = TestSys::new_evictable().await;
+        let temp_dir = TempDir::new().unwrap();
+        let engine = evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys").await;
+        let _ = create_table2_for_test(&engine).await;
         {
-            let table_id = table3(&sys.engine).await;
-            let table = sys.engine.catalog().get_table(table_id).await.unwrap();
-            let mut session = sys.new_session().unwrap();
+            let table_id = table3(&engine).await;
+            let mut session = engine.new_session().unwrap();
             let s: String = std::iter::repeat_n('0', SIZE).collect();
             // insert 60 rows
             for i in 0usize..COUNT {
                 let insert = vec![Val::from(&s[..BASE + i])];
                 let mut trx = session.begin_trx().unwrap();
-                let res = trx_insert_row(&mut trx, &table, insert).await;
+                let res = trx_insert_row_by_id(&mut trx, table_id, insert).await;
                 assert!(res.is_ok());
                 trx.commit().await.unwrap();
             }
@@ -4755,7 +4918,7 @@ fn test_mvcc_out_of_place_update() {
                     val: Val::from(&s[..BASE + COUNT + i]),
                 }];
                 let mut trx = session.begin_trx().unwrap();
-                let res = trx_update_row(&mut trx, &table, &key, update).await;
+                let res = trx_update_row_by_id(&mut trx, table_id, &key, update).await;
                 assert!(matches!(res, Ok(UpdateMvcc::Updated(_))));
                 trx.commit().await.unwrap();
             }
@@ -4769,9 +4932,11 @@ fn test_evict_pool_insert_full() {
         const SIZE: i32 = 800;
 
         // in-mem ~1000 pages, on-disk 2000 pages.
-        let sys = TestSys::new_evictable().await;
+        let temp_dir = TempDir::new().unwrap();
+        let engine = evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys").await;
+        let table_id = create_table2_for_test(&engine).await;
         {
-            let mut session = sys.new_session().unwrap();
+            let mut session = engine.new_session().unwrap();
             // insert 1000 rows
             let mut trx = session.begin_trx().unwrap();
             for i in 0..SIZE {
@@ -4780,7 +4945,7 @@ fn test_evict_pool_insert_full() {
                 // if page is half full, 35 pages are required.
                 let s: String = (0..1000).map(|_| 'a').collect();
                 let insert = vec![Val::from(i), Val::from(&s[..])];
-                trx = sys.trx_insert(trx, insert).await;
+                trx = expect_trx_insert(table_id, trx, insert).await;
             }
             let _ = trx.commit().await.unwrap();
         }
@@ -4792,22 +4957,24 @@ fn test_mem_scan_uncommitted() {
     smol::block_on(async {
         const SIZE: i32 = 10000;
 
-        let sys = TestSys::new_evictable().await;
+        let temp_dir = TempDir::new().unwrap();
+        let engine = evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys").await;
+        let table_id = create_table2_for_test(&engine).await;
 
-        let mut session = sys.new_session().unwrap();
+        let mut session = engine.new_session().unwrap();
         {
             let mut trx = session.begin_trx().unwrap();
             for i in 0..SIZE {
                 let s = format!("{}", i);
                 let insert = vec![Val::from(i), Val::from(&s[..])];
-                trx = sys.trx_insert(trx, insert).await;
+                trx = expect_trx_insert(table_id, trx, insert).await;
             }
             _ = trx.commit().await.unwrap();
         }
         {
             let mut res_len = 0usize;
-            let layout = sys.table.layout_snapshot();
-            sys.table
+            let layout = table_for_internal_assertion(&engine, table_id).layout_snapshot();
+            table_for_internal_assertion(&engine, table_id)
                 .accessor_with_layout(&layout)
                 .mem_scan_uncommitted(&session.pool_guards(), |_metadata, _row| {
                     res_len += 1;
@@ -4824,12 +4991,13 @@ fn test_mem_scan_uncommitted() {
 #[test]
 fn test_mem_scan_uncommitted_returns_error_without_meta_guard() {
     smol::block_on(async {
-        let sys = TestSys::new_evictable().await;
-        let layout = sys.table.layout_snapshot();
+        let temp_dir = TempDir::new().unwrap();
+        let engine = evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys").await;
+        let table_id = create_table2_for_test(&engine).await;
+        let layout = table_for_internal_assertion(&engine, table_id).layout_snapshot();
         let empty_guards = PoolGuards::builder().build();
 
-        let err = sys
-            .table
+        let err = table_for_internal_assertion(&engine, table_id)
             .accessor_with_layout(&layout)
             .mem_scan_uncommitted(&empty_guards, |_metadata, _row| true)
             .await
@@ -4845,34 +5013,35 @@ fn test_mem_scan_uncommitted_returns_error_without_meta_guard() {
 #[test]
 fn test_statement_read_takes_metadata_lock_only() {
     smol::block_on(async {
-        let sys = TestSys::new_evictable().await;
-        let mut session = sys.engine.new_session().unwrap();
-        insert_rows(&sys, &mut session, 0, 1, "name").await;
+        let temp_dir = TempDir::new().unwrap();
+        let engine = evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys").await;
+        let table_id = create_table2_for_test(&engine).await;
+        let mut session = engine.new_session().unwrap();
+        insert_rows(table_id, &mut session, 0, 1, "name").await;
 
-        let table_id = sys.table.table_id();
         let stmt_owner = Cell::new(None);
         let mut trx = session.begin_trx().unwrap();
         trx.exec(async |stmt| {
             let owner = stmt_tests::lock_owner(stmt);
             stmt_owner.set(Some(owner));
             let selected = stmt
-                .table_lookup_unique_mvcc(&sys.table, &single_key(0i32), &[0, 1])
+                .table_lookup_unique_mvcc(table_id, &single_key(0i32), &[0, 1])
                 .await?;
             assert!(selected.is_found());
             let repeated = stmt
-                .table_lookup_unique_mvcc(&sys.table, &single_key(0i32), &[0, 1])
+                .table_lookup_unique_mvcc(table_id, &single_key(0i32), &[0, 1])
                 .await?;
             assert!(repeated.is_found());
-            assert_eq!(lock_entry_count(&sys.engine, owner), 1);
+            assert_eq!(lock_entry_count(&engine, owner), 1);
             assert!(has_lock_entry(
-                &sys.engine,
+                &engine,
                 owner,
                 LockResource::TableMetadata(table_id),
                 LockMode::Shared,
                 LockDebugEntryState::Granted,
             ));
             assert!(!has_lock_resource(
-                &sys.engine,
+                &engine,
                 owner,
                 LockResource::TableData(table_id),
             ));
@@ -4882,7 +5051,7 @@ fn test_statement_read_takes_metadata_lock_only() {
         .unwrap();
 
         let owner = stmt_owner.get().unwrap();
-        assert_eq!(lock_entry_count(&sys.engine, owner), 0);
+        assert_eq!(lock_entry_count(&engine, owner), 0);
         trx.commit().await.unwrap();
     });
 }
@@ -4890,57 +5059,60 @@ fn test_statement_read_takes_metadata_lock_only() {
 #[test]
 fn test_statement_write_locks_are_transaction_owned_and_cached() {
     smol::block_on(async {
-        let sys = TestSys::new_evictable().await;
-        let mut session = sys.engine.new_session().unwrap();
-        let table_id = sys.table.table_id();
+        let temp_dir = TempDir::new().unwrap();
+        let engine = evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys").await;
+        let table_id = create_table2_for_test(&engine).await;
+        let mut session = engine.new_session().unwrap();
         let mut trx = session.begin_trx().unwrap();
         let owner = trx_tests::lock_owner(&trx).unwrap();
 
         trx.exec(async |stmt| {
-            stmt.table_insert_mvcc(&sys.table, vec![Val::from(10i32), Val::from("a")])
+            stmt.table_insert_mvcc(table_id, vec![Val::from(10i32), Val::from("a")])
                 .await?;
             Ok(())
         })
         .await
         .unwrap();
         assert!(has_lock_entry(
-            &sys.engine,
+            &engine,
             owner,
             LockResource::TableMetadata(table_id),
             LockMode::Shared,
             LockDebugEntryState::Granted,
         ));
         assert!(has_lock_entry(
-            &sys.engine,
+            &engine,
             owner,
             LockResource::TableData(table_id),
             LockMode::IntentExclusive,
             LockDebugEntryState::Granted,
         ));
-        assert_eq!(lock_entry_count(&sys.engine, owner), 2);
+        assert_eq!(lock_entry_count(&engine, owner), 2);
 
         trx.exec(async |stmt| {
-            stmt.table_insert_mvcc(&sys.table, vec![Val::from(11i32), Val::from("b")])
+            stmt.table_insert_mvcc(table_id, vec![Val::from(11i32), Val::from("b")])
                 .await?;
             Ok(())
         })
         .await
         .unwrap();
-        assert_eq!(lock_entry_count(&sys.engine, owner), 2);
+        assert_eq!(lock_entry_count(&engine, owner), 2);
 
         trx.rollback().await.unwrap();
-        assert_eq!(lock_entry_count(&sys.engine, owner), 0);
+        assert_eq!(lock_entry_count(&engine, owner), 0);
     });
 }
 
 #[test]
 fn test_create_table_waits_on_catalog_namespace_lock() {
     smol::block_on(async {
-        let sys = TestSys::new_evictable().await;
+        let temp_dir = TempDir::new().unwrap();
+        let engine = evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys").await;
+        let _ = create_table2_for_test(&engine).await;
         let blocker = LockOwner::Session(SessionID::new(91_400));
         assert!(
             try_acquire(
-                sys.engine.lock_manager(),
+                engine.lock_manager(),
                 LockResource::CatalogNamespace,
                 LockMode::Exclusive,
                 blocker,
@@ -4948,7 +5120,7 @@ fn test_create_table_waits_on_catalog_namespace_lock() {
             .unwrap()
         );
 
-        let mut session = sys.engine.new_session().unwrap();
+        let mut session = engine.new_session().unwrap();
         let waiting_owner = LockOwner::Session(session.id());
         let create_task = smol::spawn(async move {
             session
@@ -4964,7 +5136,7 @@ fn test_create_table_waits_on_catalog_namespace_lock() {
         });
 
         wait_for_lock_entry(
-            &sys.engine,
+            &engine,
             waiting_owner,
             LockResource::CatalogNamespace,
             LockMode::Exclusive,
@@ -4972,11 +5144,11 @@ fn test_create_table_waits_on_catalog_namespace_lock() {
         )
         .await;
 
-        assert_eq!(sys.engine.lock_manager().release_owner(blocker), 1);
+        assert_eq!(engine.lock_manager().release_owner(blocker), 1);
         let table_id = create_task.await.unwrap();
-        assert!(sys.engine.catalog().get_table(table_id).await.is_some());
+        assert!(engine.catalog().get_table(table_id).await.is_some());
         assert!(!has_lock_resource(
-            &sys.engine,
+            &engine,
             waiting_owner,
             LockResource::CatalogNamespace,
         ));
@@ -5181,9 +5353,10 @@ fn test_create_table_catalog_commit_error_after_file_publish_poisons_and_keeps_f
 #[test]
 fn test_explicit_table_locks_reject_intent_modes() {
     smol::block_on(async {
-        let sys = TestSys::new_lightweight_evictable().await;
-        let table_id = sys.table.table_id();
-        let mut session = sys.engine.new_session().unwrap();
+        let temp_dir = TempDir::new().unwrap();
+        let engine = lightweight_test_engine(&temp_dir, "redo_testsys_lightweight").await;
+        let table_id = create_table2_for_test(&engine).await;
+        let mut session = engine.new_session().unwrap();
 
         for mode in [LockMode::IntentShared, LockMode::IntentExclusive] {
             let err = session.lock_table(table_id, mode).await.unwrap_err();
@@ -5202,30 +5375,30 @@ fn test_explicit_table_locks_reject_intent_modes() {
 #[test]
 fn test_transaction_shared_table_lock_blocks_external_row_writer() {
     smol::block_on(async {
-        let sys = TestSys::new_lightweight_evictable().await;
-        let table_id = sys.table.table_id();
-        let mut session = sys.engine.new_session().unwrap();
+        let temp_dir = TempDir::new().unwrap();
+        let engine = lightweight_test_engine(&temp_dir, "redo_testsys_lightweight").await;
+        let table_id = create_table2_for_test(&engine).await;
+        let mut session = engine.new_session().unwrap();
         let mut trx = session.begin_trx().unwrap();
         let owner = trx_tests::lock_owner(&trx).unwrap();
 
         trx.lock_table(table_id, LockMode::Shared).await.unwrap();
         assert!(has_lock_entry(
-            &sys.engine,
+            &engine,
             owner,
             LockResource::TableMetadata(table_id),
             LockMode::Shared,
             LockDebugEntryState::Granted,
         ));
         assert!(has_lock_entry(
-            &sys.engine,
+            &engine,
             owner,
             LockResource::TableData(table_id),
             LockMode::Shared,
             LockDebugEntryState::Granted,
         ));
 
-        let engine_ref = sys.engine.new_ref().unwrap();
-        let table = Arc::clone(&sys.table);
+        let engine_ref = engine.new_ref().unwrap();
         let (owner_tx, owner_rx) = flume::bounded(1);
         let writer = smol::spawn(async move {
             let mut writer_session = engine_ref.new_session().unwrap();
@@ -5234,9 +5407,9 @@ fn test_transaction_shared_table_lock_blocks_external_row_writer() {
                 .send_async(trx_tests::lock_owner(&writer_trx).unwrap())
                 .await
                 .unwrap();
-            trx_insert_row(
+            trx_insert_row_by_id(
                 &mut writer_trx,
-                &table,
+                table_id,
                 vec![Val::from(31_001i32), Val::from("blocked")],
             )
             .await?;
@@ -5245,7 +5418,7 @@ fn test_transaction_shared_table_lock_blocks_external_row_writer() {
         });
         let writer_owner = owner_rx.recv_async().await.unwrap();
         wait_for_lock_entry(
-            &sys.engine,
+            &engine,
             writer_owner,
             LockResource::TableData(table_id),
             LockMode::IntentExclusive,
@@ -5261,9 +5434,10 @@ fn test_transaction_shared_table_lock_blocks_external_row_writer() {
 #[test]
 fn test_transaction_exclusive_table_lock_uses_cache_and_releases_on_commit() {
     smol::block_on(async {
-        let sys = TestSys::new_lightweight_evictable().await;
-        let table_id = sys.table.table_id();
-        let mut session = sys.engine.new_session().unwrap();
+        let temp_dir = TempDir::new().unwrap();
+        let engine = lightweight_test_engine(&temp_dir, "redo_testsys_lightweight").await;
+        let table_id = create_table2_for_test(&engine).await;
+        let mut session = engine.new_session().unwrap();
         let mut trx = session.begin_trx().unwrap();
         let owner = trx_tests::lock_owner(&trx).unwrap();
 
@@ -5271,16 +5445,16 @@ fn test_transaction_exclusive_table_lock_uses_cache_and_releases_on_commit() {
         trx.lock_table(table_id, LockMode::Shared).await.unwrap();
         trx.lock_table(table_id, LockMode::Exclusive).await.unwrap();
 
-        assert_eq!(lock_entry_count(&sys.engine, owner), 2);
+        assert_eq!(lock_entry_count(&engine, owner), 2);
         assert!(has_lock_entry(
-            &sys.engine,
+            &engine,
             owner,
             LockResource::TableMetadata(table_id),
             LockMode::Shared,
             LockDebugEntryState::Granted,
         ));
         assert!(has_lock_entry(
-            &sys.engine,
+            &engine,
             owner,
             LockResource::TableData(table_id),
             LockMode::Exclusive,
@@ -5288,19 +5462,20 @@ fn test_transaction_exclusive_table_lock_uses_cache_and_releases_on_commit() {
         ));
 
         assert_eq!(trx.commit().await.unwrap(), TrxID::new(0));
-        assert_eq!(lock_entry_count(&sys.engine, owner), 0);
+        assert_eq!(lock_entry_count(&engine, owner), 0);
     });
 }
 
 #[test]
 fn test_session_shared_table_lock_allows_reads_but_rejects_same_session_writes() {
     smol::block_on(async {
-        let sys = TestSys::new_lightweight_evictable().await;
-        let mut setup_session = sys.engine.new_session().unwrap();
-        insert_rows(&sys, &mut setup_session, 0, 1, "name").await;
+        let temp_dir = TempDir::new().unwrap();
+        let engine = lightweight_test_engine(&temp_dir, "redo_testsys_lightweight").await;
+        let table_id = create_table2_for_test(&engine).await;
+        let mut setup_session = engine.new_session().unwrap();
+        insert_rows(table_id, &mut setup_session, 0, 1, "name").await;
 
-        let table_id = sys.table.table_id();
-        let mut session = sys.engine.new_session().unwrap();
+        let mut session = engine.new_session().unwrap();
         session
             .lock_table(table_id, LockMode::Shared)
             .await
@@ -5310,7 +5485,7 @@ fn test_session_shared_table_lock_allows_reads_but_rejects_same_session_writes()
         read_trx
             .exec(async |stmt| {
                 let selected = stmt
-                    .table_lookup_unique_mvcc(&sys.table, &single_key(0i32), &[0, 1])
+                    .table_lookup_unique_mvcc(table_id, &single_key(0i32), &[0, 1])
                     .await?;
                 assert!(selected.is_found());
                 Ok(())
@@ -5320,9 +5495,9 @@ fn test_session_shared_table_lock_allows_reads_but_rejects_same_session_writes()
         read_trx.commit().await.unwrap();
 
         let mut write_trx = session.begin_trx().unwrap();
-        let err = trx_insert_row(
+        let err = trx_insert_row_by_id(
             &mut write_trx,
-            &sys.table,
+            table_id,
             vec![Val::from(31_101i32), Val::from("same-session-s")],
         )
         .await
@@ -5332,7 +5507,7 @@ fn test_session_shared_table_lock_allows_reads_but_rejects_same_session_writes()
             Some(OperationError::LockOwnerGroupConflict)
         );
         assert!(!has_lock_entry(
-            &sys.engine,
+            &engine,
             trx_tests::lock_owner(&write_trx).unwrap(),
             LockResource::TableData(table_id),
             LockMode::IntentExclusive,
@@ -5347,15 +5522,16 @@ fn test_session_shared_table_lock_allows_reads_but_rejects_same_session_writes()
 #[test]
 fn test_session_table_lock_failure_releases_fresh_metadata() {
     smol::block_on(async {
-        let sys = TestSys::new_lightweight_evictable().await;
-        let table_id = sys.table.table_id();
-        let mut session = sys.engine.new_session().unwrap();
+        let temp_dir = TempDir::new().unwrap();
+        let engine = lightweight_test_engine(&temp_dir, "redo_testsys_lightweight").await;
+        let table_id = create_table2_for_test(&engine).await;
+        let mut session = engine.new_session().unwrap();
         let session_owner = LockOwner::Session(session.id());
         let mut trx = session.begin_trx().unwrap();
 
-        trx_insert_row(
+        trx_insert_row_by_id(
             &mut trx,
-            &sys.table,
+            table_id,
             vec![Val::from(31_301i32), Val::from("same-session-ix")],
         )
         .await
@@ -5370,12 +5546,12 @@ fn test_session_table_lock_failure_releases_fresh_metadata() {
             Some(OperationError::LockOwnerGroupConflict)
         );
         assert!(!has_lock_resource(
-            &sys.engine,
+            &engine,
             session_owner,
             LockResource::TableMetadata(table_id),
         ));
         assert!(!has_lock_resource(
-            &sys.engine,
+            &engine,
             session_owner,
             LockResource::TableData(table_id),
         ));
@@ -5387,12 +5563,13 @@ fn test_session_table_lock_failure_releases_fresh_metadata() {
 #[test]
 fn test_session_table_lock_cancellation_releases_fresh_metadata() {
     smol::block_on(async {
-        let sys = TestSys::new_lightweight_evictable().await;
-        let table_id = sys.table.table_id();
+        let temp_dir = TempDir::new().unwrap();
+        let engine = lightweight_test_engine(&temp_dir, "redo_testsys_lightweight").await;
+        let table_id = create_table2_for_test(&engine).await;
         let blocker = LockOwner::Transaction(TrxID::new(91_301));
         assert!(
             try_acquire(
-                sys.engine.lock_manager(),
+                engine.lock_manager(),
                 LockResource::TableData(table_id),
                 LockMode::Exclusive,
                 blocker,
@@ -5400,7 +5577,7 @@ fn test_session_table_lock_cancellation_releases_fresh_metadata() {
             .unwrap()
         );
 
-        let session = sys.engine.new_session().unwrap();
+        let session = engine.new_session().unwrap();
         let session_owner = LockOwner::Session(session.id());
         let mut lock_fut = Box::pin(session.lock_table(table_id, LockMode::Shared));
         assert!(matches!(
@@ -5408,14 +5585,14 @@ fn test_session_table_lock_cancellation_releases_fresh_metadata() {
             std::task::Poll::Pending
         ));
         assert!(has_lock_entry(
-            &sys.engine,
+            &engine,
             session_owner,
             LockResource::TableMetadata(table_id),
             LockMode::Shared,
             LockDebugEntryState::Granted,
         ));
         assert!(has_lock_entry(
-            &sys.engine,
+            &engine,
             session_owner,
             LockResource::TableData(table_id),
             LockMode::Shared,
@@ -5424,19 +5601,14 @@ fn test_session_table_lock_cancellation_releases_fresh_metadata() {
 
         drop(lock_fut);
         wait_for_no_lock_resource(
-            &sys.engine,
+            &engine,
             session_owner,
             LockResource::TableMetadata(table_id),
         )
         .await;
-        wait_for_no_lock_resource(
-            &sys.engine,
-            session_owner,
-            LockResource::TableData(table_id),
-        )
-        .await;
+        wait_for_no_lock_resource(&engine, session_owner, LockResource::TableData(table_id)).await;
         assert_eq!(
-            sys.engine
+            engine
                 .lock_manager()
                 .release(LockResource::TableData(table_id), blocker),
             1
@@ -5447,9 +5619,10 @@ fn test_session_table_lock_cancellation_releases_fresh_metadata() {
 #[test]
 fn test_transaction_table_lock_failure_releases_fresh_metadata() {
     smol::block_on(async {
-        let sys = TestSys::new_lightweight_evictable().await;
-        let table_id = sys.table.table_id();
-        let mut session = sys.engine.new_session().unwrap();
+        let temp_dir = TempDir::new().unwrap();
+        let engine = lightweight_test_engine(&temp_dir, "redo_testsys_lightweight").await;
+        let table_id = create_table2_for_test(&engine).await;
+        let mut session = engine.new_session().unwrap();
         let session_owner = LockOwner::Session(session.id());
         session
             .lock_table(table_id, LockMode::Shared)
@@ -5467,7 +5640,7 @@ fn test_transaction_table_lock_failure_releases_fresh_metadata() {
             Some(OperationError::LockOwnerGroupConflict)
         );
         assert!(!has_lock_resource(
-            &sys.engine,
+            &engine,
             trx_owner,
             LockResource::TableMetadata(table_id),
         ));
@@ -5480,7 +5653,7 @@ fn test_transaction_table_lock_failure_releases_fresh_metadata() {
             .unwrap()
         );
         assert!(has_lock_resource(
-            &sys.engine,
+            &engine,
             session_owner,
             LockResource::TableMetadata(table_id),
         ));
@@ -5493,12 +5666,13 @@ fn test_transaction_table_lock_failure_releases_fresh_metadata() {
 #[test]
 fn test_transaction_table_lock_cancellation_releases_fresh_metadata() {
     smol::block_on(async {
-        let sys = TestSys::new_lightweight_evictable().await;
-        let table_id = sys.table.table_id();
+        let temp_dir = TempDir::new().unwrap();
+        let engine = lightweight_test_engine(&temp_dir, "redo_testsys_lightweight").await;
+        let table_id = create_table2_for_test(&engine).await;
         let blocker = LockOwner::Transaction(TrxID::new(91_302));
         assert!(
             try_acquire(
-                sys.engine.lock_manager(),
+                engine.lock_manager(),
                 LockResource::TableData(table_id),
                 LockMode::Exclusive,
                 blocker,
@@ -5506,7 +5680,7 @@ fn test_transaction_table_lock_cancellation_releases_fresh_metadata() {
             .unwrap()
         );
 
-        let mut session = sys.engine.new_session().unwrap();
+        let mut session = engine.new_session().unwrap();
         let mut trx = session.begin_trx().unwrap();
         let trx_owner = trx_tests::lock_owner(&trx).unwrap();
         let mut lock_fut = Box::pin(trx.lock_table(table_id, LockMode::Shared));
@@ -5515,14 +5689,14 @@ fn test_transaction_table_lock_cancellation_releases_fresh_metadata() {
             std::task::Poll::Pending
         ));
         assert!(has_lock_entry(
-            &sys.engine,
+            &engine,
             trx_owner,
             LockResource::TableMetadata(table_id),
             LockMode::Shared,
             LockDebugEntryState::Granted,
         ));
         assert!(has_lock_entry(
-            &sys.engine,
+            &engine,
             trx_owner,
             LockResource::TableData(table_id),
             LockMode::Shared,
@@ -5530,13 +5704,8 @@ fn test_transaction_table_lock_cancellation_releases_fresh_metadata() {
         ));
 
         drop(lock_fut);
-        wait_for_no_lock_resource(
-            &sys.engine,
-            trx_owner,
-            LockResource::TableMetadata(table_id),
-        )
-        .await;
-        wait_for_no_lock_resource(&sys.engine, trx_owner, LockResource::TableData(table_id)).await;
+        wait_for_no_lock_resource(&engine, trx_owner, LockResource::TableMetadata(table_id)).await;
+        wait_for_no_lock_resource(&engine, trx_owner, LockResource::TableData(table_id)).await;
         assert!(
             !trx_tests::cached_transaction_lock_covers(
                 &trx,
@@ -5546,7 +5715,7 @@ fn test_transaction_table_lock_cancellation_releases_fresh_metadata() {
             .unwrap()
         );
         assert_eq!(
-            sys.engine
+            engine
                 .lock_manager()
                 .release(LockResource::TableData(table_id), blocker),
             1
@@ -5558,17 +5727,17 @@ fn test_transaction_table_lock_cancellation_releases_fresh_metadata() {
 #[test]
 fn test_session_exclusive_table_lock_covers_same_session_writer() {
     smol::block_on(async {
-        let sys = TestSys::new_lightweight_evictable().await;
-        let table_id = sys.table.table_id();
-        let mut session = sys.engine.new_session().unwrap();
+        let temp_dir = TempDir::new().unwrap();
+        let engine = lightweight_test_engine(&temp_dir, "redo_testsys_lightweight").await;
+        let table_id = create_table2_for_test(&engine).await;
+        let mut session = engine.new_session().unwrap();
         let session_owner = LockOwner::Session(session.id());
         session
             .lock_table(table_id, LockMode::Exclusive)
             .await
             .unwrap();
 
-        let engine_ref = sys.engine.new_ref().unwrap();
-        let table = Arc::clone(&sys.table);
+        let engine_ref = engine.new_ref().unwrap();
         let (owner_tx, owner_rx) = flume::bounded(1);
         let external_writer = smol::spawn(async move {
             let mut writer_session = engine_ref.new_session().unwrap();
@@ -5577,9 +5746,9 @@ fn test_session_exclusive_table_lock_covers_same_session_writer() {
                 .send_async(trx_tests::lock_owner(&writer_trx).unwrap())
                 .await
                 .unwrap();
-            trx_insert_row(
+            trx_insert_row_by_id(
                 &mut writer_trx,
-                &table,
+                table_id,
                 vec![Val::from(31_201i32), Val::from("external")],
             )
             .await?;
@@ -5588,7 +5757,7 @@ fn test_session_exclusive_table_lock_covers_same_session_writer() {
         });
         let external_owner = owner_rx.recv_async().await.unwrap();
         wait_for_lock_entry(
-            &sys.engine,
+            &engine,
             external_owner,
             LockResource::TableData(table_id),
             LockMode::IntentExclusive,
@@ -5598,15 +5767,15 @@ fn test_session_exclusive_table_lock_covers_same_session_writer() {
 
         let mut same_session_trx = session.begin_trx().unwrap();
         let same_session_owner = trx_tests::lock_owner(&same_session_trx).unwrap();
-        trx_insert_row(
+        trx_insert_row_by_id(
             &mut same_session_trx,
-            &sys.table,
+            table_id,
             vec![Val::from(31_202i32), Val::from("covered")],
         )
         .await
         .unwrap();
         assert!(has_lock_entry(
-            &sys.engine,
+            &engine,
             same_session_owner,
             LockResource::TableData(table_id),
             LockMode::IntentExclusive,
@@ -5618,14 +5787,14 @@ fn test_session_exclusive_table_lock_covers_same_session_writer() {
 
         same_session_trx.commit().await.unwrap();
         assert!(has_lock_entry(
-            &sys.engine,
+            &engine,
             session_owner,
             LockResource::TableData(table_id),
             LockMode::Exclusive,
             LockDebugEntryState::Granted,
         ));
         assert!(has_lock_entry(
-            &sys.engine,
+            &engine,
             external_owner,
             LockResource::TableData(table_id),
             LockMode::IntentExclusive,
@@ -5634,7 +5803,7 @@ fn test_session_exclusive_table_lock_covers_same_session_writer() {
 
         session.unlock_table(table_id).unwrap();
         assert!(!has_lock_resource(
-            &sys.engine,
+            &engine,
             session_owner,
             LockResource::TableData(table_id),
         ));
@@ -5647,26 +5816,28 @@ fn test_table_scan_mvcc() {
     smol::block_on(async {
         const SIZE: i32 = 100;
 
-        let sys = TestSys::new_evictable().await;
+        let temp_dir = TempDir::new().unwrap();
+        let engine = evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys").await;
+        let table_id = create_table2_for_test(&engine).await;
 
         // insert 100 rows and commit
-        let mut session1 = sys.new_session().unwrap();
+        let mut session1 = engine.new_session().unwrap();
         {
             let mut trx = session1.begin_trx().unwrap();
             for i in 0..SIZE {
                 let s = format!("{}", i);
                 let insert = vec![Val::from(i), Val::from(&s[..])];
-                trx = sys.trx_insert(trx, insert).await;
+                trx = expect_trx_insert(table_id, trx, insert).await;
             }
             _ = trx.commit().await.unwrap();
         }
         // we should see 100 committed rows.
-        let mut session2 = sys.new_session().unwrap();
+        let mut session2 = engine.new_session().unwrap();
         {
             let mut trx = session2.begin_trx().unwrap();
             let mut res_len = 0usize;
             trx.exec(async |stmt| {
-                stmt.table_scan_mvcc(&sys.table, &[0], |_| {
+                stmt.table_scan_mvcc(table_id, &[0], |_| {
                     res_len += 1;
                     true
                 })
@@ -5685,7 +5856,7 @@ fn test_table_scan_mvcc() {
             for i in SIZE..SIZE * 2 {
                 let s = format!("{}", i);
                 let insert = vec![Val::from(i), Val::from(&s[..])];
-                trx = sys.trx_insert(trx, insert).await;
+                trx = expect_trx_insert(table_id, trx, insert).await;
             }
             trx
         };
@@ -5694,7 +5865,7 @@ fn test_table_scan_mvcc() {
             let mut trx = session2.begin_trx().unwrap();
             let mut res_len = 0usize;
             trx.exec(async |stmt| {
-                stmt.table_scan_mvcc(&sys.table, &[0], |_| {
+                stmt.table_scan_mvcc(table_id, &[0], |_| {
                     res_len += 1;
                     true
                 })
@@ -5714,7 +5885,7 @@ fn test_table_scan_mvcc() {
             let mut trx = session2.begin_trx().unwrap();
             let mut res_len = 0usize;
             trx.exec(async |stmt| {
-                stmt.table_scan_mvcc(&sys.table, &[0], |_| {
+                stmt.table_scan_mvcc(table_id, &[0], |_| {
                     res_len += 1;
                     true
                 })
@@ -5733,24 +5904,26 @@ fn test_table_scan_mvcc() {
 #[test]
 fn test_table_scan_mvcc_includes_cold_and_hot_rows() {
     smol::block_on(async {
-        let sys = TestSys::new_evictable().await;
-        let mut session = sys.new_session().unwrap();
-        insert_rows(&sys, &mut session, 0, 5, "cold").await;
-        sys.table.freeze(&session, usize::MAX).await.unwrap();
-        checkpoint_published(&sys.table, &mut session).await;
+        let temp_dir = TempDir::new().unwrap();
+        let engine = evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys").await;
+        let table_id = create_table2_for_test(&engine).await;
+        let mut session = engine.new_session().unwrap();
+        insert_rows(table_id, &mut session, 0, 5, "cold").await;
+        session.freeze_table(table_id, usize::MAX).await.unwrap();
+        checkpoint_published(table_id, &mut session).await;
 
         let mut trx = session.begin_trx().unwrap();
         assert_eq!(
-            scan_table_i32s(&mut trx, &sys.table).await,
+            scan_table_i32s(&mut trx, table_id).await,
             vec![0, 1, 2, 3, 4]
         );
         trx.commit().await.unwrap();
 
-        insert_rows(&sys, &mut session, 100, 3, "hot").await;
+        insert_rows(table_id, &mut session, 100, 3, "hot").await;
 
         let mut trx = session.begin_trx().unwrap();
         assert_eq!(
-            scan_table_i32s(&mut trx, &sys.table).await,
+            scan_table_i32s(&mut trx, table_id).await,
             vec![0, 1, 2, 3, 4, 100, 101, 102]
         );
         trx.commit().await.unwrap();
@@ -5760,27 +5933,29 @@ fn test_table_scan_mvcc_includes_cold_and_hot_rows() {
 #[test]
 fn test_table_scan_mvcc_cold_delete_buffer_visibility() {
     smol::block_on(async {
-        let sys = TestSys::new_evictable().await;
-        let mut session = sys.new_session().unwrap();
-        insert_rows(&sys, &mut session, 0, 5, "name").await;
-        sys.table.freeze(&session, usize::MAX).await.unwrap();
-        checkpoint_published(&sys.table, &mut session).await;
+        let temp_dir = TempDir::new().unwrap();
+        let engine = evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys").await;
+        let table_id = create_table2_for_test(&engine).await;
+        let mut session = engine.new_session().unwrap();
+        insert_rows(table_id, &mut session, 0, 5, "name").await;
+        session.freeze_table(table_id, usize::MAX).await.unwrap();
+        checkpoint_published(table_id, &mut session).await;
 
-        let mut old_reader_session = sys.new_session().unwrap();
+        let mut old_reader_session = engine.new_session().unwrap();
         let mut old_reader = old_reader_session.begin_trx().unwrap();
 
         let key = single_key(2i32);
-        sys.new_trx_delete(&mut session, &key).await;
+        expect_delete_committed(table_id, &mut session, &key).await;
 
         assert_eq!(
-            scan_table_i32s(&mut old_reader, &sys.table).await,
+            scan_table_i32s(&mut old_reader, table_id).await,
             vec![0, 1, 2, 3, 4]
         );
         old_reader.commit().await.unwrap();
 
         let mut new_reader = session.begin_trx().unwrap();
         assert_eq!(
-            scan_table_i32s(&mut new_reader, &sys.table).await,
+            scan_table_i32s(&mut new_reader, table_id).await,
             vec![0, 1, 3, 4]
         );
         new_reader.commit().await.unwrap();
@@ -5790,16 +5965,19 @@ fn test_table_scan_mvcc_cold_delete_buffer_visibility() {
 #[test]
 fn test_table_scan_mvcc_cold_update_visibility() {
     smol::block_on(async {
-        let sys = TestSys::new_evictable().await;
-        let mut session = sys.new_session().unwrap();
-        insert_rows(&sys, &mut session, 0, 3, "name").await;
-        sys.table.freeze(&session, usize::MAX).await.unwrap();
-        checkpoint_published(&sys.table, &mut session).await;
+        let temp_dir = TempDir::new().unwrap();
+        let engine = evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys").await;
+        let table_id = create_table2_for_test(&engine).await;
+        let mut session = engine.new_session().unwrap();
+        insert_rows(table_id, &mut session, 0, 3, "name").await;
+        session.freeze_table(table_id, usize::MAX).await.unwrap();
+        checkpoint_published(table_id, &mut session).await;
 
-        let mut old_reader_session = sys.new_session().unwrap();
+        let mut old_reader_session = engine.new_session().unwrap();
         let mut old_reader = old_reader_session.begin_trx().unwrap();
 
-        sys.new_trx_update(
+        expect_update_committed(
+            table_id,
             &mut session,
             &single_key(1i32),
             vec![UpdateCol {
@@ -5810,7 +5988,7 @@ fn test_table_scan_mvcc_cold_update_visibility() {
         .await;
 
         assert_eq!(
-            scan_table_pairs(&mut old_reader, &sys.table).await,
+            scan_table_pairs(&mut old_reader, table_id).await,
             vec![
                 (0, "name".to_string()),
                 (1, "name".to_string()),
@@ -5821,7 +5999,7 @@ fn test_table_scan_mvcc_cold_update_visibility() {
 
         let mut new_reader = session.begin_trx().unwrap();
         assert_eq!(
-            scan_table_pairs(&mut new_reader, &sys.table).await,
+            scan_table_pairs(&mut new_reader, table_id).await,
             vec![
                 (0, "name".to_string()),
                 (1, "updated".to_string()),
@@ -5835,25 +6013,24 @@ fn test_table_scan_mvcc_cold_update_visibility() {
 #[test]
 fn test_table_scan_mvcc_uncommitted_cold_delete_visibility() {
     smol::block_on(async {
-        let sys = TestSys::new_evictable().await;
-        let mut session = sys.new_session().unwrap();
-        insert_rows(&sys, &mut session, 0, 4, "name").await;
-        sys.table.freeze(&session, usize::MAX).await.unwrap();
-        checkpoint_published(&sys.table, &mut session).await;
+        let temp_dir = TempDir::new().unwrap();
+        let engine = evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys").await;
+        let table_id = create_table2_for_test(&engine).await;
+        let mut session = engine.new_session().unwrap();
+        insert_rows(table_id, &mut session, 0, 4, "name").await;
+        session.freeze_table(table_id, usize::MAX).await.unwrap();
+        checkpoint_published(table_id, &mut session).await;
 
         let mut writer = session.begin_trx().unwrap();
-        let res = trx_delete_row(&mut writer, &sys.table, &single_key(1i32)).await;
+        let res = trx_delete_row_by_id(&mut writer, table_id, &single_key(1i32)).await;
         assert!(matches!(res, Ok(DeleteMvcc::Deleted)));
 
-        assert_eq!(
-            scan_table_i32s(&mut writer, &sys.table).await,
-            vec![0, 2, 3]
-        );
+        assert_eq!(scan_table_i32s(&mut writer, table_id).await, vec![0, 2, 3]);
 
-        let mut other_session = sys.new_session().unwrap();
+        let mut other_session = engine.new_session().unwrap();
         let mut other_reader = other_session.begin_trx().unwrap();
         assert_eq!(
-            scan_table_i32s(&mut other_reader, &sys.table).await,
+            scan_table_i32s(&mut other_reader, table_id).await,
             vec![0, 1, 2, 3]
         );
         other_reader.commit().await.unwrap();
@@ -5864,40 +6041,35 @@ fn test_table_scan_mvcc_uncommitted_cold_delete_visibility() {
 #[test]
 fn test_table_scan_mvcc_skips_persisted_delete_delta() {
     smol::block_on(async {
-        let sys = TestSys::new_evictable().await;
-        let mut session = sys.new_session().unwrap();
-        insert_rows(&sys, &mut session, 0, 6, "name").await;
-        sys.table.freeze(&session, usize::MAX).await.unwrap();
-        checkpoint_published(&sys.table, &mut session).await;
+        let temp_dir = TempDir::new().unwrap();
+        let engine = evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys").await;
+        let table_id = create_table2_for_test(&engine).await;
+        let mut session = engine.new_session().unwrap();
+        insert_rows(table_id, &mut session, 0, 6, "name").await;
+        session.freeze_table(table_id, usize::MAX).await.unwrap();
+        checkpoint_published(table_id, &mut session).await;
 
         let key = single_key(4i32);
         let reader = session.begin_trx().unwrap();
-        let row_id =
-            assert_row_in_lwc(&sys.table, &session.pool_guards(), &key, reader.sts()).await;
+        let table = table_for_internal_assertion(&engine, table_id);
+        let row_id = assert_row_in_lwc(&table, &session.pool_guards(), &key, reader.sts()).await;
         reader.commit().await.unwrap();
 
-        sys.new_trx_delete(&mut session, &key).await;
-        let marker_ts = delete_marker_ts(sys.table.deletion_buffer().get(row_id).unwrap());
+        expect_delete_committed(table_id, &mut session, &key).await;
+        let marker_ts = delete_marker_ts(table.deletion_buffer().get(row_id).unwrap());
         wait_gc_cutoff_after(&session, marker_ts).await;
-        checkpoint_published(&sys.table, &mut session).await;
+        checkpoint_published(table_id, &mut session).await;
 
-        let active_root = sys.table.file().active_root_unchecked();
+        let snapshot = column_block_index_snapshot(&engine, table_id);
         let pool_guards = session.pool_guards();
-        let index = ColumnBlockIndex::new(
-            active_root.column_block_index_root,
-            active_root.pivot_row_id,
-            sys.table.file().file_kind(),
-            sys.table.file().sparse_file(),
-            sys.table.disk_pool(),
-            pool_guards.disk_guard(),
-        );
+        let index = snapshot.index(pool_guards.disk_guard());
         let entry = index.locate_block(row_id).await.unwrap().unwrap();
         let deltas = index.load_delete_deltas(&entry).await.unwrap();
         assert!(deltas.contains(&((row_id - entry.start_row_id) as u32)));
 
         let mut trx = session.begin_trx().unwrap();
         assert_eq!(
-            scan_table_i32s(&mut trx, &sys.table).await,
+            scan_table_i32s(&mut trx, table_id).await,
             vec![0, 1, 2, 3, 5]
         );
         trx.commit().await.unwrap();
@@ -5907,17 +6079,19 @@ fn test_table_scan_mvcc_skips_persisted_delete_delta() {
 #[test]
 fn test_table_scan_mvcc_early_stop_before_hot_phase() {
     smol::block_on(async {
-        let sys = TestSys::new_evictable().await;
-        let mut session = sys.new_session().unwrap();
-        insert_rows(&sys, &mut session, 0, 5, "cold").await;
-        sys.table.freeze(&session, usize::MAX).await.unwrap();
-        checkpoint_published(&sys.table, &mut session).await;
-        insert_rows(&sys, &mut session, 100, 2, "hot").await;
+        let temp_dir = TempDir::new().unwrap();
+        let engine = evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys").await;
+        let table_id = create_table2_for_test(&engine).await;
+        let mut session = engine.new_session().unwrap();
+        insert_rows(table_id, &mut session, 0, 5, "cold").await;
+        session.freeze_table(table_id, usize::MAX).await.unwrap();
+        checkpoint_published(table_id, &mut session).await;
+        insert_rows(table_id, &mut session, 100, 2, "hot").await;
 
         let mut trx = session.begin_trx().unwrap();
         let mut rows = Vec::new();
         trx.exec(async |stmt| {
-            stmt.table_scan_mvcc(&sys.table, &[0], |vals| {
+            stmt.table_scan_mvcc(table_id, &[0], |vals| {
                 rows.push(vals[0].as_i32().unwrap());
                 rows.len() < 3
             })
@@ -5934,17 +6108,20 @@ fn test_table_scan_mvcc_early_stop_before_hot_phase() {
 #[test]
 fn test_mem_scan_from_requires_row_page_boundary() {
     smol::block_on(async {
-        let sys = TestSys::new_evictable().await;
-        let mut session = sys.new_session().unwrap();
-        insert_rows(&sys, &mut session, 0, 4, "first").await;
-        sys.table.freeze(&session, usize::MAX).await.unwrap();
-        checkpoint_published(&sys.table, &mut session).await;
-        let captured_pivot = sys.table.file().active_root_unchecked().pivot_row_id;
+        let temp_dir = TempDir::new().unwrap();
+        let engine = evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys").await;
+        let table_id = create_table2_for_test(&engine).await;
+        let mut session = engine.new_session().unwrap();
+        insert_rows(table_id, &mut session, 0, 4, "first").await;
+        session.freeze_table(table_id, usize::MAX).await.unwrap();
+        checkpoint_published(table_id, &mut session).await;
+        let table = table_for_internal_assertion(&engine, table_id);
+        let captured_pivot = table.file().active_root_unchecked().pivot_row_id;
 
-        insert_rows(&sys, &mut session, 100, 4, "second").await;
+        insert_rows(table_id, &mut session, 100, 4, "second").await;
         let mut later_pivot = captured_pivot;
         let mut explicit_count = 0usize;
-        sys.table
+        table
             .mem
             .mem_scan_from(&session.pool_guards(), captured_pivot, |page_guard| {
                 let page = page_guard.page();
@@ -5958,8 +6135,7 @@ fn test_mem_scan_from_requires_row_page_boundary() {
         assert!(later_pivot > captured_pivot);
 
         let interior_start = captured_pivot + 2;
-        let err = sys
-            .table
+        let err = table
             .mem
             .mem_scan_from(&session.pool_guards(), interior_start, |_| true)
             .await
@@ -5970,15 +6146,15 @@ fn test_mem_scan_from_requires_row_page_boundary() {
         // memory-scan pivot to that page's exclusive row-id boundary. A real
         // later checkpoint may reclaim pages once no transaction root protects
         // them, which is outside this helper's direct contract.
-        sys.table
+        table
             .mem
             .blk_idx()
             .update_column_root(later_pivot, SUPER_BLOCK_ID)
             .await;
-        assert_eq!(sys.table.mem.pivot_row_id(), later_pivot);
+        assert_eq!(table.mem.pivot_row_id(), later_pivot);
 
         let mut current_hot_pages = 0usize;
-        sys.table
+        table
             .mem
             .mem_scan(&session.pool_guards(), |_| {
                 current_hot_pages += 1;
@@ -5993,34 +6169,44 @@ fn test_mem_scan_from_requires_row_page_boundary() {
 #[test]
 fn test_table_freeze() {
     smol::block_on(async {
-        let sys = TestSys::new_evictable().await;
+        let temp_dir = TempDir::new().unwrap();
+        let engine = evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys").await;
+        let table_id = create_table2_for_test(&engine).await;
 
-        let mut session1 = sys.new_session().unwrap();
+        let mut session1 = engine.new_session().unwrap();
         {
             let trx = session1.begin_trx().unwrap();
             let insert = vec![Val::from(1), Val::from("1")];
-            sys.trx_insert(trx, insert).await.commit().await.unwrap();
+            expect_trx_insert(table_id, trx, insert)
+                .await
+                .commit()
+                .await
+                .unwrap();
         }
-        let row_pages = sys.table.total_row_pages(&session1.pool_guards()).await;
+        let row_pages = session1.total_row_pages(table_id).await.unwrap();
         assert!(row_pages == 1);
-        sys.table.freeze(&session1, 10).await.unwrap();
+        session1.freeze_table(table_id, 10).await.unwrap();
         // after freezing, new row should be inserted into second page.
         {
             let trx = session1.begin_trx().unwrap();
             let insert = vec![Val::from(2), Val::from("2")];
-            sys.trx_insert(trx, insert).await.commit().await.unwrap();
+            expect_trx_insert(table_id, trx, insert)
+                .await
+                .commit()
+                .await
+                .unwrap();
         }
-        let row_pages = sys.table.total_row_pages(&session1.pool_guards()).await;
+        let row_pages = session1.total_row_pages(table_id).await.unwrap();
         assert!(row_pages == 2);
-        sys.table.freeze(&session1, 10).await.unwrap();
+        session1.freeze_table(table_id, 10).await.unwrap();
 
         // update row 1 will cause new insert into new page.
         {
             let mut trx = session1.begin_trx().unwrap();
             let key = SelectKey::new(0, vec![Val::from(1)]);
-            let res = trx_update_row(
+            let res = trx_update_row_by_id(
                 &mut trx,
-                &sys.table,
+                table_id,
                 &key,
                 vec![UpdateCol {
                     idx: 1,
@@ -6031,16 +6217,16 @@ fn test_table_freeze() {
             assert!(matches!(res, Ok(UpdateMvcc::Updated(_))));
             trx.commit().await.unwrap();
         }
-        let row_pages = sys.table.total_row_pages(&session1.pool_guards()).await;
+        let row_pages = session1.total_row_pages(table_id).await.unwrap();
         assert!(row_pages == 3);
 
         // update row 1 will just be in-place.
         {
             let mut trx = session1.begin_trx().unwrap();
             let key = SelectKey::new(0, vec![Val::from(1)]);
-            let res = trx_update_row(
+            let res = trx_update_row_by_id(
                 &mut trx,
-                &sys.table,
+                table_id,
                 &key,
                 vec![UpdateCol {
                     idx: 1,
@@ -6051,130 +6237,32 @@ fn test_table_freeze() {
             assert!(matches!(res, Ok(UpdateMvcc::Updated(_))));
             trx.commit().await.unwrap();
         }
-        let row_pages = sys.table.total_row_pages(&session1.pool_guards()).await;
+        let row_pages = session1.total_row_pages(table_id).await.unwrap();
         assert!(row_pages == 3);
-    });
-}
-
-#[test]
-fn test_freeze_holds_session_pin_until_scan_finishes() {
-    smol::block_on(async {
-        let (_temp_dir, engine, table) = new_lightweight_arc_table("freeze_pin").await;
-        let mut session = engine.new_session().unwrap();
-        for i in 0..4 {
-            insert_one_row(&table, &mut session, vec![Val::from(i), Val::from("pin")]).await;
-        }
-
-        let result_rx = Rc::new(RefCell::new(None));
-        let hook_result_rx = Rc::clone(&result_rx);
-        let hook_engine = Arc::clone(&engine);
-        set_test_freeze_after_pin_hook(move || async move {
-            let probe = spawn_shutdown_probe(hook_engine);
-            assert_shutdown_probe_waiting(probe.started_rx, &probe.done);
-            *hook_result_rx.borrow_mut() = Some(probe.result_rx);
-        });
-        let _reset = ResetTableHook::new(&TEST_FREEZE_AFTER_PIN_HOOK);
-
-        table.freeze(&session, usize::MAX).await.unwrap();
-        let rx = result_rx
-            .borrow_mut()
-            .take()
-            .expect("freeze hook should start shutdown probe");
-        assert_shutdown_probe_finished(rx);
-    });
-}
-
-#[test]
-fn test_checkpoint_holds_session_pin_until_publish_finishes() {
-    smol::block_on(async {
-        let (_temp_dir, engine, table) = new_lightweight_arc_table("checkpoint_pin").await;
-        let mut session = engine.new_session().unwrap();
-        for i in 0..8 {
-            insert_one_row(
-                &table,
-                &mut session,
-                vec![Val::from(i), Val::from("checkpoint-pin")],
-            )
-            .await;
-        }
-        table.freeze(&session, usize::MAX).await.unwrap();
-        wait_checkpoint_ready(&table, &session).await;
-
-        let result_rx = Rc::new(RefCell::new(None));
-        let hook_result_rx = Rc::clone(&result_rx);
-        let hook_engine = Arc::clone(&engine);
-        set_test_checkpoint_before_publish_hook(move || async move {
-            let probe = spawn_shutdown_probe(hook_engine);
-            assert_shutdown_probe_waiting(probe.started_rx, &probe.done);
-            *hook_result_rx.borrow_mut() = Some(probe.result_rx);
-        });
-        let _reset = ResetTableHook::new(&TEST_CHECKPOINT_BEFORE_PUBLISH_HOOK);
-
-        let outcome = table.checkpoint(&mut session).await.unwrap();
-        assert!(matches!(outcome, CheckpointOutcome::Published { .. }));
-        let rx = result_rx
-            .borrow_mut()
-            .take()
-            .expect("checkpoint hook should start shutdown probe");
-        assert_shutdown_probe_finished(rx);
-    });
-}
-
-#[test]
-fn test_secondary_cleanup_holds_session_pin_until_scan_finishes() {
-    smol::block_on(async {
-        let (_temp_dir, engine, table) =
-            new_lightweight_arc_table_with_non_unique_name_index("secondary_cleanup_pin").await;
-        let mut session = engine.new_session().unwrap();
-        for i in 0..4 {
-            insert_one_row(
-                &table,
-                &mut session,
-                vec![Val::from(i), Val::from("cleanup-pin")],
-            )
-            .await;
-        }
-
-        let result_rx = Rc::new(RefCell::new(None));
-        let hook_result_rx = Rc::clone(&result_rx);
-        let hook_engine = Arc::clone(&engine);
-        set_test_secondary_cleanup_before_scan_hook(move || async move {
-            let probe = spawn_shutdown_probe(hook_engine);
-            assert_shutdown_probe_waiting(probe.started_rx, &probe.done);
-            *hook_result_rx.borrow_mut() = Some(probe.result_rx);
-        });
-        let _reset = ResetTableHook::new(&TEST_SECONDARY_CLEANUP_BEFORE_SCAN_HOOK);
-
-        let stats = table
-            .cleanup_secondary_mem_indexes(&mut session, true)
-            .await
-            .unwrap();
-        assert!(!stats.indexes.is_empty());
-        let rx = result_rx
-            .borrow_mut()
-            .take()
-            .expect("secondary cleanup hook should start shutdown probe");
-        assert_shutdown_probe_finished(rx);
     });
 }
 
 #[test]
 fn test_transition_captures_uncommitted_lock_into_deletion_buffer() {
     smol::block_on(async {
-        let sys = TestSys::new_evictable().await;
-        let mut session = sys.new_session().unwrap();
-        insert_rows(&sys, &mut session, 1, 1, "lock").await;
+        let temp_dir = TempDir::new().unwrap();
+        let engine = evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys").await;
+        let table_id = create_table2_for_test(&engine).await;
+        let mut session = engine.new_session().unwrap();
+        insert_rows(table_id, &mut session, 1, 1, "lock").await;
 
         let key = single_key(1i32);
         let mut trx = session.begin_trx().unwrap();
-        let index = bound_unique_index_no(&sys.table, key.index_no);
+        let index = bound_unique_index_no(
+            &table_for_internal_assertion(&engine, table_id),
+            key.index_no,
+        );
         let (row_id, _) = index
             .lookup(session.pool_guards().index_guard(), &key.vals, trx.sts())
             .await
             .unwrap()
             .unwrap();
-        let page_id = match sys
-            .table
+        let page_id = match table_for_internal_assertion(&engine, table_id)
             .find_row(&session.pool_guards(), row_id)
             .await
             .unwrap()
@@ -6186,8 +6274,7 @@ fn test_transition_captures_uncommitted_lock_into_deletion_buffer() {
 
         let res: Result<()> = trx
             .exec(async |stmt| {
-                let page_guard = sys
-                    .engine
+                let page_guard = engine
                     .mem_pool
                     .get_page::<RowPage>(
                         session.pool_guards().mem_guard(),
@@ -6199,11 +6286,10 @@ fn test_transition_captures_uncommitted_lock_into_deletion_buffer() {
                     .lock_shared_async()
                     .await
                     .unwrap();
-                stmt.acquire_table_write_locks(sys.table.table_id()).await?;
+                stmt.acquire_table_write_locks(table_id).await?;
                 let (rt, effects) = stmt_tests::runtime_and_effects_mut(stmt);
-                let layout = sys.table.layout_snapshot();
-                let mut lock_row = sys
-                    .table
+                let layout = table_for_internal_assertion(&engine, table_id).layout_snapshot();
+                let mut lock_row = table_for_internal_assertion(&engine, table_id)
                     .accessor_with_layout(&layout)
                     .lock_row_for_write(rt, effects, &page_guard, row_id, Some(&key))
                     .await;
@@ -6224,7 +6310,7 @@ fn test_transition_captures_uncommitted_lock_into_deletion_buffer() {
                     page_ctx.row_ver().unwrap().set_frozen();
                     frozen_page
                 };
-                sys.table
+                table_for_internal_assertion(&engine, table_id)
                     .set_frozen_pages_to_transition(
                         &session.pool_guards(),
                         &[frozen_page],
@@ -6233,7 +6319,10 @@ fn test_transition_captures_uncommitted_lock_into_deletion_buffer() {
                     .await
                     .unwrap();
 
-                let marker = sys.table.deletion_buffer().get(row_id).unwrap();
+                let marker = table_for_internal_assertion(&engine, table_id)
+                    .deletion_buffer()
+                    .get(row_id)
+                    .unwrap();
                 match marker {
                     DeleteMarker::Ref(status) => {
                         assert!(std::sync::Arc::ptr_eq(&status, &stmt.runtime().status()));
@@ -6258,23 +6347,25 @@ fn test_transition_captures_uncommitted_lock_into_deletion_buffer() {
 #[test]
 fn test_checkpoint_basic_flow() {
     smol::block_on(async {
-        let sys = TestSys::new_evictable().await;
-        let mut session = sys.new_session().unwrap();
+        let temp_dir = TempDir::new().unwrap();
+        let engine = evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys").await;
+        let table_id = create_table2_for_test(&engine).await;
+        let mut session = engine.new_session().unwrap();
         let name = "x".repeat(1024);
-        insert_rows(&sys, &mut session, 0, 200, &name).await;
+        insert_rows(table_id, &mut session, 0, 200, &name).await;
 
-        let old_root = sys.table.file().active_root_unchecked().clone();
-        sys.table.freeze(&session, usize::MAX).await.unwrap();
-        let (frozen_pages, _) = sys
-            .table
+        let table = table_for_internal_assertion(&engine, table_id);
+        let old_root = table.file().active_root_unchecked().clone();
+        session.freeze_table(table_id, usize::MAX).await.unwrap();
+        let (frozen_pages, _) = table
             .collect_frozen_pages(&session.pool_guards())
             .await
             .unwrap();
         assert!(!frozen_pages.is_empty());
 
-        checkpoint_published(&sys.table, &mut session).await;
+        checkpoint_published(table_id, &mut session).await;
 
-        let new_root = sys.table.file().active_root_unchecked();
+        let new_root = table.file().active_root_unchecked().clone();
         assert!(new_root.pivot_row_id > old_root.pivot_row_id);
         assert_ne!(new_root.column_block_index_root, SUPER_BLOCK_ID);
         assert!(new_root.deletion_cutoff_ts > old_root.deletion_cutoff_ts);
@@ -6284,28 +6375,31 @@ fn test_checkpoint_basic_flow() {
 #[test]
 fn test_foreground_lifecycle_rejects_dropping_and_dropped_handles() {
     smol::block_on(async {
-        let sys = TestSys::new_lightweight_evictable().await;
-        let mut session = sys.new_session().unwrap();
+        let temp_dir = TempDir::new().unwrap();
+        let engine = lightweight_test_engine(&temp_dir, "redo_testsys_lightweight").await;
+        let table_id = create_table2_for_test(&engine).await;
+        let mut session = engine.new_session().unwrap();
         insert_one_row(
-            &sys.table,
+            table_id,
             &mut session,
             vec![Val::from(1), Val::from("lifecycle")],
         )
         .await;
 
-        sys.table.begin_drop_lifecycle().await.unwrap();
+        let table = table_for_internal_assertion(&engine, table_id);
+        table.begin_drop_lifecycle().await.unwrap();
 
         let mut read_trx = session.begin_trx().unwrap();
-        let err = trx_select_row_mvcc(&mut read_trx, &sys.table, &single_key(1), &[0, 1])
+        let err = trx_select_row_mvcc_by_id(&mut read_trx, table_id, &single_key(1), &[0, 1])
             .await
             .unwrap_err();
         assert_eq!(err.operation_error(), Some(OperationError::TableDropping));
         assert_eq!(read_trx.commit().await.unwrap(), TrxID::new(0));
 
         let mut write_trx = session.begin_trx().unwrap();
-        let err = trx_insert_row(
+        let err = trx_insert_row_by_id(
             &mut write_trx,
-            &sys.table,
+            table_id,
             vec![Val::from(2), Val::from("blocked")],
         )
         .await
@@ -6313,19 +6407,19 @@ fn test_foreground_lifecycle_rejects_dropping_and_dropped_handles() {
         assert_eq!(err.operation_error(), Some(OperationError::TableDropping));
         assert_eq!(write_trx.commit().await.unwrap(), TrxID::new(0));
 
-        sys.table.mark_dropped_lifecycle().unwrap();
+        table.mark_dropped_lifecycle().unwrap();
 
         let mut dropped_read = session.begin_trx().unwrap();
-        let err = trx_select_row_mvcc(&mut dropped_read, &sys.table, &single_key(1), &[0, 1])
+        let err = trx_select_row_mvcc_by_id(&mut dropped_read, table_id, &single_key(1), &[0, 1])
             .await
             .unwrap_err();
         assert_eq!(err.operation_error(), Some(OperationError::TableNotFound));
         assert_eq!(dropped_read.commit().await.unwrap(), TrxID::new(0));
 
         let mut dropped_write = session.begin_trx().unwrap();
-        let err = trx_insert_row(
+        let err = trx_insert_row_by_id(
             &mut dropped_write,
-            &sys.table,
+            table_id,
             vec![Val::from(3), Val::from("dropped")],
         )
         .await
@@ -6338,44 +6432,117 @@ fn test_foreground_lifecycle_rejects_dropping_and_dropped_handles() {
 #[test]
 fn test_table_drop_gate_waits_for_checkpoint_publish_lease() {
     smol::block_on(async {
-        let sys = TestSys::new_lightweight_evictable().await;
-        let _root_lease = sys.table.try_begin_checkpoint_root_mutation().unwrap();
-        let publish_lease = sys.table.try_begin_checkpoint_publish().unwrap();
-        let mut drop_fut = Box::pin(sys.table.begin_drop_lifecycle());
+        let temp_dir = TempDir::new().unwrap();
+        let engine = lightweight_test_engine(&temp_dir, "redo_testsys_lightweight").await;
+        let table_id = create_table2_for_test(&engine).await;
+        let table = table_for_internal_assertion(&engine, table_id);
+        let _root_lease = table.try_begin_checkpoint_root_mutation().unwrap();
+        let publish_lease = table.try_begin_checkpoint_publish().unwrap();
+        let mut drop_fut = Box::pin(table.begin_drop_lifecycle());
 
         assert!(matches!(
             futures::poll!(drop_fut.as_mut()),
             std::task::Poll::Pending
         ));
-        assert_eq!(sys.table.lifecycle.state(), TableLifecycleState::Dropping);
-        match sys.table.try_begin_checkpoint_publish() {
+        assert_eq!(table.lifecycle.state(), TableLifecycleState::Dropping);
+        match table.try_begin_checkpoint_publish() {
             Ok(_lease) => panic!("publish lease should be blocked by drop gate"),
             Err(reason) => assert_eq!(reason, CheckpointCancelReason::TableDropping),
         }
 
         drop(publish_lease);
         drop_fut.await.unwrap();
-        assert_eq!(sys.table.lifecycle.state(), TableLifecycleState::Dropping);
+        assert_eq!(table.lifecycle.state(), TableLifecycleState::Dropping);
     });
 }
 
 #[test]
 fn test_checkpoint_cancelled_when_table_dropping() {
     smol::block_on(async {
-        let sys = TestSys::new_lightweight_evictable().await;
-        let mut session = sys.new_session().unwrap();
-        let root_before = sys.table.file().active_root_unchecked().clone();
+        let temp_dir = TempDir::new().unwrap();
+        let engine = lightweight_test_engine(&temp_dir, "redo_testsys_lightweight").await;
+        let table_id = create_table2_for_test(&engine).await;
+        let mut session = engine.new_session().unwrap();
+        let table = table_for_internal_assertion(&engine, table_id);
+        let root_before = table.file().active_root_unchecked().clone();
 
-        wait_checkpoint_ready(&sys.table, &session).await;
-        sys.table.begin_drop_lifecycle().await.unwrap();
-        let outcome = sys.table.checkpoint(&mut session).await.unwrap();
+        wait_checkpoint_ready(table_id, &session).await;
+        table_for_internal_assertion(&engine, table_id)
+            .begin_drop_lifecycle()
+            .await
+            .unwrap();
+        let outcome = session.checkpoint_table(table_id).await.unwrap();
         assert_eq!(
             outcome,
             CheckpointOutcome::Cancelled {
                 reason: CheckpointCancelReason::TableDropping
             }
         );
-        assert_root_metadata_unchanged(&root_before, &sys.table);
+        assert_root_metadata_unchanged(
+            &root_before,
+            &table_for_internal_assertion(&engine, table_id),
+        );
+        assert!(!session.in_trx().unwrap());
+    });
+}
+
+#[test]
+fn test_checkpoint_cancelled_when_table_dropping_before_delayed_readiness() {
+    smol::block_on(async {
+        let temp_dir = TempDir::new().unwrap();
+        let engine = evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys").await;
+        let table_id = create_table2_for_test(&engine).await;
+        let mut session = engine.new_session().unwrap();
+        insert_rows(table_id, &mut session, 0, 120, "dropping-before-delay").await;
+        session.freeze_table(table_id, usize::MAX).await.unwrap();
+
+        let mut reader_session = engine.new_session().unwrap();
+        let reader = reader_session.begin_trx().unwrap();
+        checkpoint_published(table_id, &mut session).await;
+        assert!(matches!(
+            session.table_checkpoint_readiness(table_id).unwrap(),
+            CheckpointReadiness::Delayed { .. }
+        ));
+
+        let table = table_for_internal_assertion(&engine, table_id);
+        let root_before = table.file().active_root_unchecked().clone();
+        table.begin_drop_lifecycle().await.unwrap();
+
+        let outcome = session.checkpoint_table(table_id).await.unwrap();
+        assert_eq!(
+            outcome,
+            CheckpointOutcome::Cancelled {
+                reason: CheckpointCancelReason::TableDropping
+            }
+        );
+        assert_root_metadata_unchanged(&root_before, &table);
+        assert!(!session.in_trx().unwrap());
+
+        reader.commit().await.unwrap();
+    });
+}
+
+#[test]
+fn test_checkpoint_cancelled_when_table_lifecycle_dropped() {
+    smol::block_on(async {
+        let temp_dir = TempDir::new().unwrap();
+        let engine = lightweight_test_engine(&temp_dir, "redo_testsys_lightweight").await;
+        let table_id = create_table2_for_test(&engine).await;
+        let mut session = engine.new_session().unwrap();
+        let table = table_for_internal_assertion(&engine, table_id);
+        let root_before = table.file().active_root_unchecked().clone();
+
+        table.begin_drop_lifecycle().await.unwrap();
+        table.mark_dropped_lifecycle().unwrap();
+
+        let outcome = session.checkpoint_table(table_id).await.unwrap();
+        assert_eq!(
+            outcome,
+            CheckpointOutcome::Cancelled {
+                reason: CheckpointCancelReason::TableDropped
+            }
+        );
+        assert_root_metadata_unchanged(&root_before, &table);
         assert!(!session.in_trx().unwrap());
     });
 }
@@ -6383,26 +6550,36 @@ fn test_checkpoint_cancelled_when_table_dropping() {
 #[test]
 fn test_drop_table_rejects_already_dropping_lifecycle_without_poison() {
     smol::block_on(async {
-        let sys = TestSys::new_lightweight_evictable().await;
-        let table_id = sys.table.table_id();
-        let mut session = sys.new_session().unwrap();
+        let temp_dir = TempDir::new().unwrap();
+        let engine = lightweight_test_engine(&temp_dir, "redo_testsys_lightweight").await;
+        let table_id = create_table2_for_test(&engine).await;
+        let mut session = engine.new_session().unwrap();
 
-        sys.table.begin_drop_lifecycle().await.unwrap();
+        table_for_internal_assertion(&engine, table_id)
+            .begin_drop_lifecycle()
+            .await
+            .unwrap();
 
         let err = session.drop_table(table_id).await.unwrap_err();
         assert_eq!(err.operation_error(), Some(OperationError::TableDropping));
-        assert_eq!(sys.table.lifecycle.state(), TableLifecycleState::Dropping);
+        assert_eq!(
+            table_for_internal_assertion(&engine, table_id)
+                .lifecycle
+                .state(),
+            TableLifecycleState::Dropping
+        );
         assert!(!session.in_trx().unwrap());
-        assert!(sys.engine.trx_sys.storage_poison_error().is_none());
+        assert!(engine.trx_sys.storage_poison_error().is_none());
     });
 }
 
 #[test]
 fn test_drop_table_rejects_active_transaction() {
     smol::block_on(async {
-        let sys = TestSys::new_lightweight_evictable().await;
-        let table_id = sys.table.table_id();
-        let mut session = sys.new_session().unwrap();
+        let temp_dir = TempDir::new().unwrap();
+        let engine = lightweight_test_engine(&temp_dir, "redo_testsys_lightweight").await;
+        let table_id = create_table2_for_test(&engine).await;
+        let mut session = engine.new_session().unwrap();
         let trx = session.begin_trx().unwrap();
 
         let err = session.drop_table(table_id).await.unwrap_err();
@@ -6415,13 +6592,15 @@ fn test_drop_table_rejects_active_transaction() {
 #[test]
 fn test_drop_table_returns_not_found_for_missing_table() {
     smol::block_on(async {
-        let sys = TestSys::new_lightweight_evictable().await;
-        let mut session = sys.new_session().unwrap();
+        let temp_dir = TempDir::new().unwrap();
+        let engine = lightweight_test_engine(&temp_dir, "redo_testsys_lightweight").await;
+        let table_id = create_table2_for_test(&engine).await;
+        let mut session = engine.new_session().unwrap();
 
         let err = session.drop_table(TableID::new(0)).await.unwrap_err();
         assert_eq!(err.operation_error(), Some(OperationError::TableNotFound));
 
-        let missing_user_table_id = sys.table.table_id() + 1000;
+        let missing_user_table_id = table_id + 1000;
         let err = session.drop_table(missing_user_table_id).await.unwrap_err();
         assert_eq!(err.operation_error(), Some(OperationError::TableNotFound));
     });
@@ -6430,15 +6609,15 @@ fn test_drop_table_returns_not_found_for_missing_table() {
 #[test]
 fn test_drop_table_rejects_runtime_missing_catalog_row_before_gate() {
     smol::block_on(async {
-        let sys = TestSys::new_lightweight_evictable().await;
-        let table_id = sys.table.table_id();
-        let mut corrupt_session = sys.new_session().unwrap();
+        let temp_dir = TempDir::new().unwrap();
+        let engine = lightweight_test_engine(&temp_dir, "redo_testsys_lightweight").await;
+        let table_id = create_table2_for_test(&engine).await;
+        let mut corrupt_session = engine.new_session().unwrap();
         let mut corrupt_trx = corrupt_session.begin_trx().unwrap();
 
         corrupt_trx
             .exec(async |stmt| {
-                let deleted = sys
-                    .engine
+                let deleted = engine
                     .catalog()
                     .storage
                     .tables()
@@ -6455,14 +6634,19 @@ fn test_drop_table_rejects_runtime_missing_catalog_row_before_gate() {
             .unwrap();
         corrupt_trx.commit().await.unwrap();
 
-        let mut drop_session = sys.new_session().unwrap();
+        let mut drop_session = engine.new_session().unwrap();
         let err = drop_session.drop_table(table_id).await.unwrap_err();
 
         assert_eq!(err.operation_error(), Some(OperationError::TableNotFound));
-        assert_eq!(sys.table.lifecycle.state(), TableLifecycleState::Live);
+        assert_eq!(
+            table_for_internal_assertion(&engine, table_id)
+                .lifecycle
+                .state(),
+            TableLifecycleState::Live
+        );
         assert!(!drop_session.in_trx().unwrap());
-        assert!(sys.engine.trx_sys.storage_poison_error().is_none());
-        assert!(sys.engine.catalog().get_table(table_id).await.is_some());
+        assert!(engine.trx_sys.storage_poison_error().is_none());
+        assert!(engine.catalog().get_table(table_id).await.is_some());
     });
 }
 
@@ -6470,9 +6654,10 @@ fn test_drop_table_rejects_runtime_missing_catalog_row_before_gate() {
 fn test_drop_table_rejects_same_session_explicit_table_lock() {
     smol::block_on(async {
         for mode in [LockMode::Shared, LockMode::Exclusive] {
-            let sys = TestSys::new_lightweight_evictable().await;
-            let table_id = sys.table.table_id();
-            let mut session = sys.new_session().unwrap();
+            let temp_dir = TempDir::new().unwrap();
+            let engine = lightweight_test_engine(&temp_dir, "redo_testsys_lightweight").await;
+            let table_id = create_table2_for_test(&engine).await;
+            let mut session = engine.new_session().unwrap();
             let owner = LockOwner::Session(session.id());
 
             session.lock_table(table_id, mode).await.unwrap();
@@ -6482,22 +6667,27 @@ fn test_drop_table_rejects_same_session_explicit_table_lock() {
                 Some(OperationError::LockOwnerGroupConflict)
             );
 
-            assert_eq!(sys.table.lifecycle.state(), TableLifecycleState::Live);
-            assert!(sys.engine.catalog().get_table(table_id).await.is_some());
+            assert_eq!(
+                table_for_internal_assertion(&engine, table_id)
+                    .lifecycle
+                    .state(),
+                TableLifecycleState::Live
+            );
+            assert!(engine.catalog().get_table(table_id).await.is_some());
             assert!(!has_lock_resource(
-                &sys.engine,
+                &engine,
                 owner,
                 LockResource::CatalogNamespace,
             ));
             assert!(has_lock_entry(
-                &sys.engine,
+                &engine,
                 owner,
                 LockResource::TableMetadata(table_id),
                 LockMode::Shared,
                 LockDebugEntryState::Granted,
             ));
             assert!(has_lock_entry(
-                &sys.engine,
+                &engine,
                 owner,
                 LockResource::TableData(table_id),
                 mode,
@@ -6506,12 +6696,12 @@ fn test_drop_table_rejects_same_session_explicit_table_lock() {
 
             session.unlock_table(table_id).unwrap();
             assert!(!has_lock_resource(
-                &sys.engine,
+                &engine,
                 owner,
                 LockResource::TableMetadata(table_id),
             ));
             assert!(!has_lock_resource(
-                &sys.engine,
+                &engine,
                 owner,
                 LockResource::TableData(table_id),
             ));
@@ -6523,11 +6713,13 @@ fn test_drop_table_rejects_same_session_explicit_table_lock() {
 #[test]
 fn test_drop_table_fails_waiting_session_table_lock() {
     smol::block_on(async {
-        let sys = TestSys::new_lightweight_evictable().await;
-        let table_id = sys.table.table_id();
-        let root_lease = sys.table.try_begin_checkpoint_root_mutation().unwrap();
-        let publish_lease = sys.table.try_begin_checkpoint_publish().unwrap();
-        let mut drop_session = sys.new_session().unwrap();
+        let temp_dir = TempDir::new().unwrap();
+        let engine = lightweight_test_engine(&temp_dir, "redo_testsys_lightweight").await;
+        let table_id = create_table2_for_test(&engine).await;
+        let table = table_for_internal_assertion(&engine, table_id);
+        let root_lease = table.try_begin_checkpoint_root_mutation().unwrap();
+        let publish_lease = table.try_begin_checkpoint_publish().unwrap();
+        let mut drop_session = engine.new_session().unwrap();
         let drop_owner = LockOwner::Session(drop_session.id());
         let mut drop_fut = Box::pin(drop_session.drop_table(table_id));
         assert!(matches!(
@@ -6535,14 +6727,14 @@ fn test_drop_table_fails_waiting_session_table_lock() {
             std::task::Poll::Pending
         ));
         assert!(has_lock_entry(
-            &sys.engine,
+            &engine,
             drop_owner,
             LockResource::TableMetadata(table_id),
             LockMode::Exclusive,
             LockDebugEntryState::Granted,
         ));
 
-        let lock_session = sys.new_session().unwrap();
+        let lock_session = engine.new_session().unwrap();
         let lock_owner = LockOwner::Session(lock_session.id());
         let err = lock_session
             .lock_table(table_id, LockMode::Shared)
@@ -6550,7 +6742,7 @@ fn test_drop_table_fails_waiting_session_table_lock() {
             .unwrap_err();
         assert_eq!(err.operation_error(), Some(OperationError::TableDropping));
         assert!(!has_lock_resource(
-            &sys.engine,
+            &engine,
             lock_owner,
             LockResource::TableMetadata(table_id),
         ));
@@ -6559,12 +6751,12 @@ fn test_drop_table_fails_waiting_session_table_lock() {
         drop_fut.await.unwrap();
         drop(root_lease);
         assert!(!has_lock_resource(
-            &sys.engine,
+            &engine,
             lock_owner,
             LockResource::TableMetadata(table_id),
         ));
         assert!(!has_lock_resource(
-            &sys.engine,
+            &engine,
             lock_owner,
             LockResource::TableData(table_id),
         ));
@@ -6574,11 +6766,13 @@ fn test_drop_table_fails_waiting_session_table_lock() {
 #[test]
 fn test_drop_table_fails_waiting_transaction_table_lock() {
     smol::block_on(async {
-        let sys = TestSys::new_lightweight_evictable().await;
-        let table_id = sys.table.table_id();
-        let root_lease = sys.table.try_begin_checkpoint_root_mutation().unwrap();
-        let publish_lease = sys.table.try_begin_checkpoint_publish().unwrap();
-        let mut drop_session = sys.new_session().unwrap();
+        let temp_dir = TempDir::new().unwrap();
+        let engine = lightweight_test_engine(&temp_dir, "redo_testsys_lightweight").await;
+        let table_id = create_table2_for_test(&engine).await;
+        let table = table_for_internal_assertion(&engine, table_id);
+        let root_lease = table.try_begin_checkpoint_root_mutation().unwrap();
+        let publish_lease = table.try_begin_checkpoint_publish().unwrap();
+        let mut drop_session = engine.new_session().unwrap();
         let drop_owner = LockOwner::Session(drop_session.id());
         let mut drop_fut = Box::pin(drop_session.drop_table(table_id));
         assert!(matches!(
@@ -6586,14 +6780,14 @@ fn test_drop_table_fails_waiting_transaction_table_lock() {
             std::task::Poll::Pending
         ));
         assert!(has_lock_entry(
-            &sys.engine,
+            &engine,
             drop_owner,
             LockResource::TableMetadata(table_id),
             LockMode::Exclusive,
             LockDebugEntryState::Granted,
         ));
 
-        let mut lock_session = sys.new_session().unwrap();
+        let mut lock_session = engine.new_session().unwrap();
         let mut trx = lock_session.begin_trx().unwrap();
         let lock_owner = trx_tests::lock_owner(&trx).unwrap();
         let err = trx
@@ -6602,7 +6796,7 @@ fn test_drop_table_fails_waiting_transaction_table_lock() {
             .unwrap_err();
         assert_eq!(err.operation_error(), Some(OperationError::TableDropping));
         assert!(!has_lock_resource(
-            &sys.engine,
+            &engine,
             lock_owner,
             LockResource::TableMetadata(table_id),
         ));
@@ -6611,12 +6805,12 @@ fn test_drop_table_fails_waiting_transaction_table_lock() {
         drop_fut.await.unwrap();
         drop(root_lease);
         assert!(!has_lock_resource(
-            &sys.engine,
+            &engine,
             lock_owner,
             LockResource::TableMetadata(table_id),
         ));
         assert!(!has_lock_resource(
-            &sys.engine,
+            &engine,
             lock_owner,
             LockResource::TableData(table_id),
         ));
@@ -6628,12 +6822,13 @@ fn test_drop_table_fails_waiting_transaction_table_lock() {
 #[test]
 fn test_explicit_table_lock_after_drop_returns_not_found_without_locks() {
     smol::block_on(async {
-        let sys = TestSys::new_lightweight_evictable().await;
-        let table_id = sys.table.table_id();
-        let mut drop_session = sys.new_session().unwrap();
+        let temp_dir = TempDir::new().unwrap();
+        let engine = lightweight_test_engine(&temp_dir, "redo_testsys_lightweight").await;
+        let table_id = create_table2_for_test(&engine).await;
+        let mut drop_session = engine.new_session().unwrap();
         drop_session.drop_table(table_id).await.unwrap();
 
-        let lock_session = sys.new_session().unwrap();
+        let lock_session = engine.new_session().unwrap();
         let session_owner = LockOwner::Session(lock_session.id());
         let err = lock_session
             .lock_table(table_id, LockMode::Shared)
@@ -6641,17 +6836,17 @@ fn test_explicit_table_lock_after_drop_returns_not_found_without_locks() {
             .unwrap_err();
         assert_eq!(err.operation_error(), Some(OperationError::TableNotFound));
         assert!(!has_lock_resource(
-            &sys.engine,
+            &engine,
             session_owner,
             LockResource::TableMetadata(table_id),
         ));
         assert!(!has_lock_resource(
-            &sys.engine,
+            &engine,
             session_owner,
             LockResource::TableData(table_id),
         ));
 
-        let mut trx_session = sys.new_session().unwrap();
+        let mut trx_session = engine.new_session().unwrap();
         let mut trx = trx_session.begin_trx().unwrap();
         let trx_owner = trx_tests::lock_owner(&trx).unwrap();
         let err = trx
@@ -6660,12 +6855,12 @@ fn test_explicit_table_lock_after_drop_returns_not_found_without_locks() {
             .unwrap_err();
         assert_eq!(err.operation_error(), Some(OperationError::TableNotFound));
         assert!(!has_lock_resource(
-            &sys.engine,
+            &engine,
             trx_owner,
             LockResource::TableMetadata(table_id),
         ));
         assert!(!has_lock_resource(
-            &sys.engine,
+            &engine,
             trx_owner,
             LockResource::TableData(table_id),
         ));
@@ -6674,15 +6869,16 @@ fn test_explicit_table_lock_after_drop_returns_not_found_without_locks() {
 }
 
 #[test]
-fn test_drop_table_logical_cascade_and_stale_handles() {
+fn test_drop_table_logical_cascade() {
     smol::block_on(async {
-        let sys = TestSys::new_evictable_with_non_unique_name_index().await;
-        let table_id = sys.table.table_id();
-        let stale_table = Arc::clone(&sys.table);
-        let table_file_path = sys.engine.table_fs.user_table_file_path(table_id);
-        let mut session = sys.new_session().unwrap();
+        let temp_dir = TempDir::new().unwrap();
+        let engine =
+            evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys_non_unique").await;
+        let table_id = create_non_unique_name_table_for_test(&engine).await;
+        let table_file_path = engine.table_fs.user_table_file_path(table_id);
+        let mut session = engine.new_session().unwrap();
         insert_one_row(
-            &stale_table,
+            table_id,
             &mut session,
             vec![Val::from(1), Val::from("drop-me")],
         )
@@ -6697,25 +6893,24 @@ fn test_drop_table_logical_cascade_and_stale_handles() {
         assert!(std::path::Path::new(&table_file_path).exists());
         session.drop_table(table_id).await.unwrap();
 
-        assert_eq!(stale_table.lifecycle.state(), TableLifecycleState::Dropped);
         assert!(!has_lock_resource(
-            &sys.engine,
+            &engine,
             owner,
             LockResource::CatalogNamespace,
         ));
         assert!(!has_lock_resource(
-            &sys.engine,
+            &engine,
             owner,
             LockResource::TableMetadata(table_id),
         ));
         assert!(!has_lock_resource(
-            &sys.engine,
+            &engine,
             owner,
             LockResource::TableData(table_id),
         ));
-        assert!(sys.engine.catalog().get_table(table_id).await.is_none());
+        assert!(engine.catalog().get_table(table_id).await.is_none());
         assert!(
-            sys.engine
+            engine
                 .catalog()
                 .storage
                 .tables()
@@ -6725,7 +6920,7 @@ fn test_drop_table_logical_cascade_and_stale_handles() {
                 .is_none()
         );
         assert!(
-            sys.engine
+            engine
                 .catalog()
                 .storage
                 .columns()
@@ -6735,7 +6930,7 @@ fn test_drop_table_logical_cascade_and_stale_handles() {
                 .is_empty()
         );
         assert!(
-            sys.engine
+            engine
                 .catalog()
                 .storage
                 .indexes()
@@ -6745,7 +6940,7 @@ fn test_drop_table_logical_cascade_and_stale_handles() {
                 .is_empty()
         );
         assert!(
-            sys.engine
+            engine
                 .catalog()
                 .storage
                 .index_columns()
@@ -6755,7 +6950,7 @@ fn test_drop_table_logical_cascade_and_stale_handles() {
                 .is_empty()
         );
         assert!(
-            sys.engine
+            engine
                 .catalog()
                 .storage
                 .tables()
@@ -6765,7 +6960,7 @@ fn test_drop_table_logical_cascade_and_stale_handles() {
                 .is_some()
         );
         assert!(
-            !sys.engine
+            !engine
                 .catalog()
                 .storage
                 .columns()
@@ -6780,16 +6975,16 @@ fn test_drop_table_logical_cascade_and_stale_handles() {
         assert_eq!(err.operation_error(), Some(OperationError::TableNotFound));
 
         let mut stale_read = session.begin_trx().unwrap();
-        let err = trx_select_row_mvcc(&mut stale_read, &stale_table, &single_key(1), &[0, 1])
+        let err = trx_select_row_mvcc_by_id(&mut stale_read, table_id, &single_key(1), &[0, 1])
             .await
             .unwrap_err();
         assert_eq!(err.operation_error(), Some(OperationError::TableNotFound));
         assert_eq!(stale_read.commit().await.unwrap(), TrxID::new(0));
 
         let mut stale_write = session.begin_trx().unwrap();
-        let err = trx_insert_row(
+        let err = trx_insert_row_by_id(
             &mut stale_write,
-            &stale_table,
+            table_id,
             vec![Val::from(2), Val::from("blocked")],
         )
         .await
@@ -6808,7 +7003,7 @@ fn test_drop_table_logical_cascade_and_stale_handles() {
 }
 
 #[test]
-fn test_drop_table_gc_retries_stale_handle_and_deletes_file_after_catalog_checkpoint() {
+fn test_drop_table_gc_deletes_file_after_catalog_checkpoint() {
     smol::block_on(async {
         let temp_dir = TempDir::new().unwrap();
         let main_dir = temp_dir.path().to_path_buf();
@@ -6819,9 +7014,8 @@ fn test_drop_table_gc_retries_stale_handle_and_deletes_file_after_catalog_checkp
         let mut session = engine.new_session().unwrap();
         let (table_spec, index_specs) = drop_table_test_spec();
         let table_id = session.create_table(table_spec, index_specs).await.unwrap();
-        let stale_table = engine.catalog().get_table(table_id).await.unwrap();
         insert_one_row(
-            &stale_table,
+            table_id,
             &mut session,
             vec![Val::from(11), Val::from("gc-delete")],
         )
@@ -6835,32 +7029,33 @@ fn test_drop_table_gc_retries_stale_handle_and_deletes_file_after_catalog_checkp
             .checkpoint_now(&engine.trx_sys)
             .await
             .unwrap();
-        assert_path_remains_after_dropped_table_purge(&engine, &table_file_path, true).await;
-
-        drop(stale_table);
-        engine.trx_sys.request_dropped_table_purge();
-
-        engine
-            .catalog()
-            .checkpoint_now(&engine.trx_sys)
-            .await
-            .unwrap();
         wait_path_exists(&table_file_path, false).await;
+
+        let mut trx = session.begin_trx().unwrap();
+        let err = trx
+            .exec(async |stmt| {
+                stmt.table_lookup_unique_mvcc(table_id, &single_key(11), &[0, 1])
+                    .await
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(err.operation_error(), Some(OperationError::TableNotFound));
+        trx.rollback().await.unwrap();
     });
 }
 
 #[test]
 fn test_drop_table_catalog_cascade_poison_preserves_source_error() {
     smol::block_on(async {
-        let sys = TestSys::new_lightweight_evictable().await;
-        let table_id = sys.table.table_id();
-        let mut corrupt_session = sys.new_session().unwrap();
+        let temp_dir = TempDir::new().unwrap();
+        let engine = lightweight_test_engine(&temp_dir, "redo_testsys_lightweight").await;
+        let table_id = create_table2_for_test(&engine).await;
+        let mut corrupt_session = engine.new_session().unwrap();
         let mut corrupt_trx = corrupt_session.begin_trx().unwrap();
 
         corrupt_trx
             .exec(async |stmt| {
-                let deleted = sys
-                    .engine
+                let deleted = engine
                     .catalog()
                     .storage
                     .index_columns()
@@ -6879,7 +7074,7 @@ fn test_drop_table_catalog_cascade_poison_preserves_source_error() {
             .unwrap();
         corrupt_trx.commit().await.unwrap();
 
-        let mut drop_session = sys.new_session().unwrap();
+        let mut drop_session = engine.new_session().unwrap();
         let err = drop_session.drop_table(table_id).await.unwrap_err();
         let report = format!("{err:?}");
 
@@ -6903,7 +7098,7 @@ fn test_drop_table_catalog_cascade_poison_preserves_source_error() {
             "{report}"
         );
         assert!(
-            sys.engine
+            engine
                 .trx_sys
                 .storage_poison_error()
                 .as_ref()
@@ -6916,15 +7111,13 @@ fn test_drop_table_catalog_cascade_poison_preserves_source_error() {
 #[test]
 fn test_drop_table_commit_poison_preserves_source_error() {
     smol::block_on(async {
-        let sys = TestSys::new_lightweight_evictable().await;
-        let table_id = sys.table.table_id();
-        let redo_file_path = sys
-            ._temp_dir
-            .path()
-            .join("redo_testsys_lightweight.0.00000000");
+        let temp_dir = TempDir::new().unwrap();
+        let engine = lightweight_test_engine(&temp_dir, "redo_testsys_lightweight").await;
+        let table_id = create_table2_for_test(&engine).await;
+        let redo_file_path = temp_dir.path().join("redo_testsys_lightweight.0.00000000");
         let hook = Arc::new(FailingFirstWriteHook::new(redo_file_path));
         let _install = install_storage_backend_test_hook(hook.clone());
-        let mut session = sys.new_session().unwrap();
+        let mut session = engine.new_session().unwrap();
 
         let err = session.drop_table(table_id).await.unwrap_err();
         let report = format!("{err:?}");
@@ -6948,7 +7141,7 @@ fn test_drop_table_commit_poison_preserves_source_error() {
         assert!(report.contains("wait for redo group commit"), "{report}");
         assert!(report.contains("propagate from other threads"), "{report}");
         assert!(
-            sys.engine
+            engine
                 .trx_sys
                 .storage_poison_error()
                 .as_ref()
@@ -6961,43 +7154,45 @@ fn test_drop_table_commit_poison_preserves_source_error() {
 #[test]
 fn test_user_insert_commit_poison_rolls_back_session_before_return() {
     smol::block_on(async {
-        let sys = TestSys::new_lightweight_evictable().await;
-        let mut session = sys.new_session().unwrap();
-        sys.new_trx_insert(&mut session, vec![Val::from(1), Val::from("seed")])
-            .await;
-        let redo_file_path = sys
-            ._temp_dir
-            .path()
-            .join("redo_testsys_lightweight.0.00000000");
+        let temp_dir = TempDir::new().unwrap();
+        let engine = lightweight_test_engine(&temp_dir, "redo_testsys_lightweight").await;
+        let table_id = create_table2_for_test(&engine).await;
+        let mut session = engine.new_session().unwrap();
+        expect_insert_committed(
+            table_id,
+            &mut session,
+            vec![Val::from(1), Val::from("seed")],
+        )
+        .await;
+        let redo_file_path = temp_dir.path().join("redo_testsys_lightweight.0.00000000");
         let hook = Arc::new(FailingFirstWriteHook::new(redo_file_path));
         let _install = install_storage_backend_test_hook(hook.clone());
 
         let mut trx = session.begin_trx().unwrap();
-        trx = sys
-            .trx_insert(trx, vec![Val::from(169), Val::from("redo-fail")])
-            .await;
+        trx = expect_trx_insert(table_id, trx, vec![Val::from(169), Val::from("redo-fail")]).await;
         let err = trx.commit().await.unwrap_err();
         let report = format!("{err:?}");
 
         assert!(hook.call_count() > 0);
         assert!(report.contains("redo write failed"), "{report}");
         assert!(
-            sys.engine
+            engine
                 .trx_sys
                 .storage_poison_error()
                 .as_ref()
                 .is_some_and(|err| *err.current_context() == FatalError::RedoWrite)
         );
-        assert_eq!(sys.engine.session_registry.active_transaction_count(), 0);
+        assert_eq!(engine.session_registry.active_transaction_count(), 0);
     });
 }
 
 #[test]
 fn test_drop_table_waits_for_active_metadata_reader() {
     smol::block_on(async {
-        let sys = TestSys::new_lightweight_evictable().await;
-        let table_id = sys.table.table_id();
-        let mut reader_session = sys.new_session().unwrap();
+        let temp_dir = TempDir::new().unwrap();
+        let engine = lightweight_test_engine(&temp_dir, "redo_testsys_lightweight").await;
+        let table_id = create_table2_for_test(&engine).await;
+        let mut reader_session = engine.new_session().unwrap();
         let mut reader_trx = reader_session.begin_trx().unwrap();
         let (held_tx, held_rx) = flume::bounded(1);
         let (release_tx, release_rx) = flume::bounded(1);
@@ -7023,7 +7218,7 @@ fn test_drop_table_waits_for_active_metadata_reader() {
             ));
         }
 
-        let mut drop_session = sys.new_session().unwrap();
+        let mut drop_session = engine.new_session().unwrap();
         let mut drop_fut = Box::pin(drop_session.drop_table(table_id));
         assert!(matches!(
             futures::poll!(drop_fut.as_mut()),
@@ -7040,19 +7235,20 @@ fn test_drop_table_waits_for_active_metadata_reader() {
 #[test]
 fn test_drop_table_waits_for_active_table_writer() {
     smol::block_on(async {
-        let sys = TestSys::new_lightweight_evictable().await;
-        let table_id = sys.table.table_id();
-        let mut writer_session = sys.new_session().unwrap();
+        let temp_dir = TempDir::new().unwrap();
+        let engine = lightweight_test_engine(&temp_dir, "redo_testsys_lightweight").await;
+        let table_id = create_table2_for_test(&engine).await;
+        let mut writer_session = engine.new_session().unwrap();
         let mut writer_trx = writer_session.begin_trx().unwrap();
-        trx_insert_row(
+        trx_insert_row_by_id(
             &mut writer_trx,
-            &sys.table,
+            table_id,
             vec![Val::from(91), Val::from("writer")],
         )
         .await
         .unwrap();
 
-        let mut drop_session = sys.new_session().unwrap();
+        let mut drop_session = engine.new_session().unwrap();
         let mut drop_fut = Box::pin(drop_session.drop_table(table_id));
         assert!(matches!(
             futures::poll!(drop_fut.as_mut()),
@@ -7067,15 +7263,15 @@ fn test_drop_table_waits_for_active_table_writer() {
 #[test]
 fn test_catalog_checkpoint_scan_allows_runtime_removed_drop_table() {
     smol::block_on(async {
-        let sys = TestSys::new_lightweight_evictable().await;
-        let table_id = sys.table.table_id();
-        let mut session = sys.new_session().unwrap();
+        let temp_dir = TempDir::new().unwrap();
+        let engine = lightweight_test_engine(&temp_dir, "redo_testsys_lightweight").await;
+        let table_id = create_table2_for_test(&engine).await;
+        let mut session = engine.new_session().unwrap();
 
         session.drop_table(table_id).await.unwrap();
-        let batch = sys
-            .engine
+        let batch = engine
             .catalog()
-            .scan_checkpoint_batch(&sys.engine.trx_sys)
+            .scan_checkpoint_batch(&engine.trx_sys)
             .unwrap();
 
         assert_eq!(
@@ -7099,10 +7295,16 @@ fn test_drop_table_recovery_keeps_table_live_without_committed_drop() {
         let mut session = engine.new_session().unwrap();
         let (table_spec, index_specs) = drop_table_test_spec();
         let table_id = session.create_table(table_spec, index_specs).await.unwrap();
-        let table = engine.catalog().get_table(table_id).await.unwrap();
-        table.begin_drop_lifecycle().await.unwrap();
+        let table_for_internal_lifecycle = engine
+            .catalog()
+            .get_table_now(table_id)
+            .expect("created table should still be loaded");
+        table_for_internal_lifecycle
+            .begin_drop_lifecycle()
+            .await
+            .unwrap();
 
-        drop(table);
+        drop(table_for_internal_lifecycle);
         drop(session);
         drop(engine);
 
@@ -7153,7 +7355,7 @@ fn test_drop_table_recovery_replays_committed_drop_before_catalog_checkpoint() {
 }
 
 #[test]
-fn test_drop_table_catalog_checkpoint_cleans_absent_leftover_file_on_startup() {
+fn test_drop_table_catalog_checkpoint_cleans_absent_leftover_file() {
     smol::block_on(async {
         let temp_dir = TempDir::new().unwrap();
         let main_dir = temp_dir.path().to_path_buf();
@@ -7164,13 +7366,17 @@ fn test_drop_table_catalog_checkpoint_cleans_absent_leftover_file_on_startup() {
         let mut session = engine.new_session().unwrap();
         let (table_spec, index_specs) = drop_table_test_spec();
         let table_id = session.create_table(table_spec, index_specs).await.unwrap();
-        let table = engine.catalog().get_table(table_id).await.unwrap();
-        insert_one_row(
-            &table,
-            &mut session,
+        let mut trx = session.begin_trx().unwrap();
+        let insert = trx_insert_row_by_id(
+            &mut trx,
+            table_id,
             vec![Val::from(7), Val::from("checkpoint-covered")],
         )
         .await;
+        let Ok(_) = insert else {
+            panic!("insert should succeed: {insert:?}");
+        };
+        trx.commit().await.unwrap();
         let table_file_path = engine.table_fs.user_table_file_path(table_id);
 
         session.drop_table(table_id).await.unwrap();
@@ -7188,9 +7394,8 @@ fn test_drop_table_catalog_checkpoint_cleans_absent_leftover_file_on_startup() {
                 .catalog_replay_start_ts
                 > TrxID::new(1)
         );
-        assert!(std::path::Path::new(&table_file_path).exists());
+        wait_path_exists(&table_file_path, false).await;
 
-        drop(table);
         drop(session);
         drop(engine);
 
@@ -7199,7 +7404,7 @@ fn test_drop_table_catalog_checkpoint_cleans_absent_leftover_file_on_startup() {
             .await
             .unwrap();
         assert!(engine.catalog().get_table(table_id).await.is_none());
-        wait_path_exists(&table_file_path, false).await;
+        assert!(!std::path::Path::new(&table_file_path).exists());
     });
 }
 
@@ -7239,21 +7444,24 @@ fn test_recovery_cleans_post_replay_create_table_provisional_file() {
 #[test]
 fn test_checkpoint_publish_write_failure_poisons_storage() {
     smol::block_on(async {
-        let sys = TestSys::new_lightweight_evictable().await;
-        let mut session = sys.new_session().unwrap();
-        let root_before = sys.table.file().active_root_unchecked().clone();
-        wait_checkpoint_ready(&sys.table, &session).await;
-        let table_file_path = sys
-            .engine
-            .table_fs
-            .user_table_file_path(sys.table.table_id());
+        let temp_dir = TempDir::new().unwrap();
+        let engine = lightweight_test_engine(&temp_dir, "redo_testsys_lightweight").await;
+        let table_id = create_table2_for_test(&engine).await;
+        let mut session = engine.new_session().unwrap();
+        let table = table_for_internal_assertion(&engine, table_id);
+        let root_before = table.file().active_root_unchecked().clone();
+        wait_checkpoint_ready(table_id, &session).await;
+        let table_file_path = engine.table_fs.user_table_file_path(table_id);
         let hook = Arc::new(FailingFirstWriteHook::new(table_file_path));
         let _install = install_storage_backend_test_hook(hook.clone());
 
-        let err = sys.table.checkpoint(&mut session).await.unwrap_err();
-        assert_checkpoint_write_poisoned(&err, &sys);
+        let err = session.checkpoint_table(table_id).await.unwrap_err();
+        assert_checkpoint_write_poisoned(&err, &engine);
         assert!(hook.call_count() > 0);
-        assert_root_metadata_unchanged(&root_before, &sys.table);
+        assert_root_metadata_unchanged(
+            &root_before,
+            &table_for_internal_assertion(&engine, table_id),
+        );
         assert!(!session.in_trx().unwrap());
     });
 }
@@ -7261,18 +7469,21 @@ fn test_checkpoint_publish_write_failure_poisons_storage() {
 #[test]
 fn test_checkpoint_post_publication_failure_poisons_storage() {
     smol::block_on(async {
-        let sys = TestSys::new_lightweight_evictable().await;
-        let mut session = sys.new_session().unwrap();
-        let root_before = sys.table.file().active_root_unchecked().clone();
-        wait_checkpoint_ready(&sys.table, &session).await;
+        let temp_dir = TempDir::new().unwrap();
+        let engine = lightweight_test_engine(&temp_dir, "redo_testsys_lightweight").await;
+        let table_id = create_table2_for_test(&engine).await;
+        let mut session = engine.new_session().unwrap();
+        let table = table_for_internal_assertion(&engine, table_id);
+        let root_before = table.file().active_root_unchecked().clone();
+        wait_checkpoint_ready(table_id, &session).await;
 
         set_test_force_post_publish_checkpoint_error(true);
-        let res = sys.table.checkpoint(&mut session).await;
+        let res = session.checkpoint_table(table_id).await;
         set_test_force_post_publish_checkpoint_error(false);
 
         let err = res.unwrap_err();
-        assert_checkpoint_write_poisoned(&err, &sys);
-        assert!(sys.table.file().active_root_unchecked().root_ts > root_before.root_ts);
+        assert_checkpoint_write_poisoned(&err, &engine);
+        assert!(table.file().active_root_unchecked().root_ts > root_before.root_ts);
         assert!(!session.in_trx().unwrap());
     });
 }
@@ -7280,13 +7491,18 @@ fn test_checkpoint_post_publication_failure_poisons_storage() {
 #[test]
 fn test_checkpoint_readiness_ready_when_effective_ts_crossed_gc_horizon() {
     smol::block_on(async {
-        let sys = TestSys::new_evictable().await;
-        let session = sys.new_session().unwrap();
-        let root = sys.table.file().active_root_unchecked();
+        let temp_dir = TempDir::new().unwrap();
+        let engine = evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys").await;
+        let table_id = create_table2_for_test(&engine).await;
+        let session = engine.new_session().unwrap();
+        let root = table_for_internal_assertion(&engine, table_id)
+            .file()
+            .active_root_unchecked()
+            .clone();
         let effective_ts = root.effective_ts();
         wait_gc_cutoff_after(&session, effective_ts).await;
         assert!(matches!(
-            sys.table.checkpoint_readiness(&session).unwrap(),
+            session.table_checkpoint_readiness(table_id).unwrap(),
             CheckpointReadiness::Ready
         ));
     });
@@ -7295,32 +7511,84 @@ fn test_checkpoint_readiness_ready_when_effective_ts_crossed_gc_horizon() {
 #[test]
 fn test_checkpoint_readiness_returns_error_after_session_close() {
     smol::block_on(async {
-        let sys = TestSys::new_evictable().await;
-        let mut session = sys.new_session().unwrap();
+        let temp_dir = TempDir::new().unwrap();
+        let engine = evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys").await;
+        let table_id = create_table2_for_test(&engine).await;
+        let mut session = engine.new_session().unwrap();
 
         session.close().await.unwrap();
 
-        let err = sys.table.checkpoint_readiness(&session).unwrap_err();
+        let err = session.table_checkpoint_readiness(table_id).unwrap_err();
         assert_eq!(err.kind(), ErrorKind::Operation);
         assert_eq!(err.operation_error(), Some(OperationError::NotSupported));
     });
 }
 
 #[test]
+fn test_checkpoint_readiness_reports_missing_and_non_live_tables() {
+    smol::block_on(async {
+        let temp_dir = TempDir::new().unwrap();
+        let engine = lightweight_test_engine(&temp_dir, "redo_testsys_lightweight").await;
+        let table_id = create_table2_for_test(&engine).await;
+        let session = engine.new_session().unwrap();
+
+        assert_eq!(
+            session.table_checkpoint_readiness(table_id + 1000).unwrap(),
+            CheckpointReadiness::TableNotFound
+        );
+
+        let _ = session.table_checkpoint_readiness(table_id).unwrap();
+        let table = table_for_internal_assertion(&engine, table_id);
+        table.begin_drop_lifecycle().await.unwrap();
+
+        assert_eq!(
+            session.table_checkpoint_readiness(table_id).unwrap(),
+            CheckpointReadiness::TableDropping
+        );
+        let uncached_session = engine.new_session().unwrap();
+        assert_eq!(
+            uncached_session
+                .table_checkpoint_readiness(table_id)
+                .unwrap(),
+            CheckpointReadiness::TableDropping
+        );
+
+        table.mark_dropped_lifecycle().unwrap();
+
+        assert_eq!(
+            session.table_checkpoint_readiness(table_id).unwrap(),
+            CheckpointReadiness::TableNotFound
+        );
+        let uncached_session = engine.new_session().unwrap();
+        assert_eq!(
+            uncached_session
+                .table_checkpoint_readiness(table_id)
+                .unwrap(),
+            CheckpointReadiness::TableNotFound
+        );
+    });
+}
+
+#[test]
 fn test_checkpoint_readiness_delayed_reports_effective_ts_and_horizon() {
     smol::block_on(async {
-        let sys = TestSys::new_evictable().await;
-        let mut session = sys.new_session().unwrap();
-        insert_rows(&sys, &mut session, 0, 120, "readiness-delay").await;
+        let temp_dir = TempDir::new().unwrap();
+        let engine = evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys").await;
+        let table_id = create_table2_for_test(&engine).await;
+        let mut session = engine.new_session().unwrap();
+        insert_rows(table_id, &mut session, 0, 120, "readiness-delay").await;
 
-        sys.table.freeze(&session, usize::MAX).await.unwrap();
-        let mut reader_session = sys.new_session().unwrap();
+        session.freeze_table(table_id, usize::MAX).await.unwrap();
+        let mut reader_session = engine.new_session().unwrap();
         let reader = reader_session.begin_trx().unwrap();
-        checkpoint_published(&sys.table, &mut session).await;
+        checkpoint_published(table_id, &mut session).await;
 
-        let active_root = sys.table.file().active_root_unchecked();
+        let active_root = table_for_internal_assertion(&engine, table_id)
+            .file()
+            .active_root_unchecked()
+            .clone();
         let active_root_effective_ts = active_root.effective_ts();
-        let readiness = sys.table.checkpoint_readiness(&session).unwrap();
+        let readiness = session.table_checkpoint_readiness(table_id).unwrap();
         let CheckpointReadiness::Delayed { reason } = readiness else {
             panic!("expected delayed checkpoint readiness, got {readiness:?}");
         };
@@ -7331,7 +7599,7 @@ fn test_checkpoint_readiness_delayed_reports_effective_ts_and_horizon() {
         reader.commit().await.unwrap();
         wait_gc_cutoff_after(&session, active_root_effective_ts).await;
         assert!(matches!(
-            sys.table.checkpoint_readiness(&session).unwrap(),
+            session.table_checkpoint_readiness(table_id).unwrap(),
             CheckpointReadiness::Ready
         ));
     });
@@ -7340,17 +7608,19 @@ fn test_checkpoint_readiness_delayed_reports_effective_ts_and_horizon() {
 #[test]
 fn test_checkpoint_readiness_uses_root_effective_ts_not_checkpoint_start_ts() {
     smol::block_on(async {
-        let sys = TestSys::new_evictable().await;
-        let mut session = sys.new_session().unwrap();
-        insert_rows(&sys, &mut session, 0, 120, "effective-delay").await;
+        let temp_dir = TempDir::new().unwrap();
+        let engine = evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys").await;
+        let table_id = create_table2_for_test(&engine).await;
+        let mut session = engine.new_session().unwrap();
+        insert_rows(table_id, &mut session, 0, 120, "effective-delay").await;
 
-        sys.table.freeze(&session, usize::MAX).await.unwrap();
+        session.freeze_table(table_id, usize::MAX).await.unwrap();
         let reader_holder: Rc<RefCell<Option<(Session, Transaction)>>> =
             Rc::new(RefCell::new(None));
         let reader_sts = Rc::new(Cell::new(TrxID::new(0)));
         let hook_reader_holder = Rc::clone(&reader_holder);
         let hook_reader_sts = Rc::clone(&reader_sts);
-        let hook_engine = sys.engine.new_ref().unwrap();
+        let hook_engine = engine.new_ref().unwrap();
         set_test_checkpoint_after_trx_start_hook(move || async move {
             let mut reader_session = hook_engine.new_session().unwrap();
             let reader = reader_session.begin_trx().unwrap();
@@ -7358,13 +7628,16 @@ fn test_checkpoint_readiness_uses_root_effective_ts_not_checkpoint_start_ts() {
             *hook_reader_holder.borrow_mut() = Some((reader_session, reader));
         });
 
-        let checkpoint_ts = checkpoint_published(&sys.table, &mut session).await;
-        let active_root = sys.table.file().active_root_unchecked();
+        let checkpoint_ts = checkpoint_published(table_id, &mut session).await;
+        let active_root = table_for_internal_assertion(&engine, table_id)
+            .file()
+            .active_root_unchecked()
+            .clone();
         let effective_ts = active_root.effective_ts();
         assert!(checkpoint_ts < reader_sts.get());
         assert!(effective_ts > reader_sts.get());
 
-        let readiness = sys.table.checkpoint_readiness(&session).unwrap();
+        let readiness = session.table_checkpoint_readiness(table_id).unwrap();
         let CheckpointReadiness::Delayed { reason } = readiness else {
             panic!("expected effective timestamp delay, got {readiness:?}");
         };
@@ -7380,7 +7653,9 @@ fn test_checkpoint_readiness_uses_root_effective_ts_not_checkpoint_start_ts() {
             .exec(async |stmt| {
                 let (rt, effects) = stmt_tests::runtime_and_effects_mut(stmt);
                 let proof = rt.read_proof();
-                let snapshot = sys.table.root_snapshot(&proof).unwrap();
+                let snapshot = table_for_internal_assertion(&engine, table_id)
+                    .root_snapshot(&proof)
+                    .unwrap();
                 let _effects_addr = effects as *mut _;
                 assert!(snapshot.root_ts() < rt.sts());
                 assert_eq!(snapshot.effective_ts(), effective_ts);
@@ -7392,7 +7667,7 @@ fn test_checkpoint_readiness_uses_root_effective_ts_not_checkpoint_start_ts() {
         reader.commit().await.unwrap();
         wait_gc_cutoff_after(&session, effective_ts).await;
         assert!(matches!(
-            sys.table.checkpoint_readiness(&session).unwrap(),
+            session.table_checkpoint_readiness(table_id).unwrap(),
             CheckpointReadiness::Ready
         ));
     });
@@ -7401,27 +7676,32 @@ fn test_checkpoint_readiness_uses_root_effective_ts_not_checkpoint_start_ts() {
 #[test]
 fn test_checkpoint_requires_idle_session_before_delayed_outcome() {
     smol::block_on(async {
-        let sys = TestSys::new_evictable().await;
-        let mut session = sys.new_session().unwrap();
-        insert_rows(&sys, &mut session, 0, 120, "idle-before-delay").await;
+        let temp_dir = TempDir::new().unwrap();
+        let engine = evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys").await;
+        let table_id = create_table2_for_test(&engine).await;
+        let mut session = engine.new_session().unwrap();
+        insert_rows(table_id, &mut session, 0, 120, "idle-before-delay").await;
 
-        sys.table.freeze(&session, usize::MAX).await.unwrap();
-        let mut reader_session = sys.new_session().unwrap();
+        session.freeze_table(table_id, usize::MAX).await.unwrap();
+        let mut reader_session = engine.new_session().unwrap();
         let reader = reader_session.begin_trx().unwrap();
-        let first_checkpoint_ts = checkpoint_published(&sys.table, &mut session).await;
+        let first_checkpoint_ts = checkpoint_published(table_id, &mut session).await;
         assert_eq!(
-            sys.table.file().active_root_unchecked().root_ts,
+            table_for_internal_assertion(&engine, table_id)
+                .file()
+                .active_root_unchecked()
+                .root_ts,
             first_checkpoint_ts
         );
 
         let checkpoint_trx = session.begin_trx().unwrap();
         assert!(session.in_trx().unwrap());
         assert!(matches!(
-            sys.table.checkpoint_readiness(&session).unwrap(),
+            session.table_checkpoint_readiness(table_id).unwrap(),
             CheckpointReadiness::Delayed { .. }
         ));
 
-        let err = sys.table.checkpoint(&mut session).await.unwrap_err();
+        let err = session.checkpoint_table(table_id).await.unwrap_err();
         assert_eq!(err.operation_error(), Some(OperationError::NotSupported));
         assert!(format!("{err:?}").contains("checkpoint requires idle session"));
         assert!(session.in_trx().unwrap());
@@ -7435,38 +7715,39 @@ fn test_checkpoint_requires_idle_session_before_delayed_outcome() {
 #[test]
 fn test_checkpoint_delayed_preserves_root_and_frozen_pages_until_ready() {
     smol::block_on(async {
-        let sys = TestSys::new_evictable().await;
-        let mut session = sys.new_session().unwrap();
-        insert_rows(&sys, &mut session, 0, 120, "delayed-root").await;
+        let temp_dir = TempDir::new().unwrap();
+        let engine = evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys").await;
+        let table_id = create_table2_for_test(&engine).await;
+        let mut session = engine.new_session().unwrap();
+        insert_rows(table_id, &mut session, 0, 120, "delayed-root").await;
 
-        sys.table.freeze(&session, usize::MAX).await.unwrap();
-        let mut reader_session = sys.new_session().unwrap();
+        session.freeze_table(table_id, usize::MAX).await.unwrap();
+        let mut reader_session = engine.new_session().unwrap();
         let reader = reader_session.begin_trx().unwrap();
-        checkpoint_published(&sys.table, &mut session).await;
-        let root_after_first = sys.table.file().active_root_unchecked();
+        checkpoint_published(table_id, &mut session).await;
+        let table = table_for_internal_assertion(&engine, table_id);
+        let root_after_first = table.file().active_root_unchecked().clone();
         let effective_ts_protected_by_reader = root_after_first.effective_ts();
 
-        insert_rows(&sys, &mut session, 1_000, 80, "delayed-frozen").await;
-        sys.table.freeze(&session, usize::MAX).await.unwrap();
-        let (frozen_pages, _) = sys
-            .table
+        insert_rows(table_id, &mut session, 1_000, 80, "delayed-frozen").await;
+        session.freeze_table(table_id, usize::MAX).await.unwrap();
+        let (frozen_pages, _) = table
             .collect_frozen_pages(&session.pool_guards())
             .await
             .unwrap();
         assert!(!frozen_pages.is_empty());
         let first_frozen_page = frozen_pages[0].page_id;
-        let root_before_delay = sys.table.file().active_root_unchecked().clone();
+        let root_before_delay = table.file().active_root_unchecked().clone();
 
-        let outcome = sys.table.checkpoint(&mut session).await.unwrap();
+        let outcome = session.checkpoint_table(table_id).await.unwrap();
         let CheckpointOutcome::Delayed { reason } = outcome else {
             panic!("expected delayed checkpoint, got {outcome:?}");
         };
         assert_eq!(reason.effective_ts, effective_ts_protected_by_reader);
         assert_eq!(reason.min_active_sts, reader.sts());
-        assert_root_metadata_unchanged(&root_before_delay, &sys.table);
+        assert_root_metadata_unchanged(&root_before_delay, &table);
 
-        let page_guard = sys
-            .table
+        let page_guard = table
             .mem
             .must_get_row_page_shared(&session.pool_guards(), first_frozen_page)
             .await
@@ -7474,8 +7755,7 @@ fn test_checkpoint_delayed_preserves_root_and_frozen_pages_until_ready() {
         let (ctx, _) = page_guard.ctx_and_page();
         assert_eq!(ctx.row_ver().unwrap().state(), RowPageState::Frozen);
         drop(page_guard);
-        let (still_frozen_pages, _) = sys
-            .table
+        let (still_frozen_pages, _) = table
             .collect_frozen_pages(&session.pool_guards())
             .await
             .unwrap();
@@ -7483,8 +7763,8 @@ fn test_checkpoint_delayed_preserves_root_and_frozen_pages_until_ready() {
 
         reader.commit().await.unwrap();
         wait_gc_cutoff_after(&session, effective_ts_protected_by_reader).await;
-        let checkpoint_ts = checkpoint_published(&sys.table, &mut session).await;
-        let root_after_publish = sys.table.file().active_root_unchecked();
+        let checkpoint_ts = checkpoint_published(table_id, &mut session).await;
+        let root_after_publish = table.file().active_root_unchecked().clone();
         assert_eq!(root_after_publish.root_ts, checkpoint_ts);
         assert!(root_after_publish.pivot_row_id > root_before_delay.pivot_row_id);
     });
@@ -7493,32 +7773,41 @@ fn test_checkpoint_delayed_preserves_root_and_frozen_pages_until_ready() {
 #[test]
 fn test_second_checkpoint_waits_for_previous_root_horizon() {
     smol::block_on(async {
-        let sys = TestSys::new_evictable().await;
-        let mut session = sys.new_session().unwrap();
-        insert_rows(&sys, &mut session, 0, 120, "second-delay").await;
+        let temp_dir = TempDir::new().unwrap();
+        let engine = evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys").await;
+        let table_id = create_table2_for_test(&engine).await;
+        let mut session = engine.new_session().unwrap();
+        insert_rows(table_id, &mut session, 0, 120, "second-delay").await;
 
-        sys.table.freeze(&session, usize::MAX).await.unwrap();
-        let mut reader_session = sys.new_session().unwrap();
+        session.freeze_table(table_id, usize::MAX).await.unwrap();
+        let mut reader_session = engine.new_session().unwrap();
         let reader = reader_session.begin_trx().unwrap();
-        let first_checkpoint_ts = checkpoint_published(&sys.table, &mut session).await;
-        let first_effective_ts = sys.table.file().active_root_unchecked().effective_ts();
-        assert_eq!(
-            sys.table.file().active_root_unchecked().root_ts,
-            first_checkpoint_ts
-        );
+        let first_checkpoint_ts = checkpoint_published(table_id, &mut session).await;
+        let first_root = table_for_internal_assertion(&engine, table_id)
+            .file()
+            .active_root_unchecked()
+            .clone();
+        let first_effective_ts = first_root.effective_ts();
+        assert_eq!(first_root.root_ts, first_checkpoint_ts);
 
-        let root_before_second = sys.table.file().active_root_unchecked().clone();
-        let outcome = sys.table.checkpoint(&mut session).await.unwrap();
+        let root_before_second = table_for_internal_assertion(&engine, table_id)
+            .file()
+            .active_root_unchecked()
+            .clone();
+        let outcome = session.checkpoint_table(table_id).await.unwrap();
         let CheckpointOutcome::Delayed { reason } = outcome else {
             panic!("expected second checkpoint to wait, got {outcome:?}");
         };
         assert_eq!(reason.effective_ts, first_effective_ts);
         assert_eq!(reason.min_active_sts, reader.sts());
-        assert_root_metadata_unchanged(&root_before_second, &sys.table);
+        assert_root_metadata_unchanged(
+            &root_before_second,
+            &table_for_internal_assertion(&engine, table_id),
+        );
 
         reader.commit().await.unwrap();
         wait_gc_cutoff_after(&session, first_effective_ts).await;
-        let second_checkpoint_ts = checkpoint_published(&sys.table, &mut session).await;
+        let second_checkpoint_ts = checkpoint_published(table_id, &mut session).await;
         assert!(second_checkpoint_ts > first_checkpoint_ts);
     });
 }
@@ -7526,19 +7815,27 @@ fn test_second_checkpoint_waits_for_previous_root_horizon() {
 #[test]
 fn test_checkpoint_reachability_reclaims_obsolete_column_index_root() {
     smol::block_on(async {
-        let sys = TestSys::new_evictable().await;
-        let mut session = sys.new_session().unwrap();
-        insert_rows(&sys, &mut session, 0, 120, "reachability-first").await;
-        sys.table.freeze(&session, usize::MAX).await.unwrap();
-        checkpoint_published(&sys.table, &mut session).await;
-        let first_root = sys.table.file().active_root_unchecked().clone();
+        let temp_dir = TempDir::new().unwrap();
+        let engine = evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys").await;
+        let table_id = create_table2_for_test(&engine).await;
+        let mut session = engine.new_session().unwrap();
+        insert_rows(table_id, &mut session, 0, 120, "reachability-first").await;
+        session.freeze_table(table_id, usize::MAX).await.unwrap();
+        checkpoint_published(table_id, &mut session).await;
+        let first_root = table_for_internal_assertion(&engine, table_id)
+            .file()
+            .active_root_unchecked()
+            .clone();
         let first_column_root = first_root.column_block_index_root;
         assert_ne!(first_column_root, SUPER_BLOCK_ID);
 
-        insert_rows(&sys, &mut session, 1_000, 120, "reachability-second").await;
-        sys.table.freeze(&session, usize::MAX).await.unwrap();
-        checkpoint_published(&sys.table, &mut session).await;
-        let second_root = sys.table.file().active_root_unchecked().clone();
+        insert_rows(table_id, &mut session, 1_000, 120, "reachability-second").await;
+        session.freeze_table(table_id, usize::MAX).await.unwrap();
+        checkpoint_published(table_id, &mut session).await;
+        let second_root = table_for_internal_assertion(&engine, table_id)
+            .file()
+            .active_root_unchecked()
+            .clone();
         assert_ne!(second_root.column_block_index_root, first_column_root);
         assert!(
             second_root
@@ -7548,8 +7845,11 @@ fn test_checkpoint_reachability_reclaims_obsolete_column_index_root() {
         );
 
         wait_gc_cutoff_after(&session, second_root.effective_ts()).await;
-        checkpoint_published(&sys.table, &mut session).await;
-        let reclaimed_root = sys.table.file().active_root_unchecked();
+        checkpoint_published(table_id, &mut session).await;
+        let reclaimed_root = table_for_internal_assertion(&engine, table_id)
+            .file()
+            .active_root_unchecked()
+            .clone();
         assert_ne!(reclaimed_root.column_block_index_root, first_column_root);
         if reclaimed_root
             .alloc_map
@@ -7572,32 +7872,43 @@ fn test_checkpoint_reachability_reclaims_obsolete_column_index_root() {
 #[test]
 fn test_checkpoint_rechecks_readiness_after_root_mutation_lease() {
     smol::block_on(async {
-        let sys = TestSys::new_lightweight_evictable().await;
-        let mut checkpoint_session = sys.new_session().unwrap();
-        let root_before = sys.table.file().active_root_unchecked().clone();
+        let temp_dir = TempDir::new().unwrap();
+        let engine = lightweight_test_engine(&temp_dir, "redo_testsys_lightweight").await;
+        let table_id = create_table2_for_test(&engine).await;
+        let mut checkpoint_session = engine.new_session().unwrap();
+        let root_before = table_for_internal_assertion(&engine, table_id)
+            .file()
+            .active_root_unchecked()
+            .clone();
         wait_gc_cutoff_after(&checkpoint_session, root_before.effective_ts()).await;
 
-        let mut reader_session = sys.new_session().unwrap();
+        let mut reader_session = engine.new_session().unwrap();
         let reader = reader_session.begin_trx().unwrap();
         assert!(matches!(
-            sys.table.checkpoint_readiness(&checkpoint_session).unwrap(),
+            checkpoint_session
+                .table_checkpoint_readiness(table_id)
+                .unwrap(),
             CheckpointReadiness::Ready
         ));
 
-        let hook_table = Arc::clone(&sys.table);
-        let hook_engine = sys.engine.new_ref().unwrap();
+        let hook_table = table_for_internal_assertion(&engine, table_id);
+        let hook_engine = engine.new_ref().unwrap();
         let root_before_trx = root_before.root_ts;
         set_test_checkpoint_after_readiness_hook(move || async move {
             let mut competing_session = hook_engine.new_session().unwrap();
-            let checkpoint_ts = checkpoint_published(&hook_table, &mut competing_session).await;
+            let checkpoint_ts =
+                checkpoint_published(hook_table.table_id(), &mut competing_session).await;
             assert!(checkpoint_ts > root_before_trx);
         });
 
-        let outcome = sys.table.checkpoint(&mut checkpoint_session).await.unwrap();
+        let outcome = checkpoint_session.checkpoint_table(table_id).await.unwrap();
         let CheckpointOutcome::Delayed { reason } = outcome else {
             panic!("expected post-lease readiness delay, got {outcome:?}");
         };
-        let root_after = sys.table.file().active_root_unchecked();
+        let root_after = table_for_internal_assertion(&engine, table_id)
+            .file()
+            .active_root_unchecked()
+            .clone();
         assert!(root_after.root_ts > root_before.root_ts);
         assert_eq!(reason.effective_ts, root_after.effective_ts());
         assert_eq!(reason.min_active_sts, reader.sts());
@@ -7607,36 +7918,89 @@ fn test_checkpoint_rechecks_readiness_after_root_mutation_lease() {
 }
 
 #[test]
+fn test_concurrent_checkpoint_table_returns_in_progress_cancellation() {
+    smol::block_on(async {
+        let temp_dir = TempDir::new().unwrap();
+        let engine = lightweight_test_engine(&temp_dir, "redo_testsys_lightweight").await;
+        let table_id = create_table2_for_test(&engine).await;
+        let mut first_session = engine.new_session().unwrap();
+        wait_checkpoint_ready(table_id, &first_session).await;
+
+        let (entered_tx, entered_rx) = flume::bounded(1);
+        let (release_tx, release_rx) = flume::bounded(1);
+        set_test_checkpoint_after_trx_start_hook(move || async move {
+            entered_tx.send_async(()).await.unwrap();
+            release_rx.recv_async().await.unwrap();
+        });
+
+        let first_outcome = {
+            let first_checkpoint = first_session.checkpoint_table(table_id).fuse();
+            futures::pin_mut!(first_checkpoint);
+            let checkpoint_entered = entered_rx.recv_async().fuse();
+            futures::pin_mut!(checkpoint_entered);
+            futures::select! {
+                res = first_checkpoint => {
+                    panic!("first checkpoint completed before the concurrency hook: {res:?}");
+                }
+                res = checkpoint_entered => {
+                    res.unwrap();
+                }
+            }
+
+            let mut second_session = engine.new_session().unwrap();
+            let outcome = second_session.checkpoint_table(table_id).await.unwrap();
+            assert_eq!(
+                outcome,
+                CheckpointOutcome::Cancelled {
+                    reason: CheckpointCancelReason::CheckpointInProgress,
+                }
+            );
+            assert!(!second_session.in_trx().unwrap());
+
+            release_tx.send_async(()).await.unwrap();
+            first_checkpoint.await.unwrap()
+        };
+        assert!(
+            matches!(first_outcome, CheckpointOutcome::Published { .. }),
+            "first checkpoint should publish after the competing checkpoint cancels: {first_outcome:?}"
+        );
+        assert!(!first_session.in_trx().unwrap());
+    });
+}
+
+#[test]
 fn test_checkpoint_snapshot_consistency() {
     smol::block_on(async {
-        let sys = TestSys::new_evictable().await;
-        let mut session = sys.new_session().unwrap();
+        let temp_dir = TempDir::new().unwrap();
+        let engine = evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys").await;
+        let table_id = create_table2_for_test(&engine).await;
+        let mut session = engine.new_session().unwrap();
         let name = "y".repeat(256);
-        insert_rows(&sys, &mut session, 0, 120, &name).await;
+        insert_rows(table_id, &mut session, 0, 120, &name).await;
 
-        sys.table.freeze(&session, 1).await.unwrap();
+        session.freeze_table(table_id, 1).await.unwrap();
 
         let mut read_trx = session.begin_trx().unwrap();
         {
             let key = SelectKey::new(0, vec![Val::from(1)]);
-            let res = trx_select_row_mvcc(&mut read_trx, &sys.table, &key, &[0, 1]).await;
+            let res = trx_select_row_mvcc_by_id(&mut read_trx, table_id, &key, &[0, 1]).await;
             assert!(matches!(res, Ok(SelectMvcc::Found(_))));
         }
 
-        let mut write_session = sys.new_session().unwrap();
+        let mut write_session = engine.new_session().unwrap();
         let mut write_trx = write_session.begin_trx().unwrap();
         {
             let insert = vec![Val::from(10_000i32), Val::from("new")];
-            let res = trx_insert_row(&mut write_trx, &sys.table, insert).await;
+            let res = trx_insert_row_by_id(&mut write_trx, table_id, insert).await;
             assert!(res.is_ok());
         }
 
-        let mut checkpoint_session = sys.new_session().unwrap();
-        checkpoint_published(&sys.table, &mut checkpoint_session).await;
+        let mut checkpoint_session = engine.new_session().unwrap();
+        checkpoint_published(table_id, &mut checkpoint_session).await;
 
         {
             let key = SelectKey::new(0, vec![Val::from(10_000i32)]);
-            let res = trx_select_row_mvcc(&mut read_trx, &sys.table, &key, &[0, 1]).await;
+            let res = trx_select_row_mvcc_by_id(&mut read_trx, table_id, &key, &[0, 1]).await;
             assert!(matches!(res, Ok(SelectMvcc::NotFound)));
         }
 
@@ -7648,20 +8012,24 @@ fn test_checkpoint_snapshot_consistency() {
 #[test]
 fn test_checkpoint_old_root_released_after_active_reader_purged() {
     smol::block_on(async {
-        let sys = TestSys::new_evictable().await;
-        let mut session = sys.new_session().unwrap();
+        let temp_dir = TempDir::new().unwrap();
+        let engine = evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys").await;
+        let table_id = create_table2_for_test(&engine).await;
+        let mut session = engine.new_session().unwrap();
         let name = "retained-root".repeat(64);
-        insert_rows(&sys, &mut session, 0, 120, &name).await;
+        insert_rows(table_id, &mut session, 0, 120, &name).await;
 
-        sys.table.freeze(&session, usize::MAX).await.unwrap();
-        let retained_root_ptr = sys.table.file().active_root_unchecked() as *const _ as usize;
+        session.freeze_table(table_id, usize::MAX).await.unwrap();
+        let retained_root_ptr = table_for_internal_assertion(&engine, table_id)
+            .file()
+            .active_root_unchecked() as *const _ as usize;
         let drop_count_before = old_root_drop_count(retained_root_ptr);
 
-        let mut read_session = sys.new_session().unwrap();
+        let mut read_session = engine.new_session().unwrap();
         let read_trx = read_session.begin_trx().unwrap();
 
-        let mut checkpoint_session = sys.new_session().unwrap();
-        checkpoint_published(&sys.table, &mut checkpoint_session).await;
+        let mut checkpoint_session = engine.new_session().unwrap();
+        checkpoint_published(table_id, &mut checkpoint_session).await;
 
         assert_eq!(
             old_root_drop_count(retained_root_ptr),
@@ -7670,7 +8038,8 @@ fn test_checkpoint_old_root_released_after_active_reader_purged() {
         );
 
         read_trx.commit().await.unwrap();
-        sys.new_trx_insert(
+        expect_insert_committed(
+            table_id,
             &mut session,
             vec![Val::from(50_000i32), Val::from("after-retention-reader")],
         )
@@ -7692,19 +8061,22 @@ fn test_checkpoint_old_root_released_after_active_reader_purged() {
 #[test]
 fn test_checkpoint_persistence_recovery() {
     smol::block_on(async {
-        let sys = TestSys::new_evictable().await;
-        let TestSys {
-            engine,
-            table,
-            _temp_dir,
-        } = sys;
-        let table_id = table.table_id();
+        let temp_dir = TempDir::new().unwrap();
+        let engine = evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys").await;
+        let table_id = create_table2_for_test(&engine).await;
+        let table = engine
+            .catalog()
+            .get_table_now(table_id)
+            .expect("test table should exist");
         let mut session = engine.new_session().unwrap();
         let name = "z".repeat(512);
-        insert_rows_direct(&table, &mut session, 0, 150, &name).await;
+        insert_rows_direct(table_id, &mut session, 0, 150, &name).await;
 
-        table.freeze(&session, usize::MAX).await.unwrap();
-        checkpoint_published(&table, &mut session).await;
+        session
+            .freeze_table(table.table_id(), usize::MAX)
+            .await
+            .unwrap();
+        checkpoint_published(table.table_id(), &mut session).await;
 
         let root_before = table.file().active_root_unchecked().clone();
         drop(table);
@@ -7730,14 +8102,22 @@ fn test_checkpoint_persistence_recovery() {
 #[test]
 fn test_checkpoint_heartbeat() {
     smol::block_on(async {
-        let sys = TestSys::new_evictable().await;
-        let mut session = sys.new_session().unwrap();
+        let temp_dir = TempDir::new().unwrap();
+        let engine = evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys").await;
+        let table_id = create_table2_for_test(&engine).await;
+        let mut session = engine.new_session().unwrap();
         let name = "h".repeat(128);
-        insert_rows(&sys, &mut session, 0, 40, &name).await;
+        insert_rows(table_id, &mut session, 0, 40, &name).await;
 
-        let root_before = sys.table.file().active_root_unchecked().clone();
-        checkpoint_published(&sys.table, &mut session).await;
-        let root_after = sys.table.file().active_root_unchecked();
+        let root_before = table_for_internal_assertion(&engine, table_id)
+            .file()
+            .active_root_unchecked()
+            .clone();
+        checkpoint_published(table_id, &mut session).await;
+        let root_after = table_for_internal_assertion(&engine, table_id)
+            .file()
+            .active_root_unchecked()
+            .clone();
 
         assert_eq!(root_after.pivot_row_id, root_before.pivot_row_id);
         assert!(root_after.heap_redo_start_ts > root_before.heap_redo_start_ts);
@@ -7752,19 +8132,21 @@ fn test_checkpoint_heartbeat() {
 #[test]
 fn test_checkpoint_gc_verification() {
     smol::block_on(async {
-        let sys = TestSys::new_evictable().await;
-        let mut session = sys.new_session().unwrap();
+        let temp_dir = TempDir::new().unwrap();
+        let engine = evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys").await;
+        let table_id = create_table2_for_test(&engine).await;
+        let mut session = engine.new_session().unwrap();
         let name = "g".repeat(1024);
-        insert_rows(&sys, &mut session, 0, 200, &name).await;
+        insert_rows(table_id, &mut session, 0, 200, &name).await;
 
-        let allocated_before = sys.engine.mem_pool.allocated();
-        sys.table.freeze(&session, usize::MAX).await.unwrap();
-        checkpoint_published(&sys.table, &mut session).await;
-        let allocated_after = sys.engine.mem_pool.allocated();
+        let allocated_before = engine.mem_pool.allocated();
+        session.freeze_table(table_id, usize::MAX).await.unwrap();
+        checkpoint_published(table_id, &mut session).await;
+        let allocated_after = engine.mem_pool.allocated();
         let mut reclaimed = allocated_after < allocated_before;
         for _ in 0..20 {
             smol::Timer::after(Duration::from_millis(200)).await;
-            let allocated_now = sys.engine.mem_pool.allocated();
+            let allocated_now = engine.mem_pool.allocated();
             if allocated_now < allocated_before {
                 reclaimed = true;
                 break;
@@ -7777,47 +8159,46 @@ fn test_checkpoint_gc_verification() {
 #[test]
 fn test_session_cached_insert_page_reuses_live_versioned_page() {
     smol::block_on(async {
-        let sys = TestSys::new_evictable().await;
-        let mut session = sys.new_session().unwrap();
+        let temp_dir = TempDir::new().unwrap();
+        let engine = evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys").await;
+        let table_id = create_table2_for_test(&engine).await;
+        let mut session = engine.new_session().unwrap();
 
         let mut trx = session.begin_trx().unwrap();
         let row_id = unwrap_insert_result(
-            trx_insert_row(
+            trx_insert_row_by_id(
                 &mut trx,
-                &sys.table,
+                table_id,
                 vec![Val::from(1), Val::from("cached-row")],
             )
             .await,
         );
         trx.commit().await.unwrap();
 
-        let (cached_page, cached_row_id) = session
-            .load_active_insert_page(sys.table.table_id())
-            .unwrap();
+        let (cached_page, cached_row_id) = session.load_active_insert_page(table_id).unwrap();
         assert_eq!(cached_row_id, row_id);
         assert!(
-            sys.table
+            table_for_internal_assertion(&engine, table_id)
                 .mem
                 .get_row_page_versioned_shared(&session.pool_guards(), cached_page)
                 .await
                 .unwrap()
                 .is_some()
         );
-        session.save_active_insert_page(sys.table.table_id(), cached_page, cached_row_id);
+        session.save_active_insert_page(table_id, cached_page, cached_row_id);
 
         let mut trx = session.begin_trx().unwrap();
         let next_row_id = unwrap_insert_result(
-            trx_insert_row(
+            trx_insert_row_by_id(
                 &mut trx,
-                &sys.table,
+                table_id,
                 vec![Val::from(2), Val::from("still-cached")],
             )
             .await,
         );
         trx.commit().await.unwrap();
 
-        let next_page_id = match sys
-            .table
+        let next_page_id = match table_for_internal_assertion(&engine, table_id)
             .find_row(&session.pool_guards(), next_row_id)
             .await
             .unwrap()
@@ -7829,9 +8210,8 @@ fn test_session_cached_insert_page_reuses_live_versioned_page() {
         };
         assert_eq!(next_page_id, cached_page.page_id);
 
-        let (next_cached_page, next_cached_row_id) = session
-            .load_active_insert_page(sys.table.table_id())
-            .unwrap();
+        let (next_cached_page, next_cached_row_id) =
+            session.load_active_insert_page(table_id).unwrap();
         assert_eq!(next_cached_row_id, next_row_id);
         assert_eq!(next_cached_page, cached_page);
     });
@@ -7840,34 +8220,33 @@ fn test_session_cached_insert_page_reuses_live_versioned_page() {
 #[test]
 fn test_stale_session_cached_insert_page_falls_back_after_checkpoint_gc() {
     smol::block_on(async {
-        let sys = TestSys::new_evictable().await;
-        let mut session = sys.new_session().unwrap();
+        let temp_dir = TempDir::new().unwrap();
+        let engine = evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys").await;
+        let table_id = create_table2_for_test(&engine).await;
+        let mut session = engine.new_session().unwrap();
 
         let mut trx = session.begin_trx().unwrap();
         let row_id = unwrap_insert_result(
-            trx_insert_row(
+            trx_insert_row_by_id(
                 &mut trx,
-                &sys.table,
+                table_id,
                 vec![Val::from(1), Val::from("cached-row")],
             )
             .await,
         );
         trx.commit().await.unwrap();
 
-        let (cached_page, cached_row_id) = session
-            .load_active_insert_page(sys.table.table_id())
-            .unwrap();
+        let (cached_page, cached_row_id) = session.load_active_insert_page(table_id).unwrap();
         assert_eq!(cached_row_id, row_id);
-        session.save_active_insert_page(sys.table.table_id(), cached_page, cached_row_id);
+        session.save_active_insert_page(table_id, cached_page, cached_row_id);
 
-        sys.table.freeze(&session, usize::MAX).await.unwrap();
-        let mut checkpoint_session = sys.new_session().unwrap();
-        checkpoint_published(&sys.table, &mut checkpoint_session).await;
+        session.freeze_table(table_id, usize::MAX).await.unwrap();
+        let mut checkpoint_session = engine.new_session().unwrap();
+        checkpoint_published(table_id, &mut checkpoint_session).await;
 
         let mut reclaimed = false;
         for _ in 0..20 {
-            if sys
-                .table
+            if table_for_internal_assertion(&engine, table_id)
                 .mem
                 .get_row_page_versioned_shared(&session.pool_guards(), cached_page)
                 .await
@@ -7886,9 +8265,9 @@ fn test_stale_session_cached_insert_page_falls_back_after_checkpoint_gc() {
 
         let mut trx = session.begin_trx().unwrap();
         let post_gc_row_id = unwrap_insert_result(
-            trx_insert_row(
+            trx_insert_row_by_id(
                 &mut trx,
-                &sys.table,
+                table_id,
                 vec![Val::from(2), Val::from("post-gc-row")],
             )
             .await,
@@ -7896,14 +8275,13 @@ fn test_stale_session_cached_insert_page_falls_back_after_checkpoint_gc() {
         trx.commit().await.unwrap();
 
         let key = single_key(2i32);
-        sys.new_trx_select(&mut session, &key, |vals| {
+        expect_select_committed(table_id, &mut session, &key, |vals| {
             assert_eq!(vals, vec![Val::from(2), Val::from("post-gc-row")]);
         })
         .await;
 
-        let (next_cached_page, next_cached_row_id) = session
-            .load_active_insert_page(sys.table.table_id())
-            .unwrap();
+        let (next_cached_page, next_cached_row_id) =
+            session.load_active_insert_page(table_id).unwrap();
         assert_eq!(next_cached_row_id, post_gc_row_id);
         assert_ne!(next_cached_page, cached_page);
     });
@@ -7912,33 +8290,32 @@ fn test_stale_session_cached_insert_page_falls_back_after_checkpoint_gc() {
 #[test]
 fn test_validated_row_page_shared_result_rejects_stale_reused_page_range() {
     smol::block_on(async {
-        let sys = TestSys::new_evictable().await;
-        let mut session = sys.new_session().unwrap();
+        let temp_dir = TempDir::new().unwrap();
+        let engine = evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys").await;
+        let table_id = create_table2_for_test(&engine).await;
+        let mut session = engine.new_session().unwrap();
 
         let mut trx = session.begin_trx().unwrap();
         let stale_row_id = unwrap_insert_result(
-            trx_insert_row(
+            trx_insert_row_by_id(
                 &mut trx,
-                &sys.table,
+                table_id,
                 vec![Val::from(1), Val::from("cached-row")],
             )
             .await,
         );
         trx.commit().await.unwrap();
 
-        let (stale_page, cached_row_id) = session
-            .load_active_insert_page(sys.table.table_id())
-            .unwrap();
+        let (stale_page, cached_row_id) = session.load_active_insert_page(table_id).unwrap();
         assert_eq!(cached_row_id, stale_row_id);
 
-        sys.table.freeze(&session, usize::MAX).await.unwrap();
-        let mut checkpoint_session = sys.new_session().unwrap();
-        checkpoint_published(&sys.table, &mut checkpoint_session).await;
+        session.freeze_table(table_id, usize::MAX).await.unwrap();
+        let mut checkpoint_session = engine.new_session().unwrap();
+        checkpoint_published(table_id, &mut checkpoint_session).await;
 
         let mut reclaimed = false;
         for _ in 0..20 {
-            if sys
-                .table
+            if table_for_internal_assertion(&engine, table_id)
                 .mem
                 .get_row_page_versioned_shared(&session.pool_guards(), stale_page)
                 .await
@@ -7960,16 +8337,15 @@ fn test_validated_row_page_shared_result_rejects_stale_reused_page_range() {
         for key in 2..258 {
             let mut trx = session.begin_trx().unwrap();
             let row_id = unwrap_insert_result(
-                trx_insert_row(
+                trx_insert_row_by_id(
                     &mut trx,
-                    &sys.table,
+                    table_id,
                     vec![Val::from(key), Val::from(&large[..])],
                 )
                 .await,
             );
             trx.commit().await.unwrap();
-            match sys
-                .table
+            match table_for_internal_assertion(&engine, table_id)
                 .find_row(&session.pool_guards(), row_id)
                 .await
                 .unwrap()
@@ -7986,10 +8362,9 @@ fn test_validated_row_page_shared_result_rejects_stale_reused_page_range() {
         }
         let reused_row_id = reused_row_id.expect("stale row-page slot should be reused");
 
-        let layout = sys.table.layout_snapshot();
+        let layout = table_for_internal_assertion(&engine, table_id).layout_snapshot();
 
-        let stale_guard = sys
-            .table
+        let stale_guard = table_for_internal_assertion(&engine, table_id)
             .accessor_with_layout(&layout)
             .try_get_validated_row_page_shared_result(
                 &session.pool_guards(),
@@ -8003,10 +8378,9 @@ fn test_validated_row_page_shared_result_rejects_stale_reused_page_range() {
             "stale row id should not validate against the reused page range"
         );
 
-        let layout = sys.table.layout_snapshot();
+        let layout = table_for_internal_assertion(&engine, table_id).layout_snapshot();
 
-        let reused_guard = sys
-            .table
+        let reused_guard = table_for_internal_assertion(&engine, table_id)
             .accessor_with_layout(&layout)
             .try_get_validated_row_page_shared_result(
                 &session.pool_guards(),
@@ -8025,38 +8399,50 @@ fn test_validated_row_page_shared_result_rejects_stale_reused_page_range() {
 #[test]
 fn test_mvcc_insert_surfaces_cached_insert_page_reload_error() {
     smol::block_on(async {
-        let sys = TestSys::new_evictable_with_mem_size(9u64 * 1024 * 1024).await;
-        let mut session = sys.new_session().unwrap();
+        let temp_dir = TempDir::new().unwrap();
+        let engine = evictable_test_engine(&temp_dir, 9u64 * 1024 * 1024, "redo_testsys").await;
+        let table_id = create_table2_for_test(&engine).await;
+        let mut session = engine.new_session().unwrap();
 
         let large = "r".repeat(48 * 1024);
         let mut trx = session.begin_trx().unwrap();
         let row_id = unwrap_insert_result(
-            trx_insert_row(
+            trx_insert_row_by_id(
                 &mut trx,
-                &sys.table,
+                table_id,
                 vec![Val::from(1), Val::from(&large[..])],
             )
             .await,
         );
         trx.commit().await.unwrap();
 
-        let (cached_page, cached_row_id) = session
-            .load_active_insert_page(sys.table.table_id())
-            .unwrap();
+        let (cached_page, cached_row_id) = session.load_active_insert_page(table_id).unwrap();
         assert_eq!(cached_row_id, row_id);
-        session.save_active_insert_page(sys.table.table_id(), cached_page, cached_row_id);
+        session.save_active_insert_page(table_id, cached_page, cached_row_id);
 
-        let mut writer = sys.new_session().unwrap();
+        let mut writer = engine.new_session().unwrap();
         for i in 2..258 {
-            sys.new_trx_insert(&mut writer, vec![Val::from(i), Val::from(&large[..])])
-                .await;
-            if test_frame_kind(&sys.table.mem.mem_pool, cached_page.page_id) == FrameKind::Evicted {
+            expect_insert_committed(
+                table_id,
+                &mut writer,
+                vec![Val::from(i), Val::from(&large[..])],
+            )
+            .await;
+            if test_frame_kind(
+                &table_for_internal_assertion(&engine, table_id).mem.mem_pool,
+                cached_page.page_id,
+            ) == FrameKind::Evicted
+            {
                 break;
             }
         }
         let mut evicted = false;
         for _ in 0..20 {
-            if test_frame_kind(&sys.table.mem.mem_pool, cached_page.page_id) == FrameKind::Evicted {
+            if test_frame_kind(
+                &table_for_internal_assertion(&engine, table_id).mem.mem_pool,
+                cached_page.page_id,
+            ) == FrameKind::Evicted
+            {
                 evicted = true;
                 break;
             }
@@ -8068,7 +8454,7 @@ fn test_mvcc_insert_surfaces_cached_insert_page_reload_error() {
         );
 
         let mem_pool_file =
-            StorageBackendFileIdentity::from_path(sys._temp_dir.path().join("data.swp")).unwrap();
+            StorageBackendFileIdentity::from_path(temp_dir.path().join("data.swp")).unwrap();
         let read_hook = Arc::new(FailingPageReadHook::for_page(
             mem_pool_file,
             cached_page.page_id,
@@ -8078,9 +8464,9 @@ fn test_mvcc_insert_surfaces_cached_insert_page_reload_error() {
         let expected_error_kind = io::Error::from_raw_os_error(libc::EIO).kind();
 
         let mut trx = session.begin_trx().unwrap();
-        let res = trx_insert_row(
+        let res = trx_insert_row_by_id(
             &mut trx,
-            &sys.table,
+            table_id,
             vec![Val::from(100), Val::from("reload-fails")],
         )
         .await;
@@ -8101,14 +8487,16 @@ fn test_mvcc_insert_surfaces_cached_insert_page_reload_error() {
 #[test]
 fn test_mvcc_rollback_poisons_runtime_on_row_page_reload_error() {
     smol::block_on(async {
-        let sys = TestSys::new_evictable_with_mem_size(9u64 * 1024 * 1024).await;
-        let mut session = sys.new_session().unwrap();
+        let temp_dir = TempDir::new().unwrap();
+        let engine = evictable_test_engine(&temp_dir, 9u64 * 1024 * 1024, "redo_testsys").await;
+        let table_id = create_table2_for_test(&engine).await;
+        let mut session = engine.new_session().unwrap();
 
         let large = "r".repeat(48 * 1024);
         let mut trx = session.begin_trx().unwrap();
-        let row_id = match trx_insert_row(
+        let row_id = match trx_insert_row_by_id(
             &mut trx,
-            &sys.table,
+            table_id,
             vec![Val::from(1), Val::from(&large[..])],
         )
         .await
@@ -8117,22 +8505,32 @@ fn test_mvcc_rollback_poisons_runtime_on_row_page_reload_error() {
             res => panic!("res={res:?}"),
         };
 
-        let (cached_page, cached_row_id) = session
-            .load_active_insert_page(sys.table.table_id())
-            .unwrap();
+        let (cached_page, cached_row_id) = session.load_active_insert_page(table_id).unwrap();
         assert_eq!(cached_row_id, row_id);
 
-        let mut writer = sys.new_session().unwrap();
+        let mut writer = engine.new_session().unwrap();
         for i in 2..258 {
-            sys.new_trx_insert(&mut writer, vec![Val::from(i), Val::from(&large[..])])
-                .await;
-            if test_frame_kind(&sys.table.mem.mem_pool, cached_page.page_id) == FrameKind::Evicted {
+            expect_insert_committed(
+                table_id,
+                &mut writer,
+                vec![Val::from(i), Val::from(&large[..])],
+            )
+            .await;
+            if test_frame_kind(
+                &table_for_internal_assertion(&engine, table_id).mem.mem_pool,
+                cached_page.page_id,
+            ) == FrameKind::Evicted
+            {
                 break;
             }
         }
         let mut evicted = false;
         for _ in 0..20 {
-            if test_frame_kind(&sys.table.mem.mem_pool, cached_page.page_id) == FrameKind::Evicted {
+            if test_frame_kind(
+                &table_for_internal_assertion(&engine, table_id).mem.mem_pool,
+                cached_page.page_id,
+            ) == FrameKind::Evicted
+            {
                 evicted = true;
                 break;
             }
@@ -8141,7 +8539,7 @@ fn test_mvcc_rollback_poisons_runtime_on_row_page_reload_error() {
         assert!(evicted, "rollback row page should be evicted before repro");
 
         let mem_pool_file =
-            StorageBackendFileIdentity::from_path(sys._temp_dir.path().join("data.swp")).unwrap();
+            StorageBackendFileIdentity::from_path(temp_dir.path().join("data.swp")).unwrap();
         let read_hook = Arc::new(FailingPageReadHook::for_page(
             mem_pool_file,
             cached_page.page_id,
@@ -8157,15 +8555,15 @@ fn test_mvcc_rollback_poisons_runtime_on_row_page_reload_error() {
                 == Some(FatalError::RollbackAccess))
         );
         assert!(
-            sys.engine
+            engine
                 .trx_sys
                 .storage_poison_error()
                 .as_ref()
                 .is_some_and(|err| *err.current_context() == FatalError::RollbackAccess)
         );
-        assert_eq!(sys.engine.trx_sys.fatal_rollback_retention_len(), 1);
+        assert_eq!(engine.trx_sys.fatal_rollback_retention_len(), 1);
         assert!(
-            sys.engine
+            engine
                 .trx_sys
                 .ensure_runtime_healthy()
                 .as_ref()
@@ -8178,19 +8576,21 @@ fn test_mvcc_rollback_poisons_runtime_on_row_page_reload_error() {
 #[test]
 fn test_statement_rollback_poisons_runtime_on_row_page_reload_error() {
     smol::block_on(async {
-        let sys = TestSys::new_evictable_with_mem_size(9u64 * 1024 * 1024).await;
-        let mut session = sys.new_session().unwrap();
+        let temp_dir = TempDir::new().unwrap();
+        let engine = evictable_test_engine(&temp_dir, 9u64 * 1024 * 1024, "redo_testsys").await;
+        let table_id = create_table2_for_test(&engine).await;
+        let mut session = engine.new_session().unwrap();
         let large = "r".repeat(48 * 1024);
-        let mut writer = sys.new_session().unwrap();
+        let mut writer = engine.new_session().unwrap();
         let mut trx = session.begin_trx().unwrap();
         let mut hook_guard = None;
         let mut read_hook = None;
 
         let res: Result<()> = trx
             .exec(async |stmt| {
-                let row_id = match stmt_insert_row(
+                let row_id = match stmt_insert_row_by_id(
                     stmt,
-                    &sys.table,
+                    table_id,
                     vec![Val::from(1), Val::from(&large[..])],
                 )
                 .await
@@ -8199,24 +8599,31 @@ fn test_statement_rollback_poisons_runtime_on_row_page_reload_error() {
                     res => panic!("res={res:?}"),
                 };
 
-                let (cached_page, cached_row_id) = session
-                    .load_active_insert_page(sys.table.table_id())
-                    .unwrap();
+                let (cached_page, cached_row_id) =
+                    session.load_active_insert_page(table_id).unwrap();
                 assert_eq!(cached_row_id, row_id);
 
                 for i in 2..258 {
-                    sys.new_trx_insert(&mut writer, vec![Val::from(i), Val::from(&large[..])])
-                        .await;
-                    if test_frame_kind(&sys.table.mem.mem_pool, cached_page.page_id)
-                        == FrameKind::Evicted
+                    expect_insert_committed(
+                        table_id,
+                        &mut writer,
+                        vec![Val::from(i), Val::from(&large[..])],
+                    )
+                    .await;
+                    if test_frame_kind(
+                        &table_for_internal_assertion(&engine, table_id).mem.mem_pool,
+                        cached_page.page_id,
+                    ) == FrameKind::Evicted
                     {
                         break;
                     }
                 }
                 let mut evicted = false;
                 for _ in 0..20 {
-                    if test_frame_kind(&sys.table.mem.mem_pool, cached_page.page_id)
-                        == FrameKind::Evicted
+                    if test_frame_kind(
+                        &table_for_internal_assertion(&engine, table_id).mem.mem_pool,
+                        cached_page.page_id,
+                    ) == FrameKind::Evicted
                     {
                         evicted = true;
                         break;
@@ -8229,7 +8636,7 @@ fn test_statement_rollback_poisons_runtime_on_row_page_reload_error() {
                 );
 
                 let mem_pool_file =
-                    StorageBackendFileIdentity::from_path(sys._temp_dir.path().join("data.swp"))
+                    StorageBackendFileIdentity::from_path(temp_dir.path().join("data.swp"))
                         .unwrap();
                 let hook = Arc::new(FailingPageReadHook::for_page(
                     mem_pool_file,
@@ -8255,13 +8662,13 @@ fn test_statement_rollback_poisons_runtime_on_row_page_reload_error() {
             "statement rollback should reload the evicted page"
         );
         assert!(
-            sys.engine
+            engine
                 .trx_sys
                 .storage_poison_error()
                 .as_ref()
                 .is_some_and(|err| *err.current_context() == FatalError::RollbackAccess)
         );
-        assert_eq!(sys.engine.trx_sys.fatal_rollback_retention_len(), 1);
+        assert_eq!(engine.trx_sys.fatal_rollback_retention_len(), 1);
         assert!(!session.in_trx().unwrap());
 
         let err = trx.rollback().await.unwrap_err();
@@ -8275,20 +8682,28 @@ fn test_statement_rollback_poisons_runtime_on_row_page_reload_error() {
 #[test]
 fn test_checkpoint_error_rollback() {
     smol::block_on(async {
-        let sys = TestSys::new_evictable().await;
-        let mut session = sys.new_session().unwrap();
+        let temp_dir = TempDir::new().unwrap();
+        let engine = evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys").await;
+        let table_id = create_table2_for_test(&engine).await;
+        let mut session = engine.new_session().unwrap();
         let name = "e".repeat(256);
-        insert_rows(&sys, &mut session, 0, 80, &name).await;
+        insert_rows(table_id, &mut session, 0, 80, &name).await;
 
-        sys.table.freeze(&session, usize::MAX).await.unwrap();
-        let root_before = sys.table.file().active_root_unchecked().clone();
+        session.freeze_table(table_id, usize::MAX).await.unwrap();
+        let root_before = table_for_internal_assertion(&engine, table_id)
+            .file()
+            .active_root_unchecked()
+            .clone();
 
         set_test_force_lwc_build_error(true);
-        let res = sys.table.checkpoint(&mut session).await;
+        let res = session.checkpoint_table(table_id).await;
         set_test_force_lwc_build_error(false);
         assert!(res.is_err());
 
-        let root_after = sys.table.file().active_root_unchecked();
+        let root_after = table_for_internal_assertion(&engine, table_id)
+            .file()
+            .active_root_unchecked()
+            .clone();
         assert_eq!(root_after.pivot_row_id, root_before.pivot_row_id);
         assert_eq!(
             root_after.heap_redo_start_ts,
@@ -8396,7 +8811,6 @@ fn test_user_secondary_indexes_evict_and_continue_serving_lookups() {
             .unwrap();
         drop(ddl_session);
 
-        let table = engine.catalog().get_table(table_id).await.unwrap();
         let mut session = engine.new_session().unwrap();
         let mut inserted = Vec::new();
 
@@ -8406,9 +8820,9 @@ fn test_user_secondary_indexes_evict_and_continue_serving_lookups() {
                 let row_id = (batch * 64 + i) as i32;
                 let seed = format!("{:08x}", row_id);
                 let key = seed.repeat(64);
-                let res = trx_insert_row(
+                let res = trx_insert_row_by_id(
                     &mut trx,
-                    &table,
+                    table_id,
                     vec![Val::from(row_id), Val::from(&key[..])],
                 )
                 .await;
@@ -8439,7 +8853,7 @@ fn test_user_secondary_indexes_evict_and_continue_serving_lookups() {
         for key_idx in [0usize, inserted.len() / 2, inserted.len() - 1] {
             let key = SelectKey::new(0, vec![Val::from(inserted[key_idx].0)]);
             let mut trx = session.begin_trx().unwrap();
-            let res = trx_select_row_mvcc(&mut trx, &table, &key, &[0, 1]).await;
+            let res = trx_select_row_mvcc_by_id(&mut trx, table_id, &key, &[0, 1]).await;
             match res {
                 Ok(SelectMvcc::Found(vals)) => {
                     assert_eq!(
@@ -8455,135 +8869,90 @@ fn test_user_secondary_indexes_evict_and_continue_serving_lookups() {
             trx.commit().await.unwrap();
         }
 
-        let mut visible_rows = 0usize;
-        let layout = table.layout_snapshot();
-        table
-            .accessor_with_layout(&layout)
-            .mem_scan_uncommitted(&session.pool_guards(), |_metadata, row| {
-                if !row.is_deleted() {
-                    visible_rows += 1;
-                }
-                true
-            })
-            .await
-            .unwrap();
+        let mut trx = session.begin_trx().unwrap();
+        let visible_rows = scan_table_i32s(&mut trx, table_id).await.len();
+        trx.commit().await.unwrap();
         assert_eq!(visible_rows, inserted.len());
     });
 }
 
-struct TestSys {
-    table: Arc<Table>,
-    engine: Engine,
-    _temp_dir: TempDir,
+struct ColumnBlockIndexSnapshot {
+    active_root: ActiveRoot,
+    sparse_file: Arc<SparseFile>,
+    disk_pool: QuiescentGuard<ReadonlyBufferPool>,
 }
 
-impl TestSys {
+impl ColumnBlockIndexSnapshot {
     #[inline]
-    async fn new_evictable() -> Self {
-        Self::new_evictable_with_mem_size(64u64 * 1024 * 1024).await
+    fn index<'a>(&'a self, disk_pool_guard: &'a PoolGuard) -> ColumnBlockIndex<'a> {
+        ColumnBlockIndex::new(
+            self.active_root.column_block_index_root,
+            self.active_root.pivot_row_id,
+            FileKind::TableFile,
+            &self.sparse_file,
+            &self.disk_pool,
+            disk_pool_guard,
+        )
     }
+}
 
-    #[inline]
-    async fn new_lightweight_evictable() -> Self {
-        use crate::catalog::tests::table2;
+#[inline]
+async fn evictable_test_engine(
+    temp_dir: &TempDir,
+    max_mem_size: u64,
+    log_file_stem: &str,
+) -> Engine {
+    EngineConfig::default()
+        .storage_root(temp_dir.path().to_path_buf())
+        .data_buffer(
+            EvictableBufferPoolConfig::default()
+                .role(PoolRole::Mem)
+                .max_mem_size(max_mem_size)
+                .max_file_size(128u64 * 1024 * 1024),
+        )
+        .trx(TrxSysConfig::default().log_file_stem(log_file_stem))
+        .file(
+            FileSystemConfig::default()
+                .io_depth(16)
+                .readonly_buffer_size(128 * 1024 * 1024)
+                .data_dir("."),
+        )
+        .build()
+        .await
+        .unwrap()
+}
 
-        let temp_dir = TempDir::new().unwrap();
-        let main_dir = temp_dir.path().to_path_buf();
-        let engine = lightweight_test_engine_config(main_dir, "redo_testsys_lightweight")
-            .build()
-            .await
-            .unwrap();
-        let table_id = table2(&engine).await;
-        let table = engine.catalog().get_table(table_id).await.unwrap();
-        TestSys {
-            engine,
-            table,
-            _temp_dir: temp_dir,
-        }
-    }
+#[inline]
+async fn lightweight_test_engine(temp_dir: &TempDir, log_file_stem: &str) -> Engine {
+    lightweight_test_engine_config(temp_dir.path().to_path_buf(), log_file_stem)
+        .build()
+        .await
+        .unwrap()
+}
 
-    #[inline]
-    async fn new_evictable_with_mem_size(max_mem_size: u64) -> Self {
-        use crate::catalog::tests::table2;
-        // 64KB * 16
-        let temp_dir = TempDir::new().unwrap();
-        let main_dir = temp_dir.path().to_path_buf();
-        let engine = EngineConfig::default()
-            .storage_root(main_dir)
-            .data_buffer(
-                EvictableBufferPoolConfig::default()
-                    .role(PoolRole::Mem)
-                    .max_mem_size(max_mem_size)
-                    .max_file_size(128u64 * 1024 * 1024),
-            )
-            .trx(TrxSysConfig::default().log_file_stem("redo_testsys"))
-            .file(
-                FileSystemConfig::default()
-                    .io_depth(16)
-                    .readonly_buffer_size(128 * 1024 * 1024)
-                    .data_dir("."),
-            )
-            .build()
-            .await
-            .unwrap();
-        let table_id = table2(&engine).await;
-        let table = engine.catalog().get_table(table_id).await.unwrap();
-        TestSys {
-            engine,
-            table,
-            _temp_dir: temp_dir,
-        }
-    }
+#[inline]
+async fn create_table2_for_test(engine: &Engine) -> TableID {
+    crate::catalog::tests::table2(engine).await
+}
 
-    #[inline]
-    async fn new_evictable_with_non_unique_name_index() -> Self {
-        use crate::catalog::{
-            ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexSpec, TableSpec,
-        };
-        use crate::value::ValKind;
-
-        let temp_dir = TempDir::new().unwrap();
-        let main_dir = temp_dir.path().to_path_buf();
-        let engine = EngineConfig::default()
-            .storage_root(main_dir)
-            .data_buffer(
-                EvictableBufferPoolConfig::default()
-                    .role(PoolRole::Mem)
-                    .max_mem_size(64u64 * 1024 * 1024)
-                    .max_file_size(128u64 * 1024 * 1024),
-            )
-            .trx(TrxSysConfig::default().log_file_stem("redo_testsys_non_unique"))
-            .file(
-                FileSystemConfig::default()
-                    .io_depth(16)
-                    .readonly_buffer_size(128 * 1024 * 1024)
-                    .data_dir("."),
-            )
-            .build()
-            .await
-            .unwrap();
-        let mut ddl_session = engine.new_session().unwrap();
-        let table_id = ddl_session
-            .create_table(
-                TableSpec::new(vec![
-                    ColumnSpec::new("id", ValKind::I32, ColumnAttributes::empty()),
-                    ColumnSpec::new("name", ValKind::VarByte, ColumnAttributes::empty()),
-                ]),
-                vec![
-                    IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::PK),
-                    IndexSpec::new(vec![IndexKey::new(1)], IndexAttributes::empty()),
-                ],
-            )
-            .await
-            .unwrap();
-        drop(ddl_session);
-        let table = engine.catalog().get_table(table_id).await.unwrap();
-        TestSys {
-            engine,
-            table,
-            _temp_dir: temp_dir,
-        }
-    }
+#[inline]
+async fn create_non_unique_name_table_for_test(engine: &Engine) -> TableID {
+    let mut ddl_session = engine.new_session().unwrap();
+    let table_id = ddl_session
+        .create_table(
+            TableSpec::new(vec![
+                ColumnSpec::new("id", ValKind::I32, ColumnAttributes::empty()),
+                ColumnSpec::new("name", ValKind::VarByte, ColumnAttributes::empty()),
+            ]),
+            vec![
+                IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::PK),
+                IndexSpec::new(vec![IndexKey::new(1)], IndexAttributes::empty()),
+            ],
+        )
+        .await
+        .unwrap();
+    drop(ddl_session);
+    table_id
 }
 
 fn lightweight_test_engine_config(
@@ -8615,154 +8984,142 @@ fn lightweight_test_engine_config(
         )
 }
 
-async fn new_lightweight_arc_table(log_file_stem: &str) -> (TempDir, Arc<Engine>, Arc<Table>) {
-    use crate::catalog::tests::table2;
-
-    let temp_dir = TempDir::new().unwrap();
-    let engine = Arc::new(
-        lightweight_test_engine_config(temp_dir.path().to_path_buf(), log_file_stem)
-            .build()
-            .await
-            .unwrap(),
-    );
-    let table_id = table2(engine.as_ref()).await;
-    let table = engine.catalog().get_table(table_id).await.unwrap();
-    (temp_dir, engine, table)
+#[inline]
+fn table_for_internal_assertion(engine: &Engine, table_id: TableID) -> Arc<Table> {
+    engine
+        .catalog()
+        .get_table_now(table_id)
+        .expect("test table should exist")
 }
 
-async fn new_lightweight_arc_table_with_non_unique_name_index(
-    log_file_stem: &str,
-) -> (TempDir, Arc<Engine>, Arc<Table>) {
-    let temp_dir = TempDir::new().unwrap();
-    let engine = Arc::new(
-        lightweight_test_engine_config(temp_dir.path().to_path_buf(), log_file_stem)
-            .build()
-            .await
-            .unwrap(),
-    );
-    let mut ddl_session = engine.new_session().unwrap();
-    let table_id = ddl_session
-        .create_table(
-            TableSpec::new(vec![
-                ColumnSpec::new("id", ValKind::I32, ColumnAttributes::empty()),
-                ColumnSpec::new("name", ValKind::VarByte, ColumnAttributes::empty()),
-            ]),
-            vec![
-                IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::PK),
-                IndexSpec::new(vec![IndexKey::new(1)], IndexAttributes::empty()),
-            ],
-        )
-        .await
-        .unwrap();
-    drop(ddl_session);
-    let table = engine.catalog().get_table(table_id).await.unwrap();
-    (temp_dir, engine, table)
-}
-
-impl TestSys {
-    #[inline]
-    async fn new_trx_insert(&self, session: &mut Session, insert: Vec<Val>) {
-        let mut trx = session.begin_trx().unwrap();
-        trx = self.trx_insert(trx, insert).await;
-        trx.commit().await.unwrap();
-    }
-
-    #[inline]
-    async fn trx_insert(&self, mut trx: Transaction, insert: Vec<Val>) -> Transaction {
-        let res = trx_insert_row(&mut trx, &self.table, insert).await;
-        if res.is_err() {
-            panic!("res={:?}", res);
-        }
-        trx
-    }
-
-    #[inline]
-    async fn new_trx_delete(&self, session: &mut Session, key: &SelectKey) {
-        let mut trx = session.begin_trx().unwrap();
-        trx = self.trx_delete(trx, key).await;
-        trx.commit().await.unwrap();
-    }
-
-    #[inline]
-    async fn trx_delete(&self, mut trx: Transaction, key: &SelectKey) -> Transaction {
-        let res = trx_delete_row(&mut trx, &self.table, key).await;
-        if !matches!(res, Ok(DeleteMvcc::Deleted)) {
-            panic!("res={:?}", res);
-        }
-        trx
-    }
-
-    #[inline]
-    async fn new_trx_update(&self, session: &mut Session, key: &SelectKey, update: Vec<UpdateCol>) {
-        let mut trx = session.begin_trx().unwrap();
-        trx = self.trx_update(trx, key, update).await;
-        trx.commit().await.unwrap();
-    }
-
-    #[inline]
-    async fn trx_update(
-        &self,
-        mut trx: Transaction,
-        key: &SelectKey,
-        update: Vec<UpdateCol>,
-    ) -> Transaction {
-        let res = trx_update_row(&mut trx, &self.table, key, update).await;
-        if !matches!(res, Ok(UpdateMvcc::Updated(_))) {
-            panic!("res={:?}", res);
-        }
-        trx
-    }
-
-    #[inline]
-    async fn new_trx_select<F: FnOnce(Vec<Val>)>(
-        &self,
-        session: &mut Session,
-        key: &SelectKey,
-        action: F,
-    ) {
-        let mut trx = session.begin_trx().unwrap();
-        trx = self.trx_select(trx, key, action).await;
-        trx.commit().await.unwrap();
-    }
-
-    #[inline]
-    async fn new_trx_select_not_found(&self, session: &mut Session, key: &SelectKey) {
-        let mut trx = session.begin_trx().unwrap();
-        trx = self.trx_select_not_found(trx, key).await;
-        trx.commit().await.unwrap();
-    }
-
-    #[inline]
-    async fn trx_select_not_found(&self, mut trx: Transaction, key: &SelectKey) -> Transaction {
-        let res = trx_select_row_mvcc(&mut trx, &self.table, key, &[0, 1]).await;
-        assert!(matches!(res, Ok(SelectMvcc::NotFound)));
-        trx
-    }
-
-    #[inline]
-    async fn trx_select<F: FnOnce(Vec<Val>)>(
-        &self,
-        mut trx: Transaction,
-        key: &SelectKey,
-        action: F,
-    ) -> Transaction {
-        let res = trx_select_row_mvcc(&mut trx, &self.table, key, &[0, 1]).await;
-        if !matches!(res, Ok(SelectMvcc::Found(_))) {
-            panic!("res={:?}", res);
-        }
-        action(res.unwrap().unwrap_found());
-        trx
-    }
-
-    #[inline]
-    fn new_session(&self) -> Result<Session> {
-        self.engine.new_session()
+#[inline]
+fn column_block_index_snapshot(engine: &Engine, table_id: TableID) -> ColumnBlockIndexSnapshot {
+    let table = table_for_internal_assertion(engine, table_id);
+    ColumnBlockIndexSnapshot {
+        active_root: table.file().active_root_unchecked().clone(),
+        sparse_file: Arc::clone(table.file().sparse_file()),
+        disk_pool: table.disk_pool().clone(),
     }
 }
 
-async fn insert_one_row(table: &Table, session: &mut Session, values: Vec<Val>) -> RowID {
+#[inline]
+async fn expect_insert_committed(table_id: TableID, session: &mut Session, insert: Vec<Val>) {
     let mut trx = session.begin_trx().unwrap();
-    let insert = trx_insert_row(&mut trx, table, values).await;
+    trx = expect_trx_insert(table_id, trx, insert).await;
+    trx.commit().await.unwrap();
+}
+
+#[inline]
+async fn expect_trx_insert(
+    table_id: TableID,
+    mut trx: Transaction,
+    insert: Vec<Val>,
+) -> Transaction {
+    let res = trx_insert_row_by_id(&mut trx, table_id, insert).await;
+    if res.is_err() {
+        panic!("res={:?}", res);
+    }
+    trx
+}
+
+#[inline]
+async fn expect_delete_committed(table_id: TableID, session: &mut Session, key: &SelectKey) {
+    let mut trx = session.begin_trx().unwrap();
+    trx = expect_trx_delete(table_id, trx, key).await;
+    trx.commit().await.unwrap();
+}
+
+#[inline]
+async fn expect_trx_delete(
+    table_id: TableID,
+    mut trx: Transaction,
+    key: &SelectKey,
+) -> Transaction {
+    let res = trx_delete_row_by_id(&mut trx, table_id, key).await;
+    if !matches!(res, Ok(DeleteMvcc::Deleted)) {
+        panic!("res={:?}", res);
+    }
+    trx
+}
+
+#[inline]
+async fn expect_update_committed(
+    table_id: TableID,
+    session: &mut Session,
+    key: &SelectKey,
+    update: Vec<UpdateCol>,
+) {
+    let mut trx = session.begin_trx().unwrap();
+    trx = expect_trx_update(table_id, trx, key, update).await;
+    trx.commit().await.unwrap();
+}
+
+#[inline]
+async fn expect_trx_update(
+    table_id: TableID,
+    mut trx: Transaction,
+    key: &SelectKey,
+    update: Vec<UpdateCol>,
+) -> Transaction {
+    let res = trx_update_row_by_id(&mut trx, table_id, key, update).await;
+    if !matches!(res, Ok(UpdateMvcc::Updated(_))) {
+        panic!("res={:?}", res);
+    }
+    trx
+}
+
+#[inline]
+async fn expect_select_committed<F: FnOnce(Vec<Val>)>(
+    table_id: TableID,
+    session: &mut Session,
+    key: &SelectKey,
+    action: F,
+) {
+    let mut trx = session.begin_trx().unwrap();
+    trx = expect_trx_select(table_id, trx, key, action).await;
+    trx.commit().await.unwrap();
+}
+
+#[inline]
+async fn expect_select_not_found_committed(
+    table_id: TableID,
+    session: &mut Session,
+    key: &SelectKey,
+) {
+    let mut trx = session.begin_trx().unwrap();
+    trx = expect_trx_select_not_found(table_id, trx, key).await;
+    trx.commit().await.unwrap();
+}
+
+#[inline]
+async fn expect_trx_select_not_found(
+    table_id: TableID,
+    mut trx: Transaction,
+    key: &SelectKey,
+) -> Transaction {
+    let res = trx_select_row_mvcc_by_id(&mut trx, table_id, key, &[0, 1]).await;
+    assert!(matches!(res, Ok(SelectMvcc::NotFound)));
+    trx
+}
+
+#[inline]
+async fn expect_trx_select<F: FnOnce(Vec<Val>)>(
+    table_id: TableID,
+    mut trx: Transaction,
+    key: &SelectKey,
+    action: F,
+) -> Transaction {
+    let res = trx_select_row_mvcc_by_id(&mut trx, table_id, key, &[0, 1]).await;
+    if !matches!(res, Ok(SelectMvcc::Found(_))) {
+        panic!("res={:?}", res);
+    }
+    action(res.unwrap().unwrap_found());
+    trx
+}
+
+async fn insert_one_row(table_id: TableID, session: &mut Session, values: Vec<Val>) -> RowID {
+    let mut trx = session.begin_trx().unwrap();
+    let insert = trx_insert_row_by_id(&mut trx, table_id, values).await;
     let Ok(row_id) = insert else {
         panic!("insert should succeed: {insert:?}");
     };
@@ -8777,10 +9134,10 @@ fn single_key<V: Into<Val>>(value: V) -> SelectKey {
     }
 }
 
-async fn scan_table_i32s(trx: &mut Transaction, table: &Table) -> Vec<i32> {
+async fn scan_table_i32s(trx: &mut Transaction, table_id: TableID) -> Vec<i32> {
     let mut rows = Vec::new();
     trx.exec(async |stmt| {
-        stmt.table_scan_mvcc(table, &[0], |vals| {
+        stmt.table_scan_mvcc(table_id, &[0], |vals| {
             rows.push(vals[0].as_i32().unwrap());
             true
         })
@@ -8793,10 +9150,10 @@ async fn scan_table_i32s(trx: &mut Transaction, table: &Table) -> Vec<i32> {
     rows
 }
 
-async fn scan_table_pairs(trx: &mut Transaction, table: &Table) -> Vec<(i32, String)> {
+async fn scan_table_pairs(trx: &mut Transaction, table_id: TableID) -> Vec<(i32, String)> {
     let mut rows = Vec::new();
     trx.exec(async |stmt| {
-        stmt.table_scan_mvcc(table, &[0, 1], |vals| {
+        stmt.table_scan_mvcc(table_id, &[0, 1], |vals| {
             rows.push((
                 vals[0].as_i32().unwrap(),
                 vals[1].as_str().unwrap().to_string(),
@@ -9216,15 +9573,16 @@ async fn wait_gc_cutoff_after(session: &Session, ts: TrxID) {
     panic!("GC cutoff did not advance past {ts}");
 }
 
-async fn wait_checkpoint_ready(table: &Table, session: &Session) {
+async fn wait_checkpoint_ready(table_id: TableID, session: &Session) {
     let mut last_delay = None;
     for _ in 0..50 {
-        match table.checkpoint_readiness(session).unwrap() {
+        match session.table_checkpoint_readiness(table_id).unwrap() {
             CheckpointReadiness::Ready => return,
             CheckpointReadiness::Delayed { reason } => {
                 last_delay = Some(reason);
                 smol::Timer::after(Duration::from_millis(20)).await;
             }
+            readiness => panic!("checkpoint readiness is not retryable: {readiness:?}"),
         }
     }
     panic!(
@@ -9243,69 +9601,10 @@ async fn wait_path_exists(path: &str, expected: bool) {
     panic!("path existence did not become {expected}: {path}");
 }
 
-struct ShutdownProbe {
-    started_rx: mpsc::Receiver<()>,
-    done: Arc<AtomicBool>,
-    result_rx: mpsc::Receiver<std::result::Result<(), Option<LifecycleError>>>,
-}
-
-fn spawn_shutdown_probe(engine: Arc<Engine>) -> ShutdownProbe {
-    let (started_tx, started_rx) = mpsc::channel();
-    let (result_tx, result_rx) = mpsc::channel();
-    let done = Arc::new(AtomicBool::new(false));
-    let thread_done = Arc::clone(&done);
-    std::thread::spawn(move || {
-        let _ = started_tx.send(());
-        let result = engine.shutdown().map_err(|err| err.lifecycle_error());
-        thread_done.store(true, Ordering::SeqCst);
-        let _ = result_tx.send(result);
-    });
-    ShutdownProbe {
-        started_rx,
-        done,
-        result_rx,
-    }
-}
-
-fn assert_shutdown_probe_waiting(started_rx: mpsc::Receiver<()>, done: &AtomicBool) {
-    started_rx
-        .recv_timeout(Duration::from_secs(5))
-        .expect("shutdown probe thread should start before waiting assertion");
-    assert!(
-        !done.load(Ordering::SeqCst),
-        "shutdown completed while the operation runtime pin was still held"
-    );
-}
-
-fn assert_shutdown_probe_finished(
-    result_rx: mpsc::Receiver<std::result::Result<(), Option<LifecycleError>>>,
-) {
-    let result = result_rx
-        .recv_timeout(Duration::from_secs(5))
-        .expect("shutdown should complete after the operation pin is released");
-    assert_eq!(result, Ok(()));
-}
-
-async fn assert_path_remains_after_dropped_table_purge(
-    engine: &Engine,
-    path: &str,
-    expected: bool,
-) {
-    for _ in 0..10 {
-        engine.trx_sys.request_dropped_table_purge();
-        smol::Timer::after(Duration::from_millis(20)).await;
-        assert_eq!(
-            std::path::Path::new(path).exists(),
-            expected,
-            "path existence changed while dropped-table purge was retried: {path}"
-        );
-    }
-}
-
-async fn checkpoint_published(table: &Table, session: &mut Session) -> TrxID {
+async fn checkpoint_published(table_id: TableID, session: &mut Session) -> TrxID {
     let mut last_delay = None;
     for _ in 0..50 {
-        match table.checkpoint(session).await.unwrap() {
+        match session.checkpoint_table(table_id).await.unwrap() {
             CheckpointOutcome::Published { checkpoint_ts } => {
                 return checkpoint_ts;
             }
@@ -9465,17 +9764,17 @@ fn corrupt_lwc_row_shape_fingerprint(path: impl AsRef<std::path::Path>, page_id:
     });
 }
 
-async fn insert_rows(sys: &TestSys, session: &mut Session, start: i32, count: i32, name: &str) {
+async fn insert_rows(table_id: TableID, session: &mut Session, start: i32, count: i32, name: &str) {
     let mut trx = session.begin_trx().unwrap();
     for i in 0..count {
         let insert = vec![Val::from(start + i), Val::from(name)];
-        trx = sys.trx_insert(trx, insert).await;
+        trx = expect_trx_insert(table_id, trx, insert).await;
     }
     trx.commit().await.unwrap();
 }
 
 async fn insert_rows_direct(
-    table: &Table,
+    table_id: TableID,
     session: &mut Session,
     start: i32,
     count: i32,
@@ -9484,14 +9783,14 @@ async fn insert_rows_direct(
     let mut trx = session.begin_trx().unwrap();
     for i in 0..count {
         let insert = vec![Val::from(start + i), Val::from(name)];
-        let res = trx_insert_row(&mut trx, table, insert).await;
+        let res = trx_insert_row_by_id(&mut trx, table_id, insert).await;
         assert!(res.is_ok());
     }
     trx.commit().await.unwrap();
 }
 
 async fn delete_key_range_and_wait_gc_cutoff(
-    sys: &TestSys,
+    table_id: TableID,
     session: &mut Session,
     start: i32,
     count: i32,
@@ -9499,7 +9798,7 @@ async fn delete_key_range_and_wait_gc_cutoff(
     let mut max_delete_cts = TrxID::new(0);
     for i in 0..count {
         let mut trx = session.begin_trx().unwrap();
-        trx = sys.trx_delete(trx, &single_key(start + i)).await;
+        trx = expect_trx_delete(table_id, trx, &single_key(start + i)).await;
         let cts = trx.commit().await.unwrap();
         max_delete_cts = max_delete_cts.max(cts);
     }
@@ -9520,20 +9819,20 @@ fn test_secondary_index_common() {
             .unwrap();
         let table_id = table4(&engine).await;
         {
-            let table = engine.catalog().get_table(table_id).await.unwrap();
-
             let mut session = engine.new_session().unwrap();
             let user_read_set = &[0usize, 1];
             let mut trx = session.begin_trx().unwrap();
             for i in 0i32..5i32 {
-                let res = trx_insert_row(&mut trx, &table, vec![Val::from(i), Val::from(i)]).await;
+                let res =
+                    trx_insert_row_by_id(&mut trx, table_id, vec![Val::from(i), Val::from(i)])
+                        .await;
                 assert!(res.is_ok());
             }
             trx.commit().await.unwrap();
 
             let mut trx = session.begin_trx().unwrap();
             let key = SelectKey::new(0, vec![Val::from(1i32)]);
-            let res = trx_select_row_mvcc(&mut trx, &table, &key, user_read_set).await;
+            let res = trx_select_row_mvcc_by_id(&mut trx, table_id, &key, user_read_set).await;
             trx.commit().await.unwrap();
             assert!(matches!(res, Ok(SelectMvcc::Found(_))));
 
@@ -9541,7 +9840,7 @@ fn test_secondary_index_common() {
             let key = SelectKey::new(1, vec![Val::from(1i32)]);
             let res = trx
                 .exec(async |stmt| {
-                    stmt.table_index_scan_mvcc(&table, &key, user_read_set)
+                    stmt.table_index_scan_mvcc(table_id, &key, user_read_set)
                         .await
                 })
                 .await;
@@ -9554,7 +9853,7 @@ fn test_secondary_index_common() {
                 idx: 1,
                 val: Val::from(0i32),
             }];
-            let res = trx_update_row(&mut trx, &table, &key, update).await;
+            let res = trx_update_row_by_id(&mut trx, table_id, &key, update).await;
             trx.commit().await.unwrap();
             assert!(matches!(res, Ok(UpdateMvcc::Updated(_))));
 
@@ -9562,7 +9861,7 @@ fn test_secondary_index_common() {
             let key = SelectKey::new(1, vec![Val::from(0i32)]);
             let res = trx
                 .exec(async |stmt| {
-                    stmt.table_index_scan_mvcc(&table, &key, user_read_set)
+                    stmt.table_index_scan_mvcc(table_id, &key, user_read_set)
                         .await
                 })
                 .await;
@@ -9571,7 +9870,7 @@ fn test_secondary_index_common() {
 
             let mut trx = session.begin_trx().unwrap();
             let key = SelectKey::new(0, vec![Val::from(0i32)]);
-            let res = trx_delete_row(&mut trx, &table, &key).await;
+            let res = trx_delete_row_by_id(&mut trx, table_id, &key).await;
             trx.commit().await.unwrap();
             assert!(matches!(res, Ok(DeleteMvcc::Deleted)));
 
@@ -9579,7 +9878,7 @@ fn test_secondary_index_common() {
             let key = SelectKey::new(1, vec![Val::from(0i32)]);
             let res = trx
                 .exec(async |stmt| {
-                    stmt.table_index_scan_mvcc(&table, &key, user_read_set)
+                    stmt.table_index_scan_mvcc(table_id, &key, user_read_set)
                         .await
                 })
                 .await;
@@ -9592,15 +9891,17 @@ fn test_secondary_index_common() {
 #[test]
 fn test_checkpoint_cancelled_while_table_metadata_change_active() {
     smol::block_on(async {
-        let sys = TestSys::new_lightweight_evictable().await;
-        let mut checkpoint_session = sys.engine.new_session().unwrap();
+        let temp_dir = TempDir::new().unwrap();
+        let engine = lightweight_test_engine(&temp_dir, "redo_testsys_lightweight").await;
+        let table_id = create_table2_for_test(&engine).await;
+        let mut checkpoint_session = engine.new_session().unwrap();
 
-        wait_checkpoint_ready(&sys.table, &checkpoint_session).await;
-        let _metadata_lease = sys.table.begin_metadata_change().await.unwrap();
+        wait_checkpoint_ready(table_id, &checkpoint_session).await;
+        let table = table_for_internal_assertion(&engine, table_id);
+        let _metadata_lease = table.begin_metadata_change().await.unwrap();
 
-        let outcome = sys
-            .table
-            .checkpoint(&mut checkpoint_session)
+        let outcome = checkpoint_session
+            .checkpoint_table(table_id)
             .await
             .expect("checkpoint should return a normal cancellation");
 
@@ -9616,8 +9917,10 @@ fn test_checkpoint_cancelled_while_table_metadata_change_active() {
 #[test]
 fn test_runtime_layout_install_retires_removed_index_after_old_snapshot_drops() {
     smol::block_on(async {
-        let sys = TestSys::new_lightweight_evictable().await;
-        let old_layout = sys.table.layout_snapshot();
+        let temp_dir = TempDir::new().unwrap();
+        let engine = lightweight_test_engine(&temp_dir, "redo_testsys_lightweight").await;
+        let table_id = create_table2_for_test(&engine).await;
+        let old_layout = table_for_internal_assertion(&engine, table_id).layout_snapshot();
         assert_eq!(old_layout.metadata().idx.active_index_count(), 1);
 
         let metadata_without_indexes = Arc::new(
@@ -9641,8 +9944,7 @@ fn test_runtime_layout_install_retires_removed_index_after_old_snapshot_drops() 
         )
         .unwrap();
 
-        let installed = sys
-            .table
+        let installed = table_for_internal_assertion(&engine, table_id)
             .install_runtime_layout(old_layout.generation(), new_layout)
             .unwrap();
         assert_eq!(old_layout.metadata().idx.active_index_count(), 1);
@@ -9657,14 +9959,20 @@ fn test_runtime_layout_install_retires_removed_index_after_old_snapshot_drops() 
         );
         assert_eq!(installed.index_slot_count(), old_layout.index_slot_count());
         assert!(installed.secondary_indexes()[0].is_none());
-        assert_eq!(sys.table.metadata().idx.active_index_count(), 0);
-        assert!(sys.table.has_retired_secondary_indexes());
+        assert_eq!(
+            table_for_internal_assertion(&engine, table_id)
+                .metadata()
+                .idx
+                .active_index_count(),
+            0
+        );
+        assert!(table_for_internal_assertion(&engine, table_id).has_retired_secondary_indexes());
 
         let guards = PoolGuards::builder()
-            .push(PoolRole::Index, sys.engine.index_pool.pool_guard())
+            .push(PoolRole::Index, engine.index_pool.pool_guard())
             .build();
         assert_eq!(
-            sys.table
+            table_for_internal_assertion(&engine, table_id)
                 .cleanup_retired_secondary_indexes(&guards)
                 .await
                 .unwrap(),
@@ -9672,35 +9980,45 @@ fn test_runtime_layout_install_retires_removed_index_after_old_snapshot_drops() 
         );
         drop(old_layout);
         assert_eq!(
-            sys.table
+            table_for_internal_assertion(&engine, table_id)
                 .cleanup_retired_secondary_indexes(&guards)
                 .await
                 .unwrap(),
             1
         );
-        assert!(!sys.table.has_retired_secondary_indexes());
+        assert!(!table_for_internal_assertion(&engine, table_id).has_retired_secondary_indexes());
     })
 }
 
 #[test]
 fn test_dropped_unique_index_purge_delete_is_noop() {
     smol::block_on(async {
-        let sys = TestSys::new_lightweight_evictable().await;
-        let mut session = sys.new_session().unwrap();
+        let temp_dir = TempDir::new().unwrap();
+        let engine = lightweight_test_engine(&temp_dir, "redo_testsys_lightweight").await;
+        let table_id = create_table2_for_test(&engine).await;
+        let mut session = engine.new_session().unwrap();
         let key = single_key(1i32);
         let row_id = insert_one_row(
-            &sys.table,
+            table_id,
             &mut session,
             vec![Val::from(1i32), Val::from("name")],
         )
         .await;
-        sys.table.freeze(&session, usize::MAX).await.unwrap();
-        checkpoint_published(&sys.table, &mut session).await;
-        let mut hold_session = sys.new_session().unwrap();
+        session.freeze_table(table_id, usize::MAX).await.unwrap();
+        checkpoint_published(table_id, &mut session).await;
+        let mut hold_session = engine.new_session().unwrap();
         let hold_trx = hold_session.begin_trx().unwrap();
-        sys.new_trx_delete(&mut session, &key).await;
-        let min_active_sts = delete_marker_ts(sys.table.deletion_buffer().get(row_id).unwrap()) + 1;
-        let index = bound_unique_index_no(&sys.table, key.index_no);
+        expect_delete_committed(table_id, &mut session, &key).await;
+        let min_active_sts = delete_marker_ts(
+            table_for_internal_assertion(&engine, table_id)
+                .deletion_buffer()
+                .get(row_id)
+                .unwrap(),
+        ) + 1;
+        let index = bound_unique_index_no(
+            &table_for_internal_assertion(&engine, table_id),
+            key.index_no,
+        );
         assert!(matches!(
             index
                 .lookup(
@@ -9713,12 +10031,11 @@ fn test_dropped_unique_index_purge_delete_is_noop() {
             Some((actual_row_id, true)) if actual_row_id == row_id
         ));
 
-        session.drop_index(sys.table.table_id(), 0).await.unwrap();
+        session.drop_index(table_id, 0).await.unwrap();
 
-        let layout = sys.table.layout_snapshot();
+        let layout = table_for_internal_assertion(&engine, table_id).layout_snapshot();
 
-        let deleted = sys
-            .table
+        let deleted = table_for_internal_assertion(&engine, table_id)
             .accessor_with_layout(&layout)
             .delete_index(&session.pool_guards(), &key, row_id, true, min_active_sts)
             .await
@@ -9731,12 +10048,17 @@ fn test_dropped_unique_index_purge_delete_is_noop() {
 #[test]
 fn test_checkpoint_reachability_reclaims_dropped_secondary_disk_tree_root() {
     smol::block_on(async {
-        let sys = TestSys::new_lightweight_evictable().await;
-        let mut session = sys.new_session().unwrap();
-        insert_rows(&sys, &mut session, 0, 64, "drop-index-reclaim").await;
-        sys.table.freeze(&session, usize::MAX).await.unwrap();
-        checkpoint_published(&sys.table, &mut session).await;
-        let indexed_root = sys.table.file().active_root_unchecked().clone();
+        let temp_dir = TempDir::new().unwrap();
+        let engine = lightweight_test_engine(&temp_dir, "redo_testsys_lightweight").await;
+        let table_id = create_table2_for_test(&engine).await;
+        let mut session = engine.new_session().unwrap();
+        insert_rows(table_id, &mut session, 0, 64, "drop-index-reclaim").await;
+        session.freeze_table(table_id, usize::MAX).await.unwrap();
+        checkpoint_published(table_id, &mut session).await;
+        let indexed_root = table_for_internal_assertion(&engine, table_id)
+            .file()
+            .active_root_unchecked()
+            .clone();
         let dropped_disk_root = indexed_root.secondary_index_roots[0];
         assert_ne!(dropped_disk_root, SUPER_BLOCK_ID);
         assert!(
@@ -9745,8 +10067,11 @@ fn test_checkpoint_reachability_reclaims_dropped_secondary_disk_tree_root() {
                 .is_allocated(usize::from(dropped_disk_root))
         );
 
-        session.drop_index(sys.table.table_id(), 0).await.unwrap();
-        let after_drop_root = sys.table.file().active_root_unchecked().clone();
+        session.drop_index(table_id, 0).await.unwrap();
+        let after_drop_root = table_for_internal_assertion(&engine, table_id)
+            .file()
+            .active_root_unchecked()
+            .clone();
         assert_eq!(after_drop_root.secondary_index_roots[0], SUPER_BLOCK_ID);
         assert!(
             after_drop_root
@@ -9756,8 +10081,11 @@ fn test_checkpoint_reachability_reclaims_dropped_secondary_disk_tree_root() {
         );
 
         wait_gc_cutoff_after(&session, after_drop_root.effective_ts()).await;
-        checkpoint_published(&sys.table, &mut session).await;
-        let after_reclaim = sys.table.file().active_root_unchecked();
+        checkpoint_published(table_id, &mut session).await;
+        let after_reclaim = table_for_internal_assertion(&engine, table_id)
+            .file()
+            .active_root_unchecked()
+            .clone();
         assert!(
             !after_reclaim
                 .alloc_map
@@ -9770,24 +10098,34 @@ fn test_checkpoint_reachability_reclaims_dropped_secondary_disk_tree_root() {
 #[test]
 fn test_dropped_non_unique_index_purge_delete_is_noop() {
     smol::block_on(async {
-        let sys = TestSys::new_evictable_with_non_unique_name_index().await;
-        let mut session = sys.new_session().unwrap();
-        let table_id = sys.table.table_id();
+        let temp_dir = TempDir::new().unwrap();
+        let engine =
+            evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys_non_unique").await;
+        let table_id = create_non_unique_name_table_for_test(&engine).await;
+        let mut session = engine.new_session().unwrap();
         let pk = single_key(1i32);
         let row_id = insert_one_row(
-            &sys.table,
+            table_id,
             &mut session,
             vec![Val::from(1i32), Val::from("name")],
         )
         .await;
         let key = name_key("name");
-        sys.table.freeze(&session, usize::MAX).await.unwrap();
-        checkpoint_published(&sys.table, &mut session).await;
-        let mut hold_session = sys.new_session().unwrap();
+        session.freeze_table(table_id, usize::MAX).await.unwrap();
+        checkpoint_published(table_id, &mut session).await;
+        let mut hold_session = engine.new_session().unwrap();
         let hold_trx = hold_session.begin_trx().unwrap();
-        sys.new_trx_delete(&mut session, &pk).await;
-        let min_active_sts = delete_marker_ts(sys.table.deletion_buffer().get(row_id).unwrap()) + 1;
-        let index = bound_non_unique_index_no(&sys.table, key.index_no);
+        expect_delete_committed(table_id, &mut session, &pk).await;
+        let min_active_sts = delete_marker_ts(
+            table_for_internal_assertion(&engine, table_id)
+                .deletion_buffer()
+                .get(row_id)
+                .unwrap(),
+        ) + 1;
+        let index = bound_non_unique_index_no(
+            &table_for_internal_assertion(&engine, table_id),
+            key.index_no,
+        );
         assert!(matches!(
             index
                 .lookup_unique(
@@ -9806,10 +10144,9 @@ fn test_dropped_non_unique_index_purge_delete_is_noop() {
             .await
             .unwrap();
 
-        let layout = sys.table.layout_snapshot();
+        let layout = table_for_internal_assertion(&engine, table_id).layout_snapshot();
 
-        let deleted = sys
-            .table
+        let deleted = table_for_internal_assertion(&engine, table_id)
             .accessor_with_layout(&layout)
             .delete_index(&session.pool_guards(), &key, row_id, false, min_active_sts)
             .await
@@ -9822,8 +10159,10 @@ fn test_dropped_non_unique_index_purge_delete_is_noop() {
 #[test]
 fn test_runtime_layout_install_rejects_shrinking_index_slots() {
     smol::block_on(async {
-        let sys = TestSys::new_lightweight_evictable().await;
-        let old_layout = sys.table.layout_snapshot();
+        let temp_dir = TempDir::new().unwrap();
+        let engine = lightweight_test_engine(&temp_dir, "redo_testsys_lightweight").await;
+        let table_id = create_table2_for_test(&engine).await;
+        let old_layout = table_for_internal_assertion(&engine, table_id).layout_snapshot();
         assert_eq!(old_layout.index_slot_count(), 1);
 
         let shrinking_metadata = Arc::new(
@@ -9843,8 +10182,7 @@ fn test_runtime_layout_install_rejects_shrinking_index_slots() {
         )
         .unwrap();
 
-        let result = sys
-            .table
+        let result = table_for_internal_assertion(&engine, table_id)
             .install_runtime_layout(old_layout.generation(), shrinking_layout);
         assert!(result.is_err());
         let err = result.err().unwrap();
@@ -9853,7 +10191,9 @@ fn test_runtime_layout_install_rejects_shrinking_index_slots() {
             "{err:?}"
         );
         assert_eq!(
-            sys.table.layout_snapshot().generation(),
+            table_for_internal_assertion(&engine, table_id)
+                .layout_snapshot()
+                .generation(),
             old_layout.generation()
         );
     })
@@ -9873,26 +10213,27 @@ fn test_secondary_index_rollback() {
             .unwrap();
         let table_id = table4(&engine).await;
         {
-            let table = engine.catalog().get_table(table_id).await.unwrap();
-
             let mut session = engine.new_session().unwrap();
             let user_read_set = &[0usize, 1];
             let mut trx = session.begin_trx().unwrap();
             for i in 0i32..5i32 {
-                let res = trx_insert_row(&mut trx, &table, vec![Val::from(i), Val::from(i)]).await;
+                let res =
+                    trx_insert_row_by_id(&mut trx, table_id, vec![Val::from(i), Val::from(i)])
+                        .await;
                 assert!(res.is_ok());
             }
             trx.commit().await.unwrap();
 
             let mut trx = session.begin_trx().unwrap();
             let res =
-                trx_insert_row(&mut trx, &table, vec![Val::from(5i32), Val::from(5i32)]).await;
+                trx_insert_row_by_id(&mut trx, table_id, vec![Val::from(5i32), Val::from(5i32)])
+                    .await;
             assert!(res.is_ok());
             trx.rollback().await.unwrap();
 
             let mut trx = session.begin_trx().unwrap();
             let key = SelectKey::new(0, vec![Val::from(5i32)]);
-            let res = trx_select_row_mvcc(&mut trx, &table, &key, user_read_set).await;
+            let res = trx_select_row_mvcc_by_id(&mut trx, table_id, &key, user_read_set).await;
             trx.commit().await.unwrap();
             assert!(matches!(res, Ok(SelectMvcc::NotFound)));
 
@@ -9902,13 +10243,13 @@ fn test_secondary_index_rollback() {
                 idx: 1,
                 val: Val::from(0i32),
             }];
-            let res = trx_update_row(&mut trx, &table, &key, update).await;
+            let res = trx_update_row_by_id(&mut trx, table_id, &key, update).await;
             assert!(matches!(res, Ok(UpdateMvcc::Updated(_))));
             trx.rollback().await.unwrap();
 
             let mut trx = session.begin_trx().unwrap();
             let key = SelectKey::new(0, vec![Val::from(1i32)]);
-            let res = trx_select_row_mvcc(&mut trx, &table, &key, user_read_set).await;
+            let res = trx_select_row_mvcc_by_id(&mut trx, table_id, &key, user_read_set).await;
             trx.commit().await.unwrap();
             assert!(matches!(res, Ok(SelectMvcc::Found(_))));
             let vals = res.unwrap().unwrap_found();
@@ -9916,13 +10257,13 @@ fn test_secondary_index_rollback() {
 
             let mut trx = session.begin_trx().unwrap();
             let key = SelectKey::new(0, vec![Val::from(0i32)]);
-            let res = trx_delete_row(&mut trx, &table, &key).await;
+            let res = trx_delete_row_by_id(&mut trx, table_id, &key).await;
             assert!(matches!(res, Ok(DeleteMvcc::Deleted)));
             trx.rollback().await.unwrap();
 
             let mut trx = session.begin_trx().unwrap();
             let key = SelectKey::new(0, vec![Val::from(0i32)]);
-            let res = trx_select_row_mvcc(&mut trx, &table, &key, user_read_set).await;
+            let res = trx_select_row_mvcc_by_id(&mut trx, table_id, &key, user_read_set).await;
             trx.commit().await.unwrap();
             assert!(matches!(res, Ok(SelectMvcc::Found(_))));
             let vals = res.unwrap().unwrap_found();
@@ -9930,15 +10271,16 @@ fn test_secondary_index_rollback() {
 
             let mut trx = session.begin_trx().unwrap();
             let key = SelectKey::new(0, vec![Val::from(3i32)]);
-            let res = trx_delete_row(&mut trx, &table, &key).await;
+            let res = trx_delete_row_by_id(&mut trx, table_id, &key).await;
             assert!(matches!(res, Ok(DeleteMvcc::Deleted)));
-            let res = trx_insert_row(&mut trx, &table, vec![Val::from(3), Val::from(3)]).await;
+            let res =
+                trx_insert_row_by_id(&mut trx, table_id, vec![Val::from(3), Val::from(3)]).await;
             assert!(res.is_ok());
             trx.rollback().await.unwrap();
 
             let mut trx = session.begin_trx().unwrap();
             let key = SelectKey::new(0, vec![Val::from(3i32)]);
-            let res = trx_select_row_mvcc(&mut trx, &table, &key, user_read_set).await;
+            let res = trx_select_row_mvcc_by_id(&mut trx, table_id, &key, user_read_set).await;
             _ = trx.commit().await.unwrap();
             assert!(matches!(res, Ok(SelectMvcc::Found(_))));
             let vals = res.unwrap().unwrap_found();

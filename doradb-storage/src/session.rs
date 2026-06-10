@@ -6,7 +6,7 @@ use crate::error::{LifecycleError, OperationError, Result};
 use crate::id::{RowID, SessionID, TableID, TrxID};
 use crate::lock::{LockManager, LockMode, LockOwner, LockOwnerGroup, LockResource};
 use crate::quiescent::QuiescentGuard;
-use crate::table::Table;
+use crate::table::{CheckpointOutcome, CheckpointReadiness, SecondaryMemIndexCleanupStats, Table};
 use crate::trx::{
     StartedTransaction, Transaction, TrxCleanupReason, TrxEntry, TrxEntryState,
     transaction_discarded_err,
@@ -16,8 +16,8 @@ use error_stack::Report;
 use event_listener::{Event, Listener, listener};
 use parking_lot::Mutex;
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Weak};
 
 /// Shared session-level DDL admission context.
 pub(crate) struct SessionDdlContext {
@@ -29,17 +29,16 @@ pub(crate) struct SessionDdlContext {
 
 impl SessionDdlContext {
     #[inline]
-    pub(crate) fn new(session: &Session) -> Result<Self> {
-        let pin = session.pin("session DDL")?;
-        if pin.in_trx("session DDL")? {
+    pub(crate) fn new(session: &SessionPin) -> Result<Self> {
+        if session.in_trx("session DDL")? {
             return Err(Report::new(OperationError::NotSupported)
                 .attach("implicit commit due to DDL")
                 .into());
         }
-        let id = pin.id();
-        let pool_guards = pin.pool_guards();
+        let id = session.id();
+        let pool_guards = session.pool_guards();
         Ok(Self {
-            engine: pin.engine,
+            engine: session.engine.clone(),
             pool_guards,
             owner: LockOwner::Session(id),
             owner_group: LockOwnerGroup::Session(id),
@@ -88,13 +87,6 @@ impl Session {
         Ok(SessionPin { engine, state })
     }
 
-    /// Get a user-table runtime handle through this session's engine.
-    #[inline]
-    pub async fn get_table(&self, table_id: TableID) -> Result<Arc<Table>> {
-        let pin = self.pin("get table")?;
-        pin.engine.get_table(table_id).await
-    }
-
     /// Returns whether the session currently owns an active transaction.
     #[inline]
     pub fn in_trx(&self) -> Result<bool> {
@@ -108,19 +100,11 @@ impl Session {
         state.in_trx(OPERATION)
     }
 
-    /// Checked session transaction state query for internal operation paths.
-    #[inline]
-    pub(crate) fn checked_in_trx(&self, operation: &'static str) -> Result<bool> {
-        self.pin(operation)?.in_trx(operation)
-    }
-
     /// Begin a new transaction if the session is currently idle.
     #[inline]
     pub fn begin_trx(&mut self) -> Result<Transaction> {
-        let pin = self.pin("begin transaction")?;
-        let engine = &pin.engine;
-        pin.state
-            .begin_trx(|| engine.trx_sys.begin_trx(engine.clone(), &pin.state))
+        let session = self.pin("begin transaction")?;
+        session.begin_trx("begin transaction")
     }
 
     /// Close this session when it has no active transaction.
@@ -143,7 +127,8 @@ impl Session {
         table_spec: TableSpec,
         index_specs: Vec<IndexSpec>,
     ) -> Result<TableID> {
-        crate::catalog::create_table_for_session(self, table_spec, index_specs).await
+        let session = self.pin("session DDL")?;
+        crate::catalog::create_table_for_session(session, table_spec, index_specs).await
     }
 
     /// Build and publish a new secondary index for an existing user table.
@@ -153,66 +138,100 @@ impl Session {
         table_id: TableID,
         index_spec: IndexSpec,
     ) -> Result<IndexNo> {
-        crate::catalog::create_index_for_session(self, table_id, index_spec).await
+        let session = self.pin("session DDL")?;
+        crate::catalog::create_index_for_session(session, table_id, index_spec).await
     }
 
     /// Logically drop an active secondary index from an existing user table.
     #[inline]
     pub async fn drop_index(&mut self, table_id: TableID, index_no: IndexNo) -> Result<()> {
-        crate::catalog::drop_index_for_session(self, table_id, index_no).await
+        let session = self.pin("session DDL")?;
+        crate::catalog::drop_index_for_session(session, table_id, index_no).await
     }
 
     /// Logically drop an existing user table.
     #[inline]
     pub async fn drop_table(&mut self, table_id: TableID) -> Result<()> {
-        crate::catalog::drop_table_for_session(self, table_id).await
+        let session = self.pin("session DDL")?;
+        crate::catalog::drop_table_for_session(session, table_id).await
+    }
+
+    /// Freeze row pages for an existing user table and return approximate non-deleted rows visited.
+    #[inline]
+    pub async fn freeze_table(&self, table_id: TableID, max_rows: usize) -> Result<usize> {
+        let session = self.pin("freeze table")?;
+        let table = session.resolve_user_table(table_id, "freeze table").await?;
+        table.freeze(session, max_rows).await
+    }
+
+    /// Report whether an existing user table checkpoint can safely publish now.
+    #[inline]
+    pub fn table_checkpoint_readiness(&self, table_id: TableID) -> Result<CheckpointReadiness> {
+        let session = self.pin("check checkpoint readiness")?;
+        let Some(table) = session.find_existing_user_table_now(table_id) else {
+            return Ok(CheckpointReadiness::TableNotFound);
+        };
+        table.checkpoint_readiness(&session)
+    }
+
+    /// Persist eligible row-store and cold-delete state for an existing user table.
+    #[inline]
+    pub async fn checkpoint_table(&mut self, table_id: TableID) -> Result<CheckpointOutcome> {
+        let session = self.pin("checkpoint table")?;
+        let table = session
+            .resolve_existing_user_table(table_id, "checkpoint table")
+            .await?;
+        table.checkpoint(session).await
+    }
+
+    /// Returns total number of hot row pages for an existing user table.
+    #[inline]
+    pub async fn total_row_pages(&self, table_id: TableID) -> Result<usize> {
+        let session = self.pin("count table row pages")?;
+        let table = session
+            .resolve_user_table(table_id, "count table row pages")
+            .await?;
+        let guards = session.pool_guards();
+        Ok(table.total_row_pages(&guards).await)
+    }
+
+    /// Full-scan cleanup for an existing user table's secondary MemIndex entries.
+    #[inline]
+    pub async fn cleanup_secondary_mem_indexes(
+        &mut self,
+        table_id: TableID,
+        clean_live_entries: bool,
+    ) -> Result<SecondaryMemIndexCleanupStats> {
+        let session = self.pin("cleanup secondary mem indexes")?;
+        let table = session
+            .resolve_user_table(table_id, "cleanup secondary mem indexes")
+            .await?;
+        table
+            .cleanup_secondary_mem_indexes(session, clean_live_entries)
+            .await
     }
 
     /// Acquires an explicit session-lifetime table lock.
     #[inline]
     pub async fn lock_table(&self, table_id: TableID, mode: LockMode) -> Result<()> {
         mode.validate_explicit_table_lock()?;
-        let pin = self.pin("lock explicit table")?;
-        let session_id = pin.id();
-        let engine = pin.engine;
-        engine
-            .catalog()
-            .validate_user_table_live(table_id, "lock explicit table")
-            .await?;
-        let lock_manager = engine.lock_manager();
-        let owner = LockOwner::Session(session_id);
-        let owner_group = LockOwnerGroup::Session(session_id);
-        let (mut metadata_guard, mut data_guard) = lock_manager
-            .acquire_grouped_table_locks(table_id, mode, owner, owner_group)
-            .await?;
-        engine
-            .catalog()
-            .validate_user_table_live(table_id, "lock explicit table")
-            .await?;
-        if let Some(guard) = data_guard.as_mut() {
-            guard.disarm();
-        }
-        if let Some(guard) = metadata_guard.as_mut() {
-            guard.disarm();
-        }
-        Ok(())
+        let session = self.pin("lock explicit table")?;
+        session.lock_table(table_id, mode).await
     }
 
     /// Releases an explicit session-lifetime table lock when no transaction is active.
     #[inline]
     pub fn unlock_table(&self, table_id: TableID) -> Result<()> {
-        let pin = self.pin("unlock explicit table")?;
-        if pin.in_trx("unlock explicit table")? {
-            return Err(Report::new(OperationError::NotSupported)
-                .attach("unlock table while session has an active transaction")
-                .into());
-        }
-        let owner = LockOwner::Session(pin.id());
-        let lock_manager = pin.engine.lock_manager();
-        lock_manager.release(LockResource::TableData(table_id), owner);
-        lock_manager.release(LockResource::TableMetadata(table_id), owner);
-        Ok(())
+        let session = self.pin("unlock explicit table")?;
+        session.unlock_table(table_id)
     }
+}
+
+#[inline]
+fn table_not_found_error(table_id: TableID, operation: &'static str) -> crate::error::Error {
+    Report::new(OperationError::TableNotFound)
+        .attach(format!("operation={operation}, table_id={table_id}"))
+        .into()
 }
 
 impl Drop for Session {
@@ -246,10 +265,109 @@ impl SessionPin {
         self.state.pool_guards().clone()
     }
 
+    /// Begin a new transaction from this already pinned session operation.
+    #[inline]
+    pub(crate) fn begin_trx(&self, operation: &'static str) -> Result<Transaction> {
+        let engine = &self.engine;
+        self.state
+            .begin_trx(operation, || engine.trx_sys.begin_trx(engine, &self.state))
+    }
+
     /// Returns whether the pinned session is in an active transaction.
     #[inline]
     pub(crate) fn in_trx(&self, operation: &'static str) -> Result<bool> {
         self.state.in_trx(operation)
+    }
+
+    #[inline]
+    pub(crate) async fn resolve_user_table(
+        &self,
+        table_id: TableID,
+        operation: &'static str,
+    ) -> Result<Arc<Table>> {
+        if let Some(table) = self.state.cached_user_table(table_id) {
+            table.check_foreground_live(operation)?;
+            return Ok(table);
+        }
+        let table = self
+            .engine
+            .catalog()
+            .validate_user_table_live(table_id, operation)
+            .await?;
+        self.state.cache_user_table(&table);
+        Ok(table)
+    }
+
+    #[inline]
+    pub(crate) async fn resolve_existing_user_table(
+        &self,
+        table_id: TableID,
+        operation: &'static str,
+    ) -> Result<Arc<Table>> {
+        if let Some(table) = self.state.cached_user_table(table_id) {
+            return Ok(table);
+        }
+        let table = self
+            .engine
+            .catalog()
+            .get_table(table_id)
+            .await
+            .ok_or_else(|| table_not_found_error(table_id, operation))?;
+        self.state.cache_user_table(&table);
+        Ok(table)
+    }
+
+    #[inline]
+    pub(crate) fn find_existing_user_table_now(&self, table_id: TableID) -> Option<Arc<Table>> {
+        if let Some(table) = self.state.cached_user_table(table_id) {
+            return Some(table);
+        }
+        let table = self.engine.catalog().get_table_now(table_id)?;
+        self.state.cache_user_table(&table);
+        Some(table)
+    }
+
+    /// Acquires an explicit session-lifetime table lock from this pinned session.
+    #[inline]
+    pub(crate) async fn lock_table(&self, table_id: TableID, mode: LockMode) -> Result<()> {
+        let session_id = self.id();
+        let engine = &self.engine;
+        engine
+            .catalog()
+            .validate_user_table_live(table_id, "lock explicit table")
+            .await?;
+        let lock_manager = engine.lock_manager();
+        let owner = LockOwner::Session(session_id);
+        let owner_group = LockOwnerGroup::Session(session_id);
+        let (mut metadata_guard, mut data_guard) = lock_manager
+            .acquire_grouped_table_locks(table_id, mode, owner, owner_group)
+            .await?;
+        engine
+            .catalog()
+            .validate_user_table_live(table_id, "lock explicit table")
+            .await?;
+        if let Some(guard) = data_guard.as_mut() {
+            guard.disarm();
+        }
+        if let Some(guard) = metadata_guard.as_mut() {
+            guard.disarm();
+        }
+        Ok(())
+    }
+
+    /// Releases an explicit session-lifetime table lock from this pinned session.
+    #[inline]
+    pub(crate) fn unlock_table(&self, table_id: TableID) -> Result<()> {
+        if self.in_trx("unlock explicit table")? {
+            return Err(Report::new(OperationError::NotSupported)
+                .attach("unlock table while session has an active transaction")
+                .into());
+        }
+        let owner = LockOwner::Session(self.id());
+        let lock_manager = self.engine.lock_manager();
+        lock_manager.release(LockResource::TableData(table_id), owner);
+        lock_manager.release(LockResource::TableMetadata(table_id), owner);
+        Ok(())
     }
 }
 
@@ -482,6 +600,7 @@ pub(crate) struct SessionState {
     lock_manager: QuiescentGuard<LockManager>,
     lifecycle: Mutex<SessionLifecycle>,
     last_cts: AtomicU64,
+    table_cache: Mutex<HashMap<TableID, Weak<Table>>>,
     active_insert_pages: Mutex<HashMap<TableID, (VersionedPageID, RowID)>>,
 }
 
@@ -502,6 +621,7 @@ impl SessionState {
             lock_manager,
             lifecycle: Mutex::new(SessionLifecycle::RunningIdle),
             last_cts: AtomicU64::new(0),
+            table_cache: Mutex::new(HashMap::new()),
             active_insert_pages: Mutex::new(HashMap::new()),
         }
     }
@@ -556,17 +676,21 @@ impl SessionState {
     }
 
     #[inline]
-    fn begin_trx(&self, begin: impl FnOnce() -> StartedTransaction) -> Result<Transaction> {
+    fn begin_trx(
+        &self,
+        operation: &'static str,
+        begin: impl FnOnce() -> StartedTransaction,
+    ) -> Result<Transaction> {
         let mut lifecycle = self.lifecycle.lock();
         match &*lifecycle {
             SessionLifecycle::RunningIdle => {}
             SessionLifecycle::RunningActive { entry } => {
-                return Err(self.active_transaction_err("begin transaction", entry));
+                return Err(self.active_transaction_err(operation, entry));
             }
             SessionLifecycle::AbandonedIdle
             | SessionLifecycle::AbandonedActive { .. }
             | SessionLifecycle::Closed => {
-                return Err(closed_session_error(self.id, "begin transaction"));
+                return Err(closed_session_error(self.id, operation));
             }
         }
         let trx = begin();
@@ -749,6 +873,27 @@ impl SessionState {
         }
     }
 
+    /// Upgrade a cached user-table runtime if the session weak cache still reaches it.
+    #[inline]
+    pub(crate) fn cached_user_table(&self, table_id: TableID) -> Option<Arc<Table>> {
+        let mut cache = self.table_cache.lock();
+        let weak = cache.get(&table_id)?;
+        match weak.upgrade() {
+            Some(table) => Some(table),
+            None => {
+                cache.remove(&table_id);
+                None
+            }
+        }
+    }
+
+    /// Remember a successfully resolved user-table runtime without extending its lifetime.
+    #[inline]
+    pub(crate) fn cache_user_table(&self, table: &Arc<Table>) {
+        let mut cache = self.table_cache.lock();
+        cache.insert(table.table_id(), Arc::downgrade(table));
+    }
+
     /// Remove and return the cached insert page for a table, if present.
     #[inline]
     pub fn load_active_insert_page(&self, table_id: TableID) -> Option<(VersionedPageID, RowID)> {
@@ -838,6 +983,18 @@ impl TrxAttachment {
     #[inline]
     pub(crate) fn pool_guards(&self) -> &PoolGuards {
         &self.pool_guards
+    }
+
+    /// Upgrade a cached session-local user-table runtime if it is still alive.
+    #[inline]
+    pub(crate) fn cached_user_table(&self, table_id: TableID) -> Option<Arc<Table>> {
+        self.session.cached_user_table(table_id)
+    }
+
+    /// Store a weak session-local table cache entry after successful resolution.
+    #[inline]
+    pub(crate) fn cache_user_table(&self, table: &Arc<Table>) {
+        self.session.cache_user_table(table);
     }
 
     /// Remove and return the cached insert page for a table, if session state remains.
@@ -980,10 +1137,10 @@ pub(crate) mod tests {
 
         #[inline]
         fn last_cts(&self) -> TrxID {
-            let pin = self
+            let session = self
                 .pin("test session last commit timestamp")
                 .expect("test session must be running");
-            TrxID::new(pin.state.last_cts.load(Ordering::SeqCst))
+            TrxID::new(session.state.last_cts.load(Ordering::SeqCst))
         }
 
         #[inline]

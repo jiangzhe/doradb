@@ -5,7 +5,7 @@ use doradb_storage::{
 use tempfile::TempDir;
 
 #[test]
-fn public_facade_supports_table_lookup_and_mvcc_dml() {
+fn public_facade_supports_table_id_mvcc_dml() {
     smol::block_on(async {
         let root = TempDir::new().unwrap();
         let engine: Engine = EngineConfig::default()
@@ -28,12 +28,11 @@ fn public_facade_supports_table_lookup_and_mvcc_dml() {
             )
             .await
             .unwrap();
-        let table = session.get_table(table_id).await.unwrap();
 
         let mut trx = session.begin_trx().unwrap();
         let _inserted = trx
             .exec(async |stmt| {
-                stmt.table_insert_mvcc(&table, vec![Val::I32(1), Val::from("alice")])
+                stmt.table_insert_mvcc(table_id, vec![Val::I32(1), Val::from("alice")])
                     .await
             })
             .await
@@ -44,7 +43,7 @@ fn public_facade_supports_table_lookup_and_mvcc_dml() {
         let selected = trx
             .exec(async |stmt| {
                 stmt.table_lookup_unique_mvcc(
-                    &table,
+                    table_id,
                     &SelectKey::new(0, vec![Val::I32(1)]),
                     &[0, 1],
                 )
@@ -62,7 +61,7 @@ fn public_facade_supports_table_lookup_and_mvcc_dml() {
         let updated = trx
             .exec(async |stmt| {
                 stmt.table_update_unique_mvcc(
-                    &table,
+                    table_id,
                     &SelectKey::new(0, vec![Val::I32(1)]),
                     vec![UpdateCol {
                         idx: 1,
@@ -80,7 +79,7 @@ fn public_facade_supports_table_lookup_and_mvcc_dml() {
         let rows = trx
             .exec(async |stmt| {
                 let mut rows = Vec::new();
-                stmt.table_scan_mvcc(&table, &[0, 1], |row| {
+                stmt.table_scan_mvcc(table_id, &[0, 1], |row| {
                     rows.push(row);
                     true
                 })
@@ -94,7 +93,7 @@ fn public_facade_supports_table_lookup_and_mvcc_dml() {
         let scanned = trx
             .exec(async |stmt| {
                 stmt.table_index_scan_mvcc(
-                    &table,
+                    table_id,
                     &SelectKey::new(1, vec![Val::from("bob")]),
                     &[0, 1],
                 )
@@ -111,8 +110,12 @@ fn public_facade_supports_table_lookup_and_mvcc_dml() {
         let mut trx = session.begin_trx().unwrap();
         let deleted = trx
             .exec(async |stmt| {
-                stmt.table_delete_unique_mvcc(&table, &SelectKey::new(0, vec![Val::I32(1)]), false)
-                    .await
+                stmt.table_delete_unique_mvcc(
+                    table_id,
+                    &SelectKey::new(0, vec![Val::I32(1)]),
+                    false,
+                )
+                .await
             })
             .await
             .unwrap();
@@ -123,7 +126,7 @@ fn public_facade_supports_table_lookup_and_mvcc_dml() {
         let selected = trx
             .exec(async |stmt| {
                 stmt.table_lookup_unique_mvcc(
-                    &table,
+                    table_id,
                     &SelectKey::new(0, vec![Val::I32(1)]),
                     &[0, 1],
                 )
@@ -135,7 +138,6 @@ fn public_facade_supports_table_lookup_and_mvcc_dml() {
         trx.commit().await.unwrap();
 
         session.close().await.unwrap();
-        drop(table);
         engine.shutdown().unwrap();
     });
 }

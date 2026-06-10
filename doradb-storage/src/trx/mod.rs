@@ -43,17 +43,19 @@ use crate::lock::{
 };
 use crate::quiescent::QuiescentGuard;
 use crate::session::TrxAttachment;
+use crate::table::Table;
 use crate::trx::log_replay::TrxLog;
 use crate::trx::redo::{DDLRedo, RedoHeader, RedoLogs, RedoTrxKind};
 use crate::trx::undo::{IndexPurgeEntry, IndexUndoLogs, RowUndoHead, RowUndoLogs, UndoStatus};
 use error_stack::Report;
 use event_listener::{Event, EventListener};
 use parking_lot::Mutex;
+use std::collections::HashMap;
 use std::marker::PhantomData;
 use std::mem;
 use std::ops::AsyncFnOnce;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
+use std::sync::{Arc, Weak};
 
 pub use stmt::Statement;
 pub(crate) const MIN_SNAPSHOT_TS: TrxID = TrxID::new(1);
@@ -1284,6 +1286,7 @@ impl TrxTableLockGuards<'_> {
 pub(crate) struct TrxInner {
     ctx: TrxContext,
     effects: TrxEffects,
+    table_cache: HashMap<TableID, Weak<Table>>,
     lock_state: Option<OwnerLockState>,
     next_stmt_no: StmtNo,
     active: bool,
@@ -1302,6 +1305,7 @@ impl TrxInner {
         TrxInner {
             ctx: TrxContext::new(trx_id, sts, log_no, gc_no),
             effects: TrxEffects::empty(),
+            table_cache: HashMap::new(),
             lock_state: Some(OwnerLockState::new_grouped(
                 LockOwner::Transaction(trx_id),
                 owner_group,
@@ -1448,6 +1452,26 @@ impl TrxInner {
                 .attach(format!("trx_id={}", self.trx_id()))
         })?;
         Ok(stmt_no)
+    }
+
+    /// Upgrade a cached user-table runtime if this transaction weak cache can still reach it.
+    #[inline]
+    pub(crate) fn cached_user_table(&mut self, table_id: TableID) -> Option<Arc<Table>> {
+        let weak = self.table_cache.get(&table_id)?;
+        match weak.upgrade() {
+            Some(table) => Some(table),
+            None => {
+                self.table_cache.remove(&table_id);
+                None
+            }
+        }
+    }
+
+    /// Remember a successfully resolved user-table runtime without extending its lifetime.
+    #[inline]
+    pub(crate) fn cache_user_table(&mut self, table: &Arc<Table>) {
+        self.table_cache
+            .insert(table.table_id(), Arc::downgrade(table));
     }
 
     /// Returns this transaction's current status timestamp.
@@ -3289,7 +3313,7 @@ pub(crate) mod tests {
             let row_id = trx3
                 .exec(async |stmt| {
                     stmt.table_insert_mvcc(
-                        &table,
+                        table_id,
                         vec![Val::from(91_263i32), Val::from(&large[..])],
                     )
                     .await
@@ -3307,7 +3331,7 @@ pub(crate) mod tests {
                 let mut trx = writer.begin_trx().unwrap();
                 trx.exec(async |stmt| {
                     stmt.table_insert_mvcc(
-                        &table,
+                        table_id,
                         vec![Val::from(92_000i32 + i), Val::from(&large[..])],
                     )
                     .await?;
