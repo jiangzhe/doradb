@@ -1,7 +1,7 @@
 ---
 id: 000172
 title: Extract Notification Helper And Fix Prepare Waiters
-status: proposal
+status: implemented
 created: 2026-06-11
 github_issue: 692
 ---
@@ -294,6 +294,49 @@ tools/unsafe_inventory.rs --write docs/unsafe-usage-baseline.md
 
 ## Implementation Notes
 
+Implemented in branch `notify-prepare` for GitHub issue `#692`.
+
+- Added crate-private `ChangeNotifier` in `doradb-storage/src/notify.rs` with
+  epoch reads, all-waiter notification, and check-listen-recheck
+  `wait_since` behavior. Focused tests cover prior notifications, future
+  notifications, and monotonic epoch advancement.
+- Refactored `SessionRegistry` in `doradb-storage/src/session.rs` to delegate
+  transaction lifecycle notifications to `ChangeNotifier` while preserving the
+  existing crate-private wrapper methods and shutdown/active-transaction
+  behavior.
+- Reworked `SharedTrxStatus` prepare completion in
+  `doradb-storage/src/trx/mod.rs` to store `EventNotifyOnDrop`, centralize
+  prepare enter/listen/finish transitions, publish commit CTS before waking
+  prepare waiters, and release failed-precommit waiters after rollback/session
+  cleanup.
+- Added prepare-waiter regressions for normal precommit commit and
+  failed-precommit rollback. Both tests assert existing listeners wake and late
+  listener lookup returns `None`.
+- Addressed the post-implementation test-path review by removing the synthetic
+  `test_transaction_with_parts` helper and the low-value
+  `test_transaction_new_splits_context_and_empty_effects` test. Transaction
+  behavior tests that needed real lifecycle wiring now use the production
+  `Session::begin_trx` path through test helpers.
+- No unsafe code was added or modified. A date-only unsafe inventory refresh was
+  dropped during resolve as unrelated metadata churn.
+
+Validation completed during resolve:
+
+- `cargo fmt --all -- --check`: passed.
+- `cargo clippy -p doradb-storage --all-targets -- -D warnings`: passed.
+- `cargo nextest run -p doradb-storage`: 919 tests passed.
+- `tools/coverage_focus.rs --verbose --path doradb-storage/src/notify.rs --path doradb-storage/src/session.rs --path doradb-storage/src/trx`:
+  deduplicated focused coverage 11255/11905 lines, 94.54%; `notify.rs`
+  95.12%, `session.rs` 96.67%, `trx` 94.39%.
+- `tools/task.rs resolve-task-next-id --task docs/tasks/000172-extract-notification-helper-and-fix-prepare-waiters.md`:
+  updated `docs/tasks/next-id` from `000172` to `000173`.
+- `tools/task.rs resolve-task-rfc --task docs/tasks/000172-extract-notification-helper-and-fix-prepare-waiters.md`:
+  no parent RFC reference found; no RFC update required.
+
+Resolve-time tracking updates:
+
+- Source backlog `000119` was archived as implemented:
+  `docs/backlogs/closed/000119-extract-notification-helpers-and-fix-prepare-waiters.md`.
 
 ## Impacts
 
