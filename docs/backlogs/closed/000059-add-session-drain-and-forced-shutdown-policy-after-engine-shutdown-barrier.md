@@ -33,3 +33,12 @@ When a backlog item is moved to `docs/backlogs/closed/`, append:
 - Reference: <task/issue/pr reference>
 - Closed At: <YYYY-MM-DD>
 ```
+
+## Close Reason
+
+- Type: implemented
+- Detail: Implemented by the RFC-0019 weak-handle shutdown model. Public sessions and transactions are weak capabilities; Engine::shutdown closes admission and waits for active admissions, runtime pins, active transactions, abandoned transaction cleanup, and idle-session removal before component shutdown. Engine::try_shutdown provides the nonblocking retry policy by returning ShutdownBusy while work remains. No separate forced-stop API is exposed; the implemented policy is blocking drain plus retryable busy outcome.
+- Closed By: backlog close
+- Reference: Verified against doradb-storage/src/engine.rs, doradb-storage/src/session.rs, docs/engine-component-lifetime.md, docs/tasks/000165-session-handle-registry-ownership.md, and docs/tasks/000171-public-strong-handle-removal-documentation-sync.md on 2026-06-11. Validation: cargo nextest run -p doradb-storage engine_shutdown; cargo nextest run -p doradb-storage shutdown.
+
+- Closed At: 2026-06-11

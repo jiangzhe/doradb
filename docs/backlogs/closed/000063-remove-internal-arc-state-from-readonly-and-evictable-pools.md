@@ -32,3 +32,11 @@ When a backlog item is moved to `docs/backlogs/closed/`, append:
 - Reference: <task/issue/pr reference>
 - Closed At: <YYYY-MM-DD>
 ```
+
+## Close Reason
+
+- Type: wontfix
+- Detail: Removing the internal Arc state from readonly and evictable buffer pools is not expected to provide enough benefit to justify the cleanup work, so the follow-up is not planned.
+- Closed By: backlog close
+- Reference: User request to close backlog 000063 on 2026-06-11.
+- Closed At: 2026-06-11

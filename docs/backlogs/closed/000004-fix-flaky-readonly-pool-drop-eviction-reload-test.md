@@ -25,3 +25,11 @@ The test is stable in repeated runs and no longer shows intermittent `Option::un
 ## Notes (Optional)
 
 This backlog item is standalone and not a follow-up of existing task `000041`.
+
+## Close Reason
+
+- Type: stale
+- Detail: This flaky readonly-pool drop/eviction/reload test issue has not been observed again, so keeping a dedicated backlog item open is no longer useful.
+- Closed By: backlog close
+- Reference: User request to close backlog 000004 as stale on 2026-06-11.
+- Closed At: 2026-06-11
