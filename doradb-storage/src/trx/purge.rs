@@ -5,6 +5,7 @@ use crate::error::{FatalError, Result};
 use crate::file::table_file::OldRoot;
 use crate::id::{PageID, TableID, TrxID};
 use crate::latch::LatchFallbackMode;
+use crate::map::{FastHashMap, FastHashSet};
 use crate::quiescent::{QuiescentGuard, SyncQuiescentGuard};
 use crate::row::RowPage;
 use crate::table::Table;
@@ -18,8 +19,7 @@ use async_executor::LocalExecutor;
 use crossbeam_utils::CachePadded;
 use flume::{Receiver, Sender};
 use parking_lot::Mutex;
-use std::collections::HashSet;
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread::JoinHandle;
@@ -305,8 +305,8 @@ impl TransactionSystem {
         log_no: usize,
         trx_list: Vec<CommittedTrx>,
         min_active_sts: TrxID,
-    ) -> Result<HashSet<PageID>> {
-        let res: Result<HashSet<PageID>> = async {
+    ) -> Result<FastHashSet<PageID>> {
+        let res: Result<FastHashSet<PageID>> = async {
             let partition = &self.log_partitions[log_no];
             let mut table_cache = TableCache::new(catalog);
             let purge_trx_count = trx_list.len();
@@ -382,7 +382,7 @@ impl TransactionSystem {
                     }
                 }
             }
-            let mut gc_row_pages = HashSet::new();
+            let mut gc_row_pages = FastHashSet::default();
             for trx in &trx_list {
                 if let Some(pages) = trx.gc_row_pages() {
                     gc_row_pages.extend(pages.iter().copied());
@@ -417,7 +417,7 @@ impl TransactionSystem {
         &self,
         mem_pool: &EvictableBufferPool,
         guards: &PoolGuards,
-        gc_row_pages: HashSet<PageID>,
+        gc_row_pages: FastHashSet<PageID>,
     ) -> Result<()> {
         for page_id in gc_row_pages {
             let page_guard = mem_pool
@@ -539,7 +539,7 @@ pub(super) struct ActiveStsList {
     // ordered snapshot timestamps.
     pub(super) active: VecDeque<TrxID>,
     // cached deleted snapshot timestamps if it's not smallest.
-    pub(super) deleted: HashSet<TrxID>,
+    pub(super) deleted: FastHashSet<TrxID>,
 }
 
 impl ActiveStsList {
@@ -606,7 +606,7 @@ impl LogPartition {
     /// Analyze committed transaction and modify active sts list and committed transaction list.
     /// Returns whether min_active_sts may change.
     #[inline]
-    fn gc_analyze(&self, trx_list: HashMap<usize, Vec<CommittedTrx>>) -> bool {
+    fn gc_analyze(&self, trx_list: FastHashMap<usize, Vec<CommittedTrx>>) -> bool {
         let mut changed = false;
         for (gc_no, trx_list) in trx_list {
             let gc_bucket = &self.gc_buckets[gc_no];
@@ -718,7 +718,7 @@ impl GCBucket {
 pub(crate) enum GC {
     Stop,
     // transaction list per gc bucket.
-    Commit(HashMap<usize, Vec<CommittedTrx>>),
+    Commit(FastHashMap<usize, Vec<CommittedTrx>>),
 }
 
 /// Commands sent to purge workers.
@@ -842,7 +842,7 @@ impl PurgeLoop for PurgeSingleThreaded {
             if work.full_gc && curr_sts > min_sts {
                 // Start GC. Purge undo/index for all partitions first, then
                 // deallocate retired row pages once to avoid cross-partition ordering issue.
-                let mut gc_row_pages = HashSet::new();
+                let mut gc_row_pages = FastHashSet::default();
                 for partition in &*trx_sys.log_partitions {
                     let mut trx_list = vec![];
                     for gc_bucket in &partition.gc_buckets {
@@ -946,7 +946,7 @@ impl PurgeLoop for PurgeDispatcher {
                 }
                 let gc_row_pages = {
                     let mut g = gc_row_pages.lock();
-                    g.drain(..).collect::<HashSet<PageID>>()
+                    g.drain(..).collect::<FastHashSet<PageID>>()
                 };
                 if !handle_gc_row_page_deallocation_result(
                     trx_sys,

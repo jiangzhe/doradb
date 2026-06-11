@@ -40,6 +40,7 @@ use crate::index::{
     SecondaryIndex, UniqueMemIndex,
 };
 use crate::lwc::LwcBuilder;
+use crate::map::FastHashMap;
 use crate::quiescent::QuiescentGuard;
 use crate::row::ops::{SelectKey, UpdateCol};
 use crate::row::{RowPage, RowRead, var_len_for_insert};
@@ -51,7 +52,6 @@ use crate::trx::{MAX_SNAPSHOT_TS, TrxContext, TrxReadProof, trx_is_committed};
 use crate::value::{PAGE_VAR_LEN_INLINE, Val};
 use error_stack::Report;
 use parking_lot::Mutex;
-use std::collections::HashMap;
 use std::marker::PhantomData;
 use std::sync::Arc;
 use std::time::Duration;
@@ -1268,7 +1268,7 @@ enum UpdateRowInplace {
     // The hash map stores the changed column number and its old value.
     // for other columns in the changed index, we can read value(old and new are same)
     // from current page.
-    Ok(RowID, HashMap<usize, Val>, PageSharedGuard<RowPage>),
+    Ok(RowID, FastHashMap<usize, Val>, PageSharedGuard<RowPage>),
     RowNotFound,
     RowDeleted,
     WriteConflict,
@@ -1289,7 +1289,10 @@ enum DeleteInternal {
 }
 
 #[inline]
-fn index_key_is_changed(index_spec: &IndexSpec, index_change_cols: &HashMap<usize, Val>) -> bool {
+fn index_key_is_changed(
+    index_spec: &IndexSpec,
+    index_change_cols: &FastHashMap<usize, Val>,
+) -> bool {
     index_spec
         .cols
         .iter()
@@ -1300,7 +1303,7 @@ fn index_key_is_changed(index_spec: &IndexSpec, index_change_cols: &HashMap<usiz
 fn index_key_replace(
     index_spec: &IndexSpec,
     key: &SelectKey,
-    updates: &HashMap<usize, Val>,
+    updates: &FastHashMap<usize, Val>,
 ) -> SelectKey {
     let vals: Vec<Val> = index_spec
         .cols

@@ -1,9 +1,9 @@
 use crate::buffer::{EvictableBufferPool, FixedBufferPool, ReadonlyBufferPool};
 use crate::error::{Error, InternalError, Result};
+use crate::map::FastHashMap;
 use crate::quiescent::{QuiescentBox, QuiescentGuard};
 use error_stack::Report;
 use std::any::{Any, TypeId};
-use std::collections::HashMap;
 use std::future::Future;
 use std::marker::PhantomData;
 use std::ops::Deref;
@@ -109,7 +109,7 @@ impl<C: Component> ErasedComponentBox for TypedComponentBox<C> {
 /// owned state, but those retained guards are an implementation detail rather
 /// than additional registry lookup edges.
 pub(crate) struct ComponentRegistry {
-    access_map: HashMap<TypeId, Box<dyn Any + Send + Sync>>,
+    access_map: FastHashMap<TypeId, Box<dyn Any + Send + Sync>>,
     boxed_vec: Vec<Box<dyn ErasedComponentBox>>,
     shutdown_started: AtomicBool,
 }
@@ -118,14 +118,14 @@ type ShelfKey = (TypeId, TypeId);
 
 /// Build-only storage for transient provisions passed between components.
 pub(crate) struct Shelf {
-    parts: HashMap<ShelfKey, Box<dyn Any + Send>>,
+    parts: FastHashMap<ShelfKey, Box<dyn Any + Send>>,
 }
 
 impl Shelf {
     #[inline]
     pub(crate) fn new() -> Self {
         Self {
-            parts: HashMap::new(),
+            parts: FastHashMap::default(),
         }
     }
 
@@ -281,7 +281,7 @@ impl ComponentRegistry {
     #[inline]
     pub(crate) fn new() -> Self {
         Self {
-            access_map: HashMap::new(),
+            access_map: FastHashMap::default(),
             boxed_vec: Vec::new(),
             shutdown_started: AtomicBool::new(false),
         }

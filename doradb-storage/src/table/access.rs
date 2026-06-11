@@ -12,6 +12,7 @@ use crate::index::{
     NonUniqueSecondaryIndex, RowLocation, SecondaryIndex, UniqueIndex, UniqueSecondaryIndex,
 };
 use crate::lwc::PersistedLwcBlock;
+use crate::map::FastHashMap;
 use crate::row::ops::{
     DeleteMvcc, InsertIndex, LinkForUniqueIndex, ReadRow, ScanMvcc, SelectKey, SelectMvcc, UndoCol,
     UpdateCol, UpdateIndex, UpdateMvcc, UpdateRow,
@@ -33,7 +34,7 @@ use crate::trx::ver_map::RowPageState;
 use crate::trx::{MIN_SNAPSHOT_TS, SharedTrxStatus, TrxContext, TrxRuntime, trx_is_committed};
 use crate::value::Val;
 use error_stack::Report;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::BTreeSet;
 use std::mem;
 use std::sync::Arc;
 
@@ -861,7 +862,7 @@ impl UserTableAccessor<'_> {
             .iter()
             .copied()
             .zip(vals)
-            .collect::<HashMap<_, _>>();
+            .collect::<FastHashMap<_, _>>();
         self.metadata()
             .idx
             .active_indexes()
@@ -1289,7 +1290,7 @@ impl UserTableAccessor<'_> {
                         // columns are copied into undo/redo; indexed old values
                         // are retained so MemIndex can shadow or remap keys
                         // after the row latch is released.
-                        let mut index_change_cols = HashMap::new();
+                        let mut index_change_cols = FastHashMap::default();
                         // perform in-place update.
                         let (mut undo_cols, mut redo_cols) = (vec![], vec![]);
                         for uc in &mut update {
@@ -1351,12 +1352,12 @@ impl UserTableAccessor<'_> {
         update: Vec<UpdateCol>,
         old_id: RowID,
         old_guard: PageSharedGuard<RowPage>,
-    ) -> Result<(RowID, HashMap<usize, Val>, PageSharedGuard<RowPage>)> {
+    ) -> Result<(RowID, FastHashMap<usize, Val>, PageSharedGuard<RowPage>)> {
         // Build the replacement hot row and remember indexed old values. The
         // caller already turned the old hot row's first undo entry into
         // `Delete`, so this path is logically delete-old plus insert-new.
         let (new_row, old_vals, index_change_cols) = {
-            let mut index_change_cols = HashMap::new();
+            let mut index_change_cols = FastHashMap::default();
             let mut row = Vec::with_capacity(old_row.len());
             let mut old_vals = Vec::with_capacity(old_row.len());
             for (v, _) in old_row {
@@ -1449,7 +1450,7 @@ impl UserTableAccessor<'_> {
         effects: &mut StmtEffects,
         row_id: RowID,
         page_guard: &PageSharedGuard<RowPage>,
-        index_change_cols: &HashMap<usize, Val>,
+        index_change_cols: &FastHashMap<usize, Val>,
         root_snapshot: &TableRootSnapshot<'_>,
     ) -> Result<UpdateIndex> {
         let metadata = self.metadata();
@@ -1546,7 +1547,7 @@ impl UserTableAccessor<'_> {
         rt: TrxRuntime<'_>,
         effects: &mut StmtEffects,
         row_id_move: RowIdMove,
-        index_change_cols: &HashMap<usize, Val>,
+        index_change_cols: &FastHashMap<usize, Val>,
         page_guard: &PageSharedGuard<RowPage>,
         root_snapshot: &TableRootSnapshot<'_>,
     ) -> Result<UpdateIndex> {

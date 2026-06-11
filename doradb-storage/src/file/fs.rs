@@ -22,6 +22,7 @@ use crate::io::{
     BackendToken, IOBackend, IOBackendStats, IOBackendStatsHandle, IOClient, IOKind, IOMessage,
     IOQueue, IOStateMachine, IOSubmission, Operation, StdIoResult, StorageBackend,
 };
+use crate::map::FastHashSet;
 use crate::notify::EventNotifyOnDrop;
 use crate::quiescent::{QuiescentBox, QuiescentGuard, SyncQuiescentGuard};
 use crate::thread;
@@ -29,7 +30,7 @@ use crate::{IndexPool, MemPool};
 use error_stack::Report;
 use flume::{Receiver, RecvError, Selector, SendError, TryRecvError};
 use parking_lot::Mutex;
-use std::collections::{HashSet, VecDeque};
+use std::collections::VecDeque;
 use std::ffi::OsStr;
 use std::fs;
 use std::io::ErrorKind as IoErrorKind;
@@ -1519,7 +1520,7 @@ impl FileSystem {
     pub(crate) fn cleanup_checkpoint_absent_user_table_files(
         &self,
         checkpointed_next_table_id: TableID,
-        checkpointed_user_table_ids: &HashSet<TableID>,
+        checkpointed_user_table_ids: &FastHashSet<TableID>,
     ) -> Result<()> {
         for entry in fs::read_dir(&self.data_dir)? {
             let entry = entry?;
@@ -1551,8 +1552,8 @@ impl FileSystem {
     #[inline]
     pub(crate) fn cleanup_recovery_absent_user_table_files(
         &self,
-        recovered_user_table_ids: &HashSet<TableID>,
-        deferred_drop_table_ids: &HashSet<TableID>,
+        recovered_user_table_ids: &FastHashSet<TableID>,
+        deferred_drop_table_ids: &FastHashSet<TableID>,
     ) -> Result<()> {
         for entry in fs::read_dir(&self.data_dir)? {
             let entry = entry?;
@@ -2362,7 +2363,7 @@ pub(crate) mod tests {
         std::fs::write(&absent_path, b"absent").unwrap();
         std::fs::write(&future_path, b"future").unwrap();
 
-        let checkpointed_tables = HashSet::from([present_id]);
+        let checkpointed_tables = [present_id].into_iter().collect::<FastHashSet<_>>();
         fs.cleanup_checkpoint_absent_user_table_files(USER_OBJ_ID_START + 4, &checkpointed_tables)
             .unwrap();
 
@@ -2382,8 +2383,11 @@ pub(crate) mod tests {
         std::fs::create_dir(&dir_path).unwrap();
         std::fs::write(&absent_path, b"absent").unwrap();
 
-        fs.cleanup_checkpoint_absent_user_table_files(USER_OBJ_ID_START + 4, &HashSet::new())
-            .unwrap();
+        fs.cleanup_checkpoint_absent_user_table_files(
+            USER_OBJ_ID_START + 4,
+            &FastHashSet::default(),
+        )
+        .unwrap();
 
         assert!(dir_path.is_dir());
         assert!(!absent_path.exists());
@@ -2405,8 +2409,8 @@ pub(crate) mod tests {
         std::fs::write(&orphan_path, b"orphan").unwrap();
 
         fs.cleanup_recovery_absent_user_table_files(
-            &HashSet::from([recovered_id]),
-            &HashSet::from([deferred_drop_id]),
+            &[recovered_id].into_iter().collect::<FastHashSet<_>>(),
+            &[deferred_drop_id].into_iter().collect::<FastHashSet<_>>(),
         )
         .unwrap();
 

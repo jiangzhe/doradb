@@ -24,8 +24,8 @@ use crate::file::{BlockKey, SparseFile};
 use crate::id::{BlockID, FileID, PageID};
 use crate::io::{IOKind, IOSubmission, Operation, StdIoResult};
 use crate::latch::LatchFallbackMode;
+use crate::map::FastDashMap;
 use crate::quiescent::{QuiescentGuard, SyncQuiescentGuard};
-use dashmap::DashMap;
 use dashmap::mapref::entry::Entry;
 use error_stack::Report;
 use event_listener::{Event, EventListener, listener};
@@ -136,8 +136,8 @@ pub(crate) fn begin_write_barrier(
 /// Reverse lookup is stored inline in `BufferFrame` as persisted-block metadata.
 pub(crate) struct ReadonlyBufferPool {
     size: usize,
-    mappings: DashMap<BlockKey, PageID>,
-    inflights: DashMap<BlockKey, InflightBlockState>,
+    mappings: FastDashMap<BlockKey, PageID>,
+    inflights: FastDashMap<BlockKey, InflightBlockState>,
     residency: ReadonlyResidency,
     eviction_arbiter: EvictionArbiter,
     fs: QuiescentGuard<FileSystem>,
@@ -186,8 +186,8 @@ impl ReadonlyBufferPool {
         let arena = QuiescentArena::new(size)?;
         let pool = ReadonlyBufferPool {
             size,
-            mappings: DashMap::new(),
-            inflights: DashMap::new(),
+            mappings: FastDashMap::default(),
+            inflights: FastDashMap::default(),
             residency: ReadonlyResidency::new(size, eviction_arbiter),
             eviction_arbiter,
             fs,

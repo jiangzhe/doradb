@@ -41,6 +41,7 @@ use crate::lock::{
     FreshLockGuard, LockManager, LockMode, LockOwner, LockOwnerGroup, LockResource, OwnerLockState,
     StmtNo,
 };
+use crate::map::FastHashMap;
 use crate::notify::EventNotifyOnDrop;
 use crate::quiescent::QuiescentGuard;
 use crate::session::TrxAttachment;
@@ -51,7 +52,6 @@ use crate::trx::undo::{IndexPurgeEntry, IndexUndoLogs, RowUndoHead, RowUndoLogs,
 use error_stack::Report;
 use event_listener::EventListener;
 use parking_lot::Mutex;
-use std::collections::HashMap;
 use std::marker::PhantomData;
 use std::mem;
 use std::ops::AsyncFnOnce;
@@ -1321,7 +1321,7 @@ impl TrxTableLockGuards<'_> {
 pub(crate) struct TrxInner {
     ctx: TrxContext,
     effects: TrxEffects,
-    table_cache: HashMap<TableID, Weak<Table>>,
+    table_cache: FastHashMap<TableID, Weak<Table>>,
     lock_state: Option<OwnerLockState>,
     next_stmt_no: StmtNo,
     active: bool,
@@ -1340,7 +1340,7 @@ impl TrxInner {
         TrxInner {
             ctx: TrxContext::new(trx_id, sts, log_no, gc_no),
             effects: TrxEffects::empty(),
-            table_cache: HashMap::new(),
+            table_cache: FastHashMap::default(),
             lock_state: Some(OwnerLockState::new_grouped(
                 LockOwner::Transaction(trx_id),
                 owner_group,

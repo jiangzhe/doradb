@@ -7,6 +7,7 @@ use crate::io::{
     Completion, DirectBuf, IOBackendStats, IOBackendStatsHandle, IOClient, IOKind, IOQueue,
     IOStateMachine, IOSubmission, IOWorkerBuilder, Operation, StdIoResult, StorageBackend,
 };
+use crate::map::FastHashMap;
 use crate::serde::Ser;
 use crate::trx::MIN_SNAPSHOT_TS;
 use crate::trx::group::{
@@ -26,7 +27,7 @@ use flume::{Receiver, Sender};
 use glob::{Pattern, glob};
 use parking_lot::{Mutex, MutexGuard};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, VecDeque};
 use std::mem;
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
@@ -986,7 +987,8 @@ impl<'a> FileProcessor<'a> {
                     self.recycle_buf(buf);
                 }
                 // commit transactions to let waiting read operations to continue
-                let mut committed_trx_list: HashMap<usize, Vec<CommittedTrx>> = HashMap::new();
+                let mut committed_trx_list: FastHashMap<usize, Vec<CommittedTrx>> =
+                    FastHashMap::default();
                 for trx in mem::take(&mut sync_group.trx_list) {
                     let trx = trx.commit();
                     if let Some(gc_no) = trx.gc_no() {

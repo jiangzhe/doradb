@@ -32,14 +32,15 @@ use crate::io::{
     StdIoResult,
 };
 use crate::latch::{GuardState, LatchFallbackMode};
+use crate::map::FastHashMap;
 use crate::notify::EventNotifyOnDrop;
 use crate::quiescent::{QuiescentGuard, SyncQuiescentGuard};
 use crate::{IndexPool, MemPool};
 use error_stack::{Report, ensure};
 use event_listener::{Event, EventListener, listener};
 use parking_lot::Mutex;
+use std::collections::BTreeSet;
 use std::collections::hash_map::Entry;
-use std::collections::{BTreeSet, HashMap};
 use std::mem;
 use std::os::fd::{AsRawFd, RawFd};
 use std::sync::Arc;
@@ -1430,7 +1431,7 @@ struct IOStatus {
 }
 
 struct InflightIO {
-    map: Mutex<HashMap<PageID, IOStatus>>,
+    map: Mutex<FastHashMap<PageID, IOStatus>>,
     reads: AtomicUsize,
     writes: AtomicUsize,
 }
@@ -1439,7 +1440,7 @@ impl Default for InflightIO {
     #[inline]
     fn default() -> Self {
         InflightIO {
-            map: Mutex::new(HashMap::new()),
+            map: Mutex::new(FastHashMap::default()),
             reads: AtomicUsize::new(0),
             writes: AtomicUsize::new(0),
         }

@@ -24,6 +24,7 @@ use crate::error::{DataIntegrityError, Error, OperationError, Result};
 use crate::file::fs::FileSystem;
 use crate::id::{PageID, RowID, TableID, TrxID};
 use crate::latch::LatchFallbackMode;
+use crate::map::{FastHashMap, FastHashSet};
 use crate::quiescent::QuiescentGuard;
 use crate::row::RowPage;
 use crate::table::Table;
@@ -35,7 +36,7 @@ use crate::trx::{MAX_SNAPSHOT_TS, MIN_SNAPSHOT_TS};
 use crossbeam_utils::CachePadded;
 use error_stack::Report;
 use flume::Receiver;
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 /// Per-row recovery map used while rebuilding one row page from redo.
@@ -187,12 +188,12 @@ pub(crate) struct LogRecovery<'a> {
     /// a historical CTS.
     max_recovered_cts: TrxID,
     /// Per loaded user table, the persisted replay boundaries from its active root.
-    table_states: HashMap<TableID, RecoveryTableState>,
+    table_states: FastHashMap<TableID, RecoveryTableState>,
     /// Tables loaded from table-file metadata while catalog index DDL redo is pending.
-    pending_index_ddl_reconciliations: HashSet<TableID>,
+    pending_index_ddl_reconciliations: FastHashSet<TableID>,
     /// Hot row pages touched by redo replay, grouped by table for post-replay
     /// index rebuild and undo-map refresh.
-    recovered_tables: HashMap<TableID, BTreeSet<PageID>>,
+    recovered_tables: FastHashMap<TableID, BTreeSet<PageID>>,
     /// Dropped user-table files whose runtime state was destroyed during replay.
     dropped_table_file_deletes: Vec<DroppedTableFileDeleteItem>,
     /// Stable pool guards shared by recovery operations.
@@ -272,9 +273,9 @@ impl<'a> LogRecovery<'a> {
             catalog_replay_start_ts: MIN_SNAPSHOT_TS,
             replay_floor: MIN_SNAPSHOT_TS,
             max_recovered_cts: MIN_SNAPSHOT_TS,
-            table_states: HashMap::new(),
-            pending_index_ddl_reconciliations: HashSet::new(),
-            recovered_tables: HashMap::new(),
+            table_states: FastHashMap::default(),
+            pending_index_ddl_reconciliations: FastHashSet::default(),
+            recovered_tables: FastHashMap::default(),
             dropped_table_file_deletes: Vec::new(),
             pool_guards,
         }
@@ -327,7 +328,7 @@ impl<'a> LogRecovery<'a> {
             .iter()
             .filter(|table| is_user_obj_id(table.table_id))
             .map(|table| table.table_id)
-            .collect::<HashSet<_>>();
+            .collect::<FastHashSet<_>>();
         self.table_fs.cleanup_checkpoint_absent_user_table_files(
             snapshot.meta.next_table_id,
             &checkpointed_user_table_ids,
@@ -561,12 +562,16 @@ impl<'a> LogRecovery<'a> {
     }
 
     fn cleanup_post_replay_absent_user_table_files(&self) -> Result<()> {
-        let recovered_user_table_ids = self.table_states.keys().copied().collect::<HashSet<_>>();
+        let recovered_user_table_ids = self
+            .table_states
+            .keys()
+            .copied()
+            .collect::<FastHashSet<_>>();
         let deferred_drop_table_ids = self
             .dropped_table_file_deletes
             .iter()
             .map(|item| item.table_id)
-            .collect::<HashSet<_>>();
+            .collect::<FastHashSet<_>>();
         self.table_fs.cleanup_recovery_absent_user_table_files(
             &recovered_user_table_ids,
             &deferred_drop_table_ids,

@@ -1,6 +1,6 @@
 use crate::error::Result;
 use crate::lock::{LockGrant, LockManager, LockMode, LockOwner, LockOwnerGroup, LockResource};
-use std::collections::HashMap;
+use crate::map::FastHashMap;
 
 /// Owner-local logical lock cache.
 ///
@@ -10,7 +10,7 @@ use std::collections::HashMap;
 pub(crate) struct OwnerLockState {
     owner: LockOwner,
     owner_group: Option<LockOwnerGroup>,
-    held: HashMap<LockResource, LockMode>,
+    held: FastHashMap<LockResource, LockMode>,
 }
 
 impl OwnerLockState {
@@ -20,7 +20,7 @@ impl OwnerLockState {
         OwnerLockState {
             owner,
             owner_group: None,
-            held: HashMap::new(),
+            held: FastHashMap::default(),
         }
     }
 
@@ -30,7 +30,7 @@ impl OwnerLockState {
         OwnerLockState {
             owner,
             owner_group: Some(owner_group),
-            held: HashMap::new(),
+            held: FastHashMap::default(),
         }
     }
 
