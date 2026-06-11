@@ -1,7 +1,7 @@
 ---
 id: 000173
 title: Add Crate-Local Fast Hash Map Aliases
-status: proposal
+status: implemented
 created: 2026-06-11
 github_issue: 694
 ---
@@ -158,6 +158,63 @@ the project process.
 
 ## Implementation Notes
 
+Implemented in commit `e165977` on branch `fast-hash-aliases`.
+
+- Added `ahash = "0.8"` to workspace dependencies and consumed it directly
+  from `doradb-storage`.
+- Added private module `doradb-storage/src/map.rs` with crate-private
+  `FastRandomState`, `FastHashMap`, `FastHashSet`, and `FastDashMap` aliases.
+  `src/lib.rs` registers the module privately; no public export exposes the
+  hasher policy.
+- Migrated applicable internal hash map, hash set, and crate-owned DashMap
+  call sites to the new aliases. Migration covered transaction/session table
+  caches, owner lock state, lock manager resources, catalog runtime/table
+  caches, table update bookkeeping, recovery and purge bookkeeping, component
+  registries, file cleanup sets, readonly-buffer mappings/inflights, column
+  deletion buffers, buffer eviction inflight state, and numeric/internal
+  test-only helpers.
+- Kept ordered `BTreeMap`/`BTreeSet` usage unchanged and retained upstream
+  `dashmap::mapref::entry::Entry` imports where the DashMap entry API requires
+  them.
+- Did not add constructor helpers; production code uses `Default::default()`
+  and `collect()` where needed for aliases with a non-default hasher.
+- No collision-sensitive or directly user-string-keyed candidate map was found
+  that needed to remain on std hashing as an exception.
+- `Cargo.lock` is ignored by this repository's `.gitignore`; Cargo generated a
+  local lockfile during validation, but there is no tracked lockfile update in
+  this branch.
+- No unsafe code was added or modified.
+
+Validation and review completed:
+
+- `cargo fmt -p doradb-storage`
+- `cargo check -p doradb-storage`
+- `cargo clippy -p doradb-storage --all-targets -- -D warnings`
+- `cargo nextest run -p doradb-storage`: 919 tests passed.
+- `tools/coverage_focus.rs --path doradb-storage/src/lock --path
+  doradb-storage/src/trx --path doradb-storage/src/session.rs --top-uncovered
+  15`: lock 98.50%, trx 94.41%, session 96.67%.
+- `tools/coverage_focus.rs --path doradb-storage/src/buffer --path
+  doradb-storage/src/catalog --path doradb-storage/src/table --path
+  doradb-storage/src/file/fs.rs --path doradb-storage/src/component.rs
+  --top-uncovered 15`: buffer 94.89%, catalog 90.61%, table 91.27%,
+  file/fs 92.39%, component 85.43%.
+- `cargo run -p doradb-storage --example weak_handle_baseline --
+  --iterations 10 --scan-rows 10 --out-dir
+  target/weak-handle-baseline-fast-hash`: cached empty scan averaged 4041 ns
+  in the small dev-profile run and wrote
+  `target/weak-handle-baseline-fast-hash/baseline.csv`.
+- `cargo flamegraph -p doradb-storage --example weak_handle_baseline
+  --release -o target/weak-handle-baseline-fast-hash/cached-empty-scan.svg --
+  --iterations 1000000 --scan-rows 10 --only cached_resolution_empty_scan
+  --out-dir target/weak-handle-baseline-fast-hash/flame-run`: captured 342 perf
+  samples, cached empty scan averaged 326 ns, and wrote
+  `target/weak-handle-baseline-fast-hash/cached-empty-scan.svg`. The generated
+  flamegraph still shows expected std `HashMap`/`hashbrown` table-operation
+  frames because the alias uses std collections, but the previous
+  SipHash-specific `SipHash`, `BuildHasher`, and `hashbrown::make_hash` symbols
+  are absent; the visible hasher-specific frames are `ahash`/`AHasher`.
+
 
 ## Impacts
 
@@ -221,7 +278,4 @@ tools/coverage_focus.rs \
 
 ## Open Questions
 
-None for initial implementation. During implementation, if a candidate map is
-found to be user-controlled or collision-sensitive enough to keep std hashing,
-document the exception in code and summarize it in implementation notes during
-`task resolve`.
+None.
