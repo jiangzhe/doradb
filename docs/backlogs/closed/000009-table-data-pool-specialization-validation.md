@@ -19,3 +19,10 @@ Validate architecture and performance implications of specializing table row-pag
 
 Follow-up decision is documented with evidence; either specialization is confirmed stable or specific compatibility/perf fixes are defined.
 
+## Close Reason
+
+- Type: stale
+- Detail: The original generic-versus-specialized row data pool validation question is stale. Current architecture has explicit pool roles: metadata uses FixedBufferPool, user row-store and in-memory indexes use EvictableBufferPool through MemPool and IndexPool, and persisted column-store reads use ReadonlyBufferPool through DiskPool. Catalog tables still use fixed pools for metadata-scoped catalog runtime, but that is not a user row-data pool alternative requiring a generic comparison.
+- Closed By: backlog close
+- Reference: Verified against current buffer pool component mapping, Table and MemTable runtime types, catalog runtime, BlockIndex and RowPageIndex usage, and docs/buffer-pool.md on 2026-06-11.
+- Closed At: 2026-06-11
