@@ -19,6 +19,7 @@ mod latch;
 mod layout;
 mod lock;
 mod lwc;
+mod map;
 mod memcmp;
 mod notify;
 mod ptr;

@@ -826,11 +826,11 @@ pub(crate) mod tests {
     use crate::bitmap::AllocMap;
     use crate::error::InternalError;
     use crate::id::{BlockID, TrxID};
+    use crate::map::FastHashMap;
     use std::collections::BTreeSet;
-    use std::collections::HashMap;
     use std::sync::{Mutex, OnceLock};
 
-    static OLD_ROOT_DROPS: OnceLock<Mutex<HashMap<usize, usize>>> = OnceLock::new();
+    static OLD_ROOT_DROPS: OnceLock<Mutex<FastHashMap<usize, usize>>> = OnceLock::new();
 
     #[test]
     fn rebuild_alloc_map_keeps_current_meta_block_allocated() {
@@ -902,8 +902,8 @@ pub(crate) mod tests {
     }
 
     #[inline]
-    fn old_root_drops() -> &'static Mutex<HashMap<usize, usize>> {
-        OLD_ROOT_DROPS.get_or_init(|| Mutex::new(HashMap::new()))
+    fn old_root_drops() -> &'static Mutex<FastHashMap<usize, usize>> {
+        OLD_ROOT_DROPS.get_or_init(|| Mutex::new(FastHashMap::default()))
     }
 
     #[inline]

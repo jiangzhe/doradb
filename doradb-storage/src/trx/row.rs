@@ -2,6 +2,7 @@ use crate::buffer::frame::FrameContext;
 use crate::buffer::page::VersionedPageID;
 use crate::catalog::{TableColumnLayout, TableMetadata};
 use crate::id::{RowID, TableID, TrxID};
+use crate::map::FastHashMap;
 use crate::row::ops::{ReadRow, SelectKey, UndoCol, UndoVal, UpdateCol, UpdateRow};
 use crate::row::{Row, RowMut, RowPage, RowRead};
 use crate::trx::recover::RecoverMap;
@@ -15,7 +16,7 @@ use crate::trx::{SharedTrxStatus, TrxContext, TrxRuntime, trx_is_committed};
 use crate::value::Val;
 use event_listener::EventListener;
 use parking_lot::RwLockReadGuard;
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet};
 use std::mem;
 use std::sync::Arc;
 
@@ -139,7 +140,7 @@ impl<'a> RowReadAccess<'a> {
                         let Some(index_spec) = metadata.idx.index_spec(key.index_no) else {
                             return ReadRow::InvalidIndex;
                         };
-                        let user_key_idx_map: HashMap<usize, usize> = index_spec
+                        let user_key_idx_map: FastHashMap<usize, usize> = index_spec
                             .cols
                             .iter()
                             .enumerate()
@@ -437,7 +438,7 @@ impl<'a> RowReadAccess<'a> {
                         .map(|key| row.val(metadata.col.as_ref(), key.col_no as usize))
                         .collect();
                     let mvcc_key = SelectKey::new(key.index_no, vals);
-                    let mapping: HashMap<usize, usize> = index_spec
+                    let mapping: FastHashMap<usize, usize> = index_spec
                         .cols
                         .iter()
                         .enumerate()
@@ -616,7 +617,7 @@ impl RowVersion {
 }
 
 struct IndexKeyTracker {
-    user_key_idx_map: HashMap<usize, usize>,
+    user_key_idx_map: FastHashMap<usize, usize>,
     undo_key: Option<SelectKey>,
 }
 
@@ -624,7 +625,7 @@ struct KeyVersion {
     deleted: bool,
     mvcc_key: SelectKey,
     // mapping of column number to key number
-    mapping: HashMap<usize, usize>,
+    mapping: FastHashMap<usize, usize>,
 }
 
 impl KeyVersion {

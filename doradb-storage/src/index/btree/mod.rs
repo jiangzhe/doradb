@@ -1900,11 +1900,12 @@ enum BTreeCompact {
 mod tests {
     use super::*;
     use crate::error::ResourceError;
+    use crate::map::FastHashMap;
     use crate::quiescent::{QuiescentBox, QuiescentGuard};
     use rand::SeedableRng;
     use rand_chacha::ChaCha8Rng;
     use rand_distr::{Distribution, Uniform};
-    use std::collections::{BTreeMap, HashMap};
+    use std::collections::BTreeMap;
     use std::sync::{Arc, Barrier, mpsc};
     use std::time::Instant;
 
@@ -1968,8 +1969,8 @@ mod tests {
     async fn collect_level_stats(
         tree: &BTree,
         pool_guard: &PoolGuard,
-    ) -> HashMap<usize, LevelStat> {
-        let mut map = HashMap::new();
+    ) -> FastHashMap<usize, LevelStat> {
+        let mut map = FastHashMap::default();
         for height in 0usize..=tree.height() {
             let mut stat = LevelStat::default();
             let mut cursor = tree.cursor(pool_guard, height);
@@ -1988,7 +1989,7 @@ mod tests {
         map
     }
 
-    fn assert_level_links(map: &HashMap<usize, LevelStat>, height: usize) {
+    fn assert_level_links(map: &FastHashMap<usize, LevelStat>, height: usize) {
         for h in 1..=height {
             assert_eq!(map[&h].keys + 1, map[&(h - 1)].nodes);
         }

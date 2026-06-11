@@ -9,8 +9,8 @@ mod state;
 use crate::component::{Component, ComponentRegistry, ShelfScope};
 use crate::error::{OperationError, Result};
 use crate::id::{SessionID, TableID, TrxID};
+use crate::map::FastDashMap;
 use crate::quiescent::{QuiescentBox, QuiescentGuard};
-use dashmap::DashMap;
 use error_stack::Report;
 use event_listener::Event;
 use parking_lot::Mutex;
@@ -167,7 +167,7 @@ impl Drop for FreshLockGuard<'_> {
 
 /// Standalone logical lock manager.
 pub(crate) struct LockManager {
-    resources: Arc<DashMap<LockResource, ResourceState>>,
+    resources: Arc<FastDashMap<LockResource, ResourceState>>,
 }
 
 impl LockManager {
@@ -175,7 +175,7 @@ impl LockManager {
     #[inline]
     pub(crate) fn new() -> Self {
         LockManager {
-            resources: Arc::new(DashMap::new()),
+            resources: Arc::new(FastDashMap::default()),
         }
     }
 
@@ -757,7 +757,7 @@ struct GrantedLock {
 /// queued waiter. If cancellation races with promotion, the guard removes the
 /// unobserved grant before it can leak.
 struct WaiterGuard {
-    resources: Weak<DashMap<LockResource, ResourceState>>,
+    resources: Weak<FastDashMap<LockResource, ResourceState>>,
     resource: LockResource,
     waiter: Arc<Waiter>,
     active: bool,
@@ -766,7 +766,7 @@ struct WaiterGuard {
 impl WaiterGuard {
     #[inline]
     fn new(
-        resources: &Arc<DashMap<LockResource, ResourceState>>,
+        resources: &Arc<FastDashMap<LockResource, ResourceState>>,
         resource: LockResource,
         waiter: Arc<Waiter>,
     ) -> Self {

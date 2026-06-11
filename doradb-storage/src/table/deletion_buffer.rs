@@ -12,8 +12,8 @@
 //! here until they are no longer needed to make old snapshots visible.
 
 use crate::id::{RowID, TrxID};
+use crate::map::FastDashMap;
 use crate::trx::{SharedTrxStatus, trx_is_committed};
-use dashmap::DashMap;
 use dashmap::mapref::entry::Entry;
 use std::sync::Arc;
 
@@ -54,7 +54,7 @@ pub(crate) enum DeleteMarker {
 /// recent committed markers needed by transactions, rollback, purge,
 /// checkpoint, and recovery replay.
 pub(crate) struct ColumnDeletionBuffer {
-    entries: DashMap<RowID, DeleteMarker>,
+    entries: FastDashMap<RowID, DeleteMarker>,
 }
 
 impl ColumnDeletionBuffer {
@@ -62,7 +62,7 @@ impl ColumnDeletionBuffer {
     #[inline]
     pub(crate) fn new() -> Self {
         ColumnDeletionBuffer {
-            entries: DashMap::new(),
+            entries: FastDashMap::default(),
         }
     }
 

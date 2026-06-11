@@ -5,6 +5,7 @@ use crate::engine::{EngineInner, EngineRef, WeakEngineRef};
 use crate::error::{LifecycleError, OperationError, Result};
 use crate::id::{RowID, SessionID, TableID, TrxID};
 use crate::lock::{LockManager, LockMode, LockOwner, LockOwnerGroup, LockResource};
+use crate::map::{FastDashMap, FastHashMap};
 use crate::notify::ChangeNotifier;
 use crate::quiescent::QuiescentGuard;
 use crate::table::{CheckpointOutcome, CheckpointReadiness, SecondaryMemIndexCleanupStats, Table};
@@ -12,10 +13,8 @@ use crate::trx::{
     StartedTransaction, Transaction, TrxCleanupReason, TrxEntry, TrxEntryState,
     transaction_discarded_err,
 };
-use dashmap::DashMap;
 use error_stack::Report;
 use parking_lot::Mutex;
-use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 
@@ -373,7 +372,7 @@ impl SessionPin {
 
 /// Engine-owned registry for strong session state.
 pub(crate) struct SessionRegistry {
-    entries: DashMap<SessionID, Arc<SessionState>>,
+    entries: FastDashMap<SessionID, Arc<SessionState>>,
     trx_changes: ChangeNotifier,
 }
 
@@ -382,7 +381,7 @@ impl SessionRegistry {
     #[inline]
     pub(crate) fn new() -> Self {
         Self {
-            entries: DashMap::new(),
+            entries: FastDashMap::default(),
             trx_changes: ChangeNotifier::new(),
         }
     }
@@ -588,8 +587,8 @@ pub(crate) struct SessionState {
     lock_manager: QuiescentGuard<LockManager>,
     lifecycle: Mutex<SessionLifecycle>,
     last_cts: AtomicU64,
-    table_cache: Mutex<HashMap<TableID, Weak<Table>>>,
-    active_insert_pages: Mutex<HashMap<TableID, (VersionedPageID, RowID)>>,
+    table_cache: Mutex<FastHashMap<TableID, Weak<Table>>>,
+    active_insert_pages: Mutex<FastHashMap<TableID, (VersionedPageID, RowID)>>,
 }
 
 impl SessionState {
@@ -609,8 +608,8 @@ impl SessionState {
             lock_manager,
             lifecycle: Mutex::new(SessionLifecycle::RunningIdle),
             last_cts: AtomicU64::new(0),
-            table_cache: Mutex::new(HashMap::new()),
-            active_insert_pages: Mutex::new(HashMap::new()),
+            table_cache: Mutex::new(FastHashMap::default()),
+            active_insert_pages: Mutex::new(FastHashMap::default()),
         }
     }
 

@@ -24,15 +24,15 @@ use crate::error::{DataIntegrityError, Error, OperationError, Result};
 use crate::file::fs::FileSystem;
 use crate::id::{RowID, TableID, TrxID};
 use crate::index::BlockIndex;
+use crate::map::{FastDashMap, FastHashMap, FastHashSet};
 use crate::quiescent::{QuiescentBox, QuiescentGuard};
 use crate::row::ops::SelectKey;
 use crate::table::{MemTable, Table, TableRuntimeLayout};
 use crate::trx::MIN_SNAPSHOT_TS;
 use crate::trx::undo::IndexUndo;
-use dashmap::DashMap;
 use error_stack::Report;
+use std::collections::BTreeMap;
 use std::collections::hash_map::Entry;
-use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ops::Deref;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -94,7 +94,7 @@ impl Deref for CatalogTable {
 /// Catalog contains metadata of user tables.
 pub(crate) struct Catalog {
     next_table_id: AtomicU64,
-    user_tables: DashMap<TableID, Arc<Table>>,
+    user_tables: FastDashMap<TableID, Arc<Table>>,
     pub(crate) storage: CatalogStorage,
     checkpoint_gate: CatalogCheckpointGate,
 }
@@ -148,7 +148,7 @@ impl Catalog {
         let next_table_id = storage.next_table_id();
         Ok(Catalog {
             next_table_id: AtomicU64::new(next_table_id.as_u64()),
-            user_tables: DashMap::new(),
+            user_tables: FastDashMap::default(),
             storage,
             checkpoint_gate: CatalogCheckpointGate::new(),
         })
@@ -553,9 +553,9 @@ impl UserTableCacheEntry {
 /// Per-operation table cache used by rollback/recovery paths.
 pub(crate) struct TableCache<'a> {
     catalog: &'a Catalog,
-    user_tables: HashMap<TableID, UserTableCacheEntry>,
-    catalog_tables: HashMap<TableID, Arc<CatalogTable>>,
-    missing: HashSet<TableID>,
+    user_tables: FastHashMap<TableID, UserTableCacheEntry>,
+    catalog_tables: FastHashMap<TableID, Arc<CatalogTable>>,
+    missing: FastHashSet<TableID>,
 }
 
 impl<'a> TableCache<'a> {
@@ -564,9 +564,9 @@ impl<'a> TableCache<'a> {
     pub(crate) fn new(catalog: &'a Catalog) -> Self {
         TableCache {
             catalog,
-            user_tables: HashMap::new(),
-            catalog_tables: HashMap::new(),
-            missing: HashSet::new(),
+            user_tables: FastHashMap::default(),
+            catalog_tables: FastHashMap::default(),
+            missing: FastHashSet::default(),
         }
     }
 

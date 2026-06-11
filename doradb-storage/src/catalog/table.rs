@@ -9,6 +9,7 @@ use crate::index::BlockIndex;
 use crate::lock::{
     FreshLockGuard, LockGrant, LockManager, LockMode, LockOwner, LockOwnerGroup, LockResource,
 };
+use crate::map::FastHashSet;
 use crate::row::ops::SelectKey;
 use crate::row::{Row, RowRead};
 use crate::serde::{Deser, Ser, Serde};
@@ -19,7 +20,6 @@ use crate::trx::redo::DDLRedo;
 use crate::value::{Val, ValKind, ValType};
 use error_stack::Report;
 use semistr::SemiStr;
-use std::collections::HashSet;
 use std::mem;
 use std::ops::Index;
 use std::sync::Arc;
@@ -1267,7 +1267,7 @@ pub(crate) struct TableIndexLayout {
     // secondary index slots keyed by stable table-local index number.
     index_specs: IndexSpecs,
     // columns that are included in any index.
-    index_cols: HashSet<usize>,
+    index_cols: FastHashSet<usize>,
 }
 
 impl TableIndexLayout {
@@ -1279,7 +1279,7 @@ impl TableIndexLayout {
     ) -> Result<Self> {
         let index_specs =
             IndexSpecs::try_from_active(next_index_no, index_specs, column_layout.col_count())?;
-        let mut index_cols = HashSet::new();
+        let mut index_cols = FastHashSet::default();
         for index_spec in index_specs.values() {
             for key in &index_spec.cols {
                 index_cols.insert(key.col_no as usize);
@@ -1396,7 +1396,7 @@ impl TableIndexLayout {
 
     /// Returns columns included in any active secondary index.
     #[inline]
-    pub(crate) fn index_columns(&self) -> &HashSet<usize> {
+    pub(crate) fn index_columns(&self) -> &FastHashSet<usize> {
         &self.index_cols
     }
 
@@ -2020,7 +2020,10 @@ mod tests {
         assert!(dropped.idx.index_spec(1).is_none());
         assert!(dropped.idx.index_spec(2).is_none());
         assert!(dropped.idx.index_spec(3).is_none());
-        assert_eq!(dropped.idx.index_cols, HashSet::from([0]));
+        assert_eq!(
+            dropped.idx.index_cols,
+            [0].into_iter().collect::<FastHashSet<_>>()
+        );
     }
 
     #[test]
