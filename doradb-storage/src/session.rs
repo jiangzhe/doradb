@@ -5,6 +5,7 @@ use crate::engine::{EngineInner, EngineRef, WeakEngineRef};
 use crate::error::{LifecycleError, OperationError, Result};
 use crate::id::{RowID, SessionID, TableID, TrxID};
 use crate::lock::{LockManager, LockMode, LockOwner, LockOwnerGroup, LockResource};
+use crate::notify::ChangeNotifier;
 use crate::quiescent::QuiescentGuard;
 use crate::table::{CheckpointOutcome, CheckpointReadiness, SecondaryMemIndexCleanupStats, Table};
 use crate::trx::{
@@ -13,7 +14,6 @@ use crate::trx::{
 };
 use dashmap::DashMap;
 use error_stack::Report;
-use event_listener::{Event, Listener, listener};
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -374,8 +374,7 @@ impl SessionPin {
 /// Engine-owned registry for strong session state.
 pub(crate) struct SessionRegistry {
     entries: DashMap<SessionID, Arc<SessionState>>,
-    trx_changed: Event,
-    trx_change_epoch: AtomicU64,
+    trx_changes: ChangeNotifier,
 }
 
 impl SessionRegistry {
@@ -384,8 +383,7 @@ impl SessionRegistry {
     pub(crate) fn new() -> Self {
         Self {
             entries: DashMap::new(),
-            trx_changed: Event::new(),
-            trx_change_epoch: AtomicU64::new(0),
+            trx_changes: ChangeNotifier::new(),
         }
     }
 
@@ -511,22 +509,13 @@ impl SessionRegistry {
     /// Returns the current transaction lifecycle change epoch.
     #[inline]
     pub(crate) fn trx_change_epoch(&self) -> u64 {
-        self.trx_change_epoch.load(Ordering::Acquire)
+        self.trx_changes.epoch()
     }
 
     /// Wait for any transaction lifecycle change after the observed epoch.
     #[inline]
     pub(crate) fn wait_for_trx_change_since(&self, observed_epoch: u64) {
-        loop {
-            if self.trx_change_epoch() != observed_epoch {
-                return;
-            }
-            listener!(self.trx_changed => trx_changed);
-            if self.trx_change_epoch() != observed_epoch {
-                return;
-            }
-            trx_changed.wait();
-        }
+        self.trx_changes.wait_since(observed_epoch);
     }
 
     /// Remove idle and abandoned-idle sessions during engine shutdown.
@@ -588,8 +577,7 @@ impl SessionRegistry {
 
     #[inline]
     pub(crate) fn notify_trx_changed(&self) {
-        self.trx_change_epoch.fetch_add(1, Ordering::AcqRel);
-        self.trx_changed.notify(usize::MAX);
+        self.trx_changes.notify();
     }
 }
 

@@ -41,6 +41,7 @@ use crate::lock::{
     FreshLockGuard, LockManager, LockMode, LockOwner, LockOwnerGroup, LockResource, OwnerLockState,
     StmtNo,
 };
+use crate::notify::EventNotifyOnDrop;
 use crate::quiescent::QuiescentGuard;
 use crate::session::TrxAttachment;
 use crate::table::Table;
@@ -48,7 +49,7 @@ use crate::trx::log_replay::TrxLog;
 use crate::trx::redo::{DDLRedo, RedoHeader, RedoLogs, RedoTrxKind};
 use crate::trx::undo::{IndexPurgeEntry, IndexUndoLogs, RowUndoHead, RowUndoLogs, UndoStatus};
 use error_stack::Report;
-use event_listener::{Event, EventListener};
+use event_listener::EventListener;
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::marker::PhantomData;
@@ -288,7 +289,7 @@ pub(crate) struct StartedTransaction {
 pub(crate) struct SharedTrxStatus {
     ts: AtomicU64,
     preparing: AtomicBool,
-    prepare_ev: Mutex<Option<Event>>,
+    prepare_ev: Mutex<Option<EventNotifyOnDrop>>,
 }
 
 impl SharedTrxStatus {
@@ -315,14 +316,50 @@ impl SharedTrxStatus {
     }
 
     /// Returns notifier if the transaction is in prepare phase.
-    /// Prepare pahse means the transaction already get a commit timestamp
-    /// but not persist its log.
-    /// To avoid partial read, other transaction read the data modified by
-    /// this transaction should wait for
+    ///
+    /// Preparing means commit ordering has started but the transaction has not
+    /// reached its terminal commit or failed-precommit rollback outcome.
+    /// Waiters must wake for either terminal result and recheck the shared
+    /// transaction status.
     #[inline]
     pub(crate) fn prepare_listener(&self) -> Option<EventListener> {
         let g = self.prepare_ev.lock();
-        g.as_ref().map(|event| event.listen())
+        if self.preparing.load(Ordering::Acquire) {
+            g.as_ref().map(|event| event.listen())
+        } else {
+            None
+        }
+    }
+
+    /// Marks the transaction as preparing and installs a completion notifier.
+    #[inline]
+    fn mark_preparing(&self) {
+        let mut g = self.prepare_ev.lock();
+        debug_assert!(
+            !self.preparing.load(Ordering::Acquire),
+            "transaction is already preparing"
+        );
+        debug_assert!(g.is_none(), "prepare notifier should not be installed");
+        *g = Some(EventNotifyOnDrop::new());
+        self.preparing.store(true, Ordering::SeqCst);
+    }
+
+    /// Publish the commit timestamp and wake prepare waiters.
+    #[inline]
+    fn commit_prepared(&self, cts: TrxID) {
+        self.ts.store(cts.as_u64(), Ordering::SeqCst);
+        self.finish_preparing();
+    }
+
+    /// Marks prepare complete and wakes listeners registered before completion.
+    #[inline]
+    fn finish_preparing(&self) {
+        let notifier = {
+            let mut g = self.prepare_ev.lock();
+            self.preparing.store(false, Ordering::SeqCst);
+            g.take()
+        };
+        drop(notifier);
     }
 }
 
@@ -409,9 +446,7 @@ impl TrxContext {
     /// Marks the shared transaction status as preparing.
     #[inline]
     pub(crate) fn mark_preparing(&self) {
-        let mut g = self.status.prepare_ev.lock();
-        *g = Some(Event::new());
-        self.status.preparing.store(true, Ordering::SeqCst);
+        self.status.mark_preparing();
     }
 }
 
@@ -1887,9 +1922,7 @@ impl PrecommitTrxPayload {
 
     #[inline]
     fn release_prepare_waiters(&self) {
-        self.status.preparing.store(false, Ordering::SeqCst);
-        let mut g = self.status.prepare_ev.lock();
-        drop(g.take());
+        self.status.finish_preparing();
     }
 }
 
@@ -1947,15 +1980,7 @@ impl PrecommitTrx {
                 let index_gc = index_undo.commit_for_gc();
                 // For user transaction, we need to notify readers that this transaction is committed,
                 // and readers can continue their work.
-                {
-                    // first update cts.
-                    status.ts.store(self.cts.as_u64(), Ordering::SeqCst);
-                    // then reset preparing.
-                    status.preparing.store(false, Ordering::SeqCst);
-                    // finally, drop event to notify all waiting transactions.
-                    let mut g = status.prepare_ev.lock();
-                    drop(g.take());
-                }
+                status.commit_prepared(self.cts);
                 if let Some(s) = self.attachment.take() {
                     s.commit(self.cts);
                 }
@@ -2146,13 +2171,13 @@ pub(crate) mod tests {
         LockDebugEntryState, debug_snapshot, try_acquire, try_acquire_grouped,
     };
     use crate::row::ops::SelectKey;
-    use crate::session::tests as session_tests;
     use crate::session::tests::SessionTestExt;
     use crate::table::test_user_table_id;
     use crate::trx::redo::{RowRedo, RowRedoKind};
     use crate::trx::stmt::tests as stmt_tests;
     use crate::trx::undo::{IndexUndo, IndexUndoKind, OwnedRowUndo, RowUndoKind};
     use crate::value::{Val, ValKind};
+    use event_listener::Listener;
     use std::io;
     use std::sync::atomic::AtomicUsize;
     use std::sync::{Arc, mpsc};
@@ -2232,27 +2257,6 @@ pub(crate) mod tests {
         }
     }
 
-    fn test_transaction_with_parts(
-        engine: &Engine,
-        trx_id: TrxID,
-        sts: TrxID,
-        log_no: usize,
-        gc_no: usize,
-    ) -> Transaction {
-        let engine_ref = engine.new_ref().unwrap();
-        let session_id = engine_ref.next_session_id();
-        let (trx, _state) = session_tests::create_test_transaction(
-            &engine.inner().session_registry,
-            engine_ref,
-            session_id,
-            trx_id,
-            sts,
-            log_no,
-            gc_no,
-        );
-        trx
-    }
-
     #[inline]
     fn resolve_active_parts_for_test(
         trx: &Transaction,
@@ -2313,14 +2317,12 @@ pub(crate) mod tests {
         smol::block_on(async {
             let (_temp_dir, engine) =
                 test_engine("failed_entry_does_not_count_as_active_transaction").await;
-            let trx = test_transaction_with_parts(
-                &engine,
-                MIN_ACTIVE_TRX_ID + 102,
-                TrxID::new(102),
-                0,
-                0,
-            );
+            let mut session = engine.new_session().unwrap();
+            let trx = session.begin_trx().unwrap();
             let entry = transaction_entry(&trx);
+            let sts = trx.sts();
+            let log_no = transaction_log_no(&trx);
+            let gc_no = transaction_gc_no(&trx);
 
             assert_eq!(
                 engine.inner().session_registry.active_transaction_count(),
@@ -2333,6 +2335,8 @@ pub(crate) mod tests {
                 0
             );
 
+            engine.inner().trx_sys.log_partitions[log_no].gc_buckets[gc_no]
+                .gc_analyze_rollback(sts);
             engine
                 .inner()
                 .session_registry
@@ -2424,26 +2428,6 @@ pub(crate) mod tests {
     }
 
     #[inline]
-    fn transaction_has_engine(trx: &Transaction) -> bool {
-        trx.engine().is_some()
-    }
-
-    #[inline]
-    fn transaction_pool_guards_attached(trx: &Transaction) -> bool {
-        trx.resolve_active("test transaction pool guards")
-            .and_then(|(entry, attachment)| {
-                TrxCheckout::new(entry, attachment, "test transaction pool guards")
-            })
-            .map(|mut checkout| {
-                let (inner, attachment) = checkout.inner_and_attachment_mut();
-                let rt = TrxRuntime::new(inner.ctx(), attachment);
-                let _ = rt.pool_guards();
-                true
-            })
-            .unwrap_or(false)
-    }
-
-    #[inline]
     fn transaction_log_no(trx: &Transaction) -> usize {
         with_transaction_inner(
             trx,
@@ -2485,6 +2469,53 @@ pub(crate) mod tests {
         let claim = trx.claim_terminal(TrxEntryState::Committing, "prepare active transaction")?;
         let (_entry, inner, attachment) = claim.into_parts();
         inner.prepare(attachment)
+    }
+
+    #[inline]
+    fn begin_production_test_transaction(
+        engine: &Engine,
+    ) -> (crate::session::Session, Transaction) {
+        let mut session = engine.new_session().unwrap();
+        let trx = session.begin_trx().unwrap();
+        (session, trx)
+    }
+
+    #[inline]
+    fn discard_production_prepared_for_test(mut prepared: PreparedTrx) {
+        if let Some(payload) = prepared.payload.take()
+            && let Some(attachment) = prepared.attachment.as_ref()
+        {
+            let trx_sys = &attachment.engine().trx_sys;
+            trx_sys.log_partitions[payload.log_no].gc_buckets[payload.gc_no]
+                .gc_analyze_rollback(payload.sts);
+        }
+        prepared.redo_bin.take();
+        if let Some(attachment) = prepared.attachment.take() {
+            attachment.rollback();
+        }
+        prepared.release_transaction_locks();
+    }
+
+    #[inline]
+    fn finish_production_committed_for_test(
+        engine: &Engine,
+        log_no: usize,
+        committed: CommittedTrx,
+    ) {
+        if let Some(gc_no) = committed.gc_no() {
+            engine.inner().trx_sys.log_partitions[log_no].gc_buckets[gc_no]
+                .gc_analyze_commit(vec![committed]);
+        }
+    }
+
+    #[inline]
+    fn discard_production_transaction_after_fatal_rollback(trx: &mut Transaction) {
+        let sts = trx.sts();
+        let log_no = transaction_log_no(trx);
+        let gc_no = transaction_gc_no(trx);
+        let engine = trx.engine().expect("test transaction must have engine");
+        discard_transaction_after_fatal_rollback(trx);
+        engine.trx_sys.log_partitions[log_no].gc_buckets[gc_no].gc_analyze_rollback(sts);
     }
 
     /// Add one redo log entry for tests that need a non-readonly transaction.
@@ -2663,70 +2694,27 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn test_transaction_new_splits_context_and_empty_effects() {
-        smol::block_on(async {
-            let (_temp_dir, engine) = test_engine("redo_trx_context_new").await;
-            let mut trx =
-                test_transaction_with_parts(&engine, MIN_ACTIVE_TRX_ID + 42, TrxID::new(42), 3, 5);
-
-            let page_id = VersionedPageID {
-                page_id: PageID::new(7),
-                generation: 11,
-            };
-            {
-                let mut checkout = trx
-                    .checkout("test transaction context")
-                    .expect("test transaction must check out");
-                let (inner, attachment) = checkout.inner_and_attachment_mut();
-                {
-                    let rt = TrxRuntime::new(inner.ctx(), attachment);
-                    rt.save_active_insert_page(TableID::new(19), page_id, RowID::new(23));
-                    assert_eq!(
-                        rt.load_active_insert_page(TableID::new(19)),
-                        Some((page_id, RowID::new(23)))
-                    );
-                }
-                assert!(inner.effects.row_undo.is_empty());
-                assert!(inner.effects.index_undo.is_empty());
-                assert!(inner.effects.redo.is_empty());
-                assert!(inner.effects.gc_row_pages.is_empty());
-            }
-            assert!(!transaction_require_durability(&trx));
-            assert!(!transaction_require_ordered_commit(&trx));
-            assert_eq!(trx.sts(), TrxID::new(42));
-            assert_eq!(trx.trx_id(), MIN_ACTIVE_TRX_ID + 42);
-            assert_eq!(transaction_log_no(&trx), 3);
-            assert_eq!(transaction_gc_no(&trx), 5);
-            assert!(transaction_has_engine(&trx));
-            assert!(transaction_pool_guards_attached(&trx));
-
-            discard_transaction_after_fatal_rollback(&mut trx);
-        });
-    }
-    #[test]
     fn test_transaction_readonly_prepare_keeps_empty_effect_payload() {
         smol::block_on(async {
             let (_temp_dir, engine) = test_engine("redo_trx_readonly_prepare").await;
-            let trx =
-                test_transaction_with_parts(&engine, MIN_ACTIVE_TRX_ID + 43, TrxID::new(43), 1, 2);
+            let (_session, trx) = begin_production_test_transaction(&engine);
+            let expected_sts = trx.sts();
+            let expected_log_no = transaction_log_no(&trx);
+            let expected_gc_no = transaction_gc_no(&trx);
 
-            let mut prepared = prepare_transaction(trx).unwrap();
+            let prepared = prepare_transaction(trx).unwrap();
             assert!(prepared.redo_bin.is_none());
             assert!(!prepared.require_durability());
             assert!(!prepared.require_ordered_commit());
             let payload = prepared.payload.as_ref().unwrap();
-            assert_eq!(payload.sts, TrxID::new(43));
-            assert_eq!(payload.log_no, 1);
-            assert_eq!(payload.gc_no, 2);
+            assert_eq!(payload.sts, expected_sts);
+            assert_eq!(payload.log_no, expected_log_no);
+            assert_eq!(payload.gc_no, expected_gc_no);
             assert!(payload.row_undo.is_empty());
             assert!(payload.index_undo.is_empty());
             assert!(payload.gc_row_pages.is_empty());
 
-            prepared.payload.take();
-            if let Some(attachment) = prepared.attachment.take() {
-                attachment.rollback();
-            }
-            prepared.release_transaction_locks();
+            discard_production_prepared_for_test(prepared);
         });
     }
 
@@ -2734,8 +2722,7 @@ pub(crate) mod tests {
     fn test_transaction_prepare_moves_effect_payload() {
         smol::block_on(async {
             let (_temp_dir, engine) = test_engine("redo_trx_effect_prepare").await;
-            let mut trx =
-                test_transaction_with_parts(&engine, MIN_ACTIVE_TRX_ID + 44, TrxID::new(44), 2, 3);
+            let (_session, mut trx) = begin_production_test_transaction(&engine);
             add_pseudo_redo_log_entry(&mut trx);
             with_transaction_inner_mut(&mut trx, "test prepare payload", |inner| {
                 inner.row_undo_mut().push(OwnedRowUndo::new(
@@ -2751,25 +2738,23 @@ pub(crate) mod tests {
                 });
             })
             .unwrap();
+            let expected_sts = trx.sts();
+            let expected_log_no = transaction_log_no(&trx);
+            let expected_gc_no = transaction_gc_no(&trx);
 
-            let mut prepared = prepare_transaction(trx).unwrap();
+            let prepared = prepare_transaction(trx).unwrap();
             assert!(prepared.redo_bin.is_some());
             assert!(prepared.require_durability());
             assert!(prepared.require_ordered_commit());
             let payload = prepared.payload.as_ref().unwrap();
-            assert_eq!(payload.sts, TrxID::new(44));
-            assert_eq!(payload.log_no, 2);
-            assert_eq!(payload.gc_no, 3);
+            assert_eq!(payload.sts, expected_sts);
+            assert_eq!(payload.log_no, expected_log_no);
+            assert_eq!(payload.gc_no, expected_gc_no);
             assert_eq!(payload.row_undo.len(), 1);
             assert_eq!(payload.index_undo.len(), 1);
             assert!(payload.gc_row_pages.is_empty());
 
-            prepared.redo_bin.take();
-            prepared.payload.take();
-            if let Some(attachment) = prepared.attachment.take() {
-                attachment.rollback();
-            }
-            prepared.release_transaction_locks();
+            discard_production_prepared_for_test(prepared);
         });
     }
 
@@ -2777,8 +2762,7 @@ pub(crate) mod tests {
     fn test_precommit_retains_index_undo_until_successful_commit() {
         smol::block_on(async {
             let (_temp_dir, engine) = test_engine("redo_trx_precommit_index_undo").await;
-            let mut trx =
-                test_transaction_with_parts(&engine, MIN_ACTIVE_TRX_ID + 47, TrxID::new(47), 0, 0);
+            let (_session, mut trx) = begin_production_test_transaction(&engine);
             with_transaction_inner_mut(&mut trx, "test precommit index undo", |inner| {
                 inner.index_undo_mut().push(IndexUndo {
                     table_id: TableID::new(11),
@@ -2791,6 +2775,7 @@ pub(crate) mod tests {
             let precommit = prepare_transaction(trx)
                 .unwrap()
                 .fill_cts(TrxID::new(91_247));
+            let log_no = precommit.payload.as_ref().unwrap().log_no;
             let payload = precommit.payload.as_ref().unwrap();
             assert_eq!(payload.index_undo.len(), 1);
 
@@ -2799,6 +2784,113 @@ pub(crate) mod tests {
             assert_eq!(index_gc.len(), 1);
             assert_eq!(index_gc[0].table_id, TableID::new(11));
             assert_eq!(index_gc[0].row_id, RowID::new(22));
+            finish_production_committed_for_test(&engine, log_no, committed);
+        });
+    }
+
+    #[test]
+    fn test_prepare_listener_wakes_after_precommit_commit() {
+        smol::block_on(async {
+            let (_temp_dir, engine) = test_engine("redo_trx_prepare_waiter_commit").await;
+            let mut session = engine.new_session().unwrap();
+            let mut trx = session.begin_trx().unwrap();
+            add_pseudo_redo_log_entry(&mut trx);
+            let status =
+                with_transaction_inner(&trx, "test prepare commit waiter status", |inner| {
+                    inner.ctx().status()
+                })
+                .unwrap();
+
+            let prepared = prepare_transaction(trx).unwrap();
+            assert!(status.preparing());
+            let listener = status
+                .prepare_listener()
+                .expect("preparing transaction should expose a listener");
+            let waiter_status = Arc::clone(&status);
+            let (ready_tx, ready_rx) = mpsc::channel();
+            let (done_tx, done_rx) = mpsc::channel();
+            let waiter = std::thread::spawn(move || {
+                ready_tx.send(()).expect("waiter should report ready");
+                listener.wait();
+                done_tx
+                    .send(waiter_status.ts())
+                    .expect("waiter should report observed status");
+            });
+
+            ready_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("waiter should start");
+            assert!(
+                done_rx.recv_timeout(Duration::from_millis(20)).is_err(),
+                "prepare waiter should block before commit completion"
+            );
+
+            let cts = TrxID::new(91_248);
+            let mut precommit = prepared.fill_cts(cts);
+            let _redo = precommit.take_log().expect("durable test transaction");
+            let committed = precommit.commit();
+            assert_eq!(committed.cts, cts);
+            assert_eq!(
+                done_rx
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("waiter should wake after commit"),
+                cts
+            );
+            waiter.join().expect("waiter thread should finish");
+            assert_eq!(status.ts(), cts);
+            assert!(!status.preparing());
+            assert!(status.prepare_listener().is_none());
+        });
+    }
+
+    #[test]
+    fn test_prepare_listener_wakes_after_failed_precommit_rollback() {
+        smol::block_on(async {
+            let (_temp_dir, engine) = test_engine("redo_trx_prepare_waiter_rollback").await;
+            let mut session = engine.new_session().unwrap();
+            let mut trx = session.begin_trx().unwrap();
+            add_pseudo_redo_log_entry(&mut trx);
+            let status =
+                with_transaction_inner(&trx, "test prepare rollback waiter status", |inner| {
+                    inner.ctx().status()
+                })
+                .unwrap();
+
+            let prepared = prepare_transaction(trx).unwrap();
+            assert!(status.preparing());
+            let listener = status
+                .prepare_listener()
+                .expect("preparing transaction should expose a listener");
+            let waiter_status = Arc::clone(&status);
+            let (ready_tx, ready_rx) = mpsc::channel();
+            let (done_tx, done_rx) = mpsc::channel();
+            let waiter = std::thread::spawn(move || {
+                ready_tx.send(()).expect("waiter should report ready");
+                listener.wait();
+                done_tx
+                    .send(waiter_status.prepare_listener().is_none())
+                    .expect("waiter should report completion state");
+            });
+
+            ready_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("waiter should start");
+            assert!(
+                done_rx.recv_timeout(Duration::from_millis(20)).is_err(),
+                "prepare waiter should block before rollback completion"
+            );
+
+            let precommit = prepared.fill_cts(TrxID::new(91_249));
+            assert!(precommit.rollback_failed_precommit().await);
+            assert!(
+                done_rx
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("waiter should wake after failed-precommit rollback"),
+                "late listener lookup should return none after rollback"
+            );
+            waiter.join().expect("waiter thread should finish");
+            assert!(!status.preparing());
+            assert!(status.prepare_listener().is_none());
         });
     }
 
@@ -2806,8 +2898,7 @@ pub(crate) mod tests {
     fn test_statement_success_merges_statement_effects_into_transaction_effects() {
         smol::block_on(async {
             let (_temp_dir, engine) = test_engine("redo_stmt_effect_merge").await;
-            let mut trx =
-                test_transaction_with_parts(&engine, MIN_ACTIVE_TRX_ID + 45, TrxID::new(45), 0, 0);
+            let (_session, mut trx) = begin_production_test_transaction(&engine);
             trx.exec(async |stmt| {
                 let effects = stmt.effects_mut();
                 effects.push_row_undo(OwnedRowUndo::new(
@@ -2843,7 +2934,7 @@ pub(crate) mod tests {
             })
             .unwrap();
 
-            discard_transaction_after_fatal_rollback(&mut trx);
+            discard_production_transaction_after_fatal_rollback(&mut trx);
         });
     }
 
@@ -2866,8 +2957,7 @@ pub(crate) mod tests {
     fn test_statement_error_rolls_back_only_statement_effects() {
         smol::block_on(async {
             let (_temp_dir, engine) = test_engine("redo_stmt_error_rollback").await;
-            let mut trx =
-                test_transaction_with_parts(&engine, MIN_ACTIVE_TRX_ID + 49, TrxID::new(49), 0, 0);
+            let (_session, mut trx) = begin_production_test_transaction(&engine);
 
             trx.exec(async |stmt| {
                 stmt.effects_mut().insert_row_redo(
@@ -2906,7 +2996,7 @@ pub(crate) mod tests {
             })
             .unwrap();
 
-            discard_transaction_after_fatal_rollback(&mut trx);
+            discard_production_transaction_after_fatal_rollback(&mut trx);
         });
     }
 
@@ -3467,24 +3557,19 @@ pub(crate) mod tests {
     fn test_transaction_effect_predicates_split_durability_from_ordering() {
         smol::block_on(async {
             let (_temp_dir, engine) = test_engine("redo_trx_effect_predicates").await;
+            let mut session = engine.new_session().unwrap();
 
-            let mut trx =
-                test_transaction_with_parts(&engine, MIN_ACTIVE_TRX_ID + 46, TrxID::new(46), 0, 0);
+            let mut trx = session.begin_trx().unwrap();
             trx.extend_gc_row_pages(vec![PageID::new(46)]).unwrap();
             assert!(!transaction_require_durability(&trx));
             assert!(transaction_require_ordered_commit(&trx));
-            let mut prepared = prepare_transaction(trx).unwrap();
+            let prepared = prepare_transaction(trx).unwrap();
             assert!(prepared.redo_bin.is_none());
             assert!(!prepared.require_durability());
             assert!(prepared.require_ordered_commit());
-            prepared.payload.take();
-            if let Some(attachment) = prepared.attachment.take() {
-                attachment.rollback();
-            }
-            prepared.release_transaction_locks();
+            discard_production_prepared_for_test(prepared);
 
-            let mut trx =
-                test_transaction_with_parts(&engine, MIN_ACTIVE_TRX_ID + 47, TrxID::new(47), 0, 0);
+            let mut trx = session.begin_trx().unwrap();
             with_transaction_inner_mut(&mut trx, "test index undo predicate", |inner| {
                 inner.index_undo_mut().push(IndexUndo {
                     table_id: TableID::new(47),
@@ -3495,31 +3580,21 @@ pub(crate) mod tests {
             .unwrap();
             assert!(!transaction_require_durability(&trx));
             assert!(transaction_require_ordered_commit(&trx));
-            let mut prepared = prepare_transaction(trx).unwrap();
+            let prepared = prepare_transaction(trx).unwrap();
             assert!(prepared.redo_bin.is_none());
             assert!(!prepared.require_durability());
             assert!(prepared.require_ordered_commit());
-            prepared.payload.take();
-            if let Some(attachment) = prepared.attachment.take() {
-                attachment.rollback();
-            }
-            prepared.release_transaction_locks();
+            discard_production_prepared_for_test(prepared);
 
-            let mut trx =
-                test_transaction_with_parts(&engine, MIN_ACTIVE_TRX_ID + 48, TrxID::new(48), 0, 0);
+            let mut trx = session.begin_trx().unwrap();
             add_pseudo_redo_log_entry(&mut trx);
             assert!(transaction_require_durability(&trx));
             assert!(transaction_require_ordered_commit(&trx));
-            let mut prepared = prepare_transaction(trx).unwrap();
+            let prepared = prepare_transaction(trx).unwrap();
             assert!(prepared.redo_bin.is_some());
             assert!(prepared.require_durability());
             assert!(prepared.require_ordered_commit());
-            prepared.redo_bin.take();
-            prepared.payload.take();
-            if let Some(attachment) = prepared.attachment.take() {
-                attachment.rollback();
-            }
-            prepared.release_transaction_locks();
+            discard_production_prepared_for_test(prepared);
         });
     }
 
