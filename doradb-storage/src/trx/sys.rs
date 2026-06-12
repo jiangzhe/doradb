@@ -3,10 +3,11 @@ use crate::catalog::{Catalog, CatalogCheckpointScanConfig, TableCache};
 use crate::component::{Component, ComponentRegistry, IndexPool, MemPool, MetaPool, ShelfScope};
 use crate::conf::TrxSysConfig;
 use crate::engine::EngineRef;
-use crate::error::{Error, FatalError, FatalResult, InternalError, Result};
+use crate::error::{CompletionErrorKind, Error, FatalError, FatalResult, InternalError, Result};
 use crate::file::fs::FileSystem;
 use crate::file::table_file::{MutableTableFile, OldRoot, TableFile};
 use crate::id::TrxID;
+use crate::io::Completion;
 use crate::quiescent::{QuiescentBox, QuiescentGuard, SyncQuiescentGuard};
 use crate::session::{SessionState, TrxAttachment};
 use crate::thread;
@@ -95,7 +96,7 @@ pub(crate) struct TransactionSystem {
     pub(super) table_fs: CachePadded<QuiescentGuard<FileSystem>>,
     /// Wakeup channel for purge coordination.
     pub(super) purge_tx: CachePadded<Sender<Purge>>,
-    /// Best-effort abandoned transaction cleanup queue.
+    /// Transaction cleanup queue for abandoned and mandatory rollback work.
     cleanup_tx: CachePadded<Sender<TrxCleanupMessage>>,
     /// Swapped table roots retained until post-publish readers drain.
     pub(super) table_roots: CachePadded<Mutex<TableRootQueue>>,
@@ -129,13 +130,15 @@ pub(crate) struct TransactionSystemWorkersOwned {
 
 /// Message consumed by the single transaction cleanup worker.
 ///
-/// The worker serializes cleanup that cannot be performed from `Drop` or the
-/// redo worker. `Stop` is a drain barrier, not an immediate cancellation: after
-/// it is received, the worker runs any messages already pending behind the
-/// marker before exiting.
+/// The worker serializes cleanup that cannot be performed from `Drop`, from
+/// user-cancellable terminal futures, or from the redo worker. `Stop` is a
+/// drain barrier, not an immediate cancellation: after it is received, the
+/// worker runs any messages already pending behind the marker before exiting.
 pub(crate) enum TrxCleanupMessage {
     /// Best-effort rollback for a dropped or shutdown-discovered active transaction.
     Job(TrxCleanupJob),
+    /// Mandatory rollback for an explicit terminal rollback claim.
+    TerminalRollback(Box<TerminalRollbackCleanupJob>),
     /// Mandatory rollback for transactions that reached precommit but cannot commit.
     FailedPrecommit(FailedPrecommitCleanupJob),
     /// Shutdown marker consumed after redo workers can no longer enqueue cleanup.
@@ -357,7 +360,8 @@ impl TransactionSystem {
     #[inline]
     pub(crate) async fn commit_transaction(&self, claim: TrxCompletionClaim) -> Result<TrxID> {
         if let Err(err) = self.ensure_runtime_healthy() {
-            self.rollback_claim(claim, "rollback poisoned commit")
+            let completion = self.enqueue_terminal_rollback(claim, "rollback poisoned commit");
+            Self::wait_terminal_rollback(completion, "wait for poisoned commit rollback cleanup")
                 .await?;
             return Err(err.into());
         }
@@ -400,8 +404,51 @@ impl TransactionSystem {
     /// Rollback active transaction.
     #[inline]
     pub(crate) async fn rollback_transaction(&self, claim: TrxCompletionClaim) -> Result<()> {
-        self.rollback_claim(claim, "rollback active transaction")
-            .await
+        let completion = self.enqueue_terminal_rollback(claim, "rollback active transaction");
+        Self::wait_terminal_rollback(completion, "wait for terminal rollback cleanup").await
+    }
+
+    /// Queue terminal rollback cleanup and return the observer completion.
+    #[inline]
+    fn enqueue_terminal_rollback(
+        &self,
+        claim: TrxCompletionClaim,
+        operation: &'static str,
+    ) -> Arc<Completion<()>> {
+        let completion = Arc::new(Completion::new());
+        let job = TerminalRollbackCleanupJob {
+            claim,
+            completion: Arc::clone(&completion),
+            operation,
+        };
+        if let Err(err) = self
+            .cleanup_tx
+            .send(TrxCleanupMessage::TerminalRollback(Box::new(job)))
+        {
+            // The returned job owns an already-claimed terminal transaction.
+            // Do not drop, discard, or run it from this caller. A closed
+            // receiver means the cleanup-worker lifetime invariant is broken,
+            // so leak the payload and fail at that boundary.
+            mem::forget(err.0);
+            panic!("terminal rollback cleanup receiver closed before transaction-system shutdown");
+        }
+        completion
+    }
+
+    #[inline]
+    async fn wait_terminal_rollback(
+        completion: Arc<Completion<()>>,
+        operation: &'static str,
+    ) -> Result<()> {
+        match completion.wait_result().await {
+            Ok(()) => Ok(()),
+            Err(report) => match *report.current_context() {
+                CompletionErrorKind::Fatal(reason) => Err(Report::new(reason)
+                    .attach(format!("{operation}: terminal rollback cleanup failed"))
+                    .into()),
+                _ => Err(Error::from_completion_report(report, operation)),
+            },
+        }
     }
 
     /// Rollback an abandoned transaction claimed by cleanup.
@@ -678,6 +725,39 @@ impl TransactionSystem {
     }
 }
 
+/// Terminal rollback job owned by the transaction cleanup worker.
+///
+/// Once a terminal rollback claim is created, the claimed mutable transaction
+/// core owns rollback-capable undo and session cleanup obligations. This job
+/// transfers that ownership to the cleanup worker before any rollback await
+/// point, so dropping the public rollback waiter cannot cancel cleanup.
+pub(crate) struct TerminalRollbackCleanupJob {
+    claim: TrxCompletionClaim,
+    completion: Arc<Completion<()>>,
+    operation: &'static str,
+}
+
+impl TerminalRollbackCleanupJob {
+    #[inline]
+    async fn run(self) {
+        #[cfg(test)]
+        let trx_id = self.claim.entry.trx_id();
+        let trx_sys = self.claim.engine().trx_sys.clone();
+        #[cfg(test)]
+        tests::run_terminal_rollback_test_hook(trx_id, self.operation);
+        let result = trx_sys.rollback_claim(self.claim, self.operation).await;
+        match result {
+            Ok(()) => self.completion.complete(Ok(())),
+            Err(err) => self
+                .completion
+                .complete(Err(CompletionErrorKind::report_error(
+                    err,
+                    format!("terminal rollback cleanup failed: {}", self.operation),
+                ))),
+        }
+    }
+}
+
 #[derive(Default)]
 pub(crate) struct TrxSysStats {
     pub(crate) commit_count: usize,
@@ -743,6 +823,10 @@ async fn run_trx_cleanup_message(message: TrxCleanupMessage) -> bool {
     match message {
         TrxCleanupMessage::Job(job) => {
             run_trx_cleanup_job(job).await;
+            true
+        }
+        TrxCleanupMessage::TerminalRollback(job) => {
+            job.run().await;
             true
         }
         TrxCleanupMessage::FailedPrecommit(job) => {
@@ -840,11 +924,12 @@ impl Component for TransactionSystemWorkers {
         //    have either committed or handed rollback jobs to cleanup.
         // 3. Join GC workers that can receive committed transaction payloads.
         // 4. Send cleanup Stop; the cleanup worker drains already queued
-        //    abandoned and failed-precommit jobs before it exits.
+        //    abandoned, terminal rollback, and failed-precommit jobs before it exits.
         //
-        // This keeps rollback-capable precommit payloads alive until cleanup
-        // resolves them, and keeps cleanup ahead of Catalog/pool/file teardown
-        // because TransactionSystemWorkers shuts down before those components.
+        // This keeps rollback-capable terminal and precommit payloads alive
+        // until cleanup resolves them, and keeps cleanup ahead of
+        // Catalog/pool/file teardown because TransactionSystemWorkers shuts
+        // down before those components.
         let log_partitions = &*component.trx_sys.log_partitions;
         for partition in log_partitions {
             {
@@ -899,6 +984,44 @@ pub(crate) mod tests {
     use std::sync::{Arc, Barrier};
     use std::time::Duration;
     use tempfile::TempDir;
+
+    type TerminalRollbackTestHook = Arc<dyn Fn(TrxID, &'static str) + Send + Sync + 'static>;
+
+    fn terminal_rollback_test_hook_slot() -> &'static Mutex<Option<TerminalRollbackTestHook>> {
+        static HOOK: std::sync::OnceLock<Mutex<Option<TerminalRollbackTestHook>>> =
+            std::sync::OnceLock::new();
+        HOOK.get_or_init(|| Mutex::new(None))
+    }
+
+    /// Guard that restores the previous terminal rollback test hook on drop.
+    pub(crate) struct TerminalRollbackTestHookGuard {
+        previous: Option<TerminalRollbackTestHook>,
+    }
+
+    impl Drop for TerminalRollbackTestHookGuard {
+        #[inline]
+        fn drop(&mut self) {
+            *terminal_rollback_test_hook_slot().lock() = self.previous.take();
+        }
+    }
+
+    /// Install a test-only hook invoked after terminal rollback worker ownership.
+    #[inline]
+    pub(crate) fn install_terminal_rollback_test_hook(
+        hook: TerminalRollbackTestHook,
+    ) -> TerminalRollbackTestHookGuard {
+        let mut slot = terminal_rollback_test_hook_slot().lock();
+        let previous = slot.replace(hook);
+        TerminalRollbackTestHookGuard { previous }
+    }
+
+    #[inline]
+    pub(crate) fn run_terminal_rollback_test_hook(trx_id: TrxID, operation: &'static str) {
+        let hook = terminal_rollback_test_hook_slot().lock().clone();
+        if let Some(hook) = hook {
+            hook(trx_id, operation);
+        }
+    }
 
     pub(crate) fn retains_statement_row_undo(
         trx_sys: &TransactionSystem,
