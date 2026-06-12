@@ -1671,13 +1671,20 @@ mod tests {
             drop(commit_fut);
 
             std::thread::scope(|scope| {
+                let (started_tx, started_rx) = mpsc::channel();
                 let (done_tx, done_rx) = mpsc::channel();
                 let shutdown_engine = &engine;
                 let shutdown = scope.spawn(move || {
+                    started_tx
+                        .send(())
+                        .expect("shutdown thread should report start");
                     shutdown_engine.shutdown().unwrap();
                     done_tx.send(()).expect("shutdown should report completion");
                 });
 
+                started_rx
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("shutdown thread should start");
                 assert!(
                     done_rx.recv_timeout(Duration::from_millis(20)).is_err(),
                     "shutdown must wait while redo final commit is blocked"
