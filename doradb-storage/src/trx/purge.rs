@@ -883,9 +883,10 @@ impl PurgeLoop for PurgeDispatcher {
                         done: done_tx.clone(),
                         gc_row_pages: Arc::clone(&gc_row_pages),
                     };
-                    if self.0[dispatch_no % self.0.len()].send(task).is_ok() {
-                        expected_tasks += 1;
-                    }
+                    self.0[dispatch_no % self.0.len()].send(task).expect(
+                        "purge executor receiver must stay alive while dispatcher owns sender",
+                    );
+                    expected_tasks += 1;
                     dispatch_no += 1;
                 }
                 drop(done_tx);
