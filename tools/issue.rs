@@ -2164,8 +2164,7 @@ fn is_markdown_section_heading(line: &str, section: &str) -> bool {
 }
 
 fn is_markdown_level_two_heading(line: &str) -> bool {
-    let trimmed = line.trim();
-    trimmed.starts_with("## ") && !trimmed.starts_with("### ")
+    line.trim().starts_with("## ")
 }
 
 fn parse_issue_number(issue_url_or_text: &str) -> Option<i64> {
