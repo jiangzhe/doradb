@@ -14,7 +14,7 @@ use crate::trx::group::{
     Commit, CommitGroup, CommitGroupLog, CommitJoin, CommitWaiter, GroupCommit, MutexGroupCommit,
 };
 use crate::trx::log_replay::{LogBuf, MmapLogReader, RedoLogStream, TrxLog};
-use crate::trx::purge::{GC, GCBucket, Purge};
+use crate::trx::purge::{GCBucket, Purge};
 use crate::trx::sys::GC_BUCKETS;
 use crate::trx::sys::TransactionSystem;
 use crate::trx::{
@@ -115,7 +115,7 @@ impl RedoLogInitializer {
     }
 
     #[inline]
-    pub(super) fn finish(self) -> Result<(RedoLog, Receiver<GC>)> {
+    pub(super) fn finish(self, purge_tx: Sender<Purge>) -> Result<RedoLog> {
         let mut file_seq = self.file_seq.unwrap_or(0);
         let log_file = create_log_file(
             &self.file_prefix,
@@ -131,35 +131,31 @@ impl RedoLogInitializer {
             log_file: Some(log_file),
         };
         let gc_info: Vec<_> = (0..GC_BUCKETS).map(|_| GCBucket::new()).collect();
-        let (gc_chan, gc_rx) = flume::unbounded();
         let (completion_tx, completion_rx) = flume::unbounded();
         let io_backend_stats = self.ctx.stats_handle();
         let (io_worker, io_client) = self.ctx.io_worker();
-        Ok((
-            RedoLog {
-                group_commit: CachePadded::new(MutexGroupCommit::new(group_commit)),
-                persisted_cts: CachePadded::new(AtomicU64::new(MIN_SNAPSHOT_TS.as_u64())),
-                rr_gc_no: CachePadded::new(AtomicUsize::new(0)),
-                stats: Arc::new(CachePadded::new(RedoLogStats::default())),
-                gc_chan,
-                gc_buckets: gc_info.into_boxed_slice(),
-                io_worker: CachePadded::new(Mutex::new(Some(io_worker))),
-                io_client,
-                io_backend_stats,
-                completion_tx,
-                completion_rx: CachePadded::new(Mutex::new(Some(completion_rx))),
-                max_io_size: self.page_size,
-                file_prefix: self.file_prefix,
-                file_seq: AtomicU32::new(file_seq),
-                file_max_size: self.file_max_size,
-                buf_free_list: FreeList::new(
-                    self.io_depth_per_log,
-                    self.io_depth_per_log * 2,
-                    move || DirectBuf::zeroed(self.page_size),
-                ),
-            },
-            gc_rx,
-        ))
+        Ok(RedoLog {
+            group_commit: CachePadded::new(MutexGroupCommit::new(group_commit)),
+            persisted_cts: CachePadded::new(AtomicU64::new(MIN_SNAPSHOT_TS.as_u64())),
+            rr_gc_no: CachePadded::new(AtomicUsize::new(0)),
+            stats: Arc::new(CachePadded::new(RedoLogStats::default())),
+            purge_tx,
+            gc_buckets: gc_info.into_boxed_slice(),
+            io_worker: CachePadded::new(Mutex::new(Some(io_worker))),
+            io_client,
+            io_backend_stats,
+            completion_tx,
+            completion_rx: CachePadded::new(Mutex::new(Some(completion_rx))),
+            max_io_size: self.page_size,
+            file_prefix: self.file_prefix,
+            file_seq: AtomicU32::new(file_seq),
+            file_max_size: self.file_max_size,
+            buf_free_list: FreeList::new(
+                self.io_depth_per_log,
+                self.io_depth_per_log * 2,
+                move || DirectBuf::zeroed(self.page_size),
+            ),
+        })
     }
 }
 
@@ -275,8 +271,8 @@ pub(crate) struct RedoLog {
     rr_gc_no: CachePadded<AtomicUsize>,
     /// Stats of transaction system.
     pub(super) stats: Arc<CachePadded<RedoLogStats>>,
-    /// GC channel to send committed transactions to GC threads.
-    pub(super) gc_chan: Sender<GC>,
+    /// Purge coordinator channel used for committed transaction GC handoff.
+    pub(super) purge_tx: Sender<Purge>,
     /// Each GC bucket contains active sts list, committed transaction list and
     /// old transaction list.
     /// Split into multiple buckets in order to avoid bottleneck of global synchronization.
@@ -620,35 +616,6 @@ impl RedoLog {
                 return;
             }
         }
-    }
-
-    /// Execute GC analysis in loop.
-    /// This method is used by the redo log's GC analyzer thread.
-    #[inline]
-    pub(crate) fn gc_loop(&self, gc_rx: Receiver<GC>, purge_chan: Sender<Purge>) {
-        while let Ok(msg) = gc_rx.recv() {
-            match msg {
-                GC::Stop => return,
-                GC::Commit(trx_list) => {
-                    let min_active_sts_may_change = self.gc_analyze(trx_list);
-                    if min_active_sts_may_change {
-                        let _ = purge_chan.send(Purge::Next);
-                    }
-                }
-            }
-        }
-    }
-
-    /// Analyze committed transaction and modify active sts list and committed transaction list.
-    /// Returns whether min_active_sts may change.
-    #[inline]
-    fn gc_analyze(&self, trx_list: FastHashMap<usize, Vec<CommittedTrx>>) -> bool {
-        let mut changed = false;
-        for (gc_no, trx_list) in trx_list {
-            let gc_bucket = &self.gc_buckets[gc_no];
-            changed |= gc_bucket.gc_analyze_commit(trx_list);
-        }
-        changed
     }
 }
 
@@ -1011,8 +978,17 @@ impl<'a> FileProcessor<'a> {
                         committed_trx_list.entry(gc_no).or_default().push(trx);
                     }
                 }
-                // send committed transaction list to GC thread
-                let _ = self.redo_log.gc_chan.send(GC::Commit(committed_trx_list));
+                // Handoff committed transaction payloads to the purge coordinator
+                // before waking commit waiters. The purge receiver must stay alive
+                // until redo has joined during worker shutdown.
+                if !committed_trx_list.is_empty() {
+                    self.redo_log
+                        .purge_tx
+                        .send(Purge::Committed(committed_trx_list))
+                        .expect(
+                            "purge coordinator receiver must stay alive until redo workers stopped",
+                        );
+                }
                 sync_group.completion.complete(Ok(()));
             }
 
@@ -1331,7 +1307,7 @@ mod tests {
     use std::future::Future;
     use std::os::fd::AsRawFd;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-    use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
+    use std::sync::{Arc, LazyLock, Mutex, MutexGuard, mpsc};
     use std::task::{Context, Poll};
     use std::thread::JoinHandle;
     use std::time::Duration;
@@ -1648,6 +1624,83 @@ mod tests {
 
             drop(session);
             engine.shutdown().unwrap();
+        });
+    }
+
+    #[test]
+    fn test_shutdown_drains_committed_handoff_after_dropped_commit_waiter() {
+        smol::block_on(async {
+            let (_temp_dir, engine) =
+                build_redo_test_engine("commit_handoff_shutdown", LogSync::None).await;
+            let table_id = table2(&engine).await;
+            let redo_fd = {
+                engine
+                    .inner()
+                    .trx_sys
+                    .redo_log
+                    .group_commit
+                    .lock()
+                    .log_file
+                    .as_ref()
+                    .unwrap()
+                    .as_raw_fd()
+            };
+            let hook = ControlledRedoWriteHook::success(redo_fd);
+            let _install = install_storage_backend_test_hook(Arc::new(hook.clone()));
+
+            let mut session = engine.new_session().unwrap();
+            let mut trx = session.begin_trx().unwrap();
+            let sts = trx.sts();
+            assert_eq!(engine.inner().trx_sys.redo_log.min_active_sts(), sts);
+            trx.exec(async |stmt| {
+                stmt.table_insert_mvcc(table_id, vec![Val::from(2), Val::from("shutdown")])
+                    .await?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+            let mut commit_fut = Box::pin(trx.commit());
+            let waker = noop_waker();
+            let mut cx = Context::from_waker(&waker);
+            match commit_fut.as_mut().poll(&mut cx) {
+                Poll::Pending => {}
+                Poll::Ready(res) => panic!("commit should wait after handoff, got {res:?}"),
+            }
+            hook.wait_started(1).await;
+            drop(commit_fut);
+
+            std::thread::scope(|scope| {
+                let (started_tx, started_rx) = mpsc::channel();
+                let (done_tx, done_rx) = mpsc::channel();
+                let shutdown_engine = &engine;
+                let shutdown = scope.spawn(move || {
+                    started_tx
+                        .send(())
+                        .expect("shutdown thread should report start");
+                    shutdown_engine.shutdown().unwrap();
+                    done_tx.send(()).expect("shutdown should report completion");
+                });
+
+                started_rx
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("shutdown thread should start");
+                assert!(
+                    done_rx.recv_timeout(Duration::from_millis(20)).is_err(),
+                    "shutdown must wait while redo final commit is blocked"
+                );
+                hook.release();
+                done_rx
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("shutdown should finish after redo completion");
+                shutdown.join().unwrap();
+            });
+
+            assert!(
+                engine.inner().trx_sys.redo_log.min_active_sts() > sts,
+                "shutdown must drain committed purge handoff before purge exits"
+            );
+            drop(session);
         });
     }
 

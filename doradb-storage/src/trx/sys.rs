@@ -14,7 +14,7 @@ use crate::thread;
 use crate::trx::group::Commit;
 use crate::trx::log::{LOG_HEADER_PAGES, RedoLog};
 use crate::trx::log_replay::MmapLogReader;
-use crate::trx::purge::{DroppedTableFileDeleteItem, DroppedTableQueue, GC, Purge, TableRootQueue};
+use crate::trx::purge::{DroppedTableFileDeleteItem, DroppedTableQueue, Purge, TableRootQueue};
 use crate::trx::redo::RedoLogs;
 use crate::trx::sys_trx::SysTrx;
 use crate::trx::{
@@ -80,7 +80,7 @@ pub(crate) struct TransactionSystem {
     /// cts range: 1 to 1<<63
     pub(super) ts: CachePadded<AtomicU64>,
     /// Global visible snapshot timestamp.
-    /// It's updated by query/GC thread after cleaning out-of-date version chains.
+    /// It's updated by purge coordination after cleaning out-of-date version chains.
     ///
     /// Data associated with smaller timestamp will be always visible to all transactions.
     global_visible_sts: CachePadded<AtomicU64>,
@@ -117,13 +117,102 @@ pub(crate) struct TransactionSystemWorkers;
 
 pub(crate) struct TransactionSystemWorkersOwned {
     pub(crate) trx_sys: SyncQuiescentGuard<TransactionSystem>,
-    pub(crate) purge_tx: Sender<Purge>,
-    pub(crate) cleanup_tx: Sender<TrxCleanupMessage>,
-    pub(crate) io_thread: Mutex<Option<JoinHandle<()>>>,
-    pub(crate) gc_thread: Mutex<Option<JoinHandle<()>>>,
-    pub(crate) purge_threads: Mutex<Vec<JoinHandle<()>>>,
-    pub(crate) cleanup_thread: Mutex<Option<JoinHandle<()>>>,
+    workers: TransactionBackgroundWorkers,
     pub(crate) shutdown_started: AtomicBool,
+}
+
+pub(crate) struct TransactionBackgroundWorkers {
+    purge_tx: Sender<Purge>,
+    cleanup_tx: Sender<TrxCleanupMessage>,
+    io_thread: Mutex<Option<JoinHandle<()>>>,
+    purge_threads: Mutex<Vec<JoinHandle<()>>>,
+    cleanup_thread: Mutex<Option<JoinHandle<()>>>,
+}
+
+impl TransactionSystemWorkersOwned {
+    #[inline]
+    pub(crate) fn new(
+        trx_sys: SyncQuiescentGuard<TransactionSystem>,
+        purge_tx: Sender<Purge>,
+        cleanup_tx: Sender<TrxCleanupMessage>,
+        io_thread: JoinHandle<()>,
+        purge_threads: Vec<JoinHandle<()>>,
+        cleanup_thread: JoinHandle<()>,
+    ) -> Self {
+        Self {
+            trx_sys,
+            workers: TransactionBackgroundWorkers {
+                purge_tx,
+                cleanup_tx,
+                io_thread: Mutex::new(Some(io_thread)),
+                purge_threads: Mutex::new(purge_threads),
+                cleanup_thread: Mutex::new(Some(cleanup_thread)),
+            },
+            shutdown_started: AtomicBool::new(false),
+        }
+    }
+}
+
+impl TransactionBackgroundWorkers {
+    #[inline]
+    fn shutdown(&self, trx_sys: &TransactionSystem) {
+        let redo_log = &*trx_sys.redo_log;
+
+        // This shutdown order is a correctness contract, not only a resource
+        // cleanup preference. Redo owns the final commit/fail-precommit outcome
+        // after group-commit handoff, cleanup owns rollback-capable failed
+        // precommit payloads, and purge owns committed-payload GC analysis.
+        // Changing this sequence can drop or strand transaction-owned undo that
+        // MVCC structures may still reference.
+
+        // First close group-commit admission and wake redo. Any transaction
+        // already accepted by group commit must still reach one terminal owner:
+        // successful ordered completion hands committed payloads to purge, and
+        // failed ordered completion hands rollback payloads to cleanup.
+        {
+            let mut group_commit_g = redo_log.group_commit.lock();
+            group_commit_g.close(FailedPrecommitReason::Shutdown);
+            group_commit_g.queue.push_back(Commit::Shutdown);
+            redo_log.group_commit.notify_one();
+        }
+
+        // Join redo before stopping cleanup or purge. After this point no new
+        // committed-payload handoff and no new failed-precommit cleanup job can
+        // be produced by redo.
+        if let Some(handle) = self.io_thread.lock().take() {
+            handle.join().unwrap();
+        }
+
+        // Cleanup can update GC bucket state while rolling back failed,
+        // terminal, or abandoned transactions. Stop it only after redo has
+        // finished producing failed-precommit jobs, and join it before purge
+        // shutdown so purge does not exit while cleanup can still move the GC
+        // horizon.
+        let _ = self.cleanup_tx.send(TrxCleanupMessage::Stop);
+        if let Some(handle) = self.cleanup_thread.lock().take() {
+            handle.join().unwrap();
+        }
+
+        // Purge receives non-lossy committed-payload batches from redo. Its
+        // stop marker is sent after redo and cleanup have joined, so messages
+        // accepted before shutdown are recorded before the coordinator exits.
+        // The purge coalescer treats Stop as terminal and may skip a final scan,
+        // so this ordering is not optional: there must be no later committed
+        // handoff behind Stop.
+        let _ = self.purge_tx.send(Purge::Stop);
+        let purge_threads = { std::mem::take(&mut *self.purge_threads.lock()) };
+        for handle in purge_threads {
+            handle.join().unwrap();
+        }
+
+        // Close the active redo file last. Redo has stopped using it, and
+        // cleanup/purge have finished the in-memory ownership transitions that
+        // depend on ordered completion.
+        let mut group_commit_g = redo_log.group_commit.lock();
+        if let Some(log_file) = group_commit_g.log_file.take() {
+            drop(log_file);
+        }
+    }
 }
 
 /// Message consumed by the single transaction cleanup worker.
@@ -491,7 +580,7 @@ impl TransactionSystem {
             return Err(self.poison_storage(FatalError::RollbackAccess).into());
         }
         inner.effects_mut().clear_for_rollback();
-        self.redo_log.gc_buckets[gc_no].gc_analyze_rollback(sts);
+        self.redo_log.gc_buckets[gc_no].record_rollback_for_purge(sts);
         inner.release_transaction_locks(attachment);
         inner.finish_session_rollback(attachment);
         entry.finish(TrxEntryState::Terminal);
@@ -510,7 +599,7 @@ impl TransactionSystem {
             .payload
             .take()
             .expect("prepared no-op cleanup requires user transaction payload");
-        self.redo_log.gc_buckets[payload.gc_no].gc_analyze_rollback(payload.sts);
+        self.redo_log.gc_buckets[payload.gc_no].record_rollback_for_purge(payload.sts);
         if let Some(s) = trx.attachment.take() {
             s.rollback();
         }
@@ -552,19 +641,6 @@ impl TransactionSystem {
         });
         self.global_visible_sts
             .store(sts.as_u64(), Ordering::SeqCst)
-    }
-
-    /// Start the background GC thread.
-    #[inline]
-    pub(crate) fn start_gc_thread(
-        trx_sys: QuiescentGuard<Self>,
-        gc_rx: Receiver<GC>,
-        purge_chan: Sender<Purge>,
-    ) -> JoinHandle<()> {
-        let trx_sys = trx_sys.into_sync();
-        thread::spawn_named("GC-Thread", move || {
-            trx_sys.redo_log.gc_loop(gc_rx, purge_chan);
-        })
     }
 
     /// Start the background IO thread.
@@ -881,47 +957,18 @@ impl Component for TransactionSystemWorkers {
         // Cleanup lifetime invariant:
         // 1. Close group-commit admission and wake redo workers.
         // 2. Join the redo worker, so all queued/inflight failed-precommit groups
-        //    have either committed or handed rollback jobs to cleanup.
-        // 3. Join the GC worker that can receive committed transaction payloads.
-        // 4. Send cleanup Stop; the cleanup worker drains already queued
+        //    have either handed committed payloads to purge or rollback jobs to cleanup.
+        // 3. Send cleanup Stop; the cleanup worker drains already queued
         //    abandoned, terminal rollback, and failed-precommit jobs before it exits.
+        // 4. Send purge Stop; purge drains committed payloads accepted before
+        //    the stop marker and then exits.
         //
         // This keeps rollback-capable terminal and precommit payloads alive
-        // until cleanup resolves them, and keeps cleanup ahead of
-        // Catalog/pool/file teardown because TransactionSystemWorkers shuts
-        // down before those components.
-        let redo_log = &*component.trx_sys.redo_log;
-        {
-            let mut group_commit_g = redo_log.group_commit.lock();
-            group_commit_g.close(FailedPrecommitReason::Shutdown);
-            group_commit_g.queue.push_back(Commit::Shutdown);
-            redo_log.group_commit.notify_one();
-        }
-        let _ = redo_log.gc_chan.send(GC::Stop);
-
-        if let Some(handle) = component.io_thread.lock().take() {
-            handle.join().unwrap();
-        }
-        if let Some(handle) = component.gc_thread.lock().take() {
-            handle.join().unwrap();
-        }
-
-        let _ = component.cleanup_tx.send(TrxCleanupMessage::Stop);
-        let cleanup_thread = { component.cleanup_thread.lock().take() };
-        if let Some(handle) = cleanup_thread {
-            handle.join().unwrap();
-        }
-
-        let _ = component.purge_tx.send(Purge::Stop);
-        let purge_threads = { mem::take(&mut *component.purge_threads.lock()) };
-        for handle in purge_threads {
-            handle.join().unwrap();
-        }
-
-        let mut group_commit_g = redo_log.group_commit.lock();
-        if let Some(log_file) = group_commit_g.log_file.take() {
-            drop(log_file);
-        }
+        // until cleanup resolves them, keeps committed payload analysis ahead
+        // of purge shutdown, and keeps cleanup/purge ahead of Catalog/pool/file
+        // teardown because TransactionSystemWorkers shuts down before those
+        // components.
+        component.workers.shutdown(&component.trx_sys);
     }
 }
 

@@ -289,12 +289,24 @@ fn cmd_create_issue_from_doc(mut args: impl Iterator<Item = String>) -> Result<(
         .or_else(|| validated.title_hint.clone())
         .unwrap_or_else(|| format!("{} {}", validated.doc_type.to_uppercase(), validated.doc_id));
 
+    let doc_content = match fs::read_to_string(doc_path) {
+        Ok(v) => v,
+        Err(e) => {
+            print_json(&json!({
+                "created": false,
+                "error": format!("failed to read {}: {e}", normalize_path(doc_path)),
+            }));
+            return Err(1);
+        }
+    };
+
     let body = build_body(
         &validated.path,
         &validated.doc_type,
         &validated.doc_id,
         validated.title_hint.as_deref(),
         parent,
+        &doc_content,
     );
 
     let temp_path = match write_temp_issue_body(&body) {
@@ -2078,6 +2090,7 @@ fn build_body(
     doc_id: &str,
     doc_title: Option<&str>,
     parent: Option<i64>,
+    doc_content: &str,
 ) -> String {
     let mut lines = vec![
         "Planning document:".to_string(),
@@ -2093,7 +2106,65 @@ fn build_body(
     if let Some(p) = parent {
         lines.push(format!("Part of #{p}"));
     }
-    lines.join("\n") + "\n"
+    let mut body = lines.join("\n") + "\n";
+    for section in issue_body_sections(doc_type) {
+        append_issue_body_section(&mut body, doc_content, section);
+    }
+    body
+}
+
+fn issue_body_sections(doc_type: &str) -> &'static [&'static str] {
+    match doc_type {
+        "task" => &["Summary", "Context", "Goals", "Non-Goals"],
+        "rfc" => &["Summary", "Context", "Decision"],
+        _ => &[],
+    }
+}
+
+fn append_issue_body_section(body: &mut String, doc_content: &str, section: &str) {
+    body.push('\n');
+    body.push_str("## ");
+    body.push_str(section);
+    body.push_str("\n\n");
+    match extract_markdown_section(doc_content, section) {
+        Some(text) if !text.trim().is_empty() => {
+            body.push_str(text.trim_matches('\n'));
+            body.push('\n');
+        }
+        Some(_) => {
+            body.push_str("_Section is empty in the planning document._\n");
+        }
+        None => {
+            body.push_str("_Section not found in the planning document._\n");
+        }
+    }
+}
+
+fn extract_markdown_section(content: &str, section: &str) -> Option<String> {
+    let lines: Vec<&str> = content.lines().collect();
+    let start = lines
+        .iter()
+        .position(|line| is_markdown_section_heading(line, section))?;
+    let end = lines
+        .iter()
+        .enumerate()
+        .skip(start + 1)
+        .find(|(_, line)| is_markdown_level_two_heading(line))
+        .map(|(idx, _)| idx)
+        .unwrap_or(lines.len());
+    Some(lines[start + 1..end].join("\n"))
+}
+
+fn is_markdown_section_heading(line: &str, section: &str) -> bool {
+    let trimmed = line.trim();
+    let Some(heading) = trimmed.strip_prefix("## ") else {
+        return false;
+    };
+    heading.trim().eq_ignore_ascii_case(section)
+}
+
+fn is_markdown_level_two_heading(line: &str) -> bool {
+    line.trim().starts_with("## ")
 }
 
 fn parse_issue_number(issue_url_or_text: &str) -> Option<i64> {
@@ -2252,6 +2323,124 @@ mod tests {
         assert_eq!(after, input);
 
         let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_build_body_includes_task_context_sections() {
+        let doc = "\
+---
+id: 000123
+---
+
+# Task: Example
+
+## Summary
+
+Task summary.
+
+## Context
+
+Task context.
+
+## Goals
+
+1. Goal one.
+
+## Non-Goals
+
+1. Non-goal one.
+
+## Plan
+
+Do the work.
+";
+
+        let body = build_body(
+            "docs/tasks/000123-example.md",
+            "task",
+            "000123",
+            Some("Task: Example"),
+            Some(42),
+            doc,
+        );
+
+        assert!(body.contains("Planning document:\n- `docs/tasks/000123-example.md`"));
+        assert!(body.contains("Part of #42"));
+        assert!(body.contains("## Summary\n\nTask summary.\n"));
+        assert!(body.contains("## Context\n\nTask context.\n"));
+        assert!(body.contains("## Goals\n\n1. Goal one.\n"));
+        assert!(body.contains("## Non-Goals\n\n1. Non-goal one.\n"));
+        assert!(!body.contains("## Plan\n\nDo the work."));
+    }
+
+    #[test]
+    fn test_build_body_includes_rfc_context_sections() {
+        let doc = "\
+---
+id: 0012
+---
+
+# RFC-0012: Example
+
+## Summary
+
+RFC summary.
+
+## Context
+
+RFC context.
+
+## Design Inputs
+
+- [D1] `docs/architecture.md`
+
+## Decision
+
+Choose the selected direction.
+
+### Detail
+
+Decision detail stays attached.
+
+## Consequences
+
+Expected outcomes.
+";
+
+        let body = build_body(
+            "docs/rfcs/0012-example.md",
+            "rfc",
+            "0012",
+            Some("RFC-0012: Example"),
+            None,
+            doc,
+        );
+
+        assert!(body.contains("Planning document:\n- `docs/rfcs/0012-example.md`"));
+        assert!(body.contains("## Summary\n\nRFC summary.\n"));
+        assert!(body.contains("## Context\n\nRFC context.\n"));
+        assert!(body.contains("## Decision\n\nChoose the selected direction.\n\n### Detail\n\nDecision detail stays attached.\n"));
+        assert!(!body.contains("## Design Inputs\n\n- [D1]"));
+        assert!(!body.contains("## Consequences\n\nExpected outcomes."));
+    }
+
+    #[test]
+    fn test_build_body_marks_missing_requested_sections() {
+        let doc = "# Task: Example\n\n## Summary\n\nTask summary.\n";
+
+        let body = build_body(
+            "docs/tasks/000124-example.md",
+            "task",
+            "000124",
+            None,
+            None,
+            doc,
+        );
+
+        assert!(body.contains("## Summary\n\nTask summary.\n"));
+        assert!(body.contains("## Context\n\n_Section not found in the planning document._\n"));
+        assert!(body.contains("## Goals\n\n_Section not found in the planning document._\n"));
+        assert!(body.contains("## Non-Goals\n\n_Section not found in the planning document._\n"));
     }
 
     fn unique_temp_path(prefix: &str) -> PathBuf {

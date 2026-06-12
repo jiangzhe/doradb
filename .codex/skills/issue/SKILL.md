@@ -71,6 +71,10 @@ tools/issue.rs create-issue-from-doc \
 ```
 
 This script always uses `--body-file` to avoid body-length command issues.
+Issue bodies include planning metadata plus selected document context:
+- task docs: `Summary`, `Context`, `Goals`, and `Non-Goals`
+- RFC docs: `Summary`, `Context`, and `Decision`
+
 Allowed labels are strictly validated:
 - type: `type:doc`, `type:perf`, `type:feature`, `type:question`, `type:bug`, `type:chore`, `type:epic`, `type:task`
 - priority: `priority:low`, `priority:medium`, `priority:high`, `priority:critical`

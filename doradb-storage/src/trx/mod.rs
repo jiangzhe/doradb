@@ -1895,9 +1895,9 @@ impl PrecommitTrxPayload {
     }
 
     #[inline]
-    fn gc_analyze_rollback(&self, attachment: &TrxAttachment) {
+    fn record_rollback_for_purge(&self, attachment: &TrxAttachment) {
         let trx_sys = &attachment.engine().trx_sys;
-        trx_sys.redo_log.gc_buckets[self.gc_no].gc_analyze_rollback(self.sts);
+        trx_sys.redo_log.gc_buckets[self.gc_no].record_rollback_for_purge(self.sts);
     }
 
     #[inline]
@@ -2011,7 +2011,7 @@ impl PrecommitTrx {
                 self.finish_failed_precommit_with_retention(engine);
                 return false;
             }
-            payload.gc_analyze_rollback(attachment);
+            payload.record_rollback_for_purge(attachment);
         }
         self.release_transaction_locks();
         if let Some(s) = self.attachment.take() {
@@ -2312,7 +2312,7 @@ pub(crate) mod tests {
                 0
             );
 
-            engine.inner().trx_sys.redo_log.gc_buckets[gc_no].gc_analyze_rollback(sts);
+            engine.inner().trx_sys.redo_log.gc_buckets[gc_no].record_rollback_for_purge(sts);
             engine
                 .inner()
                 .session_registry
@@ -2452,7 +2452,7 @@ pub(crate) mod tests {
             && let Some(attachment) = prepared.attachment.as_ref()
         {
             let trx_sys = &attachment.engine().trx_sys;
-            trx_sys.redo_log.gc_buckets[payload.gc_no].gc_analyze_rollback(payload.sts);
+            trx_sys.redo_log.gc_buckets[payload.gc_no].record_rollback_for_purge(payload.sts);
         }
         prepared.redo_bin.take();
         if let Some(attachment) = prepared.attachment.take() {
@@ -2464,7 +2464,8 @@ pub(crate) mod tests {
     #[inline]
     fn finish_production_committed_for_test(engine: &Engine, committed: CommittedTrx) {
         if let Some(gc_no) = committed.gc_no() {
-            engine.inner().trx_sys.redo_log.gc_buckets[gc_no].gc_analyze_commit(vec![committed]);
+            engine.inner().trx_sys.redo_log.gc_buckets[gc_no]
+                .record_committed_for_purge(vec![committed]);
         }
     }
 
@@ -2474,7 +2475,7 @@ pub(crate) mod tests {
         let gc_no = transaction_gc_no(trx);
         let engine = trx.engine().expect("test transaction must have engine");
         discard_transaction_after_fatal_rollback(trx);
-        engine.trx_sys.redo_log.gc_buckets[gc_no].gc_analyze_rollback(sts);
+        engine.trx_sys.redo_log.gc_buckets[gc_no].record_rollback_for_purge(sts);
     }
 
     /// Add one redo log entry for tests that need a non-readonly transaction.

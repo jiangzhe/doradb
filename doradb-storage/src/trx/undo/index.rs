@@ -109,7 +109,7 @@ pub(crate) enum IndexUndoKind {
     /// Delete is not included in index undo,
     /// because transaction thread does not perform index deletion,
     /// in order to support MVCC.
-    /// The actual deletion is performed solely by GC thread.
+    /// The actual deletion is performed solely by purge workers.
     /// This is what GC entry means.
     /// Second parameter indicates whether the index is unique.
     DeferDelete(SelectKey, bool),

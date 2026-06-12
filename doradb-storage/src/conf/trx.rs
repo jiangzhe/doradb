@@ -8,7 +8,7 @@ use crate::file::fs::FileSystem;
 use crate::io::{StorageBackend, align_to_sector_size};
 use crate::quiescent::QuiescentGuard;
 use crate::trx::log::{LOG_HEADER_PAGES, LogSync, RedoLogInitializer, RedoLogMode};
-use crate::trx::purge::{GC, Purge};
+use crate::trx::purge::Purge;
 use crate::trx::recover::{RecoveryDeps, log_recover};
 use crate::trx::sys::{
     TransactionSystem, TransactionSystemQueues, TransactionSystemWorkers,
@@ -17,11 +17,9 @@ use crate::trx::sys::{
 use byte_unit::Byte;
 use error_stack::ResultExt;
 use flume::{Receiver, Sender};
-use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::AtomicBool;
 
 use super::consts::{
     DEFAULT_LOG_DIR, DEFAULT_LOG_FILE_MAX_SIZE, DEFAULT_LOG_FILE_STEM, DEFAULT_LOG_IO_DEPTH,
@@ -60,7 +58,6 @@ pub struct TrxSysConfig {
 }
 
 pub(crate) struct PendingTransactionSystemStartup {
-    gc_rx: Receiver<GC>,
     purge_tx: Sender<Purge>,
     purge_rx: Receiver<Purge>,
     cleanup_tx: Sender<TrxCleanupMessage>,
@@ -76,8 +73,6 @@ impl PendingTransactionSystemStartup {
         trx_sys: QuiescentGuard<TransactionSystem>,
     ) -> TransactionSystemWorkersOwned {
         let io_thread = TransactionSystem::start_io_thread(trx_sys.clone());
-        let gc_thread =
-            TransactionSystem::start_gc_thread(trx_sys.clone(), self.gc_rx, self.purge_tx.clone());
         let purge_threads = TransactionSystem::start_purge_threads(
             trx_sys.clone(),
             self.mem_pool,
@@ -85,16 +80,14 @@ impl PendingTransactionSystemStartup {
             self.purge_rx,
         );
         let cleanup_thread = TransactionSystem::start_cleanup_thread(self.cleanup_rx);
-        TransactionSystemWorkersOwned {
-            trx_sys: trx_sys.into_sync(),
-            purge_tx: self.purge_tx,
-            cleanup_tx: self.cleanup_tx,
-            io_thread: Mutex::new(Some(io_thread)),
-            gc_thread: Mutex::new(Some(gc_thread)),
-            purge_threads: Mutex::new(purge_threads),
-            cleanup_thread: Mutex::new(Some(cleanup_thread)),
-            shutdown_started: AtomicBool::new(false),
-        }
+        TransactionSystemWorkersOwned::new(
+            trx_sys.into_sync(),
+            self.purge_tx,
+            self.cleanup_tx,
+            io_thread,
+            purge_threads,
+            cleanup_thread,
+        )
     }
 }
 
@@ -222,7 +215,7 @@ impl TrxSysConfig {
 
         let (purge_tx, purge_rx) = flume::unbounded();
         let (cleanup_tx, cleanup_rx) = flume::unbounded();
-        let (redo_log, gc_rx, initial_trx_ts, initial_file_deletes) = log_recover(
+        let (redo_log, initial_trx_ts, initial_file_deletes) = log_recover(
             &meta_pool,
             RecoveryDeps {
                 index_pool,
@@ -232,6 +225,7 @@ impl TrxSysConfig {
             },
             &catalog,
             redo_log_initializer,
+            purge_tx.clone(),
         )
         .await?;
 
@@ -250,7 +244,6 @@ impl TrxSysConfig {
         Ok((
             trx_sys,
             PendingTransactionSystemStartup {
-                gc_rx,
                 purge_tx,
                 purge_rx,
                 cleanup_tx,
