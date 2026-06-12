@@ -90,11 +90,12 @@ When a transaction commits on a table:
 
 Foreground commit never updates persistent `DiskTree` pages directly.
 
-The commit log is the recovery-visible CTS carrier for non-checkpointed
-foreground changes. Checkpoint metadata and published table roots are the other
-stable timestamp carriers. An ordered no-log commit is valid only for volatile
-runtime effects. If an effect must survive restart and cannot be recovered from
-checkpoint metadata or table roots, it must emit a real redo record or marker.
+The commit log is one canonical ordered redo stream and is the
+recovery-visible CTS carrier for non-checkpointed foreground changes.
+Checkpoint metadata and published table roots are the other stable timestamp
+carriers. An ordered no-log commit is valid only for volatile runtime effects.
+If an effect must survive restart and cannot be recovered from checkpoint
+metadata or table roots, it must emit a real redo record or marker.
 
 ## 4. Checkpoint
 

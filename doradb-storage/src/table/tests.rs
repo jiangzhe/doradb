@@ -7121,7 +7121,7 @@ fn test_drop_table_commit_poison_preserves_source_error() {
         let temp_dir = TempDir::new().unwrap();
         let engine = lightweight_test_engine(&temp_dir, "redo_testsys_lightweight").await;
         let table_id = create_table2_for_test(&engine).await;
-        let redo_file_path = temp_dir.path().join("redo_testsys_lightweight.0.00000000");
+        let redo_file_path = temp_dir.path().join("redo_testsys_lightweight.00000000");
         let hook = Arc::new(FailingFirstWriteHook::new(redo_file_path));
         let _install = install_storage_backend_test_hook(hook.clone());
         let mut session = engine.new_session().unwrap();
@@ -7172,7 +7172,7 @@ fn test_user_insert_commit_poison_rolls_back_session_before_return() {
             vec![Val::from(1), Val::from("seed")],
         )
         .await;
-        let redo_file_path = temp_dir.path().join("redo_testsys_lightweight.0.00000000");
+        let redo_file_path = temp_dir.path().join("redo_testsys_lightweight.00000000");
         let hook = Arc::new(FailingFirstWriteHook::new(redo_file_path));
         let _install = install_storage_backend_test_hook(hook.clone());
 

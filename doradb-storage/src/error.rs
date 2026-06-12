@@ -49,8 +49,6 @@ pub(crate) enum ConfigError {
     InvalidCatalogFileName,
     #[error("invalid log file stem")]
     InvalidLogFileStem,
-    #[error("invalid log partition count")]
-    InvalidLogPartitions,
     #[error("path must not be empty")]
     PathMustNotBeEmpty,
     #[error("path must be valid UTF-8")]

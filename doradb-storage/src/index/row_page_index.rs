@@ -2046,7 +2046,7 @@ mod tests {
             let mut create_row_page_logs = 0usize;
             let file_prefix = temp_dir.path().join("redo_row_page_idx");
             let file_prefix = file_prefix.to_str().unwrap();
-            let logs = list_log_files(file_prefix, 0, false).unwrap();
+            let logs = list_log_files(file_prefix, false).unwrap();
             for log in logs {
                 let mut reader = engine.inner().trx_sys.log_reader(&log).unwrap();
                 loop {

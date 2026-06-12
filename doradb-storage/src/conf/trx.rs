@@ -7,7 +7,7 @@ use crate::error::{ConfigResult, Error, Result};
 use crate::file::fs::FileSystem;
 use crate::io::{StorageBackend, align_to_sector_size};
 use crate::quiescent::QuiescentGuard;
-use crate::trx::log::{LOG_HEADER_PAGES, LogPartitionInitializer, LogPartitionMode, LogSync};
+use crate::trx::log::{LOG_HEADER_PAGES, LogSync, RedoLogInitializer, RedoLogMode};
 use crate::trx::purge::{GC, Purge};
 use crate::trx::recover::{RecoveryDeps, log_recover};
 use crate::trx::sys::{
@@ -17,14 +17,15 @@ use crate::trx::sys::{
 use byte_unit::Byte;
 use error_stack::ResultExt;
 use flume::{Receiver, Sender};
+use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicBool;
 
 use super::consts::{
     DEFAULT_LOG_DIR, DEFAULT_LOG_FILE_MAX_SIZE, DEFAULT_LOG_FILE_STEM, DEFAULT_LOG_IO_DEPTH,
-    DEFAULT_LOG_IO_MAX_SIZE, DEFAULT_LOG_PARTITIONS, DEFAULT_LOG_SYNC, DEFAULT_PURGE_THREADS,
-    MAX_LOG_PARTITIONS,
+    DEFAULT_LOG_IO_MAX_SIZE, DEFAULT_LOG_SYNC, DEFAULT_PURGE_THREADS,
 };
 use super::path::{path_to_utf8, validate_log_file_stem};
 
@@ -43,10 +44,8 @@ pub struct TrxSysConfig {
     pub log_dir: PathBuf,
     // Base file name of one redo log family.
     // the complete file name pattern is:
-    // <log-dir>/<log-file-stem>.<partition_idx>.<file-sequence>
+    // <log-dir>/<log-file-stem>.<file-sequence>
     pub log_file_stem: String,
-    // Log partition number.
-    pub log_partitions: usize,
     // Controls the maximum size of each log file.
     // Log file will be rotated once the size limit is reached.
     // a u32 suffix is appended at end of the file name in
@@ -61,7 +60,7 @@ pub struct TrxSysConfig {
 }
 
 pub(crate) struct PendingTransactionSystemStartup {
-    gc_rxs: Vec<Receiver<GC>>,
+    gc_rx: Receiver<GC>,
     purge_tx: Sender<Purge>,
     purge_rx: Receiver<Purge>,
     cleanup_tx: Sender<TrxCleanupMessage>,
@@ -76,12 +75,9 @@ impl PendingTransactionSystemStartup {
         self,
         trx_sys: QuiescentGuard<TransactionSystem>,
     ) -> TransactionSystemWorkersOwned {
-        let io_threads = TransactionSystem::start_io_threads(trx_sys.clone());
-        let gc_threads = TransactionSystem::start_gc_threads(
-            trx_sys.clone(),
-            self.gc_rxs,
-            self.purge_tx.clone(),
-        );
+        let io_thread = TransactionSystem::start_io_thread(trx_sys.clone());
+        let gc_thread =
+            TransactionSystem::start_gc_thread(trx_sys.clone(), self.gc_rx, self.purge_tx.clone());
         let purge_threads = TransactionSystem::start_purge_threads(
             trx_sys.clone(),
             self.mem_pool,
@@ -93,11 +89,11 @@ impl PendingTransactionSystemStartup {
             trx_sys: trx_sys.into_sync(),
             purge_tx: self.purge_tx,
             cleanup_tx: self.cleanup_tx,
-            io_threads: parking_lot::Mutex::new(io_threads),
-            gc_threads: parking_lot::Mutex::new(gc_threads),
-            purge_threads: parking_lot::Mutex::new(purge_threads),
-            cleanup_thread: parking_lot::Mutex::new(Some(cleanup_thread)),
-            shutdown_started: std::sync::atomic::AtomicBool::new(false),
+            io_thread: Mutex::new(Some(io_thread)),
+            gc_thread: Mutex::new(Some(gc_thread)),
+            purge_threads: Mutex::new(purge_threads),
+            cleanup_thread: Mutex::new(Some(cleanup_thread)),
+            shutdown_started: AtomicBool::new(false),
         }
     }
 }
@@ -157,14 +153,6 @@ impl TrxSysConfig {
         self
     }
 
-    /// Controls how many files can be used for concurrent logging.
-    #[inline]
-    pub fn log_partitions(mut self, log_partitions: usize) -> Self {
-        assert!(log_partitions > 0 && log_partitions <= MAX_LOG_PARTITIONS);
-        self.log_partitions = log_partitions;
-        self
-    }
-
     /// Sync method of log files.
     #[inline]
     pub fn log_sync(mut self, log_sync: LogSync) -> Self {
@@ -191,21 +179,18 @@ impl TrxSysConfig {
     }
 
     #[inline]
-    pub(crate) fn log_partition_initializer(
-        &self,
-        log_no: usize,
-    ) -> Result<LogPartitionInitializer> {
+    pub(crate) fn redo_log_initializer(&self) -> Result<RedoLogInitializer> {
         debug_assert!(validate_log_file_stem(&self.log_file_stem));
         let ctx = StorageBackend::new(self.io_depth_per_log)?;
         let file_prefix = self.file_prefix().map_err(Error::from)?;
 
-        let logs = list_log_files(&file_prefix, log_no, false)?;
+        let logs = list_log_files(&file_prefix, false)?;
         let mode = if logs.is_empty() {
-            LogPartitionMode::Done
+            RedoLogMode::Done
         } else {
-            LogPartitionMode::Recovery(VecDeque::from(logs))
+            RedoLogMode::Recovery(VecDeque::from(logs))
         };
-        Ok(LogPartitionInitializer {
+        Ok(RedoLogInitializer {
             ctx,
             mode,
             file_prefix,
@@ -213,7 +198,6 @@ impl TrxSysConfig {
             page_size: self.max_io_size.as_u64() as usize,
             file_header_size: self.max_io_size.as_u64() as usize * LOG_HEADER_PAGES,
             io_depth_per_log: self.io_depth_per_log,
-            log_no,
             file_seq: None,
         })
     }
@@ -227,11 +211,7 @@ impl TrxSysConfig {
         disk_pool: QuiescentGuard<ReadonlyBufferPool>,
         catalog: QuiescentGuard<Catalog>,
     ) -> Result<(TransactionSystem, PendingTransactionSystemStartup)> {
-        let mut log_partition_initializers = Vec::with_capacity(self.log_partitions);
-        for idx in 0..self.log_partitions {
-            let initializer = self.log_partition_initializer(idx)?;
-            log_partition_initializers.push(initializer);
-        }
+        let redo_log_initializer = self.redo_log_initializer()?;
 
         let pool_guards = PoolGuards::builder()
             .push(PoolRole::Meta, meta_pool.pool_guard())
@@ -242,7 +222,7 @@ impl TrxSysConfig {
 
         let (purge_tx, purge_rx) = flume::unbounded();
         let (cleanup_tx, cleanup_rx) = flume::unbounded();
-        let (log_partitions, gc_rxs, initial_trx_ts, initial_file_deletes) = log_recover(
+        let (redo_log, gc_rx, initial_trx_ts, initial_file_deletes) = log_recover(
             &meta_pool,
             RecoveryDeps {
                 index_pool,
@@ -251,7 +231,7 @@ impl TrxSysConfig {
                 disk_pool,
             },
             &catalog,
-            log_partition_initializers,
+            redo_log_initializer,
         )
         .await?;
 
@@ -259,7 +239,7 @@ impl TrxSysConfig {
             self,
             catalog,
             table_fs,
-            log_partitions,
+            redo_log,
             initial_trx_ts,
             TransactionSystemQueues {
                 purge_tx: purge_tx.clone(),
@@ -270,7 +250,7 @@ impl TrxSysConfig {
         Ok((
             trx_sys,
             PendingTransactionSystemStartup {
-                gc_rxs,
+                gc_rx,
                 purge_tx,
                 purge_rx,
                 cleanup_tx,
@@ -291,7 +271,6 @@ impl Default for TrxSysConfig {
             log_dir: PathBuf::from(DEFAULT_LOG_DIR),
             log_file_stem: String::from(DEFAULT_LOG_FILE_STEM),
             log_file_max_size: DEFAULT_LOG_FILE_MAX_SIZE,
-            log_partitions: DEFAULT_LOG_PARTITIONS,
             log_sync: DEFAULT_LOG_SYNC,
             purge_threads: DEFAULT_PURGE_THREADS,
         }

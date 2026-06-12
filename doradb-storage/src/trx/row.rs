@@ -1110,7 +1110,6 @@ mod tests {
         TrxContext {
             status: Arc::new(SharedTrxStatus::new(MIN_ACTIVE_TRX_ID + sts.as_u64())),
             sts,
-            log_no: 0,
             gc_no: 0,
         }
     }

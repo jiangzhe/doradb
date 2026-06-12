@@ -16,7 +16,6 @@ use super::path::{
     validate_swap_file_path_candidate,
 };
 use super::{EvictableBufferPoolConfig, FileSystemConfig, TrxSysConfig};
-use crate::conf::consts::MAX_LOG_PARTITIONS;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct DurableStorageLayout {
@@ -25,7 +24,6 @@ struct DurableStorageLayout {
     catalog_file_name: String,
     log_dir: String,
     log_file_stem: String,
-    log_partitions: usize,
 }
 
 struct StoragePathResolveInput<'a> {
@@ -34,7 +32,6 @@ struct StoragePathResolveInput<'a> {
     catalog_file_name: &'a str,
     log_dir: &'a Path,
     log_file_stem: &'a str,
-    log_partitions: usize,
     data_swap_file: &'a Path,
     index_swap_file: &'a Path,
 }
@@ -77,19 +74,6 @@ impl ResolvedStoragePaths {
             format!(
                 "log file stem must be a plain file name without glob characters: {}",
                 input.log_file_stem
-            )
-        })?;
-        (|| {
-            ensure!(
-                input.log_partitions > 0 && input.log_partitions <= MAX_LOG_PARTITIONS,
-                ConfigError::InvalidLogPartitions
-            );
-            Ok(())
-        })()
-        .attach_with(|| {
-            format!(
-                "log partitions must be in 1..={MAX_LOG_PARTITIONS}: {}",
-                input.log_partitions
             )
         })?;
         validate_swap_file_path_candidate("data_swap_file", input.data_swap_file).attach_with(
@@ -135,7 +119,6 @@ impl ResolvedStoragePaths {
             catalog_file_name: input.catalog_file_name.to_string(),
             log_dir: relative_dir_display(&log_dir_rel, "log_dir")?,
             log_file_stem: input.log_file_stem.to_string(),
-            log_partitions: input.log_partitions,
         };
         let res = ResolvedStoragePaths {
             storage_root,
@@ -455,7 +438,6 @@ impl EngineConfig {
             catalog_file_name: &self.file.catalog_file_name,
             log_dir: self.trx.log_dir_ref(),
             log_file_stem: self.trx.log_file_stem_ref(),
-            log_partitions: self.trx.log_partitions,
             data_swap_file: self.data_buffer.data_swap_file_ref(),
             index_swap_file: &self.index_swap_file,
         })
@@ -635,6 +617,36 @@ mod tests {
             .unwrap();
         changed.ensure_directories().unwrap();
         let err = changed.validate_marker_if_present().unwrap_err();
+        assert!(err.is_kind(ErrorKind::Config));
+        assert_eq!(
+            err.report().downcast_ref::<ConfigError>().copied(),
+            Some(ConfigError::StorageLayoutMismatch)
+        );
+    }
+
+    #[test]
+    fn test_marker_rejects_v1_layout_with_log_partitions() {
+        let root = TempDir::new().unwrap();
+        let paths = EngineConfig::default()
+            .storage_root(root.path())
+            .resolve_storage_paths()
+            .unwrap();
+        paths.ensure_directories().unwrap();
+        // Keep the removed v1 field in this fixture to prove old partitioned
+        // storage-layout markers are rejected by the version bump.
+        std::fs::write(
+            paths.marker_path(),
+            r#"version = 1
+data_dir = "."
+catalog_file_name = "catalog.mtb"
+log_dir = "."
+log_file_stem = "redo.log"
+log_partitions = 1
+"#,
+        )
+        .unwrap();
+
+        let err = paths.validate_marker_if_present().unwrap_err();
         assert!(err.is_kind(ErrorKind::Config));
         assert_eq!(
             err.report().downcast_ref::<ConfigError>().copied(),

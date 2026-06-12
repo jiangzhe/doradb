@@ -12,7 +12,7 @@ use crate::quiescent::{QuiescentBox, QuiescentGuard, SyncQuiescentGuard};
 use crate::session::{SessionState, TrxAttachment};
 use crate::thread;
 use crate::trx::group::Commit;
-use crate::trx::log::{LOG_HEADER_PAGES, LogPartition};
+use crate::trx::log::{LOG_HEADER_PAGES, RedoLog};
 use crate::trx::log_replay::MmapLogReader;
 use crate::trx::purge::{DroppedTableFileDeleteItem, DroppedTableQueue, GC, Purge, TableRootQueue};
 use crate::trx::redo::RedoLogs;
@@ -29,7 +29,7 @@ use parking_lot::Mutex;
 use std::mem;
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread::JoinHandle;
 
 pub(crate) const GC_BUCKETS: usize = 64;
@@ -84,10 +84,8 @@ pub(crate) struct TransactionSystem {
     ///
     /// Data associated with smaller timestamp will be always visible to all transactions.
     global_visible_sts: CachePadded<AtomicU64>,
-    /// Round-robin partition id generator.
-    rr_partition_id: CachePadded<AtomicUsize>,
-    /// Multiple log partitions.
-    pub(super) log_partitions: CachePadded<Box<[CachePadded<LogPartition>]>>,
+    /// Single canonical redo log stream.
+    pub(super) redo_log: CachePadded<RedoLog>,
     /// Transaction system configuration.
     pub(super) config: CachePadded<TrxSysConfig>,
     /// Catalog of the database.
@@ -121,8 +119,8 @@ pub(crate) struct TransactionSystemWorkersOwned {
     pub(crate) trx_sys: SyncQuiescentGuard<TransactionSystem>,
     pub(crate) purge_tx: Sender<Purge>,
     pub(crate) cleanup_tx: Sender<TrxCleanupMessage>,
-    pub(crate) io_threads: Mutex<Vec<JoinHandle<()>>>,
-    pub(crate) gc_threads: Mutex<Vec<JoinHandle<()>>>,
+    pub(crate) io_thread: Mutex<Option<JoinHandle<()>>>,
+    pub(crate) gc_thread: Mutex<Option<JoinHandle<()>>>,
     pub(crate) purge_threads: Mutex<Vec<JoinHandle<()>>>,
     pub(crate) cleanup_thread: Mutex<Option<JoinHandle<()>>>,
     pub(crate) shutdown_started: AtomicBool,
@@ -156,7 +154,7 @@ impl TransactionSystem {
         config: TrxSysConfig,
         catalog: QuiescentGuard<Catalog>,
         table_fs: QuiescentGuard<FileSystem>,
-        log_partitions: Vec<CachePadded<LogPartition>>,
+        redo_log: CachePadded<RedoLog>,
         initial_ts: TrxID,
         queues: TransactionSystemQueues,
         initial_file_deletes: Vec<DroppedTableFileDeleteItem>,
@@ -165,8 +163,7 @@ impl TransactionSystem {
         TransactionSystem {
             ts: CachePadded::new(AtomicU64::new(initial_ts.as_u64())),
             global_visible_sts: CachePadded::new(AtomicU64::new(initial_ts.as_u64())),
-            rr_partition_id: CachePadded::new(AtomicUsize::new(0)),
-            log_partitions: CachePadded::new(log_partitions.into_boxed_slice()),
+            redo_log,
             config: CachePadded::new(config),
             catalog: CachePadded::new(catalog),
             table_fs: CachePadded::new(table_fs),
@@ -302,12 +299,9 @@ impl TransactionSystem {
         engine: &EngineRef,
         session_state: &Arc<SessionState>,
     ) -> StartedTransaction {
-        // Assign log partition index so current transaction will stick
-        // to certain log partition for commit.
-        let log_no = self.next_log_no();
-        let partition = &*self.log_partitions[log_no];
-        let gc_no = partition.next_gc_no();
-        let gc_bucket = &partition.gc_buckets[gc_no];
+        let redo_log = &*self.redo_log;
+        let gc_no = redo_log.next_gc_no();
+        let gc_bucket = &redo_log.gc_buckets[gc_no];
         // Add to active sts list.
         let mut g = gc_bucket.active_sts_list.lock();
         // With bucket lock, we can make sure all transactions are ordered by STS.
@@ -328,20 +322,10 @@ impl TransactionSystem {
                 .store(sts.as_u64(), Ordering::Relaxed);
         }
         drop(g); // release bucket lock.
-        let inner = TrxInner::new(trx_id, sts, log_no, gc_no, session_state.id());
+        let inner = TrxInner::new(trx_id, sts, gc_no, session_state.id());
         let entry = TrxEntry::new(inner);
         let handle = Transaction::new(engine.downgrade(), session_state.id(), trx_id, sts);
         StartedTransaction { handle, entry }
-    }
-
-    /// Returns next log(partition) number.
-    #[inline]
-    fn next_log_no(&self) -> usize {
-        if self.config.log_partitions == 1 {
-            0
-        } else {
-            self.rr_partition_id.fetch_add(1, Ordering::Relaxed) % self.config.log_partitions
-        }
     }
 
     #[inline]
@@ -369,7 +353,7 @@ impl TransactionSystem {
         // so keep it out of lock scope, and we can fill cts after the lock is held.
         let (_entry, inner, attachment) = claim.into_parts();
         inner.debug_assert_redo_invariants();
-        let partition = &*self.log_partitions[inner.log_no()];
+        let redo_log = &*self.redo_log;
         let prepared_trx = inner.prepare(attachment)?;
         if !prepared_trx.require_ordered_commit() {
             // No runtime effects means there is no CTS to publish and no commit
@@ -379,7 +363,7 @@ impl TransactionSystem {
             return Ok(TrxID::new(0));
         }
         // start group commit
-        partition.commit(prepared_trx, self, &self.ts).await
+        redo_log.commit(prepared_trx, self, &self.ts).await
     }
 
     #[inline]
@@ -390,15 +374,13 @@ impl TransactionSystem {
             // so we can just drop it if there is no change to replay.
             return Ok(TrxID::new(0));
         }
-        // System transactions are always submitted to first log partition and
-        // use the no-wait piggyback flow intentionally. They publish internal
+        // System transactions use the no-wait piggyback flow intentionally.
+        // They publish internal
         // state that becomes globally visible once the redo group commits, and
         // they are not modeled as session-bound transactions that can later be
         // rolled back through the normal user transaction API.
-        const LOG_NO: usize = 0;
-        let partition = &*self.log_partitions[LOG_NO];
         let prepared_trx = trx.prepare();
-        partition.commit_no_wait(prepared_trx, &self.ts)
+        self.redo_log.commit_no_wait(prepared_trx, &self.ts)
     }
 
     /// Rollback active transaction.
@@ -481,7 +463,6 @@ impl TransactionSystem {
         _operation: &'static str,
     ) -> Result<()> {
         let sts = inner.sts();
-        let log_no = inner.log_no();
         let gc_no = inner.gc_no();
         let pool_guards = attachment.pool_guards().clone();
         let mut table_cache = TableCache::new(&self.catalog);
@@ -510,7 +491,7 @@ impl TransactionSystem {
             return Err(self.poison_storage(FatalError::RollbackAccess).into());
         }
         inner.effects_mut().clear_for_rollback();
-        self.log_partitions[log_no].gc_buckets[gc_no].gc_analyze_rollback(sts);
+        self.redo_log.gc_buckets[gc_no].gc_analyze_rollback(sts);
         inner.release_transaction_locks(attachment);
         inner.finish_session_rollback(attachment);
         entry.finish(TrxEntryState::Terminal);
@@ -529,8 +510,7 @@ impl TransactionSystem {
             .payload
             .take()
             .expect("prepared no-op cleanup requires user transaction payload");
-        self.log_partitions[payload.log_no].gc_buckets[payload.gc_no]
-            .gc_analyze_rollback(payload.sts);
+        self.redo_log.gc_buckets[payload.gc_no].gc_analyze_rollback(payload.sts);
         if let Some(s) = trx.attachment.take() {
             s.rollback();
         }
@@ -542,19 +522,18 @@ impl TransactionSystem {
     #[cfg_attr(not(test), expect(dead_code, reason = "internal trx sys stats"))]
     pub(crate) fn trx_sys_stats(&self) -> TrxSysStats {
         let mut stats = TrxSysStats::default();
-        for partition in &*self.log_partitions {
-            stats.trx_count += partition.stats.trx_count.load(Ordering::Relaxed);
-            stats.commit_count += partition.stats.commit_count.load(Ordering::Relaxed);
-            stats.log_bytes += partition.stats.log_bytes.load(Ordering::Relaxed);
-            stats.sync_count += partition.stats.sync_count.load(Ordering::Relaxed);
-            stats.sync_nanos += partition.stats.sync_nanos.load(Ordering::Relaxed);
-            let io_stats = partition.io_backend_stats();
-            stats.io_submit_and_wait_count += io_stats.submit_and_wait_calls;
-            stats.io_submit_and_wait_nanos += io_stats.submit_and_wait_nanos;
-            stats.purge_trx_count += partition.stats.purge_trx_count.load(Ordering::Relaxed);
-            stats.purge_row_count += partition.stats.purge_row_count.load(Ordering::Relaxed);
-            stats.purge_index_count += partition.stats.purge_index_count.load(Ordering::Relaxed);
-        }
+        let redo_log = &*self.redo_log;
+        stats.trx_count += redo_log.stats.trx_count.load(Ordering::Relaxed);
+        stats.commit_count += redo_log.stats.commit_count.load(Ordering::Relaxed);
+        stats.log_bytes += redo_log.stats.log_bytes.load(Ordering::Relaxed);
+        stats.sync_count += redo_log.stats.sync_count.load(Ordering::Relaxed);
+        stats.sync_nanos += redo_log.stats.sync_nanos.load(Ordering::Relaxed);
+        let io_stats = redo_log.io_backend_stats();
+        stats.io_submit_and_wait_count += io_stats.submit_and_wait_calls;
+        stats.io_submit_and_wait_nanos += io_stats.submit_and_wait_nanos;
+        stats.purge_trx_count += redo_log.stats.purge_trx_count.load(Ordering::Relaxed);
+        stats.purge_row_count += redo_log.stats.purge_row_count.load(Ordering::Relaxed);
+        stats.purge_index_count += redo_log.stats.purge_index_count.load(Ordering::Relaxed);
         stats
     }
 
@@ -575,43 +554,29 @@ impl TransactionSystem {
             .store(sts.as_u64(), Ordering::SeqCst)
     }
 
-    /// Start background GC threads.
+    /// Start the background GC thread.
     #[inline]
-    pub(crate) fn start_gc_threads(
+    pub(crate) fn start_gc_thread(
         trx_sys: QuiescentGuard<Self>,
-        gc_rxs: Vec<Receiver<GC>>,
+        gc_rx: Receiver<GC>,
         purge_chan: Sender<Purge>,
-    ) -> Vec<JoinHandle<()>> {
+    ) -> JoinHandle<()> {
         let trx_sys = trx_sys.into_sync();
-        let mut handles = Vec::with_capacity(gc_rxs.len());
-        for (idx, gc_rx) in gc_rxs.into_iter().enumerate() {
-            let thread_name = format!("GC-Thread-{idx}");
-            let task_trx_sys = trx_sys.clone();
-            let task_purge_chan = purge_chan.clone();
-            let handle = thread::spawn_named(thread_name, move || {
-                let partition = &*task_trx_sys.log_partitions[idx];
-                partition.gc_loop(gc_rx, task_purge_chan);
-            });
-            handles.push(handle);
-        }
-        handles
+        thread::spawn_named("GC-Thread", move || {
+            trx_sys.redo_log.gc_loop(gc_rx, purge_chan);
+        })
     }
 
-    /// Start background IO threads.
+    /// Start the background IO thread.
     #[inline]
-    pub(crate) fn start_io_threads(trx_sys: QuiescentGuard<Self>) -> Vec<JoinHandle<()>> {
+    pub(crate) fn start_io_thread(trx_sys: QuiescentGuard<Self>) -> JoinHandle<()> {
         let trx_sys = trx_sys.into_sync();
-        let mut handles = Vec::with_capacity(trx_sys.log_partitions.len());
-        for idx in 0..trx_sys.log_partitions.len() {
-            let thread_name = format!("IO-Thread-{idx}");
-            let task_trx_sys = trx_sys.clone();
-            let handle = thread::spawn_named(thread_name, move || {
-                let partition = &*task_trx_sys.log_partitions[idx];
-                partition.io_loop(&task_trx_sys, &task_trx_sys.config);
-            });
-            handles.push(handle);
-        }
-        handles
+        let task_trx_sys = trx_sys.clone();
+        thread::spawn_named("IO-Thread", move || {
+            task_trx_sys
+                .redo_log
+                .io_loop(&task_trx_sys, &task_trx_sys.config);
+        })
     }
 
     /// Start the transaction cleanup worker.
@@ -698,7 +663,7 @@ impl TransactionSystem {
         )
     }
 
-    /// Returns the global ordered-completion watermark `W` from all partitions.
+    /// Returns the ordered-completion watermark `W` from the redo log.
     ///
     /// This is used as the upper bound for scanning durable redo. No-log
     /// commit barriers can advance this runtime watermark, but recovery still
@@ -706,18 +671,13 @@ impl TransactionSystem {
     /// real redo headers.
     #[inline]
     pub(crate) fn persisted_watermark_cts(&self) -> TrxID {
-        self.log_partitions
-            .iter()
-            .map(|partition| TrxID::new(partition.persisted_cts.load(Ordering::Acquire)))
-            .min()
-            .unwrap_or(MIN_SNAPSHOT_TS)
+        TrxID::new(self.redo_log.persisted_cts.load(Ordering::Acquire))
     }
 
     #[inline]
     pub(crate) fn catalog_checkpoint_scan_config(&self) -> Result<CatalogCheckpointScanConfig> {
         Ok(CatalogCheckpointScanConfig {
             file_prefix: self.config.file_prefix()?,
-            log_partitions: self.config.log_partitions,
             io_depth_per_log: self.config.io_depth_per_log,
             log_file_max_size: self.config.log_file_max_size.as_u64() as usize,
             max_io_size: self.config.max_io_size.as_u64() as usize,
@@ -920,9 +880,9 @@ impl Component for TransactionSystemWorkers {
         //
         // Cleanup lifetime invariant:
         // 1. Close group-commit admission and wake redo workers.
-        // 2. Join redo workers, so all queued/inflight failed-precommit groups
+        // 2. Join the redo worker, so all queued/inflight failed-precommit groups
         //    have either committed or handed rollback jobs to cleanup.
-        // 3. Join GC workers that can receive committed transaction payloads.
+        // 3. Join the GC worker that can receive committed transaction payloads.
         // 4. Send cleanup Stop; the cleanup worker drains already queued
         //    abandoned, terminal rollback, and failed-precommit jobs before it exits.
         //
@@ -930,23 +890,19 @@ impl Component for TransactionSystemWorkers {
         // until cleanup resolves them, and keeps cleanup ahead of
         // Catalog/pool/file teardown because TransactionSystemWorkers shuts
         // down before those components.
-        let log_partitions = &*component.trx_sys.log_partitions;
-        for partition in log_partitions {
-            {
-                let mut group_commit_g = partition.group_commit.lock();
-                group_commit_g.close(FailedPrecommitReason::Shutdown);
-                group_commit_g.queue.push_back(Commit::Shutdown);
-                partition.group_commit.notify_one();
-            }
-            let _ = partition.gc_chan.send(GC::Stop);
+        let redo_log = &*component.trx_sys.redo_log;
+        {
+            let mut group_commit_g = redo_log.group_commit.lock();
+            group_commit_g.close(FailedPrecommitReason::Shutdown);
+            group_commit_g.queue.push_back(Commit::Shutdown);
+            redo_log.group_commit.notify_one();
         }
+        let _ = redo_log.gc_chan.send(GC::Stop);
 
-        let io_threads = { mem::take(&mut *component.io_threads.lock()) };
-        for handle in io_threads {
+        if let Some(handle) = component.io_thread.lock().take() {
             handle.join().unwrap();
         }
-        let gc_threads = { mem::take(&mut *component.gc_threads.lock()) };
-        for handle in gc_threads {
+        if let Some(handle) = component.gc_thread.lock().take() {
             handle.join().unwrap();
         }
 
@@ -962,11 +918,8 @@ impl Component for TransactionSystemWorkers {
             handle.join().unwrap();
         }
 
-        for partition in log_partitions {
-            let mut group_commit_g = partition.group_commit.lock();
-            let Some(log_file) = group_commit_g.log_file.take() else {
-                continue;
-            };
+        let mut group_commit_g = redo_log.group_commit.lock();
+        if let Some(log_file) = group_commit_g.log_file.take() {
             drop(log_file);
         }
     }
@@ -1233,7 +1186,6 @@ pub(crate) mod tests {
                 )
                 .trx(
                     TrxSysConfig::default()
-                        .log_partitions(1)
                         .log_file_stem("redo_rotate")
                         .log_file_max_size(1024u64 * 1024),
                 )

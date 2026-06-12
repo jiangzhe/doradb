@@ -691,7 +691,6 @@ pub(crate) mod tests {
             MIN_ACTIVE_TRX_ID + sts.as_u64(),
             sts,
             0,
-            0,
         )
     }
 

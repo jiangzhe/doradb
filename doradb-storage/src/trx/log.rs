@@ -13,8 +13,8 @@ use crate::trx::MIN_SNAPSHOT_TS;
 use crate::trx::group::{
     Commit, CommitGroup, CommitGroupLog, CommitJoin, CommitWaiter, GroupCommit, MutexGroupCommit,
 };
-use crate::trx::log_replay::{LogBuf, LogPartitionStream, MmapLogReader, TrxLog};
-use crate::trx::purge::{GC, GCBucket};
+use crate::trx::log_replay::{LogBuf, MmapLogReader, RedoLogStream, TrxLog};
+use crate::trx::purge::{GC, GCBucket, Purge};
 use crate::trx::sys::GC_BUCKETS;
 use crate::trx::sys::TransactionSystem;
 use crate::trx::{
@@ -49,24 +49,22 @@ enum EnqueuedCommit {
     },
 }
 
-pub(crate) struct LogPartitionInitializer {
+pub(crate) struct RedoLogInitializer {
     pub(crate) ctx: StorageBackend,
-    pub(crate) mode: LogPartitionMode,
+    pub(crate) mode: RedoLogMode,
     pub(crate) file_prefix: String,
     pub(crate) file_max_size: usize,
     pub(crate) file_header_size: usize,
     pub(crate) page_size: usize,
     pub(crate) io_depth_per_log: usize,
-    pub(crate) log_no: usize,
     // sequence of last log file.
     pub(crate) file_seq: Option<u32>,
 }
 
-impl LogPartitionInitializer {
+impl RedoLogInitializer {
     #[inline]
     pub(crate) fn recovery(
         file_prefix: String,
-        log_no: usize,
         io_depth_per_log: usize,
         file_max_size: usize,
         max_io_size: usize,
@@ -74,20 +72,19 @@ impl LogPartitionInitializer {
     ) -> Result<Self> {
         Ok(Self {
             ctx: StorageBackend::new(io_depth_per_log)?,
-            mode: LogPartitionMode::Recovery(VecDeque::from(logs)),
+            mode: RedoLogMode::Recovery(VecDeque::from(logs)),
             file_prefix,
             file_max_size,
             file_header_size: max_io_size * LOG_HEADER_PAGES,
             page_size: max_io_size,
             io_depth_per_log,
-            log_no,
             file_seq: None,
         })
     }
 
     #[inline]
-    pub(crate) fn stream(self) -> LogPartitionStream {
-        LogPartitionStream {
+    pub(crate) fn stream(self) -> RedoLogStream {
+        RedoLogStream {
             initializer: self,
             reader: None,
             buffer: VecDeque::new(),
@@ -97,8 +94,8 @@ impl LogPartitionInitializer {
     #[inline]
     pub(crate) fn next_reader(&mut self) -> Result<Option<MmapLogReader>> {
         match &mut self.mode {
-            LogPartitionMode::Done => Ok(None),
-            LogPartitionMode::Recovery(logs) => {
+            RedoLogMode::Done => Ok(None),
+            RedoLogMode::Recovery(logs) => {
                 let log = logs.pop_front().unwrap();
                 self.file_seq.replace(parse_file_seq(log.as_path())?);
                 let reader = MmapLogReader::new(
@@ -110,7 +107,7 @@ impl LogPartitionInitializer {
                 if logs.is_empty() {
                     // add file seq so we always open a new log file.
                     *self.file_seq.as_mut().unwrap() += 1;
-                    self.mode = LogPartitionMode::Done;
+                    self.mode = RedoLogMode::Done;
                 }
                 Ok(Some(reader))
             }
@@ -118,11 +115,10 @@ impl LogPartitionInitializer {
     }
 
     #[inline]
-    pub(super) fn finish(self) -> Result<(LogPartition, Receiver<GC>)> {
+    pub(super) fn finish(self) -> Result<(RedoLog, Receiver<GC>)> {
         let mut file_seq = self.file_seq.unwrap_or(0);
         let log_file = create_log_file(
             &self.file_prefix,
-            self.log_no,
             file_seq,
             self.file_max_size,
             self.file_header_size,
@@ -140,11 +136,11 @@ impl LogPartitionInitializer {
         let io_backend_stats = self.ctx.stats_handle();
         let (io_worker, io_client) = self.ctx.io_worker();
         Ok((
-            LogPartition {
+            RedoLog {
                 group_commit: CachePadded::new(MutexGroupCommit::new(group_commit)),
                 persisted_cts: CachePadded::new(AtomicU64::new(MIN_SNAPSHOT_TS.as_u64())),
                 rr_gc_no: CachePadded::new(AtomicUsize::new(0)),
-                stats: Arc::new(CachePadded::new(LogPartitionStats::default())),
+                stats: Arc::new(CachePadded::new(RedoLogStats::default())),
                 gc_chan,
                 gc_buckets: gc_info.into_boxed_slice(),
                 io_worker: CachePadded::new(Mutex::new(Some(io_worker))),
@@ -152,7 +148,6 @@ impl LogPartitionInitializer {
                 io_backend_stats,
                 completion_tx,
                 completion_rx: CachePadded::new(Mutex::new(Some(completion_rx))),
-                log_no: self.log_no,
                 max_io_size: self.page_size,
                 file_prefix: self.file_prefix,
                 file_seq: AtomicU32::new(file_seq),
@@ -168,7 +163,7 @@ impl LogPartitionInitializer {
     }
 }
 
-pub(crate) enum LogPartitionMode {
+pub(crate) enum RedoLogMode {
     /// Previous log should be analyzed and replayed
     /// for data recovery.
     Recovery(VecDeque<PathBuf>),
@@ -266,10 +261,10 @@ impl IOStateMachine for LogIOStateMachine {
     fn end_loop(self) {}
 }
 
-pub(crate) struct LogPartition {
-    /// Group commit of this partition.
+pub(crate) struct RedoLog {
+    /// Group commit state for the redo log.
     pub(super) group_commit: CachePadded<MutexGroupCommit>,
-    /// Maximum ordered-completed CTS of this partition.
+    /// Maximum ordered-completed CTS of this redo log.
     ///
     /// Durability-required groups advance this after redo write/sync completes.
     /// No-log groups also advance it after ordered completion, but recovery
@@ -279,7 +274,7 @@ pub(crate) struct LogPartition {
     /// Round-robin GC number generator.
     rr_gc_no: CachePadded<AtomicUsize>,
     /// Stats of transaction system.
-    pub(super) stats: Arc<CachePadded<LogPartitionStats>>,
+    pub(super) stats: Arc<CachePadded<RedoLogStats>>,
     /// GC channel to send committed transactions to GC threads.
     pub(super) gc_chan: Sender<GC>,
     /// Each GC bucket contains active sts list, committed transaction list and
@@ -296,13 +291,11 @@ pub(crate) struct LogPartition {
     completion_tx: Sender<LogWriteCompletion>,
     /// Receiver side of redo write completions, taken by the scheduler thread at startup.
     completion_rx: CachePadded<Mutex<Option<Receiver<LogWriteCompletion>>>>,
-    /// Index of log partition in total partitions, starts from 0.
-    pub(super) log_no: usize,
     /// Maximum IO size of each group.
     pub(super) max_io_size: usize,
-    /// Log file prefix, including partition number.
+    /// Log file prefix for the single redo file family.
     pub(super) file_prefix: String,
-    /// sequence of current file in this partition, starts from 0.
+    /// Sequence of current file in this redo log, starting from 0.
     pub(super) file_seq: AtomicU32,
     /// Maximum size of single log file.
     pub(super) file_max_size: usize,
@@ -311,7 +304,7 @@ pub(crate) struct LogPartition {
     pub(super) buf_free_list: FreeList<DirectBuf>,
 }
 
-impl LogPartition {
+impl RedoLog {
     /// Returns next GC number.
     /// It is used to evenly dispatch transactions to all GC buckets.
     pub(crate) fn next_gc_no(&self) -> usize {
@@ -372,7 +365,6 @@ impl LogPartition {
         let file_seq = self.file_seq.fetch_add(1, Ordering::SeqCst);
         create_log_file(
             &self.file_prefix,
-            self.log_no,
             file_seq,
             self.file_max_size,
             // we use two pages as file header to maintain metadata of log file.
@@ -630,10 +622,33 @@ impl LogPartition {
         }
     }
 
+    /// Execute GC analysis in loop.
+    /// This method is used by the redo log's GC analyzer thread.
     #[inline]
-    #[cfg(test)]
-    pub(crate) fn logs(&self, desc: bool) -> Result<Vec<PathBuf>> {
-        list_log_files(&self.file_prefix, self.log_no, desc)
+    pub(crate) fn gc_loop(&self, gc_rx: Receiver<GC>, purge_chan: Sender<Purge>) {
+        while let Ok(msg) = gc_rx.recv() {
+            match msg {
+                GC::Stop => return,
+                GC::Commit(trx_list) => {
+                    let min_active_sts_may_change = self.gc_analyze(trx_list);
+                    if min_active_sts_may_change {
+                        let _ = purge_chan.send(Purge::Next);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Analyze committed transaction and modify active sts list and committed transaction list.
+    /// Returns whether min_active_sts may change.
+    #[inline]
+    fn gc_analyze(&self, trx_list: FastHashMap<usize, Vec<CommittedTrx>>) -> bool {
+        let mut changed = false;
+        for (gc_no, trx_list) in trx_list {
+            let gc_bucket = &self.gc_buckets[gc_no];
+            changed |= gc_bucket.gc_analyze_commit(trx_list);
+        }
+        changed
     }
 }
 
@@ -688,7 +703,7 @@ impl SyncGroup {
 }
 
 #[derive(Default)]
-pub(crate) struct LogPartitionStats {
+pub(crate) struct RedoLogStats {
     pub(crate) commit_count: AtomicUsize,
     pub(crate) trx_count: AtomicUsize,
     pub(crate) log_bytes: AtomicUsize,
@@ -730,7 +745,7 @@ impl FromStr for LogSync {
 }
 
 struct FileProcessor<'a> {
-    partition: &'a LogPartition,
+    redo_log: &'a RedoLog,
     trx_sys: &'a TransactionSystem,
     completion_rx: &'a Receiver<LogWriteCompletion>,
     io_depth: usize,
@@ -748,14 +763,14 @@ struct FileProcessor<'a> {
 impl<'a> FileProcessor<'a> {
     #[inline]
     fn new(
-        partition: &'a LogPartition,
+        redo_log: &'a RedoLog,
         trx_sys: &'a TransactionSystem,
         config: &TrxSysConfig,
         syncer: FileSyncer,
         completion_rx: &'a Receiver<LogWriteCompletion>,
     ) -> Self {
         FileProcessor {
-            partition,
+            redo_log,
             trx_sys,
             completion_rx,
             io_depth: config.io_depth_per_log,
@@ -775,7 +790,7 @@ impl<'a> FileProcessor<'a> {
     fn recycle_buf(&self, mut buf: DirectBuf) {
         if buf.capacity() == self.max_io_size {
             buf.reset();
-            self.partition.buf_free_list.push(buf);
+            self.redo_log.buf_free_list.push(buf);
         }
     }
 
@@ -798,7 +813,7 @@ impl<'a> FileProcessor<'a> {
 
         let mut queued = Vec::new();
         {
-            let mut group_commit_g = self.partition.group_commit.lock();
+            let mut group_commit_g = self.redo_log.group_commit.lock();
             group_commit_g.close(reason);
             while let Some(commit) = group_commit_g.queue.pop_front() {
                 match commit {
@@ -876,7 +891,7 @@ impl<'a> FileProcessor<'a> {
     #[inline]
     fn fetch_io_reqs_internal(&mut self) -> Option<SparseFile> {
         loop {
-            let mut group_commit_g = self.partition.group_commit.lock();
+            let mut group_commit_g = self.redo_log.group_commit.lock();
             loop {
                 match group_commit_g.queue.pop_front() {
                     None => break,
@@ -895,7 +910,7 @@ impl<'a> FileProcessor<'a> {
             if !self.sync_groups.is_empty() {
                 return None;
             }
-            self.partition
+            self.redo_log
                 .group_commit
                 .wait_for(&mut group_commit_g, Duration::from_secs(1));
         }
@@ -904,7 +919,7 @@ impl<'a> FileProcessor<'a> {
     #[inline]
     fn try_fetch_io_reqs_internal(&mut self) -> Option<SparseFile> {
         // Single thread perform IO so here we only need to use sync mutex.
-        let mut group_commit_g = self.partition.group_commit.lock();
+        let mut group_commit_g = self.redo_log.group_commit.lock();
         loop {
             match group_commit_g.queue.pop_front() {
                 None => {
@@ -975,7 +990,7 @@ impl<'a> FileProcessor<'a> {
                 return;
             }
 
-            self.partition
+            self.redo_log
                 .persisted_cts
                 .store(max_cts.as_u64(), Ordering::SeqCst);
 
@@ -997,11 +1012,11 @@ impl<'a> FileProcessor<'a> {
                     }
                 }
                 // send committed transaction list to GC thread
-                let _ = self.partition.gc_chan.send(GC::Commit(committed_trx_list));
+                let _ = self.redo_log.gc_chan.send(GC::Commit(committed_trx_list));
                 sync_group.completion.complete(Ok(()));
             }
 
-            self.partition.update_stats(
+            self.redo_log.update_stats(
                 trx_count,
                 commit_count,
                 log_bytes,
@@ -1040,7 +1055,7 @@ impl<'a> FileProcessor<'a> {
                 break;
             }
             if let Err(err) = self
-                .partition
+                .redo_log
                 .io_client
                 .send(LogIORequest::Write(submission))
             {
@@ -1125,20 +1140,19 @@ fn shrink_inflight(
 }
 
 #[inline]
-fn log_file_name(file_prefix: &str, log_no: usize, file_seq: u32) -> String {
-    format!("{file_prefix}.{log_no}.{file_seq:08x}")
+fn log_file_name(file_prefix: &str, file_seq: u32) -> String {
+    format!("{file_prefix}.{file_seq:08x}")
 }
 
 /// Create a new log file.
 #[inline]
 pub(super) fn create_log_file(
     file_prefix: &str,
-    log_no: usize,
     file_seq: u32,
     file_max_size: usize,
     file_header_size: usize,
 ) -> Result<SparseFile> {
-    let file_name = log_file_name(file_prefix, log_no, file_seq);
+    let file_name = log_file_name(file_prefix, file_seq);
     let log_file = SparseFile::create_or_fail(&file_name, file_max_size, UNTRACKED_FILE_ID)?;
     // todo: Add two pages as file header.
     let _ = log_file.alloc(file_header_size)?;
@@ -1146,11 +1160,32 @@ pub(super) fn create_log_file(
 }
 
 #[inline]
-pub(crate) fn list_log_files(file_prefix: &str, log_no: usize, desc: bool) -> Result<Vec<PathBuf>> {
-    let pattern = format!("{}.{log_no}.*", Pattern::escape(file_prefix));
+pub(crate) fn list_log_files(file_prefix: &str, desc: bool) -> Result<Vec<PathBuf>> {
+    let pattern = format!("{}.*", Pattern::escape(file_prefix));
     let mut res = vec![];
     for entry in glob(&pattern).unwrap() {
-        res.push(entry?);
+        let path = entry?;
+        let Some(suffix) = log_family_suffix(file_prefix, &path)? else {
+            continue;
+        };
+        if is_log_file_seq(suffix) {
+            res.push(path);
+            continue;
+        }
+        if is_legacy_partitioned_log_suffix(suffix) {
+            return Err(Report::new(DataIntegrityError::InvalidPayload)
+                .attach(format!(
+                    "unsupported legacy partitioned redo log file: {}",
+                    path.display()
+                ))
+                .into());
+        }
+        return Err(Report::new(DataIntegrityError::InvalidPayload)
+            .attach(format!(
+                "invalid redo log file name for single-stream layout: {}",
+                path.display()
+            ))
+            .into());
     }
     if desc {
         // reverse sort.
@@ -1159,6 +1194,42 @@ pub(crate) fn list_log_files(file_prefix: &str, log_no: usize, desc: bool) -> Re
         res.sort();
     }
     Ok(res)
+}
+
+#[inline]
+fn log_family_suffix<'a>(file_prefix: &str, file_path: &'a Path) -> Result<Option<&'a str>> {
+    let path = file_path.to_str().ok_or_else(|| {
+        Error::from(
+            Report::new(DataIntegrityError::InvalidPayload).attach(format!(
+                "log file path must be valid UTF-8: {}",
+                file_path.display()
+            )),
+        )
+    })?;
+    let Some(suffix) = path.strip_prefix(file_prefix) else {
+        return Ok(None);
+    };
+    Ok(suffix.strip_prefix('.'))
+}
+
+#[inline]
+fn is_log_file_seq(value: &str) -> bool {
+    value.len() == 8 && value.as_bytes().iter().all(u8::is_ascii_hexdigit)
+}
+
+#[inline]
+fn is_legacy_partitioned_log_suffix(value: &str) -> bool {
+    let mut parts = value.split('.');
+    let Some(partition) = parts.next() else {
+        return false;
+    };
+    let Some(seq) = parts.next() else {
+        return false;
+    };
+    parts.next().is_none()
+        && !partition.is_empty()
+        && partition.as_bytes().iter().all(u8::is_ascii_digit)
+        && is_log_file_seq(seq)
 }
 
 #[inline]
@@ -1216,7 +1287,7 @@ mod tests {
     use crate::io::{
         IOKind, StorageBackendOp, StorageBackendTestHook, install_storage_backend_test_hook,
     };
-    use crate::trx::log_replay::{LogMerger, ReadLog};
+    use crate::trx::log_replay::ReadLog;
     use crate::value::Val;
     use futures::task::noop_waker;
     use std::fs::{self, File};
@@ -1442,7 +1513,9 @@ mod tests {
                     RowID::new(1),
                 );
                 let prepared = sys_trx.prepare();
-                engine.trx_sys.log_partitions[0]
+                engine
+                    .trx_sys
+                    .redo_log
                     .commit(prepared, &engine.trx_sys, &engine.trx_sys.ts)
                     .await
             })
@@ -1474,7 +1547,6 @@ mod tests {
             .trx(
                 TrxSysConfig::default()
                     .log_file_stem(log_file_stem)
-                    .log_partitions(1)
                     .io_depth_per_log(1)
                     .log_sync(log_sync),
             )
@@ -1497,7 +1569,10 @@ mod tests {
                 build_redo_test_engine("commit_handoff_drop", LogSync::None).await;
             let table_id = table2(&engine).await;
             let redo_fd = {
-                engine.inner().trx_sys.log_partitions[0]
+                engine
+                    .inner()
+                    .trx_sys
+                    .redo_log
                     .group_commit
                     .lock()
                     .log_file
@@ -1557,8 +1632,7 @@ mod tests {
             .unwrap();
 
             {
-                let mut group_commit_g =
-                    engine.inner().trx_sys.log_partitions[0].group_commit.lock();
+                let mut group_commit_g = engine.inner().trx_sys.redo_log.group_commit.lock();
                 // Simulate the state after the redo worker has consumed any
                 // shutdown wakeup message: admission is closed, but rejection
                 // must not depend on a `Commit::Shutdown` queue tail.
@@ -1585,7 +1659,10 @@ mod tests {
                 build_redo_test_engine("user_redo_fsync_failure", LogSync::Fsync).await;
             let table_id = table2(&engine).await;
             let redo_fd = {
-                engine.inner().trx_sys.log_partitions[0]
+                engine
+                    .inner()
+                    .trx_sys
+                    .redo_log
                     .group_commit
                     .lock()
                     .log_file
@@ -1784,21 +1861,52 @@ mod tests {
         let file_prefix = log_dir.join("redo.log");
         let file_prefix = file_prefix.to_str().unwrap();
         let expected = [
-            PathBuf::from(format!("{file_prefix}.0.00000000")),
-            PathBuf::from(format!("{file_prefix}.0.00000001")),
-            PathBuf::from(format!("{file_prefix}.0.0000000a")),
+            PathBuf::from(format!("{file_prefix}.00000000")),
+            PathBuf::from(format!("{file_prefix}.00000001")),
+            PathBuf::from(format!("{file_prefix}.0000000a")),
         ];
         for path in &expected {
             File::create(path).unwrap();
         }
-        File::create(format!("{file_prefix}.1.00000000")).unwrap();
-        File::create(log_dir.join("redo.logx.0.00000000")).unwrap();
+        File::create(log_dir.join("redo.logx.00000000")).unwrap();
 
-        let asc = list_log_files(file_prefix, 0, false).unwrap();
+        let asc = list_log_files(file_prefix, false).unwrap();
         assert_eq!(expected.to_vec(), asc);
 
-        let desc = list_log_files(file_prefix, 0, true).unwrap();
+        let desc = list_log_files(file_prefix, true).unwrap();
         assert_eq!(expected.iter().rev().cloned().collect::<Vec<_>>(), desc);
+    }
+
+    #[test]
+    fn test_list_log_files_rejects_legacy_partitioned_files() {
+        let temp_dir = TempDir::new().unwrap();
+        let file_prefix = temp_dir.path().join("redo.log");
+        let file_prefix = file_prefix.to_str().unwrap();
+        File::create(format!("{file_prefix}.0.00000000")).unwrap();
+
+        let err = list_log_files(file_prefix, false).unwrap_err();
+        let report = format!("{err:?}");
+        assert!(report.contains("unsupported legacy partitioned redo log file"));
+    }
+
+    #[test]
+    fn test_engine_startup_rejects_legacy_partitioned_redo_file() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            File::create(temp_dir.path().join("legacy_redo.0.00000000")).unwrap();
+
+            let err = match EngineConfig::default()
+                .storage_root(temp_dir.path())
+                .trx(TrxSysConfig::default().log_file_stem("legacy_redo"))
+                .build()
+                .await
+            {
+                Ok(_) => panic!("engine startup should reject legacy partitioned redo files"),
+                Err(err) => err,
+            };
+            let report = format!("{err:?}");
+            assert!(report.contains("unsupported legacy partitioned redo log file"));
+        });
     }
 
     #[test]
@@ -1842,9 +1950,8 @@ mod tests {
             drop(session);
 
             let mut log_recs = 0usize;
-            let logs = engine.inner().trx_sys.log_partitions[0]
-                .logs(false)
-                .unwrap();
+            let file_prefix = engine.inner().trx_sys.config.file_prefix().unwrap();
+            let logs = list_log_files(&file_prefix, false).unwrap();
             for log in logs {
                 println!("log file {:?}", log.file_name());
                 let mut reader = engine.inner().trx_sys.log_reader(&log).unwrap();
@@ -1873,102 +1980,15 @@ mod tests {
     }
 
     #[test]
-    fn test_log_merger() {
-        smol::block_on(async {
-            const SIZE: i32 = 1000;
-
-            let temp_dir = TempDir::new().unwrap();
-            let main_dir = temp_dir.path().to_path_buf();
-            let log_file_stem = String::from("redo_merger");
-            let engine = EngineConfig::default()
-                .storage_root(main_dir)
-                .trx(
-                    TrxSysConfig::default()
-                        .log_file_stem(log_file_stem.clone())
-                        .log_partitions(2),
-                )
-                .data_buffer(
-                    EvictableBufferPoolConfig::default()
-                        .role(PoolRole::Mem)
-                        .max_mem_size(64u64 * 1024 * 1024)
-                        .max_file_size(128u64 * 1024 * 1024),
-                )
-                .build()
-                .await
-                .unwrap();
-            let table_id = table2(&engine).await;
-
-            let mut session = engine.new_session().unwrap();
-            {
-                for i in 0..SIZE {
-                    let mut trx = session.begin_trx().unwrap();
-                    trx.exec(async |stmt| {
-                        let s = format!("{}", i);
-                        let insert = vec![Val::from(i), Val::from(&s[..])];
-                        stmt.table_insert_mvcc(table_id, insert).await?;
-                        Ok(())
-                    })
-                    .await
-                    .unwrap();
-                    trx.commit().await.unwrap();
-                }
-            }
-            drop(session);
-
-            let mut log_recs = 0usize;
-            let logs = engine.inner().trx_sys.log_partitions[0]
-                .logs(false)
-                .unwrap();
-            for log in logs {
-                println!("log file {:?}", log.file_name());
-                let mut reader = engine.inner().trx_sys.log_reader(&log).unwrap();
-                loop {
-                    match reader.read() {
-                        ReadLog::SizeLimit => unreachable!(),
-                        ReadLog::DataCorrupted => unreachable!(),
-                        ReadLog::DataEnd => break,
-                        ReadLog::Some(mut group) => {
-                            while let Some(pod) = group.try_next().unwrap() {
-                                println!("header={:?}, payload={:?}", pod.header, pod.payload);
-                                log_recs += 1;
-                            }
-                        }
-                    }
-                }
-            }
-            println!("total log records {}", log_recs);
-
-            drop(engine);
-
-            // after the first engine is done, we reopen log files to test log merger.
-            let trx_sys_config = TrxSysConfig::default()
-                .log_dir(temp_dir.path())
-                .log_file_stem(log_file_stem)
-                .log_partitions(2);
-
-            let mut log_merger = LogMerger::default();
-            for i in 0..trx_sys_config.log_partitions {
-                let initializer = trx_sys_config.log_partition_initializer(i).unwrap();
-                let stream = initializer.stream();
-                log_merger.add_stream(stream).unwrap();
-            }
-
-            let mut merged_recs = 0usize;
-            while let Some(log) = log_merger.try_next().unwrap() {
-                println!("header={:?}, payload={:?}", log.header, log.payload);
-                merged_recs += 1;
-            }
-            assert!(merged_recs >= SIZE as usize);
-        });
-    }
-
-    #[test]
     fn test_redo_write_failure_poison_runtime_and_fail_waiters() {
         smol::block_on(async {
             let (_temp_dir, engine) =
                 build_redo_test_engine("redo_write_failure", LogSync::None).await;
             let redo_fd = {
-                engine.inner().trx_sys.log_partitions[0]
+                engine
+                    .inner()
+                    .trx_sys
+                    .redo_log
                     .group_commit
                     .lock()
                     .log_file
@@ -1984,7 +2004,10 @@ mod tests {
 
             let commit2 = spawn_sys_commit_wait(engine.new_ref().unwrap(), 2);
             wait_for(|| {
-                !engine.inner().trx_sys.log_partitions[0]
+                !engine
+                    .inner()
+                    .trx_sys
+                    .redo_log
                     .group_commit
                     .lock()
                     .queue
@@ -2016,7 +2039,10 @@ mod tests {
     ) {
         let (_temp_dir, engine) = build_redo_test_engine(log_file_stem, log_sync).await;
         let redo_fd = {
-            engine.inner().trx_sys.log_partitions[0]
+            engine
+                .inner()
+                .trx_sys
+                .redo_log
                 .group_commit
                 .lock()
                 .log_file
@@ -2032,7 +2058,10 @@ mod tests {
 
         let commit2 = spawn_sys_commit_wait(engine.new_ref().unwrap(), 11);
         wait_for(|| {
-            !engine.inner().trx_sys.log_partitions[0]
+            !engine
+                .inner()
+                .trx_sys
+                .redo_log
                 .group_commit
                 .lock()
                 .queue

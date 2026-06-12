@@ -28,8 +28,8 @@ use crate::map::{FastHashMap, FastHashSet};
 use crate::quiescent::QuiescentGuard;
 use crate::row::RowPage;
 use crate::table::Table;
-use crate::trx::log::{LogPartition, LogPartitionInitializer};
-use crate::trx::log_replay::{LogMerger, LogPartitionStream, TrxLog};
+use crate::trx::log::{RedoLog, RedoLogInitializer};
+use crate::trx::log_replay::{RedoLogStream, TrxLog};
 use crate::trx::purge::{DroppedTableFileDeleteItem, GC};
 use crate::trx::redo::{DDLRedo, RedoLogs, RowRedo, RowRedoKind, TableDML};
 use crate::trx::{MAX_SNAPSHOT_TS, MIN_SNAPSHOT_TS};
@@ -95,10 +95,10 @@ pub(crate) async fn log_recover(
     meta_pool: &FixedBufferPool,
     deps: RecoveryDeps,
     catalog: &Catalog,
-    mut log_partition_initializers: Vec<LogPartitionInitializer>,
+    redo_log_initializer: RedoLogInitializer,
 ) -> Result<(
-    Vec<CachePadded<LogPartition>>,
-    Vec<Receiver<GC>>,
+    CachePadded<RedoLog>,
+    Receiver<GC>,
     TrxID,
     Vec<DroppedTableFileDeleteItem>,
 )> {
@@ -111,16 +111,11 @@ pub(crate) async fn log_recover(
     // In recovery, we disable GC and redo logging.
     // All data are purely processed in memory and if
     // any failure occurs, we abort the whole process.
-    let log_partitions = log_partition_initializers.len();
-    let mut log_merger = LogMerger::default();
-    for initializer in log_partition_initializers {
-        let stream = initializer.stream();
-        log_merger.add_stream(stream)?;
-    }
+    let stream = redo_log_initializer.stream();
     let log_recovery = LogRecovery::new(
-        meta_pool, index_pool, mem_pool, table_fs, disk_pool, catalog, log_merger,
+        meta_pool, index_pool, mem_pool, table_fs, disk_pool, catalog, stream,
     );
-    let (log_streams, max_recovered_cts, dropped_table_file_deletes) =
+    let (log_stream, max_recovered_cts, dropped_table_file_deletes) =
         log_recovery.recover_all().await?;
     let next_trx_ts = max_recovered_cts
         .checked_add(1)
@@ -132,21 +127,14 @@ pub(crate) async fn log_recover(
                 )),
             )
         })?;
-    log_partition_initializers = log_streams
-        .into_iter()
-        .map(|s| s.into_initializer())
-        .collect();
-    log_partition_initializers.sort_by_key(|i| i.log_no);
-    debug_assert_eq!(log_partition_initializers.len(), log_partitions);
-
-    let mut partitions = vec![];
-    let mut gc_rxs = vec![];
-    for initializer in log_partition_initializers {
-        let (partition, gc_rx) = initializer.finish()?;
-        partitions.push(CachePadded::new(partition));
-        gc_rxs.push(gc_rx);
-    }
-    Ok((partitions, gc_rxs, next_trx_ts, dropped_table_file_deletes))
+    let initializer = log_stream.into_initializer();
+    let (redo_log, gc_rx) = initializer.finish()?;
+    Ok((
+        CachePadded::new(redo_log),
+        gc_rx,
+        next_trx_ts,
+        dropped_table_file_deletes,
+    ))
 }
 
 pub(crate) struct RecoveryDeps {
@@ -168,8 +156,8 @@ pub(crate) struct LogRecovery<'a> {
     disk_pool: QuiescentGuard<ReadonlyBufferPool>,
     /// Catalog runtime being rebuilt from checkpointed metadata and redo logs.
     catalog: &'a Catalog,
-    /// Ordered view over all redo-log partitions.
-    log_merger: LogMerger,
+    /// Ordered single redo-log stream.
+    log_stream: RedoLogStream,
     /// Catalog checkpoint boundary. Catalog redo before this timestamp is
     /// already reflected in checkpointed catalog state.
     catalog_replay_start_ts: TrxID,
@@ -255,7 +243,7 @@ impl<'a> LogRecovery<'a> {
         table_fs: QuiescentGuard<FileSystem>,
         disk_pool: QuiescentGuard<ReadonlyBufferPool>,
         catalog: &'a Catalog,
-        log_merger: LogMerger,
+        log_stream: RedoLogStream,
     ) -> Self {
         let pool_guards = PoolGuards::builder()
             .push(PoolRole::Meta, meta_pool.pool_guard())
@@ -269,7 +257,7 @@ impl<'a> LogRecovery<'a> {
             table_fs,
             disk_pool,
             catalog,
-            log_merger,
+            log_stream,
             catalog_replay_start_ts: MIN_SNAPSHOT_TS,
             replay_floor: MIN_SNAPSHOT_TS,
             max_recovered_cts: MIN_SNAPSHOT_TS,
@@ -281,19 +269,15 @@ impl<'a> LogRecovery<'a> {
         }
     }
 
-    /// Replay all redo streams, rebuild indexes, and return reopened partition streams.
+    /// Replay the redo stream, rebuild indexes, and return the reopened stream.
     #[inline]
     pub(crate) async fn recover_all(
         mut self,
-    ) -> Result<(
-        Vec<LogPartitionStream>,
-        TrxID,
-        Vec<DroppedTableFileDeleteItem>,
-    )> {
+    ) -> Result<(RedoLogStream, TrxID, Vec<DroppedTableFileDeleteItem>)> {
         self.bootstrap_checkpointed_user_tables().await?;
         // 1. replay DDL and DML into catalog metadata, hot RowStore pages, and
         //    cold delete markers.
-        while let Some(log) = self.log_merger.try_next()? {
+        while let Some(log) = self.log_stream.pop()? {
             self.replay_log(log).await?;
         }
         // 2. Ensure catalog metadata caught up with table-file roots.
@@ -306,7 +290,7 @@ impl<'a> LogRecovery<'a> {
         self.recover_indexes_and_refresh_pages().await?;
 
         Ok((
-            self.log_merger.finished_streams(),
+            self.log_stream,
             self.max_recovered_cts,
             self.dropped_table_file_deletes,
         ))
@@ -965,7 +949,7 @@ mod tests {
     use crate::row::ops::{DeleteMvcc, SelectKey, SelectMvcc, UpdateCol, UpdateMvcc};
     use crate::session::tests::SessionTestExt;
     use crate::table::{CheckpointOutcome, DeleteMarker, Table};
-    use crate::trx::log_replay::{LogMerger, TrxLog};
+    use crate::trx::log_replay::TrxLog;
     use crate::trx::redo::{DDLRedo, RedoHeader, RedoLogs, RedoTrxKind, RowRedo, RowRedoKind};
     use crate::trx::{MIN_SNAPSHOT_TS, Transaction};
     use crate::value::Val;
@@ -1036,7 +1020,13 @@ mod tests {
             engine.inner().table_fs.clone(),
             engine.inner().disk_pool.clone_inner(),
             engine.catalog(),
-            LogMerger::default(),
+            engine
+                .inner()
+                .trx_sys
+                .config
+                .redo_log_initializer()
+                .unwrap()
+                .stream(),
         );
         recovery.catalog_replay_start_ts = catalog_replay_start_ts;
         recovery.replay_floor = MIN_SNAPSHOT_TS;

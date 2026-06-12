@@ -1072,11 +1072,10 @@ pub(crate) mod tests {
         session_id: SessionID,
         trx_id: TrxID,
         sts: TrxID,
-        log_no: usize,
         gc_no: usize,
     ) -> (Transaction, Arc<SessionState>) {
         let state = Arc::new(SessionState::new(engine.clone(), session_id));
-        let inner = crate::trx::TrxInner::new(trx_id, sts, log_no, gc_no, session_id);
+        let inner = TrxInner::new(trx_id, sts, gc_no, session_id);
         let entry = TrxEntry::new(inner);
         {
             let mut lifecycle = state.lifecycle.lock();
@@ -1167,7 +1166,7 @@ pub(crate) mod tests {
             let session_id = SessionID::new(1);
             let trx_id = MIN_ACTIVE_TRX_ID;
             let state = SessionState::new(engine.new_ref().unwrap(), session_id);
-            let entry = TrxEntry::new(TrxInner::new(trx_id, MIN_SNAPSHOT_TS, 0, 0, session_id));
+            let entry = TrxEntry::new(TrxInner::new(trx_id, MIN_SNAPSHOT_TS, 0, session_id));
             {
                 let mut lifecycle = state.lifecycle.lock();
                 *lifecycle = SessionLifecycle::AbandonedActive {
@@ -1192,7 +1191,7 @@ pub(crate) mod tests {
             let session_id = SessionID::new(1);
             let trx_id = MIN_ACTIVE_TRX_ID;
             let state = SessionState::new(engine.new_ref().unwrap(), session_id);
-            let entry = TrxEntry::new(TrxInner::new(trx_id, MIN_SNAPSHOT_TS, 0, 0, session_id));
+            let entry = TrxEntry::new(TrxInner::new(trx_id, MIN_SNAPSHOT_TS, 0, session_id));
             entry.finish(TrxEntryState::Failed);
             {
                 let mut lifecycle = state.lifecycle.lock();

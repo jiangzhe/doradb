@@ -4,7 +4,7 @@ use byte_unit::Byte;
 /// Marker file stored at `storage_root` that records the durable storage layout.
 pub(crate) const STORAGE_LAYOUT_FILE_NAME: &str = "storage-layout.toml";
 /// Storage-layout marker version used for durable compatibility checks.
-pub(crate) const STORAGE_LAYOUT_VERSION: u32 = 1;
+pub(crate) const STORAGE_LAYOUT_VERSION: u32 = 2;
 
 /// Default bytes reserved for the fully resident metadata pool.
 pub(crate) const DEFAULT_ENGINE_META_BUFFER: usize = 32 * 1024 * 1024;
@@ -35,7 +35,7 @@ pub(crate) const DEFAULT_EVICTABLE_BUFFER_POOL_MAX_FILE_SIZE: Byte =
 pub(crate) const DEFAULT_EVICTABLE_BUFFER_POOL_MAX_MEM_SIZE: Byte =
     Byte::from_u64(1024 * 1024 * 1024);
 
-/// Default async IO depth allocated to each redo-log partition.
+/// Default async IO depth allocated to the redo-log worker.
 pub const DEFAULT_LOG_IO_DEPTH: usize = 32;
 /// Default upper bound for one redo-log IO request payload.
 pub const DEFAULT_LOG_IO_MAX_SIZE: Byte = Byte::from_u64(8192);
@@ -43,12 +43,6 @@ pub const DEFAULT_LOG_IO_MAX_SIZE: Byte = Byte::from_u64(8192);
 pub const DEFAULT_LOG_DIR: &str = ".";
 /// Default base file name for the redo-log family.
 pub const DEFAULT_LOG_FILE_STEM: &str = "redo.log";
-/// Default number of redo-log partitions created at startup.
-pub const DEFAULT_LOG_PARTITIONS: usize = 1;
-/// Maximum supported redo-log partition count.
-///
-/// File naming reserves two digits for the partition index, so this stays below 100.
-pub const MAX_LOG_PARTITIONS: usize = 99;
 /// Default sparse-file size cap for each redo-log file.
 pub const DEFAULT_LOG_FILE_MAX_SIZE: Byte = Byte::from_u64(1024 * 1024 * 1024);
 /// Default durability mode used when flushing redo-log writes.
