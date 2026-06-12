@@ -1,19 +1,18 @@
 ---
 name: task
-description: Design an implementation-ready task document for a feature or bug fix through deep research and multi-round design review, and run task lifecycle workflows. Use when creating task docs in this repository, running post-implementation `task checklist` review, resolving task docs, or purging completed task worktrees. Enforce background-doc research, codebase impact analysis, explicit first-principles/long-term/original-fit proposal lenses with tradeoffs, two formal review rounds with user feedback, strict RFC escalation for oversized scope, explicit user approval before writing docs/tasks files, and task-doc quality sufficient for direct implementation.
+description: Design an implementation-ready task document for a feature or bug fix through deep research and multi-round design review, and run task lifecycle workflows. Use when creating task docs in this repository, resolving task docs after implementation, or purging completed task worktrees. Enforce background-doc research, codebase impact analysis, explicit first-principles/long-term/original-fit proposal lenses with tradeoffs, two formal review rounds with user feedback, strict RFC escalation for oversized scope, explicit user approval before writing docs/tasks files, and task-doc quality sufficient for direct implementation.
 ---
 
 # Task Workflow
 
 Use this skill to design a high-quality, implementation-ready task document and to
-run post-implementation task lifecycle checks.
+run task lifecycle maintenance flows.
 Scripts are executable; invoke them directly (no `cargo +nightly -Zscript` prefix).
 
-This skill has four prompt workflows:
+This skill has three prompt workflows:
 1. `task create`: design-phase planning and implementation-ready task doc creation.
-2. `task checklist`: post-implementation review against `docs/process/dev-checklist.md`.
-3. `task resolve`: post-implementation synchronization after code/tests/review are complete.
-4. `task purge worktree`: inspect task worktrees and remove only the ones that are safe to purge.
+2. `task resolve`: post-implementation synchronization after code/tests/review are complete.
+3. `task purge worktree`: inspect task worktrees and remove only the ones that are safe to purge.
 
 ## `task create` Required Flow
 
@@ -178,69 +177,12 @@ and resolved decisions for an implementation agent to start coding directly
 from the task worktree and task doc, without running a separate planning
 command.
 
-## `task checklist` Required Flow
-
-Use `task checklist` after implementation is believed complete and before
-`task resolve`.
-
-This is a chat-report workflow only. Do not edit task docs, create backlog
-docs, commit, or push during `task checklist`. If the developer asks to fix
-reported issues, handle that as normal implementation work. If the developer
-chooses to defer actionable follow-ups, use the `$backlog` workflow separately.
-
-1. Locate the task doc:
-   - Use the user-provided task doc path when present.
-   - Otherwise, if the current worktree basename is a 6-digit task id and
-     exactly one matching `docs/tasks/<task-id>-*.md` exists, use it.
-   - Otherwise, if exactly one changed task doc is discoverable, use it.
-   - If still ambiguous, ask the developer for the task doc path.
-2. Gather review context:
-   - Read `docs/process/dev-checklist.md`.
-   - Read the task doc's Goals, Non-Goals, Plan, Test Cases, and Open Questions.
-   - If the task is RFC-linked, read the parent RFC phase and following phase
-     prerequisites referenced by the task.
-   - Inspect the implementation scope with `git status --short`,
-     `git diff --stat`, and relevant diffs.
-3. Walk every checklist category in `docs/process/dev-checklist.md`:
-   - Reliability: compare tests to task requirements, run or verify
-     `cargo nextest run -p doradb-storage`, and run
-     `tools/coverage_focus.rs --path <changed file/or/dir>` for relevant
-     changed Rust files or directories. Target at least 80% focused coverage.
-   - Security: if unsafe code changed, apply
-     `docs/process/unsafe-review-checklist.md`; otherwise mark unsafe-specific
-     checks as not applicable with evidence.
-   - Performance: review synchronization, IO, batching/parallelism,
-     algorithmic complexity, allocations/copies, recomputation, and data
-     reduction opportunities.
-   - Feature completeness: compare implementation against task goals,
-     non-goals, acceptance criteria, and explicitly protected unchanged
-     behavior. For RFC-linked tasks, also verify the implementation satisfies
-     target phase prerequisites, resolves documented phase-local choices, and
-     preserves or updates following-phase prerequisites.
-   - Documentation: verify public and crate-public item docs, trait docs, core
-     logic comments, and related concept-level documentation updates.
-   - Test-only code: confirm helpers stay inside `#[cfg(test)] mod tests`
-     unless narrowly justified, and prefer production execution paths.
-   - Complexity: review changed functions over roughly 60 lines and require a
-     split or inline comments explaining the steps and invariants.
-4. Mark each item as `pass`, `issue`, `blocked`, or `n/a`.
-   - Use `blocked` when a command cannot run or required evidence is missing.
-   - Use `n/a` only with a brief reason.
-5. Finish with one report that includes:
-   - task doc path and changed scope;
-   - commands run and results;
-   - checklist status by category;
-   - required fixes before `task resolve`;
-   - optional improvements and backlog candidates;
-   - a direct question asking which fixes or improvements the developer wants
-     handled now or deferred.
-
 ## `task resolve` Required Flow
 
-Use `task resolve` only after implementation and tests are done, `task checklist`
-has been completed, and behavior is reviewed/verified.
+Use `task resolve` only after implementation, tests, and review are complete,
+and behavior is verified.
 
-1. Confirm `task checklist` issues are fixed or explicitly accepted/deferred.
+1. Confirm known implementation/review issues are fixed or explicitly accepted/deferred.
 2. Synchronize the task doc implementation outcome by editing the task doc directly.
 3. Fill `Implementation Notes` with concrete implementation/test/review outcomes.
 4. Append unresolved future improvements to `Open Questions` when needed.

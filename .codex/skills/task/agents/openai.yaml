@@ -1,6 +1,6 @@
 interface:
   display_name: "Task"
-  short_description: "Task design, checklist, resolve, and worktree workflows"
+  short_description: "Task design, resolve, and worktree workflows"
   default_prompt: >
     Use $task create for deep-research design rounds that require explicit
     `First-Principles`, `Long-Term Evolution`, and `Original-Requirement-Fit`
@@ -13,20 +13,14 @@ interface:
     name separate from the full task-doc slug. The resulting task doc must be
     decision-complete and sufficient for an implementation agent to start
     coding directly from the task worktree and doc without a separate planning
-    command. Use $task checklist after implementation and before $task resolve:
-    read `docs/process/dev-checklist.md`,
-    compare the implementation with the task doc, inspect changed files, run or
-    verify required validation and focused coverage, review security,
-    performance, feature completeness, documentation, test-only code, and
-    complexity, then report pass/issue/blocked/n/a items in chat and ask which
-    fixes or improvements to handle now or defer. Use $task resolve from the
-    task worktree after checklist issues are fixed or explicitly
-    accepted/deferred, including `tools/task.rs resolve-task-next-id --task
-    docs/tasks/<id>-<slug>.md` before RFC sync, update RFC phase plans when
-    proposals or implementation changed prerequisites/phase-local choices,
-    handle source backlog closure explicitly through $backlog, and when
-    deferring work into backlog include the current task/RFC source plus defer
-    reason, findings, and direction hint.
+    command. Use $task resolve from the task worktree after implementation,
+    tests, and review are complete and known implementation/review issues are
+    fixed or explicitly accepted/deferred, including `tools/task.rs
+    resolve-task-next-id --task docs/tasks/<id>-<slug>.md` before RFC sync,
+    update RFC phase plans when proposals or implementation changed
+    prerequisites/phase-local choices, handle source backlog closure explicitly
+    through $backlog, and when deferring work into backlog include the current
+    task/RFC source plus defer reason, findings, and direction hint.
     Use $task purge worktree from the `main` dispatch worktree with
     `tools/task.rs purge-worktrees`, and only remove worktrees in `--apply` mode
     when the task is implemented, the worktree is clean, and the same-name
