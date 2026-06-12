@@ -1,7 +1,7 @@
 ---
 id: 000174
 title: Transaction Terminal Rollback Cancellation Safety
-status: proposal
+status: implemented
 created: 2026-06-12
 github_issue: 697
 ---
@@ -184,6 +184,60 @@ Reference:
 
 ## Implementation Notes
 
+Implemented terminal rollback cancellation safety by handing claimed terminal
+rollback work to the transaction cleanup worker before rollback awaits storage
+work. `TrxCleanupMessage` now includes a mandatory terminal rollback job that
+owns the `TrxCompletionClaim`, operation label, and completion cell. Explicit
+`Transaction::rollback(self).await` and the post-claim poisoned commit rollback
+path enqueue this job and wait only as observers on the completion.
+
+The cleanup worker runs the existing rollback ownership path, preserving fatal
+rollback retention, storage poison, transaction lock release, session rollback,
+and terminal entry publication. Send failure on terminal rollback enqueue is
+treated as a worker-lifetime invariant violation and leaks the returned message
+payload before panicking, matching the failed-precommit cleanup safety pattern.
+
+Added focused cancellation tests for dropped explicit rollback waiters, shutdown
+while a dropped rollback waiter has worker-owned cleanup in progress, duplicate
+abandoned-cleanup attempts against `RollingBack`, and cancellation of the known
+post-claim pre-handoff commit rollback path. Existing rollback-access fatal
+retention coverage verifies worker-owned terminal rollback still reports
+`FatalError::RollbackAccess`, retains rollback-owned undo, poisons storage, and
+finishes the session.
+
+Updated `docs/transaction-system.md` to document that explicit rollback becomes
+worker-owned after terminal ownership is claimed, while polled
+`Transaction::exec(...)` remains non-cancellation-safe and must be driven to
+completion.
+
+Resolved source backlog `docs/backlogs/000113-transaction-cancellation-safety.md`
+as replaced: this task implements the terminal rollback portion, remaining
+statement execution cancellation safety is tracked by
+`docs/backlogs/000124-statement-execution-cancellation-safety.md`, and adaptive
+cleanup/runtime worker scheduling is tracked by
+`docs/backlogs/000123-adaptive-background-worker-runtime.md`.
+
+Validation completed:
+- `cargo fmt`
+- `cargo clippy -p doradb-storage --all-targets -- -D warnings`
+- focused rollback cancellation tests:
+  `cargo nextest run -p doradb-storage
+  trx::tests::test_dropped_terminal_rollback_waiter_completes_worker_cleanup
+  trx::tests::test_terminal_rollback_blocks_shutdown_after_waiter_drop
+  trx::tests::test_duplicate_abandoned_cleanup_cannot_claim_terminal_rollback
+  trx::tests::test_dropped_commit_waiter_after_pre_handoff_rollback_still_cleans_up`
+- rollback fatal retention regression:
+  `cargo nextest run -p doradb-storage
+  test_mvcc_rollback_poisons_runtime_on_row_page_reload_error`
+- related rollback/precommit regression tests:
+  `cargo nextest run -p doradb-storage
+  trx::tests::test_failed_precommit_cleanup_stops_reverse_after_rollback_failure
+  trx::tests::test_transaction_locks_release_on_readonly_commit_rollback_and_ordered_commit
+  trx::tests::test_transaction_locks_release_on_precommit_abort`
+- `cargo nextest run -p doradb-storage`
+- `tools/coverage_focus.rs --path doradb-storage/src/trx` reported 94.72%
+  focused line coverage for the transaction directory.
+
 ## Impacts
 
 - `doradb-storage/src/trx/sys.rs`
@@ -257,6 +311,11 @@ Validation commands:
 ## Open Questions
 
 - Full `Transaction::exec(...)` cancellation safety remains intentionally out of
-  scope. If it remains desired after this task, track it as a separate backlog
-  or RFC because it likely requires a broader statement operation ownership
-  model.
+  scope. It is tracked as
+  `docs/backlogs/000124-statement-execution-cancellation-safety.md` because it
+  likely requires a broader statement operation ownership model.
+- Adaptive processing for long rollback or cleanup work remains intentionally
+  out of scope. It is tracked as
+  `docs/backlogs/000123-adaptive-background-worker-runtime.md` because several
+  large worker-owned rollbacks can monopolize the single cleanup worker even
+  though rollback is expected to be rare enough for this task's safety fix.

@@ -43,3 +43,11 @@ When a backlog item is moved to `docs/backlogs/closed/`, append:
 - Reference: <task/issue/pr reference>
 - Closed At: <YYYY-MM-DD>
 ```
+
+## Close Reason
+
+- Type: replaced
+- Detail: Terminal rollback cancellation safety was implemented via docs/tasks/000174-transaction-terminal-rollback-cancellation-safety.md. Remaining statement execution cancellation safety is replaced by docs/backlogs/000124-statement-execution-cancellation-safety.md, and adaptive cleanup worker/runtime scheduling concerns are tracked by docs/backlogs/000123-adaptive-background-worker-runtime.md.
+- Closed By: backlog close
+- Reference: User decision
+- Closed At: 2026-06-12
