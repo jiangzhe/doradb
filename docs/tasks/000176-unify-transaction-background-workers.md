@@ -1,7 +1,7 @@
 ---
 id: 000176
 title: Unify Transaction Background Workers
-status: proposal
+status: implemented
 created: 2026-06-12
 github_issue: 702
 ---
@@ -205,6 +205,55 @@ Rejected alternatives considered:
 
 ## Implementation Notes
 
+Implemented in `doradb-storage` as a transaction-background worker topology
+refactor:
+
+- Removed the dedicated redo GC analyzer channel/thread. Redo recovery/startup
+  now wires the purge sender into `RedoLog`, and successful ordered redo
+  completion sends non-empty committed payload maps as `Purge::Committed` before
+  waking commit waiters.
+- Moved committed transaction recording into purge coordination. The single
+  purge thread and the multi-thread purge dispatcher both record committed
+  batches into GC buckets before deciding whether to run a full purge cycle.
+- Preserved lossy purge wakeup coalescing while making committed batches
+  non-lossy. `PurgeWork` records every accepted committed batch before `Stop`;
+  `Stop` is documented as a terminal shutdown barrier that is safe only because
+  shutdown sends it after redo and cleanup have joined.
+- Grouped transaction background workers under `TransactionBackgroundWorkers`
+  inside `TransactionSystemWorkersOwned`. Shutdown now closes group-commit
+  admission, wakes and joins redo, stops and joins cleanup, stops and joins
+  purge coordination/executors, then closes the active redo file.
+- Renamed mutating GC helpers from `gc_analyze_*`/`analyze_*` to
+  `record_*_for_purge` to reflect that they mutate bucket state and enqueue
+  committed payloads for later purge.
+- Updated transaction/purge comments and related documentation wording to
+  describe purge-owned committed recording, non-lossy handoff, and staged
+  shutdown invariants.
+
+Review follow-ups addressed during implementation:
+
+- Added detailed comments on `TransactionBackgroundWorkers::shutdown` explaining
+  the shutdown-order contract and why future changes must preserve it.
+- Simplified the committed purge handoff send-failure path to an invariant
+  `expect`, matching the intended design that the purge receiver stays alive
+  until redo has joined.
+- Documented the `Purge::Stop`/`PurgeWork::stop_after` contract around both the
+  shutdown sender and purge coalescer.
+- Added a start signal to the shutdown regression test so the negative timeout
+  assertion cannot pass merely because the spawned shutdown thread has not
+  started.
+
+Validation performed:
+
+- `cargo fmt`
+- `cargo fmt -- --check`
+- `cargo check -p doradb-storage`
+- `cargo clippy -p doradb-storage --all-targets -- -D warnings`
+- `cargo nextest run -p doradb-storage`
+- `cargo nextest run -p doradb-storage --no-default-features --features libaio`
+- `cargo test -p doradb-storage test_shutdown_drains_committed_handoff_after_dropped_commit_waiter`
+- `git diff --check`
+
 ## Impacts
 
 - `doradb-storage/src/conf/trx.rs`
@@ -306,7 +355,5 @@ Rejected alternatives considered:
 
 ## Open Questions
 
-No open design questions are blocking this task. Exact internal type names are
-left to the implementation, but the commit-handoff, purge-analysis ownership,
-cleanup lifetime, and staged shutdown semantics above are acceptance
-requirements.
+No unresolved follow-up work remains for this task. The source backlog was
+implemented by this task and is closed during resolve.
