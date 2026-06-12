@@ -1200,7 +1200,7 @@ mod tests {
     use crate::id::{TableID, TrxID};
     use crate::latch::LatchFallbackMode;
     use crate::quiescent::{QuiescentBox, QuiescentGuard};
-    use crate::trx::log::list_log_files;
+    use crate::trx::log::discover_redo_log_files;
     use crate::trx::log_replay::ReadLog;
     use crate::trx::redo::DDLRedo;
     use crate::value::ValKind;
@@ -2046,7 +2046,7 @@ mod tests {
             let mut create_row_page_logs = 0usize;
             let file_prefix = temp_dir.path().join("redo_row_page_idx");
             let file_prefix = file_prefix.to_str().unwrap();
-            let logs = list_log_files(file_prefix, false).unwrap();
+            let logs = discover_redo_log_files(file_prefix, false).unwrap();
             for log in logs {
                 let mut reader = engine.inner().trx_sys.log_reader(&log).unwrap();
                 loop {

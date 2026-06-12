@@ -29,7 +29,7 @@ use super::consts::{
 };
 use super::path::{path_to_utf8, validate_log_file_stem};
 
-use crate::trx::log::list_log_files;
+use crate::trx::log::discover_redo_log_files;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TrxSysConfig {
@@ -184,7 +184,7 @@ impl TrxSysConfig {
         let ctx = StorageBackend::new(self.io_depth_per_log)?;
         let file_prefix = self.file_prefix().map_err(Error::from)?;
 
-        let logs = list_log_files(&file_prefix, false)?;
+        let logs = discover_redo_log_files(&file_prefix, false)?;
         let mode = if logs.is_empty() {
             RedoLogMode::Done
         } else {

@@ -5,7 +5,7 @@ use crate::catalog::{
 };
 use crate::error::{ErrorKind, FatalError, Result};
 use crate::id::{TableID, TrxID};
-use crate::trx::log::{RedoLogInitializer, list_log_files};
+use crate::trx::log::{RedoLogInitializer, discover_redo_log_files};
 use crate::trx::redo::{DDLRedo, RowRedoKind, TableDML};
 use crate::trx::sys::TransactionSystem;
 use event_listener::{Event, listener};
@@ -319,7 +319,7 @@ impl Catalog {
             return Ok(batch);
         }
 
-        let logs = list_log_files(&scan_cfg.file_prefix, false)?;
+        let logs = discover_redo_log_files(&scan_cfg.file_prefix, false)?;
         if logs.is_empty() {
             return Ok(batch);
         }

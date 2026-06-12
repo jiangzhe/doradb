@@ -121,8 +121,8 @@ shape over migration scaffolding.
 2. Replace redo file naming and discovery.
    - Change redo file creation to use
      `<file_prefix>.<file_sequence:08x>`.
-   - Replace partition-aware `list_log_files(file_prefix, log_no, ...)` with a
-     single-stream log discovery helper.
+   - Replace partition-aware `list_log_files(file_prefix, log_no, ...)` with
+     the single-stream `discover_redo_log_files` helper.
    - Add validation that detects legacy names matching
      `<file_prefix>.<partition>.<file_sequence:08x>` and reports a clear
      unsupported old-layout error.
@@ -209,7 +209,7 @@ shape over migration scaffolding.
   - `LogPartitionInitializer`
   - `LogPartitionMode`
   - `LogPartition`
-  - `list_log_files`
+  - `discover_redo_log_files`
   - `create_log_file`
   - log file naming/parsing tests
   - redo write/sync failure handling tests

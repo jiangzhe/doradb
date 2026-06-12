@@ -102,6 +102,8 @@ pub(crate) enum DataIntegrityError {
     TornWrite,
     #[error("invalid payload")]
     InvalidPayload,
+    #[error("redo log sequence gap")]
+    RedoLogSequenceGap,
     #[error("invalid root invariant")]
     InvalidRootInvariant,
     #[error("log file corrupted")]

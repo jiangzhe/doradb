@@ -1160,16 +1160,17 @@ pub(super) fn create_log_file(
 }
 
 #[inline]
-pub(crate) fn list_log_files(file_prefix: &str, desc: bool) -> Result<Vec<PathBuf>> {
+pub(crate) fn discover_redo_log_files(file_prefix: &str, desc: bool) -> Result<Vec<PathBuf>> {
     let pattern = format!("{}.*", Pattern::escape(file_prefix));
-    let mut res = vec![];
+    let mut files = vec![];
     for entry in glob(&pattern).unwrap() {
         let path = entry?;
         let Some(suffix) = log_family_suffix(file_prefix, &path)? else {
             continue;
         };
         if is_log_file_seq(suffix) {
-            res.push(path);
+            let file_seq = parse_file_seq(&path)?;
+            files.push((file_seq, path));
             continue;
         }
         if is_legacy_partitioned_log_suffix(suffix) {
@@ -1187,13 +1188,49 @@ pub(crate) fn list_log_files(file_prefix: &str, desc: bool) -> Result<Vec<PathBu
             ))
             .into());
     }
+    files.sort_by_key(|(seq, _)| *seq);
+    validate_redo_log_file_sequences(file_prefix, &files)?;
+    let mut res: Vec<_> = files.into_iter().map(|(_, path)| path).collect();
     if desc {
-        // reverse sort.
-        res.sort_by(|a, b| b.cmp(a));
-    } else {
-        res.sort();
+        res.reverse();
     }
     Ok(res)
+}
+
+#[inline]
+fn validate_redo_log_file_sequences(file_prefix: &str, files: &[(u32, PathBuf)]) -> Result<()> {
+    for window in files.windows(2) {
+        let prev = window[0].0;
+        let next = window[1].0;
+        if next <= prev {
+            return Err(Report::new(DataIntegrityError::InvalidPayload)
+                .attach(format!(
+                    "duplicate redo log file sequence {next:08x} in family {file_prefix}"
+                ))
+                .into());
+        }
+        let expected = prev.checked_add(1).ok_or_else(|| {
+            Error::from(
+                Report::new(DataIntegrityError::RedoLogSequenceGap).attach(format!(
+                    "redo log file family {file_prefix} has file after terminal sequence {prev:08x}"
+                )),
+            )
+        })?;
+        if next != expected {
+            let missing_end = next - 1;
+            let missing = if expected == missing_end {
+                format!("{expected:08x}")
+            } else {
+                format!("{expected:08x}..={missing_end:08x}")
+            };
+            return Err(Report::new(DataIntegrityError::RedoLogSequenceGap)
+                .attach(format!(
+                    "missing redo log file sequence(s) {missing} in family {file_prefix}"
+                ))
+                .into());
+        }
+    }
+    Ok(())
 }
 
 #[inline]
@@ -1281,7 +1318,7 @@ mod tests {
     use crate::catalog::tests::table2;
     use crate::conf::{EngineConfig, EvictableBufferPoolConfig, TrxSysConfig};
     use crate::engine::{Engine, EngineRef};
-    use crate::error::{CompletionErrorKind, FatalError, LifecycleError};
+    use crate::error::{CompletionErrorKind, DataIntegrityError, FatalError, LifecycleError};
     use crate::file::{FileSyncKind, FileSyncOp, FileSyncTestHook, set_file_sync_test_hook};
     use crate::id::{PageID, RowID, TableID};
     use crate::io::{
@@ -1853,7 +1890,7 @@ mod tests {
     }
 
     #[test]
-    fn test_list_log_files_escapes_directory_metacharacters() {
+    fn test_discover_redo_log_files_escapes_directory_metacharacters() {
         let temp_dir = TempDir::new().unwrap();
         let log_dir = temp_dir.path().join("redo[dir]");
         fs::create_dir(&log_dir).unwrap();
@@ -1863,28 +1900,46 @@ mod tests {
         let expected = [
             PathBuf::from(format!("{file_prefix}.00000000")),
             PathBuf::from(format!("{file_prefix}.00000001")),
-            PathBuf::from(format!("{file_prefix}.0000000a")),
+            PathBuf::from(format!("{file_prefix}.00000002")),
         ];
         for path in &expected {
             File::create(path).unwrap();
         }
         File::create(log_dir.join("redo.logx.00000000")).unwrap();
 
-        let asc = list_log_files(file_prefix, false).unwrap();
+        let asc = discover_redo_log_files(file_prefix, false).unwrap();
         assert_eq!(expected.to_vec(), asc);
 
-        let desc = list_log_files(file_prefix, true).unwrap();
+        let desc = discover_redo_log_files(file_prefix, true).unwrap();
         assert_eq!(expected.iter().rev().cloned().collect::<Vec<_>>(), desc);
     }
 
     #[test]
-    fn test_list_log_files_rejects_legacy_partitioned_files() {
+    fn test_discover_redo_log_files_rejects_sequence_gap() {
+        let temp_dir = TempDir::new().unwrap();
+        let file_prefix = temp_dir.path().join("redo.log");
+        let file_prefix = file_prefix.to_str().unwrap();
+        File::create(format!("{file_prefix}.00000000")).unwrap();
+        File::create(format!("{file_prefix}.00000002")).unwrap();
+
+        let err = discover_redo_log_files(file_prefix, false).unwrap_err();
+        assert_eq!(
+            err.data_integrity_error(),
+            Some(DataIntegrityError::RedoLogSequenceGap)
+        );
+        let report = format!("{err:?}");
+        assert!(report.contains("00000001"), "{report}");
+        assert!(report.contains(file_prefix), "{report}");
+    }
+
+    #[test]
+    fn test_discover_redo_log_files_rejects_legacy_partitioned_files() {
         let temp_dir = TempDir::new().unwrap();
         let file_prefix = temp_dir.path().join("redo.log");
         let file_prefix = file_prefix.to_str().unwrap();
         File::create(format!("{file_prefix}.0.00000000")).unwrap();
 
-        let err = list_log_files(file_prefix, false).unwrap_err();
+        let err = discover_redo_log_files(file_prefix, false).unwrap_err();
         let report = format!("{err:?}");
         assert!(report.contains("unsupported legacy partitioned redo log file"));
     }
@@ -1951,7 +2006,7 @@ mod tests {
 
             let mut log_recs = 0usize;
             let file_prefix = engine.inner().trx_sys.config.file_prefix().unwrap();
-            let logs = list_log_files(&file_prefix, false).unwrap();
+            let logs = discover_redo_log_files(&file_prefix, false).unwrap();
             for log in logs {
                 println!("log file {:?}", log.file_name());
                 let mut reader = engine.inner().trx_sys.log_reader(&log).unwrap();
