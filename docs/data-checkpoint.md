@@ -168,11 +168,11 @@ Instead of maintaining a separate Epoch-based mechanism for page reclamation, th
     *   This is conceptually similar to how a normal write transaction attaches its Undo Logs and Write Buffers to its context.
 
 2.  **GC Condition**:
-    *   The background GC thread periodically calculates the **`Global_Min_Active_STS`** (the Start Timestamp of the oldest active transaction in the system).
+    *   Transaction purge coordination periodically calculates the **`Global_Min_Active_STS`** (the Start Timestamp of the oldest active transaction in the system).
     *   It scans the list of committed transactions (including System Transactions).
     *   The reclamation trigger is:
         $$ T_{cp}.CTS < \text{Global\_Min\_Active\_STS} $$
 
 3.  **Reclamation Action**:
     *   **Logic**: If the condition is met, it implies that every currently active transaction started *after* the checkpoint committed. Therefore, all active readers view the system state *after* the Pivot advancement and will access the new LWC blocks on disk. No reader holds a reference to the old RowPages.
-    *   **Execution**: The GC thread frees the $T_{cp}$ transaction object, its associated Undo logs (if any), and physically deallocates the attached **RowPages**.
+    *   **Execution**: Purge workers free the $T_{cp}$ transaction object, its associated Undo logs (if any), and physically deallocate the attached **RowPages**.

@@ -30,12 +30,12 @@ use crate::row::RowPage;
 use crate::table::Table;
 use crate::trx::log::{RedoLog, RedoLogInitializer};
 use crate::trx::log_replay::{RedoLogStream, TrxLog};
-use crate::trx::purge::{DroppedTableFileDeleteItem, GC};
+use crate::trx::purge::{DroppedTableFileDeleteItem, Purge};
 use crate::trx::redo::{DDLRedo, RedoLogs, RowRedo, RowRedoKind, TableDML};
 use crate::trx::{MAX_SNAPSHOT_TS, MIN_SNAPSHOT_TS};
 use crossbeam_utils::CachePadded;
 use error_stack::Report;
-use flume::Receiver;
+use flume::Sender;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
@@ -96,12 +96,8 @@ pub(crate) async fn log_recover(
     deps: RecoveryDeps,
     catalog: &Catalog,
     redo_log_initializer: RedoLogInitializer,
-) -> Result<(
-    CachePadded<RedoLog>,
-    Receiver<GC>,
-    TrxID,
-    Vec<DroppedTableFileDeleteItem>,
-)> {
+    purge_tx: Sender<Purge>,
+) -> Result<(CachePadded<RedoLog>, TrxID, Vec<DroppedTableFileDeleteItem>)> {
     let RecoveryDeps {
         index_pool,
         mem_pool,
@@ -128,10 +124,9 @@ pub(crate) async fn log_recover(
             )
         })?;
     let initializer = log_stream.into_initializer();
-    let (redo_log, gc_rx) = initializer.finish()?;
+    let redo_log = initializer.finish(purge_tx)?;
     Ok((
         CachePadded::new(redo_log),
-        gc_rx,
         next_trx_ts,
         dropped_table_file_deletes,
     ))

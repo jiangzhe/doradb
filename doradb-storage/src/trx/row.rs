@@ -358,8 +358,8 @@ impl<'a> RowReadAccess<'a> {
                 let mut deleted = row.is_deleted();
                 let mut vals = row.clone_vals(metadata.col.as_ref());
                 // Traverse version chain until oldest version.
-                // This is safe because we already lock the row and
-                // prevent GC thread from pruging old versions.
+                // This is safe because we already lock the row and prevent
+                // purge coordination from removing old versions.
                 loop {
                     match &entry.as_ref().kind {
                         RowUndoKind::Lock => (), // do nothing.

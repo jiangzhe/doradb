@@ -256,6 +256,25 @@ impl TransactionSystem {
         self.redo_log.min_active_sts().min(max_active_sts)
     }
 
+    /// Record committed transaction handoffs accepted from redo completion.
+    ///
+    /// Purge coordination owns this step so committed payload batches cannot be
+    /// overtaken by a separate stop marker. Returns whether the
+    /// global minimum active STS may have advanced and a full purge cycle should
+    /// be requested when the engine is not already tearing down.
+    #[inline]
+    pub(super) fn record_committed_for_purge(
+        &self,
+        trx_list: FastHashMap<usize, Vec<CommittedTrx>>,
+    ) -> bool {
+        let mut changed = false;
+        for (gc_no, trx_list) in trx_list {
+            let gc_bucket = &self.redo_log.gc_buckets[gc_no];
+            changed |= gc_bucket.record_committed_for_purge(trx_list);
+        }
+        changed
+    }
+
     #[inline]
     pub(super) fn dispatch_purge(
         trx_sys: SyncQuiescentGuard<Self>,
@@ -577,7 +596,7 @@ impl ActiveStsList {
     }
 }
 
-/// GCBucket is used for GC analyzer to store and analyze GC related information,
+/// GCBucket stores and records transaction GC information for purge,
 /// including committed transaction list, old transaction list, active snapshot timestamp
 /// list, etc.
 pub(super) struct GCBucket {
@@ -620,18 +639,18 @@ impl GCBucket {
         }
     }
 
-    /// Analyze rollbacked transactions for GC.
+    /// Record a rolled-back transaction for purge.
     #[inline]
-    pub(super) fn gc_analyze_rollback(&self, sts: TrxID) -> bool {
+    pub(super) fn record_rollback_for_purge(&self, sts: TrxID) -> bool {
         debug_assert!(TrxID::new(self.min_active_sts.load(Ordering::Relaxed)) != MAX_SNAPSHOT_TS);
         let mut active_sts_list = self.active_sts_list.lock();
         let min_sts = active_sts_list.remove(sts);
         self.update_min_active_sts(min_sts)
     }
 
-    /// Analyze committed transactions for GC.
+    /// Record committed transactions for purge.
     #[inline]
-    pub(super) fn gc_analyze_commit(&self, trx_list: Vec<CommittedTrx>) -> bool {
+    pub(super) fn record_committed_for_purge(&self, trx_list: Vec<CommittedTrx>) -> bool {
         // Update both active sts list and committed transaction list
         let mut active_sts_list = self.active_sts_list.lock();
         let mut min_sts = MAX_SNAPSHOT_TS;
@@ -675,19 +694,20 @@ impl GCBucket {
     }
 }
 
-/// Messages sent from commit processing to GC analyzers.
-pub(crate) enum GC {
-    Stop,
-    // transaction list per gc bucket.
-    Commit(FastHashMap<usize, Vec<CommittedTrx>>),
-}
-
-/// Commands sent to purge workers.
+/// Messages sent to the purge coordinator.
 pub(crate) enum Purge {
     /// Stop the purge coordinator and let worker shutdown join the thread.
+    ///
+    /// This is a shutdown-only barrier. It may make the coordinator exit
+    /// without running another purge scan, so worker shutdown must enqueue it
+    /// only after redo has joined and no further non-lossy `Committed` handoffs
+    /// can be produced.
     Stop,
-    /// Run a full transaction/index/row-page purge cycle.
-    Next,
+    /// Non-lossy committed transaction payload handoff from redo completion.
+    ///
+    /// The payload map is grouped by GC bucket. The purge coordinator must
+    /// record every accepted batch before it exits.
+    Committed(FastHashMap<usize, Vec<CommittedTrx>>),
     /// Release retained table roots whose post-publish readers have drained.
     TableRootRetention,
     /// Run only dropped-table runtime/file cleanup.
@@ -699,41 +719,73 @@ struct PurgeWork {
     full_gc: bool,
     table_root_retention: bool,
     dropped_table: bool,
+    /// Terminal shutdown marker. When set, the purge loop returns without
+    /// running cleanup work collected before the marker.
+    stop_after: bool,
 }
 
 impl PurgeWork {
+    #[inline]
+    const fn none() -> Self {
+        Self {
+            full_gc: false,
+            table_root_retention: false,
+            dropped_table: false,
+            stop_after: false,
+        }
+    }
+
     #[inline]
     const fn full() -> Self {
         Self {
             full_gc: true,
             table_root_retention: true,
             dropped_table: true,
+            stop_after: false,
         }
     }
 
     #[inline]
+    #[cfg(test)]
     const fn table_root_retention() -> Self {
         Self {
             full_gc: false,
             table_root_retention: true,
             dropped_table: false,
+            stop_after: false,
         }
     }
 
     #[inline]
-    const fn dropped_table() -> Self {
+    const fn stop() -> Self {
         Self {
             full_gc: false,
             table_root_retention: false,
-            dropped_table: true,
+            dropped_table: false,
+            stop_after: true,
         }
     }
 
     #[inline]
-    fn absorb(&mut self, purge: Purge) -> bool {
+    fn absorb<F>(&mut self, purge: Purge, analyze_committed: &mut F) -> bool
+    where
+        F: FnMut(FastHashMap<usize, Vec<CommittedTrx>>) -> bool,
+    {
         match purge {
-            Purge::Stop => return false,
-            Purge::Next => *self = PurgeWork::full(),
+            Purge::Stop => {
+                // This early stop is safe only because shutdown sends `Stop`
+                // after redo has joined, so all non-lossy committed handoffs
+                // have already been queued before the marker. Do not move
+                // `Purge::Stop` earlier in shutdown without changing this
+                // coalescing contract.
+                *self = PurgeWork::stop();
+                return false;
+            }
+            Purge::Committed(trx_list) => {
+                if analyze_committed(trx_list) {
+                    *self = PurgeWork::full();
+                }
+            }
             Purge::TableRootRetention => self.table_root_retention = true,
             Purge::DroppedTable => self.dropped_table = true,
         }
@@ -742,22 +794,28 @@ impl PurgeWork {
 }
 
 #[inline]
-fn coalesce_purge_work(purge_chan: &Receiver<Purge>, initial: Purge) -> Option<PurgeWork> {
-    // Collapse queued wakeups so a burst of lightweight cleanup requests does
-    // not trigger repeated scans, while any full GC request upgrades the cycle.
-    // `Stop` always wins because shutdown must not be delayed behind cleanup.
-    let mut work = match initial {
-        Purge::Stop => return None,
-        Purge::Next => PurgeWork::full(),
-        Purge::TableRootRetention => PurgeWork::table_root_retention(),
-        Purge::DroppedTable => PurgeWork::dropped_table(),
-    };
+fn coalesce_purge_work<F>(
+    purge_chan: &Receiver<Purge>,
+    initial: Purge,
+    mut analyze_committed: F,
+) -> PurgeWork
+where
+    F: FnMut(FastHashMap<usize, Vec<CommittedTrx>>) -> bool,
+{
+    // Collapse queued lossy wakeups so bursts do not trigger repeated scans,
+    // while committed payload batches are recorded one by one and never
+    // coalesced away. `Stop` is a terminal shutdown barrier: messages before it
+    // have been absorbed, messages after it are intentionally ignored.
+    let mut work = PurgeWork::none();
+    if !work.absorb(initial, &mut analyze_committed) {
+        return work;
+    }
     while let Ok(purge) = purge_chan.try_recv() {
-        if !work.absorb(purge) {
-            return None;
+        if !work.absorb(purge, &mut analyze_committed) {
+            return work;
         }
     }
-    Some(work)
+    work
 }
 
 struct PurgeTask {
@@ -795,9 +853,12 @@ impl PurgeLoop for PurgeSingleThreaded {
         // initialize min_active_sts.
         let mut min_sts = trx_sys.global_visible_sts();
         while let Ok(purge) = purge_chan.recv() {
-            let Some(work) = coalesce_purge_work(&purge_chan, purge) else {
+            let work = coalesce_purge_work(&purge_chan, purge, |trx_list| {
+                trx_sys.record_committed_for_purge(trx_list)
+            });
+            if work.stop_after {
                 return;
-            };
+            }
             let curr_sts = trx_sys.calc_min_active_sts_for_gc();
             if work.full_gc && curr_sts > min_sts {
                 // Start GC. Purge undo/index first, then deallocate retired
@@ -867,9 +928,12 @@ impl PurgeLoop for PurgeDispatcher {
         let mut min_sts = trx_sys.global_visible_sts();
         let mut dispatch_no: usize = 0;
         'DISPATCH_LOOP: while let Ok(purge) = purge_chan.recv_async().await {
-            let Some(work) = coalesce_purge_work(&purge_chan, purge) else {
+            let work = coalesce_purge_work(&purge_chan, purge, |trx_list| {
+                trx_sys.record_committed_for_purge(trx_list)
+            });
+            if work.stop_after {
                 break 'DISPATCH_LOOP;
-            };
+            }
             let curr_sts = trx_sys.calc_min_active_sts_for_gc();
             if work.full_gc && curr_sts > min_sts {
                 // dispatch tasks to executors
@@ -1143,45 +1207,87 @@ mod tests {
     fn test_coalesce_purge_work_preserves_strongest_request() {
         let (_tx, rx) = flume::unbounded();
         assert_eq!(
-            coalesce_purge_work(&rx, Purge::TableRootRetention),
-            Some(PurgeWork::table_root_retention())
+            coalesce_purge_work(&rx, Purge::TableRootRetention, |_| {
+                panic!("no committed payload expected")
+            }),
+            PurgeWork::table_root_retention()
         );
 
         let (tx, rx) = flume::unbounded();
         tx.send(Purge::DroppedTable).unwrap();
         assert_eq!(
-            coalesce_purge_work(&rx, Purge::TableRootRetention),
-            Some(PurgeWork {
+            coalesce_purge_work(&rx, Purge::TableRootRetention, |_| {
+                panic!("no committed payload expected")
+            }),
+            PurgeWork {
                 full_gc: false,
                 table_root_retention: true,
                 dropped_table: true,
-            })
+                stop_after: false,
+            }
         );
 
         let (tx, rx) = flume::unbounded();
         tx.send(Purge::TableRootRetention).unwrap();
-        tx.send(Purge::Next).unwrap();
+        tx.send(Purge::Committed(FastHashMap::default())).unwrap();
         assert_eq!(
-            coalesce_purge_work(&rx, Purge::DroppedTable),
-            Some(PurgeWork::full())
+            coalesce_purge_work(&rx, Purge::DroppedTable, |_| true),
+            PurgeWork::full()
         );
 
         let (tx, rx) = flume::unbounded();
         tx.send(Purge::DroppedTable).unwrap();
         assert_eq!(
-            coalesce_purge_work(&rx, Purge::Next),
-            Some(PurgeWork::full())
+            coalesce_purge_work(&rx, Purge::Committed(FastHashMap::default()), |_| true),
+            PurgeWork::full()
         );
     }
 
     #[test]
     fn test_coalesce_purge_work_stop_wins() {
         let (tx, rx) = flume::unbounded();
-        tx.send(Purge::Next).unwrap();
+        tx.send(Purge::Committed(FastHashMap::default())).unwrap();
         tx.send(Purge::Stop).unwrap();
         tx.send(Purge::TableRootRetention).unwrap();
-        assert_eq!(coalesce_purge_work(&rx, Purge::DroppedTable), None);
-        assert_eq!(coalesce_purge_work(&rx, Purge::Stop), None);
+        assert_eq!(
+            coalesce_purge_work(&rx, Purge::DroppedTable, |_| true),
+            PurgeWork::stop()
+        );
+        assert_eq!(
+            coalesce_purge_work(&rx, Purge::Stop, |_| {
+                panic!("no committed payload expected")
+            }),
+            PurgeWork::stop()
+        );
+    }
+
+    #[test]
+    fn test_coalesce_purge_work_analyzes_committed_before_stop() {
+        let (tx, rx) = flume::unbounded();
+        tx.send(Purge::TableRootRetention).unwrap();
+        tx.send(Purge::Committed(FastHashMap::default())).unwrap();
+        tx.send(Purge::DroppedTable).unwrap();
+        tx.send(Purge::Committed(FastHashMap::default())).unwrap();
+        tx.send(Purge::Stop).unwrap();
+        tx.send(Purge::Committed(FastHashMap::default())).unwrap();
+
+        let mut analyzed = 0usize;
+        let work = coalesce_purge_work(&rx, Purge::Committed(FastHashMap::default()), |_| {
+            analyzed += 1;
+            true
+        });
+
+        assert_eq!(work, PurgeWork::stop());
+        assert_eq!(analyzed, 3);
+    }
+
+    #[test]
+    fn test_coalesce_purge_work_committed_can_request_full_gc() {
+        let (_tx, rx) = flume::unbounded();
+
+        let work = coalesce_purge_work(&rx, Purge::Committed(FastHashMap::default()), |_| true);
+
+        assert_eq!(work, PurgeWork::full());
     }
 
     #[test]
