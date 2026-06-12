@@ -1,7 +1,7 @@
 ---
 id: 000175
 title: Remove Multi-Stream Redo
-status: proposal
+status: implemented
 created: 2026-06-12
 github_issue: 700
 ---
@@ -30,7 +30,7 @@ Issue Labels:
 - codex
 
 Source Backlogs:
-- docs/backlogs/000120-simplify-redo-single-log-stream.md
+- docs/backlogs/closed/000120-simplify-redo-single-log-stream.md
 
 Related context:
 - docs/tasks/000169-fix-failed-precommit-redo-cleanup.md
@@ -188,6 +188,30 @@ shape over migration scaffolding.
 
 ## Implementation Notes
 
+- Implemented the single-stream redo topology: `TransactionSystem` now owns one
+  canonical `RedoLog`, commits route directly to it, transaction payload flow no
+  longer carries a log partition id, recovery replays one stream directly, and
+  catalog checkpoint scanning reads one redo file family.
+- Removed partition-era configuration and durable layout state: `log_partitions`
+  and related constants/config APIs were removed, the storage-layout marker
+  version was bumped, and legacy partitioned redo names/old layout markers are
+  rejected instead of migrated.
+- Replaced partitioned redo file discovery with `discover_redo_log_files`.
+  Discovery now validates single-stream redo names, rejects legacy partitioned
+  names, detects missing file sequence gaps with
+  `DataIntegrityError::RedoLogSequenceGap`, and keeps numeric ascending or
+  descending order.
+- Simplified runtime cleanup around the single redo log: removed dead
+  partition helpers, removed `RedoLog::logs()`, renamed remaining local redo-log
+  variables for clarity, moved `RedoLog` GC methods back into `trx/log.rs`, and
+  changed purge executor send failure handling to an invariant-preserving
+  `expect(...)`.
+- Verified implementation and review follow-ups with:
+  - `cargo fmt`
+  - `cargo clippy -p doradb-storage --all-targets -- -D warnings`
+  - `cargo nextest run -p doradb-storage` (926 passed)
+- Deferred broader transaction background worker ownership redesign to
+  `docs/backlogs/000125-redesign-redo-gc-purge-worker-ownership.md`.
 
 ## Impacts
 
@@ -315,7 +339,13 @@ shape over migration scaffolding.
 
 ## Open Questions
 
-None for the planned scope.
+Follow-up:
+
+- `docs/backlogs/000125-redesign-redo-gc-purge-worker-ownership.md` tracks the
+  broader redo IO, GC analysis, and purge worker ownership redesign that came
+  up during review. This task intentionally did not resolve whether GC analysis
+  should remain a dedicated thread, be grouped with redo IO, or move into purge
+  dispatch.
 
 Resolved decisions:
 
