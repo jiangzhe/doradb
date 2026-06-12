@@ -382,18 +382,16 @@ pub(crate) struct TrxReadProof<'ctx> {
 pub(crate) struct TrxContext {
     status: Arc<SharedTrxStatus>,
     sts: TrxID,
-    log_no: usize,
     gc_no: usize,
 }
 
 impl TrxContext {
-    /// Create a transaction context from session, status, and partition identity.
+    /// Create a transaction context from session, status, and GC bucket identity.
     #[inline]
-    pub(crate) fn new(trx_id: TrxID, sts: TrxID, log_no: usize, gc_no: usize) -> Self {
+    pub(crate) fn new(trx_id: TrxID, sts: TrxID, gc_no: usize) -> Self {
         TrxContext {
             status: Arc::new(SharedTrxStatus::new(trx_id)),
             sts,
-            log_no,
             gc_no,
         }
     }
@@ -423,12 +421,6 @@ impl TrxContext {
     #[inline]
     pub(crate) fn sts(&self) -> TrxID {
         self.sts
-    }
-
-    /// Returns the log partition number assigned to the transaction.
-    #[inline]
-    pub(crate) fn log_no(&self) -> usize {
-        self.log_no
     }
 
     /// Returns the GC bucket number assigned to the transaction.
@@ -1335,16 +1327,10 @@ pub(crate) struct TrxInner {
 
 impl TrxInner {
     #[inline]
-    pub(crate) fn new(
-        trx_id: TrxID,
-        sts: TrxID,
-        log_no: usize,
-        gc_no: usize,
-        session_id: SessionID,
-    ) -> Self {
+    pub(crate) fn new(trx_id: TrxID, sts: TrxID, gc_no: usize, session_id: SessionID) -> Self {
         let owner_group = LockOwnerGroup::Session(session_id);
         TrxInner {
-            ctx: TrxContext::new(trx_id, sts, log_no, gc_no),
+            ctx: TrxContext::new(trx_id, sts, gc_no),
             effects: TrxEffects::empty(),
             table_cache: FastHashMap::default(),
             lock_state: Some(OwnerLockState::new_grouped(
@@ -1527,12 +1513,6 @@ impl TrxInner {
         self.ctx().sts()
     }
 
-    /// Returns the log partition number assigned to this transaction.
-    #[inline]
-    pub(crate) fn log_no(&self) -> usize {
-        self.ctx().log_no()
-    }
-
     /// Returns the GC bucket number assigned to this transaction.
     #[inline]
     pub(crate) fn gc_no(&self) -> usize {
@@ -1656,7 +1636,6 @@ impl TrxInner {
                 payload: Some(PreparedTrxPayload {
                     status: self.ctx.status(),
                     sts: self.ctx.sts(),
-                    log_no: self.ctx.log_no(),
                     gc_no: self.ctx.gc_no(),
                     row_undo: RowUndoLogs::empty(),
                     index_undo: IndexUndoLogs::empty(),
@@ -1683,7 +1662,6 @@ impl TrxInner {
             payload: Some(PreparedTrxPayload {
                 status: self.ctx.status(),
                 sts: self.ctx.sts(),
-                log_no: self.ctx.log_no(),
                 gc_no: self.ctx.gc_no(),
                 row_undo,
                 index_undo,
@@ -1759,7 +1737,6 @@ fn release_carried_transaction_locks(
 pub(crate) struct PreparedTrxPayload {
     status: Arc<SharedTrxStatus>,
     sts: TrxID,
-    log_no: usize,
     gc_no: usize,
     row_undo: RowUndoLogs,
     index_undo: IndexUndoLogs,
@@ -1825,7 +1802,6 @@ impl PreparedTrx {
             Some(PreparedTrxPayload {
                 status,
                 sts,
-                log_no,
                 gc_no,
                 row_undo,
                 index_undo,
@@ -1840,7 +1816,6 @@ impl PreparedTrx {
                     payload: Some(PrecommitTrxPayload {
                         status,
                         sts,
-                        log_no,
                         gc_no,
                         row_undo,
                         index_undo,
@@ -1889,7 +1864,6 @@ impl Drop for PreparedTrx {
 pub(in crate::trx) struct PrecommitTrxPayload {
     status: Arc<SharedTrxStatus>,
     sts: TrxID,
-    log_no: usize,
     gc_no: usize,
     row_undo: RowUndoLogs,
     /// Rollback-capable index undo retained until redo durability succeeds.
@@ -1923,7 +1897,7 @@ impl PrecommitTrxPayload {
     #[inline]
     fn gc_analyze_rollback(&self, attachment: &TrxAttachment) {
         let trx_sys = &attachment.engine().trx_sys;
-        trx_sys.log_partitions[self.log_no].gc_buckets[self.gc_no].gc_analyze_rollback(self.sts);
+        trx_sys.redo_log.gc_buckets[self.gc_no].gc_analyze_rollback(self.sts);
     }
 
     #[inline]
@@ -1977,7 +1951,6 @@ impl PrecommitTrx {
             Some(PrecommitTrxPayload {
                 status,
                 sts,
-                log_no: _,
                 gc_no,
                 row_undo,
                 mut index_undo,
@@ -2290,7 +2263,6 @@ pub(crate) mod tests {
             MIN_ACTIVE_TRX_ID + 100,
             TrxID::new(100),
             0,
-            0,
             SessionID::new(100),
         ));
         let inner = entry
@@ -2327,7 +2299,6 @@ pub(crate) mod tests {
             let trx = session.begin_trx().unwrap();
             let entry = transaction_entry(&trx);
             let sts = trx.sts();
-            let log_no = transaction_log_no(&trx);
             let gc_no = transaction_gc_no(&trx);
 
             assert_eq!(
@@ -2341,8 +2312,7 @@ pub(crate) mod tests {
                 0
             );
 
-            engine.inner().trx_sys.log_partitions[log_no].gc_buckets[gc_no]
-                .gc_analyze_rollback(sts);
+            engine.inner().trx_sys.redo_log.gc_buckets[gc_no].gc_analyze_rollback(sts);
             engine
                 .inner()
                 .session_registry
@@ -2434,16 +2404,6 @@ pub(crate) mod tests {
     }
 
     #[inline]
-    fn transaction_log_no(trx: &Transaction) -> usize {
-        with_transaction_inner(
-            trx,
-            "query test transaction log partition",
-            TrxInner::log_no,
-        )
-        .expect("test transaction must be active")
-    }
-
-    #[inline]
     fn transaction_gc_no(trx: &Transaction) -> usize {
         with_transaction_inner(trx, "query test transaction GC bucket", TrxInner::gc_no)
             .expect("test transaction must be active")
@@ -2492,8 +2452,7 @@ pub(crate) mod tests {
             && let Some(attachment) = prepared.attachment.as_ref()
         {
             let trx_sys = &attachment.engine().trx_sys;
-            trx_sys.log_partitions[payload.log_no].gc_buckets[payload.gc_no]
-                .gc_analyze_rollback(payload.sts);
+            trx_sys.redo_log.gc_buckets[payload.gc_no].gc_analyze_rollback(payload.sts);
         }
         prepared.redo_bin.take();
         if let Some(attachment) = prepared.attachment.take() {
@@ -2503,25 +2462,19 @@ pub(crate) mod tests {
     }
 
     #[inline]
-    fn finish_production_committed_for_test(
-        engine: &Engine,
-        log_no: usize,
-        committed: CommittedTrx,
-    ) {
+    fn finish_production_committed_for_test(engine: &Engine, committed: CommittedTrx) {
         if let Some(gc_no) = committed.gc_no() {
-            engine.inner().trx_sys.log_partitions[log_no].gc_buckets[gc_no]
-                .gc_analyze_commit(vec![committed]);
+            engine.inner().trx_sys.redo_log.gc_buckets[gc_no].gc_analyze_commit(vec![committed]);
         }
     }
 
     #[inline]
     fn discard_production_transaction_after_fatal_rollback(trx: &mut Transaction) {
         let sts = trx.sts();
-        let log_no = transaction_log_no(trx);
         let gc_no = transaction_gc_no(trx);
         let engine = trx.engine().expect("test transaction must have engine");
         discard_transaction_after_fatal_rollback(trx);
-        engine.trx_sys.log_partitions[log_no].gc_buckets[gc_no].gc_analyze_rollback(sts);
+        engine.trx_sys.redo_log.gc_buckets[gc_no].gc_analyze_rollback(sts);
     }
 
     /// Add one redo log entry for tests that need a non-readonly transaction.
@@ -2763,7 +2716,6 @@ pub(crate) mod tests {
             let (_temp_dir, engine) = test_engine("redo_trx_readonly_prepare").await;
             let (_session, trx) = begin_production_test_transaction(&engine);
             let expected_sts = trx.sts();
-            let expected_log_no = transaction_log_no(&trx);
             let expected_gc_no = transaction_gc_no(&trx);
 
             let prepared = prepare_transaction(trx).unwrap();
@@ -2772,7 +2724,6 @@ pub(crate) mod tests {
             assert!(!prepared.require_ordered_commit());
             let payload = prepared.payload.as_ref().unwrap();
             assert_eq!(payload.sts, expected_sts);
-            assert_eq!(payload.log_no, expected_log_no);
             assert_eq!(payload.gc_no, expected_gc_no);
             assert!(payload.row_undo.is_empty());
             assert!(payload.index_undo.is_empty());
@@ -2803,7 +2754,6 @@ pub(crate) mod tests {
             })
             .unwrap();
             let expected_sts = trx.sts();
-            let expected_log_no = transaction_log_no(&trx);
             let expected_gc_no = transaction_gc_no(&trx);
 
             let prepared = prepare_transaction(trx).unwrap();
@@ -2812,7 +2762,6 @@ pub(crate) mod tests {
             assert!(prepared.require_ordered_commit());
             let payload = prepared.payload.as_ref().unwrap();
             assert_eq!(payload.sts, expected_sts);
-            assert_eq!(payload.log_no, expected_log_no);
             assert_eq!(payload.gc_no, expected_gc_no);
             assert_eq!(payload.row_undo.len(), 1);
             assert_eq!(payload.index_undo.len(), 1);
@@ -2839,7 +2788,6 @@ pub(crate) mod tests {
             let precommit = prepare_transaction(trx)
                 .unwrap()
                 .fill_cts(TrxID::new(91_247));
-            let log_no = precommit.payload.as_ref().unwrap().log_no;
             let payload = precommit.payload.as_ref().unwrap();
             assert_eq!(payload.index_undo.len(), 1);
 
@@ -2848,7 +2796,7 @@ pub(crate) mod tests {
             assert_eq!(index_gc.len(), 1);
             assert_eq!(index_gc[0].table_id, TableID::new(11));
             assert_eq!(index_gc[0].row_id, RowID::new(22));
-            finish_production_committed_for_test(&engine, log_no, committed);
+            finish_production_committed_for_test(&engine, committed);
         });
     }
 

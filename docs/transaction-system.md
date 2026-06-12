@@ -284,7 +284,7 @@ runtime execution.
      that case it enters the commit ordering path but writes no log bytes.
 2. **Log and Order**:
    - Durability-required transactions serialize their redo and append it to the
-     global commit log before becoming committed.
+     single global commit log before becoming committed.
    - Ordered-only transactions use the same commit-order barrier without
      manufacturing empty redo records.
    - Transactions with no effects are discarded through the readonly/no-op path

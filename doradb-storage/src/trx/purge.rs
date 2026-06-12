@@ -10,7 +10,6 @@ use crate::quiescent::{QuiescentGuard, SyncQuiescentGuard};
 use crate::row::RowPage;
 use crate::table::Table;
 use crate::thread;
-use crate::trx::log::LogPartition;
 use crate::trx::row::RowWriteAccess;
 use crate::trx::sys::TransactionSystem;
 use crate::trx::undo::{OwnedRowUndo, RowUndoKind};
@@ -254,12 +253,7 @@ impl TransactionSystem {
         // upperbound, we may clear the new transaction incorrectly.
         let max_active_sts = TrxID::new(self.ts.load(Ordering::SeqCst));
         // then, load actual minimum active STS from all GC buckets.
-        let mut min_ts = MAX_SNAPSHOT_TS;
-        for partition in &*self.log_partitions {
-            let ts = partition.min_active_sts();
-            min_ts = min_ts.min(ts);
-        }
-        min_ts.min(max_active_sts)
+        self.redo_log.min_active_sts().min(max_active_sts)
     }
 
     #[inline]
@@ -302,12 +296,10 @@ impl TransactionSystem {
         &self,
         catalog: &Catalog,
         guards: &PoolGuards,
-        log_no: usize,
         trx_list: Vec<CommittedTrx>,
         min_active_sts: TrxID,
     ) -> Result<FastHashSet<PageID>> {
         let res: Result<FastHashSet<PageID>> = async {
-            let partition = &self.log_partitions[log_no];
             let mut table_cache = TableCache::new(catalog);
             let purge_trx_count = trx_list.len();
             let mut purge_row_count = 0;
@@ -391,15 +383,15 @@ impl TransactionSystem {
 
             drop(trx_list);
 
-            partition
+            self.redo_log
                 .stats
                 .purge_trx_count
                 .fetch_add(purge_trx_count, Ordering::Relaxed);
-            partition
+            self.redo_log
                 .stats
                 .purge_row_count
                 .fetch_add(purge_row_count, Ordering::Relaxed);
-            partition
+            self.redo_log
                 .stats
                 .purge_index_count
                 .fetch_add(purge_index_count, Ordering::Relaxed);
@@ -582,37 +574,6 @@ impl ActiveStsList {
         let res = self.deleted.insert(value);
         debug_assert!(res);
         first
-    }
-}
-
-impl LogPartition {
-    /// Execute GC analysis in loop.
-    /// This method is used for a separate GC analyzer thread for each log partition.
-    #[inline]
-    pub(crate) fn gc_loop(&self, gc_rx: Receiver<GC>, purge_chan: Sender<Purge>) {
-        while let Ok(msg) = gc_rx.recv() {
-            match msg {
-                GC::Stop => return,
-                GC::Commit(trx_list) => {
-                    let min_active_sts_may_change = self.gc_analyze(trx_list);
-                    if min_active_sts_may_change {
-                        let _ = purge_chan.send(Purge::Next);
-                    }
-                }
-            }
-        }
-    }
-
-    /// Analyze committed transaction and modify active sts list and committed transaction list.
-    /// Returns whether min_active_sts may change.
-    #[inline]
-    fn gc_analyze(&self, trx_list: FastHashMap<usize, Vec<CommittedTrx>>) -> bool {
-        let mut changed = false;
-        for (gc_no, trx_list) in trx_list {
-            let gc_bucket = &self.gc_buckets[gc_no];
-            changed |= gc_bucket.gc_analyze_commit(trx_list);
-        }
-        changed
     }
 }
 
@@ -800,7 +761,6 @@ fn coalesce_purge_work(purge_chan: &Receiver<Purge>, initial: Purge) -> Option<P
 }
 
 struct PurgeTask {
-    log_no: usize,
     gc_no: usize,
     min_active_sts: TrxID,
     done: Sender<Result<()>>,
@@ -840,24 +800,21 @@ impl PurgeLoop for PurgeSingleThreaded {
             };
             let curr_sts = trx_sys.calc_min_active_sts_for_gc();
             if work.full_gc && curr_sts > min_sts {
-                // Start GC. Purge undo/index for all partitions first, then
-                // deallocate retired row pages once to avoid cross-partition ordering issue.
+                // Start GC. Purge undo/index first, then deallocate retired
+                // row pages once all bucket lists have been collected.
                 let mut gc_row_pages = FastHashSet::default();
-                for partition in &*trx_sys.log_partitions {
-                    let mut trx_list = vec![];
-                    for gc_bucket in &partition.gc_buckets {
-                        gc_bucket.get_purge_list(curr_sts, &mut trx_list);
-                    }
-                    let log_no = partition.log_no;
-                    let partition_gc_pages = match trx_sys
-                        .purge_trx_list(catalog, &pool_guards, log_no, trx_list, curr_sts)
-                        .await
-                    {
-                        Ok(gc_pages) => gc_pages,
-                        Err(_) => return,
-                    };
-                    gc_row_pages.extend(partition_gc_pages);
+                let mut trx_list = vec![];
+                for gc_bucket in &trx_sys.redo_log.gc_buckets {
+                    gc_bucket.get_purge_list(curr_sts, &mut trx_list);
                 }
+                let bucket_gc_pages = match trx_sys
+                    .purge_trx_list(catalog, &pool_guards, trx_list, curr_sts)
+                    .await
+                {
+                    Ok(gc_pages) => gc_pages,
+                    Err(_) => return,
+                };
+                gc_row_pages.extend(bucket_gc_pages);
                 if !handle_gc_row_page_deallocation_result(
                     trx_sys,
                     trx_sys
@@ -919,21 +876,18 @@ impl PurgeLoop for PurgeDispatcher {
                 let (done_tx, done_rx) = flume::unbounded();
                 let mut expected_tasks = 0usize;
                 let gc_row_pages = Arc::new(Mutex::new(vec![]));
-                for partition in &*trx_sys.log_partitions {
-                    let log_no = partition.log_no;
-                    for gc_no in 0..partition.gc_buckets.len() {
-                        let task = PurgeTask {
-                            log_no,
-                            gc_no,
-                            min_active_sts: curr_sts,
-                            done: done_tx.clone(),
-                            gc_row_pages: Arc::clone(&gc_row_pages),
-                        };
-                        if self.0[dispatch_no % self.0.len()].send(task).is_ok() {
-                            expected_tasks += 1;
-                        }
-                        dispatch_no += 1;
-                    }
+                for gc_no in 0..trx_sys.redo_log.gc_buckets.len() {
+                    let task = PurgeTask {
+                        gc_no,
+                        min_active_sts: curr_sts,
+                        done: done_tx.clone(),
+                        gc_row_pages: Arc::clone(&gc_row_pages),
+                    };
+                    self.0[dispatch_no % self.0.len()].send(task).expect(
+                        "purge executor receiver must stay alive while dispatcher owns sender",
+                    );
+                    expected_tasks += 1;
+                    dispatch_no += 1;
                 }
                 drop(done_tx);
                 // wait for all executors to finish their tasks in this cycle.
@@ -1005,7 +959,6 @@ impl PurgeExecutor {
         purge_chan: Receiver<PurgeTask>,
     ) {
         while let Ok(PurgeTask {
-            log_no,
             gc_no,
             min_active_sts,
             done,
@@ -1013,11 +966,10 @@ impl PurgeExecutor {
         }) = purge_chan.recv()
         {
             let mut trx_list = vec![];
-            let partition = &trx_sys.log_partitions[log_no];
-            partition.gc_buckets[gc_no].get_purge_list(min_active_sts, &mut trx_list);
+            trx_sys.redo_log.gc_buckets[gc_no].get_purge_list(min_active_sts, &mut trx_list);
             // actual purge here
             let res = trx_sys
-                .purge_trx_list(catalog, &pool_guards, log_no, trx_list, min_active_sts)
+                .purge_trx_list(catalog, &pool_guards, trx_list, min_active_sts)
                 .await;
             match res {
                 Ok(gc_pages) => {
@@ -1360,7 +1312,7 @@ mod tests {
             let err = engine
                 .inner()
                 .trx_sys
-                .purge_trx_list(engine.catalog(), &guards, 0, vec![trx], MAX_SNAPSHOT_TS)
+                .purge_trx_list(engine.catalog(), &guards, vec![trx], MAX_SNAPSHOT_TS)
                 .await
                 .unwrap_err();
             assert_eq!(
@@ -1449,13 +1401,7 @@ mod tests {
                 engine
                     .inner()
                     .trx_sys
-                    .purge_trx_list(
-                        engine.catalog(),
-                        &pool_guards,
-                        0,
-                        vec![trx],
-                        MAX_SNAPSHOT_TS,
-                    )
+                    .purge_trx_list(engine.catalog(), &pool_guards, vec![trx], MAX_SNAPSHOT_TS)
                     .await
                     .unwrap();
             }
@@ -1539,13 +1485,7 @@ mod tests {
                 engine
                     .inner()
                     .trx_sys
-                    .purge_trx_list(
-                        engine.catalog(),
-                        &pool_guards,
-                        0,
-                        vec![trx],
-                        MAX_SNAPSHOT_TS,
-                    )
+                    .purge_trx_list(engine.catalog(), &pool_guards, vec![trx], MAX_SNAPSHOT_TS)
                     .await
                     .unwrap();
             }
@@ -1656,13 +1596,7 @@ mod tests {
                 engine
                     .inner()
                     .trx_sys
-                    .purge_trx_list(
-                        engine.catalog(),
-                        &pool_guards,
-                        0,
-                        vec![trx],
-                        MAX_SNAPSHOT_TS,
-                    )
+                    .purge_trx_list(engine.catalog(), &pool_guards, vec![trx], MAX_SNAPSHOT_TS)
                     .await
                     .unwrap();
             }
@@ -1769,13 +1703,7 @@ mod tests {
                 engine
                     .inner()
                     .trx_sys
-                    .purge_trx_list(
-                        engine.catalog(),
-                        &pool_guards,
-                        0,
-                        vec![trx],
-                        MAX_SNAPSHOT_TS,
-                    )
+                    .purge_trx_list(engine.catalog(), &pool_guards, vec![trx], MAX_SNAPSHOT_TS)
                     .await
                     .unwrap();
             }

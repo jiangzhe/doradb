@@ -2,11 +2,11 @@ use crate::error::{DataIntegrityError, Result};
 use crate::io::{DirectBuf, IOBuf};
 use crate::io::{STORAGE_SECTOR_SIZE, align_to_sector_size};
 use crate::serde::{Deser, LenPrefixPod, Ser, Serde};
-use crate::trx::log::LogPartitionInitializer;
+use crate::trx::log::RedoLogInitializer;
 use crate::trx::redo::{RedoHeader, RedoLogs};
 use error_stack::Report;
 use memmap2::Mmap;
-use std::collections::{BinaryHeap, VecDeque};
+use std::collections::VecDeque;
 use std::fs::File;
 use std::mem;
 use std::ops::{Deref, DerefMut};
@@ -155,13 +155,13 @@ impl LogGroup<'_> {
     }
 }
 
-pub(crate) struct LogPartitionStream {
-    pub(super) initializer: LogPartitionInitializer,
+pub(crate) struct RedoLogStream {
+    pub(super) initializer: RedoLogInitializer,
     pub(super) reader: Option<MmapLogReader>,
     pub(super) buffer: VecDeque<TrxLog>,
 }
 
-impl Deref for LogPartitionStream {
+impl Deref for RedoLogStream {
     type Target = VecDeque<TrxLog>;
     #[inline]
     fn deref(&self) -> &Self::Target {
@@ -169,7 +169,7 @@ impl Deref for LogPartitionStream {
     }
 }
 
-impl LogPartitionStream {
+impl RedoLogStream {
     #[inline]
     pub(crate) fn fill_buffer(&mut self) -> Result<()> {
         loop {
@@ -201,15 +201,6 @@ impl LogPartitionStream {
     }
 
     #[inline]
-    pub(crate) fn fill_if_empty(&mut self) -> Result<bool> {
-        if !self.is_empty() {
-            return Ok(true);
-        }
-        self.fill_buffer()?;
-        Ok(!self.is_empty())
-    }
-
-    #[inline]
     pub(crate) fn pop(&mut self) -> Result<Option<TrxLog>> {
         match self.buffer.pop_front() {
             res @ Some(_) => Ok(res),
@@ -221,83 +212,10 @@ impl LogPartitionStream {
     }
 
     #[inline]
-    pub(super) fn into_initializer(self) -> LogPartitionInitializer {
+    pub(super) fn into_initializer(self) -> RedoLogInitializer {
         debug_assert!(self.reader.is_none());
         debug_assert!(self.buffer.is_empty());
         self.initializer
-    }
-}
-
-impl PartialEq for LogPartitionStream {
-    #[inline]
-    fn eq(&self, other: &Self) -> bool {
-        debug_assert!(!self.is_empty());
-        debug_assert!(!other.is_empty());
-        self.buffer[0].header.cts == other.buffer[0].header.cts
-    }
-}
-
-impl Eq for LogPartitionStream {}
-
-impl Ord for LogPartitionStream {
-    #[inline]
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        debug_assert!(!self.is_empty());
-        debug_assert!(!other.is_empty());
-        // ordered by CTS in ascending order.
-        // so we need to reverse the comparison.
-        other.buffer[0].header.cts.cmp(&self.buffer[0].header.cts)
-    }
-}
-
-impl PartialOrd for LogPartitionStream {
-    #[inline]
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-#[derive(Default)]
-pub(crate) struct LogMerger {
-    heap: BinaryHeap<LogPartitionStream>,
-    finished: Vec<LogPartitionStream>,
-}
-
-impl LogMerger {
-    #[inline]
-    pub(crate) fn add_stream(&mut self, mut stream: LogPartitionStream) -> Result<()> {
-        // before put the stream into priority queue, make sure there is
-        // at least one log entry.
-        if stream.fill_if_empty()? {
-            self.heap.push(stream);
-        } else {
-            // log stream is empty.
-            self.finished.push(stream);
-        }
-        Ok(())
-    }
-
-    #[inline]
-    pub(crate) fn try_next(&mut self) -> Result<Option<TrxLog>> {
-        match self.heap.pop() {
-            Some(mut stream) => {
-                let res = stream.pop()?;
-                if stream.fill_if_empty()? {
-                    // some logs remaining in the buffer, so put into heap again.
-                    self.heap.push(stream);
-                } else {
-                    // all logs are processed, put this stream into finish list.
-                    self.finished.push(stream);
-                }
-                Ok(res)
-            }
-            None => Ok(None),
-        }
-    }
-
-    #[inline]
-    pub(crate) fn finished_streams(self) -> Vec<LogPartitionStream> {
-        self.finished
     }
 }
 

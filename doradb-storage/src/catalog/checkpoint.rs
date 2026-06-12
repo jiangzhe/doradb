@@ -5,8 +5,7 @@ use crate::catalog::{
 };
 use crate::error::{ErrorKind, FatalError, Result};
 use crate::id::{TableID, TrxID};
-use crate::trx::log::{LogPartitionInitializer, list_log_files};
-use crate::trx::log_replay::LogMerger;
+use crate::trx::log::{RedoLogInitializer, discover_redo_log_files};
 use crate::trx::redo::{DDLRedo, RowRedoKind, TableDML};
 use crate::trx::sys::TransactionSystem;
 use event_listener::{Event, listener};
@@ -50,7 +49,6 @@ pub(crate) struct CatalogCheckpointBatch {
 #[derive(Clone)]
 pub(crate) struct CatalogCheckpointScanConfig {
     pub(crate) file_prefix: String,
-    pub(crate) log_partitions: usize,
     pub(crate) io_depth_per_log: usize,
     pub(crate) log_file_max_size: usize,
     pub(crate) max_io_size: usize,
@@ -280,7 +278,7 @@ impl Catalog {
     /// Scan persisted redo logs and collect one safe catalog checkpoint batch.
     ///
     /// This call satisfies the persisted-watermark precondition by using the
-    /// global durable watermark across all log partitions.
+    /// durable watermark from the single redo log.
     ///
     /// Scanned batches are intended for single-flight publish flow and must not
     /// be raced with other catalog checkpoint publishes against the same shared
@@ -321,27 +319,20 @@ impl Catalog {
             return Ok(batch);
         }
 
-        // Build a merged CTS-ordered stream over all log partitions. Missing
-        // partitions simply contribute no records to this checkpoint batch.
-        let mut log_merger = LogMerger::default();
-        for log_no in 0..scan_cfg.log_partitions {
-            let logs = list_log_files(&scan_cfg.file_prefix, log_no, false)?;
-            if logs.is_empty() {
-                continue;
-            }
-            let stream = LogPartitionInitializer::recovery(
-                scan_cfg.file_prefix.clone(),
-                log_no,
-                scan_cfg.io_depth_per_log,
-                scan_cfg.log_file_max_size,
-                scan_cfg.max_io_size,
-                logs,
-            )?
-            .stream();
-            log_merger.add_stream(stream)?;
+        let logs = discover_redo_log_files(&scan_cfg.file_prefix, false)?;
+        if logs.is_empty() {
+            return Ok(batch);
         }
+        let mut log_stream = RedoLogInitializer::recovery(
+            scan_cfg.file_prefix.clone(),
+            scan_cfg.io_depth_per_log,
+            scan_cfg.log_file_max_size,
+            scan_cfg.max_io_size,
+            logs,
+        )?
+        .stream();
 
-        while let Some(log) = log_merger.try_next()? {
+        while let Some(log) = log_stream.pop()? {
             let (header, redo) = log.into_inner();
             if header.cts < replay_start_ts {
                 // Older records are already represented by the current
