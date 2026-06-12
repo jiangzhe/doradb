@@ -1131,6 +1131,12 @@ impl TrxCompletionClaim {
     pub(crate) fn into_parts(self) -> (Arc<TrxEntry>, TrxInner, TrxAttachment) {
         (self.entry, self.inner, self.attachment)
     }
+
+    /// Returns the engine retained by this terminal or cleanup claim.
+    #[inline]
+    pub(crate) fn engine(&self) -> &EngineRef {
+        self.attachment.engine()
+    }
 }
 
 /// Reason an abandoned transaction cleanup job was queued.
@@ -2181,7 +2187,7 @@ pub(crate) mod tests {
     use std::io;
     use std::sync::atomic::AtomicUsize;
     use std::sync::{Arc, mpsc};
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
     use tempfile::TempDir;
 
     async fn test_engine(log_file_stem: &str) -> (TempDir, Engine) {
@@ -2640,6 +2646,64 @@ pub(crate) mod tests {
             .iter()
             .filter(|entry| entry.owner == owner)
             .count()
+    }
+
+    fn wait_until(mut done: impl FnMut() -> bool, message: &'static str) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !done() {
+            assert!(Instant::now() < deadline, "{message}");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    fn terminal_rollback_hook_test_lock() -> &'static std::sync::Mutex<()> {
+        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| std::sync::Mutex::new(()))
+    }
+
+    type TerminalRollbackRelease = Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>;
+
+    fn install_blocking_terminal_rollback_hook(
+        target_trx_id: TrxID,
+        target_operation: &'static str,
+    ) -> (
+        crate::trx::sys::tests::TerminalRollbackTestHookGuard,
+        mpsc::Receiver<&'static str>,
+        TerminalRollbackRelease,
+    ) {
+        let (started_tx, started_rx) = mpsc::channel();
+        let release = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let hook_release = Arc::clone(&release);
+        let hook: Arc<dyn Fn(TrxID, &'static str) + Send + Sync> =
+            Arc::new(move |trx_id, operation| {
+                if trx_id != target_trx_id || operation != target_operation {
+                    return;
+                }
+                started_tx
+                    .send(operation)
+                    .expect("terminal rollback hook should report start");
+                let (released, cvar) = &*hook_release;
+                let released = released
+                    .lock()
+                    .expect("terminal rollback release mutex should not be poisoned");
+                let (released, timeout) = cvar
+                    .wait_timeout_while(released, Duration::from_secs(5), |released| !*released)
+                    .expect("terminal rollback release wait should not be poisoned");
+                assert!(
+                    *released && !timeout.timed_out(),
+                    "terminal rollback test hook was not released"
+                );
+            });
+        let guard = crate::trx::sys::tests::install_terminal_rollback_test_hook(hook);
+        (guard, started_rx, release)
+    }
+
+    fn release_terminal_rollback_hook(release: &TerminalRollbackRelease) {
+        let (released, cvar) = &**release;
+        *released
+            .lock()
+            .expect("terminal rollback release mutex should not be poisoned") = true;
+        cvar.notify_all();
     }
 
     fn has_lock_entry(
@@ -3363,6 +3427,231 @@ pub(crate) mod tests {
             assert!(precommit.rollback_failed_precommit().await);
             assert_eq!(lock_entry_count(&engine, owner), 0);
             assert!(!session.in_trx().unwrap());
+        });
+    }
+
+    #[test]
+    fn test_dropped_terminal_rollback_waiter_completes_worker_cleanup() {
+        let _hook_lock = terminal_rollback_hook_test_lock().lock().unwrap();
+        smol::block_on(async {
+            let (_temp_dir, engine) = test_engine("trx_terminal_rollback_cancel").await;
+            let table_id = catalog_tests::table2(&engine).await;
+            let mut session = engine.new_session().unwrap();
+            let mut trx = session.begin_trx().unwrap();
+            let entry = transaction_entry(&trx);
+            let trx_id = trx.trx_id();
+            let owner = lock_owner(&trx).unwrap();
+            trx.exec(async |stmt| {
+                stmt.table_insert_mvcc(
+                    table_id,
+                    vec![Val::from(91_270i32), Val::from("terminal-rollback")],
+                )
+                .await?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+            assert!(lock_entry_count(&engine, owner) > 0);
+
+            let (_hook, started_rx, release) =
+                install_blocking_terminal_rollback_hook(trx_id, "rollback active transaction");
+            let mut rollback = Box::pin(trx.rollback());
+            assert!(matches!(
+                futures::poll!(rollback.as_mut()),
+                std::task::Poll::Pending
+            ));
+            assert_eq!(
+                started_rx
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("terminal rollback worker should start"),
+                "rollback active transaction"
+            );
+            assert_eq!(entry.inspect_state(), TrxEntryState::RollingBack);
+            assert!(session.in_trx().unwrap());
+
+            drop(rollback);
+            release_terminal_rollback_hook(&release);
+            wait_until(
+                || {
+                    !session.in_trx().unwrap()
+                        && entry.inspect_state() == TrxEntryState::Terminal
+                        && lock_entry_count(&engine, owner) == 0
+                },
+                "terminal rollback cleanup did not finish after waiter drop",
+            );
+            engine.shutdown().unwrap();
+        });
+    }
+
+    #[test]
+    fn test_terminal_rollback_blocks_shutdown_after_waiter_drop() {
+        let _hook_lock = terminal_rollback_hook_test_lock().lock().unwrap();
+        smol::block_on(async {
+            let (_temp_dir, engine) = test_engine("trx_terminal_rollback_shutdown").await;
+            let table_id = catalog_tests::table2(&engine).await;
+            let mut session = engine.new_session().unwrap();
+            let mut trx = session.begin_trx().unwrap();
+            let entry = transaction_entry(&trx);
+            let trx_id = trx.trx_id();
+            trx.exec(async |stmt| {
+                stmt.table_insert_mvcc(
+                    table_id,
+                    vec![Val::from(91_271i32), Val::from("terminal-shutdown")],
+                )
+                .await?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+            let (_hook, started_rx, release) =
+                install_blocking_terminal_rollback_hook(trx_id, "rollback active transaction");
+            let mut rollback = Box::pin(trx.rollback());
+            assert!(matches!(
+                futures::poll!(rollback.as_mut()),
+                std::task::Poll::Pending
+            ));
+            started_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("terminal rollback worker should start");
+            drop(rollback);
+
+            std::thread::scope(|scope| {
+                let (done_tx, done_rx) = mpsc::channel();
+                let shutdown_engine = &engine;
+                let shutdown = scope.spawn(move || {
+                    shutdown_engine.shutdown().unwrap();
+                    done_tx.send(()).expect("shutdown should report completion");
+                });
+
+                assert!(
+                    done_rx.recv_timeout(Duration::from_millis(20)).is_err(),
+                    "shutdown must wait for worker-owned terminal rollback"
+                );
+                release_terminal_rollback_hook(&release);
+                done_rx
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("shutdown should finish after rollback cleanup");
+                shutdown.join().unwrap();
+            });
+            assert_eq!(entry.inspect_state(), TrxEntryState::Terminal);
+            drop(session);
+        });
+    }
+
+    #[test]
+    fn test_duplicate_abandoned_cleanup_cannot_claim_terminal_rollback() {
+        let _hook_lock = terminal_rollback_hook_test_lock().lock().unwrap();
+        smol::block_on(async {
+            let (_temp_dir, engine) = test_engine("trx_terminal_rollback_duplicate").await;
+            let table_id = catalog_tests::table2(&engine).await;
+            let mut session = engine.new_session().unwrap();
+            let mut trx = session.begin_trx().unwrap();
+            let entry = transaction_entry(&trx);
+            let trx_id = trx.trx_id();
+            let session_id = trx.session_id;
+            trx.exec(async |stmt| {
+                stmt.table_insert_mvcc(
+                    table_id,
+                    vec![Val::from(91_272i32), Val::from("terminal-duplicate")],
+                )
+                .await?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+            let (_hook, started_rx, release) =
+                install_blocking_terminal_rollback_hook(trx_id, "rollback active transaction");
+            let mut rollback = Box::pin(trx.rollback());
+            assert!(matches!(
+                futures::poll!(rollback.as_mut()),
+                std::task::Poll::Pending
+            ));
+            started_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("terminal rollback worker should start");
+            assert_eq!(entry.inspect_state(), TrxEntryState::RollingBack);
+
+            let engine_ref = engine.new_ref().unwrap();
+            let (duplicate_entry, duplicate_session) = engine_ref
+                .session_registry
+                .resolve_trx(session_id, trx_id, "test duplicate cleanup claim")
+                .expect("rolling-back transaction should remain registry-visible");
+            let duplicate_attachment = TrxAttachment::new(engine_ref, duplicate_session, trx_id);
+            assert!(
+                TrxCompletionClaim::cleanup(
+                    duplicate_entry,
+                    duplicate_attachment,
+                    "test duplicate cleanup claim"
+                )
+                .is_err(),
+                "abandoned cleanup must not claim a rolling-back terminal transaction"
+            );
+
+            drop(rollback);
+            release_terminal_rollback_hook(&release);
+            wait_until(
+                || !session.in_trx().unwrap() && entry.inspect_state() == TrxEntryState::Terminal,
+                "terminal rollback cleanup did not finish after duplicate cleanup attempt",
+            );
+            engine.shutdown().unwrap();
+        });
+    }
+
+    #[test]
+    fn test_dropped_commit_waiter_after_pre_handoff_rollback_still_cleans_up() {
+        let _hook_lock = terminal_rollback_hook_test_lock().lock().unwrap();
+        smol::block_on(async {
+            let (_temp_dir, engine) = test_engine("trx_commit_pre_handoff_cancel").await;
+            let table_id = catalog_tests::table2(&engine).await;
+            let mut session = engine.new_session().unwrap();
+            let mut trx = session.begin_trx().unwrap();
+            let entry = transaction_entry(&trx);
+            let trx_id = trx.trx_id();
+            let owner = lock_owner(&trx).unwrap();
+            trx.exec(async |stmt| {
+                stmt.table_insert_mvcc(
+                    table_id,
+                    vec![Val::from(91_273i32), Val::from("pre-handoff-rollback")],
+                )
+                .await?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+            assert!(lock_entry_count(&engine, owner) > 0);
+
+            let (_hook, started_rx, release) =
+                install_blocking_terminal_rollback_hook(trx_id, "rollback poisoned commit");
+            let _ = engine.inner().trx_sys.poison_storage(FatalError::RedoWrite);
+            let mut commit = Box::pin(trx.commit());
+            assert!(matches!(
+                futures::poll!(commit.as_mut()),
+                std::task::Poll::Pending
+            ));
+            assert_eq!(
+                started_rx
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("poisoned commit rollback worker should start"),
+                "rollback poisoned commit"
+            );
+            assert!(matches!(
+                entry.inspect_state(),
+                TrxEntryState::Committing | TrxEntryState::RollingBack
+            ));
+
+            drop(commit);
+            release_terminal_rollback_hook(&release);
+            wait_until(
+                || {
+                    !session.in_trx().unwrap()
+                        && entry.inspect_state() == TrxEntryState::Terminal
+                        && lock_entry_count(&engine, owner) == 0
+                },
+                "poisoned commit rollback cleanup did not finish after waiter drop",
+            );
+            engine.shutdown().unwrap();
         });
     }
 

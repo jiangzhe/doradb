@@ -168,6 +168,14 @@ transaction handle never rolls back inline; it marks the matching active entry
 abandoned and queues transaction-system cleanup when the engine is still
 reachable.
 
+After explicit rollback claims terminal ownership and publishes `RollingBack`,
+the claimed transaction core, undo buffers, locks, and session cleanup
+attachment are handed to the transaction-system cleanup worker before rollback
+awaits row or index storage work. The public `rollback().await` future only
+waits on the worker-owned completion cell; dropping that waiter does not cancel
+rollback cleanup or release rollback-capable undo without making ownership
+explicit.
+
 The entry remains visible to session cleanup and shutdown while it is `Active`,
 `CheckedOut`, `CheckedOutAbandoned`, `Committing`, `RollingBack`, `Abandoned`,
 `CleanupRunning`, `Terminal`, or `Failed`, without keeping a strong engine
@@ -287,6 +295,10 @@ runtime execution.
      commit/rollback completion after this handoff; dropping the user commit
      future may stop observing the result but must not roll the transaction back
      or leave the session permanently active.
+   - If commit fails after claiming terminal ownership but before precommit
+     handoff, the claimed transaction is rolled back through the same
+     cleanup-worker terminal rollback path before the commit failure is
+     returned or observed by a waiter.
 3. **State Update**
    - Instead of updating a global transaction table or traversing the MemIndex, the transaction simply backfills the **Commit Timestamp (CTS)** into its Undo Log records.
    - For the **ColumnDeletionBuffer**, the CTS is attached to the delete/update markers.
