@@ -42,3 +42,11 @@ When a backlog item is moved to `docs/backlogs/closed/`, append:
 - Reference: <task/issue/pr reference>
 - Closed At: <YYYY-MM-DD>
 ```
+
+## Close Reason
+
+- Type: already-implemented
+- Detail: Tasks 000166 and 000168 implemented the concrete SessionPin long-running paths and the broader TrxAttachment/TrxRuntime ownership model; current code keeps runtime/session reachability across freeze, checkpoint, secondary MemIndex cleanup, transaction terminal/cleanup, and shutdown waits on runtime refs and active transactions.
+- Closed By: backlog close
+- Reference: docs/tasks/000166-transaction-terminal-ownership-preparation.md; docs/tasks/000168-weak-transaction-handle-and-abandoned-cleanup.md; focused investigation and nextest run on 2026-06-13
+- Closed At: 2026-06-13
