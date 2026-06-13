@@ -6,25 +6,26 @@ points that depend on the shared completion core.
 
 ## Overview
 
-The storage engine uses one backend-neutral completion-driven worker model for
-direct I/O. The generic `crate::io` layer owns:
+The storage engine uses backend-neutral completion-driven direct I/O. The
+generic `crate::io` layer owns:
 
-- request receipt from subsystem-specific channels;
 - in-flight slot allocation and completion-token validation;
 - operation ownership for direct buffers and borrowed page pointers;
 - submission batching and completion dispatch into subsystem state machines; and
-- per-worker submit/wait statistics.
+- per-driver submit/wait statistics.
 
 Backend-specific code only prepares kernel submission objects, stages them into
 the backend's submission format, submits batches, and decodes completions back
 into worker tokens.
 
-In the current runtime topology, the storage engine uses two storage-adjacent
-workers:
+In the current runtime topology, the storage engine uses one shared
+storage-adjacent worker plus one redo driver owned by the transaction log
+thread:
 
 - one shared `StorageIOWorker` for table-file reads/writes, readonly-cache miss
   loads, and `mem_pool` / `index_pool` page IO; and
-- one dedicated redo-log worker for transaction-log writes.
+- one scheduler-owned redo backend driver running inside `Log-Thread` for
+  transaction-log writes.
 
 The shared storage worker exposes three logical lanes:
 
@@ -59,10 +60,11 @@ That is the shared contract across both supported backends.
 - translation from `Operation` to the backend submission format; and
 - batch submit plus completion wait methods that return `BackendToken`s.
 
-The worker itself remains backend-neutral. Subsystems bind domain-specific
-state machines through `IOWorkerBuilder::bind(...)` and implement
-`IOStateMachine` to decide how requests become submissions and how completions
-update subsystem state.
+Schedulers remain backend-neutral. The shared storage service uses
+domain-specific state-machine methods to decide how requests become
+submissions and how completions update subsystem state. The redo path uses a
+small `LogWriteDriver` wrapper around the shared submission driver for direct
+log writes.
 
 ## Supported Backends
 
@@ -89,21 +91,21 @@ The current storage-engine integration points are:
 - evictable-pool page reads and writeback in `src/buffer/evict.rs`; and
 - redo-log writes in `src/trx/log.rs`.
 
-Table-file and buffer-pool traffic now share one storage service, while redo
-retains its own dedicated worker and durability policy.
+Table-file and buffer-pool traffic share one storage service, while redo keeps
+its own scheduling and durability policy inside `Log-Thread`.
 
 ## Redo Path
 
-Redo-log writes use a dedicated backend-neutral worker:
+Redo-log writes use the backend-neutral submission driver inside `Log-Thread`:
 
 - the scheduler serializes one commit group into a `DirectBuf`;
 - the group becomes one `Operation::pwrite_owned(...)`;
-- the redo worker reports completion back to the scheduler thread; and
-- durability is finalized above the worker with `fsync`, `fdatasync`, or no
+- the driver reports completion back to `FileProcessor`; and
+- durability is finalized above the driver with `fsync`, `fdatasync`, or no
   sync depending on `TrxSysConfig::log_sync`.
 
-Fatal redo submit, write, or sync failures poison runtime admission through
-`StoragePoisonSource::{RedoSubmit, RedoWrite, RedoSync}`.
+Fatal redo write or sync failures poison runtime admission through
+`FatalError::{RedoWrite, RedoSync}`.
 
 ## Telemetry
 

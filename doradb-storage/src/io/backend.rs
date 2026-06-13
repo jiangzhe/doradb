@@ -149,7 +149,7 @@ impl IOBackendStatsHandle {
     }
 }
 
-/// Backend-specific submit/wait contract used by [`super::IOWorker`].
+/// Backend-specific submit/wait contract used by storage IO schedulers.
 ///
 /// The worker owns scheduling and inflight lifetime. The backend owns:
 /// - how one [`super::Operation`] is prepared for the kernel
@@ -157,7 +157,7 @@ impl IOBackendStatsHandle {
 /// - how completion buffers are allocated and interpreted
 ///
 /// This keeps libaio-specific `*mut *mut iocb` layout and future io_uring
-/// submission queue layout out of the generic worker.
+/// submission queue layout out of the IO scheduler.
 pub(crate) trait IOBackend {
     type Prepared;
     type SubmitBatch;

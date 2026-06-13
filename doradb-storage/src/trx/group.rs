@@ -55,8 +55,9 @@ impl MutexGroupCommit {
 /// and perform single IO to speed up overall commit performance.
 pub(super) struct GroupCommit {
     // Commit group queue, there can be multiple groups in commit phase.
-    // Each of them submits one redo write into the backend-neutral worker and
-    // then waits for write completion plus the configured sync step.
+    // Each of them submits one redo write through the log thread's
+    // backend-neutral driver and then waits for write completion plus the
+    // configured sync step.
     pub(super) queue: VecDeque<Commit>,
     // Closed admission reason. Shutdown messages only wake the worker; this
     // flag is the source of truth for rejecting new precommit handoffs.

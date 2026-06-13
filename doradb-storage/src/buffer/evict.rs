@@ -828,11 +828,6 @@ impl IOStateMachine for EvictablePoolStateMachine {
             }
         }
     }
-
-    #[inline]
-    fn end_loop(self) {
-        // do nothing
-    }
 }
 
 /// Evictor-facing runtime that routes selected writeback through `FileSystem`.

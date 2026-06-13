@@ -1,6 +1,5 @@
 use super::{
-    BackendToken, IOBackend, IOBackendStats, IOBackendStatsHandle, IOClient, IOKind,
-    IOWorkerBuilder, Operation, StdIoResult, build_io_worker,
+    BackendToken, IOBackend, IOBackendStats, IOBackendStatsHandle, IOKind, Operation, StdIoResult,
 };
 use crate::error::{ConfigError, Error, IoError, Result, StorageOp};
 use error_stack::Report;
@@ -44,7 +43,7 @@ impl IouringBackend {
         })
     }
 
-    /// Returns maximum concurrent events exposed to the generic worker.
+    /// Returns maximum concurrent events exposed to the IO scheduler.
     #[inline]
     fn max_events(&self) -> usize {
         self.max_events
@@ -60,12 +59,6 @@ impl IouringBackend {
     #[inline]
     pub(crate) fn stats_handle(&self) -> IOBackendStatsHandle {
         self.stats.clone()
-    }
-
-    /// Builds an IO worker builder.
-    #[inline]
-    pub(crate) fn io_worker<T>(self) -> (IOWorkerBuilder<T>, IOClient<T>) {
-        build_io_worker(self)
     }
 }
 
