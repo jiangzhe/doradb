@@ -785,7 +785,12 @@ impl<'a> FileProcessor<'a> {
                     return ended_log_file;
                 }
             }
-            self.submit_io_and_try_finalize_prefix();
+            self.submit_io();
+            // Always try to publish the ordered prefix after submit. Some groups
+            // are already finished when they enter inflight, and a log rotation
+            // can leave finished inflight groups behind before the usual wait
+            // path gets another chance to run.
+            self.finalize_finished_prefix();
             self.wait_one_io_if_submitted();
             // The wait only marks a write finished; this publishes the durable
             // ordered prefix made ready by that completion.
@@ -808,10 +813,11 @@ impl<'a> FileProcessor<'a> {
             || !self.inflight.is_empty()
             || self.write_driver.pending_len() > 0
         {
-            self.submit_io_and_try_finalize_prefix();
-            if self.write_driver.submitted_len() == 0 {
-                continue;
-            }
+            self.submit_io();
+            // Rotation can return from `process_single_file` before its
+            // post-wait finalization step. Drain any finished prefix even when
+            // there is no backend-submitted write to wait for.
+            self.finalize_finished_prefix();
             self.wait_one_io_if_submitted();
             self.finalize_finished_prefix();
         }
@@ -989,15 +995,14 @@ impl<'a> FileProcessor<'a> {
         }
     }
 
-    /// Submit queued redo writes and finalize no-write progress if it appears.
+    /// Submit queued redo writes.
     ///
     /// Groups without redo bytes are already finished when they enter the
-    /// scheduler. Once submitted into `inflight`, they may unblock the ordered
-    /// prefix without any backend completion, so this method finalizes that
-    /// prefix before the caller decides whether to wait for kernel IO.
+    /// scheduler. This only admits them into `inflight`; callers must still run
+    /// `finalize_finished_prefix` after submit so those groups can unblock the
+    /// ordered prefix without a backend completion.
     #[inline]
-    fn submit_io_and_try_finalize_prefix(&mut self) {
-        let mut admitted_finished_group = false;
+    fn submit_io(&mut self) {
         while !self.sync_groups.is_empty() {
             let mut sync_group = self
                 .sync_groups
@@ -1007,7 +1012,6 @@ impl<'a> FileProcessor<'a> {
                 debug_assert!(sync_group.finished);
                 let res = self.inflight.insert(sync_group.max_cts, sync_group);
                 debug_assert!(res.is_none());
-                admitted_finished_group = true;
                 continue;
             };
             if self.write_driver.available_capacity() == 0 {
@@ -1024,9 +1028,6 @@ impl<'a> FileProcessor<'a> {
             debug_assert!(res.is_none());
         }
         self.write_driver.submit_ready();
-        if admitted_finished_group {
-            self.finalize_finished_prefix();
-        }
     }
 
     /// Wait for one submitted redo write, if any, and mark its sync group finished.
@@ -1853,6 +1854,70 @@ mod tests {
         assert_eq!(written[0].max_cts, TrxID::new(20));
         assert!(failed_written.is_empty());
         assert!(inflight.contains_key(&TrxID::new(21)));
+    }
+
+    #[test]
+    fn test_finish_pending_io_finalizes_finished_prefix_without_submitted_write() {
+        smol::block_on(async {
+            let (_engine_temp_dir, engine) =
+                build_redo_test_engine("finish_pending_no_submitted_write", LogSync::None).await;
+            let temp_dir = TempDir::new().unwrap();
+            let file_prefix = temp_dir
+                .path()
+                .join("standalone_redo.log")
+                .to_str()
+                .unwrap()
+                .to_owned();
+            let (purge_tx, _purge_rx) = flume::unbounded();
+            let redo_log = RedoLogInitializer {
+                ctx: StorageBackend::new(1).unwrap(),
+                mode: RedoLogMode::Done,
+                file_prefix,
+                file_max_size: 128 * 1024,
+                file_header_size: 4096 * LOG_HEADER_PAGES,
+                page_size: 4096,
+                io_depth_per_log: 1,
+                file_seq: None,
+            }
+            .finish(purge_tx)
+            .unwrap();
+            let syncer = {
+                redo_log
+                    .group_commit
+                    .lock()
+                    .log_file
+                    .as_ref()
+                    .unwrap()
+                    .syncer()
+            };
+            let config = TrxSysConfig::default()
+                .max_io_size(4096usize)
+                .log_sync(LogSync::None);
+            let mut write_driver = LogWriteDriver::new(StorageBackend::new(1).unwrap());
+            let cts = TrxID::new(50);
+
+            {
+                let mut fp = FileProcessor::new(
+                    &redo_log,
+                    &engine.inner().trx_sys,
+                    &config,
+                    syncer,
+                    &mut write_driver,
+                );
+                fp.inflight
+                    .insert(cts, sync_group_for_order_test(cts, true, 0));
+
+                fp.finish_pending_io();
+
+                assert!(fp.inflight.is_empty());
+                assert!(fp.sync_groups.is_empty());
+                assert_eq!(fp.write_driver.pending_len(), 0);
+                assert_eq!(fp.write_driver.submitted_len(), 0);
+            }
+
+            assert_eq!(redo_log.persisted_cts.load(Ordering::SeqCst), cts.as_u64());
+            engine.shutdown().unwrap();
+        });
     }
 
     #[test]
