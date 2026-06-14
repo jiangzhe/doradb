@@ -29,7 +29,7 @@ use parking_lot::{Mutex, MutexGuard};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, VecDeque};
 use std::mem;
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsRawFd, RawFd};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
@@ -560,9 +560,7 @@ impl RedoLog {
         config: &TrxSysConfig,
         write_driver: &'a mut LogWriteDriver,
     ) -> FileProcessor<'a> {
-        let syncer = { self.group_commit.lock().log_file.as_ref().unwrap().syncer() };
-
-        FileProcessor::new(self, trx_sys, config, syncer, write_driver)
+        FileProcessor::new(self, trx_sys, config, write_driver)
     }
 
     #[inline]
@@ -571,6 +569,9 @@ impl RedoLog {
         loop {
             let mut fp = self.file_processor(trx_sys, config, &mut write_driver);
             if let Some(ended_log_file) = fp.process_single_file() {
+                // Finished groups carry borrowed raw fds for sync. Keep the
+                // switched-out file alive until every old-file group is
+                // finalized.
                 fp.finish_pending_io();
 
                 debug_assert!(fp.inflight.is_empty());
@@ -595,6 +596,9 @@ pub(super) struct SyncGroup {
     pub(super) trx_list: Vec<PrecommitTrx>,
     pub(super) max_cts: TrxID,
     pub(super) log_bytes: usize,
+    // Redo-bearing groups keep the borrowed log fd for the final fsync. No-log
+    // groups have no file allocation and therefore no sync target.
+    pub(super) log_fd: Option<RawFd>,
     pub(super) write: Option<LogWriteSubmission>,
     pub(super) returned_buf: Option<DirectBuf>,
     pub(super) completion: Arc<Completion<()>>,
@@ -692,7 +696,6 @@ struct FileProcessor<'a> {
     sync_groups: VecDeque<SyncGroup>,
     written: Vec<SyncGroup>,
     failed_written: Vec<SyncGroup>,
-    syncer: FileSyncer,
     log_sync: LogSync,
     shutdown: bool,
 }
@@ -703,7 +706,6 @@ impl<'a> FileProcessor<'a> {
         redo_log: &'a RedoLog,
         trx_sys: &'a TransactionSystem,
         config: &TrxSysConfig,
-        syncer: FileSyncer,
         write_driver: &'a mut LogWriteDriver,
     ) -> Self {
         FileProcessor {
@@ -715,7 +717,6 @@ impl<'a> FileProcessor<'a> {
             sync_groups: VecDeque::new(),
             written: vec![],
             failed_written: vec![],
-            syncer,
             log_sync: config.log_sync,
             shutdown: false,
         }
@@ -847,9 +848,7 @@ impl<'a> FileProcessor<'a> {
                         self.shutdown = true;
                         return None;
                     }
-                    Some(Commit::Switch(log_file)) => {
-                        return Some(log_file);
-                    }
+                    Some(Commit::Switch(log_file)) => return Some(log_file),
                     Some(Commit::Group(cg)) => {
                         self.sync_groups.push_back(cg.into_sync_group());
                     }
@@ -877,13 +876,47 @@ impl<'a> FileProcessor<'a> {
                     self.shutdown = true;
                     return None;
                 }
-                Some(Commit::Switch(log_file)) => {
-                    return Some(log_file);
-                }
+                Some(Commit::Switch(log_file)) => return Some(log_file),
                 Some(Commit::Group(cg)) => {
                     self.sync_groups.push_back(cg.into_sync_group());
                 }
             }
+        }
+    }
+
+    #[inline]
+    fn written_log_fd(&self) -> RawFd {
+        let mut log_fd = None;
+        for sync_group in &self.written {
+            if sync_group.log_bytes == 0 {
+                continue;
+            }
+            let sync_group_fd = sync_group
+                .log_fd
+                .expect("redo-bearing sync group must carry its log file fd");
+            if let Some(fd) = log_fd {
+                debug_assert_eq!(
+                    fd, sync_group_fd,
+                    "finished redo prefix must not cross log file boundaries"
+                );
+            } else {
+                log_fd = Some(sync_group_fd);
+            }
+        }
+        log_fd.expect("redo-bearing finished prefix must include a log file fd")
+    }
+
+    #[inline]
+    fn sync_written_prefix(&self, log_bytes: usize) -> Result<()> {
+        if log_bytes == 0 {
+            return Ok(());
+        }
+        let log_fd = self.written_log_fd();
+        let syncer = FileSyncer::from_borrowed_fd(log_fd);
+        match self.log_sync {
+            LogSync::Fsync => syncer.fsync(),
+            LogSync::Fdatasync => syncer.fdatasync(),
+            LogSync::None => Ok(()),
         }
     }
 
@@ -925,15 +958,7 @@ impl<'a> FileProcessor<'a> {
             let max_cts = self.written.last().unwrap().max_cts;
 
             let start = Instant::now();
-            let sync_res = if log_bytes == 0 {
-                Ok(())
-            } else {
-                match self.log_sync {
-                    LogSync::Fsync => self.syncer.fsync(),
-                    LogSync::Fdatasync => self.syncer.fdatasync(),
-                    LogSync::None => Ok(()),
-                }
-            };
+            let sync_res = self.sync_written_prefix(log_bytes);
             let sync_dur = start.elapsed();
             if sync_res.is_err() {
                 let err = self.trx_sys.poison_storage(FatalError::RedoSync);
@@ -1489,6 +1514,30 @@ mod tests {
         }
     }
 
+    #[derive(Clone)]
+    struct RecordingFileSyncHook {
+        calls: Arc<Mutex<Vec<FileSyncOp>>>,
+    }
+
+    impl RecordingFileSyncHook {
+        fn new() -> Self {
+            Self {
+                calls: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+
+        fn calls(&self) -> Vec<FileSyncOp> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    impl FileSyncTestHook for RecordingFileSyncHook {
+        fn on_sync(&self, op: FileSyncOp, override_res: &mut Option<Result<()>>) {
+            self.calls.lock().unwrap().push(op);
+            *override_res = Some(Ok(()));
+        }
+    }
+
     fn spawn_sys_commit_wait(engine: EngineRef, marker: u64) -> JoinHandle<Result<TrxID>> {
         std::thread::spawn(move || {
             smol::block_on(async move {
@@ -1784,6 +1833,15 @@ mod tests {
     }
 
     fn sync_group_for_order_test(cts: TrxID, finished: bool, log_bytes: usize) -> SyncGroup {
+        sync_group_for_order_test_with_log_fd(cts, finished, log_bytes, None)
+    }
+
+    fn sync_group_for_order_test_with_log_fd(
+        cts: TrxID,
+        finished: bool,
+        log_bytes: usize,
+        log_fd: Option<RawFd>,
+    ) -> SyncGroup {
         SyncGroup {
             trx_list: vec![PrecommitTrx {
                 cts,
@@ -1795,6 +1853,7 @@ mod tests {
             }],
             max_cts: cts,
             log_bytes,
+            log_fd,
             write: None,
             returned_buf: None,
             completion: Arc::new(Completion::new()),
@@ -1885,15 +1944,6 @@ mod tests {
             }
             .finish(purge_tx)
             .unwrap();
-            let syncer = {
-                redo_log
-                    .group_commit
-                    .lock()
-                    .log_file
-                    .as_ref()
-                    .unwrap()
-                    .syncer()
-            };
             let config = TrxSysConfig::default()
                 .max_io_size(4096usize)
                 .log_sync(LogSync::None);
@@ -1905,7 +1955,6 @@ mod tests {
                     &redo_log,
                     &engine.inner().trx_sys,
                     &config,
-                    syncer,
                     &mut write_driver,
                 );
                 fp.inflight
@@ -1920,6 +1969,83 @@ mod tests {
             }
 
             assert_eq!(redo_log.persisted_cts.load(Ordering::SeqCst), cts.as_u64());
+            engine.shutdown().unwrap();
+        });
+    }
+
+    #[test]
+    fn test_finish_pending_io_syncs_switch_ended_log_file() {
+        smol::block_on(async {
+            let (_engine_temp_dir, engine) =
+                build_redo_test_engine("finish_pending_switch_syncer", LogSync::None).await;
+            let temp_dir = TempDir::new().unwrap();
+            let file_prefix = temp_dir
+                .path()
+                .join("standalone_switch_redo.log")
+                .to_str()
+                .unwrap()
+                .to_owned();
+            let (purge_tx, _purge_rx) = flume::unbounded();
+            let redo_log = RedoLogInitializer {
+                ctx: StorageBackend::new(1).unwrap(),
+                mode: RedoLogMode::Done,
+                file_prefix,
+                file_max_size: 128 * 1024,
+                file_header_size: 4096 * LOG_HEADER_PAGES,
+                page_size: 4096,
+                io_depth_per_log: 1,
+                file_seq: None,
+            }
+            .finish(purge_tx)
+            .unwrap();
+
+            let (ended_fd, current_fd) = {
+                let mut group_commit_g = redo_log.group_commit.lock();
+                let ended_fd = group_commit_g.log_file.as_ref().unwrap().as_raw_fd();
+                redo_log.rotate_log_file(&mut group_commit_g).unwrap();
+                let current_fd = group_commit_g.log_file.as_ref().unwrap().as_raw_fd();
+                (ended_fd, current_fd)
+            };
+            assert_ne!(ended_fd, current_fd);
+
+            let hook = RecordingFileSyncHook::new();
+            let _install = install_file_sync_test_hook(Arc::new(hook.clone()));
+            let config = TrxSysConfig::default()
+                .max_io_size(4096usize)
+                .log_sync(LogSync::Fsync);
+            let mut write_driver = LogWriteDriver::new(StorageBackend::new(1).unwrap());
+            let cts = TrxID::new(60);
+
+            let ended_log_file = {
+                let mut fp =
+                    redo_log.file_processor(&engine.inner().trx_sys, &config, &mut write_driver);
+                fp.inflight.insert(
+                    cts,
+                    sync_group_for_order_test_with_log_fd(cts, true, 4096, Some(ended_fd)),
+                );
+
+                let ended_log_file = fp
+                    .process_single_file()
+                    .expect("queued rotation should yield ended log file");
+                assert_eq!(ended_log_file.as_raw_fd(), ended_fd);
+
+                fp.finish_pending_io();
+
+                assert!(fp.inflight.is_empty());
+                assert!(fp.sync_groups.is_empty());
+                assert_eq!(fp.write_driver.pending_len(), 0);
+                assert_eq!(fp.write_driver.submitted_len(), 0);
+                ended_log_file
+            };
+
+            assert_eq!(redo_log.persisted_cts.load(Ordering::SeqCst), cts.as_u64());
+            let calls = hook.calls();
+            assert_eq!(calls.len(), 1);
+            assert_eq!(calls[0].kind(), FileSyncKind::Fsync);
+            assert_eq!(calls[0].fd(), ended_fd);
+            assert_ne!(calls[0].fd(), current_fd);
+
+            drop(ended_log_file);
             engine.shutdown().unwrap();
         });
     }

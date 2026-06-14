@@ -144,29 +144,32 @@ impl CommitGroup {
 
     #[inline]
     pub(super) fn into_sync_group(self) -> SyncGroup {
-        let (log_bytes, write, finished) = match self.log {
+        let (log_bytes, log_fd, write, finished) = match self.log {
             Some(log) => {
                 // Confirm data length in buffer header.
                 let buf = log.log_buf.finish();
                 // We always write a complete page instead of partial data.
                 let log_bytes = buf.capacity();
+                let log_fd = log.fd;
                 (
                     log_bytes,
+                    Some(log_fd),
                     Some(LogWriteSubmission::new(
                         self.max_cts,
-                        log.fd,
+                        log_fd,
                         log.offset,
                         buf,
                     )),
                     false,
                 )
             }
-            None => (0, None, true),
+            None => (0, None, None, true),
         };
         SyncGroup {
             trx_list: self.trx_list,
             max_cts: self.max_cts,
             log_bytes,
+            log_fd,
             write,
             returned_buf: None,
             completion: self.completion,
