@@ -1607,6 +1607,10 @@ mod tests {
             let (_temp_dir, engine) =
                 build_redo_test_engine("commit_handoff_shutdown", LogSync::None).await;
             let table_id = table2(&engine).await;
+            // Table setup commits through the same asynchronous purge handoff as
+            // user transactions. Wait until those setup commits leave the active
+            // horizon before this test opens the transaction it wants to track.
+            wait_for(|| engine.inner().trx_sys.redo_log.min_active_sts() == MAX_SNAPSHOT_TS).await;
             let redo_fd = {
                 engine
                     .inner()
