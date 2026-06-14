@@ -1,10 +1,7 @@
 use super::libaio_abi::{
     io_context_t, io_destroy, io_event, io_getevents, io_iocb_cmd, io_setup, io_submit, iocb,
 };
-use super::{
-    BackendToken, IOBackend, IOBackendStatsHandle, IOClient, IOKind, IOWorkerBuilder, Operation,
-    StdIoResult, build_io_worker,
-};
+use super::{BackendToken, IOBackend, IOBackendStatsHandle, IOKind, Operation, StdIoResult};
 use crate::error::{ConfigError, IoError, Result, StorageOp};
 use error_stack::Report;
 use libc::{EAGAIN, EINTR, c_long};
@@ -14,8 +11,8 @@ use std::time::Instant;
 
 /// Concrete libaio context used by the current storage-engine backend.
 ///
-/// This type implements the generic [`IOBackend`] contract used by
-/// [`super::IOWorker`].
+/// This type implements the generic [`IOBackend`] contract used by the storage
+/// IO schedulers.
 pub(crate) struct LibaioBackend {
     ctx: io_context_t,
     max_events: usize,
@@ -129,12 +126,6 @@ impl LibaioBackend {
         }
         (wait_calls, completed)
     }
-
-    /// Build an IO worker builder.
-    #[inline]
-    pub(crate) fn io_worker<T>(self) -> (IOWorkerBuilder<T>, IOClient<T>) {
-        build_io_worker(self)
-    }
 }
 
 #[inline]
@@ -177,7 +168,7 @@ impl Drop for LibaioBackend {
 /// Backend-owned libaio staging buffer for one worker.
 ///
 /// This stores the pointer-array layout required by `io_submit` while keeping
-/// that ABI detail out of the generic worker contract.
+/// that ABI detail out of the scheduler contract.
 pub(crate) struct LibaioSubmitBatch {
     staged: VecDeque<*mut iocb>,
     prefix: Vec<*mut iocb>,
@@ -272,7 +263,7 @@ impl IOBackend for LibaioBackend {
 pub(crate) mod tests {
     use super::*;
     use crate::file::{FixedSizeBufferFreeList, SparseFile, UNTRACKED_FILE_ID};
-    use crate::io::{DirectBuf, IOQueue, IOStateMachine, IOSubmission};
+    use crate::io::{IOBuf, IOSubmission, SubmissionDriver};
     use libc::EAGAIN;
     use std::os::fd::AsRawFd;
     use std::sync::Mutex;
@@ -327,7 +318,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn test_io_worker() {
+    fn test_submission_driver_with_libaio_backend() {
         let ctx = LibaioBackend::new(16).unwrap();
         let temp_dir = TempDir::new().unwrap();
         let file_path = temp_dir.path().join("aio_file3.txt");
@@ -335,9 +326,7 @@ pub(crate) mod tests {
         let file = SparseFile::create_or_trunc(&file_path, 1024 * 1024, UNTRACKED_FILE_ID).unwrap();
 
         let buf_free_list = FixedSizeBufferFreeList::new(4096, 4, 4);
-        let listener = SimpleListener { file };
-        let (worker, client) = ctx.io_worker();
-        let handle = worker.bind(listener).start_thread();
+        let mut driver = SubmissionDriver::new(ctx);
 
         let mut buf = buf_free_list.pop(false);
         buf.reset();
@@ -345,25 +334,35 @@ pub(crate) mod tests {
         buf.truncate(data.len());
         buf.data_mut().copy_from_slice(data);
 
-        client
-            .send(Request {
-                kind: IOKind::Write,
-                offset: 0,
-                buf,
-            })
-            .unwrap();
-        std::thread::sleep(std::time::Duration::from_millis(100));
-        let mut elem2 = buf_free_list.pop(false);
-        elem2.reset();
-        let _ = client.send(Request {
-            kind: IOKind::Read,
-            offset: 0,
-            buf: elem2,
-        });
-        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert!(
+            driver
+                .push(Submission {
+                    kind: IOKind::Write,
+                    operation: Operation::pwrite_owned(file.as_raw_fd(), 0, buf),
+                })
+                .is_ok()
+        );
+        assert_eq!(driver.submit_ready(), 1);
+        let completed = driver.wait_one();
+        assert_eq!(completed.submission.kind, IOKind::Write);
+        assert_eq!(completed.result.unwrap(), 4096);
 
-        client.shutdown();
-        handle.join().unwrap();
+        let mut read_buf = buf_free_list.pop(false);
+        read_buf.reset();
+        assert!(
+            driver
+                .push(Submission {
+                    kind: IOKind::Read,
+                    operation: Operation::pread_owned(file.as_raw_fd(), 0, read_buf),
+                })
+                .is_ok()
+        );
+        assert_eq!(driver.submit_ready(), 1);
+        let completed = driver.wait_one();
+        assert_eq!(completed.submission.kind, IOKind::Read);
+        assert_eq!(completed.result.unwrap(), 4096);
+        let buf = completed.submission.operation.buf().unwrap();
+        assert_eq!(&buf.as_bytes()[..data.len()], data);
     }
 
     #[test]
@@ -441,12 +440,6 @@ pub(crate) mod tests {
         assert_eq!(delta.wait_completions, 1);
     }
 
-    struct Request {
-        kind: IOKind,
-        offset: usize,
-        buf: DirectBuf,
-    }
-
     struct Submission {
         kind: IOKind,
         operation: Operation,
@@ -455,65 +448,6 @@ pub(crate) mod tests {
     impl IOSubmission for Submission {
         fn operation(&mut self) -> &mut Operation {
             &mut self.operation
-        }
-    }
-
-    struct SimpleListener {
-        file: SparseFile,
-    }
-
-    impl IOStateMachine for SimpleListener {
-        type Request = Request;
-        type Submission = Submission;
-
-        fn prepare_request(
-            &mut self,
-            req: Request,
-            max_new: usize,
-            queue: &mut IOQueue<Submission>,
-        ) -> Option<Request> {
-            if max_new == 0 {
-                return Some(req);
-            }
-            let operation = match req.kind {
-                IOKind::Read => Operation::pread_owned(self.file.as_raw_fd(), req.offset, req.buf),
-                IOKind::Write => {
-                    Operation::pwrite_owned(self.file.as_raw_fd(), req.offset, req.buf)
-                }
-            };
-            queue.push(Submission {
-                kind: req.kind,
-                operation,
-            });
-            None
-        }
-
-        fn on_submit(&mut self, _sub: &Submission) {}
-
-        fn on_complete(&mut self, sub: Submission, res: StdIoResult<usize>) -> IOKind {
-            match res {
-                Ok(len) => {
-                    match sub.kind {
-                        IOKind::Read => {
-                            println!("read {} bytes", len);
-                        }
-                        IOKind::Write => {
-                            println!("write {} bytes", len);
-                        }
-                    }
-                    let buf = sub.operation.buf().unwrap();
-                    let n = buf.data().len().min(20);
-                    println!("leading {} bytes: {:?}", n, &buf.data()[..n]);
-                    sub.kind
-                }
-                Err(err) => {
-                    panic!("{:?}", err);
-                }
-            }
-        }
-
-        fn end_loop(self) {
-            drop(self.file);
         }
     }
 }

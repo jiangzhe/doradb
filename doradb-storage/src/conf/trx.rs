@@ -36,7 +36,7 @@ pub struct TrxSysConfig {
     // Controls maximum IO size of each IO request.
     // This only limit the combination of multiple transactions.
     // If single transaction has very large redo log. It is kept
-    // what it is and sent to the redo IO worker as one request.
+    // as-is and submitted by the log thread as one request.
     pub max_io_size: Byte,
     // Directory where redo log files live.
     pub log_dir: PathBuf,
@@ -72,7 +72,7 @@ impl PendingTransactionSystemStartup {
         self,
         trx_sys: QuiescentGuard<TransactionSystem>,
     ) -> TransactionSystemWorkersOwned {
-        let io_thread = TransactionSystem::start_io_thread(trx_sys.clone());
+        let log_thread = TransactionSystem::start_log_thread(trx_sys.clone());
         let purge_threads = TransactionSystem::start_purge_threads(
             trx_sys.clone(),
             self.mem_pool,
@@ -84,7 +84,7 @@ impl PendingTransactionSystemStartup {
             trx_sys.into_sync(),
             self.purge_tx,
             self.cleanup_tx,
-            io_thread,
+            log_thread,
             purge_threads,
             cleanup_thread,
         )

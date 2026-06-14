@@ -1122,7 +1122,7 @@ where
     where
         B: Send + 'static,
     {
-        thread::spawn_named("StorageIOWorker", move || self.run())
+        thread::spawn_named("IO-Thread", move || self.run())
     }
 
     #[inline]

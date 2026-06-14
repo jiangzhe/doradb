@@ -124,7 +124,7 @@ pub(crate) struct TransactionSystemWorkersOwned {
 pub(crate) struct TransactionBackgroundWorkers {
     purge_tx: Sender<Purge>,
     cleanup_tx: Sender<TrxCleanupMessage>,
-    io_thread: Mutex<Option<JoinHandle<()>>>,
+    log_thread: Mutex<Option<JoinHandle<()>>>,
     purge_threads: Mutex<Vec<JoinHandle<()>>>,
     cleanup_thread: Mutex<Option<JoinHandle<()>>>,
 }
@@ -135,7 +135,7 @@ impl TransactionSystemWorkersOwned {
         trx_sys: SyncQuiescentGuard<TransactionSystem>,
         purge_tx: Sender<Purge>,
         cleanup_tx: Sender<TrxCleanupMessage>,
-        io_thread: JoinHandle<()>,
+        log_thread: JoinHandle<()>,
         purge_threads: Vec<JoinHandle<()>>,
         cleanup_thread: JoinHandle<()>,
     ) -> Self {
@@ -144,7 +144,7 @@ impl TransactionSystemWorkersOwned {
             workers: TransactionBackgroundWorkers {
                 purge_tx,
                 cleanup_tx,
-                io_thread: Mutex::new(Some(io_thread)),
+                log_thread: Mutex::new(Some(log_thread)),
                 purge_threads: Mutex::new(purge_threads),
                 cleanup_thread: Mutex::new(Some(cleanup_thread)),
             },
@@ -179,7 +179,7 @@ impl TransactionBackgroundWorkers {
         // Join redo before stopping cleanup or purge. After this point no new
         // committed-payload handoff and no new failed-precommit cleanup job can
         // be produced by redo.
-        if let Some(handle) = self.io_thread.lock().take() {
+        if let Some(handle) = self.log_thread.lock().take() {
             handle.join().unwrap();
         }
 
@@ -218,7 +218,7 @@ impl TransactionBackgroundWorkers {
 /// Message consumed by the single transaction cleanup worker.
 ///
 /// The worker serializes cleanup that cannot be performed from `Drop`, from
-/// user-cancellable terminal futures, or from the redo worker. `Stop` is a
+/// user-cancellable terminal futures, or from the log thread. `Stop` is a
 /// drain barrier, not an immediate cancellation: after it is received, the
 /// worker runs any messages already pending behind the marker before exiting.
 pub(crate) enum TrxCleanupMessage {
@@ -228,7 +228,7 @@ pub(crate) enum TrxCleanupMessage {
     TerminalRollback(Box<TerminalRollbackCleanupJob>),
     /// Mandatory rollback for transactions that reached precommit but cannot commit.
     FailedPrecommit(FailedPrecommitCleanupJob),
-    /// Shutdown marker consumed after redo workers can no longer enqueue cleanup.
+    /// Shutdown marker consumed after the log thread can no longer enqueue cleanup.
     Stop,
 }
 
@@ -643,15 +643,15 @@ impl TransactionSystem {
             .store(sts.as_u64(), Ordering::SeqCst)
     }
 
-    /// Start the background IO thread.
+    /// Start the background log thread.
     #[inline]
-    pub(crate) fn start_io_thread(trx_sys: QuiescentGuard<Self>) -> JoinHandle<()> {
+    pub(crate) fn start_log_thread(trx_sys: QuiescentGuard<Self>) -> JoinHandle<()> {
         let trx_sys = trx_sys.into_sync();
         let task_trx_sys = trx_sys.clone();
-        thread::spawn_named("IO-Thread", move || {
+        thread::spawn_named("Log-Thread", move || {
             task_trx_sys
                 .redo_log
-                .io_loop(&task_trx_sys, &task_trx_sys.config);
+                .log_loop(&task_trx_sys, &task_trx_sys.config);
         })
     }
 
@@ -711,7 +711,7 @@ impl TransactionSystem {
     ///
     /// Send failure means the cleanup receiver is gone. That should be
     /// unreachable for normal shutdown: transaction-system worker shutdown
-    /// first closes group-commit admission, wakes and joins all redo workers,
+    /// first closes group-commit admission, wakes and joins the log thread,
     /// and only then sends cleanup `Stop` and joins the cleanup worker.
     #[inline]
     pub(crate) fn request_failed_precommit_cleanup(&self, job: FailedPrecommitCleanupJob) {
@@ -724,7 +724,7 @@ impl TransactionSystem {
             // closed receiver means the worker-lifetime invariant is already
             // broken, so leak the payload and fail at the invariant boundary.
             std::mem::forget(err.0);
-            panic!("failed-precommit cleanup receiver closed before redo workers stopped");
+            panic!("failed-precommit cleanup receiver closed before log thread stopped");
         }
     }
 
@@ -801,7 +801,7 @@ pub(crate) struct TrxSysStats {
     pub(crate) log_bytes: usize,
     pub(crate) sync_count: usize,
     pub(crate) sync_nanos: usize,
-    /// Number of backend submit-or-wait calls observed across redo workers.
+    /// Number of backend submit-or-wait calls observed by the log thread.
     ///
     /// On `libaio`, one logical IO commonly contributes separate submit and
     /// wait syscalls, so this count can be roughly doubled compared with
@@ -955,8 +955,8 @@ impl Component for TransactionSystemWorkers {
         // still has to signal every channel and join every worker handle.
         //
         // Cleanup lifetime invariant:
-        // 1. Close group-commit admission and wake redo workers.
-        // 2. Join the redo worker, so all queued/inflight failed-precommit groups
+        // 1. Close group-commit admission and wake the log thread.
+        // 2. Join the log thread, so all queued/inflight failed-precommit groups
         //    have either handed committed payloads to purge or rollback jobs to cleanup.
         // 3. Send cleanup Stop; the cleanup worker drains already queued
         //    abandoned, terminal rollback, and failed-precommit jobs before it exits.
@@ -1106,7 +1106,7 @@ pub(crate) mod tests {
             let worker_trx_sys = trx_sys.clone();
             let handle = std::thread::spawn(move || {
                 worker_started.store(true, Ordering::Release);
-                let err = worker_trx_sys.poison_storage(FatalError::RedoSubmit);
+                let err = worker_trx_sys.poison_storage(FatalError::RedoWrite);
                 worker_finished.store(true, Ordering::Release);
                 err
             });
@@ -1130,19 +1130,19 @@ pub(crate) mod tests {
             drop(blocked);
 
             let err = handle.join().unwrap();
-            assert_eq!(*err.current_context(), FatalError::RedoSubmit);
+            assert_eq!(*err.current_context(), FatalError::RedoWrite);
             assert!(trx_sys.storage_poisoned.load(Ordering::Acquire));
             assert!(
                 trx_sys
                     .storage_poison_error()
                     .as_ref()
-                    .is_some_and(|err| { *err.current_context() == FatalError::RedoSubmit })
+                    .is_some_and(|err| { *err.current_context() == FatalError::RedoWrite })
             );
             assert!(
                 trx_sys
                     .ensure_runtime_healthy()
                     .as_ref()
-                    .is_err_and(|err| { *err.current_context() == FatalError::RedoSubmit })
+                    .is_err_and(|err| { *err.current_context() == FatalError::RedoWrite })
             );
 
             drop(trx_sys);
@@ -1175,7 +1175,7 @@ pub(crate) mod tests {
             let worker_a_trx_sys = trx_sys.clone();
             let worker_a = std::thread::spawn(move || {
                 worker_a_barrier.wait();
-                worker_a_trx_sys.poison_storage(FatalError::RedoSubmit)
+                worker_a_trx_sys.poison_storage(FatalError::RedoWrite)
             });
 
             let worker_b_barrier = Arc::clone(&barrier);
@@ -1205,7 +1205,7 @@ pub(crate) mod tests {
             );
             assert!(matches!(
                 stored_reason,
-                FatalError::RedoSubmit | FatalError::RedoSync
+                FatalError::RedoWrite | FatalError::RedoSync
             ));
 
             drop(trx_sys);

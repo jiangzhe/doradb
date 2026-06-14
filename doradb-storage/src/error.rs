@@ -170,8 +170,6 @@ pub(crate) enum OperationError {
 pub(crate) enum FatalError {
     #[error("storage engine poisoned")]
     Poisoned,
-    #[error("redo submit failed")]
-    RedoSubmit,
     #[error("redo write failed")]
     RedoWrite,
     #[error("redo sync failed")]

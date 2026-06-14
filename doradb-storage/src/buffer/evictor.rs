@@ -818,7 +818,7 @@ impl SharedEvictor {
 
     #[inline]
     fn start_thread(self) -> JoinHandle<()> {
-        thread::spawn_named("SharedPoolEvictor", move || self.run())
+        thread::spawn_named("Shared-Pool-Evictor", move || self.run())
     }
 
     #[inline]

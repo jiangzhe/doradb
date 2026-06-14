@@ -55,8 +55,9 @@ impl MutexGroupCommit {
 /// and perform single IO to speed up overall commit performance.
 pub(super) struct GroupCommit {
     // Commit group queue, there can be multiple groups in commit phase.
-    // Each of them submits one redo write into the backend-neutral worker and
-    // then waits for write completion plus the configured sync step.
+    // Each of them submits one redo write through the log thread's
+    // backend-neutral driver and then waits for write completion plus the
+    // configured sync step.
     pub(super) queue: VecDeque<Commit>,
     // Closed admission reason. Shutdown messages only wake the worker; this
     // flag is the source of truth for rejecting new precommit handoffs.
@@ -143,29 +144,32 @@ impl CommitGroup {
 
     #[inline]
     pub(super) fn into_sync_group(self) -> SyncGroup {
-        let (log_bytes, write, finished) = match self.log {
+        let (log_bytes, log_fd, write, finished) = match self.log {
             Some(log) => {
                 // Confirm data length in buffer header.
                 let buf = log.log_buf.finish();
                 // We always write a complete page instead of partial data.
                 let log_bytes = buf.capacity();
+                let log_fd = log.fd;
                 (
                     log_bytes,
+                    Some(log_fd),
                     Some(LogWriteSubmission::new(
                         self.max_cts,
-                        log.fd,
+                        log_fd,
                         log.offset,
                         buf,
                     )),
                     false,
                 )
             }
-            None => (0, None, true),
+            None => (0, None, None, true),
         };
         SyncGroup {
             trx_list: self.trx_list,
             max_cts: self.max_cts,
             log_bytes,
+            log_fd,
             write,
             returned_buf: None,
             completion: self.completion,

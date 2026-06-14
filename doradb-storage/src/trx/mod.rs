@@ -1204,11 +1204,11 @@ impl FailedPrecommitReason {
 /// transaction-owned undo memory, so failed-precommit cleanup must run before
 /// the shared completion wakes commit waiters.
 ///
-/// The cleanup worker owns these jobs instead of the redo worker so redo
+/// The cleanup worker owns these jobs instead of the log thread so redo
 /// failure handling can hand over rollback work and continue draining/shutting
-/// down its own queues. Transaction-system worker shutdown joins all redo
-/// workers before sending cleanup `Stop`, which keeps the cleanup receiver
-/// alive for every failed-precommit job that a redo worker can produce.
+/// down its own queues. Transaction-system worker shutdown joins the log
+/// thread before sending cleanup `Stop`, which keeps the cleanup receiver
+/// alive for every failed-precommit job that the log thread can produce.
 pub(crate) struct FailedPrecommitCleanupJob {
     trx_list: Vec<PrecommitTrx>,
     completion: Arc<Completion<()>>,
@@ -1908,7 +1908,7 @@ impl PrecommitTrxPayload {
 
 /// Transaction in the logical Committing state.
 ///
-/// Once a `PrecommitTrx` is queued in a commit group, the redo worker owns the
+/// Once a `PrecommitTrx` is queued in a commit group, the log thread owns the
 /// terminal outcome. User waiters may observe success or failure, but they no
 /// longer own session commit/rollback cleanup and cannot convert this state
 /// back into an explicit rollback.

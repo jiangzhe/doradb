@@ -13,12 +13,10 @@ mod libaio_abi;
 #[cfg(feature = "libaio")]
 mod libaio_backend;
 
-use crate::thread;
-use flume::{Receiver, SendError, Sender, TryRecvError};
+use flume::{Receiver, SendError, Sender};
 use std::collections::VecDeque;
 use std::os::unix::io::RawFd;
 use std::result::Result as StdResult;
-use std::thread::JoinHandle;
 
 pub(crate) use backend::*;
 pub(crate) use buf::*;
@@ -275,9 +273,9 @@ impl<T> IOQueue<T> {
     }
 }
 
-/// One worker-owned submission staged for backend preparation and completion.
+/// One scheduler-owned submission staged for backend preparation and completion.
 ///
-/// The generic worker only prepares and submits the backend operation. Any
+/// The IO scheduler only prepares and submits the backend operation. Any
 /// domain identity or higher-level bookkeeping lives in the concrete
 /// submission and its owning state machine.
 pub(crate) trait IOSubmission {
@@ -286,8 +284,6 @@ pub(crate) trait IOSubmission {
 }
 
 const INVALID_SLOT: u32 = u32::MAX;
-const DEFAULT_IO_EVENT_LOOP_BACKLOG: usize = 10;
-
 enum Entry<T> {
     Occupied(T),
     Vacant(u32),
@@ -323,11 +319,6 @@ impl<T> InflightSlots<T> {
             slots,
             free_head: if capacity == 0 { INVALID_SLOT } else { 0 },
         }
-    }
-
-    #[inline]
-    fn has_vacant(&self) -> bool {
-        self.free_head != INVALID_SLOT
     }
 
     #[inline]
@@ -395,7 +386,191 @@ struct InflightEntry<S, P> {
     submitted: bool,
 }
 
-/// IOStateMachine defines how one worker maps requests to submissions and
+/// One completed backend submission returned by [`SubmissionDriver`].
+pub(crate) struct CompletedSubmission<S> {
+    pub(crate) submission: S,
+    pub(crate) result: StdIoResult<usize>,
+}
+
+/// Backend-neutral direct submission driver.
+///
+/// The driver owns inflight slots, backend-prepared state, staged submission
+/// batches, completion-token validation, and backend submit/wait calls. Callers
+/// keep domain scheduling policy outside this type and push backend-facing
+/// submissions directly when capacity is available.
+pub(crate) struct SubmissionDriver<S, B = StorageBackend>
+where
+    S: IOSubmission,
+    B: IOBackend,
+{
+    backend: B,
+    events: B::Events,
+    submit_batch: B::SubmitBatch,
+    slots: InflightSlots<InflightEntry<S, B::Prepared>>,
+    staged_slots: VecDeque<u32>,
+    submitted: usize,
+    completed: VecDeque<CompletedSubmission<S>>,
+}
+
+impl<S, B> SubmissionDriver<S, B>
+where
+    S: IOSubmission,
+    B: IOBackend,
+{
+    /// Create a submission driver around one storage backend.
+    #[inline]
+    pub(crate) fn new(backend: B) -> Self {
+        let events = backend.new_events();
+        let submit_batch = backend.new_submit_batch();
+        let capacity = backend.max_events();
+        SubmissionDriver {
+            backend,
+            events,
+            submit_batch,
+            slots: InflightSlots::new(capacity),
+            staged_slots: VecDeque::with_capacity(capacity),
+            submitted: 0,
+            completed: VecDeque::new(),
+        }
+    }
+
+    /// Returns the maximum number of backend submissions this driver can own.
+    #[inline]
+    pub(crate) fn capacity(&self) -> usize {
+        self.slots.slots.len()
+    }
+
+    /// Returns remaining staging capacity.
+    ///
+    /// Completed-but-not-yet-returned submissions have already freed their
+    /// backend slots, so they do not reduce capacity for new work.
+    #[inline]
+    pub(crate) fn available_capacity(&self) -> usize {
+        self.capacity()
+            .saturating_sub(self.staged_slots.len() + self.submitted)
+    }
+
+    /// Returns submissions still owned by the driver.
+    ///
+    /// This includes backend-staged submissions, kernel-submitted submissions,
+    /// and completions fetched from the backend but not yet returned to the
+    /// caller.
+    #[inline]
+    pub(crate) fn pending_len(&self) -> usize {
+        self.staged_slots.len() + self.submitted_len()
+    }
+
+    /// Returns submissions accepted by the backend submit path but not yet
+    /// returned to the caller.
+    #[inline]
+    pub(crate) fn submitted_len(&self) -> usize {
+        self.submitted + self.completed.len()
+    }
+
+    /// Stages one submission for backend submission.
+    ///
+    /// Returns the submission unchanged when the driver has no free slot.
+    #[inline]
+    pub(crate) fn push(&mut self, mut submission: S) -> StdResult<(), S> {
+        if self.available_capacity() == 0 {
+            return Err(submission);
+        }
+        let (token, slot) = self
+            .slots
+            .reserve()
+            .expect("slot reservation should succeed when capacity is available");
+        let mut prepared = self.backend.prepare(token, submission.operation());
+        self.backend
+            .push_prepared(&mut self.submit_batch, &mut prepared);
+        self.slots.occupy_reserved(
+            slot,
+            InflightEntry {
+                submission,
+                _prepared: prepared,
+                submitted: false,
+            },
+        );
+        self.staged_slots.push_back(slot);
+        Ok(())
+    }
+
+    /// Submits staged operations up to backend capacity and returns the count
+    /// accepted by the backend.
+    #[inline]
+    pub(crate) fn submit_ready(&mut self) -> usize {
+        if self.staged_slots.is_empty() {
+            return 0;
+        }
+        let limit = self.capacity().saturating_sub(self.submitted);
+        let submit_count = self.backend.submit_batch(&mut self.submit_batch, limit);
+        #[cfg(test)]
+        let hook = tests::current_storage_backend_test_hook();
+        for _ in 0..submit_count {
+            let slot = self
+                .staged_slots
+                .pop_front()
+                .expect("submitted slots must have queued staging order");
+            let entry = self.slots.get_mut(slot);
+            debug_assert!(!entry.submitted);
+            #[cfg(test)]
+            if let Some(hook) = &hook {
+                let op = entry.submission.operation();
+                hook.on_submit(StorageBackendOp::new(op.kind(), op.fd(), op.offset()));
+            }
+            entry.submitted = true;
+        }
+        self.submitted += submit_count;
+        debug_assert!(self.submitted <= self.capacity());
+        submit_count
+    }
+
+    /// Waits for one accepted submission to complete.
+    ///
+    /// If a previous backend wait returned several completions, this returns
+    /// the next buffered completion without entering the backend wait path.
+    #[inline]
+    pub(crate) fn wait_one(&mut self) -> CompletedSubmission<S> {
+        if self.completed.is_empty() {
+            assert!(
+                self.submitted != 0,
+                "wait_one requires at least one backend-submitted operation"
+            );
+            let completions = self.backend.wait_at_least(&mut self.events, 1);
+            let completed_count = completions.len();
+            assert!(
+                completed_count <= self.submitted,
+                "backend returned more completions than submitted operations"
+            );
+            self.submitted -= completed_count;
+            for (token, res) in completions {
+                let entry = self.slots.take(token);
+                debug_assert!(entry.submitted);
+                #[cfg(test)]
+                let (entry, res) = {
+                    let mut entry = entry;
+                    let mut res = res;
+                    if let Some(hook) = tests::current_storage_backend_test_hook() {
+                        let op = entry.submission.operation();
+                        hook.on_complete(
+                            StorageBackendOp::new(op.kind(), op.fd(), op.offset()),
+                            &mut res,
+                        );
+                    }
+                    (entry, res)
+                };
+                self.completed.push_back(CompletedSubmission {
+                    submission: entry.submission,
+                    result: res,
+                });
+            }
+        }
+        self.completed
+            .pop_front()
+            .expect("backend wait must return at least one completion")
+    }
+}
+
+/// IOStateMachine defines how one scheduler maps requests to submissions and
 /// applies completion-side state transitions.
 pub(crate) trait IOStateMachine {
     type Request;
@@ -421,12 +596,9 @@ pub(crate) trait IOStateMachine {
     /// Called when IO is completed.
     /// The result contains number of bytes read/write, or the IO error.
     fn on_complete(&mut self, sub: Self::Submission, res: StdIoResult<usize>) -> IOKind;
-
-    /// Called when event loop is ended.
-    fn end_loop(self);
 }
 
-/// Cloneable sender used to enqueue requests into one [`IOWorker`].
+/// Cloneable sender used to enqueue requests into one IO scheduler.
 ///
 /// The client only transports state-machine requests. It does not own any
 /// backend-specific submission state.
@@ -476,293 +648,12 @@ impl<T> Clone for IOClient<T> {
     }
 }
 
-/// Delayed worker construction until the owner can provide the concrete state machine.
-///
-/// The builder fixes the backend and request channel first, then binds one
-/// concrete [`IOStateMachine`] later.
-pub(crate) struct IOWorkerBuilder<T, B = StorageBackend> {
-    backend: B,
-    rx: Receiver<IOMessage<T>>,
-}
-
-impl<T, B> IOWorkerBuilder<T, B>
-where
-    B: IOBackend,
-{
-    /// Attaches one state machine to this backend-bound worker builder.
-    #[inline]
-    pub(crate) fn bind<S>(self, state_machine: S) -> IOWorker<T, S, B>
-    where
-        S: IOStateMachine<Request = T>,
-    {
-        let io_depth = self.backend.max_events();
-        let submit_batch = self.backend.new_submit_batch();
-        IOWorker {
-            backend: self.backend,
-            rx: self.rx,
-            deferred_req: None,
-            shutdown: false,
-            submitted: 0,
-            staged_slots: VecDeque::new(),
-            submit_batch,
-            slots: InflightSlots::new(io_depth),
-            state_machine,
-        }
-    }
-}
-
-/// Concrete batch-oriented IO worker with one state machine implementation.
-///
-/// The worker owns:
-/// - request receipt from the channel
-/// - inflight slot allocation and ABA-safe completion tokens
-/// - backend preparation and batch submission
-/// - dispatch back into the state machine on submit and completion
-///
-/// Domain-level dedupe and same-key conflict policy remain inside the state
-/// machine and its owning subsystem.
-pub(crate) struct IOWorker<T, S: IOStateMachine<Request = T>, B: IOBackend = StorageBackend> {
-    backend: B,
-    rx: Receiver<IOMessage<T>>,
-    deferred_req: Option<T>,
-    shutdown: bool,
-    submitted: usize,
-    staged_slots: VecDeque<u32>,
-    submit_batch: B::SubmitBatch,
-    slots: InflightSlots<InflightEntry<S::Submission, B::Prepared>>,
-    state_machine: S,
-}
-
-impl<T, S, B> IOWorker<T, S, B>
-where
-    S: IOStateMachine<Request = T>,
-    S::Request: Send + 'static,
-    S::Submission: Send + 'static,
-    B: IOBackend,
-    B::Prepared: Send + 'static,
-    B::SubmitBatch: Send + 'static,
-{
-    /// Starts a dedicated thread that runs this worker until shutdown and drain.
-    pub(crate) fn start_thread(self) -> JoinHandle<()>
-    where
-        S: Send + 'static,
-        B: Send + 'static,
-    {
-        thread::spawn_named("IOWorker", move || self.run())
-    }
-
-    #[inline]
-    fn io_depth(&self) -> usize {
-        self.backend.max_events()
-    }
-
-    #[inline]
-    fn local_depth(&self, queue: &IOQueue<S::Submission>) -> usize {
-        queue.len() + self.staged_slots.len() + self.submitted
-    }
-
-    #[inline]
-    fn has_deferred(&self) -> bool {
-        self.deferred_req.is_some()
-    }
-
-    #[inline]
-    fn fetch_reqs(&mut self, queue: &mut IOQueue<S::Submission>, min_reqs: usize) {
-        let mut require_block = min_reqs != 0;
-        loop {
-            let headroom = self.io_depth() - self.local_depth(queue);
-            if headroom == 0 {
-                return;
-            }
-
-            if let Some(req) = self.deferred_req.take() {
-                let queue_len = queue.len();
-                self.deferred_req = self.state_machine.prepare_request(req, headroom, queue);
-                let admitted = queue.len() - queue_len;
-                debug_assert!(
-                    admitted <= headroom,
-                    "state machine admitted more operations than submission headroom"
-                );
-                require_block = false;
-                continue;
-            }
-
-            if self.shutdown {
-                return;
-            }
-
-            let next_msg = if require_block {
-                match self.rx.recv() {
-                    Ok(msg) => Some(msg),
-                    Err(_) => {
-                        self.shutdown = true;
-                        None
-                    }
-                }
-            } else {
-                match self.rx.try_recv() {
-                    Ok(msg) => Some(msg),
-                    Err(TryRecvError::Empty) => None,
-                    Err(TryRecvError::Disconnected) => {
-                        self.shutdown = true;
-                        None
-                    }
-                }
-            };
-            require_block = false;
-
-            let Some(msg) = next_msg else {
-                return;
-            };
-            match msg {
-                IOMessage::Shutdown => {
-                    self.shutdown = true;
-                    return;
-                }
-                IOMessage::Req(req) => {
-                    let queue_len = queue.len();
-                    self.deferred_req = self.state_machine.prepare_request(req, headroom, queue);
-                    let admitted = queue.len() - queue_len;
-                    debug_assert!(
-                        admitted <= headroom,
-                        "state machine admitted more operations than submission headroom"
-                    );
-                }
-            }
-        }
-    }
-
-    #[inline]
-    fn prepare_staged(&mut self, queue: &mut IOQueue<S::Submission>) {
-        while self.slots.has_vacant() {
-            let Some(mut sub) = queue.reqs.pop_front() else {
-                break;
-            };
-            let (token, slot) = self
-                .slots
-                .reserve()
-                .expect("slot reservation should succeed while vacant slots exist");
-            let mut prepared = self.backend.prepare(token, sub.operation());
-            self.backend
-                .push_prepared(&mut self.submit_batch, &mut prepared);
-            self.slots.occupy_reserved(
-                slot,
-                InflightEntry {
-                    submission: sub,
-                    _prepared: prepared,
-                    submitted: false,
-                },
-            );
-            self.staged_slots.push_back(slot);
-        }
-    }
-
-    fn run(mut self) {
-        // IO results.
-        let mut results = self.backend.new_events();
-        // IO queue
-        let mut queue: IOQueue<S::Submission> = IOQueue::with_capacity(self.io_depth());
-        loop {
-            debug_assert!(
-                queue.consistent(),
-                "pending IO number equals to pending request number"
-            );
-            // We only accept new channel requests if shutdown flag is false.
-            // Deferred request remainders are already worker-owned, so they
-            // must still be expanded and drained after shutdown.
-            if self.has_deferred() {
-                self.fetch_reqs(&mut queue, 0);
-            } else if !self.shutdown {
-                if self.local_depth(&queue) == 0 {
-                    // there is no IO operation running.
-                    self.fetch_reqs(&mut queue, 1);
-                } else if self.local_depth(&queue) < self.io_depth() {
-                    self.fetch_reqs(&mut queue, 0);
-                } // otherwise, do not fetch
-            }
-            self.prepare_staged(&mut queue);
-            // Event if shutdown flag is set to true, we still process queued requests.
-            if !self.staged_slots.is_empty() {
-                // Try to submit as many IO requests as possible
-                debug_assert!(self.io_depth() >= self.submitted);
-                let limit = self.io_depth() - self.submitted;
-                let submit_count = self.backend.submit_batch(&mut self.submit_batch, limit);
-                #[cfg(test)]
-                let hook = tests::current_storage_backend_test_hook();
-                for _ in 0..submit_count {
-                    let slot = self
-                        .staged_slots
-                        .pop_front()
-                        .expect("submitted slots must have queued staging order");
-                    let entry = self.slots.get_mut(slot);
-                    debug_assert!(!entry.submitted);
-                    #[cfg(test)]
-                    if let Some(hook) = &hook {
-                        let op = entry.submission.operation();
-                        hook.on_submit(StorageBackendOp::new(op.kind(), op.fd(), op.offset()));
-                    }
-                    self.state_machine.on_submit(&entry.submission);
-                    entry.submitted = true;
-                }
-                debug_assert!(queue.consistent());
-                self.submitted += submit_count;
-                debug_assert!(self.submitted <= self.io_depth());
-            }
-
-            // wait for any request to be done.
-            // Note: even if we received shutdown message, we should wait all submitted IO finish before quiting.
-            // This will prevent kernel from accessing a freed memory via async IO processing.
-            if self.submitted != 0 {
-                let completions = self.backend.wait_at_least(&mut results, 1);
-                let completed_count = completions.len();
-                for (token, res) in completions {
-                    let entry = self.slots.take(token);
-                    debug_assert!(entry.submitted);
-                    #[cfg(test)]
-                    let (entry, res) = {
-                        let mut entry = entry;
-                        let mut res = res;
-                        if let Some(hook) = tests::current_storage_backend_test_hook() {
-                            let op = entry.submission.operation();
-                            hook.on_complete(
-                                StorageBackendOp::new(op.kind(), op.fd(), op.offset()),
-                                &mut res,
-                            );
-                        }
-                        (entry, res)
-                    };
-                    let _ = self.state_machine.on_complete(entry.submission, res);
-                }
-                self.submitted -= completed_count;
-            }
-            // Drain local queues before quitting so backend-staged submissions
-            // and worker-owned request state are not dropped silently.
-            if self.shutdown
-                && self.submitted == 0
-                && !self.has_deferred()
-                && self.staged_slots.is_empty()
-                && queue.is_empty()
-            {
-                break;
-            }
-        }
-        self.state_machine.end_loop();
-    }
-}
-
-#[inline]
-fn build_io_worker<T, B>(backend: B) -> (IOWorkerBuilder<T, B>, IOClient<T>) {
-    let (rx, client) = IOClient::bounded(DEFAULT_IO_EVENT_LOOP_BACKLOG);
-    (IOWorkerBuilder { backend, rx }, client)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::mem::MaybeUninit;
     use std::os::unix::fs::MetadataExt;
     use std::path::Path;
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -950,129 +841,36 @@ mod tests {
         assert!(queue.is_empty());
     }
 
-    #[derive(Clone, Copy)]
-    struct TestBackend {
+    struct DriverBackend {
         max_events: usize,
-    }
-
-    impl IOBackend for TestBackend {
-        type Prepared = ();
-        type SubmitBatch = ();
-        type Events = ();
-
-        fn max_events(&self) -> usize {
-            self.max_events
-        }
-
-        fn new_submit_batch(&self) -> Self::SubmitBatch {}
-
-        fn new_events(&self) -> Self::Events {}
-
-        fn prepare(&mut self, _token: BackendToken, _operation: &mut Operation) -> Self::Prepared {
-            unreachable!("test backend does not stage kernel IO")
-        }
-
-        fn push_prepared(
-            &mut self,
-            _batch: &mut Self::SubmitBatch,
-            _prepared: &mut Self::Prepared,
-        ) {
-            unreachable!("test backend does not stage kernel IO")
-        }
-
-        fn submit_batch(&mut self, _batch: &mut Self::SubmitBatch, _limit: usize) -> usize {
-            unreachable!("test backend does not submit kernel IO")
-        }
-
-        fn wait_at_least(
-            &mut self,
-            _events: &mut Self::Events,
-            _min_nr: usize,
-        ) -> Vec<(BackendToken, StdIoResult<usize>)> {
-            unreachable!("test backend does not wait for kernel IO")
-        }
-    }
-
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    struct ExpandRequest {
-        remaining: usize,
-    }
-
-    struct ExpandSubmission {
-        operation: Operation,
-    }
-
-    impl IOSubmission for ExpandSubmission {
-        fn operation(&mut self) -> &mut Operation {
-            &mut self.operation
-        }
-    }
-
-    #[derive(Default)]
-    struct ExpandingStateMachine;
-
-    impl IOStateMachine for ExpandingStateMachine {
-        type Request = ExpandRequest;
-        type Submission = ExpandSubmission;
-
-        fn prepare_request(
-            &mut self,
-            mut req: ExpandRequest,
-            max_new: usize,
-            queue: &mut IOQueue<ExpandSubmission>,
-        ) -> Option<ExpandRequest> {
-            let emit = req.remaining.min(max_new);
-            for _ in 0..emit {
-                queue.push(ExpandSubmission {
-                    operation: Operation::pwrite_owned(
-                        -1,
-                        0,
-                        DirectBuf::zeroed(STORAGE_SECTOR_SIZE),
-                    ),
-                });
-            }
-            req.remaining -= emit;
-            (req.remaining != 0).then_some(req)
-        }
-
-        fn on_submit(&mut self, _sub: &ExpandSubmission) {}
-
-        fn on_complete(&mut self, _sub: ExpandSubmission, _res: StdIoResult<usize>) -> IOKind {
-            unreachable!("fetch-only tests never complete IO")
-        }
-
-        fn end_loop(self) {}
-    }
-
-    fn test_single_lane_worker(
-        max_events: usize,
-        submitted: usize,
-    ) -> (
-        IOWorker<ExpandRequest, ExpandingStateMachine, TestBackend>,
-        IOClient<ExpandRequest>,
-    ) {
-        let (builder, client) = build_io_worker(TestBackend { max_events });
-        let mut worker = builder.bind(ExpandingStateMachine);
-        worker.submitted = submitted;
-        (worker, client)
-    }
-
-    struct ImmediateBackend {
-        max_events: usize,
+        submit_results: VecDeque<usize>,
         inflight: VecDeque<BackendToken>,
     }
 
-    impl ImmediateBackend {
+    impl DriverBackend {
         #[inline]
         fn new(max_events: usize) -> Self {
-            ImmediateBackend {
+            DriverBackend {
                 max_events,
+                submit_results: VecDeque::new(),
+                inflight: VecDeque::new(),
+            }
+        }
+
+        #[inline]
+        fn with_submit_results(
+            max_events: usize,
+            submit_results: impl Into<VecDeque<usize>>,
+        ) -> Self {
+            DriverBackend {
+                max_events,
+                submit_results: submit_results.into(),
                 inflight: VecDeque::new(),
             }
         }
     }
 
-    impl IOBackend for ImmediateBackend {
+    impl IOBackend for DriverBackend {
         type Prepared = BackendToken;
         type SubmitBatch = VecDeque<BackendToken>;
         type Events = ();
@@ -1096,7 +894,12 @@ mod tests {
         }
 
         fn submit_batch(&mut self, batch: &mut Self::SubmitBatch, limit: usize) -> usize {
-            let submit_count = limit.min(batch.len());
+            let allowed = limit.min(batch.len());
+            let submit_count = self
+                .submit_results
+                .pop_front()
+                .unwrap_or(allowed)
+                .min(allowed);
             for _ in 0..submit_count {
                 let token = batch
                     .pop_front()
@@ -1124,180 +927,135 @@ mod tests {
     }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    struct RecordedRequest {
-        tag: &'static str,
-        next_op: usize,
-        remaining: usize,
+    struct DriverOp {
+        id: usize,
     }
 
-    impl RecordedRequest {
+    struct DriverSubmission {
+        op: DriverOp,
+        operation: Operation,
+    }
+
+    impl DriverSubmission {
         #[inline]
-        fn new(tag: &'static str, remaining: usize) -> Self {
-            RecordedRequest {
-                tag,
-                next_op: 0,
-                remaining,
+        fn new(id: usize, fd: RawFd, offset: usize) -> Self {
+            DriverSubmission {
+                op: DriverOp { id },
+                operation: Operation::pwrite_owned(
+                    fd,
+                    offset,
+                    DirectBuf::zeroed(STORAGE_SECTOR_SIZE),
+                ),
             }
         }
     }
 
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    struct RecordedOp {
-        tag: &'static str,
-        op_idx: usize,
-    }
-
-    struct RecordedSubmission {
-        op: RecordedOp,
-        operation: Operation,
-    }
-
-    impl IOSubmission for RecordedSubmission {
+    impl IOSubmission for DriverSubmission {
         fn operation(&mut self) -> &mut Operation {
             &mut self.operation
         }
     }
 
     #[derive(Default)]
-    struct RecordingLog {
-        submits: std::sync::Mutex<Vec<RecordedOp>>,
-        completes: std::sync::Mutex<Vec<RecordedOp>>,
-        end_count: AtomicUsize,
+    struct RecordingHook {
+        submits: Mutex<Vec<StorageBackendOp>>,
+        completes: Mutex<Vec<StorageBackendOp>>,
     }
 
-    struct RecordingStateMachine {
-        log: Arc<RecordingLog>,
-    }
-
-    type RecordingWorkerParts = (
-        IOWorker<RecordedRequest, RecordingStateMachine, ImmediateBackend>,
-        IOClient<RecordedRequest>,
-        Arc<RecordingLog>,
-    );
-
-    impl RecordingStateMachine {
-        #[inline]
-        fn new(log: Arc<RecordingLog>) -> Self {
-            RecordingStateMachine { log }
-        }
-    }
-
-    impl IOStateMachine for RecordingStateMachine {
-        type Request = RecordedRequest;
-        type Submission = RecordedSubmission;
-
-        fn prepare_request(
-            &mut self,
-            mut req: RecordedRequest,
-            max_new: usize,
-            queue: &mut IOQueue<RecordedSubmission>,
-        ) -> Option<RecordedRequest> {
-            let emit = req.remaining.min(max_new);
-            for op_idx in req.next_op..req.next_op + emit {
-                queue.push(RecordedSubmission {
-                    op: RecordedOp {
-                        tag: req.tag,
-                        op_idx,
-                    },
-                    operation: Operation::pwrite_owned(
-                        -1,
-                        0,
-                        DirectBuf::zeroed(STORAGE_SECTOR_SIZE),
-                    ),
-                });
-            }
-            req.next_op += emit;
-            req.remaining -= emit;
-            (req.remaining != 0).then_some(req)
+    impl StorageBackendTestHook for RecordingHook {
+        fn on_submit(&self, op: StorageBackendOp) {
+            self.submits.lock().unwrap().push(op);
         }
 
-        fn on_submit(&mut self, sub: &RecordedSubmission) {
-            self.log.submits.lock().unwrap().push(sub.op);
+        fn on_complete(&self, op: StorageBackendOp, _res: &mut StdIoResult<usize>) {
+            self.completes.lock().unwrap().push(op);
         }
-
-        fn on_complete(&mut self, sub: RecordedSubmission, _res: StdIoResult<usize>) -> IOKind {
-            self.log.completes.lock().unwrap().push(sub.op);
-            IOKind::Write
-        }
-
-        fn end_loop(self) {
-            self.log.end_count.fetch_add(1, Ordering::Relaxed);
-        }
-    }
-
-    fn recording_worker(max_events: usize) -> RecordingWorkerParts {
-        let log = Arc::new(RecordingLog::default());
-        let (builder, client) = build_io_worker(ImmediateBackend::new(max_events));
-        let worker = builder.bind(RecordingStateMachine::new(Arc::clone(&log)));
-        (worker, client, log)
     }
 
     #[test]
-    fn test_fetch_reqs_stops_after_request_expands_to_io_depth() {
-        let (mut worker, client) = test_single_lane_worker(2, 0);
-        let mut queue = IOQueue::with_capacity(2);
+    fn test_submission_driver_submits_and_completes_with_hooks() {
+        let hook = Arc::new(RecordingHook::default());
+        let _install = install_storage_backend_test_hook(hook.clone());
+        let mut driver = SubmissionDriver::new(DriverBackend::new(2));
 
-        client.send(ExpandRequest { remaining: 5 }).unwrap();
-        worker.fetch_reqs(&mut queue, 1);
-
-        assert_eq!(queue.len(), 2);
-        assert_eq!(worker.local_depth(&queue), 2);
-        assert_eq!(worker.deferred_req, Some(ExpandRequest { remaining: 3 }));
-    }
-
-    #[test]
-    fn test_fetch_reqs_counts_submitted_work_against_io_depth() {
-        let (mut worker, client) = test_single_lane_worker(2, 1);
-        let mut queue = IOQueue::with_capacity(2);
-
-        client.send(ExpandRequest { remaining: 1 }).unwrap();
-        client.send(ExpandRequest { remaining: 1 }).unwrap();
-
-        worker.fetch_reqs(&mut queue, 0);
-        assert_eq!(queue.len(), 1);
-        assert_eq!(worker.local_depth(&queue), 2);
-        assert!(!worker.has_deferred());
-
-        worker.submitted = 0;
-        worker.fetch_reqs(&mut queue, 0);
-        assert_eq!(queue.len(), 2);
-        assert_eq!(worker.local_depth(&queue), 2);
-    }
-
-    #[test]
-    fn test_single_lane_worker_drains_deferred_and_queued_work_once_on_shutdown() {
-        let (worker, client, log) = recording_worker(1);
-
-        client.send(RecordedRequest::new("main", 3)).unwrap();
-        client.send(RecordedRequest::new("tail", 1)).unwrap();
-        client.shutdown();
-
-        worker.run();
-
-        let submits = log.submits.lock().unwrap().clone();
-        let completes = log.completes.lock().unwrap().clone();
-        assert_eq!(
-            submits,
-            vec![
-                RecordedOp {
-                    tag: "main",
-                    op_idx: 0,
-                },
-                RecordedOp {
-                    tag: "main",
-                    op_idx: 1,
-                },
-                RecordedOp {
-                    tag: "main",
-                    op_idx: 2,
-                },
-                RecordedOp {
-                    tag: "tail",
-                    op_idx: 0,
-                },
-            ]
+        assert_eq!(driver.capacity(), 2);
+        assert_eq!(driver.available_capacity(), 2);
+        assert!(driver.push(DriverSubmission::new(1, 41, 0)).is_ok());
+        assert!(
+            driver
+                .push(DriverSubmission::new(2, 41, STORAGE_SECTOR_SIZE))
+                .is_ok()
         );
-        assert_eq!(completes, submits);
-        assert_eq!(log.end_count.load(Ordering::Relaxed), 1);
+        assert_eq!(driver.pending_len(), 2);
+        assert_eq!(driver.submitted_len(), 0);
+        assert_eq!(driver.available_capacity(), 0);
+
+        assert_eq!(driver.submit_ready(), 2);
+        assert_eq!(driver.pending_len(), 2);
+        assert_eq!(driver.submitted_len(), 2);
+
+        let first = driver.wait_one();
+        assert_eq!(first.submission.op.id, 1);
+        assert_eq!(first.result.unwrap(), STORAGE_SECTOR_SIZE);
+        assert_eq!(driver.pending_len(), 1);
+        assert_eq!(driver.submitted_len(), 1);
+
+        let second = driver.wait_one();
+        assert_eq!(second.submission.op.id, 2);
+        assert_eq!(second.result.unwrap(), STORAGE_SECTOR_SIZE);
+        assert_eq!(driver.pending_len(), 0);
+        assert_eq!(driver.submitted_len(), 0);
+        assert_eq!(driver.available_capacity(), 2);
+
+        let expected_ops = vec![
+            StorageBackendOp::new(IOKind::Write, 41, 0),
+            StorageBackendOp::new(IOKind::Write, 41, STORAGE_SECTOR_SIZE),
+        ];
+        assert_eq!(
+            hook.submits.lock().unwrap().as_slice(),
+            expected_ops.as_slice()
+        );
+        assert_eq!(
+            hook.completes.lock().unwrap().as_slice(),
+            expected_ops.as_slice()
+        );
+    }
+
+    #[test]
+    fn test_submission_driver_keeps_zero_submit_staged_for_retry() {
+        let mut driver = SubmissionDriver::new(DriverBackend::with_submit_results(
+            2,
+            VecDeque::from([0, 1, 1]),
+        ));
+
+        assert!(driver.push(DriverSubmission::new(1, 42, 0)).is_ok());
+        assert!(
+            driver
+                .push(DriverSubmission::new(2, 42, STORAGE_SECTOR_SIZE))
+                .is_ok()
+        );
+
+        assert_eq!(driver.submit_ready(), 0);
+        assert_eq!(driver.pending_len(), 2);
+        assert_eq!(driver.submitted_len(), 0);
+        assert_eq!(driver.available_capacity(), 0);
+
+        assert_eq!(driver.submit_ready(), 1);
+        assert_eq!(driver.pending_len(), 2);
+        assert_eq!(driver.submitted_len(), 1);
+        assert_eq!(driver.available_capacity(), 0);
+
+        let first = driver.wait_one();
+        assert_eq!(first.submission.op.id, 1);
+        assert_eq!(driver.pending_len(), 1);
+        assert_eq!(driver.submitted_len(), 0);
+        assert_eq!(driver.available_capacity(), 1);
+
+        assert_eq!(driver.submit_ready(), 1);
+        let second = driver.wait_one();
+        assert_eq!(second.submission.op.id, 2);
+        assert_eq!(driver.pending_len(), 0);
+        assert_eq!(driver.submitted_len(), 0);
+        assert_eq!(driver.available_capacity(), 2);
     }
 }

@@ -238,7 +238,7 @@ impl SparseFile {
     /// Returns the file syncer.
     #[inline]
     pub(crate) fn syncer(&self) -> FileSyncer {
-        FileSyncer(self.fd)
+        FileSyncer::from_borrowed_fd(self.fd)
     }
 
     /// Grow the file to given size.
@@ -548,8 +548,10 @@ impl TableFsStateMachine {
     }
 }
 
-/// FileSyncer is a simple wrapper to provide functionality
-/// of fsync() and fdatasync().
+/// Borrowed file descriptor wrapper for fsync() and fdatasync().
+///
+/// `FileSyncer` does not own or close the descriptor. The caller must keep the
+/// underlying file descriptor open until the sync operation returns.
 pub(crate) struct FileSyncer(RawFd);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -559,6 +561,15 @@ pub(crate) enum FileSyncKind {
 }
 
 impl FileSyncer {
+    /// Builds a syncer for a borrowed file descriptor.
+    ///
+    /// The returned value does not take ownership of `fd`; it is only valid
+    /// while the caller keeps that descriptor open.
+    #[inline]
+    pub(crate) fn from_borrowed_fd(fd: RawFd) -> Self {
+        Self(fd)
+    }
+
     #[inline]
     pub(crate) fn fsync(&self) -> Result<()> {
         self.sync(FileSyncKind::Fsync)
@@ -583,9 +594,9 @@ impl FileSyncer {
             }
         }
 
-        // SAFETY: `self.0` is an owned live file descriptor for the lifetime of
-        // this `FileSyncer`, and the libc sync calls do not retain borrowed
-        // memory beyond the syscall.
+        // SAFETY: `self.0` is a live borrowed file descriptor for this sync
+        // call, and the libc sync calls do not retain borrowed memory beyond
+        // the syscall.
         let ret = unsafe {
             match kind {
                 FileSyncKind::Fsync => fsync(self.0),
