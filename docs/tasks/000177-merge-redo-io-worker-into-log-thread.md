@@ -1,7 +1,7 @@
 ---
 id: 000177
 title: Merge Redo IO Worker Into Log Thread
-status: proposal
+status: implemented
 created: 2026-06-13
 github_issue: 706
 ---
@@ -250,6 +250,50 @@ Rejected alternatives considered:
 
 ## Implementation Notes
 
+Implemented the redo log worker merge and the follow-up correctness fixes.
+
+- Added a backend-neutral `SubmissionDriver<S, B = StorageBackend>` and moved
+  redo write submission into a `LogWriteDriver` owned by `Log-Thread`, removing
+  the nested redo `IOWorker` and channel handoff while preserving backend
+  submit/wait statistics, direct-buffer ownership, completion-token validation,
+  and storage backend test hooks.
+- Renamed the transaction redo worker ownership/startup path from IO-thread
+  terminology to log-thread terminology, including the spawned thread name and
+  shutdown comments.
+- Kept scheduling policy in `FileProcessor`: group-commit queue draining,
+  direct write submission, ordered completion, file sync, purge handoff,
+  failed-precommit cleanup, shutdown drain, and log rotation remain log-thread
+  responsibilities; the write driver only owns backend submissions.
+- Split and documented the scheduler phases as `submit_io`,
+  `wait_one_io_if_submitted`, and `finalize_finished_prefix`.
+  `finish_pending_io` now always tries `finalize_finished_prefix` before and
+  after waits so finished no-log or already-completed groups drain even when
+  there is no backend-submitted write to wait for.
+- Bound redo fsync to the actual written prefix rather than a processor-level
+  current-file snapshot: `SyncGroup` carries the redo log fd for redo-bearing
+  groups, `finalize_finished_prefix` constructs a borrowed `FileSyncer` from
+  the written prefix fd, and `Commit::Switch(SparseFile)` keeps old-file fds
+  alive until pending groups drain.
+- Removed the stale redo-submit fatal surface after submit stopped being
+  channel-based; redo write and sync failures remain `FatalError::RedoWrite`
+  and `FatalError::RedoSync`.
+- Hardened regression coverage for no-submitted-write pending drains,
+  switch-ended-file fsync targeting, dropped commit waiter shutdown draining,
+  closed admission after shutdown wake, redo write/sync failures, and commit
+  handoff waiter-drop behavior.
+- Created a deferred backlog follow-up for broader redo commit-group
+  construction and sync batching policy:
+  `docs/backlogs/000126-redo-commit-group-sync-batching-policy.md`.
+
+Validation completed:
+
+- `cargo fmt`
+- `cargo nextest run -p doradb-storage trx::log`
+- `cargo clippy -p doradb-storage --all-targets -- -D warnings`
+- `cargo nextest run -p doradb-storage`
+- `cargo nextest run -p doradb-storage --no-default-features --features libaio`
+- `git diff --check`
+
 ## Impacts
 
 - `doradb-storage/src/io/mod.rs`
@@ -342,4 +386,9 @@ Rejected alternatives considered:
 
 ## Open Questions
 
-None.
+The broader redo commit-group construction and opportunistic sync batching
+policy remains intentionally deferred because it needs a wider design pass on
+commit-group formation, inflight group shape, nonblocking completion draining,
+and the latency/throughput tradeoff of collapsed fsyncs:
+
+- `docs/backlogs/000126-redo-commit-group-sync-batching-policy.md`
