@@ -34,10 +34,10 @@ use crate::log::discover_redo_log_files;
 pub struct TrxSysConfig {
     // Controls inflight IO request depth of the redo log stream.
     pub io_depth: usize,
-    // Controls log block size of each IO request.
-    // This only limit the combination of multiple transactions.
-    // If single transaction has very large redo log. It is kept
-    // as-is and submitted by the log thread as one request.
+    // Controls the sector-aligned log block size for small-group IO.
+    // This only limits grouped transactions. If a single transaction has a very
+    // large redo log, it is kept as-is and submitted by the log thread as one
+    // request.
     pub log_block_size: Byte,
     // Directory where redo log files live.
     pub log_dir: PathBuf,
@@ -116,13 +116,15 @@ impl TrxSysConfig {
         self
     }
 
-    /// How large single IO operation can be.
+    /// Sector-aligned log block size for small redo groups.
     #[inline]
     pub fn log_block_size<T>(mut self, log_block_size: T) -> Self
     where
         Byte: From<T>,
     {
-        self.log_block_size = Byte::from(log_block_size);
+        let size = Byte::from(log_block_size);
+        let aligned_size = align_to_sector_size(size.as_u64() as usize);
+        self.log_block_size = <Byte as From<usize>>::from(aligned_size);
         self
     }
 
@@ -281,5 +283,35 @@ impl Default for TrxSysConfig {
             log_sync: DEFAULT_LOG_SYNC,
             purge_threads: DEFAULT_PURGE_THREADS,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::io::STORAGE_SECTOR_SIZE;
+
+    #[test]
+    fn log_block_size_rounds_below_sector_to_sector_size() {
+        let config = TrxSysConfig::default().log_block_size(1usize);
+
+        assert_eq!(config.log_block_size.as_u64(), STORAGE_SECTOR_SIZE as u64);
+    }
+
+    #[test]
+    fn log_block_size_preserves_sector_aligned_size() {
+        let config = TrxSysConfig::default().log_block_size(STORAGE_SECTOR_SIZE);
+
+        assert_eq!(config.log_block_size.as_u64(), STORAGE_SECTOR_SIZE as u64);
+    }
+
+    #[test]
+    fn log_block_size_rounds_above_sector_to_next_sector() {
+        let config = TrxSysConfig::default().log_block_size(STORAGE_SECTOR_SIZE + 1);
+
+        assert_eq!(
+            config.log_block_size.as_u64(),
+            (STORAGE_SECTOR_SIZE * 2) as u64
+        );
     }
 }

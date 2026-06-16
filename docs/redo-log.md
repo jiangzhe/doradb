@@ -386,10 +386,10 @@ floors prove that older segments are no longer needed. This likely needs the
 watermark expansion already tracked by
 `docs/backlogs/000032-deletion-watermark-meta-redo-expansion-for-log-truncation.md`.
 
-Validate and enforce `log_block_size` alignment at the config boundary. Redo
-header validation rejects persisted files whose `log_block_size` is not a
-multiple of `STORAGE_SECTOR_SIZE`, but the config setter still does not align or
-reject arbitrary values before file creation.
+Keep `log_block_size` config normalization and header validation in sync. The
+config setter rounds values up to `STORAGE_SECTOR_SIZE` multiples before file
+creation, and redo header validation rejects persisted files whose
+`log_block_size` is not a sector-aligned size.
 
 Audit small-group buffer stride. Small groups are read with a fixed
 `log_block_size` stride, while fallback `LogBuf::new` can allocate only the

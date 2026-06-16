@@ -3,6 +3,7 @@ id: 000178
 title: Redo Log Super Blocks
 status: proposal
 created: 2026-06-15
+github_issue: 710
 ---
 
 # Task: Redo Log Super Blocks

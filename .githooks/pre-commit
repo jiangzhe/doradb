@@ -63,6 +63,7 @@ while IFS= read -r path; do
     doradb-storage/src/trx/*|\
     doradb-storage/src/lwc/*|\
     doradb-storage/src/file/*|\
+    doradb-storage/src/log/*|\
     tools/unsafe_inventory.rs|\
     docs/unsafe-usage-baseline.md)
       needs_baseline=1

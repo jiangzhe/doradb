@@ -37,16 +37,15 @@ use std::thread::JoinHandle;
 
 pub(crate) const GC_BUCKETS: usize = 64;
 
-enum EnqueuedCommit {
-    Queued {
-        cts: TrxID,
-        waiter: CommitJoin,
-    },
-    Rejected {
-        cts: TrxID,
-        trx: Box<PrecommitTrx>,
-        reason: FailedPrecommitReason,
-    },
+struct QueuedCommit {
+    cts: TrxID,
+    waiter: CommitJoin,
+}
+
+struct CommitRejection {
+    cts: TrxID,
+    trx: Box<PrecommitTrx>,
+    reason: FailedPrecommitReason,
 }
 
 /// TransactionSystem controls lifecycle of all transactions.
@@ -387,17 +386,38 @@ impl TransactionSystem {
         redo_log: &RedoLog,
         group_commit_g: &mut MutexGuard<'_, GroupCommit>,
         trx: Box<PrecommitTrx>,
-    ) -> EnqueuedCommit {
+    ) -> CommitRejection {
         let cts = trx.cts;
         let err = self.poison_storage(FatalError::RedoWrite);
         let reason = FailedPrecommitReason::Fatal(*err.current_context());
         group_commit_g.close(reason);
         redo_log.group_commit.notify_one();
-        EnqueuedCommit::Rejected { cts, trx, reason }
+        CommitRejection { cts, trx, reason }
     }
 
     #[inline]
-    fn enqueue_commit(&self, trx: PreparedTrx, wait_sync: bool) -> EnqueuedCommit {
+    fn try_enqueue_new_group(
+        &self,
+        precommit_trx: PrecommitTrx,
+        group_commit_g: &mut MutexGuard<'_, GroupCommit>,
+        wait_sync: bool,
+    ) -> std::result::Result<CommitJoin, CommitRejection> {
+        let redo_log = &*self.redo_log;
+        match redo_log.enqueue_precommit_group(precommit_trx, group_commit_g, wait_sync) {
+            Ok(waiter) => {
+                redo_log.group_commit.notify_one();
+                Ok(waiter)
+            }
+            Err(trx) => Err(self.reject_group_creation_failure(redo_log, group_commit_g, trx)),
+        }
+    }
+
+    #[inline]
+    fn enqueue_commit(
+        &self,
+        trx: PreparedTrx,
+        wait_sync: bool,
+    ) -> std::result::Result<QueuedCommit, CommitRejection> {
         let redo_log = &*self.redo_log;
         let mut group_commit_g = redo_log.group_commit.lock();
         let cts = TrxID::new(self.ts.fetch_add(1, Ordering::SeqCst));
@@ -405,85 +425,71 @@ impl TransactionSystem {
         let precommit_trx = trx.fill_cts(cts);
         if let Some(reason) = group_commit_g.closed {
             drop(group_commit_g);
-            return EnqueuedCommit::Rejected {
+            return Err(CommitRejection {
                 cts,
                 trx: Box::new(precommit_trx),
                 reason,
-            };
+            });
         }
         if group_commit_g.queue.is_empty() {
-            let waiter = match redo_log.enqueue_precommit_group(
-                precommit_trx,
-                &mut group_commit_g,
-                wait_sync,
-            ) {
-                Ok(waiter) => waiter,
-                Err(trx) => {
-                    let rejected =
-                        self.reject_group_creation_failure(redo_log, &mut group_commit_g, trx);
-                    drop(group_commit_g);
-                    return rejected;
-                }
-            };
-            redo_log.group_commit.notify_one();
+            let waiter =
+                match self.try_enqueue_new_group(precommit_trx, &mut group_commit_g, wait_sync) {
+                    Ok(waiter) => waiter,
+                    Err(rejected) => {
+                        drop(group_commit_g);
+                        return Err(rejected);
+                    }
+                };
             drop(group_commit_g);
-            return EnqueuedCommit::Queued { cts, waiter };
+            return Ok(QueuedCommit { cts, waiter });
         }
         let Some(last_entry) = group_commit_g.queue.back_mut() else {
             drop(group_commit_g);
-            return EnqueuedCommit::Rejected {
+            return Err(CommitRejection {
                 cts,
                 trx: Box::new(precommit_trx),
                 reason: FailedPrecommitReason::Shutdown,
-            };
+            });
         };
         let last_group = match last_entry {
             Commit::Shutdown => {
                 drop(group_commit_g);
-                return EnqueuedCommit::Rejected {
+                return Err(CommitRejection {
                     cts,
                     trx: Box::new(precommit_trx),
                     reason: FailedPrecommitReason::Shutdown,
-                };
+                });
             }
             Commit::Group(group) => group,
             Commit::LogFileBoundary { .. } => {
-                let waiter = match redo_log.enqueue_precommit_group(
-                    precommit_trx,
-                    &mut group_commit_g,
-                    wait_sync,
-                ) {
-                    Ok(waiter) => waiter,
-                    Err(trx) => {
-                        let rejected =
-                            self.reject_group_creation_failure(redo_log, &mut group_commit_g, trx);
-                        drop(group_commit_g);
-                        return rejected;
-                    }
-                };
-                redo_log.group_commit.notify_one();
+                let waiter =
+                    match self.try_enqueue_new_group(precommit_trx, &mut group_commit_g, wait_sync)
+                    {
+                        Ok(waiter) => waiter,
+                        Err(rejected) => {
+                            drop(group_commit_g);
+                            return Err(rejected);
+                        }
+                    };
                 drop(group_commit_g);
-                return EnqueuedCommit::Queued { cts, waiter };
+                return Ok(QueuedCommit { cts, waiter });
             }
         };
         if last_group.can_join(&precommit_trx) {
             let waiter = last_group.join(precommit_trx, wait_sync);
             drop(group_commit_g);
-            return EnqueuedCommit::Queued { cts, waiter };
+            return Ok(QueuedCommit { cts, waiter });
         }
-        let waiter =
-            match redo_log.enqueue_precommit_group(precommit_trx, &mut group_commit_g, wait_sync) {
-                Ok(waiter) => waiter,
-                Err(trx) => {
-                    let rejected =
-                        self.reject_group_creation_failure(redo_log, &mut group_commit_g, trx);
-                    drop(group_commit_g);
-                    return rejected;
-                }
-            };
-        redo_log.group_commit.notify_one();
+        let waiter = match self.try_enqueue_new_group(precommit_trx, &mut group_commit_g, wait_sync)
+        {
+            Ok(waiter) => waiter,
+            Err(rejected) => {
+                drop(group_commit_g);
+                return Err(rejected);
+            }
+        };
         drop(group_commit_g);
-        EnqueuedCommit::Queued { cts, waiter }
+        Ok(QueuedCommit { cts, waiter })
     }
 
     #[inline]
@@ -501,11 +507,11 @@ impl TransactionSystem {
         // must wait for durability so the caller can commit/rollback the
         // session explicitly.
         match self.enqueue_commit(trx, false) {
-            EnqueuedCommit::Queued { cts, waiter } => {
+            Ok(QueuedCommit { cts, waiter }) => {
                 debug_assert!(waiter.is_none());
                 Ok(cts)
             }
-            EnqueuedCommit::Rejected { cts, trx, reason } => {
+            Err(CommitRejection { cts, trx, reason }) => {
                 (*trx).discard_rejected();
                 Err(reason.into_error(format!("redo group commit is closed: commit_ts={cts}")))
             }
@@ -515,8 +521,8 @@ impl TransactionSystem {
     #[inline]
     pub(crate) async fn commit_prepared(&self, trx: PreparedTrx) -> Result<TrxID> {
         let (cts, waiter) = match self.enqueue_commit(trx, true) {
-            EnqueuedCommit::Queued { cts, waiter } => (cts, waiter),
-            EnqueuedCommit::Rejected { cts, trx, reason } => {
+            Ok(QueuedCommit { cts, waiter }) => (cts, waiter),
+            Err(CommitRejection { cts, trx, reason }) => {
                 let completion = Arc::new(Completion::new());
                 let waiter = Arc::clone(&completion);
                 self.request_failed_precommit_cleanup(FailedPrecommitCleanupJob::new(

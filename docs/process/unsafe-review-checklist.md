@@ -1,7 +1,7 @@
 # Unsafe Review Checklist
 
 Use this checklist for every PR that touches `unsafe` blocks/functions in:
-`doradb-storage/src/{buffer,latch,row,index,io,trx,lwc,file}`.
+`doradb-storage/src/{buffer,latch,row,index,io,trx,lwc,file,log}`.
 
 Policy reference:
 - `docs/unsafe-usage-principles.md`
@@ -19,7 +19,7 @@ Hook behavior (`.githooks/pre-commit`):
   - `cargo fmt` (commit blocked if it changes files)
   - `cargo clippy -p doradb-storage --all-targets -- -D warnings` (commit blocked on any warning; production crate roots carry `clippy::undocumented_unsafe_blocks` via crate-level lint attributes)
 - Precondition: staged files include any path in
-  `doradb-storage/src/{buffer,latch,row,index,io,trx,lwc,file}`,
+  `doradb-storage/src/{buffer,latch,row,index,io,trx,lwc,file,log}`,
   `tools/unsafe_inventory.rs`, or `docs/unsafe-usage-baseline.md`.
 - Action: run
   `tools/unsafe_inventory.rs --write docs/unsafe-usage-baseline.md`.
