@@ -1,7 +1,7 @@
 ---
 id: 000178
 title: Redo Log Super Blocks
-status: proposal
+status: implemented
 created: 2026-06-15
 github_issue: 710
 ---
@@ -221,6 +221,47 @@ Following phase preserved:
 
 ## Implementation Notes
 
+- Implemented RFC-0020 Phase 1's v2 redo super-block baseline:
+  `doradb-storage/src/log/` now owns redo format, redo payload definitions,
+  replay, and recovery, with the former `trx/log.rs` content merged into
+  `log/mod.rs`.
+- Added `log/redo_format.rs` with fixed 4KB A/B redo header slots,
+  `RedoFileHeader` serialization, footer redundancy, BLAKE3 checksum
+  validation, header field validation, and newest-valid-slot selection.
+- New redo files write one valid initial slot-0 header and start redo payload
+  allocation at `REDO_DEFAULT_DATA_START_OFFSET`; legacy zero-header redo files
+  are rejected.
+- Header writes run through the existing async redo log write path via
+  log-file-boundary processing. No synchronous one-block metadata driver was
+  kept.
+- `MmapLogReader`, startup recovery, and catalog checkpoint scans now use the
+  selected header's `log_block_size` and `file_max_size`, validate the filename
+  sequence against the header sequence, and stop replay at the logical
+  `file_max_size` boundary.
+- Renamed the redo stride from `max_io_size`/`io_depth_per_log` to
+  `log_block_size`/`io_depth`, changed the default log block size to 4096, and
+  validate config values for direct-IO sector alignment at the config boundary.
+- Moved commit admission, GC bucket/min-active-STS ownership, and log thread
+  orchestration onto `TransactionSystem`; simplified `RedoLog` around redo file
+  state and write mechanics.
+- Removed redundant phase-1 state and fields, including `RedoFileState`,
+  `header_slot_size`, `checksum_kind`, `data_start_offset`,
+  `MmapLogReader::selected_header`, and the production `MmapLogReader::new_at`
+  helper.
+- Updated `docs/redo-log.md` and unsafe inventory docs/scripts so the new
+  top-level log module is included in the documented redo baseline.
+- Review follow-ups completed during implementation include async header
+  writes, merging header/switch queue variants into `Commit::LogFileBoundary`,
+  replacing repeated enqueue rejection handling with `CommitRejection`, moving
+  test-only replay helpers into tests, narrowing the readonly-buffer duplicate
+  load test to observable results, and bounding mmap replay reads by logical
+  redo file size.
+- Validation completed:
+  - `cargo test -p doradb-storage log::log_replay`
+  - `cargo fmt -p doradb-storage --check`
+  - `cargo clippy -p doradb-storage --all-targets -- -D warnings`
+  - `cargo nextest run -p doradb-storage`
+  - `cargo nextest run -p doradb-storage --no-default-features --features libaio`
 
 ## Impacts
 
@@ -305,10 +346,6 @@ Validation commands:
 
 ## Open Questions
 
-- Should the new `log/mod.rs` re-export common internal types such as
-  `RedoLogInitializer`, `TrxLog`, `RedoLogs`, and `RecoverMap`, or should call
-  sites import from submodules directly? Prefer narrow re-exports only when they
-  materially reduce churn.
 - Super-block writes use the redo log thread's async write driver with a header
   submission kind. No generic metadata-write abstraction is added in this phase.
 - RFC-0020 Phase 2 remains responsible for group checksum, strict transaction

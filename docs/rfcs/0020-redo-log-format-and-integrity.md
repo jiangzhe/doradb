@@ -295,7 +295,7 @@ the unsafe boundary local to reader construction. [C2], [B2]
 ## Implementation Phases
 
 - **Phase 1: V2 Redo Super Blocks**
-  - Scope: Define `RedoFileHeaderV2`, rename `max_io_size` to
+  - Scope: Define `RedoFileHeader`, rename `max_io_size` to
     `log_block_size`, write an initial header into one fixed 4KB redo super-block
     slot on new files, parse the two A/B header slots during discovery/recovery,
     record `log_block_size`, and reject files without a
@@ -309,14 +309,14 @@ the unsafe boundary local to reader construction. [C2], [B2]
     deletion.
   - Prerequisites: Existing redo directories must be empty or already v2; old
     zero-header files are intentionally rejected.
-  - Phase-local Choices: Exact field sizes; footer redundancy field layout;
-    whether header parsing lives in `trx/log.rs` or a new redo-format module;
-    whether super-block writes use the redo log thread's async write driver
-    with a separate header submission kind.
-  - Task Doc: `docs/tasks/TBD.md`
-  - Task Issue: `#0`
-  - Phase Status: `pending`
-  - Implementation Summary: `pending`
+  - Phase-local Choices: Resolved by using `RedoFileHeader` in
+    `doradb-storage/src/log/redo_format.rs` with fixed 4KB slots, footer
+    redundancy, BLAKE3 checksum validation, and async super-block writes through
+    the redo log thread's write driver.
+  - Task Doc: `docs/tasks/000178-redo-log-super-blocks.md`
+  - Task Issue: `#710`
+  - Phase Status: done
+  - Implementation Summary: Implemented v2 redo super-block baseline with top-level log module, fixed A/B redo headers, async initial header writes, validated replay/checkpoint scanning, log_block_size/io_depth rename, logical file-size replay bounds, and related docs/tests cleanup. [Task Resolve Sync: docs/tasks/000178-redo-log-super-blocks.md @ 2026-06-16]
 
 - **Phase 2: Group Checksum and Strict Record Framing**
   - Scope: Add the v2 group metadata area after the existing first length
@@ -376,8 +376,8 @@ the unsafe boundary local to reader construction. [C2], [B2]
     tested.
   - Non-goals: Benchmarking sync batching or implementing truncation.
   - Prerequisites: Phases 1 through 4 define the final v2 behavior.
-  - Phase-local Choices: Final test split across `trx/log.rs`,
-    `trx/log_replay.rs`, `trx/recover.rs`, and catalog/table recovery tests.
+  - Phase-local Choices: Final test split across `log/mod.rs`,
+    `log/log_replay.rs`, `log/recover.rs`, and catalog/table recovery tests.
   - Task Doc: `docs/tasks/TBD.md`
   - Task Issue: `#0`
   - Phase Status: `pending`
