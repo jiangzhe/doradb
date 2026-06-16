@@ -253,6 +253,12 @@ impl MmapLogReader {
     }
 
     #[inline]
+    fn bounded_read_end(&self, len: usize) -> Option<usize> {
+        let end = self.offset.checked_add(len)?;
+        (end <= self.max_file_size).then_some(end)
+    }
+
+    #[inline]
     pub(crate) fn read(&mut self) -> ReadLog<'_> {
         if self.offset >= self.max_file_size {
             return ReadLog::SizeLimit; // file is exhausted.
@@ -261,7 +267,10 @@ impl MmapLogReader {
         debug_assert!(self.offset.is_multiple_of(STORAGE_SECTOR_SIZE));
         // Try single page first.
         // This may fail as log is incomplete.
-        if let Some(mut buf) = self.m.get(self.offset..self.offset + self.log_block_size) {
+        let Some(read_end) = self.bounded_read_end(self.log_block_size) else {
+            return ReadLog::DataEnd;
+        };
+        if let Some(mut buf) = self.m.get(self.offset..read_end) {
             // Log buffer has prefix 8-byte integer, indicating the data length.
             if let Ok((idx, data_len)) = buf.deser_u64(0) {
                 // Log file is truncated to certain size, and if no data is written, the header of page
@@ -274,7 +283,10 @@ impl MmapLogReader {
                 if group_len > buf.len() {
                     // this can happen if a group exceeds the single page size.
                     let aligned_len = align_to_sector_size(group_len);
-                    if let Some(new_buf) = self.m.get(self.offset..self.offset + aligned_len) {
+                    let Some(read_end) = self.bounded_read_end(aligned_len) else {
+                        return ReadLog::DataEnd;
+                    };
+                    if let Some(new_buf) = self.m.get(self.offset..read_end) {
                         buf = new_buf;
                     } else {
                         return ReadLog::DataCorrupted; // file is incomplete.
@@ -322,6 +334,36 @@ mod tests {
             max_file_size,
             offset,
         })
+    }
+
+    #[test]
+    fn test_log_reader_stops_when_initial_block_crosses_logical_file_size() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("test.log");
+        let mut file = File::create(&file_path).unwrap();
+        file.write_all(&vec![0u8; STORAGE_SECTOR_SIZE * 2]).unwrap();
+        file.flush().unwrap();
+
+        let mut reader =
+            new_reader_at(file_path, STORAGE_SECTOR_SIZE * 2, STORAGE_SECTOR_SIZE, 0).unwrap();
+
+        assert!(matches!(reader.read(), ReadLog::DataEnd));
+    }
+
+    #[test]
+    fn test_log_reader_stops_when_expanded_group_crosses_logical_file_size() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("test.log");
+        let mut bytes = vec![0u8; STORAGE_SECTOR_SIZE * 2];
+        bytes[..mem::size_of::<u64>()].copy_from_slice(&(STORAGE_SECTOR_SIZE as u64).to_le_bytes());
+        let mut file = File::create(&file_path).unwrap();
+        file.write_all(&bytes).unwrap();
+        file.flush().unwrap();
+
+        let mut reader =
+            new_reader_at(file_path, STORAGE_SECTOR_SIZE, STORAGE_SECTOR_SIZE, 0).unwrap();
+
+        assert!(matches!(reader.read(), ReadLog::DataEnd));
     }
 
     #[test]
