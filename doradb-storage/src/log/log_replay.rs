@@ -3,9 +3,7 @@ use crate::io::{DirectBuf, IOBuf};
 use crate::io::{STORAGE_SECTOR_SIZE, align_to_sector_size};
 use crate::log::RedoLogInitializer;
 use crate::log::redo::{RedoHeader, RedoLogs};
-use crate::log::redo_format::{
-    REDO_DEFAULT_DATA_START_OFFSET, SelectedRedoFileHeader, select_redo_file_header,
-};
+use crate::log::redo_format::{REDO_DEFAULT_DATA_START_OFFSET, select_redo_file_header};
 use crate::serde::{Deser, LenPrefixPod, Ser, Serde};
 use error_stack::Report;
 use memmap2::Mmap;
@@ -227,14 +225,6 @@ pub(crate) struct MmapLogReader {
     log_block_size: usize,
     max_file_size: usize,
     offset: usize,
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "selected redo header metadata is retained for recovery diagnostics"
-        )
-    )]
-    selected_header: Option<SelectedRedoFileHeader>,
 }
 
 impl MmapLogReader {
@@ -244,8 +234,7 @@ impl MmapLogReader {
         // SAFETY: the file handle stays alive for the duration of mapping
         // creation, and the returned `Mmap` owns the mapping afterward.
         let m = unsafe { Mmap::map(&file)? };
-        let selected_header = select_redo_file_header(&m, expected_file_seq)?;
-        let header = &selected_header.header;
+        let header = select_redo_file_header(&m, expected_file_seq)?.header;
         if header.file_max_size as usize > m.len() {
             return Err(Report::new(DataIntegrityError::InvalidPayload)
                 .attach(format!(
@@ -260,35 +249,7 @@ impl MmapLogReader {
             log_block_size: header.log_block_size as usize,
             max_file_size: header.file_max_size as usize,
             offset: REDO_DEFAULT_DATA_START_OFFSET,
-            selected_header: Some(selected_header),
         })
-    }
-
-    #[inline]
-    #[cfg(test)]
-    pub(crate) fn new_at(
-        log_file_path: impl AsRef<Path>,
-        log_block_size: usize,
-        max_file_size: usize,
-        offset: usize,
-    ) -> Result<Self> {
-        let file = File::open(log_file_path.as_ref())?;
-        // SAFETY: the file handle stays alive for the duration of mapping
-        // creation, and the returned `Mmap` owns the mapping afterward.
-        let m = unsafe { Mmap::map(&file)? };
-        Ok(MmapLogReader {
-            m,
-            log_block_size,
-            max_file_size,
-            offset,
-            selected_header: None,
-        })
-    }
-
-    #[inline]
-    #[cfg(test)]
-    pub(crate) fn selected_header(&self) -> Option<&SelectedRedoFileHeader> {
-        self.selected_header.as_ref()
     }
 
     #[inline]
@@ -345,6 +306,24 @@ mod tests {
     use std::collections::BTreeMap;
     use std::io::Write;
 
+    fn new_reader_at(
+        log_file_path: impl AsRef<Path>,
+        log_block_size: usize,
+        max_file_size: usize,
+        offset: usize,
+    ) -> Result<MmapLogReader> {
+        let file = File::open(log_file_path.as_ref())?;
+        // SAFETY: the file handle stays alive for the duration of mapping
+        // creation, and the returned `Mmap` owns the mapping afterward.
+        let m = unsafe { Mmap::map(&file)? };
+        Ok(MmapLogReader {
+            m,
+            log_block_size,
+            max_file_size,
+            offset,
+        })
+    }
+
     #[test]
     fn test_log_reader_read_multi_trx_log_in_one_group() {
         let log1 = TrxLog::new(
@@ -395,7 +374,7 @@ mod tests {
         file.flush().unwrap();
 
         println!("file path {:?}", file_path);
-        let mut reader = MmapLogReader::new_at(file_path, 4096, 1024 * 1024, 0).unwrap();
+        let mut reader = new_reader_at(file_path, 4096, 1024 * 1024, 0).unwrap();
         match reader.read() {
             ReadLog::DataCorrupted | ReadLog::DataEnd | ReadLog::SizeLimit => {
                 panic!("invalid data")

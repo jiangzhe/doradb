@@ -2693,7 +2693,6 @@ mod tests {
             for log in logs {
                 println!("log file {:?}", log.file_name());
                 let mut reader = engine.inner().trx_sys.log_reader(&log).unwrap();
-                assert!(reader.selected_header().is_some());
                 loop {
                     match reader.read() {
                         ReadLog::SizeLimit => unreachable!(),
