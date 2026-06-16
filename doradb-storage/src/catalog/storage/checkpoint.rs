@@ -16,10 +16,10 @@ use crate::index::{
     ColumnDeleteDomain, ColumnLeafEntry,
 };
 use crate::io::DirectBuf;
+use crate::log::redo::RowRedoKind;
 use crate::lwc::{LwcBuilder, PersistedLwcBlock};
 use crate::row::ops::SelectKey;
 use crate::row::{InsertRow, RowPage};
-use crate::trx::redo::RowRedoKind;
 use crate::value::Val;
 use error_stack::Report;
 use std::collections::{BTreeMap, BTreeSet};
@@ -940,8 +940,8 @@ mod tests {
     use crate::file::multi_table_file::{CATALOG_MTB_FILE_ID, MutableMultiTableFile};
     use crate::id::BlockID;
     use crate::index::{ColumnBlockIndex, ColumnDeleteDomain};
+    use crate::log::redo::RowRedoKind;
     use crate::row::ops::SelectKey;
-    use crate::trx::redo::RowRedoKind;
     use crate::value::Val;
     use tempfile::TempDir;
 

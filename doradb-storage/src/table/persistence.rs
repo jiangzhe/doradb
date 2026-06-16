@@ -12,10 +12,10 @@ use crate::index::disk_tree::{
     NonUniqueDiskTreeEncodedExact, UniqueDiskTreeEncodedDelete, UniqueDiskTreeEncodedPut,
 };
 use crate::index::{ColumnBlockIndex, ColumnDeleteDeltaPatch, ColumnLeafEntry};
+use crate::log::redo::DDLRedo;
 use crate::lwc::PersistedLwcBlock;
 use crate::session::SessionPin;
 use crate::table::{CheckpointCancelReason, Table, TableRuntimeLayout};
-use crate::trx::redo::DDLRedo;
 use crate::value::{Val, ValKind, ValType};
 use error_stack::Report;
 use std::collections::BTreeSet;

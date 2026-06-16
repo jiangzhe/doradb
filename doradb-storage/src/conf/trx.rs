@@ -5,11 +5,11 @@ use crate::catalog::Catalog;
 use crate::component::Supplier;
 use crate::error::{ConfigResult, Error, Result};
 use crate::file::fs::FileSystem;
-use crate::io::{StorageBackend, align_to_sector_size};
+use crate::io::{Completion, StorageBackend, align_to_sector_size};
+use crate::log::recover::{RecoveryDeps, log_recover};
+use crate::log::{LogSync, RedoLogInitializer, RedoLogMode};
 use crate::quiescent::QuiescentGuard;
-use crate::trx::log::{LOG_HEADER_PAGES, LogSync, RedoLogInitializer, RedoLogMode};
 use crate::trx::purge::Purge;
-use crate::trx::recover::{RecoveryDeps, log_recover};
 use crate::trx::sys::{
     TransactionSystem, TransactionSystemQueues, TransactionSystemWorkers,
     TransactionSystemWorkersOwned, TrxCleanupMessage,
@@ -20,24 +20,25 @@ use flume::{Receiver, Sender};
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use super::consts::{
-    DEFAULT_LOG_DIR, DEFAULT_LOG_FILE_MAX_SIZE, DEFAULT_LOG_FILE_STEM, DEFAULT_LOG_IO_DEPTH,
-    DEFAULT_LOG_IO_MAX_SIZE, DEFAULT_LOG_SYNC, DEFAULT_PURGE_THREADS,
+    DEFAULT_LOG_BLOCK_SIZE, DEFAULT_LOG_DIR, DEFAULT_LOG_FILE_MAX_SIZE, DEFAULT_LOG_FILE_STEM,
+    DEFAULT_LOG_IO_DEPTH, DEFAULT_LOG_SYNC, DEFAULT_PURGE_THREADS,
 };
 use super::path::{path_to_utf8, validate_log_file_stem};
 
-use crate::trx::log::discover_redo_log_files;
+use crate::log::discover_redo_log_files;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TrxSysConfig {
-    // Controls infight IO request number of each log file.
-    pub io_depth_per_log: usize,
-    // Controls maximum IO size of each IO request.
+    // Controls inflight IO request depth of the redo log stream.
+    pub io_depth: usize,
+    // Controls log block size of each IO request.
     // This only limit the combination of multiple transactions.
     // If single transaction has very large redo log. It is kept
     // as-is and submitted by the log thread as one request.
-    pub max_io_size: Byte,
+    pub log_block_size: Byte,
     // Directory where redo log files live.
     pub log_dir: PathBuf,
     // Base file name of one redo log family.
@@ -58,6 +59,7 @@ pub struct TrxSysConfig {
 }
 
 pub(crate) struct PendingTransactionSystemStartup {
+    initial_redo_header: Arc<Completion<()>>,
     purge_tx: Sender<Purge>,
     purge_rx: Receiver<Purge>,
     cleanup_tx: Sender<TrxCleanupMessage>,
@@ -68,11 +70,23 @@ pub(crate) struct PendingTransactionSystemStartup {
 
 impl PendingTransactionSystemStartup {
     #[inline]
-    pub(crate) fn start(
+    pub(crate) async fn start(
         self,
         trx_sys: QuiescentGuard<TransactionSystem>,
-    ) -> TransactionSystemWorkersOwned {
+    ) -> Result<TransactionSystemWorkersOwned> {
+        // Start the log thread first because it owns the redo write driver and
+        // must process the initial redo header write submitted during recovery.
         let log_thread = TransactionSystem::start_log_thread(trx_sys.clone());
+        // Wait until the initial header is durable before exposing transaction
+        // workers; later redo records must not be accepted until the active log
+        // file has a valid super-block.
+        if let Err(report) = self.initial_redo_header.wait_result().await {
+            log_thread.join().unwrap();
+            return Err(Error::from_completion_report(
+                report,
+                "wait for initial redo super-block write",
+            ));
+        }
         let purge_threads = TransactionSystem::start_purge_threads(
             trx_sys.clone(),
             self.mem_pool,
@@ -80,14 +94,14 @@ impl PendingTransactionSystemStartup {
             self.purge_rx,
         );
         let cleanup_thread = TransactionSystem::start_cleanup_thread(self.cleanup_rx);
-        TransactionSystemWorkersOwned::new(
+        Ok(TransactionSystemWorkersOwned::new(
             trx_sys.into_sync(),
             self.purge_tx,
             self.cleanup_tx,
             log_thread,
             purge_threads,
             cleanup_thread,
-        )
+        ))
     }
 }
 
@@ -97,18 +111,18 @@ impl Supplier<TransactionSystemWorkers> for TransactionSystem {
 
 impl TrxSysConfig {
     #[inline]
-    pub fn io_depth_per_log(mut self, io_depth_per_log: usize) -> Self {
-        self.io_depth_per_log = io_depth_per_log;
+    pub fn io_depth(mut self, io_depth: usize) -> Self {
+        self.io_depth = io_depth;
         self
     }
 
     /// How large single IO operation can be.
     #[inline]
-    pub fn max_io_size<T>(mut self, max_io_size: T) -> Self
+    pub fn log_block_size<T>(mut self, log_block_size: T) -> Self
     where
         Byte: From<T>,
     {
-        self.max_io_size = Byte::from(max_io_size);
+        self.log_block_size = Byte::from(log_block_size);
         self
     }
 
@@ -174,7 +188,7 @@ impl TrxSysConfig {
     #[inline]
     pub(crate) fn redo_log_initializer(&self) -> Result<RedoLogInitializer> {
         debug_assert!(validate_log_file_stem(&self.log_file_stem));
-        let ctx = StorageBackend::new(self.io_depth_per_log)?;
+        let ctx = StorageBackend::new(self.io_depth)?;
         let file_prefix = self.file_prefix().map_err(Error::from)?;
 
         let logs = discover_redo_log_files(&file_prefix, false)?;
@@ -188,9 +202,8 @@ impl TrxSysConfig {
             mode,
             file_prefix,
             file_max_size: self.log_file_max_size.as_u64() as usize,
-            page_size: self.max_io_size.as_u64() as usize,
-            file_header_size: self.max_io_size.as_u64() as usize * LOG_HEADER_PAGES,
-            io_depth_per_log: self.io_depth_per_log,
+            log_block_size: self.log_block_size.as_u64() as usize,
+            io_depth: self.io_depth,
             file_seq: None,
         })
     }
@@ -215,7 +228,7 @@ impl TrxSysConfig {
 
         let (purge_tx, purge_rx) = flume::unbounded();
         let (cleanup_tx, cleanup_rx) = flume::unbounded();
-        let (redo_log, initial_trx_ts, initial_file_deletes) = log_recover(
+        let (redo_log, initial_trx_ts, initial_file_deletes, initial_redo_header) = log_recover(
             &meta_pool,
             RecoveryDeps {
                 index_pool,
@@ -244,6 +257,7 @@ impl TrxSysConfig {
         Ok((
             trx_sys,
             PendingTransactionSystemStartup {
+                initial_redo_header,
                 purge_tx,
                 purge_rx,
                 cleanup_tx,
@@ -259,8 +273,8 @@ impl Default for TrxSysConfig {
     #[inline]
     fn default() -> Self {
         TrxSysConfig {
-            io_depth_per_log: DEFAULT_LOG_IO_DEPTH,
-            max_io_size: DEFAULT_LOG_IO_MAX_SIZE,
+            io_depth: DEFAULT_LOG_IO_DEPTH,
+            log_block_size: DEFAULT_LOG_BLOCK_SIZE,
             log_dir: PathBuf::from(DEFAULT_LOG_DIR),
             log_file_stem: String::from(DEFAULT_LOG_FILE_STEM),
             log_file_max_size: DEFAULT_LOG_FILE_MAX_SIZE,

@@ -4,10 +4,10 @@ use crate::id::{RowID, TableID, TrxID};
 use crate::catalog::{CatalogTable, TableCache, is_catalog_obj_id};
 use crate::error::{FatalError, OperationError, Result};
 use crate::lock::{LockMode, LockOwner, LockResource, OwnerLockState};
+use crate::log::redo::{DDLRedo, RedoLogs, RowRedo};
 use crate::row::ops::{DeleteMvcc, ScanMvcc, SelectKey, SelectMvcc, UpdateCol, UpdateMvcc};
 use crate::session::TrxAttachment;
 use crate::table::Table;
-use crate::trx::redo::{DDLRedo, RedoLogs, RowRedo};
 use crate::trx::undo::{
     IndexUndo, IndexUndoKind, IndexUndoLogs, OwnedRowUndo, RowUndoKind, RowUndoLogs,
 };

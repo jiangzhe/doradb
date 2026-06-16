@@ -16,13 +16,13 @@ use crate::index::{
     ColumnBlockIndex, IndexInsert, NonUniqueIndex, NonUniqueMemIndex, SecondaryDiskTreeRuntime,
     SecondaryIndex, UniqueIndex, UniqueMemIndex,
 };
+use crate::log::redo::DDLRedo;
 use crate::lwc::PersistedLwcBlock;
 use crate::row::RowRead;
 #[cfg(test)]
 use crate::session::Session;
 use crate::session::{SessionDdlContext, SessionPin};
 use crate::table::{DeleteMarker, Table, TableRuntimeLayout, secondary_disk_tree_encoder};
-use crate::trx::redo::DDLRedo;
 use crate::trx::{Transaction, trx_is_committed};
 use crate::value::Val;
 use error_stack::Report;
@@ -2195,7 +2195,7 @@ mod tests {
             )
             .trx(
                 TrxSysConfig::default()
-                    .io_depth_per_log(1)
+                    .io_depth(1)
                     .log_file_stem(log_file_stem)
                     .purge_threads(1),
             )

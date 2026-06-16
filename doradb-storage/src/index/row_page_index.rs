@@ -1199,10 +1199,10 @@ mod tests {
     use crate::file::block_integrity::BLOCK_INTEGRITY_TRAILER_SIZE;
     use crate::id::{TableID, TrxID};
     use crate::latch::LatchFallbackMode;
+    use crate::log::discover_redo_log_files;
+    use crate::log::log_replay::ReadLog;
+    use crate::log::redo::DDLRedo;
     use crate::quiescent::{QuiescentBox, QuiescentGuard};
-    use crate::trx::log::discover_redo_log_files;
-    use crate::trx::log_replay::ReadLog;
-    use crate::trx::redo::DDLRedo;
     use crate::value::ValKind;
     use semistr::SemiStr;
     use std::future::Future;

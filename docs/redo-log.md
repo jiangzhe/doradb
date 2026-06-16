@@ -2,7 +2,7 @@
 
 This document describes the current redo-log baseline for future improvement
 work. It is based on the single-stream redo implementation in
-`doradb-storage/src/trx/`.
+`doradb-storage/src/log/`.
 
 ## Overview
 
@@ -23,12 +23,13 @@ writing log bytes; their CTS is not a recovery timestamp seed.
 
 Main source files:
 
-- `trx/redo.rs`: redo record payload types and serialization.
-- `trx/log_replay.rs`: log-group buffer format and mmap reader.
+- `log/redo.rs`: redo record payload types and serialization.
+- `log/log_replay.rs`: log-group buffer format and mmap reader.
 - `trx/group.rs`: commit-group construction.
-- `trx/log.rs`: log file allocation, group-commit scheduling, IO, sync, and
-  failure handling.
-- `trx/recover.rs`: startup replay.
+- `trx/sys.rs`: commit admission, CTS assignment, and GC bucket ownership.
+- `log/mod.rs`: log file allocation, group-commit write scheduling, IO, sync,
+  and redo-stream failure handling.
+- `log/recover.rs`: startup replay.
 - `catalog/checkpoint.rs`: catalog checkpoint scanning over durable redo.
 
 ## File Family
@@ -46,27 +47,42 @@ Example with defaults:
 ./redo.log.00000001
 ```
 
-Discovery uses `discover_redo_log_files` and requires contiguous sequence
-numbers. Legacy partitioned names like `<prefix>.<partition>.<seq>` are
-rejected. The configured defaults are:
+Discovery uses `discover_redo_log_files`, requires contiguous sequence numbers,
+and validates each file's redo super block before the file can participate in
+startup recovery or checkpoint scanning. Legacy partitioned names like
+`<prefix>.<partition>.<seq>` are rejected, and legacy zero-header redo files are
+invalid. The configured defaults are:
 
 - `log_dir = "."`
 - `log_file_stem = "redo.log"`
 - `log_file_max_size = 1 GiB`
-- `max_io_size = 8192`
-- `io_depth_per_log = 32`
+- `log_block_size = 4096`
+- `io_depth = 32`
 - `log_sync = fsync`
 
-Each log file is created as an `O_DIRECT` sparse file, truncated to
-`log_file_max_size`, and append-allocated with sector-aligned offsets. The first
-`LOG_HEADER_PAGES = 2` pages are reserved as a file header, but that header is
-currently unused and remains zero-filled. Normal log groups start after this
-reserved header area.
+Each log file is created as an `O_DIRECT` sparse file and truncated to
+`log_file_max_size`. The first two 4KB sectors are fixed A/B redo super-block
+slots:
+
+- slot 0 at offset `0`
+- slot 1 at offset `STORAGE_SECTOR_SIZE`
+- normal redo groups start at `2 * STORAGE_SECTOR_SIZE`
+
+New files write one valid initial header in slot 0 with `generation = 0`; slot 1
+stays zero-filled until later sealing work. The header write is queued through
+the log thread's async write driver as header control-plane work, before any
+later group writes for the same file. A header stores magic, format version,
+file sequence, slot number, log block size, file max size, and generation. The
+footer repeats the slot identity and generation and stores a BLAKE3 checksum
+over the slot bytes before the footer.
+Recovery selects the newest valid slot by generation and tolerates a torn or
+invalid inactive slot when the other slot is valid.
 
 When a file runs out of append capacity, the commit path creates the next file
-and queues a `Commit::Switch(old_file)` marker. The log thread keeps the old
-file descriptor alive until all already-written groups from that file are
-finalized and synced.
+and queues one log-file boundary containing the old file and the new file's
+initial header write. The log thread keeps the old file descriptor alive until
+all already-written groups from that file and the boundary header write are
+finished.
 
 ## Serialization Rules
 
@@ -104,8 +120,8 @@ The group length does not include the first `u64` length field. A zero
 `group_data_len` means logical end-of-file during replay. Since log files are
 sparse and pre-sized, unwritten areas read as zero on Linux.
 
-Small groups are intended to use a fixed `max_io_size` buffer from the redo
-free-list. Large groups can exceed `max_io_size`; they are written as one
+Small groups are intended to use a fixed `log_block_size` buffer from the redo
+free-list. Large groups can exceed `log_block_size`; they are written as one
 sector-aligned direct buffer sized to the serialized group.
 
 ## Transaction Record Format
@@ -176,12 +192,12 @@ physical row page.
    with `cts = 0` and `trx_kind = User`. System transactions use
    `trx_kind = System`.
 
-3. `RedoLog::enqueue_commit` assigns the final CTS from the transaction
-   timestamp sequence and patches that CTS into the redo header. The prepared
-   transaction becomes a `PrecommitTrx`.
+3. `TransactionSystem::enqueue_commit` assigns the final CTS from the
+   transaction timestamp sequence and patches that CTS into the redo header. The
+   prepared transaction becomes a `PrecommitTrx`.
 
-4. The transaction either joins the queue tail or starts a new `CommitGroup`.
-   Join rules:
+4. The transaction either joins the queue tail or asks `RedoLog` to allocate
+   and queue a new `CommitGroup`. Join rules:
 
    - no-log transactions can join any group;
    - a redo-bearing transaction cannot join a no-log group;
@@ -191,12 +207,13 @@ physical row page.
 5. A new redo-bearing group serializes the first transaction into a `LogBuf`,
    allocates append space from the current sparse log file, and stores the raw
    file descriptor plus offset. If allocation reaches `log_file_max_size`, the
-   path rotates to a new file and queues the old file as a switch marker.
+   path rotates to a new file and queues a log-file boundary before the group.
 
-6. `Log-Thread` drains commit queue entries into `SyncGroup`s. Each redo-bearing
-   `SyncGroup` becomes one `Operation::pwrite_owned(fd, offset, DirectBuf)`.
-   No-log groups are inserted as already-finished ordered groups with no IO
-   target.
+6. `Log-Thread` drains commit queue entries. Log-file boundaries stage an async
+   header write and stop queue fetching until pending IO plus that header write
+   drain. Redo-bearing groups drain into `SyncGroup`s and then one
+   `Operation::pwrite_owned(fd, offset, DirectBuf)` each. No-log groups are
+   inserted as already-finished ordered groups with no IO target.
 
 7. `LogWriteDriver` wraps the backend-neutral `SubmissionDriver` and submits
    direct writes through the compile-time storage backend (`io_uring` by
@@ -227,13 +244,15 @@ exist, it enters recovery mode and replays them in ascending sequence order.
 When the last discovered file is exhausted, the initializer increments the file
 sequence so normal runtime opens a fresh file after recovery.
 
-`MmapLogReader` maps one file and reads groups from the reserved-header offset.
+`MmapLogReader` maps one file, selects a valid redo super-block slot, and reads
+groups from the fixed `REDO_DEFAULT_DATA_START_OFFSET`.
 For each group:
 
-- if the group offset reaches `log_file_max_size`, the file is exhausted;
+- if the group offset reaches the header's `file_max_size`, the file is
+  exhausted;
 - if the group length field is zero, replay treats the file as ended;
-- if the group length fits within one `max_io_size` page, reader offset advances
-  by `max_io_size`;
+- if the group length fits within one header `log_block_size` block, reader
+  offset advances by `log_block_size`;
 - if the group length exceeds one page, reader offset advances by the
   sector-aligned group length;
 - invalid framing or missing mapped bytes reports `LogFileCorrupted`.
@@ -284,7 +303,7 @@ The redo path is intentionally separate from table-file and buffer-pool IO.
 - Direct buffers and file offsets must be sector-aligned.
 - `Log-Thread` owns the redo submission driver; there is no nested redo IO
   worker thread.
-- The backend IO depth is bounded by `io_depth_per_log`.
+- The backend IO depth is bounded by `io_depth` for the single redo log stream.
 - Sync is done above the backend driver after an ordered write prefix finishes.
 - Shutdown closes group-commit admission, wakes and joins `Log-Thread`, then
   stops cleanup and purge in that order.
@@ -327,7 +346,7 @@ recent log writes.
   path. Checkpoint metadata narrows replay logically, but recovery still opens
   the discovered file family from the beginning.
 - `MmapLogReader` can block the async runtime through page faults or file access.
-- A single large transaction can exceed `max_io_size` and is written as one
+- A single large transaction can exceed `log_block_size` and is written as one
   large direct IO request.
 - `persisted_cts` is an ordered-completion watermark. It can advance across
   no-log groups, so recovery must continue to seed timestamps only from
@@ -367,16 +386,15 @@ floors prove that older segments are no longer needed. This likely needs the
 watermark expansion already tracked by
 `docs/backlogs/000032-deletion-watermark-meta-redo-expansion-for-log-truncation.md`.
 
-Validate and enforce `max_io_size` alignment. The current defaults are sector
-aligned, but the config setter does not align or reject arbitrary values. Since
-the file header, writer buffers, direct IO, and reader stride all depend on this
-size, startup should require `max_io_size` to be a multiple of
-`STORAGE_SECTOR_SIZE`.
+Validate and enforce `log_block_size` alignment at the config boundary. Redo
+header validation rejects persisted files whose `log_block_size` is not a
+multiple of `STORAGE_SECTOR_SIZE`, but the config setter still does not align or
+reject arbitrary values before file creation.
 
 Audit small-group buffer stride. Small groups are read with a fixed
-`max_io_size` stride, while fallback `LogBuf::new` can allocate only the
+`log_block_size` stride, while fallback `LogBuf::new` can allocate only the
 sector-aligned serialized length if the fixed-size buffer free-list is
-exhausted. Either guarantee fixed `max_io_size` buffers for every small group or
+exhausted. Either guarantee fixed `log_block_size` buffers for every small group or
 change the reader to advance by the actual written aligned length.
 
 ### Write Path and Sync Policy

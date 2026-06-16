@@ -253,7 +253,7 @@ impl TransactionSystem {
         // upperbound, we may clear the new transaction incorrectly.
         let max_active_sts = TrxID::new(self.ts.load(Ordering::SeqCst));
         // then, load actual minimum active STS from all GC buckets.
-        self.redo_log.min_active_sts().min(max_active_sts)
+        self.min_active_sts().min(max_active_sts)
     }
 
     /// Record committed transaction handoffs accepted from redo completion.
@@ -269,7 +269,7 @@ impl TransactionSystem {
     ) -> bool {
         let mut changed = false;
         for (gc_no, trx_list) in trx_list {
-            let gc_bucket = &self.redo_log.gc_buckets[gc_no];
+            let gc_bucket = &self.gc_buckets[gc_no];
             changed |= gc_bucket.record_committed_for_purge(trx_list);
         }
         changed
@@ -599,7 +599,7 @@ impl ActiveStsList {
 /// GCBucket stores and records transaction GC information for purge,
 /// including committed transaction list, old transaction list, active snapshot timestamp
 /// list, etc.
-pub(super) struct GCBucket {
+pub(crate) struct GCBucket {
     /// Committed transaction list.
     /// When a transaction is committed, it will be put into this queue in sequence.
     /// Head is always oldest and tail is newest.
@@ -608,13 +608,13 @@ pub(super) struct GCBucket {
     /// The smallest value equals to min_active_sts.
     pub(super) active_sts_list: CachePadded<Mutex<ActiveStsList>>,
     /// Minimum active snapshot sts of this bucket.
-    pub(super) min_active_sts: CachePadded<AtomicU64>,
+    pub(crate) min_active_sts: CachePadded<AtomicU64>,
 }
 
 impl GCBucket {
     /// Create a new GC bucket.
     #[inline]
-    pub(super) fn new() -> Self {
+    pub(crate) fn new() -> Self {
         GCBucket {
             committed_trx_list: CachePadded::new(Mutex::new(VecDeque::new())),
             active_sts_list: CachePadded::new(Mutex::new(ActiveStsList::default())),
@@ -865,7 +865,7 @@ impl PurgeLoop for PurgeSingleThreaded {
                 // row pages once all bucket lists have been collected.
                 let mut gc_row_pages = FastHashSet::default();
                 let mut trx_list = vec![];
-                for gc_bucket in &trx_sys.redo_log.gc_buckets {
+                for gc_bucket in &trx_sys.gc_buckets {
                     gc_bucket.get_purge_list(curr_sts, &mut trx_list);
                 }
                 let bucket_gc_pages = match trx_sys
@@ -940,7 +940,7 @@ impl PurgeLoop for PurgeDispatcher {
                 let (done_tx, done_rx) = flume::unbounded();
                 let mut expected_tasks = 0usize;
                 let gc_row_pages = Arc::new(Mutex::new(vec![]));
-                for gc_no in 0..trx_sys.redo_log.gc_buckets.len() {
+                for gc_no in 0..trx_sys.gc_buckets.len() {
                     let task = PurgeTask {
                         gc_no,
                         min_active_sts: curr_sts,
@@ -1030,7 +1030,7 @@ impl PurgeExecutor {
         }) = purge_chan.recv()
         {
             let mut trx_list = vec![];
-            trx_sys.redo_log.gc_buckets[gc_no].get_purge_list(min_active_sts, &mut trx_list);
+            trx_sys.gc_buckets[gc_no].get_purge_list(min_active_sts, &mut trx_list);
             // actual purge here
             let res = trx_sys
                 .purge_trx_list(catalog, &pool_guards, trx_list, min_active_sts)

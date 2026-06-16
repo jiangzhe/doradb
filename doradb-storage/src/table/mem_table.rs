@@ -14,11 +14,11 @@ use crate::index::{
     RowLocation, UniqueIndex,
 };
 use crate::latch::LatchFallbackMode;
+use crate::log::redo::{RowRedo, RowRedoKind};
 use crate::quiescent::QuiescentGuard;
 use crate::row::ops::{DeleteMvcc, InsertIndex, LinkForUniqueIndex, SelectKey};
 use crate::row::{Row, RowPage, RowRead, estimate_max_row_count, var_len_for_insert};
 use crate::trx::TrxRuntime;
-use crate::trx::redo::{RowRedo, RowRedoKind};
 use crate::trx::row::{
     FindOldVersion, LockRowForWrite, LockUndo, ReadAllRows, RowReadAccess, RowWriteAccess,
 };

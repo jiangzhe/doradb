@@ -18,6 +18,7 @@ mod index;
 mod latch;
 mod layout;
 mod lock;
+mod log;
 mod lwc;
 mod map;
 mod memcmp;

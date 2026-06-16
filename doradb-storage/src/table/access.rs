@@ -11,6 +11,7 @@ use crate::index::{
     ColumnBlockIndex, ColumnLeafEntry, IndexCompareExchange, IndexInsert, NonUniqueIndex,
     NonUniqueSecondaryIndex, RowLocation, SecondaryIndex, UniqueIndex, UniqueSecondaryIndex,
 };
+use crate::log::redo::{RowRedo, RowRedoKind};
 use crate::lwc::PersistedLwcBlock;
 use crate::map::FastHashMap;
 use crate::row::ops::{
@@ -24,7 +25,6 @@ use crate::table::{
     index_key_is_changed, index_key_replace, read_latest_index_key, row_len,
     validate_page_row_range,
 };
-use crate::trx::redo::{RowRedo, RowRedoKind};
 use crate::trx::row::{
     FindOldVersion, LockRowForWrite, LockUndo, ReadAllRows, RowReadAccess, RowWriteAccess,
 };

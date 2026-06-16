@@ -2,10 +2,10 @@ use crate::buffer::frame::FrameContext;
 use crate::buffer::page::VersionedPageID;
 use crate::catalog::{TableColumnLayout, TableMetadata};
 use crate::id::{RowID, TableID, TrxID};
+use crate::log::recover::RecoverMap;
 use crate::map::FastHashMap;
 use crate::row::ops::{ReadRow, SelectKey, UndoCol, UndoVal, UpdateCol, UpdateRow};
 use crate::row::{Row, RowMut, RowPage, RowRead};
-use crate::trx::recover::RecoverMap;
 use crate::trx::stmt::StmtEffects;
 use crate::trx::undo::{
     IndexBranch, IndexBranchTarget, MainBranch, NextRowUndo, OwnedRowUndo, RowUndoHead,

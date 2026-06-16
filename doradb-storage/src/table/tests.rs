@@ -35,6 +35,7 @@ use crate::io::{
 use crate::latch::LatchFallbackMode;
 use crate::lock::tests::{LockDebugEntryState, debug_snapshot, try_acquire};
 use crate::lock::{LockMode, LockOwner, LockResource};
+use crate::log::redo::DDLRedo;
 use crate::quiescent::QuiescentGuard;
 use crate::row::RowPage;
 use crate::row::ops::{DeleteMvcc, SelectKey, SelectMvcc, UpdateCol, UpdateMvcc};
@@ -43,7 +44,6 @@ use crate::table::{
     CheckpointCancelReason, CheckpointOutcome, CheckpointReadiness, DeleteMarker, Table,
     TableLifecycleState, TableRuntimeLayout,
 };
-use crate::trx::redo::DDLRedo;
 use crate::trx::row::LockRowForWrite;
 use crate::trx::stmt::Statement;
 use crate::trx::stmt::tests as stmt_tests;
@@ -8989,7 +8989,7 @@ fn lightweight_test_engine_config(
         )
         .trx(
             TrxSysConfig::default()
-                .io_depth_per_log(1)
+                .io_depth(1)
                 .log_file_stem(log_file_stem)
                 .purge_threads(1),
         )

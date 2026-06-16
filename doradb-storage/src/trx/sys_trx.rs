@@ -1,7 +1,7 @@
 use crate::id::{PageID, RowID, TableID, TrxID};
+use crate::log::log_replay::TrxLog;
+use crate::log::redo::{DDLRedo, RedoHeader, RedoLogs, RedoTrxKind};
 use crate::trx::PreparedTrx;
-use crate::trx::log_replay::TrxLog;
-use crate::trx::redo::{DDLRedo, RedoHeader, RedoLogs, RedoTrxKind};
 use std::mem;
 
 /// SysTrx is a special kind of transaction only used for system
@@ -33,7 +33,7 @@ impl SysTrx {
 
     /// Prepare this transaction for commit.
     #[inline]
-    pub(super) fn prepare(mut self) -> PreparedTrx {
+    pub(crate) fn prepare(mut self) -> PreparedTrx {
         let redo_bin = if self.redo.is_empty() {
             None
         } else {

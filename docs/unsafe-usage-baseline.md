@@ -1,6 +1,6 @@
 # Unsafe Usage Baseline
 
-- Generated on: `2026-06-14`
+- Generated on: `2026-06-16`
 - Command: `tools/unsafe_inventory.rs`
 - Scope: `doradb-storage/src/{buffer,latch,row,index,io,trx,lwc,file}`
 
@@ -13,10 +13,10 @@
 | row | 3 | 6 | 0 | 0 | 0 | 6 |
 | index | 18 | 13 | 0 | 0 | 3 | 7 |
 | io | 7 | 20 | 0 | 0 | 1 | 17 |
-| trx | 15 | 6 | 0 | 0 | 0 | 5 |
+| trx | 11 | 5 | 0 | 0 | 0 | 4 |
 | lwc | 2 | 0 | 0 | 0 | 0 | 0 |
 | file | 8 | 13 | 0 | 0 | 2 | 13 |
-| **total** | **70** | **148** | **0** | **0** | **6** | **128** |
+| **total** | **66** | **147** | **0** | **0** | **6** | **127** |
 
 ## File Hotspots (top 40)
 
@@ -47,7 +47,6 @@
 | `doradb-storage/src/index/column_block_index.rs` | index | 1 | 1 |
 | `doradb-storage/src/index/row_page_index.rs` | index | 1 | 1 |
 | `doradb-storage/src/io/iouring_backend.rs` | io | 1 | 1 |
-| `doradb-storage/src/trx/log_replay.rs` | trx | 1 | 1 |
 | `doradb-storage/src/trx/mod.rs` | trx | 1 | 0 |
 
 ## Cast-Risk Candidates

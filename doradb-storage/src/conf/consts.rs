@@ -1,4 +1,4 @@
-use crate::trx::log::LogSync;
+use crate::log::LogSync;
 use byte_unit::Byte;
 
 /// Marker file stored at `storage_root` that records the durable storage layout.
@@ -38,7 +38,7 @@ pub(crate) const DEFAULT_EVICTABLE_BUFFER_POOL_MAX_MEM_SIZE: Byte =
 /// Default async IO depth allocated to the redo-log worker.
 pub const DEFAULT_LOG_IO_DEPTH: usize = 32;
 /// Default upper bound for one redo-log IO request payload.
-pub const DEFAULT_LOG_IO_MAX_SIZE: Byte = Byte::from_u64(8192);
+pub const DEFAULT_LOG_BLOCK_SIZE: Byte = Byte::from_u64(4096);
 /// Default relative directory where redo log files live.
 pub const DEFAULT_LOG_DIR: &str = ".";
 /// Default base file name for the redo-log family.
