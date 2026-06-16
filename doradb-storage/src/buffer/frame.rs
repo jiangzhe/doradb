@@ -3,7 +3,7 @@ use crate::catalog::TableColumnLayout;
 use crate::file::cow_file::INVALID_BLOCK_ID;
 use crate::id::{BlockID, FileID, PageID, TrxID};
 use crate::latch::HybridLatch;
-use crate::trx::recover::RecoverMap;
+use crate::log::recover::RecoverMap;
 use crate::trx::ver_map::RowVersionMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};

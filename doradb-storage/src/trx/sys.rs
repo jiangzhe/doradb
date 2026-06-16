@@ -8,31 +8,45 @@ use crate::file::fs::FileSystem;
 use crate::file::table_file::{MutableTableFile, OldRoot, TableFile};
 use crate::id::TrxID;
 use crate::io::Completion;
+use crate::log::log_replay::MmapLogReader;
+use crate::log::redo::RedoLogs;
+use crate::log::{FileProcessor, LogWriteDriver, RedoLog, parse_file_seq};
 use crate::quiescent::{QuiescentBox, QuiescentGuard, SyncQuiescentGuard};
 use crate::session::{SessionState, TrxAttachment};
 use crate::thread;
-use crate::trx::group::Commit;
-use crate::trx::log::{LOG_HEADER_PAGES, RedoLog};
-use crate::trx::log_replay::MmapLogReader;
-use crate::trx::purge::{DroppedTableFileDeleteItem, DroppedTableQueue, Purge, TableRootQueue};
-use crate::trx::redo::RedoLogs;
+use crate::trx::group::{Commit, CommitJoin, GroupCommit};
+use crate::trx::purge::{
+    DroppedTableFileDeleteItem, DroppedTableQueue, GCBucket, Purge, TableRootQueue,
+};
 use crate::trx::sys_trx::SysTrx;
 use crate::trx::{
-    FailedPrecommitCleanupJob, FailedPrecommitReason, FatalRollbackRetention, MAX_SNAPSHOT_TS,
-    MIN_ACTIVE_TRX_ID, MIN_SNAPSHOT_TS, PreparedTrx, StartedTransaction, Transaction,
-    TrxCleanupJob, TrxCleanupReason, TrxCompletionClaim, TrxEntry, TrxEntryState, TrxInner,
+    FailedPrecommitCleanupJob, FailedPrecommitReason, FatalRollbackRetention, MAX_COMMIT_TS,
+    MAX_SNAPSHOT_TS, MIN_ACTIVE_TRX_ID, MIN_SNAPSHOT_TS, PrecommitTrx, PreparedTrx,
+    StartedTransaction, Transaction, TrxCleanupJob, TrxCleanupReason, TrxCompletionClaim, TrxEntry,
+    TrxEntryState, TrxInner,
 };
 use crossbeam_utils::CachePadded;
 use error_stack::Report;
 use flume::{Receiver, Sender};
-use parking_lot::Mutex;
+use parking_lot::{Mutex, MutexGuard};
 use std::mem;
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::thread::JoinHandle;
 
 pub(crate) const GC_BUCKETS: usize = 64;
+
+struct QueuedCommit {
+    cts: TrxID,
+    waiter: CommitJoin,
+}
+
+struct CommitRejection {
+    cts: TrxID,
+    trx: Box<PrecommitTrx>,
+    reason: FailedPrecommitReason,
+}
 
 /// TransactionSystem controls lifecycle of all transactions.
 ///
@@ -78,16 +92,23 @@ pub(crate) struct TransactionSystem {
     /// trx_id range: (1<<63)+1 to uint::MAX-1
     /// sts range: 1 to 1<<63
     /// cts range: 1 to 1<<63
-    pub(super) ts: CachePadded<AtomicU64>,
+    pub(crate) ts: CachePadded<AtomicU64>,
     /// Global visible snapshot timestamp.
     /// It's updated by purge coordination after cleaning out-of-date version chains.
     ///
     /// Data associated with smaller timestamp will be always visible to all transactions.
     global_visible_sts: CachePadded<AtomicU64>,
+    /// Round-robin GC number generator.
+    rr_gc_no: CachePadded<AtomicUsize>,
+    /// Active and completed transaction buckets used by purge.
+    ///
+    /// Split into multiple buckets to avoid a single global synchronization
+    /// point on transaction begin/finish.
+    pub(super) gc_buckets: Box<[GCBucket]>,
     /// Single canonical redo log stream.
-    pub(super) redo_log: CachePadded<RedoLog>,
+    pub(crate) redo_log: CachePadded<RedoLog>,
     /// Transaction system configuration.
-    pub(super) config: CachePadded<TrxSysConfig>,
+    pub(crate) config: CachePadded<TrxSysConfig>,
     /// Catalog of the database.
     pub(crate) catalog: CachePadded<QuiescentGuard<Catalog>>,
     /// Table file facade used by background dropped-table cleanup.
@@ -249,9 +270,12 @@ impl TransactionSystem {
         initial_file_deletes: Vec<DroppedTableFileDeleteItem>,
     ) -> Self {
         debug_assert!((MIN_SNAPSHOT_TS..MAX_SNAPSHOT_TS).contains(&initial_ts));
+        let gc_buckets: Vec<_> = (0..GC_BUCKETS).map(|_| GCBucket::new()).collect();
         TransactionSystem {
             ts: CachePadded::new(AtomicU64::new(initial_ts.as_u64())),
             global_visible_sts: CachePadded::new(AtomicU64::new(initial_ts.as_u64())),
+            rr_gc_no: CachePadded::new(AtomicUsize::new(0)),
+            gc_buckets: gc_buckets.into_boxed_slice(),
             redo_log,
             config: CachePadded::new(config),
             catalog: CachePadded::new(catalog),
@@ -329,11 +353,203 @@ impl TransactionSystem {
     /// guarantee for raw row-undo pointers that may still be reachable from
     /// in-memory row-version chains.
     #[inline]
-    pub(in crate::trx) fn retain_fatal_rollback(&self, retention: FatalRollbackRetention) {
+    pub(super) fn retain_fatal_rollback(&self, retention: FatalRollbackRetention) {
         if retention.is_empty() {
             return;
         }
         self.fatal_rollback_retention.lock().push(retention);
+    }
+
+    /// Returns next GC number.
+    ///
+    /// It is used to evenly dispatch transactions to all GC buckets.
+    #[inline]
+    fn next_gc_no(&self) -> usize {
+        self.rr_gc_no.fetch_add(1, Ordering::Relaxed) % GC_BUCKETS
+    }
+
+    #[inline]
+    pub(crate) fn min_active_sts(&self) -> TrxID {
+        let mut min = MAX_SNAPSHOT_TS;
+        for gc_bucket in &self.gc_buckets {
+            let ts = TrxID::new(gc_bucket.min_active_sts.load(Ordering::Relaxed));
+            if ts < min {
+                min = ts;
+            }
+        }
+        min
+    }
+
+    #[inline]
+    fn reject_group_creation_failure(
+        &self,
+        redo_log: &RedoLog,
+        group_commit_g: &mut MutexGuard<'_, GroupCommit>,
+        trx: Box<PrecommitTrx>,
+    ) -> CommitRejection {
+        let cts = trx.cts;
+        let err = self.poison_storage(FatalError::RedoWrite);
+        let reason = FailedPrecommitReason::Fatal(*err.current_context());
+        group_commit_g.close(reason);
+        redo_log.group_commit.notify_one();
+        CommitRejection { cts, trx, reason }
+    }
+
+    #[inline]
+    fn try_enqueue_new_group(
+        &self,
+        precommit_trx: PrecommitTrx,
+        group_commit_g: &mut MutexGuard<'_, GroupCommit>,
+        wait_sync: bool,
+    ) -> std::result::Result<CommitJoin, CommitRejection> {
+        let redo_log = &*self.redo_log;
+        match redo_log.enqueue_precommit_group(precommit_trx, group_commit_g, wait_sync) {
+            Ok(waiter) => {
+                redo_log.group_commit.notify_one();
+                Ok(waiter)
+            }
+            Err(trx) => Err(self.reject_group_creation_failure(redo_log, group_commit_g, trx)),
+        }
+    }
+
+    #[inline]
+    fn enqueue_commit(
+        &self,
+        trx: PreparedTrx,
+        wait_sync: bool,
+    ) -> std::result::Result<QueuedCommit, CommitRejection> {
+        let redo_log = &*self.redo_log;
+        let mut group_commit_g = redo_log.group_commit.lock();
+        let cts = TrxID::new(self.ts.fetch_add(1, Ordering::SeqCst));
+        debug_assert!(cts < MAX_COMMIT_TS);
+        let precommit_trx = trx.fill_cts(cts);
+        if let Some(reason) = group_commit_g.closed {
+            drop(group_commit_g);
+            return Err(CommitRejection {
+                cts,
+                trx: Box::new(precommit_trx),
+                reason,
+            });
+        }
+        if group_commit_g.queue.is_empty() {
+            let waiter =
+                match self.try_enqueue_new_group(precommit_trx, &mut group_commit_g, wait_sync) {
+                    Ok(waiter) => waiter,
+                    Err(rejected) => {
+                        drop(group_commit_g);
+                        return Err(rejected);
+                    }
+                };
+            drop(group_commit_g);
+            return Ok(QueuedCommit { cts, waiter });
+        }
+        let Some(last_entry) = group_commit_g.queue.back_mut() else {
+            drop(group_commit_g);
+            return Err(CommitRejection {
+                cts,
+                trx: Box::new(precommit_trx),
+                reason: FailedPrecommitReason::Shutdown,
+            });
+        };
+        let last_group = match last_entry {
+            Commit::Shutdown => {
+                drop(group_commit_g);
+                return Err(CommitRejection {
+                    cts,
+                    trx: Box::new(precommit_trx),
+                    reason: FailedPrecommitReason::Shutdown,
+                });
+            }
+            Commit::Group(group) => group,
+            Commit::LogFileBoundary { .. } => {
+                let waiter =
+                    match self.try_enqueue_new_group(precommit_trx, &mut group_commit_g, wait_sync)
+                    {
+                        Ok(waiter) => waiter,
+                        Err(rejected) => {
+                            drop(group_commit_g);
+                            return Err(rejected);
+                        }
+                    };
+                drop(group_commit_g);
+                return Ok(QueuedCommit { cts, waiter });
+            }
+        };
+        if last_group.can_join(&precommit_trx) {
+            let waiter = last_group.join(precommit_trx, wait_sync);
+            drop(group_commit_g);
+            return Ok(QueuedCommit { cts, waiter });
+        }
+        let waiter = match self.try_enqueue_new_group(precommit_trx, &mut group_commit_g, wait_sync)
+        {
+            Ok(waiter) => waiter,
+            Err(rejected) => {
+                drop(group_commit_g);
+                return Err(rejected);
+            }
+        };
+        drop(group_commit_g);
+        Ok(QueuedCommit { cts, waiter })
+    }
+
+    #[inline]
+    fn commit_prepared_no_wait(&self, trx: PreparedTrx) -> Result<TrxID> {
+        debug_assert!(trx.attachment.is_none());
+        // This API is for sessionless system transactions only.
+        //
+        // System transactions are used to durably piggyback internal state
+        // changes that become globally visible once the redo group commits.
+        // They do not participate in user-session rollback semantics, so this
+        // path intentionally returns immediately without a waiter or a detached
+        // transaction attachment.
+        //
+        // Do not route a session-bound user transaction here. The user path
+        // must wait for durability so the caller can commit/rollback the
+        // session explicitly.
+        match self.enqueue_commit(trx, false) {
+            Ok(QueuedCommit { cts, waiter }) => {
+                debug_assert!(waiter.is_none());
+                Ok(cts)
+            }
+            Err(CommitRejection { cts, trx, reason }) => {
+                (*trx).discard_rejected();
+                Err(reason.into_error(format!("redo group commit is closed: commit_ts={cts}")))
+            }
+        }
+    }
+
+    #[inline]
+    pub(crate) async fn commit_prepared(&self, trx: PreparedTrx) -> Result<TrxID> {
+        let (cts, waiter) = match self.enqueue_commit(trx, true) {
+            Ok(QueuedCommit { cts, waiter }) => (cts, waiter),
+            Err(CommitRejection { cts, trx, reason }) => {
+                let completion = Arc::new(Completion::new());
+                let waiter = Arc::clone(&completion);
+                self.request_failed_precommit_cleanup(FailedPrecommitCleanupJob::new(
+                    vec![*trx],
+                    completion,
+                    reason,
+                ));
+                (cts, Some(waiter))
+            }
+        };
+        let waiter = match waiter {
+            Some(waiter) => waiter,
+            None => {
+                return Err(Error::from(
+                    Report::new(InternalError::Generic)
+                        .attach("async commit was queued without a completion waiter"),
+                ));
+            }
+        };
+        waiter.wait_result().await.map_err(|report| {
+            Error::from_completion_report(
+                report,
+                format!("wait for redo group commit: commit_ts={cts}"),
+            )
+        })?;
+        assert!(TrxID::new(self.redo_log.persisted_cts.load(Ordering::Relaxed)) >= cts);
+        Ok(cts)
     }
 
     #[inline]
@@ -388,9 +604,8 @@ impl TransactionSystem {
         engine: &EngineRef,
         session_state: &Arc<SessionState>,
     ) -> StartedTransaction {
-        let redo_log = &*self.redo_log;
-        let gc_no = redo_log.next_gc_no();
-        let gc_bucket = &redo_log.gc_buckets[gc_no];
+        let gc_no = self.next_gc_no();
+        let gc_bucket = &self.gc_buckets[gc_no];
         // Add to active sts list.
         let mut g = gc_bucket.active_sts_list.lock();
         // With bucket lock, we can make sure all transactions are ordered by STS.
@@ -442,7 +657,6 @@ impl TransactionSystem {
         // so keep it out of lock scope, and we can fill cts after the lock is held.
         let (_entry, inner, attachment) = claim.into_parts();
         inner.debug_assert_redo_invariants();
-        let redo_log = &*self.redo_log;
         let prepared_trx = inner.prepare(attachment)?;
         if !prepared_trx.require_ordered_commit() {
             // No runtime effects means there is no CTS to publish and no commit
@@ -452,7 +666,7 @@ impl TransactionSystem {
             return Ok(TrxID::new(0));
         }
         // start group commit
-        redo_log.commit(prepared_trx, self, &self.ts).await
+        self.commit_prepared(prepared_trx).await
     }
 
     #[inline]
@@ -469,7 +683,7 @@ impl TransactionSystem {
         // they are not modeled as session-bound transactions that can later be
         // rolled back through the normal user transaction API.
         let prepared_trx = trx.prepare();
-        self.redo_log.commit_no_wait(prepared_trx, &self.ts)
+        self.commit_prepared_no_wait(prepared_trx)
     }
 
     /// Rollback active transaction.
@@ -580,7 +794,7 @@ impl TransactionSystem {
             return Err(self.poison_storage(FatalError::RollbackAccess).into());
         }
         inner.effects_mut().clear_for_rollback();
-        self.redo_log.gc_buckets[gc_no].record_rollback_for_purge(sts);
+        self.gc_buckets[gc_no].record_rollback_for_purge(sts);
         inner.release_transaction_locks(attachment);
         inner.finish_session_rollback(attachment);
         entry.finish(TrxEntryState::Terminal);
@@ -599,7 +813,7 @@ impl TransactionSystem {
             .payload
             .take()
             .expect("prepared no-op cleanup requires user transaction payload");
-        self.redo_log.gc_buckets[payload.gc_no].record_rollback_for_purge(payload.sts);
+        self.gc_buckets[payload.gc_no].record_rollback_for_purge(payload.sts);
         if let Some(s) = trx.attachment.take() {
             s.rollback();
         }
@@ -643,16 +857,46 @@ impl TransactionSystem {
             .store(sts.as_u64(), Ordering::SeqCst)
     }
 
+    #[inline]
+    fn file_processor<'a>(
+        &'a self,
+        config: &TrxSysConfig,
+        write_driver: &'a mut LogWriteDriver,
+    ) -> FileProcessor<'a> {
+        FileProcessor::new(self, config, write_driver)
+    }
+
+    #[inline]
+    pub(crate) fn log_loop(&self) {
+        let redo_log = &*self.redo_log;
+        let mut write_driver = redo_log.take_log_write_driver();
+        loop {
+            let mut fp = self.file_processor(&self.config, &mut write_driver);
+            if let Some(ended_log_file) = fp.process_single_file() {
+                // Finished groups carry borrowed raw fds for sync. Keep the
+                // switched-out file alive until every old-file group is
+                // finalized.
+                fp.finish_pending_io_and_header_write();
+
+                debug_assert!(!fp.has_pending_io());
+
+                // todo: update file header.
+                // this may include information which can speed up recovery.
+                // e.g. DDL start/end pages, min/max transaction CTS.
+
+                // Close file explicitly.
+                drop(ended_log_file);
+            }
+            if fp.shutdown() {
+                return;
+            }
+        }
+    }
+
     /// Start the background log thread.
     #[inline]
     pub(crate) fn start_log_thread(trx_sys: QuiescentGuard<Self>) -> JoinHandle<()> {
-        let trx_sys = trx_sys.into_sync();
-        let task_trx_sys = trx_sys.clone();
-        thread::spawn_named("Log-Thread", move || {
-            task_trx_sys
-                .redo_log
-                .log_loop(&task_trx_sys, &task_trx_sys.config);
-        })
+        thread::spawn_named("Log-Thread", move || trx_sys.log_loop())
     }
 
     /// Start the transaction cleanup worker.
@@ -731,12 +975,8 @@ impl TransactionSystem {
     #[inline]
     #[cfg_attr(not(test), expect(dead_code, reason = "reserved log_reader"))]
     pub(crate) fn log_reader(&self, log_file_path: impl AsRef<Path>) -> Result<MmapLogReader> {
-        MmapLogReader::new(
-            log_file_path,
-            self.config.max_io_size.as_u64() as usize,
-            self.config.log_file_max_size.as_u64() as usize,
-            self.config.max_io_size.as_u64() as usize * LOG_HEADER_PAGES,
-        )
+        let path = log_file_path.as_ref();
+        MmapLogReader::new(path, parse_file_seq(path)?)
     }
 
     /// Returns the ordered-completion watermark `W` from the redo log.
@@ -754,9 +994,9 @@ impl TransactionSystem {
     pub(crate) fn catalog_checkpoint_scan_config(&self) -> Result<CatalogCheckpointScanConfig> {
         Ok(CatalogCheckpointScanConfig {
             file_prefix: self.config.file_prefix()?,
-            io_depth_per_log: self.config.io_depth_per_log,
+            io_depth: self.config.io_depth,
             log_file_max_size: self.config.log_file_max_size.as_u64() as usize,
-            max_io_size: self.config.max_io_size.as_u64() as usize,
+            log_block_size: self.config.log_block_size.as_u64() as usize,
         })
     }
 }
@@ -938,7 +1178,7 @@ impl Component for TransactionSystemWorkers {
                     .attach("provider=TransactionSystem, consumer=TransactionRuntime"),
             )
         })?;
-        registry.register::<Self>(startup.start(trx_sys))
+        registry.register::<Self>(startup.start(trx_sys).await?)
     }
 
     #[inline]
@@ -978,7 +1218,11 @@ pub(crate) mod tests {
     use crate::buffer::PoolRole;
     use crate::catalog::tests::table2;
     use crate::conf::{EngineConfig, EvictableBufferPoolConfig};
-    use crate::id::{RowID, TableID};
+    use crate::engine::Engine;
+    use crate::id::{PageID, RowID, TableID};
+    use crate::log::LogSync;
+    use crate::log::redo::{RowRedo, RowRedoKind};
+    use crate::log::redo_format::{REDO_DEFAULT_DATA_START_OFFSET, REDO_SUPER_BLOCK_SLOT_SIZE};
     use crate::value::Val;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Barrier};
@@ -1038,6 +1282,56 @@ pub(crate) mod tests {
                     .any(|undo| undo.table_id == table_id && undo.row_id == row_id),
                 _ => false,
             })
+    }
+
+    async fn build_trx_sys_redo_test_engine_with_log_file_max_size(
+        log_file_stem: &str,
+        log_file_max_size: usize,
+    ) -> (TempDir, Engine) {
+        let temp_dir = TempDir::new().unwrap();
+        let engine = EngineConfig::default()
+            .storage_root(temp_dir.path().to_path_buf())
+            .trx(
+                TrxSysConfig::default()
+                    .log_file_stem(log_file_stem)
+                    .io_depth(1)
+                    .log_sync(LogSync::None)
+                    .log_file_max_size(log_file_max_size),
+            )
+            .data_buffer(
+                EvictableBufferPoolConfig::default()
+                    .role(PoolRole::Mem)
+                    .max_mem_size(64u64 * 1024 * 1024)
+                    .max_file_size(128u64 * 1024 * 1024),
+            )
+            .build()
+            .await
+            .unwrap();
+        (temp_dir, engine)
+    }
+
+    fn add_large_system_redo(sys_trx: &mut SysTrx, value_count: usize) {
+        let values = (0..value_count as u64).map(Val::from).collect();
+        sys_trx.redo.insert_dml(
+            TableID::from(1u64),
+            RowRedo {
+                page_id: PageID::from(1u64),
+                row_id: RowID::new(0),
+                kind: RowRedoKind::Insert(values),
+            },
+        );
+    }
+
+    fn assert_direct_fatal<T: std::fmt::Debug>(res: &Result<T>, expected: FatalError) {
+        let err = match res {
+            Ok(value) => panic!("expected fatal error, got {value:?}"),
+            Err(err) => err,
+        };
+        assert_eq!(
+            err.downcast_ref::<FatalError>().copied(),
+            Some(expected),
+            "{err:?}"
+        );
     }
 
     #[test]
@@ -1256,6 +1550,30 @@ pub(crate) mod tests {
             }
             drop(session);
             drop(engine);
+        });
+    }
+
+    #[test]
+    fn test_commit_sys_new_log_allocation_failure_rejects_without_panic() {
+        smol::block_on(async {
+            let (_temp_dir, engine) = build_trx_sys_redo_test_engine_with_log_file_max_size(
+                "sys_new_log_alloc_failure",
+                REDO_DEFAULT_DATA_START_OFFSET + REDO_SUPER_BLOCK_SLOT_SIZE,
+            )
+            .await;
+            let mut sys_trx = engine.inner().trx_sys.begin_sys_trx();
+            add_large_system_redo(&mut sys_trx, 1024);
+            let res = engine.inner().trx_sys.commit_sys(sys_trx);
+
+            assert_direct_fatal(&res, FatalError::RedoWrite);
+            assert!(
+                engine
+                    .inner()
+                    .trx_sys
+                    .ensure_runtime_healthy()
+                    .as_ref()
+                    .is_err_and(|err| *err.current_context() == FatalError::RedoWrite)
+            );
         });
     }
 }

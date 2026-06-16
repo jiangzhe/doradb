@@ -15,12 +15,8 @@
 //!    c) If exists, check the timestamp in entry head. If it's larger than current STS, means
 //!    it's invisible, undo change and go to next version in the chain...
 //!    d) If less than current STS, return current version.
-mod group;
-pub(crate) mod log;
-pub(crate) mod log_replay;
+pub(crate) mod group;
 pub(crate) mod purge;
-pub(crate) mod recover;
-pub(crate) mod redo;
 pub(crate) mod row;
 pub(crate) mod stmt;
 pub(crate) mod sys;
@@ -41,13 +37,13 @@ use crate::lock::{
     FreshLockGuard, LockManager, LockMode, LockOwner, LockOwnerGroup, LockResource, OwnerLockState,
     StmtNo,
 };
+use crate::log::log_replay::TrxLog;
+use crate::log::redo::{DDLRedo, RedoHeader, RedoLogs, RedoTrxKind};
 use crate::map::FastHashMap;
 use crate::notify::EventNotifyOnDrop;
 use crate::quiescent::QuiescentGuard;
 use crate::session::TrxAttachment;
 use crate::table::Table;
-use crate::trx::log_replay::TrxLog;
-use crate::trx::redo::{DDLRedo, RedoHeader, RedoLogs, RedoTrxKind};
 use crate::trx::undo::{IndexPurgeEntry, IndexUndoLogs, RowUndoHead, RowUndoLogs, UndoStatus};
 use error_stack::Report;
 use event_listener::EventListener;
@@ -1217,7 +1213,7 @@ pub(crate) struct FailedPrecommitCleanupJob {
 
 impl FailedPrecommitCleanupJob {
     #[inline]
-    fn new(
+    pub(crate) fn new(
         trx_list: Vec<PrecommitTrx>,
         completion: Arc<Completion<()>>,
         reason: FailedPrecommitReason,
@@ -1756,10 +1752,10 @@ impl PreparedTrxPayload {
 /// `PreparedTrx` owns all transaction effects, locks, and the terminal
 /// attachment before the irreversible group-commit handoff. Dropping it is only
 /// valid after a caller has consumed or explicitly cleared those fields.
-struct PreparedTrx {
+pub(crate) struct PreparedTrx {
     redo_bin: Option<TrxLog>,
     payload: Option<PreparedTrxPayload>,
-    attachment: Option<TrxAttachment>,
+    pub(crate) attachment: Option<TrxAttachment>,
     lock_manager: Option<QuiescentGuard<LockManager>>,
     lock_state: Option<OwnerLockState>,
 }
@@ -1791,7 +1787,7 @@ impl PreparedTrx {
     }
 
     #[inline]
-    fn fill_cts(mut self, cts: TrxID) -> PrecommitTrx {
+    pub(crate) fn fill_cts(mut self, cts: TrxID) -> PrecommitTrx {
         let redo_bin = if let Some(mut redo_bin) = self.redo_bin.take() {
             redo_bin.header.cts = cts;
             Some(redo_bin)
@@ -1861,7 +1857,7 @@ impl Drop for PreparedTrx {
     }
 }
 
-pub(in crate::trx) struct PrecommitTrxPayload {
+pub(crate) struct PrecommitTrxPayload {
     status: Arc<SharedTrxStatus>,
     sts: TrxID,
     gc_no: usize,
@@ -1897,7 +1893,7 @@ impl PrecommitTrxPayload {
     #[inline]
     fn record_rollback_for_purge(&self, attachment: &TrxAttachment) {
         let trx_sys = &attachment.engine().trx_sys;
-        trx_sys.redo_log.gc_buckets[self.gc_no].record_rollback_for_purge(self.sts);
+        trx_sys.gc_buckets[self.gc_no].record_rollback_for_purge(self.sts);
     }
 
     #[inline]
@@ -1917,14 +1913,14 @@ impl PrecommitTrxPayload {
 /// rollback-capable undo, locks, and terminal attachment. The other is an
 /// attachmentless system transaction, which is directly dropped after ordered
 /// completion.
-struct PrecommitTrx {
-    cts: TrxID,
-    redo_bin: Option<TrxLog>,
+pub(crate) struct PrecommitTrx {
+    pub(crate) cts: TrxID,
+    pub(crate) redo_bin: Option<TrxLog>,
     // Payload is only for user transaction
-    payload: Option<PrecommitTrxPayload>,
-    attachment: Option<TrxAttachment>,
-    lock_manager: Option<QuiescentGuard<LockManager>>,
-    lock_state: Option<OwnerLockState>,
+    pub(crate) payload: Option<PrecommitTrxPayload>,
+    pub(crate) attachment: Option<TrxAttachment>,
+    pub(crate) lock_manager: Option<QuiescentGuard<LockManager>>,
+    pub(crate) lock_state: Option<OwnerLockState>,
 }
 
 impl PrecommitTrx {
@@ -1936,7 +1932,7 @@ impl PrecommitTrx {
 
     /// Takes the recovery-visible log record, if this transaction requires one.
     #[inline]
-    fn take_log(&mut self) -> Option<TrxLog> {
+    pub(crate) fn take_log(&mut self) -> Option<TrxLog> {
         self.redo_bin.take()
     }
 
@@ -1944,7 +1940,7 @@ impl PrecommitTrx {
     /// The method should be invoked when redo logs have been persisted to disk.
     /// It will update backfill commit timestamp and update status to committed.
     #[inline]
-    fn commit(mut self) -> CommittedTrx {
+    pub(crate) fn commit(mut self) -> CommittedTrx {
         assert!(self.redo_bin.is_none()); // redo log should be already processed by logger.
         // release the prepare notifier in transaction status
         let committed = match self.payload.take() {
@@ -2058,7 +2054,7 @@ impl PrecommitTrx {
 
     /// Discard an attachmentless rejected precommit transaction.
     #[inline]
-    fn discard_rejected(mut self) {
+    pub(crate) fn discard_rejected(mut self) {
         debug_assert!(self.payload.is_none());
         debug_assert!(self.attachment.is_none());
         self.redo_bin.take();
@@ -2100,13 +2096,13 @@ pub(crate) struct CommittedTrx {
 
 impl CommittedTrx {
     #[inline]
-    fn sts(&self) -> Option<TrxID> {
+    pub(crate) fn sts(&self) -> Option<TrxID> {
         self.payload.as_ref().map(|p| p.sts)
     }
 
     /// Returns gc_no if this transaction is GC-aware.
     #[inline]
-    fn gc_no(&self) -> Option<usize> {
+    pub(crate) fn gc_no(&self) -> Option<usize> {
         self.payload.as_ref().map(|p| p.gc_no)
     }
 
@@ -2149,10 +2145,10 @@ pub(crate) mod tests {
     use crate::lock::tests::{
         LockDebugEntryState, debug_snapshot, try_acquire, try_acquire_grouped,
     };
+    use crate::log::redo::{RowRedo, RowRedoKind};
     use crate::row::ops::SelectKey;
     use crate::session::tests::SessionTestExt;
     use crate::table::test_user_table_id;
-    use crate::trx::redo::{RowRedo, RowRedoKind};
     use crate::trx::stmt::tests as stmt_tests;
     use crate::trx::undo::{IndexUndo, IndexUndoKind, OwnedRowUndo, RowUndoKind};
     use crate::value::{Val, ValKind};
@@ -2312,7 +2308,7 @@ pub(crate) mod tests {
                 0
             );
 
-            engine.inner().trx_sys.redo_log.gc_buckets[gc_no].record_rollback_for_purge(sts);
+            engine.inner().trx_sys.gc_buckets[gc_no].record_rollback_for_purge(sts);
             engine
                 .inner()
                 .session_registry
@@ -2452,7 +2448,7 @@ pub(crate) mod tests {
             && let Some(attachment) = prepared.attachment.as_ref()
         {
             let trx_sys = &attachment.engine().trx_sys;
-            trx_sys.redo_log.gc_buckets[payload.gc_no].record_rollback_for_purge(payload.sts);
+            trx_sys.gc_buckets[payload.gc_no].record_rollback_for_purge(payload.sts);
         }
         prepared.redo_bin.take();
         if let Some(attachment) = prepared.attachment.take() {
@@ -2464,8 +2460,7 @@ pub(crate) mod tests {
     #[inline]
     fn finish_production_committed_for_test(engine: &Engine, committed: CommittedTrx) {
         if let Some(gc_no) = committed.gc_no() {
-            engine.inner().trx_sys.redo_log.gc_buckets[gc_no]
-                .record_committed_for_purge(vec![committed]);
+            engine.inner().trx_sys.gc_buckets[gc_no].record_committed_for_purge(vec![committed]);
         }
     }
 
@@ -2475,7 +2470,7 @@ pub(crate) mod tests {
         let gc_no = transaction_gc_no(trx);
         let engine = trx.engine().expect("test transaction must have engine");
         discard_transaction_after_fatal_rollback(trx);
-        engine.trx_sys.redo_log.gc_buckets[gc_no].record_rollback_for_purge(sts);
+        engine.trx_sys.gc_buckets[gc_no].record_rollback_for_purge(sts);
     }
 
     /// Add one redo log entry for tests that need a non-readonly transaction.

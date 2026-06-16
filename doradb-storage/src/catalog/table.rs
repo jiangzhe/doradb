@@ -9,6 +9,7 @@ use crate::index::BlockIndex;
 use crate::lock::{
     FreshLockGuard, LockGrant, LockManager, LockMode, LockOwner, LockOwnerGroup, LockResource,
 };
+use crate::log::redo::DDLRedo;
 use crate::map::FastHashSet;
 use crate::row::ops::SelectKey;
 use crate::row::{Row, RowRead};
@@ -16,7 +17,6 @@ use crate::serde::{Deser, Ser, Serde};
 use crate::session::{SessionDdlContext, SessionPin};
 use crate::table::Table;
 use crate::trx::Transaction;
-use crate::trx::redo::DDLRedo;
 use crate::value::{Val, ValKind, ValType};
 use error_stack::Report;
 use semistr::SemiStr;

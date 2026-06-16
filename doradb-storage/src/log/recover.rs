@@ -23,15 +23,16 @@ use crate::catalog::{
 use crate::error::{DataIntegrityError, Error, OperationError, Result};
 use crate::file::fs::FileSystem;
 use crate::id::{PageID, RowID, TableID, TrxID};
+use crate::io::Completion;
 use crate::latch::LatchFallbackMode;
+use crate::log::log_replay::{RedoLogStream, TrxLog};
+use crate::log::redo::{DDLRedo, RedoLogs, RowRedo, RowRedoKind, TableDML};
+use crate::log::{RedoLog, RedoLogInitializer};
 use crate::map::{FastHashMap, FastHashSet};
 use crate::quiescent::QuiescentGuard;
 use crate::row::RowPage;
 use crate::table::Table;
-use crate::trx::log::{RedoLog, RedoLogInitializer};
-use crate::trx::log_replay::{RedoLogStream, TrxLog};
 use crate::trx::purge::{DroppedTableFileDeleteItem, Purge};
-use crate::trx::redo::{DDLRedo, RedoLogs, RowRedo, RowRedoKind, TableDML};
 use crate::trx::{MAX_SNAPSHOT_TS, MIN_SNAPSHOT_TS};
 use crossbeam_utils::CachePadded;
 use error_stack::Report;
@@ -97,7 +98,12 @@ pub(crate) async fn log_recover(
     catalog: &Catalog,
     redo_log_initializer: RedoLogInitializer,
     purge_tx: Sender<Purge>,
-) -> Result<(CachePadded<RedoLog>, TrxID, Vec<DroppedTableFileDeleteItem>)> {
+) -> Result<(
+    CachePadded<RedoLog>,
+    TrxID,
+    Vec<DroppedTableFileDeleteItem>,
+    Arc<Completion<()>>,
+)> {
     let RecoveryDeps {
         index_pool,
         mem_pool,
@@ -124,11 +130,12 @@ pub(crate) async fn log_recover(
             )
         })?;
     let initializer = log_stream.into_initializer();
-    let redo_log = initializer.finish(purge_tx)?;
+    let (redo_log, initial_redo_header) = initializer.finish(purge_tx)?;
     Ok((
         CachePadded::new(redo_log),
         next_trx_ts,
         dropped_table_file_deletes,
+        initial_redo_header,
     ))
 }
 
@@ -940,12 +947,12 @@ mod tests {
     use crate::file::table_file::MutableTableFile;
     use crate::id::{BlockID, PageID, RowID, TableID, TrxID};
     use crate::index::{COLUMN_DELETION_BLOB_PAGE_HEADER_SIZE, ColumnBlockIndex, UniqueIndex};
+    use crate::log::log_replay::TrxLog;
+    use crate::log::redo::{DDLRedo, RedoHeader, RedoLogs, RedoTrxKind, RowRedo, RowRedoKind};
     use crate::row::RowRead;
     use crate::row::ops::{DeleteMvcc, SelectKey, SelectMvcc, UpdateCol, UpdateMvcc};
     use crate::session::tests::SessionTestExt;
     use crate::table::{CheckpointOutcome, DeleteMarker, Table};
-    use crate::trx::log_replay::TrxLog;
-    use crate::trx::redo::{DDLRedo, RedoHeader, RedoLogs, RedoTrxKind, RowRedo, RowRedoKind};
     use crate::trx::{MIN_SNAPSHOT_TS, Transaction};
     use crate::value::Val;
     use crate::value::ValKind;
@@ -993,7 +1000,7 @@ mod tests {
             )
             .trx(
                 TrxSysConfig::default()
-                    .io_depth_per_log(1)
+                    .io_depth(1)
                     .log_file_stem(log_file_stem)
                     .purge_threads(1),
             )

@@ -146,36 +146,36 @@ internal field names rather than keeping a compatibility alias. [D2], [C2],
 Add fixed-size redo super-block slots at the start of every v2 redo file. Use
 two `STORAGE_SECTOR_SIZE` slots, currently 4KB each, at offsets 0 and 4096.
 This keeps A/B header-slot discovery independent of `log_block_size`. The
-selected valid header carries `log_block_size` and `data_start_offset`; replay
-uses those stored values for group scanning. The default v2 data start should
-be `2 * STORAGE_SECTOR_SIZE` unless a later implementation task identifies a
-reason to reserve additional fixed header space. This is intentionally similar
-to table-file A/B super-block publication in protocol, not in physical slot
+selected valid header carries `log_block_size`; replay uses the stored block
+size plus fixed `REDO_DEFAULT_DATA_START_OFFSET` for group scanning. The default
+v2 data start should be `2 * STORAGE_SECTOR_SIZE` unless a later implementation
+task identifies a reason to reserve additional fixed header space. This is
+intentionally similar to table-file A/B super-block publication in protocol, not
+in physical slot
 size: table-file super-block slots are currently 32KB because table files use
 64KB pages. [D5], [C1], [C2], [C9], [C10], [U7], [U8]
 
 Keep the normal redo group write interface unchanged. Super-block writes are
 metadata writes at file creation, rotation seal, and clean shutdown seal; they
 should not flow through `CommitGroup`, `SyncGroup`, or the CTS-keyed inflight
-completion map. Implementation should add a small direct metadata-write helper
-or a separate submission kind for the fixed 4KB super-block slots, while
-leaving the existing `LogWriteSubmission` path for commit-group redo payload
-writes. [C3], [C4], [C9], [U3], [U7], [U8]
+completion map. Runtime super-block writes should use the redo log thread's
+async write driver with a separate header submission kind for the fixed 4KB
+slots, while leaving commit-group redo payload ownership unchanged. [C3], [C4],
+[C9], [U3], [U7], [U8]
 
-Use A/B redo super-block publication when sealing a file. Create one valid open
-slot when the file is created, then seal the file by writing the inactive slot
-with a higher generation, sealed durable end offset, redo min CTS, redo max
-CTS, and checksum after the log thread has drained and synced all groups for
-that file. Recovery selects the newest valid slot by generation/state/checksum
-and falls back to the older valid slot if the newer slot is torn. Each slot must
-include at least magic, format version, file sequence, header slot number,
-header slot size, data start offset, log block size, file max size, checksum
-kind, generation, file state, durable end offset, redo min CTS, and redo max
-CTS. Mirror the table-file super-block structure at the protocol level by using
-a header/body/footer layout where the footer carries a BLAKE3 checksum over the
-slot bytes before the footer and repeats the generation or sealed max CTS needed
-to detect torn writes. [D2], [D5], [C1], [C4], [C9], [C10], [U1], [U2], [U7],
-[U8], [U10]
+Use A/B redo super-block publication when sealing a file. Create one valid slot
+when the file is created, then publish the inactive slot with a higher
+generation, sealed durable end offset, redo min CTS, redo max CTS, and checksum
+after the log thread has drained and synced all groups for that file. Recovery
+selects the newest valid slot by generation/checksum and falls back to the older
+valid slot if the newer slot is torn. Each slot must include at least magic,
+format version, file sequence, header slot number, log block size, file max
+size, generation, durable end offset, redo min CTS, and redo max CTS. Mirror the
+table-file super-block
+structure at the protocol level by using a header/body/footer layout where the
+footer carries a BLAKE3 checksum over the slot bytes before the footer and
+repeats the generation or sealed max CTS needed to detect torn writes. [D2],
+[D5], [C1], [C4], [C9], [C10], [U1], [U2], [U7], [U8], [U10]
 
 Do not support legacy v1 redo recovery. A discovered redo file without a valid
 v2 magic/header slot is invalid, including all-zero reserved-header files from
@@ -295,13 +295,13 @@ the unsafe boundary local to reader construction. [C2], [B2]
 ## Implementation Phases
 
 - **Phase 1: V2 Redo Super Blocks**
-  - Scope: Define `RedoFileHeaderV2`, rename `max_io_size` to
-    `log_block_size`, write an open header into one fixed 4KB redo super-block
+  - Scope: Define `RedoFileHeader`, rename `max_io_size` to
+    `log_block_size`, write an initial header into one fixed 4KB redo super-block
     slot on new files, parse the two A/B header slots during discovery/recovery,
-    record `log_block_size` and `data_start_offset`, and reject files without a
+    record `log_block_size`, and reject files without a
     valid v2 header slot.
-  - Goals: Validate magic/version/sequence/header slot size/data start
-    offset/log block size/file max size/checksum kind/generation/slot state;
+  - Goals: Validate magic/version/sequence/header slot number/log block
+    size/file max size/generation;
     reject legacy zero-header and unknown non-v2 redo files; create only v2
     files; select the newest valid header slot and tolerate a torn inactive-slot
     write.
@@ -309,14 +309,14 @@ the unsafe boundary local to reader construction. [C2], [B2]
     deletion.
   - Prerequisites: Existing redo directories must be empty or already v2; old
     zero-header files are intentionally rejected.
-  - Phase-local Choices: Exact field sizes; footer redundancy field layout;
-    whether header parsing lives in `trx/log.rs` or a new redo-format module;
-    whether super-block writes use a small synchronous direct-write helper or a
-    separate one-shot backend submission wrapper.
-  - Task Doc: `docs/tasks/TBD.md`
-  - Task Issue: `#0`
-  - Phase Status: `pending`
-  - Implementation Summary: `pending`
+  - Phase-local Choices: Resolved by using `RedoFileHeader` in
+    `doradb-storage/src/log/redo_format.rs` with fixed 4KB slots, footer
+    redundancy, BLAKE3 checksum validation, and async super-block writes through
+    the redo log thread's write driver.
+  - Task Doc: `docs/tasks/000178-redo-log-super-blocks.md`
+  - Task Issue: `#710`
+  - Phase Status: done
+  - Implementation Summary: Implemented v2 redo super-block baseline with top-level log module, fixed A/B redo headers, async initial header writes, validated replay/checkpoint scanning, log_block_size/io_depth rename, logical file-size replay bounds, and related docs/tests cleanup. [Task Resolve Sync: docs/tasks/000178-redo-log-super-blocks.md @ 2026-06-16]
 
 - **Phase 2: Group Checksum and Strict Record Framing**
   - Scope: Add the v2 group metadata area after the existing first length
@@ -337,8 +337,8 @@ the unsafe boundary local to reader construction. [C2], [B2]
 
 - **Phase 3: Sealed Segment Ranges**
   - Scope: Track real redo min/max CTS per active file, write the inactive A/B
-    header slot into sealed state after rotation or clean shutdown once pending
-    groups are drained, and validate sealed ranges during recovery.
+    header slot with sealed metadata after rotation or clean shutdown once
+    pending groups are drained, and validate sealed ranges during recovery.
   - Goals: Make v2 file headers useful as durable segment metadata without
     depending on volatile ordered no-log CTS values.
   - Non-goals: Truncation/deletion and active crash-file sealing.
@@ -376,8 +376,8 @@ the unsafe boundary local to reader construction. [C2], [B2]
     tested.
   - Non-goals: Benchmarking sync batching or implementing truncation.
   - Prerequisites: Phases 1 through 4 define the final v2 behavior.
-  - Phase-local Choices: Final test split across `trx/log.rs`,
-    `trx/log_replay.rs`, `trx/recover.rs`, and catalog/table recovery tests.
+  - Phase-local Choices: Final test split across `log/mod.rs`,
+    `log/log_replay.rs`, `log/recover.rs`, and catalog/table recovery tests.
   - Task Doc: `docs/tasks/TBD.md`
   - Task Issue: `#0`
   - Phase Status: `pending`

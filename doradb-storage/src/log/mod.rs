@@ -1,26 +1,34 @@
+pub(crate) mod log_replay;
+pub(crate) mod recover;
+pub(crate) mod redo;
+pub(crate) mod redo_format;
+
 use crate::conf::TrxSysConfig;
-use crate::error::{ConfigError, DataIntegrityError, Error, FatalError, ResourceError, Result};
+use crate::error::{
+    CompletionErrorKind, ConfigError, DataIntegrityError, Error, FatalError, InternalError,
+    ResourceError, Result,
+};
 use crate::file::{FileSyncer, SparseFile, UNTRACKED_FILE_ID};
 use crate::free_list::FreeList;
 use crate::id::TrxID;
 use crate::io::{
-    Completion, DirectBuf, IOBackendStats, IOBackendStatsHandle, IOSubmission, Operation,
+    Completion, DirectBuf, IOBackendStats, IOBackendStatsHandle, IOBuf, IOSubmission, Operation,
     StorageBackend, SubmissionDriver,
+};
+use crate::log::log_replay::{LogBuf, MmapLogReader, RedoLogStream, TrxLog};
+use crate::log::redo_format::{
+    REDO_DEFAULT_DATA_START_OFFSET, REDO_SUPER_BLOCK_SLOT_SIZE, RedoFileHeader,
+    serialize_redo_super_block,
 };
 use crate::map::FastHashMap;
 use crate::serde::Ser;
 use crate::trx::MIN_SNAPSHOT_TS;
 use crate::trx::group::{
-    Commit, CommitGroup, CommitGroupLog, CommitJoin, CommitWaiter, GroupCommit, MutexGroupCommit,
+    Commit, CommitGroup, CommitGroupLog, CommitJoin, GroupCommit, MutexGroupCommit,
 };
-use crate::trx::log_replay::{LogBuf, MmapLogReader, RedoLogStream, TrxLog};
-use crate::trx::purge::{GCBucket, Purge};
-use crate::trx::sys::GC_BUCKETS;
+use crate::trx::purge::Purge;
 use crate::trx::sys::TransactionSystem;
-use crate::trx::{
-    CommittedTrx, FailedPrecommitCleanupJob, FailedPrecommitReason, MAX_COMMIT_TS, MAX_SNAPSHOT_TS,
-    PrecommitTrx, PreparedTrx,
-};
+use crate::trx::{CommittedTrx, FailedPrecommitCleanupJob, FailedPrecommitReason, PrecommitTrx};
 use crossbeam_utils::CachePadded;
 use error_stack::Report;
 use flume::Sender;
@@ -36,27 +44,13 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
-pub(crate) const LOG_HEADER_PAGES: usize = 2;
-enum EnqueuedCommit {
-    Queued {
-        cts: TrxID,
-        waiter: Option<CommitWaiter>,
-    },
-    Rejected {
-        cts: TrxID,
-        trx: Box<PrecommitTrx>,
-        reason: FailedPrecommitReason,
-    },
-}
-
 pub(crate) struct RedoLogInitializer {
     pub(crate) ctx: StorageBackend,
     pub(crate) mode: RedoLogMode,
     pub(crate) file_prefix: String,
     pub(crate) file_max_size: usize,
-    pub(crate) file_header_size: usize,
-    pub(crate) page_size: usize,
-    pub(crate) io_depth_per_log: usize,
+    pub(crate) log_block_size: usize,
+    pub(crate) io_depth: usize,
     // sequence of last log file.
     pub(crate) file_seq: Option<u32>,
 }
@@ -65,19 +59,18 @@ impl RedoLogInitializer {
     #[inline]
     pub(crate) fn recovery(
         file_prefix: String,
-        io_depth_per_log: usize,
+        io_depth: usize,
         file_max_size: usize,
-        max_io_size: usize,
+        log_block_size: usize,
         logs: Vec<PathBuf>,
     ) -> Result<Self> {
         Ok(Self {
-            ctx: StorageBackend::new(io_depth_per_log)?,
+            ctx: StorageBackend::new(io_depth)?,
             mode: RedoLogMode::Recovery(VecDeque::from(logs)),
             file_prefix,
             file_max_size,
-            file_header_size: max_io_size * LOG_HEADER_PAGES,
-            page_size: max_io_size,
-            io_depth_per_log,
+            log_block_size,
+            io_depth,
             file_seq: None,
         })
     }
@@ -97,13 +90,9 @@ impl RedoLogInitializer {
             RedoLogMode::Done => Ok(None),
             RedoLogMode::Recovery(logs) => {
                 let log = logs.pop_front().unwrap();
-                self.file_seq.replace(parse_file_seq(log.as_path())?);
-                let reader = MmapLogReader::new(
-                    &log,
-                    self.page_size,
-                    self.file_max_size,
-                    self.file_header_size,
-                )?;
+                let file_seq = parse_file_seq(log.as_path())?;
+                self.file_seq.replace(file_seq);
+                let reader = MmapLogReader::new(&log, file_seq)?;
                 if logs.is_empty() {
                     // add file seq so we always open a new log file.
                     *self.file_seq.as_mut().unwrap() += 1;
@@ -115,42 +104,51 @@ impl RedoLogInitializer {
     }
 
     #[inline]
-    pub(super) fn finish(self, purge_tx: Sender<Purge>) -> Result<RedoLog> {
+    pub(crate) fn finish(self, purge_tx: Sender<Purge>) -> Result<(RedoLog, Arc<Completion<()>>)> {
         let mut file_seq = self.file_seq.unwrap_or(0);
-        let log_file = create_log_file(
+        let (
+            CreatedLogFile {
+                log_file,
+                header_write,
+            },
+            header_completion,
+        ) = create_log_file_with_header_completion(
             &self.file_prefix,
             file_seq,
             self.file_max_size,
-            self.file_header_size,
+            self.log_block_size,
         )?;
         file_seq += 1;
 
+        let mut queue = VecDeque::new();
+        queue.push_back(Commit::LogFileBoundary {
+            ended_log_file: None,
+            header_write,
+        });
         let group_commit = GroupCommit {
-            queue: VecDeque::new(),
+            queue,
             closed: None,
             log_file: Some(log_file),
         };
-        let gc_info: Vec<_> = (0..GC_BUCKETS).map(|_| GCBucket::new()).collect();
         let io_backend_stats = self.ctx.stats_handle();
-        Ok(RedoLog {
-            group_commit: CachePadded::new(MutexGroupCommit::new(group_commit)),
-            persisted_cts: CachePadded::new(AtomicU64::new(MIN_SNAPSHOT_TS.as_u64())),
-            rr_gc_no: CachePadded::new(AtomicUsize::new(0)),
-            stats: Arc::new(CachePadded::new(RedoLogStats::default())),
-            purge_tx,
-            gc_buckets: gc_info.into_boxed_slice(),
-            log_write_backend: CachePadded::new(Mutex::new(Some(self.ctx))),
-            io_backend_stats,
-            max_io_size: self.page_size,
-            file_prefix: self.file_prefix,
-            file_seq: AtomicU32::new(file_seq),
-            file_max_size: self.file_max_size,
-            buf_free_list: FreeList::new(
-                self.io_depth_per_log,
-                self.io_depth_per_log * 2,
-                move || DirectBuf::zeroed(self.page_size),
-            ),
-        })
+        Ok((
+            RedoLog {
+                group_commit: CachePadded::new(MutexGroupCommit::new(group_commit)),
+                persisted_cts: CachePadded::new(AtomicU64::new(MIN_SNAPSHOT_TS.as_u64())),
+                stats: Arc::new(CachePadded::new(RedoLogStats::default())),
+                purge_tx,
+                log_write_backend: CachePadded::new(Mutex::new(Some(self.ctx))),
+                io_backend_stats,
+                log_block_size: self.log_block_size,
+                file_prefix: self.file_prefix,
+                file_seq: AtomicU32::new(file_seq),
+                file_max_size: self.file_max_size,
+                buf_free_list: FreeList::new(self.io_depth, self.io_depth * 2, move || {
+                    DirectBuf::zeroed(self.log_block_size)
+                }),
+            },
+            header_completion,
+        ))
     }
 }
 
@@ -162,17 +160,45 @@ pub(crate) enum RedoLogMode {
     Done,
 }
 
-pub(super) struct LogWriteSubmission {
-    cts: TrxID,
+pub(crate) struct LogWriteSubmission {
+    kind: LogWriteKind,
     operation: Operation,
+}
+
+enum LogWriteKind {
+    Group { cts: TrxID },
+    Header { completion: Arc<Completion<()>> },
 }
 
 impl LogWriteSubmission {
     #[inline]
-    pub(super) fn new(cts: TrxID, fd: std::os::fd::RawFd, offset: usize, buf: DirectBuf) -> Self {
+    pub(crate) fn new(cts: TrxID, fd: std::os::fd::RawFd, offset: usize, buf: DirectBuf) -> Self {
         LogWriteSubmission {
-            cts,
+            kind: LogWriteKind::Group { cts },
             operation: Operation::pwrite_owned(fd, offset, buf),
+        }
+    }
+
+    #[inline]
+    fn header(fd: RawFd, offset: usize, buf: DirectBuf) -> (Self, Arc<Completion<()>>) {
+        let completion = Arc::new(Completion::new());
+        let submission = LogWriteSubmission {
+            kind: LogWriteKind::Header {
+                completion: Arc::clone(&completion),
+            },
+            operation: Operation::pwrite_owned(fd, offset, buf),
+        };
+        (submission, completion)
+    }
+
+    #[inline]
+    fn fail_unsubmitted_header(mut self, reason: FatalError) {
+        let _ = self.operation.take_buf();
+        if let LogWriteKind::Header { completion } = self.kind {
+            completion.complete(Err(CompletionErrorKind::report_fatal(
+                reason,
+                "redo header write was not submitted",
+            )));
         }
     }
 }
@@ -184,13 +210,20 @@ impl IOSubmission for LogWriteSubmission {
     }
 }
 
-struct LogWriteCompletion {
-    cts: TrxID,
-    buf: DirectBuf,
-    poison: Option<FatalError>,
+enum LogWriteCompletion {
+    Group {
+        cts: TrxID,
+        buf: DirectBuf,
+        poison: Option<FatalError>,
+    },
+    Header {
+        completion: Arc<Completion<()>>,
+        buf: DirectBuf,
+        poison: Option<FatalError>,
+    },
 }
 
-struct LogWriteDriver {
+pub(crate) struct LogWriteDriver {
     driver: SubmissionDriver<LogWriteSubmission>,
 }
 
@@ -244,64 +277,59 @@ impl LogWriteDriver {
             Ok(_len) => Some(FatalError::RedoWrite),
             Err(_err) => Some(FatalError::RedoWrite),
         };
-        LogWriteCompletion {
-            cts: submission.cts,
-            buf,
-            poison: result,
+        match submission.kind {
+            LogWriteKind::Group { cts } => LogWriteCompletion::Group {
+                cts,
+                buf,
+                poison: result,
+            },
+            LogWriteKind::Header { completion } => LogWriteCompletion::Header {
+                completion,
+                buf,
+                poison: result,
+            },
         }
     }
 }
 
 pub(crate) struct RedoLog {
     /// Group commit state for the redo log.
-    pub(super) group_commit: CachePadded<MutexGroupCommit>,
+    pub(crate) group_commit: CachePadded<MutexGroupCommit>,
     /// Maximum ordered-completed CTS of this redo log.
     ///
     /// Durability-required groups advance this after redo write/sync completes.
     /// No-log groups also advance it after ordered completion, but recovery
     /// still seeds timestamps only from checkpoint metadata, table roots, and
     /// redo headers.
-    pub(super) persisted_cts: CachePadded<AtomicU64>,
-    /// Round-robin GC number generator.
-    rr_gc_no: CachePadded<AtomicUsize>,
+    pub(crate) persisted_cts: CachePadded<AtomicU64>,
     /// Stats of transaction system.
-    pub(super) stats: Arc<CachePadded<RedoLogStats>>,
+    pub(crate) stats: Arc<CachePadded<RedoLogStats>>,
     /// Purge coordinator channel used for committed transaction GC handoff.
-    pub(super) purge_tx: Sender<Purge>,
-    /// Each GC bucket contains active sts list, committed transaction list and
-    /// old transaction list.
-    /// Split into multiple buckets in order to avoid bottleneck of global synchronization.
-    pub(super) gc_buckets: Box<[GCBucket]>,
+    pub(crate) purge_tx: Sender<Purge>,
     /// Backend for redo writes, taken exactly once by the log thread.
     log_write_backend: CachePadded<Mutex<Option<StorageBackend>>>,
     /// Backend-owned submit/wait statistics for redo writes.
     io_backend_stats: IOBackendStatsHandle,
-    /// Maximum IO size of each group.
-    pub(super) max_io_size: usize,
+    /// Log block size of each group.
+    pub(crate) log_block_size: usize,
     /// Log file prefix for the single redo file family.
-    pub(super) file_prefix: String,
+    pub(crate) file_prefix: String,
     /// Sequence of current file in this redo log, starting from 0.
-    pub(super) file_seq: AtomicU32,
+    pub(crate) file_seq: AtomicU32,
     /// Maximum size of single log file.
-    pub(super) file_max_size: usize,
+    pub(crate) file_max_size: usize,
     /// Free list of page buffer, which is used by commit group to concat
     /// redo logs.
-    pub(super) buf_free_list: FreeList<DirectBuf>,
+    pub(crate) buf_free_list: FreeList<DirectBuf>,
 }
 
 impl RedoLog {
-    /// Returns next GC number.
-    /// It is used to evenly dispatch transactions to all GC buckets.
-    pub(crate) fn next_gc_no(&self) -> usize {
-        self.rr_gc_no.fetch_add(1, Ordering::Relaxed) % GC_BUCKETS
-    }
-
     /// Create a new log buffer to hold one transaction's redo log.
     #[inline]
     fn new_buf(&self, data: TrxLog) -> LogBuf {
         let ser_len = data.ser_len();
         let buf_len = LogBuf::actual_len(ser_len);
-        if ser_len > self.max_io_size {
+        if ser_len > self.log_block_size {
             // data is longer than single page, we need to
             let mut buf = LogBuf::new(buf_len);
             buf.ser(&data);
@@ -318,7 +346,7 @@ impl RedoLog {
 
     #[inline]
     fn try_buf_in_free_list(&self, ser_len: usize) -> Option<LogBuf> {
-        if LogBuf::actual_len(ser_len) <= self.max_io_size {
+        if LogBuf::actual_len(ser_len) <= self.log_block_size {
             // fit buffer size in free list.
             return self.buf_free_list.try_pop(true).map(LogBuf::with_buffer);
         }
@@ -326,49 +354,56 @@ impl RedoLog {
     }
 
     #[inline]
-    pub(super) fn min_active_sts(&self) -> TrxID {
-        let mut min = MAX_SNAPSHOT_TS;
-        for gc_bucket in &self.gc_buckets {
-            let ts = TrxID::new(gc_bucket.min_active_sts.load(Ordering::Relaxed));
-            if ts < min {
-                min = ts;
-            }
-        }
-        min
-    }
-
-    #[inline]
     fn rotate_log_file(&self, group_commit_g: &mut MutexGuard<'_, GroupCommit>) -> Result<()> {
-        let new_log_file = self.create_log_file()?;
-        let old_log_file = group_commit_g.log_file.replace(new_log_file).unwrap();
-        group_commit_g.queue.push_back(Commit::Switch(old_log_file));
+        let Some(old_log_file) = group_commit_g.log_file.take() else {
+            return Err(Error::from(
+                Report::new(InternalError::Generic)
+                    .attach("redo log rotation requires current log file"),
+            ));
+        };
+        let CreatedLogFile {
+            log_file: new_log_file,
+            header_write,
+        } = match self.create_log_file() {
+            Ok(created) => created,
+            Err(err) => {
+                group_commit_g.log_file = Some(old_log_file);
+                return Err(err);
+            }
+        };
+        group_commit_g.log_file = Some(new_log_file);
+        group_commit_g.queue.push_back(Commit::LogFileBoundary {
+            ended_log_file: Some(old_log_file),
+            header_write,
+        });
         Ok(())
     }
 
     #[inline]
-    fn create_log_file(&self) -> Result<SparseFile> {
+    fn create_log_file(&self) -> Result<CreatedLogFile> {
         let file_seq = self.file_seq.fetch_add(1, Ordering::SeqCst);
         create_log_file(
             &self.file_prefix,
             file_seq,
             self.file_max_size,
-            // we use two pages as file header to maintain metadata of log file.
-            self.max_io_size * LOG_HEADER_PAGES,
+            self.log_block_size,
         )
     }
 
     #[inline]
-    fn create_new_group(
+    pub(crate) fn enqueue_precommit_group(
         &self,
         mut trx: PrecommitTrx,
         group_commit_g: &mut MutexGuard<'_, GroupCommit>,
         wait_sync: bool,
-    ) -> CommitJoin {
+    ) -> std::result::Result<CommitJoin, Box<PrecommitTrx>> {
         let cts = trx.cts;
         let log = if let Some(redo_bin) = trx.take_log() {
             // Serialize redo log to buffer.
             let log_buf = self.new_buf(redo_bin);
-            let log_file = group_commit_g.log_file.as_ref().unwrap();
+            let Some(log_file) = group_commit_g.log_file.as_ref() else {
+                return Err(Box::new(trx));
+            };
             // Allocate space of log file.
             let (fd, offset) = match log_file.alloc(log_buf.capacity()) {
                 Ok((offset, _)) => (log_file.as_raw_fd(), offset),
@@ -376,16 +411,19 @@ impl RedoLog {
                     if err.resource_error() == Some(ResourceError::StorageFileCapacityExceeded) =>
                 {
                     // Rotate log file and try again.
-                    self.rotate_log_file(group_commit_g)
-                        .expect("rotate log file");
+                    if self.rotate_log_file(group_commit_g).is_err() {
+                        return Err(Box::new(trx));
+                    }
 
-                    let new_log_file = group_commit_g.log_file.as_ref().unwrap();
-                    let (offset, _) = new_log_file
-                        .alloc(log_buf.capacity())
-                        .expect("alloc on new log file");
+                    let Some(new_log_file) = group_commit_g.log_file.as_ref() else {
+                        return Err(Box::new(trx));
+                    };
+                    let Ok((offset, _)) = new_log_file.alloc(log_buf.capacity()) else {
+                        return Err(Box::new(trx));
+                    };
                     (new_log_file.as_raw_fd(), offset)
                 }
-                Err(_) => unreachable!(),
+                Err(_) => return Err(Box::new(trx)),
             };
             Some(CommitGroupLog {
                 fd,
@@ -410,110 +448,7 @@ impl RedoLog {
             completion,
         };
         group_commit_g.queue.push_back(Commit::Group(new_group));
-        waiter
-    }
-
-    #[inline]
-    fn enqueue_commit(
-        &self,
-        trx: PreparedTrx,
-        global_ts: &AtomicU64,
-        wait_sync: bool,
-    ) -> EnqueuedCommit {
-        let mut group_commit_g = self.group_commit.lock();
-        let cts = TrxID::new(global_ts.fetch_add(1, Ordering::SeqCst));
-        debug_assert!(cts < MAX_COMMIT_TS);
-        let precommit_trx = trx.fill_cts(cts);
-        if let Some(reason) = group_commit_g.closed {
-            drop(group_commit_g);
-            return EnqueuedCommit::Rejected {
-                cts,
-                trx: Box::new(precommit_trx),
-                reason,
-            };
-        }
-        if group_commit_g.queue.is_empty() {
-            let waiter = self.create_new_group(precommit_trx, &mut group_commit_g, wait_sync);
-            self.group_commit.notify_one(); // notify sync thread to work.
-            drop(group_commit_g);
-            return EnqueuedCommit::Queued { cts, waiter };
-        }
-        let last_group = match group_commit_g.queue.back_mut().unwrap() {
-            Commit::Shutdown => unreachable!("shutdown queue tail requires closed admission"),
-            Commit::Group(group) => group,
-            Commit::Switch(_) => {
-                // Impossible, switch always has one group followed.
-                unreachable!()
-            }
-        };
-        if last_group.can_join(&precommit_trx) {
-            let waiter = last_group.join(precommit_trx, wait_sync);
-            drop(group_commit_g); // unlock to let other transactions to enter commit phase.
-            return EnqueuedCommit::Queued { cts, waiter };
-        }
-        let waiter = self.create_new_group(precommit_trx, &mut group_commit_g, wait_sync);
-        self.group_commit.notify_one(); // notify sync thread to work.
-        drop(group_commit_g);
-        EnqueuedCommit::Queued { cts, waiter }
-    }
-
-    #[inline]
-    pub(super) fn commit_no_wait(&self, trx: PreparedTrx, global_ts: &AtomicU64) -> Result<TrxID> {
-        debug_assert!(trx.attachment.is_none());
-        // This API is for sessionless system transactions only.
-        //
-        // System transactions are used to durably piggyback internal state
-        // changes that become globally visible once the redo group commits. They
-        // do not participate in user-session rollback semantics, so this path
-        // intentionally returns immediately without a waiter or a detached
-        // transaction attachment.
-        //
-        // Do not route a session-bound user transaction here. The user path must
-        // wait for durability so the caller can commit/rollback the session
-        // explicitly.
-        match self.enqueue_commit(trx, global_ts, false) {
-            EnqueuedCommit::Queued { cts, waiter } => {
-                debug_assert!(waiter.is_none());
-                Ok(cts)
-            }
-            EnqueuedCommit::Rejected { cts, trx, reason } => {
-                (*trx).discard_rejected();
-                Err(reason.into_error(format!("redo group commit is closed: commit_ts={cts}")))
-            }
-        }
-    }
-
-    #[inline]
-    pub(super) async fn commit(
-        &self,
-        trx: PreparedTrx,
-        trx_sys: &TransactionSystem,
-        global_ts: &AtomicU64,
-    ) -> Result<TrxID> {
-        let (cts, waiter) = match self.enqueue_commit(trx, global_ts, true) {
-            EnqueuedCommit::Queued { cts, waiter } => (cts, waiter),
-            EnqueuedCommit::Rejected { cts, trx, reason } => {
-                let completion = Arc::new(Completion::new());
-                let waiter = Arc::clone(&completion);
-                trx_sys.request_failed_precommit_cleanup(FailedPrecommitCleanupJob::new(
-                    vec![*trx],
-                    completion,
-                    reason,
-                ));
-                (cts, Some(waiter))
-            }
-        };
-        let Some(waiter) = waiter else {
-            unreachable!("async commit must enqueue a completion waiter");
-        };
-        waiter.wait_result().await.map_err(|report| {
-            Error::from_completion_report(
-                report,
-                format!("wait for redo group commit: commit_ts={cts}"),
-            )
-        })?;
-        assert!(TrxID::new(self.persisted_cts.load(Ordering::Relaxed)) >= cts);
-        Ok(cts)
+        Ok(waiter)
     }
 
     #[inline]
@@ -539,7 +474,7 @@ impl RedoLog {
     }
 
     #[inline]
-    fn take_log_write_driver(&self) -> LogWriteDriver {
+    pub(crate) fn take_log_write_driver(&self) -> LogWriteDriver {
         let backend = self
             .log_write_backend
             .lock()
@@ -552,61 +487,23 @@ impl RedoLog {
     pub(crate) fn io_backend_stats(&self) -> IOBackendStats {
         self.io_backend_stats.snapshot()
     }
-
-    #[inline]
-    fn file_processor<'a>(
-        &'a self,
-        trx_sys: &'a TransactionSystem,
-        config: &TrxSysConfig,
-        write_driver: &'a mut LogWriteDriver,
-    ) -> FileProcessor<'a> {
-        FileProcessor::new(self, trx_sys, config, write_driver)
-    }
-
-    #[inline]
-    pub(super) fn log_loop(&self, trx_sys: &TransactionSystem, config: &TrxSysConfig) {
-        let mut write_driver = self.take_log_write_driver();
-        loop {
-            let mut fp = self.file_processor(trx_sys, config, &mut write_driver);
-            if let Some(ended_log_file) = fp.process_single_file() {
-                // Finished groups carry borrowed raw fds for sync. Keep the
-                // switched-out file alive until every old-file group is
-                // finalized.
-                fp.finish_pending_io();
-
-                debug_assert!(fp.inflight.is_empty());
-                debug_assert!(fp.sync_groups.is_empty());
-                debug_assert_eq!(fp.write_driver.pending_len(), 0);
-
-                // todo: update file header.
-                // this may include information which can speed up recovery.
-                // e.g. DDL start/end pages, min/max transaction CTS.
-
-                // Close file explicitly.
-                drop(ended_log_file);
-            }
-            if fp.shutdown {
-                return;
-            }
-        }
-    }
 }
 
-pub(super) struct SyncGroup {
-    pub(super) trx_list: Vec<PrecommitTrx>,
-    pub(super) max_cts: TrxID,
-    pub(super) log_bytes: usize,
+pub(crate) struct SyncGroup {
+    pub(crate) trx_list: Vec<PrecommitTrx>,
+    pub(crate) max_cts: TrxID,
+    pub(crate) log_bytes: usize,
     // Redo-bearing groups keep the borrowed log fd for the final fsync. No-log
     // groups have no file allocation and therefore no sync target.
-    pub(super) log_fd: Option<RawFd>,
-    pub(super) write: Option<LogWriteSubmission>,
-    pub(super) returned_buf: Option<DirectBuf>,
-    pub(super) completion: Arc<Completion<()>>,
-    pub(super) finished: bool,
+    pub(crate) log_fd: Option<RawFd>,
+    pub(crate) write: Option<LogWriteSubmission>,
+    pub(crate) returned_buf: Option<DirectBuf>,
+    pub(crate) completion: Arc<Completion<()>>,
+    pub(crate) finished: bool,
     // Redo logging is sequential: once one group fails, this group and every
     // later group cannot be part of the durable prefix. Submitted IO may still
     // complete later, but completion only returns buffers for recycling.
-    pub(super) failure_reason: Option<FailedPrecommitReason>,
+    pub(crate) failure_reason: Option<FailedPrecommitReason>,
 }
 
 impl SyncGroup {
@@ -687,11 +584,12 @@ impl FromStr for LogSync {
     }
 }
 
-struct FileProcessor<'a> {
-    redo_log: &'a RedoLog,
+pub(crate) struct FileProcessor<'a> {
     trx_sys: &'a TransactionSystem,
     write_driver: &'a mut LogWriteDriver,
-    max_io_size: usize,
+    log_block_size: usize,
+    header_writes: VecDeque<LogWriteSubmission>,
+    inflight_headers: usize,
     inflight: BTreeMap<TrxID, SyncGroup>,
     sync_groups: VecDeque<SyncGroup>,
     written: Vec<SyncGroup>,
@@ -702,17 +600,17 @@ struct FileProcessor<'a> {
 
 impl<'a> FileProcessor<'a> {
     #[inline]
-    fn new(
-        redo_log: &'a RedoLog,
+    pub(crate) fn new(
         trx_sys: &'a TransactionSystem,
         config: &TrxSysConfig,
         write_driver: &'a mut LogWriteDriver,
     ) -> Self {
         FileProcessor {
-            redo_log,
             trx_sys,
             write_driver,
-            max_io_size: config.max_io_size.as_u64() as usize,
+            log_block_size: config.log_block_size.as_u64() as usize,
+            header_writes: VecDeque::new(),
+            inflight_headers: 0,
             inflight: BTreeMap::new(),
             sync_groups: VecDeque::new(),
             written: vec![],
@@ -724,9 +622,9 @@ impl<'a> FileProcessor<'a> {
 
     #[inline]
     fn recycle_buf(&self, mut buf: DirectBuf) {
-        if buf.capacity() == self.max_io_size {
+        if buf.capacity() == self.log_block_size {
             buf.reset();
-            self.redo_log.buf_free_list.push(buf);
+            self.trx_sys.redo_log.buf_free_list.push(buf);
         }
     }
 
@@ -742,6 +640,11 @@ impl<'a> FileProcessor<'a> {
     fn fail_pending(&mut self, err: Report<FatalError>) {
         self.shutdown = true;
         let reason = FailedPrecommitReason::Fatal(*err.current_context());
+        let fatal = *err.current_context();
+        let drained_headers: Vec<_> = self.header_writes.drain(..).collect();
+        for header in drained_headers {
+            header.fail_unsubmitted_header(fatal);
+        }
         let drained_sync_groups: Vec<_> = self.sync_groups.drain(..).collect();
         for mut sync_group in drained_sync_groups {
             self.fail_sync_group(&mut sync_group, reason);
@@ -749,12 +652,18 @@ impl<'a> FileProcessor<'a> {
 
         let mut queued = Vec::new();
         {
-            let mut group_commit_g = self.redo_log.group_commit.lock();
+            let mut group_commit_g = self.trx_sys.redo_log.group_commit.lock();
             group_commit_g.close(reason);
             while let Some(commit) = group_commit_g.queue.pop_front() {
                 match commit {
                     Commit::Group(group) => queued.push(group),
-                    Commit::Switch(log_file) => drop(log_file),
+                    Commit::LogFileBoundary {
+                        ended_log_file,
+                        header_write,
+                    } => {
+                        header_write.fail_unsubmitted_header(fatal);
+                        drop(ended_log_file);
+                    }
                     Commit::Shutdown => {}
                 }
             }
@@ -771,11 +680,15 @@ impl<'a> FileProcessor<'a> {
 
     /// Process single log file until it is full or shutdown.
     #[inline]
-    fn process_single_file(&mut self) -> Option<SparseFile> {
+    pub(crate) fn process_single_file(&mut self) -> Option<SparseFile> {
         loop {
             debug_assert!(
-                self.sync_groups.len() + self.inflight.len() >= self.write_driver.pending_len(),
-                "queued and inflight groups should cover all driver-owned work"
+                self.header_writes.len()
+                    + self.inflight_headers
+                    + self.sync_groups.len()
+                    + self.inflight.len()
+                    >= self.write_driver.pending_len(),
+                "queued and inflight redo work should cover all driver-owned work"
             );
             // If shutdown flag is set, we still submit and finish all pending IOs,
             // but do not accept any new IO requests.
@@ -800,6 +713,8 @@ impl<'a> FileProcessor<'a> {
             if self.shutdown
                 && self.sync_groups.is_empty()
                 && self.inflight.is_empty()
+                && self.header_writes.is_empty()
+                && self.inflight_headers == 0
                 && self.write_driver.pending_len() == 0
             {
                 return None;
@@ -807,11 +722,13 @@ impl<'a> FileProcessor<'a> {
         }
     }
 
-    /// Finish pending IOs.
+    /// Finish pending group IOs and any boundary header write already staged.
     #[inline]
-    fn finish_pending_io(&mut self) {
+    pub(crate) fn finish_pending_io_and_header_write(&mut self) {
         while !self.sync_groups.is_empty()
             || !self.inflight.is_empty()
+            || !self.header_writes.is_empty()
+            || self.inflight_headers > 0
             || self.write_driver.pending_len() > 0
         {
             self.submit_io();
@@ -822,6 +739,20 @@ impl<'a> FileProcessor<'a> {
             self.wait_one_io_if_submitted();
             self.finalize_finished_prefix();
         }
+    }
+
+    #[inline]
+    pub(crate) fn has_pending_io(&self) -> bool {
+        !self.sync_groups.is_empty()
+            || !self.inflight.is_empty()
+            || !self.header_writes.is_empty()
+            || self.inflight_headers > 0
+            || self.write_driver.pending_len() > 0
+    }
+
+    #[inline]
+    pub(crate) fn shutdown(&self) -> bool {
+        self.shutdown
     }
 
     /// Fetch IO requests, returns ended log file if any.
@@ -840,7 +771,7 @@ impl<'a> FileProcessor<'a> {
     #[inline]
     fn fetch_io_reqs_internal(&mut self) -> Option<SparseFile> {
         loop {
-            let mut group_commit_g = self.redo_log.group_commit.lock();
+            let mut group_commit_g = self.trx_sys.redo_log.group_commit.lock();
             loop {
                 match group_commit_g.queue.pop_front() {
                     None => break,
@@ -848,16 +779,23 @@ impl<'a> FileProcessor<'a> {
                         self.shutdown = true;
                         return None;
                     }
-                    Some(Commit::Switch(log_file)) => return Some(log_file),
+                    Some(Commit::LogFileBoundary {
+                        ended_log_file,
+                        header_write,
+                    }) => {
+                        self.header_writes.push_back(header_write);
+                        return ended_log_file;
+                    }
                     Some(Commit::Group(cg)) => {
                         self.sync_groups.push_back(cg.into_sync_group());
                     }
                 }
             }
-            if !self.sync_groups.is_empty() {
+            if !self.header_writes.is_empty() || !self.sync_groups.is_empty() {
                 return None;
             }
-            self.redo_log
+            self.trx_sys
+                .redo_log
                 .group_commit
                 .wait_for(&mut group_commit_g, Duration::from_secs(1));
         }
@@ -866,7 +804,7 @@ impl<'a> FileProcessor<'a> {
     #[inline]
     fn try_fetch_io_reqs_internal(&mut self) -> Option<SparseFile> {
         // Single thread perform IO so here we only need to use sync mutex.
-        let mut group_commit_g = self.redo_log.group_commit.lock();
+        let mut group_commit_g = self.trx_sys.redo_log.group_commit.lock();
         loop {
             match group_commit_g.queue.pop_front() {
                 None => {
@@ -876,7 +814,13 @@ impl<'a> FileProcessor<'a> {
                     self.shutdown = true;
                     return None;
                 }
-                Some(Commit::Switch(log_file)) => return Some(log_file),
+                Some(Commit::LogFileBoundary {
+                    ended_log_file,
+                    header_write,
+                }) => {
+                    self.header_writes.push_back(header_write);
+                    return ended_log_file;
+                }
                 Some(Commit::Group(cg)) => {
                     self.sync_groups.push_back(cg.into_sync_group());
                 }
@@ -971,7 +915,8 @@ impl<'a> FileProcessor<'a> {
                 return;
             }
 
-            self.redo_log
+            self.trx_sys
+                .redo_log
                 .persisted_cts
                 .store(max_cts.as_u64(), Ordering::SeqCst);
 
@@ -996,7 +941,8 @@ impl<'a> FileProcessor<'a> {
                 // before waking commit waiters. The purge receiver must stay alive
                 // until redo has joined during worker shutdown.
                 if !committed_trx_list.is_empty() {
-                    self.redo_log
+                    self.trx_sys
+                        .redo_log
                         .purge_tx
                         .send(Purge::Committed(committed_trx_list))
                         .expect(
@@ -1006,7 +952,7 @@ impl<'a> FileProcessor<'a> {
                 sync_group.completion.complete(Ok(()));
             }
 
-            self.redo_log.update_stats(
+            self.trx_sys.redo_log.update_stats(
                 trx_count,
                 commit_count,
                 log_bytes,
@@ -1022,12 +968,27 @@ impl<'a> FileProcessor<'a> {
 
     /// Submit queued redo writes.
     ///
+    /// Boundary header writes are staged through the same async write driver as
+    /// group writes. Fetch stops at a log-file boundary, so groups after that
+    /// boundary are not collected until the header write has drained.
+    ///
     /// Groups without redo bytes are already finished when they enter the
     /// scheduler. This only admits them into `inflight`; callers must still run
     /// `finalize_finished_prefix` after submit so those groups can unblock the
     /// ordered prefix without a backend completion.
     #[inline]
     fn submit_io(&mut self) {
+        while let Some(submission) = self.header_writes.pop_front() {
+            if self.write_driver.available_capacity() == 0 {
+                self.header_writes.push_front(submission);
+                break;
+            }
+            if let Err(submission) = self.write_driver.push_write(submission) {
+                self.header_writes.push_front(submission);
+                break;
+            }
+            self.inflight_headers += 1;
+        }
         while !self.sync_groups.is_empty() {
             let mut sync_group = self
                 .sync_groups
@@ -1062,23 +1023,48 @@ impl<'a> FileProcessor<'a> {
             return;
         }
         let completion = self.write_driver.wait_one();
-        if let Some(source) = completion.poison {
-            let mut failed_group = self
-                .inflight
-                .remove(&completion.cts)
-                .expect("redo completion must match one inflight sync group");
-            failed_group.finish_write(completion.buf);
-            let err = self.trx_sys.poison_storage(source);
-            let reason = FailedPrecommitReason::Fatal(*err.current_context());
-            self.fail_sync_group(&mut failed_group, reason);
-            self.fail_pending(err);
-            return;
+        match completion {
+            LogWriteCompletion::Header {
+                completion,
+                buf,
+                poison,
+            } => {
+                self.inflight_headers = self
+                    .inflight_headers
+                    .checked_sub(1)
+                    .expect("redo header completion must match inflight header count");
+                drop(buf);
+                if let Some(source) = poison {
+                    completion.complete(Err(CompletionErrorKind::report_fatal(
+                        source,
+                        "redo header write failed",
+                    )));
+                    let err = self.trx_sys.poison_storage(source);
+                    self.fail_pending(err);
+                } else {
+                    completion.complete(Ok(()));
+                }
+            }
+            LogWriteCompletion::Group { cts, buf, poison } => {
+                if let Some(source) = poison {
+                    let mut failed_group = self
+                        .inflight
+                        .remove(&cts)
+                        .expect("redo completion must match one inflight sync group");
+                    failed_group.finish_write(buf);
+                    let err = self.trx_sys.poison_storage(source);
+                    let reason = FailedPrecommitReason::Fatal(*err.current_context());
+                    self.fail_sync_group(&mut failed_group, reason);
+                    self.fail_pending(err);
+                    return;
+                }
+                let sync_group = self
+                    .inflight
+                    .get_mut(&cts)
+                    .expect("redo completion must match one inflight sync group");
+                sync_group.finish_write(buf);
+            }
         }
-        let sync_group = self
-            .inflight
-            .get_mut(&completion.cts)
-            .expect("redo completion must match one inflight sync group");
-        sync_group.finish_write(completion.buf);
     }
 }
 
@@ -1118,19 +1104,60 @@ fn log_file_name(file_prefix: &str, file_seq: u32) -> String {
     format!("{file_prefix}.{file_seq:08x}")
 }
 
-/// Create a new log file.
+struct CreatedLogFile {
+    log_file: SparseFile,
+    header_write: LogWriteSubmission,
+}
+
+/// Create a new log file and prepare its initial super-block write.
 #[inline]
-pub(super) fn create_log_file(
+fn create_log_file(
     file_prefix: &str,
     file_seq: u32,
     file_max_size: usize,
-    file_header_size: usize,
-) -> Result<SparseFile> {
+    log_block_size: usize,
+) -> Result<CreatedLogFile> {
+    let (created, _) = create_log_file_with_header_completion(
+        file_prefix,
+        file_seq,
+        file_max_size,
+        log_block_size,
+    )?;
+    Ok(created)
+}
+
+#[inline]
+fn create_log_file_with_header_completion(
+    file_prefix: &str,
+    file_seq: u32,
+    file_max_size: usize,
+    log_block_size: usize,
+) -> Result<(CreatedLogFile, Arc<Completion<()>>)> {
     let file_name = log_file_name(file_prefix, file_seq);
     let log_file = SparseFile::create_or_fail(&file_name, file_max_size, UNTRACKED_FILE_ID)?;
-    // todo: Add two pages as file header.
-    let _ = log_file.alloc(file_header_size)?;
-    Ok(log_file)
+    let (header_write, header_completion) =
+        prepare_initial_redo_super_block(&log_file, file_seq, log_block_size, file_max_size)?;
+    let _ = log_file.alloc(REDO_DEFAULT_DATA_START_OFFSET)?;
+    Ok((
+        CreatedLogFile {
+            log_file,
+            header_write,
+        },
+        header_completion,
+    ))
+}
+
+#[inline]
+fn prepare_initial_redo_super_block(
+    log_file: &SparseFile,
+    file_seq: u32,
+    log_block_size: usize,
+    file_max_size: usize,
+) -> Result<(LogWriteSubmission, Arc<Completion<()>>)> {
+    let header = RedoFileHeader::initial(file_seq, log_block_size, file_max_size);
+    let mut buf = DirectBuf::zeroed(REDO_SUPER_BLOCK_SLOT_SIZE);
+    serialize_redo_super_block(buf.as_bytes_mut(), &header)?;
+    Ok(LogWriteSubmission::header(log_file.as_raw_fd(), 0, buf))
 }
 
 #[inline]
@@ -1164,6 +1191,9 @@ pub(crate) fn discover_redo_log_files(file_prefix: &str, desc: bool) -> Result<V
     }
     files.sort_by_key(|(seq, _)| *seq);
     validate_redo_log_file_sequences(file_prefix, &files)?;
+    for (file_seq, path) in &files {
+        let _ = MmapLogReader::new(path, *file_seq)?;
+    }
     let mut res: Vec<_> = files.into_iter().map(|(_, path)| path).collect();
     if desc {
         res.reverse();
@@ -1292,14 +1322,21 @@ mod tests {
     use crate::catalog::tests::table2;
     use crate::conf::{EngineConfig, EvictableBufferPoolConfig, TrxSysConfig};
     use crate::engine::{Engine, EngineRef};
-    use crate::error::{CompletionErrorKind, DataIntegrityError, FatalError, LifecycleError};
+    use crate::error::{
+        CompletionErrorKind, DataIntegrityError, FatalError, InternalError, LifecycleError,
+    };
     use crate::file::{FileSyncKind, FileSyncOp, FileSyncTestHook, set_file_sync_test_hook};
     use crate::id::{PageID, RowID, TableID};
     use crate::io::{
         IOKind, StdIoResult, StorageBackendOp, StorageBackendTestHook,
         install_storage_backend_test_hook,
     };
-    use crate::trx::log_replay::ReadLog;
+    use crate::log::log_replay::ReadLog;
+    use crate::log::redo_format::{
+        REDO_DEFAULT_DATA_START_OFFSET, REDO_SUPER_BLOCK_SLOT_SIZE, parse_redo_super_block,
+    };
+    use crate::trx::MAX_SNAPSHOT_TS;
+    use crate::trx::sys::{TransactionSystemQueues, TrxCleanupMessage};
     use crate::value::Val;
     use futures::task::noop_waker;
     use std::fs::{self, File};
@@ -1328,6 +1365,44 @@ mod tests {
         panic!("condition was not satisfied before timeout");
     }
 
+    fn create_log_file_for_test(
+        file_prefix: &str,
+        file_seq: u32,
+        file_max_size: usize,
+        log_block_size: usize,
+    ) -> SparseFile {
+        let (
+            CreatedLogFile {
+                log_file,
+                header_write,
+            },
+            header_completion,
+        ) = create_log_file_with_header_completion(
+            file_prefix,
+            file_seq,
+            file_max_size,
+            log_block_size,
+        )
+        .unwrap();
+        let mut write_driver = LogWriteDriver::new(StorageBackend::new(1).unwrap());
+        assert!(write_driver.push_write(header_write).is_ok());
+        assert_eq!(write_driver.submit_ready(), 1);
+        match write_driver.wait_one() {
+            LogWriteCompletion::Header {
+                completion,
+                buf,
+                poison,
+            } => {
+                drop(buf);
+                assert_eq!(poison, None);
+                completion.complete(Ok(()));
+            }
+            LogWriteCompletion::Group { .. } => panic!("expected redo header write completion"),
+        }
+        assert!(header_completion.completed_result().unwrap().is_ok());
+        log_file
+    }
+
     static FILE_SYNC_TEST_HOOK_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
     struct InstalledFileSyncTestHook {
@@ -1348,6 +1423,25 @@ mod tests {
         InstalledFileSyncTestHook {
             previous: set_file_sync_test_hook(Some(hook)),
             guard: Some(guard),
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct RecordingRedoWriteSubmitHook {
+        submits: Arc<Mutex<Vec<StorageBackendOp>>>,
+    }
+
+    impl RecordingRedoWriteSubmitHook {
+        fn submits(&self) -> Vec<StorageBackendOp> {
+            self.submits.lock().unwrap().clone()
+        }
+    }
+
+    impl StorageBackendTestHook for RecordingRedoWriteSubmitHook {
+        fn on_submit(&self, op: StorageBackendOp) {
+            if op.kind() == IOKind::Write {
+                self.submits.lock().unwrap().push(op);
+            }
         }
     }
 
@@ -1549,13 +1643,21 @@ mod tests {
                     RowID::new(1),
                 );
                 let prepared = sys_trx.prepare();
-                engine
-                    .trx_sys
-                    .redo_log
-                    .commit(prepared, &engine.trx_sys, &engine.trx_sys.ts)
-                    .await
+                engine.trx_sys.commit_prepared(prepared).await
             })
         })
+    }
+
+    fn assert_direct_fatal<T: std::fmt::Debug>(res: &Result<T>, expected: FatalError) {
+        let err = match res {
+            Ok(value) => panic!("expected fatal error, got {value:?}"),
+            Err(err) => err,
+        };
+        assert_eq!(
+            err.downcast_ref::<FatalError>().copied(),
+            Some(expected),
+            "{err:?}"
+        );
     }
 
     fn assert_propagated_completion_fatal<T: std::fmt::Debug>(
@@ -1577,14 +1679,28 @@ mod tests {
     }
 
     async fn build_redo_test_engine(log_file_stem: &str, log_sync: LogSync) -> (TempDir, Engine) {
+        build_redo_test_engine_with_log_file_max_size(
+            log_file_stem,
+            log_sync,
+            128usize * 1024 * 1024,
+        )
+        .await
+    }
+
+    async fn build_redo_test_engine_with_log_file_max_size(
+        log_file_stem: &str,
+        log_sync: LogSync,
+        log_file_max_size: usize,
+    ) -> (TempDir, Engine) {
         let temp_dir = TempDir::new().unwrap();
         let engine = EngineConfig::default()
             .storage_root(temp_dir.path().to_path_buf())
             .trx(
                 TrxSysConfig::default()
                     .log_file_stem(log_file_stem)
-                    .io_depth_per_log(1)
-                    .log_sync(log_sync),
+                    .io_depth(1)
+                    .log_sync(log_sync)
+                    .log_file_max_size(log_file_max_size),
             )
             .data_buffer(
                 EvictableBufferPoolConfig::default()
@@ -1596,6 +1712,172 @@ mod tests {
             .await
             .unwrap();
         (temp_dir, engine)
+    }
+
+    struct ManualLogProcessorHarness {
+        trx_sys: TransactionSystem,
+        _purge_rx: flume::Receiver<Purge>,
+        _cleanup_rx: flume::Receiver<TrxCleanupMessage>,
+    }
+
+    fn manual_log_processor_harness(
+        engine: &Engine,
+        config: TrxSysConfig,
+        redo_log: RedoLog,
+    ) -> ManualLogProcessorHarness {
+        let (purge_tx, purge_rx) = flume::unbounded();
+        let (cleanup_tx, cleanup_rx) = flume::unbounded();
+        let trx_sys = TransactionSystem::new(
+            config,
+            engine.inner().catalog.clone(),
+            engine.inner().table_fs.clone(),
+            CachePadded::new(redo_log),
+            MIN_SNAPSHOT_TS,
+            TransactionSystemQueues {
+                purge_tx,
+                cleanup_tx,
+            },
+            Vec::new(),
+        );
+        ManualLogProcessorHarness {
+            trx_sys,
+            _purge_rx: purge_rx,
+            _cleanup_rx: cleanup_rx,
+        }
+    }
+
+    #[test]
+    fn test_rotate_log_file_missing_current_file_returns_error() {
+        let temp_dir = TempDir::new().unwrap();
+        let file_prefix = temp_dir
+            .path()
+            .join("standalone_missing_current_redo.log")
+            .to_str()
+            .unwrap()
+            .to_owned();
+        let (purge_tx, _purge_rx) = flume::unbounded();
+        let (redo_log, _initial_header) = RedoLogInitializer {
+            ctx: StorageBackend::new(1).unwrap(),
+            mode: RedoLogMode::Done,
+            file_prefix,
+            file_max_size: 128 * 1024,
+            log_block_size: 4096,
+            io_depth: 1,
+            file_seq: None,
+        }
+        .finish(purge_tx)
+        .unwrap();
+
+        let err = {
+            let mut group_commit_g = redo_log.group_commit.lock();
+            drop(group_commit_g.log_file.take().unwrap());
+            redo_log.rotate_log_file(&mut group_commit_g).unwrap_err()
+        };
+
+        assert_eq!(
+            err.downcast_ref::<InternalError>().copied(),
+            Some(InternalError::Generic),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn test_commit_sys_missing_current_log_file_rejects_without_panic() {
+        smol::block_on(async {
+            let (_temp_dir, engine) =
+                build_redo_test_engine("commit_missing_current_log_file", LogSync::None).await;
+            {
+                let mut group_commit_g = engine.inner().trx_sys.redo_log.group_commit.lock();
+                drop(group_commit_g.log_file.take().unwrap());
+            }
+
+            let mut sys_trx = engine.inner().trx_sys.begin_sys_trx();
+            sys_trx.create_row_page(
+                TableID::from(1u64),
+                PageID::from(1u64),
+                RowID::new(0),
+                RowID::new(1),
+            );
+            let res = engine.inner().trx_sys.commit_sys(sys_trx);
+
+            assert_direct_fatal(&res, FatalError::RedoWrite);
+            assert!(
+                engine
+                    .inner()
+                    .trx_sys
+                    .ensure_runtime_healthy()
+                    .as_ref()
+                    .is_err_and(|err| *err.current_context() == FatalError::RedoWrite)
+            );
+        });
+    }
+
+    #[test]
+    fn test_user_commit_rotation_create_failure_rejects_without_panic() {
+        smol::block_on(async {
+            let (_temp_dir, engine) = build_redo_test_engine_with_log_file_max_size(
+                "user_rotation_create_failure",
+                LogSync::None,
+                64usize * 1024,
+            )
+            .await;
+            let table_id = table2(&engine).await;
+            let mut session = engine.new_session().unwrap();
+            let mut warmup = session.begin_trx().unwrap();
+            warmup
+                .exec(async |stmt| {
+                    stmt.table_insert_mvcc(table_id, vec![Val::from(0), Val::from("warmup")])
+                        .await?;
+                    Ok(())
+                })
+                .await
+                .unwrap();
+            warmup.commit().await.unwrap();
+
+            let file_prefix = engine.inner().trx_sys.config.file_prefix().unwrap();
+            {
+                let group_commit_g = engine.inner().trx_sys.redo_log.group_commit.lock();
+                let log_file = group_commit_g.log_file.as_ref().unwrap();
+                while log_file.alloc(REDO_SUPER_BLOCK_SLOT_SIZE).is_ok() {}
+            }
+            let next_seq = engine
+                .inner()
+                .trx_sys
+                .redo_log
+                .file_seq
+                .load(Ordering::SeqCst);
+            fs::create_dir(log_file_name(&file_prefix, next_seq)).unwrap();
+
+            let mut trx = session.begin_trx().unwrap();
+            trx.exec(async |stmt| {
+                stmt.table_insert_mvcc(
+                    table_id,
+                    vec![Val::from(1), Val::from("rotation-create-failure")],
+                )
+                .await?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+            let err = trx.commit().await.unwrap_err();
+
+            assert_eq!(
+                err.completion_error(),
+                Some(CompletionErrorKind::Fatal(FatalError::RedoWrite)),
+                "{err:?}"
+            );
+            assert!(!session.in_trx().unwrap());
+            assert!(
+                engine
+                    .inner()
+                    .trx_sys
+                    .ensure_runtime_healthy()
+                    .as_ref()
+                    .is_err_and(|err| *err.current_context() == FatalError::RedoWrite)
+            );
+            drop(session);
+        });
     }
 
     #[test]
@@ -1659,7 +1941,7 @@ mod tests {
             // Table setup commits through the same asynchronous purge handoff as
             // user transactions. Wait until those setup commits leave the active
             // horizon before this test opens the transaction it wants to track.
-            wait_for(|| engine.inner().trx_sys.redo_log.min_active_sts() == MAX_SNAPSHOT_TS).await;
+            wait_for(|| engine.inner().trx_sys.min_active_sts() == MAX_SNAPSHOT_TS).await;
             let redo_fd = {
                 engine
                     .inner()
@@ -1678,7 +1960,7 @@ mod tests {
             let mut session = engine.new_session().unwrap();
             let mut trx = session.begin_trx().unwrap();
             let sts = trx.sts();
-            assert_eq!(engine.inner().trx_sys.redo_log.min_active_sts(), sts);
+            assert_eq!(engine.inner().trx_sys.min_active_sts(), sts);
             trx.exec(async |stmt| {
                 stmt.table_insert_mvcc(table_id, vec![Val::from(2), Val::from("shutdown")])
                     .await?;
@@ -1724,7 +2006,7 @@ mod tests {
             });
 
             assert!(
-                engine.inner().trx_sys.redo_log.min_active_sts() > sts,
+                engine.inner().trx_sys.min_active_sts() > sts,
                 "shutdown must drain committed purge handoff before purge exits"
             );
             drop(session);
@@ -1920,7 +2202,7 @@ mod tests {
     }
 
     #[test]
-    fn test_finish_pending_io_finalizes_finished_prefix_without_submitted_write() {
+    fn test_finish_pending_io_and_header_write_finalizes_finished_prefix_without_submitted_write() {
         smol::block_on(async {
             let (_engine_temp_dir, engine) =
                 build_redo_test_engine("finish_pending_no_submitted_write", LogSync::None).await;
@@ -1932,35 +2214,34 @@ mod tests {
                 .unwrap()
                 .to_owned();
             let (purge_tx, _purge_rx) = flume::unbounded();
-            let redo_log = RedoLogInitializer {
+            let (redo_log, _initial_header) = RedoLogInitializer {
                 ctx: StorageBackend::new(1).unwrap(),
                 mode: RedoLogMode::Done,
                 file_prefix,
                 file_max_size: 128 * 1024,
-                file_header_size: 4096 * LOG_HEADER_PAGES,
-                page_size: 4096,
-                io_depth_per_log: 1,
+                log_block_size: 4096,
+                io_depth: 1,
                 file_seq: None,
             }
             .finish(purge_tx)
             .unwrap();
             let config = TrxSysConfig::default()
-                .max_io_size(4096usize)
+                .log_block_size(4096usize)
                 .log_sync(LogSync::None);
+            let harness = manual_log_processor_harness(&engine, config, redo_log);
             let mut write_driver = LogWriteDriver::new(StorageBackend::new(1).unwrap());
             let cts = TrxID::new(50);
 
             {
                 let mut fp = FileProcessor::new(
-                    &redo_log,
-                    &engine.inner().trx_sys,
-                    &config,
+                    &harness.trx_sys,
+                    &harness.trx_sys.config,
                     &mut write_driver,
                 );
                 fp.inflight
                     .insert(cts, sync_group_for_order_test(cts, true, 0));
 
-                fp.finish_pending_io();
+                fp.finish_pending_io_and_header_write();
 
                 assert!(fp.inflight.is_empty());
                 assert!(fp.sync_groups.is_empty());
@@ -1968,13 +2249,128 @@ mod tests {
                 assert_eq!(fp.write_driver.submitted_len(), 0);
             }
 
-            assert_eq!(redo_log.persisted_cts.load(Ordering::SeqCst), cts.as_u64());
+            assert_eq!(
+                harness
+                    .trx_sys
+                    .redo_log
+                    .persisted_cts
+                    .load(Ordering::SeqCst),
+                cts.as_u64()
+            );
+            drop(harness);
             engine.shutdown().unwrap();
         });
     }
 
     #[test]
-    fn test_finish_pending_io_syncs_switch_ended_log_file() {
+    fn test_log_file_boundary_header_write_drains_before_following_group_submit() {
+        smol::block_on(async {
+            let (_engine_temp_dir, engine) =
+                build_redo_test_engine("header_and_group_submit", LogSync::None).await;
+            let temp_dir = TempDir::new().unwrap();
+            let file_prefix = temp_dir
+                .path()
+                .join("standalone_header_group_redo.log")
+                .to_str()
+                .unwrap()
+                .to_owned();
+            let (purge_tx, _purge_rx) = flume::unbounded();
+            let (redo_log, _initial_header) = RedoLogInitializer {
+                ctx: StorageBackend::new(2).unwrap(),
+                mode: RedoLogMode::Done,
+                file_prefix,
+                file_max_size: 128 * 1024,
+                log_block_size: 4096,
+                io_depth: 2,
+                file_seq: None,
+            }
+            .finish(purge_tx)
+            .unwrap();
+            let config = TrxSysConfig::default()
+                .log_block_size(4096usize)
+                .log_sync(LogSync::None);
+            let harness = manual_log_processor_harness(&engine, config, redo_log);
+            let redo_log = &*harness.trx_sys.redo_log;
+            let cts = TrxID::new(55);
+            let (log_fd, group_offset) = {
+                let mut group_commit_g = redo_log.group_commit.lock();
+                let log_file = group_commit_g.log_file.as_ref().unwrap();
+                let log_fd = log_file.as_raw_fd();
+                let log_buf = LogBuf::new(4096);
+                let (offset, _) = log_file.alloc(log_buf.capacity()).unwrap();
+                group_commit_g.queue.push_back(Commit::Group(CommitGroup {
+                    trx_list: vec![PrecommitTrx {
+                        cts,
+                        redo_bin: None,
+                        payload: None,
+                        attachment: None,
+                        lock_manager: None,
+                        lock_state: None,
+                    }],
+                    max_cts: cts,
+                    log: Some(CommitGroupLog {
+                        fd: log_fd,
+                        offset,
+                        log_buf,
+                    }),
+                    completion: Arc::new(Completion::new()),
+                }));
+                (log_fd, offset)
+            };
+            assert_eq!(group_offset, REDO_DEFAULT_DATA_START_OFFSET);
+
+            let hook = RecordingRedoWriteSubmitHook::default();
+            let _install = install_storage_backend_test_hook(Arc::new(hook.clone()));
+            let mut write_driver = LogWriteDriver::new(StorageBackend::new(2).unwrap());
+            {
+                let mut fp = FileProcessor::new(
+                    &harness.trx_sys,
+                    &harness.trx_sys.config,
+                    &mut write_driver,
+                );
+                assert!(fp.fetch_io_reqs().is_none());
+                fp.submit_io();
+
+                assert_eq!(
+                    hook.submits(),
+                    vec![StorageBackendOp::new(IOKind::Write, log_fd, 0)]
+                );
+                assert_eq!(fp.inflight_headers, 1);
+                assert!(fp.inflight.is_empty());
+
+                fp.finish_pending_io_and_header_write();
+                assert!(fp.inflight.is_empty());
+                assert!(fp.sync_groups.is_empty());
+                assert_eq!(fp.write_driver.pending_len(), 0);
+
+                assert!(fp.fetch_io_reqs().is_none());
+                fp.submit_io();
+                assert_eq!(
+                    hook.submits(),
+                    vec![
+                        StorageBackendOp::new(IOKind::Write, log_fd, 0),
+                        StorageBackendOp::new(IOKind::Write, log_fd, group_offset),
+                    ]
+                );
+                assert_eq!(fp.inflight.len(), 1);
+                fp.finish_pending_io_and_header_write();
+            }
+
+            assert_eq!(
+                harness
+                    .trx_sys
+                    .redo_log
+                    .persisted_cts
+                    .load(Ordering::SeqCst),
+                cts.as_u64()
+            );
+            drop(harness);
+            engine.shutdown().unwrap();
+        });
+    }
+
+    #[test]
+    fn test_finish_pending_io_and_header_write_syncs_boundary_ended_log_file() {
         smol::block_on(async {
             let (_engine_temp_dir, engine) =
                 build_redo_test_engine("finish_pending_switch_syncer", LogSync::None).await;
@@ -1986,14 +2382,13 @@ mod tests {
                 .unwrap()
                 .to_owned();
             let (purge_tx, _purge_rx) = flume::unbounded();
-            let redo_log = RedoLogInitializer {
+            let (redo_log, _initial_header) = RedoLogInitializer {
                 ctx: StorageBackend::new(1).unwrap(),
                 mode: RedoLogMode::Done,
                 file_prefix,
                 file_max_size: 128 * 1024,
-                file_header_size: 4096 * LOG_HEADER_PAGES,
-                page_size: 4096,
-                io_depth_per_log: 1,
+                log_block_size: 4096,
+                io_depth: 1,
                 file_seq: None,
             }
             .finish(purge_tx)
@@ -2011,14 +2406,18 @@ mod tests {
             let hook = RecordingFileSyncHook::new();
             let _install = install_file_sync_test_hook(Arc::new(hook.clone()));
             let config = TrxSysConfig::default()
-                .max_io_size(4096usize)
+                .log_block_size(4096usize)
                 .log_sync(LogSync::Fsync);
+            let harness = manual_log_processor_harness(&engine, config, redo_log);
             let mut write_driver = LogWriteDriver::new(StorageBackend::new(1).unwrap());
             let cts = TrxID::new(60);
 
             let ended_log_file = {
-                let mut fp =
-                    redo_log.file_processor(&engine.inner().trx_sys, &config, &mut write_driver);
+                let mut fp = FileProcessor::new(
+                    &harness.trx_sys,
+                    &harness.trx_sys.config,
+                    &mut write_driver,
+                );
                 fp.inflight.insert(
                     cts,
                     sync_group_for_order_test_with_log_fd(cts, true, 4096, Some(ended_fd)),
@@ -2029,7 +2428,7 @@ mod tests {
                     .expect("queued rotation should yield ended log file");
                 assert_eq!(ended_log_file.as_raw_fd(), ended_fd);
 
-                fp.finish_pending_io();
+                fp.finish_pending_io_and_header_write();
 
                 assert!(fp.inflight.is_empty());
                 assert!(fp.sync_groups.is_empty());
@@ -2038,7 +2437,14 @@ mod tests {
                 ended_log_file
             };
 
-            assert_eq!(redo_log.persisted_cts.load(Ordering::SeqCst), cts.as_u64());
+            assert_eq!(
+                harness
+                    .trx_sys
+                    .redo_log
+                    .persisted_cts
+                    .load(Ordering::SeqCst),
+                cts.as_u64()
+            );
             let calls = hook.calls();
             assert_eq!(calls.len(), 1);
             assert_eq!(calls[0].kind(), FileSyncKind::Fsync);
@@ -2046,6 +2452,7 @@ mod tests {
             assert_ne!(calls[0].fd(), current_fd);
 
             drop(ended_log_file);
+            drop(harness);
             engine.shutdown().unwrap();
         });
     }
@@ -2123,8 +2530,13 @@ mod tests {
             PathBuf::from(format!("{file_prefix}.00000001")),
             PathBuf::from(format!("{file_prefix}.00000002")),
         ];
-        for path in &expected {
-            File::create(path).unwrap();
+        for file_seq in 0..expected.len() as u32 {
+            drop(create_log_file_for_test(
+                file_prefix,
+                file_seq,
+                128 * 1024,
+                4096,
+            ));
         }
         File::create(log_dir.join("redo.logx.00000000")).unwrap();
 
@@ -2140,8 +2552,8 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let file_prefix = temp_dir.path().join("redo.log");
         let file_prefix = file_prefix.to_str().unwrap();
-        File::create(format!("{file_prefix}.00000000")).unwrap();
-        File::create(format!("{file_prefix}.00000002")).unwrap();
+        drop(create_log_file_for_test(file_prefix, 0, 128 * 1024, 4096));
+        drop(create_log_file_for_test(file_prefix, 2, 128 * 1024, 4096));
 
         let err = discover_redo_log_files(file_prefix, false).unwrap_err();
         assert_eq!(
@@ -2166,6 +2578,32 @@ mod tests {
     }
 
     #[test]
+    fn test_create_log_file_writes_open_super_block() {
+        let temp_dir = TempDir::new().unwrap();
+        let file_prefix = temp_dir.path().join("redo.log");
+        let file_prefix = file_prefix.to_str().unwrap();
+        let log_file = create_log_file_for_test(file_prefix, 3, 128 * 1024, 4096);
+
+        let (offset, _) = log_file.alloc(4096).unwrap();
+        assert_eq!(offset, REDO_DEFAULT_DATA_START_OFFSET);
+        drop(log_file);
+
+        let bytes = fs::read(format!("{file_prefix}.00000003")).unwrap();
+        let slot0 = parse_redo_super_block(&bytes[..REDO_SUPER_BLOCK_SLOT_SIZE], 3, 0).unwrap();
+        assert_eq!(slot0.header.header_slot_no, 0);
+        assert_eq!(slot0.header.generation, 0);
+        assert_eq!(slot0.header.log_block_size, 4096);
+        assert_eq!(slot0.header.file_max_size, 128 * 1024);
+
+        let slot1 = &bytes[REDO_SUPER_BLOCK_SLOT_SIZE..REDO_DEFAULT_DATA_START_OFFSET];
+        let err = parse_redo_super_block(slot1, 3, 1).unwrap_err();
+        assert_eq!(
+            err.data_integrity_error(),
+            Some(DataIntegrityError::InvalidMagic)
+        );
+    }
+
+    #[test]
     fn test_engine_startup_rejects_legacy_partitioned_redo_file() {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
@@ -2182,6 +2620,30 @@ mod tests {
             };
             let report = format!("{err:?}");
             assert!(report.contains("unsupported legacy partitioned redo log file"));
+        });
+    }
+
+    #[test]
+    fn test_engine_startup_rejects_legacy_zero_header_redo_file() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let legacy = File::create(temp_dir.path().join("legacy_redo.00000000")).unwrap();
+            legacy.set_len(128 * 1024).unwrap();
+            drop(legacy);
+
+            let err = match EngineConfig::default()
+                .storage_root(temp_dir.path())
+                .trx(TrxSysConfig::default().log_file_stem("legacy_redo"))
+                .build()
+                .await
+            {
+                Ok(_) => panic!("engine startup should reject legacy zero-header redo files"),
+                Err(err) => err,
+            };
+            assert_eq!(
+                err.data_integrity_error(),
+                Some(DataIntegrityError::InvalidMagic)
+            );
         });
     }
 

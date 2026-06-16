@@ -694,7 +694,7 @@ pub(crate) mod tests {
     use crate::file::cow_file::COW_FILE_PAGE_SIZE;
     use crate::id::BlockID;
     use crate::index::{COLUMN_BLOCK_HEADER_SIZE, COLUMN_BLOCK_LEAF_HEADER_SIZE, ColumnBlockIndex};
-    use crate::trx::redo::DDLRedo;
+    use crate::log::redo::DDLRedo;
     use crate::trx::{MIN_SNAPSHOT_TS, Transaction};
     use crate::value::{Val, ValKind};
     use semistr::SemiStr;

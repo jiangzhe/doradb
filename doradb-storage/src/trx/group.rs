@@ -1,9 +1,9 @@
 use crate::file::SparseFile;
 use crate::id::TrxID;
 use crate::io::Completion;
+use crate::log::log_replay::LogBuf;
+use crate::log::{LogWriteSubmission, SyncGroup};
 use crate::serde::Ser;
-use crate::trx::log::{LogWriteSubmission, SyncGroup};
-use crate::trx::log_replay::LogBuf;
 use crate::trx::{FailedPrecommitReason, PrecommitTrx};
 use parking_lot::{Condvar, Mutex, MutexGuard, WaitTimeoutResult};
 use std::collections::VecDeque;
@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 /// GroupCommit with mutex and condition variable.
-pub(super) struct MutexGroupCommit {
+pub(crate) struct MutexGroupCommit {
     mu: Mutex<GroupCommit>,
     cv: Condvar,
 }
@@ -20,7 +20,7 @@ pub(super) struct MutexGroupCommit {
 impl MutexGroupCommit {
     /// Create a new group commit with mutex and condition variable.
     #[inline]
-    pub(super) fn new(group_commit: GroupCommit) -> Self {
+    pub(crate) fn new(group_commit: GroupCommit) -> Self {
         MutexGroupCommit {
             mu: Mutex::new(group_commit),
             cv: Condvar::new(),
@@ -30,19 +30,19 @@ impl MutexGroupCommit {
     /// Acquire lock.
     /// Return lock guard of group commit.
     #[inline]
-    pub(super) fn lock(&self) -> MutexGuard<'_, GroupCommit> {
+    pub(crate) fn lock(&self) -> MutexGuard<'_, GroupCommit> {
         self.mu.lock()
     }
 
     /// Notify one waiter.
     #[inline]
-    pub(super) fn notify_one(&self) -> bool {
+    pub(crate) fn notify_one(&self) -> bool {
         self.cv.notify_one()
     }
 
     /// Wait on conditional variable with timeout.
     #[inline]
-    pub(super) fn wait_for(
+    pub(crate) fn wait_for(
         &self,
         g: &mut MutexGuard<GroupCommit>,
         timeout: Duration,
@@ -53,65 +53,67 @@ impl MutexGroupCommit {
 
 /// GroupCommit is optimization to group multiple transactions
 /// and perform single IO to speed up overall commit performance.
-pub(super) struct GroupCommit {
+pub(crate) struct GroupCommit {
     // Commit group queue, there can be multiple groups in commit phase.
     // Each of them submits one redo write through the log thread's
     // backend-neutral driver and then waits for write completion plus the
     // configured sync step.
-    pub(super) queue: VecDeque<Commit>,
+    pub(crate) queue: VecDeque<Commit>,
     // Closed admission reason. Shutdown messages only wake the worker; this
     // flag is the source of truth for rejecting new precommit handoffs.
-    pub(super) closed: Option<FailedPrecommitReason>,
+    pub(crate) closed: Option<FailedPrecommitReason>,
     // Current log file.
-    pub(super) log_file: Option<SparseFile>,
+    pub(crate) log_file: Option<SparseFile>,
 }
 
 impl GroupCommit {
     #[inline]
-    pub(super) fn close(&mut self, reason: FailedPrecommitReason) {
+    pub(crate) fn close(&mut self, reason: FailedPrecommitReason) {
         if self.closed.is_none() {
             self.closed = Some(reason);
         }
     }
 }
 
-pub(super) enum Commit {
+pub(crate) enum Commit {
+    LogFileBoundary {
+        ended_log_file: Option<SparseFile>,
+        header_write: LogWriteSubmission,
+    },
     Group(CommitGroup),
-    // switch from old log file to new log file.
-    Switch(SparseFile),
     Shutdown,
 }
 
-pub(super) type CommitWaiter = Arc<Completion<()>>;
-pub(super) type CommitJoin = Option<CommitWaiter>;
+pub(crate) type CommitWaiter = Arc<Completion<()>>;
+pub(crate) type CommitJoin = Option<CommitWaiter>;
 
 /// CommitGroup groups multiple transactions with only
 /// one logical log IO and at most one fsync() call.
 /// It is controlled by two parameters:
-/// 1. Maximum IO size, e.g. 16KB.
+/// 1. Log block size, e.g. 16KB.
 /// 2. Timeout to wait for next transaction to join.
-pub(super) struct CommitGroup {
-    pub(super) trx_list: Vec<PrecommitTrx>,
-    pub(super) max_cts: TrxID,
-    pub(super) log: Option<CommitGroupLog>,
-    pub(super) completion: Arc<Completion<()>>,
+pub(crate) struct CommitGroup {
+    pub(crate) trx_list: Vec<PrecommitTrx>,
+    pub(crate) max_cts: TrxID,
+    pub(crate) log: Option<CommitGroupLog>,
+    pub(crate) completion: Arc<Completion<()>>,
 }
 
 /// Serialized redo buffer and target file allocation for a durability group.
-pub(super) struct CommitGroupLog {
-    pub(super) fd: RawFd,
-    pub(super) offset: usize,
-    pub(super) log_buf: LogBuf,
+pub(crate) struct CommitGroupLog {
+    pub(crate) fd: RawFd,
+    pub(crate) offset: usize,
+    pub(crate) log_buf: LogBuf,
 }
 
 impl CommitGroup {
     #[inline]
-    pub(super) fn require_durability(&self) -> bool {
+    pub(crate) fn require_durability(&self) -> bool {
         self.log.is_some()
     }
 
     #[inline]
-    pub(super) fn can_join(&self, trx: &PrecommitTrx) -> bool {
+    pub(crate) fn can_join(&self, trx: &PrecommitTrx) -> bool {
         if !trx.require_durability() {
             return true;
         }
@@ -125,7 +127,7 @@ impl CommitGroup {
     }
 
     #[inline]
-    pub(super) fn join(&mut self, mut trx: PrecommitTrx, wait_sync: bool) -> CommitJoin {
+    pub(crate) fn join(&mut self, mut trx: PrecommitTrx, wait_sync: bool) -> CommitJoin {
         debug_assert!(self.max_cts < trx.cts);
         if let Some(redo_bin) = trx.take_log() {
             self.log
@@ -143,7 +145,7 @@ impl CommitGroup {
     }
 
     #[inline]
-    pub(super) fn into_sync_group(self) -> SyncGroup {
+    pub(crate) fn into_sync_group(self) -> SyncGroup {
         let (log_bytes, log_fd, write, finished) = match self.log {
             Some(log) => {
                 // Confirm data length in buffer header.
@@ -185,8 +187,8 @@ mod tests {
     use crate::buffer::test_page_id;
     use crate::id::{RowID, TableID};
     use crate::io::Completion;
-    use crate::trx::log_replay::TrxLog;
-    use crate::trx::redo::{RedoHeader, RedoLogs, RedoTrxKind, RowRedo, RowRedoKind, TableDML};
+    use crate::log::log_replay::TrxLog;
+    use crate::log::redo::{RedoHeader, RedoLogs, RedoTrxKind, RowRedo, RowRedoKind, TableDML};
     use crate::value::Val;
     use std::collections::BTreeMap;
 

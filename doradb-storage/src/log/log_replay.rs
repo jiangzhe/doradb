@@ -1,9 +1,10 @@
 use crate::error::{DataIntegrityError, Result};
 use crate::io::{DirectBuf, IOBuf};
 use crate::io::{STORAGE_SECTOR_SIZE, align_to_sector_size};
+use crate::log::RedoLogInitializer;
+use crate::log::redo::{RedoHeader, RedoLogs};
+use crate::log::redo_format::{REDO_DEFAULT_DATA_START_OFFSET, select_redo_file_header};
 use crate::serde::{Deser, LenPrefixPod, Ser, Serde};
-use crate::trx::log::RedoLogInitializer;
-use crate::trx::redo::{RedoHeader, RedoLogs};
 use error_stack::Report;
 use memmap2::Mmap;
 use std::collections::VecDeque;
@@ -221,29 +222,40 @@ impl RedoLogStream {
 
 pub(crate) struct MmapLogReader {
     m: Mmap,
-    page_size: usize,
+    log_block_size: usize,
     max_file_size: usize,
     offset: usize,
 }
 
 impl MmapLogReader {
     #[inline]
-    pub(crate) fn new(
-        log_file_path: impl AsRef<Path>,
-        page_size: usize,
-        max_file_size: usize,
-        offset: usize,
-    ) -> Result<Self> {
+    pub(crate) fn new(log_file_path: impl AsRef<Path>, expected_file_seq: u32) -> Result<Self> {
         let file = File::open(log_file_path.as_ref())?;
         // SAFETY: the file handle stays alive for the duration of mapping
         // creation, and the returned `Mmap` owns the mapping afterward.
         let m = unsafe { Mmap::map(&file)? };
+        let header = select_redo_file_header(&m, expected_file_seq)?.header;
+        if header.file_max_size as usize > m.len() {
+            return Err(Report::new(DataIntegrityError::InvalidPayload)
+                .attach(format!(
+                    "redo header file_max_size exceeds mapped length: file_max_size={}, mapped_len={}",
+                    header.file_max_size,
+                    m.len()
+                ))
+                .into());
+        }
         Ok(MmapLogReader {
             m,
-            page_size,
-            max_file_size,
-            offset,
+            log_block_size: header.log_block_size as usize,
+            max_file_size: header.file_max_size as usize,
+            offset: REDO_DEFAULT_DATA_START_OFFSET,
         })
+    }
+
+    #[inline]
+    fn bounded_read_end(&self, len: usize) -> Option<usize> {
+        let end = self.offset.checked_add(len)?;
+        (end <= self.max_file_size).then_some(end)
     }
 
     #[inline]
@@ -255,7 +267,10 @@ impl MmapLogReader {
         debug_assert!(self.offset.is_multiple_of(STORAGE_SECTOR_SIZE));
         // Try single page first.
         // This may fail as log is incomplete.
-        if let Some(mut buf) = self.m.get(self.offset..self.offset + self.page_size) {
+        let Some(read_end) = self.bounded_read_end(self.log_block_size) else {
+            return ReadLog::DataEnd;
+        };
+        if let Some(mut buf) = self.m.get(self.offset..read_end) {
             // Log buffer has prefix 8-byte integer, indicating the data length.
             if let Ok((idx, data_len)) = buf.deser_u64(0) {
                 // Log file is truncated to certain size, and if no data is written, the header of page
@@ -268,14 +283,17 @@ impl MmapLogReader {
                 if group_len > buf.len() {
                     // this can happen if a group exceeds the single page size.
                     let aligned_len = align_to_sector_size(group_len);
-                    if let Some(new_buf) = self.m.get(self.offset..self.offset + aligned_len) {
+                    let Some(read_end) = self.bounded_read_end(aligned_len) else {
+                        return ReadLog::DataEnd;
+                    };
+                    if let Some(new_buf) = self.m.get(self.offset..read_end) {
                         buf = new_buf;
                     } else {
                         return ReadLog::DataCorrupted; // file is incomplete.
                     }
                     self.offset += aligned_len;
                 } else {
-                    self.offset += self.page_size;
+                    self.offset += self.log_block_size;
                 }
                 return ReadLog::Some(LogGroup {
                     data: &buf[idx..idx + data_len as usize],
@@ -294,11 +312,59 @@ mod tests {
     use crate::buffer::test_page_id;
     use crate::id::{RowID, TableID, TrxID};
     use crate::io::IOBuf;
-    use crate::trx::redo::{
+    use crate::log::redo::{
         DDLRedo, RedoHeader, RedoLogs, RedoTrxKind, RowRedo, RowRedoKind, TableDML,
     };
     use std::collections::BTreeMap;
     use std::io::Write;
+
+    fn new_reader_at(
+        log_file_path: impl AsRef<Path>,
+        log_block_size: usize,
+        max_file_size: usize,
+        offset: usize,
+    ) -> Result<MmapLogReader> {
+        let file = File::open(log_file_path.as_ref())?;
+        // SAFETY: the file handle stays alive for the duration of mapping
+        // creation, and the returned `Mmap` owns the mapping afterward.
+        let m = unsafe { Mmap::map(&file)? };
+        Ok(MmapLogReader {
+            m,
+            log_block_size,
+            max_file_size,
+            offset,
+        })
+    }
+
+    #[test]
+    fn test_log_reader_stops_when_initial_block_crosses_logical_file_size() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("test.log");
+        let mut file = File::create(&file_path).unwrap();
+        file.write_all(&vec![0u8; STORAGE_SECTOR_SIZE * 2]).unwrap();
+        file.flush().unwrap();
+
+        let mut reader =
+            new_reader_at(file_path, STORAGE_SECTOR_SIZE * 2, STORAGE_SECTOR_SIZE, 0).unwrap();
+
+        assert!(matches!(reader.read(), ReadLog::DataEnd));
+    }
+
+    #[test]
+    fn test_log_reader_stops_when_expanded_group_crosses_logical_file_size() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("test.log");
+        let mut bytes = vec![0u8; STORAGE_SECTOR_SIZE * 2];
+        bytes[..mem::size_of::<u64>()].copy_from_slice(&(STORAGE_SECTOR_SIZE as u64).to_le_bytes());
+        let mut file = File::create(&file_path).unwrap();
+        file.write_all(&bytes).unwrap();
+        file.flush().unwrap();
+
+        let mut reader =
+            new_reader_at(file_path, STORAGE_SECTOR_SIZE, STORAGE_SECTOR_SIZE, 0).unwrap();
+
+        assert!(matches!(reader.read(), ReadLog::DataEnd));
+    }
 
     #[test]
     fn test_log_reader_read_multi_trx_log_in_one_group() {
@@ -350,7 +416,7 @@ mod tests {
         file.flush().unwrap();
 
         println!("file path {:?}", file_path);
-        let mut reader = MmapLogReader::new(file_path, 4096, 1024 * 1024, 0).unwrap();
+        let mut reader = new_reader_at(file_path, 4096, 1024 * 1024, 0).unwrap();
         match reader.read() {
             ReadLog::DataCorrupted | ReadLog::DataEnd | ReadLog::SizeLimit => {
                 panic!("invalid data")

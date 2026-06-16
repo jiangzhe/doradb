@@ -297,7 +297,13 @@ impl ReadonlyBufferPool {
         inflight: &Arc<PageIOCompletion>,
         result: CompletionResult<PageID>,
     ) {
+        // Publish the result first. Waiters may observe completion before this
+        // function removes the dedupe entry, so callers must not treat immediate
+        // absence from `inflights` as part of the completion contract.
         inflight.complete(result);
+        // Cleanup is owned by the load/completion path. The pointer check avoids
+        // removing a newer same-key load or write barrier installed after this
+        // completion became visible.
         if let Entry::Occupied(occ) = self.inflights.entry(key)
             && let InflightBlockState::Loading(current) = occ.get()
             && Arc::ptr_eq(current, inflight)
@@ -590,6 +596,9 @@ impl QuiescentGuard<ReadonlyBufferPool> {
             }
             Entry::Occupied(occ) => match occ.get() {
                 InflightBlockState::Loading(inflight) => {
+                    // Joiners do not repair inflight state. A completed Loading
+                    // can be observed during the completer's publish/remove
+                    // window; the completer remains responsible for cleanup.
                     self.stats.record_miss_join();
                     return Ok(Arc::clone(inflight));
                 }
@@ -2484,7 +2493,6 @@ pub(crate) mod tests {
                     .unwrap(),
                 resident_frame_id
             );
-            assert!(!global.inflights.contains_key(&key));
             assert_eq!(global.try_get_frame_id(&key), Some(resident_frame_id));
             assert_eq!(global.allocated(), 1);
             assert_eq!(global.residency.free.lock().len(), free_before);

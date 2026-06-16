@@ -123,9 +123,9 @@ mod tests {
     use super::*;
     use crate::buffer::{BufferPool, PoolGuards, PoolRole};
     use crate::catalog::tests::{open_catalog_test_engine, table1};
+    use crate::log::redo::DDLRedo;
     use crate::session::tests::SessionTestExt;
     use crate::trx::Transaction;
-    use crate::trx::redo::DDLRedo;
     use tempfile::TempDir;
 
     fn mark_catalog_ddl(trx: &mut Transaction, ddl: DDLRedo) {

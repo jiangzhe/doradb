@@ -10,7 +10,10 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-const MODULES: [&str; 8] = ["buffer", "latch", "row", "index", "io", "trx", "lwc", "file"];
+const MODULES: [&str; 9] = [
+    "buffer", "latch", "row", "index", "io", "trx", "lwc", "file", "log",
+];
+const MODULE_SCOPE: &str = "doradb-storage/src/{buffer,latch,row,index,io,trx,lwc,file,log}";
 
 #[derive(Debug, Clone, Default)]
 struct FileMetrics {
@@ -215,7 +218,7 @@ fn render_markdown(module_rows: &[ModuleMetrics], file_rows: &[FileMetrics], top
     out.push_str("# Unsafe Usage Baseline\n\n");
     out.push_str(&format!("- Generated on: `{}`\n", generated_at()));
     out.push_str("- Command: `tools/unsafe_inventory.rs`\n");
-    out.push_str("- Scope: `doradb-storage/src/{buffer,latch,row,index,io,trx,lwc,file}`\n\n");
+    out.push_str(&format!("- Scope: `{MODULE_SCOPE}`\n\n"));
 
     out.push_str("## Module Summary\n\n");
     out.push_str("| module | files | unsafe | transmute | new_unchecked | assume_init | // SAFETY: |\n");

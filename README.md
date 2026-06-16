@@ -42,7 +42,8 @@ I'm glad to have discussions if someone is interested in details.
 - [io](./doradb-storage/src/io): Async direct IO system with compile-time-selected `libaio` and `io_uring` backends, by default `io_uring`.
 - [latch](./doradb-storage/src/latch): Async latch primitives including Mutex, RWLock and HybridLatch(enhanced RWLock with optimistic mode).
 - [lock](./doradb-storage/src/lock): Metadata lock and table-level lock.
-- [lwc](./doradb-storage/src/lwc): LightWeight Columnar format for on-disk warm data.
+- [log](./doradb-storage/src/log): Logging and recovery.
+- [lwc](./doradb-storage/src/lwc): Lightweight columnar format for on-disk warm data.
 - [row](./doradb-storage/src/row): In-memory row store and operations.
 - [table](./doradb-storage/src/table): Table of data, composite of block index, secondary index, buffer pool and table file. Support operations like index lookup, index scan, table scan, insert, delete, update, etc.
 - [trx](./doradb-storage/src/trx): Transaction system, including transaction lifecycle, redo log, undo log, recovery, garbage collect, etc.

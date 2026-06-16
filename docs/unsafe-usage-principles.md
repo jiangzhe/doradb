@@ -3,7 +3,7 @@
 This document defines repository-level rules for introducing, modifying, and reviewing `unsafe` code in `doradb-storage`.
 
 Scope:
-- `doradb-storage/src/{buffer,latch,row,index,io,trx,lwc,file}`
+- `doradb-storage/src/{buffer,latch,row,index,io,trx,lwc,file,log}`
 
 ## 1. Allowed Unsafe Categories
 
