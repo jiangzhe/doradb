@@ -24,7 +24,8 @@ writing log bytes; their CTS is not a recovery timestamp seed.
 Main source files:
 
 - `log/redo.rs`: redo record payload types and serialization.
-- `log/log_replay.rs`: log-group buffer format and mmap reader.
+- `log/buf.rs`: log-group write buffer and transaction frame serialization.
+- `log/replay.rs`: mmap reader and redo stream draining.
 - `trx/group.rs`: commit-group construction.
 - `trx/sys.rs`: commit admission, CTS assignment, and GC bucket ownership.
 - `log/mod.rs`: log file allocation, group-commit write scheduling, IO, sync,
@@ -60,29 +61,37 @@ invalid. The configured defaults are:
 - `io_depth = 32`
 - `log_sync = fsync`
 
-Each log file is created as an `O_DIRECT` sparse file and truncated to
-`log_file_max_size`. The first two 4KB sectors are fixed A/B redo super-block
-slots:
+Each log file is created as an `O_DIRECT` sparse file and truncated to the
+effective `log_file_max_size`. The configured value is first rounded so the
+data region after the fixed super-block slots contains a whole number of
+`log_block_size` groups. The first two 4KB sectors are fixed A/B redo
+super-block slots:
 
 - slot 0 at offset `0`
 - slot 1 at offset `STORAGE_SECTOR_SIZE`
 - normal redo groups start at `2 * STORAGE_SECTOR_SIZE`
 
-New files write one valid initial header in slot 0 with `generation = 0`; slot 1
-stays zero-filled until later sealing work. The header write is queued through
-the log thread's async write driver as header control-plane work, before any
-later group writes for the same file. A header stores magic, format version,
-file sequence, slot number, log block size, file max size, and generation. The
-footer repeats the slot identity and generation and stores a BLAKE3 checksum
-over the slot bytes before the footer.
-Recovery selects the newest valid slot by generation and tolerates a torn or
-invalid inactive slot when the other slot is valid.
+New files write one valid initial super-block in slot 0 with `generation = 0`;
+slot 1 stays zero-filled until later sealing work. The super-block write is
+queued through the log thread's async write driver as control-plane work, before
+any later group writes for the same file. Each slot uses the standard
+`file/block_integrity.rs` envelope: magic/version at the front, redo metadata
+payload after the integrity header, zero padding, and the BLAKE3 checksum
+trailer in the final 32 bytes. The payload stores file sequence, slot number,
+log block size, effective file max size, and generation. Recovery selects the
+newest valid slot by generation and tolerates a torn or invalid inactive slot
+when the other slot is valid.
+
+Redo files are self-describing. During restart, existing files are replayed with
+the `log_block_size` and effective file max size persisted in their selected
+super-block, even if the current configuration has changed. The next writable
+redo file is created with the latest normalized configuration.
 
 When a file runs out of append capacity, the commit path creates the next file
 and queues one log-file boundary containing the old file and the new file's
-initial header write. The log thread keeps the old file descriptor alive until
-all already-written groups from that file and the boundary header write are
-finished.
+initial super-block write. The log thread keeps the old file descriptor alive
+until all already-written groups from that file and the boundary super-block
+write are finished.
 
 ## Serialization Rules
 
@@ -96,6 +105,11 @@ Common container encodings:
 - `BTreeMap<K, V>`: `u64` entry count followed by sorted key/value pairs.
 - `Option<T>`: one `bool` byte, followed by `T` only when present.
 - `Box<T>`: same bytes as `T`.
+
+Collection deserialization rejects counts that cannot fit in the remaining
+input frame before reserving capacity or iterating entries. Redo recovery
+parses transaction payloads through an exact transaction frame, so corrupt
+collection counts are bounded by the serialized transaction length.
 
 Value encoding:
 
@@ -111,18 +125,31 @@ A group can contain one or more transaction log records.
 
 ```text
 LogGroup :=
-    u64 group_data_len
-    TrxLog[group_data_len bytes]
+    RedoGroupHeader
+    TrxLog[body_len bytes]
     zero padding to the direct-IO write length
+
+RedoGroupHeader := 28 bytes
+    u32 checksum
+    u64 body_len
+    u64 min_cts
+    u64 max_cts
 ```
 
-The group length does not include the first `u64` length field. A zero
-`group_data_len` means logical end-of-file during replay. Since log files are
-sparse and pre-sized, unwritten areas read as zero on Linux.
+`body_len` is the length of serialized `TrxLog` body bytes only. It excludes
+the 28-byte group header and excludes zero padding. The checksum is CRC32 from
+`crc32fast` over every byte after the checksum field in the physical direct-IO
+write: header bytes `4..28`, transaction body bytes, and zero padding.
+
+An all-zero 28-byte group header at the current group offset is the sparse-file
+logical EOF sentinel. A nonzero header with `body_len == 0` is invalid. There
+is no legacy group reader for the old `u64 group_data_len + body` format.
 
 Small groups are intended to use a fixed `log_block_size` buffer from the redo
 free-list. Large groups can exceed `log_block_size`; they are written as one
-sector-aligned direct buffer sized to the serialized group.
+sector-aligned direct buffer sized to the 28-byte header plus serialized group
+body. Small valid groups advance replay by `log_block_size`; large valid groups
+advance by the sector-aligned physical group length.
 
 ## Transaction Record Format
 
@@ -138,6 +165,11 @@ RedoHeader :=
     u64 cts
     u8  trx_kind
 ```
+
+`trx_data_len` is authoritative. Replay builds an exact bounded frame of that
+length, parses `RedoHeader` and `RedoLogs` inside it, and rejects
+under-consumption, over-consumption, or nested payload reads that escape the
+frame.
 
 `trx_kind`:
 
@@ -205,15 +237,19 @@ physical row page.
      serialized buffer has enough capacity.
 
 5. A new redo-bearing group serializes the first transaction into a `LogBuf`,
-   allocates append space from the current sparse log file, and stores the raw
-   file descriptor plus offset. If allocation reaches `log_file_max_size`, the
-   path rotates to a new file and queues a log-file boundary before the group.
+   tracks the min/max CTS of serialized redo records, allocates append space
+   from the current sparse log file, and stores the raw file descriptor plus
+   offset. If allocation reaches `log_file_max_size`, the path rotates to a new
+   file and queues a log-file boundary before the group.
 
 6. `Log-Thread` drains commit queue entries. Log-file boundaries stage an async
-   header write and stop queue fetching until pending IO plus that header write
-   drain. Redo-bearing groups drain into `SyncGroup`s and then one
+   super-block write and stop queue fetching until pending IO plus that
+   super-block write drain. Redo-bearing groups drain into `SyncGroup`s and then one
    `Operation::pwrite_owned(fd, offset, DirectBuf)` each. No-log groups are
-   inserted as already-finished ordered groups with no IO target.
+   inserted as already-finished ordered groups with no IO target. Before a
+   redo-bearing group is submitted, `LogBuf::finish` writes the 28-byte group
+   header with checksum zero, ensures padding bytes are zero, then patches the
+   CRC32 checksum over bytes `4..write_len`.
 
 7. `LogWriteDriver` wraps the backend-neutral `SubmissionDriver` and submits
    direct writes through the compile-time storage backend (`io_uring` by
@@ -250,15 +286,22 @@ For each group:
 
 - if the group offset reaches the header's `file_max_size`, the file is
   exhausted;
-- if the group length field is zero, replay treats the file as ended;
-- if the group length fits within one header `log_block_size` block, reader
-  offset advances by `log_block_size`;
-- if the group length exceeds one page, reader offset advances by the
-  sector-aligned group length;
-- invalid framing or missing mapped bytes reports `LogFileCorrupted`.
+- if the 28-byte group header is all zeros, replay treats the file as ended;
+- nonzero group headers are parsed and checked before transaction parsing;
+- `body_len == 0`, invalid CTS ranges, physical lengths that cross
+  `file_max_size`, missing mapped bytes, and checksum mismatches report
+  `LogFileCorrupted`;
+- checksum validation covers bytes `4..physical_len`, including zero padding;
+- only after checksum validation does the reader expose
+  `group_bytes[28..28 + body_len]` to transaction parsing;
+- if the group physical length fits within one header `log_block_size` block,
+  reader offset advances by `log_block_size`;
+- if the group physical length exceeds one page, reader offset advances by the
+  sector-aligned group length.
 
 `RedoLogStream` turns each group into individual `TrxLog` records and buffers
-them in order.
+them in order. Each decoded `TrxLog` header CTS must fall within the inclusive
+group header `min_cts..=max_cts` range.
 
 Recovery first loads checkpointed catalog state and user table roots. It then
 computes replay floors:
@@ -339,8 +382,9 @@ recent log writes.
 
 - Redo is a logical value log. It assumes committed checkpoint roots plus replay
   are sufficient; there is no undo phase.
-- The log format has no magic number, version, checksum, or per-file metadata.
-- The reserved two-page file header is unused.
+- Redo files are v2-only and require a valid fixed A/B super-block slot.
+- Physical redo groups are checksummed, but active crash files are still scanned
+  sequentially because sealed segment ranges are not implemented yet.
 - Log discovery depends on file names and contiguous sequence numbers.
 - Old log files are not physically truncated or deleted by the current redo
   path. Checkpoint metadata narrows replay logically, but recovery still opens
@@ -354,32 +398,11 @@ recent log writes.
 
 ## Potential Improvements
 
-### Format and Integrity
-
-Add a real file header containing at least magic, format version, file sequence,
-configured page size, header size, and optional min/max CTS. This would make
-startup validation explicit and allow recovery to skip whole files whose CTS
-range is older than all replay floors.
-
-Add group-level and record-level checksums. The current reader can detect some
-invalid payloads through deserialization failure, but it cannot distinguish a
-clean EOF, torn write, stale sector, or random corruption as explicitly as a
-checksummed frame with a commit marker.
-
-Make `trx_data_len` an enforced framing boundary. `LenPrefixPod::deser` reads
-the transaction length but does not currently validate that header and payload
-consume exactly that many bytes. Future hardening should reject short,
-overlong, or nested-length-inconsistent records.
-
-Bound collection lengths during deserialization. `Vec` and `BTreeMap` lengths
-come from `u64` fields and are trusted enough to allocate. Corrupted logs should
-fail with a data-integrity error rather than risk excessive allocation.
-
 ### File Layout and Retention
 
-Use the reserved file header to store segment metadata and durable end state.
-Useful fields include first CTS, last CTS, durable byte length, previous file
-sequence, and checksum coverage.
+Extend redo super-block sealing to store durable segment metadata. Useful
+fields include first redo CTS, last redo CTS, durable byte length, previous file
+sequence, and sealed-range checksum coverage.
 
 Implement physical redo truncation or deletion after catalog and table replay
 floors prove that older segments are no longer needed. This likely needs the
@@ -387,15 +410,15 @@ watermark expansion already tracked by
 `docs/backlogs/000032-deletion-watermark-meta-redo-expansion-for-log-truncation.md`.
 
 Keep `log_block_size` config normalization and header validation in sync. The
-config setter rounds values up to `STORAGE_SECTOR_SIZE` multiples before file
+config path rounds values up to `STORAGE_SECTOR_SIZE` multiples before file
 creation, and redo header validation rejects persisted files whose
-`log_block_size` is not a sector-aligned size.
+`log_block_size` is not a sector-aligned size. `log_file_max_size` is normalized
+to `REDO_DEFAULT_DATA_START_OFFSET + N * log_block_size`; persisted super-blocks
+with a sector-aligned but log-block-misaligned data region are invalid.
 
-Audit small-group buffer stride. Small groups are read with a fixed
-`log_block_size` stride, while fallback `LogBuf::new` can allocate only the
-sector-aligned serialized length if the fixed-size buffer free-list is
-exhausted. Either guarantee fixed `log_block_size` buffers for every small group or
-change the reader to advance by the actual written aligned length.
+Keep small-group buffer stride and reader advancement in sync. Small groups are
+read with a fixed `log_block_size` stride, so write-side fallback allocation
+must continue to use a full `log_block_size` direct buffer for normal groups.
 
 ### Write Path and Sync Policy
 
@@ -419,13 +442,13 @@ Replace mmap recovery reads with an async-friendly reader or a dedicated
 blocking reader thread. This is already tracked by
 `docs/backlogs/000050-refactor-redo-log-reader-avoid-sync-mmap-in-async-runtime.md`.
 
-Use file-header CTS ranges to skip old files before mmap/open/read. Today replay
+Use sealed file CTS ranges to skip old files before mmap/open/read. Today replay
 uses logical per-record filters after reading groups.
 
 Parallelize DML replay after preserving DDL pipeline barriers and per-table/page
 ordering. The code already has `dispatch_dml` and `wait_for_dml_done` boundaries
 for this direction.
 
-Add stronger corrupted-tail tests. Recovery should have explicit coverage for
-zero EOF, torn length field, torn payload, bad op code, bad collection length,
-checksum mismatch after checksums exist, and rotation-boundary crashes.
+Broaden corrupted-tail integration tests. Recovery should have explicit coverage
+for zero EOF, torn group header, torn payload, bad op code, bad collection
+length, checksum mismatch, and rotation-boundary crashes.

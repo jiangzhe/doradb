@@ -206,57 +206,65 @@ impl Serde for [u8] {
     #[inline]
     fn deser_u64(&self, idx: usize) -> Result<(usize, u64)> {
         debug_assert!(idx + mem::size_of::<u64>() <= self.len());
-        let val = u64::from_le_bytes(self[idx..idx + mem::size_of::<u64>()].try_into()?);
-        Ok((idx + mem::size_of::<u64>(), val))
+        let end = idx + mem::size_of::<u64>();
+        let val = u64::from_le_bytes(self[idx..end].try_into()?);
+        Ok((end, val))
     }
 
     #[inline]
     fn deser_i64(&self, idx: usize) -> Result<(usize, i64)> {
         debug_assert!(idx + mem::size_of::<i64>() <= self.len());
-        let val = i64::from_le_bytes(self[idx..idx + mem::size_of::<i64>()].try_into()?);
-        Ok((idx + mem::size_of::<i64>(), val))
+        let end = idx + mem::size_of::<i64>();
+        let val = i64::from_le_bytes(self[idx..end].try_into()?);
+        Ok((end, val))
     }
 
     #[inline]
     fn deser_f64(&self, idx: usize) -> Result<(usize, f64)> {
         debug_assert!(idx + mem::size_of::<f64>() <= self.len());
-        let val = f64::from_le_bytes(self[idx..idx + mem::size_of::<f64>()].try_into()?);
-        Ok((idx + mem::size_of::<f64>(), val))
+        let end = idx + mem::size_of::<f64>();
+        let val = f64::from_le_bytes(self[idx..end].try_into()?);
+        Ok((end, val))
     }
 
     #[inline]
     fn deser_u32(&self, idx: usize) -> Result<(usize, u32)> {
         debug_assert!(idx + mem::size_of::<u32>() <= self.len());
-        let val = u32::from_le_bytes(self[idx..idx + mem::size_of::<u32>()].try_into()?);
-        Ok((idx + mem::size_of::<u32>(), val))
+        let end = idx + mem::size_of::<u32>();
+        let val = u32::from_le_bytes(self[idx..end].try_into()?);
+        Ok((end, val))
     }
 
     #[inline]
     fn deser_i32(&self, idx: usize) -> Result<(usize, i32)> {
         debug_assert!(idx + mem::size_of::<i32>() <= self.len());
-        let val = i32::from_le_bytes(self[idx..idx + mem::size_of::<i32>()].try_into()?);
-        Ok((idx + mem::size_of::<i32>(), val))
+        let end = idx + mem::size_of::<i32>();
+        let val = i32::from_le_bytes(self[idx..end].try_into()?);
+        Ok((end, val))
     }
 
     #[inline]
     fn deser_f32(&self, idx: usize) -> Result<(usize, f32)> {
         debug_assert!(idx + mem::size_of::<f32>() <= self.len());
-        let val = f32::from_le_bytes(self[idx..idx + mem::size_of::<f32>()].try_into()?);
-        Ok((idx + mem::size_of::<f32>(), val))
+        let end = idx + mem::size_of::<f32>();
+        let val = f32::from_le_bytes(self[idx..end].try_into()?);
+        Ok((end, val))
     }
 
     #[inline]
     fn deser_u16(&self, idx: usize) -> Result<(usize, u16)> {
         debug_assert!(idx + mem::size_of::<u16>() <= self.len());
-        let val = u16::from_le_bytes(self[idx..idx + mem::size_of::<u16>()].try_into()?);
-        Ok((idx + mem::size_of::<u16>(), val))
+        let end = idx + mem::size_of::<u16>();
+        let val = u16::from_le_bytes(self[idx..end].try_into()?);
+        Ok((end, val))
     }
 
     #[inline]
     fn deser_i16(&self, idx: usize) -> Result<(usize, i16)> {
         debug_assert!(idx + mem::size_of::<i16>() <= self.len());
-        let val = i16::from_le_bytes(self[idx..idx + mem::size_of::<i16>()].try_into()?);
-        Ok((idx + mem::size_of::<i16>(), val))
+        let end = idx + mem::size_of::<i16>();
+        let val = i16::from_le_bytes(self[idx..end].try_into()?);
+        Ok((end, val))
     }
 
     #[inline]
@@ -274,22 +282,25 @@ impl Serde for [u8] {
     #[inline]
     fn deser_byte_slice(&self, idx: usize, len: usize) -> Result<(usize, &[u8])> {
         debug_assert!(idx + len <= self.len());
-        let res = &self[idx..idx + len];
-        Ok((idx + len, res))
+        let end = idx + len;
+        let res = &self[idx..end];
+        Ok((end, res))
     }
 
     #[inline]
     fn deser_byte_array<const N: usize>(&self, idx: usize) -> Result<(usize, [u8; N])> {
         debug_assert!(idx + N <= self.len());
+        let end = idx + N;
         let mut res = [0u8; N];
-        res.copy_from_slice(&self[idx..idx + N]);
-        Ok((idx + N, res))
+        res.copy_from_slice(&self[idx..end]);
+        Ok((end, res))
     }
 
     #[inline]
     fn deser(&self, idx: usize, len: usize) -> Result<(usize, &[u8])> {
         debug_assert!(idx + len <= self.len());
-        Ok((idx + len, &self[idx..idx + len]))
+        let end = idx + len;
+        Ok((end, &self[idx..end]))
     }
 }
 
@@ -542,7 +553,25 @@ impl<T: Deser> Deser for Vec<T> {
     #[inline]
     fn deser<S: Serde + ?Sized>(input: &S, start_idx: usize) -> Result<(usize, Self)> {
         let (mut idx, len) = input.deser_u64(start_idx)?;
-        let mut vec = Vec::with_capacity(len as usize);
+        let len = usize::try_from(len).map_err(|_| {
+            Report::new(DataIntegrityError::InvalidPayload)
+                .attach("deserialize Vec length exceeds usize")
+        })?;
+        // Cap the attacker-controlled element count before allocation. Current
+        // storage payload collections are byte-backed, so a count larger than
+        // the remaining frame is treated as corrupt instead of reserving memory.
+        let remaining = input.size().checked_sub(idx).ok_or_else(|| {
+            Report::new(DataIntegrityError::InvalidPayload)
+                .attach(format!("deserialize Vec start exceeds input: idx={idx}"))
+        })?;
+        if len > remaining {
+            return Err(Report::new(DataIntegrityError::InvalidPayload)
+                .attach(format!(
+                    "deserialize Vec length exceeds remaining bytes: len={len}, remaining={remaining}"
+                ))
+                .into());
+        }
+        let mut vec = Vec::with_capacity(len);
         for _ in 0..len {
             let (idx0, val) = T::deser(input, idx)?;
             idx = idx0;
@@ -636,6 +665,25 @@ impl<K: Ord + Deser, V: Deser> Deser for BTreeMap<K, V> {
     #[inline]
     fn deser<S: Serde + ?Sized>(input: &S, start_idx: usize) -> Result<(usize, Self)> {
         let (mut idx, len) = input.deser_u64(start_idx)?;
+        let len = usize::try_from(len).map_err(|_| {
+            Report::new(DataIntegrityError::InvalidPayload)
+                .attach("deserialize BTreeMap length exceeds usize")
+        })?;
+        // Cap the attacker-controlled entry count before iteration. Current
+        // persisted map entries are byte-backed, so a count larger than the
+        // remaining frame is treated as corrupt.
+        let remaining = input.size().checked_sub(idx).ok_or_else(|| {
+            Report::new(DataIntegrityError::InvalidPayload).attach(format!(
+                "deserialize BTreeMap start exceeds input: idx={idx}"
+            ))
+        })?;
+        if len > remaining {
+            return Err(Report::new(DataIntegrityError::InvalidPayload)
+                .attach(format!(
+                    "deserialize BTreeMap length exceeds remaining bytes: len={len}, remaining={remaining}"
+                ))
+                .into());
+        }
         let mut map = BTreeMap::new();
         for _ in 0..len {
             let (idx0, k) = K::deser(input, idx)?;
@@ -862,6 +910,7 @@ impl<H: fmt::Debug, P: fmt::Debug> fmt::Debug for LenPrefixPod<H, P> {
 impl<'a, H: Ser<'a>, P: Ser<'a>> LenPrefixPod<H, P> {
     /// Create a new LenPrefixStruct.
     #[inline]
+    #[expect(dead_code, reason = "reserved len-prefix serde container")]
     pub fn new(header: H, payload: P) -> Self {
         let header_len = header.ser_len();
         let payload_len = payload.ser_len();
@@ -1081,6 +1130,19 @@ mod tests {
     }
 
     #[test]
+    fn test_vec_deser_rejects_count_larger_than_remaining_input() {
+        let mut out = vec![0u8; mem::size_of::<u64>()];
+        out[..].ser_u64(0, u64::MAX);
+
+        let err = Vec::<TestStruct>::deser(&out[..], 0).unwrap_err();
+
+        assert_eq!(
+            err.data_integrity_error(),
+            Some(DataIntegrityError::InvalidPayload)
+        );
+    }
+
+    #[test]
     fn test_btree_map_serde() {
         let map = BTreeMap::from([(
             1,
@@ -1096,6 +1158,19 @@ mod tests {
         let (idx, val) = BTreeMap::<u64, TestStruct>::deser(&out[..], 0).unwrap();
         assert_eq!(idx, out.len());
         assert_eq!(val, map);
+    }
+
+    #[test]
+    fn test_btree_map_deser_rejects_count_larger_than_remaining_input() {
+        let mut out = vec![0u8; mem::size_of::<u64>()];
+        out[..].ser_u64(0, u64::MAX);
+
+        let err = BTreeMap::<u64, TestStruct>::deser(&out[..], 0).unwrap_err();
+
+        assert_eq!(
+            err.data_integrity_error(),
+            Some(DataIntegrityError::InvalidPayload)
+        );
     }
 
     #[test]

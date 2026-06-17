@@ -38,6 +38,7 @@ memmap2 = { workspace = true }
 futures = { workspace = true }
 scopeguard = { workspace = true }
 blake3 = { workspace = true }
+crc32fast = { workspace = true }
 ordered-float = { workspace = true }
 dashmap = { workspace = true }
 io-uring = { workspace = true, optional = true }
