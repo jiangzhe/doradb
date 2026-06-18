@@ -72,15 +72,45 @@ super-block slots:
 - normal redo groups start at `2 * STORAGE_SECTOR_SIZE`
 
 New files write one valid initial super-block in slot 0 with `generation = 0`;
-slot 1 stays zero-filled until later sealing work. The super-block write is
-queued through the log thread's async write driver as control-plane work, before
-any later group writes for the same file. Each slot uses the standard
+the inactive slot stays zero-filled until the file is sealed. The super-block
+write is queued through the log thread's async write driver as control-plane
+work, before any later group writes for the same file. Each slot uses the standard
 `file/block_integrity.rs` envelope: magic/version at the front, redo metadata
 payload after the integrity header, zero padding, and the BLAKE3 checksum
 trailer in the final 32 bytes. The payload stores file sequence, slot number,
-log block size, effective file max size, and generation. Recovery selects the
-newest valid slot by generation and tolerates a torn or invalid inactive slot
-when the other slot is valid.
+log block size, effective file max size, generation, durable end offset, and
+the real serialized redo CTS range for sealed files. Recovery selects the newest
+valid slot by generation and tolerates a torn or invalid inactive slot when the
+other slot is valid.
+
+Super-block payload fields:
+
+```text
+RedoSuperBlock :=
+    u32 file_seq
+    u32 slot_no
+    u64 log_block_size
+    u64 file_max_size
+    u64 generation
+    u64 durable_end_offset
+    u64 min_redo_cts
+    u64 max_redo_cts
+```
+
+The segment metadata has three valid encodings:
+
+- unsealed/open: all three segment fields are zero;
+- sealed empty: `durable_end_offset = 2 * STORAGE_SECTOR_SIZE` and both CTS
+  fields are zero;
+- sealed non-empty: `durable_end_offset` is sector-aligned, greater than the
+  data start, no larger than `file_max_size`, and
+  `0 < min_redo_cts <= max_redo_cts`.
+
+Every other combination is invalid. The sealed CTS range is derived only from
+redo-bearing physical group headers that reached the ordered durable prefix
+after the configured sync policy succeeded. Ordered no-log transactions,
+`CommitGroup.max_cts`, `SyncGroup.max_cts`, and the runtime
+`persisted_cts` watermark do not contribute to sealed file ranges.
 
 Redo files are self-describing. During restart, existing files are replayed with
 the `log_block_size` and effective file max size persisted in their selected
@@ -91,7 +121,13 @@ When a file runs out of append capacity, the commit path creates the next file
 and queues one log-file boundary containing the old file and the new file's
 initial super-block write. The log thread keeps the old file descriptor alive
 until all already-written groups from that file and the boundary super-block
-write are finished.
+write are finished. It then hands the old file to `RedoFileSealer`, which queues
+an async seal write for the inactive super-block slot with `generation + 1`, the
+durable end offset, and the real redo CTS range accumulated for that file. The
+old file remains open until the seal write completes and the configured seal
+sync policy finishes, but processing can continue on the next file while that
+seal write is pending. Seal write failure poisons storage as `RedoWrite`; seal
+sync failure poisons storage as `RedoSync`.
 
 ## Serialization Rules
 
@@ -261,14 +297,22 @@ physical row page.
    the submitted buffer length. Short writes and IO errors become
    `FatalError::RedoWrite`.
 
-9. `FileProcessor::finalize_finished_prefix` commits only the contiguous
+9. `RedoLogWriter::finalize_finished_prefix` commits only the contiguous
    finished CTS prefix. When the prefix contains redo bytes, it performs the
    configured sync policy (`fsync`, `fdatasync`, or `none`) on the file
-   descriptor that owns those writes.
+   descriptor that owns those writes. Only after that sync step succeeds does
+   `RedoFileSealer` record each redo-bearing group's
+   `durable_end_offset`, `min_cts`, and `max_cts`.
 
 10. After sync succeeds, `persisted_cts` advances to the prefix max CTS, each
     `PrecommitTrx` is finalized, committed payloads are handed to purge, waiters
     are completed, buffers are recycled, and stats are updated.
+
+11. During clean shutdown, after pending redo work drains, the log thread
+    best-effort seals the active file with the same segment metadata and sync
+    policy. A clean-shutdown seal failure increments a redo seal failure stat
+    but does not poison storage or fail shutdown by itself; recovery treats the
+    file as unsealed if the inactive slot was not durably published.
 
 The handoff into group commit is irreversible for user transactions. After a
 `PrecommitTrx` is queued, the log thread owns the successful commit path and
@@ -286,12 +330,17 @@ sequence so normal runtime opens a fresh file after recovery.
 groups from the fixed `REDO_DEFAULT_DATA_START_OFFSET`.
 For each group:
 
-- if the group offset reaches the header's `file_max_size`, the file is
+- if an unsealed group offset reaches the header's `file_max_size`, the file is
   exhausted;
-- if the 28-byte group header is all zeros, replay treats the file as ended;
+- if a sealed group offset reaches `durable_end_offset`, the file is exhausted
+  after the scanned group-header CTS range matches the sealed super-block
+  range;
+- if the 28-byte group header is all zeros, replay treats an unsealed file as
+  ended and treats a sealed file as corrupted before `durable_end_offset`;
 - nonzero group headers are parsed and checked before transaction parsing;
 - `body_len == 0`, invalid CTS ranges, physical lengths that cross
-  `file_max_size`, missing mapped bytes, and checksum mismatches report
+  the unsealed `file_max_size` or sealed `durable_end_offset`, missing mapped
+  bytes, checksum mismatches, and sealed range mismatches report
   `LogFileCorrupted`;
 - checksum validation covers bytes `4..physical_len`, including zero padding;
 - only after checksum validation does the reader expose
@@ -301,9 +350,10 @@ For each group:
 - if the group physical length exceeds one page, reader offset advances by the
   sector-aligned group length.
 
-`RedoLogStream` turns each group into individual `TrxLog` records and buffers
-them in order. Each decoded `TrxLog` header CTS must fall within the inclusive
-group header `min_cts..=max_cts` range.
+Sealed empty files are exhausted immediately at the data start and do not need
+a zero EOF group. `RedoLogStream` still drains sealed non-empty files normally;
+whole-file skip is not implemented in this phase. Each decoded `TrxLog` header
+CTS must fall within the inclusive group header `min_cts..=max_cts` range.
 
 Recovery first loads checkpointed catalog state and user table roots. It then
 computes replay floors:
@@ -385,8 +435,9 @@ recent log writes.
 - Redo is a logical value log. It assumes committed checkpoint roots plus replay
   are sufficient; there is no undo phase.
 - Redo files are v2-only and require a valid fixed A/B super-block slot.
-- Physical redo groups are checksummed, but active crash files are still scanned
-  sequentially because sealed segment ranges are not implemented yet.
+- Physical redo groups are checksummed. Sealed files validate their durable end
+  offset and real redo CTS range during replay, but active crash files can
+  remain unsealed and are scanned sequentially.
 - Log discovery depends on file names and contiguous sequence numbers.
 - Old log files are not physically truncated or deleted by the current redo
   path. Checkpoint metadata narrows replay logically, but recovery still opens
@@ -396,15 +447,12 @@ recent log writes.
   large direct IO request.
 - `persisted_cts` is an ordered-completion watermark. It can advance across
   no-log groups, so recovery must continue to seed timestamps only from
-  checkpoint metadata, table roots, and real redo headers.
+  checkpoint metadata, table roots, and real redo headers. Phase 3 still scans
+  sealed files, so it does not seed recovery timestamps from sealed headers.
 
 ## Potential Improvements
 
 ### File Layout and Retention
-
-Extend redo super-block sealing to store durable segment metadata. Useful
-fields include first redo CTS, last redo CTS, durable byte length, previous file
-sequence, and sealed-range checksum coverage.
 
 Implement physical redo truncation or deletion after catalog and table replay
 floors prove that older segments are no longer needed. This likely needs the

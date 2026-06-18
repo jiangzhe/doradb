@@ -15,10 +15,8 @@ use std::mem;
 pub(crate) struct LogBuf {
     /// Sector-aligned bytes that will be submitted to the redo writer.
     buf: DirectBuf,
-    /// Lowest commit timestamp among appended transaction frames.
-    min_cts: Option<TrxID>,
-    /// Highest commit timestamp among appended transaction frames.
-    max_cts: Option<TrxID>,
+    /// Inclusive commit timestamp range among appended transaction frames.
+    cts_range: Option<(TrxID, TrxID)>,
 }
 
 impl LogBuf {
@@ -29,8 +27,7 @@ impl LogBuf {
         buf.truncate(RedoGroupHeader::SIZE);
         LogBuf {
             buf,
-            min_cts: None,
-            max_cts: None,
+            cts_range: None,
         }
     }
 
@@ -40,8 +37,7 @@ impl LogBuf {
         buf.truncate(RedoGroupHeader::SIZE);
         LogBuf {
             buf,
-            min_cts: None,
-            max_cts: None,
+            cts_range: None,
         }
     }
 
@@ -54,8 +50,9 @@ impl LogBuf {
         let new_offset = trx_log.ser(self.buf.as_bytes_mut(), offset);
         self.buf.truncate(new_offset);
         let cts = trx_log.header.cts;
-        self.min_cts = Some(self.min_cts.map_or(cts, |min_cts| min_cts.min(cts)));
-        self.max_cts = Some(self.max_cts.map_or(cts, |max_cts| max_cts.max(cts)));
+        self.cts_range = Some(self.cts_range.map_or((cts, cts), |(min_cts, max_cts)| {
+            (min_cts.min(cts), max_cts.max(cts))
+        }));
     }
 
     /// Write the group header, checksum the physical buffer, and return it.
@@ -69,8 +66,9 @@ impl LogBuf {
         let body_len = len - RedoGroupHeader::SIZE;
         debug_assert!(body_len > 0);
         self.buf.as_bytes_mut()[len..].fill(0);
-        let min_cts = self.min_cts.unwrap_or_else(|| TrxID::new(0));
-        let max_cts = self.max_cts.unwrap_or_else(|| TrxID::new(0));
+        let (min_cts, max_cts) = self
+            .cts_range
+            .unwrap_or_else(|| (TrxID::new(0), TrxID::new(0)));
         let header = RedoGroupHeader::new(body_len, min_cts, max_cts);
         let header_end = header.ser(self.buf.as_bytes_mut(), 0);
         debug_assert_eq!(header_end, RedoGroupHeader::SIZE);
@@ -89,6 +87,12 @@ impl LogBuf {
     #[inline]
     pub(crate) fn capacity(&self) -> usize {
         self.buf.capacity()
+    }
+
+    /// Return the real serialized redo CTS range tracked for this group.
+    #[inline]
+    pub(crate) fn redo_cts_range(&self) -> Option<(TrxID, TrxID)> {
+        self.cts_range
     }
 
     /// Return whether an additional serialized frame of `len` bytes fits.
@@ -270,5 +274,17 @@ mod tests {
             err.data_integrity_error(),
             Some(DataIntegrityError::InvalidPayload)
         );
+    }
+
+    #[test]
+    fn test_log_buf_exposes_serialized_redo_cts_range() {
+        let mut buf = LogBuf::new(128);
+        assert_eq!(buf.redo_cts_range(), None);
+
+        buf.append_trx_log(&simple_trx_log(TrxID::new(7)));
+        assert_eq!(buf.redo_cts_range(), Some((TrxID::new(7), TrxID::new(7))));
+
+        buf.append_trx_log(&simple_trx_log(TrxID::new(9)));
+        assert_eq!(buf.redo_cts_range(), Some((TrxID::new(7), TrxID::new(9))));
     }
 }

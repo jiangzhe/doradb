@@ -100,7 +100,7 @@ Redo-log writes use the backend-neutral submission driver inside `Log-Thread`:
 
 - the scheduler serializes one commit group into a `DirectBuf`;
 - the group becomes one `Operation::pwrite_owned(...)`;
-- the driver reports completion back to `FileProcessor`; and
+- the driver reports completion back to `RedoLogWriter`; and
 - durability is finalized above the driver with `fsync`, `fdatasync`, or no
   sync depending on `TrxSysConfig::log_sync`.
 

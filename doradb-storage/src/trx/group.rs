@@ -1,13 +1,11 @@
-use crate::file::SparseFile;
 use crate::id::TrxID;
 use crate::io::Completion;
 use crate::log::buf::LogBuf;
-use crate::log::{LogWriteSubmission, SyncGroup};
+use crate::log::{LogWriteSubmission, RedoGroupWriteMeta, RedoLogFile, SyncGroup};
 use crate::serde::Ser;
 use crate::trx::{FailedPrecommitReason, PrecommitTrx};
 use parking_lot::{Condvar, Mutex, MutexGuard, WaitTimeoutResult};
 use std::collections::VecDeque;
-use std::os::fd::RawFd;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -63,7 +61,7 @@ pub(crate) struct GroupCommit {
     // flag is the source of truth for rejecting new precommit handoffs.
     pub(crate) closed: Option<FailedPrecommitReason>,
     // Current log file.
-    pub(crate) log_file: Option<SparseFile>,
+    pub(crate) log_file: Option<RedoLogFile>,
 }
 
 impl GroupCommit {
@@ -77,7 +75,7 @@ impl GroupCommit {
 
 pub(crate) enum Commit {
     LogFileBoundary {
-        ended_log_file: Option<SparseFile>,
+        ended_log_file: Option<RedoLogFile>,
         header_write: LogWriteSubmission,
     },
     Group(CommitGroup),
@@ -101,8 +99,7 @@ pub(crate) struct CommitGroup {
 
 /// Serialized redo buffer and target file allocation for a durability group.
 pub(crate) struct CommitGroupLog {
-    pub(crate) fd: RawFd,
-    pub(crate) offset: usize,
+    pub(crate) write_meta: RedoGroupWriteMeta,
     pub(crate) log_buf: LogBuf,
 }
 
@@ -130,11 +127,17 @@ impl CommitGroup {
     pub(crate) fn join(&mut self, mut trx: PrecommitTrx, wait_sync: bool) -> CommitJoin {
         debug_assert!(self.max_cts < trx.cts);
         if let Some(redo_bin) = trx.take_log() {
-            self.log
+            let log = self
+                .log
                 .as_mut()
-                .expect("durability transaction cannot join a no-log group")
+                .expect("durability transaction cannot join a no-log group");
+            log.log_buf.append_trx_log(&redo_bin);
+            let (min_redo_cts, max_redo_cts) = log
                 .log_buf
-                .append_trx_log(&redo_bin);
+                .redo_cts_range()
+                .expect("redo-bearing group must track a CTS range");
+            log.write_meta.min_redo_cts = min_redo_cts;
+            log.write_meta.max_redo_cts = max_redo_cts;
         }
         self.max_cts = trx.cts;
         // Session completion ownership stays with the queued PrecommitTrx. The
@@ -146,32 +149,35 @@ impl CommitGroup {
 
     #[inline]
     pub(crate) fn into_sync_group(self) -> SyncGroup {
-        let (log_bytes, log_fd, write, finished) = match self.log {
+        let (log_bytes, log_fd, write_meta, write, finished) = match self.log {
             Some(log) => {
                 // Confirm data length in buffer header.
+                let write_meta = log.write_meta;
                 let buf = log.log_buf.finish();
                 // We always write a complete page instead of partial data.
                 let log_bytes = buf.capacity();
-                let log_fd = log.fd;
+                let log_fd = write_meta.fd;
                 (
                     log_bytes,
                     Some(log_fd),
+                    Some(write_meta),
                     Some(LogWriteSubmission::new(
                         self.max_cts,
                         log_fd,
-                        log.offset,
+                        write_meta.offset,
                         buf,
                     )),
                     false,
                 )
             }
-            None => (0, None, None, true),
+            None => (0, None, None, None, true),
         };
         SyncGroup {
             trx_list: self.trx_list,
             max_cts: self.max_cts,
             log_bytes,
             log_fd,
+            write_meta,
             write,
             returned_buf: None,
             completion: self.completion,
@@ -263,8 +269,14 @@ mod tests {
             trx_list: vec![precommit(cts)],
             max_cts: cts,
             log: Some(CommitGroupLog {
-                fd: 0,
-                offset: 0,
+                write_meta: RedoGroupWriteMeta {
+                    file_seq: 0,
+                    fd: 0,
+                    offset: 0,
+                    end_offset: log_buf.capacity(),
+                    min_redo_cts: cts,
+                    max_redo_cts: cts,
+                },
                 log_buf,
             }),
             completion: Arc::new(Completion::new()),

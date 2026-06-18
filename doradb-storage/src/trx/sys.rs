@@ -10,7 +10,7 @@ use crate::id::TrxID;
 use crate::io::Completion;
 use crate::log::redo::RedoLogs;
 use crate::log::replay::MmapLogReader;
-use crate::log::{FileProcessor, LogWriteDriver, RedoLog, parse_file_seq};
+use crate::log::{LogWriteDriver, RedoFileSealer, RedoLog, RedoLogWriter, parse_file_seq};
 use crate::quiescent::{QuiescentBox, QuiescentGuard, SyncQuiescentGuard};
 use crate::session::{SessionState, TrxAttachment};
 use crate::thread;
@@ -831,6 +831,7 @@ impl TransactionSystem {
         stats.log_bytes += redo_log.stats.log_bytes.load(Ordering::Relaxed);
         stats.sync_count += redo_log.stats.sync_count.load(Ordering::Relaxed);
         stats.sync_nanos += redo_log.stats.sync_nanos.load(Ordering::Relaxed);
+        stats.seal_failure_count += redo_log.stats.seal_failure_count.load(Ordering::Relaxed);
         let io_stats = redo_log.io_backend_stats();
         stats.io_submit_and_wait_count += io_stats.submit_and_wait_calls;
         stats.io_submit_and_wait_nanos += io_stats.submit_and_wait_nanos;
@@ -858,36 +859,42 @@ impl TransactionSystem {
     }
 
     #[inline]
-    fn file_processor<'a>(
+    fn redo_log_writer<'a>(
         &'a self,
         config: &TrxSysConfig,
         write_driver: &'a mut LogWriteDriver,
-    ) -> FileProcessor<'a> {
-        FileProcessor::new(self, config, write_driver)
+    ) -> RedoLogWriter<'a> {
+        RedoLogWriter::new(self, config, write_driver)
     }
 
     #[inline]
     pub(crate) fn log_loop(&self) {
         let redo_log = &*self.redo_log;
         let mut write_driver = redo_log.take_log_write_driver();
+        let mut sealer = RedoFileSealer::new(&self.config);
         loop {
-            let mut fp = self.file_processor(&self.config, &mut write_driver);
-            if let Some(ended_log_file) = fp.process_single_file() {
-                // Finished groups carry borrowed raw fds for sync. Keep the
-                // switched-out file alive until every old-file group is
-                // finalized.
-                fp.finish_pending_io_and_header_write();
+            let shutdown = {
+                let mut writer = self.redo_log_writer(&self.config, &mut write_driver);
+                if let Some(ended_log_file) = writer.process_single_file(&mut sealer) {
+                    // Finished groups carry borrowed raw fds for sync. Keep the
+                    // switched-out file alive until every old-file group is
+                    // finalized.
+                    writer.finish_pending_io_and_header_write(&mut sealer);
 
-                debug_assert!(!fp.has_pending_io());
+                    debug_assert!(!writer.has_pending_io());
 
-                // todo: update file header.
-                // this may include information which can speed up recovery.
-                // e.g. DDL start/end pages, min/max transaction CTS.
-
-                // Close file explicitly.
-                drop(ended_log_file);
-            }
-            if fp.shutdown() {
+                    if let Err(reason) = sealer.enqueue_rotated_file(ended_log_file) {
+                        let err = self.poison_storage(reason);
+                        writer.fail_pending(&mut sealer, err);
+                    }
+                }
+                writer.shutdown()
+            };
+            if shutdown {
+                let _ = sealer.finish_pending(self, &mut write_driver);
+                if self.storage_poison_error().is_none() {
+                    sealer.seal_active_file_best_effort(self, &mut write_driver);
+                }
                 return;
             }
         }
@@ -1041,6 +1048,7 @@ pub(crate) struct TrxSysStats {
     pub(crate) log_bytes: usize,
     pub(crate) sync_count: usize,
     pub(crate) sync_nanos: usize,
+    pub(crate) seal_failure_count: usize,
     /// Number of backend submit-or-wait calls observed by the log thread.
     ///
     /// On `libaio`, one logical IO commonly contributes separate submit and
