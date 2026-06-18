@@ -157,10 +157,52 @@ pub(crate) struct MmapLogReader {
     m: Mmap,
     /// Normal physical stride for redo groups in this file.
     log_block_size: usize,
-    /// Logical end offset declared by the selected super-block.
-    max_file_size: usize,
+    /// End offset for the current scan; sealed files stop at durable end.
+    scan_end_offset: usize,
+    /// Sealed range validation state, when the selected super-block is sealed.
+    sealed: Option<SealedReplayState>,
     /// Next group offset to read.
     offset: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SealedReplayState {
+    expected_range: Option<(TrxID, TrxID)>,
+    actual_min_cts: Option<TrxID>,
+    actual_max_cts: Option<TrxID>,
+}
+
+impl SealedReplayState {
+    #[inline]
+    fn new(expected_range: Option<(TrxID, TrxID)>) -> Self {
+        Self {
+            expected_range,
+            actual_min_cts: None,
+            actual_max_cts: None,
+        }
+    }
+
+    #[inline]
+    fn record_group(&mut self, header: RedoGroupHeader) {
+        self.actual_min_cts = Some(
+            self.actual_min_cts
+                .map_or(header.min_cts, |current| current.min(header.min_cts)),
+        );
+        self.actual_max_cts = Some(
+            self.actual_max_cts
+                .map_or(header.max_cts, |current| current.max(header.max_cts)),
+        );
+    }
+
+    #[inline]
+    fn actual_range(&self) -> Option<(TrxID, TrxID)> {
+        self.actual_min_cts.zip(self.actual_max_cts)
+    }
+
+    #[inline]
+    fn validate(self) -> bool {
+        self.actual_range() == self.expected_range
+    }
 }
 
 impl MmapLogReader {
@@ -181,10 +223,19 @@ impl MmapLogReader {
                 ))
                 .into());
         }
+        let (scan_end_offset, sealed) = if super_block.is_sealed() {
+            (
+                super_block.durable_end_offset as usize,
+                Some(SealedReplayState::new(super_block.sealed_redo_range())),
+            )
+        } else {
+            (super_block.file_max_size as usize, None)
+        };
         Ok(MmapLogReader {
             m,
             log_block_size: super_block.log_block_size as usize,
-            max_file_size: super_block.file_max_size as usize,
+            scan_end_offset,
+            sealed,
             offset: REDO_DEFAULT_DATA_START_OFFSET,
         })
     }
@@ -193,7 +244,12 @@ impl MmapLogReader {
     #[inline]
     fn bounded_read_end(&self, len: usize) -> Option<usize> {
         let end = self.offset.checked_add(len)?;
-        (end <= self.max_file_size).then_some(end)
+        (end <= self.scan_end_offset).then_some(end)
+    }
+
+    #[inline]
+    fn validate_sealed_end(&self) -> bool {
+        self.sealed.is_none_or(SealedReplayState::validate)
     }
 
     /// Read and validate one physical redo group.
@@ -203,7 +259,13 @@ impl MmapLogReader {
     /// corrupt or partially written group.
     #[inline]
     pub(crate) fn read(&mut self) -> ReadLog<'_> {
-        if self.offset >= self.max_file_size {
+        if self.offset >= self.scan_end_offset {
+            if !self.validate_sealed_end() {
+                return ReadLog::DataCorrupted;
+            }
+            if self.sealed.is_some() {
+                return ReadLog::DataEnd;
+            }
             return ReadLog::SizeLimit; // file is exhausted.
         }
         // Redo groups always start at sector-aligned offsets.
@@ -219,6 +281,9 @@ impl MmapLogReader {
         };
         debug_assert_eq!(idx, RedoGroupHeader::SIZE);
         if header.is_zero_eof() {
+            if self.sealed.is_some() {
+                return ReadLog::DataCorrupted;
+            }
             return ReadLog::DataEnd;
         }
         if header.validate().is_err() {
@@ -249,7 +314,13 @@ impl MmapLogReader {
         let Some(body) = buf.get(RedoGroupHeader::SIZE..body_end) else {
             return ReadLog::DataCorrupted;
         };
+        if let Some(sealed) = self.sealed.as_mut() {
+            sealed.record_group(header);
+        }
         self.offset += physical_len;
+        if self.offset == self.scan_end_offset && !self.validate_sealed_end() {
+            return ReadLog::DataCorrupted;
+        }
         ReadLog::Some(LogGroup::new(body, header.min_cts, header.max_cts))
     }
 }
@@ -281,7 +352,28 @@ mod tests {
         Ok(MmapLogReader {
             m,
             log_block_size,
-            max_file_size,
+            scan_end_offset: max_file_size,
+            sealed: None,
+            offset,
+        })
+    }
+
+    fn new_sealed_reader_at(
+        log_file_path: impl AsRef<Path>,
+        log_block_size: usize,
+        scan_end_offset: usize,
+        offset: usize,
+        expected_range: Option<(TrxID, TrxID)>,
+    ) -> Result<MmapLogReader> {
+        let file = File::open(log_file_path.as_ref())?;
+        // SAFETY: the file handle stays alive for the duration of mapping
+        // creation, and the returned `Mmap` owns the mapping afterward.
+        let m = unsafe { Mmap::map(&file)? };
+        Ok(MmapLogReader {
+            m,
+            log_block_size,
+            scan_end_offset,
+            sealed: Some(SealedReplayState::new(expected_range)),
             offset,
         })
     }
@@ -457,6 +549,102 @@ mod tests {
 
         assert!(group.try_next().unwrap().is_some());
         assert!(group.try_next().unwrap().is_none());
+    }
+
+    #[test]
+    fn test_sealed_reader_accepts_matching_group_range() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("test.log");
+        let log = simple_trx_log(TrxID::new(5));
+        let direct_buf = log_buf_with_header_range(&log, TrxID::new(4), TrxID::new(6));
+        write_log_file(&file_path, direct_buf.as_bytes());
+
+        let mut reader = new_sealed_reader_at(
+            file_path,
+            STORAGE_SECTOR_SIZE,
+            STORAGE_SECTOR_SIZE,
+            0,
+            Some((TrxID::new(4), TrxID::new(6))),
+        )
+        .unwrap();
+
+        let ReadLog::Some(mut group) = reader.read() else {
+            panic!("expected sealed group");
+        };
+        assert!(group.try_next().unwrap().is_some());
+        assert!(group.try_next().unwrap().is_none());
+        assert!(matches!(reader.read(), ReadLog::DataEnd));
+    }
+
+    #[test]
+    fn test_sealed_reader_accepts_empty_file_without_zero_eof() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("test.log");
+        write_log_file(&file_path, &vec![0u8; STORAGE_SECTOR_SIZE]);
+
+        let mut reader = new_sealed_reader_at(file_path, STORAGE_SECTOR_SIZE, 0, 0, None).unwrap();
+
+        assert!(matches!(reader.read(), ReadLog::DataEnd));
+    }
+
+    #[test]
+    fn test_sealed_reader_rejects_zero_eof_before_durable_end() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("test.log");
+        write_log_file(&file_path, &vec![0u8; STORAGE_SECTOR_SIZE]);
+
+        let mut reader = new_sealed_reader_at(
+            file_path,
+            STORAGE_SECTOR_SIZE,
+            STORAGE_SECTOR_SIZE,
+            0,
+            Some((TrxID::new(1), TrxID::new(1))),
+        )
+        .unwrap();
+
+        assert!(matches!(reader.read(), ReadLog::DataCorrupted));
+    }
+
+    #[test]
+    fn test_sealed_reader_rejects_group_crossing_durable_end() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("test.log");
+        let mut bytes = vec![0u8; STORAGE_SECTOR_SIZE * 2];
+        let header = RedoGroupHeader::new(STORAGE_SECTOR_SIZE, TrxID::new(1), TrxID::new(1));
+        header.ser(&mut bytes[..], 0);
+        RedoGroupHeader::patch_checksum(&mut bytes).unwrap();
+        write_log_file(&file_path, &bytes);
+
+        let mut reader = new_sealed_reader_at(
+            file_path,
+            STORAGE_SECTOR_SIZE,
+            STORAGE_SECTOR_SIZE,
+            0,
+            Some((TrxID::new(1), TrxID::new(1))),
+        )
+        .unwrap();
+
+        assert!(matches!(reader.read(), ReadLog::DataCorrupted));
+    }
+
+    #[test]
+    fn test_sealed_reader_rejects_mismatched_group_range() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("test.log");
+        let log = simple_trx_log(TrxID::new(5));
+        let direct_buf = log_buf_with_header_range(&log, TrxID::new(5), TrxID::new(5));
+        write_log_file(&file_path, direct_buf.as_bytes());
+
+        let mut reader = new_sealed_reader_at(
+            file_path,
+            STORAGE_SECTOR_SIZE,
+            STORAGE_SECTOR_SIZE,
+            0,
+            Some((TrxID::new(4), TrxID::new(6))),
+        )
+        .unwrap();
+
+        assert!(matches!(reader.read(), ReadLog::DataCorrupted));
     }
 
     #[test]

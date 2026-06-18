@@ -27,7 +27,7 @@ pub(crate) const REDO_DEFAULT_DATA_START_OFFSET: usize =
 pub(crate) const REDO_GROUP_HEADER_SIZE: usize = mem::size_of::<u32>() + mem::size_of::<u64>() * 3;
 /// Serialized size of redo metadata inside a super-block integrity envelope.
 pub(crate) const REDO_SUPER_BLOCK_PAYLOAD_SIZE: usize =
-    mem::size_of::<u32>() * 2 + mem::size_of::<u64>() * 3;
+    mem::size_of::<u32>() * 2 + mem::size_of::<u64>() * 6;
 
 /// Fixed prefix for one redo group.
 ///
@@ -227,21 +227,24 @@ impl Deser for RedoGroupHeader {
 /// | Bytes            | Field                         |
 /// |------------------|-------------------------------|
 /// | 0..16            | block-integrity header        |
-/// | 16..48           | redo super-block payload      |
-/// | 48..slot_size-32 | zero padding                  |
+/// | 16..72           | redo super-block payload      |
+/// | 72..slot_size-32 | zero padding                  |
 /// | slot_size-32..   | block-integrity BLAKE3 trailer |
 /// ```
 ///
 /// The redo payload is serialized at byte `16`:
 ///
 /// ```text
-/// | Payload bytes | Field          | Type | Encoding      |
-/// |---------------|----------------|------|---------------|
-/// | 0..4          | file_seq       | u32  | little-endian |
-/// | 4..8          | slot_no        | u32  | little-endian |
-/// | 8..16         | log_block_size | u64  | little-endian |
-/// | 16..24        | file_max_size  | u64  | little-endian |
-/// | 24..32        | generation     | u64  | little-endian |
+/// | Payload bytes | Field              | Type | Encoding      |
+/// |---------------|--------------------|------|---------------|
+/// | 0..4          | file_seq           | u32  | little-endian |
+/// | 4..8          | slot_no            | u32  | little-endian |
+/// | 8..16         | log_block_size     | u64  | little-endian |
+/// | 16..24        | file_max_size      | u64  | little-endian |
+/// | 24..32        | generation         | u64  | little-endian |
+/// | 32..40        | durable_end_offset | u64  | little-endian |
+/// | 40..48        | min_redo_cts       | u64  | little-endian |
+/// | 48..56        | max_redo_cts       | u64  | little-endian |
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RedoSuperBlock {
@@ -255,6 +258,12 @@ pub(crate) struct RedoSuperBlock {
     pub(crate) file_max_size: u64,
     /// Monotonic generation for choosing the newest valid super-block slot.
     pub(crate) generation: u64,
+    /// Offset immediately after the last durable redo group in a sealed file.
+    pub(crate) durable_end_offset: u64,
+    /// Lowest commit timestamp serialized into durable redo groups in this file.
+    pub(crate) min_redo_cts: u64,
+    /// Highest commit timestamp serialized into durable redo groups in this file.
+    pub(crate) max_redo_cts: u64,
 }
 
 impl RedoSuperBlock {
@@ -267,7 +276,63 @@ impl RedoSuperBlock {
             log_block_size: log_block_size as u64,
             file_max_size: file_max_size as u64,
             generation: 0,
+            durable_end_offset: 0,
+            min_redo_cts: 0,
+            max_redo_cts: 0,
         }
+    }
+
+    /// Return true when this super-block publishes sealed segment metadata.
+    #[inline]
+    pub(crate) fn is_sealed(&self) -> bool {
+        self.durable_end_offset != 0
+    }
+
+    /// Return true for a sealed file that contains no durable redo groups.
+    #[inline]
+    pub(crate) fn sealed_empty(&self) -> bool {
+        self.durable_end_offset == REDO_DEFAULT_DATA_START_OFFSET as u64
+            && self.min_redo_cts == 0
+            && self.max_redo_cts == 0
+    }
+
+    /// Return the sealed redo CTS range for a non-empty sealed file.
+    #[inline]
+    pub(crate) fn sealed_redo_range(&self) -> Option<(TrxID, TrxID)> {
+        (self.is_sealed() && !self.sealed_empty())
+            .then(|| (TrxID::new(self.min_redo_cts), TrxID::new(self.max_redo_cts)))
+    }
+
+    /// Build a sealed super-block for the inactive slot of an open file.
+    #[inline]
+    pub(crate) fn sealed_from_open(
+        open: &RedoSuperBlock,
+        slot_no: u32,
+        durable_end_offset: usize,
+        redo_range: Option<(TrxID, TrxID)>,
+    ) -> Result<Self> {
+        let generation = open.generation.checked_add(1).ok_or_else(|| {
+            Error::from(
+                Report::new(DataIntegrityError::InvalidPayload)
+                    .attach("block=redo-super-block, generation overflow while sealing"),
+            )
+        })?;
+        let (min_redo_cts, max_redo_cts) = match redo_range {
+            Some((min_redo_cts, max_redo_cts)) => (min_redo_cts.as_u64(), max_redo_cts.as_u64()),
+            None => (0, 0),
+        };
+        let sealed = RedoSuperBlock {
+            file_seq: open.file_seq,
+            slot_no,
+            log_block_size: open.log_block_size,
+            file_max_size: open.file_max_size,
+            generation,
+            durable_end_offset: durable_end_offset as u64,
+            min_redo_cts,
+            max_redo_cts,
+        };
+        validate_super_block_fields(&sealed, sealed.file_seq, slot_no)?;
+        Ok(sealed)
     }
 }
 
@@ -279,6 +344,9 @@ impl Ser<'_> for RedoSuperBlock {
             + mem::size_of::<u64>()
             + mem::size_of::<u64>()
             + mem::size_of::<u64>()
+            + mem::size_of::<u64>()
+            + mem::size_of::<u64>()
+            + mem::size_of::<u64>()
     }
 
     #[inline]
@@ -287,7 +355,10 @@ impl Ser<'_> for RedoSuperBlock {
         let idx = out.ser_u32(idx, self.slot_no);
         let idx = out.ser_u64(idx, self.log_block_size);
         let idx = out.ser_u64(idx, self.file_max_size);
-        out.ser_u64(idx, self.generation)
+        let idx = out.ser_u64(idx, self.generation);
+        let idx = out.ser_u64(idx, self.durable_end_offset);
+        let idx = out.ser_u64(idx, self.min_redo_cts);
+        out.ser_u64(idx, self.max_redo_cts)
     }
 }
 
@@ -301,6 +372,9 @@ impl Deser for RedoSuperBlock {
         let (idx, log_block_size) = input.deser_u64(idx)?;
         let (idx, file_max_size) = input.deser_u64(idx)?;
         let (idx, generation) = input.deser_u64(idx)?;
+        let (idx, durable_end_offset) = input.deser_u64(idx)?;
+        let (idx, min_redo_cts) = input.deser_u64(idx)?;
+        let (idx, max_redo_cts) = input.deser_u64(idx)?;
         Ok((
             idx,
             RedoSuperBlock {
@@ -309,6 +383,9 @@ impl Deser for RedoSuperBlock {
                 log_block_size,
                 file_max_size,
                 generation,
+                durable_end_offset,
+                min_redo_cts,
+                max_redo_cts,
             },
         ))
     }
@@ -475,7 +552,40 @@ fn validate_super_block_fields(
             ))
             .into());
     }
+    validate_sealed_segment_fields(super_block)?;
     Ok(())
+}
+
+/// Validate durable segment metadata combinations.
+#[inline]
+fn validate_sealed_segment_fields(super_block: &RedoSuperBlock) -> Result<()> {
+    let durable_end_offset = super_block.durable_end_offset;
+    let min_redo_cts = super_block.min_redo_cts;
+    let max_redo_cts = super_block.max_redo_cts;
+    if durable_end_offset == 0 && min_redo_cts == 0 && max_redo_cts == 0 {
+        return Ok(());
+    }
+    if durable_end_offset == REDO_DEFAULT_DATA_START_OFFSET as u64
+        && min_redo_cts == 0
+        && max_redo_cts == 0
+    {
+        return Ok(());
+    }
+    let file_max_size = super_block.file_max_size;
+    if durable_end_offset > REDO_DEFAULT_DATA_START_OFFSET as u64
+        && durable_end_offset <= file_max_size
+        && durable_end_offset <= usize::MAX as u64
+        && (durable_end_offset as usize).is_multiple_of(STORAGE_SECTOR_SIZE)
+        && min_redo_cts > 0
+        && min_redo_cts <= max_redo_cts
+    {
+        return Ok(());
+    }
+    Err(Report::new(DataIntegrityError::InvalidPayload)
+        .attach(format!(
+            "block=redo-super-block, invalid sealed fields: durable_end_offset={durable_end_offset}, min_redo_cts={min_redo_cts}, max_redo_cts={max_redo_cts}, file_max_size={file_max_size}"
+        ))
+        .into())
 }
 
 /// Return true when a persisted size is usable for direct I/O.
@@ -621,6 +731,9 @@ mod tests {
             &(STORAGE_SECTOR_SIZE as u64 * 8).to_le_bytes()
         );
         assert_eq!(&buf[40..48], &0u64.to_le_bytes());
+        assert_eq!(&buf[48..56], &0u64.to_le_bytes());
+        assert_eq!(&buf[56..64], &0u64.to_le_bytes());
+        assert_eq!(&buf[64..72], &0u64.to_le_bytes());
         assert_eq!(
             checksum_offset(REDO_SUPER_BLOCK_SLOT_SIZE),
             REDO_SUPER_BLOCK_SLOT_SIZE - BLOCK_INTEGRITY_TRAILER_SIZE
@@ -712,6 +825,92 @@ mod tests {
             let err = parse_redo_super_block(&buf, 7, 0).unwrap_err();
             assert_integrity_error(err, expected);
             let _ = name;
+        }
+    }
+
+    #[test]
+    fn redo_super_block_accepts_valid_sealed_encodings() {
+        let open = valid_super_block(0, 0);
+
+        assert!(!open.is_sealed());
+        assert!(!open.sealed_empty());
+        assert_eq!(open.sealed_redo_range(), None);
+
+        let empty =
+            RedoSuperBlock::sealed_from_open(&open, 1, REDO_DEFAULT_DATA_START_OFFSET, None)
+                .unwrap();
+        assert!(empty.is_sealed());
+        assert!(empty.sealed_empty());
+        assert_eq!(empty.sealed_redo_range(), None);
+        assert_eq!(empty.generation, 1);
+        assert_eq!(empty.slot_no, 1);
+
+        let non_empty = RedoSuperBlock::sealed_from_open(
+            &open,
+            1,
+            REDO_DEFAULT_DATA_START_OFFSET + STORAGE_SECTOR_SIZE,
+            Some((TrxID::new(5), TrxID::new(9))),
+        )
+        .unwrap();
+        assert!(non_empty.is_sealed());
+        assert!(!non_empty.sealed_empty());
+        assert_eq!(
+            non_empty.sealed_redo_range(),
+            Some((TrxID::new(5), TrxID::new(9)))
+        );
+    }
+
+    #[test]
+    fn redo_super_block_rejects_invalid_sealed_field_combinations() {
+        let open = valid_super_block(0, 0);
+        let cases = [
+            RedoSuperBlock {
+                durable_end_offset: 0,
+                min_redo_cts: 1,
+                max_redo_cts: 1,
+                ..open.clone()
+            },
+            RedoSuperBlock {
+                durable_end_offset: REDO_DEFAULT_DATA_START_OFFSET as u64,
+                min_redo_cts: 1,
+                max_redo_cts: 1,
+                ..open.clone()
+            },
+            RedoSuperBlock {
+                durable_end_offset: (REDO_DEFAULT_DATA_START_OFFSET + STORAGE_SECTOR_SIZE) as u64,
+                min_redo_cts: 0,
+                max_redo_cts: 1,
+                ..open.clone()
+            },
+            RedoSuperBlock {
+                durable_end_offset: (REDO_DEFAULT_DATA_START_OFFSET + STORAGE_SECTOR_SIZE) as u64,
+                min_redo_cts: 2,
+                max_redo_cts: 1,
+                ..open.clone()
+            },
+            RedoSuperBlock {
+                durable_end_offset: (REDO_DEFAULT_DATA_START_OFFSET + 1) as u64,
+                min_redo_cts: 1,
+                max_redo_cts: 1,
+                ..open.clone()
+            },
+            RedoSuperBlock {
+                durable_end_offset: REDO_DEFAULT_DATA_START_OFFSET as u64 - 1,
+                min_redo_cts: 1,
+                max_redo_cts: 1,
+                ..open.clone()
+            },
+            RedoSuperBlock {
+                durable_end_offset: open.file_max_size + STORAGE_SECTOR_SIZE as u64,
+                min_redo_cts: 1,
+                max_redo_cts: 1,
+                ..open
+            },
+        ];
+
+        for super_block in cases {
+            let err = validate_super_block_fields(&super_block, 7, 0).unwrap_err();
+            assert_integrity_error(err, DataIntegrityError::InvalidPayload);
         }
     }
 
