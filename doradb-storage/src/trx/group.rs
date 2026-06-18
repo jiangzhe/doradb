@@ -1,7 +1,7 @@
 use crate::file::SparseFile;
 use crate::id::TrxID;
 use crate::io::Completion;
-use crate::log::log_replay::LogBuf;
+use crate::log::buf::LogBuf;
 use crate::log::{LogWriteSubmission, SyncGroup};
 use crate::serde::Ser;
 use crate::trx::{FailedPrecommitReason, PrecommitTrx};
@@ -134,7 +134,7 @@ impl CommitGroup {
                 .as_mut()
                 .expect("durability transaction cannot join a no-log group")
                 .log_buf
-                .ser(&redo_bin);
+                .append_trx_log(&redo_bin);
         }
         self.max_cts = trx.cts;
         // Session completion ownership stays with the queued PrecommitTrx. The
@@ -187,7 +187,7 @@ mod tests {
     use crate::buffer::test_page_id;
     use crate::id::{RowID, TableID};
     use crate::io::Completion;
-    use crate::log::log_replay::TrxLog;
+    use crate::log::buf::TrxLog;
     use crate::log::redo::{RedoHeader, RedoLogs, RedoTrxKind, RowRedo, RowRedoKind, TableDML};
     use crate::value::Val;
     use std::collections::BTreeMap;
@@ -287,7 +287,7 @@ mod tests {
     #[test]
     fn test_commit_group_join_without_sync_listener() {
         let mut log_buf = LogBuf::new(64);
-        log_buf.ser(&redo_bin(TrxID::new(1)));
+        log_buf.append_trx_log(&redo_bin(TrxID::new(1)));
         let mut group = log_group(TrxID::new(1), log_buf);
 
         let listener = group.join(precommit(TrxID::new(2)), false);
@@ -302,7 +302,7 @@ mod tests {
     #[test]
     fn test_commit_group_can_join_respects_capacity() {
         let mut log_buf = LogBuf::new(64);
-        log_buf.ser(&redo_bin(TrxID::new(100)));
+        log_buf.append_trx_log(&redo_bin(TrxID::new(100)));
         let mut group = log_group(TrxID::new(1), log_buf);
 
         let candidate1 = precommit_large(TrxID::new(2));
@@ -338,7 +338,7 @@ mod tests {
     #[test]
     fn test_commit_group_log_group_accepts_no_log_transaction() {
         let mut log_buf = LogBuf::new(64);
-        log_buf.ser(&redo_bin(TrxID::new(10)));
+        log_buf.append_trx_log(&redo_bin(TrxID::new(10)));
         let mut group = log_group(TrxID::new(10), log_buf);
 
         assert!(group.require_durability());

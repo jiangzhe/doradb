@@ -62,14 +62,14 @@ Issue Labels:
 
 ### Code References
 
-- [C1] `doradb-storage/src/trx/log.rs` - `LOG_HEADER_PAGES` reserves header
-  space; file creation currently only allocates that space.
-- [C2] `doradb-storage/src/trx/log_replay.rs` - `MmapLogReader` reads a
-  length-prefixed physical group and advances by configured page size or
-  aligned large-group length.
+- [C1] `doradb-storage/src/log/mod.rs` - redo file creation reserves the
+  super-block area before data groups.
+- [C2] `doradb-storage/src/log/replay.rs` - `MmapLogReader` reads a checksummed
+  physical group and advances by configured page size or aligned large-group
+  length.
 - [C3] `doradb-storage/src/trx/group.rs` - `CommitGroup` maps one serialized
   redo buffer to one `SyncGroup` and one `LogWriteSubmission`.
-- [C4] `doradb-storage/src/trx/log.rs` - `RedoLog::new_buf`,
+- [C4] `doradb-storage/src/log/mod.rs` - `RedoLog::new_buf`,
   `create_new_group`, and `submit_io` preserve the current one-group one-write
   scheduling model.
 - [C5] `doradb-storage/src/serde.rs` - `LenPrefixPod` stores a length but does
@@ -105,16 +105,16 @@ Issue Labels:
 - [U5] User approved deferring log truncation.
 - [U6] User approved drafting this path-preserving RFC direction.
 - [U7] User identified that the two currently reserved redo header pages can be
-  used as A/B header blocks, similar to table-file super-block publication,
+  used as A/B super-block slots, similar to table-file super-block publication,
   when sealing an ended log file.
 - [U8] User questioned whether configurable block size conflicts with A/B
-  header slots and suggested renaming `max_io_size` to `log_block_size` for
+  super-block slots and suggested renaming `max_io_size` to `log_block_size` for
   clearer semantics.
 - [U9] User clarified that legacy redo-format compatibility is not required and
   the implementation should not keep old-format reader code.
-- [U10] User selected `crc32fast` CRC32 for group checksums, table-file-style
-  A/B header/footer redundancy for redo super-block slots, and best-effort
-  clean-shutdown sealing.
+- [U10] User selected `crc32fast` CRC32 for group checksums, A/B redo
+  super-block slots using the standard `file/block_integrity.rs` envelope, and
+  best-effort clean-shutdown sealing.
 
 ### Source Backlogs
 
@@ -149,9 +149,14 @@ This keeps A/B header-slot discovery independent of `log_block_size`. The
 selected valid header carries `log_block_size`; replay uses the stored block
 size plus fixed `REDO_DEFAULT_DATA_START_OFFSET` for group scanning. The default
 v2 data start should be `2 * STORAGE_SECTOR_SIZE` unless a later implementation
-task identifies a reason to reserve additional fixed header space. This is
-intentionally similar to table-file A/B super-block publication in protocol, not
-in physical slot
+task identifies a reason to reserve additional fixed header space. The effective
+redo file max size is normalized to that fixed data start plus a whole number of
+`log_block_size` groups before file creation and super-block persistence.
+Existing files remain self-describing after configuration changes: replay uses
+the persisted `log_block_size` and effective file max size from each selected
+super-block, while newly created files use the latest normalized configuration.
+This is intentionally similar to table-file A/B super-block publication in
+protocol, not in physical slot
 size: table-file super-block slots are currently 32KB because table files use
 64KB pages. [D5], [C1], [C2], [C9], [C10], [U7], [U8]
 
@@ -168,17 +173,16 @@ when the file is created, then publish the inactive slot with a higher
 generation, sealed durable end offset, redo min CTS, redo max CTS, and checksum
 after the log thread has drained and synced all groups for that file. Recovery
 selects the newest valid slot by generation/checksum and falls back to the older
-valid slot if the newer slot is torn. Each slot must include at least magic,
-format version, file sequence, header slot number, log block size, file max
-size, generation, durable end offset, redo min CTS, and redo max CTS. Mirror the
-table-file super-block
-structure at the protocol level by using a header/body/footer layout where the
-footer carries a BLAKE3 checksum over the slot bytes before the footer and
-repeats the generation or sealed max CTS needed to detect torn writes. [D2],
-[D5], [C1], [C4], [C9], [C10], [U1], [U2], [U7], [U8], [U10]
+valid slot if the newer slot is torn. Each slot must use the standard
+`file/block_integrity.rs` envelope: magic/version in the shared integrity
+header, redo metadata payload after that header, zero padding, and the BLAKE3
+checksum in the final 32-byte trailer. The payload must include at least file
+sequence, slot number, log block size, file max size, generation, durable end
+offset, redo min CTS, and redo max CTS. [D2], [D5], [C1], [C4], [C9], [C10],
+[U1], [U2], [U7], [U8], [U10]
 
 Do not support legacy v1 redo recovery. A discovered redo file without a valid
-v2 magic/header slot is invalid, including all-zero reserved-header files from
+v2 super-block slot is invalid, including all-zero reserved-header files from
 the old format. Startup may proceed only when no redo files exist or when all
 discovered redo files are valid v2 files. [D2], [C1], [C2], [U9]
 
@@ -190,13 +194,15 @@ volatile after restart. Recovery may use a sealed file's max redo CTS to seed
 CTS values. [D3], [D4], [C3], [C6]
 
 Add group-level integrity metadata without changing the one-group one-write
-model. A v2 physical group should retain a first `u64` body-length field so
-the reader can keep the current stride model, then store fixed group metadata
-such as group header length, flags, checksum kind, checksum value, redo min/max
-CTS, and optional transaction count before the packed `TrxLog` bytes. Use the
-`crc32fast` crate for group checksums. A zero body length remains logical EOF.
-The checksum must cover the group metadata with the checksum field zeroed plus
-the serialized transaction bytes, not the zero padding. [D2], [C2], [C3],
+model. The current v2 physical group starts with exactly one fixed 28-byte
+`RedoGroupHeader`: `u32 checksum`, `u64 body_len`, `u64 min_cts`, and
+`u64 max_cts`. `body_len` covers only serialized `TrxLog` body bytes and
+excludes both the header and zero padding. Use the `crc32fast` crate for group
+checksums and compute CRC32 over bytes `4..physical_write_len`, including the
+header fields after the checksum, all transaction body bytes, and zero padding.
+An all-zero group header is the sparse-file EOF sentinel; a nonzero header with
+`body_len == 0` is invalid. Do not add group magic, version, flags, checksum
+kind, optional metadata, or a transaction count in this phase. [D2], [C2], [C3],
 [C11], [U2], [U3], [U10]
 
 Treat clean-shutdown sealing as best effort. Runtime commit durability remains
@@ -295,49 +301,57 @@ the unsafe boundary local to reader construction. [C2], [B2]
 ## Implementation Phases
 
 - **Phase 1: V2 Redo Super Blocks**
-  - Scope: Define `RedoFileHeader`, rename `max_io_size` to
-    `log_block_size`, write an initial header into one fixed 4KB redo super-block
-    slot on new files, parse the two A/B header slots during discovery/recovery,
-    record `log_block_size`, and reject files without a
-    valid v2 header slot.
-  - Goals: Validate magic/version/sequence/header slot number/log block
-    size/file max size/generation;
-    reject legacy zero-header and unknown non-v2 redo files; create only v2
-    files; select the newest valid header slot and tolerate a torn inactive-slot
-    write.
+  - Scope: Define `RedoSuperBlock`, rename `max_io_size` to `log_block_size`,
+    write an initial metadata payload inside one fixed 4KB redo super-block slot
+    on new files, parse the two A/B super-block slots during discovery/recovery,
+    record `log_block_size`, and reject files without a valid v2 super-block
+    slot.
+  - Goals: Validate magic/version through the shared block-integrity header,
+    validate sequence/slot number/log block size/file max size/generation from
+    the redo payload, reject legacy zero-header and unknown non-v2 redo files,
+    create only v2 files, select the newest valid super-block slot, and tolerate
+    a torn inactive-slot write.
   - Non-goals: Group checksum, record framing changes, file skipping, and file
     deletion.
   - Prerequisites: Existing redo directories must be empty or already v2; old
     zero-header files are intentionally rejected.
-  - Phase-local Choices: Resolved by using `RedoFileHeader` in
-    `doradb-storage/src/log/redo_format.rs` with fixed 4KB slots, footer
-    redundancy, BLAKE3 checksum validation, and async super-block writes through
-    the redo log thread's write driver.
+  - Phase-local Choices: Resolved by using `RedoSuperBlock` in
+    `doradb-storage/src/log/format.rs` with fixed 4KB slots, the standard
+    block-integrity BLAKE3 trailer, and async super-block writes through the
+    redo log thread's write driver.
   - Task Doc: `docs/tasks/000178-redo-log-super-blocks.md`
   - Task Issue: `#710`
   - Phase Status: done
-  - Implementation Summary: Implemented v2 redo super-block baseline with top-level log module, fixed A/B redo headers, async initial header writes, validated replay/checkpoint scanning, log_block_size/io_depth rename, logical file-size replay bounds, and related docs/tests cleanup. [Task Resolve Sync: docs/tasks/000178-redo-log-super-blocks.md @ 2026-06-16]
+  - Implementation Summary: Implemented v2 redo super-block baseline with top-level log module, fixed A/B redo super-block slots, async initial super-block writes, validated replay/checkpoint scanning, log_block_size/io_depth rename, logical file-size replay bounds, and related docs/tests cleanup. [Task Resolve Sync: docs/tasks/000178-redo-log-super-blocks.md @ 2026-06-16]
 
 - **Phase 2: Group Checksum and Strict Record Framing**
-  - Scope: Add the v2 group metadata area after the existing first length
-    field, add `crc32fast` to dependencies, compute and verify group checksums,
-    enforce exact `TrxLog` length-prefix boundaries, and bound redo collection
-    decoding.
+  - Scope: Replace the old physical group length prefix with the exact 28-byte
+    `RedoGroupHeader`, add `crc32fast` to dependencies, compute and verify
+    group checksums over bytes `4..physical_write_len` including zero padding,
+    enforce exact `TrxLog` length-prefix boundaries, validate group CTS ranges,
+    and bound redo collection decoding.
   - Goals: Detect corrupted payloads, torn/stale group bodies, malformed
     transaction lengths, bad op codes, and oversized decoded collection counts.
   - Non-goals: Changing commit grouping, splitting large transactions, or
-    changing sync batching.
+    changing sync batching. Also no group transaction count, group magic,
+    group version, flags, checksum-kind field, optional group metadata, or
+    legacy group reader.
   - Prerequisites: Phase 1 v2 header parsing and `log_block_size` rename exist.
-  - Phase-local Choices: Whether group CTS range and transaction count are
-    mandatory in every group header or optional flags for future expansion.
-  - Task Doc: `docs/tasks/TBD.md`
-  - Task Issue: `#0`
-  - Phase Status: `pending`
-  - Implementation Summary: `pending`
+  - Phase-local Choices: Resolved by using fixed fields
+    `checksum/body_len/min_cts/max_cts`, no transaction count, no optional
+    metadata, CRC32 via `crc32fast`, all-zero header as EOF, and checksum
+    coverage over header bytes after checksum, body bytes, and padding.
+  - Task Doc: `docs/tasks/000179-redo-group-checksum-and-strict-framing.md`
+  - Task Issue: `#712`
+  - Phase Status: done
+  - Implementation Summary: Implemented the exact 28-byte group header,
+    checksum-first mmap validation, strict `TrxLog` frames, group CTS range
+    validation, persisted-config replay/new-file layout handling, and
+    `MIN_BYTES_HINT`-backed bounded collection deserialization. [Task Resolve Sync: docs/tasks/000179-redo-group-checksum-and-strict-framing.md @ 2026-06-18]
 
 - **Phase 3: Sealed Segment Ranges**
   - Scope: Track real redo min/max CTS per active file, write the inactive A/B
-    header slot with sealed metadata after rotation or clean shutdown once
+    super-block slot with sealed metadata after rotation or clean shutdown once
     pending groups are drained, and validate sealed ranges during recovery.
   - Goals: Make v2 file headers useful as durable segment metadata without
     depending on volatile ordered no-log CTS values.
@@ -376,8 +390,8 @@ the unsafe boundary local to reader construction. [C2], [B2]
     tested.
   - Non-goals: Benchmarking sync batching or implementing truncation.
   - Prerequisites: Phases 1 through 4 define the final v2 behavior.
-  - Phase-local Choices: Final test split across `log/mod.rs`,
-    `log/log_replay.rs`, `log/recover.rs`, and catalog/table recovery tests.
+  - Phase-local Choices: Final test split across `log/buf.rs`, `log/mod.rs`,
+    `log/replay.rs`, `log/recover.rs`, and catalog/table recovery tests.
   - Task Doc: `docs/tasks/TBD.md`
   - Task Issue: `#0`
   - Phase Status: `pending`
@@ -409,7 +423,7 @@ the unsafe boundary local to reader construction. [C2], [B2]
   requires either no redo files or valid v2 redo files.
 - Header sealing introduces additional metadata writes around rotation and
   clean shutdown.
-- A/B header slot selection adds another publication protocol that must be
+- A/B super-block slot selection adds another publication protocol that must be
   tested for torn writes and stale slots.
 - `crc32fast` becomes a new dependency of `doradb-storage`.
 - Recovery skip only works for sealed v2 files; active crash files still
@@ -421,10 +435,10 @@ the unsafe boundary local to reader construction. [C2], [B2]
 
 ## Open Questions
 
-- Should v2 group metadata require a transaction count to harden group parsing,
-  or is exact byte exhaustion enough after `trx_data_len` enforcement?
-- Should bounded collection decoding be implemented in generic serde helpers or
-  as redo-specific bounded parsers?
+No Phase 2 group-format questions remain open. The implemented direction uses
+exact body exhaustion after authoritative `trx_data_len` frames, stores no
+transaction count, and hardens generic `Vec`/`BTreeMap` deserialization so redo
+payload parsing remains on the existing serde path.
 
 ## Future Work
 

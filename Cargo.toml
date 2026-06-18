@@ -28,6 +28,7 @@ memmap2 = "0.9"
 futures = "0.3"
 scopeguard = "1.2"
 blake3 = "1.8"
+crc32fast = "1.4"
 ordered-float = { version = "5.1", features = ["serde"] }
 dashmap = "6.2"
 io-uring = "0.7"

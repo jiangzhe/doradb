@@ -1,7 +1,7 @@
 use crate::error::{DataIntegrityError, Error, Result};
 use crate::id::{PageID, RowID, TableID, TrxID};
 use crate::row::ops::{SelectKey, UpdateCol};
-use crate::serde::{Deser, Ser, Serde};
+use crate::serde::{Deser, MinBytesHint, Ser, Serde, min_bytes_hint};
 use crate::value::Val;
 use error_stack::Report;
 use std::collections::BTreeMap;
@@ -88,6 +88,8 @@ impl Ser<'_> for RowRedoKind {
 }
 
 impl Deser for RowRedoKind {
+    const MIN_BYTES_HINT: MinBytesHint = min_bytes_hint(mem::size_of::<u8>());
+
     #[inline]
     fn deser<S: Serde + ?Sized>(input: &S, start_idx: usize) -> Result<(usize, Self)> {
         let (idx, code) = input.deser_u8(start_idx)?;
@@ -139,6 +141,9 @@ impl Ser<'_> for RowRedo {
 }
 
 impl Deser for RowRedo {
+    const MIN_BYTES_HINT: MinBytesHint =
+        min_bytes_hint(mem::size_of::<PageID>() + mem::size_of::<RowID>() + mem::size_of::<u8>());
+
     #[inline]
     fn deser<S: Serde + ?Sized>(input: &S, start_idx: usize) -> Result<(usize, Self)> {
         let (idx, page_id) = input.deser_u64(start_idx)?;
@@ -292,6 +297,9 @@ impl Ser<'_> for DDLRedo {
 }
 
 impl Deser for DDLRedo {
+    const MIN_BYTES_HINT: MinBytesHint =
+        min_bytes_hint(mem::size_of::<u8>() + mem::size_of::<TableID>());
+
     #[inline]
     fn deser<S: Serde + ?Sized>(input: &S, start_idx: usize) -> Result<(usize, Self)> {
         let (idx, code) = input.deser_u8(start_idx)?;
@@ -429,6 +437,9 @@ impl Ser<'_> for RedoLogs {
 }
 
 impl Deser for RedoLogs {
+    const MIN_BYTES_HINT: MinBytesHint =
+        min_bytes_hint(mem::size_of::<u8>() + mem::size_of::<u64>());
+
     #[inline]
     fn deser<S: Serde + ?Sized>(input: &S, start_idx: usize) -> Result<(usize, Self)> {
         let (idx, ddl) = Option::<Box<DDLRedo>>::deser(input, start_idx)?;
@@ -479,6 +490,9 @@ impl Ser<'_> for RedoHeader {
 }
 
 impl Deser for RedoHeader {
+    const MIN_BYTES_HINT: MinBytesHint =
+        min_bytes_hint(mem::size_of::<TrxID>() + mem::size_of::<u8>());
+
     #[inline]
     fn deser<S: Serde + ?Sized>(input: &S, start_idx: usize) -> Result<(usize, Self)> {
         let (idx, cts) = TrxID::deser(input, start_idx)?;
@@ -596,6 +610,8 @@ impl Ser<'_> for TableDML {
 }
 
 impl Deser for TableDML {
+    const MIN_BYTES_HINT: MinBytesHint = min_bytes_hint(mem::size_of::<u64>());
+
     #[inline]
     fn deser<S: Serde + ?Sized>(data: &S, start_idx: usize) -> Result<(usize, Self)> {
         let (idx, rows) = BTreeMap::<RowID, RowRedo>::deser(data, start_idx)?;

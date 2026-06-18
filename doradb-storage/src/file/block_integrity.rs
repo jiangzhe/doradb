@@ -1,5 +1,5 @@
 use crate::error::{DataIntegrityError, DataIntegrityResult, Result};
-use crate::serde::{Deser, Ser, Serde};
+use crate::serde::{Deser, MinBytesHint, Ser, Serde, min_bytes_hint};
 use error_stack::{Report, ensure};
 use std::mem;
 use zerocopy_derive::{FromBytes, Immutable, IntoBytes, KnownLayout};
@@ -60,6 +60,8 @@ impl Ser<'_> for BlockIntegrityHeader {
 }
 
 impl Deser for BlockIntegrityHeader {
+    const MIN_BYTES_HINT: MinBytesHint = min_bytes_hint(BLOCK_INTEGRITY_HEADER_SIZE);
+
     #[inline]
     fn deser<S: Serde + ?Sized>(input: &S, start_idx: usize) -> Result<(usize, Self)> {
         let (idx, magic_word) = input.deser_byte_array::<8>(start_idx)?;
@@ -94,6 +96,8 @@ impl Ser<'_> for BlockIntegrityTrailer {
 }
 
 impl Deser for BlockIntegrityTrailer {
+    const MIN_BYTES_HINT: MinBytesHint = min_bytes_hint(BLOCK_INTEGRITY_TRAILER_SIZE);
+
     #[inline]
     fn deser<S: Serde + ?Sized>(input: &S, start_idx: usize) -> Result<(usize, Self)> {
         let (idx, b3sum) = input.deser_byte_array::<32>(start_idx)?;

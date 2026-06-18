@@ -1200,8 +1200,8 @@ mod tests {
     use crate::id::{TableID, TrxID};
     use crate::latch::LatchFallbackMode;
     use crate::log::discover_redo_log_files;
-    use crate::log::log_replay::ReadLog;
     use crate::log::redo::DDLRedo;
+    use crate::log::replay::ReadLog;
     use crate::quiescent::{QuiescentBox, QuiescentGuard};
     use crate::value::ValKind;
     use semistr::SemiStr;

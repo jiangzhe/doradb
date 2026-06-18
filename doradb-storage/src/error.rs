@@ -77,6 +77,8 @@ pub(crate) enum ConfigError {
     StorageLayoutMismatch,
     #[error("invalid io depth")]
     InvalidIoDepth,
+    #[error("invalid log file max size")]
+    InvalidLogFileMaxSize,
     #[error("invalid log sync")]
     InvalidLogSync,
     #[error("invalid latch fallback mode")]

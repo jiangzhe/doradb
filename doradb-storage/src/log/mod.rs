@@ -1,7 +1,8 @@
-pub(crate) mod log_replay;
+pub(crate) mod buf;
+pub(crate) mod format;
 pub(crate) mod recover;
 pub(crate) mod redo;
-pub(crate) mod redo_format;
+pub(crate) mod replay;
 
 use crate::conf::TrxSysConfig;
 use crate::error::{
@@ -15,11 +16,12 @@ use crate::io::{
     Completion, DirectBuf, IOBackendStats, IOBackendStatsHandle, IOBuf, IOSubmission, Operation,
     StorageBackend, SubmissionDriver,
 };
-use crate::log::log_replay::{LogBuf, MmapLogReader, RedoLogStream, TrxLog};
-use crate::log::redo_format::{
-    REDO_DEFAULT_DATA_START_OFFSET, REDO_SUPER_BLOCK_SLOT_SIZE, RedoFileHeader,
+use crate::log::buf::{LogBuf, TrxLog};
+use crate::log::format::{
+    REDO_DEFAULT_DATA_START_OFFSET, REDO_SUPER_BLOCK_SLOT_SIZE, RedoSuperBlock,
     serialize_redo_super_block,
 };
+use crate::log::replay::{MmapLogReader, RedoLogStream};
 use crate::map::FastHashMap;
 use crate::serde::Ser;
 use crate::trx::MIN_SNAPSHOT_TS;
@@ -329,18 +331,19 @@ impl RedoLog {
     fn new_buf(&self, data: TrxLog) -> LogBuf {
         let ser_len = data.ser_len();
         let buf_len = LogBuf::actual_len(ser_len);
-        if ser_len > self.log_block_size {
-            // data is longer than single page, we need to
+        if buf_len > self.log_block_size {
+            // Data is longer than a normal group, so allocate a large
+            // sector-aligned direct buffer for this single transaction.
             let mut buf = LogBuf::new(buf_len);
-            buf.ser(&data);
+            buf.append_trx_log(&data);
             return buf;
         }
         if let Some(mut buf) = self.try_buf_in_free_list(ser_len) {
-            buf.ser(&data);
+            buf.append_trx_log(&data);
             return buf;
         }
-        let mut buf = LogBuf::new(buf_len);
-        buf.ser(&data);
+        let mut buf = LogBuf::new(self.log_block_size);
+        buf.append_trx_log(&data);
         buf
     }
 
@@ -1154,9 +1157,9 @@ fn prepare_initial_redo_super_block(
     log_block_size: usize,
     file_max_size: usize,
 ) -> Result<(LogWriteSubmission, Arc<Completion<()>>)> {
-    let header = RedoFileHeader::initial(file_seq, log_block_size, file_max_size);
+    let super_block = RedoSuperBlock::initial(file_seq, log_block_size, file_max_size);
     let mut buf = DirectBuf::zeroed(REDO_SUPER_BLOCK_SLOT_SIZE);
-    serialize_redo_super_block(buf.as_bytes_mut(), &header)?;
+    serialize_redo_super_block(buf.as_bytes_mut(), &super_block)?;
     Ok(LogWriteSubmission::header(log_file.as_raw_fd(), 0, buf))
 }
 
@@ -1331,10 +1334,11 @@ mod tests {
         IOKind, StdIoResult, StorageBackendOp, StorageBackendTestHook,
         install_storage_backend_test_hook,
     };
-    use crate::log::log_replay::ReadLog;
-    use crate::log::redo_format::{
+    use crate::log::format::{
         REDO_DEFAULT_DATA_START_OFFSET, REDO_SUPER_BLOCK_SLOT_SIZE, parse_redo_super_block,
     };
+    use crate::log::redo::{RedoHeader, RedoLogs, RedoTrxKind};
+    use crate::log::replay::ReadLog;
     use crate::trx::MAX_SNAPSHOT_TS;
     use crate::trx::sys::{TransactionSystemQueues, TrxCleanupMessage};
     use crate::value::Val;
@@ -1384,6 +1388,14 @@ mod tests {
             log_block_size,
         )
         .unwrap();
+        submit_header_write_for_test(header_write, &header_completion);
+        log_file
+    }
+
+    fn submit_header_write_for_test(
+        header_write: LogWriteSubmission,
+        header_completion: &Completion<()>,
+    ) {
         let mut write_driver = LogWriteDriver::new(StorageBackend::new(1).unwrap());
         assert!(write_driver.push_write(header_write).is_ok());
         assert_eq!(write_driver.submit_ready(), 1);
@@ -1400,7 +1412,6 @@ mod tests {
             LogWriteCompletion::Group { .. } => panic!("expected redo header write completion"),
         }
         assert!(header_completion.completed_result().unwrap().is_ok());
-        log_file
     }
 
     static FILE_SYNC_TEST_HOOK_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
@@ -2296,7 +2307,14 @@ mod tests {
                 let mut group_commit_g = redo_log.group_commit.lock();
                 let log_file = group_commit_g.log_file.as_ref().unwrap();
                 let log_fd = log_file.as_raw_fd();
-                let log_buf = LogBuf::new(4096);
+                let mut log_buf = LogBuf::new(4096);
+                log_buf.append_trx_log(&TrxLog::new(
+                    RedoHeader {
+                        cts,
+                        trx_kind: RedoTrxKind::System,
+                    },
+                    RedoLogs::default(),
+                ));
                 let (offset, _) = log_file.alloc(log_buf.capacity()).unwrap();
                 group_commit_g.queue.push_back(Commit::Group(CommitGroup {
                     trx_list: vec![PrecommitTrx {
@@ -2590,10 +2608,10 @@ mod tests {
 
         let bytes = fs::read(format!("{file_prefix}.00000003")).unwrap();
         let slot0 = parse_redo_super_block(&bytes[..REDO_SUPER_BLOCK_SLOT_SIZE], 3, 0).unwrap();
-        assert_eq!(slot0.header.header_slot_no, 0);
-        assert_eq!(slot0.header.generation, 0);
-        assert_eq!(slot0.header.log_block_size, 4096);
-        assert_eq!(slot0.header.file_max_size, 128 * 1024);
+        assert_eq!(slot0.slot_no, 0);
+        assert_eq!(slot0.generation, 0);
+        assert_eq!(slot0.log_block_size, 4096);
+        assert_eq!(slot0.file_max_size, 128 * 1024);
 
         let slot1 = &bytes[REDO_SUPER_BLOCK_SLOT_SIZE..REDO_DEFAULT_DATA_START_OFFSET];
         let err = parse_redo_super_block(slot1, 3, 1).unwrap_err();
@@ -2601,6 +2619,100 @@ mod tests {
             err.data_integrity_error(),
             Some(DataIntegrityError::InvalidMagic)
         );
+    }
+
+    #[test]
+    fn test_restart_replays_old_log_with_persisted_config_and_creates_new_log_with_current_config()
+    {
+        let temp_dir = TempDir::new().unwrap();
+        let file_prefix = temp_dir.path().join("mixed_config_redo.log");
+        let file_prefix = file_prefix.to_str().unwrap();
+        let old_log_block_size = 8192;
+        let old_file_max_size = REDO_DEFAULT_DATA_START_OFFSET + old_log_block_size * 2;
+        let new_log_block_size = 4096;
+        let new_file_max_size = REDO_DEFAULT_DATA_START_OFFSET + new_log_block_size * 3;
+
+        let old_log_file =
+            create_log_file_for_test(file_prefix, 0, old_file_max_size, old_log_block_size);
+        let cts = TrxID::new(17);
+        let mut log_buf = LogBuf::new(old_log_block_size);
+        log_buf.append_trx_log(&TrxLog::new(
+            RedoHeader {
+                cts,
+                trx_kind: RedoTrxKind::System,
+            },
+            RedoLogs::default(),
+        ));
+        let direct_buf = log_buf.finish();
+        let (group_offset, _) = old_log_file.alloc(direct_buf.capacity()).unwrap();
+        assert_eq!(group_offset, REDO_DEFAULT_DATA_START_OFFSET);
+        let mut write_driver = LogWriteDriver::new(StorageBackend::new(1).unwrap());
+        assert!(
+            write_driver
+                .push_write(LogWriteSubmission::new(
+                    cts,
+                    old_log_file.as_raw_fd(),
+                    group_offset,
+                    direct_buf,
+                ))
+                .is_ok()
+        );
+        assert_eq!(write_driver.submit_ready(), 1);
+        match write_driver.wait_one() {
+            LogWriteCompletion::Group {
+                cts: completed_cts,
+                buf,
+                poison,
+            } => {
+                drop(buf);
+                assert_eq!(completed_cts, cts);
+                assert_eq!(poison, None);
+            }
+            LogWriteCompletion::Header { .. } => panic!("expected redo group write completion"),
+        }
+        drop(old_log_file);
+
+        let config = TrxSysConfig::default()
+            .log_dir(temp_dir.path())
+            .log_file_stem("mixed_config_redo.log")
+            .log_block_size(new_log_block_size)
+            .log_file_max_size(new_file_max_size);
+        let mut stream = config.redo_log_initializer().unwrap().stream();
+        let recovered = stream.pop().unwrap().unwrap();
+        assert_eq!(recovered.header.cts, cts);
+        assert_eq!(recovered.header.trx_kind, RedoTrxKind::System);
+        assert!(stream.pop().unwrap().is_none());
+
+        let initializer = stream.into_initializer();
+        assert_eq!(initializer.file_seq, Some(1));
+        assert_eq!(initializer.log_block_size, new_log_block_size);
+        assert_eq!(initializer.file_max_size, new_file_max_size);
+
+        let (purge_tx, _purge_rx) = flume::unbounded();
+        let (redo_log, initial_header_completion) = initializer.finish(purge_tx).unwrap();
+        let header_write = {
+            let mut group_commit_g = redo_log.group_commit.lock();
+            match group_commit_g.queue.pop_front().unwrap() {
+                Commit::LogFileBoundary {
+                    ended_log_file,
+                    header_write,
+                } => {
+                    assert!(ended_log_file.is_none());
+                    header_write
+                }
+                Commit::Group(_) | Commit::Shutdown => {
+                    panic!("expected initial redo super-block write")
+                }
+            }
+        };
+        submit_header_write_for_test(header_write, &initial_header_completion);
+        drop(redo_log);
+
+        let new_bytes = fs::read(format!("{file_prefix}.00000001")).unwrap();
+        let new_slot0 =
+            parse_redo_super_block(&new_bytes[..REDO_SUPER_BLOCK_SLOT_SIZE], 1, 0).unwrap();
+        assert_eq!(new_slot0.log_block_size, new_log_block_size as u64);
+        assert_eq!(new_slot0.file_max_size, new_file_max_size as u64);
     }
 
     #[test]
@@ -2699,11 +2811,10 @@ mod tests {
                         ReadLog::DataCorrupted => unreachable!(),
                         ReadLog::DataEnd => break,
                         ReadLog::Some(mut group) => {
-                            let data_len = group.data().len();
                             while let Some(pod) = group.try_next().unwrap() {
                                 println!(
-                                    "log {}, len={}, header={:?}, payload={:?}",
-                                    log_recs, data_len, pod.header, pod.payload
+                                    "log {}, header={:?}, payload={:?}",
+                                    log_recs, pod.header, pod.payload
                                 );
                                 log_recs += 1;
                             }

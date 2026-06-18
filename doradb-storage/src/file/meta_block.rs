@@ -7,7 +7,7 @@ use crate::file::multi_table_file::{
     CATALOG_TABLE_ROOT_DESC_COUNT, CatalogTableRootDesc, MultiTableMetaBlock,
 };
 use crate::id::{BlockID, RowID, TableID, TrxID};
-use crate::serde::{Deser, Ser, Serde};
+use crate::serde::{Deser, MinBytesHint, Ser, Serde, min_bytes_hint};
 use error_stack::Report;
 use std::mem;
 use std::num::NonZeroU64;
@@ -93,6 +93,16 @@ pub(crate) struct MetaBlock {
 }
 
 impl Deser for MetaBlock {
+    const MIN_BYTES_HINT: MinBytesHint = min_bytes_hint(
+        mem::size_of::<RowID>()
+            + mem::size_of::<TrxID>() * 2
+            + mem::size_of::<u64>() * 3 // AllocMap fixed prefix
+            + mem::size_of::<u64>() * 4 // TableBriefMetadata vector prefixes
+            + mem::size_of::<u16>() // TableBriefMetadata next_index_no
+            + mem::size_of::<u64>() // column_block_index_root
+            + mem::size_of::<u64>(), // secondary_index_roots vector prefix
+    );
+
     #[inline]
     fn deser<S: Serde + ?Sized>(input: &S, start_idx: usize) -> Result<(usize, Self)> {
         let (idx, pivot_row_id) = RowID::deser(input, start_idx)?;
@@ -228,6 +238,14 @@ pub(crate) struct MultiTableMetaBlockData {
 }
 
 impl Deser for MultiTableMetaBlockData {
+    const MIN_BYTES_HINT: MinBytesHint = min_bytes_hint(
+        mem::size_of::<TableID>()
+            + mem::size_of::<u32>() * 2
+            + CATALOG_TABLE_ROOT_DESC_COUNT
+                * (mem::size_of::<TableID>() + mem::size_of::<u64>() + mem::size_of::<RowID>())
+            + mem::size_of::<u64>() * 3,
+    );
+
     #[inline]
     fn deser<S: Serde + ?Sized>(input: &S, start_idx: usize) -> Result<(usize, Self)> {
         let (idx, next_table_id) = TableID::deser(input, start_idx)?;
