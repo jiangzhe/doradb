@@ -47,11 +47,13 @@ We rely on tooling to enforce style.
 
 ## 4. Testing
 
-*   **Unit Tests**: Place in `mod tests` within the source file or in `tests.rs`.
-    *   Prefer inline `#[cfg(test)] mod tests` in the same file as the code under test.
-    *   Keep test-only helpers and hook types inside that inline test module unless there is a strong reason to share them more broadly.
-    *   If cross-module test reuse is needed, prefer a narrow `#[cfg(test)] pub(crate) use ...::tests::{...};` re-export instead of expanding the production API or adding standalone test-support modules.
-*   **Production Shape First**: Do not widen or complicate production structs, traits, or control flow solely for tests. Prefer adapting tests to the production path, and use minimal `#[cfg(test)]` branches when test-only control is required.
+*   **Unit Test Structure**: Prefer inline `#[cfg(test)] mod tests` beside the code under test. Use `tests.rs` when a module is already organized that way.
+*   **Test-Only Code**: Keep test helpers close to tests and behind `#[cfg(test)]`. If another module needs them, use a narrow `#[cfg(test)] pub(crate)` re-export instead of widening the production API.
+*   **Production Shape First**: Do not widen or complicate production structs, traits, or control flow solely for tests. Prefer production execution paths and minimal `#[cfg(test)]` hooks when extra test control is required.
+*   **Unit Test Dedup Review**: Every unit-test update should include a final pass that extracts common reusable utilities when new or changed tests copy-paste setup, execution, or assertions.
+*   **Unit Test Dedup Patterns**: Extract helper functions for repeated object construction, round-trip flows such as `encode -> decode -> verify`, and common assertion sequences. Use table-driven tests with a case struct or array plus loop when cases share logic and differ only by input or expected output.
+*   **Concurrent Tests**: Do not use `sleep` to wait for events in tests, because it makes tests flaky. Use explicit synchronization points or predicate-based signaling to coordinate thread progress.
+*   **Randomized Tests**: Prefer randomized tests over exhaustive parameter permutations when broad input variation is useful. Keep deterministic edge-case tests separate from randomized tests, especially for error paths, boundary conditions, and format verification.
 *   **Routine Validation**: Run `cargo nextest run -p doradb-storage`.
 *   **Alternate Backend Validation**: Run `cargo nextest run -p doradb-storage --no-default-features --features libaio` manually when you need to validate the legacy-kernel alternate backend path.
 *   **Doc Tests**: This project currently does not have doctests, and routine validation does not run `cargo test --doc`.
