@@ -3,7 +3,7 @@ use crate::id::TrxID;
 use crate::io::{DirectBuf, IOBuf};
 use crate::log::format::RedoGroupHeader;
 use crate::log::redo::{RedoHeader, RedoLogs};
-use crate::serde::{Deser, Ser, Serde};
+use crate::serde::{Deser, MinBytesHint, Ser, Serde, min_bytes_hint};
 use error_stack::Report;
 use std::mem;
 
@@ -140,6 +140,9 @@ impl TrxLog {
 }
 
 impl Deser for TrxLog {
+    const MIN_BYTES_HINT: MinBytesHint =
+        min_bytes_hint(mem::size_of::<u64>() + MIN_TRX_LOG_FRAME_LEN);
+
     #[inline]
     fn deser<S: Serde + ?Sized>(input: &S, start_idx: usize) -> Result<(usize, Self)> {
         let (frame_start, data_len) = input.deser_u64(start_idx)?;

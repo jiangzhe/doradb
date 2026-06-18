@@ -1,7 +1,7 @@
 use crate::error::Result;
 use crate::id::RowID;
 use crate::row::{Row, RowMut};
-use crate::serde::{Deser, Ser, Serde};
+use crate::serde::{Deser, MinBytesHint, Ser, Serde, min_bytes_hint};
 use crate::value::Val;
 use serde::{Deserialize, Serialize};
 use std::mem;
@@ -41,6 +41,9 @@ impl Ser<'_> for SelectKey {
 }
 
 impl Deser for SelectKey {
+    const MIN_BYTES_HINT: MinBytesHint =
+        min_bytes_hint(mem::size_of::<u32>() + mem::size_of::<u64>());
+
     #[inline]
     fn deser<S: Serde + ?Sized>(input: &S, start_idx: usize) -> Result<(usize, Self)> {
         let (idx, index_no) = input.deser_u32(start_idx)?;
@@ -218,6 +221,9 @@ impl Ser<'_> for UpdateCol {
 }
 
 impl Deser for UpdateCol {
+    const MIN_BYTES_HINT: MinBytesHint =
+        min_bytes_hint(mem::size_of::<u32>() + mem::size_of::<u8>());
+
     #[inline]
     fn deser<S: Serde + ?Sized>(input: &S, start_idx: usize) -> Result<(usize, Self)> {
         let idx = start_idx;

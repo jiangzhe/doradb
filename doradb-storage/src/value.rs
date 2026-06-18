@@ -3,7 +3,7 @@ use crate::memcmp::{
     BytesExtendable, MIN_VAR_MCF_LEN, MIN_VAR_NMCF_LEN, MemCmpFormat, Null, NullableMemCmpFormat,
     SegmentedBytes,
 };
-use crate::serde::{Deser, Ser, Serde};
+use crate::serde::{Deser, MinBytesHint, Ser, Serde, min_bytes_hint};
 use error_stack::Report;
 use ordered_float::OrderedFloat;
 use serde::de::Visitor;
@@ -83,6 +83,9 @@ impl Ser<'_> for ValType {
 }
 
 impl Deser for ValType {
+    const MIN_BYTES_HINT: MinBytesHint =
+        min_bytes_hint(mem::size_of::<u8>() + mem::size_of::<u8>());
+
     #[inline]
     fn deser<S: Serde + ?Sized>(input: &S, start_idx: usize) -> Result<(usize, Self)> {
         let idx = start_idx;
@@ -619,6 +622,8 @@ impl Ser<'_> for Val {
 }
 
 impl Deser for Val {
+    const MIN_BYTES_HINT: MinBytesHint = min_bytes_hint(mem::size_of::<u8>());
+
     #[inline]
     fn deser<S: Serde + ?Sized>(input: &S, start_idx: usize) -> Result<(usize, Self)> {
         let (idx, c) = input.deser_u8(start_idx)?;

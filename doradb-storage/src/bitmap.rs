@@ -1,5 +1,5 @@
 use crate::error::Result;
-use crate::serde::{Deser, Ser, Serde};
+use crate::serde::{Deser, MinBytesHint, Ser, Serde, min_bytes_hint};
 use parking_lot::Mutex;
 use std::mem;
 use std::ops::Range;
@@ -597,6 +597,8 @@ impl Ser<'_> for AllocMap {
 }
 
 impl Deser for AllocMap {
+    const MIN_BYTES_HINT: MinBytesHint = min_bytes_hint(mem::size_of::<u64>() * 3);
+
     #[inline]
     fn deser<S: Serde + ?Sized>(input: &S, start_idx: usize) -> Result<(usize, Self)> {
         let (idx, len) = input.deser_u64(start_idx)?;

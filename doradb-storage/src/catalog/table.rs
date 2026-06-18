@@ -13,7 +13,7 @@ use crate::log::redo::DDLRedo;
 use crate::map::FastHashSet;
 use crate::row::ops::SelectKey;
 use crate::row::{Row, RowRead};
-use crate::serde::{Deser, Ser, Serde};
+use crate::serde::{Deser, MinBytesHint, Ser, Serde, min_bytes_hint};
 use crate::session::{SessionDdlContext, SessionPin};
 use crate::table::Table;
 use crate::trx::Transaction;
@@ -1653,6 +1653,11 @@ pub(crate) struct TableBriefMetadata {
 }
 
 impl Deser for TableBriefMetadata {
+    const MIN_BYTES_HINT: MinBytesHint = min_bytes_hint(
+        mem::size_of::<u64>() * 4 // four vector length prefixes
+            + mem::size_of::<u16>(), // next_index_no
+    );
+
     fn deser<S: Serde + ?Sized>(input: &S, start_idx: usize) -> Result<(usize, Self)> {
         let (idx, col_names) = <Vec<SemiStr>>::deser(input, start_idx)?;
         let (idx, col_types) = <Vec<ValType>>::deser(input, idx)?;

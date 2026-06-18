@@ -5,7 +5,7 @@ use crate::file::block_integrity::{
 };
 use crate::id::TrxID;
 use crate::io::{STORAGE_SECTOR_SIZE, align_to_sector_size};
-use crate::serde::{Deser, Ser, Serde};
+use crate::serde::{Deser, MinBytesHint, Ser, Serde, min_bytes_hint};
 use error_stack::Report;
 use std::mem;
 
@@ -199,6 +199,8 @@ impl Ser<'_> for RedoGroupHeader {
 }
 
 impl Deser for RedoGroupHeader {
+    const MIN_BYTES_HINT: MinBytesHint = min_bytes_hint(RedoGroupHeader::SIZE);
+
     #[inline]
     fn deser<S: Serde + ?Sized>(input: &S, start_idx: usize) -> Result<(usize, Self)> {
         let (idx, checksum) = input.deser_u32(start_idx)?;
@@ -290,6 +292,8 @@ impl Ser<'_> for RedoSuperBlock {
 }
 
 impl Deser for RedoSuperBlock {
+    const MIN_BYTES_HINT: MinBytesHint = min_bytes_hint(REDO_SUPER_BLOCK_PAYLOAD_SIZE);
+
     #[inline]
     fn deser<S: Serde + ?Sized>(input: &S, start_idx: usize) -> Result<(usize, Self)> {
         let (idx, file_seq) = input.deser_u32(start_idx)?;

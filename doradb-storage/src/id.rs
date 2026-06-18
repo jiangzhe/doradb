@@ -103,6 +103,9 @@ macro_rules! impl_id_serde {
         }
 
         impl crate::serde::Deser for $name {
+            const MIN_BYTES_HINT: crate::serde::MinBytesHint =
+                crate::serde::min_bytes_hint(::std::mem::size_of::<u64>());
+
             #[inline]
             fn deser<S: crate::serde::Serde + ?Sized>(
                 input: &S,
