@@ -360,10 +360,10 @@ the unsafe boundary local to reader construction. [C2], [B2]
   - Phase-local Choices: Generation-counter selection rules; how to persist and
     sync the sealed header under `fsync`, `fdatasync`, and `none`; exact logging
     or telemetry behavior when best-effort clean-shutdown sealing fails.
-  - Task Doc: `docs/tasks/TBD.md`
-  - Task Issue: `#0`
-  - Phase Status: `pending`
-  - Implementation Summary: `pending`
+  - Task Doc: `docs/tasks/000180-redo-sealed-segment-ranges.md`
+  - Task Issue: `#715`
+  - Phase Status: done
+  - Implementation Summary: Implemented sealed redo segment metadata, durable range accumulation after prefix sync, async rotated-file sealing with fatal runtime failures, best-effort active-file shutdown sealing, sealed replay validation, and redo docs/tests updates. [Task Resolve Sync: docs/tasks/000180-redo-sealed-segment-ranges.md @ 2026-06-18]
 
 - **Phase 4: Recovery Segment Skip**
   - Scope: After checkpoint bootstrap computes `replay_floor`, skip sealed v2

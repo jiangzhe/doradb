@@ -1,7 +1,7 @@
 ---
 id: 000180
 title: Redo Sealed Segment Ranges
-status: proposal
+status: implemented
 created: 2026-06-18
 github_issue: 715
 ---
@@ -196,7 +196,7 @@ Following phase preserved:
    - Do not derive these values from transaction-list max CTS or no-log groups.
 
 5. Maintain the per-file accumulator only after durable prefix sync succeeds.
-   - Add a `RedoFileSealAccumulator` owned by `FileProcessor`, keyed by
+   - Add a `RedoFileSealAccumulator` owned by `RedoFileSealer`, keyed by
      `file_seq` or otherwise scoped to the current file being processed.
    - `RedoFileSealAccumulator` should hold:
 
@@ -207,8 +207,8 @@ Following phase preserved:
      ```
 
    - Initialize `durable_end_offset` to `REDO_DEFAULT_DATA_START_OFFSET`.
-   - In `FileProcessor::finalize_finished_prefix(...)`, update the accumulator
-     only after `sync_written_prefix(log_bytes)` succeeds.
+   - In `RedoLogWriter::finalize_finished_prefix(...)`, update the sealer's
+     accumulator only after `sync_written_prefix(log_bytes)` succeeds.
    - For each successfully finalized redo-bearing `SyncGroup`:
      - set `durable_end_offset = group.write_meta.end_offset`;
      - set `min_redo_cts` to the minimum group `min_redo_cts`;
@@ -241,7 +241,7 @@ Following phase preserved:
      `FatalError::RedoSync`.
 
 7. Best-effort seal the active file on clean shutdown.
-   - When `FileProcessor::process_single_file()` exits because shutdown is set
+   - When `RedoLogWriter::process_single_file()` exits because shutdown is set
      and all pending work is drained, attempt to seal the active file before
      `TransactionSystem::log_loop()` returns.
    - The active file is still owned by `group_commit.log_file` while the log
@@ -298,6 +298,33 @@ Following phase preserved:
 
 ## Implementation Notes
 
+- Implemented the RFC-0020 Phase 3 sealed redo segment metadata:
+  `RedoSuperBlock` now carries `durable_end_offset`, `min_redo_cts`, and
+  `max_redo_cts`; initial/open headers remain unsealed with zero metadata; and
+  sealed empty/non-empty combinations are validated during super-block parsing.
+- Added redo range propagation from serialized redo groups instead of ordered
+  runtime state. `LogBuf` now stores the real redo CTS range as
+  `Option<(TrxID, TrxID)>`, and `RedoGroupWriteMeta` carries file sequence,
+  physical offsets, and group CTS range into durable-prefix finalization.
+- Added redo-local file ownership and sealing support. `RedoLogFile` preserves
+  file identity and selected open super-block metadata, `RedoFileSealer`
+  accumulates durable per-file ranges after successful prefix sync, writes the
+  inactive sealed slot asynchronously, syncs the sealed header according to
+  `log_sync`, treats rotated-file seal write/sync failure as fatal, and keeps
+  clean-shutdown active-file sealing best effort.
+- Updated recovery to recognize sealed files, bound mmap replay by
+  `durable_end_offset`, reject corruption before the sealed end, validate the
+  scanned group CTS range against sealed metadata, and continue scanning sealed
+  files normally without Phase 4 skip behavior.
+- Updated redo documentation and task follow-up tracking. The broader
+  non-blocking rotation scheduler refactor was intentionally deferred to
+  `docs/backlogs/000127-redo-io-request-id-prefix-sequencing.md`.
+- Validation completed:
+  - `cargo fmt --check`
+  - `cargo clippy -p doradb-storage --all-targets -- -D warnings`
+  - `cargo nextest run -p doradb-storage`
+  - `cargo nextest run -p doradb-storage --no-default-features --features libaio`
+
 ## Impacts
 
 - `doradb-storage/src/log/format.rs`
@@ -332,7 +359,8 @@ Important interfaces and types:
 - `LogBuf`
 - `CommitGroupLog`
 - `SyncGroup`
-- `FileProcessor`
+- `RedoLogWriter`
+- `RedoFileSealer`
 - `MmapLogReader`
 
 ## Test Cases
@@ -387,13 +415,18 @@ Important interfaces and types:
     validation path.
 
 Validation commands:
-- `cargo fmt`
+- `cargo fmt --check`
 - `cargo clippy -p doradb-storage --all-targets -- -D warnings`
 - `cargo nextest run -p doradb-storage`
 - `cargo nextest run -p doradb-storage --no-default-features --features libaio`
 
 ## Open Questions
 
-No open design questions remain for this task. RFC-0020 Phase 4 will decide
-where whole-file skip logic belongs and how skipped sealed headers seed
-`max_recovered_cts`.
+No open correctness questions remain for this task.
+
+Deferred follow-ups:
+- RFC-0020 Phase 4 will decide where whole-file skip logic belongs and how
+  skipped sealed headers seed `max_recovered_cts`.
+- `docs/backlogs/000127-redo-io-request-id-prefix-sequencing.md` tracks the
+  future scheduler refactor to make log file rotation non-blocking with
+  request-id based prefix sequencing and per-file header/group/seal prefixes.
