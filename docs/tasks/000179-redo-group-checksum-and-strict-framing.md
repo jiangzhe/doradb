@@ -1,7 +1,7 @@
 ---
 id: 000179
 title: Redo Group Checksum and Strict Framing
-status: proposal
+status: implemented
 created: 2026-06-16
 github_issue: 712
 ---
@@ -323,6 +323,65 @@ Required RFC phase-plan sync:
 
 ## Implementation Notes
 
+Implemented RFC-0020 Phase 2 and the follow-up review refinements:
+
+- Added `crc32fast` and replaced the old physical redo group length prefix with
+  `RedoGroupHeader`, a fixed 28-byte little-endian header containing
+  `checksum`, `body_len`, `min_cts`, and `max_cts`.
+- Moved durable redo format definitions into `log/format.rs`, documented the
+  on-disk layout of `RedoGroupHeader` and `RedoSuperBlock`, and renamed the
+  super-block terminology from file header to `RedoSuperBlock`.
+- Reworked redo super-block slots to use the standard
+  `file/block_integrity.rs` envelope and BLAKE3 trailer, selected slots by
+  generation, and removed the unnecessary selected-slot offset from the public
+  selection result.
+- Split `log/buf.rs` out for `LogBuf` and `TrxLog`, moved the related tests,
+  and made `TrxLog` a redo-specific exact-frame serializer/deserializer instead
+  of a `LenPrefixPod<RedoHeader, RedoLogs>` wrapper.
+- Updated `LogBuf::finish` to reserve the group header, zero padding, write the
+  header, and patch CRC32 over bytes after the checksum field through the full
+  physical write range.
+- Updated mmap replay to parse and validate `RedoGroupHeader`, treat an all-zero
+  group header as EOF, verify CRC32 before body parsing, validate logical and
+  physical lengths against the persisted file metadata, and reject transaction
+  CTS values outside the header range.
+- Removed the test-only `LogGroup::data()` accessor and kept CTS validation in
+  replay/group validation logic rather than in `physical_len()`.
+- Normalized configured redo file max size so the data region after super-block
+  slots is an integral number of persisted log blocks, and validated persisted
+  `file_max_size` against the persisted `log_block_size`.
+- Preserved restart support for changing `log_file_max_size` and
+  `log_block_size`: existing files replay with persisted metadata, while newly
+  created files use the latest normalized configuration.
+- Hardened generic collection deserialization beyond the initial byte-count
+  plan: `Deser` now exposes `MIN_BYTES_HINT: Option<NonZeroUsize>`, and
+  `Vec<T>`/`BTreeMap<K, V>` validate `len * min_element_bytes <= remaining`
+  with checked multiplication before reserving capacity or parsing entries.
+- Updated `docs/redo-log.md`, RFC-0020 Phase 2 text, and the unsafe-usage
+  baseline for the final implemented code shape.
+
+Validation performed:
+
+- `cargo test -p doradb-storage serde::tests -- --nocapture`
+- `cargo test -p doradb-storage log::redo::tests -- --nocapture`
+- `cargo test -p doradb-storage log::replay::tests -- --nocapture`
+- `cargo test -p doradb-storage log::format::tests -- --nocapture`
+- `cargo test -p doradb-storage log::tests -- --test-threads=1 --nocapture`
+- `cargo clippy -p doradb-storage --all-targets -- -D warnings`
+- `cargo nextest run -p doradb-storage`
+- `git diff --check`
+
+Review outcomes:
+
+- Per-number runtime deserialization end checks were not reintroduced; primitive
+  deserializers keep the existing debug-assert hot path, with replay relying on
+  checksum validation, exact frame slicing, and collection count hardening.
+- The collection-count guard uses checked multiplication rather than division.
+- The default parallel `cargo test -p doradb-storage log::tests -- --nocapture`
+  remains unsuitable for this module because existing global test hooks interfere
+  when run concurrently; the serial `log::tests` run and `cargo nextest` both
+  passed.
+
 ## Impacts
 
 - `Cargo.toml`
@@ -419,5 +478,5 @@ Validation commands:
 
 ## Open Questions
 
-No open design questions remain for this task. During `task resolve`, sync
-RFC-0020 Phase 2 with the exact group format and implementation outcome.
+No open questions remain for this task. RFC-0020 Phase 2 is synced with the
+implemented group format and resolve outcome.

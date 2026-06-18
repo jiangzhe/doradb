@@ -343,10 +343,11 @@ the unsafe boundary local to reader construction. [C2], [B2]
     coverage over header bytes after checksum, body bytes, and padding.
   - Task Doc: `docs/tasks/000179-redo-group-checksum-and-strict-framing.md`
   - Task Issue: `#712`
-  - Phase Status: `in_progress`
-  - Implementation Summary: Implementation in progress for the exact 28-byte
-    group header, checksum-first mmap validation, strict `TrxLog` frames,
-    group CTS range validation, and bounded collection deserialization.
+  - Phase Status: done
+  - Implementation Summary: Implemented the exact 28-byte group header,
+    checksum-first mmap validation, strict `TrxLog` frames, group CTS range
+    validation, persisted-config replay/new-file layout handling, and
+    `MIN_BYTES_HINT`-backed bounded collection deserialization. [Task Resolve Sync: docs/tasks/000179-redo-group-checksum-and-strict-framing.md @ 2026-06-18]
 
 - **Phase 3: Sealed Segment Ranges**
   - Scope: Track real redo min/max CTS per active file, write the inactive A/B

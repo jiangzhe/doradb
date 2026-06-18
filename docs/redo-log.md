@@ -106,10 +106,12 @@ Common container encodings:
 - `Option<T>`: one `bool` byte, followed by `T` only when present.
 - `Box<T>`: same bytes as `T`.
 
-Collection deserialization rejects counts that cannot fit in the remaining
-input frame before reserving capacity or iterating entries. Redo recovery
-parses transaction payloads through an exact transaction frame, so corrupt
-collection counts are bounded by the serialized transaction length.
+Collection deserialization rejects counts whose minimum serialized byte footprint
+cannot fit in the remaining input frame before reserving capacity or iterating
+entries. The generic `Deser::MIN_BYTES_HINT` associated constant supplies this
+positive lower bound for each element type. Redo recovery parses transaction
+payloads through an exact transaction frame, so corrupt collection counts are
+bounded by the serialized transaction length and the element minimum-byte hint.
 
 Value encoding:
 
