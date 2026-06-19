@@ -1822,3 +1822,213 @@ impl MemTable<FixedBufferPool, FixedBufferPool> {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::buffer::BufferPool;
+    use crate::buffer::guard::PageGuard;
+    use crate::buffer::{PoolGuards, PoolRole};
+    use crate::error::{ErrorKind, InternalError, ResourceError};
+    use crate::file::cow_file::SUPER_BLOCK_ID;
+    use crate::id::TrxID;
+    use crate::session::tests::SessionTestExt;
+    use crate::table::tests::*;
+    use crate::value::Val;
+    use tempfile::TempDir;
+
+    #[test]
+    fn test_evict_pool_insert_full() {
+        smol::block_on(async {
+            const SIZE: i32 = 800;
+
+            // in-mem ~1000 pages, on-disk 2000 pages.
+            let temp_dir = TempDir::new().unwrap();
+            let engine =
+                evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys").await;
+            let table_id = create_table2_for_test(&engine).await;
+            {
+                let mut session = engine.new_session().unwrap();
+                // insert 1000 rows
+                let mut trx = session.begin_trx().unwrap();
+                for i in 0..SIZE {
+                    // make string 1KB long, so a page can only hold about 60 rows.
+                    // if page is full, 17 pages are required.
+                    // if page is half full, 35 pages are required.
+                    let s: String = (0..1000).map(|_| 'a').collect();
+                    let insert = vec![Val::from(i), Val::from(&s[..])];
+                    trx = expect_trx_insert(table_id, trx, insert).await;
+                }
+                let _ = trx.commit().await.unwrap();
+            }
+        });
+    }
+
+    #[test]
+    fn test_mem_scan_uncommitted() {
+        smol::block_on(async {
+            const SIZE: i32 = 10000;
+
+            let temp_dir = TempDir::new().unwrap();
+            let engine =
+                evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys").await;
+            let table_id = create_table2_for_test(&engine).await;
+
+            let mut session = engine.new_session().unwrap();
+            {
+                let mut trx = session.begin_trx().unwrap();
+                for i in 0..SIZE {
+                    let s = format!("{}", i);
+                    let insert = vec![Val::from(i), Val::from(&s[..])];
+                    trx = expect_trx_insert(table_id, trx, insert).await;
+                }
+                _ = trx.commit().await.unwrap();
+            }
+            {
+                let mut res_len = 0usize;
+                let layout = table_for_internal_assertion(&engine, table_id).layout_snapshot();
+                table_for_internal_assertion(&engine, table_id)
+                    .accessor_with_layout(&layout)
+                    .mem_scan_uncommitted(&session.pool_guards(), |_metadata, _row| {
+                        res_len += 1;
+                        true
+                    })
+                    .await
+                    .unwrap();
+                println!("res.len()={}", res_len);
+                assert!(res_len == SIZE as usize);
+            }
+        });
+    }
+
+    #[test]
+    fn test_mem_scan_uncommitted_returns_error_without_meta_guard() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine =
+                evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys").await;
+            let table_id = create_table2_for_test(&engine).await;
+            let layout = table_for_internal_assertion(&engine, table_id).layout_snapshot();
+            let empty_guards = PoolGuards::builder().build();
+
+            let err = table_for_internal_assertion(&engine, table_id)
+                .accessor_with_layout(&layout)
+                .mem_scan_uncommitted(&empty_guards, |_metadata, _row| true)
+                .await
+                .unwrap_err();
+
+            assert_eq!(
+                err.downcast_ref::<InternalError>().copied(),
+                Some(InternalError::Generic)
+            );
+        });
+    }
+
+    #[test]
+    fn test_mem_scan_from_requires_row_page_boundary() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine =
+                evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys").await;
+            let table_id = create_table2_for_test(&engine).await;
+            let mut session = engine.new_session().unwrap();
+            insert_rows(table_id, &mut session, 0, 4, "first").await;
+            session.freeze_table(table_id, usize::MAX).await.unwrap();
+            checkpoint_published(table_id, &mut session).await;
+            let table = table_for_internal_assertion(&engine, table_id);
+            let captured_pivot = table.file().active_root_unchecked().pivot_row_id;
+
+            insert_rows(table_id, &mut session, 100, 4, "second").await;
+            let mut later_pivot = captured_pivot;
+            let mut explicit_count = 0usize;
+            table
+                .mem
+                .mem_scan_from(&session.pool_guards(), captured_pivot, |page_guard| {
+                    let page = page_guard.page();
+                    explicit_count += page.header.approx_non_deleted();
+                    later_pivot = page.header.start_row_id + u64::from(page.header.max_row_count);
+                    true
+                })
+                .await
+                .unwrap();
+            assert_eq!(explicit_count, 4);
+            assert!(later_pivot > captured_pivot);
+
+            let interior_start = captured_pivot + 2;
+            let err = table
+                .mem
+                .mem_scan_from(&session.pool_guards(), interior_start, |_| true)
+                .await
+                .unwrap_err();
+            assert!(err.kind() == ErrorKind::Internal);
+
+            // Keep the second batch's row page allocated while advancing only the
+            // memory-scan pivot to that page's exclusive row-id boundary. A real
+            // later checkpoint may reclaim pages once no transaction root protects
+            // them, which is outside this helper's direct contract.
+            table
+                .mem
+                .blk_idx()
+                .update_column_root(later_pivot, SUPER_BLOCK_ID)
+                .await;
+            assert_eq!(table.mem.pivot_row_id(), later_pivot);
+
+            let mut current_hot_pages = 0usize;
+            table
+                .mem
+                .mem_scan(&session.pool_guards(), |_| {
+                    current_hot_pages += 1;
+                    true
+                })
+                .await
+                .unwrap();
+            assert_eq!(current_hot_pages, 0);
+        });
+    }
+
+    #[test]
+    fn test_build_in_memory_secondary_indexes_reclaims_staged_indexes_on_error() {
+        smol::block_on(async {
+            use super::build_in_memory_secondary_indexes;
+            use crate::buffer::FixedBufferPool;
+            use crate::catalog::{
+                ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexSpec, TableMetadata,
+            };
+            use crate::quiescent::QuiescentBox;
+            use crate::value::ValKind;
+
+            let pool_bytes = std::mem::size_of::<crate::buffer::frame::BufferFrame>()
+                + std::mem::size_of::<crate::buffer::page::Page>();
+            let pool = QuiescentBox::new(
+                FixedBufferPool::with_capacity(PoolRole::Index, pool_bytes)
+                    .expect("one-page fixed index pool should be constructible"),
+            );
+            let pool_guard = (*pool).pool_guard();
+            let metadata = TableMetadata::try_new(
+                vec![ColumnSpec::new(
+                    "id",
+                    ValKind::I32,
+                    ColumnAttributes::empty(),
+                )],
+                vec![
+                    IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::PK),
+                    IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::empty()),
+                ],
+            )
+            .expect("valid table metadata");
+
+            let err = match build_in_memory_secondary_indexes(
+                pool.guard(),
+                &pool_guard,
+                &metadata,
+                TrxID::new(100),
+            )
+            .await
+            {
+                Ok(_) => panic!("second secondary-index construction should fail in one-page pool"),
+                Err(err) => err,
+            };
+            assert_eq!(err.resource_error(), Some(ResourceError::BufferPoolFull));
+            assert_eq!(pool.allocated(), 0);
+        });
+    }
+}

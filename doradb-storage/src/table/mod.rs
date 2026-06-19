@@ -8,9 +8,6 @@ mod persistence;
 mod recover;
 mod rollback;
 mod storage;
-#[cfg(test)]
-mod tests;
-
 pub(crate) use access::*;
 pub(crate) use deletion_buffer::*;
 pub use gc::{SecondaryMemIndexCleanupIndexStats, SecondaryMemIndexCleanupStats};
@@ -573,7 +570,7 @@ impl Table {
     ) -> Result<Vec<LwcBlockPersist>> {
         #[cfg(test)]
         {
-            if tests::test_force_lwc_build_error_enabled() {
+            if test_hooks::test_force_lwc_build_error_enabled() {
                 return Err(Report::new(InternalError::InjectedTestFailure).into());
             }
         }
@@ -1350,4 +1347,1243 @@ fn secondary_index_kind_mismatch(operation: &'static str, expected: &'static str
     Report::new(InternalError::SecondaryIndexKindMismatch)
         .attach(format!("operation={operation}, expected={expected}"))
         .into()
+}
+
+#[cfg(test)]
+pub(crate) mod test_hooks {
+    use std::cell::Cell;
+
+    thread_local! {
+        static TEST_FORCE_LWC_BUILD_ERROR: Cell<bool> = const { Cell::new(false) };
+    }
+
+    pub(crate) fn set_test_force_lwc_build_error(enabled: bool) {
+        TEST_FORCE_LWC_BUILD_ERROR.with(|flag| flag.set(enabled));
+    }
+
+    pub(super) fn test_force_lwc_build_error_enabled() -> bool {
+        TEST_FORCE_LWC_BUILD_ERROR.with(|flag| flag.get())
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use crate::buffer::page::PAGE_SIZE;
+    use crate::buffer::{PoolGuard, PoolGuards, PoolRole, ReadonlyBufferPool};
+    use crate::catalog::{
+        ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexSpec, TableSpec,
+        USER_OBJ_ID_START,
+    };
+    use crate::conf::{EngineConfig, EvictableBufferPoolConfig, FileSystemConfig, TrxSysConfig};
+    use crate::engine::Engine;
+    use crate::error::{
+        CompletionErrorKind, DataIntegrityError, Error, FatalError, FileKind, Result,
+    };
+    use crate::file::SparseFile;
+    use crate::file::block_integrity::{BLOCK_INTEGRITY_HEADER_SIZE, write_block_checksum};
+    use crate::file::cow_file::{COW_FILE_PAGE_SIZE, SUPER_BLOCK_ID};
+    use crate::file::table_file::ActiveRoot;
+    use crate::id::{BlockID, PageID, RowID, TableID, TrxID};
+    use crate::index::{
+        COLUMN_BLOCK_HEADER_SIZE, COLUMN_BLOCK_LEAF_HEADER_SIZE, ColumnBlockIndex, IndexInsert,
+        NonUniqueIndex, RowLocation, UniqueIndex,
+    };
+    use crate::io::{
+        IOKind, StdIoResult, StorageBackendFileIdentity, StorageBackendOp, StorageBackendTestHook,
+    };
+    use crate::lock::tests::{LockDebugEntryState, debug_snapshot};
+    use crate::lock::{LockMode, LockOwner, LockResource};
+    use crate::quiescent::QuiescentGuard;
+    use crate::row::ops::{DeleteMvcc, SelectKey, SelectMvcc, UpdateCol, UpdateMvcc};
+    use crate::session::{Session, tests::SessionTestExt};
+    use crate::table::{
+        CheckpointOutcome, CheckpointReadiness, DeleteMarker, Table, TableRuntimeLayout,
+    };
+    use crate::trx::Transaction;
+    use crate::trx::stmt::Statement;
+    use crate::value::{Val, ValKind};
+    use std::fs::OpenOptions;
+    use std::io::{self, Read, Seek, SeekFrom, Write};
+    use std::path::PathBuf;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+    use tempfile::TempDir;
+
+    pub(crate) const LIGHTWEIGHT_TEST_BUFFER_BYTES: usize = 16 * 1024 * 1024;
+    pub(crate) const LIGHTWEIGHT_TEST_MAX_FILE_BYTES: usize = 32 * 1024 * 1024;
+    pub(crate) const LIGHTWEIGHT_TEST_READONLY_BUFFER_BYTES: usize = 32 * 1024 * 1024;
+
+    #[inline]
+    pub(crate) fn test_user_table_id(offset: u64) -> TableID {
+        USER_OBJ_ID_START
+            .checked_add(offset)
+            .expect("test user table id offset overflow")
+    }
+
+    pub(crate) fn assert_table_data_integrity(
+        err: Error,
+        block_kind: &str,
+        block_id: BlockID,
+        expected: DataIntegrityError,
+    ) {
+        let report = format!("{err:?}");
+        if err.completion_error() == Some(CompletionErrorKind::DataIntegrity(expected)) {
+            assert!(report.contains("propagate from other threads"), "{report}");
+            assert!(report.contains("wait for"), "{report}");
+            return;
+        }
+        assert_eq!(err.data_integrity_error(), Some(expected), "{report}");
+        assert!(report.contains("table-file"), "{report}");
+        assert!(report.contains(block_kind), "{report}");
+        assert!(report.contains(&format!("block_id={block_id}")), "{report}");
+    }
+
+    pub(crate) fn assert_checkpoint_write_poisoned(err: &Error, engine: &Engine) {
+        assert_eq!(
+            err.report().downcast_ref::<FatalError>().copied(),
+            Some(FatalError::CheckpointWrite)
+        );
+        assert!(
+            engine
+                .inner()
+                .trx_sys
+                .storage_poison_error()
+                .as_ref()
+                .is_some_and(|err| *err.current_context() == FatalError::CheckpointWrite)
+        );
+    }
+
+    pub(crate) async fn stmt_insert_row_by_id(
+        stmt: &mut Statement<'_>,
+        table_id: TableID,
+        cols: Vec<Val>,
+    ) -> Result<RowID> {
+        stmt.table_insert_mvcc(table_id, cols).await
+    }
+
+    pub(crate) async fn stmt_delete_row_by_id(
+        stmt: &mut Statement<'_>,
+        table_id: TableID,
+        key: &SelectKey,
+    ) -> Result<DeleteMvcc> {
+        stmt.table_delete_unique_mvcc(table_id, key, false).await
+    }
+
+    pub(crate) async fn stmt_update_row_by_id(
+        stmt: &mut Statement<'_>,
+        table_id: TableID,
+        key: &SelectKey,
+        update: Vec<UpdateCol>,
+    ) -> Result<UpdateMvcc> {
+        stmt.table_update_unique_mvcc(table_id, key, update).await
+    }
+
+    pub(crate) async fn stmt_select_row_mvcc_by_id(
+        stmt: &mut Statement<'_>,
+        table_id: TableID,
+        key: &SelectKey,
+        user_read_set: &[usize],
+    ) -> Result<SelectMvcc> {
+        stmt.table_lookup_unique_mvcc(table_id, key, user_read_set)
+            .await
+    }
+
+    pub(crate) async fn trx_insert_row_by_id(
+        trx: &mut Transaction,
+        table_id: TableID,
+        cols: Vec<Val>,
+    ) -> Result<RowID> {
+        trx.exec(async |stmt| stmt_insert_row_by_id(stmt, table_id, cols).await)
+            .await
+    }
+
+    pub(crate) async fn trx_delete_row_by_id(
+        trx: &mut Transaction,
+        table_id: TableID,
+        key: &SelectKey,
+    ) -> Result<DeleteMvcc> {
+        trx.exec(async |stmt| stmt_delete_row_by_id(stmt, table_id, key).await)
+            .await
+    }
+
+    pub(crate) async fn trx_update_row_by_id(
+        trx: &mut Transaction,
+        table_id: TableID,
+        key: &SelectKey,
+        update: Vec<UpdateCol>,
+    ) -> Result<UpdateMvcc> {
+        trx.exec(async |stmt| stmt_update_row_by_id(stmt, table_id, key, update).await)
+            .await
+    }
+
+    pub(crate) async fn trx_select_row_mvcc_by_id(
+        trx: &mut Transaction,
+        table_id: TableID,
+        key: &SelectKey,
+        user_read_set: &[usize],
+    ) -> Result<SelectMvcc> {
+        trx.exec(async |stmt| stmt_select_row_mvcc_by_id(stmt, table_id, key, user_read_set).await)
+            .await
+    }
+
+    pub(crate) struct FailingPageReadHook {
+        file: StorageBackendFileIdentity,
+        offset: usize,
+        errno: i32,
+        calls: AtomicUsize,
+    }
+
+    impl FailingPageReadHook {
+        #[inline]
+        pub(crate) fn for_page(
+            file: StorageBackendFileIdentity,
+            page_id: PageID,
+            errno: i32,
+        ) -> Self {
+            Self {
+                file,
+                offset: usize::from(page_id) * PAGE_SIZE,
+                errno,
+                calls: AtomicUsize::new(0),
+            }
+        }
+
+        #[inline]
+        pub(crate) fn call_count(&self) -> usize {
+            self.calls.load(Ordering::SeqCst)
+        }
+
+        #[inline]
+        pub(crate) fn matches(&self, op: StorageBackendOp) -> bool {
+            op.kind() == IOKind::Read
+                && op.matches_file_identity(self.file)
+                && op.offset() == self.offset
+        }
+    }
+
+    impl StorageBackendTestHook for FailingPageReadHook {
+        fn on_submit(&self, op: StorageBackendOp) {
+            if self.matches(op) {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        fn on_complete(&self, op: StorageBackendOp, res: &mut StdIoResult<usize>) {
+            if self.matches(op) {
+                *res = Err(io::Error::from_raw_os_error(self.errno));
+            }
+        }
+    }
+
+    pub(crate) struct FailingFirstWriteHook {
+        file_path: PathBuf,
+        calls: AtomicUsize,
+    }
+
+    impl FailingFirstWriteHook {
+        #[inline]
+        pub(crate) fn new(file_path: impl Into<PathBuf>) -> Self {
+            Self {
+                file_path: file_path.into(),
+                calls: AtomicUsize::new(0),
+            }
+        }
+
+        #[inline]
+        pub(crate) fn call_count(&self) -> usize {
+            self.calls.load(Ordering::SeqCst)
+        }
+
+        #[inline]
+        pub(crate) fn matches(&self, op: StorageBackendOp) -> bool {
+            if op.kind() != IOKind::Write {
+                return false;
+            }
+            StorageBackendFileIdentity::from_path(&self.file_path)
+                .is_ok_and(|expected| op.matches_file_identity(expected))
+        }
+    }
+
+    impl StorageBackendTestHook for FailingFirstWriteHook {
+        fn on_complete(&self, op: StorageBackendOp, res: &mut StdIoResult<usize>) {
+            if self.matches(op) && self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                *res = Err(io::Error::from_raw_os_error(libc::EIO));
+            }
+        }
+    }
+
+    pub(crate) struct ColumnBlockIndexSnapshot {
+        pub(crate) active_root: ActiveRoot,
+        pub(crate) sparse_file: Arc<SparseFile>,
+        pub(crate) disk_pool: QuiescentGuard<ReadonlyBufferPool>,
+    }
+
+    impl ColumnBlockIndexSnapshot {
+        #[inline]
+        pub(crate) fn index<'a>(&'a self, disk_pool_guard: &'a PoolGuard) -> ColumnBlockIndex<'a> {
+            ColumnBlockIndex::new(
+                self.active_root.column_block_index_root,
+                self.active_root.pivot_row_id,
+                FileKind::TableFile,
+                &self.sparse_file,
+                &self.disk_pool,
+                disk_pool_guard,
+            )
+        }
+    }
+
+    #[inline]
+    pub(crate) async fn evictable_test_engine(
+        temp_dir: &TempDir,
+        max_mem_size: u64,
+        log_file_stem: &str,
+    ) -> Engine {
+        EngineConfig::default()
+            .storage_root(temp_dir.path().to_path_buf())
+            .data_buffer(
+                EvictableBufferPoolConfig::default()
+                    .role(PoolRole::Mem)
+                    .max_mem_size(max_mem_size)
+                    .max_file_size(128u64 * 1024 * 1024),
+            )
+            .trx(TrxSysConfig::default().log_file_stem(log_file_stem))
+            .file(
+                FileSystemConfig::default()
+                    .io_depth(16)
+                    .readonly_buffer_size(128 * 1024 * 1024)
+                    .data_dir("."),
+            )
+            .build()
+            .await
+            .unwrap()
+    }
+
+    #[inline]
+    pub(crate) async fn lightweight_test_engine(temp_dir: &TempDir, log_file_stem: &str) -> Engine {
+        lightweight_test_engine_config(temp_dir.path().to_path_buf(), log_file_stem)
+            .build()
+            .await
+            .unwrap()
+    }
+
+    #[inline]
+    pub(crate) async fn create_table2_for_test(engine: &Engine) -> TableID {
+        crate::catalog::tests::table2(engine).await
+    }
+
+    #[inline]
+    pub(crate) async fn create_non_unique_name_table_for_test(engine: &Engine) -> TableID {
+        let mut ddl_session = engine.new_session().unwrap();
+        let table_id = ddl_session
+            .create_table(
+                TableSpec::new(vec![
+                    ColumnSpec::new("id", ValKind::I32, ColumnAttributes::empty()),
+                    ColumnSpec::new("name", ValKind::VarByte, ColumnAttributes::empty()),
+                ]),
+                vec![
+                    IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::PK),
+                    IndexSpec::new(vec![IndexKey::new(1)], IndexAttributes::empty()),
+                ],
+            )
+            .await
+            .unwrap();
+        drop(ddl_session);
+        table_id
+    }
+
+    pub(crate) fn lightweight_test_engine_config(
+        main_dir: impl Into<std::path::PathBuf>,
+        log_file_stem: &str,
+    ) -> EngineConfig {
+        EngineConfig::default()
+            .storage_root(main_dir)
+            .meta_buffer(LIGHTWEIGHT_TEST_BUFFER_BYTES)
+            .index_buffer(LIGHTWEIGHT_TEST_BUFFER_BYTES)
+            .index_max_file_size(LIGHTWEIGHT_TEST_MAX_FILE_BYTES)
+            .data_buffer(
+                EvictableBufferPoolConfig::default()
+                    .role(PoolRole::Mem)
+                    .max_mem_size(LIGHTWEIGHT_TEST_BUFFER_BYTES)
+                    .max_file_size(LIGHTWEIGHT_TEST_MAX_FILE_BYTES),
+            )
+            .trx(
+                TrxSysConfig::default()
+                    .io_depth(1)
+                    .log_file_stem(log_file_stem)
+                    .purge_threads(1),
+            )
+            .file(
+                FileSystemConfig::default()
+                    .io_depth(1)
+                    .readonly_buffer_size(LIGHTWEIGHT_TEST_READONLY_BUFFER_BYTES)
+                    .data_dir("."),
+            )
+    }
+
+    #[inline]
+    pub(crate) fn table_for_internal_assertion(engine: &Engine, table_id: TableID) -> Arc<Table> {
+        engine
+            .catalog()
+            .get_table_now(table_id)
+            .expect("test table should exist")
+    }
+
+    #[inline]
+    pub(crate) fn column_block_index_snapshot(
+        engine: &Engine,
+        table_id: TableID,
+    ) -> ColumnBlockIndexSnapshot {
+        let table = table_for_internal_assertion(engine, table_id);
+        ColumnBlockIndexSnapshot {
+            active_root: table.file().active_root_unchecked().clone(),
+            sparse_file: Arc::clone(table.file().sparse_file()),
+            disk_pool: table.disk_pool().clone(),
+        }
+    }
+
+    #[inline]
+    pub(crate) async fn expect_insert_committed(
+        table_id: TableID,
+        session: &mut Session,
+        insert: Vec<Val>,
+    ) {
+        let mut trx = session.begin_trx().unwrap();
+        trx = expect_trx_insert(table_id, trx, insert).await;
+        trx.commit().await.unwrap();
+    }
+
+    #[inline]
+    pub(crate) async fn expect_trx_insert(
+        table_id: TableID,
+        mut trx: Transaction,
+        insert: Vec<Val>,
+    ) -> Transaction {
+        let res = trx_insert_row_by_id(&mut trx, table_id, insert).await;
+        if res.is_err() {
+            panic!("res={:?}", res);
+        }
+        trx
+    }
+
+    #[inline]
+    pub(crate) async fn expect_delete_committed(
+        table_id: TableID,
+        session: &mut Session,
+        key: &SelectKey,
+    ) {
+        let mut trx = session.begin_trx().unwrap();
+        trx = expect_trx_delete(table_id, trx, key).await;
+        trx.commit().await.unwrap();
+    }
+
+    #[inline]
+    pub(crate) async fn expect_trx_delete(
+        table_id: TableID,
+        mut trx: Transaction,
+        key: &SelectKey,
+    ) -> Transaction {
+        let res = trx_delete_row_by_id(&mut trx, table_id, key).await;
+        if !matches!(res, Ok(DeleteMvcc::Deleted)) {
+            panic!("res={:?}", res);
+        }
+        trx
+    }
+
+    #[inline]
+    pub(crate) async fn expect_update_committed(
+        table_id: TableID,
+        session: &mut Session,
+        key: &SelectKey,
+        update: Vec<UpdateCol>,
+    ) {
+        let mut trx = session.begin_trx().unwrap();
+        trx = expect_trx_update(table_id, trx, key, update).await;
+        trx.commit().await.unwrap();
+    }
+
+    #[inline]
+    pub(crate) async fn expect_trx_update(
+        table_id: TableID,
+        mut trx: Transaction,
+        key: &SelectKey,
+        update: Vec<UpdateCol>,
+    ) -> Transaction {
+        let res = trx_update_row_by_id(&mut trx, table_id, key, update).await;
+        if !matches!(res, Ok(UpdateMvcc::Updated(_))) {
+            panic!("res={:?}", res);
+        }
+        trx
+    }
+
+    #[inline]
+    pub(crate) async fn expect_select_committed<F: FnOnce(Vec<Val>)>(
+        table_id: TableID,
+        session: &mut Session,
+        key: &SelectKey,
+        action: F,
+    ) {
+        let mut trx = session.begin_trx().unwrap();
+        trx = expect_trx_select(table_id, trx, key, action).await;
+        trx.commit().await.unwrap();
+    }
+
+    #[inline]
+    pub(crate) async fn expect_select_not_found_committed(
+        table_id: TableID,
+        session: &mut Session,
+        key: &SelectKey,
+    ) {
+        let mut trx = session.begin_trx().unwrap();
+        trx = expect_trx_select_not_found(table_id, trx, key).await;
+        trx.commit().await.unwrap();
+    }
+
+    #[inline]
+    pub(crate) async fn expect_trx_select_not_found(
+        table_id: TableID,
+        mut trx: Transaction,
+        key: &SelectKey,
+    ) -> Transaction {
+        let res = trx_select_row_mvcc_by_id(&mut trx, table_id, key, &[0, 1]).await;
+        assert!(matches!(res, Ok(SelectMvcc::NotFound)));
+        trx
+    }
+
+    #[inline]
+    pub(crate) async fn expect_trx_select<F: FnOnce(Vec<Val>)>(
+        table_id: TableID,
+        mut trx: Transaction,
+        key: &SelectKey,
+        action: F,
+    ) -> Transaction {
+        let res = trx_select_row_mvcc_by_id(&mut trx, table_id, key, &[0, 1]).await;
+        if !matches!(res, Ok(SelectMvcc::Found(_))) {
+            panic!("res={:?}", res);
+        }
+        action(res.unwrap().unwrap_found());
+        trx
+    }
+
+    pub(crate) async fn insert_one_row(
+        table_id: TableID,
+        session: &mut Session,
+        values: Vec<Val>,
+    ) -> RowID {
+        let mut trx = session.begin_trx().unwrap();
+        let insert = trx_insert_row_by_id(&mut trx, table_id, values).await;
+        let Ok(row_id) = insert else {
+            panic!("insert should succeed: {insert:?}");
+        };
+        trx.commit().await.unwrap();
+        row_id
+    }
+
+    pub(crate) fn single_key<V: Into<Val>>(value: V) -> SelectKey {
+        SelectKey {
+            index_no: 0,
+            vals: vec![value.into()],
+        }
+    }
+
+    pub(crate) async fn scan_table_i32s(trx: &mut Transaction, table_id: TableID) -> Vec<i32> {
+        let mut rows = Vec::new();
+        trx.exec(async |stmt| {
+            stmt.table_scan_mvcc(table_id, &[0], |vals| {
+                rows.push(vals[0].as_i32().unwrap());
+                true
+            })
+            .await?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+        rows.sort_unstable();
+        rows
+    }
+
+    pub(crate) async fn scan_table_pairs(
+        trx: &mut Transaction,
+        table_id: TableID,
+    ) -> Vec<(i32, String)> {
+        let mut rows = Vec::new();
+        trx.exec(async |stmt| {
+            stmt.table_scan_mvcc(table_id, &[0, 1], |vals| {
+                rows.push((
+                    vals[0].as_i32().unwrap(),
+                    vals[1].as_str().unwrap().to_string(),
+                ));
+                true
+            })
+            .await?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+        rows.sort_unstable();
+        rows
+    }
+
+    pub(crate) fn drop_table_test_spec() -> (TableSpec, Vec<IndexSpec>) {
+        (
+            TableSpec::new(vec![
+                ColumnSpec::new("id", ValKind::I32, ColumnAttributes::empty()),
+                ColumnSpec::new("name", ValKind::VarByte, ColumnAttributes::empty()),
+            ]),
+            vec![
+                IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::PK),
+                IndexSpec::new(vec![IndexKey::new(1)], IndexAttributes::empty()),
+            ],
+        )
+    }
+
+    pub(crate) fn lock_entry_count(engine: &Engine, owner: LockOwner) -> usize {
+        debug_snapshot(engine.lock_manager())
+            .entries
+            .iter()
+            .filter(|entry| entry.owner == owner)
+            .count()
+    }
+
+    pub(crate) fn has_lock_entry(
+        engine: &Engine,
+        owner: LockOwner,
+        resource: LockResource,
+        mode: LockMode,
+        state: LockDebugEntryState,
+    ) -> bool {
+        debug_snapshot(engine.lock_manager())
+            .entries
+            .iter()
+            .any(|entry| {
+                entry.owner == owner
+                    && entry.resource == resource
+                    && entry.mode == mode
+                    && entry.state == state
+            })
+    }
+
+    pub(crate) fn has_lock_resource(
+        engine: &Engine,
+        owner: LockOwner,
+        resource: LockResource,
+    ) -> bool {
+        debug_snapshot(engine.lock_manager())
+            .entries
+            .iter()
+            .any(|entry| entry.owner == owner && entry.resource == resource)
+    }
+
+    pub(crate) async fn wait_for_no_lock_resource(
+        engine: &Engine,
+        owner: LockOwner,
+        resource: LockResource,
+    ) {
+        for _ in 0..100 {
+            if !has_lock_resource(engine, owner, resource) {
+                return;
+            }
+            smol::Timer::after(Duration::from_millis(1)).await;
+        }
+        panic!("lock resource still present: owner={owner:?}, resource={resource:?}");
+    }
+
+    pub(crate) async fn wait_for_lock_entry(
+        engine: &Engine,
+        owner: LockOwner,
+        resource: LockResource,
+        mode: LockMode,
+        state: LockDebugEntryState,
+    ) {
+        for _ in 0..100 {
+            if has_lock_entry(engine, owner, resource, mode, state) {
+                return;
+            }
+            smol::Timer::after(Duration::from_millis(1)).await;
+        }
+        panic!(
+            "lock entry not observed: owner={owner:?}, resource={resource:?}, mode={mode:?}, state={state:?}"
+        );
+    }
+
+    pub(crate) fn name_key(value: &str) -> SelectKey {
+        SelectKey {
+            index_no: 1,
+            vals: vec![Val::from(value)],
+        }
+    }
+
+    pub(crate) fn unwrap_insert_result(res: Result<RowID>) -> RowID {
+        match res {
+            Ok(row_id) => row_id,
+            res => panic!("unexpected insert result: {res:?}"),
+        }
+    }
+
+    pub(crate) fn active_secondary_root(table: &Table, index_no: usize) -> BlockID {
+        table.file().active_root_unchecked().secondary_index_roots[index_no]
+    }
+
+    pub(crate) struct BoundUniqueIndexNo {
+        layout: Arc<TableRuntimeLayout>,
+        index_no: usize,
+        root: BlockID,
+    }
+
+    impl UniqueIndex for BoundUniqueIndexNo {
+        #[inline]
+        async fn lookup(
+            &self,
+            pool_guard: &PoolGuard,
+            key: &[Val],
+            ts: TrxID,
+        ) -> Result<Option<(RowID, bool)>> {
+            let index = self.layout.secondary_index(self.index_no)?;
+            index
+                .bind_unique(self.root)?
+                .lookup(pool_guard, key, ts)
+                .await
+        }
+
+        #[inline]
+        async fn insert_if_not_exists(
+            &self,
+            pool_guard: &PoolGuard,
+            key: &[Val],
+            row_id: RowID,
+            merge_if_match_deleted: bool,
+            ts: TrxID,
+        ) -> Result<IndexInsert> {
+            let index = self.layout.secondary_index(self.index_no)?;
+            index
+                .bind_unique(self.root)?
+                .insert_if_not_exists(pool_guard, key, row_id, merge_if_match_deleted, ts)
+                .await
+        }
+
+        #[inline]
+        async fn compare_delete(
+            &self,
+            pool_guard: &PoolGuard,
+            key: &[Val],
+            old_row_id: RowID,
+            ignore_del_mask: bool,
+            ts: TrxID,
+        ) -> Result<bool> {
+            let index = self.layout.secondary_index(self.index_no)?;
+            index
+                .bind_unique(self.root)?
+                .compare_delete(pool_guard, key, old_row_id, ignore_del_mask, ts)
+                .await
+        }
+
+        #[inline]
+        async fn compare_exchange(
+            &self,
+            pool_guard: &PoolGuard,
+            key: &[Val],
+            old_row_id: RowID,
+            new_row_id: RowID,
+            ts: TrxID,
+        ) -> Result<crate::index::IndexCompareExchange> {
+            let index = self.layout.secondary_index(self.index_no)?;
+            index
+                .bind_unique(self.root)?
+                .compare_exchange(pool_guard, key, old_row_id, new_row_id, ts)
+                .await
+        }
+
+        #[inline]
+        async fn scan_values(
+            &self,
+            pool_guard: &PoolGuard,
+            values: &mut Vec<RowID>,
+            ts: TrxID,
+        ) -> Result<()> {
+            let index = self.layout.secondary_index(self.index_no)?;
+            index
+                .bind_unique(self.root)?
+                .scan_values(pool_guard, values, ts)
+                .await
+        }
+    }
+
+    pub(crate) struct BoundNonUniqueIndexNo {
+        layout: Arc<TableRuntimeLayout>,
+        index_no: usize,
+        root: BlockID,
+    }
+
+    impl NonUniqueIndex for BoundNonUniqueIndexNo {
+        #[inline]
+        async fn lookup(
+            &self,
+            pool_guard: &PoolGuard,
+            key: &[Val],
+            res: &mut Vec<RowID>,
+            ts: TrxID,
+        ) -> Result<()> {
+            let index = self.layout.secondary_index(self.index_no)?;
+            index
+                .bind_non_unique(self.root)?
+                .lookup(pool_guard, key, res, ts)
+                .await
+        }
+
+        #[inline]
+        async fn lookup_unique(
+            &self,
+            pool_guard: &PoolGuard,
+            key: &[Val],
+            row_id: RowID,
+            ts: TrxID,
+        ) -> Result<Option<bool>> {
+            let index = self.layout.secondary_index(self.index_no)?;
+            index
+                .bind_non_unique(self.root)?
+                .lookup_unique(pool_guard, key, row_id, ts)
+                .await
+        }
+
+        #[inline]
+        async fn insert_if_not_exists(
+            &self,
+            pool_guard: &PoolGuard,
+            key: &[Val],
+            row_id: RowID,
+            merge_if_match_deleted: bool,
+            ts: TrxID,
+        ) -> Result<IndexInsert> {
+            let index = self.layout.secondary_index(self.index_no)?;
+            index
+                .bind_non_unique(self.root)?
+                .insert_if_not_exists(pool_guard, key, row_id, merge_if_match_deleted, ts)
+                .await
+        }
+
+        #[inline]
+        async fn mask_as_deleted(
+            &self,
+            pool_guard: &PoolGuard,
+            key: &[Val],
+            row_id: RowID,
+            ts: TrxID,
+        ) -> Result<bool> {
+            let index = self.layout.secondary_index(self.index_no)?;
+            index
+                .bind_non_unique(self.root)?
+                .mask_as_deleted(pool_guard, key, row_id, ts)
+                .await
+        }
+
+        #[inline]
+        async fn mask_as_active(
+            &self,
+            pool_guard: &PoolGuard,
+            key: &[Val],
+            row_id: RowID,
+            ts: TrxID,
+        ) -> Result<bool> {
+            let index = self.layout.secondary_index(self.index_no)?;
+            index
+                .bind_non_unique(self.root)?
+                .mask_as_active(pool_guard, key, row_id, ts)
+                .await
+        }
+
+        #[inline]
+        async fn compare_delete(
+            &self,
+            pool_guard: &PoolGuard,
+            key: &[Val],
+            row_id: RowID,
+            ignore_del_mask: bool,
+            ts: TrxID,
+        ) -> Result<bool> {
+            let index = self.layout.secondary_index(self.index_no)?;
+            index
+                .bind_non_unique(self.root)?
+                .compare_delete(pool_guard, key, row_id, ignore_del_mask, ts)
+                .await
+        }
+
+        #[inline]
+        async fn scan_values(
+            &self,
+            pool_guard: &PoolGuard,
+            values: &mut Vec<RowID>,
+            ts: TrxID,
+        ) -> Result<()> {
+            let index = self.layout.secondary_index(self.index_no)?;
+            index
+                .bind_non_unique(self.root)?
+                .scan_values(pool_guard, values, ts)
+                .await
+        }
+    }
+
+    pub(crate) fn bound_unique_index_no(table: &Table, index_no: usize) -> BoundUniqueIndexNo {
+        let layout = table.layout_snapshot();
+        BoundUniqueIndexNo {
+            layout,
+            index_no,
+            root: active_secondary_root(table, index_no),
+        }
+    }
+
+    pub(crate) fn bound_non_unique_index_no(
+        table: &Table,
+        index_no: usize,
+    ) -> BoundNonUniqueIndexNo {
+        let layout = table.layout_snapshot();
+        BoundNonUniqueIndexNo {
+            layout,
+            index_no,
+            root: active_secondary_root(table, index_no),
+        }
+    }
+
+    pub(crate) async fn assert_row_in_lwc(
+        table: &Table,
+        guards: &PoolGuards,
+        key: &SelectKey,
+        sts: TrxID,
+    ) -> RowID {
+        let index = bound_unique_index_no(table, key.index_no);
+        let Some((row_id, _)) = index
+            .lookup(guards.index_guard(), &key.vals, sts)
+            .await
+            .expect("index lookup should succeed")
+        else {
+            panic!("row should exist");
+        };
+        match table.find_row(guards, row_id).await.unwrap() {
+            RowLocation::LwcBlock { .. } => row_id,
+            RowLocation::RowPage(..) => panic!("row should be in lwc"),
+            RowLocation::NotFound => panic!("row should exist"),
+        }
+    }
+
+    pub(crate) async fn unique_disk_tree_lookup(
+        table: &Table,
+        guards: &PoolGuards,
+        key: &SelectKey,
+    ) -> Option<RowID> {
+        let root = active_secondary_root(table, key.index_no);
+        let layout = table.layout_snapshot();
+        let tree = layout
+            .secondary_index(key.index_no)
+            .unwrap()
+            .disk_runtime()
+            .open_unique_at(root, guards.disk_guard())
+            .unwrap();
+        tree.lookup(&key.vals).await.unwrap()
+    }
+
+    pub(crate) async fn non_unique_disk_tree_prefix_scan(
+        table: &Table,
+        guards: &PoolGuards,
+        key: &SelectKey,
+    ) -> Vec<RowID> {
+        let root = active_secondary_root(table, key.index_no);
+        let layout = table.layout_snapshot();
+        let tree = layout
+            .secondary_index(key.index_no)
+            .unwrap()
+            .disk_runtime()
+            .open_non_unique_at(root, guards.disk_guard())
+            .unwrap();
+        tree.prefix_scan_entries(&key.vals)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|(_, row_id)| row_id)
+            .collect()
+    }
+
+    pub(crate) async fn assert_unique_index_entry(
+        table: &Table,
+        guards: &PoolGuards,
+        key: &SelectKey,
+        sts: TrxID,
+        expected_row_id: RowID,
+        expected_deleted: bool,
+    ) {
+        let index = bound_unique_index_no(table, key.index_no);
+        let Some((row_id, deleted)) = index
+            .lookup(guards.index_guard(), &key.vals, sts)
+            .await
+            .expect("index lookup should succeed")
+        else {
+            panic!("index entry should exist");
+        };
+        assert_eq!(row_id, expected_row_id);
+        assert_eq!(deleted, expected_deleted);
+    }
+
+    pub(crate) fn delete_marker_ts(marker: DeleteMarker) -> TrxID {
+        match marker {
+            DeleteMarker::Committed(ts) => ts,
+            DeleteMarker::Ref(status) => status.ts(),
+        }
+    }
+
+    pub(crate) async fn wait_gc_cutoff_after(session: &Session, ts: TrxID) {
+        let trx_sys = session.engine().trx_sys.clone();
+        for _ in 0..50 {
+            if trx_sys.calc_min_active_sts_for_gc() > ts {
+                return;
+            }
+            smol::Timer::after(Duration::from_millis(20)).await;
+        }
+        panic!("GC cutoff did not advance past {ts}");
+    }
+
+    pub(crate) async fn wait_checkpoint_ready(table_id: TableID, session: &Session) {
+        let mut last_delay = None;
+        for _ in 0..50 {
+            match session.table_checkpoint_readiness(table_id).unwrap() {
+                CheckpointReadiness::Ready => return,
+                CheckpointReadiness::Delayed { reason } => {
+                    last_delay = Some(reason);
+                    smol::Timer::after(Duration::from_millis(20)).await;
+                }
+                readiness => panic!("checkpoint readiness is not retryable: {readiness:?}"),
+            }
+        }
+        panic!(
+            "checkpoint readiness stayed delayed after retries by {:?}",
+            last_delay.unwrap()
+        );
+    }
+
+    pub(crate) async fn wait_path_exists(path: &str, expected: bool) {
+        for _ in 0..250 {
+            if std::path::Path::new(path).exists() == expected {
+                return;
+            }
+            smol::Timer::after(Duration::from_millis(50)).await;
+        }
+        panic!("path existence did not become {expected}: {path}");
+    }
+
+    pub(crate) async fn checkpoint_published(table_id: TableID, session: &mut Session) -> TrxID {
+        let mut last_delay = None;
+        for _ in 0..50 {
+            match session.checkpoint_table(table_id).await.unwrap() {
+                CheckpointOutcome::Published { checkpoint_ts } => {
+                    return checkpoint_ts;
+                }
+                CheckpointOutcome::Delayed { reason } => {
+                    last_delay = Some(reason);
+                    smol::Timer::after(Duration::from_millis(20)).await;
+                }
+                CheckpointOutcome::Cancelled { reason } => {
+                    panic!("checkpoint should publish, cancelled by {reason:?}")
+                }
+            }
+        }
+        panic!(
+            "checkpoint should publish, delayed after retries by {:?}",
+            last_delay.unwrap()
+        )
+    }
+
+    pub(crate) fn assert_root_metadata_unchanged(
+        before: &crate::file::table_file::ActiveRoot,
+        table: &Table,
+    ) {
+        let after = table.file().active_root_unchecked();
+        assert_eq!(after.root_ts, before.root_ts);
+        assert_eq!(after.meta_block_id, before.meta_block_id);
+        assert_eq!(after.pivot_row_id, before.pivot_row_id);
+        assert_eq!(after.heap_redo_start_ts, before.heap_redo_start_ts);
+        assert_eq!(after.deletion_cutoff_ts, before.deletion_cutoff_ts);
+        assert_eq!(
+            after.column_block_index_root,
+            before.column_block_index_root
+        );
+        assert_eq!(after.secondary_index_roots, before.secondary_index_roots);
+    }
+
+    pub(crate) fn corrupt_page_checksum(
+        path: impl AsRef<std::path::Path>,
+        page_id: impl Into<u64>,
+    ) {
+        let page_id = page_id.into();
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .unwrap();
+        let offset = page_id * COW_FILE_PAGE_SIZE as u64 + (COW_FILE_PAGE_SIZE as u64 - 1);
+        file.seek(SeekFrom::Start(offset)).unwrap();
+        let mut byte = [0u8; 1];
+        file.read_exact(&mut byte).unwrap();
+        byte[0] ^= 0xFF;
+        file.seek(SeekFrom::Start(offset)).unwrap();
+        file.write_all(&byte).unwrap();
+        file.flush().unwrap();
+    }
+
+    pub(crate) fn rewrite_page_with_checksum(
+        path: impl AsRef<std::path::Path>,
+        page_id: impl Into<u64>,
+        rewrite: impl FnOnce(&mut [u8]),
+    ) {
+        let page_id = page_id.into();
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .unwrap();
+        let offset = page_id * COW_FILE_PAGE_SIZE as u64;
+        let mut page = vec![0u8; COW_FILE_PAGE_SIZE];
+        file.seek(SeekFrom::Start(offset)).unwrap();
+        file.read_exact(&mut page).unwrap();
+        rewrite(&mut page);
+        write_block_checksum(&mut page);
+        file.seek(SeekFrom::Start(offset)).unwrap();
+        file.write_all(&page).unwrap();
+        file.flush().unwrap();
+    }
+
+    pub(crate) fn corrupt_leaf_delete_codec(
+        path: impl AsRef<std::path::Path>,
+        page_id: impl Into<u64>,
+        prefix_idx: usize,
+    ) {
+        rewrite_page_with_checksum(path, page_id, |page| {
+            let byte_offset = leaf_entry_payload_offset(page, prefix_idx) + 35;
+            page[byte_offset] = 0xFF;
+        });
+    }
+
+    pub(crate) fn corrupt_leaf_row_codec(
+        path: impl AsRef<std::path::Path>,
+        page_id: impl Into<u64>,
+        prefix_idx: usize,
+    ) {
+        rewrite_page_with_checksum(path, page_id, |page| {
+            let byte_offset = leaf_entry_payload_offset(page, prefix_idx) + 32;
+            page[byte_offset] = 0;
+        });
+    }
+
+    pub(crate) fn corrupt_leaf_block_id(
+        path: impl AsRef<std::path::Path>,
+        page_id: impl Into<u64>,
+        prefix_idx: usize,
+    ) {
+        rewrite_page_with_checksum(path, page_id, |page| {
+            let byte_offset = leaf_entry_payload_offset(page, prefix_idx);
+            page[byte_offset..byte_offset + 8].copy_from_slice(&SUPER_BLOCK_ID.to_le_bytes());
+        });
+    }
+
+    pub(crate) fn corrupt_leaf_short_delete_section_header(
+        path: impl AsRef<std::path::Path>,
+        page_id: impl Into<u64>,
+        prefix_idx: usize,
+    ) {
+        const LEAF_ENTRY_ENTRY_LEN_OFFSET: usize = 28;
+        const LEAF_ENTRY_ROW_SECTION_LEN_OFFSET: usize = 30;
+        const LEAF_ENTRY_HEADER_SIZE: usize = 32;
+        const TRUNCATED_DELETE_SECTION_LEN: usize = 4;
+
+        rewrite_page_with_checksum(path, page_id, |page| {
+            let byte_offset = leaf_entry_payload_offset(page, prefix_idx);
+            let row_section_len = u16::from_le_bytes(
+                page[byte_offset + LEAF_ENTRY_ROW_SECTION_LEN_OFFSET
+                    ..byte_offset + LEAF_ENTRY_ROW_SECTION_LEN_OFFSET + 2]
+                    .try_into()
+                    .unwrap(),
+            ) as usize;
+            let truncated_entry_len =
+                (LEAF_ENTRY_HEADER_SIZE + row_section_len + TRUNCATED_DELETE_SECTION_LEN) as u16;
+            page[byte_offset + LEAF_ENTRY_ENTRY_LEN_OFFSET
+                ..byte_offset + LEAF_ENTRY_ENTRY_LEN_OFFSET + 2]
+                .copy_from_slice(&truncated_entry_len.to_le_bytes());
+        });
+    }
+
+    pub(crate) fn leaf_entry_payload_offset(page: &[u8], prefix_idx: usize) -> usize {
+        const SEARCH_TYPE_PLAIN: u8 = 1;
+        const SEARCH_TYPE_DELTA_U32: u8 = 2;
+        const SEARCH_TYPE_DELTA_U16: u8 = 3;
+
+        let payload_start = BLOCK_INTEGRITY_HEADER_SIZE;
+        let search_type = page[payload_start + COLUMN_BLOCK_HEADER_SIZE];
+        let (prefix_size, entry_offset_offset) = match search_type {
+            SEARCH_TYPE_PLAIN => (10usize, 8usize),
+            SEARCH_TYPE_DELTA_U32 => (6usize, 4usize),
+            SEARCH_TYPE_DELTA_U16 => (4usize, 2usize),
+            _ => panic!("invalid leaf search type {search_type}"),
+        };
+        let prefix_offset =
+            payload_start + COLUMN_BLOCK_LEAF_HEADER_SIZE + prefix_idx * prefix_size;
+        let entry_offset = u16::from_le_bytes(
+            page[prefix_offset + entry_offset_offset..prefix_offset + entry_offset_offset + 2]
+                .try_into()
+                .unwrap(),
+        ) as usize;
+        payload_start + COLUMN_BLOCK_LEAF_HEADER_SIZE + entry_offset
+    }
+
+    pub(crate) fn corrupt_lwc_row_shape_fingerprint(
+        path: impl AsRef<std::path::Path>,
+        page_id: impl Into<u64>,
+    ) {
+        rewrite_page_with_checksum(path, page_id, |page| {
+            let payload_start = BLOCK_INTEGRITY_HEADER_SIZE;
+            page[payload_start] ^= 0xFF;
+        });
+    }
+
+    pub(crate) async fn insert_rows(
+        table_id: TableID,
+        session: &mut Session,
+        start: i32,
+        count: i32,
+        name: &str,
+    ) {
+        let mut trx = session.begin_trx().unwrap();
+        for i in 0..count {
+            let insert = vec![Val::from(start + i), Val::from(name)];
+            trx = expect_trx_insert(table_id, trx, insert).await;
+        }
+        trx.commit().await.unwrap();
+    }
+
+    pub(crate) async fn insert_rows_direct(
+        table_id: TableID,
+        session: &mut Session,
+        start: i32,
+        count: i32,
+        name: &str,
+    ) {
+        let mut trx = session.begin_trx().unwrap();
+        for i in 0..count {
+            let insert = vec![Val::from(start + i), Val::from(name)];
+            let res = trx_insert_row_by_id(&mut trx, table_id, insert).await;
+            assert!(res.is_ok());
+        }
+        trx.commit().await.unwrap();
+    }
+
+    pub(crate) async fn delete_key_range_and_wait_gc_cutoff(
+        table_id: TableID,
+        session: &mut Session,
+        start: i32,
+        count: i32,
+    ) {
+        let mut max_delete_cts = TrxID::new(0);
+        for i in 0..count {
+            let mut trx = session.begin_trx().unwrap();
+            trx = expect_trx_delete(table_id, trx, &single_key(start + i)).await;
+            let cts = trx.commit().await.unwrap();
+            max_delete_cts = max_delete_cts.max(cts);
+        }
+        wait_gc_cutoff_after(session, max_delete_cts).await;
+    }
 }

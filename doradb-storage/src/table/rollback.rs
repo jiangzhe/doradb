@@ -433,3 +433,509 @@ impl IndexRollback for CatalogTable {
             .await
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::catalog::tests::table4;
+    use crate::conf::{EngineConfig, EvictableBufferPoolConfig, TrxSysConfig};
+    use crate::error::{OperationError, Result};
+    use crate::id::RowID;
+    use crate::index::{RowLocation, UniqueIndex};
+    use crate::row::ops::{DeleteMvcc, SelectKey, SelectMvcc, UpdateCol, UpdateMvcc};
+    use crate::session::tests::SessionTestExt;
+    use crate::table::tests::*;
+    use crate::trx::MAX_SNAPSHOT_TS;
+    use crate::value::Val;
+    use error_stack::Report;
+    use tempfile::TempDir;
+
+    #[test]
+    fn test_column_delete_rollback() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine =
+                evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys").await;
+            let table_id = create_table2_for_test(&engine).await;
+            let mut session = engine.new_session().unwrap();
+            insert_rows(table_id, &mut session, 0, 10, "name").await;
+            session.freeze_table(table_id, usize::MAX).await.unwrap();
+            checkpoint_published(table_id, &mut session).await;
+
+            let key = single_key(2i32);
+            let mut reader_session = engine.new_session().unwrap();
+            let trx = reader_session.begin_trx().unwrap();
+            let old_row_id = assert_row_in_lwc(
+                &table_for_internal_assertion(&engine, table_id),
+                &reader_session.pool_guards(),
+                &key,
+                trx.sts(),
+            )
+            .await;
+            trx.commit().await.unwrap();
+
+            let mut trx = session.begin_trx().unwrap();
+            trx.exec(async |stmt| {
+                let res = stmt_delete_row_by_id(stmt, table_id, &key).await;
+                assert!(matches!(res, Ok(DeleteMvcc::Deleted)));
+                assert_unique_index_entry(
+                    &table_for_internal_assertion(&engine, table_id),
+                    &session.pool_guards(),
+                    &key,
+                    stmt.runtime().sts(),
+                    old_row_id,
+                    true,
+                )
+                .await;
+                Ok(())
+            })
+            .await
+            .unwrap();
+            trx.rollback().await.unwrap();
+            assert_unique_index_entry(
+                &table_for_internal_assertion(&engine, table_id),
+                &session.pool_guards(),
+                &key,
+                MAX_SNAPSHOT_TS,
+                old_row_id,
+                false,
+            )
+            .await;
+
+            let mut trx = session.begin_trx().unwrap();
+            trx = expect_trx_select(table_id, trx, &key, |row| {
+                assert_eq!(row[0], Val::from(2i32));
+            })
+            .await;
+            trx.commit().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn test_column_delete_rollback_after_checkpoint() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine =
+                evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys").await;
+            let table_id = create_table2_for_test(&engine).await;
+            let mut session = engine.new_session().unwrap();
+            insert_rows(table_id, &mut session, 0, 10, "name").await;
+
+            let key = single_key(3i32);
+            let mut trx_delete = session.begin_trx().unwrap();
+            let res = trx_delete_row_by_id(&mut trx_delete, table_id, &key).await;
+            assert!(matches!(res, Ok(DeleteMvcc::Deleted)));
+
+            session.freeze_table(table_id, usize::MAX).await.unwrap();
+            let mut checkpoint_session = engine.new_session().unwrap();
+            checkpoint_published(table_id, &mut checkpoint_session).await;
+
+            let mut reader_session = engine.new_session().unwrap();
+            let trx = reader_session.begin_trx().unwrap();
+            let _ = assert_row_in_lwc(
+                &table_for_internal_assertion(&engine, table_id),
+                &reader_session.pool_guards(),
+                &key,
+                trx.sts(),
+            )
+            .await;
+            trx.commit().await.unwrap();
+
+            let res = trx_select_row_mvcc_by_id(&mut trx_delete, table_id, &key, &[0, 1]).await;
+            assert!(matches!(res, Ok(SelectMvcc::NotFound)));
+            trx_delete.rollback().await.unwrap();
+
+            let mut trx = session.begin_trx().unwrap();
+            trx = expect_trx_select(table_id, trx, &key, |row| {
+                assert_eq!(row[0], Val::from(3i32));
+            })
+            .await;
+            trx.commit().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn test_unique_insert_rollback_restores_deleted_owner_even_when_row_missing() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine =
+                evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys").await;
+            let table_id = create_table2_for_test(&engine).await;
+            let mut session = engine.new_session().unwrap();
+            let key = single_key(10_001i32);
+            let stale_row_id = 10_001;
+
+            assert!(matches!(
+                table_for_internal_assertion(&engine, table_id)
+                    .find_row(&session.pool_guards(), RowID::new(stale_row_id))
+                    .await
+                    .unwrap(),
+                RowLocation::NotFound
+            ));
+
+            let index = bound_unique_index_no(
+                &table_for_internal_assertion(&engine, table_id),
+                key.index_no,
+            );
+            assert!(
+                index
+                    .insert_if_not_exists(
+                        session.pool_guards().index_guard(),
+                        &key.vals,
+                        RowID::new(stale_row_id),
+                        false,
+                        MAX_SNAPSHOT_TS,
+                    )
+                    .await
+                    .unwrap()
+                    .is_ok()
+            );
+            assert!(
+                index
+                    .mask_as_deleted(
+                        session.pool_guards().index_guard(),
+                        &key.vals,
+                        RowID::new(stale_row_id),
+                        MAX_SNAPSHOT_TS,
+                    )
+                    .await
+                    .unwrap()
+            );
+            assert_unique_index_entry(
+                &table_for_internal_assertion(&engine, table_id),
+                &session.pool_guards(),
+                &key,
+                MAX_SNAPSHOT_TS,
+                RowID::new(stale_row_id),
+                true,
+            )
+            .await;
+
+            let mut trx = session.begin_trx().unwrap();
+            let res: Result<()> = trx
+                .exec(async |stmt| {
+                    let new_row_id = unwrap_insert_result(
+                        stmt_insert_row_by_id(
+                            stmt,
+                            table_id,
+                            vec![Val::from(10_001i32), Val::from("reborn")],
+                        )
+                        .await,
+                    );
+                    assert_ne!(new_row_id, RowID::new(stale_row_id));
+                    assert_unique_index_entry(
+                        &table_for_internal_assertion(&engine, table_id),
+                        &session.pool_guards(),
+                        &key,
+                        stmt.runtime().sts(),
+                        new_row_id,
+                        false,
+                    )
+                    .await;
+                    Err(Report::new(OperationError::NotSupported).into())
+                })
+                .await;
+            assert_eq!(
+                res.unwrap_err().operation_error(),
+                Some(OperationError::NotSupported)
+            );
+            trx.rollback().await.unwrap();
+
+            assert_unique_index_entry(
+                &table_for_internal_assertion(&engine, table_id),
+                &session.pool_guards(),
+                &key,
+                MAX_SNAPSHOT_TS,
+                RowID::new(stale_row_id),
+                true,
+            )
+            .await;
+            expect_select_not_found_committed(table_id, &mut session, &key).await;
+            expect_insert_committed(
+                table_id,
+                &mut session,
+                vec![Val::from(10_001i32), Val::from("reclaimed")],
+            )
+            .await;
+            expect_select_committed(table_id, &mut session, &key, |vals| {
+                assert_eq!(vals, vec![Val::from(10_001i32), Val::from("reclaimed")]);
+            })
+            .await;
+        });
+    }
+
+    #[test]
+    fn test_unique_insert_rollback_restores_delete_marked_stale_hot_owner() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine =
+                evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys").await;
+            let table_id = create_table2_for_test(&engine).await;
+            let mut session = engine.new_session().unwrap();
+            let live_key = single_key(1i32);
+            let stale_key = single_key(2i32);
+            expect_insert_committed(
+                table_id,
+                &mut session,
+                vec![Val::from(1i32), Val::from("one")],
+            )
+            .await;
+
+            let reader = session.begin_trx().unwrap();
+            let old_row_id = bound_unique_index_no(
+                &table_for_internal_assertion(&engine, table_id),
+                live_key.index_no,
+            )
+            .lookup(
+                session.pool_guards().index_guard(),
+                &live_key.vals,
+                reader.sts(),
+            )
+            .await
+            .unwrap()
+            .unwrap()
+            .0;
+            reader.commit().await.unwrap();
+            assert!(matches!(
+                table_for_internal_assertion(&engine, table_id)
+                    .find_row(&session.pool_guards(), old_row_id)
+                    .await
+                    .unwrap(),
+                RowLocation::RowPage(_)
+            ));
+
+            let index = bound_unique_index_no(
+                &table_for_internal_assertion(&engine, table_id),
+                stale_key.index_no,
+            );
+            assert!(
+                index
+                    .insert_if_not_exists(
+                        session.pool_guards().index_guard(),
+                        &stale_key.vals,
+                        old_row_id,
+                        false,
+                        MAX_SNAPSHOT_TS,
+                    )
+                    .await
+                    .unwrap()
+                    .is_ok()
+            );
+            assert!(
+                index
+                    .mask_as_deleted(
+                        session.pool_guards().index_guard(),
+                        &stale_key.vals,
+                        old_row_id,
+                        MAX_SNAPSHOT_TS,
+                    )
+                    .await
+                    .unwrap()
+            );
+
+            let mut trx = session.begin_trx().unwrap();
+            let res: Result<()> = trx
+                .exec(async |stmt| {
+                    let new_row_id = unwrap_insert_result(
+                        stmt_insert_row_by_id(
+                            stmt,
+                            table_id,
+                            vec![Val::from(2i32), Val::from("two")],
+                        )
+                        .await,
+                    );
+                    assert_ne!(new_row_id, old_row_id);
+                    assert_unique_index_entry(
+                        &table_for_internal_assertion(&engine, table_id),
+                        &session.pool_guards(),
+                        &stale_key,
+                        stmt.runtime().sts(),
+                        new_row_id,
+                        false,
+                    )
+                    .await;
+                    Err(Report::new(OperationError::NotSupported).into())
+                })
+                .await;
+            assert_eq!(
+                res.unwrap_err().operation_error(),
+                Some(OperationError::NotSupported)
+            );
+            trx.rollback().await.unwrap();
+
+            assert_unique_index_entry(
+                &table_for_internal_assertion(&engine, table_id),
+                &session.pool_guards(),
+                &stale_key,
+                MAX_SNAPSHOT_TS,
+                old_row_id,
+                true,
+            )
+            .await;
+            expect_select_committed(table_id, &mut session, &live_key, |vals| {
+                assert_eq!(vals, vec![Val::from(1i32), Val::from("one")]);
+            })
+            .await;
+            expect_select_not_found_committed(table_id, &mut session, &stale_key).await;
+            expect_insert_committed(
+                table_id,
+                &mut session,
+                vec![Val::from(2i32), Val::from("two-final")],
+            )
+            .await;
+            expect_select_committed(table_id, &mut session, &stale_key, |vals| {
+                assert_eq!(vals, vec![Val::from(2i32), Val::from("two-final")]);
+            })
+            .await;
+        });
+    }
+
+    #[test]
+    fn test_mvcc_rollback_insert_normal() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine =
+                evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys").await;
+            let table_id = create_table2_for_test(&engine).await;
+            {
+                let mut session = engine.new_session().unwrap();
+                // insert 1 row
+                let mut trx = session.begin_trx().unwrap();
+                let insert = vec![Val::from(1i32), Val::from("hello")];
+                trx = expect_trx_insert(table_id, trx, insert).await;
+                // explicit rollback
+                trx.rollback().await.unwrap();
+
+                // select 1 row
+                let key = single_key(1i32);
+                _ = expect_select_not_found_committed(table_id, &mut session, &key).await;
+            }
+        });
+    }
+
+    #[test]
+    fn test_mvcc_rollback_insert_link_unique_index() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine =
+                evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys").await;
+            let table_id = create_table2_for_test(&engine).await;
+            {
+                let mut session = engine.new_session().unwrap();
+                // insert 1 row
+                let insert = vec![Val::from(1i32), Val::from("hello")];
+                expect_insert_committed(table_id, &mut session, insert).await;
+
+                // delete it
+                let key = single_key(1i32);
+                expect_delete_committed(table_id, &mut session, &key).await;
+
+                // insert again, trigger insert+link
+                let insert = vec![Val::from(1i32), Val::from("world")];
+                let mut trx = session.begin_trx().unwrap();
+                trx = expect_trx_insert(table_id, trx, insert).await;
+                // explicit rollback
+                trx.rollback().await.unwrap();
+
+                // select 1 row
+                let key = single_key(1i32);
+                _ = expect_select_not_found_committed(table_id, &mut session, &key).await;
+            }
+        });
+    }
+
+    #[test]
+    fn test_secondary_index_rollback() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let main_dir = temp_dir.path().to_path_buf();
+            let engine = EngineConfig::default()
+                .storage_root(main_dir)
+                .data_buffer(
+                    EvictableBufferPoolConfig::default().role(crate::buffer::PoolRole::Mem),
+                )
+                .trx(TrxSysConfig::default().log_file_stem("redo_secidx2"))
+                .build()
+                .await
+                .unwrap();
+            let table_id = table4(&engine).await;
+            {
+                let mut session = engine.new_session().unwrap();
+                let user_read_set = &[0usize, 1];
+                let mut trx = session.begin_trx().unwrap();
+                for i in 0i32..5i32 {
+                    let res =
+                        trx_insert_row_by_id(&mut trx, table_id, vec![Val::from(i), Val::from(i)])
+                            .await;
+                    assert!(res.is_ok());
+                }
+                trx.commit().await.unwrap();
+
+                let mut trx = session.begin_trx().unwrap();
+                let res = trx_insert_row_by_id(
+                    &mut trx,
+                    table_id,
+                    vec![Val::from(5i32), Val::from(5i32)],
+                )
+                .await;
+                assert!(res.is_ok());
+                trx.rollback().await.unwrap();
+
+                let mut trx = session.begin_trx().unwrap();
+                let key = SelectKey::new(0, vec![Val::from(5i32)]);
+                let res = trx_select_row_mvcc_by_id(&mut trx, table_id, &key, user_read_set).await;
+                trx.commit().await.unwrap();
+                assert!(matches!(res, Ok(SelectMvcc::NotFound)));
+
+                let mut trx = session.begin_trx().unwrap();
+                let key = SelectKey::new(0, vec![Val::from(1i32)]);
+                let update = vec![UpdateCol {
+                    idx: 1,
+                    val: Val::from(0i32),
+                }];
+                let res = trx_update_row_by_id(&mut trx, table_id, &key, update).await;
+                assert!(matches!(res, Ok(UpdateMvcc::Updated(_))));
+                trx.rollback().await.unwrap();
+
+                let mut trx = session.begin_trx().unwrap();
+                let key = SelectKey::new(0, vec![Val::from(1i32)]);
+                let res = trx_select_row_mvcc_by_id(&mut trx, table_id, &key, user_read_set).await;
+                trx.commit().await.unwrap();
+                assert!(matches!(res, Ok(SelectMvcc::Found(_))));
+                let vals = res.unwrap().unwrap_found();
+                assert!(vals[0] == Val::from(1i32) && vals[1] == Val::from(1i32));
+
+                let mut trx = session.begin_trx().unwrap();
+                let key = SelectKey::new(0, vec![Val::from(0i32)]);
+                let res = trx_delete_row_by_id(&mut trx, table_id, &key).await;
+                assert!(matches!(res, Ok(DeleteMvcc::Deleted)));
+                trx.rollback().await.unwrap();
+
+                let mut trx = session.begin_trx().unwrap();
+                let key = SelectKey::new(0, vec![Val::from(0i32)]);
+                let res = trx_select_row_mvcc_by_id(&mut trx, table_id, &key, user_read_set).await;
+                trx.commit().await.unwrap();
+                assert!(matches!(res, Ok(SelectMvcc::Found(_))));
+                let vals = res.unwrap().unwrap_found();
+                assert!(vals[0] == Val::from(0i32) && vals[1] == Val::from(0i32));
+
+                let mut trx = session.begin_trx().unwrap();
+                let key = SelectKey::new(0, vec![Val::from(3i32)]);
+                let res = trx_delete_row_by_id(&mut trx, table_id, &key).await;
+                assert!(matches!(res, Ok(DeleteMvcc::Deleted)));
+                let res =
+                    trx_insert_row_by_id(&mut trx, table_id, vec![Val::from(3), Val::from(3)])
+                        .await;
+                assert!(res.is_ok());
+                trx.rollback().await.unwrap();
+
+                let mut trx = session.begin_trx().unwrap();
+                let key = SelectKey::new(0, vec![Val::from(3i32)]);
+                let res = trx_select_row_mvcc_by_id(&mut trx, table_id, &key, user_read_set).await;
+                _ = trx.commit().await.unwrap();
+                assert!(matches!(res, Ok(SelectMvcc::Found(_))));
+                let vals = res.unwrap().unwrap_found();
+                assert!(vals[0] == Val::from(3i32) && vals[1] == Val::from(3i32));
+            }
+        })
+    }
+}

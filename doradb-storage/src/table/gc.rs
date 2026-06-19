@@ -626,3 +626,1623 @@ async fn compare_delete_non_unique_cleanup_entry<P: BufferPool>(
         Ok(CleanupDecision::Retain)
     }
 }
+
+#[cfg(test)]
+mod table_moved_tests {
+    use crate::catalog::IndexNo;
+    use crate::error::{DataIntegrityError, OperationError};
+    use crate::id::{RowID, TrxID};
+    use crate::index::{IndexInsert, NonUniqueIndex, UniqueIndex};
+    use crate::session::tests::SessionTestExt;
+    use crate::table::tests::*;
+    use crate::trx::MAX_SNAPSHOT_TS;
+    use crate::value::Val;
+    use tempfile::TempDir;
+
+    #[test]
+    fn test_secondary_mem_index_cleanup_removes_redundant_live_unique_entries() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine =
+                evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys").await;
+            let table_id = create_table2_for_test(&engine).await;
+            let mut session = engine.new_session().unwrap();
+            let row_count = 4;
+            insert_rows(table_id, &mut session, 0, row_count, "name").await;
+            session.freeze_table(table_id, usize::MAX).await.unwrap();
+            checkpoint_published(table_id, &mut session).await;
+
+            let index = bound_unique_index_no(&table_for_internal_assertion(&engine, table_id), 0);
+            let stats = session
+                .cleanup_secondary_mem_indexes(table_id, true)
+                .await
+                .unwrap();
+            assert!(!session.in_trx().unwrap());
+            assert_eq!(stats.indexes.len(), 1);
+            assert_eq!(stats.indexes[0].index_no, 0);
+            assert!(stats.indexes[0].unique);
+            assert_eq!(stats.indexes[0].scanned, row_count as usize);
+            assert_eq!(stats.indexes[0].removed, row_count as usize);
+            assert_eq!(stats.indexes[0].retained, 0);
+            assert_eq!(stats.indexes[0].skipped_live, 0);
+            assert_eq!(stats.indexes[0].skipped_hot_deleted, 0);
+
+            for key_value in 0..row_count {
+                let key = single_key(key_value);
+                let disk_row_id = unique_disk_tree_lookup(
+                    &table_for_internal_assertion(&engine, table_id),
+                    &session.pool_guards(),
+                    &key,
+                )
+                .await
+                .unwrap();
+                assert_eq!(
+                    index
+                        .lookup(
+                            session.pool_guards().index_guard(),
+                            &key.vals,
+                            MAX_SNAPSHOT_TS,
+                        )
+                        .await
+                        .unwrap(),
+                    Some((disk_row_id, false))
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn test_secondary_mem_index_cleanup_requires_idle_session() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine =
+                evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys").await;
+            let table_id = create_table2_for_test(&engine).await;
+            let mut session = engine.new_session().unwrap();
+            let trx = session.begin_trx().unwrap();
+
+            let err = session
+                .cleanup_secondary_mem_indexes(table_id, true)
+                .await
+                .unwrap_err();
+            let operation_error = err.operation_error();
+            let was_in_trx = session.in_trx().unwrap();
+
+            trx.rollback().await.unwrap();
+            assert_eq!(operation_error, Some(OperationError::ExistingTransaction));
+            assert!(was_in_trx);
+            assert!(!session.in_trx().unwrap());
+        });
+    }
+
+    #[test]
+    fn test_secondary_mem_index_cleanup_removes_redundant_live_non_unique_entries() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine =
+                evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys_non_unique")
+                    .await;
+            let table_id = create_non_unique_name_table_for_test(&engine).await;
+            let mut session = engine.new_session().unwrap();
+            let row_count = 5;
+            insert_rows(table_id, &mut session, 0, row_count, "same-name").await;
+            session.freeze_table(table_id, usize::MAX).await.unwrap();
+            checkpoint_published(table_id, &mut session).await;
+
+            let index =
+                bound_non_unique_index_no(&table_for_internal_assertion(&engine, table_id), 1);
+            let stats = session
+                .cleanup_secondary_mem_indexes(table_id, true)
+                .await
+                .unwrap();
+            assert_eq!(stats.indexes.len(), 2);
+            assert_eq!(stats.indexes[1].index_no, 1);
+            assert!(!stats.indexes[1].unique);
+            assert_eq!(stats.indexes[1].scanned, row_count as usize);
+            assert_eq!(stats.indexes[1].removed, row_count as usize);
+            assert_eq!(stats.indexes[1].retained, 0);
+            assert_eq!(stats.indexes[1].skipped_live, 0);
+            assert_eq!(stats.indexes[1].skipped_hot_deleted, 0);
+
+            let key = name_key("same-name");
+            let disk_rows = non_unique_disk_tree_prefix_scan(
+                &table_for_internal_assertion(&engine, table_id),
+                &session.pool_guards(),
+                &key,
+            )
+            .await;
+            assert_eq!(disk_rows.len(), row_count as usize);
+            let mut lookup_rows = Vec::new();
+            index
+                .lookup(
+                    session.pool_guards().index_guard(),
+                    &key.vals,
+                    &mut lookup_rows,
+                    MAX_SNAPSHOT_TS,
+                )
+                .await
+                .unwrap();
+            assert_eq!(lookup_rows, disk_rows);
+        });
+    }
+
+    #[test]
+    fn test_secondary_mem_index_cleanup_aggregates_bounded_batches() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine =
+                evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys_non_unique")
+                    .await;
+            let table_id = create_non_unique_name_table_for_test(&engine).await;
+            let mut session = engine.new_session().unwrap();
+            let name = "batch-name-".repeat(120);
+            let row_count = 80;
+            insert_rows(table_id, &mut session, 0, row_count, &name).await;
+            session.freeze_table(table_id, usize::MAX).await.unwrap();
+            checkpoint_published(table_id, &mut session).await;
+
+            let stats = session
+                .cleanup_secondary_mem_indexes(table_id, true)
+                .await
+                .unwrap();
+            assert_eq!(stats.indexes[1].scanned, row_count as usize);
+            assert_eq!(stats.indexes[1].removed, row_count as usize);
+            assert_eq!(stats.indexes[1].retained, 0);
+            assert_eq!(stats.indexes[1].skipped_live, 0);
+            assert_eq!(stats.indexes[1].skipped_hot_deleted, 0);
+        });
+    }
+
+    #[test]
+    fn test_secondary_mem_index_cleanup_can_retain_live_cache_entries() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine =
+                evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys_non_unique")
+                    .await;
+            let table_id = create_non_unique_name_table_for_test(&engine).await;
+            let mut session = engine.new_session().unwrap();
+            let row_count = 4;
+            insert_rows(table_id, &mut session, 0, row_count, "same-name").await;
+            session.freeze_table(table_id, usize::MAX).await.unwrap();
+            checkpoint_published(table_id, &mut session).await;
+
+            let unique_index =
+                bound_unique_index_no(&table_for_internal_assertion(&engine, table_id), 0);
+            let non_unique_index =
+                bound_non_unique_index_no(&table_for_internal_assertion(&engine, table_id), 1);
+            let stats = session
+                .cleanup_secondary_mem_indexes(table_id, false)
+                .await
+                .unwrap();
+            assert_eq!(stats.indexes.len(), 2);
+            for index_stats in &stats.indexes {
+                assert_eq!(index_stats.scanned, 0);
+                assert_eq!(index_stats.removed, 0);
+                assert_eq!(index_stats.retained, 0);
+                assert_eq!(index_stats.skipped_live, row_count as usize);
+                assert_eq!(index_stats.skipped_hot_deleted, 0);
+            }
+
+            let unique_key = single_key(0i32);
+            let unique_row_id = unique_disk_tree_lookup(
+                &table_for_internal_assertion(&engine, table_id),
+                &session.pool_guards(),
+                &unique_key,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                unique_index
+                    .lookup(
+                        session.pool_guards().index_guard(),
+                        &unique_key.vals,
+                        MAX_SNAPSHOT_TS,
+                    )
+                    .await
+                    .unwrap(),
+                Some((unique_row_id, false))
+            );
+
+            let name_key = name_key("same-name");
+            let disk_rows = non_unique_disk_tree_prefix_scan(
+                &table_for_internal_assertion(&engine, table_id),
+                &session.pool_guards(),
+                &name_key,
+            )
+            .await;
+            let mut lookup_rows = Vec::new();
+            non_unique_index
+                .lookup(
+                    session.pool_guards().index_guard(),
+                    &name_key.vals,
+                    &mut lookup_rows,
+                    MAX_SNAPSHOT_TS,
+                )
+                .await
+                .unwrap();
+            assert_eq!(lookup_rows, disk_rows);
+        });
+    }
+
+    #[test]
+    fn test_secondary_mem_index_cleanup_retains_unique_delete_shadow_without_delete_proof() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine =
+                evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys").await;
+            let table_id = create_table2_for_test(&engine).await;
+            let mut session = engine.new_session().unwrap();
+            insert_rows(table_id, &mut session, 0, 1, "name").await;
+
+            let current_key = single_key(0i32);
+            let stale_key = single_key(-1i32);
+            let index = bound_unique_index_no(&table_for_internal_assertion(&engine, table_id), 0);
+            let row_id = index
+                .lookup(
+                    session.pool_guards().index_guard(),
+                    &current_key.vals,
+                    MAX_SNAPSHOT_TS,
+                )
+                .await
+                .unwrap()
+                .unwrap()
+                .0;
+            assert!(
+                index
+                    .insert_if_not_exists(
+                        session.pool_guards().index_guard(),
+                        &stale_key.vals,
+                        row_id,
+                        false,
+                        MAX_SNAPSHOT_TS,
+                    )
+                    .await
+                    .unwrap()
+                    .is_ok()
+            );
+            assert!(
+                index
+                    .mask_as_deleted(
+                        session.pool_guards().index_guard(),
+                        &stale_key.vals,
+                        row_id,
+                        MAX_SNAPSHOT_TS,
+                    )
+                    .await
+                    .unwrap()
+            );
+
+            let stats = session
+                .cleanup_secondary_mem_indexes(table_id, true)
+                .await
+                .unwrap();
+            assert_eq!(stats.indexes[0].scanned, 0);
+            assert_eq!(stats.indexes[0].removed, 0);
+            assert_eq!(stats.indexes[0].retained, 0);
+            assert_eq!(stats.indexes[0].skipped_live, 1);
+            assert_eq!(stats.indexes[0].skipped_hot_deleted, 1);
+            assert_eq!(
+                index
+                    .lookup(
+                        session.pool_guards().index_guard(),
+                        &stale_key.vals,
+                        MAX_SNAPSHOT_TS,
+                    )
+                    .await
+                    .unwrap(),
+                Some((row_id, true))
+            );
+            assert_eq!(
+                index
+                    .lookup(
+                        session.pool_guards().index_guard(),
+                        &current_key.vals,
+                        MAX_SNAPSHOT_TS,
+                    )
+                    .await
+                    .unwrap(),
+                Some((row_id, false))
+            );
+        });
+    }
+
+    #[test]
+    fn test_secondary_mem_index_cleanup_removes_unique_delete_shadow_with_purgeable_marker() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine =
+                evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys").await;
+            let table_id = create_table2_for_test(&engine).await;
+            let mut session = engine.new_session().unwrap();
+            insert_rows(table_id, &mut session, 0, 1, "name").await;
+            session.freeze_table(table_id, usize::MAX).await.unwrap();
+            checkpoint_published(table_id, &mut session).await;
+
+            let current_key = single_key(0i32);
+            let stale_key = single_key(-1i32);
+            let row_id = unique_disk_tree_lookup(
+                &table_for_internal_assertion(&engine, table_id),
+                &session.pool_guards(),
+                &current_key,
+            )
+            .await
+            .unwrap();
+            let index = bound_unique_index_no(&table_for_internal_assertion(&engine, table_id), 0);
+            assert!(
+                index
+                    .insert_if_not_exists(
+                        session.pool_guards().index_guard(),
+                        &stale_key.vals,
+                        row_id,
+                        false,
+                        MAX_SNAPSHOT_TS,
+                    )
+                    .await
+                    .unwrap()
+                    .is_ok()
+            );
+            assert!(
+                index
+                    .mask_as_deleted(
+                        session.pool_guards().index_guard(),
+                        &stale_key.vals,
+                        row_id,
+                        MAX_SNAPSHOT_TS,
+                    )
+                    .await
+                    .unwrap()
+            );
+            table_for_internal_assertion(&engine, table_id)
+                .deletion_buffer()
+                .put_committed(row_id, TrxID::new(1))
+                .unwrap();
+
+            let stats = session
+                .cleanup_secondary_mem_indexes(table_id, true)
+                .await
+                .unwrap();
+            assert_eq!(stats.indexes[0].scanned, 2);
+            assert_eq!(stats.indexes[0].removed, 2);
+            assert_eq!(stats.indexes[0].retained, 0);
+            assert_eq!(stats.indexes[0].skipped_live, 0);
+            assert_eq!(stats.indexes[0].skipped_hot_deleted, 0);
+            assert_eq!(
+                index
+                    .lookup(
+                        session.pool_guards().index_guard(),
+                        &stale_key.vals,
+                        MAX_SNAPSHOT_TS,
+                    )
+                    .await
+                    .unwrap(),
+                None
+            );
+        });
+    }
+
+    #[test]
+    fn test_secondary_mem_index_cleanup_removes_delete_shadow_when_live_cleanup_disabled() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine =
+                evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys").await;
+            let table_id = create_table2_for_test(&engine).await;
+            let mut session = engine.new_session().unwrap();
+            insert_rows(table_id, &mut session, 0, 1, "name").await;
+            session.freeze_table(table_id, usize::MAX).await.unwrap();
+            checkpoint_published(table_id, &mut session).await;
+
+            let current_key = single_key(0i32);
+            let stale_key = single_key(-1i32);
+            let row_id = unique_disk_tree_lookup(
+                &table_for_internal_assertion(&engine, table_id),
+                &session.pool_guards(),
+                &current_key,
+            )
+            .await
+            .unwrap();
+            let index = bound_unique_index_no(&table_for_internal_assertion(&engine, table_id), 0);
+            assert!(
+                index
+                    .insert_if_not_exists(
+                        session.pool_guards().index_guard(),
+                        &stale_key.vals,
+                        row_id,
+                        false,
+                        MAX_SNAPSHOT_TS,
+                    )
+                    .await
+                    .unwrap()
+                    .is_ok()
+            );
+            assert!(
+                index
+                    .mask_as_deleted(
+                        session.pool_guards().index_guard(),
+                        &stale_key.vals,
+                        row_id,
+                        MAX_SNAPSHOT_TS,
+                    )
+                    .await
+                    .unwrap()
+            );
+            table_for_internal_assertion(&engine, table_id)
+                .deletion_buffer()
+                .put_committed(row_id, TrxID::new(1))
+                .unwrap();
+
+            let stats = session
+                .cleanup_secondary_mem_indexes(table_id, false)
+                .await
+                .unwrap();
+            assert_eq!(stats.indexes[0].scanned, 1);
+            assert_eq!(stats.indexes[0].removed, 1);
+            assert_eq!(stats.indexes[0].retained, 0);
+            assert_eq!(stats.indexes[0].skipped_live, 1);
+            assert_eq!(stats.indexes[0].skipped_hot_deleted, 0);
+            assert_eq!(
+                index
+                    .lookup(
+                        session.pool_guards().index_guard(),
+                        &stale_key.vals,
+                        MAX_SNAPSHOT_TS,
+                    )
+                    .await
+                    .unwrap(),
+                None
+            );
+            assert_eq!(
+                index
+                    .lookup(
+                        session.pool_guards().index_guard(),
+                        &current_key.vals,
+                        MAX_SNAPSHOT_TS,
+                    )
+                    .await
+                    .unwrap(),
+                Some((row_id, false))
+            );
+        });
+    }
+
+    #[test]
+    fn test_secondary_mem_index_cleanup_removes_unique_delete_shadow_with_matching_cold_entry() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine =
+                evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys").await;
+            let table_id = create_table2_for_test(&engine).await;
+            let mut session = engine.new_session().unwrap();
+            insert_rows(table_id, &mut session, 0, 1, "name").await;
+            session.freeze_table(table_id, usize::MAX).await.unwrap();
+            checkpoint_published(table_id, &mut session).await;
+
+            let current_key = single_key(0i32);
+            let row_id = unique_disk_tree_lookup(
+                &table_for_internal_assertion(&engine, table_id),
+                &session.pool_guards(),
+                &current_key,
+            )
+            .await
+            .unwrap();
+            let index = bound_unique_index_no(&table_for_internal_assertion(&engine, table_id), 0);
+            assert!(
+                index
+                    .mask_as_deleted(
+                        session.pool_guards().index_guard(),
+                        &current_key.vals,
+                        row_id,
+                        MAX_SNAPSHOT_TS,
+                    )
+                    .await
+                    .unwrap()
+            );
+
+            let stats = session
+                .cleanup_secondary_mem_indexes(table_id, true)
+                .await
+                .unwrap();
+            assert_eq!(stats.indexes[0].scanned, 1);
+            assert_eq!(stats.indexes[0].removed, 0);
+            assert_eq!(stats.indexes[0].retained, 1);
+            assert_eq!(stats.indexes[0].skipped_live, 0);
+            assert_eq!(stats.indexes[0].skipped_hot_deleted, 0);
+            assert_eq!(
+                index
+                    .lookup(
+                        session.pool_guards().index_guard(),
+                        &current_key.vals,
+                        MAX_SNAPSHOT_TS,
+                    )
+                    .await
+                    .unwrap(),
+                Some((row_id, true))
+            );
+
+            table_for_internal_assertion(&engine, table_id)
+                .deletion_buffer()
+                .put_committed(row_id, TrxID::new(1))
+                .unwrap();
+            let stats = session
+                .cleanup_secondary_mem_indexes(table_id, true)
+                .await
+                .unwrap();
+            assert_eq!(stats.indexes[0].scanned, 1);
+            assert_eq!(stats.indexes[0].removed, 1);
+            assert_eq!(stats.indexes[0].retained, 0);
+            assert_eq!(stats.indexes[0].skipped_live, 0);
+            assert_eq!(stats.indexes[0].skipped_hot_deleted, 0);
+            assert_eq!(
+                index
+                    .lookup(
+                        session.pool_guards().index_guard(),
+                        &current_key.vals,
+                        MAX_SNAPSHOT_TS,
+                    )
+                    .await
+                    .unwrap(),
+                Some((row_id, false))
+            );
+        });
+    }
+
+    #[test]
+    fn test_secondary_mem_index_cleanup_removes_unique_delete_shadow_when_cold_row_key_differs() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine =
+                evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys").await;
+            let table_id = create_table2_for_test(&engine).await;
+            let mut session = engine.new_session().unwrap();
+            insert_rows(table_id, &mut session, 0, 1, "name").await;
+            session.freeze_table(table_id, usize::MAX).await.unwrap();
+            let checkpoint_ts = checkpoint_published(table_id, &mut session).await;
+            wait_gc_cutoff_after(&session, checkpoint_ts).await;
+
+            let current_key = single_key(0i32);
+            let stale_key = single_key(-1i32);
+            let row_id = unique_disk_tree_lookup(
+                &table_for_internal_assertion(&engine, table_id),
+                &session.pool_guards(),
+                &current_key,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                unique_disk_tree_lookup(
+                    &table_for_internal_assertion(&engine, table_id),
+                    &session.pool_guards(),
+                    &stale_key
+                )
+                .await,
+                None
+            );
+            let index = bound_unique_index_no(&table_for_internal_assertion(&engine, table_id), 0);
+            assert!(
+                index
+                    .insert_if_not_exists(
+                        session.pool_guards().index_guard(),
+                        &stale_key.vals,
+                        row_id,
+                        false,
+                        MAX_SNAPSHOT_TS,
+                    )
+                    .await
+                    .unwrap()
+                    .is_ok()
+            );
+            assert!(
+                index
+                    .mask_as_deleted(
+                        session.pool_guards().index_guard(),
+                        &stale_key.vals,
+                        row_id,
+                        MAX_SNAPSHOT_TS,
+                    )
+                    .await
+                    .unwrap()
+            );
+            assert_eq!(
+                index
+                    .lookup(
+                        session.pool_guards().index_guard(),
+                        &stale_key.vals,
+                        MAX_SNAPSHOT_TS,
+                    )
+                    .await
+                    .unwrap(),
+                Some((row_id, true))
+            );
+            assert_eq!(
+                index
+                    .lookup(
+                        session.pool_guards().index_guard(),
+                        &current_key.vals,
+                        MAX_SNAPSHOT_TS,
+                    )
+                    .await
+                    .unwrap(),
+                Some((row_id, false))
+            );
+
+            let stats = session
+                .cleanup_secondary_mem_indexes(table_id, true)
+                .await
+                .unwrap();
+            assert_eq!(stats.indexes[0].scanned, 2);
+            assert_eq!(stats.indexes[0].removed, 2);
+            assert_eq!(stats.indexes[0].retained, 0);
+            assert_eq!(stats.indexes[0].skipped_live, 0);
+            assert_eq!(stats.indexes[0].skipped_hot_deleted, 0);
+            assert_eq!(
+                index
+                    .lookup(
+                        session.pool_guards().index_guard(),
+                        &stale_key.vals,
+                        MAX_SNAPSHOT_TS,
+                    )
+                    .await
+                    .unwrap(),
+                None
+            );
+            assert_eq!(
+                index
+                    .lookup(
+                        session.pool_guards().index_guard(),
+                        &current_key.vals,
+                        MAX_SNAPSHOT_TS,
+                    )
+                    .await
+                    .unwrap(),
+                Some((row_id, false))
+            );
+        });
+    }
+
+    #[test]
+    fn test_secondary_mem_index_cleanup_propagates_cold_delete_overlay_proof_error() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine =
+                evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys").await;
+            let table_id = create_table2_for_test(&engine).await;
+            let mut session = engine.new_session().unwrap();
+            insert_rows(table_id, &mut session, 0, 1, "name").await;
+            session.freeze_table(table_id, usize::MAX).await.unwrap();
+            let checkpoint_ts = checkpoint_published(table_id, &mut session).await;
+            wait_gc_cutoff_after(&session, checkpoint_ts).await;
+
+            let current_key = single_key(0i32);
+            let stale_key = single_key(-1i32);
+            let table = table_for_internal_assertion(&engine, table_id);
+            let row_id = unique_disk_tree_lookup(&table, &session.pool_guards(), &current_key)
+                .await
+                .unwrap();
+            let block_id = {
+                let pool_guards = session.pool_guards();
+                let snapshot = column_block_index_snapshot(&engine, table_id);
+                let column_index = snapshot.index(pool_guards.disk_guard());
+                column_index
+                    .locate_block(row_id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .block_id()
+            };
+            let index = bound_unique_index_no(&table, 0);
+            assert!(
+                index
+                    .insert_if_not_exists(
+                        session.pool_guards().index_guard(),
+                        &stale_key.vals,
+                        row_id,
+                        false,
+                        MAX_SNAPSHOT_TS,
+                    )
+                    .await
+                    .unwrap()
+                    .is_ok()
+            );
+            assert!(
+                index
+                    .mask_as_deleted(
+                        session.pool_guards().index_guard(),
+                        &stale_key.vals,
+                        row_id,
+                        MAX_SNAPSHOT_TS,
+                    )
+                    .await
+                    .unwrap()
+            );
+
+            let table_file_path = engine.inner().table_fs.user_table_file_path(table_id);
+            corrupt_lwc_row_shape_fingerprint(table_file_path, block_id);
+            let _ = table
+                .disk_pool()
+                .invalidate_block(table.file().sparse_file().file_id(), block_id);
+
+            let err = session
+                .cleanup_secondary_mem_indexes(table_id, true)
+                .await
+                .unwrap_err();
+            assert_table_data_integrity(
+                err,
+                "lwc-block",
+                block_id,
+                DataIntegrityError::InvalidPayload,
+            );
+            assert_eq!(
+                index
+                    .lookup(
+                        session.pool_guards().index_guard(),
+                        &stale_key.vals,
+                        MAX_SNAPSHOT_TS,
+                    )
+                    .await
+                    .unwrap(),
+                Some((row_id, true))
+            );
+        });
+    }
+
+    #[test]
+    fn test_secondary_mem_index_cleanup_retains_non_unique_delete_mark_without_delete_proof() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine =
+                evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys_non_unique")
+                    .await;
+            let table_id = create_non_unique_name_table_for_test(&engine).await;
+            let mut session = engine.new_session().unwrap();
+            insert_rows(table_id, &mut session, 0, 1, "current").await;
+
+            let pk = single_key(0i32);
+            let row_id = bound_unique_index_no(&table_for_internal_assertion(&engine, table_id), 0)
+                .lookup(
+                    session.pool_guards().index_guard(),
+                    &pk.vals,
+                    MAX_SNAPSHOT_TS,
+                )
+                .await
+                .unwrap()
+                .unwrap()
+                .0;
+            let stale_key = name_key("stale");
+            let index = bound_non_unique_index_no(
+                &table_for_internal_assertion(&engine, table_id),
+                stale_key.index_no,
+            );
+            assert!(
+                index
+                    .insert_if_not_exists(
+                        session.pool_guards().index_guard(),
+                        &stale_key.vals,
+                        row_id,
+                        false,
+                        MAX_SNAPSHOT_TS,
+                    )
+                    .await
+                    .unwrap()
+                    .is_ok()
+            );
+            assert!(
+                index
+                    .mask_as_deleted(
+                        session.pool_guards().index_guard(),
+                        &stale_key.vals,
+                        row_id,
+                        MAX_SNAPSHOT_TS,
+                    )
+                    .await
+                    .unwrap()
+            );
+
+            let stats = session
+                .cleanup_secondary_mem_indexes(table_id, true)
+                .await
+                .unwrap();
+            assert_eq!(stats.indexes[1].scanned, 0);
+            assert_eq!(stats.indexes[1].removed, 0);
+            assert_eq!(stats.indexes[1].retained, 0);
+            assert_eq!(stats.indexes[1].skipped_live, 1);
+            assert_eq!(stats.indexes[1].skipped_hot_deleted, 1);
+            assert_eq!(
+                index
+                    .lookup_unique(
+                        session.pool_guards().index_guard(),
+                        &stale_key.vals,
+                        row_id,
+                        MAX_SNAPSHOT_TS,
+                    )
+                    .await
+                    .unwrap(),
+                Some(false)
+            );
+        });
+    }
+
+    #[test]
+    fn test_secondary_mem_index_cleanup_removes_non_unique_delete_mark_with_purgeable_marker() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine =
+                evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys_non_unique")
+                    .await;
+            let table_id = create_non_unique_name_table_for_test(&engine).await;
+            let mut session = engine.new_session().unwrap();
+            insert_rows(table_id, &mut session, 0, 1, "current").await;
+            session.freeze_table(table_id, usize::MAX).await.unwrap();
+            checkpoint_published(table_id, &mut session).await;
+
+            let pk = single_key(0i32);
+            let row_id = unique_disk_tree_lookup(
+                &table_for_internal_assertion(&engine, table_id),
+                &session.pool_guards(),
+                &pk,
+            )
+            .await
+            .unwrap();
+            let stale_key = name_key("stale");
+            let index = bound_non_unique_index_no(
+                &table_for_internal_assertion(&engine, table_id),
+                stale_key.index_no,
+            );
+            assert!(
+                index
+                    .insert_if_not_exists(
+                        session.pool_guards().index_guard(),
+                        &stale_key.vals,
+                        row_id,
+                        false,
+                        MAX_SNAPSHOT_TS,
+                    )
+                    .await
+                    .unwrap()
+                    .is_ok()
+            );
+            assert!(
+                index
+                    .mask_as_deleted(
+                        session.pool_guards().index_guard(),
+                        &stale_key.vals,
+                        row_id,
+                        MAX_SNAPSHOT_TS,
+                    )
+                    .await
+                    .unwrap()
+            );
+            table_for_internal_assertion(&engine, table_id)
+                .deletion_buffer()
+                .put_committed(row_id, TrxID::new(1))
+                .unwrap();
+
+            let stats = session
+                .cleanup_secondary_mem_indexes(table_id, true)
+                .await
+                .unwrap();
+            assert_eq!(stats.indexes[1].scanned, 2);
+            assert_eq!(stats.indexes[1].removed, 2);
+            assert_eq!(stats.indexes[1].retained, 0);
+            assert_eq!(stats.indexes[1].skipped_live, 0);
+            assert_eq!(stats.indexes[1].skipped_hot_deleted, 0);
+            assert_eq!(
+                index
+                    .lookup_unique(
+                        session.pool_guards().index_guard(),
+                        &stale_key.vals,
+                        row_id,
+                        MAX_SNAPSHOT_TS,
+                    )
+                    .await
+                    .unwrap(),
+                None
+            );
+        });
+    }
+
+    #[test]
+    fn test_secondary_mem_index_cleanup_removes_non_unique_delete_mark_with_matching_cold_entry() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine =
+                evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys_non_unique")
+                    .await;
+            let table_id = create_non_unique_name_table_for_test(&engine).await;
+            let mut session = engine.new_session().unwrap();
+            insert_rows(table_id, &mut session, 0, 1, "current").await;
+            session.freeze_table(table_id, usize::MAX).await.unwrap();
+            checkpoint_published(table_id, &mut session).await;
+
+            let pk = single_key(0i32);
+            let row_id = unique_disk_tree_lookup(
+                &table_for_internal_assertion(&engine, table_id),
+                &session.pool_guards(),
+                &pk,
+            )
+            .await
+            .unwrap();
+            let current_key = name_key("current");
+            let index = bound_non_unique_index_no(
+                &table_for_internal_assertion(&engine, table_id),
+                current_key.index_no,
+            );
+            assert!(
+                index
+                    .mask_as_deleted(
+                        session.pool_guards().index_guard(),
+                        &current_key.vals,
+                        row_id,
+                        MAX_SNAPSHOT_TS,
+                    )
+                    .await
+                    .unwrap()
+            );
+
+            let stats = session
+                .cleanup_secondary_mem_indexes(table_id, true)
+                .await
+                .unwrap();
+            assert_eq!(stats.indexes[1].scanned, 1);
+            assert_eq!(stats.indexes[1].removed, 0);
+            assert_eq!(stats.indexes[1].retained, 1);
+            assert_eq!(stats.indexes[1].skipped_live, 0);
+            assert_eq!(stats.indexes[1].skipped_hot_deleted, 0);
+            assert_eq!(
+                index
+                    .lookup_unique(
+                        session.pool_guards().index_guard(),
+                        &current_key.vals,
+                        row_id,
+                        MAX_SNAPSHOT_TS,
+                    )
+                    .await
+                    .unwrap(),
+                Some(false)
+            );
+
+            table_for_internal_assertion(&engine, table_id)
+                .deletion_buffer()
+                .put_committed(row_id, TrxID::new(1))
+                .unwrap();
+            let stats = session
+                .cleanup_secondary_mem_indexes(table_id, true)
+                .await
+                .unwrap();
+            assert_eq!(stats.indexes[1].scanned, 1);
+            assert_eq!(stats.indexes[1].removed, 1);
+            assert_eq!(stats.indexes[1].retained, 0);
+            assert_eq!(stats.indexes[1].skipped_live, 0);
+            assert_eq!(stats.indexes[1].skipped_hot_deleted, 0);
+            assert_eq!(
+                index
+                    .lookup_unique(
+                        session.pool_guards().index_guard(),
+                        &current_key.vals,
+                        row_id,
+                        MAX_SNAPSHOT_TS,
+                    )
+                    .await
+                    .unwrap(),
+                Some(true)
+            );
+        });
+    }
+
+    #[test]
+    fn test_secondary_mem_index_cleanup_removes_non_unique_delete_mark_when_cold_row_key_differs() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine =
+                evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys_non_unique")
+                    .await;
+            let table_id = create_non_unique_name_table_for_test(&engine).await;
+            let mut session = engine.new_session().unwrap();
+            insert_rows(table_id, &mut session, 0, 1, "current").await;
+            session.freeze_table(table_id, usize::MAX).await.unwrap();
+            let checkpoint_ts = checkpoint_published(table_id, &mut session).await;
+            wait_gc_cutoff_after(&session, checkpoint_ts).await;
+
+            let pk = single_key(0i32);
+            let current_key = name_key("current");
+            let stale_key = name_key("stale");
+            let row_id = unique_disk_tree_lookup(
+                &table_for_internal_assertion(&engine, table_id),
+                &session.pool_guards(),
+                &pk,
+            )
+            .await
+            .unwrap();
+            assert!(
+                non_unique_disk_tree_prefix_scan(
+                    &table_for_internal_assertion(&engine, table_id),
+                    &session.pool_guards(),
+                    &stale_key
+                )
+                .await
+                .is_empty()
+            );
+            assert_eq!(
+                non_unique_disk_tree_prefix_scan(
+                    &table_for_internal_assertion(&engine, table_id),
+                    &session.pool_guards(),
+                    &current_key
+                )
+                .await,
+                vec![row_id]
+            );
+            let index = bound_non_unique_index_no(
+                &table_for_internal_assertion(&engine, table_id),
+                stale_key.index_no,
+            );
+            assert!(
+                index
+                    .insert_if_not_exists(
+                        session.pool_guards().index_guard(),
+                        &stale_key.vals,
+                        row_id,
+                        false,
+                        MAX_SNAPSHOT_TS,
+                    )
+                    .await
+                    .unwrap()
+                    .is_ok()
+            );
+            assert!(
+                index
+                    .mask_as_deleted(
+                        session.pool_guards().index_guard(),
+                        &stale_key.vals,
+                        row_id,
+                        MAX_SNAPSHOT_TS,
+                    )
+                    .await
+                    .unwrap()
+            );
+            assert_eq!(
+                index
+                    .lookup_unique(
+                        session.pool_guards().index_guard(),
+                        &stale_key.vals,
+                        row_id,
+                        MAX_SNAPSHOT_TS,
+                    )
+                    .await
+                    .unwrap(),
+                Some(false)
+            );
+            assert_eq!(
+                index
+                    .lookup_unique(
+                        session.pool_guards().index_guard(),
+                        &current_key.vals,
+                        row_id,
+                        MAX_SNAPSHOT_TS,
+                    )
+                    .await
+                    .unwrap(),
+                Some(true)
+            );
+
+            let stats = session
+                .cleanup_secondary_mem_indexes(table_id, true)
+                .await
+                .unwrap();
+            assert_eq!(stats.indexes[1].scanned, 2);
+            assert_eq!(stats.indexes[1].removed, 2);
+            assert_eq!(stats.indexes[1].retained, 0);
+            assert_eq!(stats.indexes[1].skipped_live, 0);
+            assert_eq!(stats.indexes[1].skipped_hot_deleted, 0);
+            assert_eq!(
+                index
+                    .lookup_unique(
+                        session.pool_guards().index_guard(),
+                        &stale_key.vals,
+                        row_id,
+                        MAX_SNAPSHOT_TS,
+                    )
+                    .await
+                    .unwrap(),
+                None
+            );
+            assert_eq!(
+                index
+                    .lookup_unique(
+                        session.pool_guards().index_guard(),
+                        &current_key.vals,
+                        row_id,
+                        MAX_SNAPSHOT_TS,
+                    )
+                    .await
+                    .unwrap(),
+                Some(true)
+            );
+        });
+    }
+
+    #[test]
+    fn test_lwc_unique_index_purge_uses_purgeable_delete_marker_fast_path() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine =
+                evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys").await;
+            let table_id = create_table2_for_test(&engine).await;
+            let mut session = engine.new_session().unwrap();
+            insert_rows(table_id, &mut session, 0, 1, "name").await;
+            session.freeze_table(table_id, usize::MAX).await.unwrap();
+            checkpoint_published(table_id, &mut session).await;
+
+            let key = single_key(0i32);
+            let reader = session.begin_trx().unwrap();
+            let row_id = assert_row_in_lwc(
+                &table_for_internal_assertion(&engine, table_id),
+                &session.pool_guards(),
+                &key,
+                reader.sts(),
+            )
+            .await;
+            reader.commit().await.unwrap();
+
+            let index = bound_unique_index_no(
+                &table_for_internal_assertion(&engine, table_id),
+                key.index_no,
+            );
+            assert!(
+                index
+                    .mask_as_deleted(
+                        session.pool_guards().index_guard(),
+                        &key.vals,
+                        row_id,
+                        MAX_SNAPSHOT_TS,
+                    )
+                    .await
+                    .unwrap()
+            );
+            table_for_internal_assertion(&engine, table_id)
+                .deletion_buffer()
+                .put_committed(row_id, TrxID::new(10))
+                .unwrap();
+
+            let layout = table_for_internal_assertion(&engine, table_id).layout_snapshot();
+
+            let deleted = table_for_internal_assertion(&engine, table_id)
+                .accessor_with_layout(&layout)
+                .delete_index(&session.pool_guards(), &key, row_id, true, TrxID::new(11))
+                .await
+                .unwrap();
+            assert!(deleted);
+            // A reinsertion attempt must not merge a stale MemIndex delete overlay;
+            // after purge it falls through to the immutable cold root instead.
+            assert_eq!(
+                index
+                    .insert_if_not_exists(
+                        session.pool_guards().index_guard(),
+                        &key.vals,
+                        row_id,
+                        true,
+                        TrxID::new(11),
+                    )
+                    .await
+                    .unwrap(),
+                IndexInsert::DuplicateKey(row_id, false)
+            );
+        });
+    }
+
+    #[test]
+    fn test_lwc_unique_index_purge_compares_persisted_key_when_marker_is_not_purgeable() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine =
+                evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys").await;
+            let table_id = create_table2_for_test(&engine).await;
+            let mut session = engine.new_session().unwrap();
+            insert_rows(table_id, &mut session, 0, 1, "name").await;
+            session.freeze_table(table_id, usize::MAX).await.unwrap();
+            checkpoint_published(table_id, &mut session).await;
+
+            let current_key = single_key(0i32);
+            let stale_key = single_key(-1i32);
+            let reader = session.begin_trx().unwrap();
+            let row_id = assert_row_in_lwc(
+                &table_for_internal_assertion(&engine, table_id),
+                &session.pool_guards(),
+                &current_key,
+                reader.sts(),
+            )
+            .await;
+            reader.commit().await.unwrap();
+
+            let index = bound_unique_index_no(
+                &table_for_internal_assertion(&engine, table_id),
+                current_key.index_no,
+            );
+            let _ = index
+                .insert_if_not_exists(
+                    session.pool_guards().index_guard(),
+                    &stale_key.vals,
+                    row_id,
+                    false,
+                    MAX_SNAPSHOT_TS,
+                )
+                .await
+                .unwrap();
+            assert!(
+                index
+                    .mask_as_deleted(
+                        session.pool_guards().index_guard(),
+                        &stale_key.vals,
+                        row_id,
+                        MAX_SNAPSHOT_TS,
+                    )
+                    .await
+                    .unwrap()
+            );
+            let layout = table_for_internal_assertion(&engine, table_id).layout_snapshot();
+            let deleted = table_for_internal_assertion(&engine, table_id)
+                .accessor_with_layout(&layout)
+                .delete_index(
+                    &session.pool_guards(),
+                    &stale_key,
+                    row_id,
+                    true,
+                    MAX_SNAPSHOT_TS,
+                )
+                .await
+                .unwrap();
+            assert!(deleted);
+            assert!(
+                index
+                    .lookup(
+                        session.pool_guards().index_guard(),
+                        &stale_key.vals,
+                        MAX_SNAPSHOT_TS,
+                    )
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+
+            assert!(
+                index
+                    .mask_as_deleted(
+                        session.pool_guards().index_guard(),
+                        &current_key.vals,
+                        row_id,
+                        MAX_SNAPSHOT_TS,
+                    )
+                    .await
+                    .unwrap()
+            );
+            table_for_internal_assertion(&engine, table_id)
+                .deletion_buffer()
+                .put_committed(row_id, TrxID::new(100))
+                .unwrap();
+            let layout = table_for_internal_assertion(&engine, table_id).layout_snapshot();
+            let deleted = table_for_internal_assertion(&engine, table_id)
+                .accessor_with_layout(&layout)
+                .delete_index(
+                    &session.pool_guards(),
+                    &current_key,
+                    row_id,
+                    true,
+                    TrxID::new(100),
+                )
+                .await
+                .unwrap();
+            assert!(!deleted);
+            assert!(matches!(
+                index
+                    .lookup(
+                        session.pool_guards().index_guard(),
+                        &current_key.vals,
+                        MAX_SNAPSHOT_TS,
+                    )
+                    .await
+                    .unwrap(),
+                Some((actual_row_id, true)) if actual_row_id == row_id
+            ));
+        });
+    }
+
+    #[test]
+    fn test_lwc_non_unique_index_purge_compares_persisted_key_when_marker_is_not_purgeable() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine =
+                evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys_non_unique")
+                    .await;
+            let table_id = create_non_unique_name_table_for_test(&engine).await;
+            let mut session = engine.new_session().unwrap();
+            insert_rows(table_id, &mut session, 0, 1, "current").await;
+            session.freeze_table(table_id, usize::MAX).await.unwrap();
+            checkpoint_published(table_id, &mut session).await;
+
+            let pk = single_key(0i32);
+            let current_key = name_key("current");
+            let stale_key = name_key("stale");
+            let reader = session.begin_trx().unwrap();
+            let row_id = assert_row_in_lwc(
+                &table_for_internal_assertion(&engine, table_id),
+                &session.pool_guards(),
+                &pk,
+                reader.sts(),
+            )
+            .await;
+            reader.commit().await.unwrap();
+
+            let index = bound_non_unique_index_no(
+                &table_for_internal_assertion(&engine, table_id),
+                current_key.index_no,
+            );
+            let _ = index
+                .insert_if_not_exists(
+                    session.pool_guards().index_guard(),
+                    &stale_key.vals,
+                    row_id,
+                    false,
+                    MAX_SNAPSHOT_TS,
+                )
+                .await
+                .unwrap();
+            assert!(
+                index
+                    .mask_as_deleted(
+                        session.pool_guards().index_guard(),
+                        &stale_key.vals,
+                        row_id,
+                        MAX_SNAPSHOT_TS,
+                    )
+                    .await
+                    .unwrap()
+            );
+            let layout = table_for_internal_assertion(&engine, table_id).layout_snapshot();
+            let deleted = table_for_internal_assertion(&engine, table_id)
+                .accessor_with_layout(&layout)
+                .delete_index(
+                    &session.pool_guards(),
+                    &stale_key,
+                    row_id,
+                    false,
+                    MAX_SNAPSHOT_TS,
+                )
+                .await
+                .unwrap();
+            assert!(deleted);
+            assert!(
+                index
+                    .lookup_unique(
+                        session.pool_guards().index_guard(),
+                        &stale_key.vals,
+                        row_id,
+                        MAX_SNAPSHOT_TS,
+                    )
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+
+            assert!(
+                index
+                    .mask_as_deleted(
+                        session.pool_guards().index_guard(),
+                        &current_key.vals,
+                        row_id,
+                        MAX_SNAPSHOT_TS,
+                    )
+                    .await
+                    .unwrap()
+            );
+            table_for_internal_assertion(&engine, table_id)
+                .deletion_buffer()
+                .put_committed(row_id, TrxID::new(200))
+                .unwrap();
+            let layout = table_for_internal_assertion(&engine, table_id).layout_snapshot();
+            let deleted = table_for_internal_assertion(&engine, table_id)
+                .accessor_with_layout(&layout)
+                .delete_index(
+                    &session.pool_guards(),
+                    &current_key,
+                    row_id,
+                    false,
+                    TrxID::new(200),
+                )
+                .await
+                .unwrap();
+            assert!(!deleted);
+            assert!(matches!(
+                index
+                    .lookup_unique(
+                        session.pool_guards().index_guard(),
+                        &current_key.vals,
+                        row_id,
+                        MAX_SNAPSHOT_TS,
+                    )
+                    .await
+                    .unwrap(),
+                Some(false)
+            ));
+        });
+    }
+
+    #[test]
+    fn test_index_purge_removes_delete_marked_unique_entry_when_row_is_not_found() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine =
+                evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys").await;
+            let table_id = create_table2_for_test(&engine).await;
+            let session = engine.new_session().unwrap();
+            let key = single_key(9999i32);
+            let row_id = 9999;
+            let index = bound_unique_index_no(
+                &table_for_internal_assertion(&engine, table_id),
+                key.index_no,
+            );
+            let _ = index
+                .insert_if_not_exists(
+                    session.pool_guards().index_guard(),
+                    &key.vals,
+                    RowID::new(row_id),
+                    false,
+                    MAX_SNAPSHOT_TS,
+                )
+                .await
+                .unwrap();
+            assert!(
+                index
+                    .mask_as_deleted(
+                        session.pool_guards().index_guard(),
+                        &key.vals,
+                        RowID::new(row_id),
+                        MAX_SNAPSHOT_TS,
+                    )
+                    .await
+                    .unwrap()
+            );
+
+            let layout = table_for_internal_assertion(&engine, table_id).layout_snapshot();
+
+            let deleted = table_for_internal_assertion(&engine, table_id)
+                .accessor_with_layout(&layout)
+                .delete_index(
+                    &session.pool_guards(),
+                    &key,
+                    RowID::new(row_id),
+                    true,
+                    MAX_SNAPSHOT_TS,
+                )
+                .await
+                .unwrap();
+            assert!(deleted);
+            assert!(
+                index
+                    .lookup(
+                        session.pool_guards().index_guard(),
+                        &key.vals,
+                        MAX_SNAPSHOT_TS,
+                    )
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+        });
+    }
+
+    #[test]
+    fn test_dropped_unique_index_purge_delete_is_noop() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine = lightweight_test_engine(&temp_dir, "redo_testsys_lightweight").await;
+            let table_id = create_table2_for_test(&engine).await;
+            let mut session = engine.new_session().unwrap();
+            let key = single_key(1i32);
+            let row_id = insert_one_row(
+                table_id,
+                &mut session,
+                vec![Val::from(1i32), Val::from("name")],
+            )
+            .await;
+            session.freeze_table(table_id, usize::MAX).await.unwrap();
+            checkpoint_published(table_id, &mut session).await;
+            let mut hold_session = engine.new_session().unwrap();
+            let hold_trx = hold_session.begin_trx().unwrap();
+            expect_delete_committed(table_id, &mut session, &key).await;
+            let min_active_sts = delete_marker_ts(
+                table_for_internal_assertion(&engine, table_id)
+                    .deletion_buffer()
+                    .get(row_id)
+                    .unwrap(),
+            ) + 1;
+            let index = bound_unique_index_no(
+                &table_for_internal_assertion(&engine, table_id),
+                key.index_no,
+            );
+            assert!(matches!(
+                index
+                    .lookup(
+                        session.pool_guards().index_guard(),
+                        &key.vals,
+                        MAX_SNAPSHOT_TS,
+                    )
+                    .await
+                    .unwrap(),
+                Some((actual_row_id, true)) if actual_row_id == row_id
+            ));
+
+            session.drop_index(table_id, 0).await.unwrap();
+
+            let layout = table_for_internal_assertion(&engine, table_id).layout_snapshot();
+
+            let deleted = table_for_internal_assertion(&engine, table_id)
+                .accessor_with_layout(&layout)
+                .delete_index(&session.pool_guards(), &key, row_id, true, min_active_sts)
+                .await
+                .unwrap();
+            assert!(!deleted);
+            hold_trx.commit().await.unwrap();
+        })
+    }
+
+    #[test]
+    fn test_dropped_non_unique_index_purge_delete_is_noop() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine =
+                evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys_non_unique")
+                    .await;
+            let table_id = create_non_unique_name_table_for_test(&engine).await;
+            let mut session = engine.new_session().unwrap();
+            let pk = single_key(1i32);
+            let row_id = insert_one_row(
+                table_id,
+                &mut session,
+                vec![Val::from(1i32), Val::from("name")],
+            )
+            .await;
+            let key = name_key("name");
+            session.freeze_table(table_id, usize::MAX).await.unwrap();
+            checkpoint_published(table_id, &mut session).await;
+            let mut hold_session = engine.new_session().unwrap();
+            let hold_trx = hold_session.begin_trx().unwrap();
+            expect_delete_committed(table_id, &mut session, &pk).await;
+            let min_active_sts = delete_marker_ts(
+                table_for_internal_assertion(&engine, table_id)
+                    .deletion_buffer()
+                    .get(row_id)
+                    .unwrap(),
+            ) + 1;
+            let index = bound_non_unique_index_no(
+                &table_for_internal_assertion(&engine, table_id),
+                key.index_no,
+            );
+            assert!(matches!(
+                index
+                    .lookup_unique(
+                        session.pool_guards().index_guard(),
+                        &key.vals,
+                        row_id,
+                        MAX_SNAPSHOT_TS,
+                    )
+                    .await
+                    .unwrap(),
+                Some(false)
+            ));
+
+            session
+                .drop_index(table_id, key.index_no as IndexNo)
+                .await
+                .unwrap();
+
+            let layout = table_for_internal_assertion(&engine, table_id).layout_snapshot();
+
+            let deleted = table_for_internal_assertion(&engine, table_id)
+                .accessor_with_layout(&layout)
+                .delete_index(&session.pool_guards(), &key, row_id, false, min_active_sts)
+                .await
+                .unwrap();
+            assert!(!deleted);
+            hold_trx.commit().await.unwrap();
+        })
+    }
+}
