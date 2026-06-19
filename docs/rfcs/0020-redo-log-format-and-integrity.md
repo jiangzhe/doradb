@@ -1,7 +1,7 @@
 ---
 id: 0020
 title: Redo Log Format and Integrity
-status: proposal
+status: implemented
 tags: [redo-log, recovery, storage]
 created: 2026-06-15
 github_issue: 708
@@ -397,10 +397,13 @@ the unsafe boundary local to reader construction. [C2], [B2]
   - Task Issue: `#719`
   - Phase Status: done
   - Implementation Summary: Audited final redo-log v2 docs and coverage, clarified replay-floor skip semantics, and added startup recovery tests for obsolete sealed skip, boundary no-skip corruption, and replay-relevant checksum mismatch. [Task Resolve Sync: docs/tasks/000182-redo-log-documentation-and-corruption-coverage.md @ 2026-06-19]
-  - Related Backlogs:
+  - Deferred Follow-ups:
     - `docs/backlogs/000032-deletion-watermark-meta-redo-expansion-for-log-truncation.md`
+      remains open for physical redo log truncation/deletion policy.
     - `docs/backlogs/000050-refactor-redo-log-reader-avoid-sync-mmap-in-async-runtime.md`
+      remains open for replacing synchronous mmap replay reads.
     - `docs/backlogs/000126-redo-commit-group-sync-batching-policy.md`
+      remains open for commit-group and sync batching policy analysis.
 
 ## Consequences
 
@@ -436,10 +439,12 @@ the unsafe boundary local to reader construction. [C2], [B2]
 
 ## Open Questions
 
-No Phase 2 group-format questions remain open. The implemented direction uses
-exact body exhaustion after authoritative `trx_data_len` frames, stores no
-transaction count, and hardens generic `Vec`/`BTreeMap` deserialization so redo
-payload parsing remains on the existing serde path.
+No RFC-0020 implementation questions remain open. The implemented direction
+uses exact body exhaustion after authoritative `trx_data_len` frames, stores no
+transaction count, hardens generic `Vec`/`BTreeMap` deserialization so redo
+payload parsing remains on the existing serde path, and leaves truncation,
+mmap-reader replacement, and sync-batching work in the deferred follow-up
+backlogs below.
 
 ## Future Work
 
