@@ -1,4 +1,4 @@
-use crate::error::{DataIntegrityError, Result};
+use crate::error::{DataIntegrityError, InternalError, Result};
 use crate::id::TrxID;
 use crate::io::STORAGE_SECTOR_SIZE;
 use crate::log::buf::TrxLog;
@@ -191,10 +191,17 @@ impl ReplayPlanner {
     }
 
     /// Plan which discovered redo segments must be replayed for a replay floor.
+    ///
+    /// This is a one-time transition: the floor controls which sealed segments
+    /// may be skipped, so a replan would make the already-built queue ambiguous.
     #[inline]
     pub(crate) fn plan(&mut self, floor: TrxID) -> Result<Option<TrxID>> {
-        if self.replay_floor.is_some() {
-            return Ok(self.skipped_max_recovered_cts);
+        if let Some(existing_floor) = self.replay_floor {
+            return Err(Report::new(InternalError::Generic)
+                .attach(format!(
+                    "redo replay already planned: existing_floor={existing_floor}, requested_floor={floor}"
+                ))
+                .into());
         }
 
         let mut suffix = Vec::new();
@@ -231,10 +238,15 @@ impl ReplayPlanner {
     }
 
     /// Return the next mmap reader that must be scanned.
+    ///
+    /// Callers must plan replay first so the checkpoint-derived floor is known
+    /// before any segment is opened or skipped.
     #[inline]
     pub(crate) fn next_reader(&mut self) -> Result<Option<MmapLogReader>> {
         if self.replay_floor.is_none() {
-            self.plan(crate::trx::MIN_SNAPSHOT_TS)?;
+            return Err(Report::new(InternalError::Generic)
+                .attach("redo replay read before explicit plan")
+                .into());
         }
         self.planned
             .pop_front()
@@ -281,6 +293,9 @@ impl RedoLogReplayer {
     }
 
     /// Plan replay using the checkpoint-derived floor and return skipped CTS seed.
+    ///
+    /// This must be called exactly once before `pop`; repeated calls are
+    /// rejected even if they pass the same floor.
     #[inline]
     pub(crate) fn plan_replay(&mut self, floor: TrxID) -> Result<Option<TrxID>> {
         self.planner.plan(floor)
@@ -294,6 +309,9 @@ impl RedoLogReplayer {
     }
 
     /// Refill the in-memory queue from the current reader or the next redo file.
+    ///
+    /// Requires prior `plan_replay` because opening the next reader may depend
+    /// on checkpoint-derived segment skipping decisions.
     #[inline]
     pub(crate) fn fill_buffer(&mut self) -> Result<()> {
         loop {
@@ -325,6 +343,9 @@ impl RedoLogReplayer {
     }
 
     /// Pop the next transaction redo record, reading more files on demand.
+    ///
+    /// The replayer is deliberately not self-planning: callers must provide the
+    /// replay floor via `plan_replay` before consuming records.
     #[inline]
     pub(crate) fn pop(&mut self) -> Result<Option<TrxLog>> {
         match self.buffer.pop_front() {

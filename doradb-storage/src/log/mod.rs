@@ -3522,6 +3522,42 @@ mod tests {
     }
 
     #[test]
+    fn test_redo_replayer_rejects_read_before_explicit_plan() {
+        let mut replayer = RedoLogReplayer::new(Vec::new());
+
+        let err = replayer.pop().unwrap_err();
+        assert_eq!(
+            err.downcast_ref::<InternalError>().copied(),
+            Some(InternalError::Generic)
+        );
+        assert!(
+            format!("{err:?}").contains("redo replay read before explicit plan"),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn test_redo_replay_plan_rejects_second_call() {
+        let mut replayer = RedoLogReplayer::new(Vec::new());
+
+        assert_eq!(replayer.plan_replay(TrxID::new(10)).unwrap(), None);
+        for requested_floor in [TrxID::new(10), TrxID::new(11)] {
+            let err = replayer.plan_replay(requested_floor).unwrap_err();
+            assert_eq!(
+                err.downcast_ref::<InternalError>().copied(),
+                Some(InternalError::Generic)
+            );
+            let report = format!("{err:?}");
+            assert!(report.contains("redo replay already planned"), "{report}");
+            assert!(report.contains("existing_floor=10"), "{report}");
+            assert!(
+                report.contains(&format!("requested_floor={requested_floor}")),
+                "{report}"
+            );
+        }
+    }
+
+    #[test]
     fn test_redo_replay_plan_skips_obsolete_sealed_segment_and_seeds_cts() {
         let temp_dir = TempDir::new().unwrap();
         let file_prefix = temp_dir.path().join("redo.log");
@@ -3672,6 +3708,7 @@ mod tests {
             initializer,
             mut replayer,
         } = config.redo_log_startup().unwrap();
+        assert_eq!(replayer.plan_replay(MIN_SNAPSHOT_TS).unwrap(), None);
         let recovered = replayer.pop().unwrap().unwrap();
         assert_eq!(recovered.header.cts, cts);
         assert_eq!(recovered.header.trx_kind, RedoTrxKind::System);
