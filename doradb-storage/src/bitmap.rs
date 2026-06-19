@@ -770,7 +770,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic]
+    #[should_panic(expected = "index out of bounds")]
     fn test_bitmap_out_of_bounds() {
         let bm = new_bitmap(64);
         bm.bitmap_get(64); // Should panic

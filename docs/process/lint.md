@@ -70,10 +70,10 @@ Do not use `--all-features` for `doradb-storage`: the `iouring` and `libaio`
 backend features are mutually exclusive. Validate the alternate backend with a
 separate explicit feature command when needed.
 
-The undocumented-unsafe-block policy is enabled in the active production crate
-root with `#![warn(clippy::undocumented_unsafe_blocks)]`, and `-D warnings`
-turns any violation there into a hard failure. New production target crates
-must add the same crate-level lint if they should carry the same policy.
+The undocumented-unsafe-block policy is enabled in the workspace lint manifest
+with `undocumented_unsafe_blocks = "warn"`, and `-D warnings` turns any
+violation there into a hard failure. New production workspace members must
+inherit the workspace lint policy if they should carry the same gate.
 
 ## Lint Attribute Policy
 
@@ -83,6 +83,20 @@ must add the same crate-level lint if they should carry the same policy.
 
 ## Pedantic Lints
 
-`clippy::pedantic` is currently **not** enforced.
+`clippy::pedantic` is enabled in the workspace lint manifest and inherited by
+`doradb-storage`, so it is covered by the standard strict clippy gate:
 
-A future dedicated task may evaluate selective pedantic adoption (case-by-case classification with project-specific disables where necessary).
+```bash
+cargo clippy -p doradb-storage --all-targets -- -D warnings
+```
+
+The workspace lint manifest carries a concrete `allow` list for pedantic lint
+ids that were already present at adoption time and need domain-specific cleanup.
+This is a project baseline exception to the normal preference for scoped lint
+suppression; do not replace it with a group-level `allow` for
+`clippy::pedantic`.
+
+New code should not introduce warnings for pedantic lint ids that are absent
+from the allow list. When touching code near a deferred warning, prefer fixing
+the warning and removing that lint id from the workspace allow list once it is
+clean across all targets.

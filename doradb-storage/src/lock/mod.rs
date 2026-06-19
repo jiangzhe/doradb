@@ -974,13 +974,13 @@ fn modes_are_compatible(resource: LockResource, left: LockMode, right: LockMode)
         }
         LockResource::TableData(_) => matches!(
             (left, right),
-            (LockMode::IntentShared, LockMode::IntentShared)
-                | (LockMode::IntentShared, LockMode::IntentExclusive)
-                | (LockMode::IntentShared, LockMode::Shared)
-                | (LockMode::IntentExclusive, LockMode::IntentShared)
-                | (LockMode::IntentExclusive, LockMode::IntentExclusive)
-                | (LockMode::Shared, LockMode::IntentShared)
-                | (LockMode::Shared, LockMode::Shared)
+            (
+                LockMode::IntentShared | LockMode::IntentExclusive | LockMode::Shared,
+                LockMode::IntentShared
+            ) | (
+                LockMode::IntentShared | LockMode::IntentExclusive,
+                LockMode::IntentExclusive
+            ) | (LockMode::IntentShared | LockMode::Shared, LockMode::Shared)
         ),
     }
 }

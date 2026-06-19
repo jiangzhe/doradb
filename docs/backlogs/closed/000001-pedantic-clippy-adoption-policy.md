@@ -23,3 +23,11 @@ A follow-up task is created with an approved pedantic policy and concrete implem
 ## Notes (Optional)
 
 Do not enable `clippy::pedantic` globally in CI/pre-commit until this classification and policy task is completed.
+
+## Close Reason
+
+- Type: implemented
+- Detail: Implemented via `docs/tasks/000185-adopt-pedantic-clippy-baseline.md`: pedantic is enabled in `doradb-storage`, the strict clippy gate passes with a concrete deferred allow list, low-risk mechanical lint ids were cleaned up, and follow-up reduction work is tracked in `docs/backlogs/000129-reduce-deferred-pedantic-clippy-allow-list.md`.
+- Closed By: backlog close
+- Reference: User decision
+- Closed At: 2026-06-19

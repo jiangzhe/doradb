@@ -555,7 +555,7 @@ mod tests {
             (
                 ValType::new(ValKind::I8, false),
                 Val::from(42i8),
-                &[42u8 ^ 0x80][..],
+                &[0x2a_u8 ^ 0x80][..],
             ),
             (ValType::new(ValKind::U8, false), Val::from(42u8), &[42]),
             (

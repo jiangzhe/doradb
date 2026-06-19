@@ -259,7 +259,7 @@ pub(crate) fn for_b1_unpack_extend<T: BitPackable, E: Extend<T>>(
                 let delta = (packed >> i) & 1;
                 tmp[i] = min.add_from_u8(delta);
             }
-            res.extend(tmp[..8].iter().cloned());
+            res.extend(tmp[..8].iter().copied());
         }
     }
 
@@ -420,7 +420,7 @@ pub(crate) fn for_b2_unpack_extend<T: BitPackable, E: Extend<T>>(
                 let delta = (packed >> (i * 2)) & 3;
                 tmp[i] = min.add_from_u8(delta);
             }
-            res.extend(tmp[..4].iter().cloned());
+            res.extend(tmp[..4].iter().copied());
         }
     }
 
@@ -574,7 +574,7 @@ pub(crate) fn for_b4_unpack_extend<T: BitPackable, E: Extend<T>>(
             tmp[0] = min.add_from_u8(packed & 15);
             // High nibble (bits 4-7)
             tmp[1] = min.add_from_u8((packed >> 4) & 15);
-            res.extend(tmp[..2].iter().cloned());
+            res.extend(tmp[..2].iter().copied());
         }
     }
 
@@ -1381,7 +1381,7 @@ mod tests {
     fn test_for_bitpack() {
         for _ in 0..100 {
             let (input, mut compressed, mut decompressed) = setup::<u64>(LEN, 32);
-            let min = input.iter().min().cloned().unwrap();
+            let min = input.iter().min().copied().unwrap();
             for_b32_pack(&input, min, &mut compressed);
             for_b32_unpack(&compressed, min, &mut decompressed);
             assert_eq!(input, decompressed);

@@ -1104,7 +1104,7 @@ mod tests {
                     start_row_id: RowID::new(0),
                     end_row_id: RowID::new(1),
                 })),
-                dml: Default::default(),
+                dml: std::collections::BTreeMap::default(),
             },
         )
     }
@@ -1118,7 +1118,7 @@ mod tests {
                     pivor_row_id: RowID::new(0),
                     sts: cts,
                 })),
-                dml: Default::default(),
+                dml: std::collections::BTreeMap::default(),
             },
         )
     }

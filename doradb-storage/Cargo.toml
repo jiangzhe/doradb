@@ -9,6 +9,9 @@ keywords = ["database", "encoding"]
 categories = ["database-implementations"]
 repository = "https://github.com/jiangzhe/doradb/doradb-storage/"
 
+[lints]
+workspace = true
+
 [features]
 default = ["iouring"]
 libaio = []

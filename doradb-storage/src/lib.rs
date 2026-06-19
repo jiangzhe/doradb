@@ -1,6 +1,3 @@
-#![warn(clippy::all)]
-#![warn(clippy::undocumented_unsafe_blocks)]
-
 mod bitmap;
 pub mod id;
 mod io;

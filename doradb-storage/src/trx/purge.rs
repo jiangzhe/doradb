@@ -576,7 +576,7 @@ impl ActiveStsList {
     #[inline]
     pub(super) fn remove(&mut self, value: TrxID) -> TrxID {
         debug_assert!(!self.active.is_empty());
-        let first = self.active.front().cloned().unwrap();
+        let first = self.active.front().copied().unwrap();
         if first == value {
             let _ = self.active.pop_front();
             while let Some(first) = self.active.front() {
@@ -1311,7 +1311,7 @@ mod tests {
                 active_sts_list.remove(TrxID::new(val))
             } else {
                 active_sts_list.insert(TrxID::new(val));
-                active_sts_list.active.front().cloned().unwrap()
+                active_sts_list.active.front().copied().unwrap()
             };
             assert_eq!(res, expected);
         }
@@ -1855,7 +1855,7 @@ mod tests {
 
             // Since we populate metadata table, we need to count those purge transactions and rows.
             // 100ms should be enough.
-            smol::Timer::after(Duration::from_millis(1000)).await;
+            smol::Timer::after(Duration::from_secs(1)).await;
             let init_stats = engine.inner().trx_sys.trx_sys_stats();
 
             let mut session = engine.new_session().unwrap();

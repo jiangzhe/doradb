@@ -1551,7 +1551,7 @@ impl<'a> Iterator for FlatU8Iter<'a> {
     type Item = u8;
     #[inline]
     fn next(&mut self) -> Option<Self::Item> {
-        self.0.next().cloned()
+        self.0.next().copied()
     }
 }
 

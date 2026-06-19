@@ -189,7 +189,7 @@ pub(crate) async fn create_index_for_session(
         Err(err) => {
             return progress.rollback_before_catalog_commit(err).await;
         }
-    };
+    }
     let new_layout = match build_created_index_runtime_layout(
         &old_layout,
         Arc::clone(&new_metadata),

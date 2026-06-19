@@ -706,7 +706,7 @@ impl Table {
                                     let _ = self.deletion_buffer().put_committed(row_id, ts);
                                 }
                             }
-                        };
+                        }
                         break;
                     }
                     RowUndoKind::Insert | RowUndoKind::Update(_) => {

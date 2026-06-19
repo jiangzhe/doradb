@@ -586,7 +586,7 @@ impl<P: BufferPool> RowPageIndex<P> {
         loop {
             match self.try_find_row(pool_guard, row_id).await? {
                 Valid(row_location) => return Ok(row_location),
-                Invalid => continue,
+                Invalid => {}
             }
         }
     }
