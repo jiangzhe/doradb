@@ -1189,6 +1189,21 @@ pub(crate) mod test_hooks {
         TEST_FORCE_POST_PUBLISH_CHECKPOINT_ERROR.with(|flag| flag.set(enabled));
     }
 
+    pub(crate) struct ForcePostPublishCheckpointErrorGuard;
+
+    impl ForcePostPublishCheckpointErrorGuard {
+        pub(crate) fn new() -> Self {
+            set_test_force_post_publish_checkpoint_error(true);
+            Self
+        }
+    }
+
+    impl Drop for ForcePostPublishCheckpointErrorGuard {
+        fn drop(&mut self) {
+            set_test_force_post_publish_checkpoint_error(false);
+        }
+    }
+
     pub(super) fn test_force_post_publish_checkpoint_error_enabled() -> bool {
         TEST_FORCE_POST_PUBLISH_CHECKPOINT_ERROR.with(|flag| flag.get())
     }
@@ -1248,8 +1263,8 @@ mod tests {
     use crate::session::{Session, tests::SessionTestExt};
     use crate::table::DeleteMarker;
     use crate::table::persistence::test_hooks::{
-        set_test_checkpoint_after_readiness_hook, set_test_checkpoint_after_trx_start_hook,
-        set_test_force_post_publish_checkpoint_error, set_test_force_secondary_sidecar_error,
+        ForcePostPublishCheckpointErrorGuard, set_test_checkpoint_after_readiness_hook,
+        set_test_checkpoint_after_trx_start_hook, set_test_force_secondary_sidecar_error,
     };
     use crate::table::test_hooks::set_test_force_lwc_build_error;
     use crate::table::tests::*;
@@ -2238,9 +2253,10 @@ mod tests {
             let root_before = table.file().active_root_unchecked().clone();
             wait_checkpoint_ready(table_id, &session).await;
 
-            set_test_force_post_publish_checkpoint_error(true);
-            let res = session.checkpoint_table(table_id).await;
-            set_test_force_post_publish_checkpoint_error(false);
+            let res = {
+                let _guard = ForcePostPublishCheckpointErrorGuard::new();
+                session.checkpoint_table(table_id).await
+            };
 
             let err = res.unwrap_err();
             assert_checkpoint_write_poisoned(&err, &engine);
