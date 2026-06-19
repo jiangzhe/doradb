@@ -306,7 +306,8 @@ Implemented on 2026-06-19.
    Round 1 inventory in this document.
 2. Enabled `clippy::pedantic` in the workspace lint manifest, moved the
    existing `clippy::all` and `clippy::undocumented_unsafe_blocks` warnings
-   there, and made `doradb-storage` inherit workspace lints.
+   there, made `doradb-storage` inherit workspace lints, and kept the workspace
+   lint table at the bottom of the root `Cargo.toml`.
 3. Added a concrete workspace deferred allow list for the still-violated
    pedantic lint ids. The final deferred baseline is 2,873 diagnostics across
    55 lint ids. `clippy::uninlined_format_args` is intentionally deferred by
