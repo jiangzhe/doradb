@@ -27,7 +27,20 @@ cargo fmt
 cargo clippy -p doradb-storage --all-targets -- -D warnings
 ```
 
-3. Run tests:
+3. Audit staged Rust style when Rust files are staged:
+
+```bash
+tools/style_audit.rs
+```
+
+This command checks only staged `.rs` files, reads the staged index rather than
+unstaged working-tree edits, and reports formatting, clippy, and repository
+style violations. The project-scoped `style-auditor` subagent uses the
+`$style-audit` skill to run the same read-only audit in a separate context.
+For explicit unstaged checks, pass `--force-path <file-or-dir>`; directory
+targets check only direct `.rs` children and do not recurse.
+
+4. Run tests:
 
 ```bash
 cargo nextest run -p doradb-storage
