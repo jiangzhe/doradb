@@ -946,23 +946,32 @@ mod tests {
     use crate::file::table_file::MutableTableFile;
     use crate::id::{BlockID, PageID, RowID, TableID, TrxID};
     use crate::index::{COLUMN_DELETION_BLOB_PAGE_HEADER_SIZE, ColumnBlockIndex, UniqueIndex};
+    use crate::log::LogSync;
     use crate::log::buf::TrxLog;
+    use crate::log::format::{
+        REDO_DEFAULT_DATA_START_OFFSET, REDO_SUPER_BLOCK_SLOT_SIZE, RedoGroupHeader,
+        RedoSuperBlock, serialize_redo_super_block, slot_offset,
+    };
     use crate::log::redo::{DDLRedo, RedoHeader, RedoLogs, RedoTrxKind, RowRedo, RowRedoKind};
     use crate::row::RowRead;
     use crate::row::ops::{DeleteMvcc, SelectKey, SelectMvcc, UpdateCol, UpdateMvcc};
+    use crate::serde::Ser;
     use crate::session::tests::SessionTestExt;
     use crate::table::{CheckpointOutcome, DeleteMarker, Table};
     use crate::trx::{MIN_SNAPSHOT_TS, Transaction};
     use crate::value::Val;
     use crate::value::ValKind;
-    use std::fs::OpenOptions;
+    use std::fs::{self, File, OpenOptions};
     use std::io::{Read, Seek, SeekFrom, Write};
+    use std::path::Path;
     use std::sync::Arc;
     use tempfile::TempDir;
 
     const LIGHTWEIGHT_RECOVERY_BUFFER_BYTES: usize = 16 * 1024 * 1024;
     const LIGHTWEIGHT_RECOVERY_MAX_FILE_BYTES: usize = 32 * 1024 * 1024;
     const LIGHTWEIGHT_RECOVERY_READONLY_BUFFER_BYTES: usize = 32 * 1024 * 1024;
+    const CORRUPTION_RECOVERY_LOG_BLOCK_SIZE: usize = 4096;
+    const CORRUPTION_RECOVERY_LOG_FILE_MAX_SIZE: usize = 128 * 1024;
 
     fn assert_table_data_integrity(
         err: Error,
@@ -1008,6 +1017,129 @@ mod tests {
                     .io_depth(1)
                     .readonly_buffer_size(LIGHTWEIGHT_RECOVERY_READONLY_BUFFER_BYTES),
             )
+    }
+
+    fn corruption_recovery_engine_config(
+        main_dir: impl Into<std::path::PathBuf>,
+        log_file_stem: &str,
+    ) -> EngineConfig {
+        lightweight_recovery_engine_config(main_dir, log_file_stem).trx(
+            TrxSysConfig::default()
+                .io_depth(1)
+                .log_block_size(CORRUPTION_RECOVERY_LOG_BLOCK_SIZE)
+                .log_file_stem(log_file_stem)
+                .log_file_max_size(CORRUPTION_RECOVERY_LOG_FILE_MAX_SIZE)
+                .log_sync(LogSync::None)
+                .purge_threads(1),
+        )
+    }
+
+    async fn prepare_checkpointed_recovery_floor(main_dir: &Path, log_file_stem: &str) -> TrxID {
+        let engine = corruption_recovery_engine_config(main_dir, log_file_stem)
+            .build()
+            .await
+            .unwrap();
+        let table_id = create_index_ddl_base_table(&engine, vec![primary_index_spec()]).await;
+        let mut session = engine.new_session().unwrap();
+        session.drop_table(table_id).await.unwrap();
+        drop(session);
+        engine
+            .catalog()
+            .checkpoint_now(&engine.inner().trx_sys)
+            .await
+            .unwrap();
+        let replay_floor = engine
+            .catalog()
+            .storage
+            .checkpoint_snapshot()
+            .unwrap()
+            .catalog_replay_start_ts;
+        assert!(replay_floor > MIN_SNAPSHOT_TS);
+        drop(engine);
+        remove_redo_family(main_dir, log_file_stem);
+        replay_floor
+    }
+
+    fn remove_redo_family(main_dir: &Path, log_file_stem: &str) {
+        let prefix = format!("{log_file_stem}.");
+        for entry in fs::read_dir(main_dir).unwrap() {
+            let path = entry.unwrap().path();
+            let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+                continue;
+            };
+            if file_name.starts_with(&prefix) {
+                fs::remove_file(path).unwrap();
+            }
+        }
+    }
+
+    fn write_bad_checksum_redo_file(
+        main_dir: &Path,
+        log_file_stem: &str,
+        cts: TrxID,
+        sealed: bool,
+    ) {
+        let path = main_dir.join(format!("{log_file_stem}.00000000"));
+        let mut file = File::create(path).unwrap();
+        file.set_len(CORRUPTION_RECOVERY_LOG_FILE_MAX_SIZE as u64)
+            .unwrap();
+
+        let open = RedoSuperBlock::initial(
+            0,
+            CORRUPTION_RECOVERY_LOG_BLOCK_SIZE,
+            CORRUPTION_RECOVERY_LOG_FILE_MAX_SIZE,
+        );
+        write_redo_super_block_slot(&mut file, &open);
+
+        if sealed {
+            let durable_end_offset =
+                REDO_DEFAULT_DATA_START_OFFSET + CORRUPTION_RECOVERY_LOG_BLOCK_SIZE;
+            let sealed =
+                RedoSuperBlock::sealed_from_open(&open, 1, durable_end_offset, Some((cts, cts)))
+                    .unwrap();
+            write_redo_super_block_slot(&mut file, &sealed);
+        }
+
+        let mut group = vec![0u8; CORRUPTION_RECOVERY_LOG_BLOCK_SIZE];
+        let header = RedoGroupHeader {
+            checksum: 1,
+            body_len: 1,
+            min_cts: cts,
+            max_cts: cts,
+        };
+        let body_offset = header.ser(&mut group[..], 0);
+        assert_eq!(body_offset, RedoGroupHeader::SIZE);
+        group[body_offset] = 0x7f;
+        file.seek(SeekFrom::Start(REDO_DEFAULT_DATA_START_OFFSET as u64))
+            .unwrap();
+        file.write_all(&group).unwrap();
+        file.flush().unwrap();
+    }
+
+    fn write_redo_super_block_slot(file: &mut File, super_block: &RedoSuperBlock) {
+        let mut slot = vec![0u8; REDO_SUPER_BLOCK_SLOT_SIZE];
+        serialize_redo_super_block(&mut slot, super_block).unwrap();
+        file.seek(SeekFrom::Start(slot_offset(super_block.slot_no) as u64))
+            .unwrap();
+        file.write_all(&slot).unwrap();
+    }
+
+    async fn expect_log_recovery_corruption(main_dir: &Path, log_file_stem: &str) {
+        let err = match corruption_recovery_engine_config(main_dir, log_file_stem)
+            .build()
+            .await
+        {
+            Ok(engine) => {
+                drop(engine);
+                panic!("engine startup should fail on redo corruption");
+            }
+            Err(err) => err,
+        };
+        assert_eq!(
+            err.data_integrity_error(),
+            Some(DataIntegrityError::LogFileCorrupted),
+            "{err:?}"
+        );
     }
 
     fn log_recovery_for_engine<'a>(
@@ -1883,6 +2015,59 @@ mod tests {
             + start_offset as usize;
         rewrite_page_with_checksum(path, page_id, |page| {
             page[byte_offset] = 0xFF;
+        });
+    }
+
+    #[test]
+    fn test_log_recover_skips_corrupt_obsolete_sealed_segment_and_seeds_cts() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let main_dir = temp_dir.path();
+            let log_file_stem = "recover-sealed-skip-corrupt";
+            let replay_floor = prepare_checkpointed_recovery_floor(main_dir, log_file_stem).await;
+            let skipped_max_cts = TrxID::new(replay_floor.as_u64() - 1);
+            write_bad_checksum_redo_file(main_dir, log_file_stem, skipped_max_cts, true);
+
+            let recovered = corruption_recovery_engine_config(main_dir, log_file_stem)
+                .build()
+                .await
+                .unwrap();
+            let mut session = recovered.new_session().unwrap();
+            let trx = session.begin_trx().unwrap();
+            assert!(
+                trx.sts() > skipped_max_cts,
+                "next runtime timestamp {} must exceed skipped sealed max CTS {skipped_max_cts}",
+                trx.sts()
+            );
+            trx.rollback().await.unwrap();
+            drop(session);
+            drop(recovered);
+        });
+    }
+
+    #[test]
+    fn test_log_recover_scans_boundary_sealed_segment_and_fails_corruption() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let main_dir = temp_dir.path();
+            let log_file_stem = "recover-sealed-boundary-corrupt";
+            let replay_floor = prepare_checkpointed_recovery_floor(main_dir, log_file_stem).await;
+            write_bad_checksum_redo_file(main_dir, log_file_stem, replay_floor, true);
+
+            expect_log_recovery_corruption(main_dir, log_file_stem).await;
+        });
+    }
+
+    #[test]
+    fn test_log_recover_fails_replay_relevant_group_checksum_mismatch() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let main_dir = temp_dir.path();
+            let log_file_stem = "recover-relevant-checksum-corrupt";
+            let replay_floor = prepare_checkpointed_recovery_floor(main_dir, log_file_stem).await;
+            write_bad_checksum_redo_file(main_dir, log_file_stem, replay_floor, false);
+
+            expect_log_recovery_corruption(main_dir, log_file_stem).await;
         });
     }
 

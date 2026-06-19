@@ -360,10 +360,13 @@ For each group:
 Sealed empty files are skipped during replay planning because they contain no
 redo headers and make no timestamp contribution. Sealed non-empty files whose
 `max_redo_cts < replay_floor` are skipped without mmap/group parsing, and their
-`max_redo_cts` still contributes to recovery timestamp seeding. A sealed file
-whose range reaches the replay floor, including `max_redo_cts == replay_floor`,
-is scanned normally. Each decoded `TrxLog` header CTS must fall within the
-inclusive group header `min_cts..=max_cts` range.
+`max_redo_cts` still contributes to recovery timestamp seeding. Because
+`replay_floor` is the minimum of the catalog and loaded-table replay
+boundaries, any low loaded-table heap or delete boundary keeps older sealed
+segments scan-relevant. A sealed file whose range reaches the replay floor,
+including `max_redo_cts == replay_floor`, is scanned normally. Each decoded
+`TrxLog` header CTS must fall within the inclusive group header
+`min_cts..=max_cts` range.
 
 Recovery first loads checkpointed catalog state and user table roots. It then
 computes replay floors:
