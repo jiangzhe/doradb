@@ -25,11 +25,11 @@ Main source files:
 
 - `log/redo.rs`: redo record payload types and serialization.
 - `log/buf.rs`: log-group write buffer and transaction frame serialization.
-- `log/replay.rs`: mmap reader and redo stream draining.
+- `log/replay.rs`: replay planning, mmap reader, and redo record draining.
 - `trx/group.rs`: commit-group construction.
 - `trx/sys.rs`: commit admission, CTS assignment, and GC bucket ownership.
-- `log/mod.rs`: log file allocation, group-commit write scheduling, IO, sync,
-  and redo-stream failure handling.
+- `log/mod.rs`: log file discovery, startup handoff, allocation,
+  group-commit write scheduling, IO, sync, and redo-stream failure handling.
 - `log/recover.rs`: startup replay.
 - `catalog/checkpoint.rs`: catalog checkpoint scanning over durable redo.
 
@@ -48,11 +48,14 @@ Example with defaults:
 ./redo.log.00000001
 ```
 
-Discovery uses `discover_redo_log_files`, requires contiguous sequence numbers,
-and validates each file's redo super block before the file can participate in
-startup recovery or checkpoint scanning. Legacy partitioned names like
-`<prefix>.<partition>.<seq>` are rejected, and legacy zero-header redo files are
-invalid. The configured defaults are:
+Discovery uses `discover_redo_log_files` and requires contiguous sequence
+numbers starting at `00000000`; until durable truncation metadata exists, a
+non-empty family missing that prefix is corruption. Startup first discovers
+file names and sequence continuity. Valid redo super-block metadata is selected
+later during replay planning or reader construction before a file can
+participate in startup recovery or checkpoint scanning. Legacy partitioned
+names like `<prefix>.<partition>.<seq>` are rejected, and legacy zero-header
+redo files are invalid. The configured defaults are:
 
 - `log_dir = "."`
 - `log_file_stem = "redo.log"`
@@ -321,13 +324,17 @@ observing the result; it does not roll the transaction back.
 
 ## Read and Replay Path
 
-Startup builds a `RedoLogInitializer` from discovered log files. If files
-exist, it enters recovery mode and replays them in ascending sequence order.
-When the last discovered file is exhausted, the initializer increments the file
-sequence so normal runtime opens a fresh file after recovery.
+Startup builds a `RedoLogStartup` from discovered log files: a
+`RedoLogReplayer` for existing files and a `RedoLogInitializer` for the next
+writable file. After checkpoint bootstrap computes the `replay_floor`, recovery
+reads validated redo super-block metadata from the newest files backwards until
+it reaches the oldest suffix segment that may contain replay-relevant records.
+The initializer derives the next writable file sequence from the newest
+discovered file before replay, so normal runtime opens a fresh file after
+recovery even if every planned segment was skipped.
 
-`MmapLogReader` maps one file, selects a valid redo super-block slot, and reads
-groups from the fixed `REDO_DEFAULT_DATA_START_OFFSET`.
+`MmapLogReader` maps one planned file, uses the selected valid redo super-block
+slot, and reads groups from the fixed `REDO_DEFAULT_DATA_START_OFFSET`.
 For each group:
 
 - if an unsealed group offset reaches the header's `file_max_size`, the file is
@@ -350,10 +357,13 @@ For each group:
 - if the group physical length exceeds one page, reader offset advances by the
   sector-aligned group length.
 
-Sealed empty files are exhausted immediately at the data start and do not need
-a zero EOF group. `RedoLogStream` still drains sealed non-empty files normally;
-whole-file skip is not implemented in this phase. Each decoded `TrxLog` header
-CTS must fall within the inclusive group header `min_cts..=max_cts` range.
+Sealed empty files are skipped during replay planning because they contain no
+redo headers and make no timestamp contribution. Sealed non-empty files whose
+`max_redo_cts < replay_floor` are skipped without mmap/group parsing, and their
+`max_redo_cts` still contributes to recovery timestamp seeding. A sealed file
+whose range reaches the replay floor, including `max_redo_cts == replay_floor`,
+is scanned normally. Each decoded `TrxLog` header CTS must fall within the
+inclusive group header `min_cts..=max_cts` range.
 
 Recovery first loads checkpointed catalog state and user table roots. It then
 computes replay floors:
@@ -364,9 +374,9 @@ computes replay floors:
 - `replay_floor = min(catalog replay start, loaded table heap/delete starts)`.
 
 The highest recovered timestamp is tracked separately from replay filtering.
-Recovery updates `max_recovered_cts` from checkpoint metadata, table roots, and
-every redo header, even when a record is skipped. The next runtime timestamp is
-`max_recovered_cts + 1`.
+Recovery updates `max_recovered_cts` from checkpoint metadata, table roots,
+skipped sealed segment `max_redo_cts`, and every redo header, even when a record
+is skipped. The next runtime timestamp is `max_recovered_cts + 1`.
 
 Replay rules:
 
@@ -438,17 +448,18 @@ recent log writes.
 - Physical redo groups are checksummed. Sealed files validate their durable end
   offset and real redo CTS range during replay, but active crash files can
   remain unsealed and are scanned sequentially.
-- Log discovery depends on file names and contiguous sequence numbers.
+- Log discovery depends on file names and contiguous sequence numbers starting
+  at `00000000`.
 - Old log files are not physically truncated or deleted by the current redo
-  path. Checkpoint metadata narrows replay logically, but recovery still opens
-  the discovered file family from the beginning.
+  path. Checkpoint metadata narrows replay logically, and recovery can skip
+  validated sealed files whose CTS range is fully below the replay floor.
 - `MmapLogReader` can block the async runtime through page faults or file access.
 - A single large transaction can exceed `log_block_size` and is written as one
   large direct IO request.
 - `persisted_cts` is an ordered-completion watermark. It can advance across
   no-log groups, so recovery must continue to seed timestamps only from
-  checkpoint metadata, table roots, and real redo headers. Phase 3 still scans
-  sealed files, so it does not seed recovery timestamps from sealed headers.
+  checkpoint metadata, table roots, skipped sealed non-empty segment ranges, and
+  real redo headers.
 
 ## Potential Improvements
 
@@ -492,8 +503,9 @@ Replace mmap recovery reads with an async-friendly reader or a dedicated
 blocking reader thread. This is already tracked by
 `docs/backlogs/000050-refactor-redo-log-reader-avoid-sync-mmap-in-async-runtime.md`.
 
-Use sealed file CTS ranges to skip old files before mmap/open/read. Today replay
-uses logical per-record filters after reading groups.
+Add durable first-retained-sequence metadata before implementing physical redo
+file truncation. Without that metadata, missing prefix sequences remain
+corruption.
 
 Parallelize DML replay after preserving DDL pipeline barriers and per-table/page
 ordering. The code already has `dispatch_dml` and `wait_for_dml_done` boundaries

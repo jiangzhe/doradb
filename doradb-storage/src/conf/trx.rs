@@ -5,10 +5,10 @@ use crate::catalog::Catalog;
 use crate::component::Supplier;
 use crate::error::{ConfigError, ConfigResult, Error, Result};
 use crate::file::fs::FileSystem;
-use crate::io::{Completion, StorageBackend, align_to_sector_size};
+use crate::io::{Completion, align_to_sector_size};
 use crate::log::format::REDO_DEFAULT_DATA_START_OFFSET;
 use crate::log::recover::{RecoveryDeps, log_recover};
-use crate::log::{LogSync, RedoLogInitializer, RedoLogMode};
+use crate::log::{LogSync, RedoLogStartup};
 use crate::quiescent::QuiescentGuard;
 use crate::trx::purge::Purge;
 use crate::trx::sys::{
@@ -19,7 +19,6 @@ use byte_unit::Byte;
 use error_stack::{Report, ResultExt};
 use flume::{Receiver, Sender};
 use serde::{Deserialize, Serialize};
-use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -189,29 +188,21 @@ impl TrxSysConfig {
     }
 
     #[inline]
-    pub(crate) fn redo_log_initializer(&self) -> Result<RedoLogInitializer> {
+    pub(crate) fn redo_log_startup(&self) -> Result<RedoLogStartup> {
         debug_assert!(validate_log_file_stem(&self.log_file_stem));
-        let ctx = StorageBackend::new(self.io_depth)?;
         let file_prefix = self.file_prefix().map_err(Error::from)?;
         let log_block_size = align_to_sector_size(self.log_block_size.as_u64() as usize);
         let file_max_size =
             normalize_redo_file_max_size(self.log_file_max_size.as_u64() as usize, log_block_size)?;
 
         let logs = discover_redo_log_files(&file_prefix, false)?;
-        let mode = if logs.is_empty() {
-            RedoLogMode::Done
-        } else {
-            RedoLogMode::Recovery(VecDeque::from(logs))
-        };
-        Ok(RedoLogInitializer {
-            ctx,
-            mode,
+        RedoLogStartup::recovery(
             file_prefix,
+            self.io_depth,
             file_max_size,
             log_block_size,
-            io_depth: self.io_depth,
-            file_seq: None,
-        })
+            logs,
+        )
     }
 
     #[inline]
@@ -234,7 +225,7 @@ impl TrxSysConfig {
         catalog: QuiescentGuard<Catalog>,
     ) -> Result<(TransactionSystem, PendingTransactionSystemStartup)> {
         let config = self.normalize_redo_file_layout()?;
-        let redo_log_initializer = config.redo_log_initializer()?;
+        let redo_log_startup = config.redo_log_startup()?;
 
         let pool_guards = PoolGuards::builder()
             .push(PoolRole::Meta, meta_pool.pool_guard())
@@ -254,7 +245,7 @@ impl TrxSysConfig {
                 disk_pool,
             },
             &catalog,
-            redo_log_initializer,
+            redo_log_startup,
             purge_tx.clone(),
         )
         .await?;

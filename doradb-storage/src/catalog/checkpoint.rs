@@ -5,8 +5,9 @@ use crate::catalog::{
 };
 use crate::error::{ErrorKind, FatalError, Result};
 use crate::id::{TableID, TrxID};
+use crate::log::discover_redo_log_files;
 use crate::log::redo::{DDLRedo, RowRedoKind, TableDML};
-use crate::log::{RedoLogInitializer, discover_redo_log_files};
+use crate::log::replay::RedoLogReplayer;
 use crate::trx::sys::TransactionSystem;
 use event_listener::{Event, listener};
 use parking_lot::Mutex;
@@ -49,9 +50,6 @@ pub(crate) struct CatalogCheckpointBatch {
 #[derive(Clone)]
 pub(crate) struct CatalogCheckpointScanConfig {
     pub(crate) file_prefix: String,
-    pub(crate) io_depth: usize,
-    pub(crate) log_file_max_size: usize,
-    pub(crate) log_block_size: usize,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -323,16 +321,10 @@ impl Catalog {
         if logs.is_empty() {
             return Ok(batch);
         }
-        let mut log_stream = RedoLogInitializer::recovery(
-            scan_cfg.file_prefix.clone(),
-            scan_cfg.io_depth,
-            scan_cfg.log_file_max_size,
-            scan_cfg.log_block_size,
-            logs,
-        )?
-        .stream();
+        let mut replayer = RedoLogReplayer::new(logs);
+        replayer.plan_replay(replay_start_ts)?;
 
-        while let Some(log) = log_stream.pop()? {
+        while let Some(log) = replayer.pop()? {
             let (header, redo) = log.into_inner();
             if header.cts < replay_start_ts {
                 // Older records are already represented by the current
