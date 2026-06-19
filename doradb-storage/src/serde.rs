@@ -1177,7 +1177,7 @@ impl<T: BitPackable + Deser> Deser for ForBitpackingDeser<T> {
                     .attach(format!("invalid FOR bit width {n_bits}"))
                     .into());
             }
-        };
+        }
         Ok((idx, ForBitpackingDeser(data)))
     }
 }

@@ -2205,9 +2205,7 @@ impl UserTableAccessor<'_> {
                                     );
                                     return Ok(InsertIndex::Inserted);
                                 }
-                                IndexCompareExchange::NotExists => {
-                                    continue;
-                                }
+                                IndexCompareExchange::NotExists => {}
                                 IndexCompareExchange::Mismatch => {
                                     return Ok(InsertIndex::WriteConflict);
                                 }
@@ -2454,7 +2452,6 @@ impl UserTableAccessor<'_> {
                                 IndexCompareExchange::NotExists => {
                                     // Purge thread may delete the index entry before we update,
                                     // we should re-insert.
-                                    continue;
                                 }
                             }
                         }
@@ -2728,7 +2725,7 @@ impl UserTableAccessor<'_> {
                                 IndexCompareExchange::Mismatch => {
                                     return Ok(UpdateIndex::WriteConflict);
                                 }
-                                IndexCompareExchange::NotExists => continue,
+                                IndexCompareExchange::NotExists => {}
                             }
                         }
                     }
@@ -3214,7 +3211,6 @@ impl UserTableAccessor<'_> {
                 }
                 UpdateRowInplace::RetryInTransition => {
                     smol::Timer::after(std::time::Duration::from_millis(1)).await;
-                    continue;
                 }
                 UpdateRowInplace::NoFreeSpace(old_row_id, old_row, update, old_guard) => {
                     // In-place update failed after the old row was locked and
@@ -3407,7 +3403,6 @@ impl UserTableAccessor<'_> {
                 DeleteInternal::WriteConflict => return Ok(DeleteMvcc::WriteConflict),
                 DeleteInternal::RetryInTransition => {
                     smol::Timer::after(std::time::Duration::from_millis(1)).await;
-                    continue;
                 }
                 DeleteInternal::Ok(page_guard) => {
                     // Mask every secondary-index entry for this hot row. The

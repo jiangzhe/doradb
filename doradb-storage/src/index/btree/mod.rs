@@ -1748,7 +1748,6 @@ impl<'a, V: BTreeValue, P: BufferPool> BTreeCompactor<'a, V, P> {
                             );
                             // Put right node into purge list.
                             purge_list.push(r_guard);
-                            continue;
                         }
                         MemTreeSiblingMergePlan::Partial {
                             right_count: sep_idx,

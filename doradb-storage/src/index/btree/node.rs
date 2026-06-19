@@ -657,7 +657,7 @@ impl BTreeNode {
         );
         tmp_node.extend_slots_from::<V>(self, 0, self.count());
         debug_assert!(self.free_space_after_compaction() == tmp_node.free_space());
-        mem::swap(self, tmp_node.deref_mut());
+        mem::swap(self, &mut *tmp_node);
     }
 
     /// Delete key value at given position.

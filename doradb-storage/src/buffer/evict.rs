@@ -2751,7 +2751,7 @@ pub(crate) mod tests {
                         drop(g);
                         if rng.random_bool(0.3) {
                             // choose one page and try to lock it.
-                            let page_id = pages.choose(&mut rng).cloned().unwrap();
+                            let page_id = pages.choose(&mut rng).copied().unwrap();
                             println!(
                                 "thread {} read page {}, allocated {}, in-mem {}, target_free {}, reads {}, writes {}",
                                 thread_id,

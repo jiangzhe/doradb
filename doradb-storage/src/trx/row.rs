@@ -131,7 +131,7 @@ impl<'a> RowReadAccess<'a> {
                     // hot undo chain and apply inverse operations until the
                     // visible version is reconstructed.
                     let mut next = &undo_head.next;
-                    let read_set: BTreeSet<usize> = read_set.iter().cloned().collect();
+                    let read_set: BTreeSet<usize> = read_set.iter().copied().collect();
                     let key_tracker = if let Some(key) = key {
                         // Index lookups may route through a latest row whose
                         // current key no longer matches the lookup key. Track

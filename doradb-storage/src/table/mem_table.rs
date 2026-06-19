@@ -1222,7 +1222,7 @@ impl MemTable<FixedBufferPool, FixedBufferPool> {
                                     );
                                     return Ok(InsertIndex::Inserted);
                                 }
-                                IndexCompareExchange::NotExists => continue,
+                                IndexCompareExchange::NotExists => {}
                                 IndexCompareExchange::Mismatch => {
                                     return Ok(InsertIndex::WriteConflict);
                                 }
@@ -1784,7 +1784,6 @@ impl MemTable<FixedBufferPool, FixedBufferPool> {
                 DeleteInternal::WriteConflict => return Ok(DeleteMvcc::WriteConflict),
                 DeleteInternal::RetryInTransition => {
                     smol::Timer::after(std::time::Duration::from_millis(1)).await;
-                    continue;
                 }
                 DeleteInternal::Ok(page_guard) => {
                     self.defer_delete_indexes(rt, effects, row_id, &page_guard)

@@ -406,7 +406,7 @@ impl RedoLogs {
             (None, Some(other)) => {
                 self.ddl.replace(other);
             }
-            (Some(_), None) | (None, None) => (),
+            (Some(_) | None, None) => (),
         }
         // Merge DML.
         for (table_id, table) in other.dml {
@@ -524,7 +524,7 @@ impl TableDML {
             Entry::Occupied(mut occ) => {
                 let old = occ.get_mut();
                 match (&mut old.kind, entry.kind) {
-                    (RowRedoKind::Delete, _) | (RowRedoKind::DeleteByUniqueKey(_), _) => {
+                    (RowRedoKind::Delete | RowRedoKind::DeleteByUniqueKey(_), _) => {
                         // Once the old RowID is deleted, there is impossible
                         // to have another operation on the same RowID.
                         unreachable!()

@@ -150,7 +150,7 @@ mod tests {
         while let Some(val) = list.try_pop(false) {
             results.push(val);
         }
-        results.sort();
+        results.sort_unstable();
         assert_eq!(results, (0..10).collect::<Vec<_>>());
     }
 

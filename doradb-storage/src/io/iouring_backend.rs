@@ -120,13 +120,13 @@ where
         call_count += 1;
         match submit() {
             Ok(submitted) => break submitted,
-            Err(err) if err.raw_os_error() == Some(EINTR) => continue,
+            Err(err) if err.raw_os_error() == Some(EINTR) => {}
             Err(err) if matches!(err.raw_os_error(), Some(EAGAIN | EBUSY)) => {
                 let submitted = loop {
                     call_count += 1;
                     match submit_and_wait(1) {
                         Ok(submitted) => break submitted,
-                        Err(err) if err.raw_os_error() == Some(EINTR) => continue,
+                        Err(err) if err.raw_os_error() == Some(EINTR) => {}
                         Err(err) => {
                             panic!(
                                 "io_uring blocking submit failed: err={err} pending_sqes={} limit={} staged_len={}",
@@ -165,7 +165,7 @@ where
         call_count += 1;
         match submit_and_wait(min_nr) {
             Ok(submitted) => break submitted,
-            Err(err) if err.raw_os_error() == Some(EINTR) => continue,
+            Err(err) if err.raw_os_error() == Some(EINTR) => {}
             Err(err) => panic!("io_uring wait failed: err={err} min_nr={min_nr}"),
         }
     };
