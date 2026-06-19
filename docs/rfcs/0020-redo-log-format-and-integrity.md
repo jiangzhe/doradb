@@ -393,10 +393,10 @@ the unsafe boundary local to reader construction. [C2], [B2]
   - Prerequisites: Phases 1 through 4 define the final v2 behavior.
   - Phase-local Choices: Final test split across `log/buf.rs`, `log/mod.rs`,
     `log/replay.rs`, `log/recover.rs`, and catalog/table recovery tests.
-  - Task Doc: `docs/tasks/TBD.md`
-  - Task Issue: `#0`
-  - Phase Status: `pending`
-  - Implementation Summary: `pending`
+  - Task Doc: `docs/tasks/000182-redo-log-documentation-and-corruption-coverage.md`
+  - Task Issue: `#719`
+  - Phase Status: done
+  - Implementation Summary: Audited final redo-log v2 docs and coverage, clarified replay-floor skip semantics, and added startup recovery tests for obsolete sealed skip, boundary no-skip corruption, and replay-relevant checksum mismatch. [Task Resolve Sync: docs/tasks/000182-redo-log-documentation-and-corruption-coverage.md @ 2026-06-19]
   - Related Backlogs:
     - `docs/backlogs/000032-deletion-watermark-meta-redo-expansion-for-log-truncation.md`
     - `docs/backlogs/000050-refactor-redo-log-reader-avoid-sync-mmap-in-async-runtime.md`
