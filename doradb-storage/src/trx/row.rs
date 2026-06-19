@@ -2,8 +2,8 @@ use crate::buffer::frame::FrameContext;
 use crate::buffer::page::VersionedPageID;
 use crate::catalog::{TableColumnLayout, TableMetadata};
 use crate::id::{RowID, TableID, TrxID};
-use crate::log::recover::RecoverMap;
 use crate::map::FastHashMap;
+use crate::recovery::RowRecoveryMap;
 use crate::row::ops::{ReadRow, SelectKey, UndoCol, UndoVal, UpdateCol, UpdateRow};
 use crate::row::{Row, RowMut, RowPage, RowRead};
 use crate::trx::stmt::StmtEffects;
@@ -490,7 +490,7 @@ impl<'a> RowReadAccess<'a> {
 
 pub(crate) enum RowReadState<'a> {
     RowVer(RowVersionReadGuard<'a>),
-    Recover(&'a RecoverMap),
+    Recover(&'a RowRecoveryMap),
 }
 
 impl<'a> RowReadState<'a> {
@@ -498,7 +498,7 @@ impl<'a> RowReadState<'a> {
     fn from_ctx(ctx: &'a FrameContext, row_idx: usize) -> Self {
         match ctx {
             FrameContext::RowVerMap(ver) => RowReadState::RowVer(ver.read_latch(row_idx)),
-            FrameContext::RecoverMap(rec) => RowReadState::Recover(rec),
+            FrameContext::RowRecoveryMap(rec) => RowReadState::Recover(rec),
         }
     }
 }
@@ -1118,7 +1118,7 @@ mod tests {
     fn test_read_row_latest_inactive_index_returns_invalid_index() {
         let metadata = sparse_metadata();
         let page = row_page(&metadata);
-        let frame_ctx = FrameContext::RecoverMap(RecoverMap::new(TrxID::new(0)));
+        let frame_ctx = FrameContext::RowRecoveryMap(RowRecoveryMap::new(TrxID::new(0)));
         let access = RowReadAccess::new(&page, &frame_ctx, 0);
         let key = SelectKey::new(1, vec![Val::from(10i32)]);
 
@@ -1160,7 +1160,7 @@ mod tests {
     fn test_any_version_matches_key_inactive_index_returns_false() {
         let metadata = sparse_metadata();
         let page = row_page(&metadata);
-        let frame_ctx = FrameContext::RecoverMap(RecoverMap::new(TrxID::new(0)));
+        let frame_ctx = FrameContext::RowRecoveryMap(RowRecoveryMap::new(TrxID::new(0)));
         let access = RowReadAccess::new(&page, &frame_ctx, 0);
         let key = SelectKey::new(1, vec![Val::from(10i32)]);
 
@@ -1171,7 +1171,7 @@ mod tests {
     fn test_any_version_matches_key_latest_page_row_returns_true() {
         let metadata = sparse_metadata();
         let page = row_page(&metadata);
-        let frame_ctx = FrameContext::RecoverMap(RecoverMap::new(TrxID::new(0)));
+        let frame_ctx = FrameContext::RowRecoveryMap(RowRecoveryMap::new(TrxID::new(0)));
         let access = RowReadAccess::new(&page, &frame_ctx, 0);
         let key = SelectKey::new(0, vec![Val::from(10i32)]);
 

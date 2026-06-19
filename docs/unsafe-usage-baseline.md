@@ -2,7 +2,7 @@
 
 - Generated on: `2026-06-19`
 - Command: `tools/unsafe_inventory.rs`
-- Scope: `doradb-storage/src/{buffer,latch,row,index,io,trx,lwc,file,log}`
+- Scope: `doradb-storage/src/{buffer,latch,row,index,io,trx,lwc,file,log,recovery}`
 
 ## Module Summary
 
@@ -16,8 +16,9 @@
 | trx | 11 | 5 | 0 | 0 | 0 | 4 |
 | lwc | 2 | 0 | 0 | 0 | 0 | 0 |
 | file | 8 | 13 | 0 | 0 | 2 | 13 |
-| log | 6 | 3 | 0 | 0 | 0 | 3 |
-| **total** | **72** | **150** | **0** | **0** | **6** | **130** |
+| log | 4 | 0 | 0 | 0 | 0 | 0 |
+| recovery | 5 | 3 | 0 | 0 | 0 | 3 |
+| **total** | **75** | **150** | **0** | **0** | **6** | **130** |
 
 ## File Hotspots (top 40)
 
@@ -40,7 +41,7 @@
 | `doradb-storage/src/io/mod.rs` | io | 4 | 2 |
 | `doradb-storage/src/trx/undo/row.rs` | trx | 4 | 4 |
 | `doradb-storage/src/index/block_index_root.rs` | index | 3 | 3 |
-| `doradb-storage/src/log/replay.rs` | log | 3 | 3 |
+| `doradb-storage/src/recovery/redo_stream.rs` | recovery | 3 | 3 |
 | `doradb-storage/src/buffer/fixed.rs` | buffer | 2 | 2 |
 | `doradb-storage/src/buffer/frame.rs` | buffer | 2 | 2 |
 | `doradb-storage/src/buffer/page.rs` | buffer | 2 | 1 |

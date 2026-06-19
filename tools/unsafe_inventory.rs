@@ -10,10 +10,11 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-const MODULES: [&str; 9] = [
-    "buffer", "latch", "row", "index", "io", "trx", "lwc", "file", "log",
+const MODULES: [&str; 10] = [
+    "buffer", "latch", "row", "index", "io", "trx", "lwc", "file", "log", "recovery",
 ];
-const MODULE_SCOPE: &str = "doradb-storage/src/{buffer,latch,row,index,io,trx,lwc,file,log}";
+const MODULE_SCOPE: &str =
+    "doradb-storage/src/{buffer,latch,row,index,io,trx,lwc,file,log,recovery}";
 
 #[derive(Debug, Clone, Default)]
 struct FileMetrics {
@@ -124,7 +125,8 @@ fn run() -> Result<(), String> {
             fs::create_dir_all(parent)
                 .map_err(|e| format!("failed to create {}: {e}", parent.display()))?;
         }
-        fs::write(&path, &markdown).map_err(|e| format!("failed to write {}: {e}", path.display()))?;
+        fs::write(&path, &markdown)
+            .map_err(|e| format!("failed to write {}: {e}", path.display()))?;
     }
     print!("{markdown}");
     Ok(())
@@ -199,9 +201,7 @@ fn count_word(input: &str, needle: &str) -> usize {
 
 fn generated_at() -> String {
     // Use current UTC day to reflect when inventory is generated.
-    let output = Command::new("date")
-        .args(["-u", "+%F"])
-        .output();
+    let output = Command::new("date").args(["-u", "+%F"]).output();
     if let Ok(out) = output {
         if out.status.success() {
             let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
@@ -221,7 +221,9 @@ fn render_markdown(module_rows: &[ModuleMetrics], file_rows: &[FileMetrics], top
     out.push_str(&format!("- Scope: `{MODULE_SCOPE}`\n\n"));
 
     out.push_str("## Module Summary\n\n");
-    out.push_str("| module | files | unsafe | transmute | new_unchecked | assume_init | // SAFETY: |\n");
+    out.push_str(
+        "| module | files | unsafe | transmute | new_unchecked | assume_init | // SAFETY: |\n",
+    );
     out.push_str("|---|---:|---:|---:|---:|---:|---:|\n");
     let mut total = ModuleMetrics::default();
     for m in module_rows {

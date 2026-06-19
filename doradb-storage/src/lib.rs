@@ -25,6 +25,7 @@ mod memcmp;
 mod notify;
 mod ptr;
 mod quiescent;
+mod recovery;
 mod row;
 mod serde;
 mod session;

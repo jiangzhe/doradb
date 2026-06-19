@@ -1,8 +1,6 @@
 pub(crate) mod buf;
 pub(crate) mod format;
-pub(crate) mod recover;
 pub(crate) mod redo;
-pub(crate) mod replay;
 
 use crate::conf::TrxSysConfig;
 use crate::error::{
@@ -21,7 +19,6 @@ use crate::log::format::{
     REDO_DEFAULT_DATA_START_OFFSET, REDO_SUPER_BLOCK_SLOT_SIZE, RedoSuperBlock,
     serialize_redo_super_block, slot_offset,
 };
-use crate::log::replay::RedoLogReplayer;
 use crate::map::FastHashMap;
 use crate::serde::Ser;
 use crate::trx::MIN_SNAPSHOT_TS;
@@ -120,14 +117,6 @@ pub(crate) struct RedoLogFileDescriptor {
     pub(crate) path: PathBuf,
 }
 
-/// Startup products for redo recovery and the next writable redo log.
-pub(crate) struct RedoLogStartup {
-    /// Initializer used after replay to create the next writable redo file.
-    pub(crate) initializer: RedoLogInitializer,
-    /// Replayer used to scan discovered redo files.
-    pub(crate) replayer: RedoLogReplayer,
-}
-
 pub(crate) struct RedoLogInitializer {
     pub(crate) ctx: StorageBackend,
     pub(crate) file_prefix: String,
@@ -136,31 +125,6 @@ pub(crate) struct RedoLogInitializer {
     pub(crate) io_depth: usize,
     /// Sequence for the next writable redo file.
     pub(crate) next_file_seq: u32,
-}
-
-impl RedoLogStartup {
-    #[inline]
-    pub(crate) fn recovery(
-        file_prefix: String,
-        io_depth: usize,
-        file_max_size: usize,
-        log_block_size: usize,
-        logs: Vec<RedoLogFileDescriptor>,
-    ) -> Result<Self> {
-        let replayer = RedoLogReplayer::new(logs);
-        let next_file_seq = replayer.next_file_seq()?.unwrap_or(0);
-        let initializer = RedoLogInitializer::new(
-            file_prefix,
-            io_depth,
-            file_max_size,
-            log_block_size,
-            next_file_seq,
-        )?;
-        Ok(Self {
-            initializer,
-            replayer,
-        })
-    }
 }
 
 impl RedoLogInitializer {
@@ -1806,7 +1770,7 @@ mod tests {
         REDO_DEFAULT_DATA_START_OFFSET, REDO_SUPER_BLOCK_SLOT_SIZE, parse_redo_super_block,
     };
     use crate::log::redo::{RedoHeader, RedoLogs, RedoTrxKind};
-    use crate::log::replay::{ReadLog, RedoLogReplayer, RedoLogSegment};
+    use crate::recovery::redo_stream::{ReadLog, RedoLogSegment, RedoLogStream};
     use crate::trx::MAX_SNAPSHOT_TS;
     use crate::trx::sys::{TransactionSystemQueues, TrxCleanupMessage};
     use crate::value::Val;
@@ -1859,6 +1823,26 @@ mod tests {
         .unwrap();
         submit_header_write_for_test(header_write, &header_completion);
         log_file
+    }
+
+    fn redo_stream_and_initializer_for_test(
+        file_prefix: &str,
+        io_depth: usize,
+        file_max_size: usize,
+        log_block_size: usize,
+        logs: Vec<RedoLogFileDescriptor>,
+    ) -> (RedoLogInitializer, RedoLogStream) {
+        let stream = RedoLogStream::new(logs);
+        let next_file_seq = stream.next_file_seq().unwrap().unwrap_or(0);
+        let initializer = RedoLogInitializer::new(
+            file_prefix.to_owned(),
+            io_depth,
+            file_max_size,
+            log_block_size,
+            next_file_seq,
+        )
+        .unwrap();
+        (initializer, stream)
     }
 
     fn create_sealed_log_file_for_test(
@@ -3513,19 +3497,19 @@ mod tests {
         );
         create_sealed_log_file_for_test(file_prefix, 2, REDO_DEFAULT_DATA_START_OFFSET, None);
         let descriptors = discover_redo_log_files(file_prefix, false).unwrap();
-        let mut replayer = RedoLogReplayer::new(descriptors);
+        let mut stream = RedoLogStream::new(descriptors);
 
-        assert_eq!(replayer.next_file_seq().unwrap(), Some(3));
-        let skipped = replayer.plan_replay(TrxID::new(15)).unwrap();
+        assert_eq!(stream.next_file_seq().unwrap(), Some(3));
+        let skipped = stream.plan_replay(TrxID::new(15)).unwrap();
         assert_eq!(skipped, None);
-        assert_eq!(vec![1], replayer.planned_file_seqs());
+        assert_eq!(vec![1], stream.planned_file_seqs());
     }
 
     #[test]
-    fn test_redo_replayer_rejects_read_before_explicit_plan() {
-        let mut replayer = RedoLogReplayer::new(Vec::new());
+    fn test_redo_stream_rejects_read_before_explicit_plan() {
+        let mut stream = RedoLogStream::new(Vec::new());
 
-        let err = replayer.pop().unwrap_err();
+        let err = stream.try_next().unwrap_err();
         assert_eq!(
             err.downcast_ref::<InternalError>().copied(),
             Some(InternalError::Generic)
@@ -3538,11 +3522,11 @@ mod tests {
 
     #[test]
     fn test_redo_replay_plan_rejects_second_call() {
-        let mut replayer = RedoLogReplayer::new(Vec::new());
+        let mut stream = RedoLogStream::new(Vec::new());
 
-        assert_eq!(replayer.plan_replay(TrxID::new(10)).unwrap(), None);
+        assert_eq!(stream.plan_replay(TrxID::new(10)).unwrap(), None);
         for requested_floor in [TrxID::new(10), TrxID::new(11)] {
-            let err = replayer.plan_replay(requested_floor).unwrap_err();
+            let err = stream.plan_replay(requested_floor).unwrap_err();
             assert_eq!(
                 err.downcast_ref::<InternalError>().copied(),
                 Some(InternalError::Generic)
@@ -3569,14 +3553,12 @@ mod tests {
             Some((TrxID::new(10), TrxID::new(20))),
         );
         let logs = discover_redo_log_files(file_prefix, false).unwrap();
-        let RedoLogStartup {
-            initializer,
-            mut replayer,
-        } = RedoLogStartup::recovery(file_prefix.to_owned(), 1, 128 * 1024, 4096, logs).unwrap();
+        let (initializer, mut stream) =
+            redo_stream_and_initializer_for_test(file_prefix, 1, 128 * 1024, 4096, logs);
 
-        let skipped = replayer.plan_replay(TrxID::new(21)).unwrap();
+        let skipped = stream.plan_replay(TrxID::new(21)).unwrap();
         assert_eq!(skipped, Some(TrxID::new(20)));
-        assert!(replayer.pop().unwrap().is_none());
+        assert!(stream.try_next().unwrap().is_none());
         assert_eq!(initializer.next_file_seq, 1);
     }
 
@@ -3587,14 +3569,12 @@ mod tests {
         let file_prefix = file_prefix.to_str().unwrap();
         create_sealed_log_file_for_test(file_prefix, 0, REDO_DEFAULT_DATA_START_OFFSET, None);
         let logs = discover_redo_log_files(file_prefix, false).unwrap();
-        let RedoLogStartup {
-            initializer,
-            mut replayer,
-        } = RedoLogStartup::recovery(file_prefix.to_owned(), 1, 128 * 1024, 4096, logs).unwrap();
+        let (initializer, mut stream) =
+            redo_stream_and_initializer_for_test(file_prefix, 1, 128 * 1024, 4096, logs);
 
-        let skipped = replayer.plan_replay(TrxID::new(100)).unwrap();
+        let skipped = stream.plan_replay(TrxID::new(100)).unwrap();
         assert_eq!(skipped, None);
-        assert!(replayer.pop().unwrap().is_none());
+        assert!(stream.try_next().unwrap().is_none());
         assert_eq!(initializer.next_file_seq, 1);
     }
 
@@ -3610,11 +3590,11 @@ mod tests {
             Some((TrxID::new(10), TrxID::new(20))),
         );
         let logs = discover_redo_log_files(file_prefix, false).unwrap();
-        let mut replayer = RedoLogReplayer::new(logs);
+        let mut stream = RedoLogStream::new(logs);
 
-        let skipped = replayer.plan_replay(TrxID::new(20)).unwrap();
+        let skipped = stream.plan_replay(TrxID::new(20)).unwrap();
         assert_eq!(skipped, None);
-        let err = replayer.pop().unwrap_err();
+        let err = stream.try_next().unwrap_err();
         assert_eq!(
             err.data_integrity_error(),
             Some(DataIntegrityError::LogFileCorrupted)
@@ -3704,15 +3684,20 @@ mod tests {
             .log_file_stem("mixed_config_redo.log")
             .log_block_size(new_log_block_size)
             .log_file_max_size(new_file_max_size);
-        let RedoLogStartup {
-            initializer,
-            mut replayer,
-        } = config.redo_log_startup().unwrap();
-        assert_eq!(replayer.plan_replay(MIN_SNAPSHOT_TS).unwrap(), None);
-        let recovered = replayer.pop().unwrap().unwrap();
+        let file_prefix = config.file_prefix().unwrap();
+        let logs = discover_redo_log_files(&file_prefix, false).unwrap();
+        let (initializer, mut stream) = redo_stream_and_initializer_for_test(
+            &file_prefix,
+            config.io_depth,
+            new_file_max_size,
+            new_log_block_size,
+            logs,
+        );
+        assert_eq!(stream.plan_replay(MIN_SNAPSHOT_TS).unwrap(), None);
+        let recovered = stream.try_next().unwrap().unwrap();
         assert_eq!(recovered.header.cts, cts);
         assert_eq!(recovered.header.trx_kind, RedoTrxKind::System);
-        assert!(replayer.pop().unwrap().is_none());
+        assert!(stream.try_next().unwrap().is_none());
 
         assert_eq!(initializer.next_file_seq, 1);
         assert_eq!(initializer.log_block_size, new_log_block_size);

@@ -265,8 +265,8 @@ impl ReplayPlanner {
     }
 }
 
-/// Buffered replayer of transaction redo records across a sequence of redo files.
-pub(crate) struct RedoLogReplayer {
+/// Buffered stream of transaction redo records across a sequence of redo files.
+pub(crate) struct RedoLogStream {
     /// Source of readers for successive redo files.
     planner: ReplayPlanner,
     /// Reader for the current redo file, if one is open.
@@ -275,8 +275,8 @@ pub(crate) struct RedoLogReplayer {
     buffer: VecDeque<TrxLog>,
 }
 
-impl RedoLogReplayer {
-    /// Create a redo replayer from discovered redo files.
+impl RedoLogStream {
+    /// Create a redo stream from discovered redo files.
     #[inline]
     pub(crate) fn new(discovered: Vec<RedoLogFileDescriptor>) -> Self {
         Self {
@@ -294,7 +294,7 @@ impl RedoLogReplayer {
 
     /// Plan replay using the checkpoint-derived floor and return skipped CTS seed.
     ///
-    /// This must be called exactly once before `pop`; repeated calls are
+    /// This must be called exactly once before `try_next`; repeated calls are
     /// rejected even if they pass the same floor.
     #[inline]
     pub(crate) fn plan_replay(&mut self, floor: TrxID) -> Result<Option<TrxID>> {
@@ -342,12 +342,12 @@ impl RedoLogReplayer {
         }
     }
 
-    /// Pop the next transaction redo record, reading more files on demand.
+    /// Try to read the next transaction redo record, reading more files on demand.
     ///
-    /// The replayer is deliberately not self-planning: callers must provide the
+    /// The stream is deliberately not self-planning: callers must provide the
     /// replay floor via `plan_replay` before consuming records.
     #[inline]
-    pub(crate) fn pop(&mut self) -> Result<Option<TrxLog>> {
+    pub(crate) fn try_next(&mut self) -> Result<Option<TrxLog>> {
         match self.buffer.pop_front() {
             res @ Some(_) => Ok(res),
             None => {
@@ -356,20 +356,6 @@ impl RedoLogReplayer {
             }
         }
     }
-}
-
-/// Memory-mapped reader for checksum-protected redo groups in one file.
-pub(crate) struct MmapLogReader {
-    /// Memory map of the redo file.
-    m: Mmap,
-    /// Normal physical stride for redo groups in this file.
-    log_block_size: usize,
-    /// End offset for the current scan; sealed files stop at durable end.
-    scan_end_offset: usize,
-    /// Sealed range validation state, when the selected super-block is sealed.
-    sealed: Option<SealedReplayState>,
-    /// Next group offset to read.
-    offset: usize,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -410,6 +396,20 @@ impl SealedReplayState {
     fn validate(self) -> bool {
         self.actual_range() == self.expected_range
     }
+}
+
+/// Memory-mapped reader for checksum-protected redo groups in one file.
+pub(crate) struct MmapLogReader {
+    /// Memory map of the redo file.
+    m: Mmap,
+    /// Normal physical stride for redo groups in this file.
+    log_block_size: usize,
+    /// End offset for the current scan; sealed files stop at durable end.
+    scan_end_offset: usize,
+    /// Sealed range validation state, when the selected super-block is sealed.
+    sealed: Option<SealedReplayState>,
+    /// Next group offset to read.
+    offset: usize,
 }
 
 impl MmapLogReader {

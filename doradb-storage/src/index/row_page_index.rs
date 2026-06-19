@@ -1201,8 +1201,8 @@ mod tests {
     use crate::latch::LatchFallbackMode;
     use crate::log::discover_redo_log_files;
     use crate::log::redo::DDLRedo;
-    use crate::log::replay::ReadLog;
     use crate::quiescent::{QuiescentBox, QuiescentGuard};
+    use crate::recovery::redo_stream::ReadLog;
     use crate::value::ValKind;
     use semistr::SemiStr;
     use std::future::Future;
