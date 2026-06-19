@@ -1,7 +1,7 @@
 ---
 id: 000184
 title: Restructure table module unit tests
-status: proposal
+status: implemented
 created: 2026-06-19
 github_issue: 724
 ---
@@ -213,6 +213,31 @@ Issue Labels:
 
 ## Implementation Notes
 
+- Deleted the former monolithic `doradb-storage/src/table/tests.rs` and moved
+  its table test coverage into owner modules under `doradb-storage/src/table/`
+  and `doradb-storage/src/catalog/table.rs`.
+- Kept shared table fixtures and assertions in the inline
+  `#[cfg(test)] pub(crate) mod tests` at the end of
+  `doradb-storage/src/table/mod.rs`, preserving
+  `crate::table::test_user_table_id` for sibling modules.
+- Moved test-only failure hooks to owner modules:
+  `table::test_hooks` owns the LWC build error hook and
+  `table::persistence::test_hooks` owns checkpoint and sidecar hooks.
+- Merged split `tests`/`table_moved_tests` modules where an owner file already
+  had an inline `tests` module, and left transitional `table_moved_tests`
+  modules only in owner files without a separate `tests` module.
+- Removed all introduced `#![allow(unused_imports)]` / unused-import allow
+  attributes and cleaned blank lines inside import groups.
+- Addressed review feedback for panic safety by replacing the manual
+  post-publish checkpoint error flag set/reset in
+  `test_checkpoint_post_publication_failure_poisons_storage` with a
+  `Drop`-based guard.
+- Validation completed:
+  - `cargo fmt`
+  - `cargo clippy -p doradb-storage --all-targets -- -D warnings`
+  - `cargo nextest run -p doradb-storage`
+  - targeted checks for the catalog/table moved tests and the post-publish
+    checkpoint failure test during review follow-up
 
 ## Impacts
 
