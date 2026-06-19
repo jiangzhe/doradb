@@ -1,18 +1,18 @@
-use crate::error::{DataIntegrityError, Result};
+use crate::error::{DataIntegrityError, InternalError, Result};
 use crate::id::TrxID;
 use crate::io::STORAGE_SECTOR_SIZE;
-use crate::log::RedoLogInitializer;
 use crate::log::buf::TrxLog;
 use crate::log::format::{
-    REDO_DEFAULT_DATA_START_OFFSET, RedoGroupHeader, select_redo_super_block,
+    REDO_DEFAULT_DATA_START_OFFSET, RedoGroupHeader, RedoSuperBlock, select_redo_super_block,
 };
+use crate::log::{RedoLogFileDescriptor, next_redo_file_seq};
 use crate::serde::Deser;
 use error_stack::Report;
 use memmap2::Mmap;
 use std::collections::VecDeque;
 use std::fs::File;
-use std::ops::Deref;
-use std::path::Path;
+use std::io::{ErrorKind as IoErrorKind, Read};
+use std::path::{Path, PathBuf};
 
 /// Result of reading one redo group from a log file.
 pub(crate) enum ReadLog<'a> {
@@ -80,26 +80,238 @@ impl<'a> LogGroup<'a> {
     }
 }
 
-/// Buffered stream of transaction redo records across a sequence of redo files.
-pub(crate) struct RedoLogStream {
-    /// Source of readers for successive redo files.
-    pub(super) initializer: RedoLogInitializer,
-    /// Reader for the current redo file, if one is open.
-    pub(super) reader: Option<MmapLogReader>,
-    /// Decoded records ready for recovery to consume.
-    pub(super) buffer: VecDeque<TrxLog>,
+/// Validated metadata for one redo log segment.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RedoLogSegment {
+    /// Full path to the redo log file.
+    pub(crate) path: PathBuf,
+    /// Sequence number parsed from the file name.
+    pub(crate) file_seq: u32,
+    /// Newest checksum-valid super-block selected for this file.
+    pub(crate) super_block: RedoSuperBlock,
 }
 
-impl Deref for RedoLogStream {
-    type Target = VecDeque<TrxLog>;
+impl RedoLogSegment {
+    /// Build validated segment metadata by reading only the fixed super-block area.
     #[inline]
-    fn deref(&self) -> &Self::Target {
-        &self.buffer
+    pub(crate) fn from_descriptor(descriptor: RedoLogFileDescriptor) -> Result<Self> {
+        Self::from_path(descriptor.path, descriptor.file_seq)
+    }
+
+    /// Build validated segment metadata for a path and expected sequence.
+    #[inline]
+    pub(crate) fn from_path(path: PathBuf, file_seq: u32) -> Result<Self> {
+        let mut file = File::open(&path)?;
+        let file_len = file.metadata()?.len();
+        if file_len < REDO_DEFAULT_DATA_START_OFFSET as u64 {
+            return Err(Report::new(DataIntegrityError::InvalidPayload)
+                .attach(format!(
+                    "redo log file is shorter than fixed super-block area: path={}, len={}, data_start={}",
+                    path.display(),
+                    file_len,
+                    REDO_DEFAULT_DATA_START_OFFSET
+                ))
+                .into());
+        }
+        let mut header = vec![0; REDO_DEFAULT_DATA_START_OFFSET];
+        if let Err(err) = file.read_exact(&mut header) {
+            if err.kind() == IoErrorKind::UnexpectedEof {
+                return Err(Report::new(DataIntegrityError::InvalidPayload)
+                    .attach(format!(
+                        "redo log file ended while reading fixed super-block area: path={}, data_start={}",
+                        path.display(),
+                        REDO_DEFAULT_DATA_START_OFFSET
+                    ))
+                    .into());
+            }
+            return Err(err.into());
+        }
+        let super_block = select_redo_super_block(&header, file_seq)?;
+        if super_block.file_max_size > file_len {
+            return Err(Report::new(DataIntegrityError::InvalidPayload)
+                .attach(format!(
+                    "redo super-block file_max_size exceeds file length: path={}, file_max_size={}, file_len={}",
+                    path.display(),
+                    super_block.file_max_size,
+                    file_len
+                ))
+                .into());
+        }
+        Ok(Self {
+            path,
+            file_seq,
+            super_block,
+        })
+    }
+
+    /// Return true when this segment is sealed and contains no durable redo groups.
+    #[inline]
+    pub(crate) fn sealed_empty(&self) -> bool {
+        self.super_block.sealed_empty()
+    }
+
+    /// Return the sealed redo range when this segment is sealed and non-empty.
+    #[inline]
+    pub(crate) fn sealed_redo_range(&self) -> Option<(TrxID, TrxID)> {
+        self.super_block.sealed_redo_range()
     }
 }
 
-impl RedoLogStream {
+/// Planner that selects which discovered redo segments require normal replay.
+pub(crate) struct ReplayPlanner {
+    /// Discovered file names in ascending sequence order.
+    discovered: Vec<RedoLogFileDescriptor>,
+    /// Planned segments that still require normal mmap replay.
+    planned: VecDeque<RedoLogSegment>,
+    /// Replay floor used to build the planned queue.
+    replay_floor: Option<TrxID>,
+    /// Highest CTS contributed by skipped sealed segments.
+    skipped_max_recovered_cts: Option<TrxID>,
+}
+
+impl ReplayPlanner {
+    /// Create a replay planner from discovered redo files.
+    #[inline]
+    pub(crate) fn new(discovered: Vec<RedoLogFileDescriptor>) -> Self {
+        Self {
+            discovered,
+            planned: VecDeque::new(),
+            replay_floor: None,
+            skipped_max_recovered_cts: None,
+        }
+    }
+
+    /// Return the sequence for the next writable redo file after this family.
+    #[inline]
+    pub(crate) fn next_file_seq(&self) -> Result<Option<u32>> {
+        self.discovered
+            .last()
+            .map(|descriptor| next_redo_file_seq(descriptor.file_seq))
+            .transpose()
+    }
+
+    /// Plan which discovered redo segments must be replayed for a replay floor.
+    ///
+    /// This is a one-time transition: the floor controls which sealed segments
+    /// may be skipped, so a replan would make the already-built queue ambiguous.
+    #[inline]
+    pub(crate) fn plan(&mut self, floor: TrxID) -> Result<Option<TrxID>> {
+        if let Some(existing_floor) = self.replay_floor {
+            return Err(Report::new(InternalError::Generic)
+                .attach(format!(
+                    "redo replay already planned: existing_floor={existing_floor}, requested_floor={floor}"
+                ))
+                .into());
+        }
+
+        let mut suffix = Vec::new();
+        for descriptor in self.discovered.iter().rev() {
+            let segment = RedoLogSegment::from_descriptor(descriptor.clone())?;
+            let stop = segment
+                .sealed_redo_range()
+                .is_some_and(|(min_redo_cts, _)| min_redo_cts < floor);
+            suffix.push(segment);
+            if stop {
+                break;
+            }
+        }
+        suffix.reverse();
+
+        let mut skipped_max = None::<TrxID>;
+        for segment in suffix {
+            if segment.sealed_empty() {
+                continue;
+            }
+            if let Some((_, max_redo_cts)) = segment.sealed_redo_range()
+                && max_redo_cts < floor
+            {
+                skipped_max =
+                    Some(skipped_max.map_or(max_redo_cts, |current| current.max(max_redo_cts)));
+                continue;
+            }
+            self.planned.push_back(segment);
+        }
+
+        self.replay_floor = Some(floor);
+        self.skipped_max_recovered_cts = skipped_max;
+        Ok(skipped_max)
+    }
+
+    /// Return the next mmap reader that must be scanned.
+    ///
+    /// Callers must plan replay first so the checkpoint-derived floor is known
+    /// before any segment is opened or skipped.
+    #[inline]
+    pub(crate) fn next_reader(&mut self) -> Result<Option<MmapLogReader>> {
+        if self.replay_floor.is_none() {
+            return Err(Report::new(InternalError::Generic)
+                .attach("redo replay read before explicit plan")
+                .into());
+        }
+        self.planned
+            .pop_front()
+            .map(MmapLogReader::from_segment)
+            .transpose()
+    }
+
+    /// Return the planned segment sequence list for tests.
+    #[inline]
+    #[cfg(test)]
+    pub(crate) fn planned_file_seqs(&self) -> Vec<u32> {
+        self.planned
+            .iter()
+            .map(|segment| segment.file_seq)
+            .collect()
+    }
+}
+
+/// Buffered replayer of transaction redo records across a sequence of redo files.
+pub(crate) struct RedoLogReplayer {
+    /// Source of readers for successive redo files.
+    planner: ReplayPlanner,
+    /// Reader for the current redo file, if one is open.
+    reader: Option<MmapLogReader>,
+    /// Decoded records ready for recovery to consume.
+    buffer: VecDeque<TrxLog>,
+}
+
+impl RedoLogReplayer {
+    /// Create a redo replayer from discovered redo files.
+    #[inline]
+    pub(crate) fn new(discovered: Vec<RedoLogFileDescriptor>) -> Self {
+        Self {
+            planner: ReplayPlanner::new(discovered),
+            reader: None,
+            buffer: VecDeque::new(),
+        }
+    }
+
+    /// Return the sequence for the next writable redo file after this family.
+    #[inline]
+    pub(crate) fn next_file_seq(&self) -> Result<Option<u32>> {
+        self.planner.next_file_seq()
+    }
+
+    /// Plan replay using the checkpoint-derived floor and return skipped CTS seed.
+    ///
+    /// This must be called exactly once before `pop`; repeated calls are
+    /// rejected even if they pass the same floor.
+    #[inline]
+    pub(crate) fn plan_replay(&mut self, floor: TrxID) -> Result<Option<TrxID>> {
+        self.planner.plan(floor)
+    }
+
+    /// Return the planned segment sequence list for tests.
+    #[inline]
+    #[cfg(test)]
+    pub(crate) fn planned_file_seqs(&self) -> Vec<u32> {
+        self.planner.planned_file_seqs()
+    }
+
     /// Refill the in-memory queue from the current reader or the next redo file.
+    ///
+    /// Requires prior `plan_replay` because opening the next reader may depend
+    /// on checkpoint-derived segment skipping decisions.
     #[inline]
     pub(crate) fn fill_buffer(&mut self) -> Result<()> {
         loop {
@@ -122,7 +334,7 @@ impl RedoLogStream {
                 }
             }
             debug_assert!(self.reader.is_none());
-            let reader = self.initializer.next_reader()?;
+            let reader = self.planner.next_reader()?;
             if reader.is_none() {
                 return Ok(());
             }
@@ -131,6 +343,9 @@ impl RedoLogStream {
     }
 
     /// Pop the next transaction redo record, reading more files on demand.
+    ///
+    /// The replayer is deliberately not self-planning: callers must provide the
+    /// replay floor via `plan_replay` before consuming records.
     #[inline]
     pub(crate) fn pop(&mut self) -> Result<Option<TrxLog>> {
         match self.buffer.pop_front() {
@@ -140,14 +355,6 @@ impl RedoLogStream {
                 Ok(self.buffer.pop_front())
             }
         }
-    }
-
-    /// Return the initializer after the stream has been fully drained.
-    #[inline]
-    pub(super) fn into_initializer(self) -> RedoLogInitializer {
-        debug_assert!(self.reader.is_none());
-        debug_assert!(self.buffer.is_empty());
-        self.initializer
     }
 }
 
@@ -209,15 +416,26 @@ impl MmapLogReader {
     /// Open a redo file, select its newest valid super-block slot, and mmap it.
     #[inline]
     pub(crate) fn new(log_file_path: impl AsRef<Path>, expected_file_seq: u32) -> Result<Self> {
-        let file = File::open(log_file_path.as_ref())?;
+        let segment =
+            RedoLogSegment::from_path(PathBuf::from(log_file_path.as_ref()), expected_file_seq)?;
+        Self::from_segment(segment)
+    }
+
+    /// Open and mmap a redo file using an already validated segment header.
+    #[inline]
+    pub(crate) fn from_segment(segment: RedoLogSegment) -> Result<Self> {
+        let RedoLogSegment {
+            path, super_block, ..
+        } = segment;
+        let file = File::open(&path)?;
         // SAFETY: the file handle stays alive for the duration of mapping
         // creation, and the returned `Mmap` owns the mapping afterward.
         let m = unsafe { Mmap::map(&file)? };
-        let super_block = select_redo_super_block(&m, expected_file_seq)?;
         if super_block.file_max_size as usize > m.len() {
             return Err(Report::new(DataIntegrityError::InvalidPayload)
                 .attach(format!(
-                    "redo super-block file_max_size exceeds mapped length: file_max_size={}, mapped_len={}",
+                    "redo super-block file_max_size exceeds mapped length: path={}, file_max_size={}, mapped_len={}",
+                    path.display(),
                     super_block.file_max_size,
                     m.len()
                 ))

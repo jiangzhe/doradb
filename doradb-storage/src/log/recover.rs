@@ -27,8 +27,8 @@ use crate::io::Completion;
 use crate::latch::LatchFallbackMode;
 use crate::log::buf::TrxLog;
 use crate::log::redo::{DDLRedo, RedoLogs, RowRedo, RowRedoKind, TableDML};
-use crate::log::replay::RedoLogStream;
-use crate::log::{RedoLog, RedoLogInitializer};
+use crate::log::replay::RedoLogReplayer;
+use crate::log::{RedoLog, RedoLogStartup};
 use crate::map::{FastHashMap, FastHashSet};
 use crate::quiescent::QuiescentGuard;
 use crate::row::RowPage;
@@ -97,7 +97,7 @@ pub(crate) async fn log_recover(
     meta_pool: &FixedBufferPool,
     deps: RecoveryDeps,
     catalog: &Catalog,
-    redo_log_initializer: RedoLogInitializer,
+    redo_log_startup: RedoLogStartup,
     purge_tx: Sender<Purge>,
 ) -> Result<(
     CachePadded<RedoLog>,
@@ -114,12 +114,14 @@ pub(crate) async fn log_recover(
     // In recovery, we disable GC and redo logging.
     // All data are purely processed in memory and if
     // any failure occurs, we abort the whole process.
-    let stream = redo_log_initializer.stream();
+    let RedoLogStartup {
+        initializer,
+        replayer,
+    } = redo_log_startup;
     let log_recovery = LogRecovery::new(
-        meta_pool, index_pool, mem_pool, table_fs, disk_pool, catalog, stream,
+        meta_pool, index_pool, mem_pool, table_fs, disk_pool, catalog, replayer,
     );
-    let (log_stream, max_recovered_cts, dropped_table_file_deletes) =
-        log_recovery.recover_all().await?;
+    let (max_recovered_cts, dropped_table_file_deletes) = log_recovery.recover_all().await?;
     let next_trx_ts = max_recovered_cts
         .checked_add(1)
         .filter(|ts| *ts < MAX_SNAPSHOT_TS)
@@ -130,7 +132,6 @@ pub(crate) async fn log_recover(
                 )),
             )
         })?;
-    let initializer = log_stream.into_initializer();
     let (redo_log, initial_redo_header) = initializer.finish(purge_tx)?;
     Ok((
         CachePadded::new(redo_log),
@@ -159,8 +160,8 @@ pub(crate) struct LogRecovery<'a> {
     disk_pool: QuiescentGuard<ReadonlyBufferPool>,
     /// Catalog runtime being rebuilt from checkpointed metadata and redo logs.
     catalog: &'a Catalog,
-    /// Ordered single redo-log stream.
-    log_stream: RedoLogStream,
+    /// Ordered single redo-log replayer.
+    log_replayer: RedoLogReplayer,
     /// Catalog checkpoint boundary. Catalog redo before this timestamp is
     /// already reflected in checkpointed catalog state.
     catalog_replay_start_ts: TrxID,
@@ -246,7 +247,7 @@ impl<'a> LogRecovery<'a> {
         table_fs: QuiescentGuard<FileSystem>,
         disk_pool: QuiescentGuard<ReadonlyBufferPool>,
         catalog: &'a Catalog,
-        log_stream: RedoLogStream,
+        log_replayer: RedoLogReplayer,
     ) -> Self {
         let pool_guards = PoolGuards::builder()
             .push(PoolRole::Meta, meta_pool.pool_guard())
@@ -260,7 +261,7 @@ impl<'a> LogRecovery<'a> {
             table_fs,
             disk_pool,
             catalog,
-            log_stream,
+            log_replayer,
             catalog_replay_start_ts: MIN_SNAPSHOT_TS,
             replay_floor: MIN_SNAPSHOT_TS,
             max_recovered_cts: MIN_SNAPSHOT_TS,
@@ -272,15 +273,16 @@ impl<'a> LogRecovery<'a> {
         }
     }
 
-    /// Replay the redo stream, rebuild indexes, and return the reopened stream.
+    /// Replay redo, rebuild indexes, and return recovery outcomes.
     #[inline]
-    pub(crate) async fn recover_all(
-        mut self,
-    ) -> Result<(RedoLogStream, TrxID, Vec<DroppedTableFileDeleteItem>)> {
+    pub(crate) async fn recover_all(mut self) -> Result<(TrxID, Vec<DroppedTableFileDeleteItem>)> {
         self.bootstrap_checkpointed_user_tables().await?;
+        if let Some(skipped_max_cts) = self.log_replayer.plan_replay(self.replay_floor)? {
+            self.max_recovered_cts = self.max_recovered_cts.max(skipped_max_cts);
+        }
         // 1. replay DDL and DML into catalog metadata, hot RowStore pages, and
         //    cold delete markers.
-        while let Some(log) = self.log_stream.pop()? {
+        while let Some(log) = self.log_replayer.pop()? {
             self.replay_log(log).await?;
         }
         // 2. Ensure catalog metadata caught up with table-file roots.
@@ -292,11 +294,7 @@ impl<'a> LogRecovery<'a> {
         //    and refresh pages to enable undo maps.
         self.recover_indexes_and_refresh_pages().await?;
 
-        Ok((
-            self.log_stream,
-            self.max_recovered_cts,
-            self.dropped_table_file_deletes,
-        ))
+        Ok((self.max_recovered_cts, self.dropped_table_file_deletes))
     }
 
     async fn bootstrap_checkpointed_user_tables(&mut self) -> Result<()> {
@@ -1027,9 +1025,9 @@ mod tests {
                 .inner()
                 .trx_sys
                 .config
-                .redo_log_initializer()
+                .redo_log_startup()
                 .unwrap()
-                .stream(),
+                .replayer,
         );
         recovery.catalog_replay_start_ts = catalog_replay_start_ts;
         recovery.replay_floor = MIN_SNAPSHOT_TS;

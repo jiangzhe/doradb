@@ -2048,7 +2048,7 @@ mod tests {
             let file_prefix = file_prefix.to_str().unwrap();
             let logs = discover_redo_log_files(file_prefix, false).unwrap();
             for log in logs {
-                let mut reader = engine.inner().trx_sys.log_reader(&log).unwrap();
+                let mut reader = engine.inner().trx_sys.log_reader(&log.path).unwrap();
                 loop {
                     match reader.read() {
                         ReadLog::SizeLimit | ReadLog::DataCorrupted => panic!("invalid log data"),

@@ -1001,9 +1001,6 @@ impl TransactionSystem {
     pub(crate) fn catalog_checkpoint_scan_config(&self) -> Result<CatalogCheckpointScanConfig> {
         Ok(CatalogCheckpointScanConfig {
             file_prefix: self.config.file_prefix()?,
-            io_depth: self.config.io_depth,
-            log_file_max_size: self.config.log_file_max_size.as_u64() as usize,
-            log_block_size: self.config.log_block_size.as_u64() as usize,
         })
     }
 }
