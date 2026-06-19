@@ -1,7 +1,7 @@
 ---
 id: 000181
 title: Redo Recovery Segment Skip
-status: proposal
+status: implemented
 created: 2026-06-18
 github_issue: 717
 ---
@@ -186,25 +186,60 @@ Rejected alternatives:
 
 ## Implementation Notes
 
+- Implemented filename-only redo discovery using `RedoLogFileDescriptor`.
+  Discovery validates duplicate/internal sequence gaps, rejects legacy
+  partitioned files, and rejects non-empty families missing the `00000000`
+  prefix with `DataIntegrityError::RedoLogSequenceGap`.
+- Added `RedoLogSegment` metadata validation in `log/replay.rs` so recovery can
+  read the fixed super-block area, select the newest valid A/B slot, and verify
+  `file_max_size` against file length without constructing a full mmap reader.
+- Split startup into `RedoLogStartup { initializer, replayer }`. The
+  initializer now owns only writable-log creation state, while
+  `RedoLogReplayer` owns `ReplayPlanner`, segment skip planning, mmap reader
+  construction, and transaction-log draining.
+- Moved replay-floor planning after checkpoint bootstrap. `LogRecovery` calls
+  `plan_replay(self.replay_floor)`, folds the skipped sealed segment max CTS
+  into `max_recovered_cts`, then drains the replayer normally.
+- Implemented skip semantics for sealed empty segments and sealed non-empty
+  segments whose `max_redo_cts < replay_floor`. Boundary equality remains a
+  normal scan, so corrupt still-relevant sealed data fails during replay.
+- Made replay planning explicit and single-use: `RedoLogReplayer::pop()` no
+  longer auto-plans at `MIN_SNAPSHOT_TS`, and repeated `plan_replay` calls
+  return an internal error even when the requested floor matches the original
+  floor.
+- Updated catalog checkpoint scanning to build a standalone `RedoLogReplayer`
+  and plan with the checkpoint replay start timestamp, without depending on
+  startup-only table bootstrap state.
+- Updated `docs/redo-log.md` with v2 startup/replay planning behavior, sealed
+  obsolete segment skip behavior, and the missing-prefix corruption rule.
+- Added follow-up backlog
+  `docs/backlogs/000128-recovery-module-restructure.md` for moving recovery
+  orchestration out of the log module in a separate architectural cleanup.
+- Validation completed:
+  - `cargo fmt --check -p doradb-storage`
+  - `cargo clippy -p doradb-storage --all-targets -- -D warnings`
+  - `cargo nextest run -p doradb-storage`
+  - `git diff --check`
+
 ## Impacts
 
 - `doradb-storage/src/log/mod.rs`
-  - `discover_redo_log_files` or its replacement.
+  - `discover_redo_log_files`.
   - `validate_redo_log_file_sequences`.
+  - `RedoLogStartup`.
   - `RedoLogInitializer`.
-  - `RedoLogMode`.
-  - New `RedoLogSegment` construction and replay planning helpers.
 - `doradb-storage/src/log/replay.rs`
-  - `RedoLogStream` planning/skip state.
+  - `RedoLogSegment` metadata validation.
+  - `ReplayPlanner` segment planning/skip state.
+  - `RedoLogReplayer` explicit planning and log draining.
   - `MmapLogReader` constructor that can consume a validated segment.
 - `doradb-storage/src/log/recover.rs`
   - Call replay planning after checkpoint bootstrap.
   - Fold skipped sealed segment max CTS into `max_recovered_cts`.
 - `doradb-storage/src/conf/trx.rs`
-  - Adjust initializer construction to the new discovery output.
+  - Build `RedoLogStartup` from discovered redo descriptors.
 - `doradb-storage/src/catalog/checkpoint.rs`
-  - Keep catalog checkpoint redo scanning compatible with discovery/stream API
-    changes.
+  - Scan checkpoint redo through a standalone `RedoLogReplayer`.
 - `docs/redo-log.md`
   - Update current behavior and constraints.
 
@@ -264,4 +299,5 @@ write/seal paths. This task should stay on recovery read/discovery logic.
 
 None for this task. Future physical redo truncation must define durable
 first-retained-sequence metadata before missing prefix files can become valid.
-During `task resolve`, sync RFC 0020 Phase 4 with the implemented outcome.
+Recovery/log module ownership cleanup is tracked separately in
+`docs/backlogs/000128-recovery-module-restructure.md`.

@@ -374,12 +374,13 @@ the unsafe boundary local to reader construction. [C2], [B2]
   - Non-goals: Reader refactor away from mmap and parallel replay.
   - Prerequisites: Phase 3 sealed range metadata is present and trusted only
     after checksum/header validation.
-  - Phase-local Choices: Whether skip logic belongs in `RedoLogStream`,
-    `RedoLogInitializer`, or `LogRecovery` after bootstrap.
-  - Task Doc: `docs/tasks/TBD.md`
-  - Task Issue: `#0`
-  - Phase Status: `pending`
-  - Implementation Summary: `pending`
+  - Phase-local Choices: Resolved by splitting startup into
+    `RedoLogStartup`, explicit `RedoLogReplayer` planning after checkpoint
+    bootstrap, and `ReplayPlanner`-owned sealed segment skip decisions.
+  - Task Doc: `docs/tasks/000181-redo-recovery-segment-skip.md`
+  - Task Issue: `#717`
+  - Phase Status: done
+  - Implementation Summary: Implemented validated segment metadata planning, explicit RedoLogReplayer planning after checkpoint bootstrap, sealed obsolete segment skip with CTS seeding, missing-prefix sequence rejection, catalog checkpoint scan compatibility, and docs/tests updates. [Task Resolve Sync: docs/tasks/000181-redo-recovery-segment-skip.md @ 2026-06-19]
 
 - **Phase 5: Documentation and Corruption Coverage**
   - Scope: Update `docs/redo-log.md` with the v2 format and add targeted tests
