@@ -1,0 +1,4 @@
+interface:
+  display_name: "Style Audit"
+  short_description: "Audit staged Rust coding style"
+  default_prompt: "Use $style-audit to audit staged Rust files and report style violations."

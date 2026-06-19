@@ -1,0 +1,1080 @@
+#!/usr/bin/env -S cargo +nightly -q -Zscript
+---
+[package]
+edition = "2024"
+
+[dependencies]
+proc-macro2 = { version = "1", features = ["span-locations"] }
+syn = { version = "2", features = ["full", "visit"] }
+---
+
+use proc_macro2::Span;
+use std::collections::{BTreeMap, BTreeSet};
+use std::env;
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::time::{SystemTime, UNIX_EPOCH};
+use syn::spanned::Spanned;
+use syn::visit::{self, Visit};
+use syn::{
+    Attribute, Fields, ImplItem, Item, ItemImpl, ItemMod, ItemTrait, Path as SynPath, TraitItem,
+    Type, Visibility,
+};
+
+const FMT_COMMAND: &[&str] = &["fmt", "--all", "--", "--check"];
+const CLIPPY_COMMAND: &[&str] = &[
+    "clippy",
+    "-p",
+    "doradb-storage",
+    "--all-targets",
+    "--",
+    "-D",
+    "warnings",
+];
+
+#[derive(Debug, Clone)]
+struct Violation {
+    path: String,
+    line: usize,
+    rule: &'static str,
+    message: String,
+}
+
+#[derive(Debug)]
+struct CommandResult {
+    code: Option<i32>,
+    stdout: String,
+    stderr: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum ItemGroup {
+    Use = 1,
+    Constant = 2,
+    Type = 3,
+    PublicFunction = 4,
+    PrivateFunction = 5,
+    Tests = 6,
+}
+
+struct TempSnapshot {
+    path: PathBuf,
+}
+
+#[derive(Debug, Clone)]
+struct AuditFile {
+    display_path: String,
+    full_path: PathBuf,
+}
+
+#[derive(Debug, Default)]
+struct Args {
+    help: bool,
+    force_paths: Vec<PathBuf>,
+}
+
+impl Drop for TempSnapshot {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.path);
+    }
+}
+
+fn usage() -> &'static str {
+    "Usage: tools/style_audit.rs [--force-path <file-or-dir> ...]"
+}
+
+fn main() {
+    let code = match run() {
+        Ok(code) => code,
+        Err(err) => {
+            eprintln!("{err}");
+            2
+        }
+    };
+    std::process::exit(code);
+}
+
+fn run() -> Result<i32, String> {
+    let args = parse_args()?;
+    if args.help {
+        println!("{}", usage());
+        return Ok(0);
+    }
+    run_audit(&args.force_paths)
+}
+
+fn parse_args() -> Result<Args, String> {
+    let mut parsed = Args::default();
+    let mut args = env::args().skip(1);
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--force-path" => {
+                let Some(path) = args.next() else {
+                    return Err(format!("missing value for --force-path\n{}", usage()));
+                };
+                parsed.force_paths.push(PathBuf::from(path));
+            }
+            "--help" | "-h" => {
+                if args.next().is_some() {
+                    return Err(format!("unexpected arg\n{}", usage()));
+                }
+                if !parsed.force_paths.is_empty() {
+                    return Err(format!(
+                        "--help cannot be combined with other args\n{}",
+                        usage()
+                    ));
+                }
+                parsed.help = true;
+                return Ok(parsed);
+            }
+            _ => return Err(format!("unknown arg: {arg}\n{}", usage())),
+        }
+    }
+    Ok(parsed)
+}
+
+fn run_audit(force_paths: &[PathBuf]) -> Result<i32, String> {
+    let repo_root = repo_root()?;
+    if force_paths.is_empty() {
+        run_staged_audit(&repo_root)
+    } else {
+        run_forced_audit(&repo_root, force_paths)
+    }
+}
+
+fn run_staged_audit(repo_root: &Path) -> Result<i32, String> {
+    let staged_rs = staged_rust_files(repo_root)?;
+    if staged_rs.is_empty() {
+        println!("style-audit: no staged Rust files");
+        return Ok(0);
+    }
+
+    let snapshot = export_index_snapshot(repo_root)?;
+
+    if let Some(result) = run_cargo_gate(&snapshot.path, FMT_COMMAND)? {
+        print_gate_failure("cargo fmt --all -- --check", &result);
+        return Ok(1);
+    }
+
+    if let Some(result) = run_cargo_gate(&snapshot.path, CLIPPY_COMMAND)? {
+        print_gate_failure(
+            "cargo clippy -p doradb-storage --all-targets -- -D warnings",
+            &result,
+        );
+        return Ok(1);
+    }
+
+    let files = staged_rs
+        .iter()
+        .map(|path| AuditFile {
+            display_path: normalize_path(path),
+            full_path: snapshot.path.join(path),
+        })
+        .collect::<Vec<_>>();
+    audit_files("staged", &files)
+}
+
+fn run_forced_audit(repo_root: &Path, force_paths: &[PathBuf]) -> Result<i32, String> {
+    let files = forced_rust_files(repo_root, force_paths)?;
+    if files.is_empty() {
+        println!("style-audit: no Rust files matched --force-path");
+        return Ok(0);
+    }
+
+    if let Some(result) = run_rustfmt_gate(repo_root, &files)? {
+        print_gate_failure("rustfmt --edition 2024 --check <forced files>", &result);
+        return Ok(1);
+    }
+
+    if let Some(result) = run_cargo_gate(repo_root, CLIPPY_COMMAND)? {
+        print_gate_failure(
+            "cargo clippy -p doradb-storage --all-targets -- -D warnings",
+            &result,
+        );
+        return Ok(1);
+    }
+
+    audit_files("forced", &files)
+}
+
+fn audit_files(label: &str, files: &[AuditFile]) -> Result<i32, String> {
+    let mut violations = Vec::new();
+    for file in files {
+        let content = fs::read_to_string(&file.full_path).map_err(|e| {
+            format!(
+                "failed to read {} ({}): {e}",
+                file.display_path,
+                file.full_path.display()
+            )
+        })?;
+        violations.extend(audit_content(&file.display_path, &content));
+    }
+
+    print_style_summary(label, files.len(), &violations);
+    Ok(if violations.is_empty() { 0 } else { 1 })
+}
+
+fn repo_root() -> Result<PathBuf, String> {
+    let result = run_command(Path::new("."), "git", &["rev-parse", "--show-toplevel"])?;
+    if result.code != Some(0) {
+        return Err(format!(
+            "failed to resolve git repository root\n{}{}",
+            result.stdout, result.stderr
+        ));
+    }
+    Ok(PathBuf::from(result.stdout.trim()))
+}
+
+fn staged_rust_files(repo_root: &Path) -> Result<Vec<PathBuf>, String> {
+    let result = run_command(
+        repo_root,
+        "git",
+        &[
+            "diff",
+            "--cached",
+            "--name-only",
+            "--diff-filter=ACMR",
+            "-z",
+            "--",
+            "*.rs",
+        ],
+    )?;
+    if result.code != Some(0) {
+        return Err(format!(
+            "failed to collect staged Rust files\n{}{}",
+            result.stdout, result.stderr
+        ));
+    }
+
+    let mut paths = result
+        .stdout
+        .split('\0')
+        .filter(|path| !path.is_empty() && path.ends_with(".rs"))
+        .map(PathBuf::from)
+        .collect::<Vec<_>>();
+    paths.sort();
+    paths.dedup();
+    Ok(paths)
+}
+
+fn forced_rust_files(repo_root: &Path, force_paths: &[PathBuf]) -> Result<Vec<AuditFile>, String> {
+    let mut files = Vec::new();
+    for force_path in force_paths {
+        let full_path = if force_path.is_absolute() {
+            force_path.clone()
+        } else {
+            repo_root.join(force_path)
+        };
+
+        if full_path.is_file() {
+            if is_rust_file(&full_path) {
+                files.push(AuditFile {
+                    display_path: display_path(repo_root, &full_path),
+                    full_path,
+                });
+            }
+            continue;
+        }
+
+        if full_path.is_dir() {
+            let mut children = fs::read_dir(&full_path)
+                .map_err(|e| format!("failed to read {}: {e}", full_path.display()))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| format!("failed to read {}: {e}", full_path.display()))?;
+            children.sort_by_key(|entry| entry.path());
+            for child in children {
+                let child_path = child.path();
+                if child_path.is_file() && is_rust_file(&child_path) {
+                    files.push(AuditFile {
+                        display_path: display_path(repo_root, &child_path),
+                        full_path: child_path,
+                    });
+                }
+            }
+            continue;
+        }
+
+        return Err(format!(
+            "--force-path target does not exist or is not a file/directory: {}",
+            force_path.display()
+        ));
+    }
+
+    files.sort_by(|a, b| a.display_path.cmp(&b.display_path));
+    files.dedup_by(|a, b| a.display_path == b.display_path);
+    Ok(files)
+}
+
+fn is_rust_file(path: &Path) -> bool {
+    path.extension().and_then(|value| value.to_str()) == Some("rs")
+}
+
+fn display_path(repo_root: &Path, path: &Path) -> String {
+    path.strip_prefix(repo_root)
+        .map(normalize_path)
+        .unwrap_or_else(|_| normalize_path(path))
+}
+
+fn export_index_snapshot(repo_root: &Path) -> Result<TempSnapshot, String> {
+    let mut dir = env::temp_dir();
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|e| format!("system clock before unix epoch: {e}"))?
+        .as_nanos();
+    dir.push(format!("doradb-style-audit-{}-{nanos}", std::process::id()));
+    fs::create_dir_all(&dir).map_err(|e| format!("failed to create {}: {e}", dir.display()))?;
+
+    let prefix = format!("{}/", normalize_path(&dir));
+    let result = run_command(
+        repo_root,
+        "git",
+        &["checkout-index", "--all", "--force", "--prefix", &prefix],
+    )?;
+    if result.code != Some(0) {
+        let _ = fs::remove_dir_all(&dir);
+        return Err(format!(
+            "failed to export staged index snapshot\n{}{}",
+            result.stdout, result.stderr
+        ));
+    }
+    Ok(TempSnapshot { path: dir })
+}
+
+fn run_cargo_gate(cwd: &Path, args: &[&str]) -> Result<Option<CommandResult>, String> {
+    let result = run_command(cwd, "cargo", args)?;
+    Ok((result.code != Some(0)).then_some(result))
+}
+
+fn run_rustfmt_gate(cwd: &Path, files: &[AuditFile]) -> Result<Option<CommandResult>, String> {
+    let mut command = Command::new("rustfmt");
+    command
+        .current_dir(cwd)
+        .stdin(Stdio::null())
+        .args(["--edition", "2024", "--check"]);
+    for file in files {
+        command.arg(&file.full_path);
+    }
+    let output = command
+        .output()
+        .map_err(|e| format!("failed to run rustfmt: {e}"))?;
+    let result = CommandResult {
+        code: output.status.code(),
+        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+    };
+    Ok((result.code != Some(0)).then_some(result))
+}
+
+fn run_command(cwd: &Path, program: &str, args: &[&str]) -> Result<CommandResult, String> {
+    let output = Command::new(program)
+        .args(args)
+        .current_dir(cwd)
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|e| format!("failed to run {program}: {e}"))?;
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    Ok(CommandResult {
+        code: output.status.code(),
+        stdout,
+        stderr,
+    })
+}
+
+fn print_gate_failure(command: &str, result: &CommandResult) {
+    eprintln!("style-audit: gate failed: {command}");
+    if !result.stdout.trim().is_empty() {
+        eprintln!("{}", trim_output(&result.stdout));
+    }
+    if !result.stderr.trim().is_empty() {
+        eprintln!("{}", trim_output(&result.stderr));
+    }
+}
+
+fn trim_output(output: &str) -> String {
+    const MAX_LINES: usize = 160;
+    let lines = output.lines().collect::<Vec<_>>();
+    if lines.len() <= MAX_LINES {
+        return output.trim_end().to_string();
+    }
+    let mut trimmed = lines[..MAX_LINES].join("\n");
+    trimmed.push_str("\n... output truncated ...");
+    trimmed
+}
+
+fn print_style_summary(label: &str, file_count: usize, violations: &[Violation]) {
+    if violations.is_empty() {
+        println!("style-audit: passed ({file_count} {label} Rust file(s) checked)");
+        return;
+    }
+
+    println!(
+        "style-audit: failed ({} violation(s) in {file_count} {label} Rust file(s))",
+        violations.len()
+    );
+    let mut by_file: BTreeMap<&str, Vec<&Violation>> = BTreeMap::new();
+    for violation in violations {
+        by_file.entry(&violation.path).or_default().push(violation);
+    }
+    for (path, file_violations) in by_file {
+        println!("{path}");
+        for violation in file_violations {
+            println!(
+                "  {}: {} - {}",
+                violation.line, violation.rule, violation.message
+            );
+        }
+    }
+}
+
+fn audit_content(path: &str, content: &str) -> Vec<Violation> {
+    let lines = content.lines().map(str::to_string).collect::<Vec<_>>();
+    let parsed = match syn::parse_file(content) {
+        Ok(parsed) => parsed,
+        Err(err) => {
+            return vec![Violation {
+                path: path.to_string(),
+                line: err.span().start().line.max(1),
+                rule: "parse",
+                message: err.to_string(),
+            }];
+        }
+    };
+
+    let mut out = Vec::new();
+    check_top_level_order(path, &parsed.items, &mut out);
+    check_tests_module(path, &parsed.items, &mut out);
+    check_impl_adjacency(path, &parsed.items, &mut out);
+    check_visible_docs(path, &parsed.items, &lines, &mut out);
+    check_function_attributes(path, &parsed.items, &mut out);
+    check_qualified_paths(path, &parsed.items, &mut out);
+    out.sort_by(|a, b| {
+        a.path
+            .cmp(&b.path)
+            .then(a.line.cmp(&b.line))
+            .then(a.rule.cmp(b.rule))
+            .then(a.message.cmp(&b.message))
+    });
+    out
+}
+
+fn check_top_level_order(path: &str, items: &[Item], out: &mut Vec<Violation>) {
+    let mut max_group: Option<ItemGroup> = None;
+    for item in items {
+        let Some((group, label)) = item_group(item) else {
+            continue;
+        };
+        if let Some(previous) = max_group {
+            if group < previous {
+                out.push(violation(
+                    path,
+                    span_line(item.span()),
+                    "top-level-order",
+                    format!(
+                        "{label} appears after {}; expected order is uses, constants, types, public/high-level functions, private helpers, tests",
+                        group_label(previous)
+                    ),
+                ));
+            }
+        }
+        max_group = Some(max_group.map_or(group, |previous| previous.max(group)));
+    }
+}
+
+fn check_tests_module(path: &str, items: &[Item], out: &mut Vec<Violation>) {
+    let mut tests_modules = Vec::new();
+    for (idx, item) in items.iter().enumerate() {
+        match item {
+            Item::Mod(item_mod) if is_tests_module(item_mod) => tests_modules.push((idx, item_mod)),
+            Item::Mod(item_mod) if has_cfg_test(&item_mod.attrs) => out.push(violation(
+                path,
+                span_line(item_mod.mod_token.span),
+                "tests-module",
+                format!(
+                    "test-only module `{}` should be the single `tests` module",
+                    item_mod.ident
+                ),
+            )),
+            Item::Fn(item_fn) if has_test_attr(&item_fn.attrs) => out.push(violation(
+                path,
+                span_line(item_fn.sig.fn_token.span),
+                "tests-module",
+                "top-level #[test] functions should live inside `#[cfg(test)] mod tests`"
+                    .to_string(),
+            )),
+            _ => {}
+        }
+    }
+
+    if tests_modules.len() > 1 {
+        for (_, item_mod) in tests_modules.iter().skip(1) {
+            out.push(violation(
+                path,
+                span_line(item_mod.mod_token.span),
+                "tests-module",
+                "only one top-level `#[cfg(test)] mod tests` module is allowed".to_string(),
+            ));
+        }
+    }
+
+    if let Some((idx, item_mod)) = tests_modules.first() {
+        for item in items.iter().skip(idx + 1) {
+            out.push(violation(
+                path,
+                span_line(item.span()),
+                "tests-bottom",
+                format!(
+                    "`#[cfg(test)] mod {}` should be the last top-level item",
+                    item_mod.ident
+                ),
+            ));
+        }
+    }
+}
+
+fn check_impl_adjacency(path: &str, items: &[Item], out: &mut Vec<Violation>) {
+    let local_types = items
+        .iter()
+        .filter_map(type_def_name)
+        .collect::<BTreeSet<_>>();
+    let mut inherent_impls: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+
+    for (idx, item) in items.iter().enumerate() {
+        let Item::Impl(item_impl) = item else {
+            continue;
+        };
+        let Some(self_name) = impl_self_name(item_impl) else {
+            continue;
+        };
+        if !local_types.contains(&self_name) {
+            continue;
+        }
+
+        let previous = idx.checked_sub(1).and_then(|prev| items.get(prev));
+        let adjacent = previous.is_some_and(|prev| {
+            type_def_name(prev).as_deref() == Some(self_name.as_str())
+                || matches!(prev, Item::Impl(prev_impl) if impl_self_name(prev_impl).as_deref() == Some(self_name.as_str()))
+        });
+        if !adjacent {
+            out.push(violation(
+                path,
+                span_line(item_impl.impl_token.span),
+                "impl-adjacency",
+                format!("impl for `{self_name}` should directly follow its type definition"),
+            ));
+        }
+
+        if item_impl.trait_.is_none() {
+            inherent_impls
+                .entry(self_name)
+                .or_default()
+                .push(span_line(item_impl.impl_token.span));
+        }
+    }
+
+    for (name, lines) in inherent_impls {
+        if lines.len() > 1 {
+            for line in lines.into_iter().skip(1) {
+                out.push(violation(
+                    path,
+                    line,
+                    "impl-merge",
+                    format!(
+                        "multiple inherent impl blocks for `{name}`; merge them when cfg/generic bounds allow it"
+                    ),
+                ));
+            }
+        }
+    }
+}
+
+fn check_visible_docs(path: &str, items: &[Item], lines: &[String], out: &mut Vec<Violation>) {
+    for item in items {
+        match item {
+            Item::Const(item_const) if is_public_or_crate(&item_const.vis) => check_doc_target(
+                path,
+                lines,
+                &item_const.attrs,
+                span_line(item_const.const_token.span),
+                "public-doc",
+                format!(
+                    "visible const `{}` requires a `///` doc comment",
+                    item_const.ident
+                ),
+                out,
+            ),
+            Item::Enum(item_enum) if is_public_or_crate(&item_enum.vis) => check_doc_target(
+                path,
+                lines,
+                &item_enum.attrs,
+                span_line(item_enum.enum_token.span),
+                "public-doc",
+                format!(
+                    "visible enum `{}` requires a `///` doc comment",
+                    item_enum.ident
+                ),
+                out,
+            ),
+            Item::Fn(item_fn) if is_public_or_crate(&item_fn.vis) => check_doc_target(
+                path,
+                lines,
+                &item_fn.attrs,
+                span_line(item_fn.sig.fn_token.span),
+                "public-doc",
+                format!(
+                    "visible function `{}` requires a `///` doc comment",
+                    item_fn.sig.ident
+                ),
+                out,
+            ),
+            Item::Static(item_static) if is_public_or_crate(&item_static.vis) => check_doc_target(
+                path,
+                lines,
+                &item_static.attrs,
+                span_line(item_static.static_token.span),
+                "public-doc",
+                format!(
+                    "visible static `{}` requires a `///` doc comment",
+                    item_static.ident
+                ),
+                out,
+            ),
+            Item::Struct(item_struct) => {
+                if is_public_or_crate(&item_struct.vis) {
+                    check_doc_target(
+                        path,
+                        lines,
+                        &item_struct.attrs,
+                        span_line(item_struct.struct_token.span),
+                        "public-doc",
+                        format!(
+                            "visible struct `{}` requires a `///` doc comment",
+                            item_struct.ident
+                        ),
+                        out,
+                    );
+                }
+                check_fields(path, lines, &item_struct.fields, out);
+            }
+            Item::Trait(item_trait) => {
+                if is_public_or_crate(&item_trait.vis) {
+                    check_trait_docs(path, lines, item_trait, out);
+                }
+            }
+            Item::Type(item_type) if is_public_or_crate(&item_type.vis) => check_doc_target(
+                path,
+                lines,
+                &item_type.attrs,
+                span_line(item_type.type_token.span),
+                "public-doc",
+                format!(
+                    "visible type alias `{}` requires a `///` doc comment",
+                    item_type.ident
+                ),
+                out,
+            ),
+            Item::Union(item_union) => {
+                if is_public_or_crate(&item_union.vis) {
+                    check_doc_target(
+                        path,
+                        lines,
+                        &item_union.attrs,
+                        span_line(item_union.union_token.span),
+                        "public-doc",
+                        format!(
+                            "visible union `{}` requires a `///` doc comment",
+                            item_union.ident
+                        ),
+                        out,
+                    );
+                }
+                check_fields(path, lines, &Fields::Named(item_union.fields.clone()), out);
+            }
+            Item::Impl(item_impl) => check_impl_method_docs(path, lines, item_impl, out),
+            _ => {}
+        }
+    }
+}
+
+fn check_fields(path: &str, lines: &[String], fields: &Fields, out: &mut Vec<Violation>) {
+    match fields {
+        Fields::Named(named) => {
+            for field in &named.named {
+                if !is_public_or_crate(&field.vis) {
+                    continue;
+                }
+                let name = field
+                    .ident
+                    .as_ref()
+                    .map(ToString::to_string)
+                    .unwrap_or_else(|| "<unnamed>".to_string());
+                check_doc_target(
+                    path,
+                    lines,
+                    &field.attrs,
+                    span_line(field.span()),
+                    "public-doc",
+                    format!("visible field `{name}` requires a `///` doc comment"),
+                    out,
+                );
+            }
+        }
+        Fields::Unnamed(unnamed) => {
+            for (idx, field) in unnamed.unnamed.iter().enumerate() {
+                if !is_public_or_crate(&field.vis) {
+                    continue;
+                }
+                check_doc_target(
+                    path,
+                    lines,
+                    &field.attrs,
+                    span_line(field.span()),
+                    "public-doc",
+                    format!("visible tuple field #{idx} requires a `///` doc comment"),
+                    out,
+                );
+            }
+        }
+        Fields::Unit => {}
+    }
+}
+
+fn check_trait_docs(
+    path: &str,
+    lines: &[String],
+    item_trait: &ItemTrait,
+    out: &mut Vec<Violation>,
+) {
+    check_doc_target(
+        path,
+        lines,
+        &item_trait.attrs,
+        span_line(item_trait.trait_token.span),
+        "public-doc",
+        format!(
+            "visible trait `{}` requires a `///` doc comment",
+            item_trait.ident
+        ),
+        out,
+    );
+    for item in &item_trait.items {
+        if let TraitItem::Fn(method) = item {
+            check_doc_target(
+                path,
+                lines,
+                &method.attrs,
+                span_line(method.sig.fn_token.span),
+                "public-doc",
+                format!(
+                    "visible trait method `{}` requires a `///` doc comment",
+                    method.sig.ident
+                ),
+                out,
+            );
+        }
+    }
+}
+
+fn check_impl_method_docs(
+    path: &str,
+    lines: &[String],
+    item_impl: &ItemImpl,
+    out: &mut Vec<Violation>,
+) {
+    for item in &item_impl.items {
+        if let ImplItem::Fn(method) = item {
+            if is_public_or_crate(&method.vis) {
+                check_doc_target(
+                    path,
+                    lines,
+                    &method.attrs,
+                    span_line(method.sig.fn_token.span),
+                    "public-doc",
+                    format!(
+                        "visible method `{}` requires a `///` doc comment",
+                        method.sig.ident
+                    ),
+                    out,
+                );
+            }
+        }
+    }
+}
+
+fn check_doc_target(
+    path: &str,
+    lines: &[String],
+    attrs: &[Attribute],
+    line: usize,
+    rule: &'static str,
+    missing_message: String,
+    out: &mut Vec<Violation>,
+) {
+    if !has_triple_slash_doc(attrs, lines) {
+        out.push(violation(path, line, rule, missing_message));
+    }
+    check_doc_before_attrs(path, lines, attrs, line, out);
+}
+
+fn check_doc_before_attrs(
+    path: &str,
+    lines: &[String],
+    attrs: &[Attribute],
+    fallback_line: usize,
+    out: &mut Vec<Violation>,
+) {
+    let first_non_doc = attrs
+        .iter()
+        .filter(|attr| !is_doc_attr(attr))
+        .map(|attr| span_line(attr.span()))
+        .min();
+    let Some(first_non_doc) = first_non_doc else {
+        return;
+    };
+    for attr in attrs.iter().filter(|attr| is_doc_attr(attr)) {
+        let doc_line = span_line(attr.span());
+        if doc_line > first_non_doc {
+            out.push(violation(
+                path,
+                doc_line.max(fallback_line),
+                "doc-attribute-order",
+                "documentation comments must be above attributes".to_string(),
+            ));
+            return;
+        }
+        if !line_starts_with(lines, doc_line, "///") {
+            out.push(violation(
+                path,
+                doc_line,
+                "public-doc",
+                "documentation must use `///` comments, not #[doc] attributes".to_string(),
+            ));
+        }
+    }
+}
+
+fn check_function_attributes(path: &str, items: &[Item], out: &mut Vec<Violation>) {
+    for item in items {
+        match item {
+            Item::Fn(item_fn) => check_attrs_adjacent(
+                path,
+                &item_fn.attrs,
+                span_line(item_fn.sig.fn_token.span),
+                out,
+            ),
+            Item::Impl(item_impl) => {
+                for item in &item_impl.items {
+                    if let ImplItem::Fn(method) = item {
+                        check_attrs_adjacent(
+                            path,
+                            &method.attrs,
+                            span_line(method.sig.fn_token.span),
+                            out,
+                        );
+                    }
+                }
+            }
+            Item::Trait(item_trait) => {
+                for item in &item_trait.items {
+                    if let TraitItem::Fn(method) = item {
+                        check_attrs_adjacent(
+                            path,
+                            &method.attrs,
+                            span_line(method.sig.fn_token.span),
+                            out,
+                        );
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn check_attrs_adjacent(
+    path: &str,
+    attrs: &[Attribute],
+    signature_line: usize,
+    out: &mut Vec<Violation>,
+) {
+    let Some(last_attr_end) = attrs.iter().map(|attr| attr.span().end().line).max() else {
+        return;
+    };
+    if last_attr_end + 1 != signature_line {
+        out.push(violation(
+            path,
+            signature_line,
+            "attribute-adjacency",
+            "function attributes must be adjacent to the function signature".to_string(),
+        ));
+    }
+}
+
+fn check_qualified_paths(path: &str, items: &[Item], out: &mut Vec<Violation>) {
+    let mut visitor = QualifiedPathVisitor {
+        file_path: path,
+        seen: BTreeSet::new(),
+        violations: Vec::new(),
+    };
+    for item in items {
+        if matches!(item, Item::Use(_)) {
+            continue;
+        }
+        visitor.visit_item(item);
+    }
+    out.extend(visitor.violations);
+}
+
+struct QualifiedPathVisitor<'a> {
+    file_path: &'a str,
+    seen: BTreeSet<(usize, String)>,
+    violations: Vec<Violation>,
+}
+
+impl<'ast> Visit<'ast> for QualifiedPathVisitor<'_> {
+    fn visit_path(&mut self, path: &'ast SynPath) {
+        let separators = path.segments.len().saturating_sub(1);
+        if separators > 1 {
+            let line = span_line(path.span());
+            let path_text = path
+                .segments
+                .iter()
+                .map(|segment| segment.ident.to_string())
+                .collect::<Vec<_>>()
+                .join("::");
+            if self.seen.insert((line, path_text.clone())) {
+                self.violations.push(violation(
+                    self.file_path,
+                    line,
+                    "qualified-path",
+                    format!(
+                        "`{path_text}` contains more than one `::`; import it and use a shorter name"
+                    ),
+                ));
+            }
+        }
+        visit::visit_path(self, path);
+    }
+}
+
+fn item_group(item: &Item) -> Option<(ItemGroup, &'static str)> {
+    match item {
+        Item::Use(_) => Some((ItemGroup::Use, "use import")),
+        Item::Const(_) | Item::Static(_) => Some((ItemGroup::Constant, "constant")),
+        Item::Enum(_) | Item::Struct(_) | Item::Trait(_) | Item::Type(_) | Item::Union(_) => {
+            Some((ItemGroup::Type, "type definition"))
+        }
+        Item::Fn(item_fn) if is_public_or_crate(&item_fn.vis) => {
+            Some((ItemGroup::PublicFunction, "public/high-level function"))
+        }
+        Item::Fn(_) => Some((ItemGroup::PrivateFunction, "private helper function")),
+        Item::Mod(item_mod) if is_tests_module(item_mod) => Some((ItemGroup::Tests, "tests")),
+        _ => None,
+    }
+}
+
+fn group_label(group: ItemGroup) -> &'static str {
+    match group {
+        ItemGroup::Use => "use imports",
+        ItemGroup::Constant => "constants",
+        ItemGroup::Type => "type definitions",
+        ItemGroup::PublicFunction => "public/high-level functions",
+        ItemGroup::PrivateFunction => "private helper functions",
+        ItemGroup::Tests => "tests",
+    }
+}
+
+fn type_def_name(item: &Item) -> Option<String> {
+    match item {
+        Item::Enum(item) => Some(item.ident.to_string()),
+        Item::Struct(item) => Some(item.ident.to_string()),
+        Item::Trait(item) => Some(item.ident.to_string()),
+        Item::Type(item) => Some(item.ident.to_string()),
+        Item::Union(item) => Some(item.ident.to_string()),
+        _ => None,
+    }
+}
+
+fn impl_self_name(item_impl: &ItemImpl) -> Option<String> {
+    match item_impl.self_ty.as_ref() {
+        Type::Path(type_path) if type_path.qself.is_none() => type_path
+            .path
+            .segments
+            .last()
+            .map(|segment| segment.ident.to_string()),
+        Type::Reference(reference) => match reference.elem.as_ref() {
+            Type::Path(type_path) if type_path.qself.is_none() => type_path
+                .path
+                .segments
+                .last()
+                .map(|segment| segment.ident.to_string()),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn is_tests_module(item_mod: &ItemMod) -> bool {
+    item_mod.ident == "tests" && has_cfg_test(&item_mod.attrs)
+}
+
+fn has_cfg_test(attrs: &[Attribute]) -> bool {
+    attrs.iter().any(|attr| {
+        attr.path().is_ident("cfg")
+            && attr
+                .meta
+                .require_list()
+                .is_ok_and(|list| list.tokens.to_string().contains("test"))
+    })
+}
+
+fn has_test_attr(attrs: &[Attribute]) -> bool {
+    attrs.iter().any(|attr| attr.path().is_ident("test"))
+}
+
+fn has_triple_slash_doc(attrs: &[Attribute], lines: &[String]) -> bool {
+    attrs
+        .iter()
+        .filter(|attr| is_doc_attr(attr))
+        .any(|attr| line_starts_with(lines, span_line(attr.span()), "///"))
+}
+
+fn is_doc_attr(attr: &Attribute) -> bool {
+    attr.path().is_ident("doc")
+}
+
+fn is_public_or_crate(vis: &Visibility) -> bool {
+    match vis {
+        Visibility::Public(_) => true,
+        Visibility::Restricted(restricted) => restricted
+            .path
+            .segments
+            .last()
+            .is_some_and(|segment| segment.ident == "crate"),
+        Visibility::Inherited => false,
+    }
+}
+
+fn line_starts_with(lines: &[String], line: usize, prefix: &str) -> bool {
+    lines
+        .get(line.saturating_sub(1))
+        .is_some_and(|value| value.trim_start().starts_with(prefix))
+}
+
+fn span_line(span: Span) -> usize {
+    span.start().line.max(1)
+}
+
+fn violation(path: &str, line: usize, rule: &'static str, message: String) -> Violation {
+    Violation {
+        path: path.to_string(),
+        line,
+        rule,
+        message,
+    }
+}
+
+fn normalize_path(path: &Path) -> String {
+    path.to_string_lossy().replace('\\', "/")
+}
