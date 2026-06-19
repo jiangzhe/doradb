@@ -7,7 +7,7 @@ use crate::error::{ErrorKind, FatalError, Result};
 use crate::id::{TableID, TrxID};
 use crate::log::discover_redo_log_files;
 use crate::log::redo::{DDLRedo, RowRedoKind, TableDML};
-use crate::log::replay::RedoLogReplayer;
+use crate::recovery::redo_stream::RedoLogStream;
 use crate::trx::sys::TransactionSystem;
 use event_listener::{Event, listener};
 use parking_lot::Mutex;
@@ -321,10 +321,10 @@ impl Catalog {
         if logs.is_empty() {
             return Ok(batch);
         }
-        let mut replayer = RedoLogReplayer::new(logs);
-        replayer.plan_replay(replay_start_ts)?;
+        let mut stream = RedoLogStream::new(logs);
+        stream.plan_replay(replay_start_ts)?;
 
-        while let Some(log) = replayer.pop()? {
+        while let Some(log) = stream.try_next()? {
             let (header, redo) = log.into_inner();
             if header.cts < replay_start_ts {
                 // Older records are already represented by the current

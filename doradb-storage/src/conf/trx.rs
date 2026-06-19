@@ -1,21 +1,22 @@
-use crate::buffer::{
-    BufferPool, EvictableBufferPool, FixedBufferPool, PoolGuards, PoolRole, ReadonlyBufferPool,
-};
+use crate::buffer::{EvictableBufferPool, FixedBufferPool, PoolGuards, ReadonlyBufferPool};
 use crate::catalog::Catalog;
 use crate::component::Supplier;
-use crate::error::{ConfigError, ConfigResult, Error, Result};
+use crate::error::{ConfigError, ConfigResult, DataIntegrityError, Error, Result};
 use crate::file::fs::FileSystem;
 use crate::io::{Completion, align_to_sector_size};
 use crate::log::format::REDO_DEFAULT_DATA_START_OFFSET;
-use crate::log::recover::{RecoveryDeps, log_recover};
-use crate::log::{LogSync, RedoLogStartup};
+use crate::log::{LogSync, RedoLogInitializer};
 use crate::quiescent::QuiescentGuard;
+use crate::recovery::redo_stream::RedoLogStream;
+use crate::recovery::{RecoveryBuffers, RecoveryCoordinator, RecoveryResources};
+use crate::trx::MAX_SNAPSHOT_TS;
 use crate::trx::purge::Purge;
 use crate::trx::sys::{
     TransactionSystem, TransactionSystemQueues, TransactionSystemWorkers,
     TransactionSystemWorkersOwned, TrxCleanupMessage,
 };
 use byte_unit::Byte;
+use crossbeam_utils::CachePadded;
 use error_stack::{Report, ResultExt};
 use flume::{Receiver, Sender};
 use serde::{Deserialize, Serialize};
@@ -188,7 +189,10 @@ impl TrxSysConfig {
     }
 
     #[inline]
-    pub(crate) fn redo_log_startup(&self) -> Result<RedoLogStartup> {
+    pub(crate) fn prepare_recovery<'a>(
+        &self,
+        resources: RecoveryResources<'a>,
+    ) -> Result<(RecoveryCoordinator<'a>, RedoLogInitializer)> {
         debug_assert!(validate_log_file_stem(&self.log_file_stem));
         let file_prefix = self.file_prefix().map_err(Error::from)?;
         let log_block_size = align_to_sector_size(self.log_block_size.as_u64() as usize);
@@ -196,13 +200,16 @@ impl TrxSysConfig {
             normalize_redo_file_max_size(self.log_file_max_size.as_u64() as usize, log_block_size)?;
 
         let logs = discover_redo_log_files(&file_prefix, false)?;
-        RedoLogStartup::recovery(
+        let stream = RedoLogStream::new(logs);
+        let next_file_seq = stream.next_file_seq()?.unwrap_or(0);
+        let initializer = RedoLogInitializer::new(
             file_prefix,
             self.io_depth,
             file_max_size,
             log_block_size,
-            logs,
-        )
+            next_file_seq,
+        )?;
+        Ok((RecoveryCoordinator::new(resources, stream), initializer))
     }
 
     #[inline]
@@ -225,30 +232,19 @@ impl TrxSysConfig {
         catalog: QuiescentGuard<Catalog>,
     ) -> Result<(TransactionSystem, PendingTransactionSystemStartup)> {
         let config = self.normalize_redo_file_layout()?;
-        let redo_log_startup = config.redo_log_startup()?;
-
-        let pool_guards = PoolGuards::builder()
-            .push(PoolRole::Meta, meta_pool.pool_guard())
-            .push(PoolRole::Index, index_pool.pool_guard())
-            .push(PoolRole::Mem, mem_pool.pool_guard())
-            .push(PoolRole::Disk, disk_pool.pool_guard())
-            .build();
+        let mem_pool_for_purge = mem_pool.clone();
+        let recovery_buffers = RecoveryBuffers::new(meta_pool, index_pool, mem_pool, disk_pool);
+        let pool_guards = recovery_buffers.pool_guards().clone();
 
         let (purge_tx, purge_rx) = flume::unbounded();
         let (cleanup_tx, cleanup_rx) = flume::unbounded();
-        let (redo_log, initial_trx_ts, initial_file_deletes, initial_redo_header) = log_recover(
-            &meta_pool,
-            RecoveryDeps {
-                index_pool,
-                mem_pool: mem_pool.clone(),
-                table_fs: table_fs.clone(),
-                disk_pool,
-            },
-            &catalog,
-            redo_log_startup,
-            purge_tx.clone(),
-        )
-        .await?;
+        let recovery_resources =
+            RecoveryResources::new(recovery_buffers, table_fs.clone(), &catalog);
+        let (coordinator, initializer) = config.prepare_recovery(recovery_resources)?;
+        let (max_recovered_cts, initial_file_deletes) = coordinator.recover_all().await?;
+        let initial_trx_ts = recovery_initial_trx_ts(max_recovered_cts)?;
+        let (redo_log, initial_redo_header) = initializer.finish(purge_tx.clone())?;
+        let redo_log = CachePadded::new(redo_log);
 
         let trx_sys = TransactionSystem::new(
             config,
@@ -270,7 +266,7 @@ impl TrxSysConfig {
                 purge_rx,
                 cleanup_tx,
                 cleanup_rx,
-                mem_pool,
+                mem_pool: mem_pool_for_purge,
                 pool_guards,
             },
         ))
@@ -301,6 +297,20 @@ fn invalid_log_file_max_size() -> Error {
     Report::new(ConfigError::InvalidLogFileMaxSize)
         .attach("redo file max size cannot be represented after log-block alignment")
         .into()
+}
+
+#[inline]
+fn recovery_initial_trx_ts(max_recovered_cts: crate::id::TrxID) -> Result<crate::id::TrxID> {
+    max_recovered_cts
+        .checked_add(1)
+        .filter(|ts| *ts < MAX_SNAPSHOT_TS)
+        .ok_or_else(|| {
+            Error::from(
+                Report::new(DataIntegrityError::LogFileCorrupted).attach(format!(
+                    "recovered commit timestamp out of range: max_recovered_cts={max_recovered_cts}"
+                )),
+            )
+        })
 }
 
 impl Default for TrxSysConfig {

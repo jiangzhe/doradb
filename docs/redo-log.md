@@ -25,12 +25,15 @@ Main source files:
 
 - `log/redo.rs`: redo record payload types and serialization.
 - `log/buf.rs`: log-group write buffer and transaction frame serialization.
-- `log/replay.rs`: replay planning, mmap reader, and redo record draining.
 - `trx/group.rs`: commit-group construction.
 - `trx/sys.rs`: commit admission, CTS assignment, and GC bucket ownership.
-- `log/mod.rs`: log file discovery, startup handoff, allocation,
+- `log/mod.rs`: log file discovery, writable-log initialization, allocation,
   group-commit write scheduling, IO, sync, and redo-stream failure handling.
-- `log/recover.rs`: startup replay.
+- `recovery/`: startup recovery orchestration, checkpoint bootstrap, replay
+  bounds, row-page recovery state, post-replay validation, and hot-state
+  rebuild.
+- `recovery/redo_stream.rs`: replay planning, mmap reader, segment validation,
+  and redo record draining.
 - `catalog/checkpoint.rs`: catalog checkpoint scanning over durable redo.
 
 ## File Family
@@ -324,14 +327,15 @@ observing the result; it does not roll the transaction back.
 
 ## Read and Replay Path
 
-Startup builds a `RedoLogStartup` from discovered log files: a
-`RedoLogReplayer` for existing files and a `RedoLogInitializer` for the next
-writable file. After checkpoint bootstrap computes the `replay_floor`, recovery
-reads validated redo super-block metadata from the newest files backwards until
-it reaches the oldest suffix segment that may contain replay-relevant records.
-The initializer derives the next writable file sequence from the newest
-discovered file before replay, so normal runtime opens a fresh file after
-recovery even if every planned segment was skipped.
+Startup prepares recovery from discovered log files by building a
+recovery-owned `RedoLogStream` for existing files, a `RecoveryCoordinator` for
+checkpoint bootstrap and replay, and a log-owned `RedoLogInitializer` for the
+next writable file. After checkpoint bootstrap computes the `replay_floor`,
+recovery reads validated redo super-block metadata from the newest files
+backwards until it reaches the oldest suffix segment that may contain
+replay-relevant records. The initializer derives the next writable file sequence
+from the newest discovered file before replay, so normal runtime opens a fresh
+file after recovery even if every planned segment was skipped.
 
 `MmapLogReader` maps one planned file, uses the selected valid redo super-block
 slot, and reads groups from the fixed `REDO_DEFAULT_DATA_START_OFFSET`.

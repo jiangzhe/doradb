@@ -3,7 +3,7 @@ use crate::catalog::TableColumnLayout;
 use crate::file::cow_file::INVALID_BLOCK_ID;
 use crate::id::{BlockID, FileID, PageID, TrxID};
 use crate::latch::HybridLatch;
-use crate::log::recover::RecoverMap;
+use crate::recovery::RowRecoveryMap;
 use crate::trx::ver_map::RowVersionMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
@@ -149,7 +149,7 @@ impl BufferFrame {
 
     #[inline]
     pub(crate) fn init_recover_map(&mut self, create_cts: TrxID) {
-        self.ctx = Some(Box::new(FrameContext::RecoverMap(RecoverMap::new(
+        self.ctx = Some(Box::new(FrameContext::RowRecoveryMap(RowRecoveryMap::new(
             create_cts,
         ))));
     }
@@ -217,7 +217,7 @@ impl From<u8> for FrameKind {
 
 pub(crate) enum FrameContext {
     RowVerMap(RowVersionMap),
-    RecoverMap(RecoverMap),
+    RowRecoveryMap(RowRecoveryMap),
 }
 
 impl FrameContext {
@@ -225,22 +225,22 @@ impl FrameContext {
     pub(crate) fn row_ver(&self) -> Option<&RowVersionMap> {
         match self {
             FrameContext::RowVerMap(ver) => Some(ver),
-            FrameContext::RecoverMap(_) => None,
+            FrameContext::RowRecoveryMap(_) => None,
         }
     }
 
     #[inline]
-    pub(crate) fn recover(&self) -> Option<&RecoverMap> {
+    pub(crate) fn recover(&self) -> Option<&RowRecoveryMap> {
         match self {
-            FrameContext::RecoverMap(rec) => Some(rec),
+            FrameContext::RowRecoveryMap(rec) => Some(rec),
             FrameContext::RowVerMap(_) => None,
         }
     }
 
     #[inline]
-    pub(crate) fn recover_mut(&mut self) -> Option<&mut RecoverMap> {
+    pub(crate) fn recover_mut(&mut self) -> Option<&mut RowRecoveryMap> {
         match self {
-            FrameContext::RecoverMap(rec) => Some(rec),
+            FrameContext::RowRecoveryMap(rec) => Some(rec),
             FrameContext::RowVerMap(_) => None,
         }
     }

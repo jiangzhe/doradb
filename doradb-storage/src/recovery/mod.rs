@@ -12,175 +12,44 @@
 //! We separate all transactions into two kinds:
 //! 1. DDL involved transactions
 //! 2. DML-only transactions
+pub(crate) mod redo_stream;
+mod resources;
+mod row_state;
+mod timeline;
+
+use crate::buffer::BufferPool;
 use crate::buffer::guard::PageGuard;
-use crate::buffer::{
-    BufferPool, EvictableBufferPool, FixedBufferPool, PoolGuards, PoolRole, ReadonlyBufferPool,
-};
 use crate::catalog::{
-    Catalog, CatalogTable, IndexDdlKind, IndexDdlRootProof, TableColumnLayout,
-    classify_index_ddl_root, is_catalog_obj_id, is_user_obj_id,
+    CatalogTable, IndexDdlKind, IndexDdlRootProof, TableColumnLayout, classify_index_ddl_root,
+    is_catalog_obj_id, is_user_obj_id,
 };
 use crate::error::{DataIntegrityError, Error, OperationError, Result};
-use crate::file::fs::FileSystem;
 use crate::id::{PageID, RowID, TableID, TrxID};
-use crate::io::Completion;
 use crate::latch::LatchFallbackMode;
 use crate::log::buf::TrxLog;
 use crate::log::redo::{DDLRedo, RedoLogs, RowRedo, RowRedoKind, TableDML};
-use crate::log::replay::RedoLogReplayer;
-use crate::log::{RedoLog, RedoLogStartup};
 use crate::map::{FastHashMap, FastHashSet};
-use crate::quiescent::QuiescentGuard;
 use crate::row::RowPage;
 use crate::table::Table;
-use crate::trx::purge::{DroppedTableFileDeleteItem, Purge};
-use crate::trx::{MAX_SNAPSHOT_TS, MIN_SNAPSHOT_TS};
-use crossbeam_utils::CachePadded;
+use crate::trx::MIN_SNAPSHOT_TS;
+use crate::trx::purge::DroppedTableFileDeleteItem;
+use redo_stream::RedoLogStream;
+
 use error_stack::Report;
-use flume::Sender;
+pub(crate) use resources::{RecoveryBuffers, RecoveryResources};
+pub(crate) use row_state::RowRecoveryMap;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
+pub(crate) use timeline::{RecoveryTimeline, TableReplayBounds};
 
-/// Per-row recovery map used while rebuilding one row page from redo.
-pub(crate) struct RecoverMap {
-    create_cts: TrxID,
-    entries: Vec<Option<TrxID>>,
-}
-
-impl RecoverMap {
-    /// Returns a recover map with given create CTS.
-    #[inline]
-    pub(crate) fn new(create_cts: TrxID) -> Self {
-        RecoverMap {
-            create_cts,
-            entries: vec![],
-        }
-    }
-
-    /// Returns CTS when this page is created.
-    #[inline]
-    pub(crate) fn create_cts(&self) -> TrxID {
-        self.create_cts
-    }
-
-    /// Returns whether entry of given row position is vacant.
-    #[inline]
-    pub(crate) fn is_vacant(&self, row_idx: usize) -> bool {
-        row_idx >= self.entries.len() || self.entries[row_idx].is_none()
-    }
-
-    /// Insert CTS at given row position.
-    #[inline]
-    pub(crate) fn insert_at(&mut self, row_idx: usize, cts: TrxID) {
-        while self.entries.len() <= row_idx {
-            self.entries.push(None);
-        }
-        self.entries[row_idx] = Some(cts);
-    }
-
-    /// Update CTS at given row position.
-    #[inline]
-    pub(crate) fn update_at(&mut self, row_idx: usize, cts: TrxID) {
-        debug_assert!(row_idx < self.entries.len());
-        debug_assert!(self.at(row_idx).unwrap() <= cts);
-        self.entries[row_idx].replace(cts);
-    }
-
-    /// Returns CTS at given row position.
-    #[inline]
-    pub(crate) fn at(&self, row_idx: usize) -> Option<TrxID> {
-        self.entries.get(row_idx).and_then(|v| *v)
-    }
-}
-
-pub(crate) async fn log_recover(
-    meta_pool: &FixedBufferPool,
-    deps: RecoveryDeps,
-    catalog: &Catalog,
-    redo_log_startup: RedoLogStartup,
-    purge_tx: Sender<Purge>,
-) -> Result<(
-    CachePadded<RedoLog>,
-    TrxID,
-    Vec<DroppedTableFileDeleteItem>,
-    Arc<Completion<()>>,
-)> {
-    let RecoveryDeps {
-        index_pool,
-        mem_pool,
-        table_fs,
-        disk_pool,
-    } = deps;
-    // In recovery, we disable GC and redo logging.
-    // All data are purely processed in memory and if
-    // any failure occurs, we abort the whole process.
-    let RedoLogStartup {
-        initializer,
-        replayer,
-    } = redo_log_startup;
-    let log_recovery = LogRecovery::new(
-        meta_pool, index_pool, mem_pool, table_fs, disk_pool, catalog, replayer,
-    );
-    let (max_recovered_cts, dropped_table_file_deletes) = log_recovery.recover_all().await?;
-    let next_trx_ts = max_recovered_cts
-        .checked_add(1)
-        .filter(|ts| *ts < MAX_SNAPSHOT_TS)
-        .ok_or_else(|| {
-            Error::from(
-                Report::new(DataIntegrityError::LogFileCorrupted).attach(format!(
-                    "recovered commit timestamp out of range: max_recovered_cts={max_recovered_cts}"
-                )),
-            )
-        })?;
-    let (redo_log, initial_redo_header) = initializer.finish(purge_tx)?;
-    Ok((
-        CachePadded::new(redo_log),
-        next_trx_ts,
-        dropped_table_file_deletes,
-        initial_redo_header,
-    ))
-}
-
-pub(crate) struct RecoveryDeps {
-    pub(crate) index_pool: QuiescentGuard<EvictableBufferPool>,
-    pub(crate) mem_pool: QuiescentGuard<EvictableBufferPool>,
-    pub(crate) table_fs: QuiescentGuard<FileSystem>,
-    pub(crate) disk_pool: QuiescentGuard<ReadonlyBufferPool>,
-}
-
-/// Redo-log recovery coordinator for catalog metadata and user tables.
-pub(crate) struct LogRecovery<'a> {
-    /// Mutable secondary-index buffer pool used while rebuilding hot MemIndex state.
-    index_pool: QuiescentGuard<EvictableBufferPool>,
-    /// Mutable row-page buffer pool used for recovered heap pages.
-    mem_pool: QuiescentGuard<EvictableBufferPool>,
-    /// Table file system used to reload checkpointed user-table files.
-    table_fs: QuiescentGuard<FileSystem>,
-    /// Readonly disk buffer pool used by checkpointed column and DiskTree state.
-    disk_pool: QuiescentGuard<ReadonlyBufferPool>,
-    /// Catalog runtime being rebuilt from checkpointed metadata and redo logs.
-    catalog: &'a Catalog,
-    /// Ordered single redo-log replayer.
-    log_replayer: RedoLogReplayer,
-    /// Catalog checkpoint boundary. Catalog redo before this timestamp is
-    /// already reflected in checkpointed catalog state.
-    catalog_replay_start_ts: TrxID,
-    /// Earliest redo timestamp that may still affect any loaded runtime state.
-    ///
-    /// This starts at the catalog replay boundary and is lowered by loaded
-    /// user-table heap/delete replay starts so old irrelevant log records can be
-    /// skipped before per-table filtering.
-    replay_floor: TrxID,
-    /// Highest timestamp observed in checkpoint metadata, table roots, or redo
-    /// log headers during recovery.
-    ///
-    /// This is a timestamp-generator watermark, not a replay filter. It is
-    /// updated even for redo records skipped by replay boundaries so runtime
-    /// transaction timestamps restart at `max_recovered_cts + 1` and never reuse
-    /// a historical CTS.
-    max_recovered_cts: TrxID,
-    /// Per loaded user table, the persisted replay boundaries from its active root.
-    table_states: FastHashMap<TableID, RecoveryTableState>,
+/// Recovery coordinator for checkpoint bootstrap, redo replay, and final repair.
+pub(crate) struct RecoveryCoordinator<'a> {
+    /// Catalog, table files, and buffer-pool resources used by recovery.
+    resources: RecoveryResources<'a>,
+    /// Ordered single redo-log stream.
+    redo_stream: RedoLogStream,
+    /// Replay cursors, per-table bounds, and recovered CTS watermark.
+    timeline: RecoveryTimeline,
     /// Tables loaded from table-file metadata while catalog index DDL redo is pending.
     pending_index_ddl_reconciliations: FastHashSet<TableID>,
     /// Hot row pages touched by redo replay, grouped by table for post-replay
@@ -188,88 +57,18 @@ pub(crate) struct LogRecovery<'a> {
     recovered_tables: FastHashMap<TableID, BTreeSet<PageID>>,
     /// Dropped user-table files whose runtime state was destroyed during replay.
     dropped_table_file_deletes: Vec<DroppedTableFileDeleteItem>,
-    /// Stable pool guards shared by recovery operations.
-    pool_guards: PoolGuards,
 }
 
-#[derive(Clone, Copy, Debug)]
-struct RecoveryTableState {
-    /// Active table-root publication timestamp observed during recovery bootstrap.
-    root_ts: TrxID,
-    /// Lower bound for replaying heap row-page redo for this table.
-    heap_redo_start_ts: TrxID,
-    /// Lower bound for replaying persisted cold-delete metadata for this table.
-    deletion_cutoff_ts: TrxID,
-}
-
-impl RecoveryTableState {
+impl<'a> RecoveryCoordinator<'a> {
     #[inline]
-    fn replay_start_ts(self) -> TrxID {
-        self.heap_redo_start_ts.min(self.deletion_cutoff_ts)
-    }
-}
-
-#[inline]
-fn validate_create_table_reloaded_root_ts(
-    table_id: TableID,
-    create_table_cts: TrxID,
-    state: RecoveryTableState,
-    pending_index_ddl_reconciliation: bool,
-) -> Result<()> {
-    // Create-table redo reopens the latest table root. The initial create root
-    // is published before the catalog commit and therefore carries the create
-    // transaction STS, which can predate the create-table redo CTS. A metadata
-    // mismatch accepted by reload still requires a later root publication so
-    // recovery can prove pending index-DDL metadata has a durable table root.
-    if pending_index_ddl_reconciliation && state.root_ts <= create_table_cts {
-        return Err(Report::new(DataIntegrityError::InvalidRootInvariant)
-            .attach(format!(
-                "create-table pending index-DDL reconciliation requires later table root: table_id={table_id}, root_ts={}, create_table_cts={create_table_cts}",
-                state.root_ts
-            ))
-            .into());
-    }
-    Ok(())
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum UserTableRedoAction {
-    Replay,
-    SkipCheckpointCoveredUnknownTable,
-}
-
-impl<'a> LogRecovery<'a> {
-    #[inline]
-    fn new(
-        meta_pool: &FixedBufferPool,
-        index_pool: QuiescentGuard<EvictableBufferPool>,
-        mem_pool: QuiescentGuard<EvictableBufferPool>,
-        table_fs: QuiescentGuard<FileSystem>,
-        disk_pool: QuiescentGuard<ReadonlyBufferPool>,
-        catalog: &'a Catalog,
-        log_replayer: RedoLogReplayer,
-    ) -> Self {
-        let pool_guards = PoolGuards::builder()
-            .push(PoolRole::Meta, meta_pool.pool_guard())
-            .push(PoolRole::Index, index_pool.pool_guard())
-            .push(PoolRole::Mem, mem_pool.pool_guard())
-            .push(PoolRole::Disk, disk_pool.pool_guard())
-            .build();
-        LogRecovery {
-            index_pool,
-            mem_pool,
-            table_fs,
-            disk_pool,
-            catalog,
-            log_replayer,
-            catalog_replay_start_ts: MIN_SNAPSHOT_TS,
-            replay_floor: MIN_SNAPSHOT_TS,
-            max_recovered_cts: MIN_SNAPSHOT_TS,
-            table_states: FastHashMap::default(),
+    pub(crate) fn new(resources: RecoveryResources<'a>, redo_stream: RedoLogStream) -> Self {
+        RecoveryCoordinator {
+            resources,
+            redo_stream,
+            timeline: RecoveryTimeline::new(MIN_SNAPSHOT_TS),
             pending_index_ddl_reconciliations: FastHashSet::default(),
             recovered_tables: FastHashMap::default(),
             dropped_table_file_deletes: Vec::new(),
-            pool_guards,
         }
     }
 
@@ -277,12 +76,12 @@ impl<'a> LogRecovery<'a> {
     #[inline]
     pub(crate) async fn recover_all(mut self) -> Result<(TrxID, Vec<DroppedTableFileDeleteItem>)> {
         self.bootstrap_checkpointed_user_tables().await?;
-        if let Some(skipped_max_cts) = self.log_replayer.plan_replay(self.replay_floor)? {
-            self.max_recovered_cts = self.max_recovered_cts.max(skipped_max_cts);
+        if let Some(skipped_max_cts) = self.redo_stream.plan_replay(self.timeline.replay_floor)? {
+            self.timeline.max_recovered_cts = self.timeline.max_recovered_cts.max(skipped_max_cts);
         }
         // 1. replay DDL and DML into catalog metadata, hot RowStore pages, and
         //    cold delete markers.
-        while let Some(log) = self.log_replayer.pop()? {
+        while let Some(log) = self.redo_stream.try_next()? {
             self.replay_log(log).await?;
         }
         // 2. Ensure catalog metadata caught up with table-file roots.
@@ -294,30 +93,35 @@ impl<'a> LogRecovery<'a> {
         //    and refresh pages to enable undo maps.
         self.recover_indexes_and_refresh_pages().await?;
 
-        Ok((self.max_recovered_cts, self.dropped_table_file_deletes))
+        Ok((
+            self.timeline.max_recovered_cts,
+            self.dropped_table_file_deletes,
+        ))
     }
 
     async fn bootstrap_checkpointed_user_tables(&mut self) -> Result<()> {
-        let snapshot = self.catalog.storage.checkpoint_snapshot()?;
-        self.catalog_replay_start_ts = snapshot.catalog_replay_start_ts;
-        self.replay_floor = snapshot.catalog_replay_start_ts;
-        self.max_recovered_cts = self.max_recovered_cts.max(snapshot.catalog_replay_start_ts);
+        let snapshot = self.resources.catalog.storage.checkpoint_snapshot()?;
+        self.timeline
+            .seed_catalog_checkpoint(snapshot.catalog_replay_start_ts);
 
         let checkpointed_tables = self
+            .resources
             .catalog
             .storage
             .tables()
-            .list_uncommitted(&self.pool_guards)
+            .list_uncommitted(&self.resources.buffers.pool_guards)
             .await?;
         let checkpointed_user_table_ids = checkpointed_tables
             .iter()
             .filter(|table| is_user_obj_id(table.table_id))
             .map(|table| table.table_id)
             .collect::<FastHashSet<_>>();
-        self.table_fs.cleanup_checkpoint_absent_user_table_files(
-            snapshot.meta.next_table_id,
-            &checkpointed_user_table_ids,
-        )?;
+        self.resources
+            .table_fs
+            .cleanup_checkpoint_absent_user_table_files(
+                snapshot.meta.next_table_id,
+                &checkpointed_user_table_ids,
+            )?;
 
         for table in checkpointed_tables {
             if !is_user_obj_id(table.table_id) {
@@ -327,12 +131,13 @@ impl<'a> LogRecovery<'a> {
             // index-DDL roots whose catalog rows are replayed later. Such a
             // narrow mismatch is temporary and must reconcile by final validation.
             let metadata_matched = self
+                .resources
                 .catalog
                 .reload_create_table(
-                    self.mem_pool.clone(),
-                    self.index_pool.clone(),
-                    &self.table_fs,
-                    self.disk_pool.clone(),
+                    self.resources.buffers.mem_pool.clone(),
+                    self.resources.buffers.index_pool.clone(),
+                    &self.resources.table_fs,
+                    self.resources.buffers.disk_pool.clone(),
                     table.table_id,
                 )
                 .await?;
@@ -347,14 +152,14 @@ impl<'a> LogRecovery<'a> {
                 self.pending_index_ddl_reconciliations
                     .insert(table.table_id);
             }
-            self.replay_floor = self.replay_floor.min(state.replay_start_ts());
+            self.timeline.seed_table_bounds(state);
         }
         Ok(())
     }
 
     #[inline]
     fn should_replay_catalog(&self, cts: TrxID) -> bool {
-        cts >= self.catalog_replay_start_ts
+        cts >= self.timeline.catalog_replay_start_ts
     }
 
     #[inline]
@@ -364,41 +169,41 @@ impl<'a> LogRecovery<'a> {
         cts: TrxID,
         context: &'static str,
     ) -> Result<UserTableRedoAction> {
-        if self.table_states.contains_key(&table_id) {
+        if self.timeline.table_bounds.contains_key(&table_id) {
             return Ok(UserTableRedoAction::Replay);
         }
-        if cts < self.catalog_replay_start_ts {
+        if cts < self.timeline.catalog_replay_start_ts {
             return Ok(UserTableRedoAction::SkipCheckpointCoveredUnknownTable);
         }
         Err(Report::new(OperationError::TableNotFound)
             .attach(format!(
                 "invalid recovery ordering: {context}: unknown user table redo at or after catalog replay boundary: table_id={table_id}, cts={cts}, catalog_replay_start_ts={}",
-                self.catalog_replay_start_ts
+                self.timeline.catalog_replay_start_ts
             ))
             .into())
     }
 
-    async fn track_loaded_table(&mut self, table_id: TableID) -> Result<RecoveryTableState> {
-        let table = self.catalog.get_table(table_id).await.ok_or_else(|| {
-            Error::from(
-                Report::new(OperationError::TableNotFound)
-                    .attach(format!("track loaded table runtime: table_id={table_id}")),
-            )
-        })?;
+    async fn track_loaded_table(&mut self, table_id: TableID) -> Result<TableReplayBounds> {
+        let table = self
+            .resources
+            .catalog
+            .get_table(table_id)
+            .await
+            .ok_or_else(|| {
+                Error::from(
+                    Report::new(OperationError::TableNotFound)
+                        .attach(format!("track loaded table runtime: table_id={table_id}")),
+                )
+            })?;
         // `recovery_bootstrap_unchecked`: recovery records replay floors from
         // the table root loaded during restart, before normal transactions run.
         let active_root = table.file().active_root_unchecked();
-        let state = RecoveryTableState {
+        let state = TableReplayBounds {
             root_ts: active_root.root_ts,
             heap_redo_start_ts: active_root.heap_redo_start_ts,
             deletion_cutoff_ts: active_root.deletion_cutoff_ts,
         };
-        self.max_recovered_cts = self
-            .max_recovered_cts
-            .max(state.root_ts)
-            .max(state.heap_redo_start_ts)
-            .max(state.deletion_cutoff_ts);
-        let old = self.table_states.insert(table_id, state);
+        let old = self.timeline.table_bounds.insert(table_id, state);
         if old.is_some() {
             return Err(Report::new(OperationError::TableAlreadyExists)
                 .attach(format!("track loaded table state: table_id={table_id}"))
@@ -411,18 +216,18 @@ impl<'a> LogRecovery<'a> {
     fn validate_checkpoint_pending_reconciliation_cts(
         &self,
         table_id: TableID,
-        state: RecoveryTableState,
+        state: TableReplayBounds,
     ) -> Result<()> {
         // No upper bound is checked here: a table root may legitimately be newer
         // than the catalog checkpoint. The invalid state is the opposite case,
         // where a pre-cursor root would require catalog redo that checkpoint
         // bootstrap has already declared unnecessary.
-        if state.root_ts < self.catalog_replay_start_ts {
+        if state.root_ts < self.timeline.catalog_replay_start_ts {
             return Err(Report::new(DataIntegrityError::InvalidRootInvariant)
                 .attach(format!(
                     "checkpointed table pending index-DDL reconciliation has root before catalog replay boundary: table_id={table_id}, root_ts={}, catalog_replay_start_ts={}",
                     state.root_ts,
-                    self.catalog_replay_start_ts
+                    self.timeline.catalog_replay_start_ts
                 ))
                 .into());
         }
@@ -431,7 +236,8 @@ impl<'a> LogRecovery<'a> {
 
     #[inline]
     fn table_heap_redo_start_ts(&self, table_id: TableID) -> Result<TrxID> {
-        self.table_states
+        self.timeline
+            .table_bounds
             .get(&table_id)
             .map(|state| state.heap_redo_start_ts)
             .ok_or_else(|| {
@@ -443,7 +249,8 @@ impl<'a> LogRecovery<'a> {
 
     #[inline]
     fn table_deletion_cutoff_ts(&self, table_id: TableID) -> Result<TrxID> {
-        self.table_states
+        self.timeline
+            .table_bounds
             .get(&table_id)
             .map(|state| state.deletion_cutoff_ts)
             .ok_or_else(|| {
@@ -455,7 +262,8 @@ impl<'a> LogRecovery<'a> {
 
     #[inline]
     fn table_replay_start_ts(&self, table_id: TableID) -> Result<TrxID> {
-        self.table_states
+        self.timeline
+            .table_bounds
             .get(&table_id)
             .map(|state| state.replay_start_ts())
             .ok_or_else(|| {
@@ -468,8 +276,8 @@ impl<'a> LogRecovery<'a> {
     async fn replay_log(&mut self, log: TrxLog) -> Result<()> {
         // sequentially replay redo log.
         let (header, RedoLogs { ddl, dml }) = log.into_inner();
-        self.max_recovered_cts = self.max_recovered_cts.max(header.cts);
-        if header.cts < self.replay_floor {
+        self.timeline.max_recovered_cts = self.timeline.max_recovered_cts.max(header.cts);
+        if header.cts < self.timeline.replay_floor {
             return Ok(());
         }
 
@@ -490,11 +298,11 @@ impl<'a> LogRecovery<'a> {
         // Checkpointed cold secondary-index state is already available through
         // the table's DiskTree roots. Rebuild only hot row-page MemIndex state.
         for (table_id, pages) in &self.recovered_tables {
-            if let Some(table) = self.catalog.get_table(*table_id).await {
+            if let Some(table) = self.resources.catalog.get_table(*table_id).await {
                 let metadata = table.metadata();
                 for page_id in pages {
                     table
-                        .populate_index_via_row_page(&self.pool_guards, *page_id)
+                        .populate_index_via_row_page(&self.resources.buffers.pool_guards, *page_id)
                         .await?;
                     self.refresh_page(Arc::clone(&metadata.col), *page_id)
                         .await?;
@@ -505,17 +313,28 @@ impl<'a> LogRecovery<'a> {
     }
 
     async fn validate_loaded_table_metadata(&mut self) -> Result<()> {
-        let table_ids = self.table_states.keys().copied().collect::<Vec<_>>();
+        let table_ids = self
+            .timeline
+            .table_bounds
+            .keys()
+            .copied()
+            .collect::<Vec<_>>();
         for table_id in table_ids {
-            let table = self.catalog.get_table(table_id).await.ok_or_else(|| {
-                Error::from(Report::new(OperationError::TableNotFound).attach(format!(
-                    "validate recovered user table metadata: table_id={table_id}"
-                )))
-            })?;
+            let table = self
+                .resources
+                .catalog
+                .get_table(table_id)
+                .await
+                .ok_or_else(|| {
+                    Error::from(Report::new(OperationError::TableNotFound).attach(format!(
+                        "validate recovered user table metadata: table_id={table_id}"
+                    )))
+                })?;
             let active_root = table.file().active_root_unchecked();
             let (_, catalog_metadata) = self
+                .resources
                 .catalog
-                .user_table_metadata_from_catalog(&self.pool_guards, table_id)
+                .user_table_metadata_from_catalog(&self.resources.buffers.pool_guards, table_id)
                 .await?;
             if catalog_metadata != *active_root.metadata {
                 let pending = self.pending_index_ddl_reconciliations.contains(&table_id);
@@ -523,7 +342,7 @@ impl<'a> LogRecovery<'a> {
                     .attach(format!(
                         "recovered user table metadata mismatch after redo replay: table_id={table_id}, root_ts={}, catalog_replay_start_ts={}, pending_index_ddl_reconciliation={pending}, catalog_next_index_no={}, root_next_index_no={}",
                         active_root.root_ts,
-                        self.catalog_replay_start_ts,
+                        self.timeline.catalog_replay_start_ts,
                         catalog_metadata.idx.next_index_no(),
                         active_root.metadata.idx.next_index_no()
                     ))
@@ -548,7 +367,8 @@ impl<'a> LogRecovery<'a> {
 
     fn cleanup_post_replay_absent_user_table_files(&self) -> Result<()> {
         let recovered_user_table_ids = self
-            .table_states
+            .timeline
+            .table_bounds
             .keys()
             .copied()
             .collect::<FastHashSet<_>>();
@@ -557,10 +377,12 @@ impl<'a> LogRecovery<'a> {
             .iter()
             .map(|item| item.table_id)
             .collect::<FastHashSet<_>>();
-        self.table_fs.cleanup_recovery_absent_user_table_files(
-            &recovered_user_table_ids,
-            &deferred_drop_table_ids,
-        )
+        self.resources
+            .table_fs
+            .cleanup_recovery_absent_user_table_files(
+                &recovered_user_table_ids,
+                &deferred_drop_table_ids,
+            )
     }
 
     async fn refresh_page(
@@ -569,9 +391,11 @@ impl<'a> LogRecovery<'a> {
         page_id: PageID,
     ) -> Result<()> {
         let mut page_guard = self
+            .resources
+            .buffers
             .mem_pool
             .get_page::<RowPage>(
-                self.pool_guards.mem_guard(),
+                self.resources.buffers.pool_guards.mem_guard(),
                 page_id,
                 LatchFallbackMode::Exclusive,
             )
@@ -611,16 +435,19 @@ impl<'a> LogRecovery<'a> {
                 // redo may load metadata from later durable index DDL. Recovery
                 // tracks that temporary gap until index-DDL redo reconciles catalog rows.
                 let metadata_matched = self
+                    .resources
                     .catalog
                     .reload_create_table(
-                        self.mem_pool.clone(),
-                        self.index_pool.clone(),
-                        &self.table_fs,
-                        self.disk_pool.clone(),
+                        self.resources.buffers.mem_pool.clone(),
+                        self.resources.buffers.index_pool.clone(),
+                        &self.resources.table_fs,
+                        self.resources.buffers.disk_pool.clone(),
                         *table_id,
                     )
                     .await?;
                 let state = self.track_loaded_table(*table_id).await?;
+                self.timeline
+                    .seed_recovered_cts(state.max_recovered_cts_seed());
                 let pending_index_ddl_reconciliation = !metadata_matched;
                 // Validate the root/create CTS relation before marking the table
                 // as pending, so impossible metadata divergence fails at the
@@ -640,22 +467,28 @@ impl<'a> LogRecovery<'a> {
                     return Ok(());
                 }
                 self.replay_catalog_modifications(dml).await?;
-                let removed = self.catalog.remove_user_table(*table_id).ok_or_else(|| {
-                    Error::from(
-                        Report::new(OperationError::TableNotFound)
-                            .attach(format!("replay drop table: table_id={table_id}")),
-                    )
-                })?;
+                let removed = self
+                    .resources
+                    .catalog
+                    .remove_user_table(*table_id)
+                    .ok_or_else(|| {
+                        Error::from(
+                            Report::new(OperationError::TableNotFound)
+                                .attach(format!("replay drop table: table_id={table_id}")),
+                        )
+                    })?;
                 let table = Arc::try_unwrap(removed).map_err(|table| {
                     Error::from(Report::new(OperationError::TableNotFound).attach(format!(
                         "replay drop table found stale runtime handle: table_id={table_id}, strong_count={}",
                         Arc::strong_count(&table)
                     )))
                 })?;
-                table.destroy_dropped_runtime(&self.pool_guards).await?;
+                table
+                    .destroy_dropped_runtime(&self.resources.buffers.pool_guards)
+                    .await?;
                 self.dropped_table_file_deletes
                     .push(DroppedTableFileDeleteItem::new(*table_id, cts));
-                self.table_states.remove(table_id);
+                self.timeline.table_bounds.remove(table_id);
                 self.recovered_tables.remove(table_id);
                 self.pending_index_ddl_reconciliations.remove(table_id);
             }
@@ -720,23 +553,32 @@ impl<'a> LogRecovery<'a> {
                 }
                 // Row page creation is guaranteed to be ordered in the redo log,
                 // so its safe to recreate it and the row id range must be identical.
-                let table = self.catalog.get_table(*table_id).await.ok_or_else(|| {
-                    Error::from(
-                        Report::new(OperationError::TableNotFound)
-                            .attach(format!("replay create row page: table_id={table_id}")),
-                    )
-                })?;
+                let table = self
+                    .resources
+                    .catalog
+                    .get_table(*table_id)
+                    .await
+                    .ok_or_else(|| {
+                        Error::from(
+                            Report::new(OperationError::TableNotFound)
+                                .attach(format!("replay create row page: table_id={table_id}")),
+                        )
+                    })?;
                 let count = *end_row_id - *start_row_id;
                 let mut page_guard = table
                     .mem
-                    .allocate_row_page_at(&self.pool_guards, count as usize, *page_id)
+                    .allocate_row_page_at(
+                        &self.resources.buffers.pool_guards,
+                        count as usize,
+                        *page_id,
+                    )
                     .await?;
                 // Here we switch row page to recover mode.
                 page_guard.bf_mut().init_recover_map(cts);
 
                 // Record recovered pages so we can recover indexes and refresh undo map at end.
                 // Note: we do not need to recover catalog tables because they are specially handled.
-                if self.catalog.is_user_table(*table_id) {
+                if self.resources.catalog.is_user_table(*table_id) {
                     self.recovered_tables
                         .entry(*table_id)
                         .or_default()
@@ -760,12 +602,17 @@ impl<'a> LogRecovery<'a> {
                 if cts < self.table_heap_redo_start_ts(*table_id)? {
                     return Ok(());
                 }
-                let _ = self.catalog.get_table(*table_id).await.ok_or_else(|| {
-                    Error::from(
-                        Report::new(OperationError::TableNotFound)
-                            .attach(format!("replay data checkpoint: table_id={table_id}")),
-                    )
-                })?;
+                let _ = self
+                    .resources
+                    .catalog
+                    .get_table(*table_id)
+                    .await
+                    .ok_or_else(|| {
+                        Error::from(
+                            Report::new(OperationError::TableNotFound)
+                                .attach(format!("replay data checkpoint: table_id={table_id}")),
+                        )
+                    })?;
             }
         }
         Ok(())
@@ -778,7 +625,7 @@ impl<'a> LogRecovery<'a> {
         index_no: u16,
         cts: TrxID,
     ) -> Result<IndexDdlRootProof> {
-        let table = self.catalog.get_table_now(table_id);
+        let table = self.resources.catalog.get_table_now(table_id);
         let active_root = table
             .as_ref()
             .map(|table| table.file().active_root_unchecked());
@@ -808,12 +655,16 @@ impl<'a> LogRecovery<'a> {
                 if !self.should_replay_catalog(cts) {
                     continue;
                 }
-                let table = self.catalog.get_catalog_table(table_id).ok_or_else(|| {
-                    Error::from(
-                        Report::new(OperationError::TableNotFound)
-                            .attach(format!("replay catalog DML: table_id={table_id}")),
-                    )
-                })?;
+                let table = self
+                    .resources
+                    .catalog
+                    .get_catalog_table(table_id)
+                    .ok_or_else(|| {
+                        Error::from(
+                            Report::new(OperationError::TableNotFound)
+                                .attach(format!("replay catalog DML: table_id={table_id}")),
+                        )
+                    })?;
                 self.replay_catalog_table_modifications(&table, &table_dml.rows)
                     .await?;
                 continue;
@@ -826,12 +677,17 @@ impl<'a> LogRecovery<'a> {
             if cts < self.table_replay_start_ts(table_id)? {
                 continue;
             }
-            let table = self.catalog.get_table(table_id).await.ok_or_else(|| {
-                Error::from(
-                    Report::new(OperationError::TableNotFound)
-                        .attach(format!("replay user table DML: table_id={table_id}")),
-                )
-            })?;
+            let table = self
+                .resources
+                .catalog
+                .get_table(table_id)
+                .await
+                .ok_or_else(|| {
+                    Error::from(
+                        Report::new(OperationError::TableNotFound)
+                            .attach(format!("replay user table DML: table_id={table_id}")),
+                    )
+                })?;
             self.replay_table_dml(table_id, &table, &table_dml.rows, cts)
                 .await?;
         }
@@ -845,11 +701,15 @@ impl<'a> LogRecovery<'a> {
         dml: BTreeMap<TableID, TableDML>,
     ) -> Result<()> {
         for (table_id, table_dml) in dml {
-            let table = self.catalog.get_catalog_table(table_id).ok_or_else(|| {
-                Error::from(Report::new(OperationError::TableNotFound).attach(format!(
-                    "replay catalog table modifications: table_id={table_id}"
-                )))
-            })?;
+            let table = self
+                .resources
+                .catalog
+                .get_catalog_table(table_id)
+                .ok_or_else(|| {
+                    Error::from(Report::new(OperationError::TableNotFound).attach(format!(
+                        "replay catalog table modifications: table_id={table_id}"
+                    )))
+                })?;
             self.replay_catalog_table_modifications(&table, &table_dml.rows)
                 .await?;
         }
@@ -864,10 +724,14 @@ impl<'a> LogRecovery<'a> {
         for row in rows.values() {
             match &row.kind {
                 RowRedoKind::Insert(vals) => {
-                    table.insert_no_trx(&self.pool_guards, vals).await?;
+                    table
+                        .insert_no_trx(&self.resources.buffers.pool_guards, vals)
+                        .await?;
                 }
                 RowRedoKind::DeleteByUniqueKey(key) => {
-                    table.delete_unique_no_trx(&self.pool_guards, key).await?;
+                    table
+                        .delete_unique_no_trx(&self.resources.buffers.pool_guards, key)
+                        .await?;
                 }
                 RowRedoKind::Delete | RowRedoKind::Update(_) => {
                     // updates of catalog are implemented as DeleteByUniqueKey and Insert.
@@ -895,7 +759,13 @@ impl<'a> LogRecovery<'a> {
                         continue;
                     }
                     table
-                        .recover_row_insert(&self.pool_guards, row.page_id, row.row_id, vals, cts)
+                        .recover_row_insert(
+                            &self.resources.buffers.pool_guards,
+                            row.page_id,
+                            row.row_id,
+                            vals,
+                            cts,
+                        )
                         .await?;
                 }
                 RowRedoKind::Update(vals) => {
@@ -903,7 +773,13 @@ impl<'a> LogRecovery<'a> {
                         continue;
                     }
                     table
-                        .recover_row_update(&self.pool_guards, row.page_id, row.row_id, vals, cts)
+                        .recover_row_update(
+                            &self.resources.buffers.pool_guards,
+                            row.page_id,
+                            row.row_id,
+                            vals,
+                            cts,
+                        )
                         .await?;
                 }
                 RowRedoKind::Delete => {
@@ -915,7 +791,12 @@ impl<'a> LogRecovery<'a> {
                         continue;
                     }
                     table
-                        .recover_row_delete(&self.pool_guards, row.page_id, row.row_id, cts)
+                        .recover_row_delete(
+                            &self.resources.buffers.pool_guards,
+                            row.page_id,
+                            row.row_id,
+                            cts,
+                        )
                         .await?;
                 }
                 RowRedoKind::DeleteByUniqueKey(_) => {
@@ -928,11 +809,38 @@ impl<'a> LogRecovery<'a> {
     }
 }
 
+#[inline]
+fn validate_create_table_reloaded_root_ts(
+    table_id: TableID,
+    create_table_cts: TrxID,
+    state: TableReplayBounds,
+    pending_index_ddl_reconciliation: bool,
+) -> Result<()> {
+    // Create-table redo reopens the latest table root. The initial create root
+    // is published before the catalog commit and therefore carries the create
+    // transaction STS, which can predate the create-table redo CTS. A metadata
+    // mismatch accepted by reload still requires a later root publication so
+    // recovery can prove pending index-DDL metadata has a durable table root.
+    if pending_index_ddl_reconciliation && state.root_ts <= create_table_cts {
+        return Err(Report::new(DataIntegrityError::InvalidRootInvariant)
+            .attach(format!(
+                "create-table pending index-DDL reconciliation requires later table root: table_id={table_id}, root_ts={}, create_table_cts={create_table_cts}",
+                state.root_ts
+            ))
+            .into());
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum UserTableRedoAction {
+    Replay,
+    SkipCheckpointCoveredUnknownTable,
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{
-        LogRecovery, RecoverMap, RecoveryTableState, validate_create_table_reloaded_root_ts,
-    };
+    use super::{RecoveryCoordinator, validate_create_table_reloaded_root_ts};
     use crate::buffer::PoolRole;
     use crate::catalog::{
         ActiveIndexSpec, ColumnAttributes, ColumnSpec, IndexAttributes, IndexColumnObject,
@@ -953,6 +861,7 @@ mod tests {
         RedoSuperBlock, serialize_redo_super_block, slot_offset,
     };
     use crate::log::redo::{DDLRedo, RedoHeader, RedoLogs, RedoTrxKind, RowRedo, RowRedoKind};
+    use crate::recovery::{RecoveryBuffers, RecoveryResources, RowRecoveryMap, TableReplayBounds};
     use crate::row::RowRead;
     use crate::row::ops::{DeleteMvcc, SelectKey, SelectMvcc, UpdateCol, UpdateMvcc};
     use crate::serde::Ser;
@@ -1145,24 +1054,23 @@ mod tests {
     fn log_recovery_for_engine<'a>(
         engine: &'a crate::engine::Engine,
         catalog_replay_start_ts: TrxID,
-    ) -> LogRecovery<'a> {
-        let mut recovery = LogRecovery::new(
-            &engine.inner().meta_pool,
+    ) -> RecoveryCoordinator<'a> {
+        let buffers = RecoveryBuffers::new(
+            engine.inner().meta_pool.clone_inner(),
             engine.inner().index_pool.clone_inner(),
             engine.inner().mem_pool.clone_inner(),
-            engine.inner().table_fs.clone(),
             engine.inner().disk_pool.clone_inner(),
-            engine.catalog(),
-            engine
-                .inner()
-                .trx_sys
-                .config
-                .redo_log_startup()
-                .unwrap()
-                .replayer,
         );
-        recovery.catalog_replay_start_ts = catalog_replay_start_ts;
-        recovery.replay_floor = MIN_SNAPSHOT_TS;
+        let resources =
+            RecoveryResources::new(buffers, engine.inner().table_fs.clone(), engine.catalog());
+        let (mut recovery, _initializer) = engine
+            .inner()
+            .trx_sys
+            .config
+            .prepare_recovery(resources)
+            .unwrap();
+        recovery.timeline.catalog_replay_start_ts = catalog_replay_start_ts;
+        recovery.timeline.replay_floor = MIN_SNAPSHOT_TS;
         recovery
     }
 
@@ -1523,7 +1431,7 @@ mod tests {
 
     #[test]
     fn test_recover_map_tracks_create_cts_and_entries() {
-        let mut map = RecoverMap::new(TrxID::new(7));
+        let mut map = RowRecoveryMap::new(TrxID::new(7));
         assert_eq!(map.create_cts(), TrxID::new(7));
         assert!(map.is_vacant(0));
 
@@ -1540,14 +1448,14 @@ mod tests {
 
     #[test]
     fn test_recovery_table_state_replay_start_uses_heap_and_deletion_floor() {
-        let heap_first = RecoveryTableState {
+        let heap_first = TableReplayBounds {
             root_ts: TrxID::new(5),
             heap_redo_start_ts: TrxID::new(7),
             deletion_cutoff_ts: TrxID::new(11),
         };
         assert_eq!(heap_first.replay_start_ts(), TrxID::new(7));
 
-        let deletion_first = RecoveryTableState {
+        let deletion_first = TableReplayBounds {
             root_ts: TrxID::new(17),
             heap_redo_start_ts: TrxID::new(19),
             deletion_cutoff_ts: TrxID::new(13),
@@ -1557,7 +1465,7 @@ mod tests {
 
     #[test]
     fn test_create_table_root_ts_validation_accepts_initial_sts_root() {
-        let root_before_create = RecoveryTableState {
+        let root_before_create = TableReplayBounds {
             root_ts: TrxID::new(9),
             heap_redo_start_ts: TrxID::new(9),
             deletion_cutoff_ts: TrxID::new(9),
@@ -1570,7 +1478,7 @@ mod tests {
         )
         .unwrap();
 
-        let pending_without_later_root = RecoveryTableState {
+        let pending_without_later_root = TableReplayBounds {
             root_ts: TrxID::new(10),
             heap_redo_start_ts: TrxID::new(10),
             deletion_cutoff_ts: TrxID::new(10),
@@ -1590,7 +1498,7 @@ mod tests {
         assert!(report.contains("requires later table root"), "{report}");
         assert!(report.contains("root_ts=10"), "{report}");
 
-        let pending_with_later_root = RecoveryTableState {
+        let pending_with_later_root = TableReplayBounds {
             root_ts: TrxID::new(11),
             heap_redo_start_ts: TrxID::new(10),
             deletion_cutoff_ts: TrxID::new(10),

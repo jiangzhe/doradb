@@ -43,3 +43,11 @@ When a backlog item is moved to `docs/backlogs/closed/`, append:
 - Reference: <task/issue/pr reference>
 - Closed At: <YYYY-MM-DD>
 ```
+
+## Close Reason
+
+- Type: implemented
+- Detail: Implemented by docs/tasks/000183-recovery-module-restructure.md
+- Closed By: backlog close
+- Reference: docs/tasks/000183-recovery-module-restructure.md
+- Closed At: 2026-06-19
