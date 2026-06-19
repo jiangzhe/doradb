@@ -8,6 +8,10 @@ use crate::quiescent::QuiescentGuard;
 /// Buffer pools and stable pool guards used throughout recovery.
 pub(crate) struct RecoveryBuffers {
     /// Metadata buffer pool used for checkpointed catalog storage.
+    #[expect(
+        dead_code,
+        reason = "retained to keep the metadata pool alive during recovery"
+    )]
     pub(crate) meta_pool: QuiescentGuard<FixedBufferPool>,
     /// Mutable secondary-index buffer pool used while rebuilding hot indexes.
     pub(crate) index_pool: QuiescentGuard<EvictableBufferPool>,
@@ -46,7 +50,6 @@ impl RecoveryBuffers {
     /// Return the shared guard bundle.
     #[inline]
     pub(crate) fn pool_guards(&self) -> &PoolGuards {
-        let _keepalive = &self.meta_pool;
         &self.pool_guards
     }
 }
