@@ -715,6 +715,11 @@ fn begin_drop_metadata_active_err(table_id: TableID) -> Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::id::TrxID;
+    use crate::table::tests::*;
+    use crate::table::{CheckpointOutcome, CheckpointReadiness};
+    use crate::value::Val;
+    use tempfile::TempDir;
 
     const TABLE_ID: TableID = TableID::new(42);
 
@@ -901,6 +906,183 @@ mod tests {
             drop(metadata_fut);
             drop(root_lease);
             let _root_lease = lifecycle.try_begin_checkpoint_root_mutation().unwrap();
+        });
+    }
+
+    #[test]
+    fn test_foreground_lifecycle_rejects_dropping_and_dropped_handles() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine = lightweight_test_engine(&temp_dir, "redo_testsys_lightweight").await;
+            let table_id = create_table2_for_test(&engine).await;
+            let mut session = engine.new_session().unwrap();
+            insert_one_row(
+                table_id,
+                &mut session,
+                vec![Val::from(1), Val::from("lifecycle")],
+            )
+            .await;
+
+            let table = table_for_internal_assertion(&engine, table_id);
+            table.begin_drop_lifecycle().await.unwrap();
+
+            let mut read_trx = session.begin_trx().unwrap();
+            let err = trx_select_row_mvcc_by_id(&mut read_trx, table_id, &single_key(1), &[0, 1])
+                .await
+                .unwrap_err();
+            assert_eq!(err.operation_error(), Some(OperationError::TableDropping));
+            assert_eq!(read_trx.commit().await.unwrap(), TrxID::new(0));
+
+            let mut write_trx = session.begin_trx().unwrap();
+            let err = trx_insert_row_by_id(
+                &mut write_trx,
+                table_id,
+                vec![Val::from(2), Val::from("blocked")],
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(err.operation_error(), Some(OperationError::TableDropping));
+            assert_eq!(write_trx.commit().await.unwrap(), TrxID::new(0));
+
+            table.mark_dropped_lifecycle().unwrap();
+
+            let mut dropped_read = session.begin_trx().unwrap();
+            let err =
+                trx_select_row_mvcc_by_id(&mut dropped_read, table_id, &single_key(1), &[0, 1])
+                    .await
+                    .unwrap_err();
+            assert_eq!(err.operation_error(), Some(OperationError::TableNotFound));
+            assert_eq!(dropped_read.commit().await.unwrap(), TrxID::new(0));
+
+            let mut dropped_write = session.begin_trx().unwrap();
+            let err = trx_insert_row_by_id(
+                &mut dropped_write,
+                table_id,
+                vec![Val::from(3), Val::from("dropped")],
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(err.operation_error(), Some(OperationError::TableNotFound));
+            assert_eq!(dropped_write.commit().await.unwrap(), TrxID::new(0));
+        });
+    }
+
+    #[test]
+    fn test_table_drop_gate_waits_for_checkpoint_publish_lease() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine = lightweight_test_engine(&temp_dir, "redo_testsys_lightweight").await;
+            let table_id = create_table2_for_test(&engine).await;
+            let table = table_for_internal_assertion(&engine, table_id);
+            let _root_lease = table.try_begin_checkpoint_root_mutation().unwrap();
+            let publish_lease = table.try_begin_checkpoint_publish().unwrap();
+            let mut drop_fut = Box::pin(table.begin_drop_lifecycle());
+
+            assert!(matches!(
+                futures::poll!(drop_fut.as_mut()),
+                std::task::Poll::Pending
+            ));
+            assert_eq!(table.lifecycle.state(), TableLifecycleState::Dropping);
+            match table.try_begin_checkpoint_publish() {
+                Ok(_lease) => panic!("publish lease should be blocked by drop gate"),
+                Err(reason) => assert_eq!(reason, CheckpointCancelReason::TableDropping),
+            }
+
+            drop(publish_lease);
+            drop_fut.await.unwrap();
+            assert_eq!(table.lifecycle.state(), TableLifecycleState::Dropping);
+        });
+    }
+
+    #[test]
+    fn test_checkpoint_cancelled_when_table_dropping() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine = lightweight_test_engine(&temp_dir, "redo_testsys_lightweight").await;
+            let table_id = create_table2_for_test(&engine).await;
+            let mut session = engine.new_session().unwrap();
+            let table = table_for_internal_assertion(&engine, table_id);
+            let root_before = table.file().active_root_unchecked().clone();
+
+            wait_checkpoint_ready(table_id, &session).await;
+            table_for_internal_assertion(&engine, table_id)
+                .begin_drop_lifecycle()
+                .await
+                .unwrap();
+            let outcome = session.checkpoint_table(table_id).await.unwrap();
+            assert_eq!(
+                outcome,
+                CheckpointOutcome::Cancelled {
+                    reason: CheckpointCancelReason::TableDropping
+                }
+            );
+            assert_root_metadata_unchanged(
+                &root_before,
+                &table_for_internal_assertion(&engine, table_id),
+            );
+            assert!(!session.in_trx().unwrap());
+        });
+    }
+
+    #[test]
+    fn test_checkpoint_cancelled_when_table_dropping_before_delayed_readiness() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine =
+                evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys").await;
+            let table_id = create_table2_for_test(&engine).await;
+            let mut session = engine.new_session().unwrap();
+            insert_rows(table_id, &mut session, 0, 120, "dropping-before-delay").await;
+            session.freeze_table(table_id, usize::MAX).await.unwrap();
+
+            let mut reader_session = engine.new_session().unwrap();
+            let reader = reader_session.begin_trx().unwrap();
+            checkpoint_published(table_id, &mut session).await;
+            assert!(matches!(
+                session.table_checkpoint_readiness(table_id).unwrap(),
+                CheckpointReadiness::Delayed { .. }
+            ));
+
+            let table = table_for_internal_assertion(&engine, table_id);
+            let root_before = table.file().active_root_unchecked().clone();
+            table.begin_drop_lifecycle().await.unwrap();
+
+            let outcome = session.checkpoint_table(table_id).await.unwrap();
+            assert_eq!(
+                outcome,
+                CheckpointOutcome::Cancelled {
+                    reason: CheckpointCancelReason::TableDropping
+                }
+            );
+            assert_root_metadata_unchanged(&root_before, &table);
+            assert!(!session.in_trx().unwrap());
+
+            reader.commit().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn test_checkpoint_cancelled_when_table_lifecycle_dropped() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine = lightweight_test_engine(&temp_dir, "redo_testsys_lightweight").await;
+            let table_id = create_table2_for_test(&engine).await;
+            let mut session = engine.new_session().unwrap();
+            let table = table_for_internal_assertion(&engine, table_id);
+            let root_before = table.file().active_root_unchecked().clone();
+
+            table.begin_drop_lifecycle().await.unwrap();
+            table.mark_dropped_lifecycle().unwrap();
+
+            let outcome = session.checkpoint_table(table_id).await.unwrap();
+            assert_eq!(
+                outcome,
+                CheckpointOutcome::Cancelled {
+                    reason: CheckpointCancelReason::TableDropped
+                }
+            );
+            assert_root_metadata_unchanged(&root_before, &table);
+            assert!(!session.in_trx().unwrap());
         });
     }
 }

@@ -159,8 +159,11 @@ pub(crate) struct RetiredSecondaryIndex {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::buffer::{BufferPool, PoolGuards, PoolRole};
     use crate::catalog::{ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey, IndexSpec};
+    use crate::table::tests::*;
     use crate::value::ValKind;
+    use tempfile::TempDir;
 
     fn metadata_without_indexes() -> Arc<TableMetadata> {
         Arc::new(
@@ -225,5 +228,128 @@ mod tests {
         };
 
         assert!(err.is_kind(crate::error::ErrorKind::Internal), "{err:?}");
+    }
+
+    #[test]
+    fn test_runtime_layout_install_retires_removed_index_after_old_snapshot_drops() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine = lightweight_test_engine(&temp_dir, "redo_testsys_lightweight").await;
+            let table_id = create_table2_for_test(&engine).await;
+            let old_layout = table_for_internal_assertion(&engine, table_id).layout_snapshot();
+            assert_eq!(old_layout.metadata().idx.active_index_count(), 1);
+
+            let metadata_without_indexes = Arc::new(
+                TableMetadata::try_new_with_next_index_no(
+                    vec![
+                        ColumnSpec::new("id", ValKind::I32, ColumnAttributes::empty()),
+                        ColumnSpec::new("name", ValKind::VarByte, ColumnAttributes::empty()),
+                    ],
+                    vec![],
+                    old_layout.metadata().idx.next_index_no(),
+                )
+                .unwrap(),
+            );
+            let mut inactive_slots: Vec<Option<Arc<SecondaryIndex<EvictableBufferPool>>>> =
+                Vec::with_capacity(old_layout.index_slot_count());
+            inactive_slots.resize_with(old_layout.index_slot_count(), || None);
+            let new_layout = TableRuntimeLayout::new(
+                old_layout.generation() + 1,
+                metadata_without_indexes,
+                inactive_slots.into_boxed_slice(),
+            )
+            .unwrap();
+
+            let installed = table_for_internal_assertion(&engine, table_id)
+                .install_runtime_layout(old_layout.generation(), new_layout)
+                .unwrap();
+            assert_eq!(old_layout.metadata().idx.active_index_count(), 1);
+            assert_eq!(installed.metadata().idx.active_index_count(), 0);
+            assert_eq!(
+                installed.metadata().idx.next_index_no(),
+                old_layout.metadata().idx.next_index_no()
+            );
+            assert_eq!(
+                installed.metadata().idx.index_slot_count(),
+                old_layout.metadata().idx.index_slot_count()
+            );
+            assert_eq!(installed.index_slot_count(), old_layout.index_slot_count());
+            assert!(installed.secondary_indexes()[0].is_none());
+            assert_eq!(
+                table_for_internal_assertion(&engine, table_id)
+                    .metadata()
+                    .idx
+                    .active_index_count(),
+                0
+            );
+            assert!(
+                table_for_internal_assertion(&engine, table_id).has_retired_secondary_indexes()
+            );
+
+            let guards = PoolGuards::builder()
+                .push(PoolRole::Index, engine.inner().index_pool.pool_guard())
+                .build();
+            assert_eq!(
+                table_for_internal_assertion(&engine, table_id)
+                    .cleanup_retired_secondary_indexes(&guards)
+                    .await
+                    .unwrap(),
+                0
+            );
+            drop(old_layout);
+            assert_eq!(
+                table_for_internal_assertion(&engine, table_id)
+                    .cleanup_retired_secondary_indexes(&guards)
+                    .await
+                    .unwrap(),
+                1
+            );
+            assert!(
+                !table_for_internal_assertion(&engine, table_id).has_retired_secondary_indexes()
+            );
+        })
+    }
+
+    #[test]
+    fn test_runtime_layout_install_rejects_shrinking_index_slots() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine = lightweight_test_engine(&temp_dir, "redo_testsys_lightweight").await;
+            let table_id = create_table2_for_test(&engine).await;
+            let old_layout = table_for_internal_assertion(&engine, table_id).layout_snapshot();
+            assert_eq!(old_layout.index_slot_count(), 1);
+
+            let shrinking_metadata = Arc::new(
+                TableMetadata::try_new(
+                    vec![
+                        ColumnSpec::new("id", ValKind::I32, ColumnAttributes::empty()),
+                        ColumnSpec::new("name", ValKind::VarByte, ColumnAttributes::empty()),
+                    ],
+                    vec![],
+                )
+                .expect("valid table metadata"),
+            );
+            let shrinking_layout = TableRuntimeLayout::new(
+                old_layout.generation() + 1,
+                shrinking_metadata,
+                Vec::<Option<Arc<SecondaryIndex<EvictableBufferPool>>>>::new().into_boxed_slice(),
+            )
+            .unwrap();
+
+            let result = table_for_internal_assertion(&engine, table_id)
+                .install_runtime_layout(old_layout.generation(), shrinking_layout);
+            assert!(result.is_err());
+            let err = result.err().unwrap();
+            assert!(
+                format!("{err:?}").contains("new layout must not shrink sparse index slots"),
+                "{err:?}"
+            );
+            assert_eq!(
+                table_for_internal_assertion(&engine, table_id)
+                    .layout_snapshot()
+                    .generation(),
+                old_layout.generation()
+            );
+        })
     }
 }

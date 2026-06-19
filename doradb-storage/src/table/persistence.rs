@@ -685,7 +685,7 @@ impl Table {
         // fork, so no secondary root can be published on its own.
         #[cfg(test)]
         {
-            if super::tests::test_force_secondary_sidecar_error_enabled() {
+            if test_hooks::test_force_secondary_sidecar_error_enabled() {
                 return Err(Report::new(InternalError::InjectedTestFailure).into());
             }
         }
@@ -959,7 +959,7 @@ impl Table {
         let table_writes = session.engine.table_fs.background_writes().clone();
         let pool_guards = session.pool_guards();
         #[cfg(test)]
-        super::tests::run_test_checkpoint_after_readiness_hook().await;
+        test_hooks::run_test_checkpoint_after_readiness_hook().await;
         let root_mutation_lease = match self.try_begin_checkpoint_root_mutation() {
             Ok(lease) => lease,
             Err(reason) => return Ok(CheckpointOutcome::Cancelled { reason }),
@@ -995,7 +995,7 @@ impl Table {
         let mut trx = session.begin_trx("checkpoint table")?;
         let checkpoint_ts = trx.sts();
         #[cfg(test)]
-        super::tests::run_test_checkpoint_after_trx_start_hook().await;
+        test_hooks::run_test_checkpoint_after_trx_start_hook().await;
         if !frozen_pages.is_empty() {
             self.set_frozen_pages_to_transition(&pool_guards, &frozen_pages, cutoff_ts)
                 .await?;
@@ -1144,7 +1144,7 @@ impl Table {
             .update_column_root(published_pivot_row_id, published_column_root)
             .await;
         #[cfg(test)]
-        if super::tests::test_force_post_publish_checkpoint_error_enabled() {
+        if test_hooks::test_force_post_publish_checkpoint_error_enabled() {
             let poison = trx_sys.poison_storage(FatalError::CheckpointWrite);
             crate::trx::tests::discard_transaction_after_fatal_rollback(&mut trx);
             return Err(poison.into());
@@ -1161,8 +1161,122 @@ impl Table {
 }
 
 #[cfg(test)]
+pub(crate) mod test_hooks {
+    use std::cell::{Cell, RefCell};
+    use std::future::Future;
+    use std::pin::Pin;
+
+    type TableHook = Box<dyn FnOnce() -> Pin<Box<dyn Future<Output = ()> + 'static>> + 'static>;
+
+    thread_local! {
+        static TEST_FORCE_SECONDARY_SIDECAR_ERROR: Cell<bool> = const { Cell::new(false) };
+        static TEST_FORCE_POST_PUBLISH_CHECKPOINT_ERROR: Cell<bool> = const { Cell::new(false) };
+        static TEST_CHECKPOINT_AFTER_READINESS_HOOK: RefCell<Option<TableHook>> =
+            const { RefCell::new(None) };
+        static TEST_CHECKPOINT_AFTER_TRX_START_HOOK: RefCell<Option<TableHook>> =
+            const { RefCell::new(None) };
+    }
+
+    pub(crate) fn set_test_force_secondary_sidecar_error(enabled: bool) {
+        TEST_FORCE_SECONDARY_SIDECAR_ERROR.with(|flag| flag.set(enabled));
+    }
+
+    pub(super) fn test_force_secondary_sidecar_error_enabled() -> bool {
+        TEST_FORCE_SECONDARY_SIDECAR_ERROR.with(|flag| flag.get())
+    }
+
+    pub(crate) fn set_test_force_post_publish_checkpoint_error(enabled: bool) {
+        TEST_FORCE_POST_PUBLISH_CHECKPOINT_ERROR.with(|flag| flag.set(enabled));
+    }
+
+    pub(crate) struct ForcePostPublishCheckpointErrorGuard;
+
+    impl ForcePostPublishCheckpointErrorGuard {
+        pub(crate) fn new() -> Self {
+            set_test_force_post_publish_checkpoint_error(true);
+            Self
+        }
+    }
+
+    impl Drop for ForcePostPublishCheckpointErrorGuard {
+        fn drop(&mut self) {
+            set_test_force_post_publish_checkpoint_error(false);
+        }
+    }
+
+    pub(super) fn test_force_post_publish_checkpoint_error_enabled() -> bool {
+        TEST_FORCE_POST_PUBLISH_CHECKPOINT_ERROR.with(|flag| flag.get())
+    }
+
+    pub(crate) fn set_test_checkpoint_after_readiness_hook<F, Fut>(hook: F)
+    where
+        F: FnOnce() -> Fut + 'static,
+        Fut: Future<Output = ()> + 'static,
+    {
+        TEST_CHECKPOINT_AFTER_READINESS_HOOK.with(|slot| {
+            let old = slot
+                .borrow_mut()
+                .replace(Box::new(move || Box::pin(hook())));
+            assert!(old.is_none(), "checkpoint readiness hook already installed");
+        });
+    }
+
+    pub(crate) fn set_test_checkpoint_after_trx_start_hook<F, Fut>(hook: F)
+    where
+        F: FnOnce() -> Fut + 'static,
+        Fut: Future<Output = ()> + 'static,
+    {
+        TEST_CHECKPOINT_AFTER_TRX_START_HOOK.with(|slot| {
+            let old = slot
+                .borrow_mut()
+                .replace(Box::new(move || Box::pin(hook())));
+            assert!(
+                old.is_none(),
+                "checkpoint transaction-start hook already installed"
+            );
+        });
+    }
+
+    pub(super) async fn run_test_checkpoint_after_readiness_hook() {
+        let hook = TEST_CHECKPOINT_AFTER_READINESS_HOOK.with(|slot| slot.borrow_mut().take());
+        if let Some(hook) = hook {
+            hook().await;
+        }
+    }
+
+    pub(super) async fn run_test_checkpoint_after_trx_start_hook() {
+        let hook = TEST_CHECKPOINT_AFTER_TRX_START_HOOK.with(|slot| slot.borrow_mut().take());
+        if let Some(hook) = hook {
+            hook().await;
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
+    use crate::buffer::BufferPool;
+    use crate::file::cow_file::tests::old_root_drop_count;
+    use crate::index::{RowLocation, UniqueIndex};
+    use crate::io::install_storage_backend_test_hook;
+    use crate::row::ops::{SelectKey, SelectMvcc};
+    use crate::session::{Session, tests::SessionTestExt};
+    use crate::table::DeleteMarker;
+    use crate::table::persistence::test_hooks::{
+        ForcePostPublishCheckpointErrorGuard, set_test_checkpoint_after_readiness_hook,
+        set_test_checkpoint_after_trx_start_hook, set_test_force_secondary_sidecar_error,
+    };
+    use crate::table::test_hooks::set_test_force_lwc_build_error;
+    use crate::table::tests::*;
+    use crate::trx::Transaction;
+    use crate::trx::stmt::tests as stmt_tests;
+    use crate::trx::ver_map::RowPageState;
+    use futures::FutureExt;
+    use std::cell::{Cell, RefCell};
+    use std::rc::Rc;
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tempfile::TempDir;
 
     #[test]
     fn test_unique_sidecar_normalize_keeps_latest_put_and_suppresses_delete() {
@@ -1238,5 +1352,1716 @@ mod tests {
         };
         assert_eq!(inserts, vec![b"a".to_vec()]);
         assert_eq!(deletes, vec![b"b".to_vec(), b"c".to_vec()]);
+    }
+
+    #[test]
+    fn test_checkpoint_persists_committed_cold_delete_markers() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine =
+                evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys").await;
+            let table_id = create_table2_for_test(&engine).await;
+            let mut session = engine.new_session().unwrap();
+            insert_rows(table_id, &mut session, 0, 10, "name").await;
+            session.freeze_table(table_id, usize::MAX).await.unwrap();
+            checkpoint_published(table_id, &mut session).await;
+
+            let key = single_key(6i32);
+            let reader = session.begin_trx().unwrap();
+            let table = table_for_internal_assertion(&engine, table_id);
+            let row_id =
+                assert_row_in_lwc(&table, &session.pool_guards(), &key, reader.sts()).await;
+            reader.commit().await.unwrap();
+
+            expect_delete_committed(table_id, &mut session, &key).await;
+            let marker = table.deletion_buffer().get(row_id).unwrap();
+            let marker_ts = delete_marker_ts(marker);
+            wait_gc_cutoff_after(&session, marker_ts).await;
+            let pool_guards = session.pool_guards();
+            let snapshot_before = column_block_index_snapshot(&engine, table_id);
+            let index_before = snapshot_before.index(pool_guards.disk_guard());
+            let entry_before = index_before
+                .locate_block(row_id)
+                .await
+                .unwrap()
+                .expect("persisted entry should exist before delete checkpoint");
+
+            checkpoint_published(table_id, &mut session).await;
+
+            let pool_guards = session.pool_guards();
+            let snapshot = column_block_index_snapshot(&engine, table_id);
+            let active_root = &snapshot.active_root;
+            let index = snapshot.index(pool_guards.disk_guard());
+            let entry = index
+                .locate_block(row_id)
+                .await
+                .unwrap()
+                .expect("persisted entry should exist");
+            assert!(active_root.deletion_cutoff_ts > marker_ts);
+            assert_eq!(entry.block_id(), entry_before.block_id());
+            assert_eq!(entry.end_row_id(), entry_before.end_row_id());
+            assert_eq!(entry.row_id_span(), entry_before.row_id_span());
+            assert_eq!(entry.row_count(), entry_before.row_count());
+            let deltas = index.load_delete_deltas(&entry).await.unwrap();
+            let expected_delta = (row_id - entry.start_row_id) as u32;
+            assert!(deltas.contains(&expected_delta));
+        });
+    }
+
+    #[test]
+    fn test_checkpoint_publishes_unique_secondary_disk_tree_root() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine =
+                evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys").await;
+            let table_id = create_table2_for_test(&engine).await;
+            let mut session = engine.new_session().unwrap();
+            insert_rows(table_id, &mut session, 0, 3, "name").await;
+
+            session.freeze_table(table_id, usize::MAX).await.unwrap();
+            checkpoint_published(table_id, &mut session).await;
+
+            let active_root = table_for_internal_assertion(&engine, table_id)
+                .file()
+                .active_root_unchecked()
+                .clone();
+            assert_ne!(active_root.secondary_index_roots[0], SUPER_BLOCK_ID);
+            let reader = session.begin_trx().unwrap();
+            for key_value in 0..3 {
+                let key = single_key(key_value);
+                let row_id = assert_row_in_lwc(
+                    &table_for_internal_assertion(&engine, table_id),
+                    &session.pool_guards(),
+                    &key,
+                    reader.sts(),
+                )
+                .await;
+                assert_eq!(
+                    unique_disk_tree_lookup(
+                        &table_for_internal_assertion(&engine, table_id),
+                        &session.pool_guards(),
+                        &key
+                    )
+                    .await,
+                    Some(row_id)
+                );
+            }
+            reader.commit().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn test_trx_read_proof_root_snapshot_captures_active_root() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine =
+                evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys").await;
+            let table_id = create_table2_for_test(&engine).await;
+            let mut session = engine.new_session().unwrap();
+
+            let mut trx = session.begin_trx().unwrap();
+            for id in 0..8 {
+                trx = expect_trx_insert(
+                    table_id,
+                    trx,
+                    vec![Val::from(id), Val::from(format!("v{id}").as_str())],
+                )
+                .await;
+            }
+            trx.commit().await.unwrap();
+            checkpoint_published(table_id, &mut session).await;
+
+            let mut trx = session.begin_trx().unwrap();
+            trx.exec(async |stmt| {
+                let (rt, effects) = stmt_tests::runtime_and_effects_mut(stmt);
+                let proof = rt.read_proof();
+                let snapshot = table_for_internal_assertion(&engine, table_id)
+                    .root_snapshot(&proof)
+                    .unwrap();
+                let _effects_addr = effects as *mut _;
+                table_for_internal_assertion(&engine, table_id).with_active_root(
+                    &proof,
+                    |active_root| {
+                        assert_eq!(snapshot.root_ts(), active_root.root_ts);
+                        assert_eq!(snapshot.pivot_row_id(), active_root.pivot_row_id);
+                        assert_eq!(
+                            snapshot.column_block_index_root(),
+                            active_root.column_block_index_root
+                        );
+                        assert_eq!(
+                            snapshot.deletion_cutoff_ts(),
+                            active_root.deletion_cutoff_ts
+                        );
+                        assert_eq!(
+                            snapshot.secondary_index_root(0).unwrap(),
+                            active_root.secondary_index_roots[0]
+                        );
+                        assert_eq!(
+                            snapshot.root_is_visible_to(rt.sts()),
+                            active_root.effective_ts() < rt.sts()
+                        );
+                    },
+                );
+                Ok(())
+            })
+            .await
+            .unwrap();
+            trx.rollback().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn test_checkpoint_publishes_non_unique_secondary_disk_tree_entries_across_lwc_splits() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine =
+                evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys_non_unique")
+                    .await;
+            let table_id = create_non_unique_name_table_for_test(&engine).await;
+            let mut session = engine.new_session().unwrap();
+            let name = "split-name-".repeat(120);
+            let row_count = 80;
+            insert_rows(table_id, &mut session, 0, row_count, &name).await;
+
+            session.freeze_table(table_id, usize::MAX).await.unwrap();
+            checkpoint_published(table_id, &mut session).await;
+
+            let name_key = name_key(&name);
+            let table = table_for_internal_assertion(&engine, table_id);
+            let row_ids =
+                non_unique_disk_tree_prefix_scan(&table, &session.pool_guards(), &name_key).await;
+            assert_eq!(row_ids.len(), row_count as usize);
+
+            let first_key = single_key(0i32);
+            let last_key = single_key(row_count - 1);
+            let first_row_id = unique_disk_tree_lookup(&table, &session.pool_guards(), &first_key)
+                .await
+                .unwrap();
+            let last_row_id = unique_disk_tree_lookup(&table, &session.pool_guards(), &last_key)
+                .await
+                .unwrap();
+            let pool_guards = session.pool_guards();
+            let snapshot = column_block_index_snapshot(&engine, table_id);
+            let column_index = snapshot.index(pool_guards.disk_guard());
+            let first_entry = column_index
+                .locate_block(first_row_id)
+                .await
+                .unwrap()
+                .unwrap();
+            let last_entry = column_index
+                .locate_block(last_row_id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_ne!(first_entry.block_id(), last_entry.block_id());
+        });
+    }
+
+    #[test]
+    fn test_deletion_checkpoint_updates_secondary_disk_tree_roots() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine =
+                evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys_non_unique")
+                    .await;
+            let table_id = create_non_unique_name_table_for_test(&engine).await;
+            let mut session = engine.new_session().unwrap();
+            insert_rows(table_id, &mut session, 0, 2, "same-name").await;
+            session.freeze_table(table_id, usize::MAX).await.unwrap();
+            checkpoint_published(table_id, &mut session).await;
+
+            let delete_key = single_key(0i32);
+            let keep_key = single_key(1i32);
+            let deleted_row_id = unique_disk_tree_lookup(
+                &table_for_internal_assertion(&engine, table_id),
+                &session.pool_guards(),
+                &delete_key,
+            )
+            .await
+            .unwrap();
+            let kept_row_id = unique_disk_tree_lookup(
+                &table_for_internal_assertion(&engine, table_id),
+                &session.pool_guards(),
+                &keep_key,
+            )
+            .await
+            .unwrap();
+
+            expect_delete_committed(table_id, &mut session, &delete_key).await;
+            let marker_ts = delete_marker_ts(
+                table_for_internal_assertion(&engine, table_id)
+                    .deletion_buffer()
+                    .get(deleted_row_id)
+                    .unwrap(),
+            );
+            wait_gc_cutoff_after(&session, marker_ts).await;
+            checkpoint_published(table_id, &mut session).await;
+
+            assert_eq!(
+                unique_disk_tree_lookup(
+                    &table_for_internal_assertion(&engine, table_id),
+                    &session.pool_guards(),
+                    &delete_key
+                )
+                .await,
+                None
+            );
+            assert_eq!(
+                unique_disk_tree_lookup(
+                    &table_for_internal_assertion(&engine, table_id),
+                    &session.pool_guards(),
+                    &keep_key
+                )
+                .await,
+                Some(kept_row_id)
+            );
+            let exact_rows = non_unique_disk_tree_prefix_scan(
+                &table_for_internal_assertion(&engine, table_id),
+                &session.pool_guards(),
+                &name_key("same-name"),
+            )
+            .await;
+            assert_eq!(exact_rows, vec![kept_row_id]);
+        });
+    }
+
+    #[test]
+    fn test_unique_checkpoint_overlap_keeps_new_disk_tree_owner() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine = lightweight_test_engine(&temp_dir, "redo_testsys_lightweight").await;
+            let table_id = create_table2_for_test(&engine).await;
+            let mut session = engine.new_session().unwrap();
+            let old_row_id = insert_one_row(
+                table_id,
+                &mut session,
+                vec![Val::from(1i32), Val::from("old")],
+            )
+            .await;
+            session.freeze_table(table_id, usize::MAX).await.unwrap();
+            checkpoint_published(table_id, &mut session).await;
+
+            let key = single_key(1i32);
+            expect_delete_committed(table_id, &mut session, &key).await;
+            let delete_ts = delete_marker_ts(
+                table_for_internal_assertion(&engine, table_id)
+                    .deletion_buffer()
+                    .get(old_row_id)
+                    .unwrap(),
+            );
+            let new_row_id = insert_one_row(
+                table_id,
+                &mut session,
+                vec![Val::from(1i32), Val::from("new")],
+            )
+            .await;
+
+            session.freeze_table(table_id, usize::MAX).await.unwrap();
+            let readiness_ts = delete_ts.max(
+                table_for_internal_assertion(&engine, table_id)
+                    .file()
+                    .active_root_unchecked()
+                    .root_ts,
+            );
+            wait_gc_cutoff_after(&session, readiness_ts).await;
+            checkpoint_published(table_id, &mut session).await;
+
+            assert_eq!(
+                unique_disk_tree_lookup(
+                    &table_for_internal_assertion(&engine, table_id),
+                    &session.pool_guards(),
+                    &key
+                )
+                .await,
+                Some(new_row_id)
+            );
+        });
+    }
+
+    #[test]
+    fn test_secondary_sidecar_failure_keeps_checkpoint_root_atomic() {
+        struct ResetSidecarHook;
+
+        impl Drop for ResetSidecarHook {
+            fn drop(&mut self) {
+                set_test_force_secondary_sidecar_error(false);
+            }
+        }
+
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine =
+                evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys").await;
+            let table_id = create_table2_for_test(&engine).await;
+            let mut session = engine.new_session().unwrap();
+            insert_rows(table_id, &mut session, 0, 2, "name").await;
+            session.freeze_table(table_id, usize::MAX).await.unwrap();
+            checkpoint_published(table_id, &mut session).await;
+
+            let key = single_key(0i32);
+            let row_id = unique_disk_tree_lookup(
+                &table_for_internal_assertion(&engine, table_id),
+                &session.pool_guards(),
+                &key,
+            )
+            .await
+            .unwrap();
+            expect_delete_committed(table_id, &mut session, &key).await;
+            let marker_ts = delete_marker_ts(
+                table_for_internal_assertion(&engine, table_id)
+                    .deletion_buffer()
+                    .get(row_id)
+                    .unwrap(),
+            );
+            wait_gc_cutoff_after(&session, marker_ts).await;
+            let root_before = table_for_internal_assertion(&engine, table_id)
+                .file()
+                .active_root_unchecked()
+                .clone();
+
+            set_test_force_secondary_sidecar_error(true);
+            let _reset = ResetSidecarHook;
+            let err = session.checkpoint_table(table_id).await.unwrap_err();
+            assert_eq!(
+                err.report().downcast_ref::<InternalError>().copied(),
+                Some(InternalError::InjectedTestFailure)
+            );
+
+            let root_after = table_for_internal_assertion(&engine, table_id)
+                .file()
+                .active_root_unchecked()
+                .clone();
+            assert_eq!(
+                root_after.deletion_cutoff_ts,
+                root_before.deletion_cutoff_ts
+            );
+            assert_eq!(
+                root_after.column_block_index_root,
+                root_before.column_block_index_root
+            );
+            assert_eq!(
+                root_after.secondary_index_roots,
+                root_before.secondary_index_roots
+            );
+        });
+    }
+
+    #[test]
+    fn test_checkpoint_all_deleted_row_page_advances_without_column_index() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine =
+                evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys").await;
+            let table_id = create_table2_for_test(&engine).await;
+            let mut session = engine.new_session().unwrap();
+            insert_rows(table_id, &mut session, 0, 10, "name").await;
+            delete_key_range_and_wait_gc_cutoff(table_id, &mut session, 0, 10).await;
+
+            let root_before = table_for_internal_assertion(&engine, table_id)
+                .file()
+                .active_root_unchecked()
+                .clone();
+            session.freeze_table(table_id, usize::MAX).await.unwrap();
+            checkpoint_published(table_id, &mut session).await;
+
+            let root_after = table_for_internal_assertion(&engine, table_id)
+                .file()
+                .active_root_unchecked()
+                .clone();
+            assert!(root_after.pivot_row_id > root_before.pivot_row_id);
+            assert_eq!(root_after.column_block_index_root, SUPER_BLOCK_ID);
+            assert!(root_after.deletion_cutoff_ts > root_before.deletion_cutoff_ts);
+            for i in 0..10 {
+                expect_select_not_found_committed(table_id, &mut session, &single_key(i)).await;
+            }
+        });
+    }
+
+    #[test]
+    fn test_checkpoint_transition_delete_marker_waits_for_next_cutoff_range() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine =
+                evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys").await;
+            let table_id = create_table2_for_test(&engine).await;
+            let mut session = engine.new_session().unwrap();
+            insert_rows(table_id, &mut session, 0, 1, "name").await;
+
+            let key = single_key(0i32);
+            let reader = session.begin_trx().unwrap();
+            let table = table_for_internal_assertion(&engine, table_id);
+            let index = bound_unique_index_no(&table, key.index_no);
+            let (row_id, _) = index
+                .lookup(session.pool_guards().index_guard(), &key.vals, reader.sts())
+                .await
+                .unwrap()
+                .expect("row should exist before delete");
+            assert!(matches!(
+                table
+                    .find_row(&session.pool_guards(), row_id)
+                    .await
+                    .unwrap(),
+                RowLocation::RowPage(_)
+            ));
+            reader.commit().await.unwrap();
+
+            let mut hold_session = engine.new_session().unwrap();
+            let hold_trx = hold_session.begin_trx().unwrap();
+            let hold_sts = hold_trx.sts();
+
+            let mut writer_session = engine.new_session().unwrap();
+            expect_delete_committed(table_id, &mut writer_session, &key).await;
+            assert!(table.deletion_buffer().get(row_id).is_none());
+
+            session.freeze_table(table_id, usize::MAX).await.unwrap();
+            let mut checkpoint_session = engine.new_session().unwrap();
+            checkpoint_published(table_id, &mut checkpoint_session).await;
+
+            let marker = table.deletion_buffer().get(row_id).unwrap();
+            let delete_cts = delete_marker_ts(marker);
+            assert!(delete_cts >= hold_sts);
+
+            let snapshot_after_first = column_block_index_snapshot(&engine, table_id);
+            let root_after_first = &snapshot_after_first.active_root;
+            let pool_guards = session.pool_guards();
+            let index_after_first = snapshot_after_first.index(pool_guards.disk_guard());
+            let entry_after_first = index_after_first
+                .locate_block(row_id)
+                .await
+                .unwrap()
+                .expect("transition snapshot should persist the row into LWC");
+            assert!(root_after_first.deletion_cutoff_ts <= delete_cts);
+            assert!(
+                index_after_first
+                    .load_delete_deltas(&entry_after_first)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+
+            hold_trx.rollback().await.unwrap();
+            wait_gc_cutoff_after(&checkpoint_session, delete_cts).await;
+            checkpoint_published(table_id, &mut checkpoint_session).await;
+
+            let snapshot_after_second = column_block_index_snapshot(&engine, table_id);
+            let root_after_second = &snapshot_after_second.active_root;
+            let pool_guards = session.pool_guards();
+            let index_after_second = snapshot_after_second.index(pool_guards.disk_guard());
+            let entry_after_second = index_after_second
+                .locate_block(row_id)
+                .await
+                .unwrap()
+                .expect("persisted entry should still exist");
+            let deltas = index_after_second
+                .load_delete_deltas(&entry_after_second)
+                .await
+                .unwrap();
+            let expected_delta = (row_id - entry_after_second.start_row_id) as u32;
+            assert!(root_after_second.deletion_cutoff_ts > delete_cts);
+            assert!(deltas.contains(&expected_delta));
+        });
+    }
+
+    #[test]
+    fn test_checkpoint_fails_when_eligible_delete_marker_has_no_column_index() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine =
+                evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys").await;
+            let table_id = create_table2_for_test(&engine).await;
+            let mut session = engine.new_session().unwrap();
+            insert_rows(table_id, &mut session, 0, 4, "name").await;
+            delete_key_range_and_wait_gc_cutoff(table_id, &mut session, 0, 4).await;
+            session.freeze_table(table_id, usize::MAX).await.unwrap();
+            checkpoint_published(table_id, &mut session).await;
+
+            let root_before = table_for_internal_assertion(&engine, table_id)
+                .file()
+                .active_root_unchecked()
+                .clone();
+            assert!(root_before.pivot_row_id > RowID::new(0));
+            assert_eq!(root_before.column_block_index_root, SUPER_BLOCK_ID);
+            let marker_ts = root_before.deletion_cutoff_ts;
+            table_for_internal_assertion(&engine, table_id)
+                .deletion_buffer()
+                .put_committed(RowID::new(0), marker_ts)
+                .unwrap();
+            wait_gc_cutoff_after(&session, marker_ts).await;
+
+            let err = session.checkpoint_table(table_id).await.unwrap_err();
+            assert_eq!(
+                err.report().downcast_ref::<DataIntegrityError>().copied(),
+                Some(DataIntegrityError::InvalidRootInvariant)
+            );
+            let root_after = table_for_internal_assertion(&engine, table_id)
+                .file()
+                .active_root_unchecked()
+                .clone();
+            assert_eq!(
+                root_after.deletion_cutoff_ts,
+                root_before.deletion_cutoff_ts
+            );
+            assert_eq!(
+                root_after.column_block_index_root,
+                root_before.column_block_index_root
+            );
+        });
+    }
+
+    #[test]
+    fn test_checkpoint_fails_when_eligible_delete_marker_cannot_be_located() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine =
+                evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys").await;
+            let table_id = create_table2_for_test(&engine).await;
+            let mut session = engine.new_session().unwrap();
+            insert_rows(table_id, &mut session, 0, 1, "name").await;
+            session.freeze_table(table_id, usize::MAX).await.unwrap();
+            checkpoint_published(table_id, &mut session).await;
+
+            let key = single_key(0i32);
+            let reader = session.begin_trx().unwrap();
+            let table = table_for_internal_assertion(&engine, table_id);
+            let row_id =
+                assert_row_in_lwc(&table, &session.pool_guards(), &key, reader.sts()).await;
+            reader.commit().await.unwrap();
+
+            let snapshot_before = column_block_index_snapshot(&engine, table_id);
+            let root_before = &snapshot_before.active_root;
+            assert_ne!(root_before.column_block_index_root, SUPER_BLOCK_ID);
+            let missing_row_id = row_id + 1;
+            assert!(missing_row_id < root_before.pivot_row_id);
+            let pool_guards = session.pool_guards();
+            let index = snapshot_before.index(pool_guards.disk_guard());
+            assert!(index.locate_block(missing_row_id).await.unwrap().is_none());
+
+            let marker_ts = root_before.deletion_cutoff_ts;
+            table
+                .deletion_buffer()
+                .put_committed(missing_row_id, marker_ts)
+                .unwrap();
+            wait_gc_cutoff_after(&session, marker_ts).await;
+
+            let err = session.checkpoint_table(table_id).await.unwrap_err();
+            assert_eq!(
+                err.report().downcast_ref::<DataIntegrityError>().copied(),
+                Some(DataIntegrityError::InvalidRootInvariant)
+            );
+            assert_eq!(
+                table.file().active_root_unchecked().deletion_cutoff_ts,
+                root_before.deletion_cutoff_ts
+            );
+        });
+    }
+
+    #[test]
+    fn test_checkpoint_ignores_missing_old_delete_marker_below_previous_cutoff() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine =
+                evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys").await;
+            let table_id = create_table2_for_test(&engine).await;
+            let mut session = engine.new_session().unwrap();
+            insert_rows(table_id, &mut session, 0, 1, "name").await;
+            session.freeze_table(table_id, usize::MAX).await.unwrap();
+            checkpoint_published(table_id, &mut session).await;
+
+            let key = single_key(0i32);
+            let reader = session.begin_trx().unwrap();
+            let table = table_for_internal_assertion(&engine, table_id);
+            let row_id =
+                assert_row_in_lwc(&table, &session.pool_guards(), &key, reader.sts()).await;
+            reader.commit().await.unwrap();
+
+            let root_before = table.file().active_root_unchecked().clone();
+            assert!(root_before.deletion_cutoff_ts > TrxID::new(0));
+            let missing_row_id = row_id + 1;
+            assert!(missing_row_id < root_before.pivot_row_id);
+            let old_marker_ts = root_before.deletion_cutoff_ts.saturating_sub(1);
+            table
+                .deletion_buffer()
+                .put_committed(missing_row_id, old_marker_ts)
+                .unwrap();
+            wait_gc_cutoff_after(&session, root_before.deletion_cutoff_ts).await;
+
+            checkpoint_published(table_id, &mut session).await;
+            assert!(
+                table.file().active_root_unchecked().deletion_cutoff_ts
+                    > root_before.deletion_cutoff_ts
+            );
+        });
+    }
+
+    #[test]
+    fn test_checkpoint_skips_cold_delete_markers_at_or_after_cutoff() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine =
+                evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys").await;
+            let table_id = create_table2_for_test(&engine).await;
+            let mut session = engine.new_session().unwrap();
+            insert_rows(table_id, &mut session, 0, 10, "name").await;
+            session.freeze_table(table_id, usize::MAX).await.unwrap();
+            checkpoint_published(table_id, &mut session).await;
+
+            let key = single_key(7i32);
+            let reader = session.begin_trx().unwrap();
+            let row_id = assert_row_in_lwc(
+                &table_for_internal_assertion(&engine, table_id),
+                &session.pool_guards(),
+                &key,
+                reader.sts(),
+            )
+            .await;
+            reader.commit().await.unwrap();
+
+            let mut hold_session = engine.new_session().unwrap();
+            let hold_trx = hold_session.begin_trx().unwrap();
+            let hold_sts = hold_trx.sts();
+
+            let mut writer_session = engine.new_session().unwrap();
+            expect_delete_committed(table_id, &mut writer_session, &key).await;
+
+            let table = table_for_internal_assertion(&engine, table_id);
+            let marker = table.deletion_buffer().get(row_id).unwrap();
+            let delete_cts = match marker {
+                DeleteMarker::Committed(ts) => ts,
+                DeleteMarker::Ref(status) => status.ts(),
+            };
+            assert!(delete_cts >= hold_sts);
+
+            let mut checkpoint_session = engine.new_session().unwrap();
+            checkpoint_published(table_id, &mut checkpoint_session).await;
+
+            let snapshot = column_block_index_snapshot(&engine, table_id);
+            let active_root = &snapshot.active_root;
+            let pool_guards = session.pool_guards();
+            let index = snapshot.index(pool_guards.disk_guard());
+            let entry = index
+                .locate_block(row_id)
+                .await
+                .unwrap()
+                .expect("persisted entry should exist");
+            assert!(active_root.deletion_cutoff_ts <= delete_cts);
+            assert!(index.load_delete_deltas(&entry).await.unwrap().is_empty());
+
+            hold_trx.rollback().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn test_checkpoint_fails_on_invalid_v2_delete_metadata() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine =
+                evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys").await;
+            let table_id = create_table2_for_test(&engine).await;
+            let mut session = engine.new_session().unwrap();
+            insert_rows(table_id, &mut session, 0, 10, "name").await;
+            session.freeze_table(table_id, usize::MAX).await.unwrap();
+            checkpoint_published(table_id, &mut session).await;
+
+            let key1 = single_key(6i32);
+            let reader = session.begin_trx().unwrap();
+            let table = table_for_internal_assertion(&engine, table_id);
+            let row_id1 =
+                assert_row_in_lwc(&table, &session.pool_guards(), &key1, reader.sts()).await;
+            reader.commit().await.unwrap();
+
+            expect_delete_committed(table_id, &mut session, &key1).await;
+            let marker1 = table.deletion_buffer().get(row_id1).unwrap();
+            let marker1_ts = delete_marker_ts(marker1);
+            wait_gc_cutoff_after(&session, marker1_ts).await;
+            checkpoint_published(table_id, &mut session).await;
+
+            let pool_guards = session.pool_guards();
+            let snapshot = column_block_index_snapshot(&engine, table_id);
+            let index = snapshot.index(pool_guards.disk_guard());
+            let entry = index
+                .locate_block(row_id1)
+                .await
+                .unwrap()
+                .expect("persisted entry should exist");
+
+            let key2 = single_key(7i32);
+            let mut reader_session = engine.new_session().unwrap();
+            let reader = reader_session.begin_trx().unwrap();
+            let row_id2 =
+                assert_row_in_lwc(&table, &reader_session.pool_guards(), &key2, reader.sts()).await;
+            reader.commit().await.unwrap();
+            let entry2 = index
+                .locate_block(row_id2)
+                .await
+                .unwrap()
+                .expect("second persisted entry should exist");
+            assert_eq!(entry2.leaf_block_id, entry.leaf_block_id);
+            drop(reader_session);
+
+            expect_delete_committed(table_id, &mut session, &key2).await;
+            let marker2 = table.deletion_buffer().get(row_id2).unwrap();
+            let marker2_ts = delete_marker_ts(marker2);
+            wait_gc_cutoff_after(&session, marker2_ts).await;
+
+            let table_file_path = engine.inner().table_fs.user_table_file_path(table_id);
+            corrupt_leaf_delete_codec(table_file_path, entry.leaf_block_id, 0);
+            let _ = table
+                .disk_pool()
+                .invalidate_block(table.file().sparse_file().file_id(), entry.leaf_block_id);
+
+            let err = session.checkpoint_table(table_id).await.unwrap_err();
+            assert_table_data_integrity(
+                err,
+                "column-block-index",
+                entry.leaf_block_id,
+                DataIntegrityError::InvalidPayload,
+            );
+        });
+    }
+
+    #[test]
+    fn test_checkpoint_fails_on_short_v2_delete_section_header() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine =
+                evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys").await;
+            let table_id = create_table2_for_test(&engine).await;
+            let mut session = engine.new_session().unwrap();
+            insert_rows(table_id, &mut session, 0, 10, "name").await;
+            session.freeze_table(table_id, usize::MAX).await.unwrap();
+            checkpoint_published(table_id, &mut session).await;
+
+            let key1 = single_key(6i32);
+            let reader = session.begin_trx().unwrap();
+            let table = table_for_internal_assertion(&engine, table_id);
+            let row_id1 =
+                assert_row_in_lwc(&table, &session.pool_guards(), &key1, reader.sts()).await;
+            reader.commit().await.unwrap();
+
+            expect_delete_committed(table_id, &mut session, &key1).await;
+            let marker1 = table.deletion_buffer().get(row_id1).unwrap();
+            let marker1_ts = delete_marker_ts(marker1);
+            wait_gc_cutoff_after(&session, marker1_ts).await;
+            checkpoint_published(table_id, &mut session).await;
+
+            let pool_guards = session.pool_guards();
+            let snapshot = column_block_index_snapshot(&engine, table_id);
+            let index = snapshot.index(pool_guards.disk_guard());
+            let entry = index
+                .locate_block(row_id1)
+                .await
+                .unwrap()
+                .expect("persisted entry should exist");
+
+            let key2 = single_key(7i32);
+            let mut reader_session = engine.new_session().unwrap();
+            let reader = reader_session.begin_trx().unwrap();
+            let row_id2 =
+                assert_row_in_lwc(&table, &reader_session.pool_guards(), &key2, reader.sts()).await;
+            reader.commit().await.unwrap();
+            let entry2 = index
+                .locate_block(row_id2)
+                .await
+                .unwrap()
+                .expect("second persisted entry should exist");
+            assert_eq!(entry2.leaf_block_id, entry.leaf_block_id);
+            drop(reader_session);
+
+            expect_delete_committed(table_id, &mut session, &key2).await;
+            let marker2 = table.deletion_buffer().get(row_id2).unwrap();
+            let marker2_ts = delete_marker_ts(marker2);
+            wait_gc_cutoff_after(&session, marker2_ts).await;
+
+            let table_file_path = engine.inner().table_fs.user_table_file_path(table_id);
+            corrupt_leaf_short_delete_section_header(table_file_path, entry.leaf_block_id, 0);
+            let _ = table
+                .disk_pool()
+                .invalidate_block(table.file().sparse_file().file_id(), entry.leaf_block_id);
+
+            let err = session.checkpoint_table(table_id).await.unwrap_err();
+            assert_table_data_integrity(
+                err,
+                "column-block-index",
+                entry.leaf_block_id,
+                DataIntegrityError::InvalidPayload,
+            );
+        });
+    }
+
+    #[test]
+    fn test_checkpoint_basic_flow() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine =
+                evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys").await;
+            let table_id = create_table2_for_test(&engine).await;
+            let mut session = engine.new_session().unwrap();
+            let name = "x".repeat(1024);
+            insert_rows(table_id, &mut session, 0, 200, &name).await;
+
+            let table = table_for_internal_assertion(&engine, table_id);
+            let old_root = table.file().active_root_unchecked().clone();
+            session.freeze_table(table_id, usize::MAX).await.unwrap();
+            let (frozen_pages, _) = table
+                .collect_frozen_pages(&session.pool_guards())
+                .await
+                .unwrap();
+            assert!(!frozen_pages.is_empty());
+
+            checkpoint_published(table_id, &mut session).await;
+
+            let new_root = table.file().active_root_unchecked().clone();
+            assert!(new_root.pivot_row_id > old_root.pivot_row_id);
+            assert_ne!(new_root.column_block_index_root, SUPER_BLOCK_ID);
+            assert!(new_root.deletion_cutoff_ts > old_root.deletion_cutoff_ts);
+        });
+    }
+
+    #[test]
+    fn test_checkpoint_publish_write_failure_poisons_storage() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine = lightweight_test_engine(&temp_dir, "redo_testsys_lightweight").await;
+            let table_id = create_table2_for_test(&engine).await;
+            let mut session = engine.new_session().unwrap();
+            let table = table_for_internal_assertion(&engine, table_id);
+            let root_before = table.file().active_root_unchecked().clone();
+            wait_checkpoint_ready(table_id, &session).await;
+            let table_file_path = engine.inner().table_fs.user_table_file_path(table_id);
+            let hook = Arc::new(FailingFirstWriteHook::new(table_file_path));
+            let _install = install_storage_backend_test_hook(hook.clone());
+
+            let err = session.checkpoint_table(table_id).await.unwrap_err();
+            assert_checkpoint_write_poisoned(&err, &engine);
+            assert!(hook.call_count() > 0);
+            assert_root_metadata_unchanged(
+                &root_before,
+                &table_for_internal_assertion(&engine, table_id),
+            );
+            assert!(!session.in_trx().unwrap());
+        });
+    }
+
+    #[test]
+    fn test_checkpoint_post_publication_failure_poisons_storage() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine = lightweight_test_engine(&temp_dir, "redo_testsys_lightweight").await;
+            let table_id = create_table2_for_test(&engine).await;
+            let mut session = engine.new_session().unwrap();
+            let table = table_for_internal_assertion(&engine, table_id);
+            let root_before = table.file().active_root_unchecked().clone();
+            wait_checkpoint_ready(table_id, &session).await;
+
+            let res = {
+                let _guard = ForcePostPublishCheckpointErrorGuard::new();
+                session.checkpoint_table(table_id).await
+            };
+
+            let err = res.unwrap_err();
+            assert_checkpoint_write_poisoned(&err, &engine);
+            assert!(table.file().active_root_unchecked().root_ts > root_before.root_ts);
+            assert!(!session.in_trx().unwrap());
+        });
+    }
+
+    #[test]
+    fn test_checkpoint_readiness_ready_when_effective_ts_crossed_gc_horizon() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine =
+                evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys").await;
+            let table_id = create_table2_for_test(&engine).await;
+            let session = engine.new_session().unwrap();
+            let root = table_for_internal_assertion(&engine, table_id)
+                .file()
+                .active_root_unchecked()
+                .clone();
+            let effective_ts = root.effective_ts();
+            wait_gc_cutoff_after(&session, effective_ts).await;
+            assert!(matches!(
+                session.table_checkpoint_readiness(table_id).unwrap(),
+                CheckpointReadiness::Ready
+            ));
+        });
+    }
+
+    #[test]
+    fn test_checkpoint_readiness_returns_error_after_session_close() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine =
+                evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys").await;
+            let table_id = create_table2_for_test(&engine).await;
+            let mut session = engine.new_session().unwrap();
+
+            session.close().await.unwrap();
+
+            let err = session.table_checkpoint_readiness(table_id).unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::Operation);
+            assert_eq!(err.operation_error(), Some(OperationError::NotSupported));
+        });
+    }
+
+    #[test]
+    fn test_checkpoint_readiness_reports_missing_and_non_live_tables() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine = lightweight_test_engine(&temp_dir, "redo_testsys_lightweight").await;
+            let table_id = create_table2_for_test(&engine).await;
+            let session = engine.new_session().unwrap();
+
+            assert_eq!(
+                session.table_checkpoint_readiness(table_id + 1000).unwrap(),
+                CheckpointReadiness::TableNotFound
+            );
+
+            let _ = session.table_checkpoint_readiness(table_id).unwrap();
+            let table = table_for_internal_assertion(&engine, table_id);
+            table.begin_drop_lifecycle().await.unwrap();
+
+            assert_eq!(
+                session.table_checkpoint_readiness(table_id).unwrap(),
+                CheckpointReadiness::TableDropping
+            );
+            let uncached_session = engine.new_session().unwrap();
+            assert_eq!(
+                uncached_session
+                    .table_checkpoint_readiness(table_id)
+                    .unwrap(),
+                CheckpointReadiness::TableDropping
+            );
+
+            table.mark_dropped_lifecycle().unwrap();
+
+            assert_eq!(
+                session.table_checkpoint_readiness(table_id).unwrap(),
+                CheckpointReadiness::TableNotFound
+            );
+            let uncached_session = engine.new_session().unwrap();
+            assert_eq!(
+                uncached_session
+                    .table_checkpoint_readiness(table_id)
+                    .unwrap(),
+                CheckpointReadiness::TableNotFound
+            );
+        });
+    }
+
+    #[test]
+    fn test_checkpoint_readiness_delayed_reports_effective_ts_and_horizon() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine =
+                evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys").await;
+            let table_id = create_table2_for_test(&engine).await;
+            let mut session = engine.new_session().unwrap();
+            insert_rows(table_id, &mut session, 0, 120, "readiness-delay").await;
+
+            session.freeze_table(table_id, usize::MAX).await.unwrap();
+            let mut reader_session = engine.new_session().unwrap();
+            let reader = reader_session.begin_trx().unwrap();
+            checkpoint_published(table_id, &mut session).await;
+
+            let active_root = table_for_internal_assertion(&engine, table_id)
+                .file()
+                .active_root_unchecked()
+                .clone();
+            let active_root_effective_ts = active_root.effective_ts();
+            let readiness = session.table_checkpoint_readiness(table_id).unwrap();
+            let CheckpointReadiness::Delayed { reason } = readiness else {
+                panic!("expected delayed checkpoint readiness, got {readiness:?}");
+            };
+            assert_eq!(reason.effective_ts, active_root_effective_ts);
+            assert_eq!(reason.min_active_sts, reader.sts());
+            assert!(reason.effective_ts >= reason.min_active_sts);
+
+            reader.commit().await.unwrap();
+            wait_gc_cutoff_after(&session, active_root_effective_ts).await;
+            assert!(matches!(
+                session.table_checkpoint_readiness(table_id).unwrap(),
+                CheckpointReadiness::Ready
+            ));
+        });
+    }
+
+    #[test]
+    fn test_checkpoint_readiness_uses_root_effective_ts_not_checkpoint_start_ts() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine =
+                evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys").await;
+            let table_id = create_table2_for_test(&engine).await;
+            let mut session = engine.new_session().unwrap();
+            insert_rows(table_id, &mut session, 0, 120, "effective-delay").await;
+
+            session.freeze_table(table_id, usize::MAX).await.unwrap();
+            let reader_holder: Rc<RefCell<Option<(Session, Transaction)>>> =
+                Rc::new(RefCell::new(None));
+            let reader_sts = Rc::new(Cell::new(TrxID::new(0)));
+            let hook_reader_holder = Rc::clone(&reader_holder);
+            let hook_reader_sts = Rc::clone(&reader_sts);
+            let hook_engine = engine.new_ref().unwrap();
+            set_test_checkpoint_after_trx_start_hook(move || async move {
+                let mut reader_session = hook_engine.new_session().unwrap();
+                let reader = reader_session.begin_trx().unwrap();
+                hook_reader_sts.set(reader.sts());
+                *hook_reader_holder.borrow_mut() = Some((reader_session, reader));
+            });
+
+            let checkpoint_ts = checkpoint_published(table_id, &mut session).await;
+            let active_root = table_for_internal_assertion(&engine, table_id)
+                .file()
+                .active_root_unchecked()
+                .clone();
+            let effective_ts = active_root.effective_ts();
+            assert!(checkpoint_ts < reader_sts.get());
+            assert!(effective_ts > reader_sts.get());
+
+            let readiness = session.table_checkpoint_readiness(table_id).unwrap();
+            let CheckpointReadiness::Delayed { reason } = readiness else {
+                panic!("expected effective timestamp delay, got {readiness:?}");
+            };
+            assert_eq!(reason.effective_ts, effective_ts);
+            assert!(reason.min_active_sts <= reader_sts.get());
+            assert!(reason.effective_ts >= reason.min_active_sts);
+
+            let (_, mut reader) = reader_holder
+                .borrow_mut()
+                .take()
+                .expect("reader hook should install an active transaction");
+            reader
+                .exec(async |stmt| {
+                    let (rt, effects) = stmt_tests::runtime_and_effects_mut(stmt);
+                    let proof = rt.read_proof();
+                    let snapshot = table_for_internal_assertion(&engine, table_id)
+                        .root_snapshot(&proof)
+                        .unwrap();
+                    let _effects_addr = effects as *mut _;
+                    assert!(snapshot.root_ts() < rt.sts());
+                    assert_eq!(snapshot.effective_ts(), effective_ts);
+                    assert!(!snapshot.root_is_visible_to(rt.sts()));
+                    Ok(())
+                })
+                .await
+                .unwrap();
+            reader.commit().await.unwrap();
+            wait_gc_cutoff_after(&session, effective_ts).await;
+            assert!(matches!(
+                session.table_checkpoint_readiness(table_id).unwrap(),
+                CheckpointReadiness::Ready
+            ));
+        });
+    }
+
+    #[test]
+    fn test_checkpoint_requires_idle_session_before_delayed_outcome() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine =
+                evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys").await;
+            let table_id = create_table2_for_test(&engine).await;
+            let mut session = engine.new_session().unwrap();
+            insert_rows(table_id, &mut session, 0, 120, "idle-before-delay").await;
+
+            session.freeze_table(table_id, usize::MAX).await.unwrap();
+            let mut reader_session = engine.new_session().unwrap();
+            let reader = reader_session.begin_trx().unwrap();
+            let first_checkpoint_ts = checkpoint_published(table_id, &mut session).await;
+            assert_eq!(
+                table_for_internal_assertion(&engine, table_id)
+                    .file()
+                    .active_root_unchecked()
+                    .root_ts,
+                first_checkpoint_ts
+            );
+
+            let checkpoint_trx = session.begin_trx().unwrap();
+            assert!(session.in_trx().unwrap());
+            assert!(matches!(
+                session.table_checkpoint_readiness(table_id).unwrap(),
+                CheckpointReadiness::Delayed { .. }
+            ));
+
+            let err = session.checkpoint_table(table_id).await.unwrap_err();
+            assert_eq!(err.operation_error(), Some(OperationError::NotSupported));
+            assert!(format!("{err:?}").contains("checkpoint requires idle session"));
+            assert!(session.in_trx().unwrap());
+
+            checkpoint_trx.rollback().await.unwrap();
+            assert!(!session.in_trx().unwrap());
+            reader.commit().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn test_checkpoint_delayed_preserves_root_and_frozen_pages_until_ready() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine =
+                evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys").await;
+            let table_id = create_table2_for_test(&engine).await;
+            let mut session = engine.new_session().unwrap();
+            insert_rows(table_id, &mut session, 0, 120, "delayed-root").await;
+
+            session.freeze_table(table_id, usize::MAX).await.unwrap();
+            let mut reader_session = engine.new_session().unwrap();
+            let reader = reader_session.begin_trx().unwrap();
+            checkpoint_published(table_id, &mut session).await;
+            let table = table_for_internal_assertion(&engine, table_id);
+            let root_after_first = table.file().active_root_unchecked().clone();
+            let effective_ts_protected_by_reader = root_after_first.effective_ts();
+
+            insert_rows(table_id, &mut session, 1_000, 80, "delayed-frozen").await;
+            session.freeze_table(table_id, usize::MAX).await.unwrap();
+            let (frozen_pages, _) = table
+                .collect_frozen_pages(&session.pool_guards())
+                .await
+                .unwrap();
+            assert!(!frozen_pages.is_empty());
+            let first_frozen_page = frozen_pages[0].page_id;
+            let root_before_delay = table.file().active_root_unchecked().clone();
+
+            let outcome = session.checkpoint_table(table_id).await.unwrap();
+            let CheckpointOutcome::Delayed { reason } = outcome else {
+                panic!("expected delayed checkpoint, got {outcome:?}");
+            };
+            assert_eq!(reason.effective_ts, effective_ts_protected_by_reader);
+            assert_eq!(reason.min_active_sts, reader.sts());
+            assert_root_metadata_unchanged(&root_before_delay, &table);
+
+            let page_guard = table
+                .mem
+                .must_get_row_page_shared(&session.pool_guards(), first_frozen_page)
+                .await
+                .unwrap();
+            let (ctx, _) = page_guard.ctx_and_page();
+            assert_eq!(ctx.row_ver().unwrap().state(), RowPageState::Frozen);
+            drop(page_guard);
+            let (still_frozen_pages, _) = table
+                .collect_frozen_pages(&session.pool_guards())
+                .await
+                .unwrap();
+            assert_eq!(still_frozen_pages[0].page_id, first_frozen_page);
+
+            reader.commit().await.unwrap();
+            wait_gc_cutoff_after(&session, effective_ts_protected_by_reader).await;
+            let checkpoint_ts = checkpoint_published(table_id, &mut session).await;
+            let root_after_publish = table.file().active_root_unchecked().clone();
+            assert_eq!(root_after_publish.root_ts, checkpoint_ts);
+            assert!(root_after_publish.pivot_row_id > root_before_delay.pivot_row_id);
+        });
+    }
+
+    #[test]
+    fn test_second_checkpoint_waits_for_previous_root_horizon() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine =
+                evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys").await;
+            let table_id = create_table2_for_test(&engine).await;
+            let mut session = engine.new_session().unwrap();
+            insert_rows(table_id, &mut session, 0, 120, "second-delay").await;
+
+            session.freeze_table(table_id, usize::MAX).await.unwrap();
+            let mut reader_session = engine.new_session().unwrap();
+            let reader = reader_session.begin_trx().unwrap();
+            let first_checkpoint_ts = checkpoint_published(table_id, &mut session).await;
+            let first_root = table_for_internal_assertion(&engine, table_id)
+                .file()
+                .active_root_unchecked()
+                .clone();
+            let first_effective_ts = first_root.effective_ts();
+            assert_eq!(first_root.root_ts, first_checkpoint_ts);
+
+            let root_before_second = table_for_internal_assertion(&engine, table_id)
+                .file()
+                .active_root_unchecked()
+                .clone();
+            let outcome = session.checkpoint_table(table_id).await.unwrap();
+            let CheckpointOutcome::Delayed { reason } = outcome else {
+                panic!("expected second checkpoint to wait, got {outcome:?}");
+            };
+            assert_eq!(reason.effective_ts, first_effective_ts);
+            assert_eq!(reason.min_active_sts, reader.sts());
+            assert_root_metadata_unchanged(
+                &root_before_second,
+                &table_for_internal_assertion(&engine, table_id),
+            );
+
+            reader.commit().await.unwrap();
+            wait_gc_cutoff_after(&session, first_effective_ts).await;
+            let second_checkpoint_ts = checkpoint_published(table_id, &mut session).await;
+            assert!(second_checkpoint_ts > first_checkpoint_ts);
+        });
+    }
+
+    #[test]
+    fn test_checkpoint_reachability_reclaims_obsolete_column_index_root() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine =
+                evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys").await;
+            let table_id = create_table2_for_test(&engine).await;
+            let mut session = engine.new_session().unwrap();
+            insert_rows(table_id, &mut session, 0, 120, "reachability-first").await;
+            session.freeze_table(table_id, usize::MAX).await.unwrap();
+            checkpoint_published(table_id, &mut session).await;
+            let first_root = table_for_internal_assertion(&engine, table_id)
+                .file()
+                .active_root_unchecked()
+                .clone();
+            let first_column_root = first_root.column_block_index_root;
+            assert_ne!(first_column_root, SUPER_BLOCK_ID);
+
+            insert_rows(table_id, &mut session, 1_000, 120, "reachability-second").await;
+            session.freeze_table(table_id, usize::MAX).await.unwrap();
+            checkpoint_published(table_id, &mut session).await;
+            let second_root = table_for_internal_assertion(&engine, table_id)
+                .file()
+                .active_root_unchecked()
+                .clone();
+            assert_ne!(second_root.column_block_index_root, first_column_root);
+            assert!(
+                second_root
+                    .alloc_map
+                    .is_allocated(usize::from(first_column_root)),
+                "the old column-index root stays allocated while the displaced root is protected"
+            );
+
+            wait_gc_cutoff_after(&session, second_root.effective_ts()).await;
+            checkpoint_published(table_id, &mut session).await;
+            let reclaimed_root = table_for_internal_assertion(&engine, table_id)
+                .file()
+                .active_root_unchecked()
+                .clone();
+            assert_ne!(reclaimed_root.column_block_index_root, first_column_root);
+            if reclaimed_root
+                .alloc_map
+                .is_allocated(usize::from(first_column_root))
+            {
+                assert_eq!(
+                    reclaimed_root.meta_block_id, first_column_root,
+                    "the freed obsolete column-index root may be immediately reused for the new meta block"
+                );
+            }
+            assert!(
+                reclaimed_root
+                    .alloc_map
+                    .is_allocated(usize::from(second_root.column_block_index_root)),
+                "current column-index root must remain allocated"
+            );
+        });
+    }
+
+    #[test]
+    fn test_checkpoint_rechecks_readiness_after_root_mutation_lease() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine = lightweight_test_engine(&temp_dir, "redo_testsys_lightweight").await;
+            let table_id = create_table2_for_test(&engine).await;
+            let mut checkpoint_session = engine.new_session().unwrap();
+            let root_before = table_for_internal_assertion(&engine, table_id)
+                .file()
+                .active_root_unchecked()
+                .clone();
+            wait_gc_cutoff_after(&checkpoint_session, root_before.effective_ts()).await;
+
+            let mut reader_session = engine.new_session().unwrap();
+            let reader = reader_session.begin_trx().unwrap();
+            assert!(matches!(
+                checkpoint_session
+                    .table_checkpoint_readiness(table_id)
+                    .unwrap(),
+                CheckpointReadiness::Ready
+            ));
+
+            let hook_table = table_for_internal_assertion(&engine, table_id);
+            let hook_engine = engine.new_ref().unwrap();
+            let root_before_trx = root_before.root_ts;
+            set_test_checkpoint_after_readiness_hook(move || async move {
+                let mut competing_session = hook_engine.new_session().unwrap();
+                let checkpoint_ts =
+                    checkpoint_published(hook_table.table_id(), &mut competing_session).await;
+                assert!(checkpoint_ts > root_before_trx);
+            });
+
+            let outcome = checkpoint_session.checkpoint_table(table_id).await.unwrap();
+            let CheckpointOutcome::Delayed { reason } = outcome else {
+                panic!("expected post-lease readiness delay, got {outcome:?}");
+            };
+            let root_after = table_for_internal_assertion(&engine, table_id)
+                .file()
+                .active_root_unchecked()
+                .clone();
+            assert!(root_after.root_ts > root_before.root_ts);
+            assert_eq!(reason.effective_ts, root_after.effective_ts());
+            assert_eq!(reason.min_active_sts, reader.sts());
+
+            reader.commit().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn test_concurrent_checkpoint_table_returns_in_progress_cancellation() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine = lightweight_test_engine(&temp_dir, "redo_testsys_lightweight").await;
+            let table_id = create_table2_for_test(&engine).await;
+            let mut first_session = engine.new_session().unwrap();
+            wait_checkpoint_ready(table_id, &first_session).await;
+
+            let (entered_tx, entered_rx) = flume::bounded(1);
+            let (release_tx, release_rx) = flume::bounded(1);
+            set_test_checkpoint_after_trx_start_hook(move || async move {
+                entered_tx.send_async(()).await.unwrap();
+                release_rx.recv_async().await.unwrap();
+            });
+
+            let first_outcome = {
+                let first_checkpoint = first_session.checkpoint_table(table_id).fuse();
+                futures::pin_mut!(first_checkpoint);
+                let checkpoint_entered = entered_rx.recv_async().fuse();
+                futures::pin_mut!(checkpoint_entered);
+                futures::select! {
+                    res = first_checkpoint => {
+                        panic!("first checkpoint completed before the concurrency hook: {res:?}");
+                    }
+                    res = checkpoint_entered => {
+                        res.unwrap();
+                    }
+                }
+
+                let mut second_session = engine.new_session().unwrap();
+                let outcome = second_session.checkpoint_table(table_id).await.unwrap();
+                assert_eq!(
+                    outcome,
+                    CheckpointOutcome::Cancelled {
+                        reason: CheckpointCancelReason::CheckpointInProgress,
+                    }
+                );
+                assert!(!second_session.in_trx().unwrap());
+
+                release_tx.send_async(()).await.unwrap();
+                first_checkpoint.await.unwrap()
+            };
+            assert!(
+                matches!(first_outcome, CheckpointOutcome::Published { .. }),
+                "first checkpoint should publish after the competing checkpoint cancels: {first_outcome:?}"
+            );
+            assert!(!first_session.in_trx().unwrap());
+        });
+    }
+
+    #[test]
+    fn test_checkpoint_snapshot_consistency() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine =
+                evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys").await;
+            let table_id = create_table2_for_test(&engine).await;
+            let mut session = engine.new_session().unwrap();
+            let name = "y".repeat(256);
+            insert_rows(table_id, &mut session, 0, 120, &name).await;
+
+            session.freeze_table(table_id, 1).await.unwrap();
+
+            let mut read_trx = session.begin_trx().unwrap();
+            {
+                let key = SelectKey::new(0, vec![Val::from(1)]);
+                let res = trx_select_row_mvcc_by_id(&mut read_trx, table_id, &key, &[0, 1]).await;
+                assert!(matches!(res, Ok(SelectMvcc::Found(_))));
+            }
+
+            let mut write_session = engine.new_session().unwrap();
+            let mut write_trx = write_session.begin_trx().unwrap();
+            {
+                let insert = vec![Val::from(10_000i32), Val::from("new")];
+                let res = trx_insert_row_by_id(&mut write_trx, table_id, insert).await;
+                assert!(res.is_ok());
+            }
+
+            let mut checkpoint_session = engine.new_session().unwrap();
+            checkpoint_published(table_id, &mut checkpoint_session).await;
+
+            {
+                let key = SelectKey::new(0, vec![Val::from(10_000i32)]);
+                let res = trx_select_row_mvcc_by_id(&mut read_trx, table_id, &key, &[0, 1]).await;
+                assert!(matches!(res, Ok(SelectMvcc::NotFound)));
+            }
+
+            write_trx.rollback().await.unwrap();
+            read_trx.commit().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn test_checkpoint_old_root_released_after_active_reader_purged() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine =
+                evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys").await;
+            let table_id = create_table2_for_test(&engine).await;
+            let mut session = engine.new_session().unwrap();
+            let name = "retained-root".repeat(64);
+            insert_rows(table_id, &mut session, 0, 120, &name).await;
+
+            session.freeze_table(table_id, usize::MAX).await.unwrap();
+            let retained_root_ptr = table_for_internal_assertion(&engine, table_id)
+                .file()
+                .active_root_unchecked() as *const _ as usize;
+            let drop_count_before = old_root_drop_count(retained_root_ptr);
+
+            let mut read_session = engine.new_session().unwrap();
+            let read_trx = read_session.begin_trx().unwrap();
+
+            let mut checkpoint_session = engine.new_session().unwrap();
+            checkpoint_published(table_id, &mut checkpoint_session).await;
+
+            assert_eq!(
+                old_root_drop_count(retained_root_ptr),
+                drop_count_before,
+                "old root must stay retained while a pre-checkpoint transaction is active"
+            );
+
+            read_trx.commit().await.unwrap();
+            expect_insert_committed(
+                table_id,
+                &mut session,
+                vec![Val::from(50_000i32), Val::from("after-retention-reader")],
+            )
+            .await;
+
+            for _ in 0..50 {
+                if old_root_drop_count(retained_root_ptr) > drop_count_before {
+                    break;
+                }
+                smol::Timer::after(Duration::from_millis(20)).await;
+            }
+            assert!(
+                old_root_drop_count(retained_root_ptr) > drop_count_before,
+                "old root should be released after transaction GC crosses the checkpoint"
+            );
+        });
+    }
+
+    #[test]
+    fn test_checkpoint_persistence_recovery() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine =
+                evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys").await;
+            let table_id = create_table2_for_test(&engine).await;
+            let table = engine
+                .catalog()
+                .get_table_now(table_id)
+                .expect("test table should exist");
+            let mut session = engine.new_session().unwrap();
+            let name = "z".repeat(512);
+            insert_rows_direct(table_id, &mut session, 0, 150, &name).await;
+
+            session
+                .freeze_table(table.table_id(), usize::MAX)
+                .await
+                .unwrap();
+            checkpoint_published(table.table_id(), &mut session).await;
+
+            let root_before = table.file().active_root_unchecked().clone();
+            drop(table);
+
+            let table_file = engine
+                .inner()
+                .table_fs
+                .open_table_file(table_id, engine.inner().disk_pool.clone_inner())
+                .await
+                .unwrap();
+            let root_after = table_file.active_root_unchecked();
+            assert_eq!(root_after.pivot_row_id, root_before.pivot_row_id);
+            assert_eq!(
+                root_after.heap_redo_start_ts,
+                root_before.heap_redo_start_ts
+            );
+            assert_eq!(
+                root_after.deletion_cutoff_ts,
+                root_before.deletion_cutoff_ts
+            );
+        });
+    }
+
+    #[test]
+    fn test_checkpoint_heartbeat() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine =
+                evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys").await;
+            let table_id = create_table2_for_test(&engine).await;
+            let mut session = engine.new_session().unwrap();
+            let name = "h".repeat(128);
+            insert_rows(table_id, &mut session, 0, 40, &name).await;
+
+            let root_before = table_for_internal_assertion(&engine, table_id)
+                .file()
+                .active_root_unchecked()
+                .clone();
+            checkpoint_published(table_id, &mut session).await;
+            let root_after = table_for_internal_assertion(&engine, table_id)
+                .file()
+                .active_root_unchecked()
+                .clone();
+
+            assert_eq!(root_after.pivot_row_id, root_before.pivot_row_id);
+            assert!(root_after.heap_redo_start_ts > root_before.heap_redo_start_ts);
+            assert!(root_after.deletion_cutoff_ts > root_before.deletion_cutoff_ts);
+            assert_eq!(
+                root_after.column_block_index_root,
+                root_before.column_block_index_root
+            );
+        });
+    }
+
+    #[test]
+    fn test_checkpoint_gc_verification() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine =
+                evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys").await;
+            let table_id = create_table2_for_test(&engine).await;
+            let mut session = engine.new_session().unwrap();
+            let name = "g".repeat(1024);
+            insert_rows(table_id, &mut session, 0, 200, &name).await;
+
+            let allocated_before = engine.inner().mem_pool.allocated();
+            session.freeze_table(table_id, usize::MAX).await.unwrap();
+            checkpoint_published(table_id, &mut session).await;
+            let allocated_after = engine.inner().mem_pool.allocated();
+            let mut reclaimed = allocated_after < allocated_before;
+            for _ in 0..20 {
+                smol::Timer::after(Duration::from_millis(200)).await;
+                let allocated_now = engine.inner().mem_pool.allocated();
+                if allocated_now < allocated_before {
+                    reclaimed = true;
+                    break;
+                }
+            }
+            assert!(reclaimed, "row pages should be reclaimed after purge");
+        });
+    }
+
+    #[test]
+    fn test_checkpoint_error_rollback() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine =
+                evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys").await;
+            let table_id = create_table2_for_test(&engine).await;
+            let mut session = engine.new_session().unwrap();
+            let name = "e".repeat(256);
+            insert_rows(table_id, &mut session, 0, 80, &name).await;
+
+            session.freeze_table(table_id, usize::MAX).await.unwrap();
+            let root_before = table_for_internal_assertion(&engine, table_id)
+                .file()
+                .active_root_unchecked()
+                .clone();
+
+            set_test_force_lwc_build_error(true);
+            let res = session.checkpoint_table(table_id).await;
+            set_test_force_lwc_build_error(false);
+            assert!(res.is_err());
+
+            let root_after = table_for_internal_assertion(&engine, table_id)
+                .file()
+                .active_root_unchecked()
+                .clone();
+            assert_eq!(root_after.pivot_row_id, root_before.pivot_row_id);
+            assert_eq!(
+                root_after.heap_redo_start_ts,
+                root_before.heap_redo_start_ts
+            );
+            assert_eq!(
+                root_after.deletion_cutoff_ts,
+                root_before.deletion_cutoff_ts
+            );
+            assert_eq!(
+                root_after.column_block_index_root,
+                root_before.column_block_index_root
+            );
+        });
+    }
+
+    #[test]
+    fn test_checkpoint_cancelled_while_table_metadata_change_active() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine = lightweight_test_engine(&temp_dir, "redo_testsys_lightweight").await;
+            let table_id = create_table2_for_test(&engine).await;
+            let mut checkpoint_session = engine.new_session().unwrap();
+
+            wait_checkpoint_ready(table_id, &checkpoint_session).await;
+            let table = table_for_internal_assertion(&engine, table_id);
+            let _metadata_lease = table.begin_metadata_change().await.unwrap();
+
+            let outcome = checkpoint_session
+                .checkpoint_table(table_id)
+                .await
+                .expect("checkpoint should return a normal cancellation");
+
+            assert_eq!(
+                outcome,
+                CheckpointOutcome::Cancelled {
+                    reason: CheckpointCancelReason::TableMetadataChanging,
+                }
+            );
+        })
+    }
+
+    #[test]
+    fn test_checkpoint_reachability_reclaims_dropped_secondary_disk_tree_root() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine = lightweight_test_engine(&temp_dir, "redo_testsys_lightweight").await;
+            let table_id = create_table2_for_test(&engine).await;
+            let mut session = engine.new_session().unwrap();
+            insert_rows(table_id, &mut session, 0, 64, "drop-index-reclaim").await;
+            session.freeze_table(table_id, usize::MAX).await.unwrap();
+            checkpoint_published(table_id, &mut session).await;
+            let indexed_root = table_for_internal_assertion(&engine, table_id)
+                .file()
+                .active_root_unchecked()
+                .clone();
+            let dropped_disk_root = indexed_root.secondary_index_roots[0];
+            assert_ne!(dropped_disk_root, SUPER_BLOCK_ID);
+            assert!(
+                indexed_root
+                    .alloc_map
+                    .is_allocated(usize::from(dropped_disk_root))
+            );
+
+            session.drop_index(table_id, 0).await.unwrap();
+            let after_drop_root = table_for_internal_assertion(&engine, table_id)
+                .file()
+                .active_root_unchecked()
+                .clone();
+            assert_eq!(after_drop_root.secondary_index_roots[0], SUPER_BLOCK_ID);
+            assert!(
+                after_drop_root
+                    .alloc_map
+                    .is_allocated(usize::from(dropped_disk_root)),
+                "DROP INDEX detaches the root but leaves page reclamation to checkpoint reachability"
+            );
+
+            wait_gc_cutoff_after(&session, after_drop_root.effective_ts()).await;
+            checkpoint_published(table_id, &mut session).await;
+            let after_reclaim = table_for_internal_assertion(&engine, table_id)
+                .file()
+                .active_root_unchecked()
+                .clone();
+            assert!(
+                !after_reclaim
+                    .alloc_map
+                    .is_allocated(usize::from(dropped_disk_root)),
+                "checkpoint reachability should reclaim detached DiskTree pages"
+            );
+        })
     }
 }

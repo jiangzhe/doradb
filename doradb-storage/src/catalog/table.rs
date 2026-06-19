@@ -1680,7 +1680,30 @@ impl Deser for TableBriefMetadata {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::catalog::{ColumnSpec, IndexAttributes, IndexKey};
+    use crate::catalog::table::test_hooks as catalog_table_tests;
+    use crate::catalog::table::test_hooks::CreateTableTestFailure;
+    use crate::catalog::{
+        CatalogCheckpointScanStopReason, ColumnAttributes, ColumnSpec, IndexAttributes, IndexKey,
+        IndexSpec, TableSpec,
+    };
+    use crate::error::{
+        CompletionErrorKind, ConfigError, Error, ErrorKind, FatalError, InternalError,
+        OperationError,
+    };
+    use crate::id::{SessionID, TableID, TrxID};
+    use crate::io::install_storage_backend_test_hook;
+    use crate::lock::tests::{LockDebugEntryState, try_acquire};
+    use crate::lock::{LockMode, LockOwner, LockResource};
+    use crate::log::redo::DDLRedo;
+    use crate::session::tests::SessionTestExt;
+    use crate::table::TableLifecycleState;
+    use crate::table::tests::*;
+    use crate::trx::stmt::tests as stmt_tests;
+    use crate::trx::tests as trx_tests;
+    use crate::value::{Val, ValKind};
+    use std::cell::Cell;
+    use std::sync::Arc;
+    use tempfile::TempDir;
 
     fn assert_invalid_index_spec(err: Error, expected_message: &str) {
         assert!(err.is_kind(crate::error::ErrorKind::Config));
@@ -2057,5 +2080,1610 @@ mod tests {
             out_of_range.operation_error(),
             Some(OperationError::IndexNotFound)
         );
+    }
+
+    #[test]
+    fn test_statement_read_takes_metadata_lock_only() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine =
+                evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys").await;
+            let table_id = create_table2_for_test(&engine).await;
+            let mut session = engine.new_session().unwrap();
+            insert_rows(table_id, &mut session, 0, 1, "name").await;
+
+            let stmt_owner = Cell::new(None);
+            let mut trx = session.begin_trx().unwrap();
+            trx.exec(async |stmt| {
+                let owner = stmt_tests::lock_owner(stmt);
+                stmt_owner.set(Some(owner));
+                let selected = stmt
+                    .table_lookup_unique_mvcc(table_id, &single_key(0i32), &[0, 1])
+                    .await?;
+                assert!(selected.is_found());
+                let repeated = stmt
+                    .table_lookup_unique_mvcc(table_id, &single_key(0i32), &[0, 1])
+                    .await?;
+                assert!(repeated.is_found());
+                assert_eq!(lock_entry_count(&engine, owner), 1);
+                assert!(has_lock_entry(
+                    &engine,
+                    owner,
+                    LockResource::TableMetadata(table_id),
+                    LockMode::Shared,
+                    LockDebugEntryState::Granted,
+                ));
+                assert!(!has_lock_resource(
+                    &engine,
+                    owner,
+                    LockResource::TableData(table_id),
+                ));
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+            let owner = stmt_owner.get().unwrap();
+            assert_eq!(lock_entry_count(&engine, owner), 0);
+            trx.commit().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn test_statement_write_locks_are_transaction_owned_and_cached() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine =
+                evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys").await;
+            let table_id = create_table2_for_test(&engine).await;
+            let mut session = engine.new_session().unwrap();
+            let mut trx = session.begin_trx().unwrap();
+            let owner = trx_tests::lock_owner(&trx).unwrap();
+
+            trx.exec(async |stmt| {
+                stmt.table_insert_mvcc(table_id, vec![Val::from(10i32), Val::from("a")])
+                    .await?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+            assert!(has_lock_entry(
+                &engine,
+                owner,
+                LockResource::TableMetadata(table_id),
+                LockMode::Shared,
+                LockDebugEntryState::Granted,
+            ));
+            assert!(has_lock_entry(
+                &engine,
+                owner,
+                LockResource::TableData(table_id),
+                LockMode::IntentExclusive,
+                LockDebugEntryState::Granted,
+            ));
+            assert_eq!(lock_entry_count(&engine, owner), 2);
+
+            trx.exec(async |stmt| {
+                stmt.table_insert_mvcc(table_id, vec![Val::from(11i32), Val::from("b")])
+                    .await?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+            assert_eq!(lock_entry_count(&engine, owner), 2);
+
+            trx.rollback().await.unwrap();
+            assert_eq!(lock_entry_count(&engine, owner), 0);
+        });
+    }
+
+    #[test]
+    fn test_create_table_waits_on_catalog_namespace_lock() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine =
+                evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys").await;
+            let _ = create_table2_for_test(&engine).await;
+            let blocker = LockOwner::Session(SessionID::new(91_400));
+            assert!(
+                try_acquire(
+                    engine.lock_manager(),
+                    LockResource::CatalogNamespace,
+                    LockMode::Exclusive,
+                    blocker,
+                )
+                .unwrap()
+            );
+
+            let mut session = engine.new_session().unwrap();
+            let waiting_owner = LockOwner::Session(session.id());
+            let create_task = smol::spawn(async move {
+                session
+                    .create_table(
+                        TableSpec::new(vec![ColumnSpec::new(
+                            "id",
+                            crate::value::ValKind::I32,
+                            ColumnAttributes::empty(),
+                        )]),
+                        vec![IndexSpec::new(vec![IndexKey::new(0)], IndexAttributes::PK)],
+                    )
+                    .await
+            });
+
+            wait_for_lock_entry(
+                &engine,
+                waiting_owner,
+                LockResource::CatalogNamespace,
+                LockMode::Exclusive,
+                LockDebugEntryState::Waiting,
+            )
+            .await;
+
+            assert_eq!(engine.lock_manager().release_owner(blocker), 1);
+            let table_id = create_task.await.unwrap();
+            assert!(engine.catalog().get_table(table_id).await.is_some());
+            assert!(!has_lock_resource(
+                &engine,
+                waiting_owner,
+                LockResource::CatalogNamespace,
+            ));
+        });
+    }
+
+    #[test]
+    fn test_create_table_rejects_invalid_metadata_before_file_creation() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let main_dir = temp_dir.path().to_path_buf();
+            let engine = lightweight_test_engine_config(main_dir, "create_invalid_metadata")
+                .build()
+                .await
+                .unwrap();
+            let mut session = engine.new_session().unwrap();
+            let table_id = engine.catalog().curr_next_table_id();
+            let table_file_path = engine.inner().table_fs.user_table_file_path(table_id);
+
+            let err = session
+                .create_table(
+                    TableSpec::new(vec![ColumnSpec::new(
+                        "id",
+                        ValKind::I32,
+                        ColumnAttributes::empty(),
+                    )]),
+                    vec![IndexSpec::new(vec![], IndexAttributes::PK)],
+                )
+                .await
+                .unwrap_err();
+
+            assert_eq!(
+                err.report().downcast_ref::<ConfigError>().copied(),
+                Some(ConfigError::InvalidIndexSpec)
+            );
+            assert!(engine.catalog().get_table(table_id).await.is_none());
+            assert!(!session.in_trx().unwrap());
+            wait_path_exists(&table_file_path, false).await;
+        });
+    }
+
+    #[test]
+    fn test_create_table_catalog_staging_failure_rolls_back_and_deletes_file() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let main_dir = temp_dir.path().to_path_buf();
+            let engine = lightweight_test_engine_config(main_dir, "create_fail_catalog")
+                .build()
+                .await
+                .unwrap();
+            let mut session = engine.new_session().unwrap();
+            let table_id = engine.catalog().curr_next_table_id();
+            let table_file_path = engine.inner().table_fs.user_table_file_path(table_id);
+            let (table_spec, index_specs) = drop_table_test_spec();
+
+            catalog_table_tests::set_create_table_failure(Some(
+                CreateTableTestFailure::AfterCatalogStaged,
+            ));
+            let res = session.create_table(table_spec, index_specs).await;
+            catalog_table_tests::set_create_table_failure(None);
+
+            let err = res.unwrap_err();
+            assert_eq!(
+                err.report().downcast_ref::<InternalError>().copied(),
+                Some(InternalError::InjectedTestFailure)
+            );
+            assert!(engine.catalog().get_table(table_id).await.is_none());
+            assert!(!session.in_trx().unwrap());
+            wait_path_exists(&table_file_path, false).await;
+        });
+    }
+
+    #[test]
+    fn test_create_table_file_publish_failure_rolls_back_catalog_and_deletes_file() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let main_dir = temp_dir.path().to_path_buf();
+            let engine = lightweight_test_engine_config(main_dir, "create_fail_publish")
+                .build()
+                .await
+                .unwrap();
+            let mut session = engine.new_session().unwrap();
+            let table_id = engine.catalog().curr_next_table_id();
+            let table_file_path = engine.inner().table_fs.user_table_file_path(table_id);
+            let hook = Arc::new(FailingFirstWriteHook::new(table_file_path.clone()));
+            let _install = install_storage_backend_test_hook(hook.clone());
+            let (table_spec, index_specs) = drop_table_test_spec();
+
+            let err = session
+                .create_table(table_spec, index_specs)
+                .await
+                .unwrap_err();
+
+            assert!(err.is_kind(ErrorKind::Io), "{err:?}");
+            assert!(hook.call_count() > 0);
+            assert!(engine.catalog().get_table(table_id).await.is_none());
+            assert!(!session.in_trx().unwrap());
+            wait_path_exists(&table_file_path, false).await;
+        });
+    }
+
+    #[test]
+    fn test_create_table_after_file_published_failure_rolls_back_catalog_and_deletes_file() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let main_dir = temp_dir.path().to_path_buf();
+            let engine = lightweight_test_engine_config(main_dir, "create_fail_after_file")
+                .build()
+                .await
+                .unwrap();
+            let mut session = engine.new_session().unwrap();
+            let table_id = engine.catalog().curr_next_table_id();
+            let table_file_path = engine.inner().table_fs.user_table_file_path(table_id);
+            let (table_spec, index_specs) = drop_table_test_spec();
+
+            catalog_table_tests::set_create_table_failure(Some(
+                CreateTableTestFailure::AfterFilePublished,
+            ));
+            let res = session.create_table(table_spec, index_specs).await;
+            catalog_table_tests::set_create_table_failure(None);
+
+            let err = res.unwrap_err();
+            assert_eq!(
+                err.report().downcast_ref::<InternalError>().copied(),
+                Some(InternalError::InjectedTestFailure)
+            );
+            assert!(engine.catalog().get_table(table_id).await.is_none());
+            assert!(!session.in_trx().unwrap());
+            wait_path_exists(&table_file_path, false).await;
+        });
+    }
+
+    #[test]
+    fn test_create_table_runtime_failure_after_file_publish_rolls_back_and_deletes_file() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let main_dir = temp_dir.path().to_path_buf();
+            let engine = lightweight_test_engine_config(main_dir, "create_fail_runtime")
+                .build()
+                .await
+                .unwrap();
+            let mut session = engine.new_session().unwrap();
+            let table_id = engine.catalog().curr_next_table_id();
+            let table_file_path = engine.inner().table_fs.user_table_file_path(table_id);
+            let (table_spec, index_specs) = drop_table_test_spec();
+
+            catalog_table_tests::set_create_table_failure(Some(
+                CreateTableTestFailure::AfterRuntimeBuilt,
+            ));
+            let res = session.create_table(table_spec, index_specs).await;
+            catalog_table_tests::set_create_table_failure(None);
+
+            let err = res.unwrap_err();
+            assert_eq!(
+                err.report().downcast_ref::<InternalError>().copied(),
+                Some(InternalError::InjectedTestFailure)
+            );
+            assert!(engine.catalog().get_table(table_id).await.is_none());
+            assert!(!session.in_trx().unwrap());
+            wait_path_exists(&table_file_path, false).await;
+        });
+    }
+
+    #[test]
+    fn test_create_table_catalog_commit_error_after_file_publish_poisons_and_keeps_file() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let main_dir = temp_dir.path().to_path_buf();
+            let engine = lightweight_test_engine_config(main_dir, "create_fail_commit")
+                .build()
+                .await
+                .unwrap();
+            let mut session = engine.new_session().unwrap();
+            let table_id = engine.catalog().curr_next_table_id();
+            let table_file_path = engine.inner().table_fs.user_table_file_path(table_id);
+            let (table_spec, index_specs) = drop_table_test_spec();
+
+            catalog_table_tests::set_create_table_failure(Some(
+                CreateTableTestFailure::PoisonBeforeCatalogCommit,
+            ));
+            let res = session.create_table(table_spec, index_specs).await;
+            catalog_table_tests::set_create_table_failure(None);
+
+            let err = res.unwrap_err();
+            assert_eq!(
+                err.report().downcast_ref::<FatalError>().copied(),
+                Some(FatalError::Poisoned)
+            );
+            assert!(
+                engine
+                    .inner()
+                    .trx_sys
+                    .storage_poison_error()
+                    .as_ref()
+                    .is_some_and(|err| *err.current_context() == FatalError::Poisoned)
+            );
+            assert!(engine.catalog().get_table(table_id).await.is_none());
+            assert!(!session.in_trx().unwrap());
+            assert!(std::path::Path::new(&table_file_path).exists());
+        });
+    }
+
+    #[test]
+    fn test_explicit_table_locks_reject_intent_modes() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine = lightweight_test_engine(&temp_dir, "redo_testsys_lightweight").await;
+            let table_id = create_table2_for_test(&engine).await;
+            let mut session = engine.new_session().unwrap();
+
+            for mode in [LockMode::IntentShared, LockMode::IntentExclusive] {
+                let err = session.lock_table(table_id, mode).await.unwrap_err();
+                assert_eq!(err.operation_error(), Some(OperationError::InvalidLockMode));
+            }
+
+            let mut trx = session.begin_trx().unwrap();
+            for mode in [LockMode::IntentShared, LockMode::IntentExclusive] {
+                let err = trx.lock_table(table_id, mode).await.unwrap_err();
+                assert_eq!(err.operation_error(), Some(OperationError::InvalidLockMode));
+            }
+            trx.rollback().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn test_transaction_shared_table_lock_blocks_external_row_writer() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine = lightweight_test_engine(&temp_dir, "redo_testsys_lightweight").await;
+            let table_id = create_table2_for_test(&engine).await;
+            let mut session = engine.new_session().unwrap();
+            let mut trx = session.begin_trx().unwrap();
+            let owner = trx_tests::lock_owner(&trx).unwrap();
+
+            trx.lock_table(table_id, LockMode::Shared).await.unwrap();
+            assert!(has_lock_entry(
+                &engine,
+                owner,
+                LockResource::TableMetadata(table_id),
+                LockMode::Shared,
+                LockDebugEntryState::Granted,
+            ));
+            assert!(has_lock_entry(
+                &engine,
+                owner,
+                LockResource::TableData(table_id),
+                LockMode::Shared,
+                LockDebugEntryState::Granted,
+            ));
+
+            let engine_ref = engine.new_ref().unwrap();
+            let (owner_tx, owner_rx) = flume::bounded(1);
+            let writer = smol::spawn(async move {
+                let mut writer_session = engine_ref.new_session().unwrap();
+                let mut writer_trx = writer_session.begin_trx().unwrap();
+                owner_tx
+                    .send_async(trx_tests::lock_owner(&writer_trx).unwrap())
+                    .await
+                    .unwrap();
+                trx_insert_row_by_id(
+                    &mut writer_trx,
+                    table_id,
+                    vec![Val::from(31_001i32), Val::from("blocked")],
+                )
+                .await?;
+                writer_trx.commit().await?;
+                Ok::<(), Error>(())
+            });
+            let writer_owner = owner_rx.recv_async().await.unwrap();
+            wait_for_lock_entry(
+                &engine,
+                writer_owner,
+                LockResource::TableData(table_id),
+                LockMode::IntentExclusive,
+                LockDebugEntryState::Waiting,
+            )
+            .await;
+
+            trx.rollback().await.unwrap();
+            writer.await.unwrap();
+        });
+    }
+
+    #[test]
+    fn test_transaction_exclusive_table_lock_uses_cache_and_releases_on_commit() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine = lightweight_test_engine(&temp_dir, "redo_testsys_lightweight").await;
+            let table_id = create_table2_for_test(&engine).await;
+            let mut session = engine.new_session().unwrap();
+            let mut trx = session.begin_trx().unwrap();
+            let owner = trx_tests::lock_owner(&trx).unwrap();
+
+            trx.lock_table(table_id, LockMode::Exclusive).await.unwrap();
+            trx.lock_table(table_id, LockMode::Shared).await.unwrap();
+            trx.lock_table(table_id, LockMode::Exclusive).await.unwrap();
+
+            assert_eq!(lock_entry_count(&engine, owner), 2);
+            assert!(has_lock_entry(
+                &engine,
+                owner,
+                LockResource::TableMetadata(table_id),
+                LockMode::Shared,
+                LockDebugEntryState::Granted,
+            ));
+            assert!(has_lock_entry(
+                &engine,
+                owner,
+                LockResource::TableData(table_id),
+                LockMode::Exclusive,
+                LockDebugEntryState::Granted,
+            ));
+
+            assert_eq!(trx.commit().await.unwrap(), TrxID::new(0));
+            assert_eq!(lock_entry_count(&engine, owner), 0);
+        });
+    }
+
+    #[test]
+    fn test_session_shared_table_lock_allows_reads_but_rejects_same_session_writes() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine = lightweight_test_engine(&temp_dir, "redo_testsys_lightweight").await;
+            let table_id = create_table2_for_test(&engine).await;
+            let mut setup_session = engine.new_session().unwrap();
+            insert_rows(table_id, &mut setup_session, 0, 1, "name").await;
+
+            let mut session = engine.new_session().unwrap();
+            session
+                .lock_table(table_id, LockMode::Shared)
+                .await
+                .unwrap();
+
+            let mut read_trx = session.begin_trx().unwrap();
+            read_trx
+                .exec(async |stmt| {
+                    let selected = stmt
+                        .table_lookup_unique_mvcc(table_id, &single_key(0i32), &[0, 1])
+                        .await?;
+                    assert!(selected.is_found());
+                    Ok(())
+                })
+                .await
+                .unwrap();
+            read_trx.commit().await.unwrap();
+
+            let mut write_trx = session.begin_trx().unwrap();
+            let err = trx_insert_row_by_id(
+                &mut write_trx,
+                table_id,
+                vec![Val::from(31_101i32), Val::from("same-session-s")],
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(
+                err.operation_error(),
+                Some(OperationError::LockOwnerGroupConflict)
+            );
+            assert!(!has_lock_entry(
+                &engine,
+                trx_tests::lock_owner(&write_trx).unwrap(),
+                LockResource::TableData(table_id),
+                LockMode::IntentExclusive,
+                LockDebugEntryState::Waiting,
+            ));
+            write_trx.rollback().await.unwrap();
+
+            session.unlock_table(table_id).unwrap();
+        });
+    }
+
+    #[test]
+    fn test_session_table_lock_failure_releases_fresh_metadata() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine = lightweight_test_engine(&temp_dir, "redo_testsys_lightweight").await;
+            let table_id = create_table2_for_test(&engine).await;
+            let mut session = engine.new_session().unwrap();
+            let session_owner = LockOwner::Session(session.id());
+            let mut trx = session.begin_trx().unwrap();
+
+            trx_insert_row_by_id(
+                &mut trx,
+                table_id,
+                vec![Val::from(31_301i32), Val::from("same-session-ix")],
+            )
+            .await
+            .unwrap();
+
+            let err = session
+                .lock_table(table_id, LockMode::Shared)
+                .await
+                .unwrap_err();
+            assert_eq!(
+                err.operation_error(),
+                Some(OperationError::LockOwnerGroupConflict)
+            );
+            assert!(!has_lock_resource(
+                &engine,
+                session_owner,
+                LockResource::TableMetadata(table_id),
+            ));
+            assert!(!has_lock_resource(
+                &engine,
+                session_owner,
+                LockResource::TableData(table_id),
+            ));
+
+            trx.rollback().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn test_session_table_lock_cancellation_releases_fresh_metadata() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine = lightweight_test_engine(&temp_dir, "redo_testsys_lightweight").await;
+            let table_id = create_table2_for_test(&engine).await;
+            let blocker = LockOwner::Transaction(TrxID::new(91_301));
+            assert!(
+                try_acquire(
+                    engine.lock_manager(),
+                    LockResource::TableData(table_id),
+                    LockMode::Exclusive,
+                    blocker,
+                )
+                .unwrap()
+            );
+
+            let session = engine.new_session().unwrap();
+            let session_owner = LockOwner::Session(session.id());
+            let mut lock_fut = Box::pin(session.lock_table(table_id, LockMode::Shared));
+            assert!(matches!(
+                futures::poll!(lock_fut.as_mut()),
+                std::task::Poll::Pending
+            ));
+            assert!(has_lock_entry(
+                &engine,
+                session_owner,
+                LockResource::TableMetadata(table_id),
+                LockMode::Shared,
+                LockDebugEntryState::Granted,
+            ));
+            assert!(has_lock_entry(
+                &engine,
+                session_owner,
+                LockResource::TableData(table_id),
+                LockMode::Shared,
+                LockDebugEntryState::Waiting,
+            ));
+
+            drop(lock_fut);
+            wait_for_no_lock_resource(
+                &engine,
+                session_owner,
+                LockResource::TableMetadata(table_id),
+            )
+            .await;
+            wait_for_no_lock_resource(&engine, session_owner, LockResource::TableData(table_id))
+                .await;
+            assert_eq!(
+                engine
+                    .lock_manager()
+                    .release(LockResource::TableData(table_id), blocker),
+                1
+            );
+        });
+    }
+
+    #[test]
+    fn test_transaction_table_lock_failure_releases_fresh_metadata() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine = lightweight_test_engine(&temp_dir, "redo_testsys_lightweight").await;
+            let table_id = create_table2_for_test(&engine).await;
+            let mut session = engine.new_session().unwrap();
+            let session_owner = LockOwner::Session(session.id());
+            session
+                .lock_table(table_id, LockMode::Shared)
+                .await
+                .unwrap();
+            let mut trx = session.begin_trx().unwrap();
+            let trx_owner = trx_tests::lock_owner(&trx).unwrap();
+
+            let err = trx
+                .lock_table(table_id, LockMode::Exclusive)
+                .await
+                .unwrap_err();
+            assert_eq!(
+                err.operation_error(),
+                Some(OperationError::LockOwnerGroupConflict)
+            );
+            assert!(!has_lock_resource(
+                &engine,
+                trx_owner,
+                LockResource::TableMetadata(table_id),
+            ));
+            assert!(
+                !trx_tests::cached_transaction_lock_covers(
+                    &trx,
+                    LockResource::TableMetadata(table_id),
+                    LockMode::Shared
+                )
+                .unwrap()
+            );
+            assert!(has_lock_resource(
+                &engine,
+                session_owner,
+                LockResource::TableMetadata(table_id),
+            ));
+
+            trx.rollback().await.unwrap();
+            session.unlock_table(table_id).unwrap();
+        });
+    }
+
+    #[test]
+    fn test_transaction_table_lock_cancellation_releases_fresh_metadata() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine = lightweight_test_engine(&temp_dir, "redo_testsys_lightweight").await;
+            let table_id = create_table2_for_test(&engine).await;
+            let blocker = LockOwner::Transaction(TrxID::new(91_302));
+            assert!(
+                try_acquire(
+                    engine.lock_manager(),
+                    LockResource::TableData(table_id),
+                    LockMode::Exclusive,
+                    blocker,
+                )
+                .unwrap()
+            );
+
+            let mut session = engine.new_session().unwrap();
+            let mut trx = session.begin_trx().unwrap();
+            let trx_owner = trx_tests::lock_owner(&trx).unwrap();
+            let mut lock_fut = Box::pin(trx.lock_table(table_id, LockMode::Shared));
+            assert!(matches!(
+                futures::poll!(lock_fut.as_mut()),
+                std::task::Poll::Pending
+            ));
+            assert!(has_lock_entry(
+                &engine,
+                trx_owner,
+                LockResource::TableMetadata(table_id),
+                LockMode::Shared,
+                LockDebugEntryState::Granted,
+            ));
+            assert!(has_lock_entry(
+                &engine,
+                trx_owner,
+                LockResource::TableData(table_id),
+                LockMode::Shared,
+                LockDebugEntryState::Waiting,
+            ));
+
+            drop(lock_fut);
+            wait_for_no_lock_resource(&engine, trx_owner, LockResource::TableMetadata(table_id))
+                .await;
+            wait_for_no_lock_resource(&engine, trx_owner, LockResource::TableData(table_id)).await;
+            assert!(
+                !trx_tests::cached_transaction_lock_covers(
+                    &trx,
+                    LockResource::TableMetadata(table_id),
+                    LockMode::Shared
+                )
+                .unwrap()
+            );
+            assert_eq!(
+                engine
+                    .lock_manager()
+                    .release(LockResource::TableData(table_id), blocker),
+                1
+            );
+            trx.rollback().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn test_session_exclusive_table_lock_covers_same_session_writer() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine = lightweight_test_engine(&temp_dir, "redo_testsys_lightweight").await;
+            let table_id = create_table2_for_test(&engine).await;
+            let mut session = engine.new_session().unwrap();
+            let session_owner = LockOwner::Session(session.id());
+            session
+                .lock_table(table_id, LockMode::Exclusive)
+                .await
+                .unwrap();
+
+            let engine_ref = engine.new_ref().unwrap();
+            let (owner_tx, owner_rx) = flume::bounded(1);
+            let external_writer = smol::spawn(async move {
+                let mut writer_session = engine_ref.new_session().unwrap();
+                let mut writer_trx = writer_session.begin_trx().unwrap();
+                owner_tx
+                    .send_async(trx_tests::lock_owner(&writer_trx).unwrap())
+                    .await
+                    .unwrap();
+                trx_insert_row_by_id(
+                    &mut writer_trx,
+                    table_id,
+                    vec![Val::from(31_201i32), Val::from("external")],
+                )
+                .await?;
+                writer_trx.commit().await?;
+                Ok::<(), Error>(())
+            });
+            let external_owner = owner_rx.recv_async().await.unwrap();
+            wait_for_lock_entry(
+                &engine,
+                external_owner,
+                LockResource::TableData(table_id),
+                LockMode::IntentExclusive,
+                LockDebugEntryState::Waiting,
+            )
+            .await;
+
+            let mut same_session_trx = session.begin_trx().unwrap();
+            let same_session_owner = trx_tests::lock_owner(&same_session_trx).unwrap();
+            trx_insert_row_by_id(
+                &mut same_session_trx,
+                table_id,
+                vec![Val::from(31_202i32), Val::from("covered")],
+            )
+            .await
+            .unwrap();
+            assert!(has_lock_entry(
+                &engine,
+                same_session_owner,
+                LockResource::TableData(table_id),
+                LockMode::IntentExclusive,
+                LockDebugEntryState::Granted,
+            ));
+
+            let err = session.unlock_table(table_id).unwrap_err();
+            assert_eq!(err.operation_error(), Some(OperationError::NotSupported));
+
+            same_session_trx.commit().await.unwrap();
+            assert!(has_lock_entry(
+                &engine,
+                session_owner,
+                LockResource::TableData(table_id),
+                LockMode::Exclusive,
+                LockDebugEntryState::Granted,
+            ));
+            assert!(has_lock_entry(
+                &engine,
+                external_owner,
+                LockResource::TableData(table_id),
+                LockMode::IntentExclusive,
+                LockDebugEntryState::Waiting,
+            ));
+
+            session.unlock_table(table_id).unwrap();
+            assert!(!has_lock_resource(
+                &engine,
+                session_owner,
+                LockResource::TableData(table_id),
+            ));
+            external_writer.await.unwrap();
+        });
+    }
+
+    #[test]
+    fn test_drop_table_rejects_already_dropping_lifecycle_without_poison() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine = lightweight_test_engine(&temp_dir, "redo_testsys_lightweight").await;
+            let table_id = create_table2_for_test(&engine).await;
+            let mut session = engine.new_session().unwrap();
+
+            table_for_internal_assertion(&engine, table_id)
+                .begin_drop_lifecycle()
+                .await
+                .unwrap();
+
+            let err = session.drop_table(table_id).await.unwrap_err();
+            assert_eq!(err.operation_error(), Some(OperationError::TableDropping));
+            assert_eq!(
+                table_for_internal_assertion(&engine, table_id)
+                    .lifecycle
+                    .state(),
+                TableLifecycleState::Dropping
+            );
+            assert!(!session.in_trx().unwrap());
+            assert!(engine.inner().trx_sys.storage_poison_error().is_none());
+        });
+    }
+
+    #[test]
+    fn test_drop_table_rejects_active_transaction() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine = lightweight_test_engine(&temp_dir, "redo_testsys_lightweight").await;
+            let table_id = create_table2_for_test(&engine).await;
+            let mut session = engine.new_session().unwrap();
+            let trx = session.begin_trx().unwrap();
+
+            let err = session.drop_table(table_id).await.unwrap_err();
+            assert_eq!(err.operation_error(), Some(OperationError::NotSupported));
+
+            trx.rollback().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn test_drop_table_returns_not_found_for_missing_table() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine = lightweight_test_engine(&temp_dir, "redo_testsys_lightweight").await;
+            let table_id = create_table2_for_test(&engine).await;
+            let mut session = engine.new_session().unwrap();
+
+            let err = session.drop_table(TableID::new(0)).await.unwrap_err();
+            assert_eq!(err.operation_error(), Some(OperationError::TableNotFound));
+
+            let missing_user_table_id = table_id + 1000;
+            let err = session.drop_table(missing_user_table_id).await.unwrap_err();
+            assert_eq!(err.operation_error(), Some(OperationError::TableNotFound));
+        });
+    }
+
+    #[test]
+    fn test_drop_table_rejects_runtime_missing_catalog_row_before_gate() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine = lightweight_test_engine(&temp_dir, "redo_testsys_lightweight").await;
+            let table_id = create_table2_for_test(&engine).await;
+            let mut corrupt_session = engine.new_session().unwrap();
+            let mut corrupt_trx = corrupt_session.begin_trx().unwrap();
+
+            corrupt_trx
+                .exec(async |stmt| {
+                    let deleted = engine
+                        .catalog()
+                        .storage
+                        .tables()
+                        .delete_by_id(stmt, table_id)
+                        .await;
+                    assert!(deleted);
+                    let old = stmt
+                        .effects_mut()
+                        .set_ddl_redo(DDLRedo::DropTable(table_id));
+                    debug_assert!(old.is_none());
+                    Ok(())
+                })
+                .await
+                .unwrap();
+            corrupt_trx.commit().await.unwrap();
+
+            let mut drop_session = engine.new_session().unwrap();
+            let err = drop_session.drop_table(table_id).await.unwrap_err();
+
+            assert_eq!(err.operation_error(), Some(OperationError::TableNotFound));
+            assert_eq!(
+                table_for_internal_assertion(&engine, table_id)
+                    .lifecycle
+                    .state(),
+                TableLifecycleState::Live
+            );
+            assert!(!drop_session.in_trx().unwrap());
+            assert!(engine.inner().trx_sys.storage_poison_error().is_none());
+            assert!(engine.catalog().get_table(table_id).await.is_some());
+        });
+    }
+
+    #[test]
+    fn test_drop_table_rejects_same_session_explicit_table_lock() {
+        smol::block_on(async {
+            for mode in [LockMode::Shared, LockMode::Exclusive] {
+                let temp_dir = TempDir::new().unwrap();
+                let engine = lightweight_test_engine(&temp_dir, "redo_testsys_lightweight").await;
+                let table_id = create_table2_for_test(&engine).await;
+                let mut session = engine.new_session().unwrap();
+                let owner = LockOwner::Session(session.id());
+
+                session.lock_table(table_id, mode).await.unwrap();
+                let err = session.drop_table(table_id).await.unwrap_err();
+                assert_eq!(
+                    err.operation_error(),
+                    Some(OperationError::LockOwnerGroupConflict)
+                );
+
+                assert_eq!(
+                    table_for_internal_assertion(&engine, table_id)
+                        .lifecycle
+                        .state(),
+                    TableLifecycleState::Live
+                );
+                assert!(engine.catalog().get_table(table_id).await.is_some());
+                assert!(!has_lock_resource(
+                    &engine,
+                    owner,
+                    LockResource::CatalogNamespace,
+                ));
+                assert!(has_lock_entry(
+                    &engine,
+                    owner,
+                    LockResource::TableMetadata(table_id),
+                    LockMode::Shared,
+                    LockDebugEntryState::Granted,
+                ));
+                assert!(has_lock_entry(
+                    &engine,
+                    owner,
+                    LockResource::TableData(table_id),
+                    mode,
+                    LockDebugEntryState::Granted,
+                ));
+
+                session.unlock_table(table_id).unwrap();
+                assert!(!has_lock_resource(
+                    &engine,
+                    owner,
+                    LockResource::TableMetadata(table_id),
+                ));
+                assert!(!has_lock_resource(
+                    &engine,
+                    owner,
+                    LockResource::TableData(table_id),
+                ));
+                session.drop_table(table_id).await.unwrap();
+            }
+        });
+    }
+
+    #[test]
+    fn test_drop_table_fails_waiting_session_table_lock() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine = lightweight_test_engine(&temp_dir, "redo_testsys_lightweight").await;
+            let table_id = create_table2_for_test(&engine).await;
+            let table = table_for_internal_assertion(&engine, table_id);
+            let root_lease = table.try_begin_checkpoint_root_mutation().unwrap();
+            let publish_lease = table.try_begin_checkpoint_publish().unwrap();
+            let mut drop_session = engine.new_session().unwrap();
+            let drop_owner = LockOwner::Session(drop_session.id());
+            let mut drop_fut = Box::pin(drop_session.drop_table(table_id));
+            assert!(matches!(
+                futures::poll!(drop_fut.as_mut()),
+                std::task::Poll::Pending
+            ));
+            assert!(has_lock_entry(
+                &engine,
+                drop_owner,
+                LockResource::TableMetadata(table_id),
+                LockMode::Exclusive,
+                LockDebugEntryState::Granted,
+            ));
+
+            let lock_session = engine.new_session().unwrap();
+            let lock_owner = LockOwner::Session(lock_session.id());
+            let err = lock_session
+                .lock_table(table_id, LockMode::Shared)
+                .await
+                .unwrap_err();
+            assert_eq!(err.operation_error(), Some(OperationError::TableDropping));
+            assert!(!has_lock_resource(
+                &engine,
+                lock_owner,
+                LockResource::TableMetadata(table_id),
+            ));
+
+            drop(publish_lease);
+            drop_fut.await.unwrap();
+            drop(root_lease);
+            assert!(!has_lock_resource(
+                &engine,
+                lock_owner,
+                LockResource::TableMetadata(table_id),
+            ));
+            assert!(!has_lock_resource(
+                &engine,
+                lock_owner,
+                LockResource::TableData(table_id),
+            ));
+        });
+    }
+
+    #[test]
+    fn test_drop_table_fails_waiting_transaction_table_lock() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine = lightweight_test_engine(&temp_dir, "redo_testsys_lightweight").await;
+            let table_id = create_table2_for_test(&engine).await;
+            let table = table_for_internal_assertion(&engine, table_id);
+            let root_lease = table.try_begin_checkpoint_root_mutation().unwrap();
+            let publish_lease = table.try_begin_checkpoint_publish().unwrap();
+            let mut drop_session = engine.new_session().unwrap();
+            let drop_owner = LockOwner::Session(drop_session.id());
+            let mut drop_fut = Box::pin(drop_session.drop_table(table_id));
+            assert!(matches!(
+                futures::poll!(drop_fut.as_mut()),
+                std::task::Poll::Pending
+            ));
+            assert!(has_lock_entry(
+                &engine,
+                drop_owner,
+                LockResource::TableMetadata(table_id),
+                LockMode::Exclusive,
+                LockDebugEntryState::Granted,
+            ));
+
+            let mut lock_session = engine.new_session().unwrap();
+            let mut trx = lock_session.begin_trx().unwrap();
+            let lock_owner = trx_tests::lock_owner(&trx).unwrap();
+            let err = trx
+                .lock_table(table_id, LockMode::Exclusive)
+                .await
+                .unwrap_err();
+            assert_eq!(err.operation_error(), Some(OperationError::TableDropping));
+            assert!(!has_lock_resource(
+                &engine,
+                lock_owner,
+                LockResource::TableMetadata(table_id),
+            ));
+
+            drop(publish_lease);
+            drop_fut.await.unwrap();
+            drop(root_lease);
+            assert!(!has_lock_resource(
+                &engine,
+                lock_owner,
+                LockResource::TableMetadata(table_id),
+            ));
+            assert!(!has_lock_resource(
+                &engine,
+                lock_owner,
+                LockResource::TableData(table_id),
+            ));
+
+            trx.rollback().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn test_explicit_table_lock_after_drop_returns_not_found_without_locks() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine = lightweight_test_engine(&temp_dir, "redo_testsys_lightweight").await;
+            let table_id = create_table2_for_test(&engine).await;
+            let mut drop_session = engine.new_session().unwrap();
+            drop_session.drop_table(table_id).await.unwrap();
+
+            let lock_session = engine.new_session().unwrap();
+            let session_owner = LockOwner::Session(lock_session.id());
+            let err = lock_session
+                .lock_table(table_id, LockMode::Shared)
+                .await
+                .unwrap_err();
+            assert_eq!(err.operation_error(), Some(OperationError::TableNotFound));
+            assert!(!has_lock_resource(
+                &engine,
+                session_owner,
+                LockResource::TableMetadata(table_id),
+            ));
+            assert!(!has_lock_resource(
+                &engine,
+                session_owner,
+                LockResource::TableData(table_id),
+            ));
+
+            let mut trx_session = engine.new_session().unwrap();
+            let mut trx = trx_session.begin_trx().unwrap();
+            let trx_owner = trx_tests::lock_owner(&trx).unwrap();
+            let err = trx
+                .lock_table(table_id, LockMode::Exclusive)
+                .await
+                .unwrap_err();
+            assert_eq!(err.operation_error(), Some(OperationError::TableNotFound));
+            assert!(!has_lock_resource(
+                &engine,
+                trx_owner,
+                LockResource::TableMetadata(table_id),
+            ));
+            assert!(!has_lock_resource(
+                &engine,
+                trx_owner,
+                LockResource::TableData(table_id),
+            ));
+            trx.rollback().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn test_drop_table_logical_cascade() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine =
+                evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys_non_unique")
+                    .await;
+            let table_id = create_non_unique_name_table_for_test(&engine).await;
+            let table_file_path = engine.inner().table_fs.user_table_file_path(table_id);
+            let mut session = engine.new_session().unwrap();
+            insert_one_row(
+                table_id,
+                &mut session,
+                vec![Val::from(1), Val::from("drop-me")],
+            )
+            .await;
+            let (other_spec, other_indexes) = drop_table_test_spec();
+            let other_table_id = session
+                .create_table(other_spec, other_indexes)
+                .await
+                .unwrap();
+            let owner = LockOwner::Session(session.id());
+
+            assert!(std::path::Path::new(&table_file_path).exists());
+            session.drop_table(table_id).await.unwrap();
+
+            assert!(!has_lock_resource(
+                &engine,
+                owner,
+                LockResource::CatalogNamespace,
+            ));
+            assert!(!has_lock_resource(
+                &engine,
+                owner,
+                LockResource::TableMetadata(table_id),
+            ));
+            assert!(!has_lock_resource(
+                &engine,
+                owner,
+                LockResource::TableData(table_id),
+            ));
+            assert!(engine.catalog().get_table(table_id).await.is_none());
+            assert!(
+                engine
+                    .catalog()
+                    .storage
+                    .tables()
+                    .find_uncommitted_by_id(&session.pool_guards(), table_id)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(
+                engine
+                    .catalog()
+                    .storage
+                    .columns()
+                    .list_uncommitted_by_table_id(&session.pool_guards(), table_id)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+            assert!(
+                engine
+                    .catalog()
+                    .storage
+                    .indexes()
+                    .list_uncommitted_by_table_id(&session.pool_guards(), table_id)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+            assert!(
+                engine
+                    .catalog()
+                    .storage
+                    .index_columns()
+                    .list_uncommitted_by_table_id(&session.pool_guards(), table_id)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+            assert!(
+                engine
+                    .catalog()
+                    .storage
+                    .tables()
+                    .find_uncommitted_by_id(&session.pool_guards(), other_table_id)
+                    .await
+                    .unwrap()
+                    .is_some()
+            );
+            assert!(
+                !engine
+                    .catalog()
+                    .storage
+                    .columns()
+                    .list_uncommitted_by_table_id(&session.pool_guards(), other_table_id)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+            assert!(std::path::Path::new(&table_file_path).exists());
+
+            let err = session.drop_table(table_id).await.unwrap_err();
+            assert_eq!(err.operation_error(), Some(OperationError::TableNotFound));
+
+            let mut stale_read = session.begin_trx().unwrap();
+            let err = trx_select_row_mvcc_by_id(&mut stale_read, table_id, &single_key(1), &[0, 1])
+                .await
+                .unwrap_err();
+            assert_eq!(err.operation_error(), Some(OperationError::TableNotFound));
+            assert_eq!(stale_read.commit().await.unwrap(), TrxID::new(0));
+
+            let mut stale_write = session.begin_trx().unwrap();
+            let err = trx_insert_row_by_id(
+                &mut stale_write,
+                table_id,
+                vec![Val::from(2), Val::from("blocked")],
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(err.operation_error(), Some(OperationError::TableNotFound));
+            assert_eq!(stale_write.commit().await.unwrap(), TrxID::new(0));
+
+            let (later_spec, later_indexes) = drop_table_test_spec();
+            let later_table_id = session
+                .create_table(later_spec, later_indexes)
+                .await
+                .unwrap();
+            assert!(later_table_id > table_id);
+            assert!(later_table_id > other_table_id);
+        });
+    }
+
+    #[test]
+    fn test_drop_table_gc_deletes_file_after_catalog_checkpoint() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let main_dir = temp_dir.path().to_path_buf();
+            let engine = lightweight_test_engine_config(main_dir, "drop_gc_destroy")
+                .build()
+                .await
+                .unwrap();
+            let mut session = engine.new_session().unwrap();
+            let (table_spec, index_specs) = drop_table_test_spec();
+            let table_id = session.create_table(table_spec, index_specs).await.unwrap();
+            insert_one_row(
+                table_id,
+                &mut session,
+                vec![Val::from(11), Val::from("gc-delete")],
+            )
+            .await;
+            let table_file_path = engine.inner().table_fs.user_table_file_path(table_id);
+
+            session.drop_table(table_id).await.unwrap();
+            engine.inner().trx_sys.request_dropped_table_purge();
+            engine
+                .catalog()
+                .checkpoint_now(&engine.inner().trx_sys)
+                .await
+                .unwrap();
+            wait_path_exists(&table_file_path, false).await;
+
+            let mut trx = session.begin_trx().unwrap();
+            let err = trx
+                .exec(async |stmt| {
+                    stmt.table_lookup_unique_mvcc(table_id, &single_key(11), &[0, 1])
+                        .await
+                })
+                .await
+                .unwrap_err();
+            assert_eq!(err.operation_error(), Some(OperationError::TableNotFound));
+            trx.rollback().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn test_drop_table_catalog_cascade_poison_preserves_source_error() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine = lightweight_test_engine(&temp_dir, "redo_testsys_lightweight").await;
+            let table_id = create_table2_for_test(&engine).await;
+            let mut corrupt_session = engine.new_session().unwrap();
+            let mut corrupt_trx = corrupt_session.begin_trx().unwrap();
+
+            corrupt_trx
+                .exec(async |stmt| {
+                    let deleted = engine
+                        .catalog()
+                        .storage
+                        .index_columns()
+                        .delete_by_index(stmt, table_id, 0)
+                        .await
+                        .unwrap();
+                    assert_eq!(deleted, 1);
+                    let old = stmt.effects_mut().set_ddl_redo(DDLRedo::DropIndex {
+                        table_id,
+                        index_no: 0,
+                    });
+                    debug_assert!(old.is_none());
+                    Ok(())
+                })
+                .await
+                .unwrap();
+            corrupt_trx.commit().await.unwrap();
+
+            let mut drop_session = engine.new_session().unwrap();
+            let err = drop_session.drop_table(table_id).await.unwrap_err();
+            let report = format!("{err:?}");
+
+            assert_eq!(
+                err.report().downcast_ref::<FatalError>().copied(),
+                Some(FatalError::Poisoned),
+                "{report}"
+            );
+            assert_eq!(
+                err.report().downcast_ref::<InternalError>().copied(),
+                Some(InternalError::Generic),
+                "{report}"
+            );
+            assert!(
+                report.contains("drop table failed after lifecycle gate: table_id="),
+                "{report}"
+            );
+            assert!(report.contains("operation=catalog cascade"), "{report}");
+            assert!(
+                report.contains("drop table catalog cascade count mismatch"),
+                "{report}"
+            );
+            assert!(
+                engine
+                    .inner()
+                    .trx_sys
+                    .storage_poison_error()
+                    .as_ref()
+                    .is_some_and(|err| *err.current_context() == FatalError::Poisoned)
+            );
+            assert!(!drop_session.in_trx().unwrap());
+        });
+    }
+
+    #[test]
+    fn test_drop_table_commit_poison_preserves_source_error() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine = lightweight_test_engine(&temp_dir, "redo_testsys_lightweight").await;
+            let table_id = create_table2_for_test(&engine).await;
+            let redo_file_path = temp_dir.path().join("redo_testsys_lightweight.00000000");
+            let hook = Arc::new(FailingFirstWriteHook::new(redo_file_path));
+            let _install = install_storage_backend_test_hook(hook.clone());
+            let mut session = engine.new_session().unwrap();
+
+            let err = session.drop_table(table_id).await.unwrap_err();
+            let report = format!("{err:?}");
+
+            assert!(hook.call_count() > 0);
+            assert_eq!(
+                err.report().downcast_ref::<FatalError>().copied(),
+                Some(FatalError::RedoWrite),
+                "{report}"
+            );
+            assert_eq!(
+                err.completion_error(),
+                Some(CompletionErrorKind::Fatal(FatalError::RedoWrite)),
+                "{report}"
+            );
+            assert!(
+                report.contains("drop table failed after lifecycle gate: table_id="),
+                "{report}"
+            );
+            assert!(report.contains("operation=commit"), "{report}");
+            assert!(report.contains("wait for redo group commit"), "{report}");
+            assert!(report.contains("propagate from other threads"), "{report}");
+            assert!(
+                engine
+                    .inner()
+                    .trx_sys
+                    .storage_poison_error()
+                    .as_ref()
+                    .is_some_and(|err| *err.current_context() == FatalError::RedoWrite)
+            );
+            assert!(!session.in_trx().unwrap());
+        });
+    }
+
+    #[test]
+    fn test_user_insert_commit_poison_rolls_back_session_before_return() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine = lightweight_test_engine(&temp_dir, "redo_testsys_lightweight").await;
+            let table_id = create_table2_for_test(&engine).await;
+            let mut session = engine.new_session().unwrap();
+            expect_insert_committed(
+                table_id,
+                &mut session,
+                vec![Val::from(1), Val::from("seed")],
+            )
+            .await;
+            let redo_file_path = temp_dir.path().join("redo_testsys_lightweight.00000000");
+            let hook = Arc::new(FailingFirstWriteHook::new(redo_file_path));
+            let _install = install_storage_backend_test_hook(hook.clone());
+
+            let mut trx = session.begin_trx().unwrap();
+            trx = expect_trx_insert(table_id, trx, vec![Val::from(169), Val::from("redo-fail")])
+                .await;
+            let err = trx.commit().await.unwrap_err();
+            let report = format!("{err:?}");
+
+            assert!(hook.call_count() > 0);
+            assert!(report.contains("redo write failed"), "{report}");
+            assert!(
+                engine
+                    .inner()
+                    .trx_sys
+                    .storage_poison_error()
+                    .as_ref()
+                    .is_some_and(|err| *err.current_context() == FatalError::RedoWrite)
+            );
+            assert_eq!(
+                engine.inner().session_registry.active_transaction_count(),
+                0
+            );
+        });
+    }
+
+    #[test]
+    fn test_drop_table_waits_for_active_metadata_reader() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine = lightweight_test_engine(&temp_dir, "redo_testsys_lightweight").await;
+            let table_id = create_table2_for_test(&engine).await;
+            let mut reader_session = engine.new_session().unwrap();
+            let mut reader_trx = reader_session.begin_trx().unwrap();
+            let (held_tx, held_rx) = flume::bounded(1);
+            let (release_tx, release_rx) = flume::bounded(1);
+            let mut reader_fut = Box::pin(reader_trx.exec(async |stmt| {
+                stmt_tests::acquire_statement_lock(
+                    stmt,
+                    LockResource::TableMetadata(table_id),
+                    LockMode::Shared,
+                )
+                .await?;
+                held_tx.send_async(()).await.unwrap();
+                release_rx.recv_async().await.unwrap();
+                Ok(())
+            }));
+
+            loop {
+                if held_rx.try_recv().is_ok() {
+                    break;
+                }
+                assert!(matches!(
+                    futures::poll!(reader_fut.as_mut()),
+                    std::task::Poll::Pending
+                ));
+            }
+
+            let mut drop_session = engine.new_session().unwrap();
+            let mut drop_fut = Box::pin(drop_session.drop_table(table_id));
+            assert!(matches!(
+                futures::poll!(drop_fut.as_mut()),
+                std::task::Poll::Pending
+            ));
+
+            release_tx.send_async(()).await.unwrap();
+            reader_fut.await.unwrap();
+            assert_eq!(reader_trx.commit().await.unwrap(), TrxID::new(0));
+            drop_fut.await.unwrap();
+        });
+    }
+
+    #[test]
+    fn test_drop_table_waits_for_active_table_writer() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine = lightweight_test_engine(&temp_dir, "redo_testsys_lightweight").await;
+            let table_id = create_table2_for_test(&engine).await;
+            let mut writer_session = engine.new_session().unwrap();
+            let mut writer_trx = writer_session.begin_trx().unwrap();
+            trx_insert_row_by_id(
+                &mut writer_trx,
+                table_id,
+                vec![Val::from(91), Val::from("writer")],
+            )
+            .await
+            .unwrap();
+
+            let mut drop_session = engine.new_session().unwrap();
+            let mut drop_fut = Box::pin(drop_session.drop_table(table_id));
+            assert!(matches!(
+                futures::poll!(drop_fut.as_mut()),
+                std::task::Poll::Pending
+            ));
+
+            assert!(writer_trx.commit().await.unwrap() > TrxID::new(0));
+            drop_fut.await.unwrap();
+        });
+    }
+
+    #[test]
+    fn test_catalog_checkpoint_scan_allows_runtime_removed_drop_table() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine = lightweight_test_engine(&temp_dir, "redo_testsys_lightweight").await;
+            let table_id = create_table2_for_test(&engine).await;
+            let mut session = engine.new_session().unwrap();
+
+            session.drop_table(table_id).await.unwrap();
+            let batch = engine
+                .catalog()
+                .scan_checkpoint_batch(&engine.inner().trx_sys)
+                .unwrap();
+
+            assert_eq!(
+                batch.stop_reason,
+                CatalogCheckpointScanStopReason::ReachedDurableUpper
+            );
+            assert_eq!(batch.catalog_ddl_txn_count, 2);
+            assert!(batch.safe_cts >= batch.replay_start_ts);
+        });
+    }
+
+    #[test]
+    fn test_drop_table_catalog_checkpoint_cleans_absent_leftover_file() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let main_dir = temp_dir.path().to_path_buf();
+            let engine = lightweight_test_engine_config(main_dir.clone(), "drop_recover_absence")
+                .build()
+                .await
+                .unwrap();
+            let mut session = engine.new_session().unwrap();
+            let (table_spec, index_specs) = drop_table_test_spec();
+            let table_id = session.create_table(table_spec, index_specs).await.unwrap();
+            let mut trx = session.begin_trx().unwrap();
+            let insert = trx_insert_row_by_id(
+                &mut trx,
+                table_id,
+                vec![Val::from(7), Val::from("checkpoint-covered")],
+            )
+            .await;
+            let Ok(_) = insert else {
+                panic!("insert should succeed: {insert:?}");
+            };
+            trx.commit().await.unwrap();
+            let table_file_path = engine.inner().table_fs.user_table_file_path(table_id);
+
+            session.drop_table(table_id).await.unwrap();
+            engine
+                .catalog()
+                .checkpoint_now(&engine.inner().trx_sys)
+                .await
+                .unwrap();
+            assert!(
+                engine
+                    .catalog()
+                    .storage
+                    .checkpoint_snapshot()
+                    .unwrap()
+                    .catalog_replay_start_ts
+                    > TrxID::new(1)
+            );
+            wait_path_exists(&table_file_path, false).await;
+
+            drop(session);
+            drop(engine);
+
+            let engine = lightweight_test_engine_config(main_dir, "drop_recover_absence")
+                .build()
+                .await
+                .unwrap();
+            assert!(engine.catalog().get_table(table_id).await.is_none());
+            assert!(!std::path::Path::new(&table_file_path).exists());
+        });
     }
 }
