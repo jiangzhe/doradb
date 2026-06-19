@@ -1,7 +1,7 @@
 ---
 id: 000183
 title: Recovery Module Restructure
-status: proposal
+status: implemented
 created: 2026-06-19
 github_issue: 722
 ---
@@ -31,7 +31,7 @@ Issue Labels:
 - codex
 
 Source Backlogs:
-- `docs/backlogs/000128-recovery-module-restructure.md`
+- `docs/backlogs/closed/000128-recovery-module-restructure.md`
 
 Backlog `000128` was raised after task `000181` split redo startup into a
 startup handoff containing an initializer and stream, then moved replay-floor
@@ -321,6 +321,47 @@ Design sources:
 
 ## Implementation Notes
 
+- Added the top-level `doradb-storage/src/recovery/` module and wired it from
+  `doradb-storage/src/lib.rs`. Startup recovery orchestration now lives under
+  recovery as `RecoveryCoordinator`; `log` no longer exports `recover`.
+- Replaced the old recovery dependency bag with `RecoveryBuffers` and
+  `RecoveryResources`. The buffer grouping builds stable `PoolGuards` once and
+  retains recovery-owned pool handles for the startup recovery lifetime.
+- Moved row-page recovery state out of `log::recover` as `RowRecoveryMap`, and
+  updated buffer/frame and transaction row-read paths to import it from
+  `crate::recovery`.
+- Added focused recovery concepts for replay bounds and timestamp state through
+  `TableReplayBounds` and `RecoveryTimeline`, preserving existing replay
+  filters and `max_recovered_cts` seeding behavior.
+- Moved redo stream planning/reading from `log/replay.rs` to
+  `recovery/redo_stream.rs`, renamed the runtime stream to `RedoLogStream`, and
+  renamed stream iteration from `pop()` to `try_next()`.
+- Removed `RecoveryStartup` and the extra `recovery::recover()` wrapper.
+  `TrxSysConfig::prepare_recovery` now returns `(RecoveryCoordinator,
+  RedoLogInitializer)`, and `TrxSysConfig::prepare` runs recovery and redo-log
+  initialization as explicit sequential calls.
+- Addressed review follow-ups during implementation:
+  `TrxSysConfig::redo_log_startup` was renamed through the final
+  `prepare_recovery` API, `RecoveryStartup::recovery()` was removed with the
+  wrapper, and the no-op `_keepalive` local in
+  `RecoveryBuffers::pool_guards()` was removed. The retained `meta_pool` field
+  now has an explicit dead-code expectation documenting that it is kept for
+  ownership/liveness.
+- Updated ownership documentation in `docs/redo-log.md` and `README.md`.
+  Updated `tools/unsafe_inventory.rs` and regenerated
+  `docs/unsafe-usage-baseline.md` so unsafe redo-stream mmap usage is reported
+  under `recovery` instead of `log`.
+- Closed source backlog
+  `docs/backlogs/closed/000128-recovery-module-restructure.md` as implemented.
+- Validation completed:
+  - `cargo fmt --check`
+  - `cargo clippy -p doradb-storage --all-targets -- -D warnings`
+  - `cargo nextest run -p doradb-storage`
+  - `tools/unsafe_inventory.rs --write docs/unsafe-usage-baseline.md`
+  The final full nextest run passed 1003 tests. One earlier full nextest run
+  hit a transient `table::tests::test_checkpoint_error_rollback` failure; that
+  test passed when rerun directly and in the final full suite.
+
 ## Impacts
 
 - `doradb-storage/src/recovery/mod.rs`
@@ -416,11 +457,7 @@ Design sources:
 
 ## Open Questions
 
-- Exact type names are left to implementation judgment, but the chosen names
-  must reflect recovery concepts. Suggested names are `RecoveryCoordinator`,
-  `RecoveryBuffers`, `RecoveryResources`, `RecoveryTimeline`,
-  `TableReplayBounds`, and `RowRecoveryMap`.
+- No task-blocking open questions remain.
 - Backlog `000087` remains open for broader recovery cleanup and parallel
-  replay. If this implementation exposes additional concurrency or replay
-  ordering design needs, defer them to that backlog or create a new backlog
-  item rather than expanding this task.
+  replay. This task established the recovery/log ownership boundary but did not
+  change sequential replay ordering or introduce worker dispatch.
